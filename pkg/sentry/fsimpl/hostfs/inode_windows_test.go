@@ -640,6 +640,31 @@ func TestWindowsHostCaseMismatchIsNotExist(t *testing.T) {
 	}
 }
 
+func TestWindowsHostRefusesShortNameAlias(t *testing.T) {
+	h, dir := winTestHost(t)
+	const name = "Long Workspace Filename.txt"
+	winTestWrite(t, h, name, "content")
+	full, err := windows.UTF16PtrFromString(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf [1024]uint16
+	n, err := windows.GetShortPathName(full, &buf[0], uint32(len(buf)))
+	if err != nil || n >= uint32(len(buf)) {
+		t.Fatalf("query short name = %d, %v", n, err)
+	}
+	alias := filepath.Base(windows.UTF16ToString(buf[:n]))
+	if alias == name {
+		t.Skip("the volume does not create short names")
+	}
+	if _, err := h.lstat(alias); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lstat(%q) = %v, want not-exist", alias, err)
+	}
+	if _, err := h.lstat(name); err != nil {
+		t.Fatalf("lstat stored name: %v", err)
+	}
+}
+
 func TestWindowsHostChtimes(t *testing.T) {
 	h, _ := winTestHost(t)
 	winTestWrite(t, h, "f", "x")

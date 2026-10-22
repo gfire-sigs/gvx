@@ -553,6 +553,28 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 	}
 	defer closeHandle(handle)
 	stored, err := finalPathLeaf(handle)
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		// Normalization can traverse ancestors outside the workspace. A
+		// listing of the pinned parent verifies the exact name without them.
+		dir, openErr := openAt(parent.handle, ".", windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES,
+			windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE)
+		if openErr != nil {
+			return hostInfo{}, hostError("read parent directory", rel, openErr)
+		}
+		entries, listErr := readDirHandle(dir)
+		closeHandle(dir)
+		if listErr != nil {
+			return hostInfo{}, hostError("read parent directory", rel, listErr)
+		}
+		stored = ""
+		for _, entry := range entries {
+			if entry.name == parent.name {
+				stored = entry.name
+				break
+			}
+		}
+		err = nil
+	}
 	if err != nil {
 		return hostInfo{}, hostError("lstat", rel, err)
 	}
@@ -727,6 +749,14 @@ func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error) {
 		return nil, err
 	}
 	defer closeHandle(handle)
+	entries, err := readDirHandle(handle)
+	if err != nil {
+		return nil, hostError("read directory", rel, err)
+	}
+	return entries, nil
+}
+
+func readDirHandle(handle windows.Handle) ([]hostDirEntry, error) {
 	// The kernel requires an 8-byte aligned buffer. A large Go allocation
 	// meets this, and the explicit uint64 backing makes the guarantee local.
 	backing := make([]uint64, dirBufferSize/8)
@@ -744,11 +774,11 @@ func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error) {
 			break
 		}
 		if err != nil {
-			return nil, hostError("read directory", rel, err)
+			return nil, err
 		}
 		class = windows.FileFullDirectoryInfo
 		if out, err = parseDirBuffer(buf, out); err != nil {
-			return nil, hostError("read directory", rel, err)
+			return nil, err
 		}
 	}
 	return out, nil
