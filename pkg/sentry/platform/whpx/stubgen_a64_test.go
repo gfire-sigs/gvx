@@ -26,7 +26,7 @@ import (
 // Arm Architecture Reference Manual: HVC #imm16 is 0xD4000002 | imm16<<5,
 // and IC IALLUIS is SYS #0, C7, C1, #0.
 const (
-	a64WordHVC0     = 0xD4000002
+	a64WordHVC1     = 0xD4000022
 	a64WordICIALLUS = 0xD508711F
 )
 
@@ -98,7 +98,7 @@ func TestA64CommonHandlerSpillsAndExits(t *testing.T) {
 		fmt.Sprintf("STP X4, X5, [SP,#%d]", commOffFaultAddr),
 		fmt.Sprintf("MOV W0, #%#x", uint32(ExitException)),
 		fmt.Sprintf("STR W0, [SP,#%d]", commOffExitReason),
-		fmt.Sprintf("word %#x", a64WordHVC0),
+		fmt.Sprintf("word %#x", a64WordHVC1),
 	)
 	if len(got) != len(want) {
 		t.Fatalf("common handler has %d instructions, want %d:\n%v", len(got), len(want), got)

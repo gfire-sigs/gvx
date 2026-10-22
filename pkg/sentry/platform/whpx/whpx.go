@@ -19,7 +19,7 @@
 // long mode on amd64 and at EL1 on arm64, with a small stub that this package
 // generates (stubgen_x86.go and stubgen_a64.go). A system call or a fault
 // enters the stub. The stub spills the registers into a per-processor
-// CommPage, writes the exit reason and executes HLT (amd64) or HVC #0
+// CommPage, writes the exit reason and executes HLT (amd64) or HVC #1
 // (arm64). The Sentry reads the CommPage, runs the Linux system call and
 // resumes the stub. Register calls to the hypervisor are rare. They happen at
 // bring-up and on the cold path: floating-point state, clone, signal delivery

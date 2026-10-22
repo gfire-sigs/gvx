@@ -37,6 +37,13 @@ const (
 
 	// maxVPs caps the virtual processors of one partition.
 	maxVPs = 64
+
+	// GIC registers occupy the device range below the RAM window. Each
+	// redistributor needs one 128 KiB frame that belongs to one virtual CPU.
+	a64GicDistributor       = 0x08000000
+	a64GicITS               = 0x08080000
+	a64GicRedistributors    = 0x080A0000
+	a64GicRedistributorSize = 0x20000
 )
 
 // Kernel region layout. The region lives in the upper canonical half. All

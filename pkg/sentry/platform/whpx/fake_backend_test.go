@@ -370,6 +370,7 @@ func writeStubExit(buf []byte, pc uint64) {
 	clear(buf)
 	if runtime.GOARCH == "arm64" {
 		binary.LittleEndian.PutUint32(buf[a64ExitOffReason:], a64ExitHypercall)
+		binary.LittleEndian.PutUint16(buf[a64ExitOffHvcImm:], a64StubHvc)
 		binary.LittleEndian.PutUint64(buf[a64ExitOffHdrPc:], pc)
 		return
 	}

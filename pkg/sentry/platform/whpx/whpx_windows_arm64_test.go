@@ -18,9 +18,51 @@ package whpx
 
 import (
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
+
+func TestRealSecondaryProcessorSyscall(t *testing.T) {
+	p := newRealPlatform(t)
+	if p.vpCount < 2 {
+		t.Skip("the partition has only one virtual processor")
+	}
+	c, mm, ac := realGuest(t, p, guestSyscallCode)
+	v, err := newVP(p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := v.destroy(); err != nil {
+			t.Error(err)
+		}
+	})
+	if result, done := c.prepareRun(v, mm.as.(*AddressSpace), ac); done {
+		t.Fatal(result.err)
+	}
+
+	canceled := make(chan error, 1)
+	timer := time.AfterFunc(5*time.Second, func() { canceled <- p.be.cancel(v.index) })
+	err = p.be.run(v.index, v.exit)
+	if !timer.Stop() {
+		if cancelErr := <-canceled; cancelErr != nil {
+			t.Errorf("cancel secondary processor: %v", cancelErr)
+		}
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit, err := v.decodeExit()
+	if err != nil || exit.kind != exitStub {
+		t.Fatalf("secondary processor exit = %+v, %v; want a syscall trap", exit, err)
+	}
+	result, _ := c.onStubExit(v, exit, ac)
+	if result.err != nil || result.sig != nil {
+		t.Fatalf("secondary processor syscall = %+v", result)
+	}
+	checkSyscallExit(t, ac)
+}
 
 var (
 	// svc #0

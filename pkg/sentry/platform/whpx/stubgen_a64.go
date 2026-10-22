@@ -25,7 +25,7 @@ import (
 // to Common. SP_EL1 always equals the CommPage address of the virtual
 // processor, so the handler addresses CommPage through SP without a scratch
 // register. Common spills X0 to X30, SP_EL0, ELR_EL1, SPSR_EL1, TPIDR_EL0,
-// FAR_EL1 and ESR_EL1, writes ExitException and executes HVC #0. The Sentry
+// FAR_EL1 and ESR_EL1, writes ExitException and executes HVC #1. The Sentry
 // resumes the virtual processor at Reload, which restores the system
 // registers and the general registers and returns with ERET.
 
@@ -48,6 +48,9 @@ const (
 	a64ECSVC64         = 0x15
 	a64ECDataAbortLow  = 0x24
 	a64ECInstrAbortLow = 0x20
+
+	// Hyper-V consumes HVC #0 as its own hypercall ABI. HVC #1 exits to WHP.
+	a64StubHvc = 1
 )
 
 // MAIR_EL1 attribute bytes. Index 0 must be Normal write-back because
@@ -140,7 +143,7 @@ func buildA64Stubs() (*a64Stubs, error) {
 	a.movzW(0, uint16(ExitException))
 	a.strWSP(0, commOffExitReason)
 	hvc := a.pos()
-	a.hvc(0)
+	a.hvc(a64StubHvc)
 
 	// Reload path. HVC returns here, and the Sentry can also start here.
 	reload := a.pos()

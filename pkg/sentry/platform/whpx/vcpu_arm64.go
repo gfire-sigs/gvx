@@ -81,6 +81,9 @@ func (v *vcpu) archBringUp() error {
 	sctlr := b.u64(0)
 
 	b.reset()
+	// Secondary processors start suspended until the host clears StartupSuspend.
+	b.add64(a64RegActivity, 0)
+	b.add64(a64RegGicrBase, a64GicRedistributors+uint64(v.index)*a64GicRedistributorSize)
 	b.add64(a64RegMair, a64Mair)
 	b.add64(a64RegTcr, a64TCR)
 	b.add64(a64RegTtbr0, p.kernel.pt.TTBR0_EL1(false, 0))
@@ -166,7 +169,7 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 // onStubExit reads the CommPage after the stub executed HVC.
 func (c *Context) onStubExit(v *vcpu, ex exitInfo, ac *arch.Context64) (runResult, bool) {
 	comm := v.comm
-	if ex.hvcImmediate != 0 {
+	if ex.hvcImmediate != a64StubHvc {
 		v.st.invalidate()
 		return runResult{err: fmt.Errorf("whpx: virtual processor %d executed HVC #%d", v.index, ex.hvcImmediate)}, false
 	}
