@@ -17,7 +17,7 @@ Running Linux binaries or container images on Windows and macOS usually forces a
 | **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
 | **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
 
-The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry was offline. A reachable registry adds about one second for the tag check. Only `hvf` and `systrap` on `darwin/arm64` are executed in this repository.
+The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry was offline. A reachable registry adds about one second for the tag check. These timings describe `darwin/arm64` only. Native `windows/arm64` tests also verify WHPX with static and dynamic ELF files and the M2 and M3 image gates.
 
 ```mermaid
 flowchart LR
@@ -135,7 +135,11 @@ Windows enforces a 64KB alignment granularity on `VirtualAlloc(..., MEM_RESERVE,
 
 `pkg/sentry/platform/whpx` (Windows `amd64`/`arm64`) and `pkg/sentry/platform/hvf` (macOS `arm64`/`amd64`) map guest pages from `pgalloc.MemoryFile` through `WHvMapGpaRange` and `hv_vm_map`. The EROFS image uses a read-only file descriptor, and `hv_vm_map` rejects it. `hvf` copies those pages into immutable slab pages. Stage-1 4KB translation granules (`arm64`) and Extended Page Tables (`amd64`) enforce `R/W/X` at 4KB boundaries.
 
-Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path syscall exit (`bluepill_*.go` in `hvf`, `stubgen_*.go` in `whpx`). `arch.Context64` holds the general and FP registers, and every `Switch` loads and stores them. `Hypervisor.framework` ties a vCPU to its host thread, so `hvf` runs each vCPU on a dedicated locked worker thread. `hvf` on `darwin/arm64` is the only hardware backend that this repository executes. `whpx` and `hvf` on `darwin/amd64` are compile-checked only.
+Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path syscall exit (`bluepill_*.go` in `hvf`, `stubgen_*.go` in `whpx`). `arch.Context64` holds the general and FP registers, and every `Switch` loads and stores them. `Hypervisor.framework` ties a vCPU to its host thread, so `hvf` runs each vCPU on a dedicated locked worker thread. Native tests execute `hvf` on `darwin/arm64` and `whpx` on `windows/arm64`. CI verifies `windows/amd64` where WHPX is available. `hvf` on `darwin/amd64` is compile-checked only.
+
+ARM64 WHPX needs GICv3 configuration before partition setup and a redistributor address for each vCPU. Secondary vCPUs need their `StartupSuspend` bit cleared. The stub uses `HVC #1`, because Hyper-V consumes `HVC #0` through its own hypercall interface.
+
+Windows allows one mapped WHPX partition per host process. Concurrent sandboxes need separate host processes. NTFS also rejects directory renames while a descendant remains open.
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
@@ -165,7 +169,9 @@ On Windows, every open call sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHAR
 
 After opening the hypervisor handle, cached `.erofs` layers, `-p` / `-net=wg` sockets, and `/workspace` `os.Root`, `pkg/hostlockdown` locks down the host process before guest entry. `rungv` and `pkg/gvx` enable the lockdown by default. `hostlockdown.Apply` returns an error when a self-probe shows that the lockdown did not take effect.
 
-On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` and lowers the primary token to `Low Integrity`. It also binds a `SE_GROUP_USE_FOR_DENY_ONLY` token to vCPU threads, enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, and sets `DisallowWin32kSystemCalls = 1`. These Windows steps are compile-checked only.
+On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` and lowers the primary token to `Low Integrity`. It also binds a `SE_GROUP_USE_FOR_DENY_ONLY` token to vCPU threads, enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, and sets `DisallowWin32kSystemCalls = 1`. Native tests verify these calls.
+
+File restrictions apply only to threads that call `BindThread`. Other Go threads can still read outside the workspace. Windows does not enforce `AllowOutboundNet` or `OutboundUDPPorts` at the host boundary.
 
 On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(deny default)` Seatbelt profile through `sandbox_init`. The profile denies process creation and new host file opens. After `Apply`, `getaddrinfo` and reads of `/etc/resolv.conf` fail, so `pkg/netbackend` reads the DNS resolvers before the lockdown.
 

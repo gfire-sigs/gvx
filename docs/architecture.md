@@ -270,7 +270,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | **vCPU Execution Call** | `WHvRunVirtualProcessor(partition, vpIndex, ...)` | `hv_vcpu_run(vcpu)` on a dedicated worker thread per vCPU. The worker calls `runtime.LockOSThread()`, because a vCPU belongs to the thread that created it. |
 | **Async Signal Preemption** | `WHvCancelRunVirtualProcessor(partition, vpIndex, 0)` | `hv_vcpus_exit(&vcpu, 1)` |
 | **`amd64` Syscall Trap (`bluepill_x86.go`, `stubgen_x86.go`)** | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT`. | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT` / `VMCALL`. |
-| **`arm64` Syscall Trap (`bluepill_arm64.go`, `stubgen_a64.go`)** | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. |
+| **`arm64` Syscall Trap (`bluepill_arm64.go`, `stubgen_a64.go`)** | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #1`. | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. |
 | **Read-only File Mappings** | Maps read-only host views directly into the partition. | `hv_vm_map` rejects the read-only descriptor of an EROFS image. `hvf` copies those pages into immutable slab pages, and pgalloc memory files map directly. |
 | **Unknown Exit Reason** | Not applicable. | `HV_EXIT_REASON_UNKNOWN` carries no information. The worker resumes the vCPU as it does after a cancellation, and `Switch` fails after 4096 consecutive unknown exits. |
 
@@ -284,7 +284,7 @@ sequenceDiagram
 
     Guest->>Stub: Execute SYSCALL (amd64) / SVC #0 (arm64) or trigger Page Fault
     Stub->>Comm: Spill Fast-Path syscall GPRs (or full state on fault), RIP/ELR_EL1, RSP/SP_EL0
-    Stub->>HV: Execute HLT (amd64) or HVC #0 (arm64)
+    Stub->>HV: Execute HLT (amd64) or HVC (arm64)
     HV-->>Sentry: Return from WHvRunVirtualProcessor / hv_vcpu_run
     Sentry->>Comm: Read spilled registers directly from shared page slice
     Sentry->>Sentry: Dispatch Linux syscall or resolve VMA page fault (PullFullState on clone/signal)
@@ -453,7 +453,7 @@ A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware 
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go and scopes all `/workspace` opens to the `os.Root` handle. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Applies host containment before guest entry. Windows restricts file access on bound vCPU threads. Linux retains path limitations with a workspace. |
 
 ```mermaid
 stateDiagram-v2
@@ -472,7 +472,9 @@ stateDiagram-v2
 Execute these steps in `lockdown_windows.go` before starting virtual processor or `systrap` execution:
 
 > [!IMPORTANT]
-> Open the WHPX partition handle (or pre-spawn the `systrap` stub subprocess and `sysmsg` mapping), cached `.erofs` layer handles, `-p` host listeners, the `-net=wg` UDP socket, and `/workspace` `os.Root` before calling `hostlockdown.Apply()`. Once `hostlockdown.Apply()` locks down the process token and sets `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, the Windows kernel rejects new host file opens and child processes.
+> Open the WHPX partition, cached layers, network sockets, and workspace before calling `hostlockdown.Apply()`.
+> The Job Object blocks child creation.
+> Only threads that call `BindThread` receive the restricted token.
 
 1. Apply an inheritable Low-Integrity ACE (`S-1-16-4096`) to writable `/workspace` directories so Windows MIC permits guest writes after token downgrade.
 2. Open the live primary process token (`OpenProcessToken`) and call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete all privileges in-place.
@@ -482,6 +484,10 @@ Execute these steps in `lockdown_windows.go` before starting virtual processor o
 6. Set `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` on the Job Object to block child process creation (`cmd.exe`, `powershell.exe`).
 7. Set `JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_WRITECLIPBOARD` to isolate host UI handles and the clipboard.
 8. Call `SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy, ...)` with `DisallowWin32kSystemCalls = 1` to block `win32kfull.sys` system calls.
+
+#### Windows Lockdown Limits (Descriptive Module)
+
+The restricted token applies only to threads that call `BindThread`. Other Go threads can still read outside the workspace. Windows does not enforce the network options at the host boundary.
 
 #### macOS Lockdown Sequence (`lockdown_darwin.go`) (Procedural Module)
 
@@ -555,6 +561,7 @@ A hosted runner is a virtual machine. The macOS runner cannot create a nested VM
 | :--- | :--- |
 | `darwin/arm64` `hvf` | The Apple Silicon development host. A hosted runner has no hypervisor. |
 | `darwin/arm64` `systrap` | The development host and CI. |
-| `windows/amd64` and `windows/arm64` | CI builds both. CI runs `windows/amd64` tests, and `whpx` runs only where the runner has the Windows Hypervisor Platform. `windows/arm64` is compile-checked only. |
+| `windows/amd64` | CI builds and tests the target. WHPX tests run only where the runner has the Windows Hypervisor Platform. |
+| `windows/arm64` | Native WHPX tests verify static and dynamic ELF execution, interactive BusyBox, Alpine, nginx, Python, and Node. CI cross-compiles the target. |
 | `darwin/amd64` | Compile-checked only. |
 | `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both. |
