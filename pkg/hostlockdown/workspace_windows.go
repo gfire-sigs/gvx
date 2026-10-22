@@ -178,9 +178,11 @@ func (g workspaceGrant) addLogonACE(path string, isDir bool, current *windows.AC
 	defer pin.Unpin()
 	pin.Pin(g.logon)
 	entries := []windows.EXPLICIT_ACCESS{sidEntry(g.logon, g.mask, windows.GRANT_ACCESS, inherit)}
-	for _, stale := range staleLogonSIDs(current, g.logon) {
-		pin.Pin(stale)
-		entries = append(entries, sidEntry(stale, 0, windows.REVOKE_ACCESS, windows.NO_INHERITANCE))
+	if isLogonSessionSID(g.logon) {
+		for _, stale := range staleLogonSIDs(current, g.logon) {
+			pin.Pin(stale)
+			entries = append(entries, sidEntry(stale, 0, windows.REVOKE_ACCESS, windows.NO_INHERITANCE))
+		}
 	}
 	merged, err := windows.ACLFromEntries(entries, current)
 	if err != nil {
@@ -190,6 +192,39 @@ func (g workspaceGrant) addLogonACE(path string, isDir bool, current *windows.AC
 		return fmt.Errorf("hostlockdown: SetNamedSecurityInfo(DACL) %q: %w", path, err)
 	}
 	return nil
+}
+
+func revokeWorkspaceSID(root string, sid *windows.SID) error {
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
+			return nil
+		}
+		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			return fmt.Errorf("hostlockdown: read workspace DACL %q: %w", path, err)
+		}
+		acl, _, err := sd.DACL()
+		if errors.Is(err, windows.ERROR_OBJECT_NOT_FOUND) || err == nil && acl == nil {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var pin runtime.Pinner
+		defer pin.Unpin()
+		pin.Pin(sid)
+		merged, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{sidEntry(sid, 0, windows.REVOKE_ACCESS, windows.NO_INHERITANCE)}, acl)
+		if err != nil {
+			return err
+		}
+		if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, merged, nil); err != nil {
+			return fmt.Errorf("hostlockdown: revoke workspace SID %q: %w", path, err)
+		}
+		return nil
+	})
 }
 
 func sidEntry(sid *windows.SID, mask windows.ACCESS_MASK, mode windows.ACCESS_MODE, inherit uint32) windows.EXPLICIT_ACCESS {

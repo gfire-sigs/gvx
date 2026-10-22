@@ -42,6 +42,13 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 		return Status{}, err
 	}
 	defer primary.Close()
+	app, err := tokenIsAppContainer(primary)
+	if err != nil {
+		return Status{}, err
+	}
+	if app {
+		return applyAppContainerLockdown(primary)
+	}
 	id, err := readTokenIdentity(primary)
 	if err != nil {
 		return Status{}, err
@@ -83,7 +90,7 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	if err := probeRestrictedOpenBlocked(restricted, workspaceReal); err != nil {
 		return Status{}, err
 	}
-	st.UnboundFileOpenBlocked = true
+	st.BoundThreadFileOpenBlocked = true
 
 	// Steps 5 to 7: containment job.
 	job, err := createContainmentJob()

@@ -36,6 +36,13 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "appcontainer-worker" {
+		if err := runAppContainerWorker(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if mode := os.Getenv(childModeEnv); mode != "" {
 		if err := runLockedChild(mode); err != nil {
 			fmt.Fprintf(os.Stderr, "child %s: %v\n", mode, err)
@@ -322,7 +329,7 @@ func runLockedChild(mode string) error {
 			errs = append(errs, fmt.Errorf(format, args...))
 		}
 	}
-	expect(st.Applied && st.SubprocessBlocked && st.UnboundFileOpenBlocked && st.IntegrityDowngraded && st.Win32kBlocked, "status = %+v", st)
+	expect(st.Applied && st.SubprocessBlocked && st.BoundThreadFileOpenBlocked && !st.UnboundFileOpenBlocked && st.IntegrityDowngraded && st.Win32kBlocked, "status = %+v", st)
 	expect(IsLockedDown(), "IsLockedDown = false after Apply")
 
 	_, err = pre.WriteString("pre-opened")

@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package hostlockdown applies irreversible host OS self-containment to the
-// current process after all required host handles are open. Windows uses a
-// restricted token, Low integrity, a job object and no win32k. macOS uses a
-// Seatbelt profile and RLIMIT_NPROC=0.
+// Package hostlockdown starts Windows AppContainer workers and applies containment before guest execution.
+// macOS uses a Seatbelt profile and RLIMIT_NPROC=0.
 package hostlockdown
 
 import (
@@ -72,10 +70,10 @@ type Status struct {
 	// with an active process limit of one.
 	SubprocessBlocked bool
 
-	// UnboundFileOpenBlocked reports that opens outside the workspace fail.
-	// macOS: probe opens failed in the whole process. Windows: probe opens
-	// failed on a thread that holds the restricted token, so only threads
-	// that call BindThread have this property. Linux: the seccomp filter
+	// UnboundFileOpenBlocked reports that host policy denies unlisted file opens.
+	// Windows AppContainer also permits its profile and system resources.
+	// The legacy Windows thread token leaves this field false.
+	// macOS probes the whole process. Linux: the seccomp filter
 	// rejects every open when no workspace exists. With a workspace, the filter
 	// rejects opens relative to the working directory but must allow opens
 	// relative to a directory descriptor, and seccomp cannot read the path. An
@@ -83,15 +81,22 @@ type Status struct {
 	// root, so the field stays false.
 	UnboundFileOpenBlocked bool
 
+	// BoundThreadFileOpenBlocked reports a restricted token on explicitly bound Windows threads.
+	BoundThreadFileOpenBlocked bool
+
+	// AppContainer reports a process token with no network capabilities.
+	// Windows still permits access to system resources that grant AppContainer access.
+	AppContainer bool
+
 	// IntegrityDowngraded reports a Low integrity primary token. Windows only.
 	IntegrityDowngraded bool
 
 	// Win32kBlocked reports that win32k system calls are disabled. Windows only.
 	Win32kBlocked bool
 
-	// NetworkOutboundBlocked reports that a self-probe observed a rejected
-	// outbound TCP connect. Apply leaves it false when the options allow
-	// outbound traffic.
+	// NetworkOutboundBlocked reports blocked direct host connections.
+	// Windows verifies an AppContainer token without network capabilities.
+	// Other hosts probe an outbound TCP connection when policy denies it.
 	NetworkOutboundBlocked bool
 
 	SeatbeltProfile string
