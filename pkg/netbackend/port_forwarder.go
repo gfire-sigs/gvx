@@ -118,7 +118,7 @@ type boundTCPForward struct {
 
 type boundUDPForward struct {
 	rule       PortForwardRule
-	packetConn *net.UDPConn
+	packetConn DatagramSocket
 
 	// sessions maps a client address to its session. PortForwarder.mu guards it.
 	sessions map[netip.AddrPort]*udpForwardSession
@@ -135,14 +135,15 @@ type udpForwardSession struct {
 // PortForwarder binds host TCP listeners and UDP packet sockets prior to
 // hostlockdown.Apply() and forwards inbound traffic into Netstack via gonet.
 type PortForwarder struct {
-	mu      sync.Mutex
-	tcpList []*boundTCPForward
-	udpList []*boundUDPForward
-	started bool
-	closed  bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	hostNetwork HostNetwork
+	mu          sync.Mutex
+	tcpList     []*boundTCPForward
+	udpList     []*boundUDPForward
+	started     bool
+	closed      bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 
 	// udpIdle is the time without a datagram after which a UDP session ends.
 	udpIdle time.Duration
@@ -153,8 +154,14 @@ type PortForwarder struct {
 
 // NewPortForwarder constructs an empty PortForwarder ready for PreBind.
 func NewPortForwarder() *PortForwarder {
+	return NewPortForwarderWithNetwork(HostNetwork{})
+}
+
+// NewPortForwarderWithNetwork creates a forwarder with an explicit socket provider.
+func NewPortForwarderWithNetwork(network HostNetwork) *PortForwarder {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PortForwarder{
+		hostNetwork:    network,
 		ctx:            ctx,
 		cancel:         cancel,
 		udpIdle:        defaultUDPIdleTimeout,
@@ -189,7 +196,7 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 
 		switch proto {
 		case "tcp":
-			ln, err := net.Listen("tcp", bindAddr)
+			ln, err := pf.hostNetwork.listen("tcp", bindAddr)
 			if err != nil {
 				return fmt.Errorf("netbackend: bind tcp %s: %w", bindAddr, err)
 			}
@@ -208,14 +215,14 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 				listener: ln,
 			})
 		case "udp":
-			pc, err := net.ListenPacket("udp", bindAddr)
+			pc, err := pf.hostNetwork.listenPacket("udp", bindAddr)
 			if err != nil {
 				return fmt.Errorf("netbackend: bind udp %s: %w", bindAddr, err)
 			}
-			udpConn, ok := pc.(*net.UDPConn)
+			udpConn, ok := pc.(DatagramSocket)
 			if !ok {
 				_ = pc.Close()
-				return fmt.Errorf("netbackend: bind udp %s: socket is %T, want *net.UDPConn", bindAddr, pc)
+				return fmt.Errorf("netbackend: bind udp %s: socket is %T, want DatagramSocket", bindAddr, pc)
 			}
 			actualPort := uint16(udpConn.LocalAddr().(*net.UDPAddr).Port)
 			pf.udpList = append(pf.udpList, &boundUDPForward{

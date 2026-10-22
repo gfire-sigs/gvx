@@ -86,6 +86,10 @@ type WireGuardConfig struct {
 	// Logger receives wireguard-go device messages. When nil, the endpoint
 	// discards them. Verbose messages use the Debug level.
 	Logger *slog.Logger
+
+	// ListenPacket supplies the pre-bound UDP socket. The endpoint owns the returned socket.
+	// A nil function uses net.ListenPacket.
+	ListenPacket func(network, address string) (net.PacketConn, error) `json:"-"`
 }
 
 // WireGuardEndpoint attaches a Netstack channel.Endpoint (MTU 1420) to the
@@ -246,7 +250,11 @@ func (w *WireGuardEndpoint) preBindLocked() error {
 	if w.udpConn != nil {
 		return nil
 	}
-	pc, err := net.ListenPacket("udp", w.cfg.ListenUDPAddr)
+	listen := w.cfg.ListenPacket
+	if listen == nil {
+		listen = net.ListenPacket
+	}
+	pc, err := listen("udp", w.cfg.ListenUDPAddr)
 	if err != nil {
 		return fmt.Errorf("netbackend: bind WireGuard UDP socket %q: %w", w.cfg.ListenUDPAddr, err)
 	}

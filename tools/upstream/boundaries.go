@@ -151,6 +151,7 @@ var platformBackends = []string{"pkg/sentry/platform/whpx", "pkg/sentry/platform
 // boundaryExceptions is the complete list of imports that the SPEC table does not name.
 // Add an entry only when the Go type system or an upstream interface forces the import.
 var boundaryExceptions = []importException{
+	{[]string{"pkg/gvx"}, "internal/sandboxrpc", "the Windows broker bounds messages from an isolated Sentry worker"},
 	// Sentry foundation packages appear in the signatures of the kernel, VFS, and platform interfaces.
 	{sentryAPIUsers, "pkg/context", "Sentry entry points take context.Context"},
 	{sentryAPIUsers, "pkg/hostarch", "Sentry address and page types live in pkg/hostarch"},

@@ -39,6 +39,7 @@ var (
 	procGetPartitionProperty   = modWinHvPlatform.NewProc("WHvGetPartitionProperty")
 	procSetPartitionProperty   = modWinHvPlatform.NewProc("WHvSetPartitionProperty")
 	procMapGpaRange            = modWinHvPlatform.NewProc("WHvMapGpaRange")
+	procMapGpaRange2           = modWinHvPlatform.NewProc("WHvMapGpaRange2")
 	procUnmapGpaRange          = modWinHvPlatform.NewProc("WHvUnmapGpaRange")
 	procCreateVirtualProcessor = modWinHvPlatform.NewProc("WHvCreateVirtualProcessor")
 	procDeleteVirtualProcessor = modWinHvPlatform.NewProc("WHvDeleteVirtualProcessor")

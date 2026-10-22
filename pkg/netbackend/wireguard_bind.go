@@ -42,7 +42,7 @@ var pastDeadline = time.Unix(1, 0)
 // Close stops the receive function by setting an expired read deadline. It
 // leaves the socket open, so Open can run again on the same socket.
 type preboundBind struct {
-	sock *net.UDPConn
+	sock DatagramSocket
 
 	mu sync.Mutex
 	// session is the active Open generation, or nil while the bind is closed.
@@ -60,9 +60,9 @@ var _ conn.Bind = (*preboundBind)(nil)
 // newPreboundBind returns a Bind over sock. The socket must stay open until
 // the Device that uses the Bind is closed.
 func newPreboundBind(sock net.PacketConn) (*preboundBind, error) {
-	udp, ok := sock.(*net.UDPConn)
+	udp, ok := sock.(DatagramSocket)
 	if !ok {
-		return nil, fmt.Errorf("netbackend: WireGuard socket is %T, want *net.UDPConn", sock)
+		return nil, fmt.Errorf("netbackend: WireGuard socket is %T, want DatagramSocket", sock)
 	}
 	return &preboundBind{sock: udp}, nil
 }
