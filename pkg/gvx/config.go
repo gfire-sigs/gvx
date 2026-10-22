@@ -194,12 +194,13 @@ type Config struct {
 	// architecture.
 	Architecture string
 
-	// DisableHostLockdown skips pkg/hostlockdown. New applies the lockdown
-	// (Windows RestrictedToken and JobObject, or macOS Seatbelt) by default,
-	// after it opens all host handles. The lockdown is irreversible for
-	// the host process, so embedders that keep using the process for other
-	// work must set this field.
+	// DisableHostLockdown permits trusted execution without host containment.
+	// Windows callers use NewProcess for containment. New rejects this configuration
+	// unless DisableHostLockdown is true. macOS and Linux apply irreversible
+	// containment to the caller through New.
 	DisableHostLockdown bool
+
+	processNetwork *processNetworkIO
 }
 
 // normalize applies defaults and rejects contradictory settings before New

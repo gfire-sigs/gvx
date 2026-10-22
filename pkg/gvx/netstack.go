@@ -15,8 +15,10 @@
 package gvx
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 
@@ -30,6 +32,12 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
 	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 )
+
+type processNetworkIO struct {
+	dial   func(context.Context, string, string) (net.Conn, error)
+	lookup func(context.Context, string) ([]netip.Addr, error)
+	host   netbackend.HostNetwork
+}
 
 // initNetstack builds the Netstack for the configured mode and pre-binds
 // every host socket that must outlive the lockdown.
@@ -71,10 +79,15 @@ func (s *Sandbox) initNetstack() error {
 		return nil
 
 	case NetModeNAT:
-		st, fwd, err := netbackend.NewNATStack(netbackend.NATConfig{
+		natConfig := netbackend.NATConfig{
 			IsolateLAN:        s.cfg.IsolateLAN,
 			StreamInterceptor: s.cfg.StreamInterceptor,
-		})
+		}
+		if s.cfg.processNetwork != nil {
+			natConfig.DialContext = s.cfg.processNetwork.dial
+			natConfig.LookupHost = s.cfg.processNetwork.lookup
+		}
+		st, fwd, err := netbackend.NewNATStack(natConfig)
 		if err != nil {
 			return err
 		}
@@ -82,7 +95,11 @@ func (s *Sandbox) initNetstack() error {
 		s.natForwarder = fwd
 
 		if len(s.cfg.PortForwards) > 0 {
-			pf := netbackend.NewPortForwarder()
+			var hostNetwork netbackend.HostNetwork
+			if s.cfg.processNetwork != nil {
+				hostNetwork = s.cfg.processNetwork.host
+			}
+			pf := netbackend.NewPortForwarderWithNetwork(hostNetwork)
 			rules := make([]netbackend.PortForwardRule, 0, len(s.cfg.PortForwards))
 			for _, pfSpec := range s.cfg.PortForwards {
 				hostIP := pfSpec.BindAddress

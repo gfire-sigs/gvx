@@ -1,6 +1,6 @@
 # `gvx`
 
-`gvx` ports Google's gVisor user-space Linux kernel (Sentry) to 64-bit Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`, `darwin/amd64`) as co-equal Priority-0 targets. It also supports Linux (`linux/amd64`, `linux/arm64`) officially. It executes unmodified Linux ELF64 binaries and multi-arch OCI container images inside one unprivileged host process via the `rungv` CLI or `pkg/gvx` SDK. Callers get isolated Linux execution on Windows and Mac with millisecond startup, no Linux virtual machine, no kernel drivers, and no administrator or `root` privileges.
+`gvx` ports the gVisor user-space Linux kernel to Windows, macOS, and Linux on `amd64` and `arm64`. It runs Linux ELF64 programs and OCI images without booting a Linux kernel. Windows uses an AppContainer for Sentry and a separate broker for WHPX and permitted sockets. macOS and Linux retain their existing host containment. `rungv` and `pkg/gvx` require no administrator or `root` privileges.
 
 ---
 
@@ -12,7 +12,7 @@ Running Linux binaries or container images on Windows and macOS usually forces a
 
 | Runtime Model | Host Targets | Cold Start | Memory Overhead | Admin / `sudo` Required | 4KB `mmap(MAP_FIXED)` | Direct OCI Image Run |
 | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows & macOS (`amd64`, `arm64`) | `~20 ms` | `~30 MiB` | No (Low Integrity / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
+| **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows & macOS (`amd64`, `arm64`) | `~20 ms` | `~30 MiB` | No (AppContainer / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
 | **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k` build); unavailable on Windows and macOS `amd64` | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt) | 16KB host pages, native stub tasks | Yes (In-Memory Tar-to-EROFS) |
 | **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
 | **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
@@ -73,55 +73,92 @@ codesign --sign - --entitlements entitlements.plist --force ./rungv
 ./rungv run -platform=systrap -image=alpine:3.20 -- uname -m
 ```
 
-`rungv run` locks down the host process before guest entry. Pass `-lockdown=false` only for debugging. The command then prints a warning.
+`rungv run` confines Sentry before guest entry. Windows starts an AppContainer worker and keeps the caller outside its restrictions. Pass `-lockdown=false` only for debugging. The command then prints a warning.
 
 ### 2.2 Embeddable Go SDK (`pkg/gvx`)
 
-Embed `gvx` inside a Windows or macOS host binary to run sandboxed Linux toolchains without external daemons:
+Use `NewProcess` on Windows and `New` on macOS or Linux. Windows `New` returns `ErrProcessIsolationRequired` unless `DisableHostLockdown` is true. `NewProcess` starts a worker without changing the caller's token. Supply a self-contained worker executable that calls `ServeProcess`.
 
 > [!CAUTION]
-> Always call `sb.Close()` after `sb.Run()` returns. Omitting `sb.Close()` leaks hypervisor guest physical mappings, cached EROFS handles, the `os.Root` workspace handle, and host sandbox resources. Defer `sb.Close()` immediately after `gvx.New()` succeeds.
+> Defer `Close` after either constructor succeeds.
+> Call `Close` before the host program exits.
 
-1. Construct a `gvx.Config` specifying the execution backend, OCI image or rootfs path, network mode, and workspace path.
-2. Call `gvx.New(ctx, cfg)` to compile or open EROFS layers, initialize networking, and apply self-lockdown (`pkg/hostlockdown`). Set `Config.DisableHostLockdown` only for debugging.
-3. Call `sb.Run(ctx)` to execute the guest binary and read its Linux exit code.
+1. Construct `gvx.Config` with the image, network mode, and workspace.
+2. Use `gvx.NewProcess` on Windows.
+3. Add a worker entry point that calls `gvx.ServeProcess`.
+4. Use `gvx.New` on macOS or Linux.
+5. Call `Run` with a cancellation context.
 
 ```go
 package main
 
 import (
-	"context"
-	"fmt"
-	"os"
+    "context"
+    "fmt"
+    "os"
+    "runtime"
 
-	"z.gfire.dev/gvx/pkg/gvx"
+    "z.gfire.dev/gvx/pkg/gvx"
 )
 
 func main() {
-	ctx := context.Background()
-	sb, err := gvx.New(ctx, gvx.Config{
-		Platform:      gvx.PlatformAuto, // Tries whpx or hvf first, then systrap; reports both errors if all fail
-		NetworkMode:   gvx.NetModeNAT,
-		OCIImage:      "alpine:3.20",
-		WorkspacePath: "./repo",
-		Argv:          []string{"/usr/bin/git", "status"},
-		Stdout:        os.Stdout,
-		Stderr:        os.Stderr,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "init sandbox: %v\n", err)
-		os.Exit(1)
-	}
-	defer sb.Close()
+    if len(os.Args) == 2 && os.Args[1] == "--gvx-worker" {
+        if err := gvx.ServeProcess(context.Background(), gvx.WorkerOptions{}); err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            os.Exit(1)
+        }
+        return
+    }
+    os.Exit(run())
+}
 
-	exitCode, err := sb.Run(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "run sandbox: %v\n", err)
-		os.Exit(1)
-	}
-	os.Exit(exitCode)
+func run() (code int) {
+    ctx := context.Background()
+    cfg := gvx.Config{
+        NetworkMode: gvx.NetModeNAT,
+        OCIImage:    "alpine:3.20",
+        Argv:        []string{"/bin/uname", "-m"},
+        Stdout:      os.Stdout,
+        Stderr:      os.Stderr,
+    }
+    var sandbox interface {
+        Run(context.Context) (int, error)
+        Close() error
+    }
+    var err error
+    if runtime.GOOS == "windows" {
+        executable, pathErr := os.Executable()
+        if pathErr != nil {
+            fmt.Fprintln(os.Stderr, pathErr)
+            return 1
+        }
+        sandbox, err = gvx.NewProcess(ctx, gvx.WorkerCommand{
+            Executable: executable,
+            Arguments:  []string{"--gvx-worker"},
+        }, cfg)
+    } else {
+        sandbox, err = gvx.New(ctx, cfg)
+    }
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        return 1
+    }
+    defer func() {
+        if err := sandbox.Close(); err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            code = 1
+        }
+    }()
+    code, err = sandbox.Run(ctx)
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        return 1
+    }
+    return code
 }
 ```
+
+`NewProcess` accepts an optional `*os.File` for stdin. It forwards console input through the broker and copies output to the supplied writers. The caller owns these streams. `Close` cancels pending operations and removes the worker profile and its workspace entries.
 
 ---
 
@@ -139,7 +176,7 @@ Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path s
 
 ARM64 WHPX needs GICv3 configuration before partition setup and a redistributor address for each vCPU. Secondary vCPUs need their `StartupSuspend` bit cleared. The stub uses `HVC #1`, because Hyper-V consumes `HVC #0` through its own hypercall interface.
 
-Windows allows one mapped WHPX partition per host process. Concurrent sandboxes need separate host processes. NTFS also rejects directory renames while a descendant remains open.
+Direct WHPX sandboxes can map one partition per source process. `NewProcess` gives each sandbox a separate source process. NTFS still rejects directory renames while a descendant remains open.
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
@@ -167,11 +204,13 @@ On Windows, every open call sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHAR
 
 ### 3.5 Unprivileged Self-Lockdown (`pkg/hostlockdown`)
 
-After opening the hypervisor handle, cached `.erofs` layers, `-p` / `-net=wg` sockets, and `/workspace` `os.Root`, `pkg/hostlockdown` locks down the host process before guest entry. `rungv` and `pkg/gvx` enable the lockdown by default. `hostlockdown.Apply` returns an error when a self-probe shows that the lockdown did not take effect.
+`rungv` enables host containment by default. On Windows, `NewProcess` prepares OCI layers and starts Sentry inside an AppContainer without network capabilities. The broker opens WHPX and maps worker pages through `WHvMapGpaRange2`. The worker token restricts existing and new Go threads.
 
-On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` and lowers the primary token to `Low Integrity`. It also binds a `SE_GROUP_USE_FOR_DENY_ONLY` token to vCPU threads, enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, and sets `DisallowWin32kSystemCalls = 1`. Native tests verify these calls.
+The broker supplies NAT sockets, declared port forwarders, and the single WireGuard socket. It denies every network operation in `none` mode. NAT enforces `IsolateLAN` in the broker. WireGuard pins both the peer address and port. The worker cannot open a direct host connection in any mode.
 
-File restrictions apply only to threads that call `BindThread`. Other Go threads can still read outside the workspace. Windows does not enforce `AllowOutboundNet` or `OutboundUDPPorts` at the host boundary.
+The worker removes privileges, retains Low integrity, disables win32k calls, and belongs to a job with an active process limit of one. Windows still permits AppContainer system resources and private profile storage. Workspace access uses its package SID. `Close` removes that SID from workspace entries.
+
+The legacy Windows `hostlockdown.Apply` path restricts only threads that call `BindThread`. It reports `BoundThreadFileOpenBlocked`, while `UnboundFileOpenBlocked` stays false. The SDK rejects this partial boundary by default. `DisableHostLockdown` retains the explicit debugging path.
 
 On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(deny default)` Seatbelt profile through `sandbox_init`. The profile denies process creation and new host file opens. After `Apply`, `getaddrinfo` and reads of `/etc/resolv.conf` fail, so `pkg/netbackend` reads the DNS resolvers before the lockdown.
 

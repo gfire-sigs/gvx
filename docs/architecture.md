@@ -11,7 +11,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | Design Objective | Engineering Contract | Verification Boundary |
 | :--- | :--- | :--- |
 | **Priority-0 Dual-OS & Dual-Arch** | Targets `windows/amd64`, `windows/arm64`, `darwin/arm64`, and `darwin/amd64` from one codebase. | Compiles and runs native `linux/amd64` and `linux/arm64` ELF64 workloads on Windows and macOS. |
-| **Zero Runtime Elevation** | Runs under a standard user account and locks down the host process before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
+| **Zero Runtime Elevation** | Runs under a standard user account and confines Sentry before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
 | **Hardware 4KB Paging (`whpx` & `hvf`)** | Uses `WinHvPlatform.dll` (Windows) and `Hypervisor.framework` (macOS) with 4KB EPT and Stage-1/Stage-2 tables. | Bypasses the Windows 64KB `VirtualAlloc` limit and the Apple Silicon 16KB host page limit. |
 | **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows returns `ErrUnavailable`. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
 | **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
@@ -21,7 +21,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 ```mermaid
 flowchart TD
     HostApp["Host Caller (cmd/rungv or pkg/gvx)"] --> OCI["pkg/oci (Multi-Arch OCI Pull & In-Memory Tar-to-EROFS Cache)"]
-    OCI --> Lockdown["pkg/hostlockdown (Windows RestrictedToken/JobObject or macOS Seatbelt)"]
+    OCI --> Lockdown["pkg/hostlockdown (Windows AppContainer/JobObject or macOS Seatbelt)"]
     Lockdown --> Sentry["pkg/sentry/kernel (Pure-Go Linux Syscall & Task Engine: amd64 & arm64)"]
     Sentry --> VFS["pkg/sentry/vfs (VFS2 Layer)"]
     Sentry --> Net["pkg/tcpip (Pure-Go Netstack TCP/IP)"]
@@ -43,7 +43,7 @@ The `systrap` fallback runs on macOS `arm64` only, and it needs 16KB guest pages
 
 | Host Target | Primary Engine (`whpx` / `hvf`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | Not implemented (`ErrUnavailable`). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
+| **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | Not implemented (`ErrUnavailable`). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (20H2+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
 | **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | Not implemented (`ErrUnavailable`). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
 | **`darwin/arm64`** (Apple Silicon M1-M5) | `platform/hvf` (`Hypervisor.framework` Stage-1 4KB + Stage-2 16KB) | `platform/systrap` (`darwinsystrap`: 4B `B` Island Patch + `sys_icache_invalidate`), built with `-tags pagesize_16k`. | 16KB Host Page / 16KB Map Granularity | Entitlement `com.apple.security.hypervisor` for `hvf`. Runs `linux/arm64` images. |
 | **`darwin/amd64`** (Intel Mac) | `platform/hvf` (`Hypervisor.framework` VT-x 4KB EPT) | Dropped. | 4KB Page / 4KB Map Granularity | Runs `linux/amd64` images on `hvf`. |
@@ -115,7 +115,8 @@ gvx/ (Fork of google/gvisor@go)
  │   │   ├── fd_windows.go                  # [NEW] Unified HostHandle wrapping Win32 HANDLE
  │   │   └── fd_darwin.go                   # [NEW] Unified HostHandle wrapping Darwin FD
  │   ├── hostlockdown/
- │   │   ├── lockdown_windows.go            # [NEW] RestrictedToken, Low Integrity, JobObject, Win32k block
+ │   │   ├── process_windows.go             # [NEW] AppContainer worker and Job Object ownership
+ │   │   ├── lockdown_windows.go            # [NEW] Low integrity, privileges, and win32k policy
  │   │   ├── lockdown_darwin.go             # [NEW] Seatbelt sandbox_init SBPL profile & RLIMIT_NPROC=0
  │   │   └── lockdown_other.go              # [NEW] Returns ErrUnsupported on other hosts
  │   └── sentry/
@@ -174,7 +175,7 @@ Each package owns one architectural boundary. Enforce top-down import directiona
 | `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, and Sentry boot. | `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip` | `cmd/*` |
 | `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests and compiles `.tar` layers into `.erofs` files. | `pkg/abi/linux` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
 | `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
-| `pkg/hostlockdown` | Locks down the host process via Windows Tokens/JobObjects or macOS Seatbelt. | `golang.org/x/sys/windows`, `golang.org/x/sys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
+| `pkg/hostlockdown` | Starts Windows AppContainer workers and applies host containment before guest execution. | `golang.org/x/sys/windows`, `golang.org/x/sys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
 | `pkg/sentry/kernel` | Dispatches the OS-agnostic Linux task, signal, and syscall table (`amd64` & `arm64`). | `pkg/abi/linux`, `pkg/sentry/platform`, `pkg/sentry/vfs`, `pkg/sync` | `golang.org/x/sys/windows`, `pkg/hostlockdown` |
 | `pkg/sentry/platform/whpx` | Executes guest Ring-3/EL0 code on Windows via `WinHvPlatform.dll` and 4KB EPT/Stage-2. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/sys/windows` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
 | `pkg/sentry/platform/hvf` | Executes guest EL0/Ring-3 code on macOS via `Hypervisor.framework` and 4KB Stage-1/Stage-2. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/sys/unix` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
@@ -453,13 +454,13 @@ A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware 
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go and scopes all `/workspace` opens to the `os.Root` handle. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Applies host containment before guest entry. Windows restricts file access on bound vCPU threads. Linux retains path limitations with a workspace. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Applies host containment before guest entry. Windows confines the Sentry process with AppContainer. Linux retains path limitations with a workspace. |
 
 ```mermaid
 stateDiagram-v2
     [*] --> PreInit: Launch rungv or pkg/gvx (Unprivileged User Account)
     PreInit --> HandlesOpen: Open Hypervisor (WHPX/HVF) or Pre-Spawn systrap Stub, .erofs Layers, Sockets, and /workspace os.Root
-    HandlesOpen --> WinLockdown: Windows: In-Place SE_PRIVILEGE_REMOVED + Low Integrity + Deny-Only SID + JobObject + NoWin32k
+    HandlesOpen --> WinLockdown: Windows: AppContainer worker + WHPX/socket broker + Low integrity + JobObject + NoWin32k
     HandlesOpen --> MacLockdown: macOS: sandbox_init Seatbelt Profile (deny process-fork/exec/file-*) + RLIMIT_NPROC=0
     HandlesOpen --> LinuxLockdown: Linux: PR_SET_NO_NEW_PRIVS + seccomp allowlist of the runsc Sentry on every thread (other calls kill the process)
     WinLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
@@ -467,27 +468,51 @@ stateDiagram-v2
     LinuxLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
 ```
 
-#### Windows Lockdown Sequence (`lockdown_windows.go`) (Procedural Module)
+#### Windows Worker and Broker (Descriptive Module)
 
-Execute these steps in `lockdown_windows.go` before starting virtual processor or `systrap` execution:
+`pkg/gvx.NewProcess` owns one AppContainer worker and its broker. `cmd/rungv` selects this boundary by default on Windows. `gvx.New` returns `ErrProcessIsolationRequired` unless the caller explicitly disables host lockdown. The caller retains its original token.
+
+The AppContainer token covers every worker thread, including threads that Go creates after initialization. Windows permits system resources and private profile storage. The parent grants the package SID access to the workspace. The worker receives only the selected standard streams, protocol pipes, and read-only layer descriptors.
+
+The broker owns WHPX because AppContainer denies partition creation. `WHvMapGpaRange2` maps pages from the fixed worker process. A request cannot select another source process. Separate worker address spaces permit concurrent sandboxes in one caller. Native ARM64 tests verify this arrangement.
+
+| Broker operation | Enforced boundary |
+| :--- | :--- |
+| WHPX | One fixed worker process, bounded GPA ranges, at most 64 virtual processors, and bounded register batches. |
+| `none` | No host sockets or DNS requests. |
+| `nat` | Numeric TCP/UDP destinations, broker-side LAN policy, and declared inbound listeners. |
+| Published UDP | Replies only to observed clients, with a 30-second inactivity limit. |
+| `wg` | One connected UDP socket, with the configured peer address and port. No additional sockets or DNS requests. |
+| Console | Reads from the caller's selected console. Cancellation targets only the broker's reading thread. |
+
+`internal/sandboxrpc` limits each RPC frame to 128 KiB and each connection to 256 pending requests. Initialization messages have a 1 MiB limit. The network broker permits at most 1024 sockets. These limits bound memory allocation from worker requests. The broker rejects unsupported operations.
+
+Microsoft documents [AppContainer launch](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer) and [remote GPA mappings](https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvmapgparange2). These APIs define the worker token and source-process contract.
+
+#### Windows Initialization (Procedural Module)
+
+Use this sequence before entering guest code. Keep ownership in `pkg/gvx`, `pkg/hostlockdown`, and `pkg/sentry/platform/whpx`.
 
 > [!IMPORTANT]
-> Open the WHPX partition, cached layers, network sockets, and workspace before calling `hostlockdown.Apply()`.
-> The Job Object blocks child creation.
-> Only threads that call `BindThread` receive the restricted token.
+> Keep the worker process object open until the broker releases its mappings.
+> Call `ProcessSandbox.Close` before the caller exits.
 
-1. Apply an inheritable Low-Integrity ACE (`S-1-16-4096`) to writable `/workspace` directories so Windows MIC permits guest writes after token downgrade.
-2. Open the live primary process token (`OpenProcessToken`) and call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete all privileges in-place.
-3. Call `SetTokenInformation(hPrimaryToken, TokenIntegrityLevel, ...)` to lower the live primary token integrity level to `Low` (`S-1-16-4096`) in-place.
-4. Create a `DISABLE_MAX_PRIVILEGE` restricted token with `SE_GROUP_USE_FOR_DENY_ONLY` and bind it to each vCPU thread via `SetThreadToken`.
-5. Create an anonymous Job Object with `CreateJobObjectW` and assign the current process via `AssignProcessToJobObject`.
-6. Set `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` on the Job Object to block child process creation (`cmd.exe`, `powershell.exe`).
-7. Set `JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_WRITECLIPBOARD` to isolate host UI handles and the clipboard.
-8. Call `SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy, ...)` with `DisallowWin32kSystemCalls = 1` to block `win32kfull.sys` system calls.
+1. Resolve OCI images and open verified layer descriptors in the caller.
+2. Create a unique AppContainer profile without network capabilities.
+3. Grant its package SID access to the selected workspace.
+4. Start the worker suspended with an explicit list of inherited descriptors.
+5. Assign the worker to a job with one active process and termination on final handle closure.
+6. Resume the worker.
+7. Create WHPX in the broker and fix its source process to the worker.
+8. Initialize Sentry, workspace access, network proxies, and memory before applying worker lockdown.
+9. Remove worker privileges.
+10. Verify its AppContainer token, job limits, and Low integrity.
+11. Disable win32k system calls.
+12. Enter guest code after the worker reports successful containment.
+13. Terminate the worker before releasing broker mappings during forced shutdown.
+14. Remove profile resources and workspace entries after the worker exits.
 
-#### Windows Lockdown Limits (Descriptive Module)
-
-The restricted token applies only to threads that call `BindThread`. Other Go threads can still read outside the workspace. Windows does not enforce the network options at the host boundary.
+The legacy `hostlockdown.Apply` path still supports explicitly bound threads. It reports `BoundThreadFileOpenBlocked` and leaves `UnboundFileOpenBlocked` false. It does not provide the boundary that `NewProcess` enforces.
 
 #### macOS Lockdown Sequence (`lockdown_darwin.go`) (Procedural Module)
 
@@ -528,7 +553,7 @@ Implementation proceeds across five sequential milestones (`M1` through `M5`) ta
 | **M1** | **Host Primitives & Pure-Go Sentry Compile** | `pkg/sync` (`WaitOnAddress` & `__ulock_wait`), `pkg/memutil` (`MapViewOfFile3` & `mach_vm_remap`), `pkg/fd`, `pgalloc`, `time`, `hostcpu`, `tools/upstream`, and Sentry build-tag expansion (`linux \|\| windows \|\| darwin`). | `go build ./pkg/sentry/kernel/...` and primitive unit tests pass on `windows/{amd64,arm64}` and `darwin/{arm64,amd64}`. |
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | `pkg/sentry/platform/whpx` (Windows `amd64`/`arm64`), `pkg/sentry/platform/hvf` (macOS `arm64`/`amd64`), shared-page stubs generated in Go (`bluepill_*.go`, `stubgen_*.go`), `cmd/rungv`, and `pkg/gvx`. | Boot static `busybox` (`PID 1`) via `platform/whpx` on Windows and `platform/hvf` on macOS and execute commands at a `busybox ash` prompt. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | `clone`, `futex`, signals, TLS (`ARCH_SET_FS` & `TPIDR_EL0`), VDSO, `pkg/netbackend` (`-net=nat -p` & `-net=wg`), and `pkg/oci` (multi-arch Tar-to-EROFS + `fsimpl/overlay`). | Run unmodified `alpine:3.20`, `nginx:alpine`, `python:3.12-alpine`, and `node:22-alpine` OCI images (`amd64` & `arm64`) on Windows and macOS. |
-| **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | `pkg/sentry/fsimpl/hostfs` (`os.OpenRoot`, `NtCreateFile`/`openat`, `.gvx_meta`) and `pkg/hostlockdown` (Windows RestrictedToken/JobObject & macOS Seatbelt `sandbox_init`). | Pass POSIX rename/unlink torture tests (`git rebase`, `bun install`) on `/workspace`; verify subprocess creation fails on both Windows and macOS. |
+| **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | `pkg/sentry/fsimpl/hostfs` (`os.OpenRoot`, `NtCreateFile`/`openat`, `.gvx_meta`) and `pkg/hostlockdown` (Windows AppContainer/JobObject with a WHPX broker & macOS Seatbelt `sandbox_init`). | Pass POSIX rename/unlink torture tests (`git rebase`, `bun install`) on `/workspace`; verify subprocess creation fails on both Windows and macOS. |
 | **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap`; `winsystrap` is not implemented)** | `pkg/sentry/platform/systrap`: `commit_mm_darwin.go`, the lazy page-trap `arm64asm` syscall patcher (`patcher_arm64_xplat.go`), trampoline islands, `sysmsg` shared-memory stub tasks, and a strict Seatbelt profile for each stub. The `x86asm` patcher, `winsystrap`, and Rosetta 2 / Prism support stay out of scope. | Execute static, dynamic, and JIT (`node`, `python3`) `arm64` ELF64 workloads via `-platform=systrap` on macOS `arm64` with `-tags pagesize_16k`. Windows and macOS `amd64` return `ErrUnavailable`. |
 
 ### 4.1 Host-Native-First Execution Order and Unified E2E Suite (Descriptive Module)
@@ -562,6 +587,6 @@ A hosted runner is a virtual machine. The macOS runner cannot create a nested VM
 | `darwin/arm64` `hvf` | The Apple Silicon development host. A hosted runner has no hypervisor. |
 | `darwin/arm64` `systrap` | The development host and CI. |
 | `windows/amd64` | CI builds and tests the target. WHPX tests run only where the runner has the Windows Hypervisor Platform. |
-| `windows/arm64` | Native WHPX tests verify static and dynamic ELF execution, interactive BusyBox, Alpine, nginx, Python, and Node. CI cross-compiles the target. |
+| `windows/arm64` | Native tests verify WHPX execution, AppContainer containment, NAT forwarding, WireGuard exchange, console I/O, and concurrent workers. CI cross-compiles the target. |
 | `darwin/amd64` | Compile-checked only. |
 | `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both. |

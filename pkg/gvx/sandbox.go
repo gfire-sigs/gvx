@@ -60,9 +60,13 @@ type Sandbox struct {
 // MemoryFile, then locks down the host process unless
 // Config.DisableHostLockdown is set. Every host handle exists before the
 // lockdown call because the lockdown denies new host file opens.
+// Windows requires NewProcess unless Config.DisableHostLockdown is true.
 func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 	if err := cfg.normalize(); err != nil {
 		return nil, err
+	}
+	if runtime.GOOS == "windows" && !cfg.DisableHostLockdown {
+		return nil, ErrProcessIsolationRequired
 	}
 
 	sb := &Sandbox{cfg: cfg}

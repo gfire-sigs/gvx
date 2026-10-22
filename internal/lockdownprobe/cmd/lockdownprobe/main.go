@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -30,6 +31,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"time"
 
 	"z.gfire.dev/gvx/internal/lockdownprobe"
@@ -54,10 +57,14 @@ func main() {
 	if os.Getenv(childEnv) != "" {
 		return
 	}
-	os.Exit(run())
+	worker := len(os.Args) > 1 && os.Args[1] == "worker"
+	if worker {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
+	os.Exit(run(worker))
 }
 
-func run() int {
+func run(worker bool) int {
 	lockdown := flag.Bool("lockdown", true, "keep the default host lockdown")
 	binPath := flag.String("bin", "", "guest ELF64 path")
 	image := flag.String("image", "", "OCI image reference; the arguments after the flags become the guest command")
@@ -96,6 +103,45 @@ func run() int {
 	var guestOut bytes.Buffer
 	cfg.Stdout = &guestOut
 	cfg.Stderr = os.Stderr
+	inspect := func(sb *gvx.Sandbox) lockdownprobe.Report {
+		return inspectHost(sb, cfg, *outsideFile, *outsideDir, *dialTarget)
+	}
+	if worker {
+		err := gvx.ServeProcess(context.Background(), gvx.WorkerOptions{AfterLockdown: func(_ context.Context, sb *gvx.Sandbox) error { return json.NewEncoder(os.Stdout).Encode(inspect(sb)) }})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+	if runtime.GOOS == "windows" && !cfg.DisableHostLockdown {
+		executable, err := os.Executable()
+		if err != nil {
+			rep.NewErr = err.Error()
+			return emit(rep, 1)
+		}
+		command := gvx.WorkerCommand{Executable: executable, Arguments: append([]string{"worker"}, os.Args[1:]...)}
+		process, err := gvx.NewProcess(context.Background(), command, cfg)
+		if err != nil {
+			rep.NewErr = err.Error()
+			return emit(rep, 1)
+		}
+		code, runErr := process.Run(context.Background())
+		runErr = errors.Join(runErr, process.Close())
+		decoder := json.NewDecoder(bytes.NewReader(guestOut.Bytes()))
+		if err := decoder.Decode(&rep); err != nil {
+			rep.NewErr = fmt.Sprintf("decode worker probes: %v", err)
+			return emit(rep, 1)
+		}
+		output := guestOut.Bytes()[decoder.InputOffset():]
+		output = bytes.TrimPrefix(output, []byte{'\n'})
+		rep.GuestStdout = string(output)
+		rep.GuestExitCode = code
+		if runErr != nil {
+			rep.GuestRunErr = runErr.Error()
+		}
+		return emit(rep, 0)
+	}
 	sb, err := gvx.New(context.Background(), cfg)
 	if err != nil {
 		rep.NewErr = err.Error()
@@ -104,17 +150,26 @@ func run() int {
 	defer func() {
 		_ = sb.Close()
 	}()
-	rep.Platform = sb.PlatformName()
-	rep.Lockdown = sb.LockdownStatus()
-	rep.LockedAPI = hostlockdown.IsLockedDown()
+	rep = inspect(sb)
+	code, err := sb.Run(context.Background())
+	rep.GuestExitCode = code
+	rep.GuestStdout = guestOut.String()
+	if err != nil {
+		rep.GuestRunErr = err.Error()
+	}
+	return emit(rep, 0)
+}
 
-	data, err := os.ReadFile(*outsideFile)
+func inspectHost(sb *gvx.Sandbox, cfg gvx.Config, outsideFile, outsideDir, dialTarget string) lockdownprobe.Report {
+	rep := lockdownprobe.Report{Platform: sb.PlatformName(), Lockdown: sb.LockdownStatus(), LockedAPI: hostlockdown.IsLockedDown()}
+
+	data, err := os.ReadFile(outsideFile)
 	if err != nil {
 		rep.ReadOutsideErr = err.Error()
 	} else {
 		rep.OutsideReadBytes = string(data)
 	}
-	if err := os.WriteFile(filepath.Join(*outsideDir, "escape.txt"), []byte("escaped"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(outsideDir, "escape.txt"), []byte("escaped"), 0o600); err != nil {
 		rep.WriteOutsideErr = err.Error()
 	}
 	spawn := exec.Command(os.Args[0])
@@ -123,9 +178,9 @@ func run() int {
 		rep.SpawnErr = err.Error()
 	}
 
-	if *dialTarget != "" {
+	if dialTarget != "" {
 		rep.DialAttempted = true
-		conn, err := net.DialTimeout("tcp", *dialTarget, 5*time.Second)
+		conn, err := dialAfterLockdown(sb, cfg, dialTarget)
 		if err != nil {
 			rep.DialErr = err.Error()
 		} else if err := conn.Close(); err != nil {
@@ -136,13 +191,31 @@ func run() int {
 		rep.WireGuardErr = exchangeOverWireGuard(sb)
 	}
 
-	code, err := sb.Run(context.Background())
-	rep.GuestExitCode = code
-	rep.GuestStdout = guestOut.String()
-	if err != nil {
-		rep.GuestRunErr = err.Error()
+	return rep
+}
+
+func dialAfterLockdown(sb *gvx.Sandbox, cfg gvx.Config, address string) (net.Conn, error) {
+	if cfg.NetworkMode != gvx.NetModeNAT {
+		return net.DialTimeout("tcp", address, 5*time.Second)
 	}
-	return emit(rep, 0)
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return nil, err
+	}
+	if ip.IsLoopback() {
+		ip = netip.MustParseAddr(netbackend.HostGatewayIPv4)
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return gonet.DialContextTCP(ctx, sb.Stack(), tcpip.FullAddress{NIC: netbackend.Eth0NICID, Addr: tcpip.AddrFromSlice(ip.AsSlice()), Port: uint16(number)}, ipv4.ProtocolNumber)
 }
 
 func emit(rep lockdownprobe.Report, code int) int {

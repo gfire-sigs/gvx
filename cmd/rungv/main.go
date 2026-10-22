@@ -62,6 +62,12 @@ func executeCLI(ctx context.Context, args []string, stdin io.Reader, stdout, std
 
 	subcmd := args[0]
 	switch subcmd {
+	case "worker":
+		if err := gvx.ServeProcess(ctx, gvx.WorkerOptions{}); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
 	case "run":
 		return runSubcommand(ctx, args[1:], stdin, stdout, stderr)
 	case "pull":
@@ -108,7 +114,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	workDirFlag := fs.String("workdir", "", "Initial guest working directory")
 	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL")
-	lockdownFlag := fs.Bool("lockdown", true, "Lock down the host process before guest entry (RestrictedToken and JobObject, or Seatbelt); use -lockdown=false to opt out")
+	lockdownFlag := fs.Bool("lockdown", true, "Apply host isolation before guest entry; use -lockdown=false to opt out")
 	ttyFlag := fs.Bool("t", false, "Allocate a pseudo-TTY for guest stdio")
 	interactiveFlag := fs.Bool("i", false, "Keep STDIN open")
 	itFlag := fs.Bool("it", false, "Allocate an interactive pseudo-TTY for guest stdio")
@@ -199,7 +205,7 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return exitCode
 	}
 
-	sb, err := gvx.New(ctx, rc.cfg)
+	sb, err := openSandbox(ctx, rc.cfg)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv run: init sandbox: %v\n", err)
 		if errors.Is(err, gvx.ErrInvalidConfig) {
@@ -226,6 +232,23 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return exitCode
 	}
 	return exitCode
+}
+
+type runningSandbox interface {
+	Run(context.Context) (int, error)
+	Close() error
+	PlatformName() string
+}
+
+func openSandbox(ctx context.Context, cfg gvx.Config) (runningSandbox, error) {
+	if runtime.GOOS == "windows" && !cfg.DisableHostLockdown {
+		executable, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		return gvx.NewProcess(ctx, gvx.WorkerCommand{Executable: executable, Arguments: []string{"worker"}}, cfg)
+	}
+	return gvx.New(ctx, cfg)
 }
 
 func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
