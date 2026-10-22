@@ -292,3 +292,37 @@ func TestMapFilePrivateWriteDoesNotReachFile(t *testing.T) {
 		t.Fatalf("file byte after private write = (%#x, %v), want 0x01", buf[0], err)
 	}
 }
+
+func TestMapSliceSharesSubpageFile(t *testing.T) {
+	t.Parallel()
+	fd, err := CreateMemFD("subpage", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := os.NewFile(uintptr(fd), "memfd")
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := f.Truncate(8); err != nil {
+		t.Fatal(err)
+	}
+	mapFile := func() []byte {
+		mapping, err := MapSlice(0, 8, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED, uintptr(fd), 0)
+		if err != nil {
+			t.Fatalf("map an eight-byte file: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := UnmapSlice(mapping); err != nil {
+				t.Error(err)
+			}
+		})
+		return mapping
+	}
+	first, second := mapFile(), mapFile()
+	first[7] = 0x42
+	if second[7] != 0x42 {
+		t.Fatalf("second view byte = %#x, want 0x42", second[7])
+	}
+}

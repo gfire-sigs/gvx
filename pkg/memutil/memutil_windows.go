@@ -70,10 +70,11 @@ func protectionFor(prot uintptr, private bool) mapProtection {
 }
 
 // mapSection maps [offset, offset+size) of section into the current process.
-// The offset is a multiple of the allocation granularity and the size is a multiple of the page size.
+// The offset is a multiple of the allocation granularity.
 func mapSection(section windows.Handle, offset uint64, size uintptr, p mapProtection) (uintptr, error) {
 	var addr uintptr
-	if err := procMapViewOfFile3.Find(); err == nil {
+	// MapViewOfFile3 requires whole pages. MapViewOfFile accepts shorter views.
+	if err := procMapViewOfFile3.Find(); err == nil && size%pageSize4K == 0 {
 		r1, _, callErr := procMapViewOfFile3.Call(
 			uintptr(section),
 			uintptr(windows.CurrentProcess()), // The pseudo-handle selects this process.
@@ -193,7 +194,8 @@ func MapFile(addr, size, prot, flags, fd, offset uintptr) (uintptr, error) {
 
 	baseOffset := uint64(offset) &^ (allocGranularity - 1)
 	delta := uintptr(uint64(offset) - baseOffset)
-	viewSize := (delta + size + pageSize4K - 1) &^ (pageSize4K - 1)
+	// The view cannot exceed the section size. Windows rounds its host pages.
+	viewSize := delta + size
 	base, err := mapSection(section, baseOffset, viewSize, p)
 	if err != nil {
 		return 0, err
