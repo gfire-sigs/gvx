@@ -228,3 +228,24 @@ func TestCtrSlotLoadsTheConstantAndReturns(t *testing.T) {
 		t.Error("an out-of-range return must be rejected")
 	}
 }
+
+func TestIsDataCacheMaintenance(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		word uint32
+		want bool
+	}{
+		{"dc civac, x3", 0xd50b7e23, true},
+		{"dc cvau, x0", 0xd50b7b20, true},
+		{"dc cvac, xzr", 0xd50b7a3f, true},
+		{"dc cvap, x30", 0xd50b7c3e, true},
+		{"dc zva, x1", 0xd50b7421, false},
+		{"ic ivau, x1", 0xd50b7521, false},
+		{"dc ivac, x1", 0xd5087621, false},
+		{"nop", 0xd503201f, false},
+	} {
+		if got := isDataCacheMaintenance(tc.word); got != tc.want {
+			t.Errorf("isDataCacheMaintenance(%#x), %s = %v, want %v", tc.word, tc.name, got, tc.want)
+		}
+	}
+}

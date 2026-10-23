@@ -29,10 +29,14 @@ func (m memoryFileChunks) AllocateChunk(length uint64) (memmap.FileRange, error)
 	return m.Allocate(length, pgalloc.AllocOpts{Kind: usage.Anonymous})
 }
 
-// attachChunkMemory moves the chunks of mapped workspace files into the kernel
-// memory file when the platform needs it. It must run before the first mapping.
+// attachChunkMemory moves the chunks of mapped host directory files into the
+// kernel memory file when the platform needs it. It covers every bind and
+// volume mount. It must run before the first mapping.
 func (s *Sandbox) attachChunkMemory() {
-	if sharedChunkMemory && s.workspace != nil && s.memFile != nil {
-		s.workspace.SetChunkMemory(memoryFileChunks{s.memFile})
+	if !sharedChunkMemory || s.memFile == nil {
+		return
+	}
+	for _, ws := range s.workspaces {
+		ws.SetChunkMemory(memoryFileChunks{s.memFile})
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -33,6 +34,7 @@ const (
 	childModeEnv = "GVX_HOSTLOCKDOWN_CHILD_MODE"
 	childWSEnv   = "GVX_HOSTLOCKDOWN_WORKSPACE"
 	childOutEnv  = "GVX_HOSTLOCKDOWN_OUTSIDE"
+	childROEnv   = "GVX_HOSTLOCKDOWN_READONLY"
 )
 
 func TestMain(m *testing.M) {
@@ -300,7 +302,13 @@ func TestApplyLockdownWindows(t *testing.T) {
 }
 
 func runLockedChild(mode string) error {
-	if mode != "files" {
+	switch mode {
+	case "files":
+	case "cpu":
+		return runCPUChild()
+	case "mounts":
+		return runMountsChild()
+	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
 	ws, outside := os.Getenv(childWSEnv), os.Getenv(childOutEnv)
@@ -319,7 +327,7 @@ func runLockedChild(mode string) error {
 		return err
 	}
 
-	st, err := Apply(Options{WorkspacePath: ws})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
@@ -370,4 +378,108 @@ func runLockedChild(mode string) error {
 		errs = append(errs, errors.New("cmd.exe ran after Apply"))
 	}
 	return errors.Join(errs...)
+}
+
+// TestApplyCapsTheCPUTimeOfTheJob proves that the lockdown puts the hard CPU cap
+// on the job of the process, by reading the cap back in the locked child.
+func TestApplyCapsTheCPUTimeOfTheJob(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), childModeEnv+"=cpu")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+	}
+}
+
+func runCPUChild() error {
+	const quota = 500
+	st, err := Apply(Options{CPUQuotaMillis: quota})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	if !st.CPUQuotaEnforced {
+		return fmt.Errorf("status = %+v, want CPUQuotaEnforced", st)
+	}
+	// A NULL job handle names the job of the calling process.
+	var got jobCPURateControl
+	if err := queryJobInformation(0, jobObjectCPURateControlInformation, unsafe.Pointer(&got), unsafe.Sizeof(got)); err != nil {
+		return fmt.Errorf("QueryInformationJobObject: %w", err)
+	}
+	want := jobCPURate(quota, runtime.NumCPU())
+	if got.CPURate != want || got.ControlFlags&jobCPURateControlHardCap == 0 {
+		return fmt.Errorf("job CPU cap = %+v, want a hard cap with rate %d", got, want)
+	}
+	return nil
+}
+
+// TestApplyLockdownWithTwoMounts proves that a writable mount and a read-only
+// mount both serve a bound thread, that the read-only mount refuses a write,
+// and that a path outside every mount stays closed.
+func TestApplyLockdownWithTwoMounts(t *testing.T) {
+	dir := func() string {
+		p, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("EvalSymlinks: %v", err)
+		}
+		return p
+	}
+	rw, ro, outside := dir(), dir(), dir()
+	if err := os.WriteFile(filepath.Join(ro, "existing.txt"), []byte("read-only-content"), 0o600); err != nil {
+		t.Fatalf("WriteFile existing: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("host-secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), childModeEnv+"=mounts", childWSEnv+"="+rw, childROEnv+"="+ro, childOutEnv+"="+outside)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+	}
+}
+
+func runMountsChild() error {
+	rw, ro, outside := os.Getenv(childWSEnv), os.Getenv(childROEnv), os.Getenv(childOutEnv)
+	rwRoot, err := os.OpenRoot(rw)
+	if err != nil {
+		return err
+	}
+	roRoot, err := os.OpenRoot(ro)
+	if err != nil {
+		return err
+	}
+	st, err := Apply(Options{Mounts: []HostMount{{Path: rw}, {Path: ro, ReadOnly: true}}})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	if !st.Applied || !st.BoundThreadFileOpenBlocked || st.UnboundFileOpenBlocked {
+		return fmt.Errorf("status = %+v, want bound-thread restrictions without process isolation", st)
+	}
+
+	done := make(chan []error, 1)
+	go func() {
+		runtime.LockOSThread()
+		var errs []error
+		if err := BindThread(); err != nil {
+			done <- []error{fmt.Errorf("BindThread: %w", err)}
+			return
+		}
+		if f, err := rwRoot.OpenFile("new.txt", os.O_CREATE|os.O_RDWR, 0o600); err != nil {
+			errs = append(errs, fmt.Errorf("create in the writable mount: %w", err))
+		} else {
+			_ = f.Close()
+		}
+		if data, err := roRoot.ReadFile("existing.txt"); err != nil || string(data) != "read-only-content" {
+			errs = append(errs, fmt.Errorf("read in the read-only mount = %q, %v", data, err))
+		}
+		if f, err := roRoot.OpenFile("new.txt", os.O_CREATE|os.O_RDWR, 0o600); err == nil {
+			_ = f.Close()
+			errs = append(errs, errors.New("create in the read-only mount succeeded"))
+		} else if !errors.Is(err, fs.ErrPermission) {
+			errs = append(errs, fmt.Errorf("create in the read-only mount = %v, want a permission error", err))
+		}
+		if _, err := os.ReadFile(filepath.Join(outside, "secret.txt")); !errors.Is(err, fs.ErrPermission) {
+			errs = append(errs, fmt.Errorf("read outside every mount = %v, want a permission error", err))
+		}
+		done <- errs
+	}()
+	return errors.Join(<-done...)
 }

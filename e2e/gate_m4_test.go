@@ -304,7 +304,12 @@ func tortureScript(caseInsensitive bool) string {
 	if caseInsensitive {
 		flag = "1"
 	}
-	return "CASE_INSENSITIVE=" + flag + "\n" + posixTortureScript
+	openDirRename := "1"
+	if runtime.GOOS == "windows" {
+		// NTFS refuses to rename a directory that has an open descendant.
+		openDirRename = "0"
+	}
+	return "CASE_INSENSITIVE=" + flag + "\nOPEN_DIR_RENAME=" + openDirRename + "\n" + posixTortureScript
 }
 
 var posixTortureMarkers = []string{"T1-OK", "T2-OK", "T3-OK", "T4-OK", "T5-OK", "T6-OK", "T7-OK", "T8-OK", "T9-OK", "T10-OK", "ALL-OK"}

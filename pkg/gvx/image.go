@@ -136,11 +136,8 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		layerFiles = append(layerFiles, img.LayerFiles...)
 		img.LayerFiles = nil
 		layerPaths = append(layerPaths, img.LayerPaths...)
-		if len(s.cfg.Argv) == 0 {
-			s.cfg.Argv = img.Config.CommandVector(nil)
-		}
-		if len(s.cfg.Envv) == 0 && len(img.Config.Env) > 0 {
-			s.cfg.Envv = append([]string(nil), img.Config.Env...)
+		if err := s.applyImageDefaults(img.Config); err != nil {
+			return err
 		}
 	}
 
@@ -177,6 +174,13 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		}
 	}
 
+	if len(s.cfg.Argv) == 0 && (len(s.cfg.Cmd) > 0 || s.cfg.EntrypointSet) {
+		// A layer tar has no image config: the caller names the whole command.
+		if err := s.applyImageDefaults(oci.RuntimeConfig{}); err != nil {
+			return err
+		}
+	}
+
 	if len(layerFiles) != len(layerPaths) {
 		return fmt.Errorf("gvx: %d opened EROFS layers but %d layer paths", len(layerFiles), len(layerPaths))
 	}
@@ -190,6 +194,27 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 			return err
 		}
 	}
+	return nil
+}
+
+// applyImageDefaults fills the command and the environment of the guest from
+// the config of its image. The command follows Docker rules, and the caller
+// environment replaces the image values key by key.
+func (s *Sandbox) applyImageDefaults(img oci.RuntimeConfig) error {
+	argv, err := composeCommand(img, commandSource{
+		Argv:          s.cfg.Argv,
+		Entrypoint:    s.cfg.Entrypoint,
+		EntrypointSet: s.cfg.EntrypointSet,
+		Cmd:           s.cfg.Cmd,
+	})
+	if err != nil {
+		return err
+	}
+	env, err := mergeEnv(img.Env, s.cfg.Envv)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	s.cfg.Argv, s.cfg.Envv = argv, env
 	return nil
 }
 
@@ -211,11 +236,18 @@ func verifySameLayerFile(opened *os.File, path string) error {
 }
 
 // ResolveImage resolves image into cached EROFS layers for the Linux
-// architecture arch. The image is an OCI archive path or a registry reference.
+// architecture arch. The image is an OCI archive path or a Docker image
+// reference such as "alpine:3.20", "ghcr.io/org/img:v1", or
+// "name@sha256:<digest>". The reference names its registry.
+//
+// A non-empty baseURL, such as the -registry-url flag, overrides the
+// registry. The call then drops a registry host in the reference and keeps
+// the repository path as written.
+//
 // A registry pull revalidates the tag over the network. When the registry is
 // unreachable, ResolveImage falls back to the image that an earlier pull
-// cached, first in cache and then, for Docker Hub references, in the default
-// host layer cache.
+// cached. It looks in the cache first. Without an override, it then looks in
+// the default host layer cache.
 func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, arch string) (*oci.ResolvedImage, error) {
 	arch = cmp.Or(arch, runtime.GOARCH)
 	if info, err := os.Stat(image); err == nil && !info.IsDir() {
@@ -233,12 +265,22 @@ func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, ar
 		return img, nil
 	}
 
-	repo, ref := splitImageRef(image)
 	explicitRegistry := baseURL != ""
-	baseURL = strings.TrimRight(cmp.Or(baseURL, oci.DefaultRegistryBaseURL), "/")
-	repo = oci.NormalizeRegistryRepo(baseURL, repo)
+	var ref oci.Reference
+	var refErr error
+	if explicitRegistry {
+		baseURL = strings.TrimRight(baseURL, "/")
+		ref, refErr = oci.ParseReferenceAt(image, baseURL)
+	} else {
+		ref, refErr = oci.ParseReference(image)
+		baseURL = ref.BaseURL()
+	}
+	if refErr != nil {
+		return nil, fmt.Errorf("gvx: %q is neither an image archive file nor a valid image reference: %w", image, refErr)
+	}
+	repo, tag := ref.Repository, ref.ManifestReference()
 
-	img, pullErr := oci.PullRegistryImage(ctx, nil, baseURL, repo, ref, arch, cache)
+	img, pullErr := oci.PullRegistryImage(ctx, nil, baseURL, repo, tag, arch, cache)
 	if pullErr == nil {
 		return img, nil
 	}
@@ -246,7 +288,7 @@ func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, ar
 		return nil, pullErr
 	}
 
-	cached, cacheErr := cache.LoadCachedImage(baseURL, repo, ref, arch)
+	cached, cacheErr := cache.LoadCachedImage(baseURL, repo, tag, arch)
 	if cacheErr == nil {
 		return cached, nil
 	}
@@ -259,7 +301,7 @@ func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, ar
 			return nil, errors.Join(pullErr, err)
 		}
 		if defaultCache.Dir() != cache.Dir() {
-			imported, err := cache.ImportCachedImage(defaultCache, baseURL, repo, ref, arch)
+			imported, err := cache.ImportCachedImage(defaultCache, baseURL, repo, tag, arch)
 			if err == nil {
 				return imported, nil
 			}
@@ -276,14 +318,4 @@ func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, ar
 func isNetworkError(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr)
-}
-
-func splitImageRef(image string) (repo, ref string) {
-	ref = "latest"
-	repo = image
-	if colon := strings.LastIndexByte(image, ':'); colon != -1 && !strings.Contains(image[colon:], "/") {
-		repo = image[:colon]
-		ref = image[colon+1:]
-	}
-	return repo, ref
 }

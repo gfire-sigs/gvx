@@ -474,9 +474,21 @@ type imageRecord struct {
 	Format    string   `json:"format"`
 	Manifests [][]byte `json:"manifests"`
 	Config    []byte   `json:"config"`
+	// Source is sourceArchive for an image that came from an archive. Other
+	// records came from a registry. Records written before the field existed
+	// have none, which means a registry.
+	Source string `json:"source,omitempty"`
+	// OriginBaseURL and OriginRepository name the registry that holds the
+	// original blobs when a tag copied the record to another name.
+	OriginBaseURL    string `json:"originBaseURL,omitempty"`
+	OriginRepository string `json:"originRepository,omitempty"`
 }
 
-const imageRecordVersion = 2
+const (
+	imageRecordVersion = 2
+	// sourceArchive marks an image whose original layer blobs are not in any registry.
+	sourceArchive = "archive"
+)
 
 func cacheKey(format string, parts ...string) string {
 	parts = append([]string{format}, parts...)
@@ -496,8 +508,25 @@ func (c *LayerCache) tagRecordPath(baseURL, repository, tag, arch string) string
 	return filepath.Join(c.dir, tagPrefix+cacheKey(c.format(), strings.ToLower(baseURL), repository, tag, arch)+cacheJSONSuffix)
 }
 
+// tagRecord maps a tag, or a digest reference, to a manifest digest. Records
+// from before tagRecordVersion 2 hold only the digest. The fields that name
+// the reference make the record listable, and every later write adds them.
 type tagRecord struct {
 	Digest string `json:"digest"`
+
+	Version      int    `json:"version,omitempty"`
+	BaseURL      string `json:"baseURL,omitempty"`
+	Repository   string `json:"repository,omitempty"`
+	Architecture string `json:"architecture,omitempty"`
+	// Tag is the tag. A reference by digest stores the digest here.
+	Tag string `json:"tag,omitempty"`
+}
+
+const tagRecordVersion = 2
+
+// named reports whether the record carries the names of its reference.
+func (r tagRecord) named() bool {
+	return r.Version >= tagRecordVersion && r.Repository != "" && r.Tag != "" && isDigestRef(r.Digest)
 }
 
 // storeImage records a resolved image under its manifest digest.
@@ -512,9 +541,13 @@ func (c *LayerCache) storeImage(rec imageRecord) error {
 	return writeFileAtomic(filepath.Dir(p), filepath.Base(p), raw)
 }
 
-// storeTag records the manifest digest that a tag pointed to.
+// storeTag records the manifest digest that a tag pointed to. A digest
+// reference passes the digest as tag.
 func (c *LayerCache) storeTag(baseURL, repository, tag, arch, digest string) error {
-	raw, err := json.Marshal(tagRecord{Digest: digest})
+	raw, err := json.Marshal(tagRecord{
+		Digest: digest, Version: tagRecordVersion,
+		BaseURL: baseURL, Repository: repository, Tag: tag, Architecture: arch,
+	})
 	if err != nil {
 		return fmt.Errorf("oci: encode tag record: %w", err)
 	}
@@ -550,23 +583,39 @@ func (c *LayerCache) LoadCachedImage(baseURL, repository, reference, targetArch 
 	return img, nil
 }
 
-// loadImageByDigest loads and re-verifies the record of a manifest digest.
-func (c *LayerCache) loadImageByDigest(baseURL, repository, digest, arch string) (*ResolvedImage, error) {
-	raw, err := readFileShared(c.imageRecordPath(baseURL, repository, digest, arch))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, ErrNotCached
-		}
-		return nil, fmt.Errorf("oci: read image record: %w", err)
-	}
+// decodedRecord is the verified content of an image record.
+type decodedRecord struct {
+	manifest ImageManifest
+	// manifestBody is the verbatim body of the image manifest.
+	manifestBody []byte
+	config       []byte
+	cfg          RuntimeConfig
+	// layerHex lists the cache keys of the layers, from the lowest up.
+	layerHex []string
+}
+
+// decodeRecord parses an image record and re-derives the image from its
+// verbatim blobs. A non-empty digest or arch must equal the one in the
+// record. It returns ErrNotCached for a record that is stale, belongs to
+// another format, or fails verification.
+func (c *LayerCache) decodeRecord(raw []byte, digest, arch string) (imageRecord, *decodedRecord, error) {
 	var rec imageRecord
 	if err := json.Unmarshal(raw, &rec); err != nil || rec.Version != imageRecordVersion || len(rec.Manifests) == 0 ||
-		rec.Digest != digest || rec.Architecture != arch || rec.Format != c.format() {
-		return nil, ErrNotCached
+		(digest != "" && rec.Digest != digest) || (arch != "" && rec.Architecture != arch) || rec.Format != c.format() {
+		return imageRecord{}, nil, ErrNotCached
 	}
+	dec, err := c.verifyRecord(rec)
+	if err != nil {
+		return imageRecord{}, nil, err
+	}
+	return rec, dec, nil
+}
 
-	// Re-derive the image from the verbatim blobs. A record that was edited
-	// after it was written no longer matches the digest that names it.
+// verifyRecord re-derives the image from the verbatim blobs of rec. A record
+// that was edited after it was written no longer matches the digest that
+// names it.
+func (c *LayerCache) verifyRecord(rec imageRecord) (*decodedRecord, error) {
+	digest, arch := rec.Digest, rec.Architecture
 	byDigest := make(map[string][]byte, len(rec.Manifests))
 	for _, m := range rec.Manifests {
 		sum := sha256.Sum256(m)
@@ -596,30 +645,51 @@ func (c *LayerCache) loadImageByDigest(baseURL, repository, digest, arch string)
 	if err != nil {
 		return nil, fmt.Errorf("oci: cached image record is invalid: %w", err)
 	}
-
-	digests := make([]string, 0, len(res.Manifest.Layers))
-	paths := make([]string, 0, len(res.Manifest.Layers))
+	layerHex := make([]string, 0, len(res.Manifest.Layers))
 	for _, l := range res.Manifest.Layers {
 		hexStr, err := parseDigest(l.Digest)
 		if err != nil {
 			return nil, fmt.Errorf("oci: cached image record is invalid: %w", err)
 		}
+		layerHex = append(layerHex, hexStr)
+	}
+	return &decodedRecord{
+		manifest: res.Manifest, manifestBody: res.Chain[len(res.Chain)-1],
+		config: rec.Config, cfg: cfg, layerHex: layerHex,
+	}, nil
+}
+
+// loadImageByDigest loads and re-verifies the record of a manifest digest.
+func (c *LayerCache) loadImageByDigest(baseURL, repository, digest, arch string) (*ResolvedImage, error) {
+	raw, err := readFileShared(c.imageRecordPath(baseURL, repository, digest, arch))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotCached
+		}
+		return nil, fmt.Errorf("oci: read image record: %w", err)
+	}
+	_, dec, err := c.decodeRecord(raw, digest, arch)
+	if err != nil {
+		return nil, err
+	}
+
+	paths := make([]string, 0, len(dec.layerHex))
+	for _, hexStr := range dec.layerHex {
 		p, ok := c.HasLayer(hexStr)
 		if !ok {
 			return nil, ErrNotCached
 		}
-		digests = append(digests, hexStr)
 		paths = append(paths, p)
 	}
-	handles, err := c.OpenLayerHandles(digests)
+	handles, err := c.OpenLayerHandles(dec.layerHex)
 	if err != nil {
 		return nil, ErrNotCached
 	}
 	return &ResolvedImage{
 		Architecture:   arch,
-		Config:         cfg,
+		Config:         dec.cfg,
 		ManifestDigest: digest,
-		LayerDigests:   digests,
+		LayerDigests:   dec.layerHex,
 		LayerPaths:     paths,
 		LayerFiles:     handles,
 	}, nil
@@ -656,10 +726,8 @@ func (c *LayerCache) ImportCachedImage(src *LayerCache, baseURL, repository, ref
 	if err := writeFileAtomic(filepath.Dir(p), filepath.Base(p), rawRec); err != nil {
 		return nil, err
 	}
-	if !isDigestRef(reference) {
-		if err := c.storeTag(baseURL, repository, reference, targetArch, img.ManifestDigest); err != nil {
-			return nil, err
-		}
+	if err := c.storeTag(baseURL, repository, reference, targetArch, img.ManifestDigest); err != nil {
+		return nil, err
 	}
 	return c.LoadCachedImage(baseURL, repository, reference, targetArch)
 }

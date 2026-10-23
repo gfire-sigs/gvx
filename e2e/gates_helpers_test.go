@@ -169,6 +169,17 @@ type guestSpec struct {
 	stdin     io.Reader
 	tty       bool
 	timeout   time.Duration
+
+	// The Docker run settings. A zero value leaves the default.
+	cmd           []string
+	entrypoint    []string
+	entrypointSet bool
+	user          string
+	hostname      string
+	resources     gvx.Resources
+	mounts        []gvx.Mount
+	readOnlyRoot  bool
+	publishAll    bool
 }
 
 func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
@@ -184,7 +195,16 @@ func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
 		OCICacheDir:         cache,
 		WorkspacePath:       g.workspace,
 		Argv:                g.argv,
+		Cmd:                 g.cmd,
+		Entrypoint:          g.entrypoint,
+		EntrypointSet:       g.entrypointSet,
 		Envv:                g.envv,
+		User:                g.user,
+		Hostname:            g.hostname,
+		Resources:           g.resources,
+		Mounts:              g.mounts,
+		ReadOnlyRoot:        g.readOnlyRoot,
+		PublishAll:          g.publishAll,
 		Stdin:               g.stdin,
 		Stdout:              stdout,
 		Stderr:              stderr,

@@ -13,7 +13,7 @@ Running Linux binaries or container images on Windows and macOS usually forces a
 | Runtime Model | Host Targets | Cold Start | Memory Overhead | Admin / `sudo` Required | 4KB `mmap(MAP_FIXED)` | Direct OCI Image Run |
 | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
 | **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows & macOS (`amd64`, `arm64`) | `~20 ms` | `~30 MiB` | No (AppContainer / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
-| **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k` build); unavailable on Windows and macOS `amd64` | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt) | 16KB host pages, native stub tasks | Yes (In-Memory Tar-to-EROFS) |
+| **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k` build); Windows ARM64; trusted Windows AMD64 | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt or AppContainer) | Native stub tasks | Yes (In-Memory Tar-to-EROFS) |
 | **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
 | **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
 
@@ -47,6 +47,7 @@ Use these steps to compile `rungv` and run an unmodified OCI image on Windows or
 3. Pass `-net=wg` with a WireGuard configuration file when strict L3 host LAN isolation is required.
 4. Select the guest architecture with `-arch`. The hardware backends accept only the host architecture.
 5. Run `rungv stub` to probe the `systrap` engine. The command exits with status 1 and prints the typed error when the engine is unavailable.
+6. Use the Docker flags `-e`, `-u`, `-v`, `-m`, `--cpus`, `-P`, `--read-only`, and `--tmpfs`, and the image commands `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, and `logout`. The reference [`docs/cli.md`](docs/cli.md) lists every flag and every difference from Docker.
 
 ```bash
 # Build on macOS (Apple Silicon arm64 or Intel amd64) and apply free ad-hoc hypervisor signature
@@ -180,7 +181,7 @@ Direct WHPX sandboxes can map one partition per source process. `NewProcess` giv
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
-`systrap` is implemented for macOS `arm64` only, and it needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). A Linux `ET_EXEC` image at `0x400000` does not load. On Windows, `New()` returns `*ErrUnavailable`. On macOS `amd64`, the project dropped the Rosetta 2 engine. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
+`systrap` runs on macOS `arm64` and on Windows. The macOS engine needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). The macOS engine cannot load an `ET_EXEC` image, because every `arm64` task has a 4GB `PAGEZERO`. Run such an image with `-platform=hvf`. The Windows engine runs on `amd64` and `arm64`, needs no hypervisor, and puts the guest above 16TB. It also holds the range from `0x10000` to `0x7FFE0000`, so an `ET_EXEC` image runs at the address that it links to. [`docs/systrap-windows.md`](docs/systrap-windows.md) records its measurements, design, and limits. Windows ARM64 seals native syscall instructions and confines Sentry and stubs in separate AppContainers. Windows AMD64 requires `-lockdown=false` and trusted guests. On macOS `amd64`, the project dropped the Rosetta 2 engine. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
 
 ### 3.2 Dual-Track Netstack and Port Forwarding (`pkg/netbackend`)
 
@@ -204,7 +205,7 @@ On Windows, every open call sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHAR
 
 ### 3.5 Unprivileged Self-Lockdown (`pkg/hostlockdown`)
 
-`rungv` enables host containment by default. On Windows, `NewProcess` prepares OCI layers and starts Sentry inside an AppContainer without network capabilities. The broker opens WHPX and maps worker pages through `WHvMapGpaRange2`. The worker token restricts existing and new Go threads.
+`rungv` enables host containment by default. On Windows, `NewProcess` prepares OCI layers and starts Sentry inside an AppContainer without network capabilities. The broker opens WHPX and maps worker pages through `WHvMapGpaRange2`. For ARM64 systrap, it creates separate AppContainer stubs and needs no hypervisor. The worker token restricts existing and new Go threads.
 
 The broker supplies NAT sockets, declared port forwarders, and the single WireGuard socket. It denies every network operation in `none` mode. NAT enforces `IsolateLAN` in the broker. WireGuard pins both the peer address and port. The worker cannot open a direct host connection in any mode.
 
@@ -233,6 +234,7 @@ Read the architecture plan and agent operating manual before modifying any packa
 | Document | Audience | Scope Description |
 | :--- | :--- | :--- |
 | [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync pipeline, and M1-M5 milestones. |
+| [`docs/cli.md`](docs/cli.md) | Users & Engineers | Every `rungv` command, every flag of `rungv run`, the run rules, and the differences from Docker. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 rules, package import boundaries, and verification gates. |
 
 ---
@@ -274,7 +276,7 @@ This table maps each implementation milestone to its deliverables and verificati
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | Boot static `busybox` (`PID 1`) via `platform/whpx` (Windows) and `platform/hvf` (macOS) on `amd64` and `arm64` and reach an interactive `busybox ash` prompt. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | Implement `clone`, `futex`, signals, TLS (`ARCH_SET_FS` & `TPIDR_EL0`), VDSO, `pkg/netbackend` (`-net=nat -p` & `-net=wg`), and `pkg/oci`. Boot `alpine:3.20` and `nginx:alpine`. |
 | **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | Pass POSIX rename and unlink tests (`git rebase`, `bun install`) on `/workspace` and verify `pkg/hostlockdown` blocks child process spawning on Windows and macOS. |
-| **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap`; `winsystrap` is not implemented)** | Lazy page-trap `arm64asm` syscall patcher, trampoline islands, and `sysmsg` stub subprocesses. Status: macOS `arm64` runs real guests and needs `pagesize_16k`. Windows returns `*ErrUnavailable`. The Rosetta 2 and Prism cross-arch engines are dropped. |
+| **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap` and `winsystrap`)** | macOS: lazy page-trap `arm64asm` syscall patcher, trampoline islands, and `sysmsg` stub subprocesses. Windows: stub host, debug object, placeholder window, and the `x86asm` and `brk` patchers. Status: macOS `arm64` runs real guests and needs `pagesize_16k`. Windows `amd64` and `arm64` run real guests. The Rosetta 2 and Prism cross-arch engines are dropped. |
 
 ---
 

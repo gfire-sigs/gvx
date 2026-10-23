@@ -29,15 +29,15 @@ import (
 // Sentry on every thread of the process. The program is the one that runsc
 // builds for the Sentry: an allowlist, where every other system call kills the
 // process. The options follow the config of the Sandbox. The platform adds its
-// own rules, and NAT adds the host socket rules of hostinet. A workspace adds
-// the rules of the host filesystem, which allow opens relative to a directory
-// descriptor only.
+// own rules, and NAT adds the host socket rules of hostinet. A bind or volume
+// mount adds the rules of the host filesystem, which allow opens relative to a
+// directory descriptor only.
 func (s *Sandbox) syscallFilter() func() error {
 	return func() error {
 		opt := config.Options{
 			Platform:       s.plat.SeccompInfo(),
 			HostNetwork:    s.cfg.NetworkMode == NetModeNAT,
-			HostFilesystem: s.cfg.WorkspacePath != "",
+			HostFilesystem: s.cfg.hasHostDirs(),
 			// gvx has no control server. No descriptor has this number.
 			ControllerFD: math.MaxUint32,
 		}
@@ -108,7 +108,7 @@ func embedderRules(cfg Config) seccomp.SyscallRules {
 	// The Go runtime reads the CPU affinity mask once a second to adjust
 	// GOMAXPROCS. The call reads one mask and has no side effect.
 	rules.Add(unix.SYS_SCHED_GETAFFINITY, seccomp.MatchAll{})
-	if cfg.WorkspacePath != "" {
+	if cfg.hasHostDirs() {
 		// os.Root.Rename calls renameat. The host filesystem rules of runsc
 		// have only renameat2.
 		rules.Add(unix.SYS_RENAMEAT, seccomp.PerArg{

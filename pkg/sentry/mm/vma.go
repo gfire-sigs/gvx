@@ -190,7 +190,7 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 
 	// Does the provided suggestion work?
 	if ar, ok := opts.Addr.ToRange(length); ok {
-		if allowedAR.IsSupersetOf(ar) {
+		if allowedAR.IsSupersetOf(ar) && !mm.overlapsHole(ar) {
 			if opts.Unmap {
 				return ar.Start, nil
 			}
@@ -225,12 +225,12 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 	}
 
 	if opts.Map32Bit {
-		return mm.findLowestAvailableLocked(length, alignment, allowedAR)
+		return mm.findAvoidingHoleLocked(length, alignment, allowedAR, false)
 	}
 	if mm.layout.DefaultDirection == arch.MmapBottomUp {
-		return mm.findLowestAvailableLocked(length, alignment, hostarch.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr})
+		return mm.findAvoidingHoleLocked(length, alignment, hostarch.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr}, false)
 	}
-	return mm.findHighestAvailableLocked(length, alignment, hostarch.AddrRange{mm.layout.MinAddr, mm.layout.TopDownBase})
+	return mm.findAvoidingHoleLocked(length, alignment, hostarch.AddrRange{mm.layout.MinAddr, mm.layout.TopDownBase}, true)
 }
 
 func (mm *MemoryManager) applicationAddrRange() hostarch.AddrRange {

@@ -59,7 +59,7 @@ func runAppContainerWorker() error {
 	if connection != nil {
 		connection.Close()
 	}
-	report.Status, err = Apply(Options{WorkspacePath: input.Workspace})
+	report.Status, err = Apply(Options{Mounts: []HostMount{{Path: input.Workspace}}})
 	if err != nil {
 		return err
 	}

@@ -41,6 +41,10 @@ type ProcessOptions struct {
 	Files                 []*os.File
 	WorkspacePath         string
 	WorkspaceReadOnly     bool
+	Mounts                []HostMount
+	Suspended             bool
+	DisableWin32k         bool
+	CPUQuotaMillis        int64
 }
 
 // Process owns one AppContainer, its child, and a job that kills the child on close.
@@ -48,10 +52,13 @@ type ProcessOptions struct {
 type Process struct {
 	mu        sync.Mutex
 	process   windows.Handle
+	thread    windows.Handle
+	pid       uint32
 	job       windows.Handle
 	profile   string
 	directory string
 	workspace string
+	mounts    []string
 	sid       *windows.SID
 	closed    bool
 	waiters   sync.WaitGroup
@@ -74,8 +81,16 @@ var (
 // The executable must implement the caller's worker protocol. It cannot create a WHPX partition.
 // Close the returned Process after Wait, including when initialization fails.
 func StartProcess(opts ProcessOptions) (_ *Process, err error) {
-	if opts.Executable == "" || opts.Stdin == nil || opts.Stdout == nil || opts.Stderr == nil {
-		return nil, errors.New("hostlockdown: an executable and three standard files are required")
+	standard := []*os.File{opts.Stdin, opts.Stdout, opts.Stderr}
+	hasStreams := opts.Stdin != nil || opts.Stdout != nil || opts.Stderr != nil
+	if opts.Executable == "" || hasStreams && (opts.Stdin == nil || opts.Stdout == nil || opts.Stderr == nil) {
+		return nil, errors.New("hostlockdown: an executable and either zero or three standard files are required")
+	}
+	if !hasStreams {
+		standard = nil
+	}
+	if err := validateMounts(opts.Mounts); err != nil {
+		return nil, err
 	}
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
@@ -109,11 +124,21 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 		return nil, err
 	}
 	if opts.WorkspacePath != "" {
-		p.workspace, err = resolveWorkspace(opts.WorkspacePath)
+		p.workspace, err = resolveMount(opts.WorkspacePath)
 		if err != nil {
 			return nil, err
 		}
 		if err := prepareWorkspace(p.workspace, p.sid, opts.WorkspaceReadOnly); err != nil {
+			return nil, err
+		}
+	}
+	for _, mount := range opts.Mounts {
+		real, err := resolveMount(mount.Path)
+		if err != nil {
+			return nil, err
+		}
+		p.mounts = append(p.mounts, real)
+		if err := prepareWorkspace(real, p.sid, mount.ReadOnly); err != nil {
 			return nil, err
 		}
 	}
@@ -125,7 +150,7 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 			_ = windows.CloseHandle(h)
 		}
 	}()
-	for _, file := range append([]*os.File{opts.Stdin, opts.Stdout, opts.Stderr}, opts.Files...) {
+	for _, file := range append(standard, opts.Files...) {
 		if file == nil {
 			return nil, errors.New("hostlockdown: inherited file is nil")
 		}
@@ -135,7 +160,14 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 		}
 		inherited = append(inherited, duplicate)
 	}
-	attrs, err := windows.NewProcThreadAttributeList(2)
+	attributeCount := uint32(1)
+	if len(inherited) > 0 {
+		attributeCount++
+	}
+	if opts.DisableWin32k {
+		attributeCount++
+	}
+	attrs, err := windows.NewProcThreadAttributeList(attributeCount)
 	if err != nil {
 		return nil, err
 	}
@@ -144,8 +176,16 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 	if err := attrs.Update(0x20009, unsafe.Pointer(&caps), unsafe.Sizeof(caps)); err != nil {
 		return nil, fmt.Errorf("hostlockdown: set AppContainer capabilities: %w", err)
 	}
-	if err := attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&inherited[0]), uintptr(len(inherited))*unsafe.Sizeof(inherited[0])); err != nil {
-		return nil, fmt.Errorf("hostlockdown: set inherited files: %w", err)
+	if len(inherited) > 0 {
+		if err := attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&inherited[0]), uintptr(len(inherited))*unsafe.Sizeof(inherited[0])); err != nil {
+			return nil, fmt.Errorf("hostlockdown: set inherited files: %w", err)
+		}
+	}
+	if opts.DisableWin32k {
+		policy := uint64(1 << 28)
+		if err := attrs.Update(0x20007, unsafe.Pointer(&policy), unsafe.Sizeof(policy)); err != nil {
+			return nil, err
+		}
 	}
 	args := append([]string{executable}, opts.Arguments...)
 	command, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(args))
@@ -159,7 +199,7 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 			environment = append(environment, key+"="+value)
 		}
 	}
-	for i, h := range inherited[3:] {
+	for i, h := range inherited[len(standard):] {
 		environment = append(environment, fmt.Sprintf("GVX_WORKER_FD_%d=%d", i, h))
 	}
 	if os.Getenv("GVX_DEBUG_LOG") == "1" {
@@ -173,15 +213,29 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 	}
 	si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
 	si.Cb = uint32(unsafe.Sizeof(si))
-	si.Flags = windows.STARTF_USESTDHANDLES
-	si.StdInput, si.StdOutput, si.StdErr = inherited[0], inherited[1], inherited[2]
+	if hasStreams {
+		si.Flags = windows.STARTF_USESTDHANDLES
+		si.StdInput, si.StdOutput, si.StdErr = inherited[0], inherited[1], inherited[2]
+	}
 	var pi windows.ProcessInformation
 	flags := uint32(windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NO_WINDOW | windows.CREATE_SUSPENDED)
-	if err := windows.CreateProcess(nil, command, nil, nil, true, flags, &block[0], directory, &si.StartupInfo, &pi); err != nil {
+	if err := windows.CreateProcess(nil, command, nil, nil, len(inherited) > 0, flags, &block[0], directory, &si.StartupInfo, &pi); err != nil {
 		return nil, fmt.Errorf("hostlockdown: start AppContainer worker: %w", err)
 	}
 	p.process = pi.Process
-	defer windows.CloseHandle(pi.Thread)
+	if opts.DisableWin32k {
+		var policy processMitigationSystemCallDisablePolicy
+		result, _, callErr := procGetProcessMitigationPolicy.Call(uintptr(p.process), processSystemCallDisablePolicy, uintptr(unsafe.Pointer(&policy)), unsafe.Sizeof(policy))
+		if result == 0 {
+			_ = windows.CloseHandle(pi.Thread)
+			return nil, fmt.Errorf("hostlockdown: read worker win32k policy: %w", callErr)
+		}
+		if policy.Flags&disallowWin32kSystemCalls == 0 {
+			_ = windows.CloseHandle(pi.Thread)
+			return nil, errors.New("hostlockdown: worker win32k calls remain enabled")
+		}
+	}
+	p.thread, p.pid = pi.Thread, pi.ProcessId
 	runtime.KeepAlive(inherited)
 	p.job, err = windows.CreateJobObject(nil, nil)
 	if err != nil {
@@ -200,8 +254,15 @@ func StartProcess(opts ProcessOptions) (_ *Process, err error) {
 	if err := windows.AssignProcessToJobObject(p.job, p.process); err != nil {
 		return nil, fmt.Errorf("hostlockdown: assign worker job: %w", err)
 	}
-	if _, err := windows.ResumeThread(pi.Thread); err != nil {
-		return nil, fmt.Errorf("hostlockdown: resume worker: %w", err)
+	if opts.CPUQuotaMillis > 0 {
+		if err := setJobCPURate(p.job, opts.CPUQuotaMillis); err != nil {
+			return nil, err
+		}
+	}
+	if !opts.Suspended {
+		if _, err := windows.ResumeThread(pi.Thread); err != nil {
+			return nil, fmt.Errorf("hostlockdown: resume worker: %w", err)
+		}
 	}
 	return p, nil
 }
@@ -223,6 +284,24 @@ func copyProgram(destination, source string) (err error) {
 
 // Handle borrows the process object until Close. Only the trusted broker may use it.
 func (p *Process) Handle() uintptr { return uintptr(p.process) }
+
+// InitialThread borrows the primary thread until Close. Suspended workers have not run it.
+func (p *Process) InitialThread() uintptr { return uintptr(p.thread) }
+func (p *Process) ID() uint32             { return p.pid }
+
+// RemovePrivileges strips privileges after the program completes its loader initialization.
+func (p *Process) RemovePrivileges() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return os.ErrClosed
+	}
+	var token windows.Token
+	if err := windows.OpenProcessToken(p.process, windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, &token); err != nil {
+		return err
+	}
+	return errors.Join(removeAllTokenPrivileges(token), token.Close())
+}
 
 // Wait waits for child exit. Close can interrupt Wait by terminating the child.
 func (p *Process) Wait() (uint32, error) {
@@ -300,8 +379,15 @@ func (p *Process) Close() error {
 		errs = append(errs, windows.CloseHandle(p.job))
 		p.job = 0
 	}
+	if p.thread != 0 {
+		errs = append(errs, windows.CloseHandle(p.thread))
+		p.thread = 0
+	}
 	if p.workspace != "" && p.sid != nil {
 		errs = append(errs, revokeWorkspaceSID(p.workspace, p.sid))
+	}
+	for _, mount := range p.mounts {
+		errs = append(errs, revokeWorkspaceSID(mount, p.sid))
 	}
 	if p.profile != "" {
 		name, err := windows.UTF16PtrFromString(p.profile)

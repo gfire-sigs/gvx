@@ -265,9 +265,20 @@ func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedI
 		return nil, err
 	}
 
+	digests, err := a.compileOCILayers(res.Manifest.Layers)
+	if err != nil {
+		return nil, err
+	}
+	return a.cache.finishImage(targetArch, cfg, "", digests)
+}
+
+// compileOCILayers compiles the layer blobs of an OCI manifest from the archive
+// into the cache and returns their cache keys. It skips a layer that the cache
+// already holds.
+func (a *archive) compileOCILayers(layers []Descriptor) ([]string, error) {
 	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
-	digests := make([]string, 0, len(res.Manifest.Layers))
-	for _, l := range res.Manifest.Layers {
+	digests := make([]string, 0, len(layers))
+	for _, l := range layers {
 		if err := checkLayerDescriptor(l, a.cache.limits); err != nil {
 			return nil, err
 		}
@@ -288,7 +299,7 @@ func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedI
 		}
 		digests = append(digests, hexStr)
 	}
-	return a.cache.finishImage(targetArch, cfg, "", digests)
+	return digests, nil
 }
 
 // dockerSaveEntry is one image of a `docker save` manifest.json.
@@ -301,6 +312,33 @@ type dockerSaveEntry struct {
 // loadDockerSave resolves a `docker save` archive. It has no layer digests, so
 // the config's diff IDs verify the layers.
 func (a *archive) loadDockerSave(targetArch string) (*ResolvedImage, error) {
+	entries, err := a.dockerSaveEntries()
+	if err != nil {
+		return nil, err
+	}
+	var firstErr error
+	for _, e := range entries {
+		img, skip, err := a.compileDockerSaveEntry(e, targetArch)
+		if skip {
+			// A multi-image archive can hold other architectures.
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return a.cache.finishImage(targetArch, img.cfg, "", img.digests)
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return nil, errors.New("oci: manifest.json lists no images")
+}
+
+// dockerSaveEntries parses manifest.json.
+func (a *archive) dockerSaveEntries() ([]dockerSaveEntry, error) {
 	raw, err := a.readJSON("manifest.json")
 	if err != nil {
 		return nil, err
@@ -309,62 +347,69 @@ func (a *archive) loadDockerSave(targetArch string) (*ResolvedImage, error) {
 	if err := json.Unmarshal(raw, &entries); err != nil {
 		return nil, fmt.Errorf("oci: parse manifest.json: %w", err)
 	}
+	return entries, nil
+}
 
-	var firstErr error
-	for _, e := range entries {
-		cfgName, err := cleanTarPath(e.Config)
-		if err != nil {
-			return nil, err
-		}
-		cfgBytes, err := a.readJSON(cfgName)
-		if err != nil {
-			return nil, err
-		}
-		cfg, err := parseImageConfig(cfgBytes, targetArch, len(e.Layers))
-		if err != nil {
-			// A multi-image archive can hold other architectures.
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		var parsed imageConfigFile
-		if err := json.Unmarshal(cfgBytes, &parsed); err != nil {
-			return nil, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
-		}
-		if len(parsed.RootFS.DiffIDs) != len(e.Layers) {
-			return nil, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", len(parsed.RootFS.DiffIDs), len(e.Layers))
-		}
+// dockerSaveImage is one compiled image of a `docker save` archive.
+type dockerSaveImage struct {
+	cfgBytes []byte
+	cfg      RuntimeConfig
+	// diffIDs are the diff IDs of the config, one per layer.
+	diffIDs []string
+	// digests are the cache keys of the layers, which are the diff ID hex.
+	digests []string
+	// layerSizes are the sizes of the layer members in the archive.
+	layerSizes []int64
+}
 
-		image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
-		digests := make([]string, 0, len(e.Layers))
-		for i, layer := range e.Layers {
-			diffHex, err := parseDigest(parsed.RootFS.DiffIDs[i])
-			if err != nil {
-				return nil, err
-			}
-			name, err := cleanTarPath(layer)
-			if err != nil {
-				return nil, err
-			}
-			if _, ok := a.cache.HasLayer(diffHex); !ok {
-				sr, ok := a.reader(name)
-				if !ok {
-					return nil, fmt.Errorf("oci: layer %q is missing from the archive", layer)
-				}
-				spec := layerSpec{key: diffHex, blobSize: -1, diffID: diffHex, image: image}
-				if _, _, err := a.cache.compileAndStore(spec, sr); err != nil {
-					return nil, fmt.Errorf("oci: compile layer %q: %w", layer, err)
-				}
-			}
-			digests = append(digests, diffHex)
+// compileDockerSaveEntry compiles the layers of one manifest.json entry. skip
+// is true, with the cause in err, when the entry is for another architecture.
+func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (img *dockerSaveImage, skip bool, err error) {
+	cfgName, err := cleanTarPath(e.Config)
+	if err != nil {
+		return nil, false, err
+	}
+	cfgBytes, err := a.readJSON(cfgName)
+	if err != nil {
+		return nil, false, err
+	}
+	cfg, err := parseImageConfig(cfgBytes, targetArch, len(e.Layers))
+	if err != nil {
+		return nil, true, err
+	}
+	var parsed imageConfigFile
+	if err := json.Unmarshal(cfgBytes, &parsed); err != nil {
+		return nil, false, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
+	}
+	if len(parsed.RootFS.DiffIDs) != len(e.Layers) {
+		return nil, false, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", len(parsed.RootFS.DiffIDs), len(e.Layers))
+	}
+
+	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
+	out := &dockerSaveImage{cfgBytes: cfgBytes, cfg: cfg, diffIDs: parsed.RootFS.DiffIDs}
+	for i, layer := range e.Layers {
+		diffHex, err := parseDigest(parsed.RootFS.DiffIDs[i])
+		if err != nil {
+			return nil, false, err
 		}
-		return a.cache.finishImage(targetArch, cfg, "", digests)
+		name, err := cleanTarPath(layer)
+		if err != nil {
+			return nil, false, err
+		}
+		if _, ok := a.cache.HasLayer(diffHex); !ok {
+			sr, ok := a.reader(name)
+			if !ok {
+				return nil, false, fmt.Errorf("oci: layer %q is missing from the archive", layer)
+			}
+			spec := layerSpec{key: diffHex, blobSize: -1, diffID: diffHex, image: image}
+			if _, _, err := a.cache.compileAndStore(spec, sr); err != nil {
+				return nil, false, fmt.Errorf("oci: compile layer %q: %w", layer, err)
+			}
+		}
+		out.digests = append(out.digests, diffHex)
+		out.layerSizes = append(out.layerSizes, a.members[name].size)
 	}
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	return nil, errors.New("oci: manifest.json lists no images")
+	return out, false, nil
 }
 
 // loadRootfs compiles an archive that is itself a root filesystem tarball.

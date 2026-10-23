@@ -78,6 +78,23 @@ func run(worker bool) int {
 	wgPrivate := flag.String("wg-private", "", "hex WireGuard private key of the guest")
 	wgPeerPublic := flag.String("wg-peer-public", "", "hex WireGuard public key of the peer")
 	wgEndpoint := flag.String("wg-endpoint", "", "WireGuard peer host:port")
+	var mounts []gvx.Mount
+	flag.Func("volume", "guest mount in -v form src:dst[:ro|rw]; repeatable", func(spec string) error {
+		m, err := gvx.ParseVolume(spec)
+		mounts = append(mounts, m)
+		return err
+	})
+	flag.Func("mount", "guest mount in --mount form; repeatable", func(spec string) error {
+		m, err := gvx.ParseMount(spec)
+		mounts = append(mounts, m)
+		return err
+	})
+	flag.Func("tmpfs", "guest tmpfs in --tmpfs form; repeatable", func(spec string) error {
+		m, err := gvx.ParseTmpfs(spec)
+		mounts = append(mounts, m)
+		return err
+	})
+	readOnlyRoot := flag.Bool("read-only-root", false, "mount the guest root file system read-only")
 	flag.Parse()
 
 	cfg := gvx.Config{
@@ -87,6 +104,8 @@ func run(worker bool) int {
 		OCIImage:            *image,
 		Argv:                flag.Args(),
 		WorkspacePath:       *workspace,
+		Mounts:              mounts,
+		ReadOnlyRoot:        *readOnlyRoot,
 		OCICacheDir:         *cacheDir,
 		DisableHostLockdown: !*lockdown,
 	}

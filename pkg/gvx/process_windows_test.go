@@ -44,18 +44,25 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func requireProcessHypervisor(t *testing.T) {
+func processTestPlatforms(t *testing.T) []PlatformType {
 	t.Helper()
-	platform, err := whpx.New()
-	if errors.Is(err, whpx.ErrUnsupported) {
-		t.Skip(err)
+	var platforms []PlatformType
+	if runtime.GOARCH == "arm64" {
+		platforms = append(platforms, PlatformSystrap)
 	}
-	if err != nil {
+	p, err := whpx.New()
+	if err == nil {
+		if err := p.Close(); err != nil {
+			t.Fatal(err)
+		}
+		platforms = append(platforms, PlatformWHPX)
+	} else if !errors.Is(err, whpx.ErrUnsupported) {
 		t.Fatal(err)
 	}
-	if err := platform.Close(); err != nil {
-		t.Fatal(err)
+	if len(platforms) == 0 {
+		t.Skip("no confined execution platform is available")
 	}
+	return platforms
 }
 
 func TestWindowsNewRequiresProcessIsolation(t *testing.T) {
@@ -66,7 +73,12 @@ func TestWindowsNewRequiresProcessIsolation(t *testing.T) {
 }
 
 func TestProcessForwardsGuestHTTP(t *testing.T) {
-	requireProcessHypervisor(t)
+	for _, target := range processTestPlatforms(t) {
+		t.Run(string(target), func(t *testing.T) { testProcessForwardsGuestHTTP(t, target) })
+	}
+}
+
+func testProcessForwardsGuestHTTP(t *testing.T, target PlatformType) {
 	workspace := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workspace, "input.txt"), []byte("brokered HTTP\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -82,7 +94,7 @@ func TestProcessForwardsGuestHTTP(t *testing.T) {
 	var stderr bytes.Buffer
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	sandbox, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{NetworkMode: NetModeNAT, ELFBytes: guest, OCICacheDir: t.TempDir(), WorkspacePath: workspace, PortForwards: []PortForward{{HostPort: 0, GuestPort: 8080, Protocol: "tcp"}}, Stderr: &stderr})
+	sandbox, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{Platform: target, NetworkMode: NetModeNAT, ELFBytes: guest, OCICacheDir: t.TempDir(), WorkspacePath: workspace, PortForwards: []PortForward{{HostPort: 0, GuestPort: 8080, Protocol: "tcp"}}, Stderr: &stderr})
 	if err != nil {
 		t.Fatalf("NewProcess: %v; stderr=%s", err, stderr.String())
 	}
@@ -127,7 +139,12 @@ func TestProcessForwardsGuestHTTP(t *testing.T) {
 }
 
 func TestProcessSandboxesHaveIndependentMemory(t *testing.T) {
-	requireProcessHypervisor(t)
+	for _, target := range processTestPlatforms(t) {
+		t.Run(string(target), func(t *testing.T) { testProcessSandboxesHaveIndependentMemory(t, target) })
+	}
+}
+
+func testProcessSandboxesHaveIndependentMemory(t *testing.T, target PlatformType) {
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +160,7 @@ func TestProcessSandboxesHaveIndependentMemory(t *testing.T) {
 			t.Fatal(err)
 		}
 		output := new(bytes.Buffer)
-		sandbox, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{NetworkMode: NetModeNone, ELFBytes: guest, OCICacheDir: t.TempDir(), Stdout: output, Stderr: io.Discard})
+		sandbox, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{Platform: target, NetworkMode: NetModeNone, ELFBytes: guest, OCICacheDir: t.TempDir(), Stdout: output, Stderr: io.Discard})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -180,7 +197,12 @@ func (w *readyOutput) Write(data []byte) (int, error) {
 }
 
 func TestProcessCancellationStopsBlockedGuest(t *testing.T) {
-	requireProcessHypervisor(t)
+	for _, target := range processTestPlatforms(t) {
+		t.Run(string(target), func(t *testing.T) { testProcessCancellationStopsBlockedGuest(t, target) })
+	}
+}
+
+func testProcessCancellationStopsBlockedGuest(t *testing.T, target PlatformType) {
 	guest, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +220,7 @@ func TestProcessCancellationStopsBlockedGuest(t *testing.T) {
 	output := &readyOutput{ready: make(chan struct{})}
 	setupCtx, setupCancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer setupCancel()
-	sandbox, err := NewProcess(setupCtx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{NetworkMode: NetModeNone, ELFBytes: guest, Argv: []string{"/bin/app", "/dev/stdin", "/dev/stdin"}, OCICacheDir: t.TempDir(), Stdin: input, Stdout: output, Stderr: io.Discard})
+	sandbox, err := NewProcess(setupCtx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{Platform: target, NetworkMode: NetModeNone, ELFBytes: guest, Argv: []string{"/bin/app", "/dev/stdin", "/dev/stdin"}, OCICacheDir: t.TempDir(), Stdin: input, Stdout: output, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +255,12 @@ func TestProcessCancellationStopsBlockedGuest(t *testing.T) {
 }
 
 func TestProcessRunsGuestWithoutLockingCaller(t *testing.T) {
-	requireProcessHypervisor(t)
+	for _, target := range processTestPlatforms(t) {
+		t.Run(string(target), func(t *testing.T) { testProcessRunsGuestWithoutLockingCaller(t, target) })
+	}
+}
+
+func testProcessRunsGuestWithoutLockingCaller(t *testing.T, target PlatformType) {
 	t.Chdir(t.TempDir())
 	guest, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/workspace/result.txt", "isolated guest\n")
 	if err != nil {
@@ -254,7 +281,7 @@ func TestProcessRunsGuestWithoutLockingCaller(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	sandbox, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{Platform: PlatformWHPX, NetworkMode: NetModeNone, ELFBytes: guest, OCICacheDir: t.TempDir(), WorkspacePath: workspace, Stdout: &stdout, Stderr: &stderr})
+	sandbox, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{Platform: target, NetworkMode: NetModeNone, ELFBytes: guest, OCICacheDir: t.TempDir(), WorkspacePath: workspace, Stdout: &stdout, Stderr: &stderr})
 	if err != nil {
 		t.Fatalf("NewProcess: %v; stderr=%s", err, stderr.String())
 	}
@@ -276,5 +303,49 @@ func TestProcessRunsGuestWithoutLockingCaller(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(workspace, "result.txt"))
 	if err != nil || string(content) != "isolated guest\n" {
 		t.Fatalf("workspace result: %q, %v; stderr=%s", content, err, stderr.String())
+	}
+}
+
+func TestProcessMountsAndLimits(t *testing.T) {
+	for _, target := range processTestPlatforms(t) {
+		t.Run(string(target), func(t *testing.T) {
+			dir := t.TempDir()
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			guest, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/data/result.txt", "mounted data")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			sb, err := NewProcess(ctx, WorkerCommand{Executable: executable, Arguments: []string{"gvx-process-worker"}}, Config{
+				Platform: target, NetworkMode: NetModeNone, ELFBytes: guest, OCICacheDir: t.TempDir(), Stderr: &stderr,
+				Mounts: []Mount{{Kind: MountBind, HostPath: dir, GuestPath: "/data"}}, Resources: Resources{MemoryBytes: 64 << 20, CPUMillis: 500},
+			})
+			if err != nil {
+				t.Fatalf("NewProcess: %v; stderr=%s", err, stderr.String())
+			}
+			defer func() {
+				if err := sb.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			want := LimitReport{Memory: true, CPUCount: true, CPUTime: target == PlatformWHPX}
+			if got := sb.Limits(); got != want {
+				t.Fatalf("limits=%+v, want %+v", got, want)
+			}
+			if got := sb.PlatformName(); got != string(target) {
+				t.Fatalf("platform=%s, want %s", got, target)
+			}
+			if code, err := sb.Run(ctx); err != nil || code != 0 {
+				t.Fatalf("Run: %d, %v; stderr=%s", code, err, stderr.String())
+			}
+			if data, err := os.ReadFile(filepath.Join(dir, "result.txt")); err != nil || string(data) != "mounted data" {
+				t.Fatalf("mount data=%q, error=%v", data, err)
+			}
+		})
 	}
 }

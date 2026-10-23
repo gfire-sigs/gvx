@@ -1030,8 +1030,8 @@ func TestDockerConfigHostMatching(t *testing.T) {
 		{"docker.io.evil.example", "https://registry-1.docker.io", false},
 	} {
 		writeDockerConfig(t, tc.key, "u", "p", "")
-		if _, ok := loadDockerConfigAuth(tc.target); ok != tc.want {
-			t.Errorf("config key %q for %s: found = %v, want %v", tc.key, tc.target, ok, tc.want)
+		if _, ok, err := (CredentialStore{}).Lookup(context.Background(), tc.target); err != nil || ok != tc.want {
+			t.Errorf("config key %q for %s: found = %v, err = %v, want found = %v", tc.key, tc.target, ok, err, tc.want)
 		}
 	}
 }

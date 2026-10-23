@@ -115,6 +115,23 @@ func scanARM64(code []byte) []patchSite {
 	return sites
 }
 
+// arm64DCOps lists the `dc` operations by virtual address that a Linux kernel
+// lets EL0 run, with register 0: cvac, cvau, cvap, cvadp, and civac.
+var arm64DCOps = [...]uint32{0xd50b7a20, 0xd50b7b20, 0xd50b7c20, 0xd50b7d20, 0xd50b7e20}
+
+// isDataCacheMaintenance reports whether w is a `dc` operation by virtual
+// address that cleans or invalidates a cache line. Windows raises an illegal
+// instruction exception for it at EL0. The guest memory stays coherent, so the
+// operation has no effect that a guest can observe, and a NOP replaces it.
+func isDataCacheMaintenance(w uint32) bool {
+	for _, op := range arm64DCOps {
+		if w&^arm64RegMask == op {
+			return true
+		}
+	}
+	return false
+}
+
 // encodeBranch returns the B instruction at address from that jumps to to.
 func encodeBranch(from, to uint64) (uint32, error) {
 	if from&3 != 0 || to&3 != 0 {

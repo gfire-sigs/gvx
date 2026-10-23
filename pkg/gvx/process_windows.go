@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 
@@ -28,32 +29,41 @@ import (
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
-	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
+	"z.gfire.dev/gvx/pkg/sentry/platform/systrap"
 	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
 )
 
 type processConfiguration struct {
-	Argv, Envv         []string
-	WorkDir, Workspace string
-	ReadOnly, TTY      bool
-	LayerCount         int
-	Network            NetworkMode
-	IsolateLAN         bool
-	PortForwards       []PortForward
-	WireGuard          *netbackend.WireGuardConfig
-	ConsoleInput       bool
+	Argv, Envv           []string
+	WorkDir, Workspace   string
+	ReadOnly, TTY        bool
+	LayerCount           int
+	Network              NetworkMode
+	IsolateLAN           bool
+	PortForwards         []PortForward
+	WireGuard            *netbackend.WireGuardConfig
+	ConsoleInput         bool
+	Platform             PlatformType
+	Mounts               []Mount
+	User, Hostname, Name string
+	Resources            Resources
+	ReadOnlyRoot         bool
 }
 type processResult struct {
-	Status hostlockdown.Status
-	Code   int
-	Error  string
-	Ports  []int
+	Status      hostlockdown.Status
+	Code        int
+	Error       string
+	MemoryLimit bool
+	Ports       []int
+	Published   []PublishedPort
+	Limits      LimitReport
 }
 
 type processState struct {
 	mu           sync.Mutex
 	child        *hostlockdown.Process
 	broker       *whpx.Broker
+	stubBroker   *systrap.StubBroker
 	network      *networkBroker
 	console      *hostlockdown.ConsoleReader
 	server       *sandboxrpc.Server
@@ -77,8 +87,11 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 	if cfg.DisableHostLockdown {
 		return nil, fmt.Errorf("%w: NewProcess requires host lockdown", ErrInvalidConfig)
 	}
-	if cfg.Platform != PlatformAuto && cfg.Platform != PlatformWHPX {
-		return nil, fmt.Errorf("%w: NewProcess requires WHPX", ErrInvalidConfig)
+	if cfg.Platform != PlatformAuto && cfg.Platform != PlatformWHPX && cfg.Platform != PlatformSystrap {
+		return nil, fmt.Errorf("%w: unsupported Windows process platform", ErrInvalidConfig)
+	}
+	if cfg.Platform == PlatformSystrap && runtime.GOARCH != "arm64" {
+		return nil, fmt.Errorf("%w: confined systrap requires windows/arm64", ErrPlatformUnavailable)
 	}
 	if worker.Executable == "" {
 		return nil, fmt.Errorf("%w: worker executable is required", ErrInvalidConfig)
@@ -94,6 +107,27 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 		return nil, err
 	}
 	cfg = prepared.cfg
+	cfg.PortForwards = prepared.effectivePortForwards()
+	cfg.PublishAll = false
+	if cfg.User == "" && prepared.resolvedImg != nil {
+		cfg.User = prepared.resolvedImg.Config.User
+	}
+	cfg.Mounts = append([]Mount(nil), cfg.Mounts...)
+	for i, mount := range cfg.Mounts {
+		if mount.Kind == MountTmpfs {
+			continue
+		}
+		dir, err := prepared.prepareHostDir(mount)
+		if err != nil {
+			return nil, err
+		}
+		dir, err = filepath.EvalSymlinks(dir)
+		if err != nil {
+			return nil, err
+		}
+		mount.Kind, mount.HostPath, mount.VolumeName, mount.CreateHostPathIfMissing = MountBind, dir, "", false
+		cfg.Mounts[i] = mount
+	}
 	if cfg.WorkspacePath != "" {
 		absolute, err := filepath.Abs(cfg.WorkspacePath)
 		if err != nil {
@@ -202,7 +236,15 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 	if err != nil {
 		return nil, err
 	}
-	files := []*os.File{controlRead, replyWrite, brokerRead, requestWrite}
+	stubRead, stubWrite, err := pipe()
+	if err != nil {
+		return nil, err
+	}
+	stubReplyRead, stubReplyWrite, err := pipe()
+	if err != nil {
+		return nil, err
+	}
+	files := []*os.File{controlRead, replyWrite, brokerRead, requestWrite, stubWrite, stubReplyRead}
 	for _, layer := range prepared.layerHandles {
 		duplicate, err := layer.Dup()
 		if err != nil {
@@ -216,7 +258,13 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 		temporary = append(temporary, file)
 		files = append(files, file)
 	}
-	state.child, err = hostlockdown.StartProcess(hostlockdown.ProcessOptions{Executable: worker.Executable, Arguments: worker.Arguments, Stdin: input, Stdout: stdout, Stderr: stderr, Files: files, WorkspacePath: cfg.WorkspacePath, WorkspaceReadOnly: cfg.WorkspaceReadOnly})
+	var mounts []hostlockdown.HostMount
+	for _, mount := range cfg.mountList() {
+		if mount.Kind != MountTmpfs {
+			mounts = append(mounts, hostlockdown.HostMount{Path: mount.HostPath, ReadOnly: mount.ReadOnly})
+		}
+	}
+	state.child, err = hostlockdown.StartProcess(hostlockdown.ProcessOptions{Executable: worker.Executable, Arguments: worker.Arguments, Stdin: input, Stdout: stdout, Stderr: stderr, Files: files, Mounts: mounts, CPUQuotaMillis: cfg.Resources.CPUMillis})
 	if err != nil {
 		return nil, err
 	}
@@ -230,18 +278,37 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 			_ = file.Close()
 		}
 	}
-	state.broker, err = whpx.NewBroker(state.child.Handle())
-	if err != nil {
-		return nil, err
+	if cfg.Platform == PlatformAuto || cfg.Platform == PlatformWHPX {
+		state.broker, err = whpx.NewBroker(state.child.Handle())
+		if err != nil {
+			if cfg.Platform != PlatformAuto || runtime.GOARCH != "arm64" || !errors.Is(err, whpx.ErrUnsupported) {
+				return nil, err
+			}
+			cfg.Platform = PlatformSystrap
+		} else {
+			cfg.Platform = PlatformWHPX
+		}
+	}
+	if cfg.Platform == PlatformSystrap {
+		state.stubBroker, err = systrap.NewStubBroker(state.child.Handle(), stubRead, stubReplyWrite)
+		if err != nil {
+			return nil, err
+		}
+		keep[stubRead], keep[stubReplyWrite] = true, true
+	} else {
+		_ = stubRead.Close()
+		_ = stubReplyWrite.Close()
 	}
 	connection := &sandboxrpc.Pipe{Reader: requestRead, Output: brokerWrite}
-	state.server, err = sandboxrpc.NewServer(connection, "Hypervisor", state.broker)
+	state.server, err = sandboxrpc.NewServer(connection, "Network", state.network)
 	if err != nil {
 		return nil, err
 	}
 	keep[requestRead], keep[brokerWrite] = true, true
-	if err := state.server.Register("Network", state.network); err != nil {
-		return nil, err
+	if state.broker != nil {
+		if err := state.server.Register("Hypervisor", state.broker); err != nil {
+			return nil, err
+		}
 	}
 	if state.console != nil {
 		if err := state.server.Register("Input", &consoleInputService{reader: state.console}); err != nil {
@@ -252,7 +319,7 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 	go func() { state.server.Serve(); close(state.served) }()
 	state.watched = make(chan struct{})
 	go func() { <-state.exited; state.shutdown(); close(state.watched) }()
-	configuration := processConfiguration{Argv: cfg.Argv, Envv: cfg.Envv, WorkDir: cfg.WorkDir, Workspace: cfg.WorkspacePath, ReadOnly: cfg.WorkspaceReadOnly, TTY: cfg.TTY, LayerCount: len(prepared.layerHandles), Network: cfg.NetworkMode, IsolateLAN: cfg.IsolateLAN, PortForwards: cfg.PortForwards, WireGuard: cfg.WireGuardConfig}
+	configuration := processConfiguration{Argv: cfg.Argv, Envv: cfg.Envv, WorkDir: cfg.WorkDir, Workspace: cfg.WorkspacePath, ReadOnly: cfg.WorkspaceReadOnly, TTY: cfg.TTY, LayerCount: len(prepared.layerHandles), Network: cfg.NetworkMode, IsolateLAN: cfg.IsolateLAN, PortForwards: cfg.PortForwards, WireGuard: cfg.WireGuardConfig, Platform: cfg.Platform, Mounts: cfg.Mounts, User: cfg.User, Hostname: cfg.Hostname, Name: cfg.Name, Resources: cfg.Resources, ReadOnlyRoot: cfg.ReadOnlyRoot}
 	if cfg.NetworkMode != NetModeWireGuard {
 		configuration.WireGuard = nil
 	}
@@ -279,7 +346,7 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 	if reply.Error != "" {
 		return nil, fmt.Errorf("gvx: initialize worker: %s", reply.Error)
 	}
-	return &ProcessSandbox{state: state, status: reply.Status, ports: reply.Ports}, nil
+	return &ProcessSandbox{state: state, status: reply.Status, ports: reply.Ports, published: reply.Published, limits: reply.Limits, platform: string(cfg.Platform)}, nil
 }
 
 func (p *processState) run(ctx context.Context) (int, error) {
@@ -312,6 +379,9 @@ func (p *processState) run(ctx context.Context) (int, error) {
 		p.outputs.Wait()
 		if outputErr := errors.Join(p.outputErrors...); outputErr != nil {
 			return result.Code, outputErr
+		}
+		if result.MemoryLimit {
+			return result.Code, fmt.Errorf("%w: %s", ErrMemoryLimit, result.Error)
 		}
 		if result.Error != "" {
 			return result.Code, errors.New(result.Error)
@@ -347,6 +417,9 @@ func (p *processState) shutdown() {
 		}
 		if p.broker != nil {
 			errs = append(errs, p.broker.Close())
+		}
+		if p.stubBroker != nil {
+			errs = append(errs, p.stubBroker.Close())
 		}
 		if p.child != nil {
 			errs = append(errs, p.child.Close())
@@ -398,7 +471,7 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 			_ = file.Close()
 		}
 	}()
-	for index := range 4 {
+	for index := range 6 {
 		handle, err := workerHandle(index)
 		if err != nil {
 			return err
@@ -421,16 +494,23 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 	if configuration.ConsoleInput {
 		guestInput = &consoleInputProxy{client: client}
 	}
-	sandbox := &Sandbox{cfg: Config{Platform: PlatformWHPX, NetworkMode: configuration.Network, IsolateLAN: configuration.IsolateLAN, PortForwards: configuration.PortForwards, WireGuardConfig: configuration.WireGuard, processNetwork: proxy.networkIO(), Argv: configuration.Argv, Envv: configuration.Envv, WorkDir: configuration.WorkDir, WorkspacePath: configuration.Workspace, WorkspaceReadOnly: configuration.ReadOnly, TTY: configuration.TTY, Stdin: guestInput, Stdout: os.Stdout, Stderr: os.Stderr}, platName: string(PlatformWHPX)}
+	sandbox := &Sandbox{cfg: Config{Platform: configuration.Platform, NetworkMode: configuration.Network, IsolateLAN: configuration.IsolateLAN, PortForwards: configuration.PortForwards, WireGuardConfig: configuration.WireGuard, processNetwork: proxy.networkIO(), Argv: configuration.Argv, Envv: configuration.Envv, WorkDir: configuration.WorkDir, WorkspacePath: configuration.Workspace, WorkspaceReadOnly: configuration.ReadOnly, TTY: configuration.TTY, Stdin: guestInput, Stdout: os.Stdout, Stderr: os.Stderr, Mounts: configuration.Mounts, User: configuration.User, Hostname: configuration.Hostname, Name: configuration.Name, Resources: configuration.Resources, ReadOnlyRoot: configuration.ReadOnlyRoot}, platName: string(configuration.Platform)}
 	defer func() { err = errors.Join(err, sandbox.Close()) }()
 	initialize := func() error {
 		var err error
-		sandbox.plat, err = whpx.NewBrokered(client)
+		switch configuration.Platform {
+		case PlatformWHPX:
+			sandbox.plat, err = whpx.NewBrokered(client)
+		case PlatformSystrap:
+			sandbox.plat, err = systrap.NewBrokered(files[4], files[5])
+		default:
+			return errors.New("gvx: invalid worker platform")
+		}
 		if err != nil {
 			return err
 		}
 		for index := range configuration.LayerCount {
-			handle, err := workerHandle(4 + index)
+			handle, err := workerHandle(6 + index)
 			if err != nil {
 				return err
 			}
@@ -440,11 +520,8 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 			}
 			sandbox.layerHandles = append(sandbox.layerHandles, layer)
 		}
-		if configuration.Workspace != "" {
-			sandbox.workspace, err = hostfs.OpenWorkspace(configuration.Workspace, configuration.ReadOnly)
-			if err != nil {
-				return err
-			}
+		if err := sandbox.openMounts(); err != nil {
+			return err
 		}
 		if err := sandbox.initNetstack(); err != nil {
 			return err
@@ -454,7 +531,10 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 			return err
 		}
 		sandbox.attachChunkMemory()
-		sandbox.lockdown, err = hostlockdown.Apply(hostlockdown.Options{})
+		sandbox.lockdown, err = hostlockdown.Apply(hostlockdown.Options{CPUQuotaMillis: configuration.Resources.CPUMillis})
+		if configuration.Platform == PlatformSystrap {
+			sandbox.lockdown.CPUQuotaEnforced = false
+		}
 		return err
 	}
 	if err := initialize(); err != nil {
@@ -471,7 +551,7 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 	for index := range configuration.PortForwards {
 		ports = append(ports, sandbox.BoundPort(index))
 	}
-	if err := sandboxrpc.WriteMessage(control, processResult{Status: sandbox.lockdown, Ports: ports}); err != nil {
+	if err := sandboxrpc.WriteMessage(control, processResult{Status: sandbox.lockdown, Ports: ports, Published: sandbox.PublishedPorts(), Limits: sandbox.Limits()}); err != nil {
 		return err
 	}
 	var command string
@@ -482,7 +562,7 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 		return errors.New("gvx: invalid worker command")
 	}
 	code, runErr := sandbox.Run(ctx)
-	result := processResult{Code: code}
+	result := processResult{Code: code, MemoryLimit: errors.Is(runErr, ErrMemoryLimit)}
 	if runErr != nil {
 		result.Error = runErr.Error()
 	}

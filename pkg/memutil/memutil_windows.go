@@ -179,11 +179,17 @@ func MapFile(addr, size, prot, flags, fd, offset uintptr) (uintptr, error) {
 		return 0, fmt.Errorf("MapFile: anonymous mapping at offset %#x: %w", offset, windows.ERROR_INVALID_PARAMETER)
 	}
 
-	// Writable sections cover offset+size so that a file shorter than the
-	// mapping grows, which CreateFileMapping needs. Read-only sections map the file as it is.
+	baseOffset := uint64(offset) &^ (allocGranularity - 1)
+	delta := uintptr(uint64(offset) - baseOffset)
+	viewSize := (delta + size + pageSize4K - 1) &^ (pageSize4K - 1)
+
+	// Writable sections cover the whole view so that a file shorter than the
+	// view grows, which MapViewOfFile needs: a view larger than the section is
+	// refused, even when the view only rounds the size up to a page. Read-only
+	// sections map the file as it is.
 	var maxSize uint64
 	if handle == windows.InvalidHandle || p.section != windows.PAGE_READONLY && p.section != windows.PAGE_EXECUTE_READ {
-		maxSize = uint64(offset) + uint64(size)
+		maxSize = baseOffset + uint64(viewSize)
 	}
 	section, err := windows.CreateFileMapping(handle, nil, p.section, uint32(maxSize>>32), uint32(maxSize), nil)
 	if err != nil {
@@ -192,10 +198,6 @@ func MapFile(addr, size, prot, flags, fd, offset uintptr) (uintptr, error) {
 	// The view keeps the section alive, so the handle closes on every path.
 	defer windows.CloseHandle(section)
 
-	baseOffset := uint64(offset) &^ (allocGranularity - 1)
-	delta := uintptr(uint64(offset) - baseOffset)
-	// The view cannot exceed the section size. Windows rounds its host pages.
-	viewSize := delta + size
 	base, err := mapSection(section, baseOffset, viewSize, p)
 	if err != nil {
 		return 0, err

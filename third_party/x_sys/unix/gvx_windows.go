@@ -361,7 +361,7 @@ func Statfs(path string, buf *Statfs_t) error                                { r
 
 // Ftruncate sets the file size without moving the file pointer.
 func Ftruncate(fd int, length int64) error {
-	return winErrno(windows.Ftruncate(windows.Handle(uintptr(fd)), length))
+	return winError(windows.Ftruncate(windows.Handle(uintptr(fd)), length))
 }
 func Truncate(path string, length int64) error                                  { return os.Truncate(path, length) }
 func Fsync(fd int) error                                                        { return syscall.FlushFileBuffers(syscall.Handle(uintptr(fd))) }

@@ -378,7 +378,7 @@ func TestE2ERungvConfigurationErrors(t *testing.T) {
 		{"wireguard without config", []string{"-net=wg"}, 2, "WireGuardConfig"},
 		{"unknown architecture", []string{"-net=none", "-arch=riscv64"}, 2, "riscv64"},
 		{"foreign architecture on hardware backend", []string{"-net=none", "-arch=" + otherArch()}, 2, "systrap"},
-		{"unknown network mode", []string{"-net=bridge"}, 2, "bridge"},
+		{"unknown network mode", []string{"-net=vxlan"}, 2, "vxlan"},
 		{"other-OS hypervisor", []string{"-net=none", "-platform=" + string(foreignHypervisorPlatform())}, 1, string(foreignHypervisorPlatform())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -437,14 +437,38 @@ func TestE2ERungvPullAndRunOverlayWhiteoutsAndCaseSensitivity(t *testing.T) {
 	baseURL := overlayRegistry(t)
 	cacheDir := t.TempDir()
 
+	// layers reports the number of layers that the store holds for the image
+	// of the test registry and an architecture, as `rungv inspect` shows it.
+	layers := func(arch string) int {
+		t.Helper()
+		name := strings.TrimPrefix(baseURL, "http://") + "/gvx/e2e:1"
+		stdout, stderr, code := runTool(t, rungv, "inspect", "-arch="+arch, "-cache-dir="+cacheDir, name)
+		if code != 0 {
+			t.Fatalf("rungv inspect %s = (code %d, stdout %q, stderr %q), want the pulled image", name, code, stdout, stderr)
+		}
+		var out []struct {
+			RootFS struct{ Layers []string }
+		}
+		if err := json.Unmarshal([]byte(stdout), &out); err != nil || len(out) != 1 {
+			t.Fatalf("rungv inspect output = %q (%v), want one image", stdout, err)
+		}
+		return len(out[0].RootFS.Layers)
+	}
+
 	stdout, stderr, code := runTool(t, rungv, "pull", "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/e2e:1")
-	if code != 0 || !strings.Contains(stdout, "pulled gvx/e2e:1 (2 EROFS layers") {
-		t.Fatalf("rungv pull = (code %d, stdout %q, stderr %q), want two cached layers", code, stdout, stderr)
+	if code != 0 || !strings.Contains(stdout, "Digest: sha256:") {
+		t.Fatalf("rungv pull = (code %d, stdout %q, stderr %q), want success with the digest", code, stdout, stderr)
+	}
+	if got := layers(runtime.GOARCH); got != 2 {
+		t.Fatalf("the pulled image has %d layers, want 2", got)
 	}
 	// -arch selects the other architecture's manifest: one layer.
 	stdout, stderr, code = runTool(t, rungv, "pull", "-arch="+otherArch(), "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/e2e:1")
-	if code != 0 || !strings.Contains(stdout, "(1 EROFS layers") {
-		t.Fatalf("rungv pull -arch=%s = (code %d, stdout %q, stderr %q), want one cached layer", otherArch(), code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("rungv pull -arch=%s = (code %d, stdout %q, stderr %q), want success", otherArch(), code, stdout, stderr)
+	}
+	if got := layers(otherArch()); got != 1 {
+		t.Fatalf("the image for %s has %d layers, want 1", otherArch(), got)
 	}
 
 	runCat := func(paths ...string) (stdout, stderr string, code int) {

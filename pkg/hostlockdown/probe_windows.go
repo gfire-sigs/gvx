@@ -27,13 +27,13 @@ import (
 )
 
 // probeRestrictedOpenBlocked binds the restricted token to a scratch thread
-// and opens host paths that the workspace entry does not cover. The kernel
+// and opens host paths that no mount covers. The kernel
 // must answer ERROR_ACCESS_DENIED for each existing path. The probe also
 // proves that SetThreadToken accepts the token without a privilege.
 //
 // The scratch goroutine never unlocks its thread. The runtime ends the thread
 // when the goroutine returns, and that drops the impersonation token.
-func probeRestrictedOpenBlocked(token windows.Token, workspaceReal string) error {
+func probeRestrictedOpenBlocked(token windows.Token, mountsReal []string) error {
 	result := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
@@ -41,22 +41,30 @@ func probeRestrictedOpenBlocked(token windows.Token, workspaceReal string) error
 			result <- fmt.Errorf("hostlockdown: SetThreadToken on probe thread: %w", err)
 			return
 		}
-		result <- openUnlistedPaths(unlistedProbeTargets(workspaceReal))
+		result <- openUnlistedPaths(unlistedProbeTargets(mountsReal))
 	}()
 	return <-result
 }
 
-// unlistedProbeTargets returns existing host locations outside the workspace.
-func unlistedProbeTargets(workspaceReal string) []string {
-	var targets []string
-	if workspaceReal != "" {
-		targets = append(targets, filepath.Dir(workspaceReal))
+// unlistedProbeTargets returns host locations outside every mount. The parent
+// of each mount, the profile directory, and the hosts file are candidates. A
+// candidate that lies inside a mount is dropped.
+func unlistedProbeTargets(mountsReal []string) []string {
+	var candidates []string
+	for _, real := range mountsReal {
+		candidates = append(candidates, filepath.Dir(real))
 	}
 	if home := os.Getenv("USERPROFILE"); home != "" {
-		targets = append(targets, home)
+		candidates = append(candidates, home)
 	}
 	if root := os.Getenv("SystemRoot"); root != "" {
-		targets = append(targets, filepath.Join(root, "System32", "drivers", "etc", "hosts"))
+		candidates = append(candidates, filepath.Join(root, "System32", "drivers", "etc", "hosts"))
+	}
+	var targets []string
+	for _, c := range candidates {
+		if outsideAll(c, mountsReal) {
+			targets = append(targets, c)
+		}
 	}
 	return targets
 }

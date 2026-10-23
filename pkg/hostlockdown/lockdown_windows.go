@@ -47,22 +47,27 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 		return Status{}, err
 	}
 	if app {
-		return applyAppContainerLockdown(primary)
+		return applyAppContainerLockdown(primary, opts.CPUQuotaMillis)
 	}
 	id, err := readTokenIdentity(primary)
 	if err != nil {
 		return Status{}, err
 	}
 
-	// Step 1: Low-Integrity label and logon SID entry on the workspace.
-	var workspaceReal string
-	if opts.WorkspacePath != "" {
-		if workspaceReal, err = resolveWorkspace(opts.WorkspacePath); err != nil {
+	// Step 1: Low-Integrity label and logon SID entry on every mount. A
+	// directory that two mounts name, or that lies below another mount, gets
+	// the rights of each mount. Each grant only adds access, so the order of
+	// the mounts does not matter.
+	mountsReal := make([]string, 0, len(opts.Mounts))
+	for _, m := range opts.Mounts {
+		real, err := resolveMount(m.Path)
+		if err != nil {
 			return Status{}, err
 		}
-		if err := prepareWorkspace(workspaceReal, id.logon, opts.WorkspaceReadOnly); err != nil {
+		if err := prepareWorkspace(real, id.logon, m.ReadOnly); err != nil {
 			return Status{}, err
 		}
+		mountsReal = append(mountsReal, real)
 	}
 
 	// Step 2: remove every privilege from the live primary token.
@@ -87,17 +92,18 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 			_ = restricted.Close()
 		}
 	}()
-	if err := probeRestrictedOpenBlocked(restricted, workspaceReal); err != nil {
+	if err := probeRestrictedOpenBlocked(restricted, mountsReal); err != nil {
 		return Status{}, err
 	}
 	st.BoundThreadFileOpenBlocked = true
 
 	// Steps 5 to 7: containment job.
-	job, err := createContainmentJob()
+	job, err := createContainmentJob(opts.CPUQuotaMillis)
 	if err != nil {
 		return Status{}, err
 	}
 	st.SubprocessBlocked = true
+	st.CPUQuotaEnforced = opts.CPUQuotaMillis > 0
 
 	// Step 8: disallow win32k system calls.
 	if err := disableWin32kSystemCalls(); err != nil {
@@ -127,14 +133,17 @@ func openPrimaryToken() (windows.Token, error) {
 	return token, nil
 }
 
-func resolveWorkspace(path string) (string, error) {
+func resolveMount(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", fmt.Errorf("hostlockdown: resolve workspace %q: %w", path, err)
+		return "", fmt.Errorf("hostlockdown: resolve mount %q: %w", path, err)
 	}
 	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return "", fmt.Errorf("hostlockdown: resolve workspace symlinks %q: %w", abs, err)
+		return "", fmt.Errorf("hostlockdown: resolve mount symlinks %q: %w", abs, err)
+	}
+	if filepath.Dir(real) == real {
+		return "", fmt.Errorf("hostlockdown: mount %q resolves to the volume root %q and would allow every file on it", path, real)
 	}
 	return real, nil
 }

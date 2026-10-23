@@ -49,7 +49,9 @@ Every subsystem that allocates host kernel handles, virtual memory arenas, or CP
 
 `pgalloc.MemoryFile` owns the backing shared memory created via `CreateFileMappingW` and `MapViewOfFile3` on Windows or `mmap(MAP_ANON)` and `mach_vm_remap` on macOS. `platform/whpx` (`WHvMapGpaRange`) and `platform/hvf` (`hv_vm_map`) map 4KB slices from `MemoryFile` into guest physical memory; `AddressSpace.Unmap()` unmaps GPA ranges before `MemoryFile` releases the backing pages.
 
-`platform/systrap` on macOS `arm64` (`darwinsystrap`) owns the guest virtual arena (`[guestArenaBase, guestArenaEnd)`), shared `sysmsg` context pages, and 4KB Trampoline Islands. Windows has no engine and returns `ErrUnavailable`. The engine disassembles executable pages on lazy execute faults using `golang.org/x/arch/arm64/arm64asm` to patch `svc #0` (`0xD4000001`) instructions in-place. The `x86asm` patcher for `syscall` (`0F 05`) is out of scope. The fault handler (Mach exception port and signal handler) inspects the faulting address first. It defers to the Go runtime for any fault outside `[guestArenaBase, guestArenaEnd)`.
+`platform/systrap` on macOS `arm64` (`darwinsystrap`) owns the guest virtual arena (`[guestArenaBase, guestArenaEnd)`), shared `sysmsg` context pages, and 4KB Trampoline Islands. It disassembles executable pages on lazy execute faults using `golang.org/x/arch/arm64/arm64asm` to patch `svc #0` (`0xD4000001`) instructions in-place. The fault handler (Mach exception port and signal handler) inspects the faulting address first. It defers to the Go runtime for any fault outside `[guestArenaBase, guestArenaEnd)`.
+
+`platform/systrap` on Windows (`winsystrap`) owns one stub process for each address space and one debug object for all stubs. A stub host that starts before `hostlockdown.Apply()` creates the stubs. The engine replaces `syscall` with `CC 90` on `amd64` and `svc #0` with `brk` on `arm64`, and it receives every stop through the debug object. Read [`docs/systrap-windows.md`](docs/systrap-windows.md) before you change it. Set `GVX_SYSTRAP_TRACE=1` to print each stop.
 
 ### 3.2 Host Handle and Lockdown Ordering
 
@@ -114,7 +116,7 @@ rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md docs/ 2>/dev/null
 
 ### 5.1 Continuous Integration (Descriptive Module)
 
-The workflow `.github/workflows/ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner is a virtual machine without a hypervisor, so it runs the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand. On Linux, run `scripts/seccomp-audit.sh` when a change adds a host call, because a call outside the seccomp allowlist kills the process.
+The workflow `.github/workflows/ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. A hosted macOS runner and the hosted `windows-11-arm` runner are virtual machines without a hypervisor, so they run the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand. On Linux, run `scripts/seccomp-audit.sh` when a change adds a host call, because a call outside the seccomp allowlist kills the process.
 
 Keep CI usage low. Do not add jobs that repeat work, and do not run registry tests on every push. Use these environment variables in CI only:
 
@@ -123,4 +125,5 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_ALLOW_NO_HYPERVISOR=1` | Skips the tests that need a hypervisor when `hv_vm_create` or `WHvCreatePartition` fails. |
 | `GVX_E2E_OFFLINE=1` | Skips the tests that pull from a registry. |
 | `GVX_E2E_REQUIRE_NETWORK=1` | Fails, and does not skip, when the registry is unreachable. |
-| `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. |
+| `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. The value `2` also prints debug lines, such as each fault that the Sentry cannot resolve. |
+| `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop and the state of each stub. The value `3` prints only the state and the count of each kind of stop. The value `4` also samples the program counter and prints the hottest addresses. |

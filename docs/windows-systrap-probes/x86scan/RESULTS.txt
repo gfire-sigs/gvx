@@ -1,0 +1,7 @@
+x86-64: files=17 text=4.42 MB data=1.96 MB
+  0F 05 byte pairs in text: 539 (121.8 per MB)
+  labeled the same by 16 sweeps: 505 real SYSCALL instructions, 34 inside another instruction, 0 labeled differently
+  0F 05 byte pairs in non-executable data: 54 (27.6 per MB)
+arm64: files=17 text=3.81 MB data=2.35 MB
+  SVC words in text: 478 (svc #0: 478)
+  non-executable data words that match the SVC pattern: 1 (0.426 per MB)

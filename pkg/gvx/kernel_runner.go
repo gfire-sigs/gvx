@@ -15,6 +15,7 @@
 package gvx
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -70,6 +72,9 @@ import (
 func init() {
 	if os.Getenv("GVX_DEBUG_LOG") == "" && os.Getenv("GVX_STRACE") == "" {
 		log.SetTarget(&log.Writer{Next: io.Discard})
+	}
+	if os.Getenv("GVX_DEBUG_LOG") == "2" {
+		log.SetLevel(log.Debug)
 	}
 	if os.Getenv("GVX_STRACE") != "" {
 		strace.Initialize()
@@ -371,10 +376,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		Timekeeper:           tk,
 		RootUserNamespace:    creds.UserNamespace,
 		RootNetworkNamespace: rootNetNS,
-		ApplicationCores:     uint(maxCPUs),
+		ApplicationCores:     uint(guestCPUs(s.cfg.Resources.CPUMillis, maxCPUs)),
 		Vdso:                 vdso,
 		VdsoParams:           vdsoParams,
-		RootUTSNamespace:     kernel.NewUTSNamespace("gvx", "localdomain", creds.UserNamespace),
+		RootUTSNamespace:     kernel.NewUTSNamespace(s.hostname(), "localdomain", creds.UserNamespace),
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		RootPIDNamespace:     kernel.NewRootPIDNamespace(creds.UserNamespace),
 		MaxFDLimit:           kernel.MaxFdLimit,
@@ -421,6 +426,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err != nil {
 		return 1, err
 	}
+	user, procCreds, err := s.guestUser(sctxWithRoot, vfsObj, creds, root)
+	if err != nil {
+		return 1, err
+	}
 
 	fdTable := k.NewFDTable()
 	defer fdTable.DecRef(sctx)
@@ -455,14 +464,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		workDir = "/"
 	}
 
-	envv := s.cfg.Envv
-	if len(envv) == 0 {
-		envv = []string{
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-			"HOME=/root",
-			"TERM=xterm",
-		}
-	}
+	envv := finalizeEnv(s.cfg.Envv, guestEnvDefaults{Home: user.Home, Hostname: s.hostname(), TTY: tty != nil})
 
 	mntns.IncRef()
 	procArgs := kernel.CreateProcessArgs{
@@ -470,7 +472,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		Argv:                 argv,
 		Envv:                 envv,
 		WorkingDirectory:     workDir,
-		Credentials:          creds,
+		Credentials:          procCreds,
 		FDTable:              fdTable,
 		MountNamespace:       mntns,
 		Umask:                0o022,
@@ -479,12 +481,18 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		UTSNamespace:         k.RootUTSNamespace(),
 		IPCNamespace:         k.RootIPCNamespace(),
 		Origin:               kernel.OriginExec,
-		ContainerID:          "gvx-default",
+		ContainerID:          cmp.Or(s.cfg.Name, "gvx-default"),
 		PIDNamespace:         k.RootPIDNamespace(),
 	}
 
 	tg, _, err := k.CreateProcess(procArgs)
 	if err != nil {
+		read := func(path string, maxBytes int) ([]byte, error) {
+			return readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
+		}
+		if hint := s.nonPIEHintForGuestFile(read, execPath); hint != "" {
+			err = fmt.Errorf("%w; %s", err, hint)
+		}
 		return 1, fmt.Errorf("gvx: create guest process %q: %w", execPath, err)
 	}
 
@@ -501,12 +509,43 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		}
 	}()
 
+	var memoryExceeded atomic.Bool
+	if limit := s.cfg.Resources.MemoryBytes; limit > 0 {
+		guard := memoryGuard{
+			limit: uint64(limit),
+			// The accounting counts a committed page only after a scan of the
+			// memory file. UpdateUsage limits its own scan rate.
+			used: func() uint64 {
+				_ = mf.UpdateUsage(nil)
+				return usage.MemoryAccounting.Total()
+			},
+			interval: memoryPollInterval,
+			kill: func() {
+				memoryExceeded.Store(true)
+				_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+			},
+		}
+		guardCtx, stopGuard := context.WithCancel(ctx)
+		guardDone := make(chan struct{})
+		go func() {
+			defer close(guardDone)
+			guard.run(guardCtx)
+		}()
+		defer func() {
+			stopGuard()
+			<-guardDone
+		}()
+	}
+
 	k.WaitExited()
 	close(doneCh)
 	k.Pause()
 
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
+	}
+	if memoryExceeded.Load() {
+		return 137, ErrMemoryLimit
 	}
 
 	ws := tg.ExitStatus()
@@ -579,34 +618,45 @@ func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, vfsObj *
 }
 
 func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
-	for _, dir := range []string{"/proc", "/sys", "/dev", "/tmp", "/etc", "/root", "/workspace", "/bin", "/usr/bin"} {
+	// The tmpfs that holds the writes of the guest has the mode 01777, and the
+	// overlay shows it as the mode of "/". A guest user that is not root could
+	// then create files in "/". Images use the mode 0755 for "/".
+	if err := vfsObj.SetStatAt(sctx, creds, &vfs.PathOperation{Root: root, Start: root, Path: makeFPath("/")}, &vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_MODE, Mode: 0o755},
+	}); err != nil {
+		return fmt.Errorf("gvx: set the mode of the guest root: %w", err)
+	}
+	for _, dir := range []string{"/proc", "/sys", "/dev", "/etc", "/root", "/workspace", "/bin", "/usr/bin"} {
 		if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, dir, 0o755); err != nil {
 			return fmt.Errorf("gvx: create guest directory %s: %w", dir, err)
 		}
 	}
+	// Programs expect a sticky, world-writable /tmp. An image that has one keeps it.
+	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, "/tmp", 0o1777); err != nil {
+		return fmt.Errorf("gvx: create guest directory /tmp: %w", err)
+	}
 
-	mountSubfs := func(target, fsName, data string) error {
+	mountSubfs := func(target, fsName string, opts *vfs.MountOptions) error {
 		pop := vfs.PathOperation{
 			Root:  root,
 			Start: root,
 			Path:  makeFPath(target),
 		}
-		if _, err := vfsObj.MountAt(sctx, creds, "", &pop, fsName, &vfs.MountOptions{
-			GetFilesystemOptions: vfs.GetFilesystemOptions{
-				Data: data,
-			},
-		}); err != nil {
+		if _, err := vfsObj.MountAt(sctx, creds, "", &pop, fsName, opts); err != nil {
 			return fmt.Errorf("gvx: mount %s at %s: %w", fsName, target, err)
 		}
 		return nil
 	}
-	if err := mountSubfs("/proc", "proc", ""); err != nil {
+	dataOpts := func(data string) *vfs.MountOptions {
+		return &vfs.MountOptions{GetFilesystemOptions: vfs.GetFilesystemOptions{Data: data}}
+	}
+	if err := mountSubfs("/proc", "proc", dataOpts("")); err != nil {
 		return err
 	}
-	if err := mountSubfs("/sys", "sysfs", ""); err != nil {
+	if err := mountSubfs("/sys", "sysfs", dataOpts("")); err != nil {
 		return err
 	}
-	if err := mountSubfs("/dev", "devtmpfs", ""); err != nil {
+	if err := mountSubfs("/dev", "devtmpfs", dataOpts("")); err != nil {
 		return err
 	}
 	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, "/dev/pts", 0o755); err != nil {
@@ -615,10 +665,10 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, "/dev/shm", 0o1777); err != nil {
 		return fmt.Errorf("gvx: create guest directory /dev/shm: %w", err)
 	}
-	if err := mountSubfs("/dev/pts", "devpts", "ptmxmode=0666,mode=0620"); err != nil {
+	if err := mountSubfs("/dev/pts", "devpts", dataOpts("ptmxmode=0666,mode=0620")); err != nil {
 		return err
 	}
-	if err := mountSubfs("/dev/shm", "tmpfs", ""); err != nil {
+	if err := mountSubfs("/dev/shm", "tmpfs", dataOpts("")); err != nil {
 		return err
 	}
 
@@ -637,26 +687,58 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		}
 	}
 
-	// Mount the host /workspace directory directly via the VFS2 hostfs driver.
-	if s.workspace != nil {
-		pop := vfs.PathOperation{
-			Root:  root,
-			Start: root,
-			Path:  makeFPath("/workspace"),
-		}
-		if _, err := vfsObj.MountAt(sctx, creds, "", &pop, hostfs.Name, &vfs.MountOptions{
-			ReadOnly: s.workspace.ReadOnly(),
-			GetFilesystemOptions: vfs.GetFilesystemOptions{
-				InternalData: hostfs.InternalFilesystemOptions{
-					Workspace: s.workspace,
-				},
-			},
-		}); err != nil {
-			return fmt.Errorf("gvx: mount hostfs at /workspace: %w", err)
+	if err := s.writeGuestHostFiles(sctx, vfsObj, creds, root); err != nil {
+		return err
+	}
+
+	// s.mounts is ordered by increasing path depth, so a mount point below
+	// another mount exists in that mount before the guest mounts there.
+	for _, m := range s.mounts {
+		if err := s.mountUserMount(sctx, vfsObj, creds, root, m, mountSubfs); err != nil {
+			return err
 		}
 	}
 
+	if s.cfg.ReadOnlyRoot {
+		if err := vfsObj.SetMountReadOnly(root.Mount(), true); err != nil {
+			return fmt.Errorf("gvx: mount the root read-only: %w", err)
+		}
+	}
 	return nil
+}
+
+// mountUserMount creates the guest directory of m and mounts it there. A bind
+// or volume mount uses the VFS2 hostfs driver. A tmpfs mount uses the Sentry
+// tmpfs with a size limit and mode 1777.
+func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, m sandboxMount, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
+	dirMode := linux.FileMode(0o755)
+	if m.Kind == MountTmpfs {
+		dirMode = 0o1777
+	}
+	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, m.GuestPath, dirMode); err != nil {
+		return fmt.Errorf("gvx: create guest directory %s: %w", m.GuestPath, err)
+	}
+	if m.Kind == MountTmpfs {
+		return mountSubfs(m.GuestPath, "tmpfs", &vfs.MountOptions{
+			ReadOnly:             m.ReadOnly,
+			GetFilesystemOptions: vfs.GetFilesystemOptions{Data: tmpfsMountData(m.TmpfsSizeBytes)},
+		})
+	}
+	return mountSubfs(m.GuestPath, hostfs.Name, &vfs.MountOptions{
+		ReadOnly: m.workspace.ReadOnly(),
+		GetFilesystemOptions: vfs.GetFilesystemOptions{
+			InternalData: hostfs.InternalFilesystemOptions{Workspace: m.workspace},
+		},
+	})
+}
+
+// tmpfsMountData returns the mount data of a tmpfs mount. A zero size keeps
+// the default limit of the Sentry tmpfs.
+func tmpfsMountData(sizeBytes int64) string {
+	if sizeBytes == 0 {
+		return "mode=1777"
+	}
+	return fmt.Sprintf("size=%d,mode=1777", sizeBytes)
 }
 
 func vfsWriteFile(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, guestPath string, data []byte, mode linux.FileMode) error {

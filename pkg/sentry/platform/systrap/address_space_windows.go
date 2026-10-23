@@ -1,0 +1,597 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build windows
+
+package systrap
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+	"golang.org/x/sys/windows"
+
+	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
+)
+
+// blockState says which mapping of a guest page the stub currently sees.
+type blockState uint8
+
+const (
+	// blockData maps the original frame without execute permission.
+	blockData blockState = iota
+	// blockExec maps a patched private copy as read and execute.
+	blockExec
+)
+
+// execBlock is one page of a guest mapping that allows execution.
+//
+// WHY: the original frame can be shared between address spaces and mapped at
+// different addresses, and the patch holds addresses and site tables. So the
+// stub never executes the original frame. A first fetch faults, the Sentry
+// patches a private copy, and the stub sees the copy instead. A block that
+// also allows writes alternates between the writable original and the
+// executable copy, so code that a guest writes is always patched before it
+// runs.
+type execBlock struct {
+	base uint64
+	// src is the Sentry address of the original frame.
+	src     uint64
+	srcSec  *sectionRef
+	srcOff  uint64
+	at      hostarch.AccessType
+	state   blockState
+	priv    privPage
+	hasPriv bool
+	// sites maps the page offset of a patched instruction to its description.
+	sites map[uint16]siteInfo
+}
+
+// addressSpace is one stub process and the guest mappings in it.
+type addressSpace struct {
+	platform.NoAddressSpaceIO
+
+	p  *Platform
+	sp *stubProc
+
+	// patchMu serializes patching. Two threads that fault on the same block
+	// then patch it once.
+	patchMu sync.Mutex
+
+	mu       sync.Mutex
+	released bool
+	win      *guestWindows
+	blocks   map[uint64]*execBlock
+
+	// internal holds the engine pages at the top of the window.
+	internal *anonSection
+	// copies holds the sections of mappings that copy file bytes. They live
+	// until the address space is released.
+	copies []*anonSection
+
+	// patchedBlocks counts blocks that the Sentry patched.
+	patchedBlocks atomic.Uint64
+}
+
+// PatchedBlocks returns how many code pages this address space patched.
+func (as *addressSpace) PatchedBlocks() uint64 { return as.patchedBlocks.Load() }
+
+var errAddressSpaceReleased = errors.New("the address space is released")
+
+// AlignmentError reports a mapping request that the 4KB host page cannot honor.
+type AlignmentError struct {
+	Op   string
+	Addr uint64
+	Len  uint64
+}
+
+// Error implements error.
+func (e *AlignmentError) Error() string {
+	return fmt.Sprintf("%s [%#x, %#x) is not aligned to the %dKB host page", e.Op, e.Addr, e.Addr+e.Len, blockSize/1024)
+}
+
+func blockRound(n uint64) uint64 { return n &^ (blockSize - 1) }
+
+func checkAligned(op string, addr, length uint64) error {
+	if length == 0 || addr%blockSize != 0 || length%blockSize != 0 {
+		return &AlignmentError{Op: op, Addr: addr, Len: length}
+	}
+	return nil
+}
+
+// stubView performs the window map calls on one stub process.
+type stubView struct{ proc windows.Handle }
+
+func winProtect(p viewProt) uint32 {
+	switch p {
+	case viewRead:
+		return windows.PAGE_READONLY
+	case viewReadWrite:
+		return windows.PAGE_READWRITE
+	case viewReadExec:
+		return windows.PAGE_EXECUTE_READ
+	case viewReadWriteExec:
+		return windows.PAGE_EXECUTE_READWRITE
+	}
+	return windows.PAGE_NOACCESS
+}
+
+func (v stubView) SplitPlaceholder(addr, size uint64) error {
+	return splitPlaceholder(v.proc, uintptr(addr), uintptr(size))
+}
+
+func (v stubView) CoalescePlaceholders(addr, size uint64) error {
+	return coalescePlaceholders(v.proc, uintptr(addr), uintptr(size))
+}
+
+func (v stubView) MapView(addr, size uint64, backing viewBacking, off uint64, prot viewProt) error {
+	if prot == viewReadWriteExec {
+		return errors.New("systrap: writable executable mappings are forbidden")
+	}
+	ref := backing.(*sectionRef)
+	err := mapViewIntoPlaceholder(ref.h, v.proc, uintptr(addr), uintptr(size), off, winProtect(prot))
+	if err == nil || (prot != viewReadExec && prot != viewReadWriteExec) {
+		return err
+	}
+	// A read-only fallback never exposes the patched copy to guest writes.
+	if err2 := mapViewIntoPlaceholder(ref.h, v.proc, uintptr(addr), uintptr(size), off, windows.PAGE_READONLY); err2 != nil {
+		return fmt.Errorf("%w (read-only mapping: %v)", err, err2)
+	}
+	if protectErr := v.ProtectView(addr, size, prot); protectErr != nil {
+		return errors.Join(protectErr, v.UnmapView(addr))
+	}
+	return nil
+}
+
+func (v stubView) UnmapView(addr uint64) error {
+	return unmapViewToPlaceholder(v.proc, uintptr(addr))
+}
+
+func (v stubView) ProtectView(addr, size uint64, prot viewProt) error {
+	var old uint32
+	if err := windows.VirtualProtectEx(v.proc, uintptr(addr), uintptr(size), winProtect(prot), &old); err != nil {
+		return fmt.Errorf("VirtualProtectEx(%#x+%#x): %w", addr, size, err)
+	}
+	return nil
+}
+
+func newAddressSpace(p *Platform) (*addressSpace, error) {
+	sp, err := p.newStubProc()
+	if err != nil {
+		return nil, fmt.Errorf("create a stub process: %w", err)
+	}
+	wins := []*windowMap{newWindowMap(stubView{sp.proc}, winBase, winLimit)}
+	if p.lowWindow {
+		wins = append(wins, newWindowMap(stubView{sp.proc}, lowBase, lowLimit))
+	}
+	as := &addressSpace{
+		p:      p,
+		sp:     sp,
+		win:    newGuestWindows(wins...),
+		blocks: make(map[uint64]*execBlock),
+	}
+	pagesStart := time.Now()
+	defer func() { bringUpStats.pagesNs.Add(uint64(time.Since(pagesStart))) }()
+	if err := as.setupInternal(); err != nil {
+		sp.destroy()
+		return nil, fmt.Errorf("map the engine pages of the stub: %w", err)
+	}
+	return as, nil
+}
+
+// setupInternal maps the engine pages: one page of code and the pages of the
+// per-thread data slots. The arch file writes the code.
+func (as *addressSpace) setupInternal() error {
+	sec, err := newAnonSection(internalSize)
+	if err != nil {
+		return err
+	}
+	as.internal = sec
+	as.sp.internal = sec
+	writeInternalCode(sec.local[:codeSize])
+	if err := as.win.Map(internalBase, codeSize, &sec.ref, 0, viewReadExec); err != nil {
+		return err
+	}
+	if err := as.win.Map(internalBase+codeSize, internalSize-codeSize, &sec.ref, codeSize, viewReadWrite); err != nil {
+		return err
+	}
+	return flushInstructionCache(as.sp.proc, uintptr(internalBase), codeSize)
+}
+
+// viewProtFor converts guest access to the protection of an original frame.
+// An original frame never allows execute.
+func viewProtFor(at hostarch.AccessType) viewProt {
+	switch {
+	case at.Write:
+		return viewReadWrite
+	case at.Read || at.Execute:
+		return viewRead
+	}
+	return viewNone
+}
+
+// MapFile implements platform.AddressSpace.MapFile.
+func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) (err error) {
+	if traceEvents {
+		defer func() {
+			if err != nil {
+				tracef("MapFile %#x %v %v: %v", uint64(addr), fr, at, err)
+			}
+		}()
+	}
+	guest := uint64(addr)
+	if err := checkAligned("map", guest, fr.Length()); err != nil {
+		return err
+	}
+	if fr.Start%blockSize != 0 {
+		return &AlignmentError{Op: "map memory file range", Addr: fr.Start, Len: fr.Length()}
+	}
+	if guest < as.p.userMin || guest+fr.Length() > as.p.userMax {
+		return fmt.Errorf("mapping [%#x, %#x) lies outside the guest range [%#x, %#x)", guest, guest+fr.Length(), as.p.userMin, as.p.userMax)
+	}
+	if as.sp.dead.Load() {
+		return as.sp.deathError()
+	}
+	// A file with a host handle maps through a section of that file. Any other
+	// file, such as a workspace file of hostfs, maps through a copy of its
+	// bytes, which serves a mapping without write permission.
+	var sec *sectionRef
+	var copied *anonSection
+	if fd := f.FD(); fd >= 0 {
+		var err error
+		if sec, err = as.p.sections.get(windows.Handle(fd), fr.End, at.Write); err != nil {
+			sec = nil
+			if at.Write {
+				return fmt.Errorf("map a writable range of the memory file: %w", err)
+			}
+		}
+	} else if at.Write {
+		return fmt.Errorf("the file has no host handle and cannot map writable: %w", unix.ENODEV)
+	}
+	if sec == nil {
+		var err error
+		if copied, err = copyRange(f, fr); err != nil {
+			return err
+		}
+		sec = &copied.ref
+	}
+	secOff := fr.Start
+	if copied != nil {
+		secOff = 0
+	}
+	var srcs []uint64
+	if at.Execute {
+		// The patcher reads the original frames through the Sentry mapping.
+		bs, err := f.MapInternal(fr, hostarch.AccessType{Read: true})
+		if err != nil {
+			return fmt.Errorf("map the memory file range %v for the patcher: %w", fr, err)
+		}
+		for ; !bs.IsEmpty(); bs = bs.Tail() {
+			b := bs.Head()
+			n := uint64(b.Len())
+			if n%blockSize != 0 || uint64(uintptr(b.Addr()))%blockSize != 0 {
+				return &AlignmentError{Op: "map memory file range", Addr: uint64(uintptr(b.Addr())), Len: n}
+			}
+			for off := uint64(0); off < n; off += blockSize {
+				srcs = append(srcs, uint64(uintptr(b.Addr()))+off)
+			}
+		}
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released {
+		return errAddressSpaceReleased
+	}
+	if copied != nil {
+		as.copies = append(as.copies, copied)
+	}
+	if err := as.win.Map(guest, fr.Length(), sec, secOff, viewProtFor(at)); err != nil {
+		return as.mapErr(fmt.Errorf("map [%#x, %#x): %w", guest, guest+fr.Length(), err))
+	}
+	for i, base := 0, guest; base < guest+fr.Length(); i, base = i+1, base+blockSize {
+		as.dropBlockLocked(base)
+		if at.Execute {
+			as.blocks[base] = &execBlock{base: base, src: srcs[i], srcSec: sec, srcOff: secOff + uint64(i)*blockSize, at: at, state: blockData}
+		}
+	}
+	return nil
+}
+
+// mapErr reports a dead stub as such.
+func (as *addressSpace) mapErr(err error) error {
+	if as.sp.dead.Load() {
+		return as.sp.deathError()
+	}
+	return err
+}
+
+// dropBlockLocked forgets the exec state of one block and frees its copy.
+func (as *addressSpace) dropBlockLocked(base uint64) {
+	if blk, ok := as.blocks[base]; ok {
+		if blk.hasPriv {
+			as.p.priv.release(blk.priv)
+		}
+		delete(as.blocks, base)
+	}
+}
+
+// Unmap implements platform.AddressSpace.Unmap. A range that is not page
+// aligned unmaps whole pages around it, which can only remove more than the
+// request and never leaves access that the memory manager revoked.
+func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
+	start := blockRound(uint64(addr))
+	end := (uint64(addr) + length + blockSize - 1) &^ (blockSize - 1)
+	start = max(start, as.p.userMin)
+	end = min(end, as.p.userMax)
+	if end <= start {
+		return
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released || as.sp.dead.Load() {
+		return
+	}
+	if err := as.win.Unmap(start, end-start); err != nil && !as.sp.dead.Load() {
+		// Windows rejects only a malformed range or a broken window here. Both
+		// are Sentry bugs, and a stale mapping would expose freed memory.
+		panic(fmt.Sprintf("systrap: unmap [%#x, %#x): %v", start, end, err))
+	}
+	// The memory manager unmaps whole address spaces when a process exits, so
+	// the range can hold far more pages than the address space has blocks.
+	if (end-start)/blockSize > uint64(len(as.blocks)) {
+		for base := range as.blocks {
+			if base >= start && base < end {
+				as.dropBlockLocked(base)
+			}
+		}
+	} else {
+		for base := start; base < end; base += blockSize {
+			as.dropBlockLocked(base)
+		}
+	}
+}
+
+// Release implements platform.AddressSpace.Release.
+func (as *addressSpace) Release() {
+	as.mu.Lock()
+	if as.released {
+		as.mu.Unlock()
+		return
+	}
+	as.released = true
+	as.mu.Unlock()
+
+	// Terminating the process stops every thread, so no stub thread touches
+	// the pages that go back to the pool below.
+	as.sp.destroy()
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	for base := range as.blocks {
+		as.dropBlockLocked(base)
+	}
+	if as.internal != nil {
+		as.internal.close()
+		as.internal = nil
+	}
+	for _, c := range as.copies {
+		c.close()
+	}
+	as.copies = nil
+}
+
+// PreFork implements platform.AddressSpace.PreFork.
+func (*addressSpace) PreFork() {}
+
+// PostFork implements platform.AddressSpace.PostFork.
+func (*addressSpace) PostFork() {}
+
+// ----- lazy patching ------------------------------------------------------
+
+var errPatchRaced = errors.New("the block changed while it was patched")
+
+// patchBlock patches the block that holds addr and maps the patched copy as
+// read and execute. It runs on the task goroutine, which is allowed to call
+// into the memory manager.
+func (as *addressSpace) patchBlock(ctx context.Context, mm platform.MemoryManager, addr uint64) error {
+	as.patchMu.Lock()
+	defer as.patchMu.Unlock()
+	base := blockRound(addr)
+	for attempt := 0; attempt < 4; attempt++ {
+		err := as.patchBlockOnce(ctx, mm, base)
+		if !errors.Is(err, errPatchRaced) {
+			return err
+		}
+	}
+	return errPatchRaced
+}
+
+// neighborBytes returns the Sentry copy of up to n bytes at the edge of the
+// exec block next to base. before selects the block under base.
+func (as *addressSpace) neighborBytes(base uint64, before bool, n int) []byte {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	nb := base + blockSize
+	if before {
+		nb = base - blockSize
+	}
+	blk := as.blocks[nb]
+	if blk == nil {
+		return nil
+	}
+	page := blk.frame()
+	if page == nil {
+		return nil
+	}
+	var out []byte
+	if before {
+		out = page[blockSize-n:]
+	} else {
+		out = page[:n]
+	}
+	return append([]byte(nil), out...)
+}
+
+func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryManager, base uint64) error {
+	as.mu.Lock()
+	blk := as.blocks[base]
+	if as.released || blk == nil {
+		as.mu.Unlock()
+		return errPatchRaced
+	}
+	if blk.state == blockExec {
+		// Another thread patched the block while this one waited for patchMu.
+		as.mu.Unlock()
+		return nil
+	}
+	src := blk.src
+	as.mu.Unlock()
+
+	// The guest can write the original frame while this copy runs when the
+	// block allows writes. The patched copy then holds a torn image, but the
+	// guest has no promise about code that it modifies while it executes it.
+	copyBuf := make([]byte, blockSize)
+	copy(copyBuf, unsafe.Slice((*byte)(addrPtr(src)), blockSize))
+	sites, err := as.patchPage(ctx, mm, base, copyBuf)
+	if err != nil {
+		return err
+	}
+
+	pg, err := as.p.priv.alloc()
+	if err != nil {
+		return err
+	}
+	copy(pg.bytes(), copyBuf)
+	if err := flushInstructionCache(windows.CurrentProcess(), uintptr(unsafe.Pointer(&pg.bytes()[0])), blockSize); err != nil {
+		as.p.priv.release(pg)
+		return err
+	}
+
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if cur := as.blocks[base]; as.released || cur != blk || blk.state != blockData || blk.src != src {
+		as.p.priv.release(pg)
+		return errPatchRaced
+	}
+	if err := as.win.Map(base, blockSize, &pg.chunk.ref, pg.off, viewReadExec); err != nil {
+		as.p.priv.release(pg)
+		return as.mapErr(err)
+	}
+	if err := flushInstructionCache(as.sp.proc, uintptr(base), blockSize); err != nil {
+		return err
+	}
+	blk.priv, blk.hasPriv = pg, true
+	blk.state = blockExec
+	blk.sites = sites
+	as.patchedBlocks.Add(1)
+	return nil
+}
+
+// restoreData maps the original frame of a block again, so that a guest write
+// to a writable and executable block succeeds. The next fetch patches again.
+func (as *addressSpace) restoreData(base uint64) (bool, error) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[base]
+	if as.released || blk == nil || blk.state != blockExec || !blk.at.Write {
+		return false, nil
+	}
+	if err := as.win.Map(base, blockSize, blk.srcSec, blk.srcOff, viewProtFor(blk.at)); err != nil {
+		return false, as.mapErr(err)
+	}
+	as.p.priv.release(blk.priv)
+	blk.priv, blk.hasPriv = privPage{}, false
+	blk.state = blockData
+	blk.sites = nil
+	return true, nil
+}
+
+// blockStateOf reports whether base is an exec block and its state.
+func (as *addressSpace) blockStateOf(base uint64) (blockState, hostarch.AccessType, bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[base]
+	if blk == nil {
+		return 0, hostarch.NoAccess, false
+	}
+	return blk.state, blk.at, true
+}
+
+// siteAt returns the description of the patched instruction at guest address
+// a, if the block of a is an executable copy that has one there.
+func (as *addressSpace) siteAt(a uint64) (siteInfo, bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[blockRound(a)]
+	if blk == nil || blk.state != blockExec {
+		return siteInfo{}, false
+	}
+	s, ok := blk.sites[uint16(a-blk.base)]
+	return s, ok
+}
+
+// inPatchedCode reports whether a lies in a patched copy that the stub runs.
+func (as *addressSpace) inPatchedCode(a uint64) bool {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[blockRound(a)]
+	return blk != nil && blk.state == blockExec
+}
+
+// inInternal reports whether a lies in the engine pages.
+func inInternal(a uint64) bool { return a >= internalBase && a < internalBase+internalSize }
+
+// codeBytes returns up to n bytes of the original frames at guest address a,
+// or nil when the block of a is not an exec block.
+func (as *addressSpace) codeBytes(a uint64, n int) []byte {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[blockRound(a)]
+	if blk == nil {
+		return nil
+	}
+	page := blk.frame()
+	if page == nil {
+		return nil
+	}
+	off := int(a - blk.base)
+	out := append([]byte(nil), page[off:min(off+n, blockSize)]...)
+	if len(out) < n {
+		if next := as.blocks[blk.base+blockSize]; next != nil {
+			if np := next.frame(); np != nil {
+				out = append(out, np[:n-len(out)]...)
+			}
+		}
+	}
+	return out
+}
+
+// frame returns the bytes of the block: the original frame, or the patched
+// copy for a block that has no memory file frame.
+func (blk *execBlock) frame() []byte {
+	switch {
+	case blk.src != 0:
+		return unsafe.Slice((*byte)(addrPtr(blk.src)), blockSize)
+	case blk.hasPriv:
+		return blk.priv.bytes()
+	}
+	return nil
+}

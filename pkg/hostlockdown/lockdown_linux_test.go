@@ -127,7 +127,7 @@ func TestLinuxApplyWithWorkspaceReportsTheDirectoryDescriptorGap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st, err := Apply(Options{WorkspacePath: workspace, AllowOutboundNet: true, InstallSyscallFilter: installTestFilter(true)})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: workspace}}, AllowOutboundNet: true, InstallSyscallFilter: installTestFilter(true)})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

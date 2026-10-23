@@ -145,7 +145,7 @@ func TestPullAndRunRegistryImage(t *testing.T) {
 	cacheDir := t.TempDir()
 
 	code, stdout, stderr := runCLI(t, "pull", "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/cli:1")
-	if code != 0 || !strings.Contains(stdout, "pulled gvx/cli:1 (1 EROFS layers cached in "+cacheDir) {
+	if code != 0 || !strings.Contains(stdout, "Digest: sha256:") || !strings.Contains(stdout, "Status: Downloaded newer image for") {
 		t.Fatalf("rungv pull = (code %d, stdout %q, stderr %q)", code, stdout, stderr)
 	}
 	code, stdout, stderr = runCLI(t, "pull", "-arch="+otherArch(), "-cache-dir="+cacheDir, "-registry-url="+baseURL, "gvx/cli:1")

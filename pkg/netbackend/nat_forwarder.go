@@ -337,7 +337,11 @@ func (nf *NATForwarder) spawn(fn func()) bool {
 }
 
 // ResolveOutboundTarget maps a guest destination IP and port to a host network
-// address and enforces the IsolateLAN policy when enabled.
+// address. An address of the guest itself (loopback, the guest IP, or the
+// unspecified address) never leaves the guest: Netstack hands such a SYN to
+// the TCP forwarder when no guest socket listens, and a dial would reach a
+// host service on the same port. The method rejects those addresses. It also
+// enforces the IsolateLAN policy when enabled.
 func (nf *NATForwarder) ResolveOutboundTarget(dstIP netip.Addr, dstPort uint16) (string, error) {
 	gatewayIP := netip.MustParseAddr(HostGatewayIPv4)
 	guestIP := netip.MustParseAddr(DefaultGuestIPv4)
@@ -349,8 +353,12 @@ func (nf *NATForwarder) ResolveOutboundTarget(dstIP netip.Addr, dstPort uint16) 
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(dstPort))), nil
 	}
 
+	if dstIP == guestIP || dstIP.IsLoopback() || dstIP.IsUnspecified() {
+		return "", fmt.Errorf("netbackend: %s is an address of the guest itself, and no guest socket listens on it; use the host gateway %s to reach the host", dstIP, gatewayIP)
+	}
+
 	if nf.cfg.IsolateLAN {
-		if dstIP == guestIP || dstIP.IsLoopback() || dstIP.IsPrivate() || dstIP.IsLinkLocalUnicast() || dstIP.IsLinkLocalMulticast() {
+		if dstIP.IsPrivate() || dstIP.IsLinkLocalUnicast() || dstIP.IsLinkLocalMulticast() {
 			return "", fmt.Errorf("netbackend: outbound access to private/local address %s blocked by -isolate-lan", dstIP)
 		}
 	}

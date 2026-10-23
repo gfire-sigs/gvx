@@ -64,7 +64,7 @@ func RequireAppContainer() error {
 	return requireAppContainerToken(token)
 }
 
-func applyAppContainerLockdown(primary windows.Token) (Status, error) {
+func applyAppContainerLockdown(primary windows.Token, cpuQuotaMillis int64) (Status, error) {
 	if err := requireAppContainerToken(primary); err != nil {
 		return Status{}, err
 	}
@@ -87,5 +87,14 @@ func applyAppContainerLockdown(primary windows.Token) (Status, error) {
 	} else {
 		return Status{}, errors.New("hostlockdown: worker has no user profile for the file probe")
 	}
-	return Status{AppContainer: true, SubprocessBlocked: true, UnboundFileOpenBlocked: true, NetworkOutboundBlocked: true, IntegrityDowngraded: true, Win32kBlocked: true}, nil
+	if cpuQuotaMillis > 0 {
+		var actual jobCPURateControl
+		if err := queryJobInformation(0, jobObjectCPURateControlInformation, unsafe.Pointer(&actual), unsafe.Sizeof(actual)); err != nil {
+			return Status{}, err
+		}
+		if actual.ControlFlags&(jobCPURateControlEnable|jobCPURateControlHardCap) != jobCPURateControlEnable|jobCPURateControlHardCap {
+			return Status{}, errors.New("hostlockdown: worker has no CPU cap")
+		}
+	}
+	return Status{CPUQuotaEnforced: cpuQuotaMillis > 0, AppContainer: true, SubprocessBlocked: true, UnboundFileOpenBlocked: true, NetworkOutboundBlocked: true, IntegrityDowngraded: true, Win32kBlocked: true}, nil
 }

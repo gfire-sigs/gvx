@@ -60,6 +60,15 @@ func winErrno(err error) Errno {
 	return errno
 }
 
+// winError is winErrno for a function that returns an error. A nil error stays
+// nil, where a zero Errno in an error would report a failure.
+func winError(err error) error {
+	if errno := winErrno(err); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 // winMapping describes one mapping that mmap created.
 type winMapping struct {
 	base    uintptr // Address that UnmapViewOfFile or VirtualFree needs.
@@ -387,10 +396,12 @@ func Mprotect(b []byte, prot int) error {
 	return nil
 }
 
-// Fallocate extends a file or punches a hole, as far as Windows allows.
+// Fallocate extends a file, as far as Windows allows.
 // Mode 0 grows the file to off+length and never shrinks it.
-// FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE marks the file sparse and zeroes the
-// range with FSCTL_SET_ZERO_DATA. NTFS refuses the call with EBUSY while a view maps the range.
+// FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE returns ENOTSUP, and the caller
+// zeroes the range itself. A hole makes the file sparse, and the first write to
+// each hole of a sparse file waits for NTFS to allocate a cluster. A guest that
+// wrote to a mapped sparse memory file ran 10 to 20 times slower.
 func Fallocate(fd int, mode uint32, off int64, length int64) error {
 	if off < 0 || length <= 0 {
 		return EINVAL
@@ -403,25 +414,9 @@ func Fallocate(fd int, mode uint32, off int64, length int64) error {
 	switch mode {
 	case 0:
 		if target := off + length; target > st.Size {
-			return winErrno(windows.Ftruncate(handle, target))
+			return winError(windows.Ftruncate(handle, target))
 		}
 		return nil
-	case FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE:
-		// NTFS caches in 4KB pages. A range that splits a page would zero live neighbours.
-		if off%winPageSize != 0 || (off+length)%winPageSize != 0 {
-			return ENOTSUP
-		}
-		if off >= st.Size {
-			return nil
-		}
-		var returned uint32
-		if err := windows.DeviceIoControl(handle, windows.FSCTL_SET_SPARSE, nil, 0, nil, 0, &returned, nil); err != nil {
-			return winErrno(err)
-		}
-		// FILE_ZERO_DATA_INFORMATION: FileOffset, then BeyondFinalZero.
-		zero := [2]int64{off, min(off+length, st.Size)}
-		err := windows.DeviceIoControl(handle, windows.FSCTL_SET_ZERO_DATA, (*byte)(unsafe.Pointer(&zero)), uint32(unsafe.Sizeof(zero)), nil, 0, &returned, nil)
-		return winErrno(err)
 	}
 	return ENOTSUP
 }

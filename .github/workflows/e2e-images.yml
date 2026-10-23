@@ -4,11 +4,19 @@ name: e2e-images
 # demand instead of on every push. The hosted macOS runner has no hypervisor.
 # The macOS job runs the systrap variants of the gates, which need none. The
 # Linux jobs run every gate on the upstream systrap platform with the seccomp
-# lockdown, because Linux has no hypervisor backend.
+# lockdown, because Linux has no hypervisor backend. The Windows jobs run the
+# systrap variants on the engine of gvx. The windows-11-arm runner has no
+# hypervisor either.
 on:
   schedule:
     - cron: "17 3 * * 0"
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Run one job family: all, darwin, linux, or windows"
+        type: choice
+        default: all
+        options: [all, darwin, linux, windows]
 
 concurrency:
   group: e2e-images
@@ -23,6 +31,7 @@ env:
 jobs:
   darwin-arm64-systrap:
     name: systrap gates on darwin/arm64
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -39,9 +48,13 @@ jobs:
             -exec "$PWD/scripts/codesign-exec.sh" \
             -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
             ./e2e
+          go test -count=1 -timeout 30m -tags pagesize_16k \
+            -exec "$PWD/scripts/codesign-exec.sh" \
+            -run 'TestE2EDockerRun.*/systrap' ./e2e
 
   linux-systrap:
     name: gates on linux/${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -63,3 +76,28 @@ jobs:
           go-version-file: go.mod
       - name: Run the registry gates on the upstream systrap platform
         run: go test -count=1 -timeout 50m ./e2e
+
+  windows-systrap:
+    name: systrap gates on ${{ matrix.os }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+      GVX_E2E_REQUIRE_NETWORK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run the registry gates on the systrap engine
+        shell: bash
+        run: |
+          go test -count=1 -timeout 80m -skip 'HostLockdown' \
+            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
+            ./e2e
+          go test -count=1 -timeout 30m -skip 'HostLockdown' -run 'TestE2EDockerRun.*/systrap' ./e2e

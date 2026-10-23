@@ -158,6 +158,66 @@ func TestNATIsolateLANPolicy(t *testing.T) {
 	}
 }
 
+// TestNATGuestLocalAddressesNeverReachHostServices proves that a guest dial to
+// its own loopback or its own address fails while a host service listens on
+// the same port. Netstack hands such a SYN to the forwarder when no guest
+// socket listens, so a plain dial would reach the host service.
+func TestNATGuestLocalAddressesNeverReachHostServices(t *testing.T) {
+	hostLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer func() {
+		_ = hostLn.Close()
+	}()
+	hostPort := uint16(hostLn.Addr().(*net.TCPAddr).Port)
+	accepted := make(chan struct{}, 4)
+	go func() {
+		for {
+			conn, acceptErr := hostLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			accepted <- struct{}{}
+			_ = conn.Close()
+		}
+	}()
+
+	s, natFwd, err := NewNATStack(NATConfig{IsolateLAN: false})
+	if err != nil {
+		t.Fatalf("NewNATStack failed: %v", err)
+	}
+	defer func() {
+		_ = natFwd.Close()
+		s.Close()
+	}()
+
+	for _, guestLocal := range [][4]byte{{127, 0, 0, 1}, {10, 0, 2, 15}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, err := gonet.DialContextTCP(ctx, s, tcpip.FullAddress{Addr: tcpip.AddrFrom4(guestLocal), Port: hostPort}, ipv4.ProtocolNumber)
+		cancel()
+		if err == nil {
+			_ = conn.Close()
+			t.Errorf("guest dial to %v:%d succeeded, want a refused connection", net.IP(guestLocal[:]), hostPort)
+		}
+	}
+	select {
+	case <-accepted:
+		t.Error("the host service accepted a connection from a guest dial to a guest-local address")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	nf := &NATForwarder{}
+	for _, ipStr := range []string{"::1", "0.0.0.0", "::"} {
+		if _, err := nf.ResolveOutboundTarget(netip.MustParseAddr(ipStr), hostPort); err == nil {
+			t.Errorf("ResolveOutboundTarget(%s) succeeded, want an error", ipStr)
+		}
+	}
+	if target, err := nf.ResolveOutboundTarget(netip.MustParseAddr(HostGatewayIPv4), hostPort); err != nil || target != fmt.Sprintf("127.0.0.1:%d", hostPort) {
+		t.Errorf("ResolveOutboundTarget(gateway) = (%q, %v), want the host loopback", target, err)
+	}
+}
+
 func TestNATVirtualDNSRelayUDPAndTCP(t *testing.T) {
 	s, natFwd, err := NewNATStack(NATConfig{
 		IsolateLAN: true,

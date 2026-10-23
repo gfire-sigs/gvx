@@ -33,7 +33,7 @@ func TestProbesRejectUnlockedProcess(t *testing.T) {
 		want string
 	}{
 		{"subprocess", probeSubprocessBlocked, "spawn succeeded"},
-		{"unlisted open", func() error { return probeUnlistedOpenBlocked(ws) }, "succeeded after lockdown"},
+		{"unlisted open", func() error { return probeUnlistedOpenBlocked([]string{ws}) }, "succeeded after lockdown"},
 		{"outbound", probeOutboundBlocked, "reached the network stack"},
 	}
 	for _, tt := range tests {
@@ -46,13 +46,16 @@ func TestProbesRejectUnlockedProcess(t *testing.T) {
 	}
 }
 
-func TestProbeWorkspaceReachable(t *testing.T) {
-	ws := realTempDir(t)
-	if err := probeWorkspaceReachable(ws); err != nil {
-		t.Fatalf("probeWorkspaceReachable(existing) = %v", err)
+func TestProbeMountsReachable(t *testing.T) {
+	first, second := realTempDir(t), realTempDir(t)
+	if err := probeMountsReachable([]string{first, second}); err != nil {
+		t.Fatalf("probeMountsReachable(existing) = %v", err)
 	}
-	if err := probeWorkspaceReachable(filepath.Join(ws, "absent")); err == nil {
-		t.Fatal("probeWorkspaceReachable(missing) = nil, want error")
+	if err := probeMountsReachable(nil); err != nil {
+		t.Fatalf("probeMountsReachable(no mounts) = %v", err)
+	}
+	if err := probeMountsReachable([]string{first, filepath.Join(second, "absent")}); err == nil {
+		t.Fatal("probeMountsReachable(second mount missing) = nil, want error")
 	}
 }
 

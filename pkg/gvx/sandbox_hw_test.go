@@ -375,11 +375,13 @@ func staticBase() uint64 {
 	return systrapBase()
 }
 
-// systrapBase returns a link address that the systrap platform of the host
+// systrapBase returns a link address that every systrap engine of the host
 // allows. The macOS engine places guest addresses above the host reservations,
 // which end at 0x7000000000 on Apple silicon, so it needs an address at 16TB.
-// The upstream Linux platform accepts the classic 0x400000, and the amd64 HTTP
-// server guest needs an address below 4GB.
+// The Windows engine holds 16TB and up in its high window, and the classic
+// addresses in its low window. The test of the low window is
+// TestSandboxStartsStaticExecutablesAtLowAddresses. The upstream Linux
+// platform accepts the classic 0x400000.
 func systrapBase() uint64 {
 	if runtime.GOOS == "linux" {
 		return 0x400000
@@ -427,6 +429,50 @@ func TestSandboxRunsStaticAndDynamicELF64UnderSystrap(t *testing.T) {
 			code, err := sb.Run(context.Background())
 			if err != nil || code != tc.wantCode || outBuf.String() != tc.wantOut {
 				t.Fatalf("Run() = (%d, %v) stdout %q, want (%d, nil) %q", code, err, outBuf.String(), tc.wantCode, tc.wantOut)
+			}
+		})
+	}
+}
+
+// TestSandboxStartsStaticExecutablesAtLowAddresses starts static executables
+// that link at the addresses that real linkers use: 0x10000 for Go on arm64 and
+// 0x400000 for most others. The Windows engine holds them in its low window.
+// The macOS engine cannot hold them, because every arm64 task has a 4GB
+// PAGEZERO. It must refuse and name the cause and the engine that works.
+func TestSandboxStartsStaticExecutablesAtLowAddresses(t *testing.T) {
+	systraptest.Require(t)
+	for _, base := range []uint64{0x10000, 0x400000} {
+		t.Run("base-0x"+strconv.FormatUint(base, 16), func(t *testing.T) {
+			elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, base, 0, "low-window-ok\n")
+			if err != nil {
+				t.Fatalf("BuildGuestELF64At failed: %v", err)
+			}
+			cfg := hostTestConfig(t)
+			cfg.Platform = PlatformSystrap
+			cfg.ELFBytes = elf
+			var outBuf bytes.Buffer
+			cfg.Stdout = &outBuf
+			sb, err := New(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("New(systrap) failed: %v", err)
+			}
+			defer func() {
+				if err := sb.Close(); err != nil {
+					t.Errorf("Close() failed: %v", err)
+				}
+			}()
+			code, err := sb.Run(context.Background())
+			if runtime.GOOS == "windows" {
+				if err != nil || code != 0 || outBuf.String() != "low-window-ok\n" {
+					t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), "low-window-ok\n")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Run() = (%d, nil), want an error: this engine cannot hold an executable at %#x", code, base)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "position-independent") || !strings.Contains(msg, "-platform=hvf") {
+				t.Errorf("error %q does not name the cause and the engine that works", msg)
 			}
 		})
 	}

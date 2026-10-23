@@ -39,9 +39,12 @@ type WorkerOptions struct {
 // ProcessSandbox runs Sentry in a Windows AppContainer and keeps the caller outside its restrictions.
 // Close releases the worker and broker after Run. A ProcessSandbox executes one guest command.
 type ProcessSandbox struct {
-	state  *processState
-	status hostlockdown.Status
-	ports  []int
+	state     *processState
+	status    hostlockdown.Status
+	ports     []int
+	published []PublishedPort
+	limits    LimitReport
+	platform  string
 }
 
 // NewProcess prepares image layers before it starts an isolated worker. Windows supports this API.
@@ -60,8 +63,12 @@ func ServeProcess(ctx context.Context, options WorkerOptions) error {
 
 func (p *ProcessSandbox) Run(ctx context.Context) (int, error) { return p.state.run(ctx) }
 func (p *ProcessSandbox) Close() error                         { return p.state.close() }
-func (p *ProcessSandbox) PlatformName() string                 { return string(PlatformWHPX) }
+func (p *ProcessSandbox) PlatformName() string                 { return p.platform }
 func (p *ProcessSandbox) LockdownStatus() hostlockdown.Status  { return p.status }
+func (p *ProcessSandbox) PublishedPorts() []PublishedPort {
+	return append([]PublishedPort(nil), p.published...)
+}
+func (p *ProcessSandbox) Limits() LimitReport { return p.limits }
 func (p *ProcessSandbox) BoundPort(index int) int {
 	if index < 0 || index >= len(p.ports) {
 		return 0

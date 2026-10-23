@@ -70,8 +70,8 @@ func applyOSLockdown(opts Options) (Status, error) {
 	if err != nil {
 		return st, err
 	}
-	if !dirfdBlocked && opts.WorkspacePath == "" {
-		return st, errors.New("hostlockdown: the filter allows an open through a directory descriptor, and no workspace needs it")
+	if !dirfdBlocked && len(opts.Mounts) == 0 {
+		return st, errors.New("hostlockdown: the filter allows an open through a directory descriptor, and no mount needs it")
 	}
 	st.UnboundFileOpenBlocked = dirfdBlocked
 

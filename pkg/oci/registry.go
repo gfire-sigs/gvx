@@ -26,8 +26,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -71,6 +69,15 @@ type registryClient struct {
 	idle    time.Duration
 	// authz is the Authorization header value that the last challenge produced.
 	authz string
+	// store supplies the credentials of the registry.
+	store CredentialStore
+	// fixed replaces the store when set. Login uses it to test credentials
+	// that are not stored yet.
+	fixed       *Credentials
+	credsLoaded bool
+	cred        Credentials
+	haveCred    bool
+	credErr     error
 }
 
 func newRegistryClient(client *http.Client, baseURL, repo string, lim Limits) (*registryClient, error) {
@@ -390,16 +397,32 @@ type bearerTokenResponse struct {
 	AccessToken string `json:"access_token"`
 }
 
+// credentials returns the stored credentials for the registry. It asks the
+// store once and keeps the answer, so a retry does not run a helper again.
+func (rc *registryClient) credentials(ctx context.Context) (Credentials, bool, error) {
+	if rc.fixed != nil {
+		return *rc.fixed, true, nil
+	}
+	if !rc.credsLoaded {
+		rc.cred, rc.haveCred, rc.credErr = rc.store.Lookup(ctx, rc.baseURL.String())
+		rc.credsLoaded = true
+	}
+	return rc.cred, rc.haveCred, rc.credErr
+}
+
 // authorize answers a 401 challenge and stores the resulting credentials.
 func (rc *registryClient) authorize(ctx context.Context, header string) error {
 	ch := parseChallenge(header)
-	cred, haveCred := loadDockerConfigAuth(rc.baseURL.String())
+	cred, haveCred, err := rc.credentials(ctx)
+	if err != nil {
+		return err
+	}
 	switch ch.scheme {
 	case "basic":
-		if !haveCred || (cred.username == "" && cred.password == "") {
+		if !haveCred || (cred.Username == "" && cred.Password == "") {
 			return fmt.Errorf("oci: basic authentication required by %s but no credentials found in docker config", rc.baseURL.Host)
 		}
-		rc.authz = "Basic " + base64.StdEncoding.EncodeToString([]byte(cred.username+":"+cred.password))
+		rc.authz = "Basic " + base64.StdEncoding.EncodeToString([]byte(cred.Username+":"+cred.Password))
 		return nil
 	case "bearer":
 		token, err := rc.fetchBearerToken(ctx, ch, cred, haveCred)
@@ -413,7 +436,7 @@ func (rc *registryClient) authorize(ctx context.Context, header string) error {
 	}
 }
 
-func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cred dockerCredential, haveCred bool) (string, error) {
+func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cred Credentials, haveCred bool) (string, error) {
 	realm := ch.params["realm"]
 	if realm == "" {
 		return "", errors.New("oci: missing realm in WWW-Authenticate challenge")
@@ -430,10 +453,10 @@ func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cr
 	useCred := haveCred && realmMayReceiveCredentials(rc.baseURL, u)
 
 	var req *http.Request
-	if useCred && cred.username == "" && cred.password == "" && cred.identityToken != "" {
+	if useCred && cred.Username == "" && cred.Password == "" && cred.IdentityToken != "" {
 		form := url.Values{
 			"grant_type":    {"refresh_token"},
-			"refresh_token": {cred.identityToken},
+			"refresh_token": {cred.IdentityToken},
 			"client_id":     {userAgent},
 		}
 		if s := ch.params["service"]; s != "" {
@@ -460,8 +483,8 @@ func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cr
 		if err != nil {
 			return "", fmt.Errorf("oci: build token request: %w", err)
 		}
-		if useCred && (cred.username != "" || cred.password != "") {
-			req.SetBasicAuth(cred.username, cred.password)
+		if useCred && (cred.Username != "" || cred.Password != "") {
+			req.SetBasicAuth(cred.Username, cred.Password)
 		}
 	}
 	req.Header.Set("User-Agent", userAgent)
@@ -490,85 +513,4 @@ func (rc *registryClient) fetchBearerToken(ctx context.Context, ch challenge, cr
 	default:
 		return "", errors.New("oci: empty bearer token in auth response")
 	}
-}
-
-type dockerConfigFile struct {
-	Auths map[string]struct {
-		Auth          string `json:"auth"`
-		Username      string `json:"username"`
-		Password      string `json:"password"`
-		IdentityToken string `json:"identitytoken"`
-		RegistryToken string `json:"registrytoken"`
-	} `json:"auths"`
-}
-
-// dockerCredential is one entry of the docker config auths table.
-type dockerCredential struct {
-	username      string
-	password      string
-	identityToken string
-}
-
-// configKeyHost returns the canonical host of a docker config auths key.
-func configKeyHost(key string) string {
-	k := strings.ToLower(strings.TrimSpace(key))
-	if strings.Contains(k, "://") {
-		if u, err := url.Parse(k); err == nil && u.Host != "" {
-			return canonicalHost(u)
-		}
-	}
-	if slash := strings.IndexByte(k, '/'); slash >= 0 {
-		k = k[:slash]
-	}
-	return strings.TrimSuffix(k, ":443")
-}
-
-// loadDockerConfigAuth returns the docker config credentials for the registry
-// at rawTargetURL. Credential helpers are not consulted.
-func loadDockerConfigAuth(rawTargetURL string) (dockerCredential, bool) {
-	parsed, err := url.Parse(rawTargetURL)
-	if err != nil || parsed.Host == "" {
-		return dockerCredential{}, false
-	}
-	targetHost := canonicalHost(parsed)
-
-	cfgPath := ""
-	if dir := os.Getenv("DOCKER_CONFIG"); dir != "" {
-		cfgPath = filepath.Join(dir, "config.json")
-	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
-		cfgPath = filepath.Join(home, ".docker", "config.json")
-	}
-	if cfgPath == "" {
-		return dockerCredential{}, false
-	}
-	raw, err := readFileShared(cfgPath)
-	if err != nil {
-		return dockerCredential{}, false
-	}
-	var cfg dockerConfigFile
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return dockerCredential{}, false
-	}
-
-	hubTarget := dockerHubHosts[strings.ToLower(parsed.Hostname())]
-	for key, entry := range cfg.Auths {
-		keyHost := configKeyHost(key)
-		if keyHost != targetHost && !(hubTarget && dockerHubHosts[strings.TrimSuffix(keyHost, ":443")]) {
-			continue
-		}
-		if entry.Username != "" || entry.Password != "" {
-			return dockerCredential{username: entry.Username, password: entry.Password, identityToken: entry.IdentityToken}, true
-		}
-		if entry.Auth != "" {
-			if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(entry.Auth)); err == nil {
-				if user, pass, found := strings.Cut(string(decoded), ":"); found {
-					return dockerCredential{username: user, password: pass, identityToken: entry.IdentityToken}, true
-				}
-			}
-		}
-		if entry.IdentityToken != "" {
-			return dockerCredential{identityToken: entry.IdentityToken}, true
-		}
-	}
-	return dockerCredential{}, false
 }

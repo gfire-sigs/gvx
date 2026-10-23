@@ -438,12 +438,8 @@ func BuildGuestHTTPServerELF64(targetArch string, port uint16, serveFilePath str
 }
 
 // BuildGuestHTTPServerELF64At is like BuildGuestHTTPServerELF64 but links the
-// image at baseVA. The arm64 code reaches any 48-bit baseVA. The amd64 code
-// loads addresses with 32-bit immediates, so it needs a baseVA below 4GB.
+// image at baseVA. Both codes reach any 48-bit baseVA.
 func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, serveFilePath string, workspaceOutPath string, workspaceOutContent string) ([]byte, error) {
-	if (targetArch == "amd64" || targetArch == "x86_64") && baseVA >= 1<<32 {
-		return nil, fmt.Errorf("testelf: baseVA %#x does not fit the 32-bit immediates of the amd64 code", baseVA)
-	}
 	if baseVA >= 1<<48 {
 		return nil, fmt.Errorf("testelf: baseVA %#x is above the 48-bit address space", baseVA)
 	}
@@ -585,17 +581,22 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 			binary.LittleEndian.PutUint32(b[3:7], val)
 			code = append(code, b[:]...)
 		}
+		// movAddr loads a 64-bit address into RSI with MOVABS.
+		movAddr := func(val uint64) {
+			code = append(code, 0x48, 0xbe)
+			code = binary.LittleEndian.AppendUint64(code, val)
+		}
 
 		if workspaceOutPath != "" {
-			movImm32(0x48, 0xc7, ^uint32(99))              // MOV RDI, -100
-			movImm32(0x48, 0xc6, uint32(baseVA+wsPathOff)) // MOV RSI, wsPathVA
-			movImm32(0x48, 0xc2, 0x241)                    // MOV RDX, O_WRONLY|O_CREAT|O_TRUNC
-			movImm32(0x49, 0xc2, 0o644)                    // MOV R10, 0644
-			movImm32(0x48, 0xc0, 257)                      // MOV RAX, 257 (SYS_openat)
-			code = append(code, 0x0f, 0x05)                // SYSCALL
-			code = append(code, 0x49, 0x89, 0xc4)          // MOV R12, RAX
-			code = append(code, 0x4c, 0x89, 0xe7)          // MOV RDI, R12
-			movImm32(0x48, 0xc6, uint32(baseVA+wsContentOff))
+			movImm32(0x48, 0xc7, ^uint32(99))     // MOV RDI, -100
+			movAddr(baseVA + wsPathOff)           // MOV RSI, wsPathVA
+			movImm32(0x48, 0xc2, 0x241)           // MOV RDX, O_WRONLY|O_CREAT|O_TRUNC
+			movImm32(0x49, 0xc2, 0o644)           // MOV R10, 0644
+			movImm32(0x48, 0xc0, 257)             // MOV RAX, 257 (SYS_openat)
+			code = append(code, 0x0f, 0x05)       // SYSCALL
+			code = append(code, 0x49, 0x89, 0xc4) // MOV R12, RAX
+			code = append(code, 0x4c, 0x89, 0xe7) // MOV RDI, R12
+			movAddr(baseVA + wsContentOff)
 			movImm32(0x48, 0xc2, uint32(len(workspaceOutContent)))
 			movImm32(0x48, 0xc0, 1)               // MOV RAX, 1 (SYS_write)
 			code = append(code, 0x0f, 0x05)       // SYSCALL
@@ -606,13 +607,13 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 
 		// Read serveFilePath into baseVA + httpBodyOff.
 		movImm32(0x48, 0xc7, ^uint32(99))
-		movImm32(0x48, 0xc6, uint32(baseVA+servePathOff))
+		movAddr(baseVA + servePathOff)
 		code = append(code, 0x48, 0x31, 0xd2, 0x4d, 0x31, 0xd2) // XOR RDX, RDX; XOR R10, R10
 		movImm32(0x48, 0xc0, 257)                               // SYS_openat
 		code = append(code, 0x0f, 0x05)
 		code = append(code, 0x49, 0x89, 0xc4) // MOV R12, RAX (fd)
 		code = append(code, 0x4c, 0x89, 0xe7) // MOV RDI, R12
-		movImm32(0x48, 0xc6, uint32(baseVA+httpBodyOff))
+		movAddr(baseVA + httpBodyOff)
 		movImm32(0x48, 0xc2, 512)
 		code = append(code, 0x48, 0x31, 0xc0, 0x0f, 0x05) // SYS_read
 		code = append(code, 0x49, 0x89, 0xc5)             // MOV R13, RAX (bodyLen)
@@ -630,7 +631,7 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 
 		// SYS_bind(listenFD, sockaddrVA, 16)
 		code = append(code, 0x4c, 0x89, 0xe7)
-		movImm32(0x48, 0xc6, uint32(baseVA+sockaddrOff))
+		movAddr(baseVA + sockaddrOff)
 		movImm32(0x48, 0xc2, 16)
 		movImm32(0x48, 0xc0, 49) // SYS_bind
 		code = append(code, 0x0f, 0x05)
@@ -649,13 +650,13 @@ func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, 
 
 		// SYS_read(connFD, reqScratchVA, 512)
 		code = append(code, 0x4c, 0x89, 0xf7) // MOV RDI, R14
-		movImm32(0x48, 0xc6, uint32(baseVA+reqScratchOff))
+		movAddr(baseVA + reqScratchOff)
 		movImm32(0x48, 0xc2, 512)
 		code = append(code, 0x48, 0x31, 0xc0, 0x0f, 0x05)
 
 		// SYS_write(connFD, httpRespVA, 38 + R13)
 		code = append(code, 0x4c, 0x89, 0xf7) // MOV RDI, R14
-		movImm32(0x48, 0xc6, uint32(baseVA+httpRespOff))
+		movAddr(baseVA + httpRespOff)
 		code = append(code, 0x4c, 0x89, 0xea)     // MOV RDX, R13
 		code = append(code, 0x48, 0x83, 0xc2, 38) // ADD RDX, 38
 		movImm32(0x48, 0xc0, 1)                   // SYS_write

@@ -65,7 +65,7 @@ func TestGvxFallocateExtendsButNeverShrinks(t *testing.T) {
 	}
 }
 
-func TestGvxFallocatePunchHoleZeroesUnmappedRange(t *testing.T) {
+func TestGvxFallocatePunchHoleIsUnsupported(t *testing.T) {
 	const size = 128 * 1024
 	f := gvxTempFile(t, size)
 	data := make([]byte, size)
@@ -76,23 +76,16 @@ func TestGvxFallocatePunchHoleZeroesUnmappedRange(t *testing.T) {
 		t.Fatalf("WriteAt: %v", err)
 	}
 	const mode = unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE
-	if err := unix.Fallocate(int(f.Fd()), mode, 65536, 65536); err != nil {
-		t.Fatalf("Fallocate(PUNCH_HOLE): %v", err)
-	}
-	if got := gvxFileSize(t, f); got != size {
-		t.Fatalf("size after punch = %d, want %d (KEEP_SIZE)", got, size)
+	if err := unix.Fallocate(int(f.Fd()), mode, 65536, 65536); !errors.Is(err, unix.ENOTSUP) {
+		t.Fatalf("Fallocate(PUNCH_HOLE) = %v, want ENOTSUP, so that the caller zeroes the range", err)
 	}
 	buf := make([]byte, size)
 	if _, err := f.ReadAt(buf, 0); err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
 	for i, b := range buf {
-		want := byte(0xAA)
-		if i >= 65536 {
-			want = 0
-		}
-		if b != want {
-			t.Fatalf("file[%d] = %#x after punch, want %#x", i, b, want)
+		if b != 0xAA {
+			t.Fatalf("file[%d] = %#x after the refused punch, want 0xaa", i, b)
 		}
 	}
 }

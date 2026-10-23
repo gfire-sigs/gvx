@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux && !(darwin && arm64 && pagesize_16k)
+//go:build !linux && !windows && !(darwin && arm64 && pagesize_16k)
 
 package main
 
@@ -23,8 +23,9 @@ import (
 )
 
 // TestStubReportsUnavailableEngine covers every host without a runnable
-// systrap engine: the default 4KB build on darwin/arm64, darwin/amd64, and
-// Windows. Linux runs the upstream platform. The command prints no stub data and exits with the engine error.
+// systrap engine: the default 4KB build on darwin/arm64 and darwin/amd64.
+// Linux runs the upstream platform, and Windows runs the engine of gvx. The
+// command prints no stub data and exits with the engine error.
 func TestStubReportsUnavailableEngine(t *testing.T) {
 	code, stdout, stderr := runStub(t)
 	if code != 1 || stdout != "" {

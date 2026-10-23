@@ -17,7 +17,6 @@
 package hostlockdown
 
 import (
-	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -37,12 +36,13 @@ func addrOfSandboxInitWithParameters() uintptr
 func sandboxFreeErrorTrampoline()
 func addrOfSandboxFreeError() uintptr
 
-// Seatbelt parameter names. The profile refers to them with (param "NAME") so
-// that path strings never appear inside the SBPL text.
-const (
-	paramWorkspace     = "WORKSPACE_DIR"
-	paramWorkspaceReal = "WORKSPACE_DIR_REAL"
-)
+// mountParam returns the Seatbelt parameter names of mount i. The profile
+// refers to them with (param "NAME") so that path strings never appear inside
+// the SBPL text. The first name carries the absolute path as given. The second
+// carries the path after symlink resolution.
+func mountParam(i int) (given, real string) {
+	return fmt.Sprintf("MOUNT_%d", i), fmt.Sprintf("MOUNT_%d_REAL", i)
+}
 
 // BuildSeatbeltProfile returns the macOS Seatbelt SBPL policy for opts.
 //
@@ -62,15 +62,16 @@ func BuildSeatbeltProfile(opts Options) string {
 	// Helpers that started before Apply, such as the systrap stub, stay
 	// signalable for shutdown. Apply blocks fork, so no other child can exist.
 	b.WriteString("(allow signal (target children))\n")
-	if opts.WorkspacePath != "" {
+	for i, m := range opts.Mounts {
 		// Seatbelt evaluates the resolved path of every open, including
 		// openat relative to a pinned directory descriptor.
 		ops := "file-read* file-write*"
-		if opts.WorkspaceReadOnly {
+		if m.ReadOnly {
 			ops = "file-read*"
 		}
-		fmt.Fprintf(&b, "(allow %s (subpath (param %q)))\n", ops, paramWorkspace)
-		fmt.Fprintf(&b, "(allow %s (subpath (param %q)))\n", ops, paramWorkspaceReal)
+		given, real := mountParam(i)
+		fmt.Fprintf(&b, "(allow %s (subpath (param %q)))\n", ops, given)
+		fmt.Fprintf(&b, "(allow %s (subpath (param %q)))\n", ops, real)
 	}
 	switch {
 	case opts.AllowOutboundNet:
@@ -93,22 +94,36 @@ func BuildSeatbeltProfile(opts Options) string {
 // grants bind, and only pre-bound sockets may receive traffic.
 const denyNewBind = "(deny network-bind)\n"
 
+// resolveMounts returns the absolute path of every mount and the path after
+// symlink resolution. The result has one entry per mount, in order.
+func resolveMounts(mounts []HostMount) (abs, real []string, err error) {
+	for _, m := range mounts {
+		a, err := filepath.Abs(m.Path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("hostlockdown: resolve mount %q: %w", m.Path, err)
+		}
+		r, err := filepath.EvalSymlinks(a)
+		if err != nil {
+			return nil, nil, fmt.Errorf("hostlockdown: resolve mount symlinks %q: %w", a, err)
+		}
+		if r == "/" {
+			return nil, nil, fmt.Errorf("hostlockdown: mount %q resolves to \"/\" and would allow every host file", m.Path)
+		}
+		abs = append(abs, a)
+		real = append(real, r)
+	}
+	return abs, real, nil
+}
+
 func applyOSLockdown(opts Options) (Status, error) {
+	absPaths, realPaths, err := resolveMounts(opts.Mounts)
+	if err != nil {
+		return Status{}, err
+	}
 	var params []string
-	var workspaceReal string
-	if opts.WorkspacePath != "" {
-		absWS, err := filepath.Abs(opts.WorkspacePath)
-		if err != nil {
-			return Status{}, fmt.Errorf("hostlockdown: resolve workspace %q: %w", opts.WorkspacePath, err)
-		}
-		workspaceReal, err = filepath.EvalSymlinks(absWS)
-		if err != nil {
-			return Status{}, fmt.Errorf("hostlockdown: resolve workspace symlinks %q: %w", absWS, err)
-		}
-		if workspaceReal == "/" {
-			return Status{}, errors.New("hostlockdown: workspace \"/\" would allow every host file")
-		}
-		params = append(params, paramWorkspace, absWS, paramWorkspaceReal, workspaceReal)
+	for i := range opts.Mounts {
+		given, real := mountParam(i)
+		params = append(params, given, absPaths[i], real, realPaths[i])
 	}
 	profile := BuildSeatbeltProfile(opts)
 
@@ -132,13 +147,11 @@ func applyOSLockdown(opts Options) (Status, error) {
 	if err := probeSubprocessBlocked(); err != nil {
 		return Status{}, err
 	}
-	if err := probeUnlistedOpenBlocked(workspaceReal); err != nil {
+	if err := probeUnlistedOpenBlocked(realPaths); err != nil {
 		return Status{}, err
 	}
-	if workspaceReal != "" {
-		if err := probeWorkspaceReachable(workspaceReal); err != nil {
-			return Status{}, err
-		}
+	if err := probeMountsReachable(realPaths); err != nil {
+		return Status{}, err
 	}
 	if err := desc.verify(); err != nil {
 		return Status{}, err

@@ -49,8 +49,8 @@ func TestParseRunArgsDefaults(t *testing.T) {
 	if cfg.NetworkMode != gvx.NetModeNAT {
 		t.Errorf("NetworkMode = %q, want nat", cfg.NetworkMode)
 	}
-	if cfg.OCIImage != "alpine:3.20" || strings.Join(cfg.Argv, " ") != "echo hi" {
-		t.Errorf("image/argv = %q %q", cfg.OCIImage, cfg.Argv)
+	if cfg.OCIImage != "alpine:3.20" || strings.Join(cfg.Cmd, " ") != "echo hi" || len(cfg.Argv) != 0 {
+		t.Errorf("image/cmd/argv = %q %q %q, want the arguments of an image as Cmd and no Argv", cfg.OCIImage, cfg.Cmd, cfg.Argv)
 	}
 }
 
@@ -114,9 +114,9 @@ func TestParseRunArgsUsageErrors(t *testing.T) {
 		wantStderr string
 	}{
 		{"no target", nil, 2, "specify"},
-		{"bad port", []string{"-p", "nope", "-image=x"}, 2, "port forward"},
+		{"bad port", []string{"-p", "nope", "-image=x"}, 2, "nope"},
 		{"unknown flag", []string{"-bogus"}, 2, "bogus"},
-		{"help", []string{"-h"}, 0, "Usage"},
+		{"help", []string{"--help"}, 0, "Usage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, code, done, stderr := parse(t, tc.args...)

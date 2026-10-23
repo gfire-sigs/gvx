@@ -23,7 +23,9 @@ package e2e
 // posixTortureScript runs in busybox sh. It renames and unlinks files that a
 // descriptor holds open, replaces files atomically, removes trees with open
 // files, and covers links, ownership, and case rules. The variable
-// CASE_INSENSITIVE is 1 when the host volume ignores case.
+// CASE_INSENSITIVE is 1 when the host volume ignores case. The variable
+// OPEN_DIR_RENAME is 0 when the host refuses to rename a directory that has an
+// open descendant, as NTFS does. The script then closes the descriptor first.
 const posixTortureScript = `set -eu
 cd /workspace
 fail() { echo "FAIL: $*"; exit 1; }
@@ -61,11 +63,14 @@ echo T3-OK
 mkdir d1
 echo inside > d1/k
 exec 6<d1/k
+[ "$OPEN_DIR_RENAME" = 1 ] || exec 6<&-
 mv d1 d3
 [ ! -e d1 ] || fail "d1 still visible"
 expect "$(cat d3/k)" inside "moved file"
-expect "$(cat <&6)" inside "fd in moved dir"
-exec 6<&-
+if [ "$OPEN_DIR_RENAME" = 1 ]; then
+  expect "$(cat <&6)" inside "fd in moved dir"
+  exec 6<&-
+fi
 echo T4-OK
 
 # 5. atomic replace pattern, 200 rounds, with a reader on the first version.

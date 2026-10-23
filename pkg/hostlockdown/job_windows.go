@@ -19,6 +19,7 @@ package hostlockdown
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -32,6 +33,11 @@ const (
 	// PROCESS_MITIGATION_POLICY enumeration of winnt.h. The order is
 	// DEP 0, ASLR 1, DynamicCode 2, StrictHandleCheck 3, SystemCallDisable 4.
 	processSystemCallDisablePolicy = 4
+
+	// jobObjectCPURateControlInformation is JobObjectCpuRateControlInformation.
+	jobObjectCPURateControlInformation = 15
+	jobCPURateControlEnable            = 0x1
+	jobCPURateControlHardCap           = 0x4
 
 	// disallowWin32kSystemCalls is bit 0 of the Flags union in
 	// PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY.
@@ -47,6 +53,13 @@ var (
 	procGetProcessMitigationPolicy = modKernel32.NewProc("GetProcessMitigationPolicy")
 )
 
+// jobCPURateControl mirrors JOBOBJECT_CPU_RATE_CONTROL_INFORMATION. The union
+// of the C structure holds CpuRate here.
+type jobCPURateControl struct {
+	ControlFlags uint32
+	CPURate      uint32
+}
+
 // processMitigationSystemCallDisablePolicy mirrors
 // PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY.
 type processMitigationSystemCallDisablePolicy struct {
@@ -57,7 +70,7 @@ type processMitigationSystemCallDisablePolicy struct {
 // assigns the current process first, then limits the job to one active
 // process and isolates USER handles and the clipboard. The caller keeps the
 // returned handle open for the process lifetime. On error the handle is closed.
-func createContainmentJob() (job windows.Handle, err error) {
+func createContainmentJob(cpuQuotaMillis int64) (job windows.Handle, err error) {
 	job, err = windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return 0, fmt.Errorf("hostlockdown: CreateJobObject: %w", err)
@@ -78,6 +91,12 @@ func createContainmentJob() (job windows.Handle, err error) {
 	limits.BasicLimitInformation.ActiveProcessLimit = 1
 	if err = setJobInformation(job, windows.JobObjectExtendedLimitInformation, unsafe.Pointer(&limits), unsafe.Sizeof(limits)); err != nil {
 		return 0, fmt.Errorf("hostlockdown: SetInformationJobObject(ExtendedLimit): %w", err)
+	}
+
+	if cpuQuotaMillis > 0 {
+		if err := setJobCPURate(job, cpuQuotaMillis); err != nil {
+			return 0, err
+		}
 	}
 
 	ui := windows.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: jobUILimits}
@@ -165,6 +184,22 @@ func disableWin32kSystemCalls() error {
 	}
 	if got.Flags&disallowWin32kSystemCalls == 0 {
 		return fmt.Errorf("hostlockdown: win32k system call policy reads back as %#x", got.Flags)
+	}
+	return nil
+}
+
+func setJobCPURate(job windows.Handle, cpuQuotaMillis int64) error {
+	rate := jobCPURate(cpuQuotaMillis, runtime.NumCPU())
+	info := jobCPURateControl{ControlFlags: jobCPURateControlEnable | jobCPURateControlHardCap, CPURate: rate}
+	if err := setJobInformation(job, jobObjectCPURateControlInformation, unsafe.Pointer(&info), unsafe.Sizeof(info)); err != nil {
+		return fmt.Errorf("hostlockdown: SetInformationJobObject(CpuRateControl): %w", err)
+	}
+	var got jobCPURateControl
+	if err := queryJobInformation(job, jobObjectCPURateControlInformation, unsafe.Pointer(&got), unsafe.Sizeof(got)); err != nil {
+		return fmt.Errorf("hostlockdown: QueryInformationJobObject(CpuRateControl): %w", err)
+	}
+	if got.ControlFlags&info.ControlFlags != info.ControlFlags || got.CPURate != info.CPURate {
+		return fmt.Errorf("hostlockdown: the job CPU cap reads back as %+v, want %+v", got, info)
 	}
 	return nil
 }

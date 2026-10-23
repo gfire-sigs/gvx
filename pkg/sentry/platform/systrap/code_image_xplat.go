@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64
+//go:build (darwin && arm64) || windows
 
 package systrap
 
@@ -20,6 +20,7 @@ import (
 	"debug/elf"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/context"
@@ -27,12 +28,13 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// The x18 rewrite changes every word that looks like an instruction naming
-// x18. A segment that holds code also holds data in the usual linker layout:
+// Some rewrites change every word or byte run that looks like an instruction:
+// the x18 rewrite on darwin and the SYSCALL scan of the amd64 Windows engine.
+// A segment that holds code also holds data in the usual linker layout:
 // symbol tables, relocations and read-only constants share the executable
-// segment with .text. A data word that the rewrite changes would corrupt the
-// data that the guest reads. So the patcher rewrites x18 sites only inside
-// the executable sections of the file that backs the page.
+// segment with .text. A change to a data word would corrupt the data that the
+// guest reads. So these rewrites touch only the executable sections of the
+// file that backs the page.
 
 // span is a half-open range of addresses.
 type span struct{ lo, hi uint64 }
@@ -49,15 +51,20 @@ type codeImage struct {
 	exec []span
 }
 
-// parseCodeImage reads the program and section headers of an arm64 ELF file.
-// It returns an error for anything else, so the caller leaves the page alone.
+// parseCodeImage reads the program and section headers of an ELF file of the
+// guest architecture. It returns an error for anything else, so the caller
+// leaves the page alone.
 func parseCodeImage(r io.ReaderAt) (*codeImage, error) {
 	f, err := elf.NewFile(r)
 	if err != nil {
 		return nil, err
 	}
-	if f.Class != elf.ELFCLASS64 || f.Machine != elf.EM_AARCH64 {
-		return nil, fmt.Errorf("the file is not a 64-bit arm64 ELF file (class %v, machine %v)", f.Class, f.Machine)
+	want := elf.EM_X86_64
+	if runtime.GOARCH == "arm64" {
+		want = elf.EM_AARCH64
+	}
+	if f.Class != elf.ELFCLASS64 || f.Machine != want {
+		return nil, fmt.Errorf("the file is not a 64-bit %s ELF file (class %v, machine %v)", runtime.GOARCH, f.Class, f.Machine)
 	}
 	ci := &codeImage{}
 	for _, p := range f.Progs {
@@ -162,6 +169,26 @@ func (s codeScope) contains(a uint64) bool {
 	}
 	for _, r := range s.spans {
 		if a >= r.lo && a+4 <= r.hi {
+			return true
+		}
+	}
+	return false
+}
+
+// proven reports whether the section headers of a file describe the block.
+func (s codeScope) proven() bool { return !s.all && !s.none }
+
+// containsRange reports whether the n bytes at guest address a all belong to
+// code.
+func (s codeScope) containsRange(a, n uint64) bool {
+	switch {
+	case s.all:
+		return true
+	case s.none:
+		return false
+	}
+	for _, r := range s.spans {
+		if a >= r.lo && a+n <= r.hi {
 			return true
 		}
 	}

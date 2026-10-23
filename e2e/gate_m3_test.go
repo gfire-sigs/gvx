@@ -290,7 +290,7 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 
 	for _, arch := range []string{foreign, host} {
 		stdout, stderr, code := runTool(t, rungv, "pull", "-arch="+arch, "-cache-dir="+cacheDir, "alpine:3.20")
-		if code != 0 || !strings.Contains(stdout, "pulled alpine:3.20") {
+		if code != 0 || !strings.Contains(stdout, "Digest: sha256:") {
 			t.Fatalf("rungv pull -arch=%s alpine:3.20 = (code %d, stdout %q, stderr %q)", arch, code, stdout, stderr)
 		}
 	}

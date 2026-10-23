@@ -29,9 +29,9 @@ func profileLines(profile string) []string {
 func TestSeatbeltProfileStartsFromDenyDefault(t *testing.T) {
 	for _, opts := range []Options{
 		{},
-		{WorkspacePath: "/ws"},
-		{WorkspacePath: "/ws", AllowOutboundNet: true},
-		{WorkspacePath: "/ws", OutboundUDPPorts: []uint16{51820}},
+		{Mounts: []HostMount{{Path: "/ws"}}},
+		{Mounts: []HostMount{{Path: "/ws"}}, AllowOutboundNet: true},
+		{Mounts: []HostMount{{Path: "/ws"}}, OutboundUDPPorts: []uint16{51820}},
 	} {
 		lines := profileLines(BuildSeatbeltProfile(opts))
 		if lines[0] != "(version 1)" || lines[1] != "(deny default)" {
@@ -61,20 +61,31 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 	}{
 		{
 			name: "workspace",
-			opts: Options{WorkspacePath: "/ws"},
+			opts: Options{Mounts: []HostMount{{Path: "/ws"}}},
 			wantAllow: []string{
 				"(allow signal (target children))",
-				`(allow file-read* file-write* (subpath (param "WORKSPACE_DIR")))`,
-				`(allow file-read* file-write* (subpath (param "WORKSPACE_DIR_REAL")))`,
+				`(allow file-read* file-write* (subpath (param "MOUNT_0")))`,
+				`(allow file-read* file-write* (subpath (param "MOUNT_0_REAL")))`,
 			},
 		},
 		{
 			name: "read-only workspace",
-			opts: Options{WorkspacePath: "/ws", WorkspaceReadOnly: true},
+			opts: Options{Mounts: []HostMount{{Path: "/ws", ReadOnly: true}}},
 			wantAllow: []string{
 				"(allow signal (target children))",
-				`(allow file-read* (subpath (param "WORKSPACE_DIR")))`,
-				`(allow file-read* (subpath (param "WORKSPACE_DIR_REAL")))`,
+				`(allow file-read* (subpath (param "MOUNT_0")))`,
+				`(allow file-read* (subpath (param "MOUNT_0_REAL")))`,
+			},
+		},
+		{
+			name: "two mounts with different access",
+			opts: Options{Mounts: []HostMount{{Path: "/rw"}, {Path: "/ro", ReadOnly: true}}},
+			wantAllow: []string{
+				"(allow signal (target children))",
+				`(allow file-read* file-write* (subpath (param "MOUNT_0")))`,
+				`(allow file-read* file-write* (subpath (param "MOUNT_0_REAL")))`,
+				`(allow file-read* (subpath (param "MOUNT_1")))`,
+				`(allow file-read* (subpath (param "MOUNT_1_REAL")))`,
 			},
 		},
 		{
@@ -127,7 +138,7 @@ func TestSeatbeltProfileNeverAllowsBroadOperations(t *testing.T) {
 		"(allow file-write*)", "(allow file-read*)", "(allow network*", "(allow default",
 		"(allow system", "(allow ipc", "(allow signal (target others", "(allow signal)", "(allow job-creation",
 	}
-	profile := BuildSeatbeltProfile(Options{WorkspacePath: "/ws", AllowOutboundNet: true, OutboundUDPPorts: []uint16{1}})
+	profile := BuildSeatbeltProfile(Options{Mounts: []HostMount{{Path: "/ws"}}, AllowOutboundNet: true, OutboundUDPPorts: []uint16{1}})
 	for _, prefix := range broad {
 		if strings.Contains(profile, prefix) {
 			t.Errorf("profile contains broad rule %q:\n%s", prefix, profile)
@@ -141,7 +152,7 @@ func TestSeatbeltProfileNeverAllowsBroadOperations(t *testing.T) {
 }
 
 func TestSeatbeltProfileProcessDeniesComeLast(t *testing.T) {
-	lines := profileLines(BuildSeatbeltProfile(Options{WorkspacePath: "/ws", AllowOutboundNet: true}))
+	lines := profileLines(BuildSeatbeltProfile(Options{Mounts: []HostMount{{Path: "/ws"}}, AllowOutboundNet: true}))
 	n := len(lines)
 	if lines[n-2] != "(deny process-fork)" || lines[n-1] != "(deny process-exec*)" {
 		t.Fatalf("profile ends with %q, want the process denies last", lines[n-2:])
@@ -163,8 +174,13 @@ func TestSeatbeltProfileDeniesBindAfterInboundAllow(t *testing.T) {
 }
 
 func TestSeatbeltProfileKeepsPathsOutOfPolicyText(t *testing.T) {
-	profile := BuildSeatbeltProfile(Options{WorkspacePath: `/tmp/evil") (allow default) ("`})
-	if strings.Contains(profile, "evil") || strings.Contains(profile, "/tmp") {
-		t.Fatalf("workspace path leaked into the policy text:\n%s", profile)
+	profile := BuildSeatbeltProfile(Options{Mounts: []HostMount{
+		{Path: `/tmp/evil") (allow default) ("`},
+		{Path: `/var/other") (allow default) ("`, ReadOnly: true},
+	}})
+	for _, leaked := range []string{"evil", "other", "/tmp", "/var"} {
+		if strings.Contains(profile, leaked) {
+			t.Fatalf("mount path leaked %q into the policy text:\n%s", leaked, profile)
+		}
 	}
 }

@@ -189,6 +189,16 @@ jobs:
       - name: Test the packages that gvx owns
         shell: bash
         run: go test -count=1 $OWNED
+      - name: Test the systrap engine and the Sentry on it
+        shell: bash
+        # The engine needs no hypervisor. The e2e tests that check the host
+        # lockdown fail on the hosted runner for the hardware backend as well,
+        # so the run skips them.
+        env:
+          GVX_E2E_OFFLINE: "1"
+        run: |
+          go test -count=1 ./pkg/sentry/platform/systrap/
+          go test -count=1 -skip 'HostLockdown' -run 'Systrap|systrap|Stub' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
       - name: Report the hypervisor state of the runner
         shell: pwsh
         continue-on-error: true
@@ -211,3 +221,24 @@ jobs:
           ./rungv.exe run -platform=auto -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
+
+  windows-arm64:
+    name: test windows/arm64 (systrap)
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The hosted runner has no hypervisor, so the systrap engine is the only
+      # backend that runs guests here.
+      - name: Test the systrap engine
+        shell: bash
+        run: go test -count=1 ./pkg/sentry/platform/systrap/
+      - name: Test the Sentry on the systrap engine
+        shell: bash
+        env:
+          GVX_E2E_OFFLINE: "1"
+        run: go test -count=1 -skip 'HostLockdown' -run 'Systrap|systrap|Stub|Process' ./pkg/gvx/ ./cmd/rungv/ ./e2e/

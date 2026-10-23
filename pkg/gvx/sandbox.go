@@ -35,7 +35,7 @@ import (
 )
 
 // Sandbox coordinates the execution backend (whpx or hvf), OCI EROFS
-// overlay layers, /workspace hostfs mount, Dual-Track Netstack, and host
+// overlay layers, hostfs, volume and tmpfs mounts, Dual-Track Netstack, and host
 // process self-lockdown.
 type Sandbox struct {
 	mu            sync.Mutex
@@ -46,17 +46,22 @@ type Sandbox struct {
 	resolvedImg   *oci.ResolvedImage
 	layerHandles  []*fd.HostHandle
 	workspace     *hostfs.Workspace
+	workspaces    []*hostfs.Workspace
+	mounts        []sandboxMount
 	netStack      *stack.Stack
 	natForwarder  *netbackend.NATForwarder
 	portForwarder *netbackend.PortForwarder
 	wgEndpoint    *netbackend.WireGuardEndpoint
 	wgPeerPort    uint16
 	lockdown      hostlockdown.Status
-	closed        bool
+	// forwards holds the port forwards that initNetstack bound, in rule order:
+	// the caller list, then the ports that PublishAll added.
+	forwards []PortForward
+	closed   bool
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
-// handles, the /workspace os.Root, the network sockets, and the kernel
+// handles, the os.Root of every bind and volume mount, the network sockets, and the kernel
 // MemoryFile, then locks down the host process unless
 // Config.DisableHostLockdown is set. Every host handle exists before the
 // lockdown call because the lockdown denies new host file opens.
@@ -86,12 +91,8 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return cleanup(err)
 	}
 
-	if cfg.WorkspacePath != "" {
-		ws, err := hostfs.OpenWorkspace(cfg.WorkspacePath, cfg.WorkspaceReadOnly)
-		if err != nil {
-			return cleanup(fmt.Errorf("gvx: open workspace %q: %w", cfg.WorkspacePath, err))
-		}
-		sb.workspace = ws
+	if err := sb.openMounts(); err != nil {
+		return cleanup(err)
 	}
 
 	if err := sb.initNetstack(); err != nil {
@@ -194,8 +195,8 @@ func openHVF() (platform.Platform, string, error) {
 // socket to reach the peer port. The none mode gets no outbound access.
 func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 	opts := hostlockdown.Options{
-		WorkspacePath:        s.cfg.WorkspacePath,
-		WorkspaceReadOnly:    s.cfg.WorkspaceReadOnly,
+		CPUQuotaMillis:       s.cfg.Resources.CPUMillis,
+		Mounts:               s.hostMounts(),
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
 		InstallSyscallFilter: s.syscallFilter(),
 	}
@@ -221,7 +222,8 @@ func (s *Sandbox) Stack() *stack.Stack {
 	return s.netStack
 }
 
-// Workspace returns the Sandbox's /workspace hostfs.Workspace handle.
+// Workspace returns the hostfs.Workspace handle of the mount at /workspace. It
+// returns nil when no bind or volume mount uses /workspace.
 func (s *Sandbox) Workspace() *hostfs.Workspace {
 	return s.workspace
 }
@@ -229,6 +231,71 @@ func (s *Sandbox) Workspace() *hostfs.Workspace {
 // LayerHandles returns the pre-opened read-only EROFS HostHandles.
 func (s *Sandbox) LayerHandles() []*fd.HostHandle {
 	return s.layerHandles
+}
+
+// PublishedPort is one host port that forwards to a guest port.
+type PublishedPort struct {
+	GuestPort uint16
+	Protocol  string // "tcp" or "udp"
+	HostAddr  string // the bind address, such as "127.0.0.1"
+	HostPort  uint16 // the port that the host socket really uses
+}
+
+// PublishedPorts lists the bound port forwards, in rule order: the forwards of
+// Config.PortForwards first, then the image ports that Config.PublishAll added.
+// A forward with host port zero shows the free port that the host chose. It is
+// empty before New binds the sockets, and for a mode other than nat.
+func (s *Sandbox) PublishedPorts() []PublishedPort {
+	if s.portForwarder == nil {
+		return nil
+	}
+	rules := s.portForwarder.BoundRules()
+	out := make([]PublishedPort, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, PublishedPort{GuestPort: r.GuestPort, Protocol: r.Proto, HostAddr: r.HostIP, HostPort: r.HostPort})
+	}
+	return out
+}
+
+// effectivePortForwards returns Config.PortForwards followed by one forward to
+// a free port of 127.0.0.1 for each image port that Config.PublishAll adds. A
+// port that Config.PortForwards already forwards stays as the caller wrote it.
+func (s *Sandbox) effectivePortForwards() []PortForward {
+	out := append([]PortForward(nil), s.cfg.PortForwards...)
+	if !s.cfg.PublishAll || s.resolvedImg == nil {
+		return out
+	}
+	forwarded := make(map[string]bool, len(out))
+	for _, f := range out {
+		forwarded[fmt.Sprintf("%d/%s", f.GuestPort, f.Protocol)] = true
+	}
+	for _, p := range s.resolvedImg.Config.ExposedPortList() {
+		if key := fmt.Sprintf("%d/%s", p.Port, p.Protocol); !forwarded[key] {
+			out = append(out, PortForward{GuestPort: p.Port, Protocol: p.Protocol, BindAddress: "127.0.0.1"})
+		}
+	}
+	return out
+}
+
+// LimitReport says which resource limits of Config.Resources the sandbox enforces.
+type LimitReport struct {
+	// Memory is true when the sandbox kills a guest that passes the memory limit.
+	Memory bool
+	// CPUCount is true when the guest sees only the CPUs of the quota.
+	CPUCount bool
+	// CPUTime is true when the host OS caps the CPU time of the sandbox. Only
+	// Windows does, and only when the lockdown is on.
+	CPUTime bool
+}
+
+// Limits reports how the sandbox enforces Config.Resources. A limit that the
+// Config does not set is false.
+func (s *Sandbox) Limits() LimitReport {
+	return LimitReport{
+		Memory:   s.cfg.Resources.MemoryBytes > 0,
+		CPUCount: s.cfg.Resources.CPUMillis > 0,
+		CPUTime:  s.lockdown.CPUQuotaEnforced,
+	}
 }
 
 // BoundPort returns the bound host TCP/UDP port for the idx-th PortForward rule.
@@ -258,7 +325,7 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 }
 
 // Close releases all host handles owned by the Sandbox: port forwarders,
-// WireGuard endpoint, Netstack, /workspace os.Root, EROFS layer handles, and
+// WireGuard endpoint, Netstack, the os.Root of every mount, EROFS layer handles, and
 // the hypervisor platform.
 func (s *Sandbox) Close() error {
 	s.mu.Lock()
@@ -296,11 +363,8 @@ func (s *Sandbox) Close() error {
 		s.netStack = nil
 	}
 
-	if s.workspace != nil {
-		if err := s.workspace.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		s.workspace = nil
+	if err := s.closeMounts(); err != nil {
+		errs = append(errs, err)
 	}
 
 	for _, hh := range s.layerHandles {

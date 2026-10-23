@@ -41,6 +41,11 @@ expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !pagesize_64k && !
 # Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno.go).
 seam pkg/syserr/syserr.go
 
+# Content seam: the memory manager keeps mappings out of the address hole of a platform
+# (pkg/sentry/platform/addrhole.go and pkg/sentry/mm/addrhole.go). The Windows engine
+# has a low guest window and a high guest window, and the host owns the range between them.
+seam pkg/sentry/mm/vma.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin

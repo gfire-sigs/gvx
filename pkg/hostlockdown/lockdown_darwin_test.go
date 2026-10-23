@@ -44,6 +44,7 @@ import (
 const (
 	childModeEnv = "GVX_HOSTLOCKDOWN_CHILD_MODE"
 	childWSEnv   = "GVX_HOSTLOCKDOWN_WORKSPACE"
+	childWS2Env  = "GVX_HOSTLOCKDOWN_WORKSPACE2"
 	childOutEnv  = "GVX_HOSTLOCKDOWN_OUTSIDE"
 	childPeerEnv = "GVX_HOSTLOCKDOWN_PEER_PORT"
 	childTCPEnv  = "GVX_HOSTLOCKDOWN_TCP_ADDR"
@@ -271,6 +272,17 @@ func TestLockdownDarwinFreshOutboundSockets(t *testing.T) {
 		childTCPEnv+"="+tcp.Addr().String(), childTCP6Env+"="+tcp6.Addr().String(), childUDPEnv+"="+udp.LocalAddr().String())...)
 }
 
+func TestLockdownDarwinTwoMountsWithDifferentAccess(t *testing.T) {
+	_, _, env := workspaceEnv(t)
+	env = append(env, childWS2Env+"="+realTempDir(t))
+	runChildToCompletion(t, "two-mounts", env...)
+}
+
+func TestLockdownDarwinNestedAndDuplicateMounts(t *testing.T) {
+	_, _, env := workspaceEnv(t)
+	runChildToCompletion(t, "nested-mounts", env...)
+}
+
 func TestLockdownDarwinRejectsRootWorkspace(t *testing.T) {
 	runChildToCompletion(t, "root-workspace")
 }
@@ -297,6 +309,10 @@ func runLockedChild(mode string) error {
 		return childFiles()
 	case "readonly-workspace":
 		return childReadOnlyWorkspace()
+	case "two-mounts":
+		return childTwoMounts()
+	case "nested-mounts":
+		return childNestedMounts()
 	case "prespawned-child":
 		return childPreSpawned()
 	case "net-none":
@@ -310,7 +326,7 @@ func runLockedChild(mode string) error {
 	case "runtime":
 		return childRuntime()
 	case "root-workspace":
-		_, err := Apply(Options{WorkspacePath: "/"})
+		_, err := Apply(Options{Mounts: []HostMount{{Path: "/"}}})
 		if err == nil {
 			return errors.New("Apply accepted workspace /")
 		}
@@ -319,7 +335,7 @@ func runLockedChild(mode string) error {
 		}
 		return nil
 	case "missing-workspace":
-		_, err := Apply(Options{WorkspacePath: os.Getenv(childWSEnv)})
+		_, err := Apply(Options{Mounts: []HostMount{{Path: os.Getenv(childWSEnv)}}})
 		if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("Apply(missing workspace) = %v, want ErrNotExist", err)
 		}
@@ -354,14 +370,14 @@ func childFiles() error {
 		return err
 	}
 
-	st, err := Apply(Options{WorkspacePath: ws})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
 	var c childChecks
 	c.expect(st.Applied && st.SubprocessBlocked && st.UnboundFileOpenBlocked && st.NetworkOutboundBlocked, "status = %+v", st)
 	c.expect(IsLockedDown(), "IsLockedDown = false after Apply")
-	again, err := Apply(Options{WorkspacePath: ws})
+	again, err := Apply(Options{Mounts: []HostMount{{Path: ws}}})
 	c.expect(err == nil && again == st, "second Apply = %+v, %v; want %+v", again, err, st)
 
 	// Descriptors opened before Apply keep working, including descriptors for
@@ -413,13 +429,66 @@ func childFiles() error {
 	return c.err()
 }
 
+// childTwoMounts applies two mounts with different access. Both must open and
+// follow their own read-only flag. A path outside both must stay closed.
+func childTwoMounts() error {
+	rw, ro, outside := os.Getenv(childWSEnv), os.Getenv(childWS2Env), os.Getenv(childOutEnv)
+	if err := os.WriteFile(filepath.Join(rw, "in.txt"), []byte("rw-data"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(ro, "in.txt"), []byte("ro-data"), 0o600); err != nil {
+		return err
+	}
+	st, err := Apply(Options{Mounts: []HostMount{{Path: rw}, {Path: ro, ReadOnly: true}}})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(st.Applied && st.UnboundFileOpenBlocked, "status = %+v", st)
+	data, err := os.ReadFile(filepath.Join(rw, "in.txt"))
+	c.expect(err == nil && string(data) == "rw-data", "read writable mount = %q, %v", data, err)
+	c.expect(os.WriteFile(filepath.Join(rw, "out.txt"), []byte("x"), 0o600) == nil, "write in writable mount")
+	data, err = os.ReadFile(filepath.Join(ro, "in.txt"))
+	c.expect(err == nil && string(data) == "ro-data", "read read-only mount = %q, %v", data, err)
+	err = os.WriteFile(filepath.Join(ro, "out.txt"), []byte("x"), 0o600)
+	c.expect(errors.Is(err, fs.ErrPermission), "write in read-only mount = %v, want permission error", err)
+	_, err = os.ReadFile(filepath.Join(outside, "secret.txt"))
+	c.expect(errors.Is(err, fs.ErrPermission), "read outside both mounts = %v, want permission error", err)
+	_, err = os.ReadDir(filepath.Dir(rw))
+	c.expect(errors.Is(err, fs.ErrPermission), "list the parent of the mounts = %v, want permission error", err)
+	return c.err()
+}
+
+// childNestedMounts applies a duplicate mount and a mount below another one.
+// Apply must succeed, and the probes must pick paths that no mount covers.
+func childNestedMounts() error {
+	ws, outside := os.Getenv(childWSEnv), os.Getenv(childOutEnv)
+	sub := filepath.Join(ws, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(sub, "in.txt"), []byte("nested"), 0o600); err != nil {
+		return err
+	}
+	_, err := Apply(Options{Mounts: []HostMount{{Path: ws}, {Path: sub, ReadOnly: true}, {Path: ws}, {Path: sub, ReadOnly: true}}})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	data, err := os.ReadFile(filepath.Join(sub, "in.txt"))
+	c.expect(err == nil && string(data) == "nested", "read nested mount = %q, %v", data, err)
+	_, err = os.ReadFile(filepath.Join(outside, "secret.txt"))
+	c.expect(errors.Is(err, fs.ErrPermission), "read outside the mounts = %v, want permission error", err)
+	return c.err()
+}
+
 func childPreSpawned() error {
 	ws := os.Getenv(childWSEnv)
 	helper := exec.Command("/bin/sleep", "60")
 	if err := helper.Start(); err != nil {
 		return err
 	}
-	if _, err := Apply(Options{WorkspacePath: ws}); err != nil {
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: ws}}}); err != nil {
 		_ = helper.Process.Kill()
 		return fmt.Errorf("Apply: %w", err)
 	}
@@ -442,7 +511,7 @@ func childReadOnlyWorkspace() error {
 	if err != nil {
 		return err
 	}
-	if _, err := Apply(Options{WorkspacePath: ws, WorkspaceReadOnly: true}); err != nil {
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: ws, ReadOnly: true}}}); err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
 	var c childChecks
@@ -471,7 +540,7 @@ func childNetNone() error {
 	if err != nil {
 		return err
 	}
-	st, err := Apply(Options{WorkspacePath: ws})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
@@ -504,7 +573,7 @@ func childNetNAT() error {
 	if err != nil {
 		return err
 	}
-	st, err := Apply(Options{WorkspacePath: ws, AllowOutboundNet: true})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}, AllowOutboundNet: true})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
@@ -572,7 +641,7 @@ func childNetUDP() error {
 	if err != nil {
 		return err
 	}
-	st, err := Apply(Options{WorkspacePath: ws, OutboundUDPPorts: []uint16{uint16(peerPort)}})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}, OutboundUDPPorts: []uint16{uint16(peerPort)}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
@@ -604,7 +673,7 @@ func childNetUDP() error {
 
 func childNetFresh() error {
 	ws := os.Getenv(childWSEnv)
-	if _, err := Apply(Options{WorkspacePath: ws, AllowOutboundNet: true}); err != nil {
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: ws}}, AllowOutboundNet: true}); err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
 	var c childChecks
@@ -639,7 +708,7 @@ func childNetFresh() error {
 
 func childRuntime() error {
 	ws := os.Getenv(childWSEnv)
-	if _, err := Apply(Options{WorkspacePath: ws}); err != nil {
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: ws}}}); err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
 	var c childChecks

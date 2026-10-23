@@ -102,7 +102,7 @@ var boundaryRules = []importRule{
 	},
 	{
 		pkg:       "pkg/sentry/platform/systrap",
-		allowed:   []string{"pkg/sentry/platform", "pkg/memutil", "pkg/abi/linux", "golang.org/x/arch/*"},
+		allowed:   []string{"pkg/sentry/platform", "pkg/memutil", "pkg/abi/linux", "golang.org/x/arch/*", "pkg/hostlockdown"},
 		forbidden: []string{"pkg/sentry/kernel/*", "pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "cmd/*"},
 	},
 	{

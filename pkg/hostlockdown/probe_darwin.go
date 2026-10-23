@@ -103,16 +103,21 @@ func probeSubprocessBlocked() error {
 	return fmt.Errorf("hostlockdown: subprocess probe failed for an unrelated reason: %w", err)
 }
 
-// probeUnlistedOpenBlocked opens host paths outside every allowed subpath.
-// The workspace parent directory always exists, so it anchors the probe even
-// when the system paths are missing.
-func probeUnlistedOpenBlocked(workspaceReal string) error {
-	candidates := append([]string(nil), unlistedProbePaths...)
-	if workspaceReal != "" {
-		candidates = append([]string{filepath.Dir(workspaceReal)}, candidates...)
+// probeUnlistedOpenBlocked opens host paths outside every mount. The parent
+// directory of each mount anchors the probe when it lies outside all mounts,
+// so the probe works even when the system paths are missing. A fixed system
+// path that lies inside a mount is no candidate.
+func probeUnlistedOpenBlocked(mountsReal []string) error {
+	var candidates []string
+	for _, real := range mountsReal {
+		candidates = append(candidates, filepath.Dir(real))
 	}
+	candidates = append(candidates, unlistedProbePaths...)
 	var blocked int
 	for _, path := range candidates {
+		if !outsideAll(path, mountsReal) {
+			continue
+		}
 		fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 		if err == nil {
 			_ = unix.Close(fd)
@@ -132,14 +137,19 @@ func probeUnlistedOpenBlocked(workspaceReal string) error {
 	return nil
 }
 
-// probeWorkspaceReachable opens the workspace directory. It proves that the
-// allow rules for the workspace subpaths match after parameter expansion.
-func probeWorkspaceReachable(workspaceReal string) error {
-	fd, err := unix.Open(workspaceReal, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("hostlockdown: open workspace %q after lockdown: %w", workspaceReal, err)
+// probeMountsReachable opens every mount directory. It proves that the allow
+// rules of each mount match after parameter expansion.
+func probeMountsReachable(mountsReal []string) error {
+	for _, real := range mountsReal {
+		fd, err := unix.Open(real, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("hostlockdown: open mount %q after lockdown: %w", real, err)
+		}
+		if err := unix.Close(fd); err != nil {
+			return err
+		}
 	}
-	return unix.Close(fd)
+	return nil
 }
 
 // probeOutboundBlocked connects a TCP socket to a closed loopback port. A
