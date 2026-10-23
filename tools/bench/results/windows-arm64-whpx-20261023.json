@@ -1,0 +1,2661 @@
+{
+  "metadata": {
+    "revision": "9df1d8b992858b9d6dc576e977ebf16426cf1b72",
+    "diff": " M tools/bench/compare_windows.py\n",
+    "host": "Windows-11-10.0.26300-SP0",
+    "processor": "ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc",
+    "go": "go version go1.27.3 windows/arm64",
+    "wsl_kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "guest_sha256": "12645e7b94f2459bc91b16d3f5762860c881cbed4d8912360e90d4d7c22819bc",
+    "runner_sha256": "9828b5b692ea6ee0fd899d4e2355fbf441564d7732cb2b4a84e424d7b54500a2",
+    "wsl_distribution": "Debian",
+    "wsl_state": "kept running; no shutdown",
+    "settings": {
+      "distribution": "Debian",
+      "backend": "whpx",
+      "samples": 30,
+      "idle_seconds": 60.0,
+      "counts": [
+        1,
+        4,
+        16
+      ],
+      "http_requests": 2000,
+      "phases": [
+        "startup",
+        "compute",
+        "idle",
+        "http"
+      ],
+      "lockdown": true
+    },
+    "wsl_vm_initial_cim": {
+      "ProcessId": 22444,
+      "WorkingSetSize": 596967424,
+      "PageFileUsage": 2254344
+    },
+    "hardware": {
+      "cpu": "Snapdragon X Plus X1P42100",
+      "logical_processors": 8,
+      "ram_bytes": 33897037824,
+      "model": "Lenovo 83HL",
+      "windows": "Windows 11 Home 10.0.26300",
+      "power_plan": "Balanced"
+    },
+    "binary_source_revision": "bb58dce5b7ab5452bdcdd7b71efde3d020de13c9",
+    "raw_sha256": {
+      "confined": "1d529bdb819e30b5c2a842fd590d3531d9d84d32cc7835d12fd996a3fb043f42",
+      "trusted_diagnostic": "6b7f930d28df37acd18d1ba54d31fb743bc7660cc90ea265f4cd2a1fe21d4485"
+    }
+  },
+  "startup_ms": {
+    "gvx": {
+      "count": 30,
+      "median": 972.1588999964297,
+      "p95": 1077.5126999942586,
+      "min": 850.4321000073105,
+      "max": 1081.8685999984154
+    },
+    "wsl": {
+      "count": 30,
+      "median": 144.7341500024777,
+      "p95": 169.32499999529682,
+      "min": 129.78030000522267,
+      "max": 209.28429999912623
+    }
+  },
+  "compute_ms": {
+    "gvx": {
+      "cpu": {
+        "count": 7,
+        "median": 201.2142,
+        "p95": 211.7389,
+        "min": 198.7616,
+        "max": 211.7389
+      },
+      "syscall": {
+        "count": 7,
+        "median": 1174.560991,
+        "p95": 1207.752045,
+        "min": 1136.695085,
+        "max": 1207.752045
+      }
+    },
+    "wsl": {
+      "cpu": {
+        "count": 7,
+        "median": 192.465565,
+        "p95": 201.33666,
+        "min": 190.643015,
+        "max": 201.33666
+      },
+      "syscall": {
+        "count": 7,
+        "median": 1.82595,
+        "p95": 2.111073,
+        "min": 1.805745,
+        "max": 2.111073
+      }
+    }
+  },
+  "idle": [
+    {
+      "engine": "wsl",
+      "instances": 1,
+      "seconds": 60.01154160499573,
+      "host_physical_delta_bytes": {
+        "count": 61,
+        "median": 18460672,
+        "p95": 121266176,
+        "min": -27103232,
+        "max": 132489216
+      },
+      "host_commit_delta_bytes": {
+        "count": 61,
+        "median": 86953984,
+        "p95": 157966336,
+        "min": 10792960,
+        "max": 162852864
+      },
+      "owned_private_commit_bytes": {
+        "count": 61,
+        "median": 11857920,
+        "p95": 11997184,
+        "min": 9539584,
+        "max": 12001280
+      },
+      "owned_process_count": {
+        "count": 61,
+        "median": 5,
+        "p95": 5,
+        "min": 4,
+        "max": 5
+      },
+      "owned_cpu_seconds": 0.0,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 633516032,
+        "PageFileUsage": 2270860
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 649023488,
+        "PageFileUsage": 2248556
+      }
+    },
+    {
+      "engine": "gvx",
+      "instances": 1,
+      "seconds": 60.01230025291443,
+      "host_physical_delta_bytes": {
+        "count": 61,
+        "median": 9560064,
+        "p95": 77148160,
+        "min": -48410624,
+        "max": 80183296
+      },
+      "host_commit_delta_bytes": {
+        "count": 61,
+        "median": 57815040,
+        "p95": 162238464,
+        "min": 7012352,
+        "max": 176308224
+      },
+      "owned_private_commit_bytes": {
+        "count": 61,
+        "median": 137949184,
+        "p95": 138047488,
+        "min": 137834496,
+        "max": 138055680
+      },
+      "owned_process_count": {
+        "count": 61,
+        "median": 4,
+        "p95": 4,
+        "min": 4,
+        "max": 4
+      },
+      "owned_cpu_seconds": 0.15625,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 649023488,
+        "PageFileUsage": 2248556
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 646725632,
+        "PageFileUsage": 2241120
+      }
+    },
+    {
+      "engine": "wsl",
+      "instances": 4,
+      "seconds": 10.010674953460693,
+      "host_physical_delta_bytes": {
+        "count": 11,
+        "median": 189427712,
+        "p95": 243978240,
+        "min": 11304960,
+        "max": 243978240
+      },
+      "host_commit_delta_bytes": {
+        "count": 11,
+        "median": 365334528,
+        "p95": 481800192,
+        "min": 5775360,
+        "max": 481800192
+      },
+      "owned_private_commit_bytes": {
+        "count": 11,
+        "median": 47673344,
+        "p95": 47718400,
+        "min": 45395968,
+        "max": 47718400
+      },
+      "owned_process_count": {
+        "count": 11,
+        "median": 20,
+        "p95": 20,
+        "min": 19,
+        "max": 20
+      },
+      "owned_cpu_seconds": 0.0,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 646725632,
+        "PageFileUsage": 2241120
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 660140032,
+        "PageFileUsage": 2253948
+      }
+    },
+    {
+      "engine": "gvx",
+      "instances": 4,
+      "seconds": 10.011739015579224,
+      "host_physical_delta_bytes": {
+        "count": 11,
+        "median": 251846656,
+        "p95": 278667264,
+        "min": 245264384,
+        "max": 278667264
+      },
+      "host_commit_delta_bytes": {
+        "count": 11,
+        "median": 600424448,
+        "p95": 622727168,
+        "min": 583565312,
+        "max": 622727168
+      },
+      "owned_private_commit_bytes": {
+        "count": 11,
+        "median": 548962304,
+        "p95": 549101568,
+        "min": 548962304,
+        "max": 549101568
+      },
+      "owned_process_count": {
+        "count": 11,
+        "median": 16,
+        "p95": 16,
+        "min": 16,
+        "max": 16
+      },
+      "owned_cpu_seconds": 0.171875,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 660160512,
+        "PageFileUsage": 2253948
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 651390976,
+        "PageFileUsage": 2254460
+      }
+    },
+    {
+      "engine": "wsl",
+      "instances": 16,
+      "seconds": 10.01285457611084,
+      "host_physical_delta_bytes": {
+        "count": 11,
+        "median": 188432384,
+        "p95": 252764160,
+        "min": 172290048,
+        "max": 252764160
+      },
+      "host_commit_delta_bytes": {
+        "count": 11,
+        "median": 235352064,
+        "p95": 293523456,
+        "min": 230596608,
+        "max": 293523456
+      },
+      "owned_private_commit_bytes": {
+        "count": 11,
+        "median": 191918080,
+        "p95": 191918080,
+        "min": 190091264,
+        "max": 191918080
+      },
+      "owned_process_count": {
+        "count": 11,
+        "median": 80,
+        "p95": 80,
+        "min": 79,
+        "max": 80
+      },
+      "owned_cpu_seconds": 0.0,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 651128832,
+        "PageFileUsage": 2254460
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 714162176,
+        "PageFileUsage": 2306276
+      }
+    },
+    {
+      "engine": "gvx",
+      "instances": 16,
+      "seconds": 10.012653350830078,
+      "host_physical_delta_bytes": {
+        "count": 11,
+        "median": 1217572864,
+        "p95": 1237696512,
+        "min": 1166458880,
+        "max": 1237696512
+      },
+      "host_commit_delta_bytes": {
+        "count": 11,
+        "median": 2585686016,
+        "p95": 2631036928,
+        "min": 2510635008,
+        "max": 2631036928
+      },
+      "owned_private_commit_bytes": {
+        "count": 11,
+        "median": 2193444864,
+        "p95": 2193469440,
+        "min": 2193387520,
+        "max": 2193469440
+      },
+      "owned_process_count": {
+        "count": 11,
+        "median": 64,
+        "p95": 64,
+        "min": 64,
+        "max": 64
+      },
+      "owned_cpu_seconds": 0.84375,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 679088128,
+        "PageFileUsage": 2306340
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 663642112,
+        "PageFileUsage": 2247380
+      }
+    }
+  ],
+  "http": {
+    "gvx": {
+      "requests_per_second": {
+        "count": 3,
+        "median": 389.20106381826974,
+        "p95": 393.3275752805732,
+        "min": 381.60780143753715,
+        "max": 393.3275752805732
+      },
+      "latency_ms": {
+        "count": 6000,
+        "median": 2.4110499944072217,
+        "p95": 58.83639999956358,
+        "min": 1.5650999994250014,
+        "max": 136.8038000073284
+      },
+      "errors": 0
+    },
+    "wsl": {
+      "requests_per_second": {
+        "count": 3,
+        "median": 12582.153598481387,
+        "p95": 12786.685479982576,
+        "min": 12525.465837705973,
+        "max": 12786.685479982576
+      },
+      "latency_ms": {
+        "count": 6000,
+        "median": 0.2685000072233379,
+        "p95": 0.4633000062312931,
+        "min": 0.11079999967478216,
+        "max": 16.814699993119575
+      },
+      "errors": 0
+    }
+  },
+  "failures": [],
+  "startup_samples": [
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "elapsed_ms": 850.4321000073105
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "elapsed_ms": 142.7758000063477
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "elapsed_ms": 140.63330000499263
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "elapsed_ms": 1060.9763999964343
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "elapsed_ms": 919.2390000098385
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "elapsed_ms": 141.8303999962518
+    },
+    {
+      "engine": "wsl",
+      "sample": 3,
+      "elapsed_ms": 139.56530000723433
+    },
+    {
+      "engine": "gvx",
+      "sample": 3,
+      "elapsed_ms": 1037.3402999975951
+    },
+    {
+      "engine": "gvx",
+      "sample": 4,
+      "elapsed_ms": 1032.0337000011932
+    },
+    {
+      "engine": "wsl",
+      "sample": 4,
+      "elapsed_ms": 148.7044999958016
+    },
+    {
+      "engine": "wsl",
+      "sample": 5,
+      "elapsed_ms": 209.28429999912623
+    },
+    {
+      "engine": "gvx",
+      "sample": 5,
+      "elapsed_ms": 959.4433000020217
+    },
+    {
+      "engine": "gvx",
+      "sample": 6,
+      "elapsed_ms": 918.7005999992834
+    },
+    {
+      "engine": "wsl",
+      "sample": 6,
+      "elapsed_ms": 146.1905000032857
+    },
+    {
+      "engine": "wsl",
+      "sample": 7,
+      "elapsed_ms": 141.17639999312814
+    },
+    {
+      "engine": "gvx",
+      "sample": 7,
+      "elapsed_ms": 978.2313000032445
+    },
+    {
+      "engine": "gvx",
+      "sample": 8,
+      "elapsed_ms": 971.1844999983441
+    },
+    {
+      "engine": "wsl",
+      "sample": 8,
+      "elapsed_ms": 159.08610000042245
+    },
+    {
+      "engine": "wsl",
+      "sample": 9,
+      "elapsed_ms": 169.32499999529682
+    },
+    {
+      "engine": "gvx",
+      "sample": 9,
+      "elapsed_ms": 1077.5126999942586
+    },
+    {
+      "engine": "gvx",
+      "sample": 10,
+      "elapsed_ms": 992.6050000067335
+    },
+    {
+      "engine": "wsl",
+      "sample": 10,
+      "elapsed_ms": 143.06119999673683
+    },
+    {
+      "engine": "wsl",
+      "sample": 11,
+      "elapsed_ms": 129.78030000522267
+    },
+    {
+      "engine": "gvx",
+      "sample": 11,
+      "elapsed_ms": 1016.8648999970173
+    },
+    {
+      "engine": "gvx",
+      "sample": 12,
+      "elapsed_ms": 965.5506999988575
+    },
+    {
+      "engine": "wsl",
+      "sample": 12,
+      "elapsed_ms": 154.0168000065023
+    },
+    {
+      "engine": "wsl",
+      "sample": 13,
+      "elapsed_ms": 155.77029999985825
+    },
+    {
+      "engine": "gvx",
+      "sample": 13,
+      "elapsed_ms": 939.942199998768
+    },
+    {
+      "engine": "gvx",
+      "sample": 14,
+      "elapsed_ms": 951.6603000083705
+    },
+    {
+      "engine": "wsl",
+      "sample": 14,
+      "elapsed_ms": 152.3689000023296
+    },
+    {
+      "engine": "wsl",
+      "sample": 15,
+      "elapsed_ms": 148.7061000079848
+    },
+    {
+      "engine": "gvx",
+      "sample": 15,
+      "elapsed_ms": 973.1332999945153
+    },
+    {
+      "engine": "gvx",
+      "sample": 16,
+      "elapsed_ms": 1007.0832000055816
+    },
+    {
+      "engine": "wsl",
+      "sample": 16,
+      "elapsed_ms": 146.85069999541156
+    },
+    {
+      "engine": "wsl",
+      "sample": 17,
+      "elapsed_ms": 147.33700000215322
+    },
+    {
+      "engine": "gvx",
+      "sample": 17,
+      "elapsed_ms": 970.8604000043124
+    },
+    {
+      "engine": "gvx",
+      "sample": 18,
+      "elapsed_ms": 1081.8685999984154
+    },
+    {
+      "engine": "wsl",
+      "sample": 18,
+      "elapsed_ms": 147.837199998321
+    },
+    {
+      "engine": "wsl",
+      "sample": 19,
+      "elapsed_ms": 143.27780000166968
+    },
+    {
+      "engine": "gvx",
+      "sample": 19,
+      "elapsed_ms": 996.0038000135683
+    },
+    {
+      "engine": "gvx",
+      "sample": 20,
+      "elapsed_ms": 977.2260999889113
+    },
+    {
+      "engine": "wsl",
+      "sample": 20,
+      "elapsed_ms": 148.38870000676252
+    },
+    {
+      "engine": "wsl",
+      "sample": 21,
+      "elapsed_ms": 141.18489999964368
+    },
+    {
+      "engine": "gvx",
+      "sample": 21,
+      "elapsed_ms": 959.3611000018427
+    },
+    {
+      "engine": "gvx",
+      "sample": 22,
+      "elapsed_ms": 952.9155000054743
+    },
+    {
+      "engine": "wsl",
+      "sample": 22,
+      "elapsed_ms": 143.21680000284687
+    },
+    {
+      "engine": "wsl",
+      "sample": 23,
+      "elapsed_ms": 142.67099999415223
+    },
+    {
+      "engine": "gvx",
+      "sample": 23,
+      "elapsed_ms": 967.6327999914065
+    },
+    {
+      "engine": "gvx",
+      "sample": 24,
+      "elapsed_ms": 966.8132999941008
+    },
+    {
+      "engine": "wsl",
+      "sample": 24,
+      "elapsed_ms": 141.56350000121165
+    },
+    {
+      "engine": "wsl",
+      "sample": 25,
+      "elapsed_ms": 139.53689999470953
+    },
+    {
+      "engine": "gvx",
+      "sample": 25,
+      "elapsed_ms": 953.6132000066573
+    },
+    {
+      "engine": "gvx",
+      "sample": 26,
+      "elapsed_ms": 987.5025000073947
+    },
+    {
+      "engine": "wsl",
+      "sample": 26,
+      "elapsed_ms": 142.66319999296684
+    },
+    {
+      "engine": "wsl",
+      "sample": 27,
+      "elapsed_ms": 140.10629999393132
+    },
+    {
+      "engine": "gvx",
+      "sample": 27,
+      "elapsed_ms": 1064.2940999969142
+    },
+    {
+      "engine": "gvx",
+      "sample": 28,
+      "elapsed_ms": 894.7026999958325
+    },
+    {
+      "engine": "wsl",
+      "sample": 28,
+      "elapsed_ms": 149.23359999374952
+    },
+    {
+      "engine": "wsl",
+      "sample": 29,
+      "elapsed_ms": 148.89580001181457
+    },
+    {
+      "engine": "gvx",
+      "sample": 29,
+      "elapsed_ms": 1011.680299998261
+    }
+  ],
+  "compute_samples": [
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 200780800,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 191606823,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 191299500,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 198761600,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 198801300,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 201336660,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 3,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 195009881,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 3,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 201214200,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 4,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 211738900,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 4,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 190643015,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 5,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 192465565,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 5,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 202912600,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 6,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 206861900,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 6,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 193852478,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "count": 10000,
+      "elapsed_ns": 1201486820,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "count": 10000,
+      "elapsed_ns": 1825950,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "count": 10000,
+      "elapsed_ns": 2111073,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "count": 10000,
+      "elapsed_ns": 1169442218,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "count": 10000,
+      "elapsed_ns": 1166781274,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "count": 10000,
+      "elapsed_ns": 1893252,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 3,
+      "count": 10000,
+      "elapsed_ns": 1805745,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 3,
+      "count": 10000,
+      "elapsed_ns": 1207752045,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 4,
+      "count": 10000,
+      "elapsed_ns": 1174560991,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 4,
+      "count": 10000,
+      "elapsed_ns": 1939256,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 5,
+      "count": 10000,
+      "elapsed_ns": 1808846,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 5,
+      "count": 10000,
+      "elapsed_ns": 1202397473,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 6,
+      "count": 10000,
+      "elapsed_ns": 1136695085,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 6,
+      "count": 10000,
+      "elapsed_ns": 1821239,
+      "mode": "syscall"
+    }
+  ],
+  "http_runs": [
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "concurrency": 4,
+      "elapsed_seconds": 5.1387321000074735,
+      "errors": []
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "concurrency": 4,
+      "elapsed_seconds": 0.15967470000032336,
+      "errors": []
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "concurrency": 4,
+      "elapsed_seconds": 0.15641270000196528,
+      "errors": []
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "concurrency": 4,
+      "elapsed_seconds": 5.084820199990645,
+      "errors": []
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "concurrency": 4,
+      "elapsed_seconds": 5.240982999996049,
+      "errors": []
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "concurrency": 4,
+      "elapsed_seconds": 0.15895530000852887,
+      "errors": []
+    }
+  ],
+  "memory_samples": [
+    {
+      "engine": "wsl",
+      "instances": 1,
+      "baseline": [
+        {
+          "time": 1792742396.3534374,
+          "available_physical_bytes": 10040164352,
+          "host_commit_bytes": 33500336128,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742396.3632746,
+          "available_physical_bytes": 10039816192,
+          "host_commit_bytes": 33500020736,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742396.3724303,
+          "available_physical_bytes": 10040164352,
+          "host_commit_bytes": 33499095040,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792742396.482776,
+          "available_physical_bytes": 10036740096,
+          "host_commit_bytes": 33510813696,
+          "owned_private_commit_bytes": 9539584,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742397.493858,
+          "available_physical_bytes": 10019213312,
+          "host_commit_bytes": 33548091392,
+          "owned_private_commit_bytes": 12001280,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742398.5043783,
+          "available_physical_bytes": 10037645312,
+          "host_commit_bytes": 33538134016,
+          "owned_private_commit_bytes": 11997184,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742399.51865,
+          "available_physical_bytes": 10031030272,
+          "host_commit_bytes": 33540202496,
+          "owned_private_commit_bytes": 11997184,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742400.5301776,
+          "available_physical_bytes": 10016129024,
+          "host_commit_bytes": 33549357056,
+          "owned_private_commit_bytes": 11997184,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742401.543164,
+          "available_physical_bytes": 10021703680,
+          "host_commit_bytes": 33538105344,
+          "owned_private_commit_bytes": 11997184,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742402.5538118,
+          "available_physical_bytes": 10035417088,
+          "host_commit_bytes": 33524731904,
+          "owned_private_commit_bytes": 11997184,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742403.5676906,
+          "available_physical_bytes": 10034515968,
+          "host_commit_bytes": 33531617280,
+          "owned_private_commit_bytes": 11997184,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742404.577957,
+          "available_physical_bytes": 10041413632,
+          "host_commit_bytes": 33525161984,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742405.5888104,
+          "available_physical_bytes": 10009165824,
+          "host_commit_bytes": 33586974720,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742406.6002352,
+          "available_physical_bytes": 10025779200,
+          "host_commit_bytes": 33537892352,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742407.6104665,
+          "available_physical_bytes": 10029555712,
+          "host_commit_bytes": 33525747712,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742408.6215787,
+          "available_physical_bytes": 9907675136,
+          "host_commit_bytes": 33662607360,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742409.6327572,
+          "available_physical_bytes": 9913851904,
+          "host_commit_bytes": 33662873600,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742410.6435819,
+          "available_physical_bytes": 9918898176,
+          "host_commit_bytes": 33661644800,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742411.6545043,
+          "available_physical_bytes": 9919234048,
+          "host_commit_bytes": 33657987072,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742412.6652257,
+          "available_physical_bytes": 9917325312,
+          "host_commit_bytes": 33653727232,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742413.6755338,
+          "available_physical_bytes": 9931087872,
+          "host_commit_bytes": 33654177792,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742414.6867096,
+          "available_physical_bytes": 9934954496,
+          "host_commit_bytes": 33640452096,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742415.6966012,
+          "available_physical_bytes": 9930694656,
+          "host_commit_bytes": 33639075840,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742416.7070048,
+          "available_physical_bytes": 10009985024,
+          "host_commit_bytes": 33630900224,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742417.7180555,
+          "available_physical_bytes": 10009919488,
+          "host_commit_bytes": 33632284672,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742418.7283607,
+          "available_physical_bytes": 10012581888,
+          "host_commit_bytes": 33630478336,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742419.73876,
+          "available_physical_bytes": 10009403392,
+          "host_commit_bytes": 33630466048,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742420.7494988,
+          "available_physical_bytes": 10009882624,
+          "host_commit_bytes": 33631059968,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742421.7595463,
+          "available_physical_bytes": 10008805376,
+          "host_commit_bytes": 33638789120,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742422.7700071,
+          "available_physical_bytes": 10008592384,
+          "host_commit_bytes": 33636732928,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742423.7805438,
+          "available_physical_bytes": 10006609920,
+          "host_commit_bytes": 33635827712,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742424.7908027,
+          "available_physical_bytes": 10005282816,
+          "host_commit_bytes": 33639170048,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742425.8025267,
+          "available_physical_bytes": 10006396928,
+          "host_commit_bytes": 33636995072,
+          "owned_private_commit_bytes": 11976704,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742426.8128645,
+          "available_physical_bytes": 10011017216,
+          "host_commit_bytes": 33636225024,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742427.8241987,
+          "available_physical_bytes": 10005434368,
+          "host_commit_bytes": 33642663936,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742428.8347034,
+          "available_physical_bytes": 10001874944,
+          "host_commit_bytes": 33642000384,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742429.846818,
+          "available_physical_bytes": 10005999616,
+          "host_commit_bytes": 33637806080,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742430.8576798,
+          "available_physical_bytes": 10023657472,
+          "host_commit_bytes": 33605611520,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742431.8685377,
+          "available_physical_bytes": 10019426304,
+          "host_commit_bytes": 33602772992,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742432.8786478,
+          "available_physical_bytes": 10020077568,
+          "host_commit_bytes": 33604829184,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742433.889761,
+          "available_physical_bytes": 10021515264,
+          "host_commit_bytes": 33602093056,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742434.9024308,
+          "available_physical_bytes": 10022359040,
+          "host_commit_bytes": 33602048000,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742435.912652,
+          "available_physical_bytes": 10021113856,
+          "host_commit_bytes": 33600479232,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742436.9233396,
+          "available_physical_bytes": 10059808768,
+          "host_commit_bytes": 33559457792,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742437.9348934,
+          "available_physical_bytes": 10059165696,
+          "host_commit_bytes": 33557868544,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742438.9450276,
+          "available_physical_bytes": 10067267584,
+          "host_commit_bytes": 33546309632,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742439.9563587,
+          "available_physical_bytes": 10066423808,
+          "host_commit_bytes": 33546203136,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742440.968548,
+          "available_physical_bytes": 10057826304,
+          "host_commit_bytes": 33551683584,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742441.98048,
+          "available_physical_bytes": 10053529600,
+          "host_commit_bytes": 33562124288,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742442.990814,
+          "available_physical_bytes": 10039291904,
+          "host_commit_bytes": 33566142464,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742444.0016274,
+          "available_physical_bytes": 10046173184,
+          "host_commit_bytes": 33560719360,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742445.0121832,
+          "available_physical_bytes": 10039549952,
+          "host_commit_bytes": 33566552064,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742446.0228055,
+          "available_physical_bytes": 10025762816,
+          "host_commit_bytes": 33581027328,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742447.0334127,
+          "available_physical_bytes": 10018820096,
+          "host_commit_bytes": 33587417088,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742448.0435386,
+          "available_physical_bytes": 10022539264,
+          "host_commit_bytes": 33588645888,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742449.0541387,
+          "available_physical_bytes": 10024144896,
+          "host_commit_bytes": 33584308224,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742450.0653038,
+          "available_physical_bytes": 10025025536,
+          "host_commit_bytes": 33583296512,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742451.0760305,
+          "available_physical_bytes": 10027479040,
+          "host_commit_bytes": 33582329856,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742452.0868475,
+          "available_physical_bytes": 10026631168,
+          "host_commit_bytes": 33577574400,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742453.098142,
+          "available_physical_bytes": 10027692032,
+          "host_commit_bytes": 33581223936,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742454.1088502,
+          "available_physical_bytes": 10029465600,
+          "host_commit_bytes": 33577934848,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742455.120163,
+          "available_physical_bytes": 10027651072,
+          "host_commit_bytes": 33577463808,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742456.1316931,
+          "available_physical_bytes": 10026475520,
+          "host_commit_bytes": 33578074112,
+          "owned_private_commit_bytes": 11857920,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792742456.4943175,
+          "available_physical_bytes": 10031226880,
+          "host_commit_bytes": 33574998016,
+          "owned_private_commit_bytes": 11829248,
+          "owned_process_count": 5
+        }
+      ]
+    },
+    {
+      "engine": "gvx",
+      "instances": 1,
+      "baseline": [
+        {
+          "time": 1792742458.4490006,
+          "available_physical_bytes": 10019602432,
+          "host_commit_bytes": 33600180224,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742458.4584491,
+          "available_physical_bytes": 10010755072,
+          "host_commit_bytes": 33601232896,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742458.467641,
+          "available_physical_bytes": 10010783744,
+          "host_commit_bytes": 33601232896,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792742459.3764684,
+          "available_physical_bytes": 9962127360,
+          "host_commit_bytes": 33746980864,
+          "owned_private_commit_bytes": 137834496,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742460.386953,
+          "available_physical_bytes": 9955459072,
+          "host_commit_bytes": 33748410368,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742461.3979797,
+          "available_physical_bytes": 9953677312,
+          "host_commit_bytes": 33745346560,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742462.408516,
+          "available_physical_bytes": 9944522752,
+          "host_commit_bytes": 33761243136,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742463.4194636,
+          "available_physical_bytes": 9930600448,
+          "host_commit_bytes": 33777471488,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742464.4294808,
+          "available_physical_bytes": 9933635584,
+          "host_commit_bytes": 33761775616,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742465.4404895,
+          "available_physical_bytes": 9933266944,
+          "host_commit_bytes": 33763471360,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742466.4511645,
+          "available_physical_bytes": 9953910784,
+          "host_commit_bytes": 33735704576,
+          "owned_private_commit_bytes": 137863168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742467.4611385,
+          "available_physical_bytes": 9954840576,
+          "host_commit_bytes": 33744084992,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742468.4718807,
+          "available_physical_bytes": 9940725760,
+          "host_commit_bytes": 33766010880,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742469.4829865,
+          "available_physical_bytes": 9931796480,
+          "host_commit_bytes": 33777541120,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742470.4933975,
+          "available_physical_bytes": 9942069248,
+          "host_commit_bytes": 33747976192,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742471.5041957,
+          "available_physical_bytes": 9949335552,
+          "host_commit_bytes": 33745080320,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742472.5164182,
+          "available_physical_bytes": 9954013184,
+          "host_commit_bytes": 33737564160,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742473.526912,
+          "available_physical_bytes": 9953894400,
+          "host_commit_bytes": 33739747328,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742474.5385623,
+          "available_physical_bytes": 9954820096,
+          "host_commit_bytes": 33737736192,
+          "owned_private_commit_bytes": 137871360,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742475.5500383,
+          "available_physical_bytes": 9954140160,
+          "host_commit_bytes": 33742131200,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742476.559879,
+          "available_physical_bytes": 9961758720,
+          "host_commit_bytes": 33736077312,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742477.5707529,
+          "available_physical_bytes": 10038652928,
+          "host_commit_bytes": 33632911360,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742478.5864067,
+          "available_physical_bytes": 10059194368,
+          "host_commit_bytes": 33625288704,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742479.5975685,
+          "available_physical_bytes": 10054283264,
+          "host_commit_bytes": 33623035904,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742480.607824,
+          "available_physical_bytes": 10050879488,
+          "host_commit_bytes": 33624784896,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742481.6192298,
+          "available_physical_bytes": 10044190720,
+          "host_commit_bytes": 33634422784,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742482.6294618,
+          "available_physical_bytes": 10047041536,
+          "host_commit_bytes": 33629392896,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742483.6399853,
+          "available_physical_bytes": 10037424128,
+          "host_commit_bytes": 33646567424,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742484.6513147,
+          "available_physical_bytes": 10040782848,
+          "host_commit_bytes": 33643307008,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742485.6619077,
+          "available_physical_bytes": 10038620160,
+          "host_commit_bytes": 33642958848,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742486.673077,
+          "available_physical_bytes": 10042716160,
+          "host_commit_bytes": 33642008576,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742487.684228,
+          "available_physical_bytes": 10039369728,
+          "host_commit_bytes": 33642704896,
+          "owned_private_commit_bytes": 137879552,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742488.6942642,
+          "available_physical_bytes": 10042408960,
+          "host_commit_bytes": 33640337408,
+          "owned_private_commit_bytes": 137957376,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742489.7046835,
+          "available_physical_bytes": 10035253248,
+          "host_commit_bytes": 33650356224,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742490.7167907,
+          "available_physical_bytes": 10048532480,
+          "host_commit_bytes": 33613381632,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742491.7268934,
+          "available_physical_bytes": 10049863680,
+          "host_commit_bytes": 33614008320,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742492.7376292,
+          "available_physical_bytes": 10050846720,
+          "host_commit_bytes": 33613275136,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742493.7488976,
+          "available_physical_bytes": 10050949120,
+          "host_commit_bytes": 33614700544,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742494.7612736,
+          "available_physical_bytes": 10050248704,
+          "host_commit_bytes": 33615671296,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742495.7721305,
+          "available_physical_bytes": 10044702720,
+          "host_commit_bytes": 33620836352,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742496.7832248,
+          "available_physical_bytes": 10042798080,
+          "host_commit_bytes": 33624289280,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742497.7937136,
+          "available_physical_bytes": 10049716224,
+          "host_commit_bytes": 33616306176,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742498.8046763,
+          "available_physical_bytes": 10048778240,
+          "host_commit_bytes": 33613594624,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742499.816846,
+          "available_physical_bytes": 10048380928,
+          "host_commit_bytes": 33619730432,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742500.8282113,
+          "available_physical_bytes": 10052939776,
+          "host_commit_bytes": 33611587584,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742501.8396428,
+          "available_physical_bytes": 10050191360,
+          "host_commit_bytes": 33611509760,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742502.8511288,
+          "available_physical_bytes": 10053189632,
+          "host_commit_bytes": 33608245248,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742503.8620746,
+          "available_physical_bytes": 10048417792,
+          "host_commit_bytes": 33615699968,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742504.874424,
+          "available_physical_bytes": 10052079616,
+          "host_commit_bytes": 33614094336,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742505.8849914,
+          "available_physical_bytes": 9959436288,
+          "host_commit_bytes": 33702875136,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742506.8955996,
+          "available_physical_bytes": 9977638912,
+          "host_commit_bytes": 33682132992,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742507.9058526,
+          "available_physical_bytes": 9977425920,
+          "host_commit_bytes": 33682300928,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742508.917356,
+          "available_physical_bytes": 9988464640,
+          "host_commit_bytes": 33670049792,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742509.9280005,
+          "available_physical_bytes": 9989021696,
+          "host_commit_bytes": 33672048640,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742510.9388976,
+          "available_physical_bytes": 9987362816,
+          "host_commit_bytes": 33674268672,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742511.9495828,
+          "available_physical_bytes": 9995960320,
+          "host_commit_bytes": 33663545344,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742512.9595964,
+          "available_physical_bytes": 9999888384,
+          "host_commit_bytes": 33663107072,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742513.9701562,
+          "available_physical_bytes": 9999581184,
+          "host_commit_bytes": 33664380928,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742514.9804842,
+          "available_physical_bytes": 10001223680,
+          "host_commit_bytes": 33659047936,
+          "owned_private_commit_bytes": 138047488,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742515.990929,
+          "available_physical_bytes": 10003472384,
+          "host_commit_bytes": 33654853632,
+          "owned_private_commit_bytes": 138055680,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742517.0019965,
+          "available_physical_bytes": 10008182784,
+          "host_commit_bytes": 33653166080,
+          "owned_private_commit_bytes": 138055680,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742518.0119286,
+          "available_physical_bytes": 9983188992,
+          "host_commit_bytes": 33695531008,
+          "owned_private_commit_bytes": 138055680,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742519.0227084,
+          "available_physical_bytes": 9975771136,
+          "host_commit_bytes": 33700982784,
+          "owned_private_commit_bytes": 137932800,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792742519.3887687,
+          "available_physical_bytes": 9986277376,
+          "host_commit_bytes": 33692069888,
+          "owned_private_commit_bytes": 137949184,
+          "owned_process_count": 4
+        }
+      ]
+    },
+    {
+      "engine": "wsl",
+      "instances": 4,
+      "baseline": [
+        {
+          "time": 1792742521.502433,
+          "available_physical_bytes": 10025480192,
+          "host_commit_bytes": 33573662720,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742521.511507,
+          "available_physical_bytes": 10048557056,
+          "host_commit_bytes": 33551433728,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742521.5211568,
+          "available_physical_bytes": 10048303104,
+          "host_commit_bytes": 33551433728,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792742521.9340506,
+          "available_physical_bytes": 9950961664,
+          "host_commit_bytes": 33690906624,
+          "owned_private_commit_bytes": 45395968,
+          "owned_process_count": 19
+        },
+        {
+          "time": 1792742522.945035,
+          "available_physical_bytes": 9871241216,
+          "host_commit_bytes": 33844711424,
+          "owned_private_commit_bytes": 47718400,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742523.958706,
+          "available_physical_bytes": 9804324864,
+          "host_commit_bytes": 34033233920,
+          "owned_private_commit_bytes": 47689728,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742524.9717593,
+          "available_physical_bytes": 9839775744,
+          "host_commit_bytes": 33939595264,
+          "owned_private_commit_bytes": 47689728,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742525.9860141,
+          "available_physical_bytes": 9816858624,
+          "host_commit_bytes": 33916768256,
+          "owned_private_commit_bytes": 47689728,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742526.9971414,
+          "available_physical_bytes": 9858875392,
+          "host_commit_bytes": 33918087168,
+          "owned_private_commit_bytes": 47673344,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742528.0140388,
+          "available_physical_bytes": 9846181888,
+          "host_commit_bytes": 33995603968,
+          "owned_private_commit_bytes": 47673344,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742529.0247548,
+          "available_physical_bytes": 9848651776,
+          "host_commit_bytes": 33927413760,
+          "owned_private_commit_bytes": 47673344,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742530.036383,
+          "available_physical_bytes": 9900093440,
+          "host_commit_bytes": 33801162752,
+          "owned_private_commit_bytes": 47673344,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742531.0492437,
+          "available_physical_bytes": 9956696064,
+          "host_commit_bytes": 33699397632,
+          "owned_private_commit_bytes": 47673344,
+          "owned_process_count": 20
+        },
+        {
+          "time": 1792742531.9447255,
+          "available_physical_bytes": 10036998144,
+          "host_commit_bytes": 33557209088,
+          "owned_private_commit_bytes": 47673344,
+          "owned_process_count": 20
+        }
+      ]
+    },
+    {
+      "engine": "gvx",
+      "instances": 4,
+      "baseline": [
+        {
+          "time": 1792742533.8941934,
+          "available_physical_bytes": 10084913152,
+          "host_commit_bytes": 33498062848,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742533.9041145,
+          "available_physical_bytes": 10083942400,
+          "host_commit_bytes": 33495511040,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742533.9136965,
+          "available_physical_bytes": 10083737600,
+          "host_commit_bytes": 33496702976,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792742537.353457,
+          "available_physical_bytes": 9838678016,
+          "host_commit_bytes": 34102079488,
+          "owned_private_commit_bytes": 549101568,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742538.3641846,
+          "available_physical_bytes": 9832103936,
+          "host_commit_bytes": 34100846592,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742539.3747876,
+          "available_physical_bytes": 9832095744,
+          "host_commit_bytes": 34093322240,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742540.385726,
+          "available_physical_bytes": 9827491840,
+          "host_commit_bytes": 34097127424,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742541.3968709,
+          "available_physical_bytes": 9828704256,
+          "host_commit_bytes": 34096844800,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742542.4074411,
+          "available_physical_bytes": 9833205760,
+          "host_commit_bytes": 34080268288,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742543.4193358,
+          "available_physical_bytes": 9833508864,
+          "host_commit_bytes": 34085187584,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742544.430542,
+          "available_physical_bytes": 9836736512,
+          "host_commit_bytes": 34087518208,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742545.4408815,
+          "available_physical_bytes": 9808281600,
+          "host_commit_bytes": 34119430144,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742546.4518611,
+          "available_physical_bytes": 9807437824,
+          "host_commit_bytes": 34118860800,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        },
+        {
+          "time": 1792742547.365196,
+          "available_physical_bytes": 9805275136,
+          "host_commit_bytes": 34116542464,
+          "owned_private_commit_bytes": 548962304,
+          "owned_process_count": 16
+        }
+      ]
+    },
+    {
+      "engine": "wsl",
+      "instances": 16,
+      "baseline": [
+        {
+          "time": 1792742549.9308527,
+          "available_physical_bytes": 10048147456,
+          "host_commit_bytes": 33537429504,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742549.940611,
+          "available_physical_bytes": 10045927424,
+          "host_commit_bytes": 33537363968,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742549.95075,
+          "available_physical_bytes": 10044059648,
+          "host_commit_bytes": 33537347584,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792742551.4769056,
+          "available_physical_bytes": 9814978560,
+          "host_commit_bytes": 33821863936,
+          "owned_private_commit_bytes": 190091264,
+          "owned_process_count": 79
+        },
+        {
+          "time": 1792742552.492033,
+          "available_physical_bytes": 9793163264,
+          "host_commit_bytes": 33830887424,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742553.5058572,
+          "available_physical_bytes": 9843834880,
+          "host_commit_bytes": 33780334592,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742554.5209193,
+          "available_physical_bytes": 9858916352,
+          "host_commit_bytes": 33773559808,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742555.535447,
+          "available_physical_bytes": 9855791104,
+          "host_commit_bytes": 33775374336,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742556.5520234,
+          "available_physical_bytes": 9858535424,
+          "host_commit_bytes": 33767960576,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742557.56437,
+          "available_physical_bytes": 9873637376,
+          "host_commit_bytes": 33770364928,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742558.5788722,
+          "available_physical_bytes": 9863663616,
+          "host_commit_bytes": 33769873408,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742559.59129,
+          "available_physical_bytes": 9859899392,
+          "host_commit_bytes": 33772716032,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742560.6068873,
+          "available_physical_bytes": 9856897024,
+          "host_commit_bytes": 33770926080,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        },
+        {
+          "time": 1792742561.4897602,
+          "available_physical_bytes": 9857495040,
+          "host_commit_bytes": 33772113920,
+          "owned_private_commit_bytes": 191918080,
+          "owned_process_count": 80
+        }
+      ]
+    },
+    {
+      "engine": "gvx",
+      "instances": 16,
+      "baseline": [
+        {
+          "time": 1792742563.586184,
+          "available_physical_bytes": 10109054976,
+          "host_commit_bytes": 33499570176,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742563.5956094,
+          "available_physical_bytes": 10109853696,
+          "host_commit_bytes": 33499652096,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792742563.6050575,
+          "available_physical_bytes": 10098130944,
+          "host_commit_bytes": 33512353792,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792742577.8598316,
+          "available_physical_bytes": 8871358464,
+          "host_commit_bytes": 36130689024,
+          "owned_private_commit_bytes": 2193387520,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742578.8722398,
+          "available_physical_bytes": 8876019712,
+          "host_commit_bytes": 36122525696,
+          "owned_private_commit_bytes": 2193436672,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742579.8857822,
+          "available_physical_bytes": 8878133248,
+          "host_commit_bytes": 36116193280,
+          "owned_private_commit_bytes": 2193436672,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742580.8984509,
+          "available_physical_bytes": 8871780352,
+          "host_commit_bytes": 36109357056,
+          "owned_private_commit_bytes": 2193436672,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742581.9100862,
+          "available_physical_bytes": 8879427584,
+          "host_commit_bytes": 36094734336,
+          "owned_private_commit_bytes": 2193436672,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742582.922593,
+          "available_physical_bytes": 8891482112,
+          "host_commit_bytes": 36083081216,
+          "owned_private_commit_bytes": 2193444864,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742583.9357555,
+          "available_physical_bytes": 8900587520,
+          "host_commit_bytes": 36085338112,
+          "owned_private_commit_bytes": 2193444864,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742584.9481752,
+          "available_physical_bytes": 8893517824,
+          "host_commit_bytes": 36081004544,
+          "owned_private_commit_bytes": 2193453056,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742585.9600842,
+          "available_physical_bytes": 8899809280,
+          "host_commit_bytes": 36074795008,
+          "owned_private_commit_bytes": 2193469440,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742586.9723654,
+          "available_physical_bytes": 8938176512,
+          "host_commit_bytes": 36010287104,
+          "owned_private_commit_bytes": 2193469440,
+          "owned_process_count": 64
+        },
+        {
+          "time": 1792742587.872485,
+          "available_physical_bytes": 8942596096,
+          "host_commit_bytes": 36014338048,
+          "owned_private_commit_bytes": 2193469440,
+          "owned_process_count": 64
+        }
+      ]
+    }
+  ],
+  "trusted_diagnostic": {
+    "lockdown": false,
+    "phases": [
+      "compute"
+    ],
+    "compute_ms": {
+      "gvx": {
+        "cpu": {
+          "count": 7,
+          "median": 192.5281,
+          "p95": 193.7946,
+          "min": 191.635,
+          "max": 193.7946
+        },
+        "syscall": {
+          "count": 7,
+          "median": 239.5342,
+          "p95": 277.9544,
+          "min": 234.2892,
+          "max": 277.9544
+        }
+      },
+      "wsl": {
+        "cpu": {
+          "count": 7,
+          "median": 191.918453,
+          "p95": 193.589979,
+          "min": 189.334155,
+          "max": 193.589979
+        },
+        "syscall": {
+          "count": 7,
+          "median": 2.033056,
+          "p95": 2.452991,
+          "min": 1.817738,
+          "max": 2.452991
+        }
+      }
+    },
+    "compute_samples": [
+      {
+        "engine": "gvx",
+        "sample": 0,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 191647400,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 0,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 193589979,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 1,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 191845747,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 1,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 192528100,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 2,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 192400100,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 2,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 192714713,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 3,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 189334155,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 3,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 193348700,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 4,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 191635000,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 4,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 191918453,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 5,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 193452969,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 5,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 192667700,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 6,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 193794600,
+        "mode": "cpu"
+      },
+      {
+        "engine": "wsl",
+        "sample": 6,
+        "checksum": 3608916330791240157,
+        "count": 100000000,
+        "elapsed_ns": 191201998,
+        "mode": "cpu"
+      },
+      {
+        "engine": "gvx",
+        "sample": 0,
+        "count": 10000,
+        "elapsed_ns": 239970900,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 0,
+        "count": 10000,
+        "elapsed_ns": 2033056,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 1,
+        "count": 10000,
+        "elapsed_ns": 1978151,
+        "mode": "syscall"
+      },
+      {
+        "engine": "gvx",
+        "sample": 1,
+        "count": 10000,
+        "elapsed_ns": 239084100,
+        "mode": "syscall"
+      },
+      {
+        "engine": "gvx",
+        "sample": 2,
+        "count": 10000,
+        "elapsed_ns": 239534200,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 2,
+        "count": 10000,
+        "elapsed_ns": 1877444,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 3,
+        "count": 10000,
+        "elapsed_ns": 1817738,
+        "mode": "syscall"
+      },
+      {
+        "engine": "gvx",
+        "sample": 3,
+        "count": 10000,
+        "elapsed_ns": 234289200,
+        "mode": "syscall"
+      },
+      {
+        "engine": "gvx",
+        "sample": 4,
+        "count": 10000,
+        "elapsed_ns": 277954400,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 4,
+        "count": 10000,
+        "elapsed_ns": 2176269,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 5,
+        "count": 10000,
+        "elapsed_ns": 2452991,
+        "mode": "syscall"
+      },
+      {
+        "engine": "gvx",
+        "sample": 5,
+        "count": 10000,
+        "elapsed_ns": 240250700,
+        "mode": "syscall"
+      },
+      {
+        "engine": "gvx",
+        "sample": 6,
+        "count": 10000,
+        "elapsed_ns": 235245500,
+        "mode": "syscall"
+      },
+      {
+        "engine": "wsl",
+        "sample": 6,
+        "count": 10000,
+        "elapsed_ns": 2351083,
+        "mode": "syscall"
+      }
+    ],
+    "failures": []
+  }
+}

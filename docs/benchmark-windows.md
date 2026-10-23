@@ -1,10 +1,10 @@
 # Windows ARM64 Runtime Comparison
 
-This benchmark compares confined Windows `systrap` with an existing Debian distribution on WSL2.
+This benchmark compares confined Windows `systrap` and WHPX with an existing Debian distribution on WSL2.
 Both runtimes execute the same static Linux ARM64 Go binary.
 The driver preserves running WSL distributions and Docker workloads.
 
-## Measured Results
+## Measured Systrap Results
 
 The measurements used a Lenovo 83HL with a Snapdragon X Plus X1P42100 and eight logical processors.
 The host ran Windows 11 Home build 26300 with 31.57 GiB RAM and the Balanced power plan.
@@ -43,9 +43,46 @@ Negative physical increases show this interference, so the single-instance obser
 The existing WSL VM used about 735 MiB before the first idle run, including existing Debian and Docker workloads.
 These measurements do not support a general claim that Windows systrap uses fewer resources than WSL2.
 
+## Measured WHPX Results
+
+The WHPX run reused both executable files from the systrap run; their SHA-256 hashes match.
+The driver repeated the WSL baseline while Debian and Docker continued to run.
+The [WHPX samples](../tools/bench/results/windows-arm64-whpx-20261023.json) record the confined run and a separate diagnostic without lockdown.
+The hardware, workload, repetition counts, and power plan match the systrap comparison.
+
+| Metric | Confined gvx WHPX | Existing WSL2 |
+| :--- | ---: | ---: |
+| Command startup, median | 972 ms | 145 ms |
+| Command startup, p95 | 1,078 ms | 169 ms |
+| Integer loop, median | 201 ms | 192 ms |
+| 10,000 `getpid` calls, median | 1,175 ms | 1.83 ms |
+| HTTP requests per second, median | 389 | 12,582 |
+| HTTP request latency, median | 2.41 ms | 0.269 ms |
+| HTTP request latency, p95 | 58.8 ms | 0.463 ms |
+| HTTP errors | 0 | 0 |
+
+| Idle instances | WHPX private commit | Windows host physical increase with WHPX | Windows host physical increase with WSL |
+| ---: | ---: | ---: | ---: |
+| 1 | 132 MiB | 9 MiB (-46 to 77) | 18 MiB (-26 to 126) |
+| 4 | 524 MiB | 240 MiB (234 to 266) | 181 MiB (11 to 233) |
+| 16 | 2,092 MiB | 1,161 MiB (1,112 to 1,180) | 180 MiB (164 to 241) |
+
+One WHPX sandbox used four Windows processes and about 0.16 CPU seconds over sixty idle seconds.
+The physical memory observations retain the background interference described below.
+Private commit excludes shared mappings and resources that Windows charges outside these processes.
+
+The diagnostic disabled lockdown only for the generated workload and repeated each compute measurement seven times.
+Its median was 240 ms for 10,000 `getpid` calls, versus 1,175 ms with confinement.
+The integer loop took 193 ms without confinement and 201 ms with confinement.
+Removing confinement also removes the broker, so this diagnostic does not isolate every source of overhead.
+
+The [WHPX broker](../pkg/sentry/platform/whpx/broker_windows.go) uses RPC for each run and each register operation.
+The diagnostic indicates substantial overhead in the confined path and warrants profiling of those RPC calls.
+It does not establish a performance advantage over WSL2 or an equivalent isolation boundary without lockdown.
+
 ## Measurement Boundary
 
-The benchmark targets the M5 execution path through `cmd/rungv`.
+The benchmark targets the M2 WHPX path and the M5 systrap path through `cmd/rungv`.
 The workload belongs to `internal/benchguest`; the Windows driver belongs to `tools/bench`.
 Neither component changes the Sentry or its platform bindings.
 
@@ -57,7 +94,7 @@ Neither component changes the Sentry or its platform bindings.
 | Idle | One guest for 60 seconds; four and sixteen guests for ten seconds each | Explicit readiness and successful exit |
 | HTTP | 2,000 requests per run, four clients, 1,024-byte responses, three runs | Status 200 and exact response bytes |
 
-Startup includes normal sandbox initialization, image conversion, AppContainer creation, and shutdown.
+Startup includes sandbox initialization, image conversion, AppContainer creation, partition creation for WHPX, and shutdown.
 It excludes compilation, registry access, and the initial warm-up.
 WSL commands use `wsl.exe --exec` and a private directory on the Linux filesystem.
 The driver verifies the installed binary with SHA-256.
@@ -89,7 +126,21 @@ The driver builds both binaries and writes raw samples to `results.json` and agg
 The driver removes only its own temporary Linux executable and directory.
 
 ```powershell
-python tools/bench/compare_windows.py --distribution Debian --output "$env:TEMP/gvx-bench-$([guid]::NewGuid().ToString('N'))"
+$systrapRun = Join-Path $env:TEMP ("gvx-systrap-" + [guid]::NewGuid().ToString("N"))
+python tools/bench/compare_windows.py --backend systrap --distribution Debian --output $systrapRun
+$whpxRun = Join-Path $env:TEMP ("gvx-whpx-" + [guid]::NewGuid().ToString("N"))
+python tools/bench/compare_windows.py --backend whpx --distribution Debian --binary-dir $systrapRun --output $whpxRun
+```
+
+Repeat only the compute diagnostic without lockdown:
+
+> [!CAUTION]
+> Disable lockdown only for the generated benchmark binary.
+> This diagnostic removes the normal host containment.
+
+```powershell
+$directRun = Join-Path $env:TEMP ("gvx-whpx-direct-" + [guid]::NewGuid().ToString("N"))
+python tools/bench/compare_windows.py --backend whpx --no-lockdown --binary-dir $systrapRun --phases compute --samples 7 --output $directRun
 ```
 
 ## Not verified

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import shutil
 import socket
 import statistics
 import subprocess
@@ -277,6 +278,10 @@ def http_worker(port, count):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--distribution", default="Debian")
+    parser.add_argument("--backend", choices=["systrap", "whpx"], default="systrap")
+    parser.add_argument("--lockdown", action=argparse.BooleanOptionalAction, default=True,
+                        help="Disable only for trusted benchmark binaries")
+    parser.add_argument("--binary-dir", type=Path, help="Reuse guest.elf and rungv.exe from an earlier run")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--idle-seconds", type=float, default=60)
@@ -294,9 +299,13 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     guest_binary = output / "guest.elf"
     runner = output / "rungv.exe"
-    env = dict(os.environ, GOOS="linux", GOARCH="arm64", CGO_ENABLED="0")
-    run(["go", "build", "-o", str(guest_binary), "./internal/benchguest"], cwd=repo, env=env)
-    run(["go", "build", "-o", str(runner), "./cmd/rungv"], cwd=repo)
+    if args.binary_dir:
+        shutil.copyfile(args.binary_dir / "guest.elf", guest_binary)
+        shutil.copyfile(args.binary_dir / "rungv.exe", runner)
+    else:
+        env = dict(os.environ, GOOS="linux", GOARCH="arm64", CGO_ENABLED="0")
+        run(["go", "build", "-o", str(guest_binary), "./internal/benchguest"], cwd=repo, env=env)
+        run(["go", "build", "-o", str(runner), "./cmd/rungv"], cwd=repo)
     wsl = ["wsl.exe", "-d", args.distribution, "--exec"]
     linux_dir = f"/tmp/gvx-bench-{uuid.uuid4().hex}"
     linux_binary = linux_dir + "/guest"
@@ -313,7 +322,8 @@ def main():
                              "wsl_kernel": run(wsl + ["uname", "-r"], capture_output=True).stdout.decode().strip(),
                              "guest_sha256": digest, "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
                              "wsl_distribution": args.distribution, "wsl_state": "kept running; no shutdown",
-                             "settings": vars(args) | {"output": str(output)}},
+                             "settings": vars(args) | {"output": str(output),
+                                                       "binary_dir": str(args.binary_dir) if args.binary_dir else None}},
                "startup": [], "compute": [], "idle": [], "http": [], "failures": []}
     results["metadata"]["wsl_vm_initial_cim"] = wsl_vm_cim()
     sequence = 0
@@ -328,7 +338,7 @@ def main():
         if engine == "wsl":
             return wsl + [linux_binary, *workload]
         network = ["-net=nat", "-p", f"127.0.0.1:{port}:8080"] if port else ["-net=none"]
-        return [str(runner), "run", "-platform=systrap", *network,
+        return [str(runner), "run", f"-platform={args.backend}", f"-lockdown={str(args.lockdown).lower()}", *network,
                 f"-cache-dir={output / 'cache'}", f"-bin={guest_binary}", "--", *workload]
 
     def start_guest(engine, mode, port=None):
