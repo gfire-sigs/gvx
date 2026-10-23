@@ -89,18 +89,18 @@ func startFakeDNSServer(t *testing.T, handler dnsHandler) *fakeDNSServer {
 		ln  net.Listener
 		err error
 	)
-	// The UDP and TCP sockets must share a port. Another program may hold the
-	// TCP side of a free UDP port, so retry with a new port.
+	// Allocate through TCP so Windows excludes its reserved TCP ranges.
+	// Keep the listener open while binding UDP at the same port.
 	for range 50 {
-		pc, err = net.ListenPacket("udp", "127.0.0.1:0")
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		ln, err = net.Listen("tcp", pc.LocalAddr().String())
+		pc, err = net.ListenPacket("udp", ln.Addr().String())
 		if err == nil {
 			break
 		}
-		_ = pc.Close()
+		_ = ln.Close()
 	}
 	if err != nil {
 		t.Fatalf("no port is free for both UDP and TCP: %v", err)
