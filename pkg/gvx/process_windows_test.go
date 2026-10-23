@@ -349,3 +349,17 @@ func TestProcessMountsAndLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestProcessRefusesSystrapWithoutNativeSyscallSealing(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("native syscall sealing is available")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := NewProcess(t.Context(), WorkerCommand{Executable: executable}, Config{Platform: PlatformSystrap, NetworkMode: NetModeNone})
+	if sb != nil || !errors.Is(err, ErrPlatformUnavailable) {
+		t.Fatalf("NewProcess=%v, error=%v; want unavailable confined systrap", sb, err)
+	}
+}

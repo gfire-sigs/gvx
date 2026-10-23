@@ -1196,7 +1196,7 @@ func TestE2ESystrapWorkspaceWrite(t *testing.T) {
 }
 
 func TestE2ESystrapHostLockdownDefault(t *testing.T) {
-	systraptest.Require(t)
+	systraptest.RequireHostLockdown(t)
 	probe := toolPath(t, lockdownProbePkg)
 	guestELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/workspace/guest.txt", "systrap-locked\n")
 	if err != nil {
@@ -1237,7 +1237,7 @@ func TestE2ESystrapHostLockdownDefault(t *testing.T) {
 }
 
 func TestE2ERungvSystrapDefaultLockdown(t *testing.T) {
-	systraptest.Require(t)
+	systraptest.RequireHostLockdown(t)
 	rungv := toolPath(t, rungvPkg)
 	guestELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/workspace/cli.txt", "cli-systrap\n")
 	if err != nil {

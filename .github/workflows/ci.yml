@@ -241,4 +241,4 @@ jobs:
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
-        run: go test -count=1 -skip 'HostLockdown' -run 'Systrap|systrap|Stub|Process' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+        run: go test -count=1 -run 'Systrap|systrap|Stub|Process' ./pkg/gvx/ ./cmd/rungv/ ./e2e/

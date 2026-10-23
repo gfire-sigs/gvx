@@ -18,7 +18,10 @@
 // imports no gvx package, so tests inside pkg/gvx can use it.
 package systraptest
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // Available reports whether the systrap engine starts in this build. It
 // returns false only for the typed errors that mean a missing prerequisite: an
@@ -52,5 +55,14 @@ func RequireUnavailable(t testing.TB) {
 	t.Helper()
 	if Available(t) {
 		t.Skip("systrap engine is available in this build, so the unavailable path does not apply")
+	}
+}
+
+// RequireHostLockdown skips targets that support trusted systrap execution only.
+func RequireHostLockdown(t testing.TB) {
+	t.Helper()
+	Require(t)
+	if runtime.GOOS == "windows" && runtime.GOARCH != "arm64" {
+		t.Skip("confined Windows systrap requires ARM64 native syscall sealing")
 	}
 }
