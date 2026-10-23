@@ -350,6 +350,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 
 | Run | Runners | Content |
 | :--- | :--- | :--- |
+| [`39914070033`](https://github.com/gfire-sigs/gvx/actions/runs/39914070033) | both | ARM64 syscall sealing, AppContainer stubs, confined workers, automatic selection, and default host containment. |
 | `39790745508` | both | Exports, stub bytes, direct syscalls, mitigation policy, spawn time. |
 | `39791228959` | both | Placeholders, executable views, remote 4KB cost, FS base loss, event round trip. |
 | `39791535847` | both | `arm64` `x18`, `TPIDR_EL0`, `ctr_el0`, `ic ivau`, WHP presence. |

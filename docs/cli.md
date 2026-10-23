@@ -107,7 +107,7 @@ The tmpfs options are `size`, `ro`, and `rw`. The option `size` takes a number w
 | Host OS | What the lockdown does with a mount |
 | :--- | :--- |
 | macOS | The Seatbelt profile gets a read rule, and a write rule for a writable mount, for the path and for its resolved path. |
-| Windows | The lockdown writes a Low integrity label on each object of a writable mount. It grants the logon session read and execute access, and write access for a writable mount. |
+| Windows | The lockdown grants the AppContainer SID access to each mount. It marks writable mounts with Low integrity. |
 | Linux | The seccomp filter allows opens through a directory descriptor when a mount exists. |
 
 > [!WARNING]
@@ -159,7 +159,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `--name` | Sets the container ID of the kernel and nothing else. |
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
-| Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
+| Guest architecture | Must equal the host architecture. |
 | Executables that link at a fixed address (non-PIE) | The macOS `systrap` engine refuses them, and the error names `-platform=hvf`. `hvf`, `whpx`, and the Windows `systrap` engine run them. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
 

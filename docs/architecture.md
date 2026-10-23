@@ -39,7 +39,9 @@ flowchart TD
 
 `gvx` pairs hardware virtualization (`whpx` and `hvf`) as the default Tier-1 engine with the `systrap` backend as the user-mode fallback. Linux uses the upstream gVisor platforms.
 
-The macOS `systrap` fallback runs on `arm64` only, and it needs 16KB guest pages (`-tags pagesize_16k`). Windows `systrap` generates its minimal PE stub in Go. Confined Windows systrap supports ARM64. AMD64 requires trusted execution without lockdown. The project dropped the Rosetta 2 engine for `darwin/amd64`. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without that filter would let a guest issue host system calls. The guest architecture must equal the host architecture on every backend.
+The macOS `systrap` fallback runs on `arm64` only, and it needs 16KB guest pages (`-tags pagesize_16k`). Windows `systrap` generates its minimal PE stub in Go. Confined Windows systrap supports ARM64. AMD64 requires trusted execution without lockdown.
+
+The project dropped the Rosetta 2 engine for `darwin/amd64`. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without that filter would let a guest issue host system calls. The guest architecture must equal the host architecture on every backend.
 
 | Host Target | Primary Engine (`whpx` / `hvf`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
 | :--- | :--- | :--- | :--- | :--- |
