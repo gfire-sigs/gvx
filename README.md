@@ -6,18 +6,21 @@
 
 ## 1. Architecture and Capability Overview
 
-Running Linux binaries or container images on Windows and macOS usually forces a heavy compromise. WSL2, Docker Desktop, and Apple `Virtualization.framework` boot a full Linux virtual machine that consumes hundreds of megabytes of RAM and requires background virtualization daemons. QEMU emulates an entire motherboard and CPU in software.
+WSL2 and Docker Desktop run Linux programs inside a Linux virtual machine.
+`gvx` implements Linux system calls in user space without booting a Linux kernel.
+This design does not guarantee lower latency or memory use than an existing WSL2 instance.
 
 `gvx` takes a direct user-space approach. About 65% of upstream `google/gvisor` (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,overlay,tmpfs}`, and `pkg/tcpip`) is OS-agnostic Go code supporting both `amd64` and `arm64`. `tools/upstream` expands those build constraints to `linux || windows || darwin` automatically. Thin host packages bind to Windows (`WinHvPlatform.dll`, `WaitOnAddress`, `MapViewOfFile3`) and macOS (`Hypervisor.framework`, `__ulock_wait`, `mach_vm_remap`) primitives.
 
-| Runtime Model | Host Targets | Cold Start | Memory Overhead | Admin / `sudo` Required | 4KB `mmap(MAP_FIXED)` | Direct OCI Image Run |
-| :--- | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows & macOS (`amd64`, `arm64`) | `~20 ms` | `~30 MiB` | No (AppContainer / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
-| **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k` build); Windows ARM64; trusted Windows AMD64 | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt or AppContainer) | Native stub tasks | Yes (In-Memory Tar-to-EROFS) |
-| **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
-| **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
+| Runtime Model | Host Targets | Execution Boundary | Direct OCI Image Run |
+| :--- | :--- | :--- | :--- |
+| **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows and macOS (`amd64`, `arm64`) | Sentry and hardware guest mappings | Yes |
+| **`gvx` / `rungv` (`systrap`, M5)** | macOS ARM64; Windows ARM64; trusted Windows AMD64 | Sentry and native stub tasks | Yes |
+| **WSL2** | Windows | Linux kernel inside a VM | Through a container runtime |
+| **Docker Desktop** | Windows and macOS | Container runtime inside a Linux VM | Yes |
 
-The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry was offline. A reachable registry adds about one second for the tag check. These timings describe `darwin/arm64` only. Native `windows/arm64` tests also verify WHPX with static and dynamic ELF files and the M2 and M3 image gates.
+The [Windows ARM64 comparison](docs/benchmark-windows.md) records latency and memory costs with a reproducible workload.
+That comparison preserves existing WSL2 and Docker workloads and excludes WSL VM startup.
 
 ```mermaid
 flowchart LR
@@ -239,6 +242,7 @@ Read the architecture plan and agent operating manual before modifying any packa
 | :--- | :--- | :--- |
 | [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync pipeline, and M1-M5 milestones. |
 | [`docs/cli.md`](docs/cli.md) | Users & Engineers | Every `rungv` command, every flag of `rungv run`, the run rules, and the differences from Docker. |
+| [`docs/benchmark-windows.md`](docs/benchmark-windows.md) | Users and Engineers | Reproducible Windows ARM64 measurements against an existing WSL2 distribution. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 rules, package import boundaries, and verification gates. |
 
 ---
