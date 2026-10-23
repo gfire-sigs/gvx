@@ -363,3 +363,7 @@ func TestProcessRefusesSystrapWithoutNativeSyscallSealing(t *testing.T) {
 		t.Fatalf("NewProcess=%v, error=%v; want unavailable confined systrap", sb, err)
 	}
 }
+
+func TestProcessAutoUsesAvailableBackend(t *testing.T) {
+	testProcessSandboxesHaveIndependentMemory(t, PlatformAuto)
+}

@@ -16,4 +16,5 @@ package systrap
 
 import "golang.org/x/sys/windows"
 
+// AMD64 permits trusted execution only. NewBrokered rejects this architecture.
 func sealHostSyscalls(windows.Handle) error { return nil }
