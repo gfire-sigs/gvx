@@ -1,0 +1,1621 @@
+{
+  "metadata": {
+    "revision": "1327d305616e79b944cf36f29d539734d0f56790",
+    "diff": " M pkg/sentry/platform/whpx/vcpu_arm64.go\n",
+    "host": "Windows-11-10.0.26300-SP0",
+    "processor": "ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc",
+    "go": "go version go1.27.3 windows/arm64",
+    "wsl_kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "guest_sha256": "12645e7b94f2459bc91b16d3f5762860c881cbed4d8912360e90d4d7c22819bc",
+    "runner_sha256": "3a6893dc5ec589015e6d0bba620dc717426ad7474d60d3f8f1badd1ae3fde6d5",
+    "baseline_runner_sha256": "9828b5b692ea6ee0fd899d4e2355fbf441564d7732cb2b4a84e424d7b54500a2",
+    "wsl_distribution": "Debian",
+    "wsl_state": "kept running; no shutdown",
+    "settings": {
+      "distribution": "Debian",
+      "backend": "whpx",
+      "lockdown": true,
+      "samples": 30,
+      "idle_seconds": 15.0,
+      "counts": [
+        1
+      ],
+      "http_requests": 2000,
+      "phases": [
+        "startup",
+        "compute",
+        "idle",
+        "http"
+      ]
+    },
+    "wsl_vm_initial_cim": {
+      "ProcessId": 22444,
+      "WorkingSetSize": 508497920,
+      "PageFileUsage": 2288336
+    },
+    "hardware": {
+      "cpu": "Snapdragon X Plus X1P42100",
+      "logical_processors": 8,
+      "ram_bytes": 33897037824,
+      "model": "Lenovo 83HL",
+      "windows": "Windows 11 Home 10.0.26300",
+      "power_plan": "Balanced"
+    },
+    "baseline_source_revision": "bb58dce5b7ab5452bdcdd7b71efde3d020de13c9",
+    "raw_sha256": "828ca699b2f9a49ca74f836062c3afca88dbc340ec116790b3b895d06b77d8b9"
+  },
+  "startup_ms": {
+    "baseline": {
+      "count": 30,
+      "median": 1012.9293000063626,
+      "p95": 1072.1323000034317,
+      "min": 926.349500005017,
+      "max": 1074.1091999952914
+    },
+    "gvx": {
+      "count": 30,
+      "median": 912.9226499935612,
+      "p95": 965.1115000015125,
+      "min": 861.8217000039294,
+      "max": 978.8540999870747
+    },
+    "wsl": {
+      "count": 30,
+      "median": 139.14465000561904,
+      "p95": 152.92870000121184,
+      "min": 125.86119999468792,
+      "max": 159.14519999932963
+    }
+  },
+  "compute_ms": {
+    "baseline": {
+      "cpu": {
+        "count": 7,
+        "median": 198.2802,
+        "p95": 205.0031,
+        "min": 194.8715,
+        "max": 205.0031
+      },
+      "syscall": {
+        "count": 7,
+        "median": 1461.28802,
+        "p95": 1477.786575,
+        "min": 1418.596978,
+        "max": 1477.786575
+      }
+    },
+    "gvx": {
+      "cpu": {
+        "count": 7,
+        "median": 198.8584,
+        "p95": 202.5878,
+        "min": 191.202,
+        "max": 202.5878
+      },
+      "syscall": {
+        "count": 7,
+        "median": 511.0076,
+        "p95": 569.8368,
+        "min": 506.1384,
+        "max": 569.8368
+      }
+    },
+    "wsl": {
+      "cpu": {
+        "count": 7,
+        "median": 191.083321,
+        "p95": 207.537905,
+        "min": 187.291703,
+        "max": 207.537905
+      },
+      "syscall": {
+        "count": 7,
+        "median": 1.804009,
+        "p95": 1.851812,
+        "min": 1.783907,
+        "max": 1.851812
+      }
+    }
+  },
+  "idle": [
+    {
+      "engine": "wsl",
+      "instances": 1,
+      "seconds": 15.011643171310425,
+      "host_physical_delta_bytes": {
+        "count": 16,
+        "median": 67887104.0,
+        "p95": 72806400,
+        "min": 2842624,
+        "max": 72806400
+      },
+      "host_commit_delta_bytes": {
+        "count": 16,
+        "median": 13137920.0,
+        "p95": 26038272,
+        "min": 6041600,
+        "max": 26038272
+      },
+      "owned_private_commit_bytes": {
+        "count": 16,
+        "median": 12005376.0,
+        "p95": 12005376,
+        "min": 10526720,
+        "max": 12005376
+      },
+      "owned_process_count": {
+        "count": 16,
+        "median": 5.0,
+        "p95": 5,
+        "min": 5,
+        "max": 5
+      },
+      "owned_cpu_seconds": 0.03125,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 526102528,
+        "PageFileUsage": 2297240
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 592756736,
+        "PageFileUsage": 2300512
+      }
+    },
+    {
+      "engine": "gvx",
+      "instances": 1,
+      "seconds": 15.013159036636353,
+      "host_physical_delta_bytes": {
+        "count": 16,
+        "median": 82298880.0,
+        "p95": 110145536,
+        "min": 1785856,
+        "max": 110145536
+      },
+      "host_commit_delta_bytes": {
+        "count": 16,
+        "median": 161888256.0,
+        "p95": 199352320,
+        "min": 56205312,
+        "max": 199352320
+      },
+      "owned_private_commit_bytes": {
+        "count": 16,
+        "median": 136839168.0,
+        "p95": 136839168,
+        "min": 136830976,
+        "max": 136839168
+      },
+      "owned_process_count": {
+        "count": 16,
+        "median": 4.0,
+        "p95": 4,
+        "min": 4,
+        "max": 4
+      },
+      "owned_cpu_seconds": 0.046875,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 592760832,
+        "PageFileUsage": 2300512
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 593670144,
+        "PageFileUsage": 2287124
+      }
+    },
+    {
+      "engine": "baseline",
+      "instances": 1,
+      "seconds": 15.012196063995361,
+      "host_physical_delta_bytes": {
+        "count": 16,
+        "median": 79968256.0,
+        "p95": 120987648,
+        "min": 44408832,
+        "max": 120987648
+      },
+      "host_commit_delta_bytes": {
+        "count": 16,
+        "median": 142116864.0,
+        "p95": 243470336,
+        "min": 101142528,
+        "max": 243470336
+      },
+      "owned_private_commit_bytes": {
+        "count": 16,
+        "median": 137527296.0,
+        "p95": 137551872,
+        "min": 137527296,
+        "max": 137551872
+      },
+      "owned_process_count": {
+        "count": 16,
+        "median": 4.0,
+        "p95": 4,
+        "min": 4,
+        "max": 4
+      },
+      "owned_cpu_seconds": 0.046875,
+      "wsl_vm_before_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 593670144,
+        "PageFileUsage": 2287124
+      },
+      "wsl_vm_after_cim": {
+        "ProcessId": 22444,
+        "WorkingSetSize": 590602240,
+        "PageFileUsage": 2287124
+      }
+    }
+  ],
+  "http": {
+    "baseline": {
+      "requests_per_second": {
+        "count": 3,
+        "median": 389.83240676044977,
+        "p95": 390.41491559847464,
+        "min": 364.07090543016125,
+        "max": 390.41491559847464
+      },
+      "latency_ms": {
+        "count": 6000,
+        "median": 2.452799992170185,
+        "p95": 62.00839999655727,
+        "min": 1.473600001190789,
+        "max": 185.36829999356996
+      },
+      "errors": 0
+    },
+    "gvx": {
+      "requests_per_second": {
+        "count": 3,
+        "median": 886.497394716515,
+        "p95": 907.520692035357,
+        "min": 882.7673095533233,
+        "max": 907.520692035357
+      },
+      "latency_ms": {
+        "count": 6000,
+        "median": 0.999950003460981,
+        "p95": 35.60760000254959,
+        "min": 0.6874000100651756,
+        "max": 119.31949999416247
+      },
+      "errors": 0
+    },
+    "wsl": {
+      "requests_per_second": {
+        "count": 3,
+        "median": 12932.135387001113,
+        "p95": 15028.057382681634,
+        "min": 12579.130593878592,
+        "max": 15028.057382681634
+      },
+      "latency_ms": {
+        "count": 6000,
+        "median": 0.24300000222865492,
+        "p95": 0.44839999463874847,
+        "min": 0.08399999933317304,
+        "max": 12.99730000027921
+      },
+      "errors": 0
+    }
+  },
+  "failures": [],
+  "startup_samples": [
+    {
+      "engine": "baseline",
+      "sample": 0,
+      "elapsed_ms": 926.349500005017
+    },
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "elapsed_ms": 934.3185000034282
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "elapsed_ms": 143.40450000599958
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "elapsed_ms": 131.4864000014495
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "elapsed_ms": 914.6229000034509
+    },
+    {
+      "engine": "baseline",
+      "sample": 1,
+      "elapsed_ms": 1002.7827000012621
+    },
+    {
+      "engine": "baseline",
+      "sample": 2,
+      "elapsed_ms": 967.9547999985516
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "elapsed_ms": 915.0431999878492
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "elapsed_ms": 139.91450000321493
+    },
+    {
+      "engine": "wsl",
+      "sample": 3,
+      "elapsed_ms": 129.6520000032615
+    },
+    {
+      "engine": "gvx",
+      "sample": 3,
+      "elapsed_ms": 876.4234999980545
+    },
+    {
+      "engine": "baseline",
+      "sample": 3,
+      "elapsed_ms": 979.423400000087
+    },
+    {
+      "engine": "baseline",
+      "sample": 4,
+      "elapsed_ms": 1029.0725999948336
+    },
+    {
+      "engine": "gvx",
+      "sample": 4,
+      "elapsed_ms": 931.4544999942882
+    },
+    {
+      "engine": "wsl",
+      "sample": 4,
+      "elapsed_ms": 141.0470999981044
+    },
+    {
+      "engine": "wsl",
+      "sample": 5,
+      "elapsed_ms": 139.17120000405703
+    },
+    {
+      "engine": "gvx",
+      "sample": 5,
+      "elapsed_ms": 965.1115000015125
+    },
+    {
+      "engine": "baseline",
+      "sample": 5,
+      "elapsed_ms": 1032.8428000066197
+    },
+    {
+      "engine": "baseline",
+      "sample": 6,
+      "elapsed_ms": 1029.8508000123547
+    },
+    {
+      "engine": "gvx",
+      "sample": 6,
+      "elapsed_ms": 897.6180000026943
+    },
+    {
+      "engine": "wsl",
+      "sample": 6,
+      "elapsed_ms": 159.14519999932963
+    },
+    {
+      "engine": "wsl",
+      "sample": 7,
+      "elapsed_ms": 136.2894000048982
+    },
+    {
+      "engine": "gvx",
+      "sample": 7,
+      "elapsed_ms": 939.7690000041621
+    },
+    {
+      "engine": "baseline",
+      "sample": 7,
+      "elapsed_ms": 1048.519200005103
+    },
+    {
+      "engine": "baseline",
+      "sample": 8,
+      "elapsed_ms": 1008.5942000005161
+    },
+    {
+      "engine": "gvx",
+      "sample": 8,
+      "elapsed_ms": 916.4786000037566
+    },
+    {
+      "engine": "wsl",
+      "sample": 8,
+      "elapsed_ms": 130.45490000513382
+    },
+    {
+      "engine": "wsl",
+      "sample": 9,
+      "elapsed_ms": 135.40090000606142
+    },
+    {
+      "engine": "gvx",
+      "sample": 9,
+      "elapsed_ms": 871.4096000039717
+    },
+    {
+      "engine": "baseline",
+      "sample": 9,
+      "elapsed_ms": 1010.8650000038324
+    },
+    {
+      "engine": "baseline",
+      "sample": 10,
+      "elapsed_ms": 955.5935999960639
+    },
+    {
+      "engine": "gvx",
+      "sample": 10,
+      "elapsed_ms": 952.6174000056926
+    },
+    {
+      "engine": "wsl",
+      "sample": 10,
+      "elapsed_ms": 139.48489999165758
+    },
+    {
+      "engine": "wsl",
+      "sample": 11,
+      "elapsed_ms": 125.86119999468792
+    },
+    {
+      "engine": "gvx",
+      "sample": 11,
+      "elapsed_ms": 912.9574999969918
+    },
+    {
+      "engine": "baseline",
+      "sample": 11,
+      "elapsed_ms": 1074.1091999952914
+    },
+    {
+      "engine": "baseline",
+      "sample": 12,
+      "elapsed_ms": 962.6831999921706
+    },
+    {
+      "engine": "gvx",
+      "sample": 12,
+      "elapsed_ms": 978.8540999870747
+    },
+    {
+      "engine": "wsl",
+      "sample": 12,
+      "elapsed_ms": 129.3941000039922
+    },
+    {
+      "engine": "wsl",
+      "sample": 13,
+      "elapsed_ms": 133.98230000166222
+    },
+    {
+      "engine": "gvx",
+      "sample": 13,
+      "elapsed_ms": 870.579499998712
+    },
+    {
+      "engine": "baseline",
+      "sample": 13,
+      "elapsed_ms": 979.6341000037501
+    },
+    {
+      "engine": "baseline",
+      "sample": 14,
+      "elapsed_ms": 998.9796000008937
+    },
+    {
+      "engine": "gvx",
+      "sample": 14,
+      "elapsed_ms": 956.3912000012351
+    },
+    {
+      "engine": "wsl",
+      "sample": 14,
+      "elapsed_ms": 139.68769999337383
+    },
+    {
+      "engine": "wsl",
+      "sample": 15,
+      "elapsed_ms": 130.45869999041315
+    },
+    {
+      "engine": "gvx",
+      "sample": 15,
+      "elapsed_ms": 906.5127999929246
+    },
+    {
+      "engine": "baseline",
+      "sample": 15,
+      "elapsed_ms": 1041.8132999911904
+    },
+    {
+      "engine": "baseline",
+      "sample": 16,
+      "elapsed_ms": 1072.1323000034317
+    },
+    {
+      "engine": "gvx",
+      "sample": 16,
+      "elapsed_ms": 868.588199999067
+    },
+    {
+      "engine": "wsl",
+      "sample": 16,
+      "elapsed_ms": 142.8773999941768
+    },
+    {
+      "engine": "wsl",
+      "sample": 17,
+      "elapsed_ms": 139.11810000718106
+    },
+    {
+      "engine": "gvx",
+      "sample": 17,
+      "elapsed_ms": 868.6698999954388
+    },
+    {
+      "engine": "baseline",
+      "sample": 17,
+      "elapsed_ms": 1014.9936000088928
+    },
+    {
+      "engine": "baseline",
+      "sample": 18,
+      "elapsed_ms": 951.9074999989243
+    },
+    {
+      "engine": "gvx",
+      "sample": 18,
+      "elapsed_ms": 912.8877999901306
+    },
+    {
+      "engine": "wsl",
+      "sample": 18,
+      "elapsed_ms": 139.5092000020668
+    },
+    {
+      "engine": "wsl",
+      "sample": 19,
+      "elapsed_ms": 139.7787000023527
+    },
+    {
+      "engine": "gvx",
+      "sample": 19,
+      "elapsed_ms": 867.9952000093181
+    },
+    {
+      "engine": "baseline",
+      "sample": 19,
+      "elapsed_ms": 1068.1133999896701
+    },
+    {
+      "engine": "baseline",
+      "sample": 20,
+      "elapsed_ms": 1052.997899998445
+    },
+    {
+      "engine": "gvx",
+      "sample": 20,
+      "elapsed_ms": 861.8217000039294
+    },
+    {
+      "engine": "wsl",
+      "sample": 20,
+      "elapsed_ms": 152.92870000121184
+    },
+    {
+      "engine": "wsl",
+      "sample": 21,
+      "elapsed_ms": 134.09089999913704
+    },
+    {
+      "engine": "gvx",
+      "sample": 21,
+      "elapsed_ms": 903.376299989759
+    },
+    {
+      "engine": "baseline",
+      "sample": 21,
+      "elapsed_ms": 951.3781999994535
+    },
+    {
+      "engine": "baseline",
+      "sample": 22,
+      "elapsed_ms": 1020.6972999876598
+    },
+    {
+      "engine": "gvx",
+      "sample": 22,
+      "elapsed_ms": 944.9962000071537
+    },
+    {
+      "engine": "wsl",
+      "sample": 22,
+      "elapsed_ms": 141.02100000309292
+    },
+    {
+      "engine": "wsl",
+      "sample": 23,
+      "elapsed_ms": 138.89390000258572
+    },
+    {
+      "engine": "gvx",
+      "sample": 23,
+      "elapsed_ms": 876.8450000061421
+    },
+    {
+      "engine": "baseline",
+      "sample": 23,
+      "elapsed_ms": 971.4893999916967
+    },
+    {
+      "engine": "baseline",
+      "sample": 24,
+      "elapsed_ms": 1041.261599995778
+    },
+    {
+      "engine": "gvx",
+      "sample": 24,
+      "elapsed_ms": 872.9126999969594
+    },
+    {
+      "engine": "wsl",
+      "sample": 24,
+      "elapsed_ms": 140.9877999976743
+    },
+    {
+      "engine": "wsl",
+      "sample": 25,
+      "elapsed_ms": 138.59070000762586
+    },
+    {
+      "engine": "gvx",
+      "sample": 25,
+      "elapsed_ms": 867.9984000045806
+    },
+    {
+      "engine": "baseline",
+      "sample": 25,
+      "elapsed_ms": 1016.7007999989437
+    },
+    {
+      "engine": "baseline",
+      "sample": 26,
+      "elapsed_ms": 1022.8330999962054
+    },
+    {
+      "engine": "gvx",
+      "sample": 26,
+      "elapsed_ms": 921.4587000024039
+    },
+    {
+      "engine": "wsl",
+      "sample": 26,
+      "elapsed_ms": 148.00709999690298
+    },
+    {
+      "engine": "wsl",
+      "sample": 27,
+      "elapsed_ms": 135.40669999201782
+    },
+    {
+      "engine": "gvx",
+      "sample": 27,
+      "elapsed_ms": 877.6694999978645
+    },
+    {
+      "engine": "baseline",
+      "sample": 27,
+      "elapsed_ms": 969.5703000033973
+    },
+    {
+      "engine": "baseline",
+      "sample": 28,
+      "elapsed_ms": 972.217600006843
+    },
+    {
+      "engine": "gvx",
+      "sample": 28,
+      "elapsed_ms": 949.8110999993514
+    },
+    {
+      "engine": "wsl",
+      "sample": 28,
+      "elapsed_ms": 139.7815999953309
+    },
+    {
+      "engine": "wsl",
+      "sample": 29,
+      "elapsed_ms": 128.93850001273677
+    },
+    {
+      "engine": "gvx",
+      "sample": 29,
+      "elapsed_ms": 950.8395999873755
+    },
+    {
+      "engine": "baseline",
+      "sample": 29,
+      "elapsed_ms": 1027.3186999984318
+    }
+  ],
+  "compute_samples": [
+    {
+      "engine": "baseline",
+      "sample": 0,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 198280200,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 201076700,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 191083321,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 207537905,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 191202000,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 1,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 205003100,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 2,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 201115100,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 200591200,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 190691598,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 3,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 188694479,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 3,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 202587800,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 3,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 198187100,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 4,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 200105700,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 4,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 193094800,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 4,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 192301705,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 5,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 187291703,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 5,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 195788900,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 5,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 194871500,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 6,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 196248100,
+      "mode": "cpu"
+    },
+    {
+      "engine": "gvx",
+      "sample": 6,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 198858400,
+      "mode": "cpu"
+    },
+    {
+      "engine": "wsl",
+      "sample": 6,
+      "checksum": 3608916330791240157,
+      "count": 100000000,
+      "elapsed_ns": 191629873,
+      "mode": "cpu"
+    },
+    {
+      "engine": "baseline",
+      "sample": 0,
+      "count": 10000,
+      "elapsed_ns": 1474590033,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "count": 10000,
+      "elapsed_ns": 508710800,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "count": 10000,
+      "elapsed_ns": 1800208,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "count": 10000,
+      "elapsed_ns": 1827310,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "count": 10000,
+      "elapsed_ns": 506138400,
+      "mode": "syscall"
+    },
+    {
+      "engine": "baseline",
+      "sample": 1,
+      "count": 10000,
+      "elapsed_ns": 1477786575,
+      "mode": "syscall"
+    },
+    {
+      "engine": "baseline",
+      "sample": 2,
+      "count": 10000,
+      "elapsed_ns": 1418596978,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "count": 10000,
+      "elapsed_ns": 514315200,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "count": 10000,
+      "elapsed_ns": 1804009,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 3,
+      "count": 10000,
+      "elapsed_ns": 1851812,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 3,
+      "count": 10000,
+      "elapsed_ns": 569836800,
+      "mode": "syscall"
+    },
+    {
+      "engine": "baseline",
+      "sample": 3,
+      "count": 10000,
+      "elapsed_ns": 1450274645,
+      "mode": "syscall"
+    },
+    {
+      "engine": "baseline",
+      "sample": 4,
+      "count": 10000,
+      "elapsed_ns": 1461288020,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 4,
+      "count": 10000,
+      "elapsed_ns": 511007600,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 4,
+      "count": 10000,
+      "elapsed_ns": 1783907,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 5,
+      "count": 10000,
+      "elapsed_ns": 1801409,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 5,
+      "count": 10000,
+      "elapsed_ns": 509588900,
+      "mode": "syscall"
+    },
+    {
+      "engine": "baseline",
+      "sample": 5,
+      "count": 10000,
+      "elapsed_ns": 1448518228,
+      "mode": "syscall"
+    },
+    {
+      "engine": "baseline",
+      "sample": 6,
+      "count": 10000,
+      "elapsed_ns": 1469111054,
+      "mode": "syscall"
+    },
+    {
+      "engine": "gvx",
+      "sample": 6,
+      "count": 10000,
+      "elapsed_ns": 511390000,
+      "mode": "syscall"
+    },
+    {
+      "engine": "wsl",
+      "sample": 6,
+      "count": 10000,
+      "elapsed_ns": 1831010,
+      "mode": "syscall"
+    }
+  ],
+  "http_runs": [
+    {
+      "engine": "baseline",
+      "sample": 0,
+      "concurrency": 4,
+      "elapsed_seconds": 5.493435399999726,
+      "errors": []
+    },
+    {
+      "engine": "gvx",
+      "sample": 0,
+      "concurrency": 4,
+      "elapsed_seconds": 2.2038065000087954,
+      "errors": []
+    },
+    {
+      "engine": "wsl",
+      "sample": 0,
+      "concurrency": 4,
+      "elapsed_seconds": 0.15465349999431055,
+      "errors": []
+    },
+    {
+      "engine": "wsl",
+      "sample": 1,
+      "concurrency": 4,
+      "elapsed_seconds": 0.1589934999938123,
+      "errors": []
+    },
+    {
+      "engine": "gvx",
+      "sample": 1,
+      "concurrency": 4,
+      "elapsed_seconds": 2.26560270000482,
+      "errors": []
+    },
+    {
+      "engine": "baseline",
+      "sample": 1,
+      "concurrency": 4,
+      "elapsed_seconds": 5.122755100004724,
+      "errors": []
+    },
+    {
+      "engine": "baseline",
+      "sample": 2,
+      "concurrency": 4,
+      "elapsed_seconds": 5.130409799996414,
+      "errors": []
+    },
+    {
+      "engine": "gvx",
+      "sample": 2,
+      "concurrency": 4,
+      "elapsed_seconds": 2.256069800001569,
+      "errors": []
+    },
+    {
+      "engine": "wsl",
+      "sample": 2,
+      "concurrency": 4,
+      "elapsed_seconds": 0.13308440000400878,
+      "errors": []
+    }
+  ],
+  "memory_samples": [
+    {
+      "engine": "wsl",
+      "instances": 1,
+      "baseline": [
+        {
+          "time": 1792747004.0678914,
+          "available_physical_bytes": 10224533504,
+          "host_commit_bytes": 34154971136,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792747004.0802274,
+          "available_physical_bytes": 10222661632,
+          "host_commit_bytes": 34154971136,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792747004.0924003,
+          "available_physical_bytes": 10224222208,
+          "host_commit_bytes": 34154643456,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792747004.210411,
+          "available_physical_bytes": 10221379584,
+          "host_commit_bytes": 34165669888,
+          "owned_private_commit_bytes": 10526720,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747005.2222688,
+          "available_physical_bytes": 10176561152,
+          "host_commit_bytes": 34171920384,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747006.2365735,
+          "available_physical_bytes": 10163019776,
+          "host_commit_bytes": 34171920384,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747007.250199,
+          "available_physical_bytes": 10156867584,
+          "host_commit_bytes": 34170707968,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747008.2637947,
+          "available_physical_bytes": 10153578496,
+          "host_commit_bytes": 34168078336,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747009.2756245,
+          "available_physical_bytes": 10152964096,
+          "host_commit_bytes": 34166640640,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747010.2877836,
+          "available_physical_bytes": 10152804352,
+          "host_commit_bytes": 34166886400,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747011.3023024,
+          "available_physical_bytes": 10154172416,
+          "host_commit_bytes": 34170953728,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747012.3153481,
+          "available_physical_bytes": 10154995712,
+          "host_commit_bytes": 34171097088,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747013.3262732,
+          "available_physical_bytes": 10158166016,
+          "host_commit_bytes": 34166964224,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747014.3404522,
+          "available_physical_bytes": 10155802624,
+          "host_commit_bytes": 34168287232,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747015.353027,
+          "available_physical_bytes": 10155573248,
+          "host_commit_bytes": 34166583296,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747016.3658357,
+          "available_physical_bytes": 10157187072,
+          "host_commit_bytes": 34168139776,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747017.3805423,
+          "available_physical_bytes": 10151415808,
+          "host_commit_bytes": 34181009408,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747018.3917475,
+          "available_physical_bytes": 10159251456,
+          "host_commit_bytes": 34161012736,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        },
+        {
+          "time": 1792747019.2220542,
+          "available_physical_bytes": 10166747136,
+          "host_commit_bytes": 34161889280,
+          "owned_private_commit_bytes": 12005376,
+          "owned_process_count": 5
+        }
+      ]
+    },
+    {
+      "engine": "gvx",
+      "instances": 1,
+      "baseline": [
+        {
+          "time": 1792747021.179589,
+          "available_physical_bytes": 10125168640,
+          "host_commit_bytes": 34184232960,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792747021.1899664,
+          "available_physical_bytes": 10119122944,
+          "host_commit_bytes": 34183954432,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792747021.2008493,
+          "available_physical_bytes": 10121674752,
+          "host_commit_bytes": 34184028160,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792747021.9659321,
+          "available_physical_bytes": 10056654848,
+          "host_commit_bytes": 34338394112,
+          "owned_private_commit_bytes": 136830976,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747022.9790964,
+          "available_physical_bytes": 10039685120,
+          "host_commit_bytes": 34352594944,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747023.9929993,
+          "available_physical_bytes": 10011529216,
+          "host_commit_bytes": 34383093760,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747025.00552,
+          "available_physical_bytes": 10022191104,
+          "host_commit_bytes": 34383380480,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747026.0180845,
+          "available_physical_bytes": 10025160704,
+          "host_commit_bytes": 34379403264,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747027.030512,
+          "available_physical_bytes": 10016550912,
+          "host_commit_bytes": 34373369856,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747028.0429826,
+          "available_physical_bytes": 10026455040,
+          "host_commit_bytes": 34356404224,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747029.0555713,
+          "available_physical_bytes": 10035290112,
+          "host_commit_bytes": 34347978752,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747030.0717247,
+          "available_physical_bytes": 10039066624,
+          "host_commit_bytes": 34343919616,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747031.0841613,
+          "available_physical_bytes": 10037571584,
+          "host_commit_bytes": 34347913216,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747032.0968385,
+          "available_physical_bytes": 10046353408,
+          "host_commit_bytes": 34335010816,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747033.1080782,
+          "available_physical_bytes": 10049662976,
+          "host_commit_bytes": 34331201536,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747034.1199844,
+          "available_physical_bytes": 10054381568,
+          "host_commit_bytes": 34328260608,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747035.1323793,
+          "available_physical_bytes": 10056302592,
+          "host_commit_bytes": 34331156480,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747036.1454797,
+          "available_physical_bytes": 10051256320,
+          "host_commit_bytes": 34337210368,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747036.9790912,
+          "available_physical_bytes": 10119888896,
+          "host_commit_bytes": 34240233472,
+          "owned_private_commit_bytes": 136839168,
+          "owned_process_count": 4
+        }
+      ]
+    },
+    {
+      "engine": "baseline",
+      "instances": 1,
+      "baseline": [
+        {
+          "time": 1792747039.026961,
+          "available_physical_bytes": 10222292992,
+          "host_commit_bytes": 34081808384,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792747039.03715,
+          "available_physical_bytes": 10213568512,
+          "host_commit_bytes": 34081742848,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        },
+        {
+          "time": 1792747039.048265,
+          "available_physical_bytes": 10216255488,
+          "host_commit_bytes": 34080800768,
+          "owned_processes": [],
+          "excluded_processes": [],
+          "wsl_vm": [
+            {
+              "pid": 22444,
+              "error": 5
+            }
+          ]
+        }
+      ],
+      "samples": [
+        {
+          "time": 1792747040.0750237,
+          "available_physical_bytes": 10095267840,
+          "host_commit_bytes": 34325213184,
+          "owned_private_commit_bytes": 137551872,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747041.088035,
+          "available_physical_bytes": 10129469440,
+          "host_commit_bytes": 34244063232,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747042.1000736,
+          "available_physical_bytes": 10133426176,
+          "host_commit_bytes": 34220511232,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747043.113883,
+          "available_physical_bytes": 10132709376,
+          "host_commit_bytes": 34227404800,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747044.12578,
+          "available_physical_bytes": 10147135488,
+          "host_commit_bytes": 34213982208,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747045.1377368,
+          "available_physical_bytes": 10126651392,
+          "host_commit_bytes": 34234191872,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747046.1497087,
+          "available_physical_bytes": 10126012416,
+          "host_commit_bytes": 34241011712,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747047.1634598,
+          "available_physical_bytes": 10131247104,
+          "host_commit_bytes": 34232291328,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747048.1756415,
+          "available_physical_bytes": 10142609408,
+          "host_commit_bytes": 34221015040,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747049.1882508,
+          "available_physical_bytes": 10139148288,
+          "host_commit_bytes": 34226704384,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747050.1997554,
+          "available_physical_bytes": 10129346560,
+          "host_commit_bytes": 34233434112,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747051.2127411,
+          "available_physical_bytes": 10141241344,
+          "host_commit_bytes": 34214391808,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747052.226871,
+          "available_physical_bytes": 10150268928,
+          "host_commit_bytes": 34210033664,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747053.239668,
+          "available_physical_bytes": 10159726592,
+          "host_commit_bytes": 34194878464,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747054.2514937,
+          "available_physical_bytes": 10159226880,
+          "host_commit_bytes": 34189168640,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        },
+        {
+          "time": 1792747055.0872197,
+          "available_physical_bytes": 10171846656,
+          "host_commit_bytes": 34182885376,
+          "owned_private_commit_bytes": 137527296,
+          "owned_process_count": 4
+        }
+      ]
+    }
+  ]
+}

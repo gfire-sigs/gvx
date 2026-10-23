@@ -114,12 +114,12 @@ func (v *vcpu) reloadVA() uint64 {
 	return v.p.kernel.layout.code() + uint64(v.p.kernel.a64.Reload)
 }
 
-// prepareRun loads the registers of ac into the CommPage and arranges the
-// processor so that the next run executes the reload path.
 type resumePCPreparer interface {
 	prepareResumePC(uint32, uint64) error
 }
 
+// prepareRun loads the registers of ac into the CommPage and arranges the
+// processor so that the next run executes the reload path.
 func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (runResult, bool) {
 	state := ac.StateData()
 	r := &state.Regs
