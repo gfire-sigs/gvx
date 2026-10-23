@@ -162,7 +162,7 @@ def distribution(values):
 def summarize(results):
     summary = {"metadata": results["metadata"], "startup_ms": {}, "compute_ms": {},
                "idle": [], "http": {}, "failures": results["failures"]}
-    for engine in ("gvx", "wsl"):
+    for engine in ("baseline", "gvx", "wsl"):
         startup = [row["elapsed_ms"] for row in results["startup"] if row["engine"] == engine]
         if startup:
             summary["startup_ms"][engine] = distribution(startup)
@@ -282,6 +282,8 @@ def main():
     parser.add_argument("--lockdown", action=argparse.BooleanOptionalAction, default=True,
                         help="Disable only for trusted benchmark binaries")
     parser.add_argument("--binary-dir", type=Path, help="Reuse guest.elf and rungv.exe from an earlier run")
+    parser.add_argument("--runner", type=Path, help="Use a prebuilt rungv.exe")
+    parser.add_argument("--baseline-runner", type=Path, help="Compare a second rungv.exe with identical settings")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--idle-seconds", type=float, default=60)
@@ -301,11 +303,19 @@ def main():
     runner = output / "rungv.exe"
     if args.binary_dir:
         shutil.copyfile(args.binary_dir / "guest.elf", guest_binary)
-        shutil.copyfile(args.binary_dir / "rungv.exe", runner)
     else:
         env = dict(os.environ, GOOS="linux", GOARCH="arm64", CGO_ENABLED="0")
         run(["go", "build", "-o", str(guest_binary), "./internal/benchguest"], cwd=repo, env=env)
+    if args.runner:
+        shutil.copyfile(args.runner, runner)
+    elif args.binary_dir:
+        shutil.copyfile(args.binary_dir / "rungv.exe", runner)
+    else:
         run(["go", "build", "-o", str(runner), "./cmd/rungv"], cwd=repo)
+    baseline_runner = output / "baseline.exe"
+    if args.baseline_runner:
+        shutil.copyfile(args.baseline_runner, baseline_runner)
+    engines = ("baseline", "gvx", "wsl") if args.baseline_runner else ("gvx", "wsl")
     wsl = ["wsl.exe", "-d", args.distribution, "--exec"]
     linux_dir = f"/tmp/gvx-bench-{uuid.uuid4().hex}"
     linux_binary = linux_dir + "/guest"
@@ -321,9 +331,10 @@ def main():
                              "go": run(["go", "version"], capture_output=True).stdout.decode().strip(),
                              "wsl_kernel": run(wsl + ["uname", "-r"], capture_output=True).stdout.decode().strip(),
                              "guest_sha256": digest, "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+                             "baseline_runner_sha256": hashlib.sha256(baseline_runner.read_bytes()).hexdigest() if args.baseline_runner else None,
                              "wsl_distribution": args.distribution, "wsl_state": "kept running; no shutdown",
-                             "settings": vars(args) | {"output": str(output),
-                                                       "binary_dir": str(args.binary_dir) if args.binary_dir else None}},
+                             "settings": {key: str(value) if isinstance(value, Path) else value
+                                          for key, value in vars(args).items()}},
                "startup": [], "compute": [], "idle": [], "http": [], "failures": []}
     results["metadata"]["wsl_vm_initial_cim"] = wsl_vm_cim()
     sequence = 0
@@ -338,7 +349,8 @@ def main():
         if engine == "wsl":
             return wsl + [linux_binary, *workload]
         network = ["-net=nat", "-p", f"127.0.0.1:{port}:8080"] if port else ["-net=none"]
-        return [str(runner), "run", f"-platform={args.backend}", f"-lockdown={str(args.lockdown).lower()}", *network,
+        executable = baseline_runner if engine == "baseline" else runner
+        return [str(executable), "run", f"-platform={args.backend}", f"-lockdown={str(args.lockdown).lower()}", *network,
                 f"-cache-dir={output / 'cache'}", f"-bin={guest_binary}", "--", *workload]
 
     def start_guest(engine, mode, port=None):
@@ -353,13 +365,13 @@ def main():
         return guest
 
     try:
-        for engine in ("gvx", "wsl"):
+        for engine in engines:
             warm = run(command(engine, "hello"), capture_output=True, timeout=60)
             if json.loads(warm.stdout) != {"arch": "arm64", "mode": "hello"}:
                 raise RuntimeError("Warm-up output differs")
         print("Warm-up complete", flush=True)
         for sample in range(args.samples if "startup" in args.phases else 0):
-            for engine in (("gvx", "wsl") if sample % 2 == 0 else ("wsl", "gvx")):
+            for engine in (engines if sample % 2 == 0 else reversed(engines)):
                 start = time.perf_counter()
                 completed = run(command(engine, "hello"), capture_output=True, timeout=60)
                 elapsed = (time.perf_counter() - start) * 1000
@@ -372,7 +384,7 @@ def main():
         cpu_checksum = None
         for mode, count in ((("cpu", 100_000_000), ("syscall", 10000)) if "compute" in args.phases else ()):
             for sample in range(min(args.samples, 7)):
-                for engine in (("gvx", "wsl") if sample % 2 == 0 else ("wsl", "gvx")):
+                for engine in (engines if sample % 2 == 0 else reversed(engines)):
                     completed = run(command(engine, mode, f"-count={count}"), capture_output=True, timeout=120)
                     value = json.loads(completed.stdout)
                     if value["mode"] != mode or value["count"] != count or value["elapsed_ns"] <= 0:
@@ -385,7 +397,7 @@ def main():
                 save()
             print(f"{mode} complete", flush=True)
         for count in (args.counts if "idle" in args.phases else []):
-            for engine in ("wsl", "gvx"):
+            for engine in reversed(engines):
                 guests = []
                 vm_before = wsl_vm_cim()
                 baseline = [memory_snapshot([]) for _ in range(3)]
@@ -405,7 +417,7 @@ def main():
                     close_guests(guests)
                 print(f"{engine} idle instances={count} complete", flush=True)
         for sample in range(min(args.samples, 3) if "http" in args.phases else 0):
-            for engine in (("gvx", "wsl") if sample % 2 == 0 else ("wsl", "gvx")):
+            for engine in (engines if sample % 2 == 0 else reversed(engines)):
                 port = free_port()
                 guest = start_guest(engine, "http", port)
                 try:
@@ -432,7 +444,7 @@ def main():
         run(wsl + ["rm", "-f", linux_binary])
         run(wsl + ["rmdir", linux_dir])
     (output / "summary.json").write_text(json.dumps(summarize(results), indent=2) + "\n", encoding="utf-8")
-    for engine in ("gvx", "wsl"):
+    for engine in engines:
         values = [row["elapsed_ms"] for row in results["startup"] if row["engine"] == engine]
         if values:
             print(engine, "startup_ms", distribution(values), flush=True)

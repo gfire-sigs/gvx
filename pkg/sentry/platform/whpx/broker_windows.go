@@ -17,6 +17,7 @@ package whpx
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/rpc"
 	"runtime"
 	"sync"
@@ -29,15 +30,17 @@ import (
 
 // BrokerRequest carries operations on one partition. Source always belongs to the fixed worker process.
 type BrokerRequest struct {
-	Operation  string
-	Index      uint32
-	Processors uint32
-	Source     uint64
-	GPA        uint64
-	Size       uint64
-	Flags      uint32
-	Names      []uint32
-	Values     []byte
+	Operation   string
+	Index       uint32
+	Processors  uint32
+	Source      uint64
+	GPA         uint64
+	Size        uint64
+	Flags       uint32
+	Names       []uint32
+	Values      []byte
+	ResumePC    uint64
+	SetResumePC bool
 }
 
 // BrokerReply contains register values, an exit context, or host capabilities.
@@ -54,15 +57,18 @@ type BrokerReply struct {
 // Broker owns a WHPX partition whose pages belong to one worker.
 // The caller owns the process object and must keep it open until Close returns.
 type Broker struct {
-	mu       sync.RWMutex
-	stateMu  sync.Mutex
-	backend  *winBackend
-	process  windows.Handle
-	features hostFeatures
-	vpCount  uint32
-	created  [maxVPs]bool
-	running  [maxVPs]atomic.Bool
-	closed   atomic.Bool
+	mu         sync.RWMutex
+	stateMu    sync.Mutex
+	backend    *winBackend
+	process    windows.Handle
+	features   hostFeatures
+	vpCount    uint32
+	created    [maxVPs]bool
+	running    [maxVPs]atomic.Bool
+	closed     atomic.Bool
+	closeOnce  sync.Once
+	closeErr   error
+	resumeRegs [maxVPs]*regBatch
 }
 
 // NewBroker binds all memory mappings to workerProcess. Requests cannot select another process.
@@ -188,7 +194,24 @@ func (b *Broker) Call(request BrokerRequest, reply *BrokerReply) error {
 	defer b.running[request.Index].Store(false)
 	switch request.Operation {
 	case "Run":
-		reply.Values = alignedBuf(exitCtxBufSize, 16)
+		if request.SetResumePC {
+			if runtime.GOARCH != "arm64" {
+				return errors.New("whpx: a resume PC requires ARM64")
+			}
+			registers := b.resumeRegs[request.Index]
+			if registers == nil {
+				registers = newRegBatch(1)
+				b.resumeRegs[request.Index] = registers
+			}
+			registers.reset()
+			registers.add64(a64RegPc, request.ResumePC)
+			if err := b.backend.setRegs(request.Index, registers); err != nil {
+				return err
+			}
+		}
+		if len(reply.Values) != exitCtxBufSize || uintptr(unsafe.Pointer(&reply.Values[0]))%16 != 0 {
+			reply.Values = alignedBuf(exitCtxBufSize, 16)
+		}
 		return b.backend.run(request.Index, reply.Values)
 	case "GetRegisters", "SetRegisters":
 		if len(request.Names) == 0 || len(request.Names) > 512 {
@@ -220,9 +243,12 @@ func validBrokerRange(request BrokerRequest) bool {
 
 // Close stops processors before it releases the partition and its mappings.
 func (b *Broker) Close() error {
-	if b.closed.Swap(true) {
-		return nil
-	}
+	b.closeOnce.Do(func() { b.closeErr = b.close() })
+	return b.closeErr
+}
+
+func (b *Broker) close() error {
+	b.closed.Store(true)
 	var errs []error
 	b.mu.RLock()
 	b.stateMu.Lock()
@@ -248,18 +274,47 @@ func (b *Broker) Close() error {
 type brokerBackend struct {
 	winBackend
 	client *rpc.Client
+	runs   *runClient
+}
+
+// ServeRuns owns connection. Disconnecting it closes the partition and joins all run workers.
+func (b *Broker) ServeRuns(connection io.ReadWriteCloser) error {
+	if connection == nil {
+		return errors.New("whpx: run connection is required")
+	}
+	return serveRuns(connection, func(request runRequest, exit []byte) error {
+		reply := BrokerReply{Values: exit}
+		return b.Call(BrokerRequest{Operation: "Run", Index: request.index, ResumePC: request.resumePC, SetResumePC: request.setPC}, &reply)
+	}, b.Close)
 }
 
 // NewBrokered creates a platform through a broker registered as Hypervisor.
 // The caller owns client and closes it after Platform.Close.
 func NewBrokered(client *rpc.Client) (*Platform, error) {
+	return newBrokered(client, nil)
+}
+
+// NewBrokeredWithRuns owns connection, including on failure. The caller owns client.
+func NewBrokeredWithRuns(client *rpc.Client, connection io.ReadWriteCloser) (*Platform, error) {
+	if connection == nil {
+		return nil, errors.New("whpx: run connection is required")
+	}
+	return newBrokered(client, newRunClient(connection))
+}
+
+func newBrokered(client *rpc.Client, runs *runClient) (_ *Platform, err error) {
+	defer func() {
+		if err != nil && runs != nil {
+			err = errors.Join(err, runs.Close())
+		}
+	}()
 	if client == nil {
 		return nil, errors.New("whpx: broker client is required")
 	}
 	if err := checkPageSize(hostarch.PageSize); err != nil {
 		return nil, err
 	}
-	return newPlatform(&brokerBackend{client: client}, Options{})
+	return newPlatform(&brokerBackend{client: client, runs: runs}, Options{})
 }
 
 func (b *brokerBackend) invoke(request BrokerRequest) (reply BrokerReply, err error) {
@@ -276,6 +331,9 @@ func (b *brokerBackend) createPartition(count uint32) (partitionInfo, error) {
 }
 func (b *brokerBackend) closePartition() error {
 	_, err := b.invoke(BrokerRequest{Operation: "Close"})
+	if b.runs != nil {
+		err = errors.Join(err, b.runs.Close())
+	}
 	return err
 }
 func (b *brokerBackend) mapGPA(source unsafe.Pointer, gpa, size uint64, flags uint32) error {
@@ -299,6 +357,9 @@ func (b *brokerBackend) cancel(index uint32) error {
 	return err
 }
 func (b *brokerBackend) run(index uint32, exit []byte) error {
+	if b.runs != nil {
+		return b.runs.run(index, exit)
+	}
 	r, err := b.invoke(BrokerRequest{Operation: "Run", Index: index})
 	if err == nil && len(r.Values) != len(exit) {
 		return errors.New("whpx: invalid broker exit context")
@@ -318,5 +379,22 @@ func (b *brokerBackend) getRegs(index uint32, rb *regBatch) error {
 func (b *brokerBackend) setRegs(index uint32, rb *regBatch) error {
 	names, values := rb.view()
 	_, err := b.invoke(BrokerRequest{Operation: "SetRegisters", Index: index, Names: names, Values: values})
+	if err == nil && b.runs != nil && runtime.GOARCH == "arm64" {
+		for _, name := range names {
+			if name == a64RegPc {
+				b.runs.clearResumePC(index)
+				break
+			}
+		}
+	}
 	return err
+}
+
+func (b *brokerBackend) prepareResumePC(index uint32, pc uint64) error {
+	if b.runs != nil {
+		return b.runs.prepareResumePC(index, pc)
+	}
+	registers := newRegBatch(1)
+	registers.add64(a64RegPc, pc)
+	return b.setRegs(index, registers)
 }

@@ -64,6 +64,9 @@ type processState struct {
 	child        *hostlockdown.Process
 	broker       *whpx.Broker
 	stubBroker   *systrap.StubBroker
+	runPipe      *sandboxrpc.Pipe
+	runDone      chan struct{}
+	runErr       error
 	network      *networkBroker
 	console      *hostlockdown.ConsoleReader
 	server       *sandboxrpc.Server
@@ -295,6 +298,14 @@ func startProcess(ctx context.Context, worker WorkerCommand, cfg Config) (_ *Pro
 			return nil, err
 		}
 		keep[stubRead], keep[stubReplyWrite] = true, true
+	} else if state.broker != nil {
+		state.runPipe = &sandboxrpc.Pipe{Reader: stubRead, Output: stubReplyWrite}
+		keep[stubRead], keep[stubReplyWrite] = true, true
+		state.runDone = make(chan struct{})
+		go func() {
+			state.runErr = state.broker.ServeRuns(state.runPipe)
+			close(state.runDone)
+		}()
 	} else {
 		_ = stubRead.Close()
 		_ = stubReplyWrite.Close()
@@ -418,6 +429,9 @@ func (p *processState) shutdown() {
 		if p.broker != nil {
 			errs = append(errs, p.broker.Close())
 		}
+		if p.runPipe != nil {
+			_ = p.runPipe.Close()
+		}
 		if p.stubBroker != nil {
 			errs = append(errs, p.stubBroker.Close())
 		}
@@ -442,6 +456,9 @@ func (p *processState) close() error {
 	if p.served != nil {
 		<-p.served
 	}
+	if p.runDone != nil {
+		<-p.runDone
+	}
 	if p.watched != nil {
 		<-p.watched
 	}
@@ -449,7 +466,7 @@ func (p *processState) close() error {
 	for _, file := range p.outputFiles {
 		_ = file.Close()
 	}
-	return errors.Join(append([]error{p.closeErr}, p.outputErrors...)...)
+	return errors.Join(append([]error{p.closeErr, p.runErr}, p.outputErrors...)...)
 }
 
 func workerHandle(index int) (uintptr, error) {
@@ -500,7 +517,7 @@ func serveProcess(ctx context.Context, options WorkerOptions) (err error) {
 		var err error
 		switch configuration.Platform {
 		case PlatformWHPX:
-			sandbox.plat, err = whpx.NewBrokered(client)
+			sandbox.plat, err = whpx.NewBrokeredWithRuns(client, &sandboxrpc.Pipe{Reader: files[5], Output: files[4]})
 		case PlatformSystrap:
 			sandbox.plat, err = systrap.NewBrokered(files[4], files[5])
 		default:

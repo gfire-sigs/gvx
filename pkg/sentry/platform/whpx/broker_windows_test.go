@@ -31,7 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-func newRealBrokeredPlatform(t *testing.T) *Platform {
+func newRealBrokeredPlatform(t *testing.T, fastRuns bool) *Platform {
 	t.Helper()
 	broker, err := NewBroker(uintptr(windows.CurrentProcess()))
 	if errors.Is(err, ErrUnsupported) {
@@ -54,7 +54,21 @@ func newRealBrokeredPlatform(t *testing.T) *Platform {
 	go func() { server.ServeConn(left); close(done) }()
 	client := rpc.NewClient(right)
 	t.Cleanup(func() { client.Close(); left.Close(); <-done })
-	p, err := NewBrokered(client)
+	var p *Platform
+	if fastRuns {
+		runServer, runConnection := net.Pipe()
+		runDone := make(chan error, 1)
+		go func() { runDone <- broker.ServeRuns(runServer) }()
+		t.Cleanup(func() {
+			_ = runConnection.Close()
+			if err := <-runDone; err != nil {
+				t.Error(err)
+			}
+		})
+		p, err = NewBrokeredWithRuns(client, runConnection)
+	} else {
+		p, err = NewBrokered(client)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,17 +81,24 @@ func newRealBrokeredPlatform(t *testing.T) *Platform {
 }
 
 func TestRealBrokeredSyscall(t *testing.T) {
-	p := newRealBrokeredPlatform(t)
-	c, mm, ac := realGuest(t, p, guestSyscallCode)
-	signal, _, err := c.Switch(nil, mm, ac, -1)
-	if err != nil || signal != nil {
-		t.Fatalf("brokered syscall: %v, %v", signal, err)
+	for _, mode := range []string{"RPC", "binary"} {
+		t.Run(mode, func(t *testing.T) {
+			p := newRealBrokeredPlatform(t, mode == "binary")
+			c, mm, ac := realGuest(t, p, guestSyscallCode)
+			for range 3 {
+				setGuestEntry(ac, guestCodeAddr)
+				signal, _, err := c.Switch(nil, mm, ac, -1)
+				if err != nil || signal != nil {
+					t.Fatalf("brokered syscall: %v, %v", signal, err)
+				}
+				checkSyscallExit(t, ac)
+			}
+		})
 	}
-	checkSyscallExit(t, ac)
 }
 
 func TestBrokerKeepsReadOnlyHostFileUnchanged(t *testing.T) {
-	p := newRealBrokeredPlatform(t)
+	p := newRealBrokeredPlatform(t, true)
 	path := filepath.Join(t.TempDir(), "read-only.dat")
 	if err := os.WriteFile(path, make([]byte, pageSize), 0o600); err != nil {
 		t.Fatal(err)

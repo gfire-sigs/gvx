@@ -116,6 +116,10 @@ func (v *vcpu) reloadVA() uint64 {
 
 // prepareRun loads the registers of ac into the CommPage and arranges the
 // processor so that the next run executes the reload path.
+type resumePCPreparer interface {
+	prepareResumePC(uint32, uint64) error
+}
+
 func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (runResult, bool) {
 	state := ac.StateData()
 	r := &state.Regs
@@ -154,7 +158,14 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 		b.add64(a64RegPc, v.reloadVA())
 	}
 	if b.n > 0 {
-		if err := v.p.be.setRegs(v.index, b); err != nil {
+		var err error
+		if resume, ok := v.p.be.(resumePCPreparer); ok && b.n == 1 && b.names[0] == a64RegPc {
+			// The broker applies this PC with the next Run, without another pipe round trip.
+			err = resume.prepareResumePC(v.index, v.reloadVA())
+		} else {
+			err = v.p.be.setRegs(v.index, b)
+		}
+		if err != nil {
 			st.invalidate()
 			return runResult{err: fmt.Errorf("whpx: resume virtual processor %d: %w", v.index, err)}, true
 		}
