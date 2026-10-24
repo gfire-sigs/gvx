@@ -83,32 +83,53 @@ func TestInstructionCrossesBlockBoundary(t *testing.T) {
 // bytes at that address, so the thread must continue in the slot tail, run the
 // relocated instruction, and go on behind it. A real Go guest crashed in the
 // child of clone before this rule.
+//
+// The test resumes behind every one of many sites. Each site has its own slot,
+// so the bytes of its JMP differ. A resume at the raw address executes those
+// bytes as code, and the chance that all of them run without a fault and keep
+// the count is negligible.
 func TestFastPathResumeBehindPatchedSyscall(t *testing.T) {
+	const sites = 12
 	r := newRig(t, newFastPlatform(t))
 	inc := []byte{0x48, 0xFF, 0xC3} // inc rbx
-	first := gSyscall(1)
-	second := gSyscall(2)
 	var prog []byte
-	prog = append(prog, first...)
-	prog = append(prog, inc...)
-	prog = append(prog, second...)
-	prog = append(prog, inc...)
+	var returns []uint64
+	for range sites {
+		prog = append(prog, gSyscall(1)...)
+		returns = append(returns, codeVA+uint64(len(prog)))
+		prog = append(prog, inc...)
+	}
 	prog = append(prog, gSyscall(3)...)
 	r.program(prog)
-	retSecond := codeVA + uint64(len(first)+len(inc)+len(second))
 
-	si, _, err := r.run()
-	mustSyscall(t, si, err, 1, r.ac)
-	if _, ok := r.as.jumpTail(retSecond); !ok {
-		t.Fatalf("the SYSCALL before %#x did not become a JMP", retSecond)
+	// runToExit continues after each system call 1 until system call 3.
+	runToExit := func() {
+		t.Helper()
+		for {
+			si, _, err := r.run()
+			if si == nil && err == nil && regNr(r.ac) == 1 {
+				continue
+			}
+			mustSyscall(t, si, err, 3, r.ac)
+			return
+		}
 	}
-	// Continue at the return address of the second SYSCALL, as the child of a
-	// clone does. The Sentry never writes the island address to the registers.
-	r.ac.SetIP(uintptr(retSecond))
-	si, _, err = r.run()
-	mustSyscall(t, si, err, 3, r.ac)
-	if got := regAcc(r.ac); got != 1 {
-		t.Errorf("the relocated instruction ran %d times, want 1", got)
+	runToExit()
+	if got := regAcc(r.ac); got != sites {
+		t.Fatalf("the first pass counted %d, want %d", got, sites)
+	}
+	for i, ret := range returns {
+		if _, ok := r.as.jumpTail(ret); !ok {
+			t.Fatalf("the SYSCALL before %#x did not become a JMP", ret)
+		}
+		// Continue at the return address, as the child of a clone does. The
+		// Sentry never writes the island address to the registers.
+		r.ac.StateData().Regs.Rbx = 0
+		r.ac.SetIP(uintptr(ret))
+		runToExit()
+		if got, want := regAcc(r.ac), uint64(sites-i); got != want {
+			t.Errorf("resume behind site %d (%#x): the relocated instructions ran %d times, want %d", i, ret, got, want)
+		}
 	}
 }
 
