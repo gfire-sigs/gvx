@@ -23,7 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // cloneImage copies the bytes of the image while a volume has it open. The
@@ -205,4 +207,89 @@ func TestCrashBeforeAnySync(t *testing.T) {
 		t.Fatal(err)
 	}
 	runE2fsck(t, clone)
+}
+
+// TestCrashRecoveryDatabaseWorkload runs a workload shaped like SQLite in WAL
+// mode on the VFS layer. The writer appends frames to the log and syncs the
+// log after each transaction. It checkpoints pages into the database file and
+// syncs that file. It keeps a rollback file that it has unlinked but not
+// closed, and it ends with writes that no sync covers. The test clones the
+// image in that state. The remount must keep every byte that a sync covered,
+// free the unlinked file, and leave no lost+found directory.
+func TestCrashRecoveryDatabaseWorkload(t *testing.T) {
+	e := newEnv(t)
+	const page, frame = blockSize, blockSize + 24
+	db := e.mustOpen("app.db", linux.O_CREAT|linux.O_RDWR)
+	wal := e.mustOpen("app.db-wal", linux.O_CREAT|linux.O_RDWR)
+	rollback := e.mustOpen("app.db-journal", linux.O_CREAT|linux.O_RDWR)
+	e.write(rollback, pattern(9, 100000))
+	if err := e.unlink("app.db-journal"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustMkdir("attachments")
+
+	var committedDB, committedWAL []byte
+	sync := func(fd *vfs.FileDescription) {
+		t.Helper()
+		if err := fd.Sync(e.ctx); err != nil {
+			t.Fatalf("fsync: %v", err)
+		}
+	}
+	for tx := range 30 {
+		data := pattern(byte(tx), frame)
+		e.pwrite(wal, data, int64(tx)*frame)
+		sync(wal)
+		committedWAL = append(committedWAL, data...)
+		if tx%10 == 9 {
+			for p := range 10 {
+				data := pattern(byte(100+tx+p), page)
+				e.pwrite(db, data, int64(tx/10*10+p)*page)
+				committedDB = append(committedDB[:min(len(committedDB), (tx/10*10+p)*page)], data...)
+			}
+			sync(db)
+		}
+	}
+	// Work that no sync covers. It extends the files and adds new files.
+	for tx := 30; tx < 45; tx++ {
+		e.pwrite(wal, pattern(byte(tx), frame), int64(tx)*frame)
+	}
+	e.pwrite(db, pattern(77, 10*page), 40*page)
+	for i := range 12 {
+		e.writeFile(fmt.Sprintf("attachments/new-%d", i), pattern(byte(i), 30000))
+	}
+
+	clone := cloneImage(t, e.path)
+	raw, err := os.ReadFile(clone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := le.Uint16(raw[superOffset+sbState:]); state&stateValid != 0 {
+		t.Fatalf("the clone has s_state %#x, want the valid bit clear during the workload", state)
+	}
+
+	r := openEnv(t, clone, VolumeOptions{}, vfs.MountOptions{})
+	gotWAL := r.readFile("app.db-wal")
+	if len(gotWAL) < len(committedWAL) || !bytes.Equal(gotWAL[:len(committedWAL)], committedWAL) {
+		t.Errorf("the log lost committed frames: %d bytes after the crash, %d committed", len(gotWAL), len(committedWAL))
+	}
+	gotDB := r.readFile("app.db")
+	if len(gotDB) < len(committedDB) || !bytes.Equal(gotDB[:len(committedDB)], committedDB) {
+		t.Errorf("the database lost committed pages: %d bytes after the crash, %d committed", len(gotDB), len(committedDB))
+	}
+	names := r.readdir("")
+	for _, name := range names {
+		if name == "lost+found" || name == "app.db-journal" {
+			t.Errorf("the root lists %q after the recovery", name)
+		}
+	}
+	if used, reachable := usedInodes(r.fs.v), countReachable(t, r.fs.v); used != reachable+firstIno-2 {
+		t.Errorf("%d inodes in use, %d reachable: the recovery left unreachable inodes", used, reachable)
+	}
+	r.unmount()
+	runE2fsck(t, clone)
+
+	// The original volume still works: close the handles that the crash left.
+	for _, fd := range []*vfs.FileDescription{db, wal, rollback} {
+		fd.DecRef(e.ctx)
+	}
 }
