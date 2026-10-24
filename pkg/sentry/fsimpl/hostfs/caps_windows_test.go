@@ -59,9 +59,7 @@ func TestWindowsReadOnlyProbeFollowsAnExistingName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rw.mu.Lock()
 	_, _, err = rw.createFile("Existing.txt", 0o644, 0, 0)
-	rw.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
