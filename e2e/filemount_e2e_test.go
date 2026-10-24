@@ -99,7 +99,6 @@ func TestE2EFileBindMountExposesOnlyTheFile(t *testing.T) {
 			if rep.ReadOutsideErr == "" && runtime.GOOS != "windows" {
 				t.Errorf("host read of the sibling file succeeded after the lockdown: %q", rep.OutsideReadBytes)
 			}
-			t.Logf("DEBUGSTDERR %s", stderr)
 			if rep.WriteOutsideErr == "" {
 				t.Errorf("host write outside the mounts succeeded after the lockdown")
 			}

@@ -624,19 +624,19 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 func lstatIn(dir windows.Handle, name, rel string) (hostInfo, error) {
 	handle, err := openAt(dir, name, windows.FILE_READ_ATTRIBUTES, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
 	if err != nil {
-		return hostInfo{}, hostError("lstat-open", rel, err)
+		return hostInfo{}, hostError("lstat", rel, err)
 	}
 	defer closeHandle(handle)
 	stored, err := finalPathLeaf(handle)
 	if err != nil {
-		return hostInfo{}, hostError("lstat-final", rel, err)
+		return hostInfo{}, hostError("lstat", rel, err)
 	}
 	if stored != name {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w: %w", rel, errNameMismatch, windows.ERROR_FILE_NOT_FOUND)
 	}
 	info, err := statHandle(handle)
 	if err != nil {
-		return hostInfo{}, hostError("lstat-stat", rel, err)
+		return hostInfo{}, hostError("lstat", rel, err)
 	}
 	return info, nil
 }
