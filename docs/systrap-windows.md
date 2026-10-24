@@ -6,7 +6,7 @@ This document describes the `systrap` engine for Windows. The engine runs a Linu
 | :--- | :--- |
 | Status | Implemented for `windows/arm64` and `windows/amd64`. The engine runs the Sentry and its guests on both hosted runners. |
 | Stops | Every system call, page fault, and signal reaches the Sentry through a debug object. One stop costs about 70 to 115 µs on `arm64` and about 80 to 190 µs on `amd64`, depending on the host. |
-| Fast path | Optional, off by default. `GVX_SYSTRAP_FASTPATH=1` lets a patched system call skip the debugger. Section 6.8 describes it. Nobody has run it on a Windows host. |
+| Fast path | On by default. `GVX_SYSTRAP_FASTPATH=0` turns it off, and `GVX_SYSTRAP_FASTPATH=1` makes a host that cannot run it an error. A patched system call skips the debugger. Section 6.8 describes it. |
 | Security | The engine is not a syscall sandbox. Windows has no filter for NT system calls, so a hostile guest can reach the NT services of the stub token. |
 | Value | Hosts without the Windows Hypervisor Platform (WHP): the `windows-11-arm` runner, and Windows on ARM virtual machines on Apple silicon. |
 
@@ -289,7 +289,7 @@ The stub runs with a token that has no privileges and Low integrity, in a job th
 
 ### 6.8 Fast Path
 
-The fast path is optional and off by default. Set `GVX_SYSTRAP_FASTPATH=1` to turn it on. It serves a patched system call without the debugger: no `NtSuspendThread`, no `NtResumeThread`, no `NtDebugContinue`, and no context call. The latency is a design target. Nobody has measured it on a Windows host.
+The fast path is on by default. `New` falls back to the debug path when the host cannot run it. Set `GVX_SYSTRAP_FASTPATH=1` to turn a failed fast path into an error, and `GVX_SYSTRAP_FASTPATH=0` to turn the fast path off. It serves a patched system call without the debugger: no `NtSuspendThread`, no `NtResumeThread`, no `NtDebugContinue`, and no context call. The latency is a design target.
 
 | Part | Content |
 | :--- | :--- |
@@ -336,7 +336,7 @@ On `arm64`, the block holds V0 to V31, FPSR, and FPCR. The ABI lets a call clobb
 
 On `amd64`, the block is an XSAVE image at offset `0x100` of the `winSysmsg`. The routine writes it with `XSAVE64` and loads it with `XRSTOR64`. The feature mask is `0xE7`: x87, SSE, AVX, and the three AVX-512 components. The processor ignores the mask bits that XCR0 does not enable. The Sentry copies the image to and from the Linux XSAVE image of the guest. It sets only the XSTATE_BV bits of components that the operating system enabled, because `XRSTOR64` faults on any other bit.
 
-When the variable is set, `New` runs a guest with six system calls in a new stub. All six must take the fast path. A failed run, or a run that exceeds 30 seconds, makes `New` return `ErrUnavailable`. A host that fails this test therefore reports the failure and does not fall back without notice.
+By default, `New` runs a guest with six system calls in a new stub. All six must take the fast path. A failed run, or a run that exceeds 30 seconds, makes `New` fall back to the debug path. With `GVX_SYSTRAP_FASTPATH=1`, such a run makes `New` return `ErrUnavailable`. With `GVX_SYSTRAP_FASTPATH=0`, `New` skips the fast path.
 
 The design rests on facts that no Windows document states:
 
@@ -351,7 +351,7 @@ The design rests on facts that no Windows document states:
 | Handoff state machine | Unit tests with channel events and the race detector, also on macOS. |
 | Generated machine code | Decoding with `x86asm` and `arm64asm`, and an emulator that runs the spin hit, the sleep, the races, and the cold resume, also on macOS. |
 | `amd64` patch plan | Unit tests of the relocation and branch rules, also on macOS. |
-| End to end | `fastpath_windows_test.go`, and the engine tests with the variable set. Nobody has run them on a Windows host. |
+| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. Both hosted Windows runners pass them. |
 | Latency | Not measured. |
 
 The engine never reuses a slot of an island, so a page that a guest patches again and again allocates more slots. A thread count above 512 for one stub fails with an error. An `arm64` guest must keep 512 bytes below its stack pointer writable at each system call.
@@ -399,7 +399,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 
 | Item | State |
 | :--- | :--- |
-| Fast path | Implemented as an option, off by default (section 6.8). Nobody has run it on a Windows host, and its latency is not measured. The design target is an event round trip of 12 to 27 µs, against 70 to 190 µs for a stop. |
+| Fast path | Implemented and on by default (section 6.8). The fast path tests pass on `windows-latest` and `windows-11-arm`. The design target is an event round trip of 12 to 27 µs, against 70 to 190 µs for a stop. |
 | Guest addresses outside the two windows | No guest mapping can use an address below `0x10000` or between `0x7ffe0000` and 16 TiB. The memory manager treats the second range as a hole. |
 | Writing to the executing page | A guest that writes to the page that it executes gets SIGSEGV. |
 | GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
