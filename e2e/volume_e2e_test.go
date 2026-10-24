@@ -17,6 +17,7 @@
 package e2e
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -95,7 +96,9 @@ func TestE2EVolumePersistsAcrossSandboxes(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(cacheDir, "volumes", "testvol")); err == nil {
 				t.Error("the volume created a hostfs directory beside the image")
 			}
+			requireCleanImage(t, image, "write")
 			run("verify")
+			requireCleanImage(t, image, "verify")
 			keepImage(t, image)
 			if bin, err := exec.LookPath("e2fsck"); err == nil {
 				if out, err := exec.Command(bin, "-fn", image).CombinedOutput(); err != nil {
@@ -120,5 +123,24 @@ func keepImage(t *testing.T, image string) {
 	name := strings.ReplaceAll(t.Name(), "/", "_") + ".img"
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// requireCleanImage fails the test unless the superblock of the image has the
+// valid bit. The close of a sandbox sets the bit, so the next mount runs no
+// repair. The superblock starts at byte 1024 and s_state is at offset 0x3A.
+func requireCleanImage(t *testing.T, image, after string) {
+	t.Helper()
+	f, err := os.Open(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var state [2]byte
+	if _, err := f.ReadAt(state[:], 1024+0x3A); err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint16(state[:])&1 == 0 {
+		t.Errorf("after the %s sandbox the image is not marked clean (s_state %#x)", after, state)
 	}
 }

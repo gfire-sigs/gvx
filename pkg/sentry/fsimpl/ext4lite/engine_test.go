@@ -25,7 +25,7 @@ import (
 )
 
 func TestEmptyVolumeIsClean(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	if err := v.close(); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestEmptyVolumeIsClean(t *testing.T) {
 // TestStorageRepresentations covers the three representations of a file: the
 // inline form, the extent root in the inode, and the extent leaf blocks.
 func TestStorageRepresentations(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 
 	inlineSizes := []int{0, 1, 59, 60, 61, 100, maxInline}
@@ -113,7 +113,7 @@ func TestStorageRepresentations(t *testing.T) {
 }
 
 func TestSparseAndTruncate(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	f := createChild(t, v, root, "sparse", modeRegular|0o644)
 	writeAll(t, f, 10*blockSize+100, []byte("tail"))
@@ -163,7 +163,7 @@ func TestSparseAndTruncate(t *testing.T) {
 }
 
 func TestDirectoryGrowthAndShrink(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	dir := createChild(t, v, root, "big", modeDir|0o755)
 	const count = 700
@@ -217,7 +217,7 @@ func TestDirectoryGrowthAndShrink(t *testing.T) {
 }
 
 func TestSymlinkSpecialAndXattr(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	short := createChild(t, v, root, "short-link", modeSymlink|0o777)
 	writeAll(t, short, 0, []byte("target/file"))
@@ -283,7 +283,7 @@ func TestSymlinkSpecialAndXattr(t *testing.T) {
 }
 
 func TestGrowthAcrossGroupsAndShrink(t *testing.T) {
-	for _, tier := range []storageTier{tierNative, tierFallback} {
+	for _, tier := range []storageTier{platformTier, tierFallback} {
 		t.Run(fmt.Sprint("tier", tier), func(t *testing.T) {
 			v, path := newTestVolume(t, tier)
 			root := mustRoot(t, v)
@@ -325,7 +325,7 @@ func TestGrowthAcrossGroupsAndShrink(t *testing.T) {
 // TestFreedBlocksWaitForFlush checks the rule that keeps a crash safe: a block
 // that the disk records as used does not return to the pool before a flush.
 func TestFreedBlocksWaitForFlush(t *testing.T) {
-	v, _ := newTestVolume(t, tierNative)
+	v, _ := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	a := createChild(t, v, root, "a", modeRegular|0o644)
 	writeAll(t, a, 0, pattern(1, blockSize*2))
@@ -364,7 +364,7 @@ func TestFreedBlocksWaitForFlush(t *testing.T) {
 // TestRandomOperationsMatchModel runs random writes, truncates, and hole
 // punches on one file and compares the file with a plain byte slice.
 func TestRandomOperationsMatchModel(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	f := createChild(t, v, root, "model", modeRegular|0o644)
 	var model []byte

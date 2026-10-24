@@ -38,7 +38,7 @@ type fakeEndpoint struct {
 // copy. The copy is what a power failure at this instant leaves on the host.
 func crashClone(t *testing.T, e *env) *env {
 	t.Helper()
-	return openEnv(t, cloneImage(t, e.path), VolumeOptions{}, vfs.MountOptions{})
+	return openEnv(t, cloneImage(t, e.fs.v), VolumeOptions{}, vfs.MountOptions{})
 }
 
 // TestOSyncWriteIsDurable checks the order of a synchronous write. After the

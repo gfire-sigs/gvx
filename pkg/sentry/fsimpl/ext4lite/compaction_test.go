@@ -34,7 +34,7 @@ func unlink(t testing.TB, v *volume, dir *node, name string, n *node) {
 // the clean unmount to return every trailing group. The 8 MiB that stay sit
 // in the last groups before the unmount, so the unmount has to move them.
 func TestCompactionShrinksHostFile(t *testing.T) {
-	for _, tier := range []storageTier{tierNative, tierFallback} {
+	for _, tier := range []storageTier{platformTier, tierFallback} {
 		v, path := newTestVolume(t, tier)
 		root := mustRoot(t, v)
 		chunk := pattern(3, 1<<20)

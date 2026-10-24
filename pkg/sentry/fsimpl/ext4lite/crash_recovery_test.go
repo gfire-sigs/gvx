@@ -29,11 +29,17 @@ import (
 )
 
 // cloneImage copies the bytes of the image while a volume has it open. The
-// copy is what a power failure at this instant would leave on the host.
-func cloneImage(t testing.TB, path string) string {
+// copy is what a power failure at this instant would leave on the host. It
+// reads through the handle of the volume, because on Windows the lock of the
+// volume stops every other handle from reading the file.
+func cloneImage(t testing.TB, v *volume) string {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	size, err := v.hf.Size()
 	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, size)
+	if _, err := v.hf.ReadAt(data, 0); err != nil {
 		t.Fatal(err)
 	}
 	clone := filepath.Join(t.TempDir(), "clone.ext4")
@@ -49,7 +55,7 @@ func cloneImage(t testing.TB, path string) string {
 // remount must keep every committed file, reclaim the rest, and leave the
 // volume consistent.
 func TestCrashRecovery(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, _ := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 
 	// A database and its write-ahead log, both committed.
@@ -88,7 +94,7 @@ func TestCrashRecovery(t *testing.T) {
 	}
 	writeAll(t, db, 64*blockSize, pattern(200, blockSize))
 
-	clone := cloneImage(t, path)
+	clone := cloneImage(t, v)
 	abandon(v)
 
 	rv, err := tryOpenVolume(clone, volumeOptions{now: func() time.Time { return testNow }})
@@ -185,11 +191,11 @@ func countReachable(t testing.TB, v *volume) uint32 {
 // TestCrashBeforeAnySync mounts the image that a crash left right after the
 // first write. Nothing was committed, so the volume must come back empty.
 func TestCrashBeforeAnySync(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, _ := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	n := createChild(t, v, root, "never-synced", modeRegular|0o644)
 	writeAll(t, n, 0, pattern(1, 3*blockSize))
-	clone := cloneImage(t, path)
+	clone := cloneImage(t, v)
 	abandon(v)
 
 	rv, err := tryOpenVolume(clone, volumeOptions{now: func() time.Time { return testNow }})
@@ -258,7 +264,7 @@ func TestCrashRecoveryDatabaseWorkload(t *testing.T) {
 		e.writeFile(fmt.Sprintf("attachments/new-%d", i), pattern(byte(i), 30000))
 	}
 
-	clone := cloneImage(t, e.path)
+	clone := cloneImage(t, e.fs.v)
 	raw, err := os.ReadFile(clone)
 	if err != nil {
 		t.Fatal(err)

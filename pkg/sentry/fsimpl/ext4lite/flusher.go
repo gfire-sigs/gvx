@@ -59,6 +59,9 @@ func (fs *filesystem) startFlusher() {
 			case <-f.stop:
 				return
 			case <-t.C:
+				if fs.v.isClosed() {
+					return
+				}
 				// A failure stays in the engine. The next flush writes the
 				// same blocks again, and fsync reports the error to the guest.
 				_ = fs.syncAll()
@@ -77,4 +80,11 @@ func (fs *filesystem) stopFlusher() {
 		<-f.done
 		fs.flusher = nil
 	}
+}
+
+// isClosed reports whether the volume has been closed.
+func (v *volume) isClosed() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.closed
 }

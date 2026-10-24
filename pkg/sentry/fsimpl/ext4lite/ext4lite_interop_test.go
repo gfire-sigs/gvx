@@ -179,6 +179,12 @@ func TestInteropKernelMount(t *testing.T) {
 		full := append(append([]string{}, priv...), args...)
 		return exec.Command(full[0], full[1:]...).CombinedOutput()
 	}
+	// The files belong to root with the modes that the guest chose, so the
+	// test reads them with the same privilege as the mount.
+	readPriv := func(p string) ([]byte, error) {
+		full := append(append([]string{}, priv...), "cat", p)
+		return exec.Command(full[0], full[1:]...).Output()
+	}
 	path := buildInteropImage(t)
 	mnt := t.TempDir()
 	if out, err := run("mount", "-o", "loop,ro", "-t", "ext4", path, mnt); err != nil {
@@ -191,7 +197,7 @@ func TestInteropKernelMount(t *testing.T) {
 		case "extents-10m", "spacer":
 			continue
 		}
-		got, err := os.ReadFile(filepath.Join(mnt, name))
+		got, err := readPriv(filepath.Join(mnt, name))
 		if err != nil {
 			t.Errorf("kernel read of %s: %v", name, err)
 			continue
@@ -200,7 +206,7 @@ func TestInteropKernelMount(t *testing.T) {
 			t.Errorf("kernel read of %s: %d bytes differ from the %d bytes written", name, len(got), len(data))
 		}
 	}
-	big, err := os.ReadFile(filepath.Join(mnt, "extents-10m"))
+	big, err := readPriv(filepath.Join(mnt, "extents-10m"))
 	if err != nil || len(big) != 10<<20 {
 		t.Fatalf("kernel read of extents-10m: %d bytes, %v", len(big), err)
 	}

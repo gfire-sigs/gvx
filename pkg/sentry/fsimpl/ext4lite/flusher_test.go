@@ -58,7 +58,7 @@ func TestBackgroundFlushMakesChangesDurableWithoutFsync(t *testing.T) {
 			t.Fatal("no background flush ran")
 		}
 	}
-	clone := cloneImage(t, e.path)
+	clone := cloneImage(t, e.fs.v)
 
 	r := openEnv(t, clone, VolumeOptions{}, vfs.MountOptions{})
 	wantBytes(t, "file after the background flush", r.readFile("dir/file"), data)

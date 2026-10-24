@@ -40,7 +40,7 @@ type corruptFixture struct {
 
 func buildCorruptFixture(t *testing.T) corruptFixture {
 	t.Helper()
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	f1 := createChild(t, v, root, "file1", modeRegular|0o644)
 	f2 := createChild(t, v, root, "file2", modeRegular|0o644)
@@ -341,7 +341,7 @@ func TestCorruptGroupDescriptor(t *testing.T) {
 
 // TestCorruptExtentLeaf damages an extent leaf block.
 func TestCorruptExtentLeaf(t *testing.T) {
-	v, path := newTestVolume(t, tierNative)
+	v, path := newTestVolume(t, platformTier)
 	root := mustRoot(t, v)
 	a := createChild(t, v, root, "a", modeRegular|0o644)
 	b := createChild(t, v, root, "b", modeRegular|0o644)
