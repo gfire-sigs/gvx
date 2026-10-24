@@ -26,16 +26,16 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// These tests force the fast path on, whatever GVX_SYSTRAP_FASTPATH says. The
-// rest of the engine tests run with the fast path when the variable is set.
+// These tests require the fast path, whatever GVX_SYSTRAP_FASTPATH says. The
+// rest of the engine tests run with the fast path by default.
 
 // newFastPlatform returns a platform that runs system calls through the fast
 // path. New runs the self test and fails when the host cannot run it.
 func newFastPlatform(t testing.TB) *Platform {
 	t.Helper()
-	prev := fastPathRequested
-	fastPathRequested = true
-	t.Cleanup(func() { fastPathRequested = prev })
+	prev := fastPathMode
+	fastPathMode = fastPathRequired
+	t.Cleanup(func() { fastPathMode = prev })
 	p := newPlatform(t)
 	if !p.fast {
 		t.Fatal("the platform does not run the fast path")
@@ -226,12 +226,50 @@ func TestFastPathConcurrentThreads(t *testing.T) {
 }
 
 func TestFastPathProbeRoundTrip(t *testing.T) {
-	prev := fastPathRequested
-	fastPathRequested = true
-	t.Cleanup(func() { fastPathRequested = prev })
+	prev := fastPathMode
+	fastPathMode = fastPathRequired
+	t.Cleanup(func() { fastPathMode = prev })
 	info, err := Probe()
 	if err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
 	t.Logf("fast path round trip %v", info.RoundTrip)
+}
+
+func TestParseFastPathMode(t *testing.T) {
+	for in, want := range map[string]fastPathSetting{
+		"":      fastPathAuto,
+		"1":     fastPathRequired,
+		"0":     fastPathOff,
+		"true":  fastPathAuto,
+		"other": fastPathAuto,
+	} {
+		if got := parseFastPathMode(in); got != want {
+			t.Errorf("parseFastPathMode(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// TestAutoModeUsesTheFastPath checks that the default platform runs the fast
+// path on a host that can run it. The other tests of the engine then cover the
+// fast path without a special setting.
+func TestAutoModeUsesTheFastPath(t *testing.T) {
+	prev := fastPathMode
+	fastPathMode = fastPathAuto
+	t.Cleanup(func() { fastPathMode = prev })
+	p := newPlatform(t)
+	if !p.fast {
+		t.Skip("this host cannot run the fast path, so New fell back to the debug path")
+	}
+}
+
+// TestOffModeUsesTheDebugPath checks that GVX_SYSTRAP_FASTPATH=0 keeps the
+// debug path.
+func TestOffModeUsesTheDebugPath(t *testing.T) {
+	prev := fastPathMode
+	fastPathMode = fastPathOff
+	t.Cleanup(func() { fastPathMode = prev })
+	if p := newPlatform(t); p.fast {
+		t.Fatal("the platform runs the fast path with the mode off")
+	}
 }

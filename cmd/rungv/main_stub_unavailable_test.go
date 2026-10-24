@@ -23,7 +23,7 @@ import (
 )
 
 // TestStubReportsUnavailableEngine covers every host without a runnable
-// systrap engine: the default 4KB build on darwin/arm64 and darwin/amd64.
+// systrap engine: the default 4KB build on darwin/arm64.
 // Linux runs the upstream platform, and Windows runs the engine of gvx. The
 // command prints no stub data and exits with the engine error.
 func TestStubReportsUnavailableEngine(t *testing.T) {

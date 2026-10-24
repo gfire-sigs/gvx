@@ -80,7 +80,34 @@ var configureOnce sync.Once
 
 // New starts the stub host and returns a Platform. It must run before the
 // Sentry locks itself down, because the host is a child process.
+//
+// The fast path is on by default. When this host cannot run it, New falls back
+// to the debug path. GVX_SYSTRAP_FASTPATH=1 makes a host that cannot run the
+// fast path an error, and GVX_SYSTRAP_FASTPATH=0 turns the fast path off.
 func New() (*Platform, error) {
+	switch fastPathMode {
+	case fastPathOff:
+		return open(false)
+	case fastPathRequired:
+		return open(true)
+	}
+	p, err := open(true)
+	if err == nil {
+		return p, nil
+	}
+	if traceEvents {
+		tracef("systrap: the fast path is unavailable, so the platform uses the debug path: %v", err)
+	}
+	if p, err2 := open(false); err2 == nil {
+		return p, nil
+	} else {
+		return nil, err2
+	}
+}
+
+// open starts the stub host, and it prepares the fast path when fast is true.
+// It releases everything that it started when it fails.
+func open(fast bool) (*Platform, error) {
 	configureOnce.Do(configureArch)
 	breakAddr, err := dbgBreakPointAddr()
 	if err != nil {
@@ -102,7 +129,7 @@ func New() (*Platform, error) {
 		userMin:   winBase,
 		userMax:   internalBase,
 	}
-	if fastPathRequested {
+	if fast {
 		if err := p.prepareFast(); err != nil {
 			dbg.close()
 			_ = host.close()
@@ -119,9 +146,8 @@ func New() (*Platform, error) {
 		}
 	}
 	if p.fast {
-		// GVX_SYSTRAP_FASTPATH=1 asks for the fast path, so a host that cannot
-		// run it is an error. The run proves the facts that the Windows
-		// documents do not state.
+		// A short guest run proves the facts that the Windows documents do not
+		// state. A host that fails the run cannot use the fast path.
 		if err := p.selfTestFast(); err != nil {
 			_ = p.Close()
 			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path failed its self test: %v", err)}

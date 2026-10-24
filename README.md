@@ -1,6 +1,6 @@
 # `gvx`
 
-`gvx` ports Google's gVisor user-space Linux kernel (Sentry) to 64-bit Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`, `darwin/amd64`) as co-equal Priority-0 targets. It also supports Linux (`linux/amd64`, `linux/arm64`) officially. It executes unmodified Linux ELF64 binaries and multi-arch OCI container images inside one unprivileged host process via the `rungv` CLI or `pkg/gvx` SDK. Callers get isolated Linux execution on Windows and Mac with millisecond startup, no Linux virtual machine, no kernel drivers, and no administrator or `root` privileges.
+`gvx` ports Google's gVisor user-space Linux kernel (Sentry) to 64-bit Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`) as co-equal Priority-0 targets. It also supports Linux (`linux/amd64`, `linux/arm64`) officially. It executes unmodified Linux ELF64 binaries and multi-arch OCI container images inside one unprivileged host process via the `rungv` CLI or `pkg/gvx` SDK. Callers get isolated Linux execution on Windows and Mac with millisecond startup, no Linux virtual machine, no kernel drivers, and no administrator or `root` privileges.
 
 ---
 
@@ -12,8 +12,8 @@ Running Linux binaries or container images on Windows and macOS usually forces a
 
 | Runtime Model | Host Targets | Cold Start | Memory Overhead | Admin / `sudo` Required | 4KB `mmap(MAP_FIXED)` | Direct OCI Image Run |
 | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows & macOS (`amd64`, `arm64`) | `~20 ms` | `~30 MiB` | No (Low Integrity / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
-| **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k` build); unavailable on Windows and macOS `amd64` | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt) | 16KB host pages, native stub tasks | Yes (In-Memory Tar-to-EROFS) |
+| **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows (`amd64`, `arm64`) & macOS (`arm64`) | `~20 ms` | `~30 MiB` | No (Low Integrity / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
+| **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k` build) and Windows `amd64` and `arm64` | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt) | 16KB host pages, native stub tasks | Yes (In-Memory Tar-to-EROFS) |
 | **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
 | **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
 
@@ -50,7 +50,7 @@ Use these steps to compile `rungv` and run an unmodified OCI image on Windows or
 6. Use the Docker flags `-e`, `-u`, `-v`, `-m`, `--cpus`, `-P`, `--read-only`, and `--tmpfs`, and the image commands `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, and `logout`. The reference [`docs/cli.md`](docs/cli.md) lists every flag and every difference from Docker.
 
 ```bash
-# Build on macOS (Apple Silicon arm64 or Intel amd64) and apply free ad-hoc hypervisor signature
+# Build on macOS (Apple Silicon arm64) and apply free ad-hoc hypervisor signature
 go build -o rungv ./cmd/rungv
 codesign --sign - --entitlements entitlements.plist --force ./rungv
 
@@ -161,9 +161,9 @@ The external smoke owns private daemon paths and never changes host-global conta
 
 Windows enforces a 64KB alignment granularity on `VirtualAlloc(..., MEM_RESERVE, ...)`, while Apple Silicon macOS enforces a 16KB host page size (`vm_page_size = 16384`). Linux ELF loaders require 4KB alignment for `mmap(MAP_FIXED)`. The hardware backends keep 4KB guest pages. The `systrap` backend on macOS `arm64` cannot, so it needs 16KB guest pages.
 
-`pkg/sentry/platform/whpx` (Windows `amd64`/`arm64`) and `pkg/sentry/platform/hvf` (macOS `arm64`/`amd64`) map guest pages from `pgalloc.MemoryFile` through `WHvMapGpaRange` and `hv_vm_map`. The EROFS image uses a read-only file descriptor, and `hv_vm_map` rejects it. `hvf` copies those pages into immutable slab pages. Stage-1 4KB translation granules (`arm64`) and Extended Page Tables (`amd64`) enforce `R/W/X` at 4KB boundaries.
+`pkg/sentry/platform/whpx` (Windows `amd64`/`arm64`) and `pkg/sentry/platform/hvf` (macOS `arm64`) map guest pages from `pgalloc.MemoryFile` through `WHvMapGpaRange` and `hv_vm_map`. The EROFS image uses a read-only file descriptor, and `hv_vm_map` rejects it. `hvf` copies those pages into immutable slab pages. Stage-1 4KB translation granules (`arm64`) and Extended Page Tables (`amd64`) enforce `R/W/X` at 4KB boundaries.
 
-Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path syscall exit (`bluepill_*.go` in `hvf`, `stubgen_*.go` in `whpx`). `arch.Context64` holds the general and FP registers, and every `Switch` loads and stores them. `Hypervisor.framework` ties a vCPU to its host thread, so `hvf` runs each vCPU on a dedicated locked worker thread. `hvf` on `darwin/arm64` is the only hardware backend that this repository executes. `whpx` and `hvf` on `darwin/amd64` are compile-checked only.
+Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path syscall exit (`bluepill_arm64.go` in `hvf`, `stubgen_*.go` in `whpx`). `arch.Context64` holds the general and FP registers, and every `Switch` loads and stores them. `Hypervisor.framework` ties a vCPU to its host thread, so `hvf` runs each vCPU on a dedicated locked worker thread. `hvf` on `darwin/arm64` is the only hardware backend that this repository executes on a development host. `whpx` runs on the hosted Windows runners.
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
@@ -236,7 +236,7 @@ Read the architecture plan and agent operating manual before modifying any packa
 
 | Document | Audience | Scope Description |
 | :--- | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync, M1-M5 milestones, and the optional containerd control adapter. |
+| [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows `amd64`/`arm64` and macOS `arm64` specs, upstream sync, M1-M5 milestones, and the optional containerd control adapter. |
 | [`docs/cli.md`](docs/cli.md) | Users & Engineers | Every `rungv` command, every flag of `rungv run`, the run rules, and the differences from Docker. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 rules, package import boundaries, and verification gates. |
 
@@ -248,16 +248,15 @@ Read the architecture plan and agent operating manual before modifying any packa
 
 ### 5.1 Build and Verification Steps
 
-1. Cross-compile all packages across the four Priority-0 targets (`windows/amd64`, `windows/arm64`, `darwin/arm64`, `darwin/amd64`).
+1. Cross-compile all packages across the three non-Linux Priority-0 targets (`windows/amd64`, `windows/arm64`, `darwin/arm64`).
 2. Run the unit test suite with the signing wrapper. The wrapper gives test binaries the `hvf` entitlement.
 3. Audit the upstream diff against `UPSTREAM_COMMIT` to verify the `< 1.0%` modification ceiling.
 
 ```bash
-# Compile across all four Priority-0 targets
+# Compile across the three non-Linux Priority-0 targets
 GOOS=windows GOARCH=amd64 go build ./...
 GOOS=windows GOARCH=arm64 go build ./...
 GOOS=darwin  GOARCH=arm64 go build ./...
-GOOS=darwin  GOARCH=amd64 go build ./...
 
 # Run the tests and the upstream diff audit
 go test -race -exec "$PWD/scripts/codesign-exec.sh" ./...
@@ -267,7 +266,7 @@ go run ./tools/upstream -mode=audit -max-ratio=0.01
 go test -race -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/platform/systrap/...
 ```
 
-GitHub Actions verifies every change. The workflow `ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner has no hypervisor, so it runs the `systrap` suites with `-tags pagesize_16k`. The workflow `e2e-images.yml` pulls real images once a week.
+GitHub Actions verifies every change. The workflow `ci.yml` builds and vets all five targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner has no hypervisor, so it runs the `systrap` suites with `-tags pagesize_16k`. The workflow `e2e-images.yml` pulls real images once a week.
 
 ### 5.2 Implementation Roadmap (`M1` to `M5`)
 
@@ -275,7 +274,7 @@ This table maps each implementation milestone to its deliverables and verificati
 
 | Phase | Milestone | Target Workload and Verification Gate |
 | :--- | :--- | :--- |
-| **M1** | **Host Primitives & Pure-Go Sentry Compile** | `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pgalloc`, `time`, `hostcpu`, `tools/upstream`, and `pkg/sentry/kernel` compile on `windows/{amd64,arm64}` and `darwin/{arm64,amd64}`. |
+| **M1** | **Host Primitives & Pure-Go Sentry Compile** | `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pgalloc`, `time`, `hostcpu`, `tools/upstream`, and `pkg/sentry/kernel` compile on `windows/{amd64,arm64}` and `darwin/arm64`. |
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | Boot static `busybox` (`PID 1`) via `platform/whpx` (Windows) and `platform/hvf` (macOS) on `amd64` and `arm64` and reach an interactive `busybox ash` prompt. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | Implement `clone`, `futex`, signals, TLS (`ARCH_SET_FS` & `TPIDR_EL0`), VDSO, `pkg/netbackend` (`-net=nat -p` & `-net=wg`), and `pkg/oci`. Boot `alpine:3.20` and `nginx:alpine`. |
 | **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | Pass POSIX rename and unlink tests (`git rebase`, `bun install`) on `/workspace` and verify `pkg/hostlockdown` blocks child process spawning on Windows and macOS. |

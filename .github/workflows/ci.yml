@@ -70,9 +70,9 @@ jobs:
             pkg/hostlockdown pkg/syserr pkg/sentry/platform/hvf pkg/sentry/platform/whpx \
             pkg/sentry/fsimpl/hostfs pkg/sentry/fsimpl/ext4lite)
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
-      - name: Build every package for the six targets
+      - name: Build every package for the five targets
         run: |
-          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
+          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "::group::build $target"
             GOOS=${target%/*} GOARCH=${target#*/} go build ./...
             echo "::endgroup::"
@@ -80,15 +80,15 @@ jobs:
           echo "::group::build darwin/arm64 with pagesize_16k"
           GOOS=darwin GOARCH=arm64 go build -tags pagesize_16k ./...
           echo "::endgroup::"
-      - name: Vet the packages that gvx wrote for the six targets
+      - name: Vet the packages that gvx wrote for the five targets
         run: |
-          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
+          for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "::group::vet $target"
             GOOS=${target%/*} GOARCH=${target#*/} go vet $VET
             echo "::endgroup::"
           done
           # The systrap package mixes upstream Linux files with gvx files, so vet it where only gvx files build.
-          for target in darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
+          for target in darwin/arm64 windows/amd64 windows/arm64; do
             GOOS=${target%/*} GOARCH=${target#*/} go vet ./pkg/sentry/platform/systrap/
           done
           GOOS=darwin GOARCH=arm64 go vet -tags pagesize_16k ./pkg/sentry/platform/... ./pkg/gvx/... ./e2e/...

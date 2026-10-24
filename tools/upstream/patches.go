@@ -76,7 +76,6 @@ var (
 // nonLinuxTargets lists the Priority-0 host targets that must not compile Linux-only upstream code.
 var nonLinuxTargets = []buildTarget{
 	{"darwin", "arm64"},
-	{"darwin", "amd64"},
 	{"windows", "amd64"},
 	{"windows", "arm64"},
 }

@@ -43,10 +43,29 @@ import (
 //
 // Section 6.8 of docs/systrap-windows.md describes the design and its limits.
 
-// fastPathRequested is set by the environment variable GVX_SYSTRAP_FASTPATH=1.
-// The fast path is off by default. When the variable is set, New proves the
-// fast path with a short guest run and fails when the run fails.
-var fastPathRequested = os.Getenv("GVX_SYSTRAP_FASTPATH") == "1"
+// fastPathMode selects how New treats the fast path. GVX_SYSTRAP_FASTPATH=1
+// requires it, and New fails when the self test fails. GVX_SYSTRAP_FASTPATH=0
+// turns it off. Any other value, or no value, tries the fast path and falls
+// back to the debug path when the host cannot run it.
+var fastPathMode = parseFastPathMode(os.Getenv("GVX_SYSTRAP_FASTPATH"))
+
+type fastPathSetting int
+
+const (
+	fastPathAuto fastPathSetting = iota
+	fastPathRequired
+	fastPathOff
+)
+
+func parseFastPathMode(v string) fastPathSetting {
+	switch v {
+	case "1":
+		return fastPathRequired
+	case "0":
+		return fastPathOff
+	}
+	return fastPathAuto
+}
 
 var (
 	procNtCreateEvent            = modNtdll.NewProc("NtCreateEvent")

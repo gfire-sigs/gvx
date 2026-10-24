@@ -12,7 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !arm64
+
 package hvf
 
-// hostPageSize is the Intel host page and the EPT mapping granule of hv_vm_map.
-const hostPageSize = 0x1000
+// The engine runs on darwin/arm64 only. The project dropped darwin/amd64. A
+// build for any other architecture still compiles the shared code of the
+// package, so these constants give it the values that it needs. They never
+// reach a running guest.
+
+// maxUserAddress is the end of the user address range of a 48-bit layout.
+const maxUserAddress = 1 << 48
+
+// userUpperStart is the first address above the user range.
+const userUpperStart = uintptr(maxUserAddress)
