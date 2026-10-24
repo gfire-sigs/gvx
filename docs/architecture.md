@@ -542,7 +542,7 @@ On APFS, a lookup that misses the exact name falls back to the NFC form of the n
 
 #### Single-File Mount (Descriptive Module)
 
-`OpenWorkspace` accepts the path of a regular file. It resolves links in the path, pins the parent directory with `os.OpenRoot`, and remembers the stored name of the file. The root of the mounted filesystem is that file. The guest sees no other name of the parent directory. The lockdown grants the one file only: a Seatbelt `literal` rule on macOS, and a Low-integrity label and an ACL on the file on Windows.
+`OpenWorkspace` accepts the path of a regular file. It resolves links in the path, pins the parent directory with `os.OpenRoot`, and remembers the stored name of the file. The root of the mounted filesystem is that file. The guest sees no other name of the parent directory. The lockdown grants the one file only: a Seatbelt `literal` rule on macOS. On Windows it puts a Low-integrity label and an ACL entry on the file. It also adds one non-inherited `FILE_TRAVERSE` entry for the logon SID to the parent directory. The restricted token lacks `SeChangeNotifyPrivilege`, so a relative open through the pinned parent needs that right. The entry gives no listing and no creation, and no sibling gains access, because each sibling keeps its own ACL.
 
 The mode writes no `.gvx_meta`, because the parent directory belongs to the user. The mode, the owner, and the extended attributes that the guest sets stay in memory and reset at the next start. A change of the times reaches the host file. The guest mount point is an empty regular file. A `unlink` or a `rename` of the mount point returns `EBUSY`, because the mount point lies in the outer filesystem. A `link` to the file returns `EXDEV`.
 
