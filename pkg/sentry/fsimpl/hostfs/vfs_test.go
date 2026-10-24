@@ -49,7 +49,7 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	return newEnvOpts(t, workspaceOptions{coalesce: defaultMetaCoalesce})
+	return newEnvOpts(t, workspaceOptions{coalesce: defaultCoalesceWindow})
 }
 
 func newEnvOpts(t *testing.T, opts workspaceOptions) *env {

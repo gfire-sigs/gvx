@@ -203,7 +203,7 @@ func TestRenameTypeRules(t *testing.T) {
 		t.Fatalf("RENAME_NOREPLACE to fresh name: %v", err)
 	}
 	err = e.vfsObj.RenameAt(e.ctx, e.creds, e.pop("fresh"), e.pop("fresh2"), &vfs.RenameOptions{Flags: linux.RENAME_EXCHANGE})
-	wantErrno(t, "RENAME_EXCHANGE", err, linuxerr.EINVAL)
+	wantErrno(t, "RENAME_EXCHANGE onto a missing name", err, linuxerr.ENOENT)
 }
 
 func TestRenameOverVirtualSymlinkAndOntoSameFile(t *testing.T) {
@@ -328,8 +328,19 @@ func TestVirtualSymlinksStayOffTheHost(t *testing.T) {
 		t.Fatalf("lstat = (mode %o size %d, %v)", st.Mode&linux.S_IFMT, st.Size, err)
 	}
 	wantErrno(t, "symlink onto existing name", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/hello.txt"), "x"), linuxerr.EEXIST)
-	wantErrno(t, "escaping relative target", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/up"), "../../out"), linuxerr.EACCES)
-	wantErrno(t, "absolute target", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/abs"), "/etc/passwd"), linuxerr.EACCES)
+	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/up"), "../../out"); err != nil {
+		t.Fatalf("escaping relative target = %v, want success", err)
+	}
+	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/abs"), "/etc/passwd"); err != nil {
+		t.Fatalf("absolute target = %v, want success", err)
+	}
+	wantErrno(t, "empty target", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/none"), ""), linuxerr.ENOENT)
+	wantErrno(t, "target with a NUL byte", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("sub/nul"), "a\x00b"), linuxerr.EINVAL)
+	for _, name := range []string{"sub/up", "sub/abs"} {
+		if err := e.unlink(name); err != nil {
+			t.Fatal(err)
+		}
+	}
 	wantErrno(t, "rmdir of a symlink", e.vfsObj.RmdirAt(e.ctx, e.creds, e.pop("sub/link")), linuxerr.ENOTDIR)
 
 	// A directory that holds a virtual symlink is not empty.

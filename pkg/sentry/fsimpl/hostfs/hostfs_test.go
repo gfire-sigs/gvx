@@ -23,7 +23,6 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -50,12 +49,21 @@ func TestWorkspaceMetaPersistenceAndSymlinkContainment(t *testing.T) {
 		t.Fatalf("Symlink(intra-workspace) failed: %v", err)
 	}
 
-	// Verify symlink escape outside workspace is rejected.
-	if err := ws.Symlink("../../../etc/passwd", "scripts/bin/escape.sh"); !errors.Is(err, ErrPathTraversal) {
-		t.Fatalf("Symlink(escape) = %v, want ErrPathTraversal", err)
+	// A guest symlink lives only in .gvx_meta, so every target is valid. The
+	// guest VFS resolves the target in the guest namespace.
+	for link, target := range map[string]string{
+		"scripts/bin/escape.sh":     "../../../etc/passwd",
+		"scripts/bin/abs_escape.sh": "/etc/passwd",
+	} {
+		if err := ws.Symlink(target, link); err != nil {
+			t.Fatalf("Symlink(%q -> %q) = %v, want success", link, target, err)
+		}
+		if got, err := ws.Readlink(link); err != nil || got != target {
+			t.Fatalf("Readlink(%q) = (%q, %v), want %q", link, got, err, target)
+		}
 	}
-	if err := ws.Symlink("/etc/passwd", "scripts/bin/abs_escape.sh"); !errors.Is(err, ErrPathTraversal) {
-		t.Fatalf("Symlink(abs_escape) = %v, want ErrPathTraversal", err)
+	if err := ws.Symlink("", "scripts/bin/empty.sh"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Symlink(empty target) = %v, want ErrNotExist", err)
 	}
 	if _, err := ws.OpenFile("../outside.txt", os.O_RDONLY, 0); !errors.Is(err, ErrPathTraversal) {
 		t.Fatalf("OpenFile(../outside.txt) = %v, want ErrPathTraversal", err)
@@ -241,12 +249,16 @@ func TestHostFSVFS2MountAndFileOperations(t *testing.T) {
 		t.Fatalf("ReadlinkAt(sub/link.txt) = (%q, %v), want (\"hello.txt\", nil)", target, err)
 	}
 
-	// 5. Verify escaping symlink target is rejected with EACCES.
+	// 5. The guest VFS accepts a target that climbs out of the workspace. It
+	// resolves the target in the guest namespace and never on the host.
 	if err := vfsObj.SymlinkAt(ctx, creds, &vfs.PathOperation{
 		Root:  root,
 		Start: root,
 		Path:  fspath.Parse("sub/escape.txt"),
-	}, "../../../etc/passwd"); !errors.Is(err, linuxerr.EACCES) {
-		t.Fatalf("SymlinkAt(escape) = %v, want EACCES", err)
+	}, "../../../etc/passwd"); err != nil {
+		t.Fatalf("SymlinkAt(escape) = %v, want success", err)
+	}
+	if _, err := os.Lstat(filepath.Join(wsDir, "sub", "escape.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the escaping link reached the host: %v", err)
 	}
 }

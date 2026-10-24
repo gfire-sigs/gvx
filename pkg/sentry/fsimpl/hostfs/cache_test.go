@@ -211,7 +211,7 @@ func newCountEnv(t *testing.T) (*env, *countingHost, *testClock) {
 	clock := &testClock{}
 	clock.ns.Store(int64(time.Hour))
 	e := newEnvOpts(t, workspaceOptions{
-		coalesce: defaultMetaCoalesce,
+		coalesce: defaultCoalesceWindow,
 		clock:    clock.now,
 		wrapHost: func(b hostBackend) hostBackend {
 			ch.hostBackend = b

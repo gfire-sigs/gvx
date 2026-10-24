@@ -249,7 +249,7 @@ func TestHostWatcherLockedChild(t *testing.T) {
 	if dir == "" {
 		t.Skip("runs only as the locked child of TestHostWatcherWorksAfterTheHostLockdown")
 	}
-	ws, err := openWorkspace(dir, false, workspaceOptions{coalesce: defaultMetaCoalesce})
+	ws, err := openWorkspace(dir, false, workspaceOptions{coalesce: defaultCoalesceWindow})
 	if err != nil {
 		t.Fatal(err)
 	}

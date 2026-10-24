@@ -69,7 +69,7 @@ func newQuiesceEnv(t *testing.T, variant string, wrap func(hostBackend) hostBack
 	var opts workspaceOptions
 	switch variant {
 	case variantNative:
-		opts = workspaceOptions{coalesce: defaultMetaCoalesce, caps: lockingCaps()}
+		opts = workspaceOptions{coalesce: defaultCoalesceWindow, caps: lockingCaps()}
 		opts.wrapHost = wrap
 	case variantWinVolume:
 		opts = volumeOptions(winCaps, true, true, true)

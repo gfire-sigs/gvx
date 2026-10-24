@@ -153,7 +153,9 @@ func (h *hostHandle) fstat(host hostBackend) (hostInfo, error) {
 	return info, err
 }
 
-// sync flushes the live host file to stable storage.
+// sync flushes the live host file to stable storage. A host that needs write
+// access to flush a handle, such as Windows, skips a read-only handle, because
+// that handle never wrote the file.
 func (h *hostHandle) sync() error {
 	f, err := h.acquire()
 	if err != nil {
@@ -162,6 +164,9 @@ func (h *hostHandle) sync() error {
 	defer h.release()
 	if h.syncFn != nil {
 		return h.syncFn()
+	}
+	if flushNeedsWrite && h.flags == os.O_RDONLY {
+		return nil
 	}
 	return f.Sync()
 }

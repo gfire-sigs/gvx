@@ -27,7 +27,6 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
-	"z.gfire.dev/gvx/pkg/sentry/socket/unix/transport"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -194,7 +193,7 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, ino := range inodes {
-		if err := ino.syncData(); err != nil {
+		if err := ino.syncFile(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -246,6 +245,24 @@ type inode struct {
 	wmu sync.Mutex
 
 	data fileData
+
+	// writeCount tracks the processes that execute this file, which blocks
+	// every write to it. Hard links share the count. See exec_busy.go.
+	writeCount vfs.WriteCount
+
+	// unlinked reports that no name in the namespace reaches the inode any
+	// more: the guest removed the last link, or the guest created the file
+	// with O_TMPFILE and has not linked it. The link count that stat reports
+	// is zero then.
+	unlinked atomicbitops.Bool
+
+	// tmp holds the host state of a file that the guest created with
+	// O_TMPFILE, or nil. Protected by fs.mu. See tmpfile.go.
+	tmp *tmpFile
+
+	// special holds the in-memory state of a socket, a FIFO, or a device
+	// node. See special_node.go.
+	special specialState
 
 	// guest records the host state that the last guest write produced. The
 	// host watcher uses it to tell a guest write from a host write. See
@@ -385,6 +402,7 @@ func (i *inode) syncData() error {
 func (i *inode) destroy() {
 	i.fs.ws.watchForget(i)
 	i.data.release()
+	i.releaseTmp()
 }
 
 // virtualInoFor derives the inode number of a virtual symlink from its path.
@@ -398,7 +416,9 @@ func virtualInoFor(rel string) uint64 {
 // the host file yet.
 func (fs *filesystem) inodeForLocked(e entry, rel string) *inode {
 	if !e.virtual {
-		if ino, ok := fs.inodes[e.info.id]; ok && ino.kind == e.info.kind {
+		// An unlinked inode never names a file of the host again. The host
+		// can reuse its inode number once nothing holds the file open.
+		if ino, ok := fs.inodes[e.info.id]; ok && ino.kind == e.info.kind && !ino.unlinked.Load() {
 			ino.update(e)
 			return ino
 		}
@@ -417,6 +437,7 @@ func (fs *filesystem) inodeForLocked(e entry, rel string) *inode {
 		fs.inodes[e.info.id] = ino
 	}
 	ino.data.init(ino)
+	ino.initSpecial(e)
 	return ino
 }
 
@@ -576,7 +597,7 @@ func (fs *filesystem) pruneLocked(d *dentry) {
 	for _, c := range d.children {
 		fs.pruneLocked(c)
 	}
-	if d != fs.root && len(d.children) == 0 && d.refs.Load() == 1 {
+	if d != fs.root && len(d.children) == 0 && d.refs.Load() == 1 && !d.inode.pinnedLocked() {
 		fs.detachLocked(d)
 	}
 }
@@ -896,7 +917,9 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		}
 		src := vd.Dentry().Impl().(*dentry)
 		if src.dead {
-			return linuxerr.ENOENT
+			// An unnamed file from O_TMPFILE is the only dead file that can
+			// gain a name.
+			return fs.linkTmpLocked(rp.Credentials(), src, parent, name, rel)
 		}
 		if src.inode.isDir() {
 			return linuxerr.EPERM
@@ -931,21 +954,6 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	})
 }
 
-// MknodAt implements vfs.FilesystemImpl.MknodAt.
-func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
-	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name, rel string) error {
-		if t := opts.Mode.FileType(); t != linux.S_IFREG && t != 0 {
-			return linuxerr.EPERM
-		}
-		uid, gid, _ := newOwner(parent.inode, rp.Credentials())
-		f, _, err := fs.ws.createFile(rel, uint32(opts.Mode)&0o7777, uint32(uid), uint32(gid))
-		if err != nil {
-			return translateHostError(err)
-		}
-		return translateHostError(f.Close())
-	})
-}
-
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt. Symbolic links live in
 // .gvx_meta: the host never receives a link, so no host link can leave the
 // workspace.
@@ -962,7 +970,7 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 // OpenAt implements vfs.FilesystemImpl.OpenAt.
 func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	if opts.Flags&linux.O_TMPFILE != 0 {
-		return nil, linuxerr.EOPNOTSUPP
+		return fs.openTmpfile(ctx, rp, opts)
 	}
 
 	if opts.Flags&linux.O_CREAT == 0 {
@@ -1101,6 +1109,13 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
 			return nil, err
 		}
+		// Linux rejects a write open of a running program. The check covers
+		// O_TRUNC, which AccessTypesForOpenFlags folds into the write access.
+		if ats.MayWrite() {
+			if err := d.inode.checkWritable(); err != nil {
+				return nil, err
+			}
+		}
 	}
 	switch {
 	case d.inode.isRegular():
@@ -1119,6 +1134,9 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, err
 		}
 		return &fd.vfsfd, nil
+	case d.inode.isSpecial():
+		closeCreated()
+		return d.openSpecial(ctx, rp, opts)
 	default:
 		closeCreated()
 		// Symlinks open only with O_PATH, which the VFS layer handles.
@@ -1167,8 +1185,16 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil {
 		return err
 	}
-	if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
-		return linuxerr.EINVAL
+	if err := checkRenameFlags(opts.Flags); err != nil {
+		return err
+	}
+	if opts.Flags&linux.RENAME_WHITEOUT != 0 {
+		// Linux asks for CAP_MKNOD in the initial user namespace, because
+		// the whiteout is a device node.
+		creds := rp.Credentials()
+		if !creds.HasCapabilityIn(linux.CAP_MKNOD, creds.UserNamespace.Root()) {
+			return linuxerr.EPERM
+		}
 	}
 	newName := rp.Component()
 	if newName == "." || newName == ".." {
@@ -1188,6 +1214,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 	defer mnt.EndWrite()
+	if opts.Flags&linux.RENAME_EXCHANGE != 0 {
+		return fs.exchangeAt(ctx, rp, newParent, newName, oldParentVD.Dentry().Impl().(*dentry), oldName, opts)
+	}
 
 	creds := rp.Credentials()
 	oldParent := oldParentVD.Dentry().Impl().(*dentry)
@@ -1261,9 +1290,20 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 	vfsObj.RenameBegin(&handle)
-	if err := fs.ws.rename(oldRel, newRel); err != nil {
+	var replacedLinks uint32
+	if replaced != nil {
+		replacedLinks = fs.specialLinksLocked(replaced)
+	}
+	whiteout := opts.Flags&linux.RENAME_WHITEOUT != 0
+	var renameErr error
+	if whiteout {
+		renameErr = fs.ws.renameWhiteout(oldRel, newRel)
+	} else {
+		renameErr = fs.ws.rename(oldRel, newRel)
+	}
+	if renameErr != nil {
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
-		return translateHostError(err)
+		return translateHostError(renameErr)
 	}
 	// The moved inode, the replaced inode, and both parents change times or
 	// link counts. The old name is gone, and the new name is taken.
@@ -1271,10 +1311,17 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	renamed.inode.invalidateMeta()
 	oldParent.inode.invalidateMeta()
 	newParent.inode.invalidateMeta()
-	oldParent.inode.negAdd(oldName, now)
+	if whiteout {
+		// The whiteout holds the old name now.
+		oldParent.inode.negDel(oldName)
+	} else {
+		oldParent.inode.negAdd(oldName, now)
+	}
 	newParent.inode.negDel(newName)
 	if replaced != nil {
 		replaced.inode.invalidateMeta()
+		replaced.inode.noteReplaced()
+		fs.retireSpecialLocked(replaced.inode, replacedLinks)
 		fs.detachLocked(replaced)
 	}
 	fs.moveLocked(renamed, newParent, newName, newRel)
@@ -1409,9 +1456,15 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
 		return err
 	}
-	if err := fs.ws.unlink(child.relPath); err != nil {
+	links := fs.specialLinksLocked(child)
+	last, err := fs.ws.unlinkLast(child.relPath)
+	if err != nil {
 		vfsObj.AbortDeleteDentry(&child.vfsd)
 		return translateHostError(err)
+	}
+	fs.retireSpecialLocked(child.inode, links)
+	if last {
+		child.inode.noteUnlinked()
 	}
 	// The link count of the shared inode and the times of the parent change.
 	child.inode.invalidateMeta()
@@ -1468,6 +1521,13 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 		}
 		if !d.inode.isRegular() {
 			return linuxerr.EINVAL
+		}
+		if opts.NeedWritePerm {
+			// truncate(2), unlike ftruncate(2), needs write access to the
+			// file and so fails while a process executes it.
+			if err := d.inode.checkWritable(); err != nil {
+				return err
+			}
 		}
 		if err := d.inode.truncate(d, h, int64(stat.Size)); err != nil {
 			return err
@@ -1609,7 +1669,13 @@ func (i *inode) statx(devMinor uint32) linux.Statx {
 func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 	info := e.info
 	nlink := info.nlink
-	if e.isDir() && nlink < 2 {
+	switch {
+	case i.unlinked.Load():
+		// No name reaches the file. Linux and macOS report this through
+		// fstat. A Windows file keeps a link count while a handle stays
+		// open, and a named temporary file keeps its host name.
+		nlink = 0
+	case e.isDir() && nlink < 2:
 		nlink = 2
 	}
 	btime := info.btime
@@ -1620,7 +1686,7 @@ func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 	if blocks == 0 && info.size > 0 {
 		blocks = (uint64(info.size) + 511) / 512
 	}
-	return linux.Statx{
+	st := linux.Statx{
 		Mask:     linux.STATX_BASIC_STATS | linux.STATX_BTIME,
 		Blksize:  4096,
 		Nlink:    nlink,
@@ -1637,52 +1703,20 @@ func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 		DevMajor: 0,
 		DevMinor: devMinor,
 	}
+	st.RdevMajor, st.RdevMinor = unpackRdev(e.attr.Rdev)
+	return st
 }
 
-// StatFSAt implements vfs.FilesystemImpl.StatFSAt.
+// StatFSAt implements vfs.FilesystemImpl.StatFSAt. It reports the capacity of
+// the host volume.
 func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
 	fs.lock()
-	defer fs.unlock(ctx)
-	if _, err := fs.resolveLocked(ctx, rp); err != nil {
+	_, err := fs.resolveLocked(ctx, rp)
+	fs.unlock(ctx)
+	if err != nil {
 		return linux.Statfs{}, err
 	}
-	return defaultStatFS(), nil
-}
-
-// defaultStatFS reports a fixed capacity. The host layer does not expose
-// volume capacity through the pinned handle on every platform.
-func defaultStatFS() linux.Statfs {
-	return linux.Statfs{
-		Type:            0x686f7374, // "host"
-		BlockSize:       4096,
-		FragmentSize:    4096,
-		Blocks:          1024 * 1024,
-		BlocksFree:      512 * 1024,
-		BlocksAvailable: 512 * 1024,
-		Files:           1024 * 1024,
-		FilesFree:       512 * 1024,
-		NameLength:      maxFilenameLen,
-	}
-}
-
-// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
-func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
-	return nil, linuxerr.ENOTSUP
-}
-
-// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
-func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
-	return "", linuxerr.ENOTSUP
-}
-
-// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
-func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
-	return linuxerr.ENOTSUP
-}
-
-// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
-func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
-	return linuxerr.ENOTSUP
+	return fs.statFS()
 }
 
 // GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
@@ -1693,20 +1727,6 @@ func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, 
 // SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.
 func (fs *filesystem) SetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
 	return nil, 0, linuxerr.EOPNOTSUPP
-}
-
-// BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
-func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
-	fs.lock()
-	defer fs.unlock(ctx)
-	d, err := fs.resolveLocked(ctx, rp)
-	if err != nil {
-		return nil, err
-	}
-	if err := d.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
-		return nil, err
-	}
-	return nil, linuxerr.ECONNREFUSED
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.

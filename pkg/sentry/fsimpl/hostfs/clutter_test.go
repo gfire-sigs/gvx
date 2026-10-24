@@ -30,7 +30,7 @@ import (
 // clutterOptions returns the options of a workspace that follows the clutter
 // rules of the host operating system goos.
 func clutterOptions(goos string) workspaceOptions {
-	return workspaceOptions{coalesce: defaultMetaCoalesce, hostOS: goos}
+	return workspaceOptions{coalesce: defaultCoalesceWindow, hostOS: goos}
 }
 
 func newClutterEnv(t *testing.T, goos string) *env {
@@ -439,7 +439,7 @@ func TestMetaSchemaVersionOneStillLoads(t *testing.T) {
 	if err := os.WriteFile(dir+"/"+MetaFileName, []byte(v1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	e, closeEnv := openEnvAt(t, dir, workspaceOptions{coalesce: defaultMetaCoalesce})
+	e, closeEnv := openEnvAt(t, dir, workspaceOptions{coalesce: defaultCoalesceWindow})
 	st := e.mustStat("f")
 	if st.UID != 5 || st.GID != 6 || st.Mode&0o7777 != 0o600 {
 		t.Fatalf("stat of f = uid %d gid %d mode %o, want 5 6 600", st.UID, st.GID, st.Mode&0o7777)
@@ -471,7 +471,7 @@ func TestMetaSchemaVersionTwoKeepsXattrs(t *testing.T) {
 	if err := os.WriteFile(dir+"/"+MetaFileName, []byte(v2), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	e, closeEnv := openEnvAt(t, dir, workspaceOptions{coalesce: defaultMetaCoalesce})
+	e, closeEnv := openEnvAt(t, dir, workspaceOptions{coalesce: defaultCoalesceWindow})
 	entry, err := e.ws.lookup("f")
 	if err != nil {
 		t.Fatal(err)

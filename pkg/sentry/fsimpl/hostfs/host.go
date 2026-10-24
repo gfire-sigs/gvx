@@ -75,6 +75,10 @@ type hostBackend interface {
 	lstatAt(dir hostDirHandle, name string) (hostInfo, error)
 	// openChildAt is open for name inside dir.
 	openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error)
+
+	// hostOps holds the host calls of the extended operations of GVXIP-001
+	// section 4.3. See host_ops.go.
+	hostOps
 }
 
 // hostKind is the file type of a host directory entry.
@@ -91,6 +95,11 @@ const (
 	// hostKindOther is any other host object, such as a device, a socket, or a
 	// junction. hostfs refuses to open these.
 	hostKindOther
+	// hostKindSpecial is a placeholder file that stands for a socket, a FIFO,
+	// or a device node. The host holds an empty regular file, and .gvx_meta
+	// holds the type. Only entryFromInfo produces this kind. The host layer
+	// never reports it.
+	hostKindSpecial
 )
 
 // hostID identifies a host file independent of the path used to reach it.

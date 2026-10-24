@@ -79,7 +79,7 @@ func (fd *dirFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 
 // StatFS implements vfs.FileDescriptionImpl.StatFS.
 func (fd *dirFD) StatFS(ctx context.Context) (linux.Statfs, error) {
-	return defaultStatFS(), nil
+	return fd.dentry.fs.statFS()
 }
 
 func direntType(kind hostKind) uint8 {
@@ -91,6 +91,22 @@ func direntType(kind hostKind) uint8 {
 	default:
 		return linux.DT_REG
 	}
+}
+
+// direntTypeOf returns the dirent type of a listing entry. A placeholder
+// reports the type that its .gvx_meta record names.
+func direntTypeOf(l dirListing) uint8 {
+	switch l.special {
+	case linux.S_IFSOCK:
+		return linux.DT_SOCK
+	case linux.S_IFIFO:
+		return linux.DT_FIFO
+	case linux.S_IFCHR:
+		return linux.DT_CHR
+	case linux.S_IFBLK:
+		return linux.DT_BLK
+	}
+	return direntType(l.kind)
 }
 
 // loadLocked lists the directory into fd.snapshot. The entries "." and ".."
@@ -137,7 +153,7 @@ func (fd *dirFD) loadLocked() error {
 			}
 			ino = e.info.id.ino
 		}
-		snap = append(snap, vfs.Dirent{Name: c.name, Type: direntType(c.kind), Ino: ino})
+		snap = append(snap, vfs.Dirent{Name: c.name, Type: direntTypeOf(c), Ino: ino})
 	}
 	for i := range snap {
 		snap[i].NextOff = int64(i + 1)
@@ -190,10 +206,15 @@ func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, e
 	return newOff, nil
 }
 
-// Sync implements vfs.FileDescriptionImpl.Sync.
+// Sync implements vfs.FileDescriptionImpl.Sync. It bypasses the coalesce
+// window of the metadata table. It flushes the directory, the entry of the
+// directory in its parent, the mapped pages of the filesystem, and .gvx_meta.
 func (fd *dirFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 	var errs []error
 	if err := fd.dentry.fs.ws.syncDir(fd.dentry.path()); err != nil {
+		errs = append(errs, err)
+	}
+	if err := fd.dentry.syncParentDir(); err != nil {
 		errs = append(errs, err)
 	}
 	if err := fd.dentry.fs.Sync(ctx); err != nil {

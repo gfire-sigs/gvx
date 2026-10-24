@@ -60,9 +60,11 @@ const (
 	metaVersion   = 2
 	metaVersionV1 = 1
 
-	// defaultMetaCoalesce is the delay between the first unflushed mutation
-	// and the background flush. Later mutations in the window share one flush.
-	defaultMetaCoalesce = 50 * time.Millisecond
+	// defaultCoalesceWindow is the delay between the first unflushed
+	// metadata mutation and the background flush. Later mutations in the
+	// window share one flush. Sync bypasses the window. See section 6 of
+	// GVXIP-001.
+	defaultCoalesceWindow = 250 * time.Millisecond
 
 	// maxFilenameLen is the longest name hostfs reports. It matches the
 	// NAME_MAX of Linux, APFS, and NTFS.
@@ -107,7 +109,10 @@ var (
 //
 // Atime, Mtime, and Ctime hold Unix nanoseconds. They apply to virtual
 // symlinks only, which have no host file to carry timestamps. Xattrs holds the
-// extended attributes that the host cannot store.
+// extended attributes that the host cannot store. A record whose Mode names a
+// socket, a FIFO, or a device stands for an empty placeholder file on the
+// host. Rdev holds the device number of a device record: the major number in
+// the high 32 bits and the minor number in the low 32 bits.
 type POSIXAttr struct {
 	Mode    uint32            `json:"mode"`
 	UID     uint32            `json:"uid"`
@@ -117,6 +122,7 @@ type POSIXAttr struct {
 	Atime   int64             `json:"atime,omitempty"`
 	Mtime   int64             `json:"mtime,omitempty"`
 	Ctime   int64             `json:"ctime,omitempty"`
+	Rdev    uint64            `json:"rdev,omitempty"`
 }
 
 type metaStoreFile struct {
@@ -236,6 +242,8 @@ type Workspace struct {
 	// records against the host. mu protects them.
 	pruneKeys   []string
 	pruneCursor int
+	// maxMeta is the most entries that meta may hold. See checkMetaRoomLocked.
+	maxMeta int
 }
 
 type workspaceOptions struct {
@@ -251,6 +259,9 @@ type workspaceOptions struct {
 	caps *WorkspaceCaps
 	// hostOS replaces runtime.GOOS where hostfs picks the host clutter rules.
 	hostOS string
+	// maxMeta replaces the limit of .gvx_meta entries. Tests use it to reach
+	// the limit with few files.
+	maxMeta int
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files. A platform
@@ -284,7 +295,7 @@ func (w *Workspace) chunkMemory() ChunkMemory {
 // OpenWorkspace opens hostPath via os.OpenRoot prior to hostlockdown.Apply()
 // and loads any persisted .gvx_meta table.
 func OpenWorkspace(hostPath string, readOnly bool) (*Workspace, error) {
-	return openWorkspace(hostPath, readOnly, workspaceOptions{coalesce: defaultMetaCoalesce})
+	return openWorkspace(hostPath, readOnly, workspaceOptions{coalesce: defaultCoalesceWindow})
 }
 
 func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Workspace, error) {
@@ -336,6 +347,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		codec:            newNameCodec(caps),
 		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
 		clutter:          clutterRulesFor(hostOS),
+		maxMeta:          metaLimit(opts.maxMeta),
 	}
 	if caps.LocksOpenDirMove {
 		w.handles = newWinHandleRegistry(workspaceHandleOps{w})
@@ -790,7 +802,11 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 		typ = linux.S_IFREG
 	}
 	if m, ok := w.meta[rel]; ok {
-		return POSIXAttr{Mode: typ | m.Mode&0o7777, UID: m.UID, GID: m.GID, Xattrs: m.Xattrs}
+		a := POSIXAttr{Mode: typ | m.Mode&0o7777, UID: m.UID, GID: m.GID, Xattrs: m.Xattrs}
+		if st := placeholderType(info, m); st != 0 {
+			a.Mode, a.Rdev = st|m.Mode&0o7777, m.Rdev
+		}
+		return a
 	}
 	return POSIXAttr{Mode: typ | defaultPerm(info)}
 }
@@ -851,7 +867,11 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 func (w *Workspace) entryFromInfo(rel string, info hostInfo) (entry, error) {
 	switch info.kind {
 	case hostKindDir, hostKindRegular:
-		return entry{attr: w.effectiveAttr(rel, info), info: info}, nil
+		attr := w.effectiveAttr(rel, info)
+		if specialFileType(attr.Mode) != 0 {
+			info.kind, info.size, info.blocks = hostKindSpecial, 0, 0
+		}
+		return entry{attr: attr, info: info}, nil
 	case hostKindSymlink:
 		hostRel, err := w.hostPath(rel)
 		if err != nil {
@@ -1051,6 +1071,9 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 	if rel == "." {
 		return nil, entry{}, errIsDir
 	}
+	if err := w.checkMetaRoomLocked(rel); err != nil {
+		return nil, entry{}, err
+	}
 	hostRel, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return nil, entry{}, err
@@ -1160,6 +1183,9 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if rel == "." {
 		return fs.ErrExist
 	}
+	if err := w.checkMetaRoomLocked(rel); err != nil {
+		return err
+	}
 	hostRel, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return err
@@ -1244,6 +1270,9 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 	if gid != nil {
 		cur.GID = *gid
 	}
+	if err := w.checkMetaRoomLocked(rel); err != nil {
+		return err
+	}
 	w.meta[rel] = cur
 	if e.info.nlink > 1 && !e.isDir() {
 		if err := w.propagateLinkAttrLocked(rel, e.info.id, cur); err != nil {
@@ -1279,8 +1308,10 @@ func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAt
 	return nil
 }
 
-// Symlink records an intra-workspace symbolic link in .gvx_meta after
-// validating that target does not escape the workspace root.
+// Symlink records a guest symbolic link in .gvx_meta. The host never receives
+// a link. The target may be absolute or climb above the workspace, because the
+// Sentry VFS resolves it in the guest namespace. Only an empty target and a
+// target with a NUL byte fail.
 func (w *Workspace) Symlink(target, linkRelPath string) error {
 	cleanLink, err := CleanRelativePath(linkRelPath)
 	if err != nil {
@@ -1290,7 +1321,7 @@ func (w *Workspace) Symlink(target, linkRelPath string) error {
 }
 
 func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
-	if err := validateSymlinkTarget(rel, target); err != nil {
+	if err := validateGuestSymlinkTarget(target); err != nil {
 		return err
 	}
 	w.mu.Lock()
@@ -1302,6 +1333,9 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 		return fs.ErrExist
 	}
 	if err := w.checkParentDirLocked(rel); err != nil {
+		return err
+	}
+	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return err
 	}
 	if _, _, err := w.createTargetLocked(rel); err != nil {
@@ -1386,6 +1420,11 @@ func (w *Workspace) Rename(oldRel, newRel string) error {
 func (w *Workspace) rename(oldRel, newRel string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.renameLocked(oldRel, newRel)
+}
+
+// renameLocked is rename for a caller that holds w.mu for writing.
+func (w *Workspace) renameLocked(oldRel, newRel string) error {
 	if err := w.checkWritableLocked(oldRel, newRel); err != nil {
 		return err
 	}
@@ -1568,6 +1607,9 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	if err != nil {
 		return err
 	}
+	if err := w.checkMetaRoomLocked(newRel); err != nil {
+		return err
+	}
 	dstPath, leaf, err := w.createTargetLocked(newRel)
 	if err != nil {
 		return err
@@ -1594,29 +1636,38 @@ func (w *Workspace) Unlink(relPath string) error {
 }
 
 func (w *Workspace) unlink(rel string) error {
+	_, err := w.unlinkLast(rel)
+	return err
+}
+
+// unlinkLast is unlink that also reports whether the call removed the last
+// name of the file. A file with another hard link, and a virtual symbolic
+// link, report false.
+func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkWritableLocked(rel); err != nil {
-		return err
+		return false, err
 	}
 	if rel == "." {
-		return errIsDir
+		return false, errIsDir
 	}
 	e, err := w.lookupLocked(rel)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if e.isDir() {
-		return errIsDir
+		return false, errIsDir
 	}
 	if !e.virtual {
 		hostRel, err := w.hostPath(rel)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if err := w.host.unlink(hostRel); err != nil {
-			return err
+			return false, err
 		}
+		last = e.info.nlink <= 1
 		w.handles.detach(rel)
 		parent, name := splitParent(rel)
 		w.removeDirNameLocked(parent, name, leafOf(hostRel))
@@ -1624,7 +1675,7 @@ func (w *Workspace) unlink(rel string) error {
 	}
 	delete(w.meta, rel)
 	w.markDirtyLocked()
-	return nil
+	return last, nil
 }
 
 // Rmdir removes an empty directory at relPath inside the pinned workspace.
@@ -1747,6 +1798,8 @@ type dirListing struct {
 	virtual bool
 	// leaf is the stored host name. It is empty for a virtual symlink.
 	leaf string
+	// special is the file type of a socket, FIFO, or device record, or zero.
+	special uint32
 }
 
 // listDir returns the visible children of the directory at rel, host entries
@@ -1781,6 +1834,12 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 			continue
 		}
 		if e.kind == hostKindOther || w.hiddenByName(e.name) {
+			// An internal file has no owner while the guest sees an empty
+			// directory, so the removal of the directory unlinks it. A guest
+			// that holds an unnamed temporary file open keeps its inode.
+			if e.kind == hostKindRegular && isEphemeralName(e.name) {
+				clutter = append(clutter, e.name)
+			}
 			continue
 		}
 		if w.clutter.candidate(e.name) {
@@ -1815,7 +1874,11 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 		if guest != e.name {
 			w.setAlt(rel, guest, e.name)
 		}
-		byName[guest] = dirListing{name: guest, kind: e.kind, ino: e.ino, leaf: e.name}
+		l := dirListing{name: guest, kind: e.kind, ino: e.ino, leaf: e.name}
+		if e.kind == hostKindRegular {
+			l.special = specialFileType(w.meta[joinRelPath(rel, guest)].Mode)
+		}
+		byName[guest] = l
 	}
 	prefix := rel + "/"
 	if rel == "." {

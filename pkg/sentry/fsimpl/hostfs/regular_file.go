@@ -48,6 +48,9 @@ type regularFD struct {
 	// mu protects off.
 	mu  sync.Mutex
 	off int64
+	// dirSynced is set once a write through a synchronous description made
+	// the directory entry durable. See durability.go.
+	dirSynced atomic.Bool
 }
 
 // openHost opens the host file of d. It passes the entry that the lookup
@@ -56,6 +59,11 @@ type regularFD struct {
 // forgets the cached entry and resolves the path again, which gives the exact
 // error.
 func (d *dentry) openHost(flags int) (*hostHandle, error) {
+	if d.inode.unlinked.Load() {
+		if t := d.tmpOf(); t != nil {
+			return d.fs.ws.openTmp(t, flags)
+		}
+	}
 	rel := d.path()
 	h, err := d.fs.ws.openHandleWithAttr(rel, d.inode.snapshot(), flags)
 	if err == nil {
@@ -153,7 +161,7 @@ func (fd *regularFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error
 
 // StatFS implements vfs.FileDescriptionImpl.StatFS.
 func (fd *regularFD) StatFS(ctx context.Context) (linux.Statfs, error) {
-	return defaultStatFS(), nil
+	return fd.dentry.fs.statFS()
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -302,16 +310,6 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 	if err != nil {
 		return n, offset + n, translateHostError(err)
 	}
-	if n > 0 && fd.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 {
-		// Without a durable write the call cannot honour O_SYNC, so it reports
-		// no progress, as Linux does for a failed generic_write_sync.
-		if err := ino.data.flushRange(uint64(offset), uint64(offset+n)); err != nil {
-			return 0, offset, translateHostError(err)
-		}
-		if err := fd.h.sync(); err != nil {
-			return 0, offset, translateHostError(err)
-		}
-	}
 	// As with Linux, writing clears the set-user-ID and set-group-ID bits.
 	if n > 0 {
 		if mode := uint32(ino.mode()); vfs.ClearSUIDAndSGID(mode) != mode {
@@ -320,6 +318,14 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 				return 0, offset, err
 			}
 			_ = d.refresh()
+		}
+	}
+	if n > 0 && fd.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 {
+		// The write bypasses the coalesce window of the metadata table.
+		// Without a durable write the call cannot honour O_SYNC, so it reports
+		// no progress, as Linux does for a failed generic_write_sync.
+		if err := fd.syncWrite(offset, offset+n); err != nil {
+			return 0, offset, translateHostError(err)
 		}
 	}
 	return n, offset + n, nil
@@ -373,24 +379,19 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 	return newOff, nil
 }
 
-// Sync implements vfs.FileDescriptionImpl.Sync. It reports every failure of
-// the write-back, the host flush, and the metadata flush.
+// Sync implements vfs.FileDescriptionImpl.Sync. Both fsync and fdatasync
+// bypass the coalesce window of the metadata table. They flush the mapped
+// pages, the host file, the directory entry, and .gvx_meta, and they report
+// every failure. See durability.go.
 func (fd *regularFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
-	var errs []error
-	if err := fd.dentry.inode.data.syncData(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := fd.h.sync(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := fd.dentry.fs.ws.Sync(); err != nil {
-		errs = append(errs, err)
-	}
-	return translateHostError(errors.Join(errs...))
+	return translateHostError(fd.persist(true))
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *regularFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
+	if err := fd.dentry.inode.checkMapping(opts); err != nil {
+		return err
+	}
 	writable := fd.vfsfd.IsWritable() && fd.vfsfd.IsReadable()
 	if err := fd.dentry.inode.data.attachHandle(fd.h, writable); err != nil {
 		return translateHostError(err)

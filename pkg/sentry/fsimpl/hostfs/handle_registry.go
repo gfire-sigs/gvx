@@ -301,11 +301,21 @@ func (o workspaceHandleOps) closeFile(f *os.File) error {
 }
 
 // reopen opens rel from the pinned workspace root with the original access
-// mode. The host open uses the same share flags as every other open.
+// mode. The host open uses the same share flags as every other open. The last
+// component of an unnamed temporary file is a host name already, so it skips
+// the name codec. The codec would escape the "~gvx~" prefix of the name.
 func (o workspaceHandleOps) reopen(rel string, flags int) (*os.File, error) {
-	hostRel, err := o.w.hostPath(rel)
+	parent, leaf := splitParent(rel)
+	if !isEphemeralName(leaf) {
+		hostRel, err := o.w.hostPath(rel)
+		if err != nil {
+			return nil, err
+		}
+		return o.w.host.open(hostRel, flags&accessModeMask, 0)
+	}
+	hostDir, err := o.w.hostPath(parent)
 	if err != nil {
 		return nil, err
 	}
-	return o.w.host.open(hostRel, flags&accessModeMask, 0)
+	return o.w.host.open(hostChild(hostDir, leaf), flags&accessModeMask, 0)
 }

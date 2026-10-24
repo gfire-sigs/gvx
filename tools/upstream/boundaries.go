@@ -226,7 +226,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/refs", "vfs.DentryImpl reference counting uses refs.RefCounter"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "golang.org/x/text/unicode/norm", "APFS stores names in NFD, so the guest view of a name needs NFC conversion (GVXIP-001 section 2.2)"},
 	{[]string{"pkg/sentry/fsimpl/ext4lite"}, "pkg/errors", "toLinuxErr finds the *errors.Error values that the engine returns"},
-	{[]string{"pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/kernel/pipe", "mknod FIFO files open through the VFS pipe implementation"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/kernel/pipe", "mknod FIFO files open through the VFS pipe implementation"},
 	{[]string{"pkg/sentry/platform/systrap"}, "golang.org/x/sys/*", "host memory and subprocess APIs on Windows and macOS (SPEC section 3.3)"},
 	{[]string{"pkg/sentry/kernel"}, "pkg/hostarch", "addrhole_xplat.go lists the address holes of a platform as hostarch.AddrRange values"},
 
@@ -272,6 +272,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/hostlockdown"}, "pkg/seccomp", "tests install a small seccomp program through Options.InstallSyscallFilter"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/hostlockdown", "a test proves that the stub keeps working after hostlockdown.Apply"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/hostlockdown", "a test proves that the host watcher keeps working after hostlockdown.Apply"},
+	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/waiter", "a FIFO test blocks inside the VFS through a context.Context.BlockOn method"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "a test pins that the vDSO image that the Sentry maps never names x18"},
 }
 

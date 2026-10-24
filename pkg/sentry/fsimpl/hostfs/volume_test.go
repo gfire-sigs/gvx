@@ -343,7 +343,7 @@ func (v *volumeHost) openChildAt(dir hostDirHandle, name string, flags int, perm
 // volumeOptions builds the options of a workspace on a modeled volume.
 func volumeOptions(caps WorkspaceCaps, fold, verified, win bool) workspaceOptions {
 	return workspaceOptions{
-		coalesce: defaultMetaCoalesce,
+		coalesce: defaultCoalesceWindow,
 		caps:     &caps,
 		wrapHost: func(b hostBackend) hostBackend { return newVolumeHost(b, fold, verified, win) },
 	}

@@ -306,7 +306,7 @@ func TestMetaOfEscapedEntriesSurvivesReopenAndPruning(t *testing.T) {
 func TestNormalizedHostNamesShowAsNFC(t *testing.T) {
 	for _, caps := range []WorkspaceCaps{apfsCSCaps, macCaps} {
 		t.Run(fmt.Sprintf("fold=%v", !caps.CaseSensitive), func(t *testing.T) {
-			e := newEnvOpts(t, workspaceOptions{coalesce: defaultMetaCoalesce, caps: &caps})
+			e := newEnvOpts(t, workspaceOptions{coalesce: defaultCoalesceWindow, caps: &caps})
 			nfd, nfc := "cafe\u0301.txt", "caf\u00e9.txt"
 			if err := os.WriteFile(e.host(nfd), []byte("host"), 0o600); err != nil {
 				t.Fatal(err)

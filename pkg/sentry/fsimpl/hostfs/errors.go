@@ -47,6 +47,8 @@ func translateHostError(err error) error {
 		return linuxerr.ENAMETOOLONG
 	case errors.Is(err, errHostUnsupported):
 		return linuxerr.EOPNOTSUPP
+	case errors.Is(err, errMetaFull):
+		return linuxerr.ENOSPC
 	case errors.Is(err, os.ErrClosed):
 		return linuxerr.EIO
 	}
