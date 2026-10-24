@@ -55,6 +55,20 @@ type workspaceGrant struct {
 	logon    *windows.SID
 	mask     windows.ACCESS_MASK
 	readOnly bool
+	// noInherit makes the entry of a directory apply to that directory only.
+	noInherit bool
+}
+
+// grantParentTraverse lets the restricted token open the file mount through
+// the pinned parent directory. The token has no SeChangeNotifyPrivilege, so
+// the system checks the traverse right on the directory that holds the file.
+// The logon SID gets FILE_TRAVERSE on that directory only, with no
+// inheritance. It gets no list right, no right to add a file, and no right on
+// any sibling, so the sibling files, the listing, and a new file next to the
+// mount stay closed. The label of the directory stays as it is.
+func grantParentTraverse(dir string, logon *windows.SID) error {
+	g := workspaceGrant{logon: logon, mask: windows.FILE_TRAVERSE, readOnly: true, noInherit: true}
+	return g.apply(dir, true)
 }
 
 // prepareWorkspace applies step 1. For a writable workspace it labels every
@@ -81,7 +95,10 @@ func prepareWorkspace(path string, logon *windows.SID, readOnly, isFile bool) er
 	}
 	grant := workspaceGrant{logon: logon, mask: workspaceAccessMask(readOnly), readOnly: readOnly}
 	if isFile {
-		return grant.apply(root, false)
+		if err := grant.apply(root, false); err != nil {
+			return err
+		}
+		return grantParentTraverse(filepath.Dir(root), logon)
 	}
 	if err := grant.apply(root, true); err != nil {
 		return err
@@ -176,7 +193,7 @@ func (g workspaceGrant) read(path string, isDir bool) (objectState, error) {
 // would only pile up in the workspace ACLs.
 func (g workspaceGrant) addLogonACE(path string, isDir bool, current *windows.ACL) error {
 	inherit := uint32(windows.NO_INHERITANCE)
-	if isDir {
+	if isDir && !g.noInherit {
 		inherit = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 	}
 	// TrusteeValue holds a raw SID address, so the SIDs stay pinned until the
