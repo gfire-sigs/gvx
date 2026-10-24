@@ -459,7 +459,13 @@ func TestProcessLauncherDeathBeforeBootstrap(t *testing.T) {
 func testBlockedProcessBootstrap(t *testing.T, killLauncher bool) {
 	t.Helper()
 	f := newProcessFixture(t)
+	// The launcher-death case needs time to reach the kill on a loaded runner
+	// before the bootstrap deadline ends the launcher by itself. The child
+	// still exits long before the 15 second wait of awaitProcessExit.
 	f.timeout = 2 * time.Second
+	if killLauncher {
+		f.timeout = 6 * time.Second
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	writer := fullProcessBootstrapPipe(t)
@@ -506,6 +512,7 @@ func awaitReadyProcessRecord(t *testing.T, ctx context.Context, bundle string) s
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	path := filepath.Join(bundle, ".gvx-shim", "state.json")
+	var lastErr error
 	for {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -517,12 +524,14 @@ func awaitReadyProcessRecord(t *testing.T, ctx context.Context, bundle string) s
 				return record
 			}
 		} else if !os.IsNotExist(err) {
-			t.Fatalf("observe startup state: %v", err)
+			// Windows refuses a read while the shim replaces the file, so a
+			// read error only counts when the deadline ends the wait.
+			lastErr = err
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			t.Fatalf("no ready child while launcher output was blocked: %v", ctx.Err())
+			t.Fatalf("no ready child while launcher output was blocked: %v (last read error: %v)", ctx.Err(), lastErr)
 		}
 	}
 }

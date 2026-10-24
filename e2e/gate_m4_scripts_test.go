@@ -164,6 +164,7 @@ git config --global user.email gvx@example.test
 git config --global user.name "gvx e2e"
 git config --global init.defaultBranch main
 git config --global gc.auto 0
+git config --global maintenance.auto false
 
 git init -q repo
 cd repo
@@ -200,7 +201,7 @@ i=0
 mkdir -p tree
 while [ $i -lt 2100 ]; do
   d=tree/d$((i % 40))
-  mkdir -p "$d"
+  [ $i -lt 40 ] && mkdir -p "$d"
   echo "file $i" > "$d/f$i.txt"
   i=$((i + 1))
 done
