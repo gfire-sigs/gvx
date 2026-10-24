@@ -228,6 +228,14 @@ func TestCrashRecoveryDatabaseWorkload(t *testing.T) {
 	db := e.mustOpen("app.db", linux.O_CREAT|linux.O_RDWR)
 	wal := e.mustOpen("app.db-wal", linux.O_CREAT|linux.O_RDWR)
 	rollback := e.mustOpen("app.db-journal", linux.O_CREAT|linux.O_RDWR)
+	// The descriptors outlive the crash clone. The deferred release also runs
+	// when the test ends early, so the volume closes and Windows can delete
+	// the image.
+	defer func() {
+		for _, fd := range []*vfs.FileDescription{db, wal, rollback} {
+			fd.DecRef(e.ctx)
+		}
+	}()
 	e.write(rollback, pattern(9, 100000))
 	if err := e.unlink("app.db-journal"); err != nil {
 		t.Fatal(err)
@@ -293,9 +301,4 @@ func TestCrashRecoveryDatabaseWorkload(t *testing.T) {
 	}
 	r.unmount()
 	runE2fsck(t, clone)
-
-	// The original volume still works: close the handles that the crash left.
-	for _, fd := range []*vfs.FileDescription{db, wal, rollback} {
-		fd.DecRef(e.ctx)
-	}
 }
