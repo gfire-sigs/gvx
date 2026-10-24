@@ -404,6 +404,7 @@ func (fd *regularFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) e
 	if err := vfs.GenericConfigureMMap(&fd.vfsfd, &fd.dentry.inode.data, opts); err != nil {
 		return err
 	}
+	fd.dentry.inode.data.reserveHandle(fd.h, writable)
 	opts.SentryOwnedContent = true
 	return nil
 }
@@ -541,7 +542,11 @@ type fileData struct {
 	mh           *hostHandle
 	mhWritable   bool
 	writableMaps int
-	wbErr        error
+	// pending is the handle that ConfigureMMap reserved for the next
+	// AddMapping. See reserveHandle.
+	pending         *hostHandle
+	pendingWritable bool
+	wbErr           error
 
 	mf dataMemmapFile
 }
@@ -556,6 +561,11 @@ func (c *fileData) init(ino *inode) {
 func (c *fileData) attachHandle(h *hostHandle, writable bool) error {
 	c.dataMu.Lock()
 	defer c.dataMu.Unlock()
+	return c.attachLocked(h, writable)
+}
+
+// attachLocked is attachHandle for a caller that holds dataMu.
+func (c *fileData) attachLocked(h *hostHandle, writable bool) error {
 	if c.mh != nil && (c.mhWritable || !writable) {
 		return nil
 	}
@@ -579,6 +589,38 @@ func (c *fileData) attachHandle(h *hostHandle, writable bool) error {
 	return nil
 }
 
+// reserveHandle keeps h for the AddMapping call that follows ConfigureMMap.
+// The reservation stays until AddMapping takes it, or until the inode dies
+// when the mmap fails between the two calls. It keeps the handle that can write
+// back, because one AddMapping serves whichever mapping came first.
+func (c *fileData) reserveHandle(h *hostHandle, writable bool) {
+	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
+	if c.pending != nil {
+		if c.pendingWritable || !writable {
+			return
+		}
+		_ = c.pending.decRef()
+	}
+	h.incRef()
+	c.pending = h
+	c.pendingWritable = writable
+}
+
+// restoreHandleLocked attaches the reserved handle when no handle is attached.
+func (c *fileData) restoreHandleLocked() error {
+	p := c.pending
+	if p == nil {
+		return nil
+	}
+	writable := c.pendingWritable
+	c.pending = nil
+	c.pendingWritable = false
+	err := c.attachLocked(p, writable)
+	_ = p.decRef()
+	return err
+}
+
 // release drops the cache when the inode dies.
 func (c *fileData) release() {
 	_ = c.syncData()
@@ -587,6 +629,11 @@ func (c *fileData) release() {
 	c.dataMu.Lock()
 	defer c.dataMu.Unlock()
 	c.dropLocked()
+	if c.pending != nil {
+		_ = c.pending.decRef()
+		c.pending = nil
+		c.pendingWritable = false
+	}
 }
 
 // dropLocked frees every chunk and the attached handle.
@@ -810,11 +857,17 @@ func (c *fileData) chunkLocked(idx uint64) (*cacheChunk, error) {
 func (c *fileData) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
 	c.mapsMu.Lock()
 	defer c.mapsMu.Unlock()
+	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
+	// A RemoveMapping on another thread can drop the handle between the
+	// ConfigureMMap of this mapping and this call. The reserved handle comes
+	// back here, under the lock that RemoveMapping also takes.
+	if err := c.restoreHandleLocked(); err != nil {
+		return translateHostError(err)
+	}
 	c.mappings.AddMapping(ms, ar, offset, writable)
 	if writable {
-		c.dataMu.Lock()
 		c.writableMaps++
-		c.dataMu.Unlock()
 	}
 	return nil
 }

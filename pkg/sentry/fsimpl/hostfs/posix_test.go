@@ -807,6 +807,48 @@ func (e *env) mapFile(fd *vfs.FileDescription, length uint64, writable bool) (me
 	return opts.Mappable, ms, ar
 }
 
+// TestMappingSurvivesTheLastUnmapOfAnotherThread replays the interleaving that
+// made git pack-objects die of SIGBUS. Thread B configures a mapping of a file
+// that thread A has mapped. Thread A unmaps its mapping, which was the last
+// one, before thread B adds its mapping. The page fault of B must still find a
+// handle.
+func TestMappingSurvivesTheLastUnmapOfAnotherThread(t *testing.T) {
+	forEachChunkMode(t, func(t *testing.T, e *env) {
+		e.writeFile("loose", []byte("twenty-six bytes of data."))
+		fd := e.mustOpen("loose", linux.O_RDONLY)
+		defer fd.DecRef(e.ctx)
+		const length = hostarch.PageSize
+
+		first, msA, arA := e.mapFile(fd, length, false)
+
+		optsB := &memmap.MMapOpts{Length: length, Perms: hostarch.Read, MaxPerms: hostarch.Read, Private: true}
+		if err := fd.ConfigureMMap(e.ctx, optsB); err != nil {
+			t.Fatalf("ConfigureMMap B: %v", err)
+		}
+		first.RemoveMapping(e.ctx, msA, arA, 0, false)
+		msB := &recordingSpace{}
+		arB := hostarch.AddrRange{Start: 0x30000, End: 0x30000 + length}
+		if err := optsB.Mappable.AddMapping(e.ctx, msB, arB, 0, false); err != nil {
+			t.Fatalf("AddMapping B: %v", err)
+		}
+		required := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+		ts, err := optsB.Mappable.Translate(e.ctx, required, required, hostarch.Read)
+		if err != nil || len(ts) == 0 {
+			t.Fatalf("Translate after the other mapping ended = (%v, %v), want a translation", ts, err)
+		}
+
+		// The last unmap releases every handle again.
+		optsB.Mappable.RemoveMapping(e.ctx, msB, arB, 0, false)
+		data := &fd.Impl().(*regularFD).dentry.inode.data
+		data.dataMu.Lock()
+		held := data.mh != nil || data.pending != nil
+		data.dataMu.Unlock()
+		if held {
+			t.Fatalf("the file data still holds a handle after the last unmap")
+		}
+	})
+}
+
 func TestMappedPagesWriteBackAndStayCoherent(t *testing.T) {
 	forEachChunkMode(t, testMappedPagesWriteBackAndStayCoherent)
 }

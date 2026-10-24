@@ -528,6 +528,8 @@ A lookup result stays valid for 1 second without a host call. A positive result 
 
 A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware backends and the macOS `systrap` engine map a guest page by host pointer, so `hostfs` keeps each chunk on the Go heap. The upstream Linux `systrap` platform runs guest code in stub processes and maps a guest page by the descriptor of a memory file. On Linux, `pkg/gvx` therefore passes the kernel memory file to `Workspace.SetChunkMemory`, and `hostfs` allocates each chunk there. `hostfs` invalidates the mappings of a truncated file before it drops its reference to a chunk.
 
+The mapped pages of a file read through one host handle. The last `munmap` of a file releases that handle. A second thread can configure a new mapping of the same file before the first thread unmaps. `ConfigureMMap` therefore reserves its handle, and `AddMapping` attaches the reserved handle again when the unmap released the first one. Without the reservation, a page fault of the new mapping ends in `SIGBUS`, which `git gc` hit in `pack-objects`.
+
 A `pread` writes back only the dirty chunks that overlap its byte range. It reads from the host file straight into the destination blocks of the caller, with one allocation for each call. A file with no guest mapping skips the write-back without a lock.
 
 #### Name Translation and Host Clutter (Descriptive Module)
