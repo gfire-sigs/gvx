@@ -326,7 +326,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	}
 	var host hostBackend = backend
 	if single != "" {
-		host = &singleHost{hostBackend: host, name: single}
+		host = &singleHost{hostBackend: host, bound: backend, name: single}
 	}
 	if opts.wrapHost != nil {
 		host = opts.wrapHost(host)

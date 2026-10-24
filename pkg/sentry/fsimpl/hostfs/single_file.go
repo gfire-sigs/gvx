@@ -50,13 +50,18 @@ import (
 // through unchanged. Workspace refuses every path other than ".".
 type singleHost struct {
 	hostBackend
+	// bound is the same backend as hostBackend. It stats the bound file without
+	// a query that needs a list right on the parent directory.
+	bound interface {
+		lstatBound(name string) (hostInfo, error)
+	}
 	// name is the host name of the file inside the pinned parent directory.
 	name string
 }
 
 func (s *singleHost) lstat(rel string) (hostInfo, error) {
 	if rel == "." {
-		return s.hostBackend.lstat(s.name)
+		return s.bound.lstatBound(s.name)
 	}
 	return s.hostBackend.lstat(rel)
 }
