@@ -101,7 +101,7 @@ A bind mount shows a host directory in the guest. A named volume is one image fi
 
 The image holds an ext4 file system that the `ext4lite` driver reads and writes. The image grows in steps of 16MiB, up to 64GiB. A clean exit returns the unused tail to the host. One sandbox at a time can use a volume, because the driver locks the image file. A second sandbox on the same volume fails at start. A read-only mount of a volume opens the image read-only and fails when the last run did not end cleanly.
 
-The guest sees only the files that it wrote. The host sees one file. After a crash or a kill, the next run repairs the image: it keeps every file that the guest synced, and it frees the files and blocks that no directory names. `e2fsck -fn` accepts a clean image, and `mount -o loop -t ext4` mounts it on Linux.
+The guest sees only the files that it wrote. The host sees one file. After a crash or a kill, the next run repairs the image. It keeps every file that the guest synced, and it frees the files and blocks that no directory names. `e2fsck -fn` accepts a clean image, and `mount -o loop -t ext4` mounts it on Linux.
 
 A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
 
@@ -111,11 +111,13 @@ The guest path of a mount is absolute and clean. It is not `/`. It is not `/proc
 
 The tmpfs options are `size`, `ro`, and `rw`. The option `size` takes a number with a binary unit. Any other tmpfs option stops the run with an error that names it.
 
+A volume with the `ext4lite` driver needs no lockdown rule for a host path. The sandbox opens the image file before the lockdown, and the guest reaches it only through that open file.
+
 | Host OS | What the lockdown does with a mount |
 | :--- | :--- |
 | macOS | The Seatbelt profile gets a read rule, and a write rule for a writable mount, for the path and for its resolved path. |
 | Windows | The lockdown writes a Low integrity label on each object of a writable mount. It grants the logon session read and execute access, and write access for a writable mount. |
-| Linux | The seccomp filter allows opens through a directory descriptor when a mount exists. |
+| Linux | The seccomp filter allows opens through a directory descriptor when a bind mount or a `hostfs` volume exists. |
 
 > [!WARNING]
 > On Windows, a bind mount changes the security descriptors of the host directory. Mount only a directory that the guest may change.

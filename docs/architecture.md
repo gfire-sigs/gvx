@@ -558,7 +558,7 @@ A clean unmount returns unused space to the host. It moves the blocks of the tra
 
 #### Crash Safety (Descriptive Module)
 
-The volume has no journal. A flush writes the extent leaf blocks and the xattr blocks first. It then writes the inode table blocks, the directory blocks, the bitmaps, the group descriptors, and the superblock, and it ends with `fsync` of the host file. Every data write goes straight to the host file. `fsync`, `fdatasync`, `sync`, and a write on an `O_SYNC` or `O_DSYNC` descriptor run this flush. A background flush runs every 5 seconds, so a guest that never syncs loses at most the last 5 seconds.
+The volume has no journal. A flush writes the extent leaf blocks and the xattr blocks first. It then writes the inode table blocks and the directory blocks. Then it writes the bitmaps, the group descriptors, and the superblock, and it ends with `fsync` of the host file. Every data write goes straight to the host file. `fsync`, `fdatasync`, `sync`, and a write on an `O_SYNC` or `O_DSYNC` descriptor run this flush. A background flush runs every 5 seconds, so a guest that never syncs loses at most the last 5 seconds.
 
 The allocator never reuses a block or an inode that the disk still records as used. A freed block waits until the next flush ends. A crash can therefore never leave an inode on disk that names a block that another file has overwritten. A block that never reached the disk returns to the pool at once.
 
@@ -630,21 +630,21 @@ Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framew
 
 Execute these steps after the `systrap` platform, the cached `.erofs` layer descriptors, the network sockets, and the `/workspace` directory exist. The lockdown reuses the seccomp allowlist of the gVisor Sentry in `runsc/boot/filter`. `pkg/hostlockdown` must not import the Sentry. Therefore `pkg/gvx` builds the program and passes it in `Options.InstallSyscallFilter`.
 
-1. Build the rules with `config.Rules`. Pass the `SeccompInfo` of the `systrap` platform. Enable the host network rules for `-net=nat`. Enable the host filesystem rules when a workspace exists.
-2. Merge the embedder rules of `gvx`. They allow `fcntl` with close-on-exec, `renameat`, and `sched_getaffinity`. NAT adds sockets with protocol 0. WireGuard adds `sendto` and `recvfrom`.
+1. Build the rules with `config.Rules`. Pass the `SeccompInfo` of the `systrap` platform. Enable the host network rules for `-net=nat`. Enable the host filesystem rules when a workspace, a bind mount, or a hostfs volume exists.
+2. Merge the embedder rules of `gvx`. They allow `fcntl` with close-on-exec, `renameat`, and `sched_getaffinity`. An `ext4lite` volume adds `flock` with `LOCK_UN`. NAT adds sockets with protocol 0. WireGuard adds `sendto` and `recvfrom`.
 3. Add a last rule set that returns `EPERM` for `execve`, `execveat`, `clone`, `openat`, and `socket`. It applies only when no allow rule matched. Every other call outside the allowlist kills the process.
 4. Install the program on every thread with `seccomp(SECCOMP_FILTER_FLAG_TSYNC)`. The call sets `PR_SET_NO_NEW_PRIVS` first.
 5. Probe the result. `execve` and `clone` must fail with `EPERM`. An `openat` relative to the working directory must fail with `EPERM`. A TCP `socket` must fail unless the options allow outbound traffic.
 
 #### Linux Lockdown Limits (Descriptive Module)
 
-Seccomp reads no path. A workspace needs `openat` relative to a directory descriptor, and that call can open an absolute path. gVisor closes this gap with a mount namespace and `chroot`. A library cannot create them without privilege, because the Go runtime runs many threads. `Status.UnboundFileOpenBlocked` is therefore false on Linux when a workspace exists.
+Seccomp reads no path. A workspace or a hostfs mount needs `openat` relative to a directory descriptor, and that call can open an absolute path. gVisor closes this gap with a mount namespace and `chroot`. A library cannot create them without privilege, because the Go runtime runs many threads. `Status.UnboundFileOpenBlocked` is therefore false on Linux when a bind mount, a workspace, or a hostfs volume exists. It is true when the guest has only `ext4lite` volumes and tmpfs mounts, because the filter then has no rule for `openat`.
 
 Seccomp cannot read a socket address. The filter cannot pin the WireGuard peer port the way the Seatbelt profile does. The `EPERM` rule set keeps the process alive where `runsc` kills it. Code in the embedding process then sees an error from `os/exec`, `os.Open`, or `net.Dial`. The Go runtime also opens cgroup files once a second to adjust `GOMAXPROCS`, and it accepts a failure.
 
 The upstream `systrap` platform hangs while it starts in a cgo build. `New` returns `ErrPlatformUnavailable` there, and race builds use cgo. Build with `CGO_ENABLED=0`. A missing rule kills the process. Run `scripts/seccomp-audit.sh` to list the calls that the allowlist lacks. It builds with the tag `gvx_seccomp_log`, which logs those calls and allows them.
 
-### 3.9 Optional Containerd Control Adapter (Descriptive Module)
+### 3.10 Optional Containerd Control Adapter (Descriptive Module)
 
 The command `containerd-shim-gvx-v2` implements runtime identity `io.containerd.gvx.v2`. Its `internal/gvxshim` adapter adds the G3 control boundary beside M2, without changing the M1 through M5 runtime.
 The daemon never calls `gvx.New`, starts a guest, or applies guest lockdown. The standalone SDK does not depend on it.
