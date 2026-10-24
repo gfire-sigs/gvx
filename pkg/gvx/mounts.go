@@ -29,6 +29,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/oci"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
 )
 
@@ -38,15 +39,28 @@ type MountKind string
 const (
 	// MountBind mounts a host directory through hostfs.
 	MountBind MountKind = "bind"
-	// MountVolume mounts a named volume through hostfs. The volume is a host
-	// directory below the gvx cache directory.
+	// MountVolume mounts a named volume. The default driver is ext4lite, which
+	// stores the volume in one image file below the gvx cache directory.
 	MountVolume MountKind = "volume"
 	// MountTmpfs mounts a memory-backed tmpfs.
 	MountTmpfs MountKind = "tmpfs"
 )
 
+// MountDriver selects the filesystem of a volume mount.
+type MountDriver string
+
+const (
+	// DriverExt4lite stores the volume in one ext4 image file, <name>.ext4. The
+	// sandbox opens the file before the host lockdown. It needs no host
+	// directory access afterward. It is the default.
+	DriverExt4lite MountDriver = "ext4lite"
+	// DriverHostfs stores the volume as a host directory and mounts it through
+	// hostfs. It needs a host directory handle that stays open.
+	DriverHostfs MountDriver = "hostfs"
+)
+
 // Mount describes one extra guest mount. New opens the host directory of a
-// bind or volume mount before the host lockdown.
+// bind mount, or the image of a volume mount, before the host lockdown.
 type Mount struct {
 	// Kind selects the backing store.
 	Kind MountKind
@@ -58,12 +72,18 @@ type Mount struct {
 	// VolumeName names a volume. It matches [a-zA-Z0-9][a-zA-Z0-9_.-]*.
 	VolumeName string
 
+	// Driver selects the filesystem of a volume mount. The zero value selects
+	// ext4lite, except for a volume that exists only as a hostfs directory
+	// from an older release. That volume keeps using hostfs.
+	Driver MountDriver
+
 	// GuestPath is the absolute, clean mount point in the guest. It is not "/".
 	// It is not /proc, /sys, or /dev, and it is not below them, except below
 	// /dev/shm.
 	GuestPath string
 
-	// ReadOnly mounts the guest path in read-only mode.
+	// ReadOnly mounts the guest path in read-only mode. A read-only ext4lite
+	// volume opens its image read-only and fails when the image needs repair.
 	ReadOnly bool
 
 	// TmpfsSizeBytes limits a tmpfs mount. Zero selects the default limit of
@@ -177,6 +197,7 @@ func ParseMount(spec string) (Mount, error) {
 		kind     = MountVolume
 		src, dst string
 		size     string
+		driver   string
 		readOnly bool
 	)
 	for _, field := range fields {
@@ -198,6 +219,8 @@ func ParseMount(spec string) (Mount, error) {
 			}
 		case "tmpfs-size":
 			size = value
+		case "driver":
+			driver = strings.ToLower(strings.TrimSpace(value))
 		default:
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: unsupported key %q", spec, key)
 		}
@@ -205,7 +228,15 @@ func ParseMount(spec string) (Mount, error) {
 	if dst == "" {
 		return Mount{}, fmt.Errorf("gvx: invalid mount %q: dst is required", spec)
 	}
-	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly}
+	switch MountDriver(driver) {
+	case "", DriverExt4lite, DriverHostfs:
+	default:
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: unsupported driver %q (use ext4lite or hostfs)", spec, driver)
+	}
+	if driver != "" && kind != MountVolume {
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: driver needs type=volume", spec)
+	}
+	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly, Driver: MountDriver(driver)}
 	switch kind {
 	case MountBind, MountVolume:
 		if src == "" {
@@ -330,6 +361,9 @@ func (m Mount) validate() error {
 	if m.CreateHostPathIfMissing && m.Kind != MountBind {
 		return errors.New("CreateHostPathIfMissing applies to bind mounts only")
 	}
+	if m.Driver != "" && m.Kind != MountVolume {
+		return errors.New("Driver applies to volume mounts only")
+	}
 	switch m.Kind {
 	case MountBind:
 		if m.VolumeName != "" {
@@ -342,6 +376,11 @@ func (m Mount) validate() error {
 		}
 		if !volumeNamePattern.MatchString(m.VolumeName) {
 			return fmt.Errorf("invalid volume name %q", m.VolumeName)
+		}
+		switch m.Driver {
+		case "", DriverExt4lite, DriverHostfs:
+		default:
+			return fmt.Errorf("unsupported volume driver %q (use ext4lite or hostfs)", m.Driver)
 		}
 	case MountTmpfs:
 		if m.HostPath != "" || m.VolumeName != "" {
@@ -396,14 +435,20 @@ func validateGuestPath(p string) error {
 	return nil
 }
 
-// hasHostDirs reports whether the guest uses any host directory. The Linux
-// seccomp filter needs the host filesystem rules in that case.
+// hasHostDirs reports whether the configuration asks for a host directory. A
+// volume asks for one only when its driver is hostfs. A volume without a driver
+// uses ext4lite, unless it falls back to an older hostfs directory. The Sandbox
+// knows that case only when it has opened the mounts, so the Linux seccomp
+// filter uses Sandbox.usesHostDirs.
 func (c Config) hasHostDirs() bool {
 	if c.WorkspacePath != "" {
 		return true
 	}
 	for _, m := range c.Mounts {
-		if m.Kind != MountTmpfs {
+		switch {
+		case m.Kind == MountTmpfs:
+		case m.Kind == MountVolume && m.Driver != DriverHostfs:
+		default:
 			return true
 		}
 	}
@@ -424,12 +469,14 @@ func (c Config) volumeRoot() (string, error) {
 	return filepath.Join(filepath.Dir(layers), "volumes"), nil
 }
 
-// sandboxMount is a Mount that New has prepared. A bind or volume mount holds
-// its absolute host directory and its open hostfs workspace.
+// sandboxMount is a Mount that New has prepared. A bind mount or a hostfs
+// volume holds its absolute host directory and its open hostfs workspace. An
+// ext4lite volume holds its open volume.
 type sandboxMount struct {
 	Mount
 	hostPath  string
 	workspace *hostfs.Workspace
+	volume    *ext4lite.Volume
 }
 
 // mountList returns every guest mount: the WorkspacePath mount first, then
@@ -443,19 +490,41 @@ func (c Config) mountList() []Mount {
 }
 
 // openMounts prepares the host directories, opens one hostfs workspace for
-// each bind or volume mount, and records the mounts in the order that the
-// guest mounts them. A directory that two mounts share with the same access
-// shares one workspace, so two flush loops never write the same metadata file.
-// openMounts must run before the host lockdown.
+// each bind mount and each hostfs volume, opens the image of each ext4lite
+// volume, and records the mounts in the order that the guest mounts them. A
+// directory that two mounts share with the same access shares one workspace,
+// so two flush loops never write the same metadata file. openMounts must run
+// before the host lockdown.
 func (s *Sandbox) openMounts() error {
 	type workspaceKey struct {
 		dir      string
 		readOnly bool
 	}
 	shared := make(map[workspaceKey]*hostfs.Workspace)
+	volumes := make(map[string]bool)
 	for _, m := range s.cfg.mountList() {
+		if m.Kind == MountVolume {
+			driver, err := s.cfg.resolveVolumeDriver(m)
+			if err != nil {
+				return err
+			}
+			m.Driver = driver
+		}
 		sm := sandboxMount{Mount: m}
-		if m.Kind != MountTmpfs {
+		switch {
+		case m.Kind == MountTmpfs:
+		case m.Kind == MountVolume && m.Driver == DriverExt4lite:
+			if volumes[m.VolumeName] {
+				return fmt.Errorf("gvx: volume %q is mounted twice: %w", m.VolumeName, ErrInvalidConfig)
+			}
+			volumes[m.VolumeName] = true
+			vol, err := s.openVolumeImage(m)
+			if err != nil {
+				return err
+			}
+			s.volumes = append(s.volumes, vol)
+			sm.volume = vol
+		default:
 			dir, err := s.prepareHostDir(m)
 			if err != nil {
 				return err
@@ -482,6 +551,65 @@ func (s *Sandbox) openMounts() error {
 	}
 	sortMountsByDepth(s.mounts)
 	return nil
+}
+
+// volumeImagePath returns the host path of the image file of a volume.
+func (c Config) volumeImagePath(name string) (string, error) {
+	root, err := c.volumeRoot()
+	if err != nil {
+		return "", fmt.Errorf("gvx: locate the volume directory: %w", err)
+	}
+	return filepath.Join(root, name+".ext4"), nil
+}
+
+// resolveVolumeDriver picks the driver of a volume mount. An explicit driver
+// wins. Without one, a volume uses ext4lite, unless a hostfs directory of that
+// name exists and no image exists. A volume from an older release lives in
+// that directory, and the mount must not hide its files.
+func (c Config) resolveVolumeDriver(m Mount) (MountDriver, error) {
+	if m.Driver != "" {
+		return m.Driver, nil
+	}
+	image, err := c.volumeImagePath(m.VolumeName)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(image); err == nil {
+		return DriverExt4lite, nil
+	}
+	root := filepath.Dir(image)
+	if info, err := os.Stat(filepath.Join(root, m.VolumeName)); err == nil && info.IsDir() {
+		return DriverHostfs, nil
+	}
+	return DriverExt4lite, nil
+}
+
+// openVolumeImage opens the image file of an ext4lite volume and creates it
+// when it does not exist. A read-only mount opens the file read-only and
+// never creates it.
+func (s *Sandbox) openVolumeImage(m Mount) (*ext4lite.Volume, error) {
+	image, err := s.cfg.volumeImagePath(m.VolumeName)
+	if err != nil {
+		return nil, err
+	}
+	flags := os.O_RDWR | os.O_CREATE
+	if m.ReadOnly {
+		flags = os.O_RDONLY
+	} else if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
+		return nil, fmt.Errorf("gvx: create the volume directory: %w", err)
+	}
+	f, err := os.OpenFile(image, flags, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("gvx: open volume %q: %w", m.VolumeName, err)
+	}
+	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{ReadOnly: m.ReadOnly})
+	if errors.Is(err, ext4lite.ErrVolumeInUse) {
+		return nil, fmt.Errorf("gvx: volume %q is in use by another sandbox: %w", m.VolumeName, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gvx: mount volume %q from %q: %w", m.VolumeName, image, err)
+	}
+	return vol, nil
 }
 
 // prepareHostDir returns the absolute host directory of a bind or volume
@@ -520,18 +648,32 @@ func sortMountsByDepth(mounts []sandboxMount) {
 	})
 }
 
-// hostMounts lists the host directories that the lockdown must allow.
+// hostMounts lists the host directories that the lockdown must allow. An
+// ext4lite volume needs none, because its image file is open before the
+// lockdown.
 func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 	var list []hostlockdown.HostMount
 	for _, m := range s.mounts {
-		if m.Kind != MountTmpfs {
+		if m.Kind != MountTmpfs && m.volume == nil {
 			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly})
 		}
 	}
 	return list
 }
 
-// closeMounts closes every hostfs workspace once.
+// usesHostDirs reports whether a mount opened a host directory. Only then does
+// the Linux seccomp filter need the host filesystem rules.
+func (s *Sandbox) usesHostDirs() bool {
+	for _, m := range s.mounts {
+		if m.Kind != MountTmpfs && m.volume == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// closeMounts closes every hostfs workspace and every ext4lite volume once. The
+// volume close compacts and truncates the image and marks it clean.
 func (s *Sandbox) closeMounts() error {
 	var errs []error
 	for _, ws := range s.workspaces {
@@ -539,7 +681,13 @@ func (s *Sandbox) closeMounts() error {
 			errs = append(errs, err)
 		}
 	}
+	for _, vol := range s.volumes {
+		if err := vol.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("gvx: close volume: %w", err))
+		}
+	}
 	s.workspaces = nil
+	s.volumes = nil
 	s.mounts = nil
 	s.workspace = nil
 	return errors.Join(errs...)

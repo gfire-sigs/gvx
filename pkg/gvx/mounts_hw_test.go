@@ -198,7 +198,7 @@ func TestSandboxGuestWritesFollowMountAccess(t *testing.T) {
 	}{
 		{"writable bind", "/mnt/a/out.txt", false, 0, "writable"},
 		{"read-only bind", "/mnt/b/out.txt", false, 1, "read-only"},
-		{"volume", "/vol/out.txt", false, 0, "volume"},
+		{"volume", "/vol/out.txt", false, 0, ""},
 		{"tmpfs", "/scratch/out.txt", false, 0, ""},
 		{"tmpfs under a read-only root", "/scratch/out.txt", true, 0, ""},
 		{"bind under a read-only root", "/mnt/a/out.txt", true, 0, "writable"},
@@ -231,6 +231,11 @@ func TestSandboxGuestWritesFollowMountAccess(t *testing.T) {
 				_, err := os.Stat(filepath.Join(dir, "out.txt"))
 				if want := name == tc.hostDir && tc.wantCode == 0; (err == nil) != want {
 					t.Errorf("host file in the %s directory exists = %v, want %v (stat error %v)", name, err == nil, want, err)
+				}
+			}
+			if tc.name == "volume" {
+				if info, err := os.Stat(filepath.Join(cfg.OCICacheDir, "volumes", "data.ext4")); err != nil || info.Size() == 0 {
+					t.Errorf("volume image: %v, %v; want a non-empty file", info, err)
 				}
 			}
 		})

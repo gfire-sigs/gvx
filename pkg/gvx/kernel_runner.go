@@ -44,6 +44,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/dev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/devpts"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/erofs"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/overlay"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/proc"
@@ -398,6 +399,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	vfsObj.MustRegisterFilesystemType("devpts", &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 
 	if err := memdev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register memdev: %w", err)
@@ -711,8 +713,9 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 }
 
 // mountUserMount creates the guest directory of m and mounts it there. A bind
-// or volume mount uses the VFS2 hostfs driver. A tmpfs mount uses the Sentry
-// tmpfs with a size limit and mode 1777.
+// mount or a hostfs volume uses the VFS2 hostfs driver. An ext4lite volume uses
+// the ext4lite driver on its open image. A tmpfs mount uses the Sentry tmpfs
+// with a size limit and mode 1777.
 func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, m sandboxMount, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
 	dirMode := linux.FileMode(0o755)
 	if m.Kind == MountTmpfs {
@@ -725,6 +728,14 @@ func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 		return mountSubfs(m.GuestPath, "tmpfs", &vfs.MountOptions{
 			ReadOnly:             m.ReadOnly,
 			GetFilesystemOptions: vfs.GetFilesystemOptions{Data: tmpfsMountData(m.TmpfsSizeBytes)},
+		})
+	}
+	if m.volume != nil {
+		return mountSubfs(m.GuestPath, ext4lite.Name, &vfs.MountOptions{
+			ReadOnly: m.ReadOnly,
+			GetFilesystemOptions: vfs.GetFilesystemOptions{
+				InternalData: ext4lite.InternalFilesystemOptions{Volume: m.volume},
+			},
 		})
 	}
 	return mountSubfs(m.GuestPath, hostfs.Name, &vfs.MountOptions{

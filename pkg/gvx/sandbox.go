@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/oci"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -47,6 +48,7 @@ type Sandbox struct {
 	layerHandles  []*fd.HostHandle
 	workspace     *hostfs.Workspace
 	workspaces    []*hostfs.Workspace
+	volumes       []*ext4lite.Volume
 	mounts        []sandboxMount
 	netStack      *stack.Stack
 	natForwarder  *netbackend.NATForwarder

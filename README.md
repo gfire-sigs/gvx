@@ -23,7 +23,7 @@ The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached
 flowchart LR
     OCI["Unmodified OCI Image (amd64 / arm64)"] --> Platform["Execution Backend (whpx, hvf, or systrap)"]
     Platform -->|"Shared 4KB Comm Page or sysmsg Stub"| Sentry["gVisor Sentry Kernel (Pure Go on Windows & macOS)"]
-    Sentry --> VFS["VFS2: overlay (tmpfs + EROFS Layers) & hostfs (/workspace)"]
+    Sentry --> VFS["VFS2: overlay (tmpfs + EROFS Layers), hostfs (/workspace), & ext4lite (volumes)"]
     Sentry --> Netstack["Netstack (pkg/tcpip eth0 & lo)"]
     Netstack <-->|"Track A (-net=nat -p)"| NAT["L4 Go net NAT & Port Forwarder"]
     Netstack <-->|"Track B (-net=wg)"| WG["L3 In-Memory wireguard-go Tunnel"]

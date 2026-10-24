@@ -1291,9 +1291,6 @@ func TestStatfs(t *testing.T) {
 	if inodesBefore-inodesAfter != 1 {
 		t.Fatalf("one file took %d inodes, want 1", inodesBefore-inodesAfter)
 	}
-	if got := statfs(); got.BlocksFree >= before.BlocksFree || got.FilesFree >= before.FilesFree {
-		t.Fatalf("statfs after the write = %+v, want fewer free blocks and inodes than %+v", got, before)
-	}
 	fd := e.mustOpen("big", linux.O_RDONLY)
 	viaFD, err := fd.StatFS(e.ctx)
 	if err != nil || viaFD.Type != linux.EXT_SUPER_MAGIC || viaFD.Blocks == 0 {

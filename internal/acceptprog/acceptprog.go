@@ -53,6 +53,7 @@ const (
 	HerdrWorkspaceListWant = `{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[]}}` + "\n"
 
 	goStaticPackage = "z.gfire.dev/gvx/internal/acceptprog/gostatic"
+	volTreePackage  = "z.gfire.dev/gvx/internal/acceptprog/voltree"
 	herdrReleaseURL = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -180,4 +181,23 @@ func download(url, path string) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// BuildVolumeTree compiles the guest program voltree for the Linux
+// architecture goarch and returns the path of the executable. The program
+// writes a tree into a volume and verifies it in a later sandbox.
+func BuildVolumeTree(tb testing.TB, goarch string) string {
+	tb.Helper()
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
+	}
+	out := filepath.Join(tb.TempDir(), "voltree")
+	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags=-linkmode=internal", volTreePackage)
+	cmd.Dir = moduleRoot(tb)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		tb.Fatalf("build the volume guest for linux/%s: %v\n%s", goarch, err, msg)
+	}
+	return out
 }

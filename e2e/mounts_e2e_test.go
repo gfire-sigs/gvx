@@ -40,7 +40,7 @@ func TestE2EHostLockdownKeepsEveryMountReachable(t *testing.T) {
 	}{
 		{"writable bind", "/mnt/a/guest.txt", 0, "writable"},
 		{"read-only bind", "/mnt/b/guest.txt", 1, "read-only"},
-		{"volume", "/vol/guest.txt", 0, "volume"},
+		{"volume", "/vol/guest.txt", 0, ""},
 		{"tmpfs", "/scratch/guest.txt", 0, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -96,6 +96,12 @@ func TestE2EHostLockdownKeepsEveryMountReachable(t *testing.T) {
 					t.Errorf("guest.txt in the %s directory: read error %v, want present = %v", name, err, want)
 				} else if err == nil && string(data) != "guest-ran\n" {
 					t.Errorf("guest.txt in the %s directory = %q", name, data)
+				}
+			}
+			if tc.name == "volume" {
+				info, err := os.Stat(filepath.Join(cacheDir, "volumes", "data.ext4"))
+				if err != nil || info.Size() == 0 {
+					t.Errorf("the volume image: %v, %v; want a non-empty file", info, err)
 				}
 			}
 		})

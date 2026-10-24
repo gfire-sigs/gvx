@@ -51,7 +51,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. |
 | `-P` | Publish every port that the image declares with `EXPOSE` to a free port of `127.0.0.1`. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory or a named volume. |
-| `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly` | Mount with the Docker key syntax. |
+| `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
 | `--read-only` | Mount the root file system of the guest read-only. |
 | `-m`, `--memory SIZE` | Limit the guest memory. The units are `b`, `k`, `m`, `g`, and `t`. The minimum is 6m. |
@@ -97,7 +97,13 @@ The sandbox writes the hostname to `/etc/hostname`. It adds a line with the gues
 
 ### 4.4 Mounts
 
-A bind mount shows a host directory in the guest. A named volume is a host directory below a `volumes` directory. That directory is inside the `-cache-dir` directory, or else next to the default layer cache. The volume name matches `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. The sandbox creates a missing volume directory and a missing `-v` bind directory before the lockdown. A `--mount type=bind` source must exist.
+A bind mount shows a host directory in the guest. A named volume is one image file, `<name>.ext4`, in a `volumes` directory. That directory is inside the `-cache-dir` directory, or else next to the default layer cache. The volume name matches `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. The sandbox creates a missing volume image and a missing `-v` bind directory before the lockdown. A `--mount type=bind` source must exist.
+
+The image holds an ext4 file system that the `ext4lite` driver reads and writes. The image grows in steps of 16MiB, up to 64GiB. A clean exit returns the unused tail to the host. One sandbox at a time can use a volume, because the driver locks the image file. A second sandbox on the same volume fails at start. A read-only mount of a volume opens the image read-only and fails when the last run did not end cleanly.
+
+The guest sees only the files that it wrote. The host sees one file. After a crash or a kill, the next run repairs the image: it keeps every file that the guest synced, and it frees the files and blocks that no directory names. `e2fsck -fn` accepts a clean image, and `mount -o loop -t ext4` mounts it on Linux.
+
+A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
 
 A source with no path separator that is not an absolute path names a volume. A Windows drive letter stays in the source, as in `C:\data:/data:ro`. A bind mount of a single file is not supported.
 
@@ -153,7 +159,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | Docker | `rungv` |
 | :--- | :--- |
 | `-d`, `ps`, `exec`, `logs`, `stop`, `rm`, `restart` | Not available. A run is in the foreground and has no state. |
-| `docker build`, `compose`, `network`, `volume` | Not available. Remove a named volume by deleting its directory. |
+| `docker build`, `compose`, `network`, `volume` | Not available. Remove a named volume by deleting its image file, `<name>.ext4`. |
 | Image `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, labels | Ignored. |
 | `--network host` | Refused. The guest has its own network stack. |
 | A port range in `-p` | Refused. |

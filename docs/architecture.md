@@ -28,6 +28,7 @@ flowchart TD
     Sentry --> Platform["pkg/sentry/platform (Execution Backend Interface)"]
     VFS --> Overlay["fsimpl/overlay (tmpfs Upper + Multi-Layer EROFS Lower)"]
     VFS --> HostFS["fsimpl/hostfs (os.Root + NtCreateFile / openat + .gvx_meta)"]
+    VFS --> Ext4lite["fsimpl/ext4lite (one host file in the ext4 format)"]
     Net --> NetNAT["pkg/netbackend: Track A (-net=nat L4 Go net NAT & -p Port Forwarder)"]
     Net --> NetWG["pkg/netbackend: Track B (-net=wg L3 channel.Endpoint + wireguard-go)"]
     Platform --> WHPX["platform/whpx (Windows WinHvPlatform.dll: amd64 & arm64)"]
@@ -162,11 +163,18 @@ gvx/ (Fork of google/gvisor@go)
  │       │       ├── systrap_darwin_amd64.go # [NEW] Returns ErrUnavailable
  │       │       └── stub/                  # [NEW] C and assembly sources and the signed arm64 stub binary
  │       └── fsimpl/
- │           └── hostfs/                    # [NEW] Secure os.Root + .gvx_meta host mount (Windows, macOS, and Linux)
- │               ├── hostfs.go
- │               ├── inode_windows.go
- │               ├── inode_darwin.go
- │               └── posix_rename_windows.go
+ │           ├── hostfs/                    # [NEW] Secure os.Root + .gvx_meta host mount (Windows, macOS, and Linux)
+ │           │   ├── hostfs.go
+ │           │   ├── inode_windows.go
+ │           │   ├── inode_darwin.go
+ │           │   └── posix_rename_windows.go
+ │           └── ext4lite/                  # [NEW] Volume file system: one host file in the ext4 format
+ │               ├── ondisk.go              # Geometry and codecs
+ │               ├── alloc.go               # Block and inode allocator
+ │               ├── flush.go               # Ordered flush
+ │               ├── fsck.go                # fsckLite
+ │               ├── compact.go             # Unmount compaction
+ │               └── storage_*.go           # Storage tiers A, B, and C
  └── e2e/                                   # [NEW] Unified OS-agnostic end-to-end test suite
      ├── sandbox_e2e_test.go
      └── gate_*_test.go                     # Milestone gates M2, M3, and M4
@@ -191,6 +199,7 @@ Each package owns one architectural boundary. Enforce top-down import directiona
 | `pkg/sentry/platform/hvf` | Executes guest EL0/Ring-3 code on macOS via `Hypervisor.framework` and 4KB Stage-1/Stage-2. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/sys/unix` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
 | `pkg/sentry/platform/systrap` | Executes guest code via in-place syscall patching, `sysmsg` shared memory, and isolated stub subprocesses across Linux, macOS, and Windows. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/arch/*` | `pkg/sentry/kernel`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf` |
 | `pkg/sentry/fsimpl/hostfs` | Mounts host `/workspace` via `os.Root`, `NtCreateFile`/`openat`, and `.gvx_meta`. | `pkg/sentry/vfs`, `pkg/abi/linux`, `pkg/fd`, `golang.org/x/sys/*` | `pkg/sentry/platform/*` |
+| `pkg/sentry/fsimpl/ext4lite` | Stores one named volume in one pre-opened host file in the ext4 format. | `pkg/sentry/vfs`, `pkg/abi/linux`, `pkg/fd`, `golang.org/x/sys/*` | `pkg/sentry/platform/*`, `cmd/*` |
 | `pkg/sync`, `pkg/memutil`, `pkg/fd` | Provide host futexes, shared memory views, and host handles on Windows and macOS. | `golang.org/x/sys/windows`, `golang.org/x/sys/unix` | `pkg/sentry/*` |
 
 `tools/upstream` enforces this table with `boundaries.go`. Sentry foundation packages such as `pkg/context`, `pkg/hostarch`, `pkg/usermem`, and `pkg/sentry/memmap` appear in every platform and VFS interface, so those packages import them. Each other import needs a reason-annotated exception in `boundaries.go`.
@@ -521,14 +530,62 @@ A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware 
 
 A `pread` writes back only the dirty chunks that overlap its byte range. It reads from the host file straight into the destination blocks of the caller, with one allocation for each call. A file with no guest mapping skips the write-back without a lock.
 
-### 3.8 Host Self-Lockdown and Security Model: `pkg/hostlockdown`
+### 3.8 Volume File System: `pkg/sentry/fsimpl/ext4lite`
+
+`fsimpl/ext4lite` stores a named volume in one host file. The sandbox opens that file before the host lockdown. After the lockdown, the volume needs no host path and no new host handle. A sandbox that has only ext4lite volumes therefore reports `UnboundFileOpenBlocked`, also on Linux.
+
+#### Image Layout (Descriptive Module)
+
+The image uses the ext4 on-disk format with 4KiB blocks. A block group has 4096 blocks and 4096 inodes of 256 bytes, so one group takes 16MiB. Group `g` covers the blocks `4096*g` to `4096*g+4095`. The first data block is 0, and the superblock sits at byte 1024 of block 0. The groups 0, 1, and every power of 3, 5, or 7 hold a copy of the superblock.
+
+A group with a superblock copy starts with 65 header blocks. These are the superblock and 64 blocks for the group descriptors. The 64 blocks hold the descriptors that the volume needs now and reserved descriptor blocks for growth. The sum stays 64, so a volume grows to 4096 groups (64GiB) without moving any block. The resize inode (inode 7) lists the reserved blocks, as `resize_inode` requires. In group 0, the block bitmap is block 65, the inode bitmap is block 66, and the inode table is blocks 67 to 322.
+
+The volume enables `ext_attr`, `resize_inode`, `filetype`, `extents`, `64bit`, `inline_data`, `sparse_super`, `large_file`, and `extra_isize`. It has no journal, no directory index, and no checksums. `e2fsck -fn` accepts a clean image, and the Linux kernel can mount it.
+
+#### Storage Forms (Descriptive Module)
+
+An inode keeps its data in one of three forms. An inline file keeps up to 60 bytes in `i_block` and up to 68 more bytes in the `system.data` attribute behind the extra inode fields. The limit is therefore 128 bytes. A symlink with a target shorter than 60 bytes is a fast symlink, which ext4 stores in `i_block` with no flag.
+
+A file of more data uses an extent tree. A tree of depth 0 keeps up to 4 extents in `i_block`. A tree of depth 1 keeps up to 4 index entries in `i_block`. Each index entry names a leaf block of up to 340 extents, so a file has at most 1360 extents. A directory always uses extents and has no hash tree. A lookup reads the whole directory once and answers from a map.
+
+Every attribute other than `system.data` lives in one xattr block for each inode. The block holds at most 4KiB. A larger set fails with `ENOSPC`.
+
+#### Growth, Shrink, and Storage Tiers (Descriptive Module)
+
+The volume grows by one 16MiB group when no free block or inode remains. Three storage tiers allocate the host space for a new group without a sparse hole. Tier A calls `fallocate` on Linux and `fcntl(F_PREALLOCATE)` on macOS. Tier B sets `FileAllocationInfo` on Windows and never sets `FSCTL_SET_SPARSE`. Tier C calls `ftruncate` and grows the file as the allocator needs blocks. The probe at open selects the first tier that works, and a failed call moves the volume down one tier.
+
+A clean unmount returns unused space to the host. It moves the blocks of the trailing groups into free holes of lower groups. It then removes the empty trailing groups, flushes the metadata, truncates the host file, sets the valid bit, and syncs block 0. The move changes blocks only. An inode keeps its number, so a group that holds an inode stays.
+
+#### Crash Safety (Descriptive Module)
+
+The volume has no journal. A flush writes the extent leaf blocks and the xattr blocks first. It then writes the inode table blocks, the directory blocks, the bitmaps, the group descriptors, and the superblock, and it ends with `fsync` of the host file. Every data write goes straight to the host file. `fsync`, `fdatasync`, `sync`, and a write on an `O_SYNC` or `O_DSYNC` descriptor run this flush. A background flush runs every 5 seconds, so a guest that never syncs loses at most the last 5 seconds.
+
+The allocator never reuses a block or an inode that the disk still records as used. A freed block waits until the next flush ends. A crash can therefore never leave an inode on disk that names a block that another file has overwritten. A block that never reached the disk returns to the pool at once.
+
+A writable mount clears the valid bit in block 0 and syncs it before the first guest write. A mount that finds the bit clear runs `fsckLite`. It walks the tree from the root inode and rebuilds the bitmaps and the link counts from what it reaches. It frees every inode that no directory names, and it frees the blocks of those inodes. It creates no `lost+found` directory. It fails with `EUCLEAN` on a directory cycle, on a block that two inodes own, and on a bound violation.
+
+#### Untrusted Image Checks (Descriptive Module)
+
+A volume file is untrusted input. `isValidDataBlock` rejects every block that overlaps the superblock, the descriptors, a bitmap, or an inode table. The mount, the extent parser, and the directory parser apply it to every block number. The directory parser checks that each `rec_len` is at least 8, is a multiple of 4, and ends inside the block. A failed check returns `EUCLEAN` and never writes to the image.
+
+#### Sandbox Integration (Procedural Module)
+
+> [!IMPORTANT]
+> Open the volume file before `hostlockdown.Apply()`. The lockdown refuses every new host open.
+
+1. Write `-v name:/guest/path`. The sandbox opens or creates `<cacheDir>/volumes/<name>.ext4`.
+2. Wait for the exclusive lock of the file. A second sandbox on the same volume fails with `ErrVolumeInUse`.
+3. Mount the volume through `ext4lite`. Add `driver=hostfs` to `--mount` to use a host directory instead.
+4. Keep a volume directory of an older release on `hostfs`. The sandbox does this only when the directory exists and the `.ext4` file does not.
+
+### 3.9 Host Self-Lockdown and Security Model: `pkg/hostlockdown`
 
 `gvx` enforces a three-ring defense-in-depth security model against untrusted guest code.
 
 | Security Ring | Boundary Owner | Enforced Invariant |
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
-| **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go and scopes all `/workspace` opens to the `os.Root` handle. |
+| **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `fsimpl/ext4lite`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go. Scopes all `/workspace` opens to the `os.Root` handle. Keeps each volume inside one pre-opened host file. |
 | **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. The host directories of the mounts are the only bound files. |
 
 ```mermaid

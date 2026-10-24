@@ -20,8 +20,8 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
-// memoryFileChunks lets hostfs keep the chunks of mapped files in the kernel
-// memory file.
+// memoryFileChunks lets hostfs and ext4lite keep the chunks of mapped files in
+// the kernel memory file.
 type memoryFileChunks struct{ *pgalloc.MemoryFile }
 
 // AllocateChunk implements hostfs.ChunkMemory.
@@ -29,14 +29,17 @@ func (m memoryFileChunks) AllocateChunk(length uint64) (memmap.FileRange, error)
 	return m.Allocate(length, pgalloc.AllocOpts{Kind: usage.Anonymous})
 }
 
-// attachChunkMemory moves the chunks of mapped host directory files into the
-// kernel memory file when the platform needs it. It covers every bind and
-// volume mount. It must run before the first mapping.
+// attachChunkMemory moves the chunks of mapped files into the kernel memory
+// file when the platform needs it. It covers every bind mount, hostfs volume,
+// and ext4lite volume. It must run before the first mapping.
 func (s *Sandbox) attachChunkMemory() {
 	if !sharedChunkMemory || s.memFile == nil {
 		return
 	}
 	for _, ws := range s.workspaces {
 		ws.SetChunkMemory(memoryFileChunks{s.memFile})
+	}
+	for _, vol := range s.volumes {
+		vol.SetChunkMemory(memoryFileChunks{s.memFile})
 	}
 }

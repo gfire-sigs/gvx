@@ -123,6 +123,7 @@ jobs:
       - name: Test the packages that gvx owns
         env:
           EXT4LITE_REQUIRE_E2FSCK: "1"
+          EXT4LITE_REQUIRE_LOOPMOUNT: "1"
         run: go test -race -count=1 $OWNED
       # The upstream systrap platform hangs while it starts in a cgo build, and
       # the race detector needs cgo. The steps below build without cgo.

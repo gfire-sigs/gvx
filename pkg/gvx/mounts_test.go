@@ -277,25 +277,122 @@ func TestOpenMountsPreparesHostDirectoriesAndWorkspaces(t *testing.T) {
 	if want := []string{"/workspace", "/vol", "/mnt/ro", "/mnt/made", "/a/b/scratch"}; !slices.Equal(guestOrder, want) {
 		t.Fatalf("mount order = %v, want %v", guestOrder, want)
 	}
-	volumeDir := filepath.Join(root, "cache", "volumes", "data")
+	volumeRoot := filepath.Join(root, "cache", "volumes")
 	wantHost := []hostlockdown.HostMount{
-		{Path: workspaceDir}, {Path: volumeDir}, {Path: roDir, ReadOnly: true}, {Path: created},
+		{Path: workspaceDir}, {Path: roDir, ReadOnly: true}, {Path: created},
 	}
 	if got := sb.hostMounts(); !slices.Equal(got, wantHost) {
-		t.Fatalf("hostMounts() = %+v, want %+v", got, wantHost)
+		t.Fatalf("hostMounts() = %+v, want %+v (an ext4lite volume needs no host path)", got, wantHost)
+	}
+	if !sb.usesHostDirs() {
+		t.Error("usesHostDirs() = false with bind mounts")
 	}
 	if info, err := os.Stat(created); err != nil || !info.IsDir() {
 		t.Fatalf("bind source %s was not created: %v", created, err)
 	}
-	info, err := os.Stat(volumeDir)
+	info, err := os.Stat(volumeRoot)
 	if err != nil || !info.IsDir() {
-		t.Fatalf("volume directory %s was not created: %v", volumeDir, err)
+		t.Fatalf("volume directory %s was not created: %v", volumeRoot, err)
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
 		t.Errorf("volume directory mode = %v, want 0700", info.Mode().Perm())
 	}
-	if len(sb.workspaces) != 4 {
-		t.Errorf("open workspaces = %d, want one for each bind and volume mount", len(sb.workspaces))
+	if info, err := os.Stat(filepath.Join(volumeRoot, "data.ext4")); err != nil || info.Size() == 0 {
+		t.Errorf("volume image = %v, %v; want a non-empty file", info, err)
+	}
+	if len(sb.workspaces) != 3 || len(sb.volumes) != 1 {
+		t.Errorf("open workspaces = %d and volumes = %d, want 3 and 1", len(sb.workspaces), len(sb.volumes))
+	}
+}
+
+func TestOpenMountsVolumeDriverSelection(t *testing.T) {
+	cache := t.TempDir()
+	volumes := filepath.Join(cache, "volumes")
+	if err := os.MkdirAll(filepath.Join(volumes, "legacy"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volumes, "legacy", "keep.txt"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{OCICacheDir: cache, Mounts: []Mount{
+		{Kind: MountVolume, VolumeName: "legacy", GuestPath: "/legacy"},
+		{Kind: MountVolume, VolumeName: "fresh", GuestPath: "/fresh"},
+		{Kind: MountVolume, VolumeName: "forced", GuestPath: "/forced", Driver: DriverHostfs},
+	}}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	sb := &Sandbox{cfg: cfg}
+	t.Cleanup(func() {
+		if err := sb.closeMounts(); err != nil {
+			t.Errorf("closeMounts() failed: %v", err)
+		}
+	})
+	if err := sb.openMounts(); err != nil {
+		t.Fatalf("openMounts() failed: %v", err)
+	}
+	got := map[string]MountDriver{}
+	for _, m := range sb.mounts {
+		got[m.VolumeName] = m.Driver
+	}
+	want := map[string]MountDriver{"legacy": DriverHostfs, "fresh": DriverExt4lite, "forced": DriverHostfs}
+	for name, driver := range want {
+		if got[name] != driver {
+			t.Errorf("volume %s uses %q, want %q", name, got[name], driver)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(volumes, "legacy.ext4")); err == nil {
+		t.Error("a legacy volume directory got an image file beside it")
+	}
+	if _, err := os.Stat(filepath.Join(volumes, "fresh.ext4")); err != nil {
+		t.Errorf("the new volume has no image: %v", err)
+	}
+}
+
+func TestOpenMountsRejectsBusyAndDuplicateVolumes(t *testing.T) {
+	cache := t.TempDir()
+	open := func(mounts ...Mount) (*Sandbox, error) {
+		cfg := Config{OCICacheDir: cache, Mounts: mounts}
+		if err := cfg.normalize(); err != nil {
+			t.Fatal(err)
+		}
+		sb := &Sandbox{cfg: cfg}
+		return sb, sb.openMounts()
+	}
+	first, err := open(Mount{Kind: MountVolume, VolumeName: "shared", GuestPath: "/a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := open(Mount{Kind: MountVolume, VolumeName: "shared", GuestPath: "/a"})
+	if err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Errorf("a second sandbox on the same volume = %v, want an in-use error", err)
+	}
+	if cerr := second.closeMounts(); cerr != nil {
+		t.Errorf("closeMounts() after a failed openMounts() = %v", cerr)
+	}
+	if err := first.closeMounts(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := open(Mount{Kind: MountVolume, VolumeName: "shared", GuestPath: "/a"})
+	if err != nil {
+		t.Fatalf("reopen of a closed volume: %v", err)
+	}
+	if err := again.closeMounts(); err != nil {
+		t.Fatal(err)
+	}
+	dup, err := open(
+		Mount{Kind: MountVolume, VolumeName: "twice", GuestPath: "/a"},
+		Mount{Kind: MountVolume, VolumeName: "twice", GuestPath: "/b"},
+	)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("one volume mounted twice = %v, want ErrInvalidConfig", err)
+	}
+	if err := dup.closeMounts(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = open(Mount{Kind: MountVolume, VolumeName: "missing", GuestPath: "/a", ReadOnly: true})
+	if err == nil {
+		t.Error("a read-only mount of a missing volume succeeded")
 	}
 }
 
@@ -374,7 +471,9 @@ func TestConfigHasHostDirsIgnoresTmpfs(t *testing.T) {
 		{"tmpfs only", Config{Mounts: []Mount{{Kind: MountTmpfs, GuestPath: "/t"}}}, false},
 		{"workspace", Config{WorkspacePath: "/w"}, true},
 		{"bind", Config{Mounts: []Mount{{Kind: MountBind, HostPath: "/h", GuestPath: "/b"}}}, true},
-		{"volume", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v"}}}, true},
+		{"volume", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v"}}}, false},
+		{"volume with the ext4lite driver", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v", Driver: DriverExt4lite}}}, false},
+		{"volume with the hostfs driver", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v", Driver: DriverHostfs}}}, true},
 	} {
 		if got := tc.cfg.hasHostDirs(); got != tc.want {
 			t.Errorf("%s: hasHostDirs() = %v, want %v", tc.name, got, tc.want)
@@ -388,5 +487,31 @@ func TestTmpfsMountDataCarriesSizeAndMode(t *testing.T) {
 	}
 	if got, want := tmpfsMountData(1<<20), "size=1048576,mode=1777"; got != want {
 		t.Errorf("tmpfsMountData(1 MiB) = %q, want %q", got, want)
+	}
+}
+
+func TestParseMountDriver(t *testing.T) {
+	for _, tc := range []struct {
+		spec string
+		want MountDriver
+	}{
+		{"type=volume,src=data,dst=/v", ""},
+		{"src=data,dst=/v,driver=hostfs", DriverHostfs},
+		{"src=data,dst=/v,driver=ext4lite", DriverExt4lite},
+		{"src=data,dst=/v,driver=EXT4LITE", DriverExt4lite},
+	} {
+		m, err := ParseMount(tc.spec)
+		if err != nil || m.Driver != tc.want || m.Kind != MountVolume {
+			t.Errorf("ParseMount(%q) = %+v, %v; want a volume with driver %q", tc.spec, m, err, tc.want)
+		}
+	}
+	for _, spec := range []string{
+		"src=data,dst=/v,driver=zfs",
+		"type=bind,src=/h,dst=/b,driver=hostfs",
+		"type=tmpfs,dst=/t,driver=ext4lite",
+	} {
+		if m, err := ParseMount(spec); err == nil {
+			t.Errorf("ParseMount(%q) = %+v, want an error", spec, m)
+		}
 	}
 }

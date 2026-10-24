@@ -29,20 +29,21 @@ import (
 // Sentry on every thread of the process. The program is the one that runsc
 // builds for the Sentry: an allowlist, where every other system call kills the
 // process. The options follow the config of the Sandbox. The platform adds its
-// own rules, and NAT adds the host socket rules of hostinet. A bind or volume
-// mount adds the rules of the host filesystem, which allow opens relative to a
-// directory descriptor only.
+// own rules, and NAT adds the host socket rules of hostinet. A bind mount or a
+// hostfs volume adds the rules of the host filesystem, which allow opens
+// relative to a directory descriptor only. An ext4lite volume adds none, because
+// its image file is open already.
 func (s *Sandbox) syscallFilter() func() error {
 	return func() error {
 		opt := config.Options{
 			Platform:       s.plat.SeccompInfo(),
 			HostNetwork:    s.cfg.NetworkMode == NetModeNAT,
-			HostFilesystem: s.cfg.hasHostDirs(),
+			HostFilesystem: s.usesHostDirs(),
 			// gvx has no control server. No descriptor has this number.
 			ControllerFD: math.MaxUint32,
 		}
 		rules, denyRules := config.Rules(opt)
-		rules.Merge(embedderRules(s.cfg))
+		rules.Merge(embedderRules(s.cfg, s.usesHostDirs(), len(s.volumes) > 0))
 
 		seccompOpts := config.SeccompOptions(opt)
 		if seccompLogOnly {
@@ -90,7 +91,7 @@ func rejectedRules() seccomp.SyscallRules {
 // server. The Sentry in gvx runs in the host process and reaches the host
 // through Go packages, so these calls come from pkg/fd, os.Root, and the net
 // package. Each rule is as narrow as the call allows.
-func embedderRules(cfg Config) seccomp.SyscallRules {
+func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 	rules := seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		// pkg/fd marks a duplicated descriptor close-on-exec.
 		unix.SYS_FCNTL: seccomp.Or{
@@ -108,7 +109,7 @@ func embedderRules(cfg Config) seccomp.SyscallRules {
 	// The Go runtime reads the CPU affinity mask once a second to adjust
 	// GOMAXPROCS. The call reads one mask and has no side effect.
 	rules.Add(unix.SYS_SCHED_GETAFFINITY, seccomp.MatchAll{})
-	if cfg.hasHostDirs() {
+	if hostDirs {
 		// os.Root.Rename calls renameat. The host filesystem rules of runsc
 		// have only renameat2.
 		rules.Add(unix.SYS_RENAMEAT, seccomp.PerArg{
@@ -116,6 +117,15 @@ func embedderRules(cfg Config) seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
+		})
+	}
+	if volumes {
+		// An ext4lite volume holds an exclusive lock on its image file. The
+		// close of the volume releases the lock with flock(LOCK_UN) before it
+		// closes the descriptor. The rule allows no other operation.
+		rules.Add(unix.SYS_FLOCK, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(unix.LOCK_UN),
 		})
 	}
 	switch cfg.NetworkMode {
