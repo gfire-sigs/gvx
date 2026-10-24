@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (linux || windows || darwin) && amd64
+//go:build linux && amd64
 
 package sysmsg
 

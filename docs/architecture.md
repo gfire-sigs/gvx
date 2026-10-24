@@ -108,7 +108,7 @@ gvx/ (Fork of google/gvisor@go)
  │   ├── hostarch/
  │   │   └── hostarch_darwin_arm64_16k.go   # [NEW] Opt-in 16KB page size (-tags pagesize_16k) for the macOS systrap engine
  │   ├── sync/
- │   │   ├── futex_linux.go                 # [NEW] Linux SYS_FUTEX implementation
+ │   │   ├── futex_linux_xplat.go           # [NEW] Linux SYS_FUTEX implementation
  │   │   ├── futex_windows.go               # [NEW] WaitOnAddress / WakeByAddressSingle bindings
  │   │   └── futex_darwin.go                # [NEW] XNU __ulock_wait / __ulock_wake bindings
  │   ├── memutil/

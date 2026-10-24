@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (linux || windows || darwin) && !pagesize_64k
+//go:build linux && !pagesize_64k
 
 package sysmsg
 

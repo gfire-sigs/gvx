@@ -38,7 +38,7 @@ func TestClassifyFilePartitionsThreeIsolationTiers(t *testing.T) {
 		{name: "tier2 arch before marker", path: "pkg/sentry/platform/systrap/patcher_amd64_xplat.go", want: Tier2Sibling},
 		{name: "tier2 darwin test", path: "pkg/sync/futex_darwin_test.go", want: Tier2Sibling},
 		{name: "tier3 sentry kernel", path: "pkg/sentry/kernel/kernel.go", want: Tier3Upstream},
-		{name: "tier3 linux futex", path: "pkg/sync/futex_linux.go", want: Tier3Upstream},
+		{name: "tier2 linux xplat futex", path: "pkg/sync/futex_linux_xplat.go", want: Tier2Sibling},
 		{name: "tier3 token inside word", path: "pkg/sentry/kernel/darwinish.go", want: Tier3Upstream},
 		{name: "tier1 ext4lite volume engine", path: "pkg/sentry/fsimpl/ext4lite/ext4lite.go", want: Tier1Additive},
 		{name: "tier1 hvcommon shared stubs", path: "pkg/sentry/platform/hvcommon/arm64.go", want: Tier1Additive},

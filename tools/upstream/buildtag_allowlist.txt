@@ -103,18 +103,6 @@ linux-only pkg/sentry/platform/systrap/
 linux-only pkg/sentry/platform/systrap/sysmsg/
 linux-only pkg/sentry/platform/systrap/usertrap/
 
-# ERRATA-001-E5: the amd64 5-byte JMP rewriter of usertrap and the message types of sysmsg
-# build on every host. A file rule wins over the directory rule above, so the arm64 files,
-# the state files, and the raw-syscall file sysmsg_unsafe.go stay Linux-only.
-expand pkg/sentry/platform/systrap/usertrap/usertrap.go
-expr pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go (linux || windows || darwin) && amd64
-expr pkg/sentry/platform/systrap/usertrap/usertrap_amd64_unsafe.go (linux || windows || darwin) && amd64
-expr pkg/sentry/platform/systrap/usertrap/usertrap_amd64_abi_autogen_unsafe.go (linux || windows || darwin) && amd64
-expand pkg/sentry/platform/systrap/sysmsg/sysmsg.go
-expr pkg/sentry/platform/systrap/sysmsg/sighandler_amd64.go (linux || windows || darwin) && amd64
-expr pkg/sentry/platform/systrap/sysmsg/sysmsg_amd64.go (linux || windows || darwin) && amd64
-expr pkg/sentry/platform/systrap/sysmsg/sysmsg_4k.go (linux || windows || darwin) && !pagesize_64k
-
 # pkg/sentry/seccheck sink: undefined: unix.Writev on windows.
 linux-only pkg/sentry/seccheck/sinks/remote/
 

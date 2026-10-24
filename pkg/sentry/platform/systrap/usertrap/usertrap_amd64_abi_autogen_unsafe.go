@@ -6,7 +6,7 @@
 // is filtered based on pre-defined file suffixes related to build constraints,
 // see tools/defs.bzl:calculate_sets().
 
-//go:build (linux || windows || darwin) && amd64
+//go:build linux && amd64
 
 package usertrap
 

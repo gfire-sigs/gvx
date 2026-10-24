@@ -1,4 +1,4 @@
-//go:build linux || windows || darwin
+//go:build linux
 
 // Copyright 2020 The gVisor Authors.
 //
