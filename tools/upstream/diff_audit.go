@@ -110,6 +110,7 @@ type AuditConfig struct {
 
 var tier1Prefixes = []string{
 	"cmd/rungv/",
+	"cmd/containerd-shim-gvx-v2/",
 	"pkg/gvx/",
 	"pkg/oci/",
 	"pkg/netbackend/",
@@ -121,6 +122,7 @@ var tier1Prefixes = []string{
 	"pkg/sentry/platform/hvcommon/",
 	"e2e/",
 	"tools/upstream/",
+	"tools/shiminterop/",
 	"docs/",
 	"internal/",
 }

@@ -124,6 +124,33 @@ func main() {
 }
 ```
 
+### 2.3 Containerd Control Shim (Procedural Module)
+
+Build the optional `containerd-shim-gvx-v2` command separately from `rungv`. These smoke tests need no guest image, registry, or rootfs.
+
+> [!IMPORTANT]
+> Use the shim only for control-plane experiments. It rejects workload creation and does not implement CRI.
+
+1. Build the shim with the toolchain selected by `go.mod`.
+2. Run the native control tests without an external binary override.
+3. Run the isolated ShimManager smoke on Linux.
+4. Run the native rejection smoke with a containerd `2.2.4` executable.
+
+```sh
+go build -o "$PWD/containerd-shim-gvx-v2" ./cmd/containerd-shim-gvx-v2
+SHIM_BINARY="$PWD/containerd-shim-gvx-v2"
+
+go test -count=1 -skip '^TestContainerdNativeRejection$' ./internal/gvxshim
+
+GVX_SHIM_BINARY="$SHIM_BINARY" \
+  go -C tools/shiminterop test -v -count=1 -run '^TestShimManagerInterop$' ./...
+
+GVX_SHIM_BINARY="$SHIM_BINARY" GVX_CONTAINERD_BINARY=/bin/containerd \
+  go test -v -count=1 ./internal/gvxshim -run '^TestContainerdNativeRejection$'
+```
+
+The external smoke owns private daemon paths and never changes host-global containerd configuration. The architecture guide records the [compatibility evidence](docs/architecture.md#43-containerd-shim-verification-reference-module).
+
 ---
 
 ## 3. Core Mechanics and Invariants (Descriptive Module)
@@ -178,6 +205,27 @@ On Linux (`lockdown_linux.go` and `pkg/gvx/syscallfilter_linux.go`), it installs
 
 `tools/upstream` widens `//go:build linux` tags on allowlisted Sentry files after each `git merge upstream/go`, and it fences Linux-only files from the new targets. `-mode=audit` compares the tree with the pinned upstream archive and checks the SPEC import boundaries.
 
+The merged-tree audit at `0d0ef55` charged 16 of 2485 files (0.64%) against the `< 0.7%` ceiling. The charged share excludes Linux fences; the audit also reports a strict count that includes them.
+
+### 3.7 Optional Containerd Control Adapter
+
+Runtime identity `io.containerd.gvx.v2` resolves to `containerd-shim-gvx-v2`. The adapter implements control-only G3 without changing the M1 through M5 guest runtime.
+
+| Boundary | Implemented behavior | Limit |
+| :--- | :--- | :--- |
+| Bootstrap | JSON version `3`, protocol `ttrpc`, separate serving child, empty successful stderr | No binary bootstrap from containerd `2.3` |
+| Task v3 | `Connect` returns the real shim PID, task PID `0`, and version `gvx-control-v1`; `Shutdown` stops the daemon | No Task v2 service or workloads |
+| Native Sandbox | `CreateSandbox` attaches the caller, then returns `Unimplemented`; `ShutdownSandbox` stops the daemon | No successful sandbox creation or CRI |
+| Executable cleanup | `delete` uses an independent stop endpoint and waits for lease release | No termination from a stored PID |
+
+Every instance belongs to one owner, containerd address, namespace, ID, and canonical bundle. Delete validates that identity and the admitted generation before removing owned resources.
+
+The caller supplies `-namespace`, `-id`, and a local `-address` to `start`. The bundle defaults to the current directory; `delete` requires an explicit `-bundle`.
+The positive `-timeout` defaults to five seconds and bounds startup, handoff, cleanup, and shutdown drain. An unattached child exits when handoff expires.
+Nonempty runtime options remain unsupported. The standalone SDK needs no daemon and retains its existing lockdown behavior.
+
+Delete preserves containerd-owned bundle entries and stable lock files. Conflicting ownership or an unresponsive child produces an error rather than destructive cleanup.
+The isolated `tools/shiminterop` module retains the SDK's compatible telemetry dependencies. It does not downgrade root dependencies or fork SDK code.
 The audit charges 24 of 2485 upstream files (0.97%) against the `< 1.0%` ceiling. It reports 596 Linux fences separately. Counted together with the fences, the modified share is 25%, so the strict reading of the ceiling is not met.
 
 ---
@@ -188,7 +236,7 @@ Read the architecture plan and agent operating manual before modifying any packa
 
 | Document | Audience | Scope Description |
 | :--- | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync pipeline, and M1-M5 milestones. |
+| [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync, M1-M5 milestones, and the optional containerd control adapter. |
 | [`docs/cli.md`](docs/cli.md) | Users & Engineers | Every `rungv` command, every flag of `rungv run`, the run rules, and the differences from Docker. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 rules, package import boundaries, and verification gates. |
 

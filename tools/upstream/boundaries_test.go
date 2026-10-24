@@ -41,6 +41,21 @@ func TestBoundaryAllowListsFollowSpecTable(t *testing.T) {
 		bad     []string
 	}{
 		{
+			name: "isolated shim interop imports upstream without the root module", file: "tools/shiminterop/shim_manager_linux_test.go",
+			imports: []string{"github.com/containerd/containerd/v2/core/runtime/v2", "github.com/containerd/containerd/api/runtime/task/v3", "github.com/containerd/typeurl/v2", "golang.org/x/sys/unix"},
+			bad:     []string{m + "internal/gvxshim", m + "pkg/gvx", m + "pkg/sentry/kernel", m + "runsc/boot", m + "cmd/containerd-shim-gvx-v2"},
+		},
+		{
+			name: "shim command only composes the adapter", file: "cmd/containerd-shim-gvx-v2/main.go",
+			imports: []string{m + "internal/gvxshim", "os"},
+			bad:     []string{m + "pkg/gvx", m + "pkg/sentry/kernel", m + "runsc/boot", m + "shim/v1/cli"},
+		},
+		{
+			name: "shim control has no guest runtime dependency", file: "internal/gvxshim/service.go",
+			imports: []string{"context", "golang.org/x/sys/unix", "golang.org/x/sys/windows", "github.com/Microsoft/go-winio", "github.com/containerd/ttrpc", "github.com/containerd/containerd/api/runtime/task/v3", "github.com/containerd/containerd/v2/pkg/identifiers", "google.golang.org/grpc/status", "google.golang.org/protobuf/proto"},
+			bad:     []string{m + "pkg/gvx", m + "pkg/hostlockdown", m + "pkg/sentry/kernel", m + "runsc/boot", m + "cmd/rungv", m + "shim/v1/cli", "github.com/containerd/containerd/v2/pkg/shim", "github.com/containerd/containerd/v2/client"},
+		},
+		{
 			name: "cmd/rungv may import gvx and oci only", file: "cmd/rungv/main.go",
 			imports: []string{m + "pkg/gvx", m + "pkg/oci", "flag"},
 			bad:     []string{m + "pkg/netbackend", m + "pkg/hostlockdown", m + "pkg/sentry/kernel", m + "pkg/log"},
@@ -48,7 +63,7 @@ func TestBoundaryAllowListsFollowSpecTable(t *testing.T) {
 		{
 			name: "pkg/gvx coordinates the subsystems", file: "pkg/gvx/sandbox.go",
 			imports: []string{m + "pkg/oci", m + "pkg/netbackend", m + "pkg/hostlockdown", m + "pkg/sentry/vfs", m + "pkg/sentry/kernel", m + "pkg/fd", m + "pkg/tcpip/stack", m + "pkg/context", m + "pkg/cpuid"},
-			bad:     []string{m + "cmd/rungv", m + "pkg/rand", m + "pkg/unet"},
+			bad:     []string{m + "cmd/rungv", m + "pkg/rand", m + "pkg/unet", m + "internal/gvxshim"},
 		},
 		{
 			name: "pkg/oci stays independent of the sentry", file: "pkg/oci/pull.go",
@@ -336,5 +351,16 @@ func TestBoundaryPlatformSharedLibraries(t *testing.T) {
 	}
 	if vs := boundaryCheck(t, "pkg/sentry/platform/whpx/stub.go", importLines("golang.org/x/arch/x86/x86asm")); len(vs) != 1 {
 		t.Errorf("whpx production code must not import x/arch: %d violations, want 1", len(vs))
+	}
+}
+
+func TestShimControlInteropImportsStayTestOnly(t *testing.T) {
+	t.Parallel()
+	imports := importLines("github.com/containerd/containerd/v2/core/runtime/v2", "github.com/containerd/containerd/v2/client", "github.com/containerd/typeurl/v2", "github.com/opencontainers/runtime-spec/specs-go")
+	if vs := boundaryCheck(t, "internal/gvxshim/interop_linux_test.go", imports); len(vs) != 0 {
+		t.Errorf("upstream interop test imports flagged: %v", vs)
+	}
+	if vs := boundaryCheck(t, "internal/gvxshim/lifecycle.go", imports); len(vs) != 4 {
+		t.Errorf("production interop imports: %d violations, want 4", len(vs))
 	}
 }

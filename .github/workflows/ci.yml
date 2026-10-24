@@ -234,6 +234,9 @@ jobs:
           go-version-file: go.mod
       # The hosted runner has no hypervisor, so the systrap engine is the only
       # backend that runs guests here.
+      - name: Test the shim control plane
+        shell: bash
+        run: go test -count=1 ./internal/gvxshim/ ./cmd/containerd-shim-gvx-v2/
       - name: Test the systrap engine
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/systrap/

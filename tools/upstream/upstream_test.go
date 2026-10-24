@@ -24,6 +24,9 @@ func TestClassifyFilePartitionsThreeIsolationTiers(t *testing.T) {
 		want IsolationTier
 	}{
 		{name: "tier1 cli runner", path: "cmd/rungv/main.go", want: Tier1Additive},
+		{name: "tier1 shim command", path: "cmd/containerd-shim-gvx-v2/main.go", want: Tier1Additive},
+		{name: "tier1 shim control", path: "internal/gvxshim/lifecycle.go", want: Tier1Additive},
+		{name: "tier1 isolated shim interop", path: "tools/shiminterop/shim_manager_linux_test.go", want: Tier1Additive},
 		{name: "tier1 hvf backend", path: "pkg/sentry/platform/hvf/hvf.go", want: Tier1Additive},
 		{name: "tier1 hostfs driver", path: "pkg/sentry/fsimpl/hostfs/hostfs.go", want: Tier1Additive},
 		{name: "tier1 internal helpers", path: "internal/testelf/elf.go", want: Tier1Additive},
@@ -130,7 +133,7 @@ func TestRepositoryMaskKeepsUpstreamTreesIncluded(t *testing.T) {
 			t.Errorf("Decide(%q) = %v, want MaskInclude", rel, got)
 		}
 	}
-	for _, rel := range []string{"pkg/gvx/sandbox.go", "pkg/sentry/platform/platforms/platforms_darwin.go", "internal/testelf/elf.go"} {
+	for _, rel := range []string{"pkg/gvx/sandbox.go", "pkg/sentry/platform/platforms/platforms_darwin.go", "pkg/sentry/fsimpl/ext4lite/ext4lite.go", "pkg/sentry/platform/hvcommon/arm64.go", "internal/testelf/elf.go", "cmd/containerd-shim-gvx-v2/main.go", "internal/gvxshim/lifecycle.go", "tools/shiminterop/shim_manager_linux_test.go", "tools/shiminterop/go.mod"} {
 		if got := mask.Decide(rel); got != MaskProtect {
 			t.Errorf("Decide(%q) = %v, want MaskProtect", rel, got)
 		}

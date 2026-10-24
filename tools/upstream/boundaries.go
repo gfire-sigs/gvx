@@ -61,6 +61,37 @@ const (
 
 var boundaryRules = []importRule{
 	{
+		pkg: "tools/shiminterop",
+		allowed: []string{
+			"github.com/containerd/containerd/api/runtime/*",
+			"github.com/containerd/containerd/v2/core/runtime/*",
+			"github.com/containerd/containerd/v2/core/events/exchange",
+			"github.com/containerd/containerd/v2/pkg/namespaces",
+			"github.com/containerd/errdefs", "github.com/containerd/typeurl/v2",
+			"github.com/opencontainers/runtime-spec/specs-go",
+			"golang.org/x/sys/unix", "google.golang.org/grpc/*",
+		},
+		forbidden: []string{"pkg/*", "internal/*", "cmd/*", "runsc/*", "shim/*"},
+	},
+	{
+		pkg:       "cmd/containerd-shim-gvx-v2",
+		allowed:   []string{"internal/gvxshim"},
+		forbidden: []string{"pkg/*", "runsc/*", "shim/*"},
+	},
+	{
+		pkg: "internal/gvxshim",
+		allowed: []string{
+			"golang.org/x/sys/*", "github.com/Microsoft/go-winio",
+			"github.com/containerd/containerd/api/runtime/*",
+			"github.com/containerd/containerd/v2/pkg/identifiers",
+			"github.com/containerd/containerd/v2/pkg/namespaces",
+			"github.com/containerd/ttrpc", "google.golang.org/grpc/*", "google.golang.org/protobuf/*",
+			"github.com/sirupsen/logrus",
+			"github.com/containerd/log",
+		},
+		forbidden: []string{"pkg/*", "runsc/*", "shim/*", "cmd/*"},
+	},
+	{
 		pkg:               "cmd/rungv",
 		allowed:           []string{"pkg/gvx", "pkg/oci"},
 		forbidden:         []string{pkgSentryAll},
@@ -69,7 +100,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/gvx",
 		allowed:   []string{"pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/tcpip/*"},
-		forbidden: []string{"cmd/*"},
+		forbidden: []string{"cmd/*", "internal/gvxshim/*"},
 	},
 	{
 		pkg:       "pkg/oci",
@@ -221,6 +252,10 @@ var boundaryExceptions = []importException{
 
 // boundaryTestExceptions apply to _test.go files only.
 var boundaryTestExceptions = []importException{
+	{[]string{"internal/gvxshim"}, "github.com/containerd/containerd/v2/*", "interop tests exercise the pinned containerd lifecycle and private daemon"},
+	{[]string{"internal/gvxshim"}, "github.com/containerd/typeurl/v2", "interop tests marshal a real OCI specification"},
+	{[]string{"internal/gvxshim"}, "github.com/containerd/errdefs", "interop tests assert native unsupported-operation errors"},
+	{[]string{"internal/gvxshim"}, "github.com/opencontainers/runtime-spec/specs-go", "interop tests supply a minimal OCI specification without a workload"},
 	{[]string{"pkg/gvx", "cmd/rungv"}, "internal/*", "gvx-owned guest ELF and image fixtures for tests"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/hvcommon"}, "golang.org/x/arch/*", "tests disassemble the generated guest stubs"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/pgalloc", "tests back the chunks of mapped files with a memory file, as pkg/gvx does on Linux"},
