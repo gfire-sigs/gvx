@@ -576,41 +576,50 @@ func TestCaseSensitiveNamesOnTheGuestView(t *testing.T) {
 	wantErrno(t, "lookup with other case", func() error { _, err := e.stat("readme"); return err }(), linuxerr.ENOENT)
 	_, err := e.open("readme", linux.O_RDONLY, 0)
 	wantErrno(t, "open with other case", err, linuxerr.ENOENT)
-	if e.ws.host.caseInsensitive() || hostFoldsCase(t, e.dir) {
-		// The host would alias the two names. hostfs refuses the collision
-		// instead of silently opening the other file.
-		_, err = e.open("readme", linux.O_CREAT|linux.O_WRONLY, 0o644)
-		wantErrno(t, "create colliding name", err, linuxerr.EEXIST)
-	} else {
-		e.writeFile("readme", []byte("lower"))
-		if got := e.readFile("Readme"); string(got) != "upper" {
-			t.Fatalf("Readme = %q", got)
+
+	// Names that differ only in case coexist, also on a host that folds case.
+	// The codec stores a later name under an escaped host name.
+	e.writeFile("readme", []byte("lower"))
+	e.writeFile("README", []byte("third"))
+	for name, want := range map[string]string{"Readme": "upper", "readme": "lower", "README": "third"} {
+		if got := e.readFile(name); string(got) != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
 		}
 	}
-	if got := e.readdir("."); got[0] != "Readme" {
-		t.Fatalf("listing = %v, want the stored case", got)
+	if got := e.readdir("."); fmt.Sprint(got) != "[README Readme readme]" {
+		t.Fatalf("listing = %v, want the three names with their own case", got)
+	}
+	if err := e.unlink("readme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.unlink("README"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A rename onto a case variant creates the new name beside the old one.
+	e.writeFile("other", []byte("o"))
+	if err := e.rename("other", "README"); err != nil {
+		t.Fatalf("rename onto a case variant: %v", err)
 	}
 	if got := e.readFile("Readme"); string(got) != "upper" {
-		t.Fatalf("Readme = %q after rejected collision", got)
+		t.Fatalf("Readme = %q after the rename", got)
 	}
-	if e.ws.host.caseInsensitive() || hostFoldsCase(t, e.dir) {
-		// Replacing "Readme" through the name "README" would destroy a file
-		// that the guest sees under another name.
-		e.writeFile("other", []byte("o"))
-		wantErrno(t, "rename onto a case variant", e.rename("other", "README"), linuxerr.EEXIST)
-		if got := e.readFile("Readme"); string(got) != "upper" {
-			t.Fatalf("Readme = %q after a refused rename", got)
-		}
-		if err := e.unlink("other"); err != nil {
-			t.Fatal(err)
-		}
+	if got := e.readFile("README"); string(got) != "o" {
+		t.Fatalf("README = %q after the rename", got)
 	}
+	if err := e.unlink("README"); err != nil {
+		t.Fatal(err)
+	}
+
 	// Renaming only the case works.
 	if err := e.rename("Readme", "README"); err != nil {
 		t.Fatalf("case-only rename: %v", err)
 	}
-	if got := e.readdir("."); got[len(got)-1] != "README" && got[0] != "README" {
-		t.Fatalf("listing after case rename = %v", got)
+	if got := e.readdir("."); fmt.Sprint(got) != "[README]" {
+		t.Fatalf("listing after case rename = %v, want [README]", got)
+	}
+	if got := e.readFile("README"); string(got) != "upper" {
+		t.Fatalf("README = %q after the case rename", got)
 	}
 }
 

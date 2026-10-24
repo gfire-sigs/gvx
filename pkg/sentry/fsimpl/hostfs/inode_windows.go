@@ -158,32 +158,6 @@ func validateWindowsName(name string) error {
 	return nil
 }
 
-// isReservedDeviceName reports whether Windows treats name as a device. The
-// match ignores case and any extension, so "nul.txt" is reserved.
-func isReservedDeviceName(name string) bool {
-	stem, _, _ := strings.Cut(name, ".")
-	upper := strings.ToUpper(strings.TrimRight(stem, " "))
-	switch upper {
-	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
-		return true
-	}
-	for _, prefix := range [...]string{"COM", "LPT"} {
-		rest, ok := strings.CutPrefix(upper, prefix)
-		if !ok {
-			continue
-		}
-		r, size := utf8.DecodeRuneInString(rest)
-		if size == 0 || size != len(rest) {
-			continue
-		}
-		// The superscript digits are device names too.
-		if (r >= '0' && r <= '9') || r == '\u00b9' || r == '\u00b2' || r == '\u00b3' {
-			return true
-		}
-	}
-	return false
-}
-
 // openAt opens one component relative to the directory handle dir. The name
 // holds no separator. The empty name or "." opens dir itself again. Every open
 // shares read, write, and delete access, never follows a reparse point, and

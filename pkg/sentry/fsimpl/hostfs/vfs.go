@@ -18,7 +18,6 @@ import (
 	"errors"
 	"hash/fnv"
 	iofs "io/fs"
-	"os"
 	"sync"
 	"time"
 
@@ -247,6 +246,11 @@ type inode struct {
 	wmu sync.Mutex
 
 	data fileData
+
+	// guest records the host state that the last guest write produced. The
+	// host watcher uses it to tell a guest write from a host write. See
+	// watcher.go.
+	guest guestState
 }
 
 func (i *inode) snapshot() entry {
@@ -379,6 +383,7 @@ func (i *inode) syncData() error {
 
 // destroy releases the resources of an inode with no dentries left.
 func (i *inode) destroy() {
+	i.fs.ws.watchForget(i)
 	i.data.release()
 }
 
@@ -529,11 +534,19 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
+	// A guest inotify watch is about to join this set, or it is leaving. The
+	// VFS offers no hook that can fail the add, so a refusal of the cap leaves
+	// the guest watch without host events and only logs the reason.
+	if err := d.fs.ws.watchDentry(d); err != nil {
+		d.fs.ws.logWatchRefusal(d, err)
+	}
 	return &d.inode.watches
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
-func (d *dentry) OnZeroWatches(ctx context.Context) {}
+func (d *dentry) OnZeroWatches(ctx context.Context) {
+	d.fs.ws.unwatchDentry(d)
+}
 
 // dropLocked removes d and its cached children from the tree after the host
 // object they described changed or vanished.
@@ -897,6 +910,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		}
 		// The link count of the shared inode changed.
 		src.inode.invalidateMeta()
+		src.inode.fs.ws.watchNoteInode(src.inode)
 		src.inode.watches.Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
 		return nil
 	})
@@ -1027,7 +1041,7 @@ afterTrailingSymlink:
 		defer rp.Mount().EndWrite()
 		rel := joinRelPath(parent.relPath, name)
 		uid, gid, _ := newOwner(parent.inode, rp.Credentials())
-		f, e, err := fs.ws.createFile(rel, uint32(opts.Mode)&0o7777, uint32(uid), uint32(gid))
+		f, e, err := fs.ws.createHandle(rel, uint32(opts.Mode)&0o7777, uint32(uid), uint32(gid))
 		if errors.Is(err, iofs.ErrExist) && !mustCreate && !retriedExist {
 			// A host process created the name after the negative entry. Drop
 			// the entry and resolve the name again, once.
@@ -1072,10 +1086,10 @@ afterTrailingSymlink:
 // file that OpenAt just created, or nil.
 //
 // Preconditions: fs.mu is not held.
-func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *os.File) (*vfs.FileDescription, error) {
+func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *hostHandle) (*vfs.FileDescription, error) {
 	closeCreated := func() {
 		if created != nil {
-			_ = created.Close()
+			_ = created.decRef()
 		}
 	}
 	ats := vfs.AccessTypesForOpenFlags(opts)
@@ -1264,6 +1278,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		fs.detachLocked(replaced)
 	}
 	fs.moveLocked(renamed, newParent, newName, newRel)
+	fs.ws.watchNoteInode(renamed.inode)
 	deferDecRef(fs, vfsObj.CommitRenameReplaceDentry(ctx, &handle, &renamed.vfsd, replacedVFSD))
 	vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParent.inode.watches, &newParent.inode.watches, oldName, newName, renamed.inode.isDir())
 	return nil
@@ -1403,6 +1418,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	parent.inode.invalidateMeta()
 	parent.inode.negAdd(name, fs.ws.nowNano())
 	// Notify before the dentry dies, or the watches would be dropped first.
+	fs.ws.watchNoteInode(child.inode)
 	vfs.InotifyRemoveChild(ctx, &child.inode.watches, &parent.inode.watches, name)
 	fs.detachLocked(child)
 	deferDecRef(fs, vfsObj.CommitDeleteDentry(ctx, &child.vfsd))
@@ -1496,7 +1512,10 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 		if d.isDead() {
 			return linuxerr.ENOENT
 		}
-		if err := d.fs.ws.chtimes(d.path(), at, mt); err != nil {
+		d.inode.guestBegin()
+		err := d.fs.ws.chtimes(d.path(), at, mt)
+		d.inode.guestEndPath(d.path())
+		if err != nil {
 			return translateHostError(err)
 		}
 	}

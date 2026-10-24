@@ -36,41 +36,6 @@ import (
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
-// hostHandle is a reference-counted host file handle. File descriptions and
-// the mapped-page cache share handles, so a mapping can write back after the
-// file description that created it closes.
-type hostHandle struct {
-	f    *os.File
-	refs atomic.Int32
-
-	// syncFn replaces File.Sync when set. Tests use it to inject failures.
-	syncFn func() error
-}
-
-func newHostHandle(f *os.File) *hostHandle {
-	h := &hostHandle{f: f}
-	h.refs.Store(1)
-	return h
-}
-
-func (h *hostHandle) incRef() {
-	h.refs.Add(1)
-}
-
-func (h *hostHandle) decRef() error {
-	if h.refs.Add(-1) == 0 {
-		return h.f.Close()
-	}
-	return nil
-}
-
-func (h *hostHandle) sync() error {
-	if h.syncFn != nil {
-		return h.syncFn()
-	}
-	return h.f.Sync()
-}
-
 // regularFD implements vfs.FileDescriptionImpl for regular files.
 type regularFD struct {
 	vfsfd vfs.FileDescription
@@ -90,21 +55,22 @@ type regularFD struct {
 // and no second lookup. When the host no longer holds that regular file, it
 // forgets the cached entry and resolves the path again, which gives the exact
 // error.
-func (d *dentry) openHost(flags int) (*os.File, error) {
+func (d *dentry) openHost(flags int) (*hostHandle, error) {
 	rel := d.path()
-	f, err := d.fs.ws.openRegularWithAttr(rel, d.inode.snapshot(), flags)
+	h, err := d.fs.ws.openHandleWithAttr(rel, d.inode.snapshot(), flags)
 	if err == nil {
-		return f, nil
+		return h, nil
 	}
 	d.inode.invalidateMeta()
-	f, _, err = d.fs.ws.openRegular(rel, flags)
-	return f, err
+	return d.fs.ws.openHandle(rel, flags)
 }
 
-func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *os.File) (*vfs.FileDescription, error) {
-	f := created
+// openRegular creates the file description of d. created is the handle of a
+// file that OpenAt just created, or nil.
+func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *hostHandle) (*vfs.FileDescription, error) {
+	h := created
 	writable := vfs.MayWriteFileWithOpenFlags(opts.Flags)
-	if f == nil {
+	if h == nil {
 		hostFlags := os.O_RDONLY
 		switch opts.Flags & linux.O_ACCMODE {
 		case linux.O_WRONLY:
@@ -113,12 +79,11 @@ func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *v
 			hostFlags = os.O_RDWR
 		}
 		var err error
-		f, err = d.openHost(hostFlags)
+		h, err = d.openHost(hostFlags)
 		if err != nil {
 			return nil, translateHostError(err)
 		}
 	}
-	h := newHostHandle(f)
 	fd := &regularFD{dentry: d, h: h}
 	fd.LockFD.Init(&d.inode.locks)
 	mnt := rp.Mount()
@@ -166,7 +131,7 @@ func (fd *regularFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Stat
 		return linux.Statx{}, err
 	}
 	e := d.inode.snapshot()
-	info, err := d.fs.ws.host.fstat(fd.h.f)
+	info, err := fd.h.fstat(d.fs.ws.host)
 	if err != nil {
 		return linux.Statx{}, translateHostError(err)
 	}
@@ -211,7 +176,7 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if err := fd.dentry.inode.data.flushRange(uint64(offset), end); err != nil {
 		return 0, translateHostError(err)
 	}
-	r := hostFileReader{f: fd.h.f, off: offset}
+	r := hostFileReader{h: fd.h, off: offset}
 	read, err := dst.CopyOutFrom(ctx, &r)
 	switch {
 	case err == nil:
@@ -230,7 +195,7 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 // destination. It replaces io.NewSectionReader and safemem.FromIOReader, which
 // together allocate two objects for each read.
 type hostFileReader struct {
-	f   *os.File
+	h   *hostHandle
 	off int64
 }
 
@@ -244,7 +209,7 @@ func (r *hostFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 		var n int
 		var err error
 		if !dst.NeedSafecopy() {
-			n, err = r.f.ReadAt(dst.ToSlice(), r.off)
+			n, err = r.h.readAt(dst.ToSlice(), r.off)
 		} else {
 			// ReadAt cannot write to memory that faults, so it reads into a
 			// scratch buffer first.
@@ -252,7 +217,7 @@ func (r *hostFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 				scratch = make([]byte, dst.Len())
 			}
 			var rn int
-			rn, err = r.f.ReadAt(scratch[:dst.Len()], r.off)
+			rn, err = r.h.readAt(scratch[:dst.Len()], r.off)
 			var werr error
 			n, werr = safemem.Copy(dst, safemem.BlockFromSafeSlice(scratch[:rn]))
 			if werr != nil {
@@ -291,7 +256,7 @@ type handleWriter struct {
 }
 
 func (w *handleWriter) Write(p []byte) (int, error) {
-	n, err := w.fd.h.f.WriteAt(p, w.off)
+	n, err := w.fd.h.writeAt(p, w.off)
 	if n > 0 {
 		w.fd.dentry.inode.invalidateMeta()
 		w.fd.dentry.inode.data.writeThrough(w.off, p[:n])
@@ -311,9 +276,12 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 	ino := d.inode
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
+	// The host watcher must not mistake this write for a host write.
+	ino.guestBegin()
+	defer fd.h.guestEnd(ino)
 
 	if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 {
-		info, err := d.fs.ws.host.fstat(fd.h.f)
+		info, err := fd.h.fstat(d.fs.ws.host)
 		if err != nil {
 			return 0, offset, translateHostError(err)
 		}
@@ -377,7 +345,7 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 	case linux.SEEK_CUR:
 		newOff = fd.off + offset
 	case linux.SEEK_END, linux.SEEK_DATA, linux.SEEK_HOLE:
-		info, err := fd.dentry.fs.ws.host.fstat(fd.h.f)
+		info, err := fd.h.fstat(fd.dentry.fs.ws.host)
 		if err != nil {
 			return 0, translateHostError(err)
 		}
@@ -440,23 +408,29 @@ func (i *inode) truncate(d *dentry, h *hostHandle, size int64) error {
 	if size < 0 {
 		return linuxerr.EINVAL
 	}
-	var f *os.File
-	if h != nil {
-		f = h.f
-	} else {
+	if h == nil {
 		opened, err := d.openHost(os.O_WRONLY)
 		if err != nil {
 			return translateHostError(err)
 		}
 		defer func() {
-			_ = opened.Close()
+			_ = opened.decRef()
 		}()
-		f = opened
+		h = opened
 	}
 	i.wmu.Lock()
 	defer i.wmu.Unlock()
-	if err := f.Truncate(size); err != nil {
+	i.guestBegin()
+	f, err := h.acquire()
+	if err != nil {
+		i.guestEnd(hostInfo{}, false)
 		return translateHostError(err)
+	}
+	truncErr := f.Truncate(size)
+	i.guestEndFile(f)
+	h.release()
+	if truncErr != nil {
+		return translateHostError(truncErr)
 	}
 	i.invalidateMeta()
 	i.data.truncated(size)
@@ -533,8 +507,16 @@ func newChunkBuf() []byte {
 // truth for read and write system calls. Writes go through to cached chunks.
 // Reads first write back the dirty chunks that they overlap.
 //
-// Concurrent modification of the host file by another host process is not
-// reflected in chunks that are already loaded.
+// A host process that changes the file is visible only while a guest inotify
+// watch covers the file or its directory. The host watcher then drops the
+// clean chunks through invalidateCleanChunks. Without a watch, chunks that
+// are already loaded keep the old bytes.
+//
+// A directory rename can close the attached handle and reopen it at the new
+// path. This is safe because the chunks live in Sentry memory, and the guest
+// reads and writes them without the host file. A chunk that the guest changed
+// stays dirty until a write-back writes it. A write-back goes through the
+// handle, which waits for the reopen. See handle_registry.go.
 type fileData struct {
 	ino *inode
 
@@ -572,13 +554,14 @@ func (c *fileData) attachHandle(h *hostHandle, writable bool) error {
 		return nil
 	}
 	if c.mh == nil {
-		info, err := c.ino.fs.ws.host.fstat(h.f)
+		info, err := h.fstat(c.ino.fs.ws.host)
 		if err != nil {
 			return err
 		}
 		c.size = info.size
 		c.chunks = make(map[uint64]*cacheChunk)
 	}
+	h.owner.Store(c)
 	h.incRef()
 	old := c.mh
 	c.mh = h
@@ -622,6 +605,14 @@ func (c *fileData) takeWritebackErr() error {
 	return err
 }
 
+// noteWritebackErr records a write-back failure that no caller can return, so
+// the next fsync or close reports it.
+func (c *fileData) noteWritebackErr(err error) {
+	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
+	c.wbErr = errors.Join(c.wbErr, err)
+}
+
 // syncData writes back every dirty chunk and returns any earlier write-back
 // failure that no caller observed.
 func (c *fileData) syncData() error {
@@ -648,6 +639,10 @@ func (c *fileData) flushLocked(start, end uint64) error {
 	if len(c.chunks) == 0 || c.mh == nil {
 		return nil
 	}
+	// The handle stays acquired from the first write to the end of the loop.
+	// A directory rename cannot close the file in between. The loop takes no
+	// lock of this package that the lock order places before the handle.
+	var f *os.File
 	var errs []error
 	for idx, ch := range c.chunks {
 		base := idx << chunkShift
@@ -662,12 +657,23 @@ func (c *fileData) flushLocked(start, end uint64) error {
 		if n > chunkSize {
 			n = chunkSize
 		}
-		if _, err := c.mh.f.WriteAt(ch.buf[:n], int64(base)); err != nil {
+		if f == nil {
+			var err error
+			if f, err = c.mh.acquire(); err != nil {
+				return err
+			}
+			c.ino.guestBegin()
+		}
+		if _, err := f.WriteAt(ch.buf[:n], int64(base)); err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		c.ino.invalidateMeta()
 		ch.dirty = c.writableMaps > 0
+	}
+	if f != nil {
+		c.ino.guestEndFile(f)
+		c.mh.release()
 	}
 	return errors.Join(errs...)
 }
@@ -729,6 +735,51 @@ func (c *fileData) truncated(size int64) {
 	}
 }
 
+// invalidateCleanChunks drops the cached state that a change by a host process
+// made stale. It refreshes the cached size, drops every chunk that holds no
+// guest modification, and invalidates every mapping, so the next access to a
+// mapped page loads the chunk again from the host file. A chunk with a guest
+// modification stays, because the next write-back would overwrite the host
+// bytes at that offset anyway.
+//
+// The order follows truncated: the mappings go first, and the chunk memory
+// goes after them, because a platform that mapped a chunk holds its own
+// reference. Invalidate calls into the memory manager, which holds its own
+// locks while it calls Translate, so dataMu must be free when it runs.
+func (c *fileData) invalidateCleanChunks() {
+	if !c.active.Load() {
+		return
+	}
+	c.mapsMu.Lock()
+	defer c.mapsMu.Unlock()
+
+	c.dataMu.Lock()
+	if c.mh == nil {
+		c.dataMu.Unlock()
+		return
+	}
+	if info, err := c.mh.fstat(c.ino.fs.ws.host); err == nil {
+		c.size = info.size
+	}
+	var dropped []*cacheChunk
+	for idx, ch := range c.chunks {
+		base := int64(idx) << chunkShift
+		switch {
+		case !ch.dirty:
+			dropped = append(dropped, ch)
+			delete(c.chunks, idx)
+		case base < c.size && base+chunkSize > c.size:
+			clear(ch.buf[c.size-base:])
+		}
+	}
+	c.dataMu.Unlock()
+
+	c.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	for _, ch := range dropped {
+		ch.release()
+	}
+}
+
 // chunkLocked returns the chunk idx, loading it from the host file when absent.
 func (c *fileData) chunkLocked(idx uint64) (*cacheChunk, error) {
 	if ch, ok := c.chunks[idx]; ok {
@@ -741,7 +792,7 @@ func (c *fileData) chunkLocked(idx uint64) (*cacheChunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.mh.f.ReadAt(ch.buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
+	if _, err := c.mh.readAt(ch.buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
 		ch.release()
 		return nil, err
 	}

@@ -43,6 +43,8 @@ func translateHostError(err error) error {
 		return linuxerr.EISDIR
 	case errors.Is(err, errInvalidMove), errors.Is(err, errInvalidHostName):
 		return linuxerr.EINVAL
+	case errors.Is(err, errNameTooLong):
+		return linuxerr.ENAMETOOLONG
 	case errors.Is(err, errHostUnsupported):
 		return linuxerr.EOPNOTSUPP
 	case errors.Is(err, os.ErrClosed):

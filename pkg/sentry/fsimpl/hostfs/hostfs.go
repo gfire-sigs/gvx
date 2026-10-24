@@ -36,6 +36,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -54,7 +55,10 @@ const (
 	MetaFileName = ".gvx_meta"
 	metaTempName = ".gvx_meta.tmp"
 
-	metaVersion = 1
+	// metaVersion is the schema version that hostfs writes. metaVersionV1 is
+	// the schema before the xattr field. The reader accepts both.
+	metaVersion   = 2
+	metaVersionV1 = 1
 
 	// defaultMetaCoalesce is the delay between the first unflushed mutation
 	// and the background flush. Later mutations in the window share one flush.
@@ -97,19 +101,22 @@ var (
 	errInvalidMove = errors.New("hostfs: cannot move a directory into itself")
 )
 
-// POSIXAttr stores virtual POSIX permissions, ownership, and symlink target
-// metadata in .gvx_meta for a workspace-relative path.
+// POSIXAttr stores virtual POSIX permissions, ownership, symlink target, and
+// extended attributes in .gvx_meta for a workspace-relative path. It is the
+// record of schema version 2.
 //
 // Atime, Mtime, and Ctime hold Unix nanoseconds. They apply to virtual
-// symlinks only, which have no host file to carry timestamps.
+// symlinks only, which have no host file to carry timestamps. Xattrs holds the
+// extended attributes that the host cannot store.
 type POSIXAttr struct {
-	Mode    uint32 `json:"mode"`
-	UID     uint32 `json:"uid"`
-	GID     uint32 `json:"gid"`
-	Symlink string `json:"symlink,omitempty"`
-	Atime   int64  `json:"atime,omitempty"`
-	Mtime   int64  `json:"mtime,omitempty"`
-	Ctime   int64  `json:"ctime,omitempty"`
+	Mode    uint32            `json:"mode"`
+	UID     uint32            `json:"uid"`
+	GID     uint32            `json:"gid"`
+	Symlink string            `json:"symlink,omitempty"`
+	Xattrs  map[string][]byte `json:"xattrs,omitempty"`
+	Atime   int64             `json:"atime,omitempty"`
+	Mtime   int64             `json:"mtime,omitempty"`
+	Ctime   int64             `json:"ctime,omitempty"`
 }
 
 type metaStoreFile struct {
@@ -134,9 +141,11 @@ func (e *entry) isSymlink() bool {
 	return e.attr.Mode&linux.S_IFMT == linux.S_IFLNK
 }
 
-// dirNames is a snapshot of one directory listing used to verify that a name
-// exists with exactly the requested case. The snapshot follows mutations
-// through Workspace.addDirNameLocked and Workspace.removeDirNameLocked.
+// dirNames is a snapshot of one directory listing. It holds the host names as
+// the host stores them, and it verifies that a name exists with exactly the
+// requested case, form, and escape. The snapshot follows mutations through
+// Workspace.addDirNameLocked and Workspace.removeDirNameLocked. The snapshot
+// belongs to the guest directory path that keys Workspace.nameCache.
 type dirNames struct {
 	id    hostID
 	mtime int64
@@ -144,6 +153,9 @@ type dirNames struct {
 	// of the directory.
 	until int64
 	names map[string]struct{}
+	// aux holds the secondary indexes. Workspace.nameMu protects it, and a
+	// change of names resets it.
+	aux *dirAux
 }
 
 // Workspace wraps a pre-opened Go 1.25+ *os.Root directory handle and enforces
@@ -152,7 +164,7 @@ type Workspace struct {
 	// mu protects meta, metaGen, and closed. Lock order: Workspace.mu, then
 	// pinMu, then nameMu. filesystem.mu is always taken before Workspace.mu.
 	mu       sync.RWMutex
-	hostPath string
+	rootPath string
 	root     *os.Root
 	host     hostBackend
 	readOnly bool
@@ -170,6 +182,9 @@ type Workspace struct {
 
 	nameMu    sync.Mutex
 	nameCache map[string]*dirNames
+	// altNames holds the stored host names that differ from the plain
+	// encoding of the guest name. nameMu protects it. See names.go.
+	altNames map[altKey]string
 
 	// pinMu protects pins, the sweep state, and the fields of every pin but
 	// h, id, and root. pins holds the pinned directory handles by
@@ -193,9 +208,34 @@ type Workspace struct {
 	// when chunks live on the Go heap.
 	chunkMem atomic.Pointer[chunkMemoryHolder]
 
+	// watch bridges changes that host processes make to the guest. See
+	// watcher.go.
+	watch hostWatcher
+
 	// beforeMetaRename lets tests stop a flush between the temporary file
 	// write and the rename, which models a crash.
 	beforeMetaRename func() error
+
+	// caps records the capabilities of the host volume. The fields below it
+	// follow from caps and never change after openWorkspace returns.
+	caps WorkspaceCaps
+	// codec translates between guest names and host names.
+	codec NameCodec
+	// stateful reports that the stored name of an entry can differ from the
+	// plain encoding of its guest name: the volume folds case or normalizes
+	// Unicode.
+	stateful bool
+	// clutter selects the host shell files that guest listings hide.
+	clutter clutterRules
+	// handles tracks the open regular-file handles when the host locks an
+	// open directory against a move. It is nil on every other host. See
+	// handle_registry.go.
+	handles *winHandleRegistry
+
+	// pruneKeys and pruneCursor drive the incremental check of the .gvx_meta
+	// records against the host. mu protects them.
+	pruneKeys   []string
+	pruneCursor int
 }
 
 type workspaceOptions struct {
@@ -206,6 +246,11 @@ type workspaceOptions struct {
 	wrapHost func(hostBackend) hostBackend
 	// clock replaces the monotonic clock of the cache expiry.
 	clock func() int64
+	// caps replaces the probe of the host volume. Tests use it to model
+	// another volume.
+	caps *WorkspaceCaps
+	// hostOS replaces runtime.GOOS where hostfs picks the host clutter rules.
+	hostOS string
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files. A platform
@@ -265,8 +310,18 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		start := time.Now()
 		clock = func() int64 { return int64(time.Since(start)) }
 	}
+	var caps WorkspaceCaps
+	if opts.caps != nil {
+		caps = *opts.caps
+	} else {
+		caps = platformCaps(host, readOnly)
+	}
+	hostOS := opts.hostOS
+	if hostOS == "" {
+		hostOS = runtime.GOOS
+	}
 	w := &Workspace{
-		hostPath:         absPath,
+		rootPath:         absPath,
 		root:             root,
 		host:             host,
 		readOnly:         readOnly,
@@ -277,11 +332,21 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		clock:            clock,
 		coalesce:         opts.coalesce,
 		beforeMetaRename: opts.beforeMetaRename,
+		caps:             caps,
+		codec:            newNameCodec(caps),
+		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
+		clutter:          clutterRulesFor(hostOS),
+	}
+	if caps.LocksOpenDirMove {
+		w.handles = newWinHandleRegistry(workspaceHandleOps{w})
 	}
 	if err := w.loadMeta(); err != nil {
 		_ = host.close()
 		_ = root.Close()
 		return nil, err
+	}
+	if !readOnly {
+		w.sweepEphemeral()
 	}
 	if !readOnly && w.coalesce > 0 {
 		w.kick = make(chan struct{}, 1)
@@ -299,7 +364,7 @@ func (w *Workspace) Root() *os.Root {
 
 // HostPath returns the absolute host directory path of the workspace.
 func (w *Workspace) HostPath() string {
-	return w.hostPath
+	return w.rootPath
 }
 
 // ReadOnly reports whether the workspace mount disallows mutations.
@@ -318,6 +383,7 @@ func (w *Workspace) Close() error {
 	w.closing = true
 	w.mu.Unlock()
 
+	w.watchShutdown()
 	if w.stop != nil {
 		close(w.stop)
 		<-w.done
@@ -404,7 +470,7 @@ func (w *Workspace) loadMeta() error {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return fmt.Errorf("hostfs: parse %s: %w", MetaFileName, err)
 	}
-	if parsed.Version != metaVersion {
+	if parsed.Version != metaVersion && parsed.Version != metaVersionV1 {
 		return fmt.Errorf("hostfs: %s has unsupported version %d", MetaFileName, parsed.Version)
 	}
 	for k, v := range parsed.Entries {
@@ -414,6 +480,9 @@ func (w *Workspace) loadMeta() error {
 		}
 		w.meta[cleanKey] = v
 	}
+	// Records of host files that vanished while no guest ran are dead state.
+	w.pruneOrphansLocked(len(w.meta))
+	w.pruneKeys, w.pruneCursor = nil, 0
 	return nil
 }
 
@@ -461,11 +530,21 @@ func (w *Workspace) flushMeta() error {
 	defer w.flushMu.Unlock()
 
 	w.mu.RLock()
-	gen := w.metaGen
-	if gen == w.metaFlushedGen {
-		w.mu.RUnlock()
+	dirty := w.metaGen != w.metaFlushedGen
+	w.mu.RUnlock()
+	if !dirty {
 		return nil
 	}
+	// Drop the records whose host object vanished before the table goes to
+	// disk. One batch per flush keeps the pause short.
+	w.mu.Lock()
+	if !w.closed {
+		w.pruneOrphansLocked(pruneBatch)
+	}
+	w.mu.Unlock()
+
+	w.mu.RLock()
+	gen := w.metaGen
 	payload, err := json.Marshal(metaStoreFile{Version: metaVersion, Entries: w.meta})
 	w.mu.RUnlock()
 	if err != nil {
@@ -525,96 +604,121 @@ func (w *Workspace) nowNano() int64 {
 	return w.clock()
 }
 
-// exactNameIn reports whether the host stores rel under exactly the
-// requested name. On a case-insensitive volume the host resolves "A" to a file
-// stored as "a". Guest code expects case-sensitive names, so hostfs compares
-// the requested name with the stored directory entry. A non-nil pin is the
-// pinned handle of the directory that holds rel. The snapshot of the listing
-// stays valid for cacheTTL without a host call, and a stat of the directory
-// proves it afterwards.
-func (w *Workspace) exactNameIn(rel string, pin *dirPin) (bool, error) {
-	if !w.host.caseInsensitive() || rel == "." {
+// exactNameIn reports whether the host stores the entry leaf of the guest
+// directory parent under exactly that name. On a case-insensitive volume the
+// host resolves "A" to a file stored as "a". Guest code expects case-sensitive
+// names, so hostfs compares the requested name with the stored directory
+// entry. A non-nil pin is the pinned handle of the directory parent.
+func (w *Workspace) exactNameIn(parent, leaf string, pin *dirPin) (bool, error) {
+	if !w.host.caseInsensitive() {
 		return true, nil
 	}
-	parent, name := splitParent(rel)
 	for attempt := range 2 {
-		now := w.nowNano()
-		w.nameMu.Lock()
-		cached := w.nameCache[parent]
-		fresh := attempt == 0 && cached != nil && now < cached.until
-		w.nameMu.Unlock()
-		if !fresh {
-			pinfo, err := w.dirInfo(parent, pin)
-			if err != nil {
-				return false, err
-			}
-			w.nameMu.Lock()
-			cached = w.nameCache[parent]
-			fresh = attempt == 0 && cached != nil && cached.id == pinfo.id && cached.mtime == pinfo.mtime.UnixNano()
-			if fresh {
-				cached.until = now + int64(cacheTTL)
-			}
-			w.nameMu.Unlock()
-			if !fresh {
-				entries, err := w.host.readDir(parent)
-				if err != nil {
-					return false, err
-				}
-				cached = &dirNames{id: pinfo.id, mtime: pinfo.mtime.UnixNano(), until: now + int64(cacheTTL), names: make(map[string]struct{}, len(entries))}
-				for _, e := range entries {
-					cached.names[e.name] = struct{}{}
-				}
-				w.nameMu.Lock()
-				if len(w.nameCache) >= maxNameCacheDirs {
-					w.nameCache = make(map[string]*dirNames)
-				}
-				w.nameCache[parent] = cached
-				w.nameMu.Unlock()
-			}
+		snap, fresh, err := w.snapshotDir(parent, pin, attempt == 1)
+		if err != nil {
+			return false, err
 		}
 		w.nameMu.Lock()
-		_, ok := cached.names[name]
+		_, ok := snap.names[leaf]
 		w.nameMu.Unlock()
-		if ok {
-			return true, nil
-		}
-		if !fresh {
-			return false, nil
+		if ok || fresh {
+			return ok, nil
 		}
 		// A cached snapshot may predate an external creation: re-read once.
 	}
 	return false, nil
 }
 
-// dirInfo reads the metadata of the directory rel. It uses the pin when one
-// is given and a path walk otherwise.
+// snapshotDir returns the listing snapshot of the guest directory parent. The
+// snapshot stays valid for cacheTTL without a host call, and a stat of the
+// directory proves it afterwards. A non-nil pin is the pinned handle of the
+// directory. forceRead skips the cache. The second result reports that the
+// call read the directory from the host.
+func (w *Workspace) snapshotDir(parent string, pin *dirPin, forceRead bool) (*dirNames, bool, error) {
+	now := w.nowNano()
+	w.nameMu.Lock()
+	cached := w.nameCache[parent]
+	if !forceRead && cached != nil && now < cached.until {
+		w.nameMu.Unlock()
+		return cached, false, nil
+	}
+	w.nameMu.Unlock()
+	pinfo, err := w.dirInfo(parent, pin)
+	if err != nil {
+		return nil, false, err
+	}
+	if !forceRead {
+		w.nameMu.Lock()
+		cached = w.nameCache[parent]
+		if cached != nil && cached.id == pinfo.id && cached.mtime == pinfo.mtime.UnixNano() {
+			cached.until = now + int64(cacheTTL)
+			w.nameMu.Unlock()
+			return cached, false, nil
+		}
+		w.nameMu.Unlock()
+	}
+	hostDir, err := w.hostPath(parent)
+	if err != nil {
+		return nil, false, err
+	}
+	entries, err := w.host.readDir(hostDir)
+	if err != nil {
+		return nil, false, err
+	}
+	snap := &dirNames{id: pinfo.id, mtime: pinfo.mtime.UnixNano(), until: now + int64(cacheTTL), names: make(map[string]struct{}, len(entries))}
+	for _, e := range entries {
+		snap.names[e.name] = struct{}{}
+	}
+	w.nameMu.Lock()
+	if len(w.nameCache) >= maxNameCacheDirs {
+		w.nameCache = make(map[string]*dirNames)
+	}
+	w.nameCache[parent] = snap
+	w.nameMu.Unlock()
+	return snap, true, nil
+}
+
+// dirInfo reads the metadata of the guest directory rel. It uses the pin when
+// one is given and a path walk otherwise.
 func (w *Workspace) dirInfo(rel string, pin *dirPin) (hostInfo, error) {
 	if pin != nil {
 		return w.host.fstatDir(pin.h)
 	}
-	return w.host.lstat(rel)
+	hostDir, err := w.hostPath(rel)
+	if err != nil {
+		return hostInfo{}, err
+	}
+	return w.host.lstat(hostDir)
 }
 
-// tracksDirNames reports whether the backend needs the listing snapshots.
-func (w *Workspace) tracksDirNames() bool {
+// needsExactCheck reports whether the backend resolves a name that differs in
+// case from the stored name and leaves the comparison to hostfs.
+func (w *Workspace) needsExactCheck() bool {
 	return w.host.caseInsensitive() && !w.host.caseVerified()
 }
 
-// addDirNameLocked records that the host directory dir now holds name. It
-// updates the snapshot of dir in place, so the next exactNameIn call does not
-// list dir again. A directory without a snapshot stays without one. Callers
-// hold w.mu for writing.
-func (w *Workspace) addDirNameLocked(dir, name string) {
-	w.updateDirName(dir, name, true)
+// tracksDirNames reports whether the listing snapshots need updates when the
+// guest mutates a directory.
+func (w *Workspace) tracksDirNames() bool {
+	return w.stateful || w.needsExactCheck()
 }
 
-// removeDirNameLocked records that the host directory dir no longer holds
-// name. Callers hold w.mu for writing.
-func (w *Workspace) removeDirNameLocked(dir, name string) {
-	w.updateDirName(dir, name, false)
+// addDirNameLocked records that the host directory dir now holds the entry
+// hostName for the guest name name. It updates the snapshot of dir in place, so
+// the next lookup does not list dir again. A directory without a snapshot stays
+// without one. Callers hold w.mu for writing.
+func (w *Workspace) addDirNameLocked(dir, name, hostName string) {
+	w.updateDirName(dir, name, hostName, true)
 }
 
-func (w *Workspace) updateDirName(dir, name string, present bool) {
+// removeDirNameLocked records that the host directory dir no longer holds the
+// entry hostName. Callers hold w.mu for writing.
+func (w *Workspace) removeDirNameLocked(dir, name, hostName string) {
+	w.updateDirName(dir, name, hostName, false)
+}
+
+func (w *Workspace) updateDirName(dir, name, hostName string, present bool) {
+	w.watchNoteName(dir, name)
 	if !w.tracksDirNames() {
 		return
 	}
@@ -625,10 +729,11 @@ func (w *Workspace) updateDirName(dir, name string, present bool) {
 		return
 	}
 	if present {
-		cached.names[name] = struct{}{}
+		cached.names[hostName] = struct{}{}
 	} else {
-		delete(cached.names, name)
+		delete(cached.names, hostName)
 	}
+	cached.aux = nil
 	w.nameMu.Unlock()
 
 	// The mutation changed the modification time of the directory. Stamp the
@@ -685,7 +790,7 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 		typ = linux.S_IFREG
 	}
 	if m, ok := w.meta[rel]; ok {
-		return POSIXAttr{Mode: typ | m.Mode&0o7777, UID: m.UID, GID: m.GID}
+		return POSIXAttr{Mode: typ | m.Mode&0o7777, UID: m.UID, GID: m.GID, Xattrs: m.Xattrs}
 	}
 	return POSIXAttr{Mode: typ | defaultPerm(info)}
 }
@@ -694,37 +799,51 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 // It walks the path from the workspace root on every call, so the result
 // never depends on a pinned handle. Callers hold w.mu.
 func (w *Workspace) lookupLocked(rel string) (entry, error) {
+	e, _, err := w.lookupProbeLocked(rel)
+	return e, err
+}
+
+// lookupProbeLocked is lookupLocked that also returns where the host holds the
+// entry, or the name that a new entry at rel would get. Callers hold w.mu.
+func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 	if w.closed {
-		return entry{}, os.ErrClosed
+		return entry{}, hostProbe{}, os.ErrClosed
 	}
 	if isReservedPath(rel) {
-		return entry{}, fs.ErrNotExist
+		return entry{}, hostProbe{}, fs.ErrNotExist
 	}
 	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
 		parent, _ := splitParent(rel)
-		pinfo, err := w.host.lstat(parent)
+		hostDir, err := w.hostPath(parent)
 		if err != nil {
-			return entry{}, err
+			return entry{}, hostProbe{}, err
+		}
+		pinfo, err := w.host.lstat(hostDir)
+		if err != nil {
+			return entry{}, hostProbe{}, err
 		}
 		if pinfo.kind != hostKindDir {
-			return entry{}, errNotDir
+			return entry{}, hostProbe{}, errNotDir
 		}
-		return virtualEntry(m), nil
+		return virtualEntry(m), hostProbe{}, nil
 	}
-	info, err := w.host.lstat(rel)
+	if rel == "." {
+		info, err := w.host.lstat(rel)
+		if err != nil {
+			return entry{}, hostProbe{}, err
+		}
+		e, err := w.entryFromInfo(rel, info)
+		return e, hostProbe{found: true, info: info}, err
+	}
+	p, err := w.locateLocked(rel)
 	if err != nil {
-		return entry{}, err
+		return entry{}, hostProbe{}, err
 	}
-	// A backend that reports caseVerified compared the stored name inside
-	// lstat already, so the directory listing would add nothing.
-	if !w.host.caseVerified() {
-		if ok, err := w.exactNameIn(rel, nil); err != nil {
-			return entry{}, err
-		} else if !ok {
-			return entry{}, nameMismatch(rel)
-		}
+	if !p.found || p.hidden {
+		return entry{}, p, p.missingError(rel)
 	}
-	return w.entryFromInfo(rel, info)
+	e, err := w.entryFromInfo(rel, p.info)
+	return e, p, err
 }
 
 // entryFromInfo builds the effective state of rel from its host metadata.
@@ -734,7 +853,11 @@ func (w *Workspace) entryFromInfo(rel string, info hostInfo) (entry, error) {
 	case hostKindDir, hostKindRegular:
 		return entry{attr: w.effectiveAttr(rel, info), info: info}, nil
 	case hostKindSymlink:
-		target, err := w.host.readlink(rel)
+		hostRel, err := w.hostPath(rel)
+		if err != nil {
+			return entry{}, err
+		}
+		target, err := w.host.readlink(hostRel)
 		if err != nil {
 			return entry{}, err
 		}
@@ -797,7 +920,11 @@ func (w *Workspace) checkWritableLocked(rels ...string) error {
 // checkParentDirLocked verifies that the parent of rel is a host directory.
 func (w *Workspace) checkParentDirLocked(rel string) error {
 	parent, _ := splitParent(rel)
-	pinfo, err := w.host.lstat(parent)
+	hostDir, err := w.hostPath(parent)
+	if err != nil {
+		return err
+	}
+	pinfo, err := w.host.lstat(hostDir)
 	if err != nil {
 		return err
 	}
@@ -807,20 +934,42 @@ func (w *Workspace) checkParentDirLocked(rel string) error {
 	return nil
 }
 
-// existsLocked reports whether rel names any entry, host or virtual.
-func (w *Workspace) existsLocked(rel string) (bool, error) {
+// createTargetLocked returns the host path and the stored name for a new entry
+// at rel. It fails with fs.ErrExist when an entry that the guest can see, or a
+// virtual symlink, holds the name. A hidden host clutter file at the name goes
+// away first. Callers hold w.mu for writing.
+func (w *Workspace) createTargetLocked(rel string) (hostRel, leaf string, err error) {
 	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
-		return true, nil
+		return "", "", fs.ErrExist
 	}
-	_, err := w.host.lstat(rel)
-	switch {
-	case err == nil, errors.Is(err, errNameMismatch):
-		return true, nil
-	case errors.Is(err, fs.ErrNotExist):
-		return false, nil
-	default:
-		return false, err
+	p, err := w.locateLocked(rel)
+	if err != nil {
+		return "", "", err
 	}
+	if p.found {
+		if !p.clutter {
+			return "", "", fs.ErrExist
+		}
+		hostRel, err = w.hostPath(rel)
+		if err != nil {
+			return "", "", err
+		}
+		if err := w.host.unlink(hostRel); err != nil && !isNotExist(err) {
+			return "", "", err
+		}
+		return hostRel, leafOf(hostRel), nil
+	}
+	if p.collided && !w.stateful {
+		// The host holds the name under another case, and hostfs cannot tell
+		// it apart.
+		return "", "", fs.ErrExist
+	}
+	parent, _ := splitParent(rel)
+	hostDir, err := w.hostPath(parent)
+	if err != nil {
+		return "", "", err
+	}
+	return hostChild(hostDir, p.create), p.create, nil
 }
 
 func hostOpenFlags(flags int) (int, error) {
@@ -859,6 +1008,11 @@ func (w *Workspace) OpenFile(relPath string, flags int, mode uint32) (*os.File, 
 func (w *Workspace) openRegular(rel string, flags int) (*os.File, entry, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	return w.openRegularLocked(rel, flags)
+}
+
+// openRegularLocked is openRegular for a caller that holds w.mu.
+func (w *Workspace) openRegularLocked(rel string, flags int) (*os.File, entry, error) {
 	e, err := w.lookupLocked(rel)
 	if err != nil {
 		return nil, entry{}, err
@@ -869,7 +1023,11 @@ func (w *Workspace) openRegular(rel string, flags int) (*os.File, entry, error) 
 	if e.isSymlink() {
 		return nil, entry{}, ErrPathTraversal
 	}
-	f, err := w.host.open(rel, flags&^(os.O_CREATE|os.O_EXCL), 0)
+	hostRel, err := w.hostPath(rel)
+	if err != nil {
+		return nil, entry{}, err
+	}
+	f, err := w.host.open(hostRel, flags&^(os.O_CREATE|os.O_EXCL), 0)
 	if err != nil {
 		return nil, entry{}, err
 	}
@@ -882,32 +1040,37 @@ func (w *Workspace) openRegular(rel string, flags int) (*os.File, entry, error) 
 func (w *Workspace) createFile(rel string, perm, uid, gid uint32) (*os.File, entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.createFileLocked(rel, perm, uid, gid)
+}
+
+// createFileLocked is createFile for a caller that holds w.mu for writing.
+func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.File, entry, error) {
 	if err := w.checkWritableLocked(rel); err != nil {
 		return nil, entry{}, err
 	}
 	if rel == "." {
 		return nil, entry{}, errIsDir
 	}
-	if exists, err := w.existsLocked(rel); err != nil {
+	hostRel, leaf, err := w.createTargetLocked(rel)
+	if err != nil {
 		return nil, entry{}, err
-	} else if exists {
-		return nil, entry{}, fs.ErrExist
 	}
-	f, err := w.host.open(rel, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := w.host.open(hostRel, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, entry{}, err
 	}
 	info, err := w.host.fstat(f)
 	if err != nil {
 		_ = f.Close()
-		_ = w.host.unlink(rel)
+		_ = w.host.unlink(hostRel)
 		return nil, entry{}, err
 	}
 	attr := POSIXAttr{Mode: linux.S_IFREG | perm&0o7777, UID: uid, GID: gid}
 	w.meta[rel] = attr
 	w.markDirtyLocked()
 	parent, name := splitParent(rel)
-	w.addDirNameLocked(parent, name)
+	w.setAlt(parent, name, leaf)
+	w.addDirNameLocked(parent, name, leaf)
 	return f, entry{attr: attr, info: info}, nil
 }
 
@@ -997,18 +1160,18 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if rel == "." {
 		return fs.ErrExist
 	}
-	if exists, err := w.existsLocked(rel); err != nil {
+	hostRel, leaf, err := w.createTargetLocked(rel)
+	if err != nil {
 		return err
-	} else if exists {
-		return fs.ErrExist
 	}
-	if err := w.host.mkdir(rel); err != nil {
+	if err := w.host.mkdir(hostRel); err != nil {
 		return err
 	}
 	w.meta[rel] = POSIXAttr{Mode: linux.S_IFDIR | mode&0o7777, UID: uid, GID: gid}
 	w.markDirtyLocked()
 	parent, name := splitParent(rel)
-	w.addDirNameLocked(parent, name)
+	w.setAlt(parent, name, leaf)
+	w.addDirNameLocked(parent, name, leaf)
 	return nil
 }
 
@@ -1098,7 +1261,11 @@ func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAt
 		if k == skip || m.Symlink != "" {
 			continue
 		}
-		info, err := w.host.lstat(k)
+		hostRel, err := w.hostPath(k)
+		if err != nil {
+			continue
+		}
+		info, err := w.host.lstat(hostRel)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotDir) {
 				continue
@@ -1137,10 +1304,8 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 	if err := w.checkParentDirLocked(rel); err != nil {
 		return err
 	}
-	if exists, err := w.existsLocked(rel); err != nil {
+	if _, _, err := w.createTargetLocked(rel); err != nil {
 		return err
-	} else if exists {
-		return fs.ErrExist
 	}
 	now := time.Now().UnixNano()
 	w.meta[rel] = POSIXAttr{
@@ -1240,16 +1405,46 @@ func (w *Workspace) rename(oldRel, newRel string) error {
 	if err := w.checkParentDirLocked(newRel); err != nil {
 		return err
 	}
-	dst, dstErr := w.lookupLocked(newRel)
+	dst, dstProbe, dstErr := w.lookupProbeLocked(newRel)
 	dstExists := dstErr == nil
 	if dstErr != nil && !errors.Is(dstErr, fs.ErrNotExist) {
 		return dstErr
 	}
-	if errors.Is(dstErr, errNameMismatch) && !strings.EqualFold(oldRel, newRel) {
-		// The host would replace the file that holds the other-case name,
-		// which the guest sees as a different file.
-		return fs.ErrExist
+
+	oldParent, oldName := splitParent(oldRel)
+	newParent, newName := splitParent(newRel)
+	var srcPath string
+	if !src.virtual {
+		if srcPath, err = w.hostPath(oldRel); err != nil {
+			return err
+		}
 	}
+	dstLeaf := dstProbe.create
+	if !dstExists && dstProbe.collided {
+		switch {
+		case dstProbe.occupant != "" && !src.virtual && strings.EqualFold(oldParent, newParent) && dstProbe.occupant == leafOf(srcPath):
+			// Only the case of the name changes: the entry keeps the plain
+			// form of the new name.
+			if dstLeaf, err = w.codec.leafForm(newName); err != nil {
+				return err
+			}
+		case dstProbe.occupant == "" && !strings.EqualFold(oldRel, newRel):
+			// The host would replace the file that holds the other-case name,
+			// which the guest sees as a different file.
+			return fs.ErrExist
+		}
+	}
+	if dstExists || dstLeaf == "" {
+		if dstLeaf, err = w.hostLeaf(newParent, newName); err != nil {
+			return err
+		}
+	}
+	newHostDir, err := w.hostPath(newParent)
+	if err != nil {
+		return err
+	}
+	dstPath := hostChild(newHostDir, dstLeaf)
+
 	if dstExists {
 		if !src.virtual && !dst.virtual && src.info.id == dst.info.id && !src.isDir() {
 			// Two names of one file: POSIX rename succeeds and changes nothing.
@@ -1261,24 +1456,19 @@ func (w *Workspace) rename(oldRel, newRel string) error {
 		case !src.isDir() && dst.isDir():
 			return errIsDir
 		case src.isDir():
-			empty, err := w.dirEmptyLocked(newRel)
-			if err != nil {
+			if err := w.purgeEmptyDirLocked(newRel, dstPath); err != nil {
 				return err
-			}
-			if !empty {
-				return errNotEmpty
 			}
 		}
 	}
 
-	oldParent, oldName := splitParent(oldRel)
-	newParent, newName := splitParent(newRel)
+	var quiesced *quiescedTree
 	if src.virtual {
 		if dstExists && !dst.virtual {
-			if err := w.host.unlink(newRel); err != nil {
+			if err := w.host.unlink(dstPath); err != nil {
 				return err
 			}
-			w.removeDirNameLocked(newParent, newName)
+			w.removeDirNameLocked(newParent, newName, dstLeaf)
 		}
 	} else {
 		// Windows refuses to rename a directory with an open handle below it,
@@ -1290,20 +1480,47 @@ func (w *Workspace) rename(oldRel, newRel string) error {
 			w.closeSubtreeHandlesLocked(newRel)
 		}
 		if dstExists && dst.isDir() && !dst.virtual && !hostRenameReplacesDir {
-			if err := w.host.rmdir(newRel); err != nil {
+			if err := w.host.rmdir(dstPath); err != nil {
 				return err
 			}
 		}
-		if err := w.host.rename(oldRel, newRel); err != nil {
+		// A host that locks an open directory against a move needs the files
+		// below the directory closed during the rename. They reopen after the
+		// stored names moved.
+		if src.isDir() {
+			quiesced = w.handles.quiesce(oldRel)
+		}
+		if err := w.host.rename(srcPath, dstPath); err != nil {
+			_ = quiesced.finish(false, "")
 			return err
 		}
-		w.removeDirNameLocked(oldParent, oldName)
-		w.addDirNameLocked(newParent, newName)
+		w.removeDirNameLocked(oldParent, oldName, leafOf(srcPath))
+		w.addDirNameLocked(newParent, newName, dstLeaf)
 		if src.isDir() {
 			w.dropDirNamesLocked(oldRel)
 		}
 		if dstExists && dst.isDir() {
 			w.dropDirNamesLocked(newRel)
+		}
+	}
+
+	// The stored names move with the entries. The destination entry and its
+	// subtree die, the subtree of the source moves, and the moved entry gets
+	// the stored name of its new name.
+	w.dropAltTree(newRel)
+	w.moveAltTree(oldRel, newRel)
+	w.dropAlt(oldParent, oldName)
+	if !src.virtual {
+		w.setAlt(newParent, newName, dstLeaf)
+		// Open handles follow their files to the new names. A replaced file
+		// keeps its open handles, which no longer name any path.
+		if src.isDir() {
+			_ = quiesced.finish(true, newRel)
+		} else {
+			if dstExists {
+				w.handles.detach(newRel)
+			}
+			w.handles.moveFile(oldRel, newRel)
 		}
 	}
 
@@ -1329,22 +1546,6 @@ func (w *Workspace) rename(oldRel, newRel string) error {
 	return nil
 }
 
-// dirEmptyLocked reports whether the directory holds neither host entries nor
-// virtual symlinks.
-func (w *Workspace) dirEmptyLocked(rel string) (bool, error) {
-	prefix := rel + "/"
-	for k, m := range w.meta {
-		if m.Symlink != "" && strings.HasPrefix(k, prefix) {
-			return false, nil
-		}
-	}
-	entries, err := w.host.readDir(rel)
-	if err != nil {
-		return false, err
-	}
-	return len(entries) == 0, nil
-}
-
 // link creates a hard link. The new path shares the host file and its
 // attributes with oldRel.
 func (w *Workspace) link(oldRel, newRel string) error {
@@ -1363,18 +1564,22 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	if err := w.checkParentDirLocked(newRel); err != nil {
 		return err
 	}
-	if exists, err := w.existsLocked(newRel); err != nil {
+	srcPath, err := w.hostPath(oldRel)
+	if err != nil {
 		return err
-	} else if exists {
-		return fs.ErrExist
 	}
-	if err := w.host.link(oldRel, newRel); err != nil {
+	dstPath, leaf, err := w.createTargetLocked(newRel)
+	if err != nil {
+		return err
+	}
+	if err := w.host.link(srcPath, dstPath); err != nil {
 		return err
 	}
 	w.meta[newRel] = src.attr
 	w.markDirtyLocked()
 	parent, name := splitParent(newRel)
-	w.addDirNameLocked(parent, name)
+	w.setAlt(parent, name, leaf)
+	w.addDirNameLocked(parent, name, leaf)
 	return nil
 }
 
@@ -1405,11 +1610,17 @@ func (w *Workspace) unlink(rel string) error {
 		return errIsDir
 	}
 	if !e.virtual {
-		if err := w.host.unlink(rel); err != nil {
+		hostRel, err := w.hostPath(rel)
+		if err != nil {
 			return err
 		}
+		if err := w.host.unlink(hostRel); err != nil {
+			return err
+		}
+		w.handles.detach(rel)
 		parent, name := splitParent(rel)
-		w.removeDirNameLocked(parent, name)
+		w.removeDirNameLocked(parent, name, leafOf(hostRel))
+		w.dropAlt(parent, name)
 	}
 	delete(w.meta, rel)
 	w.markDirtyLocked()
@@ -1441,23 +1652,24 @@ func (w *Workspace) rmdir(rel string) error {
 	if !e.isDir() {
 		return errNotDir
 	}
-	empty, err := w.dirEmptyLocked(rel)
+	hostRel, err := w.hostPath(rel)
 	if err != nil {
 		return err
 	}
-	if !empty {
-		return errNotEmpty
+	if err := w.purgeEmptyDirLocked(rel, hostRel); err != nil {
+		return err
 	}
 	// Windows refuses to remove a directory that has an open handle.
 	w.closeSubtreeHandlesLocked(rel)
-	if err := w.host.rmdir(rel); err != nil {
+	if err := w.host.rmdir(hostRel); err != nil {
 		return err
 	}
 	delete(w.meta, rel)
 	w.markDirtyLocked()
 	parent, name := splitParent(rel)
-	w.removeDirNameLocked(parent, name)
+	w.removeDirNameLocked(parent, name, leafOf(hostRel))
 	w.dropDirNamesLocked(rel)
+	w.dropAltTree(rel)
 	return nil
 }
 
@@ -1487,7 +1699,11 @@ func (w *Workspace) syncDir(rel string) error {
 	if w.closed {
 		return os.ErrClosed
 	}
-	return w.host.syncDir(rel)
+	hostRel, err := w.hostPath(rel)
+	if err != nil {
+		return err
+	}
+	return w.host.syncDir(hostRel)
 }
 
 // chtimes sets host timestamps of a host file, or the recorded timestamps of
@@ -1515,7 +1731,11 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 		w.markDirtyLocked()
 		return nil
 	}
-	return w.host.chtimes(rel, atime, mtime)
+	hostRel, err := w.hostPath(rel)
+	if err != nil {
+		return err
+	}
+	return w.host.chtimes(hostRel, atime, mtime)
 }
 
 // dirListing is one directory entry with its type and the host inode number
@@ -1525,6 +1745,8 @@ type dirListing struct {
 	kind    hostKind
 	ino     uint64
 	virtual bool
+	// leaf is the stored host name. It is empty for a virtual symlink.
+	leaf string
 }
 
 // listDir returns the visible children of the directory at rel, host entries
@@ -1532,32 +1754,68 @@ type dirListing struct {
 func (w *Workspace) listDir(rel string) ([]dirListing, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	out, _, err := w.listDirLocked(rel)
+	return out, err
+}
+
+// listDirLocked is listDir for a caller that holds w.mu. It also returns the
+// stored names of the host clutter files that the listing hides. The listing
+// teaches the alternate-name table the stored name of every entry whose guest
+// name differs from it.
+func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 	if w.closed {
-		return nil, os.ErrClosed
+		return nil, nil, os.ErrClosed
 	}
-	entries, err := w.host.readDir(rel)
+	hostDir, err := w.hostPath(rel)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	entries, err := w.host.readDir(hostDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	var clutter []string
 	byName := make(map[string]dirListing, len(entries))
 	for _, e := range entries {
 		if rel == "." && isReservedPath(e.name) {
 			continue
 		}
-		if e.kind == hostKindOther {
+		if e.kind == hostKindOther || w.hiddenByName(e.name) {
 			continue
 		}
+		if w.clutter.candidate(e.name) {
+			info := hostInfo{kind: e.kind}
+			if e.kind == hostKindRegular && w.clutter.needsContent(e.name) {
+				fi, err := w.host.lstat(hostChild(hostDir, e.name))
+				if err != nil {
+					continue
+				}
+				info = fi
+			}
+			if w.isClutterLocked(rel, e.name, info) {
+				clutter = append(clutter, e.name)
+				continue
+			}
+		}
+		guest := w.listName(rel, e.name)
 		if e.kind == hostKindSymlink {
-			full := joinRelPath(rel, e.name)
+			full := joinRelPath(rel, guest)
 			if _, ok := w.meta[full]; ok {
 				continue
 			}
-			target, err := w.host.readlink(full)
+			target, err := w.host.readlink(hostChild(hostDir, e.name))
 			if err != nil || validateSymlinkTarget(full, target) != nil {
 				continue
 			}
 		}
-		byName[e.name] = dirListing{name: e.name, kind: e.kind, ino: e.ino}
+		if old, dup := byName[guest]; dup && old.leaf == guest {
+			// Two host names show as one guest name. The plain name wins.
+			continue
+		}
+		if guest != e.name {
+			w.setAlt(rel, guest, e.name)
+		}
+		byName[guest] = dirListing{name: guest, kind: e.kind, ino: e.ino, leaf: e.name}
 	}
 	prefix := rel + "/"
 	if rel == "." {
@@ -1578,7 +1836,7 @@ func (w *Workspace) listDir(rel string) ([]dirListing, error) {
 		out = append(out, l)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
-	return out, nil
+	return out, clutter, nil
 }
 
 // ListEntries returns the sorted workspace-relative paths of all files,

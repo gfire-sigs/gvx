@@ -637,6 +637,9 @@ func TestDirectoryListingFollowsMutationsInPlace(t *testing.T) {
 	yes, no := true, false
 	e, ch, _ := newCountEnv(t)
 	ch.insensitive, ch.verified = &yes, &no
+	// OpenWorkspace lists the root once to sweep the internal files of a
+	// killed process. The count below starts after that call.
+	ch.reset()
 	e.mustMkdir("dir")
 	e.writeFile("dir/first", []byte("1"))
 	// The first lookup of an existing name lists the workspace root for the

@@ -90,14 +90,7 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, info, err := w.host.openDirAt(parent.h, name)
-	if err == nil && !w.host.caseVerified() {
-		// A case-insensitive volume opens "DIR" when it stores "dir". The pin
-		// would then stand for a name that the guest must not see.
-		if err = w.verifyDirName(rel, parent); err != nil {
-			_ = w.host.closeDir(h)
-		}
-	}
+	h, info, err := w.openDirNamed(parentRel, parent, name)
 	w.releasePinLocked(parent)
 	if err != nil {
 		return nil, err
@@ -113,19 +106,37 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 	return p, nil
 }
 
-// verifyDirName fails with nameMismatch when the host stores the directory rel
-// under a name with another case. parent is the pin of the directory that
-// holds rel. The caller holds w.pinMu, and exactNameIn takes only the lock of
-// the name snapshots.
-func (w *Workspace) verifyDirName(rel string, parent *dirPin) error {
-	ok, err := w.exactNameIn(rel, parent)
+// openDirNamed opens the directory name of the guest directory parentRel
+// through the pinned handle parent. It resolves the stored host name and fails
+// when the host stores the directory under another case or form. The caller
+// holds w.pinMu, and the name resolution takes only the lock of the name
+// snapshots.
+func (w *Workspace) openDirNamed(parentRel string, parent *dirPin, name string) (h hostDirHandle, info hostInfo, err error) {
+	opened := false
+	closeOpened := func() {
+		if opened {
+			_ = w.host.closeDir(h)
+			opened = false
+		}
+	}
+	probe, err := w.locateIn(parentRel, name, parent, false, func(leaf string) (hostInfo, error) {
+		closeOpened()
+		oh, oinfo, oerr := w.host.openDirAt(parent.h, leaf)
+		if oerr != nil {
+			return hostInfo{}, oerr
+		}
+		h, opened = oh, true
+		return oinfo, nil
+	})
 	if err != nil {
-		return err
+		closeOpened()
+		return h, hostInfo{}, err
 	}
-	if !ok {
-		return nameMismatch(rel)
+	if !probe.found || probe.hidden {
+		closeOpened()
+		return h, hostInfo{}, probe.missingError(joinRelPath(parentRel, name))
 	}
-	return nil
+	return h, probe.info, nil
 }
 
 // holdPin returns the existing pin of rel with one reference, or nil. It
@@ -184,6 +195,7 @@ func (w *Workspace) retirePinLocked(rel string, p *dirPin) error {
 //
 // The caller holds w.mu for writing, so no lookup holds a pin.
 func (w *Workspace) closeSubtreeHandlesLocked(rel string) {
+	w.watchQuiesce(rel)
 	w.pinMu.Lock()
 	defer w.pinMu.Unlock()
 	w.retireSubtreeLocked(rel)
@@ -298,22 +310,18 @@ func (w *Workspace) lookupIn(parentRel, name string) (entry, error) {
 	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
 		return virtualEntry(m), nil
 	}
-	info, err := w.host.lstatAt(pin.h, name)
+	p, err := w.locateIn(parentRel, name, pin, true, func(leaf string) (hostInfo, error) {
+		return w.host.lstatAt(pin.h, leaf)
+	})
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			w.checkPin(rel, hostID{}, false)
-		}
 		return entry{}, err
 	}
-	if !w.host.caseVerified() {
-		if ok, err := w.exactNameIn(rel, pin); err != nil {
-			return entry{}, err
-		} else if !ok {
-			return entry{}, nameMismatch(rel)
-		}
+	if !p.found || p.hidden {
+		w.checkPin(rel, hostID{}, false)
+		return entry{}, p.missingError(rel)
 	}
-	w.checkPin(rel, info.id, info.kind == hostKindDir)
-	return w.entryFromInfo(rel, info)
+	w.checkPin(rel, p.info.id, p.info.kind == hostKindDir)
+	return w.entryFromInfo(rel, p.info)
 }
 
 // lookupPath is lookup through pinned handles. The path "." names the
@@ -334,6 +342,12 @@ func (w *Workspace) lookupPath(rel string) (entry, error) {
 func (w *Workspace) openRegularWithAttr(rel string, e entry, flags int) (*os.File, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	return w.openRegularWithAttrLocked(rel, e, flags)
+}
+
+// openRegularWithAttrLocked is openRegularWithAttr for a caller that holds
+// w.mu.
+func (w *Workspace) openRegularWithAttrLocked(rel string, e entry, flags int) (*os.File, error) {
 	if w.closed {
 		return nil, os.ErrClosed
 	}
@@ -344,10 +358,14 @@ func (w *Workspace) openRegularWithAttr(rel string, e entry, flags int) (*os.Fil
 		return nil, ErrPathTraversal
 	}
 	parent, name := splitParent(rel)
+	leaf, err := w.hostLeaf(parent, name)
+	if err != nil {
+		return nil, err
+	}
 	pin, err := w.acquirePin(parent)
 	if err != nil {
 		return nil, err
 	}
 	defer w.releasePin(pin)
-	return w.host.openChildAt(pin.h, name, flags&^(os.O_CREATE|os.O_EXCL), 0)
+	return w.host.openChildAt(pin.h, leaf, flags&^(os.O_CREATE|os.O_EXCL), 0)
 }
