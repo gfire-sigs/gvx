@@ -306,6 +306,9 @@ func TestSingleFileSyncAllocateAndMap(t *testing.T) {
 // rename, as an editor does. A fresh open reaches the new file, and a file
 // description that is open keeps the old one.
 func TestSingleFileFollowsAnAtomicHostReplace(t *testing.T) {
+	if isWindowsHost() {
+		t.Skip("Windows refuses a rename over a file that another handle holds open, so a host editor cannot replace the bound file this way")
+	}
 	s := newSingleEnv(t, "old content", false)
 	old := s.mustOpen("mp", linux.O_RDONLY)
 	defer old.DecRef(s.ctx)

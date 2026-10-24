@@ -31,16 +31,28 @@ import (
 )
 
 const (
-	childModeEnv = "GVX_HOSTLOCKDOWN_CHILD_MODE"
-	childWSEnv   = "GVX_HOSTLOCKDOWN_WORKSPACE"
-	childOutEnv  = "GVX_HOSTLOCKDOWN_OUTSIDE"
-	childROEnv   = "GVX_HOSTLOCKDOWN_READONLY"
+	childModeEnv   = "GVX_HOSTLOCKDOWN_CHILD_MODE"
+	childWSEnv     = "GVX_HOSTLOCKDOWN_WORKSPACE"
+	childOutEnv    = "GVX_HOSTLOCKDOWN_OUTSIDE"
+	childROEnv     = "GVX_HOSTLOCKDOWN_READONLY"
+	childResultEnv = "GVX_HOSTLOCKDOWN_RESULT"
 )
 
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(childModeEnv); mode != "" {
+		// The child opens the result file before the lockdown, because the
+		// lockdown can refuse a write to the pipes of the parent.
+		var result *os.File
+		if path := os.Getenv(childResultEnv); path != "" {
+			result, _ = os.Create(path)
+		}
 		if err := runLockedChild(mode); err != nil {
-			fmt.Fprintf(os.Stderr, "child %s: %v\n", mode, err)
+			msg := fmt.Sprintf("child %s: %v\n", mode, err)
+			if result != nil {
+				_, _ = result.WriteString(msg)
+				_ = result.Sync()
+			}
+			fmt.Fprint(os.Stderr, msg)
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -535,10 +547,12 @@ func TestApplyLockdownWithFileMount(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "sibling.txt"), []byte("sibling-data"), 0o600); err != nil {
 		t.Fatalf("WriteFile sibling: %v", err)
 	}
+	result := filepath.Join(t.TempDir(), "result.txt")
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), childModeEnv+"=file-mount", childWSEnv+"="+dir)
+	cmd.Env = append(os.Environ(), childModeEnv+"=file-mount", childWSEnv+"="+dir, childResultEnv+"="+result)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+		reported, _ := os.ReadFile(result)
+		t.Fatalf("lockdown child failed: %v\n%s\nreported: %s", err, out, reported)
 	}
 }
 
