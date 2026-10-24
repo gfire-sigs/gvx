@@ -126,17 +126,14 @@ mkdir cs
 echo upper > cs/File.txt
 [ -e cs/File.txt ] || fail "exact-case lookup failed"
 if [ -e cs/file.txt ]; then fail "other-case lookup resolved"; fi
-if [ "$CASE_INSENSITIVE" = 1 ]; then
-  if { echo lower > cs/file.txt; } 2>/dev/null; then fail "colliding create succeeded"; fi
-  expect "$(cat cs/File.txt)" upper "File.txt after collision"
-  expect "$(ls cs)" File.txt "listing after collision"
-else
-  echo lower > cs/file.txt
-  echo shout > cs/FILE.TXT
-  expect "$(ls cs | wc -l)" 3 "case variants"
-  expect "$(cat cs/file.txt)" lower "file.txt"
-  expect "$(cat cs/FILE.TXT)" shout "FILE.TXT"
-fi
+# Case variants coexist on every host, because hostfs escapes the later variants.
+echo lower > cs/file.txt
+echo shout > cs/FILE.TXT
+expect "$(ls cs | wc -l)" 3 "case variants"
+expect "$(cat cs/file.txt)" lower "file.txt"
+expect "$(cat cs/FILE.TXT)" shout "FILE.TXT"
+rm cs/file.txt cs/FILE.TXT
+expect "$(ls cs)" File.txt "listing after the variants go"
 mv cs/File.txt cs/Renamed.txt
 expect "$(cat cs/Renamed.txt)" upper "renamed"
 echo x > cs/Casey.txt

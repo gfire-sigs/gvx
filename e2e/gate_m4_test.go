@@ -164,8 +164,8 @@ func readMetaTable(t *testing.T, dir string) metaTable {
 	if err := json.Unmarshal(raw, &table); err != nil {
 		t.Fatalf("%s is not a complete JSON table (%d bytes): %v", hostfs.MetaFileName, len(raw), err)
 	}
-	if table.Version != 1 {
-		t.Fatalf("%s version = %d, want 1", hostfs.MetaFileName, table.Version)
+	if table.Version != 2 {
+		t.Fatalf("%s version = %d, want 2", hostfs.MetaFileName, table.Version)
 	}
 	return table
 }

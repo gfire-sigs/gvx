@@ -850,8 +850,17 @@ func TestE2EWorkspaceHostfsPOSIXAndAntiTOCTOU(t *testing.T) {
 	if _, err := ws.ReadFile("../../etc/passwd"); err == nil {
 		t.Fatalf("ws.ReadFile(../../etc/passwd) succeeded, want ErrPathTraversal")
 	}
-	if err := ws.Symlink("../../outside", "src/escape_link"); err == nil {
-		t.Fatalf("ws.Symlink(../../outside) succeeded, want ErrPathTraversal")
+	// A guest symlink lives only in .gvx_meta, so any non-empty target is
+	// valid. The host never receives the link, and the guest resolves the
+	// target in its own namespace.
+	if err := ws.Symlink("../../outside", "src/escape_link"); err != nil {
+		t.Fatalf("ws.Symlink(../../outside) = %v, want success for a virtual symlink", err)
+	}
+	if _, err := os.Lstat(filepath.Join(ws.HostPath(), "src", "escape_link")); err == nil {
+		t.Fatalf("the virtual symlink src/escape_link exists on the host")
+	}
+	if err := ws.Symlink("", "src/empty_link"); err == nil {
+		t.Fatalf("ws.Symlink with an empty target succeeded, want ENOENT")
 	}
 }
 
