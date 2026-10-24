@@ -82,6 +82,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	rootEntry, err := ws.lookup(".")
 	if err != nil {
+		println("DEBUGHOSTFS lookup root:", err.Error())
 		return fail(translateHostError(err))
 	}
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
