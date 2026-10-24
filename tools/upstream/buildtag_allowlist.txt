@@ -55,6 +55,10 @@ seam pkg/sentry/loader/elf.go
 # for the thread pointer, and upstream cleared it (pkg/sentry/arch/arch_aarch64.go).
 seam pkg/sentry/arch/arch_aarch64.go
 
+# Content seam: inotify_add_watch(2) asks a dentry to admit the watch before it adds one
+# (pkg/sentry/syscalls/linux/sys_inotify.go). hostfs returns ENOSPC above 8192 watched objects.
+seam pkg/sentry/syscalls/linux/sys_inotify.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin

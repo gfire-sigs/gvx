@@ -24,6 +24,14 @@ import (
 
 const allFlags = linux.IN_NONBLOCK | linux.IN_CLOEXEC
 
+// inotifyWatchAdmitter is implemented by a dentry that can refuse a new guest
+// watch, for example because the host event bridge of its filesystem is full.
+// AdmitInotifyWatch returns an error such as ENOSPC before the watch exists,
+// and it succeeds for a dentry that already has a host watch.
+type inotifyWatchAdmitter interface {
+	AdmitInotifyWatch() error
+}
+
 // InotifyInit1 implements the inotify_init1() syscalls.
 func InotifyInit1(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	flags := args[0].Int()
@@ -115,6 +123,13 @@ func InotifyAddWatch(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) 
 		return 0, nil, err
 	}
 	defer d.DecRef(t)
+
+	// A filesystem with a bounded host event bridge can refuse the watch.
+	if a, ok := d.Dentry().Impl().(inotifyWatchAdmitter); ok {
+		if err := a.AdmitInotifyWatch(); err != nil {
+			return 0, nil, err
+		}
+	}
 
 	return uintptr(ino.AddWatch(d.Dentry(), mask)), nil, nil
 }

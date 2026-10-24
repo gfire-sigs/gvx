@@ -657,6 +657,22 @@ func TestHostWatcherRacesWithGuestWrites(t *testing.T) {
 	}
 }
 
+// admit runs the check that inotify_add_watch(2) makes before it adds a guest
+// watch on the path. It returns the error that the guest sees.
+func (w *watchEnv) admit(p string) error {
+	w.t.Helper()
+	vd, err := w.vfsObj.GetDentryAt(w.ctx, w.creds, w.fpop(p), &vfs.GetDentryOptions{})
+	if err != nil {
+		w.t.Fatalf("GetDentryAt %q: %v", p, err)
+	}
+	defer vd.DecRef(w.ctx)
+	a, ok := vd.Dentry().Impl().(interface{ AdmitInotifyWatch() error })
+	if !ok {
+		w.t.Fatalf("the dentry of %q has no AdmitInotifyWatch", p)
+	}
+	return a.AdmitInotifyWatch()
+}
+
 func TestHostWatcherCapRefusesTheExtraWatch(t *testing.T) {
 	w := newWatchEnv(t)
 	hw := &w.ws.watch
@@ -664,37 +680,81 @@ func TestHostWatcherCapRefusesTheExtraWatch(t *testing.T) {
 	for _, d := range []string{"a", "b", "c"} {
 		w.mustMkdir(d)
 	}
+	for _, d := range []string{"a", "b"} {
+		if err := w.admit(d); err != nil {
+			t.Fatalf("admit %q below the cap = %v", d, err)
+		}
+	}
 	wa := w.add("a", hostEventMask)
 	w.add("b", hostEventMask)
 	w.settle()
 
-	vd, err := w.vfsObj.GetDentryAt(w.ctx, w.creds, w.fpop("c"), &vfs.GetDentryOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer vd.DecRef(w.ctx)
-	if err := w.ws.watchDentry(vd.Dentry().Impl().(*dentry)); !linuxerr.Equals(linuxerr.ENOSPC, err) {
-		t.Fatalf("watchDentry above the cap = %v, want ENOSPC", err)
+	if err := w.admit("c"); !linuxerr.Equals(linuxerr.ENOSPC, err) {
+		t.Fatalf("admit of a third object at the cap = %v, want ENOSPC", err)
 	}
 	if got := hw.watchedCount(); got != 2 {
 		t.Fatalf("watched objects = %d, want 2", got)
 	}
+	if got := hw.rejected.Load(); got != 1 {
+		t.Fatalf("rejected watches = %d, want 1", got)
+	}
 
-	// The VFS cannot fail the add. The guest watch on the third directory works
-	// for guest events and gets no host events.
-	w.add("c", hostEventMask)
-	hostWrite(t, w.host("c/x"), "x")
+	// An object that is already watched never hits the cap, so a mask update
+	// or a watch of a second inotify instance succeeds.
+	if err := w.admit("a"); err != nil {
+		t.Fatalf("admit of a watched object at the cap = %v, want nil", err)
+	}
+	w.add("a", hostEventMask|linux.IN_MASK_ADD)
 	hostWrite(t, w.host("a/x"), "x")
 	w.sync()
-	w.expect("host change in a refused directory and an accepted one", "CREATE x")
-	w.writeFile("c/y", []byte("y"))
-	w.expect("guest change in the refused directory", "CREATE y", "MODIFY y")
+	w.expect("host change in a watched directory at the cap", "CREATE x")
 
 	// Ending a watch frees a slot.
 	w.rm(wa)
+	if err := w.admit("c"); err != nil {
+		t.Fatalf("admit after a slot became free = %v, want nil", err)
+	}
 	w.add("c", hostEventMask)
 	if got := hw.watchedCount(); got != 2 {
 		t.Fatalf("watched objects after the swap = %d, want 2", got)
+	}
+}
+
+// TestHostWatcherDefaultCapIs8192 fills a workspace to the real cap with
+// placeholder entries. The 8193rd object gets ENOSPC and a watched one passes.
+func TestHostWatcherDefaultCapIs8192(t *testing.T) {
+	if maxWatchedDentries != 8192 {
+		t.Fatalf("maxWatchedDentries = %d, want 8192", maxWatchedDentries)
+	}
+	w := newWatchEnv(t)
+	hw := &w.ws.watch
+	w.mustMkdir("a")
+	w.mustMkdir("b")
+	if err := w.admit("a"); err != nil {
+		t.Fatalf("admit of the first object = %v", err)
+	}
+	fill := make(map[*inode]*watchEntry)
+	hw.mu.Lock()
+	for len(hw.entries) < maxWatchedDentries {
+		ino := new(inode)
+		e := new(watchEntry)
+		hw.entries[ino] = e
+		fill[ino] = e
+	}
+	hw.mu.Unlock()
+	t.Cleanup(func() {
+		hw.mu.Lock()
+		for ino := range fill {
+			delete(hw.entries, ino)
+		}
+		hw.mu.Unlock()
+	})
+
+	if err := w.admit("b"); !linuxerr.Equals(linuxerr.ENOSPC, err) {
+		t.Fatalf("admit of watch 8193 = %v, want ENOSPC", err)
+	}
+	if err := w.admit("a"); err != nil {
+		t.Fatalf("admit of a watched object at 8192 = %v, want nil", err)
 	}
 }
 

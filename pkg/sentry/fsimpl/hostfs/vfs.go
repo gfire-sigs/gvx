@@ -558,6 +558,23 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 	d.inode.watches.Notify(ctx, "", events, cookie, et, false)
 }
 
+// AdmitInotifyWatch is called by inotify_add_watch(2) before a new guest watch
+// joins d. It attaches the host watch and returns ENOSPC when the workspace
+// already watches maxWatchedDentries other objects. A dentry that has a host
+// watch always passes, so a mask update never fails. Any other host error
+// leaves the guest watch without host events and only logs the reason.
+func (d *dentry) AdmitInotifyWatch() error {
+	err := d.fs.ws.watchDentry(d)
+	if err == nil {
+		return nil
+	}
+	if linuxerr.Equals(linuxerr.ENOSPC, err) {
+		return linuxerr.ENOSPC
+	}
+	d.fs.ws.logWatchRefusal(d, err)
+	return nil
+}
+
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
 	// A guest inotify watch is about to join this set, or it is leaving. The

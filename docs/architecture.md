@@ -560,8 +560,7 @@ A backend only says when to look. The scan compares the state of the object with
 
 A guest mutation must not echo. A mutation of names removes the name from the next scan. A mutation of content or times records the host state that it produced, under a generation counter, and a scan that finds the same state sends nothing. A change that the guest did not make drops the clean chunks of the page cache and the cached metadata before the event leaves. A guest that reacts to the event therefore reads the new bytes through `read` and `mmap`. Chunks that a writable mapping dirtied stay.
 
-> [!NOTE]
-> `vfs.Inotify.AddWatch` cannot return an error. A watch above the cap still works for guest events and gets no host events. `watchDentry` returns `ENOSPC`, and the watcher logs the refusal once. A guest-visible `ENOSPC` needs a change in upstream `pkg/sentry/vfs`, which the upstream budget does not allow today.
+The cap is visible to the guest. Before `inotify_add_watch(2)` adds a watch, the syscall layer calls `AdmitInotifyWatch` on a dentry that implements it. The seam is in `pkg/sentry/syscalls/linux/sys_inotify.go`. The hostfs dentry attaches the host watch and returns `ENOSPC` when the workspace already watches 8,192 other objects. An object that has a host watch always passes, so a mask update or a second `inotify` instance never fails. A host error other than `ENOSPC` leaves the guest watch without host events, and the watcher logs it once.
 
 #### Extended Operations and Durability (Descriptive Module)
 

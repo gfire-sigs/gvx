@@ -65,9 +65,10 @@ import (
 //
 // Known limits:
 //
-//   - vfs.Inotify.AddWatch cannot fail, so a watch above the cap keeps working
-//     for guest events but gets no host events. watchDentry returns ENOSPC
-//     and dentry.Watches logs it.
+//   - The syscall layer calls dentry.AdmitInotifyWatch before it adds a guest
+//     watch, so a watch above the cap fails with ENOSPC. dentry.Watches only
+//     logs a refusal that a race lets through. A backend error other than
+//     ENOSPC leaves the guest watch without host events.
 //   - OnZeroWatches can race with an AddWatch that already passed
 //     dentry.Watches. The host bridge of that watch then ends early, and a new
 //     inotify_add_watch on the same file brings it back.
