@@ -77,6 +77,41 @@ func TestInstructionCrossesBlockBoundary(t *testing.T) {
 	mustSyscall(t, si, err, 93, r.ac)
 }
 
+// TestFastPathResumeBehindPatchedSyscall starts a thread at the return address
+// of a SYSCALL that the patcher replaced with a JMP. A new thread of clone and
+// a sigreturn to an interrupted system call do this. The JMP overwrote the
+// bytes at that address, so the thread must continue in the slot tail, run the
+// relocated instruction, and go on behind it. A real Go guest crashed in the
+// child of clone before this rule.
+func TestFastPathResumeBehindPatchedSyscall(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	inc := []byte{0x48, 0xFF, 0xC3} // inc rbx
+	first := gSyscall(1)
+	second := gSyscall(2)
+	var prog []byte
+	prog = append(prog, first...)
+	prog = append(prog, inc...)
+	prog = append(prog, second...)
+	prog = append(prog, inc...)
+	prog = append(prog, gSyscall(3)...)
+	r.program(prog)
+	retSecond := codeVA + uint64(len(first)+len(inc)+len(second))
+
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	if _, ok := r.as.jumpTail(retSecond); !ok {
+		t.Fatalf("the SYSCALL before %#x did not become a JMP", retSecond)
+	}
+	// Continue at the return address of the second SYSCALL, as the child of a
+	// clone does. The Sentry never writes the island address to the registers.
+	r.ac.SetIP(uintptr(retSecond))
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 3, r.ac)
+	if got := regAcc(r.ac); got != 1 {
+		t.Errorf("the relocated instruction ran %d times, want 1", got)
+	}
+}
+
 // TestNearZeroBase checks which faults look like an access through a lost FS
 // base. A positive offset from a zero base lies below the lowest guest
 // address. A real guest address never counts, so a static executable at

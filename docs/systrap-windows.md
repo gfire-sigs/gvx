@@ -322,6 +322,8 @@ On `amd64`, the patcher replaces `syscall` and the three bytes after it with `jm
 
 A branch from a distant page and an indirect jump can still land in the overwritten bytes. The patcher cannot see them. The scan of section 5 accepts the same kind of risk for the bytes of the `syscall` itself. The common `syscall; ret` of musl keeps `CC 90`, because the byte after `ret` can start another function.
 
+A thread can also start at the return address of a patched `syscall`. The new thread of `clone` does this. A `sigreturn` that restores the frame of an interrupted call does it too. The `jmp` overwrote the bytes at that address. The engine therefore starts such a thread at the tail of the slot. The tail runs the relocated instructions and jumps to the code behind them. The Sentry never writes the address of the tail into the registers of the guest. Without this rule, the child of `clone` in a Go guest ran the bytes of the `jmp` and crashed with SIGSEGV on `windows/amd64`.
+
 On `amd64`, the spill routine finds the page of its thread through the TEB. The Sentry writes the address of the page into `NT_TIB.ArbitraryUserPointer` at offset `0x28` of each guest thread. `gs:[0x28]` names the word, and the slot also uses `SubSystemTib` and `FiberData` (offsets `0x18` and `0x20`) as scratch words.
 
 On `arm64`, no register can name the TEB. The guest owns `x18`, and Windows keeps the CPU number in `TPIDRRO_EL0`. The engine therefore writes the address of the page into the real `TPIDR_EL0` of each fast thread. The guest thread pointer moves to the `TLS` word of the page. The patcher replaces each `mrs xN, tpidr_el0` with a branch to a 16-byte slot that loads the `TLS` word, or with a `brk` that the Sentry emulates. A `msr tpidr_el0, xN` trap stores the `TLS` word and runs no TLS routine. A page of guest code that the patcher did not scan would read the wrong value, but the page trap scans every page before it runs.
@@ -351,7 +353,7 @@ The design rests on facts that no Windows document states:
 | Handoff state machine | Unit tests with channel events and the race detector, also on macOS. |
 | Generated machine code | Decoding with `x86asm` and `arm64asm`, and an emulator that runs the spin hit, the sleep, the races, and the cold resume, also on macOS. |
 | `amd64` patch plan | Unit tests of the relocation and branch rules, also on macOS. |
-| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. Both hosted Windows runners pass them. |
+| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
 | Latency | Not measured. |
 
 The engine never reuses a slot of an island, so a page that a guest patches again and again allocates more slots. A thread count above 512 for one stub fails with an error. An `arm64` guest must keep 512 bytes below its stack pointer writable at each system call.
