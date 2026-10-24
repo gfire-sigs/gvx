@@ -165,14 +165,50 @@ func (th *thread) goThroughTrampoline(fsBase uint64) error {
 	return nil
 }
 
-// archStart adds the FS base to the state that start loaded.
+// archStart adds the FS base to the state that start loaded. A thread that
+// continues at the return address of a patched SYSCALL continues in the slot
+// tail, because the JMP overwrote the bytes at that address.
 func (th *thread) archStart(ac *arch.Context64) error {
 	th.fsFix.n = 0
+	th.ctx.setPC(th.resumePC(th.ctx.pc()))
 	fs := ac.StateData().Regs.Fs_base
 	if fs == 0 {
 		return nil
 	}
 	return th.goThroughTrampoline(fs)
+}
+
+// resumePC returns the address where a thread continues for the guest program
+// counter pc. The return address of a SYSCALL that became a JMP lies inside the
+// JMP. A new thread of clone, and a sigreturn to an interrupted system call,
+// continue there. The slot tail runs the relocated instructions and jumps back
+// to the code behind them, which is where the guest continues.
+func (th *thread) resumePC(pc uint64) uint64 {
+	as := th.sp.owner.Load()
+	if as == nil {
+		return pc
+	}
+	if tail, ok := as.jumpTail(pc); ok {
+		return tail
+	}
+	return pc
+}
+
+// jumpTail returns the slot tail for the return address pc of a SYSCALL that
+// became a JMP. The JMP overwrote the bytes at pc, so the thread must continue
+// in the slot instead.
+func (as *addressSpace) jumpTail(pc uint64) (uint64, bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[blockRound(pc)]
+	if blk == nil || blk.state != blockExec || pc-blk.base < winSiteLen {
+		return 0, false
+	}
+	s, ok := blk.sites[uint16(pc-blk.base-winSiteLen)]
+	if !ok || s.kind != winSiteJump {
+		return 0, false
+	}
+	return s.tail, true
 }
 
 // pullArch completes the copy of the registers into ac.
@@ -322,7 +358,13 @@ type siteInfo struct {
 	reg    uint8
 	wide   bool
 	length uint8
+	// tail is the address of the slot tail of a winSiteJump.
+	tail uint64
 }
+
+// winSiteJump marks the SYSCALL that became a JMP to a slot. The debugger
+// never sees a trap there, so the kind only serves resumePC.
+const winSiteJump amd64SiteKind = 0x80
 
 // patchPage replaces the SYSCALL and RDFSBASE instructions of one page with
 // traps. page is a copy of the original frame. With the fast path, a SYSCALL
@@ -354,8 +396,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			continue
 		}
 		if as.p.fast && s.Kind == amd64SiteSyscall && s.Offset >= 0 {
-			if end, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
+			if end, tail, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
 				jumpEnd = end
+				sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
 				continue
 			}
 		}
@@ -371,16 +414,16 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 }
 
 // patchJump replaces the SYSCALL at offset off of page with a JMP to a new
-// slot. It returns the end of the bytes that the patch owns, or false when the
-// site keeps its trap.
-func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, bool) {
+// slot. It returns the end of the bytes that the patch owns and the address of
+// the slot tail, or false when the site keeps its trap.
+func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, uint64, bool) {
 	if hasPrefixBefore(plan.before, plan.page, off) {
 		// A prefix would apply to the JMP.
-		return 0, false
+		return 0, 0, false
 	}
 	reloc, ok := plan.plan(off)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	site := base + uint64(off)
 	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
@@ -393,9 +436,9 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 		if traceEvents {
 			tracef("no trampoline slot for the SYSCALL at %#x: %v", site, err)
 		}
-		return 0, false
+		return 0, 0, false
 	}
-	return off + winSiteLen + len(reloc), true
+	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, true
 }
 
 // hasPrefixBefore reports whether the byte in front of page[off] is an
