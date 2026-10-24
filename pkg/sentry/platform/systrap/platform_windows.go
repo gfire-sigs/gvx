@@ -81,15 +81,21 @@ var configureOnce sync.Once
 // New starts the stub host and returns a Platform. It must run before the
 // Sentry locks itself down, because the host is a child process.
 //
-// The fast path is on by default. When this host cannot run it, New falls back
-// to the debug path. GVX_SYSTRAP_FASTPATH=1 makes a host that cannot run the
-// fast path an error, and GVX_SYSTRAP_FASTPATH=0 turns the fast path off.
+// On arm64 the fast path is on by default. When this host cannot run it, New
+// falls back to the debug path. On amd64 the default is off for now: a static
+// Go guest crashes with SIGSEGV under the fast path on windows-latest, while
+// every synthetic fast path test passes. GVX_SYSTRAP_FASTPATH=1 makes a host
+// that cannot run the fast path an error, and GVX_SYSTRAP_FASTPATH=0 turns the
+// fast path off.
 func New() (*Platform, error) {
 	switch fastPathMode {
 	case fastPathOff:
 		return open(false)
 	case fastPathRequired:
 		return open(true)
+	}
+	if runtime.GOARCH == "amd64" {
+		return open(false)
 	}
 	p, err := open(true)
 	if err == nil {
