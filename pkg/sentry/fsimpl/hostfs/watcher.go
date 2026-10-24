@@ -304,8 +304,14 @@ func (w *Workspace) unwatchDentry(d *dentry) {
 	hw.remove(e)
 }
 
-// watchForget releases the host watch of an inode that no dentry names any
-// more. The caller holds filesystem.mu.
+// watchForget ends the host watch of an inode that no dentry names any more.
+// The caller holds filesystem.mu.
+//
+// A guest rmdir or unlink of a watched object ends here: the dentry dies with
+// the removal, so no scan would find the object gone. When the host no longer
+// names the object, the guest watchers get IN_DELETE_SELF and IN_IGNORED, as
+// on Linux. When the object still exists, the watch just ends. That happens
+// when the dentry cache drops an unused dentry.
 func (w *Workspace) watchForget(ino *inode) {
 	hw := &w.watch
 	if hw.active.Load() == 0 {
@@ -314,17 +320,24 @@ func (w *Workspace) watchForget(ino *inode) {
 	hw.mu.Lock()
 	e := hw.entries[ino]
 	hw.mu.Unlock()
-	if e != nil {
-		hw.remove(e)
+	if e == nil {
+		return
+	}
+	_, exists, err := e.statSelf()
+	removed := hw.remove(e)
+	if removed && err == nil && !exists {
+		ino.invalidateMeta()
+		ino.watches.HandleDeletion(context.Background())
 	}
 }
 
-// remove ends the watch of e. It is safe to call twice.
-func (hw *hostWatcher) remove(e *watchEntry) {
+// remove ends the watch of e and reports whether this call ended it. It is
+// safe to call twice: the second call returns false.
+func (hw *hostWatcher) remove(e *watchEntry) bool {
 	hw.mu.Lock()
 	if hw.entries[e.ino] != e {
 		hw.mu.Unlock()
-		return
+		return false
 	}
 	delete(hw.entries, e.ino)
 	delete(hw.dirs, e)
@@ -352,6 +365,7 @@ func (hw *hostWatcher) remove(e *watchEntry) {
 			unused.close()
 		}()
 	}
+	return true
 }
 
 // watchNoteName records that a guest mutation changed the entry name of the
@@ -572,6 +586,10 @@ type watchEntry struct {
 	self        nameStat
 	touched     map[string]struct{}
 	selfTouched bool
+	// suspectGone is set by a backend that lost its handle in a way that
+	// suggests a removed directory. A scan that cannot stat the object then
+	// takes it as gone.
+	suspectGone atomic.Bool
 	retry       *time.Timer
 
 	// backendData belongs to the backend of the entry. The backend guards it.
@@ -684,7 +702,18 @@ type scanResult struct {
 func (e *watchEntry) statSelf() (st nameStat, exists bool, err error) {
 	parent, name, hasParent := e.selfNames()
 	if !hasParent {
-		return nameStat{}, true, nil
+		if e.ws.single == "" {
+			return nameStat{}, true, nil
+		}
+		// The root of a single-file workspace is the bound file.
+		ent, err := e.ws.lookupPath(".")
+		switch {
+		case err == nil:
+			return nameStatOf(ent.info), true, nil
+		case errors.Is(err, fs.ErrNotExist):
+			return nameStat{}, false, nil
+		}
+		return nameStat{}, false, err
 	}
 	ent, err := e.ws.lookupIn(parent, name)
 	switch {
@@ -705,6 +734,11 @@ func (e *watchEntry) statSelf() (st nameStat, exists bool, err error) {
 func (e *watchEntry) scanHost() scanResult {
 	var res scanResult
 	st, exists, err := e.statSelf()
+	if err != nil && e.suspectGone.Load() {
+		// The backend lost its handle for a reason that means a removed
+		// directory, and the lookup fails too. Take that as the removal.
+		st, exists, err = nameStat{}, false, nil
+	}
 	if err != nil {
 		res.err = err
 		return res
@@ -1144,8 +1178,11 @@ func (e *watchEntry) apply(out *dispatch) {
 	e.hw.delivered.Add(uint64(len(out.events)))
 	if out.gone {
 		e.ino.invalidateMeta()
-		e.ino.watches.HandleDeletion(ctx)
-		e.hw.remove(e)
+		// Only the call that ends the watch reports the deletion, so a removal
+		// that the guest path already reported gives one event.
+		if e.hw.remove(e) {
+			e.ino.watches.HandleDeletion(ctx)
+		}
 		return
 	}
 	if out.deferred {

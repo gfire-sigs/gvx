@@ -15,12 +15,14 @@
 // Package hostlockdown applies irreversible host OS self-containment to the
 // current process after all required host handles are open. Windows uses a
 // restricted token, Low integrity, a job object and no win32k. macOS uses a
-// Seatbelt profile and RLIMIT_NPROC=0.
+// Seatbelt profile and RLIMIT_NPROC=0. A host mount is a directory or one
+// regular file.
 package hostlockdown
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -33,23 +35,32 @@ var ErrUnsupported = errors.New("hostlockdown: unsupported host OS")
 // ErrNotLockedDown reports that BindThread ran before a successful Apply.
 var ErrNotLockedDown = errors.New("hostlockdown: Apply has not succeeded")
 
-// HostMount names one host directory that the locked process may open files
-// below.
+// HostMount names one host directory or one host regular file that the locked
+// process may open. A directory mount allows every file below the directory.
+// A file mount allows that one file only. The parent directory and the
+// sibling files of a file mount stay closed by path.
 type HostMount struct {
-	// Path is the host directory. It must exist when Apply runs. The root of a
-	// file system, such as "/" or "C:\", is refused.
+	// Path is the host directory, or the host file when File is true. It must
+	// exist when Apply runs. The root of a file system, such as "/" or "C:\",
+	// is refused.
 	Path string
 
-	// ReadOnly limits the locked process to read access below Path.
+	// ReadOnly limits the locked process to read access to Path and, for a
+	// directory mount, to everything below it.
 	ReadOnly bool
+
+	// File marks Path as one regular file. Apply refuses the mount when Path
+	// is not a regular file. A symbolic link to a regular file is allowed.
+	// The lockdown does not allow access to the parent directory by path.
+	File bool
 }
 
 // Options configures the host OS lockdown boundary.
 type Options struct {
-	// Mounts lists the host directories that the locked process may open
-	// files below. Duplicate and nested entries are allowed. The lockdown only
-	// adds allow rules, so a path is writable when any entry that covers it is
-	// writable.
+	// Mounts lists the host directories and files that the locked process
+	// may open. Duplicate and nested entries are allowed. A file mount below
+	// a directory mount is allowed. The lockdown only adds allow rules, so a
+	// path is writable when any entry that covers it is writable.
 	Mounts []HostMount
 
 	// AllowOutboundNet permits new outbound TCP and UDP connections and accept
@@ -159,7 +170,8 @@ func Apply(opts Options) (Status, error) {
 }
 
 // validateMounts refuses an empty path and the root of a file system. A root
-// mount would allow every host file.
+// mount would allow every host file. It also refuses a file mount whose path
+// is missing or is not a regular file.
 func validateMounts(mounts []HostMount) error {
 	for i, m := range mounts {
 		if m.Path == "" {
@@ -171,6 +183,16 @@ func validateMounts(mounts []HostMount) error {
 		}
 		if filepath.Dir(abs) == abs {
 			return fmt.Errorf("hostlockdown: mount %q is the root of a file system and would allow every host file", m.Path)
+		}
+		if !m.File {
+			continue
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return fmt.Errorf("hostlockdown: stat file mount %q: %w", m.Path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("hostlockdown: file mount %q is not a regular file", m.Path)
 		}
 	}
 	return nil

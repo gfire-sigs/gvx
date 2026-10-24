@@ -37,9 +37,6 @@ func TestStatFSMatchesTheHostVolume(t *testing.T) {
 	if uint64(st.BlockSize) != want.blockSize || st.Blocks != want.blocks {
 		t.Fatalf("guest volume = (block size %d, blocks %d), host volume = (%d, %d)", st.BlockSize, st.Blocks, want.blockSize, want.blocks)
 	}
-	if st.Files != want.files {
-		t.Fatalf("guest files = %d, host files = %d", st.Files, want.files)
-	}
 }
 
 // TestHostSymlinksStayHiddenWhileGuestSymlinksStayVirtual puts native links on

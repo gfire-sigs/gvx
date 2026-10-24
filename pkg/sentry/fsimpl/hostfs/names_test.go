@@ -359,6 +359,9 @@ func TestOverlongEncodedNameFailsWithENAMETOOLONG(t *testing.T) {
 }
 
 func TestLinuxVolumeNeverTranslatesNames(t *testing.T) {
+	if isWindowsHost() {
+		t.Skip("a real Windows volume refuses these names, so this test models a Linux volume on Linux and macOS only")
+	}
 	e := newVolumeEnv(t, linuxCaps, false, false, false)
 	names := []string{"aux.c", "~gvx~literal", "Net::HTTP.3pm", "%41", "trail.", "Readme", "other"}
 	for _, n := range names {

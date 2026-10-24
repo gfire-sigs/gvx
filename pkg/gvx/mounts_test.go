@@ -44,6 +44,8 @@ func TestParseVolume(t *testing.T) {
 		{`d:\My Files\x:/x:rw`, Mount{Kind: MountBind, HostPath: `d:\My Files\x`, GuestPath: "/x", CreateHostPathIfMissing: true}},
 		{"C:/data:/data", Mount{Kind: MountBind, HostPath: "C:/data", GuestPath: "/data", CreateHostPathIfMissing: true}},
 		{"C:/data:/data:ro", Mount{Kind: MountBind, HostPath: "C:/data", GuestPath: "/data", ReadOnly: true, CreateHostPathIfMissing: true}},
+		{"/host/file.txt:/data/file.txt", Mount{Kind: MountBind, HostPath: "/host/file.txt", GuestPath: "/data/file.txt", CreateHostPathIfMissing: true}},
+		{"/host/file.txt:/data/file.txt:ro", Mount{Kind: MountBind, HostPath: "/host/file.txt", GuestPath: "/data/file.txt", ReadOnly: true, CreateHostPathIfMissing: true}},
 	} {
 		t.Run(tc.spec, func(t *testing.T) {
 			got, err := ParseVolume(tc.spec)
@@ -77,6 +79,8 @@ func TestParseMount(t *testing.T) {
 		{"type=bind,source=/h,destination=/g,readonly=false", Mount{Kind: MountBind, HostPath: "/h", GuestPath: "/g"}},
 		{`type=bind,src=C:\data,dst=/g,ro`, Mount{Kind: MountBind, HostPath: `C:\data`, GuestPath: "/g", ReadOnly: true}},
 		{`type=bind,"src=/h,x",dst=/g`, Mount{Kind: MountBind, HostPath: "/h,x", GuestPath: "/g"}},
+		{"type=bind,src=/h/file.txt,dst=/g/file.txt", Mount{Kind: MountBind, HostPath: "/h/file.txt", GuestPath: "/g/file.txt"}},
+		{"type=bind,src=/h/file.txt,dst=/g/file.txt,ro", Mount{Kind: MountBind, HostPath: "/h/file.txt", GuestPath: "/g/file.txt", ReadOnly: true}},
 		{"type=volume,src=data,dst=/v", Mount{Kind: MountVolume, VolumeName: "data", GuestPath: "/v"}},
 		{"src=data,dst=/v,ro", Mount{Kind: MountVolume, VolumeName: "data", GuestPath: "/v", ReadOnly: true}},
 		{"type=tmpfs,dst=/t", Mount{Kind: MountTmpfs, GuestPath: "/t"}},
@@ -144,10 +148,6 @@ func TestParseTmpfs(t *testing.T) {
 
 func TestConfigNormalizeRejectsInvalidMounts(t *testing.T) {
 	dir := t.TempDir()
-	file := filepath.Join(dir, "file.txt")
-	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	missing := filepath.Join(dir, "missing")
 	tmpfs := func(guest string) Mount { return Mount{Kind: MountTmpfs, GuestPath: guest} }
 
@@ -171,7 +171,6 @@ func TestConfigNormalizeRejectsInvalidMounts(t *testing.T) {
 		{"duplicate guest path", Config{Mounts: []Mount{tmpfs("/a"), {Kind: MountVolume, VolumeName: "v", GuestPath: "/a"}}}, "/a"},
 		{"mount at workspace with WorkspacePath", Config{WorkspacePath: dir, Mounts: []Mount{tmpfs("/workspace")}}, "WorkspacePath"},
 		{"missing bind source", Config{Mounts: []Mount{{Kind: MountBind, HostPath: missing, GuestPath: "/a"}}}, "does not exist"},
-		{"bind source is a file", Config{Mounts: []Mount{{Kind: MountBind, HostPath: file, GuestPath: "/a"}}}, "files are not supported"},
 		{"bind without source", Config{Mounts: []Mount{{Kind: MountBind, GuestPath: "/a"}}}, "HostPath"},
 		{"bind with volume name", Config{Mounts: []Mount{{Kind: MountBind, HostPath: dir, VolumeName: "v", GuestPath: "/a"}}}, "VolumeName"},
 		{"bind with size", Config{Mounts: []Mount{{Kind: MountBind, HostPath: dir, GuestPath: "/a", TmpfsSizeBytes: 1}}}, "TmpfsSizeBytes"},
@@ -196,13 +195,35 @@ func TestConfigNormalizeRejectsInvalidMounts(t *testing.T) {
 	}
 }
 
+func TestConfigNormalizeRejectsBindSourceOfOtherFileType(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows host has no device file at a fixed path")
+	}
+	cfg := Config{Mounts: []Mount{{Kind: MountBind, HostPath: os.DevNull, GuestPath: "/null"}}}
+	err := cfg.normalize()
+	if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "neither a directory nor a regular file") {
+		t.Fatalf("normalize() error = %v, want ErrInvalidConfig that names the file type", err)
+	}
+	cfg.Mounts[0].CreateHostPathIfMissing = true
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("normalize() accepted a device file with CreateHostPathIfMissing")
+	}
+}
+
 func TestConfigNormalizeAcceptsMounts(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing")
+	file := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg := Config{Mounts: []Mount{
 		{Kind: MountBind, HostPath: dir, GuestPath: "/workspace"},
 		{Kind: MountBind, HostPath: missing, GuestPath: "/created", CreateHostPathIfMissing: true},
 		{Kind: MountBind, HostPath: dir, GuestPath: "/again", ReadOnly: true},
+		{Kind: MountBind, HostPath: file, GuestPath: "/data/file.txt"},
+		{Kind: MountBind, HostPath: file, GuestPath: "/file-ro.txt", ReadOnly: true},
+		{Kind: MountBind, HostPath: file, GuestPath: "/file-create.txt", CreateHostPathIfMissing: true},
 		{Kind: MountVolume, VolumeName: "Data-1.x_y", GuestPath: "/vol"},
 		{Kind: MountTmpfs, GuestPath: "/dev/shm/inner", TmpfsSizeBytes: 4096},
 		{Kind: MountTmpfs, GuestPath: "/a/b/c"},
@@ -302,6 +323,126 @@ func TestOpenMountsPreparesHostDirectoriesAndWorkspaces(t *testing.T) {
 	}
 	if len(sb.workspaces) != 3 || len(sb.volumes) != 1 {
 		t.Errorf("open workspaces = %d and volumes = %d, want 3 and 1", len(sb.workspaces), len(sb.volumes))
+	}
+}
+
+func TestOpenMountsBindsOneFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "data.txt")
+	if err := os.WriteFile(file, []byte("host data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realFile, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Mounts: []Mount{
+		{Kind: MountBind, HostPath: file, GuestPath: "/data.txt"},
+		{Kind: MountBind, HostPath: filepath.Join(dir, ".", "data.txt"), GuestPath: "/again.txt"},
+		{Kind: MountBind, HostPath: file, GuestPath: "/ro.txt", ReadOnly: true, CreateHostPathIfMissing: true},
+		{Kind: MountBind, HostPath: dir, GuestPath: "/dir"},
+	}}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	sb := &Sandbox{cfg: cfg}
+	t.Cleanup(func() {
+		if err := sb.closeMounts(); err != nil {
+			t.Errorf("closeMounts() failed: %v", err)
+		}
+	})
+	if err := sb.openMounts(); err != nil {
+		t.Fatalf("openMounts() failed: %v", err)
+	}
+	// A file mount and a mount of its parent are different workspaces. Two
+	// mounts of one file with the same access share one workspace.
+	if len(sb.workspaces) != 3 {
+		t.Fatalf("open workspaces = %d, want 3 (shared writable file, read-only file, directory)", len(sb.workspaces))
+	}
+	byGuest := make(map[string]sandboxMount)
+	for _, m := range sb.mounts {
+		byGuest[m.GuestPath] = m
+	}
+	if byGuest["/data.txt"].workspace != byGuest["/again.txt"].workspace {
+		t.Error("two writable mounts of one file use two workspaces, want one")
+	}
+	if byGuest["/data.txt"].workspace == byGuest["/ro.txt"].workspace {
+		t.Error("a read-only and a writable mount of one file share a workspace")
+	}
+	if byGuest["/data.txt"].workspace == byGuest["/dir"].workspace {
+		t.Error("a file mount and a mount of its parent directory share a workspace")
+	}
+	for _, guest := range []string{"/data.txt", "/again.txt", "/ro.txt"} {
+		m := byGuest[guest]
+		if !m.hostFile || m.hostPath != realFile || !m.workspace.SingleFile() {
+			t.Errorf("mount %s: hostFile = %v, hostPath = %q, SingleFile = %v; want a file mount of %q", guest, m.hostFile, m.hostPath, m.workspace.SingleFile(), realFile)
+		}
+	}
+	if m := byGuest["/dir"]; m.hostFile || m.workspace.SingleFile() {
+		t.Errorf("directory mount: hostFile = %v, SingleFile = %v; want false", m.hostFile, m.workspace.SingleFile())
+	}
+	if got, err := os.ReadFile(file); err != nil || string(got) != "host data" {
+		t.Errorf("host file = %q, %v; want it unchanged", got, err)
+	}
+
+	var files, dirs int
+	for _, hm := range sb.hostMounts() {
+		switch {
+		case hm.File && hm.Path == realFile:
+			files++
+		case !hm.File && hm.Path == dir:
+			dirs++
+		default:
+			t.Errorf("unexpected hostMounts() entry %+v", hm)
+		}
+	}
+	if files != 3 || dirs != 1 {
+		t.Errorf("hostMounts() has %d file entries and %d directory entries, want 3 and 1", files, dirs)
+	}
+	if !sb.usesHostDirs() {
+		t.Error("usesHostDirs() = false with a file mount")
+	}
+}
+
+func TestOpenMountsCreatesDirectoryOnlyAndKeepsExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "data.txt")
+	if err := os.WriteFile(file, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created := filepath.Join(dir, "made")
+	sb := &Sandbox{cfg: Config{Mounts: []Mount{
+		{Kind: MountBind, HostPath: file, GuestPath: "/data.txt", CreateHostPathIfMissing: true},
+		{Kind: MountBind, HostPath: created, GuestPath: "/made", CreateHostPathIfMissing: true},
+	}}}
+	t.Cleanup(func() {
+		if err := sb.closeMounts(); err != nil {
+			t.Errorf("closeMounts() failed: %v", err)
+		}
+	})
+	if err := sb.openMounts(); err != nil {
+		t.Fatalf("openMounts() failed: %v", err)
+	}
+	if info, err := os.Stat(file); err != nil || !info.Mode().IsRegular() {
+		t.Errorf("host file after openMounts() = %v, %v; want a regular file", info, err)
+	}
+	if info, err := os.Stat(created); err != nil || !info.IsDir() {
+		t.Errorf("created bind source = %v, %v; want a directory", info, err)
+	}
+}
+
+func TestOpenMountsRejectsFileAsWorkspacePath(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "data.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sb := &Sandbox{cfg: Config{WorkspacePath: file}}
+	err := sb.openMounts()
+	if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "WorkspacePath") {
+		t.Fatalf("openMounts() error = %v, want ErrInvalidConfig that names WorkspacePath", err)
+	}
+	if err := sb.closeMounts(); err != nil {
+		t.Fatalf("closeMounts() after a failed openMounts() = %v, want success", err)
 	}
 }
 
@@ -471,6 +612,7 @@ func TestConfigHasHostDirsIgnoresTmpfs(t *testing.T) {
 		{"tmpfs only", Config{Mounts: []Mount{{Kind: MountTmpfs, GuestPath: "/t"}}}, false},
 		{"workspace", Config{WorkspacePath: "/w"}, true},
 		{"bind", Config{Mounts: []Mount{{Kind: MountBind, HostPath: "/h", GuestPath: "/b"}}}, true},
+		{"bind of a file path", Config{Mounts: []Mount{{Kind: MountBind, HostPath: "/h/file.txt", GuestPath: "/f.txt"}}}, true},
 		{"volume", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v"}}}, false},
 		{"volume with the ext4lite driver", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v", Driver: DriverExt4lite}}}, false},
 		{"volume with the hostfs driver", Config{Mounts: []Mount{{Kind: MountVolume, VolumeName: "v", GuestPath: "/v", Driver: DriverHostfs}}}, true},

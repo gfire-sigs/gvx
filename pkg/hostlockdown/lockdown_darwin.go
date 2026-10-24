@@ -69,9 +69,15 @@ func BuildSeatbeltProfile(opts Options) string {
 		if m.ReadOnly {
 			ops = "file-read*"
 		}
+		// A file mount uses literal, so the rule matches that one path and
+		// opens neither the parent directory nor the sibling files.
+		filter := "subpath"
+		if m.File {
+			filter = "literal"
+		}
 		given, real := mountParam(i)
-		fmt.Fprintf(&b, "(allow %s (subpath (param %q)))\n", ops, given)
-		fmt.Fprintf(&b, "(allow %s (subpath (param %q)))\n", ops, real)
+		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, given)
+		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, real)
 	}
 	switch {
 	case opts.AllowOutboundNet:
@@ -150,7 +156,7 @@ func applyOSLockdown(opts Options) (Status, error) {
 	if err := probeUnlistedOpenBlocked(realPaths); err != nil {
 		return Status{}, err
 	}
-	if err := probeMountsReachable(realPaths); err != nil {
+	if err := probeMountsReachable(opts.Mounts, realPaths); err != nil {
 		return Status{}, err
 	}
 	if err := desc.verify(); err != nil {

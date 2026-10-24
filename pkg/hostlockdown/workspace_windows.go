@@ -62,11 +62,15 @@ type workspaceGrant struct {
 // workspace it grants the logon SID access so the restricted thread token
 // passes its second access evaluation.
 //
-// SetNamedSecurityInfo propagates inheritable ACEs to existing children. The
-// walk then verifies every object and repairs the ones that keep a protected
-// ACL. The walk skips symbolic links and junctions, so it never changes a
-// target outside the workspace.
-func prepareWorkspace(path string, logon *windows.SID, readOnly bool) error {
+// A file mount (isFile) labels and grants that one file with no inheritance
+// flags. The parent directory and the sibling files keep their security
+// descriptors, so the restricted token cannot reach them by path.
+//
+// For a directory, SetNamedSecurityInfo propagates inheritable ACEs to
+// existing children. The walk then verifies every object and repairs the ones
+// that keep a protected ACL. The walk skips symbolic links and junctions, so
+// it never changes a target outside the workspace.
+func prepareWorkspace(path string, logon *windows.SID, readOnly, isFile bool) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("hostlockdown: resolve workspace %q: %w", path, err)
@@ -76,6 +80,9 @@ func prepareWorkspace(path string, logon *windows.SID, readOnly bool) error {
 		return fmt.Errorf("hostlockdown: resolve workspace symlinks %q: %w", abs, err)
 	}
 	grant := workspaceGrant{logon: logon, mask: workspaceAccessMask(readOnly), readOnly: readOnly}
+	if isFile {
+		return grant.apply(root, false)
+	}
 	if err := grant.apply(root, true); err != nil {
 		return err
 	}

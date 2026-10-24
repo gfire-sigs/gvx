@@ -31,7 +31,8 @@ func within(root, path string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// outsideAll reports whether path lies outside every directory in roots.
+// outsideAll reports whether path lies outside every mount root in roots. A
+// root is a directory or one file. A file root covers only its own path.
 func outsideAll(path string, roots []string) bool {
 	for _, root := range roots {
 		if within(root, path) {

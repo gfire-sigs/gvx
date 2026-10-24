@@ -49,15 +49,16 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 
 	// Step 1: Low-Integrity label and logon SID entry on every mount. A
 	// directory that two mounts name, or that lies below another mount, gets
-	// the rights of each mount. Each grant only adds access, so the order of
-	// the mounts does not matter.
+	// the rights of each mount. A file mount gets the label and the entry on
+	// that one file. Each grant only adds access, so the order of the mounts
+	// does not matter.
 	mountsReal := make([]string, 0, len(opts.Mounts))
 	for _, m := range opts.Mounts {
 		real, err := resolveMount(m.Path)
 		if err != nil {
 			return Status{}, err
 		}
-		if err := prepareWorkspace(real, id.logon, m.ReadOnly); err != nil {
+		if err := prepareWorkspace(real, id.logon, m.ReadOnly, m.File); err != nil {
 			return Status{}, err
 		}
 		mountsReal = append(mountsReal, real)

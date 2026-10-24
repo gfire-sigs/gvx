@@ -59,6 +59,11 @@ type regularFD struct {
 // forgets the cached entry and resolves the path again, which gives the exact
 // error.
 func (d *dentry) openHost(flags int) (*hostHandle, error) {
+	if d.fs.ws.single != "" {
+		// The root is the one bound file. Resolve its name again, so a file
+		// that a host editor replaced is the file that the guest opens.
+		return d.fs.ws.openSingle(flags)
+	}
 	if d.inode.unlinked.Load() {
 		if t := d.tmpOf(); t != nil {
 			return d.fs.ws.openTmp(t, flags)

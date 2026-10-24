@@ -19,20 +19,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/socket/unix/transport"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
+	"z.gfire.dev/gvx/pkg/waiter"
 )
 
 // This file tests the extended operations of GVXIP-001 section 4.1, 4.3, and
@@ -1818,4 +1824,1184 @@ func (f *failNthRename) rename(oldRel, newRel string) error {
 		return os.ErrPermission
 	}
 	return f.hostBackend.rename(oldRel, newRel)
+}
+
+// The tests below cover section 4.2: AF_UNIX sockets, FIFOs, device nodes, extended
+// attributes, and the limit of the .gvx_meta table.
+
+// idProvider supplies the unique identifiers that Unix endpoints need.
+type idProvider struct{ n atomic.Uint64 }
+
+func (p *idProvider) UniqueID() uint64 { return p.n.Add(1) }
+
+// blockingCtx lets a goroutine block inside the VFS the way a task does. Each
+// goroutine that may block needs its own value.
+type blockingCtx struct {
+	cookieContext
+	nt gvcontext.NoTask
+}
+
+// BlockOn implements context.Context.BlockOn.
+func (c *blockingCtx) BlockOn(w waiter.Waitable, mask waiter.EventMask) bool {
+	return c.nt.BlockOn(w, mask)
+}
+
+func (e *env) blocking() *blockingCtx {
+	return &blockingCtx{cookieContext: e.ctx.(cookieContext)}
+}
+
+func (e *env) mknod(p string, mode linux.FileMode, major, minor uint32, ep transport.BoundEndpoint) error {
+	return e.vfsObj.MknodAt(e.ctx, e.creds, e.pop(p), &vfs.MknodOptions{Mode: mode, DevMajor: major, DevMinor: minor, Endpoint: ep})
+}
+
+func (e *env) mustMknod(p string, mode linux.FileMode) {
+	e.t.Helper()
+	if err := e.mknod(p, mode, 0, 0, nil); err != nil {
+		e.t.Fatalf("mknod %q %#o: %v", p, mode, err)
+	}
+}
+
+func (e *env) boundEndpoint(p string) (transport.BoundEndpoint, error) {
+	return e.vfsObj.BoundEndpointAt(e.ctx, e.creds, e.pop(p), &vfs.BoundEndpointOptions{})
+}
+
+// impl returns the filesystem behind the mount of the test.
+func (e *env) impl() *filesystem {
+	return e.root.Mount().Filesystem().Impl().(*filesystem)
+}
+
+// direntTypes lists the dirent type of each entry of the directory p.
+func (e *env) direntTypes(p string) map[string]uint8 {
+	e.t.Helper()
+	fd := e.mustOpen(p, linux.O_RDONLY|linux.O_DIRECTORY)
+	defer fd.DecRef(e.ctx)
+	out := map[string]uint8{}
+	err := fd.IterDirents(e.ctx, vfs.IterDirentsCallbackFunc(func(d vfs.Dirent) error {
+		out[d.Name] = d.Type
+		return nil
+	}))
+	if err != nil {
+		e.t.Fatalf("readdir %q: %v", p, err)
+	}
+	return out
+}
+
+func (e *env) hostSize(p string) int64 {
+	e.t.Helper()
+	info, err := os.Lstat(e.host(p))
+	if err != nil {
+		e.t.Fatalf("host stat %q: %v", p, err)
+	}
+	if !info.Mode().IsRegular() {
+		e.t.Fatalf("host file %q has mode %v, want a regular placeholder", p, info.Mode())
+	}
+	return info.Size()
+}
+
+// newListeningEndpoint returns a listening stream endpoint, once as the
+// connecting API and once as the bound endpoint that a socket file stores.
+func newListeningEndpoint(t *testing.T, ctx gvcontext.Context, ids *idProvider) (transport.Endpoint, transport.BoundEndpoint) {
+	t.Helper()
+	server := transport.NewConnectioned(ctx, linux.SOCK_STREAM, ids)
+	if err := server.Bind(transport.Address{Addr: "/sock"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := server.Listen(ctx, 4); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	return server, server.(transport.BoundEndpoint)
+}
+
+func TestMknodSocketConnectsThroughBoundEndpointAt(t *testing.T) {
+	e := newEnv(t)
+	ids := &idProvider{}
+	server, bep := newListeningEndpoint(t, e.ctx, ids)
+	if err := e.mknod("sock", linux.S_IFSOCK|0o755, 0, 0, bep); err != nil {
+		t.Fatalf("mknod socket: %v", err)
+	}
+
+	st := e.mustStat("sock")
+	if st.Mode&linux.S_IFMT != linux.S_IFSOCK || st.Mode&0o7777 != 0o755 || st.Size != 0 {
+		t.Fatalf("stat = mode %#o size %d, want a socket of mode 0755 and size 0", st.Mode, st.Size)
+	}
+	if got := e.hostSize("sock"); got != 0 {
+		t.Fatalf("host placeholder holds %d bytes, want 0", got)
+	}
+	if got := e.readdir("."); len(got) != 1 || got[0] != "sock" {
+		t.Fatalf("readdir = %v, want [sock]", got)
+	}
+	if got := e.direntTypes(".")["sock"]; got != linux.DT_SOCK {
+		t.Fatalf("dirent type = %d, want DT_SOCK", got)
+	}
+
+	bound, err := e.boundEndpoint("sock")
+	if err != nil {
+		t.Fatalf("BoundEndpointAt: %v", err)
+	}
+	if bound != bep {
+		t.Fatalf("BoundEndpointAt returned another endpoint than the one that mknod stored")
+	}
+	client := transport.NewConnectioned(e.ctx, linux.SOCK_STREAM, ids)
+	if serr := client.Connect(e.ctx, bound); serr != nil {
+		t.Fatalf("Connect through the socket file: %v", serr)
+	}
+	peer, serr := server.Accept(e.ctx, nil)
+	if serr != nil {
+		t.Fatalf("Accept: %v", serr)
+	}
+	if n, _, serr := client.SendMsg(e.ctx, [][]byte{[]byte("ping")}, transport.ControlMessages{}, nil); serr != nil || n != 4 {
+		t.Fatalf("SendMsg = (%d, %v), want 4 bytes", n, serr)
+	}
+	buf := make([]byte, 16)
+	out, _, serr := peer.RecvMsg(e.ctx, [][]byte{buf}, transport.RecvArgs{})
+	if serr != nil || string(buf[:out.RecvLen]) != "ping" {
+		t.Fatalf("RecvMsg = (%q, %v), want ping", buf[:out.RecvLen], serr)
+	}
+
+	_, err = e.open("sock", linux.O_RDONLY, 0)
+	wantErrno(t, "open of a socket file", err, linuxerr.ENXIO)
+}
+
+func TestSocketKeepsItsEndpointAcrossRenameLinkAndPruning(t *testing.T) {
+	e := newEnv(t)
+	_, want := newListeningEndpoint(t, e.ctx, &idProvider{})
+	if err := e.mknod("sock", linux.S_IFSOCK|0o777, 0, 0, want); err != nil {
+		t.Fatal(err)
+	}
+	// want is the endpoint that every name of the socket must return.
+	check := func(path string) {
+		t.Helper()
+		got, err := e.boundEndpoint(path)
+		if err != nil || got != want {
+			t.Fatalf("BoundEndpointAt(%q) = (%v, %v), want the stored endpoint", path, got, err)
+		}
+	}
+
+	if err := e.rename("sock", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	check("renamed")
+	wantErrno(t, "BoundEndpointAt of the old name", func() error { _, err := e.boundEndpoint("sock"); return err }(), linuxerr.ENOENT)
+
+	if err := e.link("renamed", "alias"); err != nil {
+		t.Fatalf("link of a socket file: %v", err)
+	}
+	check("alias")
+	if a, b := e.mustStat("renamed"), e.mustStat("alias"); a.Ino != b.Ino || a.Nlink != 2 {
+		t.Fatalf("stat = (ino %d, nlink %d) and ino %d, want one inode with 2 links", a.Ino, a.Nlink, b.Ino)
+	}
+
+	// The cache must not drop a dentry that holds an endpoint.
+	fs := e.impl()
+	fs.mu.Lock()
+	fs.pruneLocked(fs.root)
+	fs.mu.Unlock()
+	check("renamed")
+	check("alias")
+
+	// Removing one name keeps the endpoint on the other.
+	if err := e.unlink("renamed"); err != nil {
+		t.Fatal(err)
+	}
+	check("alias")
+}
+
+func TestUnlinkOfSocketRemovesPlaceholderAndRecord(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("sock", linux.S_IFSOCK|0o600)
+	if err := e.unlink("sock"); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	if _, err := os.Lstat(e.host("sock")); !os.IsNotExist(err) {
+		t.Fatalf("host placeholder after unlink: %v, want it removed", err)
+	}
+	e.ws.mu.RLock()
+	_, ok := e.ws.meta["sock"]
+	e.ws.mu.RUnlock()
+	if ok {
+		t.Fatalf("the .gvx_meta record of the socket survived the unlink")
+	}
+	_, err := e.stat("sock")
+	wantErrno(t, "stat after unlink", err, linuxerr.ENOENT)
+	// The name is free again.
+	e.mustMknod("sock", linux.S_IFIFO|0o600)
+	if st := e.mustStat("sock"); st.Mode&linux.S_IFMT != linux.S_IFIFO {
+		t.Fatalf("recreated node has type %#o, want a FIFO", st.Mode&linux.S_IFMT)
+	}
+}
+
+func TestSocketWithoutEndpointRefusesConnections(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("stale", linux.S_IFSOCK|0o777)
+	e.mustMknod("fifo", linux.S_IFIFO|0o666)
+	e.writeFile("file", []byte("x"))
+	for _, p := range []string{"stale", "fifo", "file"} {
+		_, err := e.boundEndpoint(p)
+		wantErrno(t, "BoundEndpointAt of "+p, err, linuxerr.ECONNREFUSED)
+	}
+	_, err := e.boundEndpoint("missing")
+	wantErrno(t, "BoundEndpointAt of a missing name", err, linuxerr.ENOENT)
+}
+
+func TestSpecialNodesPersistAcrossReopen(t *testing.T) {
+	dir := resolvedTempDir(t)
+	e, closeEnv := openEnvAt(t, dir, workspaceOptions{coalesce: defaultCoalesceWindow})
+	_, bep := newListeningEndpoint(t, e.ctx, &idProvider{})
+	if err := e.mknod("sock", linux.S_IFSOCK|0o751, 0, 0, bep); err != nil {
+		t.Fatal(err)
+	}
+	e.mustMknod("fifo", linux.S_IFIFO|0o640)
+	if err := e.mknod("tty", linux.S_IFCHR|0o620, 4, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.mknod("disk", linux.S_IFBLK|0o660, 8, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.mustMkdir("dir")
+	if err := e.mknod("dir/nested", linux.S_IFIFO|0o600, 0, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	closeEnv()
+
+	e2, _ := openEnvAt(t, dir, workspaceOptions{coalesce: defaultCoalesceWindow})
+	for _, tc := range []struct {
+		path         string
+		typ          uint16
+		perm         uint16
+		major, minor uint32
+	}{
+		{"sock", linux.S_IFSOCK, 0o751, 0, 0},
+		{"fifo", linux.S_IFIFO, 0o640, 0, 0},
+		{"tty", linux.S_IFCHR, 0o620, 4, 7},
+		{"disk", linux.S_IFBLK, 0o660, 8, 1},
+		{"dir/nested", linux.S_IFIFO, 0o600, 0, 0},
+	} {
+		st := e2.mustStat(tc.path)
+		if st.Mode&linux.S_IFMT != tc.typ || st.Mode&0o7777 != tc.perm || st.RdevMajor != tc.major || st.RdevMinor != tc.minor {
+			t.Errorf("stat %q after reopen = type %#o perm %#o rdev %d:%d, want %#o %#o %d:%d",
+				tc.path, st.Mode&linux.S_IFMT, st.Mode&0o7777, st.RdevMajor, st.RdevMinor, tc.typ, tc.perm, tc.major, tc.minor)
+		}
+	}
+	// The endpoint of the earlier mount is gone.
+	_, err := e2.boundEndpoint("sock")
+	wantErrno(t, "BoundEndpointAt after reopen", err, linuxerr.ECONNREFUSED)
+	// A FIFO of the earlier mount opens with an empty pipe.
+	fd, err := e2.open("fifo", linux.O_RDONLY|linux.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatalf("open FIFO after reopen: %v", err)
+	}
+	fd.DecRef(e2.ctx)
+	types := e2.direntTypes(".")
+	for name, want := range map[string]uint8{"sock": linux.DT_SOCK, "fifo": linux.DT_FIFO, "tty": linux.DT_CHR, "disk": linux.DT_BLK, "dir": linux.DT_DIR} {
+		if types[name] != want {
+			t.Errorf("dirent type of %q = %d, want %d", name, types[name], want)
+		}
+	}
+}
+
+func TestFIFOTransfersDataBetweenDescriptors(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("fifo", linux.S_IFIFO|0o644)
+	if st := e.mustStat("fifo"); st.Mode&linux.S_IFMT != linux.S_IFIFO || st.Size != 0 {
+		t.Fatalf("stat = mode %#o size %d, want an empty FIFO", st.Mode, st.Size)
+	}
+	if got := e.direntTypes(".")["fifo"]; got != linux.DT_FIFO {
+		t.Fatalf("dirent type = %d, want DT_FIFO", got)
+	}
+
+	// A non-blocking open for writing fails while no reader exists.
+	_, err := e.open("fifo", linux.O_WRONLY|linux.O_NONBLOCK, 0)
+	wantErrno(t, "O_WRONLY|O_NONBLOCK without a reader", err, linuxerr.ENXIO)
+
+	// A non-blocking open for reading succeeds without a writer.
+	reader := e.mustOpen("fifo", linux.O_RDONLY|linux.O_NONBLOCK)
+	defer reader.DecRef(e.ctx)
+	dst := make([]byte, 16)
+	writer := e.mustOpen("fifo", linux.O_WRONLY|linux.O_NONBLOCK)
+	defer writer.DecRef(e.ctx)
+	_, err = reader.Read(e.ctx, usermem.BytesIOSequence(dst), vfs.ReadOptions{})
+	wantErrno(t, "read of an empty FIFO with a writer", err, linuxerr.ErrWouldBlock)
+	if n, err := writer.Write(e.ctx, usermem.BytesIOSequence([]byte("through memory")), vfs.WriteOptions{}); err != nil || n != 14 {
+		t.Fatalf("write to the FIFO = (%d, %v), want 14 bytes", n, err)
+	}
+	n, err := reader.Read(e.ctx, usermem.BytesIOSequence(dst), vfs.ReadOptions{})
+	if err != nil || string(dst[:n]) != "through memory" {
+		t.Fatalf("read from the FIFO = (%q, %v), want the written bytes", dst[:n], err)
+	}
+	if got := e.hostSize("fifo"); got != 0 {
+		t.Fatalf("the host placeholder holds %d bytes, want 0: FIFO data stays in Sentry memory", got)
+	}
+}
+
+func TestFIFOBlockingOpenWaitsForTheOtherEnd(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("fifo", linux.S_IFIFO|0o644)
+
+	type result struct {
+		fd  *vfs.FileDescription
+		err error
+	}
+	opened := make(chan result, 1)
+	readerCtx := e.blocking()
+	go func() {
+		fd, err := e.vfsObj.OpenAt(readerCtx, e.creds, e.fpop("fifo"), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+		opened <- result{fd, err}
+	}()
+
+	// The writer open succeeds once the reader exists. Both opens finish only
+	// when each sees the other end.
+	writer, err := e.vfsObj.OpenAt(e.blocking(), e.creds, e.fpop("fifo"), &vfs.OpenOptions{Flags: linux.O_WRONLY})
+	if err != nil {
+		t.Fatalf("blocking open for writing: %v", err)
+	}
+	defer writer.DecRef(e.ctx)
+	r := <-opened
+	if r.err != nil {
+		t.Fatalf("blocking open for reading: %v", r.err)
+	}
+	defer r.fd.DecRef(e.ctx)
+
+	if _, err := writer.Write(e.ctx, usermem.BytesIOSequence([]byte("hello")), vfs.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, 8)
+	n, err := r.fd.Read(readerCtx, usermem.BytesIOSequence(dst), vfs.ReadOptions{})
+	if err != nil || string(dst[:n]) != "hello" {
+		t.Fatalf("read = (%q, %v), want hello", dst[:n], err)
+	}
+}
+
+func TestFIFOReadWriteOpenNeverBlocks(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("fifo", linux.S_IFIFO|0o644)
+	fd := e.mustOpen("fifo", linux.O_RDWR)
+	defer fd.DecRef(e.ctx)
+	if _, err := fd.Write(e.ctx, usermem.BytesIOSequence([]byte("loop")), vfs.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, 8)
+	n, err := fd.Read(e.ctx, usermem.BytesIOSequence(dst), vfs.ReadOptions{})
+	if err != nil || string(dst[:n]) != "loop" {
+		t.Fatalf("read = (%q, %v), want loop", dst[:n], err)
+	}
+}
+
+func TestNewFIFODoesNotShareThePipeOfAnUnlinkedOne(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("a", linux.S_IFIFO|0o644)
+	reader := e.mustOpen("a", linux.O_RDONLY|linux.O_NONBLOCK)
+	defer reader.DecRef(e.ctx)
+	if err := e.unlink("a"); err != nil {
+		t.Fatal(err)
+	}
+	// The host may hand the inode number of a to b. Opening b for writing
+	// must still find no reader, because the reader belongs to the old pipe.
+	e.mustMknod("b", linux.S_IFIFO|0o644)
+	_, err := e.open("b", linux.O_WRONLY|linux.O_NONBLOCK, 0)
+	wantErrno(t, "O_WRONLY|O_NONBLOCK on a new FIFO", err, linuxerr.ENXIO)
+}
+
+type stubDevice struct{ err error }
+
+func (d stubDevice) Open(gvcontext.Context, *vfs.Mount, *vfs.Dentry, vfs.OpenOptions) (*vfs.FileDescription, error) {
+	return nil, d.err
+}
+
+func TestMknodDeviceNodes(t *testing.T) {
+	e := newEnv(t)
+	if err := e.mknod("null", linux.S_IFCHR|0o666, 1, 3, nil); err != nil {
+		t.Fatalf("mknod char device: %v", err)
+	}
+	if err := e.mknod("sda", linux.S_IFBLK|0o660, 8, 0, nil); err != nil {
+		t.Fatalf("mknod block device: %v", err)
+	}
+	st := e.mustStat("null")
+	if st.Mode&linux.S_IFMT != linux.S_IFCHR || st.Mode&0o7777 != 0o666 || st.RdevMajor != 1 || st.RdevMinor != 3 {
+		t.Fatalf("stat null = type %#o perm %#o rdev %d:%d, want a 0666 character device 1:3", st.Mode&linux.S_IFMT, st.Mode&0o7777, st.RdevMajor, st.RdevMinor)
+	}
+	st = e.mustStat("sda")
+	if st.Mode&linux.S_IFMT != linux.S_IFBLK || st.RdevMajor != 8 || st.RdevMinor != 0 {
+		t.Fatalf("stat sda = type %#o rdev %d:%d, want a block device 8:0", st.Mode&linux.S_IFMT, st.RdevMajor, st.RdevMinor)
+	}
+	if got := e.hostSize("null"); got != 0 {
+		t.Fatalf("host placeholder of a device holds %d bytes", got)
+	}
+
+	// No device is registered, so open fails as it does on other filesystems.
+	_, err := e.open("null", linux.O_RDONLY, 0)
+	wantErrno(t, "open of an unregistered device", err, linuxerr.ENXIO)
+
+	// A registered device receives the open.
+	if err := e.vfsObj.RegisterDevice(vfs.CharDevice, 1, 3, stubDevice{err: linuxerr.EIO}, &vfs.RegisterDeviceOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.open("null", linux.O_RDONLY, 0)
+	wantErrno(t, "open of a registered device", err, linuxerr.EIO)
+
+	wantErrno(t, "mknod with a major above the limit", e.mknod("big", linux.S_IFCHR|0o600, rdevMajorMax+1, 0, nil), linuxerr.EINVAL)
+	wantErrno(t, "mknod of a directory", e.mknod("d", linux.S_IFDIR|0o755, 0, 0, nil), linuxerr.EINVAL)
+	wantErrno(t, "mknod over an existing name", e.mknod("null", linux.S_IFIFO|0o600, 0, 0, nil), linuxerr.EEXIST)
+}
+
+func TestWhiteoutRecordIsACharacterDeviceZero(t *testing.T) {
+	e := newEnv(t)
+	e.ws.mu.Lock()
+	err := e.ws.createWhiteoutLocked("gone")
+	e.ws.mu.Unlock()
+	if err != nil {
+		t.Fatalf("createWhiteoutLocked: %v", err)
+	}
+	st := e.mustStat("gone")
+	if st.Mode&linux.S_IFMT != linux.S_IFCHR || st.Mode&0o7777 != 0 || st.RdevMajor != 0 || st.RdevMinor != 0 {
+		t.Fatalf("whiteout stat = type %#o perm %#o rdev %d:%d, want character device 0:0 with mode 0", st.Mode&linux.S_IFMT, st.Mode&0o7777, st.RdevMajor, st.RdevMinor)
+	}
+	if got := e.hostSize("gone"); got != 0 {
+		t.Fatalf("whiteout placeholder holds %d bytes", got)
+	}
+	e.ws.mu.Lock()
+	err = e.ws.createWhiteoutLocked("gone")
+	e.ws.mu.Unlock()
+	if !os.IsExist(err) {
+		t.Fatalf("second whiteout = %v, want an exist error", err)
+	}
+}
+
+func TestChmodAndChownKeepTheSpecialType(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("fifo", linux.S_IFIFO|0o600)
+	if err := e.setStat("fifo", linux.Statx{Mask: linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID, Mode: 0o640, UID: 7, GID: 8}); err != nil {
+		t.Fatalf("setstat: %v", err)
+	}
+	st := e.mustStat("fifo")
+	if st.Mode != linux.S_IFIFO|0o640 || st.UID != 7 || st.GID != 8 {
+		t.Fatalf("stat = mode %#o uid %d gid %d, want FIFO 0640 owned by 7:8", st.Mode, st.UID, st.GID)
+	}
+	wantErrno(t, "truncate of a FIFO", e.setStat("fifo", linux.Statx{Mask: linux.STATX_SIZE, Size: 0}), linuxerr.EINVAL)
+}
+
+func TestPlaceholderWithHostContentIsARegularFile(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("node", linux.S_IFSOCK|0o600)
+	if err := os.WriteFile(e.host("node"), []byte("replaced by a host tool"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attr, size, err := e.ws.Stat("node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attr.Mode&linux.S_IFMT != linux.S_IFREG || size == 0 {
+		t.Fatalf("Stat = type %#o size %d, want a regular file: the host file has content", attr.Mode&linux.S_IFMT, size)
+	}
+}
+
+func TestMknodRegularFileStaysAnOrdinaryFile(t *testing.T) {
+	e := newEnv(t)
+	e.mustMknod("plain", linux.S_IFREG|0o644)
+	e.writeFile("plain", []byte("data"))
+	if got := e.readFile("plain"); string(got) != "data" {
+		t.Fatalf("read = %q", got)
+	}
+	if st := e.mustStat("plain"); st.Mode&linux.S_IFMT != linux.S_IFREG {
+		t.Fatalf("type = %#o, want a regular file", st.Mode&linux.S_IFMT)
+	}
+}
+
+func TestMetaTableLimitRefusesNewRecords(t *testing.T) {
+	e := newEnvOpts(t, workspaceOptions{coalesce: defaultCoalesceWindow, maxMeta: 5})
+	hostOnly := e.host("hostfile")
+	if err := os.WriteFile(hostOnly, []byte("h"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"f1", "f2"} {
+		e.writeFile(name, []byte("x"))
+	}
+	e.mustMkdir("d1")
+	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("l1"), "target"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustMknod("n1", linux.S_IFIFO|0o600)
+	e.ws.mu.RLock()
+	count := len(e.ws.meta)
+	e.ws.mu.RUnlock()
+	if count != 5 {
+		t.Fatalf("the table holds %d records, want 5", count)
+	}
+
+	_, err := e.open("f3", linux.O_CREAT|linux.O_WRONLY, 0o644)
+	wantErrno(t, "create at the limit", err, linuxerr.ENOSPC)
+	wantErrno(t, "mkdir at the limit", e.mkdir("d2"), linuxerr.ENOSPC)
+	wantErrno(t, "symlink at the limit", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("l2"), "t"), linuxerr.ENOSPC)
+	wantErrno(t, "mknod FIFO at the limit", e.mknod("n2", linux.S_IFIFO|0o600, 0, 0, nil), linuxerr.ENOSPC)
+	wantErrno(t, "mknod device at the limit", e.mknod("n3", linux.S_IFCHR|0o600, 1, 1, nil), linuxerr.ENOSPC)
+	wantErrno(t, "link at the limit", e.link("f1", "f1link"), linuxerr.ENOSPC)
+	wantErrno(t, "chmod of a file without a record", e.setStat("hostfile", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}), linuxerr.ENOSPC)
+	wantErrno(t, "chown of a file without a record", e.setStat("hostfile", linux.Statx{Mask: linux.STATX_UID, UID: 5}), linuxerr.ENOSPC)
+	wantErrno(t, "setxattr on a file without a record", e.setXattr("hostfile", "trusted.k", "v", 0), linuxerr.ENOSPC)
+
+	// A refused mutation leaves no host object behind.
+	for _, name := range []string{"f3", "d2", "l2", "n2", "n3", "f1link"} {
+		if _, err := os.Lstat(e.host(name)); !os.IsNotExist(err) {
+			t.Errorf("host entry %q exists after a refused mutation: %v", name, err)
+		}
+	}
+
+	// A record that exists needs no room, so its owner can still change it.
+	if err := e.setStat("f1", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}); err != nil {
+		t.Fatalf("chmod of a file with a record at the limit: %v", err)
+	}
+	// Removing a record makes room again.
+	if err := e.unlink("n1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.mknod("n2", linux.S_IFIFO|0o600, 0, 0, nil); err != nil {
+		t.Fatalf("mknod after an unlink made room: %v", err)
+	}
+}
+
+func TestHostWatcherSuppressesEchoOfSpecialNodes(t *testing.T) {
+	w := newWatchEnv(t)
+	w.mustMkdir("d")
+	w.add("d", hostEventMask)
+	w.settle()
+	hw := &w.ws.watch
+
+	// Prove first that the bridge is live, so that the checks below mean
+	// something.
+	hostWrite(t, w.host("d/probe"), "p")
+	w.sync()
+	w.expect("probe", "CREATE probe")
+	w.settle()
+	base := hw.delivered.Load()
+
+	step := func(what string, op func()) {
+		t.Helper()
+		op()
+		// The guest events arrive without a scan. The scan that follows
+		// must add nothing.
+		w.drain()
+		w.sync()
+		w.expectNone("echo of " + what)
+		if got := hw.delivered.Load(); got != base {
+			t.Fatalf("%s: the watcher delivered %d notifications for a guest mutation", what, got-base)
+		}
+	}
+	step("mknod of a socket", func() {
+		_, bep := newListeningEndpoint(t, w.env.ctx, &idProvider{})
+		if err := w.mknod("d/sock", linux.S_IFSOCK|0o600, 0, 0, bep); err != nil {
+			t.Fatal(err)
+		}
+	})
+	step("mknod of a FIFO", func() { w.mustMknod("d/fifo", linux.S_IFIFO|0o600) })
+	step("mknod of a device", func() {
+		if err := w.mknod("d/dev", linux.S_IFCHR|0o600, 1, 3, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	step("whiteout", func() {
+		w.ws.mu.Lock()
+		defer w.ws.mu.Unlock()
+		if err := w.ws.createWhiteoutLocked("d/white"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	step("rename of a FIFO", func() {
+		if err := w.rename("d/fifo", "d/fifo2"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	step("hard link of a socket", func() {
+		if err := w.link("d/sock", "d/sock2"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	step("unlink of a socket", func() {
+		if err := w.unlink("d/sock"); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestMknodOnAReadOnlyWorkspace(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws, err := OpenWorkspace(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := mountEnv(t, ws, dir)
+	t.Cleanup(func() {
+		e.root.DecRef(e.ctx)
+		_ = ws.Close()
+	})
+	for name, mode := range map[string]linux.FileMode{"sock": linux.S_IFSOCK | 0o600, "fifo": linux.S_IFIFO | 0o600, "dev": linux.S_IFCHR | 0o600} {
+		wantErrno(t, "mknod "+name+" on a read-only workspace", e.mknod(name, mode, 1, 1, nil), linuxerr.EROFS)
+		if _, err := os.Lstat(e.host(name)); !os.IsNotExist(err) {
+			t.Errorf("host entry %q exists after a refused mknod: %v", name, err)
+		}
+	}
+}
+
+// newMetaEnv returns a mount whose extended attributes live in .gvx_meta on
+// every host. The tests of the native store are in vfs_special_linux_test.go.
+func newMetaEnv(t *testing.T) *env {
+	t.Helper()
+	e := newEnv(t)
+	e.ws.caps.NativeXattr = false
+	return e
+}
+
+func (e *env) setXattrAs(creds *auth.Credentials, p, name, value string, flags uint32) error {
+	return e.vfsObj.SetXattrAt(e.ctx, creds, e.pop(p), &vfs.SetXattrOptions{Name: name, Value: value, Flags: flags})
+}
+
+func (e *env) setXattr(p, name, value string, flags uint32) error {
+	return e.setXattrAs(e.creds, p, name, value, flags)
+}
+
+func (e *env) mustSetXattr(p, name, value string) {
+	e.t.Helper()
+	if err := e.setXattr(p, name, value, 0); err != nil {
+		e.t.Fatalf("setxattr %q %q: %v", p, name, err)
+	}
+}
+
+func (e *env) getXattrAs(creds *auth.Credentials, p, name string, size uint64) (string, error) {
+	return e.vfsObj.GetXattrAt(e.ctx, creds, e.pop(p), &vfs.GetXattrOptions{Name: name, Size: size})
+}
+
+func (e *env) getXattr(p, name string) (string, error) {
+	return e.getXattrAs(e.creds, p, name, 0)
+}
+
+func (e *env) mustGetXattr(p, name string) string {
+	e.t.Helper()
+	v, err := e.getXattr(p, name)
+	if err != nil {
+		e.t.Fatalf("getxattr %q %q: %v", p, name, err)
+	}
+	return v
+}
+
+func (e *env) listXattrAs(creds *auth.Credentials, p string, size uint64) ([]string, error) {
+	names, err := e.vfsObj.ListXattrAt(e.ctx, creds, e.pop(p), size)
+	slices.Sort(names)
+	return names, err
+}
+
+func (e *env) listXattr(p string) []string {
+	e.t.Helper()
+	names, err := e.listXattrAs(e.creds, p, 0)
+	if err != nil {
+		e.t.Fatalf("listxattr %q: %v", p, err)
+	}
+	return names
+}
+
+func (e *env) removeXattr(p, name string) error {
+	return e.vfsObj.RemoveXattrAt(e.ctx, e.creds, e.pop(p), name)
+}
+
+// userCreds returns the credentials of an unprivileged user.
+func (e *env) userCreds(uid auth.KUID) *auth.Credentials {
+	return auth.NewUserCredentials(uid, auth.KGID(uid), nil, nil, e.creds.UserNamespace)
+}
+
+// openWorld makes the workspace root writable for every user.
+func (e *env) openWorld() {
+	e.t.Helper()
+	if err := e.setStat(".", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o777}); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func TestXattrCreateReplaceListRemove(t *testing.T) {
+	e := newMetaEnv(t)
+	e.writeFile("f", []byte("data"))
+
+	wantErrno(t, "REPLACE of a missing name", e.setXattr("f", "user.a", "1", linux.XATTR_REPLACE), linuxerr.ENODATA)
+	if err := e.setXattr("f", "user.a", "1", linux.XATTR_CREATE); err != nil {
+		t.Fatalf("CREATE of a new name: %v", err)
+	}
+	wantErrno(t, "CREATE of an existing name", e.setXattr("f", "user.a", "2", linux.XATTR_CREATE), linuxerr.EEXIST)
+	if err := e.setXattr("f", "user.a", "22", linux.XATTR_REPLACE); err != nil {
+		t.Fatalf("REPLACE of an existing name: %v", err)
+	}
+	e.mustSetXattr("f", "user.b", "")
+	e.mustSetXattr("f", "trusted.t", "root")
+
+	if got := e.mustGetXattr("f", "user.a"); got != "22" {
+		t.Fatalf("getxattr user.a = %q, want 22", got)
+	}
+	if got := e.mustGetXattr("f", "user.b"); got != "" {
+		t.Fatalf("getxattr of an empty value = %q", got)
+	}
+	if got := e.listXattr("f"); !slices.Equal(got, []string{"trusted.t", "user.a", "user.b"}) {
+		t.Fatalf("listxattr = %v", got)
+	}
+	_, err := e.getXattrAs(e.creds, "f", "user.a", 1)
+	wantErrno(t, "getxattr with a small size hint", err, linuxerr.ERANGE)
+	_, err = e.listXattrAs(e.creds, "f", 3)
+	wantErrno(t, "listxattr with a small size hint", err, linuxerr.ERANGE)
+	if _, err := e.listXattrAs(e.creds, "f", 4096); err != nil {
+		t.Fatalf("listxattr with a large size hint: %v", err)
+	}
+
+	if err := e.removeXattr("f", "user.a"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.getXattr("f", "user.a")
+	wantErrno(t, "getxattr after remove", err, linuxerr.ENODATA)
+	wantErrno(t, "remove of a missing name", e.removeXattr("f", "user.a"), linuxerr.ENODATA)
+	if got := e.listXattr("f"); !slices.Equal(got, []string{"trusted.t", "user.b"}) {
+		t.Fatalf("listxattr after remove = %v", got)
+	}
+	_, err = e.getXattr("missing", "user.a")
+	wantErrno(t, "getxattr of a missing file", err, linuxerr.ENOENT)
+
+	// The file itself is untouched.
+	if got := e.readFile("f"); string(got) != "data" {
+		t.Fatalf("content = %q", got)
+	}
+	if st := e.mustStat("f"); st.Mode&linux.S_IFMT != linux.S_IFREG {
+		t.Fatalf("type = %#o, want a regular file", st.Mode&linux.S_IFMT)
+	}
+}
+
+func TestXattrOnAHostFileWithoutARecord(t *testing.T) {
+	e := newMetaEnv(t)
+	if err := os.WriteFile(e.host("plain"), []byte("host"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	e.mustSetXattr("plain", "user.k", "v")
+	if got := e.mustGetXattr("plain", "user.k"); got != "v" {
+		t.Fatalf("getxattr = %q", got)
+	}
+	st := e.mustStat("plain")
+	wantMode := uint16(linux.S_IFREG | 0o640)
+	if isWindowsHost() {
+		// Windows keeps no permission bits, so hostfs shows its default mode.
+		wantMode = st.Mode
+	}
+	if st.Mode != wantMode || st.Size != 4 {
+		t.Fatalf("stat = mode %#o size %d, want the host mode and size to survive the new record", st.Mode, st.Size)
+	}
+}
+
+func TestXattrNamespaces(t *testing.T) {
+	e := newMetaEnv(t)
+	e.openWorld()
+	alice, bob := e.userCreds(1000), e.userCreds(2000)
+	fd, err := e.vfsObj.OpenAt(e.ctx, alice, e.pop("mine"), &vfs.OpenOptions{Flags: linux.O_CREAT | linux.O_WRONLY, Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd.DecRef(e.ctx)
+
+	// user.* belongs to the owner of a regular file.
+	if err := e.setXattrAs(alice, "mine", "user.note", "hi", 0); err != nil {
+		t.Fatalf("owner sets user.note: %v", err)
+	}
+	wantErrno(t, "write of user.* by another user", e.setXattrAs(bob, "mine", "user.note", "no", 0), linuxerr.EACCES)
+	if got, err := e.getXattrAs(bob, "mine", "user.note", 0); err != nil || got != "hi" {
+		t.Fatalf("read of user.* by another user with read permission = (%q, %v)", got, err)
+	}
+
+	// trusted.* needs CAP_SYS_ADMIN.
+	wantErrno(t, "write of trusted.* by a user", e.setXattrAs(alice, "mine", "trusted.x", "1", 0), linuxerr.EPERM)
+	_, err = e.getXattrAs(alice, "mine", "trusted.x", 0)
+	wantErrno(t, "read of trusted.* by a user", err, linuxerr.ENODATA)
+	if err := e.setXattrAs(e.creds, "mine", "trusted.x", "1", 0); err != nil {
+		t.Fatalf("root sets trusted.x: %v", err)
+	}
+	if got, err := e.getXattrAs(e.creds, "mine", "trusted.x", 0); err != nil || got != "1" {
+		t.Fatalf("root reads trusted.x = (%q, %v)", got, err)
+	}
+	_, err = e.getXattrAs(alice, "mine", "trusted.x", 0)
+	wantErrno(t, "read of an existing trusted.* by a user", err, linuxerr.ENODATA)
+	if names, err := e.listXattrAs(alice, "mine", 0); err != nil || !slices.Equal(names, []string{"user.note"}) {
+		t.Fatalf("a user lists %v (%v), want trusted.x hidden", names, err)
+	}
+	if names, err := e.listXattrAs(e.creds, "mine", 0); err != nil || !slices.Equal(names, []string{"trusted.x", "user.note"}) {
+		t.Fatalf("root lists %v (%v), want both names", names, err)
+	}
+
+	// security.* is read-only, except security.capability.
+	wantErrno(t, "write of security.selinux", e.setXattr("mine", "security.selinux", "ctx", 0), linuxerr.EOPNOTSUPP)
+	_, err = e.getXattr("mine", "security.selinux")
+	wantErrno(t, "read of an unset security.selinux", err, linuxerr.ENODATA)
+
+	// system.* and unknown namespaces are not supported.
+	wantErrno(t, "write of system.posix_acl_access", e.setXattr("mine", "system.posix_acl_access", "x", 0), linuxerr.EOPNOTSUPP)
+	_, err = e.getXattr("mine", "system.posix_acl_access")
+	wantErrno(t, "read of system.posix_acl_access", err, linuxerr.EOPNOTSUPP)
+	wantErrno(t, "write of a name without a namespace", e.setXattr("mine", "plain", "x", 0), linuxerr.EOPNOTSUPP)
+}
+
+func TestXattrOnEveryFileType(t *testing.T) {
+	e := newMetaEnv(t)
+	e.openWorld()
+	alice := e.userCreds(1000)
+	e.mustMkdir("dir")
+	e.mustMknod("fifo", linux.S_IFIFO|0o666)
+	e.mustMknod("sock", linux.S_IFSOCK|0o666)
+	if err := e.mknod("dev", linux.S_IFCHR|0o666, 1, 3, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("link"), "dir"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Directories carry user.* attributes.
+	if err := e.setXattrAs(e.creds, "dir", "user.d", "dv", 0); err != nil {
+		t.Fatalf("user.* on a directory: %v", err)
+	}
+	if got := e.mustGetXattr("dir", "user.d"); got != "dv" {
+		t.Fatalf("directory attribute = %q", got)
+	}
+
+	// Other types carry no user.* attributes but keep trusted.* and security.capability space.
+	for _, p := range []string{"fifo", "sock", "dev", "link"} {
+		wantErrno(t, "user.* on "+p, e.setXattrAs(alice, p, "user.x", "1", 0), linuxerr.EPERM)
+		_, err := e.getXattrAs(alice, p, "user.x", 0)
+		wantErrno(t, "read of user.* on "+p, err, linuxerr.ENODATA)
+		if err := e.setXattr(p, "trusted.k", "kv", 0); err != nil {
+			t.Fatalf("trusted.k on %s: %v", p, err)
+		}
+		if got := e.mustGetXattr(p, "trusted.k"); got != "kv" {
+			t.Fatalf("trusted.k on %s = %q", p, got)
+		}
+		if got := e.listXattr(p); !slices.Equal(got, []string{"trusted.k"}) {
+			t.Fatalf("listxattr of %s = %v", p, got)
+		}
+	}
+	// The symlink keeps its target and type.
+	if st, err := e.lstat("link"); err != nil || st.Mode&linux.S_IFMT != linux.S_IFLNK {
+		t.Fatalf("lstat link = (%#o, %v), want a symlink", st.Mode, err)
+	}
+	if got, err := e.vfsObj.ReadlinkAt(e.ctx, e.creds, e.pop("link")); err != nil || got != "dir" {
+		t.Fatalf("readlink = (%q, %v)", got, err)
+	}
+	for p, want := range map[string]uint32{"fifo": linux.S_IFIFO, "sock": linux.S_IFSOCK, "dev": linux.S_IFCHR} {
+		if st := e.mustStat(p); uint32(st.Mode)&linux.S_IFMT != want {
+			t.Fatalf("type of %s = %#o after setxattr, want %#o", p, st.Mode&linux.S_IFMT, want)
+		}
+	}
+	if st := e.mustStat("dev"); st.RdevMajor != 1 || st.RdevMinor != 3 {
+		t.Fatalf("rdev of dev = %d:%d after setxattr, want 1:3", st.RdevMajor, st.RdevMinor)
+	}
+}
+
+func TestXattrSizeCapPerInode(t *testing.T) {
+	e := newMetaEnv(t)
+	e.writeFile("a", nil)
+	e.writeFile("b", nil)
+
+	// "user.a" has 6 bytes, so 4090 bytes of value fill the cap exactly.
+	e.mustSetXattr("a", "user.a", strings.Repeat("x", maxXattrBytes-len("user.a")))
+	wantErrno(t, "replace above the cap", e.setXattr("a", "user.a", strings.Repeat("x", maxXattrBytes-len("user.a")+1), 0), linuxerr.ENOSPC)
+	if got := e.mustGetXattr("a", "user.a"); len(got) != maxXattrBytes-len("user.a") {
+		t.Fatalf("a refused replace changed the value to %d bytes", len(got))
+	}
+	wantErrno(t, "another name at the cap", e.setXattr("a", "user.b", "", 0), linuxerr.ENOSPC)
+
+	// The cap counts names and values of all attributes of one inode.
+	e.mustSetXattr("b", "user.one", strings.Repeat("y", 2000))
+	e.mustSetXattr("b", "user.two", strings.Repeat("y", 2000))
+	wantErrno(t, "third attribute above the cap", e.setXattr("b", "user.three", strings.Repeat("y", 200), 0), linuxerr.ENOSPC)
+	// A smaller replace and a remove both make room.
+	e.mustSetXattr("b", "user.one", "short")
+	e.mustSetXattr("b", "user.three", strings.Repeat("y", 200))
+	if err := e.removeXattr("b", "user.two"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustSetXattr("b", "user.four", strings.Repeat("y", 1500))
+
+	// A single value above 64 KiB is too big, before any cap applies.
+	wantErrno(t, "value above XATTR_SIZE_MAX", e.setXattr("b", "user.big", strings.Repeat("z", linux.XATTR_SIZE_MAX+1), 0), linuxerr.E2BIG)
+}
+
+func TestXattrMapsAreCopiedOnChange(t *testing.T) {
+	cur := map[string][]byte{"user.a": []byte("1")}
+	next, err := setXattrMap(cur, "user.b", []byte("2"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cur) != 1 || len(next) != 2 {
+		t.Fatalf("setXattrMap changed its input: cur %v next %v", cur, next)
+	}
+	value := []byte("3")
+	next2, err := setXattrMap(next, "user.c", value, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value[0] = 'X'
+	if string(next2["user.c"]) != "3" {
+		t.Fatalf("setXattrMap kept the caller buffer: %q", next2["user.c"])
+	}
+	gone, err := removeXattrMap(next2, "user.a")
+	if err != nil || len(next2) != 3 || len(gone) != 2 {
+		t.Fatalf("removeXattrMap = (%v, %v), input %v", gone, err, next2)
+	}
+	if last, err := removeXattrMap(map[string][]byte{"user.a": nil}, "user.a"); err != nil || last != nil {
+		t.Fatalf("removal of the last name = (%v, %v), want a nil map", last, err)
+	}
+	if _, err := removeXattrMap(cur, "user.zz"); !linuxerr.Equals(linuxerr.ENODATA, err) {
+		t.Fatalf("removal of a missing name = %v, want ENODATA", err)
+	}
+}
+
+func TestXattrHardLinksShareAttributes(t *testing.T) {
+	e := newMetaEnv(t)
+	e.writeFile("a", []byte("x"))
+	e.mustSetXattr("a", "user.first", "1")
+	if err := e.link("a", "b"); err != nil {
+		t.Fatal(err)
+	}
+	// A new link starts with the attributes of the file.
+	if got := e.mustGetXattr("b", "user.first"); got != "1" {
+		t.Fatalf("attribute through the new link = %q", got)
+	}
+	// A change through either name shows through the other.
+	e.mustSetXattr("b", "user.second", "2")
+	if got := e.mustGetXattr("a", "user.second"); got != "2" {
+		t.Fatalf("attribute set through b, read through a = %q", got)
+	}
+	e.mustSetXattr("a", "user.first", "changed")
+	if got := e.mustGetXattr("b", "user.first"); got != "changed" {
+		t.Fatalf("attribute replaced through a, read through b = %q", got)
+	}
+	if err := e.removeXattr("b", "user.second"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.getXattr("a", "user.second")
+	wantErrno(t, "attribute removed through b, read through a", err, linuxerr.ENODATA)
+	if got := e.listXattr("a"); !slices.Equal(got, e.listXattr("b")) {
+		t.Fatalf("listxattr a = %v, b = %v, want equal", got, e.listXattr("b"))
+	}
+	// A third name joins the set, and the table holds one map for each name.
+	if err := e.link("b", "c"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustSetXattr("c", "user.third", "3")
+	for _, p := range []string{"a", "b", "c"} {
+		if got := e.listXattr(p); !slices.Equal(got, []string{"user.first", "user.third"}) {
+			t.Fatalf("listxattr %s = %v", p, got)
+		}
+	}
+
+	// unlink, rename, and a later link keep the attributes consistent.
+	if err := e.unlink("a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rename("b", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.mustGetXattr("renamed", "user.third"); got != "3" {
+		t.Fatalf("attribute after unlink and rename = %q", got)
+	}
+	e.mustSetXattr("c", "user.after", "4")
+	if got := e.mustGetXattr("renamed", "user.after"); got != "4" {
+		t.Fatalf("attribute through the renamed link = %q", got)
+	}
+	e.ws.mu.RLock()
+	_, goneRecord := e.ws.meta["a"]
+	_, movedRecord := e.ws.meta["renamed"]
+	e.ws.mu.RUnlock()
+	if goneRecord || !movedRecord {
+		t.Fatalf("records after unlink and rename: a=%v renamed=%v, want a gone and renamed present", goneRecord, movedRecord)
+	}
+}
+
+func TestXattrHardLinkedFIFOSharesAttributes(t *testing.T) {
+	e := newMetaEnv(t)
+	e.mustMknod("fifo", linux.S_IFIFO|0o600)
+	if err := e.link("fifo", "fifo2"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustSetXattr("fifo2", "trusted.k", "v")
+	if got := e.mustGetXattr("fifo", "trusted.k"); got != "v" {
+		t.Fatalf("attribute through the other name = %q", got)
+	}
+	if st := e.mustStat("fifo2"); st.Mode&linux.S_IFMT != linux.S_IFIFO || st.Nlink != 2 {
+		t.Fatalf("stat = type %#o nlink %d, want a FIFO with 2 links", st.Mode&linux.S_IFMT, st.Nlink)
+	}
+}
+
+func TestXattrFollowsRenameAndUnlink(t *testing.T) {
+	e := newMetaEnv(t)
+	e.mustMkdir("d")
+	e.writeFile("d/f", []byte("x"))
+	e.mustSetXattr("d/f", "user.k", "v")
+	e.mustSetXattr("d", "user.dir", "dv")
+	if err := e.rename("d", "moved"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.mustGetXattr("moved/f", "user.k"); got != "v" {
+		t.Fatalf("file attribute after a directory rename = %q", got)
+	}
+	if got := e.mustGetXattr("moved", "user.dir"); got != "dv" {
+		t.Fatalf("directory attribute after a rename = %q", got)
+	}
+	_, err := e.getXattr("d", "user.dir")
+	wantErrno(t, "attribute at the old directory name", err, linuxerr.ENOENT)
+
+	// A rename over a file with attributes replaces them.
+	e.writeFile("target", []byte("t"))
+	e.mustSetXattr("target", "user.old", "o")
+	if err := e.rename("moved/f", "target"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.listXattr("target"); !slices.Equal(got, []string{"user.k"}) {
+		t.Fatalf("attributes after a rename over a file = %v, want only those of the moved file", got)
+	}
+
+	// A removed file leaves no attributes for a new file of the same name.
+	if err := e.unlink("target"); err != nil {
+		t.Fatal(err)
+	}
+	e.writeFile("target", nil)
+	if got := e.listXattr("target"); len(got) != 0 {
+		t.Fatalf("a new file starts with attributes %v", got)
+	}
+	e.ws.mu.RLock()
+	rec := e.ws.meta["target"]
+	e.ws.mu.RUnlock()
+	if len(rec.Xattrs) != 0 {
+		t.Fatalf("the record of a new file holds attributes %v", rec.Xattrs)
+	}
+}
+
+func TestXattrPersistAcrossReopen(t *testing.T) {
+	dir := resolvedTempDir(t)
+	e, closeEnv := openEnvAt(t, dir, workspaceOptions{coalesce: defaultCoalesceWindow})
+	e.ws.caps.NativeXattr = false
+	e.writeFile("file", []byte("x"))
+	e.mustMkdir("dir")
+	e.mustMknod("fifo", linux.S_IFIFO|0o600)
+	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("link"), "file"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustSetXattr("file", "user.f", "file value")
+	e.mustSetXattr("dir", "user.d", "dir value")
+	e.mustSetXattr("fifo", "trusted.p", "fifo value")
+	e.mustSetXattr("link", "trusted.l", "link value\x00with a NUL")
+	e.mustSetXattr("file", "trusted.t", "second")
+	closeEnv()
+
+	e2, _ := openEnvAt(t, dir, workspaceOptions{coalesce: defaultCoalesceWindow})
+	e2.ws.caps.NativeXattr = false
+	for _, tc := range []struct{ path, name, want string }{
+		{"file", "user.f", "file value"},
+		{"file", "trusted.t", "second"},
+		{"dir", "user.d", "dir value"},
+		{"fifo", "trusted.p", "fifo value"},
+		{"link", "trusted.l", "link value\x00with a NUL"},
+	} {
+		if got, err := e2.getXattr(tc.path, tc.name); err != nil || got != tc.want {
+			t.Errorf("getxattr %s %s after reopen = (%q, %v), want %q", tc.path, tc.name, got, err, tc.want)
+		}
+	}
+	if got := e2.listXattr("file"); !slices.Equal(got, []string{"trusted.t", "user.f"}) {
+		t.Errorf("listxattr after reopen = %v", got)
+	}
+	if st := e2.mustStat("fifo"); st.Mode&linux.S_IFMT != linux.S_IFIFO {
+		t.Errorf("type of the FIFO after reopen = %#o", st.Mode&linux.S_IFMT)
+	}
+}
+
+func TestXattrThroughFileDescriptors(t *testing.T) {
+	e := newMetaEnv(t)
+	e.writeFile("f", []byte("data"))
+	e.mustMkdir("d")
+
+	fd := e.mustOpen("f", linux.O_RDWR)
+	defer fd.DecRef(e.ctx)
+	if err := fd.SetXattr(e.ctx, &vfs.SetXattrOptions{Name: "user.fd", Value: "v1"}); err != nil {
+		t.Fatalf("fsetxattr: %v", err)
+	}
+	if got, err := fd.GetXattr(e.ctx, &vfs.GetXattrOptions{Name: "user.fd"}); err != nil || got != "v1" {
+		t.Fatalf("fgetxattr = (%q, %v)", got, err)
+	}
+	if got := e.mustGetXattr("f", "user.fd"); got != "v1" {
+		t.Fatalf("path getxattr after fsetxattr = %q", got)
+	}
+	if names, err := fd.ListXattr(e.ctx, 0); err != nil || !slices.Equal(names, []string{"user.fd"}) {
+		t.Fatalf("flistxattr = (%v, %v)", names, err)
+	}
+
+	dfd := e.mustOpen("d", linux.O_RDONLY|linux.O_DIRECTORY)
+	defer dfd.DecRef(e.ctx)
+	if err := dfd.SetXattr(e.ctx, &vfs.SetXattrOptions{Name: "user.dirfd", Value: "dv"}); err != nil {
+		t.Fatalf("fsetxattr on a directory: %v", err)
+	}
+	if got := e.mustGetXattr("d", "user.dirfd"); got != "dv" {
+		t.Fatalf("directory attribute = %q", got)
+	}
+	if err := dfd.RemoveXattr(e.ctx, "user.dirfd"); err != nil {
+		t.Fatalf("fremovexattr on a directory: %v", err)
+	}
+
+	// An unlinked file with an open descriptor keeps working attributes.
+	if err := e.unlink("f"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fd.GetXattr(e.ctx, &vfs.GetXattrOptions{Name: "user.fd"}); err != nil || got != "v1" {
+		t.Fatalf("fgetxattr on an unlinked file = (%q, %v)", got, err)
+	}
+	if err := fd.SetXattr(e.ctx, &vfs.SetXattrOptions{Name: "user.fd", Value: "v2"}); err != nil {
+		t.Fatalf("fsetxattr on an unlinked file: %v", err)
+	}
+	if got, err := fd.GetXattr(e.ctx, &vfs.GetXattrOptions{Name: "user.fd"}); err != nil || got != "v2" {
+		t.Fatalf("fgetxattr after the change = (%q, %v)", got, err)
+	}
+	if err := fd.RemoveXattr(e.ctx, "user.fd"); err != nil {
+		t.Fatalf("fremovexattr on an unlinked file: %v", err)
+	}
+	e.ws.mu.RLock()
+	_, ok := e.ws.meta["f"]
+	e.ws.mu.RUnlock()
+	if ok {
+		t.Fatalf("an xattr call on an unlinked file created a record for its old name")
+	}
+}
+
+func TestXattrOnAReadOnlyWorkspace(t *testing.T) {
+	dir := resolvedTempDir(t)
+	if err := os.WriteFile(dir+"/f", []byte("ro"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := OpenWorkspace(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := mountEnv(t, ws, dir)
+	t.Cleanup(func() {
+		e.root.DecRef(e.ctx)
+		_ = ws.Close()
+	})
+	wantErrno(t, "setxattr on a read-only workspace", e.setXattr("f", "user.k", "v", 0), linuxerr.EROFS)
+	wantErrno(t, "removexattr on a read-only workspace", e.removeXattr("f", "user.k"), linuxerr.EROFS)
+	_, err = e.getXattr("f", "user.k")
+	wantErrno(t, "getxattr on a read-only workspace", err, linuxerr.ENODATA)
+	if got := e.listXattr("f"); len(got) != 0 {
+		t.Fatalf("listxattr = %v", got)
+	}
+}
+
+func TestXattrMetaTableHoldsTheValues(t *testing.T) {
+	e := newMetaEnv(t)
+	e.writeFile("f", nil)
+	e.mustSetXattr("f", "user.k", "v")
+	e.ws.mu.RLock()
+	got := maps.Clone(e.ws.meta["f"].Xattrs)
+	e.ws.mu.RUnlock()
+	if len(got) != 1 || string(got["user.k"]) != "v" {
+		t.Fatalf("the record holds %v, want user.k=v", got)
+	}
+	if err := e.ws.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(e.host(MetaFileName))
+	if err != nil || !strings.Contains(string(raw), `"user.k"`) {
+		t.Fatalf(".gvx_meta = (%q, %v), want it to hold user.k", raw, err)
+	}
 }

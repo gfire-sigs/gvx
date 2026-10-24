@@ -283,6 +283,21 @@ func TestLockdownDarwinNestedAndDuplicateMounts(t *testing.T) {
 	runChildToCompletion(t, "nested-mounts", env...)
 }
 
+func TestLockdownDarwinFileMount(t *testing.T) {
+	_, _, env := workspaceEnv(t)
+	runChildToCompletion(t, "file-mount", env...)
+}
+
+func TestLockdownDarwinReadOnlyFileMount(t *testing.T) {
+	_, _, env := workspaceEnv(t)
+	runChildToCompletion(t, "file-mount-readonly", env...)
+}
+
+func TestLockdownDarwinFileMountBelowDirectoryMount(t *testing.T) {
+	_, _, env := workspaceEnv(t)
+	runChildToCompletion(t, "file-mount-below-directory", env...)
+}
+
 func TestLockdownDarwinRejectsRootWorkspace(t *testing.T) {
 	runChildToCompletion(t, "root-workspace")
 }
@@ -313,6 +328,12 @@ func runLockedChild(mode string) error {
 		return childTwoMounts()
 	case "nested-mounts":
 		return childNestedMounts()
+	case "file-mount":
+		return childFileMount()
+	case "file-mount-readonly":
+		return childFileMountReadOnly()
+	case "file-mount-below-directory":
+		return childFileMountBelowDirectory()
 	case "prespawned-child":
 		return childPreSpawned()
 	case "net-none":
@@ -477,6 +498,112 @@ func childNestedMounts() error {
 	var c childChecks
 	data, err := os.ReadFile(filepath.Join(sub, "in.txt"))
 	c.expect(err == nil && string(data) == "nested", "read nested mount = %q, %v", data, err)
+	_, err = os.ReadFile(filepath.Join(outside, "secret.txt"))
+	c.expect(errors.Is(err, fs.ErrPermission), "read outside the mounts = %v, want permission error", err)
+	return c.err()
+}
+
+// childFileMount applies one file mount. Only that file opens by path. The
+// sibling file and the parent directory stay closed. A descriptor that the
+// child opened before Apply stays readable and writable.
+func childFileMount() error {
+	ws, outside := os.Getenv(childWSEnv), os.Getenv(childOutEnv)
+	target, sibling := filepath.Join(ws, "target.txt"), filepath.Join(ws, "sibling.txt")
+	if err := os.WriteFile(target, []byte("target-data"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(sibling, []byte("sibling-data"), 0o600); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		return err
+	}
+	held, err := root.OpenFile("target.txt", os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	st, err := Apply(Options{Mounts: []HostMount{{Path: target, File: true}}})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(st.Applied && st.UnboundFileOpenBlocked, "status = %+v", st)
+	_, err = os.ReadFile(sibling)
+	c.expect(errors.Is(err, fs.ErrPermission), "read sibling by path = %v, want permission error", err)
+	_, err = root.Open("sibling.txt")
+	c.expect(errors.Is(err, fs.ErrPermission), "read sibling through the pre-opened root = %v, want permission error", err)
+	_, err = os.ReadDir(ws)
+	c.expect(errors.Is(err, fs.ErrPermission), "list the parent of the file mount = %v, want permission error", err)
+	_, err = os.ReadFile(filepath.Join(outside, "secret.txt"))
+	c.expect(errors.Is(err, fs.ErrPermission), "read outside the mount = %v, want permission error", err)
+	_, err = os.OpenFile(filepath.Join(ws, "created.txt"), os.O_CREATE|os.O_WRONLY, 0o600)
+	c.expect(errors.Is(err, fs.ErrPermission), "create next to the file mount = %v, want permission error", err)
+
+	data, err := os.ReadFile(target)
+	c.expect(err == nil && string(data) == "target-data", "read target by path = %q, %v", data, err)
+	c.expect(os.WriteFile(target, []byte("by-path"), 0o600) == nil, "write target by path")
+
+	// The held descriptor keeps its read and write access.
+	_, err = held.WriteAt([]byte("held"), 0)
+	c.expect(err == nil, "write through the pre-opened descriptor: %v", err)
+	buf := make([]byte, 4)
+	_, err = held.ReadAt(buf, 0)
+	c.expect(err == nil && string(buf) == "held", "read through the pre-opened descriptor = %q, %v", buf, err)
+	return c.err()
+}
+
+// childFileMountReadOnly applies a read-only file mount. The file reads by
+// path and does not open for write. A held writable descriptor still writes.
+func childFileMountReadOnly() error {
+	ws := os.Getenv(childWSEnv)
+	target, sibling := filepath.Join(ws, "target.txt"), filepath.Join(ws, "sibling.txt")
+	if err := os.WriteFile(target, []byte("target-data"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(sibling, []byte("sibling-data"), 0o600); err != nil {
+		return err
+	}
+	held, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: target, File: true, ReadOnly: true}}}); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	data, err := os.ReadFile(target)
+	c.expect(err == nil && string(data) == "target-data", "read target by path = %q, %v", data, err)
+	_, err = os.OpenFile(target, os.O_WRONLY, 0)
+	c.expect(errors.Is(err, fs.ErrPermission), "open target for write = %v, want permission error", err)
+	_, err = os.ReadFile(sibling)
+	c.expect(errors.Is(err, fs.ErrPermission), "read sibling by path = %v, want permission error", err)
+	_, err = held.WriteAt([]byte("held"), 0)
+	c.expect(err == nil, "write through the pre-opened descriptor: %v", err)
+	return c.err()
+}
+
+// childFileMountBelowDirectory applies a writable file mount below a
+// read-only directory mount. The file keeps its own write access.
+func childFileMountBelowDirectory() error {
+	ws, outside := os.Getenv(childWSEnv), os.Getenv(childOutEnv)
+	target, sibling := filepath.Join(ws, "target.txt"), filepath.Join(ws, "sibling.txt")
+	if err := os.WriteFile(target, []byte("target-data"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(sibling, []byte("sibling-data"), 0o600); err != nil {
+		return err
+	}
+	mounts := []HostMount{{Path: ws, ReadOnly: true}, {Path: target, File: true}}
+	if _, err := Apply(Options{Mounts: mounts}); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(os.WriteFile(target, []byte("new"), 0o600) == nil, "write the file mount below a read-only directory")
+	_, err := os.ReadFile(sibling)
+	c.expect(err == nil, "read sibling in the directory mount: %v", err)
+	err = os.WriteFile(sibling, []byte("new"), 0o600)
+	c.expect(errors.Is(err, fs.ErrPermission), "write sibling in the read-only directory = %v, want permission error", err)
 	_, err = os.ReadFile(filepath.Join(outside, "secret.txt"))
 	c.expect(errors.Is(err, fs.ErrPermission), "read outside the mounts = %v, want permission error", err)
 	return c.err()

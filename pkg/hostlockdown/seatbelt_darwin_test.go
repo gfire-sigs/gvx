@@ -145,8 +145,38 @@ func TestSeatbeltProfileNeverAllowsBroadOperations(t *testing.T) {
 		}
 	}
 	for _, line := range profileLines(profile) {
-		if strings.HasPrefix(line, "(allow file-") && !strings.Contains(line, "(subpath (param ") {
-			t.Errorf("file rule without a parameterized subpath: %q", line)
+		if strings.HasPrefix(line, "(allow file-") && !strings.Contains(line, "(subpath (param ") && !strings.Contains(line, "(literal (param ") {
+			t.Errorf("file rule without a parameterized path: %q", line)
+		}
+	}
+}
+
+func TestSeatbeltProfileFileMountUsesLiteralOnly(t *testing.T) {
+	profile := BuildSeatbeltProfile(Options{Mounts: []HostMount{
+		{Path: "/data/rw.txt", File: true},
+		{Path: "/data/ro.txt", File: true, ReadOnly: true},
+		{Path: "/data/dir"},
+	}})
+	want := []string{
+		`(allow file-read* file-write* (literal (param "MOUNT_0")))`,
+		`(allow file-read* file-write* (literal (param "MOUNT_0_REAL")))`,
+		`(allow file-read* (literal (param "MOUNT_1")))`,
+		`(allow file-read* (literal (param "MOUNT_1_REAL")))`,
+		`(allow file-read* file-write* (subpath (param "MOUNT_2")))`,
+		`(allow file-read* file-write* (subpath (param "MOUNT_2_REAL")))`,
+	}
+	var got []string
+	for _, line := range profileLines(profile) {
+		if strings.HasPrefix(line, "(allow file-") {
+			got = append(got, line)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("file rules = %q, want %q", got, want)
+	}
+	for _, leaked := range []string{"/data", "rw.txt", "ro.txt"} {
+		if strings.Contains(profile, leaked) {
+			t.Fatalf("mount path leaked %q into the policy text:\n%s", leaked, profile)
 		}
 	}
 }

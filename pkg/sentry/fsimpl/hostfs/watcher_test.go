@@ -929,3 +929,39 @@ func TestNativeBackendReleasesItsResources(t *testing.T) {
 		t.Fatal("the backend holds a goroutine, a descriptor, or a handle after the last watch ended")
 	}
 }
+
+func TestHostWatcherReportsGuestRemovalOfWatchedObjects(t *testing.T) {
+	w := newWatchEnv(t)
+	w.mustMkdir("gone")
+	w.writeFile("f", []byte("x"))
+	w.add("gone", hostEventMask)
+	w.add("f", hostEventMask)
+	w.settle()
+
+	if err := w.vfsObj.RmdirAt(w.env.ctx, w.creds, w.pop("gone")); err != nil {
+		t.Fatal(err)
+	}
+	w.sync()
+	// One IN_DELETE_SELF and one IN_IGNORED, whichever path saw the removal.
+	w.expect("after a guest rmdir of a watched directory", "DELETE_SELF ", "IGNORED ")
+	if err := w.unlink("f"); err != nil {
+		t.Fatal(err)
+	}
+	w.sync()
+	got := eventNames(w.drain())
+	count := func(s string) int {
+		n := 0
+		for _, g := range got {
+			if g == s {
+				n++
+			}
+		}
+		return n
+	}
+	if count("DELETE_SELF ") != 1 || count("IGNORED ") != 1 {
+		t.Fatalf("events after a guest unlink of a watched file = %q, want one DELETE_SELF and one IGNORED", got)
+	}
+	if got := w.ws.watch.watchedCount(); got != 0 {
+		t.Fatalf("watched objects after the removals = %d, want 0", got)
+	}
+}

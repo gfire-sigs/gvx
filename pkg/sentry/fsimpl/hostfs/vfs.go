@@ -386,6 +386,11 @@ func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) e
 }
 
 func (i *inode) matches(e entry) bool {
+	if i.fs.ws.single != "" {
+		// The only inode is the root, which stands for the name of the bound
+		// file. A host editor can replace the file under that name.
+		return !e.virtual && e.info.kind == i.kind
+	}
 	if i.virtual != e.virtual {
 		return false
 	}

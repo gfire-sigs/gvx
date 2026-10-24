@@ -50,7 +50,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `-t` | Allocate a pseudo-terminal. |
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. |
 | `-P` | Publish every port that the image declares with `EXPOSE` to a free port of `127.0.0.1`. |
-| `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory or a named volume. |
+| `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, one host file, or a named volume. |
 | `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
 | `--read-only` | Mount the root file system of the guest read-only. |
@@ -97,7 +97,7 @@ The sandbox writes the hostname to `/etc/hostname`. It adds a line with the gues
 
 ### 4.4 Mounts
 
-A bind mount shows a host directory in the guest. A named volume is one image file, `<name>.ext4`, in a `volumes` directory. That directory is inside the `-cache-dir` directory, or else next to the default layer cache. The volume name matches `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. The sandbox creates a missing volume image and a missing `-v` bind directory before the lockdown. A `--mount type=bind` source must exist.
+A bind mount shows a host directory or one host file in the guest. A named volume is one image file, `<name>.ext4`, in a `volumes` directory. That directory is inside the `-cache-dir` directory, or else next to the default layer cache. The volume name matches `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. The sandbox creates a missing volume image and a missing `-v` bind directory before the lockdown. The sandbox never creates a missing file. A `--mount type=bind` source must exist.
 
 The image holds an ext4 file system that the `ext4lite` driver reads and writes. The image grows in steps of 16MiB, up to 64GiB. A clean exit returns the unused tail to the host. One sandbox at a time can use a volume, because the driver locks the image file. A second sandbox on the same volume fails at start. A read-only mount of a volume opens the image read-only and fails when the last run did not end cleanly.
 
@@ -105,7 +105,11 @@ The guest sees only the files that it wrote. The host sees one file. After a cra
 
 A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
 
-A source with no path separator that is not an absolute path names a volume. A Windows drive letter stays in the source, as in `C:\data:/data:ro`. A bind mount of a single file is not supported.
+A source with no path separator that is not an absolute path names a volume. A Windows drive letter stays in the source, as in `C:\data:/data:ro`.
+
+A bind source can be one regular file, as in `-v /host/app.conf:/etc/app.conf:ro`. A socket, a device, or a pipe is not valid. The guest sees only that file. The parent directory and the sibling files of the host file are not exposed, and the guest cannot reach them by a path. The sandbox creates the guest path as an empty regular file with the mode 0644, and it creates the missing parent directories. The option `:ro` makes the file read-only. The option `-workspace` takes a directory only.
+
+A file mount writes no `.gvx_meta` file. The mode, the owner, and the times of the file stay in memory and reset at the next start. An `unlink`, a `rename`, or a `link` of the mounted file in the guest returns `EBUSY`, as for a file that Docker bind-mounts. When a host editor replaces the file with an atomic rename, the next open of the guest path reaches the new file. A descriptor that was already open keeps the old file.
 
 The guest path of a mount is absolute and clean. It is not `/`. It is not `/proc`, `/sys`, `/dev`, or a path below them, except a path below `/dev/shm`. Two mounts cannot share a guest path. A mount at `/workspace` conflicts with `-workspace`.
 
@@ -120,7 +124,7 @@ A volume with the `ext4lite` driver needs no lockdown rule for a host path. The 
 | Linux | The seccomp filter allows opens through a directory descriptor when a bind mount or a `hostfs` volume exists. |
 
 > [!WARNING]
-> On Windows, a bind mount changes the security descriptors of the host directory. Mount only a directory that the guest may change.
+> On Windows, a bind mount changes the security descriptors of the host directory, or of the host file for a file mount. Mount only a path that the guest may change.
 
 ### 4.5 Resource limits
 

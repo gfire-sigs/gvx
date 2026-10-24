@@ -244,6 +244,10 @@ type Workspace struct {
 	pruneCursor int
 	// maxMeta is the most entries that meta may hold. See checkMetaRoomLocked.
 	maxMeta int
+	// single is the host name of the bound file in single-file mode, or empty
+	// for a directory workspace. It never changes after openWorkspace
+	// returns. See single_file.go.
+	single string
 }
 
 type workspaceOptions struct {
@@ -303,9 +307,17 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: resolve workspace path %q: %w", hostPath, err)
 	}
-	root, err := os.OpenRoot(absPath)
+	// A regular file selects the single-file mode: the pinned directory is the
+	// parent of the file, and the stored name of the file is remembered.
+	pinDir, single := absPath, ""
+	if fi, serr := os.Stat(absPath); serr == nil && fi.Mode().IsRegular() {
+		if pinDir, single, err = splitSingleFile(absPath); err != nil {
+			return nil, err
+		}
+	}
+	root, err := os.OpenRoot(pinDir)
 	if err != nil {
-		return nil, fmt.Errorf("hostfs: os.OpenRoot(%q): %w", absPath, err)
+		return nil, fmt.Errorf("hostfs: os.OpenRoot(%q): %w", pinDir, err)
 	}
 	backend, err := newHostRoot(root)
 	if err != nil {
@@ -313,6 +325,9 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		return nil, err
 	}
 	var host hostBackend = backend
+	if single != "" {
+		host = &singleHost{hostBackend: host, name: single}
+	}
 	if opts.wrapHost != nil {
 		host = opts.wrapHost(host)
 	}
@@ -325,7 +340,13 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	if opts.caps != nil {
 		caps = *opts.caps
 	} else {
-		caps = platformCaps(host, readOnly)
+		// The probe of a writable workspace creates files. A single-file
+		// workspace must not write into the directory of the user.
+		caps = platformCaps(host, readOnly || single != "")
+	}
+	if single != "" {
+		// The attributes of the guest stay in memory.
+		caps.NativeXattr = false
 	}
 	hostOS := opts.hostOS
 	if hostOS == "" {
@@ -348,9 +369,16 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
 		clutter:          clutterRulesFor(hostOS),
 		maxMeta:          metaLimit(opts.maxMeta),
+		single:           single,
 	}
 	if caps.LocksOpenDirMove {
 		w.handles = newWinHandleRegistry(workspaceHandleOps{w})
+	}
+	if single != "" {
+		// Every host change reaches the guest through the poll backend, which
+		// reads the one file by name.
+		w.watch.factory = func(hw *hostWatcher) (watchBackend, error) { return newPollBackend(hw), nil }
+		return w, nil
 	}
 	if err := w.loadMeta(); err != nil {
 		_ = host.close()
@@ -535,7 +563,9 @@ func (w *Workspace) flushLoop() {
 // flushMeta writes the table if it changed since the last write. The payload
 // is built under the read lock and written without it.
 func (w *Workspace) flushMeta() error {
-	if w.readOnly {
+	if w.readOnly || w.single != "" {
+		// A single-file workspace owns no directory, so it keeps its metadata
+		// in memory and never writes .gvx_meta.
 		return nil
 	}
 	w.flushMu.Lock()
@@ -825,7 +855,7 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 	if w.closed {
 		return entry{}, hostProbe{}, os.ErrClosed
 	}
-	if isReservedPath(rel) {
+	if isReservedPath(rel) || (w.single != "" && rel != ".") {
 		return entry{}, hostProbe{}, fs.ErrNotExist
 	}
 	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
@@ -932,6 +962,9 @@ func (w *Workspace) checkWritableLocked(rels ...string) error {
 	for _, rel := range rels {
 		if isReservedPath(rel) {
 			return errReservedName
+		}
+		if w.single != "" && rel != "." {
+			return fs.ErrNotExist
 		}
 	}
 	return nil

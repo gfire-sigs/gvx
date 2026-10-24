@@ -137,11 +137,17 @@ func probeUnlistedOpenBlocked(mountsReal []string) error {
 	return nil
 }
 
-// probeMountsReachable opens every mount directory. It proves that the allow
-// rules of each mount match after parameter expansion.
-func probeMountsReachable(mountsReal []string) error {
-	for _, real := range mountsReal {
-		fd, err := unix.Open(real, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+// probeMountsReachable opens every mount. A directory mount opens as a
+// directory and a file mount opens as a file. It proves that the allow rules
+// of each mount match after parameter expansion. The slice mountsReal holds
+// the resolved path of each entry of mounts, in order.
+func probeMountsReachable(mounts []HostMount, mountsReal []string) error {
+	for i, real := range mountsReal {
+		flags := unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC
+		if mounts[i].File {
+			flags = unix.O_RDONLY | unix.O_CLOEXEC
+		}
+		fd, err := unix.Open(real, flags, 0)
 		if err != nil {
 			return fmt.Errorf("hostlockdown: open mount %q after lockdown: %w", real, err)
 		}

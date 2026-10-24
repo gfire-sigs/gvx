@@ -17,6 +17,7 @@
 package hostlockdown
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,14 +49,29 @@ func TestProbesRejectUnlockedProcess(t *testing.T) {
 
 func TestProbeMountsReachable(t *testing.T) {
 	first, second := realTempDir(t), realTempDir(t)
-	if err := probeMountsReachable([]string{first, second}); err != nil {
+	dirs := []HostMount{{Path: first}, {Path: second}}
+	if err := probeMountsReachable(dirs, []string{first, second}); err != nil {
 		t.Fatalf("probeMountsReachable(existing) = %v", err)
 	}
-	if err := probeMountsReachable(nil); err != nil {
+	if err := probeMountsReachable(nil, nil); err != nil {
 		t.Fatalf("probeMountsReachable(no mounts) = %v", err)
 	}
-	if err := probeMountsReachable([]string{first, filepath.Join(second, "absent")}); err == nil {
+	if err := probeMountsReachable(dirs, []string{first, filepath.Join(second, "absent")}); err == nil {
 		t.Fatal("probeMountsReachable(second mount missing) = nil, want error")
+	}
+}
+
+func TestProbeMountsReachableOpensFileMountAsFile(t *testing.T) {
+	dir := realTempDir(t)
+	file := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(file, []byte("data"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := probeMountsReachable([]HostMount{{Path: file, File: true}}, []string{file}); err != nil {
+		t.Fatalf("probeMountsReachable(file mount) = %v", err)
+	}
+	if err := probeMountsReachable([]HostMount{{Path: file}}, []string{file}); err == nil {
+		t.Fatal("probeMountsReachable(file listed as directory) = nil, want error")
 	}
 }
 

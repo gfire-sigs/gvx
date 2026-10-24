@@ -309,7 +309,11 @@ func (b *winBackend) reopen() {
 		case err == nil:
 			e.rescan()
 		case errors.Is(err, fs.ErrNotExist) || tries >= maxResumeAttempts:
+			// The directory is gone, or it stays unreachable. A scan that cannot
+			// stat it reports the removal, so the guest hears IN_DELETE_SELF.
+			e.suspectGone.Store(true)
 			e.rescan()
+			e.suspectGone.Store(false)
 		default:
 			b.mu.Lock()
 			if !b.closed && !e.dead.Load() {
@@ -376,8 +380,19 @@ func (b *winBackend) complete(key uintptr, n uint32, err error) {
 		b.mu.Unlock()
 	}
 	// ERROR_NOTIFY_ENUM_DIR, ERROR_ACCESS_DENIED, and a zero-byte packet all
-	// call for a scan of the whole directory.
+	// call for a scan of the whole directory. A handle that fails with an
+	// access or handle error and cannot be posted again means that the host
+	// removed the directory. The scan then reports the removal even when the
+	// stat fails with an error that no not-found code covers.
+	lost := repost != nil && (errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_INVALID_HANDLE) ||
+		errors.Is(repost, windows.ERROR_ACCESS_DENIED) || errors.Is(repost, windows.ERROR_INVALID_HANDLE))
+	if lost {
+		e.suspectGone.Store(true)
+	}
 	e.rescan()
+	if lost {
+		e.suspectGone.Store(false)
+	}
 }
 
 func (b *winBackend) close() {

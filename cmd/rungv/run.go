@@ -188,7 +188,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	readOnlyRootFlag := fs.Bool("read-only", false, "Mount the root file system of the guest read-only")
 	var volumeFlags, mountFlags, tmpfsFlags listFlag
 	alias([]string{"v", "volume"}, func(n string) {
-		fs.Var(&volumeFlags, n, "Mount a host directory or a named volume (an ext4 image file): src:dst[:ro|rw]")
+		fs.Var(&volumeFlags, n, "Mount a host directory, one host file, or a named volume (an ext4 image file): src:dst[:ro|rw]")
 	})
 	fs.Var(&mountFlags, "mount", "Mount with Docker syntax: type=bind|volume|tmpfs,src=...,dst=...,readonly[,driver=ext4lite|hostfs]")
 	fs.Var(&tmpfsFlags, "tmpfs", "Mount a tmpfs: /path[:size=64m,ro]")

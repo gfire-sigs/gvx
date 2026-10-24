@@ -58,3 +58,25 @@ func TestOutsideAllRequiresEveryMountToMiss(t *testing.T) {
 		t.Error("every path is outside an empty mount list")
 	}
 }
+
+func TestOutsideAllTreatsFileMountAsOnePath(t *testing.T) {
+	base := t.TempDir()
+	file := filepath.Join(base, "dir", "target.txt")
+	mounts := []string{file}
+	if outsideAll(file, mounts) {
+		t.Error("the file mount path counts as outside")
+	}
+	if !outsideAll(filepath.Dir(file), mounts) {
+		t.Error("the parent of a file mount does not count as outside")
+	}
+	if !outsideAll(filepath.Join(filepath.Dir(file), "sibling.txt"), mounts) {
+		t.Error("a sibling of a file mount does not count as outside")
+	}
+	if !outsideAll(file+".bak", mounts) {
+		t.Error("a path that shares the file name prefix does not count as outside")
+	}
+	withDir := []string{filepath.Dir(file), file}
+	if outsideAll(filepath.Dir(file), withDir) {
+		t.Error("the parent counts as outside when a directory mount covers it")
+	}
+}

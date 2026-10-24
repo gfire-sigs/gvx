@@ -712,7 +712,8 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	return nil
 }
 
-// mountUserMount creates the guest directory of m and mounts it there. A bind
+// mountUserMount creates the guest mount point of m and mounts it there. The
+// mount point is a directory, or an empty regular file for a file mount. A bind
 // mount or a hostfs volume uses the VFS2 hostfs driver. An ext4lite volume uses
 // the ext4lite driver on its open image. A tmpfs mount uses the Sentry tmpfs
 // with a size limit and mode 1777.
@@ -721,7 +722,11 @@ func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	if m.Kind == MountTmpfs {
 		dirMode = 0o1777
 	}
-	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, m.GuestPath, dirMode); err != nil {
+	if m.hostFile {
+		if err := vfsEnsureEmptyFile(sctx, vfsObj, creds, root, m.GuestPath, 0o644); err != nil {
+			return fmt.Errorf("gvx: create guest file %s: %w", m.GuestPath, err)
+		}
+	} else if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, m.GuestPath, dirMode); err != nil {
 		return fmt.Errorf("gvx: create guest directory %s: %w", m.GuestPath, err)
 	}
 	if m.Kind == MountTmpfs {
@@ -818,6 +823,35 @@ func vfsEnsureDirAll(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, cred
 			return fmt.Errorf("mkdir %s: %w", cur, err)
 		}
 	}
+	return nil
+}
+
+// vfsEnsureEmptyFile creates an empty regular file at guestPath and the
+// missing parent directories. An existing regular file stays as it is. Any
+// other existing file type is an error, because a file mount needs a file.
+func vfsEnsureEmptyFile(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, guestPath string, mode linux.FileMode) error {
+	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, path.Dir(guestPath), 0o755); err != nil {
+		return err
+	}
+	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(guestPath)}
+	st, err := vfsObj.StatAt(sctx, creds, &pop, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+	if err == nil {
+		if st.Mode&linux.S_IFMT != linux.S_IFREG {
+			return fmt.Errorf("%s: not a regular file", guestPath)
+		}
+		return nil
+	}
+	if !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return fmt.Errorf("stat %s: %w", guestPath, err)
+	}
+	fd, err := vfsObj.OpenAt(sctx, creds, &pop, &vfs.OpenOptions{
+		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_EXCL,
+		Mode:  mode,
+	})
+	if err != nil {
+		return fmt.Errorf("create %s: %w", guestPath, err)
+	}
+	fd.DecRef(sctx)
 	return nil
 }
 

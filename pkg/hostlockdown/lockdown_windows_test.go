@@ -179,6 +179,48 @@ func TestWorkspaceAccessMask(t *testing.T) {
 	}
 }
 
+// TestPrepareWorkspaceFileLabelsOnlyTheFile proves that a file mount puts the
+// Low label and the logon SID entry on that file and on nothing around it.
+func TestPrepareWorkspaceFileLabelsOnlyTheFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	sibling := filepath.Join(dir, "sibling.txt")
+	for _, p := range []string{target, sibling} {
+		if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
+			t.Fatalf("WriteFile %q: %v", p, err)
+		}
+	}
+	primary, err := openPrimaryToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	id, err := readTokenIdentity(primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareWorkspace(target, id.logon, false, true); err != nil {
+		t.Fatalf("prepareWorkspace(file) = %v", err)
+	}
+	grant := workspaceGrant{logon: id.logon, mask: workspaceAccessMask(false)}
+	state, err := grant.read(target, false)
+	if err != nil || !state.complete() {
+		t.Errorf("target state = %+v, %v; want the Low label and the logon entry", state, err)
+	}
+	for _, other := range []struct {
+		path  string
+		isDir bool
+	}{{sibling, false}, {dir, true}} {
+		state, err := grant.read(other.path, other.isDir)
+		if err != nil {
+			t.Fatalf("read %q: %v", other.path, err)
+		}
+		if state.labeled {
+			t.Errorf("%q carries a Low label after a file mount of its neighbor", other.path)
+		}
+	}
+}
+
 func TestGrantsAccess(t *testing.T) {
 	logon := mustSID(t, "S-1-5-5-0-123456")
 	rw := workspaceAccessMask(false)
@@ -301,6 +343,8 @@ func runLockedChild(mode string) error {
 		return runCPUChild()
 	case "mounts":
 		return runMountsChild()
+	case "file-mount":
+		return runFileMountChild()
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
@@ -475,4 +519,86 @@ func runMountsChild() error {
 		done <- errs
 	}()
 	return errors.Join(<-done...)
+}
+
+// TestApplyLockdownWithFileMount proves that a file mount serves a bound
+// thread for that file only. The sibling file and the parent directory stay
+// closed.
+func TestApplyLockdownWithFileMount(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("target-data"), 0o600); err != nil {
+		t.Fatalf("WriteFile target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sibling.txt"), []byte("sibling-data"), 0o600); err != nil {
+		t.Fatalf("WriteFile sibling: %v", err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), childModeEnv+"=file-mount", childWSEnv+"="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+	}
+}
+
+func runFileMountChild() error {
+	dir := os.Getenv(childWSEnv)
+	target := filepath.Join(dir, "target.txt")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	held, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	st, err := Apply(Options{Mounts: []HostMount{{Path: target, File: true}}})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	if !st.Applied || !st.UnboundFileOpenBlocked {
+		return fmt.Errorf("status = %+v, want an applied lockdown that blocks unbound opens", st)
+	}
+	var errs []error
+	if _, err := held.WriteString("held"); err != nil {
+		errs = append(errs, fmt.Errorf("write through the pre-opened handle: %w", err))
+	}
+
+	done := make(chan []error, 1)
+	go func() {
+		runtime.LockOSThread()
+		var threadErrs []error
+		if err := BindThread(); err != nil {
+			done <- []error{fmt.Errorf("BindThread: %w", err)}
+			return
+		}
+		f, err := root.OpenFile("target.txt", os.O_RDWR, 0)
+		if err != nil {
+			threadErrs = append(threadErrs, fmt.Errorf("open the file mount through the root on a bound thread: %w", err))
+		} else {
+			if _, err := f.WriteString("bound"); err != nil {
+				threadErrs = append(threadErrs, fmt.Errorf("write the file mount on a bound thread: %w", err))
+			}
+			_ = f.Close()
+		}
+		if f, err := root.Open("sibling.txt"); err == nil {
+			_ = f.Close()
+			threadErrs = append(threadErrs, errors.New("open of the sibling file through the root succeeded"))
+		} else if !errors.Is(err, fs.ErrPermission) {
+			threadErrs = append(threadErrs, fmt.Errorf("open sibling through the root = %v, want a permission error", err))
+		}
+		if _, err := os.ReadFile(filepath.Join(dir, "sibling.txt")); !errors.Is(err, fs.ErrPermission) {
+			threadErrs = append(threadErrs, fmt.Errorf("read sibling by path = %v, want a permission error", err))
+		}
+		if _, err := os.ReadDir(dir); !errors.Is(err, fs.ErrPermission) {
+			threadErrs = append(threadErrs, fmt.Errorf("list the parent of the file mount = %v, want a permission error", err))
+		}
+		if _, err := root.OpenFile("created.txt", os.O_CREATE|os.O_RDWR, 0o600); !errors.Is(err, fs.ErrPermission) {
+			threadErrs = append(threadErrs, fmt.Errorf("create next to the file mount = %v, want a permission error", err))
+		}
+		done <- threadErrs
+	}()
+	errs = append(errs, <-done...)
+	return errors.Join(errs...)
 }

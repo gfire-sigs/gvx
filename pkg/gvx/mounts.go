@@ -37,7 +37,8 @@ import (
 type MountKind string
 
 const (
-	// MountBind mounts a host directory through hostfs.
+	// MountBind mounts a host directory or one host regular file through
+	// hostfs.
 	MountBind MountKind = "bind"
 	// MountVolume mounts a named volume. The default driver is ext4lite, which
 	// stores the volume in one image file below the gvx cache directory.
@@ -59,14 +60,18 @@ const (
 	DriverHostfs MountDriver = "hostfs"
 )
 
-// Mount describes one extra guest mount. New opens the host directory of a
-// bind mount, or the image of a volume mount, before the host lockdown.
+// Mount describes one extra guest mount. New opens the host directory or the
+// host file of a bind mount, or the image of a volume mount, before the host
+// lockdown.
 type Mount struct {
 	// Kind selects the backing store.
 	Kind MountKind
 
-	// HostPath is the host directory of a bind mount. A relative path is
-	// relative to the working directory of the host process.
+	// HostPath is the host directory or the host regular file of a bind
+	// mount. A relative path is relative to the working directory of the host
+	// process. A file mount exposes only that file: the guest mount point is
+	// an empty regular file, and the parent directory and the sibling files
+	// stay out of reach of the guest.
 	HostPath string
 
 	// VolumeName names a volume. It matches [a-zA-Z0-9][a-zA-Z0-9_.-]*.
@@ -91,8 +96,9 @@ type Mount struct {
 	TmpfsSizeBytes int64
 
 	// CreateHostPathIfMissing creates the host directory of a bind mount when
-	// it does not exist. New creates it before the host lockdown. Without it, a
-	// missing directory is an error.
+	// the path does not exist. New creates it before the host lockdown.
+	// Without it, a missing path is an error. It never creates a file, and it
+	// leaves an existing file or directory as it is.
 	CreateHostPathIfMissing bool
 }
 
@@ -107,8 +113,9 @@ var reservedGuestDirs = []string{"/proc", "/sys", "/dev"}
 
 // ParseVolume parses the value of a -v flag: src:dst[:ro|rw]. A source without
 // a path separator that is not absolute names a volume. Any other source is a
-// host directory, which New creates when it is missing. A Windows drive letter
-// in the source is part of the source: C:\data:/data:ro.
+// host path: a directory, which New creates when it is missing, or an
+// existing regular file. A Windows drive letter in the source is part of the
+// source: C:\data:/data:ro.
 func ParseVolume(spec string) (Mount, error) {
 	src, dst, mode, err := splitVolumeSpec(spec)
 	if err != nil {
@@ -180,7 +187,7 @@ func hasDrivePrefix(s string) bool {
 	return c >= 'a' && c <= 'z'
 }
 
-// isHostPathSource reports whether a volume source names a host directory.
+// isHostPathSource reports whether a volume source names a host path.
 func isHostPathSource(src string) bool {
 	return strings.ContainsAny(src, `/\`) || filepath.IsAbs(src) || hasDrivePrefix(src)
 }
@@ -392,25 +399,48 @@ func (m Mount) validate() error {
 	return nil
 }
 
-// validateBindSource requires an existing directory. A missing directory is
-// valid when CreateHostPathIfMissing is set.
+// validateBindSource requires an existing directory or an existing regular
+// file. A missing path is valid when CreateHostPathIfMissing is set. That
+// option creates a directory only.
 func (m Mount) validateBindSource() error {
 	if m.HostPath == "" {
 		return errors.New("a bind mount needs HostPath")
 	}
-	info, err := os.Stat(m.HostPath)
+	kind, err := classifyHostPath(m.HostPath)
 	switch {
-	case errors.Is(err, os.ErrNotExist):
-		if m.CreateHostPathIfMissing {
-			return nil
-		}
-		return fmt.Errorf("bind source %q does not exist", m.HostPath)
 	case err != nil:
 		return fmt.Errorf("bind source %q: %w", m.HostPath, err)
-	case !info.IsDir():
-		return fmt.Errorf("bind source %q is not a directory: bind mounts of files are not supported", m.HostPath)
+	case kind == hostPathMissing && !m.CreateHostPathIfMissing:
+		return fmt.Errorf("bind source %q does not exist", m.HostPath)
 	}
 	return nil
+}
+
+// hostPathKind is the type of a host path that a bind mount names.
+type hostPathKind int
+
+const (
+	hostPathMissing hostPathKind = iota
+	hostPathDir
+	hostPathFile
+)
+
+// classifyHostPath reports whether p is a directory, a regular file, or
+// missing. It follows symbolic links. It returns an error for any other file
+// type, such as a socket or a device, and for a failed stat.
+func classifyHostPath(p string) (hostPathKind, error) {
+	info, err := os.Stat(p)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return hostPathMissing, nil
+	case err != nil:
+		return hostPathMissing, err
+	case info.IsDir():
+		return hostPathDir, nil
+	case info.Mode().IsRegular():
+		return hostPathFile, nil
+	}
+	return hostPathMissing, fmt.Errorf("is neither a directory nor a regular file (mode %s)", info.Mode().Type())
 }
 
 // validateGuestPath requires an absolute, clean path that is not "/" and that
@@ -435,11 +465,11 @@ func validateGuestPath(p string) error {
 	return nil
 }
 
-// hasHostDirs reports whether the configuration asks for a host directory. A
-// volume asks for one only when its driver is hostfs. A volume without a driver
-// uses ext4lite, unless it falls back to an older hostfs directory. The Sandbox
-// knows that case only when it has opened the mounts, so the Linux seccomp
-// filter uses Sandbox.usesHostDirs.
+// hasHostDirs reports whether the configuration asks for a host path: a
+// directory or a file. A volume asks for one only when its driver is hostfs. A
+// volume without a driver uses ext4lite, unless it falls back to an older
+// hostfs directory. The Sandbox knows that case only when it has opened the
+// mounts, so the Linux seccomp filter uses Sandbox.usesHostDirs.
 func (c Config) hasHostDirs() bool {
 	if c.WorkspacePath != "" {
 		return true
@@ -470,11 +500,13 @@ func (c Config) volumeRoot() (string, error) {
 }
 
 // sandboxMount is a Mount that New has prepared. A bind mount or a hostfs
-// volume holds its absolute host directory and its open hostfs workspace. An
-// ext4lite volume holds its open volume.
+// volume holds its absolute host path and its open hostfs workspace. The
+// host path is a regular file when hostFile is set, and a directory
+// otherwise. An ext4lite volume holds its open volume.
 type sandboxMount struct {
 	Mount
 	hostPath  string
+	hostFile  bool
 	workspace *hostfs.Workspace
 	volume    *ext4lite.Volume
 }
@@ -489,17 +521,30 @@ func (c Config) mountList() []Mount {
 	return append(list, c.Mounts...)
 }
 
-// openMounts prepares the host directories, opens one hostfs workspace for
-// each bind mount and each hostfs volume, opens the image of each ext4lite
-// volume, and records the mounts in the order that the guest mounts them. A
-// directory that two mounts share with the same access shares one workspace,
-// so two flush loops never write the same metadata file. openMounts must run
-// before the host lockdown.
-func (s *Sandbox) openMounts() error {
-	type workspaceKey struct {
-		dir      string
-		readOnly bool
+// workspaceKey identifies a hostfs workspace. A file mount and a directory
+// mount of its parent are different workspaces.
+type workspaceKey struct {
+	path     string
+	file     bool
+	readOnly bool
+}
+
+// newWorkspaceKey returns the key of a host path. It resolves symbolic links
+// when it can, so two names of one path share a key.
+func newWorkspaceKey(hostPath string, file, readOnly bool) workspaceKey {
+	if resolved, err := filepath.EvalSymlinks(hostPath); err == nil {
+		hostPath = resolved
 	}
+	return workspaceKey{path: hostPath, file: file, readOnly: readOnly}
+}
+
+// openMounts prepares the host paths, opens one hostfs workspace for each
+// bind mount and each hostfs volume, opens the image of each ext4lite volume,
+// and records the mounts in the order that the guest mounts them. A path that
+// two mounts share with the same access and the same kind (directory or
+// file) shares one workspace, so two flush loops never write the same
+// metadata file. openMounts must run before the host lockdown.
+func (s *Sandbox) openMounts() error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	volumes := make(map[string]bool)
 	for _, m := range s.cfg.mountList() {
@@ -525,19 +570,20 @@ func (s *Sandbox) openMounts() error {
 			s.volumes = append(s.volumes, vol)
 			sm.volume = vol
 		default:
-			dir, err := s.prepareHostDir(m)
+			hostPath, isFile, err := s.prepareHostPath(m)
 			if err != nil {
 				return err
 			}
-			sm.hostPath = dir
-			key := workspaceKey{dir: dir, readOnly: m.ReadOnly}
-			if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-				key.dir = resolved
+			if isFile && m.GuestPath == workspaceGuestPath && s.cfg.WorkspacePath != "" {
+				return fmt.Errorf("gvx: WorkspacePath %q is a file: it must be a directory: %w", hostPath, ErrInvalidConfig)
 			}
+			sm.hostPath = hostPath
+			sm.hostFile = isFile
+			key := newWorkspaceKey(hostPath, isFile, m.ReadOnly)
 			ws, ok := shared[key]
 			if !ok {
-				if ws, err = hostfs.OpenWorkspace(dir, m.ReadOnly); err != nil {
-					return fmt.Errorf("gvx: open mount %s from %q: %w", m.GuestPath, dir, err)
+				if ws, err = hostfs.OpenWorkspace(hostPath, m.ReadOnly); err != nil {
+					return fmt.Errorf("gvx: open mount %s from %q: %w", m.GuestPath, hostPath, err)
 				}
 				shared[key] = ws
 				s.workspaces = append(s.workspaces, ws)
@@ -612,31 +658,46 @@ func (s *Sandbox) openVolumeImage(m Mount) (*ext4lite.Volume, error) {
 	return vol, nil
 }
 
-// prepareHostDir returns the absolute host directory of a bind or volume
-// mount. It creates the directory when the mount asks for it. A volume
-// directory gets mode 0700.
-func (s *Sandbox) prepareHostDir(m Mount) (string, error) {
+// prepareHostPath returns the absolute host path of a bind or volume mount
+// and whether that path is a regular file. It creates a missing directory
+// when the mount asks for it. It never creates or changes a file. A volume
+// directory gets mode 0700. The path of a file mount has no symbolic link,
+// so hostfs and the lockdown pin the real file.
+func (s *Sandbox) prepareHostPath(m Mount) (string, bool, error) {
 	if m.Kind == MountVolume {
 		root, err := s.cfg.volumeRoot()
 		if err != nil {
-			return "", fmt.Errorf("gvx: locate the volume directory: %w", err)
+			return "", false, fmt.Errorf("gvx: locate the volume directory: %w", err)
 		}
 		dir := filepath.Join(root, m.VolumeName)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return "", fmt.Errorf("gvx: create volume %q: %w", m.VolumeName, err)
+			return "", false, fmt.Errorf("gvx: create volume %q: %w", m.VolumeName, err)
 		}
-		return dir, nil
+		return dir, false, nil
 	}
-	dir, err := filepath.Abs(m.HostPath)
+	abs, err := filepath.Abs(m.HostPath)
 	if err != nil {
-		return "", fmt.Errorf("gvx: resolve bind source %q: %w", m.HostPath, err)
+		return "", false, fmt.Errorf("gvx: resolve bind source %q: %w", m.HostPath, err)
 	}
-	if m.CreateHostPathIfMissing {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("gvx: create bind source %q: %w", dir, err)
+	kind, err := classifyHostPath(abs)
+	if err != nil {
+		return "", false, fmt.Errorf("gvx: bind source %q: %w", abs, err)
+	}
+	switch kind {
+	case hostPathFile:
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return "", false, fmt.Errorf("gvx: resolve bind source %q: %w", abs, err)
+		}
+		return resolved, true, nil
+	case hostPathMissing:
+		if m.CreateHostPathIfMissing {
+			if err := os.MkdirAll(abs, 0o755); err != nil {
+				return "", false, fmt.Errorf("gvx: create bind source %q: %w", abs, err)
+			}
 		}
 	}
-	return dir, nil
+	return abs, false, nil
 }
 
 // sortMountsByDepth orders mounts by increasing guest path depth. A mount
@@ -648,21 +709,21 @@ func sortMountsByDepth(mounts []sandboxMount) {
 	})
 }
 
-// hostMounts lists the host directories that the lockdown must allow. An
-// ext4lite volume needs none, because its image file is open before the
-// lockdown.
+// hostMounts lists the host directories and files that the lockdown must
+// allow. An ext4lite volume needs none, because its image file is open before
+// the lockdown.
 func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 	var list []hostlockdown.HostMount
 	for _, m := range s.mounts {
 		if m.Kind != MountTmpfs && m.volume == nil {
-			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly})
+			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly, File: m.hostFile})
 		}
 	}
 	return list
 }
 
-// usesHostDirs reports whether a mount opened a host directory. Only then does
-// the Linux seccomp filter need the host filesystem rules.
+// usesHostDirs reports whether a mount opened a host directory or file. Only
+// then does the Linux seccomp filter need the host filesystem rules.
 func (s *Sandbox) usesHostDirs() bool {
 	for _, m := range s.mounts {
 		if m.Kind != MountTmpfs && m.volume == nil {
