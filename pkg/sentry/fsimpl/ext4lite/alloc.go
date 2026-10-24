@@ -54,6 +54,10 @@ type group struct {
 	// needsBackup is set for a new group that holds a superblock copy. The
 	// next flush writes the copy.
 	needsBackup bool
+	// migDirty holds one bit for each 4 KiB block of the group that a write
+	// changed since the last DrainDirtyBlocks. It is nil while no block is
+	// marked. v.mu protects it.
+	migDirty *bitmap
 }
 
 func (g *group) availBlocks() uint32 { return g.desc.freeBlocks - g.heldBlockCount }
@@ -338,4 +342,81 @@ func (v *volume) trimGroupsLocked() int {
 		v.descDirty = true
 	}
 	return removed
+}
+
+// markWrittenLocked records that a write changed the bytes [off, off+n) of the
+// host file. It sets the bit of every 4 KiB physical block that the range
+// touches. A range beyond the last group has no bitmap, because the volume
+// shrank, and the bits are dropped.
+//
+// Precondition: v.mu is held and v.migTracking is true.
+func (v *volume) markWrittenLocked(off int64, n int) {
+	if n <= 0 || off < 0 {
+		return
+	}
+	first := uint64(off) / blockSize
+	last := (uint64(off) + uint64(n) - 1) / blockSize
+	for blk := first; blk <= last; blk++ {
+		gi := blk / blocksPerGroup
+		if gi >= uint64(len(v.groups)) {
+			return
+		}
+		lazyBitmap(&v.groups[gi].migDirty).set(uint32(blk % blocksPerGroup))
+	}
+}
+
+// allocatedExtentsLocked returns the allocated blocks of every group as runs of
+// contiguous physical blocks in ascending order. A block is allocated when the
+// block bitmap of its group has the bit. The bitmap marks the metadata blocks
+// of the group, the file data, the directory blocks, the extent leaves, and
+// the attribute blocks. A block that a guest freed and that waits for the next
+// flush is free here.
+//
+// Precondition: v.mu is held.
+func (v *volume) allocatedExtentsLocked() []BlockExtent {
+	var out []BlockExtent
+	for gi, g := range v.groups {
+		out = appendBitmapRuns(out, groupStart(uint32(gi)), &g.blocks)
+	}
+	return out
+}
+
+// takeDirtyExtentsLocked returns the marked blocks of every group as runs and
+// clears the marks.
+//
+// Precondition: v.mu is held.
+func (v *volume) takeDirtyExtentsLocked() []BlockExtent {
+	var out []BlockExtent
+	for gi, g := range v.groups {
+		if g.migDirty == nil {
+			continue
+		}
+		out = appendBitmapRuns(out, groupStart(uint32(gi)), g.migDirty)
+		g.migDirty = nil
+	}
+	return out
+}
+
+// appendBitmapRuns appends the runs of set bits of b to out. The bit i is the
+// physical block start+i. A run that continues the last run of out joins it, so
+// a run can cross the border between two groups.
+func appendBitmapRuns(out []BlockExtent, start uint64, b *bitmap) []BlockExtent {
+	for i := uint32(0); i < blocksPerGroup; {
+		if !b.test(i) {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < blocksPerGroup && b.test(j) {
+			j++
+		}
+		blk, n := start+uint64(i), uint64(j-i)
+		if last := len(out) - 1; last >= 0 && out[last].Block+out[last].Count == blk {
+			out[last].Count += n
+		} else {
+			out = append(out, BlockExtent{Block: blk, Count: n})
+		}
+		i = j
+	}
+	return out
 }

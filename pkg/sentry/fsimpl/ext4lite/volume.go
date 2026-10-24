@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -63,6 +64,14 @@ type volume struct {
 	flushedOnce     bool
 	// fixups lists the repairs that fsckLite queued for the first mount.
 	fixups []func() error
+	// migTracking is true while a live migration records the written blocks in
+	// group.migDirty. EnableMigrationTracking sets it.
+	//
+	// +checklocks:mu
+	migTracking bool
+	// migOn mirrors migTracking for trackedFile.WriteAt, which skips v.mu while
+	// no migration runs. Only the holder of v.mu writes it.
+	migOn atomic.Bool
 
 	// nodeMu protects nodes and dirtyNodes.
 	nodeMu     sync.Mutex
@@ -141,6 +150,8 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 		nodes:      make(map[uint32]*node),
 		dirtyNodes: make(map[uint32]*node),
 	}
+	// Every write to the image goes through v.hf, so one wrapper sees them all.
+	v.hf = &trackedFile{hostFile: hf, v: v}
 	if v.now == nil {
 		v.now = time.Now
 	}

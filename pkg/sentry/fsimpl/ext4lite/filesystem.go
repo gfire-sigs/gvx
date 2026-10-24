@@ -133,6 +133,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// One reference for the filesystem and one for the mount.
 	fs.root.refs.Add(1)
 	fs.mu.Unlock()
+	vol.dataSync.Store(&dataSyncHook{fn: fs.syncMapped})
 	if !fs.readOnly {
 		fs.startFlusher()
 	}
@@ -212,6 +213,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 		ino.destroy(ctx)
 	}
 	fs.mu.Unlock()
+	fs.vol.dataSync.Store(nil)
 	// Release has no error result, so a failure is logged. An earlier Sync
 	// call already reported the failures that it saw.
 	if err := fs.vol.Close(); err != nil {
@@ -235,6 +237,16 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 // syncAll writes the dirty mapped data of every inode and then flushes the
 // volume. It reports every failure as a Linux error.
 func (fs *filesystem) syncAll() error {
+	err := fs.syncMapped()
+	if serr := fs.v.sync(); serr != nil {
+		err = errors.Join(err, serr)
+	}
+	return toLinuxErr(err)
+}
+
+// syncMapped writes the dirty mapped data of every inode to the host file. The
+// volume drain of a live migration calls it before the flush of the volume.
+func (fs *filesystem) syncMapped() error {
 	fs.mu.Lock()
 	list := make([]*inode, 0, len(fs.inodes))
 	for _, ino := range fs.inodes {
@@ -249,10 +261,7 @@ func (fs *filesystem) syncAll() error {
 			errs = append(errs, err)
 		}
 	}
-	if err := fs.v.sync(); err != nil {
-		errs = append(errs, err)
-	}
-	return toLinuxErr(errors.Join(errs...))
+	return errors.Join(errs...)
 }
 
 // stepLocked resolves rp.Component() below d. The Boolean result reports that

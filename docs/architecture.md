@@ -616,6 +616,14 @@ The allocator never reuses a block or an inode that the disk still records as us
 
 A writable mount clears the valid bit in block 0 and syncs it before the first guest write. A mount that finds the bit clear runs `fsckLite`. It walks the tree from the root inode and rebuilds the bitmaps and the link counts from what it reaches. It frees every inode that no directory names, and it frees the blocks of those inodes. It creates no `lost+found` directory. It fails with `EUCLEAN` on a directory cycle, on a block that two inodes own, and on a bound violation.
 
+#### Live Migration Block Tracking (Descriptive Module)
+
+A pre-copy migration sends the image in two passes. `Volume.AllocatedBlocks` returns the allocated 4KiB blocks as `(Block, Count)` runs in ascending order. The runs include the metadata blocks of every group, and they skip every free block. `Volume.EnableMigrationTracking` starts a record with one bit for each block of a group.
+
+The host file of a volume is a `trackedFile`, so every write marks its blocks. The wrapper covers the data writes, the zeroing of edge blocks, the relocations of a compaction, and every metadata write of a flush. The mark follows the write, so a drain never loses a block that a concurrent write changes.
+
+`Volume.DrainDirtyBlocks` writes the mapped pages of a mounted file system, flushes the volume, and returns the marked runs. It clears the record. Call `EnableMigrationTracking` before `AllocatedBlocks`. Run the last drain while the guest is stopped.
+
 #### Untrusted Image Checks (Descriptive Module)
 
 A volume file is untrusted input. `isValidDataBlock` rejects every block that overlaps the superblock, the descriptors, a bitmap, or an inode table. The mount, the extent parser, and the directory parser apply it to every block number. The directory parser checks that each `rec_len` is at least 8, is a multiple of 4, and ends inside the block. A failed check returns `EUCLEAN` and never writes to the image.
