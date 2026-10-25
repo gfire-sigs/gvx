@@ -78,13 +78,11 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 		return Status{}, err
 	}
 
-	// Step 3: lower the live primary token to Low integrity.
-	if err := lowerTokenIntegrityToLow(primary); err != nil {
-		return Status{}, err
-	}
-	st.IntegrityDowngraded = true
-
-	// Step 4: restricted impersonation token for the process threads and BindThread.
+	// Step 3: restricted impersonation token (already lowered to Low integrity)
+	// for the process threads and BindThread. The live primary token stays at
+	// its original integrity until Step 9 binds all pre-existing peer threads
+	// so OpenThread(THREAD_SET_THREAD_TOKEN) does not fail MIC NO_WRITE_UP on
+	// threads spawned before Apply.
 	restricted, err := createRestrictedImpersonationToken(primary, id, opts.AllowOutboundNet)
 	if err != nil {
 		return Status{}, err
@@ -121,12 +119,12 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	st.Win32kBlocked = true
 
 	// Step 9: attach the restricted impersonation token to every existing
-	// thread in the process so unbound file opens and disallowed socket
-	// creations fail across the process.
-	if err := bindProcessThreads(restricted); err != nil {
+	// thread in the process and lower the live primary token to Low integrity.
+	if err := bindProcessThreads(primary, restricted); err != nil {
 		_ = windows.CloseHandle(job)
 		return Status{}, err
 	}
+	st.IntegrityDowngraded = true
 	st.UnboundFileOpenBlocked = true
 
 	handlesMu.Lock()
@@ -160,7 +158,7 @@ func prewarmWinsock() {
 	}
 }
 
-func prewarmOSThreads(n int) {
+func prewarmOSThreads(n int, onParked func() error) error {
 	var ready sync.WaitGroup
 	var done sync.WaitGroup
 	ready.Add(n)
@@ -176,22 +174,31 @@ func prewarmOSThreads(n int) {
 		}()
 	}
 	ready.Wait()
+	err := onParked()
 	close(release)
 	done.Wait()
+	return err
 }
 
-func bindProcessThreads(token windows.Token) error {
-	prewarmOSThreads(max(runtime.GOMAXPROCS(0)*8, 64))
+func bindProcessThreads(primary, token windows.Token) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	pid := windows.GetCurrentProcessId()
 	selfTID := windows.GetCurrentThreadId()
-	for range 3 {
-		if err := bindPeerThreadsOnce(pid, selfTID, token); err != nil {
-			return err
-		}
-		runtime.Gosched()
+	if err := prewarmOSThreads(max(runtime.GOMAXPROCS(0)*8, 64), func() error {
+		return bindPeerThreadsOnce(pid, selfTID, token)
+	}); err != nil {
+		return err
+	}
+	if err := bindPeerThreadsOnce(pid, selfTID, token); err != nil {
+		return err
+	}
+	if err := lowerTokenIntegrityToLow(primary); err != nil {
+		return err
+	}
+	if err := bindPeerThreadsOnce(pid, selfTID, token); err != nil {
+		return err
 	}
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)

@@ -258,7 +258,7 @@ func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity
 	var imp windows.Token
 	if err := windows.DuplicateTokenEx(
 		primary,
-		windows.TOKEN_DUPLICATE|windows.TOKEN_IMPERSONATE|windows.TOKEN_QUERY,
+		windows.TOKEN_DUPLICATE|windows.TOKEN_IMPERSONATE|windows.TOKEN_QUERY|windows.TOKEN_ADJUST_DEFAULT,
 		nil,
 		windows.SecurityImpersonation,
 		windows.TokenImpersonation,
@@ -267,6 +267,9 @@ func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity
 		return 0, fmt.Errorf("hostlockdown: DuplicateTokenEx: %w", err)
 	}
 	defer imp.Close()
+	if err := lowerTokenIntegrityToLow(imp); err != nil {
+		return 0, err
+	}
 
 	deny := denyOnlySIDsForMode(id.user, id.groups, allowOutboundNet)
 	restrict := []windows.SIDAndAttributes{{Sid: id.logon}}
