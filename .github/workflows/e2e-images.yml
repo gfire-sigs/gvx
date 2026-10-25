@@ -13,10 +13,10 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run one job family: all, darwin, linux, or windows"
+        description: "Run one job family: all, linux, darwin, or windows"
         type: choice
         default: all
-        options: [all, darwin, linux, windows]
+        options: [all, linux, darwin, windows]
 
 concurrency:
   group: e2e-images
@@ -29,31 +29,8 @@ env:
   GOFLAGS: -mod=readonly
 
 jobs:
-  darwin-arm64-systrap:
-    name: systrap gates on darwin/arm64
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
-    runs-on: macos-15
-    timeout-minutes: 90
-    env:
-      GVX_ALLOW_NO_HYPERVISOR: "1"
-      GVX_E2E_REQUIRE_NETWORK: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Run the registry gates on the systrap engine
-        run: |
-          go test -count=1 -timeout 80m -tags pagesize_16k \
-            -exec "$PWD/scripts/codesign-exec.sh" \
-            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
-            ./e2e
-          go test -count=1 -timeout 30m -tags pagesize_16k \
-            -exec "$PWD/scripts/codesign-exec.sh" \
-            -run 'TestE2EDockerRun.*/systrap' ./e2e
-
-  linux-systrap:
-    name: gates on linux/${{ matrix.arch }}
+  linux:
+    name: test linux/${{ matrix.arch }}
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -70,31 +47,64 @@ jobs:
       # The upstream systrap platform hangs while it starts in a cgo build.
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Run the registry gates on the upstream systrap platform
+      - name: Test end-to-end registry gates
         run: go test -count=1 -timeout 50m ./e2e
 
-  windows-systrap:
-    name: systrap gates on ${{ matrix.os }}
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
-    runs-on: ${{ matrix.os }}
+  darwin-arm64:
+    name: test darwin/arm64
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
+    runs-on: macos-15
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, windows-11-arm]
     env:
       GVX_ALLOW_NO_HYPERVISOR: "1"
       GVX_E2E_REQUIRE_NETWORK: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Run the registry gates on the systrap engine
+      - name: Test end-to-end registry gates
+        run: |
+          go test -count=1 -timeout 80m -tags pagesize_16k \
+            -exec "$PWD/scripts/codesign-exec.sh" \
+            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
+            ./e2e
+          go test -count=1 -timeout 30m -tags pagesize_16k \
+            -exec "$PWD/scripts/codesign-exec.sh" \
+            -run 'TestE2EDockerRun.*/systrap' ./e2e
+
+  windows:
+    name: test windows/${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+      GVX_E2E_REQUIRE_NETWORK: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test end-to-end registry gates
         shell: bash
         run: |
           go test -count=1 -timeout 80m \

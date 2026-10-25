@@ -10,7 +10,7 @@ on:
         description: "Hosted runner"
         type: choice
         default: windows-latest
-        options: [windows-latest, windows-11-arm, macos-15, ubuntu-24.04, ubuntu-24.04-arm]
+        options: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-latest, windows-11-arm]
       packages:
         description: "Package patterns for go test"
         default: ./pkg/sentry/fsimpl/hostfs/...
@@ -35,15 +35,17 @@ env:
 
 jobs:
   test:
-    name: go test on ${{ inputs.runner }}
+    name: test (${{ inputs.runner }})
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Run the selected tests
+      - name: Run selected tests
         shell: bash
         env:
           PACKAGES: ${{ inputs.packages }}
@@ -62,7 +64,7 @@ jobs:
             args+=(-exec "$PWD/scripts/codesign-exec.sh")
           fi
           go test "${args[@]}" $PACKAGES
-      - name: Show crash reports and sandbox denials of the run
+      - name: Collect macOS crash reports and sandbox logs
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |

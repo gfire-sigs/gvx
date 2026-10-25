@@ -31,25 +31,28 @@ env:
   OWNED: >-
     ./cmd/... ./internal/... ./tools/upstream/... ./pkg/gvx/... ./pkg/oci/...
     ./pkg/netbackend/... ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/...
-    ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/...
+    ./pkg/sentry/fsimpl/chunkcache/... ./pkg/sentry/fsimpl/hostfs/...
+    ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/...
     ./pkg/sync/... ./pkg/sentry/pgalloc/... ./pkg/sentry/time/...
-    ./pkg/sentry/hostcpu/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/...
-    ./pkg/sentry/platform/whpx/... ./pkg/sentry/fsimpl/ext4lite/...
+    ./pkg/sentry/hostcpu/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvcommon/...
+    ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/... ./pkg/sentry/fsimpl/ext4lite/...
   # The owned packages that need no hypervisor and no 16KB build. On a hosted
   # macOS runner, pkg/gvx and cmd/rungv need the systrap engine instead.
   OWNED_PLAIN: >-
     ./internal/... ./tools/upstream/... ./pkg/oci/... ./pkg/netbackend/...
-    ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/... ./pkg/sentry/fsimpl/hostfs/...
-    ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/... ./pkg/sync/...
+    ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/... ./pkg/sentry/fsimpl/chunkcache/...
+    ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/... ./pkg/sync/...
     ./pkg/sentry/pgalloc/... ./pkg/sentry/time/... ./pkg/sentry/hostcpu/...
-    ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
+    ./pkg/hostlockdown/... ./pkg/sentry/platform/hvcommon/...
+    ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
     ./pkg/sentry/fsimpl/ext4lite/...
   # Packages that gvx wrote. Upstream packages carry vet findings that the
   # project does not fix.
   VET: >-
     ./cmd/... ./internal/... ./tools/upstream/... ./pkg/gvx/... ./pkg/oci/...
-    ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/...
-    ./pkg/sentry/platform/whpx/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/...
+    ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvcommon/...
+    ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
+    ./pkg/sentry/fsimpl/chunkcache/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/...
     ./pkg/sentry/fsimpl/ext4lite/...
     ./e2e/...
 
@@ -60,17 +63,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Check formatting of the packages that gvx owns
+      - name: Check Go formatting
         run: |
           unformatted=$(gofmt -l cmd e2e internal tools/upstream pkg/gvx pkg/oci pkg/netbackend \
-            pkg/hostlockdown pkg/syserr pkg/sentry/platform/hvf pkg/sentry/platform/whpx \
-            pkg/sentry/fsimpl/hostfs pkg/sentry/fsimpl/ext4lite)
+            pkg/hostlockdown pkg/syserr pkg/sentry/platform/hvcommon pkg/sentry/platform/hvf \
+            pkg/sentry/platform/whpx pkg/sentry/fsimpl/chunkcache pkg/sentry/fsimpl/hostfs \
+            pkg/sentry/fsimpl/ext4lite)
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
-      - name: Build every package for the five targets
+      - name: Build all target platforms
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "::group::build $target"
@@ -80,7 +86,7 @@ jobs:
           echo "::group::build darwin/arm64 with pagesize_16k"
           GOOS=darwin GOARCH=arm64 go build -tags pagesize_16k ./...
           echo "::endgroup::"
-      - name: Vet the packages that gvx wrote for the five targets
+      - name: Vet all target platforms
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "::group::vet $target"
@@ -92,12 +98,12 @@ jobs:
             GOOS=${target%/*} GOARCH=${target#*/} go vet ./pkg/sentry/platform/systrap/
           done
           GOOS=darwin GOARCH=arm64 go vet -tags pagesize_16k ./pkg/sentry/platform/... ./pkg/gvx/... ./e2e/...
-      - name: Cache the pinned upstream archive
+      - name: Cache upstream archive
         uses: actions/cache@v4
         with:
           path: ~/.cache/gvx/upstream
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
-      - name: Audit the upstream diff
+      - name: Audit upstream diff
         run: go run ./tools/upstream -mode=audit -max-ratio=0.01
 
   linux:
@@ -116,28 +122,30 @@ jobs:
     env:
       GVX_E2E_OFFLINE: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test the packages that gvx owns
+      - name: Test owned packages
         env:
           EXT4LITE_REQUIRE_E2FSCK: "1"
           EXT4LITE_REQUIRE_LOOPMOUNT: "1"
         run: go test -race -count=1 $OWNED
       # The upstream systrap platform hangs while it starts in a cgo build, and
       # the race detector needs cgo. The steps below build without cgo.
-      - name: Test the Linux lockdown and the end-to-end suite without cgo
+      - name: Test systrap engine and end-to-end suite
         env:
           CGO_ENABLED: "0"
         run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./e2e/
-      - name: Build rungv and a guest
+      - name: Build rungv and smoke guest
         env:
           CGO_ENABLED: "0"
         run: |
           go build -o rungv ./cmd/rungv
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
-      - name: Run the guest on the upstream systrap platform without the lockdown
+      - name: Run smoke guest without lockdown
         env:
           GVX_DEBUG_LOG: "1"
         run: |
@@ -145,7 +153,7 @@ jobs:
           ./rungv run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
-      - name: Run the guest under the seccomp lockdown
+      - name: Run smoke guest with lockdown
         env:
           GVX_DEBUG_LOG: "1"
         run: |
@@ -166,17 +174,19 @@ jobs:
       GVX_ALLOW_NO_HYPERVISOR: "1"
       GVX_E2E_OFFLINE: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test the packages that need no hypervisor
+      - name: Test owned packages
         run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED_PLAIN
-      - name: Test the systrap engine and the SDK with 16KB pages
+      - name: Test systrap engine and SDK (16KB pages)
         run: |
           go test -race -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
             ./pkg/sentry/platform/systrap/... ./pkg/gvx/... ./cmd/...
-      - name: Run the systrap end-to-end tests that need no registry
+      - name: Test systrap end-to-end suite
         run: |
           go test -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
             -run 'TestE2ESystrap|TestE2ERungvSystrap' ./e2e
@@ -187,28 +197,30 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test the packages that gvx owns
+      - name: Test owned packages
         shell: bash
         run: go test -count=1 $OWNED
-      - name: Test the systrap engine and the Sentry on it
+      - name: Test systrap engine and end-to-end suite
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
         run: |
           go test -count=1 ./pkg/sentry/platform/systrap/
           go test -count=1 -run 'Systrap|systrap|Stub|HostLockdown' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
-      - name: Report the hypervisor state of the runner
+      - name: Report runner hypervisor state
         shell: pwsh
         continue-on-error: true
         run: |
           Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List FeatureName, State
           Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
-      - name: Build rungv and a guest, then try to run it
+      - name: Smoke test rungv guest execution
         shell: bash
         # The step reports the outcome and does not fail the job until the
         # hosted runner is known to run a guest. GVX_DEBUG_LOG prints the
@@ -225,24 +237,26 @@ jobs:
           grep -q gvx-smoke-ok smoke.out
 
   windows-arm64:
-    name: test windows/arm64 (systrap)
+    name: test windows/arm64
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-11-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       # The hosted runner has no hypervisor, so the systrap engine is the only
       # backend that runs guests here.
-      - name: Test the shim control plane
+      - name: Test shim control plane
         shell: bash
         run: go test -count=1 ./internal/gvxshim/ ./cmd/containerd-shim-gvx-v2/
-      - name: Test the systrap engine
+      - name: Test systrap engine
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/systrap/
-      - name: Test the Sentry on the systrap engine
+      - name: Test systrap end-to-end suite
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
