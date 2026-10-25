@@ -40,6 +40,10 @@ const (
 	// nzcvMask selects the condition flags in PSTATE.
 	nzcvMask = 0xf0000000
 
+	// vregsOffset and fpcrOffset alias the shared fpsimd_context offsets.
+	vregsOffset = fpStateOffV
+	fpcrOffset  = fpStateOffFpcr
+
 	// startTimeout bounds the wait for a new stub thread to reach its first park.
 	startTimeout = 20 * time.Second
 
