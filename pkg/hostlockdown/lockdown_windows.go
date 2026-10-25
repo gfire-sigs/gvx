@@ -161,12 +161,46 @@ func prewarmWinsock() {
 	}
 }
 
+func prewarmOSThreads(n int) {
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(n)
+	done.Add(n)
+	release := make(chan struct{})
+	for range n {
+		go func() {
+			runtime.LockOSThread()
+			ready.Done()
+			<-release
+			runtime.UnlockOSThread()
+			done.Done()
+		}()
+	}
+	ready.Wait()
+	close(release)
+	done.Wait()
+}
+
 func bindProcessThreads(token windows.Token) error {
+	prewarmOSThreads(max(runtime.GOMAXPROCS(0)*8, 64))
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	pid := windows.GetCurrentProcessId()
 	selfTID := windows.GetCurrentThreadId()
+	for range 3 {
+		if err := bindPeerThreadsOnce(pid, selfTID, token); err != nil {
+			return err
+		}
+		runtime.Gosched()
+	}
+	if err := windows.SetThreadToken(nil, token); err != nil {
+		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)
+	}
+	return nil
+}
+
+func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
 		return fmt.Errorf("hostlockdown: CreateToolhelp32Snapshot: %w", err)
@@ -195,9 +229,6 @@ func bindProcessThreads(token windows.Token) error {
 		if err := windows.SetThreadToken(&h, token); err != nil {
 			return fmt.Errorf("hostlockdown: SetThreadToken(peer thread): %w", err)
 		}
-	}
-	if err := windows.SetThreadToken(nil, token); err != nil {
-		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)
 	}
 	return nil
 }
