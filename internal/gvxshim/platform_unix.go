@@ -350,6 +350,49 @@ func authorizeUID(peerUID, effectiveUID uint32) error {
 	return nil
 }
 
+func authorizePeerWith(conn net.Conn, peerUID func(fd int) (uint32, error)) error {
+	sc, ok := conn.(syscall.Conn)
+	if !ok {
+		return errUnsafeEntry
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var peerErr error
+	err = raw.Control(func(fd uintptr) {
+		uid, err := peerUID(int(fd))
+		if err != nil {
+			peerErr = err
+			return
+		}
+		peerErr = authorizeUID(uid, uint32(os.Geteuid()))
+	})
+	return errors.Join(err, peerErr)
+}
+
+func finishPinnedSocket(dir *pinnedDir, name string, fd int, file *os.File, ref ownedEntry, chmodFlags int) (_ net.Listener, err error) {
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, removeBoundSocket(dir, ref))
+		}
+	}()
+	if err := unix.Fchmodat(int(dir.Handle.Fd()), name, 0600, chmodFlags); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	if err := unix.Listen(fd, 32); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	listener, err := net.FileListener(file)
+	if err = errors.Join(err, file.Close()); err != nil {
+		if listener != nil {
+			err = errors.Join(err, listener.Close())
+		}
+		return nil, err
+	}
+	return listener, nil
+}
+
 func boundSocketReference(dir *pinnedDir, name string) (ownedEntry, error) {
 	if !validComponent(name) {
 		return ownedEntry{}, errUnsafeEntry

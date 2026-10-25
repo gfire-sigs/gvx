@@ -24,6 +24,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/limits"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
@@ -156,39 +157,9 @@ type nodeReader struct {
 // ReadToBlocks implements safemem.Reader.ReadToBlocks. A short read returns the
 // error of the node, which is io.EOF at the end of the file.
 func (r *nodeReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
-	var done uint64
-	var scratch []byte
-	for ; !dsts.IsEmpty(); dsts = dsts.Tail() {
-		dst := dsts.Head()
-		var n int
-		var err error
-		if !dst.NeedSafecopy() {
-			n, err = r.n.readAt(dst.ToSlice(), r.off)
-		} else {
-			// The node cannot write to memory that faults, so it reads into a
-			// scratch buffer first.
-			if len(scratch) < dst.Len() {
-				scratch = make([]byte, dst.Len())
-			}
-			var rn int
-			rn, err = r.n.readAt(scratch[:dst.Len()], r.off)
-			var werr error
-			n, werr = safemem.Copy(dst, safemem.BlockFromSafeSlice(scratch[:rn]))
-			if werr != nil {
-				err = werr
-			}
-		}
-		r.off += int64(n)
-		done += uint64(n)
-		if n != dst.Len() {
-			if err == nil && done > 0 {
-				// A short read without an error ends the file.
-				err = io.EOF
-			}
-			return done, err
-		}
-	}
-	return done, nil
+	done, off, err := chunkcache.ReadAtToBlocks(dsts, r.off, r.n.readAt)
+	r.off = off
+	return done, err
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.

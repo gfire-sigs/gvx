@@ -161,36 +161,15 @@ func (h *hostRoot) remove(op, rel string, wantDir bool) error {
 // access error, which hostfs reports as EACCES.
 // Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
 func (h *hostRoot) rename(oldRel, newRel string) error {
-	if oldRel == "." || newRel == "." {
-		return hostError2("rename", oldRel, newRel, windows.ERROR_SHARING_VIOLATION)
-	}
-	oldParent, err := h.walkParent("rename", oldRel)
-	if err != nil {
-		return err
-	}
-	defer oldParent.release()
-	newParent, err := h.walkParent("rename", newRel)
-	if err != nil {
-		return err
-	}
-	defer newParent.release()
-	src, err := openAt(oldParent.handle, oldParent.name, windows.DELETE|windows.FILE_READ_ATTRIBUTES,
-		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
-	if err != nil {
-		return hostError2("rename", oldRel, newRel, err)
-	}
-	defer closeHandle(src)
-	buf, size, err := newNameInfo(
+	return h.setTargetName(
+		"rename",
+		oldRel,
+		newRel,
+		windows.ERROR_SHARING_VIOLATION,
+		windows.DELETE|windows.FILE_READ_ATTRIBUTES,
 		windows.FILE_RENAME_REPLACE_IF_EXISTS|windows.FILE_RENAME_POSIX_SEMANTICS,
-		newParent.handle, newParent.name)
-	if err != nil {
-		return hostError2("rename", oldRel, newRel, err)
-	}
-	var iosb windows.IO_STATUS_BLOCK
-	if err := windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), size, fileRenameInformationEx); err != nil {
-		return hostError2("rename", oldRel, newRel, err)
-	}
-	return nil
+		fileRenameInformationEx,
+	)
 }
 
 // link creates a hard link newRel to the entry oldRel. The source open uses
@@ -201,33 +180,45 @@ func (h *hostRoot) rename(oldRel, newRel string) error {
 // own error, which hostErrno maps to EOPNOTSUPP. The function never copies.
 // Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_link_information
 func (h *hostRoot) link(oldRel, newRel string) error {
+	// ReplaceIfExists stays zero: an existing destination returns EEXIST.
+	return h.setTargetName(
+		"link",
+		oldRel,
+		newRel,
+		windows.ERROR_PRIVILEGE_NOT_HELD,
+		windows.FILE_WRITE_ATTRIBUTES,
+		0,
+		fileLinkInformation,
+	)
+}
+
+func (h *hostRoot) setTargetName(op, oldRel, newRel string, rootErr error, access, flags, infoClass uint32) error {
 	if oldRel == "." || newRel == "." {
-		return hostError2("link", oldRel, newRel, windows.ERROR_PRIVILEGE_NOT_HELD)
+		return hostError2(op, oldRel, newRel, rootErr)
 	}
-	oldParent, err := h.walkParent("link", oldRel)
+	oldParent, err := h.walkParent(op, oldRel)
 	if err != nil {
 		return err
 	}
 	defer oldParent.release()
-	newParent, err := h.walkParent("link", newRel)
+	newParent, err := h.walkParent(op, newRel)
 	if err != nil {
 		return err
 	}
 	defer newParent.release()
-	src, err := openAt(oldParent.handle, oldParent.name, windows.FILE_WRITE_ATTRIBUTES,
+	src, err := openAt(oldParent.handle, oldParent.name, access,
 		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
 	if err != nil {
-		return hostError2("link", oldRel, newRel, err)
+		return hostError2(op, oldRel, newRel, err)
 	}
 	defer closeHandle(src)
-	// ReplaceIfExists stays zero: an existing destination returns EEXIST.
-	buf, size, err := newNameInfo(0, newParent.handle, newParent.name)
+	buf, size, err := newNameInfo(flags, newParent.handle, newParent.name)
 	if err != nil {
-		return hostError2("link", oldRel, newRel, err)
+		return hostError2(op, oldRel, newRel, err)
 	}
 	var iosb windows.IO_STATUS_BLOCK
-	if err := windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), size, fileLinkInformation); err != nil {
-		return hostError2("link", oldRel, newRel, err)
+	if err := windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), size, infoClass); err != nil {
+		return hostError2(op, oldRel, newRel, err)
 	}
 	return nil
 }

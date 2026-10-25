@@ -23,6 +23,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	pkgcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
@@ -274,6 +275,25 @@ func (v *vcpu) decodeExit() (exitInfo, error) {
 		return decodeExitA64(v.exit)
 	}
 	return decodeExitX64(v.exit)
+}
+
+// onMemoryFault converts a guest physical access fault into SIGBUS.
+func (c *Context) onMemoryFault(v *vcpu, ex exitInfo, ac *arch.Context64) runResult {
+	if ex.inKernel(v.p.arm64) {
+		v.st.invalidate()
+		return runResult{err: fmt.Errorf("whpx: virtual processor %d faulted on guest physical address %#x in the stub at %#x", v.index, ex.gpa, ex.pc)}
+	}
+	if err := c.saveUserRegs(v, ac); err != nil {
+		return runResult{err: err}
+	}
+	v.st.parked = false
+	log.Warningf("whpx: guest physical fault at gpa %#x, gva %#x, pc %#x", ex.gpa, ex.gva, ex.pc)
+	t := trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, hasAddr: true, addr: ex.gva}
+	if !ex.gvaValid {
+		t.addr = 0
+	}
+	t.access = hostarch.AccessType{Read: !ex.write && !ex.execute, Write: ex.write, Execute: ex.execute}
+	return t.result()
 }
 
 // acImage returns the floating-point image of ac.

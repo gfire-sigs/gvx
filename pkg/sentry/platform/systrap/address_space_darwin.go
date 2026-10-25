@@ -20,33 +20,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
-)
-
-// islandReach is the largest distance between a patched instruction and the
-// island that holds its slot. A B instruction reaches 128MiB, and the margin
-// covers the island size and the slot's own branch back.
-const islandReach = 120 << 20
-
-// blockState says which mapping of a guest block the stub currently sees.
-type blockState uint8
-
-const (
-	// blockData maps the original frame without execute permission.
-	blockData blockState = iota
-	// blockExec maps a patched private copy as read and execute.
-	blockExec
 )
 
 // execBlock is one host page of a guest mapping that allows execution.
@@ -185,25 +167,7 @@ type addressSpace struct {
 	patchedBlocks atomic.Uint64
 }
 
-// PatchedBlocks returns how many code blocks this address space patched.
-func (as *addressSpace) PatchedBlocks() uint64 { return as.patchedBlocks.Load() }
-
-var (
-	errAddressSpaceReleased = errors.New("the address space is released")
-	errDeadStub             = errors.New("the stub task died")
-)
-
-// AlignmentError reports a mapping request that the 16KB host page cannot honor.
-type AlignmentError struct {
-	Op   string
-	Addr uint64
-	Len  uint64
-}
-
-// Error implements error.
-func (e *AlignmentError) Error() string {
-	return fmt.Sprintf("%s [%#x, %#x) is not aligned to the %dKB host page", e.Op, e.Addr, e.Addr+e.Len, blockSize/1024)
-}
+var errDeadStub = errors.New("the stub task died")
 
 func newAddressSpace(p *Platform) (*addressSpace, error) {
 	proc, err := p.host.forkProc()
@@ -235,15 +199,6 @@ func (as *addressSpace) wakeAll() {
 	for th := range as.threads {
 		ulockWakeAll(&th.sm.State)
 	}
-}
-
-func blockRound(n uint64) uint64 { return n &^ (blockSize - 1) }
-
-func checkAligned(op string, addr, length uint64) error {
-	if length == 0 || addr%blockSize != 0 || length%blockSize != 0 {
-		return &AlignmentError{Op: op, Addr: addr, Len: length}
-	}
-	return nil
 }
 
 // stubProt converts guest access to a Mach protection that never includes execute.
@@ -503,19 +458,11 @@ func (as *addressSpace) Release() {
 	}
 }
 
-// PreFork implements platform.AddressSpace.PreFork.
-func (*addressSpace) PreFork() {}
-
-// PostFork implements platform.AddressSpace.PostFork.
-func (*addressSpace) PostFork() {}
-
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS. arm64 has no
 // GS register.
 func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error { return nil }
 
 // ----- lazy patching ------------------------------------------------------
-
-var errPatchRaced = errors.New("the block changed while it was patched")
 
 // patchBlock patches the block that holds addr and maps the patched copy as
 // read and execute. It runs on the task goroutine, which is allowed to call
@@ -753,17 +700,6 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	return true, nil
 }
 
-// blockStateOf reports whether base is an exec block and its state.
-func (as *addressSpace) blockStateOf(base uint64) (blockState, hostarch.AccessType, bool) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	blk := as.blocks[base]
-	if blk == nil {
-		return 0, hostarch.NoAccess, false
-	}
-	return blk.state, blk.at, true
-}
-
 // isWritableExecutable reports whether base is an exec block that allows
 // writes. A write fault in such a block from an instruction inside the block
 // cannot succeed, because the engine gives the block either write or execute
@@ -811,13 +747,6 @@ func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager
 	return nil, 0, 0, errors.New("no trampoline island has room")
 }
 
-func absDiff(a, b uint64) uint64 {
-	if a > b {
-		return a - b
-	}
-	return b - a
-}
-
 // newIsland reserves a sealed VMA within reach of near through the memory
 // manager and maps a private page of slots there.
 func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager, near uint64) error {
@@ -834,64 +763,19 @@ func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager
 	case as.p.zone:
 		minAddr = max(minAddr, zoneBias+zoneLimit)
 	}
-	var lastErr error
-	for try := 0; try < 128; try++ {
-		off := (uint64(rand.Int64N(islandReach-(4<<20))) + 2<<20) &^ (blockSize - 1)
-		var cand uint64
-		if rand.IntN(2) == 0 {
-			if near < off {
-				continue
-			}
-			cand = near - off
-		} else {
-			cand = near + off
-		}
-		cand = blockRound(cand)
+	return as.newIslandAt(ctx, mm, near, func(cand uint64) (uint64, bool) {
 		if cand < minAddr || cand+blockSize > maxAddr {
-			continue
+			return 0, false
 		}
-		stubCand := cand + shift
-		as.mu.Lock()
-		if _, busy := as.reserved[stubCand]; busy || as.islands[stubCand] != nil || as.released {
-			as.mu.Unlock()
-			continue
-		}
-		as.reserved[stubCand] = struct{}{}
-		as.mu.Unlock()
-
-		_, err := mm.MMap(ctx, memmap.MMapOpts{
-			Length:    blockSize,
-			Addr:      hostarch.Addr(cand),
-			Fixed:     true,
-			NoReplace: true,
-			Private:   true,
-			Name:      "[systrap]",
-			Sealed:    true,
-			Perms:     hostarch.AccessType{Read: true, Execute: true},
-			MaxPerms:  hostarch.AccessType{Read: true, Execute: true},
-		})
-		if err != nil {
-			as.mu.Lock()
-			delete(as.reserved, stubCand)
-			as.mu.Unlock()
-			lastErr = err
-			continue
-		}
-		if err := as.installIsland(stubCand); err != nil {
-			return err
-		}
-		return nil
-	}
-	if lastErr == nil {
-		lastErr = unix.ENOMEM
-	}
-	return fmt.Errorf("find an address within 128MiB for a trampoline island: %w", lastErr)
+		return cand + shift, true
+	})
 }
 
 // installIsland maps a zeroed private page as read and execute at base.
 func (as *addressSpace) installIsland(base uint64) error {
 	page, err := as.p.pool.alloc()
 	if err != nil {
+		as.dropReservation(base)
 		return err
 	}
 	as.mu.Lock()
@@ -907,14 +791,6 @@ func (as *addressSpace) installIsland(base uint64) error {
 	}
 	as.islands[base] = &island{base: base, page: page, slots: make(map[uint32]slotMeta)}
 	return nil
-}
-
-// inIsland reports whether pc lies in an island.
-func (as *addressSpace) inIsland(pc uint64) bool {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	_, ok := as.islands[blockRound(pc)]
-	return ok
 }
 
 // maxSlotSize bounds the byte size of a slot, so that a lookup by an address

@@ -16,31 +16,11 @@
 
 package hostfs
 
-import (
-	"fmt"
-
-	"golang.org/x/sys/unix"
-)
+import "golang.org/x/sys/unix"
 
 // exchange swaps the entries oldRel and newRel with one host call. Both parent
 // directories resolve through descriptors, so the call stays inside the pinned
 // workspace. renameSwap holds the call of the platform.
 func (h *hostRoot) exchange(oldRel, newRel string) error {
-	if oldRel == "." || newRel == "." {
-		return fmt.Errorf("hostfs: exchange %q and %q: %w", oldRel, newRel, unix.EBUSY)
-	}
-	oldParent, oldName, releaseOld, err := h.walkParent(oldRel)
-	if err != nil {
-		return err
-	}
-	defer releaseOld()
-	newParent, newName, releaseNew, err := h.walkParent(newRel)
-	if err != nil {
-		return err
-	}
-	defer releaseNew()
-	if err := retryEINTR(func() error { return renameSwap(oldParent, oldName, newParent, newName) }); err != nil {
-		return fmt.Errorf("hostfs: exchange %q and %q: %w", oldRel, newRel, err)
-	}
-	return nil
+	return h.withTwoParents("exchange", "and", oldRel, newRel, unix.EBUSY, renameSwap)
 }

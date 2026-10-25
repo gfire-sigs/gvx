@@ -60,6 +60,8 @@ func TestDecodeStubExit(t *testing.T) {
 			kind: exitSignal, signo: linux.SIGTRAP, code: sigTrapHWBkp, addr: pc},
 		{name: "watchpoint", vec: vecLowerELSync, esr: esr(ecWatchpoint, 0),
 			kind: exitSignal, signo: linux.SIGTRAP, code: sigTrapHWBkp, addr: far},
+		{name: "fp exception", vec: vecLowerELSync, esr: esr(ecFPExc64, 0),
+			kind: exitSignal, signo: linux.SIGFPE, code: sigFpeFltInv, addr: pc},
 		{name: "undefined instruction", vec: vecLowerELSync, esr: esr(ecUnknown, 0),
 			kind: exitSignal, signo: linux.SIGILL, code: sigIllIllOpc, addr: pc},
 		{name: "illegal execution state", vec: vecLowerELSync, esr: esr(ecIllegalState, 0),

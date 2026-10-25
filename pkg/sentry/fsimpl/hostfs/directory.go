@@ -16,11 +16,10 @@ package hostfs
 
 import (
 	"errors"
-	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -31,6 +30,26 @@ type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.LockFD
+
+	dentry *dentry
+	h      *hostHandle
+}
+
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
+func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
+	d := fd.dentry
+	if err := d.setStat(ctx, auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), &opts, fd.h); err != nil {
+		return err
+	}
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
+	}
+	return nil
+}
+
+// StatFS implements vfs.FileDescriptionImpl.StatFS.
+func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
+	return fd.dentry.fs.statFS()
 }
 
 // dirFD implements vfs.FileDescriptionImpl for directories.
@@ -43,14 +62,7 @@ type fileDescription struct {
 type dirFD struct {
 	fileDescription
 	vfs.DirectoryFileDescriptionDefaultImpl
-
-	dentry *dentry
-
-	// mu protects the fields below.
-	mu       sync.Mutex
-	snapshot []vfs.Dirent
-	loaded   bool
-	off      int64
+	cursor chunkcache.DirCursor
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -63,23 +75,6 @@ func (fd *dirFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, e
 		return linux.Statx{}, err
 	}
 	return d.inode.statxFor(d.inode.snapshot(), d.fs.devMinor), nil
-}
-
-// SetStat implements vfs.FileDescriptionImpl.SetStat.
-func (fd *dirFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	d := fd.dentry
-	if err := d.setStat(ctx, auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), &opts, nil); err != nil {
-		return err
-	}
-	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
-		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
-	}
-	return nil
-}
-
-// StatFS implements vfs.FileDescriptionImpl.StatFS.
-func (fd *dirFD) StatFS(ctx context.Context) (linux.Statfs, error) {
-	return fd.dentry.fs.statFS()
 }
 
 func direntType(kind hostKind) uint8 {
@@ -109,9 +104,9 @@ func direntTypeOf(l dirListing) uint8 {
 	return direntType(l.kind)
 }
 
-// loadLocked lists the directory into fd.snapshot. The entries "." and ".."
-// come first, then the children by name.
-func (fd *dirFD) loadLocked() error {
+// load lists the directory into a snapshot. The entries "." and ".." come
+// first, then the children by name.
+func (fd *dirFD) load() ([]vfs.Dirent, error) {
 	d := fd.dentry
 	fs := d.fs
 	// A listing is a revalidation point: drop what the guest learned about
@@ -125,7 +120,7 @@ func (fd *dirFD) loadLocked() error {
 	fs.mu.Unlock()
 	children, err := fs.ws.listDir(d.path())
 	if err != nil {
-		return translateHostError(err)
+		return nil, translateHostError(err)
 	}
 	fs.mu.Lock()
 	parentIno := d.inode.ino
@@ -158,52 +153,18 @@ func (fd *dirFD) loadLocked() error {
 	for i := range snap {
 		snap[i].NextOff = int64(i + 1)
 	}
-	fd.snapshot = snap
-	fd.loaded = true
-	return nil
+	return snap, nil
 }
 
 // IterDirents implements vfs.FileDescriptionImpl.IterDirents.
 func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
-	if !fd.loaded {
-		if err := fd.loadLocked(); err != nil {
-			return err
-		}
-	}
-	for fd.off < int64(len(fd.snapshot)) {
-		if err := cb.Handle(fd.snapshot[fd.off]); err != nil {
-			return err
-		}
-		fd.off++
-	}
-	return nil
+	return fd.cursor.IterDirents(cb, fd.load)
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek. Seeking to the start discards
 // the snapshot, so rewinddir observes the current directory.
 func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
-	var newOff int64
-	switch whence {
-	case linux.SEEK_SET:
-		newOff = offset
-	case linux.SEEK_CUR:
-		newOff = fd.off + offset
-	default:
-		return 0, linuxerr.EINVAL
-	}
-	if newOff < 0 {
-		return 0, linuxerr.EINVAL
-	}
-	if newOff == 0 {
-		fd.loaded = false
-		fd.snapshot = nil
-	}
-	fd.off = newOff
-	return newOff, nil
+	return fd.cursor.Seek(offset, whence)
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. It bypasses the coalesce

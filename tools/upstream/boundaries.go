@@ -135,7 +135,7 @@ var boundaryRules = []importRule{
 	},
 	{
 		pkg:       "pkg/sentry/platform/systrap",
-		allowed:   []string{"pkg/sentry/platform", "pkg/memutil", "pkg/abi/linux", "golang.org/x/arch/*"},
+		allowed:   []string{"pkg/sentry/platform", "pkg/sentry/platform/hvcommon", "pkg/memutil", "pkg/abi/linux", "golang.org/x/arch/*"},
 		forbidden: []string{"pkg/sentry/kernel/*", "pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "cmd/*"},
 		// usertrap is upstream code. It reads guest memory through kernel.Task, so
 		// its own rule below keeps the other bans and drops the kernel ban.
@@ -147,7 +147,7 @@ var boundaryRules = []importRule{
 	},
 	{
 		pkg:       "pkg/sentry/fsimpl/hostfs",
-		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/fsimpl/chunkcache", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
 		forbidden: []string{"pkg/sentry/platform/*", "cmd/*"},
 	},
 	{
@@ -155,7 +155,13 @@ var boundaryRules = []importRule{
 		// implements the same VFS interfaces as hostfs, so it gets the same
 		// import surface, and it must not reach a platform backend.
 		pkg:       "pkg/sentry/fsimpl/ext4lite",
-		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/fsimpl/chunkcache", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		forbidden: []string{"pkg/sentry/platform/*", "cmd/*"},
+	},
+	{
+		// chunkcache holds the page-chunk cache and VFS helpers that hostfs and ext4lite share.
+		pkg:       "pkg/sentry/fsimpl/chunkcache",
+		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "golang.org/x/sys/*"},
 		forbidden: []string{"pkg/sentry/platform/*", "cmd/*"},
 	},
 	{
@@ -197,8 +203,10 @@ var sentryAPIUsers = []string{
 	"pkg/gvx",
 	"pkg/sentry/fsimpl/hostfs",
 	"pkg/sentry/fsimpl/ext4lite",
+	"pkg/sentry/fsimpl/chunkcache",
 	"pkg/sentry/platform/whpx",
 	"pkg/sentry/platform/hvf",
+	"pkg/sentry/platform/hvcommon",
 	"pkg/sentry/platform/systrap",
 }
 
@@ -219,14 +227,14 @@ var boundaryExceptions = []importException{
 	{sentryAPIUsers, "pkg/log", "upstream logging package"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/systrap"}, "pkg/sentry/arch", "platform.Context.Switch exchanges arch.Context64 values"},
 	{platformBackends, "pkg/sentry/platform/interrupt", "platform.Context.Switch callers wake a running vCPU through interrupt.Forwarder"},
-	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf"}, "pkg/ring0/pagetables", "hardware backends build guest stage-1 and stage-2 page tables with the shared pagetables package"},
-	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/kernel/auth", "vfs.FilesystemImpl methods take auth.Credentials"},
+	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/hvcommon"}, "pkg/ring0/pagetables", "hardware backends build guest stage-1 and stage-2 page tables with the shared pagetables package"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache"}, "pkg/sentry/kernel/auth", "vfs.FilesystemImpl methods take auth.Credentials"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/limits", "vfs write paths consult limits.FileSize"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/socket/unix/transport", "vfs.FilesystemImpl.BoundEndpointAt returns transport.BoundEndpoint"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/refs", "vfs.DentryImpl reference counting uses refs.RefCounter"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "golang.org/x/text/unicode/norm", "APFS stores names in NFD, so the guest view of a name needs NFC conversion (GVXIP-001 section 2.2)"},
 	{[]string{"pkg/sentry/fsimpl/ext4lite"}, "pkg/errors", "toLinuxErr finds the *errors.Error values that the engine returns"},
-	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/kernel/pipe", "mknod FIFO files open through the VFS pipe implementation"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache"}, "pkg/sentry/kernel/pipe", "mknod FIFO files open through the VFS pipe implementation"},
 	{[]string{"pkg/sentry/platform/systrap"}, "golang.org/x/sys/*", "host memory and subprocess APIs on Windows and macOS (SPEC section 3.3)"},
 	{[]string{"pkg/sentry/kernel"}, "pkg/hostarch", "addrhole_xplat.go lists the address holes of a platform as hostarch.AddrRange values"},
 

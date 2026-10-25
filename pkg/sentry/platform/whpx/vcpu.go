@@ -35,6 +35,9 @@ type addrRange struct{ start, end uint64 }
 
 func (r addrRange) contains(addr uint64) bool { return addr >= r.start && addr < r.end }
 
+// invalidate forgets everything about the processor.
+func (s *vpState) invalidate() { *s = vpState{} }
+
 // vcpu is one virtual processor of the partition.
 //
 // A Context uses a vcpu only while it runs Switch. The Context that last used

@@ -19,7 +19,6 @@ package hostlockdown
 import (
 	"fmt"
 	"net"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -247,18 +246,8 @@ func openPrimaryToken() (windows.Token, error) {
 }
 
 func resolveMount(path string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("hostlockdown: resolve mount %q: %w", path, err)
-	}
-	real, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", fmt.Errorf("hostlockdown: resolve mount symlinks %q: %w", abs, err)
-	}
-	if filepath.Dir(real) == real {
-		return "", fmt.Errorf("hostlockdown: mount %q resolves to the volume root %q and would allow every file on it", path, real)
-	}
-	return real, nil
+	_, real, err := resolveMountPath(path)
+	return real, err
 }
 
 // BindThread attaches the process-lifetime restricted token to the calling OS

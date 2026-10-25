@@ -359,6 +359,46 @@ type armThreadState struct {
 	Flags uint32
 }
 
+// getReg returns general-purpose register reg (0..31). Reg 18 returns x18,
+// reg 29 returns FP, reg 30 returns LR, and reg 31 returns SP when spFor31 is
+// true or 0 (XZR) otherwise.
+func (ss *armThreadState) getReg(reg uint8, x18 uint64, spFor31 bool) uint64 {
+	switch {
+	case reg == x18Reg:
+		return x18
+	case reg < 29:
+		return ss.X[reg]
+	case reg == 29:
+		return ss.FP
+	case reg == 30:
+		return ss.LR
+	case spFor31:
+		return ss.SP
+	default:
+		return 0
+	}
+}
+
+// setReg writes v to general-purpose register reg (0..31). Reg 18 writes to
+// *x18 when x18 is non-nil, reg 29 writes FP, reg 30 writes LR, and reg 31
+// writes SP when spFor31 is true or discards the write (XZR) otherwise.
+func (ss *armThreadState) setReg(reg uint8, v uint64, x18 *uint64, spFor31 bool) {
+	switch {
+	case reg == x18Reg:
+		if x18 != nil {
+			*x18 = v
+		}
+	case reg < 29:
+		ss.X[reg] = v
+	case reg == 29:
+		ss.FP = v
+	case reg == 30:
+		ss.LR = v
+	case spFor31:
+		ss.SP = v
+	}
+}
+
 // armNeonState is the ARM_NEON_STATE64 flavor.
 type armNeonState struct {
 	V    [32][16]byte

@@ -29,16 +29,13 @@ package systrap
 
 import (
 	"fmt"
-	"math"
 	"sync"
 
 	"golang.org/x/sys/unix"
 
-	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
-	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
 )
 
 const (
@@ -195,11 +192,6 @@ func (p *Platform) Close() error {
 	return p.closeErr
 }
 
-// SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
-// The guest memory lives in another task, so the Sentry reaches it through the
-// memory file only.
-func (*Platform) SupportsAddressSpaceIO() bool { return false }
-
 // MapUnit implements platform.Platform.MapUnit. MapFile maps a whole range with
 // one remap and one protection call, so a fault maps up to 256KB of its pma at
 // once. A larger unit would map pages that the guest never touches.
@@ -214,9 +206,6 @@ func (p *Platform) MinUserAddress() hostarch.Addr {
 	}
 	return hostarch.Addr(p.userMin)
 }
-
-// MaxUserAddress implements platform.Platform.MaxUserAddress.
-func (p *Platform) MaxUserAddress() hostarch.Addr { return hostarch.Addr(p.userMax) }
 
 // UserAddressHole implements platform.AddressHolePlatform. In zone mode the
 // range between the zone and the first address above the biased zone holds
@@ -250,22 +239,6 @@ func (p *Platform) guestAddr(stub uint64) uint64 {
 func (p *Platform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	return newAddressSpace(p)
 }
-
-// NewContext implements platform.Platform.NewContext.
-func (p *Platform) NewContext(context.Context) platform.Context {
-	c := &Context{p: p}
-	c.interrupt = interrupt.Forwarder{Dst: c}
-	return c
-}
-
-// SeccompInfo implements platform.Platform.SeccompInfo.
-func (*Platform) SeccompInfo() platform.SeccompInfo {
-	return platform.StaticSeccompInfo{PlatformName: PlatformName}
-}
-
-// ConcurrencyCount implements platform.Platform.ConcurrencyCount. Each guest
-// thread has its own host thread, so the platform never makes Switch wait.
-func (*Platform) ConcurrencyCount() int { return math.MaxInt }
 
 // mapUnit is the alignment that the memory manager uses to widen a fault.
 const mapUnit = 256 << 10

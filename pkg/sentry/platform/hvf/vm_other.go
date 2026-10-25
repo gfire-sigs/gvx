@@ -54,9 +54,9 @@ func (*vmState) retain() error { return errUnsupportedOS }
 
 func (*vmState) release() {}
 
-func (*vmState) allocPage() ([]byte, uint64, error) { return nil, 0, errUnsupportedOS }
+func (*vmState) AllocPage() ([]byte, uint64, error) { return nil, 0, errUnsupportedOS }
 
-func (*vmState) freePage([]byte, uint64) {}
+func (*vmState) FreePage([]byte, uint64) {}
 
 func (*vmState) resolveMemory(*regionUser, memmap.File, safemem.BlockSeq, bool) ([]segment, error) {
 	return nil, errUnsupportedOS

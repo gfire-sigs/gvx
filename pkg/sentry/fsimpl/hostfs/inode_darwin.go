@@ -32,18 +32,12 @@ const pcCaseSensitive = 11
 // whose case differs from the stored name.
 func probeCaseInsensitive(dir *os.File) (bool, error) {
 	var sensitive int
-	var probeErr error
-	rc, err := dir.SyscallConn()
-	if err != nil {
-		return false, err
-	}
-	if err := rc.Control(func(fd uintptr) {
-		sensitive, probeErr = unix.Fpathconf(int(fd), pcCaseSensitive)
+	if err := withFileFD(dir, func(fd int) error {
+		var err error
+		sensitive, err = unix.Fpathconf(fd, pcCaseSensitive)
+		return err
 	}); err != nil {
 		return false, err
-	}
-	if probeErr != nil {
-		return false, probeErr
 	}
 	return sensitive == 0, nil
 }

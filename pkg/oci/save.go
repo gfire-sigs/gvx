@@ -48,7 +48,8 @@ type preparedSave struct {
 
 // saveBlobPath returns the archive member of a blob.
 func saveBlobPath(digest string) string {
-	return "blobs/sha256/" + normalizeDigestHex(digest)
+	name, _ := blobMemberName(digest)
+	return name
 }
 
 // SaveImages writes one tar archive of the images to w. The archive is an OCI

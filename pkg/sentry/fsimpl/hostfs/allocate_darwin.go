@@ -34,22 +34,13 @@ import (
 // writes zeros over the unaligned pieces at the ends of the range. A volume
 // that refuses F_PUNCHHOLE gets zeros over the whole range.
 func allocateNative(f *os.File, mode uint64, off, length int64) error {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return fmt.Errorf("hostfs: fallocate: %w", err)
-	}
-	var callErr error
-	if err := rc.Control(func(fd uintptr) {
+	if err := withFileFD(f, func(fd int) error {
 		if mode&linux.FALLOC_FL_PUNCH_HOLE != 0 {
-			callErr = punchHole(f, int(fd), mode, off, length)
-			return
+			return punchHole(f, fd, mode, off, length)
 		}
-		callErr = preallocate(int(fd), mode, off, length)
+		return preallocate(fd, mode, off, length)
 	}); err != nil {
 		return fmt.Errorf("hostfs: fallocate: %w", err)
-	}
-	if callErr != nil {
-		return fmt.Errorf("hostfs: fallocate: %w", callErr)
 	}
 	return nil
 }

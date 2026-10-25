@@ -28,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 var (
@@ -65,10 +66,7 @@ type chunkedFile interface {
 }
 
 // segment is a run of contiguous guest physical memory.
-type segment struct {
-	ipa    uint64
-	length uint64
-}
+type segment = hvcommon.GPARun
 
 // region is one Stage-2 mapping. It maps the host range [host, host+size) at
 // ipa. When copied is non-nil, the mapping holds a private copy of that range
@@ -274,11 +272,7 @@ func (m *regionMap) resolve(u *regionUser, f memmap.File, bs safemem.BlockSeq, w
 			}
 			u.use(r)
 			ipa := r.ipa + uint64(base+off-r.host)
-			if k := len(segs) - 1; k >= 0 && segs[k].ipa+segs[k].length == ipa {
-				segs[k].length += uint64(take)
-			} else {
-				segs = append(segs, segment{ipa: ipa, length: uint64(take)})
-			}
+			segs = hvcommon.AppendGPARun(segs, ipa, uint64(take))
 			off += take
 		}
 	}

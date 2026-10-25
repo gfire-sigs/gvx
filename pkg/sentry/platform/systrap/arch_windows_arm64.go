@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // Windows runs a guest `svc #0` as an NT system call, and EL0 code cannot read
@@ -63,7 +64,7 @@ const (
 	siteMOVX18 siteKind = 6
 )
 
-func brkWord(imm uint32) uint32 { return arm64BRK | imm<<5 }
+func brkWord(imm uint32) uint32 { return hvcommon.BRK(uint16(imm)) }
 
 // fetchWindow is the length of an instruction in bytes. Instructions are
 // aligned, so a fetch never crosses a block.
@@ -470,24 +471,3 @@ func (th *thread) archFastGetFP(f *fastThread, ac *arch.Context64) error {
 	f.slot.sm.storeVector(ac)
 	return nil
 }
-
-func movzImm(rd, imm uint32) uint32 { return 0xd2800000 | imm<<5 | rd }
-func subsImm1(rd uint32) uint32     { return 0xf1000400 | rd<<5 | rd }
-
-// probeProgram returns the guest code of Probe: calls system calls with
-// number 5, then one with number 6.
-func probeProgram(calls int) []byte {
-	words := []uint32{
-		movzImm(1, uint32(calls)), movzImm(8, 5),
-		arm64SVC0, subsImm1(1), 0x54ffffc1, // svc; subs x1, x1, #1; b.ne -8
-		movzImm(8, 6), arm64SVC0,
-	}
-	code := make([]byte, 4*len(words))
-	for i, w := range words {
-		binary.LittleEndian.PutUint32(code[4*i:], w)
-	}
-	return code
-}
-
-// probeSyscallNumber returns the number of the system call that stopped the guest.
-func probeSyscallNumber(ac *arch.Context64) uint64 { return ac.StateData().Regs.Regs[8] }

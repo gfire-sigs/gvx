@@ -142,14 +142,7 @@ func (c *Context) zoneBodyFault(ctx context.Context, mm platform.MemoryManager, 
 
 // addToRegister adds delta to a general-purpose register of the thread state.
 func addToRegister(ss *armThreadState, reg uint8, delta uint64) {
-	switch {
-	case reg < 29:
-		ss.X[reg] += delta
-	case reg == 29:
-		ss.FP += delta
-	case reg == 30:
-		ss.LR += delta
-	}
+	ss.setReg(reg, ss.getReg(reg, 0, false)+delta, nil, false)
 }
 
 // restoreSpilledScratch puts the guest values of x16 and x17 back into the

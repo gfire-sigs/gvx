@@ -17,19 +17,15 @@
 package systrap
 
 import (
-	"errors"
 	"fmt"
-	"math"
 	"os"
 	"runtime"
 	"sync"
 
 	"golang.org/x/sys/unix"
 
-	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
-	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
 )
 
 // Platform implements platform.Platform with stub processes that run the guest
@@ -204,20 +200,12 @@ func (p *Platform) Close() error {
 	return p.closeErr
 }
 
-// SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
-// The guest memory lives in another process, so the Sentry reaches it through
-// the memory file only.
-func (*Platform) SupportsAddressSpaceIO() bool { return false }
-
 // MapUnit implements platform.Platform.MapUnit. A view costs the same at any
 // size, so the memory manager maps whole mappings at a time.
 func (*Platform) MapUnit() uint64 { return 0 }
 
 // MinUserAddress implements platform.Platform.MinUserAddress.
 func (p *Platform) MinUserAddress() hostarch.Addr { return hostarch.Addr(p.userMin) }
-
-// MaxUserAddress implements platform.Platform.MaxUserAddress.
-func (p *Platform) MaxUserAddress() hostarch.Addr { return hostarch.Addr(p.userMax) }
 
 // NewAddressSpace implements platform.Platform.NewAddressSpace. The platform
 // starts a stub process for each address space.
@@ -230,22 +218,6 @@ func (p *Platform) NewAddressSpace(platform.AddressSpaceOptions) (platform.Addre
 	}
 	return as, nil
 }
-
-// NewContext implements platform.Platform.NewContext.
-func (p *Platform) NewContext(context.Context) platform.Context {
-	c := &Context{p: p}
-	c.interrupt.Dst = c
-	return c
-}
-
-// SeccompInfo implements platform.Platform.SeccompInfo.
-func (*Platform) SeccompInfo() platform.SeccompInfo {
-	return platform.StaticSeccompInfo{PlatformName: PlatformName}
-}
-
-// ConcurrencyCount implements platform.Platform.ConcurrencyCount. A thread
-// never waits for a free slot, so the platform does not limit concurrency.
-func (*Platform) ConcurrencyCount() int { return math.MaxInt }
 
 // Confinement names the confinement that the host applied to the stubs.
 func (p *Platform) Confinement() string {
@@ -262,8 +234,3 @@ func (p *Platform) Confinement() string {
 	}
 	return s
 }
-
-// errNoAddressSpace reports that the memory manager has no address space of this platform.
-var errNoAddressSpace = &platform.ContextError{Err: errors.New("no stub address space"), Errno: 14}
-
-var _ interrupt.Receiver = (*Context)(nil)

@@ -16,8 +16,6 @@ package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 
@@ -39,23 +37,17 @@ func init() {
 // what the stub reported. It exits with 1 and the engine error when the host
 // has no usable systrap engine.
 func stubSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("rungv stub", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
+	fs := newImageFlagSet("stub", stderr)
+	if code, stop := parseImageFlags(fs, args); stop {
+		return code
 	}
 	if fs.NArg() != 0 {
-		_, _ = fmt.Fprintf(stderr, "rungv stub: unexpected argument %q\n", fs.Arg(0))
-		return 2
+		return imageUsageError(stderr, "stub", "unexpected argument %q", fs.Arg(0))
 	}
 
 	info, err := gvx.ProbeStub(ctx)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv stub: %v\n", err)
-		return 1
+		return imageFail(stderr, "stub", err)
 	}
 	_, _ = fmt.Fprintf(stdout, "systrap stub ok\n"+
 		"architecture: %s\n"+

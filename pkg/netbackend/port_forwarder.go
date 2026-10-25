@@ -61,6 +61,14 @@ type PortForwardRule struct {
 // ParsePortForwardRule parses a CLI port-forward specification such as
 // "8080:80", "127.0.0.1:8080:80", "8080:80/tcp", or "5353:53/udp".
 func ParsePortForwardRule(spec string) (PortForwardRule, error) {
+	return ParsePortForwardSpec(spec, false, false)
+}
+
+// ParsePortForwardSpec parses a port-forward specification. When allowSinglePort
+// is true, Docker forms such as "80", "ip::80", and "[ipv6]:8080:80" are
+// accepted. When strictBindIP is true, an explicit bind address must parse as
+// an IPv4 or bracketed IPv6 address.
+func ParsePortForwardSpec(spec string, allowSinglePort, strictBindIP bool) (PortForwardRule, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return PortForwardRule{}, errors.New("netbackend: empty port forward specification")
@@ -68,36 +76,58 @@ func ParsePortForwardRule(spec string) (PortForwardRule, error) {
 
 	proto := "tcp"
 	if slashIdx := strings.LastIndexByte(spec, '/'); slashIdx != -1 {
-		proto = strings.ToLower(spec[slashIdx+1:])
+		proto = strings.ToLower(strings.TrimSpace(spec[slashIdx+1:]))
 		spec = spec[:slashIdx]
 		if proto != "tcp" && proto != "udp" {
 			return PortForwardRule{}, fmt.Errorf("netbackend: unsupported protocol %q in port forward spec", proto)
 		}
 	}
 
-	parts := strings.Split(spec, ":")
-	var hostIP, hostPortStr, guestPortStr string
-	switch len(parts) {
-	case 2:
-		hostIP = "127.0.0.1"
-		hostPortStr = parts[0]
-		guestPortStr = parts[1]
-	case 3:
-		hostIP = parts[0]
-		if hostIP == "" {
-			hostIP = "127.0.0.1"
+	hostIP := "127.0.0.1"
+	rest := spec
+	if strings.HasPrefix(rest, "[") {
+		end := strings.IndexByte(rest, ']')
+		if end < 0 || end+1 >= len(rest) || rest[end+1] != ':' {
+			return PortForwardRule{}, fmt.Errorf("netbackend: invalid port forward %q: an IPv6 address needs brackets and a port", spec)
 		}
-		hostPortStr = parts[1]
-		guestPortStr = parts[2]
+		hostIP, rest = rest[1:end], rest[end+2:]
+		if ip, err := netip.ParseAddr(hostIP); err != nil || !ip.Is6() {
+			return PortForwardRule{}, fmt.Errorf("netbackend: invalid IPv6 address %q in %q", hostIP, spec)
+		}
+	}
+
+	parts := strings.Split(rest, ":")
+	if hostIP == "127.0.0.1" && len(parts) == 3 {
+		hostIP, parts = parts[0], parts[1:]
+		if hostIP == "" && !strictBindIP {
+			hostIP = "127.0.0.1"
+		} else if strictBindIP {
+			if ip, err := netip.ParseAddr(hostIP); err != nil || !ip.Is4() {
+				return PortForwardRule{}, fmt.Errorf("netbackend: invalid bind address %q in %q (want an IPv4 address, or an IPv6 address in brackets)", hostIP, spec)
+			}
+		}
+	}
+
+	var hostPortStr, guestPortStr string
+	switch {
+	case len(parts) == 1 && allowSinglePort:
+		guestPortStr = parts[0]
+	case len(parts) == 2:
+		hostPortStr, guestPortStr = parts[0], parts[1]
 	default:
 		return PortForwardRule{}, fmt.Errorf("netbackend: invalid port forward format %q", spec)
 	}
 
-	hostPort, err := strconv.ParseUint(hostPortStr, 10, 16)
-	if err != nil {
-		return PortForwardRule{}, fmt.Errorf("netbackend: invalid host port %q: %w", hostPortStr, err)
+	var hostPort uint64
+	hostPortStr = strings.TrimSpace(hostPortStr)
+	if hostPortStr != "" || !allowSinglePort {
+		var err error
+		hostPort, err = strconv.ParseUint(hostPortStr, 10, 16)
+		if err != nil {
+			return PortForwardRule{}, fmt.Errorf("netbackend: invalid host port %q: %w", hostPortStr, err)
+		}
 	}
-	guestPort, err := strconv.ParseUint(guestPortStr, 10, 16)
+	guestPort, err := strconv.ParseUint(strings.TrimSpace(guestPortStr), 10, 16)
 	if err != nil || guestPort == 0 {
 		return PortForwardRule{}, fmt.Errorf("netbackend: invalid guest port %q", guestPortStr)
 	}
@@ -273,18 +303,7 @@ func (pf *PortForwarder) Start(s *stack.Stack) {
 // spawn runs fn on a tracked goroutine. It returns false after Close, so that
 // no goroutine starts while Close waits.
 func (pf *PortForwarder) spawn(fn func()) bool {
-	pf.mu.Lock()
-	if pf.closed {
-		pf.mu.Unlock()
-		return false
-	}
-	pf.wg.Add(1)
-	pf.mu.Unlock()
-	go func() {
-		defer pf.wg.Done()
-		fn()
-	}()
-	return true
+	return spawnTracked(&pf.mu, &pf.closed, &pf.wg, fn)
 }
 
 func (pf *PortForwarder) serveTCP(s *stack.Stack, b *boundTCPForward) {

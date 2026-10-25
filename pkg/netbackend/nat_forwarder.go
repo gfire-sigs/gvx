@@ -175,9 +175,9 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 	return n + dropped, err
 }
 
-// NewNATStack creates a pure-Go Netstack configured with lo (127.0.0.1/8) and
-// eth0 (10.0.2.15/24) and attaches a Track A L4 NATForwarder.
-func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
+// NewLoopbackStack creates a pure-Go Netstack configured with lo (127.0.0.1/8)
+// and a loopback route table.
+func NewLoopbackStack() (*stack.Stack, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -190,9 +190,24 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 			icmp.NewProtocol6,
 		},
 	})
-
 	if err := configureLoopbackNIC(s, LoopbackNICID); err != nil {
 		s.Close()
+		return nil, err
+	}
+	s.SetRouteTable([]tcpip.Route{
+		{
+			Destination: header.IPv4LoopbackSubnet,
+			NIC:         LoopbackNICID,
+		},
+	})
+	return s, nil
+}
+
+// NewNATStack creates a pure-Go Netstack configured with lo (127.0.0.1/8) and
+// eth0 (10.0.2.15/24) and attaches a Track A L4 NATForwarder.
+func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
+	s, err := NewLoopbackStack()
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -319,21 +334,26 @@ func (nf *NATForwarder) Close() error {
 	return nil
 }
 
-// spawn runs fn on a tracked goroutine. It returns false after Close, so that
-// no goroutine starts while Close waits.
-func (nf *NATForwarder) spawn(fn func()) bool {
-	nf.mu.Lock()
-	if nf.closed {
-		nf.mu.Unlock()
+// spawnTracked runs fn on a tracked goroutine unless *closed is true.
+func spawnTracked(mu *sync.Mutex, closed *bool, wg *sync.WaitGroup, fn func()) bool {
+	mu.Lock()
+	if *closed {
+		mu.Unlock()
 		return false
 	}
-	nf.wg.Add(1)
-	nf.mu.Unlock()
+	wg.Add(1)
+	mu.Unlock()
 	go func() {
-		defer nf.wg.Done()
+		defer wg.Done()
 		fn()
 	}()
 	return true
+}
+
+// spawn runs fn on a tracked goroutine. It returns false after Close, so that
+// no goroutine starts while Close waits.
+func (nf *NATForwarder) spawn(fn func()) bool {
+	return spawnTracked(&nf.mu, &nf.closed, &nf.wg, fn)
 }
 
 // ResolveOutboundTarget maps a guest destination IP and port to a host network

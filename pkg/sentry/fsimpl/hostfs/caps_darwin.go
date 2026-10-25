@@ -16,8 +16,6 @@
 
 package hostfs
 
-import "golang.org/x/sys/unix"
-
 // platformCaps probes the volume of the workspace root on macOS. The host
 // backend reads the case rule of the volume with fpathconf. A temporary file
 // in the root shows whether the volume treats the NFC and NFD forms of a name
@@ -40,7 +38,7 @@ func platformCaps(host hostBackend, readOnly bool) WorkspaceCaps {
 	return caps
 }
 
-// probeRenameSwap reports whether renamex_np exchanges two names on the
+// probeRenameSwap reports whether renameSwap exchanges two names on the
 // volume.
 func probeRenameSwap(host hostBackend) bool {
 	base := probeBase()
@@ -55,5 +53,5 @@ func probeRenameSwap(host hostBackend) bool {
 	}
 	defer removeB()
 	dirfd := int(host.rootDir())
-	return unix.RenameatxNp(dirfd, base+"a", dirfd, base+"b", unix.RENAME_SWAP) == nil
+	return renameSwap(dirfd, base+"a", dirfd, base+"b") == nil
 }

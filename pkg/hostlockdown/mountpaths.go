@@ -17,9 +17,27 @@
 package hostlockdown
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
+
+// resolveMountPath returns the absolute path of path and its symlink-resolved
+// target, rejecting a path that resolves to a filesystem or volume root.
+func resolveMountPath(path string) (abs, real string, err error) {
+	abs, err = filepath.Abs(path)
+	if err != nil {
+		return "", "", fmt.Errorf("hostlockdown: resolve mount %q: %w", path, err)
+	}
+	real, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("hostlockdown: resolve mount symlinks %q: %w", abs, err)
+	}
+	if filepath.Dir(real) == real {
+		return "", "", fmt.Errorf("hostlockdown: mount %q resolves to the volume root %q and would allow every host file", path, real)
+	}
+	return abs, real, nil
+}
 
 // within reports whether path is root or lies below root. Both paths must be
 // absolute and clean. Case rules follow filepath.Rel on the host OS.

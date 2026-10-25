@@ -21,8 +21,6 @@ import (
 	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
-	"z.gfire.dev/gvx/pkg/hostarch"
-	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -83,9 +81,6 @@ type vpState struct {
 	fsBase, gsBase uint64
 	ds, es, fs, gs uint16
 }
-
-// invalidate forgets everything about the processor.
-func (s *vpState) invalidate() { *s = vpState{} }
 
 // rootValue returns the CR3 value of the address space.
 func (as *AddressSpace) rootValue() uint64 {
@@ -198,7 +193,7 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	comm.Regs[15] = r.R15
 	comm.SP = r.Rsp
 	comm.PC = r.Rip
-	comm.PstateOrRflags = flags
+	comm.Pstate = flags
 	comm.CS = r.Cs
 	comm.SS = r.Ss
 	comm.Root = as.rootValue()
@@ -275,7 +270,7 @@ func (c *Context) onStubExit(v *vcpu, _ exitInfo, ac *arch.Context64) (runResult
 	default:
 		v.st.invalidate()
 		return runResult{err: fmt.Errorf("whpx: virtual processor %d halted with stub exit reason %d, rip %#x, vector %d, error code %#x",
-			v.index, reason, comm.PC, comm.Vector, comm.FaultCode)}, false
+			v.index, reason, comm.PC, comm.Vector, comm.ESR)}, false
 	}
 	if reason == ExitSyscall {
 		// SYSCALL stores the return address in RCX and the flags in R11.
@@ -285,24 +280,15 @@ func (c *Context) onStubExit(v *vcpu, _ exitInfo, ac *arch.Context64) (runResult
 		return runResult{}, false
 	}
 	r.Rip = comm.PC
-	r.Eflags = comm.PstateOrRflags
+	r.Eflags = comm.Pstate
 	r.Cs = comm.CS
 	r.Ss = comm.SS
-	t, err := classifyX86(comm.Vector, comm.FaultCode, comm.FaultAddr, comm.PC)
+	t, err := classifyX86(comm.Vector, comm.ESR, comm.FaultAddr, comm.PC)
 	if err != nil {
 		v.st.invalidate()
 		return runResult{err: err}, false
 	}
 	return t.result(), false
-}
-
-// result converts a trap into the return values of Switch.
-func (t trap) result() runResult {
-	info := &linux.SignalInfo{Signo: int32(t.signo), Code: t.code}
-	if t.hasAddr {
-		info.SetAddr(t.addr)
-	}
-	return runResult{sig: info, at: t.access, err: platform.ErrContextSignal}
 }
 
 // saveUserRegs reads the registers of a processor that stopped in user mode.
@@ -360,23 +346,4 @@ func (c *Context) onCancel(v *vcpu, ex exitInfo, ac *arch.Context64) (cancelActi
 		return cancelInterrupt, nil
 	}
 	return cancelInterrupt, fmt.Errorf("whpx: virtual processor %d was cancelled at unknown kernel address %#x", v.index, ex.pc)
-}
-
-// onMemoryFault converts a guest physical access fault into SIGBUS.
-func (c *Context) onMemoryFault(v *vcpu, ex exitInfo, ac *arch.Context64) runResult {
-	if ex.cpl != 3 {
-		v.st.invalidate()
-		return runResult{err: fmt.Errorf("whpx: virtual processor %d faulted on guest physical address %#x in the stub at %#x", v.index, ex.gpa, ex.pc)}
-	}
-	if err := c.saveUserRegs(v, ac); err != nil {
-		return runResult{err: err}
-	}
-	v.st.parked = false
-	log.Warningf("whpx: guest physical fault at gpa %#x, gva %#x, rip %#x", ex.gpa, ex.gva, ex.pc)
-	t := trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, hasAddr: true, addr: ex.gva}
-	if !ex.gvaValid {
-		t.addr = 0
-	}
-	t.access = hostarch.AccessType{Read: !ex.write && !ex.execute, Write: ex.write, Execute: ex.execute}
-	return t.result()
 }

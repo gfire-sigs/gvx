@@ -14,34 +14,22 @@
 
 package hvf
 
+import "z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
+
 // EL1 system register values that every vCPU receives at creation.
-
 const (
-	// cntvCtlMasked sets CNTV_CTL_EL0.IMASK. The guest never programs the
-	// virtual timer, and the mask keeps it from raising an exit.
-	cntvCtlMasked uint64 = 2
-
-	// pstateModeMask selects the M[4:0] field of PSTATE. EL0t is zero.
+	cntvCtlMasked  uint64 = 2
 	pstateModeMask uint64 = 0x1f
-
-	// pstateUserMask keeps the condition flags N, Z, C and V, which are the
-	// only PSTATE bits that Linux user code changes directly.
 	pstateUserMask uint64 = 0xf0000000
 )
 
 // sctlrEL1 enables the MMU and the caches, and lets EL0 run the instructions
 // that glibc and the Go runtime use without a trap to EL1.
-const sctlrEL1 uint64 = 0 |
-	1<<0 | // M: Stage-1 translation on.
-	1<<2 | // C: data caches on.
+const sctlrEL1 uint64 = hvcommon.SCTLREL1Set |
 	1<<3 | // SA: SP alignment check at EL1.
 	1<<4 | // SA0: SP alignment check at EL0, as Linux does.
-	1<<12 | // I: instruction caches on.
-	1<<14 | // DZE: DC ZVA runs at EL0.
-	1<<15 | // UCT: CTR_EL0 reads at EL0.
 	1<<16 | // nTWI: WFI runs at EL0.
 	1<<18 | // nTWE: WFE runs at EL0.
-	1<<26 | // UCI: IC IVAU, DC CVAU, DC CIVAC and DC CVAC run at EL0.
 	sctlrRes1
 
 // sctlrRes1 holds the bits that are RES1 on cores without the matching

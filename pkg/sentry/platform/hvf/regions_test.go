@@ -171,7 +171,7 @@ func TestFourMiBBlockNeedsOneStage2Map(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(segs) != 1 || segs[0].length != 4<<20 {
+	if len(segs) != 1 || segs[0].Size != 4<<20 {
 		t.Fatalf("segments = %+v, want one run of 4 MiB", segs)
 	}
 	if maps, _ := be.counts(); maps != 1 {
@@ -205,8 +205,8 @@ func TestResolveKeepsGuestPhysicalOffsetsOfTheHostRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := a[0].ipa + 64<<10; b[0].ipa != want {
-		t.Errorf("ipa of the second range = %#x, want %#x", b[0].ipa, want)
+	if want := a[0].GPA + 64<<10; b[0].GPA != want {
+		t.Errorf("ipa of the second range = %#x, want %#x", b[0].GPA, want)
 	}
 }
 
@@ -228,7 +228,7 @@ func TestMemoryFileMapsEveryChunkOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(segs) != 1 || segs[0].length != 3<<20 {
+	if len(segs) != 1 || segs[0].Size != 3<<20 {
 		t.Errorf("segments = %+v, want one contiguous run: the chunks sit side by side", segs)
 	}
 	if maps, unmaps := be.counts(); maps != 3 || unmaps != 0 {
@@ -275,8 +275,8 @@ func TestOtherFilesLoseTheirRegionWithTheLastUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again[0].ipa != first[0].ipa {
-		t.Errorf("ipa after reuse = %#x, want the released %#x", again[0].ipa, first[0].ipa)
+	if again[0].GPA != first[0].GPA {
+		t.Errorf("ipa after reuse = %#x, want the released %#x", again[0].GPA, first[0].GPA)
 	}
 }
 
@@ -300,7 +300,7 @@ func TestAFileNeverUsesTheRegionOfAnotherFile(t *testing.T) {
 	if maps, _ := be.counts(); maps != 2 {
 		t.Errorf("hv_vm_map calls = %d, want 2: each file needs its own region", maps)
 	}
-	if first[0].ipa == second[0].ipa {
+	if first[0].GPA == second[0].GPA {
 		t.Error("two files share one guest physical range")
 	}
 }
@@ -422,7 +422,7 @@ func TestPrivateCopyHoldsOnlyTheBytesOfTheBlock(t *testing.T) {
 	if off != 4<<10 || r.size != testGranule {
 		t.Fatalf("the block lies at %#x in a region of %#x bytes, want %#x in %#x", off, r.size, 4<<10, testGranule)
 	}
-	if len(segs) != 1 || segs[0].ipa != r.ipa+uint64(off) || segs[0].length != hi-lo {
+	if len(segs) != 1 || segs[0].GPA != r.ipa+uint64(off) || segs[0].Size != hi-lo {
 		t.Errorf("segments %+v, want one segment of the block at ipa %#x", segs, r.ipa+uint64(off))
 	}
 	if !bytes.Equal(r.copied[off:off+(hi-lo)], mem[lo:hi]) {

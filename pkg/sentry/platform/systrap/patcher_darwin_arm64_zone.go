@@ -19,6 +19,8 @@ package systrap
 import (
 	"encoding/binary"
 	"fmt"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // Every arm64 task on macOS has a 4GB PAGEZERO, so a Linux executable that
@@ -230,19 +232,20 @@ func (a *memAccess) classifySingle(insn, v uint32, rt, rn uint8) {
 	}
 }
 
-// encodeTBNZ returns tbnz xt, #bit with a branch of delta bytes. The bit
-// number must be 32 or more, which is the case for every bit that a slot tests.
+// encodeTBNZ returns tbnz xt, #bit with a branch of delta bytes.
 func encodeTBNZ(rt uint8, bit uint, delta int) uint32 {
-	return 0x37000000 | 1<<31 | uint32(bit-32)<<19 | uint32(delta/4)&0x3fff<<5 | uint32(rt)
+	return hvcommon.TBNZ(int(rt), int(bit), delta)
 }
 
 func encodeBiasTBNZ(rt uint8, delta int) uint32 { return encodeTBNZ(rt, zoneBiasBit, delta) }
 
-func encodeBiasOrr(rd, rn uint8) uint32      { return zoneBiasOrr | uint32(rn)<<5 | uint32(rd) }
-func encodeBiasAnd(rd, rn uint8) uint32      { return zoneBiasAnd | uint32(rn)<<5 | uint32(rd) }
-func encodeMovZ(rd uint8, imm uint64) uint32 { return arm64MOVZ | uint32(imm&0xffff)<<5 | uint32(rd) }
+func encodeBiasOrr(rd, rn uint8) uint32 { return zoneBiasOrr | uint32(rn)<<5 | uint32(rd) }
+func encodeBiasAnd(rd, rn uint8) uint32 { return zoneBiasAnd | uint32(rn)<<5 | uint32(rd) }
+func encodeMovZ(rd uint8, imm uint64) uint32 {
+	return hvcommon.MOVZ(int(rd), uint16(imm&0xffff))
+}
 func encodeMovK(rd uint8, imm uint64, shift uint) uint32 {
-	return zoneMOVK | uint32(shift/16)<<21 | uint32(imm&0xffff)<<5 | uint32(rd)
+	return hvcommon.MOVK(int(rd), uint16(imm&0xffff), int(shift))
 }
 
 // encodeMemSlot writes the slot of a load or store at site into buf. It

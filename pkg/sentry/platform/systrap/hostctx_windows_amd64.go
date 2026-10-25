@@ -17,7 +17,6 @@
 package systrap
 
 import (
-	"encoding/binary"
 	"sync"
 	"unsafe"
 )
@@ -144,24 +143,9 @@ func (c *hostContext) loadXState(fp []byte) {
 	if x == nil {
 		return
 	}
-	var bv uint64
-	if len(fp) >= xsaveHeaderOffset+8 {
-		bv = binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
-	}
-	for _, comp := range xstateComponents {
-		if x.mask&(1<<comp.id) == 0 {
-			continue
-		}
-		dst := c.locate(comp.id, comp.size)
-		if dst == nil {
-			continue
-		}
-		if bv&(1<<comp.id) != 0 && len(fp) >= comp.offset+comp.size {
-			copy(dst, fp[comp.offset:comp.offset+comp.size])
-		} else {
-			clear(dst)
-		}
-	}
+	loadXStateComponents(fp, x.mask, func(comp xstateComponent) []byte {
+		return c.locate(comp.id, comp.size)
+	})
 	procSetXStateFeaturesMask.Call(c.ptr(), uintptr(x.mask))
 }
 
@@ -174,21 +158,7 @@ func (c *hostContext) storeXState(fp []byte) {
 	}
 	var have uint64
 	procGetXStateFeaturesMask.Call(c.ptr(), uintptr(unsafe.Pointer(&have)))
-	bv := binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
-	for _, comp := range xstateComponents {
-		if x.mask&(1<<comp.id) == 0 || len(fp) < comp.offset+comp.size {
-			continue
-		}
-		if have&(1<<comp.id) == 0 {
-			// The thread holds the initial state of this component.
-			clear(fp[comp.offset : comp.offset+comp.size])
-			bv &^= 1 << comp.id
-			continue
-		}
-		if src := c.locate(comp.id, comp.size); src != nil {
-			copy(fp[comp.offset:comp.offset+comp.size], src)
-			bv |= 1 << comp.id
-		}
-	}
-	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], bv)
+	storeXStateComponents(fp, x.mask, have, func(comp xstateComponent) []byte {
+		return c.locate(comp.id, comp.size)
+	})
 }

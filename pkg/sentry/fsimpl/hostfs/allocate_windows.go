@@ -46,18 +46,10 @@ func allocateNative(f *os.File, mode uint64, off, length int64) error {
 	if mode&linux.FALLOC_FL_PUNCH_HOLE != 0 {
 		return fmt.Errorf("hostfs: fallocate: punch hole: %w", errHostUnsupported)
 	}
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return fmt.Errorf("hostfs: fallocate: %w", err)
-	}
-	var callErr error
-	if err := rc.Control(func(fd uintptr) {
-		callErr = reserve(windows.Handle(fd), mode&linux.FALLOC_FL_KEEP_SIZE == 0, off+length)
+	if err := withFileHandle(f, func(handle windows.Handle) error {
+		return reserve(handle, mode&linux.FALLOC_FL_KEEP_SIZE == 0, off+length)
 	}); err != nil {
 		return fmt.Errorf("hostfs: fallocate: %w", err)
-	}
-	if callErr != nil {
-		return fmt.Errorf("hostfs: fallocate: %w", callErr)
 	}
 	return nil
 }

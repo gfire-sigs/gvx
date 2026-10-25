@@ -29,6 +29,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
 )
 
@@ -47,9 +48,9 @@ type Context struct {
 	// needRestoreFP is true when the thread must load the vector state of ac at
 	// the next start: the Sentry changed it, or the thread is new.
 	needRestoreFP bool
-	// fpInThread is true while the vector state of the guest lives in the
+	// fpInStub is true while the vector state of the guest lives in the
 	// thread only, and ac holds an older copy. PullFullState reads it.
-	fpInThread bool
+	fpInStub bool
 }
 
 // threadIn returns the thread of c in as. It creates the thread on first use
@@ -77,7 +78,7 @@ func (c *Context) threadIn(as *addressSpace) (*thread, error) {
 	}
 	c.th.Store(th)
 	c.needRestoreFP = true
-	c.fpInThread = false
+	c.fpInStub = false
 	return th, nil
 }
 
@@ -121,7 +122,7 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 
 	loadFP := c.needRestoreFP
 	c.needRestoreFP = false
-	c.fpInThread = false
+	c.fpInStub = false
 	if err := th.start(ac, loadFP); err != nil {
 		return nil, hostarch.NoAccess, c.runErr(as, err)
 	}
@@ -162,7 +163,7 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 				}
 				// The stop copied the general-purpose registers. The vector
 				// registers stay in the parked thread until PullFullState.
-				c.fpInThread = true
+				c.fpInStub = true
 				return out.si, out.at, out.err
 			}
 		}
@@ -292,19 +293,19 @@ const (
 
 // Linux siginfo codes that the engine reports. The values are the Linux ABI.
 const (
-	illIllOpc  = 1
-	trapBrkpt  = 1
-	busAdrAln  = 1
-	busAdrErr  = 2
-	segvMapErr = 1
-	segvAccErr = 2
-	fpeIntDiv  = 1
-	fpeIntOvf  = 2
-	fpeFltDiv  = 3
-	fpeFltOvf  = 4
-	fpeFltUnd  = 5
-	fpeFltRes  = 6
-	fpeFltInv  = 7
+	illIllOpc  = hvcommon.IllIllOpc
+	trapBrkpt  = hvcommon.TrapBrkpt
+	busAdrAln  = hvcommon.BusAdrAln
+	busAdrErr  = hvcommon.BusAdrErr
+	segvMapErr = hvcommon.SegvMapErr
+	segvAccErr = hvcommon.SegvAccErr
+	fpeIntDiv  = hvcommon.FpeIntDiv
+	fpeIntOvf  = hvcommon.FpeIntOvf
+	fpeFltDiv  = hvcommon.FpeFltDiv
+	fpeFltOvf  = hvcommon.FpeFltOvf
+	fpeFltUnd  = hvcommon.FpeFltUnd
+	fpeFltRes  = hvcommon.FpeFltRes
+	fpeFltInv  = hvcommon.FpeFltInv
 )
 
 // Access kinds of ExceptionInformation[0] of an access violation.
@@ -438,11 +439,6 @@ func (as *addressSpace) mapped(addr uint64) bool {
 	return ok
 }
 
-// Interrupt implements platform.Context.Interrupt.
-func (c *Context) Interrupt() {
-	c.interrupt.NotifyInterrupt()
-}
-
 // NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt. The flag is
 // set before the state check, and Switch tests the flag after it starts the
 // thread, so one of the two sides always sees the other.
@@ -476,7 +472,7 @@ func (c *Context) stopThread(th *thread) {
 // the general-purpose registers, so this call reads the vector state from the
 // parked thread.
 func (c *Context) PullFullState(_ platform.AddressSpace, ac *arch.Context64) error {
-	if !c.fpInThread {
+	if !c.fpInStub {
 		return nil
 	}
 	th := c.th.Load()
@@ -497,39 +493,6 @@ func (c *Context) PullFullState(_ platform.AddressSpace, ac *arch.Context64) err
 		}
 		th.ctx.storeFP(ac)
 	}
-	c.fpInThread = false
+	c.fpInStub = false
 	return nil
 }
-
-// FullStateChanged implements platform.Context.FullStateChanged. The next
-// start loads the vector state from ac into the thread.
-func (c *Context) FullStateChanged() {
-	c.needRestoreFP = true
-	c.fpInThread = false
-}
-
-// Preempt implements platform.Context.Preempt. Switch never waits for a free
-// slot, so there is nothing to preempt.
-func (*Context) Preempt() {}
-
-// Release implements platform.Context.Release.
-func (c *Context) Release() {
-	if th := c.th.Swap(nil); th != nil {
-		th.destroy()
-	}
-}
-
-// PrepareSleep implements platform.Context.PrepareSleep.
-func (*Context) PrepareSleep() {}
-
-// PrepareUninterruptibleSleep implements platform.Context.PrepareUninterruptibleSleep.
-func (*Context) PrepareUninterruptibleSleep() {}
-
-// PrepareStop implements platform.Context.PrepareStop.
-func (*Context) PrepareStop() {}
-
-// PrepareExecve implements platform.Context.PrepareExecve.
-func (*Context) PrepareExecve() {}
-
-// PrepareExit implements platform.Context.PrepareExit.
-func (*Context) PrepareExit() {}

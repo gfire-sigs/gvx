@@ -19,22 +19,22 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
-// si_code values of SIGSEGV, SIGBUS, SIGILL and SIGFPE. The linux package
-// only defines the SIGTRAP and SI_* codes.
+// si_code values of SIGSEGV, SIGBUS, SIGILL and SIGFPE.
 const (
-	segvMapErr = 1
-	segvAccErr = 2
-	busAdrAln  = 1
-	busAdrErr  = 2
-	illIllOpc  = 1
-	illIllOpn  = 2
-	illIllTrp  = 4
-	fpeIntDiv  = 1
-	fpeIntOvf  = 2
-	fpeFltInv  = 7
+	segvMapErr = hvcommon.SegvMapErr
+	segvAccErr = hvcommon.SegvAccErr
+	busAdrAln  = hvcommon.BusAdrAln
+	busAdrErr  = hvcommon.BusAdrErr
+	illIllOpc  = hvcommon.IllIllOpc
+	illIllOpn  = hvcommon.IllIllOpn
+	illIllTrp  = hvcommon.IllIllTrp
+	fpeIntDiv  = hvcommon.FpeIntDiv
+	fpeIntOvf  = hvcommon.FpeIntOvf
+	fpeFltInv  = hvcommon.FpeFltInv
 )
 
 // trapKind tells the Switch loop what an exit from the stub means.
@@ -64,173 +64,117 @@ type trap struct {
 	hasAddr bool
 }
 
+// result converts a trap into the return values of Switch.
+func (t trap) result() runResult {
+	info := &linux.SignalInfo{Signo: int32(t.signo), Code: t.code}
+	if t.hasAddr {
+		info.SetAddr(t.addr)
+	}
+	return runResult{sig: info, at: t.access, err: platform.ErrContextSignal}
+}
+
 // Vectors of x86 exceptions.
 const (
-	x86VecDivide        = 0
-	x86VecDebug         = 1
-	x86VecNMI           = 2
-	x86VecBreakpoint    = 3
-	x86VecOverflow      = 4
-	x86VecBound         = 5
-	x86VecInvalidOpcode = 6
-	x86VecNoMath        = 7
-	x86VecDoubleFault   = 8
-	x86VecInvalidTSS    = 10
-	x86VecSegNotPresent = 11
-	x86VecStackSegment  = 12
-	x86VecGeneralProt   = 13
-	x86VecPageFault     = 14
-	x86VecX87           = 16
-	x86VecAlignment     = 17
-	x86VecMachineCheck  = 18
-	x86VecSIMD          = 19
+	x86VecDivide        = hvcommon.X86VecDivide
+	x86VecDebug         = hvcommon.X86VecDebug
+	x86VecNMI           = hvcommon.X86VecNMI
+	x86VecBreakpoint    = hvcommon.X86VecBreakpoint
+	x86VecOverflow      = hvcommon.X86VecOverflow
+	x86VecBound         = hvcommon.X86VecBound
+	x86VecInvalidOpcode = hvcommon.X86VecInvalidOpcode
+	x86VecNoMath        = hvcommon.X86VecNoMath
+	x86VecDoubleFault   = hvcommon.X86VecDoubleFault
+	x86VecInvalidTSS    = hvcommon.X86VecInvalidTSS
+	x86VecSegNotPresent = hvcommon.X86VecSegNotPresent
+	x86VecStackSegment  = hvcommon.X86VecStackSegment
+	x86VecGeneralProt   = hvcommon.X86VecGeneralProt
+	x86VecPageFault     = hvcommon.X86VecPageFault
+	x86VecX87           = hvcommon.X86VecX87
+	x86VecAlignment     = hvcommon.X86VecAlignment
+	x86VecMachineCheck  = hvcommon.X86VecMachineCheck
+	x86VecSIMD          = hvcommon.X86VecSIMD
 )
 
-// classifyX86 maps an exception of the amd64 stub to a signal. The mapping
-// follows the KVM platform so that applications see the same signals.
+// classifyX86 maps an exception of the amd64 stub to a signal.
 func classifyX86(vector, errCode, cr2, rip uint64) (trap, error) {
-	t := trap{kind: trapSignal, hasAddr: true, addr: rip}
-	switch vector {
-	case x86VecPageFault:
-		t.signo = linux.SIGSEGV
-		t.addr = cr2
-		t.access = hostarch.AccessType{
-			Read:    errCode&(1<<1) == 0,
-			Write:   errCode&(1<<1) != 0,
-			Execute: errCode&(1<<4) != 0,
-		}
-		t.code = segvMapErr
-		if errCode&1 != 0 {
-			t.code = segvAccErr
-		}
-	case x86VecDebug:
-		t.signo = linux.SIGTRAP
-		t.code = linux.TRAP_TRACE
-	case x86VecBreakpoint:
-		t.signo = linux.SIGTRAP
-		t.code = linux.SI_KERNEL
-		t.hasAddr, t.addr = false, 0
-	case x86VecGeneralProt, x86VecSegNotPresent, x86VecBound, x86VecInvalidTSS, x86VecStackSegment:
-		t.signo = linux.SIGSEGV
-		t.code = linux.SI_KERNEL
-	case x86VecInvalidOpcode, x86VecNoMath:
-		t.signo = linux.SIGILL
-		t.code = illIllOpc
-	case x86VecDivide:
-		t.signo = linux.SIGFPE
-		t.code = fpeIntDiv
-	case x86VecOverflow:
-		t.signo = linux.SIGFPE
-		t.code = fpeIntOvf
-	case x86VecX87, x86VecSIMD:
-		t.signo = linux.SIGFPE
-		t.code = fpeFltInv
-	case x86VecAlignment:
-		t.signo = linux.SIGBUS
-		t.code = busAdrAln
-		t.hasAddr, t.addr = false, 0
-	case x86VecNMI, x86VecDoubleFault, x86VecMachineCheck:
-		return trap{}, fmt.Errorf("whpx: unrecoverable guest exception, vector %d, error code %#x, rip %#x", vector, errCode, rip)
-	default:
-		t.signo = linux.SIGSEGV
-		t.code = linux.SI_KERNEL
+	sig, at, hasAddr, addr, err := hvcommon.ClassifyX86Exception(vector, errCode, cr2, rip)
+	if err != nil {
+		return trap{}, fmt.Errorf("whpx: %w", err)
 	}
-	return t, nil
+	return trap{
+		kind:    trapSignal,
+		signo:   linux.Signal(sig.Signo),
+		code:    sig.Code,
+		addr:    addr,
+		access:  at,
+		hasAddr: hasAddr,
+	}, nil
 }
 
 // ESR_EL1 exception classes that EL0 can raise.
 const (
-	esrECUnknown   = 0x00
-	esrECWFx       = 0x01
-	esrECFPAccess  = 0x07
-	esrECIllState  = 0x0E
-	esrECSVC64     = 0x15
-	esrECSysReg    = 0x18
-	esrECInstrAbrt = 0x20
-	esrECPCAlign   = 0x22
-	esrECDataAbrt  = 0x24
-	esrECSPAlign   = 0x26
-	esrECFPExc     = 0x2C
-	esrECSError    = 0x2F
-	esrECBrkptLow  = 0x30
-	esrECStepLow   = 0x32
-	esrECWatchLow  = 0x34
-	esrECBrk64     = 0x3C
+	esrECUnknown   = hvcommon.ECUnknown
+	esrECWFx       = hvcommon.ECWFx
+	esrECFPAccess  = hvcommon.ECFPAccess
+	esrECIllState  = hvcommon.ECIllegalState
+	esrECSVC64     = hvcommon.ECSVC64
+	esrECSysReg    = hvcommon.ECSysReg
+	esrECInstrAbrt = hvcommon.ECInstrAbortLower
+	esrECPCAlign   = hvcommon.ECPCAlignment
+	esrECDataAbrt  = hvcommon.ECDataAbortLower
+	esrECSPAlign   = hvcommon.ECSPAlignment
+	esrECFPExc     = hvcommon.ECFPExc64
+	esrECSError    = hvcommon.ECSError
+	esrECBrkptLow  = hvcommon.ECBreakpointLower
+	esrECStepLow   = hvcommon.ECSoftStepLower
+	esrECWatchLow  = hvcommon.ECWatchpointLower
+	esrECBrk64     = hvcommon.ECBRK64
 
-	esrECShift = 26
+	esrECShift = hvcommon.ESRECShift
 	esrWnR     = 1 << 6
 	esrCM      = 1 << 8
-	esrFSCMask = 0x3F
+	esrFSCMask = hvcommon.ESRFSCMask
 )
 
-// classifyA64 maps an exception of the arm64 stub to a system call, a signal
-// or a skipped instruction. slot is the vector table slot, esr and far are
-// the syndrome and fault address registers, and pc is ELR_EL1.
-func classifyA64(slot, esr, far, pc uint64) (trap, error) {
+// classifyA64 maps an exception of the arm64 stub to a system call, a signal,
+// or a skipped instruction.
+func classifyA64(slot, esr, far, pc, sp uint64) (trap, error) {
 	if slot != a64SlotLowA64Sync {
 		if slot == a64SlotLowA64SErr {
 			return trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, hasAddr: true, addr: pc}, nil
 		}
 		return trap{}, fmt.Errorf("whpx: unexpected arm64 exception vector slot %d, esr %#x, pc %#x", slot, esr, pc)
 	}
-	ec := esr >> esrECShift & 0x3F
-	t := trap{kind: trapSignal, hasAddr: true, addr: pc}
-	switch ec {
-	case esrECSVC64:
+	kind, sig, at := hvcommon.DecodeA64SyncException(esr, far, pc, sp)
+	switch kind {
+	case hvcommon.A64ExitSyscall:
 		return trap{kind: trapSyscall}, nil
-	case esrECWFx:
+	case hvcommon.A64ExitSkip:
 		return trap{kind: trapSkip}, nil
-	case esrECDataAbrt, esrECInstrAbrt:
-		t.addr = far
-		t.access = a64AccessType(esr)
-		fsc := esr & esrFSCMask
-		switch {
-		case fsc <= 0x03:
-			t.signo, t.code = linux.SIGSEGV, segvMapErr
-		case fsc >= 0x04 && fsc <= 0x07:
-			t.signo, t.code = linux.SIGSEGV, segvMapErr
-		case fsc == 0x21:
-			t.signo, t.code = linux.SIGBUS, busAdrAln
-		case fsc >= 0x09 && fsc <= 0x0F:
-			t.signo, t.code = linux.SIGSEGV, segvAccErr
-		default:
-			t.signo, t.code = linux.SIGBUS, busAdrErr
-		}
-	case esrECPCAlign, esrECSPAlign:
-		t.signo, t.code = linux.SIGBUS, busAdrAln
-		if ec == esrECPCAlign {
-			t.addr = far
-		}
-	case esrECSError:
-		t.signo, t.code = linux.SIGBUS, busAdrErr
-	case esrECFPExc:
-		t.signo, t.code = linux.SIGFPE, fpeFltInv
-	case esrECBrk64:
-		t.signo, t.code = linux.SIGTRAP, linux.TRAP_BRKPT
-	case esrECBrkptLow, esrECWatchLow:
-		t.signo, t.code = linux.SIGTRAP, linux.TRAP_HWBKPT
-	case esrECStepLow:
-		t.signo, t.code = linux.SIGTRAP, linux.TRAP_TRACE
-	case esrECUnknown, esrECIllState, esrECSysReg, esrECFPAccess:
-		t.signo, t.code = linux.SIGILL, illIllOpc
+	case hvcommon.A64ExitSysReg:
+		return trap{kind: trapSignal, signo: linux.SIGILL, code: illIllOpc, hasAddr: true, addr: pc}, nil
 	default:
-		t.signo, t.code = linux.SIGILL, illIllTrp
+		return trap{
+			kind:    trapSignal,
+			signo:   linux.Signal(sig.Signo),
+			code:    sig.Code,
+			addr:    sig.Addr(),
+			access:  at,
+			hasAddr: true,
+		}, nil
 	}
-	return t, nil
 }
 
 // emulateA64SysReg emulates an EL0 read of an ARM64 ID register or CTR_EL0 when
-// the lower-EL synchronous exception has EC = 0x18. It writes the result into
-// comm.Regs and reports true when the guest should skip the trapped instruction
-// and resume.
+// the lower-EL synchronous exception has EC = 0x18.
 func emulateA64SysReg(comm *CommPage, ids *hvcommon.IDRegisters) bool {
 	if comm.Vector != hvcommon.SlotLowerSync {
 		return false
 	}
-	if comm.FaultCode>>esrECShift&0x3F != esrECSysReg {
+	if hvcommon.ESREC(comm.ESR) != esrECSysReg {
 		return false
 	}
-	iss := hvcommon.DecodeSysRegISS(comm.FaultCode)
+	iss := hvcommon.DecodeSysRegISS(comm.ESR)
 	val, ok := ids.EmulateSysRegRead(iss)
 	if !ok {
 		return false
@@ -239,18 +183,4 @@ func emulateA64SysReg(comm *CommPage, ids *hvcommon.IDRegisters) bool {
 		comm.Regs[iss.Rt] = val
 	}
 	return true
-}
-
-// a64AccessType decodes the access of a data or instruction abort from ESR_EL1.
-func a64AccessType(esr uint64) hostarch.AccessType {
-	switch esr >> esrECShift & 0x3F {
-	case esrECInstrAbrt:
-		return hostarch.Execute
-	case esrECDataAbrt:
-		if esr&(esrWnR|esrCM) == esrWnR {
-			return hostarch.Write
-		}
-		return hostarch.Read
-	}
-	return hostarch.NoAccess
 }

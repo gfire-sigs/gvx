@@ -38,7 +38,7 @@ func newFakeAllocator() *fakeAllocator {
 	return &fakeAllocator{next: 0x1_0000_0000, live: make(map[uint64][]byte)}
 }
 
-func (a *fakeAllocator) allocPage() ([]byte, uint64, error) {
+func (a *fakeAllocator) AllocPage() ([]byte, uint64, error) {
 	a.calls++
 	if a.failAt != 0 && a.calls == a.failAt {
 		return nil, 0, errors.New("allocator failure")
@@ -52,7 +52,7 @@ func (a *fakeAllocator) allocPage() ([]byte, uint64, error) {
 	return page, ipa, nil
 }
 
-func (a *fakeAllocator) freePage(page []byte, ipa uint64) {
+func (a *fakeAllocator) FreePage(page []byte, ipa uint64) {
 	if a.live[ipa] == nil || &a.live[ipa][0] != &page[0] {
 		panic("freePage of a page that is not live")
 	}
@@ -196,26 +196,26 @@ func TestFreedTablePagesWaitForRecycle(t *testing.T) {
 	if !s.unmapRange(va, 2<<20) {
 		t.Fatal("unmapRange reported no invalidation")
 	}
-	if n := s.alloc.quarantined(); n != 1 {
+	if n := s.alloc.Quarantined(); n != 1 {
 		t.Fatalf("%d pages wait in quarantine, want the one table that the unmap emptied", n)
 	}
 	if tlbAfter, _ := s.generations(); tlbAfter != tlb+1 {
 		t.Errorf("TLB generation = %d, want %d", tlbAfter, tlb+1)
 	}
-	for _, p := range s.alloc.quarantine {
-		for _, r := range s.alloc.ready {
+	for _, p := range s.alloc.Quarantine {
+		for _, r := range s.alloc.Ready {
 			if p == r {
 				t.Fatal("a quarantined page is ready for reuse before recycle")
 			}
 		}
 	}
-	freed := slices.Clone(s.alloc.quarantine)
+	freed := slices.Clone(s.alloc.Quarantine)
 	s.recycle()
-	if n := s.alloc.quarantined(); n != 0 {
+	if n := s.alloc.Quarantined(); n != 0 {
 		t.Errorf("%d pages stay in quarantine after recycle", n)
 	}
 	for _, p := range freed {
-		if !slices.Contains(s.alloc.ready, p) {
+		if !slices.Contains(s.alloc.Ready, p) {
 			t.Error("a recycled page is not ready for reuse")
 		}
 		for _, v := range p {

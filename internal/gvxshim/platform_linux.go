@@ -5,33 +5,21 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 func authorizePeer(conn net.Conn) error {
-	sc, ok := conn.(syscall.Conn)
-	if !ok {
-		return errUnsafeEntry
-	}
-	raw, err := sc.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var peerErr error
-	err = raw.Control(func(fd uintptr) {
-		cred, err := unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	return authorizePeerWith(conn, func(fd int) (uint32, error) {
+		cred, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED)
 		if err != nil {
-			peerErr = err
-			return
+			return 0, err
 		}
-		peerErr = authorizeUID(cred.Uid, uint32(os.Geteuid()))
+		return cred.Uid, nil
 	})
-	return errors.Join(err, peerErr)
 }
 
-func bindPinnedSocket(dir *pinnedDir, name string) (_ net.Listener, err error) {
+func bindPinnedSocket(dir *pinnedDir, name string) (net.Listener, error) {
 	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
@@ -44,23 +32,5 @@ func bindPinnedSocket(dir *pinnedDir, name string) (_ net.Listener, err error) {
 	if err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, removeBoundSocket(dir, ref))
-		}
-	}()
-	if err := unix.Fchmodat(int(dir.Handle.Fd()), name, 0600, 0); err != nil {
-		return nil, errors.Join(err, file.Close())
-	}
-	if err := unix.Listen(fd, 32); err != nil {
-		return nil, errors.Join(err, file.Close())
-	}
-	listener, err := net.FileListener(file)
-	if err = errors.Join(err, file.Close()); err != nil {
-		if listener != nil {
-			err = errors.Join(err, listener.Close())
-		}
-		return nil, err
-	}
-	return listener, nil
+	return finishPinnedSocket(dir, name, fd, file, ref, 0)
 }

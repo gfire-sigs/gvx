@@ -34,11 +34,7 @@ func openLog(ctx context.Context, paths *instancePaths, diagnostics ownedEntry, 
 	s := &unixLogSink{paths: paths, diagnostics: file, timeout: writeTimeout}
 	info, err := paths.Bundle.Root.Lstat("log")
 	if err == nil {
-		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || info.Mode()&os.ModeNamedPipe == 0 || st.Uid != uint32(os.Geteuid()) || st.Nlink != 1 || info.Mode().Perm()&0022 != 0 {
-			return logOutput{}, errors.Join(errUnsafeEntry, file.Close())
-		}
-		id, idErr := platformInfoIdentity(info)
+		id, idErr := validateFIFOInfo(info)
 		if idErr != nil {
 			return logOutput{}, errors.Join(idErr, file.Close())
 		}
@@ -83,10 +79,9 @@ func (s *unixLogSink) Write(data []byte) (int, error) {
 	file := os.NewFile(uintptr(fd), "containerd log FIFO")
 	openedInfo, err := file.Stat()
 	if err == nil {
-		id, err = platformInfoIdentity(openedInfo)
+		id, err = validateFIFOInfo(openedInfo)
 	}
-	openedStat, ok := openedInfoSys(openedInfo)
-	if err != nil || id != *s.fifoID || !ok || openedStat.Uid != uint32(os.Geteuid()) || openedStat.Nlink != 1 || openedInfo.Mode()&os.ModeNamedPipe == 0 || openedInfo.Mode().Perm()&0022 != 0 {
+	if err != nil || id != *s.fifoID {
 		s.mu.Unlock()
 		return 0, errors.Join(errPathChanged, err, file.Close())
 	}
@@ -151,10 +146,13 @@ func (s *unixLogSink) Close() error {
 	return errors.Join(err, s.diagnostics.Close())
 }
 
-func openedInfoSys(info os.FileInfo) (*syscall.Stat_t, bool) {
+func validateFIFOInfo(info os.FileInfo) (fileIdentity, error) {
 	if info == nil {
-		return nil, false
+		return fileIdentity{}, errUnsafeEntry
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
-	return st, ok
+	if !ok || info.Mode()&os.ModeNamedPipe == 0 || st.Uid != uint32(os.Geteuid()) || st.Nlink != 1 || info.Mode().Perm()&0022 != 0 {
+		return fileIdentity{}, errUnsafeEntry
+	}
+	return platformInfoIdentity(info)
 }

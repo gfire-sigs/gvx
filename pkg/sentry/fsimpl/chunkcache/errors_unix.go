@@ -12,11 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux
+//go:build !windows
 
-package gvx
+package chunkcache
 
-// sharedChunkMemory is true on Linux. The upstream systrap platform runs guest
-// code in stub processes, and it maps a guest page by the descriptor of the
-// memory file. A chunk on the Go heap has no descriptor.
-const sharedChunkMemory = true
+import (
+	"errors"
+	"syscall"
+)
+
+// IsHostDiskFull reports whether err means that the host volume has no free
+// space or quota left.
+func IsHostDiskFull(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}

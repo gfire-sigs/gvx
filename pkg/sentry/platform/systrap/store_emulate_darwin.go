@@ -71,37 +71,14 @@ type storeRegs struct {
 // get returns a general-purpose register. Number 31 is the stack pointer when
 // sp is true, and the zero register otherwise.
 func (r storeRegs) get(n uint8, sp bool) uint64 {
-	switch {
-	case n == x18Reg:
-		return *r.x18
-	case n < 29:
-		return r.ss.X[n]
-	case n == 29:
-		return r.ss.FP
-	case n == 30:
-		return r.ss.LR
-	case sp:
-		return r.ss.SP
-	}
-	return 0
+	return r.ss.getReg(n, *r.x18, sp)
 }
 
 // set writes a register that a store updates: the base register of a
 // writeback form, or the status register of a store exclusive. Number 31 is the
 // stack pointer.
 func (r storeRegs) set(n uint8, v uint64) {
-	switch {
-	case n == x18Reg:
-		*r.x18 = v
-	case n < 29:
-		r.ss.X[n] = v
-	case n == 29:
-		r.ss.FP = v
-	case n == 30:
-		r.ss.LR = v
-	default:
-		r.ss.SP = v
-	}
+	r.ss.setReg(n, v, r.x18, true)
 }
 
 // decodeStore decodes the store forms that the Sentry runs: the single register

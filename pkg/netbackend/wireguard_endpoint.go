@@ -37,9 +37,6 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/icmp"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 )
 
 const (
@@ -414,20 +411,8 @@ func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.E
 }
 
 func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, error) {
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol,
-			ipv6.NewProtocol,
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-			icmp.NewProtocol4,
-			icmp.NewProtocol6,
-		},
-	})
-	if err := configureLoopbackNIC(s, LoopbackNICID); err != nil {
-		s.Close()
+	s, err := NewLoopbackStack()
+	if err != nil {
 		return nil, nil, err
 	}
 

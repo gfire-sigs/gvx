@@ -437,16 +437,26 @@ func (c *hostContext) registerSum() uint64 {
 	return h.Sum64()
 }
 
+// isX86Prefix reports whether b is a legacy instruction prefix or a REX prefix.
+func isX86Prefix(b byte) bool {
+	if b >= 0x40 && b <= 0x4F {
+		return true
+	}
+	switch b {
+	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
+		return true
+	}
+	return false
+}
+
 // hasFSPrefix reports whether the instruction at the start of code carries an
 // FS segment override prefix.
 func hasFSPrefix(code []byte) bool {
 	for _, b := range code {
-		switch {
-		case b == 0x64:
+		if b == 0x64 {
 			return true
-		case b == 0x65, b == 0x2E, b == 0x36, b == 0x3E, b == 0x26, b == 0x66, b == 0x67, b == 0xF0, b == 0xF2, b == 0xF3:
-		case b >= 0x40 && b <= 0x4F:
-		default:
+		}
+		if !isX86Prefix(b) {
 			return false
 		}
 	}
@@ -559,24 +569,14 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 // hasPrefixBefore reports whether the byte in front of page[off] is an
 // instruction prefix, a legacy prefix or REX.
 func hasPrefixBefore(before, page []byte, off int) bool {
-	var b byte
 	switch {
 	case off > 0:
-		b = page[off-1]
+		return isX86Prefix(page[off-1])
 	case len(before) > 0:
-		b = before[len(before)-1]
+		return isX86Prefix(before[len(before)-1])
 	default:
 		return false
 	}
-	switch {
-	case b >= 0x40 && b <= 0x4F:
-		return true
-	}
-	switch b {
-	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
-		return true
-	}
-	return false
 }
 
 // newWinTrap describes the trap of the SYSCALL at site.
@@ -612,21 +612,3 @@ func (th *thread) archFastGetFP(f *fastThread, ac *arch.Context64) error {
 	f.slot.sm.storeVector(ac)
 	return nil
 }
-
-// probeProgram returns the guest code of Probe: calls system calls with
-// number 5, then one with number 6.
-func probeProgram(calls int) []byte {
-	n := uint32(calls)
-	return []byte{
-		0x41, 0xBC, byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24), // mov r12d, calls
-		0xB8, 5, 0, 0, 0, // loop: mov eax, 5
-		0x0F, 0x05, // syscall
-		0x41, 0xFF, 0xCC, // dec r12d
-		0x75, 0xF4, // jnz loop
-		0xB8, 6, 0, 0, 0, // mov eax, 6
-		0x0F, 0x05, // syscall
-	}
-}
-
-// probeSyscallNumber returns the number of the system call that stopped the guest.
-func probeSyscallNumber(ac *arch.Context64) uint64 { return ac.StateData().Regs.Orig_rax }

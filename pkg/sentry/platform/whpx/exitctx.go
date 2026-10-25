@@ -107,6 +107,14 @@ func (e exitInfo) String() string {
 	return fmt.Sprintf("exit reason %#x at pc %#x", e.reason, e.pc)
 }
 
+// inKernel reports whether the guest was in kernel mode at the exit.
+func (e exitInfo) inKernel(arm64 bool) bool {
+	if arm64 {
+		return e.cpsr&a64PstateModeMask != 0
+	}
+	return e.cpl != 3
+}
+
 // decodeExitX64 decodes an x64 exit context.
 func decodeExitX64(buf []byte) (exitInfo, error) {
 	if len(buf) < exitCtxSizeX64 {

@@ -32,6 +32,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
 )
 
@@ -63,10 +64,7 @@ const (
 	darwinSIGEMT  = 7
 )
 
-var (
-	errNoAddressSpace = &platform.ContextError{Err: errors.New("no stub address space"), Errno: unix.EFAULT}
-	errDeadContext    = &platform.ContextError{Err: errDeadStub, Errno: unix.ECHILD}
-)
+var errDeadContext = &platform.ContextError{Err: errDeadStub, Errno: unix.ECHILD}
 
 // thread is one guest thread: a Mach thread of a stub task.
 type thread struct {
@@ -317,14 +315,6 @@ func (th *thread) tryCapture() bool {
 	return true
 }
 
-// inPatchedCode reports whether pc lies in a patched copy that the stub runs.
-func (as *addressSpace) inPatchedCode(pc uint64) bool {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	blk := as.blocks[blockRound(pc)]
-	return blk != nil && blk.state == blockExec
-}
-
 // threadIn returns the thread of c in as. It creates the thread on first use
 // and replaces a thread of an earlier address space.
 func (c *Context) threadIn(as *addressSpace) (*thread, error) {
@@ -442,18 +432,7 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 
 // msrValue returns the value that a trapped `msr tpidr_el0, xN` writes.
 func msrValue(sm *sysmsg, reg uint8) uint64 {
-	switch {
-	case reg == 31:
-		return 0
-	case reg == x18Reg:
-		return sm.X18
-	case reg < 29:
-		return sm.MC.SS.X[reg]
-	case reg == 29:
-		return sm.MC.SS.FP
-	default:
-		return sm.MC.SS.LR
-	}
+	return sm.MC.SS.getReg(reg, sm.X18, false)
 }
 
 // prepareResume writes the state of ac into the sysmsg and returns the resume
@@ -518,39 +497,19 @@ func (c *Context) pull(th *thread, ac *arch.Context64, pc uint64, kind uint32) {
 	c.fpInStub = true
 }
 
-// fpHeaderSize is the size of the fpsimd_context header that precedes the
-// FPSR, FPCR and vector registers in the Sentry's floating point state.
-const (
-	fpsrOffset  = 8
-	fpcrOffset  = 12
-	vregsOffset = 16
-)
-
 // loadFP copies the vector state of the sysmsg into the Sentry's state.
 func loadFP(dst *arch.Context64, ns *armNeonState) {
-	fp := *dst.FloatingPointData()
-	putUint32(fp[fpsrOffset:], ns.FPSR)
-	putUint32(fp[fpcrOffset:], ns.FPCR)
-	for i := range ns.V {
-		copy(fp[vregsOffset+16*i:], ns.V[i][:])
-	}
+	vec := unsafe.Slice((*byte)(unsafe.Pointer(&ns.V[0][0])), 32*16)
+	copyFPToArch(dst, vec, ns.FPSR, ns.FPCR)
 }
 
 // storeFP copies the Sentry's vector state into the sysmsg.
 func storeFP(ns *armNeonState, ac *arch.Context64) {
-	fp := *ac.FloatingPointData()
-	ns.FPSR = getUint32(fp[fpsrOffset:])
-	ns.FPCR = getUint32(fp[fpcrOffset:])
-	for i := range ns.V {
-		copy(ns.V[i][:], fp[vregsOffset+16*i:vregsOffset+16*i+16])
+	vec := unsafe.Slice((*byte)(unsafe.Pointer(&ns.V[0][0])), 32*16)
+	if fpsr, fpcr, ok := copyFPFromArch(vec, ac); ok {
+		ns.FPSR = fpsr
+		ns.FPCR = fpcr
 	}
-}
-
-func putUint32(b []byte, v uint32) {
-	b[0], b[1], b[2], b[3] = byte(v), byte(v>>8), byte(v>>16), byte(v>>24)
-}
-func getUint32(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 }
 
 // PullFullState implements platform.Context.PullFullState.
@@ -565,12 +524,6 @@ func (c *Context) PullFullState(as platform.AddressSpace, ac *arch.Context64) er
 	loadFP(ac, &th.sm.MC.NS)
 	c.fpInStub = false
 	return nil
-}
-
-// FullStateChanged implements platform.Context.FullStateChanged.
-func (c *Context) FullStateChanged() {
-	c.needRestoreFP = true
-	c.fpInStub = false
 }
 
 // signalAction is the outcome of a signal stop.
@@ -714,37 +667,34 @@ func faultSignal(darwinSig uint64, esr uint32) (linux.Signal, int32) {
 	const (
 		dfscMask      = 0x3f
 		dfscAlignment = 0x21
-		segvMapErr    = 1
-		segvAccErr    = 2
-		busAdrAln     = 1
 	)
 	if esr&dfscMask == dfscAlignment {
-		return linux.SIGBUS, busAdrAln
+		return linux.SIGBUS, hvcommon.BusAdrAln
 	}
 	if darwinSig == darwinSIGSEGV {
-		return linux.SIGSEGV, segvMapErr
+		return linux.SIGSEGV, hvcommon.SegvMapErr
 	}
-	return linux.SIGSEGV, segvAccErr
+	return linux.SIGSEGV, hvcommon.SegvAccErr
 }
 
 func linuxFPECode(darwin int32) int32 {
 	switch darwin {
 	case 1:
-		return 3 // FPE_FLTDIV
+		return hvcommon.FpeFltDiv
 	case 2:
-		return 4 // FPE_FLTOVF
+		return hvcommon.FpeFltOvf
 	case 3:
-		return 5 // FPE_FLTUND
+		return hvcommon.FpeFltUnd
 	case 4:
-		return 6 // FPE_FLTRES
+		return hvcommon.FpeFltRes
 	case 5:
-		return 7 // FPE_FLTINV
+		return hvcommon.FpeFltInv
 	case 6:
 		return 8 // FPE_FLTSUB
 	case 7:
-		return 1 // FPE_INTDIV
+		return hvcommon.FpeIntDiv
 	case 8:
-		return 2 // FPE_INTOVF
+		return hvcommon.FpeIntOvf
 	}
 	return 0
 }
@@ -767,17 +717,7 @@ func emulateARM64MRS(as *addressSpace, sm *sysmsg, pc uint64) bool {
 	if !ok {
 		return false
 	}
-	switch {
-	case rt == 31:
-	case rt == x18Reg:
-		sm.X18 = val
-	case rt < 29:
-		sm.MC.SS.X[rt] = val
-	case rt == 29:
-		sm.MC.SS.FP = val
-	case rt == 30:
-		sm.MC.SS.LR = val
-	}
+	sm.MC.SS.setReg(rt, val, &sm.X18, false)
 	sm.MC.SS.PC = pc + 4
 	return true
 }
@@ -801,11 +741,6 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, sig uint64, ec uin
 	return signalAction{si: si, at: at, err: platform.ErrContextSignal}
 }
 
-// Interrupt implements platform.Context.Interrupt.
-func (c *Context) Interrupt() {
-	c.interrupt.NotifyInterrupt()
-}
-
 // NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt. The flag is
 // set before the state check, and Switch tests the flag after it resumes the
 // thread, so one of the two sides always sees the other.
@@ -815,29 +750,3 @@ func (c *Context) NotifyInterrupt() {
 		th.forceStop()
 	}
 }
-
-// Preempt implements platform.Context.Preempt. Switch never waits for a free
-// slot, so there is nothing to preempt.
-func (*Context) Preempt() {}
-
-// Release implements platform.Context.Release.
-func (c *Context) Release() {
-	if th := c.th.Swap(nil); th != nil {
-		th.destroy()
-	}
-}
-
-// PrepareSleep implements platform.Context.PrepareSleep.
-func (*Context) PrepareSleep() {}
-
-// PrepareUninterruptibleSleep implements platform.Context.PrepareUninterruptibleSleep.
-func (*Context) PrepareUninterruptibleSleep() {}
-
-// PrepareStop implements platform.Context.PrepareStop.
-func (*Context) PrepareStop() {}
-
-// PrepareExecve implements platform.Context.PrepareExecve.
-func (*Context) PrepareExecve() {}
-
-// PrepareExit implements platform.Context.PrepareExit.
-func (*Context) PrepareExit() {}

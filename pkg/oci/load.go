@@ -89,18 +89,12 @@ func (a *archive) register(arch string) ([]LoadedImage, error) {
 	if err := a.index(); err != nil {
 		return nil, err
 	}
-	if _, ok := a.members["index.json"]; ok {
-		raw, err := a.readJSON("index.json")
-		if err != nil {
-			return nil, err
-		}
-		var idx ImageIndex
-		if err := json.Unmarshal(raw, &idx); err == nil && len(idx.Manifests) > 0 {
-			return a.registerOCILayout(idx, arch)
-		}
-		if _, ok := a.members["oci-layout"]; ok {
-			return nil, errors.New("oci: archive has an oci-layout marker but index.json lists no manifests")
-		}
+	_, idx, ok, err := a.readIndexManifests()
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return a.registerOCILayout(idx, arch)
 	}
 	if _, ok := a.members["manifest.json"]; ok {
 		return a.registerDockerSave(arch)

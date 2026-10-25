@@ -14,20 +14,24 @@
 
 package whpx
 
-import "unsafe"
+import (
+	"unsafe"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
+)
 
 const (
-	pageSize  = 4096
+	pageSize  = hvcommon.PageSize4K
 	pageShift = 12
-	pageMask  = pageSize - 1
+	pageMask  = hvcommon.PageMask4K
 
 	// minUserAddr is the lowest address the Sentry maps for applications.
-	minUserAddr = 0x10000
+	minUserAddr = hvcommon.MinUserAddr
 
 	// maxUserAddrX64 and maxUserAddrA64 bound the lower canonical halves of
 	// 4-level paging and of a 48-bit TTBR0 region.
-	maxUserAddrX64 = 1 << 47
-	maxUserAddrA64 = 1 << 48
+	maxUserAddrX64 = hvcommon.MaxUserAddrX64
+	maxUserAddrA64 = hvcommon.MaxUserAddrA64
 
 	// Guest physical addresses stay below 64 GiB, so every host with a
 	// physical address width of 36 bits or more can back them. The first GiB
@@ -109,44 +113,29 @@ const (
 )
 
 // CommPage is the 4KB page that the in-partition stub and the Sentry share.
-//
-// The stub spills user registers here and the Sentry writes the registers
-// for the next return here. Floating-point and vector state stays inside the
-// virtual processor on the fast path.
-//
-// On amd64, Regs holds RAX, RCX, RDX, RBX, a placeholder for RSP, RBP, RSI,
-// RDI and R8 to R15 at the hardware register numbers. On arm64, Regs holds
-// X0 to X30.
 type CommPage struct {
-	Regs           [31]uint64
-	SP             uint64
-	PC             uint64
-	PstateOrRflags uint64
-	TLS            uint64
-	FaultAddr      uint64
-	FaultCode      uint64
-	Vector         uint64
-	CS             uint64
-	SS             uint64
-	Root           uint64
-	ExitReason     uint32
-	Flags          uint32
-	_              [commTSSOff - commEnd]byte
-	TSS            [commTSSSize]byte
-	_              [pageSize - commTSSOff - commTSSSize]byte
+	hvcommon.CommHeader
+	CS         uint64
+	SS         uint64
+	Root       uint64
+	ExitReason uint32
+	Flags      uint32
+	_          [commTSSOff - commEnd]byte
+	TSS        [commTSSSize]byte
+	_          [pageSize - commTSSOff - commTSSSize]byte
 }
 
 // Byte offsets inside CommPage. The stubs encode them, so TestCommPageOffsets
 // pins them to the struct.
 const (
-	commOffRegs       = 0x000
-	commOffSP         = 0x0F8
-	commOffPC         = 0x100
-	commOffPstate     = 0x108
-	commOffTLS        = 0x110
-	commOffFaultAddr  = 0x118
-	commOffFaultCode  = 0x120
-	commOffVector     = 0x128
+	commOffRegs       = hvcommon.CommOffRegs
+	commOffSP         = hvcommon.CommOffSP
+	commOffPC         = hvcommon.CommOffPC
+	commOffPstate     = hvcommon.CommOffPstate
+	commOffTLS        = hvcommon.CommOffTLS
+	commOffFaultAddr  = hvcommon.CommOffFaultAddr
+	commOffFaultCode  = hvcommon.CommOffESR
+	commOffVector     = hvcommon.CommOffVector
 	commOffCS         = 0x130
 	commOffSS         = 0x138
 	commOffRoot       = 0x140

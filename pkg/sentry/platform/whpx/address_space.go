@@ -73,8 +73,8 @@ func newAddressSpace(p *Platform) (*AddressSpace, error) {
 		alloc:  newPTAllocator(p.pool),
 		active: make(map[*vcpu]struct{}),
 	}
-	if err := as.alloc.reserve(2); err != nil {
-		as.alloc.drain()
+	if err := as.alloc.Reserve(2); err != nil {
+		as.alloc.Drain()
 		return nil, fmt.Errorf("whpx: reserve page tables: %w", err)
 	}
 	as.pt = pagetables.NewWithUpper(as.alloc, p.kernelPageTables(), uintptr(p.kernel.layout.base))
@@ -189,22 +189,22 @@ func (as *AddressSpace) install(addr hostarch.Addr, runs []gpaRun, at hostarch.A
 	if as.released {
 		return platform.SegmentationFault{Addr: addr}
 	}
-	if err := as.alloc.reserve(ptReserveForRuns(runs)); err != nil {
+	if err := as.alloc.Reserve(ptReserveForRuns(runs)); err != nil {
 		return fmt.Errorf("whpx: reserve page tables: %w", err)
 	}
 	opts := userPageOpts(at)
 	replaced := false
 	va := uint64(addr)
 	for _, r := range runs {
-		if as.pt.Map(hostarch.Addr(va), uintptr(r.size), opts, uintptr(r.gpa)) {
+		if as.pt.Map(hostarch.Addr(va), uintptr(r.Size), opts, uintptr(r.GPA)) {
 			replaced = true
 		}
-		va += r.size
+		va += r.Size
 	}
 	if at.Execute {
 		as.execGen.Add(1)
 	}
-	if replaced || as.alloc.quarantined() > 0 {
+	if replaced || as.alloc.Quarantined() > 0 {
 		as.invalidate()
 	}
 	return nil
@@ -228,12 +228,12 @@ func (as *AddressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	// A range that starts or ends inside a large entry splits the entry. The
 	// split needs page-table pages. A failure here leaves entries that the
 	// guest can still use, so it stops the program.
-	if err := as.alloc.reserve(ptSplitReserve); err != nil {
+	if err := as.alloc.Reserve(ptSplitReserve); err != nil {
 		log.Warningf("whpx: %v", err)
 		panic(fmt.Sprintf("whpx: cannot reserve page tables to unmap guest memory: %v", err))
 	}
 	removed := as.pt.Unmap(hostarch.Addr(start), uintptr(end-start))
-	if removed || as.alloc.quarantined() > 0 {
+	if removed || as.alloc.Quarantined() > 0 {
 		as.invalidate()
 	}
 }
@@ -250,7 +250,7 @@ func (as *AddressSpace) Release() {
 	as.pt.Unmap(0, uintptr(as.p.maxUser()))
 	as.invalidate()
 	as.forgetIdleRoots()
-	as.alloc.drain()
+	as.alloc.Drain()
 }
 
 // forgetIdleRoots invalidates the state of every idle processor that still

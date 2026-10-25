@@ -26,31 +26,32 @@ import (
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/erofs"
 )
 
 // On-disk constants of the EROFS format that the compiler emits.
 const (
-	erofsInodeLayoutExtended = 1
+	erofsInodeLayoutExtended = erofs.InodeLayoutExtended
 
-	erofsDataLayoutFlatPlain  = 0
-	erofsDataLayoutFlatInline = 2
-	erofsDataLayoutChunkBased = 4
+	erofsDataLayoutFlatPlain  = erofs.InodeDataLayoutFlatPlain
+	erofsDataLayoutFlatInline = erofs.InodeDataLayoutFlatInline
+	erofsDataLayoutChunkBased = erofs.InodeDataLayoutChunkBased
 
 	// erofsFeatureIncompatChunkedFile is required by chunk-based inodes.
-	erofsFeatureIncompatChunkedFile = 0x4
+	erofsFeatureIncompatChunkedFile = erofs.FeatureIncompatChunkedFile
 
-	erofsXattrIbodyHeaderSize = 12
-	erofsXattrEntryHeaderSize = 4
-	erofsXattrAlign           = 4
+	erofsXattrIbodyHeaderSize = erofs.XattrIbodyHeaderSize
+	erofsXattrEntryHeaderSize = erofs.XattrEntryHeaderSize
+	erofsXattrAlign           = erofs.XattrAlign
 
-	erofsXattrIndexUser            = 1
-	erofsXattrIndexPosixACLAccess  = 2
-	erofsXattrIndexPosixACLDefault = 3
-	erofsXattrIndexTrusted         = 4
-	erofsXattrIndexSecurity        = 6
+	erofsXattrIndexUser            = erofs.XattrIndexUser
+	erofsXattrIndexPosixACLAccess  = erofs.XattrIndexPosixACLAccess
+	erofsXattrIndexPosixACLDefault = erofs.XattrIndexPosixACLDefault
+	erofsXattrIndexTrusted         = erofs.XattrIndexTrusted
+	erofsXattrIndexSecurity        = erofs.XattrIndexSecurity
 
-	erofsNullAddr = math.MaxUint32
-	erofsMaxName  = 255
+	erofsNullAddr = erofs.NullAddr
+	erofsMaxName  = erofs.MaxNameLen
 	// maxSymlinkTarget is PATH_MAX. Longer targets are invalid on Linux.
 	maxSymlinkTarget = 4096
 	erofsInodeAlign  = 1 << EROFSInodeSlotBits
@@ -121,10 +122,7 @@ func splitXattrName(name string) (index uint8, suffix string) {
 // xattrIcount returns the i_xattr_icount field for an inline xattr area. The
 // 12-byte header counts as one 4-byte unit.
 func xattrIcount(ibody []byte) uint16 {
-	if len(ibody) == 0 {
-		return 0
-	}
-	return uint16((len(ibody)-erofsXattrIbodyHeaderSize)/erofsXattrAlign + 1)
+	return erofs.XattrIcount(uint32(len(ibody)))
 }
 
 // direntType returns the EROFS directory entry file type for mode.

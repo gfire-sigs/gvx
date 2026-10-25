@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux && !darwin && !windows
+//go:build !darwin && !windows
 
 package hostfs
 
-// newWatchBackend returns the host watcher backend of a Unix host that has no
-// native backend. It is the revalidator of watcher_poll.go.
+// newWatchBackend returns the host watcher backend when no native backend is
+// used. It is the revalidator of watcher_poll.go. On Linux, the seccomp rule
+// set that the Sentry installs after hostlockdown.Apply allows openat with
+// O_NOFOLLOW below a descriptor, fstatat, getdents64, and close; a scan uses
+// nothing else.
 func newWatchBackend(hw *hostWatcher) (watchBackend, error) {
 	return newPollBackend(hw), nil
 }

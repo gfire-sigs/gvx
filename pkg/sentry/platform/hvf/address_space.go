@@ -103,12 +103,12 @@ func (as *AddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	}()
 	va := uint64(addr)
 	for _, s := range segs {
-		inv, err := as.pt.mapRange(va, s.ipa, s.length, at)
+		inv, err := as.pt.mapRange(va, s.GPA, s.Size, at)
 		invalidated = invalidated || inv
 		if err != nil {
 			return err
 		}
-		va += s.length
+		va += s.Size
 	}
 	return nil
 }

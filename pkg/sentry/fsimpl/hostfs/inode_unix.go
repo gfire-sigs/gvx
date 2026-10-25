@@ -325,20 +325,26 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 	return statToHostInfo(&st), nil
 }
 
-func (h *hostRoot) fstat(f *os.File) (hostInfo, error) {
+// withFileFD runs fn with the descriptor of f and keeps f open until fn
+// returns.
+func withFileFD(f *os.File, fn func(fd int) error) error {
 	rc, err := f.SyscallConn()
 	if err != nil {
-		return hostInfo{}, fmt.Errorf("hostfs: fstat: %w", err)
+		return err
 	}
+	var fnErr error
+	if err := rc.Control(func(fd uintptr) { fnErr = fn(int(fd)) }); err != nil {
+		return err
+	}
+	return fnErr
+}
+
+func (h *hostRoot) fstat(f *os.File) (hostInfo, error) {
 	var st unix.Stat_t
-	var statErr error
-	if err := rc.Control(func(fd uintptr) {
-		statErr = retryEINTR(func() error { return unix.Fstat(int(fd), &st) })
+	if err := withFileFD(f, func(fd int) error {
+		return retryEINTR(func() error { return unix.Fstat(fd, &st) })
 	}); err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: fstat: %w", err)
-	}
-	if statErr != nil {
-		return hostInfo{}, fmt.Errorf("hostfs: fstat: %w", statErr)
 	}
 	return statToHostInfo(&st), nil
 }
@@ -380,9 +386,9 @@ func (h *hostRoot) unlinkat(rel string, flags int) error {
 	return nil
 }
 
-func (h *hostRoot) rename(oldRel, newRel string) error {
+func (h *hostRoot) withTwoParents(op, prep, oldRel, newRel string, rootErr error, fn func(oldDir int, oldName string, newDir int, newName string) error) error {
 	if oldRel == "." || newRel == "." {
-		return fmt.Errorf("hostfs: rename %q to %q: %w", oldRel, newRel, unix.EBUSY)
+		return fmt.Errorf("hostfs: %s %q %s %q: %w", op, oldRel, prep, newRel, rootErr)
 	}
 	oldParent, oldName, releaseOld, err := h.walkParent(oldRel)
 	if err != nil {
@@ -394,31 +400,21 @@ func (h *hostRoot) rename(oldRel, newRel string) error {
 		return err
 	}
 	defer releaseNew()
-	if err := retryEINTR(func() error { return unix.Renameat(oldParent, oldName, newParent, newName) }); err != nil {
-		return fmt.Errorf("hostfs: rename %q to %q: %w", oldRel, newRel, err)
+	if err := retryEINTR(func() error { return fn(oldParent, oldName, newParent, newName) }); err != nil {
+		return fmt.Errorf("hostfs: %s %q %s %q: %w", op, oldRel, prep, newRel, err)
 	}
 	return nil
 }
 
+func (h *hostRoot) rename(oldRel, newRel string) error {
+	return h.withTwoParents("rename", "to", oldRel, newRel, unix.EBUSY, unix.Renameat)
+}
+
 func (h *hostRoot) link(oldRel, newRel string) error {
-	if oldRel == "." || newRel == "." {
-		return fmt.Errorf("hostfs: link %q to %q: %w", oldRel, newRel, unix.EPERM)
-	}
-	oldParent, oldName, releaseOld, err := h.walkParent(oldRel)
-	if err != nil {
-		return err
-	}
-	defer releaseOld()
-	newParent, newName, releaseNew, err := h.walkParent(newRel)
-	if err != nil {
-		return err
-	}
-	defer releaseNew()
 	// Flags 0 links a symbolic link itself and never its target.
-	if err := retryEINTR(func() error { return unix.Linkat(oldParent, oldName, newParent, newName, 0) }); err != nil {
-		return fmt.Errorf("hostfs: link %q to %q: %w", oldRel, newRel, err)
-	}
-	return nil
+	return h.withTwoParents("link", "to", oldRel, newRel, unix.EPERM, func(oldDir int, oldName string, newDir int, newName string) error {
+		return unix.Linkat(oldDir, oldName, newDir, newName, 0)
+	})
 }
 
 func (h *hostRoot) readlink(rel string) (string, error) {
@@ -461,32 +457,27 @@ func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: read directory %q: %w", rel, err)
 	}
-	rc, err := dir.SyscallConn()
-	if err != nil {
-		return nil, fmt.Errorf("hostfs: read directory %q: %w", rel, err)
-	}
 	out := make([]hostDirEntry, 0, len(names))
-	var entryErr error
-	if err := rc.Control(func(fd uintptr) {
+	if err := withFileFD(dir, func(fd int) error {
 		for _, name := range names {
 			var st unix.Stat_t
-			serr := retryEINTR(func() error { return unix.Fstatat(int(fd), name, &st, unix.AT_SYMLINK_NOFOLLOW) })
+			serr := retryEINTR(func() error { return unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW) })
 			if errors.Is(serr, unix.ENOENT) {
 				// The entry vanished after listing: a concurrent unlink.
 				continue
 			}
 			if serr != nil {
-				entryErr = fmt.Errorf("hostfs: lstat %q in %q: %w", name, rel, serr)
-				return
+				return fmt.Errorf("hostfs: lstat %q in %q: %w", name, rel, serr)
 			}
 			info := statToHostInfo(&st)
 			out = append(out, hostDirEntry{name: name, kind: info.kind, ino: info.id.ino})
 		}
+		return nil
 	}); err != nil {
+		if strings.HasPrefix(err.Error(), "hostfs: lstat ") {
+			return nil, err
+		}
 		return nil, fmt.Errorf("hostfs: read directory %q: %w", rel, err)
-	}
-	if entryErr != nil {
-		return nil, entryErr
 	}
 	return out, nil
 }

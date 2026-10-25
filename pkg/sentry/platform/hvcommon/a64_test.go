@@ -68,6 +68,14 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{"eret", ERET, "ERET "},
 		{"isb", ISB, "ISB SY"},
 		{"tlbi vmalle1", TLBIVMALLE1, "TLBI VMALLE1"},
+		{"movk", MOVK(3, 0xABCD, 16), "MOVK X3, #0xabcd, LSL #16"},
+		{"mov reg", MOVReg(4, 17), "MOV X4, X17"},
+		{"br", BR(16), "BR X16"},
+		{"blr", BLR(17), "BLR X17"},
+		{"tbnz", TBNZ(0, 0, 0x10), "TBNZ W0, #0, .+0x10"},
+		{"brk", BRK(1), "BRK #0x1"},
+		{"nop", NOP, "NOP "},
+		{"svc #0", SVC0, "SVC #0x0"},
 	} {
 		if got := decodeA64(t, c.word); got != c.want {
 			t.Errorf("%s: %#x decodes as %q, want %q", c.name, c.word, got, c.want)

@@ -19,6 +19,8 @@ package systrap
 import (
 	"encoding/binary"
 	"fmt"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // The arm64 patcher rewrites four instruction classes of a Linux guest.
@@ -32,22 +34,17 @@ import (
 // their cache maintenance loops. macOS raises SIGILL on that read, so
 // `mrs xN, ctr_el0` becomes a branch to a slot that loads a constant.
 const (
-	arm64SVC0       = 0xd4000001
+	arm64SVC0       = hvcommon.SVC0
 	arm64MRSTPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
 	arm64MRSCTR     = 0xd53b0020 // mrs xN, ctr_el0 with N in bits 4:0.
-	arm64MOVZ       = 0xd2800000 // movz xN, #imm16 with imm16 in bits 20:5.
-	arm64MOVKLSL16  = 0xf2a00000 // movk xN, #imm16, lsl #16 with imm16 in bits 20:5.
 	arm64MSRTPIDR   = 0xd51bd040 // msr tpidr_el0, xN with N in bits 4:0.
 	arm64RegMask    = 0x1f
-	arm64NOP        = 0xd503201f
+	arm64NOP        = hvcommon.NOP
 	arm64ADRx17     = 0x10000000 | 17
 	arm64LDRLitx16  = 0x58000000 | 16
-	arm64BRx16      = 0xd61f0200
 	arm64B          = 0x14000000
 	arm64MRSTPIDRRO = 0xd53bd060 // mrs xN, tpidrro_el0
 	arm64ANDxMinus8 = 0x927df000 // and xN, xN, #0xfffffffffffffff8
-	arm64STRx       = 0xf9000000 // str xT, [xN, #imm12*8]
-	arm64LDRx       = 0xf9400000 // ldr xT, [xN, #imm12*8]
 
 	// arm64ScratchReg is the hardware x18 register, which holds no guest value
 	// on macOS because scanX18 moves guest x18 accesses to sysmsg.X18.
@@ -75,7 +72,7 @@ const (
 	// instruction and data cache lines, the line size that Apple silicon reports.
 	// A guest uses the value only to step through cache maintenance by address,
 	// and a line size at or below the real one only costs extra iterations.
-	ctrEL0Value = 0x8444c004
+	ctrEL0Value = hvcommon.DefaultCTREL0
 )
 
 // siteKind classifies a patched instruction.
@@ -187,21 +184,19 @@ func encodeTrapSlot(buf []byte, slotVA, retPC, spill uint64) error {
 	const (
 		ptr0 = arm64MRSTPIDRRO | arm64ScratchReg
 		ptr1 = arm64ANDxMinus8 | arm64ScratchReg<<5 | arm64ScratchReg
-		off0 = (trapScratchOffset / 8) << 10
-		off1 = ((trapScratchOffset + 8) / 8) << 10
 	)
 	words := [...]uint32{
 		ptr0,
 		ptr1,
-		arm64STRx | off0 | arm64ScratchReg<<5 | 16,
-		arm64STRx | off1 | arm64ScratchReg<<5 | 17,
+		hvcommon.STRX(arm64ScratchReg, 16, trapScratchOffset),
+		hvcommon.STRX(arm64ScratchReg, 17, trapScratchOffset+8),
 		arm64ADRx17 | uint32((trapSlotTailOffset-16)>>2)<<5,   // adr x17, tail: byte offset 28.
 		arm64LDRLitx16 | uint32((trapSlotLitOffset-20)>>2)<<5, // ldr x16, [pc, +28].
-		arm64BRx16,
+		hvcommon.BR(16),
 		ptr0,
 		ptr1,
-		arm64LDRx | off0 | arm64ScratchReg<<5 | 16,
-		arm64LDRx | off1 | arm64ScratchReg<<5 | 17,
+		hvcommon.LDRX(arm64ScratchReg, 16, trapScratchOffset),
+		hvcommon.LDRX(arm64ScratchReg, 17, trapScratchOffset+8),
 		back,
 	}
 	for i, w := range words {
@@ -211,39 +206,57 @@ func encodeTrapSlot(buf []byte, slotVA, retPC, spill uint64) error {
 	return nil
 }
 
-// encodeLoadSlot writes a slot at slotVA that replaces `mrs xN, tpidr_el0`.
-// The slot reads the thread's sysmsg pointer from TPIDRRO_EL0, clears the low
-// bits that the kernel may use for a CPU number, loads the virtual TLS word
-// into xN and returns to retPC. It clobbers no other register and no flag.
-func encodeLoadSlot(buf []byte, slotVA, retPC uint64, reg uint8, tlsOffset uint32) error {
+// encodeLoadSysmsgSlot writes a 16-byte slot at slotVA that reads a thread
+// sysmsg base register (`sysRegBase | reg`), optionally clears its low 3 CPU-ID
+// bits (`AND xN, xN, #-8`), loads the 64-bit word at `off` into `reg`, and
+// branches to `retPC`.
+func encodeLoadSysmsgSlot(buf []byte, slotVA, retPC uint64, reg uint8, sysRegBase uint32, maskLowBits bool, off uint32) error {
 	if len(buf) < loadSlotSize {
 		return fmt.Errorf("load slot buffer has %d bytes", len(buf))
 	}
 	if reg >= 31 {
 		return fmt.Errorf("load slot register %d", reg)
 	}
-	if tlsOffset%8 != 0 || tlsOffset/8 > 0xfff {
-		return fmt.Errorf("tls offset %#x is not encodable", tlsOffset)
+	if off%8 != 0 || off/8 > 0xfff {
+		return fmt.Errorf("tls offset %#x is not encodable", off)
 	}
-	back, err := encodeBranch(slotVA+12, retPC)
+	r := uint32(reg)
+	if maskLowBits {
+		back, err := encodeBranch(slotVA+12, retPC)
+		if err != nil {
+			return err
+		}
+		binary.LittleEndian.PutUint32(buf[0:], sysRegBase|r)
+		binary.LittleEndian.PutUint32(buf[4:], arm64ANDxMinus8|r<<5|r)
+		binary.LittleEndian.PutUint32(buf[8:], hvcommon.LDRX(int(reg), int(reg), int(off)))
+		binary.LittleEndian.PutUint32(buf[12:], back)
+		return nil
+	}
+	back, err := encodeBranch(slotVA+8, retPC)
 	if err != nil {
 		return err
 	}
-	r := uint32(reg)
-	binary.LittleEndian.PutUint32(buf[0:], arm64MRSTPIDRRO|r)
-	binary.LittleEndian.PutUint32(buf[4:], arm64ANDxMinus8|r<<5|r)
-	binary.LittleEndian.PutUint32(buf[8:], arm64LDRx|(tlsOffset/8)<<10|r<<5|r)
-	binary.LittleEndian.PutUint32(buf[12:], back)
+	binary.LittleEndian.PutUint32(buf[0:], sysRegBase|r)
+	binary.LittleEndian.PutUint32(buf[4:], hvcommon.LDRX(int(reg), int(reg), int(off)))
+	binary.LittleEndian.PutUint32(buf[8:], back)
+	binary.LittleEndian.PutUint32(buf[12:], arm64NOP)
 	return nil
+}
+
+// encodeLoadSlot writes a slot at slotVA that replaces `mrs xN, tpidr_el0`.
+// The slot reads the thread's sysmsg pointer from TPIDRRO_EL0, clears the low
+// bits that the kernel may use for a CPU number, loads the virtual TLS word
+// into xN and returns to retPC. It clobbers no other register and no flag.
+func encodeLoadSlot(buf []byte, slotVA, retPC uint64, reg uint8, tlsOffset uint32) error {
+	return encodeLoadSysmsgSlot(buf, slotVA, retPC, reg, arm64MRSTPIDRRO, true, tlsOffset)
 }
 
 // ctrWords returns the two instructions that load ctrEL0Value into register
 // reg: movz for the low half and movk for the high half.
 func ctrWords(reg uint8) [2]uint32 {
-	r := uint32(reg)
 	return [2]uint32{
-		arm64MOVZ | (ctrEL0Value&0xffff)<<5 | r,
-		arm64MOVKLSL16 | (ctrEL0Value>>16)<<5 | r,
+		hvcommon.MOVZ(int(reg), uint16(ctrEL0Value&0xffff)),
+		hvcommon.MOVK(int(reg), uint16(ctrEL0Value>>16), 16),
 	}
 }
 
@@ -273,34 +286,13 @@ func encodeCTRSlot(buf []byte, slotVA, retPC uint64, reg uint8) error {
 // for the EL1 identification registers, CTR_EL0, and DCZID_EL0 that Linux
 // exposes to EL0 via HWCAP_CPUID.
 func decodeARM64SysRegMRS(insn uint32) (rt uint8, val uint64, ok bool) {
-	if (insn & 0xfff00000) != 0xd5300000 {
+	iss, ok := hvcommon.DecodeMRSSysRegISS(insn)
+	if !ok {
 		return 0, 0, false
 	}
-	rt = uint8(insn & 0x1f)
-	switch insn &^ 0x1f {
-	case 0xd5380000: // MIDR_EL1 (S3_0_C0_C0_0)
-		return rt, 0x410fd030, true
-	case 0xd53800c0: // REVIDR_EL1 (S3_0_C0_C0_6)
-		return rt, 0, true
-	case 0xd5380400: // ID_AA64PFR0_EL1 (S3_0_C0_C4_0)
-		return rt, 0x0000000000000011, true
-	case 0xd5380420: // ID_AA64PFR1_EL1 (S3_0_C0_C4_1)
-		return rt, 0, true
-	case 0xd5380600: // ID_AA64ISAR0_EL1 (S3_0_C0_C6_0)
-		return rt, 0x0000000000211120, true
-	case 0xd5380620: // ID_AA64ISAR1_EL1 (S3_0_C0_C6_1)
-		return rt, 0x0000000000100001, true
-	case 0xd5380700: // ID_AA64MMFR0_EL1 (S3_0_C0_C7_0)
-		return rt, 0x0000000000100005, true
-	case 0xd5380720: // ID_AA64MMFR1_EL1 (S3_0_C0_C7_1)
-		return rt, 0, true
-	case 0xd5380740: // ID_AA64MMFR2_EL1 (S3_0_C0_C7_2)
-		return rt, 0, true
-	case 0xd53b0020: // CTR_EL0 (S3_3_C0_C0_1)
-		return rt, ctrEL0Value, true
-	case 0xd53b00e0: // DCZID_EL0 (S3_3_C0_C0_7)
-		return rt, 0x00000004, true
-	default:
+	val, ok = hvcommon.DefaultIDRegisters().EmulateSysRegRead(iss)
+	if !ok {
 		return 0, 0, false
 	}
+	return uint8(iss.Rt), val, true
 }

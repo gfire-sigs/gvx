@@ -23,6 +23,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -59,16 +60,8 @@ const (
 	maxXattrBytes = 4096
 )
 
-// checkXattrPrefix accepts the namespaces that this filesystem stores: user,
-// trusted, and security. A POSIX ACL is not supported, so the system namespace
-// is rejected.
 func checkXattrPrefix(name string) error {
-	for _, prefix := range []string{linux.XATTR_USER_PREFIX, linux.XATTR_TRUSTED_PREFIX, linux.XATTR_SECURITY_PREFIX} {
-		if strings.HasPrefix(name, prefix) {
-			return nil
-		}
-	}
-	return linuxerr.EOPNOTSUPP
+	return chunkcache.CheckXattrPrefix(name)
 }
 
 // xattrBytes returns the size that the meta store charges for m.
@@ -335,24 +328,7 @@ func (d *dentry) listXattr(creds *auth.Credentials, size uint64, h *hostHandle) 
 	if err != nil {
 		return nil, err
 	}
-	haveCap := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
-	names := make([]string, 0, len(all))
-	listSize := 0
-	for _, name := range all {
-		if checkXattrPrefix(name) != nil {
-			continue
-		}
-		if !haveCap && strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
-			continue
-		}
-		names = append(names, name)
-		// One more byte for the null terminator.
-		listSize += len(name) + 1
-	}
-	if size != 0 && uint64(listSize) > size {
-		return nil, linuxerr.ERANGE
-	}
-	return names, nil
+	return chunkcache.FilterXattrList(all, creds, size)
 }
 
 func (d *dentry) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions, h *hostHandle) (string, error) {
@@ -536,17 +512,17 @@ func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 }
 
 // ListXattr implements vfs.FileDescriptionImpl.ListXattr.
-func (fd *regularFD) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
 	return fd.dentry.listXattr(auth.CredentialsFromContext(ctx), size, fd.h)
 }
 
 // GetXattr implements vfs.FileDescriptionImpl.GetXattr.
-func (fd *regularFD) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
 	return fd.dentry.getXattr(auth.CredentialsFromContext(ctx), &opts, fd.h)
 }
 
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
-func (fd *regularFD) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	if err := fd.dentry.setXattr(auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), &opts, fd.h); err != nil {
 		return err
 	}
@@ -555,36 +531,8 @@ func (fd *regularFD) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) err
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
-func (fd *regularFD) RemoveXattr(ctx context.Context, name string) error {
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	if err := fd.dentry.removeXattr(auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), name, fd.h); err != nil {
-		return err
-	}
-	fd.dentry.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
-}
-
-// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
-func (fd *dirFD) ListXattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.dentry.listXattr(auth.CredentialsFromContext(ctx), size, nil)
-}
-
-// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
-func (fd *dirFD) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
-	return fd.dentry.getXattr(auth.CredentialsFromContext(ctx), &opts, nil)
-}
-
-// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
-func (fd *dirFD) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
-	if err := fd.dentry.setXattr(auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), &opts, nil); err != nil {
-		return err
-	}
-	fd.dentry.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
-}
-
-// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
-func (fd *dirFD) RemoveXattr(ctx context.Context, name string) error {
-	if err := fd.dentry.removeXattr(auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), name, nil); err != nil {
 		return err
 	}
 	fd.dentry.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)

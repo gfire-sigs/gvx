@@ -33,16 +33,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// blockState says which mapping of a guest page the stub currently sees.
-type blockState uint8
-
-const (
-	// blockData maps the original frame without execute permission.
-	blockData blockState = iota
-	// blockExec maps a patched private copy as read and execute.
-	blockExec
-)
-
 // execBlock is one page of a guest mapping that allows execution.
 //
 // WHY: the original frame can be shared between address spaces and mapped at
@@ -102,32 +92,6 @@ type addressSpace struct {
 
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
-}
-
-// PatchedBlocks returns how many code pages this address space patched.
-func (as *addressSpace) PatchedBlocks() uint64 { return as.patchedBlocks.Load() }
-
-var errAddressSpaceReleased = errors.New("the address space is released")
-
-// AlignmentError reports a mapping request that the 4KB host page cannot honor.
-type AlignmentError struct {
-	Op   string
-	Addr uint64
-	Len  uint64
-}
-
-// Error implements error.
-func (e *AlignmentError) Error() string {
-	return fmt.Sprintf("%s [%#x, %#x) is not aligned to the %dKB host page", e.Op, e.Addr, e.Addr+e.Len, blockSize/1024)
-}
-
-func blockRound(n uint64) uint64 { return n &^ (blockSize - 1) }
-
-func checkAligned(op string, addr, length uint64) error {
-	if length == 0 || addr%blockSize != 0 || length%blockSize != 0 {
-		return &AlignmentError{Op: op, Addr: addr, Len: length}
-	}
-	return nil
 }
 
 // stubView performs the window map calls on one stub process.
@@ -464,15 +428,7 @@ func (as *addressSpace) Release() {
 	as.releaseIslandsLocked()
 }
 
-// PreFork implements platform.AddressSpace.PreFork.
-func (*addressSpace) PreFork() {}
-
-// PostFork implements platform.AddressSpace.PostFork.
-func (*addressSpace) PostFork() {}
-
 // ----- lazy patching ------------------------------------------------------
-
-var errPatchRaced = errors.New("the block changed while it was patched")
 
 // patchBlock patches the block that holds addr and maps the patched copy as
 // read and execute. It runs on the task goroutine, which is allowed to call
@@ -602,17 +558,6 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	return true, nil
 }
 
-// blockStateOf reports whether base is an exec block and its state.
-func (as *addressSpace) blockStateOf(base uint64) (blockState, hostarch.AccessType, bool) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	blk := as.blocks[base]
-	if blk == nil {
-		return 0, hostarch.NoAccess, false
-	}
-	return blk.state, blk.at, true
-}
-
 // siteAt returns the description of the patched instruction at guest address
 // a, if the block of a is an executable copy that has one there.
 func (as *addressSpace) siteAt(a uint64) (siteInfo, bool) {
@@ -624,14 +569,6 @@ func (as *addressSpace) siteAt(a uint64) (siteInfo, bool) {
 	}
 	s, ok := blk.sites[uint16(a-blk.base)]
 	return s, ok
-}
-
-// inPatchedCode reports whether a lies in a patched copy that the stub runs.
-func (as *addressSpace) inPatchedCode(a uint64) bool {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	blk := as.blocks[blockRound(a)]
-	return blk != nil && blk.state == blockExec
 }
 
 // inInternal reports whether a lies in the engine pages.

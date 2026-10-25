@@ -137,10 +137,70 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, handle func(context.Con
 	}
 }
 
+type dnsRelay struct {
+	gvxAddrs   []netip.Addr
+	hasGateway bool
+	isolateLAN bool
+	lookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
+	servers    []string
+	dials      []func(ctx context.Context, network, addr string) (net.Conn, error)
+	log        *slog.Logger
+}
+
+func (nf *NATForwarder) dnsRelay() dnsRelay {
+	var d net.Dialer
+	return dnsRelay{
+		gvxAddrs:   []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)},
+		hasGateway: true,
+		isolateLAN: nf.cfg.IsolateLAN,
+		lookupHost: nf.cfg.LookupHost,
+		servers:    nf.upstreamDNS,
+		dials:      []func(context.Context, string, string) (net.Conn, error){d.DialContext},
+		log:        nf.log,
+	}
+}
+
+func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
+	gvxAddrs := []netip.Addr{w.cfg.GuestIPv4.Addr()}
+	if w.cfg.GuestIPv6.IsValid() {
+		gvxAddrs = append(gvxAddrs, w.cfg.GuestIPv6.Addr())
+	}
+	stackDial := func(dctx context.Context, network, server string) (net.Conn, error) {
+		return dialStackDNS(dctx, w.stack, network, server)
+	}
+	var hostDialer net.Dialer
+	dials := []func(context.Context, string, string) (net.Conn, error){
+		hostDialer.DialContext,
+		stackDial,
+	}
+	if len(w.cfg.DNSServers) > 0 {
+		// Explicit WireGuard DNS servers travel inside the tunnel first.
+		dials[0], dials[1] = stackDial, hostDialer.DialContext
+	}
+	return dnsRelay{
+		gvxAddrs:   gvxAddrs,
+		lookupHost: w.cfg.LookupHost,
+		servers:    w.upstreamDNS,
+		dials:      dials,
+		log:        log,
+	}
+}
+
 // handleDNSQuery answers one DNS message. The relay owns a few names and
 // resolves A and AAAA queries through the LookupHost hook. It forwards every
 // other query to the host DNS servers and answers SERVFAIL when none replies.
 func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
+	return nf.dnsRelay().handleQuery(ctx, req)
+}
+
+// forwardRawDNSUpstream sends the wire query to each host DNS server in turn
+// and returns the first usable answer. A server that fails, answers SERVFAIL,
+// or answers REFUSED does not stop the search.
+func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
+	return nf.dnsRelay().forwardRawUpstream(ctx, req)
+}
+
+func (r dnsRelay) handleQuery(ctx context.Context, req []byte) []byte {
 	if len(req) < dnsHeaderSize {
 		return nil
 	}
@@ -158,9 +218,9 @@ func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
 	rawQuestion := req[dnsHeaderSize:q.endOff]
 
 	if q.qclass == dnsClassIN && (q.qtype == dnsTypeA || q.qtype == dnsTypeAAAA) {
-		addrs, found, handled, lookupErr := nf.lookupLocalAddrs(ctx, q.name)
-		if lookupErr != nil {
-			nf.log.Debug("netbackend: DNS lookup hook failed", "name", q.name, "error", lookupErr)
+		addrs, found, handled, lookupErr := r.lookupLocalAddrs(ctx, q.name)
+		if lookupErr != nil && r.log != nil {
+			r.log.Debug("netbackend: DNS lookup hook failed", "name", q.name, "error", lookupErr)
 		}
 		if handled {
 			if !found {
@@ -170,9 +230,11 @@ func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
 		}
 	}
 
-	resp, err := nf.forwardRawDNSUpstream(ctx, req)
+	resp, err := r.forwardRawUpstream(ctx, req)
 	if err != nil {
-		nf.log.Debug("netbackend: forward DNS query", "name", q.name, "error", err)
+		if r.log != nil {
+			r.log.Debug("netbackend: forward DNS query", "name", q.name, "error", err)
+		}
 		return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeSrv)
 	}
 	return resp
@@ -181,7 +243,7 @@ func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
 // lookupLocalAddrs resolves the names that the relay answers without an
 // upstream server. handled is false when the relay must forward the query.
 // found is false for a name that does not exist.
-func (nf *NATForwarder) lookupLocalAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
+func (r dnsRelay) lookupLocalAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
 	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
 	switch clean {
 	case "localhost", "localhost.localdomain":
@@ -190,21 +252,23 @@ func (nf *NATForwarder) lookupLocalAddrs(ctx context.Context, qname string) (add
 			netip.MustParseAddr("::1"),
 		}, true, true, nil
 	case "host.docker.internal", "gateway.docker.internal":
-		if nf.cfg.IsolateLAN {
-			return nil, false, true, nil
+		if r.hasGateway {
+			if r.isolateLAN {
+				return nil, false, true, nil
+			}
+			return []netip.Addr{netip.MustParseAddr(HostGatewayIPv4)}, true, true, nil
 		}
-		return []netip.Addr{netip.MustParseAddr(HostGatewayIPv4)}, true, true, nil
 	case "gvx":
-		return []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)}, true, true, nil
+		return r.gvxAddrs, true, true, nil
 	}
 
-	if nf.cfg.LookupHost == nil {
+	if r.lookupHost == nil {
 		return nil, false, false, nil
 	}
 	rctx, cancel := context.WithTimeout(ctx, defaultDNSTimeout)
 	defer cancel()
 
-	addrs, err = nf.cfg.LookupHost(rctx, clean)
+	addrs, err = r.lookupHost(rctx, clean)
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
@@ -215,41 +279,33 @@ func (nf *NATForwarder) lookupLocalAddrs(ctx context.Context, qname string) (add
 	return addrs, true, true, nil
 }
 
-// forwardRawDNSUpstream sends the wire query to each host DNS server in turn
-// and returns the first usable answer. A server that fails, answers SERVFAIL,
-// or answers REFUSED does not stop the search.
-func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
-	if len(nf.upstreamDNS) == 0 {
+func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, error) {
+	if len(r.servers) == 0 {
 		return nil, errNoDNSServers
 	}
 	var errs []error
-	for _, server := range nf.upstreamDNS {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	for _, server := range r.servers {
+		for _, dial := range r.dials {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req)
+			if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
+				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req)
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
+				continue
+			}
+			switch binary.BigEndian.Uint16(resp[2:4]) & dnsRCodeMask {
+			case dnsRCodeSrv, dnsRCodeRefus:
+				errs = append(errs, fmt.Errorf("server %s: rcode %d", server, binary.BigEndian.Uint16(resp[2:4])&dnsRCodeMask))
+				continue
+			}
+			return resp, nil
 		}
-		resp, err := exchangeDNS(ctx, "udp", server, req)
-		if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
-			resp, err = exchangeDNS(ctx, "tcp", server, req)
-		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("server %s: %w", server, err))
-			continue
-		}
-		switch binary.BigEndian.Uint16(resp[2:4]) & dnsRCodeMask {
-		case dnsRCodeSrv, dnsRCodeRefus:
-			errs = append(errs, fmt.Errorf("server %s: rcode %d", server, binary.BigEndian.Uint16(resp[2:4])&dnsRCodeMask))
-			continue
-		}
-		return resp, nil
 	}
 	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
-}
-
-// exchangeDNS sends req to server over network ("udp" or "tcp") and returns the
-// matching response. The response has a header and the same transaction ID.
-func exchangeDNS(ctx context.Context, network, server string, req []byte) ([]byte, error) {
-	var d net.Dialer
-	return exchangeDNSWithDial(ctx, d.DialContext, network, server, req)
 }
 
 func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte) ([]byte, error) {
@@ -391,7 +447,7 @@ func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn
 		w.dnsWG.Add(1)
 		go func(pkt []byte, peer net.Addr) {
 			defer w.dnsWG.Done()
-			resp := w.handleDNSQuery(ctx, pkt, log)
+			resp := w.dnsRelay(log).handleQuery(ctx, pkt)
 			if len(resp) > 0 {
 				_ = conn.SetWriteDeadline(time.Now().Add(defaultDNSTimeout))
 				_, _ = conn.WriteTo(resp, peer)
@@ -414,122 +470,9 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 		w.dnsWG.Add(1)
 		go func(c net.Conn) {
 			defer w.dnsWG.Done()
-			serveTCPDNSConn(ctx, c, func(qctx context.Context, req []byte) []byte {
-				return w.handleDNSQuery(qctx, req, log)
-			})
+			serveTCPDNSConn(ctx, c, w.dnsRelay(log).handleQuery)
 		}(conn)
 	}
-}
-
-func (w *WireGuardEndpoint) handleDNSQuery(ctx context.Context, req []byte, log *slog.Logger) []byte {
-	if len(req) < dnsHeaderSize {
-		return nil
-	}
-	txID := binary.BigEndian.Uint16(req[0:2])
-	reqFlags := binary.BigEndian.Uint16(req[2:4])
-	qdCount := binary.BigEndian.Uint16(req[4:6])
-	if qdCount == 0 {
-		return buildDNSErrorResponse(txID, reqFlags, nil, dnsRCodeFmt)
-	}
-	q, err := parseDNSQuestion(req, dnsHeaderSize)
-	if err != nil {
-		return buildDNSErrorResponse(txID, reqFlags, nil, dnsRCodeFmt)
-	}
-	rawQuestion := req[dnsHeaderSize:q.endOff]
-
-	if q.qclass == dnsClassIN && (q.qtype == dnsTypeA || q.qtype == dnsTypeAAAA) {
-		addrs, found, handled, lookupErr := w.lookupLocalAddrs(ctx, q.name)
-		if lookupErr != nil && log != nil {
-			log.Debug("netbackend: WireGuard DNS lookup hook failed", "name", q.name, "error", lookupErr)
-		}
-		if handled {
-			if !found {
-				return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeNX)
-			}
-			return buildDNSAddressResponse(txID, reqFlags, rawQuestion, q.qtype, addrs)
-		}
-	}
-
-	resp, err := w.forwardRawDNSUpstream(ctx, req)
-	if err != nil {
-		if log != nil {
-			log.Debug("netbackend: forward WireGuard DNS query", "name", q.name, "error", err)
-		}
-		return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeSrv)
-	}
-	return resp
-}
-
-func (w *WireGuardEndpoint) lookupLocalAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
-	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
-	switch clean {
-	case "localhost", "localhost.localdomain":
-		return []netip.Addr{
-			netip.MustParseAddr("127.0.0.1"),
-			netip.MustParseAddr("::1"),
-		}, true, true, nil
-	case "gvx":
-		out := []netip.Addr{w.cfg.GuestIPv4.Addr()}
-		if w.cfg.GuestIPv6.IsValid() {
-			out = append(out, w.cfg.GuestIPv6.Addr())
-		}
-		return out, true, true, nil
-	}
-	if w.cfg.LookupHost == nil {
-		return nil, false, false, nil
-	}
-	rctx, cancel := context.WithTimeout(ctx, defaultDNSTimeout)
-	defer cancel()
-	addrs, err = w.cfg.LookupHost(rctx, clean)
-	if err != nil {
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-			return nil, false, true, nil
-		}
-		return nil, false, false, err
-	}
-	return addrs, true, true, nil
-}
-
-func (w *WireGuardEndpoint) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
-	if len(w.upstreamDNS) == 0 {
-		return nil, errNoDNSServers
-	}
-	stackDial := func(dctx context.Context, network, server string) (net.Conn, error) {
-		return dialStackDNS(dctx, w.stack, network, server)
-	}
-	var hostDialer net.Dialer
-	dials := []func(context.Context, string, string) (net.Conn, error){
-		hostDialer.DialContext,
-		stackDial,
-	}
-	if len(w.cfg.DNSServers) > 0 {
-		// Explicit WireGuard DNS servers travel inside the tunnel first.
-		dials[0], dials[1] = stackDial, hostDialer.DialContext
-	}
-	var errs []error
-	for _, server := range w.upstreamDNS {
-		for _, dial := range dials {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req)
-			if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
-				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req)
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
-				continue
-			}
-			switch binary.BigEndian.Uint16(resp[2:4]) & dnsRCodeMask {
-			case dnsRCodeSrv, dnsRCodeRefus:
-				errs = append(errs, fmt.Errorf("server %s: rcode %d", server, binary.BigEndian.Uint16(resp[2:4])&dnsRCodeMask))
-				continue
-			}
-			return resp, nil
-		}
-	}
-	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
 func validDNSResponse(msg []byte, txID uint16) bool {

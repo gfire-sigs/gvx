@@ -119,6 +119,7 @@ var tier1Prefixes = []string{
 	"pkg/sentry/platform/hvf/",
 	"pkg/sentry/fsimpl/hostfs/",
 	"pkg/sentry/fsimpl/ext4lite/",
+	"pkg/sentry/fsimpl/chunkcache/",
 	"pkg/sentry/platform/hvcommon/",
 	"e2e/",
 	"tools/upstream/",

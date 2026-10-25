@@ -22,44 +22,42 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
-// This file decodes ARM64 exception syndromes into Linux behavior. It has no
-// host dependency, so unit tests exercise it on every OS.
-
 // ESR_ELx exception classes (ARM DDI 0487, D17.2.37).
 const (
-	ecUnknown      = 0x00
-	ecWFx          = 0x01
-	ecIllegalState = 0x0e
+	ecUnknown      = hvcommon.ECUnknown
+	ecWFx          = hvcommon.ECWFx
+	ecIllegalState = hvcommon.ECIllegalState
 	ecSVC64        = hvcommon.ECSVC64
-	ecHVC64        = 0x16
-	ecSysReg       = 0x18
+	ecHVC64        = hvcommon.ECHVC64
+	ecSysReg       = hvcommon.ECSysReg
 	ecInstrAbort   = hvcommon.ECInstrAbortLower
-	ecPCAlignment  = 0x22
+	ecPCAlignment  = hvcommon.ECPCAlignment
 	ecDataAbort    = hvcommon.ECDataAbortLower
-	ecSPAlignment  = 0x26
-	ecBreakpoint   = 0x30
-	ecBreakpointEL = 0x31
-	ecSoftStep     = 0x32
-	ecSoftStepEL   = 0x33
-	ecWatchpoint   = 0x34
-	ecWatchpointEL = 0x35
-	ecBRK64        = 0x3c
+	ecSPAlignment  = hvcommon.ECSPAlignment
+	ecFPExc64      = hvcommon.ECFPExc64
+	ecBreakpoint   = hvcommon.ECBreakpointLower
+	ecBreakpointEL = hvcommon.ECBreakpointCur
+	ecSoftStep     = hvcommon.ECSoftStepLower
+	ecSoftStepEL   = hvcommon.ECSoftStepCur
+	ecWatchpoint   = hvcommon.ECWatchpointLower
+	ecWatchpointEL = hvcommon.ECWatchpointCur
+	ecBRK64        = hvcommon.ECBRK64
 )
 
 // Fault status codes in ESR_ELx.ISS for aborts.
 const (
-	fscTranslationL0 = 0x04
-	fscTranslationL3 = 0x07
-	fscPermissionL1  = 0x0d
-	fscPermissionL3  = 0x0f
-	fscSyncExternal  = 0x10
-	fscAlignment     = 0x21
+	fscTranslationL0 = hvcommon.FSCTranslationL0
+	fscTranslationL3 = hvcommon.FSCTranslationL3
+	fscPermissionL1  = hvcommon.FSCPermissionL1
+	fscPermissionL3  = hvcommon.FSCPermissionL3
+	fscSyncExternal  = hvcommon.FSCSyncExternal
+	fscAlignment     = hvcommon.FSCAlignment
 
 	issS1PTW = 1 << 7 // The abort happened during a stage-1 table walk.
 )
 
-func esrEC(esr uint64) uint64  { return esr >> 26 & 0x3f }
-func esrFSC(esr uint64) uint64 { return esr & 0x3f }
+func esrEC(esr uint64) uint64  { return hvcommon.ESREC(esr) }
+func esrFSC(esr uint64) uint64 { return hvcommon.ESRFSC(esr) }
 
 // decodeStubExit decodes the state that the EL1 stub spilled: the vector slot,
 // ESR_EL1, FAR_EL1, ELR_EL1 and SP_EL0 of the guest exception.
@@ -68,47 +66,16 @@ func decodeStubExit(vec, esr, far, pc, sp uint64) exitAction {
 		return exitAction{kind: exitInternal, err: fmt.Errorf(
 			"hvf: unexpected guest exception vector %d (esr=%#x far=%#x elr=%#x)", vec, esr, far, pc)}
 	}
-	switch ec := esrEC(esr); ec {
-	case ecSVC64:
+	kind, sig, at := hvcommon.DecodeA64SyncException(esr, far, pc, sp)
+	switch kind {
+	case hvcommon.A64ExitSyscall:
 		return exitAction{kind: exitSyscall}
-	case ecInstrAbort, ecDataAbort:
-		return decodeUserAbort(esr, far)
-	case ecPCAlignment:
-		return signalAction(linux.SIGBUS, sigBusAdrAln, far, hostarch.NoAccess)
-	case ecSPAlignment:
-		// FAR_EL1 is architecturally unknown for an SP alignment fault.
-		return signalAction(linux.SIGBUS, sigBusAdrAln, sp, hostarch.NoAccess)
-	case ecBRK64:
-		return signalAction(linux.SIGTRAP, sigTrapBrkpt, pc, hostarch.NoAccess)
-	case ecSoftStep, ecSoftStepEL:
-		return signalAction(linux.SIGTRAP, sigTrapTrace, pc, hostarch.NoAccess)
-	case ecBreakpoint, ecBreakpointEL:
-		return signalAction(linux.SIGTRAP, sigTrapHWBkp, pc, hostarch.NoAccess)
-	case ecWatchpoint, ecWatchpointEL:
-		return signalAction(linux.SIGTRAP, sigTrapHWBkp, far, hostarch.NoAccess)
-	case ecSysReg:
+	case hvcommon.A64ExitSkip:
+		return exitAction{kind: exitWFx}
+	case hvcommon.A64ExitSysReg:
 		return exitAction{kind: exitSysReg}
 	default:
-		// Undefined instructions (EC 0), illegal execution state, an HVC or
-		// SMC from EL0, and every unlisted class behave as SIGILL, as Linux does.
-		return signalAction(linux.SIGILL, sigIllIllOpc, pc, hostarch.NoAccess)
-	}
-}
-
-// decodeUserAbort maps a stage-1 instruction or data abort from EL0 to SIGSEGV
-// or SIGBUS, with the access type taken from the syndrome.
-func decodeUserAbort(esr, far uint64) exitAction {
-	addr := uint64(hostarch.UntaggedUserAddr(hostarch.Addr(far)))
-	at := hostarch.ESRAccessType(esr)
-	switch fsc := esrFSC(esr); {
-	case fsc == fscAlignment:
-		return signalAction(linux.SIGBUS, sigBusAdrAln, addr, at)
-	case fsc >= fscSyncExternal && fsc < fscAlignment:
-		return signalAction(linux.SIGBUS, sigBusAdrErr, addr, at)
-	case fsc >= fscTranslationL0 && fsc <= fscTranslationL3:
-		return signalAction(linux.SIGSEGV, sigSegvMap, addr, at)
-	default:
-		return signalAction(linux.SIGSEGV, sigSegvAcc, addr, at)
+		return exitAction{kind: exitSignal, info: sig, at: at}
 	}
 }
 
@@ -144,24 +111,18 @@ func decodeStage2Abort(syndrome, va, ipa uint64) exitAction {
 	case fsc >= fscPermissionL1 && fsc <= fscPermissionL3:
 		return signalAction(linux.SIGSEGV, sigSegvAcc, addr, at)
 	case fsc >= fscTranslationL0 && fsc <= fscTranslationL3:
-		// Nonexistent physical page: Linux reports this as BUS_ADRERR.
 		return signalAction(linux.SIGBUS, sigBusAdrErr, addr, at)
 	default:
 		return signalAction(linux.SIGBUS, sigBusObjErr, addr, at)
 	}
 }
 
-// sysRegISS holds the fields of the ISS of an EC 0x18 exception.
 type sysRegISS = hvcommon.SysRegISS
 
 func decodeSysRegISS(esr uint64) sysRegISS {
 	return hvcommon.DecodeSysRegISS(esr)
 }
 
-const (
-	keyMIDR = hvcommon.KeyMIDR
-)
+const keyMIDR = hvcommon.KeyMIDR
 
-// idRegisters holds the values that EL0 reads of the ID registers and the
-// system counter.
 type idRegisters = hvcommon.IDRegisters

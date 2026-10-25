@@ -205,12 +205,9 @@ func normalizeArch(arch string) string {
 // ParseRuntimeConfig parses Entrypoint, Cmd, Env, WorkingDir, and User from an
 // OCI Image Configuration JSON payload.
 func ParseRuntimeConfig(configJSON []byte) (RuntimeConfig, error) {
-	var parsed imageConfigFile
-	if err := json.Unmarshal(configJSON, &parsed); err != nil {
-		return RuntimeConfig{}, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
-	}
-	if parsed.Config.WorkingDir == "" {
-		parsed.Config.WorkingDir = "/"
+	parsed, err := parseImageConfigFile(configJSON, "", -1)
+	if err != nil {
+		return RuntimeConfig{}, err
 	}
 	return parsed.Config, nil
 }
@@ -218,23 +215,35 @@ func ParseRuntimeConfig(configJSON []byte) (RuntimeConfig, error) {
 // parseImageConfig parses an image config and rejects an image for another OS
 // or architecture, or a config that disagrees with the manifest layer count.
 func parseImageConfig(raw []byte, arch string, layers int) (RuntimeConfig, error) {
+	parsed, err := parseImageConfigFile(raw, arch, layers)
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	return parsed.Config, nil
+}
+
+func parseImageConfigFile(raw []byte, arch string, layers int) (imageConfigFile, error) {
 	var parsed imageConfigFile
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return RuntimeConfig{}, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
+		return imageConfigFile{}, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
 	}
-	if parsed.OS != "" && !strings.EqualFold(parsed.OS, "linux") {
-		return RuntimeConfig{}, fmt.Errorf("oci: image targets OS %q, want linux", parsed.OS)
+	if arch != "" {
+		if parsed.OS != "" && !strings.EqualFold(parsed.OS, "linux") {
+			return imageConfigFile{}, fmt.Errorf("oci: image targets OS %q, want linux", parsed.OS)
+		}
+		if parsed.Architecture != "" && normalizeArch(parsed.Architecture) != arch {
+			return imageConfigFile{}, fmt.Errorf("oci: image targets architecture %q, want %s", parsed.Architecture, arch)
+		}
 	}
-	if parsed.Architecture != "" && normalizeArch(parsed.Architecture) != arch {
-		return RuntimeConfig{}, fmt.Errorf("oci: image targets architecture %q, want %s", parsed.Architecture, arch)
-	}
-	if n := len(parsed.RootFS.DiffIDs); n != 0 && n != layers {
-		return RuntimeConfig{}, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", n, layers)
+	if layers >= 0 {
+		if n := len(parsed.RootFS.DiffIDs); n != 0 && n != layers {
+			return imageConfigFile{}, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", n, layers)
+		}
 	}
 	if parsed.Config.WorkingDir == "" {
 		parsed.Config.WorkingDir = "/"
 	}
-	return parsed.Config, nil
+	return parsed, nil
 }
 
 // parseDigest returns the lowercase hex of a "sha256:<hex>" digest.

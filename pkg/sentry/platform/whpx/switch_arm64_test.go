@@ -67,7 +67,7 @@ func (e *a64Env) hvc() uint64 {
 // and reports the HVC exit at pc.
 func (e *a64Env) trap(vp *fakeVP, exit []byte, slot, esrVal, far, elr uint64, mutate func(c *CommPage)) {
 	c := e.comm(vp)
-	c.Vector, c.FaultCode, c.FaultAddr, c.PC = slot, esrVal, far, elr
+	c.Vector, c.ESR, c.FaultAddr, c.PC = slot, esrVal, far, elr
 	if mutate != nil {
 		mutate(c)
 	}
@@ -101,7 +101,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 		e.svc(vp, exit, 0x400004, func(c *CommPage) {
 			c.Regs[0] = 0xAA
 			c.TLS = 0x5678
-			c.PstateOrRflags = 0x20000000
+			c.Pstate = 0x20000000
 		})
 		return nil
 	}
@@ -118,8 +118,8 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if first.SP != 0x7FFF0000 || first.PC != 0x400000 || first.TLS != 0x1234 {
 		t.Errorf("CommPage has SP %#x PC %#x TLS %#x", first.SP, first.PC, first.TLS)
 	}
-	if first.PstateOrRflags != 0x60000000 {
-		t.Errorf("PSTATE is %#x, want the NZCV bits only", first.PstateOrRflags)
+	if first.Pstate != 0x60000000 {
+		t.Errorf("PSTATE is %#x, want the NZCV bits only", first.Pstate)
 	}
 	if first.Root != e.as.rootValue() {
 		t.Errorf("root is %#x, want %#x", first.Root, e.as.rootValue())
@@ -720,7 +720,7 @@ func TestThreadInitRunsOnEverySwitch(t *testing.T) {
 	ac := arch.New(arch.ARM64)
 	fb.onRun = func(vp *fakeVP, exit []byte) error {
 		cp := p.kernel.commPage(int(vp.index))
-		cp.Vector, cp.FaultCode = a64SlotLowA64Sync, esr(esrECSVC64, 0)
+		cp.Vector, cp.ESR = a64SlotLowA64Sync, esr(esrECSVC64, 0)
 		atomic.StoreUint32(&cp.ExitReason, uint32(ExitException))
 		writeStubExit(exit, p.kernel.layout.code()+uint64(p.kernel.a64.Reload))
 		return nil

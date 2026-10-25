@@ -355,12 +355,12 @@ func TestFreedPageTablesWaitForTheInvalidation(t *testing.T) {
 	}()
 	waitCancels(fb, v, 1)
 	// The freed table waits in quarantine while the processor may still walk it.
-	if q := as.alloc.quarantined(); q == 0 {
+	if q := as.alloc.Quarantined(); q == 0 {
 		t.Error("no page table is quarantined after the last entry went away")
 	}
 	leave()
 	<-done
-	if q := as.alloc.quarantined(); q != 0 {
+	if q := as.alloc.Quarantined(); q != 0 {
 		t.Errorf("%d page tables stay in quarantine after the invalidation", q)
 	}
 }

@@ -82,8 +82,8 @@ func (k *kernelMap) ttbr1() uint64 {
 func (v *vmState) initKernel(slots int) error {
 	initPageTables()
 	alloc := newTableAlloc(v)
-	if err := alloc.reserve(kernelTablePages); err != nil {
-		alloc.drain()
+	if err := alloc.Reserve(kernelTablePages); err != nil {
+		alloc.Drain()
 		return err
 	}
 	k := &v.kernel
@@ -91,14 +91,14 @@ func (v *vmState) initKernel(slots int) error {
 	k.pt = pagetables.New(alloc)
 	k.comm = make([]kernelComm, slots)
 
-	vecPage, vecIPA, err := v.allocPage()
+	vecPage, vecIPA, err := v.AllocPage()
 	if err != nil {
 		return err
 	}
 	copy(vecPage, buildVectorPage())
 	k.mapPage(kernelVectorVA, vecIPA, kernelCode)
 	for i := range k.comm {
-		page, ipa, err := v.allocPage()
+		page, ipa, err := v.AllocPage()
 		if err != nil {
 			return err
 		}

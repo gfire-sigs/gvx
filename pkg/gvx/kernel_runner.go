@@ -428,7 +428,18 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err != nil {
 		return 1, err
 	}
+	var (
+		cachedExecHeader []byte
+		cachedExecErr    error
+		cachedExecOnce   sync.Once
+	)
 	readGuest := func(path string, maxBytes int) ([]byte, error) {
+		if path == execPath && maxBytes == elfProbeBytes {
+			cachedExecOnce.Do(func() {
+				cachedExecHeader, cachedExecErr = readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
+			})
+			return cachedExecHeader, cachedExecErr
+		}
 		return readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
 	}
 	if err := s.checkELFLayout(readGuest, execPath, hostarch.PageSize); err != nil {
@@ -877,7 +888,7 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 		return "", fmt.Errorf("gvx: executable %q not found in guest rootfs", cmd)
 	}
 
-	pathEnv := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	pathEnv := defaultPath
 	for _, kv := range envv {
 		if after, ok := strings.CutPrefix(kv, "PATH="); ok && after != "" {
 			pathEnv = after

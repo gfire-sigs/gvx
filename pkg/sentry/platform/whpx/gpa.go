@@ -21,6 +21,8 @@ import (
 	"sort"
 	"sync"
 	"unsafe"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // errGPAExhausted reports that a zone of the guest physical window is full.
@@ -95,19 +97,12 @@ func partitionFlags(writable bool) uint32 {
 }
 
 // gpaRun is a contiguous range of guest physical memory.
-type gpaRun struct {
-	gpa  uint64
-	size uint64
-}
+type gpaRun = hvcommon.GPARun
 
 // appendRun adds a range to runs. It joins the range to the last run when
 // the two touch.
 func appendRun(runs []gpaRun, gpa, size uint64) []gpaRun {
-	if n := len(runs); n > 0 && runs[n-1].gpa+runs[n-1].size == gpa {
-		runs[n-1].size += size
-		return runs
-	}
-	return append(runs, gpaRun{gpa: gpa, size: size})
+	return hvcommon.AppendGPARun(runs, gpa, size)
 }
 
 // span is a range inside an arena. Both fields are byte offsets from the

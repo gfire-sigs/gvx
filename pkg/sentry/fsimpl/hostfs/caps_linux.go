@@ -52,20 +52,19 @@ func probeLinuxCalls(host hostBackend, caps *WorkspaceCaps) {
 	}
 	defer removeB()
 
-	rc, err := fa.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = rc.Control(func(fd uintptr) {
-		if unix.Fsetxattr(int(fd), "user.gvx.probe", []byte{1}, 0) != nil {
+	if err := withFileFD(fa, func(fd int) error {
+		if unix.Fsetxattr(fd, "user.gvx.probe", []byte{1}, 0) != nil {
 			caps.NativeXattr = false
 		}
-		if unix.Fallocate(int(fd), 0, 0, 4096) != nil {
+		if unix.Fallocate(fd, 0, 0, 4096) != nil {
 			caps.NativeFallocate = false
 		}
-	})
+		return nil
+	}); err != nil {
+		return
+	}
 	dirfd := int(host.rootDir())
-	if unix.Renameat2(dirfd, base+"a", dirfd, base+"b", unix.RENAME_EXCHANGE) != nil {
+	if renameSwap(dirfd, base+"a", dirfd, base+"b") != nil {
 		caps.NativeRenameSwap = false
 	}
 }

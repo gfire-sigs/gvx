@@ -18,7 +18,6 @@ package hostlockdown
 
 import (
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -104,16 +103,9 @@ const denyNewBind = "(deny network-bind)\n"
 // symlink resolution. The result has one entry per mount, in order.
 func resolveMounts(mounts []HostMount) (abs, real []string, err error) {
 	for _, m := range mounts {
-		a, err := filepath.Abs(m.Path)
+		a, r, err := resolveMountPath(m.Path)
 		if err != nil {
-			return nil, nil, fmt.Errorf("hostlockdown: resolve mount %q: %w", m.Path, err)
-		}
-		r, err := filepath.EvalSymlinks(a)
-		if err != nil {
-			return nil, nil, fmt.Errorf("hostlockdown: resolve mount symlinks %q: %w", a, err)
-		}
-		if r == "/" {
-			return nil, nil, fmt.Errorf("hostlockdown: mount %q resolves to \"/\" and would allow every host file", m.Path)
+			return nil, nil, err
 		}
 		abs = append(abs, a)
 		real = append(real, r)

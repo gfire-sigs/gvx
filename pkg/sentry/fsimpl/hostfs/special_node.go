@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/pipe"
 	"z.gfire.dev/gvx/pkg/sentry/socket/unix/transport"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -238,19 +239,8 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 func (d *dentry) openSpecial(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ino := d.inode
 	attr := ino.snapshot().attr
-	switch attr.Mode & linux.S_IFMT {
-	case linux.S_IFIFO:
-		return ino.special.pipe.Open(ctx, rp.Mount(), &d.vfsd, opts.Flags, &ino.locks)
-	case linux.S_IFCHR, linux.S_IFBLK:
-		kind := vfs.CharDevice
-		if attr.Mode&linux.S_IFMT == linux.S_IFBLK {
-			kind = vfs.BlockDevice
-		}
-		major, minor := unpackRdev(attr.Rdev)
-		return rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, rp.Mount(), &d.vfsd, kind, major, minor, opts)
-	default:
-		return nil, linuxerr.ENXIO
-	}
+	major, minor := unpackRdev(attr.Rdev)
+	return chunkcache.OpenSpecial(ctx, rp, &d.vfsd, opts, attr.Mode, ino.special.pipe, &ino.locks, major, minor)
 }
 
 // specialLinksLocked returns the host link count of the special inode of d

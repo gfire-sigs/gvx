@@ -119,28 +119,28 @@ func TestMemoryMapJoinsRangesInAnyOrder(t *testing.T) {
 	}
 	top := runs[0]
 	runs, err = m.resolve(page(4, 8), true, nil)
-	if err != nil || len(runs) != 1 || runs[0].gpa+runs[0].size != top.gpa {
-		t.Fatalf("a range below the first one got %v, want it to end at %#x (%v)", runs, top.gpa, err)
+	if err != nil || len(runs) != 1 || runs[0].GPA+runs[0].Size != top.GPA {
+		t.Fatalf("a range below the first one got %v, want it to end at %#x (%v)", runs, top.GPA, err)
 	}
 	// A call above, as a bottom-up allocation does.
-	if runs, err = m.resolve(page(12, 16), true, nil); err != nil || len(runs) != 1 || runs[0].gpa != top.gpa+4*pageSize {
+	if runs, err = m.resolve(page(12, 16), true, nil); err != nil || len(runs) != 1 || runs[0].GPA != top.GPA+4*pageSize {
 		t.Fatalf("a range above the first one got %v (%v)", runs, err)
 	}
 	// The whole range is one run now and needs no further call.
 	maps0, _ := fb.calls()
 	runs, err = m.resolve(page(4, 16), true, nil)
-	if err != nil || len(runs) != 1 || runs[0].size != 12*pageSize || runs[0].gpa != top.gpa-4*pageSize {
+	if err != nil || len(runs) != 1 || runs[0].Size != 12*pageSize || runs[0].GPA != top.GPA-4*pageSize {
 		t.Fatalf("the joined range got %v (%v)", runs, err)
 	}
 	// Only the gap below page 4 registers, and the whole range joins again.
 	runs, err = m.resolve(page(0, 16), true, nil)
-	if err != nil || len(runs) != 1 || runs[0].size != 16*pageSize {
+	if err != nil || len(runs) != 1 || runs[0].Size != 16*pageSize {
 		t.Fatalf("the full range got %v (%v)", runs, err)
 	}
 	if maps, _ := fb.calls(); maps-maps0 != 1 {
 		t.Errorf("two resolves made %d map calls, want 1", maps-maps0)
 	}
-	host, ok := hostOf(fb, runs[0].gpa)
+	host, ok := hostOf(fb, runs[0].GPA)
 	if !ok || host != unsafe.Pointer(&mem[0]) {
 		t.Errorf("the first guest page maps host %p, want %p", host, &mem[0])
 	}
@@ -155,7 +155,7 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 	if err != nil || len(ro) != 1 {
 		t.Fatalf("read-only resolve returned %v, %v", ro, err)
 	}
-	if mp, _, _ := fb.mappingOf(ro[0].gpa); mp.flags != mapFlagRead|mapFlagExecute {
+	if mp, _, _ := fb.mappingOf(ro[0].GPA); mp.flags != mapFlagRead|mapFlagExecute {
 		t.Errorf("a read-only request maps with flags %#x", mp.flags)
 	}
 
@@ -166,13 +166,13 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 	if err != nil || len(rw) != 1 {
 		t.Fatalf("writable resolve returned %v, %v", rw, err)
 	}
-	if rw[0].gpa == ro[0].gpa {
+	if rw[0].GPA == ro[0].GPA {
 		t.Fatal("a write request reuses the read-only guest range")
 	}
-	if mp, host, _ := fb.mappingOf(rw[0].gpa); mp.flags != mapFlagRead|mapFlagWrite|mapFlagExecute || host != unsafe.Pointer(&mem[0]) {
+	if mp, host, _ := fb.mappingOf(rw[0].GPA); mp.flags != mapFlagRead|mapFlagWrite|mapFlagExecute || host != unsafe.Pointer(&mem[0]) {
 		t.Errorf("a write request maps host %p with flags %#x", host, mp.flags)
 	}
-	if mp, _, ok := fb.mappingOf(ro[0].gpa); !ok || mp.flags != mapFlagRead|mapFlagExecute {
+	if mp, _, ok := fb.mappingOf(ro[0].GPA); !ok || mp.flags != mapFlagRead|mapFlagExecute {
 		t.Error("the read-only range changed when the writable range registered")
 	}
 	if maps, unmaps := fb.calls(); maps-maps0 != 1 || unmaps != unmaps0 {
@@ -181,7 +181,7 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 
 	// A later read request reuses the writable range without a call.
 	again, err := m.resolve(mem[:2*pageSize], false, nil)
-	if err != nil || len(again) != 1 || again[0].gpa != rw[0].gpa {
+	if err != nil || len(again) != 1 || again[0].GPA != rw[0].GPA {
 		t.Fatalf("read after write got %v, want the writable range (%v)", again, err)
 	}
 	if maps, _ := fb.calls(); maps-maps0 != 1 {
@@ -194,10 +194,10 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 	if err != nil || len(mixed) != 2 {
 		t.Fatalf("mixed resolve returned %v, %v", mixed, err)
 	}
-	if mixed[0].gpa != rw[0].gpa || mixed[0].size != 2*pageSize || mixed[1].size != 2*pageSize {
+	if mixed[0].GPA != rw[0].GPA || mixed[0].Size != 2*pageSize || mixed[1].Size != 2*pageSize {
 		t.Errorf("mixed resolve returned %v", mixed)
 	}
-	if mp, _, _ := fb.mappingOf(mixed[1].gpa); mp.flags != mapFlagRead|mapFlagExecute {
+	if mp, _, _ := fb.mappingOf(mixed[1].GPA); mp.flags != mapFlagRead|mapFlagExecute {
 		t.Errorf("the unregistered part maps with flags %#x", mp.flags)
 	}
 }
@@ -217,7 +217,7 @@ func TestMemoryMapFailedRegistrationChangesNothing(t *testing.T) {
 	}
 	fb.mapErr = nil
 	runs, err := m.resolve(mem[:pageSize], true, nil)
-	if err != nil || len(runs) != 1 || runs[0].gpa < gpaTableEnd || runs[0].gpa >= gpaTableEnd+arenaSize {
+	if err != nil || len(runs) != 1 || runs[0].GPA < gpaTableEnd || runs[0].GPA >= gpaTableEnd+arenaSize {
 		t.Fatalf("retry returned %v, %v, want the first arena", runs, err)
 	}
 }
@@ -236,10 +236,10 @@ func TestMemoryMapSpansTwoArenas(t *testing.T) {
 		t.Errorf("a range over two arenas made %d map calls, want 2", maps-maps0)
 	}
 	// Two fresh arenas take neighbouring windows, so the range stays whole.
-	if len(runs) != 1 || runs[0].size != uint64(len(mem)) {
+	if len(runs) != 1 || runs[0].Size != uint64(len(mem)) {
 		t.Errorf("resolve returned %v, want one run of %d bytes", runs, len(mem))
 	}
-	host, ok := hostOf(fb, runs[0].gpa+uint64(len(mem))-pageSize)
+	host, ok := hostOf(fb, runs[0].GPA+uint64(len(mem))-pageSize)
 	if !ok || host != unsafe.Pointer(&mem[len(mem)-pageSize]) {
 		t.Errorf("the last guest page maps host %p, want %p", host, &mem[len(mem)-pageSize])
 	}

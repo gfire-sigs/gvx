@@ -17,7 +17,6 @@
 package systrap
 
 import (
-	"encoding/binary"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -116,25 +115,16 @@ func (r *winRegs) storeTo(ac *arch.Context64, ret uint64) {
 // storeVector copies V0 to V31, FPSR, and FPCR from the sysmsg into the
 // floating-point state of ac.
 func (m *winSysmsg) storeVector(ac *arch.Context64) {
-	state := *ac.FloatingPointData()
-	if len(state) < fpStateOffV+32*16 {
-		return
-	}
-	copy(state[fpStateOffV:fpStateOffV+32*16], m.Vec[:])
-	binary.LittleEndian.PutUint32(state[fpStateOffFpsr:], uint32(m.Fpsr))
-	binary.LittleEndian.PutUint32(state[fpStateOffFpcr:], uint32(m.Fpcr))
+	copyFPToArch(ac, m.Vec[:], uint32(m.Fpsr), uint32(m.Fpcr))
 }
 
 // loadVector copies the floating-point state of ac into the vector block of
 // the sysmsg. The spill routine loads the block on the next resume.
 func (m *winSysmsg) loadVector(ac *arch.Context64) {
-	state := *ac.FloatingPointData()
-	if len(state) < fpStateOffV+32*16 {
-		return
+	if fpsr, fpcr, ok := copyFPFromArch(m.Vec[:], ac); ok {
+		m.Fpsr = uint64(fpsr)
+		m.Fpcr = uint64(fpcr)
 	}
-	copy(m.Vec[:], state[fpStateOffV:fpStateOffV+32*16])
-	m.Fpsr = uint64(binary.LittleEndian.Uint32(state[fpStateOffFpsr:]))
-	m.Fpcr = uint64(binary.LittleEndian.Uint32(state[fpStateOffFpcr:]))
 }
 
 // resumeState returns the state that the Sentry publishes for ac after a trap.

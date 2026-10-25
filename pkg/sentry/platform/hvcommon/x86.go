@@ -14,7 +14,112 @@
 
 package hvcommon
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/hostarch"
+)
+
+// Linux si_code values for SIGSEGV, SIGBUS, SIGILL, SIGFPE, and SIGTRAP.
+const (
+	SegvMapErr = 1
+	SegvAccErr = 2
+	BusAdrAln  = 1
+	BusAdrErr  = 2
+	BusObjErr  = 3
+	IllIllOpc  = 1
+	IllIllOpn  = 2
+	IllIllTrp  = 4
+	TrapBrkpt  = 1
+	FpeIntDiv  = 1
+	FpeIntOvf  = 2
+	FpeFltDiv  = 3
+	FpeFltOvf  = 4
+	FpeFltUnd  = 5
+	FpeFltRes  = 6
+	FpeFltInv  = 7
+)
+
+// Architectural x86-64 exception vector numbers.
+const (
+	X86VecDivide        = 0
+	X86VecDebug         = 1
+	X86VecNMI           = 2
+	X86VecBreakpoint    = 3
+	X86VecOverflow      = 4
+	X86VecBound         = 5
+	X86VecInvalidOpcode = 6
+	X86VecNoMath        = 7
+	X86VecDoubleFault   = 8
+	X86VecInvalidTSS    = 10
+	X86VecSegNotPresent = 11
+	X86VecStackSegment  = 12
+	X86VecGeneralProt   = 13
+	X86VecPageFault     = 14
+	X86VecX87           = 16
+	X86VecAlignment     = 17
+	X86VecMachineCheck  = 18
+	X86VecSIMD          = 19
+)
+
+// ClassifyX86Exception maps an x86-64 guest exception vector, error code, CR2,
+// and RIP to a Linux SignalInfo and memory AccessType.
+func ClassifyX86Exception(vector, errCode, cr2, rip uint64) (sig *linux.SignalInfo, at hostarch.AccessType, hasAddr bool, addr uint64, err error) {
+	info := &linux.SignalInfo{}
+	hasAddr = true
+	addr = rip
+	switch vector {
+	case X86VecPageFault:
+		info.Signo = int32(linux.SIGSEGV)
+		addr = cr2
+		at = hostarch.AccessType{
+			Read:    errCode&(1<<1) == 0,
+			Write:   errCode&(1<<1) != 0,
+			Execute: errCode&(1<<4) != 0,
+		}
+		info.Code = SegvMapErr
+		if errCode&1 != 0 {
+			info.Code = SegvAccErr
+		}
+	case X86VecDebug:
+		info.Signo = int32(linux.SIGTRAP)
+		info.Code = linux.TRAP_TRACE
+	case X86VecBreakpoint:
+		info.Signo = int32(linux.SIGTRAP)
+		info.Code = linux.SI_KERNEL
+		hasAddr, addr = false, 0
+	case X86VecGeneralProt, X86VecSegNotPresent, X86VecBound, X86VecInvalidTSS, X86VecStackSegment:
+		info.Signo = int32(linux.SIGSEGV)
+		info.Code = linux.SI_KERNEL
+	case X86VecInvalidOpcode, X86VecNoMath:
+		info.Signo = int32(linux.SIGILL)
+		info.Code = IllIllOpc
+	case X86VecDivide:
+		info.Signo = int32(linux.SIGFPE)
+		info.Code = FpeIntDiv
+	case X86VecOverflow:
+		info.Signo = int32(linux.SIGFPE)
+		info.Code = FpeIntOvf
+	case X86VecX87, X86VecSIMD:
+		info.Signo = int32(linux.SIGFPE)
+		info.Code = FpeFltInv
+	case X86VecAlignment:
+		info.Signo = int32(linux.SIGBUS)
+		info.Code = BusAdrAln
+		hasAddr, addr = false, 0
+	case X86VecNMI, X86VecDoubleFault, X86VecMachineCheck:
+		return nil, hostarch.NoAccess, false, 0, fmt.Errorf("unrecoverable guest exception, vector %d, error code %#x, rip %#x", vector, errCode, rip)
+	default:
+		info.Signo = int32(linux.SIGSEGV)
+		info.Code = linux.SI_KERNEL
+	}
+	if hasAddr {
+		info.SetAddr(addr)
+	}
+	return info, at, hasAddr, addr, nil
+}
 
 // Segment selectors of the guest GDT. They follow the Linux x86-64 layout, so
 // the user selectors equal the values that pkg/sentry/arch stores in the user

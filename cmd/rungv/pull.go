@@ -16,12 +16,9 @@ package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx"
@@ -42,44 +39,34 @@ func init() {
 }
 
 func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("rungv pull", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-
-	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
+	fs := newImageFlagSet("pull", stderr)
+	cacheFlags := addImageCacheFlags(fs)
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL that replaces the registry of the reference")
-	archFlag := fs.String("arch", runtime.GOARCH, "Target Linux architecture (amd64 or arm64)")
 
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
+	if code, stop := parseImageFlags(fs, args); stop {
+		return code
 	}
 
 	remaining := fs.Args()
 	if len(remaining) == 0 {
-		_, _ = fmt.Fprintln(stderr, "rungv pull: missing <image-or-archive> argument")
-		return 2
+		return imageUsageError(stderr, "pull", "missing <image-or-archive> argument")
 	}
 	target := remaining[0]
 	registryURL := strings.TrimSpace(*registryURLFlag)
 
-	cache, err := gvx.NewLayerCache(strings.TrimSpace(*cacheDirFlag))
+	cache, arch, err := cacheFlags.open()
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv pull: %v\n", err)
-		return 1
+		return imageFail(stderr, "pull", err)
 	}
 
 	if info, statErr := os.Stat(target); statErr == nil && !info.IsDir() {
-		resolved, err := gvx.ResolveImage(ctx, cache, registryURL, target, *archFlag)
+		resolved, err := gvx.ResolveImage(ctx, cache, registryURL, target, arch)
 		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "rungv pull: %v\n", err)
-			return 1
+			return imageFail(stderr, "pull", err)
 		}
 		layerCount := len(resolved.LayerDigests)
 		if closeErr := resolved.Close(); closeErr != nil {
-			_, _ = fmt.Fprintf(stderr, "rungv pull: %v\n", closeErr)
-			return 1
+			return imageFail(stderr, "pull", closeErr)
 		}
 		_, _ = fmt.Fprintf(stdout, "pulled %s (%d EROFS layers cached in %s)\n", target, layerCount, cache.Dir())
 		return 0
@@ -94,26 +81,23 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 		baseURL = ref.BaseURL()
 	}
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv pull: %v\n", err)
-		return 2
+		return imageUsageError(stderr, "pull", "%v", err)
 	}
 
-	before, _ := cache.CachedDigest(baseURL, ref.Repository, ref.ManifestReference(), *archFlag)
+	before, _ := cache.CachedDigest(baseURL, ref.Repository, ref.ManifestReference(), arch)
 	label := ref.Tag
 	if ref.Digest != "" {
 		label = ref.Digest
 	}
 	_, _ = fmt.Fprintf(stdout, "%s: Pulling from %s\n", label, ref.Repository)
 
-	resolved, err := gvx.ResolveImage(ctx, cache, registryURL, target, *archFlag)
+	resolved, err := gvx.ResolveImage(ctx, cache, registryURL, target, arch)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv pull: %v\n", err)
-		return 1
+		return imageFail(stderr, "pull", err)
 	}
 	digest := resolved.ManifestDigest
 	if closeErr := resolved.Close(); closeErr != nil {
-		_, _ = fmt.Fprintf(stderr, "rungv pull: %v\n", closeErr)
-		return 1
+		return imageFail(stderr, "pull", closeErr)
 	}
 	status := "Downloaded newer image for " + ref.Familiar()
 	if before != "" && before == digest {

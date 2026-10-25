@@ -213,23 +213,35 @@ func LoadArchiveTar(r io.Reader, cache *LayerCache, targetArch string) (*Resolve
 	return img, loadErr
 }
 
+func (a *archive) readIndexManifests() ([]byte, ImageIndex, bool, error) {
+	if _, ok := a.members["index.json"]; !ok {
+		return nil, ImageIndex{}, false, nil
+	}
+	raw, err := a.readJSON("index.json")
+	if err != nil {
+		return nil, ImageIndex{}, false, err
+	}
+	var idx ImageIndex
+	if err := json.Unmarshal(raw, &idx); err == nil && len(idx.Manifests) > 0 {
+		return raw, idx, true, nil
+	}
+	if _, ok := a.members["oci-layout"]; ok {
+		return nil, ImageIndex{}, false, errors.New("oci: archive has an oci-layout marker but index.json lists no manifests")
+	}
+	return nil, ImageIndex{}, false, nil
+}
+
 func (a *archive) load(targetArch string) (*ResolvedImage, error) {
 	if err := a.index(); err != nil {
 		return nil, err
 	}
 
-	if _, ok := a.members["index.json"]; ok {
-		raw, err := a.readJSON("index.json")
-		if err != nil {
-			return nil, err
-		}
-		var idx ImageIndex
-		if err := json.Unmarshal(raw, &idx); err == nil && len(idx.Manifests) > 0 {
-			return a.loadOCILayout(raw, targetArch)
-		}
-		if _, ok := a.members["oci-layout"]; ok {
-			return nil, errors.New("oci: archive has an oci-layout marker but index.json lists no manifests")
-		}
+	raw, _, ok, err := a.readIndexManifests()
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return a.loadOCILayout(raw, targetArch)
 	}
 	if _, ok := a.members["manifest.json"]; ok {
 		return a.loadDockerSave(targetArch)
@@ -373,20 +385,16 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 	if err != nil {
 		return nil, false, err
 	}
-	cfg, err := parseImageConfig(cfgBytes, targetArch, len(e.Layers))
+	parsed, err := parseImageConfigFile(cfgBytes, targetArch, len(e.Layers))
 	if err != nil {
 		return nil, true, err
-	}
-	var parsed imageConfigFile
-	if err := json.Unmarshal(cfgBytes, &parsed); err != nil {
-		return nil, false, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
 	}
 	if len(parsed.RootFS.DiffIDs) != len(e.Layers) {
 		return nil, false, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", len(parsed.RootFS.DiffIDs), len(e.Layers))
 	}
 
 	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
-	out := &dockerSaveImage{cfgBytes: cfgBytes, cfg: cfg, diffIDs: parsed.RootFS.DiffIDs}
+	out := &dockerSaveImage{cfgBytes: cfgBytes, cfg: parsed.Config, diffIDs: parsed.RootFS.DiffIDs}
 	for i, layer := range e.Layers {
 		diffHex, err := parseDigest(parsed.RootFS.DiffIDs[i])
 		if err != nil {

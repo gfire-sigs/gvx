@@ -28,8 +28,8 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/refs"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
-	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/socket/unix/transport"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -47,32 +47,19 @@ const (
 	maxLinks = 65000
 )
 
-// ChunkMemory supplies the memory for the chunks of mapped files. A platform
-// that runs guest code in another process maps guest pages by file descriptor,
-// so it cannot use Go heap memory. The Linux systrap platform is one.
-type ChunkMemory interface {
-	memmap.File
-
-	// AllocateChunk returns a zeroed range of length bytes. The caller holds
-	// one reference, which it drops with DecRef.
-	AllocateChunk(length uint64) (memmap.FileRange, error)
-}
-
-type chunkMemoryHolder struct{ m ChunkMemory }
+// ChunkMemory supplies the memory for the chunks of mapped files.
+type ChunkMemory = chunkcache.ChunkMemory
 
 // SetChunkMemory makes mem back the chunks that files create from now on. Call
 // it once before the first mapping, and only with memory that outlives every
 // mapping.
 func (vol *Volume) SetChunkMemory(mem ChunkMemory) {
-	vol.chunkMem.Store(&chunkMemoryHolder{m: mem})
+	vol.chunkMem.Set(mem)
 }
 
 // chunkMemory returns the shared chunk memory, or nil.
 func (vol *Volume) chunkMemory() ChunkMemory {
-	if h := vol.chunkMem.Load(); h != nil {
-		return h.m
-	}
-	return nil
+	return vol.chunkMem.Get()
 }
 
 // InternalFilesystemOptions is the vfs.GetFilesystemOptions.InternalData of a

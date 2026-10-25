@@ -74,17 +74,20 @@ func TestClassifyX86(t *testing.T) {
 func esr(ec, iss uint64) uint64 { return ec<<esrECShift | 1<<25 | iss }
 
 func TestClassifyA64(t *testing.T) {
-	const pc = 0x400100
-	const far = 0x7FFF0000
+	const pc uint64 = 0x400100
+	const far uint64 = 0x7FFF0000
+	const sp uint64 = 0x7FFEE003
 	for _, c := range []struct {
-		name      string
-		slot, esr uint64
-		want      trap
-		wantErr   bool
+		name           string
+		slot, esr, far uint64
+		want           trap
+		wantErr        bool
 	}{
 		{name: "svc", slot: a64SlotLowA64Sync, esr: esr(esrECSVC64, 0), want: trap{kind: trapSyscall}},
 		{name: "wfi", slot: a64SlotLowA64Sync, esr: esr(esrECWFx, 0), want: trap{kind: trapSkip}},
 		{name: "data abort translation level 3 read", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x07),
+			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvMapErr, addr: far, hasAddr: true, access: hostarch.Read}},
+		{name: "data abort strips TBI tag", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x07), far: 0xAA00_0000_0000_0000 | far,
 			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvMapErr, addr: far, hasAddr: true, access: hostarch.Read}},
 		{name: "data abort permission level 3 write", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, esrWnR|0x0F),
 			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvAccErr, addr: far, hasAddr: true, access: hostarch.Write}},
@@ -97,7 +100,7 @@ func TestClassifyA64(t *testing.T) {
 		{name: "data abort external", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x10),
 			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, addr: far, hasAddr: true, access: hostarch.Read}},
 		{name: "sp alignment", slot: a64SlotLowA64Sync, esr: esr(esrECSPAlign, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrAln, addr: pc, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrAln, addr: sp, hasAddr: true}},
 		{name: "unknown reason", slot: a64SlotLowA64Sync, esr: esr(esrECUnknown, 0),
 			want: trap{kind: trapSignal, signo: linux.SIGILL, code: illIllOpc, addr: pc, hasAddr: true}},
 		{name: "mrs from el0", slot: a64SlotLowA64Sync, esr: esr(esrECSysReg, 0),
@@ -114,7 +117,11 @@ func TestClassifyA64(t *testing.T) {
 		{name: "exception taken at el1", slot: a64SlotCurSPxSync, esr: esr(esrECDataAbrt, 0x07), wantErr: true},
 		{name: "aarch32 el0", slot: a64SlotLowA32Sync, wantErr: true},
 	} {
-		got, err := classifyA64(c.slot, c.esr, far, pc)
+		f := far
+		if c.far != 0 {
+			f = c.far
+		}
+		got, err := classifyA64(c.slot, c.esr, f, pc, sp)
 		if (err != nil) != c.wantErr {
 			t.Errorf("%s: error %v, want error %v", c.name, err, c.wantErr)
 			continue

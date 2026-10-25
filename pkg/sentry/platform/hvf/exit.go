@@ -17,19 +17,21 @@ package hvf
 import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // Linux si_code values shared by the exit decoders.
 const (
-	sigIllIllOpc = 1
-	sigBusAdrAln = 1
-	sigBusAdrErr = 2
-	sigBusObjErr = 3
-	sigSegvMap   = 1
-	sigSegvAcc   = 2
-	sigTrapBrkpt = 1
-	sigTrapTrace = 2
-	sigTrapHWBkp = 4
+	sigIllIllOpc = hvcommon.IllIllOpc
+	sigBusAdrAln = hvcommon.BusAdrAln
+	sigBusAdrErr = hvcommon.BusAdrErr
+	sigBusObjErr = hvcommon.BusObjErr
+	sigSegvMap   = hvcommon.SegvMapErr
+	sigSegvAcc   = hvcommon.SegvAccErr
+	sigTrapBrkpt = linux.TRAP_BRKPT
+	sigTrapTrace = linux.TRAP_TRACE
+	sigTrapHWBkp = linux.TRAP_HWBKPT
+	sigFpeFltInv = hvcommon.FpeFltInv
 )
 
 // exitKind classifies a guest exit.

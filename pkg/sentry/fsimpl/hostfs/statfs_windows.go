@@ -99,16 +99,9 @@ func (h *hostRoot) statfsByHandle() (hostVolume, bool) {
 // finalDirPath returns the DOS path of the directory that handle names. The
 // result has the prefix \\?\ and the stored case of every component.
 func finalDirPath(handle windows.Handle) (string, error) {
-	var stack [512]uint16
-	buf := stack[:]
-	for {
-		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), 0)
-		if err != nil {
-			return "", err
-		}
-		if int(n) < len(buf) {
-			return windows.UTF16ToString(buf[:n]), nil
-		}
-		buf = make([]uint16, int(n)+1)
+	buf, err := finalPathByHandle(handle, 0)
+	if err != nil {
+		return "", err
 	}
+	return windows.UTF16ToString(buf), nil
 }

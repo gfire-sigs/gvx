@@ -183,7 +183,7 @@ func (c *fileData) punched(off, length uint64) {
 		base := idx << chunkShift
 		lo, hi := max(off, base), min(end, base+chunkSize)
 		if lo < hi {
-			clear(ch.buf[lo-base : hi-base])
+			clear(ch.Buf[lo-base : hi-base])
 		}
 	}
 }

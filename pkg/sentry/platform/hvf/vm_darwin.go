@@ -230,8 +230,8 @@ func (v *vmState) releaseSlabsLocked() {
 	v.freePages = nil
 }
 
-// allocPage implements pageAllocator.
-func (v *vmState) allocPage() ([]byte, uint64, error) {
+// AllocPage implements pageAllocator.
+func (v *vmState) AllocPage() ([]byte, uint64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.closed {
@@ -276,8 +276,8 @@ func (v *vmState) newSlabLocked() error {
 	return nil
 }
 
-// freePage implements pageAllocator.
-func (v *vmState) freePage(page []byte, ipa uint64) {
+// FreePage implements pageAllocator.
+func (v *vmState) FreePage(page []byte, ipa uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.pagesInUse--

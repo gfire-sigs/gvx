@@ -15,25 +15,16 @@
 package ext4lite
 
 import (
-	"strings"
-
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
-// checkXattrPrefix accepts the namespaces that this filesystem stores:
-// user, trusted, and security. A POSIX ACL is not supported, so the system
-// namespace is rejected.
 func checkXattrPrefix(name string) error {
-	for _, prefix := range []string{linux.XATTR_USER_PREFIX, linux.XATTR_TRUSTED_PREFIX, linux.XATTR_SECURITY_PREFIX} {
-		if strings.HasPrefix(name, prefix) {
-			return nil
-		}
-	}
-	return linuxerr.EOPNOTSUPP
+	return chunkcache.CheckXattrPrefix(name)
 }
 
 // listXattr returns the names of the attributes that the caller may see. The
@@ -44,24 +35,7 @@ func (i *inode) listXattr(creds *auth.Credentials, size uint64) ([]string, error
 	if err != nil {
 		return nil, toLinuxErr(err)
 	}
-	haveCap := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
-	names := make([]string, 0, len(all))
-	listSize := 0
-	for _, name := range all {
-		if checkXattrPrefix(name) != nil {
-			continue
-		}
-		if !haveCap && strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
-			continue
-		}
-		names = append(names, name)
-		// One more byte for the null terminator.
-		listSize += len(name) + 1
-	}
-	if size != 0 && uint64(listSize) > size {
-		return nil, linuxerr.ERANGE
-	}
-	return names, nil
+	return chunkcache.FilterXattrList(all, creds, size)
 }
 
 func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {

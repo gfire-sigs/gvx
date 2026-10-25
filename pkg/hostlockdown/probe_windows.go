@@ -26,24 +26,30 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// probeRestrictedOpenBlocked binds the restricted token to a scratch thread
-// and opens host paths that no mount covers. The kernel
-// must answer ERROR_ACCESS_DENIED for each existing path. The probe also
-// proves that SetThreadToken accepts the token without a privilege.
-//
-// The scratch goroutine never unlocks its thread. The runtime ends the thread
-// when the goroutine returns, and that drops the impersonation token.
-func probeRestrictedOpenBlocked(token windows.Token, mountsReal []string) error {
+// runOnRestrictedThread locks a scratch OS thread, impersonates token, and
+// invokes fn. The scratch goroutine never unlocks its thread so the runtime
+// destroys the OS thread and drops the impersonation token on return.
+func runOnRestrictedThread(token windows.Token, threadDesc string, fn func() error) error {
 	result := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
 		if err := windows.SetThreadToken(nil, token); err != nil {
-			result <- fmt.Errorf("hostlockdown: SetThreadToken on probe thread: %w", err)
+			result <- fmt.Errorf("hostlockdown: SetThreadToken on %s: %w", threadDesc, err)
 			return
 		}
-		result <- openUnlistedPaths(unlistedProbeTargets(mountsReal))
+		result <- fn()
 	}()
 	return <-result
+}
+
+// probeRestrictedOpenBlocked binds the restricted token to a scratch thread
+// and opens host paths that no mount covers. The kernel
+// must answer ERROR_ACCESS_DENIED for each existing path. The probe also
+// proves that SetThreadToken accepts the token without a privilege.
+func probeRestrictedOpenBlocked(token windows.Token, mountsReal []string) error {
+	return runOnRestrictedThread(token, "probe thread", func() error {
+		return openUnlistedPaths(unlistedProbeTargets(mountsReal))
+	})
 }
 
 // unlistedProbeTargets returns host locations outside every mount. The parent
@@ -105,20 +111,12 @@ func openUnlistedPaths(paths []string) error {
 // probeRestrictedSocketBlocked binds token to a scratch thread and verifies
 // that creating a new TCP socket via WSASocket fails.
 func probeRestrictedSocketBlocked(token windows.Token) error {
-	result := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		if err := windows.SetThreadToken(nil, token); err != nil {
-			result <- fmt.Errorf("hostlockdown: SetThreadToken on socket probe thread: %w", err)
-			return
-		}
+	return runOnRestrictedThread(token, "socket probe thread", func() error {
 		s, err := windows.WSASocket(windows.AF_INET, windows.SOCK_STREAM, windows.IPPROTO_TCP, nil, 0, windows.WSA_FLAG_OVERLAPPED)
 		if err == nil {
 			_ = windows.Closesocket(s)
-			result <- errors.New("hostlockdown: restricted token created a TCP socket")
-			return
+			return errors.New("hostlockdown: restricted token created a TCP socket")
 		}
-		result <- nil
-	}()
-	return <-result
+		return nil
+	})
 }

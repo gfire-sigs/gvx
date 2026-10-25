@@ -19,6 +19,9 @@ package systrap
 import (
 	"encoding/binary"
 	"fmt"
+
+	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // The Windows engine has no C toolchain step, so Go code generates the spill
@@ -67,34 +70,34 @@ const (
 
 // a64ldrX and the other encoders build one instruction word. Each takes the
 // operands in the order of the assembler text.
-func a64ldrX(rt, rn, off uint32) uint32 { return 0xf9400000 | (off/8)<<10 | rn<<5 | rt }
-func a64strX(rt, rn, off uint32) uint32 { return 0xf9000000 | (off/8)<<10 | rn<<5 | rt }
-func a64ldrW(rt, rn, off uint32) uint32 { return 0xb9400000 | (off/4)<<10 | rn<<5 | rt }
-func a64strW(rt, rn, off uint32) uint32 { return 0xb9000000 | (off/4)<<10 | rn<<5 | rt }
+func a64ldrX(rt, rn, off uint32) uint32 { return hvcommon.LDRX(int(rn), int(rt), int(off)) }
+func a64strX(rt, rn, off uint32) uint32 { return hvcommon.STRX(int(rn), int(rt), int(off)) }
+func a64ldrW(rt, rn, off uint32) uint32 { return hvcommon.LDRW(int(rn), int(rt), int(off)) }
+func a64strW(rt, rn, off uint32) uint32 { return hvcommon.STRW(int(rn), int(rt), int(off)) }
 func a64ldarW(rt, rn uint32) uint32     { return 0x88dffc00 | rn<<5 | rt }
 func a64stlrW(rt, rn uint32) uint32     { return 0x889ffc00 | rn<<5 | rt }
 
 // a64stpQ and a64ldpQ store and load two 128-bit vector registers. off is a
 // byte offset that is a multiple of 16 between -1024 and 1008.
 func a64stpQ(rt, rt2, rn uint32, off int32) uint32 {
-	return 0xad000000 | uint32(off/16)&0x7f<<15 | rt2<<10 | rn<<5 | rt
+	return hvcommon.STPQ(int(rn), int(rt), int(rt2), int(off))
 }
 
 func a64ldpQ(rt, rt2, rn uint32, off int32) uint32 {
-	return 0xad400000 | uint32(off/16)&0x7f<<15 | rt2<<10 | rn<<5 | rt
+	return hvcommon.LDPQ(int(rn), int(rt), int(rt2), int(off))
 }
 
 // a64ldp and a64stp use the signed offset form. off is a byte offset that is a
 // multiple of 8 between -512 and 504.
 func a64ldp(rt, rt2, rn uint32, off int32) uint32 {
-	return 0xa9400000 | uint32(off/8)&0x7f<<15 | rt2<<10 | rn<<5 | rt
+	return hvcommon.LDPX(int(rn), int(rt), int(rt2), int(off))
 }
 
 func a64stp(rt, rt2, rn uint32, off int32) uint32 {
-	return 0xa9000000 | uint32(off/8)&0x7f<<15 | rt2<<10 | rn<<5 | rt
+	return hvcommon.STPX(int(rn), int(rt), int(rt2), int(off))
 }
 
-func a64movReg(rd, rm uint32) uint32 { return 0xaa0003e0 | rm<<16 | rd }
+func a64movReg(rd, rm uint32) uint32 { return hvcommon.MOVReg(int(rd), int(rm)) }
 
 // a64movFromSP is `mov xd, sp`, and a64movToSP is `mov sp, xn`.
 func a64movFromSP(rd uint32) uint32 { return 0x91000000 | a64SP<<5 | rd }
@@ -103,15 +106,15 @@ func a64movToSP(rn uint32) uint32   { return 0x91000000 | rn<<5 | a64SP }
 // a64addSPShifted is `add sp, xn, #imm, lsl #12`.
 func a64addSPShifted(rn, imm uint32) uint32 { return 0x91400000 | imm<<10 | rn<<5 | a64SP }
 
-func a64movzX(rd, imm uint32) uint32 { return 0xd2800000 | imm<<5 | rd }
-func a64movzW(rd, imm uint32) uint32 { return 0x52800000 | imm<<5 | rd }
+func a64movzX(rd, imm uint32) uint32 { return hvcommon.MOVZ(int(rd), uint16(imm)) }
+func a64movzW(rd, imm uint32) uint32 { return hvcommon.MOVZW(int(rd), uint16(imm)) }
 
 // a64cmpW is `cmp wn, #imm`, and a64subsW1 is `subs wd, wd, #1`.
 func a64cmpW(rn, imm uint32) uint32 { return 0x7100001f | imm<<10 | rn<<5 }
 func a64subsW1(rd uint32) uint32    { return 0x71000400 | rd<<5 | rd }
 
-func a64blr(rn uint32) uint32 { return 0xd63f0000 | rn<<5 }
-func a64br(rn uint32) uint32  { return 0xd61f0000 | rn<<5 }
+func a64blr(rn uint32) uint32 { return hvcommon.BLR(int(rn)) }
+func a64br(rn uint32) uint32  { return hvcommon.BR(int(rn)) }
 
 // a64Asm collects words and resolves branches to labels.
 type a64Asm struct {
@@ -395,22 +398,7 @@ const winTLSSlotSize = loadSlotSize
 // address into xN, loads the TLS word of the guest through it, and returns to
 // the instruction after the site. It changes no other register and no flag.
 func encodeWinTLSSlot(buf []byte, slotVA, site uint64, reg uint8) error {
-	if len(buf) < winTLSSlotSize {
-		return fmt.Errorf("TLS slot buffer has %d bytes", len(buf))
-	}
-	if reg >= 31 {
-		return fmt.Errorf("TLS slot register %d", reg)
-	}
-	back, err := encodeBranch(slotVA+8, winSiteReturn(site))
-	if err != nil {
-		return err
-	}
-	r := uint32(reg)
-	binary.LittleEndian.PutUint32(buf[0:], a64TPIDR|r)
-	binary.LittleEndian.PutUint32(buf[4:], a64ldrX(r, r, winOffTLS))
-	binary.LittleEndian.PutUint32(buf[8:], back)
-	binary.LittleEndian.PutUint32(buf[12:], arm64NOP)
-	return nil
+	return encodeLoadSysmsgSlot(buf, slotVA, winSiteReturn(site), reg, a64TPIDR, false, winOffTLS)
 }
 
 // encodeWinX18SetSlot writes the slot that replaces `mov x18, xN` at site. The
@@ -434,3 +422,21 @@ func encodeWinX18SetSlot(buf []byte, slotVA, site uint64, reg uint8) error {
 	binary.LittleEndian.PutUint32(buf[12:], back)
 	return nil
 }
+
+// probeProgram returns the guest code of Probe: calls system calls with
+// number 5, then one with number 6.
+func probeProgram(calls int) []byte {
+	words := []uint32{
+		a64movzX(1, uint32(calls)), a64movzX(8, 5),
+		arm64SVC0, 0xf1000400 | 1<<5 | 1, 0x54ffffc1, // svc; subs x1, x1, #1; b.ne -8
+		a64movzX(8, 6), arm64SVC0,
+	}
+	code := make([]byte, 4*len(words))
+	for i, w := range words {
+		binary.LittleEndian.PutUint32(code[4*i:], w)
+	}
+	return code
+}
+
+// probeSyscallNumber returns the number of the system call that stopped the guest.
+func probeSyscallNumber(ac *arch.Context64) uint64 { return ac.StateData().Regs.Regs[8] }

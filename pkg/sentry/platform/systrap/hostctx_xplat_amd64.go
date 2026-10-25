@@ -21,6 +21,7 @@ import (
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // hostContext holds one Windows AMD64 CONTEXT record. The record needs
@@ -61,8 +62,8 @@ const (
 	// Windows user-mode selectors of a 64-bit thread. A CONTEXT_CONTROL record
 	// with a zero SegCs makes Windows put the thread in 32-bit compatibility
 	// mode, which drops the upper half of RIP and RSP.
-	userSegCs = 0x33
-	userSegSs = 0x2b
+	userSegCs = hvcommon.SelUserCS64
+	userSegSs = hvcommon.SelUserSS
 
 	ctxAMD64        = 0x00100000
 	ctxFlagControl  = ctxAMD64 | 0x1
@@ -94,6 +95,60 @@ var xstateComponents = []xstateComponent{
 // xsaveHeaderOffset is the offset of the XSAVE header. The first word of the
 // header is XSTATE_BV, which names the components that hold live state.
 const xsaveHeaderOffset = 512
+
+// loadXStateComponents copies the extended components of the Linux XSAVE image
+// fp enabled by mask into the slices returned by locate, and returns the
+// bitmask of components that were present and non-initial in fp.
+func loadXStateComponents(fp []byte, mask uint64, locate func(comp xstateComponent) []byte) uint64 {
+	var bv uint64
+	if len(fp) >= xsaveHeaderOffset+8 {
+		bv = binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
+	}
+	var loaded uint64
+	for _, comp := range xstateComponents {
+		bit := uint64(1) << comp.id
+		if mask&bit == 0 {
+			continue
+		}
+		dst := locate(comp)
+		if dst == nil {
+			continue
+		}
+		if bv&bit != 0 && len(fp) >= comp.offset+comp.size {
+			copy(dst, fp[comp.offset:comp.offset+comp.size])
+			loaded |= bit
+		} else {
+			clear(dst)
+		}
+	}
+	return loaded
+}
+
+// storeXStateComponents copies the extended components from locate into the
+// Linux XSAVE image fp and updates the XSTATE_BV header word.
+func storeXStateComponents(fp []byte, mask, have uint64, locate func(comp xstateComponent) []byte) {
+	if len(fp) < xsaveHeaderOffset+8 {
+		return
+	}
+	bv := binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
+	for _, comp := range xstateComponents {
+		bit := uint64(1) << comp.id
+		if mask&bit == 0 || len(fp) < comp.offset+comp.size {
+			continue
+		}
+		dst := fp[comp.offset : comp.offset+comp.size]
+		if have&bit == 0 {
+			clear(dst)
+			bv &^= bit
+			continue
+		}
+		if src := locate(comp); src != nil {
+			copy(dst, src)
+			bv |= bit
+		}
+	}
+	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], bv)
+}
 
 // ptr returns the address to pass to GetThreadContext and SetThreadContext.
 func (c *hostContext) ptr() uintptr { return uintptr(unsafe.Pointer(&c.buf[0])) }

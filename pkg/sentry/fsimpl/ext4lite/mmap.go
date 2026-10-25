@@ -16,83 +16,31 @@ package ext4lite
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 const (
-	// chunkShift is the log2 of the cache granule. The granule is a multiple of
-	// every host page size and of the 4 KiB guest page size.
-	chunkShift = 16
-	chunkSize  = 1 << chunkShift
-
-	// chunkAlign is the alignment of a chunk in host memory. Platforms map
-	// chunks into guest address spaces page by page.
-	chunkAlign = 16 << 10
-
-	// maxReadahead bounds how much of a mapping one Translate call loads.
-	maxReadahead = 64 << 10
+	chunkShift = chunkcache.ChunkShift
+	chunkSize  = chunkcache.ChunkSize
 )
 
-type cacheChunk struct {
-	buf   []byte
-	dirty bool
-
-	// mem and fr locate the chunk in shared memory. They are zero when buf is
-	// Go heap memory.
-	mem ChunkMemory
-	fr  memmap.FileRange
-}
-
-// release returns shared memory to its owner. The memory stays valid for the
-// mappings that still hold a reference.
-func (ch *cacheChunk) release() {
-	if ch.mem != nil {
-		ch.mem.DecRef(ch.fr)
-		ch.mem = nil
-	}
-}
+type cacheChunk = chunkcache.Chunk
 
 // newChunk allocates the memory of one chunk. With ChunkMemory, the chunk lives
 // in a memory file, which a platform can map into a guest process by file
 // descriptor. Without it, the chunk lives on the Go heap.
 func (c *fileData) newChunk() (*cacheChunk, error) {
-	mem := c.ino.fs.vol.chunkMemory()
-	if mem == nil {
-		return &cacheChunk{buf: newChunkBuf()}, nil
-	}
-	fr, err := mem.AllocateChunk(chunkSize)
-	if err != nil {
-		return nil, err
-	}
-	bs, err := mem.MapInternal(fr, hostarch.ReadWrite)
-	if err != nil {
-		mem.DecRef(fr)
-		return nil, err
-	}
-	if bs.NumBlocks() != 1 || bs.NumBytes() != chunkSize {
-		mem.DecRef(fr)
-		return nil, fmt.Errorf("ext4lite: the chunk memory maps %d blocks of %d bytes, want one block of %d", bs.NumBlocks(), bs.NumBytes(), chunkSize)
-	}
-	return &cacheChunk{buf: bs.Head().ToSlice(), mem: mem, fr: fr}, nil
-}
-
-// newChunkBuf allocates one chunk aligned to chunkAlign. Go heap memory never
-// moves, so slices handed to platforms stay valid for the chunk lifetime.
-func newChunkBuf() []byte {
-	raw := make([]byte, chunkSize+chunkAlign)
-	skip := (chunkAlign - int(uintptr(unsafe.Pointer(&raw[0]))%chunkAlign)) % chunkAlign
-	return raw[skip : skip+chunkSize : skip+chunkSize]
+	return chunkcache.NewChunk(c.ino.fs.vol.chunkMemory())
 }
 
 // fileData is the mapped-page cache of a regular file. The cache exists only
@@ -152,7 +100,7 @@ func (c *fileData) release(flush bool) error {
 // dropLocked frees every chunk.
 func (c *fileData) dropLocked() {
 	for _, ch := range c.chunks {
-		ch.release()
+		ch.Release()
 	}
 	c.chunks = nil
 	c.active.Store(false)
@@ -201,11 +149,11 @@ func (c *fileData) flushLocked(start, end uint64) error {
 	wrote := false
 	for idx, ch := range c.chunks {
 		base := idx << chunkShift
-		if !ch.dirty || base >= end || base+chunkSize <= start {
+		if !ch.Dirty || base >= end || base+chunkSize <= start {
 			continue
 		}
 		if base >= size {
-			ch.dirty = c.writableMaps > 0
+			ch.Dirty = c.writableMaps > 0
 			continue
 		}
 		limit := min(size-base, chunkSize)
@@ -213,7 +161,7 @@ func (c *fileData) flushLocked(start, end uint64) error {
 			errs = append(errs, err)
 			continue
 		}
-		ch.dirty = c.writableMaps > 0
+		ch.Dirty = c.writableMaps > 0
 	}
 	if wrote {
 		c.ino.touchMCtime()
@@ -226,7 +174,7 @@ func (c *fileData) flushLocked(start, end uint64) error {
 func (c *fileData) writeChunkLocked(ch *cacheChunk, base, limit uint64, wrote *bool) error {
 	n := c.ino.n
 	for off := uint64(0); off < limit; off += blockSize {
-		page := ch.buf[off:min(off+blockSize, limit)]
+		page := ch.Buf[off:min(off+blockSize, limit)]
 		if isZero(page) && holeAt(n, base+off) {
 			continue
 		}
@@ -271,7 +219,7 @@ func (c *fileData) writeThrough(oldSize uint64, off int64, p []byte) {
 		within := int(uint64(off) & (chunkSize - 1))
 		n := min(len(p), chunkSize-within)
 		if ch, ok := c.chunks[idx]; ok {
-			copy(ch.buf[within:within+n], p[:n])
+			copy(ch.Buf[within:within+n], p[:n])
 		}
 		off += int64(n)
 		p = p[n:]
@@ -291,7 +239,7 @@ func (c *fileData) zeroLocked(start, end uint64) {
 		base := idx << chunkShift
 		lo := max(start, base) - base
 		hi := min(end, base+chunkSize) - base
-		clear(ch.buf[lo:hi])
+		clear(ch.Buf[lo:hi])
 	}
 }
 
@@ -335,7 +283,7 @@ func (c *fileData) truncated(old, size uint64) {
 			dropped = append(dropped, ch)
 			delete(c.chunks, idx)
 		case base+chunkSize > size:
-			clear(ch.buf[size-base:])
+			clear(ch.Buf[size-base:])
 		}
 	}
 	c.dataMu.Unlock()
@@ -343,7 +291,7 @@ func (c *fileData) truncated(old, size uint64) {
 	pgend, _ := hostarch.PageRoundUp(size)
 	c.mappings.Invalidate(memmap.MappableRange{Start: pgend, End: math.MaxUint64}, memmap.InvalidateOpts{})
 	for _, ch := range dropped {
-		ch.release()
+		ch.Release()
 	}
 }
 
@@ -359,8 +307,8 @@ func (c *fileData) chunkLocked(idx uint64) (*cacheChunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.ino.n.readAt(ch.buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
-		ch.release()
+	if _, err := c.ino.n.readAt(ch.Buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
+		ch.Release()
 		return nil, err
 	}
 	c.chunks[idx] = ch
@@ -413,26 +361,11 @@ func (c *fileData) InvalidateUnsavable(ctx context.Context) error {
 	return toLinuxErr(c.syncData())
 }
 
-func maxFillRange(required, optional memmap.MappableRange) memmap.MappableRange {
-	if required.Length() >= maxReadahead {
-		return required
-	}
-	if optional.Length() <= maxReadahead {
-		return optional
-	}
-	optional.Start = required.Start
-	if optional.Length() <= maxReadahead {
-		return optional
-	}
-	optional.End = optional.Start + maxReadahead
-	return optional
-}
-
 // markDirtyLocked flags the chunks that overlap [start, end) as dirty.
 func (c *fileData) markDirtyLocked(start, end uint64) {
 	for idx := start >> chunkShift; idx <= (end-1)>>chunkShift; idx++ {
 		if ch, ok := c.chunks[idx]; ok {
-			ch.dirty = true
+			ch.Dirty = true
 		}
 	}
 }
@@ -458,7 +391,7 @@ func (c *fileData) Translate(ctx context.Context, required, optional memmap.Mapp
 	if optional.End > pgend {
 		optional.End = pgend
 	}
-	mr := maxFillRange(required, optional)
+	mr := chunkcache.MaxFillRange(required, optional)
 	for idx := mr.Start >> chunkShift; idx <= (mr.End-1)>>chunkShift; idx++ {
 		if _, err := c.chunkLocked(idx); err != nil {
 			if idx<<chunkShift < required.End {
@@ -474,41 +407,11 @@ func (c *fileData) Translate(ctx context.Context, required, optional memmap.Mapp
 		c.markDirtyLocked(mr.Start, mr.End)
 		perms.Write = true
 	}
-	ts := c.translationsLocked(mr, perms)
+	ts := chunkcache.Translations(c.chunks, mr, perms, &c.mf)
 	if beyondEOF {
 		return ts, &memmap.BusError{Err: io.EOF}
 	}
 	return ts, nil
-}
-
-// translationsLocked describes where the pages of mr live. Heap chunks form one
-// translation, and the heap file maps file offsets to chunk memory. Chunks in
-// shared memory need one translation each, because the allocator places chunks
-// apart. Every chunk of mr exists when this runs.
-func (c *fileData) translationsLocked(mr memmap.MappableRange, perms hostarch.AccessType) []memmap.Translation {
-	if c.chunks[mr.Start>>chunkShift].mem == nil {
-		return []memmap.Translation{{
-			Source: mr,
-			File:   &c.mf,
-			Offset: mr.Start,
-			Perms:  perms,
-		}}
-	}
-	var ts []memmap.Translation
-	for off := mr.Start; off < mr.End; {
-		idx := off >> chunkShift
-		ch := c.chunks[idx]
-		base := idx << chunkShift
-		end := min(mr.End, base+chunkSize)
-		ts = append(ts, memmap.Translation{
-			Source: memmap.MappableRange{Start: off, End: end},
-			File:   ch.mem,
-			Offset: ch.fr.Start + (off - base),
-			Perms:  perms,
-		})
-		off = end
-	}
-	return ts
 }
 
 // dataMemmapFile exposes the chunks of a fileData as a memmap.File. Offsets
@@ -543,7 +446,7 @@ func (mf *dataMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessTyp
 		}
 		base := idx << chunkShift
 		end := min(fr.End-base, chunkSize)
-		blocks = append(blocks, safemem.BlockFromSafeSlice(ch.buf[off-base:end]))
+		blocks = append(blocks, safemem.BlockFromSafeSlice(ch.Buf[off-base:end]))
 		off = base + end
 	}
 	if at.Write {

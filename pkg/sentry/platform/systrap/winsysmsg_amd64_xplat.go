@@ -145,23 +145,14 @@ func (m *winSysmsg) loadVector(ac *arch.Context64, enabled uint64) {
 func (m *winSysmsg) loadXsave(fp []byte, enabled uint64) {
 	clear(m.Xsave[:])
 	copy(m.Xsave[:xsaveHeaderOffset], fp)
+	loaded := loadXStateComponents(fp, enabled, func(comp xstateComponent) []byte {
+		return m.Xsave[comp.offset : comp.offset+comp.size]
+	})
 	var bv uint64
 	if len(fp) >= xsaveHeaderOffset+8 {
-		bv = binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
+		bv = binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:]) & winXsaveLegacy
 	}
-	bv &= winXsaveLegacy | enabled
-	bv |= winXsaveLegacy
-	for _, comp := range xstateComponents {
-		bit := uint64(1) << comp.id
-		if bv&bit == 0 {
-			continue
-		}
-		if len(fp) < comp.offset+comp.size {
-			bv &^= bit
-			continue
-		}
-		copy(m.Xsave[comp.offset:comp.offset+comp.size], fp[comp.offset:comp.offset+comp.size])
-	}
+	bv |= winXsaveLegacy | loaded
 	// XCOMP_BV and the reserved bytes of the header stay zero, which selects
 	// the standard format.
 	binary.LittleEndian.PutUint64(m.Xsave[xsaveHeaderOffset:], bv)
@@ -180,20 +171,7 @@ func (m *winSysmsg) storeXsave(fp []byte) {
 		return
 	}
 	have := binary.LittleEndian.Uint64(m.Xsave[xsaveHeaderOffset:])
-	bv := binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
-	for _, comp := range xstateComponents {
-		bit := uint64(1) << comp.id
-		if len(fp) < comp.offset+comp.size {
-			continue
-		}
-		dst := fp[comp.offset : comp.offset+comp.size]
-		if have&bit == 0 {
-			clear(dst)
-			bv &^= bit
-			continue
-		}
-		copy(dst, m.Xsave[comp.offset:comp.offset+comp.size])
-		bv |= bit
-	}
-	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], bv)
+	storeXStateComponents(fp, ^uint64(0), have, func(comp xstateComponent) []byte {
+		return m.Xsave[comp.offset : comp.offset+comp.size]
+	})
 }

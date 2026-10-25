@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/pipe"
 	"z.gfire.dev/gvx/pkg/sentry/socket/unix/transport"
@@ -205,15 +206,7 @@ func (d *dentry) IncRef() {
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
-	for {
-		r := d.refs.Load()
-		if r <= 0 {
-			return false
-		}
-		if d.refs.CompareAndSwap(r, r+1) {
-			return true
-		}
-	}
+	return chunkcache.TryIncRef(&d.refs)
 }
 
 // DecRef implements vfs.DentryImpl.DecRef.

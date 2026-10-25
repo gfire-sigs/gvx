@@ -21,14 +21,6 @@ import (
 	"strconv"
 
 	"z.gfire.dev/gvx/pkg/netbackend"
-	"z.gfire.dev/gvx/pkg/tcpip"
-	"z.gfire.dev/gvx/pkg/tcpip/header"
-	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
-	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
-	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
-	"z.gfire.dev/gvx/pkg/tcpip/stack"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 )
 
 // initNetstack builds the Netstack for the configured mode and pre-binds
@@ -36,37 +28,10 @@ import (
 func (s *Sandbox) initNetstack() error {
 	switch s.cfg.NetworkMode {
 	case NetModeNone:
-		st := stack.New(stack.Options{
-			NetworkProtocols: []stack.NetworkProtocolFactory{
-				ipv4.NewProtocol,
-				ipv6.NewProtocol,
-			},
-			TransportProtocols: []stack.TransportProtocolFactory{
-				tcp.NewProtocol,
-				udp.NewProtocol,
-			},
-		})
-		if err := st.CreateNIC(netbackend.LoopbackNICID, loopback.New()); err != nil {
-			st.Close()
-			return fmt.Errorf("gvx: create loopback NIC: %v", err)
+		st, err := netbackend.NewLoopbackStack()
+		if err != nil {
+			return err
 		}
-		loAddr := tcpip.ProtocolAddress{
-			Protocol: ipv4.ProtocolNumber,
-			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.AddrFrom4([4]byte{127, 0, 0, 1}),
-				PrefixLen: 8,
-			},
-		}
-		if err := st.AddProtocolAddress(netbackend.LoopbackNICID, loAddr, stack.AddressProperties{}); err != nil {
-			st.Close()
-			return fmt.Errorf("gvx: add loopback address: %v", err)
-		}
-		st.SetRouteTable([]tcpip.Route{
-			{
-				Destination: header.IPv4LoopbackSubnet,
-				NIC:         netbackend.LoopbackNICID,
-			},
-		})
 		s.netStack = st
 		return nil
 

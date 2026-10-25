@@ -124,6 +124,27 @@ const (
 	fpStateOffV    = 16
 )
 
+// copyFPFromArch copies V0..V31, FPSR, and FPCR from ac into vec (512 bytes).
+func copyFPFromArch(vec []byte, ac *arch.Context64) (fpsr, fpcr uint32, ok bool) {
+	state := *ac.FloatingPointData()
+	if len(state) < fpStateOffV+32*16 {
+		return 0, 0, false
+	}
+	copy(vec[:32*16], state[fpStateOffV:fpStateOffV+32*16])
+	return binary.LittleEndian.Uint32(state[fpStateOffFpsr:]), binary.LittleEndian.Uint32(state[fpStateOffFpcr:]), true
+}
+
+// copyFPToArch copies V0..V31, FPSR, and FPCR into ac from vec (512 bytes).
+func copyFPToArch(ac *arch.Context64, vec []byte, fpsr, fpcr uint32) {
+	state := *ac.FloatingPointData()
+	if len(state) < fpStateOffV+32*16 {
+		return
+	}
+	copy(state[fpStateOffV:fpStateOffV+32*16], vec[:32*16])
+	binary.LittleEndian.PutUint32(state[fpStateOffFpsr:], fpsr)
+	binary.LittleEndian.PutUint32(state[fpStateOffFpcr:], fpcr)
+}
+
 // loadFrom copies the guest registers of ac into the record. It sets the
 // context flags to gprFlags, or to guestFlags when fp is true and the record
 // also carries the vector state.
@@ -144,11 +165,9 @@ func (c *hostContext) loadFrom(ac *arch.Context64, fp bool) {
 	if !fp {
 		return
 	}
-	state := *ac.FloatingPointData()
-	if len(state) >= fpStateOffV+32*16 {
-		copy(c.buf[ctxOffV:ctxOffV+32*16], state[fpStateOffV:fpStateOffV+32*16])
-		c.put32(ctxOffFpsr, binary.LittleEndian.Uint32(state[fpStateOffFpsr:]))
-		c.put32(ctxOffFpcr, binary.LittleEndian.Uint32(state[fpStateOffFpcr:]))
+	if fpsr, fpcr, ok := copyFPFromArch(c.buf[ctxOffV:ctxOffV+32*16], ac); ok {
+		c.put32(ctxOffFpsr, fpsr)
+		c.put32(ctxOffFpcr, fpcr)
 	}
 }
 
@@ -168,10 +187,5 @@ func (c *hostContext) storeTo(ac *arch.Context64) {
 // storeFP copies the vector state of the record into ac. The record must hold
 // fpFlags.
 func (c *hostContext) storeFP(ac *arch.Context64) {
-	state := *ac.FloatingPointData()
-	if len(state) >= fpStateOffV+32*16 {
-		copy(state[fpStateOffV:fpStateOffV+32*16], c.buf[ctxOffV:ctxOffV+32*16])
-		binary.LittleEndian.PutUint32(state[fpStateOffFpsr:], c.u32(ctxOffFpsr))
-		binary.LittleEndian.PutUint32(state[fpStateOffFpcr:], c.u32(ctxOffFpcr))
-	}
+	copyFPToArch(ac, c.buf[ctxOffV:ctxOffV+32*16], c.u32(ctxOffFpsr), c.u32(ctxOffFpcr))
 }

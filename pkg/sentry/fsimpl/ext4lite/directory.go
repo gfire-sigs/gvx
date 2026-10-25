@@ -15,11 +15,10 @@
 package ext4lite
 
 import (
-	"sync"
-
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -33,12 +32,7 @@ import (
 type dirFD struct {
 	fileDescription
 	vfs.DirectoryFileDescriptionDefaultImpl
-
-	// mu protects the fields below.
-	mu       sync.Mutex
-	snapshot []vfs.Dirent
-	loaded   bool
-	off      int64
+	cursor chunkcache.DirCursor
 }
 
 // openDir creates the file description of a directory.
@@ -83,64 +77,30 @@ func direntType(ft uint8) uint8 {
 	return linux.DT_UNKNOWN
 }
 
-// loadLocked lists the directory into fd.snapshot. The entries "." and ".."
-// come first, then the other entries in the order of the directory blocks.
-func (fd *dirFD) loadLocked() error {
+// load lists the directory into a snapshot. The entries "." and ".." come
+// first, then the other entries in the order of the directory blocks.
+func (fd *dirFD) load() ([]vfs.Dirent, error) {
 	ents, err := fd.dentry.inode.n.entries()
 	if err != nil {
-		return toLinuxErr(err)
+		return nil, toLinuxErr(err)
 	}
 	snap := make([]vfs.Dirent, len(ents))
 	for i, e := range ents {
 		snap[i] = vfs.Dirent{Name: e.name, Type: direntType(e.ft), Ino: uint64(e.ino), NextOff: int64(i + 1)}
 	}
-	fd.snapshot = snap
-	fd.loaded = true
 	fd.dentry.inode.touchAtime(fd.vfsfd.Mount())
-	return nil
+	return snap, nil
 }
 
 // IterDirents implements vfs.FileDescriptionImpl.IterDirents.
 func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
-	if !fd.loaded {
-		if err := fd.loadLocked(); err != nil {
-			return err
-		}
-	}
-	for fd.off < int64(len(fd.snapshot)) {
-		if err := cb.Handle(fd.snapshot[fd.off]); err != nil {
-			return err
-		}
-		fd.off++
-	}
-	return nil
+	return fd.cursor.IterDirents(cb, fd.load)
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek. Seeking to the start discards
 // the snapshot, so rewinddir observes the current directory.
 func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
-	var newOff int64
-	switch whence {
-	case linux.SEEK_SET:
-		newOff = offset
-	case linux.SEEK_CUR:
-		newOff = fd.off + offset
-	default:
-		return 0, linuxerr.EINVAL
-	}
-	if newOff < 0 {
-		return 0, linuxerr.EINVAL
-	}
-	if newOff == 0 {
-		fd.loaded = false
-		fd.snapshot = nil
-	}
-	fd.off = newOff
-	return newOff, nil
+	return fd.cursor.Seek(offset, whence)
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. The volume flush writes the

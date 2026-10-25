@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux
+//go:build windows
 
-package gvx
+package chunkcache
 
-import "runtime"
+import (
+	"errors"
 
-// sharedChunkMemory is true on Windows and false on macOS. The Windows systrap
-// platform maps writable guest pages by the host handle of the memory file,
-// whereas macOS platforms map guest pages by host pointer.
-const sharedChunkMemory = runtime.GOOS == "windows"
+	"golang.org/x/sys/windows"
+)
+
+// IsHostDiskFull reports whether err means that the host volume has no free
+// space left.
+func IsHostDiskFull(err error) bool {
+	return errors.Is(err, windows.ERROR_DISK_FULL) || errors.Is(err, windows.ERROR_HANDLE_DISK_FULL)
+}

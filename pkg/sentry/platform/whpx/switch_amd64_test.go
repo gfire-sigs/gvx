@@ -79,8 +79,8 @@ func (e *x64Env) syscall(vp *fakeVP, exit []byte, rip, rflags uint64, mutate fun
 // exception simulates the exception stub.
 func (e *x64Env) exception(vp *fakeVP, exit []byte, vector, errCode, cr2, rip uint64) {
 	c := e.comm(vp)
-	c.Vector, c.FaultCode, c.FaultAddr, c.PC = vector, errCode, cr2, rip
-	c.PstateOrRflags, c.CS, c.SS = 0x246, x64SelUserCS, x64SelUserSS
+	c.Vector, c.ESR, c.FaultAddr, c.PC = vector, errCode, cr2, rip
+	c.Pstate, c.CS, c.SS = 0x246, x64SelUserCS, x64SelUserSS
 	atomic.StoreUint32(&c.ExitReason, uint32(ExitException))
 	writeStubExit(exit, e.p.kernel.layout.code()+uint64(e.p.kernel.x64.HltException)+1)
 }
@@ -115,8 +115,8 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 			t.Errorf("CommPage.Regs[%d] is %#x, want %#x", idx, first.Regs[idx], want)
 		}
 	}
-	if first.SP != 0x7FFF0000 || first.PC != 0x400000 || first.PstateOrRflags != 0x246 {
-		t.Errorf("SP %#x PC %#x RFLAGS %#x", first.SP, first.PC, first.PstateOrRflags)
+	if first.SP != 0x7FFF0000 || first.PC != 0x400000 || first.Pstate != 0x246 {
+		t.Errorf("SP %#x PC %#x RFLAGS %#x", first.SP, first.PC, first.Pstate)
 	}
 	if first.Flags != flagReloadRoot {
 		t.Errorf("flags are %#x: SYSRET is correct and the first entry flushes", first.Flags)
@@ -221,8 +221,8 @@ func TestSwitchSanitizesFlagsAndRefusesBadState(t *testing.T) {
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if saw.PstateOrRflags != 0x246 || saw.Flags&flagFullRestore == 0 {
-		t.Errorf("RFLAGS %#x flags %#x: IOPL must not reach user mode, and SYSRET would carry it", saw.PstateOrRflags, saw.Flags)
+	if saw.Pstate != 0x246 || saw.Flags&flagFullRestore == 0 {
+		t.Errorf("RFLAGS %#x flags %#x: IOPL must not reach user mode, and SYSRET would carry it", saw.Pstate, saw.Flags)
 	}
 
 	runs := e.fb.vps[0].runs

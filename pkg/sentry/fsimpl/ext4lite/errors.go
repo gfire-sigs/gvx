@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 )
 
 // hostError translates an error of the host file into a Linux error. A full
@@ -33,7 +34,7 @@ func hostError(err error) error {
 		return err
 	}
 	switch {
-	case isHostDiskFull(err):
+	case chunkcache.IsHostDiskFull(err):
 		return &linuxerrWrap{host: err, errno: linuxerr.ENOSPC}
 	default:
 		return &linuxerrWrap{host: err, errno: linuxerr.EIO}

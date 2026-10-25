@@ -31,13 +31,14 @@ import (
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/erofs"
 )
 
 const (
 	// EROFSSuperBlockMagicV1 is the EROFS v1 magic number at byte offset 1024.
-	EROFSSuperBlockMagicV1 uint32 = 0xe0f5e1e2
+	EROFSSuperBlockMagicV1 uint32 = erofs.SuperBlockMagicV1
 	// EROFSSuperBlockOffset is the byte offset of the EROFS superblock.
-	EROFSSuperBlockOffset = 1024
+	EROFSSuperBlockOffset = erofs.SuperBlockOffset
 	// EROFSBlockSize is the default block size of gvx EROFS images.
 	EROFSBlockSize = 4096
 	// EROFSBlockSizeBits is log2(EROFSBlockSize).
@@ -49,11 +50,11 @@ const (
 	// MaxBlockSize is the largest block size that the compiler emits.
 	MaxBlockSize = 65536
 	// EROFSInodeSlotBits is log2(32), the EROFS inode slot alignment.
-	EROFSInodeSlotBits = 5
+	EROFSInodeSlotBits = erofs.InodeSlotBits
 	// EROFSInodeExtendedSize is the 64-byte extended inode size (2 slots).
-	EROFSInodeExtendedSize = 64
+	EROFSInodeExtendedSize = erofs.InodeExtendedSize
 	// EROFSDirentSize is the 12-byte on-disk directory entry size.
-	EROFSDirentSize = 12
+	EROFSDirentSize = erofs.DirentSize
 
 	// WhiteoutPrefix is the OCI/OverlayFS whiteout file prefix.
 	WhiteoutPrefix = ".wh."

@@ -19,13 +19,8 @@ package systrap
 import (
 	"errors"
 	"fmt"
-	"math/rand/v2"
-
-	"golang.org/x/sys/unix"
 
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/hostarch"
-	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
@@ -38,7 +33,7 @@ import (
 // winIslandReach is the largest distance between a patched instruction and the
 // island that holds its slot. A B instruction reaches 128MiB on arm64. The
 // margin covers the page size and the slot branch back.
-const winIslandReach = 120 << 20
+const winIslandReach = islandReach
 
 // winSlotUnit is the allocation quantum in bytes of an island page.
 const winSlotUnit = 16
@@ -150,14 +145,6 @@ func (as *addressSpace) releaseIslandsLocked() {
 	}
 }
 
-// inIsland reports whether pc lies in an island.
-func (as *addressSpace) inIsland(pc uint64) bool {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	_, ok := as.islands[blockRound(pc)]
-	return ok
-}
-
 // slotStartSite returns the site of the slot that starts at pc, if pc is the
 // first address of a slot.
 func (as *addressSpace) slotStartSite(pc uint64) (uint64, bool) {
@@ -174,13 +161,6 @@ func (as *addressSpace) slotStartSite(pc uint64) (uint64, bool) {
 // slotAtTail returns the site of the slot whose tail is at tail.
 func (as *addressSpace) slotAtTail(tail uint64) (uint64, bool) {
 	return as.slotStartSite(tail - winSlotTailOffset)
-}
-
-func absDiff(a, b uint64) uint64 {
-	if a > b {
-		return a - b
-	}
-	return b - a
 }
 
 // guestPageOK reports whether the page at va lies in a guest window.
@@ -248,54 +228,9 @@ func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager
 // newIsland reserves a sealed mapping within reach of near through the memory
 // manager and maps a private page of slots there.
 func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager, near uint64) error {
-	var lastErr error
-	for range 128 {
-		off := (uint64(rand.Int64N(winIslandReach-(4<<20))) + 2<<20) &^ (blockSize - 1)
-		var cand uint64
-		if rand.IntN(2) == 0 {
-			if near < off {
-				continue
-			}
-			cand = near - off
-		} else {
-			cand = near + off
-		}
-		cand = blockRound(cand)
-		if !as.guestPageOK(cand) {
-			continue
-		}
-		as.mu.Lock()
-		if _, busy := as.reserved[cand]; busy || as.islands[cand] != nil || as.released {
-			as.mu.Unlock()
-			continue
-		}
-		as.reserved[cand] = struct{}{}
-		as.mu.Unlock()
-
-		_, err := mm.MMap(ctx, memmap.MMapOpts{
-			Length:    blockSize,
-			Addr:      hostarch.Addr(cand),
-			Fixed:     true,
-			NoReplace: true,
-			Private:   true,
-			Name:      "[systrap]",
-			Sealed:    true,
-			Perms:     hostarch.AccessType{Read: true, Execute: true},
-			MaxPerms:  hostarch.AccessType{Read: true, Execute: true},
-		})
-		if err != nil {
-			as.mu.Lock()
-			delete(as.reserved, cand)
-			as.mu.Unlock()
-			lastErr = err
-			continue
-		}
-		return as.installIsland(cand)
-	}
-	if lastErr == nil {
-		lastErr = unix.ENOMEM
-	}
-	return fmt.Errorf("find an address within 120MiB for a trampoline island: %w", lastErr)
+	return as.newIslandAt(ctx, mm, near, func(cand uint64) (uint64, bool) {
+		return cand, as.guestPageOK(cand)
+	})
 }
 
 // installIsland maps a zeroed private page as read and execute at base.
@@ -318,10 +253,4 @@ func (as *addressSpace) installIsland(base uint64) error {
 	}
 	as.islands[base] = &island{base: base, page: pg, slots: make(map[uint32]uint64)}
 	return flushInstructionCache(as.sp.proc, uintptr(base), blockSize)
-}
-
-func (as *addressSpace) dropReservation(base uint64) {
-	as.mu.Lock()
-	delete(as.reserved, base)
-	as.mu.Unlock()
 }

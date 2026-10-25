@@ -109,20 +109,6 @@ func (w *Workspace) withXattrFD(t xattrTarget, fn func(fd int) error) error {
 	return errHostUnsupported
 }
 
-// withFileFD runs fn with the descriptor of f and keeps f open until fn
-// returns.
-func withFileFD(f *os.File, fn func(fd int) error) error {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var fnErr error
-	if err := rc.Control(func(fd uintptr) { fnErr = fn(int(fd)) }); err != nil {
-		return err
-	}
-	return fnErr
-}
-
 func (w *Workspace) nativeGetXattr(t xattrTarget, name string) (value []byte, err error) {
 	err = w.withXattrFD(t, func(fd int) error {
 		for {

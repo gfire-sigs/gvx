@@ -322,18 +322,14 @@ func (c *LayerCache) Select(query, arch string) (Selection, error) {
 func (c *LayerCache) imageByReference(images []Image, ref Reference, arch string) (Image, bool, error) {
 	digest := ref.Digest
 	if digest == "" {
-		raw, err := readFileShared(c.tagRecordPath(ref.BaseURL(), ref.Repository, ref.Tag, arch))
-		if errors.Is(err, os.ErrNotExist) {
+		var err error
+		digest, err = c.resolveTagDigest(ref.BaseURL(), ref.Repository, ref.Tag, arch)
+		if errors.Is(err, ErrNotCached) {
 			return Image{}, false, nil
 		}
 		if err != nil {
-			return Image{}, false, fmt.Errorf("oci: read tag record: %w", err)
+			return Image{}, false, err
 		}
-		var tr tagRecord
-		if err := json.Unmarshal(raw, &tr); err != nil || !isDigestRef(tr.Digest) {
-			return Image{}, false, nil
-		}
-		digest = tr.Digest
 	}
 	want := imageKey(ref.BaseURL(), ref.Repository, digest)
 	for _, img := range images {
@@ -564,17 +560,9 @@ func (c *LayerCache) removeUnusedLayers(candidates []string) error {
 // two small files and needs no network and no layer hashing.
 func (c *LayerCache) CachedDigest(baseURL, repository, reference, arch string) (string, bool) {
 	baseURL, repository, reference, arch = normalizePullArgs(baseURL, repository, reference, arch)
-	digest := reference
-	if !isDigestRef(reference) {
-		raw, err := readFileShared(c.tagRecordPath(baseURL, repository, reference, arch))
-		if err != nil {
-			return "", false
-		}
-		var tr tagRecord
-		if err := json.Unmarshal(raw, &tr); err != nil || !isDigestRef(tr.Digest) {
-			return "", false
-		}
-		digest = tr.Digest
+	digest, err := c.resolveTagDigest(baseURL, repository, reference, arch)
+	if err != nil {
+		return "", false
 	}
 	raw, err := readFileShared(c.imageRecordPath(baseURL, repository, digest, arch))
 	if err != nil {

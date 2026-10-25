@@ -19,19 +19,15 @@ package systrap
 import (
 	"fmt"
 	"runtime"
-	"time"
 
 	"golang.org/x/sys/unix"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
-	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
-
-const probeCalls = 2000
 
 // probeMM is the minimal MemoryManager of Probe.
 type probeMM struct {
@@ -126,31 +122,10 @@ func Probe() (ProbeInfo, error) {
 	if err := as.installData(stackAddr); err != nil {
 		return info, err
 	}
-	c := p.NewContext(context.Background()).(*Context)
-	defer c.Release()
-	ac := arch.New(arch.Host)
-	ac.SetIP(codeAddr)
-	ac.SetStack(stackAddr + blockSize - 0x100)
-	var start time.Time
-	for calls := 0; ; calls++ {
-		si, _, err := c.Switch(context.Background(), mm, ac, -1)
-		if si != nil || err != nil {
-			return info, fmt.Errorf("guest probe stopped with signal %v, error %v", si, err)
-		}
-		switch probeSyscallNumber(ac) {
-		case 5:
-			if calls == 1 {
-				// The first call created the thread, so timing starts after it.
-				start = time.Now()
-			}
-		case 6:
-			if calls != probeCalls {
-				return info, fmt.Errorf("guest made %d calls, want %d", calls, probeCalls)
-			}
-			info.RoundTrip = time.Since(start) / (probeCalls - 1)
-			return info, nil
-		default:
-			return info, fmt.Errorf("guest probe made unexpected system call %d", probeSyscallNumber(ac))
-		}
+	rt, err := runProbeLoop(p, mm, codeAddr, stackAddr)
+	if err != nil {
+		return info, err
 	}
+	info.RoundTrip = rt
+	return info, nil
 }

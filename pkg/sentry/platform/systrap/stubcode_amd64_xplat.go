@@ -22,6 +22,9 @@ import (
 	"strings"
 
 	"golang.org/x/arch/x86/x86asm"
+
+	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // The Windows engine has no C toolchain step, so Go code generates the amd64
@@ -201,13 +204,11 @@ func (a *x86Asm) xrstor64(base int, disp int32) { a.memOp(true, []byte{0x0F, 0xA
 
 // movLoadGS is `mov r64, gs:[abs32]`, and movStoreGS is `mov gs:[abs32], r64`.
 func (a *x86Asm) movLoadGS(reg int, abs uint32) {
-	a.emit(0x65, x86Rex(true, reg, 0), 0x8B, byte(reg&7)<<3|4, 0x25)
-	a.imm32(abs)
+	a.b = hvcommon.AppendMovFromGS(a.b, reg, abs)
 }
 
 func (a *x86Asm) movStoreGS(abs uint32, reg int) {
-	a.emit(0x65, x86Rex(true, reg, 0), 0x89, byte(reg&7)<<3|4, 0x25)
-	a.imm32(abs)
+	a.b = hvcommon.AppendMovToGS(a.b, reg, abs)
 }
 
 // jmpGS is `jmp qword gs:[abs32]`.
@@ -604,3 +605,21 @@ func (p *jmpPlanner) plan(off int) ([]byte, bool) {
 func planJmpPatch(before, page, after []byte, off int) ([]byte, bool) {
 	return newJmpPlanner(before, page, after).plan(off)
 }
+
+// probeProgram returns the guest code of Probe: calls system calls with
+// number 5, then one with number 6.
+func probeProgram(calls int) []byte {
+	n := uint32(calls)
+	return []byte{
+		0x41, 0xBC, byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24), // mov r12d, calls
+		0xB8, 5, 0, 0, 0, // loop: mov eax, 5
+		0x0F, 0x05, // syscall
+		0x41, 0xFF, 0xCC, // dec r12d
+		0x75, 0xF4, // jnz loop
+		0xB8, 6, 0, 0, 0, // mov eax, 6
+		0x0F, 0x05, // syscall
+	}
+}
+
+// probeSyscallNumber returns the number of the system call that stopped the guest.
+func probeSyscallNumber(ac *arch.Context64) uint64 { return ac.StateData().Regs.Orig_rax }

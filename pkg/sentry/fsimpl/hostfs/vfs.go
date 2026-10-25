@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -508,15 +509,7 @@ func (d *dentry) IncRef() {
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
-	for {
-		r := d.refs.Load()
-		if r <= 0 {
-			return false
-		}
-		if d.refs.CompareAndSwap(r, r+1) {
-			return true
-		}
-	}
+	return chunkcache.TryIncRef(&d.refs)
 }
 
 // DecRef implements vfs.DentryImpl.DecRef.
@@ -1150,7 +1143,8 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return nil, linuxerr.EINVAL
 		}
-		fd := &dirFD{dentry: d}
+		fd := &dirFD{}
+		fd.dentry = d
 		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, rp.Credentials(), rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{AllowDirectIO: true}); err != nil {
 			return nil, err

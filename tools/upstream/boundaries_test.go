@@ -230,13 +230,13 @@ func TestBoundaryHvcommonIsSharedByBothHardwareBackends(t *testing.T) {
 	t.Parallel()
 
 	m := modulePrefix
-	for _, file := range []string{"pkg/sentry/platform/whpx/x.go", "pkg/sentry/platform/hvf/x.go"} {
+	for _, file := range []string{"pkg/sentry/platform/whpx/x.go", "pkg/sentry/platform/hvf/x.go", "pkg/sentry/platform/systrap/x_xplat.go"} {
 		if vs := boundaryCheck(t, file, importLines(m+"pkg/sentry/platform/hvcommon")); len(vs) != 0 {
 			t.Errorf("%s importing hvcommon flagged: %v", file, vs)
 		}
 	}
-	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/x_xplat.go", importLines(m+"pkg/sentry/platform/hvcommon")); len(vs) != 1 {
-		t.Errorf("systrap importing hvcommon: %d violations, want 1", len(vs))
+	if vs := boundaryCheck(t, "pkg/sentry/fsimpl/hostfs/x.go", importLines(m+"pkg/sentry/platform/hvcommon")); len(vs) != 1 {
+		t.Errorf("hostfs importing hvcommon: %d violations, want 1", len(vs))
 	}
 	// hvcommon holds pure helpers. It never imports a backend.
 	for _, backend := range []string{"whpx", "hvf", "systrap"} {

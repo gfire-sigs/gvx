@@ -24,6 +24,8 @@ import (
 	"sync"
 
 	"golang.org/x/arch/arm64/arm64asm"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // The kernel of macOS zeroes x18 whenever a thread returns from an exception.
@@ -125,13 +127,7 @@ func isLSEAtomic(w uint32) bool {
 
 // movConst returns the words that load v into register rd.
 func movConst(rd uint8, v uint64) []uint32 {
-	words := []uint32{0xd2800000 | uint32(v&0xffff)<<5 | uint32(rd)}
-	for sh := uint(16); sh < 64; sh += 16 {
-		if chunk := uint32(v >> sh & 0xffff); chunk != 0 {
-			words = append(words, 0xf2800000|uint32(sh/16)<<21|chunk<<5|uint32(rd))
-		}
-	}
-	return words
+	return hvcommon.MovConstCompact(int(rd), v)
 }
 
 // decodeMu serializes decodeARM64. Decode of x/arch sets a flag in a package
@@ -374,7 +370,7 @@ func planTPIDRRead() *x18Plan {
 	return &x18Plan{kind: siteX18, scratch: scratch, body: []uint32{
 		arm64MRSTPIDRRO | scratch,
 		arm64ANDxMinus8 | scratch<<5 | scratch,
-		arm64LDRx | (tlsOffset/8)<<10 | scratch<<5 | scratch,
+		hvcommon.LDRX(scratch, scratch, tlsOffset),
 	}}
 }
 
@@ -406,11 +402,11 @@ func sysmsgPointer() [2]uint32 {
 }
 
 func strFromSysmsg(reg uint8, off uint32) uint32 {
-	return 0xf9000000 | (off/8)<<10 | x18Reg<<5 | uint32(reg)
+	return hvcommon.STRX(x18Reg, int(reg), int(off))
 }
 
 func ldrFromSysmsg(reg uint8, off uint32) uint32 {
-	return arm64LDRx | (off/8)<<10 | x18Reg<<5 | uint32(reg)
+	return hvcommon.LDRX(x18Reg, int(reg), int(off))
 }
 
 // encodeX18Slot writes the slot of p at slotVA into buf. The instruction of

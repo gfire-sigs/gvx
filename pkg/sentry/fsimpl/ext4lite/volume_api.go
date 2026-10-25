@@ -19,6 +19,8 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 )
 
 // ErrVolumeInUse is the error of OpenVolume when another handle holds the host
@@ -39,7 +41,7 @@ type Volume struct {
 	v *volume
 
 	// chunkMem backs the page-cache chunks of mapped files. See SetChunkMemory.
-	chunkMem atomic.Pointer[chunkMemoryHolder]
+	chunkMem chunkcache.ChunkMemoryHolder
 	// mounted is set by the first mount. A volume serves one filesystem.
 	mounted atomic.Bool
 	// dataSync writes the mapped pages of the mounted file system. The mount

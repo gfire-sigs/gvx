@@ -574,25 +574,33 @@ func statHandle(handle windows.Handle) (hostInfo, error) {
 	return info, nil
 }
 
+// finalPathByHandle calls GetFinalPathNameByHandle with the given flags and
+// grows the buffer when the initial stack buffer is too small.
+func finalPathByHandle(handle windows.Handle, flags uint32) ([]uint16, error) {
+	var stack [512]uint16
+	buf := stack[:]
+	for {
+		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), flags)
+		if err != nil {
+			return nil, err
+		}
+		if int(n) < len(buf) {
+			return buf[:n], nil
+		}
+		// The result did not fit. n is the required size with the NUL.
+		buf = make([]uint16, int(n)+1)
+	}
+}
+
 // finalPathLeaf returns the last component of the normalized name of an open
 // handle. The normalized name carries the stored case and the long form of
 // the name. It differs from the requested name when the volume matched the
 // request case-insensitively or through a short 8.3 name.
 // Source: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
 func finalPathLeaf(handle windows.Handle) (string, error) {
-	var stack [512]uint16
-	buf := stack[:]
-	for {
-		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), finalPathNormalizedNoVolume)
-		if err != nil {
-			return "", err
-		}
-		if int(n) < len(buf) {
-			buf = buf[:n]
-			break
-		}
-		// The result did not fit. n is the required size with the NUL.
-		buf = make([]uint16, int(n)+1)
+	buf, err := finalPathByHandle(handle, finalPathNormalizedNoVolume)
+	if err != nil {
+		return "", err
 	}
 	i := len(buf)
 	for i > 0 && buf[i-1] != '\\' {
@@ -641,20 +649,28 @@ func lstatIn(dir windows.Handle, name, rel string) (hostInfo, error) {
 	return info, nil
 }
 
-func (h *hostRoot) fstat(f *os.File) (hostInfo, error) {
+func withFileHandle(f *os.File, fn func(handle windows.Handle) error) error {
 	rc, err := f.SyscallConn()
 	if err != nil {
-		return hostInfo{}, hostError("fstat", f.Name(), err)
+		return err
 	}
-	var info hostInfo
-	var statErr error
+	var callErr error
 	if err := rc.Control(func(fd uintptr) {
-		info, statErr = statHandle(windows.Handle(fd))
+		callErr = fn(windows.Handle(fd))
+	}); err != nil {
+		return err
+	}
+	return callErr
+}
+
+func (h *hostRoot) fstat(f *os.File) (hostInfo, error) {
+	var info hostInfo
+	if err := withFileHandle(f, func(handle windows.Handle) error {
+		var err error
+		info, err = statHandle(handle)
+		return err
 	}); err != nil {
 		return hostInfo{}, hostError("fstat", f.Name(), err)
-	}
-	if statErr != nil {
-		return hostInfo{}, hostError("fstat", f.Name(), statErr)
 	}
 	return info, nil
 }
@@ -802,6 +818,10 @@ func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error) {
 		return nil, err
 	}
 	defer closeHandle(handle)
+	return readDirHandle(handle, rel)
+}
+
+func readDirHandle(handle windows.Handle, rel string) ([]hostDirEntry, error) {
 	// The kernel requires an 8-byte aligned buffer. A large Go allocation
 	// meets this, and the explicit uint64 backing makes the guarantee local.
 	backing := make([]uint64, dirBufferSize/8)

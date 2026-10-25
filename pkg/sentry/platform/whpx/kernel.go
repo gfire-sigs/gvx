@@ -21,6 +21,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // kernelRegion is the guest memory that every address space shares: the stub
@@ -50,7 +51,7 @@ type kernelRegion struct {
 
 // kernelPageCount is the number of page-table pages that mapping the kernel
 // region can allocate at most.
-const kernelPageCount = 16
+const kernelPageCount = hvcommon.KernelTablePages
 
 // buildKernelRegion creates the shared kernel mappings for slots virtual
 // processors.
@@ -124,7 +125,7 @@ func buildKernelRegion(be backend, gpa *gpaAllocator, pool *ptPool, arm64 bool, 
 	}
 
 	kr.alloc = newPTAllocator(pool)
-	if err = kr.alloc.reserve(kernelPageCount); err != nil {
+	if err = kr.alloc.Reserve(kernelPageCount); err != nil {
 		return kr, err
 	}
 	kr.pt = pagetables.New(kr.alloc)
@@ -163,7 +164,7 @@ func (kr *kernelRegion) release(be backend, gpa *gpaAllocator) error {
 		unmap(kr.commGPA, uint64(kr.slots)*pageSize)
 	}
 	if kr.alloc != nil {
-		kr.alloc.drain()
+		kr.alloc.Drain()
 	}
 	for _, mem := range [][]byte{kr.codeMem, kr.commMem} {
 		if mem != nil {

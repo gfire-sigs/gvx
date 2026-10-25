@@ -56,11 +56,12 @@ func TestA64VectorTableSlots(t *testing.T) {
 	}
 	for slot := range a64VectorSlots {
 		base := s.Vectors + slot*a64VectorSlotSize
-		got := a64Listing(t, s.Code, base, base+12)
+		got := a64Listing(t, s.Code, base, base+16)
 		want := []string{
 			"STP X0, X1, [SP]",
 			fmt.Sprintf("MOV X0, #%#x", slot),
-			fmt.Sprintf("B .+%#x", s.Common-(base+8)),
+			fmt.Sprintf("STR X0, [SP,#%d]", commOffVector),
+			fmt.Sprintf("B .+%#x", s.Common-(base+12)),
 		}
 		for i := range want {
 			if got[i] != want[i] {
@@ -81,7 +82,6 @@ func TestA64CommonHandlerSpillsAndExits(t *testing.T) {
 	}
 	got := a64Listing(t, s.Code, s.Common, s.Hvc+4)
 	var want []string
-	want = append(want, fmt.Sprintf("STR X0, [SP,#%d]", commOffVector))
 	for r := 2; r < 30; r += 2 {
 		want = append(want, fmt.Sprintf("STP X%d, X%d, [SP,#%d]", r, r+1, commOffRegs+r*8))
 	}

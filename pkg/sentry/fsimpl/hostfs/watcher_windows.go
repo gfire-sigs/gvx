@@ -439,25 +439,9 @@ func (w *Workspace) listNames(h hostDirHandle, rel string) ([]string, error) {
 		be.listMu.Lock()
 		defer be.listMu.Unlock()
 	}
-	backing := make([]uint64, dirBufferSize/8)
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), dirBufferSize)
-	var entries []hostDirEntry
-	class := uint32(windows.FileFullDirectoryRestartInfo)
-	for {
-		err := windows.GetFileInformationByHandleEx(windows.Handle(h), class, &buf[0], uint32(len(buf)))
-		if err == windows.ERROR_NO_MORE_FILES {
-			break
-		}
-		if err == windows.ERROR_FILE_NOT_FOUND && class == windows.FileFullDirectoryRestartInfo {
-			break
-		}
-		if err != nil {
-			return nil, hostError("read directory", rel, err)
-		}
-		class = windows.FileFullDirectoryInfo
-		if entries, err = parseDirBuffer(buf, entries); err != nil {
-			return nil, hostError("read directory", rel, err)
-		}
+	entries, err := readDirHandle(windows.Handle(h), rel)
+	if err != nil {
+		return nil, err
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {

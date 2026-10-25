@@ -16,7 +16,7 @@ package ext4lite
 
 import (
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -31,18 +31,6 @@ import (
 // until another process opens the other end.
 func (d *dentry) openSpecial(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ino := d.inode
-	switch ino.kind {
-	case modeFIFO:
-		return ino.pipe.Open(ctx, rp.Mount(), &d.vfsd, opts.Flags, &ino.locks)
-	case modeChar, modeBlock:
-		kind := vfs.CharDevice
-		if ino.kind == modeBlock {
-			kind = vfs.BlockDevice
-		}
-		a := ino.attr()
-		major, minor := decodeRdev(a.rdev)
-		return rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, rp.Mount(), &d.vfsd, kind, major, minor, opts)
-	default:
-		return nil, linuxerr.ENXIO
-	}
+	major, minor := decodeRdev(ino.attr().rdev)
+	return chunkcache.OpenSpecial(ctx, rp, &d.vfsd, opts, uint32(ino.kind), ino.pipe, &ino.locks, major, minor)
 }

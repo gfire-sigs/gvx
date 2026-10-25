@@ -412,25 +412,17 @@ func (c *LayerCache) OpenLayerHandles(digests []string) ([]*os.File, error) {
 	for _, d := range digests {
 		hexStr := normalizeDigestHex(d)
 		if hexStr == "" {
-			closeAllFiles(files)
+			_ = CloseLayerFiles(files)
 			return nil, fmt.Errorf("oci: invalid layer digest %q", d)
 		}
 		f, err := c.openVerifiedLayer(hexStr)
 		if err != nil {
-			closeAllFiles(files)
+			_ = CloseLayerFiles(files)
 			return nil, err
 		}
 		files = append(files, f)
 	}
 	return files, nil
-}
-
-func closeAllFiles(files []*os.File) {
-	for _, f := range files {
-		if f != nil {
-			_ = f.Close()
-		}
-	}
 }
 
 func normalizeDigestHex(digest string) string {
@@ -555,32 +547,35 @@ func (c *LayerCache) storeTag(baseURL, repository, tag, arch, digest string) err
 	return writeFileAtomic(filepath.Dir(p), filepath.Base(p), raw)
 }
 
+func (c *LayerCache) resolveTagDigest(baseURL, repository, reference, arch string) (string, error) {
+	if isDigestRef(reference) {
+		return reference, nil
+	}
+	raw, err := readFileShared(c.tagRecordPath(baseURL, repository, reference, arch))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrNotCached
+		}
+		return "", fmt.Errorf("oci: read tag record: %w", err)
+	}
+	var tr tagRecord
+	if err := json.Unmarshal(raw, &tr); err != nil || !isDigestRef(tr.Digest) {
+		return "", ErrNotCached
+	}
+	return tr.Digest, nil
+}
+
 // LoadCachedImage returns the image that an earlier pull stored for reference,
 // without any network access. A tag resolves to the digest that the last
 // successful pull saw, which allows offline runs. A digest reference is exact.
 // It returns ErrNotCached if the image or any of its layers is missing.
 func (c *LayerCache) LoadCachedImage(baseURL, repository, reference, targetArch string) (*ResolvedImage, error) {
 	baseURL, repository, reference, targetArch = normalizePullArgs(baseURL, repository, reference, targetArch)
-	digest := reference
-	if !isDigestRef(reference) {
-		raw, err := readFileShared(c.tagRecordPath(baseURL, repository, reference, targetArch))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil, ErrNotCached
-			}
-			return nil, fmt.Errorf("oci: read tag record: %w", err)
-		}
-		var tr tagRecord
-		if err := json.Unmarshal(raw, &tr); err != nil || !isDigestRef(tr.Digest) {
-			return nil, ErrNotCached
-		}
-		digest = tr.Digest
-	}
-	img, err := c.loadImageByDigest(baseURL, repository, digest, targetArch)
+	digest, err := c.resolveTagDigest(baseURL, repository, reference, targetArch)
 	if err != nil {
 		return nil, err
 	}
-	return img, nil
+	return c.loadImageByDigest(baseURL, repository, digest, targetArch)
 }
 
 // decodedRecord is the verified content of an image record.
@@ -618,8 +613,7 @@ func (c *LayerCache) verifyRecord(rec imageRecord) (*decodedRecord, error) {
 	digest, arch := rec.Digest, rec.Architecture
 	byDigest := make(map[string][]byte, len(rec.Manifests))
 	for _, m := range rec.Manifests {
-		sum := sha256.Sum256(m)
-		byDigest["sha256:"+hex.EncodeToString(sum[:])] = m
+		byDigest[blobDigest(m)] = m
 	}
 	top, ok := byDigest[digest]
 	if !ok {

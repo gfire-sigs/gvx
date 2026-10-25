@@ -28,18 +28,10 @@ import (
 // values in the guest and on the host, so the mode passes unchanged. The
 // seccomp allowlist of the host filesystem permits fallocate.
 func allocateNative(f *os.File, mode uint64, off, length int64) error {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return fmt.Errorf("hostfs: fallocate: %w", err)
-	}
-	var callErr error
-	if err := rc.Control(func(fd uintptr) {
-		callErr = retryEINTR(func() error { return unix.Fallocate(int(fd), uint32(mode), off, length) })
+	if err := withFileFD(f, func(fd int) error {
+		return retryEINTR(func() error { return unix.Fallocate(fd, uint32(mode), off, length) })
 	}); err != nil {
 		return fmt.Errorf("hostfs: fallocate: %w", err)
-	}
-	if callErr != nil {
-		return fmt.Errorf("hostfs: fallocate: %w", callErr)
 	}
 	return nil
 }

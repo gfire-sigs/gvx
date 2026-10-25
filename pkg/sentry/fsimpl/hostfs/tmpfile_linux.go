@@ -18,6 +18,7 @@ package hostfs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -29,15 +30,15 @@ import (
 // nothing behind.
 const tmpfileUnlinkAtOnce = true
 
-// openAnon opens an unnamed file in the directory descriptor dirfd with the
+// openAnonAt opens an unnamed file in the directory descriptor dir with the
 // native O_TMPFILE flag. The seccomp rule of the host filesystem needs
 // O_NOFOLLOW and a non-negative directory descriptor, and the call has both.
 // The kernel frees the file at the last close, and a crash of the process
 // leaves nothing behind.
-func openAnon(dirfd int) (*os.File, error) {
-	fd, err := openatRetry(dirfd, ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+func (h *hostRoot) openAnonAt(dir hostDirHandle) (*os.File, error) {
+	fd, err := openatRetry(int(dir), ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("hostfs: create unnamed file: %w", err)
 	}
 	return os.NewFile(uintptr(fd), "O_TMPFILE"), nil
 }
