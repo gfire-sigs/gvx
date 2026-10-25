@@ -52,11 +52,15 @@ const (
 	// brkMRSTLS replaces `mrs xN, tpidr_el0` when the fast path has no slot for
 	// it. 0x5c5 belongs to the cold resume of the fast path.
 	brkMRSTLS = 0x5c6
+	brkMOVX18 = 0x5c7
 
 	arm64ICIVAU = 0xd50b7520 // ic ivau, xN with N in bits 4:0.
+	arm64MOVX18 = 0xaa0003f2 // mov x18, xM (orr x18, xzr, xM) with M in bits 20:16.
 
 	// siteICIVAU is a guest `ic ivau, xN`.
 	siteICIVAU siteKind = 5
+	// siteMOVX18 is a guest `mov x18, xN`.
+	siteMOVX18 siteKind = 6
 )
 
 func brkWord(imm uint32) uint32 { return arm64BRK | imm<<5 }
@@ -127,6 +131,7 @@ func (th *thread) archStart(ac *arch.Context64) error {
 	want := ac.StateData().Regs.TPIDR_EL0
 	if f := th.fast.Load(); f != nil {
 		f.slot.sm.TLS = want
+		f.slot.sm.X18 = ac.StateData().Regs.Regs[18]
 		want = f.slot.va
 	}
 	if th.tlsKnown && th.tls == want {
@@ -143,6 +148,7 @@ func (th *thread) resumePC(pc uint64) uint64 { return pc }
 func (th *thread) pullArch(ac *arch.Context64) {
 	if f := th.fast.Load(); f != nil {
 		ac.StateData().Regs.TPIDR_EL0 = f.slot.sm.TLS
+		f.slot.sm.X18 = ac.StateData().Regs.Regs[18]
 		return
 	}
 	if th.tlsKnown {
@@ -225,6 +231,18 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		// A read of the guest thread pointer that no slot serves.
 		if f := th.fast.Load(); f != nil && site.reg != 31 {
 			th.ctx.setReg(int(site.reg), f.slot.sm.TLS)
+			if site.reg == 18 {
+				f.slot.sm.X18 = f.slot.sm.TLS
+			}
+		}
+	case siteMOVX18:
+		var v uint64
+		if site.reg != 31 {
+			v = th.ctx.reg(int(site.reg))
+		}
+		th.ctx.setReg(18, v)
+		if f := th.fast.Load(); f != nil {
+			f.slot.sm.X18 = v
 		}
 	default:
 		return outcome{}, false
@@ -302,10 +320,12 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			if !as.p.fast || s.Reg == 31 {
 				continue
 			}
-			if word, ref, ok := as.fastTLSBranch(ctx, mm, base+uint64(s.Offset), s.Reg); ok {
-				binary.LittleEndian.PutUint32(page[s.Offset:], word)
-				slots = append(slots, ref)
-				continue
+			if s.Reg != 18 {
+				if word, ref, ok := as.fastTLSBranch(ctx, mm, base+uint64(s.Offset), s.Reg); ok {
+					binary.LittleEndian.PutUint32(page[s.Offset:], word)
+					slots = append(slots, ref)
+					continue
+				}
 			}
 			imm = brkMRSTLS
 		default:
@@ -318,6 +338,18 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	for off := 0; off+4 <= len(page); off += 4 {
 		w := binary.LittleEndian.Uint32(page[off:])
 		switch {
+		case as.p.fast && w&0xffe0ffff == arm64MOVX18:
+			rm := uint8((w >> 16) & arm64RegMask)
+			if rm == 18 {
+				continue
+			}
+			if word, ref, ok := as.fastX18SetBranch(ctx, mm, base+uint64(off), rm); ok {
+				binary.LittleEndian.PutUint32(page[off:], word)
+				slots = append(slots, ref)
+				continue
+			}
+			binary.LittleEndian.PutUint32(page[off:], brkWord(brkMOVX18))
+			sites[uint16(off)] = siteInfo{kind: siteMOVX18, reg: rm}
 		case w&^arm64RegMask == arm64ICIVAU:
 			binary.LittleEndian.PutUint32(page[off:], brkWord(brkICIVAU))
 			sites[uint16(off)] = siteInfo{kind: siteICIVAU, reg: uint8(w & arm64RegMask)}
@@ -327,6 +359,29 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		}
 	}
 	return sites, slots, nil
+}
+
+// fastX18SetBranch allocates a slot for the `mov x18, xN` at site and returns
+// the branch that replaces the instruction.
+func (as *addressSpace) fastX18SetBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, winSlotRef, bool) {
+	slotVA, ref, err := as.installSlot(ctx, mm, site, winTLSSlotSize, func(buf []byte, slotVA uint64) error {
+		return encodeWinX18SetSlot(buf, slotVA, site, reg)
+	})
+	var word uint32
+	if err == nil {
+		if word, err = encodeBranch(site, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
+	}
+	if err != nil {
+		if traceEvents {
+			tracef("no trampoline slot for the mov x18 at %#x: %v", site, err)
+		}
+		return 0, winSlotRef{}, false
+	}
+	return word, ref, true
 }
 
 // fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and
@@ -386,7 +441,12 @@ func (th *thread) archFastTrap(ac *arch.Context64) { th.pullArch(ac) }
 // archFastHot reports whether the thread can resume without a debug stop. The
 // Sentry writes the TLS word of the sysmsg at each start, so the TLS value never
 // forces a cold resume.
-func (th *thread) archFastHot(*arch.Context64) bool { return true }
+func (th *thread) archFastHot(ac *arch.Context64) bool {
+	if f := th.fast.Load(); f != nil {
+		f.slot.sm.TLS = ac.StateData().Regs.TPIDR_EL0
+	}
+	return true
+}
 
 // archPC returns the program counter of ac.
 func archPC(ac *arch.Context64) uint64 { return ac.StateData().Regs.Pc }

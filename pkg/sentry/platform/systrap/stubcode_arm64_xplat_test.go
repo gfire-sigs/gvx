@@ -454,10 +454,12 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	}
 	// Run the slot. It ends in a BR to the spill routine, which it entered
 	// with x17 set to the tail.
+	const guestX18 = 0x1818_1818_1818_1818
 	m := newA64Machine(buf, slot)
 	m.sp = rigStack
 	m.tpidr = rigSysm
-	m.x[16], m.x[17] = rigGuestX16, rigGuestX17
+	m.x[16], m.x[17], m.x[18] = rigGuestX16, rigGuestX17, guestX18
+	m.put64(rigSysm+winOffX18, guestX18)
 	for i, b := range buf {
 		m.mem[slot+uint64(i)] = b
 	}
@@ -470,11 +472,14 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	if m.x[17] != tailVA {
 		t.Fatalf("x17 = %#x at the jump, the tail is %#x", m.x[17], uint64(tailVA))
 	}
+	if m.x[18] != guestX18 {
+		t.Fatalf("x18 = %#x at the jump, want %#x", m.x[18], uint64(guestX18))
+	}
 	if m.get64(rigSysm+winOffScratch) != rigGuestX16 || m.get64(rigSysm+winOffScratch+8) != rigGuestX17 {
 		t.Fatal("the slot did not save x16 and x17 in the sysmsg scratch words")
 	}
-	// The tail restores x16 and x17 and branches to the instruction after the site.
-	m.x[16], m.x[17] = 0, 0
+	// The tail restores x16, x17, and x18 and branches to the instruction after the site.
+	m.x[16], m.x[17], m.x[18] = 0, 0, 0
 	m.pc, m.exit = tailVA, a64Exit{brk: -1}
 	if err := m.run(m.steps + 100); err != nil {
 		t.Fatal(err)
@@ -482,8 +487,45 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	if m.exit.jump != retPC {
 		t.Fatalf("the tail returns to %#x, want %#x", m.exit.jump, uint64(retPC))
 	}
-	if m.x[16] != rigGuestX16 || m.x[17] != rigGuestX17 {
-		t.Fatalf("the tail restored x16 %#x and x17 %#x", m.x[16], m.x[17])
+	if m.x[16] != rigGuestX16 || m.x[17] != rigGuestX17 || m.x[18] != guestX18 {
+		t.Fatalf("the tail restored x16 %#x, x17 %#x, x18 %#x", m.x[16], m.x[17], m.x[18])
+	}
+}
+
+func TestWinX18SetSlotUpdatesSysmsgAndHardwareX18(t *testing.T) {
+	const (
+		site = 0x7ff0_1000_0240
+		slot = 0x7ff0_1100_0140
+	)
+	for _, reg := range []uint8{0, 1, 17, 20, 31} {
+		buf := make([]byte, winTLSSlotSize)
+		if err := encodeWinX18SetSlot(buf, slot, site, reg); err != nil {
+			t.Fatalf("x%d: %v", reg, err)
+		}
+		m := newA64Machine(buf, slot)
+		for i := range m.x {
+			m.x[i] = 0x9000 + uint64(i)
+		}
+		var wantX18 uint64
+		if reg != 31 {
+			wantX18 = m.x[reg]
+		}
+		want := m.x
+		want[18] = wantX18
+		m.sp = rigStack
+		m.tpidr = rigSysm
+		if err := m.run(10); err != nil {
+			t.Fatalf("x%d: %v", reg, err)
+		}
+		if m.exit.jump != site+winSiteLen {
+			t.Errorf("x%d: the slot returns to %#x, want %#x", reg, m.exit.jump, uint64(site+winSiteLen))
+		}
+		if m.x != want {
+			t.Errorf("x%d: registers mismatch: got x18=%#x want=%#x", reg, m.x[18], wantX18)
+		}
+		if got := m.get64(rigSysm + winOffX18); got != wantX18 {
+			t.Errorf("x%d: sysmsg.X18 = %#x, want %#x", reg, got, wantX18)
+		}
 	}
 }
 

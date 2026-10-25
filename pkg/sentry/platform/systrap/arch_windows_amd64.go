@@ -221,11 +221,11 @@ func (th *thread) pullArch(*arch.Context64) {}
 // island.
 func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) || th.inIslandPC(pc) }
 
-// UserModifiedGS implements platform.AddressSpace.UserModifiedGS. It enables
-// GS-segment memory instruction trapping for this address space so the guest
-// can use a custom GS base without clobbering the stub's Windows TEB.
-func (as *addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error {
-	return as.enableGS()
+// UserModifiedGS implements platform.AddressSpace.UserModifiedGS. patchPage
+// always patches GS-segment memory instructions on Windows amd64, so setting a
+// custom GS base requires no address space state change.
+func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error {
+	return nil
 }
 
 // archEvent serves the stops that only amd64 has: the traps of patched sites.
@@ -290,9 +290,6 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 				}
 			}
 		} else {
-			if err := as.enableGS(); err != nil {
-				return fatal(err, unix.ENOMEM), true
-			}
 			ac.StateData().Regs.Gs_base = v
 		}
 		if err := th.continueEvent(ev); err != nil {
@@ -477,7 +474,7 @@ const winSiteJump amd64SiteKind = 0x80
 func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, []winSlotRef, error) {
 	before := as.neighborBytes(base, true, amd64MaxInsnLen)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
-	found := scanAMD64GS(before, page, after, as.gsUsed.Load())
+	found := scanAMD64GS(before, page, after, true)
 	scope := as.p.scopeOf(ctx, mm, base)
 	var plan *jmpPlanner
 	if as.p.fast {
@@ -496,7 +493,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	for _, s := range found {
 		// A file image proves which bytes are code. Anonymous memory and files
 		// without section headers give no proof, and the decoder alone decides.
-		if scope.proven() && !scope.containsRange(base+uint64(max(s.Offset, 0)), uint64(s.Len)) {
+		startOff := uint64(max(s.Offset, 0))
+		endOff := uint64(min(s.Offset+s.Len, blockSize))
+		if scope.proven() && !scope.containsRange(base+startOff, endOff-startOff) {
 			continue
 		}
 		if jumpEnd > 0 && s.Offset < jumpEnd {

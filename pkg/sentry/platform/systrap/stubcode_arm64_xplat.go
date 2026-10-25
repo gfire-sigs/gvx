@@ -298,11 +298,13 @@ func buildSpill() (winSpillCode, error) {
 	a.bCond(a64CondEQ, "cold")
 
 	// Hot resume. The scratch words of the sysmsg receive the guest x16 and
-	// x17 again, because a system call can change those words. The slot
-	// tail loads them back.
+	// x17 again, and X18 receives the guest x18, because a system call can
+	// change those words. The slot tail loads them back.
 	a.emit(
 		a64ldp(0, 1, base, int32(winOffX+8*16)),
 		a64stp(0, 1, base, int32(winOffScratch)),
+		a64ldrX(0, base, winOffX+8*18),
+		a64strX(0, base, winOffX18),
 	)
 	a.emit(restoreCommon(base)...)
 	a.emit(
@@ -355,32 +357,33 @@ func restoreCommon(base uint32) []uint32 {
 }
 
 // encodeWinSlot encodes the trap slot for a patched `svc #0` at site. The slot
-// saves x16 and x17 in the scratch words of the thread's winSysmsg through x18
-// and returns to the instruction after the site.
+// saves x16 and x17 in the scratch words of the thread's winSysmsg through x18,
+// restores x18 from the X18 word of the winSysmsg, and returns to the
+// instruction after the site.
 func encodeWinSlot(buf []byte, slotVA, site, spill uint64) error {
 	if len(buf) < winSlotSize {
 		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
 	}
-	back, err := encodeBranch(slotVA+winSlotTailOffset+8, winSiteReturn(site))
+	back, err := encodeBranch(slotVA+winSlotTailOffset+12, winSiteReturn(site))
 	if err != nil {
 		return err
 	}
 	words := [...]uint32{
 		a64TPIDR | 18,
 		a64stp(16, 17, 18, int32(winOffScratch)),
-		arm64ADRx17 | uint32((winSlotTailOffset-8)>>2)<<5,    // adr x17, tail: byte offset 20.
-		arm64LDRLitx16 | uint32((winSlotLitOffset-12)>>2)<<5, // ldr x16, [pc, +20].
+		a64ldrX(18, 18, winOffX18),
+		arm64ADRx17 | uint32((winSlotTailOffset-12)>>2)<<5,   // adr x17, tail: byte offset 24.
+		arm64LDRLitx16 | uint32((winSlotLitOffset-16)>>2)<<5, // ldr x16, [pc, +24].
 		a64br(16),
 		a64TPIDR | 18,
 		a64ldp(16, 17, 18, int32(winOffScratch)),
+		a64ldrX(18, 18, winOffX18),
 		back,
 	}
 	for i, w := range words {
 		binary.LittleEndian.PutUint32(buf[i*4:], w)
 	}
 	binary.LittleEndian.PutUint64(buf[winSlotLitOffset:], spill)
-	binary.LittleEndian.PutUint32(buf[40:], arm64NOP)
-	binary.LittleEndian.PutUint32(buf[44:], arm64NOP)
 	return nil
 }
 
@@ -407,5 +410,27 @@ func encodeWinTLSSlot(buf []byte, slotVA, site uint64, reg uint8) error {
 	binary.LittleEndian.PutUint32(buf[4:], a64ldrX(r, r, winOffTLS))
 	binary.LittleEndian.PutUint32(buf[8:], back)
 	binary.LittleEndian.PutUint32(buf[12:], arm64NOP)
+	return nil
+}
+
+// encodeWinX18SetSlot writes the slot that replaces `mov x18, xN` at site. The
+// slot stores xN into the X18 word of the thread's winSysmsg, copies xN into
+// hardware x18, and returns to the instruction after the site.
+func encodeWinX18SetSlot(buf []byte, slotVA, site uint64, reg uint8) error {
+	if len(buf) < winTLSSlotSize {
+		return fmt.Errorf("X18 slot buffer has %d bytes", len(buf))
+	}
+	if reg == 18 || reg > 31 {
+		return fmt.Errorf("X18 slot register %d", reg)
+	}
+	back, err := encodeBranch(slotVA+12, winSiteReturn(site))
+	if err != nil {
+		return err
+	}
+	r := uint32(reg)
+	binary.LittleEndian.PutUint32(buf[0:], a64TPIDR|18)
+	binary.LittleEndian.PutUint32(buf[4:], a64strX(r, 18, winOffX18))
+	binary.LittleEndian.PutUint32(buf[8:], a64movReg(18, r))
+	binary.LittleEndian.PutUint32(buf[12:], back)
 	return nil
 }
