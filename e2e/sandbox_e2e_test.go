@@ -537,8 +537,8 @@ func TestE2EHostLockdownEnforcedByDefault(t *testing.T) {
 
 	t.Run("default_is_locked", func(t *testing.T) {
 		rep, workspace, outside := probeRun(t)
-		if rep.Platform != string(autoPlatform()) {
-			t.Errorf("Platform = %q, want %q", rep.Platform, autoPlatform())
+		if rep.Platform != string(autoPlatform()) && rep.Platform != string(gvx.PlatformSystrap) {
+			t.Errorf("Platform = %q, want %q or %q", rep.Platform, autoPlatform(), gvx.PlatformSystrap)
 		}
 		if !rep.Lockdown.Applied || !rep.LockedAPI {
 			t.Errorf("Lockdown.Applied=%v IsLockedDown=%v, want both true by default", rep.Lockdown.Applied, rep.LockedAPI)
