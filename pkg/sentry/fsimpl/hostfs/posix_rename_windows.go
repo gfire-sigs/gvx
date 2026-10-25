@@ -20,73 +20,17 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/pkg/fd"
 )
-
-// This file implements unlink, rmdir, rename, and link with POSIX semantics.
-// A POSIX delete or rename removes or replaces a name at once, even while
-// other handles to the file stay open. Guests rely on this behavior, for
-// example when "git rebase" replaces an open file. Every operation works on
-// handles that resolve through the pinned workspace directory. No operation
-// falls back to a path-based call, so an unsupported file system returns its
-// real error and the guest sees it.
 
 const (
 	// fileLinkInformation is the FileLinkInformation class of
-	// NtSetInformationFile. The x/sys constant with the same name holds the
-	// value of FileLinkInformationEx (72). This code needs the plain class
-	// (11), which Go's own Linkat uses and which every Windows version accepts.
+	// NtSetInformationFile.
 	fileLinkInformation = 11
-
-	// fileRenameInformationEx is the FileRenameInformationEx class of
-	// NtSetInformationFile. The rename names its destination relative to a
-	// root directory handle, so it stays inside the pinned workspace. The
-	// Win32 call SetFileInformationByHandle with FileRenameInfoEx returned
-	// ERROR_INVALID_PARAMETER for this layout on a hosted Windows runner.
-	fileRenameInformationEx = 65
 
 	// fileDispositionInfoExSize is sizeof(FILE_DISPOSITION_INFO_EX).
 	fileDispositionInfoExSize = 4
 )
-
-// nameInfoHeader is the common layout of FILE_RENAME_INFO (the Ex form),
-// FILE_RENAME_INFORMATION, and FILE_LINK_INFORMATION. The first field is a
-// flag word for a rename, and a BOOLEAN ReplaceIfExists for a link.
-type nameInfoHeader struct {
-	Flags          uint32
-	RootDirectory  windows.Handle
-	FileNameLength uint32
-	FileName       [1]uint16
-}
-
-// newNameInfo builds a name information buffer that holds the simple name of
-// the destination and the handle of the destination directory. The buffer has
-// no terminating NUL, which the documentation allows. The buffer is at least
-// sizeof(nameInfoHeader) long, because the kernel rejects a shorter one, and
-// it has 8-byte alignment for the pointer-sized RootDirectory field. The
-// caller MUST keep the returned slice alive until the call that uses it ends.
-// Source: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info
-func newNameInfo(first uint32, root windows.Handle, name string) (buf []uint64, size uint32, err error) {
-	units, err := windows.UTF16FromString(name)
-	if err != nil {
-		return nil, 0, err
-	}
-	// Drop the NUL that UTF16FromString appends.
-	units = units[:len(units)-1]
-	const nameOffset = unsafe.Offsetof(nameInfoHeader{}.FileName)
-	nameBytes := len(units) * 2
-	total := max(int(unsafe.Sizeof(nameInfoHeader{})), int(nameOffset)+nameBytes)
-	words := (total + 7) / 8
-	buf = make([]uint64, words)
-	header := (*nameInfoHeader)(unsafe.Pointer(&buf[0]))
-	header.Flags = first
-	header.RootDirectory = root
-	header.FileNameLength = uint32(nameBytes)
-	if len(units) > 0 {
-		dst := unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(&buf[0]), nameOffset)), len(units))
-		copy(dst, units)
-	}
-	return buf, uint32(words * 8), nil
-}
 
 func (h *hostRoot) unlink(rel string) error {
 	return h.remove("unlink", rel, false)
@@ -168,7 +112,7 @@ func (h *hostRoot) rename(oldRel, newRel string) error {
 		windows.ERROR_SHARING_VIOLATION,
 		windows.DELETE|windows.FILE_READ_ATTRIBUTES,
 		windows.FILE_RENAME_REPLACE_IF_EXISTS|windows.FILE_RENAME_POSIX_SEMANTICS,
-		fileRenameInformationEx,
+		fd.FileRenameInformationEx,
 	)
 }
 
@@ -212,12 +156,7 @@ func (h *hostRoot) setTargetName(op, oldRel, newRel string, rootErr error, acces
 		return hostError2(op, oldRel, newRel, err)
 	}
 	defer closeHandle(src)
-	buf, size, err := newNameInfo(flags, newParent.handle, newParent.name)
-	if err != nil {
-		return hostError2(op, oldRel, newRel, err)
-	}
-	var iosb windows.IO_STATUS_BLOCK
-	if err := windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), size, infoClass); err != nil {
+	if err := fd.SetFileTargetName(src, newParent.handle, newParent.name, flags, infoClass); err != nil {
 		return hostError2(op, oldRel, newRel, err)
 	}
 	return nil

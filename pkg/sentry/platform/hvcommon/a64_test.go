@@ -19,6 +19,9 @@ import (
 	"testing"
 
 	"golang.org/x/arch/arm64/arm64asm"
+
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 func decodeA64(t *testing.T, word uint32) string {
@@ -307,6 +310,77 @@ func TestEmulateSysRegReadAndDefaults(t *testing.T) {
 		got, ok := ids.EmulateSysRegRead(iss)
 		if !ok || got != tc.want {
 			t.Errorf("%s: EmulateSysRegRead = (%#x, %v), want (%#x, true)", tc.name, got, ok, tc.want)
+		}
+	}
+
+	custom := &IDRegisters{
+		PFR0: 0x1101_0000_1011_0011 | 0xf<<32, PFR1: 0xff00,
+		ISAR1:   0x11110211202 | 0xf<<4,
+		Counter: func() uint64 { return 0x1234 },
+	}
+	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 4, 0)); !ok || got != custom.PFR0&^(0xf<<32) {
+		t.Errorf("ID_AA64PFR0_EL1 masking = (%#x, %v)", got, ok)
+	}
+	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 4, 1)); !ok || got != 0xf000 {
+		t.Errorf("ID_AA64PFR1_EL1 masking = (%#x, %v)", got, ok)
+	}
+	if got, ok := custom.EmulateSysRegRead(read(3, 0, 0, 6, 1)); !ok || got != 0x11100211002 {
+		t.Errorf("ID_AA64ISAR1_EL1 masking = (%#x, %v)", got, ok)
+	}
+	if got, ok := custom.EmulateSysRegRead(read(3, 3, 14, 0, 1)); !ok || got != 0x1234 {
+		t.Errorf("CNTPCT_EL0 = (%#x, %v)", got, ok)
+	}
+	iss := DecodeSysRegISS(uint64(ECSysReg)<<ESRECShift | 3<<20 | 7<<5 | 1)
+	if !iss.Read || iss.Rt != 7 || iss.Key() != KeyMIDR {
+		t.Errorf("DecodeSysRegISS = %+v", iss)
+	}
+}
+
+func TestDecodeA64SyncException(t *testing.T) {
+	const pc, far, sp uint64 = 0x400100, 0xbeef000, 0x7ffff3
+	esr := func(ec, iss uint64) uint64 { return ec<<ESRECShift | 1<<25 | iss }
+	for _, tc := range []struct {
+		name  string
+		esr   uint64
+		far   uint64
+		kind  A64ExitKind
+		signo linux.Signal
+		code  int32
+		addr  uint64
+		at    hostarch.AccessType
+	}{
+		{name: "svc", esr: esr(ECSVC64, 0), kind: A64ExitSyscall},
+		{name: "wfi", esr: esr(ECWFx, 0), kind: A64ExitSkip},
+		{name: "sysreg", esr: esr(ECSysReg, 1), kind: A64ExitSysReg},
+		{name: "data abort translation read", esr: esr(ECDataAbortLower, 0x05), kind: A64ExitSignal, signo: linux.SIGSEGV, code: SegvMapErr, addr: far, at: hostarch.Read},
+		{name: "data abort strips TBI tag", esr: esr(ECDataAbortLower, 0x05), far: 0x5a00_0000_0000_0000 | far, kind: A64ExitSignal, signo: linux.SIGSEGV, code: SegvMapErr, addr: far, at: hostarch.Read},
+		{name: "data abort permission write", esr: esr(ECDataAbortLower, 1<<6|0x0f), kind: A64ExitSignal, signo: linux.SIGSEGV, code: SegvAccErr, addr: far, at: hostarch.Write},
+		{name: "data abort cache maintenance is read", esr: esr(ECDataAbortLower, 1<<8|1<<6|0x0f), kind: A64ExitSignal, signo: linux.SIGSEGV, code: SegvAccErr, addr: far, at: hostarch.Read},
+		{name: "instruction abort", esr: esr(ECInstrAbortLower, 0x07), kind: A64ExitSignal, signo: linux.SIGSEGV, code: SegvMapErr, addr: far, at: hostarch.Execute},
+		{name: "alignment fault", esr: esr(ECDataAbortLower, 0x21), kind: A64ExitSignal, signo: linux.SIGBUS, code: BusAdrAln, addr: far, at: hostarch.Read},
+		{name: "external abort", esr: esr(ECDataAbortLower, 0x10), kind: A64ExitSignal, signo: linux.SIGBUS, code: BusAdrErr, addr: far, at: hostarch.Read},
+		{name: "pc alignment", esr: esr(ECPCAlignment, 0), kind: A64ExitSignal, signo: linux.SIGBUS, code: BusAdrAln, addr: far},
+		{name: "sp alignment uses SP", esr: esr(ECSPAlignment, 0), kind: A64ExitSignal, signo: linux.SIGBUS, code: BusAdrAln, addr: sp},
+		{name: "brk", esr: esr(ECBRK64, 0), kind: A64ExitSignal, signo: linux.SIGTRAP, code: linux.TRAP_BRKPT, addr: pc},
+		{name: "single step", esr: esr(ECSoftStepLower, 0), kind: A64ExitSignal, signo: linux.SIGTRAP, code: linux.TRAP_TRACE, addr: pc},
+		{name: "hardware breakpoint", esr: esr(ECBreakpointLower, 0), kind: A64ExitSignal, signo: linux.SIGTRAP, code: linux.TRAP_HWBKPT, addr: pc},
+		{name: "watchpoint", esr: esr(ECWatchpointLower, 0), kind: A64ExitSignal, signo: linux.SIGTRAP, code: linux.TRAP_HWBKPT, addr: far},
+		{name: "fp exception", esr: esr(ECFPExc64, 0), kind: A64ExitSignal, signo: linux.SIGFPE, code: FpeFltInv, addr: pc},
+		{name: "undefined instruction", esr: esr(ECUnknown, 0), kind: A64ExitSignal, signo: linux.SIGILL, code: IllIllOpc, addr: pc},
+		{name: "illegal execution state", esr: esr(ECIllegalState, 0), kind: A64ExitSignal, signo: linux.SIGILL, code: IllIllOpc, addr: pc},
+	} {
+		f := far
+		if tc.far != 0 {
+			f = tc.far
+		}
+		kind, sig, at := DecodeA64SyncException(tc.esr, f, pc, sp)
+		if kind != tc.kind {
+			t.Fatalf("%s: kind = %v, want %v", tc.name, kind, tc.kind)
+		}
+		if kind == A64ExitSignal {
+			if sig.Signo != int32(tc.signo) || sig.Code != tc.code || sig.Addr() != tc.addr || at != tc.at {
+				t.Errorf("%s: got (%+v, %v), want (%v/%d/@%#x, %v)", tc.name, sig, at, tc.signo, tc.code, tc.addr, tc.at)
+			}
 		}
 	}
 }

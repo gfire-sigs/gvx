@@ -8,7 +8,7 @@ This errata specification documents 11 architectural duplication clusters across
 | **Title** | Cross-Package Code Deduplication, Shared Subsystem Consolidation, and Divergence Fixes |
 | **Status** | Active Errata and Remediation Work Order |
 | **Upstream Baseline** | `0d2072ab24130458e928ea0a78b363a60705e433` (`upstream/go`) |
-| **Isolation Tiers** | Tier 1 (`platform/whpx`, `platform/hvf`, `platform/hvcommon`, `platform/slimvm`, `fsimpl/hostfs`, `fsimpl/ext4lite`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `cmd/rungv`, `internal/gvxshim`), Tier 2 (`platform/systrap`) |
+| **Isolation Tiers** | Tier 1 (`platform/whpx`, `platform/hvf`, `platform/hvcommon`, `fsimpl/chunkcache`, `fsimpl/hostfs`, `fsimpl/ext4lite`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `cmd/rungv`, `internal/gvxshim`), Tier 2 (`platform/systrap`), Tier 3 (`platform/slimvm`) |
 | **Companion Specs** | [`errata-001-upstream-reuse-and-efficiency.md`](errata-001-upstream-reuse-and-efficiency.md), [`errata-002-post-refactor-review-findings.md`](errata-002-post-refactor-review-findings.md), [`../architecture.md`](../architecture.md) |
 
 ---
@@ -24,7 +24,7 @@ The table below ranks all 11 deduplication and consolidation work items by corre
 | **ERRATA-003-E3** | **P1** | `fsimpl/hostfs`, `fsimpl/ext4lite`, `pkg/gvx` | `~520` | `hostfs/regular_file.go` and `ext4lite/mmap.go` duplicate the entire 64KB chunk page cache (`fileData`, `cacheChunk`, `dataMemmapFile`, `ChunkMemory`) and `safemem.Reader` block loops. | Both filesystems share one chunk-cache package (`pkg/sentry/fsimpl/chunkcache`) and one `ChunkMemory` registration hook. |
 | **ERRATA-003-E4** | **P1** | `platform/systrap`, `platform/hvcommon` | `~450` | Seven files re-declare ARM64 instruction encoders (`MOVZ`, `MOVK`, `B`, `BR`, `BLR`, `LDR`, `STR`, `LDP`, `STP`, `MRS`, `MSR`, `BRK`, `DC`); `systrap` duplicates `MRS` ID emulation and trap-slot encoding. | `hvcommon/a64.go` exports parameterized AArch64 encoders; `systrap` reuses `hvcommon` for instruction encoding and `MRS` emulation. |
 | **ERRATA-003-E5** | **P1** | `platform/systrap` (`darwin`, `windows`, `xplat`) | `~750` | `darwinsystrap` and `winsystrap` duplicate trampoline island bitmaps (`island`, `allocSlot`, `newIsland`), `addressSpace` helpers, `Platform`/`Context` boilerplate, FP/XSTATE copy loops, spin handoff, and `Probe` loops. | Shared `island_xplat.go`, `address_space_xplat.go`, `context_xplat.go`, and `probe_xplat.go` eliminate Darwin/Windows duplication. |
-| **ERRATA-003-E6** | **P1** | `platform/slimvm`, `platform/kvm`, `platform/hvcommon` | `~2,050` | `slimvm` copies `platform/kvm` across 23 files with four changed ioctl numbers and introduces an `FPE_INTOVF` (`Code: 1` vs. `2`) bug in `slimvm/machine_amd64.go:337`. | `slimvm` fixes the `FPE_INTOVF` code, shares x86 exception vector classification via `hvcommon/x86.go`, or consolidates with `kvm` behind an ioctl dialect interface. |
+| **ERRATA-003-E6** | **P1** | `platform/slimvm`, `platform/kvm`, `platform/hvcommon` | `~2,050` | Upstream Tier 3 `slimvm` copies `platform/kvm` across 23 files and introduces an `FPE_INTOVF` (`Code: 1` vs. `2`) bug in `slimvm/machine_amd64.go:337`. | `hvcommon/x86.go` exports `ClassifyX86Exception` for `whpx`; `slimvm` stays untouched as an upstream Tier 3 package under the `< 1.0%` diff budget. |
 | **ERRATA-003-E7** | **P2** | `fsimpl/hostfs`, `fsimpl/ext4lite`, `fsimpl/erofs` | `~550` | `hostfs` and `ext4lite` duplicate VFS xattr validation, host preallocation (`fallocate`/`F_PREALLOCATE`/`FileAllocationInfo`), Windows `NtQueryVolumeInformationFile`, disk-full error mapping, `PrependPath`/`IsDescendant`, and `openSpecial`. | Shared VFS helpers and `genericfstree` calls replace duplicated xattr, preallocation, `statfs`, error-mapping, and tree-walk code. |
 | **ERRATA-003-E8** | **P2** | `fsimpl/hostfs` | `~220` | `watcher_linux.go` and `watcher_other.go` are 100% identical; `tmpfile_{darwin,windows,unix}.go` duplicate non-Linux stubs; Unix and Windows files repeat `SyscallConn`, two-parent walk, `FindFirstFile`, and `GetFinalPathNameByHandle` loops. | Redundant OS stub files are merged and shared Unix/Windows helpers remove repeated syscall boilerplate. |
 | **ERRATA-003-E9** | **P2** | `pkg/netbackend`, `pkg/gvx` | `~210` | `dns_relay.go` duplicates 110 lines of DNS relay logic between `NATForwarder` and `WireGuardEndpoint`; `gvx` and `netbackend` duplicate port-forward parsing, loopback stack setup, and `spawn` helpers. | A single `dnsRelay` struct, unified `PortForwardRule` parser, `NewLoopbackStack()`, and shared `spawn` helper remove all duplication. |
@@ -210,8 +210,8 @@ The macOS (`*_darwin.go`) and Windows (`*_windows.go`) files in `pkg/sentry/plat
 
 ### 7.2 Remediation Procedure for E6 (Procedural Module)
 
-1. Open `pkg/sentry/platform/slimvm/machine_amd64.go` and fix line 337 so `ring0.Overflow` sets `Code: 2` (`FPE_INTOVF`).
-2. Extract a shared x86 exception vector classifier `ClassifyX86Exception` in `pkg/sentry/platform/hvcommon/x86.go` and reuse it in `pkg/sentry/platform/whpx/fault.go` and `pkg/sentry/platform/slimvm/machine_amd64.go`.
+1. Extract a shared x86 exception vector classifier `ClassifyX86Exception` in `pkg/sentry/platform/hvcommon/x86.go` and reuse it in `pkg/sentry/platform/whpx/fault.go`.
+2. Keep `pkg/sentry/platform/slimvm` unmodified because it is an upstream Tier 3 Google gVisor package subject to the `< 1.0%` upstream diff budget.
 3. Cross-compile `GOOS=linux GOARCH=amd64 go build ./pkg/sentry/platform/slimvm/... ./pkg/sentry/platform/kvm/...` and run `go test ./pkg/sentry/platform/hvcommon/... ./pkg/sentry/platform/whpx/...`.
 
 ---

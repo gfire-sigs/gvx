@@ -168,42 +168,57 @@ func slotSizeFor(k siteKind) int {
 	return trapSlotSize
 }
 
-// encodeTrapSlot writes a trap slot at slotVA into buf. The slot saves x16
-// and x17 in the scratch words of the thread's sysmsg, loads the stub's spill
-// routine and jumps to it with x17 set to the slot tail. After the Sentry
-// resumes the thread, the stub jumps back to the tail, which restores x16 and
-// x17 from the sysmsg and branches to retPC.
-func encodeTrapSlot(buf []byte, slotVA, retPC, spill uint64) error {
-	if len(buf) < trapSlotSize {
+// encodeTrapSysmsgSlot writes a syscall trap slot at slotVA into buf using
+// save as the entry prologue and restore as the tail epilogue.
+func encodeTrapSysmsgSlot(buf []byte, slotVA, retPC, spill uint64, save, restore []uint32) error {
+	tailOff := (len(save) + 3) * 4
+	litOff := (len(save) + 3 + len(restore) + 1) * 4
+	if len(buf) < litOff+8 {
 		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
 	}
-	back, err := encodeBranch(slotVA+trapSlotTailOffset+16, retPC)
+	backOff := len(save)*4 + 4
+	adrOff := len(save) * 4
+	ldrOff := adrOff + 4
+	back, err := encodeBranch(slotVA+uint64(tailOff+len(restore)*4), retPC)
 	if err != nil {
 		return err
 	}
+	_ = backOff
+	off := 0
+	for _, w := range save {
+		binary.LittleEndian.PutUint32(buf[off:], w)
+		off += 4
+	}
+	binary.LittleEndian.PutUint32(buf[off:], arm64ADRx17|uint32((tailOff-adrOff)>>2)<<5)
+	binary.LittleEndian.PutUint32(buf[off+4:], arm64LDRLitx16|uint32((litOff-ldrOff)>>2)<<5)
+	binary.LittleEndian.PutUint32(buf[off+8:], hvcommon.BR(16))
+	off += 12
+	for _, w := range restore {
+		binary.LittleEndian.PutUint32(buf[off:], w)
+		off += 4
+	}
+	binary.LittleEndian.PutUint32(buf[off:], back)
+	binary.LittleEndian.PutUint64(buf[litOff:], spill)
+	return nil
+}
+
+// encodeTrapSlot writes a trap slot at slotVA into buf.
+func encodeTrapSlot(buf []byte, slotVA, retPC, spill uint64) error {
 	const (
 		ptr0 = arm64MRSTPIDRRO | arm64ScratchReg
 		ptr1 = arm64ANDxMinus8 | arm64ScratchReg<<5 | arm64ScratchReg
 	)
-	words := [...]uint32{
-		ptr0,
-		ptr1,
+	save := []uint32{
+		ptr0, ptr1,
 		hvcommon.STRX(arm64ScratchReg, 16, trapScratchOffset),
 		hvcommon.STRX(arm64ScratchReg, 17, trapScratchOffset+8),
-		arm64ADRx17 | uint32((trapSlotTailOffset-16)>>2)<<5,   // adr x17, tail: byte offset 28.
-		arm64LDRLitx16 | uint32((trapSlotLitOffset-20)>>2)<<5, // ldr x16, [pc, +28].
-		hvcommon.BR(16),
-		ptr0,
-		ptr1,
+	}
+	restore := []uint32{
+		ptr0, ptr1,
 		hvcommon.LDRX(arm64ScratchReg, 16, trapScratchOffset),
 		hvcommon.LDRX(arm64ScratchReg, 17, trapScratchOffset+8),
-		back,
 	}
-	for i, w := range words {
-		binary.LittleEndian.PutUint32(buf[i*4:], w)
-	}
-	binary.LittleEndian.PutUint64(buf[trapSlotLitOffset:], spill)
-	return nil
+	return encodeTrapSysmsgSlot(buf, slotVA, retPC, spill, save, restore)
 }
 
 // encodeLoadSysmsgSlot writes a 16-byte slot at slotVA that reads a thread

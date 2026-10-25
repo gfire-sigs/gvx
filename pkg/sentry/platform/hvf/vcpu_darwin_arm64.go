@@ -66,7 +66,7 @@ type archWorker struct {
 	// synced is the flush state that a completed guest run confirmed. entry is
 	// the state the current entry asks the stub to establish.
 	synced, entry syncState
-	ids           idRegisters
+	ids           hvcommon.IDRegisters
 	// unknownExits counts consecutive hvExitReasonUnknown exits.
 	unknownExits int
 }
@@ -329,7 +329,7 @@ func (w *vcpuWorker) dispatchExit(c *Context, pt *stage1Tables, ac *arch.Context
 	case hvExitReasonCanceled:
 		return w.onCancel(c, pt)
 	case hvExitReasonException:
-		if esrEC(w.exit.syndrome) == ecHVC64 {
+		if hvcommon.ESREC(w.exit.syndrome) == hvcommon.ECHVC64 {
 			return w.onStubExit(ac)
 		}
 		return w.onHypervisorException()
@@ -428,7 +428,7 @@ func (w *vcpuWorker) onStubExit(ac *arch.Context64) (bool, *linux.SignalInfo, ho
 	case exitSignal:
 		return true, act.info, act.at, platform.ErrContextSignal
 	case exitSysReg:
-		iss := decodeSysRegISS(comm.ESR)
+		iss := hvcommon.DecodeSysRegISS(comm.ESR)
 		val, ok := w.ids.EmulateSysRegRead(iss)
 		if !ok {
 			// Writes and unknown registers raise SIGILL, as Linux does.
@@ -468,7 +468,7 @@ func (w *vcpuWorker) onHypervisorException() (bool, *linux.SignalInfo, hostarch.
 	case exitWFx:
 		return false, nil, hostarch.NoAccess, w.advancePC()
 	case exitSysReg:
-		iss := decodeSysRegISS(exit.syndrome)
+		iss := hvcommon.DecodeSysRegISS(exit.syndrome)
 		if val, ok := w.ids.EmulateSysRegRead(iss); ok {
 			if iss.Rt != 31 {
 				if err := hvSetReg(w.id, hvRegX0+iss.Rt, val); err != nil {

@@ -22,42 +22,8 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
-// ESR_ELx exception classes (ARM DDI 0487, D17.2.37).
-const (
-	ecUnknown      = hvcommon.ECUnknown
-	ecWFx          = hvcommon.ECWFx
-	ecIllegalState = hvcommon.ECIllegalState
-	ecSVC64        = hvcommon.ECSVC64
-	ecHVC64        = hvcommon.ECHVC64
-	ecSysReg       = hvcommon.ECSysReg
-	ecInstrAbort   = hvcommon.ECInstrAbortLower
-	ecPCAlignment  = hvcommon.ECPCAlignment
-	ecDataAbort    = hvcommon.ECDataAbortLower
-	ecSPAlignment  = hvcommon.ECSPAlignment
-	ecFPExc64      = hvcommon.ECFPExc64
-	ecBreakpoint   = hvcommon.ECBreakpointLower
-	ecBreakpointEL = hvcommon.ECBreakpointCur
-	ecSoftStep     = hvcommon.ECSoftStepLower
-	ecSoftStepEL   = hvcommon.ECSoftStepCur
-	ecWatchpoint   = hvcommon.ECWatchpointLower
-	ecWatchpointEL = hvcommon.ECWatchpointCur
-	ecBRK64        = hvcommon.ECBRK64
-)
-
-// Fault status codes in ESR_ELx.ISS for aborts.
-const (
-	fscTranslationL0 = hvcommon.FSCTranslationL0
-	fscTranslationL3 = hvcommon.FSCTranslationL3
-	fscPermissionL1  = hvcommon.FSCPermissionL1
-	fscPermissionL3  = hvcommon.FSCPermissionL3
-	fscSyncExternal  = hvcommon.FSCSyncExternal
-	fscAlignment     = hvcommon.FSCAlignment
-
-	issS1PTW = 1 << 7 // The abort happened during a stage-1 table walk.
-)
-
-func esrEC(esr uint64) uint64  { return hvcommon.ESREC(esr) }
-func esrFSC(esr uint64) uint64 { return hvcommon.ESRFSC(esr) }
+// issS1PTW marks a stage-2 abort that happened during a stage-1 table walk.
+const issS1PTW = 1 << 7
 
 // decodeStubExit decodes the state that the EL1 stub spilled: the vector slot,
 // ESR_EL1, FAR_EL1, ELR_EL1 and SP_EL0 of the guest exception.
@@ -83,12 +49,12 @@ func decodeStubExit(vec, esr, far, pc, sp uint64) exitAction {
 // directly, without the EL1 stub. The syndrome is ESR_EL2 and virtualAddress
 // is the guest virtual address of an abort.
 func decodeHypervisorExit(syndrome, virtualAddress, physicalAddress uint64) exitAction {
-	switch ec := esrEC(syndrome); ec {
-	case ecInstrAbort, ecDataAbort:
+	switch ec := hvcommon.ESREC(syndrome); ec {
+	case hvcommon.ECInstrAbortLower, hvcommon.ECDataAbortLower:
 		return decodeStage2Abort(syndrome, virtualAddress, physicalAddress)
-	case ecSysReg:
+	case hvcommon.ECSysReg:
 		return exitAction{kind: exitSysReg}
-	case ecWFx:
+	case hvcommon.ECWFx:
 		return exitAction{kind: exitWFx}
 	default:
 		return exitAction{kind: exitInternal, err: fmt.Errorf(
@@ -107,22 +73,12 @@ func decodeStage2Abort(syndrome, va, ipa uint64) exitAction {
 	}
 	addr := uint64(hostarch.UntaggedUserAddr(hostarch.Addr(va)))
 	at := hostarch.ESRAccessType(syndrome)
-	switch fsc := esrFSC(syndrome); {
-	case fsc >= fscPermissionL1 && fsc <= fscPermissionL3:
+	switch fsc := hvcommon.ESRFSC(syndrome); {
+	case fsc >= hvcommon.FSCPermissionL1 && fsc <= hvcommon.FSCPermissionL3:
 		return signalAction(linux.SIGSEGV, sigSegvAcc, addr, at)
-	case fsc >= fscTranslationL0 && fsc <= fscTranslationL3:
+	case fsc >= hvcommon.FSCTranslationL0 && fsc <= hvcommon.FSCTranslationL3:
 		return signalAction(linux.SIGBUS, sigBusAdrErr, addr, at)
 	default:
 		return signalAction(linux.SIGBUS, sigBusObjErr, addr, at)
 	}
 }
-
-type sysRegISS = hvcommon.SysRegISS
-
-func decodeSysRegISS(esr uint64) sysRegISS {
-	return hvcommon.DecodeSysRegISS(esr)
-}
-
-const keyMIDR = hvcommon.KeyMIDR
-
-type idRegisters = hvcommon.IDRegisters

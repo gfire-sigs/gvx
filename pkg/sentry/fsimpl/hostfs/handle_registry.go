@@ -286,8 +286,8 @@ func (o workspaceHandleOps) flush(h *hostHandle) {
 	if d == nil {
 		return
 	}
-	if err := d.flushRange(0, math.MaxUint64); err != nil {
-		d.noteWritebackErr(err)
+	if err := d.FlushRange(0, math.MaxUint64); err != nil {
+		d.NoteWritebackErr(err)
 	}
 }
 

@@ -840,9 +840,9 @@ func TestMappingSurvivesTheLastUnmapOfAnotherThread(t *testing.T) {
 		// The last unmap releases every handle again.
 		optsB.Mappable.RemoveMapping(e.ctx, msB, arB, 0, false)
 		data := &fd.Impl().(*regularFD).dentry.inode.data
-		data.dataMu.Lock()
+		data.DataMu.Lock()
 		held := data.mh != nil || data.pending != nil
-		data.dataMu.Unlock()
+		data.DataMu.Unlock()
 		if held {
 			t.Fatalf("the file data still holds a handle after the last unmap")
 		}

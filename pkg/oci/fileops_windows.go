@@ -21,29 +21,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/pkg/fd"
 )
-
-// The layer cache is a content-addressed directory. Several goroutines and
-// processes read a layer while another one publishes the same layer. Go opens
-// files without FILE_SHARE_DELETE and renames with MoveFileEx, so on Windows an
-// open reader blocks every replacement and every delete. The functions below
-// share files fully and rename with POSIX semantics, so a reader never blocks
-// a publisher.
-
-// fileRenameInformationEx is the FileRenameInformationEx class of
-// NtSetInformationFile.
-const fileRenameInformationEx = 65
-
-// renameInfo is the layout of FILE_RENAME_INFORMATION_EX.
-type renameInfo struct {
-	Flags          uint32
-	RootDirectory  windows.Handle
-	FileNameLength uint32
-	FileName       [1]uint16
-}
 
 const shareAll = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
 
@@ -82,17 +63,10 @@ func replaceFile(oldPath, newPath string) error {
 	if err != nil {
 		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: err}
 	}
-	// A name for NtSetInformationFile with no root directory is an NT path.
 	ntName := `\??\` + absNew
 	if strings.HasPrefix(absNew, `\\`) {
 		ntName = `\??\UNC\` + absNew[2:]
 	}
-	units, err := windows.UTF16FromString(ntName)
-	if err != nil {
-		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: err}
-	}
-	units = units[:len(units)-1]
-
 	oldName, err := windows.UTF16PtrFromString(oldPath)
 	if err != nil {
 		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: err}
@@ -103,16 +77,8 @@ func replaceFile(oldPath, newPath string) error {
 	}
 	defer windows.CloseHandle(src)
 
-	const nameOffset = unsafe.Offsetof(renameInfo{}.FileName)
-	total := max(int(unsafe.Sizeof(renameInfo{})), int(nameOffset)+len(units)*2)
-	buf := make([]uint64, (total+7)/8)
-	info := (*renameInfo)(unsafe.Pointer(&buf[0]))
-	info.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
-	info.FileNameLength = uint32(len(units) * 2)
-	copy(unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(&buf[0]), nameOffset)), len(units)), units)
-
-	var iosb windows.IO_STATUS_BLOCK
-	err = windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), uint32(len(buf)*8), fileRenameInformationEx)
+	const flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
+	err = fd.SetFileTargetName(src, 0, ntName, flags, fd.FileRenameInformationEx)
 	if err == nil {
 		return nil
 	}

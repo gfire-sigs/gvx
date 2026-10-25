@@ -30,6 +30,7 @@ PROTECT pkg/sentry/platform/hvcommon/**
 PROTECT pkg/sentry/platform/systrap/*_windows*
 PROTECT pkg/sentry/platform/systrap/*_darwin*
 PROTECT pkg/sentry/platform/systrap/*_xplat*
+PROTECT pkg/sentry/fsimpl/chunkcache/**
 PROTECT pkg/sentry/fsimpl/hostfs/**
 PROTECT pkg/sentry/fsimpl/ext4lite/**
 PROTECT e2e/**

@@ -401,7 +401,7 @@ func (i *inode) matches(e entry) bool {
 // syncData writes back mapped file data and reports any earlier write-back
 // failure that no caller observed.
 func (i *inode) syncData() error {
-	return i.data.syncData()
+	return i.data.SyncData()
 }
 
 // destroy releases the resources of an inode with no dentries left.

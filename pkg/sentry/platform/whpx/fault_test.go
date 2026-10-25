@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 func TestClassifyX86(t *testing.T) {
@@ -31,31 +32,31 @@ func TestClassifyX86(t *testing.T) {
 		wantErr      bool
 	}{
 		{name: "page fault not present read", vector: 14, errc: 0b00100, cr2: 0x7000,
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvMapErr, addr: 0x7000, hasAddr: true, access: hostarch.AccessType{Read: true}}},
+			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: hvcommon.SegvMapErr, addr: 0x7000, hasAddr: true, access: hostarch.AccessType{Read: true}}},
 		{name: "page fault protection write", vector: 14, errc: 0b00111, cr2: 0x7008,
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvAccErr, addr: 0x7008, hasAddr: true, access: hostarch.AccessType{Write: true}}},
+			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: hvcommon.SegvAccErr, addr: 0x7008, hasAddr: true, access: hostarch.AccessType{Write: true}}},
 		{name: "page fault instruction fetch", vector: 14, errc: 0b10101, cr2: rip,
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvAccErr, addr: rip, hasAddr: true, access: hostarch.AccessType{Read: true, Execute: true}}},
+			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: hvcommon.SegvAccErr, addr: rip, hasAddr: true, access: hostarch.AccessType{Read: true, Execute: true}}},
 		{name: "divide", vector: 0,
-			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: fpeIntDiv, addr: rip, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: hvcommon.FpeIntDiv, addr: rip, hasAddr: true}},
 		{name: "debug", vector: 1,
 			want: trap{kind: trapSignal, signo: linux.SIGTRAP, code: linux.TRAP_TRACE, addr: rip, hasAddr: true}},
 		{name: "breakpoint", vector: 3,
 			want: trap{kind: trapSignal, signo: linux.SIGTRAP, code: linux.SI_KERNEL}},
 		{name: "overflow", vector: 4,
-			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: fpeIntOvf, addr: rip, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: hvcommon.FpeIntOvf, addr: rip, hasAddr: true}},
 		{name: "invalid opcode", vector: 6,
-			want: trap{kind: trapSignal, signo: linux.SIGILL, code: illIllOpc, addr: rip, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGILL, code: hvcommon.IllIllOpc, addr: rip, hasAddr: true}},
 		{name: "general protection", vector: 13, errc: 0x2,
 			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: linux.SI_KERNEL, addr: rip, hasAddr: true}},
 		{name: "int 0x80 without gate", vector: 13, errc: 0x80<<3 | 2,
 			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: linux.SI_KERNEL, addr: rip, hasAddr: true}},
 		{name: "x87", vector: 16,
-			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: fpeFltInv, addr: rip, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: hvcommon.FpeFltInv, addr: rip, hasAddr: true}},
 		{name: "alignment", vector: 17,
-			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrAln}},
+			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: hvcommon.BusAdrAln}},
 		{name: "simd", vector: 19,
-			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: fpeFltInv, addr: rip, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: hvcommon.FpeFltInv, addr: rip, hasAddr: true}},
 		{name: "double fault", vector: 8, wantErr: true},
 		{name: "machine check", vector: 18, wantErr: true},
 		{name: "nmi", vector: 2, wantErr: true},
@@ -71,57 +72,31 @@ func TestClassifyX86(t *testing.T) {
 	}
 }
 
-func esr(ec, iss uint64) uint64 { return ec<<esrECShift | 1<<25 | iss }
+func esr(ec, iss uint64) uint64 { return ec<<hvcommon.ESRECShift | 1<<25 | iss }
 
 func TestClassifyA64(t *testing.T) {
 	const pc uint64 = 0x400100
 	const far uint64 = 0x7FFF0000
 	const sp uint64 = 0x7FFEE003
 	for _, c := range []struct {
-		name           string
-		slot, esr, far uint64
-		want           trap
-		wantErr        bool
+		name      string
+		slot, esr uint64
+		want      trap
+		wantErr   bool
 	}{
-		{name: "svc", slot: a64SlotLowA64Sync, esr: esr(esrECSVC64, 0), want: trap{kind: trapSyscall}},
-		{name: "wfi", slot: a64SlotLowA64Sync, esr: esr(esrECWFx, 0), want: trap{kind: trapSkip}},
-		{name: "data abort translation level 3 read", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x07),
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvMapErr, addr: far, hasAddr: true, access: hostarch.Read}},
-		{name: "data abort strips TBI tag", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x07), far: 0xAA00_0000_0000_0000 | far,
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvMapErr, addr: far, hasAddr: true, access: hostarch.Read}},
-		{name: "data abort permission level 3 write", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, esrWnR|0x0F),
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvAccErr, addr: far, hasAddr: true, access: hostarch.Write}},
-		{name: "data abort cache maintenance is a read", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, esrWnR|esrCM|0x0F),
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvAccErr, addr: far, hasAddr: true, access: hostarch.Read}},
-		{name: "instruction abort translation", slot: a64SlotLowA64Sync, esr: esr(esrECInstrAbrt, 0x05),
-			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: segvMapErr, addr: far, hasAddr: true, access: hostarch.Execute}},
-		{name: "data abort alignment", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x21),
-			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrAln, addr: far, hasAddr: true, access: hostarch.Read}},
-		{name: "data abort external", slot: a64SlotLowA64Sync, esr: esr(esrECDataAbrt, 0x10),
-			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, addr: far, hasAddr: true, access: hostarch.Read}},
-		{name: "sp alignment", slot: a64SlotLowA64Sync, esr: esr(esrECSPAlign, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrAln, addr: sp, hasAddr: true}},
-		{name: "unknown reason", slot: a64SlotLowA64Sync, esr: esr(esrECUnknown, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGILL, code: illIllOpc, addr: pc, hasAddr: true}},
-		{name: "mrs from el0", slot: a64SlotLowA64Sync, esr: esr(esrECSysReg, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGILL, code: illIllOpc, addr: pc, hasAddr: true}},
-		{name: "brk", slot: a64SlotLowA64Sync, esr: esr(esrECBrk64, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGTRAP, code: linux.TRAP_BRKPT, addr: pc, hasAddr: true}},
-		{name: "software step", slot: a64SlotLowA64Sync, esr: esr(esrECStepLow, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGTRAP, code: linux.TRAP_TRACE, addr: pc, hasAddr: true}},
-		{name: "fp exception", slot: a64SlotLowA64Sync, esr: esr(esrECFPExc, 0),
-			want: trap{kind: trapSignal, signo: linux.SIGFPE, code: fpeFltInv, addr: pc, hasAddr: true}},
+		{name: "svc", slot: a64SlotLowA64Sync, esr: esr(hvcommon.ECSVC64, 0), want: trap{kind: trapSyscall}},
+		{name: "wfi", slot: a64SlotLowA64Sync, esr: esr(hvcommon.ECWFx, 0), want: trap{kind: trapSkip}},
+		{name: "data abort", slot: a64SlotLowA64Sync, esr: esr(hvcommon.ECDataAbortLower, 0x07),
+			want: trap{kind: trapSignal, signo: linux.SIGSEGV, code: hvcommon.SegvMapErr, addr: far, hasAddr: true, access: hostarch.Read}},
+		{name: "mrs from el0", slot: a64SlotLowA64Sync, esr: esr(hvcommon.ECSysReg, 0),
+			want: trap{kind: trapSignal, signo: linux.SIGILL, code: hvcommon.IllIllOpc, addr: pc, hasAddr: true}},
 		{name: "serror from el0", slot: a64SlotLowA64SErr, esr: 0,
-			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, addr: pc, hasAddr: true}},
+			want: trap{kind: trapSignal, signo: linux.SIGBUS, code: hvcommon.BusAdrErr, addr: pc, hasAddr: true}},
 		{name: "irq", slot: a64SlotLowA64IRQ, wantErr: true},
-		{name: "exception taken at el1", slot: a64SlotCurSPxSync, esr: esr(esrECDataAbrt, 0x07), wantErr: true},
+		{name: "exception taken at el1", slot: a64SlotCurSPxSync, esr: esr(hvcommon.ECDataAbortLower, 0x07), wantErr: true},
 		{name: "aarch32 el0", slot: a64SlotLowA32Sync, wantErr: true},
 	} {
-		f := far
-		if c.far != 0 {
-			f = c.far
-		}
-		got, err := classifyA64(c.slot, c.esr, f, pc, sp)
+		got, err := classifyA64(c.slot, c.esr, far, pc, sp)
 		if (err != nil) != c.wantErr {
 			t.Errorf("%s: error %v, want error %v", c.name, err, c.wantErr)
 			continue

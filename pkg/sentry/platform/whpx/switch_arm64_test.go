@@ -27,6 +27,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // a64Env is a platform on a fake backend with one address space.
@@ -76,7 +77,7 @@ func (e *a64Env) trap(vp *fakeVP, exit []byte, slot, esrVal, far, elr uint64, mu
 }
 
 func (e *a64Env) svc(vp *fakeVP, exit []byte, elr uint64, mutate func(c *CommPage)) {
-	e.trap(vp, exit, a64SlotLowA64Sync, esr(esrECSVC64, 0), 0, elr, mutate)
+	e.trap(vp, exit, a64SlotLowA64Sync, esr(hvcommon.ECSVC64, 0), 0, elr, mutate)
 }
 
 func (e *a64Env) switchTo(c *Context, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
@@ -201,14 +202,14 @@ func TestSwitchPageFaultBecomesSignal(t *testing.T) {
 	c, ac := e.newContext()
 	ac.StateData().Regs.Pc = 0x400000
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		e.trap(vp, exit, a64SlotLowA64Sync, esr(esrECDataAbrt, esrWnR|0x07), 0xDEAD000, 0x400040, nil)
+		e.trap(vp, exit, a64SlotLowA64Sync, esr(hvcommon.ECDataAbortLower, 1<<6|0x07), 0xDEAD000, 0x400040, nil)
 		return nil
 	}
 	sig, at, err := e.switchTo(c, ac)
 	if !errors.Is(err, platform.ErrContextSignal) || sig == nil {
 		t.Fatalf("Switch returned %v, %v", sig, err)
 	}
-	if sig.Signo != int32(linux.SIGSEGV) || sig.Code != segvMapErr || !at.Write || at.Read {
+	if sig.Signo != int32(linux.SIGSEGV) || sig.Code != hvcommon.SegvMapErr || !at.Write || at.Read {
 		t.Errorf("signal %d code %d access %+v", sig.Signo, sig.Code, at)
 	}
 	if got := binary.LittleEndian.Uint64(sig.Fields[0:8]); got != 0xDEAD000 {
@@ -371,7 +372,7 @@ func TestSwitchSkipsWaitForInterruptInstructions(t *testing.T) {
 		cp := e.comm(vp)
 		pcs = append(pcs, cp.PC)
 		if len(pcs) == 1 {
-			e.trap(vp, exit, a64SlotLowA64Sync, esr(esrECWFx, 0), 0, 0x400010, nil)
+			e.trap(vp, exit, a64SlotLowA64Sync, esr(hvcommon.ECWFx, 0), 0, 0x400010, nil)
 			return nil
 		}
 		e.svc(vp, exit, cp.PC+4, nil)
@@ -404,7 +405,7 @@ func TestSwitchRejectsUnexpectedExits(t *testing.T) {
 			binary.LittleEndian.PutUint32(exit, a64ExitUnrecoverable)
 		}},
 		{"exception at EL1", func(e *a64Env, vp *fakeVP, exit []byte) {
-			e.trap(vp, exit, a64SlotCurSPxSync, esr(esrECDataAbrt, 0x07), 0, 0x1000, nil)
+			e.trap(vp, exit, a64SlotCurSPxSync, esr(hvcommon.ECDataAbortLower, 0x07), 0, 0x1000, nil)
 		}},
 		{"IRQ", func(e *a64Env, vp *fakeVP, exit []byte) {
 			e.trap(vp, exit, a64SlotLowA64IRQ, 0, 0, 0x1000, nil)
@@ -482,7 +483,7 @@ func TestSwitchMemoryFaultAtEL0IsSIGBUS(t *testing.T) {
 		return nil
 	}
 	sig, at, err := e.switchTo(c, ac)
-	if !errors.Is(err, platform.ErrContextSignal) || sig == nil || sig.Signo != int32(linux.SIGBUS) || sig.Code != busAdrErr || !at.Write {
+	if !errors.Is(err, platform.ErrContextSignal) || sig == nil || sig.Signo != int32(linux.SIGBUS) || sig.Code != hvcommon.BusAdrErr || !at.Write {
 		t.Fatalf("Switch returned %+v, %+v, %v", sig, at, err)
 	}
 	if got := binary.LittleEndian.Uint64(sig.Fields[0:8]); got != 0x7000 {
@@ -720,7 +721,7 @@ func TestThreadInitRunsOnEverySwitch(t *testing.T) {
 	ac := arch.New(arch.ARM64)
 	fb.onRun = func(vp *fakeVP, exit []byte) error {
 		cp := p.kernel.commPage(int(vp.index))
-		cp.Vector, cp.ESR = a64SlotLowA64Sync, esr(esrECSVC64, 0)
+		cp.Vector, cp.ESR = a64SlotLowA64Sync, esr(hvcommon.ECSVC64, 0)
 		atomic.StoreUint32(&cp.ExitReason, uint32(ExitException))
 		writeStubExit(exit, p.kernel.layout.code()+uint64(p.kernel.a64.Reload))
 		return nil
@@ -860,7 +861,7 @@ func TestSwitchEmulatesSysRegReadsAndRejectsWrites(t *testing.T) {
 		if read {
 			dir = 1
 		}
-		return esr(esrECSysReg, uint64(op0<<20|op2<<17|op1<<14|crn<<10|rt<<5|crm<<1|dir))
+		return esr(hvcommon.ECSysReg, uint64(op0<<20|op2<<17|op1<<14|crn<<10|rt<<5|crm<<1|dir))
 	}
 
 	step := 0

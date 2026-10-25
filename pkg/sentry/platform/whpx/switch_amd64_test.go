@@ -27,6 +27,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // x64Env is a platform on a fake backend with one address space.
@@ -258,14 +259,14 @@ func TestSwitchPageFaultBecomesSignalAndResumesWithIRET(t *testing.T) {
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
 		e.comm(vp).Regs[1], e.comm(vp).Regs[11] = 0x1234, 0x5678 // The application's own values.
 		e.comm(vp).SP = 0x7FFEFFF0
-		e.exception(vp, exit, x86VecPageFault, 0b00110, 0xDEAD000, 0x400040)
+		e.exception(vp, exit, hvcommon.X86VecPageFault, 0b00110, 0xDEAD000, 0x400040)
 		return nil
 	}
 	sig, at, err := e.switchTo(c, ac)
 	if !errors.Is(err, platform.ErrContextSignal) || sig == nil {
 		t.Fatalf("Switch returned %v, %v", sig, err)
 	}
-	if sig.Signo != int32(linux.SIGSEGV) || sig.Code != segvMapErr || !at.Write {
+	if sig.Signo != int32(linux.SIGSEGV) || sig.Code != hvcommon.SegvMapErr || !at.Write {
 		t.Errorf("signal %d code %d access %+v", sig.Signo, sig.Code, at)
 	}
 	if got := binary.LittleEndian.Uint64(sig.Fields[0:8]); got != 0xDEAD000 {
@@ -303,7 +304,7 @@ func TestSwitchRejectsUnexpectedExits(t *testing.T) {
 			writeStubExit(exit, 0x1000)
 		}},
 		{"double fault", func(e *x64Env, vp *fakeVP, exit []byte) {
-			e.exception(vp, exit, x86VecDoubleFault, 0, 0, 0x400000)
+			e.exception(vp, exit, hvcommon.X86VecDoubleFault, 0, 0, 0x400000)
 		}},
 		{"triple fault", func(e *x64Env, vp *fakeVP, exit []byte) {
 			binary.LittleEndian.PutUint32(exit, x64ExitUnrecoverable)
@@ -455,7 +456,7 @@ func TestSwitchMemoryFaultAtCPL3IsSIGBUS(t *testing.T) {
 		return nil
 	}
 	sig, at, err := e.switchTo(c, ac)
-	if !errors.Is(err, platform.ErrContextSignal) || sig == nil || sig.Signo != int32(linux.SIGBUS) || sig.Code != busAdrErr || !at.Write {
+	if !errors.Is(err, platform.ErrContextSignal) || sig == nil || sig.Signo != int32(linux.SIGBUS) || sig.Code != hvcommon.BusAdrErr || !at.Write {
 		t.Fatalf("Switch returned %+v, %+v, %v", sig, at, err)
 	}
 	if got := binary.LittleEndian.Uint64(sig.Fields[0:8]); got != 0x7000 {

@@ -34,6 +34,7 @@ import (
 
 	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/fd"
 )
 
 // winTestHost returns a hostRoot over a fresh temporary directory and the
@@ -228,7 +229,7 @@ func TestWindowsHostParseDirBuffer(t *testing.T) {
 }
 
 func TestWindowsHostNameInfoLayout(t *testing.T) {
-	var header nameInfoHeader
+	var header fd.NameInfoHeader
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	if got := unsafe.Offsetof(header.RootDirectory); got != ptrSize {
 		t.Errorf("offset of RootDirectory = %d, want %d", got, ptrSize)
@@ -237,14 +238,14 @@ func TestWindowsHostNameInfoLayout(t *testing.T) {
 		t.Errorf("offset of FileName = %d, want %d", got, want)
 	}
 
-	buf, size, err := newNameInfo(0x3, 0x1234, "ab")
+	buf, size, err := fd.NewNameInfo(0x3, 0x1234, "ab")
 	if err != nil {
-		t.Fatalf("newNameInfo() = %v", err)
+		t.Fatalf("NewNameInfo() = %v", err)
 	}
 	if size%8 != 0 || uintptr(size) < unsafe.Sizeof(header) || int(size) != len(buf)*8 {
-		t.Errorf("newNameInfo() size = %d for %d words, want a multiple of 8 not below %d", size, len(buf), unsafe.Sizeof(header))
+		t.Errorf("NewNameInfo() size = %d for %d words, want a multiple of 8 not below %d", size, len(buf), unsafe.Sizeof(header))
 	}
-	got := (*nameInfoHeader)(unsafe.Pointer(&buf[0]))
+	got := (*fd.NameInfoHeader)(unsafe.Pointer(&buf[0]))
 	if got.Flags != 0x3 || got.RootDirectory != 0x1234 || got.FileNameLength != 4 {
 		t.Errorf("header = %+v, want Flags=3 RootDirectory=0x1234 FileNameLength=4", *got)
 	}
@@ -255,14 +256,14 @@ func TestWindowsHostNameInfoLayout(t *testing.T) {
 	}
 
 	long := strings.Repeat("x", 300)
-	buf, size, err = newNameInfo(0, 1, long)
+	buf, size, err = fd.NewNameInfo(0, 1, long)
 	if err != nil {
-		t.Fatalf("newNameInfo(long) = %v", err)
+		t.Fatalf("NewNameInfo(long) = %v", err)
 	}
 	if want := (int(offset) + 600 + 7) / 8 * 8; int(size) != want {
-		t.Errorf("newNameInfo(long) size = %d, want %d", size, want)
+		t.Errorf("NewNameInfo(long) size = %d, want %d", size, want)
 	}
-	if got := (*nameInfoHeader)(unsafe.Pointer(&buf[0])); got.FileNameLength != 600 {
+	if got := (*fd.NameInfoHeader)(unsafe.Pointer(&buf[0])); got.FileNameLength != 600 {
 		t.Errorf("FileNameLength = %d, want 600", got.FileNameLength)
 	}
 }

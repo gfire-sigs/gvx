@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
 )
 
@@ -288,7 +289,7 @@ func (c *Context) onMemoryFault(v *vcpu, ex exitInfo, ac *arch.Context64) runRes
 	}
 	v.st.parked = false
 	log.Warningf("whpx: guest physical fault at gpa %#x, gva %#x, pc %#x", ex.gpa, ex.gva, ex.pc)
-	t := trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, hasAddr: true, addr: ex.gva}
+	t := trap{kind: trapSignal, signo: linux.SIGBUS, code: hvcommon.BusAdrErr, hasAddr: true, addr: ex.gva}
 	if !ex.gvaValid {
 		t.addr = 0
 	}

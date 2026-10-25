@@ -76,7 +76,7 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	defer ino.wmu.Unlock()
 	if punch {
 		// The host call must see the bytes that a mapping wrote.
-		if err := ino.data.flushRange(offset, end); err != nil {
+		if err := ino.data.FlushRange(offset, end); err != nil {
 			return translateHostError(err)
 		}
 	}
@@ -96,7 +96,7 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	ino.invalidateMeta()
 	switch {
 	case punch:
-		ino.data.punched(offset, length)
+		ino.data.Punched(offset, length)
 	case !keepSize:
 		if info, err := fd.h.fstat(d.fs.ws.host); err == nil {
 			ino.data.extended(info.size)
@@ -170,32 +170,14 @@ func zeroRange(f *os.File, off, n int64) error {
 	return nil
 }
 
-// punched zeroes the loaded chunks in [off, off+length) after a hole punch.
-// The host file holds zeros there, and so do the chunks now.
-func (c *fileData) punched(off, length uint64) {
-	if !c.active.Load() {
-		return
-	}
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	end := off + length
-	for idx, ch := range c.chunks {
-		base := idx << chunkShift
-		lo, hi := max(off, base), min(end, base+chunkSize)
-		if lo < hi {
-			clear(ch.Buf[lo-base : hi-base])
-		}
-	}
-}
-
 // extended raises the cached size after the host file grew. A loaded chunk
 // holds zeros beyond the old size, so no chunk changes.
 func (c *fileData) extended(size int64) {
-	if !c.active.Load() {
+	if !c.Active.Load() {
 		return
 	}
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
 	if size > c.size {
 		c.size = size
 	}

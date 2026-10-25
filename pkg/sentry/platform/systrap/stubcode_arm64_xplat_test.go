@@ -23,6 +23,7 @@ import (
 	"golang.org/x/arch/arm64/arm64asm"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 func TestA64EncodersDecodeAsIntended(t *testing.T) {
@@ -30,38 +31,38 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		word uint32
 		want string
 	}{
-		{a64TPIDR | 16, "MRS X16, S3_3_C13_C0_2"},
+		{arm64MRSTPIDR | 16, "MRS X16, S3_3_C13_C0_2"},
 		{a64MRSNZCV | 0, "MRS X0, S3_3_C4_C2_0"},
 		{a64MSRNZCV | 0, "MSR S3_3_C4_C2_0, X0"},
-		{a64ldrX(16, 16, 0x28), "LDR X16, [X16,#40]"},
-		{a64strX(17, 16, winOffTail), "STR X17, [X16,#48]"},
-		{a64ldrW(0, 19, winOffSentryWaiter), "LDR W0, [X19,#4]"},
-		{a64strW(0, 19, winOffStubWaiter), "STR W0, [X19,#8]"},
-		{a64strW(a64XZR, 19, winOffStubWaiter), "STR WZR, [X19,#8]"},
+		{hvcommon.LDRX(16, 16, 0x28), "LDR X16, [X16,#40]"},
+		{hvcommon.STRX(16, 17, winOffTail), "STR X17, [X16,#48]"},
+		{hvcommon.LDRW(19, 0, winOffSentryWaiter), "LDR W0, [X19,#4]"},
+		{hvcommon.STRW(19, 0, winOffStubWaiter), "STR W0, [X19,#8]"},
+		{hvcommon.STRW(19, a64XZR, winOffStubWaiter), "STR WZR, [X19,#8]"},
 		{a64ldarW(0, 19), "LDAR W0, [X19]"},
 		{a64stlrW(0, 19), "STLR W0, [X19]"},
-		{a64ldp(0, 1, a64SP, -512), "LDP X0, X1, [SP,#-512]"},
-		{a64stp(0, 1, 2, -512), "STP X0, X1, [X2,#-512]"},
-		{a64stpQ(0, 1, 16, winOffVec), "STP Q0, Q1, [X16,#512]"},
-		{a64ldpQ(30, 31, 16, winOffVec+16*30), "LDP Q30, Q31, [X16,#992]"},
-		{a64MRSFPSR | 0, "MRS X0, S3_3_C4_C4_1"},
-		{a64MRSFPCR | 0, "MRS X0, S3_3_C4_C4_0"},
-		{a64MSRFPSR | 0, "MSR S3_3_C4_C4_1, X0"},
-		{a64MSRFPCR | 0, "MSR S3_3_C4_C4_0, X0"},
-		{a64stp(14, 15, 16, winOffX+8*14), "STP X14, X15, [X16,#184]"},
-		{a64movReg(19, 16), "MOV X19, X16"},
+		{hvcommon.LDPX(a64SP, 0, 1, -512), "LDP X0, X1, [SP,#-512]"},
+		{hvcommon.STPX(2, 0, 1, -512), "STP X0, X1, [X2,#-512]"},
+		{hvcommon.STPQ(16, 0, 1, winOffVec), "STP Q0, Q1, [X16,#512]"},
+		{hvcommon.LDPQ(16, 30, 31, winOffVec+16*30), "LDP Q30, Q31, [X16,#992]"},
+		{hvcommon.MRS(0, hvcommon.SysRegFPSR), "MRS X0, S3_3_C4_C4_1"},
+		{hvcommon.MRS(0, hvcommon.SysRegFPCR), "MRS X0, S3_3_C4_C4_0"},
+		{hvcommon.MSR(hvcommon.SysRegFPSR, 0), "MSR S3_3_C4_C4_1, X0"},
+		{hvcommon.MSR(hvcommon.SysRegFPCR, 0), "MSR S3_3_C4_C4_0, X0"},
+		{hvcommon.STPX(16, 14, 15, winOffX+8*14), "STP X14, X15, [X16,#184]"},
+		{hvcommon.MOVReg(19, 16), "MOV X19, X16"},
 		{a64movFromSP(0), "MOV X0, SP"},
 		{a64movToSP(16), "MOV SP, X16"},
 		{a64addSPShifted(19, 2), "ADD SP, X19, #0x2, LSL #12"},
-		{a64movzX(1, 0), "MOV X1, #0x0"},
-		{a64movzW(20, 1024), "MOV W20, #0x400"},
+		{hvcommon.MOVZ(1, 0), "MOV X1, #0x0"},
+		{hvcommon.MOVZW(20, 1024), "MOV W20, #0x400"},
 		{a64cmpW(0, 2), "CMP W0, #0x2"},
 		{a64subsW1(20), "SUBS W20, W20, #0x1"},
-		{a64blr(9), "BLR X9"},
-		{a64br(17), "BR X17"},
+		{hvcommon.BLR(9), "BLR X9"},
+		{hvcommon.BR(17), "BR X17"},
 		{a64DMBISH, "DMB ISH"},
 		{a64YIELD, "YIELD "},
-		{a64BRK | brkFastExit<<5, "BRK #0x5c5"},
+		{hvcommon.BRK(brkFastExit), "BRK #0x5c5"},
 	} {
 		var b [4]byte
 		binary.LittleEndian.PutUint32(b[:], c.word)
@@ -90,7 +91,7 @@ func TestBuildSpillDecodesEveryWord(t *testing.T) {
 		}
 	}
 	w := binary.LittleEndian.Uint32(sc.code[sc.coldBrk:])
-	if w != a64BRK|brkFastExit<<5 {
+	if w != hvcommon.BRK(brkFastExit) {
 		t.Fatalf("word at the cold BRK offset is %#x", w)
 	}
 }

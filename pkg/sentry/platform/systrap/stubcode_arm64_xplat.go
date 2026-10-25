@@ -45,76 +45,27 @@ import (
 // TPIDR_EL0 across waits and stops (docs/systrap-windows.md, 3.4). The engine
 // proves the whole design at start with a short guest run.
 const (
-	a64TPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
 	a64MRSNZCV = 0xd53b4200 // mrs xN, nzcv.
 	a64MSRNZCV = 0xd51b4200 // msr nzcv, xN.
-	a64MRSFPSR = 0xd53b4420 // mrs xN, fpsr.
-	a64MRSFPCR = 0xd53b4400 // mrs xN, fpcr.
-	a64MSRFPSR = 0xd51b4420 // msr fpsr, xN.
-	a64MSRFPCR = 0xd51b4400 // msr fpcr, xN.
 	a64DMBISH  = 0xd5033bbf
 	a64YIELD   = 0xd503203f
-	a64BRK     = 0xd4200000
 
 	a64CondNE = 1
 	a64CondHS = 2
 	a64CondLO = 3
 	a64CondEQ = 0
-)
 
-// a64Reg numbers used by the routine.
-const (
 	a64SP  = 31
 	a64XZR = 31
 )
 
-// a64ldrX and the other encoders build one instruction word. Each takes the
-// operands in the order of the assembler text.
-func a64ldrX(rt, rn, off uint32) uint32 { return hvcommon.LDRX(int(rn), int(rt), int(off)) }
-func a64strX(rt, rn, off uint32) uint32 { return hvcommon.STRX(int(rn), int(rt), int(off)) }
-func a64ldrW(rt, rn, off uint32) uint32 { return hvcommon.LDRW(int(rn), int(rt), int(off)) }
-func a64strW(rt, rn, off uint32) uint32 { return hvcommon.STRW(int(rn), int(rt), int(off)) }
-func a64ldarW(rt, rn uint32) uint32     { return 0x88dffc00 | rn<<5 | rt }
-func a64stlrW(rt, rn uint32) uint32     { return 0x889ffc00 | rn<<5 | rt }
-
-// a64stpQ and a64ldpQ store and load two 128-bit vector registers. off is a
-// byte offset that is a multiple of 16 between -1024 and 1008.
-func a64stpQ(rt, rt2, rn uint32, off int32) uint32 {
-	return hvcommon.STPQ(int(rn), int(rt), int(rt2), int(off))
-}
-
-func a64ldpQ(rt, rt2, rn uint32, off int32) uint32 {
-	return hvcommon.LDPQ(int(rn), int(rt), int(rt2), int(off))
-}
-
-// a64ldp and a64stp use the signed offset form. off is a byte offset that is a
-// multiple of 8 between -512 and 504.
-func a64ldp(rt, rt2, rn uint32, off int32) uint32 {
-	return hvcommon.LDPX(int(rn), int(rt), int(rt2), int(off))
-}
-
-func a64stp(rt, rt2, rn uint32, off int32) uint32 {
-	return hvcommon.STPX(int(rn), int(rt), int(rt2), int(off))
-}
-
-func a64movReg(rd, rm uint32) uint32 { return hvcommon.MOVReg(int(rd), int(rm)) }
-
-// a64movFromSP is `mov xd, sp`, and a64movToSP is `mov sp, xn`.
-func a64movFromSP(rd uint32) uint32 { return 0x91000000 | a64SP<<5 | rd }
-func a64movToSP(rn uint32) uint32   { return 0x91000000 | rn<<5 | a64SP }
-
-// a64addSPShifted is `add sp, xn, #imm, lsl #12`.
+func a64ldarW(rt, rn uint32) uint32         { return 0x88dffc00 | rn<<5 | rt }
+func a64stlrW(rt, rn uint32) uint32         { return 0x889ffc00 | rn<<5 | rt }
+func a64movFromSP(rd uint32) uint32         { return 0x91000000 | a64SP<<5 | rd }
+func a64movToSP(rn uint32) uint32           { return 0x91000000 | rn<<5 | a64SP }
 func a64addSPShifted(rn, imm uint32) uint32 { return 0x91400000 | imm<<10 | rn<<5 | a64SP }
-
-func a64movzX(rd, imm uint32) uint32 { return hvcommon.MOVZ(int(rd), uint16(imm)) }
-func a64movzW(rd, imm uint32) uint32 { return hvcommon.MOVZW(int(rd), uint16(imm)) }
-
-// a64cmpW is `cmp wn, #imm`, and a64subsW1 is `subs wd, wd, #1`.
-func a64cmpW(rn, imm uint32) uint32 { return 0x7100001f | imm<<10 | rn<<5 }
-func a64subsW1(rd uint32) uint32    { return 0x71000400 | rd<<5 | rd }
-
-func a64blr(rn uint32) uint32 { return hvcommon.BLR(int(rn)) }
-func a64br(rn uint32) uint32  { return hvcommon.BR(int(rn)) }
+func a64cmpW(rn, imm uint32) uint32         { return 0x7100001f | imm<<10 | rn<<5 }
+func a64subsW1(rd uint32) uint32            { return 0x71000400 | rd<<5 | rd }
 
 // a64Asm collects words and resolves branches to labels.
 type a64Asm struct {
@@ -188,31 +139,31 @@ const brkFastExit = 0x5c5
 
 // saveVector returns the instructions that store V0 to V31, FPSR, and FPCR in
 // the sysmsg that base names. They use x0 as scratch, which the caller saved.
-func saveVector(base uint32) []uint32 {
+func saveVector(base int) []uint32 {
 	var w []uint32
-	for i := uint32(0); i < 32; i += 2 {
-		w = append(w, a64stpQ(i, i+1, base, int32(winOffVec+16*i)))
+	for i := 0; i < 32; i += 2 {
+		w = append(w, hvcommon.STPQ(base, i, i+1, winOffVec+16*i))
 	}
 	return append(w,
-		a64MRSFPSR|0,
-		a64strX(0, base, winOffFpsr),
-		a64MRSFPCR|0,
-		a64strX(0, base, winOffFpcr),
+		hvcommon.MRS(0, hvcommon.SysRegFPSR),
+		hvcommon.STRX(base, 0, winOffFpsr),
+		hvcommon.MRS(0, hvcommon.SysRegFPCR),
+		hvcommon.STRX(base, 0, winOffFpcr),
 	)
 }
 
 // restoreVector returns the instructions that load V0 to V31, FPSR, and FPCR
 // from the sysmsg that base names. They use x0 as scratch.
-func restoreVector(base uint32) []uint32 {
+func restoreVector(base int) []uint32 {
 	var w []uint32
-	for i := uint32(0); i < 32; i += 2 {
-		w = append(w, a64ldpQ(i, i+1, base, int32(winOffVec+16*i)))
+	for i := 0; i < 32; i += 2 {
+		w = append(w, hvcommon.LDPQ(base, i, i+1, winOffVec+16*i))
 	}
 	return append(w,
-		a64ldrX(0, base, winOffFpsr),
-		a64MSRFPSR|0,
-		a64ldrX(0, base, winOffFpcr),
-		a64MSRFPCR|0,
+		hvcommon.LDRX(base, 0, winOffFpsr),
+		hvcommon.MSR(hvcommon.SysRegFPSR, 0),
+		hvcommon.LDRX(base, 0, winOffFpcr),
+		hvcommon.MSR(hvcommon.SysRegFPCR, 0),
 	)
 }
 
@@ -225,44 +176,44 @@ func buildSpill() (winSpillCode, error) {
 		tmp  = 9
 	)
 	// The real TPIDR_EL0 of the thread holds the address of its sysmsg.
-	a.emit(a64TPIDR | 16)
+	a.emit(arm64MRSTPIDR | 16)
 	// Save x0 to x15, then the guest x16 and x17 from the sysmsg scratch words.
-	for i := uint32(0); i < 16; i += 2 {
-		a.emit(a64stp(i, i+1, 16, int32(winOffX+8*i)))
+	for i := 0; i < 16; i += 2 {
+		a.emit(hvcommon.STPX(16, i, i+1, winOffX+8*i))
 	}
 	a.emit(
-		a64ldp(0, 1, 16, int32(winOffScratch)),
-		a64stp(0, 1, 16, int32(winOffX+8*16)),
+		hvcommon.LDPX(16, 0, 1, winOffScratch),
+		hvcommon.STPX(16, 0, 1, winOffX+8*16),
 	)
-	for i := uint32(18); i < 30; i += 2 {
-		a.emit(a64stp(i, i+1, 16, int32(winOffX+8*i)))
+	for i := 18; i < 30; i += 2 {
+		a.emit(hvcommon.STPX(16, i, i+1, winOffX+8*i))
 	}
 	a.emit(saveVector(16)...)
 	a.emit(
-		a64strX(30, 16, winOffX+8*30),
+		hvcommon.STRX(16, 30, winOffX+8*30),
 		a64movFromSP(0),
-		a64strX(0, 16, winOffSP),
+		hvcommon.STRX(16, 0, winOffSP),
 		a64MRSNZCV|0,
-		a64strX(0, 16, winOffNZCV),
-		a64strX(17, 16, winOffTail),
+		hvcommon.STRX(16, 0, winOffNZCV),
+		hvcommon.STRX(16, 17, winOffTail),
 		// Switch to the stack of the stub and keep the base in x19.
-		a64movReg(base, 16),
+		hvcommon.MOVReg(base, 16),
 		a64addSPShifted(base, winThreadMapSize>>12),
 		// Publish Trapped, then wake a sleeping Sentry.
-		a64movzW(0, uint32(winStateTrapped)),
+		hvcommon.MOVZW(0, uint16(winStateTrapped)),
 		a64stlrW(0, base),
 		a64DMBISH,
-		a64ldrW(0, base, winOffSentryWaiter),
+		hvcommon.LDRW(base, 0, winOffSentryWaiter),
 	)
 	a.cbzW(0, "spin")
 	a.emit(
-		a64ldrX(0, base, winOffGuestEvent),
-		a64movzX(1, 0),
-		a64ldrX(tmp, base, winOffNtSetEvent),
-		a64blr(tmp),
+		hvcommon.LDRX(base, 0, winOffGuestEvent),
+		hvcommon.MOVZ(1, 0),
+		hvcommon.LDRX(base, tmp, winOffNtSetEvent),
+		hvcommon.BLR(tmp),
 	)
 	a.label("spin")
-	a.emit(a64movzW(cnt, winSpinStub))
+	a.emit(hvcommon.MOVZW(cnt, winSpinStub))
 	a.label("poll")
 	a.emit(
 		a64ldarW(0, base),
@@ -277,61 +228,58 @@ func buildSpill() (winSpillCode, error) {
 	// Sleep until the Sentry sets HostEvent.
 	a.label("sleep")
 	a.emit(
-		a64movzW(0, 1),
-		a64strW(0, base, winOffStubWaiter),
+		hvcommon.MOVZW(0, 1),
+		hvcommon.STRW(base, 0, winOffStubWaiter),
 		a64DMBISH,
 		a64ldarW(0, base),
 		a64cmpW(0, uint32(winStateRunHot)),
 	)
 	a.bCond(a64CondHS, "runclear")
 	a.emit(
-		a64ldrX(0, base, winOffHostEvent),
-		a64movzW(1, 0),
-		a64movzX(2, 0),
-		a64ldrX(tmp, base, winOffNtWait),
-		a64blr(tmp),
+		hvcommon.LDRX(base, 0, winOffHostEvent),
+		hvcommon.MOVZW(1, 0),
+		hvcommon.MOVZ(2, 0),
+		hvcommon.LDRX(base, tmp, winOffNtWait),
+		hvcommon.BLR(tmp),
 		a64ldarW(0, base),
 		a64cmpW(0, uint32(winStateRunHot)),
 	)
 	a.bCond(a64CondLO, "sleep")
 	a.label("runclear")
-	a.emit(a64strW(a64XZR, base, winOffStubWaiter))
+	a.emit(hvcommon.STRW(base, a64XZR, winOffStubWaiter))
 	a.label("run")
 	a.emit(a64cmpW(0, uint32(winStateRunCold)))
 	a.bCond(a64CondEQ, "cold")
 
-	// Hot resume. The scratch words of the sysmsg receive the guest x16 and
-	// x17 again, and X18 receives the guest x18, because a system call can
-	// change those words. The slot tail loads them back.
+	// Hot resume.
 	a.emit(
-		a64ldp(0, 1, base, int32(winOffX+8*16)),
-		a64stp(0, 1, base, int32(winOffScratch)),
-		a64ldrX(0, base, winOffX+8*18),
-		a64strX(0, base, winOffX18),
+		hvcommon.LDPX(base, 0, 1, winOffX+8*16),
+		hvcommon.STPX(base, 0, 1, winOffScratch),
+		hvcommon.LDRX(base, 0, winOffX+8*18),
+		hvcommon.STRX(base, 0, winOffX18),
 	)
 	a.emit(restoreCommon(base)...)
 	a.emit(
-		a64ldrX(17, base, winOffTail),
-		a64ldrX(16, base, winOffSP),
+		hvcommon.LDRX(base, 17, winOffTail),
+		hvcommon.LDRX(base, 16, winOffSP),
 		a64movToSP(16),
-		a64ldp(0, 1, base, winOffX),
-		a64ldrX(base, base, winOffX+8*base),
-		a64br(17),
+		hvcommon.LDPX(base, 0, 1, winOffX),
+		hvcommon.LDRX(base, base, winOffX+8*base),
+		hvcommon.BR(17),
 	)
 
-	// Cold resume. Every register comes from the sysmsg, including x16 and
-	// x17, and the BRK reports the stop to the Sentry.
+	// Cold resume.
 	a.label("cold")
 	a.emit(restoreCommon(base)...)
 	a.emit(
-		a64ldp(16, 17, base, int32(winOffX+8*16)),
-		a64ldrX(0, base, winOffSP),
+		hvcommon.LDPX(base, 16, 17, winOffX+8*16),
+		hvcommon.LDRX(base, 0, winOffSP),
 		a64movToSP(0),
-		a64ldp(0, 1, base, winOffX),
-		a64ldrX(base, base, winOffX+8*base),
+		hvcommon.LDPX(base, 0, 1, winOffX),
+		hvcommon.LDRX(base, base, winOffX+8*base),
 	)
 	coldBrk := len(a.words) * 4
-	a.emit(a64BRK | brkFastExit<<5)
+	a.emit(hvcommon.BRK(brkFastExit))
 	code, err := a.finish()
 	if err != nil {
 		return winSpillCode{}, err
@@ -340,70 +288,48 @@ func buildSpill() (winSpillCode, error) {
 }
 
 // restoreCommon loads the vector state, the flags, and the registers that both
-// resumes load the same way: x2 to x15, x18, x20 to x29, and x30. It runs
-// before the registers that differ. It uses x0 as scratch.
-func restoreCommon(base uint32) []uint32 {
+// resumes load the same way: x2 to x15, x18, x20 to x29, and x30.
+func restoreCommon(base int) []uint32 {
 	w := restoreVector(base)
 	w = append(w,
-		a64ldrX(0, base, winOffNZCV),
+		hvcommon.LDRX(base, 0, winOffNZCV),
 		a64MSRNZCV|0,
 	)
-	for i := uint32(2); i < 16; i += 2 {
-		w = append(w, a64ldp(i, i+1, base, int32(winOffX+8*i)))
+	for i := 2; i < 16; i += 2 {
+		w = append(w, hvcommon.LDPX(base, i, i+1, winOffX+8*i))
 	}
-	w = append(w, a64ldrX(18, base, winOffX+8*18))
-	for i := uint32(20); i < 30; i += 2 {
-		w = append(w, a64ldp(i, i+1, base, int32(winOffX+8*i)))
+	w = append(w, hvcommon.LDRX(base, 18, winOffX+8*18))
+	for i := 20; i < 30; i += 2 {
+		w = append(w, hvcommon.LDPX(base, i, i+1, winOffX+8*i))
 	}
-	w = append(w, a64ldrX(30, base, winOffX+8*30))
+	w = append(w, hvcommon.LDRX(base, 30, winOffX+8*30))
 	return w
 }
 
-// encodeWinSlot encodes the trap slot for a patched `svc #0` at site. The slot
-// saves x16 and x17 in the scratch words of the thread's winSysmsg through x18,
-// restores x18 from the X18 word of the winSysmsg, and returns to the
-// instruction after the site.
+// encodeWinSlot encodes the trap slot for a patched `svc #0` at site.
 func encodeWinSlot(buf []byte, slotVA, site, spill uint64) error {
-	if len(buf) < winSlotSize {
-		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
+	save := []uint32{
+		arm64MRSTPIDR | 18,
+		hvcommon.STPX(18, 16, 17, winOffScratch),
+		hvcommon.LDRX(18, 18, winOffX18),
 	}
-	back, err := encodeBranch(slotVA+winSlotTailOffset+12, winSiteReturn(site))
-	if err != nil {
-		return err
+	restore := []uint32{
+		arm64MRSTPIDR | 18,
+		hvcommon.LDPX(18, 16, 17, winOffScratch),
+		hvcommon.LDRX(18, 18, winOffX18),
 	}
-	words := [...]uint32{
-		a64TPIDR | 18,
-		a64stp(16, 17, 18, int32(winOffScratch)),
-		a64ldrX(18, 18, winOffX18),
-		arm64ADRx17 | uint32((winSlotTailOffset-12)>>2)<<5,   // adr x17, tail: byte offset 24.
-		arm64LDRLitx16 | uint32((winSlotLitOffset-16)>>2)<<5, // ldr x16, [pc, +24].
-		a64br(16),
-		a64TPIDR | 18,
-		a64ldp(16, 17, 18, int32(winOffScratch)),
-		a64ldrX(18, 18, winOffX18),
-		back,
-	}
-	for i, w := range words {
-		binary.LittleEndian.PutUint32(buf[i*4:], w)
-	}
-	binary.LittleEndian.PutUint64(buf[winSlotLitOffset:], spill)
-	return nil
+	return encodeTrapSysmsgSlot(buf, slotVA, winSiteReturn(site), spill, save, restore)
 }
 
 // winTLSSlotSize is the size of the slot that replaces `mrs xN, tpidr_el0`.
 const winTLSSlotSize = loadSlotSize
 
 // encodeWinTLSSlot writes the slot that replaces `mrs xN, tpidr_el0` at site.
-// The real TPIDR_EL0 holds the address of the sysmsg, so the slot reads that
-// address into xN, loads the TLS word of the guest through it, and returns to
-// the instruction after the site. It changes no other register and no flag.
 func encodeWinTLSSlot(buf []byte, slotVA, site uint64, reg uint8) error {
-	return encodeLoadSysmsgSlot(buf, slotVA, winSiteReturn(site), reg, a64TPIDR, false, winOffTLS)
+	return encodeLoadSysmsgSlot(buf, slotVA, winSiteReturn(site), reg, arm64MRSTPIDR, false, winOffTLS)
 }
 
-// encodeWinX18SetSlot writes the slot that replaces `mov x18, xN` at site. The
-// slot stores xN into the X18 word of the thread's winSysmsg, copies xN into
-// hardware x18, and returns to the instruction after the site.
+// encodeWinX18SetSlot writes the slot that replaces `mov x18, xN` at site.
 func encodeWinX18SetSlot(buf []byte, slotVA, site uint64, reg uint8) error {
 	if len(buf) < winTLSSlotSize {
 		return fmt.Errorf("X18 slot buffer has %d bytes", len(buf))
@@ -415,10 +341,10 @@ func encodeWinX18SetSlot(buf []byte, slotVA, site uint64, reg uint8) error {
 	if err != nil {
 		return err
 	}
-	r := uint32(reg)
-	binary.LittleEndian.PutUint32(buf[0:], a64TPIDR|18)
-	binary.LittleEndian.PutUint32(buf[4:], a64strX(r, 18, winOffX18))
-	binary.LittleEndian.PutUint32(buf[8:], a64movReg(18, r))
+	r := int(reg)
+	binary.LittleEndian.PutUint32(buf[0:], arm64MRSTPIDR|18)
+	binary.LittleEndian.PutUint32(buf[4:], hvcommon.STRX(18, r, winOffX18))
+	binary.LittleEndian.PutUint32(buf[8:], hvcommon.MOVReg(18, r))
 	binary.LittleEndian.PutUint32(buf[12:], back)
 	return nil
 }
@@ -427,9 +353,9 @@ func encodeWinX18SetSlot(buf []byte, slotVA, site uint64, reg uint8) error {
 // number 5, then one with number 6.
 func probeProgram(calls int) []byte {
 	words := []uint32{
-		a64movzX(1, uint32(calls)), a64movzX(8, 5),
+		hvcommon.MOVZ(1, uint16(calls)), hvcommon.MOVZ(8, 5),
 		arm64SVC0, 0xf1000400 | 1<<5 | 1, 0x54ffffc1, // svc; subs x1, x1, #1; b.ne -8
-		a64movzX(8, 6), arm64SVC0,
+		hvcommon.MOVZ(8, 6), arm64SVC0,
 	}
 	code := make([]byte, 4*len(words))
 	for i, w := range words {

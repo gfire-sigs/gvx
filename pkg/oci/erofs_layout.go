@@ -29,29 +29,7 @@ import (
 	"z.gfire.dev/gvx/pkg/erofs"
 )
 
-// On-disk constants of the EROFS format that the compiler emits.
 const (
-	erofsInodeLayoutExtended = erofs.InodeLayoutExtended
-
-	erofsDataLayoutFlatPlain  = erofs.InodeDataLayoutFlatPlain
-	erofsDataLayoutFlatInline = erofs.InodeDataLayoutFlatInline
-	erofsDataLayoutChunkBased = erofs.InodeDataLayoutChunkBased
-
-	// erofsFeatureIncompatChunkedFile is required by chunk-based inodes.
-	erofsFeatureIncompatChunkedFile = erofs.FeatureIncompatChunkedFile
-
-	erofsXattrIbodyHeaderSize = erofs.XattrIbodyHeaderSize
-	erofsXattrEntryHeaderSize = erofs.XattrEntryHeaderSize
-	erofsXattrAlign           = erofs.XattrAlign
-
-	erofsXattrIndexUser            = erofs.XattrIndexUser
-	erofsXattrIndexPosixACLAccess  = erofs.XattrIndexPosixACLAccess
-	erofsXattrIndexPosixACLDefault = erofs.XattrIndexPosixACLDefault
-	erofsXattrIndexTrusted         = erofs.XattrIndexTrusted
-	erofsXattrIndexSecurity        = erofs.XattrIndexSecurity
-
-	erofsNullAddr = erofs.NullAddr
-	erofsMaxName  = erofs.MaxNameLen
 	// maxSymlinkTarget is PATH_MAX. Longer targets are invalid on Linux.
 	maxSymlinkTarget = 4096
 	erofsInodeAlign  = 1 << EROFSInodeSlotBits
@@ -78,10 +56,10 @@ func encodeXattrIbody(xs []xattrKV) ([]byte, error) {
 	copy(sorted, xs)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].name < sorted[j].name })
 
-	out := make([]byte, erofsXattrIbodyHeaderSize)
+	out := make([]byte, erofs.XattrIbodyHeaderSize)
 	for _, x := range sorted {
 		index, suffix := splitXattrName(x.name)
-		if len(suffix) > erofsMaxName {
+		if len(suffix) > erofs.MaxNameLen {
 			return nil, fmt.Errorf("oci: xattr name %q is too long", x.name)
 		}
 		if len(x.value) > math.MaxUint16 {
@@ -92,7 +70,7 @@ func encodeXattrIbody(xs []xattrKV) ([]byte, error) {
 		binary.LittleEndian.PutUint16(out[start+2:], uint16(len(x.value)))
 		out = append(out, suffix...)
 		out = append(out, x.value...)
-		for len(out)%erofsXattrAlign != 0 {
+		for len(out)%erofs.XattrAlign != 0 {
 			out = append(out, 0)
 		}
 	}
@@ -105,15 +83,15 @@ func encodeXattrIbody(xs []xattrKV) ([]byte, error) {
 func splitXattrName(name string) (index uint8, suffix string) {
 	switch {
 	case name == linux.XATTR_NAME_POSIX_ACL_ACCESS:
-		return erofsXattrIndexPosixACLAccess, ""
+		return erofs.XattrIndexPosixACLAccess, ""
 	case name == linux.XATTR_NAME_POSIX_ACL_DEFAULT:
-		return erofsXattrIndexPosixACLDefault, ""
+		return erofs.XattrIndexPosixACLDefault, ""
 	case strings.HasPrefix(name, linux.XATTR_USER_PREFIX):
-		return erofsXattrIndexUser, name[len(linux.XATTR_USER_PREFIX):]
+		return erofs.XattrIndexUser, name[len(linux.XATTR_USER_PREFIX):]
 	case strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX):
-		return erofsXattrIndexTrusted, name[len(linux.XATTR_TRUSTED_PREFIX):]
+		return erofs.XattrIndexTrusted, name[len(linux.XATTR_TRUSTED_PREFIX):]
 	case strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX):
-		return erofsXattrIndexSecurity, name[len(linux.XATTR_SECURITY_PREFIX):]
+		return erofs.XattrIndexSecurity, name[len(linux.XATTR_SECURITY_PREFIX):]
 	default:
 		return 0, name
 	}
@@ -155,7 +133,7 @@ func planDirBlocks(names []string, bs int) (starts []int, lastUsed int, err erro
 		count, namesLen := 0, 0
 		for i+count < len(names) {
 			l := len(names[i+count])
-			if l == 0 || l > erofsMaxName {
+			if l == 0 || l > erofs.MaxNameLen {
 				return nil, 0, fmt.Errorf("oci: invalid directory entry name length %d", l)
 			}
 			if (count+1)*EROFSDirentSize+namesLen+l > bs {
@@ -301,21 +279,21 @@ func buildLayout(root *fsNode, dataEnd uint32, bs int) (*imageLayout, error) {
 			}
 			nb := uint32(len(ln.starts))
 			if ln.last < bs && base+ln.last <= bs {
-				ln.dataLayout = erofsDataLayoutFlatInline
+				ln.dataLayout = erofs.InodeDataLayoutFlatInline
 				ln.lateCount = nb - 1
 			} else {
-				ln.dataLayout = erofsDataLayoutFlatPlain
+				ln.dataLayout = erofs.InodeDataLayoutFlatPlain
 				ln.lateCount = nb
 			}
 			ln.lateStart = late
 			late += ln.lateCount
 		case n.isSymlink():
-			ln.dataLayout = erofsDataLayoutFlatPlain
+			ln.dataLayout = erofs.InodeDataLayoutFlatPlain
 			if len(n.target) == 0 || len(n.target) >= maxSymlinkTarget {
 				return nil, fmt.Errorf("oci: symlink target of %d bytes is invalid", len(n.target))
 			}
 			if base+len(n.target) <= bs {
-				ln.dataLayout = erofsDataLayoutFlatInline
+				ln.dataLayout = erofs.InodeDataLayoutFlatInline
 				ln.inline = []byte(n.target)
 			} else {
 				ln.lateStart = late
@@ -325,18 +303,18 @@ func buildLayout(root *fsNode, dataEnd uint32, bs int) (*imageLayout, error) {
 		case n.isRegular():
 			switch {
 			case n.chunked:
-				ln.dataLayout = erofsDataLayoutChunkBased
+				ln.dataLayout = erofs.InodeDataLayoutChunkBased
 				ln.chunkMap = int((n.size + blk - 1) / blk)
 				l.chunked = true
 			default:
-				ln.dataLayout = erofsDataLayoutFlatPlain
+				ln.dataLayout = erofs.InodeDataLayoutFlatPlain
 			}
 		default:
-			ln.dataLayout = erofsDataLayoutFlatPlain
+			ln.dataLayout = erofs.InodeDataLayoutFlatPlain
 		}
 
 		inlineLen := len(ln.inline)
-		if n.isDir() && ln.dataLayout == erofsDataLayoutFlatInline {
+		if n.isDir() && ln.dataLayout == erofs.InodeDataLayoutFlatInline {
 			inlineLen = ln.last
 		}
 		total := uint64(base + inlineLen + 4*ln.chunkMap)
@@ -354,7 +332,7 @@ func buildLayout(root *fsNode, dataEnd uint32, bs int) (*imageLayout, error) {
 	l.metaBlk = l.lateBase + late
 	metaBlocks := (meta + blk - 1) / blk
 	end := uint64(l.metaBlk) + metaBlocks
-	if end >= erofsNullAddr {
+	if end >= erofs.NullAddr {
 		return nil, errors.New("oci: image exceeds the EROFS block address space")
 	}
 	l.total = uint32(end)
@@ -418,7 +396,7 @@ func writeImage(dst io.WriterAt, root *fsNode, l *imageLayout) error {
 		pos += uint64(EROFSInodeExtendedSize + len(ln.ibody))
 
 		switch {
-		case ln.n.isDir() && ln.dataLayout == erofsDataLayoutFlatInline:
+		case ln.n.isDir() && ln.dataLayout == erofs.InodeDataLayoutFlatInline:
 			blk := make([]byte, l.bs)
 			fillDirBlock(blk, ln, len(ln.starts)-1, nid)
 			if _, err := mw.Write(blk[:ln.last]); err != nil {
@@ -434,8 +412,8 @@ func writeImage(dst io.WriterAt, root *fsNode, l *imageLayout) error {
 			var entry [4]byte
 			for _, r := range ln.n.runs {
 				for k := uint32(0); k < r.n; k++ {
-					addr := uint32(erofsNullAddr)
-					if r.start != erofsNullAddr {
+					addr := uint32(erofs.NullAddr)
+					if r.start != erofs.NullAddr {
 						addr = r.start + k
 					}
 					binary.LittleEndian.PutUint32(entry[:], addr)
@@ -491,7 +469,7 @@ func fillDirBlock(dst []byte, ln *layoutNode, b int, nid func(*fsNode) uint64) {
 func encodeInode(dst []byte, ln *layoutNode, l *imageLayout) {
 	n := ln.n
 	clear(dst)
-	binary.LittleEndian.PutUint16(dst[0:2], uint16(ln.dataLayout)<<1|erofsInodeLayoutExtended)
+	binary.LittleEndian.PutUint16(dst[0:2], uint16(ln.dataLayout)<<1|erofs.InodeLayoutExtended)
 	binary.LittleEndian.PutUint16(dst[2:4], xattrIcount(ln.ibody))
 	binary.LittleEndian.PutUint16(dst[4:6], n.mode)
 
@@ -511,7 +489,7 @@ func encodeInode(dst []byte, ln *layoutNode, l *imageLayout) {
 	case n.isRegular():
 		size = n.size
 		switch ln.dataLayout {
-		case erofsDataLayoutChunkBased:
+		case erofs.InodeDataLayoutChunkBased:
 			// The low 16 bits hold the chunk format. Zero selects 4-byte
 			// block map entries with chunks of one block.
 			raw = 0
@@ -543,6 +521,6 @@ func writeSuperBlock(dst []byte, rootNid uint64, inodes uint64, blocks uint32, m
 	binary.LittleEndian.PutUint32(dst[40:44], metaBlockAddr)
 	copy(dst[64:80], "gvx-erofs")
 	if chunked {
-		binary.LittleEndian.PutUint32(dst[80:84], erofsFeatureIncompatChunkedFile)
+		binary.LittleEndian.PutUint32(dst[80:84], erofs.FeatureIncompatChunkedFile)
 	}
 }

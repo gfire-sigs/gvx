@@ -17,8 +17,10 @@
 package chunkcache
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -368,4 +370,319 @@ func OpenSpecial(ctx context.Context, rp *vfs.ResolvingPath, d *vfs.Dentry, opts
 	default:
 		return nil, linuxerr.ENXIO
 	}
+}
+
+// CacheBackend provides the filesystem-specific callbacks for a mapped-page cache.
+type CacheBackend interface {
+	ChunkMemory() ChunkMemory
+	FileSizeLocked() uint64
+	CanTranslateLocked(write bool) error
+	PrepareAddMappingLocked() error
+	ReadChunkAtLocked(dst []byte, off int64) error
+	FlushLocked(start, end uint64) error
+	DropBackendLocked()
+	TranslateError(err error) error
+}
+
+// Cache holds the mapped-page chunks and mapping state of a regular file.
+type Cache struct {
+	backend CacheBackend
+
+	Active atomic.Bool
+
+	// MapsMu protects Mappings. Lock order: MapsMu, then DataMu.
+	MapsMu   sync.Mutex
+	Mappings memmap.MappingSet
+
+	// DataMu protects the fields below.
+	DataMu       sync.Mutex
+	Chunks       map[uint64]*Chunk
+	WritableMaps int
+	WBErr        error
+
+	mf dataMemmapFile
+}
+
+// Init binds the cache to b.
+func (c *Cache) Init(b CacheBackend) {
+	c.backend = b
+	c.mf.cache = c
+}
+
+// DropLocked frees every chunk and releases backend state.
+func (c *Cache) DropLocked() {
+	for _, ch := range c.Chunks {
+		ch.Release()
+	}
+	c.Chunks = nil
+	c.Active.Store(false)
+	c.backend.DropBackendLocked()
+}
+
+// TakeWritebackErr returns and clears any deferred write-back failure.
+func (c *Cache) TakeWritebackErr() error {
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	err := c.WBErr
+	c.WBErr = nil
+	return err
+}
+
+// NoteWritebackErr records a write-back failure for the next fsync or close.
+func (c *Cache) NoteWritebackErr(err error) {
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	c.WBErr = errors.Join(c.WBErr, err)
+}
+
+// SyncData writes back every dirty chunk and returns any deferred write-back error.
+func (c *Cache) SyncData() error {
+	if !c.Active.Load() {
+		return c.TakeWritebackErr()
+	}
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	err := errors.Join(c.WBErr, c.backend.FlushLocked(0, math.MaxUint64))
+	c.WBErr = nil
+	return err
+}
+
+// FlushRange writes back dirty chunks that overlap [start, end).
+func (c *Cache) FlushRange(start, end uint64) error {
+	if !c.Active.Load() {
+		return nil
+	}
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	return c.backend.FlushLocked(start, end)
+}
+
+// CopyThroughLocked copies p at off into any cached chunks that already exist.
+func (c *Cache) CopyThroughLocked(off int64, p []byte) {
+	for len(p) > 0 {
+		idx := uint64(off) >> ChunkShift
+		within := int(uint64(off) & (ChunkSize - 1))
+		n := min(len(p), ChunkSize-within)
+		if ch, ok := c.Chunks[idx]; ok {
+			copy(ch.Buf[within:within+n], p[:n])
+		}
+		off += int64(n)
+		p = p[n:]
+	}
+}
+
+// ZeroLocked clears the cached bytes in [start, end).
+func (c *Cache) ZeroLocked(start, end uint64) {
+	if end <= start {
+		return
+	}
+	for idx := start >> ChunkShift; idx <= (end-1)>>ChunkShift; idx++ {
+		ch, ok := c.Chunks[idx]
+		if !ok {
+			continue
+		}
+		base := idx << ChunkShift
+		lo := max(start, base) - base
+		hi := min(end, base+ChunkSize) - base
+		clear(ch.Buf[lo:hi])
+	}
+}
+
+// Punched clears the cached bytes of a range that fallocate turned into a hole.
+func (c *Cache) Punched(off, length uint64) {
+	if !c.Active.Load() {
+		return
+	}
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	c.ZeroLocked(off, off+length)
+}
+
+// ShrinkLocked removes chunks at or beyond size and clears any tail bytes.
+func (c *Cache) ShrinkLocked(size uint64) []*Chunk {
+	var dropped []*Chunk
+	for idx, ch := range c.Chunks {
+		base := idx << ChunkShift
+		switch {
+		case base >= size:
+			dropped = append(dropped, ch)
+			delete(c.Chunks, idx)
+		case base+ChunkSize > size:
+			clear(ch.Buf[size-base:])
+		}
+	}
+	return dropped
+}
+
+// InvalidateShrink invalidates mappings beyond size and releases dropped chunks.
+func (c *Cache) InvalidateShrink(size uint64, dropped []*Chunk) {
+	pgend, _ := hostarch.PageRoundUp(size)
+	c.Mappings.Invalidate(memmap.MappableRange{Start: pgend, End: math.MaxUint64}, memmap.InvalidateOpts{})
+	for _, ch := range dropped {
+		ch.Release()
+	}
+}
+
+// ChunkLocked returns the chunk at idx, loading it from the backend when absent.
+func (c *Cache) ChunkLocked(idx uint64) (*Chunk, error) {
+	if ch, ok := c.Chunks[idx]; ok {
+		return ch, nil
+	}
+	if err := c.backend.CanTranslateLocked(false); err != nil {
+		return nil, err
+	}
+	ch, err := NewChunk(c.backend.ChunkMemory())
+	if err != nil {
+		return nil, err
+	}
+	if err := c.backend.ReadChunkAtLocked(ch.Buf, int64(idx<<ChunkShift)); err != nil && !errors.Is(err, io.EOF) {
+		ch.Release()
+		return nil, err
+	}
+	c.Chunks[idx] = ch
+	return ch, nil
+}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+func (c *Cache) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	if err := c.backend.PrepareAddMappingLocked(); err != nil {
+		return c.backend.TranslateError(err)
+	}
+	c.Mappings.AddMapping(ms, ar, offset, writable)
+	if writable {
+		c.WritableMaps++
+	}
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (c *Cache) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
+	c.Mappings.RemoveMapping(ms, ar, offset, writable)
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	if writable && c.WritableMaps > 0 {
+		c.WritableMaps--
+	}
+	if err := c.backend.FlushLocked(0, math.MaxUint64); err != nil {
+		c.WBErr = errors.Join(c.WBErr, err)
+	}
+	if c.Mappings.IsEmpty() {
+		c.DropLocked()
+	}
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (c *Cache) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return c.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+func (c *Cache) InvalidateUnsavable(ctx context.Context) error {
+	return c.backend.TranslateError(c.SyncData())
+}
+
+// MarkDirtyLocked flags the chunks that overlap [start, end) as dirty.
+func (c *Cache) MarkDirtyLocked(start, end uint64) {
+	for idx := start >> ChunkShift; idx <= (end-1)>>ChunkShift; idx++ {
+		if ch, ok := c.Chunks[idx]; ok {
+			ch.Dirty = true
+		}
+	}
+}
+
+// Translate implements memmap.Mappable.Translate.
+func (c *Cache) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	if err := c.backend.CanTranslateLocked(at.Write); err != nil {
+		return nil, &memmap.BusError{Err: err}
+	}
+	pgend, _ := hostarch.PageRoundUp(c.backend.FileSizeLocked())
+	var beyondEOF bool
+	if required.End > pgend {
+		if required.Start >= pgend {
+			return nil, &memmap.BusError{Err: io.EOF}
+		}
+		beyondEOF = true
+		required.End = pgend
+	}
+	if optional.End > pgend {
+		optional.End = pgend
+	}
+	mr := MaxFillRange(required, optional)
+	for idx := mr.Start >> ChunkShift; idx <= (mr.End-1)>>ChunkShift; idx++ {
+		if _, err := c.ChunkLocked(idx); err != nil {
+			if idx<<ChunkShift < required.End {
+				return nil, &memmap.BusError{Err: c.backend.TranslateError(err)}
+			}
+			mr.End = idx << ChunkShift
+			break
+		}
+	}
+	perms := hostarch.ReadExecute
+	if at.Write {
+		c.MarkDirtyLocked(mr.Start, mr.End)
+		perms.Write = true
+	}
+	ts := Translations(c.Chunks, mr, perms, &c.mf)
+	if beyondEOF {
+		return ts, &memmap.BusError{Err: io.EOF}
+	}
+	return ts, nil
+}
+
+// dataMemmapFile exposes the chunks of a Cache as a memmap.File.
+type dataMemmapFile struct {
+	memmap.DefaultMemoryType
+	memmap.NoBufferedIOFallback
+
+	cache *Cache
+}
+
+// IncRef implements memmap.File.IncRef.
+func (mf *dataMemmapFile) IncRef(fr memmap.FileRange, memCgID uint32) {}
+
+// DecRef implements memmap.File.DecRef.
+func (mf *dataMemmapFile) DecRef(fr memmap.FileRange) {}
+
+// MapInternal implements memmap.File.MapInternal.
+func (mf *dataMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	c := mf.cache
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	if fr.Length() == 0 {
+		return safemem.BlockSeq{}, nil
+	}
+	var blocks []safemem.Block
+	for off := fr.Start; off < fr.End; {
+		idx := off >> ChunkShift
+		ch, err := c.ChunkLocked(idx)
+		if err != nil {
+			return safemem.BlockSeq{}, &memmap.BusError{Err: c.backend.TranslateError(err)}
+		}
+		base := idx << ChunkShift
+		end := min(fr.End-base, ChunkSize)
+		blocks = append(blocks, safemem.BlockFromSafeSlice(ch.Buf[off-base:end]))
+		off = base + end
+	}
+	if at.Write {
+		c.MarkDirtyLocked(fr.Start, fr.End)
+	}
+	return safemem.BlockSeqFromSlice(blocks), nil
+}
+
+// DataFD implements memmap.File.DataFD.
+func (mf *dataMemmapFile) DataFD(fr memmap.FileRange) (int, error) {
+	return -1, linuxerr.ENODEV
+}
+
+// FD implements memmap.File.FD.
+func (mf *dataMemmapFile) FD() int {
+	return -1
 }

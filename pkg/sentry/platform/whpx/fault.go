@@ -23,20 +23,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
-// si_code values of SIGSEGV, SIGBUS, SIGILL and SIGFPE.
-const (
-	segvMapErr = hvcommon.SegvMapErr
-	segvAccErr = hvcommon.SegvAccErr
-	busAdrAln  = hvcommon.BusAdrAln
-	busAdrErr  = hvcommon.BusAdrErr
-	illIllOpc  = hvcommon.IllIllOpc
-	illIllOpn  = hvcommon.IllIllOpn
-	illIllTrp  = hvcommon.IllIllTrp
-	fpeIntDiv  = hvcommon.FpeIntDiv
-	fpeIntOvf  = hvcommon.FpeIntOvf
-	fpeFltInv  = hvcommon.FpeFltInv
-)
-
 // trapKind tells the Switch loop what an exit from the stub means.
 type trapKind uint8
 
@@ -73,28 +59,6 @@ func (t trap) result() runResult {
 	return runResult{sig: info, at: t.access, err: platform.ErrContextSignal}
 }
 
-// Vectors of x86 exceptions.
-const (
-	x86VecDivide        = hvcommon.X86VecDivide
-	x86VecDebug         = hvcommon.X86VecDebug
-	x86VecNMI           = hvcommon.X86VecNMI
-	x86VecBreakpoint    = hvcommon.X86VecBreakpoint
-	x86VecOverflow      = hvcommon.X86VecOverflow
-	x86VecBound         = hvcommon.X86VecBound
-	x86VecInvalidOpcode = hvcommon.X86VecInvalidOpcode
-	x86VecNoMath        = hvcommon.X86VecNoMath
-	x86VecDoubleFault   = hvcommon.X86VecDoubleFault
-	x86VecInvalidTSS    = hvcommon.X86VecInvalidTSS
-	x86VecSegNotPresent = hvcommon.X86VecSegNotPresent
-	x86VecStackSegment  = hvcommon.X86VecStackSegment
-	x86VecGeneralProt   = hvcommon.X86VecGeneralProt
-	x86VecPageFault     = hvcommon.X86VecPageFault
-	x86VecX87           = hvcommon.X86VecX87
-	x86VecAlignment     = hvcommon.X86VecAlignment
-	x86VecMachineCheck  = hvcommon.X86VecMachineCheck
-	x86VecSIMD          = hvcommon.X86VecSIMD
-)
-
 // classifyX86 maps an exception of the amd64 stub to a signal.
 func classifyX86(vector, errCode, cr2, rip uint64) (trap, error) {
 	sig, at, hasAddr, addr, err := hvcommon.ClassifyX86Exception(vector, errCode, cr2, rip)
@@ -111,37 +75,12 @@ func classifyX86(vector, errCode, cr2, rip uint64) (trap, error) {
 	}, nil
 }
 
-// ESR_EL1 exception classes that EL0 can raise.
-const (
-	esrECUnknown   = hvcommon.ECUnknown
-	esrECWFx       = hvcommon.ECWFx
-	esrECFPAccess  = hvcommon.ECFPAccess
-	esrECIllState  = hvcommon.ECIllegalState
-	esrECSVC64     = hvcommon.ECSVC64
-	esrECSysReg    = hvcommon.ECSysReg
-	esrECInstrAbrt = hvcommon.ECInstrAbortLower
-	esrECPCAlign   = hvcommon.ECPCAlignment
-	esrECDataAbrt  = hvcommon.ECDataAbortLower
-	esrECSPAlign   = hvcommon.ECSPAlignment
-	esrECFPExc     = hvcommon.ECFPExc64
-	esrECSError    = hvcommon.ECSError
-	esrECBrkptLow  = hvcommon.ECBreakpointLower
-	esrECStepLow   = hvcommon.ECSoftStepLower
-	esrECWatchLow  = hvcommon.ECWatchpointLower
-	esrECBrk64     = hvcommon.ECBRK64
-
-	esrECShift = hvcommon.ESRECShift
-	esrWnR     = 1 << 6
-	esrCM      = 1 << 8
-	esrFSCMask = hvcommon.ESRFSCMask
-)
-
 // classifyA64 maps an exception of the arm64 stub to a system call, a signal,
 // or a skipped instruction.
 func classifyA64(slot, esr, far, pc, sp uint64) (trap, error) {
 	if slot != a64SlotLowA64Sync {
 		if slot == a64SlotLowA64SErr {
-			return trap{kind: trapSignal, signo: linux.SIGBUS, code: busAdrErr, hasAddr: true, addr: pc}, nil
+			return trap{kind: trapSignal, signo: linux.SIGBUS, code: hvcommon.BusAdrErr, hasAddr: true, addr: pc}, nil
 		}
 		return trap{}, fmt.Errorf("whpx: unexpected arm64 exception vector slot %d, esr %#x, pc %#x", slot, esr, pc)
 	}
@@ -152,7 +91,7 @@ func classifyA64(slot, esr, far, pc, sp uint64) (trap, error) {
 	case hvcommon.A64ExitSkip:
 		return trap{kind: trapSkip}, nil
 	case hvcommon.A64ExitSysReg:
-		return trap{kind: trapSignal, signo: linux.SIGILL, code: illIllOpc, hasAddr: true, addr: pc}, nil
+		return trap{kind: trapSignal, signo: linux.SIGILL, code: hvcommon.IllIllOpc, hasAddr: true, addr: pc}, nil
 	default:
 		return trap{
 			kind:    trapSignal,
@@ -171,7 +110,7 @@ func emulateA64SysReg(comm *CommPage, ids *hvcommon.IDRegisters) bool {
 	if comm.Vector != hvcommon.SlotLowerSync {
 		return false
 	}
-	if hvcommon.ESREC(comm.ESR) != esrECSysReg {
+	if hvcommon.ESREC(comm.ESR) != hvcommon.ECSysReg {
 		return false
 	}
 	iss := hvcommon.DecodeSysRegISS(comm.ESR)

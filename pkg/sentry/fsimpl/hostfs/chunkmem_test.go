@@ -136,8 +136,8 @@ func TestTruncateInvalidatesBeforeItReleasesChunkMemory(t *testing.T) {
 	var dataLockHeld bool
 	ms.onInvalidate = func() {
 		releasesAtInvalidate = mem.releases.Load()
-		if data.dataMu.TryLock() {
-			data.dataMu.Unlock()
+		if data.DataMu.TryLock() {
+			data.DataMu.Unlock()
 		} else {
 			dataLockHeld = true
 		}

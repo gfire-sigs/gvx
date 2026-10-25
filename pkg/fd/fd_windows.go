@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -152,4 +153,48 @@ func (h *HostHandle) Close() error {
 		return fmt.Errorf("CloseHandle: %w", err)
 	}
 	return nil
+}
+
+// FileRenameInformationEx is the FileRenameInformationEx class of NtSetInformationFile.
+const FileRenameInformationEx = 65
+
+// NameInfoHeader is the common header of FILE_RENAME_INFORMATION_EX and FILE_LINK_INFORMATION.
+type NameInfoHeader struct {
+	Flags          uint32
+	RootDirectory  windows.Handle
+	FileNameLength uint32
+	FileName       [1]uint16
+}
+
+// NewNameInfo builds an 8-byte-aligned FILE_RENAME_INFORMATION_EX or FILE_LINK_INFORMATION buffer.
+func NewNameInfo(flags uint32, root windows.Handle, name string) (buf []uint64, size uint32, err error) {
+	units, err := windows.UTF16FromString(name)
+	if err != nil {
+		return nil, 0, err
+	}
+	units = units[:len(units)-1]
+	const nameOffset = unsafe.Offsetof(NameInfoHeader{}.FileName)
+	nameBytes := len(units) * 2
+	total := max(int(unsafe.Sizeof(NameInfoHeader{})), int(nameOffset)+nameBytes)
+	words := (total + 7) / 8
+	buf = make([]uint64, words)
+	header := (*NameInfoHeader)(unsafe.Pointer(&buf[0]))
+	header.Flags = flags
+	header.RootDirectory = root
+	header.FileNameLength = uint32(nameBytes)
+	if len(units) > 0 {
+		dst := unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(&buf[0]), nameOffset)), len(units))
+		copy(dst, units)
+	}
+	return buf, uint32(words * 8), nil
+}
+
+// SetFileTargetName invokes NtSetInformationFile on src with a name-information buffer.
+func SetFileTargetName(src, root windows.Handle, name string, flags, infoClass uint32) error {
+	buf, size, err := NewNameInfo(flags, root, name)
+	if err != nil {
+		return err
+	}
+	var iosb windows.IO_STATUS_BLOCK
+	return windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), size, infoClass)
 }

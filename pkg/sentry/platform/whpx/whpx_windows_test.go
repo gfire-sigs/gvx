@@ -27,6 +27,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // These tests run guest code in a real partition. They skip when the host has
@@ -126,7 +127,7 @@ func TestRealPageFault(t *testing.T) {
 	if !errors.Is(err, platform.ErrContextSignal) || sig == nil {
 		t.Fatalf("Switch returned %v, %v", sig, err)
 	}
-	if sig.Signo != int32(linux.SIGSEGV) || sig.Code != segvMapErr || !at.Read {
+	if sig.Signo != int32(linux.SIGSEGV) || sig.Code != hvcommon.SegvMapErr || !at.Read {
 		t.Errorf("signal %d code %d access %+v", sig.Signo, sig.Code, at)
 	}
 }

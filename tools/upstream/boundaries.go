@@ -256,6 +256,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "golang.org/x/sys/unix", "the Linux lockdown names system calls for the extra rules"},
 	// pkg/oci: the EROFS writer and the layer codecs have no SPEC row of their own.
 	{[]string{"pkg/oci"}, "pkg/erofs", "SPEC section 3.6 compiles layer tarballs with the upstream erofs ABI"},
+	{[]string{"pkg/oci"}, "pkg/fd", "the Windows layer cache shares NT file rename helpers with hostfs"},
 	{[]string{"pkg/oci"}, "github.com/klauspost/compress/*", "zstd-compressed OCI layers"},
 	{[]string{"pkg/oci"}, "github.com/cespare/xxhash/*", "content-addressed layer cache keys"},
 	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "the Windows layer cache opens files with full sharing and renames with POSIX semantics"},

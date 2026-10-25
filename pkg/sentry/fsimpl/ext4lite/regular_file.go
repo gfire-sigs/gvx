@@ -105,7 +105,7 @@ func (fd *regularFD) Release(ctx context.Context) {}
 // OnClose implements vfs.FileDescriptionImpl.OnClose. It reports the write-back
 // failure of a memory mapping that ended before the file description closed.
 func (fd *regularFD) OnClose(ctx context.Context) error {
-	return toLinuxErr(fd.dentry.inode.data.takeWritebackErr())
+	return toLinuxErr(fd.dentry.inode.data.TakeWritebackErr())
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -126,7 +126,7 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if end < uint64(offset) {
 		end = math.MaxUint64
 	}
-	if err := ino.data.flushRange(uint64(offset), end); err != nil {
+	if err := ino.data.FlushRange(uint64(offset), end); err != nil {
 		return 0, toLinuxErr(err)
 	}
 	r := nodeReader{n: ino.n, off: offset}
@@ -277,7 +277,7 @@ func (i *inode) killCapability() error {
 // write on an O_SYNC or O_DSYNC descriptor.
 func (fs *filesystem) syncInode(ino *inode) error {
 	var errs []error
-	if err := ino.data.syncData(); err != nil {
+	if err := ino.data.SyncData(); err != nil {
 		errs = append(errs, err)
 	}
 	if err := fs.v.sync(); err != nil {
@@ -317,7 +317,7 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 		}
 		// A dirty mapped page over a hole counts as data only after the
 		// engine stores it.
-		if err := ino.data.flushRange(0, math.MaxUint64); err != nil {
+		if err := ino.data.FlushRange(0, math.MaxUint64); err != nil {
 			return 0, toLinuxErr(err)
 		}
 		ino.n.mu.RLock()
@@ -381,13 +381,13 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	if punch {
 		// Dirty mapped pages in the range reach the engine first, so the punch
 		// removes them as well.
-		if err := ino.data.flushRange(offset, offset+length); err != nil {
+		if err := ino.data.FlushRange(offset, offset+length); err != nil {
 			return toLinuxErr(err)
 		}
 		if err := ino.n.punchHole(offset, length); err != nil {
 			return toLinuxErr(err)
 		}
-		ino.data.punched(offset, length)
+		ino.data.Punched(offset, length)
 		ino.touchMCtime()
 		return nil
 	}

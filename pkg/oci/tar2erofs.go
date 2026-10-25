@@ -307,8 +307,8 @@ func cleanTarPath(name string) (string, error) {
 			}
 			parts = parts[:len(parts)-1]
 		default:
-			if len(comp) > erofsMaxName {
-				return "", fmt.Errorf("oci: tar entry %q has a component longer than %d bytes", name, erofsMaxName)
+			if len(comp) > erofs.MaxNameLen {
+				return "", fmt.Errorf("oci: tar entry %q has a component longer than %d bytes", name, erofs.MaxNameLen)
 			}
 			parts = append(parts, comp)
 		}
@@ -565,13 +565,13 @@ func (w *fileWriter) isZero(block []byte) bool {
 func (w *fileWriter) addData(p []byte) error {
 	c := w.c
 	nb := uint32(len(p) / c.bs)
-	if uint64(c.nextBlk)+uint64(nb) >= erofsNullAddr {
+	if uint64(c.nextBlk)+uint64(nb) >= erofs.NullAddr {
 		return errors.New("oci: layer exceeds the EROFS block address space")
 	}
 	if _, err := c.dst.WriteAt(p, int64(c.nextBlk)*int64(c.bs)); err != nil {
 		return fmt.Errorf("write EROFS data blocks: %w", err)
 	}
-	if last := len(w.runs) - 1; last >= 0 && w.runs[last].start != erofsNullAddr && w.runs[last].start+w.runs[last].n == c.nextBlk {
+	if last := len(w.runs) - 1; last >= 0 && w.runs[last].start != erofs.NullAddr && w.runs[last].start+w.runs[last].n == c.nextBlk {
 		w.runs[last].n += nb
 	} else {
 		w.runs = append(w.runs, blockRun{start: c.nextBlk, n: nb})
@@ -589,7 +589,7 @@ func (w *fileWriter) settleZeros() error {
 		return nil
 	}
 	if z >= w.c.minHoleBlocks {
-		w.runs = append(w.runs, blockRun{start: erofsNullAddr, n: z})
+		w.runs = append(w.runs, blockRun{start: erofs.NullAddr, n: z})
 		w.hasHole = true
 		return nil
 	}

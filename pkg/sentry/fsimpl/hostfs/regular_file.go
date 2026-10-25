@@ -25,7 +25,6 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/limits"
@@ -126,7 +125,7 @@ func (fd *regularFD) Release(ctx context.Context) {
 // OnClose implements vfs.FileDescriptionImpl.OnClose. It reports the write-back
 // failure of a memory mapping that ended before the file description closed.
 func (fd *regularFD) OnClose(ctx context.Context) error {
-	return translateHostError(fd.dentry.inode.data.takeWritebackErr())
+	return translateHostError(fd.dentry.inode.data.TakeWritebackErr())
 }
 
 // Stat implements vfs.FileDescriptionImpl.Stat. It reads size, times, and link
@@ -162,7 +161,7 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if end < uint64(offset) {
 		end = math.MaxUint64
 	}
-	if err := fd.dentry.inode.data.flushRange(uint64(offset), end); err != nil {
+	if err := fd.dentry.inode.data.FlushRange(uint64(offset), end); err != nil {
 		return 0, translateHostError(err)
 	}
 	r := hostFileReader{h: fd.h, off: offset}
@@ -380,13 +379,6 @@ const (
 
 type cacheChunk = chunkcache.Chunk
 
-// newChunk allocates the memory of one chunk. With ChunkMemory, the chunk
-// lives in a memory file, which a platform can map into a guest process by
-// file descriptor. Without it, the chunk lives on the Go heap.
-func (c *fileData) newChunk() (*cacheChunk, error) {
-	return chunkcache.NewChunk(c.ino.fs.ws.chunkMemory())
-}
-
 // fileData is the mapped-page cache of a regular file. The cache exists only
 // while a mapping holds an attached handle. The host file stays the source of
 // truth for read and write system calls. Writes go through to cached chunks.
@@ -403,46 +395,59 @@ func (c *fileData) newChunk() (*cacheChunk, error) {
 // stays dirty until a write-back writes it. A write-back goes through the
 // handle, which waits for the reopen. See handle_registry.go.
 type fileData struct {
+	chunkcache.Cache
 	ino *inode
 
-	// active is set while a handle is attached. The read path checks it
-	// without taking locks.
-	active atomic.Bool
-
-	// mapsMu protects mappings. Lock order: mapsMu, then dataMu.
-	mapsMu   sync.Mutex
-	mappings memmap.MappingSet
-
-	// dataMu protects the fields below.
-	dataMu       sync.Mutex
-	chunks       map[uint64]*cacheChunk
-	size         int64
-	mh           *hostHandle
-	mhWritable   bool
-	writableMaps int
-	// pending is the handle that ConfigureMMap reserved for the next
-	// AddMapping. See reserveHandle.
+	size            int64
+	mh              *hostHandle
+	mhWritable      bool
 	pending         *hostHandle
 	pendingWritable bool
-	wbErr           error
-
-	mf dataMemmapFile
 }
 
 func (c *fileData) init(ino *inode) {
 	c.ino = ino
-	c.mf.data = c
+	c.Init(c)
+}
+
+func (c *fileData) ChunkMemory() chunkcache.ChunkMemory { return c.ino.fs.ws.chunkMemory() }
+func (c *fileData) FileSizeLocked() uint64              { return uint64(c.size) }
+func (c *fileData) TranslateError(err error) error      { return translateHostError(err) }
+
+func (c *fileData) CanTranslateLocked(write bool) error {
+	if c.mh == nil {
+		return linuxerr.ENODEV
+	}
+	if write && !c.mhWritable {
+		return linuxerr.EACCES
+	}
+	return nil
+}
+
+func (c *fileData) PrepareAddMappingLocked() error { return c.restoreHandleLocked() }
+
+func (c *fileData) ReadChunkAtLocked(dst []byte, off int64) error {
+	_, err := c.mh.readAt(dst, off)
+	return err
+}
+
+func (c *fileData) DropBackendLocked() {
+	if c.mh != nil {
+		_ = c.mh.decRef()
+		c.mh = nil
+	}
+	c.mhWritable = false
 }
 
 // attachHandle makes h the handle behind mapped pages. A writable handle
 // replaces a read-only one, because only a writable handle can write back.
 func (c *fileData) attachHandle(h *hostHandle, writable bool) error {
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
 	return c.attachLocked(h, writable)
 }
 
-// attachLocked is attachHandle for a caller that holds dataMu.
+// attachLocked is attachHandle for a caller that holds DataMu.
 func (c *fileData) attachLocked(h *hostHandle, writable bool) error {
 	if c.mh != nil && (c.mhWritable || !writable) {
 		return nil
@@ -453,14 +458,14 @@ func (c *fileData) attachLocked(h *hostHandle, writable bool) error {
 			return err
 		}
 		c.size = info.size
-		c.chunks = make(map[uint64]*cacheChunk)
+		c.Chunks = make(map[uint64]*cacheChunk)
 	}
 	h.owner.Store(c)
 	h.incRef()
 	old := c.mh
 	c.mh = h
 	c.mhWritable = writable
-	c.active.Store(true)
+	c.Active.Store(true)
 	if old != nil {
 		_ = old.decRef()
 	}
@@ -468,12 +473,9 @@ func (c *fileData) attachLocked(h *hostHandle, writable bool) error {
 }
 
 // reserveHandle keeps h for the AddMapping call that follows ConfigureMMap.
-// The reservation stays until AddMapping takes it, or until the inode dies
-// when the mmap fails between the two calls. It keeps the handle that can write
-// back, because one AddMapping serves whichever mapping came first.
 func (c *fileData) reserveHandle(h *hostHandle, writable bool) {
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
 	if c.pending != nil {
 		if c.pendingWritable || !writable {
 			return
@@ -501,12 +503,12 @@ func (c *fileData) restoreHandleLocked() error {
 
 // release drops the cache when the inode dies.
 func (c *fileData) release() {
-	_ = c.syncData()
-	c.mapsMu.Lock()
-	defer c.mapsMu.Unlock()
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	c.dropLocked()
+	_ = c.SyncData()
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	c.DropLocked()
 	if c.pending != nil {
 		_ = c.pending.decRef()
 		c.pending = nil
@@ -514,80 +516,25 @@ func (c *fileData) release() {
 	}
 }
 
-// dropLocked frees every chunk and the attached handle.
-func (c *fileData) dropLocked() {
-	for _, ch := range c.chunks {
-		ch.Release()
-	}
-	c.chunks = nil
-	c.active.Store(false)
-	if c.mh != nil {
-		_ = c.mh.decRef()
-		c.mh = nil
-	}
-	c.mhWritable = false
-}
-
-func (c *fileData) takeWritebackErr() error {
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	err := c.wbErr
-	c.wbErr = nil
-	return err
-}
-
-// noteWritebackErr records a write-back failure that no caller can return, so
-// the next fsync or close reports it.
-func (c *fileData) noteWritebackErr(err error) {
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	c.wbErr = errors.Join(c.wbErr, err)
-}
-
-// syncData writes back every dirty chunk and returns any earlier write-back
-// failure that no caller observed.
-func (c *fileData) syncData() error {
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	err := errors.Join(c.wbErr, c.flushLocked(0, math.MaxUint64))
-	c.wbErr = nil
-	return err
-}
-
-func (c *fileData) flushRange(start, end uint64) error {
-	if !c.active.Load() {
-		return nil
-	}
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	return c.flushLocked(start, end)
-}
-
-// flushLocked writes the dirty chunks that overlap [start, end) to the host
+// FlushLocked writes the dirty chunks that overlap [start, end) to the host
 // file. A chunk stays dirty while a writable mapping exists, because the guest
 // can modify it at any time.
-func (c *fileData) flushLocked(start, end uint64) error {
-	if len(c.chunks) == 0 || c.mh == nil {
+func (c *fileData) FlushLocked(start, end uint64) error {
+	if len(c.Chunks) == 0 || c.mh == nil {
 		return nil
 	}
-	// The handle stays acquired from the first write to the end of the loop.
-	// A directory rename cannot close the file in between. The loop takes no
-	// lock of this package that the lock order places before the handle.
 	var f *os.File
 	var errs []error
-	for idx, ch := range c.chunks {
+	for idx, ch := range c.Chunks {
 		base := idx << chunkShift
 		if !ch.Dirty || base >= end || base+chunkSize <= start {
 			continue
 		}
 		if base >= uint64(c.size) {
-			ch.Dirty = c.writableMaps > 0
+			ch.Dirty = c.WritableMaps > 0
 			continue
 		}
-		n := uint64(c.size) - base
-		if n > chunkSize {
-			n = chunkSize
-		}
+		n := min(uint64(c.size)-base, chunkSize)
 		if f == nil {
 			var err error
 			if f, err = c.mh.acquire(); err != nil {
@@ -600,7 +547,7 @@ func (c *fileData) flushLocked(start, end uint64) error {
 			continue
 		}
 		c.ino.invalidateMeta()
-		ch.Dirty = c.writableMaps > 0
+		ch.Dirty = c.WritableMaps > 0
 	}
 	if f != nil {
 		c.ino.guestEndFile(f)
@@ -612,276 +559,63 @@ func (c *fileData) flushLocked(start, end uint64) error {
 // writeThrough copies bytes that a system call wrote to the host file into
 // the chunks that exist, so mapped pages observe them.
 func (c *fileData) writeThrough(off int64, p []byte) {
-	if !c.active.Load() {
+	if !c.Active.Load() {
 		return
 	}
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
 	if end := off + int64(len(p)); end > c.size {
 		c.size = end
 	}
-	for len(p) > 0 {
-		idx := uint64(off) >> chunkShift
-		within := int(uint64(off) & (chunkSize - 1))
-		n := min(len(p), chunkSize-within)
-		if ch, ok := c.chunks[idx]; ok {
-			copy(ch.Buf[within:within+n], p[:n])
-		}
-		off += int64(n)
-		p = p[n:]
-	}
+	c.CopyThroughLocked(off, p)
 }
 
-// truncated adjusts the cache after the host file changed size. It drops the
-// chunks beyond the new size only after it invalidated the mappings. A mapping
-// translated a chunk earlier and took its own reference when it did, so the
-// memory outlives the chunk. Invalidate calls into the memory manager, which
-// holds its own locks while it calls Translate, so dataMu must be free here.
+// truncated adjusts the cache after the host file changed size.
 func (c *fileData) truncated(size int64) {
-	if !c.active.Load() {
+	if !c.Active.Load() {
 		return
 	}
-	c.mapsMu.Lock()
-	defer c.mapsMu.Unlock()
-
-	c.dataMu.Lock()
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
+	c.DataMu.Lock()
 	c.size = size
-	var dropped []*cacheChunk
-	for idx, ch := range c.chunks {
-		base := int64(idx) << chunkShift
-		switch {
-		case base >= size:
-			dropped = append(dropped, ch)
-			delete(c.chunks, idx)
-		case base+chunkSize > size:
-			clear(ch.Buf[size-base:])
-		}
-	}
-	c.dataMu.Unlock()
-
-	pgend, _ := hostarch.PageRoundUp(uint64(size))
-	c.mappings.Invalidate(memmap.MappableRange{Start: pgend, End: math.MaxUint64}, memmap.InvalidateOpts{})
-	for _, ch := range dropped {
-		ch.Release()
-	}
+	dropped := c.ShrinkLocked(uint64(size))
+	c.DataMu.Unlock()
+	c.InvalidateShrink(uint64(size), dropped)
 }
 
 // invalidateCleanChunks drops the cached state that a change by a host process
-// made stale. It refreshes the cached size, drops every chunk that holds no
-// guest modification, and invalidates every mapping, so the next access to a
-// mapped page loads the chunk again from the host file. A chunk with a guest
-// modification stays, because the next write-back would overwrite the host
-// bytes at that offset anyway.
-//
-// The order follows truncated: the mappings go first, and the chunk memory
-// goes after them, because a platform that mapped a chunk holds its own
-// reference. Invalidate calls into the memory manager, which holds its own
-// locks while it calls Translate, so dataMu must be free when it runs.
+// made stale.
 func (c *fileData) invalidateCleanChunks() {
-	if !c.active.Load() {
+	if !c.Active.Load() {
 		return
 	}
-	c.mapsMu.Lock()
-	defer c.mapsMu.Unlock()
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
 
-	c.dataMu.Lock()
+	c.DataMu.Lock()
 	if c.mh == nil {
-		c.dataMu.Unlock()
+		c.DataMu.Unlock()
 		return
 	}
 	if info, err := c.mh.fstat(c.ino.fs.ws.host); err == nil {
 		c.size = info.size
 	}
 	var dropped []*cacheChunk
-	for idx, ch := range c.chunks {
+	for idx, ch := range c.Chunks {
 		base := int64(idx) << chunkShift
 		switch {
 		case !ch.Dirty:
 			dropped = append(dropped, ch)
-			delete(c.chunks, idx)
+			delete(c.Chunks, idx)
 		case base < c.size && base+chunkSize > c.size:
 			clear(ch.Buf[c.size-base:])
 		}
 	}
-	c.dataMu.Unlock()
+	c.DataMu.Unlock()
 
-	c.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	c.Mappings.InvalidateAll(memmap.InvalidateOpts{})
 	for _, ch := range dropped {
 		ch.Release()
 	}
-}
-
-// chunkLocked returns the chunk idx, loading it from the host file when absent.
-func (c *fileData) chunkLocked(idx uint64) (*cacheChunk, error) {
-	if ch, ok := c.chunks[idx]; ok {
-		return ch, nil
-	}
-	if c.mh == nil {
-		return nil, linuxerr.ENODEV
-	}
-	ch, err := c.newChunk()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := c.mh.readAt(ch.Buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
-		ch.Release()
-		return nil, err
-	}
-	c.chunks[idx] = ch
-	return ch, nil
-}
-
-// AddMapping implements memmap.Mappable.AddMapping.
-func (c *fileData) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
-	c.mapsMu.Lock()
-	defer c.mapsMu.Unlock()
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	// A RemoveMapping on another thread can drop the handle between the
-	// ConfigureMMap of this mapping and this call. The reserved handle comes
-	// back here, under the lock that RemoveMapping also takes.
-	if err := c.restoreHandleLocked(); err != nil {
-		return translateHostError(err)
-	}
-	c.mappings.AddMapping(ms, ar, offset, writable)
-	if writable {
-		c.writableMaps++
-	}
-	return nil
-}
-
-// RemoveMapping implements memmap.Mappable.RemoveMapping. The interface has no
-// error result, so a write-back failure waits in wbErr for fsync or close.
-func (c *fileData) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
-	c.mapsMu.Lock()
-	defer c.mapsMu.Unlock()
-	c.mappings.RemoveMapping(ms, ar, offset, writable)
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	if writable && c.writableMaps > 0 {
-		c.writableMaps--
-	}
-	if err := c.flushLocked(0, math.MaxUint64); err != nil {
-		c.wbErr = errors.Join(c.wbErr, err)
-	}
-	if c.mappings.IsEmpty() {
-		c.dropLocked()
-	}
-}
-
-// CopyMapping implements memmap.Mappable.CopyMapping.
-func (c *fileData) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
-	return c.AddMapping(ctx, ms, dstAR, offset, writable)
-}
-
-// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
-func (c *fileData) InvalidateUnsavable(ctx context.Context) error {
-	return translateHostError(c.syncData())
-}
-
-// markDirtyLocked flags the chunks that overlap [start, end) as dirty.
-func (c *fileData) markDirtyLocked(start, end uint64) {
-	for idx := start >> chunkShift; idx <= (end-1)>>chunkShift; idx++ {
-		if ch, ok := c.chunks[idx]; ok {
-			ch.Dirty = true
-		}
-	}
-}
-
-// Translate implements memmap.Mappable.Translate.
-func (c *fileData) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	if c.mh == nil {
-		return nil, &memmap.BusError{Err: linuxerr.ENODEV}
-	}
-	if at.Write && !c.mhWritable {
-		return nil, &memmap.BusError{Err: linuxerr.EACCES}
-	}
-	// Constrain translations to the file size, rounded up to a page, so that
-	// no translation reaches pages that a truncation removes.
-	pgend, _ := hostarch.PageRoundUp(uint64(c.size))
-	var beyondEOF bool
-	if required.End > pgend {
-		if required.Start >= pgend {
-			return nil, &memmap.BusError{Err: io.EOF}
-		}
-		beyondEOF = true
-		required.End = pgend
-	}
-	if optional.End > pgend {
-		optional.End = pgend
-	}
-	mr := chunkcache.MaxFillRange(required, optional)
-	for idx := mr.Start >> chunkShift; idx <= (mr.End-1)>>chunkShift; idx++ {
-		if _, err := c.chunkLocked(idx); err != nil {
-			if idx<<chunkShift < required.End {
-				return nil, &memmap.BusError{Err: translateHostError(err)}
-			}
-			mr.End = idx << chunkShift
-			break
-		}
-	}
-	perms := hostarch.ReadExecute
-	if at.Write {
-		// From now on the guest can dirty these pages at any time.
-		c.markDirtyLocked(mr.Start, mr.End)
-		perms.Write = true
-	}
-	ts := chunkcache.Translations(c.chunks, mr, perms, &c.mf)
-	if beyondEOF {
-		return ts, &memmap.BusError{Err: io.EOF}
-	}
-	return ts, nil
-}
-
-// dataMemmapFile exposes the chunks of a fileData as a memmap.File. Offsets
-// are file offsets.
-type dataMemmapFile struct {
-	memmap.DefaultMemoryType
-	memmap.NoBufferedIOFallback
-
-	data *fileData
-}
-
-// IncRef implements memmap.File.IncRef.
-func (mf *dataMemmapFile) IncRef(fr memmap.FileRange, memCgID uint32) {}
-
-// DecRef implements memmap.File.DecRef.
-func (mf *dataMemmapFile) DecRef(fr memmap.FileRange) {}
-
-// MapInternal implements memmap.File.MapInternal.
-func (mf *dataMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
-	c := mf.data
-	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
-	if fr.Length() == 0 {
-		return safemem.BlockSeq{}, nil
-	}
-	var blocks []safemem.Block
-	for off := fr.Start; off < fr.End; {
-		idx := off >> chunkShift
-		ch, err := c.chunkLocked(idx)
-		if err != nil {
-			return safemem.BlockSeq{}, &memmap.BusError{Err: translateHostError(err)}
-		}
-		base := idx << chunkShift
-		end := min(fr.End-base, chunkSize)
-		blocks = append(blocks, safemem.BlockFromSafeSlice(ch.Buf[off-base:end]))
-		off = base + end
-	}
-	if at.Write {
-		c.markDirtyLocked(fr.Start, fr.End)
-	}
-	return safemem.BlockSeqFromSlice(blocks), nil
-}
-
-// DataFD implements memmap.File.DataFD.
-func (mf *dataMemmapFile) DataFD(fr memmap.FileRange) (int, error) {
-	return -1, linuxerr.ENODEV
-}
-
-// FD implements memmap.File.FD.
-func (mf *dataMemmapFile) FD() int {
-	return -1
 }

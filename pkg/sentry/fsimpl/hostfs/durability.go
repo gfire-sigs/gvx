@@ -48,7 +48,7 @@ var flushNeedsWrite = runtime.GOOS == "windows"
 func (fd *regularFD) persist(withDir bool) error {
 	d := fd.dentry
 	var errs []error
-	if err := d.inode.data.syncData(); err != nil {
+	if err := d.inode.data.SyncData(); err != nil {
 		errs = append(errs, err)
 	}
 	if err := fd.h.sync(); err != nil {
@@ -69,7 +69,7 @@ func (fd *regularFD) persist(withDir bool) error {
 // write covers the file range [start, end). It flushes the directory entry on
 // the first call of the description only.
 func (fd *regularFD) syncWrite(start, end int64) error {
-	if err := fd.dentry.inode.data.flushRange(uint64(start), uint64(end)); err != nil {
+	if err := fd.dentry.inode.data.FlushRange(uint64(start), uint64(end)); err != nil {
 		return err
 	}
 	withDir := fd.dirSynced.CompareAndSwap(false, true)
@@ -94,12 +94,12 @@ func (d *dentry) syncParentDir() error {
 // syncHost flushes the host file behind the mapped pages. It does nothing
 // while no mapping holds a handle.
 func (c *fileData) syncHost() error {
-	c.dataMu.Lock()
+	c.DataMu.Lock()
 	h := c.mh
 	if h != nil {
 		h.incRef()
 	}
-	c.dataMu.Unlock()
+	c.DataMu.Unlock()
 	if h == nil {
 		return nil
 	}
@@ -111,5 +111,5 @@ func (c *fileData) syncHost() error {
 // syncFile writes back the mapped pages of the inode and flushes the host file
 // behind them. Filesystem.Sync calls it for each inode.
 func (i *inode) syncFile() error {
-	return errors.Join(i.data.syncData(), i.data.syncHost())
+	return errors.Join(i.data.SyncData(), i.data.syncHost())
 }

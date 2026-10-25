@@ -244,7 +244,7 @@ func (fs *filesystem) syncMapped() error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, ino := range list {
-		if err := ino.data.syncData(); err != nil {
+		if err := ino.data.SyncData(); err != nil {
 			errs = append(errs, err)
 		}
 	}
