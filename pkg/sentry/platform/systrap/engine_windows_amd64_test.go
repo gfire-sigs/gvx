@@ -131,6 +131,26 @@ func TestFastPathResumeBehindPatchedSyscall(t *testing.T) {
 			t.Errorf("resume behind site %d (%#x): the relocated instructions ran %d times, want %d", i, ret, got, want)
 		}
 	}
+
+	// Simulate the child of fork: a fresh address space where the block is still
+	// in blockData when the thread starts at the return address of a SYSCALL.
+	// The first execute fault patches the block under the thread and must redirect
+	// the program counter to the new slot tail.
+	rFork := newRig(t, r.p)
+	rFork.program(prog)
+	rFork.ac.StateData().Regs.Rbx = 0
+	rFork.ac.SetIP(uintptr(returns[0]))
+	for {
+		si, _, err := rFork.run()
+		if si == nil && err == nil && regNr(rFork.ac) == 1 {
+			continue
+		}
+		mustSyscall(t, si, err, 3, rFork.ac)
+		break
+	}
+	if got := regAcc(rFork.ac); got != sites {
+		t.Errorf("fork child resume behind site 0 on unpatched block: relocated instructions ran %d times, want %d", got, sites)
+	}
 }
 
 // TestNearZeroBase checks which faults look like an access through a lost FS

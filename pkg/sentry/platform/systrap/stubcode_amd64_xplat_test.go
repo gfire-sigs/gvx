@@ -616,6 +616,33 @@ func TestPlanJmpPatchSeesBranchFromNeighborPage(t *testing.T) {
 	}
 }
 
+func TestPlanJmpPatchRejectsNoReturnSyscall(t *testing.T) {
+	// In musl, __unmapself ends with `mov eax, 60; syscall` and __clone
+	// starts directly at site+2 (`xor eax, eax; mov al, 56`). A JMP patch on
+	// the exit syscall would overwrite the entry of __clone.
+	after := []byte{0x31, 0xC0, 0xB0, 0x38, 0x90}
+	for _, tc := range []struct {
+		name  string
+		setup []byte
+		want  bool
+	}{
+		{"mov eax, 60 (exit)", []byte{0xB8, 60, 0, 0, 0}, false},
+		{"mov eax, 231 (exit_group)", []byte{0xB8, 231, 0, 0, 0}, false},
+		{"mov rax, 15 (rt_sigreturn)", []byte{0x48, 0xC7, 0xC0, 15, 0, 0, 0}, false},
+		{"mov al, 60 (exit)", []byte{0xB0, 60}, false},
+		{"mov eax, 39 (getpid)", []byte{0xB8, 39, 0, 0, 0}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			page := pageWith(0x100-len(tc.setup), tc.setup...)
+			copy(page[0x100:], []byte{0x0F, 0x05})
+			copy(page[0x102:], after)
+			if _, ok := planJmpPatch(nil, page, nil, 0x100); ok != tc.want {
+				t.Fatalf("planJmpPatch ok = %v, want %v", ok, tc.want)
+			}
+		})
+	}
+}
+
 func TestPatchJmpEncodesRelativeJump(t *testing.T) {
 	page := pageWith(0x40, 0x0F, 0x05, 0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF)
 	const siteVA, slotVA = 0x7ff0_1000_0040, 0x7ff0_1100_0000

@@ -452,8 +452,13 @@ func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) erro
 	}
 	sm := f.slot.sm
 	f.resume = f.trap.resumeState(ac)
-	if f.resume == winStateRunHot && !th.archFastHot(ac) {
-		f.resume = winStateRunCold
+	if f.resume == winStateRunHot {
+		as := th.sp.owner.Load()
+		if as == nil {
+			f.resume = winStateRunCold
+		} else if site, ok := as.slotAtTail(sm.Tail); !ok || site != f.trap.site || !th.archFastHot(ac) {
+			f.resume = winStateRunCold
+		}
 	}
 	sm.Regs.loadFrom(ac)
 	sm.Target = archPC(ac)

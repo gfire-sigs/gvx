@@ -135,6 +135,10 @@ func (th *thread) archStart(ac *arch.Context64) error {
 	return th.setTLS(want)
 }
 
+// resumePC returns pc unchanged on arm64 because a patched SVC never overwrites
+// the instruction behind it.
+func (th *thread) resumePC(pc uint64) uint64 { return pc }
+
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(ac *arch.Context64) {
 	if f := th.fast.Load(); f != nil {

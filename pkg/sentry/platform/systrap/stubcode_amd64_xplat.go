@@ -70,6 +70,10 @@ const (
 	// winIslandReach32 is the reach of a rel32 jump. The island allocator keeps
 	// far below it.
 	winIslandReach32 = 1 << 31
+
+	// winJmpNeighborLen is the number of bytes on each side of a page that
+	// jmpPlanner scans for relative branches into a patched site.
+	winJmpNeighborLen = 256
 )
 
 // x86Reg numbers are the numbers that an instruction encodes.
@@ -473,10 +477,34 @@ func relocatable(inst x86asm.Inst) bool {
 	return true
 }
 
+// noReturnSyscallSetup reports whether inst loads a system call number that
+// never returns to the instruction after SYSCALL: rt_sigreturn (15),
+// exit (60), or exit_group (231). A function that ends with such a call needs
+// no return instruction, so the next function can start directly at site+2.
+func noReturnSyscallSetup(inst x86asm.Inst) bool {
+	if inst.Op != x86asm.MOV {
+		return false
+	}
+	reg, ok := inst.Args[0].(x86asm.Reg)
+	if !ok || (reg != x86asm.AL && reg != x86asm.EAX && reg != x86asm.RAX) {
+		return false
+	}
+	imm, ok := inst.Args[1].(x86asm.Imm)
+	if !ok {
+		return false
+	}
+	switch int64(imm) {
+	case 15, 60, 231:
+		return true
+	}
+	return false
+}
+
 // jmpPlanner decides which SYSCALL sites of one page can become a JMP rel32.
 // It decodes the page once, and each plan reuses the result.
 type jmpPlanner struct {
 	before, page, after []byte
+	buf                 []byte
 	// target marks the buffer positions that a relative branch lands on. The
 	// buffer is before, page, and after joined. The scan decodes at every byte
 	// position, so a decode inside another instruction adds false targets, which
@@ -497,6 +525,7 @@ func (p *jmpPlanner) scan() {
 	buf = append(buf, p.before...)
 	buf = append(buf, p.page...)
 	buf = append(buf, p.after...)
+	p.buf = buf
 	p.target = make([]bool, len(buf))
 	for pos := range buf {
 		inst, err := x86asm.Decode(buf[pos:], 64)
@@ -513,12 +542,25 @@ func (p *jmpPlanner) scan() {
 	}
 }
 
+// precededByNoReturn reports whether an instruction that ends at p.buf[end]
+// loads a system call number that never returns.
+func (p *jmpPlanner) precededByNoReturn(end int) bool {
+	for back := 1; back <= amd64MaxInsnLen && back <= end; back++ {
+		inst, err := x86asm.Decode(p.buf[end-back:end], 64)
+		if err == nil && inst.Len == back && noReturnSyscallSetup(inst) {
+			return true
+		}
+	}
+	return false
+}
+
 // plan decides whether the SYSCALL at page[off] can become a JMP rel32. It
 // returns the bytes to relocate into the slot, which are the whole
 // instructions that start behind the SYSCALL and cover at least three bytes.
 //
 // The plan fails when the JMP or the relocated bytes leave the page, when an
-// instruction behind the SYSCALL cannot move, or when a relative branch that
+// instruction behind the SYSCALL cannot move, when the preceding instruction
+// loads a non-returning system call number, or when a relative branch that
 // decodes in the page or in the neighbor bytes lands inside the bytes that the
 // JMP overwrites. A branch from another page or an indirect jump can still land
 // there. The patcher cannot see those, and it accepts the risk that the amd64
@@ -546,6 +588,9 @@ func (p *jmpPlanner) plan(off int) ([]byte, bool) {
 	}
 	p.scan()
 	start := len(p.before) + off
+	if p.precededByNoReturn(start) {
+		return nil, false
+	}
 	for t := start + 1; t < start+winJmpLen; t++ {
 		if p.target[t] {
 			return nil, false

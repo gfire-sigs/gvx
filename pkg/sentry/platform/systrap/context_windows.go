@@ -353,6 +353,13 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			// A fault that repeats means that the fetch reaches a block that
 			// the guest did not map for execution.
 			if patched || th.execRepeats <= execRetryLimit {
+				if next := th.resumePC(pc); next != pc {
+					th.ctx.setPC(next)
+					if err := th.continueEvent(ev); err != nil {
+						return fatal(err, unix.EFAULT)
+					}
+					return running
+				}
 				if err := th.continueUnchanged(ev); err != nil {
 					return fatal(err, unix.EFAULT)
 				}

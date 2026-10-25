@@ -378,8 +378,11 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	var plan *jmpPlanner
 	if as.p.fast {
 		// The plan reads the original bytes, because an earlier patch changes
-		// the page.
-		plan = newJmpPlanner(before, append([]byte(nil), page...), after)
+		// the page. A wider neighbor window catches branches that start more
+		// than one instruction before or after the page boundary.
+		jmpBefore := as.neighborBytes(base, true, winJmpNeighborLen)
+		jmpAfter := as.neighborBytes(base, false, winJmpNeighborLen)
+		plan = newJmpPlanner(jmpBefore, append([]byte(nil), page...), jmpAfter)
 	}
 	var keep []amd64Site
 	var slots []winSlotRef
