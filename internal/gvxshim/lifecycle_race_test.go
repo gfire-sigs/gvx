@@ -15,6 +15,7 @@ import (
 
 	taskv2 "github.com/containerd/containerd/api/runtime/task/v2"
 	task "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/ttrpc"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -110,12 +111,14 @@ func TestAbsentDeleteAdmissionPreservesLaterLiveGeneration(t *testing.T) {
 }
 
 type lifecycleChild struct {
-	fixture   *processFixture
-	command   *exec.Cmd
-	record    stateRecord
-	done      chan struct{}
-	waitError error
-	stderr    bytes.Buffer
+	fixture        *processFixture
+	command        *exec.Cmd
+	record         stateRecord
+	client         *ttrpc.Client
+	requestContext context.Context
+	done           chan struct{}
+	waitError      error
+	stderr         bytes.Buffer
 }
 
 func startLifecycleChild(t *testing.T) *lifecycleChild {
@@ -200,6 +203,8 @@ func startLifecycleChild(t *testing.T) *lifecycleChild {
 	child.record = ready
 	client, requestContext := processClient(t, ready)
 	assertProcessConnect(t, requestContext, client, ready)
+	child.client = client
+	child.requestContext = requestContext
 	return child
 }
 
@@ -318,8 +323,7 @@ func TestDeleteObservesLeaseAfterStopEndpointCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer command.Close()
-	client, requestContext := processClient(t, child.record)
-	if _, err := task.NewTTRPCTaskClient(client).Shutdown(requestContext, &task.ShutdownRequest{ID: child.record.Identity.ID}); err != nil {
+	if _, err := task.NewTTRPCTaskClient(child.client).Shutdown(child.requestContext, &task.ShutdownRequest{ID: child.record.Identity.ID}); err != nil {
 		t.Fatal(err)
 	}
 	awaitLifecycleCondition(t, ctx, "stop listener did not close admission", func() (bool, error) {

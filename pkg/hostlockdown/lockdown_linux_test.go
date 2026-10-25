@@ -57,7 +57,23 @@ func installTestFilter(allowDirfdOpen bool) func() error {
 			unix.SYS_SOCKET:   seccomp.MatchAll{},
 			unix.SYS_OPENAT:   seccomp.MatchAll{},
 		})
-		var sets []seccomp.RuleSet
+		sets := []seccomp.RuleSet{
+			{
+				Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+					unix.SYS_CLONE: seccomp.PerArg{seccomp.EqualTo(
+						unix.CLONE_VM |
+							unix.CLONE_FS |
+							unix.CLONE_FILES |
+							unix.CLONE_SIGHAND |
+							unix.CLONE_SYSVSEM |
+							unix.CLONE_SETTLS |
+							unix.CLONE_PARENT_SETTID |
+							unix.CLONE_CHILD_CLEARTID |
+							unix.CLONE_THREAD)},
+				}),
+				Action: seccomp.Allow,
+			},
+		}
 		if allowDirfdOpen {
 			sets = append(sets, seccomp.RuleSet{
 				Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{

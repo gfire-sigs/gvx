@@ -415,6 +415,14 @@ func serveInstance(startup context.Context, identity instanceIdentity, timeout t
 	result = errors.Join(result, closeListener(transport))
 	barrierErr := state.WaitAndSeal(drain)
 	if barrierErr == nil {
+		// Allow the ttRPC client receiveLoop to hit EAGAIN and wake dispatch
+		// before server.Shutdown sends EOF on the socket and cancels client.ctx.
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-drain.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
 		barrierErr = server.Shutdown(drain)
 	}
 	if barrierErr != nil {

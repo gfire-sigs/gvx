@@ -27,6 +27,7 @@ import (
 
 	"z.gfire.dev/gvx/internal/acceptprog"
 	"z.gfire.dev/gvx/internal/acceptprog/compatprobe/report"
+	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/pkg/gvx"
 )
 
@@ -40,6 +41,9 @@ func TestE2ESystrapCompatSuite(t *testing.T) {
 
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
+			if (b.plat == gvx.PlatformHVF || b.plat == gvx.PlatformWHPX) && !hvtest.Available() {
+				t.Skip("no hardware hypervisor on this host")
+			}
 			requireFixedAddressBackend(t, b)
 
 			bin := defaultBin
