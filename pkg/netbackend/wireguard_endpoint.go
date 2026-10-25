@@ -31,6 +31,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/device"
 	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -83,6 +84,13 @@ type WireGuardConfig struct {
 	// ListenUDPAddr is the address of the pre-bound UDP socket. The default
 	// is DefaultWireGuardListenAddr.
 	ListenUDPAddr string
+	// DNSServers specifies upstream DNS servers ("ip" or "ip:port") for the
+	// virtual DNS relay at 10.0.2.3:53. When empty, the endpoint discovers
+	// host DNS servers before lockdown.
+	DNSServers []string
+	// LookupHost overrides DNS name resolution for the virtual DNS relay at
+	// 10.0.2.3:53 when non-nil.
+	LookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
 	// Logger receives wireguard-go device messages. When nil, the endpoint
 	// discards them. Verbose messages use the Debug level.
 	Logger *slog.Logger
@@ -98,12 +106,17 @@ type WireGuardConfig struct {
 type WireGuardEndpoint struct {
 	cfg          WireGuardConfig
 	peerEndpoint netip.AddrPort
+	upstreamDNS  []string
 
 	mu        sync.Mutex
 	udpConn   net.PacketConn
 	stack     *stack.Stack
 	channelEP *channel.Endpoint
 	dev       *device.Device
+	dnsCancel context.CancelFunc
+	dnsUDP    *gonet.UDPConn
+	dnsTCP    *gonet.TCPListener
+	dnsWG     sync.WaitGroup
 	closed    bool
 }
 
@@ -130,6 +143,14 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 	if err := validateWireGuardConfig(&cfg); err != nil {
 		return nil, err
 	}
+	upstreamDNS, err := normalizeDNSServers(cfg.DNSServers, false)
+	if err != nil {
+		return nil, fmt.Errorf("netbackend: %w", err)
+	}
+	cfg.DNSServers = upstreamDNS
+	if len(upstreamDNS) == 0 {
+		upstreamDNS = discoverHostDNSServers()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), wgEndpointTimeout)
 	defer cancel()
@@ -137,7 +158,7 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WireGuardEndpoint{cfg: cfg, peerEndpoint: peerEndpoint}, nil
+	return &WireGuardEndpoint{cfg: cfg, peerEndpoint: peerEndpoint, upstreamDNS: upstreamDNS}, nil
 }
 
 // validateWireGuardConfig rejects unusable keys, addresses, and sizes. It
@@ -301,6 +322,12 @@ func (w *WireGuardEndpoint) Start() (*stack.Stack, error) {
 		chEP.Close()
 		return nil, fmt.Errorf("netbackend: bring up WireGuard device: %w", err)
 	}
+	if err := w.startDNSRelayLocked(s); err != nil {
+		dev.Close()
+		s.Close()
+		chEP.Close()
+		return nil, err
+	}
 
 	w.stack = s
 	w.channelEP = chEP
@@ -308,7 +335,84 @@ func (w *WireGuardEndpoint) Start() (*stack.Stack, error) {
 	return s, nil
 }
 
+// startDNSRelayLocked binds the virtual DNS relay at 10.0.2.3:53 on s when
+// 10.0.2.3 is not the guest NIC address itself.
+func (w *WireGuardEndpoint) startDNSRelayLocked(s *stack.Stack) error {
+	dnsAddr := netip.MustParseAddr(HostDNSIPv4)
+	if w.cfg.GuestIPv4.Addr() == dnsAddr {
+		return nil
+	}
+	fullAddr := tcpip.FullAddress{
+		NIC:  Eth0NICID,
+		Addr: tcpip.AddrFrom4(dnsAddr.As4()),
+		Port: DefaultDNSPort,
+	}
+	udpConn, err := gonet.DialUDP(s, &fullAddr, nil, ipv4.ProtocolNumber)
+	if err != nil {
+		return fmt.Errorf("netbackend: listen WireGuard virtual UDP DNS: %w", err)
+	}
+	tcpLn, err := gonet.ListenTCP(s, fullAddr, ipv4.ProtocolNumber)
+	if err != nil {
+		_ = udpConn.Close()
+		return fmt.Errorf("netbackend: listen WireGuard virtual TCP DNS: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w.dnsCancel = cancel
+	w.dnsUDP = udpConn
+	w.dnsTCP = tcpLn
+	log := w.cfg.Logger
+	if log == nil {
+		log = discardLogger
+	}
+	w.dnsWG.Add(2)
+	go func() {
+		defer w.dnsWG.Done()
+		w.serveUDPDNS(ctx, udpConn, log)
+	}()
+	go func() {
+		defer w.dnsWG.Done()
+		w.serveTCPDNSListener(ctx, tcpLn, log)
+	}()
+	return nil
+}
+
 // newStackLocked builds the Netstack with lo and the WireGuard eth0 NIC.
+type wgLinkEndpoint struct {
+	*channel.Endpoint
+	dnsAddr tcpip.Address
+}
+
+func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	if e.dnsAddr.Len() == 0 {
+		return e.Endpoint.WritePackets(pkts)
+	}
+	var forward stack.PacketBufferList
+	looped := 0
+	for _, pkt := range pkts.AsSlice() {
+		if pkt.NetworkProtocolNumber == ipv4.ProtocolNumber {
+			netHdr := pkt.NetworkHeader().Slice()
+			if len(netHdr) >= header.IPv4MinimumSize {
+				ipHdr := header.IPv4(netHdr)
+				if ipHdr.DestinationAddress() == e.dnsAddr || ipHdr.SourceAddress() == e.dnsAddr {
+					newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+						Payload: pkt.ToBuffer(),
+					})
+					e.Endpoint.InjectInbound(pkt.NetworkProtocolNumber, newPkt)
+					newPkt.DecRef()
+					looped++
+					continue
+				}
+			}
+		}
+		forward.PushBack(pkt)
+	}
+	if forward.Len() == 0 {
+		return looped, nil
+	}
+	n, err := e.Endpoint.WritePackets(forward)
+	return n + looped, err
+}
+
 func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
@@ -333,7 +437,12 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, e
 		chEP.Close()
 		return nil, nil, err
 	}
-	if err := s.CreateNIC(Eth0NICID, chEP); err != nil {
+	dnsAddr := netip.MustParseAddr(HostDNSIPv4)
+	linkEP := &wgLinkEndpoint{Endpoint: chEP}
+	if w.cfg.GuestIPv4.Addr() != dnsAddr {
+		linkEP.dnsAddr = tcpip.AddrFrom4(dnsAddr.As4())
+	}
+	if err := s.CreateNIC(Eth0NICID, linkEP); err != nil {
 		return fail(fmt.Errorf("netbackend: create WireGuard channel NIC: %s", err))
 	}
 	v4 := tcpip.ProtocolAddress{
@@ -349,6 +458,18 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, e
 	routes := []tcpip.Route{
 		{Destination: header.IPv4LoopbackSubnet, NIC: LoopbackNICID},
 		{Destination: header.IPv4EmptySubnet, NIC: Eth0NICID},
+	}
+	if w.cfg.GuestIPv4.Addr() != dnsAddr {
+		dnsProto := tcpip.ProtocolAddress{
+			Protocol: ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpip.AddrFrom4(dnsAddr.As4()),
+				PrefixLen: 32,
+			},
+		}
+		if err := s.AddProtocolAddress(Eth0NICID, dnsProto, stack.AddressProperties{PEB: stack.NeverPrimaryEndpoint}); err != nil {
+			return fail(fmt.Errorf("netbackend: add WireGuard virtual DNS address: %s", err))
+		}
 	}
 	if w.cfg.GuestIPv6.IsValid() {
 		v6 := tcpip.ProtocolAddress{
@@ -422,9 +543,20 @@ func (w *WireGuardEndpoint) Close() error {
 		return nil
 	}
 	w.closed = true
+	dnsCancel, dnsUDP, dnsTCP := w.dnsCancel, w.dnsUDP, w.dnsTCP
 	dev, s, chEP, sock := w.dev, w.stack, w.channelEP, w.udpConn
 	w.mu.Unlock()
 
+	if dnsCancel != nil {
+		dnsCancel()
+	}
+	if dnsUDP != nil {
+		_ = dnsUDP.Close()
+	}
+	if dnsTCP != nil {
+		_ = dnsTCP.Close()
+	}
+	w.dnsWG.Wait()
 	if dev != nil {
 		dev.Close()
 	}
@@ -534,8 +666,11 @@ func ParseWireGuardINI(iniText string) (WireGuardConfig, error) {
 				}
 				cfg.ListenUDPAddr = ":" + strconv.FormatUint(p, 10)
 			case "dns":
-				// The guest resolves names through the virtual resolver, so
-				// the file DNS list has no effect.
+				servers, err := normalizeDNSServers(strings.Split(val, ","), true)
+				if err != nil {
+					return WireGuardConfig{}, where(err)
+				}
+				cfg.DNSServers = append(cfg.DNSServers, servers...)
 			case "fwmark", "table", "preup", "postup", "predown", "postdown", "saveconfig":
 				return WireGuardConfig{}, where(fmt.Errorf("[Interface] key %q is not supported", key))
 			default:

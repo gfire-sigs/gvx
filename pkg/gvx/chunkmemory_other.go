@@ -16,6 +16,9 @@
 
 package gvx
 
-// sharedChunkMemory is false on Windows and macOS. Their platforms map guest
-// pages by host pointer, so hostfs keeps chunks on the Go heap.
-const sharedChunkMemory = false
+import "runtime"
+
+// sharedChunkMemory is true on Windows and false on macOS. The Windows systrap
+// platform maps writable guest pages by the host handle of the memory file,
+// whereas macOS platforms map guest pages by host pointer.
+const sharedChunkMemory = runtime.GOOS == "windows"

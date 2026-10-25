@@ -204,3 +204,124 @@ func TCR(ips uint64) uint64 {
 	)
 	return t0sz | irgn0 | orgn0 | sh0 | tg0 | t1sz | irgn1 | orgn1 | sh1 | tg1 | ips<<32 | tbi0
 }
+
+// SysRegISS holds the decoded ISS fields of an EC = 0x18 (MRS, MSR, or SYS)
+// exception syndrome.
+type SysRegISS struct {
+	Read                    bool
+	Rt                      uint32
+	Op0, Op1, CRn, CRm, Op2 uint32
+}
+
+// DecodeSysRegISS extracts the instruction fields from ESR_EL1 when EC is 0x18.
+func DecodeSysRegISS(esr uint64) SysRegISS {
+	return SysRegISS{
+		Read: esr&1 != 0,
+		Rt:   uint32(esr >> 5 & 0x1f),
+		CRm:  uint32(esr >> 1 & 0xf),
+		CRn:  uint32(esr >> 10 & 0xf),
+		Op1:  uint32(esr >> 14 & 0x7),
+		Op2:  uint32(esr >> 17 & 0x7),
+		Op0:  uint32(esr >> 20 & 0x3),
+	}
+}
+
+// Key returns the packed (op0, op1, CRn, CRm, op2) identifier of s.
+func (s SysRegISS) Key() uint32 {
+	return s.Op0<<14 | s.Op1<<11 | s.CRn<<7 | s.CRm<<3 | s.Op2
+}
+
+// Packed keys of the system registers that EL0 reads and the hypervisor
+// backends emulate.
+const (
+	KeyMIDR        = 3<<14 | 0<<11 | 0<<7 | 0<<3 | 0
+	KeyREVIDR      = 3<<14 | 0<<11 | 0<<7 | 0<<3 | 6
+	KeyIDAA64PFR0  = 3<<14 | 0<<11 | 0<<7 | 4<<3 | 0
+	KeyIDAA64PFR1  = 3<<14 | 0<<11 | 0<<7 | 4<<3 | 1
+	KeyIDAA64ISAR0 = 3<<14 | 0<<11 | 0<<7 | 6<<3 | 0
+	KeyIDAA64ISAR1 = 3<<14 | 0<<11 | 0<<7 | 6<<3 | 1
+	KeyIDAA64MMFR0 = 3<<14 | 0<<11 | 0<<7 | 7<<3 | 0
+	KeyIDAA64MMFR1 = 3<<14 | 0<<11 | 0<<7 | 7<<3 | 1
+	KeyIDAA64MMFR2 = 3<<14 | 0<<11 | 0<<7 | 7<<3 | 2
+	KeyCTREL0      = 3<<14 | 3<<11 | 0<<7 | 0<<3 | 1
+	KeyCNTPCT      = 3<<14 | 3<<11 | 14<<7 | 0<<3 | 1
+	KeyCNTVCT      = 3<<14 | 3<<11 | 14<<7 | 0<<3 | 2
+)
+
+// ID register fields hidden from the guest when the backend does not
+// virtualize scalable vectors, memory tagging, or pointer authentication.
+const (
+	IDAA64PFR0Hide  uint64 = 0xf<<32 | 0xff<<40
+	IDAA64PFR1Hide  uint64 = 0xf<<8 | 0xf<<16 | 0xf<<24 | 0xf<<40
+	IDAA64ISAR1Hide uint64 = 0xf<<4 | 0xf<<8 | 0xf<<24 | 0xf<<28
+)
+
+// Baseline architectural register values used when a backend does not query
+// host hardware ID registers directly.
+const (
+	DefaultMIDREL1        uint64 = 0x410fd030
+	DefaultIDAA64PFR0EL1  uint64 = 0x00000011
+	DefaultIDAA64ISAR0EL1 uint64 = 0x00211120
+	DefaultIDAA64MMFR0EL1 uint64 = 0x00100005
+	DefaultCTREL0         uint64 = 0x8444c004
+)
+
+// IDRegisters holds the values that EL0 reads of the ID registers, CTR_EL0,
+// and the physical/virtual counters return.
+type IDRegisters struct {
+	MIDR, PFR0, PFR1    uint64
+	ISAR0, ISAR1        uint64
+	MMFR0, MMFR1, MMFR2 uint64
+	CTR                 uint64
+	Counter             func() uint64
+}
+
+// DefaultIDRegisters returns an IDRegisters populated with baseline ARMv8-A
+// feature values and 64-byte cache line geometry.
+func DefaultIDRegisters() IDRegisters {
+	return IDRegisters{
+		MIDR:  DefaultMIDREL1,
+		PFR0:  DefaultIDAA64PFR0EL1,
+		ISAR0: DefaultIDAA64ISAR0EL1,
+		MMFR0: DefaultIDAA64MMFR0EL1,
+		CTR:   DefaultCTREL0,
+	}
+}
+
+// EmulateSysRegRead returns the value a trapped MRS must produce. It reports
+// false for writes and for registers that must raise SIGILL at EL0.
+func (ids *IDRegisters) EmulateSysRegRead(iss SysRegISS) (uint64, bool) {
+	if !iss.Read {
+		return 0, false
+	}
+	switch iss.Key() {
+	case KeyMIDR:
+		return ids.MIDR, true
+	case KeyREVIDR:
+		return 0, true
+	case KeyIDAA64PFR0:
+		return ids.PFR0 &^ IDAA64PFR0Hide, true
+	case KeyIDAA64PFR1:
+		return ids.PFR1 &^ IDAA64PFR1Hide, true
+	case KeyIDAA64ISAR0:
+		return ids.ISAR0, true
+	case KeyIDAA64ISAR1:
+		return ids.ISAR1 &^ IDAA64ISAR1Hide, true
+	case KeyIDAA64MMFR0:
+		return ids.MMFR0, true
+	case KeyIDAA64MMFR1:
+		return ids.MMFR1, true
+	case KeyIDAA64MMFR2:
+		return ids.MMFR2, true
+	case KeyCTREL0:
+		if ids.CTR != 0 {
+			return ids.CTR, true
+		}
+		return DefaultCTREL0, true
+	case KeyCNTPCT, KeyCNTVCT:
+		if ids.Counter != nil {
+			return ids.Counter(), true
+		}
+	}
+	return 0, false
+}

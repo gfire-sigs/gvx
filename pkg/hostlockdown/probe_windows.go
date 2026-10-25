@@ -101,3 +101,24 @@ func openUnlistedPaths(paths []string) error {
 	}
 	return nil
 }
+
+// probeRestrictedSocketBlocked binds token to a scratch thread and verifies
+// that creating a new TCP socket via WSASocket fails.
+func probeRestrictedSocketBlocked(token windows.Token) error {
+	result := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		if err := windows.SetThreadToken(nil, token); err != nil {
+			result <- fmt.Errorf("hostlockdown: SetThreadToken on socket probe thread: %w", err)
+			return
+		}
+		s, err := windows.WSASocket(windows.AF_INET, windows.SOCK_STREAM, windows.IPPROTO_TCP, nil, 0, windows.WSA_FLAG_OVERLAPPED)
+		if err == nil {
+			_ = windows.Closesocket(s)
+			result <- errors.New("hostlockdown: restricted token created a TCP socket")
+			return
+		}
+		result <- nil
+	}()
+	return <-result
+}

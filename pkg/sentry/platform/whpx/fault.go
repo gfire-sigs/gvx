@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // si_code values of SIGSEGV, SIGBUS, SIGILL and SIGFPE. The linux package
@@ -216,6 +217,28 @@ func classifyA64(slot, esr, far, pc uint64) (trap, error) {
 		t.signo, t.code = linux.SIGILL, illIllTrp
 	}
 	return t, nil
+}
+
+// emulateA64SysReg emulates an EL0 read of an ARM64 ID register or CTR_EL0 when
+// the lower-EL synchronous exception has EC = 0x18. It writes the result into
+// comm.Regs and reports true when the guest should skip the trapped instruction
+// and resume.
+func emulateA64SysReg(comm *CommPage, ids *hvcommon.IDRegisters) bool {
+	if comm.Vector != hvcommon.SlotLowerSync {
+		return false
+	}
+	if comm.FaultCode>>esrECShift&0x3F != esrECSysReg {
+		return false
+	}
+	iss := hvcommon.DecodeSysRegISS(comm.FaultCode)
+	val, ok := ids.EmulateSysRegRead(iss)
+	if !ok {
+		return false
+	}
+	if iss.Rt < 31 {
+		comm.Regs[iss.Rt] = val
+	}
+	return true
 }
 
 // a64AccessType decodes the access of a data or instruction abort from ESR_EL1.

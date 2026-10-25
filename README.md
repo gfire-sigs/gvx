@@ -17,7 +17,7 @@ Running Linux binaries or container images on Windows and macOS usually forces a
 | **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
 | **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
 
-The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry was offline. A reachable registry adds about one second for the tag check. Only `hvf` and `systrap` on `darwin/arm64` are executed in this repository.
+The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry was offline. A reachable registry adds about one second for the tag check. CI executes `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
 ```mermaid
 flowchart LR
@@ -40,7 +40,7 @@ Run an unmodified OCI image or ELF binary from the CLI via `cmd/rungv`, or embed
 Use these steps to compile `rungv` and run an unmodified OCI image on Windows or macOS:
 
 > [!IMPORTANT]
-> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On Linux, build with `CGO_ENABLED=0`. The upstream systrap platform hangs in a cgo build. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
+> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or use `-platform=systrap` without it. On Linux, build with `CGO_ENABLED=0` because the upstream `systrap` platform hangs in a cgo build. On macOS, sign the binary with `entitlements.plist` for `hvf`, and build with `-tags pagesize_16k` for `systrap`.
 
 1. Build `rungv` with the standard Go 1.25+ toolchain (and apply ad-hoc signing on macOS for `hvf`).
 2. Run an unmodified OCI image (`nginx:alpine`) with `-p 8080:80` port forwarding and `-net=nat` networking.
@@ -167,7 +167,9 @@ Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path s
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
-`systrap` runs on macOS `arm64` and on Windows. The macOS engine needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). The macOS engine cannot load an `ET_EXEC` image, because every `arm64` task has a 4GB `PAGEZERO`. Run such an image with `-platform=hvf`. The Windows engine runs on `amd64` and `arm64`, needs no hypervisor, and puts the guest above 16TB. It also holds the range from `0x10000` to `0x7FFE0000`, so an `ET_EXEC` image runs at the address that it links to. [`docs/systrap-windows.md`](docs/systrap-windows.md) records its measurements, design, and limits. The engine is not a syscall sandbox on Windows. On macOS `amd64`, the project dropped the Rosetta 2 engine. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
+`systrap` runs on macOS `arm64` and on Windows. The macOS engine needs `-tags pagesize_16k`; without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). By default, the macOS engine rejects an `ET_EXEC` image because every `arm64` task has a 4GB `PAGEZERO`. Run such an image with `-platform=hvf` or set `GVX_SYSTRAP_FIXED_IMAGES=1` for prototype zone mode.
+
+The Windows `systrap` engine runs on `amd64` and `arm64`, needs no hypervisor, and places the guest above 16TB. It also holds the range from `0x10000` to `0x7FFE0000`, so an `ET_EXEC` image runs at its linked address. [`docs/systrap-windows.md`](docs/systrap-windows.md) records its measurements, design, and limits. The engine is not a syscall sandbox on Windows. On macOS `amd64`, the project dropped the Rosetta 2 engine because a Seatbelt syscall filter on a translated process panicked XNU. `gvx` contains no instruction interpreter and no JIT.
 
 ### 3.2 Dual-Track Netstack and Port Forwarding (`pkg/netbackend`)
 
@@ -175,7 +177,7 @@ Guest applications (`nginx`, `postgres`, `git`, `curl`, `omp`, `herdr`) invoke `
 
 In Track A (`-net=nat`, default), `tcp.NewForwarder` and `udp.NewForwarder` dial outbound streams through Go's `net.DialContext` (backed by Windows IOCP and macOS `kqueue`). Outbound connections to `10.0.2.2` (`host.docker.internal`) route to the host's `127.0.0.1`, while inbound `-p hostPort:guestPort` listeners forward host traffic into Netstack via `gonet.DialTCP`. Callers can attach host-side L4/L7 proxies for LLM API key injection or pass `-isolate-lan` when untrusted workloads require RFC1918 blocking.
 
-In Track B (`-net=wg`), a Netstack `channel.Endpoint` pipes raw L3 IP packets directly in memory into `golang.zx2c4.com/wireguard/device` without `WinTun.dll` or `/dev/tun`. `wireguard-go` encrypts every packet in memory and transmits it through one pre-opened host UDP socket, physically blocking all access to the host LAN.
+In Track B (`-net=wg`), a Netstack `channel.Endpoint` pipes raw L3 IP packets directly in memory into `golang.zx2c4.com/wireguard/device` without `WinTun.dll` or `/dev/tun`. `wireguard-go` encrypts every packet in memory and transmits it through one pre-opened host UDP socket, physically blocking all access to the host LAN. Both Track A and Track B attach the virtual DNS relay at `10.0.2.3:53`.
 
 ### 3.3 Unmodified Multi-Arch OCI Image Runner (`pkg/oci`)
 
@@ -193,7 +195,7 @@ On Windows, every open call sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHAR
 
 After opening the hypervisor handle, cached `.erofs` layers, `-p` / `-net=wg` sockets, and `/workspace` `os.Root`, `pkg/hostlockdown` locks down the host process before guest entry. `rungv` and `pkg/gvx` enable the lockdown by default. `hostlockdown.Apply` returns an error when a self-probe shows that the lockdown did not take effect.
 
-On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` and lowers the primary token to `Low Integrity`. It also binds a `SE_GROUP_USE_FOR_DENY_ONLY` token to vCPU threads, enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, and sets `DisallowWin32kSystemCalls = 1`. These Windows steps are compile-checked only.
+On Windows (`lockdown_windows.go`), it restricts the primary token DACL, removes privileges via `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)`, and binds a Low-Integrity deny-only token to runtime threads. It also enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, sets `DisallowWin32kSystemCalls = 1`, and installs a Winsock outbound hook for `-net=none` and `-net=wg`. CI verifies these steps on `windows/amd64` and `windows/arm64`.
 
 On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(deny default)` Seatbelt profile through `sandbox_init`. The profile denies process creation and new host file opens. After `Apply`, `getaddrinfo` and reads of `/etc/resolv.conf` fail, so `pkg/netbackend` reads the DNS resolvers before the lockdown.
 
@@ -205,7 +207,7 @@ On Linux (`lockdown_linux.go` and `pkg/gvx/syscallfilter_linux.go`), it installs
 
 `tools/upstream` widens `//go:build linux` tags on allowlisted Sentry files after each `git merge upstream/go`, and it fences Linux-only files from the new targets. `-mode=audit` compares the tree with the pinned upstream archive and checks the SPEC import boundaries.
 
-The merged-tree audit at `0d0ef55` charged 16 of 2485 files (0.64%) against the `< 0.7%` ceiling. The charged share excludes Linux fences; the audit also reports a strict count that includes them.
+The audit charges modified upstream files against the `< 1.0%` ceiling. The charged share excludes Linux fences; the audit also reports a strict count that includes them.
 
 ### 3.7 Optional Containerd Control Adapter
 
@@ -266,7 +268,7 @@ go run ./tools/upstream -mode=audit -max-ratio=0.01
 go test -race -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/platform/systrap/...
 ```
 
-GitHub Actions verifies every change. The workflow `ci.yml` builds and vets all five targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner has no hypervisor, so it runs the `systrap` suites with `-tags pagesize_16k`. The workflow `e2e-images.yml` pulls real images once a week.
+GitHub Actions verifies every change. The workflow `ci.yml` builds and vets all five targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. A hosted macOS runner and the `windows-11-arm` runner have no hypervisor, so they run the `systrap` suites. The workflow `e2e-images.yml` pulls real images once a week.
 
 ### 5.2 Implementation Roadmap (`M1` to `M5`)
 

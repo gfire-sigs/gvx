@@ -196,14 +196,11 @@ jobs:
         run: go test -count=1 $OWNED
       - name: Test the systrap engine and the Sentry on it
         shell: bash
-        # The engine needs no hypervisor. The e2e tests that check the host
-        # lockdown fail on the hosted runner for the hardware backend as well,
-        # so the run skips them.
         env:
           GVX_E2E_OFFLINE: "1"
         run: |
           go test -count=1 ./pkg/sentry/platform/systrap/
-          go test -count=1 -skip 'HostLockdown' -run 'Systrap|systrap|Stub' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+          go test -count=1 -run 'Systrap|systrap|Stub|HostLockdown' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
       - name: Report the hypervisor state of the runner
         shell: pwsh
         continue-on-error: true
@@ -249,4 +246,4 @@ jobs:
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
-        run: go test -count=1 -skip 'HostLockdown' -run 'Systrap|systrap|Stub' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+        run: go test -count=1 -run 'Systrap|systrap|Stub|HostLockdown' ./pkg/gvx/ ./cmd/rungv/ ./e2e/

@@ -341,13 +341,14 @@ func TestLazyPatchOnce(t *testing.T) {
 		}
 		off := target - isl.base
 		slot := pageBytes(isl.page)[off:]
-		if got := binary.LittleEndian.Uint32(slot); got != arm64STPx16x17 {
-			t.Errorf("slot of site %d starts with %#x, want stp x16, x17, [sp, #-512]", idx, got)
+		const wantPtr0 = arm64MRSTPIDRRO | arm64ScratchReg
+		if got := binary.LittleEndian.Uint32(slot); got != wantPtr0 {
+			t.Errorf("slot of site %d starts with %#x, want mrs x18, tpidrro_el0 (%#x)", idx, got, uint32(wantPtr0))
 		}
-		if got := binary.LittleEndian.Uint32(slot[trapSlotTailOffset:]); got != arm64LDPx16x17 {
-			t.Errorf("slot tail of site %d is %#x, want ldp x16, x17, [sp, #-512]", idx, got)
+		if got := binary.LittleEndian.Uint32(slot[trapSlotTailOffset:]); got != wantPtr0 {
+			t.Errorf("slot tail of site %d starts with %#x, want mrs x18, tpidrro_el0 (%#x)", idx, got, uint32(wantPtr0))
 		}
-		back, ok := decodeBranch(target+trapSlotTailOffset+4, binary.LittleEndian.Uint32(slot[trapSlotTailOffset+4:]))
+		back, ok := decodeBranch(target+trapSlotTailOffset+16, binary.LittleEndian.Uint32(slot[trapSlotTailOffset+16:]))
 		if !ok || back != codeVA+uint64(idx)*4+4 {
 			t.Errorf("slot of site %d returns to %#x, want %#x", idx, back, codeVA+uint64(idx)*4+4)
 		}
@@ -1355,5 +1356,52 @@ func TestAnonymousCodeKeepsItsDataWords(t *testing.T) {
 	}
 	if got := runWith(t, 0, false); got == dataWord {
 		t.Errorf("undescribed mapping: the guest read %#x, which means that the whole-block scan did not run", got)
+	}
+}
+
+func TestIslandSlotsReclaimedOnRepatchAndUnmap(t *testing.T) {
+	p := newPlatform(t)
+	r := newRig(t, p)
+	mem := r.mapPage(dataVA, hostarch.AccessType{Read: true, Write: true, Execute: true})
+	words := []uint32{movz(8, 10), insnSVC0}
+	for i := 0; i < 64; i++ {
+		words = append(words, insnSVC0)
+	}
+	for i, w := range words {
+		binary.LittleEndian.PutUint32(mem[i*4:], w)
+	}
+	r.regs().Pc = dataVA
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 10, r.ac)
+
+	// Each patch of dataVA allocates 65 trap slots (65 * 56 = 3640 bytes).
+	// Ten repatches exceed a 16KB island (16384 bytes) unless restoreData
+	// reclaims the block's slots.
+	const rounds = 10
+	for i := 0; i < rounds; i++ {
+		if ok, err := r.as.restoreData(dataVA); !ok || err != nil {
+			t.Fatalf("round %d: restoreData = (%v, %v), want (true, nil)", i, ok, err)
+		}
+		r.regs().Pc = dataVA
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 10, r.ac)
+	}
+
+	r.as.mu.Lock()
+	islandCount := len(r.as.islands)
+	r.as.mu.Unlock()
+	if islandCount != 1 {
+		t.Fatalf("islands allocated after %d repatches = %d, want 1", rounds, islandCount)
+	}
+
+	r.as.Unmap(hostarch.Addr(dataVA), blockSize)
+	r.as.mu.Lock()
+	defer r.as.mu.Unlock()
+	for base, isl := range r.as.islands {
+		for wIdx, bits := range isl.usedBits {
+			if bits != 0 {
+				t.Errorf("island %#x word %d has usedBits %#x after Unmap, want 0", base, wIdx, bits)
+			}
+		}
 	}
 }

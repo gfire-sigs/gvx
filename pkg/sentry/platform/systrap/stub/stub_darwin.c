@@ -38,6 +38,7 @@ _Static_assert(offsetof(struct gv_sysmsg, waiter) == SM_WAITER, "waiter");
 _Static_assert(offsetof(struct gv_sysmsg, alt) == SM_ALT, "alt");
 _Static_assert(offsetof(struct gv_sysmsg, x18) == SM_X18, "x18");
 _Static_assert(offsetof(struct gv_sysmsg, spill) == SM_SPILL, "spill");
+_Static_assert(offsetof(struct gv_sysmsg, scratch) == SM_SCRATCH, "scratch");
 _Static_assert(offsetof(struct gv_sysmsg, fmc) == SM_FMC, "fmc");
 _Static_assert(sizeof(struct gv_sysmsg) <= GV_SYSMSG_SIZE, "sysmsg size");
 _Static_assert(sizeof(_STRUCT_MCONTEXT64) == MC_SIZE, "mcontext size");

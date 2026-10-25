@@ -25,10 +25,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
-	"z.gfire.dev/gvx/pkg/usermem"
 )
 
 // zoneFault handles the faults that the zone mode causes. It returns false for
@@ -56,7 +54,19 @@ func (c *Context) zoneFault(ctx context.Context, mm platform.MemoryManager, as *
 		if !ok || meta.kind != siteMem || ec != ecDataAbort {
 			return signalAction{}, false
 		}
-		if (pc-start)/4 == uint64(meta.body) {
+		wordIdx := (pc - start) / 4
+		if meta.scratch&memFixesValue != 0 && far < faultLowLimit {
+			if wordIdx < uint64(meta.body) {
+				sm.MC.SS.PC = start
+				return signalAction{resume: true}, true
+			}
+			restoreStart := uint64(meta.body) + 2
+			if wordIdx >= restoreStart && wordIdx < restoreStart+4 {
+				sm.MC.SS.PC = start + restoreStart*4
+				return signalAction{resume: true}, true
+			}
+		}
+		if wordIdx == uint64(meta.body) {
 			// The biased copy of the instruction faulted, so the slot has added
 			// the bias to the base register and has not removed it yet.
 			bias := uint64(zoneBias)
@@ -65,9 +75,7 @@ func (c *Context) zoneFault(ctx context.Context, mm platform.MemoryManager, as *
 				far -= zoneBias
 			}
 			if meta.scratch&memFixesValue != 0 {
-				if err := restoreSpilledScratch(ctx, mm, &sm.MC.SS); err != nil {
-					return contextErr(err, unix.EFAULT), true
-				}
+				restoreSpilledScratch(&sm.MC.SS, sm)
 			}
 		}
 		site := meta.site
@@ -144,23 +152,14 @@ func addToRegister(ss *armThreadState, reg uint8, delta uint64) {
 	}
 }
 
-// slotSpillBelowSP is the distance below the guest stack pointer at which a
-// memory slot spills x16 and x17 before it borrows them.
-const slotSpillBelowSP = 512
-
 // restoreSpilledScratch puts the guest values of x16 and x17 back into the
 // thread state. A memory slot that stores its base register spills the two
-// registers below the guest stack pointer, borrows them, and reloads them after
-// the instruction. A fault inside the instruction leaves the borrowed values in
-// the registers.
-func restoreSpilledScratch(ctx context.Context, mm platform.MemoryManager, ss *armThreadState) error {
-	var saved [16]byte
-	if _, err := mm.CopyIn(ctx, hostarch.Addr(ss.SP-slotSpillBelowSP), saved[:], usermem.IOOpts{IgnorePermissions: true}); err != nil {
-		return fmt.Errorf("read the registers that a slot spilled below sp %#x: %w", ss.SP, err)
-	}
-	ss.X[16] = binary.LittleEndian.Uint64(saved[0:])
-	ss.X[17] = binary.LittleEndian.Uint64(saved[8:])
-	return nil
+// registers into the scratch words of the sysmsg, borrows them, and reloads
+// them after the instruction. A fault inside the instruction leaves the
+// borrowed values in the registers.
+func restoreSpilledScratch(ss *armThreadState, sm *sysmsg) {
+	ss.X[16] = sm.Scratch[0]
+	ss.X[17] = sm.Scratch[1]
 }
 
 // zoneMappedAt reports whether the guest maps the block that holds the zone
@@ -206,11 +205,25 @@ func (as *addressSpace) patchSlotWord(ctx context.Context, mm platform.MemoryMan
 	base := blockRound(pc)
 	as.mu.Lock()
 	isl := as.islands[base]
+	var outerStart uint32
+	var outerSite uint64
+	var ok bool
+	if isl != nil {
+		var outer slotMeta
+		outer, outerStart, ok = isl.slotContaining(uint32(pc - isl.base))
+		outerSite = outer.site
+	}
 	as.mu.Unlock()
-	if isl == nil {
+	if isl == nil || !ok {
 		return false, nil
 	}
-	valid := func() bool { return !as.released && as.islands[base] == isl }
+	valid := func() bool {
+		if as.released || as.islands[base] != isl {
+			return false
+		}
+		cur, exists := isl.slots[outerStart]
+		return exists && cur.site == outerSite
+	}
 	return as.installMemSlot(ctx, mm, pc, pageBytes(isl.page), pc-isl.base, valid)
 }
 
@@ -237,9 +250,16 @@ func (as *addressSpace) installMemSlot(ctx context.Context, mm platform.MemoryMa
 	if err != nil {
 		return false, err
 	}
+	ref := slotRef{isl: isl, off: slotOff, size: memSlotSize}
+	freeAllocated := func() {
+		as.mu.Lock()
+		as.freeSlotRefsLocked([]slotRef{ref})
+		as.mu.Unlock()
+	}
 	buf := pageBytes(isl.page)[slotOff:]
 	_, body, err := encodeMemSlot(buf, slotVA, site, insn, acc)
 	if err != nil {
+		freeAllocated()
 		return false, err
 	}
 	meta := slotMeta{site: site, kind: siteMem, reg: acc.base, size: memSlotSize, body: uint8(body)}
@@ -251,6 +271,7 @@ func (as *addressSpace) installMemSlot(ctx context.Context, mm platform.MemoryMa
 	}
 	br, err := encodeBranch(site, slotVA)
 	if err != nil {
+		freeAllocated()
 		return false, err
 	}
 	flushCode(pageBytes(isl.page))
@@ -259,21 +280,46 @@ func (as *addressSpace) installMemSlot(ctx context.Context, mm platform.MemoryMa
 	// alias after it writes a copy, and the slot follows the same sequence
 	// before any thread can branch to it.
 	if err := as.syncStubCode(isl.base); err != nil {
+		freeAllocated()
 		return false, err
 	}
 	as.mu.Lock()
-	if !valid() {
+	owner := as.slotOwnerBlockLocked(site)
+	if !valid() || owner == nil {
 		// The block or the island changed while the Sentry wrote the slot,
 		// and the page behind word can belong to another block by now. The
 		// thread retries at the site and patches the new copy.
+		as.freeSlotRefsLocked([]slotRef{ref})
 		as.mu.Unlock()
 		return true, nil
 	}
 	isl.slots[slotOff] = meta
+	owner.slots = append(owner.slots, ref)
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&word[0])), br)
 	as.mu.Unlock()
 	flushCode(page)
 	return true, as.syncStubCode(blockRound(site))
+}
+
+// slotOwnerBlockLocked returns the execBlock that owns site, or the execBlock
+// that owns the outer slot when site lies inside an island slot. Callers hold
+// as.mu.
+func (as *addressSpace) slotOwnerBlockLocked(site uint64) *execBlock {
+	if blk := as.blocks[blockRound(site)]; blk != nil && blk.state == blockExec {
+		return blk
+	}
+	isl := as.islands[blockRound(site)]
+	if isl == nil {
+		return nil
+	}
+	outer, _, ok := isl.slotContaining(uint32(site - isl.base))
+	if !ok {
+		return nil
+	}
+	if blk := as.blocks[blockRound(outer.site)]; blk != nil && blk.state == blockExec {
+		return blk
+	}
+	return nil
 }
 
 // syncStubCode makes the stub task fetch the code that the Sentry wrote to the

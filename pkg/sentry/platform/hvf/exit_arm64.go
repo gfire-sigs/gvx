@@ -152,94 +152,16 @@ func decodeStage2Abort(syndrome, va, ipa uint64) exitAction {
 }
 
 // sysRegISS holds the fields of the ISS of an EC 0x18 exception.
-type sysRegISS struct {
-	read                    bool
-	rt                      uint32
-	op0, op1, crn, crm, op2 uint32
-}
+type sysRegISS = hvcommon.SysRegISS
 
 func decodeSysRegISS(esr uint64) sysRegISS {
-	return sysRegISS{
-		read: esr&1 != 0,
-		rt:   uint32(esr >> 5 & 0x1f),
-		crm:  uint32(esr >> 1 & 0xf),
-		crn:  uint32(esr >> 10 & 0xf),
-		op1:  uint32(esr >> 14 & 0x7),
-		op2:  uint32(esr >> 17 & 0x7),
-		op0:  uint32(esr >> 20 & 0x3),
-	}
+	return hvcommon.DecodeSysRegISS(esr)
 }
 
-func (s sysRegISS) key() uint32 {
-	return s.op0<<14 | s.op1<<11 | s.crn<<7 | s.crm<<3 | s.op2
-}
-
-// Encodings of the registers that userspace may read, as the key of sysRegISS.
-var (
-	keyMIDR        = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 0, op2: 0}.key()
-	keyREVIDR      = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 0, op2: 6}.key()
-	keyIDAA64PFR0  = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 4, op2: 0}.key()
-	keyIDAA64PFR1  = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 4, op2: 1}.key()
-	keyIDAA64ISAR0 = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 6, op2: 0}.key()
-	keyIDAA64ISAR1 = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 6, op2: 1}.key()
-	keyIDAA64MMFR0 = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 7, op2: 0}.key()
-	keyIDAA64MMFR1 = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 7, op2: 1}.key()
-	keyIDAA64MMFR2 = sysRegISS{op0: 3, op1: 0, crn: 0, crm: 7, op2: 2}.key()
-	keyCNTPCT      = sysRegISS{op0: 3, op1: 3, crn: 14, crm: 0, op2: 1}.key()
-	keyCNTVCT      = sysRegISS{op0: 3, op1: 3, crn: 14, crm: 0, op2: 2}.key()
-)
-
-// ID register fields that this backend hides from the guest.
 const (
-	// ID_AA64PFR0_EL1: SVE, MPAM, AMU.
-	idAA64PFR0Hide uint64 = 0xf<<32 | 0xff<<40
-	// ID_AA64PFR1_EL1: MTE, MPAM_frac, SME, MTE_frac.
-	idAA64PFR1Hide uint64 = 0xf<<8 | 0xf<<16 | 0xf<<24 | 0xf<<40
-	// ID_AA64ISAR1_EL1: APA, API, GPA, GPI (pointer authentication).
-	idAA64ISAR1Hide uint64 = 0xf<<4 | 0xf<<8 | 0xf<<24 | 0xf<<28
+	keyMIDR = hvcommon.KeyMIDR
 )
 
 // idRegisters holds the values that EL0 reads of the ID registers and the
-// system counter. They come
-// from the vCPU, with the features that this backend does not virtualize
-// hidden: scalable vectors, memory tagging, and pointer authentication.
-type idRegisters struct {
-	midr, pfr0, pfr1, isar0, isar1, mmfr0, mmfr1, mmfr2 uint64
-	// counter reads the hardware system counter. Hypervisor.framework traps
-	// EL0 reads of CNTPCT_EL0, so the host answers them.
-	counter func() uint64
-}
-
-// emulateSysRegRead returns the value a trapped MRS must produce. It reports
-// false for writes and for registers that Linux does not expose, so the guest
-// receives SIGILL for them.
-func (ids *idRegisters) emulateSysRegRead(iss sysRegISS) (uint64, bool) {
-	if !iss.read {
-		return 0, false
-	}
-	switch iss.key() {
-	case keyMIDR:
-		return ids.midr, true
-	case keyREVIDR:
-		return 0, true
-	case keyIDAA64PFR0:
-		return ids.pfr0 &^ idAA64PFR0Hide, true
-	case keyIDAA64PFR1:
-		return ids.pfr1 &^ idAA64PFR1Hide, true
-	case keyIDAA64ISAR0:
-		return ids.isar0, true
-	case keyIDAA64ISAR1:
-		return ids.isar1 &^ idAA64ISAR1Hide, true
-	case keyIDAA64MMFR0:
-		return ids.mmfr0, true
-	case keyIDAA64MMFR1:
-		return ids.mmfr1, true
-	case keyIDAA64MMFR2:
-		return ids.mmfr2, true
-	case keyCNTPCT, keyCNTVCT:
-		if ids.counter != nil {
-			return ids.counter(), true
-		}
-	}
-	return 0, false
-}
+// system counter.
+type idRegisters = hvcommon.IDRegisters

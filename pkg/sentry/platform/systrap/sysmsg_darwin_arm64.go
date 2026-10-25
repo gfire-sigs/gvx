@@ -52,9 +52,11 @@ const (
 
 	// tlsOffset is the offset of the virtual TLS word that patched `mrs` slots read.
 	tlsOffset = 24
-	// x18Offset and spillOffset locate the virtual x18 and the scratch spill word.
-	x18Offset   = 912
-	spillOffset = 920
+	// x18Offset, spillOffset and scratchOffset locate the virtual x18 and the
+	// scratch words of the sysmsg.
+	x18Offset     = 912
+	spillOffset   = 920
+	scratchOffset = 928
 
 	// waiterSentry and waiterStub are the bits of sysmsg.Waiter.
 	waiterSentry = 1
@@ -100,6 +102,8 @@ type sysmsg struct {
 	X18 uint64
 	// Spill holds the guest scratch register that a patched x18 slot borrows.
 	Spill uint64
+	// Scratch holds the guest x16 and x17 that a trap or memory slot spills.
+	Scratch [2]uint64
 	// FMC receives the context of a fault, so that a fault inside the reload
 	// code cannot destroy the guest state in MC.
 	FMC mcontext
@@ -153,6 +157,9 @@ func expectedLayout() [layoutWords]uint64 {
 		uint64(unsafe.Offsetof(sm.FMC)),
 	}
 }
+
+var _ = [1]struct{}{}[unsafe.Offsetof(sysmsg{}.Scratch)-scratchOffset]
+var _ = [1]struct{}{}[scratchOffset-trapScratchOffset]
 
 // loadState reads the handoff word with acquire semantics.
 func (sm *sysmsg) loadState() uint32 {

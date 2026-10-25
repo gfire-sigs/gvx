@@ -849,3 +849,63 @@ func TestConcurrentSwitchAndInvalidation(t *testing.T) {
 		t.Error("the page stays mapped")
 	}
 }
+
+func TestSwitchEmulatesSysRegReadsAndRejectsWrites(t *testing.T) {
+	e := newA64Env(t, 0)
+	c, ac := e.newContext()
+	ac.StateData().Regs.Pc = 0x400000
+
+	sysRegISS := func(read bool, rt, op0, op1, crn, crm, op2 uint32) uint64 {
+		dir := uint32(0)
+		if read {
+			dir = 1
+		}
+		return esr(esrECSysReg, uint64(op0<<20|op2<<17|op1<<14|crn<<10|rt<<5|crm<<1|dir))
+	}
+
+	step := 0
+	var sawAfterCTR uint64
+	var sawAfterMIDR uint64
+	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
+		step++
+		comm := e.comm(vp)
+		switch step {
+		case 1:
+			// MRS X3, MIDR_EL1 at 0x400000.
+			e.trap(vp, exit, a64SlotLowA64Sync, sysRegISS(true, 3, 3, 0, 0, 0, 0), 0, 0x400000, nil)
+		case 2:
+			sawAfterMIDR = comm.Regs[3]
+			if comm.PC != 0x400004 {
+				t.Errorf("PC after MIDR_EL1 is %#x, want 0x400004", comm.PC)
+			}
+			// MRS X4, CTR_EL0 at 0x400004.
+			e.trap(vp, exit, a64SlotLowA64Sync, sysRegISS(true, 4, 3, 3, 0, 0, 1), 0, comm.PC, nil)
+		case 3:
+			sawAfterCTR = comm.Regs[4]
+			if comm.PC != 0x400008 {
+				t.Errorf("PC after CTR_EL0 is %#x, want 0x400008", comm.PC)
+			}
+			e.svc(vp, exit, comm.PC+4, nil)
+		}
+		return nil
+	}
+	if sig, _, err := e.switchTo(c, ac); err != nil || sig != nil {
+		t.Fatalf("Switch returned %v, %v", sig, err)
+	}
+	if sawAfterMIDR == 0 {
+		t.Error("MIDR_EL1 read returned zero")
+	}
+	if sawAfterCTR == 0 {
+		t.Error("CTR_EL0 read returned zero")
+	}
+
+	// An MSR write to MIDR_EL1 must still raise SIGILL.
+	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
+		e.trap(vp, exit, a64SlotLowA64Sync, sysRegISS(false, 3, 3, 0, 0, 0, 0), 0, 0x400100, nil)
+		return nil
+	}
+	sig, _, err := e.switchTo(c, ac)
+	if !errors.Is(err, platform.ErrContextSignal) || sig == nil || sig.Signo != int32(linux.SIGILL) {
+		t.Fatalf("MSR write returned (%v, %v), want SIGILL", sig, err)
+	}
+}

@@ -223,12 +223,12 @@ func buildSpill() (winSpillCode, error) {
 	)
 	// The real TPIDR_EL0 of the thread holds the address of its sysmsg.
 	a.emit(a64TPIDR | 16)
-	// Save x0 to x15, then the guest x16 and x17 from below the guest stack.
+	// Save x0 to x15, then the guest x16 and x17 from the sysmsg scratch words.
 	for i := uint32(0); i < 16; i += 2 {
 		a.emit(a64stp(i, i+1, 16, int32(winOffX+8*i)))
 	}
 	a.emit(
-		a64ldp(0, 1, a64SP, -512),
+		a64ldp(0, 1, 16, int32(winOffScratch)),
 		a64stp(0, 1, 16, int32(winOffX+8*16)),
 	)
 	for i := uint32(18); i < 30; i += 2 {
@@ -297,13 +297,12 @@ func buildSpill() (winSpillCode, error) {
 	a.emit(a64cmpW(0, uint32(winStateRunCold)))
 	a.bCond(a64CondEQ, "cold")
 
-	// Hot resume. The words below the guest stack pointer receive the guest x16
-	// and x17 again, because a system call can change those words. The slot
+	// Hot resume. The scratch words of the sysmsg receive the guest x16 and
+	// x17 again, because a system call can change those words. The slot
 	// tail loads them back.
 	a.emit(
 		a64ldp(0, 1, base, int32(winOffX+8*16)),
-		a64ldrX(2, base, winOffSP),
-		a64stp(0, 1, 2, -512),
+		a64stp(0, 1, base, int32(winOffScratch)),
 	)
 	a.emit(restoreCommon(base)...)
 	a.emit(
@@ -356,9 +355,33 @@ func restoreCommon(base uint32) []uint32 {
 }
 
 // encodeWinSlot encodes the trap slot for a patched `svc #0` at site. The slot
-// returns to the instruction after the site.
+// saves x16 and x17 in the scratch words of the thread's winSysmsg through x18
+// and returns to the instruction after the site.
 func encodeWinSlot(buf []byte, slotVA, site, spill uint64) error {
-	return encodeTrapSlot(buf, slotVA, winSiteReturn(site), spill)
+	if len(buf) < winSlotSize {
+		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
+	}
+	back, err := encodeBranch(slotVA+winSlotTailOffset+8, winSiteReturn(site))
+	if err != nil {
+		return err
+	}
+	words := [...]uint32{
+		a64TPIDR | 18,
+		a64stp(16, 17, 18, int32(winOffScratch)),
+		arm64ADRx17 | uint32((winSlotTailOffset-8)>>2)<<5,    // adr x17, tail: byte offset 20.
+		arm64LDRLitx16 | uint32((winSlotLitOffset-12)>>2)<<5, // ldr x16, [pc, +20].
+		a64br(16),
+		a64TPIDR | 18,
+		a64ldp(16, 17, 18, int32(winOffScratch)),
+		back,
+	}
+	for i, w := range words {
+		binary.LittleEndian.PutUint32(buf[i*4:], w)
+	}
+	binary.LittleEndian.PutUint64(buf[winSlotLitOffset:], spill)
+	binary.LittleEndian.PutUint32(buf[40:], arm64NOP)
+	binary.LittleEndian.PutUint32(buf[44:], arm64NOP)
+	return nil
 }
 
 // winTLSSlotSize is the size of the slot that replaces `mrs xN, tpidr_el0`.

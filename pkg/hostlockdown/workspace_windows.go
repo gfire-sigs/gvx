@@ -188,24 +188,19 @@ func (g workspaceGrant) read(path string, isDir bool) (objectState, error) {
 	return st, nil
 }
 
-// addLogonACE grants the current logon SID access. The same update revokes
-// entries of earlier logon sessions: their SIDs never match again, so they
-// would only pile up in the workspace ACLs.
+// addLogonACE grants the current logon SID access without revoking entries of
+// other logon sessions that may share a parent directory concurrently.
 func (g workspaceGrant) addLogonACE(path string, isDir bool, current *windows.ACL) error {
 	inherit := uint32(windows.NO_INHERITANCE)
 	if isDir && !g.noInherit {
 		inherit = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 	}
-	// TrusteeValue holds a raw SID address, so the SIDs stay pinned until the
+	// TrusteeValue holds a raw SID address, so the SID stays pinned until the
 	// ACL is built.
 	var pin runtime.Pinner
 	defer pin.Unpin()
 	pin.Pin(g.logon)
 	entries := []windows.EXPLICIT_ACCESS{sidEntry(g.logon, g.mask, windows.GRANT_ACCESS, inherit)}
-	for _, stale := range staleLogonSIDs(current, g.logon) {
-		pin.Pin(stale)
-		entries = append(entries, sidEntry(stale, 0, windows.REVOKE_ACCESS, windows.NO_INHERITANCE))
-	}
 	merged, err := windows.ACLFromEntries(entries, current)
 	if err != nil {
 		return fmt.Errorf("hostlockdown: build DACL for %q: %w", path, err)

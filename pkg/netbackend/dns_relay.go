@@ -20,13 +20,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
 	"time"
+
+	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
 const (
+	// DefaultDNSPort is the standard UDP and TCP port for the virtual DNS relay.
+	DefaultDNSPort = 53
+
 	dnsHeaderSize = 12
 	dnsTypeA      = 1
 	dnsTypeAAAA   = 28
@@ -88,6 +98,10 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 }
 
 func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
+	serveTCPDNSConn(ctx, conn, nf.handleDNSQuery)
+}
+
+func serveTCPDNSConn(ctx context.Context, conn net.Conn, handle func(context.Context, []byte) []byte) {
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -109,7 +123,7 @@ func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
 		if _, err := io.ReadFull(conn, req); err != nil {
 			return
 		}
-		resp := nf.handleDNSQuery(ctx, req)
+		resp := handle(ctx, req)
 		if len(resp) == 0 {
 			return
 		}
@@ -234,10 +248,14 @@ func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) (
 // exchangeDNS sends req to server over network ("udp" or "tcp") and returns the
 // matching response. The response has a header and the same transaction ID.
 func exchangeDNS(ctx context.Context, network, server string, req []byte) ([]byte, error) {
+	var d net.Dialer
+	return exchangeDNSWithDial(ctx, d.DialContext, network, server, req)
+}
+
+func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, dnsUpstreamTimeout)
 	defer cancel()
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, network, server)
+	conn, err := dial(ctx, network, server)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +305,231 @@ func exchangeDNS(ctx context.Context, network, server string, req []byte) ([]byt
 			return buf[:n:n], nil
 		}
 	}
+}
+
+// dialStackDNS opens a UDP or TCP connection to server through s on Eth0NICID.
+func dialStackDNS(ctx context.Context, s *stack.Stack, network, server string) (net.Conn, error) {
+	ap, err := parseDNSServerAddrPort(server)
+	if err != nil {
+		return nil, err
+	}
+	addr := ap.Addr().Unmap()
+	full := tcpip.FullAddress{
+		NIC:  Eth0NICID,
+		Port: ap.Port(),
+	}
+	proto := ipv4.ProtocolNumber
+	if addr.Is6() {
+		full.Addr = tcpip.AddrFrom16(addr.As16())
+		proto = ipv6.ProtocolNumber
+	} else {
+		full.Addr = tcpip.AddrFrom4(addr.As4())
+	}
+	if network == "tcp" {
+		return gonet.DialContextTCP(ctx, s, full, proto)
+	}
+	return gonet.DialUDP(s, nil, &full, proto)
+}
+
+func parseDNSServerAddrPort(server string) (netip.AddrPort, error) {
+	if ap, err := netip.ParseAddrPort(server); err == nil {
+		return ap, nil
+	}
+	if ip, err := netip.ParseAddr(server); err == nil {
+		return netip.AddrPortFrom(ip.Unmap(), DefaultDNSPort), nil
+	}
+	host, portStr, err := net.SplitHostPort(server)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	var port uint16 = DefaultDNSPort
+	if p, err := net.LookupPort("udp", portStr); err == nil && p > 0 && p <= 65535 {
+		port = uint16(p)
+	}
+	return netip.AddrPortFrom(ip.Unmap(), port), nil
+}
+
+// normalizeDNSServers converts bare IP strings or host:port strings into
+// canonical ip:port entries. Non-IP tokens (such as search domains in wg-quick
+// DNS = lines) are skipped when skipInvalid is true.
+func normalizeDNSServers(raw []string, skipInvalid bool) ([]string, error) {
+	var out []string
+	for _, item := range raw {
+		s := strings.TrimSpace(item)
+		if s == "" {
+			continue
+		}
+		ap, err := parseDNSServerAddrPort(s)
+		if err != nil {
+			if skipInvalid {
+				continue
+			}
+			return nil, fmt.Errorf("invalid DNS server %q: %w", s, err)
+		}
+		out = append(out, ap.String())
+	}
+	return out, nil
+}
+
+func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn, log *slog.Logger) {
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stop()
+
+	buf := make([]byte, 4096)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		req := append([]byte(nil), buf[:n]...)
+		w.dnsWG.Add(1)
+		go func(pkt []byte, peer net.Addr) {
+			defer w.dnsWG.Done()
+			resp := w.handleDNSQuery(ctx, pkt, log)
+			if len(resp) > 0 {
+				_ = conn.SetWriteDeadline(time.Now().Add(defaultDNSTimeout))
+				_, _ = conn.WriteTo(resp, peer)
+			}
+		}(req, addr)
+	}
+}
+
+func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.TCPListener, log *slog.Logger) {
+	stop := context.AfterFunc(ctx, func() {
+		_ = ln.Close()
+	})
+	defer stop()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		w.dnsWG.Add(1)
+		go func(c net.Conn) {
+			defer w.dnsWG.Done()
+			serveTCPDNSConn(ctx, c, func(qctx context.Context, req []byte) []byte {
+				return w.handleDNSQuery(qctx, req, log)
+			})
+		}(conn)
+	}
+}
+
+func (w *WireGuardEndpoint) handleDNSQuery(ctx context.Context, req []byte, log *slog.Logger) []byte {
+	if len(req) < dnsHeaderSize {
+		return nil
+	}
+	txID := binary.BigEndian.Uint16(req[0:2])
+	reqFlags := binary.BigEndian.Uint16(req[2:4])
+	qdCount := binary.BigEndian.Uint16(req[4:6])
+	if qdCount == 0 {
+		return buildDNSErrorResponse(txID, reqFlags, nil, dnsRCodeFmt)
+	}
+	q, err := parseDNSQuestion(req, dnsHeaderSize)
+	if err != nil {
+		return buildDNSErrorResponse(txID, reqFlags, nil, dnsRCodeFmt)
+	}
+	rawQuestion := req[dnsHeaderSize:q.endOff]
+
+	if q.qclass == dnsClassIN && (q.qtype == dnsTypeA || q.qtype == dnsTypeAAAA) {
+		addrs, found, handled, lookupErr := w.lookupLocalAddrs(ctx, q.name)
+		if lookupErr != nil && log != nil {
+			log.Debug("netbackend: WireGuard DNS lookup hook failed", "name", q.name, "error", lookupErr)
+		}
+		if handled {
+			if !found {
+				return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeNX)
+			}
+			return buildDNSAddressResponse(txID, reqFlags, rawQuestion, q.qtype, addrs)
+		}
+	}
+
+	resp, err := w.forwardRawDNSUpstream(ctx, req)
+	if err != nil {
+		if log != nil {
+			log.Debug("netbackend: forward WireGuard DNS query", "name", q.name, "error", err)
+		}
+		return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeSrv)
+	}
+	return resp
+}
+
+func (w *WireGuardEndpoint) lookupLocalAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
+	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
+	switch clean {
+	case "localhost", "localhost.localdomain":
+		return []netip.Addr{
+			netip.MustParseAddr("127.0.0.1"),
+			netip.MustParseAddr("::1"),
+		}, true, true, nil
+	case "gvx":
+		out := []netip.Addr{w.cfg.GuestIPv4.Addr()}
+		if w.cfg.GuestIPv6.IsValid() {
+			out = append(out, w.cfg.GuestIPv6.Addr())
+		}
+		return out, true, true, nil
+	}
+	if w.cfg.LookupHost == nil {
+		return nil, false, false, nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, defaultDNSTimeout)
+	defer cancel()
+	addrs, err = w.cfg.LookupHost(rctx, clean)
+	if err != nil {
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			return nil, false, true, nil
+		}
+		return nil, false, false, err
+	}
+	return addrs, true, true, nil
+}
+
+func (w *WireGuardEndpoint) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
+	if len(w.upstreamDNS) == 0 {
+		return nil, errNoDNSServers
+	}
+	stackDial := func(dctx context.Context, network, server string) (net.Conn, error) {
+		return dialStackDNS(dctx, w.stack, network, server)
+	}
+	var hostDialer net.Dialer
+	dials := []func(context.Context, string, string) (net.Conn, error){
+		hostDialer.DialContext,
+		stackDial,
+	}
+	if len(w.cfg.DNSServers) > 0 {
+		// Explicit WireGuard DNS servers travel inside the tunnel first.
+		dials[0], dials[1] = stackDial, hostDialer.DialContext
+	}
+	var errs []error
+	for _, server := range w.upstreamDNS {
+		for _, dial := range dials {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req)
+			if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
+				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req)
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
+				continue
+			}
+			switch binary.BigEndian.Uint16(resp[2:4]) & dnsRCodeMask {
+			case dnsRCodeSrv, dnsRCodeRefus:
+				errs = append(errs, fmt.Errorf("server %s: rcode %d", server, binary.BigEndian.Uint16(resp[2:4])&dnsRCodeMask))
+				continue
+			}
+			return resp, nil
+		}
+	}
+	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
 func validDNSResponse(msg []byte, txID uint16) bool {

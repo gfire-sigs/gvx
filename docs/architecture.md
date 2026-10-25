@@ -13,10 +13,10 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Priority-0 Dual-OS & Dual-Arch** | Targets `windows/amd64`, `windows/arm64`, and `darwin/arm64` from one codebase. | Compiles and runs native `linux/amd64` and `linux/arm64` ELF64 workloads on Windows and macOS. |
 | **Zero Runtime Elevation** | Runs under a standard user account and locks down the host process before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
 | **Hardware 4KB Paging (`whpx` & `hvf`)** | Uses `WinHvPlatform.dll` (Windows) and `Hypervisor.framework` (macOS) with 4KB EPT and Stage-1/Stage-2 tables. | Bypasses the Windows 64KB `VirtualAlloc` limit and the Apple Silicon 16KB host page limit. |
-| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows (`winsystrap`) runs stub processes that a debug object controls. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
+| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows (`winsystrap`) runs stub processes with `winSysmsg` fast-path islands and debug-object stops. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
 | **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
-| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 0.7% under Section 2.2 audit rules and Go 1.25+ builds without Bazel. |
+| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 1.0% under Section 2.2 audit rules and Go 1.25+ builds without Bazel. |
 
 ```mermaid
 flowchart TD
@@ -32,7 +32,7 @@ flowchart TD
     Net --> NetNAT["pkg/netbackend: Track A (-net=nat L4 Go net NAT & -p Port Forwarder)"]
     Net --> NetWG["pkg/netbackend: Track B (-net=wg L3 channel.Endpoint + wireguard-go)"]
     Platform --> WHPX["platform/whpx (Windows WinHvPlatform.dll: amd64 & arm64)"]
-    Platform --> HVF["platform/hvf (macOS Hypervisor.framework: arm64 & amd64)"]
+    Platform --> HVF["platform/hvf (macOS Hypervisor.framework: arm64)"]
     Platform --> Systrap["platform/systrap (Unified In-Place Syscall Patcher & Stub Subprocess: Linux, macOS, Windows)"]
 ```
 
@@ -40,12 +40,12 @@ flowchart TD
 
 `gvx` pairs hardware virtualization (`whpx` and `hvf`) as the default Tier-1 engine with the `systrap` backend as the user-mode fallback. Linux uses the upstream gVisor platforms.
 
-The `systrap` fallback runs on macOS `arm64` only, and it needs 16KB guest pages (`-tags pagesize_16k`). Windows `systrap` needs a C toolchain with a COFF linker for the stub. The project dropped the Rosetta 2 engine and the whole `darwin/amd64` target. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without that filter would let a guest issue host system calls. The guest architecture must equal the host architecture on every backend.
+The `systrap` fallback runs on macOS `arm64` with 16KB guest pages (`-tags pagesize_16k`) and on Windows `amd64` and `arm64` with 4KB guest pages. The Windows engine re-executes the Sentry binary as the stub process and needs no C toolchain. The project dropped the Rosetta 2 engine and the whole `darwin/amd64` target. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without that filter would let a guest issue host system calls. The guest architecture must equal the host architecture on every backend.
 
 | Host Target | Primary Engine (`whpx` / `hvf`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | `platform/systrap` (`winsystrap`: debug-object stops, `CC 90` syscall patch). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
-| **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | `platform/systrap` (`winsystrap`: debug-object stops, `brk` patch). Runs on hosts without WHP. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
+| **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | `platform/systrap` (`winsystrap`: `winSysmsg` fast path and debug-object stops, `jmp rel32` or `CC 90` patch). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
+| **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | `platform/systrap` (`winsystrap`: `winSysmsg` fast path and debug-object stops, `B` or `brk` patch). Runs on hosts without WHP. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
 | **`darwin/arm64`** (Apple Silicon M1-M5) | `platform/hvf` (`Hypervisor.framework` Stage-1 4KB + Stage-2 16KB) | `platform/systrap` (`darwinsystrap`: 4B `B` Island Patch + `sys_icache_invalidate`), built with `-tags pagesize_16k`. | 16KB Host Page / 16KB Map Granularity | Entitlement `com.apple.security.hypervisor` for `hvf`. Runs `linux/arm64` images. |
 | **`darwin/amd64`** (Intel Mac) | None. | None. | None. | Not supported. The project dropped this target, because no Intel Mac ran the engine. |
 | **`linux/amd64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap`. | 4KB Page | CI builds and tests the packages that `gvx` owns. |
@@ -267,7 +267,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | gVisor Package | Current Linux Dependency | Windows Implementation (`_windows.go`) | macOS Implementation (`_darwin.go`) |
 | :--- | :--- | :--- | :--- |
 | **`pkg/sync`** | `SYS_FUTEX` (`FUTEX_WAIT`, `FUTEX_WAKE`) | `WaitOnAddress`, `WakeByAddressSingle`, `WakeByAddressAll` (`api-ms-win-core-synch-l1-2-0.dll`). | `__ulock_wait` and `__ulock_wake` (`UL_COMPARE_AND_WAIT` in `libSystem.B.dylib`). |
-| **`pkg/memutil` & `pgalloc`** | `memfd_create`, `SYS_MMAP`, `MADV_DONTNEED`, `FALLOC_FL_PUNCH_HOLE` | `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)`, `MapViewOfFile3`, and `DiscardVirtualMemory` (`MEM_RESET`). `MapViewOfFile3` is an export of `kernelbase.dll`, not `kernel32.dll`. `memutil` looks in `kernel32.dll`, so it uses the `MapViewOfFile` fallback on current hosts. | `mmap(MAP_ANON)`, `mach_vm_remap` (multi-view shared aliasing), and `madvise(MADV_FREE)`. |
+| **`pkg/memutil` & `pgalloc`** | `memfd_create`, `SYS_MMAP`, `MADV_DONTNEED`, `FALLOC_FL_PUNCH_HOLE` | `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)`, `MapViewOfFile3` (`kernelbase.dll`, with `MapViewOfFile` fallback), and `DiscardVirtualMemory` (`MEM_RESET`). | `mmap(MAP_ANON)`, `mach_vm_remap` (multi-view shared aliasing), and `madvise(MADV_FREE)`. |
 | **`pkg/sentry/time` & `hostcpu`** | `clock_gettime(CLOCK_MONOTONIC)`, `getcpu` VDSO | `QueryPerformanceCounter` / `QueryPerformanceFrequency` and `GetCurrentProcessorNumber`. | `mach_continuous_time` / `clock_gettime_nsec_np` and `pthread_cpu_number_np`. |
 | **`pkg/fd`** | Raw `int` FDs, `dup3`, `SCM_RIGHTS` | `HostHandle` wrapping `syscall.Handle` with explicit `Close()` ownership. | `HostHandle` wrapping Darwin file descriptors with `fcntl(F_DUPFD_CLOEXEC)`. |
 | **`pkg/fdnotifier`** | `epoll` in edge-triggered mode (`fdnotifier.go`, Linux only). | One table of observed descriptors in `fdnotifier_portable.go`, with no goroutine and no event. `NonBlockingPoll` reports every requested event as ready. | The same table in `fdnotifier_portable.go`. `NonBlockingPoll` calls `poll` once without blocking. |
@@ -277,16 +277,16 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 
 ### 3.2 Primary Hardware Hypervisor Engines: `platform/whpx` (Windows) and `platform/hvf` (macOS)
 
-`platform/whpx` (Windows `WinHvPlatform.dll`) and `platform/hvf` (macOS `Hypervisor.framework`) share one architectural design across `amd64` and `arm64`. Both backends decouple Linux 4KB `mmap(MAP_FIXED)` mappings from the Windows 64KB allocation granularity and the Apple Silicon 16KB host page granularity. Both also use an in-partition Ring-0 (`amd64`) or EL1 (`arm64`) shared communication page to avoid per-syscall register API calls.
+`platform/whpx` (Windows `WinHvPlatform.dll` on `amd64` and `arm64`) and `platform/hvf` (macOS `Hypervisor.framework` on `arm64`) share one architectural design. Both backends decouple Linux 4KB `mmap(MAP_FIXED)` mappings from the Windows 64KB allocation granularity and the Apple Silicon 16KB host page granularity. Both also use an in-partition Ring-0 (`amd64`) or EL1 (`arm64`) shared communication page to avoid per-syscall register API calls.
 
-| Hypervisor Operation | Windows (`platform/whpx` on `amd64` & `arm64`) | macOS (`platform/hvf` on `arm64` & `amd64`) |
+| Hypervisor Operation | Windows (`platform/whpx` on `amd64` & `arm64`) | macOS (`platform/hvf` on `arm64`) |
 | :--- | :--- | :--- |
 | **Privilege / OS Requirement** | Standard user token; `windows/arm64` verifies Windows 11 24H2 (`Build >= 26100.3915`) and `WHvCapabilityCodeFeatures.Arm64Support`. | Standard user token with ad-hoc `com.apple.security.hypervisor` signature (`codesign -s -`). |
 | **Partition Creation** | `WHvCreatePartition` + `WHvSetupPartition` | `hv_vm_create(NULL)` |
 | **4KB Page Granularity Mapping** | Registers each 64MiB arena of `pgalloc.MemoryFile` with the partition once through `WHvMapGpaRange`. `MapFile` and `Unmap` then change only the guest page tables, which hold 4KB or 2MiB entries. | Maps each 1GiB chunk of a `pgalloc.MemoryFile` into Stage-2 IPA once with `HV_MEMORY_READ \| WRITE \| EXEC` via `hv_vm_map`. `MapFile` and `Unmap` then change only Stage-1 (`TTBR0_EL1` with `TCR_EL1.TG0 = 0b00` 4KB granule), which enforces `R/W/X` at 4KB. |
 | **vCPU Execution Call** | `WHvRunVirtualProcessor(partition, vpIndex, ...)` | `hv_vcpu_run(vcpu)` on a dedicated worker thread per vCPU. The worker calls `runtime.LockOSThread()`, because a vCPU belongs to the thread that created it. |
 | **Async Signal Preemption** | `WHvCancelRunVirtualProcessor(partition, vpIndex, 0)` | `hv_vcpus_exit(&vcpu, 1)` |
-| **`amd64` Syscall Trap (`bluepill_x86.go`, `stubgen_x86.go`)** | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT`. | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT` / `VMCALL`. |
+| **`amd64` Syscall Trap (`stubgen_x86.go`)** | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT`. | Not applicable (`darwin/amd64` dropped). |
 | **`arm64` Syscall Trap (`bluepill_arm64.go`, `stubgen_a64.go`)** | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. |
 | **Read-only File Mappings** | Maps read-only host views directly into the partition. | `hv_vm_map` rejects the read-only descriptor of an EROFS image. `hvf` copies those pages into immutable slab pages, and pgalloc memory files map directly. |
 | **Unknown Exit Reason** | Not applicable. | `HV_EXIT_REASON_UNKNOWN` carries no information. The worker resumes the vCPU as it does after a cancellation, and `Switch` fails after 4096 consecutive unknown exits. |
@@ -342,15 +342,15 @@ The upstream package `usertrap` and the message types of `sysmsg` build on every
 
 On Windows, the `whpx` backend writes the root register of the address space on the host. The register is `CR3` on `amd64` and `TTBR0_EL1` on `arm64`. The write happens before a virtual processor runs with a recorded address space that differs from the current one. The reload stub in the guest loads the same value. A kick before the run, a cancel inside the reload stub, and `AddressSpace.Release` invalidate the recorded state of the virtual processor. The first fetch of the reload stub then never walks page tables that `Release` freed.
 
-On Windows, a stub host starts before the lockdown. The host is a copy of the Sentry executable that runs only a request loop. It creates one stub process for each address space. The stub is a suspended copy of the executable, and its entry point never runs. It lives in a one-process job under a Low-integrity token and holds no handle. The Sentry attaches every stub to one debug object. A patched syscall site, a page fault, or a signal raises an exception, and the debug object delivers it to the Sentry. The Sentry reads and writes the registers of the thread, so the stub needs no handler and no shared region. A stop costs about 70 to 190 µs.
+On Windows, a stub host starts before the lockdown. The host is a copy of the Sentry executable that runs only a request loop. It creates one stub process for each address space. The stub is a suspended copy of the executable, and its entry point never runs. It lives in a one-process job under a Low-integrity token. By default, a patched syscall jumps through an island slot into the spill routine, which exchanges registers through a shared `winSysmsg` page and spins or waits on an event pair. The Sentry also attaches every stub to one debug object, which receives page faults, signals, and fallback `CC 90` or `brk` stops.
 
 | `systrap` Subsystem | Windows (`winsystrap`: `amd64` & `arm64`), implemented | macOS (`darwinsystrap`): `arm64` implemented |
 | :--- | :--- | :--- |
 | **Page Granularity** | Reserves the guest window as one placeholder with `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` and maps memory-file pages as 4KB views with `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`. The 64KB limit does not apply to such views. The guest sees 4KB pages. | Needs `hostarch.PageSize` equal to the 16KB host page, so it requires `-tags pagesize_16k`. A build without the tag returns `*ErrUnsupportedPageSize`. The guest sees 16KB pages, and `mach_vm_remap` maps memory-file ranges into the stub task. |
-| **Guest Address Range** | A high window from `0x100000000000` (16TB) to `0x7edfffff0000`, and a low window from `0x10000` to `0x7ffe0000`. The Sentry reserves both before the loader runs, so the loader places stacks, heaps, and DLLs elsewhere. The engine pages occupy the top 64KB of the high window. The memory manager treats the range between the windows as a hole. A Linux `ET_EXEC` image at `0x10000` or `0x400000` loads in the low window. | The range starts above the permanent `PROT_NONE` reservations of the host, which the Sentry reads from the template task. It ends below the `sysmsg` blocks. A Linux `ET_EXEC` image does not load, because every `arm64` task has a 4GB `PAGEZERO`. `rungv` names `-platform=hvf` in its error. The prototype zone mode runs such an image. See section 3.3.1. |
-| **Lazy Execute Page-Trap** | Maps original frames without execute permission. On an execute fault, the Sentry receives the exception through the debug object, patches a private copy of the page, and maps the copy as `PAGE_EXECUTE_READ`. A write to a writable and executable page maps the original frame again. The scan covers the executable sections of the backing ELF file. | Maps `PROT_EXEC` pages read-only. On an instruction abort, the Sentry patches a private copy, flushes the instruction cache with `sys_icache_invalidate`, and promotes the page to `PROT_READ \| PROT_EXEC`. It rewrites only words inside ELF executable sections, because a data word can look like an instruction. |
-| **`amd64` Syscall Patching** | Replaces each decoded `0F 05` with the same-size trap `CC 90`. The scan decodes the page in 16 linear sweeps and patches a site when more than half of the sweeps agree. The Sentry emulates `SYSCALL` at the breakpoint. The patterns A, B, and C are not implemented. | Not applicable. |
-| **`arm64` Trampoline Island & I-Cache Flush** | Replaces `svc #0`, `mrs xN, ctr_el0`, `msr tpidr_el0, xN`, and `ic ivau, xN` in place with `brk` instructions. Windows raises an illegal-instruction exception, and the Sentry emulates the instruction. The engine uses no island and no branch. | Reserves an island through `mm.MMap` within `±120 MB` of the patched page. It replaces `svc #0` with `B <island_slot>` without clobbering `X30 (LR)`. The same patcher rewrites `mrs` and `msr` of `TPIDR_EL0`, reads of `CTR_EL0`, and every instruction that names `X18`. |
+| **Guest Address Range** | A high window from `0x100000000000` (16TB) to `0x7edffdff0000`, and a low window from `0x10000` to `0x7ffe0000`. The Sentry reserves both before the loader runs, so the loader places stacks, heaps, and DLLs elsewhere. The top `0x2010000` bytes of the high window hold the engine pages and the per-thread `winSysmsg` areas. The memory manager treats the range between the windows as a hole. A Linux `ET_EXEC` image at `0x10000` or `0x400000` loads in the low window. | The range starts above the permanent `PROT_NONE` reservations of the host, which the Sentry reads from the template task. It ends below the `sysmsg` blocks. A Linux `ET_EXEC` image does not load, because every `arm64` task has a 4GB `PAGEZERO`. `rungv` names `-platform=hvf` in its error. The prototype zone mode runs such an image. See section 3.3.1. |
+| **Lazy Execute Page-Trap** | Maps original frames without execute permission. On an execute fault, the Sentry receives the exception through the debug object, patches a private copy of the page, and maps the copy as `PAGE_EXECUTE_READ`. A write to a writable and executable page maps the original frame again and reclaims its island slots. The scan covers the executable sections of the backing ELF file. | Maps `PROT_EXEC` pages read-only. On an instruction abort, the Sentry patches a private copy, flushes the instruction cache with `sys_icache_invalidate`, and promotes the page to `PROT_READ \| PROT_EXEC`. It rewrites only words inside ELF executable sections, because a data word can look like an instruction. |
+| **`amd64` Syscall Patching** | Decodes the page in 16 linear sweeps and patches a site when more than half agree. With the fast path on, replaces `syscall` and the next three bytes with `jmp rel32` to a trampoline island slot when relocation rules hold, and keeps `CC 90` otherwise. | Not applicable. |
+| **`arm64` Trampoline Island & I-Cache Flush** | Reserves a 4KB island within `±120 MB` of the patched page. With the fast path on, replaces `svc #0` with `B <island_slot>` and `mrs xN, tpidr_el0` with a 16-byte slot branch; replaces `mrs xN, ctr_el0`, `msr tpidr_el0, xN`, and `ic ivau, xN` with `brk` traps, and replaces `dc` cache-clean instructions with `nop`. Reclaims island slots via a bitmap on unmap or restore. | Reserves an island through `mm.MMap` within `±120 MB` of the patched page. It replaces `svc #0` with `B <island_slot>` without clobbering `X30 (LR)` and reclaims slots via a bitmap on unmap or restore. The same patcher rewrites `mrs` and `msr` of `TPIDR_EL0`, reads of `CTR_EL0`, and every instruction that names `X18`. |
 | **Register Virtualization** | `amd64`: Windows resets the FS base at every context switch. The engine loads it through a trampoline at each start and repairs a faulting `%fs` access. `arm64`: Windows keeps `x18` and `TPIDR_EL0` across stops. A routine in the engine page writes `TPIDR_EL0`. | The kernel clobbers `TPIDR_EL0` on preemption and zeroes `X18` on every return from an exception. The `sysmsg` block holds both guest values, and patched slots read and write them there. |
 | **Unpatched Syscall Safety Net** | Not installed. The kernel calls `ProcessInstrumentationCallback` only after it ran the NT service, so the hook cannot stop a missed site. On `arm64`, a scan of every aligned word in guest pages removes every `svc` before it can run. | Each stub task applies a strict Seatbelt profile that allows only the host system calls that the stub needs. The kernel kills the stub on any other call, and the Sentry reports a dead stub. A Mach exception port cannot replay an unpatched `svc #0`, because XNU runs it as a host system call. |
 | **Cross-Arch Container Execution** | Running `GOARCH=amd64` `rungv` (`-platform=systrap`) on `windows/arm64` would invoke Windows 11 24H2 Prism. Not implemented. | Dropped. Rosetta 2 would run a translated stub, and a syscall-number Seatbelt filter on a translated process panicked the host kernel. |
@@ -381,6 +381,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Guest as Guest Thread (Stub Process)
+    participant Island as Trampoline Island & Spill Routine
+    participant WinSysmsg as Shared winSysmsg Page & Events
     participant Debug as Debug Object
     participant Sentry as Go Sentry Kernel Process
 
@@ -389,12 +391,13 @@ sequenceDiagram
     Debug->>Sentry: Exception event
     Sentry->>Guest: Patch a private copy, map it as PAGE_EXECUTE_READ, and continue the thread
 
-    Note over Guest,Sentry: Every Syscall
-    Guest->>Debug: brk (arm64) or int3 (amd64) at the patched site
-    Debug->>Sentry: Exception event
-    Sentry->>Guest: GetThreadContext, NtSuspendThread, and NtDebugContinue (the thread parks)
-    Sentry->>Sentry: Dispatch the Linux syscall
-    Sentry->>Guest: SetThreadContext and NtResumeThread
+    Note over Guest,Sentry: Fast-Path Syscall (Default)
+    Guest->>Island: B <slot> (arm64) or jmp rel32 <slot> (amd64)
+    Island->>WinSysmsg: Spill GPRs, flags, and vector state; set Trapped
+    Island->>Sentry: Spin or signal guest event and wait
+    Sentry->>WinSysmsg: Read arguments, dispatch Linux syscall, write return state
+    Sentry->>Island: Set RunHot or RunCold and signal host event
+    Island->>Guest: Reload registers and return through slot tail
 ```
 
 #### 3.3.1 Zone Mode for Fixed-Address Executables on macOS (Descriptive Module)
@@ -409,7 +412,7 @@ A fetch at an unbiased address continues at the biased address. A fault inside a
 
 The Go runtime compares every return address with the code range in its module data. The zone mode therefore adds the bias to that range and to the base of the text section map. It also adds the bias to the function values in the section `.go.func`. The Sentry writes those words before the guest runs. An `adr` or `adrp` that yields a Go code address keeps the biased value. The adjustment follows the layout of Go 1.27, and other versions are untested.
 
-The prototype has limits. Return addresses stay biased, so an unwinder that compares them with a function pointer finds no match. The slot adds two branches to each access of the image. The trap slot of the engine saves `x16` and `x17` 512 bytes below the guest stack pointer. Go assembly keeps live words just below it.
+The prototype has limits. Return addresses stay biased, so an unwinder that compares them with a function pointer finds no match. The slot adds two branches to each access of the image. The trap slot of the engine saves `x16` and `x17` in the per-thread `sysmsg.Scratch` words without touching the guest stack.
 
 A `blr` slot biases a copy of the pointer in `x16`, so the pointer register keeps its guest value. A `br` slot changes the pointer register, because the slot cannot restore it after the jump. The Sentry writes a slot and then re-applies the permission of the stub mapping. It also asks the kernel to synchronize the instruction cache of the stub task. A store into a block that is both writable and executable restores the writable frame. When the store comes from the same block, the Sentry runs the store and writes both copies of the block.
 
@@ -475,11 +478,11 @@ In `-net=nat` mode, `nat_forwarder.go` registers `tcp.NewForwarder` and `udp.New
 
 For inbound port forwarding (`-p hostPort:guestPort`), `port_forwarder.go` binds host `net.Listener` and `net.PacketConn` sockets before `hostlockdown.Apply()` executes. When a host client connects to a published port (`127.0.0.1:8080`), `port_forwarder.go` calls `gonet.DialTCP` into Netstack (`10.0.2.15:80`) and relays both streams. Go's `internal/poll` runtime multiplexes host sockets over Windows IOCP and macOS `kqueue` without custom C socket loops. Optional L4/L7 stream interceptors attach at the outbound forwarder boundary to inject host-held LLM API keys without exposing secrets inside the guest environment.
 
-A DNS relay (`dns_relay.go`) answers guest queries to `10.0.2.3` through the host resolvers. The relay reads the resolver addresses before `hostlockdown.Apply()` executes, because the macOS profile denies `getaddrinfo` and reads of `/etc/resolv.conf` afterwards. The relay has no fixed public resolver address.
+A DNS relay (`dns_relay.go`) answers guest queries to `10.0.2.3` through the host resolvers in both `-net=nat` and `-net=wg` modes. The relay reads the resolver addresses before `hostlockdown.Apply()` executes, because the macOS profile denies `getaddrinfo` and reads of `/etc/resolv.conf` afterwards. The relay has no fixed public resolver address.
 
 #### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go`) (Descriptive Module)
 
-In `-net=wg` mode, `wireguard_endpoint.go` attaches a Netstack `channel.Endpoint` (MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wireguard_tun.go` adapts the endpoint to a `tun.Device`, and `wireguard_bind.go` adapts the pre-bound socket to a `conn.Bind`. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to the WireGuard bind interface. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption. Encrypted packets exit exclusively through that pre-bound UDP socket to the configured WireGuard or Tailscale peer.
+In `-net=wg` mode, `wireguard_endpoint.go` attaches a Netstack `channel.Endpoint` (MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wireguard_tun.go` adapts the endpoint to a `tun.Device`, and `wireguard_bind.go` adapts the pre-bound socket to a `conn.Bind`. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to the WireGuard bind interface. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption. Encrypted packets exit exclusively through that pre-bound UDP socket to the configured WireGuard or Tailscale peer. Guest DNS queries to `10.0.2.3:53` resolve through the virtual DNS relay (`dns_relay.go`).
 
 ### 3.6 Unmodified Multi-Arch OCI Image Runner: `pkg/oci`
 
@@ -526,7 +529,7 @@ When the rename fails, the registry reopens the files at the old path. A file th
 
 A lookup result stays valid for 1 second without a host call. A positive result and a missing name follow that rule. A guest mutation of the entry, of a hard link to it, or of its parent drops the result at once. A change by a host process shows up after 1 second at the latest. The Windows host reports the case of a name through `finalPathLeaf`, so `hostfs` skips the second case check there.
 
-A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware backends and the macOS `systrap` engine map a guest page by host pointer, so `hostfs` keeps each chunk on the Go heap. The upstream Linux `systrap` platform runs guest code in stub processes and maps a guest page by the descriptor of a memory file. On Linux, `pkg/gvx` therefore passes the kernel memory file to `Workspace.SetChunkMemory`, and `hostfs` allocates each chunk there. `hostfs` invalidates the mappings of a truncated file before it drops its reference to a chunk.
+A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware backends and the macOS `systrap` engine map a guest page by host pointer, so `hostfs` keeps each chunk on the Go heap on macOS. The Linux and Windows `systrap` engines run guest code in stub processes and map a guest page by the descriptor or section of the kernel memory file. On Linux and Windows, `pkg/gvx` therefore passes the kernel memory file to `Workspace.SetChunkMemory` and `ext4lite.Volume.SetChunkMemory`, and both drivers allocate mapped chunks there. `hostfs` invalidates the mappings of a truncated file before it drops its reference to a chunk.
 
 The mapped pages of a file read through one host handle. The last `munmap` of a file releases that handle. A second thread can configure a new mapping of the same file before the first thread unmaps. `ConfigureMMap` therefore reserves its handle, and `AddMapping` attaches the reserved handle again when the unmap released the first one. Without the reservation, a page fault of the new mapping ends in `SIGBUS`, which `git gc` hit in `pack-objects`.
 
@@ -667,13 +670,13 @@ Execute these steps in `lockdown_windows.go` before starting virtual processor o
 > [!IMPORTANT]
 > Open the WHPX partition handle (or pre-spawn the `systrap` stub subprocess and `sysmsg` mapping), cached `.erofs` layer handles, `-p` host listeners, the `-net=wg` UDP socket, and `/workspace` `os.Root` before calling `hostlockdown.Apply()`. Once `hostlockdown.Apply()` locks down the process token and sets `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, the Windows kernel rejects new host file opens and child processes.
 
-1. Apply an inheritable Low-Integrity ACE (`S-1-16-4096`) to writable `/workspace` directories so Windows MIC permits guest writes after token downgrade.
-2. Open the live primary process token (`OpenProcessToken`) and call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete all privileges in-place.
-3. Call `SetTokenInformation(hPrimaryToken, TokenIntegrityLevel, ...)` to lower the live primary token integrity level to `Low` (`S-1-16-4096`) in-place.
-4. Create a `DISABLE_MAX_PRIVILEGE` restricted token with `SE_GROUP_USE_FOR_DENY_ONLY` and bind it to each vCPU thread via `SetThreadToken`.
-5. Create an anonymous Job Object with `CreateJobObjectW` and assign the current process via `AssignProcessToJobObject`.
-6. Set `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` on the Job Object to block child process creation (`cmd.exe`, `powershell.exe`).
-7. Set `JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_WRITECLIPBOARD` to isolate host UI handles and the clipboard.
+1. Apply an inheritable Low-Integrity ACE (`S-1-16-4096`) to bound `/workspace` paths and a non-inherited `FILE_TRAVERSE` entry to single-file mount parents.
+2. Restrict the default DACL on the live primary process token (`restrictPrimaryTokenDACL`) to deny unbound host file creation.
+3. Open the live primary process token (`OpenProcessToken`) and call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete privileges in-place.
+4. Create a `DISABLE_MAX_PRIVILEGE` restricted impersonation token at `Low` integrity (`S-1-16-4096`) with `SE_GROUP_USE_FOR_DENY_ONLY` and bind it to runtime threads via `SetThreadToken`.
+5. Install the Winsock outbound hook when `-net=none` or `-net=wg` blocks direct host socket connections and listeners.
+6. Create an anonymous Job Object with `CreateJobObjectW` and assign the current process via `AssignProcessToJobObject`.
+7. Set `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, and `JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_WRITECLIPBOARD` on the Job Object.
 8. Call `SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy, ...)` with `DisallowWin32kSystemCalls = 1` to block `win32kfull.sys` system calls.
 
 #### macOS Lockdown Sequence (`lockdown_darwin.go`) (Procedural Module)
@@ -777,11 +780,12 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 | `ci.yml` build, vet, and audit | `ubuntu-24.04` | Formatting of the packages that `gvx` owns, a build of every package for five targets and for `-tags pagesize_16k`, `go vet` of the packages that `gvx` wrote, and the upstream audit. |
 | `ci.yml` test linux | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages. Without cgo: `pkg/hostlockdown`, `pkg/gvx`, and the whole `e2e` suite with the seccomp lockdown on. Guest runs on the upstream `systrap` platform with and without the lockdown. |
 | `ci.yml` test darwin/arm64 | `macos-15` | The owned packages through `scripts/codesign-exec.sh`, then the `systrap` engine, the SDK, and the CLI with `-tags pagesize_16k`. |
-| `ci.yml` test windows/amd64 | `windows-latest` | The owned packages, a report of the hypervisor state, and an attempt to boot a guest on `whpx`. |
-| `e2e-images.yml` | `macos-15`, `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The registry gates on the `systrap` engine, once a week. The Linux jobs run every gate with the seccomp lockdown. The Windows jobs run every gate on the Windows engine, and skip the host lockdown tests. |
+| `ci.yml` test windows/amd64 | `windows-latest` | The owned packages, the `systrap` engine, the host lockdown tests, a report of the hypervisor state, and a guest boot on `whpx`. |
+| `ci.yml` test windows/arm64 | `windows-11-arm` | The owned packages, the `systrap` engine, the host lockdown tests, and the containerd shim package. |
+| `e2e-images.yml` | `macos-15`, `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The registry gates on the `systrap` engine, once a week. The Linux and Windows jobs run every gate with host lockdown enabled. |
 | `diagnose.yml` | A chosen runner | A chosen test selection or script, started by hand. |
 
-A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests.
+A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows `amd64` runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests there.
 
 The gate `TestE2EGateETExec` decides whether a backend runs an executable that links at a fixed address. It runs four programs: a static Go program, a static C program, `herdr api schema`, and the `herdr` server with one request. Each program must print the same output on every backend. The macOS `systrap` engine refuses these images by default, so its rows skip. The extra backend `systrap-zone` turns on the prototype zone mode and runs all four programs. The Go and `herdr` rows need `go` and a download of the `herdr` release file. The C row and the server row pull `alpine:3.20`.
 
@@ -789,7 +793,7 @@ The gate `TestE2EGateETExec` decides whether a backend runs an executable that l
 | :--- | :--- |
 | `darwin/arm64` `hvf` | The Apple Silicon development host. A hosted runner has no hypervisor. |
 | `darwin/arm64` `systrap` | The development host and CI. |
-| `windows/amd64` and `windows/arm64` | CI builds both. CI runs `windows/amd64` tests, and `whpx` runs only where the runner has the Windows Hypervisor Platform. `windows/arm64` is compile-checked only. |
+| `windows/amd64` and `windows/arm64` | CI builds and tests both. `whpx` runs on `windows/amd64` where the runner exposes the Windows Hypervisor Platform, and `systrap` runs on both `windows/amd64` and `windows/arm64`. |
 | `darwin/amd64` | Not supported. The project dropped this target. |
 | `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both. |
 

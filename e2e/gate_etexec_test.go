@@ -152,9 +152,9 @@ var (
 )
 
 // buildCStatic compiles the static C program once per test run inside an
-// Alpine guest. The compiler runs on systrap, except on macOS, where the
-// 4KB build has no systrap engine and hvf is the reliable choice. A hosted
-// Windows runner exposes WHP, but a whpx guest stops there while gcc runs.
+// Alpine guest. Prefer the hypervisor backend when the host has one, because
+// this step only builds the fixture. The test loop below then runs the binary
+// on each backend that the file tests.
 func buildCStatic(t *testing.T) string {
 	t.Helper()
 	requireRegistry(t)
@@ -169,8 +169,8 @@ func buildCStatic(t *testing.T) string {
 			return
 		}
 		plat := gvx.PlatformSystrap
-		if runtime.GOOS == "darwin" && hvtest.Available() {
-			plat = gvx.PlatformHVF
+		if hvtest.Available() {
+			plat = autoPlatform()
 		}
 		script := "apk add --no-cache build-base >/dev/null && gcc -O2 -static -no-pie -o /workspace/cstatic /workspace/main.c"
 		code, stdout, stderr, err := runGuestQuiet(guestSpec{

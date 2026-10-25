@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
@@ -200,7 +201,6 @@ func TestFastPathConcurrentThreads(t *testing.T) {
 	for k := 0; k < threads; k++ {
 		th := r.newThread()
 		th.ac.SetIP(codeVA)
-		// The arm64 slot saves two registers 512 bytes below the stack pointer.
 		th.ac.SetStack(uintptr(stackVA + 0x800 + uint64(k)*0x100))
 		wg.Add(1)
 		go func() {
@@ -271,5 +271,51 @@ func TestOffModeUsesTheDebugPath(t *testing.T) {
 	t.Cleanup(func() { fastPathMode = prev })
 	if p := newPlatform(t); p.fast {
 		t.Fatal("the platform runs the fast path with the mode off")
+	}
+}
+
+func TestFastPathIslandSlotsReclaimedOnRepatchAndUnmap(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	r.program(gJump(dataVA))
+	var blockProg []byte
+	for i := 0; i < 16; i++ {
+		blockProg = append(blockProg, gSyscall(11)...)
+	}
+	r.mapPage(dataVA, hostarch.AccessType{Read: true, Write: true, Execute: true}, blockProg)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 11, r.ac)
+
+	// Each patch of dataVA allocates 16 slots (1024 bytes on amd64, 768 bytes
+	// on arm64). Eight repatches exceed one 4KB island unless restoreData
+	// reclaims the block's slots.
+	const rounds = 8
+	for i := 0; i < rounds; i++ {
+		if ok, err := r.as.restoreData(dataVA); !ok || err != nil {
+			t.Fatalf("round %d: restoreData = (%v, %v), want (true, nil)", i, ok, err)
+		}
+		r.ac.SetIP(dataVA)
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 11, r.ac)
+	}
+	if got := fastStats(t, r).traps.Load(); got != rounds+1 {
+		t.Fatalf("fast traps = %d, want %d", got, rounds+1)
+	}
+
+	r.as.mu.Lock()
+	islandCount := len(r.as.islands)
+	r.as.mu.Unlock()
+	if islandCount != 1 {
+		t.Fatalf("islands allocated after %d repatches = %d, want 1", rounds, islandCount)
+	}
+
+	r.as.Unmap(hostarch.Addr(dataVA), blockSize)
+	r.as.mu.Lock()
+	defer r.as.mu.Unlock()
+	for base, isl := range r.as.islands {
+		for wIdx, bits := range isl.usedBits {
+			if bits != 0 {
+				t.Errorf("island %#x word %d has usedBits %#x after Unmap, want 0", base, wIdx, bits)
+			}
+		}
 	}
 }

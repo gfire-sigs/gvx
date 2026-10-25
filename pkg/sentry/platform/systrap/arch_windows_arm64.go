@@ -249,15 +249,17 @@ type siteInfo struct {
 // NOP. page is a copy of the original frame. With the fast path, each `svc #0`
 // becomes a branch to a trampoline slot, and a site without a slot keeps the
 // BRK.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, error) {
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, []winSlotRef, error) {
 	sites := make(map[uint16]siteInfo)
+	var slots []winSlotRef
 	for _, s := range scanARM64(page) {
 		var imm uint32
 		switch s.Kind {
 		case siteSVC:
 			if as.p.fast {
-				if word, ok := as.fastBranch(ctx, mm, base+uint64(s.Offset)); ok {
+				if word, ref, ok := as.fastBranch(ctx, mm, base+uint64(s.Offset)); ok {
 					binary.LittleEndian.PutUint32(page[s.Offset:], word)
+					slots = append(slots, ref)
 					continue
 				}
 			}
@@ -272,8 +274,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			if !as.p.fast || s.Reg == 31 {
 				continue
 			}
-			if word, ok := as.fastTLSBranch(ctx, mm, base+uint64(s.Offset), s.Reg); ok {
+			if word, ref, ok := as.fastTLSBranch(ctx, mm, base+uint64(s.Offset), s.Reg); ok {
 				binary.LittleEndian.PutUint32(page[s.Offset:], word)
+				slots = append(slots, ref)
 				continue
 			}
 			imm = brkMRSTLS
@@ -295,45 +298,53 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			binary.LittleEndian.PutUint32(page[off:], arm64NOP)
 		}
 	}
-	return sites, nil
+	return sites, slots, nil
 }
 
 // fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and
 // returns the branch that replaces the instruction.
-func (as *addressSpace) fastTLSBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, bool) {
-	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
+func (as *addressSpace) fastTLSBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, winSlotRef, bool) {
+	slotVA, ref, err := as.installSlot(ctx, mm, site, winTLSSlotSize, func(buf []byte, slotVA uint64) error {
 		return encodeWinTLSSlot(buf, slotVA, site, reg)
 	})
 	var word uint32
 	if err == nil {
-		word, err = encodeBranch(site, slotVA)
+		if word, err = encodeBranch(site, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
 	}
 	if err != nil {
 		if traceEvents {
 			tracef("no trampoline slot for the mrs at %#x: %v", site, err)
 		}
-		return 0, false
+		return 0, winSlotRef{}, false
 	}
-	return word, true
+	return word, ref, true
 }
 
 // fastBranch allocates a trampoline slot for the `svc #0` at site and returns
 // the branch that replaces the instruction.
-func (as *addressSpace) fastBranch(ctx context.Context, mm platform.MemoryManager, site uint64) (uint32, bool) {
-	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
+func (as *addressSpace) fastBranch(ctx context.Context, mm platform.MemoryManager, site uint64) (uint32, winSlotRef, bool) {
+	slotVA, ref, err := as.installSlot(ctx, mm, site, winSlotSize, func(buf []byte, slotVA uint64) error {
 		return encodeWinSlot(buf, slotVA, site, as.p.spillVA())
 	})
 	var word uint32
 	if err == nil {
-		word, err = encodeBranch(site, slotVA)
+		if word, err = encodeBranch(site, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
 	}
 	if err != nil {
 		if traceEvents {
 			tracef("no trampoline slot for the svc at %#x: %v", site, err)
 		}
-		return 0, false
+		return 0, winSlotRef{}, false
 	}
-	return word, true
+	return word, ref, true
 }
 
 // newWinTrap describes the trap of the `svc #0` at site.

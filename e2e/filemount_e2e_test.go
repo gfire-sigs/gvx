@@ -93,10 +93,7 @@ func TestE2EFileBindMountExposesOnlyTheFile(t *testing.T) {
 			if !rep.Lockdown.Applied || !rep.LockedAPI {
 				t.Errorf("Lockdown.Applied=%v IsLockedDown=%v, want both true", rep.Lockdown.Applied, rep.LockedAPI)
 			}
-			// The Windows lockdown blocks opens only on the threads that hold
-			// the restricted token, so a read from the main thread can work.
-			// The guest-side checks and the lockdown unit test prove the sibling.
-			if rep.ReadOutsideErr == "" && runtime.GOOS != "windows" {
+			if rep.ReadOutsideErr == "" {
 				t.Errorf("host read of the sibling file succeeded after the lockdown: %q", rep.OutsideReadBytes)
 			}
 			if rep.WriteOutsideErr == "" {

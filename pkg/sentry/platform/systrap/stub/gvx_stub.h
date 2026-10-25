@@ -32,7 +32,8 @@
 #define SM_ALT 888
 #define SM_X18 912
 #define SM_SPILL 920
-#define SM_FMC 928
+#define SM_SCRATCH 928
+#define SM_FMC 944
 
 // Offsets inside the Darwin mcontext64 that follows SM_MC.
 #define MC_FAR 0
@@ -103,6 +104,8 @@ struct gv_sysmsg {
   uint64_t x18;
   // Holds the guest scratch register that a patched x18 slot borrows.
   uint64_t spill;
+  // Holds the guest x16 and x17 that a trap or memory slot spills.
+  uint64_t scratch[2];
   // The signal handler saves the context of a fault here, so a fault inside
   // the reload code cannot destroy the guest state in mc.
   uint8_t fmc[MC_SIZE];

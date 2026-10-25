@@ -64,6 +64,14 @@ type execBlock struct {
 	hasPriv bool
 	// sites maps the page offset of a patched instruction to its description.
 	sites map[uint16]siteInfo
+	// slots holds the island slots that this executable copy occupies.
+	slots []winSlotRef
+}
+
+// copyHold counts the pages of an address space that still map a copied section.
+type copyHold struct {
+	sec  *anonSection
+	refs int
 }
 
 // addressSpace is one stub process and the guest mappings in it.
@@ -84,9 +92,8 @@ type addressSpace struct {
 
 	// internal holds the engine pages at the top of the window.
 	internal *anonSection
-	// copies holds the sections of mappings that copy file bytes. They live
-	// until the address space is released.
-	copies []*anonSection
+	// copies maps each block address of a copied section to its reference count.
+	copies map[uint64]*copyHold
 
 	// islands holds the pages of trampoline slots, by base address. reserved
 	// holds the island addresses that a pending mm.MMap call creates.
@@ -191,6 +198,7 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 		sp:       sp,
 		win:      newGuestWindows(wins...),
 		blocks:   make(map[uint64]*execBlock),
+		copies:   make(map[uint64]*copyHold),
 		islands:  make(map[uint64]*island),
 		reserved: make(map[uint64]struct{}),
 	}
@@ -297,12 +305,18 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		// The patcher reads the original frames through the Sentry mapping.
 		bs, err := f.MapInternal(fr, hostarch.AccessType{Read: true})
 		if err != nil {
+			if copied != nil {
+				copied.close()
+			}
 			return fmt.Errorf("map the memory file range %v for the patcher: %w", fr, err)
 		}
 		for ; !bs.IsEmpty(); bs = bs.Tail() {
 			b := bs.Head()
 			n := uint64(b.Len())
 			if n%blockSize != 0 || uint64(uintptr(b.Addr()))%blockSize != 0 {
+				if copied != nil {
+					copied.close()
+				}
 				return &AlignmentError{Op: "map memory file range", Addr: uint64(uintptr(b.Addr())), Len: n}
 			}
 			for off := uint64(0); off < n; off += blockSize {
@@ -313,16 +327,27 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.released {
+		if copied != nil {
+			copied.close()
+		}
 		return errAddressSpaceReleased
 	}
-	if copied != nil {
-		as.copies = append(as.copies, copied)
-	}
 	if err := as.win.Map(guest, fr.Length(), sec, secOff, viewProtFor(at)); err != nil {
+		if copied != nil {
+			copied.close()
+		}
 		return as.mapErr(fmt.Errorf("map [%#x, %#x): %w", guest, guest+fr.Length(), err))
+	}
+	var hold *copyHold
+	if copied != nil {
+		hold = &copyHold{sec: copied, refs: int(fr.Length() / blockSize)}
 	}
 	for i, base := 0, guest; base < guest+fr.Length(); i, base = i+1, base+blockSize {
 		as.dropBlockLocked(base)
+		as.dropCopyLocked(base)
+		if hold != nil {
+			as.copies[base] = hold
+		}
 		if at.Execute {
 			as.blocks[base] = &execBlock{base: base, src: srcs[i], srcSec: sec, srcOff: secOff + uint64(i)*blockSize, at: at, state: blockData}
 		}
@@ -341,10 +366,24 @@ func (as *addressSpace) mapErr(err error) error {
 // dropBlockLocked forgets the exec state of one block and frees its copy.
 func (as *addressSpace) dropBlockLocked(base uint64) {
 	if blk, ok := as.blocks[base]; ok {
+		freeSlotRefsLocked(blk.slots)
+		blk.slots = nil
 		if blk.hasPriv {
 			as.p.priv.release(blk.priv)
 		}
 		delete(as.blocks, base)
+	}
+}
+
+// dropCopyLocked releases one block reference to a copied section and closes
+// the section when no block maps it any more.
+func (as *addressSpace) dropCopyLocked(base uint64) {
+	if hold, ok := as.copies[base]; ok {
+		delete(as.copies, base)
+		hold.refs--
+		if hold.refs == 0 {
+			hold.sec.close()
+		}
 	}
 }
 
@@ -382,6 +421,17 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 			as.dropBlockLocked(base)
 		}
 	}
+	if (end-start)/blockSize > uint64(len(as.copies)) {
+		for base := range as.copies {
+			if base >= start && base < end {
+				as.dropCopyLocked(base)
+			}
+		}
+	} else {
+		for base := start; base < end; base += blockSize {
+			as.dropCopyLocked(base)
+		}
+	}
 	as.dropIslandsLocked(start, end)
 }
 
@@ -408,10 +458,9 @@ func (as *addressSpace) Release() {
 		as.internal.close()
 		as.internal = nil
 	}
-	for _, c := range as.copies {
-		c.close()
+	for base := range as.copies {
+		as.dropCopyLocked(base)
 	}
-	as.copies = nil
 	as.releaseIslandsLocked()
 }
 
@@ -487,37 +536,47 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	// guest has no promise about code that it modifies while it executes it.
 	copyBuf := make([]byte, blockSize)
 	copy(copyBuf, unsafe.Slice((*byte)(addrPtr(src)), blockSize))
-	sites, err := as.patchPage(ctx, mm, base, copyBuf)
+	sites, slots, err := as.patchPage(ctx, mm, base, copyBuf)
 	if err != nil {
 		return err
 	}
 
 	pg, err := as.p.priv.alloc()
 	if err != nil {
+		as.mu.Lock()
+		freeSlotRefsLocked(slots)
+		as.mu.Unlock()
 		return err
 	}
 	copy(pg.bytes(), copyBuf)
 	if err := flushInstructionCache(windows.CurrentProcess(), uintptr(unsafe.Pointer(&pg.bytes()[0])), blockSize); err != nil {
 		as.p.priv.release(pg)
+		as.mu.Lock()
+		freeSlotRefsLocked(slots)
+		as.mu.Unlock()
 		return err
 	}
 
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if cur := as.blocks[base]; as.released || cur != blk || blk.state != blockData || blk.src != src {
+		freeSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return errPatchRaced
 	}
 	if err := as.win.Map(base, blockSize, &pg.chunk.ref, pg.off, viewReadExec); err != nil {
+		freeSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return as.mapErr(err)
 	}
 	if err := flushInstructionCache(as.sp.proc, uintptr(base), blockSize); err != nil {
+		freeSlotRefsLocked(slots)
 		return err
 	}
 	blk.priv, blk.hasPriv = pg, true
 	blk.state = blockExec
 	blk.sites = sites
+	blk.slots = slots
 	as.patchedBlocks.Add(1)
 	return nil
 }
@@ -534,6 +593,8 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	if err := as.win.Map(base, blockSize, blk.srcSec, blk.srcOff, viewProtFor(blk.at)); err != nil {
 		return false, as.mapErr(err)
 	}
+	freeSlotRefsLocked(blk.slots)
+	blk.slots = nil
 	as.p.priv.release(blk.priv)
 	blk.priv, blk.hasPriv = privPage{}, false
 	blk.state = blockData

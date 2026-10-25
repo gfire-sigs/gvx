@@ -189,10 +189,16 @@ func (c *Context) onStubExit(v *vcpu, ex exitInfo, ac *arch.Context64) (runResul
 	v.st.parked = true
 	v.st.exitPC = ex.pc
 
-	t, err := classifyA64(comm.Vector, comm.FaultCode, comm.FaultAddr, comm.PC)
-	if err != nil {
-		v.st.invalidate()
-		return runResult{err: err}, false
+	var t trap
+	if emulateA64SysReg(comm, &v.ids) {
+		t = trap{kind: trapSkip}
+	} else {
+		var err error
+		t, err = classifyA64(comm.Vector, comm.FaultCode, comm.FaultAddr, comm.PC)
+		if err != nil {
+			v.st.invalidate()
+			return runResult{err: err}, false
+		}
 	}
 	if t.kind == trapSkip {
 		// Resume after the instruction, as the KVM platform does for WFI.

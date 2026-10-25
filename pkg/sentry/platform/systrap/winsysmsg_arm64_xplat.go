@@ -25,7 +25,7 @@ import (
 
 // winRegs is the register block of an arm64 winSysmsg. The stub stores the
 // registers of the trapped guest here. X[16] and X[17] hold the guest values,
-// which the slot saved below the guest stack pointer.
+// which the slot saved in Scratch.
 type winRegs struct {
 	X    [31]uint64
 	SP   uint64
@@ -35,8 +35,9 @@ type winRegs struct {
 // winSysmsg is the shared page of one guest thread.
 type winSysmsg struct {
 	winSysmsgHeader
-	Regs winRegs
-	_    [winOffVec - winOffRegs - 33*8]byte
+	Regs    winRegs
+	Scratch [2]uint64
+	_       [winOffVec - winOffRegs - 35*8]byte
 	// Vec holds V0 to V31 of the trapped guest. Fpsr and Fpcr hold the
 	// floating-point status and control registers.
 	Vec  [32 * 16]byte
@@ -46,9 +47,10 @@ type winSysmsg struct {
 
 // Offsets of the registers in the winSysmsg.
 const (
-	winOffX    = winOffRegs
-	winOffSP   = winOffRegs + 31*8
-	winOffNZCV = winOffSP + 8
+	winOffX       = winOffRegs
+	winOffSP      = winOffRegs + 31*8
+	winOffNZCV    = winOffSP + 8
+	winOffScratch = winOffNZCV + 8
 
 	// winOffVec is the offset of V0 to V31, 16 bytes each. A system call of
 	// Windows can clobber the volatile vector registers, so the spill routine
@@ -58,10 +60,13 @@ const (
 	winOffFpcr = winOffFpsr + 8
 
 	// winSlotSize is the size of one trampoline slot.
-	winSlotSize = trapSlotSize
+	winSlotSize = 48
 	// winSlotTailOffset is the offset of the slot tail. The slot passes its
 	// address to the spill routine in x17.
-	winSlotTailOffset = trapSlotTailOffset
+	winSlotTailOffset = 20
+	// winSlotLitOffset is the offset of the 8-byte literal that holds the
+	// address of the spill routine.
+	winSlotLitOffset = 32
 	// winSiteLen is the length of the patched instruction, and the offset from
 	// the site to the instruction that follows it.
 	winSiteLen = 4
@@ -70,6 +75,7 @@ const (
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs)-winOffRegs]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.SP)-31*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.NZCV)-32*8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Scratch)-winOffScratch]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Vec)-winOffVec]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Fpsr)-winOffFpsr]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Fpcr)-winOffFpcr]

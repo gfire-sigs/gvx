@@ -878,3 +878,123 @@ func TestWireGuardIPCConfig(t *testing.T) {
 		t.Fatalf("IPC config includes an unset preshared key or endpoint:\n%s", got)
 	}
 }
+
+func TestParseWireGuardINIDNS(t *testing.T) {
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	ini := fmt.Sprintf(`[Interface]
+PrivateKey = %x
+Address = 10.0.2.15/24
+DNS = 10.0.2.1, [fd00:2::1]:5353, corp.internal
+
+[Peer]
+PublicKey = %x
+Endpoint = 127.0.0.1:51820
+AllowedIPs = 0.0.0.0/0
+`, guestKey.private, peerKey.public)
+
+	cfg, err := ParseWireGuardINI(ini)
+	if err != nil {
+		t.Fatalf("ParseWireGuardINI: %v", err)
+	}
+	wantDNS := []string{
+		"10.0.2.1:53",
+		"[fd00:2::1]:5353",
+	}
+	if len(cfg.DNSServers) != len(wantDNS) || cfg.DNSServers[0] != wantDNS[0] || cfg.DNSServers[1] != wantDNS[1] {
+		t.Fatalf("DNSServers = %v, want %v", cfg.DNSServers, wantDNS)
+	}
+}
+
+func TestWireGuardVirtualDNSRelayUDPAndTCP(t *testing.T) {
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	w, err := NewWireGuardEndpoint(WireGuardConfig{
+		PrivateKey:    guestKey.private,
+		PeerPublicKey: peerKey.public,
+		LookupHost: func(_ context.Context, host string) ([]netip.Addr, error) {
+			if host == "wg.internal.corp" {
+				return []netip.Addr{netip.MustParseAddr("198.51.100.77")}, nil
+			}
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWireGuardEndpoint: %v", err)
+	}
+	defer func() {
+		_ = w.Close()
+	}()
+	s, err := w.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var q []byte
+	q = append(q,
+		0x43, 0x21,
+		0x01, 0x00,
+		0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	)
+	for _, label := range []string{"wg", "internal", "corp"} {
+		q = append(q, byte(len(label)))
+		q = append(q, label...)
+	}
+	q = append(q, 0x00, 0x00, 0x01, 0x00, 0x01)
+
+	dnsAddr := tcpip.FullAddress{
+		NIC:  Eth0NICID,
+		Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}),
+		Port: 53,
+	}
+
+	uConn, err := gonet.DialUDP(s, nil, &dnsAddr, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("gonet.DialUDP to 10.0.2.3:53: %v", err)
+	}
+	defer func() {
+		_ = uConn.Close()
+	}()
+	if _, err := uConn.Write(q); err != nil {
+		t.Fatalf("uConn.Write: %v", err)
+	}
+	_ = uConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp := make([]byte, 512)
+	n, err := uConn.Read(resp)
+	if err != nil {
+		t.Fatalf("uConn.Read: %v", err)
+	}
+	if n < 16 || binary.BigEndian.Uint16(resp[0:2]) != 0x4321 || binary.BigEndian.Uint16(resp[6:8]) != 1 {
+		t.Fatalf("unexpected UDP DNS response: len=%d id=0x%x ancount=%d", n, binary.BigEndian.Uint16(resp[0:2]), binary.BigEndian.Uint16(resp[6:8]))
+	}
+	gotIP := netip.AddrFrom4([4]byte{resp[n-4], resp[n-3], resp[n-2], resp[n-1]})
+	if gotIP != netip.MustParseAddr("198.51.100.77") {
+		t.Fatalf("resolved UDP DNS IP = %s, want 198.51.100.77", gotIP)
+	}
+
+	tConn, err := gonet.DialTCP(s, dnsAddr, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("gonet.DialTCP to 10.0.2.3:53: %v", err)
+	}
+	defer func() {
+		_ = tConn.Close()
+	}()
+	tcpFrame := make([]byte, 2+len(q))
+	binary.BigEndian.PutUint16(tcpFrame[0:2], uint16(len(q)))
+	copy(tcpFrame[2:], q)
+	if _, err := tConn.Write(tcpFrame); err != nil {
+		t.Fatalf("tConn.Write: %v", err)
+	}
+	_ = tConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var lenHdr [2]byte
+	if _, err := tConn.Read(lenHdr[:]); err != nil {
+		t.Fatalf("tConn.Read length: %v", err)
+	}
+	tcpResp := make([]byte, binary.BigEndian.Uint16(lenHdr[:]))
+	if _, err := tConn.Read(tcpResp); err != nil {
+		t.Fatalf("tConn.Read body: %v", err)
+	}
+	gotTCPIP := netip.AddrFrom4([4]byte{tcpResp[len(tcpResp)-4], tcpResp[len(tcpResp)-3], tcpResp[len(tcpResp)-2], tcpResp[len(tcpResp)-1]})
+	if gotTCPIP != netip.MustParseAddr("198.51.100.77") {
+		t.Fatalf("resolved TCP DNS IP = %s, want 198.51.100.77", gotTCPIP)
+	}
+}

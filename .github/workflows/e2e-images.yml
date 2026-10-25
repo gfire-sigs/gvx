@@ -97,8 +97,8 @@ jobs:
       - name: Run the registry gates on the systrap engine
         shell: bash
         run: |
-          go test -count=1 -timeout 80m -skip 'HostLockdown' \
+          go test -count=1 -timeout 80m \
             -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
             ./e2e
-          go test -count=1 -timeout 30m -skip 'HostLockdown' -run 'TestE2EDockerRun.*/systrap' ./e2e
-          go test -count=1 -timeout 40m -skip 'HostLockdown' -run 'TestE2EGateETExec.*/systrap' ./e2e
+          go test -count=1 -timeout 30m -run 'TestE2EDockerRun.*/systrap' ./e2e
+          go test -count=1 -timeout 40m -run 'TestE2EGateETExec.*/systrap' ./e2e

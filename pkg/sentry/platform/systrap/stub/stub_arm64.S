@@ -1,6 +1,6 @@
 // Spill and reload code of the macOS systrap stub for arm64.
-// Island slots branch to gv_spill with the guest x16 and x17 saved at
-// [sp, #-512] and x17 holding the slot tail address.
+// Island slots branch to gv_spill with the guest x16 and x17 saved in
+// sm->scratch and x17 holding the slot tail address.
 
 #include "gvx_stub.h"
 
@@ -16,7 +16,8 @@ _gv_spill:
     mrs   x16, TPIDRRO_EL0
     and   x16, x16, #0xfffffffffffffff8
     stp   x0, x1, [x16, #(SM_MC+MC_X0+0)]
-    ldp   x0, x1, [sp, #-512]
+    ldr   x0, [x16, #SM_SCRATCH]
+    ldr   x1, [x16, #(SM_SCRATCH+8)]
     stp   x0, x1, [x16, #(SM_MC+MC_X0+16*8)]
     str   x17, [x16, #SM_TAIL]
     stp   x2, x3, [x16, #(SM_MC+MC_X0+2*8)]
@@ -67,8 +68,7 @@ _gv_spill:
     mrs   x16, TPIDRRO_EL0
     and   x16, x16, #0xfffffffffffffff8
     // Hot reload: only x0 may differ from the spilled state. The guest x16 and x17
-    // still sit below the guest stack pointer, where the slot stored them. The
-    // reload stores nothing there, because a copy-on-write page may be read-only now.
+    // still sit in the scratch words of the sysmsg, where the slot stored them.
     ldr   w0, [x16, #(SM_MC+MC_FPSR)]
     ldr   w1, [x16, #(SM_MC+MC_FPCR)]
     msr   fpsr, x0

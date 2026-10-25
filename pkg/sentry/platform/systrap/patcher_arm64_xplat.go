@@ -32,38 +32,44 @@ import (
 // their cache maintenance loops. macOS raises SIGILL on that read, so
 // `mrs xN, ctr_el0` becomes a branch to a slot that loads a constant.
 const (
-	arm64SVC0      = 0xd4000001
-	arm64MRSTPIDR  = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
-	arm64MRSCTR    = 0xd53b0020 // mrs xN, ctr_el0 with N in bits 4:0.
-	arm64MOVZ      = 0xd2800000 // movz xN, #imm16 with imm16 in bits 20:5.
-	arm64MOVKLSL16 = 0xf2a00000 // movk xN, #imm16, lsl #16 with imm16 in bits 20:5.
-	arm64MSRTPIDR  = 0xd51bd040 // msr tpidr_el0, xN with N in bits 4:0.
-	arm64RegMask   = 0x1f
-	arm64NOP       = 0xd503201f
-	// The trap slot saves x16 and x17 512 bytes below the guest stack pointer.
-	// Go assembly keeps live words up to 32 bytes below the stack pointer across
-	// a system call, as runtime.clone does for its child, so a spill right
-	// below the pointer would overwrite them.
-	arm64STPx16x17  = 0xa92047f0 // stp x16, x17, [sp, #-512]
-	arm64LDPx16x17  = 0xa96047f0 // ldp x16, x17, [sp, #-512]
+	arm64SVC0       = 0xd4000001
+	arm64MRSTPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
+	arm64MRSCTR     = 0xd53b0020 // mrs xN, ctr_el0 with N in bits 4:0.
+	arm64MOVZ       = 0xd2800000 // movz xN, #imm16 with imm16 in bits 20:5.
+	arm64MOVKLSL16  = 0xf2a00000 // movk xN, #imm16, lsl #16 with imm16 in bits 20:5.
+	arm64MSRTPIDR   = 0xd51bd040 // msr tpidr_el0, xN with N in bits 4:0.
+	arm64RegMask    = 0x1f
+	arm64NOP        = 0xd503201f
 	arm64ADRx17     = 0x10000000 | 17
 	arm64LDRLitx16  = 0x58000000 | 16
 	arm64BRx16      = 0xd61f0200
 	arm64B          = 0x14000000
 	arm64MRSTPIDRRO = 0xd53bd060 // mrs xN, tpidrro_el0
 	arm64ANDxMinus8 = 0x927df000 // and xN, xN, #0xfffffffffffffff8
+	arm64STRx       = 0xf9000000 // str xT, [xN, #imm12*8]
 	arm64LDRx       = 0xf9400000 // ldr xT, [xN, #imm12*8]
+
+	// arm64ScratchReg is the hardware x18 register, which holds no guest value
+	// on macOS because scanX18 moves guest x18 accesses to sysmsg.X18.
+	arm64ScratchReg = 18
+
+	// trapScratchOffset is the byte offset of sysmsg.Scratch on macOS arm64.
+	trapScratchOffset = 928
 
 	// arm64BranchRange is the reach of a B instruction: plus or minus 128MiB.
 	arm64BranchRange = 1 << 27
 
 	// trapSlotSize and loadSlotSize are the byte sizes of the two slot kinds.
-	trapSlotSize = 32
+	trapSlotSize = 56
 	loadSlotSize = 16
 
-	// trapSlotTailOffset is the offset of the instruction that restores x16
-	// and x17 in a trap slot. The stub receives its address in x17.
-	trapSlotTailOffset = 16
+	// trapSlotTailOffset is the offset of the phase that restores x16 and x17
+	// in a trap slot. The stub receives its address in x17.
+	trapSlotTailOffset = 28
+
+	// trapSlotLitOffset is the byte offset of the 8-byte spill address literal
+	// inside a trap slot.
+	trapSlotLitOffset = 48
 
 	// ctrEL0Value is the CTR_EL0 value that the guest reads. It reports 64-byte
 	// instruction and data cache lines, the line size that Apple silicon reports.
@@ -166,30 +172,42 @@ func slotSizeFor(k siteKind) int {
 }
 
 // encodeTrapSlot writes a trap slot at slotVA into buf. The slot saves x16
-// and x17 below the guest stack pointer, loads the stub's spill routine and
-// jumps to it with x17 set to the slot tail. After the Sentry resumes the
-// thread, the stub jumps back to the tail, which restores x16 and x17 and
-// branches to retPC.
+// and x17 in the scratch words of the thread's sysmsg, loads the stub's spill
+// routine and jumps to it with x17 set to the slot tail. After the Sentry
+// resumes the thread, the stub jumps back to the tail, which restores x16 and
+// x17 from the sysmsg and branches to retPC.
 func encodeTrapSlot(buf []byte, slotVA, retPC, spill uint64) error {
 	if len(buf) < trapSlotSize {
 		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
 	}
-	back, err := encodeBranch(slotVA+trapSlotTailOffset+4, retPC)
+	back, err := encodeBranch(slotVA+trapSlotTailOffset+16, retPC)
 	if err != nil {
 		return err
 	}
+	const (
+		ptr0 = arm64MRSTPIDRRO | arm64ScratchReg
+		ptr1 = arm64ANDxMinus8 | arm64ScratchReg<<5 | arm64ScratchReg
+		off0 = (trapScratchOffset / 8) << 10
+		off1 = ((trapScratchOffset + 8) / 8) << 10
+	)
 	words := [...]uint32{
-		arm64STPx16x17,
-		arm64ADRx17 | uint32((trapSlotTailOffset-4)>>2)<<5, // adr x17, tail: byte offset 12.
-		arm64LDRLitx16 | ((24-8)>>2)<<5,                    // ldr x16, [pc, +16].
+		ptr0,
+		ptr1,
+		arm64STRx | off0 | arm64ScratchReg<<5 | 16,
+		arm64STRx | off1 | arm64ScratchReg<<5 | 17,
+		arm64ADRx17 | uint32((trapSlotTailOffset-16)>>2)<<5,   // adr x17, tail: byte offset 28.
+		arm64LDRLitx16 | uint32((trapSlotLitOffset-20)>>2)<<5, // ldr x16, [pc, +28].
 		arm64BRx16,
-		arm64LDPx16x17,
+		ptr0,
+		ptr1,
+		arm64LDRx | off0 | arm64ScratchReg<<5 | 16,
+		arm64LDRx | off1 | arm64ScratchReg<<5 | 17,
 		back,
 	}
 	for i, w := range words {
 		binary.LittleEndian.PutUint32(buf[i*4:], w)
 	}
-	binary.LittleEndian.PutUint64(buf[24:], spill)
+	binary.LittleEndian.PutUint64(buf[trapSlotLitOffset:], spill)
 	return nil
 }
 

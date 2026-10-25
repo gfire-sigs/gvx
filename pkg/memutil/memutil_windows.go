@@ -25,10 +25,10 @@ const (
 var (
 	errUnalignedSize = errors.New("memory size must be a positive multiple of 4096 bytes")
 
-	// MapViewOfFile3 lives in kernel32.dll and needs Windows 10 version 1803.
+	// MapViewOfFile3 lives in kernelbase.dll on Windows 10 version 1803 and later.
 	// Older hosts lack the export, and mapSection then uses MapViewOfFile.
-	modKernel32        = windows.NewLazySystemDLL("kernel32.dll")
-	procMapViewOfFile3 = modKernel32.NewProc("MapViewOfFile3")
+	modKernelbase      = windows.NewLazySystemDLL("kernelbase.dll")
+	procMapViewOfFile3 = modKernelbase.NewProc("MapViewOfFile3")
 )
 
 // mapProtection holds the three Win32 views of one POSIX protection request.

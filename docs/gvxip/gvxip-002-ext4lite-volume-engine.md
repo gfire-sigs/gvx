@@ -6,9 +6,9 @@ This specification defines `ext4lite` (`pkg/sentry/fsimpl/ext4lite`), a Tier 1 r
 | :--- | :--- |
 | **Document ID** | `GVXIP-002` |
 | **Title** | `ext4lite` Single-File Volume and Overlay Engine |
-| **Status** | Draft Specification |
+| **Status** | Implemented |
 | **Isolation Tier** | Tier 1 (`pkg/sentry/fsimpl/ext4lite`, `pkg/gvx`) |
-| **Target Platforms** | `darwin/arm64`, `darwin/amd64`, `windows/amd64`, `windows/arm64`, `linux/amd64`, `linux/arm64` |
+| **Target Platforms** | `darwin/arm64`, `windows/amd64`, `windows/arm64`, `linux/amd64`, `linux/arm64` |
 | **Companion Spec** | [`gvxip-001-better-posix-hostfs.md`](gvxip-001-better-posix-hostfs.md) |
 
 ---
@@ -35,7 +35,7 @@ Directory bind mounts (`hostfs`) expose individual files on the host filesystem 
 
 | Format Candidate | On-Disk Allocation and Directory Structures | Estimated Pure-Go Subset Size | Small-File Inline Storage | Non-Sparse Dynamic Shrink Support | Verdict |
 | :--- | :--- | ---: | :--- | :--- | :--- |
-| **Linux `ext4` (`ext4lite` profile)** | Flat block and inode bitmaps, static inode array per group, linear `ext4_dir_entry_2` records, 4-entry inline `ext4_extent` | `~1,400` lines | Up to `156 bytes` inside each `256-byte` inode (`INLINE_DATA`) | Supported via `16 MiB` dynamic block-group append and tail `ftruncate` | **Selected** |
+| **Linux `ext4` (`ext4lite` profile)** | Flat block and inode bitmaps, static inode array per group, linear `ext4_dir_entry_2` records, 4-entry inline `ext4_extent` | `~1,400` lines | Up to `128 bytes` inside each `256-byte` inode (`INLINE_DATA`) | Supported via `16 MiB` dynamic block-group append and tail `ftruncate` | **Selected** |
 | **Linux `XFS`** | Dual free-space B+Trees (`bnobt`, `cntbt`), inode B+Trees (`inobt`, `finobt`), directory B+Trees | `~6,500` lines | Shortform directories only | Unsupported (`XFS` AGs cannot shrink online) | Rejected |
 | **Linux `Btrfs`** | Six coupled Copy-on-Write B-Trees (Root, Extent, Chunk, Device, FS, CSUM) | `~8,000` lines | Inline B-Tree leaf items | Supported via chunk tree relocation, high CoW amplification | Rejected |
 | **OpenZFS** | DMU, SPA, ZAP hash tables, indirect DNodes, 128-bit block pointers | `~20,000` lines | DNode bonus buffer | Unsupported on single-vdev files; absent from mainline Linux kernel | Rejected |
@@ -77,7 +77,7 @@ Pre-creating a 64 GiB sparse volume file via `ftruncate(fd, 64<<30)` fails acros
 | **Block Size** | `1024 << s_log_block_size` | `4,096 B` | Matches 4 KiB guest and host page size |
 | **Blocks per Group** | `s_blocks_per_group` | `4,096` (`16 MiB`) | Legal `ext4` multiple of 8 (`mkfs.ext4 -b 4096 -g 4096`); bounds physical growth step |
 | **Inodes per Group** | `s_inodes_per_group` | `4,096` | Provides `1` inode per `4 KiB` of group space; prevents inode exhaustion on small-file trees |
-| **Inode Size** | `s_inode_size` | `256 B` | Holds `60 B` `i_block` plus `96 B` extra inline-data or `xattr` payload |
+| **Inode Size** | `s_inode_size` | `256 B` | Holds `60 B` `i_block` plus `96 B` inline `xattr` area (`68 B` max `system.data` payload) |
 | **Reserved GDT Blocks** | `Blocks 1..64` | `64 blocks` (`256 KiB`) | Pre-allocates descriptor slots for `4,096` groups (`64 GiB`) so appending a group never moves data blocks |
 
 ### 2.2 Platform Storage Contingency Matrix
@@ -104,20 +104,20 @@ Every unmounted or synced `ext4lite` image is a valid little-endian Linux `ext4`
 
 ### 3.1 Inode, Inline Data, and Extent Layout
 
-Each `256-byte` `ext4_inode` stores file metadata, inline small-file or symlink content up to `156 bytes`, or an `ext4_extent` tree header inside `i_block[60]`.
+Each `256-byte` `ext4_inode` stores file metadata, inline small-file content up to `128 bytes`, fast symlinks up to `59 bytes`, or an `ext4_extent` tree header inside `i_block[60]`.
 
 ```text
 0x00..0x27 (40B):  i_mode, i_uid, i_size_lo, i_atime, i_ctime, i_mtime, i_dtime, i_gid, i_links_count
 0x28..0x63 (60B):  i_block[60]: Inline data bytes [0..59] OR ext4_extent_header (12B) + 4 x ext4_extent (48B)
 0x64..0x7F (28B):  i_generation, i_file_acl_lo, i_size_high, i_osd2 (high 16 bits of uid, gid, links)
 0x80..0x9F (32B):  i_extra_isize (32), nanosecond timestamps (ctime_extra, mtime_extra, atime_extra, crtime)
-0xA0..0xFF (96B):  Inline xattr area (4B magic 0xEA020000 + "system.data" inline tail [60..155] or xattrs)
+0xA0..0xFF (96B):  Inline xattr area (4B magic 0xEA020000 + "system.data" entry + inline tail [60..127])
 ```
 
 | File Size or Type | `i_flags` Bit | Storage Location | Allocated 4 KiB Data Blocks |
 | :--- | :--- | :--- | ---: |
-| Regular file or symlink `0..60 B` | `EXT4_INLINE_DATA_FL` (`0x10000000`) | `i_block[0..59]` inside the `256 B` inode | `0` |
-| Regular file or symlink `61..156 B` | `EXT4_INLINE_DATA_FL` (`0x10000000`) | `i_block[0..59]` plus `system.data` inline xattr (`0xA0..0xFF`) | `0` |
+| Regular file `0..60 B` or fast symlink `< 60 B` | `EXT4_INLINE_DATA_FL` (`0x10000000`, regular files) | `i_block[0..59]` inside the `256 B` inode | `0` |
+| Regular file `61..128 B` | `EXT4_INLINE_DATA_FL` (`0x10000000`) | `i_block[0..59]` plus `system.data` inline xattr (`0xA0..0xFF`) | `0` |
 | Regular file or directory `<= 4` extents (up to `512 MiB` contiguous) | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `ext4_extent_header` (`eh_depth == 0`) + up to 4 `ext4_extent` structs in `i_block` | `ceil(size / 4096)` |
 | Regular file `> 4` extents | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `ext4_extent_header` (`eh_depth == 1`) + up to 4 `ext4_extent_idx` pointers to 4 KiB leaf extent blocks (up to `340` extents per leaf) | `ceil(size / 4096) + leafBlocks` |
 

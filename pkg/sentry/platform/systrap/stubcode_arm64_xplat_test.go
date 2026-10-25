@@ -135,11 +135,11 @@ func newSpillRig(t *testing.T) *spillRig {
 	}
 	r.guest[16], r.guest[17] = rigGuestX16, rigGuestX17
 	copy(m.x[:], r.guest[:])
-	// The slot clobbered x16 and x17 and saved the guest values below sp.
+	// The slot clobbered x16 and x17 and saved the guest values in the sysmsg scratch words.
 	m.x[16], m.x[17] = rigCode, rigTail
 	m.sp = rigStack
-	m.put64(rigStack-512, rigGuestX16)
-	m.put64(rigStack-504, rigGuestX17)
+	m.put64(rigSysm+winOffScratch, rigGuestX16)
+	m.put64(rigSysm+winOffScratch+8, rigGuestX17)
 	m.n, m.z, m.c, m.v = true, false, true, false
 	m.tpidr = rigSysm
 	m.put64(rigSysm+winOffGuestEvent, rigGuestEv)
@@ -203,15 +203,15 @@ func (r *spillRig) checkSaved(t *testing.T) {
 }
 
 // checkHotExit verifies a hot return: the routine branched to the tail with
-// the registers of the sysmsg and wrote x16 and x17 below the stack pointer.
+// the registers of the sysmsg and wrote x16 and x17 to the scratch words.
 func (r *spillRig) checkHotExit(t *testing.T, want [31]uint64) {
 	t.Helper()
 	m := r.m
 	if m.exit.brk != -1 || m.exit.jump != rigTail {
 		t.Fatalf("the routine ended with brk %d, jump %#x; want a jump to the tail %#x", m.exit.brk, m.exit.jump, uint64(rigTail))
 	}
-	// The tail loads x16 and x17 from below the stack pointer.
-	m.x[16], m.x[17] = m.get64(m.sp-512), m.get64(m.sp-504)
+	// The tail loads x16 and x17 from the scratch words of the sysmsg.
+	m.x[16], m.x[17] = m.get64(rigSysm+winOffScratch), m.get64(rigSysm+winOffScratch+8)
 	for i := 0; i < 31; i++ {
 		if m.x[i] != want[i] {
 			t.Errorf("x%d = %#x after the return, want %#x", i, m.x[i], want[i])
@@ -358,7 +358,7 @@ func TestSpillSleepsAgainAfterStaleWake(t *testing.T) {
 	r.checkHotExit(t, r.guest)
 }
 
-func TestSpillHotReturnWritesGuestX16X17BelowStack(t *testing.T) {
+func TestSpillHotReturnWritesGuestX16X17ToScratch(t *testing.T) {
 	r := newSpillRig(t)
 	m := r.m
 	want := r.guest
@@ -366,9 +366,9 @@ func TestSpillHotReturnWritesGuestX16X17BelowStack(t *testing.T) {
 	m.onYield = func(m *a64Machine) {
 		m.put64(rigSysm+winOffX+8*16, 0xAAAA)
 		m.put64(rigSysm+winOffX+8*17, 0xBBBB)
-		// The guest stack words hold stale values.
-		m.put64(rigStack-512, 0)
-		m.put64(rigStack-504, 0)
+		// The scratch words hold stale values.
+		m.put64(rigSysm+winOffScratch, 0)
+		m.put64(rigSysm+winOffScratch+8, 0)
 		r.setState(winStateRunHot)
 	}
 	if err := m.run(100000); err != nil {
@@ -456,6 +456,7 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	// with x17 set to the tail.
 	m := newA64Machine(buf, slot)
 	m.sp = rigStack
+	m.tpidr = rigSysm
 	m.x[16], m.x[17] = rigGuestX16, rigGuestX17
 	for i, b := range buf {
 		m.mem[slot+uint64(i)] = b
@@ -469,8 +470,8 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	if m.x[17] != tailVA {
 		t.Fatalf("x17 = %#x at the jump, the tail is %#x", m.x[17], uint64(tailVA))
 	}
-	if m.get64(rigStack-512) != rigGuestX16 || m.get64(rigStack-504) != rigGuestX17 {
-		t.Fatal("the slot did not save x16 and x17 below the stack pointer")
+	if m.get64(rigSysm+winOffScratch) != rigGuestX16 || m.get64(rigSysm+winOffScratch+8) != rigGuestX17 {
+		t.Fatal("the slot did not save x16 and x17 in the sysmsg scratch words")
 	}
 	// The tail restores x16 and x17 and branches to the instruction after the site.
 	m.x[16], m.x[17] = 0, 0

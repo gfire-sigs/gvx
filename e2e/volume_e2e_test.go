@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -74,10 +73,7 @@ func TestE2EVolumePersistsAcrossSandboxes(t *testing.T) {
 				if !rep.Lockdown.UnboundFileOpenBlocked {
 					t.Errorf("%s: UnboundFileOpenBlocked = false, want true for a sandbox with only an ext4lite volume", mode)
 				}
-				// The Windows lockdown blocks opens only on the threads that hold
-				// the restricted token, so a read from the main thread can work.
-				// The write is denied by the Low integrity level on every OS.
-				if rep.WriteOutsideErr == "" || (rep.ReadOutsideErr == "" && runtime.GOOS != "windows") {
+				if rep.WriteOutsideErr == "" || rep.ReadOutsideErr == "" {
 					t.Errorf("%s: host access outside the volume = (read err %q, write err %q), want both denied", mode, rep.ReadOutsideErr, rep.WriteOutsideErr)
 				}
 				if msg := rep.GuestRunErr; strings.Contains(msg, "not position-independent") || strings.Contains(msg, "cannot hold the zone") {

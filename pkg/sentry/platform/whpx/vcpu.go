@@ -21,6 +21,8 @@ import (
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // rekickInterval is how long kickAndWait waits before it sends the cancel
@@ -53,7 +55,8 @@ type vcpu struct {
 	fpOwner *Context
 
 	// st is the architecture state that only the holder uses.
-	st vpState
+	st  vpState
+	ids hvcommon.IDRegisters
 
 	// runMu guards inGuest, epoch and alive. cond wakes kickAndWait.
 	runMu   sync.Mutex
@@ -82,6 +85,7 @@ func newVP(p *Platform, index uint32) (*vcpu, error) {
 		commVA: p.kernel.layout.comm(int(index)),
 		regs:   newRegBatch(regBatchCap),
 		exit:   alignedBuf(exitCtxBufSize, 16),
+		ids:    hvcommon.DefaultIDRegisters(),
 		alive:  true,
 	}
 	v.cond = sync.NewCond(&v.runMu)
@@ -207,6 +211,9 @@ func (p *Platform) acquire(c *Context) (*vcpu, error) {
 			p.vps = append(p.vps, v)
 			v.busy = true
 			return v, nil
+		}
+		if c.kicked.Swap(false) {
+			return nil, platform.ErrContextInterrupt
 		}
 		p.waiters++
 		p.cond.Wait()

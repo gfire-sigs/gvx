@@ -50,7 +50,7 @@ const (
 
 // The slot sizes in bytes.
 const (
-	memSlotSize  = 64
+	memSlotSize  = 80
 	adrpSlotSize = 16
 	brSlotSize   = 16
 	blrSlotSize  = 32
@@ -266,7 +266,10 @@ func encodeMemSlot(buf []byte, slotVA, site uint64, insn uint32, acc memAccess) 
 	w := make([]uint32, tests, memSlotSize/4)
 	biased := insn
 	if acc.fixesValue() {
-		w = append(w, arm64STPx16x17)
+		ptr := sysmsgPointer()
+		w = append(w, ptr[0], ptr[1],
+			strFromSysmsg(16, scratchOffset),
+			strFromSysmsg(17, scratchOffset+8))
 		if acc.storeFirst {
 			w = append(w, zoneMovX16|uint32(acc.base)<<16)
 			biased = biased&^0x1f | 16
@@ -283,7 +286,10 @@ func encodeMemSlot(buf []byte, slotVA, site uint64, insn uint32, acc memAccess) 
 		w = append(w, encodeBiasAnd(acc.base, acc.base))
 	}
 	if acc.fixesValue() {
-		w = append(w, arm64LDPx16x17)
+		ptr := sysmsgPointer()
+		w = append(w, ptr[0], ptr[1],
+			ldrFromSysmsg(16, scratchOffset),
+			ldrFromSysmsg(17, scratchOffset+8))
 	}
 	back, err := encodeBranch(slotVA+uint64(len(w))*4, site+4)
 	if err != nil {

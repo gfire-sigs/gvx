@@ -19,6 +19,7 @@ package hostlockdown
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -85,6 +86,10 @@ func findLogonSID(groups []windows.SIDAndAttributes) (*windows.SID, error) {
 // into a deny-only SID: the user SID and all groups except the logon SID, the
 // integrity label and groups that are already deny-only or disabled.
 func denyOnlySIDs(user *windows.SID, groups []windows.SIDAndAttributes) []windows.SIDAndAttributes {
+	return denyOnlySIDsForMode(user, groups, false)
+}
+
+func denyOnlySIDsForMode(user *windows.SID, groups []windows.SIDAndAttributes, allowOutboundNet bool) []windows.SIDAndAttributes {
 	out := []windows.SIDAndAttributes{{Sid: user, Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY}}
 	for _, g := range groups {
 		switch {
@@ -92,11 +97,54 @@ func denyOnlySIDs(user *windows.SID, groups []windows.SIDAndAttributes) []window
 		case g.Attributes&windows.SE_GROUP_INTEGRITY != 0:
 		case g.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY != 0:
 		case g.Attributes&windows.SE_GROUP_ENABLED == 0:
+		case allowOutboundNet && isEveryoneSID(g.Sid):
 		default:
 			out = append(out, windows.SIDAndAttributes{Sid: g.Sid, Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY})
 		}
 	}
 	return out
+}
+
+func isEveryoneSID(sid *windows.SID) bool {
+	return sid != nil && sid.IsValid() &&
+		sid.IdentifierAuthority() == windows.SECURITY_WORLD_SID_AUTHORITY &&
+		sid.SubAuthorityCount() == 1 && sid.SubAuthority(0) == 0
+}
+
+type tokenDefaultDACL struct {
+	DefaultDACL *windows.ACL
+}
+
+// grantLogonInDefaultDACL adds the logon SID with GENERIC_ALL to the default
+// DACL of token so unnamed kernel objects created by the process (such as the
+// containment job, anonymous sections, events, and impersonation tokens) remain
+// accessible after threads bind the restricted token.
+func grantLogonInDefaultDACL(token windows.Token, logon *windows.SID) error {
+	buf, err := tokenInformation(token, windows.TokenDefaultDacl)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: GetTokenInformation(TokenDefaultDacl): %w", err)
+	}
+	tdd := (*tokenDefaultDACL)(unsafe.Pointer(&buf[0]))
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	pin.Pin(logon)
+	entries := []windows.EXPLICIT_ACCESS{
+		sidEntry(logon, windows.GENERIC_ALL, windows.GRANT_ACCESS, windows.NO_INHERITANCE),
+	}
+	merged, err := windows.ACLFromEntries(entries, tdd.DefaultDACL)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: build TokenDefaultDacl: %w", err)
+	}
+	newTDD := tokenDefaultDACL{DefaultDACL: merged}
+	if err := windows.SetTokenInformation(
+		token,
+		windows.TokenDefaultDacl,
+		(*byte)(unsafe.Pointer(&newTDD)),
+		uint32(unsafe.Sizeof(newTDD)),
+	); err != nil {
+		return fmt.Errorf("hostlockdown: SetTokenInformation(TokenDefaultDacl): %w", err)
+	}
+	return nil
 }
 
 // tokenInformation returns the raw TokenInformation buffer for class.
@@ -200,12 +248,13 @@ func isLowIntegritySID(sid *windows.SID) bool {
 
 // createRestrictedImpersonationToken copies the live token into an
 // impersonation token with DISABLE_MAX_PRIVILEGE, deny-only SIDs and the
-// logon SID as the only restricting SID. The system grants access only when
-// both the enabled SIDs and the restricting SIDs allow it.
+// logon SID as the restricting SID (plus Everyone when allowOutboundNet is
+// true so Winsock may open \Device\Afd\Endpoint). The system grants access
+// only when both the enabled SIDs and the restricting SIDs allow it.
 //
 // The impersonation copy keeps TOKEN_IMPERSONATE access, which SetThreadToken
 // needs. WRITE_RESTRICTED stays off so that the restriction covers reads.
-func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity) (windows.Token, error) {
+func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity, allowOutboundNet bool) (windows.Token, error) {
 	var imp windows.Token
 	if err := windows.DuplicateTokenEx(
 		primary,
@@ -219,8 +268,15 @@ func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity
 	}
 	defer imp.Close()
 
-	deny := denyOnlySIDs(id.user, id.groups)
+	deny := denyOnlySIDsForMode(id.user, id.groups, allowOutboundNet)
 	restrict := []windows.SIDAndAttributes{{Sid: id.logon}}
+	if allowOutboundNet {
+		everyoneSID, err := windows.StringToSid("S-1-1-0")
+		if err != nil {
+			return 0, fmt.Errorf("hostlockdown: parse S-1-1-0: %w", err)
+		}
+		restrict = append(restrict, windows.SIDAndAttributes{Sid: everyoneSID})
+	}
 	var restricted windows.Token
 	r1, _, callErr := procCreateRestrictedToken.Call(
 		uintptr(imp),

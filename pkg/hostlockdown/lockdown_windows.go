@@ -18,8 +18,12 @@ package hostlockdown
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -37,6 +41,9 @@ var (
 // its error. Status fields change only after the step succeeded and its effect
 // was read back from the OS.
 func applyOSLockdown(opts Options) (st Status, err error) {
+	if opts.AllowOutboundNet {
+		prewarmWinsock()
+	}
 	primary, err := openPrimaryToken()
 	if err != nil {
 		return Status{}, err
@@ -44,6 +51,9 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	defer primary.Close()
 	id, err := readTokenIdentity(primary)
 	if err != nil {
+		return Status{}, err
+	}
+	if err := grantLogonInDefaultDACL(primary, id.logon); err != nil {
 		return Status{}, err
 	}
 
@@ -75,8 +85,8 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	}
 	st.IntegrityDowngraded = true
 
-	// Step 4: restricted impersonation token for BindThread.
-	restricted, err := createRestrictedImpersonationToken(primary, id)
+	// Step 4: restricted impersonation token for the process threads and BindThread.
+	restricted, err := createRestrictedImpersonationToken(primary, id, opts.AllowOutboundNet)
 	if err != nil {
 		return Status{}, err
 	}
@@ -89,7 +99,12 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	if err := probeRestrictedOpenBlocked(restricted, mountsReal); err != nil {
 		return Status{}, err
 	}
-	st.UnboundFileOpenBlocked = true
+	if !opts.AllowOutboundNet {
+		if err := probeRestrictedSocketBlocked(restricted); err != nil {
+			return Status{}, err
+		}
+		st.NetworkOutboundBlocked = true
+	}
 
 	// Steps 5 to 7: containment job.
 	job, err := createContainmentJob(opts.CPUQuotaMillis)
@@ -106,12 +121,85 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	}
 	st.Win32kBlocked = true
 
+	// Step 9: attach the restricted impersonation token to every existing
+	// thread in the process so unbound file opens and disallowed socket
+	// creations fail across the process.
+	if err := bindProcessThreads(restricted); err != nil {
+		_ = windows.CloseHandle(job)
+		return Status{}, err
+	}
+	st.UnboundFileOpenBlocked = true
+
 	handlesMu.Lock()
 	restrictedToken = restricted
 	containmentJob = job
 	handlesMu.Unlock()
 	keep = true
 	return st, nil
+}
+
+// prewarmWinsock initializes Winsock DLLs, ConnectEx, and the Go runtime IOCP
+// netpoller before the restricted token blocks DLL file opens in System32.
+func prewarmWinsock() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err == nil {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if c, acceptErr := ln.Accept(); acceptErr == nil {
+				_ = c.Close()
+			}
+		}()
+		if c, dialErr := net.DialTimeout("tcp", ln.Addr().String(), time.Second); dialErr == nil {
+			_ = c.Close()
+		}
+		_ = ln.Close()
+		<-done
+	}
+	if pc, err := net.ListenPacket("udp", "127.0.0.1:0"); err == nil {
+		_ = pc.Close()
+	}
+}
+
+func bindProcessThreads(token windows.Token) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	pid := windows.GetCurrentProcessId()
+	selfTID := windows.GetCurrentThreadId()
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: CreateToolhelp32Snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snap)
+
+	var te windows.ThreadEntry32
+	te.Size = uint32(unsafe.Sizeof(te))
+	var handles []windows.Handle
+	defer func() {
+		for _, h := range handles {
+			_ = windows.CloseHandle(h)
+		}
+	}()
+	for err := windows.Thread32First(snap, &te); err == nil; err = windows.Thread32Next(snap, &te) {
+		if te.OwnerProcessID != pid || te.ThreadID == selfTID {
+			continue
+		}
+		h, openErr := windows.OpenThread(windows.THREAD_SET_THREAD_TOKEN, false, te.ThreadID)
+		if openErr != nil {
+			continue
+		}
+		handles = append(handles, h)
+	}
+	for _, h := range handles {
+		if err := windows.SetThreadToken(&h, token); err != nil {
+			return fmt.Errorf("hostlockdown: SetThreadToken(peer thread): %w", err)
+		}
+	}
+	if err := windows.SetThreadToken(nil, token); err != nil {
+		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)
+	}
+	return nil
 }
 
 func openPrimaryToken() (windows.Token, error) {

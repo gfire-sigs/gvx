@@ -112,12 +112,18 @@ func newContext(p *Platform) *Context {
 }
 
 // NotifyInterrupt implements interrupt.Receiver. It stops the virtual
-// processor of a running Switch.
+// processor of a running Switch or wakes a Context waiting for a free vCPU.
 func (c *Context) NotifyInterrupt() {
 	c.kicked.Store(true)
 	if v := c.vp.Load(); v != nil {
 		v.kickRunning()
+		return
 	}
+	c.p.mu.Lock()
+	if c.p.waiters > 0 {
+		c.p.cond.Broadcast()
+	}
+	c.p.mu.Unlock()
 }
 
 // affinityVP returns the virtual processor that Switch must use, or the one
@@ -149,7 +155,7 @@ func (c *Context) evict(v *vcpu) {
 }
 
 // Switch implements platform.Context.Switch.
-func (c *Context) Switch(_ pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, _ int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (c *Context) Switch(_ pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, _ int32) (sig *linux.SignalInfo, at hostarch.AccessType, retErr error) {
 	as, ok := mm.AddressSpace().(*AddressSpace)
 	if !ok || as == nil || as.p != c.p {
 		return nil, hostarch.NoAccess, fmt.Errorf("whpx: address space does not belong to this platform")
@@ -162,7 +168,12 @@ func (c *Context) Switch(_ pkgcontext.Context, mm platform.MemoryManager, ac *ar
 	if !c.interrupt.Enable() {
 		return nil, hostarch.NoAccess, platform.ErrContextInterrupt
 	}
-	defer c.interrupt.Disable()
+	defer func() {
+		c.interrupt.Disable()
+		if retErr != platform.ErrContextInterrupt && c.kicked.Swap(false) {
+			c.interrupt.NotifyInterrupt()
+		}
+	}()
 
 	// The hypervisor runs a virtual processor on the calling thread, and the
 	// restricted token binds to that thread.
@@ -228,6 +239,17 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 			}
 			return r
 		case exitCanceled:
+			if ExitReason(atomic.LoadUint32(&v.comm.ExitReason)) != ExitNone {
+				// The stub finished spilling guest state into the CommPage
+				// right as WHvCancelRunVirtualProcessor stopped the vCPU at
+				// HLT/HVC. Serve the completed stub exit instead of treating
+				// the post-HLT/HVC PC as a mid-stub cancellation.
+				r, resume := c.onStubExit(v, ex, ac)
+				if resume {
+					continue
+				}
+				return r
+			}
 			action, err := c.onCancel(v, ex, ac)
 			if err != nil {
 				v.st.invalidate()

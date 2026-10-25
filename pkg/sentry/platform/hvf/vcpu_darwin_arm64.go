@@ -120,7 +120,7 @@ func (w *vcpuWorker) configure() error {
 	if err := w.readIDRegisters(); err != nil {
 		return err
 	}
-	w.ids.counter = readSystemCounter
+	w.ids.Counter = readSystemCounter
 	w.needsReset = true
 	return nil
 }
@@ -131,14 +131,14 @@ func (w *vcpuWorker) readIDRegisters() error {
 		reg uint32
 		dst *uint64
 	}{
-		{hvSysRegMIDR, &w.ids.midr},
-		{hvSysRegIDAA64PFR0, &w.ids.pfr0},
-		{hvSysRegIDAA64PFR1, &w.ids.pfr1},
-		{hvSysRegIDAA64ISAR0, &w.ids.isar0},
-		{hvSysRegIDAA64ISAR1, &w.ids.isar1},
-		{hvSysRegIDAA64MMFR0, &w.ids.mmfr0},
-		{hvSysRegIDAA64MMFR1, &w.ids.mmfr1},
-		{hvSysRegIDAA64MMFR2, &w.ids.mmfr2},
+		{hvSysRegMIDR, &w.ids.MIDR},
+		{hvSysRegIDAA64PFR0, &w.ids.PFR0},
+		{hvSysRegIDAA64PFR1, &w.ids.PFR1},
+		{hvSysRegIDAA64ISAR0, &w.ids.ISAR0},
+		{hvSysRegIDAA64ISAR1, &w.ids.ISAR1},
+		{hvSysRegIDAA64MMFR0, &w.ids.MMFR0},
+		{hvSysRegIDAA64MMFR1, &w.ids.MMFR1},
+		{hvSysRegIDAA64MMFR2, &w.ids.MMFR2},
 	} {
 		v, err := hvGetSysReg(w.id, f.reg)
 		if err != nil {
@@ -429,14 +429,14 @@ func (w *vcpuWorker) onStubExit(ac *arch.Context64) (bool, *linux.SignalInfo, ho
 		return true, act.info, act.at, platform.ErrContextSignal
 	case exitSysReg:
 		iss := decodeSysRegISS(comm.ESR)
-		val, ok := w.ids.emulateSysRegRead(iss)
+		val, ok := w.ids.EmulateSysRegRead(iss)
 		if !ok {
 			// Writes and unknown registers raise SIGILL, as Linux does.
 			ill := signalAction(linux.SIGILL, sigIllIllOpc, comm.PC, hostarch.NoAccess)
 			return true, ill.info, ill.at, platform.ErrContextSignal
 		}
-		if iss.rt != 31 {
-			comm.Regs[iss.rt] = val
+		if iss.Rt != 31 {
+			comm.Regs[iss.Rt] = val
 		}
 		comm.PC += 4
 		return false, nil, hostarch.NoAccess, nil
@@ -469,9 +469,9 @@ func (w *vcpuWorker) onHypervisorException() (bool, *linux.SignalInfo, hostarch.
 		return false, nil, hostarch.NoAccess, w.advancePC()
 	case exitSysReg:
 		iss := decodeSysRegISS(exit.syndrome)
-		if val, ok := w.ids.emulateSysRegRead(iss); ok {
-			if iss.rt != 31 {
-				if err := hvSetReg(w.id, hvRegX0+iss.rt, val); err != nil {
+		if val, ok := w.ids.EmulateSysRegRead(iss); ok {
+			if iss.Rt != 31 {
+				if err := hvSetReg(w.id, hvRegX0+iss.Rt, val); err != nil {
 					w.invalidateState()
 					return true, nil, hostarch.NoAccess, err
 				}

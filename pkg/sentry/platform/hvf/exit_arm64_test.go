@@ -150,13 +150,13 @@ func TestDecodeHypervisorExit(t *testing.T) {
 
 func TestEmulateSysRegRead(t *testing.T) {
 	ids := &idRegisters{
-		midr: 0x610f0000, pfr0: 0x1101_0000_1011_0011 | 0xf<<32, pfr1: 0xff00,
-		isar0: 0x221100110212120, isar1: 0x11110211202 | 0xf<<4,
-		mmfr0: 0x10000f100001, mmfr1: 0x11212000, mmfr2: 0x1001001100001011,
-		counter: func() uint64 { return 0x1234 },
+		MIDR: 0x610f0000, PFR0: 0x1101_0000_1011_0011 | 0xf<<32, PFR1: 0xff00,
+		ISAR0: 0x221100110212120, ISAR1: 0x11110211202 | 0xf<<4,
+		MMFR0: 0x10000f100001, MMFR1: 0x11212000, MMFR2: 0x1001001100001011,
+		Counter: func() uint64 { return 0x1234 },
 	}
 	read := func(op0, op1, crn, crm, op2 uint32) sysRegISS {
-		return sysRegISS{read: true, rt: 3, op0: op0, op1: op1, crn: crn, crm: crm, op2: op2}
+		return sysRegISS{Read: true, Rt: 3, Op0: op0, Op1: op1, CRn: crn, CRm: crm, Op2: op2}
 	}
 	cases := []struct {
 		name string
@@ -164,30 +164,30 @@ func TestEmulateSysRegRead(t *testing.T) {
 		want uint64
 		ok   bool
 	}{
-		{"MIDR_EL1", read(3, 0, 0, 0, 0), ids.midr, true},
+		{"MIDR_EL1", read(3, 0, 0, 0, 0), ids.MIDR, true},
 		{"REVIDR_EL1", read(3, 0, 0, 0, 6), 0, true},
-		{"ID_AA64PFR0_EL1 hides SVE", read(3, 0, 0, 4, 0), ids.pfr0 &^ (0xf << 32), true},
+		{"ID_AA64PFR0_EL1 hides SVE", read(3, 0, 0, 4, 0), ids.PFR0 &^ (0xf << 32), true},
 		{"ID_AA64PFR1_EL1 hides MTE", read(3, 0, 0, 4, 1), 0xf000, true},
-		{"ID_AA64ISAR0_EL1", read(3, 0, 0, 6, 0), ids.isar0, true},
+		{"ID_AA64ISAR0_EL1", read(3, 0, 0, 6, 0), ids.ISAR0, true},
 		// 0x11110211202 has API=2 and GPI=1: both fields clear.
 		{"ID_AA64ISAR1_EL1 hides pointer authentication", read(3, 0, 0, 6, 1), 0x11100211002, true},
-		{"ID_AA64MMFR0_EL1", read(3, 0, 0, 7, 0), ids.mmfr0, true},
-		{"ID_AA64MMFR1_EL1", read(3, 0, 0, 7, 1), ids.mmfr1, true},
-		{"ID_AA64MMFR2_EL1", read(3, 0, 0, 7, 2), ids.mmfr2, true},
+		{"ID_AA64MMFR0_EL1", read(3, 0, 0, 7, 0), ids.MMFR0, true},
+		{"ID_AA64MMFR1_EL1", read(3, 0, 0, 7, 1), ids.MMFR1, true},
+		{"ID_AA64MMFR2_EL1", read(3, 0, 0, 7, 2), ids.MMFR2, true},
 		{"CNTPCT_EL0 comes from the counter", read(3, 3, 14, 0, 1), 0x1234, true},
 		{"CNTVCT_EL0 comes from the counter", read(3, 3, 14, 0, 2), 0x1234, true},
 		{"unknown register", read(3, 3, 9, 12, 0), 0, false},
 		{"ID_AA64DFR0_EL1 stays hidden", read(3, 0, 0, 5, 0), 0, false},
-		{"write to MIDR_EL1", sysRegISS{read: false, rt: 0, op0: 3}, 0, false},
+		{"write to MIDR_EL1", sysRegISS{Read: false, Rt: 0, Op0: 3}, 0, false},
 	}
 	for _, tc := range cases {
-		got, ok := ids.emulateSysRegRead(tc.iss)
+		got, ok := ids.EmulateSysRegRead(tc.iss)
 		if ok != tc.ok || got != tc.want {
 			t.Errorf("%s = (%#x, %v), want (%#x, %v)", tc.name, got, ok, tc.want, tc.ok)
 		}
 	}
-	ids.counter = nil
-	if _, ok := ids.emulateSysRegRead(read(3, 3, 14, 0, 1)); ok {
+	ids.Counter = nil
+	if _, ok := ids.EmulateSysRegRead(read(3, 3, 14, 0, 1)); ok {
 		t.Error("CNTPCT_EL0 emulated without a counter source")
 	}
 }
@@ -195,12 +195,12 @@ func TestEmulateSysRegRead(t *testing.T) {
 func TestDecodeSysRegISS(t *testing.T) {
 	// MRS X7, MIDR_EL1 (op0=3, op1=0, CRn=0, CRm=0, op2=0, direction read).
 	iss := decodeSysRegISS(esr(ecSysReg, 3<<20|7<<5|1))
-	if !iss.read || iss.rt != 7 || iss.key() != keyMIDR {
-		t.Errorf("decoded %+v (key %#x), want a read of MIDR_EL1 into X7", iss, iss.key())
+	if !iss.Read || iss.Rt != 7 || iss.Key() != keyMIDR {
+		t.Errorf("decoded %+v (key %#x), want a read of MIDR_EL1 into X7", iss, iss.Key())
 	}
 	// MSR TPIDR_EL0, X2 (op0=3, op1=3, CRn=13, CRm=0, op2=2, direction write).
 	iss = decodeSysRegISS(esr(ecSysReg, 3<<20|2<<17|3<<14|13<<10|2<<5))
-	if iss.read || iss.rt != 2 || iss.op0 != 3 || iss.op1 != 3 || iss.crn != 13 || iss.crm != 0 || iss.op2 != 2 {
+	if iss.Read || iss.Rt != 2 || iss.Op0 != 3 || iss.Op1 != 3 || iss.CRn != 13 || iss.CRm != 0 || iss.Op2 != 2 {
 		t.Errorf("decoded %+v, want a write of TPIDR_EL0 from X2", iss)
 	}
 }

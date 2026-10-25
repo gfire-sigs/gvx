@@ -466,6 +466,8 @@ func (c *Context) prepareResume(th *thread, ac *arch.Context64) uint32 {
 	th.sm.TLS = regs.TPIDR_EL0
 	// The real x18 of the thread holds no guest value. See patcher_arm64_x18.go.
 	th.sm.X18 = regs.Regs[x18Reg]
+	th.sm.Scratch[0] = regs.Regs[16]
+	th.sm.Scratch[1] = regs.Regs[17]
 	hot := th.lastKind == kindSyscall && !th.fresh && !c.needRestoreFP &&
 		regs.Pc == th.lastPC && regs.Sp == ss.SP && regs.Regs[29] == ss.FP && regs.Regs[30] == ss.LR &&
 		regs.Pstate&nzcvMask == uint64(ss.CPSR)&nzcvMask
@@ -587,17 +589,10 @@ func contextErr(err error, errno unix.Errno) signalAction {
 // handleSignal classifies a signal that the stub reported.
 func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, as *addressSpace, th *thread, ac *arch.Context64) signalAction {
 	sm := th.sm
-	// A fault on the tail of a trap slot happens after the Sentry resumed the
-	// thread and the reload restored every register but x16 and x17. The
-	// context in MC is then the final guest state, so the thread continues from
-	// it without touching the stack below the guest stack pointer.
-	if (sm.Sig == darwinSIGSEGV || sm.Sig == darwinSIGBUS) && as.isSlotTail(sm.FMC.SS.PC) {
-		if meta, ok := as.slotAt(sm.FMC.SS.PC, true); ok {
-			sm.MC.SS.PC = meta.site + 4
-			return signalAction{resume: true}
-		}
-	}
 	sm.MC = sm.FMC
+	if act, done := c.recoverTrapSlot(as, sm); done {
+		return act
+	}
 	if as.p.zone {
 		if act, done := c.zoneBodyFault(ctx, mm, as, sm.Sig, sm.MC.ES.ESR>>26, sm.MC.ES.FAR, sm.MC.SS.PC); done {
 			return act
@@ -611,22 +606,6 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 	far := sm.MC.ES.FAR
 	pc := sm.MC.SS.PC
 	ec := esr >> 26
-
-	// A fault on the first instruction of a trap slot leaves the guest
-	// registers intact. The Sentry then treats the slot as taken, so a guest
-	// with an unusable stack pointer still runs its system calls.
-	if (sig == darwinSIGSEGV || sig == darwinSIGBUS) && as.inIsland(pc) {
-		if meta, ok := as.slotAt(pc, false); ok && meta.kind.isTrap() {
-			sm.MC.SS.PC = meta.site + 4
-			if meta.kind == siteMSR {
-				sm.TLS = msrValue(sm, meta.reg)
-				return signalAction{resume: true}
-			}
-			c.pull(th, ac, meta.site+4, kindSignal)
-			ac.StateData().OrigR0 = sm.MC.SS.X[0]
-			return signalAction{}
-		}
-	}
 
 	if as.p.zone {
 		if act, done := c.zoneFault(ctx, mm, as, th, ac, sig, ec, esr, far, pc); done {
@@ -665,6 +644,33 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 	default:
 		return contextErr(fmt.Errorf("the stub task received host signal %d at %#x", sig, pc), unix.EFAULT)
 	}
+}
+
+// recoverTrapSlot repairs a fault inside a trap slot when an interrupt zeroed
+// the real x18 before a scratch load or store. Each four-word phase is
+// idempotent, so the thread restarts at the first instruction of the phase.
+func (c *Context) recoverTrapSlot(as *addressSpace, sm *sysmsg) (signalAction, bool) {
+	if sm.Sig != darwinSIGSEGV && sm.Sig != darwinSIGBUS {
+		return signalAction{}, false
+	}
+	if sm.MC.ES.FAR >= faultLowLimit {
+		return signalAction{}, false
+	}
+	pc := sm.MC.SS.PC
+	meta, start, ok := as.slotWithin(pc)
+	if !ok || !meta.kind.isTrap() {
+		return signalAction{}, false
+	}
+	off := pc - start
+	switch {
+	case off < 16:
+		sm.MC.SS.PC = start
+		return signalAction{resume: true}, true
+	case off >= trapSlotTailOffset && off < trapSlotTailOffset+16:
+		sm.MC.SS.PC = start + trapSlotTailOffset
+		return signalAction{resume: true}, true
+	}
+	return signalAction{}, false
 }
 
 // recoverX18Slot repairs a fault inside the slot of an instruction that names

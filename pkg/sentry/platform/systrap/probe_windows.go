@@ -62,7 +62,7 @@ func (as *addressSpace) installCode(ctx context.Context, mm platform.MemoryManag
 		return err
 	}
 	copy(pg.bytes(), code)
-	sites, err := as.patchPage(ctx, mm, base, pg.bytes())
+	sites, slots, err := as.patchPage(ctx, mm, base, pg.bytes())
 	if err != nil {
 		as.p.priv.release(pg)
 		return err
@@ -70,10 +70,11 @@ func (as *addressSpace) installCode(ctx context.Context, mm platform.MemoryManag
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if err := as.win.Map(base, blockSize, &pg.chunk.ref, pg.off, viewReadExec); err != nil {
+		freeSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return err
 	}
-	as.blocks[base] = &execBlock{base: base, state: blockExec, priv: pg, hasPriv: true, sites: sites}
+	as.blocks[base] = &execBlock{base: base, state: blockExec, priv: pg, hasPriv: true, sites: sites, slots: slots}
 	return flushInstructionCache(as.sp.proc, uintptr(base), blockSize)
 }
 

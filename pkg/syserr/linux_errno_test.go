@@ -88,3 +88,54 @@ func TestFromErrorKeepsAnErrnoThatHasNoHostName(t *testing.T) {
 		t.Fatalf("fromLinuxErrno(%d).ToLinux() = %d", maxErrno-1, got.ToLinux())
 	}
 }
+
+func TestFromHostSocketErrors(t *testing.T) {
+	cases := []struct {
+		host unix.Errno
+		want errno.Errno
+	}{
+		{unix.EWOULDBLOCK, errno.EAGAIN},
+		{unix.EINPROGRESS, errno.EINPROGRESS},
+		{unix.EALREADY, errno.EALREADY},
+		{unix.ENOTSOCK, errno.ENOTSOCK},
+		{unix.EDESTADDRREQ, errno.EDESTADDRREQ},
+		{unix.EMSGSIZE, errno.EMSGSIZE},
+		{unix.EPROTOTYPE, errno.EPROTOTYPE},
+		{unix.ENOPROTOOPT, errno.ENOPROTOOPT},
+		{unix.EPROTONOSUPPORT, errno.EPROTONOSUPPORT},
+		{unix.ESOCKTNOSUPPORT, errno.ESOCKTNOSUPPORT},
+		{unix.EOPNOTSUPP, errno.EOPNOTSUPP},
+		{unix.EPFNOSUPPORT, errno.EPFNOSUPPORT},
+		{unix.EAFNOSUPPORT, errno.EAFNOSUPPORT},
+		{unix.EADDRINUSE, errno.EADDRINUSE},
+		{unix.EADDRNOTAVAIL, errno.EADDRNOTAVAIL},
+		{unix.ENETDOWN, errno.ENETDOWN},
+		{unix.ENETUNREACH, errno.ENETUNREACH},
+		{unix.ENETRESET, errno.ENETRESET},
+		{unix.ECONNABORTED, errno.ECONNABORTED},
+		{unix.ECONNRESET, errno.ECONNRESET},
+		{unix.ENOBUFS, errno.ENOBUFS},
+		{unix.EISCONN, errno.EISCONN},
+		{unix.ENOTCONN, errno.ENOTCONN},
+		{unix.ESHUTDOWN, errno.ESHUTDOWN},
+		{unix.ETOOMANYREFS, errno.ETOOMANYREFS},
+		{unix.ETIMEDOUT, errno.ETIMEDOUT},
+		{unix.ECONNREFUSED, errno.ECONNREFUSED},
+		{unix.EHOSTDOWN, errno.EHOSTDOWN},
+		{unix.EHOSTUNREACH, errno.EHOSTUNREACH},
+		{unix.EDQUOT, errno.EDQUOT},
+		{unix.ESTALE, errno.ESTALE},
+	}
+	for _, tc := range cases {
+		err := FromHost(tc.host)
+		if err == nil {
+			t.Fatalf("FromHost(%v) = nil", tc.host)
+		}
+		if got := err.ToLinux(); got != tc.want {
+			t.Errorf("FromHost(%v).ToLinux() = %v (%d), want %v (%d)", tc.host, got, got, tc.want, tc.want)
+		}
+		if got := FromError(tc.host).ToLinux(); got != tc.want {
+			t.Errorf("FromError(%v).ToLinux() = %v (%d), want %v (%d)", tc.host, got, got, tc.want, tc.want)
+		}
+	}
+}

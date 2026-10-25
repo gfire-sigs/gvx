@@ -40,14 +40,71 @@ import (
 // margin covers the page size and the slot branch back.
 const winIslandReach = 120 << 20
 
+// winSlotUnit is the allocation quantum in bytes of an island page.
+const winSlotUnit = 16
+
+// winIslandUnits is the number of allocation units in one island page.
+const winIslandUnits = blockSize / winSlotUnit
+
+// winSlotRef identifies a range of bytes that an execBlock occupies in an island.
+type winSlotRef struct {
+	isl  *island
+	off  uint32
+	size uint32
+}
+
 // island is one page of trampoline slots.
 type island struct {
 	base uint64
 	page privPage
-	// used is the number of bytes of the page that slots occupy.
-	used uint32
+	// usedBits marks the 16-byte units of the page that slots occupy.
+	usedBits [winIslandUnits / 64]uint64
 	// slots maps the offset of each slot to the address of its patched site.
 	slots map[uint32]uint64
+}
+
+// alloc reserves a contiguous run of size bytes on isl and returns its byte offset.
+// Callers hold as.mu.
+func (isl *island) alloc(size uint32) (uint32, bool) {
+	need := int((size + winSlotUnit - 1) / winSlotUnit)
+	if need <= 0 || need > winIslandUnits {
+		return 0, false
+	}
+	run := 0
+	start := 0
+	for u := 0; u < winIslandUnits; u++ {
+		if isl.usedBits[u/64]&(uint64(1)<<(u%64)) != 0 {
+			run = 0
+			start = u + 1
+			continue
+		}
+		run++
+		if run == need {
+			for k := start; k < start+need; k++ {
+				isl.usedBits[k/64] |= uint64(1) << (k % 64)
+			}
+			return uint32(start * winSlotUnit), true
+		}
+	}
+	return 0, false
+}
+
+// free releases a slot range that alloc reserved and removes its site entry.
+// Callers hold as.mu.
+func (isl *island) free(off, size uint32) {
+	start := int(off / winSlotUnit)
+	count := int((size + winSlotUnit - 1) / winSlotUnit)
+	for k := start; k < start+count && k < winIslandUnits; k++ {
+		isl.usedBits[k/64] &^= uint64(1) << (k % 64)
+	}
+	delete(isl.slots, off)
+}
+
+// freeSlotRefsLocked releases every island slot in refs. Callers hold as.mu.
+func freeSlotRefsLocked(refs []winSlotRef) {
+	for _, r := range refs {
+		r.isl.free(r.off, r.size)
+	}
 }
 
 // islandRange tells MapFile what to do with a mapping that touches an island.
@@ -137,39 +194,47 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 	return inLow || inHigh
 }
 
-// installSlot allocates a slot within reach of site, lets encode write the slot
-// code, and returns the address of the slot. The page of the slot is the
-// private page that the stub maps for execution, so the slot is live as soon as
-// the call returns and the instruction cache of the stub is flushed.
-func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, site uint64, encode func(buf []byte, slotVA uint64) error) (uint64, error) {
-	isl, off, err := as.allocSlot(ctx, mm, site)
+// installSlot allocates a slot of size bytes within reach of site, lets encode
+// write the slot code, and returns the address and reference of the slot. The
+// page of the slot is the private page that the stub maps for execution, so the
+// slot is live as soon as the call returns and the instruction cache of the
+// stub is flushed.
+func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, site uint64, size uint32, encode func(buf []byte, slotVA uint64) error) (uint64, winSlotRef, error) {
+	isl, off, err := as.allocSlot(ctx, mm, site, size)
 	if err != nil {
-		return 0, err
+		return 0, winSlotRef{}, err
 	}
+	ref := winSlotRef{isl: isl, off: off, size: size}
 	slotVA := isl.base + uint64(off)
-	if err := encode(isl.page.bytes()[off:off+winSlotSize], slotVA); err != nil {
-		return 0, err
+	if err := encode(isl.page.bytes()[off:off+size], slotVA); err != nil {
+		as.mu.Lock()
+		isl.free(off, size)
+		as.mu.Unlock()
+		return 0, winSlotRef{}, err
 	}
 	as.mu.Lock()
 	isl.slots[off] = site
 	as.mu.Unlock()
-	if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), winSlotSize); err != nil {
-		return 0, err
+	if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), uintptr(size)); err != nil {
+		as.mu.Lock()
+		isl.free(off, size)
+		as.mu.Unlock()
+		return 0, winSlotRef{}, err
 	}
-	return slotVA, nil
+	return slotVA, ref, nil
 }
 
-// allocSlot returns space for a slot within reach of site. It creates an island
-// through the memory manager when no island has room.
-func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager, site uint64) (*island, uint32, error) {
+// allocSlot returns space for a slot of size bytes within reach of site. It
+// creates an island through the memory manager when no island has room.
+func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager, site uint64, size uint32) (*island, uint32, error) {
 	for range 3 {
 		as.mu.Lock()
 		for _, isl := range as.islands {
-			if absDiff(isl.base, site) < winIslandReach && isl.used+winSlotSize <= blockSize {
-				off := isl.used
-				isl.used += winSlotSize
-				as.mu.Unlock()
-				return isl, off, nil
+			if absDiff(isl.base, site) < winIslandReach {
+				if off, ok := isl.alloc(size); ok {
+					as.mu.Unlock()
+					return isl, off, nil
+				}
 			}
 		}
 		as.mu.Unlock()

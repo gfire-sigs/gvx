@@ -63,7 +63,22 @@ type execBlock struct {
 	at    hostarch.AccessType
 	state blockState
 	priv  uint64
+	slots []slotRef
 }
+
+// slotRef identifies one allocated range inside a trampoline island.
+type slotRef struct {
+	isl  *island
+	off  uint32
+	size uint32
+}
+
+// slotUnit is the allocation granularity of an island in bytes, and
+// islandUnits is the number of units in one island page.
+const (
+	slotUnit    = 8
+	islandUnits = blockSize / slotUnit
+)
 
 // patchItem is one instruction that the patcher replaces. x18 is set for the
 // instructions that name x18.
@@ -89,10 +104,47 @@ type slotMeta struct {
 
 // island is one host page of trampoline slots in the guest address space.
 type island struct {
-	base  uint64
-	page  uint64
-	used  uint32
-	slots map[uint32]slotMeta
+	base     uint64
+	page     uint64
+	usedBits [islandUnits / 64]uint64
+	slots    map[uint32]slotMeta
+}
+
+// alloc claims a contiguous range of size bytes in the island and returns its
+// byte offset. Callers hold as.mu.
+func (isl *island) alloc(size uint32) (uint32, bool) {
+	need := (size + slotUnit - 1) / slotUnit
+	if need == 0 || need > islandUnits {
+		return 0, false
+	}
+	var run, start uint32
+	for u := uint32(0); u < islandUnits; u++ {
+		if isl.usedBits[u/64]&(uint64(1)<<(u%64)) != 0 {
+			run = 0
+			continue
+		}
+		if run == 0 {
+			start = u
+		}
+		run++
+		if run == need {
+			for k := start; k < start+need; k++ {
+				isl.usedBits[k/64] |= uint64(1) << (k % 64)
+			}
+			return start * slotUnit, true
+		}
+	}
+	return 0, false
+}
+
+// free releases a slot range that alloc claimed. Callers hold as.mu.
+func (isl *island) free(off, size uint32) {
+	delete(isl.slots, off)
+	start := off / slotUnit
+	need := (size + slotUnit - 1) / slotUnit
+	for k := start; k < start+need && k < islandUnits; k++ {
+		isl.usedBits[k/64] &^= uint64(1) << (k % 64)
+	}
 }
 
 // addressSpace is one stub task and the guest mappings in it.
@@ -326,10 +378,21 @@ func (as *addressSpace) mapRunLocked(va, n, src uint64, at hostarch.AccessType) 
 // dropBlockLocked forgets the exec state of one block and frees its copy.
 func (as *addressSpace) dropBlockLocked(base uint64) {
 	if blk, ok := as.blocks[base]; ok {
+		as.freeSlotRefsLocked(blk.slots)
+		blk.slots = nil
 		if blk.priv != 0 {
 			as.p.pool.release(blk.priv)
 		}
 		delete(as.blocks, base)
+	}
+}
+
+// freeSlotRefsLocked releases the island slots in refs. Callers hold as.mu.
+func (as *addressSpace) freeSlotRefsLocked(refs []slotRef) {
+	for _, r := range refs {
+		if as.islands[r.isl.base] == r.isl {
+			r.isl.free(r.off, r.size)
+		}
 	}
 }
 
@@ -521,6 +584,12 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		})
 	}
 	touched := make(map[*island]struct{})
+	var allocated []slotRef
+	freeAllocated := func() {
+		as.mu.Lock()
+		as.freeSlotRefsLocked(allocated)
+		as.mu.Unlock()
+	}
 	for _, s := range items {
 		site := base + uint64(s.Offset)
 		if (s.Kind == siteMRS || s.Kind == siteCTR) && s.Reg == 31 {
@@ -534,8 +603,10 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		}
 		isl, off, slotVA, err := as.allocSlot(ctx, mm, site, size)
 		if err != nil {
+			freeAllocated()
 			return fmt.Errorf("allocate a trampoline slot for %#x: %w", site, err)
 		}
+		allocated = append(allocated, slotRef{isl: isl, off: off, size: uint32(size)})
 		buf := pageBytes(isl.page)[off:]
 		meta := slotMeta{site: site, kind: s.Kind, reg: s.Reg, size: uint32(size)}
 		switch s.Kind {
@@ -555,10 +626,12 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 			err = encodeTrapSlot(buf, slotVA, site+4, as.p.host.hello.Spill)
 		}
 		if err != nil {
+			freeAllocated()
 			return fmt.Errorf("encode the slot for %#x: %w", site, err)
 		}
 		br, err := encodeBranch(site, slotVA)
 		if err != nil {
+			freeAllocated()
 			return err
 		}
 		putWord(copyBuf[s.Offset:], br)
@@ -601,8 +674,10 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 			}
 			isl, off, slotVA, err := as.allocSlot(ctx, mm, site, size)
 			if err != nil {
+				freeAllocated()
 				return fmt.Errorf("allocate a zone slot for %#x: %w", site, err)
 			}
+			allocated = append(allocated, slotRef{isl: isl, off: off, size: uint32(size)})
 			buf := pageBytes(isl.page)[off:]
 			switch z.kind {
 			case siteAdrp:
@@ -611,10 +686,12 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 				_, err = encodeIndirectSlot(buf, slotVA, site, z.reg, z.link)
 			}
 			if err != nil {
+				freeAllocated()
 				return fmt.Errorf("encode the zone slot for %#x: %w", site, err)
 			}
 			br, err := encodeBranch(site, slotVA)
 			if err != nil {
+				freeAllocated()
 				return err
 			}
 			putWord(copyBuf[z.offset:], br)
@@ -630,6 +707,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 
 	privAddr, err := as.p.pool.alloc()
 	if err != nil {
+		freeAllocated()
 		return err
 	}
 	priv := pageBytes(privAddr)
@@ -639,15 +717,18 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if cur := as.blocks[base]; as.released || cur != blk || blk.state != blockData || blk.src != src {
+		as.freeSlotRefsLocked(allocated)
 		as.p.pool.release(privAddr)
 		return errPatchRaced
 	}
 	if err := as.mapPages(base, blockSize, privAddr, vmProtRead|vmProtExecute); err != nil {
+		as.freeSlotRefsLocked(allocated)
 		as.p.pool.release(privAddr)
 		return err
 	}
 	blk.priv = privAddr
 	blk.state = blockExec
+	blk.slots = allocated
 	as.patchedBlocks.Add(1)
 	return nil
 }
@@ -664,6 +745,8 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	if err := as.mapPages(base, blockSize, blk.src, stubProt(blk.at)); err != nil {
 		return false, err
 	}
+	as.freeSlotRefsLocked(blk.slots)
+	blk.slots = nil
 	as.p.pool.release(blk.priv)
 	blk.priv = 0
 	blk.state = blockData
@@ -713,11 +796,11 @@ func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager
 	for attempt := 0; attempt < 3; attempt++ {
 		as.mu.Lock()
 		for _, isl := range as.islands {
-			if absDiff(isl.base, site) < islandReach && isl.used+uint32(size) <= blockSize {
-				off := isl.used
-				isl.used += uint32(size)
-				as.mu.Unlock()
-				return isl, off, isl.base + uint64(off), nil
+			if absDiff(isl.base, site) < islandReach {
+				if off, ok := isl.alloc(uint32(size)); ok {
+					as.mu.Unlock()
+					return isl, off, isl.base + uint64(off), nil
+				}
 			}
 		}
 		as.mu.Unlock()

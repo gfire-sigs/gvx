@@ -49,7 +49,7 @@ The engine needs 4KB mappings of a shared memory file in the address space of an
 
 The window map in section 6.2 follows these rules. A mapping of arbitrary size becomes one view. A partial unmap unmaps the whole view and maps the surviving parts again.
 
-The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kernelbase.dll`. They are not exports of `kernel32.dll` on either runner. `pkg/memutil/memutil_windows.go` looks up `MapViewOfFile3` in `kernel32.dll`, so that path always falls back to `MapViewOfFile`. The fallback works for mappings in the current process. The engine binds its own calls in `nt_windows.go`.
+The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kernelbase.dll`. They are not exports of `kernel32.dll` on either runner. `pkg/memutil/memutil_windows.go` loads `MapViewOfFile3` from `kernelbase.dll` and keeps `MapViewOfFile` as a fallback. The engine binds its own calls in `nt_windows.go`.
 
 ### 3.2 Signaling and Process Cost
 
@@ -59,7 +59,7 @@ The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kern
 | Round trip of two auto-reset events between two processes | 19.5 to 27.4 µs | 12.0 to 12.6 µs |
 | `CreateProcess(CREATE_SUSPENDED)`, terminate, wait | 1.2 to 2.6 ms | 2.7 to 3.0 ms |
 
-`WaitOnAddress` keeps its wait list in the memory of one process, so it cannot signal across processes. The event round trip is the cost that a fast path would pay. The current engine does not use events.
+`WaitOnAddress` keeps its wait list in the memory of one process, so it cannot signal across processes. The event round trip is the cost that the fast path of section 6.8 pays when spinning does not wake the peer.
 
 ### 3.3 System Call Behavior
 
@@ -223,7 +223,7 @@ The low window is `[0x10000, 0x7ffe0000)`. It holds a non-PIE `ET_EXEC` image at
 
 The repair of a lost FS base treats a small positive offset from zero as a candidate. With the low window, that offset stops at `0x10000`, the lowest guest address. An access above it is a real guest access, for example to the TLS block of a static executable at `0x400000`.
 
-The memory file is a temporary file. `sectionCache` creates a section of that file for the file handle that `memmap.File.FD` returns, and it creates a new section when the file grows. A host file that the Sentry opened read-only, such as an erofs layer, maps through a read-only section. A file without a host handle, such as a workspace file of `hostfs`, maps through a copy of its bytes in an anonymous section. Such a mapping cannot be writable.
+The memory file is a temporary file. `sectionCache` creates a section of that file for the file handle that `memmap.File.FD` returns, and it creates a new section when the file grows. A host file that the Sentry opened read-only, such as an erofs layer, maps through a read-only section. `pkg/gvx` passes the kernel memory file to `hostfs` and `ext4lite` via `SetChunkMemory`, so their mapped chunks share a host handle and support writable mappings. A file without a host handle maps read-only through an anonymous section.
 
 ### 6.3 Page Trap and Patching
 
@@ -310,7 +310,7 @@ A patched instruction jumps to a slot. The slot jumps to the spill routine. The 
 
 The stub stores `Trapped` with release semantics and sets the guest event only when `SentryWaiter` is set. It then polls the state word 1024 times. After that it sets `StubWaiter`, tests the state again, and sleeps on the host event. The Sentry polls 512 times, sets `SentryWaiter`, tests again, and sleeps on the guest event. Each flag has one writer. A fence separates the store of the state from the load of the other flag. A stale event signal does no harm, because both sides test the state after each wake.
 
-On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot is the trap slot of the macOS engine. It saves `x16` and `x17` 512 bytes below the guest stack pointer. It jumps to the spill routine with `x17` set to the slot tail. The routine writes `x16` and `x17` below the stack pointer again before it returns, because a system call can change those words.
+On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot saves `x16` and `x17` in the `Scratch` words of `winSysmsg` without touching the guest stack. It jumps to the spill routine with `x17` set to the slot tail. The routine writes the updated `x16` and `x17` values back to `Scratch` before it returns through the slot tail.
 
 On `amd64`, the patcher replaces `syscall` and the three bytes after it with `jmp rel32`. The slot holds a copy of the instructions that those bytes belong to. The slot uses no guest stack, so it keeps the red zone. The patcher keeps `CC 90` in each of these cases:
 
@@ -356,7 +356,7 @@ The design rests on facts that no Windows document states:
 | End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
 | Latency | Not measured. |
 
-The engine never reuses a slot of an island, so a page that a guest patches again and again allocates more slots. A thread count above 512 for one stub fails with an error. An `arm64` guest must keep 512 bytes below its stack pointer writable at each system call.
+The engine reclaims island slots through a per-island bitmap when a code page unmaps or returns to data state. A thread count above 512 for one stub fails with an error.
 
 ## 7. Security Model
 
@@ -405,7 +405,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | Guest addresses outside the two windows | No guest mapping can use an address below `0x10000` or between `0x7ffe0000` and 16 TiB. The memory manager treats the second range as a hole. |
 | Writing to the executing page | A guest that writes to the page that it executes gets SIGSEGV. |
 | GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
-| Workspace files | A file without a host handle maps through a copy. A writable shared mapping of such a file fails with `ENODEV`. |
+| Workspace files | `pkg/gvx` passes the kernel memory file to `hostfs` and `ext4lite` via `SetChunkMemory`, so writable shared mappings work. A custom `memmap.File` without a host handle maps read-only through a copy and rejects writable shared mappings with `ENODEV`. |
 | Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. |
 | JIT engines | Node 22 (V8) passes its two gates on both runners. A JVM is untested. |
 | Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |

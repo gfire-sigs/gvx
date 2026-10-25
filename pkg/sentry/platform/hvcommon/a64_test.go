@@ -243,3 +243,30 @@ func TestTCRFieldValues(t *testing.T) {
 		}
 	}
 }
+
+func TestEmulateSysRegReadAndDefaults(t *testing.T) {
+	ids := DefaultIDRegisters()
+	read := func(op0, op1, crn, crm, op2 uint32) SysRegISS {
+		return SysRegISS{Read: true, Rt: 4, Op0: op0, Op1: op1, CRn: crn, CRm: crm, Op2: op2}
+	}
+	for _, tc := range []struct {
+		name string
+		iss  SysRegISS
+		want uint64
+		ok   bool
+	}{
+		{"MIDR_EL1", read(3, 0, 0, 0, 0), DefaultMIDREL1, true},
+		{"REVIDR_EL1", read(3, 0, 0, 0, 6), 0, true},
+		{"ID_AA64PFR0_EL1", read(3, 0, 0, 4, 0), DefaultIDAA64PFR0EL1, true},
+		{"ID_AA64ISAR0_EL1", read(3, 0, 0, 6, 0), DefaultIDAA64ISAR0EL1, true},
+		{"ID_AA64MMFR0_EL1", read(3, 0, 0, 7, 0), DefaultIDAA64MMFR0EL1, true},
+		{"CTR_EL0", read(3, 3, 0, 0, 1), DefaultCTREL0, true},
+		{"write rejected", SysRegISS{Read: false, Rt: 0, Op0: 3}, 0, false},
+		{"unknown rejected", read(3, 3, 9, 12, 0), 0, false},
+	} {
+		got, ok := ids.EmulateSysRegRead(tc.iss)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("%s = (%#x, %v), want (%#x, %v)", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+}

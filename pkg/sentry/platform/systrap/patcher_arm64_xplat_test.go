@@ -107,20 +107,36 @@ func TestTrapSlotLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := func(i int) uint32 { return binary.LittleEndian.Uint32(buf[4*i:]) }
-	// Disassembly: stp x16, x17, [sp, #-512]; adr x17, .+12; ldr x16, .+16; br x16;
-	// ldp x16, x17, [sp, #-512]; b ret; .quad spill.
-	if w(0) != 0xa92047f0 || w(1) != 0x10000071 || w(2) != 0x58000090 || w(3) != 0xd61f0200 || w(4) != 0xa96047f0 {
-		t.Errorf("slot words = %#x %#x %#x %#x %#x", w(0), w(1), w(2), w(3), w(4))
+	const (
+		wantMRS  = 0xd53bd060 | 18
+		wantAND  = 0x927df000 | 18<<5 | 18
+		wantSTR0 = 0xf9000000 | (trapScratchOffset/8)<<10 | 18<<5 | 16
+		wantSTR1 = 0xf9000000 | ((trapScratchOffset+8)/8)<<10 | 18<<5 | 17
+		wantADR  = 0x10000000 | 3<<5 | 17
+		wantLDRL = 0x58000000 | 7<<5 | 16
+		wantBR   = 0xd61f0200
+		wantLDR0 = 0xf9400000 | (trapScratchOffset/8)<<10 | 18<<5 | 16
+		wantLDR1 = 0xf9400000 | ((trapScratchOffset+8)/8)<<10 | 18<<5 | 17
+	)
+	wantWords := [...]uint32{
+		wantMRS, wantAND, wantSTR0, wantSTR1,
+		wantADR, wantLDRL, wantBR,
+		wantMRS, wantAND, wantLDR0, wantLDR1,
 	}
-	if target, ok := decodeBranch(slotVA+20, w(5)); !ok || target != ret {
+	for i, want := range wantWords {
+		if got := w(i); got != want {
+			t.Errorf("slot word %d = %#x, want %#x", i, got, want)
+		}
+	}
+	if target, ok := decodeBranch(slotVA+trapSlotTailOffset+16, w(11)); !ok || target != ret {
 		t.Errorf("slot returns to %#x, %v, want %#x", target, ok, uint64(ret))
 	}
-	if got := binary.LittleEndian.Uint64(buf[24:]); got != spill {
+	if got := binary.LittleEndian.Uint64(buf[trapSlotLitOffset:]); got != spill {
 		t.Errorf("slot literal = %#x, want %#x", got, uint64(spill))
 	}
 	// The slot must keep X30: no instruction of the slot writes x30.
-	for i := 0; i < 6; i++ {
-		if w(i)&0x1f == 30 && w(i)&0xffe00000 != 0xa9000000 && i != 5 {
+	for i := 0; i < 12; i++ {
+		if w(i)&0x1f == 30 && i != 11 {
 			t.Errorf("slot word %d (%#x) names x30", i, w(i))
 		}
 	}

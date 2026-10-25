@@ -370,7 +370,7 @@ const winSiteJump amd64SiteKind = 0x80
 // traps. page is a copy of the original frame. With the fast path, a SYSCALL
 // whose following instructions can move becomes a JMP to a trampoline slot,
 // and every other SYSCALL keeps the trap.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, error) {
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, []winSlotRef, error) {
 	before := as.neighborBytes(base, true, amd64MaxInsnLen)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
 	found := scanAMD64(before, page, after)
@@ -382,6 +382,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		plan = newJmpPlanner(before, append([]byte(nil), page...), after)
 	}
 	var keep []amd64Site
+	var slots []winSlotRef
 	sites := make(map[uint16]siteInfo, len(found))
 	// jumpEnd is the end of the bytes that the last JMP patch owns.
 	jumpEnd := 0
@@ -396,9 +397,10 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			continue
 		}
 		if as.p.fast && s.Kind == amd64SiteSyscall && s.Offset >= 0 {
-			if end, tail, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
+			if end, tail, ref, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
 				jumpEnd = end
 				sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
+				slots = append(slots, ref)
 				continue
 			}
 		}
@@ -408,37 +410,44 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		}
 	}
 	if _, err := patchAMD64(page, keep); err != nil {
-		return nil, err
+		as.mu.Lock()
+		freeSlotRefsLocked(slots)
+		as.mu.Unlock()
+		return nil, nil, err
 	}
-	return sites, nil
+	return sites, slots, nil
 }
 
 // patchJump replaces the SYSCALL at offset off of page with a JMP to a new
-// slot. It returns the end of the bytes that the patch owns and the address of
-// the slot tail, or false when the site keeps its trap.
-func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, uint64, bool) {
+// slot. It returns the end of the bytes that the patch owns, the address of
+// the slot tail, and the slot reference, or false when the site keeps its trap.
+func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, uint64, winSlotRef, bool) {
 	if hasPrefixBefore(plan.before, plan.page, off) {
 		// A prefix would apply to the JMP.
-		return 0, 0, false
+		return 0, 0, winSlotRef{}, false
 	}
 	reloc, ok := plan.plan(off)
 	if !ok {
-		return 0, 0, false
+		return 0, 0, winSlotRef{}, false
 	}
 	site := base + uint64(off)
-	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, site, winSlotSize, func(buf []byte, slotVA uint64) error {
 		return encodeWinSlot(buf, slotVA, site, as.p.spillVA(), reloc)
 	})
 	if err == nil {
-		err = patchJmp(page, off, site, slotVA)
+		if err = patchJmp(page, off, site, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
 	}
 	if err != nil {
 		if traceEvents {
 			tracef("no trampoline slot for the SYSCALL at %#x: %v", site, err)
 		}
-		return 0, 0, false
+		return 0, 0, winSlotRef{}, false
 	}
-	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, true
+	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, ref, true
 }
 
 // hasPrefixBefore reports whether the byte in front of page[off] is an
