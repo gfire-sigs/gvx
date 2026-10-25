@@ -372,7 +372,7 @@ func probeWine64PE32PlusExec() (string, string, error) {
 	}
 	defer syscall.Syscall(syscall.SYS_MUNMAP, addr, imageSize, 0)
 
-	mapped := unsafe.Slice((*byte)(unsafe.Pointer(addr)), imageSize)
+	mapped := mmapBytes(addr, imageSize)
 
 	// Apply per-section protections (.text RX, .rdata R, .data RW).
 	if err := syscall.Mprotect(mapped[0x4000:0x8000], syscall.PROT_READ|syscall.PROT_EXEC); err != nil {
@@ -423,7 +423,7 @@ func probeWine64PEMmapLayout() (string, string, error) {
 		syscall.Syscall(syscall.SYS_MUNMAP, peAddr, 4*pageSize, 0)
 		return "", "", fmt.Errorf("MAP_FIXED section split: addr=%#x errno=%v", secAddr, errno)
 	}
-	*(*uint64)(unsafe.Pointer(secAddr)) = 0x140000000
+	binary.LittleEndian.PutUint64(mmapBytes(secAddr, 8), 0x140000000)
 	syscall.Syscall(syscall.SYS_MUNMAP, peAddr, 4*pageSize, 0)
 
 	// 2. Low 32-bit address (< 2GB) hint allocation used by Wine64 for 32-bit structures.
@@ -431,7 +431,7 @@ func probeWine64PEMmapLayout() (string, string, error) {
 	if errno != 0 || lowAddr == 0 {
 		return "", "", fmt.Errorf("low32 mmap: addr=%#x errno=%v", lowAddr, errno)
 	}
-	*(*uint64)(unsafe.Pointer(lowAddr)) = 0x123456789abcdef0
+	binary.LittleEndian.PutUint64(mmapBytes(lowAddr, 8), 0x123456789abcdef0)
 
 	// 3. mremap expansion (MREMAP_MAYMOVE = 1).
 	remapped, _, errno := syscall.Syscall6(syscall.SYS_MREMAP, lowAddr, pageSize, 2*pageSize, 1, 0, 0)
@@ -440,10 +440,15 @@ func probeWine64PEMmapLayout() (string, string, error) {
 		return "", "", fmt.Errorf("mremap: %v", errno)
 	}
 	defer syscall.Syscall(syscall.SYS_MUNMAP, remapped, 2*pageSize, 0)
-	if got := *(*uint64)(unsafe.Pointer(remapped)); got != 0x123456789abcdef0 {
+	if got := binary.LittleEndian.Uint64(mmapBytes(remapped, 8)); got != 0x123456789abcdef0 {
 		return "", "", fmt.Errorf("mremap content = %#x", got)
 	}
 	return "mmap:pe_fixed=0x140000000:low32=ok:mremap=ok", fmt.Sprintf("pe=%#x low32=%#x mremap=%#x", peAddr, lowAddr, remapped), nil
+}
+
+func mmapBytes(addr uintptr, length int) []byte {
+	ptr := *(*unsafe.Pointer)(unsafe.Pointer(&addr))
+	return unsafe.Slice((*byte)(ptr), length)
 }
 
 func probeWine64WineserverIPC() (string, string, error) {
