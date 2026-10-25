@@ -928,7 +928,9 @@ func TestInterruptKeepsGuestState(t *testing.T) {
 	interrupts := 0
 	for {
 		stop := make(chan struct{})
+		done := make(chan struct{})
 		go func() {
+			defer close(done)
 			for {
 				r.ctx.Interrupt()
 				select {
@@ -940,6 +942,7 @@ func TestInterruptKeepsGuestState(t *testing.T) {
 		}()
 		si, _, err := r.run()
 		close(stop)
+		<-done
 		if errors.Is(err, platform.ErrContextInterrupt) {
 			interrupts++
 			continue
