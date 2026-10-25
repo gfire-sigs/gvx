@@ -636,6 +636,9 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 		}
 		return c.reportFault(th, ac, sig, ec, esr, far, pc)
 	case darwinSIGILL:
+		if emulateARM64MRS(as, sm, pc) {
+			return signalAction{resume: true}
+		}
 		return c.reportSignal(th, ac, linux.SIGILL, 1, pc, pc)
 	case darwinSIGTRAP:
 		return c.reportSignal(th, ac, linux.SIGTRAP, linux.TRAP_BRKPT, pc, pc)
@@ -751,6 +754,32 @@ func (c *Context) reportSignal(th *thread, ac *arch.Context64, sig linux.Signal,
 	si := &linux.SignalInfo{Signo: int32(sig), Code: code}
 	si.SetAddr(addr)
 	return signalAction{si: si, err: platform.ErrContextSignal}
+}
+
+// emulateARM64MRS emulates an EL0 read of an AArch64 ID register, CTR_EL0, or
+// DCZID_EL0 when macOS raises SIGILL at pc.
+func emulateARM64MRS(as *addressSpace, sm *sysmsg, pc uint64) bool {
+	insn, ok := as.codeWord(pc)
+	if !ok {
+		return false
+	}
+	rt, val, ok := decodeARM64SysRegMRS(insn)
+	if !ok {
+		return false
+	}
+	switch {
+	case rt == 31:
+	case rt == x18Reg:
+		sm.X18 = val
+	case rt < 29:
+		sm.MC.SS.X[rt] = val
+	case rt == 29:
+		sm.MC.SS.FP = val
+	case rt == 30:
+		sm.MC.SS.LR = val
+	}
+	sm.MC.SS.PC = pc + 4
+	return true
 }
 
 // reportFault converts a memory fault into SIGSEGV or SIGBUS for the guest.

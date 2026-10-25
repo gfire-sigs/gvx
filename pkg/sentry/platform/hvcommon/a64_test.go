@@ -261,12 +261,44 @@ func TestEmulateSysRegReadAndDefaults(t *testing.T) {
 		{"ID_AA64ISAR0_EL1", read(3, 0, 0, 6, 0), DefaultIDAA64ISAR0EL1, true},
 		{"ID_AA64MMFR0_EL1", read(3, 0, 0, 7, 0), DefaultIDAA64MMFR0EL1, true},
 		{"CTR_EL0", read(3, 3, 0, 0, 1), DefaultCTREL0, true},
+		{"DCZID_EL0", read(3, 3, 0, 0, 7), DefaultDCZIDEL0, true},
 		{"write rejected", SysRegISS{Read: false, Rt: 0, Op0: 3}, 0, false},
 		{"unknown rejected", read(3, 3, 9, 12, 0), 0, false},
 	} {
 		got, ok := ids.EmulateSysRegRead(tc.iss)
 		if ok != tc.ok || got != tc.want {
 			t.Errorf("%s = (%#x, %v), want (%#x, %v)", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		insn uint32
+		rt   uint32
+		want uint64
+		ok   bool
+	}{
+		{"MRS X7, MIDR_EL1", 0xd5380007, 7, DefaultMIDREL1, true},
+		{"MRS X9, ID_AA64PFR0_EL1", 0xd5380409, 9, DefaultIDAA64PFR0EL1, true},
+		{"MRS X11, ID_AA64ISAR0_EL1", 0xd538060b, 11, DefaultIDAA64ISAR0EL1, true},
+		{"MRS X12, ID_AA64MMFR0_EL1", 0xd538070c, 12, DefaultIDAA64MMFR0EL1, true},
+		{"MRS X13, CTR_EL0", 0xd53b002d, 13, DefaultCTREL0, true},
+		{"MRS X14, DCZID_EL0", 0xd53b00ee, 14, DefaultDCZIDEL0, true},
+		{"MSR rejected", 0xd5180000, 0, 0, false},
+	} {
+		iss, ok := DecodeMRSSysRegISS(tc.insn)
+		if ok != tc.ok {
+			t.Fatalf("%s: DecodeMRSSysRegISS(%#x) ok = %v, want %v", tc.name, tc.insn, ok, tc.ok)
+		}
+		if !ok {
+			continue
+		}
+		if iss.Rt != tc.rt {
+			t.Errorf("%s: Rt = %d, want %d", tc.name, iss.Rt, tc.rt)
+		}
+		got, ok := ids.EmulateSysRegRead(iss)
+		if !ok || got != tc.want {
+			t.Errorf("%s: EmulateSysRegRead = (%#x, %v), want (%#x, true)", tc.name, got, ok, tc.want)
 		}
 	}
 }

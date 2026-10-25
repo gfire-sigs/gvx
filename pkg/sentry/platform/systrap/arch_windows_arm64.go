@@ -168,6 +168,12 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	}
 	site, ok := as.siteAt(ev.Addr)
 	if !ok {
+		if ev.Code == statusIllegalInsn && th.emulateARM64MRS(as, ev.Addr) {
+			if err := th.continueEvent(ev); err != nil {
+				return fatal(err, unix.EFAULT), true
+			}
+			return running, true
+		}
 		return outcome{}, false
 	}
 	pc := ev.Addr
@@ -238,6 +244,24 @@ func (th *thread) illegalSignal(as *addressSpace, pc uint64) (linuxSig, int32) {
 		return sigTRAP, trapBrkpt
 	}
 	return sigILL, illIllOpc
+}
+
+// emulateARM64MRS emulates an EL0 read of an AArch64 ID register, CTR_EL0, or
+// DCZID_EL0 when Windows reports an illegal instruction at pc.
+func (th *thread) emulateARM64MRS(as *addressSpace, pc uint64) bool {
+	b := as.codeBytes(pc, 4)
+	if len(b) != 4 {
+		return false
+	}
+	rt, val, ok := decodeARM64SysRegMRS(binary.LittleEndian.Uint32(b))
+	if !ok {
+		return false
+	}
+	if rt != 31 {
+		th.ctx.setReg(int(rt), val)
+	}
+	th.ctx.setPC(pc + 4)
+	return true
 }
 
 // archFault reports whether the engine repaired a fault. arm64 has no FS base.

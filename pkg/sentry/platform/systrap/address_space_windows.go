@@ -102,6 +102,39 @@ type addressSpace struct {
 
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
+	// gsUsed is set once a guest thread sets a custom GS base.
+	gsUsed atomic.Bool
+}
+
+// enableGS activates GS-segment memory instruction patching for the address
+// space and reverts any already-patched executable blocks to data state so
+// their next instruction fetch re-patches them with GS trapping enabled.
+func (as *addressSpace) enableGS() error {
+	if !as.gsUsed.CompareAndSwap(false, true) {
+		return nil
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released || as.sp.dead.Load() {
+		return nil
+	}
+	for _, blk := range as.blocks {
+		if blk.state != blockExec {
+			continue
+		}
+		if err := as.win.Map(blk.base, blockSize, blk.srcSec, blk.srcOff, viewProtFor(blk.at)); err != nil {
+			return as.mapErr(err)
+		}
+		freeSlotRefsLocked(blk.slots)
+		blk.slots = nil
+		if blk.hasPriv {
+			as.p.priv.release(blk.priv)
+			blk.priv, blk.hasPriv = privPage{}, false
+		}
+		blk.state = blockData
+		blk.sites = nil
+	}
+	return nil
 }
 
 // PatchedBlocks returns how many code pages this address space patched.

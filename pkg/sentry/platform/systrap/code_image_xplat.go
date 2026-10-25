@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"debug/elf"
+	"debug/pe"
 	"fmt"
 	"io"
 	"runtime"
@@ -51,12 +52,15 @@ type codeImage struct {
 	exec []span
 }
 
-// parseCodeImage reads the program and section headers of an ELF file of the
-// guest architecture. It returns an error for anything else, so the caller
-// leaves the page alone.
+// parseCodeImage reads the program and section headers of an ELF or PE32+ file
+// of the guest architecture. It returns an error for anything else, so the
+// caller leaves the page alone.
 func parseCodeImage(r io.ReaderAt) (*codeImage, error) {
 	f, err := elf.NewFile(r)
 	if err != nil {
+		if peCI, peErr := parsePECodeImage(r); peErr == nil {
+			return peCI, nil
+		}
 		return nil, err
 	}
 	want := elf.EM_X86_64
@@ -83,6 +87,55 @@ func parseCodeImage(r io.ReaderAt) (*codeImage, error) {
 	if len(ci.exec) == 0 {
 		// A file without section headers gives no way to separate code from data.
 		return nil, fmt.Errorf("the file has no executable section")
+	}
+	return ci, nil
+}
+
+// parsePECodeImage reads the section headers of a 64-bit PE32+ image for
+// Wine64 guests.
+func parsePECodeImage(r io.ReaderAt) (*codeImage, error) {
+	f, err := pe.NewFile(r)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	want := uint16(pe.IMAGE_FILE_MACHINE_AMD64)
+	if runtime.GOARCH == "arm64" {
+		want = pe.IMAGE_FILE_MACHINE_ARM64
+	}
+	if f.Machine != want {
+		return nil, fmt.Errorf("the file is not a %s PE32+ file (machine %#x)", runtime.GOARCH, f.Machine)
+	}
+	if _, ok := f.OptionalHeader.(*pe.OptionalHeader64); !ok {
+		return nil, fmt.Errorf("the PE file has no 64-bit optional header")
+	}
+	const (
+		imageScnCntCode    = 0x00000020
+		imageScnMemExecute = 0x20000000
+	)
+	ci := &codeImage{}
+	for _, s := range f.Sections {
+		if s.Size == 0 {
+			continue
+		}
+		ci.loads = append(ci.loads, loadSegment{
+			vaddr:  uint64(s.VirtualAddress),
+			off:    uint64(s.Offset),
+			filesz: uint64(s.Size),
+		})
+		if s.Characteristics&(imageScnCntCode|imageScnMemExecute) != 0 {
+			execSize := uint64(s.VirtualSize)
+			if execSize == 0 || execSize > uint64(s.Size) {
+				execSize = uint64(s.Size)
+			}
+			ci.exec = append(ci.exec, span{
+				lo: uint64(s.VirtualAddress),
+				hi: uint64(s.VirtualAddress) + execSize,
+			})
+		}
+	}
+	if len(ci.loads) == 0 || len(ci.exec) == 0 {
+		return nil, fmt.Errorf("the PE32+ file has no executable section")
 	}
 	return ci, nil
 }

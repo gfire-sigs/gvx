@@ -978,3 +978,24 @@ func (as *addressSpace) isSlotTail(pc uint64) bool {
 	_, ok := as.slotAt(pc, true)
 	return ok
 }
+
+// codeWord returns the 32-bit instruction word of the original frame or island
+// at stub address pc, or false when pc does not lie at an aligned offset of an
+// executable block or trampoline island.
+func (as *addressSpace) codeWord(pc uint64) (uint32, bool) {
+	if pc&3 != 0 {
+		return 0, false
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	base := blockRound(pc)
+	if blk := as.blocks[base]; blk != nil && blk.src != 0 {
+		page := unsafe.Slice((*byte)(addrPtr(blk.src)), blockSize)
+		return binary.LittleEndian.Uint32(page[pc-base:]), true
+	}
+	if isl := as.islands[base]; isl != nil && isl.page != 0 {
+		page := pageBytes(isl.page)
+		return binary.LittleEndian.Uint32(page[pc-base:]), true
+	}
+	return 0, false
+}

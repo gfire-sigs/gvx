@@ -52,9 +52,10 @@ const (
 	// request that lists workspaces.
 	HerdrWorkspaceListWant = `{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[]}}` + "\n"
 
-	goStaticPackage = "z.gfire.dev/gvx/internal/acceptprog/gostatic"
-	volTreePackage  = "z.gfire.dev/gvx/internal/acceptprog/voltree"
-	herdrReleaseURL = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
+	goStaticPackage    = "z.gfire.dev/gvx/internal/acceptprog/gostatic"
+	volTreePackage     = "z.gfire.dev/gvx/internal/acceptprog/voltree"
+	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
+	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
 // herdrAssets maps a Linux architecture to the herdr v0.9.5 release file and
@@ -198,6 +199,44 @@ func BuildVolumeTree(tb testing.TB, goarch string) string {
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	if msg, err := cmd.CombinedOutput(); err != nil {
 		tb.Fatalf("build the volume guest for linux/%s: %v\n%s", goarch, err, msg)
+	}
+	return out
+}
+
+// BuildCompatProbe compiles the guest compatibility, fingerprint, and
+// benchmark program compatprobe for the Linux architecture goarch and returns
+// the path of the static ET_EXEC executable.
+func BuildCompatProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return BuildCompatProbeAt(tb, goarch, 0)
+}
+
+// BuildCompatProbeAt compiles compatprobe linked at textAddr when textAddr is
+// non-zero, or at the default toolchain address when textAddr is zero.
+func BuildCompatProbeAt(tb testing.TB, goarch string, textAddr uint64) string {
+	tb.Helper()
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
+	}
+	out := filepath.Join(tb.TempDir(), "compatprobe")
+	ldflags := "-ldflags=-linkmode=internal"
+	if textAddr != 0 {
+		ldflags = fmt.Sprintf("-ldflags=-linkmode=internal -T %#x", textAddr)
+	}
+	cmd := exec.Command(goTool, "build", "-o", out, ldflags, compatProbePackage)
+	cmd.Dir = moduleRoot(tb)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		tb.Fatalf("build compatprobe for linux/%s: %v\n%s", goarch, err, msg)
+	}
+	f, err := elf.Open(out)
+	if err != nil {
+		tb.Fatalf("open compatprobe: %v", err)
+	}
+	defer f.Close()
+	if f.Type != elf.ET_EXEC {
+		tb.Fatalf("compatprobe has type %v, want ET_EXEC", f.Type)
 	}
 	return out
 }

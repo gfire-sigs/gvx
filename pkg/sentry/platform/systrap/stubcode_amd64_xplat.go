@@ -459,7 +459,7 @@ func patchJmp(page []byte, off int, siteVA, slotVA uint64) error {
 // and the engine repairs the base only for faults in guest pages.
 func relocatable(inst x86asm.Inst) bool {
 	op := inst.Op.String()
-	for _, p := range []string{"J", "CALL", "LCALL", "LJMP", "RET", "LRET", "IRET", "INT", "SYSCALL", "SYSENTER", "SYSEXIT", "SYSRET", "LOOP", "XBEGIN", "HLT", "UD"} {
+	for _, p := range []string{"J", "CALL", "LCALL", "LJMP", "RET", "LRET", "IRET", "INT", "SYSCALL", "SYSENTER", "SYSEXIT", "SYSRET", "LOOP", "XBEGIN", "HLT", "UD", "RDFSBASE", "RDGSBASE", "WRFSBASE", "WRGSBASE"} {
 		if strings.HasPrefix(op, p) {
 			return false
 		}

@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math/rand"
 	"reflect"
 	"testing"
@@ -427,5 +428,95 @@ func TestPatchAMD64Errors(t *testing.T) {
 		if !bytes.Equal(c.page, orig) {
 			t.Errorf("%s: patchAMD64 changed the page on error", c.name)
 		}
+	}
+}
+
+func TestScanAMD64GSAndEmulateGSMemInsn(t *testing.T) {
+	// Wine64 TEB sequence:
+	//   rdgsbase r8                (f3 49 0f ae c8, len 5)
+	//   mov rax, gs:[0x30]         (65 48 8b 04 25 30 00 00 00, len 9)
+	//   mov gs:[rcx+0x1480], rdx   (65 48 89 91 80 14 00 00, len 8)
+	//   add qword ptr gs:[0x10], 7 (65 48 83 04 25 10 00 00 00 07, len 10)
+	//   ret                        (c3)
+	code := []byte{
+		0xf3, 0x49, 0x0f, 0xae, 0xc8,
+		0x65, 0x48, 0x8b, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00,
+		0x65, 0x48, 0x89, 0x91, 0x80, 0x14, 0x00, 0x00,
+		0x65, 0x48, 0x83, 0x04, 0x25, 0x10, 0x00, 0x00, 0x00, 0x07,
+		0xc3,
+	}
+	if got := scanAMD64(nil, code, nil); len(got) != 0 {
+		t.Fatalf("scanAMD64 without gsMem found %+v, want none", got)
+	}
+	sites := scanAMD64GS(nil, code, nil, true)
+	want := []amd64Site{
+		{Offset: 0, Len: 5, Kind: amd64SiteRDGSBASE, Reg: 8, Wide: true},
+		{Offset: 5, Len: 9, Kind: amd64SiteGSMem},
+		{Offset: 14, Len: 8, Kind: amd64SiteGSMem},
+		{Offset: 22, Len: 10, Kind: amd64SiteGSMem},
+	}
+	if !reflect.DeepEqual(sites, want) {
+		t.Fatalf("scanAMD64GS = %+v, want %+v", sites, want)
+	}
+
+	teb := make([]byte, 0x2000)
+	const gsBase = 0x7fff00000000
+	// Populate TEB->Self at offset 0x30 and a counter at 0x10.
+	binary.LittleEndian.PutUint64(teb[0x30:], gsBase)
+	binary.LittleEndian.PutUint64(teb[0x10:], 35)
+
+	readMem := func(addr uint64, buf []byte) bool {
+		if addr < gsBase || addr+uint64(len(buf)) > gsBase+uint64(len(teb)) {
+			return false
+		}
+		copy(buf, teb[addr-gsBase:])
+		return true
+	}
+	writeMem := func(addr uint64, buf []byte) bool {
+		if addr < gsBase || addr+uint64(len(buf)) > gsBase+uint64(len(teb)) {
+			return false
+		}
+		copy(teb[addr-gsBase:], buf)
+		return true
+	}
+
+	var regs [16]uint64
+	var eflags uint32
+	regs[1] = 8                  // RCX = 8 (TlsSlots[1])
+	regs[2] = 0xfeedfacecafebabe // RDX
+
+	// 1. mov rax, gs:[0x30]
+	if out := emulateGSMemInsn(code[5:14], gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+		t.Fatalf("emulate mov load = %+v", out)
+	}
+	if regs[0] != gsBase {
+		t.Fatalf("RAX after mov rax, gs:[0x30] = %#x, want %#x", regs[0], gsBase)
+	}
+
+	// 2. mov gs:[rcx+0x1480], rdx
+	if out := emulateGSMemInsn(code[14:22], gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+		t.Fatalf("emulate mov store = %+v", out)
+	}
+	// Verify with mov r9, gs:[0x1488] (65 4c 8b 0c 25 88 14 00 00)
+	loadSlot1 := []byte{0x65, 0x4c, 0x8b, 0x0c, 0x25, 0x88, 0x14, 0x00, 0x00}
+	if out := emulateGSMemInsn(loadSlot1, gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+		t.Fatalf("emulate mov slot1 load = %+v", out)
+	}
+	if regs[9] != 0xfeedfacecafebabe {
+		t.Fatalf("R9 = %#x, want 0xfeedfacecafebabe", regs[9])
+	}
+
+	// 3. add qword ptr gs:[0x10], 7
+	if out := emulateGSMemInsn(code[22:32], gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+		t.Fatalf("emulate add = %+v", out)
+	}
+	if teb[0x10] != 42 {
+		t.Fatalf("teb[0x10] = %d, want 42", teb[0x10])
+	}
+
+	// 4. Out-of-bounds access reports a fault at the target address.
+	badLoad := []byte{0x65, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x40, 0x00, 0x00}
+	if out := emulateGSMemInsn(badLoad, gsBase, &regs, &eflags, readMem, writeMem); !out.fault || out.faultAddr != gsBase+0x4000 {
+		t.Fatalf("emulate out-of-bounds load = %+v, want fault at %#x", out, gsBase+0x4000)
 	}
 }

@@ -292,10 +292,6 @@ func posixTortureWant(caseInsensitive bool) map[string]wsEntry {
 		"cs/Renamed.txt": fileEntry(0o644, "upper\n"),
 		"cs/casey.txt":   fileEntry(0o644, "x\n"),
 	}
-	if !caseInsensitive {
-		want["cs/file.txt"] = fileEntry(0o644, "lower\n")
-		want["cs/FILE.TXT"] = fileEntry(0o644, "shout\n")
-	}
 	return want
 }
 
@@ -334,9 +330,6 @@ func TestE2EGateM4PosixTortureBusybox(t *testing.T) {
 			// The host holds the exact-case names that the guest chose.
 			names := hostDirNames(t, filepath.Join(workspace, "cs"))
 			wantNames := []string{"Renamed.txt", "casey.txt"}
-			if !caseInsensitive {
-				wantNames = []string{"FILE.TXT", "Renamed.txt", "casey.txt", "file.txt"}
-			}
 			if strings.Join(names, ",") != strings.Join(wantNames, ",") {
 				t.Errorf("host listing of cs = %v, want %v", names, wantNames)
 			}

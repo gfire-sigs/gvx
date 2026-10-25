@@ -268,3 +268,39 @@ func encodeCTRSlot(buf []byte, slotVA, retPC uint64, reg uint8) error {
 	binary.LittleEndian.PutUint32(buf[12:], arm64NOP)
 	return nil
 }
+
+// decodeARM64SysRegMRS decodes an AArch64 MRS instruction (`0xD5300000 | ...`)
+// for the EL1 identification registers, CTR_EL0, and DCZID_EL0 that Linux
+// exposes to EL0 via HWCAP_CPUID.
+func decodeARM64SysRegMRS(insn uint32) (rt uint8, val uint64, ok bool) {
+	if (insn & 0xfff00000) != 0xd5300000 {
+		return 0, 0, false
+	}
+	rt = uint8(insn & 0x1f)
+	switch insn &^ 0x1f {
+	case 0xd5380000: // MIDR_EL1 (S3_0_C0_C0_0)
+		return rt, 0x410fd030, true
+	case 0xd53800c0: // REVIDR_EL1 (S3_0_C0_C0_6)
+		return rt, 0, true
+	case 0xd5380400: // ID_AA64PFR0_EL1 (S3_0_C0_C4_0)
+		return rt, 0x0000000000000011, true
+	case 0xd5380420: // ID_AA64PFR1_EL1 (S3_0_C0_C4_1)
+		return rt, 0, true
+	case 0xd5380600: // ID_AA64ISAR0_EL1 (S3_0_C0_C6_0)
+		return rt, 0x0000000000211120, true
+	case 0xd5380620: // ID_AA64ISAR1_EL1 (S3_0_C0_C6_1)
+		return rt, 0x0000000000100001, true
+	case 0xd5380700: // ID_AA64MMFR0_EL1 (S3_0_C0_C7_0)
+		return rt, 0x0000000000100005, true
+	case 0xd5380720: // ID_AA64MMFR1_EL1 (S3_0_C0_C7_1)
+		return rt, 0, true
+	case 0xd5380740: // ID_AA64MMFR2_EL1 (S3_0_C0_C7_2)
+		return rt, 0, true
+	case 0xd53b0020: // CTR_EL0 (S3_3_C0_C0_1)
+		return rt, ctrEL0Value, true
+	case 0xd53b00e0: // DCZID_EL0 (S3_3_C0_C0_7)
+		return rt, 0x00000004, true
+	default:
+		return 0, 0, false
+	}
+}

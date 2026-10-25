@@ -43,6 +43,17 @@ const (
 	// amd64SiteRDFSBASE is RDFSBASE r32 or r64, bytes F3 [REX] 0F AE /0 with
 	// mod=11.
 	amd64SiteRDFSBASE
+	// amd64SiteRDGSBASE is RDGSBASE r32 or r64, bytes F3 [REX] 0F AE /1 with
+	// mod=11.
+	amd64SiteRDGSBASE
+	// amd64SiteWRFSBASE is WRFSBASE r32 or r64, bytes F3 [REX] 0F AE /2 with
+	// mod=11.
+	amd64SiteWRFSBASE
+	// amd64SiteWRGSBASE is WRGSBASE r32 or r64, bytes F3 [REX] 0F AE /3 with
+	// mod=11.
+	amd64SiteWRGSBASE
+	// amd64SiteGSMem is a memory instruction with a GS segment override prefix.
+	amd64SiteGSMem
 )
 
 const (
@@ -123,6 +134,12 @@ type amd64Candidate struct {
 // instruction boundaries after a few instructions. A site is real when more
 // than half of the distinct sweeps decode it as an instruction.
 func scanAMD64(before, page, after []byte) []amd64Site {
+	return scanAMD64GS(before, page, after, false)
+}
+
+// scanAMD64GS runs scanAMD64 and, when gsMem is true, also reports memory
+// instructions that carry a GS segment override prefix.
+func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
 	if len(page) == 0 {
 		return nil
 	}
@@ -149,7 +166,7 @@ func scanAMD64(before, page, after []byte) []amd64Site {
 		for pos := start; pos < pageEnd; {
 			d := &decoded[pos]
 			if !d.known {
-				*d = decodeAMD64(buf[pos:])
+				*d = decodeAMD64WithGS(buf[pos:], gsMem)
 			}
 			if d.kind != 0 {
 				site := amd64Site{Offset: pos - pageStart, Len: int(d.size), Kind: d.kind, Reg: d.reg, Wide: d.wide}
@@ -177,11 +194,25 @@ func scanAMD64(before, page, after []byte) []amd64Site {
 		}
 	}
 	sort.Slice(sites, func(i, j int) bool { return sites[i].Offset < sites[j].Offset })
+	if len(sites) > 1 {
+		kept := sites[:1]
+		for _, s := range sites[1:] {
+			prev := kept[len(kept)-1]
+			if s.Offset >= prev.Offset+prev.Len {
+				kept = append(kept, s)
+			}
+		}
+		sites = kept
+	}
 	return sites
 }
 
 // decodeAMD64 decodes the instruction at the start of b.
 func decodeAMD64(b []byte) amd64Decoded {
+	return decodeAMD64WithGS(b, false)
+}
+
+func decodeAMD64WithGS(b []byte, gsMem bool) amd64Decoded {
 	inst, err := x86asm.Decode(b, 64)
 	if err != nil || inst.Len == 0 {
 		return amd64Decoded{known: true}
@@ -190,19 +221,50 @@ func decodeAMD64(b []byte) amd64Decoded {
 	switch inst.Op {
 	case x86asm.SYSCALL:
 		d.kind = amd64SiteSyscall
-	case x86asm.RDFSBASE:
-		// The last byte is ModRM. A REX prefix, when present, sits directly
-		// before the two opcode bytes 0F AE.
-		modrm := b[inst.Len-1]
-		if modrm>>6 != 3 || modrm>>3&7 != 0 {
+	case x86asm.RDFSBASE, x86asm.RDGSBASE, x86asm.WRFSBASE, x86asm.WRGSBASE:
+		// Register-operand FSGSBASE instructions end with 0F AE ModRM (mod=11).
+		if inst.Len < 4 || b[inst.Len-3] != 0x0F || b[inst.Len-2] != 0xAE {
 			return d
 		}
-		d.kind = amd64SiteRDFSBASE
+		modrm := b[inst.Len-1]
+		if modrm>>6 != 3 {
+			return d
+		}
+		switch modrm >> 3 & 7 {
+		case 0:
+			d.kind = amd64SiteRDFSBASE
+		case 1:
+			if !gsMem {
+				return d
+			}
+			d.kind = amd64SiteRDGSBASE
+		case 2:
+			if !gsMem {
+				return d
+			}
+			d.kind = amd64SiteWRFSBASE
+		case 3:
+			if !gsMem {
+				return d
+			}
+			d.kind = amd64SiteWRGSBASE
+		default:
+			return d
+		}
 		d.reg = modrm & 7
 		if inst.Len >= 4 {
 			if rex := b[inst.Len-4]; rex&0xF0 == 0x40 {
 				d.reg |= (rex & 1) << 3
 				d.wide = rex&8 != 0
+			}
+		}
+	default:
+		if gsMem && inst.Op != x86asm.LEA && inst.Len >= 2 {
+			for _, arg := range inst.Args {
+				if mem, ok := arg.(x86asm.Mem); ok && mem.Segment == x86asm.GS {
+					d.kind = amd64SiteGSMem
+					break
+				}
 			}
 		}
 	}
@@ -241,9 +303,13 @@ func patchAMD64(page []byte, sites []amd64Site) (spill int, err error) {
 					return 0, fmt.Errorf("syscall site at %d: byte %d is %#x, want %#x", s.Offset, j, page[i], w)
 				}
 			}
-		case amd64SiteRDFSBASE:
+		case amd64SiteRDFSBASE, amd64SiteRDGSBASE, amd64SiteWRFSBASE, amd64SiteWRGSBASE:
 			if s.Len < 4 {
-				return 0, fmt.Errorf("rdfsbase site at %d has length %d", s.Offset, s.Len)
+				return 0, fmt.Errorf("fsgsbase site at %d has length %d", s.Offset, s.Len)
+			}
+		case amd64SiteGSMem:
+			if s.Len < 2 {
+				return 0, fmt.Errorf("gs memory site at %d has length %d", s.Offset, s.Len)
 			}
 		default:
 			return 0, fmt.Errorf("site at %d has unknown kind %d", s.Offset, s.Kind)

@@ -23,8 +23,11 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+	"golang.org/x/sys/windows"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
@@ -218,10 +221,11 @@ func (th *thread) pullArch(*arch.Context64) {}
 // island.
 func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) || th.inIslandPC(pc) }
 
-// UserModifiedGS implements platform.AddressSpace.UserModifiedGS. Windows uses
-// the GS base for the TEB, so a guest cannot set it.
-func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error {
-	return fmt.Errorf("the GS base of a guest thread is not available on Windows")
+// UserModifiedGS implements platform.AddressSpace.UserModifiedGS. It enables
+// GS-segment memory instruction trapping for this address space so the guest
+// can use a custom GS base without clobbering the stub's Windows TEB.
+func (as *addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error {
+	return as.enableGS()
 }
 
 // archEvent serves the stops that only amd64 has: the traps of patched sites.
@@ -250,19 +254,119 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		r.R11 = r.Eflags
 		r.Orig_rax = r.Rax
 		return outcome{done: true}, true
-	case amd64SiteRDFSBASE:
+	case amd64SiteRDFSBASE, amd64SiteRDGSBASE:
 		v := ac.StateData().Regs.Fs_base
+		if site.kind == amd64SiteRDGSBASE {
+			v = ac.StateData().Regs.Gs_base
+		}
 		if !site.wide {
 			v &= 0xFFFFFFFF
 		}
-		th.ctx.put64(120+8*int(site.reg), v)
+		th.ctx.put64(ctxOffRax+8*int(site.reg), v)
 		th.ctx.setPC(ev.Addr + uint64(site.length))
 		if err := th.continueEvent(ev); err != nil {
 			return fatal(err, unix.EFAULT), true
 		}
 		return running, true
+	case amd64SiteWRFSBASE, amd64SiteWRGSBASE:
+		v := th.ctx.u64(ctxOffRax + 8*int(site.reg))
+		if !site.wide {
+			v &= 0xFFFFFFFF
+		}
+		if v >= as.p.userMax {
+			th.ctx.setPC(ev.Addr)
+			if err := th.stopAndPull(ac, ev); err != nil {
+				return fatal(err, unix.EFAULT), true
+			}
+			si := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: linux.SI_KERNEL}
+			return outcome{done: true, si: si, err: platform.ErrContextSignal}, true
+		}
+		th.ctx.setPC(ev.Addr + uint64(site.length))
+		if site.kind == amd64SiteWRFSBASE {
+			ac.StateData().Regs.Fs_base = v
+			if v != 0 {
+				if err := th.goThroughTrampoline(v); err != nil {
+					return fatal(err, unix.EFAULT), true
+				}
+			}
+		} else {
+			if err := as.enableGS(); err != nil {
+				return fatal(err, unix.ENOMEM), true
+			}
+			ac.StateData().Regs.Gs_base = v
+		}
+		if err := th.continueEvent(ev); err != nil {
+			return fatal(err, unix.EFAULT), true
+		}
+		return running, true
+	case amd64SiteGSMem:
+		return th.emulateGSMemSite(as, ac, ev, site)
 	}
 	return outcome{}, false
+}
+
+// emulateGSMemSite emulates a trapped GS-segment memory instruction in the stub
+// process.
+func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debugEvent, site siteInfo) (outcome, bool) {
+	code := as.codeBytes(ev.Addr, int(site.length))
+	if len(code) < int(site.length) {
+		return outcome{}, false
+	}
+	var regs [16]uint64
+	for i := range regs {
+		regs[i] = th.ctx.u64(ctxOffRax + 8*i)
+	}
+	eflags := th.ctx.u32(ctxOffEFlags)
+	readMem := func(addr uint64, buf []byte) bool {
+		if len(buf) == 0 || addr < as.p.userMin || addr+uint64(len(buf)) > as.p.userMax {
+			return false
+		}
+		var n uintptr
+		err := windows.ReadProcessMemory(th.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
+		return err == nil && n == uintptr(len(buf))
+	}
+	writeMem := func(addr uint64, buf []byte) bool {
+		if len(buf) == 0 || addr < as.p.userMin || addr+uint64(len(buf)) > as.p.userMax {
+			return false
+		}
+		base := blockRound(addr)
+		if blockRound(ev.Addr) != base {
+			_, _ = as.restoreData(base)
+		}
+		var n uintptr
+		err := windows.WriteProcessMemory(th.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
+		return err == nil && n == uintptr(len(buf))
+	}
+	res := emulateGSMemInsn(code, ac.StateData().Regs.Gs_base, &regs, &eflags, readMem, writeMem)
+	if res.fault {
+		th.ctx.setPC(ev.Addr)
+		if err := th.stopAndPull(ac, ev); err != nil {
+			return fatal(err, unix.EFAULT), true
+		}
+		at := hostarch.Read
+		if res.faultWrite {
+			at = hostarch.Write
+		}
+		sigCode := int32(segvMapErr)
+		if as.mapped(res.faultAddr) {
+			sigCode = segvAccErr
+		}
+		si := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: sigCode}
+		si.SetAddr(res.faultAddr)
+		return outcome{done: true, si: si, at: at, err: platform.ErrContextSignal}, true
+	}
+	if !res.ok {
+		return outcome{}, false
+	}
+	for i := range regs {
+		th.ctx.put64(ctxOffRax+8*i, regs[i])
+	}
+	th.ctx.put32(ctxOffEFlags, eflags)
+	th.ctx.setPC(ev.Addr + uint64(site.length))
+	if err := th.continueEvent(ev); err != nil {
+		return fatal(err, unix.EFAULT), true
+	}
+	return running, true
 }
 
 // illegalSignal classifies an illegal-instruction exception.
@@ -373,7 +477,7 @@ const winSiteJump amd64SiteKind = 0x80
 func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, []winSlotRef, error) {
 	before := as.neighborBytes(base, true, amd64MaxInsnLen)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
-	found := scanAMD64(before, page, after)
+	found := scanAMD64GS(before, page, after, as.gsUsed.Load())
 	scope := as.p.scopeOf(ctx, mm, base)
 	var plan *jmpPlanner
 	if as.p.fast {

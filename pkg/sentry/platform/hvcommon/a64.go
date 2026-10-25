@@ -244,9 +244,27 @@ const (
 	KeyIDAA64MMFR1 = 3<<14 | 0<<11 | 0<<7 | 7<<3 | 1
 	KeyIDAA64MMFR2 = 3<<14 | 0<<11 | 0<<7 | 7<<3 | 2
 	KeyCTREL0      = 3<<14 | 3<<11 | 0<<7 | 0<<3 | 1
+	KeyDCZIDEL0    = 3<<14 | 3<<11 | 0<<7 | 0<<3 | 7
 	KeyCNTPCT      = 3<<14 | 3<<11 | 14<<7 | 0<<3 | 1
 	KeyCNTVCT      = 3<<14 | 3<<11 | 14<<7 | 0<<3 | 2
 )
+
+// DecodeMRSSysRegISS decodes a 32-bit AArch64 MRS instruction word into a
+// SysRegISS value suitable for IDRegisters.EmulateSysRegRead.
+func DecodeMRSSysRegISS(insn uint32) (SysRegISS, bool) {
+	if insn&0xfff00000 != 0xd5300000 {
+		return SysRegISS{}, false
+	}
+	return SysRegISS{
+		Read: true,
+		Rt:   insn & 0x1f,
+		Op2:  (insn >> 5) & 0x7,
+		CRm:  (insn >> 8) & 0xf,
+		CRn:  (insn >> 12) & 0xf,
+		Op1:  (insn >> 16) & 0x7,
+		Op0:  3,
+	}, true
+}
 
 // ID register fields hidden from the guest when the backend does not
 // virtualize scalable vectors, memory tagging, or pointer authentication.
@@ -264,6 +282,7 @@ const (
 	DefaultIDAA64ISAR0EL1 uint64 = 0x00211120
 	DefaultIDAA64MMFR0EL1 uint64 = 0x00100005
 	DefaultCTREL0         uint64 = 0x8444c004
+	DefaultDCZIDEL0       uint64 = 0x00000004
 )
 
 // IDRegisters holds the values that EL0 reads of the ID registers, CTR_EL0,
@@ -318,6 +337,8 @@ func (ids *IDRegisters) EmulateSysRegRead(iss SysRegISS) (uint64, bool) {
 			return ids.CTR, true
 		}
 		return DefaultCTREL0, true
+	case KeyDCZIDEL0:
+		return DefaultDCZIDEL0, true
 	case KeyCNTPCT, KeyCNTVCT:
 		if ids.Counter != nil {
 			return ids.Counter(), true
