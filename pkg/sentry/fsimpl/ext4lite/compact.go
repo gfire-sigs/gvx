@@ -25,7 +25,8 @@ import (
 // little shrinks. It moves blocks only. An inode keeps its number, so a group
 // that holds an inode stays.
 
-// errNoRoom reports that a relocation found no free block below the target.
+// errNoRoom reports that the free space below the compaction target cannot hold
+// a move. The inode stays where it is.
 var errNoRoom = errors.New("ext4lite: no free block below the compaction target")
 
 // shutdownLocked ends a writable mount. The caller holds flushMu.
@@ -35,28 +36,48 @@ func (v *volume) shutdownLocked() error {
 	if err := v.flushLocked(); err != nil {
 		return err
 	}
-	if err := v.compactLocked(); err != nil {
-		// The volume stays marked as not clean. The next mount runs fsckLite.
-		errs = append(errs, err)
+	compactErr := v.compactLocked()
+	if compactErr != nil {
+		// The volume stays marked as not clean. The next mount runs fsckLite. An
+		// inode that a failed move left in a trailing group still needs that group,
+		// so the shutdown keeps every group and the host file size.
+		errs = append(errs, compactErr)
+	}
+	removed := 0
+	if compactErr == nil {
+		v.mu.Lock()
+		removed = v.trimGroupsLocked()
+		v.mu.Unlock()
+		if removed > 0 {
+			if err := v.flushLocked(); err != nil {
+				return errors.Join(append(errs, err)...)
+			}
+		}
 	}
 	v.mu.Lock()
-	removed := v.trimGroupsLocked()
 	groups := len(v.groups)
 	v.mu.Unlock()
-	if removed > 0 {
-		if err := v.flushLocked(); err != nil {
+	if v.j != nil {
+		// The log must be empty before the host file shrinks. A later replay
+		// would write the blocks of a removed group beyond the end of the file.
+		if err := v.endSession(true); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
 	}
-	if v.hf.Tier() != tierFallback || removed > 0 {
-		want := int64(groups) * groupBytes
+	want := int64(groups) * groupBytes
+	if compactErr == nil && (v.hf.Tier() != tierFallback || removed > 0) {
 		if size, err := v.hf.Size(); err == nil && size != want {
 			if err := v.hf.Truncate(want); err != nil {
 				return errors.Join(append(errs, hostError(err))...)
 			}
 		}
-	} else if err := v.hf.EnsureSize(int64(groups) * groupBytes); err != nil {
-		errs = append(errs, hostError(err))
+	} else if v.hf.Tier() == tierFallback {
+		if err := v.hf.EnsureSize(want); err != nil {
+			errs = append(errs, hostError(err))
+		}
+	}
+	if v.j != nil {
+		return errors.Join(errs...)
 	}
 	if len(errs) == 0 {
 		v.mu.Lock()
@@ -119,7 +140,8 @@ func (v *volume) compactTarget() uint32 {
 }
 
 // compactLocked moves the blocks of the trailing groups downward and flushes
-// the result. The caller holds flushMu.
+// the result. An inode that cannot move stays where it is, and that is no
+// error. The caller holds flushMu.
 func (v *volume) compactLocked() error {
 	lo := v.compactTarget()
 	if lo >= v.numGroups() {
@@ -137,10 +159,7 @@ func (v *volume) compactLocked() error {
 		err = n.relocateLocked(low)
 		n.mu.Unlock()
 		v.putNode(n)
-		if err == errNoRoom {
-			break
-		}
-		if err != nil {
+		if err != nil && !errors.Is(err, errNoRoom) {
 			errs = append(errs, err)
 		}
 	}
@@ -170,156 +189,209 @@ func (v *volume) allocatedInodes() []uint32 {
 	return out
 }
 
+// runMove is a data run that moves below the target. dst holds the new runs
+// that replace src. Their file blocks are the blocks of src.
+type runMove struct {
+	src extent
+	dst []extent
+}
+
 // relocateLocked moves every block of the node at or above low to a free block
-// below low. The caller holds n.mu.
-func (n *node) relocateLocked(low uint64) error {
-	touched := n.fileACL >= low && n.fileACL != 0
-	for _, l := range n.leaves {
-		touched = touched || l >= low
-	}
-	for _, e := range n.exts {
-		touched = touched || e.pblk >= low
-	}
-	if !touched {
+// below low. It plans the whole move before it copies a block. A move that
+// needs more extents than a tree holds is skipped. A move that lacks free
+// blocks below low returns errNoRoom. Either way the node keeps its blocks. Any
+// other failure rolls the plan back, so the node also keeps its blocks. The
+// caller holds n.mu for writing.
+func (n *node) relocateLocked(low uint64) (err error) {
+	if !n.touchedAbove(low) {
 		return nil
 	}
 	if n.isDir() {
 		if err := n.loadDirLocked(); err != nil {
 			return err
 		}
+	}
+	if n.fileACL >= low {
+		if _, err := n.xattrsLocked(); err != nil {
+			return err
+		}
+	}
+	var (
+		moves     []runMove
+		newList   []extent
+		tree      treeUpdate
+		newACL    uint64
+		committed bool
+	)
+	defer func() {
+		if !committed {
+			err = joinCleanup(err, n.releaseMoveLocked(moves, tree, newACL))
+		}
+	}()
+
+	// Plan the data runs. A run that lies below low stays where it is.
+	for _, e := range n.exts {
+		if e.pblk < low {
+			newList = appendRun(newList, e)
+			continue
+		}
+		dst, err := n.allocBelowLocked(low, e)
+		if err != nil {
+			return err
+		}
+		moves = append(moves, runMove{src: e, dst: dst})
+		for _, d := range dst {
+			newList = appendRun(newList, d)
+		}
+	}
+	if len(newList) > maxTreeExtents {
+		return nil
+	}
+	below := func(uint64) (uint64, error) { return n.allocBelowOneLocked(low) }
+	tree, err = n.prepareTreeLocked(newList, func(blk uint64) bool { return blk < low }, below)
+	if err != nil {
+		return err
+	}
+	if n.fileACL >= low {
+		if newACL, err = n.allocBelowOneLocked(low); err != nil {
+			return err
+		}
+	}
+
+	// Copy the data. The old runs stay allocated until the commit.
+	for _, m := range moves {
+		for _, d := range m.dst {
+			if err := n.copyBlocks(m.src.pbn(d.lblk), d.pblk, d.n); err != nil {
+				return err
+			}
+		}
+	}
+
+	// A shared xattr block stays for the other names. The node gives up its
+	// name and writes its attributes to the new private block. A failure here
+	// still rolls the plan back.
+	sharedACL := newACL != 0 && n.xa != nil && n.xa.shared
+	if sharedACL {
+		if err := n.releaseShareLocked(); err != nil {
+			return err
+		}
+		n.xa.shared = false
+	}
+
+	committed = true
+	n.commitTreeLocked(tree)
+	var errs []error
+	for _, m := range moves {
+		errs = append(errs, n.v.freeBlocks(m.src.pblk, m.src.n))
+	}
+	if newACL != 0 {
+		if !sharedACL {
+			errs = append(errs, n.v.freeBlocks(n.fileACL, 1))
+		}
+		n.fileACL = newACL
+		n.dirtyXattr = true
+	}
+	if n.isDir() {
 		for _, b := range n.dir.blocks {
 			b.dirty = true
 		}
 	}
-	if n.fileACL >= low && n.fileACL != 0 {
-		if _, err := n.xattrsLocked(); err != nil {
-			return err
-		}
-		nb, err := n.moveBlock(n.fileACL, low)
-		if err != nil {
-			return err
-		}
-		n.fileACL = nb
-		n.dirtyXattr = true
+	return errors.Join(errs...)
+}
+
+// touchedAbove reports whether the node holds a block at or above low.
+func (n *node) touchedAbove(low uint64) bool {
+	if n.fileACL >= low {
+		return true
 	}
-	for i, l := range n.leaves {
-		if l < low {
-			continue
+	for _, l := range n.leaves {
+		if l.blk >= low {
+			return true
 		}
-		nb, err := n.moveBlock(l, low)
-		if err != nil {
-			return err
-		}
-		n.leaves[i] = nb
-		n.dirtyLeaf = true
 	}
-	var list []extent
+	for _, x := range n.ixs {
+		if x.blk >= low {
+			return true
+		}
+	}
 	for _, e := range n.exts {
-		if e.pblk < low {
-			list = insertMapping(list, e)
-			continue
-		}
-		moved, err := n.moveExtent(e, low)
-		for _, m := range moved {
-			list = insertMapping(list, m)
-		}
-		if err != nil {
-			// Keep the part that did not move.
-			rest := e
-			var done uint32
-			for _, m := range moved {
-				done += m.n
-			}
-			if done < e.n {
-				rest = extent{lblk: e.lblk + done, n: e.n - done, pblk: e.pbn(e.lblk + done)}
-				list = insertMapping(list, rest)
-			}
-			for _, e2 := range n.exts[indexAfter(n.exts, e):] {
-				list = insertMapping(list, e2)
-			}
-			// A failure here leaves the volume marked as not clean, so the next
-			// mount runs fsckLite.
-			if serr := n.setExtentsLocked(list); serr != nil {
-				err = errors.Join(err, serr)
-			}
-			n.markDirtyLocked()
-			return err
+		if e.pblk >= low {
+			return true
 		}
 	}
-	if err := n.setExtentsLocked(list); err != nil {
-		return err
-	}
-	n.markDirtyLocked()
-	return nil
+	return false
 }
 
-// indexAfter returns the index of the extent after e in list.
-func indexAfter(list []extent, e extent) int {
-	for i := range list {
-		if list[i].lblk == e.lblk {
-			return i + 1
+// releaseMoveLocked frees the blocks that a move allocated and did not commit.
+func (n *node) releaseMoveLocked(moves []runMove, tree treeUpdate, newACL uint64) error {
+	var errs []error
+	for _, m := range moves {
+		for _, d := range m.dst {
+			errs = append(errs, n.v.freeBlocks(d.pblk, d.n))
 		}
 	}
-	return len(list)
+	errs = append(errs, tree.abandon(n.v))
+	if newACL != 0 {
+		errs = append(errs, n.v.freeBlocks(newACL, 1))
+	}
+	return errors.Join(errs...)
 }
 
-// moveBlock copies one block to a free block below low and frees the old one.
-func (n *node) moveBlock(blk, low uint64) (uint64, error) {
-	dst, got, err := n.v.allocBlocks(0, 1)
-	if err != nil {
-		return 0, err
-	}
-	if dst >= low || got != 1 {
-		_ = n.v.freeBlocks(dst, got)
-		return 0, errNoRoom
-	}
-	var buf [blockSize]byte
-	if _, err := n.v.hf.ReadAt(buf[:], int64(blk)*blockSize); err != nil {
-		_ = n.v.freeBlocks(dst, 1)
-		return 0, hostError(err)
-	}
-	if _, err := n.v.hf.WriteAt(buf[:], int64(dst)*blockSize); err != nil {
-		_ = n.v.freeBlocks(dst, 1)
-		return 0, hostError(err)
-	}
-	if err := n.v.freeBlocks(blk, 1); err != nil {
-		return 0, err
-	}
-	return dst, nil
-}
-
-// moveExtent copies the blocks of e into free runs below low and frees the
-// blocks of e that it copied. It returns the new extents, which cover the
-// start of e when it fails in the middle.
-func (n *node) moveExtent(e extent, low uint64) ([]extent, error) {
+// allocBelowLocked takes free runs below low that hold the blocks of e. The
+// returned runs carry the file blocks of e. A failure frees the runs that it
+// took already.
+func (n *node) allocBelowLocked(low uint64, e extent) ([]extent, error) {
 	var out []extent
-	buf := make([]byte, 1<<20)
 	for done := uint32(0); done < e.n; {
-		dst, got, err := n.v.allocBlocks(0, e.n-done)
+		blk, got, err := n.v.allocBlocks(0, e.n-done)
+		if err == nil && blk >= low {
+			err = joinCleanup(errNoRoom, n.v.freeBlocks(blk, got))
+		}
 		if err != nil {
-			return out, err
+			return nil, joinCleanup(err, n.releaseRuns(out))
 		}
-		if dst >= low {
-			_ = n.v.freeBlocks(dst, got)
-			return out, errNoRoom
-		}
-		src := e.pblk + uint64(done)
-		for off := uint64(0); off < uint64(got)*blockSize; off += uint64(len(buf)) {
-			chunk := buf[:min(uint64(len(buf)), uint64(got)*blockSize-off)]
-			if _, err := n.v.hf.ReadAt(chunk, int64(src)*blockSize+int64(off)); err != nil && !errors.Is(err, io.EOF) {
-				_ = n.v.freeBlocks(dst, got)
-				return out, hostError(err)
-			}
-			if _, err := n.v.hf.WriteAt(chunk, int64(dst)*blockSize+int64(off)); err != nil {
-				_ = n.v.freeBlocks(dst, got)
-				return out, hostError(err)
-			}
-		}
-		if err := n.v.freeBlocks(src, got); err != nil {
-			return out, err
-		}
-		out = append(out, extent{lblk: e.lblk + done, n: got, pblk: dst})
+		out = append(out, extent{lblk: e.lblk + done, n: got, pblk: blk, uninit: e.uninit})
 		done += got
 	}
 	return out, nil
+}
+
+// releaseRuns frees the host blocks of the runs.
+func (n *node) releaseRuns(runs []extent) error {
+	var errs []error
+	for _, r := range runs {
+		errs = append(errs, n.v.freeBlocks(r.pblk, r.n))
+	}
+	return errors.Join(errs...)
+}
+
+// allocBelowOneLocked takes one free block below low.
+func (n *node) allocBelowOneLocked(low uint64) (uint64, error) {
+	blk, got, err := n.v.allocBlocks(0, 1)
+	if err != nil {
+		return 0, err
+	}
+	if blk >= low {
+		return 0, joinCleanup(errNoRoom, n.v.freeBlocks(blk, got))
+	}
+	return blk, nil
+}
+
+// copyBlocks copies count blocks from host block src to host block dst. A read
+// past the end of the host file yields zeros.
+func (n *node) copyBlocks(src, dst uint64, count uint32) error {
+	buf := make([]byte, 1<<20)
+	total := uint64(count) * blockSize
+	for off := uint64(0); off < total; off += uint64(len(buf)) {
+		chunk := buf[:min(uint64(len(buf)), total-off)]
+		k, err := n.v.hf.ReadAt(chunk, int64(src)*blockSize+int64(off))
+		if err != nil && !errors.Is(err, io.EOF) {
+			return hostError(err)
+		}
+		clear(chunk[k:])
+		if _, err := n.v.hf.WriteAt(chunk, int64(dst)*blockSize+int64(off)); err != nil {
+			return hostError(err)
+		}
+	}
+	return nil
 }

@@ -18,6 +18,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -97,14 +98,13 @@ afterTrailingSymlink:
 		if err := parent.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 			return nil, err
 		}
-		mnt := rp.Mount()
-		if err := fs.beginWrite(mnt); err != nil {
-			return nil, err
-		}
-		defer mnt.EndWrite()
-		uid, gid, _ := parent.inode.newOwner(rp.Credentials())
-		ino, err := fs.newChildLocked(parent, name, modeRegular|uint16(opts.Mode&0o7777), uid, gid, 0, nil)
-		if err != nil {
+		var ino *inode
+		if err := fs.writeOp(rp.Mount(), func() error {
+			uid, gid, _ := parent.inode.newOwner(rp.Credentials())
+			var err error
+			ino, err = fs.newChildLocked(parent, name, modeRegular|uint16(opts.Mode&0o7777), uid, gid, 0, nil)
+			return err
+		}); err != nil {
 			return nil, err
 		}
 		child = fs.newDentryLocked(parent, name, ino)
@@ -163,7 +163,17 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	}
 	switch ino.kind {
 	case modeRegular:
-		return d.openRegular(ctx, rp, opts, afterCreate)
+		fd, err := d.openRegular(ctx, rp, opts, afterCreate)
+		if err != nil {
+			return nil, err
+		}
+		if !afterCreate && opts.Flags&linux.O_TRUNC != 0 {
+			if err := d.clearPrivsAfterTruncate(rp.Credentials()); err != nil {
+				fd.DecRef(ctx)
+				return nil, err
+			}
+		}
+		return fd, nil
 	case modeDir:
 		return d.openDir(ctx, rp, opts, ats)
 	case modeSymlink:
@@ -172,4 +182,28 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	default:
 		return d.openSpecial(ctx, rp, opts)
 	}
+}
+
+// clearPrivsMode returns mode without the set-user-ID and set-group-ID bits. A
+// caller that holds CAP_FSETID for the file keeps the bits, as Linux allows.
+func clearPrivsMode(creds *auth.Credentials, mode uint16, uid, gid uint32) uint16 {
+	if creds.HasCapabilityOnFile(linux.CAP_FSETID, auth.KUID(uid), auth.KGID(gid)) {
+		return mode
+	}
+	return uint16(vfs.ClearSUIDAndSGID(uint32(mode)))
+}
+
+// writeClearPrivsMode is clearPrivsMode for a write by the caller of ctx.
+func writeClearPrivsMode(ctx context.Context, mode uint16, uid, gid uint32) uint16 {
+	return clearPrivsMode(auth.CredentialsFromContext(ctx), mode, uid, gid)
+}
+
+// clearPrivsAfterTruncate removes the set-user-ID and set-group-ID bits and the
+// file capabilities after O_TRUNC, as Linux does when a truncate changes a
+// file. It runs after the truncate, so the caller has the write permission.
+func (d *dentry) clearPrivsAfterTruncate(creds *auth.Credentials) error {
+	d.inode.mutate(func(n *node) {
+		n.mode = clearPrivsMode(creds, n.mode, n.uid, n.gid)
+	})
+	return d.inode.killCapability()
 }

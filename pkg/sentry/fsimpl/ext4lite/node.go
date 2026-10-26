@@ -34,8 +34,13 @@ func encodeTime(t tstamp) (lo, extra uint32) {
 	return uint32(t.sec), t.nsec<<2 | epoch
 }
 
+// maxNsec is the largest valid nanosecond count of a timestamp.
+const maxNsec = 999_999_999
+
+// decodeTime returns the time of an inode time field. A hostile extra field can
+// hold more nanoseconds than a second has, so the count is clamped.
 func decodeTime(lo, extra uint32) tstamp {
-	return tstamp{sec: int64(int32(lo)) + int64(extra&3)<<32, nsec: extra >> 2}
+	return tstamp{sec: int64(int32(lo)) + int64(extra&3)<<32, nsec: min(extra>>2, maxNsec)}
 }
 
 // node is the in-memory copy of one inode. The volume keeps one node for each
@@ -74,9 +79,12 @@ type node struct {
 	// exts maps the file blocks that hold data. A file block that no extent
 	// covers is a hole.
 	exts []extent
-	// leaves lists the extent leaf blocks, which exist while exts has more
-	// than four entries.
-	leaves []uint64
+	// leaves lists the extent leaf blocks in order. A tree read from disk may
+	// hold fewer extents in a leaf than a full leaf does.
+	leaves []leafBlock
+	// ixs lists the index blocks of a depth-2 tree in order. Each names a run
+	// of leaves.
+	ixs []indexBlock
 	// nblocks counts the blocks that the inode owns: data, leaves, and the
 	// xattr block.
 	nblocks uint64
@@ -86,11 +94,18 @@ type node struct {
 
 	// fileACL is the block of the xattr block, or 0.
 	fileACL uint64
+	// xattrRelease is the refcount write that this node owes for a shared
+	// xattr block that it gave up. It stays set, so a later flush of the node
+	// writes the current count again until the block is freed.
+	xattrRelease *xattrRelease
 
 	dirtyInode bool
 	dirtyLeaf  bool
 	dirtyXattr bool
 	deleted    bool
+	// orphan is true while the node is in the orphan list of the volume. The
+	// field dtime then holds the next inode of the list.
+	orphan bool
 }
 
 func (n *node) isDir() bool     { return n.mode&modeTypeMask == modeDir }
@@ -188,6 +203,10 @@ func (v *volume) putNode(n *node) {
 	if !last {
 		return
 	}
+	// The last reference can drop after the unlink call returned, so the free
+	// of the blocks and the inode enters the gate on its own.
+	v.gate.enterInner()
+	defer v.gate.exit()
 	n.mu.Lock()
 	unlinked := n.links == 0 && !n.deleted
 	if unlinked {
@@ -260,7 +279,7 @@ func (n *node) destroyLocked() error {
 		errs = err
 	}
 	if n.fileACL != 0 {
-		if err := n.v.freeBlocks(n.fileACL, 1); err != nil && errs == nil {
+		if err := n.dropXattrBlockLocked(); err != nil && errs == nil {
 			errs = err
 		}
 		n.fileACL = 0
@@ -269,6 +288,7 @@ func (n *node) destroyLocked() error {
 		errs = err
 	}
 	n.deleted = true
+	n.orphan = false
 	n.nblocks = 0
 	n.inline, n.exts, n.leaves = nil, nil, nil
 	n.dir, n.xa = nil, nil
@@ -344,13 +364,44 @@ func (v *volume) parseInode(ino uint32, raw []byte) (*node, error) {
 	default:
 		return nil, corrupt("inode %d has the mode %#o", ino, n.mode)
 	}
-	if n.isDir() {
-		n.dir = &dirData{index: make(map[string]*dirEntry)}
-		if n.size == 0 || n.size%blockSize != 0 || n.flags&flagExtents == 0 {
-			return nil, corrupt("directory inode %d has a bad size or format", ino)
+	if !n.hasContent() {
+		// A device or a pipe has no content, but it can keep attributes.
+		if _, err := n.ibodyData(raw); err != nil {
+			return nil, err
 		}
 	}
+	if err := n.validateSize(); err != nil {
+		return nil, err
+	}
+	if n.isDir() {
+		n.dir = &dirData{index: make(map[string]*dirEntry)}
+	}
+	if err := n.readXattrRef(); err != nil {
+		return nil, err
+	}
 	return n, nil
+}
+
+// validateSize checks the size of the node against its type. A directory must
+// be covered by its extents, so the size never reaches a block that the inode
+// does not map. The check runs after the content is parsed.
+func (n *node) validateSize() error {
+	switch {
+	case n.isRegular():
+		if n.size > maxFileSize {
+			return corrupt("regular inode %d has the size %d", n.ino, n.size)
+		}
+	case n.isSymlink():
+		if n.size == 0 || n.size > maxSymlinkTarget {
+			return corrupt("symlink inode %d has the size %d", n.ino, n.size)
+		}
+	case n.isDir():
+		blocks := n.size / blockSize
+		if n.size == 0 || n.size%blockSize != 0 || n.flags&flagExtents == 0 || blocks > maxDirBlocks || !mappedPrefix(n.exts, blocks) {
+			return corrupt("directory inode %d has the size %d or a bad format", n.ino, n.size)
+		}
+	}
+	return nil
 }
 
 // fastSymlink reports whether the node is a symlink whose target is short
@@ -363,9 +414,16 @@ func (n *node) fastSymlink() bool {
 // parseContent reads i_block as inline content or as an extent tree.
 func (n *node) parseContent(raw []byte) error {
 	if n.isSymlink() && n.flags&(flagInlineData|flagExtents) == 0 {
+		// Compare the 64-bit size before the conversion to int, which can wrap.
+		if n.size == 0 || n.size >= iBlockSize {
+			return corrupt("fast symlink inode %d has a bad target size", n.ino)
+		}
 		size := int(n.size)
-		if size == 0 || size >= iBlockSize || raw[inBlock+size] != 0 || bytes.IndexByte(raw[inBlock:inBlock+size], 0) >= 0 {
+		if raw[inBlock+size] != 0 || bytes.IndexByte(raw[inBlock:inBlock+size], 0) >= 0 {
 			return corrupt("fast symlink inode %d has a bad target", n.ino)
+		}
+		if _, err := n.ibodyData(raw); err != nil {
+			return err
 		}
 		n.flags |= flagInlineData
 		n.inline = bytes.Clone(raw[inBlock : inBlock+size])
@@ -416,7 +474,7 @@ func (n *node) serializeLocked() (im inodeImage) {
 	le.PutUint32(raw[inFileACLLo:], uint32(n.fileACL))
 	le.PutUint16(raw[inFileACLHi:], uint16(n.fileACL>>32))
 	dtime := n.dtime
-	if n.links == 0 && dtime == 0 {
+	if n.links == 0 && dtime == 0 && !n.orphan {
 		// e2fsck expects a deletion time on an inode that no directory names.
 		dtime = uint32(n.v.now().Unix())
 	}
@@ -451,6 +509,7 @@ func (n *node) serializeLocked() (im inodeImage) {
 			n.serializeExtents(raw[inBlock : inBlock+iBlockSize])
 		}
 	}
+	n.encodeBodyXattrsLocked(raw)
 	return im
 }
 
@@ -462,6 +521,7 @@ func (n *node) snapshot(p *flushPlan) {
 	if !n.dirtyInode && !n.dirtyLeaf && !n.dirtyXattr && !n.hasDirtyDirBlocks() {
 		return
 	}
+	n.emitReleasedBlockLocked(p)
 	if n.deleted {
 		p.inodes = append(p.inodes, inodeImage{ino: n.ino})
 		n.dirtyInode, n.dirtyLeaf, n.dirtyXattr = false, false, false

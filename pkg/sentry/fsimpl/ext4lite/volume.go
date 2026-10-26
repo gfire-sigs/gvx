@@ -45,6 +45,40 @@ type volume struct {
 	// flushMu serializes flushes and the close.
 	flushMu sync.Mutex
 
+	// gate makes the snapshot of a flush a cut between guest operations.
+	gate opGate
+
+	// j is the journal. It is nil when the volume runs without one, for
+	// example when group 0 of an old volume has no room for it.
+	j *journal
+	// journalInode is the image of inode 8, which the next write of metadata
+	// adds to the inode table. createJournal sets it.
+	journalInode        inodeImage
+	pendingJournalInode bool
+	// revokePending lists the blocks that the guest freed since the last
+	// snapshot and that a transaction of the current log can hold as metadata.
+	// inflight holds the blocks of the transaction that is being written.
+	// volume.mu protects both.
+	revokePending []uint64
+	inflight      map[uint64]struct{}
+	// allocSinceSnap is true when a block was allocated since the last
+	// snapshot. volume.mu protects it.
+	allocSinceSnap bool
+
+	// orphans holds the nodes that have no link and that a guest still holds.
+	// Only the snapshot of a flush and the mount use it, so flushMu protects
+	// it. orphanHead is the first inode of the chain that the next snapshot
+	// writes into the superblock, and orphanChanged tells the snapshot to write
+	// it.
+	orphans       map[uint32]*node
+	orphanHead    uint32
+	orphanChanged bool
+
+	// assertGate makes the allocator panic when a caller changes it outside the
+	// operation gate. The VFS tests turn it on to find an operation that
+	// forgot to enter the gate.
+	assertGate atomic.Bool
+
 	// mu protects the allocator state and the fields up to the next blank
 	// line.
 	mu              sync.Mutex
@@ -62,8 +96,20 @@ type volume struct {
 	state           uint16
 	closed          bool
 	flushedOnce     bool
+	// xattrShares maps each xattr block that several inodes name to its share.
+	xattrShares map[uint64]*xattrShare
 	// fixups lists the repairs that fsckLite queued for the first mount.
 	fixups []func() error
+	// diskGroups is the number of groups that the superblock on disk records.
+	// The write of a volume without a journal orders its blocks by the change
+	// of this number. flushMu protects it.
+	diskGroups int
+	// fsckMode is true while fsckLite runs. A directory block then skips the
+	// entries that cannot be right instead of failing as a whole.
+	fsckMode bool
+	// repairNotes describes what fsckLite dropped or rebuilt. The filesystem
+	// logs the notes at mount, and the tests read them.
+	repairNotes []string
 	// migTracking is true while a live migration records the written blocks in
 	// group.migDirty. EnableMigrationTracking sets it.
 	//
@@ -115,8 +161,8 @@ func checkSuperblock(sb []byte, hostSize int64) (groups uint32, err error) {
 		{"descriptor size", uint64(le.Uint16(sb[sbDescSize:])), descSize},
 		{"first data block", uint64(le.Uint32(sb[sbFirstDataBlock:])), 0},
 		{"first inode", uint64(le.Uint32(sb[sbFirstIno:])), firstIno},
-		{"compat features", uint64(le.Uint32(sb[sbFeatureCompat:])), featCompat},
-		{"incompat features", uint64(le.Uint32(sb[sbFeatureIncompat:])), featIncompat},
+		{"compat features", uint64(le.Uint32(sb[sbFeatureCompat:]) &^ compatHasJournal), featCompat},
+		{"incompat features", uint64(le.Uint32(sb[sbFeatureIncompat:]) &^ incompatRecover), featIncompat},
 		{"ro_compat features", uint64(le.Uint32(sb[sbFeatureRoCompat:])), featRoCompat},
 	}
 	for _, c := range checks {
@@ -152,6 +198,9 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	}
 	// Every write to the image goes through v.hf, so one wrapper sees them all.
 	v.hf = &trackedFile{hostFile: hf, v: v}
+	v.gate.init()
+	v.inflight = make(map[uint64]struct{})
+	v.orphans = make(map[uint32]*node)
 	if v.now == nil {
 		v.now = time.Now
 	}
@@ -171,9 +220,33 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	}
 	v.state = le.Uint16(v.sb[sbState:])
 
+	// A journal that holds committed transactions is applied before any other
+	// metadata is read, because the transactions can change every block.
+	if v.j, err = v.loadJournal(); err != nil {
+		return nil, err
+	}
+	recovered := false
+	if v.j != nil {
+		v.j.seq = v.j.super.sequence
+		if v.j.needsReplay(v.sb[:]) {
+			if opts.readOnly {
+				return nil, corrupt("the journal holds transactions and a read-only mount cannot replay them")
+			}
+			if err := v.replayJournal(v.j); err != nil {
+				return nil, err
+			}
+			recovered = true
+			if groups, err = checkSuperblock(v.sb[:], size); err != nil {
+				return nil, err
+			}
+			v.state = le.Uint16(v.sb[sbState:])
+		}
+	}
+
 	if err := v.loadGroups(groups); err != nil {
 		return nil, err
 	}
+	v.diskGroups = int(groups)
 	if v.hf.Tier() != tierFallback {
 		if want := int64(groups) * groupBytes; size < want {
 			if opts.readOnly {
@@ -186,7 +259,10 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 		}
 	}
 
-	if v.state&stateValid == 0 {
+	// A volume with a journal is consistent after a replay. A volume without a
+	// journal, or one that an unknown writer left unclean, needs the repair.
+	unclean := v.state&stateValid == 0 && !recovered
+	if v.state&stateError != 0 || unclean {
 		if err := v.fsckLite(); err != nil {
 			return nil, err
 		}
@@ -210,12 +286,39 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	if err := v.runFixups(); err != nil {
 		return nil, err
 	}
-	if !v.readOnly {
+	if v.readOnly {
+		return v, nil
+	}
+	if v.j == nil && !disableJournalUpgrade.Load() {
+		// An old volume gets a journal when group 0 has room for it.
+		if ok, err := v.createJournal(true); err != nil {
+			return nil, err
+		} else if ok {
+			if err := v.flushDirectLocked(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if v.j != nil {
+		if err := v.startSession(); err != nil {
+			return nil, err
+		}
+	} else {
 		// Clear the valid bit first. The next mount runs fsckLite when this
 		// mount ends abnormally.
 		v.state &^= stateValid
 		v.sbDirty = true
 		if err := v.writeSuperblockNow(); err != nil {
+			return nil, err
+		}
+	}
+	// A crash can leave inodes that a guest unlinked and still held open.
+	cleaned, err := v.cleanOrphans()
+	if err != nil {
+		return nil, err
+	}
+	if cleaned {
+		if err := v.flushLocked(); err != nil {
 			return nil, err
 		}
 	}
@@ -246,6 +349,18 @@ func (v *volume) loadGroups(n uint32) error {
 			return hostError(err)
 		}
 		g.inodes.decode(bm[:])
+		if gi == 0 {
+			// The reserved inodes are never free. A damaged bitmap that frees
+			// one would let the allocator hand out an inode that the volume
+			// cannot load again, so the mount sets the bits and writes them with
+			// the next flush.
+			for i := uint32(0); i < firstIno-1; i++ {
+				if !g.inodes.test(i) {
+					g.inodes.set(i)
+					g.dirty = true
+				}
+			}
+		}
 		for b := uint32(0); b < metaBlocksOf(gi); b++ {
 			if !g.blocks.test(b) {
 				return corrupt("group %d block bitmap frees metadata block %d", gi, b)
@@ -273,6 +388,8 @@ func (v *volume) close() error {
 	}
 	v.closed = true
 	v.mu.Unlock()
+	// The unmount frees blocks with no guest operation running.
+	v.assertGate.Store(false)
 
 	var errs []error
 	if !v.readOnly {

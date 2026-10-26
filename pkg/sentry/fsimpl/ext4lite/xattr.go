@@ -23,10 +23,13 @@ import (
 )
 
 // Extended attributes live in two places. The system.data attribute of an
-// inline file lives in the inode, behind the extra fields. Every other
-// attribute of an inode lives in one xattr block, which the inode names in
-// i_file_acl. The block is never shared. The total size of the attributes of
-// one inode stays below one block.
+// inline file lives in the inode, behind the extra fields. A Linux kernel can
+// also store other attributes there, and the engine keeps them in the inode
+// while they stay unchanged. Every other attribute lives in one xattr block,
+// which the inode names in i_file_acl. Linux can share one block between
+// inodes. The engine reads a shared block in place but never changes it:
+// before an inode changes its attributes, the inode moves to a private block.
+// The attributes that the block holds stay below one block.
 
 // Name indexes of the xattr entries.
 const (
@@ -47,12 +50,37 @@ type xattrEntry struct {
 	index uint8
 	name  string
 	value []byte
+	// inBody reports that the entry lives in the inode. Otherwise the entry
+	// lives in the xattr block.
+	inBody bool
 }
 
 // xattrData holds the attributes of a node other than system.data.
 type xattrData struct {
 	entries     []xattrEntry
 	blockLoaded bool
+	// shared reports that the node names a xattr block that the volume tracks
+	// as a share. The node must not change that block in place. It gives up its
+	// name through releaseShareLocked before it moves away from the block.
+	shared bool
+}
+
+// xattrShare is a xattr block that more than one inode names. The volume keeps
+// one share for each such block in volume.xattrShares, guarded by volume.mu.
+// refs counts the names that remain, including the releases that a flush has
+// not written yet. The disk holds the count only after the flush.
+type xattrShare struct {
+	refs uint32
+	// block is the block as the disk held it when the share began. A shared
+	// block never changes, so only its count differs from the disk.
+	block []byte
+}
+
+// xattrRelease is the refcount write that a node owes the disk after it gave up
+// its name of a shared block.
+type xattrRelease struct {
+	blk   uint64
+	share *xattrShare
 }
 
 // xattrEntryLen returns the size of an entry with a name of nameLen bytes.
@@ -202,12 +230,99 @@ func encodeXattrBlock(es []xattrEntry) []byte {
 }
 
 // xattrBlockImageLocked returns the image of the xattr block, when the node
-// has one.
+// has one. A block that is not loaded has no change to write. A shared block
+// has none either: the node writes it only after it moved to a private block.
+// A failed flush marks the attributes dirty again, and that must not rewrite
+// the block of another inode with a count of one.
 func (n *node) xattrBlockImageLocked() (blockWrite, bool) {
-	if n.fileACL == 0 || n.xa == nil {
+	if n.fileACL == 0 || n.xa == nil || !n.xa.blockLoaded || n.xa.shared {
 		return blockWrite{}, false
 	}
-	return blockWrite{n.fileACL, encodeXattrBlock(n.xa.entries)}, true
+	return blockWrite{n.fileACL, encodeXattrBlock(blockEntries(n.xa.entries))}, true
+}
+
+// blockEntries returns the entries that live in the xattr block.
+func blockEntries(es []xattrEntry) []xattrEntry {
+	var out []xattrEntry
+	for _, e := range es {
+		if !e.inBody {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// ibodySpace returns the bytes that the entries need in the inode. The count
+// includes the magic number and the four zero bytes that end the list.
+func ibodySpace(es []xattrEntry) int {
+	total := 4 + 4
+	for _, e := range es {
+		total += xattrEntryLen(len(e.name)) + roundUp4(len(e.value))
+	}
+	return total
+}
+
+// readXattrRef records whether the node names a shared xattr block. The first
+// node that loads a block with more than one name registers a share in the
+// volume table. The table holds the count from then on, because a release that
+// a flush has not written yet is not on the disk. A block with a bad header is
+// left for the lazy check, which reports it when an attribute is read.
+func (n *node) readXattrRef() error {
+	v := n.v
+	if n.fileACL == 0 || !isValidDataBlock(n.fileACL, v.blocksCountSnapshot()) {
+		return nil
+	}
+	v.mu.Lock()
+	known := v.xattrShares[n.fileACL] != nil
+	v.mu.Unlock()
+	if !known {
+		var buf [blockSize]byte
+		if _, err := v.hf.ReadAt(buf[:], int64(n.fileACL)*blockSize); err != nil {
+			return hostError(err)
+		}
+		if le.Uint32(buf[0:]) != xattrMagic {
+			return nil
+		}
+		refs := le.Uint32(buf[4:])
+		if refs == 0 {
+			return corrupt("inode %d xattr block %d has no reference", n.ino, n.fileACL)
+		}
+		if refs == 1 {
+			return nil
+		}
+		v.mu.Lock()
+		if v.xattrShares == nil {
+			v.xattrShares = make(map[uint64]*xattrShare)
+		}
+		if v.xattrShares[n.fileACL] == nil {
+			v.xattrShares[n.fileACL] = &xattrShare{refs: refs, block: bytes.Clone(buf[:])}
+		}
+		v.mu.Unlock()
+	}
+	if n.xa == nil {
+		n.xa = &xattrData{}
+	}
+	n.xa.shared = true
+	return nil
+}
+
+// encodeBodyXattrsLocked writes the attributes that live in the inode. The caller
+// holds n.mu. An inline node keeps no such attribute, so serializeInline alone
+// writes its system.data value.
+func (n *node) encodeBodyXattrsLocked(raw []byte) {
+	if n.xa == nil {
+		return
+	}
+	var es []xattrEntry
+	for _, e := range n.xa.entries {
+		if e.inBody {
+			es = append(es, e)
+		}
+	}
+	if len(es) == 0 {
+		return
+	}
+	encodeIbodyXattrs(raw[ibodyOffset:], es)
 }
 
 // xattrsLocked returns the attributes of the node and reads the block once.
@@ -228,7 +343,7 @@ func (n *node) xattrsLocked() (*xattrData, error) {
 	if _, err := n.v.hf.ReadAt(buf[:], int64(n.fileACL)*blockSize); err != nil {
 		return nil, hostError(err)
 	}
-	if le.Uint32(buf[0:]) != xattrMagic || le.Uint32(buf[4:]) != 1 {
+	if le.Uint32(buf[0:]) != xattrMagic || le.Uint32(buf[4:]) == 0 {
 		return nil, corrupt("inode %d xattr block %d has a bad header", n.ino, n.fileACL)
 	}
 	es, err := parseXattrEntries(buf[:], xattrHeaderSize, 0)
@@ -318,6 +433,10 @@ func (n *node) listXattr() ([]string, error) {
 // setXattr stores the attribute. With create, it fails with EEXIST when the
 // attribute exists. With replace, it fails with ENODATA when it does not.
 func (n *node) setXattr(full string, value []byte, create, replace bool) error {
+	// Callers that run after an operation ended, such as the capability clear
+	// of an open, are outside the gate. The entry accepts a nested caller.
+	n.v.gate.enterInner()
+	defer n.v.gate.exit()
 	idx, name, ok := splitXattrName(full)
 	if !ok || (idx == xattrIndexSystem && name == "data") {
 		return linuxerr.EOPNOTSUPP
@@ -350,7 +469,7 @@ func (n *node) setXattr(full string, value []byte, create, replace bool) error {
 	} else {
 		next = append(next, ent)
 	}
-	if xattrBlockSize(next) > blockSize {
+	if xattrBlockSize(blockEntries(next)) > blockSize {
 		return linuxerr.ENOSPC
 	}
 	return n.installXattrsLocked(next)
@@ -358,6 +477,8 @@ func (n *node) setXattr(full string, value []byte, create, replace bool) error {
 
 // removeXattr deletes the attribute.
 func (n *node) removeXattr(full string) error {
+	n.v.gate.enterInner()
+	defer n.v.gate.exit()
 	idx, name, ok := splitXattrName(full)
 	if !ok {
 		return linuxerr.EOPNOTSUPP
@@ -377,17 +498,41 @@ func (n *node) removeXattr(full string) error {
 	return linuxerr.ENODATA
 }
 
-// installXattrsLocked replaces the attribute list and adjusts the block.
+// installXattrsLocked replaces the attribute list and adjusts the block. A
+// shared block is never changed in place. The node takes a private block for
+// its block entries, and then it gives up its name of the shared block. The
+// private block is allocated first, so a failure leaves the node as it was.
 func (n *node) installXattrsLocked(next []xattrEntry) error {
+	inBlock := len(blockEntries(next)) > 0
 	switch {
-	case len(next) > 0 && n.fileACL == 0:
+	case n.xa.shared:
+		var blk uint64
+		if inBlock {
+			b, _, err := n.v.allocBlocks(0, 1)
+			if err != nil {
+				return err
+			}
+			blk = b
+		}
+		if err := n.releaseShareLocked(); err != nil {
+			if inBlock {
+				_ = n.v.freeBlocks(blk, 1)
+			}
+			return err
+		}
+		n.fileACL = blk
+		if !inBlock {
+			n.nblocks--
+		}
+		n.xa.shared = false
+	case inBlock && n.fileACL == 0:
 		blk, _, err := n.v.allocBlocks(0, 1)
 		if err != nil {
 			return err
 		}
 		n.fileACL = blk
 		n.nblocks++
-	case len(next) == 0 && n.fileACL != 0:
+	case !inBlock && n.fileACL != 0:
 		if err := n.v.freeBlocks(n.fileACL, 1); err != nil {
 			return err
 		}
@@ -398,4 +543,69 @@ func (n *node) installXattrsLocked(next []xattrEntry) error {
 	n.dirtyXattr = true
 	n.markDirtyLocked()
 	return nil
+}
+
+// releaseShareLocked gives up the name that the node holds of its shared xattr
+// block. The last name frees the block. Another name leaves the block allocated,
+// and the node owes the disk the smaller count, which emitReleasedBlockLocked
+// writes. A node holds at most one release, because it names one shared block
+// and a block it gets in return is private. The caller holds n.mu. It changes
+// nothing when it fails.
+func (n *node) releaseShareLocked() error {
+	v := n.v
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	share := v.xattrShares[n.fileACL]
+	if share == nil {
+		return corrupt("inode %d gives up xattr block %d, which is not shared", n.ino, n.fileACL)
+	}
+	if share.refs > 1 {
+		share.refs--
+		n.xattrRelease = &xattrRelease{blk: n.fileACL, share: share}
+		return nil
+	}
+	if err := v.freeBlocksLocked(n.fileACL, 1); err != nil {
+		return err
+	}
+	delete(v.xattrShares, n.fileACL)
+	return nil
+}
+
+// dropXattrBlockLocked gives up the xattr block of a node that is destroyed. A
+// shared block stays allocated while another inode names it.
+func (n *node) dropXattrBlockLocked() error {
+	if n.xa != nil && n.xa.shared {
+		return n.releaseShareLocked()
+	}
+	return n.v.freeBlocks(n.fileACL, 1)
+}
+
+// emitReleasedBlockLocked adds the refcount write that a released share owes the
+// disk to the flush plan. The image carries the count at this moment. Counts only
+// fall, so the last image of a block in a plan holds the lowest count, and the
+// disk ends with the current count. The plan keeps one image for each block. A
+// share that no inode names any more writes nothing, because its block is free.
+// The caller holds n.mu.
+func (n *node) emitReleasedBlockLocked(p *flushPlan) {
+	r := n.xattrRelease
+	if r == nil {
+		return
+	}
+	v := n.v
+	v.mu.Lock()
+	live := v.xattrShares[r.blk] == r.share
+	refs := r.share.refs
+	v.mu.Unlock()
+	if !live {
+		return
+	}
+	img := bytes.Clone(r.share.block)
+	le.PutUint32(img[4:], refs)
+	for i := range p.leaves {
+		if p.leaves[i].blk == r.blk {
+			p.leaves[i].data = img
+			return
+		}
+	}
+	p.leaves = append(p.leaves, blockWrite{r.blk, img})
 }

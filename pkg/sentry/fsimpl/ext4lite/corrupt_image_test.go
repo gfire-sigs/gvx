@@ -204,8 +204,8 @@ func TestCorruptDirectoryRecLen(t *testing.T) {
 		if !isDamage(err) {
 			t.Errorf("rec_len %d: lookup = %v, want EUCLEAN or EIO", recLen, err)
 		}
-		if _, err := dir.entries(); !isDamage(err) {
-			t.Errorf("rec_len %d: entries = %v, want EUCLEAN or EIO", recLen, err)
+		if _, err := dir.entriesFrom(0); !isDamage(err) {
+			t.Errorf("rec_len %d: entriesFrom = %v, want EUCLEAN or EIO", recLen, err)
 		}
 		if err := dir.addEntry("new", 12, ftRegular); !isDamage(err) {
 			t.Errorf("rec_len %d: addEntry = %v, want EUCLEAN or EIO", recLen, err)
@@ -239,7 +239,8 @@ func TestCorruptDirectoryRecLenInRoot(t *testing.T) {
 	}
 }
 
-// TestCorruptDirectoryCycle makes a directory name its own parent as a child.
+// TestCorruptDirectoryCycle makes a directory name itself as a child. fsckLite
+// drops the entry and mounts the rest.
 func TestCorruptDirectoryCycle(t *testing.T) {
 	fx := buildCorruptFixture(t)
 	// Replace the entry "inner" of dir by an entry that names dir itself.
@@ -251,14 +252,17 @@ func TestCorruptDirectoryCycle(t *testing.T) {
 		le.PutUint32(b[idx-8:], fx.dir)
 	})
 	setUncleanState(t, fx.path)
-	before := imageBytes(t, fx.path)
-	if _, err := openForCorruptTest(fx.path); !isDamage(err) {
-		t.Errorf("open of a cyclic graph = %v, want EUCLEAN", err)
+	v, err := openForCorruptTest(fx.path)
+	if err != nil {
+		t.Fatalf("open of a cyclic graph: %v", err)
 	}
-	after := imageBytes(t, fx.path)
-	if !bytes.Equal(before, after) {
-		t.Error("the failed mount changed the image")
+	if len(v.repairNotes) == 0 {
+		t.Error("fsckLite dropped the cyclic entry without a note")
 	}
+	if _, _, err := mustNode(t, v, fx.dir).lookup("inner"); err == nil {
+		t.Error("the entry that closes the cycle is still in the directory")
+	}
+	abandon(v)
 }
 
 // TestCorruptDirectoryGrandparentCycle points a subdirectory at the root.
@@ -272,11 +276,21 @@ func TestCorruptDirectoryGrandparentCycle(t *testing.T) {
 		le.PutUint32(b[idx-8:], rootIno)
 	})
 	setUncleanState(t, fx.path)
-	if _, err := openForCorruptTest(fx.path); !isDamage(err) {
-		t.Errorf("open = %v, want EUCLEAN", err)
+	v, err := openForCorruptTest(fx.path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
 	}
+	if len(v.repairNotes) == 0 {
+		t.Error("fsckLite dropped the entry that names the root without a note")
+	}
+	if _, _, err := mustNode(t, v, fx.dir).lookup("sub"); err == nil {
+		t.Error("the entry that names the root is still in the directory")
+	}
+	abandon(v)
 }
 
+// TestCorruptCrossLinkedExtents makes two files own one block. fsckLite keeps
+// the first owner and mounts the rest.
 func TestCorruptCrossLinkedExtents(t *testing.T) {
 	fx := buildCorruptFixture(t)
 	var shared extent
@@ -292,13 +306,14 @@ func TestCorruptCrossLinkedExtents(t *testing.T) {
 		encodeExtent(raw[inBlock+extHeaderSize:], shared)
 	})
 	setUncleanState(t, fx.path)
-	before := imageBytes(t, fx.path)
-	if _, err := openForCorruptTest(fx.path); !isDamage(err) {
-		t.Errorf("open with cross-linked extents = %v, want EUCLEAN", err)
+	v, err := openForCorruptTest(fx.path)
+	if err != nil {
+		t.Fatalf("open with cross-linked extents: %v", err)
 	}
-	if after := imageBytes(t, fx.path); !bytes.Equal(before, after) {
-		t.Error("the failed mount changed the image")
+	if len(v.repairNotes) == 0 {
+		t.Error("fsckLite resolved the cross-link without a note")
 	}
+	abandon(v)
 }
 
 func mustNode(t testing.TB, v *volume, ino uint32) *node {
@@ -350,7 +365,7 @@ func TestCorruptExtentLeaf(t *testing.T) {
 		writeAll(t, b, int64(i)*blockSize, pattern(2, blockSize))
 	}
 	a.mu.RLock()
-	leaf := a.leaves[0]
+	leaf := a.leaves[0].blk
 	ino := a.ino
 	a.mu.RUnlock()
 	if err := v.close(); err != nil {

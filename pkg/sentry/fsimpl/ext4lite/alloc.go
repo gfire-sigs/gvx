@@ -101,6 +101,7 @@ func (v *volume) allocBlocks(goal uint64, want uint32) (uint64, uint32, error) {
 	if want == 0 {
 		return 0, 0, nil
 	}
+	v.checkGate()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.allocBlocksLocked(goal, want)
@@ -153,6 +154,7 @@ func (v *volume) takeRunLocked(gi, off, want uint32) (uint64, uint32, error) {
 	g.desc.freeBlocks -= n
 	v.freeBlocksTotal -= uint64(n)
 	g.dirty = true
+	v.allocSinceSnap = true
 	return start, n, nil
 }
 
@@ -180,6 +182,7 @@ func (v *volume) ensureHostLocked(blockEnd uint64) error {
 // freeBlocks returns n blocks from start to the pool. The blocks that the disk
 // records as used stay held until the next flush ends.
 func (v *volume) freeBlocks(start uint64, n uint32) error {
+	v.checkGate()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.freeBlocksLocked(start, n)
@@ -203,6 +206,7 @@ func (v *volume) freeBlocksLocked(start uint64, n uint32) error {
 			lazyBitmap(&g.heldBlocks).set(off)
 			g.heldBlockCount++
 			v.heldBlocksTotal++
+			v.revokeIfLoggedLocked(b)
 		}
 		g.desc.freeBlocks++
 		v.freeBlocksTotal++
@@ -211,8 +215,34 @@ func (v *volume) freeBlocksLocked(start uint64, n uint32) error {
 	return nil
 }
 
+// checkGate panics when a caller changes the allocator outside the operation
+// gate. A snapshot taken between two steps of such a caller could write a state
+// that never existed. The tests turn the check on.
+func (v *volume) checkGate() {
+	if v.assertGate.Load() && !v.gate.held() {
+		panic("ext4lite: the allocator changed outside the operation gate")
+	}
+}
+
+// revokeIfLoggedLocked queues a revoke record for block b when a transaction of
+// the current log, or the transaction in flight, can hold b as metadata. Data
+// blocks never enter a transaction, so a freed data block needs no record. The
+// caller holds v.mu.
+func (v *volume) revokeIfLoggedLocked(b uint64) {
+	if v.j == nil {
+		return
+	}
+	if _, ok := v.j.logged[b]; !ok {
+		if _, ok := v.inflight[b]; !ok {
+			return
+		}
+	}
+	v.revokePending = append(v.revokePending, b)
+}
+
 // allocInode takes the lowest free inode number.
 func (v *volume) allocInode(isDir bool) (uint32, error) {
+	v.checkGate()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.readOnly {
@@ -249,6 +279,7 @@ func (v *volume) allocInode(isDir bool) (uint32, error) {
 // freeInode returns an inode number to the pool. The disk keeps the inode
 // marked as used until the next flush ends, when it was in use before.
 func (v *volume) freeInode(ino uint32, isDir bool) error {
+	v.checkGate()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if ino < firstIno || ino > uint32(len(v.groups))*inodesPerGroup {
@@ -282,14 +313,17 @@ func (v *volume) appendGroupLocked() error {
 	if n >= maxGroups {
 		return linuxerr.ENOSPC
 	}
-	if avail, err := v.hf.AvailBytes(); err == nil && avail < groupBytes {
-		return linuxerr.ENOSPC
-	}
 	need := int64(n+1) * groupBytes
+	room := uint64(groupBytes)
 	if v.hf.Tier() == tierFallback {
-		// The fallback tier extends the file on demand. The new group needs
-		// its metadata area now.
-		need = int64(groupStart(n)+uint64(metaBlocksOf(n))) * blockSize
+		// The fallback tier extends the file on demand. The new group needs its
+		// metadata area and one data block now, and the file grows by the blocks
+		// that the guest writes later.
+		need = int64(groupStart(n)+uint64(metaBlocksOf(n))+1) * blockSize
+		room = uint64(metaBlocksOf(n)+1) * blockSize
+	}
+	if avail, err := v.hf.AvailBytes(); err == nil && avail < room {
+		return linuxerr.ENOSPC
 	}
 	if err := v.hf.EnsureSize(need); err != nil {
 		return hostError(err)

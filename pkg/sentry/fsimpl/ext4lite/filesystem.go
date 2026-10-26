@@ -93,6 +93,11 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if !vol.mounted.CompareAndSwap(false, true) {
 		return nil, nil, linuxerr.EBUSY
 	}
+	// fsckLite dropped what it could not keep. The notes tell the user why a
+	// file is missing.
+	for _, note := range vol.v.repairNotes {
+		ctx.Warningf("ext4lite: repaired the volume: %s", note)
+	}
 	fail := func(err error) (*vfs.Filesystem, *vfs.Dentry, error) {
 		vol.mounted.Store(false)
 		return nil, nil, err
@@ -179,13 +184,59 @@ func (fs *filesystem) now() tstamp {
 	return tstamp{sec: t.Unix(), nsec: uint32(t.Nanosecond())}
 }
 
-// beginWrite checks that the volume and the mount accept a write. On success
-// the caller calls mnt.EndWrite.
+// beginWrite checks that the volume and the mount accept a write, and it enters
+// the operation gate. On success the caller calls endWrite once.
+//
+// The call first throttles the guest while too many nodes wait for a flush, so
+// that one transaction never outgrows the journal. The throttle runs before the
+// gate, because a flush needs the gate closed.
 func (fs *filesystem) beginWrite(mnt *vfs.Mount) error {
 	if fs.readOnly {
 		return linuxerr.EROFS
 	}
-	return mnt.CheckBeginWrite()
+	if err := fs.v.throttle(); err != nil {
+		return toLinuxErr(err)
+	}
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	fs.v.gate.enterOp()
+	return nil
+}
+
+// endWrite ends the operation that beginWrite started.
+func (fs *filesystem) endWrite(mnt *vfs.Mount) {
+	fs.v.gate.exit()
+	mnt.EndWrite()
+}
+
+// retryHeld runs op. An operation that fails with ENOSPC while freed space waits
+// for a flush gets one more try after the flush. op must return with the gate
+// open and with no node lock. It can run under fs.mu, because a flush takes no
+// filesystem lock. The retry depends on the volume state and not on a flag that
+// the failed call set, because parallel operations would overwrite such a flag.
+func (fs *filesystem) retryHeld(op func() error) error {
+	err := op()
+	if err == nil || !linuxerr.Equals(linuxerr.ENOSPC, err) || !fs.v.hasHeld() {
+		return err
+	}
+	if serr := fs.v.sync(); serr != nil {
+		return toLinuxErr(serr)
+	}
+	return op()
+}
+
+// writeOp runs op as one guest operation that changes the volume. op runs in the
+// gate, and the wrapper retries it once after a flush when the volume ran out of
+// space that a flush frees.
+func (fs *filesystem) writeOp(mnt *vfs.Mount, op func() error) error {
+	return fs.retryHeld(func() error {
+		if err := fs.beginWrite(mnt); err != nil {
+			return err
+		}
+		defer fs.endWrite(mnt)
+		return op()
+	})
 }
 
 // Release implements vfs.FilesystemImpl.Release. It writes back mapped data,
@@ -244,7 +295,15 @@ func (fs *filesystem) syncMapped() error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, ino := range list {
-		if err := ino.data.SyncData(); err != nil {
+		err := ino.data.SyncData()
+		if errors.Is(err, errSpaceHeld) && fs.v.hasHeld() {
+			// The write-back found no free block while freed blocks wait for a
+			// flush. The flush runs with the gate open.
+			if serr := fs.v.sync(); serr == nil {
+				err = ino.data.SyncData()
+			}
+		}
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}

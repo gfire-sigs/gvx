@@ -79,10 +79,6 @@ func (i *inode) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.SetX
 	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, uid, opts.Name); err != nil {
 		return err
 	}
-	if err := i.fs.beginWrite(mnt); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
 	value := opts.Value
 	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
 		var err error
@@ -93,11 +89,13 @@ func (i *inode) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.SetX
 	}
 	create := opts.Flags&linux.XATTR_CREATE != 0
 	replace := opts.Flags&linux.XATTR_REPLACE != 0
-	if err := i.n.setXattr(opts.Name, []byte(value), create, replace); err != nil {
-		return toLinuxErr(err)
-	}
-	i.touchCtime()
-	return nil
+	return i.fs.writeOp(mnt, func() error {
+		if err := i.n.setXattr(opts.Name, []byte(value), create, replace); err != nil {
+			return toLinuxErr(err)
+		}
+		i.touchCtime()
+		return nil
+	})
 }
 
 func (i *inode) removeXattr(creds *auth.Credentials, mnt *vfs.Mount, name string) error {
@@ -111,15 +109,13 @@ func (i *inode) removeXattr(creds *auth.Credentials, mnt *vfs.Mount, name string
 	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, uid, name); err != nil {
 		return err
 	}
-	if err := i.fs.beginWrite(mnt); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
-	if err := i.n.removeXattr(name); err != nil {
-		return toLinuxErr(err)
-	}
-	i.touchCtime()
-	return nil
+	return i.fs.writeOp(mnt, func() error {
+		if err := i.n.removeXattr(name); err != nil {
+			return toLinuxErr(err)
+		}
+		i.touchCtime()
+		return nil
+	})
 }
 
 // ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.

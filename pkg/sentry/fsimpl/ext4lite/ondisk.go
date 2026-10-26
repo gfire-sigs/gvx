@@ -254,8 +254,10 @@ func (g *groupDesc) decode(b []byte) {
 // extent is one run of file blocks. A file block is a logical 4 KiB block.
 type extent struct {
 	lblk uint32
-	n    uint32 // 1 to maxExtentLen
+	n    uint32 // 1 to maxExtentLen, or to maxUninitExtentLen when uninit
 	pblk uint64
+	// uninit marks an extent whose blocks read as zeros until a write sets them.
+	uninit bool
 }
 
 // Extent tree limits.
@@ -264,7 +266,6 @@ const (
 	maxExtentLen    = 32768
 	rootExtents     = 4
 	leafExtents     = (blockSize - 12) / 12
-	maxFileExtents  = rootExtents * leafExtents
 	extHeaderSize   = 12
 	extEntrySize    = 12
 	maxLogicalBlock = 1<<32 - 1
@@ -285,17 +286,29 @@ func encodeExtentHeader(b []byte, entries, max, depth int) {
 
 func encodeExtent(b []byte, e extent) {
 	le.PutUint32(b[0:], e.lblk)
-	le.PutUint16(b[4:], uint16(e.n))
+	ln := uint16(e.n)
+	if e.uninit {
+		ln += uninitExtentOffset
+	}
+	le.PutUint16(b[4:], ln)
 	le.PutUint16(b[6:], uint16(e.pblk>>32))
 	le.PutUint32(b[8:], uint32(e.pblk))
 }
 
+// decodeExtent reads an extent entry. An ee_len above maxExtentLen marks an
+// uninitialized extent whose length is ee_len minus maxExtentLen.
 func decodeExtent(b []byte) extent {
-	return extent{
+	ln := le.Uint16(b[4:])
+	e := extent{
 		lblk: le.Uint32(b[0:]),
-		n:    uint32(le.Uint16(b[4:])),
 		pblk: uint64(le.Uint16(b[6:]))<<32 | uint64(le.Uint32(b[8:])),
 	}
+	if ln > maxExtentLen {
+		e.uninit = true
+		ln -= uninitExtentOffset
+	}
+	e.n = uint32(ln)
+	return e
 }
 
 func encodeExtentIdx(b []byte, lblk uint32, leaf uint64) {

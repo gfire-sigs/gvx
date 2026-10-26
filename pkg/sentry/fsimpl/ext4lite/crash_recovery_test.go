@@ -171,7 +171,7 @@ func countReachable(t testing.TB, v *volume) uint32 {
 			t.Fatal(err)
 		}
 		if n.isDir() {
-			ents, err := n.entries()
+			ents, err := n.entriesFrom(0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -202,7 +202,7 @@ func TestCrashBeforeAnySync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ents, err := mustRoot(t, rv).entries()
+	ents, err := mustRoot(t, rv).entriesFrom(0)
 	if err != nil {
 		t.Fatal(err)
 	}

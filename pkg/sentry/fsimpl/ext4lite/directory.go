@@ -15,24 +15,27 @@
 package ext4lite
 
 import (
+	"sync"
+
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // dirFD implements vfs.FileDescriptionImpl for directories.
 //
-// A directory description lists the directory once, when the guest first reads
-// it or rewinds it. Every later read comes from that snapshot. POSIX leaves the
-// visibility of entries that change during iteration unspecified. The snapshot
-// keeps offsets stable while the guest deletes entries it already read, as
-// rm -rf does.
+// The position of a description is a cookie: the byte offset in the directory
+// of the next entry to return. An entry keeps its offset while it lives,
+// because unlinking another entry never moves it. So a read that interleaves
+// with unlinks neither repeats nor skips a surviving entry, as rm -rf needs.
+// A cookie that names no entry resumes at the next entry.
 type dirFD struct {
 	fileDescription
 	vfs.DirectoryFileDescriptionDefaultImpl
-	cursor chunkcache.DirCursor
+
+	mu  sync.Mutex
+	pos int64
 }
 
 // openDir creates the file description of a directory.
@@ -77,30 +80,55 @@ func direntType(ft uint8) uint8 {
 	return linux.DT_UNKNOWN
 }
 
-// load lists the directory into a snapshot. The entries "." and ".." come
-// first, then the other entries in the order of the directory blocks.
-func (fd *dirFD) load() ([]vfs.Dirent, error) {
-	ents, err := fd.dentry.inode.n.entries()
-	if err != nil {
-		return nil, toLinuxErr(err)
-	}
-	snap := make([]vfs.Dirent, len(ents))
-	for i, e := range ents {
-		snap[i] = vfs.Dirent{Name: e.name, Type: direntType(e.ft), Ino: uint64(e.ino), NextOff: int64(i + 1)}
-	}
-	fd.dentry.inode.touchAtime(fd.vfsfd.Mount())
-	return snap, nil
-}
-
-// IterDirents implements vfs.FileDescriptionImpl.IterDirents.
+// IterDirents implements vfs.FileDescriptionImpl.IterDirents. It returns the
+// entries at or after the position, in directory order. The position moves past
+// each entry that the callback accepts, so a callback that fails leaves the
+// failed entry for the next call.
 func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
-	return fd.cursor.IterDirents(cb, fd.load)
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	inode := fd.dentry.inode
+	ents, err := inode.n.entriesFrom(uint64(fd.pos))
+	if err != nil {
+		return toLinuxErr(err)
+	}
+	inode.touchAtime(fd.vfsfd.Mount())
+	for _, e := range ents {
+		d := vfs.Dirent{Name: e.name, Type: direntType(e.ft), Ino: uint64(e.ino), NextOff: int64(e.next)}
+		if err := cb.Handle(d); err != nil {
+			return err
+		}
+		fd.pos = int64(e.next)
+	}
+	return nil
 }
 
-// Seek implements vfs.FileDescriptionImpl.Seek. Seeking to the start discards
-// the snapshot, so rewinddir observes the current directory.
+// Seek implements vfs.FileDescriptionImpl.Seek. The offset is a cookie. Seeking
+// to zero rewinds the directory. SEEK_END names the size of the directory, as
+// ext4 does.
 func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
-	return fd.cursor.SeekDir(offset, whence)
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	var newOff int64
+	switch whence {
+	case linux.SEEK_SET:
+		newOff = offset
+	case linux.SEEK_CUR:
+		newOff = fd.pos + offset
+	case linux.SEEK_END:
+		n := fd.dentry.inode.n
+		n.mu.RLock()
+		size := n.size
+		n.mu.RUnlock()
+		newOff = int64(size) + offset
+	default:
+		return 0, linuxerr.EINVAL
+	}
+	if newOff < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	fd.pos = newOff
+	return newOff, nil
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. The volume flush writes the

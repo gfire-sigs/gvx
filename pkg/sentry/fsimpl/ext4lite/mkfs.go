@@ -19,11 +19,40 @@ import (
 	"time"
 )
 
+// mkfsMarker starts block 0 of a file while the first format runs. The boot
+// area of an ext4 file system, the first 1024 bytes, is unused, so the marker
+// does not collide with the format. The final write of block 0 clears it. A
+// file that has the marker and no superblock is a format that a crash cut
+// short. No guest ever mounted it, so the next open formats it again.
+const mkfsMarker = "EXT4LITE-MKFS-IN-PROGRESS"
+
+// unfinishedFormat reports whether hf holds the remains of a format that did
+// not finish.
+func unfinishedFormat(hf hostFile) (bool, error) {
+	var b [blockSize]byte
+	if _, err := hf.ReadAt(b[:], 0); err != nil {
+		return false, hostError(err)
+	}
+	return string(b[:len(mkfsMarker)]) == mkfsMarker && le.Uint16(b[superOffset+sbMagic:]) != superMagic, nil
+}
+
 // formatVolume writes an empty volume of one block group into hf. The file
-// must be empty. The result has the root directory and the resize inode, and
-// it has the valid bit set, as mke2fs leaves a new file system.
+// must be empty. The result has the root directory, the resize inode, and the
+// journal, and it has the valid bit set, as mke2fs leaves a new file system.
+//
+// The format is restartable. It writes the marker first, flushes the file, and
+// writes the superblock last, after a second flush. A crash in between leaves
+// a file that unfinishedFormat recognizes.
 func formatVolume(hf hostFile, now time.Time) error {
 	if err := hf.Truncate(0); err != nil {
+		return hostError(err)
+	}
+	var marker [blockSize]byte
+	copy(marker[:], mkfsMarker)
+	if _, err := hf.WriteAt(marker[:], 0); err != nil {
+		return hostError(err)
+	}
+	if err := hf.Sync(); err != nil {
 		return hostError(err)
 	}
 	if err := hf.EnsureSize(groupBytes); err != nil {
@@ -38,9 +67,15 @@ func formatVolume(hf hostFile, now time.Time) error {
 		now:        func() time.Time { return now },
 		nodes:      make(map[uint32]*node),
 		dirtyNodes: make(map[uint32]*node),
+		inflight:   make(map[uint64]struct{}),
+		orphans:    make(map[uint32]*node),
 		hostBytes:  size,
 		state:      stateValid,
+		// The first image writes its superblock last, as a format that a crash
+		// cut short must leave no superblock behind.
+		diskGroups: 1,
 	}
+	v.gate.init()
 	g := newGroup(0)
 	for i := uint32(0); i < firstIno-1; i++ {
 		g.inodes.set(i)
@@ -52,6 +87,11 @@ func formatVolume(hf hostFile, now time.Time) error {
 	v.freeInodesTotal = uint64(g.desc.freeInodes)
 	v.initSuperLocked(now)
 	v.sbDirty, v.descDirty, v.resizeDirty = true, true, true
+	// The journal takes its blocks before the root directory does. The file is
+	// new, so the journal area already reads as zeros.
+	if _, err := v.createJournal(false); err != nil {
+		return err
+	}
 
 	ts := tstamp{sec: now.Unix(), nsec: uint32(now.Nanosecond())}
 	root := &node{
@@ -63,7 +103,7 @@ func formatVolume(hf hostFile, now time.Time) error {
 	if err := root.initDir(rootIno); err != nil {
 		return err
 	}
-	if err := v.sync(); err != nil {
+	if err := v.flushDirectLocked(); err != nil {
 		return err
 	}
 	return nil

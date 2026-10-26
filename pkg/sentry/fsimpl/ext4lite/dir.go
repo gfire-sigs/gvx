@@ -15,6 +15,8 @@
 package ext4lite
 
 import (
+	"errors"
+	"slices"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -24,25 +26,37 @@ import (
 // a 4-byte inode number, a 2-byte record length, a 1-byte name length, a
 // 1-byte file type, and the name. The directory has no hash tree. A lookup
 // reads the whole directory once and then answers from a map.
+//
+// A record runs from the offset of its entry to the offset of the next live
+// entry of the block, or to the end of the block. The bytes in front of the
+// first entry form one empty record. Removing an entry hands its bytes to the
+// record in front of it, so no other entry moves. The byte offset of an entry
+// in the directory is its cookie, and that cookie stays valid while the entry
+// lives.
 
 // maxNameLen is the longest name of a directory entry.
 const maxNameLen = 255
 
-// dirEntry is one live record of a directory.
+// maxDirBlocks caps a directory at 2^20 blocks, which is 4 GiB. A larger size
+// in an inode is damage, and the engine refuses to grow a directory past it.
+const maxDirBlocks = 1 << 20
+
+// dirEntry is one live entry of a directory. off is its byte offset in blk.
 type dirEntry struct {
 	name string
 	ino  uint32
 	ft   uint8
+	off  int
 	blk  *dirBlock
 }
 
 // entryLen returns the record length of an entry with a name of nameLen bytes.
 func entryLen(nameLen int) int { return roundUp4(8 + nameLen) }
 
-// dirBlock is one 4 KiB block of a directory.
+// dirBlock is one 4 KiB block of a directory. Its entries are in offset order.
 type dirBlock struct {
 	entries []*dirEntry
-	// used is the sum of the record lengths of entries.
+	// used is the sum of the record lengths that the live entries need.
 	used  int
 	dirty bool
 }
@@ -55,11 +69,13 @@ type dirData struct {
 	loaded bool
 }
 
-// dirEnt is one entry that a directory listing returns.
+// dirEnt is one entry that a directory listing returns. next is the cookie of
+// the entry after it.
 type dirEnt struct {
 	name string
 	ino  uint32
 	ft   uint8
+	next uint64
 }
 
 // validName reports whether name can be a directory entry name.
@@ -73,8 +89,34 @@ func validName(name string) error {
 	return nil
 }
 
+// mappedBlocks returns the number of file blocks that the extents map.
+func (n *node) mappedBlocks() uint64 {
+	var total uint64
+	for _, e := range n.exts {
+		total += uint64(e.n)
+	}
+	return total
+}
+
+// mappedPrefix reports whether the sorted extent list maps every file block
+// below nb.
+func mappedPrefix(list []extent, nb uint64) bool {
+	var next uint64
+	for _, e := range list {
+		if next >= nb {
+			break
+		}
+		if uint64(e.lblk) > next {
+			return false
+		}
+		next = max(next, uint64(e.end()))
+	}
+	return next >= nb
+}
+
 // loadDirLocked reads the blocks of the directory. The caller holds n.mu for
-// writing.
+// writing. parseInode checked the size against the extents, so the capacity
+// comes from the blocks that the extents map.
 func (n *node) loadDirLocked() error {
 	d := n.dir
 	if d == nil {
@@ -84,7 +126,7 @@ func (n *node) loadDirLocked() error {
 		return nil
 	}
 	nb := n.size / blockSize
-	blocks := make([]*dirBlock, 0, nb)
+	blocks := make([]*dirBlock, 0, min(nb, n.mappedBlocks()))
 	index := make(map[string]*dirEntry)
 	var buf [blockSize]byte
 	for lb := uint32(0); uint64(lb) < nb; lb++ {
@@ -105,8 +147,10 @@ func (n *node) loadDirLocked() error {
 	return nil
 }
 
-// parseDirBlock decodes one block and adds its entries to index. Every record
-// must obey the bounds, or the walk could loop or read outside the block.
+// parseDirBlock decodes one block and adds its live entries to index. Every
+// record must obey the bounds, or the walk could loop or read outside the block.
+// An empty record and a record behind a live entry carry no entry. The layout
+// of the block then comes from the live entries alone.
 func (n *node) parseDirBlock(buf []byte, first bool, index map[string]*dirEntry) (*dirBlock, error) {
 	b := &dirBlock{}
 	inodes := n.v.numGroups() * inodesPerGroup
@@ -122,17 +166,35 @@ func (n *node) parseDirBlock(buf []byte, first bool, index map[string]*dirEntry)
 			return nil, corrupt("directory inode %d record at offset %d has the length %d", n.ino, off, rec)
 		}
 		if ino != 0 {
+			// The repair keeps the other entries of a block, and it skips an
+			// entry that cannot be right. A mount that is not a repair refuses
+			// the whole directory.
 			if ino > inodes || (ino < firstIno && ino != rootIno) {
+				if n.v.fsckMode {
+					b.dirty = true
+					off += rec
+					continue
+				}
 				return nil, corrupt("directory inode %d entry names inode %d", n.ino, ino)
 			}
 			name := string(buf[off+8 : off+8+nameLen])
 			if nameLen == 0 || strings.ContainsAny(name, "/\x00") {
+				if n.v.fsckMode {
+					b.dirty = true
+					off += rec
+					continue
+				}
 				return nil, corrupt("directory inode %d has an entry with the name %q", n.ino, name)
 			}
 			if _, dup := index[name]; dup {
+				if n.v.fsckMode {
+					b.dirty = true
+					off += rec
+					continue
+				}
 				return nil, corrupt("directory inode %d lists %q twice", n.ino, name)
 			}
-			e := &dirEntry{name: name, ino: ino, ft: ft, blk: b}
+			e := &dirEntry{name: name, ino: ino, ft: ft, off: off, blk: b}
 			b.entries = append(b.entries, e)
 			b.used += entryLen(nameLen)
 			index[name] = e
@@ -164,25 +226,28 @@ func (n *node) dirBlockImagesLocked() []blockWrite {
 	return out
 }
 
-// image encodes the block. The last record extends to the end of the block.
+// image encodes the block. Each record runs to the offset of the next live
+// entry, so the last record reaches the end of the block. The bytes in front of
+// the first entry form one empty record.
 func (b *dirBlock) image() []byte {
 	buf := make([]byte, blockSize)
 	if len(b.entries) == 0 {
 		le.PutUint16(buf[4:], blockSize)
 		return buf
 	}
-	off := 0
+	if first := b.entries[0].off; first > 0 {
+		le.PutUint16(buf[4:], uint16(first))
+	}
 	for i, e := range b.entries {
-		rec := entryLen(len(e.name))
-		if i == len(b.entries)-1 {
-			rec = blockSize - off
+		end := blockSize
+		if i+1 < len(b.entries) {
+			end = b.entries[i+1].off
 		}
-		le.PutUint32(buf[off:], e.ino)
-		le.PutUint16(buf[off+4:], uint16(rec))
-		buf[off+6] = byte(len(e.name))
-		buf[off+7] = e.ft
-		copy(buf[off+8:], e.name)
-		off += rec
+		le.PutUint32(buf[e.off:], e.ino)
+		le.PutUint16(buf[e.off+4:], uint16(end-e.off))
+		buf[e.off+6] = byte(len(e.name))
+		buf[e.off+7] = e.ft
+		copy(buf[e.off+8:], e.name)
 	}
 	return buf
 }
@@ -203,8 +268,8 @@ func (n *node) initDir(parent uint32) error {
 	n.nblocks++
 	n.size = blockSize
 	b := &dirBlock{dirty: true}
-	self := &dirEntry{name: ".", ino: n.ino, ft: ftDir, blk: b}
-	up := &dirEntry{name: "..", ino: parent, ft: ftDir, blk: b}
+	self := &dirEntry{name: ".", ino: n.ino, ft: ftDir, off: 0, blk: b}
+	up := &dirEntry{name: "..", ino: parent, ft: ftDir, off: entryLen(1), blk: b}
 	b.entries = []*dirEntry{self, up}
 	b.used = entryLen(1) + entryLen(2)
 	n.dir = &dirData{blocks: []*dirBlock{b}, index: map[string]*dirEntry{".": self, "..": up}, loaded: true}
@@ -229,6 +294,63 @@ func (n *node) lookup(name string) (uint32, uint8, error) {
 	return e.ino, e.ft, nil
 }
 
+// place stores e at the first offset where its record fits, and reports whether
+// the block had room. The bytes in front of the first entry come first. Each
+// entry then offers the bytes behind its own record, up to the next entry.
+func (b *dirBlock) place(e *dirEntry) bool {
+	need := entryLen(len(e.name))
+	if blockSize-b.used < need {
+		return false
+	}
+	lead := blockSize
+	if len(b.entries) > 0 {
+		lead = b.entries[0].off
+	}
+	if lead >= need {
+		e.off = 0
+		b.insertAt(0, e)
+		return true
+	}
+	for i, x := range b.entries {
+		end := blockSize
+		if i+1 < len(b.entries) {
+			end = b.entries[i+1].off
+		}
+		at := x.off + entryLen(len(x.name))
+		if end-at >= need {
+			e.off = at
+			b.insertAt(i+1, e)
+			return true
+		}
+	}
+	return false
+}
+
+// insertAt puts e at position i of the live entries, and sets the block of e.
+func (b *dirBlock) insertAt(i int, e *dirEntry) {
+	e.blk = b
+	b.entries = slices.Insert(b.entries, i, e)
+	b.used += entryLen(len(e.name))
+	b.dirty = true
+}
+
+// remove takes e out of the block. The record of e joins the record in front
+// of it, so the entries behind e keep their offsets.
+func (b *dirBlock) remove(e *dirEntry) {
+	i := slices.Index(b.entries, e)
+	if i < 0 {
+		return
+	}
+	b.entries = slices.Delete(b.entries, i, i+1)
+	b.used -= entryLen(len(e.name))
+	b.dirty = true
+}
+
+// emptyWithout reports whether the block holds no entry besides e.
+func (b *dirBlock) emptyWithout(e *dirEntry) bool {
+	return len(b.entries) == 0 || len(b.entries) == 1 && b.entries[0] == e
+}
+
 // addEntry adds name for inode ino. It returns EEXIST when name exists.
 func (n *node) addEntry(name string, ino uint32, ft uint8) error {
 	if err := validName(name); err != nil {
@@ -245,28 +367,23 @@ func (n *node) addEntry(name string, ino uint32, ft uint8) error {
 	if _, ok := n.dir.index[name]; ok {
 		return linuxerr.EEXIST
 	}
-	need := entryLen(len(name))
-	var blk *dirBlock
-	if last := n.dir.blocks[len(n.dir.blocks)-1]; last.used+need <= blockSize {
-		blk = last
-	} else {
-		for _, b := range n.dir.blocks {
-			if b.used+need <= blockSize {
-				blk = b
-				break
-			}
+	e := &dirEntry{name: name, ino: ino, ft: ft}
+	placed := false
+	for _, b := range n.dir.blocks {
+		if b.place(e) {
+			placed = true
+			break
 		}
 	}
-	if blk == nil {
-		var err error
-		if blk, err = n.appendDirBlockLocked(); err != nil {
+	if !placed {
+		b, err := n.appendDirBlockLocked()
+		if err != nil {
 			return err
 		}
+		if !b.place(e) {
+			return corrupt("directory inode %d: an empty block has no room for %q", n.ino, name)
+		}
 	}
-	e := &dirEntry{name: name, ino: ino, ft: ft, blk: blk}
-	blk.entries = append(blk.entries, e)
-	blk.used += need
-	blk.dirty = true
 	n.dir.index[name] = e
 	n.markDirtyLocked()
 	return nil
@@ -274,6 +391,9 @@ func (n *node) addEntry(name string, ino uint32, ft uint8) error {
 
 // appendDirBlockLocked adds one empty block at the end of the directory.
 func (n *node) appendDirBlockLocked() (*dirBlock, error) {
+	if uint64(len(n.dir.blocks)) >= maxDirBlocks {
+		return nil, linuxerr.ENOSPC
+	}
 	goal := uint64(0)
 	if k := len(n.exts); k > 0 {
 		goal = n.exts[k-1].pend()
@@ -294,7 +414,10 @@ func (n *node) appendDirBlockLocked() (*dirBlock, error) {
 	return b, nil
 }
 
-// removeEntry removes name from the directory.
+// removeEntry removes name from the directory. The blocks that the removal
+// empties leave the end of the directory first, because that step can fail.
+// It runs before the entry index changes, so a failure leaves the directory as
+// it was.
 func (n *node) removeEntry(name string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -308,26 +431,70 @@ func (n *node) removeEntry(name string) error {
 	if !ok || name == "." || name == ".." {
 		return linuxerr.ENOENT
 	}
-	b := e.blk
-	for i, x := range b.entries {
-		if x == e {
-			b.entries = append(b.entries[:i], b.entries[i+1:]...)
-			break
-		}
+	keep := len(n.dir.blocks)
+	for keep > 1 && n.dir.blocks[keep-1].emptyWithout(e) {
+		keep--
 	}
-	b.used -= entryLen(len(name))
-	b.dirty = true
-	delete(n.dir.index, name)
-	// Free the empty blocks at the end of the directory.
-	for k := len(n.dir.blocks) - 1; k > 0 && len(n.dir.blocks[k].entries) == 0; k-- {
-		if err := n.freeRangeLocked(uint32(k), maxLogicalBlock); err != nil {
+	var freed []extent
+	if keep < len(n.dir.blocks) {
+		var err error
+		if freed, err = n.dropTailLocked(keep); err != nil {
 			return err
 		}
-		n.dir.blocks = n.dir.blocks[:k]
-		n.size = uint64(k) * blockSize
 	}
+	e.blk.remove(e)
+	delete(n.dir.index, name)
 	n.markDirtyLocked()
-	return nil
+	// The mapping no longer names the freed blocks. A failure to free them
+	// leaks blocks, and the directory stays consistent.
+	return freeExtents(n.v, freed)
+}
+
+// dropTailLocked drops the directory blocks from index keep on. It checks that
+// the bitmap holds every block that it frees, before it changes the mapping. It
+// changes nothing when it returns an error. The caller frees the returned extents
+// after its own changes.
+func (n *node) dropTailLocked(keep int) ([]extent, error) {
+	list, freed := removeRange(n.exts, uint32(keep), maxLogicalBlock)
+	for _, f := range freed {
+		if !n.v.blocksAllocated(f.pblk, f.n) {
+			return nil, corrupt("directory inode %d maps blocks %d+%d that the bitmap does not hold", n.ino, f.pblk, f.n)
+		}
+	}
+	if err := n.setExtentsLocked(list); err != nil {
+		return nil, err
+	}
+	n.dir.blocks = n.dir.blocks[:keep]
+	n.size = uint64(keep) * blockSize
+	for _, f := range freed {
+		n.nblocks -= uint64(f.n)
+	}
+	return freed, nil
+}
+
+// freeExtents returns the blocks of the extents to the pool.
+func freeExtents(v *volume, list []extent) error {
+	var errs error
+	for _, f := range list {
+		errs = errors.Join(errs, v.freeBlocks(f.pblk, f.n))
+	}
+	return errs
+}
+
+// blocksAllocated reports whether the bitmap marks the n data blocks from start
+// as used. freeBlocks refuses any other run, so a caller checks the run before
+// it changes state that depends on the free.
+func (v *volume) blocksAllocated(start uint64, n uint32) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	blocks := v.blocksCountLocked()
+	for i := range n {
+		b := start + uint64(i)
+		if !isValidDataBlock(b, blocks) || !v.groups[b/blocksPerGroup].blocks.test(uint32(b%blocksPerGroup)) {
+			return false
+		}
+	}
+	return true
 }
 
 // replaceEntry points the existing entry name at another inode.
@@ -352,9 +519,10 @@ func (n *node) setParent(parent uint32) error {
 	return n.replaceEntry("..", parent, ftDir)
 }
 
-// entries returns the entries of the directory in storage order, including
-// . and ..
-func (n *node) entries() ([]dirEnt, error) {
+// entriesFrom lists the live entries whose cookies are at or after pos, in
+// directory order. Each entry carries the cookie of the entry after it. A
+// position that names no entry resumes at the next entry, as ext4 does.
+func (n *node) entriesFrom(pos uint64) ([]dirEnt, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if !n.isDir() {
@@ -364,10 +532,24 @@ func (n *node) entries() ([]dirEnt, error) {
 		return nil, err
 	}
 	var out []dirEnt
-	for _, b := range n.dir.blocks {
+	// appended reports that the previous entry is in out, so it needs the
+	// cookie of the entry that follows it.
+	appended := false
+	for bi, b := range n.dir.blocks {
+		base := uint64(bi) * blockSize
 		for _, e := range b.entries {
-			out = append(out, dirEnt{e.name, e.ino, e.ft})
+			at := base + uint64(e.off)
+			if appended {
+				out[len(out)-1].next = at
+			}
+			appended = at >= pos
+			if appended {
+				out = append(out, dirEnt{name: e.name, ino: e.ino, ft: e.ft})
+			}
 		}
+	}
+	if appended {
+		out[len(out)-1].next = n.size
 	}
 	return out, nil
 }

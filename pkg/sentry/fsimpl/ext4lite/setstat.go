@@ -124,70 +124,67 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.M
 			return err
 		}
 	}
-	if err := i.fs.beginWrite(mnt); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
-
-	bumpC := false
-	if mask&linux.STATX_SIZE != 0 {
-		switch {
-		case i.isDir():
-			return linuxerr.EISDIR
-		case !i.isRegular():
-			return linuxerr.EINVAL
-		}
-		if err := i.truncate(stat.Size); err != nil {
-			return err
-		}
-	}
-	now := i.fs.now()
-	clearPrivs := opts.ClearPrivs
-	i.mutate(func(n *node) {
-		if mask&linux.STATX_UID != 0 {
-			n.uid = stat.UID
-			bumpC = true
-		}
-		if mask&linux.STATX_GID != 0 {
-			n.gid = stat.GID
-			bumpC = true
-		}
-		if mask&linux.STATX_MODE != 0 {
-			m := uint32(n.mode&modeTypeMask) | uint32(stat.Mode&0o7777)
-			if clearPrivs {
-				m = vfs.ClearSUIDAndSGID(m)
-				clearPrivs = false
+	return i.fs.writeOp(mnt, func() error {
+		bumpC := false
+		if mask&linux.STATX_SIZE != 0 {
+			switch {
+			case i.isDir():
+				return linuxerr.EISDIR
+			case !i.isRegular():
+				return linuxerr.EINVAL
 			}
-			n.mode = uint16(m)
-			bumpC = true
+			if err := i.truncate(stat.Size); err != nil {
+				return err
+			}
 		}
-		if clearPrivs {
-			n.mode = uint16(vfs.ClearSUIDAndSGID(uint32(n.mode)))
-			bumpC = true
+		now := i.fs.now()
+		clearPrivs := opts.ClearPrivs
+		i.mutate(func(n *node) {
+			if mask&linux.STATX_UID != 0 {
+				n.uid = stat.UID
+				bumpC = true
+			}
+			if mask&linux.STATX_GID != 0 {
+				n.gid = stat.GID
+				bumpC = true
+			}
+			if mask&linux.STATX_MODE != 0 {
+				m := uint32(n.mode&modeTypeMask) | uint32(stat.Mode&0o7777)
+				if clearPrivs {
+					m = vfs.ClearSUIDAndSGID(m)
+					clearPrivs = false
+				}
+				n.mode = uint16(m)
+				bumpC = true
+			}
+			if clearPrivs {
+				n.mode = uint16(vfs.ClearSUIDAndSGID(uint32(n.mode)))
+				bumpC = true
+			}
+			if mask&linux.STATX_ATIME != 0 {
+				n.atime = timeFromStatx(stat.Atime, now)
+				bumpC = true
+			}
+			if mask&linux.STATX_MTIME != 0 {
+				n.mtime = timeFromStatx(stat.Mtime, now)
+				bumpC = true
+			}
+			if mask&linux.STATX_CTIME != 0 {
+				n.ctime = timeFromStatx(stat.Ctime, now)
+				bumpC = false
+			}
+			if bumpC {
+				n.ctime = now
+			}
+		})
+		if opts.ClearPrivs {
+			// A change of the content or the owner removes the file capabilities.
+			if err := i.n.removeXattr(linux.XATTR_SECURITY_CAPABILITY); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
+				return toLinuxErr(err)
+			}
 		}
-		if mask&linux.STATX_ATIME != 0 {
-			n.atime = timeFromStatx(stat.Atime, now)
-			bumpC = true
-		}
-		if mask&linux.STATX_MTIME != 0 {
-			n.mtime = timeFromStatx(stat.Mtime, now)
-			bumpC = true
-		}
-		if mask&linux.STATX_CTIME != 0 {
-			n.ctime = timeFromStatx(stat.Ctime, now)
-			bumpC = false
-		}
-		if bumpC {
-			n.ctime = now
-		}
+		return nil
 	})
-	if opts.ClearPrivs {
-		// A change of the content or the owner removes the file capabilities.
-		if err := i.n.removeXattr(linux.XATTR_SECURITY_CAPABILITY); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
-			return toLinuxErr(err)
-		}
-	}
-	return nil
 }
 
 // SetStatAt implements vfs.FilesystemImpl.SetStatAt.

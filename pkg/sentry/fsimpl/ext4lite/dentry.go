@@ -342,6 +342,9 @@ func (fs *filesystem) inodeForNodeLocked(n *node) *inode {
 // has none. Every change of the volume goes through this filesystem, so a
 // cached dentry is always current.
 func (fs *filesystem) lookupChildLocked(parent *dentry, name string) (*dentry, error) {
+	if len(name) > maxNameLen {
+		return nil, linuxerr.ENAMETOOLONG
+	}
 	if c := parent.children[name]; c != nil {
 		return c, nil
 	}

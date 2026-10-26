@@ -107,16 +107,15 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if parent.dead {
 		return linuxerr.ENOENT
 	}
-	mnt := rp.Mount()
-	if err := fs.beginWrite(mnt); err != nil {
+	var ino *inode
+	if err := fs.writeOp(rp.Mount(), func() error {
+		if err := parent.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+			return err
+		}
+		var err error
+		ino, err = create(parent, name)
 		return err
-	}
-	defer mnt.EndWrite()
-	if err := parent.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
-		return err
-	}
-	ino, err := create(parent, name)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	fs.newDentryLocked(parent, name, ino)
@@ -237,10 +236,15 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 	creds := rp.Credentials()
+	// Linux looks up the name before it checks the write permission of the
+	// parent, so a name that is too long fails first.
+	name := rp.Component()
+	if len(name) > maxNameLen {
+		return linuxerr.ENAMETOOLONG
+	}
 	if err := parent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	name := rp.Component()
 	if name == "." || name == ".." {
 		return linuxerr.EISDIR
 	}
@@ -261,7 +265,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if err := fs.beginWrite(mnt); err != nil {
 		return err
 	}
-	defer mnt.EndWrite()
+	defer fs.endWrite(mnt)
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
@@ -290,10 +294,13 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 	creds := rp.Credentials()
+	name := rp.Component()
+	if len(name) > maxNameLen {
+		return linuxerr.ENAMETOOLONG
+	}
 	if err := parent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	name := rp.Component()
 	if name == "." {
 		return linuxerr.EINVAL
 	}
@@ -321,7 +328,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err := fs.beginWrite(mnt); err != nil {
 		return err
 	}
-	defer mnt.EndWrite()
+	defer fs.endWrite(mnt)
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
@@ -392,133 +399,130 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 		return linuxerr.EBUSY
 	}
-	if len(newName) > maxNameLen {
+	if len(newName) > maxNameLen || len(oldName) > maxNameLen {
 		return linuxerr.ENAMETOOLONG
 	}
 	mnt := rp.Mount()
 	if mnt != oldParentVD.Mount() {
 		return linuxerr.EXDEV
 	}
-	if err := fs.beginWrite(mnt); err != nil {
-		return err
-	}
-	defer mnt.EndWrite()
-
-	creds := rp.Credentials()
-	oldParent := oldParentVD.Dentry().Impl().(*dentry)
-	if err := oldParent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
-	}
-	renamed, err := fs.lookupChildLocked(oldParent, oldName)
-	if err != nil {
-		return err
-	}
-	if err := mayDelete(creds, oldParent.inode, renamed.inode); err != nil {
-		return err
-	}
-	if renamed.inode.isDir() {
-		if isAncestorLocked(renamed, newParent) {
-			return linuxerr.EINVAL
+	return fs.writeOp(mnt, func() error {
+		creds := rp.Credentials()
+		oldParent := oldParentVD.Dentry().Impl().(*dentry)
+		if err := oldParent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
 		}
-		if oldParent != newParent {
-			// Writability is needed to change the entry "..".
-			if err := renamed.inode.checkPermissions(creds, vfs.MayWrite); err != nil {
+		renamed, err := fs.lookupChildLocked(oldParent, oldName)
+		if err != nil {
+			return err
+		}
+		if err := mayDelete(creds, oldParent.inode, renamed.inode); err != nil {
+			return err
+		}
+		if renamed.inode.isDir() {
+			if isAncestorLocked(renamed, newParent) {
+				return linuxerr.EINVAL
+			}
+			if oldParent != newParent {
+				// Writability is needed to change the entry "..".
+				if err := renamed.inode.checkPermissions(creds, vfs.MayWrite); err != nil {
+					return err
+				}
+			}
+		} else if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
+			return linuxerr.ENOTDIR
+		}
+		if err := newParent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
+		}
+		replaced, err := fs.lookupChildLocked(newParent, newName)
+		if err != nil {
+			if !linuxerr.Equals(linuxerr.ENOENT, err) {
+				return err
+			}
+			replaced = nil
+		}
+		crossDir := oldParent != newParent
+		switch {
+		case replaced == nil && exchange:
+			return linuxerr.ENOENT
+		case replaced == nil:
+			if renamed.inode.isDir() && crossDir && newParent.inode.attr().links >= maxLinks {
+				return linuxerr.EMLINK
+			}
+		case opts.Flags&linux.RENAME_NOREPLACE != 0:
+			return linuxerr.EEXIST
+		default:
+			if err := mayDelete(creds, newParent.inode, replaced.inode); err != nil {
+				return err
+			}
+			if err := fs.checkReplaceLocked(creds, rp, opts, renamed, replaced, oldParent, newParent, exchange); err != nil {
 				return err
 			}
 		}
-	} else if !exchange && (opts.MustBeDir || rp.MustBeDir()) {
-		return linuxerr.ENOTDIR
-	}
-	if err := newParent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
-	}
-	replaced, err := fs.lookupChildLocked(newParent, newName)
-	if err != nil {
-		if !linuxerr.Equals(linuxerr.ENOENT, err) {
-			return err
+		if newParent.dead {
+			return linuxerr.ENOENT
 		}
-		replaced = nil
-	}
-	crossDir := oldParent != newParent
-	switch {
-	case replaced == nil && exchange:
-		return linuxerr.ENOENT
-	case replaced == nil:
-		if renamed.inode.isDir() && crossDir && newParent.inode.attr().links >= maxLinks {
-			return linuxerr.EMLINK
+		// A rename of a file onto itself, or onto another name of the same file,
+		// changes nothing.
+		if replaced != nil && (renamed == replaced || (renamed.inode == replaced.inode && !renamed.inode.isDir())) {
+			return nil
 		}
-	case opts.Flags&linux.RENAME_NOREPLACE != 0:
-		return linuxerr.EEXIST
-	default:
-		if err := mayDelete(creds, newParent.inode, replaced.inode); err != nil {
-			return err
-		}
-		if err := fs.checkReplaceLocked(creds, rp, opts, renamed, replaced, oldParent, newParent, exchange); err != nil {
-			return err
-		}
-	}
-	if newParent.dead {
-		return linuxerr.ENOENT
-	}
-	// A rename of a file onto itself, or onto another name of the same file,
-	// changes nothing.
-	if replaced != nil && (renamed == replaced || (renamed.inode == replaced.inode && !renamed.inode.isDir())) {
-		return nil
-	}
 
-	vfsObj := rp.VirtualFilesystem()
-	mntns := vfs.MountNamespaceFromContext(ctx)
-	defer mntns.DecRef(ctx)
-	var replacedVFSD *vfs.Dentry
-	if replaced != nil {
-		replacedVFSD = &replaced.vfsd
-	}
-	handle, err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD)
-	if err != nil {
-		return err
-	}
-	vfsObj.RenameBegin(&handle)
-	if exchange {
-		err = fs.exchangeEntries(oldParent, oldName, renamed, newParent, newName, replaced)
-	} else {
-		err = fs.moveEntries(oldParent, oldName, renamed, newParent, newName, replaced)
-	}
-	if err != nil {
-		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
-		return err
-	}
-	if exchange {
-		fs.adjustExchangeLinks(oldParent, newParent, renamed, replaced)
-		fs.exchangeDentriesLocked(ctx, renamed, replaced)
-		vfsObj.CommitRenameExchangeDentry(&handle, &renamed.vfsd, replacedVFSD)
-		replaced.inode.touchCtime()
-		vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParent.inode.watches, &newParent.inode.watches, oldName, newName, renamed.inode.isDir())
-		vfs.InotifyRename(ctx, &replaced.inode.watches, &newParent.inode.watches, &oldParent.inode.watches, newName, oldName, replaced.inode.isDir())
-	} else {
+		vfsObj := rp.VirtualFilesystem()
+		mntns := vfs.MountNamespaceFromContext(ctx)
+		defer mntns.DecRef(ctx)
+		var replacedVFSD *vfs.Dentry
 		if replaced != nil {
-			if replaced.inode.isDir() {
-				// The replaced directory loses its links and the entry "..".
-				replaced.inode.mutate(func(n *node) { n.links = 0 })
-				newParent.inode.addLinks(-1)
-			} else {
-				replaced.inode.addLinks(-1)
+			replacedVFSD = &replaced.vfsd
+		}
+		handle, err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD)
+		if err != nil {
+			return err
+		}
+		vfsObj.RenameBegin(&handle)
+		if exchange {
+			err = fs.exchangeEntries(oldParent, oldName, renamed, newParent, newName, replaced)
+		} else {
+			err = fs.moveEntries(oldParent, oldName, renamed, newParent, newName, replaced)
+		}
+		if err != nil {
+			vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
+			return err
+		}
+		if exchange {
+			fs.adjustExchangeLinks(oldParent, newParent, renamed, replaced)
+			fs.exchangeDentriesLocked(ctx, renamed, replaced)
+			vfsObj.CommitRenameExchangeDentry(&handle, &renamed.vfsd, replacedVFSD)
+			replaced.inode.touchCtime()
+			vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParent.inode.watches, &newParent.inode.watches, oldName, newName, renamed.inode.isDir())
+			vfs.InotifyRename(ctx, &replaced.inode.watches, &newParent.inode.watches, &oldParent.inode.watches, newName, oldName, replaced.inode.isDir())
+		} else {
+			if replaced != nil {
+				if replaced.inode.isDir() {
+					// The replaced directory loses its links and the entry "..".
+					replaced.inode.mutate(func(n *node) { n.links = 0 })
+					newParent.inode.addLinks(-1)
+				} else {
+					replaced.inode.addLinks(-1)
+				}
+				fs.detachLocked(ctx, replaced)
 			}
-			fs.detachLocked(ctx, replaced)
+			if renamed.inode.isDir() && crossDir {
+				oldParent.inode.addLinks(-1)
+				newParent.inode.addLinks(1)
+			}
+			fs.moveLocked(ctx, renamed, newParent, newName)
+			fs.deferDecRef(vfsObj.CommitRenameReplaceDentry(ctx, &handle, &renamed.vfsd, replacedVFSD))
+			vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParent.inode.watches, &newParent.inode.watches, oldName, newName, renamed.inode.isDir())
 		}
-		if renamed.inode.isDir() && crossDir {
-			oldParent.inode.addLinks(-1)
-			newParent.inode.addLinks(1)
+		oldParent.inode.touchMCtime()
+		if crossDir {
+			newParent.inode.touchMCtime()
 		}
-		fs.moveLocked(ctx, renamed, newParent, newName)
-		fs.deferDecRef(vfsObj.CommitRenameReplaceDentry(ctx, &handle, &renamed.vfsd, replacedVFSD))
-		vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParent.inode.watches, &newParent.inode.watches, oldName, newName, renamed.inode.isDir())
-	}
-	oldParent.inode.touchMCtime()
-	if crossDir {
-		newParent.inode.touchMCtime()
-	}
-	renamed.inode.touchCtime()
-	return nil
+		renamed.inode.touchCtime()
+		return nil
+	})
 }
 
 // checkReplaceLocked applies the type rules of a rename that replaces or

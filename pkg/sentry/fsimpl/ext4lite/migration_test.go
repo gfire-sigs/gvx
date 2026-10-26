@@ -138,7 +138,7 @@ func compareTrees(t *testing.T, av *volume, a *node, bv *volume, b *node, path s
 
 func listNames(t *testing.T, dir *node) []string {
 	t.Helper()
-	ents, err := dir.entries()
+	ents, err := dir.entriesFrom(0)
 	if err != nil {
 		t.Fatal(err)
 	}

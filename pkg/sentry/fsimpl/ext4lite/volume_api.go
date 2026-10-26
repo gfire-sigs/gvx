@@ -17,6 +17,7 @@ package ext4lite
 import (
 	"errors"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,9 +73,18 @@ func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 	if err != nil {
 		return nil, hostError(err)
 	}
-	if size == 0 && !opts.ReadOnly {
-		if err := formatVolume(hf, time.Now()); err != nil {
-			return nil, err
+	if !opts.ReadOnly {
+		fresh := size == 0
+		if !fresh {
+			var err error
+			if fresh, err = unfinishedFormat(hf); err != nil {
+				return nil, err
+			}
+		}
+		if fresh {
+			if err := formatVolume(hf, time.Now()); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return openVolume(hf, volumeOptions{readOnly: opts.ReadOnly})
@@ -173,10 +183,28 @@ type dataSyncHook struct{ fn func() error }
 type trackedFile struct {
 	hostFile
 	v *volume
+
+	// dataDirty is true while a write of file data waits for a host flush.
+	// The ordered mode of the journal reads it.
+	dataDirty atomic.Bool
+
+	// pmu protects pending.
+	pmu sync.Mutex
+	// pending holds the home blocks that a committed transaction could not
+	// write yet. A read returns them, so that the engine never sees the stale
+	// block on the host file. The next flush writes them again.
+	pending map[uint64][]byte
 }
 
-// WriteAt implements io.WriterAt.
+// WriteAt implements io.WriterAt. It counts as a write of file data.
 func (t *trackedFile) WriteAt(p []byte, off int64) (int, error) {
+	t.dataDirty.Store(true)
+	return t.writeMeta(p, off)
+}
+
+// writeMeta writes metadata. It marks the blocks for a live migration, but it
+// does not count as file data that waits for a flush.
+func (t *trackedFile) writeMeta(p []byte, off int64) (int, error) {
 	n, err := t.hostFile.WriteAt(p, off)
 	if n > 0 && t.v.migOn.Load() {
 		t.v.mu.Lock()
@@ -184,6 +212,32 @@ func (t *trackedFile) WriteAt(p []byte, off int64) (int, error) {
 			t.v.markWrittenLocked(off, n)
 		}
 		t.v.mu.Unlock()
+	}
+	return n, err
+}
+
+// Sync implements hostFile. The flag clears before the host call, so a write
+// that races with the flush keeps the flag.
+func (t *trackedFile) Sync() error {
+	t.dataDirty.Store(false)
+	return t.hostFile.Sync()
+}
+
+// ReadAt implements io.ReaderAt. It returns the blocks of a failed home write
+// in place of the stale host blocks.
+func (t *trackedFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := t.hostFile.ReadAt(p, off)
+	t.pmu.Lock()
+	defer t.pmu.Unlock()
+	if len(t.pending) == 0 {
+		return n, err
+	}
+	for blk, data := range t.pending {
+		start := int64(blk) * blockSize
+		lo, hi := max(off, start), min(off+int64(len(p)), start+blockSize)
+		if lo < hi {
+			copy(p[lo-off:hi-off], data[lo-start:hi-start])
+		}
 	}
 	return n, err
 }

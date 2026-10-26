@@ -112,6 +112,7 @@ func openEnv(t *testing.T, path string, vopts VolumeOptions, mopts vfs.MountOpti
 
 func mountVolume(t *testing.T, vol *Volume, path string, mopts vfs.MountOptions) *env {
 	t.Helper()
+	vol.v.assertGate.Store(true)
 	ctx := gvcontext.Background()
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
 	vfsObj := &vfs.VirtualFilesystem{}
@@ -1200,13 +1201,25 @@ func TestChmodChownUtimes(t *testing.T) {
 	err = e.vfsObj.SetStatAt(e.ctx, other, e.fpop("f"), &vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_MTIME, Mtime: ts(5)}})
 	wantErrno(t, "explicit time by a non-owner", err, linuxerr.EPERM)
 
-	// A write clears the set-user-ID bit, and the owner change persists.
+	// The root caller of this test holds CAP_FSETID, so its write keeps the
+	// set-user-ID bit. The owner, without CAP_FSETID, clears it with a write.
 	if err := chmod(user, 0o4755); err != nil {
 		t.Fatal(err)
 	}
 	e.writeFile("f", []byte("rewritten"))
+	if st := e.mustStat("f"); st.Mode&linux.S_ISUID == 0 {
+		t.Fatalf("mode after a root write = %#o, want the set-user-ID bit kept", st.Mode)
+	}
+	ownerFD, err := e.vfsObj.OpenAt(e.ctx, user, e.fpop("f"), &vfs.OpenOptions{Flags: linux.O_WRONLY})
+	if err != nil {
+		t.Fatalf("owner open for writing: %v", err)
+	}
+	if _, err := ownerFD.PWrite(withCredentials(e.ctx, user), usermem.BytesIOSequence([]byte("owner")), 0, vfsWriteOpts); err != nil {
+		t.Fatalf("owner write: %v", err)
+	}
+	ownerFD.DecRef(e.ctx)
 	if st := e.mustStat("f"); st.Mode&linux.S_ISUID != 0 {
-		t.Fatalf("mode after a write = %#o, want the set-user-ID bit cleared", st.Mode)
+		t.Fatalf("mode after an owner write = %#o, want the set-user-ID bit cleared", st.Mode)
 	}
 
 	e = e.remount()

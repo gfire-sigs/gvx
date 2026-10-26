@@ -85,12 +85,7 @@ func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *v
 		return nil, err
 	}
 	if !afterCreate && opts.Flags&linux.O_TRUNC != 0 {
-		if err := d.fs.beginWrite(mnt); err != nil {
-			fd.vfsfd.DecRef(ctx)
-			return nil, err
-		}
-		err := d.inode.truncate(0)
-		mnt.EndWrite()
+		err := d.fs.writeOp(mnt, func() error { return d.inode.truncate(0) })
 		if err != nil {
 			fd.vfsfd.DecRef(ctx)
 			return nil, err
@@ -126,7 +121,7 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if end < uint64(offset) {
 		end = math.MaxUint64
 	}
-	if err := ino.data.FlushRange(uint64(offset), end); err != nil {
+	if err := ino.flushMapped(uint64(offset), end); err != nil {
 		return 0, toLinuxErr(err)
 	}
 	r := nodeReader{n: ino.n, off: offset}
@@ -206,10 +201,52 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 		return 0, offset, linuxerr.EOPNOTSUPP
 	}
 	d := fd.dentry
-	ino := d.inode
 	if d.fs.readOnly {
 		return 0, offset, linuxerr.EROFS
 	}
+	// A write that finds no free block while freed blocks wait for a flush
+	// flushes once with the gate open and writes the rest.
+	cur, pos := src, offset
+	var total int64
+	var werr error
+	for retry := 0; ; retry++ {
+		n, end, err := fd.pwriteGated(ctx, cur, pos, opts)
+		total += n
+		finalOff, werr = end, err
+		if !errors.Is(err, errSpaceHeld) || retry > 0 || !d.fs.v.hasHeld() {
+			break
+		}
+		if serr := d.fs.v.sync(); serr != nil {
+			return total, finalOff, toLinuxErr(serr)
+		}
+		cur, pos = cur.DropFirst64(n), end
+	}
+	if werr != nil {
+		return total, finalOff, toLinuxErr(werr)
+	}
+	durable := fd.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 || opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0
+	if total > 0 && durable {
+		// Without a durable write the call cannot honour the sync flag, so it
+		// reports no progress, as Linux does for a failed generic_write_sync.
+		if err := d.fs.syncInode(d.inode); err != nil {
+			return 0, offset, err
+		}
+	}
+	return total, finalOff, nil
+}
+
+// pwriteGated writes in the operation gate. It returns the bytes that it wrote,
+// the offset behind them, and the raw error of the engine, so that pwrite can
+// recognize a request that waits for a flush. The gate comes before wmu, as in
+// every other operation.
+func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (written, finalOff int64, err error) {
+	d := fd.dentry
+	ino := d.inode
+	if err := d.fs.v.throttle(); err != nil {
+		return 0, offset, err
+	}
+	d.fs.v.gate.enterOp()
+	defer d.fs.v.gate.exit()
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
 
@@ -236,24 +273,13 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 		now := d.fs.now()
 		ino.mutate(func(nd *node) {
 			nd.mtime, nd.ctime = now, now
-			nd.mode = uint16(vfs.ClearSUIDAndSGID(uint32(nd.mode)))
+			nd.mode = writeClearPrivsMode(ctx, nd.mode, nd.uid, nd.gid)
 		})
 		if err := ino.killCapability(); err != nil {
 			return n, offset + n, err
 		}
 	}
-	if err != nil {
-		return n, offset + n, toLinuxErr(err)
-	}
-	durable := fd.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 || opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0
-	if n > 0 && durable {
-		// Without a durable write the call cannot honour the sync flag, so it
-		// reports no progress, as Linux does for a failed generic_write_sync.
-		if err := d.fs.syncInode(ino); err != nil {
-			return 0, offset, err
-		}
-	}
-	return n, offset + n, nil
+	return n, offset + n, err
 }
 
 // killCapability removes the file capabilities after a write. It reads the
@@ -317,7 +343,7 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 		}
 		// A dirty mapped page over a hole counts as data only after the
 		// engine stores it.
-		if err := ino.data.FlushRange(0, math.MaxUint64); err != nil {
+		if err := ino.flushMapped(0, math.MaxUint64); err != nil {
 			return 0, toLinuxErr(err)
 		}
 		ino.n.mu.RLock()
@@ -349,7 +375,10 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 // the dirty mapped data first and then flush the volume in the strict order,
 // so a directory entry never points to an inode that the host file lacks.
 func (fd *regularFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
-	return fd.dentry.fs.syncInode(fd.dentry.inode)
+	ino := fd.dentry.inode
+	ino.wmu.Lock()
+	defer ino.wmu.Unlock()
+	return fd.dentry.fs.syncInode(ino)
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate. It supports mode 0,
@@ -370,12 +399,24 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	if offset+length < offset || offset+length > math.MaxInt64 {
 		return linuxerr.EFBIG
 	}
+	if !keepSize && limits.FromContext(ctx) != nil {
+		// Like Linux, a call that grows the file past RLIMIT_FSIZE fails whole.
+		limit, err := vfs.CheckLimit(ctx, int64(offset), int64(length))
+		if err != nil {
+			return err
+		}
+		if limit < int64(length) {
+			return linuxerr.EFBIG
+		}
+	}
 	d := fd.dentry
 	ino := d.inode
-	if err := d.fs.beginWrite(fd.vfsfd.Mount()); err != nil {
-		return err
-	}
-	defer fd.vfsfd.Mount().EndWrite()
+	return d.fs.writeOp(fd.vfsfd.Mount(), func() error { return fd.allocateLocked(ino, offset, length, punch, keepSize) })
+}
+
+// allocateLocked runs a validated fallocate in the operation gate. The gate
+// comes before wmu, as in every operation.
+func (fd *regularFD) allocateLocked(ino *inode, offset, length uint64, punch, keepSize bool) error {
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
 	if punch {

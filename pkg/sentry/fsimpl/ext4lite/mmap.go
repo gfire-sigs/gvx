@@ -15,7 +15,9 @@
 package ext4lite
 
 import (
+	"bytes"
 	"errors"
+	"io"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
@@ -33,6 +35,13 @@ type cacheChunk = chunkcache.Chunk
 // write system calls. Those calls write through to the engine and to the
 // chunks that exist. A read first writes back the dirty chunks that it
 // overlaps.
+//
+// Lock order: the inode write mutex wmu comes first, then the cache MapsMu,
+// then the cache DataMu, then the node mutex n.mu. A write-back runs with
+// DataMu held, so it never takes wmu. The callers that write back take wmu
+// before they call into the cache. A memory-manager call that drops a mapping
+// takes MapsMu and DataMu without wmu, so the write-back checks the size under
+// n.mu for every page it writes.
 type fileData struct {
 	chunkcache.Cache
 	ino *inode
@@ -76,11 +85,14 @@ func (c *fileData) fileSize() uint64 {
 	return n.size
 }
 
-// release drops the cache when the inode dies.
+// release drops the cache when the inode dies. A flush takes the write mutex
+// first, as every other write-back does.
 func (c *fileData) release(flush bool) error {
 	var err error
 	if flush {
+		c.ino.wmu.Lock()
 		err = c.SyncData()
+		c.ino.wmu.Unlock()
 	}
 	c.MapsMu.Lock()
 	defer c.MapsMu.Unlock()
@@ -90,12 +102,25 @@ func (c *fileData) release(flush bool) error {
 	return err
 }
 
+// flushMapped writes back the dirty pages of the mapping that overlap [start,
+// end). It takes the write mutex first, so a truncate, a punch, or an
+// allocation cannot run between the write-back and its size check. The caller
+// holds no lock of the inode.
+func (i *inode) flushMapped(start, end uint64) error {
+	if !i.data.Active.Load() {
+		return nil
+	}
+	i.wmu.Lock()
+	defer i.wmu.Unlock()
+	return i.data.FlushRange(start, end)
+}
+
 // FlushLocked writes the dirty chunks that overlap [start, end) to the engine.
+// The caller holds DataMu.
 func (c *fileData) FlushLocked(start, end uint64) error {
 	if len(c.Chunks) == 0 {
 		return nil
 	}
-	size := c.fileSize()
 	var errs []error
 	wrote := false
 	for idx, ch := range c.Chunks {
@@ -103,12 +128,7 @@ func (c *fileData) FlushLocked(start, end uint64) error {
 		if !ch.Dirty || base >= end || base+chunkSize <= start {
 			continue
 		}
-		if base >= size {
-			ch.Dirty = c.WritableMaps > 0
-			continue
-		}
-		limit := min(size-base, chunkSize)
-		if err := c.writeChunkLocked(ch, base, limit, &wrote); err != nil {
+		if err := c.writeChunkLocked(ch, base, &wrote); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -120,36 +140,31 @@ func (c *fileData) FlushLocked(start, end uint64) error {
 	return errors.Join(errs...)
 }
 
-// writeChunkLocked writes the first limit bytes of ch, which sits at file
-// offset base, page by page.
-func (c *fileData) writeChunkLocked(ch *cacheChunk, base, limit uint64, wrote *bool) error {
+// writeChunkLocked writes the pages of ch whose bytes differ from the file. Its
+// base is the file offset of the chunk. A page that matches the file costs no
+// write, and the times of the file stay as they are for it.
+func (c *fileData) writeChunkLocked(ch *cacheChunk, base uint64, wrote *bool) error {
 	n := c.ino.n
-	for off := uint64(0); off < limit; off += blockSize {
-		page := ch.Buf[off:min(off+blockSize, limit)]
-		if isZero(page) && holeAt(n, base+off) {
-			continue
-		}
-		if _, err := n.writeAt(page, int64(base+off)); err != nil {
+	var cur [blockSize]byte
+	for off := uint64(0); off < chunkSize; off += blockSize {
+		pos := base + off
+		page := ch.Buf[off : off+blockSize]
+		k, err := n.readAt(cur[:], int64(pos))
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
-		*wrote = true
-	}
-	return nil
-}
-
-// holeAt reports whether the block at file offset off has no data.
-func holeAt(n *node, off uint64) bool {
-	next, ok := n.seekData(off)
-	return !ok || next >= off+blockSize
-}
-
-func isZero(p []byte) bool {
-	for _, b := range p {
-		if b != 0 {
-			return false
+		if k == 0 || bytes.Equal(cur[:k], page[:k]) {
+			continue
+		}
+		w, err := n.writeBackAt(page[:k], int64(pos))
+		if err != nil {
+			return err
+		}
+		if w > 0 {
+			*wrote = true
 		}
 	}
-	return true
+	return nil
 }
 
 // writeThrough copies bytes that a system call wrote to the engine into the
@@ -184,4 +199,13 @@ func (c *fileData) truncated(old, size uint64) {
 	dropped := c.ShrinkLocked(size)
 	c.DataMu.Unlock()
 	c.InvalidateShrink(size, dropped)
+}
+
+func isZero(p []byte) bool {
+	for _, b := range p {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
