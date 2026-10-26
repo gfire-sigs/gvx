@@ -284,9 +284,9 @@ func (c *DirCursor) IterDirents(cb vfs.IterDirentsCallback, load func() ([]vfs.D
 	return nil
 }
 
-// Seek updates the directory offset and clears the cached snapshot when rewound
-// to offset zero.
-func (c *DirCursor) Seek(offset int64, whence int32) (int64, error) {
+// SeekDir updates the directory offset and clears the cached snapshot when
+// rewound to offset zero.
+func (c *DirCursor) SeekDir(offset int64, whence int32) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var newOff int64

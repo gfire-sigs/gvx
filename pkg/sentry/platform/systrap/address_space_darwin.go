@@ -165,6 +165,10 @@ type addressSpace struct {
 
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
+
+	// zoneState caches whether this address space holds mappings in the 4GB
+	// zone (0: unknown, 1: no zone mappings, 2: has zone mappings).
+	zoneState atomic.Uint32
 }
 
 var errDeadStub = errors.New("the stub task died")
@@ -322,6 +326,7 @@ func (as *addressSpace) mapRunLocked(va, n, src uint64, at hostarch.AccessType) 
 		as.dropBlockLocked(base)
 		if inZoneStub(base) {
 			as.zoneMapped[base] = struct{}{}
+			as.zoneState.Store(2)
 		}
 		if at.Execute {
 			as.blocks[base] = &execBlock{base: base, src: src + (base - va), at: at, state: blockData}
@@ -883,16 +888,20 @@ func (as *addressSpace) hasZone(mm platform.MemoryManager) bool {
 	if !as.p.zone {
 		return false
 	}
-	as.mu.Lock()
-	for base := range as.blocks {
-		if inZoneStub(base) {
-			as.mu.Unlock()
+	switch as.zoneState.Load() {
+	case 2:
+		return true
+	case 1:
+		return false
+	}
+	if q, ok := mm.(interface{ HasMappingIn(hostarch.AddrRange) bool }); ok {
+		if q.HasMappingIn(hostarch.AddrRange{Start: zoneMin, End: zoneLimit}) {
+			as.zoneState.Store(2)
 			return true
 		}
+		as.zoneState.CompareAndSwap(0, 1)
+		return as.zoneState.Load() == 2
 	}
-	as.mu.Unlock()
-	if q, ok := mm.(interface{ HasMappingIn(hostarch.AddrRange) bool }); ok {
-		return q.HasMappingIn(hostarch.AddrRange{Start: zoneMin, End: zoneLimit})
-	}
+	as.zoneState.Store(2)
 	return true
 }

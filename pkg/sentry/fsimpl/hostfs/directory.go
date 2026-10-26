@@ -164,7 +164,7 @@ func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) er
 // Seek implements vfs.FileDescriptionImpl.Seek. Seeking to the start discards
 // the snapshot, so rewinddir observes the current directory.
 func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
-	return fd.cursor.Seek(offset, whence)
+	return fd.cursor.SeekDir(offset, whence)
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. It bypasses the coalesce

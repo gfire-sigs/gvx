@@ -564,7 +564,8 @@ func probeWine64NtdllSyncSignal() (string, string, error) {
 		done <- nil
 	}()
 	<-ready
-	for i := 0; i < 200; i++ {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
 		n, _, _ := syscall.Syscall6(
 			syscall.SYS_FUTEX,
 			uintptr(unsafe.Pointer(&futexWord)),
@@ -577,7 +578,20 @@ func probeWine64NtdllSyncSignal() (string, string, error) {
 		if n >= 1 {
 			break
 		}
-		time.Sleep(200 * time.Microsecond)
+		if time.Now().After(deadline) {
+			atomic.StoreUint32(&futexWord, 1)
+			syscall.Syscall6(
+				syscall.SYS_FUTEX,
+				uintptr(unsafe.Pointer(&futexWord)),
+				futexWakeBitsetPrivate,
+				1,
+				0,
+				0,
+				bitsetMask,
+			)
+			break
+		}
+		time.Sleep(500 * time.Microsecond)
 	}
 	if err := <-done; err != nil {
 		return "", "", err
