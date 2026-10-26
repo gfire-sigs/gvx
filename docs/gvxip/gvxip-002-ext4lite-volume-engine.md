@@ -31,7 +31,7 @@ Directory bind mounts (`hostfs`) expose individual files on the host filesystem 
 
 ### 1.1 Filesystem Format Evaluation
 
-`ext4lite` requires a compact pure-Go implementation (under 1,500 lines) with zero B+Tree rebalancing during `fsync`. The format must also store small files inline and shrink without sparse holes.
+`ext4lite` requires a pure-Go implementation with zero B+Tree rebalancing during `fsync`. The size of the implementation has no limit, because the metadata journal and the repair code need space. The format must also store small files inline, shrink without sparse holes, and stay mountable by the Linux kernel.
 
 | Format Candidate | On-Disk Allocation and Directory Structures | Estimated Pure-Go Subset Size | Small-File Inline Storage | Non-Sparse Dynamic Shrink Support | Verdict |
 | :--- | :--- | ---: | :--- | :--- | :--- |
@@ -98,9 +98,9 @@ Every unmounted or synced `ext4lite` image is a valid little-endian Linux `ext4`
 
 | Feature Set Field | Offset in `ext4_super_block` | Bitmask Value | Enabled Flags and Rationale |
 | :--- | ---: | ---: | :--- |
-| `s_feature_compat` | `0x5C` | `0x00000008` | `COMPAT_EXT_ATTR` (`0x08`) only; `COMPAT_HAS_JOURNAL` (`0x04`) and `COMPAT_DIR_INDEX` (`0x20`) cleared |
-| `s_feature_incompat` | `0x60` | `0x000080C2` | `INCOMPAT_FILETYPE` (`0x02`), `INCOMPAT_EXTENTS` (`0x40`), `INCOMPAT_64BIT` (`0x80`), `INCOMPAT_INLINE_DATA` (`0x8000`) |
-| `s_feature_ro_compat` | `0x64` | `0x00000042` | `RO_COMPAT_LARGE_FILE` (`0x02`), `RO_COMPAT_EXTRA_ISIZE` (`0x40`) |
+| `s_feature_compat` | `0x5C` | `0x0000001C` | `COMPAT_EXT_ATTR` (`0x08`), `COMPAT_RESIZE_INODE` (`0x10`), and `COMPAT_HAS_JOURNAL` (`0x04`); `COMPAT_DIR_INDEX` (`0x20`) cleared. A volume of an older release lacks `COMPAT_HAS_JOURNAL` until the first writable mount adds a journal. |
+| `s_feature_incompat` | `0x60` | `0x000080C2` | `INCOMPAT_FILETYPE` (`0x02`), `INCOMPAT_EXTENTS` (`0x40`), `INCOMPAT_64BIT` (`0x80`), `INCOMPAT_INLINE_DATA` (`0x8000`). `INCOMPAT_RECOVER` (`0x04`) is set while the log is in use. |
+| `s_feature_ro_compat` | `0x64` | `0x00000043` | `RO_COMPAT_SPARSE_SUPER` (`0x01`), `RO_COMPAT_LARGE_FILE` (`0x02`), `RO_COMPAT_EXTRA_ISIZE` (`0x40`) |
 
 ### 3.1 Inode, Inline Data, and Extent Layout
 
@@ -120,6 +120,7 @@ Each `256-byte` `ext4_inode` stores file metadata, inline small-file content up 
 | Regular file `61..128 B` | `EXT4_INLINE_DATA_FL` (`0x10000000`) | `i_block[0..59]` plus `system.data` inline xattr (`0xA0..0xFF`) | `0` |
 | Regular file or directory `<= 4` extents (up to `512 MiB` contiguous) | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `ext4_extent_header` (`eh_depth == 0`) + up to 4 `ext4_extent` structs in `i_block` | `ceil(size / 4096)` |
 | Regular file `> 4` extents | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `ext4_extent_header` (`eh_depth == 1`) + up to 4 `ext4_extent_idx` pointers to 4 KiB leaf extent blocks (up to `340` extents per leaf) | `ceil(size / 4096) + leafBlocks` |
+| Regular file `> 1360` extents | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `eh_depth == 2`, up to 4 index blocks of `340` entries, each entry naming a leaf (up to `462,400` extents) | `ceil(size / 4096) + indexBlocks + leafBlocks` |
 
 ### 3.2 Untrusted Image Validation Invariants
 
@@ -139,7 +140,7 @@ Because a backing `.ext4` file resides on the host disk and can be modified offl
 `ext4lite` separates in-memory metadata mutation during normal system calls from synchronous disk durability during `fsync`, `fdatasync`, `sync`, and `O_DSYNC` or `O_SYNC` writes:
 
 - **In-Memory Runtime State**: At mount time, `ext4lite` loads bitmaps into memory (`alloc.go`) and populates `dentry` maps lazily on lookup. VFS calls (`CreateAt`, `MkdirAt`, `SymlinkAt`, `UnlinkAt`, `RenameAt`, `SetStatAt`, `SetXattrAt`) mutate Go structs in memory. They mark the affected inode, directory, and bitmaps dirty in `dirtyTracker` and return immediately. Short-lived compiler temporaries that close after `unlink` without calling `fsync` return their blocks to the in-memory bitmap without touching disk metadata.
-- **Strict Durability on Sync**: Guest databases (PostgreSQL, MySQL, SQLite, etcd) call `fsync`, `fdatasync`, or write with `O_DSYNC` or `O_SYNC` on commit. `ext4lite` executes an ordered write-through flush to the host descriptor and calls `hostFile.Sync()` (`fsync` on Unix; `FlushFileBuffers` on Windows) before returning.
+- **Strict Durability on Sync**: Guest databases (PostgreSQL, MySQL, SQLite, etcd) call `fsync`, `fdatasync`, or write with `O_DSYNC` or `O_SYNC` on commit. `ext4lite` commits the dirty metadata as one JBD2 transaction and calls `hostFile.Sync()` (`fsync` on Unix; `FlushFileBuffers` on Windows) before returning.
 
 ```mermaid
 sequenceDiagram
@@ -152,47 +153,51 @@ sequenceDiagram
     EXT4->>PageCache: WriteAt(hostFD, allocatedBlockOffset)
     DB->>EXT4: 2. fsync(wal_fd) / fdatasync(wal_fd)
     EXT4->>PageCache: Step 1: Flush dirty mmap pages of wal_fd via WriteAt
-    alt Inode size, extents, or parent directory changed
-        EXT4->>PageCache: Step 2: Write dirty 4 KiB Inode Table block(s) via WriteAt
-        EXT4->>PageCache: Step 3: Write dirty 4 KiB Parent Dir block(s) via WriteAt
-        EXT4->>PageCache: Step 4: Write dirty 4 KiB Bitmap and GDT block(s) via WriteAt
+    EXT4->>EXT4: Step 2: Close the gate and copy the dirty metadata into block images
+    opt The transaction allocates a block
+        EXT4->>Disk: Step 3: hostFile.Sync() makes the file data durable
     end
+    EXT4->>PageCache: Step 4: Write the journal blocks and the commit block
     EXT4->>Disk: Step 5: hostFile.Sync() (fsync / FlushFileBuffers)
     Disk-->>EXT4: Hardware flush complete
+    EXT4->>PageCache: Step 6: Write the images to their home blocks
     EXT4-->>DB: Return 0
 ```
 
-### 4.1 Ordered Strict Sync Procedure
+### 4.1 Journal Commit Procedure
 
-Execute this procedure in `regularFD.Sync`, `directoryFD.Sync`, and `O_DSYNC` or `O_SYNC` write paths.
+Run this procedure in `regularFD.Sync`, `directoryFD.Sync`, the background flush, and the `O_DSYNC` or `O_SYNC` write paths.
 
 > [!CAUTION]
-> Always write dirty data blocks before writing dirty inode table blocks, and always write dirty inode table blocks before writing dirty directory blocks. Reversing this order can expose a directory entry that points to an uninitialized inode or stale data blocks if host power fails mid-flush.
+> Write a home block only after the commit of its transaction is durable. A home block that reaches the disk first leaves a state that no replay can undo.
 
-1. Flush all dirty mapped 1 MiB chunks in `inode.data` to their 4 KiB block offsets in `hostFile` via `WriteAt`.
-2. Return `hostFile.Sync()` immediately if `opts.DataOnly` (`fdatasync`) is set and the inode size and extents are clean.
-3. Acquire `fs.metaFlushMu.Lock()`.
-4. Serialize the dirty `256-byte` `ext4_inode` into its 4 KiB inode-table block and write that block to `hostFile`.
-5. Serialize and write the parent directory's 4 KiB `ext4_dir_entry_2` blocks if a create or rename dirtied the parent.
-6. Write any dirtied 4 KiB block-bitmap, inode-bitmap, Group Descriptor Table, or Superblock blocks to `hostFile`.
-7. Clear the dirty bits for the flushed blocks in `dirtyTracker` and release `fs.metaFlushMu.Unlock()`.
-8. Call `hostFile.Sync()` and return any host I/O error translated via `translateHostError`.
+1. Flush all dirty mapped chunks of the file to their blocks in `hostFile` via `WriteAt`.
+2. Close the operation gate and wait until no guest operation runs.
+3. Copy every dirty node, bitmap, descriptor, and the superblock into 4 KiB block images. Open the gate.
+4. Call `hostFile.Sync()` first when the transaction allocated a block and file data waits for a flush.
+5. Write the revoke blocks, the descriptor blocks with their images, and the commit block to the journal in one `WriteAt`.
+6. Call `hostFile.Sync()` and return any host I/O error translated via `hostError`. The transaction is durable.
+7. Release the freed blocks and inodes of the transaction to the allocator.
+8. Write the images to their home blocks. Keep an image in the read overlay when its write fails, and write it again at the next flush.
 
-### 4.2 Unmount Tail Compaction and Mount-Time Self-Healing
+### 4.2 Unmount Tail Compaction and Mount-Time Recovery
 
-`ext4lite` runs without a JBD2 block journal (`^has_journal`). It tracks mount state via `s_state` in `ext4_super_block` (`EXT4_VALID_FS = 0x0001`). After an abnormal host termination (`SIGKILL` or power loss), a mount-time reachability scan (`fsckLite`) reconstructs the bitmaps in memory.
+`ext4lite` runs with a JBD2 metadata journal (`has_journal`, inode 8). It sets `EXT4_FEATURE_INCOMPAT_RECOVER` while the log is in use. After an abnormal host termination (`SIGKILL` or power loss), the mount replays the committed transactions. A volume without a journal falls back to the reachability scan (`fsckLite`), which reconstructs the bitmaps in memory.
 
-Unlike `mkfs.ext4`, `ext4lite` does not create a `/lost+found` directory in the volume root. Database initializers (`PostgreSQL` `initdb`, `MySQL` `mysqld --initialize`) and `git clone` reject non-empty mount points when `/lost+found` is present. An allocated inode that is unreachable from root inode `#2` during `fsckLite` comes from an unlinked open file or an interrupted pre-`fsync` write. `fsckLite` reclaims those unreachable inodes and their data blocks directly into the free bitmaps instead of linking them into `/lost+found`.
+Unlike `mkfs.ext4`, `ext4lite` does not create a `/lost+found` directory in the volume root. Database initializers (`PostgreSQL` `initdb`, `MySQL` `mysqld --initialize`) and `git clone` reject non-empty mount points when `/lost+found` is present. A file that a guest unlinked and kept open is an orphan. The volume lists orphans in `s_last_orphan` and `i_dtime`, and the mount frees them. `fsckLite` reclaims the unreachable inodes of a volume without a journal directly into the free bitmaps instead of linking them into `/lost+found`.
 
 > [!IMPORTANT]
-> Clear `EXT4_VALID_FS` (`s_state = 0`) and flush Block 0 before servicing the first guest write on a writable mount. Leaving `EXT4_VALID_FS` set while the volume is mounted skips bitmap reconstruction after a host crash.
+> Start the log and set the recovery flag before the first guest write on a writable mount. Without the flag, the Linux kernel treats the journal as empty and drops its transactions.
 
 1. Read `ext4_super_block` from Block 0 at mount time and verify `s_magic == 0xEF53`.
-2. Run `fsckLite` if `s_state & EXT4_VALID_FS == 0` to walk reachable directories from inode `#2` and rebuild bitmaps.
-3. Set `s_state = 0` in Block 0 and write Block 0 to `hostFile` on writable mounts.
-4. Relocate allocated data blocks from trailing sparse-used groups into lower free holes during `filesystem.Release`.
-5. Decrement `s_blocks_count` and `s_inodes_count` for trailing empty 16 MiB groups and call `hostFile.Truncate`.
-6. Flush all dirty metadata blocks, set `s_state = EXT4_VALID_FS`, write Block 0, and call `hostFile.Sync()`.
+2. Read the journal superblock. Replay the log when its start is not zero or the recovery flag is set. Replay only blocks inside the final size of the volume and inside the host file.
+3. Run `fsckLite` when the volume has no journal and `s_state & EXT4_VALID_FS == 0`, or when the error flag is set.
+4. Add a journal to a volume that has none, when group 0 has a free run of 1024 blocks.
+5. Write the log start and the recovery flag, and flush the host file.
+6. Free the inodes of the orphan list.
+7. Relocate allocated data blocks from trailing sparse-used groups into lower free holes during `filesystem.Release`. Skip an inode when the move does not fit.
+8. Commit the new size, flush the home blocks, empty the log, and clear the recovery flag.
+9. Call `hostFile.Truncate` for the removed groups, and set `s_state = EXT4_VALID_FS`.
 
 ---
 
