@@ -375,6 +375,7 @@ func (th *thread) writeTEBSysmsg(va uint64) error {
 	if err != nil {
 		return err
 	}
+	th.teb = teb
 	var written uintptr
 	if err := windows.WriteProcessMemory(th.sp.proc, uintptr(teb+winTEBSysmsg), (*byte)(unsafe.Pointer(&va)), unsafe.Sizeof(va), &written); err != nil {
 		return fmt.Errorf("WriteProcessMemory(TEB of thread %d): %w", th.tid, err)

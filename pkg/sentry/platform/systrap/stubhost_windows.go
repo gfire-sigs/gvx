@@ -202,6 +202,7 @@ func writeHostReply(out io.Writer, errno uint32, sh *stubHandles, level confinem
 var (
 	modAdvapi32               = windows.NewLazySystemDLL("advapi32.dll")
 	procCreateRestrictedToken = modAdvapi32.NewProc("CreateRestrictedToken")
+	procAdjustTokenPrivileges = modAdvapi32.NewProc("AdjustTokenPrivileges")
 	procCreateProcessAsUserW  = modAdvapi32.NewProc("CreateProcessAsUserW")
 
 	procInitializeProcThreadAttributeList = modKernel32.NewProc("InitializeProcThreadAttributeList")
@@ -228,7 +229,7 @@ const (
 func buildStubToken() (windows.Token, confinement, error) {
 	var self windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(),
-		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ADJUST_DEFAULT|windows.TOKEN_ADJUST_SESSIONID, &self)
+		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ADJUST_DEFAULT|windows.TOKEN_ADJUST_SESSIONID|windows.TOKEN_ADJUST_PRIVILEGES, &self)
 	if err != nil {
 		return 0, 0, fmt.Errorf("OpenProcessToken: %w", err)
 	}
@@ -237,6 +238,10 @@ func buildStubToken() (windows.Token, confinement, error) {
 	r, _, e := procCreateRestrictedToken.Call(uintptr(self), disableMaxPrivilege, 0, 0, 0, 0, 0, 0, uintptr(unsafe.Pointer(&restricted)))
 	if r == 0 {
 		return 0, 0, fmt.Errorf("CreateRestrictedToken: %w", e)
+	}
+	if err := removeAllStubPrivileges(restricted); err != nil {
+		restricted.Close()
+		return 0, 0, err
 	}
 	sid, err := windows.StringToSid(lowIntegritySID)
 	if err != nil {
@@ -251,6 +256,49 @@ func buildStubToken() (windows.Token, confinement, error) {
 		return 0, 0, fmt.Errorf("SetTokenInformation(TokenIntegrityLevel): %w", err)
 	}
 	return restricted, confineToken, nil
+}
+
+// removeAllStubPrivileges deletes every privilege from token with
+// SE_PRIVILEGE_REMOVED so a stub process can never re-enable a privilege.
+func removeAllStubPrivileges(token windows.Token) error {
+	var needed uint32
+	err := windows.GetTokenInformation(token, windows.TokenPrivileges, nil, 0, &needed)
+	if err != nil && !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+		return fmt.Errorf("GetTokenInformation(TokenPrivileges size): %w", err)
+	}
+	if needed == 0 {
+		return nil
+	}
+	buf := make([]byte, needed)
+	if err := windows.GetTokenInformation(token, windows.TokenPrivileges, &buf[0], needed, &needed); err != nil {
+		return fmt.Errorf("GetTokenInformation(TokenPrivileges): %w", err)
+	}
+	tp := (*windows.Tokenprivileges)(unsafe.Pointer(&buf[0]))
+	if tp.PrivilegeCount == 0 {
+		return nil
+	}
+	entries := unsafe.Slice(&tp.Privileges[0], tp.PrivilegeCount)
+	for i := range entries {
+		entries[i].Attributes = windows.SE_PRIVILEGE_REMOVED
+	}
+	r, _, callErr := procAdjustTokenPrivileges.Call(
+		uintptr(token),
+		0,
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(needed),
+		0,
+		0,
+	)
+	if r == 0 {
+		return fmt.Errorf("AdjustTokenPrivileges: %w", callErr)
+	}
+	if err := windows.GetTokenInformation(token, windows.TokenPrivileges, &buf[0], uint32(len(buf)), &needed); err != nil {
+		return fmt.Errorf("GetTokenInformation(TokenPrivileges verify): %w", err)
+	}
+	if tp.PrivilegeCount != 0 {
+		return fmt.Errorf("stub token retained %d privileges after removal", tp.PrivilegeCount)
+	}
+	return nil
 }
 
 // release closes the job and the process handle of a stub that the Sentry

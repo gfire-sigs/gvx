@@ -48,14 +48,20 @@ type winSlotRef struct {
 	size uint32
 }
 
+// islandSlot records the guest site and byte size of one trampoline slot.
+type islandSlot struct {
+	site uint64
+	size uint32
+}
+
 // island is one page of trampoline slots.
 type island struct {
 	base uint64
 	page privPage
 	// usedBits marks the 16-byte units of the page that slots occupy.
 	usedBits [winIslandUnits / 64]uint64
-	// slots maps the offset of each slot to the address of its patched site.
-	slots map[uint32]uint64
+	// slots maps the offset of each slot to its guest site and byte size.
+	slots map[uint32]islandSlot
 }
 
 // alloc reserves a contiguous run of size bytes on isl and returns its byte offset.
@@ -154,8 +160,26 @@ func (as *addressSpace) slotStartSite(pc uint64) (uint64, bool) {
 	if isl == nil {
 		return 0, false
 	}
-	site, ok := isl.slots[uint32(pc-isl.base)]
-	return site, ok
+	s, ok := isl.slots[uint32(pc-isl.base)]
+	return s.site, ok
+}
+
+// slotContaining returns the guest site and start address of the slot that
+// contains pc.
+func (as *addressSpace) slotContaining(pc uint64) (site uint64, slotVA uint64, ok bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	isl := as.islands[blockRound(pc)]
+	if isl == nil {
+		return 0, 0, false
+	}
+	rel := uint32(pc - isl.base)
+	for off, s := range isl.slots {
+		if rel >= off && rel < off+s.size {
+			return s.site, isl.base + uint64(off), true
+		}
+	}
+	return 0, 0, false
 }
 
 // slotAtTail returns the site of the slot whose tail is at tail.
@@ -193,7 +217,7 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 		return 0, winSlotRef{}, err
 	}
 	as.mu.Lock()
-	isl.slots[off] = site
+	isl.slots[off] = islandSlot{site: site, size: size}
 	as.mu.Unlock()
 	if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), uintptr(size)); err != nil {
 		as.mu.Lock()
@@ -251,6 +275,6 @@ func (as *addressSpace) installIsland(base uint64) error {
 		as.p.priv.release(pg)
 		return as.mapErr(err)
 	}
-	as.islands[base] = &island{base: base, page: pg, slots: make(map[uint32]uint64)}
+	as.islands[base] = &island{base: base, page: pg, slots: make(map[uint32]islandSlot)}
 	return flushInstructionCache(as.sp.proc, uintptr(base), blockSize)
 }

@@ -286,6 +286,12 @@ func (th *thread) emulateARM64MRS(as *addressSpace, pc uint64) bool {
 // archFault reports whether the engine repaired a fault. arm64 has no FS base.
 func (th *thread) archFault(*addressSpace, *arch.Context64, debugEvent) bool { return false }
 
+// recoverIslandFault reports whether a fault inside a trampoline island slot
+// was rewound to its guest site.
+func (th *thread) recoverIslandFault(*addressSpace, *arch.Context64, *debugEvent) (bool, error) {
+	return false, nil
+}
+
 // siteInfo describes one patched instruction.
 type siteInfo struct {
 	kind siteKind

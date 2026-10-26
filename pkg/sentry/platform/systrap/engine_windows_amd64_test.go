@@ -181,3 +181,62 @@ func TestNearZeroBase(t *testing.T) {
 		}
 	}
 }
+
+// TestFastPathTLSAndGSMovSlots verifies that RDFSBASE, RDGSBASE, and GS-segment
+// MOV instructions execute through trampoline island slots without modifying
+// RFLAGS, and that a faulting GS MOV restores the scratch register and reports
+// SIGSEGV at the guest instruction address.
+func TestFastPathTLSAndGSMovSlots(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	page := r.mapPage(dataVA, hostarch.ReadWrite)
+	store64(page[0x28:], 0x1122_3344_5566_7788)
+
+	var prog []byte
+	prog = append(prog, imm64([]byte{0x48, 0xB8}, dataVA)...)                // mov rax, dataVA
+	prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD8)                        // wrgsbase rax
+	prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xCB)                        // rdgsbase rbx
+	prog = append(prog, 0x65, 0x4C, 0x8B, 0x24, 0x25, 0x28, 0, 0, 0)         // mov r12, gs:[0x28]
+	prog = append(prog, imm64([]byte{0x49, 0xBD}, 0xDEAD_BEEF_CAFE_0001)...) // mov r13, 0xdeadbeefcafe0001
+	prog = append(prog, 0x65, 0x4C, 0x89, 0x2C, 0x25, 0x30, 0, 0, 0)         // mov gs:[0x30], r13
+	prog = append(prog, 0x65, 0x4C, 0x8B, 0x34, 0x25, 0x30, 0, 0, 0)         // mov r14, gs:[0x30]
+	prog = append(prog, gSyscall(93)...)
+	r.program(prog)
+
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 93, r.ac)
+	regs := &r.ac.StateData().Regs
+	if regs.Rbx != dataVA {
+		t.Errorf("rdgsbase rbx = %#x, want %#x", regs.Rbx, uint64(dataVA))
+	}
+	if regs.R12 != 0x1122_3344_5566_7788 {
+		t.Errorf("mov r12, gs:[0x28] = %#x, want 0x1122334455667788", regs.R12)
+	}
+	if regs.R14 != 0xDEAD_BEEF_CAFE_0001 {
+		t.Errorf("mov r14, gs:[0x30] = %#x, want 0xdeadbeefcafe0001", regs.R14)
+	}
+
+	// Verify that a faulting GS MOV with Gs_base == 0 preserves the destination
+	// register and reports SIGSEGV at the guest instruction address.
+	rFault := newRig(t, r.p)
+	var faultProg []byte
+	faultProg = append(faultProg, imm64([]byte{0x49, 0xBC}, 0xABCD_1234_5678_9000)...) // mov r12, sentinel
+	faultSite := codeVA + uint64(len(faultProg))
+	faultProg = append(faultProg, 0x65, 0x4C, 0x8B, 0x24, 0x25, 0x28, 0, 0, 0) // mov r12, gs:[0x28]
+	faultProg = append(faultProg, gSyscall(93)...)
+	rFault.program(faultProg)
+
+	si, _, err = rFault.run()
+	if si == nil || err == nil {
+		t.Fatalf("expected SIGSEGV from GS load with zero base, got si=%v err=%v", si, err)
+	}
+	fregs := &rFault.ac.StateData().Regs
+	if fregs.Rip != faultSite {
+		t.Errorf("fault RIP = %#x, want %#x", fregs.Rip, faultSite)
+	}
+	if fregs.R12 != 0xABCD_1234_5678_9000 {
+		t.Errorf("fault clobbered r12 = %#x, want 0xabcd123456789000", fregs.R12)
+	}
+	if si.Addr() != 0x28 {
+		t.Errorf("fault addr = %#x, want 0x28", si.Addr())
+	}
+}

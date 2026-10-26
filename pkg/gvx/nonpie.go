@@ -16,6 +16,7 @@ package gvx
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 )
 
@@ -75,4 +76,26 @@ func (s *Sandbox) nonPIEHintForGuestFile(read func(path string, maxBytes int) ([
 		return ""
 	}
 	return nonPIEHint(header, uint64(s.plat.MinUserAddress()), runtime.GOOS)
+}
+
+// maybeEnableFixedImageZone activates the 4GB fixed-address zone on platforms
+// that support it when execPath is an ET_EXEC binary linked in [0x10000, 4GB)
+// and GVX_SYSTRAP_FIXED_IMAGES is not "0".
+func (s *Sandbox) maybeEnableFixedImageZone(read func(path string, maxBytes int) ([]byte, error), execPath string) {
+	if os.Getenv("GVX_SYSTRAP_FIXED_IMAGES") == "0" {
+		return
+	}
+	ze, ok := s.plat.(interface{ EnableZone() error })
+	if !ok {
+		return
+	}
+	header, err := read(execPath, elfProbeBytes)
+	if err != nil || len(header) == 0 {
+		return
+	}
+	lowest, ok := lowestLoadAddress(header)
+	if !ok || lowest < 0x10000 || lowest >= 1<<32 {
+		return
+	}
+	_ = ze.EnableZone()
 }

@@ -587,7 +587,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		as.mu.Unlock()
 		touched[isl] = struct{}{}
 	}
-	if as.p.zone {
+	if as.hasZone(mm) {
 		taken := claimed
 		for _, it := range items {
 			taken[int(it.Offset)] = struct{}{}
@@ -874,4 +874,25 @@ func (as *addressSpace) codeWord(pc uint64) (uint32, bool) {
 		return binary.LittleEndian.Uint32(page[pc-base:]), true
 	}
 	return 0, false
+}
+
+// hasZone reports whether zone translation is active for as. An address space
+// whose MemoryManager reports no mappings in the low 4GB zone is a normal PIE
+// process and skips zone scanning and fault translation.
+func (as *addressSpace) hasZone(mm platform.MemoryManager) bool {
+	if !as.p.zone {
+		return false
+	}
+	as.mu.Lock()
+	for base := range as.blocks {
+		if inZoneStub(base) {
+			as.mu.Unlock()
+			return true
+		}
+	}
+	as.mu.Unlock()
+	if q, ok := mm.(interface{ HasMappingIn(hostarch.AddrRange) bool }); ok {
+		return q.HasMappingIn(hostarch.AddrRange{Start: zoneMin, End: zoneLimit})
+	}
+	return true
 }

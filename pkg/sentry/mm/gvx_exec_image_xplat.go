@@ -61,6 +61,16 @@ func (mm *MemoryManager) ExecImageAt(ctx context.Context, addr hostarch.Addr) pl
 	}
 }
 
+// HasMappingIn reports whether any virtual memory area overlaps ar.
+//
+// +checklocksexclude:mm.mappingMu
+func (mm *MemoryManager) HasMappingIn(ar hostarch.AddrRange) bool {
+	mm.mappingMu.RLock()
+	defer mm.mappingMu.RUnlock()
+	seg := mm.vmas.LowerBoundSegment(ar.Start)
+	return seg.Ok() && seg.Start() < ar.End
+}
+
 // fileReaderAt reads a file description at absolute offsets.
 type fileReaderAt struct {
 	ctx context.Context

@@ -44,6 +44,14 @@ func TestWinRegsFollowTheSyscallInstruction(t *testing.T) {
 	if r.FsBase != src.StateData().Regs.Fs_base {
 		t.Errorf("the block holds FS base %#x, want %#x", r.FsBase, src.StateData().Regs.Fs_base)
 	}
+	if r.GsBase != 0 || r.GsMemBase != winNonCanonGSBase {
+		t.Errorf("zero GS base loaded GsBase=%#x GsMemBase=%#x, want 0 and %#x", r.GsBase, r.GsMemBase, winNonCanonGSBase)
+	}
+	src.StateData().Regs.Gs_base = 0x7000_0000_3000
+	r.loadTLSFrom(src)
+	if r.GsBase != 0x7000_0000_3000 || r.GsMemBase != 0x7000_0000_3000 {
+		t.Errorf("non-zero GS base loaded GsBase=%#x GsMemBase=%#x", r.GsBase, r.GsMemBase)
+	}
 
 	dst := arch.New(arch.Host)
 	dst.StateData().Regs.Fs_base = 0x1234

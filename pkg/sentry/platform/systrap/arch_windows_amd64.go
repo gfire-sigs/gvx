@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync/atomic"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/sys/windows"
@@ -174,6 +175,9 @@ func (th *thread) goThroughTrampoline(fsBase uint64) error {
 func (th *thread) archStart(ac *arch.Context64) error {
 	th.fsFix.n = 0
 	th.ctx.setPC(th.resumePC(th.ctx.pc()))
+	if f := th.fast.Load(); f != nil {
+		f.slot.sm.Regs.loadTLSFrom(ac)
+	}
 	fs := ac.StateData().Regs.Fs_base
 	if fs == 0 {
 		return nil
@@ -291,6 +295,9 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 			}
 		} else {
 			ac.StateData().Regs.Gs_base = v
+		}
+		if f := th.fast.Load(); f != nil {
+			f.slot.sm.Regs.loadTLSFrom(ac)
 		}
 		if err := th.continueEvent(ev); err != nil {
 			return fatal(err, unix.EFAULT), true
@@ -465,10 +472,13 @@ func hasFSPrefix(code []byte) bool {
 
 // siteInfo describes one patched instruction.
 type siteInfo struct {
-	kind   amd64SiteKind
-	reg    uint8
-	wide   bool
-	length uint8
+	kind    amd64SiteKind
+	reg     uint8
+	scratch uint8
+	wide    bool
+	store   bool
+	length  uint8
+	disp    int32
 	// tail is the address of the slot tail of a winSiteJump.
 	tail uint64
 }
@@ -512,12 +522,34 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			// The bytes of this site belong to the previous slot.
 			continue
 		}
-		if as.p.fast && s.Kind == amd64SiteSyscall && s.Offset >= 0 {
-			if end, tail, ref, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
-				jumpEnd = end
-				sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
-				slots = append(slots, ref)
-				continue
+		if as.p.fast && s.Offset >= 0 {
+			switch s.Kind {
+			case amd64SiteSyscall:
+				if end, tail, ref, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
+					jumpEnd = end
+					sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
+					slots = append(slots, ref)
+					continue
+				}
+			case amd64SiteRDFSBASE, amd64SiteRDGSBASE:
+				if ref, ok := as.patchTLSBaseJump(ctx, mm, base, plan, page, s); ok {
+					slots = append(slots, ref)
+					continue
+				}
+			case amd64SiteGSMem:
+				if gp, ref, ok := as.patchGSMovJump(ctx, mm, base, plan, page, s); ok {
+					sites[uint16(s.Offset)] = siteInfo{
+						kind:    amd64SiteGSMem,
+						reg:     gp.reg,
+						scratch: gp.scratch,
+						wide:    gp.wide,
+						store:   gp.store,
+						length:  uint8(s.Len),
+						disp:    gp.disp,
+					}
+					slots = append(slots, ref)
+					continue
+				}
 			}
 		}
 		keep = append(keep, s)
@@ -564,6 +596,92 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 		return 0, 0, winSlotRef{}, false
 	}
 	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, ref, true
+}
+
+// patchTLSBaseJump replaces the RDFSBASE or RDGSBASE instruction s in page
+// with a JMP to a trampoline slot when the instruction can be replaced in
+// place.
+func (as *addressSpace) patchTLSBaseJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, s amd64Site) (winSlotRef, bool) {
+	if hasPrefixBefore(plan.before, plan.page, s.Offset) || !plan.canReplaceInPlace(s.Offset, s.Len) {
+		return winSlotRef{}, false
+	}
+	site := base + uint64(s.Offset)
+	isGS := s.Kind == amd64SiteRDGSBASE
+	slotVA, ref, err := as.installSlot(ctx, mm, site, winTLSSlotSize, func(buf []byte, slotVA uint64) error {
+		return encodeWinTLSBaseSlot(buf, slotVA, site, s.Len, s.Reg, s.Wide, isGS)
+	})
+	if err == nil {
+		if err = patchJmpSite(page, s.Offset, s.Len, site, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
+	}
+	if err != nil {
+		return winSlotRef{}, false
+	}
+	return ref, true
+}
+
+// patchGSMovJump replaces a 32-bit or 64-bit GS-segment MOV instruction s in
+// page with a JMP to a trampoline slot when the instruction can be replaced in
+// place.
+func (as *addressSpace) patchGSMovJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, s amd64Site) (gsMovPlan, winSlotRef, bool) {
+	if hasPrefixBefore(plan.before, plan.page, s.Offset) || !plan.canReplaceInPlace(s.Offset, s.Len) {
+		return gsMovPlan{}, winSlotRef{}, false
+	}
+	gp, ok := planGSMov(plan.page[s.Offset : s.Offset+s.Len])
+	if !ok {
+		return gsMovPlan{}, winSlotRef{}, false
+	}
+	site := base + uint64(s.Offset)
+	slotVA, ref, err := as.installSlot(ctx, mm, site, winGSMovSlotSize, func(buf []byte, slotVA uint64) error {
+		return encodeWinGSMovSlot(buf, slotVA, site, s.Len, gp)
+	})
+	if err == nil {
+		if err = patchJmpSite(page, s.Offset, s.Len, site, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
+	}
+	if err != nil {
+		return gsMovPlan{}, winSlotRef{}, false
+	}
+	return gp, ref, true
+}
+
+// recoverIslandFault restores the guest registers and program counter when a
+// GS-segment MOV trampoline slot faults on the guest memory access.
+func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *debugEvent) (bool, error) {
+	if ev.Info[0] == avExecute {
+		return false, nil
+	}
+	pc := th.ctx.pc()
+	site, slotVA, ok := as.slotContaining(pc)
+	if !ok {
+		return false, nil
+	}
+	info, ok := as.siteAt(site)
+	if !ok || info.kind != amd64SiteGSMem {
+		return false, nil
+	}
+	if pc > slotVA {
+		var saved uint64
+		var read uintptr
+		if err := windows.ReadProcessMemory(th.sp.proc, uintptr(th.teb+winTEBScratchA), (*byte)(unsafe.Pointer(&saved)), unsafe.Sizeof(saved), &read); err != nil || read != unsafe.Sizeof(saved) {
+			return false, fmt.Errorf("ReadProcessMemory(TEB scratch of thread %d): %w", th.tid, err)
+		}
+		th.ctx.put64(ctxOffRax+8*int(info.scratch), saved)
+	}
+	th.ctx.setPC(site)
+	ev.Info[1] = ac.StateData().Regs.Gs_base + uint64(int64(info.disp))
+	if info.store {
+		ev.Info[0] = avWrite
+	} else {
+		ev.Info[0] = avRead
+	}
+	return true, nil
 }
 
 // hasPrefixBefore reports whether the byte in front of page[off] is an

@@ -439,9 +439,9 @@ func TestSandboxRunsStaticAndDynamicELF64UnderSystrap(t *testing.T) {
 
 // TestSandboxStartsStaticExecutablesAtLowAddresses starts static executables
 // that link at the addresses that real linkers use: 0x10000 for Go on arm64 and
-// 0x400000 for most others. The Windows engine holds them in its low window.
-// The macOS engine cannot hold them, because every arm64 task has a 4GB
-// PAGEZERO. It must refuse and name the cause and the engine that works.
+// 0x400000 for most others. The Windows engine holds them in its low window,
+// and the macOS engine activates its 4GB zone automatically unless
+// GVX_SYSTRAP_FIXED_IMAGES=0 disables it.
 func TestSandboxStartsStaticExecutablesAtLowAddresses(t *testing.T) {
 	systraptest.Require(t)
 	for _, base := range []uint64{0x10000, 0x400000} {
@@ -465,17 +465,30 @@ func TestSandboxStartsStaticExecutablesAtLowAddresses(t *testing.T) {
 				}
 			}()
 			code, err := sb.Run(context.Background())
-			if runtime.GOOS == "windows" {
-				if err != nil || code != 0 || outBuf.String() != "low-window-ok\n" {
-					t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), "low-window-ok\n")
+			if err != nil || code != 0 || outBuf.String() != "low-window-ok\n" {
+				t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), "low-window-ok\n")
+			}
+			if runtime.GOOS == "darwin" {
+				t.Setenv("GVX_SYSTRAP_FIXED_IMAGES", "0")
+				var errOut bytes.Buffer
+				cfgOff := hostTestConfig(t)
+				cfgOff.Platform = PlatformSystrap
+				cfgOff.ELFBytes = elf
+				cfgOff.Stdout = &errOut
+				sbOff, err := New(context.Background(), cfgOff)
+				if err != nil {
+					t.Fatalf("New(systrap, zone off) failed: %v", err)
 				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("Run() = (%d, nil), want an error: this engine cannot hold an executable at %#x", code, base)
-			}
-			if msg := err.Error(); !strings.Contains(msg, "position-independent") || !strings.Contains(msg, "-platform=hvf") {
-				t.Errorf("error %q does not name the cause and the engine that works", msg)
+				defer func() {
+					if cerr := sbOff.Close(); cerr != nil {
+						t.Errorf("Close(zone off) failed: %v", cerr)
+					}
+				}()
+				if code, err := sbOff.Run(context.Background()); err == nil {
+					t.Fatalf("Run(zone off) = (%d, nil), want an error when GVX_SYSTRAP_FIXED_IMAGES=0", code)
+				} else if msg := err.Error(); !strings.Contains(msg, "position-independent") || !strings.Contains(msg, "-platform=hvf") {
+					t.Errorf("error %q does not name the cause and the engine that works", msg)
+				}
 			}
 		})
 	}

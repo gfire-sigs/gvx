@@ -550,7 +550,7 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 	if act, done := c.recoverTrapSlot(as, sm); done {
 		return act
 	}
-	if as.p.zone {
+	if as.hasZone(mm) {
 		if act, done := c.zoneBodyFault(ctx, mm, as, sm.Sig, sm.MC.ES.ESR>>26, sm.MC.ES.FAR, sm.MC.SS.PC); done {
 			return act
 		}
@@ -564,7 +564,7 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 	pc := sm.MC.SS.PC
 	ec := esr >> 26
 
-	if as.p.zone {
+	if as.hasZone(mm) {
 		if act, done := c.zoneFault(ctx, mm, as, th, ac, sig, ec, esr, far, pc); done {
 			return act
 		}

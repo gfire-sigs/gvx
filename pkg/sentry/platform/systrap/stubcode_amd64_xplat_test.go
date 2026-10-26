@@ -797,3 +797,139 @@ func TestSpillDoesNotWriteTheVectorImageOutsideItsComponents(t *testing.T) {
 		t.Errorf("the routine wrote %#x into a byte that no saved component owns", got)
 	}
 }
+
+func TestEncodeWinTLSBaseSlotExecutesAllRegistersAndWidths(t *testing.T) {
+	const (
+		fsVal   = 0x7ff0_0400_1234_5678
+		gsVal   = 0x7ff0_0500_9abc_def0
+		siteLen = 5
+	)
+	for _, isGS := range []bool{false, true} {
+		for _, wide := range []bool{true, false} {
+			for reg := uint8(0); reg < 16; reg++ {
+				slot := make([]byte, winTLSSlotSize)
+				if err := encodeWinTLSBaseSlot(slot, rigCodeBase, rigSite, siteLen, reg, wide, isGS); err != nil {
+					t.Fatalf("isGS=%v wide=%v reg=%d: %v", isGS, wide, reg, err)
+				}
+				m := newX86Machine(slot, rigCodeBase)
+				var initRegs [16]uint64
+				for i := range initRegs {
+					initRegs[i] = 0x1111_0000_0000_0000 + uint64(i)*0x10101
+				}
+				m.r = initRegs
+				m.rflags = rigFlags
+				m.gsBase = rigTEB
+				m.put64(rigTEB+winTEBSysmsg, rigSysm)
+				m.put64(rigSysm+winOffFsBase, fsVal)
+				m.put64(rigSysm+winOffGsBase, gsVal)
+				if err := m.run(32); err != nil {
+					t.Fatalf("isGS=%v wide=%v reg=%d: run failed: %v", isGS, wide, reg, err)
+				}
+				if m.exit.jump != rigSite+siteLen {
+					t.Fatalf("jump = %#x, want %#x", m.exit.jump, uint64(rigSite+siteLen))
+				}
+				if m.rflags != rigFlags {
+					t.Fatalf("rflags = %#x, want %#x", m.rflags, uint64(rigFlags))
+				}
+				want := uint64(fsVal)
+				if isGS {
+					want = gsVal
+				}
+				if !wide {
+					want &= 0xffffffff
+				}
+				for i := range 16 {
+					exp := initRegs[i]
+					if uint8(i) == reg {
+						exp = want
+					}
+					if m.r[i] != exp {
+						t.Fatalf("isGS=%v wide=%v reg=%d: r[%d] = %#x, want %#x", isGS, wide, reg, i, m.r[i], exp)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestPlanAndEncodeWinGSMovSlotExecutesLoadsAndStores(t *testing.T) {
+	const (
+		guestGSBase = 0x7ff0_0600_0000
+		disp        = 0x28
+	)
+	cases := []struct {
+		name  string
+		insn  []byte
+		reg   uint8
+		wide  bool
+		store bool
+	}{
+		{"mov rax, gs:[0x28]", []byte{0x65, 0x48, 0x8B, 0x04, 0x25, 0x28, 0, 0, 0}, x86RAX, true, false},
+		{"mov r12, gs:[0x28]", []byte{0x65, 0x4C, 0x8B, 0x24, 0x25, 0x28, 0, 0, 0}, x86R12, true, false},
+		{"mov rsp, gs:[0x28]", []byte{0x65, 0x48, 0x8B, 0x24, 0x25, 0x28, 0, 0, 0}, x86RSP, true, false},
+		{"mov eax, gs:[0x28]", []byte{0x65, 0x8B, 0x04, 0x25, 0x28, 0, 0, 0}, x86RAX, false, false},
+		{"mov r15d, gs:[0x28]", []byte{0x65, 0x44, 0x8B, 0x3C, 0x25, 0x28, 0, 0, 0}, x86R15, false, false},
+		{"mov gs:[0x28], rax", []byte{0x65, 0x48, 0x89, 0x04, 0x25, 0x28, 0, 0, 0}, x86RAX, true, true},
+		{"mov gs:[0x28], r13", []byte{0x65, 0x4C, 0x89, 0x2C, 0x25, 0x28, 0, 0, 0}, x86R13, true, true},
+		{"mov gs:[0x28], ecx", []byte{0x65, 0x89, 0x0C, 0x25, 0x28, 0, 0, 0}, x86RCX, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gp, ok := planGSMov(tc.insn)
+			if !ok {
+				t.Fatalf("planGSMov rejected % x", tc.insn)
+			}
+			if gp.reg != tc.reg || gp.wide != tc.wide || gp.store != tc.store || gp.disp != disp {
+				t.Fatalf("planGSMov = %+v, want reg=%d wide=%v store=%v disp=%#x", gp, tc.reg, tc.wide, tc.store, disp)
+			}
+			slot := make([]byte, winGSMovSlotSize)
+			if err := encodeWinGSMovSlot(slot, rigCodeBase, rigSite, len(tc.insn), gp); err != nil {
+				t.Fatal(err)
+			}
+			m := newX86Machine(slot, rigCodeBase)
+			var initRegs [16]uint64
+			for i := range initRegs {
+				initRegs[i] = 0x2222_0000_0000_0000 + uint64(i)*0x30303
+			}
+			m.r = initRegs
+			m.rflags = rigFlags
+			m.gsBase = rigTEB
+			m.put64(rigTEB+winTEBSysmsg, rigSysm)
+			m.put64(rigSysm+winOffGsMemBase, guestGSBase)
+			const memSeed = 0xCAFE_BABE_1234_5678
+			m.put64(guestGSBase+disp, memSeed)
+			if err := m.run(32); err != nil {
+				t.Fatalf("run failed: %v", err)
+			}
+			if m.exit.jump != rigSite+uint64(len(tc.insn)) {
+				t.Fatalf("jump = %#x, want %#x", m.exit.jump, rigSite+uint64(len(tc.insn)))
+			}
+			if m.rflags != rigFlags {
+				t.Fatalf("rflags = %#x, want %#x", m.rflags, uint64(rigFlags))
+			}
+			for i := range 16 {
+				want := initRegs[i]
+				if !tc.store && uint8(i) == tc.reg {
+					want = memSeed
+					if !tc.wide {
+						want &= 0xffffffff
+					}
+				}
+				if m.r[i] != want {
+					t.Fatalf("r[%d] = %#x, want %#x", i, m.r[i], want)
+				}
+			}
+			if tc.store {
+				gotMem := m.get64(guestGSBase + disp)
+				wantMem := initRegs[tc.reg]
+				if !tc.wide {
+					gotMem = uint64(m.get32(guestGSBase + disp))
+					wantMem &= 0xffffffff
+				}
+				if gotMem != wantMem {
+					t.Fatalf("stored %#x, want %#x", gotMem, wantMem)
+				}
+			}
+		})
+	}
+}

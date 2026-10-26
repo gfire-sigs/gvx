@@ -110,6 +110,9 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
 		}
 		sb.lockdown = st
+		if tb, ok := sb.plat.(interface{ SetThreadInit(func() error) }); ok {
+			tb.SetThreadInit(hostlockdown.BindThread)
+		}
 	}
 
 	return sb, nil

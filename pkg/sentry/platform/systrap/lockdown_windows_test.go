@@ -83,3 +83,14 @@ func TestLockdownChild(t *testing.T) {
 	si, _, err := c.Switch(r1.rctx, r1.mm, ac, -1)
 	mustSyscall(t, si, err, 21, ac)
 }
+
+func TestStubTokenRemovesAllPrivileges(t *testing.T) {
+	tok, level, err := buildStubToken()
+	if err != nil {
+		t.Fatalf("buildStubToken: %v", err)
+	}
+	defer tok.Close()
+	if level&confineToken == 0 {
+		t.Fatalf("confinement level = %#x, want confineToken", level)
+	}
+}

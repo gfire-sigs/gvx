@@ -21,6 +21,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 
@@ -68,8 +69,20 @@ type Platform struct {
 	ntSetEvent uint64
 	ntWait     uint64
 
+	threadInit atomic.Pointer[func() error]
+
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// SetThreadInit registers a callback that Switch runs on the calling OS thread
+// before serving a guest context.
+func (p *Platform) SetThreadInit(fn func() error) {
+	if fn == nil {
+		p.threadInit.Store(nil)
+		return
+	}
+	p.threadInit.Store(&fn)
 }
 
 var configureOnce sync.Once

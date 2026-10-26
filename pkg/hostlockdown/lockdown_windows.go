@@ -34,6 +34,7 @@ var (
 	handlesMu       sync.RWMutex
 	restrictedToken windows.Token
 	containmentJob  windows.Handle
+	boundTIDs       sync.Map
 )
 
 // applyOSLockdown runs the SPEC 3.8 Windows steps in order. Each step returns
@@ -203,6 +204,7 @@ func bindProcessThreads(primary, token windows.Token) error {
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)
 	}
+	boundTIDs.Store(selfTID, struct{}{})
 	return nil
 }
 
@@ -215,10 +217,14 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 
 	var te windows.ThreadEntry32
 	te.Size = uint32(unsafe.Sizeof(te))
-	var handles []windows.Handle
+	type peerHandle struct {
+		tid uint32
+		h   windows.Handle
+	}
+	var peers []peerHandle
 	defer func() {
-		for _, h := range handles {
-			_ = windows.CloseHandle(h)
+		for _, p := range peers {
+			_ = windows.CloseHandle(p.h)
 		}
 	}()
 	for err := windows.Thread32First(snap, &te); err == nil; err = windows.Thread32Next(snap, &te) {
@@ -229,12 +235,14 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 		if openErr != nil {
 			continue
 		}
-		handles = append(handles, h)
+		peers = append(peers, peerHandle{tid: te.ThreadID, h: h})
 	}
-	for _, h := range handles {
+	for _, p := range peers {
+		h := p.h
 		if err := windows.SetThreadToken(&h, token); err != nil {
 			return fmt.Errorf("hostlockdown: SetThreadToken(peer thread): %w", err)
 		}
+		boundTIDs.Store(p.tid, struct{}{})
 	}
 	return nil
 }
@@ -271,8 +279,13 @@ func BindThread() error {
 	if token == 0 {
 		return ErrNotLockedDown
 	}
+	tid := windows.GetCurrentThreadId()
+	if _, ok := boundTIDs.Load(tid); ok {
+		return nil
+	}
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken: %w", err)
 	}
+	boundTIDs.Store(tid, struct{}{})
 	return nil
 }

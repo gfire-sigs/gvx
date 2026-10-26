@@ -68,6 +68,8 @@ type thread struct {
 	// fast is the fast path state of the thread. It is nil when the platform
 	// runs without the fast path.
 	fast atomic.Pointer[fastThread]
+	// teb is the address of the thread environment block in the stub process.
+	teb uint64
 	// evQueued counts the events in the channel, so that a Sentry thread that
 	// polls the handoff word sees a stop that the debugger delivered.
 	evQueued atomic.Int32

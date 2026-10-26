@@ -26,18 +26,22 @@ import (
 // winRegs is the register block of an amd64 winSysmsg. The order of the
 // general-purpose registers is the order of the CONTEXT record. FsBase holds
 // the guest FS base, which the stub loads with WRFSBASE before it returns.
+// GsBase holds the guest GS base for RDGSBASE slots, and GsMemBase holds the
+// guest GS base (or winNonCanonGSBase when zero) for GS memory slots.
 type winRegs struct {
 	Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi uint64
 	R8, R9, R10, R11, R12, R13, R14, R15   uint64
 	Rflags                                 uint64
 	FsBase                                 uint64
+	GsBase                                 uint64
+	GsMemBase                              uint64
 }
 
 // winSysmsg is the shared page of one guest thread.
 type winSysmsg struct {
 	winSysmsgHeader
 	Regs winRegs
-	_    [winOffXsave - winOffFsBase - 8]byte
+	_    [winOffXsave - winOffGsMemBase - 8]byte
 	// Xsave holds the vector state of the trapped guest in the standard XSAVE
 	// format. A call into ntdll can clobber the volatile vector registers on
 	// Windows, so the spill routine saves them before its first call and loads
@@ -49,9 +53,16 @@ type winSysmsg struct {
 // that an instruction encodes: RAX 0, RCX 1, RDX 2, RBX 3, RSP 4, RBP 5, RSI 6,
 // RDI 7, R8 to R15 8 to 15.
 const (
-	winOffRegBase = winOffRegs
-	winOffRflags  = winOffRegs + 16*8
-	winOffFsBase  = winOffRflags + 8
+	winOffRegBase   = winOffRegs
+	winOffRflags    = winOffRegs + 16*8
+	winOffFsBase    = winOffRflags + 8
+	winOffGsBase    = winOffFsBase + 8
+	winOffGsMemBase = winOffGsBase + 8
+
+	// winNonCanonGSBase replaces a zero guest GS base in GsMemBase so a fast
+	// GS memory slot raises an access violation even when the low window maps
+	// the displacement.
+	winNonCanonGSBase = uint64(1) << 63
 
 	// winOffXsave is the offset of the XSAVE area of the guest vector state.
 	// XSAVE and XRSTOR fault on an address that is not 64-byte aligned, and
@@ -76,6 +87,8 @@ var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.Rsp)-4*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.R15)-15*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.Rflags)-16*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.FsBase)-17*8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.GsBase)-18*8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.GsMemBase)-19*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Xsave)-winOffXsave]
 var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsg{})-(winOffXsave+winXsaveSize)]
 var _ = [1]struct{}{}[winOffXsave%64]
@@ -87,6 +100,10 @@ const (
 	// winSlotSize is the size of one trampoline slot. The slot holds the entry
 	// code, the relocated instructions, and the jump back.
 	winSlotSize = 64
+	// winTLSSlotSize is the size of an RDFSBASE or RDGSBASE trampoline slot.
+	winTLSSlotSize = 32
+	// winGSMovSlotSize is the size of a GS-segment MOV trampoline slot.
+	winGSMovSlotSize = 48
 )
 
 // winTrap describes one trap of a thread, as the Sentry decoded it.
@@ -97,13 +114,25 @@ type winTrap struct {
 	ret uint64
 }
 
+// loadTLSFrom copies the guest FS and GS base registers of ac into the block.
+func (r *winRegs) loadTLSFrom(ac *arch.Context64) {
+	g := &ac.StateData().Regs
+	r.FsBase = g.Fs_base
+	r.GsBase = g.Gs_base
+	if g.Gs_base == 0 {
+		r.GsMemBase = winNonCanonGSBase
+	} else {
+		r.GsMemBase = g.Gs_base
+	}
+}
+
 // loadFrom copies the registers of ac into the block.
 func (r *winRegs) loadFrom(ac *arch.Context64) {
 	g := &ac.StateData().Regs
 	r.Rax, r.Rcx, r.Rdx, r.Rbx, r.Rsp, r.Rbp, r.Rsi, r.Rdi = g.Rax, g.Rcx, g.Rdx, g.Rbx, g.Rsp, g.Rbp, g.Rsi, g.Rdi
 	r.R8, r.R9, r.R10, r.R11, r.R12, r.R13, r.R14, r.R15 = g.R8, g.R9, g.R10, g.R11, g.R12, g.R13, g.R14, g.R15
 	r.Rflags = g.Eflags
-	r.FsBase = g.Fs_base
+	r.loadTLSFrom(ac)
 }
 
 // storeTo copies the block into ac the way a SYSCALL leaves the registers: RCX

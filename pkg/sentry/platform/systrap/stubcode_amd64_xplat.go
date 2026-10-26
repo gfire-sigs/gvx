@@ -140,18 +140,17 @@ func x86Rex(w bool, reg, base int) byte {
 	return r
 }
 
-// memOp emits opcode bytes with a ModRM [base+disp32] operand. base must not
-// be RSP or R12, which need a SIB byte. w selects REX.W, and rexAlways forces
-// a REX prefix for a 32-bit operation on a high register.
+// memOp emits opcode bytes with a ModRM [base+disp32] operand. A base of RSP
+// or R12 emits the required 0x24 SIB byte. w selects REX.W.
 func (a *x86Asm) memOp(w bool, op []byte, reg, base int, disp int32) {
-	if base&7 == 4 {
-		panic("x86 base register needs a SIB byte")
-	}
 	if r := x86Rex(w, reg, base); r != 0x40 {
 		a.emit(r)
 	}
 	a.emit(op...)
 	a.emit(0x80 | byte(reg&7)<<3 | byte(base&7))
+	if base&7 == 4 {
+		a.emit(0x24)
+	}
 	a.imm32(uint32(disp))
 }
 
@@ -165,6 +164,11 @@ func (a *x86Asm) movStore(base int, disp int32, reg int) {
 
 // movLoad32 is `mov r32, [base+disp32]`.
 func (a *x86Asm) movLoad32(reg, base int, disp int32) { a.memOp(false, []byte{0x8B}, reg, base, disp) }
+
+// movStore32 is `mov [base+disp32], r32`.
+func (a *x86Asm) movStore32(base int, disp int32, reg int) {
+	a.memOp(false, []byte{0x89}, reg, base, disp)
+}
 
 // movStoreImm32 is `mov dword [base+disp32], imm32`.
 func (a *x86Asm) movStoreImm32(base int, disp int32, v uint32) {
@@ -440,8 +444,14 @@ func rel32(from, to uint64) (uint32, error) {
 // patchJmp writes `jmp rel32` to slotVA over the SYSCALL at page[off] and the
 // three bytes behind it.
 func patchJmp(page []byte, off int, siteVA, slotVA uint64) error {
-	if off < 0 || off+winJmpLen > len(page) {
-		return fmt.Errorf("jump at %d does not fit in a page of %d bytes", off, len(page))
+	return patchJmpSite(page, off, winJmpLen, siteVA, slotVA)
+}
+
+// patchJmpSite writes `jmp rel32` to slotVA over the siteLen-byte instruction
+// at page[off] and fills any trailing bytes of the instruction with INT3.
+func patchJmpSite(page []byte, off, siteLen int, siteVA, slotVA uint64) error {
+	if siteLen < winJmpLen || off < 0 || off+siteLen > len(page) {
+		return fmt.Errorf("jump at %d (len %d) does not fit in a page of %d bytes", off, siteLen, len(page))
 	}
 	rel, err := rel32(siteVA+winJmpLen, slotVA)
 	if err != nil {
@@ -449,6 +459,150 @@ func patchJmp(page []byte, off int, siteVA, slotVA uint64) error {
 	}
 	page[off] = 0xE9
 	binary.LittleEndian.PutUint32(page[off+1:], rel)
+	for i := winJmpLen; i < siteLen; i++ {
+		page[off+i] = 0xCC
+	}
+	return nil
+}
+
+// encodeWinTLSBaseSlot writes the slot for a patched RDFSBASE or RDGSBASE
+// instruction of siteLen bytes at site. It reads FsBase or GsBase from the
+// thread winSysmsg into reg without touching flags or other registers, then
+// jumps to site+siteLen.
+func encodeWinTLSBaseSlot(buf []byte, slotVA, site uint64, siteLen int, reg uint8, wide, isGS bool) error {
+	if len(buf) < winTLSSlotSize {
+		return fmt.Errorf("TLS slot buffer has %d bytes", len(buf))
+	}
+	var a x86Asm
+	a.movLoadGS(int(reg), winTEBSysmsg)
+	disp := int32(winOffFsBase)
+	if isGS {
+		disp = int32(winOffGsBase)
+	}
+	if wide {
+		a.movLoad(int(reg), int(reg), disp)
+	} else {
+		a.movLoad32(int(reg), int(reg), disp)
+	}
+	back := slotVA + uint64(len(a.b)) + 5
+	rel, err := rel32(back, site+uint64(siteLen))
+	if err != nil {
+		return err
+	}
+	a.emit(0xE9)
+	a.imm32(rel)
+	for len(a.b) < winTLSSlotSize {
+		a.emit(0xCC)
+	}
+	copy(buf[:winTLSSlotSize], a.b)
+	return nil
+}
+
+// gsMovPlan describes a 32-bit or 64-bit MOV between a general-purpose
+// register and a constant displacement in the GS segment (`gs:[disp32]`).
+type gsMovPlan struct {
+	reg     uint8
+	scratch uint8
+	wide    bool
+	store   bool
+	disp    int32
+}
+
+// gsMovReg maps a 32-bit or 64-bit x86asm general-purpose register to its
+// hardware register number (0..15) and width.
+func gsMovReg(r x86asm.Reg) (uint8, bool, bool) {
+	if r >= x86asm.RAX && r <= x86asm.R15 {
+		return uint8(r - x86asm.RAX), true, true
+	}
+	if r >= x86asm.EAX && r <= x86asm.R15L {
+		return uint8(r - x86asm.EAX), false, true
+	}
+	return 0, false, false
+}
+
+// planGSMov decodes a GS-prefixed instruction and reports whether it is a
+// 32-bit or 64-bit MOV between a general-purpose register and `gs:[disp32]`.
+func planGSMov(code []byte) (gsMovPlan, bool) {
+	if len(code) < winJmpLen {
+		return gsMovPlan{}, false
+	}
+	inst, err := x86asm.Decode(code, 64)
+	if err != nil || inst.Len != len(code) || inst.Op != x86asm.MOV {
+		return gsMovPlan{}, false
+	}
+	for _, p := range inst.Prefix {
+		if p == 0 {
+			break
+		}
+		b := byte(p & 0xFF)
+		if b != 0x65 && (b < 0x40 || b > 0x4F) {
+			return gsMovPlan{}, false
+		}
+	}
+	if r, ok := inst.Args[0].(x86asm.Reg); ok {
+		mem, memOK := inst.Args[1].(x86asm.Mem)
+		reg, wide, regOK := gsMovReg(r)
+		if !memOK || !regOK || mem.Segment != x86asm.GS || mem.Base != 0 || mem.Index != 0 || int64(int32(mem.Disp)) != mem.Disp {
+			return gsMovPlan{}, false
+		}
+		scratch := reg
+		if reg == x86RSP {
+			scratch = x86RAX
+		}
+		return gsMovPlan{reg: reg, scratch: scratch, wide: wide, store: false, disp: int32(mem.Disp)}, true
+	}
+	if r, ok := inst.Args[1].(x86asm.Reg); ok {
+		mem, memOK := inst.Args[0].(x86asm.Mem)
+		reg, wide, regOK := gsMovReg(r)
+		if !memOK || !regOK || mem.Segment != x86asm.GS || mem.Base != 0 || mem.Index != 0 || int64(int32(mem.Disp)) != mem.Disp {
+			return gsMovPlan{}, false
+		}
+		scratch := uint8(x86RAX)
+		if reg == x86RAX {
+			scratch = x86RCX
+		}
+		return gsMovPlan{reg: reg, scratch: scratch, wide: wide, store: true, disp: int32(mem.Disp)}, true
+	}
+	return gsMovPlan{}, false
+}
+
+// encodeWinGSMovSlot writes a trampoline slot for a patched GS-segment MOV
+// instruction of siteLen bytes at site. It spills p.scratch to winTEBScratchA,
+// loads GsMemBase from the thread winSysmsg, performs the 32-bit or 64-bit
+// memory access at [GsMemBase+disp], restores p.scratch when needed, and jumps
+// to site+siteLen without modifying RFLAGS.
+func encodeWinGSMovSlot(buf []byte, slotVA, site uint64, siteLen int, p gsMovPlan) error {
+	if len(buf) < winGSMovSlotSize {
+		return fmt.Errorf("GS MOV slot buffer has %d bytes", len(buf))
+	}
+	var a x86Asm
+	a.movStoreGS(winTEBScratchA, int(p.scratch))
+	a.movLoadGS(int(p.scratch), winTEBSysmsg)
+	a.movLoad(int(p.scratch), int(p.scratch), winOffGsMemBase)
+	switch {
+	case p.store && p.wide:
+		a.movStore(int(p.scratch), p.disp, int(p.reg))
+	case p.store && !p.wide:
+		a.movStore32(int(p.scratch), p.disp, int(p.reg))
+	case !p.store && p.wide:
+		a.movLoad(int(p.reg), int(p.scratch), p.disp)
+	default:
+		a.movLoad32(int(p.reg), int(p.scratch), p.disp)
+	}
+	if p.store || p.scratch != p.reg {
+		a.movLoadGS(int(p.scratch), winTEBScratchA)
+	}
+	back := slotVA + uint64(len(a.b)) + 5
+	rel, err := rel32(back, site+uint64(siteLen))
+	if err != nil {
+		return err
+	}
+	a.emit(0xE9)
+	a.imm32(rel)
+	for len(a.b) < winGSMovSlotSize {
+		a.emit(0xCC)
+	}
+	copy(buf[:winGSMovSlotSize], a.b)
 	return nil
 }
 
@@ -598,6 +752,26 @@ func (p *jmpPlanner) plan(off int) ([]byte, bool) {
 		}
 	}
 	return reloc, true
+}
+
+// canReplaceInPlace reports whether a siteLen-byte instruction at offset off in
+// page can be overwritten with a 5-byte JMP without relocating the following
+// instruction.
+func (p *jmpPlanner) canReplaceInPlace(off, siteLen int) bool {
+	if siteLen < winJmpLen || off < 0 || off+siteLen > len(p.page) {
+		return false
+	}
+	p.scan()
+	start := len(p.before) + off
+	if p.precededByNoReturn(start) {
+		return false
+	}
+	for t := start + 1; t < start+siteLen; t++ {
+		if p.target[t] {
+			return false
+		}
+	}
+	return true
 }
 
 // planJmpPatch plans one site. A caller with many sites in one page uses a

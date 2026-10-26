@@ -100,6 +100,11 @@ func fatal(err error, errno unix.Errno) outcome {
 
 // Switch implements platform.Context.Switch.
 func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arch.Context64, _ int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+	if fn := c.p.threadInit.Load(); fn != nil && *fn != nil {
+		if err := (*fn)(); err != nil {
+			return nil, hostarch.NoAccess, &platform.ContextError{Err: err, Errno: unix.EPERM}
+		}
+	}
 	var as *addressSpace
 	if mm != nil {
 		as, _ = mm.AddressSpace().(*addressSpace)
@@ -322,6 +327,14 @@ const execRetryLimit = 3
 // faultStop serves an access violation. The engine repairs a fault that its
 // own page state caused and reports every other fault as SIGSEGV.
 func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *addressSpace, th *thread, ac *arch.Context64, ev debugEvent) outcome {
+	fromSlot, err := th.recoverIslandFault(as, ac, &ev)
+	if err != nil {
+		return fatal(err, unix.EFAULT)
+	}
+	continueFault := th.continueUnchanged
+	if fromSlot {
+		continueFault = th.continueEvent
+	}
 	kind, addr := ev.Info[0], ev.Info[1]
 	pc := th.ctx.pc()
 	switch kind {
@@ -383,7 +396,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		if ok, err := as.restoreData(base); err != nil {
 			return fatal(err, unix.ENOMEM)
 		} else if ok {
-			if err := th.continueUnchanged(ev); err != nil {
+			if err := continueFault(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running
@@ -391,7 +404,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		// A writable data state means that another thread restored the block
 		// after this thread faulted, so the write retries.
 		if st, at, ok := as.blockStateOf(base); ok && st == blockData && at.Write {
-			if err := th.continueUnchanged(ev); err != nil {
+			if err := continueFault(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running

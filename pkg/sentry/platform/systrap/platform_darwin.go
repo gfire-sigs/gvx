@@ -197,6 +197,16 @@ func (p *Platform) Close() error {
 // once. A larger unit would map pages that the guest never touches.
 func (*Platform) MapUnit() uint64 { return mapUnit }
 
+// EnableZone activates the 4GB zone for fixed-address executables when the
+// host address range can hold it.
+func (p *Platform) EnableZone() error {
+	if p.userMin > zoneBias+zoneMin || p.userMax < zoneBias+zoneLimit+blockSize {
+		return fmt.Errorf("the guest address range [%#x, %#x) cannot hold the zone for fixed-address executables at %#x", p.userMin, p.userMax, uint64(zoneBias))
+	}
+	p.zone = true
+	return nil
+}
+
 // MinUserAddress implements platform.Platform.MinUserAddress. In zone mode the
 // guest range starts at the bottom of the zone, where a fixed-address
 // executable links.
