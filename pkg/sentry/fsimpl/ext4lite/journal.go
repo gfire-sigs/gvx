@@ -40,6 +40,9 @@ type journal struct {
 	super journalSuper
 	// extents maps the blocks of the journal file to host blocks.
 	extents []extent
+	// leaves lists any extent leaf blocks of inode 8 when the journal uses a
+	// depth-1 tree.
+	leaves []uint64
 	// head is the log position of the next transaction.
 	head uint32
 	// seq is the sequence number of the next transaction.
@@ -54,6 +57,11 @@ type journal struct {
 // transaction never writes there. A replay that did would overwrite the log that
 // it still reads, and a second replay after a crash would see another log.
 func (j *journal) holds(blk uint64) bool {
+	for _, l := range j.leaves {
+		if blk == l {
+			return true
+		}
+	}
 	for _, e := range j.extents {
 		if blk >= e.pblk && blk-e.pblk < uint64(e.n) {
 			return true
@@ -147,11 +155,11 @@ func (v *volume) loadJournal() (*journal, error) {
 		return nil, corrupt("journal inode has the size %d", size)
 	}
 	blocksCount := uint64(le.Uint32(v.sb[sbBlocksCountLo:])) | uint64(le.Uint32(v.sb[sbBlocksCountHi:]))<<32
-	exts, err := parseJournalExtents(raw[inBlock:inBlock+iBlockSize], size/blockSize, blocksCount)
+	exts, leaves, err := v.parseJournalExtents(raw[inBlock:inBlock+iBlockSize], size/blockSize, blocksCount)
 	if err != nil {
 		return nil, err
 	}
-	j := &journal{extents: exts, logged: make(map[uint64]struct{})}
+	j := &journal{extents: exts, leaves: leaves, logged: make(map[uint64]struct{})}
 	blocks := uint32(min(size/blockSize, 1<<31))
 	sb, err := v.readLog(j, 0)
 	if err != nil {
@@ -170,31 +178,65 @@ func (v *volume) loadJournal() (*journal, error) {
 
 // parseJournalExtents reads the extents of the journal inode. The volume has
 // not loaded its groups when it replays the journal, so the check cannot use
-// the engine parser. The journal must fill its file with up to four extents
-// in the inode. A journal in an extent tree of depth 1 is not supported.
-func parseJournalExtents(root []byte, blocks, volumeBlocks uint64) ([]extent, error) {
+// the engine parser. The journal may sit in depth 0 (up to 4 extents in the
+// inode) or depth 1 (up to 4 extent leaf blocks).
+func (v *volume) parseJournalExtents(root []byte, blocks, volumeBlocks uint64) ([]extent, []uint64, error) {
 	if le.Uint16(root[0:]) != extMagic {
-		return nil, corrupt("journal inode has no extent header")
+		return nil, nil, corrupt("journal inode has no extent header")
 	}
-	entries, depth := int(le.Uint16(root[2:])), le.Uint16(root[6:])
-	if depth != 0 || entries < 1 || entries > rootExtents {
-		return nil, corrupt("journal inode has %d entries at depth %d, want 1 to %d at depth 0", entries, depth, rootExtents)
+	entries, maxE, depth := int(le.Uint16(root[2:])), int(le.Uint16(root[4:])), le.Uint16(root[6:])
+	if maxE != rootExtents || entries < 1 || entries > rootExtents || depth > 1 {
+		return nil, nil, corrupt("journal inode has %d entries at depth %d", entries, depth)
 	}
-	var out []extent
-	var next uint64
-	for i := range entries {
-		e := decodeExtent(root[extHeaderSize+extEntrySize*i:])
-		if e.n == 0 || e.n > maxExtentLen || uint64(e.lblk) != next || e.pblk >= volumeBlocks ||
+	var (
+		out    []extent
+		leaves []uint64
+		next   uint64
+	)
+	addExt := func(e extent, idx int) error {
+		if e.uninit || e.n == 0 || e.n > maxExtentLen || uint64(e.lblk) != next || e.pblk >= volumeBlocks ||
 			e.pend() > volumeBlocks || isMetadataBlock(e.pblk) || isMetadataBlock(e.pend()-1) {
-			return nil, corrupt("journal extent %d (%d+%d at %d) is not valid", i, e.lblk, e.n, e.pblk)
+			return corrupt("journal extent %d (%d+%d at %d) is not valid", idx, e.lblk, e.n, e.pblk)
 		}
 		next += uint64(e.n)
 		out = append(out, e)
+		return nil
+	}
+	if depth == 0 {
+		for i := range entries {
+			if err := addExt(decodeExtent(root[extHeaderSize+extEntrySize*i:]), i); err != nil {
+				return nil, nil, err
+			}
+		}
+	} else {
+		var leaf [blockSize]byte
+		for i := range entries {
+			_, lb := decodeExtentIdx(root[extHeaderSize+extEntrySize*i:])
+			if lb >= volumeBlocks || isMetadataBlock(lb) {
+				return nil, nil, corrupt("journal extent leaf %d is not valid", lb)
+			}
+			if _, err := v.hf.ReadAt(leaf[:], int64(lb)*blockSize); err != nil {
+				return nil, nil, hostError(err)
+			}
+			if le.Uint16(leaf[0:]) != extMagic || le.Uint16(leaf[6:]) != 0 {
+				return nil, nil, corrupt("journal extent leaf %d has a bad header", lb)
+			}
+			lcnt, lmax := int(le.Uint16(leaf[2:])), int(le.Uint16(leaf[4:]))
+			if lmax != leafExtents || lcnt < 1 || lcnt > lmax {
+				return nil, nil, corrupt("journal extent leaf %d has %d of %d entries", lb, lcnt, lmax)
+			}
+			leaves = append(leaves, lb)
+			for j := range lcnt {
+				if err := addExt(decodeExtent(leaf[extHeaderSize+extEntrySize*j:]), len(out)); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
 	}
 	if next != blocks {
-		return nil, corrupt("journal extents cover %d blocks, the inode has %d", next, blocks)
+		return nil, nil, corrupt("journal extents cover %d blocks, the inode has %d", next, blocks)
 	}
-	return out, nil
+	return out, leaves, nil
 }
 
 // needsReplay reports whether the log can hold a transaction that the volume

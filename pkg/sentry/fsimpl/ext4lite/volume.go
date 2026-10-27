@@ -90,9 +90,7 @@ type volume struct {
 	hostBytes       int64
 	sbDirty         bool
 	descDirty       bool
-	resizeDirty     bool
 	sb              [superSize]byte
-	resizeDind      uint64
 	state           uint16
 	closed          bool
 	flushedOnce     bool
@@ -164,6 +162,8 @@ func checkSuperblock(sb []byte, hostSize int64) (groups uint32, err error) {
 		{"compat features", uint64(le.Uint32(sb[sbFeatureCompat:]) &^ compatHasJournal), featCompat},
 		{"incompat features", uint64(le.Uint32(sb[sbFeatureIncompat:]) &^ incompatRecover), featIncompat},
 		{"ro_compat features", uint64(le.Uint32(sb[sbFeatureRoCompat:])), featRoCompat},
+		{"first meta_bg", uint64(le.Uint32(sb[sbFirstMetaBG:])), 0},
+		{"reserved gdt blocks", uint64(le.Uint16(sb[sbReservedGDT:])), 0},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -175,11 +175,9 @@ func checkSuperblock(sb []byte, hostSize int64) (groups uint32, err error) {
 		return 0, corrupt("superblock block count %d is not 1 to %d groups", blocks, maxGroups)
 	}
 	groups = uint32(blocks / blocksPerGroup)
-	if got := uint64(le.Uint32(sb[sbInodesCount:])); got != uint64(groups)*inodesPerGroup {
-		return 0, corrupt("superblock inode count %d, want %d", got, uint64(groups)*inodesPerGroup)
-	}
-	if got, want := uint32(le.Uint16(sb[sbReservedGDT:])), reservedGDTBlocks(groups); got != want {
-		return 0, corrupt("superblock reserves %d descriptor blocks, want %d", got, want)
+	wantInodes := uint64(min(groups, maxInodeGroups)) * inodesPerGroup
+	if got := uint64(le.Uint32(sb[sbInodesCount:])); got != wantInodes {
+		return 0, corrupt("superblock inode count %d, want %d", got, wantInodes)
 	}
 	return groups, nil
 }
@@ -267,9 +265,6 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 			return nil, err
 		}
 	}
-	if err := v.loadResizeInode(); err != nil {
-		return nil, err
-	}
 	root, err := v.getNode(rootIno)
 	if err != nil {
 		return nil, err
@@ -331,7 +326,8 @@ func (v *volume) loadGroups(n uint32) error {
 	var blk [blockSize]byte
 	for gi := uint32(0); gi < n; gi++ {
 		if gi%descsPerBlock == 0 {
-			if _, err := v.hf.ReadAt(blk[:], int64(1+gi/descsPerBlock)*blockSize); err != nil {
+			descBlk := primaryDescBlock(gi / descsPerBlock)
+			if _, err := v.hf.ReadAt(blk[:], int64(descBlk)*blockSize); err != nil {
 				return hostError(err)
 			}
 		}
@@ -355,6 +351,14 @@ func (v *volume) loadGroups(n uint32) error {
 			// cannot load again, so the mount sets the bits and writes them with
 			// the next flush.
 			for i := uint32(0); i < firstIno-1; i++ {
+				if !g.inodes.test(i) {
+					g.inodes.set(i)
+					g.dirty = true
+				}
+			}
+		}
+		if gi >= maxInodeGroups {
+			for i := uint32(0); i < inodesPerGroup; i++ {
 				if !g.inodes.test(i) {
 					g.inodes.set(i)
 					g.dirty = true
@@ -410,7 +414,7 @@ type statfsInfo struct {
 }
 
 // statfs reports the space of the volume. The free space adds the room that the
-// volume can still gain by new groups, limited by the size limit of 64 GiB and
+// volume can still gain by new groups, limited by the size limit of 64 TiB and
 // by the free space of the host volume.
 func (v *volume) statfs() statfsInfo {
 	v.mu.Lock()
@@ -423,20 +427,21 @@ func (v *volume) statfs() statfsInfo {
 	total := groups*blocksPerGroup - meta
 	growBlocks := uint64(0)
 	if groups < maxGroups {
-		growBlocks = (maxGroups - groups) * (blocksPerGroup - uint64(headerBlocks) - 2 - inodeTableBlocks)
+		growBlocks = (maxGroups - groups) * (blocksPerGroup - 2 - 2 - inodeTableBlocks)
 		if avail, err := v.hf.AvailBytes(); err == nil {
 			growBlocks = min(growBlocks, avail/blockSize)
 		}
 	}
 	growInodes := uint64(0)
-	if groups < maxGroups {
-		growInodes = (maxGroups - groups) * inodesPerGroup
+	if groups < maxInodeGroups {
+		growInodes = (maxInodeGroups - groups) * inodesPerGroup
 		growInodes = min(growInodes, growBlocks)
 	}
+	inodeGroups := min(groups, maxInodeGroups)
 	return statfsInfo{
 		blocks: total + growBlocks,
 		bfree:  v.freeBlocksTotal + growBlocks,
-		files:  groups*inodesPerGroup + growInodes,
+		files:  inodeGroups*inodesPerGroup + growInodes,
 		ffree:  v.freeInodesTotal + growInodes,
 	}
 }

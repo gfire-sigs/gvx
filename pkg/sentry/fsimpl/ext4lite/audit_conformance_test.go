@@ -53,7 +53,7 @@ func TestAuditOracleDetects(t *testing.T) {
 	tree := auFsck(good, true).Tree
 	victim := tree["/victim"].ino
 	inodeOff := func(ino uint32) int64 {
-		const group0Table = 65 + 2
+		const group0Table = 4
 		return int64(group0Table)*auBlock + int64(ino-1)*auISize
 	}
 	patch := func(img *auPages, off int64, b ...byte) { img.writeAt(b, off) }
@@ -82,15 +82,15 @@ func TestAuditOracleDetects(t *testing.T) {
 		{"free bit set", "bitmap says used", func(img *auPages) {
 			// Block 4095 is free in a volume this small.
 			var b [1]byte
-			img.readAt(b[:], 65*auBlock+511)
+			img.readAt(b[:], 2*auBlock+511)
 			b[0] |= 0x80
-			patch(img, 65*auBlock+511, b[:]...)
+			patch(img, 2*auBlock+511, b[:]...)
 		}},
 		{"inode bitmap bit", "bitmap says used=false", func(img *auPages) {
 			var b [1]byte
-			img.readAt(b[:], 66*auBlock+int64((victim-1)/8))
+			img.readAt(b[:], 3*auBlock+int64((victim-1)/8))
 			b[0] &^= 1 << ((victim - 1) % 8)
-			patch(img, 66*auBlock+int64((victim-1)/8), b[:]...)
+			patch(img, 3*auBlock+int64((victim-1)/8), b[:]...)
 		}},
 		{"superblock magic", "magic", func(img *auPages) { patch(img, 1024+0x38, 0, 0) }},
 	}

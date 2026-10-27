@@ -53,11 +53,15 @@ type dirEntry struct {
 // entryLen returns the record length of an entry with a name of nameLen bytes.
 func entryLen(nameLen int) int { return roundUp4(8 + nameLen) }
 
+// minEntryLen is the record length of the shortest valid directory entry.
+const minEntryLen = 12
+
 // dirBlock is one 4 KiB block of a directory. Its entries are in offset order.
 type dirBlock struct {
 	entries []*dirEntry
 	// used is the sum of the record lengths that the live entries need.
 	used  int
+	idx   int
 	dirty bool
 }
 
@@ -66,7 +70,10 @@ type dirBlock struct {
 type dirData struct {
 	blocks []*dirBlock
 	index  map[string]*dirEntry
-	loaded bool
+	// firstFree is the lowest block index that has at least minEntryLen bytes
+	// of free space.
+	firstFree int
+	loaded    bool
 }
 
 // dirEnt is one entry that a directory listing returns. next is the cookie of
@@ -141,6 +148,7 @@ func (n *node) loadDirLocked() error {
 		if err != nil {
 			return err
 		}
+		blk.idx = int(lb)
 		blocks = append(blocks, blk)
 	}
 	d.blocks, d.index, d.loaded = blocks, index, true
@@ -369,9 +377,17 @@ func (n *node) addEntry(name string, ino uint32, ft uint8) error {
 	}
 	e := &dirEntry{name: name, ino: ino, ft: ft}
 	placed := false
-	for _, b := range n.dir.blocks {
+	for i := n.dir.firstFree; i < len(n.dir.blocks); i++ {
+		b := n.dir.blocks[i]
+		if i == n.dir.firstFree && blockSize-b.used < minEntryLen {
+			n.dir.firstFree = i + 1
+			continue
+		}
 		if b.place(e) {
 			placed = true
+			if i == n.dir.firstFree && blockSize-b.used < minEntryLen {
+				n.dir.firstFree = i + 1
+			}
 			break
 		}
 	}
@@ -409,7 +425,7 @@ func (n *node) appendDirBlockLocked() (*dirBlock, error) {
 	}
 	n.nblocks++
 	n.size += blockSize
-	b := &dirBlock{dirty: true}
+	b := &dirBlock{idx: len(n.dir.blocks), dirty: true}
 	n.dir.blocks = append(n.dir.blocks, b)
 	return b, nil
 }
@@ -443,6 +459,9 @@ func (n *node) removeEntry(name string) error {
 		}
 	}
 	e.blk.remove(e)
+	if e.blk.idx < len(n.dir.blocks) && e.blk.idx < n.dir.firstFree && blockSize-e.blk.used >= minEntryLen {
+		n.dir.firstFree = e.blk.idx
+	}
 	delete(n.dir.index, name)
 	n.markDirtyLocked()
 	// The mapping no longer names the freed blocks. A failure to free them
@@ -465,6 +484,9 @@ func (n *node) dropTailLocked(keep int) ([]extent, error) {
 		return nil, err
 	}
 	n.dir.blocks = n.dir.blocks[:keep]
+	if n.dir.firstFree > keep {
+		n.dir.firstFree = keep
+	}
 	n.size = uint64(keep) * blockSize
 	for _, f := range freed {
 		n.nblocks -= uint64(f.n)

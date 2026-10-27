@@ -115,7 +115,7 @@ func imageBytes(t *testing.T, path string) []byte {
 // metadataBlocksUnchanged compares the metadata blocks of two images.
 func metadataBlocksUnchanged(t *testing.T, before, after []byte) {
 	t.Helper()
-	for blk := uint64(1); blk < 323; blk++ {
+	for blk := uint64(1); blk < 260; blk++ {
 		lo, hi := blk*blockSize, (blk+1)*blockSize
 		if !bytes.Equal(before[lo:hi], after[lo:hi]) {
 			t.Errorf("metadata block %d changed", blk)
@@ -135,8 +135,8 @@ func openForCorruptTest(path string) (*volume, error) {
 // metadata. The first access must fail, and the write must not reach the block.
 func TestCorruptExtentTargets(t *testing.T) {
 	// Block 0 holds the superblock. Block 1 holds the first descriptors.
-	// Block 65 is the block bitmap and 67 is the start of the inode table.
-	for _, target := range []uint64{0, 1, 65, 66, 67, 200, 322} {
+	// Block 2 is the block bitmap and 4 is the start of the inode table.
+	for _, target := range []uint64{0, 1, 2, 3, 4, 200, 259} {
 		fx := buildCorruptFixture(t)
 		patchInode(t, fx.path, fx.file1, func(raw []byte) {
 			encodeExtent(raw[inBlock+extHeaderSize:], extent{lblk: 0, n: 1, pblk: target})
@@ -375,7 +375,7 @@ func TestCorruptExtentLeaf(t *testing.T) {
 		"magic":       func(b []byte) { le.PutUint16(b[0:], 0) },
 		"entry count": func(b []byte) { le.PutUint16(b[2:], 5000) },
 		"depth":       func(b []byte) { le.PutUint16(b[6:], 3) },
-		"target":      func(b []byte) { encodeExtent(b[extHeaderSize:], extent{lblk: 0, n: 1, pblk: 67}) },
+		"target":      func(b []byte) { encodeExtent(b[extHeaderSize:], extent{lblk: 0, n: 1, pblk: 4}) },
 	} {
 		orig := imageBytes(t, path)
 		patchBlock(t, path, leaf, edit)

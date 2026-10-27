@@ -86,7 +86,7 @@ func formatVolume(hf hostFile, now time.Time) error {
 	v.freeBlocksTotal = uint64(g.desc.freeBlocks)
 	v.freeInodesTotal = uint64(g.desc.freeInodes)
 	v.initSuperLocked(now)
-	v.sbDirty, v.descDirty, v.resizeDirty = true, true, true
+	v.sbDirty, v.descDirty = true, true
 	// The journal takes its blocks before the root directory does. The file is
 	// new, so the journal area already reads as zeros.
 	if _, err := v.createJournal(false); err != nil {

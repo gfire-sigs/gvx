@@ -43,14 +43,14 @@ func auMetadataSpans(img *auPages, res *auResult) []auSpan {
 	spans := []auSpan{
 		{1024, 1024, "superblock"},
 		{auBlock, auDescSz, "group descriptor"},
-		{65 * auBlock, 512, "block bitmap"},
-		{66 * auBlock, 512, "inode bitmap"},
+		{2 * auBlock, 512, "block bitmap"},
+		{3 * auBlock, 512, "inode bitmap"},
 	}
 	var maxIno uint32
 	for _, e := range res.Tree {
 		maxIno = max(maxIno, e.ino)
 	}
-	spans = append(spans, auSpan{67 * auBlock, int64(maxIno) * auISize, "inode table"})
+	spans = append(spans, auSpan{4 * auBlock, int64(maxIno) * auISize, "inode table"})
 	for blk, owner := range res.Blocks {
 		var e *auEnt
 		for _, x := range res.Tree {

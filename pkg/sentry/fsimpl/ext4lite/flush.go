@@ -28,6 +28,7 @@ package ext4lite
 // directory blocks, and last bitmaps, descriptors, and the superblock.
 
 import (
+	"cmp"
 	"errors"
 	"slices"
 )
@@ -57,7 +58,6 @@ type flushPlan struct {
 	dirs     []blockWrite
 	bitmaps  []blockWrite
 	descs    []blockWrite
-	resize   []blockWrite
 	backups  []blockWrite
 	super    blockWrite
 	hasSuper bool
@@ -72,7 +72,7 @@ type flushPlan struct {
 	// snapshot. Such a transaction needs the file data to be durable first.
 	allocated bool
 	// snapshot of the flags that a failure restores
-	sbDirty, descDirty, resizeDirty, journalInode bool
+	sbDirty, descDirty, journalInode bool
 	// orphanChanged is true when this plan writes a new orphan chain head.
 	orphanChanged bool
 }
@@ -80,13 +80,13 @@ type flushPlan struct {
 // empty reports whether the plan writes nothing.
 func (p *flushPlan) empty() bool {
 	return len(p.leaves) == 0 && len(p.inodes) == 0 && len(p.dirs) == 0 && len(p.bitmaps) == 0 &&
-		len(p.descs) == 0 && len(p.resize) == 0 && len(p.backups) == 0 && !p.hasSuper && len(p.revokes) == 0
+		len(p.descs) == 0 && len(p.backups) == 0 && !p.hasSuper && len(p.revokes) == 0
 }
 
 // blockNumbers returns the numbers of the blocks that the plan writes.
 func (p *flushPlan) blockNumbers() []uint64 {
 	var out []uint64
-	for _, list := range [][]blockWrite{p.leaves, p.dirs, p.resize, p.bitmaps, p.descs, p.backups} {
+	for _, list := range [][]blockWrite{p.leaves, p.dirs, p.bitmaps, p.descs, p.backups} {
 		for _, w := range list {
 			out = append(out, w.blk)
 		}
@@ -114,13 +114,21 @@ func (v *volume) markDirty(n *node) {
 // journal.
 const maxDirtyNodes = 96
 
+// dirtyNodeLimit returns the dirty node threshold for the volume journal.
+func (v *volume) dirtyNodeLimit() int {
+	if v.j != nil && v.j.super.maxlen > journalBlocks {
+		return max(maxDirtyNodes, int(v.j.super.maxlen)/10)
+	}
+	return maxDirtyNodes
+}
+
 // throttle flushes before an operation when too many nodes wait for a flush.
 // The caller holds no lock and has not entered the gate.
 func (v *volume) throttle() error {
 	v.nodeMu.Lock()
 	n := len(v.dirtyNodes)
 	v.nodeMu.Unlock()
-	if n < maxDirtyNodes {
+	if n < v.dirtyNodeLimit() {
 		return nil
 	}
 	return v.sync()
@@ -212,10 +220,10 @@ func (v *volume) snapshotPlan() (*flushPlan, error) {
 	return plan, nil
 }
 
-// snapshotAllocLocked captures the bitmaps, the descriptors, the resize inode,
-// and the superblock. The caller holds v.mu.
+// snapshotAllocLocked captures the bitmaps, the descriptors, and the
+// superblock. The caller holds v.mu.
 func (v *volume) snapshotAllocLocked(p *flushPlan) error {
-	p.sbDirty, p.descDirty, p.resizeDirty = v.sbDirty, v.descDirty, v.resizeDirty
+	p.sbDirty, p.descDirty = v.sbDirty, v.descDirty
 	p.allocated = v.allocSinceSnap
 	v.allocSinceSnap = false
 	p.revokes = v.revokePending
@@ -230,12 +238,6 @@ func (v *volume) snapshotAllocLocked(p *flushPlan) error {
 		p.inodes = append(p.inodes, v.journalInode)
 		p.journalInode = true
 		v.pendingJournalInode = false
-	}
-	if v.resizeDirty {
-		if err := v.buildResizeLocked(p); err != nil {
-			return err
-		}
-		v.resizeDirty = false
 	}
 
 	descBlocksDirty := make(map[uint32]bool)
@@ -275,15 +277,22 @@ func (v *volume) snapshotAllocLocked(p *flushPlan) error {
 		}
 	}
 	for bi := range descBlocksDirty {
-		p.descs = append(p.descs, blockWrite{1 + uint64(bi), v.descBlockLocked(bi)})
+		img := v.descBlockLocked(bi)
+		p.descs = append(p.descs, blockWrite{primaryDescBlock(bi), img})
+		bg := bi * descsPerBlock
+		for _, off := range []uint32{1, descsPerBlock - 1} {
+			if bg+off < uint32(len(v.groups)) {
+				p.backups = append(p.backups, blockWrite{metaDescBlock(bg + off), img})
+			}
+		}
 	}
-	slices.SortFunc(p.descs, func(a, b blockWrite) int { return int(a.blk) - int(b.blk) })
+	slices.SortFunc(p.descs, func(a, b blockWrite) int { return cmp.Compare(a.blk, b.blk) })
 
 	v.fillSuperLocked()
 	var b0 [blockSize]byte
 	copy(b0[superOffset:], v.sb[:])
 	p.super = blockWrite{0, b0[:]}
-	p.hasSuper = v.sbDirty || len(p.bitmaps) > 0 || len(p.descs) > 0 || len(p.resize) > 0
+	p.hasSuper = v.sbDirty || len(p.bitmaps) > 0 || len(p.descs) > 0
 
 	// A new group with a superblock copy gets its copy of the superblock and of
 	// the descriptor blocks. Later flushes leave the copies as they are, as the
@@ -295,12 +304,16 @@ func (v *volume) snapshotAllocLocked(p *flushPlan) error {
 		}
 		g.needsBackup = false
 		p.backupOf = append(p.backupOf, uint32(gi))
-		start := groupStart(uint32(gi))
-		p.backups = append(p.backups, blockWrite{start, v.backupSuperLocked(uint32(gi))})
-		for i := uint32(0); i < descBlocks(uint32(len(v.groups))); i++ {
-			p.backups = append(p.backups, blockWrite{start + 1 + uint64(i), v.descBlockLocked(i)})
+		if hasSuper(uint32(gi)) {
+			start := groupStart(uint32(gi))
+			p.backups = append(p.backups, blockWrite{start, v.backupSuperLocked(uint32(gi))})
+		}
+		if hasMetaDesc(uint32(gi)) && uint32(gi)%descsPerBlock != 0 {
+			p.backups = append(p.backups, blockWrite{metaDescBlock(uint32(gi)), v.descBlockLocked(uint32(gi) / descsPerBlock)})
 		}
 	}
+	slices.SortFunc(p.backups, func(a, b blockWrite) int { return cmp.Compare(a.blk, b.blk) })
+	p.backups = slices.CompactFunc(p.backups, func(a, b blockWrite) bool { return a.blk == b.blk })
 	v.sbDirty, v.descDirty = false, false
 
 	// The transaction holds these blocks, so a free of one of them needs a
@@ -346,11 +359,11 @@ func (v *volume) fillSuperLocked() {
 	blocks := v.blocksCountLocked()
 	v.setSbU32(sbBlocksCountLo, uint32(blocks))
 	v.setSbU32(sbBlocksCountHi, uint32(blocks>>32))
-	v.setSbU32(sbInodesCount, uint32(len(v.groups))*inodesPerGroup)
+	inodeGroups := min(uint32(len(v.groups)), maxInodeGroups)
+	v.setSbU32(sbInodesCount, inodeGroups*inodesPerGroup)
 	v.setSbU32(sbFreeBlocksLo, uint32(v.freeBlocksTotal))
 	v.setSbU32(sbFreeBlocksHi, uint32(v.freeBlocksTotal>>32))
 	v.setSbU32(sbFreeInodes, uint32(v.freeInodesTotal))
-	v.setSbU16(sbReservedGDT, uint16(reservedGDTBlocks(uint32(len(v.groups)))))
 	v.setSbU16(sbState, v.state)
 	v.setSbU32(sbWtime, uint32(v.now().Unix()))
 }
@@ -378,7 +391,6 @@ func (p *flushPlan) blockImages(hf hostFile) ([]blockWrite, error) {
 	add(p.leaves)
 	add(inodeBlocks)
 	add(p.dirs)
-	add(p.resize)
 	add(p.bitmaps)
 	add(p.descs)
 	add(p.backups)
@@ -427,7 +439,7 @@ func (v *volume) writePlanDirect(plan *flushPlan) error {
 	}
 	var nodes, groups []blockWrite
 	nodes = append(append(append(nodes, plan.leaves...), inodeBlocks...), plan.dirs...)
-	groups = append(append(append(append(groups, plan.resize...), plan.bitmaps...), plan.descs...), plan.backups...)
+	groups = append(append(append(groups, plan.bitmaps...), plan.descs...), plan.backups...)
 
 	write := func(list []blockWrite) error {
 		for _, w := range list {
@@ -637,7 +649,6 @@ func (v *volume) restorePlan(p *flushPlan) {
 	}
 	v.sbDirty = v.sbDirty || p.sbDirty
 	v.descDirty = v.descDirty || p.descDirty
-	v.resizeDirty = v.resizeDirty || p.resizeDirty
 	v.allocSinceSnap = v.allocSinceSnap || p.allocated
 	v.revokePending = append(p.revokes, v.revokePending...)
 	if p.journalInode {

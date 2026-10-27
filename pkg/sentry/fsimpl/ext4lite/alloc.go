@@ -71,22 +71,28 @@ func lazyBitmap(p **bitmap) *bitmap {
 }
 
 // newGroup returns the state of a fresh group number idx. Its metadata blocks
-// are in use and every inode is free.
+// are in use and every allocatable inode is free.
 func newGroup(idx uint32) *group {
 	g := &group{}
 	metaBlocks := uint32(groupOverhead(idx)) + 2 + inodeTableBlocks
 	for b := uint32(0); b < metaBlocks; b++ {
 		g.blocks.set(b)
 	}
+	freeIno := inodesOfGroup(idx)
+	if freeIno == 0 {
+		for i := uint32(0); i < inodesPerGroup; i++ {
+			g.inodes.set(i)
+		}
+	}
 	g.desc = groupDesc{
 		blockBitmap: blockBitmapBlock(idx),
 		inodeBitmap: inodeBitmapBlock(idx),
 		inodeTable:  inodeTableStart(idx),
 		freeBlocks:  blocksPerGroup - metaBlocks,
-		freeInodes:  inodesPerGroup,
+		freeInodes:  freeIno,
 	}
 	g.dirty = true
-	g.needsBackup = hasSuper(idx) && idx > 0
+	g.needsBackup = (hasSuper(idx) && idx > 0) || (hasMetaDesc(idx) && idx%descsPerBlock != 0)
 	return g
 }
 
@@ -270,6 +276,9 @@ func (v *volume) allocInode(isDir bool) (uint32, error) {
 		if v.heldInodesTotal > 0 {
 			return 0, errSpaceHeld
 		}
+		if uint32(len(v.groups)) >= maxInodeGroups {
+			return 0, linuxerr.ENOSPC
+		}
 		if err := v.appendGroupLocked(); err != nil {
 			return 0, err
 		}
@@ -337,12 +346,9 @@ func (v *volume) appendGroupLocked() error {
 	g := newGroup(n)
 	v.groups = append(v.groups, g)
 	v.freeBlocksTotal += uint64(g.desc.freeBlocks)
-	v.freeInodesTotal += inodesPerGroup
+	v.freeInodesTotal += uint64(g.desc.freeInodes)
 	v.sbDirty = true
 	v.descDirty = true
-	if hasSuper(n) || descBlocks(n+1) != descBlocks(n) {
-		v.resizeDirty = true
-	}
 	return nil
 }
 
@@ -351,7 +357,7 @@ func (v *volume) appendGroupLocked() error {
 func (v *volume) groupIsEmpty(gi int) bool {
 	g := v.groups[gi]
 	return g.desc.freeBlocks == blocksPerGroup-metaBlocksOf(uint32(gi)) &&
-		g.desc.freeInodes == inodesPerGroup &&
+		g.desc.freeInodes == inodesOfGroup(uint32(gi)) &&
 		g.heldBlockCount == 0 && g.heldInodeCount == 0
 }
 
@@ -366,9 +372,6 @@ func (v *volume) trimGroupsLocked() int {
 		v.freeBlocksTotal -= uint64(g.desc.freeBlocks)
 		v.freeInodesTotal -= uint64(g.desc.freeInodes)
 		v.groups = v.groups[:gi]
-		if hasSuper(uint32(gi)) || descBlocks(uint32(gi+1)) != descBlocks(uint32(gi)) {
-			v.resizeDirty = true
-		}
 		removed++
 	}
 	if removed > 0 {

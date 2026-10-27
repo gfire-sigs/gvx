@@ -15,20 +15,19 @@
 package ext4lite
 
 // A volume is a row of block groups of 4,096 blocks. Group g covers the blocks
-// [g*4096, (g+1)*4096). A group that holds a copy of the superblock starts
-// with that copy and with the descriptor area. Group 0 holds the primary
-// copies. The bitmaps, the inode table, and the data blocks follow.
+// [g*4096, (g+1)*4096). Every meta-group of 64 block groups stores its 4 KiB
+// descriptor block at the start of its first group (with backups in the second
+// and last groups of the meta-group). A group that holds a superblock copy
+// places the superblock at its first block, ahead of any descriptor block.
+// The bitmaps, the inode table, and the data blocks follow.
 //
-//	block 0           superblock (the structure starts at byte 1024)
-//	blocks 1..64      group descriptors, then reserved descriptor blocks
-//	(backup groups carry the same 65 blocks at their start)
-//	+0                block bitmap
+//	+0                block bitmap (after superblock and meta_bg descriptor)
 //	+1                inode bitmap
 //	+2..+257          inode table
-//	+258..+4095       data and directory blocks
+//	+258..+end        data and directory blocks
 //
-// The sparse_super feature limits the copies to group 0, group 1, and the
-// groups that are a power of 3, 5, or 7.
+// The sparse_super feature limits the superblock copies to group 0, group 1,
+// and the groups that are a power of 3, 5, or 7.
 
 // isPowerOf reports whether n is a power of base, with the exponent 1 or more.
 func isPowerOf(n, base uint32) bool {
@@ -46,8 +45,7 @@ func isPowerOf(n, base uint32) bool {
 	}
 }
 
-// hasSuper reports whether group g holds a copy of the superblock and of the
-// descriptor area.
+// hasSuper reports whether group g holds a copy of the superblock.
 func hasSuper(g uint32) bool {
 	if g <= 1 {
 		return true
@@ -58,13 +56,51 @@ func hasSuper(g uint32) bool {
 	return isPowerOf(g, 3) || isPowerOf(g, 5) || isPowerOf(g, 7)
 }
 
-// groupOverhead returns the number of blocks at the start of group g that hold
-// the copy of the superblock and the descriptor area.
-func groupOverhead(g uint32) uint64 {
+// superBlocksOf returns 1 when group g holds a superblock copy, and 0 otherwise.
+func superBlocksOf(g uint32) uint64 {
 	if hasSuper(g) {
-		return headerBlocks
+		return 1
 	}
 	return 0
+}
+
+// hasMetaDesc reports whether group g holds a primary or backup descriptor
+// block of its meta-group.
+func hasMetaDesc(g uint32) bool {
+	rem := g % descsPerBlock
+	return rem == 0 || rem == 1 || rem == descsPerBlock-1
+}
+
+// groupOverhead returns the number of blocks at the start of group g that hold
+// a superblock copy and a meta-group descriptor block.
+func groupOverhead(g uint32) uint64 {
+	ov := superBlocksOf(g)
+	if hasMetaDesc(g) {
+		ov++
+	}
+	return ov
+}
+
+// primaryDescBlock returns the block that holds the primary copy of descriptor
+// block bi.
+func primaryDescBlock(bi uint32) uint64 {
+	bg := bi * descsPerBlock
+	return groupStart(bg) + superBlocksOf(bg)
+}
+
+// metaDescBlock returns the descriptor block inside group g of a meta-group.
+func metaDescBlock(g uint32) uint64 {
+	return groupStart(g) + superBlocksOf(g)
+}
+
+// inodesOfGroup returns the number of allocatable inodes in group g. Groups at
+// or above maxInodeGroups hold data blocks only so that 32-bit inode numbers
+// and s_inodes_count never overflow.
+func inodesOfGroup(g uint32) uint32 {
+	if g >= maxInodeGroups {
+		return 0
+	}
+	return inodesPerGroup
 }
 
 func groupStart(g uint32) uint64 { return uint64(g) * blocksPerGroup }
@@ -79,23 +115,6 @@ func dataStartBlock(g uint32) uint64 { return inodeTableStart(g) + inodeTableBlo
 // descBlocks returns the number of descriptor blocks that groups groups need.
 func descBlocks(groups uint32) uint32 {
 	return (groups + descsPerBlock - 1) / descsPerBlock
-}
-
-// reservedGDTBlocks returns the number of reserved descriptor blocks. The
-// reserved blocks let the volume grow without a move of any data block.
-func reservedGDTBlocks(groups uint32) uint32 {
-	return gdtAreaBlocks - descBlocks(groups)
-}
-
-// backupGroups returns the groups after group 0 that hold a superblock copy.
-func backupGroups(groups uint32) []uint32 {
-	var out []uint32
-	for g := uint32(1); g < groups; g++ {
-		if hasSuper(g) {
-			out = append(out, g)
-		}
-	}
-	return out
 }
 
 // isMetadataBlock reports whether block b belongs to the superblock, the

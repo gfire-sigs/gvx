@@ -550,9 +550,9 @@ func auWriteRawInode(img *auPages, ino uint32, raw []byte) {
 }
 
 // auInodeOffset returns the byte offset of inode ino. The inode table starts at
-// block 67 of the layout that the oracle checks.
+// block 4 of the layout that the oracle checks.
 func auInodeOffset(ino uint32) int64 {
-	return int64(67)*auBlock + int64(ino-1)*auISize
+	return int64(4)*auBlock + int64(ino-1)*auISize
 }
 
 // auAttr is one attribute that an image keeps in the inode.
@@ -965,5 +965,22 @@ func TestReadBeyondTheFileSizeIsEOF(t *testing.T) {
 		if got != 0 || !errors.Is(err, io.EOF) {
 			t.Errorf("read at %d = (%d, %v), want (0, EOF)", off, got, err)
 		}
+	}
+}
+
+// TestClearSUIDAndSGIDOnBlockAndSocketModes verifies that clearSUIDAndSGID
+// strips SUID and executable SGID bits on block device and socket modes while
+// keeping SUID and SGID bits on directory modes.
+func TestClearSUIDAndSGIDOnBlockAndSocketModes(t *testing.T) {
+	for _, kind := range []uint16{modeRegular, modeBlock, modeChar, modeFIFO, modeSocket} {
+		if got, want := clearSUIDAndSGID(kind|0o6555), kind|0o0555; got != want {
+			t.Errorf("clearSUIDAndSGID(%#o) = %#o, want %#o", kind|0o6555, got, want)
+		}
+		if got, want := clearSUIDAndSGID(kind|0o6545), kind|0o2545; got != want {
+			t.Errorf("clearSUIDAndSGID(%#o) = %#o, want %#o", kind|0o6545, got, want)
+		}
+	}
+	if got, want := clearSUIDAndSGID(modeDir|0o6555), uint16(modeDir|0o6555); got != want {
+		t.Errorf("clearSUIDAndSGID(dir) = %#o, want %#o", got, want)
 	}
 }

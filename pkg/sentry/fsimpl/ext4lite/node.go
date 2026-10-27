@@ -82,9 +82,10 @@ type node struct {
 	// leaves lists the extent leaf blocks in order. A tree read from disk may
 	// hold fewer extents in a leaf than a full leaf does.
 	leaves []leafBlock
-	// ixs lists the index blocks of a depth-2 tree in order. Each names a run
-	// of leaves.
+	// ixs lists the index blocks of a tree of depth 2 or more in level order.
 	ixs []indexBlock
+	// ixLevels groups the index blocks by on-disk eh_depth (1..depth-1).
+	ixLevels [][]indexBlock
 	// nblocks counts the blocks that the inode owns: data, leaves, and the
 	// xattr block.
 	nblocks uint64
@@ -290,7 +291,7 @@ func (n *node) destroyLocked() error {
 	n.deleted = true
 	n.orphan = false
 	n.nblocks = 0
-	n.inline, n.exts, n.leaves = nil, nil, nil
+	n.inline, n.exts, n.leaves, n.ixs, n.ixLevels = nil, nil, nil, nil, nil
 	n.dir, n.xa = nil, nil
 	n.markDirtyLocked()
 	return errs
@@ -300,7 +301,7 @@ func (n *node) destroyLocked() error {
 func (v *volume) loadNode(ino uint32) (*node, error) {
 	v.mu.Lock()
 	groups := uint32(len(v.groups))
-	if ino < 1 || ino > groups*inodesPerGroup || ino == resizeIno || (ino < firstIno && ino != rootIno) {
+	if ino < 1 || ino > groups*inodesPerGroup || (ino < firstIno && ino != rootIno) {
 		v.mu.Unlock()
 		return nil, corrupt("inode number %d is not valid", ino)
 	}

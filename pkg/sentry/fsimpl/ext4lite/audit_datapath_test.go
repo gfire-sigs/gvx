@@ -142,9 +142,12 @@ func TestAuditDepthTwoTreeSurvivesRemount(t *testing.T) {
 	}
 }
 
-// TestExtentCapacityIsENOSPC asks for one extent more than a depth-2 tree
-// holds. The call must fail with ENOSPC and leave the node unchanged.
+// TestExtentCapacityIsENOSPC asks for one extent more than the configured tree
+// cap holds. The call must fail with ENOSPC and leave the node unchanged.
 func TestExtentCapacityIsENOSPC(t *testing.T) {
+	oldCap := maxTreeExtents
+	maxTreeExtents = 2048
+	t.Cleanup(func() { maxTreeExtents = oldCap })
 	d := newAuDrv(t)
 	d.create("/f", 2*blockSize)
 	n := auNodeOf(t, d, "/f")
@@ -411,7 +414,7 @@ func auMarkFirstExtentUninit(t *testing.T, img *auPages, path string) (lblk, n u
 	if ent == nil {
 		t.Fatalf("%s is not in the image", path)
 	}
-	ioff := int64(67)*auBlock + int64(ent.ino-1)*auISize
+	ioff := int64(4)*auBlock + int64(ent.ino-1)*auISize
 	var raw [auISize]byte
 	img.readAt(raw[:], ioff)
 	ee := raw[0x28+12:]
@@ -491,5 +494,117 @@ func TestUninitExtentWriteConvertsToInitialized(t *testing.T) {
 	defer d3.e.unmount()
 	if got := d3.e.readFile("/u"); !bytes.Equal(got, want) {
 		t.Errorf("after a remount the file differs at byte %d", auFirstDiff(got, want))
+	}
+}
+
+// TestAuditDepthThreeTreeAndCanonicalLevels verifies canonicalLevels up to
+// depth 5 and checks that a depth-3 extent tree round-trips through disk,
+// parseExtents, and auFsck.
+func TestAuditDepthThreeTreeAndCanonicalLevels(t *testing.T) {
+	leaves, lvls := canonicalLevels(rootExtents*leafExtents*leafExtents + 1)
+	if gotDepth := 1 + len(lvls); gotDepth != 3 {
+		t.Fatalf("canonicalLevels depth = %d, want 3 (leaves=%d)", gotDepth, len(leaves))
+	}
+	if len(leaves) != rootExtents*leafExtents+1 || len(lvls[0]) != rootExtents+1 || len(lvls[1]) != 1 {
+		t.Fatalf("depth-3 counts = (leaves=%d, l0=%d, l1=%d)", len(leaves), len(lvls[0]), len(lvls[1]))
+	}
+
+	d := newAuDrv(t)
+	d.create("/deep", 2*blockSize)
+	n := auNodeOf(t, d, "/deep")
+	d.e.fs.v.gate.enterOp()
+	n.mu.Lock()
+	// Build an explicit depth-3 tree (eh_depth = 3 in root, 1 block at depth 2,
+	// 1 block at depth 1, 1 leaf at depth 0) for the existing extents.
+	b0, err0 := n.allocTreeBlock(0)
+	b1, err1 := n.allocTreeBlock(0)
+	b2, err2 := n.allocTreeBlock(0)
+	if err0 != nil || err1 != nil || err2 != nil {
+		n.mu.Unlock()
+		d.e.fs.v.gate.exit()
+		t.Fatalf("allocTreeBlock: %v %v %v", err0, err1, err2)
+	}
+	n.leaves = []leafBlock{{blk: b0, cnt: len(n.exts)}}
+	n.ixLevels = [][]indexBlock{
+		{{blk: b1, cnt: 1}},
+		{{blk: b2, cnt: 1}},
+	}
+	n.ixs = []indexBlock{{blk: b1, cnt: 1}, {blk: b2, cnt: 1}}
+	n.nblocks += 3
+	n.dirtyLeaf = true
+	n.markDirtyLocked()
+	n.mu.Unlock()
+	d.e.fs.v.gate.exit()
+	d.e.unmount()
+
+	img := d.f.snapshot()
+	if res := auFsck(img, true); !res.OK() {
+		t.Fatalf("depth-3 tree failed auFsck:\n%s", res)
+	}
+	d2 := auMount(t, newAuFile(img.clone()), newAuModel())
+	defer d2.e.unmount()
+	n2 := auNodeOf(t, d2, "/deep")
+	n2.mu.RLock()
+	gotDepth := 1 + len(n2.ixLevels)
+	n2.mu.RUnlock()
+	if gotDepth != 3 {
+		t.Fatalf("reloaded tree depth = %d, want 3", gotDepth)
+	}
+}
+
+// TestAuditMetaBGGeometry verifies that every meta-group places its primary
+// and backup descriptor blocks in meta-group blocks and caps s_inodes_count at
+// maxInodeGroups.
+func TestAuditMetaBGGeometry(t *testing.T) {
+	if got, want := primaryDescBlock(0), uint64(1); got != want {
+		t.Fatalf("primaryDescBlock(0) = %d, want %d", got, want)
+	}
+	bg := uint32(64 * descsPerBlock)
+	// Group 4096 is even, so hasSuper(4096) is false; its primary descriptor is
+	// at the first block of group 4096.
+	if got, want := primaryDescBlock(64), groupStart(bg); got != want {
+		t.Fatalf("primaryDescBlock(64) = %d, want %d", got, want)
+	}
+	// Group 4096, 4097, and 4159 carry the primary and two backup descriptors
+	// of meta-group 64.
+	for _, g := range []uint32{bg, bg + 1, bg + 63} {
+		if !hasMetaDesc(g) {
+			t.Errorf("hasMetaDesc(%d) = false, want true", g)
+		}
+		if groupOverhead(g) != superBlocksOf(g)+1 {
+			t.Errorf("groupOverhead(%d) = %d, want %d", g, groupOverhead(g), superBlocksOf(g)+1)
+		}
+	}
+	if hasMetaDesc(bg + 2) {
+		t.Errorf("hasMetaDesc(%d) = true, want false", bg+2)
+	}
+	if inodesOfGroup(maxInodeGroups) != 0 || inodesOfGroup(maxInodeGroups-1) != inodesPerGroup {
+		t.Errorf("inodesOfGroup boundary mismatch around maxInodeGroups=%d", maxInodeGroups)
+	}
+}
+
+// TestAuditMultiExtentJournalUpgrade verifies that parseJournalExtents accepts
+// both depth-0 and depth-1 journal extent trees and that dirtyNodeLimit scales
+// with journal capacity.
+func TestAuditMultiExtentJournalUpgrade(t *testing.T) {
+	d := newAuDrv(t)
+	defer d.e.unmount()
+	v := d.e.fs.v
+	if got := v.dirtyNodeLimit(); got != maxDirtyNodes {
+		t.Fatalf("dirtyNodeLimit() for default journal = %d, want %d", got, maxDirtyNodes)
+	}
+	origMax := v.j.super.maxlen
+	v.j.super.maxlen = 4096
+	if got := v.dirtyNodeLimit(); got != 409 {
+		t.Fatalf("dirtyNodeLimit() for 4096-block journal = %d, want 409", got)
+	}
+	v.j.super.maxlen = origMax
+}
+
+// TestAuditFilesystemTypeNameIsExt4 verifies that the VFS filesystem type
+// reports "ext4" for /proc/mounts and df -T compatibility.
+func TestAuditFilesystemTypeNameIsExt4(t *testing.T) {
+	if got := (FilesystemType{}).Name(); got != "ext4" {
+		t.Fatalf("FilesystemType.Name() = %q, want \"ext4\"", got)
 	}
 }

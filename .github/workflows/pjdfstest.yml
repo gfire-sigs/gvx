@@ -1,0 +1,241 @@
+name: pjdfstest
+
+# Runs the POSIX filesystem conformance suite (pjdfstest) inside a rungv guest
+# mounted on an ext4lite volume across all five target platforms whenever
+# pkg/sentry/fsimpl/ext4lite changes (on push, pull_request, or manual dispatch).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pkg/sentry/fsimpl/ext4lite/**"
+      - ".github/workflows/pjdfstest.yml"
+  pull_request:
+    paths:
+      - "pkg/sentry/fsimpl/ext4lite/**"
+      - ".github/workflows/pjdfstest.yml"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Run one job family: all, linux, darwin, or windows"
+        type: choice
+        default: all
+        options: [all, linux, darwin, windows]
+
+concurrency:
+  group: pjdfstest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  linux:
+    name: pjdfstest linux/${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux' || inputs.only == 'darwin' || inputs.only == 'windows'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build rungv
+        env:
+          CGO_ENABLED: "0"
+        run: go build -o rungv ./cmd/rungv
+      - name: Build and run pjdfstest inside guest on ext4lite volume
+        if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
+        run: |
+          mkdir -p "$PWD/bundle" "$PWD/cache"
+          ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle" -v pjdfs_vol:/mnt/vol alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache git build-base autoconf automake perl perl-utils openssl bash >/dev/null
+            git clone --depth=1 https://github.com/pjd/pjdfstest.git /mnt/vol/pjdfstest
+            cd /mnt/vol/pjdfstest
+            autoreconf -ifs
+            CFLAGS="-O2 -Wl,-z,max-page-size=65536" ./configure >/dev/null
+            make pjdfstest >/dev/null
+            cp -r /mnt/vol/pjdfstest/* /workspace/
+            sed -i "s/openssl md5 | awk '\''{print \$NF}'\''/md5sum | awk '\''{print \$1}'\''/g" /workspace/tests/misc.sh
+            mkdir -p /mnt/vol/testdir
+            cd /mnt/vol/testdir
+            prove -r /mnt/vol/pjdfstest/tests
+          '
+          e2fsck -fn "$PWD/cache/volumes/pjdfs_vol.ext4"
+      - name: Build pjdfstest bundle for non-Linux runners
+        if: github.event_name == 'workflow_dispatch' && inputs.only != 'all' && inputs.only != 'linux'
+        run: |
+          mkdir -p "$PWD/bundle" "$PWD/cache"
+          ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle" -v pjdfs_vol:/mnt/vol alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache git build-base autoconf automake >/dev/null
+            git clone --depth=1 https://github.com/pjd/pjdfstest.git /mnt/vol/pjdfstest
+            cd /mnt/vol/pjdfstest
+            autoreconf -ifs
+            CFLAGS="-O2 -Wl,-z,max-page-size=65536" ./configure >/dev/null
+            make pjdfstest >/dev/null
+            cp -r /mnt/vol/pjdfstest/* /workspace/
+            sed -i "s/openssl md5 | awk '\''{print \$NF}'\''/md5sum | awk '\''{print \$1}'\''/g" /workspace/tests/misc.sh
+          '
+      - name: Upload guest-built pjdfstest bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-bundle-${{ matrix.arch }}
+          path: bundle/
+
+  darwin-arm64:
+    name: pjdfstest darwin/arm64
+    needs: linux
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Download pjdfstest bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: pjdfstest-bundle-arm64
+          path: bundle
+      - name: Build rungv (16KB pages)
+        run: go build -tags pagesize_16k -o rungv ./cmd/rungv
+      - name: Run pjdfstest on ext4lite volume
+        run: |
+          mkdir -p ./cache
+          "$PWD/scripts/codesign-exec.sh" "$PWD/rungv" run -platform=systrap -cache-dir=./cache -workspace=./bundle -v pjdfs_vol:/mnt/vol alpine:3.20 sh -c '
+            set -e
+            cp -r /workspace /tmp/pjdfstest
+            chmod +x /tmp/pjdfstest/pjdfstest
+            run_suite() {
+              suite="$1"
+              mkdir -p "/mnt/vol/work/$suite"
+              cd "/mnt/vol/work/$suite"
+              for t in /tmp/pjdfstest/tests/"$suite"/*.t; do
+                rc=0
+                out=$(sh "$t") || rc=$?
+                plan=$(printf "%s\n" "$out" | sed -n "s/^1\.\.\([0-9][0-9]*\).*/\1/p" | head -n 1)
+                ok_cnt=$(printf "%s\n" "$out" | grep -cE "^(ok |not ok [0-9]+ # TODO)" || true)
+                bad=$(printf "%s\n" "$out" | grep -E "^not ok" | grep -v "# TODO" || true)
+                if [ "$rc" -ne 0 ] || [ -z "$plan" ] || [ -n "$bad" ] || [ "$ok_cnt" -ne "$plan" ]; then
+                  echo "FAIL: $t (rc=$rc plan=$plan ok=$ok_cnt)"
+                  printf "%s\n" "$bad"
+                  return 1
+                fi
+                echo "PASS: $t ($ok_cnt/$plan)"
+              done
+            }
+            pids=""
+            active=0
+            rc_all=0
+            for d in /tmp/pjdfstest/tests/*; do
+              [ -d "$d" ] || continue
+              s=$(basename "$d")
+              run_suite "$s" &
+              pids="$pids $!"
+              active=$((active + 1))
+              if [ "$active" -ge 4 ]; then
+                for p in $pids; do wait "$p" || rc_all=1; done
+                pids=""
+                active=0
+                [ "$rc_all" -eq 0 ]
+              fi
+            done
+            for p in $pids; do wait "$p" || rc_all=1; done
+            [ "$rc_all" -eq 0 ]
+          '
+
+  windows:
+    name: pjdfstest windows/${{ matrix.arch }}
+    needs: linux
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Download pjdfstest bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: pjdfstest-bundle-${{ matrix.arch }}
+          path: bundle
+      - name: Build rungv
+        shell: bash
+        run: go build -o rungv.exe ./cmd/rungv
+      - name: Run pjdfstest on ext4lite volume
+        shell: bash
+        run: |
+          mkdir -p ./cache
+          ./rungv.exe run -platform=systrap -cache-dir=./cache -workspace=./bundle -v pjdfs_vol:/mnt/vol alpine:3.20 sh -c '
+            set -e
+            cp -r /workspace /tmp/pjdfstest
+            chmod +x /tmp/pjdfstest/pjdfstest
+            run_suite() {
+              suite="$1"
+              mkdir -p "/mnt/vol/work/$suite"
+              cd "/mnt/vol/work/$suite"
+              for t in /tmp/pjdfstest/tests/"$suite"/*.t; do
+                rc=0
+                out=$(sh "$t") || rc=$?
+                plan=$(printf "%s\n" "$out" | sed -n "s/^1\.\.\([0-9][0-9]*\).*/\1/p" | head -n 1)
+                ok_cnt=$(printf "%s\n" "$out" | grep -cE "^(ok |not ok [0-9]+ # TODO)" || true)
+                bad=$(printf "%s\n" "$out" | grep -E "^not ok" | grep -v "# TODO" || true)
+                if [ "$rc" -ne 0 ] || [ -z "$plan" ] || [ -n "$bad" ] || [ "$ok_cnt" -ne "$plan" ]; then
+                  echo "FAIL: $t (rc=$rc plan=$plan ok=$ok_cnt)"
+                  printf "%s\n" "$bad"
+                  return 1
+                fi
+                echo "PASS: $t ($ok_cnt/$plan)"
+              done
+            }
+            pids=""
+            active=0
+            rc_all=0
+            for d in /tmp/pjdfstest/tests/*; do
+              [ -d "$d" ] || continue
+              s=$(basename "$d")
+              run_suite "$s" &
+              pids="$pids $!"
+              active=$((active + 1))
+              if [ "$active" -ge 4 ]; then
+                for p in $pids; do wait "$p" || rc_all=1; done
+                pids=""
+                active=0
+                [ "$rc_all" -eq 0 ]
+              fi
+            done
+            for p in $pids; do wait "$p" || rc_all=1; done
+            [ "$rc_all" -eq 0 ]
+          '

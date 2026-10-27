@@ -149,16 +149,16 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.M
 				bumpC = true
 			}
 			if mask&linux.STATX_MODE != 0 {
-				m := uint32(n.mode&modeTypeMask) | uint32(stat.Mode&0o7777)
+				m := (n.mode & modeTypeMask) | uint16(stat.Mode&0o7777)
 				if clearPrivs {
-					m = vfs.ClearSUIDAndSGID(m)
+					m = clearSUIDAndSGID(m)
 					clearPrivs = false
 				}
-				n.mode = uint16(m)
+				n.mode = m
 				bumpC = true
 			}
 			if clearPrivs {
-				n.mode = uint16(vfs.ClearSUIDAndSGID(uint32(n.mode)))
+				n.mode = clearSUIDAndSGID(n.mode)
 				bumpC = true
 			}
 			if mask&linux.STATX_ATIME != 0 {

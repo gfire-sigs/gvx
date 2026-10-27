@@ -353,7 +353,7 @@ func TestAuditOrphanChainIsWrittenToTheSuperblock(t *testing.T) {
 		}
 		seen[ino] = true
 		var raw [auISize]byte
-		blk, off := uint64(65+2)+uint64((ino-1)/16), int64((ino-1)%16)*auISize
+		blk, off := uint64(4)+uint64((ino-1)/16), int64((ino-1)%16)*auISize
 		replayed.readAt(raw[:], int64(blk)*auBlock+off)
 		if links := auLE.Uint16(raw[0x1A:]); links != 0 {
 			t.Errorf("orphan inode %d has %d links", ino, links)

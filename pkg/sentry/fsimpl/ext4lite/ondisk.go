@@ -30,27 +30,22 @@ const (
 	inodeTableBlocks = inodesPerGroup * inodeSize / blockSize
 	groupBytes       = blocksPerGroup * blockSize
 
-	// gdtAreaBlocks is the number of blocks behind the superblock that hold
-	// the group descriptors and the reserved descriptor blocks. The sum stays
-	// constant: a new descriptor block takes the first reserved block.
-	gdtAreaBlocks = 64
+	// maxVolumeBytes is the size limit of a volume (64 TiB).
+	maxVolumeBytes = 64 << 40
 
-	// maxGroups is the number of descriptors that the descriptor area holds.
-	maxGroups = gdtAreaBlocks * descsPerBlock
+	// maxGroups is the maximum number of block groups in a volume.
+	maxGroups = maxVolumeBytes / groupBytes
 
-	// maxVolumeBytes is the size limit of a volume.
-	maxVolumeBytes = maxGroups * groupBytes
-
-	// headerBlocks is the size of the superblock and the descriptor area.
-	headerBlocks = 1 + gdtAreaBlocks
+	// maxInodeGroups is the maximum number of block groups that can hold
+	// inodes within the 32-bit s_inodes_count superblock field.
+	maxInodeGroups = (1<<32 - 1) / inodesPerGroup
 
 	superOffset = 1024
 	superSize   = 1024
 	superMagic  = 0xEF53
 
-	firstIno  = 11
-	rootIno   = 2
-	resizeIno = 7
+	firstIno = 11
+	rootIno  = 2
 
 	// extraIsize is the size of the extra inode fields. The in-inode xattr
 	// area starts behind them.
@@ -64,10 +59,10 @@ const (
 
 // Feature flags of the profile.
 const (
-	compatExtAttr     = 0x0008
-	compatResizeInode = 0x0010
+	compatExtAttr = 0x0008
 
 	incompatFiletype   = 0x0002
+	incompatMetaBG     = 0x0010
 	incompatExtents    = 0x0040
 	incompat64bit      = 0x0080
 	incompatInlineData = 0x8000
@@ -76,8 +71,8 @@ const (
 	roCompatLargeFile   = 0x0002
 	roCompatExtraIsize  = 0x0040
 
-	featCompat   = compatExtAttr | compatResizeInode
-	featIncompat = incompatFiletype | incompatExtents | incompat64bit | incompatInlineData
+	featCompat   = compatExtAttr
+	featIncompat = incompatFiletype | incompatMetaBG | incompatExtents | incompat64bit | incompatInlineData
 	featRoCompat = roCompatSparseSuper | roCompatLargeFile | roCompatExtraIsize
 )
 
@@ -155,6 +150,7 @@ const (
 	sbDefHashVersion  = 0xFC
 	sbDescSize        = 0xFE
 	sbDefaultMountOpt = 0x100
+	sbFirstMetaBG     = 0x104
 	sbMkfsTime        = 0x108
 	sbBlocksCountHi   = 0x150
 	sbRBlocksCountHi  = 0x154

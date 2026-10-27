@@ -42,7 +42,7 @@ func auFsckImage(t *testing.T) (*auPages, *auResult) {
 
 // auInodeAt returns the byte offset of an inode in group 0.
 func auInodeAt(ino uint32) int64 {
-	return int64(67)*auBlock + int64(ino-1)*auISize
+	return int64(4)*auBlock + int64(ino-1)*auISize
 }
 
 // auMountLegacy mounts the image without a journal upgrade and returns the

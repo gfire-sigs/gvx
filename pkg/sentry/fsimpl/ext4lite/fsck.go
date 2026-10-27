@@ -100,6 +100,7 @@ func (n *node) loadDirTolerantLocked(parent uint32) (repaired bool) {
 			}
 			index[name] = e
 		}
+		blk.idx = int(lb)
 		blocks = append(blocks, blk)
 	}
 	d.blocks, d.index, d.loaded = blocks, index, true
@@ -137,20 +138,13 @@ func (v *volume) fsckLite() error {
 		return nil
 	}
 
-	// The resize inode owns its double indirect block, and the journal inode
-	// owns the journal.
-	blk, off := inodeLocation(resizeIno)
-	var buf [blockSize]byte
-	if _, err := v.hf.ReadAt(buf[:], int64(blk)*blockSize); err != nil {
-		return hostError(err)
-	}
-	dind := uint64(le.Uint32(buf[off+inBlock+inBlockDind*4:]))
-	if dind != 0 && isValidDataBlock(dind, uint64(nGroups)*blocksPerGroup) {
-		if err := claimRuns([]run{{dind, 1}}, resizeIno); err != nil {
-			return err
-		}
-	}
+	// The journal inode owns the journal blocks.
 	if v.j != nil {
+		for _, l := range v.j.leaves {
+			if err := claimRuns([]run{{l, 1}}, journalIno); err != nil {
+				return err
+			}
+		}
 		for _, e := range v.j.extents {
 			if err := claimRuns([]run{{e.pblk, e.n}}, journalIno); err != nil {
 				return err
@@ -340,6 +334,11 @@ func (v *volume) rebuildFromWalk(seen map[uint32]*fsckInode, claimed []bitmap) e
 		}
 		if gi == 0 {
 			for i := uint32(0); i < firstIno-1; i++ {
+				g.inodes.set(i)
+			}
+		}
+		if uint32(gi) >= maxInodeGroups {
+			for i := uint32(0); i < inodesPerGroup; i++ {
 				g.inodes.set(i)
 			}
 		}

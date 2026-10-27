@@ -46,11 +46,14 @@ const (
 	auFlagExtents = 0x80000
 	auFlagInline  = 0x10000000
 
-	// Journal values from the ext4 and JBD2 documentation.
+	// Journal and meta_bg values from the ext4 and JBD2 documentation.
 	auCompatJournal   = 0x4
 	auIncompatRecover = 0x4
+	auIncompatMetaBG  = 0x10
 	auJournalMagic    = 0xC03B3998
 	auJournalBlocks   = 1024
+	auMaxGroups       = 1 << 22
+	auMaxInodeGroups  = (1<<32 - 1) / auIPG
 )
 
 // auEnt is one object that the walk reaches.
@@ -101,10 +104,14 @@ func auHasSuper(g int) bool {
 }
 
 func auOverhead(g int) int {
+	ov := 0
 	if auHasSuper(g) {
-		return 1 + auGDTBlocks
+		ov++
 	}
-	return 0
+	if rem := g % 64; rem == 0 || rem == 1 || rem == 63 {
+		ov++
+	}
+	return ov
 }
 
 type auChecker struct {
@@ -163,9 +170,11 @@ func (c *auChecker) super() bool {
 		"desc_size":        {uint32(auLE.Uint16(sb[0xFE:])), auDescSz},
 		"first_ino":        {auLE.Uint32(sb[0x54:]), auFirstIno},
 		"first_data_blk":   {auLE.Uint32(sb[0x14:]), 0},
-		"feature_compat":   {auLE.Uint32(sb[0x5C:]) &^ auCompatJournal, 0x18},
-		"feature_incompat": {auLE.Uint32(sb[0x60:]) &^ auIncompatRecover, 0x80C2},
+		"feature_compat":   {auLE.Uint32(sb[0x5C:]) &^ auCompatJournal, 0x08},
+		"feature_incompat": {auLE.Uint32(sb[0x60:]) &^ auIncompatRecover, 0x80D2},
 		"feature_ro":       {auLE.Uint32(sb[0x64:]), 0x43},
+		"first_meta_bg":    {auLE.Uint32(sb[0x104:]), 0},
+		"reserved_gdt":     {uint32(auLE.Uint16(sb[0xCE:])), 0},
 	}
 	for name, v := range want {
 		if v[0] != v[1] {
@@ -173,21 +182,16 @@ func (c *auChecker) super() bool {
 		}
 	}
 	blocks := uint64(auLE.Uint32(sb[0x04:])) | uint64(auLE.Uint32(sb[0x150:]))<<32
-	if blocks == 0 || blocks%auBPG != 0 || blocks/auBPG > 4096 {
+	if blocks == 0 || blocks%auBPG != 0 || blocks/auBPG > auMaxGroups {
 		r.problemf("blocks_count %d", blocks)
 		return false
 	}
 	c.blocks = blocks
 	c.groups = int(blocks / auBPG)
 	r.Groups = c.groups
-	if got := auLE.Uint32(sb[0x00:]); got != uint32(c.groups*auIPG) {
-		r.problemf("inodes_count %d, want %d", got, c.groups*auIPG)
-	}
-	// The group descriptor area keeps 64 blocks. descBlocks of them hold
-	// descriptors and the rest are reserved for growth.
-	descBlocks := (c.groups + 63) / 64
-	if got := int(auLE.Uint16(sb[0xCE:])); got != auGDTBlocks-descBlocks {
-		r.problemf("reserved_gdt_blocks %d, want %d", got, auGDTBlocks-descBlocks)
+	inodeGroups := min(c.groups, auMaxInodeGroups)
+	if got := auLE.Uint32(sb[0x00:]); got != uint32(inodeGroups*auIPG) {
+		r.problemf("inodes_count %d, want %d", got, inodeGroups*auIPG)
 	}
 	if c.img.size < int64(blocks)*auBlock {
 		r.problemf("host file has %d bytes, the volume has %d", c.img.size, int64(blocks)*auBlock)
@@ -202,7 +206,13 @@ func (c *auChecker) super() bool {
 }
 
 func (c *auChecker) desc(g int) []byte {
-	return c.read(uint64(1+g/64), (g%64)*auDescSz, auDescSz)
+	bi := g / 64
+	bg := bi * 64
+	blk := uint64(bg * auBPG)
+	if auHasSuper(bg) {
+		blk++
+	}
+	return c.read(blk, (g%64)*auDescSz, auDescSz)
 }
 
 func (c *auChecker) bitmapBlocks(g int) (bb, ib, it uint64) {
@@ -238,15 +248,6 @@ func (c *auChecker) checkReserved() {
 		}
 		if got != [3]uint64{bb, ib, it} {
 			c.res.problemf("group %d descriptor places bitmaps and table at %v, want %v", g, got, [3]uint64{bb, ib, it})
-		}
-	}
-	// The resize inode owns its double indirect block.
-	raw := c.inodeRaw(7)
-	if dind := uint64(auLE.Uint32(raw[0x28+13*4:])); dind != 0 {
-		if !c.validData(dind) {
-			c.res.problemf("resize inode names block %d", dind)
-		} else {
-			c.claim[dind] = 7
 		}
 	}
 	c.checkJournal()
@@ -329,33 +330,36 @@ func (c *auChecker) parseExtents(ino uint32, root []byte) (exts []auExtent, leav
 		}
 		leafExts(lb, ln, lmax)
 	}
-	switch depth {
-	case 0:
+	switch {
+	case depth == 0:
 		leafExts(root, entries, max)
-	case 1:
-		for i := range entries {
-			addLeaf(indexEntry(root, i))
-		}
-	case 2:
-		for i := range entries {
-			ib := indexEntry(root, i)
-			if !c.validData(ib) {
-				r.problemf("inode %d: index entry names block %d", ino, ib)
-				continue
+	case depth >= 1 && depth <= 5:
+		var walk func(blk uint64, d int)
+		walk = func(blk uint64, d int) {
+			if d == 0 {
+				addLeaf(blk)
+				return
 			}
-			leaves = append(leaves, ib)
-			idx := c.read(ib, 0, auBlock)
+			if !c.validData(blk) {
+				r.problemf("inode %d: index entry names block %d", ino, blk)
+				return
+			}
+			leaves = append(leaves, blk)
+			idx := c.read(blk, 0, auBlock)
 			cnt, imax, idepth, ok := hdr(idx)
 			if !ok {
-				continue
+				return
 			}
-			if idepth != 1 || imax != 340 || cnt < 1 || cnt > imax {
-				r.problemf("inode %d: index block %d has depth %d, %d of %d entries", ino, ib, idepth, cnt, imax)
-				continue
+			if idepth != d || imax != 340 || cnt < 1 || cnt > imax {
+				r.problemf("inode %d: index block %d has depth %d, %d of %d entries", ino, blk, idepth, cnt, imax)
+				return
 			}
 			for j := range cnt {
-				addLeaf(indexEntry(idx, j))
+				walk(indexEntry(idx, j), d-1)
 			}
+		}
+		for i := range entries {
+			walk(indexEntry(root, i), depth-1)
 		}
 	default:
 		r.problemf("inode %d: extent depth %d", ino, depth)
@@ -727,22 +731,29 @@ func (c *auChecker) bitmaps() {
 	}
 	// Every superblock copy and descriptor copy must match the primary.
 	for g := 1; g < c.groups; g++ {
-		if !auHasSuper(g) {
-			continue
+		if auHasSuper(g) {
+			start := uint64(g * auBPG)
+			if auLE.Uint16(c.read(start, 0x38, 2)) != auSuperMagic {
+				r.problemf("group %d: the superblock copy has no magic at byte 0x38 of its first block", g)
+			} else if got := auLE.Uint16(c.read(start, 0x5A, 2)); int(got) != g {
+				r.problemf("group %d: the superblock copy names group %d", g, got)
+			}
 		}
-		start := uint64(g * auBPG)
-		if auLE.Uint16(c.read(start, 0x38, 2)) != auSuperMagic {
-			r.problemf("group %d: the superblock copy has no magic at byte 0x38 of its first block", g)
-		} else if got := auLE.Uint16(c.read(start, 0x5A, 2)); int(got) != g {
-			r.problemf("group %d: the superblock copy names group %d", g, got)
-		}
-		// The kernel leaves the copies as they are after a mkfs or a resize.
-		// The counters in them go stale, so only the locations must match.
-		for i := 1; i <= (c.groups+63)/64; i++ {
-			pri, bak := c.read(uint64(i), 0, auBlock), c.read(start+uint64(i), 0, auBlock)
-			for d := 0; d < 64 && (i-1)*64+d < c.groups; d++ {
+		if rem := g % 64; rem == 1 || rem == 63 {
+			bi := g / 64
+			bg := bi * 64
+			priBlk := uint64(bg * auBPG)
+			if auHasSuper(bg) {
+				priBlk++
+			}
+			bakBlk := uint64(g * auBPG)
+			if auHasSuper(g) {
+				bakBlk++
+			}
+			pri, bak := c.read(priBlk, 0, auBlock), c.read(bakBlk, 0, auBlock)
+			for d := 0; d < 64 && bi*64+d < c.groups; d++ {
 				if !slices.Equal(pri[d*auDescSz:d*auDescSz+0x0C], bak[d*auDescSz:d*auDescSz+0x0C]) {
-					r.problemf("group %d: descriptor %d of the copy places the group metadata elsewhere", g, (i-1)*64+d)
+					r.problemf("group %d: descriptor %d of the copy places the group metadata elsewhere", g, bi*64+d)
 				}
 			}
 		}

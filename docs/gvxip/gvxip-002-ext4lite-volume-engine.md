@@ -57,16 +57,13 @@ Pre-creating a 64 GiB sparse volume file via `ftruncate(fd, 64<<30)` fails acros
 
 ```text
 +-----------------------------------------------------------------------+
-| Fixed Volume Header (Blocks 0..64, 260 KiB total)                     |
+| Block Group 0 (Blocks 0..4095, 16 MiB = 4,096 x 4 KiB blocks)         |
 | - Block 0 (4 KiB):      1024B zero pad + ext4_super_block (1024B)     |
-| - Blocks 1..64 (256 KiB): Pre-reserved Group Descriptor Table (GDT)   |
-|                           (4,096 x 64-byte descriptors = 64 GiB max)  |
-+-----------------------------------------------------------------------+
-| Block Group 0 (Blocks 65..4160, 16 MiB = 4,096 x 4 KiB blocks)        |
-| - Block +0 (4 KiB):     Block Allocation Bitmap (4,096 bits = 512B)   |
-| - Block +1 (4 KiB):     Inode Allocation Bitmap (4,096 bits = 512B)   |
-| - Blocks +2..+257:      Inode Table (4,096 x 256B = 1 MiB)            |
-| - Blocks +258..+4095:   Data and Directory Blocks (3,838 blocks)      |
+| - Block 1 (4 KiB):      Meta-group 0 descriptor block (groups 0..63)  |
+| - Block 2 (4 KiB):      Block Allocation Bitmap (4,096 bits = 512B)   |
+| - Block 3 (4 KiB):      Inode Allocation Bitmap (4,096 bits = 512B)   |
+| - Blocks 4..259:        Inode Table (4,096 x 256B = 1 MiB)            |
+| - Blocks 260..4095:     Data and Directory Blocks (3,836 blocks)      |
 +-----------------------------------------------------------------------+
 | Block Group 1..N (16 MiB each, appended on demand at physical EOF)    |
 +-----------------------------------------------------------------------+
@@ -76,9 +73,9 @@ Pre-creating a 64 GiB sparse volume file via `ftruncate(fd, 64<<30)` fails acros
 | :--- | :--- | ---: | :--- |
 | **Block Size** | `1024 << s_log_block_size` | `4,096 B` | Matches 4 KiB guest and host page size |
 | **Blocks per Group** | `s_blocks_per_group` | `4,096` (`16 MiB`) | Legal `ext4` multiple of 8 (`mkfs.ext4 -b 4096 -g 4096`); bounds physical growth step |
-| **Inodes per Group** | `s_inodes_per_group` | `4,096` | Provides `1` inode per `4 KiB` of group space; prevents inode exhaustion on small-file trees |
+| **Inodes per Group** | `s_inodes_per_group` | `4,096` | Provides `1` inode per `4 KiB` of group space up to `maxInodeGroups` (`4.29B` inodes) |
 | **Inode Size** | `s_inode_size` | `256 B` | Holds `60 B` `i_block` plus `96 B` inline `xattr` area (`68 B` max `system.data` payload) |
-| **Reserved GDT Blocks** | `Blocks 1..64` | `64 blocks` (`256 KiB`) | Pre-allocates descriptor slots for `4,096` groups (`64 GiB`) so appending a group never moves data blocks |
+| **Meta-Group Descriptors (`meta_bg`)** | `s_first_meta_bg = 0` | `1 block` per `64` groups | Places each 64-group descriptor block at the start of its meta-group (`bg`, with backups in `bg+1` and `bg+63`) up to `64 TiB` without moving data blocks |
 
 ### 2.2 Platform Storage Contingency Matrix
 
@@ -86,9 +83,9 @@ When opening or creating the backing `.ext4` file before `hostlockdown.Apply()`,
 
 | Contingency Tier | Host Environment | Group Append Mechanism (`+16 MiB`) | Space Reclamation Mechanism (`-16 MiB`) | `StatFS` Free Space Formula |
 | :--- | :--- | :--- | :--- | :--- |
-| **Tier A: Native Prealloc** | Linux (`ext4`, `xfs`, `btrfs`), macOS (`APFS`) | `unix.Fallocate(fd, 0, off, 16<<20)` or `fcntl(F_PREALLOCATE)` plus `ftruncate` | First-fit block reuse; tail compaction on `Close()` followed by `unix.Ftruncate` | `min(64 GiB - usedBytes, hostAvailBytes)` |
-| **Tier B: Windows Dense** | Windows (`NTFS`, `ReFS`) | Non-sparse file extended via `SetFileInformationByHandle(FileAllocationInfo)` in `16 MiB` chunks | First-fit block reuse; tail compaction on `Close()` followed by `SetEndOfFile` | `min(64 GiB - usedBytes, hostAvailBytes)` |
-| **Tier C: Universal Fallback** | `exFAT`, `FAT32`, `HFS+`, SMB, NFS (when prealloc returns `EOPNOTSUPP` or `EINVAL`) | Extend via `ftruncate` in `4 MiB` steps up to `highWaterBlock * 4096` | First-fit block reuse; tail `ftruncate` when trailing groups empty | `min(64 GiB - usedBytes, hostAvailBytes)` |
+| **Tier A: Native Prealloc** | Linux (`ext4`, `xfs`, `btrfs`), macOS (`APFS`) | `unix.Fallocate(fd, 0, off, 16<<20)` or `fcntl(F_PREALLOCATE)` plus `ftruncate` | First-fit block reuse; tail compaction on `Close()` followed by `unix.Ftruncate` | `min(64 TiB - usedBytes, hostAvailBytes)` |
+| **Tier B: Windows Dense** | Windows (`NTFS`, `ReFS`) | Non-sparse file extended via `SetFileInformationByHandle(FileAllocationInfo)` in `16 MiB` chunks | First-fit block reuse; tail compaction on `Close()` followed by `SetEndOfFile` | `min(64 TiB - usedBytes, hostAvailBytes)` |
+| **Tier C: Universal Fallback** | `exFAT`, `FAT32`, `HFS+`, SMB, NFS (when prealloc returns `EOPNOTSUPP` or `EINVAL`) | Extend via `ftruncate` in `4 MiB` steps up to `highWaterBlock * 4096` | First-fit block reuse; tail `ftruncate` when trailing groups empty | `min(64 TiB - usedBytes, hostAvailBytes)` |
 
 ---
 
@@ -98,8 +95,8 @@ Every unmounted or synced `ext4lite` image is a valid little-endian Linux `ext4`
 
 | Feature Set Field | Offset in `ext4_super_block` | Bitmask Value | Enabled Flags and Rationale |
 | :--- | ---: | ---: | :--- |
-| `s_feature_compat` | `0x5C` | `0x0000001C` | `COMPAT_EXT_ATTR` (`0x08`), `COMPAT_RESIZE_INODE` (`0x10`), and `COMPAT_HAS_JOURNAL` (`0x04`); `COMPAT_DIR_INDEX` (`0x20`) cleared. A volume of an older release lacks `COMPAT_HAS_JOURNAL` until the first writable mount adds a journal. |
-| `s_feature_incompat` | `0x60` | `0x000080C2` | `INCOMPAT_FILETYPE` (`0x02`), `INCOMPAT_EXTENTS` (`0x40`), `INCOMPAT_64BIT` (`0x80`), `INCOMPAT_INLINE_DATA` (`0x8000`). `INCOMPAT_RECOVER` (`0x04`) is set while the log is in use. |
+| `s_feature_compat` | `0x5C` | `0x0000000C` | `COMPAT_EXT_ATTR` (`0x08`) and `COMPAT_HAS_JOURNAL` (`0x04`); `COMPAT_DIR_INDEX` (`0x20`) cleared. A volume without a journal lacks `COMPAT_HAS_JOURNAL` until the first writable mount adds one. |
+| `s_feature_incompat` | `0x60` | `0x000080D2` | `INCOMPAT_FILETYPE` (`0x02`), `INCOMPAT_META_BG` (`0x10`, `s_first_meta_bg = 0`), `INCOMPAT_EXTENTS` (`0x40`), `INCOMPAT_64BIT` (`0x80`), `INCOMPAT_INLINE_DATA` (`0x8000`). `INCOMPAT_RECOVER` (`0x04`) is set while the log is in use. |
 | `s_feature_ro_compat` | `0x64` | `0x00000043` | `RO_COMPAT_SPARSE_SUPER` (`0x01`), `RO_COMPAT_LARGE_FILE` (`0x02`), `RO_COMPAT_EXTRA_ISIZE` (`0x40`) |
 
 ### 3.1 Inode, Inline Data, and Extent Layout
@@ -120,7 +117,7 @@ Each `256-byte` `ext4_inode` stores file metadata, inline small-file content up 
 | Regular file `61..128 B` | `EXT4_INLINE_DATA_FL` (`0x10000000`) | `i_block[0..59]` plus `system.data` inline xattr (`0xA0..0xFF`) | `0` |
 | Regular file or directory `<= 4` extents (up to `512 MiB` contiguous) | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `ext4_extent_header` (`eh_depth == 0`) + up to 4 `ext4_extent` structs in `i_block` | `ceil(size / 4096)` |
 | Regular file `> 4` extents | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `ext4_extent_header` (`eh_depth == 1`) + up to 4 `ext4_extent_idx` pointers to 4 KiB leaf extent blocks (up to `340` extents per leaf) | `ceil(size / 4096) + leafBlocks` |
-| Regular file `> 1360` extents | `EXT4_EXTENTS_FL` (`0x00080000`) | Root `eh_depth == 2`, up to 4 index blocks of `340` entries, each entry naming a leaf (up to `462,400` extents) | `ceil(size / 4096) + indexBlocks + leafBlocks` |
+| Regular file `> 1360` extents | `EXT4_EXTENTS_FL` (`0x00080000`) | Generalized extent tree (`eh_depth 2..5`, `EXT4_MAX_EXTENT_DEPTH = 5`), with `340` entries per 4 KiB index or leaf block up to `maxLogicalBlock` | `ceil(size / 4096) + indexBlocks + leafBlocks` |
 
 ### 3.2 Untrusted Image Validation Invariants
 
@@ -128,7 +125,7 @@ Because a backing `.ext4` file resides on the host disk and can be modified offl
 
 | Validation Boundary | Enforced Invariant | Prevented Attack Class |
 | :--- | :--- | :--- |
-| **Extent Physical Block Range** (`isValidDataBlock`) | Every physical block `b` in an `ext4_extent` must satisfy `65 <= b < s_blocks_count` and `(b - 65) % 4096 >= 258`. | Prevents a crafted file extent from pointing at the Superblock (`Block 0`), GDT (`Blocks 1..64`), bitmaps, or inode tables (metadata overwrite via data write). |
+| **Extent Physical Block Range** (`isValidDataBlock`) | Every physical block `b` in an `ext4_extent` must satisfy `b < s_blocks_count` and `(b % 4096) >= groupOverhead(b / 4096) + 258`. | Prevents a crafted file extent from pointing at the Superblock (`Block 0`), `meta_bg` descriptors, bitmaps, or inode tables (metadata overwrite via data write). |
 | **Directory Entry Stepping** (`ext4_dir_entry_2.rec_len`) | Every directory record must satisfy `rec_len >= 8`, `rec_len % 4 == 0`, and `offset + int(rec_len) <= 4096`. | Prevents infinite CPU loops (`rec_len == 0`) and out-of-bounds slice reads during `getdents64` and `lookup`. |
 | **Reachability Graph Walk** (`fsckLite`) | `fsckLite` tracks a `visitedInodes` bitmap and a `claimedBlocks` bitmap across the walk from root inode `#2`. | Rejects cyclic directory links (preventing stack overflow) and cross-linked extents where two inodes claim the same physical data block. |
 | **In-Memory Cache Eviction & Xattr Cap** | Per-inode `xattr` payloads are capped at `4 KiB`, and unreferenced `dentry` nodes are evicted when `vfs.Dentry` refcounts hit zero. | Prevents a guest from exhausting Sentry Go heap memory via unbounded metadata creation. |

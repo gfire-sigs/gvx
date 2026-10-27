@@ -124,10 +124,7 @@ func (v *volume) compactTarget() uint32 {
 	var used uint64
 	for gi := n - 1; gi >= 1; gi-- {
 		g := v.groups[gi]
-		if g.desc.freeInodes != inodesPerGroup || g.heldBlockCount != 0 {
-			break
-		}
-		if v.resizeDind/blocksPerGroup == uint64(gi) {
+		if g.desc.freeInodes != inodesOfGroup(gi) || g.heldBlockCount != 0 {
 			break
 		}
 		used += uint64(blocksPerGroup - metaBlocksOf(gi) - g.desc.freeBlocks)

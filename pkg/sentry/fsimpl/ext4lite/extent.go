@@ -23,16 +23,17 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
 
-// The extent tree of an inode lives in i_block and in up to two levels of
-// blocks below it. The root holds up to four entries. With four extents or
-// fewer, the root holds the extents (depth 0). With more, each leaf block holds
-// up to 340 extents, and the root names up to four leaves (depth 1). With more
-// than four leaves, the root names up to four index blocks, and each index block
-// names up to 340 leaves (depth 2). A file has at most 462,400 extents.
+// The extent tree of an inode lives in i_block and in up to five levels of
+// blocks below it (eh_depth 0..5). The root holds up to four entries. With four
+// extents or fewer, the root holds the extents (depth 0). With more, each leaf
+// block holds up to 340 extents, and intermediate index levels each hold up to
+// 340 child pointers per block until the top level fits inside the four root
+// slots.
 //
-// The engine writes a canonical tree: every leaf is full except the last one.
-// A tree read from disk keeps its leaf counts until an extent changes, so that
-// a flush without a change writes the same tree that it read.
+// The engine writes a canonical tree: every leaf and index block is full except
+// the last one of its level. A tree read from disk keeps its counts until an
+// extent changes, so that a flush without a change writes the same tree that it
+// read.
 
 const (
 	// uninitExtentOffset is added to the length of an uninitialized extent to
@@ -41,9 +42,12 @@ const (
 	// maxUninitExtentLen is the longest uninitialized extent. Its ee_len value
 	// must stay within 16 bits, so the length is at most 32767 blocks.
 	maxUninitExtentLen = maxExtentLen - 1
-	// maxTreeExtents is the most extents of a depth-2 tree.
-	maxTreeExtents = rootExtents * leafExtents * leafExtents
+	// maxExtentDepth is the maximum eh_depth of an extent tree in Linux ext4.
+	maxExtentDepth = 5
 )
+
+// maxTreeExtents is the maximum number of extents that an inode can hold.
+var maxTreeExtents = int(maxLogicalBlock)
 
 // leafBlock is one extent leaf block. cnt is the number of extents it holds.
 type leafBlock struct {
@@ -51,8 +55,8 @@ type leafBlock struct {
 	cnt int
 }
 
-// indexBlock is one index block of a depth-2 tree. cnt is the number of leaves
-// that it names.
+// indexBlock is one index block of an extent tree. cnt is the number of child
+// blocks of the level below it that it names.
 type indexBlock struct {
 	blk uint64
 	cnt int
@@ -118,50 +122,52 @@ func (n *node) parseExtents(raw []byte) error {
 		return corrupt("inode %d extent root has %d of %d entries", n.ino, entries, max)
 	}
 	var (
-		list   []extent
-		leaves []leafBlock
-		ixs    []indexBlock
-		idxBuf [blockSize]byte
-		leaf   [blockSize]byte
+		list     []extent
+		leaves   []leafBlock
+		ixs      []indexBlock
+		ixLevels [][]indexBlock
 	)
-	switch depth {
-	case 0:
+	switch {
+	case depth == 0:
 		for i := range entries {
 			list = append(list, decodeExtent(root[extHeaderSize+i*extEntrySize:]))
 		}
-	case 1:
+	case depth >= 1 && depth <= maxExtentDepth:
 		if entries == 0 {
-			return corrupt("inode %d extent root names no leaf", n.ino)
+			return corrupt("inode %d extent root names no child block", n.ino)
 		}
-		for i := range entries {
-			_, blk := decodeExtentIdx(root[extHeaderSize+i*extEntrySize:])
-			cnt, err := n.readTreeBlock(blk, 0, leaf[:])
+		if depth >= 2 {
+			ixLevels = make([][]indexBlock, depth-1)
+		}
+		var walk func(blk uint64, d int) error
+		walk = func(blk uint64, d int) error {
+			var buf [blockSize]byte
+			cnt, err := n.readTreeBlock(blk, uint16(d), buf[:])
 			if err != nil {
 				return err
 			}
-			list = appendLeafExtents(list, leaf[:], cnt)
-			leaves = append(leaves, leafBlock{blk: blk, cnt: cnt})
-		}
-	case 2:
-		if entries == 0 {
-			return corrupt("inode %d extent root names no index block", n.ino)
-		}
-		for i := range entries {
-			_, blk := decodeExtentIdx(root[extHeaderSize+i*extEntrySize:])
-			cnt, err := n.readTreeBlock(blk, 1, idxBuf[:])
-			if err != nil {
-				return err
+			if d == 0 {
+				list = appendLeafExtents(list, buf[:], cnt)
+				leaves = append(leaves, leafBlock{blk: blk, cnt: cnt})
+				return nil
 			}
-			ixs = append(ixs, indexBlock{blk: blk, cnt: cnt})
+			ixLevels[d-1] = append(ixLevels[d-1], indexBlock{blk: blk, cnt: cnt})
 			for j := range cnt {
-				_, lb := decodeExtentIdx(idxBuf[extHeaderSize+j*extEntrySize:])
-				lcnt, err := n.readTreeBlock(lb, 0, leaf[:])
-				if err != nil {
+				_, child := decodeExtentIdx(buf[extHeaderSize+j*extEntrySize:])
+				if err := walk(child, d-1); err != nil {
 					return err
 				}
-				list = appendLeafExtents(list, leaf[:], lcnt)
-				leaves = append(leaves, leafBlock{blk: lb, cnt: lcnt})
 			}
+			return nil
+		}
+		for i := range entries {
+			_, blk := decodeExtentIdx(root[extHeaderSize+i*extEntrySize:])
+			if err := walk(blk, depth-1); err != nil {
+				return err
+			}
+		}
+		for _, lvl := range ixLevels {
+			ixs = append(ixs, lvl...)
 		}
 	default:
 		return corrupt("inode %d extent tree has depth %d", n.ino, depth)
@@ -172,7 +178,7 @@ func (n *node) parseExtents(raw []byte) error {
 	if err := n.checkTreeBlocks(list, leaves, ixs); err != nil {
 		return err
 	}
-	n.exts, n.leaves, n.ixs = list, leaves, ixs
+	n.exts, n.leaves, n.ixs, n.ixLevels = list, leaves, ixs, ixLevels
 	n.nblocks = uint64(len(leaves) + len(ixs))
 	for _, e := range list {
 		n.nblocks += uint64(e.n)
@@ -250,16 +256,20 @@ func (n *node) serializeExtents(dst []byte) {
 		for i, e := range n.exts {
 			encodeExtent(dst[extHeaderSize+i*extEntrySize:], e)
 		}
-	case len(n.ixs) == 0:
+	case len(n.ixLevels) == 0:
 		firsts := n.leafFirsts()
 		encodeExtentHeader(dst, len(n.leaves), rootExtents, 1)
 		for i, l := range n.leaves {
 			encodeExtentIdx(dst[extHeaderSize+i*extEntrySize:], firsts[i], l.blk)
 		}
 	default:
-		firsts := n.indexFirsts()
-		encodeExtentHeader(dst, len(n.ixs), rootExtents, 2)
-		for j, x := range n.ixs {
+		firsts := n.leafFirsts()
+		for _, lvl := range n.ixLevels {
+			firsts = levelFirsts(firsts, lvl)
+		}
+		top := n.ixLevels[len(n.ixLevels)-1]
+		encodeExtentHeader(dst, len(top), rootExtents, 1+len(n.ixLevels))
+		for j, x := range top {
 			encodeExtentIdx(dst[extHeaderSize+j*extEntrySize:], firsts[j], x.blk)
 		}
 	}
@@ -277,46 +287,53 @@ func (n *node) leafFirsts() []uint32 {
 	return out
 }
 
-// indexFirsts returns the first file block that each index block of a depth-2
-// tree names.
-func (n *node) indexFirsts() []uint32 {
-	leafFirst := n.leafFirsts()
-	out := make([]uint32, len(n.ixs))
-	leaf := 0
-	for j, x := range n.ixs {
-		out[j] = leafFirst[leaf]
-		leaf += x.cnt
+// levelFirsts returns the first file block that each index block of lvl names,
+// given the first file blocks of the child level below it.
+func levelFirsts(childFirsts []uint32, lvl []indexBlock) []uint32 {
+	out := make([]uint32, len(lvl))
+	child := 0
+	for j, x := range lvl {
+		out[j] = childFirsts[child]
+		child += x.cnt
 	}
 	return out
 }
 
-// leafImagesLocked returns the images of every tree block: the leaves, and the
-// index blocks of a depth-2 tree.
+// leafImagesLocked returns the images of every tree block: the leaves and all
+// index levels above them.
 func (n *node) leafImagesLocked() []blockWrite {
 	var out []blockWrite
 	ext := 0
-	for _, l := range n.leaves {
+	childBlks := make([]uint64, len(n.leaves))
+	for i, l := range n.leaves {
 		buf := make([]byte, blockSize)
 		encodeExtentHeader(buf, l.cnt, leafExtents, 0)
 		for j, e := range n.exts[ext : ext+l.cnt] {
 			encodeExtent(buf[extHeaderSize+j*extEntrySize:], e)
 		}
 		ext += l.cnt
+		childBlks[i] = l.blk
 		out = append(out, blockWrite{l.blk, buf})
 	}
-	if len(n.ixs) == 0 {
+	if len(n.ixLevels) == 0 {
 		return out
 	}
-	firsts := n.leafFirsts()
-	leaf := 0
-	for _, x := range n.ixs {
-		buf := make([]byte, blockSize)
-		encodeExtentHeader(buf, x.cnt, leafExtents, 1)
-		for j := range x.cnt {
-			encodeExtentIdx(buf[extHeaderSize+j*extEntrySize:], firsts[leaf+j], n.leaves[leaf+j].blk)
+	childFirsts := n.leafFirsts()
+	for d, lvl := range n.ixLevels {
+		nextBlks := make([]uint64, len(lvl))
+		k := 0
+		for i, x := range lvl {
+			buf := make([]byte, blockSize)
+			encodeExtentHeader(buf, x.cnt, leafExtents, d+1)
+			for j := range x.cnt {
+				encodeExtentIdx(buf[extHeaderSize+j*extEntrySize:], childFirsts[k+j], childBlks[k+j])
+			}
+			k += x.cnt
+			nextBlks[i] = x.blk
+			out = append(out, blockWrite{x.blk, buf})
 		}
-		leaf += x.cnt
-		out = append(out, blockWrite{x.blk, buf})
+		childFirsts = levelFirsts(childFirsts, lvl)
+		childBlks = nextBlks
 	}
 	return out
 }
@@ -334,18 +351,21 @@ func (n *node) treeBlocksLocked() []uint64 {
 	return out
 }
 
-// canonicalShape returns the extent counts of the leaves and the leaf counts of
-// the index blocks of the canonical tree for n extents. Depth 0 has neither,
-// depth 1 has leaves only, and depth 2 has both.
-func canonicalShape(n int) (leaves, ixs []int) {
+// canonicalLevels returns the extent counts of the leaves and the child counts
+// of each index level for n extents. Depth 0 has neither, depth 1 has leaves
+// only, and depth D >= 2 has D-1 index levels.
+func canonicalLevels(n int) (leaves []int, ixLevels [][]int) {
 	if n <= rootExtents {
 		return nil, nil
 	}
 	leaves = fullPacks(n, leafExtents)
-	if len(leaves) > rootExtents {
-		ixs = fullPacks(len(leaves), leafExtents)
+	cur := leaves
+	for len(cur) > rootExtents {
+		next := fullPacks(len(cur), leafExtents)
+		ixLevels = append(ixLevels, next)
+		cur = next
 	}
-	return leaves, ixs
+	return leaves, ixLevels
 }
 
 // fullPacks splits total into runs of per items. Every run is full except the
@@ -362,9 +382,10 @@ func fullPacks(total, per int) []int {
 // keeps its old tree until the update commits, so a failed change changes
 // nothing.
 type treeUpdate struct {
-	list   []extent
-	leaves []leafBlock
-	ixs    []indexBlock
+	list     []extent
+	leaves   []leafBlock
+	ixs      []indexBlock
+	ixLevels [][]indexBlock
 	// added lists the blocks that the update allocated.
 	added []uint64
 	// dropped lists the blocks of the old tree that the new tree does not use.
@@ -396,12 +417,15 @@ func (n *node) prepareTreeLocked(list []extent, reuse func(blk uint64) bool, all
 	if len(list) > maxTreeExtents {
 		return treeUpdate{}, linuxerr.ENOSPC
 	}
+	leafCnt, ixLvls := canonicalLevels(len(list))
+	if 1+len(ixLvls) > maxExtentDepth {
+		return treeUpdate{}, linuxerr.ENOSPC
+	}
 	var goal uint64
 	if len(list) > 0 {
 		goal = list[0].pblk
 	}
 	u := treeUpdate{list: list}
-	leafCnt, ixCnt := canonicalShape(len(list))
 	u.leaves = make([]leafBlock, len(leafCnt))
 	for i, cnt := range leafCnt {
 		if i < len(n.leaves) && reuse(n.leaves[i].blk) {
@@ -415,18 +439,27 @@ func (n *node) prepareTreeLocked(list []extent, reuse func(blk uint64) bool, all
 		u.added = append(u.added, blk)
 		u.leaves[i] = leafBlock{blk: blk, cnt: cnt}
 	}
-	u.ixs = make([]indexBlock, len(ixCnt))
-	for j, cnt := range ixCnt {
-		if j < len(n.ixs) && reuse(n.ixs[j].blk) {
-			u.ixs[j] = indexBlock{blk: n.ixs[j].blk, cnt: cnt}
-			continue
+	if len(ixLvls) > 0 {
+		u.ixLevels = make([][]indexBlock, len(ixLvls))
+	}
+	j := 0
+	for d, lvlCnt := range ixLvls {
+		lvl := make([]indexBlock, len(lvlCnt))
+		for k, cnt := range lvlCnt {
+			if j < len(n.ixs) && reuse(n.ixs[j].blk) {
+				lvl[k] = indexBlock{blk: n.ixs[j].blk, cnt: cnt}
+			} else {
+				blk, err := alloc(goal)
+				if err != nil {
+					return treeUpdate{}, joinCleanup(err, u.abandon(n.v))
+				}
+				u.added = append(u.added, blk)
+				lvl[k] = indexBlock{blk: blk, cnt: cnt}
+			}
+			u.ixs = append(u.ixs, lvl[k])
+			j++
 		}
-		blk, err := alloc(goal)
-		if err != nil {
-			return treeUpdate{}, joinCleanup(err, u.abandon(n.v))
-		}
-		u.added = append(u.added, blk)
-		u.ixs[j] = indexBlock{blk: blk, cnt: cnt}
+		u.ixLevels[d] = lvl
 	}
 	for i, l := range n.leaves {
 		if i >= len(u.leaves) || u.leaves[i].blk != l.blk {
@@ -444,7 +477,7 @@ func (n *node) prepareTreeLocked(list []extent, reuse func(blk uint64) bool, all
 // commitTreeLocked installs the update and frees the blocks that it dropped.
 // The caller holds n.mu for writing and has checked the update.
 func (n *node) commitTreeLocked(u treeUpdate) {
-	n.exts, n.leaves, n.ixs = u.list, u.leaves, u.ixs
+	n.exts, n.leaves, n.ixs, n.ixLevels = u.list, u.leaves, u.ixs, u.ixLevels
 	n.nblocks += uint64(len(u.added))
 	for _, b := range u.dropped {
 		n.nblocks--
@@ -639,6 +672,6 @@ func (n *node) freeAllBlocksLocked() error {
 	for _, b := range n.treeBlocksLocked() {
 		errs = append(errs, n.v.freeBlocks(b, 1))
 	}
-	n.exts, n.leaves, n.ixs = nil, nil, nil
+	n.exts, n.leaves, n.ixs, n.ixLevels = nil, nil, nil, nil
 	return errors.Join(errs...)
 }

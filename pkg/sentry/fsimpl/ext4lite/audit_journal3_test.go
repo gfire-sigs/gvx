@@ -40,18 +40,18 @@ func auDowngrade(t *testing.T, img *auPages) *auPages {
 	auLE.PutUint32(sb[0x0C:], uint32(free))
 	out.writeAt(sb[:], 1024)
 
-	const inodeTable = 67
+	const inodeTable = 4
 	out.writeAt(make([]byte, auISize), int64(inodeTable)*auBlock+7*auISize)
 
 	var bm [512]byte
-	out.readAt(bm[:], 65*auBlock)
+	out.readAt(bm[:], 2*auBlock)
 	for _, e := range j.exts {
 		for i := uint32(0); i < e.n; i++ {
 			b := e.pblk + uint64(i)
 			bm[b/8] &^= 1 << (b % 8)
 		}
 	}
-	out.writeAt(bm[:], 65*auBlock)
+	out.writeAt(bm[:], 2*auBlock)
 	var gd [auDescSz]byte
 	out.readAt(gd[:], auBlock)
 	auLE.PutUint16(gd[0x0C:], uint16(auLE.Uint16(gd[0x0C:])+uint16(j.blocks)))
@@ -117,15 +117,15 @@ func TestAuditLegacyVolumeWithoutRoomStaysLegacy(t *testing.T) {
 	// Mark every 400th free block of group 0 as used. No free run reaches 1024
 	// blocks, and the blocks look like data that no inode names.
 	var bm [512]byte
-	legacy.readAt(bm[:], 65*auBlock)
+	legacy.readAt(bm[:], 2*auBlock)
 	marked := 0
-	for b := 323 + 200; b < blocksPerGroup; b += 400 {
+	for b := 260 + 200; b < blocksPerGroup; b += 400 {
 		if bm[b/8]&(1<<(b%8)) == 0 {
 			bm[b/8] |= 1 << (b % 8)
 			marked++
 		}
 	}
-	legacy.writeAt(bm[:], 65*auBlock)
+	legacy.writeAt(bm[:], 2*auBlock)
 	var sb [1024]byte
 	legacy.readAt(sb[:], 1024)
 	auLE.PutUint32(sb[0x0C:], auLE.Uint32(sb[0x0C:])-uint32(marked))

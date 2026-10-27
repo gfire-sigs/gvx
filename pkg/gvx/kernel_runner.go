@@ -400,6 +400,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	if ext4lite.Name != "ext4lite" {
+		vfsObj.MustRegisterFilesystemType("ext4lite", ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	}
 
 	if err := memdev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register memdev: %w", err)

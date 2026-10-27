@@ -35,7 +35,7 @@ import (
 )
 
 // Name is the name of the filesystem type.
-const Name = "ext4lite"
+const Name = "ext4"
 
 const (
 	// pruneThreshold is the dentry count above which the cache drops the

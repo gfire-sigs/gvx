@@ -184,13 +184,26 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	}
 }
 
+// clearSUIDAndSGID clears the set-user-ID and set-group-ID bits of a
+// non-directory mode after a write, truncation, or ownership change.
+func clearSUIDAndSGID(mode uint16) uint16 {
+	if mode&modeTypeMask == modeDir {
+		return mode
+	}
+	mode &^= linux.ModeSetUID
+	if mode&(linux.ModeSetGID|linux.ModeGroupExec) == linux.ModeSetGID|linux.ModeGroupExec {
+		mode &^= linux.ModeSetGID
+	}
+	return mode
+}
+
 // clearPrivsMode returns mode without the set-user-ID and set-group-ID bits. A
 // caller that holds CAP_FSETID for the file keeps the bits, as Linux allows.
 func clearPrivsMode(creds *auth.Credentials, mode uint16, uid, gid uint32) uint16 {
 	if creds.HasCapabilityOnFile(linux.CAP_FSETID, auth.KUID(uid), auth.KGID(gid)) {
 		return mode
 	}
-	return uint16(vfs.ClearSUIDAndSGID(uint32(mode)))
+	return clearSUIDAndSGID(mode)
 }
 
 // writeClearPrivsMode is clearPrivsMode for a write by the caller of ctx.

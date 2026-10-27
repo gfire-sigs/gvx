@@ -89,7 +89,7 @@ func TestAuditCraftedInodeFields(t *testing.T) {
 		if e == nil {
 			t.Fatalf("%s is missing from the base image", path)
 		}
-		inodeOff := int64(67)*auBlock + int64(e.ino-1)*auISize
+		inodeOff := int64(4)*auBlock + int64(e.ino-1)*auISize
 		for _, f := range fields {
 			for _, v := range values {
 				img := base.clone()
@@ -141,7 +141,7 @@ func TestAuditPartialExtentLeavesDoNotPanicFlush(t *testing.T) {
 	base := d.f.snapshot()
 	res := auFsck(base, true)
 	e := res.Tree["/frag-a"]
-	ioff := int64(67)*auBlock + int64(e.ino-1)*auISize
+	ioff := int64(4)*auBlock + int64(e.ino-1)*auISize
 	var raw [auISize]byte
 	base.readAt(raw[:], ioff)
 	if auLE.Uint16(raw[0x28+6:]) != 1 {
@@ -269,9 +269,9 @@ func TestAuditReservedInodesStayReserved(t *testing.T) {
 	d.e.unmount()
 	img := d.f.snapshot()
 	var bm [4]byte
-	img.readAt(bm[:], 66*auBlock)
+	img.readAt(bm[:], 3*auBlock)
 	bm[0], bm[1] = 0x02, 0 // keep only the root inode
-	img.writeAt(bm[:2], 66*auBlock)
+	img.writeAt(bm[:2], 3*auBlock)
 
 	var problems []string
 	if msg := auGuarded(func() {
