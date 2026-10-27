@@ -82,7 +82,8 @@ jobs:
           run_worker() {
             w="$1"
             shift
-            ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle" -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
+            cp -r "$PWD/bundle" "$PWD/bundle_$w"
+            ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle_$w" -ro -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
               set -e
               cp -r /workspace /mnt/vol/pjdfstest
               chmod +x /mnt/vol/pjdfstest/pjdfstest
@@ -142,15 +143,18 @@ jobs:
           name: pjdfstest-bundle-arm64
           path: bundle
       - name: Build rungv (16KB pages)
-        run: go build -tags pagesize_16k -o rungv ./cmd/rungv
+        run: |
+          go build -tags pagesize_16k -o rungv ./cmd/rungv
+          codesign --force --sign - ./rungv
       - name: Run pjdfstest on ext4lite volume
         run: |
           mkdir -p ./cache
-          "$PWD/scripts/codesign-exec.sh" "$PWD/rungv" pull -cache-dir=./cache alpine:3.20
+          "$PWD/rungv" pull -cache-dir=./cache alpine:3.20
           run_worker() {
             w="$1"
             shift
-            "$PWD/scripts/codesign-exec.sh" "$PWD/rungv" run -platform=systrap -cache-dir=./cache -workspace=./bundle -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
+            cp -r ./bundle "./bundle_$w"
+            "$PWD/rungv" run -platform=systrap -cache-dir=./cache -workspace="./bundle_$w" -ro -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
               set -e
               cp -r /workspace /tmp/pjdfstest
               chmod +x /tmp/pjdfstest/pjdfstest
@@ -225,7 +229,8 @@ jobs:
           run_worker() {
             w="$1"
             shift
-            ./rungv.exe run -platform=systrap -cache-dir=./cache -workspace=./bundle -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
+            cp -r ./bundle "./bundle_$w"
+            ./rungv.exe run -platform=systrap -cache-dir=./cache -workspace="./bundle_$w" -ro -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
               set -e
               cp -r /workspace /tmp/pjdfstest
               chmod +x /tmp/pjdfstest/pjdfstest

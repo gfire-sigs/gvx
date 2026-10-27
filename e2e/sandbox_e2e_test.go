@@ -1257,6 +1257,11 @@ func TestE2ERungvSystrapDefaultLockdown(t *testing.T) {
 		t.Fatalf("write guest ELF: %v", err)
 	}
 	workspace := t.TempDir()
+	// Pre-populate cli.txt so the run also verifies looking up and overwriting
+	// an existing workspace file after hostlockdown.Apply.
+	if err := os.WriteFile(filepath.Join(workspace, "cli.txt"), []byte("old\n"), 0o600); err != nil {
+		t.Fatalf("seed workspace cli.txt: %v", err)
+	}
 	stdout, stderr, code := runTool(t, rungv, "run", "-platform=systrap", "-net=none",
 		"-cache-dir="+t.TempDir(), "-workspace="+workspace, elfPath)
 	if code != 0 {

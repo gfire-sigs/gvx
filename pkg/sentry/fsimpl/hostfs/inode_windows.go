@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -424,7 +425,7 @@ func (h *hostRoot) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hos
 	if err != nil {
 		return 0, hostInfo{}, hostError("open directory", name, err)
 	}
-	stored, err := finalPathLeaf(handle)
+	stored, err := storedNameIn(windows.Handle(dir), handle, name)
 	if err != nil {
 		closeHandle(handle)
 		return 0, hostInfo{}, hostError("open directory", name, err)
@@ -609,6 +610,60 @@ func finalPathLeaf(handle windows.Handle) (string, error) {
 	return windows.UTF16ToString(buf[i:]), nil
 }
 
+// fileFullDirectoryInformation is the FileFullDirectoryInformation class of
+// NtQueryDirectoryFile.
+const fileFullDirectoryInformation = 2
+
+var procNtQueryDirectoryFile = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryDirectoryFile")
+
+// storedNameIn queries the directory dir for the single entry matching name and
+// returns its stored name. The stored name carries the on-disk case and the
+// long form of the name. Unlike GetFinalPathNameByHandle, it reads only dir and
+// never walks ancestor directories outside the workspace root, so it succeeds
+// after hostlockdown.Apply removes SeChangeNotifyPrivilege.
+// Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile
+func storedNameIn(dir, handle windows.Handle, name string) (string, error) {
+	listHandle, err := openAt(dir, "", windows.FILE_LIST_DIRECTORY, windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE)
+	if err != nil {
+		return finalPathLeaf(handle)
+	}
+	defer closeHandle(listHandle)
+	filter, err := windows.NewNTUnicodeString(name)
+	if err != nil {
+		return "", err
+	}
+	var backing [(dirInfoNameOffset + 2*512 + 7) / 8]uint64
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), len(backing)*8)
+	var iosb windows.IO_STATUS_BLOCK
+	r1, _, _ := procNtQueryDirectoryFile.Call(
+		uintptr(listHandle),
+		0,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&iosb)),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+		fileFullDirectoryInformation,
+		1,
+		uintptr(unsafe.Pointer(filter)),
+		1,
+	)
+	runtime.KeepAlive(filter)
+	if r1 != 0 {
+		return finalPathLeaf(handle)
+	}
+	nameLen := int(binary.LittleEndian.Uint32(buf[dirInfoNameLengthOffset:]))
+	if nameLen%2 != 0 || dirInfoNameOffset+nameLen > len(buf) {
+		return "", errMalformedDirBuffer
+	}
+	units := make([]uint16, nameLen/2)
+	for i := range units {
+		units[i] = binary.LittleEndian.Uint16(buf[dirInfoNameOffset+2*i:])
+	}
+	return windows.UTF16ToString(units), nil
+}
+
 func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 	if rel == "." {
 		info, err := statHandle(h.handle)
@@ -635,7 +690,7 @@ func lstatIn(dir windows.Handle, name, rel string) (hostInfo, error) {
 		return hostInfo{}, hostError("lstat", rel, err)
 	}
 	defer closeHandle(handle)
-	stored, err := finalPathLeaf(handle)
+	stored, err := storedNameIn(dir, handle, name)
 	if err != nil {
 		return hostInfo{}, hostError("lstat", rel, err)
 	}
