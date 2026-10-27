@@ -54,7 +54,7 @@ func emulateGSMemInsn(
 	readMem func(addr uint64, buf []byte) bool,
 	writeMem func(addr uint64, buf []byte) bool,
 ) gsEmulOutcome {
-	inst, err := x86asm.Decode(code, 64)
+	inst, err := decodeX86(code)
 	if err != nil || inst.Len == 0 {
 		return gsEmulOutcome{}
 	}

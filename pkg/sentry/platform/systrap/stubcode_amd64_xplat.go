@@ -526,7 +526,7 @@ func planGSMov(code []byte) (gsMovPlan, bool) {
 	if len(code) < winJmpLen {
 		return gsMovPlan{}, false
 	}
-	inst, err := x86asm.Decode(code, 64)
+	inst, err := decodeX86(code)
 	if err != nil || inst.Len != len(code) || inst.Op != x86asm.MOV {
 		return gsMovPlan{}, false
 	}
@@ -683,7 +683,7 @@ func (p *jmpPlanner) scan() {
 	p.buf = buf
 	p.target = make([]bool, len(buf))
 	for pos := range buf {
-		inst, err := x86asm.Decode(buf[pos:], 64)
+		inst, err := decodeX86(buf[pos:])
 		if err != nil || inst.Op == 0 || inst.Len == 0 {
 			continue
 		}
@@ -701,7 +701,7 @@ func (p *jmpPlanner) scan() {
 // loads a system call number that never returns.
 func (p *jmpPlanner) precededByNoReturn(end int) bool {
 	for back := 1; back <= amd64MaxInsnLen && back <= end; back++ {
-		inst, err := x86asm.Decode(p.buf[end-back:end], 64)
+		inst, err := decodeX86(p.buf[end-back : end])
 		if err == nil && inst.Len == back && noReturnSyscallSetup(inst) {
 			return true
 		}
@@ -731,7 +731,7 @@ func (p *jmpPlanner) plan(off int) ([]byte, bool) {
 		if pos >= len(page) {
 			return nil, false
 		}
-		inst, err := x86asm.Decode(page[pos:], 64)
+		inst, err := decodeX86(page[pos:])
 		if err != nil || inst.Op == 0 || inst.Len == 0 || pos+inst.Len > len(page) || !relocatable(inst) {
 			return nil, false
 		}
