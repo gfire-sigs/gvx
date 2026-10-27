@@ -249,25 +249,56 @@ func (w *windowMap) Map(addr, size uint64, backing viewBacking, off uint64, prot
 	return w.remap(keep)
 }
 
-// Unmap turns [addr, addr+size) into placeholders. A range without views is
-// a no-op.
+// Unmap turns [addr, addr+size) into placeholders and merges adjacent
+// placeholders. A range without views is a no-op.
 func (w *windowMap) Unmap(addr, size uint64) error {
 	if err := w.checkRange(addr, size, 0x1000); err != nil {
 		return err
 	}
+	end := addr + size
 	i := w.first(addr)
+	var keep []piece
 	mapped := false
-	for j := i; j < len(w.ext) && w.ext[j].addr < addr+size; j++ {
-		mapped = mapped || w.ext[j].view != nil
+	for j := i; j < len(w.ext) && w.ext[j].addr < end; j++ {
+		e := w.ext[j]
+		if e.view == nil {
+			continue
+		}
+		mapped = true
+		if err := w.host.UnmapView(e.addr); err != nil {
+			return w.fail("unmap view", err)
+		}
+		if e.addr < addr {
+			keep = append(keep, piece{e.addr, addr - e.addr, *e.view})
+		}
+		if e.end() > end {
+			keep = append(keep, piece{end, e.end() - end, viewInfo{e.view.backing, e.view.off + (end - e.addr), e.view.prot}})
+		}
+		w.ext[j].view = nil
 	}
 	if !mapped {
 		return nil
 	}
-	keep, err := w.placeholder(addr, size)
-	if err != nil {
+	if err := w.remap(keep); err != nil {
 		return err
 	}
-	return w.remap(keep)
+	i = w.first(addr)
+	for i > 0 && w.ext[i-1].view == nil {
+		i--
+	}
+	j := w.first(end - 1)
+	for j+1 < len(w.ext) && w.ext[j+1].view == nil {
+		j++
+	}
+	if j > i {
+		cAddr := w.ext[i].addr
+		cSize := w.ext[j].end() - cAddr
+		if err := w.host.CoalescePlaceholders(cAddr, cSize); err != nil {
+			return w.fail("coalesce placeholders", err)
+		}
+		w.splice(i, j+1, extent{addr: cAddr, size: cSize})
+	}
+	return nil
 }
 
 // Protect changes the protection of [addr, addr+size). Every page of the

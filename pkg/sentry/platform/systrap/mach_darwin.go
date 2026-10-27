@@ -209,7 +209,7 @@ func init() {
 
 // vmRemap maps size bytes of srcTask at srcAddr into dstTask at dstAddr and
 // replaces any mapping there. The mapping shares the pages with the source.
-func vmRemap(dstTask machPort, dstAddr, size uint64, srcTask machPort, srcAddr uint64) error {
+func vmRemap(dstTask machPort, dstAddr, size uint64, srcTask machPort, srcAddr uint64) (curProt, maxProt int32, err error) {
 	target := dstAddr
 	var cur, max int32
 	r := machCalls.vmRemap.call(
@@ -220,12 +220,12 @@ func vmRemap(dstTask machPort, dstAddr, size uint64, srcTask machPort, srcAddr u
 	runtime.KeepAlive(&cur)
 	runtime.KeepAlive(&max)
 	if err := kr("mach_vm_remap", r); err != nil {
-		return err
+		return 0, 0, err
 	}
 	if target != dstAddr {
-		return fmt.Errorf("mach_vm_remap placed the mapping at %#x instead of %#x", target, dstAddr)
+		return 0, 0, fmt.Errorf("mach_vm_remap placed the mapping at %#x instead of %#x", target, dstAddr)
 	}
-	return nil
+	return cur, max, nil
 }
 
 // vmRegionBasicInfo64 is VM_REGION_BASIC_INFO_64 and the size in 32-bit words

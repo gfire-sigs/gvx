@@ -30,6 +30,7 @@ package systrap
 import (
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -93,8 +94,67 @@ type Platform struct {
 	// images caches the headers of the files that guests map as code.
 	images imageCache
 
+	// roMu guards roCache and roBytes.
+	roMu    sync.Mutex
+	roCache map[roSpanKey]uint64
+	roBytes uint64
+
+	// cleanCode records 16KB-aligned read-only code block addresses that have
+	// already been scanned and verified to hold zero patch sites.
+	cleanCode sync.Map
+
 	closeOnce sync.Once
 	closeErr  error
+}
+
+type roSpanKey struct {
+	src  uint64
+	size uint64
+}
+
+const maxROCacheBytes = 256 << 20
+
+// alignedReadOnly returns a 16KB-aligned contiguous copy of the immutable
+// read-only range [src, src+size) so that MapFile can remap the whole span in
+// one mach_vm_remap call instead of per-page composite copies.
+func (p *Platform) alignedReadOnly(src, size uint64) (uint64, bool) {
+	if size == 0 || size%blockSize != 0 {
+		return 0, false
+	}
+	key := roSpanKey{src: src, size: size}
+	p.roMu.Lock()
+	if p.roCache != nil {
+		if addr, ok := p.roCache[key]; ok {
+			p.roMu.Unlock()
+			return addr, true
+		}
+	}
+	if p.roBytes+size > maxROCacheBytes {
+		p.roMu.Unlock()
+		return 0, false
+	}
+	p.roMu.Unlock()
+
+	addr, err := vmAllocate(p.host.self, size)
+	if err != nil {
+		return 0, false
+	}
+	copy(unsafe.Slice((*byte)(addrPtr(addr)), size), unsafe.Slice((*byte)(addrPtr(src)), size))
+	_ = vmProtect(p.host.self, addr, size, false, vmProtRead)
+
+	p.roMu.Lock()
+	if p.roCache == nil {
+		p.roCache = make(map[roSpanKey]uint64)
+	}
+	if existing, ok := p.roCache[key]; ok {
+		p.roMu.Unlock()
+		_ = vmDeallocate(p.host.self, addr, size)
+		return existing, true
+	}
+	p.roCache[key] = addr
+	p.roBytes += size
+	p.roMu.Unlock()
+	return addr, true
 }
 
 var (
@@ -178,6 +238,13 @@ func userRangeFromRegions(list regionLister) (lo, hi uint64, err error) {
 func (p *Platform) Close() error {
 	p.closeOnce.Do(func() {
 		err := p.host.close()
+		p.roMu.Lock()
+		for k, addr := range p.roCache {
+			_ = vmDeallocate(p.host.self, addr, k.size)
+		}
+		p.roCache = nil
+		p.roBytes = 0
+		p.roMu.Unlock()
 		if perr := p.pool.close(); err == nil {
 			err = perr
 		}

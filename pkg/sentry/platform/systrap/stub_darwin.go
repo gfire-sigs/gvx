@@ -129,21 +129,29 @@ type stubHost struct {
 	waiters map[uint64]chan helloMsg
 	procs   map[machPort]*stubProc
 
-	stop     chan struct{}
-	monitor  sync.WaitGroup
-	closed   bool
-	closeErr error
+	stop          chan struct{}
+	fillStop      chan struct{}
+	ready         chan *stubProc
+	startFillOnce sync.Once
+	fillWG        sync.WaitGroup
+	monitor       sync.WaitGroup
+	closed        bool
+	closeErr      error
 }
+
+const darwinStubPoolDepth = 2
 
 // spawnStubHost starts the template process. It must run before the Sentry
 // locks itself down, because the lockdown profile forbids process creation.
 func spawnStubHost(pool *pagePool) (*stubHost, error) {
 	h := &stubHost{
-		pool:    pool,
-		self:    selfTask(),
-		waiters: make(map[uint64]chan helloMsg),
-		procs:   make(map[machPort]*stubProc),
-		stop:    make(chan struct{}),
+		pool:     pool,
+		self:     selfTask(),
+		waiters:  make(map[uint64]chan helloMsg),
+		procs:    make(map[machPort]*stubProc),
+		stop:     make(chan struct{}),
+		fillStop: make(chan struct{}),
+		ready:    make(chan *stubProc, darwinStubPoolDepth),
 	}
 	recv, err := portAllocateReceive(h.self)
 	if err != nil {
@@ -374,13 +382,68 @@ func (h *stubHost) userRange() (lo, hi uint64, err error) {
 	})
 }
 
-// forkProc asks the template to fork one stub task and returns its handle.
-// The child has dropped the channel to the Sentry and runs under the strict
-// sandbox profile before the Sentry sees it.
+// fillPool keeps ready stub tasks in h.ready so forkProc returns without
+// waiting for a template fork round-trip.
+func (h *stubHost) fillPool() {
+	defer h.fillWG.Done()
+	for {
+		select {
+		case <-h.fillStop:
+			return
+		default:
+		}
+		p, err := h.forkProcFresh()
+		if err != nil {
+			select {
+			case <-h.fillStop:
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+		select {
+		case h.ready <- p:
+		case <-h.fillStop:
+			return
+		}
+	}
+}
+
+// forkProc returns a ready stub task from the pool or asks the template to
+// fork one. The child has dropped the channel to the Sentry and runs under the
+// strict sandbox profile before the Sentry sees it.
 func (h *stubHost) forkProc() (*stubProc, error) {
+	defer h.startFillOnce.Do(func() {
+		h.mu.Lock()
+		closed := h.closed
+		h.mu.Unlock()
+		if !closed {
+			h.fillWG.Add(1)
+			go h.fillPool()
+		}
+	})
+	for {
+		select {
+		case p := <-h.ready:
+			if p.dead.Load() {
+				h.dropProc(p)
+				continue
+			}
+			return p, nil
+		default:
+		}
+		return h.forkProcFresh()
+	}
+}
+
+func (h *stubHost) forkProcFresh() (*stubProc, error) {
 	h.ctlMu.Lock()
 	defer h.ctlMu.Unlock()
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil, errors.New("the stub host is closed")
+	}
 	h.cookie++
 	cookie := h.cookie
 	ch := make(chan helloMsg, 1)
@@ -417,6 +480,9 @@ func (h *stubHost) forkProc() (*stubProc, error) {
 			return nil, err
 		}
 		return p, nil
+	case <-h.stop:
+		abandon()
+		return nil, errors.New("the stub host is closed")
 	case <-time.After(forkTimeout):
 		abandon()
 		return nil, errors.New("the forked stub did not report in time")
@@ -470,6 +536,19 @@ func (h *stubHost) close() error {
 		return err
 	}
 	h.closed = true
+	h.mu.Unlock()
+
+	close(h.fillStop)
+	h.fillWG.Wait()
+	for {
+		select {
+		case <-h.ready:
+		default:
+			goto drained
+		}
+	}
+drained:
+	h.mu.Lock()
 	procs := make([]*stubProc, 0, len(h.procs))
 	for _, p := range h.procs {
 		procs = append(procs, p)
@@ -477,7 +556,6 @@ func (h *stubHost) close() error {
 	h.procs = make(map[machPort]*stubProc)
 	h.mu.Unlock()
 
-	close(h.stop)
 	var errs []error
 	for _, p := range procs {
 		if p != h.tmpl {
@@ -487,6 +565,7 @@ func (h *stubHost) close() error {
 	}
 	// The template is a child of the Sentry, so a signal ends it and wait reaps it.
 	h.killPid()
+	close(h.stop)
 	h.monitor.Wait()
 	if h.ctlAddr != 0 {
 		if err := vmDeallocate(h.self, h.ctlAddr, blockSize); err != nil {

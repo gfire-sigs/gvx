@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -485,16 +486,30 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		return nil
 	}
 	src := blk.src
+	readOnly := !blk.at.Write && src != 0
 	as.mu.Unlock()
 
 	// The guest can write the original frame while this copy runs when the
 	// block allows writes. The patched copy then holds a torn image, but the
 	// guest has no promise about code that it modifies while it executes it.
+	orig := unsafe.Slice((*byte)(addrPtr(src)), blockSize)
 	copyBuf := make([]byte, blockSize)
-	copy(copyBuf, unsafe.Slice((*byte)(addrPtr(src)), blockSize))
-	sites, slots, err := as.patchPage(ctx, mm, base, copyBuf)
-	if err != nil {
-		return err
+	copy(copyBuf, orig)
+	var sites map[uint16]siteInfo
+	var slots []winSlotRef
+	_, cleanHit := false, false
+	if readOnly {
+		_, cleanHit = as.p.cleanCode.Load(src)
+	}
+	if !cleanHit {
+		var err error
+		sites, slots, err = as.patchPage(ctx, mm, base, copyBuf)
+		if err != nil {
+			return err
+		}
+		if readOnly && len(sites) == 0 && len(slots) == 0 && cleanBoundarySafe(copyBuf) && bytes.Equal(copyBuf, orig) {
+			as.p.cleanCode.Store(src, struct{}{})
+		}
 	}
 
 	pg, err := as.p.priv.alloc()
@@ -609,4 +624,24 @@ func (blk *execBlock) frame() []byte {
 		return blk.priv.bytes()
 	}
 	return nil
+}
+
+// cleanBoundarySafe reports whether the first and last 15 bytes of page have
+// no opcode bytes that could join a neighbor page to form a patched site.
+func cleanBoundarySafe(page []byte) bool {
+	const edge = 15
+	if len(page) < 2*edge {
+		return false
+	}
+	for _, b := range page[:edge] {
+		if b == 0x05 || b == 0x0F || b == 0xAE || b == 0x65 {
+			return false
+		}
+	}
+	for _, b := range page[len(page)-edge:] {
+		if b == 0x05 || b == 0x0F || b == 0xAE || b == 0x65 {
+			return false
+		}
+	}
+	return true
 }

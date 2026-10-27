@@ -35,6 +35,15 @@ func (mm *MemoryManager) overlapsHole(ar hostarch.AddrRange) bool {
 	return hole.Length() != 0 && ar.Overlaps(hole)
 }
 
+// isHostBlockPlatform reports whether the platform maps guest memory in 16KB
+// host blocks.
+func (mm *MemoryManager) isHostBlockPlatform() bool {
+	if mm.layout.MinAddr >= 0x4_0000_0000 {
+		return true
+	}
+	return mm.addressHole().End >= 0x4000_0000_0000
+}
+
 // findAvoidingHoleLocked searches bounds like findLowestAvailableLocked, or
 // like findHighestAvailableLocked when highest is true, but never returns a
 // range inside the address hole. The part of bounds on the preferred side of
@@ -43,14 +52,14 @@ func (mm *MemoryManager) overlapsHole(ar hostarch.AddrRange) bool {
 // +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findAvoidingHoleLocked(length, alignment uint64, bounds hostarch.AddrRange, highest bool) (hostarch.Addr, error) {
 	const hostBlockAlign = 0x4000
-	if length >= hostBlockAlign && alignment < hostBlockAlign {
+	hole := mm.addressHole()
+	if mm.isHostBlockPlatform() && alignment < hostBlockAlign {
 		alignment = hostBlockAlign
 	}
 	find := mm.findLowestAlignedLocked
 	if highest {
 		find = mm.findHighestAlignedLocked
 	}
-	hole := mm.addressHole()
 	if hole.Length() == 0 || !bounds.Overlaps(hole) {
 		return find(length, alignment, bounds)
 	}
@@ -79,13 +88,14 @@ func (mm *MemoryManager) findAvoidingHoleLocked(length, alignment uint64, bounds
 // +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findLowestAlignedLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
 	for gap := mm.vmas.LowerBoundGap(bounds.Start); gap.Ok() && gap.Start() < bounds.End; gap = gap.NextLargeEnoughGap(hostarch.Addr(length)) {
-		if gr := gap.availableRange().Intersect(bounds); uint64(gr.Length()) >= length {
-			if offset := uint64(gr.Start) % alignment; offset != 0 {
-				if uint64(gr.Length()) >= length+alignment-offset {
-					return gr.Start + hostarch.Addr(alignment-offset), nil
-				}
+		gr := gap.availableRange().Intersect(bounds)
+		if offset := uint64(gr.Start) % alignment; offset != 0 {
+			if uint64(gr.Length()) < alignment-offset {
 				continue
 			}
+			gr.Start += hostarch.Addr(alignment - offset)
+		}
+		if uint64(gr.Length()) >= length {
 			return gr.Start, nil
 		}
 	}
@@ -95,7 +105,14 @@ func (mm *MemoryManager) findLowestAlignedLocked(length, alignment uint64, bound
 // +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findHighestAlignedLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
 	for gap := mm.vmas.UpperBoundGap(bounds.End); gap.Ok() && gap.End() > bounds.Start; gap = gap.PrevLargeEnoughGap(hostarch.Addr(length)) {
-		if gr := gap.availableRange().Intersect(bounds); uint64(gr.Length()) >= length {
+		gr := gap.availableRange().Intersect(bounds)
+		if rem := uint64(gr.End) % alignment; rem != 0 {
+			if uint64(gr.End) <= rem || gr.End-hostarch.Addr(rem) <= gr.Start {
+				continue
+			}
+			gr.End -= hostarch.Addr(rem)
+		}
+		if uint64(gr.Length()) >= length {
 			start := gr.End - hostarch.Addr(length)
 			if offset := uint64(start) % alignment; offset != 0 {
 				if gr.Start <= start-hostarch.Addr(offset) {

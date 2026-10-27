@@ -48,6 +48,10 @@ type Platform struct {
 	// images caches the headers of the files that guests map as code.
 	images imageCache
 
+	// cleanCode records read-only MemoryFile page addresses that were scanned
+	// and verified to require zero patches.
+	cleanCode sync.Map
+
 	// breakAddr is the address of ntdll!DbgBreakPoint, where a new guest
 	// thread starts.
 	breakAddr uintptr

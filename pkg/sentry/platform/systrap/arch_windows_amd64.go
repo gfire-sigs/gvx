@@ -495,6 +495,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	before := as.neighborBytes(base, true, amd64MaxInsnLen)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
 	found := scanAMD64GS(before, page, after, true)
+	if len(found) == 0 {
+		return nil, nil, nil
+	}
 	scope := as.p.scopeOf(ctx, mm, base)
 	var plan *jmpPlanner
 	if as.p.fast {

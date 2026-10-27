@@ -308,7 +308,7 @@ func stubProt(at hostarch.AccessType) int {
 // It lowers the maximum protection first, so the guest cannot raise it with a
 // raw Mach trap even if the sandbox profile were to allow one.
 func (as *addressSpace) mapPages(addr, size, src uint64, prot int) error {
-	if err := vmRemap(as.proc.task, addr, size, as.p.host.self, src); err != nil {
+	if _, _, err := vmRemap(as.proc.task, addr, size, as.p.host.self, src); err != nil {
 		return as.taskErr(err)
 	}
 	if err := vmProtect(as.proc.task, addr, size, true, prot); err != nil {
@@ -337,6 +337,13 @@ func checkSubBlockAligned(op string, addr, length uint64) error {
 	return nil
 }
 
+// isReadOnlyFile reports whether f rejects writable internal mappings.
+func isReadOnlyFile(f memmap.File, fr memmap.FileRange) bool {
+	probe := memmap.FileRange{Start: fr.Start, End: fr.Start + subBlockSize}
+	_, err := f.MapInternal(probe, hostarch.Write)
+	return err != nil
+}
+
 // MapFile implements platform.AddressSpace.MapFile.
 //
 // Mappings may be aligned to 4KB virtual sub-blocks (subBlockSize) or 16KB
@@ -359,6 +366,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	if err != nil {
 		return fmt.Errorf("map the memory file range %v for the stub: %w", fr, err)
 	}
+	immutable := !at.Write && isReadOnlyFile(f, fr)
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.released {
@@ -371,7 +379,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		if src%subBlockSize != 0 || n%subBlockSize != 0 {
 			return &AlignmentError{Op: "map memory file range", Addr: src, Len: n}
 		}
-		if err := as.mapRangeLocked(va, n, src, at); err != nil {
+		if err := as.mapRangeImmutableLocked(va, n, src, at, immutable); err != nil {
 			return err
 		}
 		va += n
@@ -381,56 +389,80 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 
 // mapRangeLocked installs [va, va+n) from the Sentry address src.
 func (as *addressSpace) mapRangeLocked(va, n, src uint64, at hostarch.AccessType) error {
-	for n > 0 && (va%blockSize != 0 || n < blockSize || src%blockSize != 0) {
-		if err := as.mapSubBlockAtLocked(va, src, at); err != nil {
+	return as.mapRangeImmutableLocked(va, n, src, at, false)
+}
+
+func (as *addressSpace) mapRangeImmutableLocked(va, n, src uint64, at hostarch.AccessType, immutable bool) error {
+	for n > 0 && (va%blockSize != 0 || n < blockSize) {
+		step := min(n, blockRound(va)+blockSize-va)
+		if err := as.mapSubBlocksInHostBlockLocked(va, step, src, at); err != nil {
 			return err
 		}
-		va += subBlockSize
-		src += subBlockSize
-		n -= subBlockSize
+		va += step
+		src += step
+		n -= step
 	}
 	fullLen := n &^ (blockSize - 1)
 	if fullLen > 0 {
-		runStart := va
-		for base := va; base < va+fullLen; base += blockSize {
-			if !as.isIslandBlockLocked(base) {
-				continue
+		runSrc := src
+		aligned := runSrc%blockSize == 0
+		if !aligned && immutable {
+			if cachedSrc, ok := as.p.alignedReadOnly(src, fullLen); ok {
+				runSrc = cachedSrc
+				aligned = true
 			}
-			if err := as.mapRunLocked(runStart, base-runStart, src+(runStart-va), at); err != nil {
+		}
+		if aligned {
+			if err := as.mapAlignedRunLocked(va, fullLen, runSrc, at); err != nil {
 				return err
 			}
-			runStart = base + blockSize
-		}
-		if err := as.mapRunLocked(runStart, va+fullLen-runStart, src+(runStart-va), at); err != nil {
-			return err
+		} else {
+			for base := va; base < va+fullLen; base += blockSize {
+				if err := as.mapSubBlocksInHostBlockLocked(base, blockSize, src+(base-va), at); err != nil {
+					return err
+				}
+			}
 		}
 		va += fullLen
 		src += fullLen
 		n -= fullLen
 	}
-	for n > 0 {
-		if err := as.mapSubBlockAtLocked(va, src, at); err != nil {
+	if n > 0 {
+		if err := as.mapSubBlocksInHostBlockLocked(va, n, src, at); err != nil {
 			return err
 		}
-		va += subBlockSize
-		src += subBlockSize
-		n -= subBlockSize
 	}
 	return nil
 }
 
-func (as *addressSpace) mapSubBlockAtLocked(va, subSrc uint64, at hostarch.AccessType) error {
+func (as *addressSpace) mapAlignedRunLocked(va, fullLen, src uint64, at hostarch.AccessType) error {
+	runStart := va
+	for base := va; base < va+fullLen; base += blockSize {
+		if !as.isIslandBlockLocked(base) {
+			continue
+		}
+		if err := as.mapRunLocked(runStart, base-runStart, src+(runStart-va), at); err != nil {
+			return err
+		}
+		runStart = base + blockSize
+	}
+	return as.mapRunLocked(runStart, va+fullLen-runStart, src+(runStart-va), at)
+}
+
+func (as *addressSpace) mapSubBlocksInHostBlockLocked(va, length, subSrc uint64, at hostarch.AccessType) error {
 	base := blockRound(va)
 	if as.isIslandBlockLocked(base) {
 		return nil
 	}
-	subIdx := int((va - base) / subBlockSize)
 	hb := as.hostBlocks[base]
 	if hb == nil {
 		hb = &hostBlock{}
 		as.hostBlocks[base] = hb
 	}
-	hb.subs[subIdx] = subPage{src: subSrc, at: at}
+	for off := uint64(0); off < length; off += subBlockSize {
+		subIdx := int((va + off - base) / subBlockSize)
+		hb.subs[subIdx] = subPage{src: subSrc + off, at: at}
+	}
 	return as.refreshHostBlockLocked(base, hb)
 }
 
@@ -484,11 +516,7 @@ func (as *addressSpace) refreshHostBlockLocked(base uint64, hb *hostBlock) error
 			hb.mappedComp = false
 		}
 		hb.syncComp()
-		if hb.writeMask != 0 || (hb.mappedMask != 0xF && hb.execMask == 0) {
-			as.compBlocks[base] = hb
-		} else {
-			delete(as.compBlocks, base)
-		}
+		as.compBlocks[base] = hb
 		backingSrc = hb.comp
 		if hb.mappedComp && (as.blocks[base] == nil || as.blocks[base].state == blockData) {
 			needMap = false
@@ -654,13 +682,9 @@ func (p *Platform) stubRanges(start, end uint64) [][2]uint64 {
 // unmapStubLocked removes the stub range [start, end).
 func (as *addressSpace) unmapStubLocked(start, end uint64) {
 	for start < end && (start%blockSize != 0 || end-start < blockSize) {
-		base := blockRound(start)
-		subIdx := int((start - base) / subBlockSize)
-		if hb := as.hostBlocks[base]; hb != nil && hb.subs[subIdx].src != 0 {
-			hb.subs[subIdx] = subPage{}
-			_ = as.refreshHostBlockLocked(base, hb)
-		}
-		start += subBlockSize
+		step := min(end-start, blockRound(start)+blockSize-start)
+		as.unmapSubBlocksInHostBlockLocked(start, step)
+		start += step
 	}
 	midEnd := end &^ (blockSize - 1)
 	if start < midEnd {
@@ -697,14 +721,27 @@ func (as *addressSpace) unmapStubLocked(start, end uint64) {
 		}
 		start = midEnd
 	}
-	for start < end {
-		base := blockRound(start)
-		subIdx := int((start - base) / subBlockSize)
-		if hb := as.hostBlocks[base]; hb != nil && hb.subs[subIdx].src != 0 {
+	if start < end {
+		as.unmapSubBlocksInHostBlockLocked(start, end-start)
+	}
+}
+
+func (as *addressSpace) unmapSubBlocksInHostBlockLocked(va, length uint64) {
+	base := blockRound(va)
+	hb := as.hostBlocks[base]
+	if hb == nil {
+		return
+	}
+	changed := false
+	for off := uint64(0); off < length; off += subBlockSize {
+		subIdx := int((va + off - base) / subBlockSize)
+		if hb.subs[subIdx].src != 0 {
 			hb.subs[subIdx] = subPage{}
-			_ = as.refreshHostBlockLocked(base, hb)
+			changed = true
 		}
-		start += subBlockSize
+	}
+	if changed {
+		_ = as.refreshHostBlockLocked(base, hb)
 	}
 }
 
@@ -892,19 +929,22 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	src := blk.src
 	var subs [subBlocksPerBlock]subPage
 	execMask := uint8(0xF)
+	directRO := !blk.at.Write && src != 0
 	if hb != nil {
 		if hb.comp != 0 {
 			hb.syncComp()
 		}
 		subs = hb.subs
 		execMask = hb.execMask
+		directRO = directRO && hb.canMapDirect() && hb.writeMask == 0 && hb.execMask == 0xF
 	}
 	retired := blk.retiredSlots
 	blk.retiredSlots = nil
 	as.mu.Unlock()
 
+	directRO = directRO && !as.hasZone(mm)
 	copyBuf := make([]byte, blockSize)
-	if hb != nil {
+	if hb != nil && !hb.canMapDirect() {
 		for s := 0; s < subBlocksPerBlock; s++ {
 			if subs[s].src != 0 {
 				off := s * subBlockSize
@@ -915,45 +955,65 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		copy(copyBuf, unsafe.Slice((*byte)(addrPtr(src)), blockSize))
 	}
 
-	gbase := as.p.guestAddr(base)
-	scope := as.p.scopeOf(ctx, mm, gbase)
-	effExecMask := execMask & scope.subBlockMask(gbase)
-
 	var items []patchItem
-	claimed := make(map[int]struct{})
-	for _, s := range scanARM64(copyBuf) {
-		subIdx := s.Offset / subBlockSize
-		if execMask&(1<<subIdx) == 0 {
-			continue
-		}
-		claimed[int(s.Offset)] = struct{}{}
-		it := patchItem{patchSite: s}
-		if s.Kind == siteMRS && s.Reg == x18Reg {
-			it.Kind, it.x18 = siteX18, planTPIDRRead()
-		}
-		if s.Kind == siteCTR && s.Reg == x18Reg {
-			it.Kind, it.x18 = siteX18, planCTRRead()
-		}
-		items = append(items, it)
+	var claimed map[int]struct{}
+	var gbase uint64
+	var scope codeScope
+	var effExecMask uint8
+	_, cleanHit := false, false
+	if directRO {
+		_, cleanHit = as.p.cleanCode.Load(src)
 	}
-	if !scope.none {
-		for _, x := range scanX18(copyBuf, base, func(off int) bool {
-			subIdx := off / subBlockSize
-			if effExecMask&(1<<subIdx) == 0 {
-				return true
+	if !cleanHit {
+		gbase = as.p.guestAddr(base)
+		scope = as.p.scopeOf(ctx, mm, gbase)
+		effExecMask = execMask & scope.subBlockMask(gbase)
+
+		claimed = make(map[int]struct{})
+		for _, s := range scanARM64(copyBuf) {
+			subIdx := s.Offset / subBlockSize
+			if execMask&(1<<subIdx) == 0 {
+				continue
 			}
-			if _, taken := claimed[off]; taken {
-				return true
+			claimed[int(s.Offset)] = struct{}{}
+			it := patchItem{patchSite: s}
+			if s.Kind == siteMRS && s.Reg == x18Reg {
+				it.Kind, it.x18 = siteX18, planTPIDRRead()
 			}
-			if !scope.contains(gbase + uint64(off)) {
-				return true
+			if s.Kind == siteCTR && s.Reg == x18Reg {
+				it.Kind, it.x18 = siteX18, planCTRRead()
 			}
-			return scope.stripped && isASCIIStringWindow(copyBuf, off)
-		}) {
-			items = append(items, patchItem{
-				patchSite: patchSite{Offset: x.Offset, Kind: x.Plan.kind, Orig: binary.LittleEndian.Uint32(copyBuf[x.Offset:])},
-				x18:       x.Plan,
-			})
+			items = append(items, it)
+		}
+		skippedX18 := false
+		if !scope.none {
+			for _, x := range scanX18(copyBuf, base, func(off int) bool {
+				subIdx := off / subBlockSize
+				if effExecMask&(1<<subIdx) == 0 {
+					skippedX18 = true
+					return true
+				}
+				if _, taken := claimed[off]; taken {
+					return true
+				}
+				if !scope.contains(gbase + uint64(off)) {
+					skippedX18 = true
+					return true
+				}
+				if scope.stripped && isASCIIStringWindow(copyBuf, off) {
+					skippedX18 = true
+					return true
+				}
+				return false
+			}) {
+				items = append(items, patchItem{
+					patchSite: patchSite{Offset: x.Offset, Kind: x.Plan.kind, Orig: binary.LittleEndian.Uint32(copyBuf[x.Offset:])},
+					x18:       x.Plan,
+				})
+			}
+		}
+		if directRO && !scope.none && !skippedX18 && len(items) == 0 {
+			as.p.cleanCode.Store(src, struct{}{})
 		}
 	}
 

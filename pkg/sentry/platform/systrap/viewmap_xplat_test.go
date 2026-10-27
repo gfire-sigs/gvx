@@ -324,4 +324,27 @@ func TestGuestWindowsServeTwoWindows(t *testing.T) {
 	if _, ok := highHost.pageState(testBase + 0x1000); ok {
 		t.Error("the high view survived an unmap that covers it")
 	}
+	if len(lowHost.regions) != 1 || len(highHost.regions) != 1 {
+		t.Errorf("after full unmap low regions = %d, high regions = %d, want 1 each", len(lowHost.regions), len(highHost.regions))
+	}
+}
+
+func TestWindowMapUnmapCoalescesAdjacentPlaceholders(t *testing.T) {
+	host := newFakeHost(testBase, testLimit)
+	w := newWindowMap(host, testBase, testLimit)
+	if err := w.Map(testBase+0x2000, 0x2000, "s", 0, viewReadWrite); err != nil {
+		t.Fatal(err)
+	}
+	beforeCalls := host.calls
+	if err := w.Unmap(testBase+0x1000, 0x4000); err != nil {
+		t.Fatal(err)
+	}
+	// Unmapping the view and coalescing with its surrounding placeholders takes
+	// exactly 2 host calls (UnmapView + CoalescePlaceholders) and 0 splits.
+	if got := host.calls - beforeCalls; got != 2 {
+		t.Errorf("Unmap made %d host calls, want 2 (UnmapView + CoalescePlaceholders)", got)
+	}
+	if len(w.ext) != 1 || len(host.regions) != 1 {
+		t.Errorf("after Unmap extents = %d, host regions = %d, want 1", len(w.ext), len(host.regions))
+	}
 }

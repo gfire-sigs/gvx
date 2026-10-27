@@ -184,7 +184,7 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 
 // poolDepth is the number of ready stubs that the platform keeps. A stub takes
 // 10 to 20 ms to start, and each fork and each exec of a guest needs one.
-const poolDepth = 2
+const poolDepth = 6
 
 // stubPool keeps ready stubs, so that a fork or an exec does not wait for the
 // loader of a new process. One goroutine fills the pool while the guests run.

@@ -137,6 +137,20 @@ func scanAMD64(before, page, after []byte) []amd64Site {
 	return scanAMD64GS(before, page, after, false)
 }
 
+// hasAMD64CandidateBytes reports whether buf contains the opcode bytes of a
+// SYSCALL (0F 05), FSGSBASE (0F AE), or GS-prefixed instruction (65).
+func hasAMD64CandidateBytes(buf []byte, gsMem bool) bool {
+	for i, b := range buf {
+		if b == 0x0F && i+1 < len(buf) && (buf[i+1] == 0x05 || buf[i+1] == 0xAE) {
+			return true
+		}
+		if gsMem && b == 0x65 {
+			return true
+		}
+	}
+	return false
+}
+
 // scanAMD64GS runs scanAMD64 and, when gsMem is true, also reports memory
 // instructions that carry a GS segment override prefix.
 func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
@@ -147,6 +161,9 @@ func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
 	buf = append(buf, before...)
 	buf = append(buf, page...)
 	buf = append(buf, after...)
+	if !hasAMD64CandidateBytes(buf, gsMem) {
+		return nil
+	}
 	pageStart := len(before)
 	pageEnd := pageStart + len(page)
 

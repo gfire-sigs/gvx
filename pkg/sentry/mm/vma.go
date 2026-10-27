@@ -182,7 +182,7 @@ const (
 func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOpts) (hostarch.Addr, error) {
 	if opts.Fixed {
 		opts.Map32Bit = false
-	} else if opts.Addr != 0 {
+	} else if opts.Addr != 0 && mm.isHostBlockPlatform() {
 		opts.Addr &^= 0x3fff
 	}
 	allowedAR := mm.applicationAddrRange()

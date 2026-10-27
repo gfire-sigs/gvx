@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/arch/arm64/arm64asm"
 
@@ -142,6 +143,10 @@ func decodeARM64(b []byte) (arm64asm.Inst, error) {
 	return arm64asm.Decode(b)
 }
 
+// nonX18Cache caches 32-bit instruction words that decodeARM64 proved do not
+// reference X18 or W18. Each entry stores (uint64(w)<<32) | 1.
+var nonX18Cache [8192]uint64
+
 // planX18 decides whether the instruction w at address site names x18 and
 // returns the slot that replaces it. It returns nil for every other word.
 //
@@ -150,6 +155,10 @@ func decodeARM64(b []byte) (arm64asm.Inst, error) {
 // only when the decoded instruction of the rewritten word equals the decoded
 // original with x18 renamed.
 func planX18(w uint32, site uint64) *x18Plan {
+	// Unconditional B and BL encode only a 26-bit immediate offset.
+	if w&0x7c000000 == 0x14000000 {
+		return nil
+	}
 	mayNameX18 := false
 	for _, sh := range x18FieldShifts {
 		if fieldAt(w, sh) == x18Reg {
@@ -159,6 +168,11 @@ func planX18(w uint32, site uint64) *x18Plan {
 	if !mayNameX18 {
 		return nil
 	}
+	cacheIdx := (w * 0x9e3779b1) >> 19
+	cacheTag := (uint64(w) << 32) | 1
+	if atomic.LoadUint64(&nonX18Cache[cacheIdx]) == cacheTag {
+		return nil
+	}
 	var raw [4]byte
 	binary.LittleEndian.PutUint32(raw[:], w)
 	inst, err := decodeARM64(raw[:])
@@ -166,10 +180,12 @@ func planX18(w uint32, site uint64) *x18Plan {
 		if isLSEAtomic(w) {
 			return planAtomic(w)
 		}
+		atomic.StoreUint64(&nonX18Cache[cacheIdx], cacheTag)
 		return nil
 	}
 	text := inst.String()
 	if !x18RegX.MatchString(text) && !x18RegW.MatchString(text) {
+		atomic.StoreUint64(&nonX18Cache[cacheIdx], cacheTag)
 		return nil
 	}
 	switch inst.Op {
