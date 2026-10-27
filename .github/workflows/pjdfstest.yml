@@ -57,6 +57,8 @@ jobs:
           CGO_ENABLED: "0"
         run: go build -o rungv ./cmd/rungv
       - name: Build pjdfstest bundle inside guest
+        env:
+          GOMAXPROCS: "1"
         run: |
           mkdir -p "$PWD/bundle" "$PWD/cache"
           ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle" -v pjdfs_build:/mnt/vol alpine:3.20 sh -c '
@@ -78,6 +80,8 @@ jobs:
           path: bundle/
       - name: Run pjdfstest inside guest on ext4lite volumes
         if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
+        env:
+          GOMAXPROCS: "1"
         run: |
           run_worker() {
             w="$1"
