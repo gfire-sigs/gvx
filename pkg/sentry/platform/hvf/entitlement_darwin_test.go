@@ -17,12 +17,18 @@
 package hvf
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const childEnv = "GVX_HVF_TEST_CHILD"
@@ -157,6 +163,27 @@ func TestChildCreatesPlatform(t *testing.T) {
 	}
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		DNSNames:     []string{"localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{DNSName: "localhost"}); err != nil && strings.Contains(err.Error(), "SecPolicyCreateSSL") {
+		t.Fatalf("TLS certificate check failed with SecPolicyCreateSSL after re-exec: %v", err)
 	}
 	exe, _ := os.Executable()
 	io.WriteString(os.Stdout, "CHILD-EXE="+exe+"\n")

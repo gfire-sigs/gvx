@@ -195,10 +195,15 @@ func openHVF() (platform.Platform, string, error) {
 // needs arbitrary outbound dials. WireGuard needs only its pre-bound UDP
 // socket to reach the peer port. The none mode gets no outbound access.
 func (s *Sandbox) lockdownOptions() hostlockdown.Options {
+	var ttyPath string
+	if s.cfg.TTY || isHostTerminalReader(s.cfg.Stdin) {
+		ttyPath = hostTerminalPath(s.cfg.Stdin, s.cfg.Stdout)
+	}
 	opts := hostlockdown.Options{
 		CPUQuotaMillis:       s.cfg.Resources.CPUMillis,
 		Mounts:               s.hostMounts(),
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
+		TTYPath:              ttyPath,
 		InstallSyscallFilter: s.syscallFilter(),
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {

@@ -33,10 +33,10 @@ seam pkg/sentry/fsimpl/erofs/erofs.go
 seam pkg/sentry/fsimpl/erofs/filesystem.go
 
 # pkg/hostarch: the opt-in 16KB page size (build tag pagesize_16k, SPEC section 1 and 3.3).
-# Upstream already reserves a tag for 64KB pages. Each 4KB file gains one more negated tag so that
-# exactly one of the three page-size files applies. The new gvx file hostarch_darwin_arm64_16k.go holds the 16KB constants.
-expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !pagesize_64k && !pagesize_16k
-expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !pagesize_64k && !pagesize_16k
+# Upstream already reserves a tag for 64KB pages. Each 4KB file gains negated tags so that
+# exactly one of the page-size files applies, and hostarch_darwin_arm64_4k.go / hostarch_darwin_arm64_16k.go hold the darwin constants.
+expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !darwin && !pagesize_64k && !pagesize_16k
+expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !darwin && !pagesize_64k && !pagesize_16k
 
 # Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno_xplat.go).
 seam pkg/syserr/syserr.go

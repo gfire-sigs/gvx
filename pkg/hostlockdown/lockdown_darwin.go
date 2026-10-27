@@ -78,6 +78,9 @@ func BuildSeatbeltProfile(opts Options) string {
 		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, given)
 		fmt.Fprintf(&b, "(allow %s (%s (param %q)))\n", ops, filter, real)
 	}
+	if opts.TTYPath != "" {
+		fmt.Fprintf(&b, "(allow file-ioctl (literal (param %q)))\n", "TTY_0")
+	}
 	switch {
 	case opts.AllowOutboundNet:
 		b.WriteString("(allow network-outbound)\n")
@@ -122,6 +125,9 @@ func applyOSLockdown(opts Options) (Status, error) {
 	for i := range opts.Mounts {
 		given, real := mountParam(i)
 		params = append(params, given, absPaths[i], real, realPaths[i])
+	}
+	if opts.TTYPath != "" {
+		params = append(params, "TTY_0", opts.TTYPath)
 	}
 	profile := BuildSeatbeltProfile(opts)
 

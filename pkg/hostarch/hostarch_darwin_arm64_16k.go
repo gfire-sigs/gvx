@@ -16,8 +16,6 @@
 
 package hostarch
 
-import "golang.org/x/sys/unix"
-
 const (
 	// PageShift is the binary log of the system page size.
 	// 16K pages: 2^14 = 16384. This matches the Apple Silicon VM page size,
@@ -29,9 +27,3 @@ const (
 	// This gives 32MB huge pages.
 	HugePageShift = 25
 )
-
-func init() {
-	if size := unix.Getpagesize(); size != PageSize {
-		println("WARNING: host page size mismatch - running on non-16K host")
-	}
-}

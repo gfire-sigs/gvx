@@ -80,6 +80,12 @@ type Options struct {
 	// containment job. Status.CPUQuotaEnforced reports whether Apply did.
 	CPUQuotaMillis int64
 
+	// TTYPath names the pre-opened host terminal device node (such as
+	// "/dev/ttys001") that the locked process configures with ioctl to enter
+	// and restore raw terminal mode. macOS grants file-ioctl on that literal
+	// path without granting file-read or file-write.
+	TTYPath string
+
 	// InstallSyscallFilter installs the seccomp program of the embedder. Only
 	// Linux uses it, and Apply fails there when it is nil. The caller builds the
 	// program, because the allowlist depends on the Sentry platform, which this

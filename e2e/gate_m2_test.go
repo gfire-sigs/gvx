@@ -239,6 +239,11 @@ func TestE2EGateM2BusyboxAshInteractive(t *testing.T) {
 			// Exit statuses of failing commands reach the shell.
 			requireContains(t, "status", s.do(`false; echo "rc=$?"`, "rc=1\n"), "rc=1\n")
 
+			if tc.tty {
+				requireContains(t, "dev_tty", s.do(`echo "ctty=ok" > /dev/tty`, "ctty=ok\n"), "ctty=ok\n")
+				requireContains(t, "stty_size", s.do(`echo "winsize=$(stty size)"`, "winsize=24 80\n"), "winsize=24 80\n")
+			}
+
 			s.send("exit 7")
 			res := s.finish()
 			if res.err != nil || res.code != 7 {

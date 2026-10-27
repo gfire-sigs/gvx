@@ -18,14 +18,20 @@ package hvf
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -72,8 +78,34 @@ func init() {
 	}
 	os.Unsetenv(envTempDir)
 	if isOwnTempDir(dir) {
+		warmDarwinTLS()
 		os.RemoveAll(dir)
 	}
+}
+
+// warmDarwinTLS initializes macOS Security.framework before the re-executed
+// binary unlinks its temporary executable directory, preventing subsequent
+// SecPolicyCreateSSL calls from failing with error 0.
+func warmDarwinTLS() {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		DNSNames:     []string{"localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return
+	}
+	_, _ = cert.Verify(x509.VerifyOptions{DNSName: "localhost"})
 }
 
 // isOwnTempDir reports whether dir has the shape of a directory that

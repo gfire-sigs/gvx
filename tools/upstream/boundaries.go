@@ -243,6 +243,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "pkg/cpuid", "kernel.Init requires a cpuid.FeatureSet"},
 	{[]string{"pkg/gvx"}, "pkg/marshal/primitive", "guest memory copies use primitive marshal types"},
 	{[]string{"pkg/gvx"}, "pkg/memutil", "kernel memory files need host memory views"},
+	{[]string{"pkg/gvx"}, "pkg/waiter", "stdio file descriptions implement waiter.Waitable for VFS blocking reads and epoll"},
 
 	// pkg/netbackend: Netstack's own foundation packages sit outside the pkg/tcpip tree.
 	{[]string{"pkg/netbackend"}, "pkg/buffer", "pkg/tcpip packets are pkg/buffer.Buffer values"},
@@ -253,7 +254,7 @@ var boundaryExceptions = []importException{
 	// pkg/gvx: the Linux lockdown reuses the seccomp allowlist of the gVisor Sentry.
 	{[]string{"pkg/gvx"}, "runsc/boot/filter/config", "the Linux lockdown installs the runsc Sentry allowlist"},
 	{[]string{"pkg/gvx"}, "pkg/seccomp", "the Linux lockdown builds the seccomp program with the upstream rule types"},
-	{[]string{"pkg/gvx"}, "golang.org/x/sys/unix", "the Linux lockdown names system calls for the extra rules"},
+	{[]string{"pkg/gvx"}, "golang.org/x/sys/*", "the Linux lockdown names system calls and the TTY bridge queries host terminal state"},
 	// pkg/oci: the EROFS writer and the layer codecs have no SPEC row of their own.
 	{[]string{"pkg/oci"}, "pkg/erofs", "SPEC section 3.6 compiles layer tarballs with the upstream erofs ABI"},
 	{[]string{"pkg/oci"}, "pkg/fd", "the Windows layer cache shares NT file rename helpers with hostfs"},
@@ -269,6 +270,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"internal/gvxshim"}, "github.com/containerd/errdefs", "interop tests assert native unsupported-operation errors"},
 	{[]string{"internal/gvxshim"}, "github.com/opencontainers/runtime-spec/specs-go", "interop tests supply a minimal OCI specification without a workload"},
 	{[]string{"pkg/gvx", "cmd/rungv"}, "internal/*", "gvx-owned guest ELF and image fixtures for tests"},
+	{[]string{"pkg/gvx"}, "github.com/creack/pty", "darwin PTY tests verify host terminal raw mode and termios restoration"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/hvcommon"}, "golang.org/x/arch/*", "tests disassemble the generated guest stubs"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/pgalloc", "tests back the chunks of mapped files with a memory file, as pkg/gvx does on Linux"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/memutil", "tests create the memfd of the memory file that backs chunks"},

@@ -51,7 +51,9 @@ type stdioDevice struct {
 // Open implements vfs.Device.Open.
 func (d stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &stdioFD{reader: d.reader, writer: d.writer, tty: d.tty, mu: d.mu}
-	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
+		SpecialFile: d.tty != nil,
+	}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -69,9 +71,22 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 	}
 	names := [3]string{"stdin", "stdout", "stderr"}
 	flags := [3]uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_WRONLY}
+	if tty != nil {
+		errMu := tty.outMu
+		if errw != out {
+			errMu = new(sync.Mutex)
+		}
+		devs = [3]stdioDevice{
+			{reader: in, writer: out, tty: tty, mu: tty.outMu},
+			{reader: in, writer: out, tty: tty, mu: tty.outMu},
+			{reader: in, writer: errw, tty: tty, mu: errMu},
+		}
+		flags = [3]uint32{linux.O_RDWR, linux.O_RDWR, linux.O_RDWR}
+	}
 	for i := range devs {
-		devs[i].tty = tty
-		devs[i].mu = new(sync.Mutex)
+		if devs[i].mu == nil {
+			devs[i].mu = new(sync.Mutex)
+		}
 		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, uint32(i), devs[i], &vfs.RegisterDeviceOptions{}); err != nil {
 			return fds, fmt.Errorf("gvx: register the %s device: %w", names[i], err)
 		}

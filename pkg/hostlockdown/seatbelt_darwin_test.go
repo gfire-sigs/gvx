@@ -116,6 +116,14 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 				"(allow network-inbound)",
 			},
 		},
+		{
+			name: "host tty ioctl",
+			opts: Options{TTYPath: "/dev/ttys001"},
+			wantAllow: []string{
+				"(allow signal (target children))",
+				`(allow file-ioctl (literal (param "TTY_0")))`,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -26,6 +26,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -62,6 +65,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
+	"z.gfire.dev/gvx/pkg/waiter"
 
 	// Register Linux syscall tables and socket families in the Sentry kernel.
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink"
@@ -95,35 +99,466 @@ func init() {
 var errRunConsumed = errors.New("gvx: Sandbox.Run already ran and consumed the kernel memory file")
 
 type ttyState struct {
-	mu      sync.Mutex
-	termios linux.KernelTermios
-	winsize linux.Winsize
-	fgPgrp  int32
-	session int32
+	mu         sync.Mutex
+	termios    linux.KernelTermios
+	winsize    linux.Winsize
+	fgPgrp     int32
+	session    int32
+	rawHost    bool
+	lineBuf    []byte
+	readBuf    []byte
+	pendingEOF bool
+	hostEOF    bool
+	hostErr    error
+	stopped    bool
+
+	in    io.Reader
+	out   io.Writer
+	outMu *sync.Mutex
+	ktty  *kernel.TTY
+	wq    waiter.Queue
 }
 
+var _ kernel.TTYOperations = (*ttyState)(nil)
+
 func newDefaultTTYState() *ttyState {
-	return &ttyState{
+	return newTTYState(nil, nil, false, 24, 80)
+}
+
+func newTTYState(in io.Reader, out io.Writer, rawHost bool, rows, cols uint16) *ttyState {
+	if rows == 0 {
+		rows = 24
+	}
+	if cols == 0 {
+		cols = 80
+	}
+	t := &ttyState{
 		termios: linux.DefaultReplicaTermios,
 		winsize: linux.Winsize{
-			Row: 24,
-			Col: 80,
+			Row: rows,
+			Col: cols,
 		},
 		fgPgrp:  1,
 		session: 1,
+		rawHost: rawHost,
+		in:      in,
+		out:     out,
+		outMu:   new(sync.Mutex),
+	}
+	t.ktty = kernel.NewTTY(0, t)
+	return t
+}
+
+func (t *ttyState) IncRef()                  {}
+func (t *ttyState) DecRef(gvcontext.Context) {}
+
+func (t *ttyState) OpenTTY(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd := &stdioFD{
+		reader: t.in,
+		writer: t.out,
+		tty:    t,
+		mu:     t.outMu,
+	}
+	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
+		SpecialFile: true,
+	}); err != nil {
+		return nil, err
+	}
+	if opts.Flags&linux.O_NOCTTY == 0 {
+		if tsk := kernel.TaskFromContext(ctx); tsk != nil && t.ktty != nil {
+			_ = tsk.ThreadGroup().SetControllingTTY(ctx, t.ktty, false, fd.vfsfd.IsReadable())
+		}
+	}
+	return &fd.vfsfd, nil
+}
+
+func (t *ttyState) startPump() {
+	if t.in == nil {
+		t.finishInput(io.EOF)
+		return
+	}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := t.in.Read(buf)
+			if n > 0 {
+				if !t.consumeInput(buf[:n]) {
+					return
+				}
+			}
+			if err != nil {
+				t.finishInput(err)
+				return
+			}
+		}
+	}()
+}
+
+func (t *ttyState) stop() {
+	t.mu.Lock()
+	t.stopped = true
+	t.hostEOF = true
+	t.mu.Unlock()
+	if d, ok := t.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = d.SetReadDeadline(time.Now())
+	}
+	t.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
+}
+
+func (t *ttyState) finishInput(err error) {
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		return
+	}
+	if len(t.lineBuf) > 0 {
+		t.readBuf = append(t.readBuf, t.lineBuf...)
+		t.lineBuf = t.lineBuf[:0]
+	}
+	t.hostEOF = true
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+		t.hostErr = err
+	}
+	t.mu.Unlock()
+	t.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
+}
+
+func (t *ttyState) cc(idx int) byte {
+	if idx < 0 || idx >= len(t.termios.ControlCharacters) {
+		return 0
+	}
+	return t.termios.ControlCharacters[idx]
+}
+
+func (t *ttyState) appendOutputNewlineLocked(dst *[]byte) {
+	if t.termios.OEnabled(linux.OPOST) && t.termios.OEnabled(linux.ONLCR) {
+		*dst = append(*dst, '\r', '\n')
+		return
+	}
+	*dst = append(*dst, '\n')
+}
+
+func (t *ttyState) appendEchoByteLocked(dst *[]byte, b byte) {
+	if b == '\n' {
+		t.appendOutputNewlineLocked(dst)
+		return
+	}
+	if (b < 0x20 || b == 0x7f) && b != '\t' && t.termios.LEnabled(linux.ECHOCTL) {
+		if b == 0x7f {
+			*dst = append(*dst, '^', '?')
+		} else {
+			*dst = append(*dst, '^', b+0x40)
+		}
+		return
+	}
+	*dst = append(*dst, b)
+}
+
+func (t *ttyState) popLastCharLocked() (erased byte, ok bool) {
+	if len(t.lineBuf) == 0 {
+		return 0, false
+	}
+	if t.termios.IEnabled(linux.IUTF8) {
+		_, size := utf8.DecodeLastRune(t.lineBuf)
+		if size > 0 {
+			b := t.lineBuf[len(t.lineBuf)-size]
+			t.lineBuf = t.lineBuf[:len(t.lineBuf)-size]
+			return b, true
+		}
+	}
+	b := t.lineBuf[len(t.lineBuf)-1]
+	t.lineBuf = t.lineBuf[:len(t.lineBuf)-1]
+	return b, true
+}
+
+func (t *ttyState) echoEraseCharLocked(dst *[]byte, erased byte) {
+	if !t.termios.LEnabled(linux.ECHO) || !t.termios.LEnabled(linux.ECHOE) {
+		return
+	}
+	cols := 1
+	if (erased < 0x20 || erased == 0x7f) && erased != '\t' {
+		if t.termios.LEnabled(linux.ECHOCTL) {
+			cols = 2
+		} else {
+			cols = 0
+		}
+	}
+	for range cols {
+		*dst = append(*dst, '\b', ' ', '\b')
+	}
+}
+
+func (t *ttyState) eraseOneCharLocked(echo *[]byte) {
+	if erased, ok := t.popLastCharLocked(); ok {
+		t.echoEraseCharLocked(echo, erased)
+	}
+}
+
+func (t *ttyState) eraseOneWordLocked(echo *[]byte) {
+	seenWord := false
+	for len(t.lineBuf) > 0 {
+		last := t.lineBuf[len(t.lineBuf)-1]
+		isWord := unicode.IsLetter(rune(last)) || unicode.IsDigit(rune(last)) || last == '_'
+		if isWord {
+			seenWord = true
+		} else if seenWord {
+			break
+		}
+		erased, ok := t.popLastCharLocked()
+		if !ok {
+			break
+		}
+		t.echoEraseCharLocked(echo, erased)
+	}
+}
+
+func (t *ttyState) eraseLineLocked(echo *[]byte) {
+	for len(t.lineBuf) > 0 {
+		erased, ok := t.popLastCharLocked()
+		if !ok {
+			break
+		}
+		if t.termios.LEnabled(linux.ECHOK) {
+			t.echoEraseCharLocked(echo, erased)
+		}
+	}
+}
+
+func (t *ttyState) consumeInput(chunk []byte) bool {
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		return false
+	}
+	if !t.rawHost {
+		t.readBuf = append(t.readBuf, chunk...)
+		t.mu.Unlock()
+		t.wq.Notify(waiter.ReadableEvents)
+		return true
+	}
+
+	var (
+		echo       []byte
+		sigs       []linux.Signal
+		notifyRead bool
+	)
+
+	for _, b := range chunk {
+		if t.termios.IEnabled(linux.ISTRIP) {
+			b &= 0x7f
+		}
+		switch b {
+		case '\r':
+			if t.termios.IEnabled(linux.IGNCR) {
+				continue
+			}
+			if t.termios.IEnabled(linux.ICRNL) {
+				b = '\n'
+			}
+		case '\n':
+			if t.termios.IEnabled(linux.INLCR) {
+				b = '\r'
+			}
+		}
+		if t.termios.IEnabled(linux.IUCLC) && b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+
+		if t.termios.LEnabled(linux.ISIG) && b != 0 {
+			var sig linux.Signal
+			switch b {
+			case t.cc(linux.VINTR):
+				sig = linux.SIGINT
+			case t.cc(linux.VQUIT):
+				sig = linux.SIGQUIT
+			case t.cc(linux.VSUSP):
+				sig = linux.SIGTSTP
+			}
+			if sig != 0 {
+				sigs = append(sigs, sig)
+				if !t.termios.LEnabled(linux.NOFLSH) {
+					t.lineBuf = t.lineBuf[:0]
+					t.readBuf = t.readBuf[:0]
+					t.pendingEOF = false
+				}
+				if t.termios.LEnabled(linux.ECHO) {
+					if t.termios.LEnabled(linux.ECHOCTL) {
+						echo = append(echo, '^', b+0x40)
+					}
+					t.appendOutputNewlineLocked(&echo)
+				}
+				continue
+			}
+		}
+
+		if !t.termios.LEnabled(linux.ICANON) {
+			t.readBuf = append(t.readBuf, b)
+			notifyRead = true
+			if t.termios.LEnabled(linux.ECHO) {
+				t.appendEchoByteLocked(&echo, b)
+			}
+			continue
+		}
+
+		verase := t.cc(linux.VERASE)
+		if b != 0 && (b == verase || (verase == 0x7f && b == '\b')) {
+			t.eraseOneCharLocked(&echo)
+			continue
+		}
+		if t.termios.LEnabled(linux.IEXTEN) && b != 0 && b == t.cc(linux.VWERASE) {
+			t.eraseOneWordLocked(&echo)
+			continue
+		}
+		if b != 0 && b == t.cc(linux.VKILL) {
+			t.eraseLineLocked(&echo)
+			continue
+		}
+		if b != 0 && b == t.cc(linux.VEOF) {
+			if len(t.lineBuf) > 0 {
+				t.readBuf = append(t.readBuf, t.lineBuf...)
+				t.lineBuf = t.lineBuf[:0]
+			} else {
+				t.pendingEOF = true
+			}
+			notifyRead = true
+			continue
+		}
+
+		t.lineBuf = append(t.lineBuf, b)
+		if t.termios.LEnabled(linux.ECHO) {
+			t.appendEchoByteLocked(&echo, b)
+		} else if b == '\n' && t.termios.LEnabled(linux.ECHONL) {
+			t.appendOutputNewlineLocked(&echo)
+		}
+
+		veol := t.cc(linux.VEOL)
+		veol2 := t.cc(linux.VEOL2)
+		if b == '\n' || (b != 0 && (b == veol || b == veol2)) {
+			t.readBuf = append(t.readBuf, t.lineBuf...)
+			t.lineBuf = t.lineBuf[:0]
+			notifyRead = true
+		}
+	}
+	t.mu.Unlock()
+
+	if len(echo) > 0 && t.out != nil {
+		t.outMu.Lock()
+		_, _ = t.out.Write(echo)
+		t.outMu.Unlock()
+	}
+	for _, sig := range sigs {
+		t.signalForeground(sig)
+	}
+	if notifyRead {
+		t.wq.Notify(waiter.ReadableEvents)
+	}
+	return true
+}
+
+func (t *ttyState) signalForeground(sig linux.Signal) {
+	if t.ktty == nil {
+		return
+	}
+	t.ktty.SignalForegroundProcessGroup(kernel.SignalInfoPriv(sig))
+}
+
+func (t *ttyState) read(ctx gvcontext.Context, dst usermem.IOSequence) (int64, error) {
+	if dst.NumBytes() == 0 {
+		return 0, nil
+	}
+	t.mu.Lock()
+	if len(t.readBuf) > 0 {
+		count := min(int(dst.NumBytes()), len(t.readBuf))
+		chunk := append([]byte(nil), t.readBuf[:count]...)
+		t.readBuf = t.readBuf[count:]
+		t.mu.Unlock()
+		copied, err := dst.CopyOut(ctx, chunk)
+		return int64(copied), err
+	}
+	if t.pendingEOF {
+		t.pendingEOF = false
+		t.mu.Unlock()
+		return 0, io.EOF
+	}
+	if t.hostEOF {
+		err := t.hostErr
+		t.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	t.mu.Unlock()
+	return 0, linuxerr.ErrWouldBlock
+}
+
+func (t *ttyState) readReadiness() waiter.EventMask {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var mask waiter.EventMask
+	if len(t.readBuf) > 0 || t.pendingEOF || t.hostEOF {
+		mask |= waiter.ReadableEvents
+	}
+	if t.hostEOF && len(t.readBuf) == 0 {
+		mask |= waiter.EventHUp
+	}
+	return mask
+}
+
+func (t *ttyState) readableBytes() int32 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return int32(len(t.readBuf))
+}
+
+func (t *ttyState) flushInput() {
+	t.mu.Lock()
+	t.lineBuf = t.lineBuf[:0]
+	t.readBuf = t.readBuf[:0]
+	t.pendingEOF = false
+	t.mu.Unlock()
+}
+
+func (t *ttyState) shouldTranslateONLCR() bool {
+	if !t.rawHost {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.termios.OEnabled(linux.OPOST) && t.termios.OEnabled(linux.ONLCR)
+}
+
+func (t *ttyState) setTermios(kt linux.KernelTermios, flushInput bool) {
+	t.mu.Lock()
+	wasCanon := t.termios.LEnabled(linux.ICANON)
+	t.termios = kt
+	if flushInput {
+		t.lineBuf = t.lineBuf[:0]
+		t.readBuf = t.readBuf[:0]
+		t.pendingEOF = false
+	} else if wasCanon && !t.termios.LEnabled(linux.ICANON) && len(t.lineBuf) > 0 {
+		t.readBuf = append(t.readBuf, t.lineBuf...)
+		t.lineBuf = t.lineBuf[:0]
+	}
+	notify := len(t.readBuf) > 0
+	t.mu.Unlock()
+	if notify {
+		t.wq.Notify(waiter.ReadableEvents)
+	}
+}
+
+func (t *ttyState) setWinsize(ws linux.Winsize) {
+	t.mu.Lock()
+	changed := t.winsize.Row != ws.Row || t.winsize.Col != ws.Col
+	t.winsize = ws
+	t.mu.Unlock()
+	if changed {
+		t.signalForeground(linux.SIGWINCH)
 	}
 }
 
 func isHostTerminalReader(r io.Reader) bool {
-	f, ok := r.(*os.File)
-	if !ok || f == nil {
-		return false
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return (info.Mode() & os.ModeCharDevice) != 0
+	return isHostTerminal(r)
 }
 
 type stdioFD struct {
@@ -141,6 +576,37 @@ type stdioFD struct {
 
 func (f *stdioFD) Release(gvcontext.Context) {}
 
+func (f *stdioFD) EventRegister(e *waiter.Entry) error {
+	if f.tty != nil {
+		f.tty.wq.EventRegister(e)
+	}
+	return nil
+}
+
+func (f *stdioFD) EventUnregister(e *waiter.Entry) {
+	if f.tty != nil {
+		f.tty.wq.EventUnregister(e)
+	}
+}
+
+func (f *stdioFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	if f.tty == nil {
+		return waiter.ReadableEvents | waiter.WritableEvents
+	}
+	var ready waiter.EventMask
+	if f.writer != nil {
+		ready |= waiter.WritableEvents
+	}
+	if f.reader != nil {
+		ready |= f.tty.readReadiness()
+	}
+	return ready & mask
+}
+
+func (f *stdioFD) Epollable() bool {
+	return f.tty != nil
+}
+
 func (f *stdioFD) Stat(_ gvcontext.Context, _ vfs.StatOptions) (linux.Statx, error) {
 	if f.tty != nil {
 		return linux.Statx{
@@ -148,6 +614,7 @@ func (f *stdioFD) Stat(_ gvcontext.Context, _ vfs.StatOptions) (linux.Statx, err
 			Mode:      linux.S_IFCHR | 0o620,
 			Nlink:     1,
 			Blksize:   1024,
+			Ino:       1,
 			RdevMajor: linux.UNIX98_PTY_REPLICA_MAJOR,
 			RdevMinor: 0,
 		}, nil
@@ -169,6 +636,9 @@ func (f *stdioFD) SetStat(gvcontext.Context, vfs.SetStatOptions) error {
 func (f *stdioFD) Read(ctx gvcontext.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
 	if f.reader == nil {
 		return 0, io.EOF
+	}
+	if f.tty != nil {
+		return f.tty.read(ctx, dst)
 	}
 	if dst.NumBytes() == 0 {
 		return 0, nil
@@ -198,6 +668,27 @@ func (f *stdioFD) PRead(ctx gvcontext.Context, dst usermem.IOSequence, _ int64, 
 	return f.Read(ctx, dst, opts)
 }
 
+func translateONLCR(src []byte) []byte {
+	var nlCount int
+	for _, b := range src {
+		if b == '\n' {
+			nlCount++
+		}
+	}
+	if nlCount == 0 {
+		return src
+	}
+	out := make([]byte, 0, len(src)+nlCount)
+	for _, b := range src {
+		if b == '\n' {
+			out = append(out, '\r', '\n')
+		} else {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
 // Write copies guest output to the host writer. A host write failure returns
 // EIO to the guest, so the guest never sees a successful write that the host
 // dropped.
@@ -209,11 +700,15 @@ func (f *stdioFD) Write(ctx gvcontext.Context, src usermem.IOSequence, _ vfs.Wri
 	buf := make([]byte, total)
 	n, inErr := src.CopyIn(ctx, buf)
 	if n > 0 && f.writer != nil {
+		out := buf[:n]
+		if f.tty != nil && f.tty.shouldTranslateONLCR() {
+			out = translateONLCR(out)
+		}
 		f.mu.Lock()
-		wn, wErr := f.writer.Write(buf[:n])
+		_, wErr := f.writer.Write(out)
 		f.mu.Unlock()
 		if wErr != nil {
-			return int64(wn), linuxerr.EIO
+			return 0, linuxerr.EIO
 		}
 	}
 	return int64(n), inErr
@@ -232,12 +727,11 @@ func (f *stdioFD) Ioctl(ctx gvcontext.Context, _ usermem.IO, _ uintptr, args arc
 		return 0, linuxerr.ENOTTY
 	}
 
-	f.tty.mu.Lock()
-	defer f.tty.mu.Unlock()
-
 	switch cmd := args[1].Uint(); cmd {
 	case linux.TCGETS:
+		f.tty.mu.Lock()
 		termios := f.tty.termios.ToTermios()
+		f.tty.mu.Unlock()
 		_, err := termios.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TCSETS, linux.TCSETSW, linux.TCSETSF:
@@ -245,30 +739,50 @@ func (f *stdioFD) Ioctl(ctx gvcontext.Context, _ usermem.IO, _ uintptr, args arc
 		if _, err := termios.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
-		f.tty.termios.FromTermios(termios)
+		f.tty.mu.Lock()
+		kt := f.tty.termios
+		f.tty.mu.Unlock()
+		kt.FromTermios(termios)
+		f.tty.setTermios(kt, cmd == linux.TCSETSF)
 		return 0, nil
 	case linux.TCGETS2:
-		_, err := f.tty.termios.CopyOut(t, args[2].Pointer())
+		f.tty.mu.Lock()
+		kt := f.tty.termios
+		f.tty.mu.Unlock()
+		_, err := kt.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TCSETS2, linux.TCSETSW2, linux.TCSETSF2:
 		var kt linux.KernelTermios
 		if _, err := kt.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
-		f.tty.termios = kt
+		f.tty.setTermios(kt, cmd == linux.TCSETSF2)
 		return 0, nil
 	case linux.TIOCGWINSZ:
-		_, err := f.tty.winsize.CopyOut(t, args[2].Pointer())
+		f.tty.mu.Lock()
+		ws := f.tty.winsize
+		f.tty.mu.Unlock()
+		_, err := ws.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TIOCSWINSZ:
 		var ws linux.Winsize
 		if _, err := ws.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
-		f.tty.winsize = ws
+		f.tty.setWinsize(ws)
 		return 0, nil
 	case linux.TIOCGPGRP:
-		ret := primitive.Int32(f.tty.fgPgrp)
+		if f.tty.ktty != nil {
+			if pgid, err := t.ThreadGroup().ForegroundProcessGroupID(f.tty.ktty); err == nil {
+				ret := primitive.Int32(pgid)
+				_, cErr := ret.CopyOut(t, args[2].Pointer())
+				return 0, cErr
+			}
+		}
+		f.tty.mu.Lock()
+		fg := f.tty.fgPgrp
+		f.tty.mu.Unlock()
+		ret := primitive.Int32(fg)
 		_, err := ret.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TIOCSPGRP:
@@ -276,21 +790,56 @@ func (f *stdioFD) Ioctl(ctx gvcontext.Context, _ usermem.IO, _ uintptr, args arc
 		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
+		f.tty.mu.Lock()
 		f.tty.fgPgrp = int32(pgid)
+		f.tty.mu.Unlock()
+		if f.tty.ktty != nil && t.ThreadGroup().TTY() == f.tty.ktty {
+			return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, f.tty.ktty, kernel.ProcessGroupID(pgid))
+		}
 		return 0, nil
 	case linux.TIOCGSID:
-		ret := primitive.Int32(f.tty.session)
+		if f.tty.ktty != nil {
+			if sid, err := t.ThreadGroup().SessionID(f.tty.ktty, false); err == nil {
+				ret := primitive.Int32(sid)
+				_, cErr := ret.CopyOut(t, args[2].Pointer())
+				return 0, cErr
+			}
+		}
+		f.tty.mu.Lock()
+		sid := f.tty.session
+		f.tty.mu.Unlock()
+		ret := primitive.Int32(sid)
 		_, err := ret.CopyOut(t, args[2].Pointer())
 		return 0, err
+	case linux.TIOCSCTTY:
+		if f.tty.ktty != nil {
+			steal := args[2].Int() == 1
+			_ = t.ThreadGroup().SetControllingTTY(ctx, f.tty.ktty, steal, true)
+		}
+		return 0, nil
+	case linux.TIOCNOTTY:
+		if f.tty.ktty != nil {
+			_ = t.ThreadGroup().ReleaseControllingTTY(ctx, f.tty.ktty)
+		}
+		return 0, nil
 	case linux.TIOCGPTN:
 		ret := primitive.Uint32(0)
 		_, err := ret.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.FIONREAD:
-		ret := primitive.Int32(0)
+		ret := primitive.Int32(f.tty.readableBytes())
 		_, err := ret.CopyOut(t, args[2].Pointer())
 		return 0, err
-	case linux.TIOCSCTTY, linux.TIOCNOTTY, linux.TCSBRK, linux.TCFLSH, linux.TIOCSPTLCK:
+	case linux.TCFLSH:
+		switch args[2].Uint() {
+		case linux.TCIFLUSH, linux.TCIOFLUSH:
+			f.tty.flushInput()
+		case linux.TCOFLUSH:
+		default:
+			return 0, linuxerr.EINVAL
+		}
+		return 0, nil
+	case linux.TCSBRK, linux.TIOCSPTLCK:
 		return 0, nil
 	default:
 		return 0, linuxerr.ENOTTY
@@ -459,7 +1008,15 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	var tty *ttyState
 	if s.cfg.TTY || isHostTerminalReader(s.cfg.Stdin) {
-		tty = newDefaultTTYState()
+		restoreTerm, rawHost := enterHostRawMode(s.cfg.Stdin, s.cfg.Stdout)
+		defer restoreTerm()
+		rows, cols, _ := hostTerminalSize(s.cfg.Stdin, s.cfg.Stdout)
+		tty = newTTYState(s.cfg.Stdin, s.cfg.Stdout, rawHost, rows, cols)
+		stopWinch := watchHostWinch(ctx, s.cfg.Stdin, s.cfg.Stdout, func(r, c uint16) {
+			tty.setWinsize(linux.Winsize{Row: r, Col: c})
+		})
+		defer stopWinch()
+		defer tty.stop()
 	}
 
 	stdio, err := openStdioFDs(sctx, vfsObj, creds, s.cfg.Stdin, s.cfg.Stdout, s.cfg.Stderr, tty)
@@ -489,6 +1046,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	envv := finalizeEnv(s.cfg.Envv, guestEnvDefaults{Home: user.Home, Hostname: s.hostname(), TTY: tty != nil})
 
+	var procTTY *kernel.TTY
+	if tty != nil {
+		procTTY = tty.ktty
+	}
+
 	mntns.IncRef()
 	procArgs := kernel.CreateProcessArgs{
 		Filename:             execPath,
@@ -506,6 +1068,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		Origin:               kernel.OriginExec,
 		ContainerID:          cmp.Or(s.cfg.Name, "gvx-default"),
 		PIDNamespace:         k.RootPIDNamespace(),
+		TTY:                  procTTY,
 	}
 
 	tg, _, err := k.CreateProcess(procArgs)
@@ -514,6 +1077,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 			err = fmt.Errorf("%w; %s", err, hint)
 		}
 		return 1, fmt.Errorf("gvx: create guest process %q: %w", execPath, err)
+	}
+
+	if tty != nil {
+		tty.startPump()
 	}
 
 	if err := k.Start(); err != nil {
