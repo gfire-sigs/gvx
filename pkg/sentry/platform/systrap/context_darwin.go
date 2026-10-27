@@ -366,6 +366,7 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 	defer c.interrupt.Disable()
 	c.kicked.Store(false)
 
+	as.beforeSwitch(ctx, mm)
 	state := c.prepareResume(th, ac)
 	// stopPC and stopKind describe the last stop that Switch resumed
 	// internally, so that an interrupt reports the state of that stop.
@@ -399,7 +400,8 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 			}
 			if meta.kind == siteMSR {
 				sm.TLS = msrValue(sm, meta.reg)
-				th.lastKind, th.lastPC = kindSyscall, meta.site+4
+				guestNext := as.p.guestAddr(meta.site) + 4
+				th.lastKind, th.lastPC = kindSyscall, guestNext
 				stopPC, stopKind = meta.site+4, kindSyscall
 				state = stateRunHot
 				continue
@@ -408,11 +410,15 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 				// The guest jumps through x18, whose value only the sysmsg holds.
 				// The cold resume loads the new PC from the context.
 				if meta.reg == 1 {
-					sm.MC.SS.LR = meta.site + 4
+					sm.MC.SS.LR = as.p.guestAddr(meta.site) + 4
 				}
-				sm.MC.SS.PC = sm.X18
+				target := sm.X18
+				if as.p.zone && inZoneGuest(target) && as.zoneMappedExec(target) {
+					target += zoneBias
+				}
+				sm.MC.SS.PC = target
 				th.lastKind = kindSignal
-				stopPC, stopKind = sm.X18, kindSignal
+				stopPC, stopKind = target, kindSignal
 				state = stateRunCold
 				continue
 			}
@@ -466,7 +472,11 @@ func (c *Context) prepareResume(th *thread, ac *arch.Context64) uint32 {
 	for i := 0; i < 29; i++ {
 		ss.X[i] = regs.Regs[i]
 	}
-	ss.FP, ss.LR, ss.SP, ss.PC = regs.Regs[29], regs.Regs[30], regs.Sp, regs.Pc
+	stubPC := regs.Pc
+	if th.as.p.zone && inZoneGuest(stubPC) && th.as.zoneMappedExec(stubPC) {
+		stubPC += zoneBias
+	}
+	ss.FP, ss.LR, ss.SP, ss.PC = regs.Regs[29], regs.Regs[30], regs.Sp, stubPC
 	ss.CPSR = uint32(regs.Pstate & nzcvMask)
 	ss.Flags = 0
 	if c.needRestoreFP || th.fresh {
@@ -490,10 +500,11 @@ func (c *Context) pull(th *thread, ac *arch.Context64, pc uint64, kind uint32) {
 	regs.Regs[x18Reg] = th.sm.X18
 	regs.Regs[29], regs.Regs[30] = ss.FP, ss.LR
 	regs.Sp = ss.SP
-	regs.Pc = pc
+	guestPC := c.p.guestAddr(pc)
+	regs.Pc = guestPC
 	regs.Pstate = uint64(ss.CPSR) & nzcvMask
 	regs.TPIDR_EL0 = th.sm.TLS
-	th.lastKind, th.lastPC = kind, pc
+	th.lastKind, th.lastPC = kind, guestPC
 	if kind != kindSyscall {
 		// A signal stop restores the whole context, so ss.PC must carry the resume address.
 		ss.PC = pc
@@ -574,7 +585,7 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 	case darwinSIGSEGV, darwinSIGBUS:
 		switch ec {
 		case ecInstructionAbort:
-			if st, _, ok := as.blockStateOf(blockRound(pc)); ok {
+			if st, _, ok := as.blockStateOf(blockRound(pc)); ok && as.isExecSubBlock(pc) {
 				if st == blockData {
 					if err := as.patchBlock(ctx, mm, pc); err != nil {
 						return contextErr(fmt.Errorf("patch the code page at %#x: %w", blockRound(pc), err), unix.ENOMEM)
@@ -585,6 +596,15 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 				return signalAction{resume: true}
 			}
 		case ecDataAbort:
+			if far < faultLowLimit && sm.X18 >= faultLowLimit {
+				patched, err := as.patchX18Site(ctx, mm, pc)
+				if err != nil {
+					return contextErr(fmt.Errorf("patch the x18 access at %#x: %w", pc, err), unix.ENOMEM)
+				}
+				if patched {
+					return signalAction{resume: true}
+				}
+			}
 			if esr&esrWnR != 0 {
 				if act, done := c.storeToExecBlock(as, sm, pc, far); done {
 					return act

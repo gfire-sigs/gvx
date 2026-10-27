@@ -126,11 +126,12 @@ func TestScanZoneFindsTheInstructionsThatNeedSlots(t *testing.T) {
 	put(1, 0x907fffe4) // adrp x4, +4GB less 16KB: outside the zone
 	put(2, 0xd63f0100) // blr x8
 	put(3, 0xd61f0120) // br x9
-	put(4, 0xd63f03c0) // blr x30: the link register has no slot
+	put(4, 0xd65f03c0) // ret x30
 	put(5, 0x9000001f) // adrp xzr: discards the result
+	put(6, 0x94000010) // bl +0x40
 	sites := scanZone(code, base, func(int) bool { return false })
-	if len(sites) != 3 {
-		t.Fatalf("scanZone found %d sites, want 3: %+v", len(sites), sites)
+	if len(sites) != 5 {
+		t.Fatalf("scanZone found %d sites, want 5: %+v", len(sites), sites)
 	}
 	if s := sites[0]; s.kind != siteAdrp || s.reg != 3 || s.value != 0x400000 {
 		t.Errorf("first site = %+v, want adrp x3 with value 0x400000", s)
@@ -140,5 +141,11 @@ func TestScanZoneFindsTheInstructionsThatNeedSlots(t *testing.T) {
 	}
 	if s := sites[2]; s.kind != siteIndirect || s.reg != 9 || s.link {
 		t.Errorf("third site = %+v, want br x9", s)
+	}
+	if s := sites[3]; s.kind != siteIndirect || s.reg != 30 || s.link {
+		t.Errorf("fourth site = %+v, want ret x30", s)
+	}
+	if s := sites[4]; s.kind != siteBL || s.value != base+24+0x40 {
+		t.Errorf("fifth site = %+v, want bl with target %#x", s, uint64(base+24+0x40))
 	}
 }

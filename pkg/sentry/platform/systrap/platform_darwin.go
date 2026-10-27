@@ -104,7 +104,7 @@ var (
 // New spawns the template stub process and returns a Platform. It must run
 // before the Sentry locks itself down.
 func New() (*Platform, error) {
-	if host := unix.Getpagesize(); hostarch.PageSize != blockSize || host != blockSize {
+	if host := unix.Getpagesize(); (hostarch.PageSize != subBlockSize && hostarch.PageSize != blockSize) || host != blockSize {
 		return nil, &ErrUnsupportedPageSize{GuestPage: hostarch.PageSize, HostPage: host}
 	}
 	configureOnce.Do(func() { arch.ConfigureAddressSpace(1 << 48) })
@@ -120,14 +120,8 @@ func New() (*Platform, error) {
 		_ = pool.close()
 		return nil, err
 	}
-	zone := zoneModeRequested()
-	if zone {
-		if userMin > zoneBias+zoneMin || userMax < zoneBias+zoneLimit+blockSize {
-			_ = host.close()
-			_ = pool.close()
-			return nil, fmt.Errorf("the guest address range [%#x, %#x) cannot hold the zone for fixed-address executables at %#x", userMin, userMax, uint64(zoneBias))
-		}
-	}
+	canHoldZone := userMin <= zoneBias+zoneMin && userMax >= zoneBias+zoneLimit+blockSize
+	zone := canHoldZone && !zoneModeDisabled()
 	return &Platform{pool: pool, host: host, userMin: userMin, userMax: userMax, zone: zone}, nil
 }
 

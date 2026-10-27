@@ -334,8 +334,12 @@ func planAddress(site uint64, inst arm64asm.Inst) *x18Plan {
 	if inst.Op == arm64asm.ADRP {
 		base = site &^ 0xfff
 	}
+	target := uint64(int64(base) + int64(rel))
+	if inZoneStub(target) {
+		target -= zoneBias
+	}
 	const scratch = 17
-	return &x18Plan{kind: siteX18, scratch: scratch, body: movConst(scratch, uint64(int64(base)+int64(rel)))}
+	return &x18Plan{kind: siteX18, scratch: scratch, body: movConst(scratch, target)}
 }
 
 // planLiteral builds the slot of a load from a literal pool into x18.
@@ -530,6 +534,34 @@ type x18Site struct {
 	// Offset is the byte offset of the instruction inside the scanned code.
 	Offset uint32
 	Plan   *x18Plan
+}
+
+// isASCIIStringWindow reports whether the 16-byte window around off in code
+// consists of printable ASCII or string terminators, which indicates embedded
+// read-only string data in a stripped single-segment ELF.
+func isASCIIStringWindow(code []byte, off int) bool {
+	start := off - 4
+	if start < 0 {
+		start = 0
+	}
+	end := start + 16
+	if end > len(code) {
+		end = len(code)
+	}
+	if end-start < 8 {
+		return false
+	}
+	printable := 0
+	for _, b := range code[start:end] {
+		switch {
+		case b >= 0x20 && b <= 0x7e, b == '\n', b == '\r', b == '\t':
+			printable++
+		case b == 0:
+		default:
+			return false
+		}
+	}
+	return printable >= (end-start)*3/4
 }
 
 // scanX18 returns the x18 sites of one code block. base is the guest address

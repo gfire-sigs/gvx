@@ -12,29 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64 && !pagesize_16k
+//go:build darwin && arm64
 
 package systrap
 
 import (
-	"errors"
 	"testing"
+
+	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
-// TestNewNeedsSixteenKilobytePages checks that a default build refuses to run
-// instead of running in a degraded mode.
-func TestNewNeedsSixteenKilobytePages(t *testing.T) {
+// TestNewSupportsConfiguredGuestPageSize checks that New succeeds with 4KB and
+// 16KB guest page sizes on a 16KB Apple silicon host.
+func TestNewSupportsConfiguredGuestPageSize(t *testing.T) {
+	if hostarch.PageSize != subBlockSize && hostarch.PageSize != blockSize {
+		t.Fatalf("unexpected hostarch.PageSize = %d", hostarch.PageSize)
+	}
 	p, err := New()
-	if p != nil {
-		_ = p.Close()
-		t.Fatal("New succeeded with 4KB guest pages")
+	if err != nil {
+		t.Fatalf("New() with %dB guest pages failed: %v", hostarch.PageSize, err)
 	}
-	var pe *ErrUnsupportedPageSize
-	if !errors.As(err, &pe) {
-		t.Fatalf("New error = %v, want *ErrUnsupportedPageSize", err)
-	}
-	const want = "systrap on darwin/arm64 needs hostarch.PageSize == host VM page size (16KB): build with -tags pagesize_16k"
-	if got := err.Error(); len(got) < len(want) || got[:len(want)] != want {
-		t.Fatalf("error text = %q, want prefix %q", got, want)
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

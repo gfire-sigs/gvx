@@ -63,3 +63,11 @@ type ExecImageProvider interface {
 	// headers sit beyond the last mapped segment.
 	ExecImageAt(ctx context.Context, addr hostarch.Addr) ExecImage
 }
+
+// SubBlockPopulator is implemented by a MemoryManager that can populate a 4KB
+// sub-block inside a larger host page.
+type SubBlockPopulator interface {
+	// PopulateSubBlock ensures that a readable virtual memory area at addr is
+	// mapped into the active AddressSpace.
+	PopulateSubBlock(ctx context.Context, addr hostarch.Addr) bool
+}

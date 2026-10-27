@@ -389,7 +389,7 @@ func systrapBase() uint64 {
 	if runtime.GOOS == "linux" {
 		return 0x400000
 	}
-	return 0x1000_0000_0000
+	return 0x5000_0000_0000
 }
 
 func TestSandboxRunsStaticAndDynamicELF64UnderSystrap(t *testing.T) {

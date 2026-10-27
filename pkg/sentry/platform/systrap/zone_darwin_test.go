@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64 && pagesize_16k
+//go:build darwin && arm64
 
 package systrap
 
@@ -23,6 +23,9 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 // The guests of the zone tests link where a fixed-address executable links: the
@@ -41,13 +44,15 @@ var (
 // guest address range of the host cannot hold the zone.
 func newZonePlatform(t testing.TB) *Platform {
 	t.Helper()
-	t.Setenv(ZoneEnv, "1")
 	p, err := New()
 	if err != nil {
 		if strings.Contains(err.Error(), "cannot hold the zone") {
 			t.Skipf("zone mode is unavailable on this host: %v", err)
 		}
 		t.Fatalf("New: %v", err)
+	}
+	if !p.zone {
+		t.Skip("zone mode is unavailable on this host")
 	}
 	t.Cleanup(func() {
 		if err := p.Close(); err != nil {
@@ -269,7 +274,7 @@ func TestZoneFaultsReportGuestAddresses(t *testing.T) {
 		if got := r.regs().Regs[1]; got != 0 {
 			t.Errorf("x1 = %#x after the fault, want the guest value 0", got)
 		}
-		if got, want := r.regs().Pc, uint64(zoneBias+zoneCode+12); got != want {
+		if got, want := r.regs().Pc, uint64(zoneCode+12); got != want {
 			t.Errorf("pc = %#x, want the site %#x", got, want)
 		}
 	})
@@ -413,5 +418,136 @@ func TestUnmapAcrossTheHoleKeepsTheBiasedZone(t *testing.T) {
 		if r[0] < zoneBias+zoneLimit {
 			t.Errorf("range %#x reaches into the hole that holds the biased zone", r)
 		}
+	}
+}
+
+func TestZoneBLProducesUnbiasedLinkRegister(t *testing.T) {
+	// A direct bl inside the zone must set x30 (LR) to the unbiased guest
+	// return address so stack unwinders and pointer comparisons see the true
+	// guest address, and ret must return through that unbiased address.
+	r := newZoneRig(t)
+	prog := make([]uint32, 0x30)
+	// 0x00: bl +0x80 (target zoneCode+0x80)
+	// 0x04: mov x8, #9
+	// 0x08: svc #0
+	prog[0] = 0x94000020
+	prog[1] = movz(8, 9)
+	prog[2] = insnSVC0
+	// 0x80: mov x0, x30
+	// 0x84: ret
+	prog[0x80/4] = 0xaa1e03e0
+	prog[0x84/4] = 0xd65f03c0
+	r.zoneProgram(zoneCode, prog...)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	if got, want := r.regs().Regs[0], uint64(zoneCode+4); got != want {
+		t.Errorf("x30 inside callee of bl = %#x, want unbiased guest address %#x", got, want)
+	}
+}
+
+func TestZoneIndirectBranchesPreserveAllRegistersAndFlags(t *testing.T) {
+	// Pure assembly programs hold live values in x16, x17, xRn, and NZCV across
+	// br, blr, and ret. Verify that indirect branches clobber no general-purpose
+	// register and no condition flag.
+	r := newZoneRig(t)
+	prog := make([]uint32, 0x40)
+	body := []uint32{
+		movz(16, 0x1616),
+		movz(17, 0x1717),
+	}
+	body = append(body, loadAddr(9, zoneCode+0x80)...)
+	body = append(body,
+		0xd2800000, // mov x0, #0
+		0xf100041f, // cmp x0, #1 (sets N=1)
+		0xd63f0120, // blr x9
+		0x1a9f57ea, // cset w10, mi (reads N flag after blr + ret)
+		movz(8, 9),
+		insnSVC0,
+	)
+	copy(prog, body)
+	// Callee at 0x80: copies x30 into x11 and returns via ret x30 without
+	// touching x16, x17, x9, or NZCV.
+	prog[0x80/4] = 0xaa1e03eb // mov x11, x30
+	prog[0x84/4] = 0xd65f03c0 // ret
+	r.zoneProgram(zoneCode, prog...)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	x := &r.regs().Regs
+	if x[16] != 0x1616 || x[17] != 0x1717 {
+		t.Errorf("x16, x17 = %#x, %#x, want 0x1616, 0x1717", x[16], x[17])
+	}
+	if x[9] != zoneCode+0x80 {
+		t.Errorf("x9 = %#x, want %#x", x[9], uint64(zoneCode+0x80))
+	}
+	if x[10] != 1 {
+		t.Errorf("N flag after blr and ret = %d, want 1", x[10])
+	}
+	wantRet := uint64(zoneCode + 4*(len(body)-3))
+	if x[11] != wantRet {
+		t.Errorf("x30 seen by callee = %#x, want unbiased %#x", x[11], wantRet)
+	}
+}
+
+func TestZoneStackPointerAccessEmulated(t *testing.T) {
+	// When a guest places its stack inside the low 4GB zone, loads and stores
+	// through SP are emulated by the Sentry.
+	r := newZoneRig(t)
+	r.mapPage(zoneData, readWrite)
+	r.mapPage(zoneCode, readExec,
+		movz(1, 0x4242),
+		0xf90007e1, // str x1, [sp, #8]
+		0xf94007e0, // ldr x0, [sp, #8]
+		movz(8, 9),
+		insnSVC0,
+	)
+	r.ac.SetIP(zoneCode)
+	r.ac.SetStack(zoneData + 0x100)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	if got := r.regs().Regs[0]; got != 0x4242 {
+		t.Errorf("x0 = %#x, want 0x4242 loaded from zone SP", got)
+	}
+}
+
+func TestZoneFourKilobyteSubBlocks(t *testing.T) {
+	// Map sub-block 0 of zoneCode as read-execute and sub-block 1 (zoneCode+0x1000)
+	// as read-write within the same 16KB host block.
+	r := newZoneRig(t)
+	fr, err := r.mf.Allocate(blockSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := r.mf.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := bs.Head().ToSlice()
+	prog := append(loadAddr(1, zoneCode+subBlockSize),
+		movz(2, 0x7788),
+		0xf9000022, // str x2, [x1]
+		0xf9400020, // ldr x0, [x1]
+		movz(8, 9),
+		insnSVC0,
+	)
+	for i, w := range prog {
+		binary.LittleEndian.PutUint32(mem[i*4:], w)
+	}
+	r.mm.reserve(zoneCode, blockSize)
+	r.mm.record(zoneCode, mem)
+	sub0 := memmap.FileRange{Start: fr.Start, End: fr.Start + subBlockSize}
+	sub1 := memmap.FileRange{Start: fr.Start + subBlockSize, End: fr.Start + 2*subBlockSize}
+	if err := r.as.MapFile(zoneCode, r.mf, sub0, readExec, false); err != nil {
+		t.Fatalf("MapFile sub0: %v", err)
+	}
+	if err := r.as.MapFile(zoneCode+subBlockSize, r.mf, sub1, readWrite, false); err != nil {
+		t.Fatalf("MapFile sub1: %v", err)
+	}
+	r.mapPage(stackVA, readWrite)
+	r.ac.SetIP(zoneCode)
+	r.ac.SetStack(stackVA + blockSize - 0x100)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	if got := r.regs().Regs[0]; got != 0x7788 {
+		t.Errorf("x0 = %#x, want 0x7788 from 4KB RW sub-block adjacent to 4KB RX sub-block", got)
 	}
 }

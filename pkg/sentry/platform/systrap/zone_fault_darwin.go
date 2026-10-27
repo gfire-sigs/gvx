@@ -51,7 +51,14 @@ func (c *Context) zoneFault(ctx context.Context, mm platform.MemoryManager, as *
 	sm := th.sm
 	if as.inIsland(pc) {
 		meta, start, ok := as.slotWithin(pc)
-		if !ok || meta.kind != siteMem || ec != ecDataAbort {
+		if !ok {
+			return signalAction{}, false
+		}
+		if meta.kind == siteIndirect && ec == ecDataAbort && far < faultLowLimit {
+			sm.MC.SS.PC = start
+			return signalAction{resume: true}, true
+		}
+		if meta.kind != siteMem || ec != ecDataAbort {
 			return signalAction{}, false
 		}
 		wordIdx := (pc - start) / 4
@@ -104,6 +111,24 @@ func (c *Context) zoneFault(ctx context.Context, mm platform.MemoryManager, as *
 	case ec == ecInstructionAbort && inZoneGuest(pc) && as.zoneMappedExec(pc):
 		sm.MC.SS.PC = pc + zoneBias
 		return signalAction{resume: true}, true
+	case ec == ecInstructionAbort && (pc == 0 || (pc >= zoneBias && pc < zoneBias+zoneMin)):
+		target := sm.IndTarget
+		if pc >= zoneBias && pc < zoneBias+zoneMin && target >= zoneMin {
+			// Hardware x18 was zeroed before orr x18, x18, #zoneBias, so the
+			// branch landed at zoneBias while IndTarget holds the true target.
+		} else if pc >= zoneBias && pc < zoneBias+zoneMin {
+			target = pc - zoneBias
+		}
+		if inZoneGuest(target) && as.zoneMappedExec(target) {
+			sm.MC.SS.PC = target + zoneBias
+			return signalAction{resume: true}, true
+		}
+		if target >= zoneLimit {
+			sm.MC.SS.PC = target
+			return signalAction{resume: true}, true
+		}
+		sm.MC.SS.PC = target
+		return c.reportFault(th, ac, sig, ec, esr, target, target), true
 	case ec == ecDataAbort && inZoneGuest(far) && as.zoneMappedAt(far):
 		ok, err := as.patchMemSite(ctx, mm, pc)
 		if err != nil {
@@ -111,6 +136,9 @@ func (c *Context) zoneFault(ctx context.Context, mm platform.MemoryManager, as *
 		}
 		if ok {
 			return signalAction{resume: true}, true
+		}
+		if act, done := c.emulateZoneMemAccess(as, sm, pc, far, esr&esrWnR != 0); done {
+			return act, true
 		}
 	}
 	return signalAction{}, false
@@ -155,21 +183,169 @@ func restoreSpilledScratch(ss *armThreadState, sm *sysmsg) {
 	ss.X[17] = sm.Scratch[1]
 }
 
-// zoneMappedAt reports whether the guest maps the block that holds the zone
-// address a.
+// zoneMappedAt reports whether the guest maps the 4KB sub-block that holds the
+// zone address a.
 func (as *addressSpace) zoneMappedAt(a uint64) bool {
+	stub := a + zoneBias
+	base := blockRound(stub)
+	subIdx := (stub - base) / subBlockSize
 	as.mu.Lock()
 	defer as.mu.Unlock()
-	_, ok := as.zoneMapped[blockRound(a+zoneBias)]
+	if hb := as.hostBlocks[base]; hb != nil {
+		return hb.subs[subIdx].src != 0
+	}
+	_, ok := as.zoneMapped[base]
 	return ok
 }
 
-// zoneMappedExec reports whether the guest maps the zone address a as code.
+// zoneMappedExec reports whether the guest maps the 4KB sub-block at zone
+// address a with execute permission.
 func (as *addressSpace) zoneMappedExec(a uint64) bool {
+	stub := a + zoneBias
+	base := blockRound(stub)
+	subIdx := (stub - base) / subBlockSize
 	as.mu.Lock()
 	defer as.mu.Unlock()
-	_, ok := as.blocks[blockRound(a+zoneBias)]
+	if hb := as.hostBlocks[base]; hb != nil {
+		return hb.execMask&(1<<subIdx) != 0
+	}
+	_, ok := as.blocks[base]
 	return ok
+}
+
+// emulateZoneMemAccess emulates a load, store, atomic, or cache maintenance
+// instruction at pc targeting a mapped zone address when classifyMemAccess
+// declines to patch the instruction in place (for example when the instruction
+// accesses the zone through SP).
+func (c *Context) emulateZoneMemAccess(as *addressSpace, sm *sysmsg, pc, farGuest uint64, isWrite bool) (signalAction, bool) {
+	if isWrite {
+		if act, done := c.storeToExecBlock(as, sm, pc, farGuest); done {
+			return act, true
+		}
+		return signalAction{}, false
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released {
+		return signalAction{}, false
+	}
+	insn, ok := as.codeWordLocked(pc)
+	if !ok {
+		return signalAction{}, false
+	}
+	read := func(addr uint64, n int) ([]byte, bool) {
+		if n <= 0 {
+			return nil, false
+		}
+		out := make([]byte, n)
+		stubStart := as.p.stubAddr(addr)
+		for i := 0; i < n; i++ {
+			cur := stubStart + uint64(i)
+			tBase := blockRound(cur)
+			ts := int((cur - tBase) / subBlockSize)
+			if tHB := as.hostBlocks[tBase]; tHB != nil {
+				sub := tHB.subs[ts]
+				if sub.src == 0 {
+					return nil, false
+				}
+				subOff := cur - (tBase + uint64(ts)*subBlockSize)
+				out[i] = unsafe.Slice((*byte)(addrPtr(sub.src)), subBlockSize)[subOff]
+			} else if tBlk := as.blocks[tBase]; tBlk != nil && tBlk.src != 0 {
+				out[i] = pageBytes(tBlk.src)[cur-tBase]
+			} else {
+				return nil, false
+			}
+		}
+		return out, true
+	}
+	regs := storeRegs{ss: &sm.MC.SS, ns: &sm.MC.NS, x18: &sm.X18}
+	if emulateLoad(insn, regs, read) {
+		sm.MC.SS.PC = pc + 4
+		return signalAction{resume: true}, true
+	}
+	return signalAction{}, false
+}
+
+// patchX18Site patches a single instruction at stub address pc that names x18
+// when it faults at runtime (such as inside an anonymous JIT mapping that was
+// not statically scanned).
+func (as *addressSpace) patchX18Site(ctx context.Context, mm platform.MemoryManager, pc uint64) (bool, error) {
+	base := blockRound(pc)
+	as.mu.Lock()
+	blk := as.blocks[base]
+	if as.released || blk == nil || blk.state != blockExec || blk.priv == 0 {
+		as.mu.Unlock()
+		return false, nil
+	}
+	priv := blk.priv
+	as.mu.Unlock()
+
+	as.patchMu.Lock()
+	defer as.patchMu.Unlock()
+	page := pageBytes(priv)
+	off := pc - base
+	word := page[off : off+4]
+	insn := binary.LittleEndian.Uint32(word)
+	if target, ok := decodeBranch(pc, insn); ok {
+		if meta, found := as.slotAt(target, false); found && meta.site == pc {
+			return true, nil
+		}
+	}
+	p := planX18(insn, pc)
+	if p == nil {
+		return false, nil
+	}
+	size := p.slotSize()
+	isl, slotOff, slotVA, err := as.allocSlot(ctx, mm, pc, size)
+	if err != nil {
+		return false, err
+	}
+	ref := slotRef{isl: isl, off: slotOff, size: uint32(size)}
+	freeAllocated := func() {
+		as.mu.Lock()
+		as.freeSlotRefsLocked([]slotRef{ref})
+		as.mu.Unlock()
+	}
+	buf := pageBytes(isl.page)[slotOff:]
+	meta := slotMeta{site: pc, kind: p.kind, size: uint32(size)}
+	switch p.kind {
+	case siteX18, siteX18Cond:
+		meta.body, meta.scratch = uint8(len(p.body)), p.scratch
+		err = encodeX18Slot(buf, slotVA, pc, p)
+	case siteX18Jump:
+		if p.link {
+			meta.reg = 1
+		}
+		err = encodeTrapSlot(buf, slotVA, pc+4, as.p.host.hello.Spill)
+	default:
+		err = fmt.Errorf("unexpected x18 plan kind %d", p.kind)
+	}
+	if err != nil {
+		freeAllocated()
+		return false, err
+	}
+	br, err := encodeBranch(pc, slotVA)
+	if err != nil {
+		freeAllocated()
+		return false, err
+	}
+	flushCode(pageBytes(isl.page))
+	if err := as.syncStubCode(isl.base); err != nil {
+		freeAllocated()
+		return false, err
+	}
+	as.mu.Lock()
+	if as.released || as.blocks[base] != blk || blk.state != blockExec || blk.priv != priv {
+		as.freeSlotRefsLocked([]slotRef{ref})
+		as.mu.Unlock()
+		return true, nil
+	}
+	isl.slots[slotOff] = meta
+	blk.slots = append(blk.slots, ref)
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(&word[0])), br)
+	as.mu.Unlock()
+	flushCode(page)
+	return true, as.syncStubCode(base)
 }
 
 // patchMemSite replaces the load or store at the stub address pc by a branch

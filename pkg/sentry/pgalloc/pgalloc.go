@@ -762,51 +762,59 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 			uwgap = unwaste.LastLargeEnoughGap(alloc.length)
 		}
 		if uwgap.Ok() {
-			alloc.recycled = true
-			if alloc.opts.Dir == BottomUp {
-				fr = memmap.FileRange{
-					Start: uwgap.Start(),
-					End:   uwgap.Start() + alloc.length,
+			var ok bool
+			if alloc.huge {
+				ok = true
+				if alloc.opts.Dir == BottomUp {
+					fr = memmap.FileRange{
+						Start: uwgap.Start(),
+						End:   uwgap.Start() + alloc.length,
+					}
+				} else {
+					fr = memmap.FileRange{
+						Start: uwgap.End() - alloc.length,
+						End:   uwgap.End(),
+					}
 				}
 			} else {
-				fr = memmap.FileRange{
-					Start: uwgap.End() - alloc.length,
-					End:   uwgap.End(),
-				}
+				fr, ok = alignSmallAllocRange(uwgap.Range(), alloc.length, alloc.opts.Dir)
 			}
-			unwaste.Insert(uwgap, fr, unwasteInfo{})
-			// Update reference count for these pages from 0 to 1.
-			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
-				uf := ufseg.ValuePtr()
-				if uf.refs != 0 {
-					panic(fmt.Sprintf("waste pages %v have unexpected refcount %d during recycling of %v\n%s", ufseg.Range(), uf.refs, fr, f.stringLocked()))
-				}
-				uf.refs = 1
-				return true
-			})
-			// These pages should all be unknown-commitment or known-committed;
-			// mark them unknown-commitment, for consistency with non-recycling
-			// allocations (below).
-			f.memAcct.MutateFullRange(fr, func(maseg memAcctIterator) bool {
-				ma := maseg.ValuePtr()
-				malen := maseg.Range().Length()
-				if ma.knownCommitted {
-					if ma.kind != usage.System {
-						panic(fmt.Sprintf("waste pages %v have unexpected kind %v\n%s", maseg.Range(), ma.kind, f.stringLocked()))
+			if ok {
+				alloc.recycled = true
+				unwaste.Insert(uwgap, fr, unwasteInfo{})
+				// Update reference count for these pages from 0 to 1.
+				unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
+					uf := ufseg.ValuePtr()
+					if uf.refs != 0 {
+						panic(fmt.Sprintf("waste pages %v have unexpected refcount %d during recycling of %v\n%s", ufseg.Range(), uf.refs, fr, f.stringLocked()))
 					}
-					ma.knownCommitted = false
-					ma.commitSeq = f.commitSeq
-					f.knownCommittedBytes -= malen
-					if !f.opts.DisableMemoryAccounting {
-						usage.MemoryAccounting.Dec(malen, usage.System, ma.memCgID)
+					uf.refs = 1
+					return true
+				})
+				// These pages should all be unknown-commitment or known-committed;
+				// mark them unknown-commitment, for consistency with non-recycling
+				// allocations (below).
+				f.memAcct.MutateFullRange(fr, func(maseg memAcctIterator) bool {
+					ma := maseg.ValuePtr()
+					malen := maseg.Range().Length()
+					if ma.knownCommitted {
+						if ma.kind != usage.System {
+							panic(fmt.Sprintf("waste pages %v have unexpected kind %v\n%s", maseg.Range(), ma.kind, f.stringLocked()))
+						}
+						ma.knownCommitted = false
+						ma.commitSeq = f.commitSeq
+						f.knownCommittedBytes -= malen
+						if !f.opts.DisableMemoryAccounting {
+							usage.MemoryAccounting.Dec(malen, usage.System, ma.memCgID)
+						}
 					}
-				}
-				ma.kind = alloc.opts.Kind
-				ma.memCgID = alloc.opts.MemCgID
-				ma.wasteOrReleasing = false
-				return true
-			})
-			return
+					ma.kind = alloc.opts.Kind
+					ma.memCgID = alloc.opts.MemCgID
+					ma.wasteOrReleasing = false
+					return true
+				})
+				return
+			}
 		}
 	}
 
@@ -819,6 +827,21 @@ retryFree:
 	} else {
 		ufgap = unfree.LastLargeEnoughGap(alloc.length)
 	}
+	if ufgap.Ok() && !alloc.huge {
+		if alignedFR, ok := alignSmallAllocRange(ufgap.Range(), alloc.length, alloc.opts.Dir); ok {
+			fr = alignedFR
+		} else {
+			need := alloc.length + uint64(unix.Getpagesize()) - uint64(hostarch.PageSize)
+			if alloc.opts.Dir == BottomUp {
+				ufgap = unfree.FirstLargeEnoughGap(need)
+			} else {
+				ufgap = unfree.LastLargeEnoughGap(need)
+			}
+			if ufgap.Ok() {
+				fr, _ = alignSmallAllocRange(ufgap.Range(), alloc.length, alloc.opts.Dir)
+			}
+		}
+	}
 	if !ufgap.Ok() {
 		// Extend the file to create more chunks.
 		err = f.extendChunksLocked(alloc)
@@ -828,15 +851,17 @@ retryFree:
 		// Retry the allocation using new chunks.
 		goto retryFree
 	}
-	if alloc.opts.Dir == BottomUp {
-		fr = memmap.FileRange{
-			Start: ufgap.Start(),
-			End:   ufgap.Start() + alloc.length,
-		}
-	} else {
-		fr = memmap.FileRange{
-			Start: ufgap.End() - alloc.length,
-			End:   ufgap.End(),
+	if fr.Length() == 0 {
+		if alloc.opts.Dir == BottomUp {
+			fr = memmap.FileRange{
+				Start: ufgap.Start(),
+				End:   ufgap.Start() + alloc.length,
+			}
+		} else {
+			fr = memmap.FileRange{
+				Start: ufgap.End() - alloc.length,
+				End:   ufgap.End(),
+			}
 		}
 	}
 	unfree.Insert(ufgap, fr, unfreeInfo{refs: 1})

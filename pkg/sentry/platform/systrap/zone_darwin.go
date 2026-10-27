@@ -18,10 +18,10 @@ package systrap
 
 import "os"
 
-// ZoneEnv names the environment variable that turns the zone mode on. The mode
-// is a prototype. It lets a guest run an executable that links below 4GB, and
-// it moves every other mapping of the guest above the biased zone.
+// ZoneEnv names the optional environment variable that overrides zone mode.
+// Zone mode is enabled automatically when the host address range can hold the
+// biased 4GB zone; setting ZoneEnv to "0" disables it.
 const ZoneEnv = "GVX_SYSTRAP_FIXED_IMAGES"
 
-// zoneModeRequested reports whether the environment turns the zone mode on.
-func zoneModeRequested() bool { return os.Getenv(ZoneEnv) == "1" }
+// zoneModeDisabled reports whether the environment explicitly disables zone mode.
+func zoneModeDisabled() bool { return os.Getenv(ZoneEnv) == "0" }

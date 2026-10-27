@@ -42,9 +42,13 @@ func (mm *MemoryManager) overlapsHole(ar hostarch.AddrRange) bool {
 //
 // +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findAvoidingHoleLocked(length, alignment uint64, bounds hostarch.AddrRange, highest bool) (hostarch.Addr, error) {
-	find := mm.findLowestAvailableLocked
+	const hostBlockAlign = 0x4000
+	if length >= hostBlockAlign && alignment < hostBlockAlign {
+		alignment = hostBlockAlign
+	}
+	find := mm.findLowestAlignedLocked
 	if highest {
-		find = mm.findHighestAvailableLocked
+		find = mm.findHighestAlignedLocked
 	}
 	hole := mm.addressHole()
 	if hole.Length() == 0 || !bounds.Overlaps(hole) {
@@ -70,4 +74,37 @@ func (mm *MemoryManager) findAvoidingHoleLocked(length, alignment uint64, bounds
 		}
 	}
 	return 0, linuxerr.ENOMEM
+}
+
+// +checklocksread:mm.mappingMu
+func (mm *MemoryManager) findLowestAlignedLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
+	for gap := mm.vmas.LowerBoundGap(bounds.Start); gap.Ok() && gap.Start() < bounds.End; gap = gap.NextLargeEnoughGap(hostarch.Addr(length)) {
+		if gr := gap.availableRange().Intersect(bounds); uint64(gr.Length()) >= length {
+			if offset := uint64(gr.Start) % alignment; offset != 0 {
+				if uint64(gr.Length()) >= length+alignment-offset {
+					return gr.Start + hostarch.Addr(alignment-offset), nil
+				}
+				continue
+			}
+			return gr.Start, nil
+		}
+	}
+	return mm.findLowestAvailableLocked(length, alignment, bounds)
+}
+
+// +checklocksread:mm.mappingMu
+func (mm *MemoryManager) findHighestAlignedLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
+	for gap := mm.vmas.UpperBoundGap(bounds.End); gap.Ok() && gap.End() > bounds.Start; gap = gap.PrevLargeEnoughGap(hostarch.Addr(length)) {
+		if gr := gap.availableRange().Intersect(bounds); uint64(gr.Length()) >= length {
+			start := gr.End - hostarch.Addr(length)
+			if offset := uint64(start) % alignment; offset != 0 {
+				if gr.Start <= start-hostarch.Addr(offset) {
+					return start - hostarch.Addr(offset), nil
+				}
+				continue
+			}
+			return start, nil
+		}
+	}
+	return mm.findHighestAvailableLocked(length, alignment, bounds)
 }

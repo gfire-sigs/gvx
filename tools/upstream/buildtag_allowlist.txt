@@ -45,6 +45,7 @@ seam pkg/syserr/syserr.go
 # (pkg/sentry/platform/addrhole_xplat.go and pkg/sentry/mm/addrhole_xplat.go). The Windows engine
 # has a low guest window and a high guest window, and the host owns the range between them.
 seam pkg/sentry/mm/vma.go
+seam pkg/sentry/mm/pma.go
 
 # Content seam: the ELF loader gives a host page that holds parts of two PT_LOAD segments
 # the union of their permissions (pkg/sentry/loader/elf.go). A host with 16KB pages needs

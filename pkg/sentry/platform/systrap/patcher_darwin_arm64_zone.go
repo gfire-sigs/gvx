@@ -54,8 +54,9 @@ const (
 const (
 	memSlotSize  = 80
 	adrpSlotSize = 16
-	brSlotSize   = 16
-	blrSlotSize  = 32
+	blSlotSize   = 16
+	brSlotSize   = 32
+	blrSlotSize  = 48
 )
 
 // The words of the zone slots.
@@ -65,6 +66,7 @@ const (
 	zoneBiasAnd = 0x9251f800 // and xd, xn, #^zoneBias
 	zoneMovX16  = 0xaa0003f0 // mov x16, xm with m in bits 20:16
 	zoneMovX17  = 0xaa0003f1 // mov x17, xm with m in bits 20:16
+	zoneMovX18  = 0xaa0003f2 // mov x18, xm with m in bits 20:16
 	zoneBrReg   = 0xd61f0000 // br xn with n in bits 9:5
 )
 
@@ -75,8 +77,10 @@ const (
 	siteMem siteKind = iota + 200
 	// siteAdrp is an adr or adrp whose result lies in the zone.
 	siteAdrp
-	// siteIndirect is a br or blr through a register.
+	// siteIndirect is a br, blr, or ret through a register.
 	siteIndirect
+	// siteBL is a direct bl in the zone that loads an unbiased return address.
+	siteBL
 )
 
 // Flags of a memory slot, stored in slotMeta.scratch.
@@ -237,7 +241,13 @@ func encodeTBNZ(rt uint8, bit uint, delta int) uint32 {
 	return hvcommon.TBNZ(int(rt), int(bit), delta)
 }
 
+// encodeTBZ returns tbz xt, #bit with a branch of delta bytes.
+func encodeTBZ(rt uint8, bit uint, delta int) uint32 {
+	return hvcommon.TBZ(int(rt), int(bit), delta)
+}
+
 func encodeBiasTBNZ(rt uint8, delta int) uint32 { return encodeTBNZ(rt, zoneBiasBit, delta) }
+func encodeBiasTBZ(rt uint8, delta int) uint32  { return encodeTBZ(rt, zoneBiasBit, delta) }
 
 func encodeBiasOrr(rd, rn uint8) uint32 { return zoneBiasOrr | uint32(rn)<<5 | uint32(rd) }
 func encodeBiasAnd(rd, rn uint8) uint32 { return zoneBiasAnd | uint32(rn)<<5 | uint32(rd) }
@@ -344,32 +354,52 @@ func encodeAdrpSlot(buf []byte, slotVA, site uint64, rd uint8, value uint64) err
 	return nil
 }
 
-// encodeIndirectSlot writes a slot that replaces br or blr through register
-// rn. The slot adds the bias to a pointer of the zone and jumps. For blr it
-// first sets the link register to site+4, so that the callee returns to the
-// guest code and not to the slot. It returns the byte size of the slot.
-//
-// A blr leaves rn unchanged, and a guest keeps a callback pointer in a
-// callee-saved register for later compares and stores. The slot therefore
-// biases a copy of the pointer in x16. No callee reads x16 on entry, because
-// the calling convention names it a scratch register for the call itself. The
-// registers x16 and x17 and every br change the register in place. A br does
-// not return to the slot, so the slot cannot restore the register.
-func encodeIndirectSlot(buf []byte, slotVA, site uint64, rn uint8, link bool) (int, error) {
-	reg := rn
-	var w []uint32
-	if link && rn != 16 && rn != 17 {
-		reg = 16
-		w = append(w, zoneMovX16|uint32(rn)<<16)
+// encodeBLSlot writes a slot that loads the unbiased guest return address
+// guestRet into x30 and branches to the stub target address.
+func encodeBLSlot(buf []byte, slotVA, guestRet, target uint64) error {
+	if len(buf) < blSlotSize || guestRet >= 1<<32 {
+		return fmt.Errorf("bl slot for return %#x in %d bytes", guestRet, len(buf))
 	}
-	w = append(w, encodeBiasTBNZ(reg, 8), encodeBiasOrr(reg, reg))
+	br, err := encodeBranch(slotVA+8, target)
+	if err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint32(buf[0:], encodeMovZ(30, guestRet))
+	binary.LittleEndian.PutUint32(buf[4:], encodeMovK(30, guestRet>>16, 16))
+	binary.LittleEndian.PutUint32(buf[8:], br)
+	binary.LittleEndian.PutUint32(buf[12:], arm64NOP)
+	return nil
+}
+
+// encodeIndirectSlot writes a slot that replaces br, blr, or ret through
+// register rn. The slot saves the target in sysmsg.IndTarget, biases a copy in
+// hardware x18 without modifying X0..X17, X19..X30, or NZCV, and jumps. For
+// blr it sets x30 to the unbiased guest return address.
+func encodeIndirectSlot(buf []byte, slotVA, site uint64, rn uint8, link bool) (int, error) {
+	ptr := sysmsgPointer()
+	w := []uint32{
+		ptr[0],
+		ptr[1],
+		strFromSysmsg(rn, indTargetOffset),
+		zoneMovX18 | uint32(rn)<<16,
+		encodeBiasTBNZ(x18Reg, 8),
+		encodeBiasOrr(x18Reg, x18Reg),
+	}
 	size := brSlotSize
 	if link {
-		ret := site + 4
+		guestSite := site
+		if inZoneStub(guestSite) {
+			guestSite -= zoneBias
+		}
+		ret := guestSite + 4
 		w = append(w, encodeMovZ(30, ret), encodeMovK(30, ret>>16, 16), encodeMovK(30, ret>>32, 32))
 		size = blrSlotSize
 	}
-	w = append(w, zoneBrReg|uint32(reg)<<5)
+	if !link || rn != 30 {
+		back := -(len(w) - 3) * 4
+		w = append(w, encodeBiasTBZ(x18Reg, back))
+	}
+	w = append(w, zoneBrReg|uint32(x18Reg)<<5)
 	if len(buf) < size || len(w)*4 > size {
 		return 0, fmt.Errorf("indirect slot needs %d bytes, buffer has %d", size, len(buf))
 	}
@@ -387,7 +417,8 @@ type zoneSite struct {
 	offset uint32
 	kind   siteKind
 	reg    uint8
-	// value is the guest address that an adr or adrp slot loads.
+	// value is the guest address that an adr or adrp slot loads, or the stub
+	// target address of a direct bl slot.
 	value uint64
 	link  bool
 	orig  uint32
@@ -413,21 +444,30 @@ func decodePCRelative(w uint32, pc uint64) (rd uint8, target uint64, ok bool) {
 // another class of the patcher already claimed.
 func scanZone(code []byte, base uint64, skip func(off int) bool) []zoneSite {
 	var out []zoneSite
+	inZone := inZoneStub(base)
 	for off := 0; off+4 <= len(code); off += 4 {
 		w := binary.LittleEndian.Uint32(code[off:])
 		switch {
 		case w&0x1f000000 == 0x10000000:
 			rd, target, ok := decodePCRelative(w, base+uint64(off))
-			if !ok || rd == 31 || !inZoneStub(target) || skip(off) {
+			if !ok || rd == 31 || rd == x18Reg || !inZoneStub(target) || skip(off) {
 				continue
 			}
 			out = append(out, zoneSite{offset: uint32(off), kind: siteAdrp, reg: rd, value: target - zoneBias, orig: w})
-		case w&0xfffffc1f == 0xd61f0000, w&0xfffffc1f == 0xd63f0000:
+		case w&0xfffffc1f == 0xd61f0000, w&0xfffffc1f == 0xd63f0000, w&0xfffffc1f == 0xd65f0000:
 			rn := uint8(w >> 5 & 31)
-			if rn == 30 || rn == x18Reg || skip(off) {
+			if rn == x18Reg || skip(off) {
 				continue
 			}
-			out = append(out, zoneSite{offset: uint32(off), kind: siteIndirect, reg: rn, link: w&0x00200000 != 0, orig: w})
+			link := w&0xfffffc1f == 0xd63f0000
+			out = append(out, zoneSite{offset: uint32(off), kind: siteIndirect, reg: rn, link: link, orig: w})
+		case inZone && w&0xfc000000 == 0x94000000:
+			if skip(off) {
+				continue
+			}
+			imm := int64(int32(w<<6)>>6) * 4
+			target := uint64(int64(base+uint64(off)) + imm)
+			out = append(out, zoneSite{offset: uint32(off), kind: siteBL, value: target, orig: w})
 		}
 	}
 	return out

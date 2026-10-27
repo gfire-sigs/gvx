@@ -1141,10 +1141,8 @@ func TestE2ERealLinuxBusyboxPythonNodeAcrossBackends(t *testing.T) {
 	}
 }
 
-// systrapStaticBase is a link address that the macOS systrap engine allows.
-// Its guest addresses start above the host reservations, which end at 0x7000000000
-// on Apple silicon, so the address sits at 16TB.
-const systrapStaticBase = 0x1000_0000_0000
+// systrapStaticBase is the standard static ELF64 link address.
+const systrapStaticBase = 0x400000
 
 func TestE2ESystrapStaticAndDynamicELF64(t *testing.T) {
 	systraptest.Require(t)

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64 && pagesize_16k
+//go:build darwin && arm64
 
 package systrap
 
@@ -1123,12 +1123,16 @@ func TestMapFileRejectsPartialHostPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var ae *AlignmentError
-	if err := r.as.MapFile(codeVA+0x1000, r.mf, fr, hostarch.ReadWrite, false); !errors.As(err, &ae) {
+	if err := r.as.MapFile(codeVA+0x800, r.mf, fr, hostarch.ReadWrite, false); !errors.As(err, &ae) {
 		t.Errorf("MapFile at an unaligned address = %v, want an AlignmentError", err)
 	}
-	short := memmap.FileRange{Start: fr.Start, End: fr.Start + 0x1000}
+	short := memmap.FileRange{Start: fr.Start, End: fr.Start + 0x800}
 	if err := r.as.MapFile(codeVA, r.mf, short, hostarch.ReadWrite, false); !errors.As(err, &ae) {
-		t.Errorf("MapFile of a 4KB range = %v, want an AlignmentError", err)
+		t.Errorf("MapFile of a 2KB range = %v, want an AlignmentError", err)
+	}
+	sub := memmap.FileRange{Start: fr.Start, End: fr.Start + subBlockSize}
+	if err := r.as.MapFile(codeVA+subBlockSize, r.mf, sub, hostarch.ReadWrite, false); err != nil {
+		t.Errorf("MapFile of a 4KB virtual sub-block = %v, want nil", err)
 	}
 }
 
@@ -1271,14 +1275,17 @@ func TestUserRangeFromRegions(t *testing.T) {
 // reservation at 0x455e0c0000 ended a V8 guest with SIGBUS.
 func TestGuestRangeHasNoHostHoles(t *testing.T) {
 	p := newPlatform(t)
-	lo := uint64(p.MinUserAddress())
+	lo := p.userMin
 	if lo < userFloor || lo%blockSize != 0 {
-		t.Fatalf("MinUserAddress = %#x, want a host-page-aligned value at or above %#x", lo, uint64(userFloor))
+		t.Fatalf("userMin = %#x, want a host-page-aligned value at or above %#x", lo, uint64(userFloor))
 	}
 	// 0x455e0c0000 sits inside the macOS reservation on Apple silicon, so
 	// the minimum must lie above it on that hardware.
 	if lo <= 0x45_5e0c_0000 {
-		t.Fatalf("MinUserAddress = %#x lies inside the host reservation at 0x455e0c0000", lo)
+		t.Fatalf("userMin = %#x lies inside the host reservation at 0x455e0c0000", lo)
+	}
+	if p.zone {
+		lo = max(lo, uint64(zoneBias+zoneLimit))
 	}
 	r := newRig(t, p)
 	hi := uint64(p.MaxUserAddress())

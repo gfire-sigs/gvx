@@ -91,3 +91,36 @@ func (f *MemoryFile) decommitRange(fr memmap.FileRange) {
 		f.manuallyZero(tail)
 	}
 }
+
+// alignSmallAllocRange chooses a range of length bytes inside gap, aligned to
+// the host page size when possible.
+func alignSmallAllocRange(gap memmap.FileRange, length uint64, dir Direction) (memmap.FileRange, bool) {
+	if gap.Length() < length {
+		return memmap.FileRange{}, false
+	}
+	hostPage := uint64(unix.Getpagesize())
+	if hostPage > uint64(hostarch.PageSize) {
+		mask := hostPage - 1
+		if dir == BottomUp {
+			start := (gap.Start + mask) &^ mask
+			if start >= gap.Start && start+length > start && start+length <= gap.End {
+				return memmap.FileRange{Start: start, End: start + length}, true
+			}
+			if length >= hostPage {
+				return memmap.FileRange{}, false
+			}
+		} else {
+			start := (gap.End - length) &^ mask
+			if start >= gap.Start {
+				return memmap.FileRange{Start: start, End: start + length}, true
+			}
+			if length >= hostPage {
+				return memmap.FileRange{}, false
+			}
+		}
+	}
+	if dir == BottomUp {
+		return memmap.FileRange{Start: gap.Start, End: gap.Start + length}, true
+	}
+	return memmap.FileRange{Start: gap.End - length, End: gap.End}, true
+}

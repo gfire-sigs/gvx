@@ -135,10 +135,11 @@ func CBZ(rt, byteOff int) uint32 {
 	return 0xB4000000 | (uint32(byteOff/4)&0x7FFFF)<<5 | uint32(rt)
 }
 
-// TBZ encodes TBZ Xt, #bit with a byte displacement from the branch. The bit
-// number must be below 32, so the encoding is the one of TBZ Wt.
+// TBZ encodes TBZ Xt, #bit with a byte displacement from the branch.
 func TBZ(rt, bit, byteOff int) uint32 {
-	return 0x36000000 | uint32(bit)<<19 | (uint32(byteOff/4)&0x3FFF)<<5 | uint32(rt)
+	b5 := uint32(bit>>5) & 1
+	b40 := uint32(bit & 0x1F)
+	return 0x36000000 | b5<<31 | b40<<19 | (uint32(byteOff/4)&0x3FFF)<<5 | uint32(rt)
 }
 
 // TBNZ encodes TBNZ Xt, #bit with a byte displacement from the branch.

@@ -36,8 +36,7 @@ import (
 // backends and verifies that every probe digest matches the Linux golden
 // standard.
 func TestE2ESystrapCompatSuite(t *testing.T) {
-	defaultBin := acceptprog.BuildCompatProbe(t, runtime.GOARCH)
-	var darwinHighBin string
+	bin := acceptprog.BuildCompatProbe(t, runtime.GOARCH)
 
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
@@ -45,14 +44,6 @@ func TestE2ESystrapCompatSuite(t *testing.T) {
 				t.Skip("no hardware hypervisor on this host")
 			}
 			requireFixedAddressBackend(t, b)
-
-			bin := defaultBin
-			if runtime.GOOS == "darwin" && b.plat == gvx.PlatformSystrap && b.name != zoneBackend {
-				if darwinHighBin == "" {
-					darwinHighBin = acceptprog.BuildCompatProbeAt(t, runtime.GOARCH, systrapStaticBase+0x1000)
-				}
-				bin = darwinHighBin
-			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()

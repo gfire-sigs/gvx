@@ -31,6 +31,90 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
+const subBlocksPerBlock = blockSize / subBlockSize
+
+// subPage describes one 4KB guest sub-block inside a 16KB host block.
+type subPage struct {
+	src uint64
+	at  hostarch.AccessType
+}
+
+// hostBlock tracks the four 4KB guest sub-blocks of one 16KB host page.
+type hostBlock struct {
+	subs       [subBlocksPerBlock]subPage
+	mappedMask uint8
+	execMask   uint8
+	writeMask  uint8
+	directSrc  uint64
+	comp       uint64
+	mappedComp bool
+}
+
+func (hb *hostBlock) recompute() {
+	var mapped, exec, write uint8
+	for s := 0; s < subBlocksPerBlock; s++ {
+		sub := hb.subs[s]
+		if sub.src == 0 {
+			continue
+		}
+		bit := uint8(1 << s)
+		mapped |= bit
+		if sub.at.Execute {
+			exec |= bit
+		}
+		if sub.at.Write {
+			write |= bit
+		}
+	}
+	hb.mappedMask = mapped
+	hb.execMask = exec
+	hb.writeMask = write
+	hb.directSrc = 0
+	if mapped == 0xF && hb.subs[0].src%blockSize == 0 {
+		baseSrc := hb.subs[0].src
+		contig := true
+		for s := 1; s < subBlocksPerBlock; s++ {
+			if hb.subs[s].src != baseSrc+uint64(s)*subBlockSize {
+				contig = false
+				break
+			}
+		}
+		if contig {
+			hb.directSrc = baseSrc
+		}
+	}
+}
+
+func (hb *hostBlock) canMapDirect() bool {
+	return hb.directSrc != 0 && (hb.writeMask == 0 || hb.writeMask == 0xF)
+}
+
+func (hb *hostBlock) syncComp() {
+	if hb.comp == 0 {
+		return
+	}
+	dst := pageBytes(hb.comp)
+	for s := 0; s < subBlocksPerBlock; s++ {
+		off := s * subBlockSize
+		dstWords := unsafe.Slice((*uint64)(unsafe.Pointer(&dst[off])), subBlockSize/8)
+		sub := hb.subs[s]
+		if sub.src != 0 {
+			srcWords := unsafe.Slice((*uint64)(addrPtr(sub.src)), subBlockSize/8)
+			for i, w := range srcWords {
+				if dstWords[i] != w {
+					dstWords[i] = w
+				}
+			}
+		} else {
+			for i, w := range dstWords {
+				if w != 0 {
+					dstWords[i] = 0
+				}
+			}
+		}
+	}
+}
+
 // execBlock is one host page of a guest mapping that allows execution.
 //
 // WHY: the original frame can be shared between address spaces and mapped at
@@ -40,12 +124,13 @@ import (
 // writes alternates between the writable original and the executable copy, so
 // code that a guest writes is always patched before it runs.
 type execBlock struct {
-	base  uint64
-	src   uint64
-	at    hostarch.AccessType
-	state blockState
-	priv  uint64
-	slots []slotRef
+	base         uint64
+	src          uint64
+	at           hostarch.AccessType
+	state        blockState
+	priv         uint64
+	slots        []slotRef
+	retiredSlots []slotRef
 }
 
 // slotRef identifies one allocated range inside a trampoline island.
@@ -90,6 +175,9 @@ type island struct {
 	page     uint64
 	usedBits [islandUnits / 64]uint64
 	slots    map[uint32]slotMeta
+	// brSlots caches the offset+1 of shared non-linking indirect branch slots
+	// (BR Xn and RET Xn) indexed by register number 0..30.
+	brSlots [31]uint32
 }
 
 // alloc claims a contiguous range of size bytes in the island and returns its
@@ -140,17 +228,16 @@ type addressSpace struct {
 	// then patch it once, and no sites get duplicate slots.
 	patchMu sync.Mutex
 
-	mu       sync.Mutex
-	released bool
-	blocks   map[uint64]*execBlock
-	islands  map[uint64]*island
+	mu            sync.Mutex
+	released      bool
+	blocks        map[uint64]*execBlock
+	hostBlocks    map[uint64]*hostBlock
+	partialBlocks map[uint64]*hostBlock
+	compBlocks    map[uint64]*hostBlock
+	islands       map[uint64]*island
 	// zoneMapped holds the stub address of every block that the guest maps in
 	// the zone. It is empty outside the zone mode.
 	zoneMapped map[uint64]struct{}
-	// zoneImageDone records that the first block of the zone prepared the
-	// image, and goText bounds the code of a Go image as guest addresses.
-	zoneImageDone bool
-	goText        [2]uint64
 	// reserved holds island addresses that a pending mm.MMap call creates.
 	reserved map[uint64]struct{}
 	threads  map[*thread]struct{}
@@ -179,13 +266,16 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 		return nil, fmt.Errorf("create a stub task: %w", err)
 	}
 	as := &addressSpace{
-		p:          p,
-		proc:       proc,
-		blocks:     make(map[uint64]*execBlock),
-		islands:    make(map[uint64]*island),
-		zoneMapped: make(map[uint64]struct{}),
-		reserved:   make(map[uint64]struct{}),
-		threads:    make(map[*thread]struct{}),
+		p:             p,
+		proc:          proc,
+		blocks:        make(map[uint64]*execBlock),
+		hostBlocks:    make(map[uint64]*hostBlock),
+		partialBlocks: make(map[uint64]*hostBlock),
+		compBlocks:    make(map[uint64]*hostBlock),
+		islands:       make(map[uint64]*island),
+		zoneMapped:    make(map[uint64]struct{}),
+		reserved:      make(map[uint64]struct{}),
+		threads:       make(map[*thread]struct{}),
 	}
 	wake := as.wakeAll
 	proc.onDead.Store(&wake)
@@ -240,15 +330,23 @@ func (as *addressSpace) taskErr(err error) error {
 	return err
 }
 
+func checkSubBlockAligned(op string, addr, length uint64) error {
+	if length == 0 || addr%subBlockSize != 0 || length%subBlockSize != 0 {
+		return &AlignmentError{Op: op, Addr: addr, Len: length}
+	}
+	return nil
+}
+
 // MapFile implements platform.AddressSpace.MapFile.
 //
-// Every mapping covers whole host pages. The memory file frames must also
-// start on a host page boundary, because Mach maps pages and not bytes. A
-// build with 16KB guest pages guarantees both. In zone mode a mapping inside
-// the zone lands at the guest address plus the bias.
+// Mappings may be aligned to 4KB virtual sub-blocks (subBlockSize) or 16KB
+// host blocks (blockSize). When four contiguous 4KB sub-blocks share a
+// 16KB-aligned MemoryFile frame and agree on write access, the stub maps the
+// MemoryFile frame directly; otherwise the address space maintains a 16KB
+// composite page for that host block.
 func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	guest := uint64(addr)
-	if err := checkAligned("map", guest, fr.Length()); err != nil {
+	if err := checkSubBlockAligned("map", guest, fr.Length()); err != nil {
 		return err
 	}
 	if as.p.zone && guest < zoneLimit && (guest < zoneMin || guest+fr.Length() > zoneLimit) {
@@ -270,7 +368,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	for ; !bs.IsEmpty(); bs = bs.Tail() {
 		b := bs.Head()
 		src, n := uint64(uintptr(b.Addr())), uint64(b.Len())
-		if src%blockSize != 0 || n%blockSize != 0 {
+		if src%subBlockSize != 0 || n%subBlockSize != 0 {
 			return &AlignmentError{Op: "map memory file range", Addr: src, Len: n}
 		}
 		if err := as.mapRangeLocked(va, n, src, at); err != nil {
@@ -282,25 +380,145 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 }
 
 // mapRangeLocked installs [va, va+n) from the Sentry address src.
-//
-// An island lives in a sealed VMA that the memory manager populates like any
-// other mapping. The island keeps its own private page, so the frame of the VMA
-// stays unused and the range skips the block of every island, including an
-// island that the memory manager still populates. The memory manager can hand
-// over a range that spans an island when it maps a whole map unit of one
-// pma. The sealed VMA protects the island, so no mapping can replace it.
 func (as *addressSpace) mapRangeLocked(va, n, src uint64, at hostarch.AccessType) error {
-	runStart := va
-	for base := va; base < va+n; base += blockSize {
-		if !as.isIslandBlockLocked(base) {
-			continue
-		}
-		if err := as.mapRunLocked(runStart, base-runStart, src+(runStart-va), at); err != nil {
+	for n > 0 && (va%blockSize != 0 || n < blockSize || src%blockSize != 0) {
+		if err := as.mapSubBlockAtLocked(va, src, at); err != nil {
 			return err
 		}
-		runStart = base + blockSize
+		va += subBlockSize
+		src += subBlockSize
+		n -= subBlockSize
 	}
-	return as.mapRunLocked(runStart, va+n-runStart, src+(runStart-va), at)
+	fullLen := n &^ (blockSize - 1)
+	if fullLen > 0 {
+		runStart := va
+		for base := va; base < va+fullLen; base += blockSize {
+			if !as.isIslandBlockLocked(base) {
+				continue
+			}
+			if err := as.mapRunLocked(runStart, base-runStart, src+(runStart-va), at); err != nil {
+				return err
+			}
+			runStart = base + blockSize
+		}
+		if err := as.mapRunLocked(runStart, va+fullLen-runStart, src+(runStart-va), at); err != nil {
+			return err
+		}
+		va += fullLen
+		src += fullLen
+		n -= fullLen
+	}
+	for n > 0 {
+		if err := as.mapSubBlockAtLocked(va, src, at); err != nil {
+			return err
+		}
+		va += subBlockSize
+		src += subBlockSize
+		n -= subBlockSize
+	}
+	return nil
+}
+
+func (as *addressSpace) mapSubBlockAtLocked(va, subSrc uint64, at hostarch.AccessType) error {
+	base := blockRound(va)
+	if as.isIslandBlockLocked(base) {
+		return nil
+	}
+	subIdx := int((va - base) / subBlockSize)
+	hb := as.hostBlocks[base]
+	if hb == nil {
+		hb = &hostBlock{}
+		as.hostBlocks[base] = hb
+	}
+	hb.subs[subIdx] = subPage{src: subSrc, at: at}
+	return as.refreshHostBlockLocked(base, hb)
+}
+
+func (as *addressSpace) refreshHostBlockLocked(base uint64, hb *hostBlock) error {
+	hb.recompute()
+	if hb.mappedMask == 0 {
+		if err := vmDeallocate(as.proc.task, base, blockSize); err != nil && !as.proc.dead.Load() {
+			return as.taskErr(err)
+		}
+		as.dropBlockLocked(base)
+		if hb.comp != 0 {
+			as.p.pool.release(hb.comp)
+			hb.comp = 0
+		}
+		delete(as.hostBlocks, base)
+		delete(as.partialBlocks, base)
+		delete(as.compBlocks, base)
+		delete(as.zoneMapped, base)
+		return nil
+	}
+	if hb.mappedMask != 0xF || (hb.writeMask == 0xF && hb.execMask == 0 && hb.directSrc == 0) {
+		as.partialBlocks[base] = hb
+	} else {
+		delete(as.partialBlocks, base)
+	}
+	if inZoneStub(base) {
+		as.zoneMapped[base] = struct{}{}
+		as.zoneState.Store(2)
+	}
+	var backingSrc uint64
+	prot := vmProtRead
+	needMap := true
+	if hb.canMapDirect() {
+		backingSrc = hb.directSrc
+		if hb.writeMask == 0xF {
+			prot |= vmProtWrite
+		}
+		if hb.comp != 0 {
+			as.p.pool.release(hb.comp)
+			hb.comp = 0
+		}
+		hb.mappedComp = false
+		delete(as.compBlocks, base)
+	} else {
+		if hb.comp == 0 {
+			comp, err := as.p.pool.alloc()
+			if err != nil {
+				return err
+			}
+			hb.comp = comp
+			hb.mappedComp = false
+		}
+		hb.syncComp()
+		if hb.writeMask != 0 || (hb.mappedMask != 0xF && hb.execMask == 0) {
+			as.compBlocks[base] = hb
+		} else {
+			delete(as.compBlocks, base)
+		}
+		backingSrc = hb.comp
+		if hb.mappedComp && (as.blocks[base] == nil || as.blocks[base].state == blockData) {
+			needMap = false
+		}
+	}
+	if needMap {
+		if err := as.mapPages(base, blockSize, backingSrc, prot); err != nil {
+			return fmt.Errorf("map [%#x, %#x): %w", base, base+blockSize, err)
+		}
+		hb.mappedComp = (backingSrc == hb.comp && hb.comp != 0)
+	}
+	if hb.execMask != 0 {
+		execAt := hostarch.AccessType{Read: true, Write: hb.writeMask != 0, Execute: true}
+		if blk := as.blocks[base]; blk != nil {
+			blk.retiredSlots = append(blk.retiredSlots, blk.slots...)
+			blk.slots = nil
+			if blk.priv != 0 {
+				as.p.pool.release(blk.priv)
+				blk.priv = 0
+			}
+			blk.src = backingSrc
+			blk.at = execAt
+			blk.state = blockData
+		} else {
+			as.blocks[base] = &execBlock{base: base, src: backingSrc, at: execAt, state: blockData}
+		}
+	} else {
+		as.dropBlockLocked(base)
+	}
+	return nil
 }
 
 // isIslandBlockLocked reports whether the block at base holds an island or
@@ -313,8 +531,8 @@ func (as *addressSpace) isIslandBlockLocked(base uint64) bool {
 	return ok
 }
 
-// mapRunLocked installs [va, va+n), a range without an island, from the Sentry
-// address src.
+// mapRunLocked installs [va, va+n), a 16KB-aligned range without an island,
+// from the 16KB-aligned Sentry address src.
 func (as *addressSpace) mapRunLocked(va, n, src uint64, at hostarch.AccessType) error {
 	if n == 0 {
 		return nil
@@ -323,13 +541,40 @@ func (as *addressSpace) mapRunLocked(va, n, src uint64, at hostarch.AccessType) 
 		return fmt.Errorf("map [%#x, %#x): %w", va, va+n, err)
 	}
 	for base := va; base < va+n; base += blockSize {
+		bSrc := src + (base - va)
+		hb := as.hostBlocks[base]
+		if hb == nil {
+			hb = &hostBlock{}
+			as.hostBlocks[base] = hb
+		} else if hb.comp != 0 {
+			as.p.pool.release(hb.comp)
+			hb.comp = 0
+		}
+		hb.mappedComp = false
+		for s := 0; s < subBlocksPerBlock; s++ {
+			hb.subs[s] = subPage{src: bSrc + uint64(s)*subBlockSize, at: at}
+		}
+		hb.mappedMask = 0xF
+		if at.Execute {
+			hb.execMask = 0xF
+		} else {
+			hb.execMask = 0
+		}
+		if at.Write {
+			hb.writeMask = 0xF
+		} else {
+			hb.writeMask = 0
+		}
+		hb.directSrc = bSrc
+		delete(as.partialBlocks, base)
+		delete(as.compBlocks, base)
 		as.dropBlockLocked(base)
 		if inZoneStub(base) {
 			as.zoneMapped[base] = struct{}{}
 			as.zoneState.Store(2)
 		}
 		if at.Execute {
-			as.blocks[base] = &execBlock{base: base, src: src + (base - va), at: at, state: blockData}
+			as.blocks[base] = &execBlock{base: base, src: bSrc, at: at, state: blockData}
 		}
 	}
 	return nil
@@ -339,12 +584,26 @@ func (as *addressSpace) mapRunLocked(va, n, src uint64, at hostarch.AccessType) 
 func (as *addressSpace) dropBlockLocked(base uint64) {
 	if blk, ok := as.blocks[base]; ok {
 		as.freeSlotRefsLocked(blk.slots)
+		as.freeSlotRefsLocked(blk.retiredSlots)
 		blk.slots = nil
+		blk.retiredSlots = nil
 		if blk.priv != 0 {
 			as.p.pool.release(blk.priv)
 		}
 		delete(as.blocks, base)
 	}
+}
+
+func (as *addressSpace) dropHostBlockLocked(base uint64) {
+	if hb, ok := as.hostBlocks[base]; ok {
+		if hb.comp != 0 {
+			as.p.pool.release(hb.comp)
+			hb.comp = 0
+		}
+		delete(as.hostBlocks, base)
+	}
+	delete(as.partialBlocks, base)
+	delete(as.compBlocks, base)
 }
 
 // freeSlotRefsLocked releases the island slots in refs. Callers hold as.mu.
@@ -356,12 +615,10 @@ func (as *addressSpace) freeSlotRefsLocked(refs []slotRef) {
 	}
 }
 
-// Unmap implements platform.AddressSpace.Unmap. A range that is not host page
-// aligned unmaps whole pages around it, which can only remove more than the
-// request and never leaves access that the memory manager revoked.
+// Unmap implements platform.AddressSpace.Unmap.
 func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
-	guestStart := blockRound(uint64(addr))
-	guestEnd := (uint64(addr) + length + blockSize - 1) &^ (blockSize - 1)
+	guestStart := uint64(addr) &^ (subBlockSize - 1)
+	guestEnd := (uint64(addr) + length + subBlockSize - 1) &^ (subBlockSize - 1)
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.released || as.dead.Load() {
@@ -396,34 +653,132 @@ func (p *Platform) stubRanges(start, end uint64) [][2]uint64 {
 
 // unmapStubLocked removes the stub range [start, end).
 func (as *addressSpace) unmapStubLocked(start, end uint64) {
-	if err := vmDeallocate(as.proc.task, start, end-start); err != nil && !as.proc.dead.Load() {
-		// The kernel rejects only a malformed range here, which is a Sentry bug.
-		panic(fmt.Sprintf("systrap: unmap [%#x, %#x): %v", start, end, err))
+	for start < end && (start%blockSize != 0 || end-start < blockSize) {
+		base := blockRound(start)
+		subIdx := int((start - base) / subBlockSize)
+		if hb := as.hostBlocks[base]; hb != nil && hb.subs[subIdx].src != 0 {
+			hb.subs[subIdx] = subPage{}
+			_ = as.refreshHostBlockLocked(base, hb)
+		}
+		start += subBlockSize
 	}
-	// The memory manager unmaps whole address spaces when a process exits, so
-	// the range can hold far more pages than the address space has blocks.
-	if (end-start)/blockSize > uint64(len(as.blocks)) {
-		for base := range as.blocks {
-			if base >= start && base < end {
+	midEnd := end &^ (blockSize - 1)
+	if start < midEnd {
+		if err := vmDeallocate(as.proc.task, start, midEnd-start); err != nil && !as.proc.dead.Load() {
+			panic(fmt.Sprintf("systrap: unmap [%#x, %#x): %v", start, midEnd, err))
+		}
+		if (midEnd-start)/blockSize > uint64(len(as.hostBlocks)+len(as.blocks)) {
+			for base := range as.blocks {
+				if base >= start && base < midEnd {
+					as.dropBlockLocked(base)
+				}
+			}
+			for base := range as.hostBlocks {
+				if base >= start && base < midEnd {
+					as.dropHostBlockLocked(base)
+				}
+			}
+		} else {
+			for base := start; base < midEnd; base += blockSize {
 				as.dropBlockLocked(base)
+				as.dropHostBlockLocked(base)
 			}
 		}
-	} else {
-		for base := start; base < end; base += blockSize {
-			as.dropBlockLocked(base)
+		for base := range as.zoneMapped {
+			if base >= start && base < midEnd {
+				delete(as.zoneMapped, base)
+			}
+		}
+		for base, isl := range as.islands {
+			if base < midEnd && start < base+blockSize {
+				delete(as.islands, base)
+				as.p.pool.release(isl.page)
+			}
+		}
+		start = midEnd
+	}
+	for start < end {
+		base := blockRound(start)
+		subIdx := int((start - base) / subBlockSize)
+		if hb := as.hostBlocks[base]; hb != nil && hb.subs[subIdx].src != 0 {
+			hb.subs[subIdx] = subPage{}
+			_ = as.refreshHostBlockLocked(base, hb)
+		}
+		start += subBlockSize
+	}
+}
+
+// beforeSwitch populates sibling 4KB sub-blocks of partially mapped 16KB host
+// blocks and synchronizes composite pages with their underlying 4KB MemoryFile
+// frames before resuming the guest thread.
+func (as *addressSpace) beforeSwitch(ctx context.Context, mm platform.MemoryManager) {
+	if mm == nil {
+		return
+	}
+	if pop, ok := mm.(platform.SubBlockPopulator); ok {
+		var toPop []hostarch.Addr
+		var poppedBases []uint64
+		as.mu.Lock()
+		for base, hb := range as.partialBlocks {
+			delete(as.partialBlocks, base)
+			poppedBases = append(poppedBases, base)
+			gbase := as.p.guestAddr(base)
+			if hb.mappedMask == 0xF {
+				toPop = append(toPop, hostarch.Addr(gbase))
+			} else {
+				for s := 0; s < subBlocksPerBlock; s++ {
+					if hb.mappedMask&(1<<s) == 0 {
+						toPop = append(toPop, hostarch.Addr(gbase+uint64(s)*subBlockSize))
+					}
+				}
+			}
+		}
+		as.mu.Unlock()
+		for _, addr := range toPop {
+			pop.PopulateSubBlock(ctx, addr)
+		}
+		if len(poppedBases) > 0 {
+			as.mu.Lock()
+			for _, base := range poppedBases {
+				delete(as.partialBlocks, base)
+			}
+			as.mu.Unlock()
 		}
 	}
-	for base := range as.zoneMapped {
-		if base >= start && base < end {
-			delete(as.zoneMapped, base)
+	as.mu.Lock()
+	for base, hb := range as.compBlocks {
+		hb.syncComp()
+		if blk := as.blocks[base]; blk != nil && blk.state == blockExec && blk.priv != 0 {
+			priv := pageBytes(blk.priv)
+			for s := 0; s < subBlocksPerBlock; s++ {
+				if hb.execMask&(1<<s) == 0 && hb.subs[s].src != 0 {
+					off := s * subBlockSize
+					srcWords := unsafe.Slice((*uint64)(addrPtr(hb.subs[s].src)), subBlockSize/8)
+					dstWords := unsafe.Slice((*uint64)(unsafe.Pointer(&priv[off])), subBlockSize/8)
+					for i, w := range srcWords {
+						if dstWords[i] != w {
+							dstWords[i] = w
+						}
+					}
+				}
+			}
 		}
 	}
-	for base, isl := range as.islands {
-		if base < end && start < base+blockSize {
-			delete(as.islands, base)
-			as.p.pool.release(isl.page)
-		}
+	as.mu.Unlock()
+}
+
+// isExecSubBlock reports whether the 4KB sub-block containing stubAddr has
+// execute permission.
+func (as *addressSpace) isExecSubBlock(stubAddr uint64) bool {
+	base := blockRound(stubAddr)
+	subIdx := (stubAddr - base) / subBlockSize
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if hb := as.hostBlocks[base]; hb != nil {
+		return hb.execMask&(1<<subIdx) != 0
 	}
+	blk := as.blocks[base]
+	return blk != nil && blk.at.Execute
 }
 
 // Release implements platform.AddressSpace.Release.
@@ -453,6 +808,9 @@ func (as *addressSpace) Release() {
 	for base := range as.blocks {
 		as.dropBlockLocked(base)
 	}
+	for base := range as.hostBlocks {
+		as.dropHostBlockLocked(base)
+	}
 	for base, isl := range as.islands {
 		as.p.pool.release(isl.page)
 		delete(as.islands, base)
@@ -469,16 +827,46 @@ func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) err
 
 // ----- lazy patching ------------------------------------------------------
 
+// populateBlock populates any unmapped 4KB sibling sub-blocks of the 16KB host
+// block at base before patching or executing it.
+func (as *addressSpace) populateBlock(ctx context.Context, mm platform.MemoryManager, base uint64) {
+	if mm == nil {
+		return
+	}
+	pop, ok := mm.(platform.SubBlockPopulator)
+	if !ok {
+		return
+	}
+	var toPop []hostarch.Addr
+	as.mu.Lock()
+	if hb := as.partialBlocks[base]; hb != nil {
+		delete(as.partialBlocks, base)
+		gbase := as.p.guestAddr(base)
+		for s := 0; s < subBlocksPerBlock; s++ {
+			if hb.mappedMask&(1<<s) == 0 {
+				toPop = append(toPop, hostarch.Addr(gbase+uint64(s)*subBlockSize))
+			}
+		}
+	}
+	as.mu.Unlock()
+	for _, addr := range toPop {
+		pop.PopulateSubBlock(ctx, addr)
+	}
+	if len(toPop) > 0 {
+		as.mu.Lock()
+		delete(as.partialBlocks, base)
+		as.mu.Unlock()
+	}
+}
+
 // patchBlock patches the block that holds addr and maps the patched copy as
 // read and execute. It runs on the task goroutine, which is allowed to call
 // into the memory manager.
 func (as *addressSpace) patchBlock(ctx context.Context, mm platform.MemoryManager, addr uint64) error {
+	base := blockRound(addr)
+	as.populateBlock(ctx, mm, base)
 	as.patchMu.Lock()
 	defer as.patchMu.Unlock()
-	base := blockRound(addr)
-	if as.p.zone && inZoneStub(base) {
-		as.prepareZoneImage(ctx, mm, base)
-	}
 	for attempt := 0; attempt < 4; attempt++ {
 		err := as.patchBlockOnce(ctx, mm, base)
 		if !errors.Is(err, errPatchRaced) {
@@ -491,6 +879,7 @@ func (as *addressSpace) patchBlock(ctx context.Context, mm platform.MemoryManage
 func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryManager, base uint64) error {
 	as.mu.Lock()
 	blk := as.blocks[base]
+	hb := as.hostBlocks[base]
 	if as.released || blk == nil {
 		as.mu.Unlock()
 		return errPatchRaced
@@ -501,51 +890,117 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		return nil
 	}
 	src := blk.src
+	var subs [subBlocksPerBlock]subPage
+	execMask := uint8(0xF)
+	if hb != nil {
+		if hb.comp != 0 {
+			hb.syncComp()
+		}
+		subs = hb.subs
+		execMask = hb.execMask
+	}
+	retired := blk.retiredSlots
+	blk.retiredSlots = nil
 	as.mu.Unlock()
 
-	// The guest can write the original frame while this copy runs when the
-	// block allows writes. The patched copy then holds a torn image, but the
-	// guest has no promise about code that it modifies while it executes it.
 	copyBuf := make([]byte, blockSize)
-	copy(copyBuf, unsafe.Slice((*byte)(addrPtr(src)), blockSize))
-	sites := scanARM64(copyBuf)
-	items := make([]patchItem, 0, len(sites))
-	claimed := make(map[int]struct{}, len(sites))
-	for _, s := range sites {
+	if hb != nil {
+		for s := 0; s < subBlocksPerBlock; s++ {
+			if subs[s].src != 0 {
+				off := s * subBlockSize
+				copy(copyBuf[off:off+subBlockSize], unsafe.Slice((*byte)(addrPtr(subs[s].src)), subBlockSize))
+			}
+		}
+	} else {
+		copy(copyBuf, unsafe.Slice((*byte)(addrPtr(src)), blockSize))
+	}
+
+	gbase := as.p.guestAddr(base)
+	scope := as.p.scopeOf(ctx, mm, gbase)
+	effExecMask := execMask & scope.subBlockMask(gbase)
+
+	var items []patchItem
+	claimed := make(map[int]struct{})
+	for _, s := range scanARM64(copyBuf) {
+		subIdx := s.Offset / subBlockSize
+		if execMask&(1<<subIdx) == 0 {
+			continue
+		}
 		claimed[int(s.Offset)] = struct{}{}
 		it := patchItem{patchSite: s}
 		if s.Kind == siteMRS && s.Reg == x18Reg {
-			// The slot of `mrs x18, tpidr_el0` writes the virtual x18.
 			it.Kind, it.x18 = siteX18, planTPIDRRead()
 		}
 		if s.Kind == siteCTR && s.Reg == x18Reg {
-			// The slot of `mrs x18, ctr_el0` writes the virtual x18.
 			it.Kind, it.x18 = siteX18, planCTRRead()
 		}
 		items = append(items, it)
 	}
-	gbase := as.p.guestAddr(base)
-	scope := as.p.scopeOf(ctx, mm, gbase)
-	for _, x := range scanX18(copyBuf, base, func(off int) bool {
-		_, taken := claimed[off]
-		return taken || !scope.contains(gbase+uint64(off))
-	}) {
-		items = append(items, patchItem{
-			patchSite: patchSite{Offset: x.Offset, Kind: x.Plan.kind, Orig: binary.LittleEndian.Uint32(copyBuf[x.Offset:])},
-			x18:       x.Plan,
-		})
+	if !scope.none {
+		for _, x := range scanX18(copyBuf, base, func(off int) bool {
+			subIdx := off / subBlockSize
+			if effExecMask&(1<<subIdx) == 0 {
+				return true
+			}
+			if _, taken := claimed[off]; taken {
+				return true
+			}
+			if !scope.contains(gbase + uint64(off)) {
+				return true
+			}
+			return scope.stripped && isASCIIStringWindow(copyBuf, off)
+		}) {
+			items = append(items, patchItem{
+				patchSite: patchSite{Offset: x.Offset, Kind: x.Plan.kind, Orig: binary.LittleEndian.Uint32(copyBuf[x.Offset:])},
+				x18:       x.Plan,
+			})
+		}
 	}
+
 	touched := make(map[*island]struct{})
 	var allocated []slotRef
+	var keptTrapSlots []slotRef
+	takeRetired := func(site uint64, kind siteKind, reg uint8, size uint32) (*island, uint32, uint64, bool) {
+		as.mu.Lock()
+		defer as.mu.Unlock()
+		for i, r := range retired {
+			if as.islands[r.isl.base] != r.isl {
+				continue
+			}
+			m, ok := r.isl.slots[r.off]
+			if ok && m.site == site && m.kind == kind && m.reg == reg && r.size == size {
+				retired = append(retired[:i], retired[i+1:]...)
+				return r.isl, r.off, r.isl.base + uint64(r.off), true
+			}
+		}
+		return nil, 0, 0, false
+	}
+	cleanupUnusedRetired := func() {
+		as.mu.Lock()
+		defer as.mu.Unlock()
+		for _, r := range retired {
+			if as.islands[r.isl.base] != r.isl {
+				continue
+			}
+			if m, ok := r.isl.slots[r.off]; ok && m.kind.isTrap() {
+				keptTrapSlots = append(keptTrapSlots, r)
+				continue
+			}
+			r.isl.free(r.off, r.size)
+		}
+		retired = nil
+	}
 	freeAllocated := func() {
 		as.mu.Lock()
 		as.freeSlotRefsLocked(allocated)
+		as.freeSlotRefsLocked(retired)
+		as.freeSlotRefsLocked(keptTrapSlots)
 		as.mu.Unlock()
 	}
+
 	for _, s := range items {
 		site := base + uint64(s.Offset)
 		if (s.Kind == siteMRS || s.Kind == siteCTR) && s.Reg == 31 {
-			// Reading TPIDR_EL0 or CTR_EL0 into XZR discards the value.
 			putWord(copyBuf[s.Offset:], arm64NOP)
 			continue
 		}
@@ -553,14 +1008,23 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		if s.x18 != nil {
 			size = s.x18.slotSize()
 		}
-		isl, off, slotVA, err := as.allocSlot(ctx, mm, site, size)
-		if err != nil {
-			freeAllocated()
-			return fmt.Errorf("allocate a trampoline slot for %#x: %w", site, err)
+		metaReg := s.Reg
+		if s.Kind == siteX18Jump && s.x18.link {
+			metaReg = 1
+		}
+		isl, off, slotVA, ok := takeRetired(site, s.Kind, metaReg, uint32(size))
+		if !ok {
+			var err error
+			isl, off, slotVA, err = as.allocSlot(ctx, mm, site, size)
+			if err != nil {
+				freeAllocated()
+				return fmt.Errorf("allocate a trampoline slot for %#x: %w", site, err)
+			}
 		}
 		allocated = append(allocated, slotRef{isl: isl, off: off, size: uint32(size)})
 		buf := pageBytes(isl.page)[off:]
-		meta := slotMeta{site: site, kind: s.Kind, reg: s.Reg, size: uint32(size)}
+		meta := slotMeta{site: site, kind: s.Kind, reg: metaReg, size: uint32(size)}
+		var err error
 		switch s.Kind {
 		case siteMRS:
 			err = encodeLoadSlot(buf, slotVA, site+4, s.Reg, tlsOffset)
@@ -570,9 +1034,6 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 			meta.body, meta.scratch = uint8(len(s.x18.body)), s.x18.scratch
 			err = encodeX18Slot(buf, slotVA, site, s.x18)
 		case siteX18Jump:
-			if s.x18.link {
-				meta.reg = 1
-			}
 			err = encodeTrapSlot(buf, slotVA, site+4, as.p.host.hello.Spill)
 		default:
 			err = encodeTrapSlot(buf, slotVA, site+4, as.p.host.hello.Spill)
@@ -597,43 +1058,73 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		for _, it := range items {
 			taken[int(it.Offset)] = struct{}{}
 		}
-		// The scan recognizes instructions by their bit pattern. A data word in
-		// a block that also holds code, such as a string at the start of the
-		// read-only data, can look like an adr or a br. When the section
-		// headers describe the block, the scan skips the words outside the
-		// executable sections. A page without usable headers stays whole,
-		// because the biased addresses need the slots.
+		lits := literalWords(copyBuf)
 		skip := func(off int) bool {
+			subIdx := off / subBlockSize
+			if effExecMask&(1<<subIdx) == 0 {
+				return true
+			}
 			if _, t := taken[off]; t {
 				return true
 			}
-			return scope.proven() && !scope.contains(gbase+uint64(off))
+			if _, data := lits[off]; data {
+				return true
+			}
+			if scope.proven() && !scope.contains(gbase+uint64(off)) {
+				return true
+			}
+			return isASCIIStringWindow(copyBuf, off)
 		}
 		for _, z := range scanZone(copyBuf, base, skip) {
-			if z.kind == siteAdrp && as.isGoCode(z.value) {
-				// The Go runtime compares a function address with the code range
-				// of its module data, and the zone mode biased that range. An
-				// adr or adrp that yields a code address keeps the biased value.
+			site := base + uint64(z.offset)
+			if z.kind == siteIndirect && !z.link {
+				slotVA, isl, newlyCreated, err := as.allocSharedBrSlot(ctx, mm, site, z.reg)
+				if err != nil {
+					freeAllocated()
+					return fmt.Errorf("allocate a shared indirect slot for %#x: %w", site, err)
+				}
+				if newlyCreated {
+					touched[isl] = struct{}{}
+				}
+				br, err := encodeBranch(site, slotVA)
+				if err != nil {
+					freeAllocated()
+					return err
+				}
+				putWord(copyBuf[z.offset:], br)
 				continue
 			}
-			site := base + uint64(z.offset)
 			size := adrpSlotSize
 			switch {
+			case z.kind == siteBL:
+				size = blSlotSize
 			case z.kind == siteIndirect && z.link:
 				size = blrSlotSize
 			case z.kind == siteIndirect:
 				size = brSlotSize
 			}
-			isl, off, slotVA, err := as.allocSlot(ctx, mm, site, size)
-			if err != nil {
-				freeAllocated()
-				return fmt.Errorf("allocate a zone slot for %#x: %w", site, err)
+			isl, off, slotVA, ok := takeRetired(site, z.kind, z.reg, uint32(size))
+			if !ok {
+				var err error
+				if z.kind == siteBL {
+					isl, off, slotVA, err = as.allocSlotNearBoth(ctx, mm, site, z.value, size)
+				} else {
+					isl, off, slotVA, err = as.allocSlot(ctx, mm, site, size)
+				}
+				if err != nil {
+					freeAllocated()
+					return fmt.Errorf("allocate a zone slot for %#x: %w", site, err)
+				}
 			}
 			allocated = append(allocated, slotRef{isl: isl, off: off, size: uint32(size)})
 			buf := pageBytes(isl.page)[off:]
+			var err error
 			switch z.kind {
 			case siteAdrp:
 				err = encodeAdrpSlot(buf, slotVA, site, z.reg, z.value)
+			case siteBL:
+				guestRet := (site - zoneBias) + 4
+				err = encodeBLSlot(buf, slotVA, guestRet, z.value)
 			default:
 				_, err = encodeIndirectSlot(buf, slotVA, site, z.reg, z.link)
 			}
@@ -653,6 +1144,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 			touched[isl] = struct{}{}
 		}
 	}
+	cleanupUnusedRetired()
 	for isl := range touched {
 		flushCode(pageBytes(isl.page))
 	}
@@ -670,17 +1162,23 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	defer as.mu.Unlock()
 	if cur := as.blocks[base]; as.released || cur != blk || blk.state != blockData || blk.src != src {
 		as.freeSlotRefsLocked(allocated)
+		as.freeSlotRefsLocked(keptTrapSlots)
 		as.p.pool.release(privAddr)
 		return errPatchRaced
 	}
 	if err := as.mapPages(base, blockSize, privAddr, vmProtRead|vmProtExecute); err != nil {
 		as.freeSlotRefsLocked(allocated)
+		as.freeSlotRefsLocked(keptTrapSlots)
 		as.p.pool.release(privAddr)
 		return err
+	}
+	if hb := as.hostBlocks[base]; hb != nil {
+		hb.mappedComp = false
 	}
 	blk.priv = privAddr
 	blk.state = blockExec
 	blk.slots = allocated
+	blk.retiredSlots = append(blk.retiredSlots, keptTrapSlots...)
 	as.patchedBlocks.Add(1)
 	return nil
 }
@@ -694,10 +1192,13 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	if as.released || blk == nil || blk.state != blockExec || !blk.at.Write {
 		return false, nil
 	}
+	if hb := as.hostBlocks[base]; hb != nil && (!hb.canMapDirect() || hb.writeMask != 0xF) {
+		return false, nil
+	}
 	if err := as.mapPages(base, blockSize, blk.src, stubProt(blk.at)); err != nil {
 		return false, err
 	}
-	as.freeSlotRefsLocked(blk.slots)
+	blk.retiredSlots = append(blk.retiredSlots, blk.slots...)
 	blk.slots = nil
 	as.p.pool.release(blk.priv)
 	blk.priv = 0
@@ -752,13 +1253,71 @@ func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager
 	return nil, 0, 0, errors.New("no trampoline island has room")
 }
 
+// allocSlotNearBoth returns space for a slot within reach of both site and
+// target.
+func (as *addressSpace) allocSlotNearBoth(ctx context.Context, mm platform.MemoryManager, site, target uint64, size int) (*island, uint32, uint64, error) {
+	mid := site/2 + target/2
+	for attempt := 0; attempt < 3; attempt++ {
+		as.mu.Lock()
+		for _, isl := range as.islands {
+			if absDiff(isl.base, site) < islandReach && absDiff(isl.base, target) < islandReach {
+				if off, ok := isl.alloc(uint32(size)); ok {
+					as.mu.Unlock()
+					return isl, off, isl.base + uint64(off), nil
+				}
+			}
+		}
+		as.mu.Unlock()
+		if err := as.newIslandNearBoth(ctx, mm, mid, site, target); err != nil {
+			return nil, 0, 0, err
+		}
+	}
+	return nil, 0, 0, errors.New("no trampoline island has room within reach of both site and target")
+}
+
+// allocSharedBrSlot returns the address of a shared non-linking indirect
+// branch slot (BR Xn or RET Xn) for register rn within reach of site.
+func (as *addressSpace) allocSharedBrSlot(ctx context.Context, mm platform.MemoryManager, site uint64, rn uint8) (uint64, *island, bool, error) {
+	if rn >= 31 {
+		return 0, nil, false, fmt.Errorf("invalid indirect branch register %d", rn)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		as.mu.Lock()
+		for _, isl := range as.islands {
+			if absDiff(isl.base, site) >= islandReach {
+				continue
+			}
+			if cached := isl.brSlots[rn]; cached != 0 {
+				off := cached - 1
+				as.mu.Unlock()
+				return isl.base + uint64(off), isl, false, nil
+			}
+			if off, ok := isl.alloc(brSlotSize); ok {
+				slotVA := isl.base + uint64(off)
+				buf := pageBytes(isl.page)[off:]
+				if _, err := encodeIndirectSlot(buf, slotVA, site, rn, false); err != nil {
+					isl.free(off, brSlotSize)
+					as.mu.Unlock()
+					return 0, nil, false, err
+				}
+				isl.slots[off] = slotMeta{site: site, kind: siteIndirect, reg: rn, size: brSlotSize}
+				isl.brSlots[rn] = off + 1
+				as.mu.Unlock()
+				return slotVA, isl, true, nil
+			}
+		}
+		as.mu.Unlock()
+		if err := as.newIsland(ctx, mm, site); err != nil {
+			return 0, nil, false, err
+		}
+	}
+	return 0, nil, false, errors.New("no trampoline island has room")
+}
+
 // newIsland reserves a sealed VMA within reach of near through the memory
 // manager and maps a private page of slots there.
 func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager, near uint64) error {
 	minAddr, maxAddr := as.p.userMin, as.p.userMax
-	// A site in the zone gets an island in the zone, at a guest address that
-	// maps to a stub address within reach. Every other site gets an island
-	// above the biased zone.
 	var shift uint64
 	switch {
 	case as.p.zone && inZoneStub(near):
@@ -773,6 +1332,29 @@ func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager
 			return 0, false
 		}
 		return cand + shift, true
+	})
+}
+
+func (as *addressSpace) newIslandNearBoth(ctx context.Context, mm platform.MemoryManager, mid, site, target uint64) error {
+	minAddr, maxAddr := as.p.userMin, as.p.userMax
+	var shift uint64
+	switch {
+	case as.p.zone && inZoneStub(mid):
+		shift = zoneBias
+		mid -= shift
+		minAddr, maxAddr = zoneMin, zoneLimit
+	case as.p.zone:
+		minAddr = max(minAddr, zoneBias+zoneLimit)
+	}
+	return as.newIslandAt(ctx, mm, mid, func(cand uint64) (uint64, bool) {
+		if cand < minAddr || cand+blockSize > maxAddr {
+			return 0, false
+		}
+		stubCand := cand + shift
+		if absDiff(stubCand, site) >= islandReach || absDiff(stubCand, target) >= islandReach {
+			return 0, false
+		}
+		return stubCand, true
 	})
 }
 
@@ -864,12 +1446,25 @@ func (as *addressSpace) isSlotTail(pc uint64) bool {
 // at stub address pc, or false when pc does not lie at an aligned offset of an
 // executable block or trampoline island.
 func (as *addressSpace) codeWord(pc uint64) (uint32, bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.codeWordLocked(pc)
+}
+
+func (as *addressSpace) codeWordLocked(pc uint64) (uint32, bool) {
 	if pc&3 != 0 {
 		return 0, false
 	}
-	as.mu.Lock()
-	defer as.mu.Unlock()
 	base := blockRound(pc)
+	subIdx := int((pc - base) / subBlockSize)
+	if hb := as.hostBlocks[base]; hb != nil {
+		sub := hb.subs[subIdx]
+		if sub.src != 0 && sub.at.Execute {
+			subOff := pc - (base + uint64(subIdx)*subBlockSize)
+			page := unsafe.Slice((*byte)(addrPtr(sub.src)), subBlockSize)
+			return binary.LittleEndian.Uint32(page[subOff:]), true
+		}
+	}
 	if blk := as.blocks[base]; blk != nil && blk.src != 0 {
 		page := unsafe.Slice((*byte)(addrPtr(blk.src)), blockSize)
 		return binary.LittleEndian.Uint32(page[pc-base:]), true
@@ -902,6 +1497,5 @@ func (as *addressSpace) hasZone(mm platform.MemoryManager) bool {
 		as.zoneState.CompareAndSwap(0, 1)
 		return as.zoneState.Load() == 2
 	}
-	as.zoneState.Store(2)
-	return true
+	return as.zoneState.Load() == 2
 }

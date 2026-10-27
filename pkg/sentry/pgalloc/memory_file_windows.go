@@ -111,3 +111,13 @@ func (f *MemoryFile) decommitRange(fr memmap.FileRange) {
 		_ = DecommitSharedPages(bs)
 	})
 }
+
+func alignSmallAllocRange(gap memmap.FileRange, length uint64, dir Direction) (memmap.FileRange, bool) {
+	if gap.Length() < length {
+		return memmap.FileRange{}, false
+	}
+	if dir == BottomUp {
+		return memmap.FileRange{Start: gap.Start, End: gap.Start + length}, true
+	}
+	return memmap.FileRange{Start: gap.End - length, End: gap.End}, true
+}

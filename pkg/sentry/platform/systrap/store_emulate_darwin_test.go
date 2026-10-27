@@ -146,3 +146,68 @@ func TestStoreEmulationRefusesARangeThatTheCheckRejects(t *testing.T) {
 		t.Errorf("execute = %v and wrote = %v, want a refusal with no write", ok, wrote)
 	}
 }
+
+func TestEmulateAtomicOrCacheOp(t *testing.T) {
+	mem := make([]byte, 128)
+	for i := range mem {
+		mem[i] = 0xff
+	}
+	var ss armThreadState
+	var ns armNeonState
+	var x18 uint64
+	regs := storeRegs{ss: &ss, ns: &ns, x18: &x18}
+	check := func(addr uint64, n int) bool {
+		return addr >= 0x1000 && addr+uint64(n) <= 0x1000+uint64(len(mem))
+	}
+	read := func(addr uint64, n int) []byte {
+		off := addr - 0x1000
+		out := make([]byte, n)
+		copy(out, mem[off:int(off)+n])
+		return out
+	}
+	write := func(addr uint64, b []byte) {
+		off := addr - 0x1000
+		copy(mem[off:], b)
+	}
+
+	// dc zva, x2 zeroes the 64-byte cache line containing x2.
+	ss.X[2] = 0x1018
+	if _, ok := emulateAtomicOrCacheOp(0xd50b7422, regs, check, read, write); !ok {
+		t.Fatal("emulateAtomicOrCacheOp refused dc zva")
+	}
+	for i := 0; i < 64; i++ {
+		if mem[i] != 0 {
+			t.Fatalf("mem[%d] = %#x after dc zva, want 0", i, mem[i])
+		}
+	}
+	if mem[64] != 0xff {
+		t.Fatalf("mem[64] = %#x, want 0xff outside the cache line", mem[64])
+	}
+
+	// ldadd x1, x0, [x2] at 0x1000: old=0, add 42 -> mem=42, x0=0; then add 8 -> mem=50, x0=42.
+	ss.X[2] = 0x1000
+	ss.X[1] = 42
+	if _, ok := emulateAtomicOrCacheOp(0xf8210040, regs, check, read, write); !ok {
+		t.Fatal("emulateAtomicOrCacheOp refused ldadd")
+	}
+	if ss.X[0] != 0 {
+		t.Fatalf("x0 = %d after first ldadd, want 0", ss.X[0])
+	}
+	ss.X[1] = 8
+	if _, ok := emulateAtomicOrCacheOp(0xf8210040, regs, check, read, write); !ok {
+		t.Fatal("emulateAtomicOrCacheOp refused second ldadd")
+	}
+	if ss.X[0] != 42 || decodeLEUint(mem[:8]) != 50 {
+		t.Fatalf("after second ldadd: x0=%d mem=%d, want 42 and 50", ss.X[0], decodeLEUint(mem[:8]))
+	}
+
+	// cas x3, x4, [x2] at 0x1000: compare x3=50, swap with x4=99.
+	ss.X[3] = 50
+	ss.X[4] = 99
+	if _, ok := emulateAtomicOrCacheOp(0xc8a37c44, regs, check, read, write); !ok {
+		t.Fatal("emulateAtomicOrCacheOp refused cas")
+	}
+	if ss.X[3] != 50 || decodeLEUint(mem[:8]) != 99 {
+		t.Fatalf("after cas: x3=%d mem=%d, want 50 and 99", ss.X[3], decodeLEUint(mem[:8]))
+	}
+}

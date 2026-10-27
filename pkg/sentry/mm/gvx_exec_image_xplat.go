@@ -20,12 +20,19 @@ import (
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
-var _ platform.ExecImageProvider = (*MemoryManager)(nil)
+var (
+	_ platform.ExecImageProvider = (*MemoryManager)(nil)
+	_ platform.SubBlockPopulator = (*MemoryManager)(nil)
+)
 
 // ExecImageAt implements platform.ExecImageProvider.ExecImageAt.
 //
@@ -69,6 +76,148 @@ func (mm *MemoryManager) HasMappingIn(ar hostarch.AddrRange) bool {
 	defer mm.mappingMu.RUnlock()
 	seg := mm.vmas.LowerBoundSegment(ar.Start)
 	return seg.Ok() && seg.Start() < ar.End
+}
+
+// PopulateSubBlock implements platform.SubBlockPopulator.PopulateSubBlock.
+//
+// +checklocksexclude:mm.mappingMu
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) PopulateSubBlock(ctx context.Context, addr hostarch.Addr) bool {
+	addr = hostarch.UntaggedUserAddr(addr)
+	ar, ok := addr.RoundDown().ToRange(uint64(hostarch.PageSize))
+	if !ok {
+		return false
+	}
+	mm.mappingMu.RLock()
+	vseg := mm.vmas.FindSegment(ar.Start)
+	if !vseg.Ok() {
+		mm.mappingMu.RUnlock()
+		return false
+	}
+	vma := vseg.ValuePtr()
+	if !vma.effectivePerms.Read && !vma.effectivePerms.Execute {
+		mm.mappingMu.RUnlock()
+		return false
+	}
+	at := hostarch.Read
+	if !vma.effectivePerms.Read {
+		at = hostarch.Execute
+	} else if vma.mappable != nil && vma.private && vma.effectivePerms.Write && !vma.effectivePerms.Execute {
+		at = vma.effectivePerms
+	}
+	mm.activeMu.Lock()
+	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, false /* callerIndirectCommit */, false /* forPin */)
+	if err != nil {
+		mm.activeMu.Unlock()
+		mm.mappingMu.RUnlock()
+		return false
+	}
+	const hostBlockSize = 0x4000
+	blockStart := ar.Start &^ hostarch.Addr(hostBlockSize-1)
+	blockAR := hostarch.AddrRange{Start: blockStart, End: blockStart + hostBlockSize}
+	oldFRs, coalesced := mm.coalescePrivateBlockLocked(ctx, blockAR)
+	mm.mappingMu.RUnlock()
+	mm.activeMu.DowngradeLock()
+	if coalesced {
+		err = mm.mapASLocked(ctx, mm.pmas.LowerBoundSegment(blockAR.Start), blockAR, memmap.PlatformEffectPopulate)
+	} else {
+		err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectPopulate)
+	}
+	mm.activeMu.RUnlock()
+	for _, oldFR := range oldFRs {
+		mm.mf.DecRef(oldFR)
+	}
+	return err == nil
+}
+
+// coalescePrivateBlockLocked coalesces a 16KB host block whose 4KB sub-blocks
+// are all backed by private non-CoW writable MemoryFile PMAs into a single
+// 16KB-aligned MemoryFile range so the platform can map it directly.
+//
+// +checklocksread:mm.mappingMu
+// +checklocks:mm.activeMu
+func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR hostarch.AddrRange) ([]memmap.FileRange, bool) {
+	const hostBlockSize = 0x4000
+	pseg := mm.pmas.LowerBoundSegment(blockAR.Start)
+	if !pseg.Ok() || pseg.Start() > blockAR.Start {
+		return nil, false
+	}
+	firstOff := pseg.ValuePtr().off + uint64(blockAR.Start-pseg.Start())
+	alreadyAligned := firstOff%hostBlockSize == 0
+	cur := blockAR.Start
+	for seg := pseg; cur < blockAR.End; seg = seg.NextSegment() {
+		if !seg.Ok() || seg.Start() > cur {
+			return nil, false
+		}
+		pma := seg.ValuePtr()
+		if pma.file != mm.mf || !pma.private || pma.needCOW || !pma.effectivePerms.Read || !pma.effectivePerms.Write || pma.effectivePerms.Execute {
+			return nil, false
+		}
+		segOff := pma.off + uint64(cur-seg.Start())
+		if segOff != firstOff+uint64(cur-blockAR.Start) {
+			alreadyAligned = false
+		}
+		if err := seg.getInternalMappingsLocked(); err != nil {
+			return nil, false
+		}
+		if seg.End() >= blockAR.End {
+			cur = blockAR.End
+			break
+		}
+		cur = seg.End()
+	}
+	if alreadyAligned {
+		return nil, true
+	}
+	fr, err := mm.mf.Allocate(hostBlockSize, pgalloc.AllocOpts{
+		Kind:    usage.Anonymous,
+		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		return nil, false
+	}
+	if fr.Start%hostBlockSize != 0 {
+		mm.mf.DecRef(fr)
+		return nil, false
+	}
+	dsts, err := mm.mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		mm.mf.DecRef(fr)
+		return nil, false
+	}
+	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
+		subAR := seg.Range().Intersect(blockAR)
+		srcs := mm.internalMappingsLocked(seg, subAR)
+		subDsts := dsts.DropFirst64(uint64(subAR.Start - blockAR.Start)).TakeFirst64(uint64(subAR.Length()))
+		if _, err := safemem.CopySeq(subDsts, srcs); err != nil {
+			mm.mf.DecRef(fr)
+			return nil, false
+		}
+	}
+	mm.unmapASLocked(blockAR)
+	var oldFRs []memmap.FileRange
+	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
+		seg = mm.pmas.Isolate(seg, blockAR)
+		oldFRs = append(oldFRs, seg.fileRange())
+		pma := seg.ValuePtr()
+		pma.off = fr.Start + uint64(seg.Start()-blockAR.Start)
+		pma.internalMappings = safemem.BlockSeq{}
+		if prev := seg.PrevSegment(); prev.Ok() {
+			if merged := mm.pmas.Merge(prev, seg); merged.Ok() {
+				seg = merged
+			}
+		}
+		if seg.End() == blockAR.End {
+			if next := seg.NextSegment(); next.Ok() {
+				if merged := mm.pmas.Merge(seg, next); merged.Ok() {
+					seg = merged
+				}
+			}
+			break
+		}
+	}
+	return oldFRs, true
 }
 
 // fileReaderAt reads a file description at absolute offsets.

@@ -52,11 +52,12 @@ const (
 
 	// tlsOffset is the offset of the virtual TLS word that patched `mrs` slots read.
 	tlsOffset = 24
-	// x18Offset, spillOffset and scratchOffset locate the virtual x18 and the
-	// scratch words of the sysmsg.
-	x18Offset     = 912
-	spillOffset   = 920
-	scratchOffset = 928
+	// x18Offset, spillOffset, scratchOffset and indTargetOffset locate the
+	// virtual x18, the scratch words and the indirect branch target of the sysmsg.
+	x18Offset       = 912
+	spillOffset     = 920
+	scratchOffset   = 928
+	indTargetOffset = 1760
 
 	// waiterSentry and waiterStub are the bits of sysmsg.Waiter.
 	waiterSentry = 1
@@ -107,6 +108,9 @@ type sysmsg struct {
 	// FMC receives the context of a fault, so that a fault inside the reload
 	// code cannot destroy the guest state in MC.
 	FMC mcontext
+	// IndTarget holds the guest target address of a zero-clobber indirect
+	// branch slot in zone mode.
+	IndTarget uint64
 }
 
 // ctlPage mirrors struct gv_ctl, the command page of the template process.
@@ -160,6 +164,7 @@ func expectedLayout() [layoutWords]uint64 {
 
 var _ = [1]struct{}{}[unsafe.Offsetof(sysmsg{}.Scratch)-scratchOffset]
 var _ = [1]struct{}{}[scratchOffset-trapScratchOffset]
+var _ = [1]struct{}{}[unsafe.Offsetof(sysmsg{}.IndTarget)-indTargetOffset]
 
 // loadState reads the handoff word with acquire semantics.
 func (sm *sysmsg) loadState() uint32 {

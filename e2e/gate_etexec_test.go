@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -43,12 +42,8 @@ import (
 // systrap-zone turns on the prototype zone mode of that engine, and it runs
 // the four programs.
 
-// zoneBackend names the macOS systrap engine with the prototype zone mode.
-const zoneBackend = "systrap-zone"
-
 // fixedAddressBackends lists each backend once. On Linux the hardware entry
-// and the systrap entry are the same platform. On macOS the list ends with the
-// systrap engine in zone mode.
+// and the systrap entry are the same platform.
 func fixedAddressBackends() []gateBackend {
 	var out []gateBackend
 	seen := map[gvx.PlatformType]bool{}
@@ -57,9 +52,6 @@ func fixedAddressBackends() []gateBackend {
 			seen[b.plat] = true
 			out = append(out, b)
 		}
-	}
-	if runtime.GOOS == "darwin" {
-		out = append(out, gateBackend{zoneBackend, gvx.PlatformSystrap})
 	}
 	return out
 }
@@ -76,9 +68,6 @@ func requireFixedAddressBackend(t *testing.T, b gateBackend) {
 		return
 	}
 	requireBackend(t, b)
-	if b.name == zoneBackend {
-		t.Setenv("GVX_SYSTRAP_FIXED_IMAGES", "1")
-	}
 }
 
 // skipWhenFixedAddressRefused skips the test when err is the refusal of an

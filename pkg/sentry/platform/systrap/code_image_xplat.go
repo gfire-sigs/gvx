@@ -50,6 +50,9 @@ type codeImage struct {
 	loads []loadSegment
 	// exec lists the sections that hold instructions, as file virtual addresses.
 	exec []span
+	// stripped is true when the file has no section headers and exec comes
+	// from the executable PT_LOAD segments.
+	stripped bool
 }
 
 // parseCodeImage reads the program and section headers of an ELF or PE32+ file
@@ -84,8 +87,30 @@ func parseCodeImage(r io.ReaderAt) (*codeImage, error) {
 	if len(ci.loads) == 0 {
 		return nil, fmt.Errorf("the file has no loadable segment")
 	}
+	if len(ci.exec) == 0 && len(f.Sections) == 0 {
+		// A stripped ELF has no section headers. Fall back to PT_LOAD segments
+		// with PF_X while excluding the ELF header and program header table.
+		hdrEnd := uint64((64 + len(f.Progs)*56 + 3) &^ 3)
+		for _, p := range f.Progs {
+			if p.Type != elf.PT_LOAD || p.Flags&elf.PF_X == 0 || p.Filesz == 0 {
+				continue
+			}
+			lo := p.Vaddr
+			hi := p.Vaddr + p.Filesz
+			if p.Off < hdrEnd {
+				skip := hdrEnd - p.Off
+				if skip >= p.Filesz {
+					continue
+				}
+				lo += skip
+			}
+			if lo < hi {
+				ci.exec = append(ci.exec, span{lo: lo, hi: hi})
+			}
+		}
+		ci.stripped = len(ci.exec) > 0
+	}
 	if len(ci.exec) == 0 {
-		// A file without section headers gives no way to separate code from data.
 		return nil, fmt.Errorf("the file has no executable section")
 	}
 	return ci, nil
@@ -144,8 +169,8 @@ func parsePECodeImage(r io.ReaderAt) (*codeImage, error) {
 // address for the page at guest address base that maps file offset off.
 func (ci *codeImage) bias(base, off uint64) (uint64, bool) {
 	for _, l := range ci.loads {
-		start := l.off &^ (blockSize - 1)
-		end := (l.off + l.filesz + blockSize - 1) &^ (blockSize - 1)
+		start := l.off &^ (subBlockSize - 1)
+		end := (l.off + l.filesz + subBlockSize - 1) &^ (subBlockSize - 1)
 		if off < start || off >= end {
 			continue
 		}
@@ -158,11 +183,15 @@ func (ci *codeImage) bias(base, off uint64) (uint64, bool) {
 // codeIn returns the parts of the block at base that lie in executable
 // sections. bias is the value that bias returned for the block.
 func (ci *codeImage) codeIn(base, bias uint64) []span {
+	return ci.codeInRange(base, blockSize, bias)
+}
+
+func (ci *codeImage) codeInRange(base, size, bias uint64) []span {
 	var out []span
 	for _, s := range ci.exec {
 		lo, hi := s.lo+bias, s.hi+bias
 		lo = max(lo, base)
-		hi = min(hi, base+blockSize)
+		hi = min(hi, base+size)
 		if lo < hi {
 			out = append(out, span{lo, hi})
 		}
@@ -208,8 +237,39 @@ type codeScope struct {
 	// Sentry provides, anonymous memory, and a file that is not a usable ELF
 	// image.
 	none bool
+	// stripped is true when spans come from PF_X PT_LOAD segments without
+	// section headers, so static scans require a valid instruction window.
+	stripped bool
 	// spans lists the code ranges when neither flag is set.
 	spans []span
+}
+
+// subBlockSize is the 4KB virtual sub-block granularity inside a 16KB host page.
+const subBlockSize = 4096
+
+// subBlockMask returns a 4-bit mask of the 4KB virtual sub-blocks in the 16KB
+// block at guest address base that intersect executable code spans. When the
+// scope has no section boundaries (all or none), it returns 0xf so every
+// sub-block follows the block-wide rule.
+func (s codeScope) subBlockMask(base uint64) uint8 {
+	if s.all || s.none || s.stripped {
+		return 0xf
+	}
+	var mask uint8
+	for i := uint64(0); i < blockSize/subBlockSize; i++ {
+		subLo := base + i*subBlockSize
+		subHi := subLo + subBlockSize
+		for _, r := range s.spans {
+			if max(subLo, r.lo) < min(subHi, r.hi) {
+				mask |= 1 << i
+				break
+			}
+		}
+	}
+	if mask == 0 {
+		return 0xf
+	}
+	return mask
 }
 
 // contains reports whether the word at guest address a belongs to code.
@@ -265,27 +325,45 @@ func (p *Platform) scopeOf(ctx context.Context, m interface{}, base uint64) code
 	if !ok {
 		return codeScope{all: true}
 	}
-	info := im.ExecImageAt(ctx, hostarch.Addr(base))
-	if info.Kind != platform.MappingFile {
-		return codeScope{none: true}
-	}
-	defer info.Release()
-	key := imageKey{info.Device, info.Inode}
-	ci, cached := p.images.lookup(key)
-	if !cached {
-		parsed, err := parseCodeImage(info.File)
-		if err != nil {
-			parsed = nil
+	var spans []span
+	stripped := false
+	for s := uint64(0); s < blockSize/subBlockSize; s++ {
+		subBase := base + s*subBlockSize
+		info := im.ExecImageAt(ctx, hostarch.Addr(subBase))
+		if info.Kind != platform.MappingFile {
+			continue
 		}
-		ci = parsed
-		p.images.store(key, ci)
+		key := imageKey{info.Device, info.Inode}
+		ci, cached := p.images.lookup(key)
+		if !cached {
+			parsed, err := parseCodeImage(info.File)
+			if err != nil {
+				parsed = nil
+			}
+			ci = parsed
+			p.images.store(key, ci)
+		}
+		info.Release()
+		if ci == nil {
+			continue
+		}
+		bias, ok := ci.bias(subBase, info.Offset)
+		if !ok {
+			continue
+		}
+		if ci.stripped {
+			stripped = true
+		}
+		for _, sp := range ci.codeInRange(subBase, subBlockSize, bias) {
+			if n := len(spans); n > 0 && spans[n-1].hi == sp.lo {
+				spans[n-1].hi = sp.hi
+			} else {
+				spans = append(spans, sp)
+			}
+		}
 	}
-	if ci == nil {
+	if len(spans) == 0 {
 		return codeScope{none: true}
 	}
-	bias, ok := ci.bias(base, info.Offset)
-	if !ok {
-		return codeScope{none: true}
-	}
-	return codeScope{spans: ci.codeIn(base, bias)}
+	return codeScope{stripped: stripped, spans: spans}
 }
