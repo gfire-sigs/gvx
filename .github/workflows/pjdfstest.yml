@@ -70,8 +70,74 @@ jobs:
             CFLAGS="-O2 -Wl,-z,max-page-size=65536" ./configure >/dev/null
             make pjdfstest >/dev/null
             cp -r /mnt/vol/pjdfstest/* /workspace/
-            sed -i "s/openssl md5 | awk '\''{print \$NF}'\''/md5sum | awk '\''{print \$1}'\''/g" /workspace/tests/misc.sh
           '
+          cat > "$PWD/bundle/tests/conf" <<'EOF'
+          os="Linux"
+          GREP="grep"
+          fs="EXT4"
+          EOF
+          sed -i 's/dir=`dirname \$0`/dir=${0%\/*}/g' "$PWD/bundle/tests"/*/*.t
+          sed -i '/^confdir=/,/^fstest=/c\confdir="${dir}/.."\nmaindir="${dir}/../.."\nfstest="${maindir}/pjdfstest"' "$PWD/bundle/tests/misc.sh"
+          cat >> "$PWD/bundle/tests/misc.sh" <<'EOF'
+
+          _nl='
+          '
+          expect()
+          {
+          	e="${1}"
+          	shift
+          	r=$(${fstest} $* 2>/dev/null)
+          	r=${r##*$_nl}
+          	_m=1
+          	case "${e}" in
+          	*'('*|*'*'*|*'['*|*'.'*|*'+'*|*'?'*|*'^'*|*'$'*)
+          		echo "${r}" | ${GREP} -Eq '^'${e}'$' && _m=0
+          		;;
+          	*)
+          		case "|${e}|" in
+          		*"|${r}|"*) _m=0 ;;
+          		esac
+          		;;
+          	esac
+          	if [ $_m -eq 0 ]; then
+          		if [ -z "${todomsg}" ]; then
+          			echo "ok ${ntest}"
+          		else
+          			echo "ok ${ntest} # TODO ${todomsg}"
+          		fi
+          	else
+          		if [ -z "${todomsg}" ]; then
+          			echo "not ok ${ntest} - tried '$*', expected ${e}, got ${r}"
+          		else
+          			echo "not ok ${ntest} # TODO ${todomsg}"
+          		fi
+          	fi
+          	todomsg=""
+          	: $(( ntest += 1 ))
+          }
+
+          namegen()
+          {
+          	read _u < /proc/sys/kernel/random/uuid
+          	while [ "${_u#*-}" != "$_u" ]; do _u="${_u%%-*}${_u#*-}"; done
+          	echo "pjdfstest_${_u}"
+          }
+
+          namegen_len()
+          {
+          	len="${1}"
+          	name=""
+          	while [ ${#name} -lt ${len} ]; do
+          		read _u < /proc/sys/kernel/random/uuid
+          		while [ "${_u#*-}" != "$_u" ]; do _u="${_u%%-*}${_u#*-}"; done
+          		name="${name}${_u}"
+          	done
+          	while [ ${#name} -gt ${len} ]; do
+          		name="${name%?}"
+          	done
+          	printf "%s" "${name}"
+          }
+          EOF
           e2fsck -fn "$PWD/cache/volumes/pjdfs_build.ext4"
       - name: Upload guest-built pjdfstest bundle
         uses: actions/upload-artifact@v4
