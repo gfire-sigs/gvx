@@ -1104,12 +1104,7 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
-	if err := f.decommitFile(fr); err != nil {
-		log.Warningf("Failed to decommit %v: %v", fr, err)
-		// Zero the pages manually. This won't reduce memory usage, but at
-		// least ensures that the pages will be zeroed when reallocated.
-		f.manuallyZero(fr)
-	}
+	f.decommitRange(fr)
 }
 
 // HasUniqueRef returns true if all pages in the given range have exactly one
@@ -1340,10 +1335,11 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 	if !huge {
 		// Decommit the range being released, then mark the released range as
 		// freed.
+		decommitFR := f.expandReleaseRangeLocked(fr)
 		f.mu.Unlock()
-		f.decommitOrManuallyZero(fr)
+		f.decommitOrManuallyZero(decommitFR)
 		f.mu.Lock()
-		f.unfreeSmall.RemoveFullRange(fr)
+		f.unfreeSmall.RemoveFullRange(decommitFR)
 		return
 	}
 

@@ -51,6 +51,10 @@ seam pkg/sentry/mm/vma.go
 # this for guests that link with 4KB segment alignment.
 seam pkg/sentry/loader/elf.go
 
+# Content seam: MemoryFile splits decommits at host page boundaries and merges released
+# sub-pages into whole host pages before punching holes (pkg/sentry/pgalloc/pgalloc.go).
+seam pkg/sentry/pgalloc/pgalloc.go
+
 # Content seam: ptrace SETREGSET on arm64 keeps TPIDR_EL0. The register set has no field
 # for the thread pointer, and upstream cleared it (pkg/sentry/arch/arch_aarch64.go).
 seam pkg/sentry/arch/arch_aarch64.go

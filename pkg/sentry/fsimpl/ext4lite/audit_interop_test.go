@@ -81,9 +81,9 @@ func auRequireTool(t *testing.T, name, requireVar string) string {
 func TestInteropE2fsckReplaysOurJournal(t *testing.T) {
 	bin := auRequireTool(t, "e2fsck", "EXT4LITE_REQUIRE_E2FSCK")
 	path, model := auCrashImageFile(t)
-	out, err := exec.Command(bin, "-fy", path).CombinedOutput()
+	out, err := exec.Command(bin, "-p", path).CombinedOutput()
 	if code := auExitCode(err); code != 0 && code != 1 {
-		t.Fatalf("e2fsck -fy exits with %d:\n%s", code, bytes.TrimSpace(out))
+		t.Fatalf("e2fsck -p exits with %d:\n%s", code, bytes.TrimSpace(out))
 	}
 	if out, err := exec.Command(bin, "-fn", path).CombinedOutput(); err != nil {
 		t.Fatalf("e2fsck -fn after the replay: %v\n%s", err, bytes.TrimSpace(out))

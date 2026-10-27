@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/memutil"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 var (
@@ -97,4 +98,16 @@ func DecommitSharedPages(region []byte) error {
 // ReleaseSharedPages unmaps a shared region allocated by AllocateSharedPages.
 func ReleaseSharedPages(region []byte) error {
 	return memutil.UnmapView(region)
+}
+
+// expandReleaseRangeLocked returns fr unchanged on Windows.
+func (f *MemoryFile) expandReleaseRangeLocked(fr memmap.FileRange) memmap.FileRange {
+	return fr
+}
+
+// decommitRange zeroes fr and releases whole host pages with DiscardVirtualMemory.
+func (f *MemoryFile) decommitRange(fr memmap.FileRange) {
+	f.forEachMappingSlice(fr, func(bs []byte) {
+		_ = DecommitSharedPages(bs)
+	})
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -357,5 +358,142 @@ func TestUsageScanCommitsTheTouchedPagesOnly(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("knownCommittedBytes = %d after touching pages %v of %d, want %d", got, touched, pages, want)
+	}
+}
+
+// TestDecommitUnalignedRangePunchesInteriorHostPages verifies that Decommit on
+// a range with 4KB-aligned ends zeroes the partial head and tail in memory and
+// punches holes in the interior whole host pages.
+func TestDecommitUnalignedRangePunchesInteriorHostPages(t *testing.T) {
+	t.Parallel()
+	mf, err := NewDefaultMemoryFile(MemoryFileOpts{DisableMemoryAccounting: true})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	page := uint64(hostarch.PageSize)
+	hostPage := uint64(unix.Getpagesize())
+	const hostPages = 4
+	total := hostPages * hostPage
+	fr, err := mf.Allocate(total, AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	mem := bs.Head().ToSlice()
+	for i := range mem {
+		mem[i] = 0xA5
+	}
+	if err := mf.file.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	before, err := mf.TotalUsage()
+	if err != nil {
+		t.Fatalf("TotalUsage before Decommit: %v", err)
+	}
+	if before < total {
+		t.Skipf("backing file reports %d bytes before Decommit, want at least %d", before, total)
+	}
+
+	sub := memmap.FileRange{Start: fr.Start + page, End: fr.End - page}
+	mf.Decommit(sub)
+
+	for i, b := range mem {
+		off := fr.Start + uint64(i)
+		want := byte(0xA5)
+		if off >= sub.Start && off < sub.End {
+			want = 0
+		}
+		if b != want {
+			t.Fatalf("mem[%d] = %#x, want %#x", i, b, want)
+		}
+	}
+	after, err := mf.TotalUsage()
+	if err != nil {
+		t.Fatalf("TotalUsage after Decommit: %v", err)
+	}
+	reclaimed := before - after
+	wantReclaimed := 2 * hostPage
+	if reclaimed < wantReclaimed {
+		t.Fatalf("reclaimed %d bytes from backing file, want at least %d", reclaimed, wantReclaimed)
+	}
+}
+
+// TestReleaseSubPagesCoalescesIntoWholeHostPageHolePunch verifies that
+// releasing all 4KB sub-pages of a 16KB host page one by one punches a hole in
+// the backing file once the final sub-page is released.
+func TestReleaseSubPagesCoalescesIntoWholeHostPageHolePunch(t *testing.T) {
+	t.Parallel()
+	mf, err := NewDefaultMemoryFile(MemoryFileOpts{DisableMemoryAccounting: true})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	page := uint64(hostarch.PageSize)
+	hostPage := uint64(unix.Getpagesize())
+	pagesPerHost := hostPage / page
+	var subRanges []memmap.FileRange
+	for range pagesPerHost {
+		fr, err := mf.Allocate(page, AllocOpts{Kind: usage.Anonymous})
+		if err != nil {
+			t.Fatalf("Allocate: %v", err)
+		}
+		bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			t.Fatalf("MapInternal: %v", err)
+		}
+		slice := bs.Head().ToSlice()
+		for i := range slice {
+			slice[i] = 0x5C
+		}
+		subRanges = append(subRanges, fr)
+	}
+	if err := mf.file.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	before, err := mf.TotalUsage()
+	if err != nil {
+		t.Fatalf("TotalUsage before release: %v", err)
+	}
+	if before == 0 {
+		t.Skip("backing file reports 0 bytes before release")
+	}
+
+	// Release one sub-page at a time in non-sequential order so releaserMain
+	// handles each sub-page individually before the final sub-page completes the host page.
+	order := []int{0, int(pagesPerHost) - 1}
+	for i := 1; i < int(pagesPerHost)-1; i++ {
+		order = append(order, i)
+	}
+	if pagesPerHost == 1 {
+		order = []int{0}
+	}
+	for _, idx := range order {
+		mf.DecRef(subRanges[idx])
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			mf.mu.Lock()
+			busy := mf.haveWaste
+			mf.mu.Unlock()
+			if !busy {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	after, err := mf.TotalUsage()
+	if err != nil {
+		t.Fatalf("TotalUsage after release: %v", err)
+	}
+	if after >= before {
+		t.Fatalf("TotalUsage after releasing all sub-pages = %d, want less than %d", after, before)
 	}
 }

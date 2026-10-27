@@ -70,9 +70,30 @@ jobs:
             make pjdfstest >/dev/null
             cp -r /mnt/vol/pjdfstest/* /workspace/
             sed -i "s/openssl md5 | awk '\''{print \$NF}'\''/md5sum | awk '\''{print \$1}'\''/g" /workspace/tests/misc.sh
-            mkdir -p /mnt/vol/testdir
-            cd /mnt/vol/testdir
-            prove -r /mnt/vol/pjdfstest/tests
+            run_suite() {
+              suite="$1"
+              mkdir -p "/mnt/vol/work/$suite"
+              cd "/mnt/vol/work/$suite"
+              prove -r "/mnt/vol/pjdfstest/tests/$suite"
+            }
+            pids=""
+            active=0
+            rc_all=0
+            for d in /mnt/vol/pjdfstest/tests/*; do
+              [ -d "$d" ] || continue
+              s=$(basename "$d")
+              run_suite "$s" &
+              pids="$pids $!"
+              active=$((active + 1))
+              if [ "$active" -ge 4 ]; then
+                for p in $pids; do wait "$p" || rc_all=1; done
+                pids=""
+                active=0
+                [ "$rc_all" -eq 0 ]
+              fi
+            done
+            for p in $pids; do wait "$p" || rc_all=1; done
+            [ "$rc_all" -eq 0 ]
           '
           e2fsck -fn "$PWD/cache/volumes/pjdfs_vol.ext4"
       - name: Build pjdfstest bundle for non-Linux runners
