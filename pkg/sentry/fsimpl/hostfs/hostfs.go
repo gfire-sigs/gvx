@@ -243,6 +243,9 @@ type Workspace struct {
 	pruneCursor int
 	// maxMeta is the most entries that meta may hold. See checkMetaRoomLocked.
 	maxMeta int
+	// dirTimes records the last virtual symlink mutation time in a directory
+	// that has no .gvx_meta record of its own. mu protects it.
+	dirTimes map[string]int64
 	// single is the host name of the bound file in single-file mode, or empty
 	// for a directory workspace. It never changes after openWorkspace
 	// returns. See single_file.go.
@@ -355,6 +358,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
 		clutter:          clutterRulesFor(hostOS),
 		maxMeta:          metaLimit(opts.maxMeta),
+		dirTimes:         make(map[string]int64),
 		single:           single,
 	}
 	if caps.LocksOpenDirMove {
@@ -818,13 +822,42 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 		typ = linux.S_IFREG
 	}
 	if m, ok := w.meta[rel]; ok {
-		a := POSIXAttr{Mode: typ | m.Mode&0o7777, UID: m.UID, GID: m.GID, Xattrs: m.Xattrs}
+		a := POSIXAttr{
+			Mode:   typ | m.Mode&0o7777,
+			UID:    m.UID,
+			GID:    m.GID,
+			Mtime:  m.Mtime,
+			Ctime:  m.Ctime,
+			Xattrs: m.Xattrs,
+		}
 		if st := placeholderType(info, m); st != 0 {
 			a.Mode, a.Rdev = st|m.Mode&0o7777, m.Rdev
 		}
+		if t := w.dirTimes[rel]; t > 0 {
+			a.Mtime = max(a.Mtime, t)
+			a.Ctime = max(a.Ctime, t)
+		}
 		return a
 	}
-	return POSIXAttr{Mode: typ | defaultPerm(info)}
+	a := POSIXAttr{Mode: typ | defaultPerm(info)}
+	if t := w.dirTimes[rel]; t > 0 {
+		a.Mtime = t
+		a.Ctime = t
+	}
+	return a
+}
+
+// touchDirLocked records now as the modification and change time of dir when a
+// virtual symlink changes inside it without a host directory mutation. Callers
+// hold w.mu for writing.
+func (w *Workspace) touchDirLocked(dir string, now int64) {
+	if m, ok := w.meta[dir]; ok && m.Symlink == "" {
+		m.Mtime = now
+		m.Ctime = now
+		w.meta[dir] = m
+	} else {
+		w.dirTimes[dir] = now
+	}
 }
 
 // lookupLocked resolves rel to its effective state without following links.
@@ -1289,6 +1322,7 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 	if gid != nil {
 		cur.GID = *gid
 	}
+	cur.Ctime = now
 	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return err
 	}
@@ -1370,6 +1404,8 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 		Mtime:   now,
 		Ctime:   now,
 	}
+	parent, _ := splitParent(rel)
+	w.touchDirLocked(parent, now)
 	w.markDirtyLocked()
 	return nil
 }
@@ -1584,10 +1620,20 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 
 	// Table update: the destination record dies, the source record and every
 	// record below it move.
+	now := time.Now().UnixNano()
 	delete(w.meta, newRel)
+	delete(w.dirTimes, newRel)
 	if m, ok := w.meta[oldRel]; ok {
 		delete(w.meta, oldRel)
+		m.Ctime = now
 		w.meta[newRel] = m
+	}
+	delete(w.dirTimes, oldRel)
+	if src.virtual {
+		w.touchDirLocked(oldParent, now)
+		if !dstExists || dst.virtual {
+			w.touchDirLocked(newParent, now)
+		}
 	}
 	prefix := oldRel + "/"
 	var moved []string
@@ -1691,6 +1737,9 @@ func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
 		parent, name := splitParent(rel)
 		w.removeDirNameLocked(parent, name, leafOf(hostRel))
 		w.dropAlt(parent, name)
+	} else {
+		parent, _ := splitParent(rel)
+		w.touchDirLocked(parent, time.Now().UnixNano())
 	}
 	delete(w.meta, rel)
 	w.markDirtyLocked()
@@ -1805,7 +1854,18 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 	if err != nil {
 		return err
 	}
-	return w.host.chtimes(hostRel, atime, mtime)
+	if err := w.host.chtimes(hostRel, atime, mtime); err != nil {
+		return err
+	}
+	if mtime != nil {
+		delete(w.dirTimes, rel)
+		if m, ok := w.meta[rel]; ok && m.Mtime != 0 {
+			m.Mtime = 0
+			w.meta[rel] = m
+			w.markDirtyLocked()
+		}
+	}
+	return nil
 }
 
 // dirListing is one directory entry with its type and the host inode number

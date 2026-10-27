@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -1202,4 +1203,120 @@ func TestReadOnlyWorkspaceRejectsMutationsThroughTheVFS(t *testing.T) {
 	wantErrno(t, "mkdir on read-only workspace", e.mkdir("d"), linuxerr.EROFS)
 	wantErrno(t, "rename on read-only workspace", e.rename("f", "h"), linuxerr.EROFS)
 	wantErrno(t, "chmod on read-only workspace", e.setStat("f", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}), linuxerr.EROFS)
+}
+
+func TestVirtualMetadataUpdatesCtimeAndClearsBlockSocketPrivileges(t *testing.T) {
+	e := newEnv(t)
+	e.writeFile("f", []byte("data"))
+	if err := e.link("f", "f_link"); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	before := e.mustStat("f")
+	time.Sleep(2 * time.Millisecond)
+
+	if err := e.setStat("f", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}); err != nil {
+		t.Fatalf("chmod f: %v", err)
+	}
+	afterF := e.mustStat("f")
+	afterLink := e.mustStat("f_link")
+	if afterF.Ctime.ToNsec() <= before.Ctime.ToNsec() {
+		t.Fatalf("chmod did not advance ctime: before=%d after=%d", before.Ctime.ToNsec(), afterF.Ctime.ToNsec())
+	}
+	if afterLink.Ctime.ToNsec() != afterF.Ctime.ToNsec() {
+		t.Fatalf("hard link ctime mismatch: f=%d f_link=%d", afterF.Ctime.ToNsec(), afterLink.Ctime.ToNsec())
+	}
+
+	// Verify ClearPrivs on S_IFBLK (0x6000) and S_IFSOCK (0xc000).
+	if err := e.vfsObj.MknodAt(e.ctx, e.creds, e.pop("blk"), &vfs.MknodOptions{
+		Mode:     linux.FileMode(linux.S_IFBLK | linux.S_ISUID | linux.S_ISGID | 0o770),
+		DevMajor: 1,
+		DevMinor: 2,
+	}); err != nil {
+		t.Fatalf("mknod blk: %v", err)
+	}
+	if err := e.vfsObj.MknodAt(e.ctx, e.creds, e.pop("sock"), &vfs.MknodOptions{
+		Mode: linux.FileMode(linux.S_IFSOCK | linux.S_ISUID | linux.S_ISGID | 0o770),
+	}); err != nil {
+		t.Fatalf("mknod sock: %v", err)
+	}
+	for _, name := range []string{"blk", "sock"} {
+		if err := e.vfsObj.SetStatAt(e.ctx, e.creds, e.pop(name), &vfs.SetStatOptions{
+			Stat:       linux.Statx{Mask: linux.STATX_UID, UID: 1000},
+			ClearPrivs: true,
+		}); err != nil {
+			t.Fatalf("chown %s: %v", name, err)
+		}
+		if got := e.mustStat(name).Mode & (linux.S_ISUID | linux.S_ISGID); got != 0 {
+			t.Fatalf("%s retained set-ID bits %#o after ClearPrivs", name, got)
+		}
+	}
+}
+
+func TestVirtualSymlinkUpdatesParentDirMtimeAndCtime(t *testing.T) {
+	e := newEnv(t)
+	e.mustMkdir("dir")
+	t0 := e.mustStat("dir")
+	time.Sleep(2 * time.Millisecond)
+
+	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("dir/sym"), "target"); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	t1 := e.mustStat("dir")
+	if t1.Mtime.ToNsec() <= t0.Mtime.ToNsec() || t1.Ctime.ToNsec() <= t0.Ctime.ToNsec() {
+		t.Fatalf("symlink did not advance dir mtime/ctime: before=(%d,%d) after=(%d,%d)",
+			t0.Mtime.ToNsec(), t0.Ctime.ToNsec(), t1.Mtime.ToNsec(), t1.Ctime.ToNsec())
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := e.unlink("dir/sym"); err != nil {
+		t.Fatalf("unlink sym: %v", err)
+	}
+	t2 := e.mustStat("dir")
+	if t2.Mtime.ToNsec() <= t1.Mtime.ToNsec() || t2.Ctime.ToNsec() <= t1.Ctime.ToNsec() {
+		t.Fatalf("unlink sym did not advance dir mtime/ctime: before=(%d,%d) after=(%d,%d)",
+			t1.Mtime.ToNsec(), t1.Ctime.ToNsec(), t2.Mtime.ToNsec(), t2.Ctime.ToNsec())
+	}
+
+	// Explicit utimensat on the directory can set an earlier mtime.
+	past := linux.StatxTimestamp{Sec: 1700000000, Nsec: 0}
+	if err := e.setStat("dir", linux.Statx{Mask: linux.STATX_MTIME, Mtime: past}); err != nil {
+		t.Fatalf("utimensat dir: %v", err)
+	}
+	if got := e.mustStat("dir").Mtime.Sec; got != past.Sec {
+		t.Fatalf("dir mtime after utimensat = %d, want %d", got, past.Sec)
+	}
+}
+
+func TestUtimensatOmitPreservesUnchangedTimestamp(t *testing.T) {
+	e := newEnv(t)
+	e.writeFile("f", []byte("x"))
+	orig := e.mustStat("f")
+
+	const date1 = 1900000000
+	const date2 = 1950000000
+	if err := e.setStat("f", linux.Statx{
+		Mask:  linux.STATX_ATIME,
+		Atime: linux.StatxTimestamp{Sec: date1, Nsec: 0},
+		Mtime: linux.StatxTimestamp{Nsec: linux.UTIME_OMIT},
+	}); err != nil {
+		t.Fatalf("utimensat atime only: %v", err)
+	}
+	st1 := e.mustStat("f")
+	if st1.Atime.Sec != date1 || st1.Mtime.Sec != orig.Mtime.Sec {
+		t.Fatalf("after atime-only utimensat: atime=%d (want %d), mtime=%d (want %d)",
+			st1.Atime.Sec, date1, st1.Mtime.Sec, orig.Mtime.Sec)
+	}
+
+	if err := e.setStat("f", linux.Statx{
+		Mask:  linux.STATX_MTIME,
+		Atime: linux.StatxTimestamp{Nsec: linux.UTIME_OMIT},
+		Mtime: linux.StatxTimestamp{Sec: date2, Nsec: 0},
+	}); err != nil {
+		t.Fatalf("utimensat mtime only: %v", err)
+	}
+	st2 := e.mustStat("f")
+	if st2.Atime.Sec != date1 || st2.Mtime.Sec != date2 {
+		t.Fatalf("after mtime-only utimensat: atime=%d (want %d), mtime=%d (want %d)",
+			st2.Atime.Sec, date1, st2.Mtime.Sec, date2)
+	}
 }

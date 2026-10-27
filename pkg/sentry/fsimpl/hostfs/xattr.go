@@ -19,6 +19,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
@@ -156,6 +157,7 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 	if t.rel == "" {
 		t.ino.attrMu.Lock()
 		t.ino.cur.attr.Xattrs = next
+		t.ino.cur.attr.Ctime = time.Now().UnixNano()
 		t.ino.attrMu.Unlock()
 		return nil
 	}
@@ -170,13 +172,16 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 	if err := w.checkMetaRoomLocked(t.rel); err != nil {
 		return translateHostError(err)
 	}
+	now := time.Now().UnixNano()
 	rec := e.attr
 	rec.Xattrs = next
+	rec.Ctime = now
 	w.meta[t.rel] = rec
 	// The snapshot of the inode follows the record, so an open descriptor of
 	// a file that the guest unlinks later still sees the attributes.
 	t.ino.attrMu.Lock()
 	t.ino.cur.attr.Xattrs = next
+	t.ino.cur.attr.Ctime = now
 	t.ino.attrMu.Unlock()
 	if e.info.nlink > 1 && !e.isDir() && !e.virtual {
 		if err := w.propagateLinkAttrLocked(t.rel, e.info.id, rec); err != nil {

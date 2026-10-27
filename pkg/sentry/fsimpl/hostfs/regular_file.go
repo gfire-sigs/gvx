@@ -266,8 +266,8 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 	}
 	// As with Linux, writing clears the set-user-ID and set-group-ID bits.
 	if n > 0 {
-		if mode := uint32(ino.mode()); vfs.ClearSUIDAndSGID(mode) != mode {
-			m := vfs.ClearSUIDAndSGID(mode) & 0o7777
+		if mode := uint32(ino.mode()); clearSUIDAndSGID(mode) != mode {
+			m := clearSUIDAndSGID(mode) & 0o7777
 			if err := d.setAttr(&m, nil, nil); err != nil {
 				return 0, offset, err
 			}

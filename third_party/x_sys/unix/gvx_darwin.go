@@ -101,8 +101,8 @@ const (
 	AT_STATX_SYNC_AS_STAT = 0x0000
 	AT_STATX_FORCE_SYNC   = 0x2000
 	AT_STATX_DONT_SYNC    = 0x4000
-	UTIME_NOW             = (1 << 30) - 1
-	UTIME_OMIT            = (1 << 30) - 2
+	UTIME_NOW             = -1
+	UTIME_OMIT            = -2
 
 	POLLRDHUP = 0x2000
 

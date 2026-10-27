@@ -89,6 +89,10 @@ func TestInteropE2fsckReplaysOurJournal(t *testing.T) {
 		t.Fatalf("e2fsck -fn after the replay: %v\n%s", err, bytes.TrimSpace(out))
 	}
 	e := openEnv(t, path, VolumeOptions{}, vfs.MountOptions{})
+	// e2fsck Pass 3 creates an empty /lost+found directory when running in
+	// writable mode. Remove it if empty; a non-empty /lost+found stays and
+	// fails the comparison below.
+	_ = e.rmdir("/lost+found")
 	for _, msg := range auCompareLive(e, model) {
 		t.Errorf("after the replay by e2fsck: %s", msg)
 	}
@@ -134,6 +138,10 @@ func TestInteropKernelReplaysOurJournal(t *testing.T) {
 		}
 	}
 	e := openEnv(t, path, VolumeOptions{}, vfs.MountOptions{})
+	// e2fsck Pass 3 creates an empty /lost+found directory when running in
+	// writable mode. Remove it if empty; a non-empty /lost+found stays and
+	// fails the comparison below.
+	_ = e.rmdir("/lost+found")
 	for _, msg := range auCompareLive(e, model) {
 		t.Errorf("after the replay by the kernel: %s", msg)
 	}

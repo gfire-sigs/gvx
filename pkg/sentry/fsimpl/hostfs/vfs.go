@@ -1562,9 +1562,9 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 		gid = &stat.GID
 	}
 	if opts.ClearPrivs && !d.inode.isDir() {
-		m := vfs.ClearSUIDAndSGID(uint32(e.attr.Mode)) & 0o7777
+		m := clearSUIDAndSGID(uint32(e.attr.Mode)) & 0o7777
 		if mode != nil {
-			m = vfs.ClearSUIDAndSGID(*mode|e.attr.Mode&linux.S_IFMT) & 0o7777
+			m = clearSUIDAndSGID(*mode|e.attr.Mode&linux.S_IFMT) & 0o7777
 		}
 		mode = &m
 	}
@@ -1597,6 +1597,17 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 	}
 	d.inode.invalidateMeta()
 	return d.refresh()
+}
+
+// clearSUIDAndSGID clears the set-user-ID and set-group-ID bits of a
+// non-directory mode. Upstream vfs.ClearSUIDAndSGID tests ModeDirectory without
+// masking the file type, which misclassifies S_IFBLK (0x6000) and S_IFSOCK
+// (0xc000) as directories.
+func clearSUIDAndSGID(mode uint32) uint32 {
+	if mode&linux.S_IFMT == linux.S_IFDIR {
+		return mode
+	}
+	return vfs.ClearSUIDAndSGID(mode&^uint32(linux.S_IFMT)) | (mode & linux.S_IFMT)
 }
 
 func statxTime(ts linux.StatxTimestamp, now time.Time) time.Time {
@@ -1634,6 +1645,7 @@ func (d *dentry) setAttr(mode, uid, gid *uint32) error {
 	if gid != nil {
 		a.GID = *gid
 	}
+	a.Ctime = time.Now().UnixNano()
 	return nil
 }
 
@@ -1698,6 +1710,14 @@ func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 	if btime.IsZero() {
 		btime = info.mtime
 	}
+	mtime := info.mtime
+	if e.attr.Mtime > mtime.UnixNano() {
+		mtime = time.Unix(0, e.attr.Mtime)
+	}
+	ctime := info.ctime
+	if e.attr.Ctime > ctime.UnixNano() {
+		ctime = time.Unix(0, e.attr.Ctime)
+	}
 	blocks := uint64(info.blocks)
 	if blocks == 0 && info.size > 0 {
 		blocks = (uint64(info.size) + 511) / 512
@@ -1713,8 +1733,8 @@ func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 		Size:     uint64(info.size),
 		Blocks:   blocks,
 		Atime:    statxTimestamp(info.atime),
-		Mtime:    statxTimestamp(info.mtime),
-		Ctime:    statxTimestamp(info.ctime),
+		Mtime:    statxTimestamp(mtime),
+		Ctime:    statxTimestamp(ctime),
 		Btime:    statxTimestamp(btime),
 		DevMajor: 0,
 		DevMinor: devMinor,

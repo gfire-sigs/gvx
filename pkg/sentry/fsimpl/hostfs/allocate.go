@@ -22,6 +22,8 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/limits"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // This file implements fallocate(2) for regular files. hostfs supports three
@@ -61,6 +63,15 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	end := offset + length
 	if end < offset || end > math.MaxInt64 {
 		return linuxerr.EFBIG
+	}
+	if !keepSize && limits.FromContext(ctx) != nil {
+		limit, err := vfs.CheckLimit(ctx, int64(offset), int64(length))
+		if err != nil {
+			return err
+		}
+		if limit < int64(length) {
+			return linuxerr.EFBIG
+		}
 	}
 	d := fd.dentry
 	ino := d.inode
