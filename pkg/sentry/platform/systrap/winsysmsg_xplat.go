@@ -195,6 +195,18 @@ type spillOptions struct {
 	// did before the call flag and FPDirty. Only BenchmarkFastPathRoundTrip sets
 	// it, so that the benchmark compares both routines in one process on one host.
 	alwaysRestore bool
+	// spinStub is the number of polls of the stub before it sleeps. Zero means
+	// winSpinStub. Only the spin sweep benchmark sets it.
+	spinStub int
+}
+
+// stubSpin returns the number of polls that the generated routine makes before
+// it sleeps.
+func (o spillOptions) stubSpin() int {
+	if o.spinStub > 0 {
+		return o.spinStub
+	}
+	return winSpinStub
 }
 
 // winSignaler is the event pair behind one thread. The Windows engine backs

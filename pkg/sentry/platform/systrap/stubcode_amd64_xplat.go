@@ -362,7 +362,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 
 	a.label("spin")
 	a.emit(0xBB)
-	a.imm32(winSpinStub) // mov ebx, spin count
+	a.imm32(uint32(opts.stubSpin())) // mov ebx, spin count
 	a.label("poll")
 	a.movLoad32(x86RAX, base, winOffState)
 	a.emit(0x83, 0xF8, byte(winStateRunHot)) // cmp eax, RunHot

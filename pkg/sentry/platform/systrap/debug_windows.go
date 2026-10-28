@@ -144,7 +144,7 @@ func statsLine() string {
 	for k := stopKind(0); k < stopKinds; k++ {
 		fmt.Fprintf(&b, " %s %d %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6, stopStats.waitNs[k].Load()/1e6)
 	}
-	line := strings.TrimSuffix(b.String(), ",") + fmt.Sprintf("; fast traps %d", fastTraps.Load())
+	line := strings.TrimSuffix(b.String(), ",") + fmt.Sprintf("; fast traps %d (Sentry slept %d, stub woken %d)", fastTraps.Load(), fastSentrySleeps.Load(), fastStubWakes.Load())
 	if sites := archStatsLine(); sites != "" {
 		line += "; " + sites
 	}

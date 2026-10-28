@@ -232,7 +232,10 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		hvcommon.BLR(tmp),
 	)
 	a.label("spin")
-	a.emit(hvcommon.MOVZW(cnt, winSpinStub))
+	if opts.stubSpin() > 0xFFFF {
+		return winSpillCode{}, fmt.Errorf("stub spin %d does not fit a MOVZ immediate", opts.stubSpin())
+	}
+	a.emit(hvcommon.MOVZW(cnt, uint16(opts.stubSpin())))
 	a.label("poll")
 	a.emit(
 		a64ldarW(0, base),

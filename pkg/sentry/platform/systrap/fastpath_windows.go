@@ -126,6 +126,17 @@ func writeEventsReply(out io.Writer, errno uint32, ev eventHandles) error {
 // fastTraps counts the system calls that the fast path served, for the trace.
 var fastTraps atomic.Uint64
 
+// fastSentrySleeps counts the waits in which the Sentry polled spin times
+// without seeing the trap and slept on the guest event. fastStubWakes counts
+// the resumes that found the stub asleep and set the host event. Both cost a
+// kernel call and a thread wake-up, so a high count means that a spin window is
+// shorter than the time the other side needs to answer.
+var fastSentrySleeps, fastStubWakes atomic.Uint64
+
+// sentrySpin is the number of polls of the Sentry before it sleeps. Only
+// the spin sweep benchmark changes it, and it does so while no guest runs.
+var sentrySpin = winSpinSentry
+
 // ---- platform --------------------------------------------------------------
 
 // prepareFast builds the spill routine and finds the ntdll functions that it
@@ -189,13 +200,22 @@ type fastSlot struct {
 	sm  *winSysmsg
 	// guest and host are the events in the Sentry process.
 	guest, host windows.Handle
+	// sleeps counts the sleeps of the Sentry on guest, and wakes counts the
+	// sets of host that woke the stub.
+	sleeps, wakes atomic.Uint64
 }
 
 // signalHost implements winSignaler.
-func (s *fastSlot) signalHost() error { return windows.SetEvent(s.host) }
+func (s *fastSlot) signalHost() error {
+	s.wakes.Add(1)
+	fastStubWakes.Add(1)
+	return windows.SetEvent(s.host)
+}
 
 // waitGuest implements winSignaler.
 func (s *fastSlot) waitGuest() error {
+	s.sleeps.Add(1)
+	fastSentrySleeps.Add(1)
 	_, err := windows.WaitForSingleObject(s.guest, windows.INFINITE)
 	return err
 }
@@ -412,7 +432,7 @@ func (th *thread) waitNext() (ev debugEvent, trapped bool, err error) {
 		return ev, false, err
 	}
 	pending := func() bool { return th.evQueued.Load() > 0 || th.sp.dead.Load() }
-	res, err := f.slot.sm.winSysmsgHeader.await(winSpinSentry, f.slot, pending)
+	res, err := f.slot.sm.winSysmsgHeader.await(sentrySpin, f.slot, pending)
 	if err != nil {
 		if th.sp.dead.Load() {
 			return debugEvent{}, false, th.sp.deathError()
