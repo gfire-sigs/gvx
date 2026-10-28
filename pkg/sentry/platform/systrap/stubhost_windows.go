@@ -95,7 +95,10 @@ type stubHostLoop struct {
 	token  windows.Token
 	level  confinement
 	exe    string
-	jobs   map[uint32]windows.Handle
+	// image is the locked file that the stubs run. It is nil when the host could
+	// not write it. The stubs then run a copy of the executable of the host.
+	image *stubImage
+	jobs  map[uint32]windows.Handle
 	// procs holds a handle to each live stub, to duplicate event handles into it.
 	procs map[uint32]windows.Handle
 	// debug is the debug object of the Sentry, in the handle table of the host.
@@ -121,6 +124,12 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 5
 	}
+	tImage := time.Now()
+	h.image, err = createStubImage(os.TempDir())
+	if err != nil && traceEvents {
+		tracef("stub host: no stub image, the stubs run the executable of the host: %v", err)
+	}
+	defer h.image.close()
 	if traceWatch {
 		// The age is the time from the creation of the process to this point. It
 		// covers the kernel, the loader, the Go runtime, and the package inits.
@@ -129,8 +138,8 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 		if windows.GetProcessTimes(windows.CurrentProcess(), &created, &exited, &kernel, &user) == nil {
 			age = float64(time.Now().UnixNano()-created.Nanoseconds()) / 1e6
 		}
-		fmt.Fprintf(os.Stderr, "systrap: stub host ms: age at start %.1f, token %.1f, setup %.1f\n",
-			age, float64(time.Since(tToken))/1e6, float64(time.Since(tStart))/1e6)
+		fmt.Fprintf(os.Stderr, "systrap: stub host ms: age at start %.1f, token %.1f, image %.1f, setup %.1f\n",
+			age, float64(tImage.Sub(tToken))/1e6, float64(time.Since(tImage))/1e6, float64(time.Since(tStart))/1e6)
 	}
 	// The first reply tells the Sentry that the host is ready.
 	if err := writeHostReply(out, 0, nil, h.level); err != nil {
@@ -373,7 +382,11 @@ func (h *stubHostLoop) newEvents(pid uint32) (out eventHandles, err error) {
 // newStub creates one confined, suspended stub process and returns handles in
 // the Sentry process.
 func (h *stubHostLoop) newStub() (*stubHandles, error) {
-	cmd, err := windows.UTF16PtrFromString(`"` + h.exe + `" stub`)
+	img := h.exe
+	if h.image != nil {
+		img = h.image.path
+	}
+	cmd, err := windows.UTF16PtrFromString(`"` + img + `" stub`)
 	if err != nil {
 		return nil, err
 	}
