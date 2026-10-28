@@ -599,6 +599,20 @@ func TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("stopThread did not return while the thread waited at an event")
 	}
+
+	// Serve the event as Switch does, so that the thread runs on to the next
+	// system call and the cleanup of the test finds it in the spill routine.
+	r.ctx.kicked.Store(false)
+	ev, trapped, err := th.waitNext()
+	if err != nil || trapped {
+		t.Fatalf("waitNext = (trapped %v, %v), want the event of the cold resume", trapped, err)
+	}
+	if out := r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev); out.done {
+		t.Fatalf("the cold resume ended the stop: %+v", out)
+	}
+	if _, trapped, err := th.waitNext(); err != nil || !trapped {
+		t.Fatalf("waitNext = (trapped %v, %v), want the trap of system call 7", trapped, err)
+	}
 }
 
 // TestKickDuringColdResumeInterruptsTheGuest checks the other half of the fix:
