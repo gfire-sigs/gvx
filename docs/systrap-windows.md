@@ -120,10 +120,33 @@ Caution for `amd64`: the `CONTEXT` structure starts with six home slots, so `Con
 | Thread start at `ntdll!DbgBreakPoint`, then `SetThreadContext` while the thread is parked | yes | yes |
 | Same call after `ntdll` `.text` becomes read-only | the thread did not run and the process died | same |
 | Same call after every syscall instruction in `ntdll` `.text` becomes an undefined instruction (524 and 1444 sites) | the thread did not run and the process died | same |
-| A generated minimal PE image with no imports | starts, then exits with `0xC000007B` | same |
+| A generated minimal PE image with no load configuration directory, with or without imports | starts, then exits with `0xC000007B` | same |
+| Same image with a load configuration directory that sets `GuardFlags` to `IMAGE_GUARD_SECURITY_COOKIE_UNUSED` | runs and returns the exit code of the entry point | same |
+| Same image without high entropy ASLR | the loader may place it below 4 GB, inside the low guest window | same |
 | Low-integrity restricted token, one-process job, Win32k disable, all at creation | works with the whole flow | works with the whole flow |
 
-A new thread starts in `ntdll!RtlUserThreadStart`. That path needs executable `ntdll` code and its syscall instructions. Removing the `ntdll` syscall gadgets therefore breaks thread creation, and the stub keeps `ntdll` executable. The engine does not generate a PE image. It starts a second copy of the Sentry executable as the stub image and parks it before the entry point runs.
+A new thread starts in `ntdll!RtlUserThreadStart`. That path needs executable `ntdll` code and its syscall instructions. Removing the `ntdll` syscall gadgets therefore breaks thread creation, and the stub keeps `ntdll` executable. The stub keeps the loader of Windows but needs no code of its own. The engine parks the initial thread before the entry point runs. The image of the stub therefore only has to pass the loader.
+
+The loader of Windows 11 fails an image that has no load configuration directory. The failure is `0xC000007B` before the loader reads any import. A trace of the loader with `ShowSnaps` ends right after the line "Beginning execution". Changing single header fields of the system programs `hostname.exe` and `find.exe` and of a Go program showed it. Only a zero load configuration directory broke them. The directory needs its `Size` field. With a null security cookie it also needs `GuardFlags` with `IMAGE_GUARD_SECURITY_COOKIE_UNUSED`. The image also needs high entropy ASLR. Without it, the loader places the image below 4 GB. There it can take a part of the low guest window.
+
+The host therefore writes a 1 KB image of its own, built by `buildStubImage`. The image has one section with an entry point that returns zero, an empty relocation block, and the load configuration. The host writes the file once into the temporary directory and runs every stub from it.
+
+> [!IMPORTANT]
+> The image file is code that the host executes. A process of the same user must not be able to replace it between the write and the first use.
+
+The host opens the file with `CREATE_NEW` and a handle that shares nothing, writes the bytes, and closes it. It then reopens the file with read access and `FILE_SHARE_READ` only, and keeps that handle until it exits. No process can open the file for write or delete, or rename it, while the handle is open. The loader asks for read access, so it still maps the file. The host reads the file through the held handle. It compares the bytes, the file index, and the link count with the values of its own write, and it refuses a reparse point. A process that replaced the file before the lock makes the check fail. A rename of the directory of the file fails with "Access is denied" while the handle is open. The host runs the stubs from the canonical path of the handle. This is the same method that `secureexec` of the `gosuda/hqq` repository uses on Windows.
+
+When the host cannot write or lock the image, the stubs run a copy of the Sentry executable, as before. `GVX_SYSTRAP_TRACE=1` prints the reason. The host removes the file when it exits, after it waits for the stubs to end. A crashed host leaves the file. The next host removes every file older than ten minutes whose name starts with `gvx-stub-`.
+
+Measured on the hosted runners, the median of eight runs, with the copy of the Sentry executable and with the small image:
+
+| Measure | `amd64` before | `amd64` after | `arm64` before | `arm64` after |
+| :--- | :--- | :--- | :--- | :--- |
+| Host time to create one stub | 6.3 ms | 1.5 ms | 14.8 ms | 4.3 ms |
+| Loader time in one stub | 16.8 ms | 9.9 ms | 20.0 ms | 21.0 ms |
+| `fork` and `wait` | 14.9 ms | 7.1 ms | 24.0 ms | 14.0 ms |
+| `fork` and `exec` of a minimal executable | 12.9 ms | 6.4 ms | 23.7 ms | 21.8 ms |
+| Self test in `New` | 6 to 8 ms | 2 to 3.5 ms | 13 to 17 ms | 5.9 ms |
 
 ### 3.7 Instruction Scan of Real Binaries
 
@@ -189,7 +212,7 @@ The Linux numbers use the upstream `systrap` platform and a build without cgo. T
 
 `GVX_SYSTRAP_TRACE=3` prints the time of each step of `New` and `Close`. On `amd64`, `New` spends 11 to 16 ms to start the stub host. It spends 12 to 16 ms to start the first stub, and 5 to 8 ms in the self test. On `arm64` the same steps take 21, 28 to 33, and 13 to 15 ms. The stub host and the loader of a stub dominate.
 
-The stub host is a second copy of the Sentry executable. The trace of the host shows where its time goes. On `amd64` the host reaches its request loop 10 to 17 ms after Windows created the process. The package initializers and the setup of the token take about 1.5 ms of that. A trivial Go program, built without the Sentry, reaches `main` 4.8 ms after creation on `amd64` and 12 ms on `arm64`. The size of the executable therefore costs about 10 ms on `amd64` and 2 to 6 ms on `arm64`. A smaller host executable would save that time. It would need a second executable next to the Sentry, which the engine avoids.
+The stub host is a copy of the Sentry executable. The trace of the host shows where its time goes. On `amd64` the host reaches its request loop 10 to 17 ms after Windows created the process. The package initializers and the setup of the token take about 1.5 ms of that. A trivial Go program, built without the Sentry, reaches `main` 4.8 ms after creation on `amd64` and 12 ms on `arm64`. The size of the executable therefore costs about 10 ms on `amd64` and 2 to 6 ms on `arm64`. A smaller host executable would save that time. The stubs no longer run this copy, as section 3.6 explains. The host itself still does.
 
 An attempt to hide the start behind the rest of `gvx.New` did not help. `New` opened the platform in a goroutine while it opened the layers, the mounts, the network, and the memory file. On the hosted runners with four cores, `New` took 43 ms instead of 38 ms. The first `Run` took 27 ms instead of 4.5 ms, because the pool had less time to fill. The change was reverted.
 
@@ -264,7 +287,7 @@ An indirect jump into the middle of an instruction can run a hidden `0F 05`. A h
 | :--- | :--- |
 | Sentry | Owns the memory file, the guest address space maps, the patcher, and the debug object. |
 | Stub host | A copy of the Sentry executable that runs only a request loop. It starts before `hostlockdown.Apply`, because the lockdown job allows one process. |
-| Stub process | Another copy of the executable, created suspended, with the entry point never reached. It holds the guest address space and one thread for each guest thread. |
+| Stub process | Runs the small stub image of section 3.6, created suspended, with the entry point never reached. It holds the guest address space and one thread for each guest thread. |
 | Debug object | One native debug object, created by the Sentry, receives the exceptions of every stub. One goroutine on one OS thread waits for events and routes each to the guest thread. |
 
 The `init` function of the package runs the host loop when the environment variable `GVX_SYSTRAP_STUBHOST` is set. The Sentry starts the host with that variable and talks to it over the standard pipes. A request names no path and no command line, so a compromised Sentry cannot start a program of its choice.
