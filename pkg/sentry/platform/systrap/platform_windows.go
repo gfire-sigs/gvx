@@ -129,6 +129,7 @@ func New() (*Platform, error) {
 // open starts the stub host, and it prepares the fast path when fast is true.
 // It releases everything that it started when it fails.
 func open(fast bool) (*Platform, error) {
+	t0 := time.Now()
 	configureOnce.Do(configureArch)
 	breakAddr, err := dbgBreakPointAddr()
 	if err != nil {
@@ -138,11 +139,13 @@ func open(fast bool) (*Platform, error) {
 	if err != nil {
 		return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the debug object is unavailable: %v", err)}
 	}
+	tHost := time.Now()
 	host, err := spawnStubHost(dbg.obj)
 	if err != nil {
 		dbg.close()
 		return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the stub host did not start: %v", err)}
 	}
+	tPrep := time.Now()
 	p := &Platform{
 		host:      host,
 		dbg:       dbg,
@@ -157,7 +160,9 @@ func open(fast bool) (*Platform, error) {
 			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path is unavailable: %v", err)}
 		}
 	}
+	tLow := time.Now()
 	first := p.selectLowWindow()
+	tPool := time.Now()
 	p.startPool()
 	if first != nil {
 		select {
@@ -166,6 +171,7 @@ func open(fast bool) (*Platform, error) {
 			first.destroy()
 		}
 	}
+	tSelf := time.Now()
 	if p.fast {
 		// A short guest run proves the facts that the Windows documents do not
 		// state. A host that fails the run cannot use the fast path.
@@ -173,6 +179,12 @@ func open(fast bool) (*Platform, error) {
 			_ = p.Close()
 			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path failed its self test: %v", err)}
 		}
+	}
+	if traceWatch {
+		now := time.Now()
+		ms := func(a, b time.Time) float64 { return float64(b.Sub(a)) / 1e6 }
+		fmt.Fprintf(os.Stderr, "systrap: open ms: debugger %.1f, stub host %.1f, fast path %.1f, first stub %.1f, pool start %.1f, self test %.1f, total %.1f\n",
+			ms(t0, tHost), ms(tHost, tPrep), ms(tPrep, tLow), ms(tLow, tPool), ms(tPool, tSelf), ms(tSelf, now), ms(t0, now))
 	}
 	return p, nil
 }
@@ -216,11 +228,20 @@ func (p *Platform) Close() error {
 				printSamples()
 			}
 		}
+		t0 := time.Now()
 		p.stopPool()
+		t1 := time.Now()
 		p.dbg.close()
+		t2 := time.Now()
 		p.closeErr = p.host.close()
+		t3 := time.Now()
 		p.priv.close()
 		p.sections.close()
+		if traceWatch {
+			ms := func(a, b time.Time) float64 { return float64(b.Sub(a)) / 1e6 }
+			fmt.Fprintf(os.Stderr, "systrap: close ms: pool %.1f, debugger %.1f, stub host %.1f, memory %.1f, total %.1f\n",
+				ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, time.Now()), ms(t0, time.Now()))
+		}
 	})
 	return p.closeErr
 }
