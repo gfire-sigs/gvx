@@ -994,10 +994,6 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		}
 		return readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
 	}
-	if err := s.checkELFLayout(readGuest, execPath, hostarch.PageSize); err != nil {
-		return 1, err
-	}
-	s.maybeEnableFixedImageZone(readGuest, execPath)
 	user, procCreds, err := s.guestUser(sctxWithRoot, vfsObj, creds, root)
 	if err != nil {
 		return 1, err

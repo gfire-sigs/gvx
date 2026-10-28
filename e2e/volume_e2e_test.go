@@ -62,7 +62,7 @@ func TestE2EVolumePersistsAcrossSandboxes(t *testing.T) {
 					t.Fatalf("decode the probe report %q: %v", stdout, err)
 				}
 				if msg := rep.NewErr; msg != "" {
-					if strings.Contains(msg, "not position-independent") || strings.Contains(msg, "cannot hold the zone") {
+					if strings.Contains(msg, "not position-independent") {
 						t.Skipf("this engine cannot hold an executable that links at a fixed address: %s", msg)
 					}
 					t.Fatalf("%s: New failed: %s", mode, msg)
@@ -76,7 +76,7 @@ func TestE2EVolumePersistsAcrossSandboxes(t *testing.T) {
 				if rep.WriteOutsideErr == "" || rep.ReadOutsideErr == "" {
 					t.Errorf("%s: host access outside the volume = (read err %q, write err %q), want both denied", mode, rep.ReadOutsideErr, rep.WriteOutsideErr)
 				}
-				if msg := rep.GuestRunErr; strings.Contains(msg, "not position-independent") || strings.Contains(msg, "cannot hold the zone") {
+				if msg := rep.GuestRunErr; strings.Contains(msg, "not position-independent") {
 					t.Skipf("this engine cannot hold an executable that links at a fixed address: %s", msg)
 				}
 				if rep.GuestRunErr != "" || rep.GuestExitCode != 0 || rep.GuestStdout != mode+" ok\n" {

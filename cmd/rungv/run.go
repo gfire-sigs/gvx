@@ -163,7 +163,6 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL")
 	lockdownFlag := fs.Bool("lockdown", true, "Lock down the host process before guest entry (RestrictedToken and JobObject, or Seatbelt); use -lockdown=false to opt out")
-	elfCheckFlag := fs.Bool("elf-check", true, "Refuse an executable whose segments do not fit the guest page size, and name the segment; use -elf-check=false to opt out")
 	ttyFlag := fs.Bool("t", false, "Allocate a pseudo-TTY for guest stdio")
 	fs.Bool("i", false, "Keep STDIN open (the guest always reads the standard input of rungv)")
 	itFlag := fs.Bool("it", false, "Allocate an interactive pseudo-TTY for guest stdio")
@@ -346,7 +345,6 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		TTY:                 *ttyFlag || *itFlag,
 		DisableHostLockdown: !*lockdownFlag,
 	}
-	cfg.DisableELFLayoutCheck = !*elfCheckFlag
 	if len(guestArgs) > 0 {
 		if binPath != "" {
 			// A bare ELF has no image command: the arguments are the whole vector.

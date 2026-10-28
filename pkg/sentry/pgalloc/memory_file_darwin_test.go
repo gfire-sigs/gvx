@@ -271,7 +271,7 @@ func TestConcurrentDecommitKeepsWritesToNeighbours(t *testing.T) {
 }
 
 // TestMincoreHelperFillsOneEntryPerHostarchPage is a regression test for a Go
-// heap overflow in pagesize_16k builds. The mincore overlay wrote one byte per
+// heap overflow in builds with 16KB pages. The mincore overlay wrote one byte per
 // 4KB page while the usage scan sized its vector with one byte per 16KB page,
 // so every scan of a chunk wrote past the end of the vector into the heap.
 func TestMincoreHelperFillsOneEntryPerHostarchPage(t *testing.T) {

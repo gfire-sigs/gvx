@@ -235,13 +235,6 @@ type Config struct {
 	// the host process, so embedders that keep using the process for other
 	// work must set this field.
 	DisableHostLockdown bool
-
-	// DisableELFLayoutCheck lets an executable start although its load
-	// segments cannot map with the guest page size. By default, Run refuses
-	// such an executable before the guest starts, and the error names the
-	// segment. The check never runs with 4KB guest pages. The check reads the
-	// entry executable only, not a script interpreter or a shared object.
-	DisableELFLayoutCheck bool
 }
 
 // defaultHostname is the guest hostname when Config.Hostname is empty.

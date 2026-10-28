@@ -36,11 +36,8 @@ import (
 // Acceptance gate for executables that link at a fixed address (type
 // ET_EXEC). Four real programs must print the same output on every backend.
 // They are a static Go program, a static C program, the herdr schema command,
-// and the herdr server with one request. The macOS systrap engine cannot hold
-// such an image, because every arm64 task there has a 4GB PAGEZERO. Its
-// subtests skip while the error names that cause. The extra backend
-// systrap-zone turns on the prototype zone mode of that engine, and it runs
-// the four programs.
+// and the herdr server with one request. An engine that cannot hold such an
+// image makes its subtests skip while the error names that cause.
 
 // fixedAddressBackends lists each backend once. On Linux the hardware entry
 // and the systrap entry are the same platform.
@@ -61,9 +58,6 @@ func fixedAddressBackends() []gateBackend {
 func requireFixedAddressBackend(t *testing.T, b gateBackend) {
 	t.Helper()
 	if b.plat == gvx.PlatformHVF || b.plat == gvx.PlatformWHPX {
-		if childBuildTags != "" {
-			t.Skip("the hardware backends keep 4KB guest pages; this build has larger pages")
-		}
 		hvtest.Require(t)
 		return
 	}
@@ -77,7 +71,7 @@ func skipWhenFixedAddressRefused(t *testing.T, what string, err error) {
 	if err == nil {
 		return
 	}
-	if msg := err.Error(); strings.Contains(msg, "not position-independent") || strings.Contains(msg, "cannot hold the zone") {
+	if msg := err.Error(); strings.Contains(msg, "not position-independent") {
 		t.Skipf("this engine cannot hold an executable that links at a fixed address: %v", err)
 	}
 	t.Fatalf("%s: %v", what, err)

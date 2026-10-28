@@ -166,7 +166,7 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 		for rep := range repeat {
 			ns, detail, err := runBenchOnce(b, bin, name)
 			if err != nil {
-				if strings.Contains(err.Error(), "not position-independent") || strings.Contains(err.Error(), "cannot hold the zone") {
+				if strings.Contains(err.Error(), "not position-independent") {
 					t.Skipf("this engine cannot hold the guest: %v", err)
 				}
 				failures++

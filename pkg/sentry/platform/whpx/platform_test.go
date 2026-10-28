@@ -193,8 +193,8 @@ func TestCloseReportsBackendErrors(t *testing.T) {
 }
 
 // requireGuestPageSize skips a test that reads 4KB entries from the shared
-// page table package. Under the pagesize_16k build tag that package builds
-// 16KB entries, and NewWithOptions refuses the configuration.
+// page table package. Under a larger page build tag that package builds
+// larger entries, and NewWithOptions refuses the configuration.
 func requireGuestPageSize(t *testing.T) {
 	t.Helper()
 	if hostarch.PageSize != pageSize {

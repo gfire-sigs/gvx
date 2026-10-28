@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64 && !pagesize_64k && !pagesize_16k
+//go:build darwin && arm64 && !pagesize_64k
 
 package hostarch
 
 const (
 	// PageShift is the binary log of the guest page size (4KB).
 	// Apple Silicon hosts run with 16KB hardware pages while Hypervisor.framework
-	// and the 4KB systrap engine present 4KB guest pages to Linux binaries.
+	// presents 4KB guest pages to Linux binaries.
 	PageShift = 12
 
 	// HugePageShift is the binary log of the guest huge page size (2MB).

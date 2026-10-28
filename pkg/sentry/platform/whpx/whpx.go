@@ -142,7 +142,7 @@ func NewWithOptions(opts Options) (*Platform, error) {
 
 // checkPageSize verifies that the Sentry page size equals the page size of the
 // partition. The shared page table package builds entries of the Sentry page
-// size, so a build with the pagesize_16k tag would map 16KB entries over 4KB
+// size, so a build with a larger page tag would map larger entries over 4KB
 // guest pages.
 func checkPageSize(sentryPage int) error {
 	if sentryPage != pageSize {
