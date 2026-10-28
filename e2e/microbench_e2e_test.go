@@ -47,6 +47,9 @@ import (
 // come from this file: they time gvx.New, Run, and Close of a guest that exits
 // at once.
 
+// benchTimeout is the time that one benchmark of the guest can take.
+const benchTimeout = 60 * time.Second
+
 const microBenchEnv = "GVX_E2E_BENCH"
 
 type benchLine struct {
@@ -184,7 +187,7 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 // time for each operation. On failure, detail holds the head of the guest
 // error output.
 func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail string, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), benchTimeout)
 	defer cancel()
 	var outBuf, errBuf bytes.Buffer
 	sb, err := gvx.New(ctx, gvx.Config{
@@ -200,8 +203,26 @@ func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail stri
 	if err != nil {
 		return 0, "", err
 	}
-	code, runErr := sb.Run(ctx)
-	closeErr := sb.Close()
+	// Run does not return when the guest hangs, even after the context ends, so
+	// the benchmark waits for it in a goroutine and gives up when the time is
+	// over. The sandbox of a hung guest stays open.
+	type runResult struct {
+		code     int
+		runErr   error
+		closeErr error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		code, err := sb.Run(ctx)
+		done <- runResult{code, err, sb.Close()}
+	}()
+	var rr runResult
+	select {
+	case rr = <-done:
+	case <-time.After(benchTimeout + 10*time.Second):
+		return 0, "", fmt.Errorf("hung: no result within %v", benchTimeout)
+	}
+	code, runErr, closeErr := rr.code, rr.runErr, rr.closeErr
 	fail := func(format string, args ...any) (float64, string, error) {
 		head := errBuf.String()
 		if len(head) > 600 {
