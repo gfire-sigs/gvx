@@ -453,7 +453,7 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 
 To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to the guest. A line has the exception code, the address, and the bytes at the program counter.
 
-The value `2` also prints every stop and prints the state of each stub every three seconds. The value `3` prints only that state and the count of each kind of stop, which does not change the timing of the guest. The value `4` also samples the program counter every five milliseconds and prints the hottest addresses. The output has an upper bound of 400 lines, or 200000 lines for the value `2`.
+The value `2` also prints every stop and prints the state of each stub every three seconds. The value `3` prints only that state, the count of each kind of stop, and, on `amd64`, the count of `syscall` sites by patch outcome and by the reason that a site keeps `CC 90`. This output does not change the timing of the guest. The value `4` also samples the program counter every five milliseconds and prints the hottest addresses. The output has an upper bound of 400 lines, or 200000 lines for the value `2`.
 
 ## 12. Sources
 

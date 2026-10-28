@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -444,18 +445,6 @@ func (c *hostContext) registerSum() uint64 {
 	return h.Sum64()
 }
 
-// isX86Prefix reports whether b is a legacy instruction prefix or a REX prefix.
-func isX86Prefix(b byte) bool {
-	if b >= 0x40 && b <= 0x4F {
-		return true
-	}
-	switch b {
-	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
-		return true
-	}
-	return false
-}
-
 // hasFSPrefix reports whether the instruction at the start of code carries an
 // FS segment override prefix.
 func hasFSPrefix(code []byte) bool {
@@ -468,6 +457,28 @@ func hasFSPrefix(code []byte) bool {
 		}
 	}
 	return false
+}
+
+// siteStats counts the SYSCALL sites that patchPage met, by outcome, for the
+// statistics line of GVX_SYSTRAP_TRACE=3. A trap counts under the reason that
+// the planner gave.
+var siteStats struct {
+	// post counts the sites that became a JMP over the SYSCALL and the bytes
+	// behind it.
+	post atomic.Uint64
+	// noSlot counts the sites that kept the trap because no island had room.
+	noSlot atomic.Uint64
+	trap   [planRejects]atomic.Uint64
+}
+
+// archStatsLine summarizes siteStats.
+func archStatsLine() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "SYSCALL sites: jmp %d, trap for no slot %d; trap for", siteStats.post.Load(), siteStats.noSlot.Load())
+	for r := planOK + 1; r < planRejects; r++ {
+		fmt.Fprintf(&b, " %s %d,", r, siteStats.trap[r].Load())
+	}
+	return strings.TrimSuffix(b.String(), ",")
 }
 
 // siteInfo describes one patched instruction.
@@ -575,10 +586,12 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, uint64, winSlotRef, bool) {
 	if hasPrefixBefore(plan.before, plan.page, off) {
 		// A prefix would apply to the JMP.
+		siteStats.trap[planPrefix].Add(1)
 		return 0, 0, winSlotRef{}, false
 	}
-	reloc, ok := plan.plan(off)
-	if !ok {
+	reloc, reject := plan.plan(off)
+	if reject != planOK {
+		siteStats.trap[reject].Add(1)
 		return 0, 0, winSlotRef{}, false
 	}
 	site := base + uint64(off)
@@ -596,8 +609,10 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 		if traceEvents {
 			tracef("no trampoline slot for the SYSCALL at %#x: %v", site, err)
 		}
+		siteStats.noSlot.Add(1)
 		return 0, 0, winSlotRef{}, false
 	}
+	siteStats.post.Add(1)
 	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, ref, true
 }
 
@@ -685,19 +700,6 @@ func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *d
 		ev.Info[0] = avRead
 	}
 	return true, nil
-}
-
-// hasPrefixBefore reports whether the byte in front of page[off] is an
-// instruction prefix, a legacy prefix or REX.
-func hasPrefixBefore(before, page []byte, off int) bool {
-	switch {
-	case off > 0:
-		return isX86Prefix(page[off-1])
-	case len(before) > 0:
-		return isX86Prefix(before[len(before)-1])
-	default:
-		return false
-	}
 }
 
 // newWinTrap describes the trap of the SYSCALL at site.

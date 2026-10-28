@@ -632,6 +632,31 @@ func relocatable(inst x86asm.Inst) bool {
 	return true
 }
 
+// isX86Prefix reports whether b is a legacy instruction prefix or a REX prefix.
+func isX86Prefix(b byte) bool {
+	if b >= 0x40 && b <= 0x4F {
+		return true
+	}
+	switch b {
+	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
+		return true
+	}
+	return false
+}
+
+// hasPrefixBefore reports whether the byte in front of page[off] is an
+// instruction prefix, a legacy prefix or REX.
+func hasPrefixBefore(before, page []byte, off int) bool {
+	switch {
+	case off > 0:
+		return isX86Prefix(page[off-1])
+	case len(before) > 0:
+		return isX86Prefix(before[len(before)-1])
+	default:
+		return false
+	}
+}
+
 // noReturnSyscallSetup reports whether inst loads a system call number that
 // never returns to the instruction after SYSCALL: rt_sigreturn (15),
 // exit (60), or exit_group (231). A function that ends with such a call needs
@@ -709,6 +734,33 @@ func (p *jmpPlanner) precededByNoReturn(end int) bool {
 	return false
 }
 
+// planReject names the reason why a SYSCALL keeps its INT3 trap.
+type planReject uint8
+
+const (
+	// planOK means that the planner found a patch.
+	planOK planReject = iota
+	// planPageEdge means that the bytes that the JMP needs leave the page.
+	planPageEdge
+	// planNotRelocatable means that an instruction that the JMP overwrites
+	// cannot move, or does not decode.
+	planNotRelocatable
+	// planNoReturn means that the preceding instruction loads the number of a
+	// system call that never returns.
+	planNoReturn
+	// planBranchTarget means that a relative branch lands inside the bytes that
+	// the JMP overwrites.
+	planBranchTarget
+	// planPrefix means that a prefix byte stands in front of the SYSCALL.
+	planPrefix
+
+	planRejects
+)
+
+var planRejectNames = [planRejects]string{"ok", "page edge", "not relocatable", "no-return call", "branch target", "prefix"}
+
+func (r planReject) String() string { return planRejectNames[r] }
+
 // plan decides whether the SYSCALL at page[off] can become a JMP rel32. It
 // returns the bytes to relocate into the slot, which are the whole
 // instructions that start behind the SYSCALL and cover at least three bytes.
@@ -719,39 +771,40 @@ func (p *jmpPlanner) precededByNoReturn(end int) bool {
 // decodes in the page or in the neighbor bytes lands inside the bytes that the
 // JMP overwrites. A branch from another page or an indirect jump can still land
 // there. The patcher cannot see those, and it accepts the risk that the amd64
-// scan already accepts for the bytes of the SYSCALL itself.
-func (p *jmpPlanner) plan(off int) ([]byte, bool) {
+// scan already accepts for the bytes of the SYSCALL itself. The reason of a
+// failure is the second result.
+func (p *jmpPlanner) plan(off int) ([]byte, planReject) {
 	page := p.page
 	if off < 0 || off+winJmpLen > len(page) {
-		return nil, false
+		return nil, planPageEdge
 	}
 	var reloc []byte
 	pos := off + winSiteLen
 	for len(reloc) < winMinRelocated {
 		if pos >= len(page) {
-			return nil, false
+			return nil, planPageEdge
 		}
 		inst, err := decodeX86(page[pos:])
 		if err != nil || inst.Op == 0 || inst.Len == 0 || pos+inst.Len > len(page) || !relocatable(inst) {
-			return nil, false
+			return nil, planNotRelocatable
 		}
 		reloc = append(reloc, page[pos:pos+inst.Len]...)
 		pos += inst.Len
 	}
 	if len(reloc) > winMaxRelocated {
-		return nil, false
+		return nil, planNotRelocatable
 	}
 	p.scan()
 	start := len(p.before) + off
 	if p.precededByNoReturn(start) {
-		return nil, false
+		return nil, planNoReturn
 	}
 	for t := start + 1; t < start+winJmpLen; t++ {
 		if p.target[t] {
-			return nil, false
+			return nil, planBranchTarget
 		}
 	}
-	return reloc, true
+	return reloc, planOK
 }
 
 // canReplaceInPlace reports whether a siteLen-byte instruction at offset off in
@@ -777,7 +830,8 @@ func (p *jmpPlanner) canReplaceInPlace(off, siteLen int) bool {
 // planJmpPatch plans one site. A caller with many sites in one page uses a
 // jmpPlanner, which decodes the page once.
 func planJmpPatch(before, page, after []byte, off int) ([]byte, bool) {
-	return newJmpPlanner(before, page, after).plan(off)
+	reloc, reject := newJmpPlanner(before, page, after).plan(off)
+	return reloc, reject == planOK
 }
 
 // probeProgram returns the guest code of Probe: calls system calls with

@@ -19,6 +19,7 @@ package systrap
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -943,5 +944,162 @@ func TestPlanJmpPatchRelocatesVZero(t *testing.T) {
 	reloc, ok := planJmpPatch(nil, page, nil, 0)
 	if want := []byte{0xc5, 0xf8, 0x77}; !ok || !bytes.Equal(reloc, want) {
 		t.Errorf("planJmpPatch = (% x, %v), want (% x, true)", reloc, ok, want)
+	}
+}
+
+// planKind names how patchPage patches a SYSCALL site.
+type planKind string
+
+const (
+	// planPost is the JMP over the SYSCALL and the bytes behind it.
+	planPost planKind = "post"
+	// planTrap is the INT3 trap.
+	planTrap planKind = "trap"
+)
+
+// planKindOf returns how patchPage patches the SYSCALL at page[off].
+func planKindOf(before, page, after []byte, off int) planKind {
+	if hasPrefixBefore(before, page, off) {
+		return planTrap
+	}
+	if _, ok := planJmpPatch(before, page, after, off); ok {
+		return planPost
+	}
+	return planTrap
+}
+
+// corpusSite is one SYSCALL site of a real binary, or the smallest synthetic
+// byte pattern that reaches one reject reason of the planner.
+type corpusSite struct {
+	name string
+	// code is the hex dump of the bytes around the SYSCALL. site is the offset
+	// of the SYSCALL in code.
+	code string
+	site int
+	// at is the page offset of code[0]. The value atPageEnd puts the last byte
+	// of code at the last byte of the page.
+	at int
+	// lead is the hex dump of the bytes that precede the page.
+	lead string
+	want planKind
+}
+
+const atPageEnd = -1
+
+// corpusSites lists the sites. The bytes of the real sites come from Alpine
+// 3.20.3 (musl 1.2.5), Debian 12 libc6 2.36-9+deb12u14 (glibc), and a Go 1.27
+// static linux/amd64 binary.
+var corpusSites = []corpusSite{
+	{
+		// __syscall_cp_asm: the jnz at __cp_begin lands on the jmp behind the
+		// ret, so the byte behind the ret is a branch target.
+		name: "musl __syscall_cp_asm",
+		code: "48890e0f0585c0750f31ed5f41ffd189c731c0b03c0f05f4c38b0785c075244989fb4889f04889d74889ce4c89c24d89ca4c8b4424084c8b4c24104c895c24080f05c3e901ccffff4154b802000000554889f5be00880800",
+		site: 64,
+		want: planTrap,
+	},
+	{
+		name: "Go runtime.osyield",
+		code: "004883c4205dc3ccccccccccccccccccccccccb8180000000f05c3cccccccccccccccccccccccccccccccccccccccccc",
+		site: 24,
+		want: planTrap,
+	},
+	{
+		name: "glibc getpid",
+		code: "44000031c9e9a9fcffff660f1f840000000000b8270000000f05c30f1f840000000000b86e0000000f05c30f1f840000",
+		site: 24,
+		want: planTrap,
+	},
+	{
+		// The js at the start of the code lands on the instruction behind the
+		// SYSCALL.
+		name: "glibc futex of pthread_cond_wait with a branch target",
+		code: "7864482b1425280000000f85b10100004881c4880000005b5d415c415d415e415fc30f1f40004889d048f7d083e0014939c675b0418b07488b314839f275a5a801750a8d7002f0410fb13775ea89ee4531d2ba010000004c89ff4080f681b8ca0000000f05483d00f0ffff0f8673ffffff83c01683e0f70f8467ff",
+		site: 99,
+		want: planTrap,
+	},
+	{
+		name: "Go Syscall6",
+		code: "cccccccccccccccccccccccc4989f24889fa4889ce4889df0f05483d01f0ffff761348f7d84889c148c7c0ffffffffbb",
+		site: 24,
+		want: planPost,
+	},
+	{
+		name: "call in the window",
+		code: "909090e8000000000f05c3cccc",
+		site: 8,
+		want: planTrap,
+	},
+	{
+		// jmp +0x10 at offset 0 lands at offset 18, one byte behind the
+		// start of `mov eax, 24`.
+		name: "branch target inside the window",
+		code: "eb10" + "90909090909090909090909090" + "90" + "b8180000000f05c3cccc",
+		site: 21,
+		want: planTrap,
+	},
+	{
+		// jmp +0x0e at offset 0 lands at offset 16, the start of `mov eax, 24`.
+		name: "branch target at the start of the window",
+		code: "eb0e" + "90909090909090909090909090" + "90" + "b8180000000f05c3cccc",
+		site: 21,
+		want: planTrap,
+	},
+	{
+		name: "window starts in the previous page",
+		code: "0f05c3cccccccccc",
+		site: 0,
+		at:   0,
+		lead: "909090909090909090b818000000",
+		want: planTrap,
+	},
+	{
+		name: "prefix in front of the SYSCALL",
+		code: "b818000000" + "480f05" + "c3cccc",
+		site: 6,
+		want: planTrap,
+	},
+	{
+		name: "exit with no byte behind the SYSCALL",
+		code: "b83c0000000f05",
+		site: 5,
+		at:   atPageEnd,
+		want: planTrap,
+	},
+}
+
+func TestCorpusSitesPlan(t *testing.T) {
+	for _, c := range corpusSites {
+		t.Run(c.name, func(t *testing.T) {
+			code, err := hex.DecodeString(c.code)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.HasPrefix(code[c.site:], []byte{0x0F, 0x05}) {
+				t.Fatalf("code[%d:] does not start with a SYSCALL", c.site)
+			}
+			lead, err := hex.DecodeString(c.lead)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := c.at
+			if at == atPageEnd {
+				at = amd64PageSize - len(code)
+			}
+			page := pageWith(at, code...)
+			off := at + c.site
+			found := false
+			for _, s := range scanAMD64(lead, page, nil) {
+				if s.Kind == amd64SiteSyscall && s.Offset == off {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("scanAMD64 does not report a SYSCALL at page offset %d", off)
+			}
+			if got := planKindOf(lead, page, nil, off); got != c.want {
+				t.Fatalf("plan = %s, want %s", got, c.want)
+			}
+		})
 	}
 }

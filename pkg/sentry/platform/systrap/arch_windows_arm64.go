@@ -145,6 +145,9 @@ func (th *thread) archStart(ac *arch.Context64) error {
 // the instruction behind it.
 func (th *thread) resumePC(pc uint64) uint64 { return pc }
 
+// archStatsLine returns an empty line, because every arm64 SVC patches the same way.
+func archStatsLine() string { return "" }
+
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(ac *arch.Context64) {
 	if f := th.fast.Load(); f != nil {
