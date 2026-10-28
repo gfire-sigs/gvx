@@ -522,8 +522,9 @@ func (th *thread) inIslandPC(pc uint64) bool {
 }
 
 // rewindToSite moves a thread that stopped at the first instruction of a slot
-// back to the patched instruction. The slot has not run, so the registers are
-// the guest registers, and the patched instruction jumps to the slot again.
+// back to the instruction that jumps to the slot. The slot has not run, so the
+// registers are the guest registers, and the jump enters the slot again. For a
+// pre-window slot that instruction lies in front of the SYSCALL.
 func (th *thread) rewindToSite() bool {
 	if th.fast.Load() == nil {
 		return false
@@ -532,11 +533,11 @@ func (th *thread) rewindToSite() bool {
 	if as == nil {
 		return false
 	}
-	site, ok := as.slotStartSite(th.ctx.pc())
+	slot, ok := as.slotStart(th.ctx.pc())
 	if !ok {
 		return false
 	}
-	th.ctx.setPC(site)
+	th.ctx.setPC(slot.jmpVA)
 	return true
 }
 

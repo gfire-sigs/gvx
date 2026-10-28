@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
@@ -238,5 +239,208 @@ func TestFastPathTLSAndGSMovSlots(t *testing.T) {
 	}
 	if si.Addr() != 0x28 {
 		t.Errorf("fault addr = %#x, want 0x28", si.Addr())
+	}
+}
+
+// preWindowGuest is a loop whose SYSCALL has the shape of the cancellation
+// point of musl: instructions that carry the plan stand in front of the
+// SYSCALL, and a jump follows it. The post plan fails on the jump, so only the
+// pre-window can patch the SYSCALL. The loop counts in RBX and enters the
+// system call 1.
+type preWindowGuest struct {
+	code []byte
+	// start is the guest address of the first instruction of the window, which
+	// the JMP replaces. site is the guest address of the SYSCALL.
+	start, site uint64
+}
+
+// newPreWindowGuest returns a guest whose window holds the instructions of
+// window, with at least five bytes.
+func newPreWindowGuest(window ...[]byte) preWindowGuest {
+	code := nops(64)
+	loop := len(code)
+	code = append(code, 0x48, 0xFF, 0xC3) // inc rbx
+	code = append(code, 0xB8, 1, 0, 0, 0) // mov eax, 1
+	start := len(code)
+	for _, w := range window {
+		code = append(code, w...)
+	}
+	site := len(code)
+	code = append(code, 0x0F, 0x05)                           // syscall
+	code = append(code, 0xEB, byte(int8(loop-(len(code)+2)))) // jmp loop
+	return preWindowGuest{code: code, start: codeVA + uint64(start), site: codeVA + uint64(site)}
+}
+
+// movStackRbx is `mov [rsp+8], rbx`, which stores the count where a signal
+// frame of musl keeps the cancellation state.
+var movStackRbx = []byte{0x48, 0x89, 0x5C, 0x24, 0x08}
+
+const preWindowSP = stackVA + blockSize - 0x100
+
+// mapInto maps the guest and its stack and points the registers at the loop. It
+// returns the Sentry view of the stack page.
+func (g preWindowGuest) mapInto(r *rig) []byte {
+	r.mapPage(codeVA, execAccess, g.code)
+	stack := r.mapPage(stackVA, hostarch.ReadWrite)
+	r.ac.SetIP(codeVA)
+	r.ac.SetStack(preWindowSP)
+	return stack
+}
+
+// stackWord reads the word at the guest address va of the stack page.
+func stackWord(stack []byte, va uint64) uint64 { return load64(stack[va-stackVA:]) }
+
+// TestFastPathPreWindowServesEverySystemCall runs the guest through 2000
+// system calls. Every call must take the fast path, and the instruction in
+// the window must run before each one.
+func TestFastPathPreWindowServesEverySystemCall(t *testing.T) {
+	g := newPreWindowGuest(movStackRbx)
+	r := newRig(t, newFastPlatform(t))
+	stack := g.mapInto(r)
+	const calls = 2000
+	for i := uint64(1); i <= calls; i++ {
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 1, r.ac)
+		if got := regPC(r.ac); got != g.site+2 {
+			t.Fatalf("call %d: the guest pc is %#x, want %#x behind the SYSCALL", i, got, g.site+2)
+		}
+		if got := stackWord(stack, preWindowSP+8); got != i {
+			t.Fatalf("call %d: the instruction in the window stored %d", i, got)
+		}
+		if got := regAcc(r.ac); got != i {
+			t.Fatalf("call %d: the loop counted %d", i, got)
+		}
+	}
+	f := fastStats(t, r)
+	if got := f.traps.Load(); got != calls {
+		t.Errorf("the fast path served %d of %d system calls", got, calls)
+	}
+	if got := f.colds.Load(); got != 0 {
+		t.Errorf("%d resumes ended in a debug stop, want none", got)
+	}
+	if s, ok := r.as.siteAt(g.start); !ok || s.kind != winSiteJumpBefore {
+		t.Errorf("site at the window = %+v, %v, want winSiteJumpBefore", s, ok)
+	}
+	if s, ok := r.as.siteAt(g.site); !ok || s.kind != amd64SiteSyscall || s.entry == 0 {
+		t.Errorf("site at the SYSCALL = %+v, %v, want a trap with a slot entry", s, ok)
+	}
+}
+
+// TestPreWindowFaultReportsTheOriginalAddress makes the second instruction of
+// the window fault on a stack page that is not mapped. The slot runs that
+// instruction, so the stop lies in the island. The guest must see the address
+// of the instruction in the original code. After the Sentry maps the page, the
+// guest continues at that instruction, and the first instruction of the window
+// does not run again.
+func TestPreWindowFaultReportsTheOriginalAddress(t *testing.T) {
+	g := newPreWindowGuest(
+		[]byte{0x48, 0x89, 0xDA}, // mov rdx, rbx
+		movStackRbx,
+	)
+	r := newRig(t, newFastPlatform(t))
+	r.mapPage(codeVA, execAccess, g.code)
+	const sp = stackVA + 0x800 // the page at stackVA is not mapped
+	r.ac.SetIP(codeVA)
+	r.ac.SetStack(sp)
+
+	si, at, err := r.run()
+	wantSignal(t, si, err, linux.SIGSEGV)
+	if at != hostarch.Write || si.Addr() != sp+8 {
+		t.Fatalf("fault = access %v addr %#x, want a write at %#x", at, si.Addr(), uint64(sp+8))
+	}
+	pc := regPC(r.ac)
+	if r.as.inIsland(pc) {
+		t.Fatalf("the guest pc %#x lies in an island", pc)
+	}
+	if want := g.start + 3; pc != want {
+		t.Fatalf("the guest pc is %#x, want %#x of the faulting instruction", pc, want)
+	}
+	if got := regArg(r.ac, 2); got != 1 {
+		t.Fatalf("rdx = %d after the first instruction, want 1", got)
+	}
+
+	// The Sentry changes RBX and maps the page. A guest that runs the first
+	// instruction again would copy the new value to RDX.
+	r.ac.StateData().Regs.Rbx = 999
+	stack := r.mapPage(stackVA, hostarch.ReadWrite)
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	if got := regArg(r.ac, 2); got != 1 {
+		t.Errorf("rdx = %d, the first instruction of the window ran again", got)
+	}
+	if got := stackWord(stack, sp+8); got != 999 {
+		t.Errorf("the stored word = %d, want 999", got)
+	}
+	if got := regPC(r.ac); got != g.site+2 {
+		t.Errorf("the guest pc is %#x, want %#x behind the SYSCALL", got, g.site+2)
+	}
+}
+
+// TestPreWindowRestartAndSignalHandler restarts a system call the way the
+// Sentry does after a signal: the program counter goes back to the SYSCALL. The
+// handler and the sigreturn must see guest addresses only. The restart must
+// not run the window again, and it stays on the fast path.
+func TestPreWindowRestartAndSignalHandler(t *testing.T) {
+	g := newPreWindowGuest(movStackRbx)
+	r := newRig(t, newFastPlatform(t))
+	stack := g.mapInto(r)
+	const handlerVA = dataVA
+	// mov eax, 2; syscall; nop; nop; nop; nop: the post plan patches this one.
+	r.mapPage(handlerVA, execAccess, []byte{0xB8, 2, 0, 0, 0, 0x0F, 0x05, 0x90, 0x90, 0x90, 0x90})
+
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	if pc := regPC(r.ac); pc != g.site+2 || r.as.inIsland(pc) {
+		t.Fatalf("the signal frame would hold pc %#x, want %#x", pc, g.site+2)
+	}
+
+	// Deliver a signal at the system call: save the frame with the restart
+	// address, and run the handler.
+	saved := *r.ac.StateData()
+	saved.Regs.Rip = g.site
+	r.ac.SetIP(handlerVA)
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 2, r.ac)
+
+	// sigreturn.
+	*r.ac.StateData() = saved
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	if got := regAcc(r.ac); got != 1 {
+		t.Errorf("the restart ran the loop again: RBX = %d, want 1", got)
+	}
+	if got := stackWord(stack, preWindowSP+8); got != 1 {
+		t.Errorf("the restart ran the window again: stored word = %d, want 1", got)
+	}
+	if pc := regPC(r.ac); pc != g.site+2 {
+		t.Errorf("the guest pc after the restart is %#x, want %#x", pc, g.site+2)
+	}
+	f := fastStats(t, r)
+	if got := f.traps.Load(); got != 3 {
+		t.Errorf("fast traps = %d, want 3: the restart must enter the slot", got)
+	}
+}
+
+// TestPreWindowCloneChildStartsBehindTheSyscall starts a second thread at the
+// byte behind the SYSCALL of a pre-window, as the child of clone does. The
+// bytes there did not change, so the child runs them in place.
+func TestPreWindowCloneChildStartsBehindTheSyscall(t *testing.T) {
+	g := newPreWindowGuest(movStackRbx)
+	r := newRig(t, newFastPlatform(t))
+	g.mapInto(r)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+
+	child := r.newThread()
+	child.ac.SetIP(uintptr(g.site + 2))
+	child.ac.SetStack(preWindowSP - 0x200)
+	child.ac.StateData().Regs.Rbx = 40
+	si, _, err = child.run()
+	mustSyscall(t, si, err, 1, child.ac)
+	if got := regAcc(child.ac); got != 41 {
+		t.Errorf("the child counted %d, want 41", got)
+	}
+	if got := regPC(child.ac); got != g.site+2 {
+		t.Errorf("the child pc is %#x, want %#x", got, g.site+2)
 	}
 }

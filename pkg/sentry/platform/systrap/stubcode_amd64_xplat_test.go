@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"strings"
 	"testing"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -133,10 +135,13 @@ const (
 )
 
 type spillRig struct {
-	m       *x86Machine
-	sc      winSpillCode
-	guest   [16]uint64
-	reloc   []byte
+	m     *x86Machine
+	sc    winSpillCode
+	guest [16]uint64
+	reloc []byte
+	// pre is true for a pre-window slot. Its relocated instructions run before
+	// the entry code, and its tail jumps to site+2.
+	pre     bool
 	tail    uint64
 	callLog []string
 	// onCallee acts as the kernel during a call.
@@ -147,17 +152,33 @@ var rigNop3 = []byte{0x0F, 0x1F, 0x00} // nop dword ptr [rax]
 
 func newSpillRig(t *testing.T, reloc []byte) *spillRig {
 	t.Helper()
+	return newSlotRig(t, reloc, false)
+}
+
+// newPreSpillRig returns a rig whose slot is a pre-window slot with the
+// relocated instructions reloc. The machine starts at the first of them.
+func newPreSpillRig(t *testing.T, reloc []byte) *spillRig {
+	t.Helper()
+	return newSlotRig(t, reloc, true)
+}
+
+func newSlotRig(t *testing.T, reloc []byte, pre bool) *spillRig {
+	t.Helper()
 	sc, err := buildSpill()
 	if err != nil {
 		t.Fatal(err)
 	}
 	code := make([]byte, rigSpillOff+len(sc.code))
-	if err := encodeWinSlot(code, rigCodeBase, rigSite, rigCodeBase+rigSpillOff, reloc); err != nil {
+	encode := encodeWinSlot
+	if pre {
+		encode = encodeWinPreSlot
+	}
+	if err := encode(code, rigCodeBase, rigSite, rigCodeBase+rigSpillOff, reloc); err != nil {
 		t.Fatal(err)
 	}
 	copy(code[rigSpillOff:], sc.code)
 	m := newX86Machine(code, rigCodeBase)
-	r := &spillRig{m: m, sc: sc, reloc: reloc, tail: rigCodeBase + winSlotTailOffset}
+	r := &spillRig{m: m, sc: sc, reloc: reloc, pre: pre, tail: rigCodeBase + winSlotTailOffset}
 	for i := range r.guest {
 		r.guest[i] = 0x1000_0000_0000_0000 + uint64(i)*0x0101_0101
 	}
@@ -244,8 +265,12 @@ func (r *spillRig) checkSaved(t *testing.T, except ...int) {
 func (r *spillRig) checkHotExit(t *testing.T, want [16]uint64, wantFlags uint64) {
 	t.Helper()
 	m := r.m
-	if m.exit.trap != 0 || m.exit.jump != rigSite+2+uint64(len(r.reloc)) {
-		t.Fatalf("the code ended with trap %d, jump %#x; want a jump to %#x", m.exit.trap, m.exit.jump, rigSite+2+uint64(len(r.reloc)))
+	wantJump := uint64(rigSite + 2)
+	if !r.pre {
+		wantJump += uint64(len(r.reloc))
+	}
+	if m.exit.trap != 0 || m.exit.jump != wantJump {
+		t.Fatalf("the code ended with trap %d, jump %#x; want a jump to %#x", m.exit.trap, m.exit.jump, wantJump)
 	}
 	for n := range 16 {
 		if m.r[n] != want[n] {
@@ -947,25 +972,10 @@ func TestPlanJmpPatchRelocatesVZero(t *testing.T) {
 	}
 }
 
-// planKind names how patchPage patches a SYSCALL site.
-type planKind string
-
-const (
-	// planPost is the JMP over the SYSCALL and the bytes behind it.
-	planPost planKind = "post"
-	// planTrap is the INT3 trap.
-	planTrap planKind = "trap"
-)
-
-// planKindOf returns how patchPage patches the SYSCALL at page[off].
+// planKindOf returns how patchPage patches the SYSCALL at page[off] when no
+// other site constrains the patch.
 func planKindOf(before, page, after []byte, off int) planKind {
-	if hasPrefixBefore(before, page, off) {
-		return planTrap
-	}
-	if _, ok := planJmpPatch(before, page, after, off); ok {
-		return planPost
-	}
-	return planTrap
+	return newJmpPlanner(before, page, after).planSite(off, 0).kind
 }
 
 // corpusSite is one SYSCALL site of a real binary, or the smallest synthetic
@@ -976,7 +986,9 @@ type corpusSite struct {
 	// of the SYSCALL in code.
 	code string
 	site int
-	// at is the page offset of code[0]. The value atPageEnd puts the last byte
+	// at is the page offset of code[0]. Zero means corpusDefaultAt, so that the
+	// planner sees bytes in front of the site. The value atPageStart puts
+	// code[0] at the first byte of the page, and atPageEnd puts the last byte
 	// of code at the last byte of the page.
 	at int
 	// lead is the hex dump of the bytes that precede the page.
@@ -984,7 +996,11 @@ type corpusSite struct {
 	want planKind
 }
 
-const atPageEnd = -1
+const (
+	atPageEnd       = -1
+	atPageStart     = -2
+	corpusDefaultAt = 0x200
+)
 
 // corpusSites lists the sites. The bytes of the real sites come from Alpine
 // 3.20.3 (musl 1.2.5), Debian 12 libc6 2.36-9+deb12u14 (glibc), and a Go 1.27
@@ -996,19 +1012,19 @@ var corpusSites = []corpusSite{
 		name: "musl __syscall_cp_asm",
 		code: "48890e0f0585c0750f31ed5f41ffd189c731c0b03c0f05f4c38b0785c075244989fb4889f04889d74889ce4c89c24d89ca4c8b4424084c8b4c24104c895c24080f05c3e901ccffff4154b802000000554889f5be00880800",
 		site: 64,
-		want: planTrap,
+		want: planPre,
 	},
 	{
 		name: "Go runtime.osyield",
-		code: "004883c4205dc3ccccccccccccccccccccccccb8180000000f05c3cccccccccccccccccccccccccccccccccccccccccc",
-		site: 24,
-		want: planTrap,
+		code: "83ec204883c7084889febf02100000b89e0000000f05483d01f0ffff760bc70425f1000000f10000004883c4205dc3ccccccccccccccccccccccccb8180000000f05c3cccccccccccccccccccccccccccccccccccccccccc",
+		site: 64,
+		want: planPre,
 	},
 	{
 		name: "glibc getpid",
-		code: "44000031c9e9a9fcffff660f1f840000000000b8270000000f05c30f1f840000000000b86e0000000f05c30f1f840000",
-		site: 24,
-		want: planTrap,
+		code: "b74c13fe66894c10fee9b7feffffe8282d04000f1f840000000000b901000000e9b6fcffff660f1f44000031c9e9a9fcffff660f1f840000000000b8270000000f05c30f1f840000000000b86e0000000f05c30f1f840000",
+		site: 64,
+		want: planPre,
 	},
 	{
 		// The js at the start of the code lands on the instruction behind the
@@ -1016,7 +1032,7 @@ var corpusSites = []corpusSite{
 		name: "glibc futex of pthread_cond_wait with a branch target",
 		code: "7864482b1425280000000f85b10100004881c4880000005b5d415c415d415e415fc30f1f40004889d048f7d083e0014939c675b0418b07488b314839f275a5a801750a8d7002f0410fb13775ea89ee4531d2ba010000004c89ff4080f681b8ca0000000f05483d00f0ffff0f8673ffffff83c01683e0f70f8467ff",
 		site: 99,
-		want: planTrap,
+		want: planPre,
 	},
 	{
 		name: "Go Syscall6",
@@ -1043,14 +1059,14 @@ var corpusSites = []corpusSite{
 		name: "branch target at the start of the window",
 		code: "eb0e" + "90909090909090909090909090" + "90" + "b8180000000f05c3cccc",
 		site: 21,
-		want: planTrap,
+		want: planPre,
 	},
 	{
 		name: "window starts in the previous page",
 		code: "0f05c3cccccccccc",
 		site: 0,
-		at:   0,
-		lead: "909090909090909090b818000000",
+		at:   atPageStart,
+		lead: strings.Repeat("90", 59) + "b818000000",
 		want: planTrap,
 	},
 	{
@@ -1083,7 +1099,12 @@ func TestCorpusSitesPlan(t *testing.T) {
 				t.Fatal(err)
 			}
 			at := c.at
-			if at == atPageEnd {
+			switch at {
+			case 0:
+				at = corpusDefaultAt
+			case atPageStart:
+				at = 0
+			case atPageEnd:
 				at = amd64PageSize - len(code)
 			}
 			page := pageWith(at, code...)
@@ -1101,5 +1122,226 @@ func TestCorpusSitesPlan(t *testing.T) {
 				t.Fatalf("plan = %s, want %s", got, c.want)
 			}
 		})
+	}
+}
+
+func TestPlanSiteRules(t *testing.T) {
+	var (
+		sys      = []byte{0x0F, 0x05}
+		ret      = []byte{0xC3}
+		movEax24 = []byte{0xB8, 0x18, 0, 0, 0}
+		// mov qword [rsp+8], 0x12345678
+		movMem9 = []byte{0x48, 0xC7, 0x44, 0x24, 0x08, 0x78, 0x56, 0x34, 0x12}
+		// mov rax, 0x1122334455667788
+		movImm64 = []byte{0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11}
+		addEbx   = []byte{0x81, 0xC3, 1, 0, 0, 0}
+		imulRax  = []byte{0x48, 0x0F, 0xAF, 0xC3}
+		// mov rax, fs:[0x28]
+		movFS = []byte{0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0, 0, 0}
+		call  = []byte{0xE8, 1, 2, 3, 4}
+		// cmp rax, -4095; jbe +0x13
+		cmpJbe = []byte{0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x76, 0x13}
+		xorEax = []byte{0x31, 0xC0, 0x90, 0x90}
+	)
+	// jumpTo returns lead bytes that start with a short jump to the byte at
+	// offset target of the lead and the window.
+	jumpTo := func(target int) []byte {
+		lead := nops(64)
+		lead[0], lead[1] = 0xEB, byte(target-2)
+		return lead
+	}
+	for _, c := range []struct {
+		name   string
+		lead   []byte // nil means 64 NOPs
+		window []byte
+		tail   []byte
+		atEnd  bool // the tail ends at the end of the page
+		// floorDelta is the distance from the first window byte to the floor.
+		floorDelta int
+		want       planKind
+	}{
+		{name: "P1 sweeps agree", window: movEax24, tail: ret, want: planPre},
+		{name: "P1 sweeps never agree", lead: bytes.Repeat([]byte{0xB8}, 64), tail: ret, want: planTrap},
+		{name: "P2 nine bytes", window: movMem9, tail: ret, want: planPre},
+		{name: "P2 nine bytes of two instructions", window: catBytes(movEax24, imulRax), tail: ret, want: planPre},
+		{name: "P2 ten bytes of one instruction", window: movImm64, tail: ret, want: planTrap},
+		{name: "P2 ten bytes of two instructions", window: catBytes(addEbx, imulRax), tail: ret, want: planTrap},
+		{name: "P3 byte behind the SYSCALL in the page", window: movEax24, tail: ret, atEnd: true, want: planPre},
+		{name: "P3 SYSCALL at the end of the page", window: movEax24, atEnd: true, want: planTrap},
+		{name: "P4 movable instruction", window: movEax24, tail: ret, want: planPre},
+		{name: "P4 segment override", window: movFS, tail: ret, want: planTrap},
+		{name: "P4 call", window: call, tail: ret, want: planTrap},
+		{name: "P5 branch to the first byte", lead: jumpTo(64), window: movEax24, tail: ret, want: planPre},
+		{name: "P5 branch to the SYSCALL", lead: jumpTo(64 + 5), window: movEax24, tail: ret, want: planPre},
+		{name: "P5 branch inside the window", lead: jumpTo(64 + 1), window: movEax24, tail: ret, want: planTrap},
+		{name: "P5 branch to the last window byte", lead: jumpTo(64 + 4), window: movEax24, tail: ret, want: planTrap},
+		{name: "P6 floor at the first byte", window: movEax24, tail: ret, floorDelta: 0, want: planPre},
+		{name: "P6 floor inside the window", window: movEax24, tail: ret, floorDelta: 1, want: planTrap},
+		{name: "P7 prefix", window: catBytes(movEax24, []byte{0x48}), tail: ret, want: planTrap},
+		{name: "P8 post wins", window: movEax24, tail: cmpJbe, want: planPost},
+		{name: "P8 pre when post fails", window: movEax24, tail: ret, want: planPre},
+		{name: "P8 pre for a no-return call", window: []byte{0xB8, 60, 0, 0, 0}, tail: xorEax, want: planPre},
+		{name: "P8 both fail", window: call, tail: ret, want: planTrap},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lead := c.lead
+			if lead == nil {
+				lead = nops(64)
+			}
+			code := catBytes(lead, c.window, sys, c.tail)
+			at := corpusDefaultAt
+			if c.atEnd {
+				at = amd64PageSize - len(code)
+			}
+			page := pageWith(at, code...)
+			site := at + len(lead) + len(c.window)
+			floor := at + len(lead) + c.floorDelta
+			got := newJmpPlanner(nil, page, nil).planSite(site, floor)
+			if got.kind != c.want {
+				t.Fatalf("plan = %s, want %s", got.kind, c.want)
+			}
+			if got.kind == planPre {
+				if wantStart := at + len(lead); got.start != wantStart && len(c.window) > 0 {
+					t.Errorf("window starts at %d, want %d", got.start, wantStart)
+				}
+				if !bytes.HasSuffix(c.window, got.reloc) || len(got.reloc) < winJmpLen || len(got.reloc) > winPreMaxRelocated {
+					t.Errorf("relocated bytes % x are not the end of the window % x", got.reloc, c.window)
+				}
+			}
+		})
+	}
+}
+
+func TestEncodeWinPreSlotLayout(t *testing.T) {
+	const slotVA, site, spill = rigCodeBase, rigSite, 0x7ff0_1100_0100
+	for n := winJmpLen; n <= winPreMaxRelocated; n++ {
+		t.Run(fmt.Sprintf("%d relocated bytes", n), func(t *testing.T) {
+			reloc := bytes.Repeat([]byte{0x90}, n)
+			buf := make([]byte, winSlotSize)
+			if err := encodeWinPreSlot(buf, slotVA, site, spill, reloc); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(buf[:n], reloc) {
+				t.Fatalf("slot starts with % x, want the relocated bytes % x", buf[:n], reloc)
+			}
+			// The entry code is a store, a LEA, a store, and an indirect jump.
+			wantOps := []x86asm.Op{x86asm.MOV, x86asm.LEA, x86asm.MOV, x86asm.JMP}
+			pos := n
+			var lea, jmp x86asm.Inst
+			for i, op := range wantOps {
+				inst, err := x86asm.Decode(buf[pos:], 64)
+				if err != nil || inst.Op != op {
+					t.Fatalf("entry instruction %d at offset %d decodes as %v, %v; want %v", i, pos, inst, err, op)
+				}
+				switch op {
+				case x86asm.LEA:
+					lea = inst
+				case x86asm.JMP:
+					jmp = inst
+				}
+				pos += inst.Len
+			}
+			if pos != n+winSlotEntryLen {
+				t.Fatalf("entry code ends at offset %d, want %d", pos, n+winSlotEntryLen)
+			}
+			// The LEA names the tail, and the JMP reads the literal.
+			leaEnd := slotVA + uint64(n) + 16
+			if got := leaEnd + uint64(lea.Args[1].(x86asm.Mem).Disp); got != slotVA+winSlotTailOffset {
+				t.Errorf("LEA loads %#x, want the tail %#x", got, uint64(slotVA+winSlotTailOffset))
+			}
+			if got := slotVA + uint64(pos) + uint64(jmp.Args[0].(x86asm.Mem).Disp); got != slotVA+winPreSlotLiteralOffset {
+				t.Errorf("JMP reads %#x, want the literal %#x", got, uint64(slotVA+winPreSlotLiteralOffset))
+			}
+			if !bytes.Equal(buf[pos:winSlotTailOffset], bytes.Repeat([]byte{0xCC}, winSlotTailOffset-pos)) {
+				t.Errorf("filler before the tail is % x", buf[pos:winSlotTailOffset])
+			}
+			// The tail jumps to the byte behind the SYSCALL.
+			tail, err := x86asm.Decode(buf[winSlotTailOffset:], 64)
+			if err != nil || tail.Op != x86asm.JMP || tail.Len != winJmpLen {
+				t.Fatalf("tail decodes as %v, %v", tail, err)
+			}
+			if got := slotVA + winSlotTailOffset + winJmpLen + uint64(int64(tail.Args[0].(x86asm.Rel))); got != site+winSiteLen {
+				t.Errorf("tail jumps to %#x, want %#x", got, uint64(site+winSiteLen))
+			}
+			if got := binary.LittleEndian.Uint64(buf[winPreSlotLiteralOffset:]); got != spill {
+				t.Errorf("literal = %#x, want %#x", got, uint64(spill))
+			}
+			rest := buf[winSlotTailOffset+winJmpLen : winPreSlotLiteralOffset]
+			if !bytes.Equal(rest, bytes.Repeat([]byte{0xCC}, len(rest))) || !bytes.Equal(buf[winPreSlotLiteralOffset+8:], bytes.Repeat([]byte{0xCC}, winSlotSize-winPreSlotLiteralOffset-8)) {
+				t.Errorf("filler after the tail is % x and % x", rest, buf[winPreSlotLiteralOffset+8:])
+			}
+		})
+	}
+}
+
+func TestEncodeWinPreSlotBounds(t *testing.T) {
+	buf := make([]byte, winSlotSize)
+	if err := encodeWinPreSlot(buf, rigCodeBase, rigSite, 0x9000, make([]byte, winJmpLen-1)); err == nil {
+		t.Error("a slot with fewer bytes than a JMP was accepted")
+	}
+	if err := encodeWinPreSlot(buf, rigCodeBase, rigSite, 0x9000, make([]byte, winPreMaxRelocated+1)); err == nil {
+		t.Error("a slot with too many relocated bytes was accepted")
+	}
+	if err := encodeWinPreSlot(buf, rigCodeBase, rigSite+2*winIslandReach32, 0x9000, make([]byte, winJmpLen)); err == nil {
+		t.Error("a slot that cannot reach the site was accepted")
+	}
+	if err := encodeWinPreSlot(buf[:winSlotSize-1], rigCodeBase, rigSite, 0x9000, make([]byte, winJmpLen)); err == nil {
+		t.Error("a short buffer was accepted")
+	}
+}
+
+func TestPreSlotRunsRelocatedInstructionsBeforeTheSpill(t *testing.T) {
+	// mov [rsp+8], r11
+	r := newPreSpillRig(t, []byte{0x4C, 0x89, 0x5C, 0x24, 0x08})
+	m := r.m
+	stored := r.guest[x86R11]
+	r.m.onYield = func(m *x86Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		if got := m.get64(rigGuestRSP + 8); got != stored {
+			t.Errorf("[rsp+8] = %#x when the stub polls, want R11 %#x", got, stored)
+		}
+		r.checkSaved(t)
+		r.setState(winStateRunHot)
+	}
+	if err := m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkHotExit(t, r.guest, rigFlags)
+	if len(r.callLog) != 0 {
+		t.Fatalf("a spin hit made calls %v", r.callLog)
+	}
+}
+
+func TestPreSlotSavesTheRegistersThatTheRelocatedInstructionsChanged(t *testing.T) {
+	// mov eax, 24
+	r := newPreSpillRig(t, []byte{0xB8, 0x18, 0, 0, 0})
+	r.guest[x86RAX] = 24
+	r.m.onYield = func(m *x86Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		r.checkSaved(t)
+		if got := r.saved(x86RAX); got != 24 {
+			t.Errorf("saved RAX = %d, want the system call number 24", got)
+		}
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkHotExit(t, r.guest, rigFlags)
+}
+
+func TestInsnOffsets(t *testing.T) {
+	// mov eax, 24; mov [rsp+8], r11; nop
+	code := []byte{0xB8, 0x18, 0, 0, 0, 0x4C, 0x89, 0x5C, 0x24, 0x08, 0x90}
+	offs, ok := insnOffsets(code)
+	if want := []uint8{0, 5, 10}; !ok || !bytes.Equal(offs, want) {
+		t.Fatalf("insnOffsets = %v, %v; want %v", offs, ok, want)
+	}
+	if _, ok := insnOffsets(code[:len(code)-3]); ok {
+		t.Error("insnOffsets accepted a cut instruction")
 	}
 }

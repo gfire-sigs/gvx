@@ -175,7 +175,7 @@ The engine does not install the hook. A missed site runs as an NT service and re
 
 The `x86-64` `syscall` instruction is two bytes. A same-size replacement fits every site. The engine writes `CC 90` (`int3` plus `nop`) over each SYSCALL. Every other byte stays in place, so nothing moves and nothing needs relocation. The debugger resolves the trap. Patching is therefore possible on `amd64`.
 
-The 5-byte `jmp rel32` patterns of the SPEC are harder. They overwrite three bytes after the `syscall`. A patcher must move those instructions into a trampoline, fix any `RIP`-relative operand, and prove that no branch lands inside the window. That work needs exact instruction boundaries. The default engine uses no such pattern. The optional fast path of section 6.8 uses it, and it keeps `CC 90` where it cannot prove the window.
+The 5-byte `jmp rel32` patterns of the SPEC are harder. The engine uses two forms. The post-window form overwrites the `syscall` and the bytes after it. The pre-window form overwrites the instructions that end at the `syscall`, and it keeps `CC 90` at the `syscall`. A patcher must move the overwritten instructions into a trampoline and prove that no branch lands inside the window. That work needs exact instruction boundaries. The default engine uses neither form. The optional fast path of section 6.8 uses them, and it keeps `CC 90` where it cannot prove the window.
 
 Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps. The sweeps start at different offsets. It patches a site only when more than half of them agree. The decoder gives no guarantee for four kinds of code:
 
@@ -314,15 +314,60 @@ The stub stores `Trapped` with release semantics and sets the guest event only w
 
 On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot saves `x16` and `x17` in the `Scratch` words of `winSysmsg` without touching the guest stack. It jumps to the spill routine with `x17` set to the slot tail. The routine writes the updated `x16` and `x17` values back to `Scratch` before it returns through the slot tail.
 
-On `amd64`, the patcher replaces `syscall` and the three bytes after it with `jmp rel32`. The slot holds a copy of the instructions that those bytes belong to. The slot uses no guest stack, so it keeps the red zone. The patcher keeps `CC 90` in each of these cases:
+On `amd64`, the patcher tries the post-window form first. It replaces `syscall` and the bytes after it with `jmp rel32`. Those bytes are whole instructions that cover at least three bytes. The slot holds a copy of the instructions. The slot uses no guest stack, so it keeps the red zone. The post-window form fails in each of these cases:
 
-- The instructions behind the `syscall`, at most three, cover fewer than three bytes or leave the page.
+- The instructions behind the `syscall` cover fewer than three bytes or leave the page.
 - One of them is a branch, a call, a return, a system call, an interrupt, or has a RIP-relative operand.
-- A relative branch that decodes in the page or in the 15 bytes on each side lands in the overwritten bytes.
+- The preceding instruction loads the number of a call that never returns: `exit`, `exit_group`, or `rt_sigreturn`.
+- A relative branch that decodes in the page or in the 256 bytes on each side lands in the overwritten bytes.
 - A prefix byte stands in front of the `syscall`.
 - The engine cannot allocate a slot.
 
-A branch from a distant page and an indirect jump can still land in the overwritten bytes. The patcher cannot see them. The scan of section 5 accepts the same kind of risk for the bytes of the `syscall` itself. The common `syscall; ret` of musl keeps `CC 90`, because the byte after `ret` can start another function.
+When the post-window form fails, the patcher tries the pre-window form. It replaces the instructions that end at the `syscall` with `jmp rel32`, and it keeps `CC 90` at the `syscall`:
+
+```text
+Original:  [I1][I2 ...][0F 05][following bytes]
+Patched:   [E9 rel32  ][CC 90][following bytes, unchanged]
+```
+
+The slot runs the relocated instructions, enters the spill routine, and returns to `syscall + 2`. The bytes behind the `syscall` do not change. A branch that lands on the `syscall` meets `CC 90`, and the debug path serves it. The pre-window form patches the cancellation point of musl, where `mov [rsp+8], r11; syscall; ret` ends in a branch target. It also patches the Go `runtime.osyield` and the `getpid` of glibc. The pre-window form needs all of these rules:
+
+- The decoder cannot run backward. Sixteen linear sweeps start 25 to 40 bytes before the `syscall`. At least 12 sweeps must reach the `syscall` and agree on the first instruction of the window.
+- The window is the fewest whole instructions that cover at least five bytes. It has at most nine bytes.
+- The window and the byte behind the `syscall` lie in one page.
+- Each instruction in the window can move to another address. The rules of the post-window form apply.
+- No relative branch that decodes in the page or in the 256 bytes on each side lands inside the window. A branch to the first byte of the window or to the `syscall` is allowed.
+- The window does not overlap another patched site. No prefix byte stands in front of the `syscall`.
+
+The pre-window form does not check for a non-returning call. It does not overwrite the bytes behind the `syscall`.
+
+The slot of the pre-window form has the size of the slot of the post-window form, 64 bytes, and the same tail offset, 40. In the table, `r` is the number of relocated bytes.
+
+| Offset | Bytes | Content |
+| :--- | ---: | :--- |
+| `0` | `r` (5 to 9) | The relocated instructions |
+| `r` | 9 | `mov gs:[winTEBScratchA], rax` |
+| `r + 9` | 7 | `lea rax, [rip + tail]` |
+| `r + 16` | 9 | `mov gs:[winTEBScratchB], rax` |
+| `r + 25` | 6 | `jmp [rip + literal]` |
+| `r + 31` | to 40 | `CC` filler |
+| `40` | 5 | The tail: `jmp rel32` to `syscall + 2` |
+| `48` | 8 | The address of the spill routine |
+
+The guest and the Sentry never see an island address. The engine also never starts a thread inside the bytes of the `jmp`. The engine applies these rules to a pre-window.
+
+| Case | Rule |
+| :--- | :--- |
+| Single step stops at the first instruction of the slot | The thread goes back to the `jmp`. The relocated instructions have not run. |
+| A stop in a relocated instruction, for example a page fault | The Sentry reports the address that the instruction has in the original code. The registers match that address. |
+| The Sentry starts a thread inside the window | The thread continues at the same instruction in the slot. |
+| The Sentry starts a thread at the `syscall` | The thread continues at the entry code of the slot. The relocated instructions ran before the call. A restart after a signal stays on the fast path. |
+| A thread starts at `syscall + 2`, as the child of `clone` does | The thread runs the bytes in place. The pre-window has no slot tail to enter. |
+| The engine repairs a fault in a relocated instruction | The thread continues in the slot with no translation. |
+
+The musl cancellation handler compares the program counter with the range of the cancellation point. An island address would fail that test and lose the request. The Sentry starts a thread at the `syscall` to restart a call. An interrupt can also stop a guest after a branch to the `syscall`, before `CC 90` runs. The next start then enters the slot behind the relocated instructions, and the guest skips them. The case is rare, and the engine accepts it.
+
+A branch from a distant page and an indirect jump can still land in the overwritten bytes of either form. The patcher cannot see them. The scan of section 5 accepts the same kind of risk for the bytes of the `syscall` itself. The common `syscall; ret` of musl keeps `CC 90` in the post-window form, because the byte after `ret` can start another function. The pre-window form patches such a site through the instructions in front of the `syscall`.
 
 A thread can also start at the return address of a patched `syscall`. The new thread of `clone` does this. A `sigreturn` that restores the frame of an interrupted call does it too. The `jmp` overwrote the bytes at that address. The engine therefore starts such a thread at the tail of the slot. The tail runs the relocated instructions and jumps to the code behind them. The Sentry never writes the address of the tail into the registers of the guest. Without this rule, the child of `clone` in a Go guest ran the bytes of the `jmp` and crashed with SIGSEGV on `windows/amd64`.
 
@@ -332,7 +377,7 @@ On `arm64`, no register can name the TEB. The guest owns `x18`, and Windows keep
 
 These stops keep the debug path: every fault, every execute fault that patches a page, every single step, every `CC 90` and `brk` site that stays trapped, `RDFSBASE`, and every signal. A thread can use both paths in turn. A thread that waits in the spill routine is not suspended, so the other threads of the stub run on.
 
-`Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls, because the trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the patched instruction, because the slot has not run.
+`Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls, because the trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the instruction that jumps to the slot, because the slot has not run. For a pre-window slot, that instruction lies in front of the `syscall`.
 
 The spill routine saves the vector state of the guest in the `winSysmsg` before it makes any call, and loads it on every resume. The Sentry reads and writes the vector state of a trapped thread in that block. The live thread context does not hold the guest state, because the calls of the routine clobber the volatile vector registers. The first CI runs failed `TestFastPathVectorStateFollowsTheSentry` on `windows-11-arm` and on `windows-latest`: `PullFullState` read zero, and a value from the Sentry reached the guest as zero.
 
@@ -395,6 +440,7 @@ State this limit in every user-facing document for the engine. Do not describe t
 | `code_image_xplat.go` | ELF section headers that limit the scan to code. |
 | `winsysmsg_xplat.go`, `winsysmsg_*_xplat.go` | Layout of the arena and of the `winSysmsg` page, the handoff state machine, and the register blocks. |
 | `stubcode_*_xplat.go` | Generators of the spill routine and the trampoline slots, and the `amd64` patch plan. |
+| `islandslot_xplat.go`, `sites_amd64_xplat.go` | The record of a trampoline slot, the site records of a patched page, and the translation tables of a pre-window. |
 | `fastpath_windows.go`, `fastisland_windows.go`, `fastselftest_windows.go` | Slots, events, the Sentry side of the handoff, the islands, and the self test of the fast path. |
 
 The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpath_windows_test.go`, `lockdown_windows_test.go`, `viewmap_xplat_test.go`, `patcher_amd64_xplat_test.go`, `hostctx_xplat_test.go`, `winsysmsg_xplat_test.go`, and `stubcode_*_xplat_test.go`. They run guests that the tests assemble by hand, through the same `Context.Switch` that the Sentry calls. The `xplat` tests also run on macOS.

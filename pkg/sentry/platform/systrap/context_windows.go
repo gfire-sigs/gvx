@@ -205,32 +205,35 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	case dbgStateSingleStep:
 		return c.stepStop(th, ac, ev)
 	}
+	// A fault in a relocated instruction stops in a slot. The guest sees the
+	// address that the instruction has in the original code.
+	pc := th.guestPC(th.ctx.pc())
 	switch ev.Code {
 	case statusAccessViol, statusInPageError:
 		return c.faultStop(ctx, mm, as, th, ac, ev)
 	case statusIllegalInsn, statusPrivInsn:
-		sig, code := th.illegalSignal(as, th.ctx.pc())
-		return c.signalStop(as, th, ac, ev, linux.Signal(sig), code, th.ctx.pc())
+		sig, code := th.illegalSignal(as, pc)
+		return c.signalStop(as, th, ac, ev, linux.Signal(sig), code, pc)
 	case statusBreakpoint:
-		return c.signalStop(as, th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, pc)
 	case statusSingleStep:
 		return c.stepStop(th, ac, ev)
 	case statusDatatypeMis:
-		return c.signalStop(as, th, ac, ev, linux.SIGBUS, busAdrAln, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGBUS, busAdrAln, pc)
 	case statusIntDivZero:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntDiv, pc)
 	case statusIntOverflow:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntOvf, pc)
 	case statusFltDivZero:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltDiv, pc)
 	case statusFltOverflow:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltOvf, pc)
 	case statusFltUnderflow:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltUnd, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltUnd, pc)
 	case statusFltInexact:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltRes, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltRes, pc)
 	case statusFltInvalid, statusFltDenormal, statusFltStack:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltInv, pc)
 	}
 	return fatal(fmt.Errorf("the stub reported exception %#x at %#x (pc %#x)", ev.Code, ev.Addr, th.ctx.pc()), unix.EFAULT)
 }
@@ -385,7 +388,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		}
 	case avWrite:
 		base := blockRound(addr)
-		if blockRound(pc) == base {
+		if blockRound(th.guestPC(pc)) == base {
 			// The guest writes to the page that it executes. Restoring the
 			// original frame removes the execute permission under the
 			// instruction, and the next fetch maps the patched copy that

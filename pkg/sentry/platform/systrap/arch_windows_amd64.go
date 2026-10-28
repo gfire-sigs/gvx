@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -175,7 +176,7 @@ func (th *thread) goThroughTrampoline(fsBase uint64) error {
 // tail, because the JMP overwrote the bytes at that address.
 func (th *thread) archStart(ac *arch.Context64) error {
 	th.fsFix.n = 0
-	th.ctx.setPC(th.resumePC(th.ctx.pc()))
+	th.ctx.setPC(th.startPC(th.ctx.pc()))
 	if f := th.fast.Load(); f != nil {
 		f.slot.sm.Regs.loadTLSFrom(ac)
 	}
@@ -186,18 +187,76 @@ func (th *thread) archStart(ac *arch.Context64) error {
 	return th.goThroughTrampoline(fs)
 }
 
+// startPC returns the address where a thread continues when the Sentry starts
+// it at the guest program counter pc. A thread that starts at the SYSCALL of a
+// pre-window continues in the entry code of the slot. The Sentry sets that
+// program counter to restart a system call, after the relocated instructions
+// ran. The slot keeps a restart on the fast path.
+func (th *thread) startPC(pc uint64) uint64 {
+	if as := th.sp.owner.Load(); as != nil {
+		if entry, ok := as.relocatedEntry(pc, true); ok {
+			return entry
+		}
+	}
+	return th.resumePC(pc)
+}
+
 // resumePC returns the address where a thread continues for the guest program
 // counter pc. The return address of a SYSCALL that became a JMP lies inside the
 // JMP. A new thread of clone, and a sigreturn to an interrupted system call,
 // continue there. The slot tail runs the relocated instructions and jumps back
-// to the code behind them, which is where the guest continues.
+// to the code behind them, which is where the guest continues. The relocated
+// instructions of a pre-window lie inside the JMP too. A thread that starts at
+// one of them, for example after a fault in it, continues at the same
+// instruction in the slot.
 func (th *thread) resumePC(pc uint64) uint64 {
 	as := th.sp.owner.Load()
 	if as == nil {
 		return pc
 	}
+	if entry, ok := as.relocatedEntry(pc, false); ok {
+		return entry
+	}
 	if tail, ok := as.jumpTail(pc); ok {
 		return tail
+	}
+	return pc
+}
+
+// relocatedEntry returns the address in a pre-window slot where a thread
+// continues when it starts at the guest address pc. It returns false when pc is
+// not a relocated instruction of a pre-window. With syscall set, it also
+// returns the entry code of the slot for the SYSCALL of a pre-window.
+func (as *addressSpace) relocatedEntry(pc uint64, syscall bool) (uint64, bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	blk := as.blocks[blockRound(pc)]
+	if blk == nil || blk.state != blockExec {
+		return 0, false
+	}
+	s, ok := blk.sites[uint16(pc-blk.base)]
+	if !ok || s.entry == 0 || (s.kind == amd64SiteSyscall && !syscall) {
+		return 0, false
+	}
+	return s.entry, true
+}
+
+// guestPC returns the program counter that the guest has for a thread that
+// stopped at pc. A thread that faults in a relocated instruction of a
+// pre-window stops in the slot. The guest, a signal frame, and the musl
+// cancellation check must see the address that the instruction has in the
+// original code.
+func (th *thread) guestPC(pc uint64) uint64 {
+	as := th.sp.owner.Load()
+	if as == nil {
+		return pc
+	}
+	slot, slotVA, ok := as.slotContaining(pc)
+	if !ok {
+		return pc
+	}
+	if gpc, ok := slot.guestPC(slotVA, pc); ok {
+		return gpc
 	}
 	return pc
 }
@@ -220,7 +279,10 @@ func (as *addressSpace) jumpTail(pc uint64) (uint64, bool) {
 }
 
 // pullArch completes the copy of the registers into ac.
-func (th *thread) pullArch(*arch.Context64) {}
+func (th *thread) pullArch(ac *arch.Context64) {
+	r := &ac.StateData().Regs
+	r.Rip = th.guestPC(r.Rip)
+}
 
 // inEngineCode reports whether pc lies in the engine pages or in a trampoline
 // island.
@@ -464,8 +526,9 @@ func hasFSPrefix(code []byte) bool {
 // the planner gave.
 var siteStats struct {
 	// post counts the sites that became a JMP over the SYSCALL and the bytes
-	// behind it.
-	post atomic.Uint64
+	// behind it. pre counts the sites that kept the trap while a JMP replaced
+	// the instructions in front of the SYSCALL.
+	post, pre atomic.Uint64
 	// noSlot counts the sites that kept the trap because no island had room.
 	noSlot atomic.Uint64
 	trap   [planRejects]atomic.Uint64
@@ -474,29 +537,12 @@ var siteStats struct {
 // archStatsLine summarizes siteStats.
 func archStatsLine() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "SYSCALL sites: jmp %d, trap for no slot %d; trap for", siteStats.post.Load(), siteStats.noSlot.Load())
+	fmt.Fprintf(&b, "SYSCALL sites: jmp behind %d, jmp before %d, trap for no slot %d; trap for", siteStats.post.Load(), siteStats.pre.Load(), siteStats.noSlot.Load())
 	for r := planOK + 1; r < planRejects; r++ {
 		fmt.Fprintf(&b, " %s %d,", r, siteStats.trap[r].Load())
 	}
 	return strings.TrimSuffix(b.String(), ",")
 }
-
-// siteInfo describes one patched instruction.
-type siteInfo struct {
-	kind    amd64SiteKind
-	reg     uint8
-	scratch uint8
-	wide    bool
-	store   bool
-	length  uint8
-	disp    int32
-	// tail is the address of the slot tail of a winSiteJump.
-	tail uint64
-}
-
-// winSiteJump marks the SYSCALL that became a JMP to a slot. The debugger
-// never sees a trap there, so the kind only serves resumePC.
-const winSiteJump amd64SiteKind = 0x80
 
 // patchPage replaces the SYSCALL and RDFSBASE instructions of one page with
 // traps. page is a copy of the original frame. With the fast path, a SYSCALL
@@ -522,9 +568,13 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	var keep []amd64Site
 	var slots []winSlotRef
 	sites := make(map[uint16]siteInfo, len(found))
-	// jumpEnd is the end of the bytes that the last JMP patch owns.
-	jumpEnd := 0
+	// jumpEnd is the end of the bytes that the last JMP patch owns. prevEnd is
+	// the end of every site that the loop met. A pre-window patch must not
+	// overwrite either.
+	jumpEnd, prevEnd := 0, 0
 	for _, s := range found {
+		floor := max(jumpEnd, prevEnd)
+		prevEnd = max(prevEnd, s.Offset+s.Len)
 		// A file image proves which bytes are code. Anonymous memory and files
 		// without section headers give no proof, and the decoder alone decides.
 		startOff := uint64(max(s.Offset, 0))
@@ -539,11 +589,29 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		if as.p.fast && s.Offset >= 0 {
 			switch s.Kind {
 			case amd64SiteSyscall:
-				if end, tail, ref, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
-					jumpEnd = end
-					sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
-					slots = append(slots, ref)
-					continue
+				pl := plan.planSite(s.Offset, floor)
+				if pl.kind == planPre && scope.proven() && !scope.containsRange(base+uint64(pl.start), uint64(s.Offset-pl.start)) {
+					// The window is not in a code section of the file.
+					pl = sitePlan{kind: planTrap, reject: pl.reject}
+				}
+				switch pl.kind {
+				case planPost:
+					if end, tail, ref, ok := as.patchJump(ctx, mm, base, page, s.Offset, pl.reloc); ok {
+						jumpEnd = end
+						sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
+						slots = append(slots, ref)
+						continue
+					}
+				case planPre:
+					if pw, ok := as.patchJumpBefore(ctx, mm, base, page, s.Offset, pl); ok {
+						jumpEnd = s.Offset
+						slots = append(slots, pw.ref)
+						maps.Copy(sites, preWindowSites(pw.start, pw.slotVA, pw.insn, s))
+						keep = append(keep, s)
+						continue
+					}
+				default:
+					siteStats.trap[pl.reject].Add(1)
 				}
 			case amd64SiteRDFSBASE, amd64SiteRDGSBASE:
 				if ref, ok := as.patchTLSBaseJump(ctx, mm, base, plan, page, s); ok {
@@ -580,22 +648,13 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	return sites, slots, nil
 }
 
-// patchJump replaces the SYSCALL at offset off of page with a JMP to a new
-// slot. It returns the end of the bytes that the patch owns, the address of
-// the slot tail, and the slot reference, or false when the site keeps its trap.
-func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, uint64, winSlotRef, bool) {
-	if hasPrefixBefore(plan.before, plan.page, off) {
-		// A prefix would apply to the JMP.
-		siteStats.trap[planPrefix].Add(1)
-		return 0, 0, winSlotRef{}, false
-	}
-	reloc, reject := plan.plan(off)
-	if reject != planOK {
-		siteStats.trap[reject].Add(1)
-		return 0, 0, winSlotRef{}, false
-	}
+// patchJump replaces the SYSCALL at offset off of page and the bytes behind it
+// with a JMP to a new slot that runs reloc. It returns the end of the bytes that
+// the patch owns, the address of the slot tail, and the slot reference, or false
+// when the site keeps its trap.
+func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, off int, reloc []byte) (int, uint64, winSlotRef, bool) {
 	site := base + uint64(off)
-	slotVA, ref, err := as.installSlot(ctx, mm, site, winSlotSize, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winSlotSize), func(buf []byte, slotVA uint64) error {
 		return encodeWinSlot(buf, slotVA, site, as.p.spillVA(), reloc)
 	})
 	if err == nil {
@@ -616,6 +675,47 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, ref, true
 }
 
+// preWindowPatch describes a pre-window patch that patchJumpBefore installed.
+type preWindowPatch struct {
+	ref    winSlotRef
+	slotVA uint64
+	// start is the page offset of the JMP.
+	start int
+	// insn holds the offset of each relocated instruction, counted from start.
+	insn []uint8
+}
+
+// patchJumpBefore replaces the instructions in front of the SYSCALL at offset
+// off of page with a JMP to a new slot, as pl describes. The SYSCALL keeps its
+// trap. It returns false when the site keeps its trap.
+func (as *addressSpace) patchJumpBefore(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, off int, pl sitePlan) (preWindowPatch, bool) {
+	insn, ok := insnOffsets(pl.reloc)
+	if !ok {
+		return preWindowPatch{}, false
+	}
+	site, jmpVA := base+uint64(off), base+uint64(pl.start)
+	rec := islandSlot{site: site, size: winSlotSize, jmpVA: jmpVA, insn: insn}
+	slotVA, ref, err := as.installSlot(ctx, mm, rec, func(buf []byte, slotVA uint64) error {
+		return encodeWinPreSlot(buf, slotVA, site, as.p.spillVA(), pl.reloc)
+	})
+	if err == nil {
+		if err = patchJmpSite(page, pl.start, off-pl.start, jmpVA, slotVA); err != nil {
+			as.mu.Lock()
+			ref.isl.free(ref.off, ref.size)
+			as.mu.Unlock()
+		}
+	}
+	if err != nil {
+		if traceEvents {
+			tracef("no trampoline slot for the instructions before the SYSCALL at %#x: %v", site, err)
+		}
+		siteStats.noSlot.Add(1)
+		return preWindowPatch{}, false
+	}
+	siteStats.pre.Add(1)
+	return preWindowPatch{ref: ref, slotVA: slotVA, start: pl.start, insn: insn}, true
+}
+
 // patchTLSBaseJump replaces the RDFSBASE or RDGSBASE instruction s in page
 // with a JMP to a trampoline slot when the instruction can be replaced in
 // place.
@@ -625,7 +725,7 @@ func (as *addressSpace) patchTLSBaseJump(ctx context.Context, mm platform.Memory
 	}
 	site := base + uint64(s.Offset)
 	isGS := s.Kind == amd64SiteRDGSBASE
-	slotVA, ref, err := as.installSlot(ctx, mm, site, winTLSSlotSize, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winTLSSlotSize), func(buf []byte, slotVA uint64) error {
 		return encodeWinTLSBaseSlot(buf, slotVA, site, s.Len, s.Reg, s.Wide, isGS)
 	})
 	if err == nil {
@@ -653,7 +753,7 @@ func (as *addressSpace) patchGSMovJump(ctx context.Context, mm platform.MemoryMa
 		return gsMovPlan{}, winSlotRef{}, false
 	}
 	site := base + uint64(s.Offset)
-	slotVA, ref, err := as.installSlot(ctx, mm, site, winGSMovSlotSize, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winGSMovSlotSize), func(buf []byte, slotVA uint64) error {
 		return encodeWinGSMovSlot(buf, slotVA, site, s.Len, gp)
 	})
 	if err == nil {
@@ -676,10 +776,11 @@ func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *d
 		return false, nil
 	}
 	pc := th.ctx.pc()
-	site, slotVA, ok := as.slotContaining(pc)
+	slot, slotVA, ok := as.slotContaining(pc)
 	if !ok {
 		return false, nil
 	}
+	site := slot.site
 	info, ok := as.siteAt(site)
 	if !ok || info.kind != amd64SiteGSMem {
 		return false, nil
