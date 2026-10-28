@@ -285,6 +285,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/hostlockdown", "a test proves that the host watcher keeps working after hostlockdown.Apply"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/waiter", "a FIFO test blocks inside the VFS through a context.Context.BlockOn method"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "a test pins that the vDSO image that the Sentry maps never names x18"},
+	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/time", "a benchmark reads the performance counter, because the runtime clock of Windows ticks every 0.5 ms"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {
