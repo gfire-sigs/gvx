@@ -37,6 +37,7 @@ var (
 	procNtRemoveProcessDebug = modNtdll.NewProc("NtRemoveProcessDebug")
 	procNtWaitForDebugEvent  = modNtdll.NewProc("NtWaitForDebugEvent")
 	procNtDebugContinue      = modNtdll.NewProc("NtDebugContinue")
+	procNtAlertThread        = modNtdll.NewProc("NtAlertThread")
 	procNtCreateThreadEx     = modNtdll.NewProc("NtCreateThreadEx")
 	procNtSuspendThread      = modNtdll.NewProc("NtSuspendThread")
 	procNtResumeThread       = modNtdll.NewProc("NtResumeThread")
@@ -185,9 +186,10 @@ func parseDebugEvent(b *[debugRecordSize]byte) debugEvent {
 // ntWaitForDebugEvent waits up to timeout for one event. It returns false on
 // a timeout or an alert.
 func ntWaitForDebugEvent(dbg windows.Handle, timeout time.Duration, buf *[debugRecordSize]byte) (bool, error) {
-	// A negative value is a relative time in 100ns units.
+	// A negative value is a relative time in 100ns units. The wait is alertable,
+	// so NtAlertThread ends it at once. It then returns false.
 	t := -int64(timeout / 100)
-	st, _, _ := procNtWaitForDebugEvent.Call(uintptr(dbg), 0, uintptr(unsafe.Pointer(&t)), uintptr(unsafe.Pointer(buf)))
+	st, _, _ := procNtWaitForDebugEvent.Call(uintptr(dbg), 1, uintptr(unsafe.Pointer(&t)), uintptr(unsafe.Pointer(buf)))
 	switch uint32(st) {
 	case 0:
 		return true, nil
@@ -195,6 +197,17 @@ func ntWaitForDebugEvent(dbg windows.Handle, timeout time.Duration, buf *[debugR
 		return false, nil
 	}
 	return false, ntCheck("NtWaitForDebugEvent", st)
+}
+
+// threadAlert is the access right that NtAlertThread needs.
+const threadAlert = 0x0004
+
+// ntAlertThread alerts thread h. A thread in an alertable wait returns from it
+// with STATUS_ALERTED. A thread that is not in one returns from its next
+// alertable wait at once.
+func ntAlertThread(h windows.Handle) error {
+	st, _, _ := procNtAlertThread.Call(uintptr(h))
+	return ntCheck("NtAlertThread", st)
 }
 
 func ntDebugContinue(dbg windows.Handle, pid, tid uint32, status uint32) error {

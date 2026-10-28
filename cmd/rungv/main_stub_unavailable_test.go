@@ -12,29 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux && !windows && !(darwin && arm64)
+//go:build !linux && !windows
 
 package main
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 )
 
 // TestStubReportsUnavailableEngine covers every host without a runnable
-// systrap engine: the default 4KB build on darwin/arm64.
-// Linux runs the upstream platform, and Windows runs the engine of gvx. The
-// command prints no stub data and exits with the engine error.
+// systrap engine. Linux runs the upstream platform, and Windows runs the
+// engine of gvx. The command prints no stub data and exits with the engine
+// error.
 func TestStubReportsUnavailableEngine(t *testing.T) {
 	code, stdout, stderr := runStub(t)
 	if code != 1 || stdout != "" {
 		t.Fatalf("rungv stub = (code %d, stdout %q, stderr %q), want (1, empty stdout)", code, stdout, stderr)
 	}
 	want := "unavailable"
-	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		want = "pagesize_16k"
-	}
 	if !strings.Contains(stderr, "rungv stub: ") || !strings.Contains(stderr, want) {
 		t.Fatalf("rungv stub stderr = %q, want the engine error containing %q", stderr, want)
 	}

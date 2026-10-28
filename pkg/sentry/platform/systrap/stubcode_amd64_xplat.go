@@ -59,6 +59,29 @@ const (
 	winSlotLiteralOffset = 32
 	// winSlotTailOffset is the offset of the slot tail.
 	winSlotTailOffset = 40
+	// winSlotEntryLen is the length of the entry code of a slot: the two stores
+	// to the TEB, the load of the tail address, and the jump to the spill
+	// routine.
+	winSlotEntryLen = 31
+	// winPreSlotLiteralOffset is the offset of the literal that holds the address
+	// of the spill routine in a pre-window slot. The literal follows the tail.
+	winPreSlotLiteralOffset = 48
+	// winPreMaxRelocated is the most bytes that the instructions before a
+	// SYSCALL can have in a pre-window slot. The instructions run in front of the
+	// entry code, and the entry code must end before the tail.
+	winPreMaxRelocated = winSlotTailOffset - winSlotEntryLen
+
+	// winPreSweeps is the number of linear decode sweeps that find the first
+	// instruction of a pre-window. At least winPreAgree sweeps must reach the
+	// SYSCALL and agree on that instruction.
+	winPreSweeps = 16
+	winPreAgree  = 12
+	// winPreSweepBack is the distance in bytes from the SYSCALL to the first
+	// byte of the first sweep. Each next sweep starts one byte later. Every
+	// sweep then has at least 25 bytes to find the instruction boundaries
+	// before it reaches a window of at most 9 bytes.
+	winPreSweepBack = 40
+
 	// winMaxRelocated is the most relocated bytes that fit in the slot: the
 	// tail offset, the jump back, and the slot size bound it.
 	winMaxRelocated = winSlotSize - winSlotTailOffset - 5
@@ -221,6 +244,14 @@ func (a *x86Asm) jmpGS(abs uint32) {
 	a.imm32(abs)
 }
 
+// rdtsc is `rdtsc; shl rdx, 32; or rax, rdx`. It leaves the 64-bit TSC in RAX
+// and clobbers RDX.
+func (a *x86Asm) rdtsc() {
+	a.emit(0x0F, 0x31)
+	a.emit(0x48, 0xC1, 0xE2, 0x20)
+	a.emit(0x48, 0x09, 0xD0)
+}
+
 // movRegReg is `mov dst, src` for 64-bit registers.
 func (a *x86Asm) movRegReg(dst, src int) {
 	a.emit(x86Rex(true, src, dst), 0x89, 0xC0|byte(src&7)<<3|byte(dst&7))
@@ -282,12 +313,22 @@ func (c winSpillCode) coldExit() int {
 
 // buildSpill generates the spill routine.
 //
-// Register use after the save: R15 holds the sysmsg and RBX counts the polls.
-// Both are callee-saved in the Windows calling convention, so the calls into
-// ntdll keep them. The stack pointer lies 64 bytes below the top of the stub
-// stack, which leaves the 32-byte shadow space of a call and keeps the 16-byte
-// alignment.
-func buildSpill() (winSpillCode, error) {
+// Register use after the save: R15 holds the sysmsg and RBX holds the end of the
+// spin window in TSC ticks.
+// R14 is the call flag: it is 0 after the save, and 1 once the routine called
+// into ntdll. These registers are callee-saved in the Windows calling
+// convention, so the calls into ntdll keep them. The stack pointer lies 64
+// bytes below the top of the stub stack, which leaves the 32-byte shadow space
+// of a call and keeps the 16-byte alignment.
+//
+// A hot resume loads the vector state only when a call ran, because the call
+// can clobber the volatile vector registers, or when the Sentry wrote the
+// vector image (FPDirty). Without both, the vector registers still hold the
+// guest state that the routine saved. A cold resume always loads it.
+func buildSpill() (winSpillCode, error) { return buildSpillWith(spillOptions{}) }
+
+// buildSpillWith generates the spill routine with the changes of opts.
+func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	var a x86Asm
 	const base = x86R15
 
@@ -310,8 +351,11 @@ func buildSpill() (winSpillCode, error) {
 	// Save the vector state before the first call. A call into ntdll can
 	// clobber the volatile vector registers, and the Sentry reads the saved
 	// image while the thread waits.
-	a.loadXsaveMask()
-	a.xsave64(base, winOffXsave)
+	if !opts.noVector {
+		a.loadXsaveMask()
+		a.xsave64(base, winOffXsave)
+	}
+	a.emit(0x45, 0x31, 0xF6) // xor r14d, r14d: no call yet
 
 	// Publish Trapped. An x86 store has release semantics. The fence orders the
 	// store before the load of the Sentry flag.
@@ -321,18 +365,23 @@ func buildSpill() (winSpillCode, error) {
 	a.jcc8(x86CCE, "spin")
 	a.movLoad(x86RCX, base, winOffGuestEvent)
 	a.emit(0x31, 0xD2) // xor edx, edx
+	a.emit(0x41, 0xBE) // mov r14d, 1: a call can clobber the vector registers
+	a.imm32(1)
 	a.callMem(base, winOffNtSetEvent)
 
+	// Spin for SpinTicks ticks of the TSC. RBX holds the end of the window.
 	a.label("spin")
-	a.emit(0xBB)
-	a.imm32(winSpinStub) // mov ebx, spin count
+	a.rdtsc()
+	a.memOp(true, []byte{0x03}, x86RAX, base, winOffSpinTicks) // add rax, [r15+SpinTicks]
+	a.movRegReg(x86RBX, x86RAX)
 	a.label("poll")
 	a.movLoad32(x86RAX, base, winOffState)
 	a.emit(0x83, 0xF8, byte(winStateRunHot)) // cmp eax, RunHot
 	a.jcc8(x86CCAE, "run")
 	a.emit(0xF3, 0x90) // pause
-	a.emit(0xFF, 0xCB) // dec ebx
-	a.jcc8(x86CCNE, "poll")
+	a.rdtsc()
+	a.emit(0x48, 0x39, 0xD8) // cmp rax, rbx
+	a.jcc8(x86CCB, "poll")
 
 	a.label("sleep")
 	a.movStoreImm32(base, winOffStubWaiter, 1)
@@ -343,6 +392,8 @@ func buildSpill() (winSpillCode, error) {
 	a.movLoad(x86RCX, base, winOffHostEvent)
 	a.emit(0x31, 0xD2)       // xor edx, edx
 	a.emit(0x45, 0x31, 0xC0) // xor r8d, r8d
+	a.emit(0x41, 0xBE)       // mov r14d, 1
+	a.imm32(1)
 	a.callMem(base, winOffNtWait)
 	a.movLoad32(x86RAX, base, winOffState)
 	a.emit(0x83, 0xF8, byte(winStateRunHot))
@@ -353,10 +404,26 @@ func buildSpill() (winSpillCode, error) {
 	a.emit(0x83, 0xF8, byte(winStateRunCold)) // cmp eax, RunCold
 	a.jcc32(x86CCE, "cold")
 
-	// Hot resume: load the vector state, the FS base, the flags, the return
-	// address, and every register, then jump to the tail.
-	a.loadXsaveMask()
-	a.xrstor64(base, winOffXsave)
+	// Hot resume: load the vector state when a call ran or the Sentry wrote the
+	// image, then load the FS base, the flags, the return address, and every
+	// register, and jump to the tail.
+	switch {
+	case opts.noVector:
+	case opts.alwaysRestore:
+		a.loadXsaveMask()
+		a.xrstor64(base, winOffXsave)
+		a.movStoreImm32(base, winOffFPDirty, 0)
+	default:
+		a.emit(0x41, 0x83, 0xFE, 0x00) // cmp r14d, 0
+		a.jcc8(x86CCNE, "hotload")
+		a.cmpMemImm8(base, winOffFPDirty, 0)
+		a.jcc8(x86CCE, "hotskip")
+		a.label("hotload")
+		a.loadXsaveMask()
+		a.xrstor64(base, winOffXsave)
+		a.movStoreImm32(base, winOffFPDirty, 0)
+		a.label("hotskip")
+	}
 	a.movLoad(x86RAX, base, winOffFsBase)
 	a.emit(0xF3, 0x48, 0x0F, 0xAE, 0xD0) // wrfsbase rax
 	a.pushMem(base, winOffRflags)
@@ -369,8 +436,11 @@ func buildSpill() (winSpillCode, error) {
 	// Cold resume: load the flags and every register, then trap. The Sentry
 	// continues the thread at Target and loads the FS base itself.
 	a.label("cold")
-	a.loadXsaveMask()
-	a.xrstor64(base, winOffXsave)
+	if !opts.noVector {
+		a.loadXsaveMask()
+		a.xrstor64(base, winOffXsave)
+		a.movStoreImm32(base, winOffFPDirty, 0)
+	}
 	a.pushMem(base, winOffRflags)
 	a.emit(0x9D)
 	loadAll(&a, base)
@@ -400,23 +470,23 @@ func encodeWinSlot(buf []byte, slotVA, site, spill uint64, reloc []byte) error {
 	if len(buf) < winSlotSize {
 		return fmt.Errorf("slot buffer has %d bytes", len(buf))
 	}
-	if len(reloc) < winMinRelocated || len(reloc) > winMaxRelocated {
+	if len(reloc) < winMinRelocated {
 		return fmt.Errorf("slot with %d relocated bytes", len(reloc))
 	}
+	moved, err := relocateInstructions(reloc, site+winSiteLen, slotVA+winSlotTailOffset, true)
+	if err != nil {
+		return err
+	}
+	if len(moved) > winMaxRelocated {
+		return fmt.Errorf("slot with %d relocated bytes after the move", len(moved))
+	}
 	var a x86Asm
-	a.movStoreGS(winTEBScratchA, x86RAX)
-	// lea rax, [rip+tail]: the instruction ends at offset 16.
-	a.emit(0x48, 0x8D, 0x05)
-	a.imm32(uint32(winSlotTailOffset - 16))
-	a.movStoreGS(winTEBScratchB, x86RAX)
-	// jmp [rip+literal]: the instruction ends at offset 31.
-	a.emit(0xFF, 0x25)
-	a.imm32(uint32(winSlotLiteralOffset - 31))
+	a.slotEntry(winSlotTailOffset, winSlotLiteralOffset)
 	for len(a.b) < winSlotLiteralOffset {
 		a.emit(0xCC)
 	}
 	a.b = binary.LittleEndian.AppendUint64(a.b, spill)
-	a.b = append(a.b, reloc...)
+	a.b = append(a.b, moved...)
 	back := slotVA + uint64(len(a.b)) + 5
 	rel, err := rel32(back, site+winSiteLen+uint64(len(reloc)))
 	if err != nil {
@@ -429,6 +499,96 @@ func encodeWinSlot(buf []byte, slotVA, site, spill uint64, reloc []byte) error {
 	}
 	copy(buf, a.b)
 	return nil
+}
+
+// slotEntry emits the entry code of a slot at the current position. The code
+// saves RAX in the TEB, loads RAX with the address of the slot tail, saves it
+// in the TEB, and jumps through the literal to the spill routine. tailOffset
+// and literalOffset are slot offsets, and the code starts at the slot offset
+// len(a.b). The code has winSlotEntryLen bytes.
+func (a *x86Asm) slotEntry(tailOffset, literalOffset int) {
+	at := len(a.b)
+	a.movStoreGS(winTEBScratchA, x86RAX)
+	// lea rax, [rip+tail]: the instruction ends 16 bytes after the entry start.
+	a.emit(0x48, 0x8D, 0x05)
+	a.imm32(uint32(int32(tailOffset - (at + 16))))
+	a.movStoreGS(winTEBScratchB, x86RAX)
+	// jmp [rip+literal]: the instruction ends at the end of the entry code.
+	a.emit(0xFF, 0x25)
+	a.imm32(uint32(int32(literalOffset - (at + winSlotEntryLen))))
+}
+
+// The pre-window slot must hold at least the 5 bytes of a JMP.
+var _ = [winPreMaxRelocated - winJmpLen]struct{}{}
+
+// encodeWinPreSlot writes the slot for a SYSCALL at site that a JMP in front
+// of the SYSCALL reaches. reloc holds the instructions that the JMP overwrites.
+// They end at site. The SYSCALL keeps its INT3 trap. The slot runs reloc, jumps
+// to the spill routine, and its tail jumps to site+2 without relocated
+// instructions:
+//
+//	reloc
+//	mov  gs:[winTEBScratchA], rax
+//	lea  rax, [rip+tail]
+//	mov  gs:[winTEBScratchB], rax
+//	jmp  [rip+literal]
+//	tail:
+//	  jmp  site+2
+//	literal: <address of the spill routine>
+func encodeWinPreSlot(buf []byte, slotVA, site, spill uint64, reloc []byte) error {
+	if len(buf) < winSlotSize {
+		return fmt.Errorf("slot buffer has %d bytes", len(buf))
+	}
+	if len(reloc) < winJmpLen || len(reloc) > winPreMaxRelocated {
+		return fmt.Errorf("pre-window slot with %d relocated bytes", len(reloc))
+	}
+	// The instructions end at site, so they start len(reloc) bytes before it.
+	moved, err := relocateInstructions(reloc, site-uint64(len(reloc)), slotVA, false)
+	if err != nil {
+		return err
+	}
+	if len(moved) != len(reloc) {
+		return fmt.Errorf("the move changed %d relocated bytes to %d", len(reloc), len(moved))
+	}
+	var a x86Asm
+	a.emit(moved...)
+	a.slotEntry(winSlotTailOffset, winPreSlotLiteralOffset)
+	if len(a.b) != len(reloc)+winSlotEntryLen {
+		return fmt.Errorf("slot entry code has %d bytes, want %d", len(a.b)-len(reloc), winSlotEntryLen)
+	}
+	for len(a.b) < winSlotTailOffset {
+		a.emit(0xCC)
+	}
+	rel, err := rel32(slotVA+winSlotTailOffset+winJmpLen, site+winSiteLen)
+	if err != nil {
+		return err
+	}
+	a.emit(0xE9)
+	a.imm32(rel)
+	for len(a.b) < winPreSlotLiteralOffset {
+		a.emit(0xCC)
+	}
+	a.b = binary.LittleEndian.AppendUint64(a.b, spill)
+	for len(a.b) < winSlotSize {
+		a.emit(0xCC)
+	}
+	copy(buf, a.b)
+	return nil
+}
+
+// insnOffsets returns the offset of each instruction in code. It returns false
+// when code does not consist of whole instructions.
+func insnOffsets(code []byte) ([]uint8, bool) {
+	var offs []uint8
+	for pos := 0; pos < len(code); {
+		inst, err := decodeX86(code[pos:])
+		if err != nil || inst.Op == 0 || inst.Len == 0 || pos+inst.Len > len(code) {
+			return nil, false
+		}
+		offs = append(offs, uint8(pos))
+		pos += inst.Len
+	}
+	return offs, true
 }
 
 // rel32 returns the displacement of a rel32 jump whose next instruction is at
@@ -606,30 +766,208 @@ func encodeWinGSMovSlot(buf []byte, slotVA, site uint64, siteLen int, p gsMovPla
 	return nil
 }
 
-// relocatable reports whether an instruction keeps its meaning when it moves
-// to another address. A branch, a call, a return, and an instruction with a
-// RIP-relative operand depend on the address. A system call instruction or an
-// interrupt would reach the engine again. An operand with a segment override
-// stays in place, because Windows can reset the FS base while the slot runs,
-// and the engine repairs the base only for faults in guest pages.
-func relocatable(inst x86asm.Inst) bool {
+// relocClass names how an instruction moves into a slot.
+type relocClass uint8
+
+const (
+	// relocNone means that the instruction cannot move.
+	relocNone relocClass = iota
+	// relocCopy means that the bytes keep their meaning at another address.
+	relocCopy
+	// relocRIP means that the instruction has a RIP-relative operand. The move
+	// adjusts the 32-bit displacement and keeps the length.
+	relocRIP
+	// relocJcc means a conditional branch with a rel8 or rel32 target. The move
+	// re-encodes it as `0F 8x rel32` to the original target.
+	relocJcc
+	// relocJmp means an unconditional JMP with a rel8 or rel32 target. The move
+	// re-encodes it as `E9 rel32` to the original target.
+	relocJmp
+)
+
+// movesBeforeSyscall reports whether an instruction of the class can move to a
+// pre-window slot. The slot runs the instructions in front of the SYSCALL, and
+// a branch there leaves the window while the SYSCALL has not run.
+func (c relocClass) movesBeforeSyscall() bool { return c == relocCopy || c == relocRIP }
+
+// size returns the length in bytes of an instruction of origLen bytes after
+// the move.
+func (c relocClass) size(origLen int) int {
+	switch c {
+	case relocJcc:
+		return 6
+	case relocJmp:
+		return winJmpLen
+	}
+	return origLen
+}
+
+// classifyReloc decides how the instruction inst, which has the bytes code,
+// moves to another address. A call, a return, and the loop and JCXZ forms
+// depend on the address and have no `rel32` form, so they cannot move. A system
+// call instruction or an interrupt would reach the engine again. An operand with
+// a segment override stays in place, because Windows can reset the FS base while
+// the slot runs, and the engine repairs the base only for faults in guest pages.
+func classifyReloc(inst x86asm.Inst, code []byte) relocClass {
+	if class := classifyBranch(inst, code); class != relocNone {
+		return class
+	}
 	op := inst.Op.String()
 	for _, p := range []string{"J", "CALL", "LCALL", "LJMP", "RET", "LRET", "IRET", "INT", "SYSCALL", "SYSENTER", "SYSEXIT", "SYSRET", "LOOP", "XBEGIN", "HLT", "UD", "RDFSBASE", "RDGSBASE", "WRFSBASE", "WRGSBASE"} {
 		if strings.HasPrefix(op, p) {
-			return false
+			return relocNone
 		}
 	}
+	class := relocCopy
 	for _, arg := range inst.Args {
 		switch a := arg.(type) {
 		case x86asm.Rel:
-			return false
+			return relocNone
 		case x86asm.Mem:
-			if a.Base == x86asm.RIP || a.Segment != 0 {
-				return false
+			if a.Segment != 0 {
+				return relocNone
+			}
+			switch {
+			case a.Base == x86asm.RIP:
+				if inst.PCRel != 4 || inst.PCRelOff+inst.PCRel > inst.Len {
+					return relocNone
+				}
+				class = relocRIP
+			case a.Base == x86asm.EIP || a.Base == x86asm.IP:
+				// An address-size prefix makes the displacement relative to EIP, and
+				// the move would need a 32-bit wrap.
+				return relocNone
+			case a.Base == 0 && a.Index == 0 && hasVEXOpcode(code):
+				// x86asm leaves out the RIP base of a VEX or EVEX operand, so the
+				// decode cannot tell it from an absolute address.
+				return relocNone
 			}
 		}
 	}
-	return true
+	return class
+}
+
+// classifyBranch returns relocJcc or relocJmp for a branch in one of the four
+// forms that have a `rel32` encoding: Jcc rel8, Jcc rel32, JMP rel8, and JMP
+// rel32, with no prefix. It returns relocNone for any other instruction.
+func classifyBranch(inst x86asm.Inst, code []byte) relocClass {
+	if len(code) != inst.Len || len(inst.Args) == 0 {
+		return relocNone
+	}
+	if _, ok := inst.Args[0].(x86asm.Rel); !ok {
+		return relocNone
+	}
+	switch {
+	case inst.Len == 2 && code[0] >= 0x70 && code[0] <= 0x7F,
+		inst.Len == 6 && code[0] == 0x0F && code[1] >= 0x80 && code[1] <= 0x8F:
+		return relocJcc
+	case inst.Len == 2 && code[0] == 0xEB, inst.Len == winJmpLen && code[0] == 0xE9:
+		return relocJmp
+	}
+	return relocNone
+}
+
+// hasVEXOpcode reports whether the instruction in code has a VEX or EVEX
+// prefix after its legacy prefixes.
+func hasVEXOpcode(code []byte) bool {
+	for _, b := range code {
+		if b == 0xC4 || b == 0xC5 || b == 0x62 {
+			return true
+		}
+		if !isX86Prefix(b) {
+			return false
+		}
+	}
+	return false
+}
+
+// appendRelocated appends the instruction inst, which has the bytes code, as
+// it must read at newVA when its original address is origVA. A RIP-relative
+// operand keeps its target. A branch becomes the `rel32` form with its original
+// target. It fails when a displacement no longer fits in 32 bits.
+func appendRelocated(dst, code []byte, inst x86asm.Inst, class relocClass, origVA, newVA uint64) ([]byte, error) {
+	origNext := int64(origVA) + int64(inst.Len)
+	switch class {
+	case relocCopy:
+		return append(dst, code...), nil
+	case relocRIP:
+		start := len(dst)
+		dst = append(dst, code...)
+		disp := int64(int32(binary.LittleEndian.Uint32(code[inst.PCRelOff:])))
+		moved := disp + origNext - (int64(newVA) + int64(inst.Len))
+		if moved != int64(int32(moved)) {
+			return nil, fmt.Errorf("RIP-relative displacement %#x of the instruction at %#x does not fit at %#x", disp, origVA, newVA)
+		}
+		binary.LittleEndian.PutUint32(dst[start+inst.PCRelOff:], uint32(int32(moved)))
+		return dst, nil
+	case relocJcc, relocJmp:
+		target := origNext + int64(inst.Args[0].(x86asm.Rel))
+		size := class.size(inst.Len)
+		moved := target - (int64(newVA) + int64(size))
+		if moved != int64(int32(moved)) {
+			return nil, fmt.Errorf("branch at %#x to %#x does not reach from %#x", origVA, uint64(target), newVA)
+		}
+		if class == relocJmp {
+			dst = append(dst, 0xE9)
+		} else {
+			cc := code[0] & 0x0F
+			if code[0] == 0x0F {
+				cc = code[1] & 0x0F
+			}
+			dst = append(dst, 0x0F, 0x80|cc)
+		}
+		return binary.LittleEndian.AppendUint32(dst, uint32(int32(moved))), nil
+	}
+	return nil, fmt.Errorf("instruction at %#x cannot move", origVA)
+}
+
+// relocateInstructions returns the whole instructions in code, which sit at the
+// address origVA, as they must read at the address newVA. With branches false,
+// a branch cannot move.
+func relocateInstructions(code []byte, origVA, newVA uint64, branches bool) ([]byte, error) {
+	var out []byte
+	for pos := 0; pos < len(code); {
+		inst, err := decodeX86(code[pos:])
+		if err != nil || inst.Op == 0 || inst.Len == 0 || pos+inst.Len > len(code) {
+			return nil, fmt.Errorf("bytes % x at %#x are not a whole instruction", code[pos:], origVA+uint64(pos))
+		}
+		raw := code[pos : pos+inst.Len]
+		class := classifyReloc(inst, raw)
+		if class == relocNone || (!branches && !class.movesBeforeSyscall()) {
+			return nil, fmt.Errorf("instruction % x at %#x cannot move into the slot", raw, origVA+uint64(pos))
+		}
+		out, err = appendRelocated(out, raw, inst, class, origVA+uint64(pos), newVA+uint64(len(out)))
+		if err != nil {
+			return nil, err
+		}
+		pos += inst.Len
+	}
+	return out, nil
+}
+
+// isX86Prefix reports whether b is a legacy instruction prefix or a REX prefix.
+func isX86Prefix(b byte) bool {
+	if b >= 0x40 && b <= 0x4F {
+		return true
+	}
+	switch b {
+	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
+		return true
+	}
+	return false
+}
+
+// hasPrefixBefore reports whether the byte in front of page[off] is an
+// instruction prefix, a legacy prefix or REX.
+func hasPrefixBefore(before, page []byte, off int) bool {
+	switch {
+	case off > 0:
+		return isX86Prefix(page[off-1])
+	case len(before) > 0:
+		return isX86Prefix(before[len(before)-1])
+	default:
+		return false
+	}
 }
 
 // noReturnSyscallSetup reports whether inst loads a system call number that
@@ -709,6 +1047,33 @@ func (p *jmpPlanner) precededByNoReturn(end int) bool {
 	return false
 }
 
+// planReject names the reason why a SYSCALL keeps its INT3 trap.
+type planReject uint8
+
+const (
+	// planOK means that the planner found a patch.
+	planOK planReject = iota
+	// planPageEdge means that the bytes that the JMP needs leave the page.
+	planPageEdge
+	// planNotRelocatable means that an instruction that the JMP overwrites
+	// cannot move, or does not decode.
+	planNotRelocatable
+	// planNoReturn means that the preceding instruction loads the number of a
+	// system call that never returns.
+	planNoReturn
+	// planBranchTarget means that a relative branch lands inside the bytes that
+	// the JMP overwrites.
+	planBranchTarget
+	// planPrefix means that a prefix byte stands in front of the SYSCALL.
+	planPrefix
+
+	planRejects
+)
+
+var planRejectNames = [planRejects]string{"ok", "page edge", "not relocatable", "no-return call", "branch target", "prefix"}
+
+func (r planReject) String() string { return planRejectNames[r] }
+
 // plan decides whether the SYSCALL at page[off] can become a JMP rel32. It
 // returns the bytes to relocate into the slot, which are the whole
 // instructions that start behind the SYSCALL and cover at least three bytes.
@@ -719,39 +1084,213 @@ func (p *jmpPlanner) precededByNoReturn(end int) bool {
 // decodes in the page or in the neighbor bytes lands inside the bytes that the
 // JMP overwrites. A branch from another page or an indirect jump can still land
 // there. The patcher cannot see those, and it accepts the risk that the amd64
-// scan already accepts for the bytes of the SYSCALL itself.
-func (p *jmpPlanner) plan(off int) ([]byte, bool) {
+// scan already accepts for the bytes of the SYSCALL itself. The reason of a
+// failure is the second result.
+func (p *jmpPlanner) plan(off int) ([]byte, planReject) {
 	page := p.page
 	if off < 0 || off+winJmpLen > len(page) {
-		return nil, false
+		return nil, planPageEdge
 	}
 	var reloc []byte
+	moved := 0
 	pos := off + winSiteLen
 	for len(reloc) < winMinRelocated {
 		if pos >= len(page) {
-			return nil, false
+			return nil, planPageEdge
 		}
 		inst, err := decodeX86(page[pos:])
-		if err != nil || inst.Op == 0 || inst.Len == 0 || pos+inst.Len > len(page) || !relocatable(inst) {
-			return nil, false
+		if err != nil || inst.Op == 0 || inst.Len == 0 || pos+inst.Len > len(page) {
+			return nil, planNotRelocatable
 		}
+		class := classifyReloc(inst, page[pos:pos+inst.Len])
+		switch class {
+		case relocNone:
+			return nil, planNotRelocatable
+		case relocJcc, relocJmp:
+			// The slot jumps to the original target. A target inside the bytes
+			// that the JMP overwrites would run the JMP bytes as code.
+			if target := pos + inst.Len + int(inst.Args[0].(x86asm.Rel)); target > off && target < off+winJmpLen {
+				return nil, planBranchTarget
+			}
+			// An unconditional jump ends the slot, and the bytes behind it can
+			// be the target of a branch from another page. The JMP of the patch
+			// must not overwrite them, so the jump must end at or behind the end of
+			// the patch.
+			if class == relocJmp && len(reloc)+inst.Len < winMinRelocated {
+				return nil, planNotRelocatable
+			}
+		}
+		moved += class.size(inst.Len)
 		reloc = append(reloc, page[pos:pos+inst.Len]...)
 		pos += inst.Len
 	}
-	if len(reloc) > winMaxRelocated {
-		return nil, false
+	if moved > winMaxRelocated {
+		return nil, planNotRelocatable
 	}
 	p.scan()
 	start := len(p.before) + off
 	if p.precededByNoReturn(start) {
-		return nil, false
+		return nil, planNoReturn
 	}
 	for t := start + 1; t < start+winJmpLen; t++ {
 		if p.target[t] {
-			return nil, false
+			return nil, planBranchTarget
 		}
 	}
-	return reloc, true
+	return reloc, planOK
+}
+
+// preWindowStart returns the buffer position of the first instruction of the
+// window that ends at the buffer position site. The window is the fewest whole
+// instructions that cover at least winJmpLen bytes.
+//
+// The decoder cannot run backward, so winPreSweeps linear sweeps start at
+// consecutive bytes before the site. A sweep votes when it reaches the site
+// exactly, which means that the site is an instruction boundary for it. At
+// least winPreAgree sweeps must agree on the first instruction of the window.
+func (p *jmpPlanner) preWindowStart(site int) (int, bool) {
+	type vote struct{ start, n int }
+	var votes [winPreSweeps]vote
+	nvotes := 0
+	// lens caches the instruction length at each position before the site.
+	// Zero is unknown, and -1 is a byte that does not start an instruction.
+	var lens [winPreSweepBack]int8
+	first := site - winPreSweepBack
+	prev := -1
+	for k := 0; k < winPreSweeps; k++ {
+		from := max(first+k, 0)
+		if from == prev {
+			continue
+		}
+		prev = from
+		cand := -1
+		pos := from
+		for pos < site {
+			if pos <= site-winJmpLen {
+				cand = pos
+			}
+			l := &lens[pos-first]
+			if *l == 0 {
+				inst, err := decodeX86(p.buf[pos:])
+				if err != nil || inst.Op == 0 || inst.Len == 0 {
+					*l = -1
+				} else {
+					*l = int8(inst.Len)
+				}
+			}
+			pos += max(int(*l), 1)
+		}
+		if pos != site || cand < 0 {
+			continue
+		}
+		i := 0
+		for i < nvotes && votes[i].start != cand {
+			i++
+		}
+		if i == nvotes {
+			votes[i].start = cand
+			nvotes++
+		}
+		votes[i].n++
+	}
+	for _, v := range votes[:nvotes] {
+		if v.n >= winPreAgree {
+			return v.start, true
+		}
+	}
+	return 0, false
+}
+
+// planBefore decides whether the SYSCALL at page[off] can keep its INT3 trap
+// while a JMP rel32 replaces the instructions in front of it. It returns the
+// page offset of the JMP and the bytes of the instructions that the JMP
+// overwrites, which the slot runs before it enters the spill routine.
+//
+// The plan succeeds only when all of these hold:
+//
+//   - At least winPreAgree decode sweeps agree on the instruction boundaries
+//     and reach the SYSCALL exactly.
+//   - The instructions cover winJmpLen to winPreMaxRelocated bytes.
+//   - The first instruction and the byte behind the SYSCALL lie in the page.
+//   - Every instruction can move to another address.
+//   - No relative branch that decodes in the page or in the neighbor bytes
+//     lands inside the window, except at its first byte.
+//
+// A branch to the SYSCALL meets its INT3 trap, which stays correct. The bytes
+// behind the SYSCALL do not change, so the plan needs no check of them. The
+// caller checks that the window does not overlap another patch, and that no
+// prefix stands in front of the SYSCALL.
+func (p *jmpPlanner) planBefore(off int) (int, []byte, bool) {
+	if off < 0 || off+winSiteLen >= len(p.page) {
+		return 0, nil, false
+	}
+	p.scan()
+	site := len(p.before) + off
+	start, ok := p.preWindowStart(site)
+	if !ok || start < len(p.before) || site-start < winJmpLen || site-start > winPreMaxRelocated {
+		return 0, nil, false
+	}
+	for pos := start; pos < site; {
+		inst, err := decodeX86(p.buf[pos:site])
+		if err != nil || inst.Op == 0 || inst.Len == 0 || !classifyReloc(inst, p.buf[pos:pos+inst.Len]).movesBeforeSyscall() {
+			return 0, nil, false
+		}
+		pos += inst.Len
+	}
+	for t := start + 1; t < site; t++ {
+		if p.target[t] {
+			return 0, nil, false
+		}
+	}
+	return start - len(p.before), append([]byte(nil), p.buf[start:site]...), true
+}
+
+// planKind names how patchPage patches a SYSCALL site.
+type planKind uint8
+
+const (
+	// planTrap keeps the INT3 trap. The debugger serves the system call.
+	planTrap planKind = iota
+	// planPost replaces the SYSCALL and the bytes behind it with a JMP.
+	planPost
+	// planPre replaces the instructions in front of the SYSCALL with a JMP and
+	// keeps the INT3 trap at the SYSCALL.
+	planPre
+)
+
+func (k planKind) String() string { return [...]string{"trap", "post", "pre"}[k] }
+
+// sitePlan is the result of planSite.
+type sitePlan struct {
+	kind planKind
+	// reject is the reason why the post plan failed. It is planOK for planPost.
+	reject planReject
+	// reloc holds the instructions that the slot runs. They follow the SYSCALL
+	// for planPost and end at the SYSCALL for planPre.
+	reloc []byte
+	// start is the page offset of the JMP of a planPre.
+	start int
+}
+
+// planSite decides how to patch the SYSCALL at page[off]. The post plan, which
+// keeps the current behavior of every site that it patches, comes first. The
+// pre plan applies only when the post plan fails. floor is the lowest page
+// offset that a pre plan can overwrite, because the bytes below it belong to
+// another site.
+func (p *jmpPlanner) planSite(off, floor int) sitePlan {
+	if hasPrefixBefore(p.before, p.page, off) {
+		// A prefix applies to the instruction at the JMP, or becomes a part of
+		// the instruction that ends at the SYSCALL.
+		return sitePlan{kind: planTrap, reject: planPrefix}
+	}
+	reloc, reject := p.plan(off)
+	if reject == planOK {
+		return sitePlan{kind: planPost, reloc: reloc}
+	}
+	if start, reloc, ok := p.planBefore(off); ok && start >= floor {
+		return sitePlan{kind: planPre, reject: reject, reloc: reloc, start: start}
+	}
+	return sitePlan{kind: planTrap, reject: reject}
 }
 
 // canReplaceInPlace reports whether a siteLen-byte instruction at offset off in
@@ -777,7 +1316,8 @@ func (p *jmpPlanner) canReplaceInPlace(off, siteLen int) bool {
 // planJmpPatch plans one site. A caller with many sites in one page uses a
 // jmpPlanner, which decodes the page once.
 func planJmpPatch(before, page, after []byte, off int) ([]byte, bool) {
-	return newJmpPlanner(before, page, after).plan(off)
+	reloc, reject := newJmpPlanner(before, page, after).plan(off)
+	return reloc, reject == planOK
 }
 
 // probeProgram returns the guest code of Probe: calls system calls with

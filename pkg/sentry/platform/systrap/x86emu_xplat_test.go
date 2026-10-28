@@ -45,6 +45,10 @@ type x86Machine struct {
 	onFence func(m *x86Machine)
 	onCall  func(m *x86Machine, target uint64)
 
+	// tsc is the time stamp counter. Each RDTSC returns it and then adds one, so
+	// a spin window of n ticks lasts n polls.
+	tsc uint64
+
 	pauses, fences, steps int
 	exit                  x86Exit
 }
@@ -141,7 +145,9 @@ func (m *x86Machine) memAddr(mem x86asm.Mem) (uint64, error) {
 // operandAddr resolves a memory operand of the instruction that ends at next.
 func (m *x86Machine) operandAddr(mem x86asm.Mem, next uint64) (uint64, error) {
 	if mem.Base == x86asm.RIP {
-		return next + uint64(mem.Disp), nil
+		// The hardware sign-extends the 32-bit displacement. x86asm reports a
+		// negative displacement as a large positive value.
+		return next + uint64(int64(int32(mem.Disp))), nil
 	}
 	return m.memAddr(mem)
 }
@@ -294,6 +300,34 @@ func (m *x86Machine) step(inst x86asm.Inst) (done bool, err error) {
 			return false, err
 		}
 		return false, m.setValue(args[0], size, v, next)
+	case "RDTSC":
+		m.r[0], m.r[2] = m.tsc&0xFFFFFFFF, m.tsc>>32
+		m.tsc++
+		return false, nil
+	case "SHL":
+		a, err := m.value(args[0], 8, next)
+		if err != nil {
+			return false, err
+		}
+		imm, ok := args[1].(x86asm.Imm)
+		if !ok {
+			return false, fmt.Errorf("shift count %v", args[1])
+		}
+		return false, m.setValue(args[0], 8, a<<uint(imm), next)
+	case "OR", "ADD":
+		size := operandSize(inst)
+		a, err := m.value(args[0], size, next)
+		if err != nil {
+			return false, err
+		}
+		b, err := m.value(args[1], size, next)
+		if err != nil {
+			return false, err
+		}
+		if op == "OR" {
+			return false, m.setValue(args[0], size, a|b, next)
+		}
+		return false, m.setValue(args[0], size, a+b, next)
 	case "LEA":
 		mem, ok := args[1].(x86asm.Mem)
 		if !ok {

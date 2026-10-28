@@ -157,6 +157,10 @@ func TestPullAndRunRegistryImage(t *testing.T) {
 		t.Fatalf("rungv pull -arch=s390x = (code %d, stderr %q), want 1", code, stderr)
 	}
 
+	// macOS runs guests on the hypervisor only. Windows falls back to systrap.
+	if runtime.GOOS == "darwin" {
+		hvtest.Require(t)
+	}
 	code, stdout, stderr = runCLI(t, "run", "-lockdown=false", "-net=none",
 		"-cache-dir="+cacheDir, "-registry-url="+baseURL, "-image=gvx/cli:1", "--", "/bin/cat", "/etc/marker")
 	if code != 0 || stdout != "host-arch\n" {
@@ -176,9 +180,6 @@ func TestRunPlatformSystrap(t *testing.T) {
 
 	if !systraptest.Available(t) {
 		want := "unavailable"
-		if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-			want = "pagesize_16k"
-		}
 		if code != 1 || stdout != "" || !strings.Contains(stderr, want) {
 			t.Fatalf("rungv run -platform=systrap = (code %d, stdout %q, stderr %q), want (1, empty, error containing %q)", code, stdout, stderr, want)
 		}

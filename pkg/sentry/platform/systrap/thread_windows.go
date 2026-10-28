@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,15 @@ func newThread(sp *stubProc, h windows.Handle, tid uint32) *thread {
 // waitEvent blocks until the debugger delivers an exception, the stub dies, or
 // limit passes. A zero limit waits without a time limit.
 func (th *thread) waitEvent(limit time.Duration) (debugEvent, error) {
+	return th.waitEventUntil(limit, nil)
+}
+
+// errWaitAborted is the result of waitEventUntil when abort closes first.
+var errWaitAborted = errors.New("the wait for the event was aborted")
+
+// waitEventUntil is waitEvent that also returns errWaitAborted when abort
+// closes. A nil abort never closes.
+func (th *thread) waitEventUntil(limit time.Duration, abort <-chan struct{}) (debugEvent, error) {
 	var timeout <-chan time.Time
 	if limit > 0 {
 		t := time.NewTimer(limit)
@@ -111,6 +121,8 @@ func (th *thread) waitEvent(limit time.Duration) (debugEvent, error) {
 		default:
 		}
 		return debugEvent{}, th.sp.deathError()
+	case <-abort:
+		return debugEvent{}, errWaitAborted
 	case <-timeout:
 		return debugEvent{}, fmt.Errorf("no stop within %v", limit)
 	}

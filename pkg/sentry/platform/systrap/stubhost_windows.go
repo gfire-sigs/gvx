@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -104,6 +105,7 @@ type stubHostLoop struct {
 // runStubHost serves requests until the Sentry closes the pipe. It returns the
 // process exit code.
 func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
+	tStart := time.Now()
 	h := &stubHostLoop{jobs: make(map[uint32]windows.Handle), procs: make(map[uint32]windows.Handle)}
 	sentry, err := windows.OpenProcess(windows.PROCESS_DUP_HANDLE, false, sentryPID)
 	if err != nil {
@@ -114,9 +116,21 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 4
 	}
+	tToken := time.Now()
 	h.token, h.level, err = buildStubToken()
 	if err != nil {
 		return 5
+	}
+	if traceWatch {
+		// The age is the time from the creation of the process to this point. It
+		// covers the kernel, the loader, the Go runtime, and the package inits.
+		var created, exited, kernel, user windows.Filetime
+		age := float64(-1)
+		if windows.GetProcessTimes(windows.CurrentProcess(), &created, &exited, &kernel, &user) == nil {
+			age = float64(time.Now().UnixNano()-created.Nanoseconds()) / 1e6
+		}
+		fmt.Fprintf(os.Stderr, "systrap: stub host ms: age at start %.1f, token %.1f, setup %.1f\n",
+			age, float64(time.Since(tToken))/1e6, float64(time.Since(tStart))/1e6)
 	}
 	// The first reply tells the Sentry that the host is ready.
 	if err := writeHostReply(out, 0, nil, h.level); err != nil {
@@ -524,14 +538,20 @@ func spawnStubHost(debug windows.Handle) (*stubHost, error) {
 	if err != nil {
 		return nil, err
 	}
+	tStart := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start the stub host: %w", err)
 	}
+	tStarted := time.Now()
 	h := &stubHost{cmd: cmd, in: in, out: out}
 	var rsp [hostRspSize]byte
 	if _, err := io.ReadFull(out, rsp[:]); err != nil {
 		_ = h.close()
 		return nil, fmt.Errorf("the stub host did not report ready: %w", err)
+	}
+	if traceWatch {
+		fmt.Fprintf(os.Stderr, "systrap: spawn ms: CreateProcess %.1f, wait for ready %.1f\n",
+			float64(tStarted.Sub(tStart))/1e6, float64(time.Since(tStarted))/1e6)
 	}
 	if binary.LittleEndian.Uint32(rsp[0:]) != hostMagic || binary.LittleEndian.Uint32(rsp[4:]) != 0 {
 		_ = h.close()

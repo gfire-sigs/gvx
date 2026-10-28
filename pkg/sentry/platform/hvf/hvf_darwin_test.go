@@ -475,6 +475,55 @@ func TestInterruptStormKeepsCountersConsistent(t *testing.T) {
 	}
 }
 
+// TestInterruptDuringSyscallExitIsNotReplayed interrupts a guest that makes
+// system calls in a loop, then redirects it to a handler as signal delivery
+// does. An interruption inside the EL1 stub must not leave the stub exit for a
+// later entry to replay against the new state. A replayed exit skips the
+// handler, so X2 keeps its old value.
+func TestInterruptDuringSyscallExitIsNotReplayed(t *testing.T) {
+	const handlerAddr = guestCodeAddr + 0x10
+	plat := newTestPlatform(t)
+	// The loop adds one to X1 and makes a system call. The handler sets X2 and
+	// makes a system call.
+	g := newGuest(t, plat,
+		insnAddX1One, insnSVC0, 0x17fffffe, // ADD X1,X1,#1; SVC #0; B .-8
+		0xd503201f,                         // NOP.
+		movz(2, 0x77), insnSVC0, insnBSelf, // Handler: MOV X2,#0x77; SVC #0; B .
+	)
+	for i := range 300 {
+		g.ac.SetIP(uintptr(guestCodeAddr))
+		res := make(chan switchResult, 1)
+		go func() {
+			// Each system call of the loop returns to here. Only an interruption
+			// or a signal ends the run.
+			for {
+				sig, at, err := g.switchOnce()
+				if sig != nil || err != nil {
+					res <- switchResult{sig, at, err}
+					return
+				}
+			}
+		}()
+		waitInGuest(t, g.ctx)
+		g.ctx.Interrupt()
+		got := receive(t, res)
+		if !errors.Is(got.err, platform.ErrContextInterrupt) {
+			t.Fatalf("iteration %d: Switch = (%v, %v), want ErrContextInterrupt", i, got.sig, got.err)
+		}
+		g.regs().Regs[2] = 0
+		g.ac.SetIP(uintptr(handlerAddr))
+		if sig, _, err := g.switchOnce(); sig != nil || err != nil {
+			t.Fatalf("iteration %d: Switch to the handler = (%v, %v), want a system call", i, sig, err)
+		}
+		if x2 := g.regs().Regs[2]; x2 != 0x77 {
+			t.Fatalf("iteration %d: X2 = %#x, want 0x77: the handler did not run", i, x2)
+		}
+		if want := uintptr(handlerAddr) + 8; g.ac.IP() != want {
+			t.Fatalf("iteration %d: IP = %#x, want %#x after the handler's system call", i, g.ac.IP(), want)
+		}
+	}
+}
+
 func TestFaultsReportSignalAndAccess(t *testing.T) {
 	plat := newTestPlatform(t)
 	cases := []struct {
