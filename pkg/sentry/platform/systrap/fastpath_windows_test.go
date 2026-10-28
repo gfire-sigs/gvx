@@ -429,40 +429,28 @@ func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, live bool, dela
 }
 
 // BenchmarkFastPathSpinSweep shows how the spin windows decide between the
-// spin path and the event path. Each case sets the number of polls of the
-// Sentry and of the stub, and the time that the Sentry holds the trap before it
+// spin path and the event path. Each case sets the window of the stub and of the
+// Sentry in microseconds, and the time that the Sentry holds the trap before it
 // answers. The work stands for the time that the Sentry needs to serve a real
 // system call. The metrics sentry-sleeps/op and stub-wakes/op count the round
 // trips in which a side gave up polling and used an event. A zero count means
 // that the spin windows covered the other side.
 //
-// The windows are loop counts, so their length in time depends on the cost of
-// one poll. A pause instruction on x86 takes tens of cycles. A yield instruction
-// on arm64 can take one. The sweep therefore reads differently on each
-// architecture.
-//
 // go test -run '^$' -bench BenchmarkFastPathSpinSweep -benchtime 1s ./pkg/sentry/platform/systrap/
 func BenchmarkFastPathSpinSweep(b *testing.B) {
-	type spin struct{ sentry, stub int }
-	spins := []spin{{512, 1024}, {4096, 1024}, {512, 16384}, {4096, 16384}, {32768, 60000}}
+	type spin struct{ stubUs, sentryUs float64 }
+	spins := []spin{{0, 0}, {1, 1}, {16, 1}, {16, 8}, {64, 8}, {256, 32}}
 	for _, work := range []time.Duration{0, 5 * time.Microsecond, 50 * time.Microsecond} {
 		for _, s := range spins {
-			name := fmt.Sprintf("work=%v/sentry=%d/stub=%d", work, s.sentry, s.stub)
-			b.Run(name, func(b *testing.B) { benchmarkSpinSweep(b, s.sentry, s.stub, work) })
+			name := fmt.Sprintf("work=%v/stub=%gus/sentry=%gus", work, s.stubUs, s.sentryUs)
+			b.Run(name, func(b *testing.B) { benchmarkSpinSweep(b, s.stubUs, s.sentryUs, work) })
 		}
 	}
 }
 
-func benchmarkSpinSweep(b *testing.B, sentry, stub int, work time.Duration) {
-	prev := sentrySpin
-	sentrySpin = sentry
-	b.Cleanup(func() { sentrySpin = prev })
+func benchmarkSpinSweep(b *testing.B, stubUs, sentryUs float64, work time.Duration) {
+	b.Setenv(spinEnv, fmt.Sprintf("%g,%g", stubUs, sentryUs))
 	p := newFastPlatform(b)
-	sc, err := buildSpillWith(spillOptions{spinStub: stub})
-	if err != nil {
-		b.Fatal(err)
-	}
-	p.spill = sc
 	r := newRig(b, p)
 	r.program(gSyscall(1), gJump(codeVA))
 	si, _, err := r.run()
@@ -493,62 +481,48 @@ func benchmarkSpinSweep(b *testing.B, sentry, stub int, work time.Duration) {
 	b.ReportMetric(float64(f.slot.wakes.Load()-wakes0)/n, "stub-wakes/op")
 }
 
-// BenchmarkSpinWindowDuration measures how long the spin windows last in time.
-// The stub window is the time from the trap to the moment that the stub sets
-// StubWaiter, with a Sentry that does not answer. The Sentry window is the time
-// that await polls before it sleeps. Both are loop counts, so the time depends
-// on the cost of one poll on the host. The metrics are ns/window.
+// BenchmarkSpinWindowDuration measures how long the spin windows last. The
+// Sentry window is the time that await polls before it sleeps. The stub window
+// is the time from the moment that the Sentry sees the trap to the moment that
+// the stub sets StubWaiter, so it is shorter by the latency of the Sentry. The
+// metric is ns/window, and the window should match the setting.
 func BenchmarkSpinWindowDuration(b *testing.B) {
 	freq := sentrytime.CounterFrequencyHz()
-	b.Run("stub", func(b *testing.B) {
-		for _, polls := range []int{winSpinStub, 16384} {
-			b.Run(fmt.Sprintf("polls=%d", polls), func(b *testing.B) {
-				p := newFastPlatform(b)
-				sc, err := buildSpillWith(spillOptions{spinStub: polls})
-				if err != nil {
-					b.Fatal(err)
-				}
-				p.spill = sc
-				r := newRig(b, p)
-				r.program(gSyscall(1), gJump(codeVA))
+	for _, us := range []float64{1, 16, 64} {
+		b.Run(fmt.Sprintf("stub/%gus", us), func(b *testing.B) {
+			b.Setenv(spinEnv, fmt.Sprintf("%g,0", us))
+			p := newFastPlatform(b)
+			r := newRig(b, p)
+			r.program(gSyscall(1), gJump(codeVA))
+			si, _, err := r.run()
+			mustSyscall(b, si, err, 1, r.ac)
+			f := fastStats(b, r)
+			var total uint64
+			for range b.N {
+				setRet(r.ac, 0)
 				si, _, err := r.run()
-				mustSyscall(b, si, err, 1, r.ac)
-				f := fastStats(b, r)
-				var total uint64
-				for range b.N {
-					setRet(r.ac, 0)
-					// Resume, wait for the next trap, and leave the stub trapped. The
-					// Sentry then polls StubWaiter and times the window.
-					si, _, err := r.run()
-					if si != nil || err != nil {
-						b.Fatalf("Switch = (%s, %v)", describe(si), err)
-					}
-					start := sentrytime.ReadCounterTicks()
-					for f.slot.sm.stubWaiter().Load() == 0 {
-					}
-					total += sentrytime.ReadCounterTicks() - start
-					// The stub sleeps now. Run does not wake an asleep stub without the
-					// event, which the next resume sets.
+				if si != nil || err != nil {
+					b.Fatalf("Switch = (%s, %v)", describe(si), err)
 				}
-				b.ReportMetric(float64(total)*1e9/float64(freq)/float64(b.N), "ns/window")
-			})
-		}
-	})
-	b.Run("sentry", func(b *testing.B) {
-		for _, polls := range []int{winSpinSentry, 4096} {
-			b.Run(fmt.Sprintf("polls=%d", polls), func(b *testing.B) {
-				var h winSysmsgHeader
-				pending := func() bool { return false }
-				var total uint64
-				for range b.N {
-					start := sentrytime.ReadCounterTicks()
-					_, _ = h.await(polls, errSignaler{}, pending)
-					total += sentrytime.ReadCounterTicks() - start
+				start := sentrytime.ReadCounterTicks()
+				for f.slot.sm.stubWaiter().Load() == 0 {
 				}
-				b.ReportMetric(float64(total)*1e9/float64(freq)/float64(b.N), "ns/window")
-			})
-		}
-	})
+				total += sentrytime.ReadCounterTicks() - start
+			}
+			b.ReportMetric(float64(total)*1e9/float64(freq)/float64(b.N), "ns/window")
+		})
+		b.Run(fmt.Sprintf("sentry/%gus", us), func(b *testing.B) {
+			var h winSysmsgHeader
+			spin := winSpin{ticks: uint64(us * spinTicksPerUs()), now: spinNow}
+			var total uint64
+			for range b.N {
+				start := sentrytime.ReadCounterTicks()
+				_, _ = h.await(spin, errSignaler{}, func() bool { return false })
+				total += sentrytime.ReadCounterTicks() - start
+			}
+			b.ReportMetric(float64(total)*1e9/float64(freq)/float64(b.N), "ns/window")
+		})
+	}
 }
 
 // errSignaler fails the first sleep, so await returns after its spin.

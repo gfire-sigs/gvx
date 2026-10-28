@@ -133,10 +133,6 @@ var fastTraps atomic.Uint64
 // shorter than the time the other side needs to answer.
 var fastSentrySleeps, fastStubWakes atomic.Uint64
 
-// sentrySpin is the number of polls of the Sentry before it sleeps. Only
-// the spin sweep benchmark changes it, and it does so while no guest runs.
-var sentrySpin = winSpinSentry
-
 // ---- platform --------------------------------------------------------------
 
 // prepareFast builds the spill routine and finds the ntdll functions that it
@@ -154,7 +150,12 @@ func (p *Platform) prepareFast() error {
 			return err
 		}
 	}
+	spin, err := newSpinWindows(spinTicksPerUs())
+	if err != nil {
+		return err
+	}
 	p.spill = sc
+	p.spin = spin
 	p.ntSetEvent = uint64(procNtSetEvent.Addr())
 	p.ntWait = uint64(procNtWaitForSingleObject.Addr())
 	p.fast = true
@@ -317,6 +318,7 @@ func (as *addressSpace) newSlot(idx int) (*fastSlot, error) {
 	s.sm.HostEvent = uint64(ev.stubHost)
 	s.sm.NtSetEvent = as.p.ntSetEvent
 	s.sm.NtWaitForSingleObject = as.p.ntWait
+	s.sm.SpinTicks = as.p.spin.stub
 	return s, nil
 }
 
@@ -333,6 +335,7 @@ func (sp *stubProc) putSlot(s *fastSlot) {
 	clear(s.sec.local[:winSysmsgSize])
 	s.sm.GuestEvent, s.sm.HostEvent = hdr.GuestEvent, hdr.HostEvent
 	s.sm.NtSetEvent, s.sm.NtWaitForSingleObject = hdr.NtSetEvent, hdr.NtWaitForSingleObject
+	s.sm.SpinTicks = hdr.SpinTicks
 	_ = windows.ResetEvent(s.guest)
 	_ = windows.ResetEvent(s.host)
 	sp.fast.free = append(sp.fast.free, s)
@@ -432,7 +435,7 @@ func (th *thread) waitNext() (ev debugEvent, trapped bool, err error) {
 		return ev, false, err
 	}
 	pending := func() bool { return th.evQueued.Load() > 0 || th.sp.dead.Load() }
-	res, err := f.slot.sm.winSysmsgHeader.await(sentrySpin, f.slot, pending)
+	res, err := f.slot.sm.winSysmsgHeader.await(winSpin{ticks: th.sp.p.spin.sentry, now: spinNow}, f.slot, pending)
 	if err != nil {
 		if th.sp.dead.Load() {
 			return debugEvent{}, false, th.sp.deathError()

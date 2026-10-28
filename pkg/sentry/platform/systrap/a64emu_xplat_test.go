@@ -43,6 +43,9 @@ type a64Machine struct {
 	mem map[uint64]byte
 
 	tpidr uint64
+	// cntvct is the virtual counter. Each read returns it and then adds one, so
+	// a spin window of n ticks lasts n polls.
+	cntvct uint64
 	// v holds V0 to V31 as two words each. fpsr and fpcr are the FP registers.
 	vec        [32][2]uint64
 	fpsr, fpcr uint64
@@ -64,6 +67,14 @@ type a64Exit struct {
 	brk int
 	// jump is the address of a BR that left the code.
 	jump uint64
+}
+
+// regOrImm returns the value of a register operand, or of an immediate.
+func (m *a64Machine) regOrImm(arg string) (uint64, error) {
+	if strings.HasPrefix(arg, "#") {
+		return m.imm(arg)
+	}
+	return m.getReg(arg)
 }
 
 func newA64Machine(code []byte, base uint64) *a64Machine {
@@ -316,6 +327,10 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		switch args[1] {
 		case "S3_3_C13_C0_2":
 			return false, m.setReg(args[0], m.tpidr)
+		case "S3_3_C14_C0_2", "CNTVCT_EL0":
+			v := m.cntvct
+			m.cntvct++
+			return false, m.setReg(args[0], v)
 		case "S3_3_C4_C4_1", "FPSR":
 			return false, m.setReg(args[0], m.fpsr)
 		case "S3_3_C4_C4_0", "FPCR":
@@ -450,7 +465,7 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		if err != nil {
 			return false, err
 		}
-		imm, err := m.imm(args[2])
+		imm, err := m.regOrImm(args[2])
 		if err != nil {
 			return false, err
 		}
@@ -478,7 +493,7 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		if err != nil {
 			return false, err
 		}
-		b, err := m.imm(immArg)
+		b, err := m.regOrImm(immArg)
 		if err != nil {
 			return false, err
 		}

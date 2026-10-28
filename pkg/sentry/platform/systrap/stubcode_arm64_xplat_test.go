@@ -49,7 +49,7 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{hvcommon.MRS(0, hvcommon.SysRegFPCR), "MRS X0, S3_3_C4_C4_0"},
 		{hvcommon.MSR(hvcommon.SysRegFPSR, 0), "MSR S3_3_C4_C4_1, X0"},
 		{hvcommon.MSR(hvcommon.SysRegFPCR, 0), "MSR S3_3_C4_C4_0, X0"},
-		{hvcommon.STPX(16, 14, 15, winOffX+8*14), "STP X14, X15, [X16,#184]"},
+		{hvcommon.STPX(16, 14, 15, winOffX+8*14), "STP X14, X15, [X16,#192]"},
 		{hvcommon.MOVReg(19, 16), "MOV X19, X16"},
 		{a64movFromSP(0), "MOV X0, SP"},
 		{a64movToSP(16), "MOV SP, X16"},
@@ -57,7 +57,9 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{hvcommon.MOVZ(1, 0), "MOV X1, #0x0"},
 		{hvcommon.MOVZW(20, 1024), "MOV W20, #0x400"},
 		{a64cmpW(0, 2), "CMP W0, #0x2"},
-		{a64subsW1(20), "SUBS W20, W20, #0x1"},
+		{a64addX(20, 1, 2), "ADD X20, X1, X2"},
+		{a64cmpX(1, 20), "CMP X1, X20"},
+		{a64MRSCNTVCT | 1, "MRS X1, S3_3_C14_C0_2"},
 		{hvcommon.BLR(9), "BLR X9"},
 		{hvcommon.BR(17), "BR X17"},
 		{a64DMBISH, "DMB ISH"},
@@ -106,6 +108,10 @@ const (
 	rigGuestX16 = 0x1616_1616_1616_1616
 	rigGuestX17 = 0x1717_1717_1717_1717
 
+	// rigSpinTicks is the spin window of the stub. The emulated counter advances
+	// one tick for each read, so the window lasts this many polls.
+	rigSpinTicks = 1024
+
 	rigGuestEv = 0xE1
 	rigHostEv  = 0xE2
 	rigSetEv   = 0xF100
@@ -152,6 +158,7 @@ func newSpillRigWith(t *testing.T, opts spillOptions) *spillRig {
 	m.put64(rigSysm+winOffHostEvent, rigHostEv)
 	m.put64(rigSysm+winOffNtSetEvent, rigSetEv)
 	m.put64(rigSysm+winOffNtWait, rigWaitFn)
+	m.put64(rigSysm+winOffSpinTicks, rigSpinTicks)
 	m.onCall = func(m *a64Machine, target uint64) {
 		if m.sp%16 != 0 || m.sp <= r.stackLow || m.sp > r.stackLow+winStubStackSize {
 			t.Errorf("call with sp %#x outside the stub stack [%#x, %#x] or unaligned", m.sp, r.stackLow, r.stackLow+winStubStackSize)
@@ -294,8 +301,8 @@ func TestSpillSleepsWhenSpinExpires(t *testing.T) {
 	if err := m.run(100000); err != nil {
 		t.Fatal(err)
 	}
-	if m.yields != winSpinStub {
-		t.Errorf("the stub polled %d times, want %d", m.yields, winSpinStub)
+	if m.yields != rigSpinTicks {
+		t.Errorf("the stub polled %d times, want %d", m.yields, rigSpinTicks)
 	}
 	if len(r.callLog) != 1 || r.callLog[0] != "wait" {
 		t.Fatalf("calls = %v, want one NtWaitForSingleObject", r.callLog)

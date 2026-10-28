@@ -63,8 +63,8 @@ func TestX86EncodersDecodeAsIntended(t *testing.T) {
 		{"load 32", enc(func(a *x86Asm) { a.movLoad32(x86RAX, x86R15, 0) }), "mov eax, dword ptr [r15]"},
 		{"store imm", enc(func(a *x86Asm) { a.movStoreImm32(x86R15, winOffStubWaiter, 1) }), "mov dword ptr [r15+0x8], 0x1"},
 		{"cmp imm8", enc(func(a *x86Asm) { a.cmpMemImm8(x86R15, winOffSentryWaiter, 0) }), "cmp dword ptr [r15+0x4], 0x0"},
-		{"push mem", enc(func(a *x86Asm) { a.pushMem(x86R15, winOffRflags) }), "push qword ptr [r15+0xc8]"},
-		{"pop mem", enc(func(a *x86Asm) { a.popMem(x86R15, winOffRflags) }), "pop qword ptr [r15+0xc8]"},
+		{"push mem", enc(func(a *x86Asm) { a.pushMem(x86R15, winOffRflags) }), "push qword ptr [r15+0xd0]"},
+		{"pop mem", enc(func(a *x86Asm) { a.popMem(x86R15, winOffRflags) }), "pop qword ptr [r15+0xd0]"},
 		{"call mem", enc(func(a *x86Asm) { a.callMem(x86R15, winOffNtWait) }), "call qword ptr [r15+0x28]"},
 		{"lea rsp", enc(func(a *x86Asm) { a.leaBase(x86RSP, x86R15, winStubStackTop) }), "lea rsp, ptr [r15+0x1fc0]"},
 		{"load gs", enc(func(a *x86Asm) { a.movLoadGS(x86RBX, winTEBScratchA) }), "mov rbx, qword ptr gs:[0x18]"},
@@ -132,6 +132,10 @@ const (
 	rigWaitFn  = 0xF200
 
 	rigFlags = 0x247
+
+	// rigSpinTicks is the spin window of the stub. The emulated TSC advances one
+	// tick for each read, so the window lasts this many polls.
+	rigSpinTicks = 1024
 )
 
 type spillRig struct {
@@ -192,6 +196,7 @@ func newSlotRig(t *testing.T, reloc []byte, pre bool, opts spillOptions) *spillR
 	m.put64(rigSysm+winOffHostEvent, rigHostEv)
 	m.put64(rigSysm+winOffNtSetEvent, rigSetEv)
 	m.put64(rigSysm+winOffNtWait, rigWaitFn)
+	m.put64(rigSysm+winOffSpinTicks, rigSpinTicks)
 	// The red zone below the guest stack pointer holds live data.
 	for i := uint64(1); i <= 128; i++ {
 		m.mem[rigGuestRSP-i] = byte(0xA0 + i)
@@ -368,8 +373,8 @@ func TestSpillSleepsWhenSpinExpires(t *testing.T) {
 	if err := m.run(100000); err != nil {
 		t.Fatal(err)
 	}
-	if m.pauses != winSpinStub {
-		t.Errorf("the stub polled %d times, want %d", m.pauses, winSpinStub)
+	if m.pauses != rigSpinTicks {
+		t.Errorf("the stub polled %d times, want %d", m.pauses, rigSpinTicks)
 	}
 	if len(r.callLog) != 1 || r.callLog[0] != "wait" {
 		t.Fatalf("calls = %v, want one NtWaitForSingleObject", r.callLog)

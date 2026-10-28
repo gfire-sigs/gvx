@@ -136,6 +136,12 @@ type winSysmsgHeader struct {
 	// the thread holds the address of this page, so the spill routine finds the
 	// page without a free register. A patched `mrs xN, tpidr_el0` loads this word.
 	TLS uint64
+	// SpinTicks is the number of cycle-counter ticks that the stub polls the
+	// handoff word before it sleeps. The counter is the TSC on amd64 and
+	// CNTVCT_EL0 on arm64. The Sentry converts the time of the window to ticks
+	// when it creates the slot. A window in time does not depend on the cost of
+	// one poll, which differs by 100 times between a pause on amd64 and a yield on arm64.
+	SpinTicks uint64
 }
 
 // Offsets inside the header. The spill routine encodes them.
@@ -151,14 +157,9 @@ const (
 	winOffTail         = 0x30
 	winOffTarget       = 0x38
 	winOffTLS          = 0x40
+	winOffSpinTicks    = 0x48
 	// winOffRegs is the offset of the register block.
-	winOffRegs = 0x48
-)
-
-// winSpinStub and winSpinSentry are the numbers of polls before a side sleeps.
-const (
-	winSpinStub   = 1024
-	winSpinSentry = 512
+	winOffRegs = 0x50
 )
 
 var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsgHeader{})-winOffRegs]
@@ -195,18 +196,6 @@ type spillOptions struct {
 	// did before the call flag and FPDirty. Only BenchmarkFastPathRoundTrip sets
 	// it, so that the benchmark compares both routines in one process on one host.
 	alwaysRestore bool
-	// spinStub is the number of polls of the stub before it sleeps. Zero means
-	// winSpinStub. Only the spin sweep benchmark sets it.
-	spinStub int
-}
-
-// stubSpin returns the number of polls that the generated routine makes before
-// it sleeps.
-func (o spillOptions) stubSpin() int {
-	if o.spinStub > 0 {
-		return o.spinStub
-	}
-	return winSpinStub
 }
 
 // winSignaler is the event pair behind one thread. The Windows engine backs
@@ -229,8 +218,16 @@ const (
 	winAwaitPending
 )
 
+// winSpin is the spin window of the Sentry. With now set, the window lasts
+// ticks of the counter that now reads. Without it, the window is polls polls.
+type winSpin struct {
+	polls int
+	ticks uint64
+	now   func() uint64
+}
+
 // await waits until the stub publishes winStateTrapped or pending reports
-// true. It polls spin times first, so a stub that answers within the window
+// true. It polls for the window first, so a stub that answers within the window
 // costs no kernel call. Then it sets SentryWaiter, tests both conditions
 // again, and sleeps on GuestEvent. The test after the flag closes the race
 // with a stub that published the state before it read the flag.
@@ -238,13 +235,33 @@ const (
 // pending runs on the polling path, so it must be cheap. A source of pending
 // must wake the sleeping side by setting GuestEvent after it sets the condition,
 // when it reads a non-zero SentryWaiter.
-func (h *winSysmsgHeader) await(spin int, sig winSignaler, pending func() bool) (winAwait, error) {
-	for range spin {
+func (h *winSysmsgHeader) await(spin winSpin, sig winSignaler, pending func() bool) (winAwait, error) {
+	poll := func() (winAwait, bool) {
 		if h.loadState() == winStateTrapped {
-			return winAwaitTrapped, nil
+			return winAwaitTrapped, true
 		}
 		if pending() {
-			return winAwaitPending, nil
+			return winAwaitPending, true
+		}
+		return 0, false
+	}
+	if spin.now == nil {
+		for range spin.polls {
+			if res, ok := poll(); ok {
+				return res, nil
+			}
+		}
+	} else if spin.ticks > 0 {
+		// The counter read costs more than a poll, so the loop reads it once for
+		// each 16 polls.
+		start := spin.now()
+		for i := 0; ; i++ {
+			if res, ok := poll(); ok {
+				return res, nil
+			}
+			if i&15 == 15 && spin.now()-start >= spin.ticks {
+				break
+			}
 		}
 	}
 	waiter := h.sentryWaiter()

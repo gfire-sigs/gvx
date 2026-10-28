@@ -77,7 +77,10 @@ type Platform struct {
 	fast bool
 	// spill is the spill routine of the fast path, and ntSetEvent and ntWait
 	// are the addresses of the ntdll functions that it calls.
-	spill      winSpillCode
+	spill winSpillCode
+	// spin holds the spin windows of the stub and of the Sentry in ticks of the
+	// cycle counter.
+	spin       spinWindows
 	ntSetEvent uint64
 	ntWait     uint64
 
@@ -131,6 +134,11 @@ func New() (*Platform, error) {
 func open(fast bool) (*Platform, error) {
 	t0 := time.Now()
 	configureOnce.Do(configureArch)
+	if fast {
+		// The calibration of the spin windows takes a few milliseconds. It runs
+		// while the stub host starts.
+		go spinTicksPerUs()
+	}
 	breakAddr, err := dbgBreakPointAddr()
 	if err != nil {
 		return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("ntdll!DbgBreakPoint is missing: %v", err)}

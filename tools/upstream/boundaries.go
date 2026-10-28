@@ -236,6 +236,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/ext4lite"}, "pkg/errors", "toLinuxErr finds the *errors.Error values that the engine returns"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache"}, "pkg/sentry/kernel/pipe", "mknod FIFO files open through the VFS pipe implementation"},
 	{[]string{"pkg/sentry/platform/systrap"}, "golang.org/x/sys/*", "host memory and subprocess APIs on Windows and macOS (SPEC section 3.3)"},
+	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/time", "the spin windows of the Windows fast path read the cycle counter and the performance counter"},
 	{[]string{"pkg/sentry/kernel"}, "pkg/hostarch", "addrhole_xplat.go lists the address holes of a platform as hostarch.AddrRange values"},
 
 	// pkg/gvx boots the Sentry. The kernel constructors take these types.
@@ -285,7 +286,6 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/hostlockdown", "a test proves that the host watcher keeps working after hostlockdown.Apply"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/waiter", "a FIFO test blocks inside the VFS through a context.Context.BlockOn method"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "a test pins that the vDSO image that the Sentry maps never names x18"},
-	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/time", "a benchmark reads the performance counter, because the runtime clock of Windows ticks every 0.5 ms"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {

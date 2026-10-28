@@ -34,7 +34,7 @@ import (
 //
 //	x16  sysmsg base at entry, until the routine copies it to x19
 //	x19  sysmsg base, a callee-saved register that the ntdll calls keep
-//	x20  poll counter
+//	x20  end of the spin window in CNTVCT_EL0 ticks
 //	x21  call flag: 0 after the save, 1 once the routine called into ntdll
 //	x9   call target
 //
@@ -53,8 +53,11 @@ import (
 const (
 	a64MRSNZCV = 0xd53b4200 // mrs xN, nzcv.
 	a64MSRNZCV = 0xd51b4200 // msr nzcv, xN.
-	a64DMBISH  = 0xd5033bbf
-	a64YIELD   = 0xd503203f
+	// a64MRSCNTVCT is `mrs xN, cntvct_el0` with N 0. The virtual counter ticks
+	// at CNTFRQ_EL0 and a program at EL0 can read it.
+	a64MRSCNTVCT = 0xd53be040
+	a64DMBISH    = 0xd5033bbf
+	a64YIELD     = 0xd503203f
 
 	a64CondNE = 1
 	a64CondHS = 2
@@ -72,6 +75,8 @@ func a64movToSP(rn uint32) uint32           { return 0x91000000 | rn<<5 | a64SP 
 func a64addSPShifted(rn, imm uint32) uint32 { return 0x91400000 | imm<<10 | rn<<5 | a64SP }
 func a64cmpW(rn, imm uint32) uint32         { return 0x7100001f | imm<<10 | rn<<5 }
 func a64subsW1(rd uint32) uint32            { return 0x71000400 | rd<<5 | rd }
+func a64addX(rd, rn, rm uint32) uint32      { return 0x8b000000 | rm<<16 | rn<<5 | rd }
+func a64cmpX(rn, rm uint32) uint32          { return 0xeb00001f | rm<<16 | rn<<5 }
 
 // a64Asm collects words and resolves branches to labels.
 type a64Asm struct {
@@ -231,11 +236,13 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		hvcommon.MOVZW(flag, 1),
 		hvcommon.BLR(tmp),
 	)
+	// Spin for SpinTicks ticks of CNTVCT_EL0. x20 holds the end of the window.
 	a.label("spin")
-	if opts.stubSpin() > 0xFFFF {
-		return winSpillCode{}, fmt.Errorf("stub spin %d does not fit a MOVZ immediate", opts.stubSpin())
-	}
-	a.emit(hvcommon.MOVZW(cnt, uint16(opts.stubSpin())))
+	a.emit(
+		a64MRSCNTVCT|1,
+		hvcommon.LDRX(base, 2, winOffSpinTicks),
+		a64addX(cnt, 1, 2),
+	)
 	a.label("poll")
 	a.emit(
 		a64ldarW(0, base),
@@ -244,9 +251,10 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	a.bCond(a64CondHS, "run")
 	a.emit(
 		a64YIELD,
-		a64subsW1(cnt),
+		a64MRSCNTVCT|1,
+		a64cmpX(1, cnt),
 	)
-	a.bCond(a64CondNE, "poll")
+	a.bCond(a64CondLO, "poll")
 	// Sleep until the Sentry sets HostEvent.
 	a.label("sleep")
 	a.emit(

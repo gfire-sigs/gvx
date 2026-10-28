@@ -244,6 +244,14 @@ func (a *x86Asm) jmpGS(abs uint32) {
 	a.imm32(abs)
 }
 
+// rdtsc is `rdtsc; shl rdx, 32; or rax, rdx`. It leaves the 64-bit TSC in RAX
+// and clobbers RDX.
+func (a *x86Asm) rdtsc() {
+	a.emit(0x0F, 0x31)
+	a.emit(0x48, 0xC1, 0xE2, 0x20)
+	a.emit(0x48, 0x09, 0xD0)
+}
+
 // movRegReg is `mov dst, src` for 64-bit registers.
 func (a *x86Asm) movRegReg(dst, src int) {
 	a.emit(x86Rex(true, src, dst), 0x89, 0xC0|byte(src&7)<<3|byte(dst&7))
@@ -305,7 +313,8 @@ func (c winSpillCode) coldExit() int {
 
 // buildSpill generates the spill routine.
 //
-// Register use after the save: R15 holds the sysmsg and RBX counts the polls.
+// Register use after the save: R15 holds the sysmsg and RBX holds the end of the
+// spin window in TSC ticks.
 // R14 is the call flag: it is 0 after the save, and 1 once the routine called
 // into ntdll. These registers are callee-saved in the Windows calling
 // convention, so the calls into ntdll keep them. The stack pointer lies 64
@@ -360,16 +369,19 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	a.imm32(1)
 	a.callMem(base, winOffNtSetEvent)
 
+	// Spin for SpinTicks ticks of the TSC. RBX holds the end of the window.
 	a.label("spin")
-	a.emit(0xBB)
-	a.imm32(uint32(opts.stubSpin())) // mov ebx, spin count
+	a.rdtsc()
+	a.memOp(true, []byte{0x03}, x86RAX, base, winOffSpinTicks) // add rax, [r15+SpinTicks]
+	a.movRegReg(x86RBX, x86RAX)
 	a.label("poll")
 	a.movLoad32(x86RAX, base, winOffState)
 	a.emit(0x83, 0xF8, byte(winStateRunHot)) // cmp eax, RunHot
 	a.jcc8(x86CCAE, "run")
 	a.emit(0xF3, 0x90) // pause
-	a.emit(0xFF, 0xCB) // dec ebx
-	a.jcc8(x86CCNE, "poll")
+	a.rdtsc()
+	a.emit(0x48, 0x39, 0xD8) // cmp rax, rbx
+	a.jcc8(x86CCB, "poll")
 
 	a.label("sleep")
 	a.movStoreImm32(base, winOffStubWaiter, 1)
