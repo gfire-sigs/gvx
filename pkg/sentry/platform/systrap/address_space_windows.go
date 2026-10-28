@@ -297,17 +297,47 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		}
 		return errAddressSpaceReleased
 	}
-	if err := as.win.Map(guest, fr.Length(), sec, secOff, viewProtFor(at)); err != nil {
-		if copied != nil {
-			copied.close()
+	// keep marks the blocks that an earlier call mapped from the same frame at
+	// the same file offset with the same access. The memory manager maps a whole
+	// mapping at each fault, so most blocks of the range are already mapped. A
+	// patched block holds a copy, a table of sites, and island slots. A new
+	// mapping would drop them while a thread of the guest can still trap at a
+	// site of the block.
+	nblk := int(fr.Length() / blockSize)
+	keep := make([]bool, nblk)
+	if at.Execute && copied == nil {
+		for i := range keep {
+			old := as.blocks[guest+uint64(i)*blockSize]
+			keep[i] = old != nil && old.src == srcs[i] && old.srcOff == secOff+uint64(i)*blockSize && old.at == at
 		}
-		return as.mapErr(fmt.Errorf("map [%#x, %#x): %w", guest, guest+fr.Length(), err))
+	}
+	for i := 0; i < nblk; {
+		if keep[i] {
+			i++
+			continue
+		}
+		j := i
+		for j < nblk && !keep[j] {
+			j++
+		}
+		start, length := guest+uint64(i)*blockSize, uint64(j-i)*blockSize
+		if err := as.win.Map(start, length, sec, secOff+uint64(i)*blockSize, viewProtFor(at)); err != nil {
+			if copied != nil {
+				copied.close()
+			}
+			return as.mapErr(fmt.Errorf("map [%#x, %#x): %w", start, start+length, err))
+		}
+		i = j
 	}
 	var hold *copyHold
 	if copied != nil {
-		hold = &copyHold{sec: copied, refs: int(fr.Length() / blockSize)}
+		hold = &copyHold{sec: copied, refs: nblk}
 	}
-	for i, base := 0, guest; base < guest+fr.Length(); i, base = i+1, base+blockSize {
+	for i := range nblk {
+		if keep[i] {
+			continue
+		}
+		base := guest + uint64(i)*blockSize
 		as.dropBlockLocked(base)
 		as.dropCopyLocked(base)
 		if hold != nil {
