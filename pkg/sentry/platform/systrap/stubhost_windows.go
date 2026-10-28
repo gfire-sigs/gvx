@@ -29,8 +29,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
-
-	"z.gfire.dev/gvx/internal/bootclock"
 )
 
 // The Sentry cannot start a process after hostlockdown.Apply, because the
@@ -131,12 +129,8 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 		if windows.GetProcessTimes(windows.CurrentProcess(), &created, &exited, &kernel, &user) == nil {
 			age = float64(time.Now().UnixNano()-created.Nanoseconds()) / 1e6
 		}
-		early := float64(-1)
-		if age >= 0 {
-			early = age - float64(time.Since(bootclock.Start))/1e6
-		}
-		fmt.Fprintf(os.Stderr, "systrap: stub host ms: age at start %.1f, age at the first init %.1f, token %.1f, setup %.1f\n",
-			age, early, float64(time.Since(tToken))/1e6, float64(time.Since(tStart))/1e6)
+		fmt.Fprintf(os.Stderr, "systrap: stub host ms: age at start %.1f, token %.1f, setup %.1f\n",
+			age, float64(time.Since(tToken))/1e6, float64(time.Since(tStart))/1e6)
 	}
 	// The first reply tells the Sentry that the host is ready.
 	if err := writeHostReply(out, 0, nil, h.level); err != nil {
