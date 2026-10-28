@@ -145,6 +145,13 @@ func (th *thread) archStart(ac *arch.Context64) error {
 // the instruction behind it.
 func (th *thread) resumePC(pc uint64) uint64 { return pc }
 
+// guestPC returns pc unchanged on arm64, because a slot relocates no
+// instruction of the guest.
+func (th *thread) guestPC(pc uint64) uint64 { return pc }
+
+// archStatsLine returns an empty line, because every arm64 SVC patches the same way.
+func archStatsLine() string { return "" }
+
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(ac *arch.Context64) {
 	if f := th.fast.Load(); f != nil {
@@ -371,7 +378,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 // fastX18SetBranch allocates a slot for the `mov x18, xN` at site and returns
 // the branch that replaces the instruction.
 func (as *addressSpace) fastX18SetBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, winSlotRef, bool) {
-	slotVA, ref, err := as.installSlot(ctx, mm, site, winTLSSlotSize, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winTLSSlotSize), func(buf []byte, slotVA uint64) error {
 		return encodeWinX18SetSlot(buf, slotVA, site, reg)
 	})
 	var word uint32
@@ -394,7 +401,7 @@ func (as *addressSpace) fastX18SetBranch(ctx context.Context, mm platform.Memory
 // fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and
 // returns the branch that replaces the instruction.
 func (as *addressSpace) fastTLSBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, winSlotRef, bool) {
-	slotVA, ref, err := as.installSlot(ctx, mm, site, winTLSSlotSize, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winTLSSlotSize), func(buf []byte, slotVA uint64) error {
 		return encodeWinTLSSlot(buf, slotVA, site, reg)
 	})
 	var word uint32
@@ -417,7 +424,7 @@ func (as *addressSpace) fastTLSBranch(ctx context.Context, mm platform.MemoryMan
 // fastBranch allocates a trampoline slot for the `svc #0` at site and returns
 // the branch that replaces the instruction.
 func (as *addressSpace) fastBranch(ctx context.Context, mm platform.MemoryManager, site uint64) (uint32, winSlotRef, bool) {
-	slotVA, ref, err := as.installSlot(ctx, mm, site, winSlotSize, func(buf []byte, slotVA uint64) error {
+	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winSlotSize), func(buf []byte, slotVA uint64) error {
 		return encodeWinSlot(buf, slotVA, site, as.p.spillVA())
 	})
 	var word uint32

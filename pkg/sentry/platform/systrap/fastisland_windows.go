@@ -48,12 +48,6 @@ type winSlotRef struct {
 	size uint32
 }
 
-// islandSlot records the guest site and byte size of one trampoline slot.
-type islandSlot struct {
-	site uint64
-	size uint32
-}
-
 // island is one page of trampoline slots.
 type island struct {
 	base uint64
@@ -151,40 +145,41 @@ func (as *addressSpace) releaseIslandsLocked() {
 	}
 }
 
-// slotStartSite returns the site of the slot that starts at pc, if pc is the
-// first address of a slot.
-func (as *addressSpace) slotStartSite(pc uint64) (uint64, bool) {
+// slotStart returns the slot that starts at pc, if pc is the first address of
+// a slot.
+func (as *addressSpace) slotStart(pc uint64) (islandSlot, bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	isl := as.islands[blockRound(pc)]
 	if isl == nil {
-		return 0, false
+		return islandSlot{}, false
 	}
 	s, ok := isl.slots[uint32(pc-isl.base)]
-	return s.site, ok
+	return s, ok
 }
 
-// slotContaining returns the guest site and start address of the slot that
-// contains pc.
-func (as *addressSpace) slotContaining(pc uint64) (site uint64, slotVA uint64, ok bool) {
+// slotContaining returns the slot that contains pc and the start address of
+// the slot.
+func (as *addressSpace) slotContaining(pc uint64) (s islandSlot, slotVA uint64, ok bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	isl := as.islands[blockRound(pc)]
 	if isl == nil {
-		return 0, 0, false
+		return islandSlot{}, 0, false
 	}
 	rel := uint32(pc - isl.base)
 	for off, s := range isl.slots {
 		if rel >= off && rel < off+s.size {
-			return s.site, isl.base + uint64(off), true
+			return s, isl.base + uint64(off), true
 		}
 	}
-	return 0, 0, false
+	return islandSlot{}, 0, false
 }
 
 // slotAtTail returns the site of the slot whose tail is at tail.
 func (as *addressSpace) slotAtTail(tail uint64) (uint64, bool) {
-	return as.slotStartSite(tail - winSlotTailOffset)
+	s, ok := as.slotStart(tail - winSlotTailOffset)
+	return s.site, ok
 }
 
 // guestPageOK reports whether the page at va lies in a guest window.
@@ -198,12 +193,13 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 	return inLow || inHigh
 }
 
-// installSlot allocates a slot of size bytes within reach of site, lets encode
-// write the slot code, and returns the address and reference of the slot. The
-// page of the slot is the private page that the stub maps for execution, so the
-// slot is live as soon as the call returns and the instruction cache of the
-// stub is flushed.
-func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, site uint64, size uint32, encode func(buf []byte, slotVA uint64) error) (uint64, winSlotRef, error) {
+// installSlot allocates a slot of rec.size bytes within reach of rec.site, lets
+// encode write the slot code, records rec for the slot, and returns the address
+// and reference of the slot. The page of the slot is the private page that the
+// stub maps for execution, so the slot is live as soon as the call returns and
+// the instruction cache of the stub is flushed.
+func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, rec islandSlot, encode func(buf []byte, slotVA uint64) error) (uint64, winSlotRef, error) {
+	site, size := rec.site, rec.size
 	isl, off, err := as.allocSlot(ctx, mm, site, size)
 	if err != nil {
 		return 0, winSlotRef{}, err
@@ -217,7 +213,7 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 		return 0, winSlotRef{}, err
 	}
 	as.mu.Lock()
-	isl.slots[off] = islandSlot{site: site, size: size}
+	isl.slots[off] = rec
 	as.mu.Unlock()
 	if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), uintptr(size)); err != nil {
 		as.mu.Lock()

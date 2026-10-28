@@ -219,3 +219,14 @@ func TestWinSysmsgXsaveStoreClearsInitialComponents(t *testing.T) {
 		t.Error("an initial component kept the old register contents in the Sentry image")
 	}
 }
+
+func TestWinSysmsgLoadVectorMarksTheImageDirty(t *testing.T) {
+	var m winSysmsg
+	if m.FPDirty != 0 {
+		t.Fatal("a new sysmsg is dirty")
+	}
+	m.loadVector(newTrapContext(), winXsaveMask)
+	if m.FPDirty != 1 {
+		t.Errorf("FPDirty = %d after the Sentry wrote the image, want 1", m.FPDirty)
+	}
+}

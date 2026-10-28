@@ -16,10 +16,10 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run one job family: all, linux, darwin, or windows"
+        description: "Run one job family: all, linux, or windows"
         type: choice
         default: all
-        options: [all, linux, darwin, windows]
+        options: [all, linux, windows]
 
 concurrency:
   group: pjdfstest-${{ github.ref }}
@@ -34,7 +34,7 @@ env:
 jobs:
   linux:
     name: pjdfstest linux/${{ matrix.arch }}
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux' || inputs.only == 'darwin' || inputs.only == 'windows'
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux' || inputs.only == 'windows'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -191,74 +191,6 @@ jobs:
           for w in 1 2 3 4; do
             e2fsck -fn "$PWD/cache/volumes/pjdfs_vol_$w.ext4"
           done
-
-  darwin-arm64:
-    name: pjdfstest darwin/arm64
-    needs: linux
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
-    runs-on: macos-15
-    timeout-minutes: 60
-    env:
-      GVX_ALLOW_NO_HYPERVISOR: "1"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Download pjdfstest bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: pjdfstest-bundle-arm64
-          path: bundle
-      - name: Build rungv (16KB pages)
-        run: |
-          go build -tags pagesize_16k -o rungv ./cmd/rungv
-          codesign --force --sign - ./rungv
-      - name: Run pjdfstest on ext4lite volume
-        run: |
-          mkdir -p ./cache
-          "$PWD/rungv" pull -cache-dir=./cache alpine:3.20
-          run_worker() {
-            w="$1"
-            shift
-            cp -r ./bundle "./bundle_$w"
-            "$PWD/rungv" run -platform=systrap -cache-dir=./cache -workspace="./bundle_$w" -ro -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
-              set -e
-              cp -r /workspace /tmp/pjdfstest
-              chmod +x /tmp/pjdfstest/pjdfstest
-              for suite in "$@"; do
-                [ -d "/tmp/pjdfstest/tests/$suite" ] || continue
-                mkdir -p "/mnt/vol/work/$suite"
-                cd "/mnt/vol/work/$suite"
-                for t in /tmp/pjdfstest/tests/"$suite"/*.t; do
-                  rc=0
-                  out=$(sh "$t") || rc=$?
-                  plan=$(printf "%s\n" "$out" | sed -n "s/^1\.\.\([0-9][0-9]*\).*/\1/p" | head -n 1)
-                  ok_cnt=$(printf "%s\n" "$out" | grep -cE "^(ok |not ok [0-9]+ # TODO)" || true)
-                  bad=$(printf "%s\n" "$out" | grep -E "^not ok" | grep -v "# TODO" || true)
-                  if [ "$rc" -ne 0 ] || [ -z "$plan" ] || [ -n "$bad" ] || [ "$ok_cnt" -ne "$plan" ]; then
-                    echo "FAIL: $t (rc=$rc plan=$plan ok=$ok_cnt)"
-                    printf "%s\n" "$bad"
-                    exit 1
-                  fi
-                  echo "PASS: $t ($ok_cnt/$plan)"
-                done
-              done
-            ' sh "$@"
-          }
-          run_worker 1 chown &
-          p1=$!
-          run_worker 2 rename &
-          p2=$!
-          run_worker 3 chmod link mknod open ftruncate &
-          p3=$!
-          run_worker 4 chflags mkdir mkfifo posix_fallocate rmdir symlink truncate unlink utimensat &
-          p4=$!
-          rc=0
-          for p in $p1 $p2 $p3 $p4; do wait "$p" || rc=1; done
-          [ "$rc" -eq 0 ]
 
   windows:
     name: pjdfstest windows/${{ matrix.arch }}

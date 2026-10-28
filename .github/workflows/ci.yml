@@ -36,16 +36,6 @@ env:
     ./pkg/sync/... ./pkg/sentry/pgalloc/... ./pkg/sentry/time/...
     ./pkg/sentry/hostcpu/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvcommon/...
     ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/... ./pkg/sentry/fsimpl/ext4lite/...
-  # The owned packages that need no hypervisor and no 16KB build. On a hosted
-  # macOS runner, pkg/gvx and cmd/rungv need the systrap engine instead.
-  OWNED_PLAIN: >-
-    ./internal/... ./tools/upstream/... ./pkg/oci/... ./pkg/netbackend/...
-    ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/... ./pkg/sentry/fsimpl/chunkcache/...
-    ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/... ./pkg/sync/...
-    ./pkg/sentry/pgalloc/... ./pkg/sentry/time/... ./pkg/sentry/hostcpu/...
-    ./pkg/hostlockdown/... ./pkg/sentry/platform/hvcommon/...
-    ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
-    ./pkg/sentry/fsimpl/ext4lite/...
   # Packages that gvx wrote. Upstream packages carry vet findings that the
   # project does not fix.
   VET: >-
@@ -83,9 +73,6 @@ jobs:
             GOOS=${target%/*} GOARCH=${target#*/} go build ./...
             echo "::endgroup::"
           done
-          echo "::group::build darwin/arm64 with pagesize_16k"
-          GOOS=darwin GOARCH=arm64 go build -tags pagesize_16k ./...
-          echo "::endgroup::"
       - name: Vet all target platforms
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
@@ -97,7 +84,6 @@ jobs:
           for target in darwin/arm64 windows/amd64 windows/arm64; do
             GOOS=${target%/*} GOARCH=${target#*/} go vet ./pkg/sentry/platform/systrap/
           done
-          GOOS=darwin GOARCH=arm64 go vet -tags pagesize_16k ./pkg/sentry/platform/... ./pkg/gvx/... ./e2e/...
       - name: Cache upstream archive
         uses: actions/cache@v4
         with:
@@ -169,8 +155,7 @@ jobs:
     timeout-minutes: 40
     env:
       # A hosted runner is a virtual machine, so it cannot create a nested VM.
-      # Tests that need Hypervisor.framework skip. The 16KB build runs the
-      # same suites on the systrap engine, which needs no hypervisor.
+      # Tests that need Hypervisor.framework skip.
       GVX_ALLOW_NO_HYPERVISOR: "1"
       GVX_E2E_OFFLINE: "1"
     steps:
@@ -181,15 +166,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test owned packages
-        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED_PLAIN
-      - name: Test systrap engine and SDK (16KB pages)
-        run: |
-          go test -race -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
-            ./pkg/sentry/platform/systrap/... ./pkg/gvx/... ./cmd/...
-      - name: Test systrap end-to-end suite
-        run: |
-          go test -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
-            -run 'TestE2ESystrap|TestE2ERungvSystrap' ./e2e
+        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED ./pkg/sentry/platform/systrap/...
 
   windows-amd64:
     name: test windows/amd64
@@ -220,21 +197,26 @@ jobs:
           Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List FeatureName, State
           Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
-      - name: Smoke test rungv guest execution
+      # The runner has the Windows Hypervisor Platform, so whpx must start.
+      # GVX_DEBUG_LOG prints the Sentry log, which names the reason of a guest
+      # crash.
+      - name: Smoke test rungv guest on whpx
         shell: bash
-        # The step reports the outcome and does not fail the job until the
-        # hosted runner is known to run a guest. GVX_DEBUG_LOG prints the
-        # Sentry log, which names the reason of a guest crash.
-        continue-on-error: true
         env:
           GVX_DEBUG_LOG: "1"
         run: |
           go build -o rungv.exe ./cmd/rungv
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
-          ./rungv.exe stub || true
-          ./rungv.exe run -platform=auto -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
+          ./rungv.exe run -platform=whpx -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
+      # The hypervisor tests fail here and never skip, because
+      # GVX_ALLOW_NO_HYPERVISOR is unset. The earlier step covers systrap.
+      - name: Test whpx end-to-end suite
+        shell: bash
+        env:
+          GVX_E2E_OFFLINE: "1"
+        run: go test -count=1 -timeout 25m -skip 'Systrap|systrap' ./e2e/
 
   windows-arm64:
     name: test windows/arm64

@@ -154,14 +154,78 @@ These numbers come from the engine tests and the stub probe on the hosted runner
 | One `fork` and `exec` of `/bin/true`, without the pool | 89 ms | 58 ms |
 | One `fork` and `exec` of `/bin/true`, with the pool | 50 ms | 31 ms |
 | One system call in a `dd` loop | 141 µs | 80 µs |
+| Fast-path round trip, spin case (`BenchmarkFastPathRoundTrip/vector/spin`) | 0.50 to 0.56 µs | 11 to 13 µs |
+| Same, with a vector restore on every hot resume (`always/spin`) | 0.67 to 0.73 µs | 11 to 13 µs |
+| Same, without the vector save and restore (`novector/spin`) | 0.46 µs | 10 to 12 µs |
+| Fast-path round trip, stub asleep on the events (`vector/sleep`) | 33 µs | 21 to 25 µs |
+| Debug-path `trap` stops in the `systrap` e2e gates, before and after the pre-window and relocation changes | 22819 to 47 | not measured |
 | `git add` of 200 small files, sparse memory file | 8 to 12 s | 12 to 19 s |
 | `git add` of 200 small files, dense memory file | 1.3 s | 0.8 s |
 
-The cost of a system call is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each need a stub process. A stub that starts on demand costs 10 to 20 ms, and the pool of section 6.1 hides it.
+The fast-path rows come from five runs of two seconds on each hosted runner, with the benchmark of section 11. Each number includes two reads of the performance counter. The `amd64` runner had an AMD EPYC 7763. Numbers from separate runner instances differ by about 10%. The rows `vector/spin` and `always/spin` come from one process, so they compare directly. The stops row counts the debug-path stops of the same `e2e` gates on `windows-latest`, before and after the pre-window and relocation changes. The `arm64` spin case takes 20 times longer than the `amd64` case, and the vector state does not change it. The cause is not measured.
+
+The cost of a system call in the other rows is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each need a stub process. A stub that starts on demand costs 10 to 20 ms, and the pool of section 6.1 hides it.
 
 The memory file of the Sentry is a temporary NTFS file. An earlier version marked it sparse when it tried to release pages. The first write to each hole of a sparse file waits for NTFS to allocate a cluster. Samples of the guest program counter showed the guest blocked at store instructions, and the `git add` row above shows the cost. 
 
 The `unix.Fallocate` shim now never sets the sparse flag. A dense memory file reserves its disk space when it grows. Twenty-four memory files of one gigabyte exhausted the disk of a hosted runner.
+
+### 3.9 Cross-Backend Micro-Benchmarks and Spin Windows
+
+The test `TestE2EMicroBench` runs the guest `internal/acceptprog/microbench` on each backend. Section 11 gives the command. Each number is the median of three runs. A hosted `windows-latest` runner is a virtual machine, so `whpx` there runs under nested virtualization. The `hvf` column comes from an Apple Silicon development host with eight cores. The Windows `systrap` columns show the engine after the changes of this section. The column "before" gives the numbers of the commit that preceded them.
+
+| Operation | `hvf` | `whpx` | Windows `systrap` `amd64` | before | Windows `systrap` `arm64` | before | Linux `systrap` `amd64` | Linux `systrap` `arm64` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `getpid` | 1.2 µs | 19 µs | 0.48 µs | 0.46 µs | 0.99 µs | 12 µs | 4.3 µs | 3.0 µs |
+| `open` and `close` | 19 µs | 58 µs | 9.4 µs | 10 µs | 9.4 µs | 60 µs | 16 µs | 16 µs |
+| Pipe round trip, 64 bytes | 12.5 µs | 174 µs | 18 µs | 41 µs | 11 µs | 58 µs | 22 µs | 17 µs |
+| Futex round trip | 23 µs | 159 µs | 13 µs | 27 µs | 8.9 µs | 33 µs | 8.5 µs | 6.7 µs |
+| `fork` and `wait` | 0.95 ms | 0.84 ms | 10 to 15 ms | 15 ms | 21 to 22 ms | 23 ms | 2.0 ms | 1.7 ms |
+| `fork` and `exec` of a minimal executable | 0.25 ms | 1.9 ms | 8.7 to 14 ms | 12 ms | 18 to 20 ms | 23 ms | 0.42 ms | 0.69 ms |
+| `gvx.New` | 10 ms | 17 ms | 38 to 54 ms | 65 ms | 83 ms | 100 ms | 2.0 ms | 2.9 ms |
+| `Close` | 0.08 ms | 1.2 ms | 3 to 4 ms | 61 to 65 ms | 5.2 to 5.5 ms | 68 to 76 ms | 0.005 ms | 0.012 ms |
+
+The Linux numbers use the upstream `systrap` platform and a build without cgo. The `whpx` costs of a system call are high on a hosted runner, and they do not predict a physical host.
+
+`GVX_SYSTRAP_TRACE=3` prints the time of each step of `New` and `Close`. On `amd64`, `New` spends 11 to 16 ms to start the stub host. It spends 12 to 16 ms to start the first stub, and 5 to 8 ms in the self test. On `arm64` the same steps take 21, 28 to 33, and 13 to 15 ms. The stub host and the loader of a stub dominate.
+
+The stub host is a second copy of the Sentry executable. The trace of the host shows where its time goes. On `amd64` the host reaches its request loop 10 to 17 ms after Windows created the process. The package initializers and the setup of the token take about 1.5 ms of that. A trivial Go program, built without the Sentry, reaches `main` 4.8 ms after creation on `amd64` and 12 ms on `arm64`. The size of the executable therefore costs about 10 ms on `amd64` and 2 to 6 ms on `arm64`. A smaller host executable would save that time. It would need a second executable next to the Sentry, which the engine avoids.
+
+An attempt to hide the start behind the rest of `gvx.New` did not help. `New` opened the platform in a goroutine while it opened the layers, the mounts, the network, and the memory file. On the hosted runners with four cores, `New` took 43 ms instead of 38 ms. The first `Run` took 27 ms instead of 4.5 ms, because the pool had less time to fill. The change was reverted.
+
+The `Close` of the first version took 60 to 76 ms. The pump thread of the debug object waited up to 50 ms in `NtWaitForDebugEvent`, and `Close` waited for the thread. The wait is now alertable, and `Close` ends it with `NtAlertThread`. The pool also terminates its idle stubs together and aborts a stub that it is still starting.
+
+#### Spin windows
+
+Both sides of the handoff poll the state word before they sleep on an event. The first version polled for a number of loop iterations. One poll took 18 ns on `amd64` with a `pause` instruction and 0.15 ns on `arm64` with a `yield` instruction. The `arm64` stub therefore gave up after about 0.2 µs. During the micro-benchmarks, the counters of the Sentry gave these results:
+
+| Host | Fast traps | Sentry slept | Stub woken by an event |
+| :--- | ---: | ---: | ---: |
+| `windows-latest` (`amd64`) | 8723421 | 2.0% | 2.4% |
+| `windows-11-arm` (`arm64`) | 827667 | 59% | 92% |
+
+The windows are now times. The Sentry converts each window to ticks of the cycle counter, with a calibration of three samples of one millisecond against the performance counter. The stub reads the same counter: the TSC on `amd64` and `CNTVCT_EL0` on `arm64`. The header of the `winSysmsg` holds the window of the stub in the word `SpinTicks`. The Sentry reads the counter once for each 16 polls. `GVX_SYSTRAP_SPIN_US=stub,sentry` sets both windows in microseconds, for example `64,8`.
+
+The sweep of the windows ran the micro-benchmarks with four settings on each hosted runner. The table gives the median in microseconds and the share of round trips that used an event.
+
+| Runner | Windows (stub, Sentry) | `getpid` | `open` and `close` | Pipe | Futex | Sentry slept | Stub woken |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `amd64` | 0 and 0 | 30.6 | 89.1 | 131.0 | 72.4 | 75.0% | 98.9% |
+| `amd64` | 16 and 1 | 0.50 | 10.2 | 61.9 | 39.6 | 4.5% | 5.2% |
+| `amd64` | 64 and 8 | 0.33 | 5.7 | 10.4 | 6.0 | 0.2% | 0.4% |
+| `amd64` | 256 and 32 | 0.48 | 10.0 | 12.2 | 9.2 | 0.1% | 0.4% |
+| `arm64` | 0 and 0 | 12.9 | 46.9 | 64.8 | 25.9 | 70.4% | 99.9% |
+| `arm64` | 16 and 1 | 1.07 | 13.4 | 37.4 | 20.1 | 4.6% | 6.4% |
+| `arm64` | 64 and 8 | 0.98 | 10.6 | 15.4 | 11.9 | 0.2% | 1.0% |
+| `arm64` | 256 and 32 | 1.06 | 14.1 | 11.6 | 9.8 | 0.1% | 0.6% |
+
+The default is 64 µs for the stub and 8 µs for the Sentry. A longer window did not help. A longer window also keeps a core busy while the other side works. A system call that the Sentry serves in more than 64 µs makes the stub sleep. The guest then pays the event round trip of section 3.2.
+
+#### Hangs of `fork`
+
+The micro-benchmarks showed that a guest `fork` or `fork` and `exec` sometimes never returned. On `windows-11-arm`, 3 of 20 runs hung before the fix. The thread dump showed one guest thread frozen at the BRK of a cold resume inside the spill routine. Its event waited in the channel. `Switch` stood in `stopThread`. Go guests send `SIGURG` with `tgkill`, and the Sentry then calls `stopThread` before it waits for events. `stopThread` waited for the thread to leave the spill routine. The thread could not leave until `Switch` replied to its event, so both waited for each other. `stopThread` now returns when an event is queued, and `Switch` tests the kick again after it served an event. After the fix, none of 32 runs hung on `windows-latest` and none of 32 runs hung on `windows-11-arm`. `TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent` fails without the fix on `arm64`. On `amd64` the pc of the INT3 lies behind the spill routine, so that test cannot fail there.
+
+The one hang on `windows-latest` has the same cause. The goroutine dump of that run showed `Switch` and the interrupter in `stopThread`, as on `arm64`. The thread had one event queued, and its program counter stood at the first instruction of the tail of a slot. The relocated instruction had faulted, so the thread was frozen at an exception inside the island. The test `TestStopThreadReturnsWhenTheThreadFaultsInASlot` makes the relocated MOV of a slot fault. It fails without the fix, and it passes with it. A fault in a relocated instruction of a post-window slot still reports an island address to the guest. The pre-window form translates the address, and the post-window form does not.
 
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
 
@@ -175,7 +239,7 @@ The engine does not install the hook. A missed site runs as an NT service and re
 
 The `x86-64` `syscall` instruction is two bytes. A same-size replacement fits every site. The engine writes `CC 90` (`int3` plus `nop`) over each SYSCALL. Every other byte stays in place, so nothing moves and nothing needs relocation. The debugger resolves the trap. Patching is therefore possible on `amd64`.
 
-The 5-byte `jmp rel32` patterns of the SPEC are harder. They overwrite three bytes after the `syscall`. A patcher must move those instructions into a trampoline, fix any `RIP`-relative operand, and prove that no branch lands inside the window. That work needs exact instruction boundaries. The default engine uses no such pattern. The optional fast path of section 6.8 uses it, and it keeps `CC 90` where it cannot prove the window.
+The 5-byte `jmp rel32` patterns of the SPEC are harder. The engine uses two forms. The post-window form overwrites the `syscall` and the bytes after it. The pre-window form overwrites the instructions that end at the `syscall`, and it keeps `CC 90` at the `syscall`. A patcher must move the overwritten instructions into a trampoline and prove that no branch lands inside the window. That work needs exact instruction boundaries. The default engine uses neither form. The optional fast path of section 6.8 uses them, and it keeps `CC 90` where it cannot prove the window.
 
 Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps. The sweeps start at different offsets. It patches a site only when more than half of them agree. The decoder gives no guarantee for four kinds of code:
 
@@ -293,7 +357,7 @@ The stub runs with a token that has no privileges and Low integrity, in a job th
 
 ### 6.8 Fast Path
 
-The fast path is on by default. `New` falls back to the debug path when the host cannot run it. Set `GVX_SYSTRAP_FASTPATH=1` to turn a failed fast path into an error, and `GVX_SYSTRAP_FASTPATH=0` to turn the fast path off. It serves a patched system call without the debugger: no `NtSuspendThread`, no `NtResumeThread`, no `NtDebugContinue`, and no context call. The latency is a design target.
+The fast path is on by default. `New` falls back to the debug path when the host cannot run it. Set `GVX_SYSTRAP_FASTPATH=1` to turn a failed fast path into an error, and `GVX_SYSTRAP_FASTPATH=0` to turn the fast path off. It serves a patched system call without the debugger: no `NtSuspendThread`, no `NtResumeThread`, no `NtDebugContinue`, and no context call. Section 3.8 lists the measured round trips.
 
 | Part | Content |
 | :--- | :--- |
@@ -312,19 +376,76 @@ A patched instruction jumps to a slot. The slot jumps to the spill routine. The 
 | `RunHot` | The program counter is unchanged, and on `arm64` so is the stack pointer. The stub loads the registers and returns through the slot tail. |
 | `RunCold` | The Sentry changed the program counter, the stack pointer, or the TLS value. The stub loads every register and executes a trap. The Sentry continues the thread at `Target` through the debug path, and loads the FS base or the TLS value. |
 
-The stub stores `Trapped` with release semantics and sets the guest event only when `SentryWaiter` is set. It then polls the state word 1024 times. After that it sets `StubWaiter`, tests the state again, and sleeps on the host event. The Sentry polls 512 times, sets `SentryWaiter`, tests again, and sleeps on the guest event. Each flag has one writer. A fence separates the store of the state from the load of the other flag. A stale event signal does no harm, because both sides test the state after each wake.
+The stub stores `Trapped` with release semantics and sets the guest event only when `SentryWaiter` is set. It then polls the state word for its spin window. After that it sets `StubWaiter`, tests the state again, and sleeps on the host event. The Sentry polls for its own window, sets `SentryWaiter`, tests again, and sleeps on the guest event. Each flag has one writer. A fence separates the store of the state from the load of the other flag. A stale event signal does no harm, because both sides test the state after each wake.
 
 On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot saves `x16` and `x17` in the `Scratch` words of `winSysmsg` without touching the guest stack. It jumps to the spill routine with `x17` set to the slot tail. The routine writes the updated `x16` and `x17` values back to `Scratch` before it returns through the slot tail.
 
-On `amd64`, the patcher replaces `syscall` and the three bytes after it with `jmp rel32`. The slot holds a copy of the instructions that those bytes belong to. The slot uses no guest stack, so it keeps the red zone. The patcher keeps `CC 90` in each of these cases:
+On `amd64`, the patcher tries the post-window form first. It replaces `syscall` and the bytes after it with `jmp rel32`. Those bytes are whole instructions that cover at least three bytes. The slot holds a copy of the instructions. The slot uses no guest stack, so it keeps the red zone. The post-window form fails in each of these cases:
 
-- The instructions behind the `syscall`, at most three, cover fewer than three bytes or leave the page.
-- One of them is a branch, a call, a return, a system call, an interrupt, or has a RIP-relative operand.
-- A relative branch that decodes in the page or in the 15 bytes on each side lands in the overwritten bytes.
+- The instructions behind the `syscall` cover fewer than three bytes or leave the page.
+- One of them cannot move. Examples are a call, a return, a system call, an interrupt, and a `loop` or `jcxz` instruction. The rules below stop some more instructions.
+- A relative `jmp` ends before the fifth byte of the patch.
+- The preceding instruction loads the number of a call that never returns: `exit`, `exit_group`, or `rt_sigreturn`.
+- A relative branch that decodes in the page or in the 256 bytes on each side lands in the overwritten bytes.
 - A prefix byte stands in front of the `syscall`.
+- The moved instructions need more than 19 bytes in the slot.
 - The engine cannot allocate a slot.
 
-A branch from a distant page and an indirect jump can still land in the overwritten bytes. The patcher cannot see them. The scan of section 5 accepts the same kind of risk for the bytes of the `syscall` itself. The common `syscall; ret` of musl keeps `CC 90`, because the byte after `ret` can start another function.
+The slot copies each moved instruction. Three classes change when they move:
+
+| Class | Rule |
+| :--- | :--- |
+| Instruction with a RIP-relative operand | The engine adds the distance from the original address to the slot address to the 32-bit displacement. The slot reads the original target. The move fails when the new displacement does not fit in 32 bits. |
+| `jcc rel8` and `jcc rel32` (post-window only) | The slot holds `0F 8x rel32` to the original target. The move fails when the target lies inside the overwritten bytes. |
+| `jmp rel8` and `jmp rel32` (post-window only) | The slot holds `E9 rel32` to the original target. The `jmp` must be the last moved instruction and must end at or behind the fifth byte of the patch. |
+
+An instruction with a segment override cannot move. A VEX or EVEX memory operand without a base register cannot move either, because `x86asm` omits the RIP base of such an operand. A 32-bit address prefix also stops the move, because the displacement then counts from `EIP`.
+
+When the post-window form fails, the patcher tries the pre-window form. It replaces the instructions that end at the `syscall` with `jmp rel32`, and it keeps `CC 90` at the `syscall`:
+
+```text
+Original:  [I1][I2 ...][0F 05][following bytes]
+Patched:   [E9 rel32  ][CC 90][following bytes, unchanged]
+```
+
+The slot runs the relocated instructions, enters the spill routine, and returns to `syscall + 2`. The bytes behind the `syscall` do not change. A branch that lands on the `syscall` meets `CC 90`, and the debug path serves it. The pre-window form patches the cancellation point of musl, where `mov [rsp+8], r11; syscall; ret` ends in a branch target. It also patches the Go `runtime.osyield` and the `getpid` of glibc. The pre-window form needs all of these rules:
+
+- The decoder cannot run backward. Sixteen linear sweeps start 25 to 40 bytes before the `syscall`. At least 12 sweeps must reach the `syscall` and agree on the first instruction of the window.
+- The window is the fewest whole instructions that cover at least five bytes. It has at most nine bytes.
+- The window and the byte behind the `syscall` lie in one page.
+- Each instruction in the window can move to another address. The RIP-relative rule above applies. A branch cannot move into a pre-window slot.
+- No relative branch that decodes in the page or in the 256 bytes on each side lands inside the window. A branch to the first byte of the window or to the `syscall` is allowed.
+- The window does not overlap another patched site. No prefix byte stands in front of the `syscall`.
+
+The pre-window form does not check for a non-returning call. It does not overwrite the bytes behind the `syscall`.
+
+The slot of the pre-window form has the size of the slot of the post-window form, 64 bytes, and the same tail offset, 40. In the table, `r` is the number of relocated bytes.
+
+| Offset | Bytes | Content |
+| :--- | ---: | :--- |
+| `0` | `r` (5 to 9) | The relocated instructions |
+| `r` | 9 | `mov gs:[winTEBScratchA], rax` |
+| `r + 9` | 7 | `lea rax, [rip + tail]` |
+| `r + 16` | 9 | `mov gs:[winTEBScratchB], rax` |
+| `r + 25` | 6 | `jmp [rip + literal]` |
+| `r + 31` | to 40 | `CC` filler |
+| `40` | 5 | The tail: `jmp rel32` to `syscall + 2` |
+| `48` | 8 | The address of the spill routine |
+
+In a pre-window, the guest and the Sentry never see an island address. The engine also never starts a thread inside the bytes of the `jmp`. The engine applies these rules to a pre-window.
+
+| Case | Rule |
+| :--- | :--- |
+| Single step stops at the first instruction of the slot | The thread goes back to the `jmp`. The relocated instructions have not run. |
+| A stop in a relocated instruction, for example a page fault | The Sentry reports the address that the instruction has in the original code. The registers match that address. |
+| The Sentry starts a thread inside the window | The thread continues at the same instruction in the slot. |
+| The Sentry starts a thread at the `syscall` | The thread continues at the entry code of the slot. The relocated instructions ran before the call. A restart after a signal stays on the fast path. |
+| A thread starts at `syscall + 2`, as the child of `clone` does | The thread runs the bytes in place. The pre-window has no slot tail to enter. |
+| The engine repairs a fault in a relocated instruction | The thread continues in the slot with no translation. |
+
+The musl cancellation handler compares the program counter with the range of the cancellation point. An island address would fail that test and lose the request. The Sentry starts a thread at the `syscall` to restart a call. An interrupt can also stop a guest after a branch to the `syscall`, before `CC 90` runs. The next start then enters the slot behind the relocated instructions, and the guest skips them. The case is rare, and the engine accepts it.
+
+A branch from a distant page and an indirect jump can still land in the overwritten bytes of either form. The patcher cannot see them. The scan of section 5 accepts the same kind of risk for the bytes of the `syscall` itself. The common `syscall; ret` of musl keeps `CC 90` in the post-window form, because the byte after `ret` can start another function. The pre-window form patches such a site through the instructions in front of the `syscall`.
 
 A thread can also start at the return address of a patched `syscall`. The new thread of `clone` does this. A `sigreturn` that restores the frame of an interrupted call does it too. The `jmp` overwrote the bytes at that address. The engine therefore starts such a thread at the tail of the slot. The tail runs the relocated instructions and jumps to the code behind them. The Sentry never writes the address of the tail into the registers of the guest. Without this rule, the child of `clone` in a Go guest ran the bytes of the `jmp` and crashed with SIGSEGV on `windows/amd64`.
 
@@ -334,11 +455,18 @@ On `arm64`, no register can name the TEB. The guest owns `x18`, and Windows keep
 
 These stops keep the debug path: every fault, every execute fault that patches a page, every single step, every `CC 90` and `brk` site that stays trapped, `RDFSBASE`, and every signal. A thread can use both paths in turn. A thread that waits in the spill routine is not suspended, so the other threads of the stub run on.
 
-`Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls, because the trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the patched instruction, because the slot has not run.
+`Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls. The trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the instruction that jumps to the slot. The slot has not run. For a pre-window slot, that instruction lies in front of the `syscall`.
 
-The spill routine saves the vector state of the guest in the `winSysmsg` before it makes any call, and loads it on every resume. The Sentry reads and writes the vector state of a trapped thread in that block. The live thread context does not hold the guest state, because the calls of the routine clobber the volatile vector registers. The first CI runs failed `TestFastPathVectorStateFollowsTheSentry` on `windows-11-arm` and on `windows-latest`: `PullFullState` read zero, and a value from the Sentry reached the guest as zero.
+The spill routine saves the vector state of the guest in the `winSysmsg` before it makes any call. The Sentry reads and writes the vector state of a trapped thread in that block. The live thread context does not hold the guest state, because the calls of the routine clobber the volatile vector registers. The first CI runs failed `TestFastPathVectorStateFollowsTheSentry` on `windows-11-arm` and on `windows-latest`: `PullFullState` read zero, and a value from the Sentry reached the guest as zero.
 
 On `arm64`, the block holds V0 to V31, FPSR, and FPCR. The ABI lets a call clobber V0 to V7 and V16 to V31, and the guest expects a system call to keep them.
+
+A hot resume loads the vector state only when the live registers can differ from the saved block. Two conditions make them differ:
+
+- The routine called into `ntdll`. It calls `NtSetEvent` when the Sentry sleeps, and `NtWaitForSingleObject` when the stub sleeps. A callee-saved register holds a call flag. It is 0 after the save, and the routine sets it to 1 before each call. This register is `R14` on `amd64` and `x21` on `arm64`.
+- The Sentry wrote the vector block while the thread was trapped. The Sentry then sets the 32-bit `FPDirty` word of the `winSysmsg` header to 1. The routine clears the word after it loads the block.
+
+The Sentry writes the block, then `FPDirty`, then the resume state. The state store has release semantics. The stub reads the state first, so it sees the block whenever it sees the flag. A cold resume always loads the vector state, and it clears `FPDirty`. The save stays unconditional, because the Sentry can read the saved block at any time while the thread is trapped.
 
 On `amd64`, the block is an XSAVE image at offset `0x100` of the `winSysmsg`. The routine writes it with `XSAVE64` and loads it with `XRSTOR64`. The feature mask is `0xE7`: x87, SSE, AVX, and the three AVX-512 components. The processor ignores the mask bits that XCR0 does not enable. The Sentry copies the image to and from the Linux XSAVE image of the guest. It sets only the XSTATE_BV bits of components that the operating system enabled, because `XRSTOR64` faults on any other bit.
 
@@ -357,8 +485,8 @@ The design rests on facts that no Windows document states:
 | Handoff state machine | Unit tests with channel events and the race detector, also on macOS. |
 | Generated machine code | Decoding with `x86asm` and `arm64asm`, and an emulator that runs the spin hit, the sleep, the races, and the cold resume, also on macOS. |
 | `amd64` patch plan | Unit tests of the relocation and branch rules, also on macOS. |
-| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
-| Latency | Not measured. |
+| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. `TestFastPathPreWindowServesEverySystemCall` and the tests after it in `engine_windows_amd64_test.go` cover the pre-window form. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
+| Latency | `BenchmarkFastPathRoundTrip` measures it, and section 3.8 lists the numbers. On `amd64`, a spin hit takes 0.50 to 0.56 µs and a sleep takes 33 µs. |
 
 The engine reclaims island slots through a per-island bitmap when a code page unmaps or returns to data state. A thread count above 512 for one stub fails with an error.
 
@@ -397,6 +525,7 @@ State this limit in every user-facing document for the engine. Do not describe t
 | `code_image_xplat.go` | ELF section headers that limit the scan to code. |
 | `winsysmsg_xplat.go`, `winsysmsg_*_xplat.go` | Layout of the arena and of the `winSysmsg` page, the handoff state machine, and the register blocks. |
 | `stubcode_*_xplat.go` | Generators of the spill routine and the trampoline slots, and the `amd64` patch plan. |
+| `islandslot_xplat.go`, `sites_amd64_xplat.go` | The record of a trampoline slot, the site records of a patched page, and the translation tables of a pre-window. |
 | `fastpath_windows.go`, `fastisland_windows.go`, `fastselftest_windows.go` | Slots, events, the Sentry side of the handoff, the islands, and the self test of the fast path. |
 
 The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpath_windows_test.go`, `lockdown_windows_test.go`, `viewmap_xplat_test.go`, `patcher_amd64_xplat_test.go`, `hostctx_xplat_test.go`, `winsysmsg_xplat_test.go`, and `stubcode_*_xplat_test.go`. They run guests that the tests assemble by hand, through the same `Context.Switch` that the Sentry calls. The `xplat` tests also run on macOS.
@@ -453,9 +582,23 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
 
+To compare the backends, run the workflow `diagnose` with this script. The test prints one line that starts with `MBRESULT` or `MBSUMMARY` for each number. Add `GVX_E2E_BENCH_ONLY=fork_wait` to run one benchmark, and `GVX_E2E_BENCH_REPEAT=8` to change the number of runs. On Linux, add `CGO_ENABLED=0`.
+
+```bash
+GVX_E2E_BENCH=1 go test -count=1 -v -timeout 25m -run TestE2EMicroBench ./e2e/
+```
+
+To measure the spin windows, run `BenchmarkFastPathSpinSweep`. It reports `sentry-sleeps/op` and `stub-wakes/op` for each combination of windows and Sentry work.
+
+To measure the round trip of the fast path, run the workflow `diagnose` on `windows-latest` and on `windows-11-arm`. Set its `script` input to the command below. The benchmark reports `ns/roundtrip` for the spin case and for the sleep case. The variant `always` loads the vector state on every hot resume. The variant `novector` has no save and no restore of the vector state, which gives an upper bound for the saving of a conditional restore. The variants `vector-live`, `always-live`, and `novector-live` run a guest that holds a live vector state. The routines of `always` and `novector` break a guest that uses a vector register, so only this benchmark runs them.
+
+```bash
+go test -run '^$' -bench BenchmarkFastPathRoundTrip -benchtime 2s -count 3 ./pkg/sentry/platform/systrap/
+```
+
 To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to the guest. A line has the exception code, the address, and the bytes at the program counter.
 
-The value `2` also prints every stop and prints the state of each stub every three seconds. The value `3` prints only that state and the count of each kind of stop, which does not change the timing of the guest. The value `4` also samples the program counter every five milliseconds and prints the hottest addresses. The output has an upper bound of 400 lines, or 200000 lines for the value `2`.
+The value `2` also prints every stop and prints the state of each stub every three seconds. The value `3` prints only that state and the count of each kind of stop. On `amd64`, it also prints the count of `syscall` sites by patch outcome and by the reason that a site keeps `CC 90`. This output does not change the timing of the guest. The value `4` also samples the program counter every five milliseconds and prints the hottest addresses. The output has an upper bound of 400 lines, or 200000 lines for the value `2`.
 
 ## 12. Sources
 

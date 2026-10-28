@@ -171,6 +171,12 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 				c.fpInStub = true
 				return out.si, out.at, out.err
 			}
+			// The thread runs on after an event that the engine served. A kick
+			// that stopThread left while the thread waited at the event must stop
+			// the thread now.
+			if c.kicked.Load() {
+				c.stopThread(th)
+			}
 		}
 	}
 }
@@ -205,32 +211,35 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	case dbgStateSingleStep:
 		return c.stepStop(th, ac, ev)
 	}
+	// A fault in a relocated instruction stops in a slot. The guest sees the
+	// address that the instruction has in the original code.
+	pc := th.guestPC(th.ctx.pc())
 	switch ev.Code {
 	case statusAccessViol, statusInPageError:
 		return c.faultStop(ctx, mm, as, th, ac, ev)
 	case statusIllegalInsn, statusPrivInsn:
-		sig, code := th.illegalSignal(as, th.ctx.pc())
-		return c.signalStop(as, th, ac, ev, linux.Signal(sig), code, th.ctx.pc())
+		sig, code := th.illegalSignal(as, pc)
+		return c.signalStop(as, th, ac, ev, linux.Signal(sig), code, pc)
 	case statusBreakpoint:
-		return c.signalStop(as, th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, pc)
 	case statusSingleStep:
 		return c.stepStop(th, ac, ev)
 	case statusDatatypeMis:
-		return c.signalStop(as, th, ac, ev, linux.SIGBUS, busAdrAln, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGBUS, busAdrAln, pc)
 	case statusIntDivZero:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntDiv, pc)
 	case statusIntOverflow:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntOvf, pc)
 	case statusFltDivZero:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltDiv, pc)
 	case statusFltOverflow:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltOvf, pc)
 	case statusFltUnderflow:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltUnd, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltUnd, pc)
 	case statusFltInexact:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltRes, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltRes, pc)
 	case statusFltInvalid, statusFltDenormal, statusFltStack:
-		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltInv, pc)
 	}
 	return fatal(fmt.Errorf("the stub reported exception %#x at %#x (pc %#x)", ev.Code, ev.Addr, th.ctx.pc()), unix.EFAULT)
 }
@@ -385,7 +394,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		}
 	case avWrite:
 		base := blockRound(addr)
-		if blockRound(pc) == base {
+		if blockRound(th.guestPC(pc)) == base {
 			// The guest writes to the page that it executes. Restoring the
 			// original frame removes the execute permission under the
 			// instruction, and the next fetch maps the patched copy that
@@ -464,10 +473,20 @@ func (c *Context) NotifyInterrupt() {
 
 // stopThread forces a stop of a running thread. A thread can run the code of a
 // trap, which publishes its own stop. The call tries again until the thread
-// leaves that code or publishes the trap, which Switch serves.
+// leaves that code, publishes the trap, or raises an exception. Switch serves
+// the trap and the exception.
+//
+// A thread that raised an exception in the code of a trap stays frozen until
+// Switch replies to the exception. A cold resume does this at its BRK or INT3.
+// Switch calls stopThread before it waits for events, so the call must return
+// when an event is queued, or the two would wait for each other. Switch then
+// tests the flag again after it served the event.
 func (c *Context) stopThread(th *thread) {
 	for i := 0; !th.forceStop(); i++ {
 		if f := th.fast.Load(); f != nil && f.slot.sm.loadState() == winStateTrapped {
+			return
+		}
+		if th.evQueued.Load() > 0 || th.sp.dead.Load() {
 			return
 		}
 		if !c.kicked.Load() {

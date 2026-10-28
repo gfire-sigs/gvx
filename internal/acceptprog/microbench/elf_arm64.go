@@ -12,11 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !(darwin && arm64)
+//go:build linux && arm64
 
-package systraptest
+package main
 
-// pageSizeMismatch is false on hosts whose engine has no page-size rule.
-func pageSizeMismatch(error) bool {
-	return false
+import "encoding/binary"
+
+const elfMachine = 183 // EM_AARCH64
+
+// trueCode is `mov x0, #0; mov x8, #94; svc #0`: exit_group(0).
+func trueCode() []byte {
+	b := make([]byte, 12)
+	for i, w := range []uint32{0xd2800000, 0xd2800bc8, 0xd4000001} {
+		binary.LittleEndian.PutUint32(b[4*i:], w)
+	}
+	return b
 }

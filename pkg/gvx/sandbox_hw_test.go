@@ -37,11 +37,22 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
+// requireGuestBackend skips a test that runs a guest when the host has no
+// engine for it. macOS runs guests on the hypervisor only. Windows falls back
+// to the systrap engine, which needs no hypervisor.
+func requireGuestBackend(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		hvtest.Require(t)
+	}
+}
+
 // hostTestConfig returns a Config for in-process tests. The default host
 // lockdown would confine the whole test binary, so these tests disable it.
 // The e2e suite covers the lockdown in child processes.
 func hostTestConfig(t *testing.T) Config {
 	t.Helper()
+	requireGuestBackend(t)
 	return Config{
 		Platform:            PlatformAuto,
 		NetworkMode:         NetModeNone,

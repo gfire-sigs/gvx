@@ -12,18 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64
+//go:build linux && amd64
 
-package systraptest
+package main
 
-import (
-	"errors"
+const elfMachine = 62 // EM_X86_64
 
-	"z.gfire.dev/gvx/pkg/sentry/platform/systrap"
-)
-
-// pageSizeMismatch reports the 4KB-guest-page build on a 16KB-page host.
-func pageSizeMismatch(err error) bool {
-	var mismatch *systrap.ErrUnsupportedPageSize
-	return errors.As(err, &mismatch)
+// trueCode is `xor edi, edi; mov eax, 231; syscall`: exit_group(0).
+func trueCode() []byte {
+	return []byte{0x31, 0xFF, 0xB8, 0xE7, 0x00, 0x00, 0x00, 0x0F, 0x05}
 }

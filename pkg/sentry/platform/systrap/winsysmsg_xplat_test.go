@@ -42,6 +42,7 @@ func TestWinSysmsgHeaderLayout(t *testing.T) {
 		{"Tail", unsafe.Offsetof(h.Tail), winOffTail},
 		{"Target", unsafe.Offsetof(h.Target), winOffTarget},
 		{"TLS", unsafe.Offsetof(h.TLS), winOffTLS},
+		{"SpinTicks", unsafe.Offsetof(h.SpinTicks), winOffSpinTicks},
 		{"size", unsafe.Sizeof(h), winOffRegs},
 	} {
 		if c.got != c.want {
@@ -49,6 +50,9 @@ func TestWinSysmsgHeaderLayout(t *testing.T) {
 		}
 	}
 }
+
+// testSpinPolls is the spin window of the Sentry in the tests, in polls.
+const testSpinPolls = 512
 
 func TestWinSysmsgFitsItsPage(t *testing.T) {
 	if got := unsafe.Sizeof(winSysmsg{}); got > winSysmsgSize {
@@ -166,7 +170,7 @@ func TestHandoffRoundTrips(t *testing.T) {
 			}()
 			sentry := (*sentrySide)(sig)
 			for i := range rounds {
-				res, err := h.await(c.sentSpin, sentry, func() bool { return false })
+				res, err := h.await(winSpin{polls: c.sentSpin}, sentry, func() bool { return false })
 				if err != nil || res != winAwaitTrapped {
 					t.Fatalf("round %d: await = %v, %v, want trapped", i, res, err)
 				}
@@ -197,7 +201,7 @@ func TestHandoffSpinHitNeedsNoSignal(t *testing.T) {
 	sig := newChanSignals()
 	sentry := (*sentrySide)(sig)
 	h.state().Store(winStateTrapped)
-	if res, err := h.await(winSpinSentry, sentry, func() bool { return false }); err != nil || res != winAwaitTrapped {
+	if res, err := h.await(winSpin{polls: testSpinPolls}, sentry, func() bool { return false }); err != nil || res != winAwaitTrapped {
 		t.Fatalf("await = %v, %v", res, err)
 	}
 	h.stubWaiter().Store(0)
@@ -231,12 +235,12 @@ func TestHandoffReleaseWakesSleepingStub(t *testing.T) {
 }
 
 func TestHandoffAwaitReturnsOnPendingReason(t *testing.T) {
-	for _, spin := range []int{0, winSpinSentry} {
+	for _, spin := range []int{0, testSpinPolls} {
 		var h winSysmsgHeader
 		sig := newChanSignals()
 		sentry := (*sentrySide)(sig)
 		h.state().Store(winStateIdle)
-		res, err := h.await(spin, sentry, func() bool { return true })
+		res, err := h.await(winSpin{polls: spin}, sentry, func() bool { return true })
 		if err != nil || res != winAwaitPending {
 			t.Fatalf("spin %d: await = %v, %v, want pending", spin, res, err)
 		}
@@ -253,7 +257,7 @@ func TestHandoffAwaitWakesOnPendingSignal(t *testing.T) {
 	var pend atomic.Bool
 	done := make(chan winAwait)
 	go func() {
-		res, _ := h.await(0, sentry, pend.Load)
+		res, _ := h.await(winSpin{}, sentry, pend.Load)
 		done <- res
 	}()
 	// A source of a pending reason sets the condition after the Sentry sleeps,
@@ -279,7 +283,7 @@ func TestHandoffAwaitIgnoresStaleSignal(t *testing.T) {
 	sig.signalGuest()
 	done := make(chan winAwait)
 	go func() {
-		res, _ := h.await(0, sentry, func() bool { return false })
+		res, _ := h.await(winSpin{}, sentry, func() bool { return false })
 		done <- res
 	}()
 	for h.loadState() == winStateTrapped || h.sentryWaiter().Load() == 0 || len(sig.guest) != 0 {
@@ -300,7 +304,7 @@ func (f failingSignals) waitGuest() error  { return f.err }
 func TestHandoffPropagatesWaitFailure(t *testing.T) {
 	var h winSysmsgHeader
 	boom := errors.New("the stub died")
-	if _, err := h.await(0, failingSignals{boom}, func() bool { return false }); !errors.Is(err, boom) {
+	if _, err := h.await(winSpin{}, failingSignals{boom}, func() bool { return false }); !errors.Is(err, boom) {
 		t.Fatalf("await error = %v, want %v", err, boom)
 	}
 	if h.sentryWaiter().Load() != 0 {

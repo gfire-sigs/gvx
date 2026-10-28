@@ -34,8 +34,14 @@ import (
 //
 //	x16  sysmsg base at entry, until the routine copies it to x19
 //	x19  sysmsg base, a callee-saved register that the ntdll calls keep
-//	x20  poll counter
+//	x20  end of the spin window in CNTVCT_EL0 ticks
+//	x21  call flag: 0 after the save, 1 once the routine called into ntdll
 //	x9   call target
+//
+// A hot resume loads the vector state only when a call ran, because the call
+// can clobber V0 to V7 and V16 to V31, or when the Sentry wrote the vector
+// block (FPDirty). Without both, the vector registers still hold the guest
+// state that the routine saved. A cold resume always loads it.
 //
 // The thread finds its sysmsg in TPIDR_EL0. The guest owns x18, and Windows
 // keeps the CPU number in TPIDRRO_EL0, so neither register can name the thread.
@@ -47,10 +53,12 @@ import (
 const (
 	a64MRSNZCV = 0xd53b4200 // mrs xN, nzcv.
 	a64MSRNZCV = 0xd51b4200 // msr nzcv, xN.
-	a64DMBISH  = 0xd5033bbf
-	a64YIELD   = 0xd503203f
+	// a64MRSCNTVCT is `mrs xN, cntvct_el0` with N 0. The virtual counter ticks
+	// at CNTFRQ_EL0 and a program at EL0 can read it.
+	a64MRSCNTVCT = 0xd53be040
+	a64DMBISH    = 0xd5033bbf
+	a64YIELD     = 0xd503203f
 
-	a64CondNE = 1
 	a64CondHS = 2
 	a64CondLO = 3
 	a64CondEQ = 0
@@ -65,7 +73,8 @@ func a64movFromSP(rd uint32) uint32         { return 0x91000000 | a64SP<<5 | rd 
 func a64movToSP(rn uint32) uint32           { return 0x91000000 | rn<<5 | a64SP }
 func a64addSPShifted(rn, imm uint32) uint32 { return 0x91400000 | imm<<10 | rn<<5 | a64SP }
 func a64cmpW(rn, imm uint32) uint32         { return 0x7100001f | imm<<10 | rn<<5 }
-func a64subsW1(rd uint32) uint32            { return 0x71000400 | rd<<5 | rd }
+func a64addX(rd, rn, rm uint32) uint32      { return 0x8b000000 | rm<<16 | rn<<5 | rd }
+func a64cmpX(rn, rm uint32) uint32          { return 0xeb00001f | rm<<16 | rn<<5 }
 
 // a64Asm collects words and resolves branches to labels.
 type a64Asm struct {
@@ -94,6 +103,11 @@ func (a *a64Asm) label(name string) {
 func (a *a64Asm) cbzW(rt uint32, label string) {
 	a.fixes = append(a.fixes, a64Fix{at: len(a.words), label: label, kind: 'c', arg: rt})
 	a.emit(0x34000000 | rt)
+}
+
+func (a *a64Asm) cbnzW(rt uint32, label string) {
+	a.fixes = append(a.fixes, a64Fix{at: len(a.words), label: label, kind: 'c', arg: rt})
+	a.emit(0x35000000 | rt)
 }
 
 func (a *a64Asm) bCond(cond uint32, label string) {
@@ -168,11 +182,15 @@ func restoreVector(base int) []uint32 {
 }
 
 // buildSpill generates the spill routine for the layout of this file.
-func buildSpill() (winSpillCode, error) {
+func buildSpill() (winSpillCode, error) { return buildSpillWith(spillOptions{}) }
+
+// buildSpillWith generates the spill routine with the changes of opts.
+func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	var a a64Asm
 	const (
 		base = 19
 		cnt  = 20
+		flag = 21
 		tmp  = 9
 	)
 	// The real TPIDR_EL0 of the thread holds the address of its sysmsg.
@@ -188,8 +206,11 @@ func buildSpill() (winSpillCode, error) {
 	for i := 18; i < 30; i += 2 {
 		a.emit(hvcommon.STPX(16, i, i+1, winOffX+8*i))
 	}
-	a.emit(saveVector(16)...)
+	if !opts.noVector {
+		a.emit(saveVector(16)...)
+	}
 	a.emit(
+		hvcommon.MOVZW(flag, 0),
 		hvcommon.STRX(16, 30, winOffX+8*30),
 		a64movFromSP(0),
 		hvcommon.STRX(16, 0, winOffSP),
@@ -210,10 +231,16 @@ func buildSpill() (winSpillCode, error) {
 		hvcommon.LDRX(base, 0, winOffGuestEvent),
 		hvcommon.MOVZ(1, 0),
 		hvcommon.LDRX(base, tmp, winOffNtSetEvent),
+		hvcommon.MOVZW(flag, 1),
 		hvcommon.BLR(tmp),
 	)
+	// Spin for SpinTicks ticks of CNTVCT_EL0. x20 holds the end of the window.
 	a.label("spin")
-	a.emit(hvcommon.MOVZW(cnt, winSpinStub))
+	a.emit(
+		a64MRSCNTVCT|1,
+		hvcommon.LDRX(base, 2, winOffSpinTicks),
+		a64addX(cnt, 1, 2),
+	)
 	a.label("poll")
 	a.emit(
 		a64ldarW(0, base),
@@ -222,9 +249,10 @@ func buildSpill() (winSpillCode, error) {
 	a.bCond(a64CondHS, "run")
 	a.emit(
 		a64YIELD,
-		a64subsW1(cnt),
+		a64MRSCNTVCT|1,
+		a64cmpX(1, cnt),
 	)
-	a.bCond(a64CondNE, "poll")
+	a.bCond(a64CondLO, "poll")
 	// Sleep until the Sentry sets HostEvent.
 	a.label("sleep")
 	a.emit(
@@ -240,6 +268,7 @@ func buildSpill() (winSpillCode, error) {
 		hvcommon.MOVZW(1, 0),
 		hvcommon.MOVZ(2, 0),
 		hvcommon.LDRX(base, tmp, winOffNtWait),
+		hvcommon.MOVZW(flag, 1),
 		hvcommon.BLR(tmp),
 		a64ldarW(0, base),
 		a64cmpW(0, uint32(winStateRunHot)),
@@ -258,6 +287,20 @@ func buildSpill() (winSpillCode, error) {
 		hvcommon.LDRX(base, 0, winOffX+8*18),
 		hvcommon.STRX(base, 0, winOffX18),
 	)
+	switch {
+	case opts.noVector:
+	case opts.alwaysRestore:
+		a.emit(restoreVector(base)...)
+		a.emit(hvcommon.STRW(base, a64XZR, winOffFPDirty))
+	default:
+		a.cbnzW(flag, "hotload")
+		a.emit(hvcommon.LDRW(base, 0, winOffFPDirty))
+		a.cbzW(0, "hotskip")
+		a.label("hotload")
+		a.emit(restoreVector(base)...)
+		a.emit(hvcommon.STRW(base, a64XZR, winOffFPDirty))
+		a.label("hotskip")
+	}
 	a.emit(restoreCommon(base)...)
 	a.emit(
 		hvcommon.LDRX(base, 17, winOffTail),
@@ -270,6 +313,10 @@ func buildSpill() (winSpillCode, error) {
 
 	// Cold resume.
 	a.label("cold")
+	if !opts.noVector {
+		a.emit(restoreVector(base)...)
+		a.emit(hvcommon.STRW(base, a64XZR, winOffFPDirty))
+	}
 	a.emit(restoreCommon(base)...)
 	a.emit(
 		hvcommon.LDPX(base, 16, 17, winOffX+8*16),
@@ -287,10 +334,10 @@ func buildSpill() (winSpillCode, error) {
 	return winSpillCode{code: code, coldBrk: coldBrk}, nil
 }
 
-// restoreCommon loads the vector state, the flags, and the registers that both
-// resumes load the same way: x2 to x15, x18, x20 to x29, and x30.
+// restoreCommon loads the flags and the registers that both resumes load the
+// same way: x2 to x15, x18, x20 to x29, and x30.
 func restoreCommon(base int) []uint32 {
-	w := restoreVector(base)
+	var w []uint32
 	w = append(w,
 		hvcommon.LDRX(base, 0, winOffNZCV),
 		a64MSRNZCV|0,

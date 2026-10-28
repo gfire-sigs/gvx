@@ -126,6 +126,13 @@ func writeEventsReply(out io.Writer, errno uint32, ev eventHandles) error {
 // fastTraps counts the system calls that the fast path served, for the trace.
 var fastTraps atomic.Uint64
 
+// fastSentrySleeps counts the waits in which the Sentry polled spin times
+// without seeing the trap and slept on the guest event. fastStubWakes counts
+// the resumes that found the stub asleep and set the host event. Both cost a
+// kernel call and a thread wake-up, so a high count means that a spin window is
+// shorter than the time the other side needs to answer.
+var fastSentrySleeps, fastStubWakes atomic.Uint64
+
 // ---- platform --------------------------------------------------------------
 
 // prepareFast builds the spill routine and finds the ntdll functions that it
@@ -143,7 +150,12 @@ func (p *Platform) prepareFast() error {
 			return err
 		}
 	}
+	spin, err := newSpinWindows(spinTicksPerUs())
+	if err != nil {
+		return err
+	}
 	p.spill = sc
+	p.spin = spin
 	p.ntSetEvent = uint64(procNtSetEvent.Addr())
 	p.ntWait = uint64(procNtWaitForSingleObject.Addr())
 	p.fast = true
@@ -189,13 +201,22 @@ type fastSlot struct {
 	sm  *winSysmsg
 	// guest and host are the events in the Sentry process.
 	guest, host windows.Handle
+	// sleeps counts the sleeps of the Sentry on guest, and wakes counts the
+	// sets of host that woke the stub.
+	sleeps, wakes atomic.Uint64
 }
 
 // signalHost implements winSignaler.
-func (s *fastSlot) signalHost() error { return windows.SetEvent(s.host) }
+func (s *fastSlot) signalHost() error {
+	s.wakes.Add(1)
+	fastStubWakes.Add(1)
+	return windows.SetEvent(s.host)
+}
 
 // waitGuest implements winSignaler.
 func (s *fastSlot) waitGuest() error {
+	s.sleeps.Add(1)
+	fastSentrySleeps.Add(1)
 	_, err := windows.WaitForSingleObject(s.guest, windows.INFINITE)
 	return err
 }
@@ -297,6 +318,7 @@ func (as *addressSpace) newSlot(idx int) (*fastSlot, error) {
 	s.sm.HostEvent = uint64(ev.stubHost)
 	s.sm.NtSetEvent = as.p.ntSetEvent
 	s.sm.NtWaitForSingleObject = as.p.ntWait
+	s.sm.SpinTicks = as.p.spin.stub
 	return s, nil
 }
 
@@ -313,6 +335,7 @@ func (sp *stubProc) putSlot(s *fastSlot) {
 	clear(s.sec.local[:winSysmsgSize])
 	s.sm.GuestEvent, s.sm.HostEvent = hdr.GuestEvent, hdr.HostEvent
 	s.sm.NtSetEvent, s.sm.NtWaitForSingleObject = hdr.NtSetEvent, hdr.NtWaitForSingleObject
+	s.sm.SpinTicks = hdr.SpinTicks
 	_ = windows.ResetEvent(s.guest)
 	_ = windows.ResetEvent(s.host)
 	sp.fast.free = append(sp.fast.free, s)
@@ -412,7 +435,7 @@ func (th *thread) waitNext() (ev debugEvent, trapped bool, err error) {
 		return ev, false, err
 	}
 	pending := func() bool { return th.evQueued.Load() > 0 || th.sp.dead.Load() }
-	res, err := f.slot.sm.winSysmsgHeader.await(winSpinSentry, f.slot, pending)
+	res, err := f.slot.sm.winSysmsgHeader.await(winSpin{ticks: th.sp.p.spin.sentry, now: spinNow}, f.slot, pending)
 	if err != nil {
 		if th.sp.dead.Load() {
 			return debugEvent{}, false, th.sp.deathError()
@@ -522,8 +545,9 @@ func (th *thread) inIslandPC(pc uint64) bool {
 }
 
 // rewindToSite moves a thread that stopped at the first instruction of a slot
-// back to the patched instruction. The slot has not run, so the registers are
-// the guest registers, and the patched instruction jumps to the slot again.
+// back to the instruction that jumps to the slot. The slot has not run, so the
+// registers are the guest registers, and the jump enters the slot again. For a
+// pre-window slot that instruction lies in front of the SYSCALL.
 func (th *thread) rewindToSite() bool {
 	if th.fast.Load() == nil {
 		return false
@@ -532,11 +556,11 @@ func (th *thread) rewindToSite() bool {
 	if as == nil {
 		return false
 	}
-	site, ok := as.slotStartSite(th.ctx.pc())
+	slot, ok := as.slotStart(th.ctx.pc())
 	if !ok {
 		return false
 	}
-	th.ctx.setPC(site)
+	th.ctx.setPC(slot.jmpVA)
 	return true
 }
 

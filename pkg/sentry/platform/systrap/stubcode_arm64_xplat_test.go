@@ -49,7 +49,7 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{hvcommon.MRS(0, hvcommon.SysRegFPCR), "MRS X0, S3_3_C4_C4_0"},
 		{hvcommon.MSR(hvcommon.SysRegFPSR, 0), "MSR S3_3_C4_C4_1, X0"},
 		{hvcommon.MSR(hvcommon.SysRegFPCR, 0), "MSR S3_3_C4_C4_0, X0"},
-		{hvcommon.STPX(16, 14, 15, winOffX+8*14), "STP X14, X15, [X16,#184]"},
+		{hvcommon.STPX(16, 14, 15, winOffX+8*14), "STP X14, X15, [X16,#192]"},
 		{hvcommon.MOVReg(19, 16), "MOV X19, X16"},
 		{a64movFromSP(0), "MOV X0, SP"},
 		{a64movToSP(16), "MOV SP, X16"},
@@ -57,7 +57,9 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{hvcommon.MOVZ(1, 0), "MOV X1, #0x0"},
 		{hvcommon.MOVZW(20, 1024), "MOV W20, #0x400"},
 		{a64cmpW(0, 2), "CMP W0, #0x2"},
-		{a64subsW1(20), "SUBS W20, W20, #0x1"},
+		{a64addX(20, 1, 2), "ADD X20, X1, X2"},
+		{a64cmpX(1, 20), "CMP X1, X20"},
+		{a64MRSCNTVCT | 1, "MRS X1, S3_3_C14_C0_2"},
 		{hvcommon.BLR(9), "BLR X9"},
 		{hvcommon.BR(17), "BR X17"},
 		{a64DMBISH, "DMB ISH"},
@@ -106,6 +108,10 @@ const (
 	rigGuestX16 = 0x1616_1616_1616_1616
 	rigGuestX17 = 0x1717_1717_1717_1717
 
+	// rigSpinTicks is the spin window of the stub. The emulated counter advances
+	// one tick for each read, so the window lasts this many polls.
+	rigSpinTicks = 1024
+
 	rigGuestEv = 0xE1
 	rigHostEv  = 0xE2
 	rigSetEv   = 0xF100
@@ -125,7 +131,12 @@ type spillRig struct {
 
 func newSpillRig(t *testing.T) *spillRig {
 	t.Helper()
-	sc, err := buildSpill()
+	return newSpillRigWith(t, spillOptions{})
+}
+
+func newSpillRigWith(t *testing.T, opts spillOptions) *spillRig {
+	t.Helper()
+	sc, err := buildSpillWith(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +158,7 @@ func newSpillRig(t *testing.T) *spillRig {
 	m.put64(rigSysm+winOffHostEvent, rigHostEv)
 	m.put64(rigSysm+winOffNtSetEvent, rigSetEv)
 	m.put64(rigSysm+winOffNtWait, rigWaitFn)
+	m.put64(rigSysm+winOffSpinTicks, rigSpinTicks)
 	m.onCall = func(m *a64Machine, target uint64) {
 		if m.sp%16 != 0 || m.sp <= r.stackLow || m.sp > r.stackLow+winStubStackSize {
 			t.Errorf("call with sp %#x outside the stub stack [%#x, %#x] or unaligned", m.sp, r.stackLow, r.stackLow+winStubStackSize)
@@ -289,8 +301,8 @@ func TestSpillSleepsWhenSpinExpires(t *testing.T) {
 	if err := m.run(100000); err != nil {
 		t.Fatal(err)
 	}
-	if m.yields != winSpinStub {
-		t.Errorf("the stub polled %d times, want %d", m.yields, winSpinStub)
+	if m.yields != rigSpinTicks {
+		t.Errorf("the stub polled %d times, want %d", m.yields, rigSpinTicks)
 	}
 	if len(r.callLog) != 1 || r.callLog[0] != "wait" {
 		t.Fatalf("calls = %v, want one NtWaitForSingleObject", r.callLog)
@@ -672,13 +684,101 @@ func TestSpillLoadsVectorStateThatTheSentryWrote(t *testing.T) {
 			}
 			m.write(rigSysm+winOffFpsr, 8, 0x33)
 			m.write(rigSysm+winOffFpcr, 8, 0x44)
+			// The Sentry marks every write of the vector block.
+			m.put32(rigSysm+winOffFPDirty, 1)
 			r.setState(resume)
 		}
 		if err := r.m.run(100000); err != nil {
 			t.Fatal(err)
 		}
 		r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
+		if got := r.m.get32(rigSysm + winOffFPDirty); got != 0 {
+			t.Errorf("FPDirty = %d after the load, want 0", got)
+		}
 	}
+}
+
+func TestSpillLoadsTheVectorStateOnlyWhenTheRegistersCanDiffer(t *testing.T) {
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	for _, c := range []struct {
+		name        string
+		dirty       uint32
+		sentryWaits bool
+		resume      uint32
+		loaded      bool
+	}{
+		{"hot spin hit with a clean block skips the load", 0, false, winStateRunHot, false},
+		{"hot spin hit with a dirty block loads it", 1, false, winStateRunHot, true},
+		{"hot resume after a call loads the block", 0, true, winStateRunHot, true},
+		{"cold resume loads the block", 0, false, winStateRunCold, true},
+		{"cold resume with a dirty block loads it", 1, false, winStateRunCold, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newSpillRig(t)
+			r.armVectors()
+			if c.sentryWaits {
+				r.sentryWaiter(1)
+			}
+			r.m.onYield = func(m *a64Machine) {
+				if r.state() != winStateTrapped {
+					return
+				}
+				// The Sentry writes a block that differs from the live registers.
+				// A clean block would be a bug of the Sentry, which the test uses to
+				// see whether the routine loads it.
+				for n := range 32 {
+					for h := range 2 {
+						m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+					}
+				}
+				m.write(rigSysm+winOffFpsr, 8, 0x33)
+				m.write(rigSysm+winOffFpcr, 8, 0x44)
+				m.put32(rigSysm+winOffFPDirty, c.dirty)
+				r.setState(c.resume)
+			}
+			if err := r.m.run(100000); err != nil {
+				t.Fatal(err)
+			}
+			if c.loaded {
+				r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
+				if got := r.m.get32(rigSysm + winOffFPDirty); got != 0 {
+					t.Errorf("FPDirty = %d after the load, want 0", got)
+				}
+			} else {
+				r.checkVectorsAre(t, "resume", guestVector, rigGuestFpsr, rigGuestFpcr)
+				if got := r.m.get32(rigSysm + winOffFPDirty); got != c.dirty {
+					t.Errorf("FPDirty = %d after a resume without a load, want %d", got, c.dirty)
+				}
+			}
+		})
+	}
+}
+
+func TestSpillCallFlagIsNotTheGuestX21(t *testing.T) {
+	// The routine keeps its call flag in x21 after it saved the guest registers.
+	// A guest x21 of 1 must not make a spin hit load the block, and the resume
+	// must return the guest x21.
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	r := newSpillRig(t)
+	r.armVectors()
+	r.m.x[21] = 1
+	r.guest[21] = 1
+	r.m.onYield = func(m *a64Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		for n := range 32 {
+			for h := range 2 {
+				m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+			}
+		}
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkVectorsAre(t, "resume", guestVector, rigGuestFpsr, rigGuestFpcr)
+	r.checkHotExit(t, r.guest)
 }
 
 func TestWinSysmsgVectorBlockMatchesTheFloatingPointState(t *testing.T) {
@@ -704,4 +804,55 @@ func TestWinSysmsgVectorBlockMatchesTheFloatingPointState(t *testing.T) {
 	if binary.LittleEndian.Uint32(got[fpStateOffFpsr:]) != 0xAB || binary.LittleEndian.Uint32(got[fpStateOffFpcr:]) != 0xCD {
 		t.Error("fpsr or fpcr differ after the round trip")
 	}
+}
+
+func TestSpillWithoutVectorStateSkipsTheImage(t *testing.T) {
+	full, err := buildSpill()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newSpillRigWith(t, spillOptions{noVector: true})
+	if len(r.sc.code) >= len(full.code) {
+		t.Errorf("the routine without the vector state has %d bytes, the full routine %d", len(r.sc.code), len(full.code))
+	}
+	r.m.onYield = func(m *a64Machine) { r.setState(winStateRunHot) }
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkHotExit(t, r.guest)
+	for off := uint64(winOffVec); off < winOffVec+32*16; off += 8 {
+		if got := r.m.get64(rigSysm + off); got != 0 {
+			t.Fatalf("the routine wrote the vector image at offset %#x", off)
+		}
+	}
+	for _, off := range []uint64{winOffFpsr, winOffFpcr} {
+		if got := r.m.get64(rigSysm + off); got != 0 {
+			t.Fatalf("the routine wrote the control word at offset %#x", off)
+		}
+	}
+}
+
+func TestSpillAlwaysRestoreLoadsOnACleanHotSpinHit(t *testing.T) {
+	// The benchmark compares this routine with the production routine, which
+	// skips the load in the same case.
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	r := newSpillRigWith(t, spillOptions{alwaysRestore: true})
+	r.armVectors()
+	r.m.onYield = func(m *a64Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		for n := range 32 {
+			for h := range 2 {
+				m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+			}
+		}
+		m.write(rigSysm+winOffFpsr, 8, 0x33)
+		m.write(rigSysm+winOffFpcr, 8, 0x44)
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
 }
