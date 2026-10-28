@@ -297,12 +297,6 @@ func TestE2ESystrapPrerequisiteError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("gvx.New(systrap) succeeded although the engine is unavailable")
 	}
-	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		if !strings.Contains(err.Error(), "pagesize_16k") {
-			t.Fatalf("gvx.New(systrap) error = %v, want the page-size requirement", err)
-		}
-		return
-	}
 	if !errors.Is(err, gvx.ErrPlatformUnavailable) {
 		t.Fatalf("gvx.New(systrap) error = %v, want ErrPlatformUnavailable", err)
 	}

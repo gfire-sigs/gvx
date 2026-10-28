@@ -176,9 +176,6 @@ func TestRunPlatformSystrap(t *testing.T) {
 
 	if !systraptest.Available(t) {
 		want := "unavailable"
-		if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-			want = "pagesize_16k"
-		}
 		if code != 1 || stdout != "" || !strings.Contains(stderr, want) {
 			t.Fatalf("rungv run -platform=systrap = (code %d, stdout %q, stderr %q), want (1, empty, error containing %q)", code, stdout, stderr, want)
 		}

@@ -132,12 +132,6 @@ func TestNewReportsSystrapPrerequisiteError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("New(systrap) succeeded although the engine is unavailable")
 	}
-	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		if !strings.Contains(err.Error(), "pagesize_16k") {
-			t.Fatalf("New(systrap) error = %v, want the page-size requirement", err)
-		}
-		return
-	}
 	if !errors.Is(err, ErrPlatformUnavailable) {
 		t.Fatalf("New(systrap) error = %v, want ErrPlatformUnavailable", err)
 	}

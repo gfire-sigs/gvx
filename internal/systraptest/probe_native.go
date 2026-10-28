@@ -27,7 +27,7 @@ import (
 func probe() (missing bool, err error) {
 	if _, err := systrap.Probe(); err != nil {
 		var unavailable *systrap.ErrUnavailable
-		return errors.As(err, &unavailable) || pageSizeMismatch(err), err
+		return errors.As(err, &unavailable), err
 	}
 	return false, nil
 }

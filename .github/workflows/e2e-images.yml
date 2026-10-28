@@ -1,22 +1,21 @@
 name: e2e-images
 
 # These tests pull real images from Docker Hub, so they run once a week and on
-# demand instead of on every push. The hosted macOS runner has no hypervisor.
-# The macOS job runs the systrap variants of the gates, which need none. The
-# Linux jobs run every gate on the upstream systrap platform with the seccomp
-# lockdown, because Linux has no hypervisor backend. The Windows jobs run the
-# systrap variants on the engine of gvx. The windows-latest runner also runs
-# the whpx variants. The windows-11-arm runner has no hypervisor.
+# demand instead of on every push. The Linux jobs run every gate on the
+# upstream systrap platform with the seccomp lockdown, because Linux has no
+# hypervisor backend. The Windows jobs run the systrap variants on the engine
+# of gvx. The windows-latest runner also runs the whpx variants. The
+# windows-11-arm runner has no hypervisor.
 on:
   schedule:
     - cron: "17 3 * * 0"
   workflow_dispatch:
     inputs:
       only:
-        description: "Run one job family: all, linux, darwin, or windows"
+        description: "Run one job family: all, linux, or windows"
         type: choice
         default: all
-        options: [all, linux, darwin, windows]
+        options: [all, linux, windows]
 
 concurrency:
   group: e2e-images
@@ -55,31 +54,6 @@ jobs:
           go-version-file: go.mod
       - name: Test end-to-end registry gates
         run: go test -count=1 -timeout 50m ./e2e
-
-  darwin-arm64:
-    name: test darwin/arm64
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
-    runs-on: macos-15
-    timeout-minutes: 90
-    env:
-      GVX_ALLOW_NO_HYPERVISOR: "1"
-      GVX_E2E_REQUIRE_NETWORK: "1"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Test end-to-end registry gates
-        run: |
-          go test -count=1 -timeout 80m -tags pagesize_16k \
-            -exec "$PWD/scripts/codesign-exec.sh" \
-            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
-            ./e2e
-          go test -count=1 -timeout 30m -tags pagesize_16k \
-            -exec "$PWD/scripts/codesign-exec.sh" \
-            -run 'TestE2EDockerRun.*/systrap' ./e2e
 
   windows:
     name: test windows/${{ matrix.arch }}
