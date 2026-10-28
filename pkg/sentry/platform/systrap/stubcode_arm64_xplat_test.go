@@ -677,13 +677,101 @@ func TestSpillLoadsVectorStateThatTheSentryWrote(t *testing.T) {
 			}
 			m.write(rigSysm+winOffFpsr, 8, 0x33)
 			m.write(rigSysm+winOffFpcr, 8, 0x44)
+			// The Sentry marks every write of the vector block.
+			m.put32(rigSysm+winOffFPDirty, 1)
 			r.setState(resume)
 		}
 		if err := r.m.run(100000); err != nil {
 			t.Fatal(err)
 		}
 		r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
+		if got := r.m.get32(rigSysm + winOffFPDirty); got != 0 {
+			t.Errorf("FPDirty = %d after the load, want 0", got)
+		}
 	}
+}
+
+func TestSpillLoadsTheVectorStateOnlyWhenTheRegistersCanDiffer(t *testing.T) {
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	for _, c := range []struct {
+		name        string
+		dirty       uint32
+		sentryWaits bool
+		resume      uint32
+		loaded      bool
+	}{
+		{"hot spin hit with a clean block skips the load", 0, false, winStateRunHot, false},
+		{"hot spin hit with a dirty block loads it", 1, false, winStateRunHot, true},
+		{"hot resume after a call loads the block", 0, true, winStateRunHot, true},
+		{"cold resume loads the block", 0, false, winStateRunCold, true},
+		{"cold resume with a dirty block loads it", 1, false, winStateRunCold, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newSpillRig(t)
+			r.armVectors()
+			if c.sentryWaits {
+				r.sentryWaiter(1)
+			}
+			r.m.onYield = func(m *a64Machine) {
+				if r.state() != winStateTrapped {
+					return
+				}
+				// The Sentry writes a block that differs from the live registers.
+				// A clean block would be a bug of the Sentry, which the test uses to
+				// see whether the routine loads it.
+				for n := range 32 {
+					for h := range 2 {
+						m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+					}
+				}
+				m.write(rigSysm+winOffFpsr, 8, 0x33)
+				m.write(rigSysm+winOffFpcr, 8, 0x44)
+				m.put32(rigSysm+winOffFPDirty, c.dirty)
+				r.setState(c.resume)
+			}
+			if err := r.m.run(100000); err != nil {
+				t.Fatal(err)
+			}
+			if c.loaded {
+				r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
+				if got := r.m.get32(rigSysm + winOffFPDirty); got != 0 {
+					t.Errorf("FPDirty = %d after the load, want 0", got)
+				}
+			} else {
+				r.checkVectorsAre(t, "resume", guestVector, rigGuestFpsr, rigGuestFpcr)
+				if got := r.m.get32(rigSysm + winOffFPDirty); got != c.dirty {
+					t.Errorf("FPDirty = %d after a resume without a load, want %d", got, c.dirty)
+				}
+			}
+		})
+	}
+}
+
+func TestSpillCallFlagIsNotTheGuestX21(t *testing.T) {
+	// The routine keeps its call flag in x21 after it saved the guest registers.
+	// A guest x21 of 1 must not make a spin hit load the block, and the resume
+	// must return the guest x21.
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	r := newSpillRig(t)
+	r.armVectors()
+	r.m.x[21] = 1
+	r.guest[21] = 1
+	r.m.onYield = func(m *a64Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		for n := range 32 {
+			for h := range 2 {
+				m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+			}
+		}
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkVectorsAre(t, "resume", guestVector, rigGuestFpsr, rigGuestFpcr)
+	r.checkHotExit(t, r.guest)
 }
 
 func TestWinSysmsgVectorBlockMatchesTheFloatingPointState(t *testing.T) {

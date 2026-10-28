@@ -114,7 +114,11 @@ type winSysmsgHeader struct {
 	SentryWaiter uint32
 	// StubWaiter is set by the stub before it sleeps on HostEvent.
 	StubWaiter uint32
-	_          uint32
+	// FPDirty is set to 1 by the Sentry each time it writes the vector image
+	// while the thread is trapped. The spill routine loads the vector image on a
+	// hot resume only when this word is 1 or when the routine called into ntdll.
+	// The routine clears the word after it loads the image.
+	FPDirty uint32
 	// GuestEvent and HostEvent are handles in the stub process. The stub sets
 	// GuestEvent to wake the Sentry and waits on HostEvent.
 	GuestEvent uint64
@@ -139,6 +143,7 @@ const (
 	winOffState        = 0x00
 	winOffSentryWaiter = 0x04
 	winOffStubWaiter   = 0x08
+	winOffFPDirty      = 0x0C
 	winOffGuestEvent   = 0x10
 	winOffHostEvent    = 0x18
 	winOffNtSetEvent   = 0x20
@@ -157,6 +162,7 @@ const (
 )
 
 var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsgHeader{})-winOffRegs]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsgHeader{}.FPDirty)-winOffFPDirty]
 
 func (h *winSysmsgHeader) state() *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Pointer(&h.State))
@@ -168,6 +174,10 @@ func (h *winSysmsgHeader) sentryWaiter() *atomic.Uint32 {
 
 func (h *winSysmsgHeader) stubWaiter() *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Pointer(&h.StubWaiter))
+}
+
+func (h *winSysmsgHeader) fpDirty() *atomic.Uint32 {
+	return (*atomic.Uint32)(unsafe.Pointer(&h.FPDirty))
 }
 
 // loadState reads the handoff word with acquire semantics.

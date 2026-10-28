@@ -1694,3 +1694,97 @@ func TestSpillWithoutVectorStateSkipsTheImage(t *testing.T) {
 		}
 	}
 }
+
+func TestSpillLoadsTheVectorStateOnlyWhenTheRegistersCanDiffer(t *testing.T) {
+	guest := vectorImage(rigVectorSeed)
+	sentry := vectorImage(rigVectorSeed + 8)
+	for _, c := range []struct {
+		name string
+		// dirty is the value of FPDirty when the Sentry resumes the thread.
+		dirty uint32
+		// sentryWaits makes the routine call NtSetEvent before the poll.
+		sentryWaits bool
+		resume      uint32
+		// loaded is true when the resume loads the image of the sysmsg.
+		loaded bool
+	}{
+		{"hot spin hit with a clean image skips the load", 0, false, winStateRunHot, false},
+		{"hot spin hit with a dirty image loads it", 1, false, winStateRunHot, true},
+		{"hot resume after a call loads the image", 0, true, winStateRunHot, true},
+		{"cold resume loads the image", 0, false, winStateRunCold, true},
+		{"cold resume with a dirty image loads it", 1, false, winStateRunCold, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newSpillRig(t, rigNop3)
+			if c.sentryWaits {
+				r.m.put32(rigSysm+winOffSentryWaiter, 1)
+			}
+			r.m.onYield = func(m *x86Machine) {
+				if r.state() != winStateTrapped {
+					return
+				}
+				// The Sentry writes an image that differs from the live registers.
+				// A clean image would be a bug of the Sentry, which the test uses
+				// to see whether the routine loads it.
+				r.putSysmsgVector(sentry)
+				r.m.put32(rigSysm+winOffFPDirty, c.dirty)
+				r.setState(c.resume)
+			}
+			if err := r.m.run(100000); err != nil {
+				t.Fatal(err)
+			}
+			want := guest
+			if c.loaded {
+				want = sentry
+			}
+			if c.sentryWaits && !c.loaded {
+				t.Fatal("a call always loads the image")
+			}
+			if !sameVector(r.m.vec[:], want) {
+				t.Errorf("the vector registers hold the image of the %s, want the image of the %s", whichImage(r.m.vec[:], guest, sentry), whichImage(want, guest, sentry))
+			}
+			if got := r.m.get32(rigSysm + winOffFPDirty); got != 0 && c.loaded {
+				t.Errorf("FPDirty = %d after a load, want 0", got)
+			}
+			if got := r.m.get32(rigSysm + winOffFPDirty); got != c.dirty && !c.loaded {
+				t.Errorf("FPDirty = %d after a resume without a load, want %d", got, c.dirty)
+			}
+		})
+	}
+}
+
+// whichImage names the image that vec holds.
+func whichImage(vec, guest, sentry []byte) string {
+	switch {
+	case sameVector(vec, guest):
+		return "guest"
+	case sameVector(vec, sentry):
+		return "Sentry"
+	}
+	return "neither"
+}
+
+func TestSpillCallFlagIsNotTheGuestR14(t *testing.T) {
+	// The routine keeps its call flag in R14 after it saved the guest registers.
+	// A guest R14 of 1 must not make a spin hit load the image, and the resume
+	// must return the guest R14.
+	guest := vectorImage(rigVectorSeed)
+	sentry := vectorImage(rigVectorSeed + 8)
+	r := newSpillRig(t, rigNop3)
+	r.m.r[x86R14] = 1
+	r.guest[x86R14] = 1
+	r.m.onYield = func(m *x86Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		r.putSysmsgVector(sentry)
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if !sameVector(r.m.vec[:], guest) {
+		t.Error("a spin hit loaded the image because the guest R14 was 1")
+	}
+	r.checkHotExit(t, r.guest, rigFlags)
+}

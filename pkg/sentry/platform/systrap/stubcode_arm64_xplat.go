@@ -35,7 +35,13 @@ import (
 //	x16  sysmsg base at entry, until the routine copies it to x19
 //	x19  sysmsg base, a callee-saved register that the ntdll calls keep
 //	x20  poll counter
+//	x21  call flag: 0 after the save, 1 once the routine called into ntdll
 //	x9   call target
+//
+// A hot resume loads the vector state only when a call ran, because the call
+// can clobber V0 to V7 and V16 to V31, or when the Sentry wrote the vector
+// block (FPDirty). Without both, the vector registers still hold the guest
+// state that the routine saved. A cold resume always loads it.
 //
 // The thread finds its sysmsg in TPIDR_EL0. The guest owns x18, and Windows
 // keeps the CPU number in TPIDRRO_EL0, so neither register can name the thread.
@@ -94,6 +100,11 @@ func (a *a64Asm) label(name string) {
 func (a *a64Asm) cbzW(rt uint32, label string) {
 	a.fixes = append(a.fixes, a64Fix{at: len(a.words), label: label, kind: 'c', arg: rt})
 	a.emit(0x34000000 | rt)
+}
+
+func (a *a64Asm) cbnzW(rt uint32, label string) {
+	a.fixes = append(a.fixes, a64Fix{at: len(a.words), label: label, kind: 'c', arg: rt})
+	a.emit(0x35000000 | rt)
 }
 
 func (a *a64Asm) bCond(cond uint32, label string) {
@@ -176,6 +187,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	const (
 		base = 19
 		cnt  = 20
+		flag = 21
 		tmp  = 9
 	)
 	// The real TPIDR_EL0 of the thread holds the address of its sysmsg.
@@ -195,6 +207,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		a.emit(saveVector(16)...)
 	}
 	a.emit(
+		hvcommon.MOVZW(flag, 0),
 		hvcommon.STRX(16, 30, winOffX+8*30),
 		a64movFromSP(0),
 		hvcommon.STRX(16, 0, winOffSP),
@@ -215,6 +228,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		hvcommon.LDRX(base, 0, winOffGuestEvent),
 		hvcommon.MOVZ(1, 0),
 		hvcommon.LDRX(base, tmp, winOffNtSetEvent),
+		hvcommon.MOVZW(flag, 1),
 		hvcommon.BLR(tmp),
 	)
 	a.label("spin")
@@ -245,6 +259,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		hvcommon.MOVZW(1, 0),
 		hvcommon.MOVZ(2, 0),
 		hvcommon.LDRX(base, tmp, winOffNtWait),
+		hvcommon.MOVZW(flag, 1),
 		hvcommon.BLR(tmp),
 		a64ldarW(0, base),
 		a64cmpW(0, uint32(winStateRunHot)),
@@ -263,7 +278,16 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		hvcommon.LDRX(base, 0, winOffX+8*18),
 		hvcommon.STRX(base, 0, winOffX18),
 	)
-	a.emit(restoreCommon(base, !opts.noVector)...)
+	if !opts.noVector {
+		a.cbnzW(flag, "hotload")
+		a.emit(hvcommon.LDRW(base, 0, winOffFPDirty))
+		a.cbzW(0, "hotskip")
+		a.label("hotload")
+		a.emit(restoreVector(base)...)
+		a.emit(hvcommon.STRW(base, a64XZR, winOffFPDirty))
+		a.label("hotskip")
+	}
+	a.emit(restoreCommon(base)...)
 	a.emit(
 		hvcommon.LDRX(base, 17, winOffTail),
 		hvcommon.LDRX(base, 16, winOffSP),
@@ -275,7 +299,11 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 
 	// Cold resume.
 	a.label("cold")
-	a.emit(restoreCommon(base, !opts.noVector)...)
+	if !opts.noVector {
+		a.emit(restoreVector(base)...)
+		a.emit(hvcommon.STRW(base, a64XZR, winOffFPDirty))
+	}
+	a.emit(restoreCommon(base)...)
 	a.emit(
 		hvcommon.LDPX(base, 16, 17, winOffX+8*16),
 		hvcommon.LDRX(base, 0, winOffSP),
@@ -292,14 +320,10 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	return winSpillCode{code: code, coldBrk: coldBrk}, nil
 }
 
-// restoreCommon loads the vector state, the flags, and the registers that both
-// resumes load the same way: x2 to x15, x18, x20 to x29, and x30. It starts with
-// the vector state when vector is true.
-func restoreCommon(base int, vector bool) []uint32 {
+// restoreCommon loads the flags and the registers that both resumes load the
+// same way: x2 to x15, x18, x20 to x29, and x30.
+func restoreCommon(base int) []uint32 {
 	var w []uint32
-	if vector {
-		w = restoreVector(base)
-	}
 	w = append(w,
 		hvcommon.LDRX(base, 0, winOffNZCV),
 		a64MSRNZCV|0,

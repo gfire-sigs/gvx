@@ -511,6 +511,20 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		off, err := a64BranchOffset(args[1])
 		next = m.pc + uint64(off)
 		return false, err
+	case "CBNZ":
+		if err := need(2); err != nil {
+			return false, err
+		}
+		v, err := m.getReg(args[0])
+		if err != nil {
+			return false, err
+		}
+		if v == 0 {
+			return false, nil
+		}
+		off, err := a64BranchOffset(args[1])
+		next = m.pc + uint64(off)
+		return false, err
 	case "B":
 		if len(args) == 1 {
 			off, err := a64BranchOffset(args[0])

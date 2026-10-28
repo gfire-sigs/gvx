@@ -306,10 +306,16 @@ func (c winSpillCode) coldExit() int {
 // buildSpill generates the spill routine.
 //
 // Register use after the save: R15 holds the sysmsg and RBX counts the polls.
-// Both are callee-saved in the Windows calling convention, so the calls into
-// ntdll keep them. The stack pointer lies 64 bytes below the top of the stub
-// stack, which leaves the 32-byte shadow space of a call and keeps the 16-byte
-// alignment.
+// R14 is the call flag: it is 0 after the save, and 1 once the routine called
+// into ntdll. These registers are callee-saved in the Windows calling
+// convention, so the calls into ntdll keep them. The stack pointer lies 64
+// bytes below the top of the stub stack, which leaves the 32-byte shadow space
+// of a call and keeps the 16-byte alignment.
+//
+// A hot resume loads the vector state only when a call ran, because the call
+// can clobber the volatile vector registers, or when the Sentry wrote the
+// vector image (FPDirty). Without both, the vector registers still hold the
+// guest state that the routine saved. A cold resume always loads it.
 func buildSpill() (winSpillCode, error) { return buildSpillWith(spillOptions{}) }
 
 // buildSpillWith generates the spill routine with the changes of opts.
@@ -340,6 +346,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		a.loadXsaveMask()
 		a.xsave64(base, winOffXsave)
 	}
+	a.emit(0x45, 0x31, 0xF6) // xor r14d, r14d: no call yet
 
 	// Publish Trapped. An x86 store has release semantics. The fence orders the
 	// store before the load of the Sentry flag.
@@ -349,6 +356,8 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	a.jcc8(x86CCE, "spin")
 	a.movLoad(x86RCX, base, winOffGuestEvent)
 	a.emit(0x31, 0xD2) // xor edx, edx
+	a.emit(0x41, 0xBE) // mov r14d, 1: a call can clobber the vector registers
+	a.imm32(1)
 	a.callMem(base, winOffNtSetEvent)
 
 	a.label("spin")
@@ -371,6 +380,8 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	a.movLoad(x86RCX, base, winOffHostEvent)
 	a.emit(0x31, 0xD2)       // xor edx, edx
 	a.emit(0x45, 0x31, 0xC0) // xor r8d, r8d
+	a.emit(0x41, 0xBE)       // mov r14d, 1
+	a.imm32(1)
 	a.callMem(base, winOffNtWait)
 	a.movLoad32(x86RAX, base, winOffState)
 	a.emit(0x83, 0xF8, byte(winStateRunHot))
@@ -381,11 +392,19 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	a.emit(0x83, 0xF8, byte(winStateRunCold)) // cmp eax, RunCold
 	a.jcc32(x86CCE, "cold")
 
-	// Hot resume: load the vector state, the FS base, the flags, the return
-	// address, and every register, then jump to the tail.
+	// Hot resume: load the vector state when a call ran or the Sentry wrote the
+	// image, then load the FS base, the flags, the return address, and every
+	// register, and jump to the tail.
 	if !opts.noVector {
+		a.emit(0x41, 0x83, 0xFE, 0x00) // cmp r14d, 0
+		a.jcc8(x86CCNE, "hotload")
+		a.cmpMemImm8(base, winOffFPDirty, 0)
+		a.jcc8(x86CCE, "hotskip")
+		a.label("hotload")
 		a.loadXsaveMask()
 		a.xrstor64(base, winOffXsave)
+		a.movStoreImm32(base, winOffFPDirty, 0)
+		a.label("hotskip")
 	}
 	a.movLoad(x86RAX, base, winOffFsBase)
 	a.emit(0xF3, 0x48, 0x0F, 0xAE, 0xD0) // wrfsbase rax
@@ -402,6 +421,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	if !opts.noVector {
 		a.loadXsaveMask()
 		a.xrstor64(base, winOffXsave)
+		a.movStoreImm32(base, winOffFPDirty, 0)
 	}
 	a.pushMem(base, winOffRflags)
 	a.emit(0x9D)

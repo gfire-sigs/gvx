@@ -391,9 +391,16 @@ These stops keep the debug path: every fault, every execute fault that patches a
 
 `Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls, because the trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the instruction that jumps to the slot, because the slot has not run. For a pre-window slot, that instruction lies in front of the `syscall`.
 
-The spill routine saves the vector state of the guest in the `winSysmsg` before it makes any call, and loads it on every resume. The Sentry reads and writes the vector state of a trapped thread in that block. The live thread context does not hold the guest state, because the calls of the routine clobber the volatile vector registers. The first CI runs failed `TestFastPathVectorStateFollowsTheSentry` on `windows-11-arm` and on `windows-latest`: `PullFullState` read zero, and a value from the Sentry reached the guest as zero.
+The spill routine saves the vector state of the guest in the `winSysmsg` before it makes any call. The Sentry reads and writes the vector state of a trapped thread in that block. The live thread context does not hold the guest state, because the calls of the routine clobber the volatile vector registers. The first CI runs failed `TestFastPathVectorStateFollowsTheSentry` on `windows-11-arm` and on `windows-latest`: `PullFullState` read zero, and a value from the Sentry reached the guest as zero.
 
 On `arm64`, the block holds V0 to V31, FPSR, and FPCR. The ABI lets a call clobber V0 to V7 and V16 to V31, and the guest expects a system call to keep them.
+
+A hot resume loads the vector state only when the live registers can differ from the saved block. Two conditions make them differ:
+
+- The routine called into `ntdll`. It calls `NtSetEvent` when the Sentry sleeps, and `NtWaitForSingleObject` when the stub sleeps. A callee-saved register holds a call flag. It is 0 after the save, and the routine sets it to 1 before each call. This register is `R14` on `amd64` and `x21` on `arm64`.
+- The Sentry wrote the vector block while the thread was trapped. The Sentry then sets the 32-bit `FPDirty` word of the `winSysmsg` header to 1. The routine clears the word after it loads the block.
+
+The Sentry writes the block, then `FPDirty`, then the resume state. The state store has release semantics. The stub reads the state first, so it sees the block whenever it sees the flag. A cold resume always loads the vector state, and it clears `FPDirty`. The save stays unconditional, because the Sentry can read the saved block at any time while the thread is trapped.
 
 On `amd64`, the block is an XSAVE image at offset `0x100` of the `winSysmsg`. The routine writes it with `XSAVE64` and loads it with `XRSTOR64`. The feature mask is `0xE7`: x87, SSE, AVX, and the three AVX-512 components. The processor ignores the mask bits that XCR0 does not enable. The Sentry copies the image to and from the Linux XSAVE image of the guest. It sets only the XSTATE_BV bits of components that the operating system enabled, because `XRSTOR64` faults on any other bit.
 
