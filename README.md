@@ -55,7 +55,7 @@ Run an unmodified OCI image or Linux ELF64 binary from the command line with `cm
 > [!IMPORTANT]
 > On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or pass `-platform=systrap` without it. On Linux, build with `CGO_ENABLED=0` because the upstream `systrap` platform hangs in a cgo build. On macOS, sign the binary with `entitlements.plist` for `hvf`. The macOS build has no `systrap` engine.
 
-1. Build `rungv` with the Go 1.25+ toolchain.
+1. Build `rungv` with the Go 1.27+ toolchain.
 2. Sign `rungv` with `entitlements.plist` on macOS.
 3. Run an unmodified OCI image (`nginx:alpine`) with `-p 8080:80` port forwarding and `-net=nat` networking.
 4. Mount a persistent named volume (`-v data:/var/lib/app`) backed by a journaled `<name>.ext4` image file.
@@ -92,11 +92,11 @@ CGO_ENABLED=0 go build -o rungv ./cmd/rungv
 | `gvx.Config` Field | Type | Description |
 | :--- | :--- | :--- |
 | `Platform` | `gvx.PlatformType` | `PlatformAuto` (tries `whpx`/`hvf`, then `systrap` on Windows and Linux), `PlatformWHPX`, `PlatformHVF`, or `PlatformSystrap`. |
-| `OCIImage` / `RootfsPath` | `string` | OCI image reference (`alpine:3.20`), local `.erofs` image, or host directory rootfs. |
+| `OCIImage` / `BinaryPath` / `ELFBytes` | `string` / `string` / `[]byte` | OCI image reference (`alpine:3.20`), a Linux ELF64 file on the host, or the bytes of one. |
 | `Argv` / `Envv` / `WorkDir` | `[]string` / `string` | Guest command vector, `KEY=VALUE` environment overrides, and working directory. |
 | `WorkspacePath` / `Mounts` | `string` / `[]gvx.Mount` | Host `/workspace` directory and additional bind (`MountBind`), volume (`MountVolume`), or `MountTmpfs` entries. |
 | `NetworkMode` / `PortForwards` | `gvx.NetworkMode` / `[]gvx.PortForward` | `NetModeNAT` (with inbound TCP/UDP forwards and optional `IsolateLAN`), `NetModeWireGuard`, or `NetModeNone`. |
-| `MemoryLimit` / `CPUs` | `uint64` / `float64` | Guest memory ceiling in bytes (enforced with `SIGKILL`) and virtual CPU quota. |
+| `Resources` | `gvx.Resources` | `MemoryBytes` is the guest memory ceiling in bytes (enforced with `SIGKILL`). `CPUMillis` is the CPU quota in thousandths of a CPU. |
 | `DisableHostLockdown` | `bool` | Skips `hostlockdown.Apply()` when set to `true`. Leave `false` in production. |
 
 > [!CAUTION]
@@ -283,7 +283,7 @@ Read the architecture specification and agent operating manual before modifying 
 
 ## 5. Build, Upstream Sync, and Verification (Procedural Module)
 
-`gvx` builds with the standard Go 1.25+ toolchain (`go build` and `go test`) across Windows, macOS, and Linux without Bazel.
+`gvx` builds with the standard Go 1.27+ toolchain (`go build` and `go test`) across Windows, macOS, and Linux without Bazel.
 
 ### 5.1 Build and Verification Steps
 
