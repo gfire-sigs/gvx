@@ -492,3 +492,67 @@ func benchmarkSpinSweep(b *testing.B, sentry, stub int, work time.Duration) {
 	b.ReportMetric(float64(f.slot.sleeps.Load()-sleeps0)/n, "sentry-sleeps/op")
 	b.ReportMetric(float64(f.slot.wakes.Load()-wakes0)/n, "stub-wakes/op")
 }
+
+// BenchmarkSpinWindowDuration measures how long the spin windows last in time.
+// The stub window is the time from the trap to the moment that the stub sets
+// StubWaiter, with a Sentry that does not answer. The Sentry window is the time
+// that await polls before it sleeps. Both are loop counts, so the time depends
+// on the cost of one poll on the host. The metrics are ns/window.
+func BenchmarkSpinWindowDuration(b *testing.B) {
+	freq := sentrytime.CounterFrequencyHz()
+	b.Run("stub", func(b *testing.B) {
+		for _, polls := range []int{winSpinStub, 16384} {
+			b.Run(fmt.Sprintf("polls=%d", polls), func(b *testing.B) {
+				p := newFastPlatform(b)
+				sc, err := buildSpillWith(spillOptions{spinStub: polls})
+				if err != nil {
+					b.Fatal(err)
+				}
+				p.spill = sc
+				r := newRig(b, p)
+				r.program(gSyscall(1), gJump(codeVA))
+				si, _, err := r.run()
+				mustSyscall(b, si, err, 1, r.ac)
+				f := fastStats(b, r)
+				var total uint64
+				for range b.N {
+					setRet(r.ac, 0)
+					// Resume, wait for the next trap, and leave the stub trapped. The
+					// Sentry then polls StubWaiter and times the window.
+					si, _, err := r.run()
+					if si != nil || err != nil {
+						b.Fatalf("Switch = (%s, %v)", describe(si), err)
+					}
+					start := sentrytime.ReadCounterTicks()
+					for f.slot.sm.stubWaiter().Load() == 0 {
+					}
+					total += sentrytime.ReadCounterTicks() - start
+					// The stub sleeps now. Run does not wake an asleep stub without the
+					// event, which the next resume sets.
+				}
+				b.ReportMetric(float64(total)*1e9/float64(freq)/float64(b.N), "ns/window")
+			})
+		}
+	})
+	b.Run("sentry", func(b *testing.B) {
+		for _, polls := range []int{winSpinSentry, 4096} {
+			b.Run(fmt.Sprintf("polls=%d", polls), func(b *testing.B) {
+				var h winSysmsgHeader
+				pending := func() bool { return false }
+				var total uint64
+				for range b.N {
+					start := sentrytime.ReadCounterTicks()
+					_, _ = h.await(polls, errSignaler{}, pending)
+					total += sentrytime.ReadCounterTicks() - start
+				}
+				b.ReportMetric(float64(total)*1e9/float64(freq)/float64(b.N), "ns/window")
+			})
+		}
+	})
+}
+
+// errSignaler fails the first sleep, so await returns after its spin.
+type errSignaler struct{}
+
+func (errSignaler) signalHost() error { return nil }
+func (errSignaler) waitGuest() error  { return errors.New("no sleep in the benchmark") }
