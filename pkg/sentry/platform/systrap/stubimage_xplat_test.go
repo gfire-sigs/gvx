@@ -53,8 +53,8 @@ func TestStubImageIsAWellFormedExecutable(t *testing.T) {
 		if oh.SizeOfImage < s.VirtualAddress+s.VirtualSize || oh.SizeOfImage%oh.SectionAlignment != 0 {
 			t.Errorf("machine %#x: SizeOfImage %#x does not cover the section or the alignment", machine, oh.SizeOfImage)
 		}
-		if oh.DllCharacteristics&0x20 != 0 {
-			t.Errorf("machine %#x: the image asks for high entropy, so the loader may place it in the guest window", machine)
+		if oh.DllCharacteristics&0x20 == 0 {
+			t.Errorf("machine %#x: the image does not ask for high entropy, so the loader places it below 4 GB, in the low guest window", machine)
 		}
 
 		lc := oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG]

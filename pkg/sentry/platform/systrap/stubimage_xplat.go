@@ -80,9 +80,10 @@ func buildStubImage(machine uint16) []byte {
 	le.PutUint32(opt[56:], 2*peSectionAlign)
 	le.PutUint32(opt[60:], peFileAlign)
 	le.PutUint16(opt[68:], 3) // console subsystem
-	// Dynamic base, no execute, and terminal server aware. High entropy is off, so
-	// the loader keeps the image below the guest window.
-	le.PutUint16(opt[70:], 0x8140)
+	// High entropy, dynamic base, no execute, and terminal server aware. Without
+	// high entropy, the loader places a 64-bit image below 4 GB, where it can
+	// take a part of the low guest window.
+	le.PutUint16(opt[70:], 0x8160)
 	le.PutUint64(opt[72:], 0x100000)
 	le.PutUint64(opt[80:], 0x1000)
 	le.PutUint64(opt[88:], 0x100000)
