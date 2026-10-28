@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 )
 
 // These tests require the fast path, whatever GVX_SYSTRAP_FASTPATH says. The
@@ -333,8 +334,9 @@ const sleepRoundTripDelay = time.Millisecond
 // The spin case resumes the thread at once, so the stub finds the resume state
 // while it spins. The sleep case holds the thread for sleepRoundTripDelay
 // first, so the stub sleeps on the host event and the resume wakes it. The
-// metric ns/roundtrip counts only the time in Switch. ns/op also counts the
-// delay of the sleep case.
+// metric ns/roundtrip counts only the time in Switch, which the performance
+// counter measures. It includes two counter reads, about 20 to 60 ns. ns/op
+// also counts the delay of the sleep case.
 //
 // The novector variants run a spill routine without the save and the restore of
 // the vector state. They give the upper bound of what skipping the vector state
@@ -383,26 +385,30 @@ func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, delay time.Dura
 	mustSyscall(b, si, err, 1, r.ac)
 	f := fastStats(b, r)
 
-	var inSwitch time.Duration
+	// The runtime clock of Windows can tick every 0.5 ms. A round trip is far
+	// shorter, and the end of a delay loop lines up with a tick, so the
+	// benchmark reads the performance counter directly.
+	delayTicks := uint64(delay) * sentrytime.CounterFrequencyHz() / uint64(time.Second)
+	var inSwitch uint64
 	b.ResetTimer()
 	for range b.N {
 		if delay > 0 {
-			for start := time.Now(); time.Since(start) < delay; {
+			for start := sentrytime.ReadCounterTicks(); sentrytime.ReadCounterTicks()-start < delayTicks; {
 			}
 			if f.slot.sm.stubWaiter().Load() == 0 {
 				b.Fatal("the stub did not sleep before the resume")
 			}
 		}
 		setRet(r.ac, 0)
-		start := time.Now()
+		start := sentrytime.ReadCounterTicks()
 		si, _, err := r.run()
-		inSwitch += time.Since(start)
+		inSwitch += sentrytime.ReadCounterTicks() - start
 		if si != nil || err != nil {
 			b.Fatalf("Switch = (%s, %v), want a system call", describe(si), err)
 		}
 	}
 	b.StopTimer()
-	b.ReportMetric(float64(inSwitch.Nanoseconds())/float64(b.N), "ns/roundtrip")
+	b.ReportMetric(float64(inSwitch)*1e9/float64(sentrytime.CounterFrequencyHz())/float64(b.N), "ns/roundtrip")
 	if got, want := f.traps.Load(), uint64(b.N)+1; got != want {
 		b.Fatalf("the fast path served %d of %d system calls", got, want)
 	}
