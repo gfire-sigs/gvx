@@ -172,32 +172,54 @@ The `unix.Fallocate` shim now never sets the sparse flag. A dense memory file re
 
 ### 3.9 Cross-Backend Micro-Benchmarks and Spin Windows
 
-The test `TestE2EMicroBench` runs the guest `internal/acceptprog/microbench` on each backend. Section 11 gives the command. Each number is the median of three runs. A hosted `windows-latest` runner is a virtual machine, so `whpx` there runs under nested virtualization. The `hvf` column comes from an Apple Silicon development host with eight cores.
+The test `TestE2EMicroBench` runs the guest `internal/acceptprog/microbench` on each backend. Section 11 gives the command. Each number is the median of three runs. A hosted `windows-latest` runner is a virtual machine, so `whpx` there runs under nested virtualization. The `hvf` column comes from an Apple Silicon development host with eight cores. The Windows `systrap` columns show the engine after the changes of this section. The column "before" gives the numbers of the commit that preceded them.
 
-| Operation | `hvf` | `whpx` | Windows `systrap` `amd64` | Windows `systrap` `arm64` | Linux `systrap` `amd64` | Linux `systrap` `arm64` |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `getpid` | 1.2 µs | 19 µs | 0.46 µs | 12 µs | 4.3 µs | 3.0 µs |
-| `open` and `close` | 19 µs | 58 µs | 10 µs | 60 µs | 16 µs | 16 µs |
-| Pipe round trip, 64 bytes | 12.5 µs | 168 µs | 41 µs | 58 µs | 22 µs | 17 µs |
-| Futex round trip | 23 µs | 155 µs | 27 µs | 33 µs | 8.5 µs | 6.7 µs |
-| `fork` and `wait` | 0.95 ms | 0.82 ms | 15 ms | 23 ms | 2.0 ms | 1.7 ms |
-| `fork` and `exec` of a minimal executable | 0.25 ms | 1.9 ms | 12 ms | 23 ms | 0.42 ms | 0.69 ms |
-| `gvx.New` | 10 ms | 18 ms | 65 ms | 100 ms | 2.0 ms | 2.9 ms |
-| `Run` of a guest that exits at once | 0.7 ms | 2.6 ms | 7 to 9 ms | 6 to 12 ms | 1.0 ms | 2.1 ms |
-| `Close` | 0.08 ms | 1.4 ms | 61 to 65 ms | 68 to 76 ms | 0.005 ms | 0.012 ms |
+| Operation | `hvf` | `whpx` | Windows `systrap` `amd64` | before | Windows `systrap` `arm64` | before | Linux `systrap` `amd64` | Linux `systrap` `arm64` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `getpid` | 1.2 µs | 19 µs | 0.48 µs | 0.46 µs | 0.99 µs | 12 µs | 4.3 µs | 3.0 µs |
+| `open` and `close` | 19 µs | 58 µs | 9.4 µs | 10 µs | 9.4 µs | 60 µs | 16 µs | 16 µs |
+| Pipe round trip, 64 bytes | 12.5 µs | 174 µs | 18 µs | 41 µs | 11 µs | 58 µs | 22 µs | 17 µs |
+| Futex round trip | 23 µs | 159 µs | 13 µs | 27 µs | 8.9 µs | 33 µs | 8.5 µs | 6.7 µs |
+| `fork` and `wait` | 0.95 ms | 0.84 ms | 10 to 15 ms | 15 ms | 21 to 22 ms | 23 ms | 2.0 ms | 1.7 ms |
+| `fork` and `exec` of a minimal executable | 0.25 ms | 1.9 ms | 8.7 to 14 ms | 12 ms | 18 to 20 ms | 23 ms | 0.42 ms | 0.69 ms |
+| `gvx.New` | 10 ms | 17 ms | 38 to 54 ms | 65 ms | 83 ms | 100 ms | 2.0 ms | 2.9 ms |
+| `Close` | 0.08 ms | 1.2 ms | 3 to 4 ms | 61 to 65 ms | 5.2 to 5.5 ms | 68 to 76 ms | 0.005 ms | 0.012 ms |
 
-The Windows `systrap` costs of `New` and `Close` are large. Both pay for the stub processes of the pool. The Linux numbers use the upstream `systrap` platform and a build without cgo.
+The Linux numbers use the upstream `systrap` platform and a build without cgo. The `whpx` costs of a system call are high on a hosted runner, and they do not predict a physical host.
 
-The `arm64` round trip of the fast path is slow because the spin windows are too short. Both windows are loop counts. A `pause` instruction on `amd64` takes tens of cycles. A `yield` instruction on `arm64` takes about one cycle. The same count therefore covers a much shorter time. During the micro-benchmarks, the counters of the Sentry gave these results:
+`GVX_SYSTRAP_TRACE=3` prints the time of each step of `New` and `Close`. On `amd64`, `New` spends 16 ms to start the stub host, 16 ms to start the first stub, and 7 to 8 ms in the self test. On `arm64` the same steps take 21, 28 to 33, and 13 to 15 ms. The stub host and the loader of a stub dominate.
+
+The `Close` of the first version took 60 to 76 ms. The pump thread of the debug object waited up to 50 ms in `NtWaitForDebugEvent`, and `Close` waited for the thread. The wait is now alertable, and `Close` ends it with `NtAlertThread`. The pool also terminates its idle stubs together and aborts a stub that it is still starting.
+
+#### Spin windows
+
+Both sides of the handoff poll the state word before they sleep on an event. The first version polled for a number of loop iterations. One poll took 18 ns on `amd64` with a `pause` instruction and 0.15 ns on `arm64` with a `yield` instruction. The `arm64` stub therefore gave up after about 0.2 µs. During the micro-benchmarks, the counters of the Sentry gave these results:
 
 | Host | Fast traps | Sentry slept | Stub woken by an event |
 | :--- | ---: | ---: | ---: |
 | `windows-latest` (`amd64`) | 8723421 | 2.0% | 2.4% |
 | `windows-11-arm` (`arm64`) | 827667 | 59% | 92% |
 
-`BenchmarkFastPathSpinSweep` changes both windows and the Sentry work time. With the default windows, an `arm64` round trip takes 17.5 µs when the Sentry answers at once. A stub window of 16384 polls and a Sentry window of 4096 polls bring it to 0.97 µs. On `amd64` the same change leaves the round trip at 0.42 µs. A Sentry work time of 50 µs still wakes the `arm64` stub on 99.9% of the round trips with a stub window of 60000 polls. On `amd64`, a window of 16384 polls covers that work time. A fixed loop count is not a stable unit. A window in time, read from the architecture counter, would fix this.
+The windows are now times. The Sentry converts each window to ticks of the cycle counter, with a calibration of three samples of one millisecond against the performance counter. The stub reads the same counter: the TSC on `amd64` and `CNTVCT_EL0` on `arm64`. The header of the `winSysmsg` holds the window of the stub in the word `SpinTicks`. The Sentry reads the counter once for each 16 polls. `GVX_SYSTRAP_SPIN_US=stub,sentry` sets both windows in microseconds, for example `64,8`.
 
-The micro-benchmarks also showed that a guest `fork` or `fork` and `exec` sometimes never returns. On `windows-11-arm`, 3 of 20 runs hung on the commit before this work. After it, the first full run hung once, and 1 of 20 later runs hung. On `windows-latest`, none of 20 runs hung before this work. After it, the first full run hung once, and none of 20 later runs hung. The cause is not known.
+The sweep of the windows ran the micro-benchmarks with four settings on each hosted runner. The table gives the median in microseconds and the share of round trips that used an event.
+
+| Runner | Windows (stub, Sentry) | `getpid` | `open` and `close` | Pipe | Futex | Sentry slept | Stub woken |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `amd64` | 0 and 0 | 30.6 | 89.1 | 131.0 | 72.4 | 75.0% | 98.9% |
+| `amd64` | 16 and 1 | 0.50 | 10.2 | 61.9 | 39.6 | 4.5% | 5.2% |
+| `amd64` | 64 and 8 | 0.33 | 5.7 | 10.4 | 6.0 | 0.2% | 0.4% |
+| `amd64` | 256 and 32 | 0.48 | 10.0 | 12.2 | 9.2 | 0.1% | 0.4% |
+| `arm64` | 0 and 0 | 12.9 | 46.9 | 64.8 | 25.9 | 70.4% | 99.9% |
+| `arm64` | 16 and 1 | 1.07 | 13.4 | 37.4 | 20.1 | 4.6% | 6.4% |
+| `arm64` | 64 and 8 | 0.98 | 10.6 | 15.4 | 11.9 | 0.2% | 1.0% |
+| `arm64` | 256 and 32 | 1.06 | 14.1 | 11.6 | 9.8 | 0.1% | 0.6% |
+
+The default is 64 µs for the stub and 8 µs for the Sentry. A longer window did not help. A longer window also keeps a core busy while the other side works. A system call that the Sentry serves in more than 64 µs makes the stub sleep, and the guest pays the event round trip of section 3.2.
+
+#### Hangs of `fork`
+
+The micro-benchmarks showed that a guest `fork` or `fork` and `exec` sometimes never returned. On `windows-11-arm`, 3 of 20 runs hung before the fix. The thread dump showed one thread of the guest frozen at the BRK of a cold resume inside the spill routine, with its event waiting in the channel. `Switch` stood in `stopThread`. Go guests send `SIGURG` with `tgkill`, and the Sentry then calls `stopThread` before it waits for events. `stopThread` waited for the thread to leave the spill routine. The thread could not leave until `Switch` replied to its event, so both waited for each other. `stopThread` now returns when an event is queued, and `Switch` tests the kick again after it served an event. After the fix, none of 32 runs hung on `windows-latest` and none of 32 runs hung on `windows-11-arm`. `TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent` fails without the fix on `arm64`. On `amd64` the pc of the INT3 lies behind the spill routine, so the test cannot fail there.
 
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
 
@@ -346,7 +368,7 @@ A patched instruction jumps to a slot. The slot jumps to the spill routine. The 
 | `RunHot` | The program counter is unchanged, and on `arm64` so is the stack pointer. The stub loads the registers and returns through the slot tail. |
 | `RunCold` | The Sentry changed the program counter, the stack pointer, or the TLS value. The stub loads every register and executes a trap. The Sentry continues the thread at `Target` through the debug path, and loads the FS base or the TLS value. |
 
-The stub stores `Trapped` with release semantics and sets the guest event only when `SentryWaiter` is set. It then polls the state word 1024 times. After that it sets `StubWaiter`, tests the state again, and sleeps on the host event. The Sentry polls 512 times, sets `SentryWaiter`, tests again, and sleeps on the guest event. Each flag has one writer. A fence separates the store of the state from the load of the other flag. A stale event signal does no harm, because both sides test the state after each wake.
+The stub stores `Trapped` with release semantics and sets the guest event only when `SentryWaiter` is set. It then polls the state word for its spin window. After that it sets `StubWaiter`, tests the state again, and sleeps on the host event. The Sentry polls for its own window, sets `SentryWaiter`, tests again, and sleeps on the guest event. Each flag has one writer. A fence separates the store of the state from the load of the other flag. A stale event signal does no harm, because both sides test the state after each wake.
 
 On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot saves `x16` and `x17` in the `Scratch` words of `winSysmsg` without touching the guest stack. It jumps to the spill routine with `x17` set to the slot tail. The routine writes the updated `x16` and `x17` values back to `Scratch` before it returns through the slot tail.
 

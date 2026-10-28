@@ -584,8 +584,9 @@ func TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent(t *testing.T) {
 	if out := r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev); out.done {
 		t.Fatalf("the cold resume ended the stop: %+v", out)
 	}
-	// The thread runs to system call 7. A fast path site publishes a trap, and a
-	// site that keeps CC 90 raises an exception.
+	// The thread runs to system call 7, or stops at once if the kick set the step
+	// flag, as it does on amd64. A fast path site publishes a trap, and a site
+	// that keeps CC 90 raises an exception.
 	ev, trapped, err = th.waitNext()
 	if err != nil {
 		t.Fatal(err)
@@ -596,8 +597,8 @@ func TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent(t *testing.T) {
 	} else {
 		out = r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev)
 	}
-	if !out.done || regNr(r.ac) != 7 {
-		t.Fatalf("the guest stopped with %+v and system call %d, want system call 7", out, regNr(r.ac))
+	if !out.done || (regNr(r.ac) != 7 && !errors.Is(out.err, platform.ErrContextInterrupt)) {
+		t.Fatalf("the guest stopped with %+v and system call %d, want system call 7 or an interrupt", out, regNr(r.ac))
 	}
 }
 
