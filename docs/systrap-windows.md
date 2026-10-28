@@ -154,10 +154,17 @@ These numbers come from the engine tests and the stub probe on the hosted runner
 | One `fork` and `exec` of `/bin/true`, without the pool | 89 ms | 58 ms |
 | One `fork` and `exec` of `/bin/true`, with the pool | 50 ms | 31 ms |
 | One system call in a `dd` loop | 141 µs | 80 µs |
+| Fast-path round trip, spin case (`BenchmarkFastPathRoundTrip/vector/spin`) | 0.50 to 0.56 µs | 11 to 13 µs |
+| Same, with a vector restore on every hot resume (`always/spin`) | 0.67 to 0.73 µs | 11 to 13 µs |
+| Same, without the vector save and restore (`novector/spin`) | 0.46 µs | 10 to 12 µs |
+| Fast-path round trip, stub asleep on the events (`vector/sleep`) | 33 µs | 21 to 25 µs |
+| Debug-path `trap` stops in the `systrap` e2e gates, before and after the pre-window and relocation changes | 22819 to 47 | not measured |
 | `git add` of 200 small files, sparse memory file | 8 to 12 s | 12 to 19 s |
 | `git add` of 200 small files, dense memory file | 1.3 s | 0.8 s |
 
-The cost of a system call is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each need a stub process. A stub that starts on demand costs 10 to 20 ms, and the pool of section 6.1 hides it.
+The fast-path rows come from five runs of two seconds on each hosted runner, with the benchmark of section 11. Each number includes two reads of the performance counter. The `amd64` runner had an AMD EPYC 7763. Numbers from separate runner instances differ by about 10%. The rows `vector/spin` and `always/spin` come from one process, so they compare directly. The stops row counts the debug-path stops of the same `e2e` gates on `windows-latest`, before and after the pre-window and relocation changes. The `arm64` spin case takes 20 times longer than the `amd64` case, and the vector state does not change it. The cause is not measured.
+
+The cost of a system call in the other rows is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each need a stub process. A stub that starts on demand costs 10 to 20 ms, and the pool of section 6.1 hides it.
 
 The memory file of the Sentry is a temporary NTFS file. An earlier version marked it sparse when it tried to release pages. The first write to each hole of a sparse file waits for NTFS to allocate a cluster. Samples of the guest program counter showed the guest blocked at store instructions, and the `git add` row above shows the cost. 
 
@@ -291,7 +298,7 @@ The stub runs with a token that has no privileges and Low integrity, in a job th
 
 ### 6.8 Fast Path
 
-The fast path is on by default. `New` falls back to the debug path when the host cannot run it. Set `GVX_SYSTRAP_FASTPATH=1` to turn a failed fast path into an error, and `GVX_SYSTRAP_FASTPATH=0` to turn the fast path off. It serves a patched system call without the debugger: no `NtSuspendThread`, no `NtResumeThread`, no `NtDebugContinue`, and no context call. The latency is a design target.
+The fast path is on by default. `New` falls back to the debug path when the host cannot run it. Set `GVX_SYSTRAP_FASTPATH=1` to turn a failed fast path into an error, and `GVX_SYSTRAP_FASTPATH=0` to turn the fast path off. It serves a patched system call without the debugger: no `NtSuspendThread`, no `NtResumeThread`, no `NtDebugContinue`, and no context call. Section 3.8 lists the measured round trips.
 
 | Part | Content |
 | :--- | :--- |
@@ -420,7 +427,7 @@ The design rests on facts that no Windows document states:
 | Generated machine code | Decoding with `x86asm` and `arm64asm`, and an emulator that runs the spin hit, the sleep, the races, and the cold resume, also on macOS. |
 | `amd64` patch plan | Unit tests of the relocation and branch rules, also on macOS. |
 | End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. `TestFastPathPreWindowServesEverySystemCall` and the tests after it in `engine_windows_amd64_test.go` cover the pre-window form. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
-| Latency | Not recorded. `BenchmarkFastPathRoundTrip` measures it, and section 11 gives the command. |
+| Latency | `BenchmarkFastPathRoundTrip` measures it, and section 3.8 lists the numbers. On `amd64`, a spin hit takes 0.50 to 0.56 µs and a sleep takes 33 µs. |
 
 The engine reclaims island slots through a per-island bitmap when a code page unmaps or returns to data state. A thread count above 512 for one stub fails with an error.
 
@@ -516,7 +523,7 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
 
-To measure the round trip of the fast path, run the workflow `diagnose` on `windows-latest` and on `windows-11-arm`. Set its `script` input to the command below. The benchmark reports `ns/roundtrip` for the spin case and for the sleep case, with and without the vector state in the spill routine. The variants without the vector state are an upper bound for the saving of a conditional restore. They break a guest that uses a vector register, so only this benchmark runs them.
+To measure the round trip of the fast path, run the workflow `diagnose` on `windows-latest` and on `windows-11-arm`. Set its `script` input to the command below. The benchmark reports `ns/roundtrip` for the spin case and for the sleep case. The variant `always` loads the vector state on every hot resume. The variant `novector` has no save and no restore of the vector state, which gives an upper bound for the saving of a conditional restore. The variants `vector-live`, `always-live`, and `novector-live` run a guest that holds a live vector state. The routines of `always` and `novector` break a guest that uses a vector register, so only this benchmark runs them.
 
 ```bash
 go test -run '^$' -bench BenchmarkFastPathRoundTrip -benchtime 2s -count 3 ./pkg/sentry/platform/systrap/
