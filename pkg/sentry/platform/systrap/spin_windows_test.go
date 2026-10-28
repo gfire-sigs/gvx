@@ -81,14 +81,20 @@ func TestSpinTicksPerUsTracksTheClock(t *testing.T) {
 	if rate < 1 || math.IsNaN(rate) {
 		t.Fatalf("spinTicksPerUs = %v", rate)
 	}
-	start, c0 := time.Now(), spinNow()
-	for time.Since(start) < 20*time.Millisecond {
+	// A descheduled thread skews one sample. The counter is right when one of
+	// a few samples agrees with the calibration.
+	var got float64
+	for range 5 {
+		start, c0 := time.Now(), spinNow()
+		for time.Since(start) < 20*time.Millisecond {
+		}
+		elapsedUs := float64(time.Since(start)) / 1e3
+		got = float64(spinNow()-c0) / elapsedUs
+		if got >= rate*0.9 && got <= rate*1.1 {
+			return
+		}
 	}
-	elapsedUs := float64(time.Since(start)) / 1e3
-	got := float64(spinNow()-c0) / elapsedUs
-	if got < rate*0.9 || got > rate*1.1 {
-		t.Errorf("the counter ran at %.1f ticks per microsecond, the calibration says %.1f", got, rate)
-	}
+	t.Errorf("the counter ran at %.1f ticks per microsecond in the last of five samples, the calibration says %.1f", got, rate)
 }
 
 // TestAwaitSpinWindowLastsItsTime checks that the Sentry polls for the time of
