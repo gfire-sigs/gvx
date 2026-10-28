@@ -191,6 +191,10 @@ type spillOptions struct {
 	// BenchmarkFastPathRoundTrip sets it, to measure what the vector state costs
 	// in one round trip. No production path sets it.
 	noVector bool
+	// alwaysRestore loads the vector state on every hot resume, as the routine
+	// did before the call flag and FPDirty. Only BenchmarkFastPathRoundTrip sets
+	// it, so that the benchmark compares both routines in one process on one host.
+	alwaysRestore bool
 }
 
 // winSignaler is the event pair behind one thread. The Windows engine backs

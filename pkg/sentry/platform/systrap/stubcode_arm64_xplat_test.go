@@ -824,3 +824,28 @@ func TestSpillWithoutVectorStateSkipsTheImage(t *testing.T) {
 		}
 	}
 }
+
+func TestSpillAlwaysRestoreLoadsOnACleanHotSpinHit(t *testing.T) {
+	// The benchmark compares this routine with the production routine, which
+	// skips the load in the same case.
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	r := newSpillRigWith(t, spillOptions{alwaysRestore: true})
+	r.armVectors()
+	r.m.onYield = func(m *a64Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		for n := range 32 {
+			for h := range 2 {
+				m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+			}
+		}
+		m.write(rigSysm+winOffFpsr, 8, 0x33)
+		m.write(rigSysm+winOffFpcr, 8, 0x44)
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
+}

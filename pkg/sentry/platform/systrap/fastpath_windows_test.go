@@ -338,10 +338,12 @@ const sleepRoundTripDelay = time.Millisecond
 // counter measures. It includes two counter reads, about 20 to 60 ns. ns/op
 // also counts the delay of the sleep case.
 //
-// The novector variants run a spill routine without the save and the restore of
-// the vector state. They give the upper bound of what skipping the vector state
-// can save. The routine breaks a guest that uses a vector register, so only
-// this benchmark runs it. The live variants run a guest that holds a live
+// The always variants run the spill routine that loads the vector state on every
+// hot resume, so they give the cost before the call flag and FPDirty. The
+// novector variants run a spill routine without the save and the restore of the
+// vector state. They give the upper bound of what skipping the vector state can
+// save. The routine breaks a guest that uses a vector register, so only this
+// benchmark runs it. The live variants run a guest that holds a live
 // vector state, so a restore of that state reads memory. The other guests leave
 // the vector state in its initial configuration, which a restore loads without
 // a read.
@@ -357,9 +359,11 @@ func BenchmarkFastPathRoundTrip(b *testing.B) {
 	}{
 		{"vector/spin", spillOptions{}, false, 0},
 		{"vector/sleep", spillOptions{}, false, sleepRoundTripDelay},
+		{"always/spin", spillOptions{alwaysRestore: true}, false, 0},
 		{"novector/spin", spillOptions{noVector: true}, false, 0},
 		{"novector/sleep", spillOptions{noVector: true}, false, sleepRoundTripDelay},
 		{"vector-live/spin", spillOptions{}, true, 0},
+		{"always-live/spin", spillOptions{alwaysRestore: true}, true, 0},
 		{"novector-live/spin", spillOptions{noVector: true}, true, 0},
 	} {
 		b.Run(c.name, func(b *testing.B) { benchmarkFastPathRoundTrip(b, c.opts, c.live, c.delay) })
@@ -368,7 +372,7 @@ func BenchmarkFastPathRoundTrip(b *testing.B) {
 
 func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, live bool, delay time.Duration) {
 	p := newFastPlatform(b)
-	if opts.noVector {
+	if opts != (spillOptions{}) {
 		sc, err := buildSpillWith(opts)
 		if err != nil {
 			b.Fatal(err)

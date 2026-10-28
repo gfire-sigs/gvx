@@ -395,7 +395,13 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	// Hot resume: load the vector state when a call ran or the Sentry wrote the
 	// image, then load the FS base, the flags, the return address, and every
 	// register, and jump to the tail.
-	if !opts.noVector {
+	switch {
+	case opts.noVector:
+	case opts.alwaysRestore:
+		a.loadXsaveMask()
+		a.xrstor64(base, winOffXsave)
+		a.movStoreImm32(base, winOffFPDirty, 0)
+	default:
 		a.emit(0x41, 0x83, 0xFE, 0x00) // cmp r14d, 0
 		a.jcc8(x86CCNE, "hotload")
 		a.cmpMemImm8(base, winOffFPDirty, 0)

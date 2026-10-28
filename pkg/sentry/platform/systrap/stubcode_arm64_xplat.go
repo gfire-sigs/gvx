@@ -278,7 +278,12 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		hvcommon.LDRX(base, 0, winOffX+8*18),
 		hvcommon.STRX(base, 0, winOffX18),
 	)
-	if !opts.noVector {
+	switch {
+	case opts.noVector:
+	case opts.alwaysRestore:
+		a.emit(restoreVector(base)...)
+		a.emit(hvcommon.STRW(base, a64XZR, winOffFPDirty))
+	default:
 		a.cbnzW(flag, "hotload")
 		a.emit(hvcommon.LDRW(base, 0, winOffFPDirty))
 		a.cbzW(0, "hotskip")

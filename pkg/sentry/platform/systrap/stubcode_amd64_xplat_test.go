@@ -1788,3 +1788,23 @@ func TestSpillCallFlagIsNotTheGuestR14(t *testing.T) {
 	}
 	r.checkHotExit(t, r.guest, rigFlags)
 }
+
+func TestSpillAlwaysRestoreLoadsOnACleanHotSpinHit(t *testing.T) {
+	// The benchmark compares this routine with the production routine, which
+	// skips the load in the same case.
+	sentry := vectorImage(rigVectorSeed + 8)
+	r := newSlotRig(t, rigNop3, false, spillOptions{alwaysRestore: true})
+	r.m.onYield = func(m *x86Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		r.putSysmsgVector(sentry)
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if !sameVector(r.m.vec[:], sentry) {
+		t.Error("the always-restore routine did not load the image on a clean hot spin hit")
+	}
+}
