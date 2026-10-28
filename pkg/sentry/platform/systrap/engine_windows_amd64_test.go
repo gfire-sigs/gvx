@@ -17,11 +17,13 @@
 package systrap
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
 // TestFSBaseIsRepairedAfterPreemption runs a loop that reads through %fs for
@@ -442,5 +444,61 @@ func TestPreWindowCloneChildStartsBehindTheSyscall(t *testing.T) {
 	}
 	if got := regPC(child.ac); got != g.site+2 {
 		t.Errorf("the child pc is %#x, want %#x", got, g.site+2)
+	}
+}
+
+// TestStopThreadReturnsWhenTheThreadFaultsInASlot makes the instruction that a
+// slot relocates fault. The thread then stands frozen at the exception inside
+// the island, which counts as trap code, until Switch replies. This is the amd64
+// form of the deadlock that TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent
+// covers on arm64. A hung guest on windows-latest showed it: Switch and the
+// interrupter both stood in stopThread, and the thread had one event queued at
+// the first instruction of a slot tail.
+func TestStopThreadReturnsWhenTheThreadFaultsInASlot(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	// syscall; mov [rsp+8], rax; nop...: the post-window plan relocates the MOV.
+	r.program(gSyscall(1), []byte{0x48, 0x89, 0x44, 0x24, 0x08}, nops(16), gSyscall(2))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+
+	// The relocated MOV writes to an address that no page backs.
+	const unmapped = 0x7000_5000_0000
+	r.ac.StateData().Regs.Rsp = unmapped
+	th := r.ctx.th.Load()
+	if err := th.start(r.ac, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := th.run(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for th.evQueued.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the relocated MOV raised no event")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	r.ctx.kicked.Store(true)
+	done := make(chan struct{})
+	go func() {
+		r.ctx.stopThread(th)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stopThread did not return while the thread waited at a fault in a slot")
+	}
+
+	// Switch serves the fault as a SIGSEGV of the guest.
+	r.ctx.kicked.Store(false)
+	ev, trapped, err := th.waitNext()
+	if err != nil || trapped {
+		t.Fatalf("waitNext = (trapped %v, %v), want the fault event", trapped, err)
+	}
+	out := r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev)
+	if !out.done || !errors.Is(out.err, platform.ErrContextSignal) {
+		t.Fatalf("the fault ended with %+v, want a signal", out)
 	}
 }
