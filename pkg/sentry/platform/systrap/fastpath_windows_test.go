@@ -556,3 +556,82 @@ type errSignaler struct{}
 
 func (errSignaler) signalHost() error { return nil }
 func (errSignaler) waitGuest() error  { return errors.New("no sleep in the benchmark") }
+
+// TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent starts a cold resume and
+// kicks the context while the thread is frozen at the trap of the resume. The
+// trap is an exception in the code of the spill routine, and only Switch can
+// reply to it. Switch calls stopThread before it waits for events, so a
+// stopThread that waits for the thread to leave the spill routine never
+// returns. Go guests that send preemption signals with tgkill hit this and
+// hung on windows-11-arm.
+func TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	mem := r.program(gSyscall(1))
+	copy(mem[0x100:], gSyscall(7))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+
+	// A changed program counter makes the resume cold.
+	r.ac.SetIP(codeVA + 0x100)
+	th := r.ctx.th.Load()
+	if err := th.start(r.ac, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := th.run(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for th.evQueued.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the cold resume raised no event")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	r.ctx.kicked.Store(true)
+	done := make(chan struct{})
+	go func() {
+		r.ctx.stopThread(th)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stopThread did not return while the thread waited at an event")
+	}
+}
+
+// TestKickDuringColdResumeInterruptsTheGuest checks the other half of the fix:
+// a kick that stopThread leaves while the thread waits at the trap of a cold
+// resume still stops the guest after Switch served the trap.
+func TestKickDuringColdResumeInterruptsTheGuest(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	mem := r.program(gSyscall(1))
+	copy(mem[0x100:], gCountSpin())
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+
+	r.ac.SetIP(codeVA + 0x100) // a cold resume into a loop that never traps
+	done := make(chan error, 1)
+	go func() {
+		si, _, err := r.run()
+		if si != nil {
+			err = fmt.Errorf("signal %s: %w", describe(si), err)
+		}
+		done <- err
+	}()
+	// Kick many times while the resume and the loop run, so some kicks land
+	// while the thread waits at the trap of the cold resume.
+	for range 200 {
+		r.ctx.Interrupt()
+		select {
+		case err := <-done:
+			if !errors.Is(err, platform.ErrContextInterrupt) {
+				t.Fatalf("Switch returned %v, want ErrContextInterrupt", err)
+			}
+			return
+		case <-time.After(time.Millisecond):
+		}
+	}
+	t.Fatal("the guest did not stop after 200 kicks")
+}

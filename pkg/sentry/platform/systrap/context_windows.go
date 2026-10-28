@@ -171,6 +171,12 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 				c.fpInStub = true
 				return out.si, out.at, out.err
 			}
+			// The thread runs on after an event that the engine served. A kick
+			// that stopThread left while the thread waited at the event must stop
+			// the thread now.
+			if c.kicked.Load() {
+				c.stopThread(th)
+			}
 		}
 	}
 }
@@ -467,10 +473,20 @@ func (c *Context) NotifyInterrupt() {
 
 // stopThread forces a stop of a running thread. A thread can run the code of a
 // trap, which publishes its own stop. The call tries again until the thread
-// leaves that code or publishes the trap, which Switch serves.
+// leaves that code, publishes the trap, or raises an exception. Switch serves
+// the trap and the exception.
+//
+// A thread that raised an exception in the code of a trap stays frozen until
+// Switch replies to the exception. A cold resume does this at its BRK or INT3.
+// Switch calls stopThread before it waits for events, so the call must return
+// when an event is queued, or the two would wait for each other. Switch then
+// tests the flag again after it served the event.
 func (c *Context) stopThread(th *thread) {
 	for i := 0; !th.forceStop(); i++ {
 		if f := th.fast.Load(); f != nil && f.slot.sm.loadState() == winStateTrapped {
+			return
+		}
+		if th.evQueued.Load() > 0 || th.sp.dead.Load() {
 			return
 		}
 		if !c.kicked.Load() {
