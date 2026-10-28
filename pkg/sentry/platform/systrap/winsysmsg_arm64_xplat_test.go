@@ -96,3 +96,14 @@ func TestWinSiteReturnIsTheNextInstruction(t *testing.T) {
 		t.Fatalf("the return address of a site at 0x1000 is %#x, want 0x1004", got)
 	}
 }
+
+func TestWinSysmsgLoadVectorMarksTheImageDirty(t *testing.T) {
+	var sm winSysmsg
+	if sm.FPDirty != 0 {
+		t.Fatal("a new sysmsg is dirty")
+	}
+	sm.loadVector(newTrapContext())
+	if sm.FPDirty != 1 {
+		t.Errorf("FPDirty = %d after the Sentry wrote the image, want 1", sm.FPDirty)
+	}
+}

@@ -45,6 +45,10 @@ type debugger struct {
 
 	stop atomic.Bool
 	done chan struct{}
+	// pump is a handle of the pump thread that NtAlertThread accepts, or zero.
+	// ready closes when run stored it.
+	pump  windows.Handle
+	ready chan struct{}
 
 	// foreign counts events for processes that the debugger does not know.
 	foreign atomic.Uint64
@@ -144,7 +148,11 @@ func statsLine() string {
 	for k := stopKind(0); k < stopKinds; k++ {
 		fmt.Fprintf(&b, " %s %d %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6, stopStats.waitNs[k].Load()/1e6)
 	}
-	return strings.TrimSuffix(b.String(), ",") + fmt.Sprintf("; fast traps %d", fastTraps.Load()) + "; " + bringUpLine()
+	line := strings.TrimSuffix(b.String(), ",") + fmt.Sprintf("; fast traps %d (Sentry slept %d, stub woken %d)", fastTraps.Load(), fastSentrySleeps.Load(), fastStubWakes.Load())
+	if sites := archStatsLine(); sites != "" {
+		line += "; " + sites
+	}
+	return line + "; " + bringUpLine()
 }
 
 func tracef(format string, args ...any) {
@@ -163,7 +171,7 @@ func newDebugger() (*debugger, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &debugger{obj: obj, procs: make(map[uint32]*stubProc), done: make(chan struct{})}
+	d := &debugger{obj: obj, procs: make(map[uint32]*stubProc), done: make(chan struct{}), ready: make(chan struct{})}
 	go d.run()
 	if traceWatch {
 		go d.watch()
@@ -252,7 +260,16 @@ func (d *debugger) close() {
 	if d.stop.Swap(true) {
 		return
 	}
+	// The pump waits up to the poll time for an event. An alert ends the wait
+	// at once, so close does not pay the poll time.
+	<-d.ready
+	if d.pump != 0 {
+		_ = ntAlertThread(d.pump)
+	}
 	<-d.done
+	if d.pump != 0 {
+		_ = windows.CloseHandle(d.pump)
+	}
 	_ = windows.CloseHandle(d.obj)
 }
 
@@ -279,6 +296,11 @@ func (d *debugger) lookup(pid uint32) *stubProc {
 func (d *debugger) run() {
 	runtime.LockOSThread()
 	defer close(d.done)
+	// A failed open only costs the poll time at close.
+	if h, err := windows.OpenThread(threadAlert, false, windows.GetCurrentThreadId()); err == nil {
+		d.pump = h
+	}
+	close(d.ready)
 	var rec [debugRecordSize]byte
 	for !d.stop.Load() {
 		ok, err := ntWaitForDebugEvent(d.obj, 50*time.Millisecond, &rec)

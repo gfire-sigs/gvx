@@ -228,13 +228,19 @@ func (w *vcpuWorker) runSwitch(r *switchReq) (*linux.SignalInfo, hostarch.Access
 }
 
 // runLoop enters the guest until an exit needs the Sentry.
+//
+// The first check consumes an interrupt that is already pending. The vCPU holds
+// a complete state at that point. After a later exit that resumes the guest,
+// onCancel handles a pending interrupt. Returning straight from the spill
+// routine would leave the stub exception in the CommPage. The next entry would
+// then replay the HVC against that stale exception.
 func (w *vcpuWorker) runLoop(c *Context, pt *stage1Tables, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
+	if c.interrupted.CompareAndSwap(true, false) {
+		return nil, hostarch.NoAccess, platform.ErrContextInterrupt
+	}
 	for {
 		if w.quit.Load() {
 			return nil, hostarch.NoAccess, errPlatformClosed
-		}
-		if c.interrupted.CompareAndSwap(true, false) {
-			return nil, hostarch.NoAccess, platform.ErrContextInterrupt
 		}
 		if err := w.prepareEntry(pt); err != nil {
 			return nil, hostarch.NoAccess, err
@@ -255,6 +261,13 @@ func (w *vcpuWorker) runLoop(c *Context, pt *stage1Tables, ac *arch.Context64) (
 		done, info, at, err := w.dispatchExit(c, pt, ac)
 		if done {
 			return info, at, err
+		}
+		if c.interrupted.Load() {
+			// The exit left the guest live. onCancel records the state for the
+			// interrupt and consumes the flag, or it resumes the guest.
+			if done, info, at, err = w.onCancel(c, pt); done {
+				return info, at, err
+			}
 		}
 	}
 }

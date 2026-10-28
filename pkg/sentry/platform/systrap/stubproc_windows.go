@@ -167,7 +167,11 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	}
 	// The loader finishes and raises the initial breakpoint of a debuggee. The
 	// stub is then fully initialized, and nothing else of its image ever runs.
-	ev, err := th0.waitEvent(startTimeout)
+	var abort <-chan struct{}
+	if p.pool != nil {
+		abort = p.pool.stop
+	}
+	ev, err := th0.waitEventUntil(startTimeout, abort)
 	if err != nil {
 		return fail(fmt.Errorf("wait for the loader of the stub: %w", err))
 	}
@@ -233,20 +237,31 @@ func (p *Platform) fillPool() {
 	}
 }
 
-// stopPool stops the goroutine and terminates the stubs that no guest took.
+// stopPool stops the goroutine and terminates the stubs that no guest took. A
+// stub that the goroutine is still starting aborts at its next wait. The
+// processes terminate together, because each one takes a few milliseconds to
+// end, and the pool holds several.
 func (p *Platform) stopPool() {
 	if p.pool == nil {
 		return
 	}
 	close(p.pool.stop)
 	<-p.pool.done
+	var idle []*stubProc
 	for {
 		select {
 		case sp := <-p.pool.ready:
-			sp.destroy()
+			idle = append(idle, sp)
+			continue
 		default:
-			return
 		}
+		break
+	}
+	for _, sp := range idle {
+		_ = ntTerminateProcess(sp.proc)
+	}
+	for _, sp := range idle {
+		sp.destroy()
 	}
 }
 

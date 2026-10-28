@@ -124,6 +124,10 @@ func (m *winSysmsg) loadVector(ac *arch.Context64) {
 	if fpsr, fpcr, ok := copyFPFromArch(m.Vec[:], ac); ok {
 		m.Fpsr = uint64(fpsr)
 		m.Fpcr = uint64(fpcr)
+		// The store has release semantics, and the Sentry publishes the resume
+		// state with a later store. The stub reads the state first, so it sees
+		// the image whenever it sees the flag.
+		m.fpDirty().Store(1)
 	}
 }
 

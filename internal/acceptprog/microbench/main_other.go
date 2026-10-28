@@ -12,16 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin && arm64
+//go:build !linux || !(amd64 || arm64)
 
-package systrap
+package main
 
-import "os"
-
-// ZoneEnv names the optional environment variable that overrides zone mode.
-// Zone mode is enabled automatically when the host address range can hold the
-// biased 4GB zone; setting ZoneEnv to "0" disables it.
-const ZoneEnv = "GVX_SYSTRAP_FIXED_IMAGES"
-
-// zoneModeDisabled reports whether the environment explicitly disables zone mode.
-func zoneModeDisabled() bool { return os.Getenv(ZoneEnv) == "0" }
+func main() {}

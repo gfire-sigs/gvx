@@ -165,6 +165,10 @@ func winSiteReturn(site uint64) uint64 { return site + winSiteLen }
 // The spill routine loads the image with XRSTOR on the next resume.
 func (m *winSysmsg) loadVector(ac *arch.Context64, enabled uint64) {
 	m.loadXsave(*ac.FloatingPointData(), enabled)
+	// The store has release semantics, and the Sentry publishes the resume state
+	// with a later store. The stub reads the state first, so it sees the image
+	// whenever it sees the flag.
+	m.fpDirty().Store(1)
 }
 
 // loadXsave builds the XSAVE image of the Linux XSAVE image fp in the sysmsg.

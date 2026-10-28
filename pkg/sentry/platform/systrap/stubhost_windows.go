@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -94,7 +95,10 @@ type stubHostLoop struct {
 	token  windows.Token
 	level  confinement
 	exe    string
-	jobs   map[uint32]windows.Handle
+	// image is the locked file that the stubs run. It is nil when the host could
+	// not write it. The stubs then run a copy of the executable of the host.
+	image *stubImage
+	jobs  map[uint32]windows.Handle
 	// procs holds a handle to each live stub, to duplicate event handles into it.
 	procs map[uint32]windows.Handle
 	// debug is the debug object of the Sentry, in the handle table of the host.
@@ -104,6 +108,7 @@ type stubHostLoop struct {
 // runStubHost serves requests until the Sentry closes the pipe. It returns the
 // process exit code.
 func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
+	tStart := time.Now()
 	h := &stubHostLoop{jobs: make(map[uint32]windows.Handle), procs: make(map[uint32]windows.Handle)}
 	sentry, err := windows.OpenProcess(windows.PROCESS_DUP_HANDLE, false, sentryPID)
 	if err != nil {
@@ -114,9 +119,27 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 4
 	}
+	tToken := time.Now()
 	h.token, h.level, err = buildStubToken()
 	if err != nil {
 		return 5
+	}
+	tImage := time.Now()
+	h.image, err = createStubImage(os.TempDir())
+	if err != nil && traceEvents {
+		tracef("stub host: no stub image, the stubs run the executable of the host: %v", err)
+	}
+	defer h.image.close()
+	if traceWatch {
+		// The age is the time from the creation of the process to this point. It
+		// covers the kernel, the loader, the Go runtime, and the package inits.
+		var created, exited, kernel, user windows.Filetime
+		age := float64(-1)
+		if windows.GetProcessTimes(windows.CurrentProcess(), &created, &exited, &kernel, &user) == nil {
+			age = float64(time.Now().UnixNano()-created.Nanoseconds()) / 1e6
+		}
+		fmt.Fprintf(os.Stderr, "systrap: stub host ms: age at start %.1f, token %.1f, image %.1f, setup %.1f\n",
+			age, float64(tImage.Sub(tToken))/1e6, float64(time.Since(tImage))/1e6, float64(time.Since(tStart))/1e6)
 	}
 	// The first reply tells the Sentry that the host is ready.
 	if err := writeHostReply(out, 0, nil, h.level); err != nil {
@@ -125,13 +148,8 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	for {
 		var req [hostReqSize]byte
 		if _, err := io.ReadFull(in, req[:]); err != nil {
-			// EOF means that the Sentry is gone. Closing the job handles kills the stubs.
-			for pid := range h.jobs {
-				h.release(pid)
-			}
-			for pid := range h.procs {
-				h.release(pid)
-			}
+			// EOF means that the Sentry is gone.
+			h.shutdown()
 			return 0
 		}
 		if binary.LittleEndian.Uint32(req[0:]) != hostMagic {
@@ -314,6 +332,21 @@ func (h *stubHostLoop) release(pid uint32) {
 	}
 }
 
+// shutdown ends every stub. Closing the last handle of a job kills its stub.
+// The host then waits for each stub to exit, because a stub that still maps the
+// image keeps the file of the image on disk.
+func (h *stubHostLoop) shutdown() {
+	for pid, job := range h.jobs {
+		_ = windows.CloseHandle(job)
+		delete(h.jobs, pid)
+	}
+	for pid, proc := range h.procs {
+		_, _ = windows.WaitForSingleObject(proc, 1000)
+		_ = windows.CloseHandle(proc)
+		delete(h.procs, pid)
+	}
+}
+
 // eventStubAccess is the right of a stub on an event: it sets and waits.
 const eventStubAccess = 0x100002 // EVENT_MODIFY_STATE | SYNCHRONIZE
 
@@ -359,7 +392,11 @@ func (h *stubHostLoop) newEvents(pid uint32) (out eventHandles, err error) {
 // newStub creates one confined, suspended stub process and returns handles in
 // the Sentry process.
 func (h *stubHostLoop) newStub() (*stubHandles, error) {
-	cmd, err := windows.UTF16PtrFromString(`"` + h.exe + `" stub`)
+	img := h.exe
+	if h.image != nil {
+		img = h.image.path
+	}
+	cmd, err := windows.UTF16PtrFromString(`"` + img + `" stub`)
 	if err != nil {
 		return nil, err
 	}
@@ -524,14 +561,20 @@ func spawnStubHost(debug windows.Handle) (*stubHost, error) {
 	if err != nil {
 		return nil, err
 	}
+	tStart := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start the stub host: %w", err)
 	}
+	tStarted := time.Now()
 	h := &stubHost{cmd: cmd, in: in, out: out}
 	var rsp [hostRspSize]byte
 	if _, err := io.ReadFull(out, rsp[:]); err != nil {
 		_ = h.close()
 		return nil, fmt.Errorf("the stub host did not report ready: %w", err)
+	}
+	if traceWatch {
+		fmt.Fprintf(os.Stderr, "systrap: spawn ms: CreateProcess %.1f, wait for ready %.1f\n",
+			float64(tStarted.Sub(tStart))/1e6, float64(time.Since(tStarted))/1e6)
 	}
 	if binary.LittleEndian.Uint32(rsp[0:]) != hostMagic || binary.LittleEndian.Uint32(rsp[4:]) != 0 {
 		_ = h.close()
