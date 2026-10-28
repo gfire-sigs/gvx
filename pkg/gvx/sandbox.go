@@ -74,16 +74,41 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 
 	sb := &Sandbox{cfg: cfg}
 
-	cleanup := func(cause error) (*Sandbox, error) {
-		return nil, errors.Join(cause, sb.Close())
+	// The platform starts child processes, which takes tens of milliseconds on
+	// Windows, and nothing below uses it until the lockdown. It opens while the
+	// layers, mounts, network, and memory file open. joinPlatform waits for it
+	// and reports its error first, as it did when New opened it first.
+	type opened struct {
+		plat platform.Platform
+		name string
+		err  error
+	}
+	platCh := make(chan opened, 1)
+	go func() {
+		p, n, e := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
+		platCh <- opened{p, n, e}
+	}()
+	joined := false
+	joinPlatform := func() error {
+		if joined {
+			return nil
+		}
+		joined = true
+		r := <-platCh
+		if r.err != nil {
+			return r.err
+		}
+		sb.plat = r.plat
+		sb.platName = r.name
+		return nil
 	}
 
-	plat, platName, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
-	if err != nil {
-		return cleanup(err)
+	cleanup := func(cause error) (*Sandbox, error) {
+		if err := joinPlatform(); err != nil {
+			cause = err
+		}
+		return nil, errors.Join(cause, sb.Close())
 	}
-	sb.plat = plat
-	sb.platName = platName
 
 	if err := sb.initOCILayers(ctx); err != nil {
 		return cleanup(err)
@@ -103,6 +128,10 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 	}
 	sb.memFile = mf
 	sb.attachChunkMemory()
+
+	if err := joinPlatform(); err != nil {
+		return cleanup(err)
+	}
 
 	if !cfg.DisableHostLockdown {
 		st, err := hostlockdown.Apply(sb.lockdownOptions())
