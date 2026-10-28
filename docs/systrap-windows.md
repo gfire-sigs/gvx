@@ -177,7 +177,7 @@ The `x86-64` `syscall` instruction is two bytes. A same-size replacement fits ev
 
 The 5-byte `jmp rel32` patterns of the SPEC are harder. They overwrite three bytes after the `syscall`. A patcher must move those instructions into a trampoline, fix any `RIP`-relative operand, and prove that no branch lands inside the window. That work needs exact instruction boundaries. The default engine uses no such pattern. The optional fast path of section 6.8 uses it, and it keeps `CC 90` where it cannot prove the window.
 
-Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps. The sweeps start at different offsets. It patches a site only when more than half of them agree. The decoder gives no guarantee for four kinds of code:
+Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps that start at different offsets. A sweep that cannot decode a byte skips it, and only the sweeps with the fewest skipped bytes vote. The engine patches a site only when more than half of those sweeps agree. The decoder gives no guarantee for four kinds of code:
 
 - Data that sits inside executable sections, such as tables and padding.
 - Hand-written assembly with computed jumps.
