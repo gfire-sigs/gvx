@@ -66,7 +66,7 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | Flag | Meaning |
 | :--- | :--- |
 | `-image REF`, `-bin ELF` | Name the image or the binary without a positional argument. |
-| `-platform BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. A value with a slash is a Docker image platform. |
+| `-platform BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. The `systrap` backend runs on Windows and Linux. macOS has no `systrap` engine. A value with a slash is a Docker image platform. |
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
@@ -175,8 +175,8 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
-| Executables that link at a fixed address (non-PIE) | The macOS `systrap` engine enables its `+2^46` biased zone mode automatically for `ET_EXEC` images linked in `[0x10000, 4GB)`. Setting `GVX_SYSTRAP_FIXED_IMAGES=0` turns the zone off, and the error then names `-platform=hvf`. `hvf`, `whpx`, and the Windows `systrap` engine run them natively. |
-| Executables with 4KB segment alignment | A build with `-tags pagesize_16k` has 16KB guest pages. `rungv` refuses an executable with a segment that is not congruent modulo 16KB. The error names the program header. Relink with `-z max-page-size=16384`, use the build without the tag, or set `-elf-check=false`. The check reads the entry executable only. Segments with different permissions can share one page. The loader maps that page writable and executable. |
+| Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
+| Executables with 4KB segment alignment | The default build has 4KB guest pages, so this row does not apply to it. The opt-in tag `-tags pagesize_16k` has 16KB guest pages. The tag served the removed macOS `systrap` engine, which could not run such executables with 4KB segments. With the tag, `rungv` refuses an executable with a segment that is not congruent modulo 16KB. The error names the program header. Relink with `-z max-page-size=16384`, use the build without the tag, or set `-elf-check=false`. The check reads the entry executable only. Segments with different permissions can share one page. The loader maps that page writable and executable. |
 | A store into the page of the storing instruction | A `systrap` engine gives a page write access or execute access, never both. The Sentry runs a store from a writable and executable page into the same page. It writes both copies of the page. The Sentry decodes the single and pair stores of general and vector registers. Exclusive and atomic stores, a store across the page edge, and a store over an instruction that the patcher changed end with SIGSEGV. The Sentry log names the instruction. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
 

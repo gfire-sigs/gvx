@@ -18,7 +18,7 @@ package systraptest
 
 import "errors"
 
-// probe reports that hosts other than Windows and macOS have no gvx engine.
+// probe reports that hosts other than Windows, macOS, and Linux have no systrap engine.
 func probe() (missing bool, err error) {
-	return true, errors.New("the gvx systrap engine runs on windows and darwin only")
+	return true, errors.New("the gvx systrap engine runs on windows and linux only")
 }

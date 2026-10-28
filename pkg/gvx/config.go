@@ -40,8 +40,8 @@ const (
 	// PlatformHVF selects the macOS Hypervisor.framework backend.
 	PlatformHVF PlatformType = "hvf"
 	// PlatformSystrap selects the native stub-subprocess backend of SPEC 3.3.
-	// On darwin/arm64 it needs a Sentry built with -tags pagesize_16k. Other
-	// hosts have no engine yet, and New returns ErrPlatformUnavailable there.
+	// It runs on Windows and Linux. macOS runs on Hypervisor.framework only, so
+	// New returns ErrPlatformUnavailable there.
 	PlatformSystrap PlatformType = "systrap"
 )
 
