@@ -933,3 +933,15 @@ func TestPlanAndEncodeWinGSMovSlotExecutesLoadsAndStores(t *testing.T) {
 		})
 	}
 }
+
+// TestPlanJmpPatchRelocatesVZero checks that the planner moves the three bytes
+// of a VZEROUPPER behind a SYSCALL, and no byte of the next instruction. The old
+// length of 5 moved two bytes of the LEA into the slot.
+func TestPlanJmpPatchRelocatesVZero(t *testing.T) {
+	// syscall; vzeroupper; lea rsp, [rbp-0x28]; ret
+	page := []byte{0x0f, 0x05, 0xc5, 0xf8, 0x77, 0x48, 0x8d, 0x65, 0xd8, 0xc3}
+	reloc, ok := planJmpPatch(nil, page, nil, 0)
+	if want := []byte{0xc5, 0xf8, 0x77}; !ok || !bytes.Equal(reloc, want) {
+		t.Errorf("planJmpPatch = (% x, %v), want (% x, true)", reloc, ok, want)
+	}
+}

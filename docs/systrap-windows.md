@@ -186,6 +186,8 @@ Finding the sites is the main problem. A byte scan has false positives: 34 of 53
 
 The engine limits the first kind with the section headers of the backing ELF file. It scans a page again each time the page becomes executable, which covers the last kind.
 
+The `x86asm` decoder has one more defect. It reads a ModRM byte for `vzeroupper` and `vzeroall`, which have none. The length that it returns is then 1 to 5 bytes too long. The engine decodes these two instructions itself, in `decodeX86`. Before this correction, the scan of Node 22 found a GS memory instruction inside a `lea`. The patch then made the `lea` an illegal instruction, and the guest received SIGILL.
+
 An indirect jump into the middle of an instruction can run a hidden `0F 05`. A hostile guest plants such a jump on purpose. Linux uses `seccomp` to catch every such call. macOS uses a Seatbelt filter that kills the stub. Windows has no equivalent. The engine makes benign guests correct, but it cannot prove completeness for hostile `amd64` code.
 
 `arm64` is different. Every instruction is four bytes and aligned. A scan of every aligned word in executable pages finds every `svc` that can run. The page trap keeps pages non-executable until the Sentry scans them, so no `svc` can run in a guest page without a scan. This holds for guest pages only. Section 7 explains the gap that remains.
