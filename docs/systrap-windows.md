@@ -170,6 +170,35 @@ The memory file of the Sentry is a temporary NTFS file. An earlier version marke
 
 The `unix.Fallocate` shim now never sets the sparse flag. A dense memory file reserves its disk space when it grows. Twenty-four memory files of one gigabyte exhausted the disk of a hosted runner.
 
+### 3.9 Cross-Backend Micro-Benchmarks and Spin Windows
+
+The test `TestE2EMicroBench` runs the guest `internal/acceptprog/microbench` on each backend. Section 11 gives the command. Each number is the median of three runs. A hosted `windows-latest` runner is a virtual machine, so `whpx` there runs under nested virtualization. The `hvf` column comes from an Apple Silicon development host with eight cores.
+
+| Operation | `hvf` | `whpx` | Windows `systrap` `amd64` | Windows `systrap` `arm64` | Linux `systrap` `amd64` | Linux `systrap` `arm64` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `getpid` | 1.2 µs | 19 µs | 0.46 µs | 12 µs | 4.3 µs | 3.0 µs |
+| `open` and `close` | 19 µs | 58 µs | 10 µs | 60 µs | 16 µs | 16 µs |
+| Pipe round trip, 64 bytes | 12.5 µs | 168 µs | 41 µs | 58 µs | 22 µs | 17 µs |
+| Futex round trip | 23 µs | 155 µs | 27 µs | 33 µs | 8.5 µs | 6.7 µs |
+| `fork` and `wait` | 0.95 ms | 0.82 ms | 15 ms | 23 ms | 2.0 ms | 1.7 ms |
+| `fork` and `exec` of a minimal executable | 0.25 ms | 1.9 ms | 12 ms | 23 ms | 0.42 ms | 0.69 ms |
+| `gvx.New` | 10 ms | 18 ms | 65 ms | 100 ms | 2.0 ms | 2.9 ms |
+| `Run` of a guest that exits at once | 0.7 ms | 2.6 ms | 7 to 9 ms | 6 to 12 ms | 1.0 ms | 2.1 ms |
+| `Close` | 0.08 ms | 1.4 ms | 61 to 65 ms | 68 to 76 ms | 0.005 ms | 0.012 ms |
+
+The Windows `systrap` costs of `New` and `Close` are large. Both pay for the stub processes of the pool. The Linux numbers use the upstream `systrap` platform and a build without cgo.
+
+The `arm64` round trip of the fast path is slow because the spin windows are too short. Both windows are loop counts. A `pause` instruction on `amd64` takes tens of cycles. A `yield` instruction on `arm64` takes about one cycle. The same count therefore covers a much shorter time. During the micro-benchmarks, the counters of the Sentry gave these results:
+
+| Host | Fast traps | Sentry slept | Stub woken by an event |
+| :--- | ---: | ---: | ---: |
+| `windows-latest` (`amd64`) | 8723421 | 2.0% | 2.4% |
+| `windows-11-arm` (`arm64`) | 827667 | 59% | 92% |
+
+`BenchmarkFastPathSpinSweep` changes both windows and the Sentry work time. With the default windows, an `arm64` round trip takes 17.5 µs when the Sentry answers at once. A stub window of 16384 polls and a Sentry window of 4096 polls bring it to 0.97 µs. On `amd64` the same change leaves the round trip at 0.42 µs. A Sentry work time of 50 µs still wakes the `arm64` stub on 99.9% of the round trips with a stub window of 60000 polls. On `amd64`, a window of 16384 polls covers that work time. A fixed loop count is not a stable unit. A window in time, read from the architecture counter, would fix this.
+
+The micro-benchmarks also showed that a guest `fork` or `fork` and `exec` sometimes never returns. On `windows-11-arm`, 3 of 20 runs hung on the commit before this work. After it, the first full run hung once, and 1 of 20 later runs hung. On `windows-latest`, none of 20 runs hung before this work. After it, the first full run hung once, and none of 20 later runs hung. The cause is not known.
+
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
 
 The SPEC lists `ProcessInstrumentationCallback` (information class 40) as the "Unpatched Syscall Safety Net". The kernel calls the callback when it returns to user mode. By then the kernel has already run the NT service. The callback sees the return address in `R10` and can detect a `0F 05` at `R10 - 2`.
@@ -522,6 +551,14 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 4. Run `go build` in the probe directory with Go 1.24 or newer.
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
+
+To compare the backends, run the workflow `diagnose` with this script. The test prints one line that starts with `MBRESULT` or `MBSUMMARY` for each number. Add `GVX_E2E_BENCH_ONLY=fork_wait` to run one benchmark, and `GVX_E2E_BENCH_REPEAT=8` to change the number of runs. On Linux, add `CGO_ENABLED=0`.
+
+```bash
+GVX_E2E_BENCH=1 go test -count=1 -v -timeout 25m -run TestE2EMicroBench ./e2e/
+```
+
+To measure the spin windows, run `BenchmarkFastPathSpinSweep`. It reports `sentry-sleeps/op` and `stub-wakes/op` for each combination of windows and Sentry work.
 
 To measure the round trip of the fast path, run the workflow `diagnose` on `windows-latest` and on `windows-11-arm`. Set its `script` input to the command below. The benchmark reports `ns/roundtrip` for the spin case and for the sleep case. The variant `always` loads the vector state on every hot resume. The variant `novector` has no save and no restore of the vector state, which gives an upper bound for the saving of a conditional restore. The variants `vector-live`, `always-live`, and `novector-live` run a guest that holds a live vector state. The routines of `always` and `novector` break a guest that uses a vector register, so only this benchmark runs them.
 
