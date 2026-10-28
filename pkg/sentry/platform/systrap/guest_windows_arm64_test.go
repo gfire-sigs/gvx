@@ -157,3 +157,7 @@ func vectorLow(ac *arch.Context64) uint64 {
 func setVectorLow(ac *arch.Context64, v uint64) {
 	binary.LittleEndian.PutUint64((*ac.FloatingPointData())[16:], v)
 }
+
+// gLiveVectorState writes V0. The arm64 routine saves and loads all 32 vector
+// registers whatever they hold, so this only makes the state non-zero.
+func gLiveVectorState() []byte { return gSetVector(0x1122_3344_5566_7788) }

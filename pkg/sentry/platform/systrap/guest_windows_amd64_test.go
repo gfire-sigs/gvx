@@ -131,3 +131,14 @@ func vectorLow(ac *arch.Context64) uint64 {
 func setVectorLow(ac *arch.Context64, v uint64) {
 	binary.LittleEndian.PutUint64((*ac.FloatingPointData())[160:], v)
 }
+
+// gLiveVectorState fills YMM0 to YMM7 with ones, so the AVX state of the
+// thread is in use and a restore of it reads memory.
+func gLiveVectorState() []byte {
+	var c []byte
+	for n := byte(0); n < 8; n++ {
+		// vpcmpeqd ymmN, ymmN, ymmN
+		c = append(c, 0xC5, 0x80|(^n&0xF)<<3|0x05, 0x76, 0xC0|n<<3|n)
+	}
+	return c
+}

@@ -341,33 +341,32 @@ const sleepRoundTripDelay = time.Millisecond
 // The novector variants run a spill routine without the save and the restore of
 // the vector state. They give the upper bound of what skipping the vector state
 // can save. The routine breaks a guest that uses a vector register, so only
-// this benchmark runs it.
+// this benchmark runs it. The live variants run a guest that holds a live
+// vector state, so a restore of that state reads memory. The other guests leave
+// the vector state in its initial configuration, which a restore loads without
+// a read.
 //
 // Run it through the diagnose workflow with a script, for example:
 // go test -run '^$' -bench BenchmarkFastPathRoundTrip -count 5 ./pkg/sentry/platform/systrap/
 func BenchmarkFastPathRoundTrip(b *testing.B) {
-	for _, vec := range []struct {
-		name string
-		opts spillOptions
+	for _, c := range []struct {
+		name  string
+		opts  spillOptions
+		live  bool
+		delay time.Duration
 	}{
-		{"vector", spillOptions{}},
-		{"novector", spillOptions{noVector: true}},
+		{"vector/spin", spillOptions{}, false, 0},
+		{"vector/sleep", spillOptions{}, false, sleepRoundTripDelay},
+		{"novector/spin", spillOptions{noVector: true}, false, 0},
+		{"novector/sleep", spillOptions{noVector: true}, false, sleepRoundTripDelay},
+		{"vector-live/spin", spillOptions{}, true, 0},
+		{"novector-live/spin", spillOptions{noVector: true}, true, 0},
 	} {
-		for _, wait := range []struct {
-			name  string
-			delay time.Duration
-		}{
-			{"spin", 0},
-			{"sleep", sleepRoundTripDelay},
-		} {
-			b.Run(vec.name+"/"+wait.name, func(b *testing.B) {
-				benchmarkFastPathRoundTrip(b, vec.opts, wait.delay)
-			})
-		}
+		b.Run(c.name, func(b *testing.B) { benchmarkFastPathRoundTrip(b, c.opts, c.live, c.delay) })
 	}
 }
 
-func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, delay time.Duration) {
+func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, live bool, delay time.Duration) {
 	p := newFastPlatform(b)
 	if opts.noVector {
 		sc, err := buildSpillWith(opts)
@@ -379,7 +378,11 @@ func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, delay time.Dura
 		p.spill = sc
 	}
 	r := newRig(b, p)
-	r.program(gSyscall(1), gJump(codeVA))
+	var prologue []byte
+	if live {
+		prologue = gLiveVectorState()
+	}
+	r.program(prologue, gSyscall(1), gJump(codeVA))
 	// The first call patches the page and creates the thread.
 	si, _, err := r.run()
 	mustSyscall(b, si, err, 1, r.ac)
