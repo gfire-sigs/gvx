@@ -212,7 +212,8 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 	return opts
 }
 
-// PlatformName returns the active platform backend name ("whpx" or "hvf").
+// PlatformName returns the active platform backend name ("whpx", "hvf", or
+// "systrap").
 func (s *Sandbox) PlatformName() string {
 	return s.platName
 }

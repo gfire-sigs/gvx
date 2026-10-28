@@ -13,9 +13,10 @@
 // limitations under the License.
 
 // Package systraptest tells tests whether the systrap engine can start in the
-// current build. The engine runs on darwin/arm64 when the Sentry builds with
-// -tags pagesize_16k. Every other build reports a typed error. The package
-// imports no gvx package, so tests inside pkg/gvx can use it.
+// current build. The engine runs on Windows, and on darwin/arm64 when the
+// Sentry builds with -tags pagesize_16k. Linux runs the upstream platform in a
+// build without cgo. Every other build reports a missing prerequisite. The
+// package imports no gvx package, so tests inside pkg/gvx can use it.
 package systraptest
 
 import "testing"

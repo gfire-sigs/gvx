@@ -39,9 +39,11 @@ const (
 	PlatformWHPX PlatformType = "whpx"
 	// PlatformHVF selects the macOS Hypervisor.framework backend.
 	PlatformHVF PlatformType = "hvf"
-	// PlatformSystrap selects the native stub-subprocess backend of SPEC 3.3.
-	// On darwin/arm64 it needs a Sentry built with -tags pagesize_16k. Other
-	// hosts have no engine yet, and New returns ErrPlatformUnavailable there.
+	// PlatformSystrap selects the stub-subprocess backend of SPEC 3.3. It runs
+	// on Windows and macOS. Linux starts the upstream systrap platform, which
+	// needs a build with CGO_ENABLED=0. On darwin/arm64 the Sentry needs
+	// -tags pagesize_16k. A host without an engine makes New return
+	// ErrPlatformUnavailable.
 	PlatformSystrap PlatformType = "systrap"
 )
 
