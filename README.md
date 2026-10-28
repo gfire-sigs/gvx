@@ -13,11 +13,11 @@ Running Linux binaries or container images on Windows and macOS traditionally re
 | Runtime Model | Host Targets | Cold Start | Memory Overhead | Admin or `sudo` Required | 4KB `mmap(MAP_FIXED)` | Direct OCI Image Run |
 | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
 | **`gvx` / `rungv` (`whpx` / `hvf`)** | Windows (`amd64`, `arm64`) & macOS (`arm64`) | `~20 ms` | `~30 MiB` | No (Low Integrity / Seatbelt) | Hardware 4KB EPT / Stage-1 MMU | Yes (In-Memory Tar-to-EROFS) |
-| **`gvx` / `rungv` (`systrap` Engine, M5)** | macOS `arm64` (`pagesize_16k`), Windows (`amd64`, `arm64`), Linux (`amd64`, `arm64`) | `~180 ms` | `~31 MiB` (Sentry only) | No (Seatbelt / Restricted Token / `seccomp`) | 4KB on Windows & Linux; 16KB on macOS | Yes (In-Memory Tar-to-EROFS) |
+| **`gvx` / `rungv` (`systrap` Engine, M5)** | Windows (`amd64`, `arm64`), Linux (`amd64`, `arm64`) | `~25 ms` (`amd64`), `~65 ms` (`arm64`) on Windows | `~31 MiB` (Sentry only) | No (Restricted Token / `seccomp`) | 4KB | Yes (In-Memory Tar-to-EROFS) |
 | **WSL2 / Docker Desktop** | Windows & macOS | `800-2500 ms` | `> 512 MiB` | Yes (VM Daemon / Services) | Guest Linux Kernel MMU | Requires VM Daemon |
 | **QEMU (`tcg` Full System)** | Windows & macOS | `1500-4000 ms` | `> 256 MiB` | No | SoftMMU Emulation | Requires Disk Image Build |
 
-The `gvx` rows come from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry remained offline during the run; a reachable registry adds about one second for tag verification. CI builds, vets, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
+The `whpx` and `hvf` row comes from `rungv run` on an Apple M1 with macOS 26 and the cached `busybox:1.36.1-musl` image. The registry remained offline during the run; a reachable registry adds about one second for tag verification. The `systrap` cold start is the median time of `gvx.New` on the GitHub-hosted runners `windows-latest` and `windows-11-arm`. These runners are virtual machines with four vCPUs. macOS has no `systrap` engine and runs on `hvf`. CI builds, vets, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
 | Architectural Layer | Owning Packages | Host Primitives and Mechanisms | Runtime Contract |
 | :--- | :--- | :--- | :--- |
@@ -53,14 +53,14 @@ Run an unmodified OCI image or Linux ELF64 binary from the command line with `cm
 | `stub` | `rungv stub` | Probe the `systrap` engine on the active host and report its readiness. |
 
 > [!IMPORTANT]
-> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or pass `-platform=systrap` without it. On Linux, build with `CGO_ENABLED=0` because the upstream `systrap` platform hangs in a cgo build. On macOS, sign the binary with `entitlements.plist` for `hvf`, and build with `-tags pagesize_16k` for `systrap`.
+> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or pass `-platform=systrap` without it. On Linux, build with `CGO_ENABLED=0` because the upstream `systrap` platform hangs in a cgo build. On macOS, sign the binary with `entitlements.plist` for `hvf`. The macOS build has no `systrap` engine.
 
 1. Build `rungv` with the Go 1.25+ toolchain.
 2. Sign `rungv` with `entitlements.plist` on macOS.
 3. Run an unmodified OCI image (`nginx:alpine`) with `-p 8080:80` port forwarding and `-net=nat` networking.
 4. Mount a persistent named volume (`-v data:/var/lib/app`) backed by a journaled `<name>.ext4` image file.
 5. Pass `-net=wg` with a WireGuard configuration file when cryptographic L3 host LAN isolation is required.
-6. Run `rungv stub` to probe the `systrap` engine before running `-platform=systrap`.
+6. Run `rungv stub` on Windows or Linux to probe the `systrap` engine before running `-platform=systrap`.
 
 ```bash
 # Build on macOS (Apple Silicon arm64) and apply the ad-hoc hypervisor signature
@@ -80,9 +80,7 @@ CGO_ENABLED=0 go build -o rungv ./cmd/rungv
 ./rungv run -net=wg -wg-conf=./sandbox-wg.conf -workspace=./my-project python:3.12-alpine \
   python3 -c "import urllib.request; print(urllib.request.urlopen('https://example.com').status)"
 
-# Build and run with the systrap engine on macOS arm64 (requires pagesize_16k)
-go build -tags pagesize_16k -o rungv ./cmd/rungv
-codesign --sign - --entitlements entitlements.plist --force ./rungv
+# Probe and run the systrap engine on Windows or Linux (no hypervisor needed)
 ./rungv stub
 ./rungv run -platform=systrap alpine:3.20 uname -m
 ```
@@ -93,7 +91,7 @@ codesign --sign - --entitlements entitlements.plist --force ./rungv
 
 | `gvx.Config` Field | Type | Description |
 | :--- | :--- | :--- |
-| `Platform` | `gvx.PlatformType` | `PlatformAuto` (tries `whpx`/`hvf`, then `systrap`), `PlatformWHPX`, `PlatformHVF`, or `PlatformSystrap`. |
+| `Platform` | `gvx.PlatformType` | `PlatformAuto` (tries `whpx`/`hvf`, then `systrap` on Windows and Linux), `PlatformWHPX`, `PlatformHVF`, or `PlatformSystrap`. |
 | `OCIImage` / `RootfsPath` | `string` | OCI image reference (`alpine:3.20`), local `.erofs` image, or host directory rootfs. |
 | `Argv` / `Envv` / `WorkDir` | `[]string` / `string` | Guest command vector, `KEY=VALUE` environment overrides, and working directory. |
 | `WorkspacePath` / `Mounts` | `string` / `[]gvx.Mount` | Host `/workspace` directory and additional bind (`MountBind`), volume (`MountVolume`), or `MountTmpfs` entries. |
@@ -180,15 +178,26 @@ The external smoke test owns private daemon paths and never modifies host-global
 
 ### 3.1 Execution Backends (`whpx`, `hvf`, and `systrap`)
 
-Hardware backends (`whpx` and `hvf`) map guest memory at 4KB granularity through hardware page tables and exchange syscall state through a shared 4KB communication page. User-mode `systrap` backends run guest code inside isolated stub processes and rewrite syscall instructions in place on lazy execute faults.
+Hardware backends (`whpx` and `hvf`) map guest memory at 4KB granularity through hardware page tables and exchange syscall state through a shared 4KB communication page. The user-mode `systrap` backends run guest code inside isolated stub processes and rewrite syscall instructions in place on lazy execute faults. They run on Windows and Linux. macOS uses `hvf` only.
 
 | Backend | Host Target | Guest Page Size | Syscall & Trap Mechanism | Fixed-Address (`ET_EXEC`) Support | Register & TLS Virtualization |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`platform/whpx`** | `windows/amd64`, `windows/arm64` | `4 KiB` (4KB EPT / Stage-2 over 64KB host views) | In-partition Ring-0 `SYSCALL` (`HLT`) or EL1 `SVC #0` (`HVC #0`) stub writing to shared `CommPage` | Full native support at linked virtual addresses | Hardware vCPU state; two-tier lazy sync (`PullFullState` on clone, fault, or signal) |
 | **`platform/hvf`** | `darwin/arm64` | `4 KiB` (Stage-1 `TTBR0_EL1` 4KB over Stage-2 16KB IPA) | In-guest EL1 `VBAR_EL1` `bluepill` stub spilling GPRs to shared `CommPage` before `HVC #0` | Full native support at linked virtual addresses | Dedicated locked OS thread per vCPU; syncs GPRs, `V0..V31`, and `TPIDR_EL0` |
-| **`platform/systrap` (`darwinsystrap`)** | `darwin/arm64` (`-tags pagesize_16k`) | `16 KiB` (`mach_vm_remap` into forked C stub task) | Lazy `PROT_EXEC` trap disassembles ELF code via `arm64asm`, patches `svc #0` to `B <island_slot>`, and wakes Sentry via `__ulock_wait` | Enabled automatically for `ET_EXEC` linked in `[0x10000, 4GB)` via `+2^46` biased zone (`GVX_SYSTRAP_FIXED_IMAGES=0` disables) | Rewrites `TPIDR_EL0`, `CTR_EL0`, and `X18` instructions in place; stores guest values in `sysmsg` |
-| **`platform/systrap` (`winsystrap`)** | `windows/amd64`, `windows/arm64` | `4 KiB` (`VirtualAlloc2` placeholder views) | Lazy execute fault patches `syscall` (`jmp rel32` or `CC 90`) and `svc #0` (`B` or `brk`); fast path uses `winSysmsg` and event pairs | Full native support via pre-reserved low window `[0x10000, 0x7FFE0000)` and high window above 16TB | `amd64`: patches `RDFSBASE`, `RDGSBASE`, and `%gs:` `MOV` to island slots; `arm64`: patches `TPIDR_EL0` reads |
+| **`platform/systrap` (`winsystrap`)** | `windows/amd64`, `windows/arm64` | `4 KiB` (`VirtualAlloc2` placeholder views) | Lazy execute fault patches `syscall` (`jmp rel32` or `CC 90`) and `svc #0` (`B` or `brk`); fast path uses `winSysmsg`, event pairs, and a time-based spin window | Full native support via pre-reserved low window `[0x10000, 0x7FFE0000)` and high window above 16TB | `amd64`: patches `RDFSBASE`, `RDGSBASE`, and `%gs:` `MOV` to island slots; `arm64`: patches `TPIDR_EL0` reads |
 | **`platform/systrap` (Upstream)** | `linux/amd64`, `linux/arm64` (`CGO_ENABLED=0`) | `4 KiB` | Upstream gVisor `sysmsg` shared memory and stub threads | Full native support | Upstream Linux register context |
+
+The Windows `systrap` fast path serves a system call without a stop in the debug object. Each side spins for a short time before it sleeps: `64 µs` in the stub and `8 µs` in the Sentry. `GVX_SYSTRAP_SPIN_US=stub,sentry` changes both values. Each stub runs a 1 KB generated executable that the host locks against writes, deletes, and renames. The table lists medians from the hosted runners. `docs/systrap-windows.md` section 3.9 has the method and the other columns.
+
+| Operation | `hvf` (Apple Silicon) | `whpx` (`windows-latest`) | Windows `systrap` `amd64` | Windows `systrap` `arm64` |
+| :--- | ---: | ---: | ---: | ---: |
+| `getpid` | `1.2 µs` | `19 µs` | `0.48 µs` | `0.99 µs` |
+| Pipe round trip, 64 bytes | `12.5 µs` | `174 µs` | `18 µs` | `11 µs` |
+| Futex round trip | `23 µs` | `159 µs` | `13 µs` | `8.9 µs` |
+| `fork` and `wait` | `0.95 ms` | `0.84 ms` | `7.1 ms` | `14 ms` |
+| `gvx.New` | `10 ms` | `17 ms` | `24 to 30 ms` | `63 to 73 ms` |
+
+Run `GVX_E2E_BENCH=1 go test -run TestE2EMicroBench ./e2e/` to measure the active host. A `systrap` stub costs one Windows process, so `fork` is the slow operation. The whpx column runs under nested virtualization and does not predict a physical host.
 
 ### 3.2 VFS2 Storage Engines (`erofs`, `ext4lite`, `hostfs`, and `chunkcache`)
 
@@ -230,7 +239,7 @@ Extracting Linux `.tar` layers onto Windows NTFS or case-insensitive macOS APFS 
 | Host OS | Process Creation Containment | File System Containment | Token, Privilege & Thread Hardening | Syscall & Network Filtering |
 | :--- | :--- | :--- | :--- | :--- |
 | **Windows** (`lockdown_windows.go`) | Anonymous Job Object with `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and UI/clipboard limits | Restricts primary token default DACL; applies Low-Integrity ACEs to writable mounts and non-inherited `FILE_TRAVERSE` to single-file mount parents | Strips privileges in place (`SE_PRIVILEGE_REMOVED`) on Sentry and stub tokens; binds `Low` integrity deny-only impersonation token to runtime and `systrap` switch threads | Sets `DisallowWin32kSystemCalls = 1`; installs Winsock outbound connect/listen hook for `-net=none` and `-net=wg` |
-| **macOS** (`lockdown_darwin.go`) | `setrlimit(RLIMIT_NPROC, 0)` and Seatbelt `(deny process-fork)` / `(deny process-exec*)` | Seatbelt `(deny default)` profile allowing file access only to bound mount paths (`subpath` for directories, `literal` for single-file mounts) | Enforces kernel-level MAC containment on the Sentry process and applies a stricter syscall-filtering Seatbelt profile inside each `systrap` stub task | Blocks outbound sockets in `-net=none` and pins UDP traffic to the WireGuard peer port in `-net=wg` |
+| **macOS** (`lockdown_darwin.go`) | `setrlimit(RLIMIT_NPROC, 0)` and Seatbelt `(deny process-fork)` / `(deny process-exec*)` | Seatbelt `(deny default)` profile allowing file access only to bound mount paths (`subpath` for directories, `literal` for single-file mounts) | Enforces kernel-level MAC containment on the Sentry process | Blocks outbound sockets in `-net=none` and pins UDP traffic to the WireGuard peer port in `-net=wg` |
 | **Linux** (`lockdown_linux.go`, `syscallfilter_linux.go`) | `PR_SET_NO_NEW_PRIVS` + `seccomp` rule returning `EPERM` on `clone`, `execve`, and `execveat` | Omits `openat` from the `seccomp` allowlist when only `ext4lite` and `tmpfs` mounts exist (`UnboundFileOpenBlocked = true`); returns `EPERM` on unbound `openat` | Synchronizes the gVisor Sentry `seccomp` BPF program across all OS threads with `SECCOMP_FILTER_FLAG_TSYNC` | Kills the process on any syscall outside the allowlist; returns `EPERM` on disallowed `socket` calls |
 
 ### 3.6 Upstream Tracking and Three-Tier Isolation
@@ -239,9 +248,9 @@ Extracting Linux `.tar` layers onto Windows NTFS or case-insensitive macOS APFS 
 
 | Isolation Tier | File Count | Repository Paths | Upstream Merge Policy |
 | :--- | ---: | :--- | :--- |
-| **Tier 1: Additive Packages** | `507` | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/{whpx,hvf,hvcommon}`, `pkg/sentry/fsimpl/{chunkcache,hostfs,ext4lite}`, `e2e`, `tools/{upstream,shiminterop}`, `docs` | Owned exclusively by `gvx` (`0.0%` conflict rate with `upstream/go`). |
-| **Tier 2: Sibling Host Files** | `155` | `*_{windows,darwin,xplat}*` files in `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/{erofs,fdnotifier,syserr,hostarch}`, `pkg/sentry/{kernel,mm,pgalloc,time,hostcpu}`, and `pkg/sentry/platform/systrap` | Placed beside unmodified `*_linux.go` files (`0.0%` conflict rate). |
-| **Tier 3: Build-Tag & Seam Patches** | `16 / 2485` (`0.64%`) | Allowlisted pure-Go files in `tools/upstream/buildtag_allowlist.txt` and minimal seam hooks (`< 1.0%` budget ceiling) | Re-applied by `go run ./tools/upstream -mode=retag`; `604` Linux-only fence tags (`24.95%` strict count) are tracked separately. |
+| **Tier 1: Additive Packages** | `515` | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/{whpx,hvf,hvcommon}`, `pkg/sentry/fsimpl/{chunkcache,hostfs,ext4lite}`, `e2e`, `tools/{upstream,shiminterop}`, `docs` | Owned exclusively by `gvx` (`0.0%` conflict rate with `upstream/go`). |
+| **Tier 2: Sibling Host Files** | `144` | `*_{windows,darwin,xplat}*` files in `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/{erofs,fdnotifier,syserr,hostarch}`, `pkg/sentry/{kernel,mm,pgalloc,time,hostcpu}`, and `pkg/sentry/platform/systrap` | Placed beside unmodified `*_linux.go` files (`0.0%` conflict rate). |
+| **Tier 3: Build-Tag & Seam Patches** | `18 / 2485` (`0.72%`) | Allowlisted pure-Go files in `tools/upstream/buildtag_allowlist.txt` and minimal seam hooks (`< 1.0%` budget ceiling) | Re-applied by `go run ./tools/upstream -mode=retag`; `604` Linux-only fence tags (`25.03%` strict count) are tracked separately. |
 
 ### 3.7 Optional Containerd Control Adapter
 
@@ -285,39 +294,35 @@ Run these steps locally before pushing changes.
 
 1. Format all source files with `go fmt ./...`.
 2. Run the native test suite with `scripts/codesign-exec.sh` on macOS.
-3. Run the `darwin/arm64` `systrap` test suite with `-tags pagesize_16k`.
-4. Cross-compile all packages across `darwin/arm64`, `windows/amd64`, `windows/arm64`, `linux/amd64`, and `linux/arm64`.
-5. Run the upstream diff audit tool to verify that charged upstream modifications remain below `1.0%`.
+3. Cross-compile all packages across `darwin/arm64`, `windows/amd64`, `windows/arm64`, `linux/amd64`, and `linux/arm64`.
+4. Run the upstream diff audit tool to verify that charged upstream modifications remain below `1.0%`.
 
 ```bash
 # 1. Format and run native unit and e2e tests on macOS arm64
 go fmt ./...
 go test -race -exec "$PWD/scripts/codesign-exec.sh" ./...
 
-# 2. Run the macOS arm64 systrap suite (requires 16KB page tag)
-go test -race -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/platform/systrap/...
-
-# 3. Cross-compile across all five supported targets
+# 2. Cross-compile across all five supported targets
 GOOS=darwin  GOARCH=arm64 go build ./...
 GOOS=windows GOARCH=amd64 go build ./...
 GOOS=windows GOARCH=arm64 go build ./...
 GOOS=linux   GOARCH=amd64 go build ./...
 GOOS=linux   GOARCH=arm64 go build ./...
 
-# 4. Verify the upstream diff budget (< 1.0% charged upstream files)
+# 3. Verify the upstream diff budget (< 1.0% charged upstream files)
 go run ./tools/upstream -mode=audit -max-ratio=0.01
 ```
 
-GitHub Actions executes six verification jobs on every push in `.github/workflows/ci.yml` and runs live registry image gates weekly in `.github/workflows/e2e-images.yml`.
+GitHub Actions executes six verification jobs on every push in `.github/workflows/ci.yml`. The workflow `.github/workflows/pjdfstest.yml` runs the POSIX conformance suite when `ext4lite` changes. The workflow `.github/workflows/e2e-images.yml` runs live registry image gates weekly. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand.
 
 | CI Job (`.github/workflows/ci.yml`) | Runner | Verification Scope |
 | :--- | :--- | :--- |
-| `build, vet, and audit` | `ubuntu-24.04` | Verifies `gofmt`, compiles all five targets plus `darwin/arm64` (`pagesize_16k`), runs `go vet`, and audits the `< 1.0%` upstream diff budget. |
+| `build, vet, and audit` | `ubuntu-24.04` | Verifies `gofmt`, compiles all five targets, runs `go vet` (including the `systrap` package on the three non-Linux targets), and audits the `< 1.0%` upstream diff budget. |
 | `test linux/amd64` | `ubuntu-24.04` | Runs `go test -race` on owned packages and `CGO_ENABLED=0` `e2e`, `pkg/gvx`, and `pkg/hostlockdown` suites with `seccomp` lockdown enabled. |
 | `test linux/arm64` | `ubuntu-24.04-arm` | Runs `go test -race` on owned packages and `CGO_ENABLED=0` `e2e`, `pkg/gvx`, and `pkg/hostlockdown` suites on ARM64 Linux. |
-| `test darwin/arm64` | `macos-15` | Runs signed package tests (`4KB` build) and the `systrap`, `pkg/gvx`, `cmd/rungv`, and `e2e` suites (`pagesize_16k` build). |
-| `test windows/amd64` | `windows-latest` | Runs owned package tests, `winsystrap` tests, `hostlockdown` suites, and `whpx` guest execution gates. |
-| `test windows/arm64` | `windows-11-arm` | Runs `internal/gvxshim`, `tools/upstream`, `winsystrap`, `hostlockdown`, and ARM64 `e2e` suites. |
+| `test darwin/arm64` | `macos-15` | Runs signed package tests. The hosted runner has no hypervisor, so `GVX_ALLOW_NO_HYPERVISOR=1` skips the guest and hypervisor tests. |
+| `test windows/amd64` | `windows-latest` | Runs owned package tests, `winsystrap` tests, the `systrap` end-to-end gates, `hostlockdown` suites, and `whpx` guest execution gates. |
+| `test windows/arm64` | `windows-11-arm` | Runs `internal/gvxshim`, `winsystrap`, and the `systrap` end-to-end gates. The runner has no hypervisor, so `systrap` runs every guest. |
 
 ### 5.2 Implementation Roadmap (`M1` to `M5`)
 
@@ -329,7 +334,7 @@ This table maps each completed milestone to its deliverables and verification ga
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | `platform/whpx` (`windows/amd64`, `windows/arm64`), `platform/hvf` (`darwin/arm64`), and `platform/hvcommon` boot static `busybox` (`PID 1`) and execute shell commands. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | `clone`, `futex`, signals, TLS, VDSO, `pkg/netbackend` (`-net=nat` & `-net=wg`), and `pkg/oci` boot `alpine:3.20`, `nginx:alpine`, `python:3.12-alpine`, and `node:22-alpine`. |
 | **M4** | **`hostfs`, `ext4lite`, `chunkcache` & Self-Lockdown** | `fsimpl/hostfs` v2, `fsimpl/ext4lite` (JBD2 journaled single-file `ext4` volumes), `fsimpl/chunkcache`, and `pkg/hostlockdown` pass POSIX durability, crash recovery, and containment gates. |
-| **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap` & `winsystrap`)** | `platform/systrap` executes static (`ET_EXEC`) and dynamic (`ET_DYN`) ELF64 workloads via trampoline islands and `sysmsg`/`winSysmsg` stubs on `darwin/arm64`, `windows/amd64`, `windows/arm64`, and Linux. |
+| **M5** | **`systrap` Fallback Engine (`winsystrap` and upstream Linux)** | `platform/systrap` executes static (`ET_EXEC`) and dynamic (`ET_DYN`) ELF64 workloads via trampoline islands and `winSysmsg` stubs on `windows/amd64` and `windows/arm64`, and through the upstream platform on Linux. The `darwin/arm64` engine was removed, and macOS runs on `hvf`. |
 
 ---
 

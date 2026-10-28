@@ -203,12 +203,12 @@ The test `TestE2EMicroBench` runs the guest `internal/acceptprog/microbench` on 
 | `open` and `close` | 19 µs | 58 µs | 9.4 µs | 10 µs | 9.4 µs | 60 µs | 16 µs | 16 µs |
 | Pipe round trip, 64 bytes | 12.5 µs | 174 µs | 18 µs | 41 µs | 11 µs | 58 µs | 22 µs | 17 µs |
 | Futex round trip | 23 µs | 159 µs | 13 µs | 27 µs | 8.9 µs | 33 µs | 8.5 µs | 6.7 µs |
-| `fork` and `wait` | 0.95 ms | 0.84 ms | 10 to 15 ms | 15 ms | 21 to 22 ms | 23 ms | 2.0 ms | 1.7 ms |
-| `fork` and `exec` of a minimal executable | 0.25 ms | 1.9 ms | 8.7 to 14 ms | 12 ms | 18 to 20 ms | 23 ms | 0.42 ms | 0.69 ms |
-| `gvx.New` | 10 ms | 17 ms | 38 to 54 ms | 65 ms | 83 ms | 100 ms | 2.0 ms | 2.9 ms |
+| `fork` and `wait` | 0.95 ms | 0.84 ms | 7.1 ms | 15 ms | 14 ms | 23 ms | 2.0 ms | 1.7 ms |
+| `fork` and `exec` of a minimal executable | 0.25 ms | 1.9 ms | 6.4 ms | 12 ms | 22 ms | 23 ms | 0.42 ms | 0.69 ms |
+| `gvx.New` | 10 ms | 17 ms | 24 to 30 ms | 65 ms | 63 to 73 ms | 100 ms | 2.0 ms | 2.9 ms |
 | `Close` | 0.08 ms | 1.2 ms | 3 to 4 ms | 61 to 65 ms | 5.2 to 5.5 ms | 68 to 76 ms | 0.005 ms | 0.012 ms |
 
-The Linux numbers use the upstream `systrap` platform and a build without cgo. The `whpx` costs of a system call are high on a hosted runner, and they do not predict a physical host.
+The rows `fork` and `wait`, `fork` and `exec`, and `gvx.New` of the Windows `systrap` columns include the stub image of section 3.6. The Linux numbers use the upstream `systrap` platform and a build without cgo. The `whpx` costs of a system call are high on a hosted runner, and they do not predict a physical host.
 
 `GVX_SYSTRAP_TRACE=3` prints the time of each step of `New` and `Close`. On `amd64`, `New` spends 11 to 16 ms to start the stub host. It spends 12 to 16 ms to start the first stub, and 5 to 8 ms in the self test. On `arm64` the same steps take 21, 28 to 33, and 13 to 15 ms. The stub host and the loader of a stub dominate.
 
