@@ -112,6 +112,14 @@ type amd64Candidate struct {
 	votes int
 }
 
+// amd64Sweep is the result of one linear decode sweep.
+type amd64Sweep struct {
+	// skipped counts the positions where the bytes did not decode.
+	skipped int
+	// sites holds the sites that the sweep decoded.
+	sites []amd64Site
+}
+
 // scanAMD64 returns the sites that overlap page and that most decode sweeps
 // agree on. Sites are sorted by Offset and never overlap.
 //
@@ -129,10 +137,13 @@ type amd64Candidate struct {
 // that holds the start of the site reports it with a positive Offset.
 //
 // The scan runs up to 16 linear sweeps with the x86asm decoder. Sweep k starts
-// at 15-k bytes before the page, clamped to the start of before. A sweep that
-// cannot decode a byte skips it. Wrong sweeps resynchronize with the real
-// instruction boundaries after a few instructions. A site is real when more
-// than half of the distinct sweeps decode it as an instruction.
+// at 15-k bytes before the page, clamped to the start of before. A sweep skips
+// each byte that it cannot decode, and a sweep that skips more bytes than
+// another sweep probably lost the instruction boundaries. Wrong sweeps
+// resynchronize with the real instruction boundaries after a few instructions.
+// A wrong sweep can stay wrong in a long run of dense vector code. A site is
+// real when more than half of the sweeps with the fewest skipped bytes decode
+// it as an instruction.
 func scanAMD64(before, page, after []byte) []amd64Site {
 	return scanAMD64GS(before, page, after, false)
 }
@@ -170,8 +181,8 @@ func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
 	// Each position decodes at most once, because the decode of a position
 	// does not depend on the sweep that reaches it.
 	decoded := make([]amd64Decoded, pageEnd)
-	candidates := make(map[int]*amd64Candidate)
-	sweeps := 0
+	var runs []amd64Sweep
+	fewest := -1
 	prevStart := -1
 	for k := 0; k < amd64SweepCount; k++ {
 		start := max(pageStart-amd64MaxInsnLen+k, 0)
@@ -179,11 +190,14 @@ func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
 			continue
 		}
 		prevStart = start
-		sweeps++
+		var run amd64Sweep
 		for pos := start; pos < pageEnd; {
 			d := &decoded[pos]
 			if !d.known {
 				*d = decodeAMD64WithGS(buf[pos:], gsMem)
+			}
+			if d.size == 0 {
+				run.skipped++
 			}
 			if d.kind != 0 {
 				site := amd64Site{Offset: pos - pageStart, Len: int(d.size), Kind: d.kind, Reg: d.reg, Wide: d.wide}
@@ -192,15 +206,33 @@ func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
 					site.Len = 2
 				}
 				if site.Offset+site.Len > 0 && site.Offset < len(page) {
-					c := candidates[site.Offset]
-					if c == nil {
-						c = &amd64Candidate{site: site}
-						candidates[site.Offset] = c
-					}
-					c.votes++
+					run.sites = append(run.sites, site)
 				}
 			}
 			pos += max(int(d.size), 1)
+		}
+		runs = append(runs, run)
+		if fewest < 0 || run.skipped < fewest {
+			fewest = run.skipped
+		}
+	}
+
+	// A sweep that skipped more bytes than another sweep probably lost the
+	// instruction boundaries. Only the sweeps with the fewest skipped bytes vote.
+	candidates := make(map[int]*amd64Candidate)
+	sweeps := 0
+	for _, run := range runs {
+		if run.skipped != fewest {
+			continue
+		}
+		sweeps++
+		for _, site := range run.sites {
+			c := candidates[site.Offset]
+			if c == nil {
+				c = &amd64Candidate{site: site}
+				candidates[site.Offset] = c
+			}
+			c.votes++
 		}
 	}
 
