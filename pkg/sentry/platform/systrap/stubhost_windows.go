@@ -148,13 +148,8 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	for {
 		var req [hostReqSize]byte
 		if _, err := io.ReadFull(in, req[:]); err != nil {
-			// EOF means that the Sentry is gone. Closing the job handles kills the stubs.
-			for pid := range h.jobs {
-				h.release(pid)
-			}
-			for pid := range h.procs {
-				h.release(pid)
-			}
+			// EOF means that the Sentry is gone.
+			h.shutdown()
 			return 0
 		}
 		if binary.LittleEndian.Uint32(req[0:]) != hostMagic {
@@ -332,6 +327,21 @@ func (h *stubHostLoop) release(pid uint32) {
 		delete(h.jobs, pid)
 	}
 	if proc, ok := h.procs[pid]; ok {
+		_ = windows.CloseHandle(proc)
+		delete(h.procs, pid)
+	}
+}
+
+// shutdown ends every stub. Closing the last handle of a job kills its stub.
+// The host then waits for each stub to exit, because a stub that still maps the
+// image keeps the file of the image on disk.
+func (h *stubHostLoop) shutdown() {
+	for pid, job := range h.jobs {
+		_ = windows.CloseHandle(job)
+		delete(h.jobs, pid)
+	}
+	for pid, proc := range h.procs {
+		_, _ = windows.WaitForSingleObject(proc, 1000)
 		_ = windows.CloseHandle(proc)
 		delete(h.procs, pid)
 	}
