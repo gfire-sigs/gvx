@@ -317,11 +317,23 @@ On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot saves `x16` an
 On `amd64`, the patcher tries the post-window form first. It replaces `syscall` and the bytes after it with `jmp rel32`. Those bytes are whole instructions that cover at least three bytes. The slot holds a copy of the instructions. The slot uses no guest stack, so it keeps the red zone. The post-window form fails in each of these cases:
 
 - The instructions behind the `syscall` cover fewer than three bytes or leave the page.
-- One of them is a branch, a call, a return, a system call, an interrupt, or has a RIP-relative operand.
+- One of them cannot move: a call, a return, a system call, an interrupt, a `loop` or `jcxz` instruction, or an instruction that the rules below keep in place.
+- A relative `jmp` ends before the fifth byte of the patch, or another instruction follows it.
 - The preceding instruction loads the number of a call that never returns: `exit`, `exit_group`, or `rt_sigreturn`.
 - A relative branch that decodes in the page or in the 256 bytes on each side lands in the overwritten bytes.
 - A prefix byte stands in front of the `syscall`.
+- The moved instructions need more than 19 bytes in the slot.
 - The engine cannot allocate a slot.
+
+The slot copies each moved instruction. Three classes change when they move:
+
+| Class | Rule |
+| :--- | :--- |
+| Instruction with a RIP-relative operand | The engine adds the distance from the original address to the slot address to the 32-bit displacement. The slot reads the original target. The move fails when the new displacement does not fit in 32 bits. |
+| `jcc rel8` and `jcc rel32` (post-window only) | The slot holds `0F 8x rel32` to the original target. The move fails when the target lies inside the overwritten bytes. |
+| `jmp rel8` and `jmp rel32` (post-window only) | The slot holds `E9 rel32` to the original target. The `jmp` must be the last moved instruction and must end at or behind the fifth byte of the patch. |
+
+A segment override keeps an instruction in place. A VEX or EVEX memory operand without a base register also keeps it in place, because `x86asm` omits the RIP base of such an operand. A 32-bit address prefix keeps it in place too, because the displacement then counts from `EIP`.
 
 When the post-window form fails, the patcher tries the pre-window form. It replaces the instructions that end at the `syscall` with `jmp rel32`, and it keeps `CC 90` at the `syscall`:
 
@@ -335,7 +347,7 @@ The slot runs the relocated instructions, enters the spill routine, and returns 
 - The decoder cannot run backward. Sixteen linear sweeps start 25 to 40 bytes before the `syscall`. At least 12 sweeps must reach the `syscall` and agree on the first instruction of the window.
 - The window is the fewest whole instructions that cover at least five bytes. It has at most nine bytes.
 - The window and the byte behind the `syscall` lie in one page.
-- Each instruction in the window can move to another address. The rules of the post-window form apply.
+- Each instruction in the window can move to another address. The RIP-relative rule above applies. A branch cannot move into a pre-window slot.
 - No relative branch that decodes in the page or in the 256 bytes on each side lands inside the window. A branch to the first byte of the window or to the `syscall` is allowed.
 - The window does not overlap another patched site. No prefix byte stands in front of the `syscall`.
 

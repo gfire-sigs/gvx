@@ -509,10 +509,10 @@ func TestEncodeWinSlotBounds(t *testing.T) {
 	if err := encodeWinSlot(buf, rigCodeBase, rigSite, 0x9000, []byte{0x90}); err == nil {
 		t.Error("a slot with one relocated byte was accepted")
 	}
-	if err := encodeWinSlot(buf, rigCodeBase, rigSite, 0x9000, make([]byte, winMaxRelocated+1)); err == nil {
+	if err := encodeWinSlot(buf, rigCodeBase, rigSite, 0x9000, nops(winMaxRelocated+1)); err == nil {
 		t.Error("a slot with too many relocated bytes was accepted")
 	}
-	if err := encodeWinSlot(buf, rigCodeBase, rigSite, 0x9000, make([]byte, winMaxRelocated)); err != nil {
+	if err := encodeWinSlot(buf, rigCodeBase, rigSite, 0x9000, nops(winMaxRelocated)); err != nil {
 		t.Errorf("a slot with the most relocated bytes was rejected: %v", err)
 	}
 	if err := encodeWinSlot(buf, rigCodeBase, rigSite+2*winIslandReach32, 0x9000, rigNop3); err == nil {
@@ -552,9 +552,9 @@ func TestPlanJmpPatch(t *testing.T) {
 		{"two short instructions", cat(sys, []byte{0x89, 0xC3, 0x48, 0x85, 0xC0}), []byte{0x89, 0xC3, 0x48, 0x85, 0xC0}},
 		{"mov r12d, eax then nop", cat(sys, []byte{0x41, 0x89, 0xC4, 0x90}), []byte{0x41, 0x89, 0xC4}},
 		{"ret follows the syscall", cat(sys, []byte{0xC3, 0x90, 0x90}), nil},
-		{"short test then branch", cat(sys, []byte{0x85, 0xC0, 0x74, 0x02, 0x90}), nil},
+		{"short test then branch", cat(sys, []byte{0x85, 0xC0, 0x74, 0x02, 0x90}), []byte{0x85, 0xC0, 0x74, 0x02}},
 		{"call behind the syscall", cat(sys, []byte{0xE8, 0x00, 0x00, 0x00, 0x00}), nil},
-		{"rip-relative load", cat(sys, []byte{0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00}), nil},
+		{"rip-relative load", cat(sys, []byte{0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00}), []byte{0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00}},
 		{"second syscall", cat(sys, sys, []byte{0x90}), nil},
 		{"fs-relative load", cat(sys, []byte{0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0, 0, 0}), nil},
 		{"undecodable bytes", cat(sys, []byte{0x06, 0x06, 0x06}), nil},
@@ -1041,6 +1041,34 @@ var corpusSites = []corpusSite{
 		want: planPost,
 	},
 	{
+		// mov dword [rip+0x546fc], 1 follows the SYSCALL.
+		name: "musl setitimer with a RIP-relative store",
+		code: "48c1e906488d04c8f0480910803db21f05000075378b052d47050085c0752d488d74242041ba0800000031d248b800000000030000004889442420b80e0000000f05c705fc46050001000000418b8088000000a900000010",
+		site: 64,
+		want: planPost,
+	},
+	{
+		// test eax, eax; jne +0x25 follows the SYSCALL.
+		name: "glibc clock_gettime with a Jcc",
+		code: "3d00f0ffff76df4889c2ebc90f1f8000000000488b05713a1000488b80e00200004885c074154883ec08ffd085c0752331c04883c408c30f1f4000b8e40000000f0585c0752531c0c3662e0f1f840000000000488b157939",
+		site: 64,
+		want: planPost,
+	},
+	{
+		// jmp rel8 follows the SYSCALL and ends before the end of the 5-byte
+		// patch, so only the instructions in front of the SYSCALL can move.
+		name: "Go nanotime1 with a JMP rel8",
+		code: "3affd0488b0424488b5424084c89e4488b4c240848898b80030000488b0c2448898b880300004869c000ca9a3b4801d048894424204883c4105dc3b8e40000000f05ebbfcccccccccccccccccccccccccccccccccccc8b7c",
+		site: 64,
+		want: planPre,
+	},
+	{
+		name: "SYSCALL followed by a JMP rel32",
+		code: "b8e40000000f05e940000000cccc",
+		site: 5,
+		want: planPost,
+	},
+	{
 		name: "call in the window",
 		code: "909090e8000000000f05c3cccc",
 		site: 8,
@@ -1282,10 +1310,10 @@ func TestEncodeWinPreSlotBounds(t *testing.T) {
 	if err := encodeWinPreSlot(buf, rigCodeBase, rigSite, 0x9000, make([]byte, winPreMaxRelocated+1)); err == nil {
 		t.Error("a slot with too many relocated bytes was accepted")
 	}
-	if err := encodeWinPreSlot(buf, rigCodeBase, rigSite+2*winIslandReach32, 0x9000, make([]byte, winJmpLen)); err == nil {
+	if err := encodeWinPreSlot(buf, rigCodeBase, rigSite+2*winIslandReach32, 0x9000, nops(winJmpLen)); err == nil {
 		t.Error("a slot that cannot reach the site was accepted")
 	}
-	if err := encodeWinPreSlot(buf[:winSlotSize-1], rigCodeBase, rigSite, 0x9000, make([]byte, winJmpLen)); err == nil {
+	if err := encodeWinPreSlot(buf[:winSlotSize-1], rigCodeBase, rigSite, 0x9000, nops(winJmpLen)); err == nil {
 		t.Error("a short buffer was accepted")
 	}
 }
@@ -1344,4 +1372,289 @@ func TestInsnOffsets(t *testing.T) {
 	if _, ok := insnOffsets(code[:len(code)-3]); ok {
 		t.Error("insnOffsets accepted a cut instruction")
 	}
+}
+
+func TestClassifyReloc(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		code []byte
+		want relocClass
+	}{
+		{"register move", []byte{0x48, 0x89, 0xD8}, relocCopy},
+		{"absolute displacement through a SIB byte", []byte{0x48, 0x8B, 0x04, 0x25, 0x10, 0, 0, 0}, relocCopy},
+		{"RIP-relative load", []byte{0x48, 0x8B, 0x05, 0x10, 0, 0, 0}, relocRIP},
+		{"RIP-relative store with an immediate", []byte{0xC7, 0x05, 0xFC, 0x46, 0x05, 0, 1, 0, 0, 0}, relocRIP},
+		{"RIP-relative LEA", []byte{0x48, 0x8D, 0x05, 4, 0, 0, 0}, relocRIP},
+		{"RIP-relative SSE load", []byte{0x66, 0x0F, 0x6F, 0x05, 4, 0, 0, 0}, relocRIP},
+		// x86asm leaves out the RIP base of a VEX operand.
+		{"RIP-relative VEX load", []byte{0xC5, 0xFA, 0x10, 0x05, 0x10, 0, 0, 0}, relocNone},
+		{"RIP-relative EVEX load", []byte{0x62, 0xF1, 0x7C, 0x48, 0x10, 0x05, 0x10, 0, 0, 0}, relocNone},
+		{"VEX load through a base register", []byte{0xC5, 0xFA, 0x10, 0x03}, relocCopy},
+		{"EIP-relative load", []byte{0x67, 0x8B, 0x05, 4, 0, 0, 0}, relocNone},
+		{"segment override", []byte{0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0, 0, 0}, relocNone},
+		{"Jcc rel8", []byte{0x74, 0x05}, relocJcc},
+		{"Jcc rel32", []byte{0x0F, 0x85, 1, 2, 3, 4}, relocJcc},
+		{"JMP rel8", []byte{0xEB, 0xBF}, relocJmp},
+		{"JMP rel32", []byte{0xE9, 1, 0, 0, 0}, relocJmp},
+		{"branch with a prefix", []byte{0x2E, 0x74, 0x05}, relocNone},
+		{"JRCXZ", []byte{0xE3, 0x05}, relocNone},
+		{"JECXZ", []byte{0x67, 0xE3, 0x05}, relocNone},
+		{"LOOP", []byte{0xE2, 0x05}, relocNone},
+		{"CALL rel32", []byte{0xE8, 1, 2, 3, 4}, relocNone},
+		{"RET", []byte{0xC3}, relocNone},
+		{"SYSCALL", []byte{0x0F, 0x05}, relocNone},
+		{"INT3", []byte{0xCC}, relocNone},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			inst, err := decodeX86(c.code)
+			if err != nil || inst.Len != len(c.code) {
+				t.Fatalf("% x decodes as %v, %v", c.code, inst, err)
+			}
+			if got := classifyReloc(inst, c.code); got != c.want {
+				t.Errorf("class = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRelocateRIPRelativeOperand(t *testing.T) {
+	// mov rax, [rip+disp]
+	mov := func(disp int32) []byte {
+		code := []byte{0x48, 0x8B, 0x05, 0, 0, 0, 0}
+		binary.LittleEndian.PutUint32(code[3:], uint32(disp))
+		return code
+	}
+	const orig = 0x7ff0_1000_0102
+	for _, c := range []struct {
+		name string
+		disp int32
+		// delta is newVA-origVA.
+		delta int64
+		ok    bool
+	}{
+		{"no move", 0x1234, 0, true},
+		{"slot above the code", 0x1234, 0x1100_0000, true},
+		{"slot below the code", 0x1234, -0x1100_0000, true},
+		{"positive limit", 0x7FFF_FFF0, 0x10, false},
+		{"positive limit minus one", 0x7FFF_FFF0, 0x0F, true},
+		{"negative limit", -0x8000_0000 + 0x10, -0x10, true},
+		{"negative limit plus one", -0x8000_0000 + 0x10, -0x11, true},
+		{"below the negative limit", -0x8000_0000 + 0x10, 0x11, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// The tests that cannot fit are those that push the new displacement
+			// out of int32. moved = disp - delta.
+			code := mov(c.disp)
+			newVA := uint64(int64(orig) + c.delta)
+			got, err := relocateInstructions(code, orig, newVA, true)
+			moved := int64(c.disp) - c.delta
+			fits := moved == int64(int32(moved))
+			if (err == nil) != fits {
+				t.Fatalf("relocateInstructions error = %v, but the displacement %#x fits = %v", err, moved, fits)
+			}
+			if err != nil {
+				return
+			}
+			if len(got) != len(code) {
+				t.Fatalf("the move changed the length from %d to %d", len(code), len(got))
+			}
+			if !bytes.Equal(got[:3], code[:3]) {
+				t.Errorf("the move changed the opcode bytes: % x", got)
+			}
+			// The target is the same: next+disp.
+			wantTarget := int64(orig) + 7 + int64(c.disp)
+			gotTarget := int64(newVA) + 7 + int64(int32(binary.LittleEndian.Uint32(got[3:])))
+			if gotTarget != wantTarget {
+				t.Errorf("the moved instruction reads %#x, want %#x", gotTarget, wantTarget)
+			}
+		})
+	}
+	// The displacement field sits before an immediate.
+	code := []byte{0xC7, 0x05, 0x10, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD}
+	got, err := relocateInstructions(code, orig, orig+0x100, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The new displacement is 0x10-0x100 = -0xF0, which is 0xFFFFFF10.
+	if want := []byte{0xC7, 0x05, 0x10, 0xFF, 0xFF, 0xFF, 0xAA, 0xBB, 0xCC, 0xDD}; !bytes.Equal(got, want) {
+		t.Errorf("mov [rip+0x10], imm32 moved up by 0x100 is % x, want % x", got, want)
+	}
+}
+
+func TestRelocateBranches(t *testing.T) {
+	const orig, slot = 0x7ff0_1000_0102, 0x7ff0_1100_0040
+	for cc := byte(0); cc < 16; cc++ {
+		for _, form := range []struct {
+			name string
+			code []byte
+			len  int
+		}{
+			{"rel8", []byte{0x70 | cc, 0x20}, 2},
+			{"rel32", []byte{0x0F, 0x80 | cc, 0x20, 0, 0, 0}, 6},
+		} {
+			t.Run(fmt.Sprintf("Jcc %x %s", cc, form.name), func(t *testing.T) {
+				got, err := relocateInstructions(form.code, orig, slot, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(got) != 6 || got[0] != 0x0F || got[1] != 0x80|cc {
+					t.Fatalf("moved branch is % x, want 0F %02X rel32", got, 0x80|cc)
+				}
+				inst, err := x86asm.Decode(got, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				target := slot + 6 + uint64(int64(inst.Args[0].(x86asm.Rel)))
+				if want := uint64(orig + form.len + 0x20); target != want {
+					t.Errorf("the moved branch goes to %#x, want the original target %#x", target, want)
+				}
+			})
+		}
+	}
+	for _, c := range []struct {
+		name string
+		code []byte
+		len  int
+		rel  int64
+	}{
+		{"JMP rel8 forward", []byte{0xEB, 0x20}, 2, 0x20},
+		{"JMP rel8 backward", []byte{0xEB, 0xBF}, 2, -0x41},
+		{"JMP rel32", []byte{0xE9, 0x00, 0x01, 0, 0}, 5, 0x100},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := relocateInstructions(c.code, orig, slot, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 5 || got[0] != 0xE9 {
+				t.Fatalf("moved jump is % x, want E9 rel32", got)
+			}
+			target := slot + 5 + uint64(int64(int32(binary.LittleEndian.Uint32(got[1:]))))
+			if want := uint64(int64(orig) + int64(c.len) + c.rel); target != want {
+				t.Errorf("the moved jump goes to %#x, want %#x", target, want)
+			}
+		})
+	}
+	t.Run("no branch in a pre-window", func(t *testing.T) {
+		if _, err := relocateInstructions([]byte{0x74, 0x05}, orig, slot, false); err == nil {
+			t.Error("a branch moved into a pre-window slot")
+		}
+	})
+	t.Run("target out of reach", func(t *testing.T) {
+		far := uint64(orig) + 2<<31
+		if _, err := relocateInstructions([]byte{0x74, 0x05}, orig, far, true); err == nil {
+			t.Error("a branch whose target is out of rel32 reach was moved")
+		}
+	})
+	t.Run("call stays in place", func(t *testing.T) {
+		if _, err := relocateInstructions([]byte{0xE8, 1, 2, 3, 4}, orig, slot, true); err == nil {
+			t.Error("a call moved")
+		}
+	})
+}
+
+func TestPlanRelocatesBranchesAndRIPOperands(t *testing.T) {
+	sys := []byte{0x0F, 0x05}
+	jmp8 := []byte{0xEB, 0x20}
+	// Long NOPs with prefixes: a Jcc rel8 grows by four bytes when it moves, so a
+	// short branch and a 15-byte NOP exceed the slot, and the 11-byte NOP fits.
+	nop11 := []byte{0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0}
+	nop15 := []byte{0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0}
+	for _, c := range []struct {
+		name string
+		tail []byte
+		want []byte // relocated original bytes, nil for a trap
+	}{
+		{"Jcc after a test", catBytes([]byte{0x85, 0xC0, 0x75, 0x25}, nops(8)), []byte{0x85, 0xC0, 0x75, 0x25}},
+		{"Jcc rel32 alone", catBytes([]byte{0x0F, 0x84, 0x80, 0, 0, 0}, nops(4)), []byte{0x0F, 0x84, 0x80, 0, 0, 0}},
+		{"Jcc to the SYSCALL", catBytes([]byte{0x85, 0xC0, 0x74, 0xFA}, nops(4)), []byte{0x85, 0xC0, 0x74, 0xFA}}, // -6 from the end: the SYSCALL
+		{"Jcc into the overwritten bytes", catBytes([]byte{0x85, 0xC0, 0x74, 0xFC}, nops(4)), nil},                // lands at site+4
+		{"Jcc to the first byte behind the patch", catBytes([]byte{0x85, 0xC0, 0x74, 0xFF}, nops(4)), []byte{0x85, 0xC0, 0x74, 0xFF}},
+		{"JMP rel32", catBytes([]byte{0xE9, 0x40, 0, 0, 0}, nops(4)), []byte{0xE9, 0x40, 0, 0, 0}},
+		{"JMP rel8 ends before the end of the patch", catBytes(jmp8, nops(8)), nil},
+		{"JMP rel8 after a one-byte instruction", catBytes([]byte{0x90}, jmp8, nops(8)), []byte{0x90, 0xEB, 0x20}},
+		{"JMP into the overwritten bytes", catBytes([]byte{0x90, 0xEB, 0xFD}, nops(8)), nil}, // lands at site+2
+		{"instruction behind a JMP stays", catBytes([]byte{0xE9, 0x40, 0, 0, 0, 0x90}, nops(4)), []byte{0xE9, 0x40, 0, 0, 0}},
+		{"JRCXZ", catBytes([]byte{0xE3, 0x05, 0x90}, nops(8)), nil},
+		{"RIP-relative store", catBytes([]byte{0xC7, 0x05, 0x10, 0, 0, 0, 1, 0, 0, 0}, nops(4)), []byte{0xC7, 0x05, 0x10, 0, 0, 0, 1, 0, 0, 0}},
+		{"RIP-relative VEX load", catBytes([]byte{0xC5, 0xFA, 0x10, 0x05, 0x10, 0, 0, 0}, nops(4)), nil},
+		{"size after the move exceeds the slot", catBytes([]byte{0x74, 0x05}, nop15, nops(4)), nil},
+		{"size after the move fits", catBytes([]byte{0x74, 0x05}, nop11, nops(4)), catBytes([]byte{0x74, 0x05}, nop11)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			page := pageWith(0x100, catBytes(sys, c.tail)...)
+			got, ok := planJmpPatch(nil, page, nil, 0x100)
+			if (c.want != nil) != ok || (ok && !bytes.Equal(got, c.want)) {
+				t.Fatalf("planJmpPatch = (% x, %v), want (% x, %v)", got, ok, c.want, c.want != nil)
+			}
+		})
+	}
+}
+
+// relocRig runs one slot of an emulated spill routine. The slot has been
+// assembled with the instructions reloc, which sit at the original address
+// origVA. The test sets the state through the registers that the Sentry saved.
+func (r *spillRig) runHot(t *testing.T, saved map[int]uint64) {
+	t.Helper()
+	r.m.onYield = func(m *x86Machine) {
+		if r.state() != winStateTrapped {
+			return
+		}
+		for n, v := range saved {
+			r.setSaved(n, v)
+		}
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostSlotRunsRelocatedBranchOnBothEdges(t *testing.T) {
+	// cmp rbx, 0; je +0x40
+	reloc := []byte{0x48, 0x83, 0xFB, 0x00, 0x74, 0x40}
+	end := uint64(rigSite + winSiteLen + len(reloc))
+	for _, c := range []struct {
+		name string
+		rbx  uint64
+		want uint64
+	}{
+		{"taken", 0, end + 0x40},
+		{"not taken", 5, end},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newSpillRig(t, reloc)
+			r.runHot(t, map[int]uint64{x86RBX: c.rbx})
+			if r.m.exit.trap != 0 || r.m.exit.jump != c.want {
+				t.Fatalf("the code ended with trap %d, jump %#x; want a jump to %#x", r.m.exit.trap, r.m.exit.jump, c.want)
+			}
+		})
+	}
+}
+
+func TestSlotsRetargetRIPRelativeLoads(t *testing.T) {
+	const want = 0x1122_3344_5566_7788
+	t.Run("post-window", func(t *testing.T) {
+		// mov rax, [rip+0x200], behind the SYSCALL.
+		reloc := []byte{0x48, 0x8B, 0x05, 0x00, 0x02, 0x00, 0x00}
+		target := uint64(rigSite + winSiteLen + len(reloc) + 0x200)
+		r := newSpillRig(t, reloc)
+		r.m.put64(target, want)
+		r.runHot(t, nil)
+		if got := r.m.r[x86RAX]; got != want {
+			t.Fatalf("the relocated load returned %#x, want %#x", got, uint64(want))
+		}
+	})
+	t.Run("pre-window", func(t *testing.T) {
+		// mov rcx, [rip+0x200], in front of the SYSCALL.
+		reloc := []byte{0x48, 0x8B, 0x0D, 0x00, 0x02, 0x00, 0x00}
+		target := uint64(rigSite) + 0x200
+		r := newPreSpillRig(t, reloc)
+		r.m.put64(target, want)
+		r.guest[x86RCX] = want
+		r.runHot(t, nil)
+		if got := r.m.r[x86RCX]; got != want {
+			t.Fatalf("the relocated load returned %#x, want %#x", got, uint64(want))
+		}
+	})
 }

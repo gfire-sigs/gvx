@@ -141,7 +141,9 @@ func (m *x86Machine) memAddr(mem x86asm.Mem) (uint64, error) {
 // operandAddr resolves a memory operand of the instruction that ends at next.
 func (m *x86Machine) operandAddr(mem x86asm.Mem, next uint64) (uint64, error) {
 	if mem.Base == x86asm.RIP {
-		return next + uint64(mem.Disp), nil
+		// The hardware sign-extends the 32-bit displacement. x86asm reports a
+		// negative displacement as a large positive value.
+		return next + uint64(int64(int32(mem.Disp))), nil
 	}
 	return m.memAddr(mem)
 }
