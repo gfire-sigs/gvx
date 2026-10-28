@@ -317,8 +317,8 @@ On `arm64`, the patcher replaces `svc #0` with `B slot`. The slot saves `x16` an
 On `amd64`, the patcher tries the post-window form first. It replaces `syscall` and the bytes after it with `jmp rel32`. Those bytes are whole instructions that cover at least three bytes. The slot holds a copy of the instructions. The slot uses no guest stack, so it keeps the red zone. The post-window form fails in each of these cases:
 
 - The instructions behind the `syscall` cover fewer than three bytes or leave the page.
-- One of them cannot move: a call, a return, a system call, an interrupt, a `loop` or `jcxz` instruction, or an instruction that the rules below keep in place.
-- A relative `jmp` ends before the fifth byte of the patch, or another instruction follows it.
+- One of them cannot move: a call, a return, a system call, an interrupt, a `loop` or `jcxz` instruction, or an instruction that the rules below stop.
+- A relative `jmp` ends before the fifth byte of the patch.
 - The preceding instruction loads the number of a call that never returns: `exit`, `exit_group`, or `rt_sigreturn`.
 - A relative branch that decodes in the page or in the 256 bytes on each side lands in the overwritten bytes.
 - A prefix byte stands in front of the `syscall`.
@@ -333,7 +333,7 @@ The slot copies each moved instruction. Three classes change when they move:
 | `jcc rel8` and `jcc rel32` (post-window only) | The slot holds `0F 8x rel32` to the original target. The move fails when the target lies inside the overwritten bytes. |
 | `jmp rel8` and `jmp rel32` (post-window only) | The slot holds `E9 rel32` to the original target. The `jmp` must be the last moved instruction and must end at or behind the fifth byte of the patch. |
 
-A segment override keeps an instruction in place. A VEX or EVEX memory operand without a base register also keeps it in place, because `x86asm` omits the RIP base of such an operand. A 32-bit address prefix keeps it in place too, because the displacement then counts from `EIP`.
+An instruction with a segment override cannot move. A VEX or EVEX memory operand without a base register cannot move either, because `x86asm` omits the RIP base of such an operand. A 32-bit address prefix also stops the move, because the displacement then counts from `EIP`.
 
 When the post-window form fails, the patcher tries the pre-window form. It replaces the instructions that end at the `syscall` with `jmp rel32`, and it keeps `CC 90` at the `syscall`:
 
