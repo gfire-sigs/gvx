@@ -55,6 +55,7 @@ const (
 	goStaticPackage    = "z.gfire.dev/gvx/internal/acceptprog/gostatic"
 	volTreePackage     = "z.gfire.dev/gvx/internal/acceptprog/voltree"
 	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
+	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -215,28 +216,42 @@ func BuildCompatProbe(tb testing.TB, goarch string) string {
 // non-zero, or at the default toolchain address when textAddr is zero.
 func BuildCompatProbeAt(tb testing.TB, goarch string, textAddr uint64) string {
 	tb.Helper()
+	return buildStaticGuest(tb, compatProbePackage, "compatprobe", goarch, textAddr)
+}
+
+// BuildMicroBench compiles the micro-benchmark guest microbench for the Linux
+// architecture goarch and returns the path of the static ET_EXEC executable.
+func BuildMicroBench(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, microBenchPackage, "microbench", goarch, 0)
+}
+
+// buildStaticGuest compiles the package pkg for linux/goarch with the internal
+// linker and returns the path of the executable, which has type ET_EXEC.
+func buildStaticGuest(tb testing.TB, pkg, name, goarch string, textAddr uint64) string {
+	tb.Helper()
 	goTool, err := exec.LookPath("go")
 	if err != nil {
 		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
 	}
-	out := filepath.Join(tb.TempDir(), "compatprobe")
+	out := filepath.Join(tb.TempDir(), name)
 	ldflags := "-ldflags=-linkmode=internal"
 	if textAddr != 0 {
 		ldflags = fmt.Sprintf("-ldflags=-linkmode=internal -T %#x", textAddr)
 	}
-	cmd := exec.Command(goTool, "build", "-o", out, ldflags, compatProbePackage)
+	cmd := exec.Command(goTool, "build", "-o", out, ldflags, pkg)
 	cmd.Dir = moduleRoot(tb)
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	if msg, err := cmd.CombinedOutput(); err != nil {
-		tb.Fatalf("build compatprobe for linux/%s: %v\n%s", goarch, err, msg)
+		tb.Fatalf("build %s for linux/%s: %v\n%s", name, goarch, err, msg)
 	}
 	f, err := elf.Open(out)
 	if err != nil {
-		tb.Fatalf("open compatprobe: %v", err)
+		tb.Fatalf("open %s: %v", name, err)
 	}
 	defer f.Close()
 	if f.Type != elf.ET_EXEC {
-		tb.Fatalf("compatprobe has type %v, want ET_EXEC", f.Type)
+		tb.Fatalf("%s has type %v, want ET_EXEC", name, f.Type)
 	}
 	return out
 }
