@@ -103,7 +103,7 @@ func (*Platform) SupportsAddressSpaceIO() bool {
 // mapUnit is the size of the window that one page fault maps. MapFile changes
 // only Stage-1 tables over whole contiguous ranges, so a window of 2 MiB costs
 // one Stage-2 lookup and up to 512 Stage-1 descriptors. It is a power-of-two
-// multiple of hostarch.PageSize, which is 16KB in a pagesize_16k build.
+// multiple of hostarch.PageSize, which is 4KB.
 const mapUnit = 2 << 20
 
 // MapUnit implements platform.Platform.MapUnit.

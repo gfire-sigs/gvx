@@ -132,9 +132,6 @@ func toolPath(t *testing.T, pkg string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	buildArgs := []string{"build", "-o", out}
-	if childBuildTags != "" {
-		buildArgs = append(buildArgs, "-tags", childBuildTags)
-	}
 	buildArgs = append(buildArgs, pkg)
 	if combined, err := exec.CommandContext(ctx, "go", buildArgs...).CombinedOutput(); err != nil {
 		t.Fatalf("go build %s failed: %v\n%s", pkg, err, combined)
@@ -284,8 +281,8 @@ func TestE2EOtherOSHypervisorFailsExplicitly(t *testing.T) {
 }
 
 // TestE2ESystrapPrerequisiteError checks the explicit -platform=systrap error
-// in builds without a runnable engine. The 16KB-page darwin/arm64 build
-// covers the running engine in the systrap tests below.
+// in builds without a runnable engine. The builds with an engine cover the
+// running engine in the systrap tests below.
 func TestE2ESystrapPrerequisiteError(t *testing.T) {
 	systraptest.RequireUnavailable(t)
 	_, err := gvx.New(context.Background(), gvx.Config{

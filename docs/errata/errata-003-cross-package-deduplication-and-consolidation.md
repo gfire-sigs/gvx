@@ -354,7 +354,7 @@ Across `pkg/gvx`, `pkg/hostlockdown`, `pkg/sentry/platform/systrap`, `cmd/rungv`
 
 ### 12.2 Remediation Procedure for E11 (Procedural Module)
 
-1. Combine the guest ELF header read in `pkg/gvx/kernel_runner.go` so `checkELFLayout` and `nonPIEHintForGuestFile` share one `64 KiB` buffer.
+1. Combine the guest ELF header read in `pkg/gvx/kernel_runner.go` so `checkELFLayout` and `nonPIEHintForGuestFile` share one `64 KiB` buffer. Resolved: the project removed `checkELFLayout` together with the 16KB page build tag.
 2. Reuse `defaultPath` (`command.go:98`), `ParseMemory` (`resources.go:39`), and `oci.IsTerminal` (`pkg/oci/terminal.go:26`) inside `pkg/gvx`.
 3. Move `resolveMounts` into `pkg/hostlockdown/lockdown.go` and extract `runOnRestrictedThread` in `pkg/hostlockdown/probe_windows.go`.
 4. Refactor `cmd/rungv/pull.go` and `cmd/rungv/stub.go` to call the flag helpers in `cmd/rungv/imagecmd.go`.

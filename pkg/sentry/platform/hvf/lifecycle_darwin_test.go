@@ -329,9 +329,8 @@ func TestReadOnlyFileDescriptorMappingUsesACopy(t *testing.T) {
 	}
 }
 
-// The Sentry maps whole hostarch pages: 4KB by default and 16KB in a
-// pagesize_16k build. The Stage-1 granule stays 4KB, so one MapFile call must
-// install every 4KB page of the range.
+// The Sentry maps whole hostarch pages of 4KB. The Stage-1 granule is 4KB too,
+// so one MapFile call must install every page of the range.
 func TestMapFileCoversWholeHostarchPages(t *testing.T) {
 	plat := newTestPlatform(t)
 	g := newGuest(t, plat, insnLdrX1X0, insnSVC0)

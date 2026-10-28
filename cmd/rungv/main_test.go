@@ -73,26 +73,6 @@ func TestParseRunArgsLockdownOptOut(t *testing.T) {
 	}
 }
 
-func TestParseRunArgsELFCheckOptOut(t *testing.T) {
-	for _, tc := range []struct {
-		flags       []string
-		wantDisable bool
-	}{
-		{nil, false},
-		{[]string{"-elf-check=false"}, true},
-		{[]string{"-elf-check=true"}, false},
-		{[]string{"-elf-check"}, false},
-	} {
-		rc, _, done, stderr := parse(t, append(tc.flags, "-image=x")...)
-		if done {
-			t.Fatalf("%v ended the command: %s", tc.flags, stderr)
-		}
-		if rc.cfg.DisableELFLayoutCheck != tc.wantDisable {
-			t.Errorf("%v: DisableELFLayoutCheck = %v, want %v", tc.flags, rc.cfg.DisableELFLayoutCheck, tc.wantDisable)
-		}
-	}
-}
-
 func TestParseRunArgsExplicitSettings(t *testing.T) {
 	rc, _, done, stderr := parse(t,
 		"-platform=HVF", "-arch=ARM64", "-net=None", "-workspace=/w", "-ro",
