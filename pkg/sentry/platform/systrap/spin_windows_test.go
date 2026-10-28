@@ -20,6 +20,8 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 )
 
 func TestParseSpinEnv(t *testing.T) {
@@ -90,24 +92,27 @@ func TestSpinTicksPerUsTracksTheClock(t *testing.T) {
 }
 
 // TestAwaitSpinWindowLastsItsTime checks that the Sentry polls for the time of
-// its window, and not for a number of loop iterations.
+// its window, and not for a number of loop iterations. The test reads the
+// performance counter, because the Go clock of Windows ticks every half
+// millisecond.
 func TestAwaitSpinWindowLastsItsTime(t *testing.T) {
-	const windowUs = 200
-	var h winSysmsgHeader
-	spin := winSpin{ticks: uint64(windowUs * spinTicksPerUs()), now: spinNow}
-	start := time.Now()
-	_, _ = h.await(spin, errSignaler{}, func() bool { return false })
-	elapsed := time.Since(start)
-	if elapsed < windowUs*time.Microsecond {
-		t.Errorf("await polled for %v, want at least %v", elapsed, windowUs*time.Microsecond)
+	const windowUs = 2000
+	freq := float64(sentrytime.CounterFrequencyHz())
+	measure := func(spin winSpin) float64 {
+		var h winSysmsgHeader
+		start := sentrytime.ReadCounterTicks()
+		_, _ = h.await(spin, errSignaler{}, func() bool { return false })
+		return float64(sentrytime.ReadCounterTicks()-start) * 1e6 / freq
 	}
-	if elapsed > 50*windowUs*time.Microsecond {
-		t.Errorf("await polled for %v, far more than %v", elapsed, windowUs*time.Microsecond)
+	got := measure(winSpin{ticks: uint64(windowUs * spinTicksPerUs()), now: spinNow})
+	if got < windowUs {
+		t.Errorf("await polled for %.0f us, want at least %d us", got, windowUs)
+	}
+	if got > 50*windowUs {
+		t.Errorf("await polled for %.0f us, far more than %d us", got, windowUs)
 	}
 	// A window of zero ticks sleeps at once.
-	start = time.Now()
-	_, _ = h.await(winSpin{now: spinNow}, errSignaler{}, func() bool { return false })
-	if time.Since(start) > 5*time.Millisecond {
-		t.Error("a window of 0 ticks polled")
+	if got := measure(winSpin{now: spinNow}); got > 1000 {
+		t.Errorf("a window of 0 ticks polled for %.0f us", got)
 	}
 }

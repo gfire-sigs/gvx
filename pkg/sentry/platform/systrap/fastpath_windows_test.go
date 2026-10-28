@@ -584,8 +584,20 @@ func TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent(t *testing.T) {
 	if out := r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev); out.done {
 		t.Fatalf("the cold resume ended the stop: %+v", out)
 	}
-	if _, trapped, err := th.waitNext(); err != nil || !trapped {
-		t.Fatalf("waitNext = (trapped %v, %v), want the trap of system call 7", trapped, err)
+	// The thread runs to system call 7. A fast path site publishes a trap, and a
+	// site that keeps CC 90 raises an exception.
+	ev, trapped, err = th.waitNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out outcome
+	if trapped {
+		out = r.ctx.fastTrap(r.as, th, r.ac)
+	} else {
+		out = r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev)
+	}
+	if !out.done || regNr(r.ac) != 7 {
+		t.Fatalf("the guest stopped with %+v and system call %d, want system call 7", out, regNr(r.ac))
 	}
 }
 

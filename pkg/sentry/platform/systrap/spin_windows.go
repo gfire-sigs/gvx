@@ -37,10 +37,13 @@ import (
 
 const (
 	// defaultStubSpinNs and defaultSentrySpinNs are the windows in nanoseconds.
-	// They equal the time that the loop counts of the first version took on
-	// amd64.
-	defaultStubSpinNs   = 16_000
-	defaultSentrySpinNs = 1_000
+	// The micro-benchmarks chose them on both hosted runners. A window of 16
+	// and 1 microseconds, the time of the first version on amd64, left 5 percent
+	// of the round trips on the events. A window of 64 and 8 microseconds left
+	// 0.2 percent, and a pipe round trip took 6 times less time on amd64. A
+	// window of 256 and 32 microseconds did not improve on it.
+	defaultStubSpinNs   = 64_000
+	defaultSentrySpinNs = 8_000
 
 	// spinEnv sets both windows in microseconds, as "stub,sentry". A window of
 	// 0 means that the side never polls. Tests and the spin sweep use it.
