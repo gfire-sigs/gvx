@@ -104,9 +104,12 @@ const (
 // winSysmsgHeader is the part of the winSysmsg that does not depend on the
 // architecture. All fields have natural alignment.
 //
-// The Sentry writes State, with Trapped excepted, Target, and the register
-// block while the state is Trapped. The stub writes the other fields. Each
-// waiter flag has one writer, so no operation needs a read-modify-write.
+// The Sentry writes State, with Trapped excepted, Target, the register block,
+// and FPDirty while the state is Trapped. The stub writes the other fields, and
+// it clears FPDirty after it loads the vector image. The release store of the
+// state orders the two writers of FPDirty. Each waiter flag has one writer, so
+// no operation needs a read-modify-write. SpinTicks is set once, when the
+// Sentry creates the slot.
 type winSysmsgHeader struct {
 	// State is the handoff word.
 	State uint32

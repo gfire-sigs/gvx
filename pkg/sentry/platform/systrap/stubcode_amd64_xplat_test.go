@@ -1440,22 +1440,18 @@ func TestRelocateRIPRelativeOperand(t *testing.T) {
 		{"no move", 0x1234, 0, true},
 		{"slot above the code", 0x1234, 0x1100_0000, true},
 		{"slot below the code", 0x1234, -0x1100_0000, true},
-		{"positive limit", 0x7FFF_FFF0, 0x10, false},
-		{"positive limit minus one", 0x7FFF_FFF0, 0x0F, true},
-		{"negative limit", -0x8000_0000 + 0x10, -0x10, true},
-		{"negative limit plus one", -0x8000_0000 + 0x10, -0x11, true},
-		{"below the negative limit", -0x8000_0000 + 0x10, 0x11, false},
+		{"largest positive displacement", 0x7FFF_FFF0, -0x0F, true},
+		{"one past the largest positive displacement", 0x7FFF_FFF0, -0x10, false},
+		{"most negative displacement", -0x8000_0000 + 0x10, 0x10, true},
+		{"one below the most negative displacement", -0x8000_0000 + 0x10, 0x11, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			// The tests that cannot fit are those that push the new displacement
-			// out of int32. moved = disp - delta.
+			// The new displacement is disp-delta. A row fails when it leaves int32.
 			code := mov(c.disp)
 			newVA := uint64(int64(orig) + c.delta)
 			got, err := relocateInstructions(code, orig, newVA, true)
-			moved := int64(c.disp) - c.delta
-			fits := moved == int64(int32(moved))
-			if (err == nil) != fits {
-				t.Fatalf("relocateInstructions error = %v, but the displacement %#x fits = %v", err, moved, fits)
+			if (err == nil) != c.ok {
+				t.Fatalf("relocateInstructions error = %v, want success %v", err, c.ok)
 			}
 			if err != nil {
 				return

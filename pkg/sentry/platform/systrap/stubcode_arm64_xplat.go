@@ -59,7 +59,6 @@ const (
 	a64DMBISH    = 0xd5033bbf
 	a64YIELD     = 0xd503203f
 
-	a64CondNE = 1
 	a64CondHS = 2
 	a64CondLO = 3
 	a64CondEQ = 0
@@ -74,7 +73,6 @@ func a64movFromSP(rd uint32) uint32         { return 0x91000000 | a64SP<<5 | rd 
 func a64movToSP(rn uint32) uint32           { return 0x91000000 | rn<<5 | a64SP }
 func a64addSPShifted(rn, imm uint32) uint32 { return 0x91400000 | imm<<10 | rn<<5 | a64SP }
 func a64cmpW(rn, imm uint32) uint32         { return 0x7100001f | imm<<10 | rn<<5 }
-func a64subsW1(rd uint32) uint32            { return 0x71000400 | rd<<5 | rd }
 func a64addX(rd, rn, rm uint32) uint32      { return 0x8b000000 | rm<<16 | rn<<5 | rd }
 func a64cmpX(rn, rm uint32) uint32          { return 0xeb00001f | rm<<16 | rn<<5 }
 

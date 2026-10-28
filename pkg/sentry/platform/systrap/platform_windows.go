@@ -109,6 +109,12 @@ var configureOnce sync.Once
 // to the debug path. GVX_SYSTRAP_FASTPATH=1 makes a host that cannot run the
 // fast path an error, and GVX_SYSTRAP_FASTPATH=0 turns the fast path off.
 func New() (*Platform, error) {
+	// A bad spin setting is an error in every mode. Without this check, the auto
+	// mode would take it for a host that cannot run the fast path and fall back
+	// to the debug path, which is 50 to 200 times slower.
+	if _, err := newSpinWindows(0); err != nil {
+		return nil, err
+	}
 	switch fastPathMode {
 	case fastPathOff:
 		return open(false)

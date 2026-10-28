@@ -116,3 +116,19 @@ func TestAwaitSpinWindowLastsItsTime(t *testing.T) {
 		t.Errorf("a window of 0 ticks polled for %.0f us", got)
 	}
 }
+
+// TestNewRejectsABadSpinSetting checks that a bad setting is an error in every
+// mode. In the auto mode it must not look like a host without the fast path.
+func TestNewRejectsABadSpinSetting(t *testing.T) {
+	t.Setenv(spinEnv, "nonsense")
+	for _, mode := range []fastPathSetting{fastPathAuto, fastPathRequired, fastPathOff} {
+		prev := fastPathMode
+		fastPathMode = mode
+		p, err := New()
+		fastPathMode = prev
+		if err == nil {
+			_ = p.Close()
+			t.Errorf("mode %d: New accepted the setting", mode)
+		}
+	}
+}
