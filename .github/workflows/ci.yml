@@ -220,21 +220,26 @@ jobs:
           Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List FeatureName, State
           Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
-      - name: Smoke test rungv guest execution
+      # The runner has the Windows Hypervisor Platform, so whpx must start.
+      # GVX_DEBUG_LOG prints the Sentry log, which names the reason of a guest
+      # crash.
+      - name: Smoke test rungv guest on whpx
         shell: bash
-        # The step reports the outcome and does not fail the job until the
-        # hosted runner is known to run a guest. GVX_DEBUG_LOG prints the
-        # Sentry log, which names the reason of a guest crash.
-        continue-on-error: true
         env:
           GVX_DEBUG_LOG: "1"
         run: |
           go build -o rungv.exe ./cmd/rungv
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
-          ./rungv.exe stub || true
-          ./rungv.exe run -platform=auto -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
+          ./rungv.exe run -platform=whpx -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
+      # The hypervisor tests fail here and never skip, because
+      # GVX_ALLOW_NO_HYPERVISOR is unset. The earlier step covers systrap.
+      - name: Test whpx end-to-end suite
+        shell: bash
+        env:
+          GVX_E2E_OFFLINE: "1"
+        run: go test -count=1 -timeout 25m -skip 'Systrap|systrap' ./e2e/
 
   windows-arm64:
     name: test windows/arm64

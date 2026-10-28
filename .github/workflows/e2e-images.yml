@@ -5,8 +5,8 @@ name: e2e-images
 # The macOS job runs the systrap variants of the gates, which need none. The
 # Linux jobs run every gate on the upstream systrap platform with the seccomp
 # lockdown, because Linux has no hypervisor backend. The Windows jobs run the
-# systrap variants on the engine of gvx. The windows-11-arm runner has no
-# hypervisor either.
+# systrap variants on the engine of gvx. The windows-latest runner also runs
+# the whpx variants. The windows-11-arm runner has no hypervisor.
 on:
   schedule:
     - cron: "17 3 * * 0"
@@ -112,3 +112,18 @@ jobs:
             ./e2e
           go test -count=1 -timeout 30m -run 'TestE2EDockerRun.*/systrap' ./e2e
           go test -count=1 -timeout 40m -run 'TestE2EGateETExec.*/systrap' ./e2e
+      # Each -run value has one slash, so the pattern before it selects the
+      # test and the pattern after it selects the subtest. The step fails
+      # instead of skipping when whpx does not start, because
+      # GVX_ALLOW_NO_HYPERVISOR is 0 here.
+      - name: Test end-to-end registry gates on whpx
+        if: matrix.arch == 'amd64'
+        shell: bash
+        env:
+          GVX_ALLOW_NO_HYPERVISOR: "0"
+        run: |
+          go test -count=1 -timeout 80m \
+            -run '^(TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)|TestE2EStdioReopenThroughDeviceNames)$/^whpx$' \
+            ./e2e
+          go test -count=1 -timeout 30m -run '^TestE2EDockerRun.*$/^whpx$' ./e2e
+          go test -count=1 -timeout 40m -run '^TestE2EGateETExec.*$/^whpx$' ./e2e
