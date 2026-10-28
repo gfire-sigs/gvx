@@ -140,7 +140,16 @@ func (r *rig) newThread() *rig {
 // It returns the Sentry view of the frame.
 func (r *rig) mapPage(va uint64, at hostarch.AccessType, content ...[]byte) []byte {
 	r.t.Helper()
-	fr, err := r.mf.Allocate(blockSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	fr, mem := r.allocFrames(1, content...)
+	r.mapRange(va, fr, at)
+	return mem
+}
+
+// allocFrames allocates n pages of the memory file and fills the start of the
+// first page with content. It returns the range and the Sentry view of it.
+func (r *rig) allocFrames(n int, content ...[]byte) (memmap.FileRange, []byte) {
+	r.t.Helper()
+	fr, err := r.mf.Allocate(uint64(n)*blockSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		r.t.Fatalf("Allocate: %v", err)
 	}
@@ -153,10 +162,15 @@ func (r *rig) mapPage(va uint64, at hostarch.AccessType, content ...[]byte) []by
 	for _, c := range content {
 		off += copy(mem[off:], c)
 	}
+	return fr, mem
+}
+
+// mapRange maps fr at va with the access at.
+func (r *rig) mapRange(va uint64, fr memmap.FileRange, at hostarch.AccessType) {
+	r.t.Helper()
 	if err := r.as.MapFile(hostarch.Addr(va), r.mf, fr, at, false); err != nil {
 		r.t.Fatalf("MapFile %#x: %v", va, err)
 	}
-	return mem
 }
 
 func load64(b []byte) uint64     { return binary.LittleEndian.Uint64(b) }

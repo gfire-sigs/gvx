@@ -328,6 +328,8 @@ An `amd64` instruction can cross into the next page. The fetch then faults in th
 
 The original frame can be shared between address spaces and mapped at different addresses. The stub therefore never executes the original frame. A guest that writes to the page that it executes would make the engine swap the two mappings forever. The engine reports SIGSEGV for that write.
 
+The memory manager maps a whole mapping at each page fault, so it maps pages again that the guest already runs. A repeated mapping with execute access keeps a block when its frame, its file offset, and its access do not change. The block then keeps its patched copy, its table of sites, and its island slots. A reset leaves a thread that already trapped at a patched site without its site. The guest then receives a SIGTRAP that it did not raise. A file without a host handle maps through a copy of its bytes, and such a mapping always gives new blocks.
+
 ### 6.4 Stops and Resumes
 
 A guest thread is parked or running. A parked thread has a suspend count of one, and its registers live in the Sentry. A stop starts when the thread raises an exception. The kernel freezes the process and sends the event to the debug object. The pump routes the event to the thread, and `Switch` reads its context.
