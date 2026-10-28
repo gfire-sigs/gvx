@@ -35,6 +35,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
+	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 )
 
 // Platform implements platform.Platform with stub processes that run the guest
@@ -305,7 +306,10 @@ func runProbeLoop(p *Platform, mm platform.MemoryManager, codeAddr, stackAddr ui
 	ac := arch.New(arch.Host)
 	ac.SetIP(uintptr(codeAddr))
 	ac.SetStack(uintptr(stackAddr + blockSize - 0x100))
-	var start time.Time
+	// The Go clock of Windows ticks every half millisecond or more, and 2000 calls
+	// on the fast path can finish inside one tick. The performance counter has
+	// a resolution of 100 ns or better.
+	var start uint64
 	for calls := 0; ; calls++ {
 		si, _, err := c.Switch(context.Background(), mm, ac, -1)
 		if si != nil || err != nil {
@@ -314,13 +318,15 @@ func runProbeLoop(p *Platform, mm platform.MemoryManager, codeAddr, stackAddr ui
 		switch num := probeSyscallNumber(ac); num {
 		case 5:
 			if calls == 1 {
-				start = time.Now()
+				start = sentrytime.ReadCounterTicks()
 			}
 		case 6:
 			if calls != probeCalls {
 				return 0, fmt.Errorf("guest made %d calls, want %d", calls, probeCalls)
 			}
-			return time.Since(start) / (probeCalls - 1), nil
+			ticks := sentrytime.ReadCounterTicks() - start
+			total := time.Duration(float64(ticks) * 1e9 / float64(sentrytime.CounterFrequencyHz()))
+			return total / (probeCalls - 1), nil
 		default:
 			return 0, fmt.Errorf("guest probe made unexpected system call %d", num)
 		}
