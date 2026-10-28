@@ -125,7 +125,12 @@ type spillRig struct {
 
 func newSpillRig(t *testing.T) *spillRig {
 	t.Helper()
-	sc, err := buildSpill()
+	return newSpillRigWith(t, spillOptions{})
+}
+
+func newSpillRigWith(t *testing.T, opts spillOptions) *spillRig {
+	t.Helper()
+	sc, err := buildSpillWith(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,5 +708,31 @@ func TestWinSysmsgVectorBlockMatchesTheFloatingPointState(t *testing.T) {
 	}
 	if binary.LittleEndian.Uint32(got[fpStateOffFpsr:]) != 0xAB || binary.LittleEndian.Uint32(got[fpStateOffFpcr:]) != 0xCD {
 		t.Error("fpsr or fpcr differ after the round trip")
+	}
+}
+
+func TestSpillWithoutVectorStateSkipsTheImage(t *testing.T) {
+	full, err := buildSpill()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newSpillRigWith(t, spillOptions{noVector: true})
+	if len(r.sc.code) >= len(full.code) {
+		t.Errorf("the routine without the vector state has %d bytes, the full routine %d", len(r.sc.code), len(full.code))
+	}
+	r.m.onYield = func(m *a64Machine) { r.setState(winStateRunHot) }
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkHotExit(t, r.guest)
+	for off := uint64(winOffVec); off < winOffVec+32*16; off += 8 {
+		if got := r.m.get64(rigSysm + off); got != 0 {
+			t.Fatalf("the routine wrote the vector image at offset %#x", off)
+		}
+	}
+	for _, off := range []uint64{winOffFpsr, winOffFpcr} {
+		if got := r.m.get64(rigSysm + off); got != 0 {
+			t.Fatalf("the routine wrote the control word at offset %#x", off)
+		}
 	}
 }

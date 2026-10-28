@@ -310,7 +310,10 @@ func (c winSpillCode) coldExit() int {
 // ntdll keep them. The stack pointer lies 64 bytes below the top of the stub
 // stack, which leaves the 32-byte shadow space of a call and keeps the 16-byte
 // alignment.
-func buildSpill() (winSpillCode, error) {
+func buildSpill() (winSpillCode, error) { return buildSpillWith(spillOptions{}) }
+
+// buildSpillWith generates the spill routine with the changes of opts.
+func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	var a x86Asm
 	const base = x86R15
 
@@ -333,8 +336,10 @@ func buildSpill() (winSpillCode, error) {
 	// Save the vector state before the first call. A call into ntdll can
 	// clobber the volatile vector registers, and the Sentry reads the saved
 	// image while the thread waits.
-	a.loadXsaveMask()
-	a.xsave64(base, winOffXsave)
+	if !opts.noVector {
+		a.loadXsaveMask()
+		a.xsave64(base, winOffXsave)
+	}
 
 	// Publish Trapped. An x86 store has release semantics. The fence orders the
 	// store before the load of the Sentry flag.
@@ -378,8 +383,10 @@ func buildSpill() (winSpillCode, error) {
 
 	// Hot resume: load the vector state, the FS base, the flags, the return
 	// address, and every register, then jump to the tail.
-	a.loadXsaveMask()
-	a.xrstor64(base, winOffXsave)
+	if !opts.noVector {
+		a.loadXsaveMask()
+		a.xrstor64(base, winOffXsave)
+	}
 	a.movLoad(x86RAX, base, winOffFsBase)
 	a.emit(0xF3, 0x48, 0x0F, 0xAE, 0xD0) // wrfsbase rax
 	a.pushMem(base, winOffRflags)
@@ -392,8 +399,10 @@ func buildSpill() (winSpillCode, error) {
 	// Cold resume: load the flags and every register, then trap. The Sentry
 	// continues the thread at Target and loads the FS base itself.
 	a.label("cold")
-	a.loadXsaveMask()
-	a.xrstor64(base, winOffXsave)
+	if !opts.noVector {
+		a.loadXsaveMask()
+		a.xrstor64(base, winOffXsave)
+	}
 	a.pushMem(base, winOffRflags)
 	a.emit(0x9D)
 	loadAll(&a, base)

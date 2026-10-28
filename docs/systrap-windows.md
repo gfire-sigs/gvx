@@ -412,8 +412,8 @@ The design rests on facts that no Windows document states:
 | Handoff state machine | Unit tests with channel events and the race detector, also on macOS. |
 | Generated machine code | Decoding with `x86asm` and `arm64asm`, and an emulator that runs the spin hit, the sleep, the races, and the cold resume, also on macOS. |
 | `amd64` patch plan | Unit tests of the relocation and branch rules, also on macOS. |
-| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
-| Latency | Not measured. |
+| End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. `TestFastPathPreWindowServesEverySystemCall` and the tests after it in `engine_windows_amd64_test.go` cover the pre-window form. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
+| Latency | Not recorded. `BenchmarkFastPathRoundTrip` measures it, and section 11 gives the command. |
 
 The engine reclaims island slots through a per-island bitmap when a code page unmaps or returns to data state. A thread count above 512 for one stub fails with an error.
 
@@ -508,6 +508,12 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 4. Run `go build` in the probe directory with Go 1.24 or newer.
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
+
+To measure the round trip of the fast path, run the workflow `diagnose` on `windows-latest` and on `windows-11-arm`. Set its `script` input to the command below. The benchmark reports `ns/roundtrip` for the spin case and for the sleep case, with and without the vector state in the spill routine. The variants without the vector state are an upper bound for the saving of a conditional restore. They break a guest that uses a vector register, so only this benchmark runs them.
+
+```bash
+go test -run '^$' -bench BenchmarkFastPathRoundTrip -benchtime 2s -count 3 ./pkg/sentry/platform/systrap/
+```
 
 To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to the guest. A line has the exception code, the address, and the bytes at the program counter.
 

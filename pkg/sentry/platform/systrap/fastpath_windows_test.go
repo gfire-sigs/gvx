@@ -319,3 +319,94 @@ func TestFastPathIslandSlotsReclaimedOnRepatchAndUnmap(t *testing.T) {
 		}
 	}
 }
+
+// sleepRoundTripDelay is how long the Sentry holds a trapped thread in the
+// sleep case of BenchmarkFastPathRoundTrip. It exceeds the spin of the stub by
+// a wide margin, so the stub sleeps on the host event before the resume.
+const sleepRoundTripDelay = time.Millisecond
+
+// BenchmarkFastPathRoundTrip measures one round trip of the fast path: the
+// guest traps, the Sentry sees the trap, answers with a fixed result and no
+// other work, and the guest resumes and traps again. The guest is a loop of
+// one patched system call.
+//
+// The spin case resumes the thread at once, so the stub finds the resume state
+// while it spins. The sleep case holds the thread for sleepRoundTripDelay
+// first, so the stub sleeps on the host event and the resume wakes it. The
+// metric ns/roundtrip counts only the time in Switch. ns/op also counts the
+// delay of the sleep case.
+//
+// The novector variants run a spill routine without the save and the restore of
+// the vector state. They give the upper bound of what skipping the vector state
+// can save. The routine breaks a guest that uses a vector register, so only
+// this benchmark runs it.
+//
+// Run it through the diagnose workflow with a script, for example:
+// go test -run '^$' -bench BenchmarkFastPathRoundTrip -count 5 ./pkg/sentry/platform/systrap/
+func BenchmarkFastPathRoundTrip(b *testing.B) {
+	for _, vec := range []struct {
+		name string
+		opts spillOptions
+	}{
+		{"vector", spillOptions{}},
+		{"novector", spillOptions{noVector: true}},
+	} {
+		for _, wait := range []struct {
+			name  string
+			delay time.Duration
+		}{
+			{"spin", 0},
+			{"sleep", sleepRoundTripDelay},
+		} {
+			b.Run(vec.name+"/"+wait.name, func(b *testing.B) {
+				benchmarkFastPathRoundTrip(b, vec.opts, wait.delay)
+			})
+		}
+	}
+}
+
+func benchmarkFastPathRoundTrip(b *testing.B, opts spillOptions, delay time.Duration) {
+	p := newFastPlatform(b)
+	if opts.noVector {
+		sc, err := buildSpillWith(opts)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// The address space copies the routine when it starts, so the new
+		// routine reaches the stub of the rig below.
+		p.spill = sc
+	}
+	r := newRig(b, p)
+	r.program(gSyscall(1), gJump(codeVA))
+	// The first call patches the page and creates the thread.
+	si, _, err := r.run()
+	mustSyscall(b, si, err, 1, r.ac)
+	f := fastStats(b, r)
+
+	var inSwitch time.Duration
+	b.ResetTimer()
+	for range b.N {
+		if delay > 0 {
+			for start := time.Now(); time.Since(start) < delay; {
+			}
+			if f.slot.sm.stubWaiter().Load() == 0 {
+				b.Fatal("the stub did not sleep before the resume")
+			}
+		}
+		setRet(r.ac, 0)
+		start := time.Now()
+		si, _, err := r.run()
+		inSwitch += time.Since(start)
+		if si != nil || err != nil {
+			b.Fatalf("Switch = (%s, %v), want a system call", describe(si), err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(inSwitch.Nanoseconds())/float64(b.N), "ns/roundtrip")
+	if got, want := f.traps.Load(), uint64(b.N)+1; got != want {
+		b.Fatalf("the fast path served %d of %d system calls", got, want)
+	}
+	if got := f.colds.Load(); got != 0 {
+		b.Fatalf("%d resumes ended in a debug stop, want none", got)
+	}
+}

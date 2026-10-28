@@ -173,6 +173,16 @@ func (h *winSysmsgHeader) stubWaiter() *atomic.Uint32 {
 // loadState reads the handoff word with acquire semantics.
 func (h *winSysmsgHeader) loadState() uint32 { return h.state().Load() }
 
+// spillOptions changes the spill routine for a measurement. The zero value is
+// the routine that the engine runs.
+type spillOptions struct {
+	// noVector removes the save and the restore of the vector state. The routine
+	// then breaks a guest that uses a vector register. Only
+	// BenchmarkFastPathRoundTrip sets it, to measure what the vector state costs
+	// in one round trip. No production path sets it.
+	noVector bool
+}
+
 // winSignaler is the event pair behind one thread. The Windows engine backs
 // it with the two auto-reset events. A test backs it with channels.
 type winSignaler interface {

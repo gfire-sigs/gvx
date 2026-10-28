@@ -168,7 +168,10 @@ func restoreVector(base int) []uint32 {
 }
 
 // buildSpill generates the spill routine for the layout of this file.
-func buildSpill() (winSpillCode, error) {
+func buildSpill() (winSpillCode, error) { return buildSpillWith(spillOptions{}) }
+
+// buildSpillWith generates the spill routine with the changes of opts.
+func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	var a a64Asm
 	const (
 		base = 19
@@ -188,7 +191,9 @@ func buildSpill() (winSpillCode, error) {
 	for i := 18; i < 30; i += 2 {
 		a.emit(hvcommon.STPX(16, i, i+1, winOffX+8*i))
 	}
-	a.emit(saveVector(16)...)
+	if !opts.noVector {
+		a.emit(saveVector(16)...)
+	}
 	a.emit(
 		hvcommon.STRX(16, 30, winOffX+8*30),
 		a64movFromSP(0),
@@ -258,7 +263,7 @@ func buildSpill() (winSpillCode, error) {
 		hvcommon.LDRX(base, 0, winOffX+8*18),
 		hvcommon.STRX(base, 0, winOffX18),
 	)
-	a.emit(restoreCommon(base)...)
+	a.emit(restoreCommon(base, !opts.noVector)...)
 	a.emit(
 		hvcommon.LDRX(base, 17, winOffTail),
 		hvcommon.LDRX(base, 16, winOffSP),
@@ -270,7 +275,7 @@ func buildSpill() (winSpillCode, error) {
 
 	// Cold resume.
 	a.label("cold")
-	a.emit(restoreCommon(base)...)
+	a.emit(restoreCommon(base, !opts.noVector)...)
 	a.emit(
 		hvcommon.LDPX(base, 16, 17, winOffX+8*16),
 		hvcommon.LDRX(base, 0, winOffSP),
@@ -288,9 +293,13 @@ func buildSpill() (winSpillCode, error) {
 }
 
 // restoreCommon loads the vector state, the flags, and the registers that both
-// resumes load the same way: x2 to x15, x18, x20 to x29, and x30.
-func restoreCommon(base int) []uint32 {
-	w := restoreVector(base)
+// resumes load the same way: x2 to x15, x18, x20 to x29, and x30. It starts with
+// the vector state when vector is true.
+func restoreCommon(base int, vector bool) []uint32 {
+	var w []uint32
+	if vector {
+		w = restoreVector(base)
+	}
 	w = append(w,
 		hvcommon.LDRX(base, 0, winOffNZCV),
 		a64MSRNZCV|0,

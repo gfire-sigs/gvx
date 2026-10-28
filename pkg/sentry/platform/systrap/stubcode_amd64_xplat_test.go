@@ -152,19 +152,19 @@ var rigNop3 = []byte{0x0F, 0x1F, 0x00} // nop dword ptr [rax]
 
 func newSpillRig(t *testing.T, reloc []byte) *spillRig {
 	t.Helper()
-	return newSlotRig(t, reloc, false)
+	return newSlotRig(t, reloc, false, spillOptions{})
 }
 
 // newPreSpillRig returns a rig whose slot is a pre-window slot with the
 // relocated instructions reloc. The machine starts at the first of them.
 func newPreSpillRig(t *testing.T, reloc []byte) *spillRig {
 	t.Helper()
-	return newSlotRig(t, reloc, true)
+	return newSlotRig(t, reloc, true, spillOptions{})
 }
 
-func newSlotRig(t *testing.T, reloc []byte, pre bool) *spillRig {
+func newSlotRig(t *testing.T, reloc []byte, pre bool, opts spillOptions) *spillRig {
 	t.Helper()
-	sc, err := buildSpill()
+	sc, err := buildSpillWith(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1657,4 +1657,40 @@ func TestSlotsRetargetRIPRelativeLoads(t *testing.T) {
 			t.Fatalf("the relocated load returned %#x, want %#x", got, uint64(want))
 		}
 	})
+}
+
+func TestSpillWithoutVectorStateSkipsTheImage(t *testing.T) {
+	full, err := buildSpill()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lean, err := buildSpillWith(spillOptions{noVector: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lean.code) >= len(full.code) {
+		t.Errorf("the routine without the vector state has %d bytes, the full routine %d", len(lean.code), len(full.code))
+	}
+	for pos := 0; pos < len(lean.code); {
+		inst, err := x86asm.Decode(lean.code[pos:], 64)
+		if err != nil {
+			t.Fatalf("instruction at offset %d does not decode: %v", pos, err)
+		}
+		if inst.Op == x86asm.XSAVE64 || inst.Op == x86asm.XRSTOR64 {
+			t.Fatalf("the routine has %v at offset %d", inst, pos)
+		}
+		pos += inst.Len
+	}
+
+	r := newSlotRig(t, rigNop3, false, spillOptions{noVector: true})
+	r.m.onYield = func(m *x86Machine) { r.setState(winStateRunHot) }
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	r.checkHotExit(t, r.guest, rigFlags)
+	for i, b := range r.sysmsgVector() {
+		if b != 0 {
+			t.Fatalf("the routine wrote byte %d of the vector image", i)
+		}
+	}
 }
