@@ -107,6 +107,17 @@ func TestLicenseListNamesEveryModule(t *testing.T) {
 	}
 }
 
+// TestComponentIndexAcceptsCRLF checks the index of a notice file that a Windows
+// checkout wrote with CRLF line endings.
+func TestComponentIndexAcceptsCRLF(t *testing.T) {
+	text := "intro\r\n\r\n" + componentListHeading + "\r\nstd go1.27.3 BSD-3-Clause\r\nexample.com/m v1.0.0 MIT\r\n\r\nbody\r\n"
+	lines, ok := componentIndex(text)
+	want := []string{"std go1.27.3 BSD-3-Clause", "example.com/m v1.0.0 MIT"}
+	if !ok || strings.Join(lines, "|") != strings.Join(want, "|") {
+		t.Fatalf("componentIndex() = (%q, %v), want (%q, true)", lines, ok, want)
+	}
+}
+
 func TestLicenseRejectsArguments(t *testing.T) {
 	code, stdout, stderr := runLicense(t, "extra")
 	if code != 2 || stdout != "" || !strings.Contains(stderr, `unexpected argument "extra"`) {

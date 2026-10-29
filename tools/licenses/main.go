@@ -104,10 +104,12 @@ func checkDocument(doc document, embeddedPath, readmePath string, stdout, stderr
 		_, _ = fmt.Fprintf(stderr, "licenses: %v\n", err)
 		return 1
 	}
-	if string(have) != want {
+	// A checkout with CRLF line endings must not make the files look stale.
+	haveText := lfOnly(string(have))
+	if haveText != want {
 		stale = true
 		_, _ = fmt.Fprintf(stderr, "%s is stale; regenerate it with: go run ./tools/licenses -o %s\n", embeddedPath, embeddedPath)
-		_, _ = io.WriteString(stderr, diffSummary(string(have), want))
+		_, _ = io.WriteString(stderr, diffSummary(haveText, want))
 	}
 
 	readme, err := os.ReadFile(readmePath)
@@ -115,7 +117,7 @@ func checkDocument(doc document, embeddedPath, readmePath string, stdout, stderr
 		_, _ = fmt.Fprintf(stderr, "licenses: %v\n", err)
 		return 1
 	}
-	if table := doc.markdownTable(); !strings.Contains(string(readme), table) {
+	if table := doc.markdownTable(); !strings.Contains(lfOnly(string(readme)), table) {
 		stale = true
 		_, _ = fmt.Fprintf(stderr, "%s does not contain the current license table; paste the output of: go run ./tools/licenses -markdown\n", readmePath)
 	}
@@ -124,6 +126,11 @@ func checkDocument(doc document, embeddedPath, readmePath string, stdout, stderr
 	}
 	_, _ = fmt.Fprintln(stdout, "license notices are current")
 	return 0
+}
+
+// lfOnly returns text with CRLF line endings replaced by LF.
+func lfOnly(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
 }
 
 // diffSummary lists the lines that differ between have and want. It prints at most

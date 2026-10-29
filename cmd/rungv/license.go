@@ -72,6 +72,8 @@ func licenseSubcommand(_ context.Context, args []string, stdout, stderr io.Write
 func componentIndex(text string) ([]string, bool) {
 	var lines []string
 	in := false
+	// A checkout with CRLF line endings adds a carriage return to every line.
+	text = strings.ReplaceAll(text, "\r\n", "\n")
 	for _, line := range strings.Split(text, "\n") {
 		switch {
 		case !in && line == componentListHeading:
