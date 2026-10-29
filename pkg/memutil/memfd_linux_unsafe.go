@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // CreateMemFD creates a memfd file and returns the fd.

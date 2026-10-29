@@ -14,7 +14,7 @@
 
 package oci
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 const (
 	ioctlGetTermios = unix.TCGETS

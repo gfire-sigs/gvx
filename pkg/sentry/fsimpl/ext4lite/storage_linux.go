@@ -21,7 +21,7 @@ import (
 	"os"
 	"runtime"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // osNativeGrow allocates the range [off, off+n) with fallocate in mode 0.

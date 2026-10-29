@@ -20,7 +20,7 @@ package console
 import (
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // StdioIsPty returns true if all stdio FDs are ptys.

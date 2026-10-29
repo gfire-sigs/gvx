@@ -34,7 +34,7 @@ import (
 	"strconv"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"google.golang.org/protobuf/proto"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/abi/linux/errno"

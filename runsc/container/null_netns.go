@@ -21,7 +21,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/runsc/config"
 	"z.gfire.dev/gvx/runsc/specutils"
 )

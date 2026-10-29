@@ -310,7 +310,12 @@ func (v BoundaryViolation) Unwrap() error { return errForbiddenImport }
 // normalizeImport strips the module prefixes and returns the repository-relative import path.
 func normalizeImport(impPath string) string {
 	trimmed := strings.TrimPrefix(impPath, modulePrefix)
-	return strings.TrimPrefix(trimmed, legacyModulePrefix)
+	trimmed = strings.TrimPrefix(trimmed, legacyModulePrefix)
+	// The module embeds the x/sys unix package. The rules name it by its upstream path.
+	if trimmed == "internal/xsys/unix" {
+		return "golang.org/x/sys/unix"
+	}
+	return trimmed
 }
 
 func isStdlibImport(impPath string) bool {

@@ -26,7 +26,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func runBasicProgram(progData []byte, device string, deviceIndex int) error {

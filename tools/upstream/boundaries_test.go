@@ -364,3 +364,18 @@ func TestShimControlInteropImportsStayTestOnly(t *testing.T) {
 		t.Errorf("production interop imports: %d violations, want 4", len(vs))
 	}
 }
+
+func TestBoundaryNormalizesTheEmbeddedXSysUnix(t *testing.T) {
+	const embedded = "z.gfire.dev/gvx/internal/xsys/unix"
+	if got := normalizeImport(embedded); got != "golang.org/x/sys/unix" {
+		t.Fatalf("normalizeImport(%q) = %q, want the upstream path", embedded, got)
+	}
+	// A rule that allows x/sys/unix allows the embedded copy, and a rule that
+	// does not allow it still refuses the copy.
+	if vs := boundaryCheck(t, "pkg/hostlockdown/lockdown_darwin.go", importLines(embedded)); len(vs) != 0 {
+		t.Errorf("hostlockdown imports the embedded unix package: %d violations, want 0: %v", len(vs), vs)
+	}
+	if vs := boundaryCheck(t, "pkg/sentry/platform/whpx/whpx.go", importLines(embedded)); len(vs) != 1 {
+		t.Errorf("whpx imports the embedded unix package: %d violations, want 1", len(vs))
+	}
+}

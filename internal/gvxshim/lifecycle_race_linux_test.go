@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func TestDeletePreservesEvidenceWhenBothServingLoopsAreUnresponsive(t *testing.T) {

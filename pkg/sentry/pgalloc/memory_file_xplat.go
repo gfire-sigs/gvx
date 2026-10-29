@@ -17,10 +17,10 @@
 package pgalloc
 
 import (
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // expandReleaseRangeLocked extends fr to cover the start and end host pages

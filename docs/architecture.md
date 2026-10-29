@@ -67,8 +67,6 @@ gvx/ (Fork of google/gvisor@go)
  ├── docs/
  │   └── architecture.md                    # [NEW] Authoritative architecture and milestone plan
  ├── scripts/                               # [NEW] codesign-exec.sh (signs test binaries) and sync-upstream.sh
- ├── third_party/
- │   └── x_sys/                             # [NEW] golang.org/x/sys with Darwin and Windows additions (go.mod replace)
  ├── tools/
  │   ├── shiminterop/                       # [NEW] Isolated SDK smoke tests
  │   └── upstream/                          # [NEW] Upstream sync, diff audit, import boundaries, and build-tag rewriter
@@ -85,6 +83,7 @@ gvx/ (Fork of google/gvisor@go)
  │   └── rungv/                             # [NEW] Standalone CLI runner (run, pull, stub)
  │       └── main.go
  ├── internal/                              # [NEW] gvxshim control adapter and test fixtures
+ │   └── xsys/unix/                         # [NEW] Embedded copy of golang.org/x/sys/unix with Darwin and Windows changes (docs/x-sys-unix.md)
  ├── pkg/
  │   ├── gvx/                               # [NEW] Embeddable Go library API for host tools
  │   │   ├── sandbox.go
@@ -785,7 +784,7 @@ The gate `TestE2EGateETExec` decides whether a backend runs an executable that l
 
 Integration verification covers `0d0ef55` after the merge of upstream `5524535`. It does not establish compatibility for every incoming feature or change guest-runtime verification above.
 
-The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2`, `tools/upstream`, `pkg/sentry/platform/hvcommon`, and `pkg/fdnotifier`. The command package has no tests; Linux `pkg/fdnotifier` also has none. The Windows runs also passed the `TestGvxFallocate` cases in `third_party/x_sys/unix`. The macOS run used `scripts/codesign-exec.sh`.
+The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2`, `tools/upstream`, `pkg/sentry/platform/hvcommon`, and `pkg/fdnotifier`. The command package has no tests; Linux `pkg/fdnotifier` also has none. The Windows runs also passed the `TestGvxFallocate` cases in `internal/xsys/unix`. The macOS run used `scripts/codesign-exec.sh`.
 
 | Boundary | Executed result | Evidence limit |
 | :--- | :--- | :--- |

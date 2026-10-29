@@ -6,7 +6,7 @@ import (
 	"os"
 	"runtime"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func authorizePeer(conn net.Conn) error {

@@ -15,7 +15,7 @@
 package stateio
 
 import (
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // This file contains utilities for implementers of AsyncReader and

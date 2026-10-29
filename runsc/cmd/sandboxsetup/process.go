@@ -24,7 +24,7 @@ import (
 	"runtime"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/runsc/cmd/util"
 	"z.gfire.dev/gvx/runsc/flag"

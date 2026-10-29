@@ -8,7 +8,7 @@ import (
 	"time"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // These are FUTEX_WAIT and FUTEX_WAKE with FUTEX_PRIVATE_FLAG from <linux/futex.h>.

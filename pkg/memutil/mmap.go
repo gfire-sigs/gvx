@@ -17,7 +17,7 @@
 package memutil
 
 import (
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // MapFile returns a memory mapping configured by the given options as per

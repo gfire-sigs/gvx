@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func TestStorageNativeReallyAllocates(t *testing.T) {

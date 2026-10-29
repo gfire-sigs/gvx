@@ -26,13 +26,13 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/google/subcommands"
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/sniffer"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 	"z.gfire.dev/gvx/pkg/xdp"
 	"z.gfire.dev/gvx/runsc/flag"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 //go:embed bpf/tcpdump_ebpf.o

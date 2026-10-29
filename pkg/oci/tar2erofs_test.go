@@ -445,7 +445,7 @@ func TestCompileEmptyLayer(t *testing.T) {
 }
 
 func TestOCIImportsStayWithinSpecLayout(t *testing.T) {
-	// pkg/oci may import only pkg/abi/linux, pkg/erofs, and pkg/fd among the gvx packages.
+	// pkg/oci may import only pkg/abi/linux, pkg/erofs, pkg/fd, and the embedded x/sys unix package among the gvx packages.
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
@@ -462,7 +462,8 @@ func TestOCIImportsStayWithinSpecLayout(t *testing.T) {
 			if strings.Contains(line, `"z.gfire.dev/gvx/`) &&
 				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/abi/linux"`) &&
 				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/erofs"`) &&
-				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/fd"`) {
+				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/fd"`) &&
+				!strings.Contains(line, `"z.gfire.dev/gvx/internal/xsys/unix"`) {
 				t.Errorf("%s imports %s", e.Name(), strings.TrimSpace(line))
 			}
 		}

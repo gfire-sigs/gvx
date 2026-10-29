@@ -5,8 +5,8 @@ package fdnotifier
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/waiter"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // NonBlockingPoll polls the given FD in non-blocking fashion.

@@ -16,7 +16,7 @@
 
 package hostfs
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // exchange swaps the entries oldRel and newRel with one host call. Both parent
 // directories resolve through descriptors, so the call stays inside the pinned

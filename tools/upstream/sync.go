@@ -23,8 +23,14 @@ const (
 	// DefaultCodeloadBaseURL is the GitHub archive base URL for downloading snapshots.
 	DefaultCodeloadBaseURL = "https://codeload.github.com/google/gvisor/tar.gz"
 
-	upstreamModulePath   = "gvisor.dev/gvisor"
-	targetModulePath     = "z.gfire.dev/gvx"
+	upstreamModulePath = "gvisor.dev/gvisor"
+	targetModulePath   = "z.gfire.dev/gvx"
+	// upstreamXSysUnix is the import of the x/sys unix package in upstream code.
+	// The module keeps its own copy of that package, because it adds Linux types
+	// and constants for Windows and reshapes some Darwin types. A replace directive
+	// would not reach a module that imports pkg/gvx, so the import path changes.
+	upstreamXSysUnix     = `"golang.org/x/sys/unix"`
+	targetXSysUnix       = `"z.gfire.dev/gvx/internal/xsys/unix"`
 	maxExtractedFileSize = 64 * 1024 * 1024
 )
 

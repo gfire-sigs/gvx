@@ -21,7 +21,7 @@ package rawfile
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // SizeofIovec is the size of a unix.Iovec in bytes.

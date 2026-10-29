@@ -77,7 +77,10 @@ jobs:
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "::group::vet $target"
-            GOOS=${target%/*} GOARCH=${target#*/} go vet $VET
+            # The embedded copy of x/sys/unix keeps the unsafe.Pointer idioms of its upstream.
+            export GOOS=${target%/*} GOARCH=${target#*/}
+            go vet $(go list $VET | grep -v '/internal/xsys/')
+            unset GOOS GOARCH
             echo "::endgroup::"
           done
           # The systrap package mixes upstream Linux files with gvx files, so vet it where only gvx files build.
@@ -91,6 +94,8 @@ jobs:
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
       - name: Audit upstream diff
         run: go run ./tools/upstream -mode=audit -max-ratio=0.01
+      - name: Build a module that imports pkg/gvx
+        run: ./scripts/check-consumer.sh
       - name: Check license notices
         run: go run ./tools/licenses -check
 

@@ -444,7 +444,7 @@ func RetagFiles(rootDir string, ps *PatchSet) (RetagReport, error) {
 			return fmt.Errorf("read %s: %w", relSlash, err)
 		}
 		updated := data
-		if bytes.Contains(updated, []byte(upstreamModulePath)) {
+		if bytes.Contains(updated, []byte(upstreamModulePath)) || bytes.Contains(updated, []byte(upstreamXSysUnix)) {
 			updated = rewriteModulePath(updated)
 			report.ModulePath++
 		}
@@ -504,8 +504,11 @@ func writeFileAtomic(abs string, data []byte, d fs.DirEntry) error {
 	return nil
 }
 
+// rewriteModulePath points the imports of upstream code at this module: the
+// gVisor module path, and the x/sys unix package that the module embeds.
 func rewriteModulePath(src []byte) []byte {
-	return bytes.ReplaceAll(src, []byte(upstreamModulePath), []byte(targetModulePath))
+	src = bytes.ReplaceAll(src, []byte(upstreamModulePath), []byte(targetModulePath))
+	return bytes.ReplaceAll(src, []byte(upstreamXSysUnix), []byte(targetXSysUnix))
 }
 
 // isGoSource reports whether relSlash is a Go or assembly file that the Go toolchain builds.

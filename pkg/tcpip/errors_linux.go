@@ -18,7 +18,7 @@
 package tcpip
 
 import (
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // TranslateErrno translate an errno from the syscall package into a

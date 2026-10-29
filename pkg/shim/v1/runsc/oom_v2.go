@@ -34,7 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // unifiedMountpoint is where the cgroup v2 hierarchy is mounted. The cgroups

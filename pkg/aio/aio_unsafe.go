@@ -17,7 +17,7 @@ package aio
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // Request provides inputs to an asynchronous I/O operation.

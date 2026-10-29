@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // isMapped reports whether every page of b is a mapped, writable range.

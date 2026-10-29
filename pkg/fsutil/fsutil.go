@@ -16,7 +16,7 @@
 // sentry and other sandbox components.
 package fsutil
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // SelfFilestorePrefix is the prefix of the self filestore file name.
 const SelfFilestorePrefix = ".gvisor.filestore."

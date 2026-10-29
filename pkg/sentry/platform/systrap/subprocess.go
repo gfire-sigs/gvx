@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	pkgcontext "z.gfire.dev/gvx/pkg/context"

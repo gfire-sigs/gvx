@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"google.golang.org/protobuf/proto"
 	"z.gfire.dev/gvx/pkg/eventchannel"
 	"z.gfire.dev/gvx/pkg/log"

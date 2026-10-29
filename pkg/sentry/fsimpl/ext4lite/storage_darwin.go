@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // osNativeGrow allocates n bytes behind the physical end of the file with

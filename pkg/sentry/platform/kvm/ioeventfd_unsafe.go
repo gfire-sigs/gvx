@@ -19,7 +19,7 @@ package kvm
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func kvmIoeventfdIoctl(vmfd int, ioeventfd *kvmIoeventfd) unix.Errno {

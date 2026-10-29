@@ -16,7 +16,7 @@
 
 package ext4lite
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // testUnsupportedErrors are the errors that mean "no preallocation".
 var testUnsupportedErrors = []error{unix.ENOTSUP, unix.EINVAL}

@@ -23,7 +23,7 @@
 package hostsyscall
 
 import (
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // RawSyscall6 is a copy of runtime.Syscall6.

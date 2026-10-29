@@ -22,7 +22,7 @@ import (
 	"sync"
 	"syscall"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/sentry/socket/plugin"
 	"z.gfire.dev/gvx/pkg/sentry/socket/plugin/cgo"

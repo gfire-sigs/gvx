@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func boundedFileIO(ctx context.Context, file *os.File, operation func(io.ReadWriter) error) (result error) {

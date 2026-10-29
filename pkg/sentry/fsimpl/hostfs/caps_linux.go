@@ -16,7 +16,7 @@
 
 package hostfs
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // platformCaps returns the capabilities of a Linux workspace volume. A Linux
 // volume keeps names case-sensitive and does not normalize Unicode, so the

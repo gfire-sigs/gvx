@@ -16,7 +16,7 @@ PROTECT .agents/**
 PROTECT docs/**
 PROTECT tools/upstream/**
 PROTECT tools/shiminterop/**
-PROTECT third_party/**
+PROTECT internal/xsys/**
 PROTECT scripts/**
 PROTECT cmd/rungv/**
 PROTECT cmd/containerd-shim-gvx-v2/**

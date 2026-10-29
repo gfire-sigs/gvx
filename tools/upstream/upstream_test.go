@@ -182,7 +182,7 @@ INCLUDE pkg/**
 	}
 
 	root := t.TempDir()
-	writeTestFile(t, root, "go.mod", "module z.gfire.dev/gvx\n\ngo 1.27.2\n\nrequire golang.org/x/arch v0.32.0\n\nreplace golang.org/x/sys => ./third_party/x_sys\n")
+	writeTestFile(t, root, "go.mod", "module z.gfire.dev/gvx\n\ngo 1.27.2\n\nrequire golang.org/x/arch v0.32.0\n\nreplace golang.org/x/sys => ./internal/xsys\n")
 	writeTestFile(t, root, "go.sum", "example.com/local v1.0.0 h1:local\n")
 	archivePath := writeArchiveFile(t, map[string]string{
 		"README.md":                      "# upstream readme\n",
@@ -227,7 +227,7 @@ INCLUDE pkg/**
 		t.Fatalf("ValidateManifest after sync: %v", err)
 	}
 	gomod := readTestFile(t, root, "go.mod")
-	for _, want := range []string{"module z.gfire.dev/gvx", "golang.org/x/mod v0.41.0", "golang.org/x/arch v0.32.0", "replace golang.org/x/sys => ./third_party/x_sys"} {
+	for _, want := range []string{"module z.gfire.dev/gvx", "golang.org/x/mod v0.41.0", "golang.org/x/arch v0.32.0", "replace golang.org/x/sys => ./internal/xsys"} {
 		if !strings.Contains(gomod, want) {
 			t.Errorf("merged go.mod lacks %q:\n%s", want, gomod)
 		}

@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // This file loads Hypervisor.framework at run time and wraps the VM-level

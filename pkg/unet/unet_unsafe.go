@@ -18,7 +18,7 @@ import (
 	"io"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // wait blocks until the socket FD is ready for reading or writing, depending

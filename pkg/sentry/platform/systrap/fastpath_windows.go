@@ -26,8 +26,8 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 )

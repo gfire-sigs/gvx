@@ -17,7 +17,7 @@ package syserr
 import (
 	"testing"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux/errno"
 	"z.gfire.dev/gvx/pkg/errors"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"

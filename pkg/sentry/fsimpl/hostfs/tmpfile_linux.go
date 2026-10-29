@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // tmpfileUnlinkAtOnce reports that a file which the guest never links loses its

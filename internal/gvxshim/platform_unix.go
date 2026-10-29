@@ -16,7 +16,7 @@ import (
 	"sync"
 	"syscall"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func currentOwner() (string, error) { return strconv.Itoa(os.Geteuid()), nil }

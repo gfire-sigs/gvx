@@ -21,9 +21,9 @@ import (
 	"os"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/memutil"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // The usage scan sizes its mincore vector with one byte per hostarch.PageSize.

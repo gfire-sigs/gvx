@@ -20,7 +20,7 @@ import (
 	"os"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // probeCaseInsensitive reports false: the Linux development build runs on

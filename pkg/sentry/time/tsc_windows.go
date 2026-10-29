@@ -23,8 +23,8 @@ import (
 	stdtime "time"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 var (

@@ -20,7 +20,7 @@ import (
 	"os"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // pcCaseSensitive is _PC_CASE_SENSITIVE from XNU <sys/unistd.h>. The value is

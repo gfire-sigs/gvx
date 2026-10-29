@@ -9,8 +9,8 @@ import (
 	"testing"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // isCommitted reports whether the page at addr is committed memory.

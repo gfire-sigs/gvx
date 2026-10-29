@@ -24,7 +24,7 @@ import (
 	"runtime"
 	"strings"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
 	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy"

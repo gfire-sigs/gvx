@@ -26,7 +26,7 @@ import (
 	"sync"
 
 	"golang.org/x/mod/semver"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // Version represents a semantic version of the form "%d.%d[.%d]".

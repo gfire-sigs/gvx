@@ -18,7 +18,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/exp/constraints"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // IOCTLInvokePtrArg makes ioctl syscalls with the command of the integer type

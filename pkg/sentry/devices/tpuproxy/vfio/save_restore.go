@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/devutil"
 	"z.gfire.dev/gvx/pkg/fdnotifier"
