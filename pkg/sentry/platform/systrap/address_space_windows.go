@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -527,9 +528,17 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	copy(copyBuf, orig)
 	var sites map[uint16]siteInfo
 	var slots []winSlotRef
-	_, cleanHit := false, false
+	// A page that an earlier scan found clean needs no scan again. The cache
+	// holds the digest of the scanned bytes, and a hit needs the same digest.
+	// The address alone is no key: the memory file reuses a frame for other
+	// content, and the guest can write the frame through another mapping.
+	var digest [sha256.Size]byte
+	cleanHit := false
 	if readOnly {
-		_, cleanHit = as.p.cleanCode.Load(src)
+		digest = sha256.Sum256(copyBuf)
+		if v, ok := as.p.cleanCode.Load(src); ok {
+			cleanHit = v.([sha256.Size]byte) == digest
+		}
 	}
 	if !cleanHit {
 		var err error
@@ -538,7 +547,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 			return err
 		}
 		if readOnly && len(sites) == 0 && len(slots) == 0 && cleanBoundarySafe(copyBuf) && bytes.Equal(copyBuf, orig) {
-			as.p.cleanCode.Store(src, struct{}{})
+			as.p.cleanCode.Store(src, digest)
 		}
 	}
 

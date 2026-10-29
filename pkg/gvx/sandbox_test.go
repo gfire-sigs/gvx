@@ -17,6 +17,7 @@ package gvx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 
@@ -151,20 +153,27 @@ func TestOpenAuto(t *testing.T) {
 
 	t.Run("hardware wins", func(t *testing.T) {
 		var hwCalls, fbCalls int
-		_, name, err := openAuto(named("hvf", &hwCalls), named("systrap", &fbCalls))
-		if err != nil || name != "hvf" || fbCalls != 0 {
-			t.Fatalf("openAuto = (%q, %v) with %d fallback calls, want (hvf, nil) and none", name, err, fbCalls)
+		got, err := openAuto(named("hvf", &hwCalls), named("systrap", &fbCalls))
+		if err != nil || got.name != "hvf" || got.fallbackFrom != nil || fbCalls != 0 {
+			t.Fatalf("openAuto = (%q, fallback %v, %v) with %d fallback calls, want (hvf, none, nil) and none", got.name, got.fallbackFrom, err, fbCalls)
 		}
 	})
 	t.Run("fallback after hardware failure", func(t *testing.T) {
 		var fbCalls int
-		_, name, err := openAuto(failHW, named("systrap", &fbCalls))
-		if err != nil || name != "systrap" || fbCalls != 1 {
-			t.Fatalf("openAuto = (%q, %v) with %d fallback calls, want (systrap, nil) and one", name, err, fbCalls)
+		got, err := openAuto(failHW, named("systrap", &fbCalls))
+		if err != nil || got.name != "systrap" || fbCalls != 1 {
+			t.Fatalf("openAuto = (%q, %v) with %d fallback calls, want (systrap, nil) and one", got.name, err, fbCalls)
+		}
+		if !errors.Is(got.fallbackFrom, hwErr) {
+			t.Errorf("fallbackFrom = %v, want the error of the hardware backend", got.fallbackFrom)
+		}
+		s := &Sandbox{fallbackFrom: got.fallbackFrom}
+		if reason := s.FallbackReason(); !strings.Contains(reason, hwErr.Error()) {
+			t.Errorf("FallbackReason = %q, want it to contain %q", reason, hwErr)
 		}
 	})
 	t.Run("both failures are reported", func(t *testing.T) {
-		_, _, err := openAuto(failHW, failFB)
+		_, err := openAuto(failHW, failFB)
 		if !errors.Is(err, hwErr) || !errors.Is(err, fbErr) {
 			t.Fatalf("openAuto error = %v, want it to wrap both backend errors", err)
 		}
@@ -378,5 +387,28 @@ func TestResolveImageFallsBackToCacheWhenRegistryIsDown(t *testing.T) {
 	}
 	if _, err := ResolveImage(context.Background(), emptyCache, registry.URL, "gvx/offline:v1", runtime.GOARCH); err == nil {
 		t.Fatalf("offline ResolveImage with an empty cache succeeded, want the network error")
+	}
+}
+
+func TestPlatformFailureHintNamesTheFix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		goos string
+		err  error
+		want string
+	}{
+		{"whpx is off", "windows", fmt.Errorf("gvx: open whpx backend: %w", whpx.ErrUnsupported), "Windows Hypervisor Platform"},
+		{"hvf without the entitlement", "darwin", errors.New("hvf: hv_vm_create failed: HV_DENIED (0xfae94007)"), "codesign"},
+		{"hvf reports the general error", "darwin", errors.New("hvf: hv_vm_create failed: HV_ERROR (0xfae94001)"), "entitlements.plist"},
+		{"hvf in a virtual machine", "darwin", errors.New("hvf: hv_vm_create failed: HV_UNSUPPORTED (0xfae9400f)"), "nested virtualization"},
+		{"a cause that gvx cannot name", "darwin", errors.New("hvf: out of memory"), ""},
+		{"linux has no hardware backend", "linux", errors.New("anything"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := platformFailureHint(tc.goos, tc.err)
+			if tc.want == "" && got != "" || !strings.Contains(got, tc.want) {
+				t.Errorf("hint = %q, want it to contain %q", got, tc.want)
+			}
+		})
 	}
 }
