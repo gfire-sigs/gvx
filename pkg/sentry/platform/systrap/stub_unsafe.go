@@ -68,7 +68,7 @@ func prepareSeccompRules(stubSysmsgStart,
 // renderStubFilter renders the precompiled stubfilter program with the given
 // name.
 func renderStubFilter(name string, vars precompiledseccomp.Values) []bpf.Instruction {
-	program, ok := GetPrecompiled(name)
+	program, ok := lookupStubFilter(name)
 	if !ok {
 		panic(fmt.Sprintf("precompiled seccomp program %q not found", name))
 	}

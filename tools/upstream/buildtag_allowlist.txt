@@ -106,6 +106,9 @@ linux-only pkg/sentry/platform/slimvm/ amd64
 linux-only pkg/sentry/platform/systrap/
 linux-only pkg/sentry/platform/systrap/sysmsg/
 linux-only pkg/sentry/platform/systrap/usertrap/
+# Content seam: renderStubFilter looks the program up through lookupStubFilter. The go branch checks in
+# programs that its generator built on amd64, so other architectures build them from the rules.
+seam pkg/sentry/platform/systrap/stub_unsafe.go
 # Seccomp filter builders of the stub processes: undefined: unix.SYS_CLONE and unix.PR_SET_PDEATHSIG on darwin.
 linux-only pkg/sentry/platform/kvm/mmapfilter/
 linux-only pkg/sentry/platform/ptrace/stubfilter/
