@@ -26,14 +26,13 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/bits"
 	"z.gfire.dev/gvx/pkg/eventchannel"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	pb "z.gfire.dev/gvx/pkg/sentry/strace/strace_go_proto"
 	slinux "z.gfire.dev/gvx/pkg/sentry/syscalls/linux"
-
-	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 // DefaultLogMaximumSize is the default LogMaximumSize.

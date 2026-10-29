@@ -199,10 +199,7 @@ func (s *State) PtraceSetRegs(src io.Reader) (int, error) {
 	if !regs.validRegs() {
 		return 0, linuxerr.EINVAL
 	}
-	// The ptrace register set carries no TPIDR_EL0. Linux changes the thread
-	// pointer only through NT_ARM_TLS, so the old value must survive.
-	regs.TPIDR_EL0 = s.Regs.TPIDR_EL0
-	s.Regs = regs
+	s.Regs.PtraceRegs = regs.PtraceRegs
 	return ptraceRegistersSize, nil
 }
 

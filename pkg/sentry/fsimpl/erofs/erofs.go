@@ -26,19 +26,18 @@ package erofs
 import (
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
-
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/erofs"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/gomaxprocs"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/refs"
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
@@ -197,7 +196,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 
-	fs.inodeBuckets = make([]inodeBucket, runtime.GOMAXPROCS(0))
+	fs.inodeBuckets = make([]inodeBucket, gomaxprocs.Base())
 	for i := range fs.inodeBuckets {
 		fs.inodeBuckets[i].init()
 	}

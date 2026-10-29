@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
+	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/ring0"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -75,6 +76,14 @@ func (m *machine) initArchState() error {
 			return err
 		}
 	}
+
+	// Cache the counter frequency.
+	if freq := ktime.CNTFRQ(); freq > 0 {
+		m.tscFrequency = freq
+	} else {
+		log.Warningf("CNTFRQ_EL0 reads back as zero; the counter frequency is unknown")
+	}
+	log.Debugf("Host counter frequency: %d Hz.", m.tscFrequency)
 
 	return nil
 }

@@ -19,10 +19,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"runtime"
 	"strings"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gomaxprocs"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/header/parse"
@@ -623,7 +623,7 @@ func newProtocol(s *stack.Stack, cc string, probe TCPProbeFunc) stack.TransportP
 		tsOffsetSecret:             tsOffsetSecret,
 		probe:                      probe,
 	}
-	p.dispatcher.init(s.InsecureRNG(), runtime.GOMAXPROCS(0))
+	p.dispatcher.init(s.InsecureRNG(), gomaxprocs.Base())
 	return &p
 }
 

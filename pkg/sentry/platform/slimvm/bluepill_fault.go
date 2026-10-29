@@ -18,7 +18,6 @@ package slimvm
 
 import (
 	"golang.org/x/sys/unix"
-
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
 )

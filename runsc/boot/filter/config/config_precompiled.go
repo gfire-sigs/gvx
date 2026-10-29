@@ -20,15 +20,12 @@ import (
 	"fmt"
 
 	"golang.org/x/sync/errgroup"
-
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
 	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy/nvconf"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	_ "z.gfire.dev/gvx/pkg/sentry/platform/platforms" // Register platforms to precompile filters for.
 	"z.gfire.dev/gvx/pkg/sync"
-
-	// Import platforms that we need to precompile filters for.
-	_ "z.gfire.dev/gvx/pkg/sentry/platform/platforms"
 )
 
 // Variable names used in precompiled filters.

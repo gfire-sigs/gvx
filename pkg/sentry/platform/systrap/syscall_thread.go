@@ -91,6 +91,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 	}
 	fr, err := t.subproc.memoryFile.Allocate(syscallThreadMessageSize, opts)
 	if err != nil {
+		t.subproc.sysmsgStackPool.Put(t.thread.sysmsgStackID)
 		return err
 	}
 
@@ -143,7 +144,7 @@ func (t *syscallThread) destroy() {
 			arch.SyscallArgument{Value: t.stubAddr},
 			arch.SyscallArgument{Value: uintptr(syscallThreadMessageSize)})
 		if err != nil {
-			panic(fmt.Sprintf("munmap failed: %v", err))
+			t.thread.Warningf("munmap failed: %v", err)
 		}
 	}
 	t.subproc.memoryFile.DecRef(t.stackRange)

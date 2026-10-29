@@ -27,9 +27,8 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/mm"
 	"z.gfire.dev/gvx/pkg/sentry/seccheck"
-	"z.gfire.dev/gvx/pkg/sentry/vfs"
-
 	ppb "z.gfire.dev/gvx/pkg/sentry/seccheck/points/points_go_proto"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // Brk implements linux syscall brk(2).

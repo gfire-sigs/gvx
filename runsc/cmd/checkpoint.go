@@ -92,7 +92,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (c *Checkpoint) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
+	cont, err := c.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -108,7 +108,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 
 	conf := args[0].(*config.Config)
 
-	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
+	cont, err := c.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}

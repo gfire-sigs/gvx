@@ -43,6 +43,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/socket/hostinet"
 	"z.gfire.dev/gvx/pkg/sentry/state"
 	"z.gfire.dev/gvx/pkg/sentry/time"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -271,7 +272,8 @@ type restorer struct {
 }
 
 // restoreSubcontainer restores a subcontainer.
-func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) error {
+// It returns whether this started the kernel.
+func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) (bool, error) {
 	containerName := r.registerContainer(l, spec, cid)
 	info := &containerInfo{
 		cid:               cid,
@@ -315,16 +317,17 @@ func (r *restorer) registerContainer(l *Loader, spec *specs.Spec, cid string) st
 }
 
 // restoreContainerInfo restores a container.
-func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
+// It returns whether this started the kernel.
+func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
-			return fmt.Errorf("container %q already restored", info.containerName)
+			return false, fmt.Errorf("container %q already restored", info.containerName)
 		}
 		if container.cid == info.cid {
-			return fmt.Errorf("container CID %q already belongs to container %q", info.cid, container.containerName)
+			return false, fmt.Errorf("container CID %q already belongs to container %q", info.cid, container.containerName)
 		}
 	}
 
@@ -343,10 +346,11 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	if len(r.containers) == r.totalContainers {
 		// Trigger the restore if this is the last container.
 		if err := r.restore(l); err != nil {
-			return err
+			return false, err
 		}
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 type restoreMounts struct {
@@ -412,6 +416,8 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	if l.root.conf.Network == config.NetworkHost {
+		ports := hostinet.ReadPortRange()
+		l.hostinetPortRange = &ports
 		devFile, err := os.Open("/proc/net/dev")
 		if err != nil {
 			log.Warningf("Failed to open /proc/net/dev during restore: %v", err)
@@ -425,6 +431,7 @@ func (r *restorer) restore(l *Loader) error {
 			l.hostinetNetSNMPFile = snmpFile
 		}
 		defer func() {
+			l.hostinetPortRange = nil
 			if l.hostinetNetDevFile != nil {
 				l.hostinetNetDevFile.Close()
 				l.hostinetNetDevFile = nil
@@ -563,6 +570,8 @@ func (r *restorer) restore(l *Loader) error {
 				return err
 			}
 			r.timer.Reached("MF metadata loaded")
+			// The kernel is restored; load the remaining pages at full speed.
+			r.asyncMFLoader.Unthrottle()
 		} else {
 			if err := r.asyncMFLoader.Wait(); err != nil {
 				return err
@@ -612,9 +621,9 @@ func (r *restorer) restore(l *Loader) error {
 		specsByCID[cid] = l.containerSpecs[name]
 	}
 	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
-		// Find all processes with no parent (root of execution), that were not started
-		// via a call to `exec`.
-		if tg.Leader().Parent() == nil && tg.Leader().Origin != kernel.OriginExec {
+		// Find all container init processes. A process with no parent is not
+		// enough: in a sandbox with no root container, orphans have none.
+		if tg.IsContainerInit() {
 			cid := tg.Leader().ContainerID()
 			proc := l.processes[execID{cid: cid}]
 			if proc == nil {
@@ -638,6 +647,11 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
+	for cid, spec := range specsByCID {
+		if spec != nil && spec.Process != nil {
+			l.k.SetContainerEnv(cid, spec.Process.Env)
+		}
+	}
 	l.k.SetSaver(l)
 	l.createNvproxyDeviceFilesAfterRestore(ctx)
 
@@ -881,6 +895,9 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	if l.noRootContainer.enabled {
 		saveOpts.Metadata[noRootContainerKey] = "true"
 	}
+
+	// Save the sandbox's CPU features.
+	saveOpts.Metadata[sentryapi.CPUFeaturesKey] = strings.Join(l.k.FeatureSet().FeatureNames(), ",")
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())

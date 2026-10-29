@@ -55,10 +55,6 @@ seam pkg/sentry/loader/elf.go
 # sub-pages into whole host pages before punching holes (pkg/sentry/pgalloc/pgalloc.go).
 seam pkg/sentry/pgalloc/pgalloc.go
 
-# Content seam: ptrace SETREGSET on arm64 keeps TPIDR_EL0. The register set has no field
-# for the thread pointer, and upstream cleared it (pkg/sentry/arch/arch_aarch64.go).
-seam pkg/sentry/arch/arch_aarch64.go
-
 # Content seam: inotify_add_watch(2) asks a dentry to admit the watch before it adds one
 # (pkg/sentry/syscalls/linux/sys_inotify.go). hostfs returns ENOSPC above 8192 watched objects.
 seam pkg/sentry/syscalls/linux/sys_inotify.go
@@ -110,6 +106,13 @@ linux-only pkg/sentry/platform/slimvm/ amd64
 linux-only pkg/sentry/platform/systrap/
 linux-only pkg/sentry/platform/systrap/sysmsg/
 linux-only pkg/sentry/platform/systrap/usertrap/
+# Content seam: renderStubFilter looks the program up through lookupStubFilter. The go branch checks in
+# programs that its generator built on amd64, so other architectures build them from the rules.
+seam pkg/sentry/platform/systrap/stub_unsafe.go
+# Seccomp filter builders of the stub processes: undefined: unix.SYS_CLONE and unix.PR_SET_PDEATHSIG on darwin.
+linux-only pkg/sentry/platform/kvm/mmapfilter/
+linux-only pkg/sentry/platform/ptrace/stubfilter/
+linux-only pkg/sentry/platform/systrap/stubfilter/
 
 # pkg/sentry/seccheck sink: undefined: unix.Writev on windows.
 linux-only pkg/sentry/seccheck/sinks/remote/

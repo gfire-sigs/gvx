@@ -75,10 +75,9 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/loader"
 	"z.gfire.dev/gvx/pkg/sentry/mm"
 	"z.gfire.dev/gvx/pkg/sentry/seccheck"
+	pb "z.gfire.dev/gvx/pkg/sentry/seccheck/points/points_go_proto"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/syserr"
-
-	pb "z.gfire.dev/gvx/pkg/sentry/seccheck/points/points_go_proto"
 )
 
 // Execve implements the execve(2) syscall by first doing these two potentially stop-requiring tasks:
@@ -251,7 +250,9 @@ func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskI
 		// if they exited via _exit(2) with exit code 0." - ptrace(2)
 		for sibling := t.tg.tasks.Front(); sibling != nil; sibling = sibling.Next() {
 			if t != sibling {
-				sibling.killLocked()
+				// The list contains tasks in t.tg; checklocks cannot infer
+				// that sibling uses the signal mutex held above.
+				sibling.killLocked() // +checklocksignore
 			}
 		}
 		// The last sibling to exit will wake t.
@@ -375,6 +376,8 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	// Lower dumpability based on cred delta, see kernel/cred.c:commit_creds().
 	if r.newCreds.EffectiveKUID != oldCreds.EffectiveKUID ||
 		r.newCreds.EffectiveKGID != oldCreds.EffectiveKGID ||
+		r.newCreds.FilesystemKUID != oldCreds.FilesystemKUID ||
+		r.newCreds.FilesystemKGID != oldCreds.FilesystemKGID ||
 		!r.newCreds.PermittedCaps.IsSubsetOf(oldCreds.PermittedCaps) {
 		r.image.MemoryManager.SetDumpability(mm.NotDumpable) // suid_dumpable is not implemented
 		t.parentDeathSignal = 0
@@ -405,10 +408,10 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 // promoteLocked makes t the leader of its thread group. If t is already the
 // thread group leader, promoteLocked is a no-op.
 //
-// Preconditions:
-//   - All other tasks in t's thread group, including the existing leader (if it
-//     is not t), have reached TaskExitZombie.
-//   - The TaskSet mutex must be locked for writing.
+// Preconditions: All other tasks in t's thread group, including the existing
+// leader (if it is not t), have reached TaskExitZombie.
+//
+// +checklocks:t.tg.pidns.owner.mu
 func (t *Task) promoteLocked() {
 	oldLeader := t.tg.leader
 	if t == oldLeader {

@@ -20,11 +20,11 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
-	"runtime"
 
 	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
+	"z.gfire.dev/gvx/pkg/gomaxprocs"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
 	"z.gfire.dev/gvx/pkg/log"
@@ -55,6 +55,18 @@ func (m *machine) initArchState() error {
 			return err
 		}
 	}
+
+	// Cache the TSC frequency. Must happen while initialization
+	// is still in progress to avoid having KVM_GET_TSC_KHZ on the seccomp
+	// allowlist.
+	if m.maxVCPUs > 0 {
+		if freq, err := m.vCPUsByID[0].getTSCFreq(); err != nil {
+			log.Warningf("Unable to read the TSC frequency: %v", err)
+		} else {
+			m.tscFrequency = uint64(freq) * 1000 // KHz to Hz.
+		}
+	}
+	log.Debugf("Host TSC frequency: %d Hz.", m.tscFrequency)
 
 	return nil
 }
@@ -567,7 +579,7 @@ func (m *machine) getMaxVCPU() {
 	// overcommit with factor 2 is still acceptable. We allocate a set of
 	// vCPU for each goruntime processor (P) and two sets of vCPUs to run
 	// user code.
-	rCPUs := runtime.GOMAXPROCS(0)
+	rCPUs := gomaxprocs.Base()
 	if 3*rCPUs < m.maxVCPUs {
 		m.maxVCPUs = 3 * rCPUs
 	}

@@ -51,11 +51,19 @@ const (
 	// TPUV6ePFDeviceID is PCI device ID of TPU V6e hardware PF.
 	TPUV6ePFDeviceID = 0x006e
 
-	// TPU7xDeviceID is the PCI device ID of TPU 7x hardware.
-	TPU7xDeviceID = 0x0075
+	// TPUV7xDeviceID is the PCI device ID of TPU 7x hardware.
+	TPUV7xDeviceID = 0x0076
 
-	// TPU7xPFDeviceID is the PCI device ID of TPU 7x hardware PF.
-	TPU7xPFDeviceID = 0x0076
+	// TPUV7xPFDeviceID is the PCI device ID of TPU 7x hardware PF.
+	TPUV7xPFDeviceID = 0x0075
+
+	// PCIBusRegexPattern matches PCI root bus directories in pciDDDD:BB form
+	// (e.g. pci0000:00 or pci0007:00).
+	PCIBusRegexPattern = `pci[[:xdigit:]]{4}:[[:xdigit:]]{2}`
+
+	// PCIDeviceRegexPattern matches PCI device addresses in
+	// domain:bus:device.function form (e.g. 0000:00:04.0 or 0007:01:00.0).
+	PCIDeviceRegexPattern = `[[:xdigit:]]{4}:([[:xdigit:]]{2}|[[:xdigit:]]{4}):[[:xdigit:]]{2}\.[[:xdigit:]]{1,2}`
 )
 
 // TPUV4InterruptsMap maps BAR indices to valid register offsets.

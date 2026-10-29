@@ -33,6 +33,7 @@ import (
 	"z.gfire.dev/gvx/pkg/ring0"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/seccomp"
+	"z.gfire.dev/gvx/pkg/sentry/platform/kvm/mmapfilter"
 	ktime "z.gfire.dev/gvx/pkg/sentry/time"
 	"z.gfire.dev/gvx/pkg/sighandling"
 	"z.gfire.dev/gvx/pkg/sync"
@@ -96,6 +97,10 @@ type machine struct {
 
 	// tscOffset is the offset to apply to the guest TSC.
 	tscOffset uint64
+
+	// tscFrequency is the frequency in Hz at which the host TSC advances,
+	// or zero if it could not be determined.
+	tscFrequency uint64
 
 	// shadowVDSO is a binary-patched copy of the host [vdso] mapped at vdsoVirt
 	// in the guest page tables when tscOffset != 0.
@@ -915,31 +920,13 @@ func seccompMmapRules(m *machine) {
 		if err := sighandling.ReplaceSignalHandler(unix.SIGSYS, addrOfSigsysHandler(), &savedSigsysHandler); err != nil {
 			panic(fmt.Sprintf("Unable to set handler for signal %d: %v", unix.SIGSYS, err))
 		}
-		rules := []seccomp.RuleSet{
-			// Trap mmap system calls and handle them in sigsysGoHandler
-			{
-				Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-					unix.SYS_MMAP: seccomp.PerArg{
-						seccomp.AnyValue{},
-						seccomp.AnyValue{},
-						seccomp.MaskedEqual(unix.PROT_EXEC, 0),
-						/* MAP_DENYWRITE is ignored and used only for filtering. */
-						seccomp.MaskedEqual(unix.MAP_DENYWRITE, 0),
-					},
-				}),
-				Action: seccomp.Trap,
-			},
+		program, ok := GetPrecompiled(mmapfilter.ProgramName)
+		if !ok {
+			panic(fmt.Sprintf("precompiled seccomp program %q not found", mmapfilter.ProgramName))
 		}
-		program := &seccomp.Program{
-			RuleSets: rules,
-			Options: seccomp.ProgramOptions{
-				DefaultAction: seccomp.Allow,
-				BadArchAction: seccomp.Allow,
-			},
-		}
-		instrs, _, err := program.Build()
+		instrs, err := program.RenderInstructions(nil)
 		if err != nil {
-			panic(fmt.Sprintf("failed to build rules: %v", err))
+			panic(fmt.Sprintf("cannot render precompiled seccomp program %q: %v", mmapfilter.ProgramName, err))
 		}
 		// Perform the actual installation.
 		if err := seccomp.SetFilter(instrs); err != nil {

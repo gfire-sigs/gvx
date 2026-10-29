@@ -17,7 +17,6 @@ package nftables
 import (
 	"bytes"
 	"fmt"
-
 	"slices"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"

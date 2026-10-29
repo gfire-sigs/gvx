@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	goContext "context"
 	"fmt"
 	"io"
 	"sync"
@@ -40,11 +41,13 @@ const kcovAreaSizeMax = 10 * 1024 * 1024
 //
 // To give the illusion that the data is always up to date, we update the shared
 // memory every time before we return to userspace.
+//
+// +stateify savable
 type Kcov struct {
 	// mf stores application memory. It is immutable after creation.
-	mf *pgalloc.MemoryFile
+	mf *pgalloc.MemoryFile `state:"nosave"`
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 
 	// mode is the current kcov mode.
 	//
@@ -77,6 +80,11 @@ type Kcov struct {
 
 	// +checklocks:mu
 	mappable *mm.SpecialMappable
+}
+
+// afterLoad is invoked by stateify.
+func (kcov *Kcov) afterLoad(ctx goContext.Context) {
+	kcov.mf = pgalloc.MemoryFileFromContext(ctx)
 }
 
 // NewKcov creates and returns a Kcov instance.
@@ -139,12 +147,6 @@ func (kcov *Kcov) InitTrace(size uint64) error {
 
 	if kcov.mode != linux.KCOV_MODE_DISABLED {
 		return linuxerr.EBUSY
-	}
-
-	// To simplify all the logic around mapping, we require that the length of the
-	// shared region is a multiple of the system page size.
-	if !hostarch.IsPageAligned(8 * size) {
-		return linuxerr.EINVAL
 	}
 
 	// We need space for at least two uint64s to hold current position and a
@@ -260,6 +262,13 @@ func (kcov *Kcov) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) erro
 	defer kcov.mu.Unlock()
 
 	if kcov.mode != linux.KCOV_MODE_INIT {
+		return linuxerr.EINVAL
+	}
+
+	// Linux accepts unaligned sizes in KCOV_INIT_TRACE, but requires mmap's
+	// page-rounded length to match the entire buffer, starting at offset zero.
+	length, ok := hostarch.PageRoundUp(opts.Length)
+	if !ok || opts.Offset != 0 || length != kcov.size*8 {
 		return linuxerr.EINVAL
 	}
 

@@ -24,7 +24,6 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
-
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	pkgcontext "z.gfire.dev/gvx/pkg/context"
@@ -109,8 +108,8 @@ type requestStub struct {
 }
 
 // maxSysmsgThreads is the maximum number of sysmsg threads that a subprocess
-// can create. It is based on GOMAXPROCS and set once, so it must be set after
-// GOMAXPROCS has been adjusted (see loader.go:Args.NumCPU).
+// can create. It is based on base GOMAXPROCS and set once, so it must be set
+// after base GOMAXPROCS has been set (see loader.go:Args.NumCPU).
 var maxSysmsgThreads = 0
 
 // maxChildThreads is the max number of all child system threads that a
@@ -214,7 +213,7 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 
 	id, ok := s.sysmsgStackPool.Get()
 	if !ok {
-		panic("unable to allocate a sysmsg stub thread")
+		return fmt.Errorf("unable to allocate a sysmsg stub thread")
 	}
 
 	ptraceThread.sysmsgStackID = id
@@ -224,7 +223,7 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 	}
 
 	if err := t.init(seccompNotify); err != nil {
-		panic("failed to create a syscall thread")
+		return fmt.Errorf("failed to create a syscall thread: %w", err)
 	}
 	s.syscallThread = &t
 

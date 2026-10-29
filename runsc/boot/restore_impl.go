@@ -16,18 +16,8 @@
 
 package boot
 
-import (
-	"z.gfire.dev/gvx/pkg/log"
-	"z.gfire.dev/gvx/pkg/sentry/time"
-)
-
 // hostTSCRealtime returns the current raw host TSC value and the host
 // CLOCK_REALTIME value in nanoseconds.
 func hostTSCRealtime() (uint64, uint64, bool) {
-	cycle, realtime, err := time.HostTSCRealtime()
-	if err != nil {
-		log.Warningf("Failed to sample host TSC for TSC offset: %v", err)
-		return 0, 0, false
-	}
-	return uint64(cycle), uint64(realtime), true
+	return sampleHostTSCRealtime()
 }

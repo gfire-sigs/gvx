@@ -17,10 +17,9 @@ package strace
 import (
 	"fmt"
 
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/syscalls/linux"
-
-	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 func fdsFromSet(t *kernel.Task, set []byte) []int {
