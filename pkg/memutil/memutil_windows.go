@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 const (

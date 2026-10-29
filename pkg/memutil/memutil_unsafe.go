@@ -20,7 +20,7 @@ package memutil
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // MapSlice is like MapFile, but returns a slice instead of a uintptr.

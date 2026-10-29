@@ -19,7 +19,7 @@ package slimvm
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 )

@@ -94,8 +94,8 @@ func main() {
 
 type layout struct {
 	size, flagsOff, pc, sp, r0, r1, r3, r6, r18 int
-	full, x18flag                                 uint32
-	trapAdvance                                   uint64
+	full, x18flag                               uint32
+	trapAdvance                                 uint64
 }
 
 var L = func() layout {

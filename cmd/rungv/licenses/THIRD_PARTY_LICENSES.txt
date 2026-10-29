@@ -151,7 +151,6 @@ Components that use this text:
       Copyright 2009 The Go Authors.
       Copyright 2016 The Go Authors. All rights reserved.
   golang.org/x/sys v0.48.0
-      note: replaced by ./third_party/x_sys in this repository
       Copyright 2009 The Go Authors.
       Copyright 2018 The Go Authors. All rights reserved.
       Copyright 2024 The Go Authors. All rights reserved.
@@ -168,7 +167,6 @@ Components that use this text:
       Copyright 2014 The Go Authors. All rights reserved.
       Copyright 2017 The Go Authors. All rights reserved.
       Copyright 2010 The Go Authors. All rights reserved.
-      Copyright 2026 The gVisor Authors.
       Copyright 2012 The Go Authors. All rights reserved.
       Copyright 2011 The Go Authors. All rights reserved.
       Copyright 2009,2010 The Go Authors. All rights reserved.

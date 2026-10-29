@@ -18,7 +18,7 @@ package devutil
 import (
 	"fmt"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"

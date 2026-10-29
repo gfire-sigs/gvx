@@ -20,7 +20,7 @@ package linuxerr
 import (
 	"fmt"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux/errno"
 	"z.gfire.dev/gvx/pkg/errors"
 )

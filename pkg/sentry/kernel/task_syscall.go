@@ -19,7 +19,7 @@ import (
 	"os"
 	"runtime/trace"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/bits"
 	"z.gfire.dev/gvx/pkg/errors"

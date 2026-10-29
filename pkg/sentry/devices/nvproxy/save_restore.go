@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/abi/nvgpu"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/devutil"

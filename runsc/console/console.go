@@ -23,7 +23,7 @@ import (
 	"os"
 
 	"github.com/creack/pty"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // NewWithSocket creates pty master/replica pair, sends the master FD over the

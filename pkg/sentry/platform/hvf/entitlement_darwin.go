@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // Hypervisor.framework refuses hv_vm_create in a process whose code signature

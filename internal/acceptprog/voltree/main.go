@@ -29,7 +29,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // entry describes one regular file of the tree.

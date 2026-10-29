@@ -24,8 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // hostRoot performs every host file operation relative to a directory file

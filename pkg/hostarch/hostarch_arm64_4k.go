@@ -16,7 +16,7 @@
 
 package hostarch
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/third_party/x_sys/unix"
 
 const (
 	// PageShift is the binary log of the system page size.

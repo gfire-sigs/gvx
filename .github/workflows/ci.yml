@@ -91,6 +91,8 @@ jobs:
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
       - name: Audit upstream diff
         run: go run ./tools/upstream -mode=audit -max-ratio=0.01
+      - name: Build a module that imports pkg/gvx
+        run: ./scripts/check-consumer.sh
       - name: Check license notices
         run: go run ./tools/licenses -check
 

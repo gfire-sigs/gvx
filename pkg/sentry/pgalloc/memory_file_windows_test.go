@@ -7,9 +7,9 @@ import (
 	"syscall"
 	"testing"
 
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 func TestSharedPagesAliasAndDecommit(t *testing.T) {

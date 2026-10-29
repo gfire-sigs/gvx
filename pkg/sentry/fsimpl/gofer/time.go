@@ -17,7 +17,7 @@
 package gofer
 
 import (
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/lisafs"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )

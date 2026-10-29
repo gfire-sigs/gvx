@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/eventfd"
 	"z.gfire.dev/gvx/pkg/flipcall"
 	"z.gfire.dev/gvx/pkg/log"

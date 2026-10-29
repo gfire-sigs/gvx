@@ -25,7 +25,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/cenkalti/backoff"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"

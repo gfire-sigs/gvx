@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // TestE2EHostPTYInteractiveShell verifies that attaching a real host PTY to a

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 var errClosedHostHandle = errors.New("host handle is closed")

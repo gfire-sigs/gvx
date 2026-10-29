@@ -19,7 +19,7 @@ package hostfs
 import (
 	"fmt"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // statfs reads the volume of the pinned workspace directory with fstatfs. The

@@ -19,7 +19,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // maxRegisterSize is the maximum register size used in memcpy and memclr. It

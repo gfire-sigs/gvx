@@ -32,7 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/shim/v1/proc"
 	"z.gfire.dev/gvx/pkg/shim/v1/runsc"

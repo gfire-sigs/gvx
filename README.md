@@ -274,6 +274,7 @@ Read the architecture specification and agent operating manual before modifying 
 | [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem architecture, Windows/macOS/Linux specifications, upstream sync rules, M1-M5 milestones, and shim verification. |
 | [`docs/cli.md`](docs/cli.md) | Users & Engineers | Complete `rungv` command reference, `rungv run` flags, mount/volume rules, and behavioral differences from Docker. |
 | [`docs/systrap-windows.md`](docs/systrap-windows.md) | Systems Engineers | Design, measurements, placeholder memory layout, fast-path islands, and limits of the Windows `systrap` engine. |
+| [`docs/x-sys-unix.md`](docs/x-sys-unix.md) | Systems Engineers | The embedded copy of `golang.org/x/sys/unix`: why it exists, what it changes, and how to update it. |
 | [`docs/gvxip/gvxip-001-better-posix-hostfs.md`](docs/gvxip/gvxip-001-better-posix-hostfs.md) | Systems Engineers | Specification for `hostfs` v2: pinned handle caching, `NameCodec`, single-file mounts, and host-to-guest `inotify`. |
 | [`docs/gvxip/gvxip-002-ext4lite-volume-engine.md`](docs/gvxip/gvxip-002-ext4lite-volume-engine.md) | Systems Engineers | Specification for `ext4lite`: 16MiB dense block groups, JBD2 ordered journaling, unmount compaction, and `fsckLite`. |
 | [`docs/gvxip/gvxip-003-backend-perf-and-compat.md`](docs/gvxip/gvxip-003-backend-perf-and-compat.md) | Systems Engineers | Cross-backend performance optimizations, large-page mapping units, and `ET_EXEC` compatibility specifications. |
@@ -350,6 +351,7 @@ The `rungv` binary contains the components below. The generator `tools/licenses`
 - `gvx` is licensed under the Apache License, Version 2.0.
 - The code derived from [google/gvisor](https://github.com/google/gvisor) is licensed under the Apache License, Version 2.0, Copyright The gVisor Authors. The pinned upstream commit is in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT).
 - The Go standard library is licensed under the BSD-3-Clause license, Copyright The Go Authors.
+- The module embeds a modified copy of the `unix` package of `golang.org/x/sys` in `third_party/x_sys/unix`. The copy stays under the BSD-3-Clause license of that module, whose text is in `third_party/x_sys/LICENSE`.
 
 The third-party Go modules that `rungv` links are listed by SPDX identifier.
 
@@ -357,7 +359,7 @@ The third-party Go modules that `rungv` links are listed by SPDX identifier.
 | :--- | :--- |
 | `Apache-2.0` | `github.com/google/btree` v1.1.2 |
 | `Apache-2.0 AND BSD-3-Clause AND MIT` | `github.com/klauspost/compress` v1.18.0 |
-| `BSD-3-Clause` | `golang.org/x/arch` v0.32.0, `golang.org/x/crypto` v0.57.0, `golang.org/x/exp` v0.0.0-20250711185948-6ae5c78190dc, `golang.org/x/mod` v0.41.0, `golang.org/x/net` v0.60.0, `golang.org/x/sync` v0.23.0, `golang.org/x/sys` v0.48.0 (local copy in `third_party/x_sys`), `golang.org/x/text` v0.42.0, `golang.org/x/time` v0.15.0, `google.golang.org/protobuf` v1.36.11 |
+| `BSD-3-Clause` | `golang.org/x/arch` v0.32.0, `golang.org/x/crypto` v0.57.0, `golang.org/x/exp` v0.0.0-20250711185948-6ae5c78190dc, `golang.org/x/mod` v0.41.0, `golang.org/x/net` v0.60.0, `golang.org/x/sync` v0.23.0, `golang.org/x/sys` v0.48.0, `golang.org/x/text` v0.42.0, `golang.org/x/time` v0.15.0, `google.golang.org/protobuf` v1.36.11 |
 | `MIT` | `golang.zx2c4.com/wintun` v0.0.0-20230126152724-0fa3db229ce2, `golang.zx2c4.com/wireguard` v0.0.0-20261006164505-2631ce99a06f |
 
 `rungv license` prints every license text of the binary, and `rungv license -list` prints the component list.

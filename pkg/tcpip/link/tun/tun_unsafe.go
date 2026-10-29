@@ -21,7 +21,7 @@ package tun
 import (
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // Open opens the specified TUN device, sets it to non-blocking mode, and

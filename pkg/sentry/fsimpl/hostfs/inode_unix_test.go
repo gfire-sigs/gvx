@@ -21,9 +21,9 @@ import (
 	"os"
 	"testing"
 
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 func TestHostSpecialFilesAreNeverOpened(t *testing.T) {

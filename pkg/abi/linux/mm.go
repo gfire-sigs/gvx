@@ -17,7 +17,7 @@ package linux
 import (
 	"fmt"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // Protections for mmap(2).

@@ -17,7 +17,7 @@
 package time
 
 import (
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 func vdsoClockGettime(clockid ClockID, ts *unix.Timespec) int

@@ -68,7 +68,7 @@ gvx/ (Fork of google/gvisor@go)
  │   └── architecture.md                    # [NEW] Authoritative architecture and milestone plan
  ├── scripts/                               # [NEW] codesign-exec.sh (signs test binaries) and sync-upstream.sh
  ├── third_party/
- │   └── x_sys/                             # [NEW] golang.org/x/sys with Darwin and Windows additions (go.mod replace)
+ │   └── x_sys/unix/                        # [NEW] Embedded copy of golang.org/x/sys/unix with Darwin and Windows changes (docs/x-sys-unix.md)
  ├── tools/
  │   ├── shiminterop/                       # [NEW] Isolated SDK smoke tests
  │   └── upstream/                          # [NEW] Upstream sync, diff audit, import boundaries, and build-tag rewriter

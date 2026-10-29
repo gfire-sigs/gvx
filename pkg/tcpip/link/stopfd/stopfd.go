@@ -21,7 +21,7 @@ import (
 	"context"
 	"fmt"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // StopFD is an eventfd used to signal the stop of a dispatcher.

@@ -18,7 +18,7 @@ package systrap
 
 import (
 	// Required for fact extraction.
-	_ "golang.org/x/sys/unix"
+	_ "z.gfire.dev/gvx/third_party/x_sys/unix"
 	_ "z.gfire.dev/gvx/pkg/abi/linux"
 )
 

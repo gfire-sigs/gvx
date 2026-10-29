@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // The macOS backend registers EVFILT_VNODE filters on descriptors that it

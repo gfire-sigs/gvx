@@ -202,3 +202,20 @@ func TestUpstreamGoFilesAppliesMask(t *testing.T) {
 		t.Fatalf("included=%v excluded=%d, want 2 files and 1 excluded", included, excluded)
 	}
 }
+
+func TestRewriteModulePathPointsXSysUnixAtTheEmbeddedCopy(t *testing.T) {
+	src := []byte("import (\n\t\"golang.org/x/sys/unix\"\n\t\"golang.org/x/sys/windows\"\n\t\"gvisor.dev/gvisor/pkg/abi/linux\"\n)\n")
+	got := string(rewriteModulePath(src))
+	for _, want := range []string{
+		`"z.gfire.dev/gvx/third_party/x_sys/unix"`,
+		`"golang.org/x/sys/windows"`,
+		`"z.gfire.dev/gvx/pkg/abi/linux"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rewritten source lacks %s:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `"golang.org/x/sys/unix"`) {
+		t.Errorf("rewritten source still imports the upstream unix package:\n%s", got)
+	}
+}

@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 const pageSize4K = 4096

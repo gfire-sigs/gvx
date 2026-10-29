@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // Self-probes run inside the locked process. Each probe changes no host state

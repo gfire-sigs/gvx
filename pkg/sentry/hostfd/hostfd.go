@@ -18,7 +18,7 @@ package hostfd
 import (
 	"io"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sync"
 )

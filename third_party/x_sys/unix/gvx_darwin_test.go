@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 func gvxTempFile(t *testing.T, size int64) *os.File {

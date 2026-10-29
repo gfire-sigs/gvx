@@ -22,7 +22,7 @@ import (
 	"io"
 
 	"cloud.google.com/go/storage"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
 	"z.gfire.dev/gvx/pkg/sync"

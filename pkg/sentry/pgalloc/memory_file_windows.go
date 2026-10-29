@@ -22,11 +22,11 @@ import (
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/memutil"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 var (

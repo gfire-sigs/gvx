@@ -26,7 +26,7 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/containerd/fifo"
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 type linuxPlatform struct {

@@ -21,7 +21,7 @@ import (
 	stdtime "time"
 	_ "unsafe" // for go:linkname
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // clockUptimeRaw is CLOCK_UPTIME_RAW from <time.h>. It counts mach_absolute_time

@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // listNames lists the host names in the directory that h names. It opens the

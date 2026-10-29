@@ -22,10 +22,10 @@ import (
 	"sync"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 const (

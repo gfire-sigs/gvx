@@ -19,7 +19,7 @@ package sighandling
 import (
 	"os"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // IgnoreChildStop is a no-op on macOS where child process stop notifications

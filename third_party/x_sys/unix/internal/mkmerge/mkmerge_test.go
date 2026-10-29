@@ -25,9 +25,9 @@ func TestImports(t *testing.T) {
 			{`"go/ast"`, "ast"},
 			{`moo "go/format"`, "moo"},
 			{`. "go/token"`, "."},
-			{`"golang.org/x/sys/unix"`, "unix"},
-			{`nix "golang.org/x/sys/unix"`, "nix"},
-			{`_ "golang.org/x/sys/unix"`, "_"},
+			{`"z.gfire.dev/gvx/third_party/x_sys/unix"`, "unix"},
+			{`nix "z.gfire.dev/gvx/third_party/x_sys/unix"`, "nix"},
+			{`_ "z.gfire.dev/gvx/third_party/x_sys/unix"`, "_"},
 		}
 
 		for _, c := range cases {

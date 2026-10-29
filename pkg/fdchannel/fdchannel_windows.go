@@ -2,7 +2,7 @@
 
 package fdchannel
 
-import "golang.org/x/sys/unix"
+import "z.gfire.dev/gvx/third_party/x_sys/unix"
 
 // NewConnectedSockets returns ENOSYS on Windows.
 func NewConnectedSockets() ([2]int, error) {

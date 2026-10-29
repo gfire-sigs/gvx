@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // int32 is the real type of a file descriptor.

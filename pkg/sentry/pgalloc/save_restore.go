@@ -25,7 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/third_party/x_sys/unix"
 	"google.golang.org/protobuf/proto"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/bitmap"
