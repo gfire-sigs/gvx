@@ -20,7 +20,7 @@ package fdbased
 import (
 	"encoding/binary"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/rawfile"
 	"z.gfire.dev/gvx/pkg/tcpip"

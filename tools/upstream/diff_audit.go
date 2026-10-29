@@ -125,7 +125,6 @@ var tier1Prefixes = []string{
 	"tools/upstream/",
 	"tools/shiminterop/",
 	"tools/licenses/",
-	"third_party/",
 	"docs/",
 	"internal/",
 }

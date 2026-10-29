@@ -27,6 +27,7 @@ import (
 	"time"
 	"unsafe"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -35,7 +36,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // TestAddressSpaceChurnReusesTablesWithoutLeakOrAliasing is the regression test

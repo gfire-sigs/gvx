@@ -21,7 +21,7 @@ package tun
 import (
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // Open opens the specified TUN device, sets it to non-blocking mode, and

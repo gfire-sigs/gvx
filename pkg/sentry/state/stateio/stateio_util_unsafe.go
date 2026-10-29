@@ -17,7 +17,7 @@ package stateio
 import (
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // SliceFromIovec returns a byte slice representing the memory described by

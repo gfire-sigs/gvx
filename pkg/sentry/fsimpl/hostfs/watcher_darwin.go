@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // The macOS backend registers EVFILT_VNODE filters on descriptors that it

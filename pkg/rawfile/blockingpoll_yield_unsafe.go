@@ -25,7 +25,7 @@ package rawfile
 import (
 	_ "unsafe" // for go:linkname
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // BlockingPoll on amd64/arm64 makes the ppoll() syscall while calling the

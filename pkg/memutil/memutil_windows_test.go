@@ -10,7 +10,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // isCommitted reports whether the page at addr is committed memory.

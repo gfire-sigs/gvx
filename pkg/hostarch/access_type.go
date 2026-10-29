@@ -14,7 +14,7 @@
 
 package hostarch
 
-import "z.gfire.dev/gvx/third_party/x_sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // AccessType specifies memory access types. This is used for
 // setting mapping permissions, as well as communicating faults.

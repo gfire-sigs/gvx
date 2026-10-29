@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/gohacks"
 )
 

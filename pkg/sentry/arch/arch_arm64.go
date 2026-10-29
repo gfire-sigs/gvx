@@ -20,7 +20,7 @@ package arch
 import (
 	"fmt"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/marshal"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"

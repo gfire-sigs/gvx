@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func boundedFileIO(ctx context.Context, file *os.File, operation func(io.ReadWriter) error) (result error) {

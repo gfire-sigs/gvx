@@ -16,7 +16,7 @@
 
 package hostfs
 
-import "z.gfire.dev/gvx/third_party/x_sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // renameSwap exchanges two directory entries with renameat2 and
 // RENAME_EXCHANGE. The seccomp allowlist of the host filesystem permits

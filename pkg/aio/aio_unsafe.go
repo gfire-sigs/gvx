@@ -17,7 +17,7 @@ package aio
 import (
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // Request provides inputs to an asynchronous I/O operation.

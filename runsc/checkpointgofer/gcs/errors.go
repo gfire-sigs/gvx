@@ -23,7 +23,7 @@ import (
 	"net/url"
 	"strings"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"google.golang.org/api/googleapi"
 	"z.gfire.dev/gvx/pkg/log"
 )

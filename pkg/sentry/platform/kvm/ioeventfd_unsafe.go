@@ -19,7 +19,7 @@ package kvm
 import (
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func kvmIoeventfdIoctl(vmfd int, ioeventfd *kvmIoeventfd) unix.Errno {

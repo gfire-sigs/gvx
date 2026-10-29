@@ -18,7 +18,7 @@
 package tcpip
 
 import (
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // TranslateErrno translate an errno from the syscall package into a

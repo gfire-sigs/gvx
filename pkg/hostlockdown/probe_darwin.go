@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // Self-probes run inside the locked process. Each probe changes no host state

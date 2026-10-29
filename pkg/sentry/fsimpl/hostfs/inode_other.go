@@ -20,7 +20,7 @@ import (
 	"os"
 	"time"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // probeCaseInsensitive reports false: the Linux development build runs on

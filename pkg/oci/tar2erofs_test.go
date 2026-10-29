@@ -463,7 +463,7 @@ func TestOCIImportsStayWithinSpecLayout(t *testing.T) {
 				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/abi/linux"`) &&
 				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/erofs"`) &&
 				!strings.Contains(line, `"z.gfire.dev/gvx/pkg/fd"`) &&
-				!strings.Contains(line, `"z.gfire.dev/gvx/third_party/x_sys/unix"`) {
+				!strings.Contains(line, `"z.gfire.dev/gvx/internal/xsys/unix"`) {
 				t.Errorf("%s imports %s", e.Name(), strings.TrimSpace(line))
 			}
 		}

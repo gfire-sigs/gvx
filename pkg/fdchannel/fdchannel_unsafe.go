@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // int32 is the real type of a file descriptor.

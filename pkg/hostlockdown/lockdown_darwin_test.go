@@ -35,7 +35,7 @@ import (
 	"testing"
 	"time"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // The tests re-execute the test binary as a locked child. Seatbelt and

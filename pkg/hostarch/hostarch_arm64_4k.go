@@ -16,7 +16,7 @@
 
 package hostarch
 
-import "z.gfire.dev/gvx/third_party/x_sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 const (
 	// PageShift is the binary log of the system page size.

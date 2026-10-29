@@ -16,7 +16,7 @@ import (
 	"sync"
 	"syscall"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func currentOwner() (string, error) { return strconv.Itoa(os.Geteuid()), nil }

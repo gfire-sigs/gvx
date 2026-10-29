@@ -49,7 +49,7 @@ import (
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/shim/v1/extension"
 	"z.gfire.dev/gvx/pkg/shim/v1/proc"
 	"z.gfire.dev/gvx/pkg/shim/v1/runsccmd"

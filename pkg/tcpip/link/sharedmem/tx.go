@@ -19,7 +19,7 @@ package sharedmem
 import (
 	"math"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/eventfd"
 	"z.gfire.dev/gvx/pkg/tcpip/link/sharedmem/queue"

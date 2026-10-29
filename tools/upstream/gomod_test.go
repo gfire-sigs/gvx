@@ -32,7 +32,7 @@ require (
 	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
 )
 
-replace golang.org/x/sys => ./third_party/x_sys
+replace golang.org/x/sys => ./internal/xsys
 `
 	out, err := MergeGoMod([]byte(upstreamGoMod), []byte(local))
 	if err != nil {
@@ -45,7 +45,7 @@ replace golang.org/x/sys => ./third_party/x_sys
 		"golang.org/x/arch v0.32.0",
 		"golang.org/x/mod v0.41.0",
 		"golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f",
-		"replace golang.org/x/sys => ./third_party/x_sys",
+		"replace golang.org/x/sys => ./internal/xsys",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("merged go.mod lacks %q:\n%s", want, got)

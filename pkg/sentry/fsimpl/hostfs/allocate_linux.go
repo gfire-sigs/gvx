@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"os"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // allocateNative passes the request to fallocate on the descriptor of f. The

@@ -24,7 +24,7 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/runsc/cmd/util"
 	"z.gfire.dev/gvx/runsc/config"
 	"z.gfire.dev/gvx/runsc/container"

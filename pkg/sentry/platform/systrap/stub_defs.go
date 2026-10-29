@@ -18,7 +18,7 @@ package systrap
 
 import (
 	// Required for fact extraction.
-	_ "z.gfire.dev/gvx/third_party/x_sys/unix"
+	_ "z.gfire.dev/gvx/internal/xsys/unix"
 	_ "z.gfire.dev/gvx/pkg/abi/linux"
 )
 

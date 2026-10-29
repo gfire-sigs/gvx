@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // osNativeGrow allocates n bytes behind the physical end of the file with

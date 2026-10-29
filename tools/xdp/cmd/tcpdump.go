@@ -32,7 +32,7 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 	"z.gfire.dev/gvx/pkg/xdp"
 	"z.gfire.dev/gvx/runsc/flag"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 //go:embed bpf/tcpdump_ebpf.o

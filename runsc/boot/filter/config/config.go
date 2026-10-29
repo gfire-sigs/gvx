@@ -24,7 +24,7 @@ import (
 	"runtime"
 	"strings"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
 	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy"

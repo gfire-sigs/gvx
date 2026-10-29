@@ -6,7 +6,7 @@ import (
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/waiter"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // NonBlockingPoll polls the given FD in non-blocking fashion.

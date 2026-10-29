@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // This file loads Hypervisor.framework at run time and wraps the VM-level

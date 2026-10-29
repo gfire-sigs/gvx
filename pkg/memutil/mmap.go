@@ -17,7 +17,7 @@
 package memutil
 
 import (
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // MapFile returns a memory mapping configured by the given options as per

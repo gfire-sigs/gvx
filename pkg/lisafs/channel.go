@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"math"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/fdchannel"
 	"z.gfire.dev/gvx/pkg/flipcall"
 	"z.gfire.dev/gvx/pkg/gomaxprocs"

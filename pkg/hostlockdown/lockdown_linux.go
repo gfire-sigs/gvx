@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // probeExecPath names a file that does not exist. A filter that rejects

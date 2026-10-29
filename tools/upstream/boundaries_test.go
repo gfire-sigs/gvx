@@ -366,7 +366,7 @@ func TestShimControlInteropImportsStayTestOnly(t *testing.T) {
 }
 
 func TestBoundaryNormalizesTheEmbeddedXSysUnix(t *testing.T) {
-	const embedded = "z.gfire.dev/gvx/third_party/x_sys/unix"
+	const embedded = "z.gfire.dev/gvx/internal/xsys/unix"
 	if got := normalizeImport(embedded); got != "golang.org/x/sys/unix" {
 		t.Fatalf("normalizeImport(%q) = %q, want the upstream path", embedded, got)
 	}

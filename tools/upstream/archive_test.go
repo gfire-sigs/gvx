@@ -207,7 +207,7 @@ func TestRewriteModulePathPointsXSysUnixAtTheEmbeddedCopy(t *testing.T) {
 	src := []byte("import (\n\t\"golang.org/x/sys/unix\"\n\t\"golang.org/x/sys/windows\"\n\t\"gvisor.dev/gvisor/pkg/abi/linux\"\n)\n")
 	got := string(rewriteModulePath(src))
 	for _, want := range []string{
-		`"z.gfire.dev/gvx/third_party/x_sys/unix"`,
+		`"z.gfire.dev/gvx/internal/xsys/unix"`,
 		`"golang.org/x/sys/windows"`,
 		`"z.gfire.dev/gvx/pkg/abi/linux"`,
 	} {

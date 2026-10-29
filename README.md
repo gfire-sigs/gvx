@@ -351,7 +351,7 @@ The `rungv` binary contains the components below. The generator `tools/licenses`
 - `gvx` is licensed under the Apache License, Version 2.0.
 - The code derived from [google/gvisor](https://github.com/google/gvisor) is licensed under the Apache License, Version 2.0, Copyright The gVisor Authors. The pinned upstream commit is in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT).
 - The Go standard library is licensed under the BSD-3-Clause license, Copyright The Go Authors.
-- The module embeds a modified copy of the `unix` package of `golang.org/x/sys` in `third_party/x_sys/unix`. The copy stays under the BSD-3-Clause license of that module, whose text is in `third_party/x_sys/LICENSE`.
+- The module embeds a modified copy of the `unix` package of `golang.org/x/sys` in `internal/xsys/unix`. The copy stays under the BSD-3-Clause license of that module, whose text is in `internal/xsys/LICENSE`.
 
 The third-party Go modules that `rungv` links are listed by SPDX identifier.
 

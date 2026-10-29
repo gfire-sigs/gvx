@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func authorizePeer(conn net.Conn) error {

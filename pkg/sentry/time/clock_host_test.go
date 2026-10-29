@@ -21,7 +21,7 @@ import (
 	"testing"
 	stdtime "time"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // spinFor busy-waits until the Go runtime clock has advanced by d.

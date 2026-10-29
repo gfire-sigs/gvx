@@ -8,7 +8,7 @@ import (
 	"time"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // These are FUTEX_WAIT and FUTEX_WAKE with FUTEX_PRIVATE_FLAG from <linux/futex.h>.

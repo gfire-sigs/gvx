@@ -22,10 +22,10 @@ import (
 	"slices"
 	"testing"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // hostVolumeOf reads the volume of dir the way the host backend does.

@@ -21,7 +21,7 @@ import (
 	"context"
 	"fmt"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // StopFD is an eventfd used to signal the stop of a dispatcher.

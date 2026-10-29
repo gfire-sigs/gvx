@@ -17,7 +17,7 @@ package host
 import (
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func setTimestamps(fd int, ts *[2]unix.Timespec) error {

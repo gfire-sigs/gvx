@@ -20,7 +20,7 @@ package console
 import (
 	"os"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // StdioIsPty returns true if all stdio FDs are ptys.

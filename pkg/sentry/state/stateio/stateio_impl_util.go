@@ -15,7 +15,7 @@
 package stateio
 
 import (
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // This file contains utilities for implementers of AsyncReader and

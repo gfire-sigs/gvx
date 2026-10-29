@@ -22,7 +22,7 @@
 // These calls return err == nil to indicate success; otherwise
 // err represents an operating system error describing the failure and
 // holds a value of type syscall.Errno.
-package unix // import "z.gfire.dev/gvx/third_party/x_sys/unix"
+package unix // import "z.gfire.dev/gvx/internal/xsys/unix"
 
 import (
 	"bytes"

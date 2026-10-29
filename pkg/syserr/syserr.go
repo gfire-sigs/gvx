@@ -20,11 +20,11 @@ package syserr
 import (
 	"fmt"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux/errno"
 	"z.gfire.dev/gvx/pkg/errors"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/safecopy"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // Error represents an internal error.

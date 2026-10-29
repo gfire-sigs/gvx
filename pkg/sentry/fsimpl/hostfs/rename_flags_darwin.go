@@ -16,7 +16,7 @@
 
 package hostfs
 
-import "z.gfire.dev/gvx/third_party/x_sys/unix"
+import "z.gfire.dev/gvx/internal/xsys/unix"
 
 // renameSwap exchanges two directory entries with renameatx_np and
 // RENAME_SWAP. The Seatbelt profile allows the call because both entries lie

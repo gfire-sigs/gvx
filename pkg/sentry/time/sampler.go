@@ -17,7 +17,7 @@ package time
 import (
 	"errors"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/log"
 )
 

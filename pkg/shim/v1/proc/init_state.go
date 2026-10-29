@@ -24,7 +24,7 @@ import (
 	"github.com/containerd/errdefs"
 	errgrpc "github.com/containerd/errdefs/pkg/errgrpc"
 	runc "github.com/containerd/go-runc"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/shim/v1/extension"
 	"z.gfire.dev/gvx/pkg/shim/v1/runsccmd"
 )

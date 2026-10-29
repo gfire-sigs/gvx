@@ -23,7 +23,7 @@ import (
 	"os"
 
 	"github.com/creack/pty"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // NewWithSocket creates pty master/replica pair, sends the master FD over the

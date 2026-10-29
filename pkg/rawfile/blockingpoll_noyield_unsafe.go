@@ -20,7 +20,7 @@ package rawfile
 import (
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // BlockingPoll is just a stub function that forwards to the ppoll() system call

@@ -19,7 +19,7 @@ package boot
 import (
 	"fmt"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	rpb "z.gfire.dev/gvx/pkg/sentry/arch/registers_go_proto"

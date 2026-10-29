@@ -23,7 +23,7 @@
 package hostsyscall
 
 import (
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // RawSyscall6 is a copy of runtime.Syscall6.

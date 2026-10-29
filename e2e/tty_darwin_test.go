@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/gvx"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // TestE2EHostPTYInteractiveShell verifies that attaching a real host PTY to a

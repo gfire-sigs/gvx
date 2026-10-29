@@ -29,7 +29,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // entry describes one regular file of the tree.

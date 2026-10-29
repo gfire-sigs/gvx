@@ -18,7 +18,7 @@ import (
 	"io"
 	"unsafe"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // wait blocks until the socket FD is ready for reading or writing, depending

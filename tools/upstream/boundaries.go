@@ -312,7 +312,7 @@ func normalizeImport(impPath string) string {
 	trimmed := strings.TrimPrefix(impPath, modulePrefix)
 	trimmed = strings.TrimPrefix(trimmed, legacyModulePrefix)
 	// The module embeds the x/sys unix package. The rules name it by its upstream path.
-	if trimmed == "third_party/x_sys/unix" {
+	if trimmed == "internal/xsys/unix" {
 		return "golang.org/x/sys/unix"
 	}
 	return trimmed

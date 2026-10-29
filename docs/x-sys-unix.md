@@ -1,12 +1,12 @@
 # The Embedded `unix` Package
 
-This module embeds a modified copy of the package `golang.org/x/sys/unix` in `third_party/x_sys/unix`. The copy replaces an earlier fork of the whole module `golang.org/x/sys`. This document states why the copy exists, what it changes, and how to update it.
+This module embeds a modified copy of the package `golang.org/x/sys/unix` in `internal/xsys/unix`. The copy replaces an earlier fork of the whole module `golang.org/x/sys`. This document states why the copy exists, what it changes, and how to update it.
 
 ## 1. Why the Copy Exists
 
 The pure-Go Sentry code of gVisor imports `golang.org/x/sys/unix` and expects Linux types and constants. The upstream package has no file for Windows. On Darwin its types follow the Darwin ABI, and the Sentry expects the Linux shape. The copy closes both gaps.
 
-The copy lives inside this module. Every import of `golang.org/x/sys/unix` in the repository points at `z.gfire.dev/gvx/third_party/x_sys/unix`. A `replace` directive of this module would not reach a module that imports `pkg/gvx`, and that module would fail to build. The script `scripts/check-consumer.sh` builds such a module for the five targets, and the build job of CI runs it.
+The copy lives inside this module. Every import of `golang.org/x/sys/unix` in the repository points at `z.gfire.dev/gvx/internal/xsys/unix`. A `replace` directive of this module would not reach a module that imports `pkg/gvx`, and that module would fail to build. The script `scripts/check-consumer.sh` builds such a module for the five targets, and the build job of CI runs it.
 
 The other packages of `golang.org/x/sys`, such as `windows` and `cpu`, come from the upstream module through the `require` line of `go.mod`.
 
@@ -26,10 +26,10 @@ The copy keeps only the files for Darwin, Linux on `amd64` and `arm64`, Windows,
 
 Run these steps when the version of `golang.org/x/sys` in `go.mod` changes.
 
-1. Download the new version of the module and copy its `unix` directory over `third_party/x_sys/unix`.
+1. Download the new version of the module and copy its `unix` directory over `internal/xsys/unix`.
 2. Delete the files for other systems, the generator scripts, and the upstream tests. Keep every file with the prefix `gvx_`.
 3. Apply the changes of section 2 to the Darwin files again. A diff against the old version of the copy lists them.
-4. Run `go build ./...` for the five targets and `go test ./third_party/x_sys/unix/`.
+4. Run `go build ./...` for the five targets and `go test ./internal/xsys/unix/`.
 5. Run `scripts/check-consumer.sh`.
 
 The sync tool `tools/upstream` rewrites the import of the package in upstream gVisor files. Its rewrite and its audit use the same rule as the rewrite of the gVisor module path.

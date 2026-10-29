@@ -20,7 +20,7 @@ package ptrace
 import (
 	"fmt"
 
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/bpf"
 	"z.gfire.dev/gvx/pkg/hosttid"
 	"z.gfire.dev/gvx/pkg/log"

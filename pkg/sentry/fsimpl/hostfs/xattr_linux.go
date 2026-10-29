@@ -21,8 +21,8 @@ import (
 	"os"
 	"strings"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/third_party/x_sys/unix"
 )
 
 // This file holds the native store of extended attributes for Linux hosts.
