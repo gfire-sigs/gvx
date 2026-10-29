@@ -4,7 +4,9 @@ package sync
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
+	gosync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -161,5 +163,59 @@ func TestFutexPingPongOrdering(t *testing.T) {
 		case <-watchdog:
 			t.Fatal("ping-pong deadlocked: a futex wakeup was lost")
 		}
+	}
+}
+
+// A waiter must return only after a wake for its word or a new value. WaitOnAddress
+// on Windows can return for a wake of another word, because the kernel hashes the
+// addresses of its wait table. The test parks probe threads on words that nobody
+// wakes, while other threads wake unrelated words without pause.
+func TestFutexWaitReturnsOnlyForItsOwnWake(t *testing.T) {
+	t.Parallel()
+	const probes, noisy = 8, 8
+	stop := make(chan struct{})
+	var noise gosync.WaitGroup
+	for range noisy {
+		word := newFutexWord(7)
+		noise.Add(1)
+		go func() {
+			defer noise.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				done := make(chan struct{})
+				go func() {
+					_ = FutexWait(word, 7, 200*time.Microsecond)
+					close(done)
+				}()
+				FutexWake(word, 1)
+				<-done
+			}
+		}()
+	}
+	errs := make(chan error, probes)
+	var wg gosync.WaitGroup
+	for range probes {
+		word := newFutexWord(7)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				if err := FutexWait(word, 7, time.Millisecond); !errors.Is(err, ErrFutexTimedOut) {
+					errs <- fmt.Errorf("FutexWait returned %v with no wake for its word, want %v", err, ErrFutexTimedOut)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	noise.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }
