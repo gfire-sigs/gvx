@@ -134,7 +134,7 @@ func TestGvxMmapHonoursProtectionAndFileOffset(t *testing.T) {
 		t.Fatalf("Munmap(unaligned view): %v", err)
 	}
 
-	private, err := unix.Mmap(int(f.Fd()), 0, 4096, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE)
+	private, err := unix.Mmap(int(f.Fd()), 0, 8192, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE)
 	if err != nil {
 		t.Fatalf("Mmap(private): %v", err)
 	}
@@ -143,7 +143,9 @@ func TestGvxMmapHonoursProtectionAndFileOffset(t *testing.T) {
 	if _, err := f.ReadAt(buf, 0); err != nil || buf[0] != 0 {
 		t.Fatalf("file byte after private write = (%#x, %v), want 0", buf[0], err)
 	}
-	if err := unix.Munmap(private[:2048]); !errors.Is(err, unix.ENOTSUP) {
+	// A length below a page rounds up to the page, as munmap(2) does, so the
+	// test releases a whole page of the two to see the refusal.
+	if err := unix.Munmap(private[:4096]); !errors.Is(err, unix.ENOTSUP) {
 		t.Fatalf("Munmap(part of mapping) = %v, want ENOTSUP", err)
 	}
 	if err := unix.Munmap(private); err != nil {
