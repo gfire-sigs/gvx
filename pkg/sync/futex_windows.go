@@ -26,39 +26,90 @@ const maxWaitMillis = windows.INFINITE - 1
 // futexWaiterShards spreads the waiter counters over independent locks.
 const futexWaiterShards = 64
 
-// futexWaiters counts the threads parked per address. WakeByAddress* does not
-// report how many threads it woke. FutexWake uses these counters to wake
-// no more than the requested number of threads and to report an upper bound.
+// futexWord holds the state of one address that has waiters.
+type futexWord struct {
+	// waiters counts the threads parked on the address.
+	waiters int
+	// wakes counts the wake-ups that FutexWake and FutexWakeAll issued for the
+	// address and that no waiter has used yet.
+	wakes int
+}
+
+// futexWaiters tracks the threads parked per address. WakeByAddress* does not
+// report how many threads it woke. FutexWake uses the counters to wake no more
+// than the requested number of threads and to report an upper bound. The wake
+// counters tell a real wake from a spurious return of WaitOnAddress.
 var futexWaiters [futexWaiterShards]struct {
-	mu      Mutex
-	waiters map[*uint32]int
+	mu    Mutex
+	words map[*uint32]*futexWord
 }
 
 func futexShard(addr *uint32) int {
 	return int(uintptr(unsafe.Pointer(addr))>>2) % futexWaiterShards
 }
 
-func futexAddWaiter(addr *uint32, delta int) int {
+// futexRegister counts one more waiter on addr.
+func futexRegister(addr *uint32) {
 	s := &futexWaiters[futexShard(addr)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.waiters == nil {
-		s.waiters = make(map[*uint32]int)
+	if s.words == nil {
+		s.words = make(map[*uint32]*futexWord)
 	}
-	n := s.waiters[addr] + delta
-	if n <= 0 {
-		delete(s.waiters, addr)
-		return 0
+	w := s.words[addr]
+	if w == nil {
+		w = &futexWord{}
+		s.words[addr] = w
 	}
-	s.waiters[addr] = n
-	return n
+	w.waiters++
 }
 
-func futexWaiterCount(addr *uint32) int {
+// futexUnregister removes one waiter. A wake-up that nobody used cannot outlast
+// the waiters, so the counter never exceeds the waiters that remain.
+func futexUnregister(addr *uint32) {
 	s := &futexWaiters[futexShard(addr)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.waiters[addr]
+	w := s.words[addr]
+	if w == nil {
+		return
+	}
+	w.waiters--
+	if w.waiters <= 0 {
+		delete(s.words, addr)
+		return
+	}
+	w.wakes = min(w.wakes, w.waiters)
+}
+
+// futexClaimWake uses one wake-up that FutexWake issued for addr. It reports
+// false when none is pending.
+func futexClaimWake(addr *uint32) bool {
+	s := &futexWaiters[futexShard(addr)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.words[addr]
+	if w == nil || w.wakes == 0 {
+		return false
+	}
+	w.wakes--
+	return true
+}
+
+// futexIssueWake records up to count wake-ups for addr, before the caller wakes
+// the threads, and returns how many it recorded: the number of waiters, capped
+// by count.
+func futexIssueWake(addr *uint32, count int) int {
+	s := &futexWaiters[futexShard(addr)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.words[addr]
+	if w == nil {
+		return 0
+	}
+	n := min(count, w.waiters)
+	w.wakes = min(w.wakes+n, w.waiters)
+	return n
 }
 
 // FutexWait parks the caller while *addr equals val.
@@ -73,8 +124,8 @@ func FutexWait(addr *uint32, val uint32, timeout time.Duration) error {
 	}
 	// The waiter registers before it calls WaitOnAddress. A waker that stored a new
 	// value before FutexWake either sees the registration or WaitOnAddress sees the new value.
-	futexAddWaiter(addr, 1)
-	defer futexAddWaiter(addr, -1)
+	futexRegister(addr)
+	defer futexUnregister(addr)
 
 	var deadline time.Time
 	if timeout >= 0 {
@@ -97,7 +148,15 @@ func FutexWait(addr *uint32, val uint32, timeout time.Duration) error {
 			uintptr(millis),
 		)
 		if r1 != 0 {
-			return nil
+			// WaitOnAddress also returns TRUE when no wake reached this address:
+			// the wait table of the kernel is hashed, and a wake for another word
+			// that shares the bucket releases this thread. A real return has one of
+			// two causes: the value changed, or FutexWake issued a wake-up that no
+			// other waiter used.
+			if atomic.LoadUint32(addr) != val || futexClaimWake(addr) {
+				return nil
+			}
+			continue
 		}
 		if e1 != syscall.Errno(windows.ERROR_TIMEOUT) {
 			return fmt.Errorf("WaitOnAddress: %w", e1)
@@ -115,7 +174,7 @@ func FutexWake(addr *uint32, count int) int {
 	if addr == nil || count <= 0 {
 		return 0
 	}
-	n := min(count, futexWaiterCount(addr))
+	n := futexIssueWake(addr, count)
 	for range n {
 		procWakeByAddrSingle.Call(uintptr(unsafe.Pointer(addr)))
 	}
@@ -128,7 +187,7 @@ func FutexWakeAll(addr *uint32) int {
 	if addr == nil {
 		return 0
 	}
-	n := futexWaiterCount(addr)
+	n := futexIssueWake(addr, int(^uint(0)>>1))
 	if n > 0 {
 		procWakeByAddrAll.Call(uintptr(unsafe.Pointer(addr)))
 	}
