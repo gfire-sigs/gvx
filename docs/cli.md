@@ -137,6 +137,14 @@ A volume with the `ext4lite` driver needs no lockdown rule for a host path. The 
 
 `rungv` binds each published port before the lockdown. It prints one line for each port to the standard error before the guest starts, as in `rungv: publishing 127.0.0.1:49493 -> 8080/tcp`. The line shows the free port that the host chose. A published port needs the NAT network mode.
 
+### 4.7 Failures and diagnostics
+
+`-platform=auto` prefers the hardware hypervisor and falls back to `systrap`. The fallback is slower. `rungv` then prints a warning that names the cause and the fix. On Windows the usual cause is a disabled "Windows Hypervisor Platform" feature. On macOS it is a binary without the hypervisor entitlement. Sign it with `codesign --sign - --entitlements entitlements.plist --force rungv`. The SDK gives the same text through `Sandbox.FallbackReason`.
+
+The exit code 137 has two causes that `rungv` tells apart. A guest that passes `--memory` gets the message about the memory limit. When the engine fails under the guest, the kernel ends the guest with SIGKILL, and `rungv` prints `the execution engine stopped the guest` with the cause. The SDK returns `ErrEngineFault` in that case. A stub process that a virus scanner ended is one example of an engine fault.
+
+`GVX_DEBUG_LOG=1` prints the log of the kernel to the standard error of `rungv`, and the value `2` also prints debug lines. Use it when a guest fails and no message names the cause. `GVX_STRACE=1` also prints each system call of the guest.
+
 ## 5. Images and registries
 
 An image reference follows the Docker rules. The first path component is a registry host when it contains a dot or a colon, or when it is `localhost`. Any other name belongs to Docker Hub, and a name with one component gets the prefix `library/`. A reference without a tag and without a digest means the tag `latest`. A digest form is `NAME@sha256:HEX`. An uppercase repository name is invalid.
