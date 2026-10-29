@@ -251,6 +251,11 @@ var stubRestrictingSIDs = []string{"S-1-1-0", "S-1-5-32-545", "S-1-5-12"}
 // user. The stub needs no handle at all, so the token is the only identity that
 // a guest escape would inherit.
 func buildStubToken() (windows.Token, confinement, error) {
+	return buildStubTokenWith(stubRestrictingSIDs)
+}
+
+// buildStubTokenWith builds the stub token with the given restricting SIDs.
+func buildStubTokenWith(restrictingSIDs []string) (windows.Token, confinement, error) {
 	var self windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(),
 		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ADJUST_DEFAULT|windows.TOKEN_ADJUST_SESSIONID|windows.TOKEN_ADJUST_PRIVILEGES, &self)
@@ -265,7 +270,7 @@ func buildStubToken() (windows.Token, confinement, error) {
 	// the user and the groups of the user only, and Low integrity blocks writes
 	// but not reads.
 	var restrict []windows.SIDAndAttributes
-	for _, sddl := range stubRestrictingSIDs {
+	for _, sddl := range restrictingSIDs {
 		sid, err := windows.StringToSid(sddl)
 		if err != nil {
 			return 0, 0, fmt.Errorf("restricting SID %s: %w", sddl, err)
@@ -273,8 +278,12 @@ func buildStubToken() (windows.Token, confinement, error) {
 		restrict = append(restrict, windows.SIDAndAttributes{Sid: sid})
 	}
 	var restricted windows.Token
+	var restrictPtr uintptr
+	if len(restrict) > 0 {
+		restrictPtr = uintptr(unsafe.Pointer(&restrict[0]))
+	}
 	r, _, e := procCreateRestrictedToken.Call(uintptr(self), disableMaxPrivilege, 0, 0, 0, 0,
-		uintptr(len(restrict)), uintptr(unsafe.Pointer(&restrict[0])), uintptr(unsafe.Pointer(&restricted)))
+		uintptr(len(restrict)), restrictPtr, uintptr(unsafe.Pointer(&restricted)))
 	if r == 0 {
 		return 0, 0, fmt.Errorf("CreateRestrictedToken: %w", e)
 	}

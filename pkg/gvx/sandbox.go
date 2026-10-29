@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/fd"
@@ -43,6 +44,7 @@ type Sandbox struct {
 	cfg           Config
 	plat          platform.Platform
 	platName      string
+	fallbackFrom  error
 	memFile       *pgalloc.MemoryFile
 	resolvedImg   *oci.ResolvedImage
 	layerHandles  []*fd.HostHandle
@@ -78,12 +80,13 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
 
-	plat, platName, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
+	opened, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
 	if err != nil {
 		return cleanup(err)
 	}
-	sb.plat = plat
-	sb.platName = platName
+	sb.plat = opened.plat
+	sb.platName = opened.name
+	sb.fallbackFrom = opened.fallbackFrom
 
 	if err := sb.initOCILayers(ctx); err != nil {
 		return cleanup(err)
@@ -125,14 +128,28 @@ var ErrPlatformUnavailable = errors.New("gvx: execution platform unavailable")
 // opener starts one execution backend and returns it with its name.
 type opener func() (platform.Platform, string, error)
 
+// openedPlatform is an execution backend that is running.
+type openedPlatform struct {
+	plat platform.Platform
+	name string
+	// fallbackFrom is the error of the hardware backend when PlatformAuto fell
+	// back. It is nil in every other case.
+	fallbackFrom error
+}
+
 // openPlatform opens the requested backend. PlatformAuto prefers the hardware
 // hypervisor of the host OS and falls back to systrap (SPEC section 1) when
-// the hypervisor cannot initialize. An explicit PlatformSystrap returns the
-// engine error. The lockdown argument tells the backend to bind vCPU threads
-// to the lockdown token.
-func openPlatform(requested PlatformType, lockdown bool) (platform.Platform, string, error) {
+// the hypervisor cannot initialize. The result then carries the error of the
+// hypervisor. An explicit PlatformSystrap returns the engine error. The
+// lockdown argument tells the backend to bind vCPU threads to the lockdown
+// token.
+func openPlatform(requested PlatformType, lockdown bool) (openedPlatform, error) {
 	hardware := func() (platform.Platform, string, error) {
 		return nil, "", fmt.Errorf("%w: no hypervisor backend for %s", ErrPlatformUnavailable, runtime.GOOS)
+	}
+	single := func(o opener) (openedPlatform, error) {
+		p, name, err := o()
+		return openedPlatform{plat: p, name: name}, err
 	}
 	switch runtime.GOOS {
 	case "windows":
@@ -142,30 +159,31 @@ func openPlatform(requested PlatformType, lockdown bool) (platform.Platform, str
 	}
 	switch requested {
 	case PlatformWHPX:
-		return openWHPX(lockdown)
+		return single(func() (platform.Platform, string, error) { return openWHPX(lockdown) })
 	case PlatformHVF:
-		return openHVF()
+		return single(openHVF)
 	case PlatformSystrap:
-		return openSystrap()
+		return single(openSystrap)
 	case PlatformAuto:
 		return openAuto(hardware, openSystrap)
 	default:
-		return nil, "", fmt.Errorf("%w: unknown platform %q", ErrInvalidConfig, requested)
+		return openedPlatform{}, fmt.Errorf("%w: unknown platform %q", ErrInvalidConfig, requested)
 	}
 }
 
 // openAuto starts the hardware backend and falls back to the fallback backend
-// when the hardware backend fails. When both fail, the error reports both.
-func openAuto(hardware, fallback opener) (platform.Platform, string, error) {
+// when the hardware backend fails. The result then carries the error of the
+// hardware backend. When both fail, the error reports both.
+func openAuto(hardware, fallback opener) (openedPlatform, error) {
 	p, name, hwErr := hardware()
 	if hwErr == nil {
-		return p, name, nil
+		return openedPlatform{plat: p, name: name}, nil
 	}
 	p, name, fbErr := fallback()
 	if fbErr == nil {
-		return p, name, nil
+		return openedPlatform{plat: p, name: name, fallbackFrom: hwErr}, nil
 	}
-	return nil, "", fmt.Errorf("gvx: no execution backend available: %w", errors.Join(hwErr, fbErr))
+	return openedPlatform{}, fmt.Errorf("gvx: no execution backend available: %w", errors.Join(hwErr, fbErr))
 }
 
 // openWHPX opens the Windows Hypervisor Platform backend. With lockdown on,
@@ -212,9 +230,45 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 	return opts
 }
 
-// PlatformName returns the active platform backend name ("whpx" or "hvf").
+// PlatformName returns the active platform backend name ("whpx", "hvf", or
+// "systrap").
 func (s *Sandbox) PlatformName() string {
 	return s.platName
+}
+
+// FallbackReason explains why PlatformAuto chose the systrap engine instead of
+// the hardware hypervisor. It returns an empty string when the hardware backend
+// runs, or when the caller named the platform. The text includes the way to fix
+// the cause when the cause is known.
+func (s *Sandbox) FallbackReason() string {
+	if s.fallbackFrom == nil {
+		return ""
+	}
+	reason := s.fallbackFrom.Error()
+	if hint := platformFailureHint(runtime.GOOS, s.fallbackFrom); hint != "" {
+		reason += "; " + hint
+	}
+	return reason
+}
+
+// platformFailureHint returns the step that fixes a failure of the hardware
+// backend, or an empty string when the cause is not one that gvx can name.
+func platformFailureHint(goos string, err error) string {
+	text := err.Error()
+	switch goos {
+	case "windows":
+		if errors.Is(err, whpx.ErrUnsupported) {
+			return "enable the Windows feature \"Windows Hypervisor Platform\" and restart, or pass -platform=systrap"
+		}
+	case "darwin":
+		switch {
+		case strings.Contains(text, "HV_DENIED"), strings.Contains(text, "HV_ERROR"):
+			return "sign the binary with the hypervisor entitlement: codesign --sign - --entitlements entitlements.plist --force <binary>"
+		case strings.Contains(text, "HV_UNSUPPORTED"), strings.Contains(text, "HV_NO_DEVICE"):
+			return "this host has no hypervisor, which is the case in a virtual machine without nested virtualization"
+		}
+	}
+	return ""
 }
 
 // LockdownStatus reports the host containment that New enforced. The zero
