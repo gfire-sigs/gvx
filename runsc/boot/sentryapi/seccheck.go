@@ -22,10 +22,8 @@ import (
 	"os"
 
 	"z.gfire.dev/gvx/pkg/sentry/seccheck"
-
-	// Register supported of sinks.
-	_ "z.gfire.dev/gvx/pkg/sentry/seccheck/sinks/null"
-	_ "z.gfire.dev/gvx/pkg/sentry/seccheck/sinks/remote"
+	_ "z.gfire.dev/gvx/pkg/sentry/seccheck/sinks/null"   // Register the null sink.
+	_ "z.gfire.dev/gvx/pkg/sentry/seccheck/sinks/remote" // Register the remote sink.
 )
 
 // InitConfig represents the configuration to apply during pod creation. For

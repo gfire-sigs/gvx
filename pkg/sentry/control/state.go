@@ -366,13 +366,7 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 		execOut = fdcollector.NewAgent(ctx, rfd, argv[0]) // transfers ownership of rfd
 		cu.Add(execOut.Stop)
 	}
-	// TODO(b/419041893): Support running the save/restore binary with container
-	// env vars without relying on the Saver().
-	var envv []string
-	if k.Saver() != nil {
-		contName := k.ContainerName(contID)
-		envv = k.Saver().SpecEnviron(contName)
-	}
+	envv := k.SpecEnviron(contID)
 
 	proc := Proc{
 		Kernel: k,
@@ -443,10 +437,8 @@ func findContainerInitProcess(k *kernel.Kernel, containerID string) (*kernel.Tas
 		}
 		return init.Leader(), nil
 	}
-	// To find the init process of a container, we look for the process with no
-	// parent (root of execution) that is not an exec process.
 	for _, tg := range k.RootPIDNamespace().ThreadGroups() {
-		if leader := tg.Leader(); leader.Parent() == nil && leader.Origin != kernel.OriginExec && leader.ContainerID() == containerID {
+		if leader := tg.Leader(); tg.IsContainerInit() && leader.ContainerID() == containerID {
 			return leader, nil
 		}
 	}

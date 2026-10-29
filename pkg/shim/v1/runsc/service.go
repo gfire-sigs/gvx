@@ -28,11 +28,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/sys/unix"
-
-	taskServer "z.gfire.dev/gvx/pkg/shim/v1/taskserver"
-	pb "z.gfire.dev/gvx/pkg/shim/v1/taskserver/task_server_go_proto"
-
 	cgroups "github.com/containerd/cgroups/v3"
 	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
 	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
@@ -42,6 +37,7 @@ import (
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
 	types "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/shim"
@@ -53,10 +49,12 @@ import (
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-
+	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/shim/v1/extension"
 	"z.gfire.dev/gvx/pkg/shim/v1/proc"
 	"z.gfire.dev/gvx/pkg/shim/v1/runsccmd"
+	taskServer "z.gfire.dev/gvx/pkg/shim/v1/taskserver"
+	pb "z.gfire.dev/gvx/pkg/shim/v1/taskserver/task_server_go_proto"
 	"z.gfire.dev/gvx/pkg/shim/v1/utils"
 	"z.gfire.dev/gvx/runsc/specutils"
 )
@@ -774,24 +772,27 @@ func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]ui
 	return pids, nil
 }
 
-// publishFailureIsFatal reports whether a failure to publish an event is fatal.
-// An empty TTRPC_ADDRESS means no event sink is configured (as under CRI-O), so
-// the publisher can never connect and publish errors are expected.
-func publishFailureIsFatal() bool {
-	return os.Getenv("TTRPC_ADDRESS") != ""
-}
-
+// forward publishes events until s.events is closed on shutdown, then closes
+// the publisher. This matches the runc shim.
+//
+// A publish error is logged rather than fatal. The publisher has already queued
+// the event for retry, and it fails for transient reasons such as containerd
+// restarting, or permanently when no event sink is configured (as under CRI-O).
+// Exiting the shim instead would take down every container it serves, which is
+// the whole pod with shim grouping.
 func (s *runscService) forward(ctx context.Context, publisher shim.Publisher) {
-	isFatal := publishFailureIsFatal()
+	// Detach from the shim context, which is done once shutdown completes, so
+	// that events still queued at that point don't fail immediately. This is
+	// best effort: the shim exits as soon as shutdown completes.
+	ns, _ := namespaces.Namespace(ctx)
+	ctx = namespaces.WithNamespace(context.Background(), ns)
 	for e := range s.events {
-		if err := publisher.Publish(ctx, getTopic(e), e); err != nil {
-			if isFatal {
-				// Should not happen when an event sink is configured.
-				panic(fmt.Errorf("post event: %w", err))
-			}
-			log.L.Warningf("Failed to post event (no containerd event sink): %v", err)
+		topic := getTopic(e)
+		if err := publisher.Publish(ctx, topic, e); err != nil {
+			log.L.WithError(err).Warningf("Failed to post event, topic: %q", topic)
 		}
 	}
+	publisher.Close()
 }
 
 func getTopic(e any) string {

@@ -74,7 +74,7 @@ func (wt *Wait) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (wt *Wait) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := wt.loadContainer(conf, f, container.LoadOpts{})
+	c, err := wt.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -98,7 +98,7 @@ func (wt *Wait) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 
 	conf := args[0].(*config.Config)
 
-	c, err := wt.loadContainer(conf, f, container.LoadOpts{})
+	c, err := wt.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}

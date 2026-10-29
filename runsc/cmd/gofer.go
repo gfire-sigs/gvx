@@ -22,11 +22,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"syscall"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"z.gfire.dev/gvx/pkg/lisafs"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/unet"
@@ -206,30 +206,38 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	g.syncFDs.syncChroot()
 	g.syncFDs.syncUsernsForRootless(uint32(g.uid), uint32(g.gid))
 
-	goferToHostRPCSock, err := unet.NewSocket(g.goferToHostRPCFD)
-	if err != nil {
-		util.Fatalf("creating rpc socket: %v", err)
+	// Only pass the FD if the gofer will actually need it.
+	var goferToHostRPC *urpc.Client
+	var mountOpener sandboxsetup.MountOpener
+	if g.goferToHostRPCFD >= 0 {
+		goferToHostRPCSock, err := unet.NewSocket(g.goferToHostRPCFD)
+		if err != nil {
+			util.Fatalf("creating rpc socket: %v", err)
+		}
+		goferToHostRPC = urpc.NewClient(goferToHostRPCSock)
+		mountOpener = makeRPCMountOpener(goferToHostRPC)
 	}
 
-	goferToHostRPC := urpc.NewClient(goferToHostRPCSock)
-	defer goferToHostRPC.Close()
-
+	var umounter *os.File
+	spawnUnmounter := g.setUpRoot && willReexec && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot
 	if g.setUpRoot {
 		// The /proc unmounter binary must be opened before SetupRootFS pivots
 		// away from the host filesystem.
-		var umounter *os.File
-		spawnUnmounter := willReexec && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot
 		if spawnUnmounter {
 			umounter = openProcUmounter()
 		}
-		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, makeRPCMountOpener(goferToHostRPC), containerID, g.bundleDir); err != nil {
+		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, containerID, g.bundleDir); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
-		if spawnUnmounter {
-			cleanupUnmounter := g.syncFDs.spawnProcUnmounter(umounter)
-			umounter.Close()
-			defer cleanupUnmounter()
-		}
+	}
+	// No longer needed past rootfs setup.
+	if goferToHostRPC != nil {
+		goferToHostRPC.Close()
+	}
+	if spawnUnmounter {
+		cleanupUnmounter := g.syncFDs.spawnProcUnmounter(umounter)
+		umounter.Close()
+		defer cleanupUnmounter()
 	}
 	extensionPrepare, err := extension.PrepareGofer(extension.GoferPrepareContext{
 		Spec:        spec,
@@ -252,6 +260,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
 		overrides["setup-root"] = "false"
+		overrides["rpc-fd"] = "-1" // Skip the `goferToHostRPCFD >= 0` branch on re-exec.
 		for key, value := range extensionPrepare.FlagOverrides {
 			overrides[key] = value
 		}
@@ -260,11 +269,6 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		panic("unreachable")
 	}
 	// No re-exec from here on out.
-
-	// This can't happen until after setCapsAndCallSelf(), since otherwise the
-	// re-executed gofer may reuse goferToHostRPCFD's file descriptor for an
-	// unrelated file.
-	goferToHostRPC.Close()
 
 	// Start profiling. This will be a noop if no profiling arguments were passed.
 	// This *must* happen while procfs is still mounted (need `/proc/self/maps`).
@@ -307,6 +311,8 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if err := fsgofer.OpenProcSelfFD(procFDPath); err != nil {
 		util.Fatalf("failed to open /proc/self/fd: %v", err)
 	}
+
+	canSetGroups := specutils.SetgroupsAllowed()
 
 	// Look up our own caps (needs procfs).
 	var resolvedCaps *sandboxsetup.ResolvedThreadCaps
@@ -356,11 +362,31 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	log.Infof("Process chroot'd to %q", root)
 
+	// Drop all supplementary groups (syscall.Setgroups applies to every thread)
+	// so that an application with none matches ours and connects to host
+	// sockets without a dedicated thread. If that is not permitted, e.g. rootless
+	// with a non-zero sandbox UID, keep them and stop offering
+	// ConnectWithGroups, whose per-thread setgroups(2) would fail the same way.
+	if canSetGroups && conf.GetHostUDS().AllowOpen() {
+		switch err := syscall.Setgroups(nil); err {
+		case nil:
+		case unix.EPERM:
+			log.Warningf("Not permitted to drop supplementary groups, keeping them and not offering ConnectWithGroups")
+			canSetGroups = false
+		default:
+			util.Fatalf("dropping supplementary groups: %v", err)
+		}
+	}
+
 	ruid := unix.Getuid()
 	euid := unix.Geteuid()
 	rgid := unix.Getgid()
 	egid := unix.Getegid()
-	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d", ruid, euid, rgid, egid)
+	groups, err := unix.Getgroups()
+	if err != nil {
+		util.Fatalf("reading supplementary groups: %v", err)
+	}
+	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d groups=%v canSetGroups=%t", ruid, euid, rgid, egid, groups, canSetGroups)
 
 	// Initialize filters.
 	opts := filter.Options{
@@ -379,10 +405,10 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root, ruid, euid, rgid, egid)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid, groups, canSetGroups)
 }
 
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, groups []int, canSetGroups bool) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock      *unet.Socket
 		mountPath string
@@ -462,6 +488,8 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		EUID:               euid,
 		RGID:               rgid,
 		EGID:               egid,
+		Groups:             groups,
+		CanSetGroups:       canSetGroups,
 	}
 	// The dev gofer connection exists to open host device files on behalf of
 	// the sentry's device proxies (e.g. nvproxy), which mediate all

@@ -22,20 +22,18 @@ import (
 	"flag"
 	"os"
 
+	api "github.com/containerd/containerd/api/runtime/sandbox/v1"
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	types "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/containerd/v2/pkg/shutdown"
+	"github.com/containerd/errdefs"
 	errgrpc "github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
-	taskServer "z.gfire.dev/gvx/pkg/shim/v1/taskserver"
-
-	api "github.com/containerd/containerd/api/runtime/sandbox/v1"
-	"github.com/containerd/errdefs"
-
 	"z.gfire.dev/gvx/pkg/shim/v1/extension"
 	rsc "z.gfire.dev/gvx/pkg/shim/v1/runsc"
+	taskServer "z.gfire.dev/gvx/pkg/shim/v1/taskserver"
 	"z.gfire.dev/gvx/pkg/sync"
 )
 
@@ -353,8 +351,12 @@ func (s *shimRedirector) Shutdown(ctx context.Context, r *task.ShutdownRequest) 
 		// stays alive as long as containers are present but acknowledges the shutdown
 		// signal without error. The error from runscService's Shutdown call is used
 		// as an indicator to identify if there are any active containers in the shim.
+		//
+		// The response must not be nil: ttrpc fails to marshal a nil response and
+		// returns an error to the caller instead, which containerd treats as a
+		// failure to delete the task.
 		log.L.Debugf("Shutdown, shim did not shutdown due to: %v", err)
-		return resp, errgrpc.ToGRPC(nil)
+		return &types.Empty{}, nil
 	}
 	s.shutdown.Shutdown()
 	return resp, nil

@@ -72,7 +72,7 @@ func (evs *Events) SetFlags(f *flag.FlagSet) {
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (evs *Events) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := evs.loadContainer(conf, f, container.LoadOpts{})
+	c, err := evs.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -88,7 +88,7 @@ func (evs *Events) Execute(_ context.Context, f *flag.FlagSet, args ...any) subc
 
 	conf := args[0].(*config.Config)
 
-	c, err := evs.loadContainer(conf, f, container.LoadOpts{})
+	c, err := evs.loadContainer(conf, f, container.LoadOpts{ReadOnly: true})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}

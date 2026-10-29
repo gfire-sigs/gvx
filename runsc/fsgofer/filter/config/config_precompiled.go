@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	"golang.org/x/sync/errgroup"
-
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
 	"z.gfire.dev/gvx/pkg/sync"

@@ -19,7 +19,6 @@ package boot
 import (
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/sentry/seccheck"
-
 	"z.gfire.dev/gvx/runsc/boot/sentryapi"
 )
 

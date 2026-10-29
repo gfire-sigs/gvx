@@ -22,9 +22,8 @@ import (
 	"context"
 
 	containerdshim "github.com/containerd/containerd/v2/pkg/shim"
-	// This import registers the runsc plugin with containerd.
 	shim "z.gfire.dev/gvx/pkg/shim/v1"
-	_ "z.gfire.dev/gvx/pkg/shim/v1/plugin"
+	_ "z.gfire.dev/gvx/pkg/shim/v1/plugin" // Register the runsc plugin with containerd.
 )
 
 // Main is the main entrypoint.

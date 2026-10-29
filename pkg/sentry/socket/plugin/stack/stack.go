@@ -23,6 +23,7 @@ package stack
 import (
 	"fmt"
 
+	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/socket/plugin"
@@ -71,12 +72,12 @@ func (s *Stack) InterfaceIDs() []int32 {
 }
 
 // AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+func (s *Stack) AddInterfaceAddr(ctx context.Context, idx int32, addr inet.InterfaceAddr) error {
 	return linuxerr.EACCES
 }
 
 // RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
-func (s *Stack) RemoveInterfaceAddr(int32, inet.InterfaceAddr) error {
+func (s *Stack) RemoveInterfaceAddr(context.Context, int32, inet.InterfaceAddr) error {
 	return linuxerr.EACCES
 }
 

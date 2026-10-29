@@ -20,10 +20,7 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
-	"z.gfire.dev/gvx/pkg/abi/linux"
-	"z.gfire.dev/gvx/pkg/bpf"
 	"z.gfire.dev/gvx/pkg/log"
-	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform/systrap/sysmsg"
@@ -97,91 +94,4 @@ func (p *sysmsgThread) Debugf(format string, v ...any) {
 	msg := p.msg
 	postfix := fmt.Sprintf(": %s", msg)
 	p.thread.Debugf(format+postfix, v...)
-}
-
-func sysmsgSyscallNotifyRules() []bpf.Instruction {
-	rules := []seccomp.RuleSet{
-		{
-			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-				unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
-			}),
-			Action: seccomp.UserNotify,
-		},
-	}
-	program := &seccomp.Program{
-		RuleSets: rules,
-		Options: seccomp.ProgramOptions{
-			DefaultAction: seccomp.Allow,
-			BadArchAction: seccomp.Allow,
-		},
-	}
-	instrs, _, err := program.Build()
-	if err != nil {
-		panic(fmt.Sprintf("failed to build rules for sysmsg threads: %v", err))
-	}
-	return instrs
-}
-
-func sysmsgThreadRules(stubStart uintptr) []bpf.Instruction {
-	var rules []seccomp.RuleSet
-	rules = appendSysThreadArchSeccompRules(rules)
-	rules = append(rules, []seccomp.RuleSet{
-		// Allow instructions from the sysmsg code stub, which is limited by one page.
-		{
-			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-				unix.SYS_FUTEX: seccomp.Or{
-					seccomp.PerArg{
-						seccomp.GreaterThan(stubStart),
-						seccomp.EqualTo(linux.FUTEX_WAKE),
-						seccomp.EqualTo(1),
-						seccomp.EqualTo(0),
-						seccomp.EqualTo(0),
-						seccomp.EqualTo(0),
-						seccomp.GreaterThan(stubStart), // rip
-					},
-					seccomp.PerArg{
-						seccomp.GreaterThan(stubStart),
-						seccomp.EqualTo(linux.FUTEX_WAIT),
-						seccomp.AnyValue{},
-						seccomp.EqualTo(0),
-						seccomp.EqualTo(0),
-						seccomp.EqualTo(0),
-						seccomp.GreaterThan(stubStart), // rip
-					},
-				},
-				unix.SYS_RT_SIGRETURN: seccomp.PerArg{
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.GreaterThan(stubStart), // rip
-				},
-				unix.SYS_SCHED_YIELD: seccomp.PerArg{
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.GreaterThan(stubStart), // rip
-				},
-			}),
-			Action: seccomp.Allow,
-		},
-	}...)
-	program := &seccomp.Program{
-		RuleSets: rules,
-		Options: seccomp.ProgramOptions{
-			DefaultAction: seccomp.Trap,
-			BadArchAction: seccomp.Trap,
-		},
-	}
-	instrs, _, err := program.Build()
-	if err != nil {
-		panic(fmt.Sprintf("failed to build rules for sysmsg threads: %v", err))
-	}
-
-	return instrs
 }

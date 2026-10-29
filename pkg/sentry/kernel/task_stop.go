@@ -107,13 +107,17 @@ func (t *Task) beginInternalStop(s TaskStop) {
 	t.beginInternalStopLocked(s)
 }
 
-// Preconditions: Same as beginInternalStop, plus:
-//   - The signal mutex must be locked.
+// Preconditions: Same as beginInternalStop.
+//
+// +checklocks:t.tg.signalHandlers.mu
 func (t *Task) beginInternalStopLocked(s TaskStop) {
 	if t.stop != nil {
 		panic(fmt.Sprintf("Attempting to enter internal stop %#v when already in internal stop %#v", s, t.stop))
 	}
 	t.Debugf("Entering internal stop %#v", s)
+	// Linux filters a restart_syscall that follows a group stop or ptrace
+	// stop, so an internal stop abandons a checkpoint-armed bypass.
+	t.bypassSeccompRestartSyscall = false
 	t.stop = s
 	t.beginStopLocked()
 }
@@ -126,9 +130,9 @@ func (t *Task) beginInternalStopLocked(s TaskStop) {
 // t.stop, which is why there is no endInternalStop that locks the signal mutex
 // for you.
 //
-// Preconditions:
-//   - The signal mutex must be locked.
-//   - The task must be in an internal stop (i.e. t.stop != nil).
+// Precondition: The task must be in an internal stop (i.e. t.stop != nil).
+//
+// +checklocks:t.tg.signalHandlers.mu
 func (t *Task) endInternalStopLocked() {
 	if t.stop == nil {
 		panic("Attempting to leave non-existent internal stop")

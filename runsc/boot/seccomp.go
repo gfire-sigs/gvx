@@ -22,7 +22,6 @@ import (
 	"fmt"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-
 	"z.gfire.dev/gvx/pkg/bpf"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sync"

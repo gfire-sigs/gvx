@@ -64,6 +64,9 @@ const (
 // by the task goroutine while it is running. The task goroutine does not
 // require synchronization to read or write these fields.
 //
+// A task's Kernel and ThreadGroup belong to the same TaskSet.
+//
+// +checklocksalias:tg.pidns.owner.mu=k.tasks.mu
 // +stateify savable
 type Task struct {
 	taskNode
@@ -99,6 +102,18 @@ type Task struct {
 	//
 	// haveSyscallReturn is exclusive to the task goroutine.
 	haveSyscallReturn bool
+
+	// bypassSeccompRestartSyscall causes the next restart_syscall to skip
+	// seccomp filtering. It is armed by Kernel.SaveTo, while the kernel is
+	// paused, for a task checkpointed with ERESTART_RESTARTBLOCK pending (see
+	// armSeccompRestartSyscallBypass), and is saved with the task. It is
+	// cleared when consumed, when a signal handler is delivered, or when the
+	// task begins an internal stop.
+	//
+	// bypassSeccompRestartSyscall is exclusive to the task goroutine, except
+	// that armSeccompRestartSyscallBypass writes it while the kernel is
+	// paused.
+	bypassSeccompRestartSyscall bool
 
 	// interruptChan is notified whenever the task goroutine is interrupted
 	// (usually by a pending signal). interruptChan is effectively a condition
@@ -956,14 +971,16 @@ func (t *Task) SetOOMScoreAdj(adj int32) error {
 	return nil
 }
 
-// KUID returns t's kuid.
+// KUID implements tcpip.PacketOwner.KUID. Like Linux's netfilter owner match,
+// it uses the filesystem UID.
 func (t *Task) KUID() uint32 {
-	return uint32(t.Credentials().EffectiveKUID)
+	return uint32(t.Credentials().FilesystemKUID)
 }
 
-// KGID returns t's kgid.
+// KGID implements tcpip.PacketOwner.KGID. Like Linux's netfilter owner match,
+// it uses the filesystem GID.
 func (t *Task) KGID() uint32 {
-	return uint32(t.Credentials().EffectiveKGID)
+	return uint32(t.Credentials().FilesystemKGID)
 }
 
 // SetKcov sets the kcov instance associated with t.

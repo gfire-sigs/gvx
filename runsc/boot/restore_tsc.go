@@ -1,6 +1,6 @@
 //go:build linux
 
-// Copyright 2021 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package systrap
+package boot
 
-import "z.gfire.dev/gvx/pkg/seccomp"
+import (
+	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/sentry/time"
+)
 
-func appendSysThreadArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet {
-	return rules
+// sampleHostTSCRealtime pairs a raw host TSC value with CLOCK_REALTIME by
+// reading both directly.
+func sampleHostTSCRealtime() (uint64, uint64, bool) {
+	cycle, realtime, err := time.HostTSCRealtime()
+	if err != nil {
+		log.Warningf("Failed to sample host TSC for TSC offset: %v", err)
+		return 0, 0, false
+	}
+	return uint64(cycle), uint64(realtime), true
 }

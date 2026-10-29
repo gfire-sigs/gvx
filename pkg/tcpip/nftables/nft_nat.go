@@ -20,7 +20,6 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/syserr"
-
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"

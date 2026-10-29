@@ -30,7 +30,6 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/context"
@@ -66,8 +65,16 @@ import (
 	_ "z.gfire.dev/gvx/pkg/sentry/platform/platforms" // register all platforms.
 	"z.gfire.dev/gvx/pkg/sentry/seccheck"
 	pb "z.gfire.dev/gvx/pkg/sentry/seccheck/points/points_go_proto"
+	"z.gfire.dev/gvx/pkg/sentry/socket/hostinet" // Top-level inet provider.
 	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink" // Register supported socket providers.
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/netfilter"
+	rdmanetlink "z.gfire.dev/gvx/pkg/sentry/socket/netlink/rdma"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/route"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/uevent"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netstack" // Top-level inet provider.
 	"z.gfire.dev/gvx/pkg/sentry/socket/plugin"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/unix"
 	"z.gfire.dev/gvx/pkg/sentry/time"
 	"z.gfire.dev/gvx/pkg/sentry/uniqueid"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
@@ -92,22 +99,10 @@ import (
 	"z.gfire.dev/gvx/runsc/boot/filter"
 	pf "z.gfire.dev/gvx/runsc/boot/portforward"
 	"z.gfire.dev/gvx/runsc/boot/pprof"
+	"z.gfire.dev/gvx/runsc/boot/sentryapi"
 	"z.gfire.dev/gvx/runsc/config"
 	"z.gfire.dev/gvx/runsc/profile"
 	"z.gfire.dev/gvx/runsc/specutils"
-
-	// Top-level inet providers.
-	"z.gfire.dev/gvx/pkg/sentry/socket/hostinet"
-	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
-
-	// Include other supported socket providers.
-	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink"
-	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/netfilter"
-	rdmanetlink "z.gfire.dev/gvx/pkg/sentry/socket/netlink/rdma"
-	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/route"
-	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/uevent"
-	_ "z.gfire.dev/gvx/pkg/sentry/socket/unix"
-	"z.gfire.dev/gvx/runsc/boot/sentryapi"
 )
 
 type containerInfo struct {
@@ -375,6 +370,10 @@ type Loader struct {
 
 	// hostinetNetSNMPFile is the pre-opened /proc/net/snmp file for hostinet restore.
 	hostinetNetSNMPFile *os.File
+
+	// hostinetPortRange is read before restore installs seccomp filters. A nil
+	// value means no destination host configuration is awaiting transfer.
+	hostinetPortRange *[2]uint16
 }
 
 // noRootContainer is the state of a sandbox with no root container.
@@ -705,6 +704,7 @@ func New(args Args) (*Loader, error) {
 		fsSaveFDs:             args.FSSaveFDs,
 		fsSaveCheckpointGofer: args.FSSaveCheckpointGofer,
 	}
+	l.restoreDone = sync.NewCond(&l.mu)
 
 	if args.NumCPU == 0 {
 		args.NumCPU = runtime.NumCPU()
@@ -1042,9 +1042,12 @@ func New(args Args) (*Loader, error) {
 // +checklocks:l.mu
 func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 	if h, ok := s.(*hostinet.Stack); ok {
-		h.SetFiles(l.hostinetNetDevFile, l.hostinetNetSNMPFile)
-		l.hostinetNetDevFile = nil
-		l.hostinetNetSNMPFile = nil
+		if l.hostinetPortRange != nil {
+			h.SetHostConfig(l.hostinetNetDevFile, l.hostinetNetSNMPFile, *l.hostinetPortRange)
+			l.hostinetNetDevFile = nil
+			l.hostinetNetSNMPFile = nil
+			l.hostinetPortRange = nil
+		}
 		return nil
 	}
 
@@ -2692,29 +2695,6 @@ func unnamedContainerNumber(containerName string) (int, bool) {
 	}
 	n, err := strconv.Atoi(s)
 	return n, err == nil
-}
-
-// +checklocksexclude:l.mu
-func (l *Loader) getContainerSpec(containerName string) *specs.Spec {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.containerSpecs[containerName]
-}
-
-// SpecEnviron returns the environment variables for the given container from
-// the container spec it was created with.
-//
-// +checklocksexclude:l.mu
-func (l *Loader) SpecEnviron(containerName string) []string {
-	spec := l.getContainerSpec(containerName)
-	if spec == nil {
-		log.Warningf("Container spec not found for container %q", containerName)
-		return nil
-	}
-	if spec.Process == nil {
-		return nil
-	}
-	return spec.Process.Env
 }
 
 // +checklocksexclude:l.mu

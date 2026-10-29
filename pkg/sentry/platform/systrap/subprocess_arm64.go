@@ -24,7 +24,6 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
-	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform/systrap/sysmsg"
 )
@@ -157,12 +156,6 @@ func maybePatchSignalInfo(regs *arch.Registers, signalInfo *linux.SignalInfo) (p
 //
 //go:nosplit
 func enableCpuidFault() {
-}
-
-// appendArchSeccompRules append architecture specific seccomp rules when creating BPF program.
-// Ref attachedThread() for more detail.
-func appendArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet {
-	return rules
 }
 
 // probeSeccomp returns true if seccomp is run after ptrace notifications,

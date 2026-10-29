@@ -120,6 +120,7 @@ func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.
 	file := &regularFile{
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
+		huge:            fs.huge,
 	}
 	err := file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
 	if err != nil {
@@ -143,7 +144,7 @@ func newUnlinkedRegularFileDescription(ctx context.Context, creds *auth.Credenti
 		panic("tmpfs.newUnlinkedRegularFileDescription() called with non-tmpfs mount")
 	}
 
-	inode, err := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777, nil /* parentDir */)
+	inode, err := fs.newRegularFile(creds.FilesystemKUID, creds.FilesystemKGID, 0777, nil /* parentDir */)
 	if err != nil {
 		return nil, err
 	}
@@ -327,11 +328,26 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	mayHuge := rf.huge && rf.inode.fs.mf.HugepagesEnabled()
 
+	// Constrain allocation to required, rounded to the nearest
+	// faultAroundAlignment.
+	faultAroundAlignment := uint64(64 << 10) // 64 KB, matches Linux's default fault_around_pages
+	if mayHuge {
+		faultAroundAlignment = hostarch.HugePageSize
+	}
+	faultAroundMask := faultAroundAlignment - 1
+	fillRange := memmap.MappableRange{
+		Start: required.Start &^ faultAroundMask,
+		End:   required.End,
+	}
+	if fillEnd := (required.End + faultAroundMask) &^ faultAroundMask; fillRange.End < fillEnd { // no overflow
+		fillRange.End = fillEnd
+	}
+
 	rf.dataMu.Lock()
 	defer rf.dataMu.Unlock()
 
-	// Constrain translations to f.attr.Size (rounded up) to prevent
-	// translation to pages that may be concurrently truncated.
+	// Constrain both allocation and translation to f.attr.Size (rounded up) to
+	// avoid pages that may be concurrently truncated.
 	pgend := offsetPageEnd(int64(rf.size.RacyLoad()))
 	var beyondEOF bool
 	if required.End > pgend {
@@ -341,17 +357,13 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		beyondEOF = true
 		required.End = pgend
 	}
+	if fillRange.End > pgend {
+		fillRange.End = pgend
+	}
 	if optional.End > pgend {
 		optional.End = pgend
 	}
 
-	// fillRange bounds how far Translate allocates ("fills") ahead of the
-	// faulting page. It is kept small to bound speculative allocation against
-	// tmpfs size limits (see filesystem.accountPages): a fault that touches a
-	// hole must not commit an unbounded number of pages and prematurely exhaust
-	// the mount's size limit. This matches gofer.maxFillRange().
-	const maxFillBytes = 64 << 10 // 64 KiB
-	fillRange := maxOptionalRange(required, optional, maxFillBytes)
 	pagesToFill := rf.data.PagesToFill(required, fillRange)
 	if !rf.inode.fs.accountPages(pagesToFill) {
 		// If we can not accommodate pagesToFill pages, then retry with just

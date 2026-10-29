@@ -20,9 +20,8 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi"
 	"z.gfire.dev/gvx/pkg/abi/linux"
-	"z.gfire.dev/gvx/pkg/sentry/kernel"
-
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
 )
 
 func epollEvent(t *kernel.Task, eventAddr hostarch.Addr) string {

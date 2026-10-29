@@ -20,10 +20,9 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	slinux "z.gfire.dev/gvx/pkg/sentry/syscalls/linux"
-
-	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 // PollEventSet is the set of poll(2) event flags.

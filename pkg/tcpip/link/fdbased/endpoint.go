@@ -41,11 +41,11 @@ package fdbased
 
 import (
 	"fmt"
-	"runtime"
 
 	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/buffer"
+	"z.gfire.dev/gvx/pkg/gomaxprocs"
 	"z.gfire.dev/gvx/pkg/rawfile"
 	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/tcpip"
@@ -326,7 +326,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 			}
 		}
 		if opts.ProcessorsPerChannel == 0 {
-			opts.ProcessorsPerChannel = max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
+			opts.ProcessorsPerChannel = max(1, gomaxprocs.Base()/len(opts.FDs))
 		}
 
 		var isPacket bool
