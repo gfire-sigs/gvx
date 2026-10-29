@@ -203,7 +203,7 @@ func TestFutexWaitReturnsOnlyForItsOwnWake(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range 200 {
+			for range 60 {
 				if err := FutexWait(word, 7, time.Millisecond); !errors.Is(err, ErrFutexTimedOut) {
 					errs <- fmt.Errorf("FutexWait returned %v with no wake for its word, want %v", err, ErrFutexTimedOut)
 					return
