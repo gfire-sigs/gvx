@@ -75,9 +75,11 @@ import (
 )
 
 func init() {
+	logDest := io.Writer(os.Stderr)
 	if os.Getenv("GVX_DEBUG_LOG") == "" && os.Getenv("GVX_STRACE") == "" {
-		log.SetTarget(&log.Writer{Next: io.Discard})
+		logDest = io.Discard
 	}
+	log.SetTarget(&log.Writer{Next: engineFaultLog{next: logDest}})
 	if os.Getenv("GVX_DEBUG_LOG") == "2" {
 		log.SetLevel(log.Debug)
 	}
@@ -1083,6 +1085,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		return 1, fmt.Errorf("gvx: start Sentry kernel: %w", err)
 	}
 
+	_ = takeEngineFault()
 	doneCh := make(chan struct{})
 	go func() {
 		select {
@@ -1132,6 +1135,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 
 	ws := tg.ExitStatus()
+	if ws.Signaled() && ws.TerminationSignal() == linux.SIGKILL {
+		if cause := takeEngineFault(); cause != "" {
+			return 128 + int(linux.SIGKILL), engineFaultError(cause)
+		}
+	}
 	if ws.Signaled() {
 		return 128 + int(ws.TerminationSignal()), nil
 	}

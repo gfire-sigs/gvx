@@ -394,6 +394,9 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	}()
 	if rc.autoPlatform {
 		_, _ = fmt.Fprintf(stderr, "rungv: platform=%s\n", sb.PlatformName())
+		if reason := sb.FallbackReason(); reason != "" {
+			_, _ = fmt.Fprintf(stderr, "rungv: warning: the hardware hypervisor is not available, so the guest runs on %s, which is slower: %s\n", sb.PlatformName(), reason)
+		}
 	}
 	if rc.cfg.DisableHostLockdown {
 		_, _ = fmt.Fprintln(stderr, "rungv: warning: host lockdown disabled")

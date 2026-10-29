@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -80,7 +81,11 @@ func createStubImage(dir string) (*stubImage, error) {
 
 	// CREATE_NEW fails when the name exists, so the host never writes through a
 	// file or link that another process planted. The write handle shares nothing.
-	w, err := windows.CreateFile(path16, windows.GENERIC_WRITE, 0, nil, windows.CREATE_NEW,
+	sa, err := stubImageSecurity()
+	if err != nil {
+		return nil, err
+	}
+	w, err := windows.CreateFile(path16, windows.GENERIC_WRITE, 0, sa, windows.CREATE_NEW,
 		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		return nil, fmt.Errorf("create the stub image: %w", err)
@@ -122,6 +127,24 @@ func createStubImage(dir string) (*stubImage, error) {
 	}
 	img.path = canonical
 	return img, nil
+}
+
+// stubImageSecurity returns the security attributes of the image file. The stub
+// token carries restricting SIDs, and the kernel then checks every access twice:
+// once for the user and once for the restricting SIDs. The file therefore grants
+// read and execute to Everyone and to RESTRICTED, and full access to the user
+// and to SYSTEM. The DACL is protected, so the temporary directory adds nothing.
+func stubImageSecurity() (*windows.SecurityAttributes, error) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return nil, fmt.Errorf("read the user of the host: %w", err)
+	}
+	sddl := "D:P(A;;FA;;;" + user.User.Sid.String() + ")(A;;FA;;;SY)(A;;FRFX;;;WD)(A;;FRFX;;;RC)"
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return nil, fmt.Errorf("build the security descriptor of the stub image: %w", err)
+	}
+	return &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}, nil
 }
 
 // verify checks that the locked file is the file that the host wrote.

@@ -57,8 +57,9 @@ type Platform struct {
 	// images caches the headers of the files that guests map as code.
 	images imageCache
 
-	// cleanCode records read-only MemoryFile page addresses that were scanned
-	// and verified to require zero patches.
+	// cleanCode maps the address of a read-only MemoryFile page to the SHA-256
+	// digest of the bytes that a scan found to need zero patches. A page is
+	// clean only while its bytes still have that digest.
 	cleanCode sync.Map
 
 	// breakAddr is the address of ntdll!DbgBreakPoint, where a new guest
