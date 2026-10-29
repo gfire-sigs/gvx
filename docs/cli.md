@@ -204,3 +204,16 @@ Move an image to another host:
 rungv save -o alpine.tar alpine:3.20
 rungv load -i alpine.tar
 ```
+
+## 9. `rungv license`
+
+`rungv license` prints the license notices of the binary. The binary embeds the notice file `cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt`, and the command prints that file. The file covers the Go standard library, the gVisor code, and each third-party module that the binary links.
+
+The synopsis is `rungv license [-list]`. The command takes no other argument.
+
+| Flag | Meaning |
+| :--- | :--- |
+| none | Print the whole notice file. Each license text appears once, followed by the components that use it. |
+| `-list` | Print one line per component: the name, the version, and the SPDX identifier. |
+
+The command exits with 0 on success and with 2 when an argument is unexpected. The notice file is regenerated with `go run ./tools/licenses`. The command `go run ./tools/licenses -check` fails when the file or the README table is stale.
