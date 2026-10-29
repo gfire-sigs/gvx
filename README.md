@@ -248,7 +248,7 @@ Extracting Linux `.tar` layers onto Windows NTFS or case-insensitive macOS APFS 
 
 | Isolation Tier | File Count | Repository Paths | Upstream Merge Policy |
 | :--- | ---: | :--- | :--- |
-| **Tier 1: Additive Packages** | `510` | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/{whpx,hvf,hvcommon}`, `pkg/sentry/fsimpl/{chunkcache,hostfs,ext4lite}`, `e2e`, `tools/{upstream,shiminterop}`, `docs` | Owned exclusively by `gvx` (`0.0%` conflict rate with `upstream/go`). |
+| **Tier 1: Additive Packages** | `510` | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/{whpx,hvf,hvcommon}`, `pkg/sentry/fsimpl/{chunkcache,hostfs,ext4lite}`, `e2e`, `tools/{upstream,shiminterop,licenses}`, `docs` | Owned exclusively by `gvx` (`0.0%` conflict rate with `upstream/go`). |
 | **Tier 2: Sibling Host Files** | `142` | `*_{windows,darwin,xplat}*` files in `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/{erofs,fdnotifier,syserr,hostarch}`, `pkg/sentry/{kernel,mm,pgalloc,time,hostcpu}`, and `pkg/sentry/platform/systrap` | Placed beside unmodified `*_linux.go` files (`0.0%` conflict rate). |
 | **Tier 3: Build-Tag & Seam Patches** | `18 / 2507` (`0.72%`) | Allowlisted pure-Go files in `tools/upstream/buildtag_allowlist.txt` and minimal seam hooks (`< 1.0%` budget ceiling) | Re-applied by `go run ./tools/upstream -mode=retag`; `624` Linux-only fence tags (`25.57%` strict count) are tracked separately. |
 

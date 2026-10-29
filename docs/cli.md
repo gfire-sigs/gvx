@@ -27,6 +27,7 @@ Run `rungv help` to print this list.
 | `login` | Store the credentials of a registry. |
 | `logout` | Remove the credentials of a registry. |
 | `stub` | Probe the `systrap` engine of this host. |
+| `license` | Print the license texts of `gvx`, of its upstream code, and of the libraries in the binary. Section 9 describes it. |
 
 Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Flags go before the arguments. Every flag has a single-dash form, such as `-e`, and a double-dash form, such as `--env`. A cluster of one-letter flags, such as `-it`, works for `-i`, `-t`, `-d`, and `-P`.
 
