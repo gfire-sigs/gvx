@@ -237,13 +237,19 @@ const (
 	mitigationExtensionPointDisable     = uint64(1) << 32
 )
 
+// stubRestrictingSIDs are the restricting SIDs of the stub token: Everyone,
+// BUILTIN\Users, and RESTRICTED. The system files that a process needs to start
+// grant at least one of them.
+var stubRestrictingSIDs = []string{"S-1-1-0", "S-1-5-32-545", "S-1-5-12"}
+
 // buildStubToken returns the primary token of every stub: the token of the
-// host without privileges, at Low integrity.
+// host with restricting SIDs, without privileges, at Low integrity.
 //
 // WHY: a Low-integrity token cannot write to Medium objects or open most
 // processes. Dropping privileges removes SeDebugPrivilege and similar rights.
-// The stub needs no handle at all, so the token is the only identity that a
-// guest escape would inherit.
+// The restricting SIDs keep the token from reading the private files of the
+// user. The stub needs no handle at all, so the token is the only identity that
+// a guest escape would inherit.
 func buildStubToken() (windows.Token, confinement, error) {
 	var self windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(),
@@ -252,8 +258,23 @@ func buildStubToken() (windows.Token, confinement, error) {
 		return 0, 0, fmt.Errorf("OpenProcessToken: %w", err)
 	}
 	defer self.Close()
+	// The restricting SIDs make the kernel check each access a second time against
+	// these SIDs only. A file that only the user can read then stays closed to a
+	// stub that runs a system call of its own, because the user private files of
+	// the profile grant none of these SIDs. A token with no restricting SID checks
+	// the user and the groups of the user only, and Low integrity blocks writes
+	// but not reads.
+	var restrict []windows.SIDAndAttributes
+	for _, sddl := range stubRestrictingSIDs {
+		sid, err := windows.StringToSid(sddl)
+		if err != nil {
+			return 0, 0, fmt.Errorf("restricting SID %s: %w", sddl, err)
+		}
+		restrict = append(restrict, windows.SIDAndAttributes{Sid: sid})
+	}
 	var restricted windows.Token
-	r, _, e := procCreateRestrictedToken.Call(uintptr(self), disableMaxPrivilege, 0, 0, 0, 0, 0, 0, uintptr(unsafe.Pointer(&restricted)))
+	r, _, e := procCreateRestrictedToken.Call(uintptr(self), disableMaxPrivilege, 0, 0, 0, 0,
+		uintptr(len(restrict)), uintptr(unsafe.Pointer(&restrict[0])), uintptr(unsafe.Pointer(&restricted)))
 	if r == 0 {
 		return 0, 0, fmt.Errorf("CreateRestrictedToken: %w", e)
 	}
@@ -392,15 +413,7 @@ func (h *stubHostLoop) newEvents(pid uint32) (out eventHandles, err error) {
 // newStub creates one confined, suspended stub process and returns handles in
 // the Sentry process.
 func (h *stubHostLoop) newStub() (*stubHandles, error) {
-	img := h.exe
-	if h.image != nil {
-		img = h.image.path
-	}
-	cmd, err := windows.UTF16PtrFromString(`"` + img + `" stub`)
-	if err != nil {
-		return nil, err
-	}
-	pi, level, err := h.createProcess(cmd)
+	pi, level, err := h.startStubProcess()
 	if err != nil {
 		return nil, err
 	}
@@ -448,6 +461,41 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 	h.procs[pi.ProcessId] = pi.Process
 	keepProc = true
 	return &stubHandles{pid: pi.ProcessId, tid: pi.ThreadId, proc: proc, thread: thread, level: level}, nil
+}
+
+// startStubProcess creates the suspended process of one stub. It runs the small
+// stub image. A policy of the machine can refuse that image: AppLocker, Windows
+// Defender Application Control, or an endpoint product can block a small
+// executable that nobody signed. When the creation fails, the host drops the
+// image and runs a copy of its own executable for this stub and for every later
+// one.
+func (h *stubHostLoop) startStubProcess() (*windows.ProcessInformation, confinement, error) {
+	if h.image == nil {
+		return h.createProcessFor(h.exe)
+	}
+	pi, level, err := h.createProcessFor(h.image.path)
+	if err == nil {
+		return pi, level, nil
+	}
+	if traceEvents {
+		tracef("stub host: the stub image %s did not start, the stubs run the executable of the host: %v", h.image.path, err)
+	}
+	h.image.close()
+	h.image = nil
+	pi, level, exeErr := h.createProcessFor(h.exe)
+	if exeErr != nil {
+		return nil, 0, fmt.Errorf("%w (the stub image failed first: %v)", exeErr, err)
+	}
+	return pi, level, nil
+}
+
+// createProcessFor starts the suspended stub from the executable at path.
+func (h *stubHostLoop) createProcessFor(path string) (*windows.ProcessInformation, confinement, error) {
+	cmd, err := windows.UTF16PtrFromString(`"` + path + `" stub`)
+	if err != nil {
+		return nil, 0, err
+	}
+	return h.createProcess(cmd)
 }
 
 // createProcess starts the suspended stub with the strongest mitigation set
@@ -537,9 +585,18 @@ type stubHost struct {
 	cmd *exec.Cmd
 	in  io.WriteCloser
 	out io.ReadCloser
+	// wait is a handle to the host that grants no more than the wait on its exit
+	// and the read of its exit code. spawnStubHost releases the full access
+	// handle of cmd when the host is ready, so a compromised Sentry cannot write
+	// the memory of the host, which runs outside the lockdown.
+	wait windows.Handle
 	// level is the confinement that the host reported for its last stub.
 	level confinement
 }
+
+// hostExitTimeoutMs is the time that close waits for the host to exit after the
+// pipe closes. The host kills its stubs first, and that takes a few milliseconds.
+const hostExitTimeoutMs = 10000
 
 // spawnStubHost starts the host process, waits until it is ready, and gives it
 // a handle to the debug object.
@@ -606,7 +663,28 @@ func spawnStubHost(debug windows.Handle) (*stubHost, error) {
 		_ = h.close()
 		return nil, fmt.Errorf("the stub host did not accept the debug object: %w", err)
 	}
+	if err := h.dropFullAccess(); err != nil {
+		_ = h.close()
+		return nil, err
+	}
 	return h, nil
+}
+
+// dropFullAccess replaces the full access handle of the host process with a
+// handle that can wait for the exit. The host starts before the lockdown, so it
+// has the user token and the user rights. Any handle with write access to its
+// memory would let a compromised Sentry run code outside the lockdown.
+func (h *stubHost) dropFullAccess() error {
+	wait, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(h.cmd.Process.Pid))
+	if err != nil {
+		return fmt.Errorf("open the stub host for waiting: %w", err)
+	}
+	if err := h.cmd.Process.Release(); err != nil {
+		_ = windows.CloseHandle(wait)
+		return fmt.Errorf("release the stub host handle: %w", err)
+	}
+	h.wait = wait
+	return nil
 }
 
 // newStub asks the host for one suspended stub process.
@@ -699,11 +777,26 @@ func (h *stubHost) release(pid uint32) {
 // kills every stub that is still alive.
 func (h *stubHost) close() error {
 	_ = h.in.Close()
-	err := h.cmd.Wait()
-	_ = h.out.Close()
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return nil
+	defer h.out.Close()
+	if h.wait == 0 {
+		// The host did not finish its start, so the full access handle is still open.
+		err := h.cmd.Wait()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return nil
+		}
+		return err
 	}
-	return err
+	defer func() {
+		_ = windows.CloseHandle(h.wait)
+		h.wait = 0
+	}()
+	ev, err := windows.WaitForSingleObject(h.wait, hostExitTimeoutMs)
+	if err != nil {
+		return fmt.Errorf("wait for the stub host: %w", err)
+	}
+	if ev != windows.WAIT_OBJECT_0 {
+		return errors.New("the stub host did not exit after its pipe closed")
+	}
+	return nil
 }
