@@ -240,7 +240,13 @@ const (
 // stubRestrictingSIDs are the restricting SIDs of the stub token: Everyone,
 // BUILTIN\Users, and RESTRICTED. The system files that a process needs to start
 // grant at least one of them.
-var stubRestrictingSIDs = []string{"S-1-1-0", "S-1-5-32-545", "S-1-5-12"}
+var stubRestrictingSIDs = []string{stubPrivateSID, "S-1-1-0", "S-1-5-32-545", "S-1-5-12"}
+
+// stubPrivateSID is the Null SID. No token holds it, so no DACL grants it unless
+// gvx does. The stub token lists it as a restricting SID and its default DACL
+// grants it full access. The stub can then open the objects that it creates,
+// such as its own process and threads, and no other process can.
+const stubPrivateSID = "S-1-0-0"
 
 // buildStubToken returns the primary token of every stub: the token of the
 // host with restricting SIDs, without privileges, at Low integrity.
@@ -287,6 +293,10 @@ func buildStubTokenWith(restrictingSIDs []string) (windows.Token, confinement, e
 	if r == 0 {
 		return 0, 0, fmt.Errorf("CreateRestrictedToken: %w", e)
 	}
+	if err := setStubDefaultDacl(restricted, self); err != nil {
+		restricted.Close()
+		return 0, 0, err
+	}
 	if err := removeAllStubPrivileges(restricted); err != nil {
 		restricted.Close()
 		return 0, 0, err
@@ -304,6 +314,48 @@ func buildStubTokenWith(restrictingSIDs []string) (windows.Token, confinement, e
 		return 0, 0, fmt.Errorf("SetTokenInformation(TokenIntegrityLevel): %w", err)
 	}
 	return restricted, confineToken, nil
+}
+
+// setStubDefaultDacl sets the default DACL of the stub token. The DACL gives the
+// process and the thread objects of the stub to the user, to SYSTEM, and to the
+// private restricting SID. A restricted token passes an access check only when
+// a restricting SID is also granted, so without the last entry the stub could
+// not open its own process and the loader would fail with 0xC0000142.
+func setStubDefaultDacl(token, parent windows.Token) error {
+	user, err := parent.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("read the user of the host token: %w", err)
+	}
+	system, err := windows.StringToSid("S-1-5-18")
+	if err != nil {
+		return err
+	}
+	private, err := windows.StringToSid(stubPrivateSID)
+	if err != nil {
+		return err
+	}
+	var entries []windows.EXPLICIT_ACCESS
+	for _, sid := range []*windows.SID{user.User.Sid, system, private} {
+		entries = append(entries, windows.EXPLICIT_ACCESS{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.NO_INHERITANCE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_UNKNOWN,
+				TrusteeValue: windows.TrusteeValueFromSID(sid),
+			},
+		})
+	}
+	acl, err := windows.ACLFromEntries(entries, nil)
+	if err != nil {
+		return fmt.Errorf("build the default DACL of the stub token: %w", err)
+	}
+	info := struct{ acl *windows.ACL }{acl}
+	if err := windows.SetTokenInformation(token, windows.TokenDefaultDacl, (*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		return fmt.Errorf("SetTokenInformation(TokenDefaultDacl): %w", err)
+	}
+	return nil
 }
 
 // removeAllStubPrivileges deletes every privilege from token with

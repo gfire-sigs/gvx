@@ -24,17 +24,12 @@ func TestDiagRestrictedToken(t *testing.T) {
 	}
 	t.Logf("user %s logon %s", user.User.Sid.String(), logon)
 	sets := map[string][]string{
-		"none":                      nil,
-		"everyone":                  {"S-1-1-0"},
-		"users":                     {"S-1-5-32-545"},
-		"restricted":                {"S-1-5-12"},
-		"everyone+users+restricted": {"S-1-1-0", "S-1-5-32-545", "S-1-5-12"},
-		"+authenticated":            {"S-1-1-0", "S-1-5-32-545", "S-1-5-12", "S-1-5-11"},
-		"+interactive+network":      {"S-1-1-0", "S-1-5-32-545", "S-1-5-12", "S-1-5-11", "S-1-5-4", "S-1-2-0"},
-		"+logon":                    {"S-1-1-0", "S-1-5-32-545", "S-1-5-12", logon},
-		"+admins":                   {"S-1-1-0", "S-1-5-32-545", "S-1-5-12", "S-1-5-32-544"},
-		"+appPackages":              {"S-1-1-0", "S-1-5-32-545", "S-1-5-12", "S-1-15-2-1"},
-		"+system":                   {"S-1-1-0", "S-1-5-32-545", "S-1-5-12", "S-1-5-18"},
+		"null":                      {"S-1-0-0"},
+		"null+restricted":           {"S-1-0-0", "S-1-5-12"},
+		"null+everyone+users":       {"S-1-0-0", "S-1-1-0", "S-1-5-32-545"},
+		"null+everyone+users+restr": {"S-1-0-0", "S-1-1-0", "S-1-5-32-545", "S-1-5-12"},
+		"null+users":                {"S-1-0-0", "S-1-5-32-545"},
+		"null+everyone":             {"S-1-0-0", "S-1-1-0"},
 	}
 	dirs := map[string]string{"tempdir": t.TempDir(), "workdir": filepath.Join(mustGetwd(t), ".diag")}
 	_ = os.MkdirAll(dirs["workdir"], 0o755)
