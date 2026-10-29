@@ -27,6 +27,7 @@ Run `rungv help` to print this list.
 | `login` | Store the credentials of a registry. |
 | `logout` | Remove the credentials of a registry. |
 | `stub` | Probe the `systrap` engine of this host. |
+| `license` | Print the license texts of `gvx`, of its upstream code, and of the libraries in the binary. Section 9 describes it. |
 
 Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Flags go before the arguments. Every flag has a single-dash form, such as `-e`, and a double-dash form, such as `--env`. A cluster of one-letter flags, such as `-it`, works for `-i`, `-t`, `-d`, and `-P`.
 
@@ -212,3 +213,16 @@ Move an image to another host:
 rungv save -o alpine.tar alpine:3.20
 rungv load -i alpine.tar
 ```
+
+## 9. `rungv license`
+
+`rungv license` prints the license notices of the binary. The binary embeds the notice file `cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt`, and the command prints that file. The file covers the Go standard library, the gVisor code, and each third-party module that the binary links.
+
+The synopsis is `rungv license [-list]`. The command takes no other argument.
+
+| Flag | Meaning |
+| :--- | :--- |
+| none | Print the whole notice file. Each license text appears once, followed by the components that use it. |
+| `-list` | Print one line per component: the name, the version, and the SPDX identifier. |
+
+The command exits with 0 on success and with 2 when an argument is unexpected. The notice file is regenerated with `go run ./tools/licenses`. The command `go run ./tools/licenses -check` fails when the file or the README table is stale.
