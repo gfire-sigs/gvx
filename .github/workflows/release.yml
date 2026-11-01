@@ -1,0 +1,164 @@
+name: release
+
+# A tag v* builds rungv for the five targets and publishes a GitHub release
+# with the CHANGELOG.md section of the tag as notes. A tag with a hyphen, such
+# as v0.1.0-rc.1, publishes a pre-release. Each release carries a SLSA v1
+# build provenance attestation for every archive. A pull request that changes
+# this file, and a manual run, execute every step except the publication.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [.github/workflows/release.yml]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, runner: ubuntu-24.04 }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04 }
+          - { goos: windows, goarch: amd64, runner: ubuntu-24.04 }
+          - { goos: windows, goarch: arm64, runner: ubuntu-24.04 }
+          # The hypervisor entitlement needs codesign, which only macOS has.
+          - { goos: darwin, goarch: arm64, runner: macos-15 }
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      # The upstream systrap platform hangs while it starts in a cgo build.
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Go records the tag as the module version only when the checkout is
+      # clean and the tag names HEAD. The check stops a release that would
+      # print a pseudo-version from rungv version.
+      - name: Build rungv
+        shell: bash
+        run: |
+          name="rungv-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}"
+          [ "$GITHUB_REF_TYPE" = tag ] || name="rungv-dryrun-${GOOS}-${GOARCH}"
+          exe=rungv
+          [ "$GOOS" = windows ] && exe=rungv.exe
+          mkdir -p "dist/$name"
+          go build -trimpath -o "dist/$name/$exe" ./cmd/rungv
+          if [ "$GOOS" = darwin ]; then
+            codesign --sign - --entitlements entitlements.plist --force "dist/$name/$exe"
+            codesign --display --entitlements - "dist/$name/$exe" | grep -q com.apple.security.hypervisor
+          fi
+          version=$(go version -m "dist/$name/$exe" | awk '$1 == "mod" { print $3 }')
+          echo "module version: $version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "module version $version differs from tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          if [ "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" = "$GOOS/$GOARCH" ]; then
+            "dist/$name/$exe" version
+          fi
+          cp LICENSE README.md cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt "dist/$name/"
+          cd dist
+          if [ "$GOOS" = windows ]; then
+            zip -qr "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      # Sigstore signs the attestation with the OIDC token of this run.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      # A pull request from a fork gets no OIDC token, so the attestation
+      # steps skip it. The verification uses the same command as README.md
+      # Section 2.4, so a dry run proves that procedure.
+      - name: Attest build provenance
+        id: attest
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/rungv-*
+      - name: Verify provenance and add the bundle
+        if: steps.attest.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          name=rungv-dryrun
+          [ "$GITHUB_REF_TYPE" = tag ] && name="rungv-$GITHUB_REF_NAME"
+          for archive in dist/rungv-*; do
+            gh attestation verify "$archive" --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" --deny-self-hosted-runners
+          done
+          cp "$BUNDLE" "dist/$name.sigstore.json"
+      # The heading of the section starts with "## [TAG]". A dry run reads
+      # the first section, so that it verifies the same parser. A
+      # relative link resolves against the release page, so the step points
+      # each one at the file in the built commit.
+      - name: Extract release notes
+        run: |
+          heading="## ["
+          [ "$GITHUB_REF_TYPE" = tag ] && heading="## [$GITHUB_REF_NAME]"
+          awk -v h="$heading" '
+            index($0, h) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > notes.md || { echo "CHANGELOG.md has no section $heading" >&2; exit 1; }
+          sed -i -E "s#\]\(([^):]+)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/\1)#g" notes.md
+          test -s notes.md
+          cat notes.md
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md "${flags[@]}" dist/*

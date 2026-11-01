@@ -47,29 +47,41 @@ func runChild(t *testing.T, name string, env ...string) (string, error) {
 // ones that Apply probes. Those return EPERM, as the filter of pkg/gvx does.
 // With allowDirfdOpen, an open relative to a directory descriptor stays allowed,
 // as it does for a workspace.
+//
+// The Go runtime can start a thread after the filter is installed. The filter
+// therefore allows the thread flags of the runtime clone call and of the libc
+// pthread_create call. The runtime adds CLONE_SETTLS on amd64 only. The filter
+// also allows clone3, which glibc pthread_create calls in a cgo build, as the
+// cgo rules of runsc do. An EPERM from clone3 aborts the process, because
+// glibc falls back to clone only after ENOSYS.
 func installTestFilter(allowDirfdOpen bool) func() error {
 	return func() error {
 		rejected := seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			unix.SYS_EXECVE:   seccomp.MatchAll{},
 			unix.SYS_EXECVEAT: seccomp.MatchAll{},
 			unix.SYS_CLONE:    seccomp.MatchAll{},
-			unix.SYS_CLONE3:   seccomp.MatchAll{},
 			unix.SYS_SOCKET:   seccomp.MatchAll{},
 			unix.SYS_OPENAT:   seccomp.MatchAll{},
 		})
+		const runtimeThread = unix.CLONE_VM |
+			unix.CLONE_FS |
+			unix.CLONE_FILES |
+			unix.CLONE_SIGHAND |
+			unix.CLONE_SYSVSEM |
+			unix.CLONE_THREAD
+		const libcThread = runtimeThread |
+			unix.CLONE_SETTLS |
+			unix.CLONE_PARENT_SETTID |
+			unix.CLONE_CHILD_CLEARTID
 		sets := []seccomp.RuleSet{
 			{
 				Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-					unix.SYS_CLONE: seccomp.PerArg{seccomp.EqualTo(
-						unix.CLONE_VM |
-							unix.CLONE_FS |
-							unix.CLONE_FILES |
-							unix.CLONE_SIGHAND |
-							unix.CLONE_SYSVSEM |
-							unix.CLONE_SETTLS |
-							unix.CLONE_PARENT_SETTID |
-							unix.CLONE_CHILD_CLEARTID |
-							unix.CLONE_THREAD)},
+					unix.SYS_CLONE: seccomp.Or{
+						seccomp.PerArg{seccomp.EqualTo(runtimeThread)},
+						seccomp.PerArg{seccomp.EqualTo(runtimeThread | unix.CLONE_SETTLS)},
+						seccomp.PerArg{seccomp.EqualTo(libcThread)},
+						seccomp.PerArg{seccomp.EqualTo(libcThread | unix.CLONE_DETACHED)},
+					},
 				}),
 				Action: seccomp.Allow,
 			},

@@ -138,6 +138,7 @@ func TestExecuteCLIDispatch(t *testing.T) {
 	}{
 		{"no arguments", nil, 2, "", "Usage"},
 		{"help", []string{"help"}, 0, "Usage", ""},
+		{"version flag is not a run flag", []string{"--version"}, 0, "rungv ", ""},
 		{"unknown subcommand", []string{"bogus"}, 2, "", "unknown subcommand"},
 		{"pull without target", []string{"pull"}, 2, "", "missing <image-or-archive>"},
 	} {
