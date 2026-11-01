@@ -48,7 +48,7 @@ const (
 
 	// testHiddenFeatures are features of testXsaveCapability whose state the
 	// Sentry does not implement.
-	testHiddenFeatures = xsaveFeatMpx | xsaveFeatXsaveSupervisor | xsaveFeatXcr1 | xsaveFeatXfd |
+	testHiddenFeatures = xsaveFeatMpx | xsaveFeatXcr1 | xsaveFeatXfd |
 		xsaveFeatAmxTile | xsaveFeatAmxBf16 | xsaveFeatAmxInt8 | xsaveFeatAmxFp16 |
 		xsaveFeatAvx10_1_256 | xsaveFeatAvx10_1_512
 )
@@ -78,7 +78,7 @@ func TestSelectGuestVector(t *testing.T) {
 			fpLimit:    testFPLimit,
 			xcr0:       xcr0Legacy | xcr0AVX | xcr0AVX512,
 			imageSize:  2688,
-			present:    xsaveFeatXsave | xsaveFeatAvx | xsaveFeatAvx2 | xsaveFeatFma | xsaveFeatAvx512 | xsaveFeatAvx512VL | xsaveFeatVaes | xsaveFeatGfni,
+			present:    xsaveFeatXsave | xsaveFeatXsaveComp | xsaveFeatXsaveSupervisor | xsaveFeatAvx | xsaveFeatAvx2 | xsaveFeatFma | xsaveFeatAvx512 | xsaveFeatAvx512VL | xsaveFeatVaes | xsaveFeatGfni,
 			absent:     testHiddenFeatures,
 		},
 		{
@@ -118,7 +118,7 @@ func TestSelectGuestVector(t *testing.T) {
 			fpLimit:    testFPLimit,
 			xcr0:       xcr0Legacy,
 			imageSize:  576,
-			present:    xsaveFeatXsave | xsaveFeatGfni,
+			present:    xsaveFeatXsave | xsaveFeatXsaveComp | xsaveFeatXsaveSupervisor | xsaveFeatGfni,
 			absent:     xsaveAVXFeatures | xsaveAVX512Features,
 			clearProc:  procFeatXop | procFeatFma4 | procFeatF16C,
 		},

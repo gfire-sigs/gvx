@@ -65,12 +65,12 @@ func TestGuestFeatureSetMatchesTheAVX512Partition(t *testing.T) {
 		t.Errorf("ValidXCR0Mask = %#x, want the guest XCR0 %#x: signal frames and sigreturn would name other components", got, p.vec.xcr0)
 	}
 	flags := cpuinfoFlags(gfs)
-	for _, want := range []string{"avx", "avx2", "fma", "f16c", "avx512f", "avx512vl", "vaes", "xsaveopt"} {
+	for _, want := range []string{"avx", "avx2", "fma", "f16c", "avx512f", "avx512vl", "vaes", "xsaveopt", "xsaves"} {
 		if !strings.Contains(flags, " "+want+" ") {
 			t.Errorf("/proc/cpuinfo flags lack %q, which the guest can use: %s", want, flags)
 		}
 	}
-	for _, hidden := range []string{"mpx", "pku", "ospke", "xsaves"} {
+	for _, hidden := range []string{"mpx", "pku", "ospke"} {
 		if strings.Contains(flags, " "+hidden+" ") {
 			t.Errorf("/proc/cpuinfo flags list %q, which the guest cannot use: %s", hidden, flags)
 		}

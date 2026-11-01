@@ -99,11 +99,16 @@ const (
 		xsaveFeatAvx512Fp16
 
 	// xsaveKept lists the features that a guest may see. The platform saves
-	// x87, SSE, AVX, and AVX-512 state. MPX, AMX, XFD, XCR1, and the
-	// supervisor state stay hidden: the Sentry implements none of them. AVX10
-	// stays hidden because the Sentry does not know CPUID leaf 0x24.
-	xsaveKept = xsaveFeatXsave | xsaveFeatXsaveopt | xsaveFeatXsaveComp | xsaveFeatGfni |
-		xsaveAVXFeatures | xsaveAVX512Features
+	// x87, SSE, AVX, and AVX-512 state. MPX, AMX, XFD, and XCR1 stay hidden:
+	// the Sentry implements none of them. AVX10 stays hidden because the
+	// Sentry does not know CPUID leaf 0x24.
+	//
+	// WHvSetupPartition returns HV_STATUS_INVALID_PARAMETER when the property
+	// drops XsaveComp or XsaveSupervisor that the capability reports (seen on
+	// AMD and Intel windows-latest runners). Both stay: XSAVEC saves only the
+	// XCR0 components, and XSAVES runs only at CPL 0.
+	xsaveKept = xsaveFeatXsave | xsaveFeatXsaveopt | xsaveFeatXsaveComp | xsaveFeatXsaveSupervisor |
+		xsaveFeatGfni | xsaveAVXFeatures | xsaveAVX512Features
 
 	// procVEXFeatures are the ProcessorFeatures bits that need the AVX state.
 	procVEXFeatures = procFeatXop | procFeatFma4 | procFeatF16C

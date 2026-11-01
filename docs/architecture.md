@@ -343,7 +343,7 @@ A guest must never see a CPU feature that it cannot use. The Sentry derives `/pr
 
 | Backend | Guest CPUID or ID Registers | Sentry Feature Set |
 | :--- | :--- | :--- |
-| **`whpx` (`amd64`)** | One selection in `vector.go` sets the `ProcessorXsaveFeatures` property and XCR0. MPX, AMX, XFD, XCR1, AVX10, and supervisor state stay hidden. | `Platform.GuestFeatureSet` removes the hidden features and reports the guest XCR0 in CPUID leaf `0xD`. |
+| **`whpx` (`amd64`)** | One selection in `vector.go` sets the `ProcessorXsaveFeatures` property and XCR0. MPX, AMX, XFD, XCR1, and AVX10 stay hidden. Hyper-V rejects a partition without `XsaveComp` or `XsaveSupervisor`, so both stay. | `Platform.GuestFeatureSet` removes the hidden features and reports the guest XCR0 in CPUID leaf `0xD`. |
 | **`whpx` (`arm64`)** | `hvcommon.DefaultIDRegisters`. | `AT_HWCAP` holds only the host features that those registers also report. |
 | **`hvf`** | Host ID registers with the PAC, SVE, MTE, SME, and MPAM fields hidden. | `AT_HWCAP` comes from the `hw.optional` sysctl keys. |
 | **`systrap` (Windows)** | Host CPUID and host XCR0. The stub saves x87, SSE, AVX, and AVX-512 state. | Host feature set. |
