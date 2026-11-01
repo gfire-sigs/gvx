@@ -28,6 +28,7 @@ Run `rungv help` to print this list.
 | `logout` | Remove the credentials of a registry. |
 | `stub` | Probe the `systrap` engine of this host. |
 | `license` | Print the license texts of `gvx`, of its upstream code, and of the libraries in the binary. Section 9 describes it. |
+| `version` | Print the version, the source commit, and the Go toolchain of the binary. Section 10 describes it. |
 
 Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Flags go before the arguments. Every flag has a single-dash form, such as `-e`, and a double-dash form, such as `--env`. A cluster of one-letter flags, such as `-it`, works for `-i`, `-t`, `-d`, and `-P`.
 
@@ -226,3 +227,15 @@ The synopsis is `rungv license [-list]`. The command takes no other argument.
 | `-list` | Print one line per component: the name, the version, and the SPDX identifier. |
 
 The command exits with 0 on success and with 2 when an argument is unexpected. The notice file is regenerated with `go run ./tools/licenses`. The command `go run ./tools/licenses -check` fails when the file or the README table is stale.
+
+## 10. `rungv version`
+
+`rungv version` prints the build identity that the Go toolchain records in the binary. Include its output in every bug report. The synopsis is `rungv version`, and `rungv --version` is the same command.
+
+| Line | Content |
+| :--- | :--- |
+| `rungv VERSION` | The module version. A build of a clean tag checkout prints the tag, such as `v0.1.0-rc.1`. Another build prints a pseudo-version or `(devel)`. |
+| `commit SHA (TIME)` | The Git commit and its commit time. The word `modified` follows when the checkout had uncommitted changes. A build without Git metadata omits this line. |
+| `go VERSION OS/ARCH` | The Go toolchain and the target of the binary. |
+
+The command exits with 0 on success and with 2 when an argument is unexpected.
