@@ -53,7 +53,6 @@ const (
 	a64ExitOffMemGva     = 56
 	a64ExitOffMemGpa     = 64
 	a64ExitOffMemSyndrom = 72
-	a64ExitOffHvcImm     = 40
 )
 
 // exitKind classifies a WHV_RUN_VP_EXIT_CONTEXT for the run loop.
@@ -94,9 +93,6 @@ type exitInfo struct {
 	gpaUnmapped bool
 	write       bool
 	execute     bool
-
-	// hvcImmediate is the HVC immediate on arm64.
-	hvcImmediate uint16
 
 	// cpsr is the PSTATE of the guest at the exit on arm64.
 	cpsr uint64
@@ -154,11 +150,6 @@ func decodeExitA64(buf []byte) (exitInfo, error) {
 		reason: binary.LittleEndian.Uint32(buf[a64ExitOffReason:]),
 	}
 	switch e.reason {
-	case a64ExitHypercall:
-		e.kind = exitStub
-		e.pc = binary.LittleEndian.Uint64(buf[a64ExitOffHdrPc:])
-		e.cpsr = binary.LittleEndian.Uint64(buf[a64ExitOffHdrCpsr:])
-		e.hvcImmediate = binary.LittleEndian.Uint16(buf[a64ExitOffHvcImm:])
 	case a64ExitCanceled:
 		e.kind = exitCanceled
 	case a64ExitUnmappedGpa, a64ExitGpaIntercept:

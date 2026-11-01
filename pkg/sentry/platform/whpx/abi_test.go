@@ -68,19 +68,18 @@ func TestExitReasonsMatchTheHeader(t *testing.T) {
 		{"x64 Canceled", x64ExitCanceled, 0x2001}, {"x64 Unrecoverable", x64ExitUnrecoverable, 0x4},
 		{"arm64 UnmappedGpa", a64ExitUnmappedGpa, 0x80000000}, {"arm64 GpaIntercept", a64ExitGpaIntercept, 0x80000001},
 		{"arm64 Unrecoverable", a64ExitUnrecoverable, 0x80000021}, {"arm64 InvalidVpRegister", a64ExitInvalidVpRegister, 0x80000020},
-		{"arm64 Hypercall", a64ExitHypercall, 0x80000050}, {"arm64 Canceled", a64ExitCanceled, 0xFFFFFFFF},
+		{"arm64 Canceled", a64ExitCanceled, 0xFFFFFFFF},
 		{"capability Features", capCodeFeatures, 1}, {"capability HypervisorPresent", capCodeHypervisorPresent, 0},
-		{"property ProcessorCount", propCodeProcessorCount, 0x1FFF}, {"property ExtendedVmExits", propCodeExtendedVmExits, 1},
+		{"property ProcessorCount", propCodeProcessorCount, 0x1FFF},
 		{"map Read", mapFlagRead, 1}, {"map Write", mapFlagWrite, 2}, {"map Execute", mapFlagExecute, 4},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s is %#x, the header says %#x", c.name, c.got, c.want)
 		}
 	}
-	// Arm64Support follows ten other bits in WHV_CAPABILITY_FEATURES, and
-	// HypercallExit follows five bits in WHV_EXTENDED_VM_EXITS.
-	if featArm64Support != 1<<11 || extExitHypercall != 1<<5 {
-		t.Errorf("Arm64Support is %#x and HypercallExit is %#x", featArm64Support, extExitHypercall)
+	// Arm64Support follows ten other bits in WHV_CAPABILITY_FEATURES.
+	if featArm64Support != 1<<11 {
+		t.Errorf("Arm64Support is %#x", featArm64Support)
 	}
 }
 

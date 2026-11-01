@@ -137,7 +137,6 @@ const (
 	a64ExitInvalidVpRegister  uint32 = 0x80000020
 	a64ExitUnrecoverable      uint32 = 0x80000021
 	a64ExitUnsupportedFeature uint32 = 0x80000022
-	a64ExitHypercall          uint32 = 0x80000050
 	a64ExitSynicSint          uint32 = 0x80000062
 	a64ExitReset              uint32 = 0x8001000C
 	a64ExitCanceled           uint32 = 0xFFFFFFFF
@@ -150,7 +149,6 @@ const (
 	capCodeXsaveFeatures     uint32 = 0x00001003
 	capCodeGicLpiIntIdBits   uint32 = 0x00002011
 
-	propCodeExtendedVmExits    uint32 = 0x00000001
 	propCodeXsaveFeatures      uint32 = 0x00001006
 	propCodeProcessorCount     uint32 = 0x00001FFF
 	propCodeLocalApicEmulation uint32 = 0x00001005
@@ -182,10 +180,6 @@ const (
 	// xsaveFeatXsaveSupport is the XsaveSupport bit of
 	// WHV_PROCESSOR_XSAVE_FEATURES.
 	xsaveFeatXsaveSupport uint64 = 1 << 0
-
-	// extExitHypercall is the HypercallExit bit of WHV_EXTENDED_VM_EXITS.
-	// Five reserved or x64-only bits precede it on both architectures.
-	extExitHypercall uint64 = 1 << 5
 )
 
 // WHV_MAP_GPA_RANGE_FLAGS values.

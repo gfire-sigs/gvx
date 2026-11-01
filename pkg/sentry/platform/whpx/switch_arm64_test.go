@@ -60,12 +60,12 @@ func (e *a64Env) reload() uint64 {
 	return e.p.kernel.layout.code() + uint64(e.p.kernel.a64.Reload)
 }
 
-func (e *a64Env) hvc() uint64 {
+func (e *a64Env) exit() uint64 {
 	return e.p.kernel.layout.code() + uint64(e.p.kernel.a64.Exit)
 }
 
 // trap simulates the EL1 stub: it spills state as the common handler does
-// and reports the HVC exit at pc.
+// and reports the notification load at the exit instruction.
 func (e *a64Env) trap(vp *fakeVP, exit []byte, slot, esrVal, far, elr uint64, mutate func(c *CommPage)) {
 	c := e.comm(vp)
 	c.Vector, c.ESR, c.FaultAddr, c.PC = slot, esrVal, far, elr
@@ -73,7 +73,7 @@ func (e *a64Env) trap(vp *fakeVP, exit []byte, slot, esrVal, far, elr uint64, mu
 		mutate(c)
 	}
 	atomic.StoreUint32(&c.ExitReason, uint32(ExitException))
-	writeStubExit(exit, e.reload())
+	writeStubExit(exit, e.exit())
 }
 
 func (e *a64Env) svc(vp *fakeVP, exit []byte, elr uint64, mutate func(c *CommPage)) {
@@ -155,7 +155,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 		t.Errorf("park PSTATE %#x PC %#x", vp.reg(a64RegPstate), vp.reg(a64RegPc))
 	}
 
-	// Second syscall of the same thread: no register call, no flush.
+	// Second syscall of the same thread: one PC write, no flush.
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
 		cp := *e.comm(vp)
 		saw = append(saw, &cp)
@@ -165,35 +165,17 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if len(vp.setCalls) != 3 {
-		t.Errorf("the fast path made %d register writes", len(vp.setCalls)-3)
+	if n := len(vp.setCalls); n != 4 || len(vp.setCalls[3]) != 1 || vp.setCalls[3][0] != a64RegPc {
+		t.Errorf("the fast path made the register writes %#x, want one PC write", vp.setCalls[3:])
+	}
+	if vp.reg(a64RegPc) != e.reload() {
+		t.Errorf("resume PC is %#x, want the reload path %#x", vp.reg(a64RegPc), e.reload())
 	}
 	if saw[1].Flags != 0 {
 		t.Errorf("second entry flags are %#x, want none", saw[1].Flags)
 	}
 	if saw[1].PC != 0x400004 {
 		t.Errorf("second entry resumes at %#x, want the previous ELR", saw[1].PC)
-	}
-
-	// A hypervisor that reports the HVC address instead of the next
-	// instruction needs the program counter set once per exit.
-	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		e.svc(vp, exit, 0x40000C, nil)
-		writeStubExit(exit, e.hvc())
-		return nil
-	}
-	if _, _, err := e.switchTo(c, ac); err != nil {
-		t.Fatal(err)
-	}
-	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		e.svc(vp, exit, 0x400010, nil)
-		return nil
-	}
-	if _, _, err := e.switchTo(c, ac); err != nil {
-		t.Fatal(err)
-	}
-	if n := len(vp.setCalls); n != 4 || len(vp.setCalls[3]) != 1 || vp.setCalls[3][0] != a64RegPc {
-		t.Errorf("after an exit at the HVC address the writes are %v", vp.setCalls[3:])
 	}
 }
 
@@ -394,12 +376,12 @@ func TestSwitchRejectsUnexpectedExits(t *testing.T) {
 		name   string
 		script func(e *a64Env, vp *fakeVP, exit []byte)
 	}{
-		{"HVC with an immediate", func(e *a64Env, vp *fakeVP, exit []byte) {
-			e.svc(vp, exit, 4, nil)
-			binary.LittleEndian.PutUint16(exit[a64ExitOffHvcImm:], 7)
+		{"notification load without a stub exit reason", func(e *a64Env, vp *fakeVP, exit []byte) {
+			writeStubExit(exit, e.exit())
 		}},
-		{"HVC without a stub exit reason", func(e *a64Env, vp *fakeVP, exit []byte) {
-			writeStubExit(exit, e.reload())
+		{"read of GPA zero outside the exit instruction", func(e *a64Env, vp *fakeVP, exit []byte) {
+			e.svc(vp, exit, 4, nil)
+			binary.LittleEndian.PutUint64(exit[a64ExitOffHdrPc:], e.reload())
 		}},
 		{"unrecoverable exception", func(e *a64Env, vp *fakeVP, exit []byte) {
 			binary.LittleEndian.PutUint32(exit, a64ExitUnrecoverable)
@@ -723,7 +705,7 @@ func TestThreadInitRunsOnEverySwitch(t *testing.T) {
 		cp := p.kernel.commPage(int(vp.index))
 		cp.Vector, cp.ESR = a64SlotLowA64Sync, esr(hvcommon.ECSVC64, 0)
 		atomic.StoreUint32(&cp.ExitReason, uint32(ExitException))
-		writeStubExit(exit, p.kernel.layout.code()+uint64(p.kernel.a64.Reload))
+		writeStubExit(exit, p.kernel.layout.code()+uint64(p.kernel.a64.Exit))
 		return nil
 	}
 	for range 3 {

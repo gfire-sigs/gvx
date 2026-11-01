@@ -147,6 +147,10 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	case !st.valid || !st.parked:
 		v.addParkRegs(b)
 	case st.exitPC != v.reloadVA():
+		// The stub stops with a load from an unbacked GPA, and the memory
+		// exit leaves PC at that load. Every stop therefore costs one PC
+		// write. WHP consumes HVC #0 without an exit, so no instruction that
+		// exits past itself is available.
 		b.add64(a64RegPc, v.reloadVA())
 	}
 	// The stub loads TTBR0_EL1 from CommPage.Root. The host also writes the
@@ -176,10 +180,6 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 // onStubExit reads the CommPage after the stub completed its register spill.
 func (c *Context) onStubExit(v *vcpu, ex exitInfo, ac *arch.Context64) (runResult, bool) {
 	comm := v.comm
-	if ex.hvcImmediate != 0 {
-		v.st.invalidate()
-		return runResult{err: fmt.Errorf("whpx: virtual processor %d executed HVC #%d", v.index, ex.hvcImmediate)}, false
-	}
 	if reason := ExitReason(atomic.LoadUint32(&comm.ExitReason)); reason != ExitException {
 		v.st.invalidate()
 		return runResult{err: fmt.Errorf("whpx: virtual processor %d stopped with stub exit reason %d", v.index, reason)}, false
