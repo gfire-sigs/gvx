@@ -12,10 +12,24 @@ This section makes the CPU features that a guest sees agree with the features th
 - **`whpx` feature set on `windows/amd64`**: `/proc/cpuinfo`, signal frames, and sigreturn checks list only the features of the partition. MPX, AMX, and protection keys no longer appear.
 - **`AT_HWCAP` on `darwin/arm64` and `windows/arm64`**: the value was 0, and the `Features` line of `/proc/cpuinfo` was empty. `hvf` guests now get the bits of the `hw.optional` sysctl keys. `whpx` guests on `windows/arm64` get the host bits that `hvcommon.DefaultIDRegisters` also reports. glibc and OpenSSL then use LSE atomics, AES, SHA, and CRC32.
 
+### Performance
+
+Each value is the median of 3 runs. The baseline is `v0.2.0`.
+
+| Workload | Host | Before | After |
+| :--- | :--- | ---: | ---: |
+| AES-128-GCM, `openssl speed` 16 KiB blocks in `alpine/openssl` on `hvf` | Apple M1 | 0.22 GB/s | 7.45 GB/s |
+| SHA-256, same method | Apple M1 | 0.45 GB/s | 2.84 GB/s |
+| ChaCha20-Poly1305, same method | Apple M1 | 0.68 GB/s | 2.12 GB/s |
+| Vector state pull and push with one system call on `whpx` | `windows-latest` (AMD, AVX2, nested Hyper-V) | 68.9 us | 63.4 us |
+| Vector state push on `whpx` | same | 16.1 us | 13.6 us |
+| System call round trip on `whpx` | same | 18.4 us | 15.9 us |
+
+The `hvf` microbenchmarks of `e2e/microbench_e2e_test.go` (`getpid`, `open_close`, `pipe_pingpong`, `futex_pingpong`, `fork_wait`, `fork_exec_true`) show no change outside the variation between runs.
+
 ### Not verified
 
 - `TestRealZMMSurvivesTheSentryAndProcessorSharing` skips on a CI runner without AVX-512.
-- The project has no measurement of `WHvGetVirtualProcessorState` latency. The call runs only on signal delivery, `clone`, `ptrace`, and vCPU sharing.
 - The `windows/arm64` `AT_HWCAP` path has no run on a Windows host.
 
 ## [v0.2.0] - 2026-11-01
