@@ -30,6 +30,10 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
+// sentryFPLimit is the Sentry image size of the amd64 selection. An arm64
+// partition ignores it.
+func sentryFPLimit() int { return testFPLimit }
+
 // a64Env is a platform on a fake backend with one address space.
 type a64Env struct {
 	t  *testing.T

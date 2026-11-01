@@ -19,154 +19,162 @@ import (
 	"fmt"
 )
 
-// This file converts between the Sentry floating-point image and the
-// register values of the Windows Hypervisor Platform. The converters are pure
+// This file converts between the Sentry floating-point image and the state
+// formats of the Windows Hypervisor Platform. The converters are pure
 // functions, so tests run them on every host.
 //
-// On amd64 the image is an FXSAVE area. The partition enables only the x87
-// and SSE state components, because the WHPX register interface cannot read
-// the upper halves of the YMM registers.
+// On amd64 the Sentry image is a standard-format XSAVE area. The hypervisor
+// reads and writes the XSAVE state of a processor in the compacted format of
+// XSAVES, which also holds supervisor components.
 //
 // On arm64 the image follows the layout of ring0.SaveFloatingPoint: FPSR at
 // byte 0, FPCR at byte 8 and Q0 to Q31 from byte 16.
 
-// FXSAVE area layout.
+// Offsets in the legacy region of an XSAVE area (the FXSAVE layout).
 const (
-	fxsaveSize     = 512
 	fxOffFCW       = 0
-	fxOffFSW       = 2
-	fxOffFTW       = 4
-	fxOffFOP       = 6
-	fxOffFIP       = 8
-	fxOffFDP       = 16
 	fxOffMXCSR     = 24
 	fxOffMXCSRMask = 28
 	fxOffST        = 32
 	fxOffXMM       = 160
+	fxOffXMMEnd    = 416
 
-	// x86XsaveHeaderOff is the offset of XSTATE_BV in an XSAVE area.
-	x86XsaveHeaderOff = 512
-
-	// x86XsaveLegacyBits are the x87 and SSE bits of XSTATE_BV.
-	x86XsaveLegacyBits = 3
+	// x86FCWInit is the x87 control word after FNINIT.
+	x86FCWInit = 0x037F
 
 	// x86MXCSRMaskDefault is the MXCSR mask of CPUs that report zero.
 	x86MXCSRMaskDefault = 0xFFBF
-
-	// x86XmmStatusMask is the XmmStatusControlMask that QEMU writes.
-	x86XmmStatusMask = 0x0000FFFF
 )
 
-// Bits of WHV_X64_FP_CONTROL_STATUS_REGISTER and the FXSAVE layout shared
-// with it.
-const (
-	fpStatusTopShift = 11
-	fpStatusTopMask  = 7
-)
-
-// x86FPRegCount is the number of registers in a legacy FP read or write: 16
-// XMM registers, 8 x87 registers and 2 control registers.
-const x86FPRegCount = 26
-
-// x86WantFP appends the legacy floating-point registers to a read batch.
-func x86WantFP(b *regBatch) {
-	for i := range 16 {
-		b.want(x64RegXmm0 + uint32(i))
+// compactedOffsets returns the offset of each component of xcompBV in a
+// compacted image, and the end of the last component.
+func (l *xsaveLayout) compactedOffsets(xcompBV uint64) (offs [xsaveComponents]uint32, end int, err error) {
+	off := uint32(xsaveHeaderEnd)
+	for i := 2; i < xsaveComponents; i++ {
+		if xcompBV&(1<<i) == 0 {
+			continue
+		}
+		a := l[i]
+		if a.size == 0 {
+			return offs, 0, fmt.Errorf("whpx: XCOMP_BV %#x names component %d, which CPUID leaf 0xD does not describe", xcompBV, i)
+		}
+		if a.align64 {
+			off = (off + 63) &^ 63
+		}
+		offs[i] = off
+		off += a.size
 	}
-	for i := range 8 {
-		b.want(x64RegFpMmx0 + uint32(i))
-	}
-	b.want(x64RegFpControlStatus)
-	b.want(x64RegXmmControlStatus)
+	return offs, int(off), nil
 }
 
-// x86FXSaveFromRegs writes the registers that x86WantFP requested into the
-// FXSAVE area at the start of image. first is the batch index of the first
-// FP register. The function leaves every byte above the FXSAVE area alone,
-// except that it marks the x87 and SSE components valid in an XSAVE header.
-func x86FXSaveFromRegs(image []byte, b *regBatch, first int) error {
-	if len(image) < fxsaveSize {
-		return fmt.Errorf("whpx: FP image is %d bytes, want at least %d", len(image), fxsaveSize)
+// checkCompacted verifies that buf is a compacted image that holds every
+// component of xcr0, and returns the component offsets.
+func (l *xsaveLayout) checkCompacted(buf []byte, xcr0 uint64) ([xsaveComponents]uint32, error) {
+	if len(buf) < xsaveHeaderEnd {
+		return [xsaveComponents]uint32{}, fmt.Errorf("whpx: XSAVE state is %d bytes, shorter than the XSAVE header", len(buf))
 	}
-	fx := image[:fxsaveSize]
-	for i := range 16 {
-		lo, hi := b.u128(first + i)
-		binary.LittleEndian.PutUint64(fx[fxOffXMM+i*16:], lo)
-		binary.LittleEndian.PutUint64(fx[fxOffXMM+i*16+8:], hi)
+	xcompBV := binary.LittleEndian.Uint64(buf[xsaveOffXcompBV:])
+	if xcompBV&xcompBVCompacted == 0 {
+		return [xsaveComponents]uint32{}, fmt.Errorf("whpx: XSAVE state has XCOMP_BV %#x, not the compacted format", xcompBV)
 	}
-	ctlLo, ctlHi := b.u128(first + 24)
-	fcw := uint16(ctlLo)
-	fsw := uint16(ctlLo >> 16)
-	ftw := uint8(ctlLo >> 32)
-	fop := uint16(ctlLo >> 48)
-	binary.LittleEndian.PutUint16(fx[fxOffFCW:], fcw)
-	binary.LittleEndian.PutUint16(fx[fxOffFSW:], fsw)
-	fx[fxOffFTW] = ftw
-	fx[fxOffFTW+1] = 0
-	binary.LittleEndian.PutUint16(fx[fxOffFOP:], fop)
-	binary.LittleEndian.PutUint64(fx[fxOffFIP:], ctlHi)
+	if missing := xcr0 &^ xcr0Legacy &^ xcompBV; missing != 0 {
+		return [xsaveComponents]uint32{}, fmt.Errorf("whpx: XSAVE state with XCOMP_BV %#x lacks components %#x of XCR0 %#x", xcompBV, missing, xcr0)
+	}
+	offs, end, err := l.compactedOffsets(xcompBV &^ xcompBVCompacted)
+	if err != nil {
+		return offs, err
+	}
+	if end > len(buf) {
+		return offs, fmt.Errorf("whpx: XSAVE state with XCOMP_BV %#x needs %d bytes, the hypervisor returned %d", xcompBV, end, len(buf))
+	}
+	return offs, nil
+}
 
-	xmmLo, xmmHi := b.u128(first + 25)
-	binary.LittleEndian.PutUint64(fx[fxOffFDP:], xmmLo)
-	binary.LittleEndian.PutUint32(fx[fxOffMXCSR:], uint32(xmmHi))
-	binary.LittleEndian.PutUint32(fx[fxOffMXCSRMask:], uint32(xmmHi>>32))
-
-	// FpMmx0 to FpMmx7 name the physical x87 registers. FXSAVE stores them
-	// in stack order, ST(i) being physical register (TOP + i) mod 8.
-	top := int(fsw>>fpStatusTopShift) & fpStatusTopMask
-	for i := range 8 {
-		lo, hi := b.u128(first + 16 + (top+i)&7)
-		slot := fx[fxOffST+i*16 : fxOffST+(i+1)*16]
-		binary.LittleEndian.PutUint64(slot[0:], lo)
-		binary.LittleEndian.PutUint16(slot[8:], uint16(hi))
-		clear(slot[10:])
+// x86StandardFromCompacted writes src, the compacted XSAVE state of a
+// processor, into dst, the standard-format image of the Sentry. It writes the
+// components of xcr0 and sets XSTATE_BV to the live ones.
+func x86StandardFromCompacted(dst, src []byte, xcr0 uint64, l *xsaveLayout) error {
+	offs, err := l.checkCompacted(src, xcr0)
+	if err != nil {
+		return err
 	}
-	if len(image) >= x86XsaveHeaderOff+8 {
-		bv := binary.LittleEndian.Uint64(image[x86XsaveHeaderOff:])
-		binary.LittleEndian.PutUint64(image[x86XsaveHeaderOff:], bv|x86XsaveLegacyBits)
+	if need := l.standardSize(xcr0); len(dst) < need {
+		return fmt.Errorf("whpx: FP image is %d bytes, XCR0 %#x needs %d", len(dst), xcr0, need)
 	}
+	bv := binary.LittleEndian.Uint64(src[xsaveOffXstateBV:])
+	copy(dst[:xsaveLegacySize], src[:xsaveLegacySize])
+	// XSAVES skips a component in its initial state, so the buffer can hold
+	// stale bytes for it. MXCSR is outside both components and always valid.
+	if bv&xcr0X87 == 0 {
+		clear(dst[:fxOffMXCSR])
+		clear(dst[fxOffST:fxOffXMM])
+		binary.LittleEndian.PutUint16(dst[fxOffFCW:], x86FCWInit)
+	}
+	if bv&xcr0SSE == 0 {
+		clear(dst[fxOffXMM:fxOffXMMEnd])
+	}
+	for i := 2; i < xsaveComponents; i++ {
+		bit := uint64(1) << i
+		if xcr0&bit == 0 || bv&bit == 0 {
+			continue
+		}
+		a := l[i]
+		copy(dst[a.offset:a.offset+a.size], src[offs[i]:offs[i]+a.size])
+	}
+	if len(dst) < xsaveHeaderEnd {
+		// An FXSAVE image has no header.
+		return nil
+	}
+	// The legacy region now holds valid x87 and SSE values in every case.
+	clear(dst[xsaveOffXstateBV:xsaveHeaderEnd])
+	binary.LittleEndian.PutUint64(dst[xsaveOffXstateBV:], bv&xcr0|xcr0Legacy)
 	return nil
 }
 
-// x86FXSaveToRegs appends the register writes that load the FXSAVE area at
-// the start of image into a virtual processor.
-func x86FXSaveToRegs(b *regBatch, image []byte) error {
-	if len(image) < fxsaveSize {
-		return fmt.Errorf("whpx: FP image is %d bytes, want at least %d", len(image), fxsaveSize)
+// x86CompactedFromStandard loads src, the standard-format image of the
+// Sentry, into dst, the current compacted XSAVE state of a processor. It
+// keeps XCOMP_BV, MXCSR_MASK, and every component outside xcr0, so the
+// supervisor state passes through unchanged. A component of xcr0 that src
+// marks as initial becomes initial.
+func x86CompactedFromStandard(dst, src []byte, xcr0 uint64, l *xsaveLayout) error {
+	offs, err := l.checkCompacted(dst, xcr0)
+	if err != nil {
+		return err
 	}
-	fx := image[:fxsaveSize]
-	for i := range 16 {
-		b.add128(x64RegXmm0+uint32(i),
-			binary.LittleEndian.Uint64(fx[fxOffXMM+i*16:]),
-			binary.LittleEndian.Uint64(fx[fxOffXMM+i*16+8:]))
+	if len(src) < xsaveLegacySize {
+		return fmt.Errorf("whpx: FP image is %d bytes, shorter than the FXSAVE area", len(src))
 	}
-	fsw := binary.LittleEndian.Uint16(fx[fxOffFSW:])
-	top := int(fsw>>fpStatusTopShift) & fpStatusTopMask
-	var phys [8][2]uint64
-	for i := range 8 {
-		slot := fx[fxOffST+i*16 : fxOffST+(i+1)*16]
-		phys[(top+i)&7] = [2]uint64{
-			binary.LittleEndian.Uint64(slot[0:]),
-			uint64(binary.LittleEndian.Uint16(slot[8:])),
+	// An FXSAVE image without a header holds x87 and SSE state only.
+	srcBV := xcr0Legacy
+	if len(src) >= xsaveHeaderEnd {
+		srcBV = binary.LittleEndian.Uint64(src[xsaveOffXstateBV:]) & xcr0
+	}
+	for i := 2; i < xsaveComponents; i++ {
+		bit := uint64(1) << i
+		if srcBV&bit == 0 {
+			continue
+		}
+		if a := l[i]; len(src) < int(a.offset+a.size) {
+			return fmt.Errorf("whpx: FP image is %d bytes, component %d ends at %d", len(src), i, a.offset+a.size)
 		}
 	}
-	for i := range 8 {
-		b.add128(x64RegFpMmx0+uint32(i), phys[i][0], phys[i][1])
-	}
-	lo := uint64(binary.LittleEndian.Uint16(fx[fxOffFCW:])) |
-		uint64(fsw)<<16 |
-		uint64(fx[fxOffFTW])<<32 |
-		uint64(binary.LittleEndian.Uint16(fx[fxOffFOP:]))<<48
-	b.add128(x64RegFpControlStatus, lo, binary.LittleEndian.Uint64(fx[fxOffFIP:]))
-
-	mask := binary.LittleEndian.Uint32(fx[fxOffMXCSRMask:])
+	copy(dst[:fxOffMXCSR], src[:fxOffMXCSR])
+	mask := binary.LittleEndian.Uint32(dst[fxOffMXCSRMask:])
 	if mask == 0 {
 		mask = x86MXCSRMaskDefault
 	}
-	mxcsr := binary.LittleEndian.Uint32(fx[fxOffMXCSR:]) & mask
-	b.add128(x64RegXmmControlStatus,
-		binary.LittleEndian.Uint64(fx[fxOffFDP:]),
-		uint64(mxcsr)|uint64(x86XmmStatusMask)<<32)
+	// XRSTORS faults on a reserved MXCSR bit.
+	binary.LittleEndian.PutUint32(dst[fxOffMXCSR:], binary.LittleEndian.Uint32(src[fxOffMXCSR:])&mask)
+	copy(dst[fxOffST:fxOffXMMEnd], src[fxOffST:fxOffXMMEnd])
+	for i := 2; i < xsaveComponents; i++ {
+		if srcBV&(1<<i) == 0 {
+			continue
+		}
+		a := l[i]
+		copy(dst[offs[i]:offs[i]+a.size], src[a.offset:a.offset+a.size])
+	}
+	bv := binary.LittleEndian.Uint64(dst[xsaveOffXstateBV:])
+	binary.LittleEndian.PutUint64(dst[xsaveOffXstateBV:], bv&^xcr0|srcBV|xcr0Legacy)
 	return nil
 }
 

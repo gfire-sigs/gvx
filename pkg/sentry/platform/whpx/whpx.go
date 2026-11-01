@@ -65,6 +65,12 @@ type Options struct {
 	// processors overrides the processor count that the partition gets. Tests
 	// set it so that they do not depend on the CPU count of the host.
 	processors int
+
+	// xsaveLayout and fpLimit override the XSAVE layout of the host CPU and
+	// the size of the Sentry floating-point image on amd64. Tests set them so
+	// that they do not depend on the CPU of the host.
+	xsaveLayout *xsaveLayout
+	fpLimit     int
 }
 
 // errClosed reports a Switch or an address space operation on a closed
@@ -82,6 +88,13 @@ type Platform struct {
 	arm64   bool
 	vpCount int
 	info    partitionInfo
+
+	// vec is the vector state of amd64 guests.
+	vec guestVector
+
+	// fpSize is the size of the floating-point image that a Context saves
+	// when another Context takes its processor.
+	fpSize int
 
 	gpa    *gpaAllocator
 	mem    *memoryMap
@@ -158,6 +171,10 @@ func checkHost(arm64 bool, f hostFeatures) error {
 		return fmt.Errorf("%w: the hypervisor is not present", ErrUnsupported)
 	}
 	if !arm64 {
+		// The floating-point state moves through the XSAVE state calls.
+		if f.xsaveFeatures&xsaveFeatXsave == 0 {
+			return fmt.Errorf("%w: WHvCapabilityCodeProcessorXsaveFeatures does not report XsaveSupport", ErrUnsupported)
+		}
 		return nil
 	}
 	const minBuild, minUBR = 26100, 3915
@@ -187,7 +204,19 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 	if vpCount <= 0 {
 		vpCount = min(max(runtime.NumCPU(), 1), maxVPs)
 	}
-	info, err := be.createPartition(uint32(vpCount))
+	cfg := partitionConfig{vpCount: uint32(vpCount)}
+	fpSize := a64FPSize
+	var vec guestVector
+	if !arm64 {
+		layout, fpLimit := opts.xsaveLayout, opts.fpLimit
+		if layout == nil {
+			layout, fpLimit = hostVectorState()
+		}
+		vec = selectGuestVector(feats.xsaveFeatures, layout, fpLimit)
+		cfg.xsaveFeatures, cfg.clearProcFeatures = vec.xsaveFeatures, vec.clearProcFeatures
+		fpSize = vec.imageSize
+	}
+	info, err := be.createPartition(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("whpx: create partition: %w", err)
 	}
@@ -197,6 +226,8 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 		arm64:   arm64,
 		vpCount: int(info.vpCount),
 		info:    info,
+		vec:     vec,
+		fpSize:  fpSize,
 	}
 	p.cond = sync.NewCond(&p.mu)
 	defer func() {
@@ -205,6 +236,12 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 			p = nil
 		}
 	}()
+
+	if !arm64 {
+		if missing := missingFeatures(vec.xcr0, info.xsaveFeatures); missing != 0 {
+			return p, fmt.Errorf("whpx: the partition dropped XSAVE features %#x that XCR0 %#x needs", missing, vec.xcr0)
+		}
+	}
 
 	archInit()
 	p.gpa = newGPAAllocator(gpaWindowBase, gpaTableEnd)
@@ -216,6 +253,18 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 	}
 	for i := p.vpCount - 1; i >= 0; i-- {
 		p.freeIdx = append(p.freeIdx, uint32(i))
+	}
+	if !arm64 {
+		// Bring-up checks the XSAVE layout that the hypervisor reports. A
+		// probe now makes New fail on a mismatch, so the caller can choose
+		// another platform before any guest runs.
+		v, err := newVP(p, 0)
+		if err != nil {
+			return p, err
+		}
+		if err := v.destroy(); err != nil {
+			return p, err
+		}
 	}
 	return p, nil
 }

@@ -14,38 +14,70 @@
 
 package whpx
 
+import (
+	"errors"
+	"fmt"
+)
+
 // readFP reads the floating-point and vector registers of the processor into
 // image. The processor must not run.
 func (v *vcpu) readFP(image []byte) error {
+	if !v.p.arm64 {
+		state, err := v.fetchXsave()
+		if err != nil {
+			return err
+		}
+		return x86StandardFromCompacted(image, state, v.p.vec.xcr0, v.p.vec.layout)
+	}
 	b := v.regs
 	b.reset()
-	if v.p.arm64 {
-		a64WantFP(b)
-	} else {
-		x86WantFP(b)
-	}
+	a64WantFP(b)
 	if err := v.p.be.getRegs(v.index, b); err != nil {
 		return err
 	}
-	if v.p.arm64 {
-		return a64FPFromRegs(image, b, 0)
-	}
-	return x86FXSaveFromRegs(image, b, 0)
+	return a64FPFromRegs(image, b, 0)
 }
 
 // writeFP loads image into the floating-point and vector registers of the
 // processor. The processor must not run.
 func (v *vcpu) writeFP(image []byte) error {
+	if !v.p.arm64 {
+		// The hypervisor state carries supervisor components and an XCOMP_BV
+		// that the Sentry image lacks, so the write starts from a fresh read.
+		state, err := v.fetchXsave()
+		if err != nil {
+			return err
+		}
+		if err := x86CompactedFromStandard(state, image, v.p.vec.xcr0, v.p.vec.layout); err != nil {
+			return err
+		}
+		return v.p.be.setXsave(v.index, state)
+	}
 	b := v.regs
 	b.reset()
-	var err error
-	if v.p.arm64 {
-		err = a64FPToRegs(b, image)
-	} else {
-		err = x86FXSaveToRegs(b, image)
-	}
-	if err != nil {
+	if err := a64FPToRegs(b, image); err != nil {
 		return err
 	}
 	return v.p.be.setRegs(v.index, b)
+}
+
+// xsaveAlign is the alignment of the XSAVE state buffer. QEMU passes a
+// page-aligned buffer to the same calls.
+const xsaveAlign = pageSize
+
+// fetchXsave reads the XSAVE state of the processor into its scratch buffer.
+// It grows the buffer once when the hypervisor asks for more space.
+func (v *vcpu) fetchXsave() ([]byte, error) {
+	for range 2 {
+		n, err := v.p.be.getXsave(v.index, v.xsave)
+		if errors.Is(err, errXsaveBufferSmall) && n > len(v.xsave) {
+			v.xsave = alignedBuf(n, xsaveAlign)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("whpx: read XSAVE state of virtual processor %d: %w", v.index, err)
+		}
+		return v.xsave[:n], nil
+	}
+	return nil, fmt.Errorf("whpx: XSAVE state of virtual processor %d grew between two reads", v.index)
 }

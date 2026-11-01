@@ -46,6 +46,13 @@ var (
 	procCancelRunVP            = modWinHvPlatform.NewProc("WHvCancelRunVirtualProcessor")
 	procGetVPRegisters         = modWinHvPlatform.NewProc("WHvGetVirtualProcessorRegisters")
 	procSetVPRegisters         = modWinHvPlatform.NewProc("WHvSetVirtualProcessorRegisters")
+
+	// The state calls replace the XSAVE calls on newer builds. Windows 10
+	// version 1809 and later export the XSAVE calls.
+	procGetVPState      = modWinHvPlatform.NewProc("WHvGetVirtualProcessorState")
+	procSetVPState      = modWinHvPlatform.NewProc("WHvSetVirtualProcessorState")
+	procGetVPXsaveState = modWinHvPlatform.NewProc("WHvGetVirtualProcessorXsaveState")
+	procSetVPXsaveState = modWinHvPlatform.NewProc("WHvSetVirtualProcessorXsaveState")
 )
 
 // hresultError is a failed WinHvPlatform call.
@@ -154,6 +161,10 @@ func (b *winBackend) features() (hostFeatures, error) {
 			return f, err
 		}
 		f.windowsBuild, f.windowsUBR = build, ubr
+		return f, nil
+	}
+	if err := getCapability(capCodeXsaveFeatures, unsafe.Pointer(&f.xsaveFeatures), 8); err != nil {
+		return f, err
 	}
 	return f, nil
 }
@@ -173,7 +184,7 @@ func windowsVersion() (build, ubr uint32, err error) {
 	return build, uint32(v), nil
 }
 
-func (b *winBackend) createPartition(vpCount uint32) (info partitionInfo, err error) {
+func (b *winBackend) createPartition(cfg partitionConfig) (info partitionInfo, err error) {
 	var h uintptr
 	if err := call(procCreatePartition, "WHvCreatePartition", uintptr(unsafe.Pointer(&h))); err != nil {
 		return info, err
@@ -184,9 +195,15 @@ func (b *winBackend) createPartition(vpCount uint32) (info partitionInfo, err er
 			err = errors.Join(err, b.closePartition())
 		}
 	}()
+	vpCount := cfg.vpCount
 	if err := call(procSetPartitionProperty, "WHvSetPartitionProperty(ProcessorCount)",
 		h, uintptr(propCodeProcessorCount), uintptr(unsafe.Pointer(&vpCount)), 4); err != nil {
 		return info, err
+	}
+	if runtime.GOARCH == "amd64" {
+		if err := setVectorProperties(h, cfg); err != nil {
+			return info, err
+		}
 	}
 	if runtime.GOARCH == "arm64" {
 		var lpiBits uint32
@@ -211,15 +228,36 @@ func (b *winBackend) createPartition(vpCount uint32) (info partitionInfo, err er
 	}
 	info.vpCount = vpCount
 	if runtime.GOARCH == "amd64" {
-		var xs uint64
 		var written uint32
 		if err := call(procGetPartitionProperty, "WHvGetPartitionProperty(ProcessorXsaveFeatures)",
-			h, uintptr(propCodeXsaveFeatures), uintptr(unsafe.Pointer(&xs)), 8, uintptr(unsafe.Pointer(&written))); err != nil {
+			h, uintptr(propCodeXsaveFeatures), uintptr(unsafe.Pointer(&info.xsaveFeatures)), 8, uintptr(unsafe.Pointer(&written))); err != nil {
 			return info, err
 		}
-		info.xsave = xs&xsaveFeatXsaveSupport != 0
 	}
 	return info, nil
+}
+
+// setVectorProperties sets the CPUID features of the vector state. The
+// properties accept writes only before WHvSetupPartition.
+func setVectorProperties(h uintptr, cfg partitionConfig) error {
+	xs := cfg.xsaveFeatures
+	if err := call(procSetPartitionProperty, "WHvSetPartitionProperty(ProcessorXsaveFeatures)",
+		h, uintptr(propCodeXsaveFeatures), uintptr(unsafe.Pointer(&xs)), 8); err != nil {
+		return err
+	}
+	if cfg.clearProcFeatures == 0 {
+		return nil
+	}
+	var pf uint64
+	if err := getCapability(capCodeProcessorFeatures, unsafe.Pointer(&pf), 8); err != nil {
+		return err
+	}
+	if pf&cfg.clearProcFeatures == 0 {
+		return nil
+	}
+	pf &^= cfg.clearProcFeatures
+	return call(procSetPartitionProperty, "WHvSetPartitionProperty(ProcessorFeatures)",
+		h, uintptr(propCodeProcessorFeatures), uintptr(unsafe.Pointer(&pf)), 8)
 }
 
 func (b *winBackend) closePartition() error {
@@ -286,6 +324,36 @@ func (b *winBackend) getRegs(index uint32, rb *regBatch) error {
 	}
 	return call(procGetVPRegisters, "WHvGetVirtualProcessorRegisters",
 		b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[0])), uintptr(len(names)), uintptr(unsafe.Pointer(&vals[0])))
+}
+
+func (b *winBackend) getXsave(index uint32, buf []byte) (int, error) {
+	var written uint32
+	var p uintptr
+	if len(buf) > 0 {
+		p = uintptr(unsafe.Pointer(&buf[0]))
+	}
+	var err error
+	if procGetVPState.Find() == nil {
+		err = call(procGetVPState, "WHvGetVirtualProcessorState(XsaveState)",
+			b.partition, uintptr(index), uintptr(vpStateTypeXsave), p, uintptr(len(buf)), uintptr(unsafe.Pointer(&written)))
+	} else {
+		err = call(procGetVPXsaveState, "WHvGetVirtualProcessorXsaveState",
+			b.partition, uintptr(index), p, uintptr(len(buf)), uintptr(unsafe.Pointer(&written)))
+	}
+	var he *hresultError
+	if errors.As(err, &he) && he.hr == hrInsufficientBuffer {
+		return int(written), fmt.Errorf("%w: %d bytes needed", errXsaveBufferSmall, written)
+	}
+	return int(written), err
+}
+
+func (b *winBackend) setXsave(index uint32, buf []byte) error {
+	if procSetVPState.Find() == nil {
+		return call(procSetVPState, "WHvSetVirtualProcessorState(XsaveState)",
+			b.partition, uintptr(index), uintptr(vpStateTypeXsave), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	}
+	return call(procSetVPXsaveState, "WHvSetVirtualProcessorXsaveState",
+		b.partition, uintptr(index), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 }
 
 func (b *winBackend) setRegs(index uint32, rb *regBatch) error {

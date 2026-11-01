@@ -20,168 +20,228 @@ import (
 	"testing"
 )
 
-func fxsampleImage() []byte {
-	img := make([]byte, 576)
-	for i := range 16 {
-		binary.LittleEndian.PutUint64(img[fxOffXMM+i*16:], 0x1111_0000_0000_0000|uint64(i))
-		binary.LittleEndian.PutUint64(img[fxOffXMM+i*16+8:], 0x2222_0000_0000_0000|uint64(i))
+// Compacted offsets of the test layout for testXcompBV. Component 5 and the
+// supervisor component 11 start on a 64-byte boundary.
+const (
+	cOffAVX    = 576
+	cOffOpmask = 832
+	cOffZMMHi  = 896
+	cOffHi16   = 1408
+	cOffPKRU   = 2432
+	cOffSuper  = 2496
+	cEnd       = 2512
+
+	xcr0All = xcr0Legacy | xcr0AVX | xcr0AVX512
+)
+
+// fill writes a pattern that differs for every byte and every seed.
+func fill(b []byte, seed byte) {
+	for i := range b {
+		b[i] = seed + byte(i*7)
 	}
-	binary.LittleEndian.PutUint16(img[fxOffFCW:], 0x037F)
-	// TOP is 3, so ST(0) is physical register 3.
-	binary.LittleEndian.PutUint16(img[fxOffFSW:], 3<<11|0x20)
-	img[fxOffFTW] = 0b0001_0110
-	binary.LittleEndian.PutUint16(img[fxOffFOP:], 0x07D9)
-	binary.LittleEndian.PutUint64(img[fxOffFIP:], 0x0000_7FFF_1234_5678)
-	binary.LittleEndian.PutUint64(img[fxOffFDP:], 0x0000_7FFF_8765_4321)
+}
+
+// compactedState returns a compacted state of the test layout with every
+// byte set to a pattern and the given XSTATE_BV.
+func compactedState(xstateBV uint64) []byte {
+	st := make([]byte, cEnd)
+	fill(st, 1)
+	clear(st[xsaveOffXstateBV:xsaveHeaderEnd])
+	binary.LittleEndian.PutUint64(st[xsaveOffXstateBV:], xstateBV)
+	binary.LittleEndian.PutUint64(st[xsaveOffXcompBV:], testXcompBV|xcompBVCompacted)
+	binary.LittleEndian.PutUint32(st[fxOffMXCSR:], 0x1F80)
+	binary.LittleEndian.PutUint32(st[fxOffMXCSRMask:], 0xFFBF)
+	return st
+}
+
+// standardImage returns a standard-format image of size bytes with a pattern
+// in every component and the given XSTATE_BV.
+func standardImage(size int, xstateBV uint64) []byte {
+	img := make([]byte, size)
+	fill(img, 9)
+	clear(img[xsaveOffXstateBV:xsaveHeaderEnd])
+	binary.LittleEndian.PutUint64(img[xsaveOffXstateBV:], xstateBV)
 	binary.LittleEndian.PutUint32(img[fxOffMXCSR:], 0x1F80)
-	binary.LittleEndian.PutUint32(img[fxOffMXCSRMask:], 0xFFFF)
-	for i := range 8 {
-		binary.LittleEndian.PutUint64(img[fxOffST+i*16:], 0xAAAA_0000_0000_0000|uint64(i))
-		binary.LittleEndian.PutUint16(img[fxOffST+i*16+8:], 0x4000|uint16(i))
-	}
 	return img
 }
 
-func TestX86FXSaveToRegistersLayout(t *testing.T) {
-	img := fxsampleImage()
-	b := newRegBatch(x86FPRegCount)
-	if err := x86FXSaveToRegs(b, img); err != nil {
-		t.Fatal(err)
-	}
-	if b.n != x86FPRegCount {
-		t.Fatalf("batch has %d registers, want %d", b.n, x86FPRegCount)
-	}
-	names, _ := b.view()
-	for i := range 16 {
-		if names[i] != x64RegXmm0+uint32(i) {
-			t.Errorf("register %d is %#x, want Xmm%d", i, names[i], i)
-		}
-		lo, hi := b.u128(i)
-		if lo != 0x1111_0000_0000_0000|uint64(i) || hi != 0x2222_0000_0000_0000|uint64(i) {
-			t.Errorf("Xmm%d is %#x:%#x", i, hi, lo)
-		}
-	}
-	// FXSAVE stores ST(i) in stack order. FpMmx registers are physical, so
-	// with TOP=3 the register FpMmx3 holds ST(0) and FpMmx2 holds ST(7).
-	for phys := range 8 {
-		st := (phys - 3) & 7
-		lo, hi := b.u128(16 + phys)
-		if names[16+phys] != x64RegFpMmx0+uint32(phys) {
-			t.Errorf("register %d is %#x, want FpMmx%d", 16+phys, names[16+phys], phys)
-		}
-		if lo != 0xAAAA_0000_0000_0000|uint64(st) || hi != 0x4000|uint64(st) {
-			t.Errorf("FpMmx%d holds ST(%d) as %#x:%#x, want mantissa and exponent of ST(%d)", phys, st, lo, hi, st)
-		}
-	}
-	if names[24] != x64RegFpControlStatus || names[25] != x64RegXmmControlStatus {
-		t.Fatalf("control registers are %#x and %#x", names[24], names[25])
-	}
-	lo, hi := b.u128(24)
-	if uint16(lo) != 0x037F || uint16(lo>>16) != 3<<11|0x20 || uint8(lo>>32) != 0b0001_0110 || uint16(lo>>48) != 0x07D9 {
-		t.Errorf("FpControlStatus low word is %#x", lo)
-	}
-	if hi != 0x0000_7FFF_1234_5678 {
-		t.Errorf("LastFpRip is %#x", hi)
-	}
-	lo, hi = b.u128(25)
-	if lo != 0x0000_7FFF_8765_4321 || uint32(hi) != 0x1F80 || uint32(hi>>32) != x86XmmStatusMask {
-		t.Errorf("XmmControlStatus is %#x:%#x", hi, lo)
+func expectEqual(t *testing.T, what string, got, want []byte) {
+	t.Helper()
+	if !bytes.Equal(got, want) {
+		t.Errorf("%s differs: got % x, want % x", what, got[:min(16, len(got))], want[:min(16, len(want))])
 	}
 }
 
-func TestX86FXSaveRoundTrip(t *testing.T) {
-	img := fxsampleImage()
-	b := newRegBatch(x86FPRegCount)
-	if err := x86FXSaveToRegs(b, img); err != nil {
+func TestStandardFromCompactedMovesEachLiveComponentToItsStandardOffset(t *testing.T) {
+	src := compactedState(xcr0All | 1<<9 | 1<<11)
+	dst := bytes.Repeat([]byte{0xEE}, testFPLimit)
+	if err := x86StandardFromCompacted(dst, src, xcr0All, testXsaveLayout()); err != nil {
 		t.Fatal(err)
 	}
-	// Reading back the same registers must rebuild the image. The upper
-	// bytes of each ST slot are reserved and stay zero.
-	back := make([]byte, 576)
-	if err := x86FXSaveFromRegs(back, b, 0); err != nil {
+	expectEqual(t, "legacy region", dst[:xsaveLegacySize], src[:xsaveLegacySize])
+	expectEqual(t, "AVX", dst[576:832], src[cOffAVX:cOffAVX+256])
+	expectEqual(t, "opmask", dst[1088:1152], src[cOffOpmask:cOffOpmask+64])
+	expectEqual(t, "ZMM_Hi256", dst[1152:1664], src[cOffZMMHi:cOffZMMHi+512])
+	expectEqual(t, "Hi16_ZMM", dst[1664:2688], src[cOffHi16:cOffHi16+1024])
+	if got := binary.LittleEndian.Uint64(dst[xsaveOffXstateBV:]); got != xcr0All {
+		t.Errorf("XSTATE_BV = %#x, want only the XCR0 components %#x", got, uint64(xcr0All))
+	}
+	if !bytes.Equal(dst[xsaveOffXcompBV:xsaveHeaderEnd], make([]byte, xsaveHeaderEnd-xsaveOffXcompBV)) {
+		t.Error("the standard header carries XCOMP_BV or reserved bytes")
+	}
+	if !bytes.Equal(dst[832:1088], bytes.Repeat([]byte{0xEE}, 1088-832)) {
+		t.Error("the conversion wrote the MPX area, which XCR0 does not enable")
+	}
+}
+
+func TestStandardFromCompactedWritesInitialValuesForUnusedLegacyComponents(t *testing.T) {
+	src := compactedState(0)
+	dst := bytes.Repeat([]byte{0xEE}, testFPLimit)
+	if err := x86StandardFromCompacted(dst, src, xcr0All, testXsaveLayout()); err != nil {
 		t.Fatal(err)
 	}
-	want := bytes.Clone(img)
-	for i := range 8 {
-		clear(want[fxOffST+i*16+10 : fxOffST+(i+1)*16])
+	if fcw := binary.LittleEndian.Uint16(dst[fxOffFCW:]); fcw != x86FCWInit {
+		t.Errorf("FCW = %#x, want the FNINIT value %#x", fcw, x86FCWInit)
 	}
-	binary.LittleEndian.PutUint64(want[x86XsaveHeaderOff:], x86XsaveLegacyBits)
-	// The hypervisor mask replaces the image mask.
-	binary.LittleEndian.PutUint32(want[fxOffMXCSRMask:], x86XmmStatusMask)
-	if !bytes.Equal(back[:fxsaveSize], want[:fxsaveSize]) {
-		for i := range fxsaveSize {
-			if back[i] != want[i] {
-				t.Fatalf("FXSAVE byte %#x is %#x, want %#x", i, back[i], want[i])
+	if !bytes.Equal(dst[2:fxOffMXCSR], make([]byte, fxOffMXCSR-2)) || !bytes.Equal(dst[fxOffST:fxOffXMMEnd], make([]byte, fxOffXMMEnd-fxOffST)) {
+		t.Error("an initial x87 or SSE component kept stale bytes")
+	}
+	if mxcsr := binary.LittleEndian.Uint32(dst[fxOffMXCSR:]); mxcsr != 0x1F80 {
+		t.Errorf("MXCSR = %#x, want the saved %#x", mxcsr, 0x1F80)
+	}
+	if got := binary.LittleEndian.Uint64(dst[xsaveOffXstateBV:]); got != xcr0Legacy {
+		t.Errorf("XSTATE_BV = %#x, want only x87 and SSE", got)
+	}
+}
+
+func TestStandardFromCompactedCopiesOnlyTheXCR0Components(t *testing.T) {
+	src := compactedState(xcr0All)
+	dst := make([]byte, 832)
+	if err := x86StandardFromCompacted(dst, src, xcr0Legacy|xcr0AVX, testXsaveLayout()); err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint64(dst[xsaveOffXstateBV:]); got != xcr0Legacy|xcr0AVX {
+		t.Errorf("XSTATE_BV = %#x, want x87, SSE and AVX", got)
+	}
+	if err := x86StandardFromCompacted(make([]byte, 831), src, xcr0Legacy|xcr0AVX, testXsaveLayout()); err == nil {
+		t.Error("an image without room for the AVX component was accepted")
+	}
+}
+
+func TestCheckCompactedRejectsStatesThatDoNotMatchTheLayout(t *testing.T) {
+	l := testXsaveLayout()
+	for _, tc := range []struct {
+		name  string
+		state func() []byte
+		xcr0  uint64
+	}{
+		{"standard format", func() []byte {
+			st := compactedState(xcr0All)
+			binary.LittleEndian.PutUint64(st[xsaveOffXcompBV:], 0)
+			return st
+		}, xcr0All},
+		{"XCR0 component outside XCOMP_BV", func() []byte {
+			st := compactedState(xcr0Legacy)
+			binary.LittleEndian.PutUint64(st[xsaveOffXcompBV:], xcr0Legacy|xcompBVCompacted)
+			return st
+		}, xcr0Legacy | xcr0AVX},
+		{"component unknown to CPUID", func() []byte {
+			st := compactedState(xcr0All)
+			binary.LittleEndian.PutUint64(st[xsaveOffXcompBV:], testXcompBV|1<<8|xcompBVCompacted)
+			return st
+		}, xcr0All},
+		{"state shorter than its layout", func() []byte { return compactedState(xcr0All)[:cEnd-1] }, xcr0All},
+		{"state shorter than the header", func() []byte { return compactedState(xcr0All)[:xsaveHeaderEnd-1] }, xcr0All},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := l.checkCompacted(tc.state(), tc.xcr0); err == nil {
+				t.Error("checkCompacted accepted the state")
 			}
-		}
-	}
-	if got := binary.LittleEndian.Uint64(back[x86XsaveHeaderOff:]); got != x86XsaveLegacyBits {
-		t.Errorf("XSTATE_BV is %#x, want %#x", got, x86XsaveLegacyBits)
+		})
 	}
 }
 
-func TestX86FXSaveFromRegistersKeepsOtherXsaveComponents(t *testing.T) {
-	// Extended components and the rest of the XSAVE header belong to the
-	// Sentry. The converter only sets the x87 and SSE bits of XSTATE_BV.
-	img := make([]byte, 1024)
-	for i := fxsaveSize; i < len(img); i++ {
-		img[i] = 0xEE
-	}
-	binary.LittleEndian.PutUint64(img[x86XsaveHeaderOff:], 0x4)
-	b := newRegBatch(x86FPRegCount)
-	if err := x86FXSaveToRegs(b, fxsampleImage()); err != nil {
+func TestCompactedFromStandardKeepsTheStateOutsideXCR0(t *testing.T) {
+	dst := compactedState(xcr0Legacy | 1<<9 | 1<<11)
+	before := bytes.Clone(dst)
+	src := standardImage(testFPLimit, xcr0All|1<<9)
+	binary.LittleEndian.PutUint32(src[fxOffMXCSR:], 0xFFFF)
+	if err := x86CompactedFromStandard(dst, src, xcr0All, testXsaveLayout()); err != nil {
 		t.Fatal(err)
 	}
-	if err := x86FXSaveFromRegs(img, b, 0); err != nil {
-		t.Fatal(err)
+	expectEqual(t, "AVX", dst[cOffAVX:cOffAVX+256], src[576:832])
+	expectEqual(t, "opmask", dst[cOffOpmask:cOffOpmask+64], src[1088:1152])
+	expectEqual(t, "ZMM_Hi256", dst[cOffZMMHi:cOffZMMHi+512], src[1152:1664])
+	expectEqual(t, "Hi16_ZMM", dst[cOffHi16:cOffHi16+1024], src[1664:2688])
+	expectEqual(t, "x87 and XMM registers", dst[fxOffST:fxOffXMMEnd], src[fxOffST:fxOffXMMEnd])
+	expectEqual(t, "PKRU", dst[cOffPKRU:cOffPKRU+8], before[cOffPKRU:cOffPKRU+8])
+	expectEqual(t, "supervisor component", dst[cOffSuper:cEnd], before[cOffSuper:cEnd])
+	expectEqual(t, "XCOMP_BV", dst[xsaveOffXcompBV:xsaveOffXcompBV+8], before[xsaveOffXcompBV:xsaveOffXcompBV+8])
+	if got, want := binary.LittleEndian.Uint64(dst[xsaveOffXstateBV:]), xcr0All|uint64(1<<9|1<<11); got != want {
+		t.Errorf("XSTATE_BV = %#x, want %#x: the image sets XCR0 bits, the processor keeps the rest", got, want)
 	}
-	if got := binary.LittleEndian.Uint64(img[x86XsaveHeaderOff:]); got != 0x4|x86XsaveLegacyBits {
-		t.Errorf("XSTATE_BV is %#x, want %#x", got, 0x4|x86XsaveLegacyBits)
+	if mxcsr := binary.LittleEndian.Uint32(dst[fxOffMXCSR:]); mxcsr != 0xFFFF&0xFFBF {
+		t.Errorf("MXCSR = %#x, want the reserved bits of MXCSR_MASK %#x cleared", mxcsr, 0xFFBF)
 	}
-	for i := x86XsaveHeaderOff + 8; i < len(img); i++ {
-		if img[i] != 0xEE {
-			t.Fatalf("byte %#x above XSTATE_BV changed to %#x", i, img[i])
-		}
+	if mask := binary.LittleEndian.Uint32(dst[fxOffMXCSRMask:]); mask != 0xFFBF {
+		t.Errorf("MXCSR_MASK = %#x, want the processor value", mask)
 	}
 }
 
-func TestX86FXSaveMXCSRIsMasked(t *testing.T) {
-	img := fxsampleImage()
-	binary.LittleEndian.PutUint32(img[fxOffMXCSR:], 0xFFFF_FFFF)
-	binary.LittleEndian.PutUint32(img[fxOffMXCSRMask:], 0)
-	b := newRegBatch(x86FPRegCount)
-	if err := x86FXSaveToRegs(b, img); err != nil {
+func TestCompactedFromStandardResetsAComponentThatTheImageMarksInitial(t *testing.T) {
+	dst := compactedState(xcr0All)
+	src := standardImage(testFPLimit, xcr0Legacy)
+	if err := x86CompactedFromStandard(dst, src, xcr0All, testXsaveLayout()); err != nil {
 		t.Fatal(err)
 	}
-	_, hi := b.u128(25)
-	if got := uint32(hi); got != x86MXCSRMaskDefault {
-		t.Errorf("MXCSR is %#x, want the reserved bits cleared with the default mask %#x", got, x86MXCSRMaskDefault)
-	}
-	img2 := fxsampleImage()
-	binary.LittleEndian.PutUint32(img2[fxOffMXCSR:], 0xFFFF_FFFF)
-	binary.LittleEndian.PutUint32(img2[fxOffMXCSRMask:], 0x0000_FFBF)
-	b.reset()
-	if err := x86FXSaveToRegs(b, img2); err != nil {
-		t.Fatal(err)
-	}
-	if _, hi = b.u128(25); uint32(hi) != 0xFFBF {
-		t.Errorf("MXCSR is %#x, want 0xffbf", uint32(hi))
+	if got := binary.LittleEndian.Uint64(dst[xsaveOffXstateBV:]); got != xcr0Legacy {
+		t.Errorf("XSTATE_BV = %#x, want the AVX and AVX-512 bits cleared", got)
 	}
 }
 
-func TestX86WantFPNamesAndShortImages(t *testing.T) {
-	b := newRegBatch(x86FPRegCount)
-	x86WantFP(b)
-	names, _ := b.view()
-	if len(names) != x86FPRegCount || names[0] != x64RegXmm0 || names[15] != x64RegXmm0+15 ||
-		names[16] != x64RegFpMmx0 || names[23] != x64RegFpMmx0+7 || names[24] != x64RegFpControlStatus || names[25] != x64RegXmmControlStatus {
-		t.Errorf("read list is %#x", names)
+func TestCompactedFromStandardRejectsAnImageShorterThanItsLiveComponents(t *testing.T) {
+	src := standardImage(832, xcr0All)
+	if err := x86CompactedFromStandard(compactedState(xcr0Legacy), src, xcr0All, testXsaveLayout()); err == nil {
+		t.Error("an image that marks AVX-512 live without its bytes was accepted")
 	}
-	if err := x86FXSaveToRegs(newRegBatch(x86FPRegCount), make([]byte, fxsaveSize-1)); err == nil {
-		t.Error("short image accepted for a write")
+}
+
+func TestXsaveConversionAcceptsAnFXSAVEImage(t *testing.T) {
+	l := testXsaveLayout()
+	fx := make([]byte, xsaveLegacySize)
+	fill(fx, 9)
+	binary.LittleEndian.PutUint32(fx[fxOffMXCSR:], 0x1F80)
+	st := compactedState(xcr0Legacy | xcr0AVX)
+	if err := x86CompactedFromStandard(st, fx, xcr0Legacy, l); err != nil {
+		t.Fatalf("load of an FXSAVE image: %v", err)
 	}
-	if err := x86FXSaveFromRegs(make([]byte, fxsaveSize-1), b, 0); err == nil {
-		t.Error("short image accepted for a read")
+	expectEqual(t, "x87 and XMM registers", st[fxOffST:fxOffXMMEnd], fx[fxOffST:fxOffXMMEnd])
+	back := make([]byte, xsaveLegacySize)
+	if err := x86StandardFromCompacted(back, st, xcr0Legacy, l); err != nil {
+		t.Fatalf("store into an FXSAVE image: %v", err)
+	}
+	expectEqual(t, "x87 and XMM registers", back[fxOffST:fxOffXMMEnd], fx[fxOffST:fxOffXMMEnd])
+}
+
+func TestXsaveConversionRoundTripsTheSentryImage(t *testing.T) {
+	l := testXsaveLayout()
+	img := standardImage(testFPLimit, xcr0All)
+	st := compactedState(xcr0Legacy)
+	if err := x86CompactedFromStandard(st, img, xcr0All, l); err != nil {
+		t.Fatal(err)
+	}
+	back := make([]byte, testFPLimit)
+	if err := x86StandardFromCompacted(back, st, xcr0All, l); err != nil {
+		t.Fatal(err)
+	}
+	// MXCSR_MASK belongs to the processor, and the area between the AVX and
+	// the AVX-512 components belongs to MPX, which XCR0 does not enable.
+	expectEqual(t, "x87 control words and MXCSR", back[:fxOffMXCSRMask], img[:fxOffMXCSRMask])
+	expectEqual(t, "x87 and XMM registers", back[fxOffST:fxOffXMMEnd], img[fxOffST:fxOffXMMEnd])
+	expectEqual(t, "AVX", back[576:832], img[576:832])
+	expectEqual(t, "AVX-512", back[1088:2688], img[1088:2688])
+	if got := binary.LittleEndian.Uint64(back[xsaveOffXstateBV:]); got != xcr0All {
+		t.Errorf("XSTATE_BV = %#x after the round trip, want %#x", got, uint64(xcr0All))
 	}
 }
 

@@ -55,10 +55,6 @@ const (
 	x64RegCr4    uint32 = 0x0000001F
 	x64RegXcr0   uint32 = 0x00000027
 
-	x64RegXmm0              uint32 = 0x00001000
-	x64RegFpMmx0            uint32 = 0x00001010
-	x64RegFpControlStatus   uint32 = 0x00001018
-	x64RegXmmControlStatus  uint32 = 0x00001019
 	x64RegEfer              uint32 = 0x00002001
 	x64RegKernelGsBase      uint32 = 0x00002002
 	x64RegStar              uint32 = 0x00002008
@@ -146,9 +142,11 @@ const (
 const (
 	capCodeHypervisorPresent uint32 = 0x00000000
 	capCodeFeatures          uint32 = 0x00000001
+	capCodeProcessorFeatures uint32 = 0x00001001
 	capCodeXsaveFeatures     uint32 = 0x00001003
 	capCodeGicLpiIntIdBits   uint32 = 0x00002011
 
+	propCodeProcessorFeatures  uint32 = 0x00001001
 	propCodeXsaveFeatures      uint32 = 0x00001006
 	propCodeProcessorCount     uint32 = 0x00001FFF
 	propCodeLocalApicEmulation uint32 = 0x00001005
@@ -176,11 +174,66 @@ const (
 	// SpeculationControl, one reserved bit, IdleSuspend, VirtualPciDeviceSupport,
 	// IommuSupport, VpHotAddRemove and DeviceAccessTracking.
 	featArm64Support uint64 = 1 << 11
-
-	// xsaveFeatXsaveSupport is the XsaveSupport bit of
-	// WHV_PROCESSOR_XSAVE_FEATURES.
-	xsaveFeatXsaveSupport uint64 = 1 << 0
 )
+
+// Bits of WHV_PROCESSOR_XSAVE_FEATURES. Each bit controls the CPUID bits of
+// the same name that the guest reads.
+const (
+	xsaveFeatXsave           uint64 = 1 << 0
+	xsaveFeatXsaveopt        uint64 = 1 << 1
+	xsaveFeatAvx             uint64 = 1 << 2
+	xsaveFeatAvx2            uint64 = 1 << 3
+	xsaveFeatFma             uint64 = 1 << 4
+	xsaveFeatMpx             uint64 = 1 << 5
+	xsaveFeatAvx512          uint64 = 1 << 6
+	xsaveFeatAvx512DQ        uint64 = 1 << 7
+	xsaveFeatAvx512CD        uint64 = 1 << 8
+	xsaveFeatAvx512BW        uint64 = 1 << 9
+	xsaveFeatAvx512VL        uint64 = 1 << 10
+	xsaveFeatXsaveComp       uint64 = 1 << 11
+	xsaveFeatXsaveSupervisor uint64 = 1 << 12
+	xsaveFeatXcr1            uint64 = 1 << 13
+	xsaveFeatAvx512Bitalg    uint64 = 1 << 14
+	xsaveFeatAvx512Ifma      uint64 = 1 << 15
+	xsaveFeatAvx512VBmi      uint64 = 1 << 16
+	xsaveFeatAvx512VBmi2     uint64 = 1 << 17
+	xsaveFeatAvx512Vnni      uint64 = 1 << 18
+	xsaveFeatGfni            uint64 = 1 << 19
+	xsaveFeatVaes            uint64 = 1 << 20
+	xsaveFeatAvx512VPopcntdq uint64 = 1 << 21
+	xsaveFeatVpclmulqdq      uint64 = 1 << 22
+	xsaveFeatAvx512Bf16      uint64 = 1 << 23
+	xsaveFeatAvx512Vp2Isect  uint64 = 1 << 24
+	xsaveFeatAvx512Fp16      uint64 = 1 << 25
+	xsaveFeatXfd             uint64 = 1 << 26
+	xsaveFeatAmxTile         uint64 = 1 << 27
+	xsaveFeatAmxBf16         uint64 = 1 << 28
+	xsaveFeatAmxInt8         uint64 = 1 << 29
+	xsaveFeatAvxVnni         uint64 = 1 << 30
+	xsaveFeatAvxIfma         uint64 = 1 << 31
+	xsaveFeatAvxNeConvert    uint64 = 1 << 32
+	xsaveFeatAvxVnniInt8     uint64 = 1 << 33
+	xsaveFeatAvxVnniInt16    uint64 = 1 << 34
+	xsaveFeatAvx10_1_256     uint64 = 1 << 35
+	xsaveFeatAvx10_1_512     uint64 = 1 << 36
+	xsaveFeatAmxFp16         uint64 = 1 << 37
+)
+
+// Bits of WHV_PROCESSOR_FEATURES whose instructions use the VEX or XOP
+// encoding. They raise #UD while XCR0 does not enable the AVX state.
+const (
+	procFeatXop  uint64 = 1 << 6
+	procFeatFma4 uint64 = 1 << 19
+	procFeatF16C uint64 = 1 << 20
+)
+
+// WHvVirtualProcessorStateTypeXsaveState selects the XSAVE state in
+// WHvGetVirtualProcessorState and WHvSetVirtualProcessorState.
+const vpStateTypeXsave uint32 = 0x00001001
+
+// hrInsufficientBuffer is WHV_E_INSUFFICIENT_BUFFER. A state read that
+// returns it reports the required size in its BytesWritten argument.
+const hrInsufficientBuffer uint32 = 0x80370301
 
 // WHV_MAP_GPA_RANGE_FLAGS values.
 const (

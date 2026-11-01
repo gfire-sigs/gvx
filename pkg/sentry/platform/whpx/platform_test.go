@@ -26,7 +26,7 @@ func TestNewPlatformFailsClosed(t *testing.T) {
 	t.Run("capability query fails", func(t *testing.T) {
 		fb := newFakeBackend()
 		fb.featErr = errors.New("capability boom")
-		if _, err := newPlatform(fb, Options{}); !errors.Is(err, fb.featErr) {
+		if _, err := newPlatform(fb, testOptions()); !errors.Is(err, fb.featErr) {
 			t.Errorf("error is %v", err)
 		}
 		if fb.partitionOpen {
@@ -36,7 +36,7 @@ func TestNewPlatformFailsClosed(t *testing.T) {
 	t.Run("hypervisor missing", func(t *testing.T) {
 		fb := newFakeBackend()
 		fb.feats.hypervisorPresent = false
-		if _, err := newPlatform(fb, Options{}); !errors.Is(err, ErrUnsupported) {
+		if _, err := newPlatform(fb, testOptions()); !errors.Is(err, ErrUnsupported) {
 			t.Errorf("error is %v", err)
 		}
 		if fb.partitionOpen {
@@ -46,7 +46,7 @@ func TestNewPlatformFailsClosed(t *testing.T) {
 	t.Run("partition creation fails", func(t *testing.T) {
 		fb := newFakeBackend()
 		fb.createErr = errors.New("create boom")
-		if _, err := newPlatform(fb, Options{}); !errors.Is(err, fb.createErr) {
+		if _, err := newPlatform(fb, testOptions()); !errors.Is(err, fb.createErr) {
 			t.Errorf("error is %v", err)
 		}
 	})
@@ -61,7 +61,7 @@ func TestNewPlatformFailsClosed(t *testing.T) {
 			}
 			return nil
 		}
-		if _, err := newPlatform(fb, Options{}); !errors.Is(err, boom) {
+		if _, err := newPlatform(fb, testOptions()); !errors.Is(err, boom) {
 			t.Fatalf("error is %v", err)
 		}
 		if fb.partitionOpen {
@@ -136,7 +136,7 @@ func TestNewPlatformMapsTheKernelRegion(t *testing.T) {
 
 func TestCloseReleasesEverything(t *testing.T) {
 	fb := newFakeBackend()
-	p, err := newPlatform(fb, Options{})
+	p, err := newPlatform(fb, testOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,8 +163,8 @@ func TestCloseReleasesEverything(t *testing.T) {
 	if err := as.(*AddressSpace).mapHost(0x500000, guestMem, hostarch.ReadWrite); !errors.Is(err, errClosed) {
 		t.Errorf("mapping after Close returned %v, want errClosed", err)
 	}
-	if len(fb.vps) != 0 || len(fb.deleted) != 1 {
-		t.Errorf("%d virtual processors remain, %d deleted", len(fb.vps), len(fb.deleted))
+	if len(fb.vps) != 0 || len(fb.deleted) != fb.created {
+		t.Errorf("%d virtual processors remain, %d of %d deleted", len(fb.vps), len(fb.deleted), fb.created)
 	}
 	if fb.partitionOpen {
 		t.Error("the partition stays open")
@@ -182,7 +182,7 @@ func TestCloseReleasesEverything(t *testing.T) {
 
 func TestCloseReportsBackendErrors(t *testing.T) {
 	fb := newFakeBackend()
-	p, err := newPlatform(fb, Options{})
+	p, err := newPlatform(fb, testOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
