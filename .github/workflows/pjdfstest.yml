@@ -47,9 +47,9 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Build rungv
@@ -140,7 +140,7 @@ jobs:
           EOF
           e2fsck -fn "$PWD/cache/volumes/pjdfs_build.ext4"
       - name: Upload guest-built pjdfstest bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pjdfstest-bundle-${{ matrix.arch }}
           path: bundle/
@@ -210,13 +210,13 @@ jobs:
       GVX_ALLOW_NO_HYPERVISOR: "1"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Download pjdfstest bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pjdfstest-bundle-${{ matrix.arch }}
           path: bundle
