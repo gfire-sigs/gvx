@@ -24,6 +24,7 @@ var GoldenDigests = map[string]string{
 	"abi_auxv_procfs":           "auxv:ok:proc:exe+maps+fd+stat+cpuinfo:rng:32b",
 	"cpu_dual_tls_wine64_teb":   "teb:self=ok:peb=ok:tls0=0xcafe1234dead5678:tls1=0x102a:svc=ok:fault=ok:sig=ok",
 	"cpu_simd_fp_preservation":  "simd:128bit:lanes=ok:svc=ok:fault=ok:xor=0xa5a5a5a55a5a5a5a",
+	"cpu_feature_consistency":   "features:hw=kernel=cpuinfo:vector=ok",
 	"wine64_pe32plus_execution": "pe32+:magic=0x20b:base=0x140000000:ret=0x140001379:tls2=0x77696e6536346f6b:data=0x57494e45",
 	"wine64_pe_mmap_layout":     "mmap:pe_fixed=0x140000000:low32=ok:mremap=ok",
 	"wine64_wineserver_ipc":     "ipc:memfd=ok:scm_rights=ok:shared_coh=0x57535256:preadv=ok",
