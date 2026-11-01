@@ -189,11 +189,20 @@ func (b *winBackend) createPartition(vpCount uint32) (info partitionInfo, err er
 		return info, err
 	}
 	if runtime.GOARCH == "arm64" {
-		// The stub exits with HVC. The hypervisor reports it to the caller
-		// only when the partition enables hypercall exits.
-		exits := extExitHypercall
-		if err := call(procSetPartitionProperty, "WHvSetPartitionProperty(ExtendedVmExits)",
-			h, uintptr(propCodeExtendedVmExits), uintptr(unsafe.Pointer(&exits)), 8); err != nil {
+		var lpiBits uint32
+		if err := getCapability(capCodeGicLpiIntIdBits, unsafe.Pointer(&lpiBits), 4); err != nil {
+			return info, err
+		}
+		ic := a64ICParameters{
+			EmulationMode: 1,
+			Distributor:   a64GicDistributor,
+			Translator:    a64GicTranslator,
+			LPIBits:       lpiBits,
+			TimerPPI:      27,
+			PMUPPI:        23,
+		}
+		if err := call(procSetPartitionProperty, "WHvSetPartitionProperty(Arm64IcParameters)",
+			h, uintptr(propCodeArm64IcParameters), uintptr(unsafe.Pointer(&ic)), unsafe.Sizeof(ic)); err != nil {
 			return info, err
 		}
 	}

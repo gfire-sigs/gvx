@@ -397,13 +397,15 @@ func writeCancelExit(buf []byte, cpl uint8, pc uint64) {
 	binary.LittleEndian.PutUint64(buf[x64ExitOffRip:], pc)
 }
 
-// writeStubExit writes the exit of the stub: HLT on amd64, HVC on arm64. pc
-// is the address that the exit context reports.
+// writeStubExit writes the exit of the stub. pc is the address that the exit
+// context reports. On amd64 the exit is HLT. On arm64 it is the EL1 read of
+// unbacked GPA zero.
 func writeStubExit(buf []byte, pc uint64) {
 	clear(buf)
 	if runtime.GOARCH == "arm64" {
-		binary.LittleEndian.PutUint32(buf[a64ExitOffReason:], a64ExitHypercall)
+		binary.LittleEndian.PutUint32(buf[a64ExitOffReason:], a64ExitUnmappedGpa)
 		binary.LittleEndian.PutUint64(buf[a64ExitOffHdrPc:], pc)
+		binary.LittleEndian.PutUint64(buf[a64ExitOffHdrCpsr:], a64PstateKernel)
 		return
 	}
 	binary.LittleEndian.PutUint32(buf[x64ExitOffReason:], x64ExitHalt)

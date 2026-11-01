@@ -244,8 +244,8 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 			if ExitReason(atomic.LoadUint32(&v.comm.ExitReason)) != ExitNone {
 				// The stub finished spilling guest state into the CommPage
 				// right as WHvCancelRunVirtualProcessor stopped the vCPU at
-				// HLT/HVC. Serve the completed stub exit instead of treating
-				// the post-HLT/HVC PC as a mid-stub cancellation.
+				// its exit instruction. Serve the completed stub exit instead
+				// of treating it as a partial register spill.
 				r, resume := c.onStubExit(v, ex, ac)
 				if resume {
 					continue
@@ -273,7 +273,13 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 // decodeExit decodes the exit context of the last run.
 func (v *vcpu) decodeExit() (exitInfo, error) {
 	if v.p.arm64 {
-		return decodeExitA64(v.exit)
+		ex, err := decodeExitA64(v.exit)
+		if err == nil && ex.kind == exitMemory && ex.gpa == 0 && ex.inKernel(true) &&
+			ex.pc == v.p.kernel.layout.code()+uint64(v.p.kernel.a64.Exit) &&
+			ExitReason(atomic.LoadUint32(&v.comm.ExitReason)) == ExitException {
+			ex.kind = exitStub
+		}
+		return ex, err
 	}
 	return decodeExitX64(v.exit)
 }

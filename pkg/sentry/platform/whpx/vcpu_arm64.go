@@ -74,15 +74,20 @@ func (v *vcpu) archBringUp() error {
 	sctlr := b.u64(0)
 
 	b.reset()
+	b.add64(a64RegGicrBase, a64GicRedistBase+uint64(v.index)*a64GicRedistSize)
 	b.add64(a64RegMair, a64Mair)
 	b.add64(a64RegTcr, a64TCR)
 	b.add64(a64RegTtbr0, p.kernel.pt.TTBR0_EL1(false, 0))
 	b.add64(a64RegTtbr1, p.kernel.pt.TTBR1_EL1(false, 0))
 	b.add64(a64RegCpacr, a64CpacrNoTrap)
 	b.add64(a64RegCntkctl, a64CntkctlEL0)
+	b.add64(a64RegCntvCtl, 2)
 	b.add64(a64RegSctlr, sctlr|a64SctlrSet)
 	b.add64(a64RegVbar, layout.code()+uint64(stubs.Vectors))
 	b.add64(a64RegTpidrro, 0)
+	// Secondary processors start suspended until the guest powers them on.
+	// Sentry schedules Linux threads directly, so every processor starts active.
+	b.add64(a64RegInternalActivity, 0)
 	v.addParkRegs(b)
 	if err := p.be.setRegs(v.index, b); err != nil {
 		return err
@@ -142,6 +147,10 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	case !st.valid || !st.parked:
 		v.addParkRegs(b)
 	case st.exitPC != v.reloadVA():
+		// The stub stops with a load from an unbacked GPA, and the memory
+		// exit leaves PC at that load. Every stop therefore costs one PC
+		// write. WHP consumes HVC #0 without an exit, so no instruction that
+		// exits past itself is available.
 		b.add64(a64RegPc, v.reloadVA())
 	}
 	// The stub loads TTBR0_EL1 from CommPage.Root. The host also writes the
@@ -168,16 +177,12 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	return runResult{}, false
 }
 
-// onStubExit reads the CommPage after the stub executed HVC.
+// onStubExit reads the CommPage after the stub completed its register spill.
 func (c *Context) onStubExit(v *vcpu, ex exitInfo, ac *arch.Context64) (runResult, bool) {
 	comm := v.comm
-	if ex.hvcImmediate != 0 {
-		v.st.invalidate()
-		return runResult{err: fmt.Errorf("whpx: virtual processor %d executed HVC #%d", v.index, ex.hvcImmediate)}, false
-	}
 	if reason := ExitReason(atomic.LoadUint32(&comm.ExitReason)); reason != ExitException {
 		v.st.invalidate()
-		return runResult{err: fmt.Errorf("whpx: virtual processor %d executed HVC with stub exit reason %d", v.index, reason)}, false
+		return runResult{err: fmt.Errorf("whpx: virtual processor %d stopped with stub exit reason %d", v.index, reason)}, false
 	}
 	v.st.parked = true
 	v.st.exitPC = ex.pc
@@ -253,7 +258,7 @@ func (c *Context) saveUserRegs(v *vcpu, ac *arch.Context64) error {
 func (v *vcpu) stubRanges() (entry, reload addrRange) {
 	code := v.p.kernel.layout.code()
 	s := v.p.kernel.a64
-	return addrRange{code + uint64(s.Vectors), code + uint64(s.Hvc) + 4},
+	return addrRange{code + uint64(s.Vectors), code + uint64(s.Exit) + 4},
 		addrRange{code + uint64(s.Reload), code + uint64(s.ReloadEnd)}
 }
 

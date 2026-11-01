@@ -80,14 +80,6 @@ type whvA64MemoryAccessContext struct {
 	Syndrome             uint64
 }
 
-type whvA64HypercallContext struct {
-	Header    whvInterceptMessageHeader
-	Immediate uint16
-	Reserved1 uint16
-	Reserved2 uint32
-	X         [18]uint64
-}
-
 type whvA64RunVpExitContext struct {
 	ExitReason uint32
 	Reserved   uint32
@@ -117,7 +109,6 @@ func TestExitContextLayoutMatchesTheHeader(t *testing.T) {
 	}
 	var a whvA64RunVpExitContext
 	var m whvA64MemoryAccessContext
-	var h whvA64HypercallContext
 	const unionOff = 16
 	if unsafe.Offsetof(a.Union) != unionOff {
 		t.Fatalf("arm64 union starts at %d, want %d", unsafe.Offsetof(a.Union), unionOff)
@@ -137,7 +128,6 @@ func TestExitContextLayoutMatchesTheHeader(t *testing.T) {
 		{"arm64 Gva", unionOff + unsafe.Offsetof(m.Gva), a64ExitOffMemGva},
 		{"arm64 Gpa", unionOff + unsafe.Offsetof(m.Gpa), a64ExitOffMemGpa},
 		{"arm64 Syndrome", unionOff + unsafe.Offsetof(m.Syndrome), a64ExitOffMemSyndrom},
-		{"arm64 hypercall Immediate", unionOff + unsafe.Offsetof(h.Immediate), a64ExitOffHvcImm},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s is %d, constant says %d", c.name, c.got, c.want)
@@ -230,27 +220,12 @@ func TestDecodeExitA64(t *testing.T) {
 		}
 	}
 	const unionOff = 16
-	var h whvA64HypercallContext
 	var m whvA64MemoryAccessContext
-
-	hvc := buf()
-	put(hvc, 0, uint32(a64ExitHypercall))
-	put(hvc, unionOff+unsafe.Offsetof(h.Header.Pc), uint64(0xFFFF000000001870))
-	put(hvc, unionOff+unsafe.Offsetof(h.Header.Cpsr), uint64(0x3C5))
-	put(hvc, unionOff+unsafe.Offsetof(h.Immediate), uint16(0))
-	e, err := decodeExitA64(hvc)
-	if err != nil || e.kind != exitStub || e.pc != 0xFFFF000000001870 || e.cpsr != 0x3C5 || e.hvcImmediate != 0 {
-		t.Errorf("hypercall decodes to %+v, %v", e, err)
-	}
-	put(hvc, unionOff+unsafe.Offsetof(h.Immediate), uint16(7))
-	if e, _ = decodeExitA64(hvc); e.hvcImmediate != 7 {
-		t.Errorf("HVC immediate is %d, want 7", e.hvcImmediate)
-	}
 
 	// Cancelled runs carry only the cancel reason, so no field may be read.
 	cancel := buf()
 	put(cancel, 0, uint32(a64ExitCanceled))
-	if e, _ = decodeExitA64(cancel); e.kind != exitCanceled {
+	if e, _ := decodeExitA64(cancel); e.kind != exitCanceled {
 		t.Errorf("cancel decodes to %+v", e)
 	}
 

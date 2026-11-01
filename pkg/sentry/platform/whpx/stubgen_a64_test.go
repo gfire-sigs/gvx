@@ -22,13 +22,8 @@ import (
 	"golang.org/x/arch/arm64/arm64asm"
 )
 
-// Raw encodings that the arm64 decoder does not name. They come from the
-// Arm Architecture Reference Manual: HVC #imm16 is 0xD4000002 | imm16<<5,
-// and IC IALLUIS is SYS #0, C7, C1, #0.
-const (
-	a64WordHVC0     = 0xD4000002
-	a64WordICIALLUS = 0xD508711F
-)
+// The decoder does not name IC IALLUIS: SYS #0, C7, C1, #0.
+const a64WordICIALLUS = 0xD508711F
 
 // a64Listing returns the decoded text of each instruction in [start, end).
 // An instruction that the decoder cannot name appears as "word 0x...".
@@ -80,7 +75,7 @@ func TestA64CommonHandlerSpillsAndExits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := a64Listing(t, s.Code, s.Common, s.Hvc+4)
+	got := a64Listing(t, s.Code, s.Common, s.Exit+4)
 	var want []string
 	for r := 2; r < 30; r += 2 {
 		want = append(want, fmt.Sprintf("STP X%d, X%d, [SP,#%d]", r, r+1, commOffRegs+r*8))
@@ -98,7 +93,14 @@ func TestA64CommonHandlerSpillsAndExits(t *testing.T) {
 		fmt.Sprintf("STP X4, X5, [SP,#%d]", commOffFaultAddr),
 		fmt.Sprintf("MOV W0, #%#x", uint32(ExitException)),
 		fmt.Sprintf("STR W0, [SP,#%d]", commOffExitReason),
-		fmt.Sprintf("word %#x", a64WordHVC0),
+	)
+	want = append(want,
+		"DSB ISH",
+		"MOV X0, #0x2000",
+		"MOVK X0, #0x0, LSL #16",
+		"MOVK X0, #0x0, LSL #32",
+		"MOVK X0, #0xffff, LSL #48",
+		"LDR XZR, [X0]",
 	)
 	if len(got) != len(want) {
 		t.Fatalf("common handler has %d instructions, want %d:\n%v", len(got), len(want), got)
@@ -108,8 +110,8 @@ func TestA64CommonHandlerSpillsAndExits(t *testing.T) {
 			t.Errorf("instruction %d is %q, want %q", i, got[i], want[i])
 		}
 	}
-	if s.Reload != s.Hvc+4 {
-		t.Errorf("reload starts at %#x, want right after HVC at %#x so that the resume falls through", s.Reload, s.Hvc+4)
+	if s.Reload != s.Exit+4 {
+		t.Errorf("reload starts at %#x, want after the exit at %#x", s.Reload, s.Exit+4)
 	}
 	// The saved field offsets must be reachable by the instruction forms.
 	if commOffFlags/4 > 0xFFF || commOffRoot/8 > 0xFFF {
