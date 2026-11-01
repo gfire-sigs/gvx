@@ -50,10 +50,14 @@ type vcpu struct {
 	commVA uint64
 
 	// regs, exit and xsave are scratch buffers for the holder of the vcpu.
-	// xsave holds the compacted XSAVE state of an amd64 processor.
-	regs  *regBatch
-	exit  []byte
-	xsave []byte
+	// xsave holds the compacted XSAVE state of an amd64 processor in its
+	// first xsaveLen bytes. xsaveCurrent reports that the processor ran no
+	// guest code since xsave was read or written.
+	regs         *regBatch
+	exit         []byte
+	xsave        []byte
+	xsaveLen     int
+	xsaveCurrent bool
 
 	// busy and fpOwner belong to Platform.mu.
 	busy    bool

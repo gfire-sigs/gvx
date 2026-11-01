@@ -220,6 +220,8 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 		return runResult{err: platform.ErrContextInterrupt}
 	}
 	for {
+		// The guest changes its vector registers.
+		v.xsaveCurrent = false
 		if err := v.p.be.run(v.index, v.exit); err != nil {
 			v.st.invalidate()
 			return runResult{err: fmt.Errorf("whpx: run virtual processor %d: %w", v.index, err)}

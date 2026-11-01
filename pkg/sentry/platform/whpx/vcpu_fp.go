@@ -23,7 +23,7 @@ import (
 // image. The processor must not run.
 func (v *vcpu) readFP(image []byte) error {
 	if !v.p.arm64 {
-		state, err := v.fetchXsave()
+		state, err := v.xsaveState()
 		if err != nil {
 			return err
 		}
@@ -43,15 +43,20 @@ func (v *vcpu) readFP(image []byte) error {
 func (v *vcpu) writeFP(image []byte) error {
 	if !v.p.arm64 {
 		// The hypervisor state carries supervisor components and an XCOMP_BV
-		// that the Sentry image lacks, so the write starts from a fresh read.
-		state, err := v.fetchXsave()
+		// that the Sentry image lacks, so the write starts from the current
+		// state of the processor.
+		state, err := v.xsaveState()
 		if err != nil {
 			return err
 		}
 		if err := x86CompactedFromStandard(state, image, v.p.vec.xcr0, v.p.vec.layout); err != nil {
 			return err
 		}
-		return v.p.be.setXsave(v.index, state)
+		if err := v.p.be.setXsave(v.index, state); err != nil {
+			v.xsaveCurrent = false
+			return err
+		}
+		return nil
 	}
 	b := v.regs
 	b.reset()
@@ -65,6 +70,17 @@ func (v *vcpu) writeFP(image []byte) error {
 // page-aligned buffer to the same calls.
 const xsaveAlign = pageSize
 
+// xsaveState returns the XSAVE state of the processor. The state call costs
+// as much as a guest exit, so it reads the state only when the processor ran
+// since the last read or write. A signal delivery pulls and then pushes the
+// state without a run in between.
+func (v *vcpu) xsaveState() ([]byte, error) {
+	if v.xsaveCurrent {
+		return v.xsave[:v.xsaveLen], nil
+	}
+	return v.fetchXsave()
+}
+
 // fetchXsave reads the XSAVE state of the processor into its scratch buffer.
 // It grows the buffer once when the hypervisor asks for more space.
 func (v *vcpu) fetchXsave() ([]byte, error) {
@@ -77,6 +93,7 @@ func (v *vcpu) fetchXsave() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("whpx: read XSAVE state of virtual processor %d: %w", v.index, err)
 		}
+		v.xsaveLen, v.xsaveCurrent = n, true
 		return v.xsave[:n], nil
 	}
 	return nil, fmt.Errorf("whpx: XSAVE state of virtual processor %d grew between two reads", v.index)

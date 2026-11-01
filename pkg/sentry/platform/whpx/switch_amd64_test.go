@@ -582,11 +582,17 @@ func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
 	// A signal handler or ptrace changes the image; the next Switch loads it.
 	setImageVector(ac, 0, 0x3333, 0xBBBB)
 	c.FullStateChanged()
+	gets = vp.xsaveGets
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
 	if lo, hi := e.fb.vector(0, 0); lo != 0x3333 || hi != 0xBBBB {
 		t.Errorf("Switch after FullStateChanged loaded YMM0 = %#x:%#x, want 0xbbbb:0x3333", hi, lo)
+	}
+	// No guest code ran between the pull and the push, so the push reuses
+	// the state of the pull.
+	if vp.xsaveGets != gets {
+		t.Errorf("the push after a pull read the XSAVE state %d more times", vp.xsaveGets-gets)
 	}
 }
 
