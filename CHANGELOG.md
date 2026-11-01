@@ -2,9 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.3.0] - 2026-11-02
 
-This section makes the CPU features that a guest sees agree with the features that it can use.
+This release makes the CPU features that a guest sees agree with the features that it can use.
 
 ### Bug Fixes
 
