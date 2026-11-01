@@ -110,7 +110,9 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       # The heading of the section is "## [TAG]". A dry run reads the
-      # "## [Unreleased]" section, so that it verifies the same parser.
+      # "## [Unreleased]" section, so that it verifies the same parser. A
+      # relative link resolves against the release page, so the step points
+      # each one at the file in the built commit.
       - name: Extract release notes
         run: |
           section=Unreleased
@@ -121,6 +123,7 @@ jobs:
             found { print }
             END { if (!found) exit 1 }
           ' CHANGELOG.md > notes.md || { echo "CHANGELOG.md has no section $section" >&2; exit 1; }
+          sed -i -E "s#\]\(([^):]+)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/\1)#g" notes.md
           test -s notes.md
           cat notes.md
       - name: Publish release
