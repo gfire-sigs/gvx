@@ -405,13 +405,16 @@ func DecodeA64SyncException(esr, far, pc, sp uint64) (kind A64ExitKind, sig *lin
 // A64StubOptions configures the shared ARM64 EL1 exception vector and
 // spill/reload page generator.
 type A64StubOptions struct {
+	// ExitLoadAddress selects an EL1 load as the exit instruction. The caller
+	// maps this address to an unbacked GPA. Zero selects HVC #0 instead.
+	ExitLoadAddress uint64
 	// SpillFP spills and reloads Q0..Q31, FPSR, and FPCR in the EL1 stub.
 	SpillFP  bool
 	OffVRegs int
 	OffFPSR  int
 	OffFPCR  int
 
-	// WriteExitReason stores ExitException (32-bit) at OffExitReason before HVC #0.
+	// WriteExitReason stores ExitException (32-bit) before the exit instruction.
 	WriteExitReason bool
 	OffExitReason   int
 	ExitException   uint16
@@ -425,8 +428,8 @@ type A64StubOptions struct {
 }
 
 // BuildA64VectorPage generates the 4KB ARM64 EL1 exception vector table,
-// common register spill handler, HVC #0 exit point, and reload/ERET routine.
-func BuildA64VectorPage(opts A64StubOptions) (page []byte, hvcOff, reloadOff, reloadEnd int) {
+// common register spill routine, exit instruction, and reload/ERET routine.
+func BuildA64VectorPage(opts A64StubOptions) (page []byte, exitOff, reloadOff, reloadEnd int) {
 	page = make([]byte, PageSize4K)
 	off := 0
 	emit := func(insn uint32) {
@@ -481,8 +484,18 @@ func BuildA64VectorPage(opts A64StubOptions) (page []byte, hvcOff, reloadOff, re
 			STRWSP(0, opts.OffExitReason),
 		)
 	}
-	hvcOff = off
-	emit(HVC(0))
+	if opts.ExitLoadAddress != 0 {
+		// Complete the register spill before the memory access exits to the host.
+		emit(DSBISH)
+		address := MovConst(0, opts.ExitLoadAddress)
+		emitAll(address[:]...)
+	}
+	exitOff = off
+	if opts.ExitLoadAddress != 0 {
+		emit(LDRX(0, 31, 0))
+	} else {
+		emit(HVC(0))
+	}
 	reloadOff = off
 
 	if !opts.ReloadTTBR0 {
@@ -542,7 +555,7 @@ func BuildA64VectorPage(opts A64StubOptions) (page []byte, hvcOff, reloadOff, re
 	}
 	emit(ERET)
 	reloadEnd = off
-	return page, hvcOff, reloadOff, reloadEnd
+	return page, exitOff, reloadOff, reloadEnd
 }
 
 // PstateEL1h is EL1 with SP_EL1 selected and the D, A, I, and F masks set.

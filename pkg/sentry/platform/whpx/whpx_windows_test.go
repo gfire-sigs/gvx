@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
@@ -91,6 +92,8 @@ func realGuest(t *testing.T, p *Platform, code []byte) (*Context, *fakeMM, *arch
 	}
 	c := p.NewContext(nil).(*Context)
 	t.Cleanup(c.Release)
+	deadline := time.AfterFunc(5*time.Second, c.Interrupt)
+	t.Cleanup(func() { deadline.Stop() })
 	ac := arch.New(arch.Host)
 	setGuestEntry(ac, guestCodeAddr)
 	return c, &fakeMM{as: as}, ac

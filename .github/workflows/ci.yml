@@ -242,9 +242,9 @@ jobs:
       - name: Test shim control plane
         shell: bash
         run: go test -count=1 ./internal/gvxshim/ ./cmd/containerd-shim-gvx-v2/
-      - name: Test systrap engine
+      - name: Test execution backends
         shell: bash
-        run: go test -count=1 ./pkg/sentry/platform/systrap/
+        run: go test -count=1 ./pkg/sentry/platform/whpx/ ./pkg/sentry/platform/systrap/
       - name: Test systrap end-to-end suite
         shell: bash
         env:

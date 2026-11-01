@@ -104,7 +104,11 @@ const (
 	a64RegSpsrEl1  uint32 = 0x00040014
 	a64RegElrEl1   uint32 = 0x00040015
 	a64RegCntkctl  uint32 = 0x00058008
+	a64RegCntvCtl  uint32 = 0x0005800E
+	a64RegGicrBase uint32 = 0x00063000
 )
+
+const a64RegInternalActivity uint32 = 0x00000004
 
 // WHV_RUN_VP_EXIT_REASON values for x64 partitions.
 const (
@@ -144,12 +148,28 @@ const (
 	capCodeHypervisorPresent uint32 = 0x00000000
 	capCodeFeatures          uint32 = 0x00000001
 	capCodeXsaveFeatures     uint32 = 0x00001003
+	capCodeGicLpiIntIdBits   uint32 = 0x00002011
 
 	propCodeExtendedVmExits    uint32 = 0x00000001
 	propCodeXsaveFeatures      uint32 = 0x00001006
 	propCodeProcessorCount     uint32 = 0x00001FFF
 	propCodeLocalApicEmulation uint32 = 0x00001005
+	propCodeArm64IcParameters  uint32 = 0x00001012
 )
+
+// a64ICParameters follows WHV_ARM64_IC_PARAMETERS in WinHvPlatformDefs.h.
+// WHP requires GICv3 configuration before setting up an ARM64 partition.
+type a64ICParameters struct {
+	EmulationMode uint32
+	_             uint32
+	Distributor   uint64
+	Translator    uint64
+	_             uint32
+	LPIBits       uint32
+	TimerPPI      uint32
+	PMUPPI        uint32
+	_             [6]uint32
+}
 
 // Bits of WHV_CAPABILITY_FEATURES and related unions.
 const (

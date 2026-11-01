@@ -5,7 +5,7 @@ It proposes the work needed to verify native Linux ARM64 workloads on Windows th
 
 | Item | Scope |
 | :--- | :--- |
-| Status | Proposed implementation plan; current source assessment |
+| Status | M2 startup implemented; additional state and compatibility verification remains planned |
 | Primary milestone | M2: WHPX initialization, guest entry, and static ELF execution |
 | Related milestones | M1 host primitives; M3 dynamic workloads; M4 containment; M5 systrap |
 | Architecture authority | [Architecture and milestone contracts](architecture.md) |
@@ -18,9 +18,9 @@ Windows ARM64 already has WHPX and systrap implementations.
 The next work should complete and verify the existing WHPX backend.
 The macOS HVF backend supplies an architectural reference for guest execution, memory isolation, and cancellation.
 
-The first blocking gap concerns interrupt controller configuration.
-The Windows backend omits the ARM64 GIC configuration that Microsoft requires before partition setup.
-Native tests reproduced a setup failure before any guest instruction executed.
+The Windows backend now configures GICv3 and activates secondary virtual processors.
+Its EL1 stub returns through an unbacked GPA read, because generic `HVC #0` did not return to the host.
+Native syscall, fault, interruption, and concurrent processor tests pass.
 
 The proposed sequence is: partition initialization, CPU state, memory lifetime, workload compatibility, containment, and sustained verification.
 Cross-compilation and systrap results cannot establish WHPX execution support.
@@ -34,7 +34,7 @@ The presence of a test does not establish a passing native result.
 | Boundary | Existing implementation | Consequence for the plan |
 | :--- | :--- | :--- |
 | M1 host primitives | Windows siblings implement futex waits, mappings, descriptors, clocks, and memory allocation. | Reuse these packages; investigate only failing ARM64 contracts. |
-| M2 Windows backend | `whpx` contains DLL calls, ARM64 registers, exception stubs, page tables, and cancellation. | Repair startup before changing guest execution. |
+| M2 Windows backend | `whpx` configures GICv3, processor startup, ARM64 registers, exception stubs, page tables, and cancellation. | Extend native verification beyond the passing execution gates. |
 | M2 macOS backend | `hvf` implements EL1 entry, 4KB Stage-1 tables, communication pages, and worker threads. | Compare invariants; retain Windows API ownership in `whpx`. |
 | Shared ARM64 logic | `hvcommon` contains instruction encoders, vector generation, exception decoding, and table allocation. | Extend shared pure logic only when both backends require the same contract. |
 | M3 integration | `pkg/gvx` selects backends and coordinates OCI, Sentry, and networking. | Reuse the Linux ARM64 ABI and image pipeline. |
@@ -60,12 +60,12 @@ Changes inside these additive platform packages require no upstream Sentry edits
 ### CI Coverage
 
 The current workflows compile all five supported targets.
-The ARM64 Windows job executes the shim, systrap, and selected runtime suites.
+The ARM64 Windows job executes the shim, both Windows platform packages, and selected systrap runtime suites.
 
 | Workflow | ARM64 Windows coverage | Missing evidence |
 | :--- | :--- | :--- |
 | [CI build job](../.github/workflows/ci.yml) | Whole-root build and selected vet commands | Native hardware behavior |
-| CI Windows ARM64 job | Shim controls, systrap platform tests, and selected offline suites | WHPX package tests and WHPX guests |
+| CI Windows ARM64 job | Shim controls, both platform packages, and selected offline suites | Native WHPX guests when the hosted runner lacks a hypervisor |
 | [Weekly image gates](../.github/workflows/e2e-images.yml) | ARM64 image workloads through systrap | ARM64 image workloads through WHPX |
 | CI macOS job | Signed tests on a hosted runner | Native HVF guests when the runner lacks a hypervisor |
 
@@ -79,7 +79,7 @@ Their host APIs, initialization requirements, and state transfer mechanisms diff
 
 | Concern | macOS HVF implementation | Windows implementation or required action |
 | :--- | :--- | :--- |
-| Guest syscall | EL0 `SVC #0`, EL1 vectors, shared state, then `HVC #0` | Reuse the existing vector generator and WHPX hypercall exit. |
+| Guest syscall | EL0 `SVC #0`, EL1 vectors, shared state, then `HVC #0` | Reuse vector generation; an EL1 read from GPA zero returns through a WHPX memory exit. |
 | Privilege separation | Immutable EL1 mappings through `TTBR1_EL1`; user mappings through `TTBR0_EL1` | Preserve the existing shared kernel tree and separate user roots. |
 | Guest page size | 4KB Stage-1 entries over 16KB host mappings | Preserve 4KB entries over Windows mappings with 64KB allocation alignment. |
 | Memory registration | HVF retains Stage-2 registrations for backing regions. | WHPX retains GPA registrations and updates guest page tables. |
@@ -100,13 +100,14 @@ The port needs the same containment outcome without copying the macOS worker mod
 
 ## 4. Gaps and Risks (Reference Module)
 
-The findings below distinguish source omissions, native failures, and unresolved compatibility risks.
+The findings below distinguish resolved startup defects from unresolved compatibility risks.
 Priority describes implementation order within this plan.
 
 | Priority | Finding | Evidence | Required result |
 | :--- | :--- | :--- | :--- |
-| P0 | Partition setup omits ARM64 interrupt controller configuration. | `createPartition` sets processor count and hypercall exits, then calls setup without GIC parameters. | Native partition creation succeeds with valid GICv3 configuration. |
-| P0 | vCPU initialization omits the redistributor base. | `archBringUp` writes EL1 registers without `WHvArm64RegisterGicrBaseGpa`. | Every vCPU receives a distinct valid redistributor region before execution. |
+| Resolved | Partition setup requires ARM64 interrupt controller configuration. | `createPartition` now configures GICv3 before setup. | Native partition creation passes. |
+| Resolved | Every vCPU requires a redistributor and an active state. | `archBringUp` configures both before execution. | Two vCPUs execute concurrently. |
+| Resolved | A generic HVC does not provide the required WHPX return path. | The stub now reads an unbacked GPA through an EL1 mapping. | Syscalls and page faults return without cancellation. |
 | P0 | ARM64 WHPX has no routine native execution gate. | CI selects systrap on the ARM64 hosted runner. | A capable ARM64 host executes explicit WHPX tests without skips. |
 | P1 | FP converters use different byte layouts. | WHPX, HVF, and systrap read different offsets in `FloatingPointData`. | Guest vectors and control registers survive signals and context migration. |
 | P1 | WHPX uses baseline ID registers. | `newVP` selects `DefaultIDRegisters`; HVF reads hardware ID registers. | Advertised features match the executable guest instruction set. |
@@ -119,14 +120,13 @@ Microsoft requires `WHvPartitionPropertyCodeArm64IcParameters` before `WHvSetupP
 The property selects GICv3 emulation and supplies its parameters.
 The [setup contract](https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvsetuppartition) documents failure when this configuration is absent.
 
-The current [partition initialization](../pkg/sentry/platform/whpx/backend_windows.go) contains no call that sets this property.
-A controlled native probe reproduced the failure without GIC configuration and succeeded after adding that configuration.
-This confirms the setup prerequisite on the assessment host.
-It does not justify classifying every setup failure as a missing host feature.
+The [partition initialization](../pkg/sentry/platform/whpx/backend_windows.go) now sets this property before setup.
+A controlled native probe reproduced the failure without GIC configuration and succeeded with that configuration.
+The runtime tests now pass partition creation on the same host.
 
 Microsoft also requires `WHvArm64RegisterGicrBaseGpa` before each vCPU runs.
 The [register contract](https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvsetvirtualprocessorregisters) defines this requirement.
-The current [ARM64 initialization](../pkg/sentry/platform/whpx/vcpu_arm64.go) omits that register.
+The [ARM64 initialization](../pkg/sentry/platform/whpx/vcpu_arm64.go) now sets that register for every virtual processor.
 
 The [Microsoft ARM64 sample](https://github.com/MicrosoftDocs/Virtualization-Documentation/blob/main/virtualization/api/hypervisor-platform/samples/WinHvSampleArm64.cpp)
 demonstrates both initialization operations.
@@ -134,8 +134,18 @@ The runtime needs valid controller configuration even though Sentry does not boo
 
 The [WHPX layout](../pkg/sentry/platform/whpx/layout.go) reserves GPA space from 1GiB through 64GiB for tables and guest memory.
 Some addresses in the Microsoft sample fall inside that window.
-The proposed controller layout uses dedicated regions below `gpaWindowBase`, with validated alignment and separate redistributors for all vCPUs.
+The controller layout uses dedicated regions below `gpaWindowBase`, with separate redistributors for all vCPUs.
 The RAM allocator must never allocate those regions.
+
+### Guest Return and Processor Startup
+
+The shared vector generator retains `HVC #0` for HVF and supports a notification load for WHPX.
+WHPX maps one EL1-only virtual page to GPA zero, which the RAM allocator never backs.
+The host recognizes this exit only at the stub instruction, with kernel privilege and a completed register spill.
+
+Secondary WHPX processors start suspended.
+The backend clears their startup suspension before Sentry assigns guest threads.
+The concurrent processor regression fails without this activation and passes with it.
 
 ### CPU State and Feature Reporting
 
@@ -178,7 +188,7 @@ Complete each acceptance gate before starting work that depends on it.
 > Verify shared ARM64 changes on macOS before adding Windows bindings.
 > Reserve controller regions outside RAM allocations before creating a WHPX partition.
 
-1. Reproduce the current failures with explicit native WHPX tests.
+1. Reproduce any new failure with explicit native WHPX tests.
 2. Add ARM64 controller configuration before partition setup.
 3. Configure the redistributor base for every vCPU.
 4. Verify EL1 initialization and the first syscall round trip.
@@ -241,7 +251,7 @@ Keep host-specific primitive tests in Windows test files.
 5. Verify NAT, port forwarding, DNS, and WireGuard behavior.
 6. Verify explicit WHPX failure and automatic fallback reporting.
 7. Execute systrap regressions after any shared ARM64 change.
-8. Extend the existing ARM64 CI job with pure WHPX contract tests.
+8. Retain WHPX contract tests in the existing ARM64 CI job.
 9. Execute hardware tests on a WHP-capable ARM64 host before release.
 10. Update backend-specific support and containment descriptions.
 
@@ -312,25 +322,27 @@ go run ./tools/upstream '-mode=audit' '-max-ratio=0.01' '-offline'
 8. Run the documentation audits from the repository's deslop skill.
 9. Read the existing CI results after pushing implementation changes.
 
-## 8. Assessment Evidence (Reference Module)
+## 8. Verification Evidence (Reference Module)
 
-The assessment uses source inspection and native execution on Windows ARM64.
+The implementation uses source inspection and native execution on Windows ARM64.
 External API references reflect the Microsoft documentation inspected on 2026-10-31.
-The results below describe this assessment only.
+The results below describe the implementation verification.
 
 | Item | Result | Limit |
 | :--- | :--- | :--- |
 | Host | Windows 11 Home, build 28000; native ARM64 Go 1.27.3; hypervisor present | Capability detection alone cannot prove partition readiness. |
-| WHPX platform suite | Four real-platform tests failed at `WHvSetupPartition` with HRESULT `0x80370304`. | No WHPX guest executed. |
+| WHPX platform suite | Real lifecycle, syscall, fault, interruption, EL1 isolation, and concurrent processor tests passed. | Native Windows ARM64 only. |
 | Isolated partition probe | Setup returned `0x80370304` without GIC parameters and `S_OK` with GICv3 parameters. | No vCPU or guest execution; runtime code remained unchanged. |
 | Shared hardware logic | `pkg/sentry/platform/hvcommon` passed. | Pure Go tests do not verify WHP. |
 | Windows systrap | The platform package passed. | This result does not establish a complete NT syscall boundary. |
 | Host primitives | Sync, memutil, fd, pgalloc, hostlockdown, and embedded unix packages passed. | Focused native suites only. |
 | Five target builds | `go build ./...` passed for Darwin ARM64, Windows AMD64/ARM64, and Linux AMD64/ARM64. | Compilation only; cgo disabled. |
-| SDK and CLI | `TestSandboxReportsPlatformName` and `TestRunELFReportsAutoBackend` failed with the same setup HRESULT. | Hardware initialization blocks those tests. |
-| Combined e2e suite | WHPX cases failed during initialization; the suite reached its eight-minute timeout during `TestE2ESystrapBusyboxPipeline`. | The active stack awaited an OCI registry response; the complete suite has no passing result. |
+| SDK and CLI | Both package suites passed. | Selected host and runtime contracts. |
+| Static and dynamic ELF | Direct WHPX and automatic selection passed; the fixed-address Go executable passed. | The complete fixed-address suite remains separate. |
+| M2 and M3 image gates | BusyBox ash, Alpine, nginx port forwarding, Python, and Node passed. | Native WHPX; the selected M3 gates also passed on systrap. |
+| M4 and network gates | POSIX torture, Git, Node modules, workspace isolation, NAT, WireGuard, and lockdown network modes passed. | The M4 workload gates also passed on systrap. |
 | Race detector | Go rejected `-race` on `windows/arm64`. | No native race evidence from this host. |
-| Upstream audit | Charged share: 18/2507 files, 0.72%; audit failed with 1427 findings. | Formatting and Linux-file findings prevent a clean audit result. |
+| Upstream audit | Charged share: 18/2507 files, 0.72%; the LF-normalized snapshot passed. | The CRLF checkout reports 1427 formatting and Linux-file findings. |
 | Documentation audits | Typography, banned vocabulary, and rhetorical scans returned zero matches across README, AGENTS, and docs. | Mechanical writing rules only. |
 
 The temporary P/Invoke probe created two partitions with one processor and hypercall exits enabled.
@@ -347,13 +359,12 @@ The capability query returned one LPI identifier bit.
 | Performance monitor PPI | `23` |
 
 The checkout uses `core.autocrlf=true`.
-Line-ending differences are a candidate explanation for the formatting findings, but this assessment did not establish their complete cause.
-The proposed document adds no upstream Go or assembly edits.
+Normalizing line endings in a temporary snapshot removes the audit violations without changing the upstream diff budget.
+The implementation changes only additive platform packages, CI, and documentation.
 
 ### Not verified
 
 This host cannot execute macOS HVF or signed macOS tests.
 Windows AMD64 and both Linux targets received compilation evidence only.
-The assessment does not prove that GIC configuration alone resolves every WHPX ARM64 failure.
-Native WHPX workloads, FP correctness across backends, and release acceptance remain open until their gates pass.
-The combined e2e timeout does not establish a systrap guest execution defect.
+The verification does not prove FP correctness across every signal and migration path.
+The complete e2e suite and release acceptance remain open until their gates pass.

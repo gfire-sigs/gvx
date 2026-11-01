@@ -65,14 +65,15 @@ type a64Stubs struct {
 	Code      []byte
 	Vectors   int
 	Common    int
-	Hvc       int
+	Exit      int
 	Reload    int
 	ReloadEnd int
 }
 
 // buildA64Stubs generates the stub code page using hvcommon.BuildA64VectorPage.
 func buildA64Stubs() (*a64Stubs, error) {
-	page, hvcOff, reloadOff, reloadEnd := hvcommon.BuildA64VectorPage(hvcommon.A64StubOptions{
+	page, exitOff, reloadOff, reloadEnd := hvcommon.BuildA64VectorPage(hvcommon.A64StubOptions{
+		ExitLoadAddress: kernelBaseA64 + kernelSysOff,
 		WriteExitReason: true,
 		OffExitReason:   int(commOffExitReason),
 		ExitException:   uint16(ExitException),
@@ -84,7 +85,7 @@ func buildA64Stubs() (*a64Stubs, error) {
 		Code:      page,
 		Vectors:   a64CodeOffVectors,
 		Common:    a64CodeOffCommon,
-		Hvc:       hvcOff,
+		Exit:      exitOff,
 		Reload:    reloadOff,
 		ReloadEnd: reloadEnd,
 	}, nil

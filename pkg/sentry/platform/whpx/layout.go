@@ -35,7 +35,7 @@ const (
 
 	// Guest physical addresses stay below 64 GiB, so every host with a
 	// physical address width of 36 bits or more can back them. The first GiB
-	// stays unmapped to keep legacy device ranges free.
+	// contains no RAM, leaving space for interrupt controllers.
 	gpaWindowBase = 1 << 30
 	gpaWindowEnd  = 1 << 36
 
@@ -54,6 +54,13 @@ const (
 
 	// maxVPs caps the virtual processors of one partition.
 	maxVPs = 64
+
+	// GIC registers occupy GPA ranges below RAM. Each redistributor uses
+	// two 64KiB frames, one for control and one for SGIs and PPIs.
+	a64GicDistributor = 0x08000000
+	a64GicTranslator  = 0x08080000
+	a64GicRedistBase  = 0x080A0000
+	a64GicRedistSize  = 0x20000
 )
 
 // Kernel region layout. The region lives in the upper canonical half. All

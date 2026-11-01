@@ -61,7 +61,7 @@ func (e *a64Env) reload() uint64 {
 }
 
 func (e *a64Env) hvc() uint64 {
-	return e.p.kernel.layout.code() + uint64(e.p.kernel.a64.Hvc)
+	return e.p.kernel.layout.code() + uint64(e.p.kernel.a64.Exit)
 }
 
 // trap simulates the EL1 stub: it spills state as the common handler does

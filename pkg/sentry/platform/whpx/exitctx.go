@@ -61,7 +61,7 @@ type exitKind uint8
 
 const (
 	// exitStub means the in-partition stub stopped the processor with HLT on
-	// amd64 or HVC on arm64.
+	// amd64 or a notification load on arm64.
 	exitStub exitKind = iota
 
 	// exitCanceled means WHvCancelRunVirtualProcessor ended the run.

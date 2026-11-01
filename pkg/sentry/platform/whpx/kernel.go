@@ -135,6 +135,10 @@ func buildKernelRegion(be backend, gpa *gpaAllocator, pool *ptPool, arm64 bool, 
 	kr.pt.Map(hostarch.Addr(kr.layout.code()), pageSize, kernel(hostarch.AccessType{Read: true, Execute: true}), uintptr(kr.codeGPA))
 	if !arm64 {
 		kr.pt.Map(hostarch.Addr(kr.layout.sys()), pageSize, kernel(hostarch.Read), uintptr(kr.sysGPA))
+	} else {
+		// WHP consumes generic HVC calls without exiting. An EL1 load from
+		// this unbacked GPA returns to the host after the stub spills state.
+		kr.pt.Map(hostarch.Addr(kr.layout.sys()), pageSize, kernel(hostarch.Read), 0)
 	}
 	kr.pt.Map(hostarch.Addr(kr.layout.comm(0)), uintptr(slots)*pageSize, kernel(hostarch.ReadWrite), uintptr(kr.commGPA))
 	kr.pt.MarkReadOnlyShared()
