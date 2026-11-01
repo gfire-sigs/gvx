@@ -332,6 +332,8 @@ ARM64 WHPX configures GICv3 before partition setup and assigns a separate redist
 It clears startup suspension because Sentry schedules guest threads without a Linux kernel.
 The EL1 notification page maps to unbacked GPA zero, outside the RAM allocator.
 An access from EL0 to this page raises a permission fault.
+The memory exit leaves PC at the load, so every stop costs one PC write before the next run.
+WHP consumes `HVC #0` without an exit, so the stub has no instruction that exits past itself.
 
 ### 3.3 Unified User-Mode Fallback Engine: `pkg/sentry/platform/systrap` (`winsystrap`) (M5)
 
