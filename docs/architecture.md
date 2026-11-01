@@ -16,7 +16,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream). Windows (`winsystrap`) runs stub processes from a small locked image with `winSysmsg` fast-path islands and debug-object stops. macOS has no `systrap` engine. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
 | **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
-| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 1.0% under Section 2.2 audit rules and Go 1.25+ builds without Bazel. |
+| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 1.0% under Section 2.2 audit rules and Go 1.27+ builds without Bazel. |
 
 ```mermaid
 flowchart TD
@@ -480,7 +480,7 @@ The sandbox applies the image settings with Docker rules. The `Entrypoint` and `
 
 #### Handle-Scoped Traversal and POSIX Adaptation (Descriptive Module)
 
-`hostfs` anchors the workspace mount using Go 1.25+ `os.OpenRoot(hostWorkspacePath)` before sandbox lockdown. On Windows (`inode_windows.go`), every file open invokes `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` pinned to the `os.Root` handle and enforces `FILE_OPEN_REPARSE_POINT`. On macOS (`inode_darwin.go`), `os.OpenRoot` uses `openat(dirfd, ..., O_NOFOLLOW | O_SYMLINK)` so the XNU kernel never traverses symbolic links or firmlinks pointing outside `/workspace`.
+`hostfs` anchors the workspace mount using `os.OpenRoot(hostWorkspacePath)` before sandbox lockdown. On Windows (`inode_windows.go`), every file open invokes `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` pinned to the `os.Root` handle and enforces `FILE_OPEN_REPARSE_POINT`. On macOS (`inode_darwin.go`), `os.OpenRoot` uses `openat(dirfd, ..., O_NOFOLLOW | O_SYMLINK)` so the XNU kernel never traverses symbolic links or firmlinks pointing outside `/workspace`.
 
 On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` on open files via `NtSetInformationFile(FileRenameInformationEx)` with `FILE_RENAME_POSIX_SEMANTICS`, and `unlink(2)` via `FileDispositionInfoEx`. NTFS refuses to rename a directory that has an open descendant, so `hostfs` closes and reopens the descendant handles around the rename. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table atomically to `.gvx_meta`.
 
@@ -767,6 +767,7 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 | `ci.yml` (`test windows/arm64`) | `windows-11-arm` | The containerd shim control plane, the `systrap` engine, and the `systrap` end-to-end and host lockdown suites. |
 | `e2e-images.yml` (`test linux/*`, `test windows/*`) | `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The registry gates on the `systrap` engine, once a week. The Linux and Windows jobs run every gate with host lockdown enabled. |
 | `diagnose.yml` (`test (<runner>)`) | A chosen runner | A chosen test selection or script, started by hand. |
+| `release.yml` (`build <target>`, `publish`) | `ubuntu-24.04`, `macos-15` | The five archives of a `v*` tag, the signature of the macOS binary, the SLSA build provenance attestation, and the GitHub release. A pull request that changes the workflow runs every step except the publication. |
 
 A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows `amd64` runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests there.
 
@@ -782,7 +783,7 @@ The gate `TestE2EGateETExec` decides whether a backend runs an executable that l
 
 ### 4.3 Containerd Shim Verification (Reference Module)
 
-Integration verification covers `0d0ef55` after the merge of upstream `5524535`. It does not establish compatibility for every incoming feature or change guest-runtime verification above.
+Integration verification covers `f3b7ef4` after the merge of upstream `90a2f3f7`. It does not establish compatibility for every incoming feature or change guest-runtime verification above.
 
 The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2`, `tools/upstream`, `pkg/sentry/platform/hvcommon`, and `pkg/fdnotifier`. The command package has no tests; Linux `pkg/fdnotifier` also has none. The Windows runs also passed the `TestGvxFallocate` cases in `internal/xsys/unix`. The macOS run used `scripts/codesign-exec.sh`.
 
@@ -791,13 +792,13 @@ The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2
 | Linux command | JSON v3/ttRPC bootstrap, independent and repeated delete, child exit, and owned state and socket cleanup passed | No guest workload |
 | Real SDK `2.1.5` | ShimManager shutdown and disconnect smoke passed | Library lifecycle, not an external daemon |
 | External containerd `2.2.4` (`193637f7`) on Linux `amd64` | Native creation returned the intended unsupported error; cleanup passed | No successful native sandbox |
-| Six production targets | Whole-root builds passed for Linux, Darwin, and Windows on `amd64` and `arm64`; Darwin `arm64` built | Cross-compilation does not prove native behavior |
-| Local Linux `amd64` | Race tests passed for `internal/gvxshim`, `tools/upstream`, and `pkg/sentry/platform/hvcommon`; focused vet passed | External containerd smoke passed separately with the actual binary |
-| Native Linux `arm64` | Focused packages passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996017628)) | Focused diagnose run; opt-in external containerd test skipped |
-| Native Darwin `arm64` | Focused packages passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996018107)) | Focused diagnose run, not the full CI workflow |
-| Native Windows `amd64` | Focused packages and fallocate cases passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996017757)) | Focused diagnose run, not the full CI workflow |
-| Native Windows `arm64` | Focused packages and fallocate cases passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996017707)) | Focused diagnose run, not the full CI workflow |
-| Upstream isolation | Both protection regressions failed before the fix and passed afterward; the audit charged 16/2485 files (0.64%), below 0.70% | Charged share excludes Linux fences |
+| Five production targets | Whole-root builds passed for `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64` ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290717221)) | Cross-compilation does not prove native behavior |
+| Native Linux `amd64` | Race tests and focused vet passed; the SDK and external containerd smoke tests passed in the same run ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290732381)) | Focused diagnose run, not the full CI workflow |
+| Native Linux `arm64` | Focused race tests passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290736565)) | Focused diagnose run; opt-in external containerd test skipped |
+| Native Darwin `arm64` | Focused race tests passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290740802)) | Focused diagnose run, not the full CI workflow |
+| Native Windows `amd64` | Focused packages and fallocate cases passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290744995)) | Focused diagnose run, not the full CI workflow |
+| Native Windows `arm64` | Focused packages and fallocate cases passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290749213)) | Focused diagnose run, not the full CI workflow |
+| Upstream isolation | The audit charged 18/2507 files (0.72%), below the 1.0% ceiling | Charged share excludes Linux fences |
 
 Workload creation and native sandbox creation remain unsupported; these results make no CRI or guest-execution claim.
 The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-module) reproduces the SDK and external-daemon boundaries without registry or rootfs dependencies.

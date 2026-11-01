@@ -20,7 +20,7 @@ Execute these numbered steps at the start of every task before editing repositor
 | Task Category | Required Skill (`.agents/skills/`) | Scope of Enforcement |
 | :--- | :--- | :--- |
 | **Umbrella Engineering** | [`just-good-practices`](.agents/skills/just-good-practices/SKILL.md) | Incremental implementation, guard clauses, and boundary error translation. |
-| **Go Implementation** | [`go-practices`](.agents/skills/go-practices/SKILL.md) | Go 1.25+ standard library usage, context ordering, and `%w` / `errors.Join` (`gojgp` lint disabled). |
+| **Go Implementation** | [`go-practices`](.agents/skills/go-practices/SKILL.md) | Go 1.27+ standard library usage, context ordering, and `%w` / `errors.Join` (`gojgp` lint disabled). |
 | **API & Signatures** | [`api-design`](.agents/skills/api-design/SKILL.md) | Explicit resource ownership, typed options, and constructor dependency injection. |
 | **Code Health** | [`code-health`](.agents/skills/code-health/SKILL.md) | Shallow control flow, domain naming, and separation of pure logic from I/O. |
 | **Testing** | [`testing-practices`](.agents/skills/testing-practices/SKILL.md) | Hermetic fixtures, `testing/synctest`, and behavioral boundary assertions. |
@@ -118,6 +118,7 @@ rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md docs/ 2>/dev/null
 ### 5.1 Continuous Integration (Descriptive Module)
 
 The workflow `.github/workflows/ci.yml` builds and vets all five targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. A hosted macOS runner and the hosted `windows-11-arm` runner are virtual machines without a hypervisor, so they run the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand. On Linux, run `scripts/seccomp-audit.sh` when a change adds a host call, because a call outside the seccomp allowlist kills the process.
+The workflow `.github/workflows/release.yml` builds, attests, and publishes the archives of a `v*` tag. It runs on a pull request only when the workflow file changes.
 
 Native shim tests reexecute production `Main` without `GVX_SHIM_BINARY`. The existing Windows/arm64 job runs the shim package explicitly.
 Explicit interoperability tests use `GVX_SHIM_BINARY`; the private external-daemon test also requires `GVX_CONTAINERD_BINARY`. The [README procedure](README.md#23-containerd-control-shim-procedural-module) separates those smoke tests from guest workloads.

@@ -54,9 +54,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Check Go formatting
@@ -88,7 +88,7 @@ jobs:
             GOOS=${target%/*} GOARCH=${target#*/} go vet ./pkg/sentry/platform/systrap/
           done
       - name: Cache upstream archive
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/gvx/upstream
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
@@ -116,9 +116,9 @@ jobs:
       GVX_E2E_OFFLINE: "1"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Test owned packages
@@ -167,9 +167,9 @@ jobs:
       GVX_E2E_OFFLINE: "1"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Test owned packages
@@ -182,9 +182,9 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Test owned packages
@@ -232,9 +232,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       # The hosted runner has no hypervisor, so the systrap engine is the only

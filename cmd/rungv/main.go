@@ -72,6 +72,8 @@ func executeCLI(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return 0
+	case "-version", "--version":
+		return commands["version"].run(ctx, args[1:], streams)
 	}
 	if c, ok := commands[subcmd]; ok {
 		return c.run(ctx, args[1:], streams)
