@@ -20,7 +20,7 @@ Execute these numbered steps at the start of every task before editing repositor
 | Task Category | Required Skill (`.agents/skills/`) | Scope of Enforcement |
 | :--- | :--- | :--- |
 | **Umbrella Engineering** | [`just-good-practices`](.agents/skills/just-good-practices/SKILL.md) | Incremental implementation, guard clauses, and boundary error translation. |
-| **Go Implementation** | [`go-practices`](.agents/skills/go-practices/SKILL.md) | Go 1.25+ standard library usage, context ordering, and `%w` / `errors.Join` (`gojgp` lint disabled). |
+| **Go Implementation** | [`go-practices`](.agents/skills/go-practices/SKILL.md) | Go 1.27+ standard library usage, context ordering, and `%w` / `errors.Join` (`gojgp` lint disabled). |
 | **API & Signatures** | [`api-design`](.agents/skills/api-design/SKILL.md) | Explicit resource ownership, typed options, and constructor dependency injection. |
 | **Code Health** | [`code-health`](.agents/skills/code-health/SKILL.md) | Shallow control flow, domain naming, and separation of pure logic from I/O. |
 | **Testing** | [`testing-practices`](.agents/skills/testing-practices/SKILL.md) | Hermetic fixtures, `testing/synctest`, and behavioral boundary assertions. |
