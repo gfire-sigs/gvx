@@ -40,6 +40,10 @@ expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !darwin && !pagesi
 # Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno_xplat.go).
 seam pkg/syserr/syserr.go
 
+# Content seam: hosts without /proc/self/auxv read HWCAP from the platform
+# (pkg/cpuid/hwcap_darwin_arm64.go, hwcap_windows_arm64.go, and hwcap_xplat.go).
+seam pkg/cpuid/cpuid.go
+
 # Content seam: the memory manager keeps mappings out of the address hole of a platform
 # (pkg/sentry/platform/addrhole_xplat.go and pkg/sentry/mm/addrhole_xplat.go). The Windows engine
 # has a low guest window and a high guest window, and the host owns the range between them.
