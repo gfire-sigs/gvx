@@ -2,6 +2,22 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This section makes the CPU features that a guest sees agree with the features that it can use.
+
+### Bug Fixes
+
+- **`whpx` on `windows/amd64`**: guests can use AVX, AVX2, FMA, F16C, and AVX-512. XCR0 was 3 (x87 and SSE), while CPUID and `/proc/cpuinfo` reported the AVX family. A program that checked only CPUID or `/proc/cpuinfo` got `SIGILL`, and x86-64-v3 images (RHEL 10 family) did not start. The backend now selects the `ProcessorXsaveFeatures` property and XCR0 together. It moves the compacted XSAVE state through `WHvGetVirtualProcessorState` and `WHvSetVirtualProcessorState`.
+- **`whpx` feature set on `windows/amd64`**: `/proc/cpuinfo`, signal frames, and sigreturn checks list only the features of the partition. MPX, AMX, protection keys, and `XSAVES` no longer appear.
+- **`AT_HWCAP` on `darwin/arm64` and `windows/arm64`**: the value was 0, and the `Features` line of `/proc/cpuinfo` was empty. `hvf` guests now get the bits of the `hw.optional` sysctl keys. `whpx` guests on `windows/arm64` get the host bits that `hvcommon.DefaultIDRegisters` also reports. glibc and OpenSSL then use LSE atomics, AES, SHA, and CRC32.
+
+### Not verified
+
+- CI has no Windows Hypervisor Platform on `windows/amd64`. The real-partition tests `TestRealGuestCPUIDMatchesXCR0`, `TestRealYMMSurvivesTheSentryAndProcessorSharing`, and `TestRealZMMSurvivesTheSentryAndProcessorSharing` need a physical host.
+- The project has no measurement of `WHvGetVirtualProcessorState` latency. The call runs only on signal delivery, `clone`, `ptrace`, and vCPU sharing.
+- The `windows/arm64` `AT_HWCAP` path has no run on a Windows host.
+
 ## [v0.2.0] - 2026-11-01
 
 This release makes the `whpx` backend run guests on `windows/arm64`. The other backends and targets have no behavior change.
