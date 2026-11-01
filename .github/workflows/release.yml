@@ -136,20 +136,20 @@ jobs:
               --source-ref "$GITHUB_REF" --deny-self-hosted-runners
           done
           cp "$BUNDLE" "dist/$name.sigstore.json"
-      # The heading of the section is "## [TAG]". A dry run reads the
-      # "## [Unreleased]" section, so that it verifies the same parser. A
+      # The heading of the section starts with "## [TAG]". A dry run reads
+      # the first section, so that it verifies the same parser. A
       # relative link resolves against the release page, so the step points
       # each one at the file in the built commit.
       - name: Extract release notes
         run: |
-          section=Unreleased
-          [ "$GITHUB_REF_TYPE" = tag ] && section=$GITHUB_REF_NAME
-          awk -v h="## [$section]" '
+          heading="## ["
+          [ "$GITHUB_REF_TYPE" = tag ] && heading="## [$GITHUB_REF_NAME]"
+          awk -v h="$heading" '
             index($0, h) == 1 { found = 1; next }
             found && /^## / { exit }
             found { print }
             END { if (!found) exit 1 }
-          ' CHANGELOG.md > notes.md || { echo "CHANGELOG.md has no section $section" >&2; exit 1; }
+          ' CHANGELOG.md > notes.md || { echo "CHANGELOG.md has no section $heading" >&2; exit 1; }
           sed -i -E "s#\]\(([^):]+)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/\1)#g" notes.md
           test -s notes.md
           cat notes.md

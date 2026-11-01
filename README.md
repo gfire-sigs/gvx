@@ -375,7 +375,7 @@ The workflow `.github/workflows/release.yml` builds and publishes a release when
 > Tag only a commit on `main` whose code passed `ci` and `e2e-images`. `ci` skips a commit that changes only documentation, so the run of the last code commit applies.
 
 1. Run the `e2e-images` workflow on the release commit and verify that it passes.
-2. Rename the `## [Unreleased]` heading of `CHANGELOG.md` to `## [TAG]`, such as `## [v0.1.0-rc.1]`.
+2. Add a section with the heading `## [TAG] - DATE` at the top of `CHANGELOG.md`, such as `## [v0.2.0] - 2026-12-01`.
 3. Merge that change into `main`.
 4. Create an annotated tag on the merge commit and push it.
 5. Verify that the `release` workflow passes and that `rungv version` of one archive prints the tag.
