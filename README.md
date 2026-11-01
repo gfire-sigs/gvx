@@ -170,6 +170,27 @@ GVX_SHIM_BINARY="$SHIM_BINARY" GVX_CONTAINERD_BINARY=/bin/containerd \
 
 The external smoke test owns private daemon paths and never modifies host-global containerd configuration. See [`docs/architecture.md`](docs/architecture.md#43-containerd-shim-verification-reference-module) for the compatibility matrix.
 
+### 2.4 Release Archives (Procedural Module)
+
+Each GitHub release has one archive for each of the five targets and a `SHA256SUMS` file. Each archive holds `rungv`, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`.
+
+> [!IMPORTANT]
+> The macOS archive has an ad-hoc signature with the hypervisor entitlement and no notarization. Gatekeeper blocks a browser download until you remove the quarantine attribute.
+
+1. Download the archive for your target and `SHA256SUMS` from the release page.
+2. Verify the archive with `shasum -a 256 -c SHA256SUMS --ignore-missing`.
+3. Extract the archive.
+4. Remove the quarantine attribute on macOS with `xattr -d com.apple.quarantine rungv`.
+5. Run `rungv version` and compare the version with the release tag.
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf rungv-v0.1.0-rc.1-darwin-arm64.tar.gz
+cd rungv-v0.1.0-rc.1-darwin-arm64
+xattr -d com.apple.quarantine rungv 2>/dev/null || true
+./rungv version
+```
+
 ---
 
 ## 3. Core Mechanics and Invariants (Descriptive Module)
@@ -207,7 +228,7 @@ Run `GVX_E2E_BENCH=1 go test -run TestE2EMicroBench ./e2e/` to measure the activ
 | :--- | :--- | :--- | :--- | :--- |
 | **`fsimpl/erofs` & `fsimpl/overlay`** | Read-only image lower layers + writable rootfs upper layer | Pre-opened `<sha256>.erofs` files + `fsimpl/tmpfs` (or persistent upper) | Zero host extraction; maps pages directly on `whpx`/`systrap` and copies into immutable slab pages on `hvf`. | `pread64` on pre-opened read-only descriptors (`0` path walks) |
 | **`fsimpl/ext4lite`** | Named volumes (`-v name:/path`, default driver, VFS type `ext4`) | Single pre-opened `<name>.ext4` file locked exclusively per sandbox | 16MiB dense block-group growth (Tiers A/B/C, up to 64TiB via `meta_bg`), JBD2 ordered metadata journal (`inode 8`), orphan list cleanup, `fsckLite` fallback, depth-0..5 extent trees, inline data (`<= 128B`), shared/in-body xattrs, unmount tail compaction, and dirty-block tracking for live migration. | `pread64`, `pwrite64`, `fsync`, `ftruncate`, `fallocate` on 1 descriptor (`UnboundFileOpenBlocked = true`) |
-| **`fsimpl/hostfs` (Directory Mode)** | Live host workspace (`-workspace`, `-v /host/dir:/guest/dir`) | Pinned Go 1.25+ `*os.Root` handle and bounded parent-handle cache (256 handles, 5s TTL) | Anti-TOCTOU traversal (`FILE_OPEN_REPARSE_POINT` / `O_NOFOLLOW`), Windows open-directory rename (`winHandleRegistry`), `NameCodec` (`~gvx~` escaping and APFS NFC/NFD normalization), atomic `.gvx_meta` persistence, and host-to-guest `inotify` bridge (`ReadDirectoryChangesW`, `kqueue`, or `fstatat` poll; up to 8,192 watches). | Handle-relative `NtCreateFile` or `openat`, `renameat`, `unlinkat` |
+| **`fsimpl/hostfs` (Directory Mode)** | Live host workspace (`-workspace`, `-v /host/dir:/guest/dir`) | Pinned `*os.Root` handle and bounded parent-handle cache (256 handles, 5s TTL) | Anti-TOCTOU traversal (`FILE_OPEN_REPARSE_POINT` / `O_NOFOLLOW`), Windows open-directory rename (`winHandleRegistry`), `NameCodec` (`~gvx~` escaping and APFS NFC/NFD normalization), atomic `.gvx_meta` persistence, and host-to-guest `inotify` bridge (`ReadDirectoryChangesW`, `kqueue`, or `fstatat` poll; up to 8,192 watches). | Handle-relative `NtCreateFile` or `openat`, `renameat`, `unlinkat` |
 | **`fsimpl/hostfs` (Single-File Mode)** | Single-file bind mount (`-v /host/file:/guest/file[:ro]`) | Pinned parent `*os.Root` scoped to the single target filename | Exposes only the bound file (siblings remain unreachable); tracks atomic host editor file replacement on fresh opens; keeps metadata in memory without writing `.gvx_meta`. | Handle-relative open of the single pinned filename |
 
 ### 3.3 Dual-Track Netstack and Port Forwarding (`pkg/netbackend`)
@@ -278,6 +299,8 @@ Read the architecture specification and agent operating manual before modifying 
 | [`docs/gvxip/gvxip-001-better-posix-hostfs.md`](docs/gvxip/gvxip-001-better-posix-hostfs.md) | Systems Engineers | Specification for `hostfs` v2: pinned handle caching, `NameCodec`, single-file mounts, and host-to-guest `inotify`. |
 | [`docs/gvxip/gvxip-002-ext4lite-volume-engine.md`](docs/gvxip/gvxip-002-ext4lite-volume-engine.md) | Systems Engineers | Specification for `ext4lite`: 16MiB dense block groups, JBD2 ordered journaling, unmount compaction, and `fsckLite`. |
 | [`docs/gvxip/gvxip-003-backend-perf-and-compat.md`](docs/gvxip/gvxip-003-backend-perf-and-compat.md) | Systems Engineers | Cross-backend performance optimizations, large-page mapping units, and `ET_EXEC` compatibility specifications. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Users & Release Engineers | Observable changes, known limitations, and unverified platforms of each release. The release workflow publishes each section as release notes. |
+| [`SECURITY.md`](SECURITY.md) | Users & Security Researchers | Security boundaries, supported versions, and the private procedure for vulnerability reports. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 writing gates, package import boundaries, and verification commands. |
 | [`cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt`](cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt) | Legal Reviewers & Users | License texts and notices of every component in the `rungv` binary, as printed by `rungv license`. |
 
@@ -337,6 +360,25 @@ This table maps each completed milestone to its deliverables and verification ga
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | `clone`, `futex`, signals, TLS, VDSO, `pkg/netbackend` (`-net=nat` & `-net=wg`), and `pkg/oci` boot `alpine:3.20`, `nginx:alpine`, `python:3.12-alpine`, and `node:22-alpine`. |
 | **M4** | **`hostfs`, `ext4lite`, `chunkcache` & Self-Lockdown** | `fsimpl/hostfs` v2, `fsimpl/ext4lite` (JBD2 journaled single-file `ext4` volumes), `fsimpl/chunkcache`, and `pkg/hostlockdown` pass POSIX durability, crash recovery, and containment gates. |
 | **M5** | **`systrap` Fallback Engine (`winsystrap` and upstream Linux)** | `platform/systrap` executes static (`ET_EXEC`) and dynamic (`ET_DYN`) ELF64 workloads via trampoline islands and `winSysmsg` stubs on `windows/amd64` and `windows/arm64`, and through the upstream platform on Linux. The `darwin/arm64` engine was removed, and macOS runs on `hvf`. |
+
+### 5.3 Release Procedure
+
+The workflow `.github/workflows/release.yml` builds and publishes a release when a tag `v*` arrives. A tag with a hyphen publishes a pre-release.
+
+> [!IMPORTANT]
+> Tag only a commit on `main` whose code passed `ci` and `e2e-images`. `ci` skips a commit that changes only documentation, so the run of the last code commit applies.
+
+1. Run the `e2e-images` workflow on the release commit and verify that it passes.
+2. Rename the `## [Unreleased]` heading of `CHANGELOG.md` to `## [TAG]`, such as `## [v0.1.0-rc.1]`.
+3. Merge that change into `main`.
+4. Create an annotated tag on the merge commit and push it.
+5. Verify that the `release` workflow passes and that `rungv version` of one archive prints the tag.
+
+```sh
+gh workflow run e2e-images.yml --ref main
+git tag -a v0.1.0-rc.1 -m "v0.1.0-rc.1"
+git push origin v0.1.0-rc.1
+```
 
 ---
 
