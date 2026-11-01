@@ -172,18 +172,24 @@ The external smoke test owns private daemon paths and never modifies host-global
 
 ### 2.4 Release Archives (Procedural Module)
 
-Each GitHub release has one archive for each of the five targets and a `SHA256SUMS` file. Each archive holds `rungv`, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`.
+Each GitHub release has one archive for each of the five targets, a `SHA256SUMS` file, and a provenance bundle `rungv-TAG.sigstore.json`. Each archive holds `rungv`, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`.
+
+The release workflow signs a SLSA v1 build provenance attestation for every archive through GitHub artifact attestations and Sigstore. The attestation names the source commit, the tag, and the workflow run that built the archive. GitHub-hosted runners and this attestation give SLSA Build Level 2. The `gh attestation verify` command checks the signature, the repository, the workflow file, and the tag. Add `--bundle rungv-TAG.sigstore.json` to read the attestation from the downloaded bundle instead of the GitHub API.
 
 > [!IMPORTANT]
 > The macOS archive has an ad-hoc signature with the hypervisor entitlement and no notarization. Gatekeeper blocks a browser download until you remove the quarantine attribute.
 
 1. Download the archive for your target and `SHA256SUMS` from the release page.
-2. Verify the archive with `shasum -a 256 -c SHA256SUMS --ignore-missing`.
-3. Extract the archive.
-4. Remove the quarantine attribute on macOS with `xattr -d com.apple.quarantine rungv`.
-5. Run `rungv version` and compare the version with the release tag.
+2. Verify the provenance of the archive with `gh attestation verify`.
+3. Verify the archive with `shasum -a 256 -c SHA256SUMS --ignore-missing`.
+4. Extract the archive.
+5. Remove the quarantine attribute on macOS with `xattr -d com.apple.quarantine rungv`.
+6. Run `rungv version` and compare the version with the release tag.
 
 ```sh
+gh attestation verify rungv-v0.1.0-rc.1-darwin-arm64.tar.gz --repo gfire-sigs/gvx \
+  --signer-workflow gfire-sigs/gvx/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0-rc.1 --deny-self-hosted-runners
 shasum -a 256 -c SHA256SUMS --ignore-missing
 tar -xzf rungv-v0.1.0-rc.1-darwin-arm64.tar.gz
 cd rungv-v0.1.0-rc.1-darwin-arm64
@@ -373,6 +379,7 @@ The workflow `.github/workflows/release.yml` builds and publishes a release when
 3. Merge that change into `main`.
 4. Create an annotated tag on the merge commit and push it.
 5. Verify that the `release` workflow passes and that `rungv version` of one archive prints the tag.
+6. Verify one archive with the `gh attestation verify` command of Section 2.4.
 
 ```sh
 gh workflow run e2e-images.yml --ref main

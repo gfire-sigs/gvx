@@ -767,6 +767,7 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 | `ci.yml` (`test windows/arm64`) | `windows-11-arm` | The containerd shim control plane, the `systrap` engine, and the `systrap` end-to-end and host lockdown suites. |
 | `e2e-images.yml` (`test linux/*`, `test windows/*`) | `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The registry gates on the `systrap` engine, once a week. The Linux and Windows jobs run every gate with host lockdown enabled. |
 | `diagnose.yml` (`test (<runner>)`) | A chosen runner | A chosen test selection or script, started by hand. |
+| `release.yml` (`build <target>`, `publish`) | `ubuntu-24.04`, `macos-15` | The five archives of a `v*` tag, the signature of the macOS binary, the SLSA build provenance attestation, and the GitHub release. A pull request that changes the workflow runs every step except the publication. |
 
 A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows `amd64` runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests there.
 

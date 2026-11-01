@@ -14,6 +14,7 @@ A vulnerability is a defect that lets a guest, an image, or a volume file cross 
 | Untrusted input | A malformed image layer, EROFS image, `ext4lite` volume file, or registry response causes an error, not memory corruption or a host write outside the cache. |
 | Network isolation | `-net=wg` sends guest traffic only through the WireGuard tunnel. `-net=none` gives the guest no host network. |
 | Control shim | `containerd-shim-gvx-v2` never signals a stored PID and never deletes files that containerd owns. |
+| Release archives | Every archive of a release has a SLSA build provenance attestation from `.github/workflows/release.yml` for the tag of the release. An archive that fails `gh attestation verify` is not a `gvx` release. |
 
 These limits are documented behavior, not vulnerabilities:
 
