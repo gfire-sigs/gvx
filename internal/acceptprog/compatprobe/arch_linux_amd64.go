@@ -45,6 +45,96 @@ func asmReadGS30AMD64() uint64
 func asmBenchTEBAMD64(iters int) uint64
 func asmProbeSIMDAMD64(in, out *[16][2]uint64, faultPage uint64)
 func asmCallEntryAMD64(fn uintptr, arg uint64) uint64
+func asmXGETBV0() uint64
+func asmProbeYMMAMD64(in, out *[16][4]uint64, faultPage, tid uint64)
+
+// x86VectorFeatures are the CPUID features whose instructions need extended
+// state in XCR0. A guest that sees one of them in CPUID must be able to run
+// its instructions, and /proc/cpuinfo must agree with CPUID.
+var x86VectorFeatures = []struct {
+	name  string
+	leaf7 bool
+	bit   uint32
+	xcr0  uint64
+}{
+	{"avx", false, 28, 0x6},
+	{"fma", false, 12, 0x6},
+	{"f16c", false, 29, 0x6},
+	{"avx2", true, 5, 0x6},
+	{"avx512f", true, 16, 0xE6},
+}
+
+func probeCPUFeatures() (string, string, error) {
+	maxLeaf, _, _, _ := asmCPUID(0, 0)
+	_, _, ecx1, _ := asmCPUID(1, 0)
+	var ebx7 uint32
+	if maxLeaf >= 7 {
+		_, ebx7, _, _ = asmCPUID(7, 0)
+	}
+	var xcr0 uint64
+	if ecx1&(1<<27) != 0 { // OSXSAVE: XGETBV raises #UD without it.
+		xcr0 = asmXGETBV0()
+	}
+	flags, err := cpuinfoFlags("flags")
+	if err != nil {
+		return "", "", err
+	}
+	var seen []string
+	for _, f := range x86VectorFeatures {
+		reg := ecx1
+		if f.leaf7 {
+			reg = ebx7
+		}
+		present := reg&(1<<f.bit) != 0
+		if present && xcr0&f.xcr0 != f.xcr0 {
+			return "", "", fmt.Errorf("CPUID reports %s, and XCR0 %#x lacks state %#x", f.name, xcr0, f.xcr0)
+		}
+		if present != flags[f.name] {
+			return "", "", fmt.Errorf("%s: CPUID reports %v, /proc/cpuinfo reports %v", f.name, present, flags[f.name])
+		}
+		if present {
+			seen = append(seen, f.name)
+		}
+	}
+	ymm := "absent"
+	if ecx1&(1<<28) != 0 {
+		if err := probeYMM(); err != nil {
+			return "", "", err
+		}
+		ymm = "ok"
+	}
+	return cpuFeaturesDigest, fmt.Sprintf("XCR0=%#x features=%s ymm=%s", xcr0, strings.Join(seen, ","), ymm), nil
+}
+
+// probeYMM checks that YMM0 to YMM15 survive a system call, a page fault, and
+// a signal handler with a sigreturn.
+func probeYMM() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	faultMem, err := syscall.Mmap(-1, 0, 0x1000, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS)
+	if err != nil {
+		return fmt.Errorf("mmap fault page: %w", err)
+	}
+	defer syscall.Munmap(faultMem)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1)
+	defer signal.Stop(ch)
+
+	var in, out [16][4]uint64
+	for i := range in {
+		for j := range in[i] {
+			in[i][j] = 0x9e3779b97f4a7c15*uint64(i*4+j+1) | 1
+		}
+	}
+	asmProbeYMMAMD64(&in, &out, uint64(uintptr(unsafe.Pointer(&faultMem[0]))), uint64(syscall.Gettid()))
+	<-ch
+	for i := range in {
+		if out[i] != in[i] {
+			return fmt.Errorf("YMM%d = %#x after a system call, a page fault and SIGUSR1, want %#x", i, out[i], in[i])
+		}
+	}
+	return nil
+}
 
 func archPrctlGet(code uintptr) (uint64, error) {
 	var val uint64

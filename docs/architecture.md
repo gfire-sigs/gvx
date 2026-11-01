@@ -137,6 +137,7 @@ gvx/ (Fork of google/gvisor@go)
  │       │   │   ├── address_space.go
  │       │   │   ├── vcpu_amd64.go
  │       │   │   ├── vcpu_arm64.go
+ │       │   │   ├── vector.go              # Guest XSAVE features, XCR0, and the compacted layout
  │       │   │   ├── stubgen_x86.go         # Go generator for the in-partition amd64 stub
  │       │   │   └── stubgen_a64.go         # Go generator for the in-partition arm64 stub
  │       │   ├── hvf/                       # [NEW] macOS Hypervisor.framework backend (arm64)
@@ -294,6 +295,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | **Async Signal Preemption** | `WHvCancelRunVirtualProcessor(partition, vpIndex, 0)` | `hv_vcpus_exit(&vcpu, 1)` |
 | **`amd64` Syscall Trap (`stubgen_x86.go`)** | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT`. | Not applicable (`darwin/amd64` dropped). |
 | **`arm64` Syscall Trap (`bluepill_arm64.go`, `stubgen_a64.go`)** | EL0 `SVC #0` enters EL1 vectors and spills registers to `CommPage`. An EL1 load from unbacked GPA zero returns to the host. | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. |
+| **`amd64` Vector State** | Sets `ProcessorXsaveFeatures` before `WHvSetupPartition`. XCR0 enables x87, SSE, AVX, and AVX-512 when the hypervisor and the Sentry image hold them. `WHvGetVirtualProcessorState` moves the compacted XSAVE state on the cold path. | Not applicable (`darwin/amd64` dropped). |
 | **Read-only File Mappings** | Maps read-only host views directly into the partition. | `hv_vm_map` rejects the read-only descriptor of an EROFS image. `hvf` copies those pages into immutable slab pages, and pgalloc memory files map directly. |
 | **Unknown Exit Reason** | Not applicable. | `HV_EXIT_REASON_UNKNOWN` carries no information. The worker resumes the vCPU as it does after a cancellation, and `Switch` fails after 4096 consecutive unknown exits. |
 
@@ -334,6 +336,19 @@ The EL1 notification page maps to unbacked GPA zero, outside the RAM allocator.
 An access from EL0 to this page raises a permission fault.
 The memory exit leaves PC at the load, so every stop costs one PC write before the next run.
 WHP consumes `HVC #0` without an exit, so the stub has no instruction that exits past itself.
+
+#### CPU Feature Exposure (Descriptive Module)
+
+A guest must never see a CPU feature that it cannot use. The Sentry derives `/proc/cpuinfo`, `AT_HWCAP`, signal frames, and sigreturn checks from one `cpuid.FeatureSet`.
+
+| Backend | Guest CPUID or ID Registers | Sentry Feature Set |
+| :--- | :--- | :--- |
+| **`whpx` (`amd64`)** | One selection in `vector.go` sets the `ProcessorXsaveFeatures` property and XCR0. MPX, AMX, XFD, XCR1, and AVX10 stay hidden. Hyper-V rejects a partition without `XsaveComp` or `XsaveSupervisor`, so both stay. | `Platform.GuestFeatureSet` removes the hidden features and reports the guest XCR0 in CPUID leaf `0xD`. |
+| **`whpx` (`arm64`)** | `hvcommon.DefaultIDRegisters`. | `AT_HWCAP` holds only the host features that those registers also report. |
+| **`hvf`** | Host ID registers with the PAC, SVE, MTE, SME, and MPAM fields hidden. | `AT_HWCAP` comes from the `hw.optional` sysctl keys. |
+| **`systrap` (Windows)** | Host CPUID and host XCR0. The stub saves x87, SSE, AVX, and AVX-512 state. | Host feature set. |
+
+On `amd64`, `New` reads the XSAVE state of one probe vCPU and checks its compacted layout against host CPUID leaf `0xD`. A mismatch makes `New` fail, and `PlatformAuto` then selects `systrap`.
 
 ### 3.3 Unified User-Mode Fallback Engine: `pkg/sentry/platform/systrap` (`winsystrap`) (M5)
 
@@ -419,6 +434,8 @@ Follow these synchronization rules in `platform/whpx`, `platform/hvf`, and `plat
 3. In `platform/systrap` trampolines, spill all GPRs (`RAX..R15` including `RCX` and `R11` on `amd64`; `X0..X30` including `X18` on `arm64`), flags, dual TLS pointers, and vector state (`XSAVEOPT` on `amd64` or `STP Q0..Q31` on `arm64`) into the `Sysmsg` context before restoring host `FSBase`/`GSBase`/`X18`/`MXCSR` and waking the Sentry thread.
 
 One implementation deviates from this contract for a stated reason. `hvf` loads and stores the general and FP registers from `arch.Context64` on every `Switch`, because `Hypervisor.framework` ties a vCPU to its host thread. `hvf` does not synchronize `TPIDRRO_EL0`, the PAC keys, or the debug registers.
+
+On `amd64`, `whpx` keeps `YMM0..15` and the AVX-512 state inside the vCPU on the fast path. The cold path reads and writes the compacted XSAVE state of the vCPU. The converters in `fp.go` translate it to and from the standard XSAVE image of `ac.FloatingPointData()`. A write keeps the supervisor components and `XCOMP_BV` that the hypervisor returned.
 
 ### 3.5 Dual-Track Netstack Backend and Port Forwarding: `pkg/netbackend`
 

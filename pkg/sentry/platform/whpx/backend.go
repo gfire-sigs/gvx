@@ -32,10 +32,9 @@ type backend interface {
 	// features returns the capability bits that gate startup.
 	features() (hostFeatures, error)
 
-	// createPartition creates, configures and sets up the partition with the
-	// given processor count. It returns the partition-wide facts that guest
-	// bring-up needs.
-	createPartition(vpCount uint32) (partitionInfo, error)
+	// createPartition creates, configures and sets up the partition. It
+	// returns the partition-wide facts that guest bring-up needs.
+	createPartition(cfg partitionConfig) (partitionInfo, error)
 
 	// closePartition deletes the partition. All virtual processors must be
 	// deleted first.
@@ -69,23 +68,52 @@ type backend interface {
 
 	getRegs(index uint32, b *regBatch) error
 	setRegs(index uint32, b *regBatch) error
+
+	// getXsave reads the compacted XSAVE state of an amd64 processor into buf
+	// and returns its size. A buffer that is too small returns
+	// errXsaveBufferSmall with the required size.
+	getXsave(index uint32, buf []byte) (int, error)
+
+	// setXsave loads a compacted XSAVE state into an amd64 processor.
+	setXsave(index uint32, buf []byte) error
 }
+
+// errXsaveBufferSmall reports that getXsave needs a larger buffer.
+var errXsaveBufferSmall = errors.New("whpx: XSAVE state buffer is too small")
 
 // hostFeatures lists the capability facts that gate startup.
 type hostFeatures struct {
 	hypervisorPresent bool
 	arm64Support      bool
-	xsaveSupport      bool
 	windowsBuild      uint32
 	windowsUBR        uint32
+
+	// xsaveFeatures is the WHV_PROCESSOR_XSAVE_FEATURES capability of an
+	// amd64 host.
+	xsaveFeatures uint64
+}
+
+// partitionConfig lists the properties that createPartition sets before
+// WHvSetupPartition.
+type partitionConfig struct {
+	vpCount uint32
+
+	// xsaveFeatures is the ProcessorXsaveFeatures property of an amd64
+	// partition.
+	xsaveFeatures uint64
+
+	// clearProcFeatures lists the ProcessorFeatures bits that an amd64
+	// partition hides from its guests.
+	clearProcFeatures uint64
 }
 
 // partitionInfo describes a created partition.
 type partitionInfo struct {
 	vpCount uint32
 
-	// xsave reports that the guest may enable XSAVE instructions.
-	xsave bool
+	// xsaveFeatures is the ProcessorXsaveFeatures property that an amd64
+	// partition reports after setup.
+	xsaveFeatures uint64
 }
 
 // regBatch holds the names and 16-byte values of one register call.

@@ -30,10 +30,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/interrupt"
 )
 
-// fpImageSize is the size of a saved floating-point image. It covers an
-// FXSAVE area with an XSAVE header on amd64 and the arm64 image.
-const fpImageSize = 576
-
 // fpWhere tells where the current floating-point state of a Context lives.
 type fpWhere uint8
 
@@ -144,7 +140,7 @@ func (c *Context) evict(v *vcpu) {
 	defer c.fpMu.Unlock()
 	if c.fpWhere == fpOnVP && c.fpVP == v {
 		if c.fpSaved == nil {
-			c.fpSaved = make([]byte, fpImageSize)
+			c.fpSaved = make([]byte, c.p.fpSize)
 		}
 		if err := v.readFP(c.fpSaved); err != nil {
 			c.fpErr = fmt.Errorf("whpx: save floating-point state: %w", err)
@@ -224,6 +220,8 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 		return runResult{err: platform.ErrContextInterrupt}
 	}
 	for {
+		// The guest changes its vector registers.
+		v.xsaveCurrent = false
 		if err := v.p.be.run(v.index, v.exit); err != nil {
 			v.st.invalidate()
 			return runResult{err: fmt.Errorf("whpx: run virtual processor %d: %w", v.index, err)}

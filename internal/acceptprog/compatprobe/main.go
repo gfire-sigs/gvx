@@ -54,6 +54,7 @@ func main() {
 		{"abi_auxv_procfs", "kernel_abi", probeAuxvProcfs},
 		{"cpu_dual_tls_wine64_teb", "wine64_cpu", probeDualTLSWine64TEB},
 		{"cpu_simd_fp_preservation", "cpu_vector", probeSIMDFP},
+		{"cpu_feature_consistency", "cpu_vector", probeCPUFeatures},
 		{"wine64_pe32plus_execution", "wine64_loader", probeWine64PE32PlusExec},
 		{"wine64_pe_mmap_layout", "wine64_mm", probeWine64PEMmapLayout},
 		{"wine64_wineserver_ipc", "wine64_ipc", probeWine64WineserverIPC},
@@ -231,6 +232,49 @@ func parseCPUInfo() map[string]string {
 		}
 	}
 	return res
+}
+
+// cpuFeaturesDigest is the digest of probeCPUFeatures. The feature sets differ
+// between hosts, so the digest names the checks, not the features.
+const cpuFeaturesDigest = "features:hw=kernel=cpuinfo:vector=ok"
+
+// cpuinfoFlags returns the words of the first /proc/cpuinfo line whose key is
+// key: "flags" on amd64 and "Features" on arm64.
+func cpuinfoFlags(key string) (map[string]bool, error) {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return nil, fmt.Errorf("read /proc/cpuinfo: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(k) != key {
+			continue
+		}
+		flags := make(map[string]bool)
+		for _, f := range strings.Fields(v) {
+			flags[f] = true
+		}
+		return flags, nil
+	}
+	return nil, fmt.Errorf("/proc/cpuinfo has no %q line", key)
+}
+
+// auxvValue returns the value of the auxiliary vector entry tag.
+func auxvValue(tag uint64) (uint64, error) {
+	data, err := os.ReadFile("/proc/self/auxv")
+	if err != nil {
+		return 0, fmt.Errorf("read /proc/self/auxv: %w", err)
+	}
+	for off := 0; off+16 <= len(data); off += 16 {
+		t := binary.LittleEndian.Uint64(data[off:])
+		if t == 0 {
+			break
+		}
+		if t == tag {
+			return binary.LittleEndian.Uint64(data[off+8:]), nil
+		}
+	}
+	return 0, fmt.Errorf("auxiliary vector has no entry %d", tag)
 }
 
 func probeAuxvProcfs() (string, string, error) {

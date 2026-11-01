@@ -11,6 +11,71 @@ TEXT ·asmCPUID(SB), NOSPLIT, $0-24
 	MOVL DX, edx+20(FP)
 	RET
 
+// func asmXGETBV0() uint64
+TEXT ·asmXGETBV0(SB), NOSPLIT, $0-8
+	XORL CX, CX
+	// xgetbv
+	BYTE $0x0f; BYTE $0x01; BYTE $0xd0
+	SHLQ $32, DX
+	ORQ  DX, AX
+	MOVQ AX, ret+0(FP)
+	RET
+
+// func asmProbeYMMAMD64(in, out *[16][4]uint64, faultPage, tid uint64)
+TEXT ·asmProbeYMMAMD64(SB), NOSPLIT, $0-32
+	MOVQ in+0(FP), DI
+	VMOVDQU 0(DI), Y0
+	VMOVDQU 32(DI), Y1
+	VMOVDQU 64(DI), Y2
+	VMOVDQU 96(DI), Y3
+	VMOVDQU 128(DI), Y4
+	VMOVDQU 160(DI), Y5
+	VMOVDQU 192(DI), Y6
+	VMOVDQU 224(DI), Y7
+	VMOVDQU 256(DI), Y8
+	VMOVDQU 288(DI), Y9
+	VMOVDQU 320(DI), Y10
+	VMOVDQU 352(DI), Y11
+	VMOVDQU 384(DI), Y12
+	VMOVDQU 416(DI), Y13
+	VMOVDQU 448(DI), Y14
+	VMOVDQU 480(DI), Y15
+	// SYS_getpid (39) while YMM0..YMM15 are live.
+	MOVL $39, AX
+	SYSCALL
+	// Demand page fault while YMM0..YMM15 are live.
+	MOVQ faultPage+16(FP), SI
+	MOVQ $0xdeadbeef, AX
+	MOVQ AX, (SI)
+	// SYS_tgkill(getpid(), tid, SIGUSR1): the handler runs on this thread
+	// and returns through sigreturn before the next instruction.
+	MOVL $39, AX
+	SYSCALL
+	MOVQ AX, DI
+	MOVQ tid+24(FP), SI
+	MOVL $10, DX
+	MOVL $234, AX
+	SYSCALL
+	MOVQ out+8(FP), DI
+	VMOVDQU Y0, 0(DI)
+	VMOVDQU Y1, 32(DI)
+	VMOVDQU Y2, 64(DI)
+	VMOVDQU Y3, 96(DI)
+	VMOVDQU Y4, 128(DI)
+	VMOVDQU Y5, 160(DI)
+	VMOVDQU Y6, 192(DI)
+	VMOVDQU Y7, 224(DI)
+	VMOVDQU Y8, 256(DI)
+	VMOVDQU Y9, 288(DI)
+	VMOVDQU Y10, 320(DI)
+	VMOVDQU Y11, 352(DI)
+	VMOVDQU Y12, 384(DI)
+	VMOVDQU Y13, 416(DI)
+	VMOVDQU Y14, 448(DI)
+	VMOVDQU Y15, 480(DI)
+	VZEROUPPER
+	RET
+
 // func asmProbeGSAMD64(faultPage, writeVal uint64) (selfBefore, pebBefore, selfAfterSVC, tls1AfterFault uint64)
 TEXT ·asmProbeGSAMD64(SB), NOSPLIT, $0-48
 	// mov r8, qword ptr gs:[0x30]

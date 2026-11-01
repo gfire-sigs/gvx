@@ -30,6 +30,14 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
+// sentryFPLimit returns the size of the Sentry floating-point image of this
+// host. The vector selection of a test platform must fit the arch.Context64
+// images that the test builds.
+func sentryFPLimit() int {
+	cpuid.Initialize()
+	return len(arch.New(arch.AMD64).FloatingPointData().Slice())
+}
+
 // x64Env is a platform on a fake backend with one address space.
 type x64Env struct {
 	t  *testing.T
@@ -43,7 +51,9 @@ func newX64Env(t *testing.T, vps int) *x64Env {
 	t.Helper()
 	cpuid.Initialize()
 	fb := newFakeBackend()
-	p := newTestPlatform(t, fb, Options{})
+	// newContext gives every Context an image of testFPLimit bytes, so the
+	// AVX-512 selection holds on every host.
+	p := newTestPlatform(t, fb, Options{xsaveLayout: testXsaveLayout(), fpLimit: testFPLimit})
 	if vps > 0 {
 		limitVPs(p, vps)
 	}
@@ -51,8 +61,16 @@ func newX64Env(t *testing.T, vps int) *x64Env {
 	return &x64Env{t: t, fb: fb, p: p, as: as, mm: &fakeMM{as: as}}
 }
 
+// newContext returns a Context and an arch.Context64 whose floating-point
+// image holds the AVX-512 state of the test layout. The image of arch.New
+// follows the CPU of the host, which can lack XSAVE.
 func (e *x64Env) newContext() (*Context, *arch.Context64) {
-	return e.p.NewContext(nil).(*Context), arch.New(arch.AMD64)
+	ac := arch.New(arch.AMD64)
+	img := make([]byte, testFPLimit+4)
+	copy(img, ac.FloatingPointData().Slice()[:xsaveLegacySize])
+	binary.LittleEndian.PutUint64(img[xsaveOffXstateBV:], xcr0Legacy)
+	*ac.FloatingPointData() = img
+	return e.p.NewContext(nil).(*Context), ac
 }
 
 func (e *x64Env) comm(vp *fakeVP) *CommPage { return e.p.kernel.commPage(int(vp.index)) }
@@ -131,9 +149,10 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	}
 
 	vp := e.fb.vps[0]
-	// Bring-up, the FP load and the park state.
-	if len(vp.setCalls) != 3 {
-		t.Fatalf("%d register writes, want 3", len(vp.setCalls))
+	// Bring-up and the park state use registers; the FP load uses the XSAVE
+	// state.
+	if len(vp.setCalls) != 2 || vp.xsaveSets != 1 {
+		t.Fatalf("%d register writes and %d XSAVE writes, want 2 and 1", len(vp.setCalls), vp.xsaveSets)
 	}
 	if vp.reg(x64RegRip) != e.reload() || vp.reg(x64RegKernelGsBase) != 0x7F0000002000 || vp.reg(x64RegInternalActivity) != 0 {
 		t.Errorf("park state: rip=%#x kernelGsBase=%#x", vp.reg(x64RegRip), vp.reg(x64RegKernelGsBase))
@@ -157,10 +176,10 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if len(vp.setCalls) != 4 {
+	if len(vp.setCalls) != 3 {
 		t.Fatalf("%d register writes after the second call", len(vp.setCalls))
 	}
-	if resume := vp.setCalls[3]; len(resume) != 2 || resume[0] != x64RegRip || resume[1] != x64RegInternalActivity {
+	if resume := vp.setCalls[2]; len(resume) != 2 || resume[0] != x64RegRip || resume[1] != x64RegInternalActivity {
 		t.Errorf("resume writes %#x, want RIP and the activity state", resume)
 	}
 	if saw[1].Flags != 0 {
@@ -175,8 +194,8 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if len(vp.setCalls[4]) < 8 || vp.reg(x64RegKernelGsBase) != 0x7F0000002000 || vp.regs[x64RegFs][0] != 0x7F0000009000 {
-		t.Errorf("FS base change gave writes %#x", vp.setCalls[4])
+	if len(vp.setCalls[3]) < 8 || vp.reg(x64RegKernelGsBase) != 0x7F0000002000 || vp.regs[x64RegFs][0] != 0x7F0000009000 {
+		t.Errorf("FS base change gave writes %#x", vp.setCalls[3])
 	}
 }
 
@@ -472,14 +491,36 @@ func TestSwitchMemoryFaultAtCPL3IsSIGBUS(t *testing.T) {
 	}
 }
 
-func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
+// requireAVX skips a test on a host whose Sentry image has no room for the
+// AVX state, because the platform then runs its guests without AVX.
+func (e *x64Env) requireAVX() {
+	e.t.Helper()
+	if e.p.vec.xcr0&xcr0AVX == 0 {
+		e.t.Skip("the Sentry floating-point image of this host has no room for the AVX state")
+	}
+}
+
+// setImageVector stores YMMn in the Sentry image of ac and marks the SSE and
+// AVX components live.
+func setImageVector(ac *arch.Context64, n int, low, high uint64) {
+	img := acImage(ac)
+	binary.LittleEndian.PutUint64(img[fxOffXMM+16*n:], low)
+	binary.LittleEndian.PutUint64(img[576+16*n:], high)
+	bv := binary.LittleEndian.Uint64(img[xsaveOffXstateBV:])
+	binary.LittleEndian.PutUint64(img[xsaveOffXstateBV:], bv|xcr0SSE|xcr0AVX)
+}
+
+// imageVector returns YMMn from the Sentry image of ac.
+func imageVector(ac *arch.Context64, n int) (low, high uint64) {
+	img := acImage(ac)
+	return binary.LittleEndian.Uint64(img[fxOffXMM+16*n:]), binary.LittleEndian.Uint64(img[576+16*n:])
+}
+
+func TestBringUpEnablesTheSelectedVectorState(t *testing.T) {
 	e := newX64Env(t, 0)
 	c, ac := e.newContext()
 	r := &ac.StateData().Regs
 	r.Rip, r.Rcx, r.Eflags, r.R11 = 0x400000, 0x400000, 0x202, 0x202
-	img := acImage(ac)
-	binary.LittleEndian.PutUint64(img[fxOffXMM:], 0x1111)
-	binary.LittleEndian.PutUint32(img[fxOffMXCSR:], 0x1F80)
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
 		e.syscall(vp, exit, 0x400002, 0x202, nil)
 		return nil
@@ -488,29 +529,82 @@ func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
 		t.Fatal(err)
 	}
 	vp := e.fb.vps[0]
-	if vp.reg(x64RegXmm0) != 0x1111 || uint32(vp.regs[x64RegXmmControlStatus][1]) != 0x1F80 {
-		t.Fatalf("first Switch loaded XMM0=%#x", vp.reg(x64RegXmm0))
+	if got := vp.reg(x64RegXcr0); got != e.p.vec.xcr0 {
+		t.Errorf("XCR0 = %#x, want the selected %#x", got, e.p.vec.xcr0)
 	}
-	e.fb.setReg(0, x64RegXmm0, 0x2222)
+	if vp.reg(x64RegCr4)&x64Cr4OSXSAVE == 0 {
+		t.Error("CR4.OSXSAVE is clear, so XGETBV and the AVX instructions fault")
+	}
+	if e.fb.cfg.xsaveFeatures != e.p.vec.xsaveFeatures {
+		t.Errorf("the partition got ProcessorXsaveFeatures %#x, the selection is %#x", e.fb.cfg.xsaveFeatures, e.p.vec.xsaveFeatures)
+	}
+}
+
+func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
+	e := newX64Env(t, 0)
+	e.requireAVX()
+	c, ac := e.newContext()
+	r := &ac.StateData().Regs
+	r.Rip, r.Rcx, r.Eflags, r.R11 = 0x400000, 0x400000, 0x202, 0x202
+	setImageVector(ac, 0, 0x1111, 0x9999)
+	binary.LittleEndian.PutUint32(acImage(ac)[fxOffMXCSR:], 0x1F80)
+	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
+		e.syscall(vp, exit, 0x400002, 0x202, nil)
+		return nil
+	}
+	if _, _, err := e.switchTo(c, ac); err != nil {
+		t.Fatal(err)
+	}
+	vp := e.fb.vps[0]
+	if lo, hi := e.fb.vector(0, 0); lo != 0x1111 || hi != 0x9999 {
+		t.Fatalf("first Switch loaded YMM0 = %#x:%#x, want 0x9999:0x1111", hi, lo)
+	}
+	e.fb.setVector(0, 0, 0x2222, 0xAAAA)
+	gets, sets := vp.xsaveGets, vp.xsaveSets
 	for range 3 {
 		if _, _, err := e.switchTo(c, ac); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, call := range vp.getCalls {
-		if len(call) > 0 && call[0] == x64RegXmm0 {
-			t.Error("the fast path read the vector registers")
-		}
+	if vp.xsaveGets != gets || vp.xsaveSets != sets {
+		t.Errorf("the fast path moved the XSAVE state: %d reads and %d writes", vp.xsaveGets-gets, vp.xsaveSets-sets)
 	}
 	if err := c.PullFullState(e.as, ac); err != nil {
 		t.Fatal(err)
 	}
-	if got := binary.LittleEndian.Uint64(acImage(ac)[fxOffXMM:]); got != 0x2222 {
-		t.Errorf("pulled XMM0 is %#x", got)
+	if lo, hi := imageVector(ac, 0); lo != 0x2222 || hi != 0xAAAA {
+		t.Errorf("pulled YMM0 = %#x:%#x, want 0xaaaa:0x2222", hi, lo)
 	}
-	// The pull must not touch bytes outside the FXSAVE area except XSTATE_BV.
 	if got := binary.LittleEndian.Uint32(acImage(ac)[fxOffMXCSR:]); got != 0x1F80 {
 		t.Errorf("pulled MXCSR is %#x", got)
+	}
+
+	// A signal handler or ptrace changes the image; the next Switch loads it.
+	setImageVector(ac, 0, 0x3333, 0xBBBB)
+	c.FullStateChanged()
+	gets = vp.xsaveGets
+	if _, _, err := e.switchTo(c, ac); err != nil {
+		t.Fatal(err)
+	}
+	if lo, hi := e.fb.vector(0, 0); lo != 0x3333 || hi != 0xBBBB {
+		t.Errorf("Switch after FullStateChanged loaded YMM0 = %#x:%#x, want 0xbbbb:0x3333", hi, lo)
+	}
+	// No guest code ran between the pull and the push, so the push reuses
+	// the state of the pull.
+	if vp.xsaveGets != gets {
+		t.Errorf("the push after a pull read the XSAVE state %d more times", vp.xsaveGets-gets)
+	}
+}
+
+func TestFloatingPointLoadFailureStopsTheSwitch(t *testing.T) {
+	e := newX64Env(t, 0)
+	c, ac := e.newContext()
+	r := &ac.StateData().Regs
+	r.Rip, r.Rcx, r.Eflags, r.R11 = 0x400000, 0x400000, 0x202, 0x202
+	boom := errors.New("set XSAVE state boom")
+	e.fb.xsaveSetErr = boom
+	if _, _, err := e.switchTo(c, ac); !errors.Is(err, boom) {
+		t.Fatalf("Switch returned %v, want the XSAVE write error", err)
 	}
 }
 
@@ -561,8 +655,8 @@ func TestFloatingPointSurvivesProcessorSharing(t *testing.T) {
 		r := &ac.StateData().Regs
 		r.Rip, r.Rcx, r.Eflags, r.R11 = 0x400000, 0x400000, 0x202, 0x202
 	}
-	binary.LittleEndian.PutUint64(acImage(acA)[fxOffXMM:], 0xAAAA)
-	binary.LittleEndian.PutUint64(acImage(acB)[fxOffXMM:], 0xBBBB)
+	setImageVector(acA, 0, 0xAAAA, 0xA0A0)
+	setImageVector(acB, 0, 0xBBBB, 0xB0B0)
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
 		e.syscall(vp, exit, 0x400000, 0x202, nil)
 		return nil
@@ -570,20 +664,19 @@ func TestFloatingPointSurvivesProcessorSharing(t *testing.T) {
 	if _, _, err := e.switchTo(a, acA); err != nil {
 		t.Fatal(err)
 	}
-	vp := e.fb.vps[0]
-	e.fb.setReg(0, x64RegXmm0, 0xA1A1)
+	e.fb.setVector(0, 0, 0xA1A1, 0xA2A2)
 	if _, _, err := e.switchTo(b, acB); err != nil {
 		t.Fatal(err)
 	}
-	if vp.reg(x64RegXmm0) != 0xBBBB {
-		t.Fatalf("b runs with XMM0=%#x", vp.reg(x64RegXmm0))
+	if lo, hi := e.fb.vector(0, 0); lo != 0xBBBB || hi != 0xB0B0 {
+		t.Fatalf("b runs with YMM0 = %#x:%#x", hi, lo)
 	}
-	e.fb.setReg(0, x64RegXmm0, 0xB1B1)
+	e.fb.setVector(0, 0, 0xB1B1, 0xB2B2)
 	if err := a.PullFullState(e.as, acA); err != nil {
 		t.Fatal(err)
 	}
-	if got := binary.LittleEndian.Uint64(acImage(acA)[fxOffXMM:]); got != 0xA1A1 {
-		t.Errorf("a pulled XMM0=%#x", got)
+	if lo, hi := imageVector(acA, 0); lo != 0xA1A1 || hi != 0xA2A2 {
+		t.Errorf("a pulled YMM0 = %#x:%#x, want the value it had when b took the processor", hi, lo)
 	}
 	if _, _, err := e.switchTo(a, acA); err != nil {
 		t.Fatal(err)
@@ -591,7 +684,7 @@ func TestFloatingPointSurvivesProcessorSharing(t *testing.T) {
 	if _, _, err := e.switchTo(b, acB); err != nil {
 		t.Fatal(err)
 	}
-	if vp.reg(x64RegXmm0) != 0xB1B1 {
-		t.Errorf("b resumes with XMM0=%#x", vp.reg(x64RegXmm0))
+	if lo, hi := e.fb.vector(0, 0); lo != 0xB1B1 || hi != 0xB2B2 {
+		t.Errorf("b resumes with YMM0 = %#x:%#x", hi, lo)
 	}
 }

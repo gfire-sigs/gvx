@@ -37,8 +37,6 @@ func TestRegisterNamesMatchTheHeader(t *testing.T) {
 		{"Idtr", x64RegIdtr, 0x1A}, {"Gdtr", x64RegGdtr, 0x1B},
 		{"Cr0", x64RegCr0, 0x1C}, {"Cr2", x64RegCr2, 0x1D}, {"Cr3", x64RegCr3, 0x1E}, {"Cr4", x64RegCr4, 0x1F},
 		{"XCr0", x64RegXcr0, 0x27},
-		{"Xmm0", x64RegXmm0, 0x1000}, {"FpMmx0", x64RegFpMmx0, 0x1010},
-		{"FpControlStatus", x64RegFpControlStatus, 0x1018}, {"XmmControlStatus", x64RegXmmControlStatus, 0x1019},
 		{"Efer", x64RegEfer, 0x2001}, {"KernelGsBase", x64RegKernelGsBase, 0x2002},
 		{"Star", x64RegStar, 0x2008}, {"Lstar", x64RegLstar, 0x2009}, {"Cstar", x64RegCstar, 0x200A}, {"Sfmask", x64RegSfmask, 0x200B},
 		{"InternalActivityState", x64RegInternalActivity, 0x80000005},
@@ -71,6 +69,9 @@ func TestExitReasonsMatchTheHeader(t *testing.T) {
 		{"arm64 Canceled", a64ExitCanceled, 0xFFFFFFFF},
 		{"capability Features", capCodeFeatures, 1}, {"capability HypervisorPresent", capCodeHypervisorPresent, 0},
 		{"property ProcessorCount", propCodeProcessorCount, 0x1FFF},
+		{"capability ProcessorFeatures", capCodeProcessorFeatures, 0x1001}, {"capability ProcessorXsaveFeatures", capCodeXsaveFeatures, 0x1003},
+		{"property ProcessorFeatures", propCodeProcessorFeatures, 0x1001}, {"property ProcessorXsaveFeatures", propCodeXsaveFeatures, 0x1006},
+		{"state type XsaveState", vpStateTypeXsave, 0x1001}, {"WHV_E_INSUFFICIENT_BUFFER", hrInsufficientBuffer, 0x80370301},
 		{"map Read", mapFlagRead, 1}, {"map Write", mapFlagWrite, 2}, {"map Execute", mapFlagExecute, 4},
 	} {
 		if c.got != c.want {
@@ -81,15 +82,26 @@ func TestExitReasonsMatchTheHeader(t *testing.T) {
 	if featArm64Support != 1<<11 {
 		t.Errorf("Arm64Support is %#x", featArm64Support)
 	}
+	for _, c := range []struct {
+		name      string
+		got, want uint64
+	}{
+		{"XsaveSupport", xsaveFeatXsave, 1 << 0}, {"AvxSupport", xsaveFeatAvx, 1 << 2}, {"Avx512Support", xsaveFeatAvx512, 1 << 6},
+		{"XsaveCompSupport", xsaveFeatXsaveComp, 1 << 11}, {"GfniSupport", xsaveFeatGfni, 1 << 19},
+		{"Avx512Fp16Support", xsaveFeatAvx512Fp16, 1 << 25}, {"AmxTileSupport", xsaveFeatAmxTile, 1 << 27},
+		{"AvxVnniSupport", xsaveFeatAvxVnni, 1 << 30}, {"AmxFp16Support", xsaveFeatAmxFp16, 1 << 37},
+		{"XopSupport", procFeatXop, 1 << 6}, {"Fma4Support", procFeatFma4, 1 << 19}, {"F16CSupport", procFeatF16C, 1 << 20},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s is %#x, the header says %#x", c.name, c.got, c.want)
+		}
+	}
 }
 
 func TestRegisterIndexSequences(t *testing.T) {
 	// X0 to X28 and Q0 to Q31 count up by one, and Fp and Lr are X29 and X30.
 	if a64RegFp != a64RegX0+29 || a64RegLr != a64RegX0+30 {
 		t.Errorf("Fp is X0+%d and Lr is X0+%d, want X29 and X30", a64RegFp-a64RegX0, a64RegLr-a64RegX0)
-	}
-	if x64RegXmm0+15 != 0x100F || x64RegFpMmx0+7 != 0x1017 {
-		t.Error("XMM and FP register runs do not match the header")
 	}
 }
 

@@ -45,6 +45,11 @@ type fakeVP struct {
 	// setCalls records the register names of every setRegs call.
 	setCalls [][]uint32
 	getCalls [][]uint32
+
+	// xsave is the compacted XSAVE state of the processor.
+	xsave     []byte
+	xsaveGets int
+	xsaveSets int
 }
 
 // runScript fills the exit context of one run. A script that returns blockRun
@@ -65,6 +70,18 @@ type fakeBackend struct {
 	runErr    error
 	info      partitionInfo
 
+	// cfg is the configuration of the last createPartition call.
+	cfg partitionConfig
+	// dropXsave lists the XSAVE features that the partition refuses.
+	dropXsave uint64
+
+	// xsaveLayout and xcompBV describe the compacted XSAVE state of every
+	// processor. xcompBV lacks the compacted-format bit.
+	xsaveLayout *xsaveLayout
+	xcompBV     uint64
+	// xsaveSetErr fails setXsave.
+	xsaveSetErr error
+
 	mapErr   func(gpa uint64) error
 	unmapErr func(gpa uint64) error
 	getErr   func(index uint32) error
@@ -75,6 +92,7 @@ type fakeBackend struct {
 	unmapCalls int
 	hosts      map[uintptr][]byte
 	vps        map[uint32]*fakeVP
+	created    int
 	deleted    []uint32
 
 	partitionOpen bool
@@ -89,10 +107,18 @@ type fakeBackend struct {
 
 func newFakeBackend() *fakeBackend {
 	fb := &fakeBackend{
-		feats:  hostFeatures{hypervisorPresent: true, arm64Support: true, windowsBuild: 26100, windowsUBR: 3915},
-		mapped: map[uint64]fakeMapping{},
-		hosts:  map[uintptr][]byte{},
-		vps:    map[uint32]*fakeVP{},
+		feats: hostFeatures{
+			hypervisorPresent: true,
+			arm64Support:      true,
+			windowsBuild:      26100,
+			windowsUBR:        3915,
+			xsaveFeatures:     testXsaveCapability,
+		},
+		mapped:      map[uint64]fakeMapping{},
+		hosts:       map[uintptr][]byte{},
+		vps:         map[uint32]*fakeVP{},
+		xsaveLayout: testXsaveLayout(),
+		xcompBV:     testXcompBV,
 	}
 	fb.cond = sync.NewCond(&fb.mu)
 	return fb
@@ -100,15 +126,17 @@ func newFakeBackend() *fakeBackend {
 
 func (fb *fakeBackend) features() (hostFeatures, error) { return fb.feats, fb.featErr }
 
-func (fb *fakeBackend) createPartition(vpCount uint32) (partitionInfo, error) {
+func (fb *fakeBackend) createPartition(cfg partitionConfig) (partitionInfo, error) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	if fb.createErr != nil {
 		return partitionInfo{}, fb.createErr
 	}
 	fb.partitionOpen = true
+	fb.cfg = cfg
 	info := fb.info
-	info.vpCount = vpCount
+	info.vpCount = cfg.vpCount
+	info.xsaveFeatures = cfg.xsaveFeatures &^ fb.dropXsave
 	return info, nil
 }
 
@@ -217,7 +245,18 @@ func (fb *fakeBackend) createVP(index uint32) error {
 	if _, ok := fb.vps[index]; ok {
 		return fmt.Errorf("virtual processor %d exists", index)
 	}
-	fb.vps[index] = &fakeVP{index: index, regs: map[uint32][2]uint64{}}
+	fb.created++
+	vp := &fakeVP{index: index, regs: map[uint32][2]uint64{}}
+	_, end, err := fb.xsaveLayout.compactedOffsets(fb.xcompBV)
+	if err != nil {
+		return err
+	}
+	// A new processor holds every component in its initial state.
+	vp.xsave = make([]byte, end)
+	binary.LittleEndian.PutUint32(vp.xsave[fxOffMXCSR:], 0x1F80)
+	binary.LittleEndian.PutUint32(vp.xsave[fxOffMXCSRMask:], 0xFFFF)
+	binary.LittleEndian.PutUint64(vp.xsave[xsaveOffXcompBV:], fb.xcompBV|xcompBVCompacted)
+	fb.vps[index] = vp
 	return nil
 }
 
@@ -354,6 +393,80 @@ func (fb *fakeBackend) setRegs(index uint32, b *regBatch) error {
 	return nil
 }
 
+func (fb *fakeBackend) getXsave(index uint32, buf []byte) (int, error) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	vp, ok := fb.vps[index]
+	if !ok {
+		return 0, fmt.Errorf("virtual processor %d does not exist", index)
+	}
+	if len(buf) < len(vp.xsave) {
+		return len(vp.xsave), errXsaveBufferSmall
+	}
+	vp.xsaveGets++
+	return copy(buf, vp.xsave), nil
+}
+
+// setXsave accepts only a state that XRSTORS loads: the same size and
+// XCOMP_BV as the state of the processor, and no XSTATE_BV bit outside it.
+func (fb *fakeBackend) setXsave(index uint32, buf []byte) error {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if fb.xsaveSetErr != nil {
+		return fb.xsaveSetErr
+	}
+	vp, ok := fb.vps[index]
+	if !ok {
+		return fmt.Errorf("virtual processor %d does not exist", index)
+	}
+	if len(buf) != len(vp.xsave) {
+		return fmt.Errorf("XSAVE state is %d bytes, want %d", len(buf), len(vp.xsave))
+	}
+	xcomp := binary.LittleEndian.Uint64(buf[xsaveOffXcompBV:])
+	if xcomp != fb.xcompBV|xcompBVCompacted {
+		return fmt.Errorf("XSAVE state has XCOMP_BV %#x, want %#x", xcomp, fb.xcompBV|xcompBVCompacted)
+	}
+	if bv := binary.LittleEndian.Uint64(buf[xsaveOffXstateBV:]); bv&^(fb.xcompBV|xcr0Legacy) != 0 {
+		return fmt.Errorf("XSAVE state has XSTATE_BV %#x outside XCOMP_BV %#x", bv, fb.xcompBV)
+	}
+	if mxcsr := binary.LittleEndian.Uint32(buf[fxOffMXCSR:]); mxcsr&^binary.LittleEndian.Uint32(buf[fxOffMXCSRMask:]) != 0 {
+		return fmt.Errorf("XSAVE state has MXCSR %#x with reserved bits", mxcsr)
+	}
+	copy(vp.xsave, buf)
+	vp.xsaveSets++
+	return nil
+}
+
+// avxOffset returns the offset of the AVX component in the compacted state.
+// The layout never changes, so the caller may hold fb.mu.
+func (fb *fakeBackend) avxOffset() int {
+	offs, _, err := fb.xsaveLayout.compactedOffsets(fb.xcompBV)
+	if err != nil {
+		panic(err)
+	}
+	return int(offs[2])
+}
+
+// setVector stores the low and high halves of YMMn in the state of a
+// processor and marks the SSE and AVX components live.
+func (fb *fakeBackend) setVector(index uint32, n int, low, high uint64) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	st := fb.vps[index].xsave
+	binary.LittleEndian.PutUint64(st[fxOffXMM+16*n:], low)
+	binary.LittleEndian.PutUint64(st[fb.avxOffset()+16*n:], high)
+	bv := binary.LittleEndian.Uint64(st[xsaveOffXstateBV:])
+	binary.LittleEndian.PutUint64(st[xsaveOffXstateBV:], bv|xcr0SSE|xcr0AVX)
+}
+
+// vector returns the low and high halves of YMMn in the state of a processor.
+func (fb *fakeBackend) vector(index uint32, n int) (low, high uint64) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	st := fb.vps[index].xsave
+	return binary.LittleEndian.Uint64(st[fxOffXMM+16*n:]), binary.LittleEndian.Uint64(st[fb.avxOffset()+16*n:])
+}
+
 // waitRunning blocks until processor index is inside a run call.
 func (fb *fakeBackend) waitRunning(index uint32) *fakeVP {
 	fb.mu.Lock()
@@ -413,6 +526,12 @@ func writeStubExit(buf []byte, pc uint64) {
 	binary.LittleEndian.PutUint64(buf[x64ExitOffRip:], pc)
 }
 
+// testOptions selects the vector state from the test layout, not from the CPU
+// of the host.
+func testOptions() Options {
+	return Options{xsaveLayout: testXsaveLayout(), fpLimit: sentryFPLimit()}
+}
+
 // newTestPlatform builds a platform on a fake backend and closes it at the
 // end of the test.
 func newTestPlatform(t testing.TB, fb *fakeBackend, opts Options) *Platform {
@@ -421,6 +540,9 @@ func newTestPlatform(t testing.TB, fb *fakeBackend, opts Options) *Platform {
 		// Several tests limit the pool to four processors, and a CI runner can
 		// have fewer CPUs than that.
 		opts.processors = 8
+	}
+	if opts.xsaveLayout == nil {
+		opts.xsaveLayout, opts.fpLimit = testXsaveLayout(), sentryFPLimit()
 	}
 	p, err := newPlatform(fb, opts)
 	if err != nil {

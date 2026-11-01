@@ -135,7 +135,7 @@ func TestFailedBringUpDeletesTheProcessor(t *testing.T) {
 
 func TestCloseCancelsRunningProcessorsAndWaits(t *testing.T) {
 	fb := newFakeBackend()
-	p, err := newPlatform(fb, Options{})
+	p, err := newPlatform(fb, testOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

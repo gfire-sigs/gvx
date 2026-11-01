@@ -248,3 +248,34 @@ func benchTEBAccess(iters int) {
 	binary.LittleEndian.PutUint64(tebMem[0x30:], tebAddr)
 	_ = asmBenchTEBARM64(tebAddr, iters)
 }
+
+// arm64HWCapFeatures pairs AT_HWCAP bits with their /proc/cpuinfo names.
+var arm64HWCapFeatures = []struct {
+	name string
+	bit  uint64
+}{
+	{"fp", 1 << 0}, {"asimd", 1 << 1}, {"aes", 1 << 3}, {"pmull", 1 << 4},
+	{"sha1", 1 << 5}, {"sha2", 1 << 6}, {"crc32", 1 << 7}, {"atomics", 1 << 8},
+}
+
+func probeCPUFeatures() (string, string, error) {
+	const atHWCap = 16
+	hwcap, err := auxvValue(atHWCap)
+	if err != nil {
+		return "", "", err
+	}
+	// Every Armv8-A processor has floating point and Advanced SIMD.
+	if hwcap&3 != 3 {
+		return "", "", fmt.Errorf("AT_HWCAP %#x lacks FP and ASIMD", hwcap)
+	}
+	flags, err := cpuinfoFlags("Features")
+	if err != nil {
+		return "", "", err
+	}
+	for _, f := range arm64HWCapFeatures {
+		if (hwcap&f.bit != 0) != flags[f.name] {
+			return "", "", fmt.Errorf("%s: AT_HWCAP %#x reports %v, /proc/cpuinfo reports %v", f.name, hwcap, hwcap&f.bit != 0, flags[f.name])
+		}
+	}
+	return cpuFeaturesDigest, fmt.Sprintf("AT_HWCAP=%#x", hwcap), nil
+}

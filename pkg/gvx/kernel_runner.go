@@ -59,6 +59,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/limits"
 	"z.gfire.dev/gvx/pkg/sentry/loader"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/sentry/strace"
 	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
@@ -94,6 +95,22 @@ func init() {
 			RTMemoryStats: &usage.RTMemoryStats{},
 		}
 	}
+}
+
+// guestFeatureSetter is a platform whose guests use fewer CPU features than
+// the host. whpx on amd64 is one: its partition exposes only the vector state
+// that it saves and restores.
+type guestFeatureSetter interface {
+	GuestFeatureSet(host cpuid.FeatureSet) cpuid.FeatureSet
+}
+
+// guestFeatureSet returns the CPU features that guests of plat can use. The
+// Sentry derives /proc/cpuinfo, signal frames, and sigreturn checks from it.
+func guestFeatureSet(plat platform.Platform) cpuid.FeatureSet {
+	if g, ok := plat.(guestFeatureSetter); ok {
+		return g.GuestFeatureSet(cpuid.HostFeatureSet())
+	}
+	return cpuid.HostFeatureSet()
 }
 
 // errRunConsumed reports a second Run call. The first Run consumes the kernel
@@ -924,7 +941,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 
 	if err := k.Init(kernel.InitKernelArgs{
-		FeatureSet:           cpuid.HostFeatureSet(),
+		FeatureSet:           guestFeatureSet(s.plat),
 		Timekeeper:           tk,
 		RootUserNamespace:    creds.UserNamespace,
 		RootNetworkNamespace: rootNetNS,

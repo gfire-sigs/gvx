@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -48,10 +49,6 @@ const (
 	x64EferLME = 1 << 8
 	x64EferLMA = 1 << 10
 	x64EferNXE = 1 << 11
-
-	// x64Xcr0 enables the x87 and SSE state components. The AVX state is out
-	// of reach of the WHPX register interface, so the guest never enables it.
-	x64Xcr0 = 3
 )
 
 // archInit sets global state of the page table package. The
@@ -96,11 +93,8 @@ func (v *vcpu) archBringUp() error {
 	b.reset()
 
 	cr0 := uint64(x64Cr0PE | x64Cr0MP | x64Cr0ET | x64Cr0NE | x64Cr0WP | x64Cr0PG)
-	cr4 := uint64(x64Cr4PAE | x64Cr4OSFXSR | x64Cr4OSXMMEXCPT)
-	if p.info.xsave {
-		cr4 |= x64Cr4OSXSAVE
-		b.add64(x64RegXcr0, x64Xcr0)
-	}
+	cr4 := uint64(x64Cr4PAE | x64Cr4OSFXSR | x64Cr4OSXMMEXCPT | x64Cr4OSXSAVE)
+	b.add64(x64RegXcr0, p.vec.xcr0)
 	b.add64(x64RegCr0, cr0)
 	b.add64(x64RegCr3, p.kernel.pt.CR3(false, 0))
 	b.add64(x64RegCr4, cr4)
@@ -126,7 +120,35 @@ func (v *vcpu) archBringUp() error {
 		return err
 	}
 	v.st.invalidate()
+	v.xsave = alignedBuf(xsaveInitialSize, xsaveAlign)
+	state, err := v.fetchXsave()
+	if err != nil {
+		return err
+	}
+	if _, err := p.vec.layout.checkCompacted(state, p.vec.xcr0); err != nil {
+		return err
+	}
 	return nil
+}
+
+// xsaveInitialSize is the first size of the XSAVE state buffer. It holds the
+// x87, SSE, AVX and AVX-512 state in the compacted format.
+const xsaveInitialSize = 3 * pageSize
+
+// hostVectorState returns the XSAVE layout of the host CPU and the size of
+// the Sentry floating-point image.
+func hostVectorState() (*xsaveLayout, int) {
+	// Initialize runs once per process. The kernel runner calls it first in
+	// production; the call here covers a direct user of the package.
+	cpuid.Initialize()
+	native := &cpuid.Native{}
+	layout := newXsaveLayout(func(sub uint32) (eax, ebx, ecx uint32) {
+		out := native.Query(cpuid.In{Eax: 0xD, Ecx: sub})
+		return out.Eax, out.Ebx, out.Ecx
+	})
+	fs := cpuid.HostFeatureSet()
+	size, _ := fs.ExtendedStateSize()
+	return layout, int(size - fs.AMXExtendedStateSize())
 }
 
 // addParkRegs appends the registers that place the processor at the start of

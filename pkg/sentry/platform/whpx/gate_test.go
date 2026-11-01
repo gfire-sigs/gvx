@@ -27,7 +27,8 @@ func TestCheckHost(t *testing.T) {
 		f       hostFeatures
 		wantErr bool
 	}{
-		{name: "amd64 with hypervisor", f: hostFeatures{hypervisorPresent: true}},
+		{name: "amd64 with hypervisor", f: hostFeatures{hypervisorPresent: true, xsaveFeatures: xsaveFeatXsave}},
+		{name: "amd64 without XsaveSupport", f: hostFeatures{hypervisorPresent: true, xsaveFeatures: xsaveFeatAvx}, wantErr: true},
 		{name: "amd64 without hypervisor", f: hostFeatures{}, wantErr: true},
 		{name: "arm64 at the minimum", arm64: true, f: good},
 		{name: "arm64 above the minimum build with a low UBR", arm64: true, f: hostFeatures{hypervisorPresent: true, arm64Support: true, windowsBuild: 26200, windowsUBR: 100}},
@@ -35,7 +36,7 @@ func TestCheckHost(t *testing.T) {
 		{name: "arm64 old build with a high UBR", arm64: true, f: hostFeatures{hypervisorPresent: true, arm64Support: true, windowsBuild: 22631, windowsUBR: 9999}, wantErr: true},
 		{name: "arm64 without Arm64Support", arm64: true, f: hostFeatures{hypervisorPresent: true, windowsBuild: 26100, windowsUBR: 3915}, wantErr: true},
 		{name: "arm64 without hypervisor", arm64: true, f: hostFeatures{arm64Support: true, windowsBuild: 26100, windowsUBR: 3915}, wantErr: true},
-		{name: "amd64 ignores the arm64 gate", f: hostFeatures{hypervisorPresent: true, windowsBuild: 19045}},
+		{name: "amd64 ignores the arm64 gate", f: hostFeatures{hypervisorPresent: true, windowsBuild: 19045, xsaveFeatures: xsaveFeatXsave}},
 	} {
 		err := checkHost(c.arm64, c.f)
 		if (err != nil) != c.wantErr {
