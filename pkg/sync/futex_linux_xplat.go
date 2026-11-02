@@ -27,7 +27,9 @@ func FutexWait(addr *uint32, val uint32, timeout time.Duration) error {
 	}
 	var ts *unix.Timespec
 	var rel unix.Timespec
+	var deadline time.Time
 	if timeout >= 0 {
+		deadline = time.Now().Add(timeout)
 		rel = unix.NsecToTimespec(timeout.Nanoseconds())
 		ts = &rel
 	}
@@ -41,9 +43,16 @@ func FutexWait(addr *uint32, val uint32, timeout time.Duration) error {
 		case syscall.ETIMEDOUT:
 			return ErrFutexTimedOut
 		case syscall.EINTR:
-			// Re-parking would restart a relative timeout, so report a spurious wake.
+			// WHY: Linux ends a FUTEX_WAIT that has a timeout with EINTR when a
+			// signal handler runs, such as the SIGURG of Go preemption. The
+			// kernel does not restart it. Park again for the time that is left,
+			// so the caller sees no wake that nobody issued.
 			if ts != nil {
-				return nil
+				left := time.Until(deadline)
+				if left <= 0 {
+					return ErrFutexTimedOut
+				}
+				rel = unix.NsecToTimespec(left.Nanoseconds())
 			}
 		default:
 			return fmt.Errorf("futex wait: %w", e)
