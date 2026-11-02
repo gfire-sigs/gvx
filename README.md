@@ -140,6 +140,8 @@ CGO_ENABLED=0 go build -o rungv ./cmd/rungv
 ./rungv run -platform=systrap alpine:3.20 sh -c "echo hello from systrap"
 ```
 
+To use `gvx` as a Docker Engine for the `docker` command of your host, follow [`docs/docker-engine.md`](docs/docker-engine.md).
+
 The table below lists the available `rungv` subcommands.
 
 | Command | Synopsis | Description |
@@ -257,6 +259,7 @@ Refer to the guides below for full CLI flag documentation, release notes, securi
 | Document | Description |
 | :--- | :--- |
 | [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, `rungv run` flags, mount and volume rules, and differences from Docker. |
+| [`docs/docker-engine.md`](docs/docker-engine.md) | Run a Docker Engine in a sandbox with an `ext4lite` volume and control it from the host through a Docker context. |
 | [`docs/architecture.md`](docs/architecture.md) | Internal subsystem design, Windows and macOS kernel bindings, and contributor development guide. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes, new features, and known limitations for each version. |
 | [`SECURITY.md`](SECURITY.md) | Security boundaries, supported versions, and private vulnerability reporting instructions. |
