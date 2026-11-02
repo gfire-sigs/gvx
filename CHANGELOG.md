@@ -7,12 +7,21 @@ This file records the observable changes of each `gvx` release. The release work
 ### Features
 
 - **Guest overlay upper layer on `ext4lite` and `hostfs`**: a guest `mount -t overlay` with `upperdir` on a named volume, a volume image, or a bind mount no longer fails with `EINVAL`. The overlay storage driver of `dockerd` therefore works with `-v NAME:/var/lib/docker` and with `-v /host/dir:/var/lib/docker`, with the containerd snapshotter and with `overlay2`. Whiteouts, opaque directories, and copy-up data survive a restart and a SIGKILL. `ext4lite` is the faster choice. `hostfs` is slower. See `docs/cli.md`, section 4.4.
+- **`iptables -m addrtype`**: the guest has the `addrtype` match in revisions 0 and 1, for IPv4 and IPv6. It knows the types `UNICAST`, `LOCAL`, `BROADCAST`, `MULTICAST`, and `UNSPEC`, and the options `--limit-iface-in` and `--limit-iface-out`. An unmodified `docker:dind` image now starts with the default `--iptables=true`. It failed with `Extension addrtype revision 0 not supported`. `docker run -p`, the default `bridge` network, user-defined networks, `docker build`, and `docker compose up` work in the guest.
+- **Port ranges in `-p`**: `-p 8000-8009:8000-8009` and `-p 8000-8009` publish one port for each number, up to 1024 ports. Two ranges must have the same length.
+- **Unix socket publishing**: `-p unix:PATH:GUEST` forwards a host Unix socket to a guest TCP port, for example `-p unix:~/.gvx/docker.sock:2375` for the Docker API. The SDK field is `PortForward.HostSocket`.
+
+### Behavior Changes
+
+- **`--privileged` on by default**: `rungv run` turns on `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid` unless `--privileged=false` is given. A flag of the three that you set wins over `--privileged`. These privileges stay inside the sandbox. The SDK fields keep their zero values off.
 
 ### Bug Fixes
 
 - **`hostfs` and `ext4lite` as overlay layers**: both drivers returned `EOPNOTSUPP` for the POSIX ACL query of the overlay, so a mount with one of them as a layer failed. They now report no ACL.
 - **Failed overlay mount**: an error after the root dentry of the overlay existed made the Sentry panic. The mount now fails with the error.
 - **Program starts from a `hostfs` layer of an overlay**: the second start of an executable on a `hostfs` lower or upper layer ended with SIGBUS or `Bad address`, for example `nginx` in a container on a `hostfs` Docker root. `hostfs` now opens a handle when a new mapping finds none.
+- **Inverted input interface in `iptables`**: a rule such as `! -i docker0 -j DNAT` came back from the guest as `-i docker0`. `iptables -C` and `iptables -D` did not find the rule. The guest now reports the `!` of `-i`, for IPv4 and IPv6.
+- **`DNAT` rule deletion**: the `DNAT` target of revision 2 reported a size of 72 bytes, but it has 80 bytes. `iptables -C` and `iptables -D` did not find a `DNAT` rule, so `dockerd` left the rule of a removed container behind. The size is now correct.
 
 ## [v0.4.1] - 2026-11-02
 

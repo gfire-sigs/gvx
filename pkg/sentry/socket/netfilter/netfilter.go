@@ -331,6 +331,8 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 		return err
 	}
 
+	bindMatcherStacks(stk, table.Rules)
+
 	stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6)
 	return nil
 }
