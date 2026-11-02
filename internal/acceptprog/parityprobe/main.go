@@ -172,7 +172,9 @@ func checkTmpfsPercent() error {
 }
 
 func checkMounted(target, fsType string) error {
-	data, err := os.ReadFile("/proc/self/mounts")
+	// /proc/self would show the mounts of the thread group leader. See
+	// checkMountNamespaceSetns.
+	data, err := os.ReadFile("/proc/thread-self/mounts")
 	if err != nil {
 		return err
 	}
@@ -385,17 +387,24 @@ func checkOverlayDentries() error {
 // enters that namespace with setns(2) from a new mount namespace, as runc
 // exec does for docker exec. runc reports a namespace as unsupported when its
 // /proc/self/ns link cannot be read.
+//
+// The probe reads the namespace of its own thread through /proc/thread-self.
+// /proc/self names the thread group leader. When a goroutine that changed its
+// namespaces exits on the main thread, the Go runtime parks that thread for
+// good, so the leader can stay in the private namespace of an earlier check.
 func checkMountNamespaceSetns() error {
-	link, err := os.Readlink("/proc/self/ns/mnt")
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	link, err := os.Readlink("/proc/thread-self/ns/mnt")
 	if err != nil {
-		return fmt.Errorf("readlink /proc/self/ns/mnt: %w", err)
+		return fmt.Errorf("readlink /proc/thread-self/ns/mnt: %w", err)
 	}
 	if !strings.HasPrefix(link, "mnt:[") {
-		return fmt.Errorf("/proc/self/ns/mnt = %q, want mnt:[N]", link)
+		return fmt.Errorf("/proc/thread-self/ns/mnt = %q, want mnt:[N]", link)
 	}
-	fd, err := syscall.Open("/proc/self/ns/mnt", syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Open("/proc/thread-self/ns/mnt", syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("open /proc/self/ns/mnt: %w", err)
+		return fmt.Errorf("open /proc/thread-self/ns/mnt: %w", err)
 	}
 	defer syscall.Close(fd)
 	return inNewThreadNamespace(syscall.CLONE_NEWNS|syscall.CLONE_FS, func() error {
