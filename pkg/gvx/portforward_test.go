@@ -38,7 +38,8 @@ func TestParsePortForwardDockerForms(t *testing.T) {
 
 func TestParsePortForwardRejectsMalformedSpecifications(t *testing.T) {
 	for _, spec := range []string{
-		"8000-8010:80",        // port range
+		"8000-8010:80",        // host range with one guest port
+		"8000-8001",           // two ports: ParsePortForwards takes ranges
 		"999.1.1.1:80:80",     // bad IPv4
 		"::1:8080:80",         // IPv6 without brackets
 		"[::1:8080:80",        // unclosed bracket

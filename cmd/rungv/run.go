@@ -150,9 +150,10 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		fs.StringVar(&netFlag, n, string(gvx.NetModeNAT), "Network backend: nat (or bridge), wg, or none")
 	})
 	isolateLANFlag := fs.Bool("isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
-	netRawFlag := fs.Bool("net-raw", false, "Allow raw sockets and iptables in the guest (dockerd needs them)")
-	packetWriteFlag := fs.Bool("allow-packet-socket-write", false, "Allow writes on AF_PACKET sockets; needs --net-raw")
-	allowSUIDFlag := fs.Bool("allow-suid", false, "Obey the set-user-ID and set-group-ID bits of guest executables")
+	privilegedFlag := fs.Bool("privileged", true, "Turn on --net-raw, --allow-packet-socket-write, and --allow-suid; --privileged=false turns them off")
+	netRawFlag := fs.Bool("net-raw", true, "Allow raw sockets and iptables in the guest (default from --privileged)")
+	packetWriteFlag := fs.Bool("allow-packet-socket-write", true, "Allow writes on AF_PACKET sockets; needs --net-raw (default from --privileged)")
+	allowSUIDFlag := fs.Bool("allow-suid", true, "Obey the set-user-ID and set-group-ID bits of guest executables (default from --privileged)")
 	wgConfFlag := fs.String("wg-conf", "", "Path to WireGuard INI configuration file")
 	wgConfigAlias := fs.String("wg-config", "", "Alias for -wg-conf")
 	imageFlag := fs.String("image", "", "OCI image reference or archive path")
@@ -239,11 +240,11 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 
 	var portForwards []gvx.PortForward
 	for _, spec := range portSpecs {
-		pf, err := gvx.ParsePortForward(spec)
+		pfs, err := gvx.ParsePortForwards(spec)
 		if err != nil {
 			return usageError("%v", err)
 		}
-		portForwards = append(portForwards, pf)
+		portForwards = append(portForwards, pfs...)
 	}
 
 	var envv []string
@@ -326,14 +327,16 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		wgConfPath = strings.TrimSpace(*wgConfigAlias)
 	}
 
+	priv := resolvePrivileges(fs, *privilegedFlag, *netRawFlag, *packetWriteFlag, *allowSUIDFlag)
+
 	cfg := gvx.Config{
 		Platform:               backend,
 		Architecture:           arch,
 		NetworkMode:            netMode,
 		IsolateLAN:             *isolateLANFlag,
-		NetRaw:                 *netRawFlag,
-		AllowPacketSocketWrite: *packetWriteFlag,
-		AllowSUID:              *allowSUIDFlag,
+		NetRaw:                 priv.netRaw,
+		AllowPacketSocketWrite: priv.packetWrite,
+		AllowSUID:              priv.allowSUID,
 		PortForwards:           portForwards,
 		PublishAll:             *publishAllFlag,
 		WireGuardConfigPath:    wgConfPath,
@@ -435,11 +438,49 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	return exitCode
 }
 
+// guestPrivileges are the guest privileges that --privileged groups.
+type guestPrivileges struct {
+	netRaw, packetWrite, allowSUID bool
+}
+
+// resolvePrivileges applies --privileged and the flags that it groups. Each
+// flag that the user set explicitly wins. A flag that the user did not set
+// takes the value of --privileged. Packet socket writes need raw sockets, so
+// they stay off when raw sockets are off, unless the user asked for both.
+//
+// WHY: --privileged is on by default. The guest privileges stay inside the
+// Sentry: a raw packet leaves the guest only through the NAT forwarder, which
+// relays TCP and UDP from host sockets, and a set-user-ID program changes
+// only guest credentials. dockerd and sudo then work without extra flags.
+func resolvePrivileges(fs *flag.FlagSet, privileged, netRaw, packetWrite, allowSUID bool) guestPrivileges {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	pick := func(name string, value bool) bool {
+		if set[name] {
+			return value
+		}
+		return privileged
+	}
+	p := guestPrivileges{
+		netRaw:      pick("net-raw", netRaw),
+		packetWrite: pick("allow-packet-socket-write", packetWrite),
+		allowSUID:   pick("allow-suid", allowSUID),
+	}
+	if !set["allow-packet-socket-write"] && !p.netRaw {
+		p.packetWrite = false
+	}
+	return p
+}
+
 // reportPublishedPorts tells the user which host port serves each guest port,
 // because a free port that the host picked is not known to the user.
 func reportPublishedPorts(w io.Writer, sb *gvx.Sandbox) {
 	for _, p := range sb.PublishedPorts() {
-		_, _ = fmt.Fprintf(w, "rungv: publishing %s -> %d/%s\n", net.JoinHostPort(p.HostAddr, strconv.Itoa(int(p.HostPort))), p.GuestPort, p.Protocol)
+		host := net.JoinHostPort(p.HostAddr, strconv.Itoa(int(p.HostPort)))
+		if p.HostSocket != "" {
+			host = "unix:" + p.HostSocket
+		}
+		_, _ = fmt.Fprintf(w, "rungv: publishing %s -> %d/%s\n", host, p.GuestPort, p.Protocol)
 	}
 }
 

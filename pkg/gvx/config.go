@@ -70,24 +70,49 @@ type PortForward struct {
 	GuestPort   uint16
 	Protocol    string
 	BindAddress string
+
+	// HostSocket is the path of a host Unix socket that forwards each
+	// connection to GuestPort over TCP. When it is set, HostPort and
+	// BindAddress are unused. New removes a socket file that an earlier run
+	// left at the path.
+	HostSocket string
 }
 
-// ParsePortForward parses a Docker publish specification: "guest",
+// ParsePortForward parses a publish specification that names one forward.
+// ParsePortForwards describes the forms.
+func ParsePortForward(spec string) (PortForward, error) {
+	forwards, err := ParsePortForwards(spec)
+	if err != nil {
+		return PortForward{}, err
+	}
+	if len(forwards) != 1 {
+		return PortForward{}, fmt.Errorf("gvx: publish specification %q names %d ports, want one", spec, len(forwards))
+	}
+	return forwards[0], nil
+}
+
+// ParsePortForwards parses a Docker publish specification: "guest",
 // "host:guest", "ip:host:guest", or "ip::guest", with an optional "/tcp" or
 // "/udp" suffix. A host port of zero, and a specification with only a guest
 // port, ask for a free host port. The default bind address is 127.0.0.1. An
-// IPv6 address is written in brackets. A port range is not supported.
-func ParsePortForward(spec string) (PortForward, error) {
-	rule, err := netbackend.ParsePortForwardSpec(spec, true, true)
+// IPv6 address is written in brackets. A port range, such as
+// "8000-8009:8000-8009" or "8000-8009", names one forward for each port; two
+// ranges must have the same length. "unix:PATH:GUEST" forwards a host Unix
+// socket to a guest TCP port.
+func ParsePortForwards(spec string) ([]PortForward, error) {
+	rules, err := netbackend.ParsePortForwardSpecs(spec, true, true)
 	if err != nil {
-		return PortForward{}, fmt.Errorf("gvx: %w", err)
+		return nil, fmt.Errorf("gvx: %w", err)
 	}
-	return PortForward{
-		HostPort:    rule.HostPort,
-		GuestPort:   rule.GuestPort,
-		Protocol:    rule.Proto,
-		BindAddress: rule.HostIP,
-	}, nil
+	out := make([]PortForward, 0, len(rules))
+	for _, rule := range rules {
+		pf := PortForward{GuestPort: rule.GuestPort, Protocol: rule.Proto, HostSocket: rule.HostSocket}
+		if rule.HostSocket == "" {
+			pf.HostPort, pf.BindAddress = rule.HostPort, rule.HostIP
+		}
+		out = append(out, pf)
+	}
+	return out, nil
 }
 
 // Resources limits what the guest may use. A zero field means no limit.
@@ -309,6 +334,11 @@ func (c *Config) normalize() error {
 	case NetModeNAT, NetModeWireGuard, NetModeNone:
 	default:
 		return fmt.Errorf("%w: unsupported network mode %q", ErrInvalidConfig, c.NetworkMode)
+	}
+	for _, pf := range c.PortForwards {
+		if pf.HostSocket != "" && pf.Protocol != "" && pf.Protocol != "tcp" {
+			return fmt.Errorf("%w: the Unix socket %s forwards tcp only, not %s", ErrInvalidConfig, pf.HostSocket, pf.Protocol)
+		}
 	}
 	if len(c.PortForwards) > 0 && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: port forwards need network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)

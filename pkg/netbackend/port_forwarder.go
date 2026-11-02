@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,172 @@ type PortForwardRule struct {
 	HostPort  uint16
 	GuestIP   string
 	GuestPort uint16
+
+	// HostSocket is the path of a host Unix socket that forwards each
+	// connection to GuestPort over TCP. When it is set, HostIP and HostPort
+	// are unused and Proto must be "tcp".
+	HostSocket string
+}
+
+// unixSocketPrefix starts a publish specification for a host Unix socket.
+const unixSocketPrefix = "unix:"
+
+// maxPortRange is the largest number of ports in one range specification.
+// Each port takes one host socket.
+const maxPortRange = 1024
+
+// ParsePortForwardSpecs parses a publish specification that can name more
+// than one forward. It accepts every form of ParsePortForwardSpec, a port
+// range on the host side and the guest side ("8000-8009:8000-8009",
+// "127.0.0.1:8000-8009:9000-9009", or a guest range alone, "8000-8009"), and
+// a host Unix socket ("unix:/path/docker.sock:2375"). Two ranges must have the
+// same length.
+func ParsePortForwardSpecs(spec string, allowSinglePort, strictBindIP bool) ([]PortForwardRule, error) {
+	spec = strings.TrimSpace(spec)
+	if strings.HasPrefix(spec, unixSocketPrefix) {
+		rule, err := parseUnixSocketSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		return []PortForwardRule{rule}, nil
+	}
+	if !strings.Contains(spec, "-") {
+		rule, err := ParsePortForwardSpec(spec, allowSinglePort, strictBindIP)
+		if err != nil {
+			return nil, err
+		}
+		return []PortForwardRule{rule}, nil
+	}
+
+	body, proto := spec, ""
+	if i := strings.LastIndexByte(body, '/'); i != -1 {
+		body, proto = body[:i], body[i:]
+	}
+	prefix, rest := "", body
+	if strings.HasPrefix(rest, "[") {
+		end := strings.Index(rest, "]:")
+		if end < 0 {
+			return nil, fmt.Errorf("netbackend: invalid port forward %q: an IPv6 address needs brackets and a port", spec)
+		}
+		prefix, rest = rest[:end+1], rest[end+2:]
+	}
+	parts := strings.Split(rest, ":")
+	if prefix == "" && len(parts) == 3 {
+		prefix, parts = parts[0], parts[1:]
+	}
+	var hostField, guestField string
+	switch len(parts) {
+	case 1:
+		guestField = parts[0]
+	case 2:
+		hostField, guestField = parts[0], parts[1]
+	default:
+		return nil, fmt.Errorf("netbackend: invalid port forward format %q", spec)
+	}
+	guestLo, guestHi, err := parsePortRange(guestField)
+	if err != nil {
+		return nil, fmt.Errorf("netbackend: invalid guest port range %q in %q: %w", guestField, spec, err)
+	}
+	count := int(guestHi-guestLo) + 1
+	hostLo := uint16(0)
+	if hostField != "" {
+		lo, hi, err := parsePortRange(hostField)
+		if err != nil {
+			return nil, fmt.Errorf("netbackend: invalid host port range %q in %q: %w", hostField, spec, err)
+		}
+		if int(hi-lo)+1 != count {
+			return nil, fmt.Errorf("netbackend: invalid port forward %q: the host range and the guest range must have the same length", spec)
+		}
+		hostLo = lo
+	}
+	if count > maxPortRange {
+		return nil, fmt.Errorf("netbackend: invalid port forward %q: a range has at most %d ports", spec, maxPortRange)
+	}
+
+	rules := make([]PortForwardRule, 0, count)
+	for i := range count {
+		guest := strconv.Itoa(int(guestLo) + i)
+		var one string
+		switch {
+		case len(parts) == 1 && prefix == "":
+			one = guest
+		case hostField == "":
+			one = prefix + "::" + guest
+		case prefix == "":
+			one = strconv.Itoa(int(hostLo)+i) + ":" + guest
+		default:
+			one = prefix + ":" + strconv.Itoa(int(hostLo)+i) + ":" + guest
+		}
+		rule, err := ParsePortForwardSpec(one+proto, allowSinglePort, strictBindIP)
+		if err != nil {
+			return nil, fmt.Errorf("netbackend: invalid port forward %q: %w", spec, err)
+		}
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+// parsePortRange parses "N" or "N-M" with 1 <= N <= M.
+func parsePortRange(s string) (lo, hi uint16, err error) {
+	s = strings.TrimSpace(s)
+	loText, hiText, isRange := strings.Cut(s, "-")
+	if !isRange {
+		hiText = loText
+	}
+	l, err := strconv.ParseUint(strings.TrimSpace(loText), 10, 16)
+	if err != nil || l == 0 {
+		return 0, 0, errors.New("want a port from 1 to 65535")
+	}
+	h, err := strconv.ParseUint(strings.TrimSpace(hiText), 10, 16)
+	if err != nil || h < l {
+		return 0, 0, errors.New("want an ascending range of ports from 1 to 65535")
+	}
+	return uint16(l), uint16(h), nil
+}
+
+// parseUnixSocketSpec parses "unix:PATH:GUESTPORT[/tcp]". The last colon
+// ends the path, so a Windows path with a drive letter works.
+func parseUnixSocketSpec(spec string) (PortForwardRule, error) {
+	body := strings.TrimPrefix(spec, unixSocketPrefix)
+	if i := strings.LastIndexByte(body, '/'); i != -1 && !strings.ContainsAny(body[i:], `:\`) {
+		if proto := strings.ToLower(body[i+1:]); proto != "tcp" {
+			return PortForwardRule{}, fmt.Errorf("netbackend: invalid port forward %q: a Unix socket forwards tcp only", spec)
+		}
+		body = body[:i]
+	}
+	i := strings.LastIndexByte(body, ':')
+	if i <= 0 {
+		return PortForwardRule{}, fmt.Errorf("netbackend: invalid port forward %q (want unix:PATH:GUESTPORT)", spec)
+	}
+	path, portText := body[:i], body[i+1:]
+	port, err := strconv.ParseUint(strings.TrimSpace(portText), 10, 16)
+	if err != nil || port == 0 {
+		return PortForwardRule{}, fmt.Errorf("netbackend: invalid guest port %q in %q", portText, spec)
+	}
+	return PortForwardRule{Proto: "tcp", GuestIP: DefaultGuestIPv4, GuestPort: uint16(port), HostSocket: path}, nil
+}
+
+// listenUnixSocket binds a Unix socket at path for a forward. It removes a
+// socket file that an earlier run left behind: that run could not remove it,
+// because the host lockdown denies file removal. It refuses any other file.
+func listenUnixSocket(path string) (net.Listener, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("netbackend: %s exists and is not a socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("netbackend: remove the old socket %s: %w", path, err)
+		}
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("netbackend: bind unix %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("netbackend: restrict the socket %s to its owner: %w", path, err)
+	}
+	return ln, nil
 }
 
 // ParsePortForwardRule parses a CLI port-forward specification such as
@@ -216,6 +383,21 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 			guestIP = DefaultGuestIPv4
 		}
 		bindAddr := net.JoinHostPort(hostIP, strconv.Itoa(int(r.HostPort)))
+
+		if r.HostSocket != "" {
+			if proto != "tcp" {
+				return fmt.Errorf("netbackend: the Unix socket %s forwards tcp only, not %s", r.HostSocket, proto)
+			}
+			ln, err := listenUnixSocket(r.HostSocket)
+			if err != nil {
+				return err
+			}
+			pf.tcpList = append(pf.tcpList, &boundTCPForward{
+				rule:     PortForwardRule{Proto: "tcp", GuestIP: guestIP, GuestPort: r.GuestPort, HostSocket: r.HostSocket},
+				listener: ln,
+			})
+			continue
+		}
 
 		switch proto {
 		case "tcp":
