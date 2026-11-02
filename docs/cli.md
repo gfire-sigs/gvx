@@ -112,6 +112,8 @@ A `--mount type=volume` source that contains a path separator names the image fi
 
 A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
 
+A guest overlay mount, as in `mount -t overlay -o lowerdir=...,upperdir=...,workdir=...`, accepts an upper directory on tmpfs, on an `ext4lite` volume, or on a `hostfs` directory. `docker:dind` needs this for the overlay storage driver, with `-v NAME:/var/lib/docker` or `-v /host/dir:/var/lib/docker`. The `ext4lite` volume is the faster persistent choice. The `hostfs` directory keeps each file as a host file, but it is slower, because it calls the host for each file operation. A measured `docker pull nginx:alpine` in `docker:dind` on macOS took about 5s on tmpfs, 9s on `ext4lite`, and 32s to 54s on `hostfs`. Another upper file system gets `EINVAL`.
+
 A source with no path separator that is not an absolute path names a volume. A Windows drive letter stays in the source, as in `C:\data:/data:ro`.
 
 A bind source can be one regular file, as in `-v /host/app.conf:/etc/app.conf:ro`. A socket, a device, or a pipe is not valid. The guest sees only that file. The parent directory and the sibling files of the host file are not exposed, and the guest cannot reach them by a path. The sandbox creates the guest path as an empty regular file with the mode 0644, and it creates the missing parent directories. The option `:ro` makes the file read-only. The option `-workspace` takes a directory only.

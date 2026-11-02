@@ -2,6 +2,18 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Features
+
+- **Guest overlay upper layer on `ext4lite` and `hostfs`**: a guest `mount -t overlay` with `upperdir` on a named volume, a volume image, or a bind mount no longer fails with `EINVAL`. The overlay storage driver of `dockerd` therefore works with `-v NAME:/var/lib/docker` and with `-v /host/dir:/var/lib/docker`, with the containerd snapshotter and with `overlay2`. Whiteouts, opaque directories, and copy-up data survive a restart and a SIGKILL. `ext4lite` is the faster choice. `hostfs` is slower. See `docs/cli.md`, section 4.4.
+
+### Bug Fixes
+
+- **`hostfs` and `ext4lite` as overlay layers**: both drivers returned `EOPNOTSUPP` for the POSIX ACL query of the overlay, so a mount with one of them as a layer failed. They now report no ACL.
+- **Failed overlay mount**: an error after the root dentry of the overlay existed made the Sentry panic. The mount now fails with the error.
+- **Program starts from a `hostfs` layer of an overlay**: the second start of an executable on a `hostfs` lower or upper layer ended with SIGBUS or `Bad address`, for example `nginx` in a container on a `hostfs` Docker root. `hostfs` now opens a handle when a new mapping finds none.
+
 ## [v0.4.1] - 2026-11-02
 
 This release makes `docker exec` work in a guest.
