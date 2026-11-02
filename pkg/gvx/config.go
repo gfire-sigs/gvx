@@ -145,11 +145,13 @@ type Config struct {
 	// NetRaw lets the guest open raw IP sockets and use iptables, as the runsc
 	// flag --net-raw does. dockerd and its bridge network need it. A raw
 	// socket can send packets with any source address on the guest network,
-	// so the default is off.
+	// so the SDK default is off. The rungv CLI turns it on through its
+	// --privileged flag, which is on by default.
 	NetRaw bool
 
 	// AllowPacketSocketWrite lets the guest send packets on AF_PACKET sockets.
-	// It needs NetRaw. The default allows only reads, as in runsc.
+	// It needs NetRaw. The SDK default allows only reads, as in runsc. The
+	// rungv CLI turns it on through --privileged.
 	AllowPacketSocketWrite bool
 
 	// PortForwards lists inbound host-to-guest port forwardings (-p host:guest).
@@ -241,7 +243,8 @@ type Config struct {
 
 	// AllowSUID makes the guest obey the set-user-ID and set-group-ID bits of
 	// executables, as the runsc flag --allow-suid does. sudo, su, and passwd
-	// need it when the guest user is not root. The default ignores the bits.
+	// need it when the guest user is not root. The SDK default ignores the
+	// bits. The rungv CLI turns it on through --privileged.
 	AllowSUID bool
 
 	// Name is an optional container name that follows the Docker rule
