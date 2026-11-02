@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Docker schema 1 images**: `rungv pull` and `rungv run` now report `image uses Docker manifest schema 1, which is not supported; rebuild or re-push it with a current Docker`. Before, a signed schema 1 manifest such as `sshipway/xclock` failed with `content digest mismatch`, because the registry reports the digest of the unsigned payload. `oci.ErrSchema1Unsupported` names the error.
+
 ## [v0.3.0] - 2026-11-02
 
 This release makes the CPU features that a guest sees agree with the features that it can use.

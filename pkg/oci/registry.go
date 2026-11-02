@@ -59,6 +59,10 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("oci: request %s returned HTTP %d", e.URL, e.StatusCode)
 }
 
+// ErrAuthRequired reports that a registry demands credentials that the
+// Docker config does not hold.
+var ErrAuthRequired = errors.New("oci: registry requires authentication")
+
 // registryClient talks to one repository of one registry.
 type registryClient struct {
 	http    *http.Client
@@ -420,7 +424,7 @@ func (rc *registryClient) authorize(ctx context.Context, header string) error {
 	switch ch.scheme {
 	case "basic":
 		if !haveCred || (cred.Username == "" && cred.Password == "") {
-			return fmt.Errorf("oci: basic authentication required by %s but no credentials found in docker config", rc.baseURL.Host)
+			return fmt.Errorf("%w: %s needs basic authentication and the docker config has no credentials for it", ErrAuthRequired, rc.baseURL.Host)
 		}
 		rc.authz = "Basic " + base64.StdEncoding.EncodeToString([]byte(cred.Username+":"+cred.Password))
 		return nil
