@@ -326,6 +326,7 @@ func (fd *regularFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) e
 		return err
 	}
 	writable := fd.vfsfd.IsWritable() && fd.vfsfd.IsReadable()
+	fd.dentry.inode.data.setSource(fd.dentry)
 	if err := fd.dentry.inode.data.attachHandle(fd.h, writable); err != nil {
 		return translateHostError(err)
 	}
@@ -403,6 +404,11 @@ type fileData struct {
 	mhWritable      bool
 	pending         *hostHandle
 	pendingWritable bool
+
+	// src is the dentry of the last ConfigureMMap call. AddMapping opens a
+	// handle through it when no handle exists. Protected by DataMu. See
+	// mapping_reopen.go.
+	src *dentry
 }
 
 func (c *fileData) init(ino *inode) {

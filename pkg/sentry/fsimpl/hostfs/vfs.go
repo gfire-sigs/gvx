@@ -1756,8 +1756,15 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 }
 
 // GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
+//
+// hostfs does not enforce POSIX ACLs, so every file has none. WHY: The overlay
+// filesystem reads the ACLs of each layer on every lookup and on mount. An
+// error would make hostfs unusable as an overlay layer.
 func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType) (*vfs.PosixACL, error) {
-	return nil, linuxerr.EOPNOTSUPP
+	fs.lock()
+	_, err := fs.resolveLocked(ctx, rp)
+	fs.unlock(ctx)
+	return nil, err
 }
 
 // SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.

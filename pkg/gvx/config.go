@@ -70,24 +70,49 @@ type PortForward struct {
 	GuestPort   uint16
 	Protocol    string
 	BindAddress string
+
+	// HostSocket is the path of a host Unix socket that forwards each
+	// connection to GuestPort over TCP. When it is set, HostPort and
+	// BindAddress are unused. New removes a socket file that an earlier run
+	// left at the path.
+	HostSocket string
 }
 
-// ParsePortForward parses a Docker publish specification: "guest",
+// ParsePortForward parses a publish specification that names one forward.
+// ParsePortForwards describes the forms.
+func ParsePortForward(spec string) (PortForward, error) {
+	forwards, err := ParsePortForwards(spec)
+	if err != nil {
+		return PortForward{}, err
+	}
+	if len(forwards) != 1 {
+		return PortForward{}, fmt.Errorf("gvx: publish specification %q names %d ports, want one", spec, len(forwards))
+	}
+	return forwards[0], nil
+}
+
+// ParsePortForwards parses a Docker publish specification: "guest",
 // "host:guest", "ip:host:guest", or "ip::guest", with an optional "/tcp" or
 // "/udp" suffix. A host port of zero, and a specification with only a guest
 // port, ask for a free host port. The default bind address is 127.0.0.1. An
-// IPv6 address is written in brackets. A port range is not supported.
-func ParsePortForward(spec string) (PortForward, error) {
-	rule, err := netbackend.ParsePortForwardSpec(spec, true, true)
+// IPv6 address is written in brackets. A port range, such as
+// "8000-8009:8000-8009" or "8000-8009", names one forward for each port; two
+// ranges must have the same length. "unix:PATH:GUEST" forwards a host Unix
+// socket to a guest TCP port.
+func ParsePortForwards(spec string) ([]PortForward, error) {
+	rules, err := netbackend.ParsePortForwardSpecs(spec, true, true)
 	if err != nil {
-		return PortForward{}, fmt.Errorf("gvx: %w", err)
+		return nil, fmt.Errorf("gvx: %w", err)
 	}
-	return PortForward{
-		HostPort:    rule.HostPort,
-		GuestPort:   rule.GuestPort,
-		Protocol:    rule.Proto,
-		BindAddress: rule.HostIP,
-	}, nil
+	out := make([]PortForward, 0, len(rules))
+	for _, rule := range rules {
+		pf := PortForward{GuestPort: rule.GuestPort, Protocol: rule.Proto, HostSocket: rule.HostSocket}
+		if rule.HostSocket == "" {
+			pf.HostPort, pf.BindAddress = rule.HostPort, rule.HostIP
+		}
+		out = append(out, pf)
+	}
+	return out, nil
 }
 
 // Resources limits what the guest may use. A zero field means no limit.
@@ -120,11 +145,13 @@ type Config struct {
 	// NetRaw lets the guest open raw IP sockets and use iptables, as the runsc
 	// flag --net-raw does. dockerd and its bridge network need it. A raw
 	// socket can send packets with any source address on the guest network,
-	// so the default is off.
+	// so the SDK default is off. The rungv CLI turns it on through its
+	// --privileged flag, which is on by default.
 	NetRaw bool
 
 	// AllowPacketSocketWrite lets the guest send packets on AF_PACKET sockets.
-	// It needs NetRaw. The default allows only reads, as in runsc.
+	// It needs NetRaw. The SDK default allows only reads, as in runsc. The
+	// rungv CLI turns it on through --privileged.
 	AllowPacketSocketWrite bool
 
 	// PortForwards lists inbound host-to-guest port forwardings (-p host:guest).
@@ -216,7 +243,8 @@ type Config struct {
 
 	// AllowSUID makes the guest obey the set-user-ID and set-group-ID bits of
 	// executables, as the runsc flag --allow-suid does. sudo, su, and passwd
-	// need it when the guest user is not root. The default ignores the bits.
+	// need it when the guest user is not root. The SDK default ignores the
+	// bits. The rungv CLI turns it on through --privileged.
 	AllowSUID bool
 
 	// Name is an optional container name that follows the Docker rule
@@ -309,6 +337,11 @@ func (c *Config) normalize() error {
 	case NetModeNAT, NetModeWireGuard, NetModeNone:
 	default:
 		return fmt.Errorf("%w: unsupported network mode %q", ErrInvalidConfig, c.NetworkMode)
+	}
+	for _, pf := range c.PortForwards {
+		if pf.HostSocket != "" && pf.Protocol != "" && pf.Protocol != "tcp" {
+			return fmt.Errorf("%w: the Unix socket %s forwards tcp only, not %s", ErrInvalidConfig, pf.HostSocket, pf.Protocol)
+		}
 	}
 	if len(c.PortForwards) > 0 && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: port forwards need network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)

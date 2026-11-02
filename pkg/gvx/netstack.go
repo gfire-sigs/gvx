@@ -18,7 +18,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
@@ -70,12 +72,31 @@ func (s *Sandbox) initNetstack() error {
 				if hostIP == "" {
 					hostIP = "127.0.0.1"
 				}
+				socket := pfSpec.HostSocket
+				if socket != "" {
+					// A shell does not expand ~ after "unix:", so the sandbox does.
+					if rest, ok := strings.CutPrefix(socket, "~/"); ok {
+						home, err := os.UserHomeDir()
+						if err != nil {
+							_ = pf.Close()
+							return fmt.Errorf("gvx: resolve ~ in the published socket %q: %w", socket, err)
+						}
+						socket = filepath.Join(home, rest)
+					}
+					abs, err := filepath.Abs(socket)
+					if err != nil {
+						_ = pf.Close()
+						return fmt.Errorf("gvx: resolve the published socket %q: %w", socket, err)
+					}
+					socket = abs
+				}
 				rules = append(rules, netbackend.PortForwardRule{
-					Proto:     pfSpec.Protocol,
-					HostIP:    hostIP,
-					HostPort:  pfSpec.HostPort,
-					GuestIP:   netbackend.DefaultGuestIPv4,
-					GuestPort: pfSpec.GuestPort,
+					Proto:      pfSpec.Protocol,
+					HostIP:     hostIP,
+					HostPort:   pfSpec.HostPort,
+					GuestIP:    netbackend.DefaultGuestIPv4,
+					GuestPort:  pfSpec.GuestPort,
+					HostSocket: socket,
 				})
 			}
 			if err := pf.PreBind(rules); err != nil {

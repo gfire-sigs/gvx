@@ -24,6 +24,12 @@
 //	parityprobe euid       copy the probe as a set-user-ID file, run the copy
 //	                       as user 1000, and print the user IDs of the copy
 //	parityprobe ids        print the real and effective user IDs
+//	parityprobe overlay-upper DIR   mount an overlay with its upper layer in DIR,
+//	                       write whiteouts and opaque directories, and verify
+//	                       the view after a new mount
+//	parityprobe overlay-write DIR [hold]   write that state; with hold, sync it,
+//	                       print SYNCED, and sleep
+//	parityprobe overlay-verify DIR   verify the state that overlay-write left
 //	parityprobe sleep      sleep for one minute
 //	parityprobe poweroff   call reboot(2) with LINUX_REBOOT_CMD_POWER_OFF
 //	parityprobe restart    call reboot(2) with LINUX_REBOOT_CMD_RESTART
@@ -64,6 +70,15 @@ func main() {
 	case "euid":
 		if err := runSetUID(); err != nil {
 			fmt.Println("FAIL euid:", err)
+			os.Exit(1)
+		}
+	case "overlay-upper", "overlay-write", "overlay-verify":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: parityprobe", os.Args[1], "DIR [hold]")
+			os.Exit(2)
+		}
+		hold := len(os.Args) > 3 && os.Args[3] == "hold"
+		if !runOverlayUpper(os.Args[1], os.Args[2], hold) {
 			os.Exit(1)
 		}
 	case "ids":

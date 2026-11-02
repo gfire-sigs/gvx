@@ -570,6 +570,8 @@ A reopened workspace shows each node with the same type and no in-memory state. 
 
 On Linux, the `user.*` attributes of regular files and directories live on the host file. `hostfs` reaches them with `fgetxattr`, `fsetxattr`, `flistxattr`, and `fremovexattr` on a pinned descriptor. Every other attribute lives in `.gvx_meta`. That covers all `trusted.*` and `security.*` attributes, every attribute on macOS and Windows, and each attribute that the host refuses with `EPERM` or `EOPNOTSUPP`. A Linux host never receives `security.capability`, because its kernel would honor the attribute on the real file.
 
+A `hostfs` or `ext4lite` directory can serve as the upper layer of a guest overlay mount, and as a lower layer. The overlay reads the POSIX ACLs of each layer on mount and on every lookup, so both drivers report no ACL instead of an error. A whiteout is a device node 0:0, and the opaque flag is the `trusted.overlay.opaque` attribute. `ext4lite` stores both in its image. `hostfs` stores both in `.gvx_meta`, so a whiteout on a host directory is an empty host file. The overlay keeps the `Mappable` of a layer file after the first `mmap`, and it calls `AddMapping` for later maps without `ConfigureMMap`. The `hostfs` file data therefore opens a new handle in `AddMapping` when the last unmap dropped the old one.
+
 The meta store holds at most 4 KiB of names and values for one inode, and it fails with `ENOSPC` above that size. A single value above 64 KiB fails with `E2BIG`. The names of a hard-linked file share one set of attributes. The `.gvx_meta` table holds at most 262,144 records. A mutation that needs a new record above that limit fails with `ENOSPC`.
 
 ### 3.8 Volume File System: `pkg/sentry/fsimpl/ext4lite`

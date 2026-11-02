@@ -180,6 +180,7 @@ type guestSpec struct {
 	mounts        []gvx.Mount
 	readOnlyRoot  bool
 	publishAll    bool
+	netRaw        bool
 }
 
 func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
@@ -205,6 +206,7 @@ func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
 		Mounts:              g.mounts,
 		ReadOnlyRoot:        g.readOnlyRoot,
 		PublishAll:          g.publishAll,
+		NetRaw:              g.netRaw,
 		Stdin:               g.stdin,
 		Stdout:              stdout,
 		Stderr:              stderr,

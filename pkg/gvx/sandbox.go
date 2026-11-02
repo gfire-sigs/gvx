@@ -300,6 +300,10 @@ type PublishedPort struct {
 	Protocol  string // "tcp" or "udp"
 	HostAddr  string // the bind address, such as "127.0.0.1"
 	HostPort  uint16 // the port that the host socket really uses
+
+	// HostSocket is the path of the host Unix socket of the forward. When it
+	// is set, HostAddr and HostPort are unused.
+	HostSocket string
 }
 
 // PublishedPorts lists the bound port forwards, in rule order: the forwards of
@@ -313,7 +317,7 @@ func (s *Sandbox) PublishedPorts() []PublishedPort {
 	rules := s.portForwarder.BoundRules()
 	out := make([]PublishedPort, 0, len(rules))
 	for _, r := range rules {
-		out = append(out, PublishedPort{GuestPort: r.GuestPort, Protocol: r.Proto, HostAddr: r.HostIP, HostPort: r.HostPort})
+		out = append(out, PublishedPort{GuestPort: r.GuestPort, Protocol: r.Proto, HostAddr: r.HostIP, HostPort: r.HostPort, HostSocket: r.HostSocket})
 	}
 	return out
 }

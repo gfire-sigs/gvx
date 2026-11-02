@@ -50,7 +50,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `--rm` | Accepted. Every run removes its container. |
 | `-i` | Accepted. The guest always reads the standard input of `rungv`. |
 | `-t` | Allocate a pseudo-terminal. |
-| `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. |
+| `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. A range such as `8000-8009:8000-8009` publishes each port. `unix:PATH:GUEST` publishes a guest TCP port on a host Unix socket. Section 4.7 gives the rules. |
 | `-P` | Publish every port that the image declares with `EXPOSE` to a free port of `127.0.0.1`. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, one host file, or a named volume. |
 | `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. A `type=volume` source with a path separator names an image file. |
@@ -73,9 +73,10 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
-| `--net-raw` | Let the guest open raw sockets and use `iptables`, as the runsc flag of the same name does. `dockerd` needs it. Section 4.8 describes the risk. |
-| `--allow-packet-socket-write` | Let the guest send on `AF_PACKET` sockets. It needs `--net-raw`. |
-| `--allow-suid` | Obey the set-user-ID and set-group-ID bits of guest executables, as the runsc flag of the same name does. `sudo`, `su`, and `passwd` need it for a user that is not root. |
+| `--privileged` | On by default. Turns on `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` turns them off. A flag of the three that you set wins over `--privileged`. Section 4.8 describes the boundary. |
+| `--net-raw` | Let the guest open raw sockets and use `iptables`. `dockerd` needs it. The default comes from `--privileged`. |
+| `--allow-packet-socket-write` | Let the guest send on `AF_PACKET` sockets. It needs `--net-raw`. The default comes from `--privileged`, and it is off when `--net-raw` is off. |
+| `--allow-suid` | Obey the set-user-ID and set-group-ID bits of guest executables. `sudo`, `su`, and `passwd` need it for a user that is not root. The default comes from `--privileged`. |
 | `-registry-url URL` | Override the registry of the image reference. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
@@ -111,6 +112,8 @@ The guest sees only the files that it wrote. The host sees one file. The image h
 A `--mount type=volume` source that contains a path separator names the image file of an `ext4lite` volume at any host path, as in `--mount type=volume,src=/disk/vols/pg.ext4,dst=/var/lib/postgresql`. A relative source starts with `./`, because a source without a separator is a volume name. The sandbox creates a missing image file before the lockdown, but not its directory. A read-only mount never creates the file. The path must not name a directory or a device. Such a volume has the same lock, journal, and growth rules as a named volume. `-v` keeps its meaning: `-v /disk/vols/pg.ext4:/data` mounts that file as one regular file.
 
 A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
+
+A guest overlay mount, as in `mount -t overlay -o lowerdir=...,upperdir=...,workdir=...`, accepts an upper directory on tmpfs, on an `ext4lite` volume, or on a `hostfs` directory. `docker:dind` needs this for the overlay storage driver, with `-v NAME:/var/lib/docker` or `-v /host/dir:/var/lib/docker`. The `ext4lite` volume is the faster persistent choice. The `hostfs` directory keeps each file as a host file, but it is slower, because it calls the host for each file operation. A measured `docker pull nginx:alpine` in `docker:dind` on macOS took about 5s on tmpfs, 9s on `ext4lite`, and 32s to 54s on `hostfs`. Another upper file system gets `EINVAL`.
 
 A source with no path separator that is not an absolute path names a volume. A Windows drive letter stays in the source, as in `C:\data:/data:ro`.
 
@@ -151,11 +154,19 @@ The root file system is a mount on top of a hidden read-only root, as in runsc. 
 
 ### 4.7 Published ports
 
-`rungv` binds each published port before the lockdown. It prints one line for each port to the standard error before the guest starts, as in `rungv: publishing 127.0.0.1:49493 -> 8080/tcp`. The line shows the free port that the host chose. A published port needs the NAT network mode.
+`rungv` binds each published port before the lockdown. It prints one line for each port to the standard error before the guest starts, as in `rungv: publishing 127.0.0.1:49493 -> 8080/tcp`. The line shows the free port that the host chose. A published port needs the NAT network mode. The guest cannot add a published port after the start, so publish every port that a program in the guest will use, such as the ports of nested containers.
+
+A range publishes one port for each number. The host range and the guest range must have the same length, as in `-p 8000-8009:8000-8009`. A guest range alone, as in `-p 8000-8009`, gets free host ports. One range has at most 1024 ports. A host port range and a single guest port are refused.
+
+`-p unix:PATH:GUEST` binds a Unix socket at `PATH` on the host and forwards each connection to the TCP port `GUEST` of the guest. A leading `~/` names the home directory, because a shell does not expand `~` after `unix:`. Only the owner can open the socket. The lockdown stops `rungv` from removing the socket file at the end. The next run replaces a socket file that it finds at `PATH`, and it refuses any other file. A path cannot contain a comma, because `-p` splits its value at commas.
 
 ### 4.8 Raw sockets
 
-A raw socket can send packets with any source address on the guest network, so `--net-raw` is off by default. The NAT mode still applies its destination rules, including `-isolate-lan`, to each packet that leaves `eth0`. The host network does not see the packets of a raw socket. The `iptables` tables work through the legacy interface (`iptables-legacy`). The `nftables` interface is not available.
+`--privileged` is on by default, because its privileges stay inside the sandbox. A raw socket can send packets with any source address on the guest network, but the packets reach only the guest stack. The NAT mode still applies its destination rules, including `-isolate-lan`, to each packet that leaves `eth0`. The host network does not see the packets of a raw socket. The `iptables` tables work through the legacy interface (`iptables-legacy`). The `nftables` interface is not available.
+
+The legacy interface has the tables `filter`, `nat`, `mangle`, and `raw`. It has these matches: `addrtype`, `comment`, `conntrack` (`--ctstate` only), `mark`, `multiport`, `owner`, `tcp`, and `udp`. The `addrtype` match knows the types `UNICAST`, `LOCAL`, `BROADCAST`, `MULTICAST`, and `UNSPEC`. It accepts `--limit-iface-in` and `--limit-iface-out`. The match `--dst-type LOCAL` is true for each address of a guest link and for the whole `127.0.0.0/8` range. The commands `iptables -C` and `iptables -D` find rules with `! -i`, `! -o`, and `-j DNAT`.
+
+An unmodified `docker:dind` image starts with the default `--iptables=true`. [`docker-engine.md`](docker-engine.md) shows how to use it as the Docker Engine of the host. The `bridge` network masquerades the traffic of its containers. A published port (`docker run -p`) uses a `DNAT` rule and the `docker-proxy` process. A user-defined network resolves container names. `docker build` and `docker compose up` work. The option `--userland-proxy=false` does not work, because the guest has no `/proc/sys/net/ipv4/conf/<link>/route_localnet`. The command `iptables-legacy-save` prints nothing, because the guest has no `/proc/net/ip_tables_names`. Use `iptables-legacy -S`.
 
 ### 4.9 Failures and diagnostics
 
@@ -211,12 +222,12 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `docker build`, `compose`, `network`, `volume` | Not available. Remove a named volume by deleting its image file, `<name>.ext4`. |
 | Image `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, labels | Ignored. |
 | `--network host` | Refused. The guest has its own network stack. |
-| A port range in `-p` | Refused. |
+| `-p HOST-RANGE:PORT` | Refused. Publish ranges of the same length. |
+| `--privileged` | On by default. Its privileges stay inside the sandbox. |
 | `--name` | Sets the container ID of the kernel and nothing else. |
 | Image with a Docker manifest schema 1 | Refused with a message. Docker 28 and later also refuse it. Rebuild or re-push the image. |
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
-| `CAP_NET_RAW` and set-user-ID programs | Off by default. Use `--net-raw` and `--allow-suid`. |
 | Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |

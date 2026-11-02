@@ -88,6 +88,9 @@ func getEntries4(table stack.Table, tablename linux.TableName) (linux.KernelIPTG
 		if rule.Filter.SrcInvert {
 			entry.Entry.IP.InverseFlags |= linux.IPT_INV_SRCIP
 		}
+		if rule.Filter.InputInterfaceInvert {
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_VIA_IN
+		}
 		if rule.Filter.OutputInterfaceInvert {
 			entry.Entry.IP.InverseFlags |= linux.IPT_INV_VIA_OUT
 		}
