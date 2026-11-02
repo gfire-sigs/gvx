@@ -157,7 +157,7 @@ type Config struct {
 	RegistryBaseURL string
 
 	// PullPolicy selects when OCIImage comes from its registry: PullAlways,
-	// PullMissing, or PullNever. Empty means PullAlways. An archive path in
+	// PullMissing, or PullNever. Empty means PullMissing. An archive path in
 	// OCIImage ignores it.
 	PullPolicy PullPolicy
 

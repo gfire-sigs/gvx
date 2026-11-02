@@ -167,7 +167,7 @@ func TestRunFlagsPullPolicy(t *testing.T) {
 		args []string
 		want gvx.PullPolicy
 	}{
-		{"default", []string{"-image=x"}, gvx.PullAlways},
+		{"default", []string{"-image=x"}, gvx.PullMissing},
 		{"always", []string{"--pull=always", "-image=x"}, gvx.PullAlways},
 		{"missing", []string{"--pull", "missing", "-image=x"}, gvx.PullMissing},
 		{"never with one dash", []string{"-pull=never", "-image=x"}, gvx.PullNever},

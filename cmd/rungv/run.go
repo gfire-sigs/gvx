@@ -165,7 +165,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	})
 	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL")
-	pullFlag := fs.String("pull", string(gvx.PullAlways), "Pull the image: always (ask the registry first), missing (use the cache first), or never (cache only)")
+	pullFlag := fs.String("pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
 	lockdownFlag := fs.Bool("lockdown", true, "Lock down the host process before guest entry (RestrictedToken and JobObject, or Seatbelt); use -lockdown=false to opt out")
 	ttyFlag := fs.Bool("t", false, "Allocate a pseudo-TTY for guest stdio")
 	fs.Bool("i", false, "Keep STDIN open (the guest always reads the standard input of rungv)")

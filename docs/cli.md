@@ -60,7 +60,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `--cpus N` | Limit the CPU quota. The value is a decimal number, such as `1.5`. |
 | `--network NAME` | `bridge` and `nat` select the NAT mode. `none` and `wg` are the other modes. `host` is refused. |
 | `--platform linux/ARCH` | Select the architecture of the image: `linux/amd64` or `linux/arm64`. |
-| `--pull POLICY` | Select when the image comes from its registry: `always` (the default), `missing`, or `never`. Section 5.1 describes the policies. |
+| `--pull POLICY` | Select when the image comes from its registry: `missing` (the default, as in Docker), `always`, or `never`. Section 5.1 describes the policies. |
 
 The flag `-d` is refused with a message, because a run has no daemon.
 
@@ -181,13 +181,13 @@ A credential helper is the program `docker-credential-NAME`. It has 30 seconds a
 
 | Policy | Order |
 | :--- | :--- |
-| `always` | Ask the registry first, so a tag that moved gives the new image. This is the default. |
-| `missing` | Use the cached image. Ask the registry only when the cache has no record of the reference. |
+| `missing` | Use the cached image. Ask the registry only when the cache has no record of the reference. This is the default, as in Docker. A tag that moved in the registry keeps the cached image until `rungv pull` or `--pull=always`. |
+| `always` | Ask the registry first, so a tag that moved gives the new image. |
 | `never` | Use the cached image only. A reference that the cache does not hold stops the run with an error. |
 
 With `always`, the cached image replaces a failed request in two cases. The first case is a registry that is unreachable. The second case is a registry that answers HTTP 401, 403, or 404, or demands credentials that the Docker configuration does not hold. `rungv` then prints one warning line to the standard error. Any other failure stops the run, and so does a missing cached image.
 
-The second case lets `rungv load -i img.tar` followed by `rungv run mylocal/app:1` work. The name `mylocal/app:1` is unknown to Docker Hub. `rungv pull` always asks the registry and never uses the cache after a 401, 403, or 404.
+The second case lets `rungv load -i img.tar` followed by `rungv run --pull=always mylocal/app:1` work. The name `mylocal/app:1` is unknown to Docker Hub. With the default `missing`, the run uses the loaded image without a registry request. `rungv pull` always asks the registry and never uses the cache after a 401, 403, or 404.
 
 ## 6. The image store
 
@@ -211,7 +211,6 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `--network host` | Refused. The guest has its own network stack. |
 | A port range in `-p` | Refused. |
 | `--name` | Sets the container ID of the kernel and nothing else. |
-| `--pull` default `missing` | The default is `always`, with the cached image as the fallback described in section 5.1. |
 | Image with a Docker manifest schema 1 | Refused with a message. Docker 28 and later also refuse it. Rebuild or re-push the image. |
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |

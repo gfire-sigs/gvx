@@ -33,11 +33,11 @@ const (
 	// PullAlways asks the registry first, so a tag that moved gives the new
 	// image. It uses the cached image when the registry is unreachable. It
 	// also uses the cached image when the registry denies access to the
-	// reference or does not know it. This is the default.
+	// reference or does not know it.
 	PullAlways PullPolicy = "always"
 
 	// PullMissing uses the cached image and asks the registry only when the
-	// cache has no record of the reference.
+	// cache has no record of the reference. This is the default, as in Docker.
 	PullMissing PullPolicy = "missing"
 
 	// PullNever uses the cached image only. A missing image is an error.
@@ -45,11 +45,11 @@ const (
 )
 
 // ParsePullPolicy converts the text of a --pull flag into a PullPolicy. Case
-// and outer spaces do not matter. Empty text selects PullAlways.
+// and outer spaces do not matter. Empty text selects PullMissing.
 func ParsePullPolicy(text string) (PullPolicy, error) {
 	switch p := PullPolicy(strings.ToLower(strings.TrimSpace(text))); p {
 	case "":
-		return PullAlways, nil
+		return PullMissing, nil
 	case PullAlways, PullMissing, PullNever:
 		return p, nil
 	}

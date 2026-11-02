@@ -269,7 +269,7 @@ func TestResolveImageWithPolicyRejectsAnUnknownPolicy(t *testing.T) {
 
 func TestParsePullPolicy(t *testing.T) {
 	for in, want := range map[string]PullPolicy{
-		"": PullAlways, "always": PullAlways, " Missing ": PullMissing, "NEVER": PullNever,
+		"": PullMissing, "always": PullAlways, " Missing ": PullMissing, "NEVER": PullNever,
 	} {
 		got, err := ParsePullPolicy(in)
 		if err != nil || got != want {
@@ -287,7 +287,7 @@ func TestConfigNormalizeValidatesThePullPolicy(t *testing.T) {
 		t.Fatalf("normalize with an unknown pull policy = %v, want ErrInvalidConfig", err)
 	}
 	cfg = Config{}
-	if err := cfg.normalize(); err != nil || cfg.PullPolicy != PullAlways {
-		t.Fatalf("normalize of the zero config = %v with policy %q, want PullAlways", err, cfg.PullPolicy)
+	if err := cfg.normalize(); err != nil || cfg.PullPolicy != PullMissing {
+		t.Fatalf("normalize of the zero config = %v with policy %q, want PullMissing", err, cfg.PullPolicy)
 	}
 }
