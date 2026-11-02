@@ -683,6 +683,13 @@ const (
 	DefaultDCZIDEL0       uint64 = 0x00000004
 )
 
+// HVFMIDREL1 is the MIDR_EL1 value of every hvf guest. The hvf backend writes
+// it to each vCPU, and /proc/cpuinfo lists its fields, so the two always agree.
+// The value names the Apple implementer (0x61) and leaves the part number and
+// revision at 0, as Hypervisor.framework reports on an Apple M1. A guest must
+// not depend on the exact core of the host.
+const HVFMIDREL1 uint64 = 0x610f0000
+
 // IDRegisters holds the values that EL0 reads of the ID registers, CTR_EL0,
 // and the physical/virtual counters return.
 type IDRegisters struct {

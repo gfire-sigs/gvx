@@ -102,6 +102,9 @@ func (w *vcpuWorker) configure() error {
 		reg uint32
 		val uint64
 	}{
+		// Every guest reads the same MIDR_EL1, whatever core the host has.
+		// /proc/cpuinfo lists the fields of hvcommon.HVFMIDREL1.
+		{hvSysRegMIDR, hvcommon.HVFMIDREL1},
 		{hvSysRegMAIR, hvcommon.MAIRNormalWB},
 		{hvSysRegTCR, hvcommon.TCR(ips)},
 		{hvSysRegTTBR1, w.vm.kernel.ttbr1()},

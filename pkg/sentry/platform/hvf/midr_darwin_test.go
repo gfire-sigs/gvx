@@ -17,48 +17,36 @@
 package hvf
 
 import (
-	"runtime"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/cpuid"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
-// TestVCPUMIDRMatchesCPUInfo verifies that /proc/cpuinfo lists the MIDR_EL1
-// value that a guest reads. The cpuid package cannot create a vCPU, so it
-// holds the expected value as a constant.
-func TestVCPUMIDRMatchesCPUInfo(t *testing.T) {
-	requireHypervisor(t)
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := hvVMCreate(); err != nil {
-		t.Fatalf("hv_vm_create: %v", err)
+// TestGuestMIDRMatchesCPUInfo verifies that /proc/cpuinfo lists the MIDR_EL1
+// value that a guest reads. Both come from cpuid.HVFMIDR, so the guest value
+// does not depend on the Apple chip of the host.
+func TestGuestMIDRMatchesCPUInfo(t *testing.T) {
+	plat := newTestPlatform(t)
+	g := newGuest(t, plat, insnMrsMIDR, insnSVC0)
+	if sig, _, err := g.switchOnce(); sig != nil || err != nil {
+		t.Fatalf("MRS MIDR_EL1: Switch = (%v, %v), want a syscall", sig, err)
 	}
-	defer func() {
-		if err := hvVMDestroy(); err != nil {
-			t.Errorf("hv_vm_destroy: %v", err)
-		}
-	}()
-	id, _, err := hvVCPUCreate()
-	if err != nil {
-		t.Fatalf("hv_vcpu_create: %v", err)
-	}
-	defer func() {
-		if err := hvVCPUDestroy(id); err != nil {
-			t.Errorf("hv_vcpu_destroy: %v", err)
-		}
-	}()
-	midr, err := hvGetSysReg(id, hvSysRegMIDR)
-	if err != nil {
-		t.Fatalf("read MIDR_EL1: %v", err)
-	}
-	if midr != cpuid.HVFMIDR() {
-		t.Fatalf("vCPU MIDR_EL1 = %#x, cpuid.HVFMIDR() = %#x", midr, cpuid.HVFMIDR())
+	midr := g.regs().Regs[0]
+	if midr != hvcommon.HVFMIDREL1 {
+		t.Fatalf("guest MIDR_EL1 = %#x, want hvcommon.HVFMIDREL1 = %#x", midr, hvcommon.HVFMIDREL1)
 	}
 	fs := cpuid.HostFeatureSet()
 	if got, want := fs.CPUImplementer(), uint8(midr>>24); got != want {
 		t.Errorf("CPUImplementer() = %#x, want %#x", got, want)
 	}
+	if got, want := fs.CPUVariant(), uint8(midr>>20&0xf); got != want {
+		t.Errorf("CPUVariant() = %#x, want %#x", got, want)
+	}
 	if got, want := fs.CPUPartnum(), uint16(midr>>4&0xfff); got != want {
 		t.Errorf("CPUPartnum() = %#x, want %#x", got, want)
+	}
+	if got, want := fs.CPURevision(), uint8(midr&0xf); got != want {
+		t.Errorf("CPURevision() = %#x, want %#x", got, want)
 	}
 }

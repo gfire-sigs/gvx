@@ -16,14 +16,8 @@
 
 package cpuid
 
-// hvfMIDR is the MIDR_EL1 value that an hvf vCPU returns. Hypervisor.framework
-// hides the host core: the part number and revision read as 0, and the
-// implementer is Apple (0x61). The value matches an Apple M1 host. A test in
-// the hvf package compares it with the register of a real vCPU.
-const hvfMIDR = 0x610f0000
+import "z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 
-// HVFMIDR returns the MIDR_EL1 value that an hvf guest reads.
-func HVFMIDR() uint64 { return hvfMIDR }
-
-// platformMIDR returns the MIDR_EL1 value of the guest on this host.
-func platformMIDR() uint64 { return hvfMIDR }
+// platformMIDR returns the MIDR_EL1 value of the guest on this host. The hvf
+// backend writes hvcommon.HVFMIDREL1 to every vCPU.
+func platformMIDR() uint64 { return hvcommon.HVFMIDREL1 }
