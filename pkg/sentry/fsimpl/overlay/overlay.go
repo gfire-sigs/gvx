@@ -147,6 +147,10 @@ type filesystem struct {
 
 	// MaxFilenameLen is the maximum filename length allowed by the overlayfs.
 	maxFilenameLen uint64
+
+	// unused holds the dentries without references. It is protected by
+	// renameMu. See dentry_cache_xplat.go.
+	unused dentryCache `state:"nosave"`
 }
 
 // +stateify savable
@@ -472,6 +476,7 @@ func clonePrivateMount(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.evictUnusedDentries(ctx)
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
 	for _, lowerDevMinor := range fs.lowerDevMinors {
@@ -678,6 +683,9 @@ type dentry struct {
 	// dirInoHash is the entry hash in fs.dirInoCache. This is only set for
 	// directories.
 	dirInoHash layerDevNoAndIno
+
+	// unusedEntry links d into fs.unused. It is protected by fs.renameMu.
+	unusedEntry dentryCacheEntry `state:"nosave"`
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -771,8 +779,8 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 		return
 	}
 
-	// Refs is still zero; destroy it.
-	d.destroyLocked(ctx)
+	// Refs is still zero; keep it for a later lookup, or destroy it.
+	d.fs.cacheOrDestroyLocked(ctx, d)
 }
 
 // destroyLocked destroys the dentry.
@@ -790,6 +798,7 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	default:
 		panic("overlay.dentry.destroyLocked() called with references on the dentry")
 	}
+	d.fs.unused.remove(d)
 
 	if d.upperVD.Ok() {
 		d.upperVD.DecRef(ctx)

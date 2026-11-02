@@ -113,6 +113,7 @@ func runChecks() {
 		{"new-netns-has-lo", checkNewNetns},
 		{"pivot-root", checkPivotRoot},
 		{"keyring-link", checkKeyringLink},
+		{"overlay-dentry-cache", checkOverlayDentries},
 	}
 	for _, c := range checks {
 		if err := c.fn(); err != nil {
@@ -302,6 +303,81 @@ func checkPivotRoot() error {
 		}
 		return nil
 	})
+}
+
+// checkOverlayDentries renames, deletes, and recreates files on the overlay
+// root after lookups have cached their dentries. It also creates more files
+// than the overlay keeps unused dentries for. A stale dentry would show a
+// file at its old name or hide a new one.
+func checkOverlayDentries() error {
+	const app = "/bin/app"
+	for range 3 {
+		if _, err := os.Stat(app); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(app, app+"2"); err != nil {
+		return fmt.Errorf("rename lower file: %w", err)
+	}
+	if _, err := os.Stat(app); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s after rename: %v, want ENOENT", app, err)
+	}
+	if err := os.Rename(app+"2", app); err != nil {
+		return err
+	}
+	if _, err := os.Stat(app); err != nil {
+		return fmt.Errorf("stat %s after rename back: %w", app, err)
+	}
+
+	base := "/tmp/dcache"
+	if err := os.MkdirAll(base+"/a/b", 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(base+"/a/b/f", []byte("x"), 0o644); err != nil {
+		return err
+	}
+	if _, err := os.Stat(base + "/a/b/f"); err != nil {
+		return err
+	}
+	if err := os.Rename(base+"/a", base+"/z"); err != nil {
+		return err
+	}
+	if _, err := os.Stat(base + "/a/b/f"); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat old path after directory rename: %v, want ENOENT", err)
+	}
+	if data, err := os.ReadFile(base + "/z/b/f"); err != nil || string(data) != "x" {
+		return fmt.Errorf("read new path after directory rename: %q, %v", data, err)
+	}
+
+	const n = 5000
+	for i := range n {
+		if err := os.WriteFile(fmt.Sprintf("%s/f%d", base, i), nil, 0o644); err != nil {
+			return err
+		}
+	}
+	for i := range n {
+		if _, err := os.Stat(fmt.Sprintf("%s/f%d", base, i)); err != nil {
+			return err
+		}
+	}
+	for i := range n {
+		if err := os.Remove(fmt.Sprintf("%s/f%d", base, i)); err != nil {
+			return err
+		}
+	}
+	for i := range n {
+		if _, err := os.Stat(fmt.Sprintf("%s/f%d", base, i)); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat f%d after unlink: %v, want ENOENT", i, err)
+		}
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 1 || entries[0].Name() != "z" {
+		return fmt.Errorf("entries of %s = %d, want only z", base, len(entries))
+	}
+	return os.RemoveAll(base)
 }
 
 // checkKeyringLink joins a new session keyring and links the user keyring into

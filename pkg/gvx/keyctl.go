@@ -15,7 +15,6 @@
 package gvx
 
 import (
-	"z.gfire.dev/gvx/pkg/abi"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
@@ -41,8 +40,8 @@ var keyctlSysno = map[arch.Arch]uintptr{
 // keyring and cannot add a key to any keyring, so the user keyring is always
 // empty. This init lets that one link succeed as a no-op.
 func init() {
-	for a, sysno := range keyctlSysno {
-		table, ok := kernel.LookupSyscallTable(abi.Linux, a)
+	for _, table := range kernel.SyscallTables() {
+		sysno, ok := keyctlSysno[table.Arch]
 		if !ok {
 			continue
 		}

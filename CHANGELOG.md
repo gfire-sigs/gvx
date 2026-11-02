@@ -17,6 +17,12 @@ This file records the observable changes of each `gvx` release. The release work
 
 - **Host RAM as the guest memory size**: `MemTotal` and `sysinfo(2)` report the physical RAM of the host, as in runsc. Before, they reported 2 GiB. A tmpfs mount without a size option gets half of that RAM, and `size=N%` now resolves. systemd failed at boot on `size=20%` before. Without `--memory`, the memory guard stops a guest that passes the host RAM.
 - **Network links**: the guest links have the names `lo` and `eth0`, so `ip addr` lists them and Docker host networking finds them. Every guest stack has ARP, local delivery, SACK, receive buffer tuning, and a default TTL of 64, as the runsc stack has.
+- **NAT mode routing**: `eth0` is now a link to a second in-memory stack that stands for the host network, and not a loopback device of the guest stack. The guest stack therefore forwards and translates packets as a Linux router does. `dockerd --net-raw` with its default `bridge` network now reaches the internet, and `docker build` works. A connection from a bridge container to `10.0.2.15` still fails, because the guest stack sends the reply through `eth0`, the link of that address.
+
+### Performance
+
+- **Root file system lookups**: the overlay of the root file system keeps up to 4096 unused dentries. Before, it destroyed a dentry at its last reference and looked up each path component in each layer again. On `hvf` (Apple M1), `stat(2)` of a file two directories below the root fell from 8.6 us to 2.3 us, a path with 8 more components from 20.8 us to 2.4 us, and a file in the merged `/tmp` from 13.4 us to 2.0 us. A plain tmpfs takes 2.0 us.
+- **`darwin` system calls**: see the `GOMAXPROCS` fix below. A 1-byte `pread` stays at about 1.9 us after the first second, where it rose to 42 us.
 
 ### Bug Fixes
 

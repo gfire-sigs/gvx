@@ -104,7 +104,13 @@ func newStack(opts StackOptions) (*stack.Stack, error) {
 }
 
 // createNamedNIC creates a NIC with the interface name that the guest sees.
+// It takes id from the ID generator of the stack, as runsc does. A bridge or
+// veth link that the guest creates later through netlink then gets the next
+// free ID.
 func createNamedNIC(s *stack.Stack, id tcpip.NICID, name string, ep stack.LinkEndpoint) error {
+	if next := s.NextNICID(); next != id {
+		return fmt.Errorf("netbackend: %s NIC needs ID %d, the stack gives %d", name, id, next)
+	}
 	if err := s.CreateNICWithOptions(id, ep, stack.NICOptions{Name: name}); err != nil {
 		return fmt.Errorf("netbackend: create %s NIC: %s", name, err)
 	}

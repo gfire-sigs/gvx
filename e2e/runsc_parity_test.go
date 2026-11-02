@@ -68,7 +68,7 @@ func TestE2ERunscParityKernelFeatures(t *testing.T) {
 	want := []string{
 		"tmpfs-percent-size", "cgroup2-mounted", "mqueue-mounted", "mq-open",
 		"dev-fuse", "dev-net-tun", "uevent-socket", "loopback-named",
-		"new-netns-has-lo", "pivot-root", "keyring-link",
+		"new-netns-has-lo", "pivot-root", "keyring-link", "overlay-dentry-cache",
 	}
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {

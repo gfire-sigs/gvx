@@ -15,7 +15,6 @@
 package gvx
 
 import (
-	"z.gfire.dev/gvx/pkg/abi"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -48,8 +47,8 @@ var rebootSysno = map[arch.Arch]uintptr{
 // systemd then never stops after "systemctl poweroff". This init replaces the
 // entry before any kernel starts.
 func init() {
-	for a, sysno := range rebootSysno {
-		table, ok := kernel.LookupSyscallTable(abi.Linux, a)
+	for _, table := range kernel.SyscallTables() {
+		sysno, ok := rebootSysno[table.Arch]
 		if !ok {
 			continue
 		}
