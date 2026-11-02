@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Guest-triggered host panic on `darwin` and `windows`**: a failed `sendmsg` on a Unix socket (for example `su` or `logger` in an Alpine guest) stopped the host with `unknown host errno "errno 107"`. `syserr.Error.ToError` returned a Linux number as a host `unix.Errno`, and `syserr.FromError` then looked it up in the host table. `ToError` now returns the `linuxerr` error on those hosts, and `FromError` keeps the Linux number.
+
 ## [v0.3.0] - 2026-11-02
 
 This release makes the CPU features that a guest sees agree with the features that it can use.

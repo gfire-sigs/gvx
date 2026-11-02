@@ -51,7 +51,7 @@ func New(message string, linuxTranslation errno.Errno) *Error {
 		panic(fmt.Sprint("invalid errno: ", err.errno))
 	}
 
-	e := error(unix.Errno(err.errno))
+	e := backwardsError(err)
 	// linuxerr.ErrWouldBlock gets translated to linuxerr.EWOULDBLOCK and
 	// enables proper blocking semantics. This should temporary address the
 	// class of blocking bugs that keep popping up with the current state of
