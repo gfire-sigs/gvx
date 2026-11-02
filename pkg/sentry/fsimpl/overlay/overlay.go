@@ -243,10 +243,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		// Only filesystems that support whiteouts (char 0,0 devices) and overlay
 		// xattrs (trusted.overlay.* or user.overlay.*) can be used as overlay
 		// upper layers. For mounts created through the mount syscall (not
-		// internal), restrict to tmpfs and gofer ("9p").
+		// internal), restrict to the types in userMountUpperFSNames.
 		upperFSName := upperRoot.Mount().Filesystem().FilesystemType().Name()
 		if !opts.InternalMount {
-			if upperFSName != "tmpfs" && upperFSName != "9p" {
+			if !isUserMountUpperFS(upperFSName) {
 				upperRoot.DecRef(ctx)
 				return nil, nil, linuxerr.EINVAL
 			}
@@ -385,6 +385,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	rootTopVD := root.topLayer()
 	rootCleanup := cleanup.Make(func() {
+		// WHY: The root holds its creation reference until the mount works.
+		// destroyLocked panics when a dentry still has a reference, so an
+		// error below would crash the sandbox instead of failing the mount.
+		root.refs.Store(0)
 		root.destroyLocked(ctx)
 		fs.vfsfs.DecRef(ctx)
 	})
