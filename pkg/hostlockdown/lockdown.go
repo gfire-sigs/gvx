@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -165,6 +166,7 @@ func Apply(opts Options) (Status, error) {
 	if err := validateMounts(opts.Mounts); err != nil {
 		return Status{}, err
 	}
+	pinGOMAXPROCS()
 	st, err := applyOSLockdown(opts)
 	if err != nil {
 		return st, err
@@ -173,6 +175,19 @@ func Apply(opts Options) (Status, error) {
 	lastStatus = st
 	lockedDownFlag.Store(true)
 	return st, nil
+}
+
+// pinGOMAXPROCS fixes GOMAXPROCS at its current value.
+//
+// WHY: Since Go 1.25 the runtime sysmon thread re-reads the CPU count once a
+// second and resets GOMAXPROCS to it. On macOS the read is a sysctl call. The
+// Seatbelt profile rejects it, the runtime sees one CPU, and GOMAXPROCS drops
+// to 1 for the rest of the process. Calling GOMAXPROCS with a positive value
+// marks the setting as manual, even when the value does not change, and sysmon
+// then stops the updates. The pin is also harmless on the other hosts, because
+// their CPU count does not change after lockdown.
+func pinGOMAXPROCS() {
+	runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
 }
 
 // validateMounts refuses an empty path and the root of a file system. A root

@@ -16,8 +16,12 @@ package syserr
 
 import (
 	"fmt"
+	"runtime"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux/errno"
+	"z.gfire.dev/gvx/pkg/errors"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
 
 // linuxErrnoErrors maps a Linux errno to the Error that newWithHost registered
@@ -47,4 +51,36 @@ func fromLinuxErrno(n errno.Errno) *Error {
 		}
 	}
 	return NewDynamic(fmt.Sprintf("linux errno %d", n), n)
+}
+
+// backwardsError returns the error value that Error.ToError gives for e.
+//
+// WHY: On Linux, unix.Errno carries the Linux number, so the value round-trips
+// through FromError. On Windows and macOS, unix.Errno is a host number. FromError
+// would then look up a Linux number in the host table and panic. For example,
+// Linux ENOTCONN (107) has no entry in the macOS table. A linuxerr error keeps
+// the Linux number on every host. ExtractErrno and FromError both accept it.
+func backwardsError(e *Error) error {
+	if runtime.GOOS == "linux" {
+		return unix.Errno(e.errno)
+	}
+	if le := lookupLinuxerr(e.errno); le != nil {
+		return le
+	}
+	return errors.New(e.errno, e.message)
+}
+
+// lookupLinuxerr returns the linuxerr error for a Linux errno, or nil when the
+// linuxerr package has none.
+func lookupLinuxerr(n errno.Errno) (le *errors.Error) {
+	defer func() {
+		if recover() != nil {
+			le = nil
+		}
+	}()
+	err := linuxerr.ErrorFromUnix(unix.Errno(n))
+	if err == nil {
+		return nil
+	}
+	return err.(*errors.Error)
 }
