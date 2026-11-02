@@ -7,6 +7,16 @@ This file records the observable changes of each `gvx` release. The release work
 ### Features
 
 - **`rungv run --pull=always|missing|never`**: the flag selects when an image comes from its registry, as in Docker. The default stays `always`. The SDK has `Config.PullPolicy` with `PullAlways`, `PullMissing`, and `PullNever`, and `Config.Warnings` for the warning line. `missing` uses the cache first. `never` uses only the cache.
+- **`--net-raw` and `--allow-packet-socket-write`**: the guest can open raw sockets and use `iptables-legacy`, as with the runsc flags of the same names. `dockerd` needs them. The SDK fields are `Config.NetRaw` and `Config.AllowPacketSocketWrite`. Both are off by default.
+- **`--allow-suid`**: the guest obeys the set-user-ID and set-group-ID bits, as with the runsc flag. `sudo` then works for a user that is not root. The SDK field is `Config.AllowSUID`. It is off by default.
+- **Container runtimes in the guest**: the guest root file system is now a mount on a hidden read-only root, as in runsc, so `pivot_root(2)` works. A new network namespace gets a stack with `lo`; `unshare -n` hung before. The kernel has `mqueue` at `/dev/mqueue`, `cgroup2` at `/sys/fs/cgroup`, `/dev/fuse`, `/dev/net/tun`, and `NETLINK_KOBJECT_UEVENT` and netfilter netlink sockets.
+- **`reboot(2)`**: a power off or a halt by root in the guest ends the run with exit code 0, and a restart ends it with 129. `systemctl poweroff` stopped no run before.
+- **Task watchdog**: the kernel logs the stacks of a task that stays in the Sentry for 3 minutes. `GVX_DEBUG_LOG=1` shows the log.
+
+### Behavior Changes
+
+- **Host RAM as the guest memory size**: `MemTotal` and `sysinfo(2)` report the physical RAM of the host, as in runsc. Before, they reported 2 GiB. A tmpfs mount without a size option gets half of that RAM, and `size=N%` now resolves. systemd failed at boot on `size=20%` before. Without `--memory`, the memory guard stops a guest that passes the host RAM.
+- **Network links**: the guest links have the names `lo` and `eth0`, so `ip addr` lists them and Docker host networking finds them. Every guest stack has ARP, local delivery, SACK, receive buffer tuning, and a default TTL of 64, as the runsc stack has.
 
 ### Bug Fixes
 
@@ -14,6 +24,8 @@ This file records the observable changes of each `gvx` release. The release work
 - **`darwin` host performance after lockdown**: `GOMAXPROCS` fell from the CPU count to 1 about one second after `hostlockdown.Apply`, and every guest system call became about 20 times slower. The Go runtime re-read `hw.ncpu` with `sysctl`, and Seatbelt rejected the call. `Apply` now pins `GOMAXPROCS` before it applies the profile.
 - **`/proc/cpuinfo` on `darwin/arm64` and `windows/arm64`**: `CPU architecture`, `CPU implementer`, `CPU part`, and `BogoMIPS` were 0. containerd then chose the platform `linux/arm64/unknown`. The fields now show architecture 8, the fields of the `MIDR_EL1` value that the guest reads, and `BogoMIPS` of twice the `CNTFRQ_EL0` frequency in MHz (48.00 for a 24 MHz counter). `hvf` guests show implementer 0x61 (Apple). The `hvf` backend writes that `MIDR_EL1` value to every vCPU, so the guest value does not depend on the Apple chip of the host.
 - **`rungv run` of a loaded image**: after `rungv load -i img.tar`, `rungv run mylocal/app:1` failed with a registry 401, because the run always asked the registry first. With the default policy, the run now uses the cached image when the registry answers 401, 403, or 404. It prints one warning line. `oci.ErrAuthRequired` names a registry that demands credentials that the Docker configuration does not hold.
+- **systemd mount units**: `run-lock.mount` and other units with `KeyringMode=shared` failed with status 237/KEYRING, because `keyctl(KEYCTL_LINK)` of the user keyring returned ENOSYS. That link now succeeds. The Sentry has no user keyring, so the link adds no key.
+- **Host crash when a guest init exits**: `rungv` stopped with a nil pointer panic when the guest init exited with a netlink socket open, as systemd does at power off. The sandbox held the last reference of the init file table and released it without a task.
 - **Docker schema 1 images**: `rungv pull` and `rungv run` now report `image uses Docker manifest schema 1, which is not supported; rebuild or re-push it with a current Docker`. Before, a signed schema 1 manifest such as `sshipway/xclock` failed with `content digest mismatch`, because the registry reports the digest of the unsigned payload. `oci.ErrSchema1Unsupported` names the error.
 
 ## [v0.3.0] - 2026-11-02

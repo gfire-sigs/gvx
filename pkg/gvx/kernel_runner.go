@@ -1036,7 +1036,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 
 	fdTable := k.NewFDTable()
-	defer fdTable.DecRef(sctx)
+	fdTableOwned := true
+	defer func() {
+		if fdTableOwned {
+			fdTable.DecRef(sctx)
+		}
+	}()
 
 	var tty *ttyState
 	if s.cfg.TTY || isHostTerminalReader(s.cfg.Stdin) {
@@ -1104,6 +1109,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 
 	tg, _, err := k.CreateProcess(procArgs)
+	// CreateProcess takes its own reference on fdTable. Drop this one now, as
+	// runsc does, so the last reference drops when the guest closes the table
+	// in a task context. The Release of a netlink socket needs that context,
+	// and a guest init such as systemd exits with netlink sockets open.
+	fdTable.DecRef(sctx)
+	fdTableOwned = false
 	if err != nil {
 		if hint := s.nonPIEHintForGuestFile(readGuest, execPath); hint != "" {
 			err = fmt.Errorf("%w; %s", err, hint)
