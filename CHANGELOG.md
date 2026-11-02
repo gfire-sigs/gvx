@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.4.0] - 2026-11-02
+
+This release closes the gaps to runsc that systemd, Docker in the guest, and desktop workloads hit. It also fixes a guest-triggered host panic and a slowdown of every system call on macOS.
 
 ### Features
 
