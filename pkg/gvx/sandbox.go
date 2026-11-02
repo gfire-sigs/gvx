@@ -73,6 +73,7 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
+	applyHostMemoryDefaults()
 
 	sb := &Sandbox{cfg: cfg}
 
