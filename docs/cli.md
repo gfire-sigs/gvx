@@ -60,6 +60,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `--cpus N` | Limit the CPU quota. The value is a decimal number, such as `1.5`. |
 | `--network NAME` | `bridge` and `nat` select the NAT mode. `none` and `wg` are the other modes. `host` is refused. |
 | `--platform linux/ARCH` | Select the architecture of the image: `linux/amd64` or `linux/arm64`. |
+| `--pull POLICY` | Select when the image comes from its registry: `missing` (the default, as in Docker), `always`, or `never`. Section 5.1 describes the policies. |
 
 The flag `-d` is refused with a message, because a run has no daemon.
 
@@ -72,6 +73,9 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
+| `--net-raw` | Let the guest open raw sockets and use `iptables`, as the runsc flag of the same name does. `dockerd` needs it. Section 4.8 describes the risk. |
+| `--allow-packet-socket-write` | Let the guest send on `AF_PACKET` sockets. It needs `--net-raw`. |
+| `--allow-suid` | Obey the set-user-ID and set-group-ID bits of guest executables, as the runsc flag of the same name does. `sudo`, `su`, and `passwd` need it for a user that is not root. |
 | `-registry-url URL` | Override the registry of the image reference. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
@@ -131,15 +135,27 @@ A volume with the `ext4lite` driver needs no lockdown rule for a host path. The 
 
 ### 4.5 Resource limits
 
-`--memory` sets a limit on the memory use of the guest. A guard reads the memory accounting of the Sentry and kills the guest with SIGKILL when the use passes the limit. The exit code is 137, and `rungv` prints a message. The guard reads the use at short intervals, so a guest can pass the limit by the amount that it allocates between two readings.
+`--memory` sets a limit on the memory use of the guest. A guard reads the memory accounting of the Sentry and kills the guest with SIGKILL when the use passes the limit. The exit code is 137, and `rungv` prints a message. The guard reads the use at short intervals, so a guest can pass the limit by the amount that it allocates between two readings. Without `--memory`, the limit is the physical RAM of the host, and the guard reads the use every 100 ms.
+
+The guest kernel takes its memory size from the physical RAM of the host, as runsc does. `MemTotal` in `/proc/meminfo` and `sysinfo(2)` report that RAM, also with `--memory`. A tmpfs mount without a size option, such as `/dev/shm`, gets half of that RAM, as on Linux. A guest mount with `size=N%` gets N percent of it. The tmpfs that holds the writes to the root file system has no size limit of its own. The memory guard limits it.
 
 `--cpus` sets the number of CPUs that the guest sees, rounded up. Windows also caps the CPU time of the host process with a hard cap on the containment job. The other host OSes have no such cap, and `rungv` prints a warning. On Windows with `-platform=systrap`, the guest runs in stub processes that the cap does not cover.
 
-### 4.6 Published ports
+### 4.6 Guest kernel
+
+The guest sees the mounts that Docker gives a container: `/proc`, `/sys`, `/sys/fs/cgroup` (the `cgroup2` hierarchy), `/dev`, `/dev/pts`, `/dev/shm`, and `/dev/mqueue`. The devices `/dev/fuse` and `/dev/net/tun` exist. A FUSE server and a TUN device stay inside the sandbox. The network links have the names `lo` and `eth0`. A new network namespace, as from `unshare -n` or runc, has only `lo`. The guest can create bridge and veth links and forward packets between them. With `--net-raw`, `dockerd` and its default `bridge` network work. A bridge container cannot connect to the `eth0` address `10.0.2.15`, because the guest sends the reply through `eth0`.
+
+The root file system is a mount on top of a hidden read-only root, as in runsc. `pivot_root(2)` therefore works, and runc can start containers in the guest. A call of `reboot(2)` by root in the guest stops the run. A power off or a halt gives the exit code 0. A restart gives 129, as if SIGHUP ended the init process. `systemctl poweroff` therefore ends `rungv`.
+
+### 4.7 Published ports
 
 `rungv` binds each published port before the lockdown. It prints one line for each port to the standard error before the guest starts, as in `rungv: publishing 127.0.0.1:49493 -> 8080/tcp`. The line shows the free port that the host chose. A published port needs the NAT network mode.
 
-### 4.7 Failures and diagnostics
+### 4.8 Raw sockets
+
+A raw socket can send packets with any source address on the guest network, so `--net-raw` is off by default. The NAT mode still applies its destination rules, including `-isolate-lan`, to each packet that leaves `eth0`. The host network does not see the packets of a raw socket. The `iptables` tables work through the legacy interface (`iptables-legacy`). The `nftables` interface is not available.
+
+### 4.9 Failures and diagnostics
 
 `-platform=auto` prefers the hardware hypervisor and falls back to `systrap`. The fallback is slower. `rungv` then prints a warning that names the cause and the fix. On Windows the usual cause is a disabled "Windows Hypervisor Platform" feature. On macOS it is a binary without the hypervisor entitlement. Sign it with `codesign --sign - --entitlements entitlements.plist --force rungv`. The SDK gives the same text through `Sandbox.FallbackReason`.
 
@@ -158,6 +174,20 @@ The credentials come from the Docker configuration file. The directory is `DOCKE
 A credential helper is the program `docker-credential-NAME`. It has 30 seconds and 1 MiB of output. A missing helper means no credentials. `rungv` sends credentials only to the registry and to its token service.
 
 `rungv login` verifies the credentials against the registry before it stores them. It stores them with the helper, or else in `auths` as base64. It keeps every other field of the file. `rungv logout` removes them.
+
+### 5.1 Pull policy
+
+`rungv run` resolves a reference through the layer cache and the registry. The flag `--pull` selects the order. An image archive or `-bin` ignores the flag.
+
+| Policy | Order |
+| :--- | :--- |
+| `missing` | Use the cached image. Ask the registry only when the cache has no record of the reference. This is the default, as in Docker. A tag that moved in the registry keeps the cached image until `rungv pull` or `--pull=always`. |
+| `always` | Ask the registry first, so a tag that moved gives the new image. |
+| `never` | Use the cached image only. A reference that the cache does not hold stops the run with an error. |
+
+With `always`, the cached image replaces a failed request in two cases. The first case is a registry that is unreachable. The second case is a registry that answers HTTP 401, 403, or 404, or demands credentials that the Docker configuration does not hold. `rungv` then prints one warning line to the standard error. Any other failure stops the run, and so does a missing cached image.
+
+The second case lets `rungv load -i img.tar` followed by `rungv run --pull=always mylocal/app:1` work. The name `mylocal/app:1` is unknown to Docker Hub. With the default `missing`, the run uses the loaded image without a registry request. `rungv pull` always asks the registry and never uses the cache after a 401, 403, or 404.
 
 ## 6. The image store
 
@@ -181,8 +211,11 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `--network host` | Refused. The guest has its own network stack. |
 | A port range in `-p` | Refused. |
 | `--name` | Sets the container ID of the kernel and nothing else. |
+| Image with a Docker manifest schema 1 | Refused with a message. Docker 28 and later also refuse it. Rebuild or re-push the image. |
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
+| `CAP_NET_RAW` and set-user-ID programs | Off by default. Use `--net-raw` and `--allow-suid`. |
+| Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
 | A store into the page of the storing instruction | A `systrap` engine gives a page write access or execute access, never both. The Sentry runs a store from a writable and executable page into the same page. It writes both copies of the page. The Sentry decodes the single and pair stores of general and vector registers. Exclusive and atomic stores, a store across the page edge, and a store over an instruction that the patcher changed end with SIGSEGV. The Sentry log names the instruction. |

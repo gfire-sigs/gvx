@@ -117,6 +117,16 @@ type Config struct {
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
 
+	// NetRaw lets the guest open raw IP sockets and use iptables, as the runsc
+	// flag --net-raw does. dockerd and its bridge network need it. A raw
+	// socket can send packets with any source address on the guest network,
+	// so the default is off.
+	NetRaw bool
+
+	// AllowPacketSocketWrite lets the guest send packets on AF_PACKET sockets.
+	// It needs NetRaw. The default allows only reads, as in runsc.
+	AllowPacketSocketWrite bool
+
 	// PortForwards lists inbound host-to-guest port forwardings (-p host:guest).
 	PortForwards []PortForward
 
@@ -145,6 +155,15 @@ type Config struct {
 
 	// RegistryBaseURL specifies an optional HTTP/HTTPS OCI registry base URL.
 	RegistryBaseURL string
+
+	// PullPolicy selects when OCIImage comes from its registry: PullAlways,
+	// PullMissing, or PullNever. Empty means PullMissing. An archive path in
+	// OCIImage ignores it.
+	PullPolicy PullPolicy
+
+	// Warnings receives host-side warning lines, such as the use of a cached
+	// image after a registry denies access. A nil value discards them.
+	Warnings io.Writer
 
 	// BinaryPath specifies a host path to a Linux ELF64 binary to execute.
 	BinaryPath string
@@ -194,6 +213,11 @@ type Config struct {
 
 	// Hostname is the hostname of the guest. The default is "gvx".
 	Hostname string
+
+	// AllowSUID makes the guest obey the set-user-ID and set-group-ID bits of
+	// executables, as the runsc flag --allow-suid does. sudo, su, and passwd
+	// need it when the guest user is not root. The default ignores the bits.
+	AllowSUID bool
 
 	// Name is an optional container name that follows the Docker rule
 	// [a-zA-Z0-9][a-zA-Z0-9_.-]+. The sandbox uses it as the container ID of the
@@ -252,6 +276,11 @@ func (c *Config) normalize() error {
 	if c.Platform == "" {
 		c.Platform = PlatformAuto
 	}
+	policy, err := ParsePullPolicy(string(c.PullPolicy))
+	if err != nil {
+		return err
+	}
+	c.PullPolicy = policy
 	switch c.Platform {
 	case PlatformAuto, PlatformWHPX, PlatformHVF, PlatformSystrap:
 	default:
@@ -305,6 +334,9 @@ func (c *Config) normalize() error {
 	}
 	if q := c.Resources.CPUMillis; q < 0 || q > int64(runtime.NumCPU())*1000 {
 		return fmt.Errorf("%w: CPU quota %d is invalid: use 0 to %d thousandths of a CPU", ErrInvalidConfig, q, runtime.NumCPU()*1000)
+	}
+	if c.AllowPacketSocketWrite && !c.NetRaw {
+		return fmt.Errorf("%w: packet socket writes need NetRaw", ErrInvalidConfig)
 	}
 	if c.PublishAll && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: publishing the exposed ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)

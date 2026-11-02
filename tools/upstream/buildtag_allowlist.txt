@@ -22,7 +22,6 @@ pkg/sentry/arch/arch.go
 pkg/ring0/ring0.go
 pkg/sentry/vfs/vfs.go
 pkg/sentry/fsimpl/tmpfs/tmpfs.go
-pkg/sentry/fsimpl/overlay/overlay.go
 pkg/tcpip/tcpip.go
 
 # Content seams: EROFS inline xattr, device node, and listxattr support (SPEC 3.6).
@@ -36,6 +35,11 @@ seam pkg/sentry/fsimpl/erofs/filesystem.go
 # The upstream 4KB file excludes darwin so that exactly one of the page-size files applies.
 expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !darwin && !pagesize_64k
 expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !darwin && !pagesize_64k
+
+# Content seam: the overlay keeps unused dentries for later lookups
+# (pkg/sentry/fsimpl/overlay/dentry_cache_xplat.go). Upstream destroys a dentry at its
+# last reference, so every path resolution looks up each component in each layer again.
+seam pkg/sentry/fsimpl/overlay/overlay.go
 
 # Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno_xplat.go).
 seam pkg/syserr/syserr.go

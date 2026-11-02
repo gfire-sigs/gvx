@@ -49,6 +49,34 @@ const (
 // ErrDigestMismatch reports that content does not match its descriptor.
 var ErrDigestMismatch = errors.New("oci: content digest mismatch")
 
+// ErrSchema1Unsupported reports a Docker image manifest of schema version 1.
+// Docker 28 and later also reject this format.
+var ErrSchema1Unsupported = errors.New("oci: image uses Docker manifest schema 1, which is not supported; rebuild or re-push it with a current Docker")
+
+// rejectSchema1 returns ErrSchema1Unsupported when body is a Docker schema 1
+// manifest, signed or not. A registry reports the digest of the unsigned
+// payload for a signed schema 1 manifest, so a digest check on the body
+// would report a misleading mismatch. A body that is not JSON passes, and the
+// next step rejects it.
+func rejectSchema1(body []byte) error {
+	var probe struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		MediaType     string `json:"mediaType"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return nil
+	}
+	if isSchema1(probe.SchemaVersion, probe.MediaType) {
+		return ErrSchema1Unsupported
+	}
+	return nil
+}
+
+// isSchema1 reports whether a manifest header names Docker schema 1.
+func isSchema1(schemaVersion int, mediaType string) bool {
+	return schemaVersion == 1 || strings.HasPrefix(mediaType, mediaTypeDockerV1Prefix)
+}
+
 // PlatformSpec identifies the OS and CPU architecture of an OCI manifest.
 type PlatformSpec struct {
 	OS           string `json:"os"`
@@ -307,8 +335,8 @@ func resolveManifestChain(top []byte, arch string, fetch func(Descriptor) ([]byt
 		if err := json.Unmarshal(body, &probe); err != nil {
 			return nil, fmt.Errorf("oci: decode manifest: %w", err)
 		}
-		if probe.SchemaVersion == 1 || strings.HasPrefix(probe.MediaType, mediaTypeDockerV1Prefix) {
-			return nil, errors.New("oci: Docker image manifest schema 1 is not supported")
+		if isSchema1(probe.SchemaVersion, probe.MediaType) {
+			return nil, ErrSchema1Unsupported
 		}
 		isIndex := probe.MediaType == mediaTypeOCIIndex || probe.MediaType == mediaTypeDockerList ||
 			(probe.MediaType == "" && probe.Config == nil && len(probe.Manifests) > 0)
@@ -448,6 +476,9 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		if topBody, err = rc.getManifest(ctx, digest); err != nil {
 			return nil, err
 		}
+	}
+	if err := rejectSchema1(topBody); err != nil {
+		return nil, err
 	}
 	if err := verifyDigest(digest, topBody); err != nil {
 		return nil, fmt.Errorf("oci: manifest %s: %w", digest, err)

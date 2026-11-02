@@ -22,6 +22,7 @@ import (
 	"debug/elf"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -128,7 +129,7 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		}
 		layerFiles = append(layerFiles, files...)
 	} else if s.cfg.OCIImage != "" {
-		img, err := ResolveImage(ctx, cache, s.cfg.RegistryBaseURL, s.cfg.OCIImage, s.cfg.Architecture)
+		img, err := ResolveImageWithPolicy(ctx, cache, s.cfg.RegistryBaseURL, s.cfg.OCIImage, s.cfg.Architecture, s.cfg.PullPolicy, s.cfg.Warnings)
 		if err != nil {
 			return err
 		}
@@ -247,8 +248,28 @@ func verifySameLayerFile(opened *os.File, path string) error {
 // A registry pull revalidates the tag over the network. When the registry is
 // unreachable, ResolveImage falls back to the image that an earlier pull
 // cached. It looks in the cache first. Without an override, it then looks in
-// the default host layer cache.
+// the default host layer cache. ResolveImage always pulls first, as
+// rungv pull needs. Use ResolveImageWithPolicy to select another order.
 func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, arch string) (*oci.ResolvedImage, error) {
+	return resolveImage(ctx, cache, baseURL, image, arch, pullOrder{policy: PullAlways}, oci.PullRegistryImage)
+}
+
+// ResolveImageWithPolicy is like ResolveImage, but policy selects when a
+// registry is the source of the image. An archive path ignores the policy.
+//
+// With PullAlways, the call also uses the cached image when the registry
+// answers that the caller has no access to the reference or that the reference
+// is unknown (HTTP 401, 403, or 404). It then writes one warning line to
+// warnings. A nil warnings discards the line.
+func ResolveImageWithPolicy(ctx context.Context, cache *oci.LayerCache, baseURL, image, arch string, policy PullPolicy, warnings io.Writer) (*oci.ResolvedImage, error) {
+	policy, err := ParsePullPolicy(string(policy))
+	if err != nil {
+		return nil, err
+	}
+	return resolveImage(ctx, cache, baseURL, image, arch, pullOrder{policy: policy, useCacheWhenDenied: true, warnings: warnings}, oci.PullRegistryImage)
+}
+
+func resolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, arch string, order pullOrder, pull registryPuller) (*oci.ResolvedImage, error) {
 	arch = cmp.Or(arch, runtime.GOARCH)
 	if info, err := os.Stat(image); err == nil && !info.IsDir() {
 		f, err := os.Open(image)
@@ -278,39 +299,14 @@ func ResolveImage(ctx context.Context, cache *oci.LayerCache, baseURL, image, ar
 	if refErr != nil {
 		return nil, fmt.Errorf("gvx: %q is neither an image archive file nor a valid image reference: %w", image, refErr)
 	}
-	repo, tag := ref.Repository, ref.ManifestReference()
-
-	img, pullErr := oci.PullRegistryImage(ctx, nil, baseURL, repo, tag, arch, cache)
-	if pullErr == nil {
-		return img, nil
-	}
-	if ctx.Err() != nil || !isNetworkError(pullErr) {
-		return nil, pullErr
-	}
-
-	cached, cacheErr := cache.LoadCachedImage(baseURL, repo, tag, arch)
-	if cacheErr == nil {
-		return cached, nil
-	}
-	if !errors.Is(cacheErr, oci.ErrNotCached) {
-		return nil, errors.Join(pullErr, cacheErr)
-	}
-	if !explicitRegistry {
-		defaultCache, err := NewLayerCache("")
-		if err != nil {
-			return nil, errors.Join(pullErr, err)
-		}
-		if defaultCache.Dir() != cache.Dir() {
-			imported, err := cache.ImportCachedImage(defaultCache, baseURL, repo, tag, arch)
-			if err == nil {
-				return imported, nil
-			}
-			if !errors.Is(err, oci.ErrNotCached) {
-				return nil, errors.Join(pullErr, err)
-			}
-		}
-	}
-	return nil, pullErr
+	return resolveRegistryImage(ctx, cache, registryRequest{
+		baseURL:          baseURL,
+		explicitRegistry: explicitRegistry,
+		repo:             ref.Repository,
+		tag:              ref.ManifestReference(),
+		arch:             arch,
+		image:            image,
+	}, order, pull)
 }
 
 // isNetworkError reports whether err comes from an unreachable registry, as

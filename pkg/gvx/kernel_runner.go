@@ -43,12 +43,15 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/devices/memdev"
 	"z.gfire.dev/gvx/pkg/sentry/devices/ttydev"
+	"z.gfire.dev/gvx/pkg/sentry/devices/tundev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/cgroup2fs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/dev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/devpts"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/erofs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fuse"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/mqfs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/overlay"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/proc"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/sys"
@@ -65,12 +68,15 @@ import (
 	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/sentry/watchdog"
 	"z.gfire.dev/gvx/pkg/usermem"
 	"z.gfire.dev/gvx/pkg/waiter"
 
 	// Register Linux syscall tables and socket families in the Sentry kernel.
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/netfilter"
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/route"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/uevent"
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/unix"
 	_ "z.gfire.dev/gvx/pkg/sentry/syscalls/linux"
 )
@@ -910,7 +916,8 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	defer mf.Destroy()
 
 	k := &kernel.Kernel{
-		Platform: s.plat,
+		Platform:  s.plat,
+		AllowSUID: s.cfg.AllowSUID,
 	}
 	k.SetMemoryFile(mf)
 
@@ -931,8 +938,8 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
 	var rootNetNS *inet.Namespace
 	if s.netStack != nil {
-		inetStack := netstack.NewStack(s.netStack, 1)
-		rootNetNS = inet.NewRootNamespace(inetStack, nil, creds.UserNamespace)
+		inetStack := netstack.NewStack(s.netStack, k.UniqueID())
+		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
 	}
 
 	maxCPUs := runtime.NumCPU()
@@ -966,6 +973,8 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	vfsObj.MustRegisterFilesystemType("devtmpfs", dev.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("devpts", &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(mqfs.Name, &mqfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(fuse.Name, &fuse.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	if ext4lite.Name != "ext4lite" {
@@ -977,6 +986,14 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 	if err := ttydev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register ttydev: %w", err)
+	}
+	if err := fuse.Register(vfsObj); err != nil {
+		return 1, fmt.Errorf("gvx: register fuse device: %w", err)
+	}
+	if rootNetNS != nil && tundev.IsNetTunSupported(rootNetNS.Stack()) {
+		if err := tundev.Register(vfsObj); err != nil {
+			return 1, fmt.Errorf("gvx: register tun device: %w", err)
+		}
 	}
 
 	sctx := k.SupervisorContext()
@@ -1019,7 +1036,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 
 	fdTable := k.NewFDTable()
-	defer fdTable.DecRef(sctx)
+	fdTableOwned := true
+	defer func() {
+		if fdTableOwned {
+			fdTable.DecRef(sctx)
+		}
+	}()
 
 	var tty *ttyState
 	if s.cfg.TTY || isHostTerminalReader(s.cfg.Stdin) {
@@ -1087,6 +1109,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 
 	tg, _, err := k.CreateProcess(procArgs)
+	// CreateProcess takes its own reference on fdTable. Drop this one now, as
+	// runsc does, so the last reference drops when the guest closes the table
+	// in a task context. The Release of a netlink socket needs that context,
+	// and a guest init such as systemd exits with netlink sockets open.
+	fdTable.DecRef(sctx)
+	fdTableOwned = false
 	if err != nil {
 		if hint := s.nonPIEHintForGuestFile(readGuest, execPath); hint != "" {
 			err = fmt.Errorf("%w; %s", err, hint)
@@ -1101,6 +1129,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err := k.Start(); err != nil {
 		return 1, fmt.Errorf("gvx: start Sentry kernel: %w", err)
 	}
+	// The watchdog logs the stacks of a task that stays in the Sentry for a
+	// long time. GVX_DEBUG_LOG shows the log.
+	dog := watchdog.New(k, watchdog.DefaultOpts)
+	dog.Start()
+	defer dog.Stop()
 
 	_ = takeEngineFault()
 	doneCh := make(chan struct{})
@@ -1113,16 +1146,17 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}()
 
 	var memoryExceeded atomic.Bool
-	if limit := s.cfg.Resources.MemoryBytes; limit > 0 {
+	hostRAM, _ := hostMemory()
+	if limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM); limit > 0 {
 		guard := memoryGuard{
-			limit: uint64(limit),
+			limit: limit,
 			// The accounting counts a committed page only after a scan of the
 			// memory file. UpdateUsage limits its own scan rate.
 			used: func() uint64 {
 				_ = mf.UpdateUsage(nil)
 				return usage.MemoryAccounting.Total()
 			},
-			interval: memoryPollInterval,
+			interval: interval,
 			kill: func() {
 				memoryExceeded.Store(true)
 				_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
@@ -1163,9 +1197,62 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	return int(ws.ExitStatus()), nil
 }
 
+// guestNetnsCreator creates the network stack of a new guest network
+// namespace, such as the namespace of unshare -n or of a runc container. The
+// stack has only lo, as a new namespace on Linux has.
+type guestNetnsCreator struct {
+	k    *kernel.Kernel
+	opts netbackend.StackOptions
+}
+
+// CreateStack implements inet.NetworkStackCreator.CreateStack.
+func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
+	st, err := netbackend.NewLoopbackStack(c.opts)
+	if err != nil {
+		return nil, err
+	}
+	return netstack.NewStack(st, c.k.UniqueID()), nil
+}
+
+// buildKernelRootMountNamespace creates the mount namespace of the guest. As
+// in runsc, the namespace root is a read-only, locked tmpfs, and the guest
+// root file system is a second mount on top of it. pivot_root(2) refuses to
+// move the namespace root mount, so runc and other container runtimes need
+// the guest root to have a parent mount.
 func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.MountNamespace, error) {
+	rootMnt, err := s.mountGuestRoot(sctx, vfsObj, creds)
+	if err != nil {
+		return nil, err
+	}
+	defer rootMnt.DecRef(sctx)
+
+	mntns, err := vfsObj.NewMountNamespace(sctx, creds, "rootfs", "tmpfs", &vfs.MountOptions{ReadOnly: true, Locked: true}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gvx: create guest mount namespace: %w", err)
+	}
+	nsRoot := mntns.Root(sctx)
+	defer nsRoot.DecRef(sctx)
+	if err := vfsObj.ConnectMountAt(sctx, creds, rootMnt, &vfs.PathOperation{Root: nsRoot, Start: nsRoot}); err != nil {
+		mntns.DecRef(sctx)
+		return nil, fmt.Errorf("gvx: mount the guest root file system: %w", err)
+	}
+	return mntns, nil
+}
+
+// rootUpperOptions are the options of the tmpfs that holds the writes of the
+// guest to its root file system. That tmpfs has no default size limit. The
+// memory guard limits it.
+var rootUpperOptions = vfs.GetFilesystemOptions{InternalData: tmpfs.FilesystemOpts{DisableDefaultSizeLimit: true}}
+
+// mountGuestRoot creates the disconnected root mount of the guest: an overlay
+// of a tmpfs on the EROFS layers, or a plain tmpfs when the guest has no image.
+func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.Mount, error) {
 	if len(s.layerHandles) == 0 {
-		return vfsObj.NewMountNamespace(sctx, creds, "", "tmpfs", &vfs.MountOptions{}, nil)
+		mnt, err := vfsObj.MountDisconnected(sctx, creds, "", "tmpfs", &vfs.MountOptions{GetFilesystemOptions: rootUpperOptions})
+		if err != nil {
+			return nil, fmt.Errorf("gvx: create tmpfs root: %w", err)
+		}
+		return mnt, nil
 	}
 
 	var lowerRoots []vfs.VirtualDentry
@@ -1200,7 +1287,7 @@ func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, vfsObj *
 		lowerRoots = append(lowerRoots, vfs.MakeVirtualDentry(mnt, rootDentry))
 	}
 
-	upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{})
+	upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
 	if err != nil {
 		cleanupLowers()
 		return nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
@@ -1209,20 +1296,20 @@ func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, vfsObj *
 	upperFS.DecRef(sctx)
 	upperRoot := vfs.MakeVirtualDentry(upperMnt, upperRootDentry)
 
-	mntns, err := vfsObj.NewMountNamespace(sctx, creds, "", "overlay", &vfs.MountOptions{
+	mnt, err := vfsObj.MountDisconnected(sctx, creds, "overlay", "overlay", &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
 			InternalData: overlay.FilesystemOptions{
 				UpperRoot:  upperRoot,
 				LowerRoots: lowerRoots,
 			},
 		},
-	}, nil)
+	})
 	upperRoot.DecRef(sctx)
 	cleanupLowers()
 	if err != nil {
-		return nil, fmt.Errorf("gvx: create overlay root mount namespace: %w", err)
+		return nil, fmt.Errorf("gvx: create overlay root: %w", err)
 	}
-	return mntns, nil
+	return mnt, nil
 }
 
 func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
@@ -1277,6 +1364,17 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		return err
 	}
 	if err := mountSubfs("/dev/shm", "tmpfs", dataOpts("")); err != nil {
+		return err
+	}
+	// Docker mounts the cgroup2 hierarchy of a private cgroup namespace at
+	// /sys/fs/cgroup. systemd, runc, and dockerd read it there.
+	if err := mountSubfs("/sys/fs/cgroup", "cgroup2", dataOpts("")); err != nil {
+		return err
+	}
+	if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, "/dev/mqueue", 0o1777); err != nil {
+		return fmt.Errorf("gvx: create guest directory /dev/mqueue: %w", err)
+	}
+	if err := mountSubfs("/dev/mqueue", mqfs.Name, dataOpts("")); err != nil {
 		return err
 	}
 

@@ -177,6 +177,17 @@ func TestLockdownDarwinRuntimeStillWorks(t *testing.T) {
 	runChildToCompletion(t, "runtime", env...)
 }
 
+// TestLockdownDarwinKeepsGOMAXPROCS verifies that the locked process keeps its
+// full CPU count. Without a pin, the Go runtime re-reads hw.ncpu with sysctl
+// once a second. Seatbelt rejects that call, so the runtime falls back to one P.
+func TestLockdownDarwinKeepsGOMAXPROCS(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("one CPU: a drop to one P is not observable")
+	}
+	_, _, env := workspaceEnv(t)
+	runChildToCompletion(t, "gomaxprocs", env...)
+}
+
 func TestLockdownDarwinOutboundNATAndInbound(t *testing.T) {
 	_, _, env := workspaceEnv(t)
 	child := startChild(t, "net-nat", env...)
@@ -346,6 +357,8 @@ func runLockedChild(mode string) error {
 		return childNetFresh()
 	case "runtime":
 		return childRuntime()
+	case "gomaxprocs":
+		return childGOMAXPROCS()
 	case "root-workspace":
 		_, err := Apply(Options{Mounts: []HostMount{{Path: "/"}}})
 		if err == nil {
@@ -831,6 +844,23 @@ func childNetFresh() error {
 		_ = uconn.Close()
 	}
 	return c.err()
+}
+
+// childGOMAXPROCS applies the lockdown and then watches GOMAXPROCS for longer
+// than two sysmon update periods.
+func childGOMAXPROCS() error {
+	want := runtime.GOMAXPROCS(0)
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: os.Getenv(childWSEnv)}}}); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := runtime.GOMAXPROCS(0); got != want {
+			return fmt.Errorf("GOMAXPROCS = %d after Apply, want %d", got, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return nil
 }
 
 func childRuntime() error {

@@ -139,3 +139,38 @@ func TestFromHostSocketErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestToErrorRoundTripsEveryLinuxErrno checks that the error value of ToError
+// returns to the same Linux errno through FromError on every host. A Linux
+// number that FromError looks up in a host table made the sentry panic on macOS.
+func TestToErrorRoundTripsEveryLinuxErrno(t *testing.T) {
+	checked := 0
+	for n := 1; n < len(linuxBackwardsTranslations); n++ {
+		if !linuxBackwardsTranslations[n].ok {
+			continue
+		}
+		checked++
+		e := NewDynamic("test", errno.Errno(n))
+		got := func() (got *Error) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("FromError(errno %d).ToError()) panicked: %v", n, r)
+				}
+			}()
+			return FromError(e.ToError())
+		}()
+		if got != nil && got.ToLinux() != errno.Errno(n) {
+			t.Errorf("round trip of errno %d gave %d", n, got.ToLinux())
+		}
+	}
+	if checked < 80 {
+		t.Fatalf("checked only %d errnos", checked)
+	}
+}
+
+func TestToErrorOfNotConnectedRoundTrips(t *testing.T) {
+	// ENOTCONN is 107 on Linux and 57 on macOS. The macOS host table has no 107.
+	if got := FromError(ErrNotConnected.ToError()); got.ToLinux() != errno.ENOTCONN {
+		t.Fatalf("round trip gave %d, want %d", got.ToLinux(), errno.ENOTCONN)
+	}
+}

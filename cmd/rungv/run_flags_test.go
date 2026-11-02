@@ -149,12 +149,37 @@ func TestRunFlagsRejectUnsupportedAndInvalidInput(t *testing.T) {
 		{"small memory", []string{"-m", "1m", "-image=x"}, "-m"},
 		{"bad cpus", []string{"--cpus", "abc", "-image=x"}, "--cpus"},
 		{"bad env name", []string{"-e", "A B=1", "-image=x"}, "-e"},
+		{"unknown pull policy", []string{"--pull", "sometimes", "-image=x"}, "--pull"},
 		{"missing env file", []string{"--env-file", filepath.Join(t.TempDir(), "absent.env"), "-image=x"}, "--env-file"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, code, done, stderr := parse(t, tc.args...)
 			if !done || code != 2 || !strings.Contains(stderr, tc.want) {
 				t.Fatalf("parseRunArgs(%v) = (code %d, done %v, stderr %q), want usage error 2 that mentions %q", tc.args, code, done, stderr, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunFlagsPullPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want gvx.PullPolicy
+	}{
+		{"default", []string{"-image=x"}, gvx.PullMissing},
+		{"always", []string{"--pull=always", "-image=x"}, gvx.PullAlways},
+		{"missing", []string{"--pull", "missing", "-image=x"}, gvx.PullMissing},
+		{"never with one dash", []string{"-pull=never", "-image=x"}, gvx.PullNever},
+		{"case and spaces", []string{"--pull", " Never ", "-image=x"}, gvx.PullNever},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, _, done, stderr := parse(t, tc.args...)
+			if done {
+				t.Fatalf("parseRunArgs ended the command: %s", stderr)
+			}
+			if rc.cfg.PullPolicy != tc.want {
+				t.Errorf("PullPolicy = %q, want %q", rc.cfg.PullPolicy, tc.want)
 			}
 		})
 	}

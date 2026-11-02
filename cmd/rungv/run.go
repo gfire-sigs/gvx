@@ -150,6 +150,9 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		fs.StringVar(&netFlag, n, string(gvx.NetModeNAT), "Network backend: nat (or bridge), wg, or none")
 	})
 	isolateLANFlag := fs.Bool("isolate-lan", false, "Block RFC1918 and loopback LAN destinations in NAT mode")
+	netRawFlag := fs.Bool("net-raw", false, "Allow raw sockets and iptables in the guest (dockerd needs them)")
+	packetWriteFlag := fs.Bool("allow-packet-socket-write", false, "Allow writes on AF_PACKET sockets; needs --net-raw")
+	allowSUIDFlag := fs.Bool("allow-suid", false, "Obey the set-user-ID and set-group-ID bits of guest executables")
 	wgConfFlag := fs.String("wg-conf", "", "Path to WireGuard INI configuration file")
 	wgConfigAlias := fs.String("wg-config", "", "Alias for -wg-conf")
 	imageFlag := fs.String("image", "", "OCI image reference or archive path")
@@ -162,6 +165,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	})
 	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL")
+	pullFlag := fs.String("pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
 	lockdownFlag := fs.Bool("lockdown", true, "Lock down the host process before guest entry (RestrictedToken and JobObject, or Seatbelt); use -lockdown=false to opt out")
 	ttyFlag := fs.Bool("t", false, "Allocate a pseudo-TTY for guest stdio")
 	fs.Bool("i", false, "Keep STDIN open (the guest always reads the standard input of rungv)")
@@ -312,38 +316,48 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		return usageError("--network: %v", err)
 	}
 
+	pullPolicy, err := gvx.ParsePullPolicy(*pullFlag)
+	if err != nil {
+		return usageError("--pull: %q must be always, missing, or never", *pullFlag)
+	}
+
 	wgConfPath := strings.TrimSpace(*wgConfFlag)
 	if wgConfPath == "" {
 		wgConfPath = strings.TrimSpace(*wgConfigAlias)
 	}
 
 	cfg := gvx.Config{
-		Platform:            backend,
-		Architecture:        arch,
-		NetworkMode:         netMode,
-		IsolateLAN:          *isolateLANFlag,
-		PortForwards:        portForwards,
-		PublishAll:          *publishAllFlag,
-		WireGuardConfigPath: wgConfPath,
-		OCIImage:            imageRef,
-		OCICacheDir:         strings.TrimSpace(*cacheDirFlag),
-		RegistryBaseURL:     strings.TrimSpace(*registryURLFlag),
-		BinaryPath:          binPath,
-		WorkspacePath:       strings.TrimSpace(*workspaceFlag),
-		WorkspaceReadOnly:   *readOnlyFlag,
-		Mounts:              mounts,
-		ReadOnlyRoot:        *readOnlyRootFlag,
-		WorkDir:             strings.TrimSpace(workDirFlag),
-		Envv:                envv,
-		User:                strings.TrimSpace(userFlag),
-		Hostname:            strings.TrimSpace(hostnameFlag),
-		Name:                strings.TrimSpace(*nameFlag),
-		Resources:           resources,
-		Stdin:               stdin,
-		Stdout:              stdout,
-		Stderr:              stderr,
-		TTY:                 *ttyFlag || *itFlag,
-		DisableHostLockdown: !*lockdownFlag,
+		Platform:               backend,
+		Architecture:           arch,
+		NetworkMode:            netMode,
+		IsolateLAN:             *isolateLANFlag,
+		NetRaw:                 *netRawFlag,
+		AllowPacketSocketWrite: *packetWriteFlag,
+		AllowSUID:              *allowSUIDFlag,
+		PortForwards:           portForwards,
+		PublishAll:             *publishAllFlag,
+		WireGuardConfigPath:    wgConfPath,
+		OCIImage:               imageRef,
+		OCICacheDir:            strings.TrimSpace(*cacheDirFlag),
+		RegistryBaseURL:        strings.TrimSpace(*registryURLFlag),
+		PullPolicy:             pullPolicy,
+		Warnings:               stderr,
+		BinaryPath:             binPath,
+		WorkspacePath:          strings.TrimSpace(*workspaceFlag),
+		WorkspaceReadOnly:      *readOnlyFlag,
+		Mounts:                 mounts,
+		ReadOnlyRoot:           *readOnlyRootFlag,
+		WorkDir:                strings.TrimSpace(workDirFlag),
+		Envv:                   envv,
+		User:                   strings.TrimSpace(userFlag),
+		Hostname:               strings.TrimSpace(hostnameFlag),
+		Name:                   strings.TrimSpace(*nameFlag),
+		Resources:              resources,
+		Stdin:                  stdin,
+		Stdout:                 stdout,
+		Stderr:                 stderr,
+		TTY:                    *ttyFlag || *itFlag,
+		DisableHostLockdown:    !*lockdownFlag,
 	}
 	if len(guestArgs) > 0 {
 		if binPath != "" {

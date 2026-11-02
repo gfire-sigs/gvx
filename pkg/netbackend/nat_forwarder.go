@@ -34,6 +34,7 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
+	"z.gfire.dev/gvx/pkg/tcpip/link/pipe"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -115,11 +116,16 @@ type NATConfig struct {
 
 	// StreamInterceptor optionally relays traffic between guestConn and hostConn.
 	StreamInterceptor StreamInterceptor
+
+	// Stack selects the optional features of the guest network stack.
+	Stack StackOptions
 }
 
 // NATForwarder implements Track A (-net=nat) L4 TCP, UDP, DNS, and ICMP egress
 // forwarding for a pure-Go Netstack instance.
 type NATForwarder struct {
+	// stack stands for the host network. Its forwarders relay the guest
+	// connections. Close closes it.
 	stack       *stack.Stack
 	cfg         NATConfig
 	log         *slog.Logger
@@ -176,20 +182,13 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 }
 
 // NewLoopbackStack creates a pure-Go Netstack configured with lo (127.0.0.1/8)
-// and a loopback route table.
-func NewLoopbackStack() (*stack.Stack, error) {
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol,
-			ipv6.NewProtocol,
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-			icmp.NewProtocol4,
-			icmp.NewProtocol6,
-		},
-	})
+// and a loopback route table. A new network namespace of the guest also gets
+// this stack, as a new namespace on Linux has only lo.
+func NewLoopbackStack(opts StackOptions) (*stack.Stack, error) {
+	s, err := newStack(opts)
+	if err != nil {
+		return nil, err
+	}
 	if err := configureLoopbackNIC(s, LoopbackNICID); err != nil {
 		s.Close()
 		return nil, err
@@ -205,25 +204,97 @@ func NewLoopbackStack() (*stack.Stack, error) {
 
 // NewNATStack creates a pure-Go Netstack configured with lo (127.0.0.1/8) and
 // eth0 (10.0.2.15/24) and attaches a Track A L4 NATForwarder.
+//
+// eth0 is one end of an in-memory link. The other end belongs to a second
+// stack that stands for the host network. That stack accepts every packet,
+// and its L4 forwarders relay the connections to the host. The guest stack
+// therefore routes as a Linux host does: it can forward the packets of a
+// bridge or a network namespace to eth0 and translate them with iptables.
 func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
-	s, err := NewLoopbackStack()
+	s, err := NewLoopbackStack(cfg.Stack)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	fwd := newNATForwarder(s, cfg)
-	if err := configureNATNIC(s, Eth0NICID, fwd); err != nil {
+	guestEP, hostEP := pipe.New("", "", natLinkMTU)
+	hostStack, err := newNATHostStack(checksumOffloadEndpoint{hostEP})
+	if err != nil {
+		s.Close()
+		return nil, nil, err
+	}
+	fwd := newNATForwarder(hostStack, cfg)
+	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, fwd); err != nil {
 		_ = fwd.Close()
 		s.Close()
 		return nil, nil, err
 	}
-	registerNATTransportHandlers(s, fwd)
+	registerNATTransportHandlers(hostStack, fwd)
 	return s, fwd, nil
 }
 
+// natLinkMTU is the MTU of the in-memory link between the guest stack and the
+// host stack. It equals the MTU of the loopback device, so a TCP segment of
+// the guest needs no fragmentation.
+const natLinkMTU = 65536
+
+// hostNICID is the NIC of the host stack that connects to the guest eth0.
+const hostNICID tcpip.NICID = 1
+
+// checksumOffloadEndpoint reports checksum offload for an in-memory link. A
+// packet on that link cannot be corrupted, so neither stack computes or
+// checks transport checksums for it, as on the loopback device.
+type checksumOffloadEndpoint struct {
+	stack.LinkEndpoint
+}
+
+// Capabilities implements stack.LinkEndpoint.Capabilities.
+func (e checksumOffloadEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return e.LinkEndpoint.Capabilities() | stack.CapabilityRXChecksumOffload | stack.CapabilityTXChecksumOffload
+}
+
+// newNATHostStack creates the stack that stands for the host network. Its only
+// NIC accepts packets to every address and sends packets from every address,
+// so its forwarders can answer for any destination of the guest.
+func newNATHostStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			tcp.NewProtocol,
+			udp.NewProtocol,
+			icmp.NewProtocol4,
+			icmp.NewProtocol6,
+		},
+	})
+	fail := func(what string, err tcpip.Error) (*stack.Stack, error) {
+		s.Close()
+		return nil, fmt.Errorf("netbackend: %s on the host stack: %s", what, err)
+	}
+	if err := s.CreateNIC(hostNICID, ep); err != nil {
+		return fail("create the NIC", err)
+	}
+	if err := s.SetPromiscuousMode(hostNICID, true); err != nil {
+		return fail("set promiscuous mode", err)
+	}
+	if err := s.SetSpoofing(hostNICID, true); err != nil {
+		return fail("set spoofing", err)
+	}
+	sack := tcpip.TCPSACKEnabled(true)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack); err != nil {
+		return fail("enable TCP SACK", err)
+	}
+	moderate := tcpip.TCPModerateReceiveBufferOption(true)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &moderate); err != nil {
+		return fail("enable TCP receive buffer tuning", err)
+	}
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: hostNICID},
+		{Destination: header.IPv6EmptySubnet, NIC: hostNICID},
+	})
+	return s, nil
+}
+
 func configureLoopbackNIC(s *stack.Stack, nicID tcpip.NICID) error {
-	if err := s.CreateNIC(nicID, loopback.New()); err != nil {
-		return fmt.Errorf("netbackend: create lo NIC: %s", err)
+	if err := createNamedNIC(s, nicID, LoopbackNICName, loopback.New()); err != nil {
+		return err
 	}
 	loAddr := tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
@@ -238,13 +309,13 @@ func configureLoopbackNIC(s *stack.Stack, nicID tcpip.NICID) error {
 	return nil
 }
 
-func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, nf *NATForwarder) error {
+func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep stack.LinkEndpoint, nf *NATForwarder) error {
 	linkEP := &natLinkEndpoint{
-		LinkEndpoint: loopback.New(),
+		LinkEndpoint: ep,
 		nf:           nf,
 	}
-	if err := s.CreateNIC(nicID, linkEP); err != nil {
-		return fmt.Errorf("netbackend: create eth0 NIC: %s", err)
+	if err := createNamedNIC(s, nicID, Eth0NICName, linkEP); err != nil {
+		return err
 	}
 	ethAddr := tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
@@ -256,16 +327,6 @@ func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, nf *NATForwarder) error 
 	if err := s.AddProtocolAddress(nicID, ethAddr, stack.AddressProperties{}); err != nil {
 		return fmt.Errorf("netbackend: add 10.0.2.15/24 to eth0: %s", err)
 	}
-	// Enable promiscuous and spoofing modes on eth0 so outbound packets to
-	// external IPv4/IPv6 addresses enter the transport demuxer and trigger
-	// the L4 TCP/UDP forwarders when no local listener matches.
-	if err := s.SetPromiscuousMode(nicID, true); err != nil {
-		return fmt.Errorf("netbackend: set promiscuous mode on eth0: %s", err)
-	}
-	if err := s.SetSpoofing(nicID, true); err != nil {
-		return fmt.Errorf("netbackend: set spoofing on eth0: %s", err)
-	}
-
 	s.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4LoopbackSubnet,
@@ -317,20 +378,17 @@ func registerNATTransportHandlers(s *stack.Stack, nf *NATForwarder) {
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 }
 
-// AttachNATForwarder registers L4 TCP and UDP forwarders on s.
-func AttachNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
-	nf := newNATForwarder(s, cfg)
-	registerNATTransportHandlers(s, nf)
-	return nf
-}
-
 // Close cancels active NAT relays and waits for goroutines to finish.
 func (nf *NATForwarder) Close() error {
 	nf.mu.Lock()
+	wasClosed := nf.closed
 	nf.closed = true
 	nf.mu.Unlock()
 	nf.cancel()
 	nf.wg.Wait()
+	if !wasClosed {
+		nf.stack.Close()
+	}
 	return nil
 }
 

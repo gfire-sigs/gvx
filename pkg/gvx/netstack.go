@@ -21,14 +21,28 @@ import (
 	"strconv"
 
 	"z.gfire.dev/gvx/pkg/netbackend"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
 )
+
+// stackOptions returns the guest network stack features that the Config
+// selects.
+func (s *Sandbox) stackOptions() netbackend.StackOptions {
+	opts := netbackend.StackOptions{
+		RawSockets:        s.cfg.NetRaw,
+		PacketSocketWrite: s.cfg.AllowPacketSocketWrite,
+	}
+	if s.cfg.NetRaw {
+		opts.IPTables = netfilter.DefaultLinuxTables
+	}
+	return opts
+}
 
 // initNetstack builds the Netstack for the configured mode and pre-binds
 // every host socket that must outlive the lockdown.
 func (s *Sandbox) initNetstack() error {
 	switch s.cfg.NetworkMode {
 	case NetModeNone:
-		st, err := netbackend.NewLoopbackStack()
+		st, err := netbackend.NewLoopbackStack(s.stackOptions())
 		if err != nil {
 			return err
 		}
@@ -39,6 +53,7 @@ func (s *Sandbox) initNetstack() error {
 		st, fwd, err := netbackend.NewNATStack(netbackend.NATConfig{
 			IsolateLAN:        s.cfg.IsolateLAN,
 			StreamInterceptor: s.cfg.StreamInterceptor,
+			Stack:             s.stackOptions(),
 		})
 		if err != nil {
 			return err
@@ -91,7 +106,9 @@ func (s *Sandbox) initNetstack() error {
 		if peerPort == 0 && !s.cfg.DisableHostLockdown {
 			return fmt.Errorf("%w: network mode %q with host lockdown needs a peer Endpoint to pin the outbound UDP port; set the Endpoint or DisableHostLockdown", ErrInvalidConfig, NetModeWireGuard)
 		}
-		wgEP, err := netbackend.NewWireGuardEndpoint(*wgCfg)
+		wgConfig := *wgCfg
+		wgConfig.Stack = s.stackOptions()
+		wgEP, err := netbackend.NewWireGuardEndpoint(wgConfig)
 		if err != nil {
 			return err
 		}
