@@ -2,6 +2,17 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Features
+
+- **`iptables -m addrtype`**: the guest has the `addrtype` match in revisions 0 and 1, for IPv4 and IPv6. It knows the types `UNICAST`, `LOCAL`, `BROADCAST`, `MULTICAST`, and `UNSPEC`, and the options `--limit-iface-in` and `--limit-iface-out`. An unmodified `docker:dind` image now starts with the default `--iptables=true`. It failed with `Extension addrtype revision 0 not supported`. `docker run -p`, the default `bridge` network, user-defined networks, `docker build`, and `docker compose up` work in the guest.
+
+### Bug Fixes
+
+- **Inverted input interface in `iptables`**: a rule such as `! -i docker0 -j DNAT` came back from the guest as `-i docker0`. `iptables -C` and `iptables -D` did not find the rule. The guest now reports the `!` of `-i`, for IPv4 and IPv6.
+- **`DNAT` rule deletion**: the `DNAT` target of revision 2 reported a size of 72 bytes, but it has 80 bytes. `iptables -C` and `iptables -D` did not find a `DNAT` rule, so `dockerd` left the rule of a removed container behind. The size is now correct.
+
 ## [v0.4.1] - 2026-11-02
 
 This release makes `docker exec` work in a guest.
