@@ -20,7 +20,7 @@ The sandbox locks itself down before the guest starts. The guest therefore canno
 
 ## 2. Start the Engine (Procedural Module)
 
-These steps start the engine and connect the `docker` command of the host to it. You need `rungv` (see the [README](../README.md#3-quickstart)) and a `docker` command on the host. The `docker` command needs no local engine. The steps were tested on macOS. On Windows, use a socket path such as `unix:C:/Users/me/.gvx/docker.sock`.
+These steps start the engine and connect the `docker` command of the host to it. You need `rungv` (see the [README](../README.md#3-quickstart)) and a `docker` command on the host. The `docker` command needs no local engine. The steps work on macOS and Windows. On Windows, use PowerShell, create the directory with `mkdir $HOME\.gvx -Force`, and create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. A `unix://` host on Windows needs Docker CLI 29 or later. With an older CLI, publish `-p 127.0.0.1:2375:2375` and use `host=tcp://127.0.0.1:2375`.
 
 > [!IMPORTANT]
 > Use host ports that no other program uses. `rungv` stops with `address already in use` when one port of a range is busy.
