@@ -114,6 +114,7 @@ func runChecks() {
 		{"pivot-root", checkPivotRoot},
 		{"keyring-link", checkKeyringLink},
 		{"overlay-dentry-cache", checkOverlayDentries},
+		{"mnt-ns-setns", checkMountNamespaceSetns},
 	}
 	for _, c := range checks {
 		if err := c.fn(); err != nil {
@@ -378,6 +379,45 @@ func checkOverlayDentries() error {
 		return fmt.Errorf("entries of %s = %d, want only z", base, len(entries))
 	}
 	return os.RemoveAll(base)
+}
+
+// checkMountNamespaceSetns reads the mount namespace link of the process and
+// enters that namespace with setns(2) from a new mount namespace, as runc
+// exec does for docker exec. runc reports a namespace as unsupported when its
+// /proc/self/ns link cannot be read.
+func checkMountNamespaceSetns() error {
+	link, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		return fmt.Errorf("readlink /proc/self/ns/mnt: %w", err)
+	}
+	if !strings.HasPrefix(link, "mnt:[") {
+		return fmt.Errorf("/proc/self/ns/mnt = %q, want mnt:[N]", link)
+	}
+	fd, err := syscall.Open("/proc/self/ns/mnt", syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open /proc/self/ns/mnt: %w", err)
+	}
+	defer syscall.Close(fd)
+	return inNewThreadNamespace(syscall.CLONE_NEWNS|syscall.CLONE_FS, func() error {
+		inner, err := os.Readlink("/proc/thread-self/ns/mnt")
+		if err != nil {
+			return fmt.Errorf("readlink in the new namespace: %w", err)
+		}
+		if inner == link {
+			return fmt.Errorf("unshare(CLONE_NEWNS) kept the namespace %s", link)
+		}
+		if _, _, errno := syscall.RawSyscall(sysSetns, uintptr(fd), syscall.CLONE_NEWNS, 0); errno != 0 {
+			return fmt.Errorf("setns(CLONE_NEWNS): %w", errno)
+		}
+		back, err := os.Readlink("/proc/thread-self/ns/mnt")
+		if err != nil {
+			return fmt.Errorf("readlink after setns: %w", err)
+		}
+		if back != link {
+			return fmt.Errorf("namespace after setns = %s, want %s", back, link)
+		}
+		return nil
+	})
 }
 
 // checkKeyringLink joins a new session keyring and links the user keyring into

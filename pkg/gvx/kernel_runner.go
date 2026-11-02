@@ -998,7 +998,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	sctx := k.SupervisorContext()
 
-	mntns, err := s.buildKernelRootMountNamespace(sctx, vfsObj, creds)
+	mntns, err := s.buildKernelRootMountNamespace(sctx, k, creds)
 	if err != nil {
 		return 1, err
 	}
@@ -1219,14 +1219,19 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 // root file system is a second mount on top of it. pivot_root(2) refuses to
 // move the namespace root mount, so runc and other container runtimes need
 // the guest root to have a parent mount.
-func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.MountNamespace, error) {
+//
+// The kernel gives the namespace its nsfs inode, as in runsc. Without that
+// inode, /proc/[pid]/ns/mnt cannot be read, and runc refuses docker exec with
+// "namespace NEWNS is not supported".
+func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, k *kernel.Kernel, creds *auth.Credentials) (*vfs.MountNamespace, error) {
+	vfsObj := k.VFS()
 	rootMnt, err := s.mountGuestRoot(sctx, vfsObj, creds)
 	if err != nil {
 		return nil, err
 	}
 	defer rootMnt.DecRef(sctx)
 
-	mntns, err := vfsObj.NewMountNamespace(sctx, creds, "rootfs", "tmpfs", &vfs.MountOptions{ReadOnly: true, Locked: true}, nil)
+	mntns, err := vfsObj.NewMountNamespace(sctx, creds, "rootfs", "tmpfs", &vfs.MountOptions{ReadOnly: true, Locked: true}, k)
 	if err != nil {
 		return nil, fmt.Errorf("gvx: create guest mount namespace: %w", err)
 	}
