@@ -501,8 +501,15 @@ func (fs *filesystem) statfs() linux.Statfs {
 }
 
 // GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
+//
+// ext4lite does not enforce POSIX ACLs, so every file has none. WHY: The
+// overlay filesystem reads the ACLs of each layer on every lookup and on
+// mount. An error would make ext4lite unusable as an overlay layer.
 func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType) (*vfs.PosixACL, error) {
-	return nil, linuxerr.EOPNOTSUPP
+	fs.lock(ctx)
+	defer fs.unlock(ctx)
+	_, err := fs.resolveLocked(ctx, rp)
+	return nil, err
 }
 
 // SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.
