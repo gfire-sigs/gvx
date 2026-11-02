@@ -53,7 +53,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. |
 | `-P` | Publish every port that the image declares with `EXPOSE` to a free port of `127.0.0.1`. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, one host file, or a named volume. |
-| `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. |
+| `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. A `type=volume` source with a path separator names an image file. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
 | `--read-only` | Mount the root file system of the guest read-only. |
 | `-m`, `--memory SIZE` | Limit the guest memory. The units are `b`, `k`, `m`, `g`, and `t`. The minimum is 6m. |
@@ -107,6 +107,8 @@ A bind mount shows a host directory or one host file in the guest. A named volum
 The image holds an ext4 file system that the `ext4lite` driver reads and writes. The image grows in steps of 16MiB, up to 64TiB. A clean exit returns the unused tail to the host. One sandbox at a time can use a volume, because the driver locks the image file. A second sandbox on the same volume fails at start. A read-only mount of a volume opens the image read-only and fails when the last run did not end cleanly.
 
 The guest sees only the files that it wrote. The host sees one file. The image has a metadata journal. After a crash or a kill, the next run replays the journal. It keeps every file that the guest synced, and it frees the files that a guest unlinked and still held open. A volume of an older release gets a journal at the first run when the first 16MiB of the image has room for it, and the image never grows for that. `e2fsck -fn` accepts a clean image, and `mount -o loop -t ext4` mounts it on Linux.
+
+A `--mount type=volume` source that contains a path separator names the image file of an `ext4lite` volume at any host path, as in `--mount type=volume,src=/disk/vols/pg.ext4,dst=/var/lib/postgresql`. A relative source starts with `./`, because a source without a separator is a volume name. The sandbox creates a missing image file before the lockdown, but not its directory. A read-only mount never creates the file. The path must not name a directory or a device. Such a volume has the same lock, journal, and growth rules as a named volume. `-v` keeps its meaning: `-v /disk/vols/pg.ext4:/data` mounts that file as one regular file.
 
 A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
 
