@@ -9,6 +9,7 @@ This release makes `docker exec` work in a guest.
 ### Bug Fixes
 
 - **`docker exec` in a guest**: runc refused `docker exec`, healthchecks, and `docker compose exec` with `namespace NEWNS is not supported`. The root mount namespace of the guest had no nsfs inode, so `/proc/[pid]/ns/mnt` could not be read. The kernel now gives the namespace its inode, as in runsc. `setns(2)` into a mount namespace also works.
+- **Linux `FutexWait` with a timeout**: a signal handler that ran during the wait, such as the SIGURG of Go preemption, made the wait return as if a wake had come. The Sentry synchronization code on Linux hosts now parks again for the time that is left.
 
 ## [v0.4.0] - 2026-11-02
 
