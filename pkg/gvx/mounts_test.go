@@ -83,6 +83,9 @@ func TestParseMount(t *testing.T) {
 		{"type=bind,src=/h/file.txt,dst=/g/file.txt,ro", Mount{Kind: MountBind, HostPath: "/h/file.txt", GuestPath: "/g/file.txt", ReadOnly: true}},
 		{"type=volume,src=data,dst=/v", Mount{Kind: MountVolume, VolumeName: "data", GuestPath: "/v"}},
 		{"src=data,dst=/v,ro", Mount{Kind: MountVolume, VolumeName: "data", GuestPath: "/v", ReadOnly: true}},
+		{"type=volume,src=/disk/data.ext4,dst=/v", Mount{Kind: MountVolume, ImagePath: "/disk/data.ext4", GuestPath: "/v"}},
+		{"src=./data.ext4,dst=/v,driver=ext4lite", Mount{Kind: MountVolume, ImagePath: "./data.ext4", GuestPath: "/v", Driver: DriverExt4lite}},
+		{`src=D:\vols\data.ext4,dst=/v,ro`, Mount{Kind: MountVolume, ImagePath: `D:\vols\data.ext4`, GuestPath: "/v", ReadOnly: true}},
 		{"type=tmpfs,dst=/t", Mount{Kind: MountTmpfs, GuestPath: "/t"}},
 		{"type=tmpfs,target=/t,tmpfs-size=64m", Mount{Kind: MountTmpfs, GuestPath: "/t", TmpfsSizeBytes: 64 << 20}},
 		{"type=tmpfs,target=/t,tmpfs-size=4096", Mount{Kind: MountTmpfs, GuestPath: "/t", TmpfsSizeBytes: 4096}},
@@ -104,6 +107,7 @@ func TestParseMount(t *testing.T) {
 		"type=bind,src=/h,dst=/g,tmpfs-size=1m", "type=volume,src=v,dst=/g,tmpfs-size=1m", "type=bind,src=/h,dst=/g,bogus=1",
 		"type=volume,src=bad name,dst=/g", "type=volume,dst=/g", "type=tmpfs,dst=/t,tmpfs-size=0", "type=tmpfs,dst=/t,tmpfs-size=big",
 		"type=bind,src=/h,dst=/g,readonly=maybe", `type=bind,src="/h,dst=/g`,
+		"type=volume,src=/disk/data.ext4,dst=/v,driver=hostfs",
 	} {
 		if m, err := ParseMount(spec); err == nil {
 			t.Errorf("ParseMount(%q) = %+v, want an error", spec, m)
@@ -534,6 +538,69 @@ func TestOpenMountsRejectsBusyAndDuplicateVolumes(t *testing.T) {
 	_, err = open(Mount{Kind: MountVolume, VolumeName: "missing", GuestPath: "/a", ReadOnly: true})
 	if err == nil {
 		t.Error("a read-only mount of a missing volume succeeded")
+	}
+}
+
+// A volume at an ImagePath keeps its files across sandboxes, is refused when
+// it is busy or mounted twice, and needs its directory to exist.
+func TestOpenMountsVolumeAtImagePath(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "data.ext4")
+	open := func(mounts ...Mount) (*Sandbox, error) {
+		cfg := Config{OCICacheDir: t.TempDir(), Mounts: mounts}
+		if err := cfg.normalize(); err != nil {
+			t.Fatal(err)
+		}
+		sb := &Sandbox{cfg: cfg}
+		return sb, sb.openMounts()
+	}
+
+	first, err := open(Mount{Kind: MountVolume, ImagePath: image, GuestPath: "/a"})
+	if err != nil {
+		t.Fatalf("open a new image: %v", err)
+	}
+	if info, err := os.Stat(image); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("image file after open = %v, %v; want a regular file", info, err)
+	}
+	busy, err := open(Mount{Kind: MountVolume, ImagePath: image, GuestPath: "/a"})
+	if err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Errorf("a second sandbox on the same image = %v, want an in-use error", err)
+	}
+	if err := busy.closeMounts(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.closeMounts(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A relative path and an absolute path to one image are the same volume.
+	t.Chdir(dir)
+	dup, err := open(
+		Mount{Kind: MountVolume, ImagePath: "data.ext4", GuestPath: "/a"},
+		Mount{Kind: MountVolume, ImagePath: image, GuestPath: "/b"},
+	)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("one image mounted twice = %v, want ErrInvalidConfig", err)
+	}
+	if err := dup.closeMounts(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, m := range []Mount{
+		{Kind: MountVolume, ImagePath: filepath.Join(dir, "no-such-dir", "x.ext4"), GuestPath: "/a"},
+		{Kind: MountVolume, ImagePath: filepath.Join(dir, "missing.ext4"), GuestPath: "/a", ReadOnly: true},
+		{Kind: MountVolume, ImagePath: dir, GuestPath: "/a"},
+	} {
+		sb, err := open(m)
+		if err == nil {
+			t.Errorf("openMounts(%+v) succeeded, want an error", m)
+		}
+		if err := sb.closeMounts(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "missing.ext4")); !os.IsNotExist(err) {
+		t.Errorf("a read-only mount created the image: %v", err)
 	}
 }
 

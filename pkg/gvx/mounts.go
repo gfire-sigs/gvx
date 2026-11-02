@@ -40,8 +40,9 @@ const (
 	// MountBind mounts a host directory or one host regular file through
 	// hostfs.
 	MountBind MountKind = "bind"
-	// MountVolume mounts a named volume. The default driver is ext4lite, which
-	// stores the volume in one image file below the gvx cache directory.
+	// MountVolume mounts a volume. The default driver is ext4lite, which
+	// stores the volume in one image file: below the gvx cache directory for a
+	// named volume, or at Mount.ImagePath.
 	MountVolume MountKind = "volume"
 	// MountTmpfs mounts a memory-backed tmpfs.
 	MountTmpfs MountKind = "tmpfs"
@@ -76,6 +77,13 @@ type Mount struct {
 
 	// VolumeName names a volume. It matches [a-zA-Z0-9][a-zA-Z0-9_.-]*.
 	VolumeName string
+
+	// ImagePath is the host path of the image file of an ext4lite volume. A
+	// volume mount sets either VolumeName or ImagePath. A relative path is
+	// relative to the working directory of the host process. New creates a
+	// missing image file, but not its directory. A read-only mount never
+	// creates the file.
+	ImagePath string
 
 	// Driver selects the filesystem of a volume mount. The zero value selects
 	// ext4lite, except for a volume that exists only as a hostfs directory
@@ -194,7 +202,9 @@ func isHostPathSource(src string) bool {
 
 // ParseMount parses the value of a --mount flag. The keys are type (bind,
 // volume, or tmpfs; volume when absent), src or source, dst, destination, or
-// target, readonly or ro, and tmpfs-size. A bind source must already exist.
+// target, readonly or ro, tmpfs-size, and driver. A bind source must already
+// exist. A volume source with a path separator sets ImagePath; any other
+// volume source is a volume name.
 func ParseMount(spec string) (Mount, error) {
 	fields, err := csv.NewReader(strings.NewReader(spec)).Read()
 	if err != nil {
@@ -254,6 +264,13 @@ func ParseMount(spec string) (Mount, error) {
 		}
 		if kind == MountBind {
 			m.HostPath = src
+			return m, nil
+		}
+		if isHostPathSource(src) {
+			if m.Driver == DriverHostfs {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: driver=hostfs needs a volume name; use type=bind for a host directory", spec)
+			}
+			m.ImagePath = src
 			return m, nil
 		}
 		if !volumeNamePattern.MatchString(src) {
@@ -373,13 +390,22 @@ func (m Mount) validate() error {
 	}
 	switch m.Kind {
 	case MountBind:
-		if m.VolumeName != "" {
-			return errors.New("a bind mount takes no VolumeName")
+		if m.VolumeName != "" || m.ImagePath != "" {
+			return errors.New("a bind mount takes no VolumeName or ImagePath")
 		}
 		return m.validateBindSource()
 	case MountVolume:
 		if m.HostPath != "" {
 			return errors.New("a volume mount takes no HostPath")
+		}
+		if m.ImagePath != "" {
+			if m.VolumeName != "" {
+				return errors.New("a volume mount takes VolumeName or ImagePath, not both")
+			}
+			if m.Driver != "" && m.Driver != DriverExt4lite {
+				return fmt.Errorf("a volume with an ImagePath needs the ext4lite driver, not %q", m.Driver)
+			}
+			return nil
 		}
 		if !volumeNamePattern.MatchString(m.VolumeName) {
 			return fmt.Errorf("invalid volume name %q", m.VolumeName)
@@ -390,8 +416,8 @@ func (m Mount) validate() error {
 			return fmt.Errorf("unsupported volume driver %q (use ext4lite or hostfs)", m.Driver)
 		}
 	case MountTmpfs:
-		if m.HostPath != "" || m.VolumeName != "" {
-			return errors.New("a tmpfs mount takes no HostPath or VolumeName")
+		if m.HostPath != "" || m.VolumeName != "" || m.ImagePath != "" {
+			return errors.New("a tmpfs mount takes no HostPath, VolumeName, or ImagePath")
 		}
 	default:
 		return fmt.Errorf("unsupported mount kind %q", m.Kind)
@@ -559,11 +585,15 @@ func (s *Sandbox) openMounts() error {
 		switch {
 		case m.Kind == MountTmpfs:
 		case m.Kind == MountVolume && m.Driver == DriverExt4lite:
-			if volumes[m.VolumeName] {
-				return fmt.Errorf("gvx: volume %q is mounted twice: %w", m.VolumeName, ErrInvalidConfig)
+			image, err := s.cfg.volumeImagePath(m)
+			if err != nil {
+				return err
 			}
-			volumes[m.VolumeName] = true
-			vol, err := s.openVolumeImage(m)
+			if volumes[image] {
+				return fmt.Errorf("gvx: volume %s is mounted twice: %w", m.volumeLabel(), ErrInvalidConfig)
+			}
+			volumes[image] = true
+			vol, err := s.openVolumeImage(m, image)
 			if err != nil {
 				return err
 			}
@@ -599,13 +629,34 @@ func (s *Sandbox) openMounts() error {
 	return nil
 }
 
-// volumeImagePath returns the host path of the image file of a volume.
-func (c Config) volumeImagePath(name string) (string, error) {
+// volumeImagePath returns the absolute host path of the image file of a
+// volume. Two mounts of one image get the same path, so openMounts can refuse
+// the second one.
+func (c Config) volumeImagePath(m Mount) (string, error) {
+	if m.ImagePath != "" {
+		abs, err := filepath.Abs(m.ImagePath)
+		if err != nil {
+			return "", fmt.Errorf("gvx: resolve volume image %q: %w", m.ImagePath, err)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return resolved, nil
+		}
+		return abs, nil
+	}
 	root, err := c.volumeRoot()
 	if err != nil {
 		return "", fmt.Errorf("gvx: locate the volume directory: %w", err)
 	}
-	return filepath.Join(root, name+".ext4"), nil
+	return filepath.Join(root, m.VolumeName+".ext4"), nil
+}
+
+// volumeLabel names a volume mount in messages: the quoted name, or the
+// image path.
+func (m Mount) volumeLabel() string {
+	if m.ImagePath != "" {
+		return fmt.Sprintf("image %q", m.ImagePath)
+	}
+	return fmt.Sprintf("%q", m.VolumeName)
 }
 
 // resolveVolumeDriver picks the driver of a volume mount. An explicit driver
@@ -616,7 +667,10 @@ func (c Config) resolveVolumeDriver(m Mount) (MountDriver, error) {
 	if m.Driver != "" {
 		return m.Driver, nil
 	}
-	image, err := c.volumeImagePath(m.VolumeName)
+	if m.ImagePath != "" {
+		return DriverExt4lite, nil
+	}
+	image, err := c.volumeImagePath(m)
 	if err != nil {
 		return "", err
 	}
@@ -630,30 +684,32 @@ func (c Config) resolveVolumeDriver(m Mount) (MountDriver, error) {
 	return DriverExt4lite, nil
 }
 
-// openVolumeImage opens the image file of an ext4lite volume and creates it
-// when it does not exist. A read-only mount opens the file read-only and
-// never creates it.
-func (s *Sandbox) openVolumeImage(m Mount) (*ext4lite.Volume, error) {
-	image, err := s.cfg.volumeImagePath(m.VolumeName)
-	if err != nil {
-		return nil, err
+// openVolumeImage opens the image file of an ext4lite volume at image and
+// creates it when it does not exist. A read-only mount opens the file
+// read-only and never creates it. For a named volume, it also creates the
+// volume directory. For an ImagePath, the directory must exist.
+func (s *Sandbox) openVolumeImage(m Mount, image string) (*ext4lite.Volume, error) {
+	if info, err := os.Stat(image); err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("gvx: volume %s: %q is not a regular file (mode %s)", m.volumeLabel(), image, info.Mode().Type())
 	}
 	flags := os.O_RDWR | os.O_CREATE
 	if m.ReadOnly {
 		flags = os.O_RDONLY
-	} else if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
-		return nil, fmt.Errorf("gvx: create the volume directory: %w", err)
+	} else if m.ImagePath == "" {
+		if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
+			return nil, fmt.Errorf("gvx: create the volume directory: %w", err)
+		}
 	}
 	f, err := os.OpenFile(image, flags, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("gvx: open volume %q: %w", m.VolumeName, err)
+		return nil, fmt.Errorf("gvx: open volume %s: %w", m.volumeLabel(), err)
 	}
 	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{ReadOnly: m.ReadOnly})
 	if errors.Is(err, ext4lite.ErrVolumeInUse) {
-		return nil, fmt.Errorf("gvx: volume %q is in use by another sandbox: %w", m.VolumeName, err)
+		return nil, fmt.Errorf("gvx: volume %s is in use by another sandbox: %w", m.volumeLabel(), err)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("gvx: mount volume %q from %q: %w", m.VolumeName, image, err)
+		return nil, fmt.Errorf("gvx: mount volume %s from %q: %w", m.volumeLabel(), image, err)
 	}
 	return vol, nil
 }
