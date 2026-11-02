@@ -162,6 +162,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	})
 	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL")
+	pullFlag := fs.String("pull", string(gvx.PullAlways), "Pull the image: always (ask the registry first), missing (use the cache first), or never (cache only)")
 	lockdownFlag := fs.Bool("lockdown", true, "Lock down the host process before guest entry (RestrictedToken and JobObject, or Seatbelt); use -lockdown=false to opt out")
 	ttyFlag := fs.Bool("t", false, "Allocate a pseudo-TTY for guest stdio")
 	fs.Bool("i", false, "Keep STDIN open (the guest always reads the standard input of rungv)")
@@ -312,6 +313,11 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		return usageError("--network: %v", err)
 	}
 
+	pullPolicy, err := gvx.ParsePullPolicy(*pullFlag)
+	if err != nil {
+		return usageError("--pull: %q must be always, missing, or never", *pullFlag)
+	}
+
 	wgConfPath := strings.TrimSpace(*wgConfFlag)
 	if wgConfPath == "" {
 		wgConfPath = strings.TrimSpace(*wgConfigAlias)
@@ -328,6 +334,8 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		OCIImage:            imageRef,
 		OCICacheDir:         strings.TrimSpace(*cacheDirFlag),
 		RegistryBaseURL:     strings.TrimSpace(*registryURLFlag),
+		PullPolicy:          pullPolicy,
+		Warnings:            stderr,
 		BinaryPath:          binPath,
 		WorkspacePath:       strings.TrimSpace(*workspaceFlag),
 		WorkspaceReadOnly:   *readOnlyFlag,

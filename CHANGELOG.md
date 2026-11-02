@@ -4,7 +4,13 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
+### Features
+
+- **`rungv run --pull=always|missing|never`**: the flag selects when an image comes from its registry, as in Docker. The default stays `always`. The SDK has `Config.PullPolicy` with `PullAlways`, `PullMissing`, and `PullNever`, and `Config.Warnings` for the warning line. `missing` uses the cache first. `never` uses only the cache.
+
 ### Bug Fixes
+
+- **`rungv run` of a loaded image**: after `rungv load -i img.tar`, `rungv run mylocal/app:1` failed with a registry 401, because the run always asked the registry first. With the default policy, the run now uses the cached image when the registry answers 401, 403, or 404. It prints one warning line. `oci.ErrAuthRequired` names a registry that demands credentials that the Docker configuration does not hold.
 
 - **Docker schema 1 images**: `rungv pull` and `rungv run` now report `image uses Docker manifest schema 1, which is not supported; rebuild or re-push it with a current Docker`. Before, a signed schema 1 manifest such as `sshipway/xclock` failed with `content digest mismatch`, because the registry reports the digest of the unsigned payload. `oci.ErrSchema1Unsupported` names the error.
 

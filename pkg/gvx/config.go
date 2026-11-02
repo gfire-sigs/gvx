@@ -146,6 +146,15 @@ type Config struct {
 	// RegistryBaseURL specifies an optional HTTP/HTTPS OCI registry base URL.
 	RegistryBaseURL string
 
+	// PullPolicy selects when OCIImage comes from its registry: PullAlways,
+	// PullMissing, or PullNever. Empty means PullAlways. An archive path in
+	// OCIImage ignores it.
+	PullPolicy PullPolicy
+
+	// Warnings receives host-side warning lines, such as the use of a cached
+	// image after a registry denies access. A nil value discards them.
+	Warnings io.Writer
+
 	// BinaryPath specifies a host path to a Linux ELF64 binary to execute.
 	BinaryPath string
 
@@ -252,6 +261,11 @@ func (c *Config) normalize() error {
 	if c.Platform == "" {
 		c.Platform = PlatformAuto
 	}
+	policy, err := ParsePullPolicy(string(c.PullPolicy))
+	if err != nil {
+		return err
+	}
+	c.PullPolicy = policy
 	switch c.Platform {
 	case PlatformAuto, PlatformWHPX, PlatformHVF, PlatformSystrap:
 	default:
