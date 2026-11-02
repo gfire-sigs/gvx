@@ -88,6 +88,9 @@ func getEntries6(table stack.Table, tablename linux.TableName) (linux.KernelIP6T
 		if rule.Filter.SrcInvert {
 			entry.Entry.IPv6.InverseFlags |= linux.IP6T_INV_SRCIP
 		}
+		if rule.Filter.InputInterfaceInvert {
+			entry.Entry.IPv6.InverseFlags |= linux.IP6T_INV_VIA_IN
+		}
 		if rule.Filter.OutputInterfaceInvert {
 			entry.Entry.IPv6.InverseFlags |= linux.IP6T_INV_VIA_OUT
 		}
