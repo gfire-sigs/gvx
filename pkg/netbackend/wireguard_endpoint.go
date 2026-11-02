@@ -91,6 +91,8 @@ type WireGuardConfig struct {
 	// Logger receives wireguard-go device messages. When nil, the endpoint
 	// discards them. Verbose messages use the Debug level.
 	Logger *slog.Logger
+	// Stack selects the optional features of the guest network stack.
+	Stack StackOptions
 }
 
 // WireGuardEndpoint attaches a Netstack channel.Endpoint (MTU 1420) to the
@@ -411,7 +413,7 @@ func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.E
 }
 
 func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, error) {
-	s, err := NewLoopbackStack()
+	s, err := NewLoopbackStack(w.cfg.Stack)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -427,8 +429,8 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, e
 	if w.cfg.GuestIPv4.Addr() != dnsAddr {
 		linkEP.dnsAddr = tcpip.AddrFrom4(dnsAddr.As4())
 	}
-	if err := s.CreateNIC(Eth0NICID, linkEP); err != nil {
-		return fail(fmt.Errorf("netbackend: create WireGuard channel NIC: %s", err))
+	if err := createNamedNIC(s, Eth0NICID, Eth0NICName, linkEP); err != nil {
+		return fail(err)
 	}
 	v4 := tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,

@@ -35,9 +35,7 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
-	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/icmp"
 	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
 	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -115,6 +113,9 @@ type NATConfig struct {
 
 	// StreamInterceptor optionally relays traffic between guestConn and hostConn.
 	StreamInterceptor StreamInterceptor
+
+	// Stack selects the optional features of the guest network stack.
+	Stack StackOptions
 }
 
 // NATForwarder implements Track A (-net=nat) L4 TCP, UDP, DNS, and ICMP egress
@@ -176,20 +177,13 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 }
 
 // NewLoopbackStack creates a pure-Go Netstack configured with lo (127.0.0.1/8)
-// and a loopback route table.
-func NewLoopbackStack() (*stack.Stack, error) {
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol,
-			ipv6.NewProtocol,
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-			icmp.NewProtocol4,
-			icmp.NewProtocol6,
-		},
-	})
+// and a loopback route table. A new network namespace of the guest also gets
+// this stack, as a new namespace on Linux has only lo.
+func NewLoopbackStack(opts StackOptions) (*stack.Stack, error) {
+	s, err := newStack(opts)
+	if err != nil {
+		return nil, err
+	}
 	if err := configureLoopbackNIC(s, LoopbackNICID); err != nil {
 		s.Close()
 		return nil, err
@@ -206,7 +200,7 @@ func NewLoopbackStack() (*stack.Stack, error) {
 // NewNATStack creates a pure-Go Netstack configured with lo (127.0.0.1/8) and
 // eth0 (10.0.2.15/24) and attaches a Track A L4 NATForwarder.
 func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
-	s, err := NewLoopbackStack()
+	s, err := NewLoopbackStack(cfg.Stack)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -222,8 +216,8 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 }
 
 func configureLoopbackNIC(s *stack.Stack, nicID tcpip.NICID) error {
-	if err := s.CreateNIC(nicID, loopback.New()); err != nil {
-		return fmt.Errorf("netbackend: create lo NIC: %s", err)
+	if err := createNamedNIC(s, nicID, LoopbackNICName, loopback.New()); err != nil {
+		return err
 	}
 	loAddr := tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
@@ -243,8 +237,8 @@ func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, nf *NATForwarder) error 
 		LinkEndpoint: loopback.New(),
 		nf:           nf,
 	}
-	if err := s.CreateNIC(nicID, linkEP); err != nil {
-		return fmt.Errorf("netbackend: create eth0 NIC: %s", err)
+	if err := createNamedNIC(s, nicID, Eth0NICName, linkEP); err != nil {
+		return err
 	}
 	ethAddr := tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
