@@ -49,6 +49,9 @@ seam pkg/sentry/socket/netfilter/netfilter.go
 seam pkg/sentry/socket/netfilter/ipv4.go
 seam pkg/sentry/socket/netfilter/ipv6.go
 
+# Content seam: the DNAT revision 2 target reports its real size (80 bytes).
+seam pkg/sentry/socket/netfilter/dnat.go
+
 # Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno_xplat.go).
 seam pkg/syserr/syserr.go
 
