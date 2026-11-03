@@ -54,6 +54,9 @@ type execBlock struct {
 	state   blockState
 	priv    privPage
 	hasPriv bool
+	// entry is the record of the installed copy in the alias index. It is nil
+	// in data state and for a frame that has no host file.
+	entry *copyEntry
 	// sites maps the page offset of a patched instruction to its description.
 	sites map[uint16]siteInfo
 	// slots holds the island slots that this executable copy occupies.
@@ -92,8 +95,18 @@ type addressSpace struct {
 	islands  map[uint64]*island
 	reserved map[uint64]struct{}
 
+	// wviews lists the guest ranges that map frames of a host file with write
+	// permission, sorted by address. aliasProt holds the pages that the engine
+	// lowered to read-only because a copy of their frame exists. alias_windows.go
+	// explains both. They are guarded by mu.
+	wviews    []*writeView
+	aliasProt map[uint64]frameKey
+
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
+	// aliasFaults counts the write faults that dropped copies of a frame
+	// because another view wrote it.
+	aliasFaults atomic.Uint64
 }
 
 // stubView performs the window map calls on one stub process.
@@ -348,7 +361,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			as.blocks[base] = &execBlock{base: base, src: srcs[i], srcSec: sec, srcOff: secOff + uint64(i)*blockSize, at: at, state: blockData}
 		}
 	}
-	return nil
+	return as.aliasMappedLocked(guest, fr.Length(), sec, secOff, at, keep)
 }
 
 // mapErr reports a dead stub as such.
@@ -366,6 +379,9 @@ func (as *addressSpace) dropBlockLocked(base uint64) {
 		blk.slots = nil
 		if blk.hasPriv {
 			as.p.priv.release(blk.priv)
+		}
+		if blk.entry != nil {
+			as.p.alias.remove(blk.entry)
 		}
 		delete(as.blocks, base)
 	}
@@ -429,6 +445,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 		}
 	}
 	as.dropIslandsLocked(start, end)
+	as.aliasUnmappedLocked(start, end)
 }
 
 // Release implements platform.AddressSpace.Release.
@@ -458,6 +475,7 @@ func (as *addressSpace) Release() {
 		as.dropCopyLocked(base)
 	}
 	as.releaseIslandsLocked()
+	as.releaseAliasLocked()
 }
 
 // ----- lazy patching ------------------------------------------------------
@@ -469,7 +487,9 @@ func (as *addressSpace) patchBlock(ctx context.Context, mm platform.MemoryManage
 	as.patchMu.Lock()
 	defer as.patchMu.Unlock()
 	base := blockRound(addr)
-	for attempt := 0; attempt < 4; attempt++ {
+	// A write through another view of the frame poisons an attempt. The next
+	// attempt copies the new bytes, so a few more attempts cost little.
+	for range 16 {
 		err := as.patchBlockOnce(ctx, mm, base)
 		if !errors.Is(err, errPatchRaced) {
 			return err
@@ -520,6 +540,25 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	writable := blk.at.Write
 	readOnly := !writable && src != 0
 	as.mu.Unlock()
+
+	// Another view of the frame can write it while this thread builds the copy.
+	// The engine records the pending copy and lowers those views before it
+	// reads the frame, so a later write faults and poisons the entry.
+	var entry *copyEntry
+	if key, ok := blk.frameID(); ok {
+		entry = &copyEntry{as: as, base: base, key: key}
+		hits := as.p.alias.begin(entry)
+		defer func() {
+			if entry != nil {
+				as.p.alias.remove(entry)
+			}
+		}()
+		// A view that stays writable next to a copy can run stale code, so a
+		// failure stops the patch.
+		if err := lowerHits(hits, key); err != nil {
+			return err
+		}
+	}
 
 	// The guest can write the original frame while this copy runs when the
 	// block allows writes. The patched copy then holds a torn image, but the
@@ -575,6 +614,11 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		as.p.priv.release(pg)
 		return errPatchRaced
 	}
+	if entry != nil && !as.p.alias.install(entry) {
+		freeSlotRefsLocked(slots)
+		as.p.priv.release(pg)
+		return errPatchRaced
+	}
 	if err := as.win.Map(base, blockSize, &pg.chunk.ref, pg.off, viewReadExec); err != nil {
 		freeSlotRefsLocked(slots)
 		as.p.priv.release(pg)
@@ -584,25 +628,49 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		freeSlotRefsLocked(slots)
 		return err
 	}
+	delete(as.aliasProt, base)
 	blk.priv, blk.hasPriv = pg, true
 	blk.state = blockExec
 	blk.sites = sites
 	blk.slots = slots
+	blk.entry, entry = entry, nil
 	as.patchedBlocks.Add(1)
 	return nil
 }
 
 // restoreData maps the original frame of a block again, so that a guest write
 // to a writable and executable block succeeds. The next fetch maps a new copy.
+// The write can also change a frame that other blocks copy, so restoreData
+// drops those copies too.
 func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	as.mu.Lock()
-	defer as.mu.Unlock()
 	blk := as.blocks[base]
 	if as.released || blk == nil || blk.state != blockExec || !blk.at.Write {
+		as.mu.Unlock()
 		return false, nil
 	}
-	if err := as.win.Map(base, blockSize, blk.srcSec, blk.srcOff, viewProtFor(blk.at)); err != nil {
-		return false, as.mapErr(err)
+	key, aliased := blk.frameID()
+	err := as.returnToDataLocked(blk)
+	as.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	if aliased {
+		if err := as.p.alias.dropAll(key); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// returnToDataLocked maps the original frame of an exec block again and frees
+// its copy. The stub sees a view without execute permission before the copy
+// goes back to the pool, so a thread that runs the copy faults and copies the
+// block again instead of running freed memory. Callers hold as.mu and checked
+// that the block is in exec state.
+func (as *addressSpace) returnToDataLocked(blk *execBlock) error {
+	if err := as.win.Map(blk.base, blockSize, blk.srcSec, blk.srcOff, viewProtFor(blk.at)); err != nil {
+		return as.mapErr(err)
 	}
 	freeSlotRefsLocked(blk.slots)
 	blk.slots = nil
@@ -610,7 +678,14 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	blk.priv, blk.hasPriv = privPage{}, false
 	blk.state = blockData
 	blk.sites = nil
-	return true, nil
+	if blk.entry != nil {
+		as.p.alias.remove(blk.entry)
+		blk.entry = nil
+	}
+	if key, ok := blk.frameID(); ok && blk.at.Write {
+		return as.relowerLocked(blk.base, key)
+	}
+	return nil
 }
 
 // siteAt returns the description of the patched instruction at guest address

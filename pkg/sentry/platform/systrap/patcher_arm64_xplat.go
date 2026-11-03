@@ -25,14 +25,14 @@ import (
 
 // The arm64 patcher rewrites four instruction classes of a Linux guest.
 //
-// The macOS kernel runs a guest `svc #0` as a host system call and clobbers
-// TPIDR_EL0 on every preemption, so each of those instructions needs a
-// replacement. `svc #0` and `msr tpidr_el0, xN` become a branch to a trap slot
-// that spills the guest state to the Sentry. `mrs xN, tpidr_el0` becomes a
-// branch to a slot that reads the virtual TLS word of the thread. A Linux
-// kernel lets EL0 read CTR_EL0, and compilers and JIT engines read it to size
-// their cache maintenance loops. macOS raises SIGILL on that read, so
-// `mrs xN, ctr_el0` becomes a branch to a slot that loads a constant.
+// The host kernel runs a guest `svc #0` as a host system call, so the
+// instruction needs a replacement. `svc #0` becomes a branch to a trap slot
+// that spills the guest state to the Sentry. `msr tpidr_el0, xN` becomes a
+// trap, and `mrs xN, tpidr_el0` becomes a branch to a slot that reads the
+// virtual TLS word of the thread. A Linux kernel lets EL0 read CTR_EL0, and
+// compilers and JIT engines read it to size their cache maintenance loops. The
+// host raises an illegal instruction on that read, so `mrs xN, ctr_el0`
+// becomes a branch to a slot that loads a constant.
 const (
 	arm64SVC0       = hvcommon.SVC0
 	arm64MRSTPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
@@ -46,11 +46,12 @@ const (
 	arm64MRSTPIDRRO = 0xd53bd060 // mrs xN, tpidrro_el0
 	arm64ANDxMinus8 = 0x927df000 // and xN, xN, #0xfffffffffffffff8
 
-	// arm64ScratchReg is the hardware x18 register, which holds no guest value
-	// on macOS because scanX18 moves guest x18 accesses to sysmsg.X18.
+	// arm64ScratchReg is the register that the slots of encodeTrapSlot use to
+	// name the sysmsg.
 	arm64ScratchReg = 18
 
-	// trapScratchOffset is the byte offset of sysmsg.Scratch on macOS arm64.
+	// trapScratchOffset is the byte offset of sysmsg.Scratch in the sysmsg that
+	// encodeTrapSlot names.
 	trapScratchOffset = 928
 
 	// arm64BranchRange is the reach of a B instruction: plus or minus 128MiB.
@@ -69,10 +70,13 @@ const (
 	trapSlotLitOffset = 48
 
 	// ctrEL0Value is the CTR_EL0 value that the guest reads. It reports 64-byte
-	// instruction and data cache lines, the line size that Apple silicon reports.
-	// A guest uses the value only to step through cache maintenance by address,
-	// and a line size at or below the real one only costs extra iterations.
-	ctrEL0Value = hvcommon.DefaultCTREL0
+	// instruction and data cache lines, as hvcommon.DefaultCTREL0 does, and sets
+	// DIC and IDC (bits 29 and 28). A guest then skips `ic ivau` and `dc cvau`
+	// when it publishes code. The engine copies each executable page into a
+	// private page and flushes the instruction cache of the stub when it maps
+	// the copy, so the guest has no maintenance left to do. The shared constant
+	// keeps DIC and IDC clear, because hvf and whpx guests need the maintenance.
+	ctrEL0Value = 0xb444c004
 )
 
 // siteKind classifies a patched instruction.
@@ -173,6 +177,7 @@ func slotSizeFor(k siteKind) int {
 func encodeTrapSysmsgSlot(buf []byte, slotVA, retPC, spill uint64, save, restore []uint32) error {
 	tailOff := (len(save) + 3) * 4
 	litOff := (len(save) + 3 + len(restore) + 1) * 4
+	litOff = (litOff + 7) &^ 7
 	if len(buf) < litOff+8 {
 		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
 	}
@@ -305,7 +310,9 @@ func decodeARM64SysRegMRS(insn uint32) (rt uint8, val uint64, ok bool) {
 	if !ok {
 		return 0, 0, false
 	}
-	val, ok = hvcommon.DefaultIDRegisters().EmulateSysRegRead(iss)
+	ids := hvcommon.DefaultIDRegisters()
+	ids.CTR = ctrEL0Value
+	val, ok = ids.EmulateSysRegRead(iss)
 	if !ok {
 		return 0, 0, false
 	}

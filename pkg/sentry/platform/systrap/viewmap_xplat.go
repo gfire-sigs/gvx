@@ -415,6 +415,16 @@ func (g *guestWindows) Unmap(addr, size uint64) error {
 	return nil
 }
 
+// Protect changes the protection of [addr, addr+size). The range must lie in
+// one window, and every page of it must belong to a view.
+func (g *guestWindows) Protect(addr, size uint64, prot viewProt) error {
+	w := g.window(addr)
+	if w == nil {
+		return fmt.Errorf("window range %#x+%#x starts outside every window", addr, size)
+	}
+	return w.Protect(addr, size, prot)
+}
+
 // Lookup returns the view that covers addr, as windowMap.Lookup does. It
 // returns false for an address outside every window.
 func (g *guestWindows) Lookup(addr uint64) (viewInfo, uint64, bool) {

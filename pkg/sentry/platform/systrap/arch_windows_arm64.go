@@ -29,11 +29,13 @@ import (
 )
 
 // Windows runs a guest `svc #0` as an NT system call, and EL0 code cannot read
-// CTR_EL0 or run IC IVAU. The patcher replaces these instructions and the
-// writes of TPIDR_EL0 with BRK instructions. Windows reports a BRK with an
-// immediate that it does not know as an illegal instruction, so the Sentry
-// receives it through the debug object, finds the site in its table, and
-// emulates the instruction (docs/systrap-windows.md, 3.4 and 6.3).
+// CTR_EL0. The patcher replaces these instructions and the writes of TPIDR_EL0
+// with BRK instructions. Windows reports a BRK with an immediate that it does
+// not know as an illegal instruction, so the Sentry receives it through the
+// debug object, finds the site in its table, and emulates the instruction
+// (docs/systrap-windows.md, 3.4 and 6.3). The patcher replaces `ic ivau` and
+// the `dc` cache-clean instructions with NOP, because the engine flushes the
+// instruction cache when it maps a patched copy.
 //
 // Windows keeps TPIDR_EL0 and x18 of a thread across every stop and resume,
 // so the guest reads TPIDR_EL0 natively. CONTEXT has no field for TPIDR_EL0.
@@ -47,21 +49,13 @@ const (
 
 	brkSyscall = 0x5c0
 	brkCTR     = 0x5c1
-	brkICIVAU  = 0x5c2
 	brkSetTLS  = 0x5c3
 	brkMSRTLS  = 0x5c4
 	// brkMRSTLS replaces `mrs xN, tpidr_el0` when the fast path has no slot for
 	// it. 0x5c5 belongs to the cold resume of the fast path.
 	brkMRSTLS = 0x5c6
-	brkMOVX18 = 0x5c7
 
 	arm64ICIVAU = 0xd50b7520 // ic ivau, xN with N in bits 4:0.
-	arm64MOVX18 = 0xaa0003f2 // mov x18, xM (orr x18, xzr, xM) with M in bits 20:16.
-
-	// siteICIVAU is a guest `ic ivau, xN`.
-	siteICIVAU siteKind = 5
-	// siteMOVX18 is a guest `mov x18, xN`.
-	siteMOVX18 siteKind = 6
 )
 
 func brkWord(imm uint32) uint32 { return hvcommon.BRK(uint16(imm)) }
@@ -132,7 +126,6 @@ func (th *thread) archStart(ac *arch.Context64) error {
 	want := ac.StateData().Regs.TPIDR_EL0
 	if f := th.fast.Load(); f != nil {
 		f.slot.sm.TLS = want
-		f.slot.sm.X18 = ac.StateData().Regs.Regs[18]
 		want = f.slot.va
 	}
 	if th.tlsKnown && th.tls == want {
@@ -156,7 +149,6 @@ func archStatsLine() string { return "" }
 func (th *thread) pullArch(ac *arch.Context64) {
 	if f := th.fast.Load(); f != nil {
 		ac.StateData().Regs.TPIDR_EL0 = f.slot.sm.TLS
-		f.slot.sm.X18 = ac.StateData().Regs.Regs[18]
 		return
 	}
 	if th.tlsKnown {
@@ -174,7 +166,11 @@ func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) err
 
 // archEvent serves the traps of patched instructions.
 func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent) (outcome, bool) {
-	if ev.Code != statusIllegalInsn && ev.Code != statusBreakpoint {
+	switch ev.Code {
+	case statusAccessViol, statusInPageError, statusDatatypeMis:
+		return th.svcSlotFault(as, ac, ev)
+	case statusIllegalInsn, statusBreakpoint:
+	default:
 		return outcome{}, false
 	}
 	if th.isFastExit(ev) {
@@ -202,13 +198,6 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	case siteCTR:
 		if site.reg != 31 {
 			th.ctx.setReg(int(site.reg), ctrEL0Value)
-		}
-	case siteICIVAU:
-		// The instruction names a virtual address. FlushInstructionCache makes
-		// the instruction cache of every CPU coherent for the range.
-		if site.reg != 31 {
-			a := th.ctx.reg(int(site.reg))
-			_ = flushInstructionCache(th.sp.proc, uintptr(a&^63), 64)
 		}
 	case siteMSR:
 		var v uint64
@@ -239,18 +228,6 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		// A read of the guest thread pointer that no slot serves.
 		if f := th.fast.Load(); f != nil && site.reg != 31 {
 			th.ctx.setReg(int(site.reg), f.slot.sm.TLS)
-			if site.reg == 18 {
-				f.slot.sm.X18 = f.slot.sm.TLS
-			}
-		}
-	case siteMOVX18:
-		var v uint64
-		if site.reg != 31 {
-			v = th.ctx.reg(int(site.reg))
-		}
-		th.ctx.setReg(18, v)
-		if f := th.fast.Load(); f != nil {
-			f.slot.sm.X18 = v
 		}
 	default:
 		return outcome{}, false
@@ -260,6 +237,27 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		return fatal(err, unix.EFAULT), true
 	}
 	return running, true
+}
+
+// svcSlotFault serves an `svc #0` through the debug path when the first
+// instruction of its trampoline slot faults. That instruction stores the guest
+// x18 below the guest stack pointer, so it faults for an invalid or unaligned
+// stack pointer and for a stack that ends at an unmapped page. No register has
+// changed yet, and the guest continues behind the site as if the slot had run.
+func (th *thread) svcSlotFault(as *addressSpace, ac *arch.Context64, ev debugEvent) (outcome, bool) {
+	if th.fast.Load() == nil {
+		return outcome{}, false
+	}
+	slot, ok := as.slotStart(th.ctx.pc())
+	if !ok || slot.size != winSlotSize {
+		return outcome{}, false
+	}
+	th.ctx.setPC(winSiteReturn(slot.site))
+	if err := th.stopAndPull(ac, ev); err != nil {
+		return fatal(err, unix.EFAULT), true
+	}
+	ac.StateData().OrigR0 = ac.StateData().Regs.Regs[0]
+	return outcome{done: true}, true
 }
 
 // illegalSignal classifies an illegal-instruction exception. Windows reports
@@ -308,9 +306,10 @@ type siteInfo struct {
 // patchPage replaces the instructions that Windows cannot run with BRK or
 // NOP. page is a copy of the original frame. With the fast path, each `svc #0`
 // becomes a branch to a trampoline slot, and a site without a slot keeps the
-// BRK. A site is an aligned word with an exact pattern, so the data beside the
-// code of a JIT compiler rarely holds one, and the patcher ignores writable.
-// The code of a JIT compiler can read TPIDR_EL0, which the fast path moves.
+// BRK. The patcher scans every executable page, writable or not, because an
+// aligned word has no marker that tells code from data. A data word that
+// equals one of the 289 patched encodings changes in the copy that the guest
+// reads. A word matches with a probability of 289 in 2^32 for uniform data.
 func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool) (map[uint16]siteInfo, []winSlotRef, error) {
 	sites := make(map[uint16]siteInfo)
 	var slots []winSlotRef
@@ -352,52 +351,13 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		sites[uint16(s.Offset)] = siteInfo{kind: s.Kind, reg: s.Reg}
 	}
 	for off := 0; off+4 <= len(page); off += 4 {
-		w := binary.LittleEndian.Uint32(page[off:])
-		switch {
-		case as.p.fast && w&0xffe0ffff == arm64MOVX18:
-			rm := uint8((w >> 16) & arm64RegMask)
-			if rm == 18 {
-				continue
-			}
-			if word, ref, ok := as.fastX18SetBranch(ctx, mm, base+uint64(off), rm); ok {
-				binary.LittleEndian.PutUint32(page[off:], word)
-				slots = append(slots, ref)
-				continue
-			}
-			binary.LittleEndian.PutUint32(page[off:], brkWord(brkMOVX18))
-			sites[uint16(off)] = siteInfo{kind: siteMOVX18, reg: rm}
-		case w&^arm64RegMask == arm64ICIVAU:
-			binary.LittleEndian.PutUint32(page[off:], brkWord(brkICIVAU))
-			sites[uint16(off)] = siteInfo{kind: siteICIVAU, reg: uint8(w & arm64RegMask)}
-		case isDataCacheMaintenance(w):
-			// No stop is needed: the operation has no effect to emulate.
+		// The engine flushes the instruction cache when it maps the copy, and
+		// the guest memory is coherent, so no stop is needed for these.
+		if w := binary.LittleEndian.Uint32(page[off:]); isDataCacheMaintenance(w) || w&^arm64RegMask == arm64ICIVAU {
 			binary.LittleEndian.PutUint32(page[off:], arm64NOP)
 		}
 	}
 	return sites, slots, nil
-}
-
-// fastX18SetBranch allocates a slot for the `mov x18, xN` at site and returns
-// the branch that replaces the instruction.
-func (as *addressSpace) fastX18SetBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, winSlotRef, bool) {
-	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winTLSSlotSize), func(buf []byte, slotVA uint64) error {
-		return encodeWinX18SetSlot(buf, slotVA, site, reg)
-	})
-	var word uint32
-	if err == nil {
-		if word, err = encodeBranch(site, slotVA); err != nil {
-			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
-			as.mu.Unlock()
-		}
-	}
-	if err != nil {
-		if traceEvents {
-			tracef("no trampoline slot for the mov x18 at %#x: %v", site, err)
-		}
-		return 0, winSlotRef{}, false
-	}
-	return word, ref, true
 }
 
 // fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and

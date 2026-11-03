@@ -10,6 +10,10 @@ This section records changes that no release contains yet.
 
 - **Directory link count on Windows `hostfs`**: `stat` of a directory reported 2 links on NTFS for every directory. It now reports 2 plus the number of subdirectories, as Linux does. Tools such as `find` use that count.
 - **Large `truncate` on Windows `hostfs`**: a growth above the free disk space failed with `ENOSPC`, and a size above the NTFS file limit failed with `EIO`. The growth now leaves a hole, as on Linux, and the size above the limit fails with `EFBIG`.
+- **Windows `systrap` engine errata** (`windows/amd64` and `windows/arm64`): three defects of the engine are fixed.
+  - A guest that wrote code through one view of a memory file and ran it through another view kept running the old code. A write through a second view of a frame now drops the patched copies of that frame in every address space. A frame without a patched copy costs no extra fault.
+  - On `windows/arm64`, a fast `svc` overwrote a live `x18` of the guest with a stale value, unless the guest set `x18` with `mov x18, xN`. The `svc` slot now saves `x18` first, so every `svc` keeps it. A guest whose stack pointer is invalid still gets its system call through the debug path. The patcher no longer rewrites `mov x18, xN`, which leaves 289 rewritten encodings instead of 320.
+  - On `windows/arm64`, every `ic ivau` of a guest cost one debug stop. The engine now replaces the instruction with `nop`, and `CTR_EL0` reports `DIC` and `IDC` for the guest. Guests that obey these bits, such as V8, skip the instruction.
 
 ## [v0.6.10002026110200] - 2026-11-03
 

@@ -287,8 +287,8 @@ func TestFastPathIslandSlotsReclaimedOnRepatchAndUnmap(t *testing.T) {
 	si, _, err := r.run()
 	mustSyscall(t, si, err, 11, r.ac)
 
-	// Each patch of dataVA allocates 16 slots (1024 bytes on amd64, 768 bytes
-	// on arm64). Eight repatches exceed one 4KB island unless restoreData
+	// Each patch of dataVA allocates 16 slots of 64 bytes, 1024 bytes in all.
+	// Eight repatches exceed one 4KB island unless restoreData
 	// reclaims the block's slots.
 	const rounds = 8
 	for i := 0; i < rounds; i++ {
@@ -635,4 +635,20 @@ func TestKickDuringColdResumeInterruptsTheGuest(t *testing.T) {
 		}
 	}
 	t.Fatal("the guest did not stop after 200 kicks")
+}
+
+// TestFastPathLeavesGuestFaultsAsSegv runs a fast system call and then a load
+// from an unmapped address. The engine repairs only the faults that its own page
+// state caused, so the guest must still get SIGSEGV.
+func TestFastPathLeavesGuestFaultsAsSegv(t *testing.T) {
+	const bad = 0x7000_0123_0000
+	r := newRig(t, newFastPlatform(t))
+	r.program(gSyscall(1), gLoadFrom(bad), gSyscall(2))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	si, at, err := r.run()
+	wantSignal(t, si, err, linux.SIGSEGV)
+	if si.Code != segvMapErr || si.Addr() != bad || at != hostarch.Read {
+		t.Errorf("fault = code %d addr %#x access %v, want code %d addr %#x access %v", si.Code, si.Addr(), at, segvMapErr, uint64(bad), hostarch.Read)
+	}
 }

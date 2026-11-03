@@ -44,6 +44,9 @@ const secCommit = 0x08000000
 // sectionRef is a section object that a stub window can map.
 type sectionRef struct {
 	h windows.Handle
+	// file identifies the host file of the section, or is zero for an
+	// anonymous section. Two sections of one file map the same frames.
+	file uintptr
 	// size is the size of the section in bytes.
 	size uint64
 	// readOnly is true for a section of a file that the Sentry opened without
@@ -98,7 +101,7 @@ func (c *sectionCache) get(file windows.Handle, end uint64, write bool) (*sectio
 			return nil, fmt.Errorf("CreateFileMapping of the file: %w", err)
 		}
 	}
-	ref := &sectionRef{h: h, size: size, readOnly: readOnly}
+	ref := &sectionRef{h: h, file: uintptr(file), size: size, readOnly: readOnly}
 	if c.files == nil {
 		c.files = make(map[windows.Handle]*sectionRef)
 	}

@@ -358,7 +358,7 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 			return false, err
 		}
 		return false, fmt.Errorf("system register %q", args[0])
-	case "LDR", "LDAR":
+	case "LDR", "LDAR", "LDUR":
 		if err := need(2); err != nil {
 			return false, err
 		}
@@ -382,7 +382,7 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 			n = 8
 		}
 		return false, m.setReg(args[0], m.read(addr, n))
-	case "STR", "STLR":
+	case "STR", "STLR", "STUR":
 		if err := need(2); err != nil {
 			return false, err
 		}
