@@ -70,10 +70,13 @@ const (
 	trapSlotLitOffset = 48
 
 	// ctrEL0Value is the CTR_EL0 value that the guest reads. It reports 64-byte
-	// instruction and data cache lines, the line size that Apple silicon reports.
-	// A guest uses the value only to step through cache maintenance by address,
-	// and a line size at or below the real one only costs extra iterations.
-	ctrEL0Value = hvcommon.DefaultCTREL0
+	// instruction and data cache lines, as hvcommon.DefaultCTREL0 does, and sets
+	// DIC and IDC (bits 29 and 28). A guest then skips `ic ivau` and `dc cvau`
+	// when it publishes code. The engine copies each executable page into a
+	// private page and flushes the instruction cache of the stub when it maps
+	// the copy, so the guest has no maintenance left to do. The shared constant
+	// keeps DIC and IDC clear, because hvf and whpx guests need the maintenance.
+	ctrEL0Value = 0xb444c004
 )
 
 // siteKind classifies a patched instruction.
@@ -306,7 +309,9 @@ func decodeARM64SysRegMRS(insn uint32) (rt uint8, val uint64, ok bool) {
 	if !ok {
 		return 0, 0, false
 	}
-	val, ok = hvcommon.DefaultIDRegisters().EmulateSysRegRead(iss)
+	ids := hvcommon.DefaultIDRegisters()
+	ids.CTR = ctrEL0Value
+	val, ok = ids.EmulateSysRegRead(iss)
 	if !ok {
 		return 0, 0, false
 	}

@@ -43,3 +43,21 @@ func TestDataCacheMaintenanceRuns(t *testing.T) {
 		t.Errorf("data = %#x, want 0x0102030405060708", got)
 	}
 }
+
+// TestCacheTypeRegisterNeedsNoMaintenance reads CTR_EL0 in the guest. The
+// engine flushes the instruction cache when it maps a patched copy, so the
+// register reports that a guest needs neither `dc cvau` nor `ic ivau`.
+func TestCacheTypeRegisterNeedsNoMaintenance(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	r.program(gReadCacheType(), gSyscall(93))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 93, r.ac)
+	got := regRet(r.ac)
+	const dic, idc = 1 << 29, 1 << 28
+	if got&dic == 0 || got&idc == 0 {
+		t.Errorf("CTR_EL0 = %#x, want DIC and IDC set", got)
+	}
+	if line := 4 << (got & 0xf); line != 64 {
+		t.Errorf("CTR_EL0 = %#x reports an instruction line of %d bytes, want 64", got, line)
+	}
+}

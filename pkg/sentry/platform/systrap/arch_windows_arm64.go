@@ -29,11 +29,13 @@ import (
 )
 
 // Windows runs a guest `svc #0` as an NT system call, and EL0 code cannot read
-// CTR_EL0 or run IC IVAU. The patcher replaces these instructions and the
-// writes of TPIDR_EL0 with BRK instructions. Windows reports a BRK with an
-// immediate that it does not know as an illegal instruction, so the Sentry
-// receives it through the debug object, finds the site in its table, and
-// emulates the instruction (docs/systrap-windows.md, 3.4 and 6.3).
+// CTR_EL0. The patcher replaces these instructions and the writes of TPIDR_EL0
+// with BRK instructions. Windows reports a BRK with an immediate that it does
+// not know as an illegal instruction, so the Sentry receives it through the
+// debug object, finds the site in its table, and emulates the instruction
+// (docs/systrap-windows.md, 3.4 and 6.3). The patcher replaces `ic ivau` and
+// the `dc` cache-clean instructions with NOP, because the engine flushes the
+// instruction cache when it maps a patched copy.
 //
 // Windows keeps TPIDR_EL0 and x18 of a thread across every stop and resume,
 // so the guest reads TPIDR_EL0 natively. CONTEXT has no field for TPIDR_EL0.
@@ -47,7 +49,6 @@ const (
 
 	brkSyscall = 0x5c0
 	brkCTR     = 0x5c1
-	brkICIVAU  = 0x5c2
 	brkSetTLS  = 0x5c3
 	brkMSRTLS  = 0x5c4
 	// brkMRSTLS replaces `mrs xN, tpidr_el0` when the fast path has no slot for
@@ -58,8 +59,6 @@ const (
 	arm64ICIVAU = 0xd50b7520 // ic ivau, xN with N in bits 4:0.
 	arm64MOVX18 = 0xaa0003f2 // mov x18, xM (orr x18, xzr, xM) with M in bits 20:16.
 
-	// siteICIVAU is a guest `ic ivau, xN`.
-	siteICIVAU siteKind = 5
 	// siteMOVX18 is a guest `mov x18, xN`.
 	siteMOVX18 siteKind = 6
 )
@@ -202,13 +201,6 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	case siteCTR:
 		if site.reg != 31 {
 			th.ctx.setReg(int(site.reg), ctrEL0Value)
-		}
-	case siteICIVAU:
-		// The instruction names a virtual address. FlushInstructionCache makes
-		// the instruction cache of every CPU coherent for the range.
-		if site.reg != 31 {
-			a := th.ctx.reg(int(site.reg))
-			_ = flushInstructionCache(th.sp.proc, uintptr(a&^63), 64)
 		}
 	case siteMSR:
 		var v uint64
@@ -366,11 +358,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			}
 			binary.LittleEndian.PutUint32(page[off:], brkWord(brkMOVX18))
 			sites[uint16(off)] = siteInfo{kind: siteMOVX18, reg: rm}
-		case w&^arm64RegMask == arm64ICIVAU:
-			binary.LittleEndian.PutUint32(page[off:], brkWord(brkICIVAU))
-			sites[uint16(off)] = siteInfo{kind: siteICIVAU, reg: uint8(w & arm64RegMask)}
-		case isDataCacheMaintenance(w):
-			// No stop is needed: the operation has no effect to emulate.
+		case w&^arm64RegMask == arm64ICIVAU, isDataCacheMaintenance(w):
+			// The engine flushes the instruction cache when it maps the copy, and
+			// the guest memory is coherent, so no stop is needed for these.
 			binary.LittleEndian.PutUint32(page[off:], arm64NOP)
 		}
 	}
