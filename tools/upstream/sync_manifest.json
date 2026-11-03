@@ -1,8 +1,8 @@
 {
-  "go_branch_sha": "90a2f3f7b8d16016a7b0219d4c9b74f2610094f2",
-  "release_tag": "release-20261026.0",
-  "release_tag_sha": "e8a2a28891ba41f3fb737dee8bb7120745d75826",
-  "extracted_files": 2520,
+  "go_branch_sha": "1cea747efe8d81d69ec1fb06199d7f166b82912e",
+  "release_tag": "release-20261102.0",
+  "release_tag_sha": "7a675ac66a1e2357abdaa6cccedabcd3cce9aa5c",
+  "extracted_files": 2539,
   "protected_skips": 5,
   "excluded_skips": 1,
   "dest_dir": "."

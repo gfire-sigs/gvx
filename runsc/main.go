@@ -19,6 +19,7 @@ package main
 
 import (
 	"z.gfire.dev/gvx/runsc/cli/maincli"
+	_ "z.gfire.dev/gvx/runsc/coretagprime" // Runs at init, before flag parsing.
 	"z.gfire.dev/gvx/runsc/version"
 )
 

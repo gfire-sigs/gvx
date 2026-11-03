@@ -46,6 +46,7 @@ type Checkpoint struct {
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
 	splitFSCheckpointPaths    pathVar
+	stateEngine               optionalStateEnginePolicy
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -75,7 +76,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.imagePath, "image-path", "", "directory path to saved container image")
 	f.BoolVar(&c.leaveRunning, "leave-running", false, "restart the container after checkpointing")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
-	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
+	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", true, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
@@ -84,6 +85,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	// Must match the default prefix applied by sandbox.Sandbox.Checkpoint.
 	c.splitFSCheckpointPaths.defaultPrefix = checkpointfiles.FSCheckpointDir
 	f.Var(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", `[<prefix>=][<container>:]<path> target to include in the filesystem checkpoint (can be repeated). <prefix> defaults to "fs". The files are written to --image-path as <prefix>_*, or into a <prefix>/ subdirectory if <prefix> ends with "/". Paths containing "=" require an explicit prefix. For capturing all of tmpfs, the path should be "all-tmpfs".`)
+	f.Var(&c.stateEngine, "state-engine", "override the sandbox's boot-time state serialization engine for this checkpoint. Values: wire|graph.")
 
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
@@ -132,6 +134,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,
 		SplitFSCheckpointPaths:     c.splitFSCheckpointPaths.targets,
+		StateEngine:                c.stateEngine.ptr(),
 	}
 
 	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {
@@ -176,4 +179,42 @@ func (g CheckpointCompression) String() string {
 // Level returns corresponding statefile.CompressionLevel value.
 func (g CheckpointCompression) Level() statefile.CompressionLevel {
 	return statefile.CompressionLevel(g)
+}
+
+type optionalStateEnginePolicy struct {
+	set   bool
+	value config.StateEnginePolicy
+}
+
+// String implements flag.Value.
+func (o *optionalStateEnginePolicy) String() string {
+	if !o.set {
+		return ""
+	}
+	return o.value.String()
+}
+
+// Set implements flag.Value.
+func (o *optionalStateEnginePolicy) Set(v string) error {
+	if err := o.value.Set(v); err != nil {
+		return err
+	}
+	o.set = true
+	return nil
+}
+
+// Get implements flag.Getter.
+func (o *optionalStateEnginePolicy) Get() any {
+	if !o.set {
+		return nil
+	}
+	return o.value
+}
+
+func (o *optionalStateEnginePolicy) ptr() *config.StateEnginePolicy {
+	if !o.set {
+		return nil
+	}
+	v := o.value
+	return &v
 }

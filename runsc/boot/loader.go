@@ -23,6 +23,7 @@ import (
 	"maps"
 	"os"
 	"runtime"
+	runtimedebug "runtime/debug"
 	"strconv"
 	"strings"
 	gtime "time"
@@ -30,7 +31,9 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"z.gfire.dev/gvx/internal/xsys/unix"
+
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/coverage"
@@ -81,6 +84,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sentry/watchdog"
 	"z.gfire.dev/gvx/pkg/sighandling"
+	pkgstate "z.gfire.dev/gvx/pkg/state"
 	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/link/ethernet"
@@ -228,6 +232,11 @@ type Loader struct {
 	// PreSeccompCallback is called right before installing seccomp filters.
 	PreSeccompCallback func()
 
+	// PostStartCallback, if set, is called once Run has successfully started
+	// the sandbox, right before the result is reported to the controller (and
+	// thus before `runsc start` returns).
+	PostStartCallback func()
+
 	// restoreDone is used to wait for restore to complete. Note that this may be
 	// much after the sandbox has started because under some configurations, the
 	// restore is allowed to proceed in the background while the sandbox runs.
@@ -255,7 +264,18 @@ type Loader struct {
 	cpuQuota  int64
 	cpuPeriod int64
 
+	// lifecycleCPUs are the CPUs that checkpoint and restore can use.
+	lifecycleCPUs lifecycleCPUs
+
 	hostTHP HostTHP
+
+	// startupHeapReleasePending is true while a goroutine waits to return
+	// the free Sentry heap memory to the host. See
+	// Loader.releaseStartupHeapWhenIdle.
+	startupHeapReleasePending atomicbitops.Bool
+
+	// freeOSMemory is runtimedebug.FreeOSMemory, replaced in tests.
+	freeOSMemory func()
 
 	// saveMu serializes save operations. Saves can be requested concurrently:
 	// autosave in save-resume mode is triggered by any task executing the
@@ -498,6 +518,9 @@ type Args struct {
 	GoferMountConfs []specutils.GoferMountConf
 	// NumCPU is the number of CPUs to create inside the sandbox.
 	NumCPU int
+	// LifecycleNumCPU is the number of CPUs that the sandbox can use during
+	// checkpoint and restore. `NumCPU` takes precedence if larger.
+	LifecycleNumCPU int
 	// CPUQuota and CPUPeriod are the raw host CFS settings that should be
 	// reflected by sandbox cgroupfs.
 	CPUQuota  int64
@@ -641,10 +664,7 @@ func New(args Args) (*Loader, error) {
 		stopProfilingRuntime()
 		metric.StopProfilingMetrics()
 	}
-
-	// Initialize seccheck points.
-	seccheck.Initialize()
-	args.StartupTimer.Reached("seccheck initialized")
+	pkgstate.EnableGraphEngine(args.Conf.StateEngine == config.StateEngineGraph)
 
 	// We initialize the rand package now to make sure /dev/urandom is pre-opened
 	// on kernels that do not support getrandom(2).
@@ -682,7 +702,8 @@ func New(args Args) (*Loader, error) {
 
 	eid := execID{cid: args.ID}
 	l := &Loader{
-		sandboxID: args.ID,
+		sandboxID:    args.ID,
+		freeOSMemory: runtimedebug.FreeOSMemory,
 		noRootContainer: noRootContainer{
 			enabled: args.NoRootContainer,
 			exit:    make(chan struct{}),
@@ -709,8 +730,12 @@ func New(args Args) (*Loader, error) {
 	if args.NumCPU == 0 {
 		args.NumCPU = runtime.NumCPU()
 	}
-	log.Infof("CPUs: %d", args.NumCPU)
 	gomaxprocs.SetBase(args.NumCPU)
+	l.lifecycleCPUs.init(args.LifecycleNumCPU, args.NumCPU)
+	log.Infof("CPUs: %d, lifecycle CPUs: %d", args.NumCPU, l.lifecycleCPUs.num)
+	if len(args.FSRestoreFDs) != 0 || args.RootfsUpperTarFD >= 0 {
+		l.lifecycleCPUs.holdForRestore()
+	}
 	args.StartupTimer.Reached("GOMAXPROCS set")
 
 	// Start filesystem checkpoint restore as soon as possible to maximize
@@ -1022,14 +1047,14 @@ func New(args Args) (*Loader, error) {
 	}
 	l.ctrl = ctrl
 
-	// Only start serving after Loader is set to controller and controller is set
-	// to Loader, because they are both used in the urpc methods.
-	if err := ctrl.srv.StartServing(); err != nil {
-		return nil, fmt.Errorf("starting control server: %w", err)
-	}
-	args.StartupTimer.Reached("control server started")
-
 	return l, nil
+}
+
+// StartControlServer starts serving control RPCs, including those that might
+// have been backlogged while the sandbox was booting.
+func (l *Loader) StartControlServer() {
+	l.ctrl.srv.StartServing()
+	l.startupTimer.Reached("control server started")
 }
 
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.
@@ -1348,6 +1373,9 @@ func (l *Loader) installSeccompFilters() error {
 // +checklocksexclude:l.mu
 func (l *Loader) Run() error {
 	err := l.run()
+	if err == nil && l.PostStartCallback != nil {
+		l.PostStartCallback()
+	}
 	l.ctrl.manager.startResultChan <- err
 	if err != nil {
 		// Give the controller some time to send the error to the
@@ -1358,6 +1386,25 @@ func (l *Loader) Run() error {
 		return err
 	}
 	return nil
+}
+
+// startupHeapReleaseIdleDelay is how long the application must stay idle
+// before the Sentry returns its free startup heap memory to the host.
+const startupHeapReleaseIdleDelay = 250 * gtime.Millisecond
+
+// releaseStartupHeapWhenIdle returns the free Sentry heap memory to the host
+// when the application is next idle for startupHeapReleaseIdleDelay. If a
+// release is already pending, it does nothing.
+func (l *Loader) releaseStartupHeapWhenIdle() {
+	if !l.startupHeapReleasePending.CompareAndSwap(false, true) {
+		return
+	}
+	k := l.k
+	go func() {
+		k.WaitForIdle(startupHeapReleaseIdleDelay)
+		l.startupHeapReleasePending.Store(false)
+		l.freeOSMemory()
+	}()
 }
 
 // +checklocksexclude:l.mu
@@ -1510,7 +1557,10 @@ func (l *Loader) run() error {
 	switch l.state {
 	case created:
 		l.state = started
+		l.releaseStartupHeapWhenIdle()
 	case restoringUnstarted:
+		// A restored sandbox releases its startup heap once the restore is
+		// complete, in containerManager.onRestoreDone.
 		l.state = restoringStarted
 	default:
 		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", l.state))
@@ -1578,6 +1628,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 				if l.noRootContainer.enabled && eid.cid == l.sandboxID {
 					log.Debugf("Joining sandbox PID namespace named %q", ns.Path)
 					pidns = l.k.RootPIDNamespace()
+					pidns.IncRef()
 					break
 				}
 			}

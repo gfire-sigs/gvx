@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sentry/watchdog"
 	"z.gfire.dev/gvx/pkg/state/statefile"
 )
@@ -81,9 +82,18 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool
 
+	// ValidateMetadata indicates whether filesystem implementations backed by
+	// remote filesystems should refresh metadata during save so that restore
+	// can validate file sizes and/or modification timestamps.
+	ValidateMetadata bool
+
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts
+
+	// GraphEngine, when non-nil, overrides the process-wide state engine for
+	// this save operation.
+	GraphEngine *bool
 }
 
 // Close releases resources owned by opts.
@@ -167,7 +177,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
+		vfsOpts := vfs.PrepareSaveOptions{
+			ValidateMetadata: opts.ValidateMetadata,
+		}
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume, opts.FSSaveOpts, vfsOpts, opts.GraphEngine) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile, opts.FSSaveOpts
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil

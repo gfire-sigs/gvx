@@ -43,6 +43,8 @@ import (
 //
 // +stateify savable
 type specialFileFD struct {
+	memmap.MappableNoHugepages
+
 	fileDescription
 	specialFDEntry
 

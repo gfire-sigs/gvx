@@ -17,7 +17,9 @@ package pretty
 
 import (
 	"fmt"
+	"html"
 	"io"
+	"math"
 	"reflect"
 	"strings"
 
@@ -28,6 +30,13 @@ import (
 type printer struct {
 	html      bool
 	typeSpecs map[string]*wire.Type
+}
+
+func (p *printer) escape(s string) string {
+	if p.html {
+		return html.EscapeString(s)
+	}
+	return s
 }
 
 func (p *printer) formatRef(x *wire.Ref, graph uint64) string {
@@ -46,7 +55,7 @@ func (p *printer) formatRef(x *wire.Ref, graph uint64) string {
 			switch v := component.(type) {
 			case *wire.FieldName:
 				buf.WriteString(".")
-				buf.WriteString(string(*v))
+				buf.WriteString(p.escape(string(*v)))
 			case wire.Index:
 				fmt.Fprintf(&buf, "[%d]", v)
 			default:
@@ -67,7 +76,7 @@ func (p *printer) formatType(t wire.TypeSpec, graph uint64) (string, bool) {
 		tag := fmt.Sprintf("g%dt%d", graph, x)
 		desc := tag
 		if spec, ok := p.typeSpecs[tag]; ok {
-			desc += fmt.Sprintf("=%s", spec.Name)
+			desc += fmt.Sprintf("=%s", p.escape(spec.Name))
 		} else {
 			desc += "!missing-type-spec"
 		}
@@ -102,7 +111,7 @@ func (p *printer) format(graph uint64, depth int, encoded wire.Object) (string, 
 	case wire.Nil:
 		return "nil", false
 	case *wire.String:
-		return fmt.Sprintf("%q", *x), *x != ""
+		return p.escape(fmt.Sprintf("%q", *x)), *x != ""
 	case *wire.Complex64:
 		return fmt.Sprintf("%f+%fi", real(*x), imag(*x)), *x != 0.0
 	case *wire.Complex128:
@@ -112,9 +121,9 @@ func (p *printer) format(graph uint64, depth int, encoded wire.Object) (string, 
 	case *wire.Type:
 		tabs := "\n" + strings.Repeat("\t", depth)
 		items := make([]string, 0, len(x.Fields)+2)
-		items = append(items, fmt.Sprintf("type %s {", x.Name))
+		items = append(items, fmt.Sprintf("type %s {", p.escape(x.Name)))
 		for i := 0; i < len(x.Fields); i++ {
-			items = append(items, fmt.Sprintf("\t%d: %s,", i, x.Fields[i]))
+			items = append(items, fmt.Sprintf("\t%d: %s,", i, p.escape(x.Fields[i])))
 		}
 		items = append(items, "}")
 		return strings.Join(items, tabs), true // No zero value.
@@ -159,7 +168,7 @@ func (p *printer) format(graph uint64, depth int, encoded wire.Object) (string, 
 		for i := 0; i < x.Fields(); i++ {
 			var name string
 			if spec != nil && i < len(spec.Fields) {
-				name = spec.Fields[i]
+				name = p.escape(spec.Fields[i])
 			} else {
 				name = fmt.Sprintf("%d", i)
 			}
@@ -189,7 +198,7 @@ func (p *printer) format(graph uint64, depth int, encoded wire.Object) (string, 
 		return fmt.Sprintf("interface[%s]{%s}", typ, element), typOk || elementOk
 	default:
 		// Must be a primitive; use reflection.
-		return fmt.Sprintf("%v", encoded), true
+		return p.escape(fmt.Sprintf("%v", encoded)), true
 	}
 }
 
@@ -219,22 +228,44 @@ func (p *printer) printStream(w io.Writer, r io.Reader) (err error) {
 
 	for {
 		// Find the first object to begin generation.
-		length, object, err := state.ReadHeader(&wr)
+		hdr, err := state.ReadHeaderMode(&wr)
 		if err == io.EOF {
 			// Nothing else to do.
 			break
 		} else if err != nil {
 			return err
 		}
-		if !object {
+		if !hdr.Object {
 			graph++ // Increment the graph.
-			if length > 0 {
-				fmt.Fprintf(w, "(%d bytes non-object data)\n", length)
-				io.Copy(io.Discard, &io.LimitedReader{
+			if hdr.Length > 0 {
+				if _, err := fmt.Fprintf(w, "(%d bytes non-object data)\n", hdr.Length); err != nil {
+					return err
+				}
+				limit := int64(math.MaxInt64)
+				if hdr.Length < math.MaxInt64 {
+					limit = int64(hdr.Length)
+				}
+				if _, err := io.Copy(io.Discard, &io.LimitedReader{
 					R: r,
-					N: int64(length),
-				})
+					N: limit,
+				}); err != nil {
+					return err
+				}
 			}
+			continue
+		}
+		if hdr.Graph {
+			if hdr.Length > 4<<30 {
+				return fmt.Errorf("invalid object graph length %d", hdr.Length)
+			}
+			data := make([]byte, hdr.Length)
+			if _, err := io.ReadFull(r, data); err != nil {
+				return err
+			}
+			if err := state.PrintGraph(w, data, graph, p.html); err != nil {
+				return err
+			}
+			graph++
 			continue
 		}
 
@@ -251,7 +282,7 @@ func (p *printer) printStream(w io.Writer, r io.Reader) (err error) {
 			tid     uint64 = 1
 			objects []objectAndID
 		)
-		for i := uint64(0); i < length; {
+		for i := uint64(0); i < hdr.Length; {
 			// Unmarshal either a type object or object ID.
 			encoded := wire.Load(&wr)
 			switch we := encoded.(type) {

@@ -87,8 +87,8 @@ linux-only pkg/sentry/hostcpu/hostcpu.go
 linux-only pkg/sentry/hostcpu/getcpu_amd64.s
 linux-only pkg/sentry/hostcpu/getcpu_arm64.s
 linux-only pkg/sentry/time/vdso.go
-linux-only pkg/sentry/time/vdso_amd64.s
-linux-only pkg/sentry/time/vdso_arm64.s
+linux-only pkg/sentry/time/vdso_asm_impl_amd64.s
+linux-only pkg/sentry/time/vdso_asm_impl_arm64.s
 linux-only pkg/sentry/platform/mmap_min_addr.go
 linux-only pkg/rawfile/blockingpoll_amd64.s
 linux-only pkg/rawfile/blockingpoll_arm64.s

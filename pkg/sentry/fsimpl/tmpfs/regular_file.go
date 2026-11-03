@@ -375,9 +375,18 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		}
 		fillRange = required
 	}
+	// The first access to any page of a huge page commits all of it, so when
+	// the fill is whole huge pages that each contain part of required, the
+	// application commits every page of the fill as soon as it touches it.
+	// Existing pages in the range make Fill() allocate small pages instead.
+	allocMode := pgalloc.AllocateUncommitted
+	if mayHuge && hostarch.IsHugePageAligned(fillRange.Start) && hostarch.IsHugePageAligned(fillRange.End) && pagesToFill<<hostarch.PageShift == fillRange.Length() {
+		allocMode = pgalloc.AllocateCallerIndirectCommit
+	}
 	pagesAlloced, cerr := rf.data.Fill(ctx, required, fillRange, rf.size.RacyLoad(), rf.inode.fs.mf, pgalloc.AllocOpts{
 		Kind:    rf.memoryUsageKind,
 		MemCgID: memCgID,
+		Mode:    allocMode,
 		Huge:    mayHuge,
 	}, nil)
 	// rf.data.Fill() may fail mid-way. We still want to account any pages that
@@ -439,6 +448,11 @@ func maxOptionalRange(required, optional memmap.MappableRange, maxBytes uint64) 
 	}
 	optional.End = optional.Start + maxBytes
 	return optional
+}
+
+// MayUseHugepages implements memmap.Mappable.MayUseHugepages.
+func (rf *regularFile) MayUseHugepages() bool {
+	return rf.huge && rf.inode.fs.mf.HugepagesEnabled()
 }
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.

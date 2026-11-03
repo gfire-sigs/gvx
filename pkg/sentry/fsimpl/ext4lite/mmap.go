@@ -56,6 +56,7 @@ func (c *fileData) ChunkMemory() chunkcache.ChunkMemory { return c.ino.fs.vol.ch
 func (c *fileData) FileSizeLocked() uint64              { return c.fileSize() }
 func (c *fileData) TranslateError(err error) error      { return toLinuxErr(err) }
 func (c *fileData) DropBackendLocked()                  {}
+func (c *fileData) MayUseHugepages() bool               { return false }
 
 func (c *fileData) CanTranslateLocked(_ bool) error {
 	if c.Chunks == nil {

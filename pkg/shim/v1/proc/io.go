@@ -40,7 +40,7 @@ var bufPool = sync.Pool{
 	},
 }
 
-func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, wg *sync.WaitGroup) error {
+func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, wg *sync.WaitGroup, closers *[]io.Closer) error {
 	var sameFile *countingWriteCloser
 	for _, i := range []struct {
 		name string
@@ -113,6 +113,10 @@ func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, w
 				}
 			}
 		}
+		*closers = append(*closers, fw)
+		if fr != nil {
+			*closers = append(*closers, fr)
+		}
 		i.dest(fw, fr)
 	}
 	if stdin == "" {
@@ -122,6 +126,7 @@ func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, w
 	if err != nil {
 		return fmt.Errorf("gvisor-containerd-shim: opening %s failed: %s", stdin, err)
 	}
+	*closers = append(*closers, f)
 	go func() {
 		p := bufPool.Get().(*[]byte)
 		defer bufPool.Put(p)

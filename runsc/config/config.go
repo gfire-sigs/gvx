@@ -121,6 +121,10 @@ type Config struct {
 	// mounts (the rootfs and bind mounts) are handled.
 	CharacterDevicePolicy CharacterDevicePolicy `flag:"character-device-policy"`
 
+	// InodeNumbers controls how inode numbers of files on gofer mounts are
+	// assigned.
+	InodeNumbers InodeNumbers `flag:"inode-numbers"`
+
 	// HostSettings controls how host settings are handled.
 	HostSettings HostSettingsPolicy `flag:"host-settings"`
 
@@ -219,6 +223,10 @@ type Config struct {
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
 	FinalMetricsLog string `flag:"final-metrics-log"`
+
+	// BootTimesLog is the file to which the startup timeline of the sandbox
+	// (see timing.Timer.Export) is written, as JSON, when the sandbox starts.
+	BootTimesLog string `flag:"boot-times-log"`
 
 	// ProfilingMetrics is a comma separated list of metric names which are
 	// going to be written to the ProfilingMetricsLog file from within the
@@ -435,6 +443,11 @@ type Config struct {
 	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
 	explicitlySet map[string]struct{}
 
+	// cliStateEngine records the --state-engine policy explicitly passed on the
+	// command line when this Config was constructed via NewFromFlags, before any
+	// OCI annotation or bundle overrides run.
+	cliStateEngine *StateEnginePolicy
+
 	// ReproduceNAT, when true, tells runsc to scrape the host network
 	// namespace's NAT iptables and reproduce it inside the sandbox.
 	ReproduceNAT bool `flag:"reproduce-nat"`
@@ -488,6 +501,9 @@ type Config struct {
 
 	// AllowConnectedOnSave allows network connections to stay established on save.
 	AllowConnectedOnSave bool `flag:"allow-connected-on-save"`
+
+	// StateEngine selects the state serialization engine used when saving checkpoints.
+	StateEngine StateEnginePolicy `flag:"state-engine"`
 
 	// AllowRootfsTarAnnotation indicates whether the rootfs tar annotation
 	// should be allowed.
@@ -1222,6 +1238,58 @@ func (p CharacterDevicePolicy) AllowsPassthrough() bool {
 	return p != CharDevEmulatedOnly
 }
 
+// InodeNumbers tells how inode numbers of files on gofer mounts (the rootfs
+// and bind mounts) are assigned.
+type InodeNumbers int
+
+const (
+	// InodeNumbersPassthrough reports host inode numbers as is. Host device
+	// numbers are mapped to sandbox-private device numbers, so files on
+	// different host devices under one mount report different device numbers,
+	// as with Linux overlayfs.
+	InodeNumbersPassthrough InodeNumbers = iota
+
+	// InodeNumbersVirtual assigns sandbox-private sequential inode numbers
+	// and a single device number per mount. This requires the sandbox to
+	// remember the host identity of every file it has ever seen, and to
+	// stat(2) every entry returned by getdents(2).
+	InodeNumbersVirtual
+)
+
+func inodeNumbersPtr(v InodeNumbers) *InodeNumbers {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (n *InodeNumbers) Set(v string) error {
+	switch v {
+	case "passthrough":
+		*n = InodeNumbersPassthrough
+	case "virtual":
+		*n = InodeNumbersVirtual
+	default:
+		return fmt.Errorf("invalid inode numbers mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (n *InodeNumbers) Get() any {
+	return *n
+}
+
+// String implements flag.Value.
+func (n InodeNumbers) String() string {
+	switch n {
+	case InodeNumbersPassthrough:
+		return "passthrough"
+	case InodeNumbersVirtual:
+		return "virtual"
+	default:
+		panic(fmt.Sprintf("Invalid inode numbers mode %d", n))
+	}
+}
+
 // OverlayMedium describes how overlay medium is configured.
 type OverlayMedium string
 
@@ -1867,4 +1935,51 @@ func (xd *XDP) Set(input string) error {
 		return fmt.Errorf("invalid --xdp value: %q", input)
 	}
 	return nil
+}
+
+// StateEnginePolicy selects the state serialization engine used for saving checkpoints.
+type StateEnginePolicy int
+
+// StateEnginePolicy values.
+const (
+	// StateEngineGraph uses the reflection-free graph serialization engine.
+	StateEngineGraph StateEnginePolicy = iota
+
+	// StateEngineWire uses the legacy wire serialization engine.
+	StateEngineWire
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *StateEnginePolicy) Set(v string) error {
+	switch v {
+	case "graph":
+		*p = StateEngineGraph
+	case "wire":
+		*p = StateEngineWire
+	default:
+		return fmt.Errorf("invalid state engine policy %q (must be one of: graph, wire)", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+func (p StateEnginePolicy) Ptr() *StateEnginePolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *StateEnginePolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p StateEnginePolicy) String() string {
+	switch p {
+	case StateEngineGraph:
+		return "graph"
+	case StateEngineWire:
+		return "wire"
+	default:
+		panic(fmt.Sprintf("invalid state engine policy %d", p))
+	}
 }

@@ -27,7 +27,7 @@ func (r *Registry) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.userNS)
 	stateSinkObject.Save(1, &r.reg)
-	stateSinkObject.Save(2, &r.totalPages)
+	stateSinkObject.SaveUint64(2, &r.totalPages)
 }
 
 func (r *Registry) afterLoad(context.Context) {}
@@ -36,7 +36,7 @@ func (r *Registry) afterLoad(context.Context) {}
 func (r *Registry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.userNS)
 	stateSourceObject.Load(1, &r.reg)
-	stateSourceObject.Load(2, &r.totalPages)
+	stateSourceObject.LoadUint64(2, &r.totalPages)
 }
 
 func (s *Shm) StateTypeName() string {
@@ -45,6 +45,7 @@ func (s *Shm) StateTypeName() string {
 
 func (s *Shm) StateFields() []string {
 	return []string{
+		"MappableNoHugepages",
 		"ShmRefs",
 		"registry",
 		"devID",
@@ -66,37 +67,44 @@ func (s *Shm) beforeSave() {}
 // +checklocksignore
 func (s *Shm) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	stateSinkObject.Save(0, &s.ShmRefs)
-	stateSinkObject.Save(1, &s.registry)
-	stateSinkObject.Save(2, &s.devID)
-	stateSinkObject.Save(3, &s.size)
-	stateSinkObject.Save(4, &s.effectiveSize)
-	stateSinkObject.Save(5, &s.fr)
-	stateSinkObject.Save(6, &s.obj)
-	stateSinkObject.Save(7, &s.attachTime)
-	stateSinkObject.Save(8, &s.detachTime)
-	stateSinkObject.Save(9, &s.changeTime)
-	stateSinkObject.Save(10, &s.creatorPID)
-	stateSinkObject.Save(11, &s.lastAttachDetachPID)
-	stateSinkObject.Save(12, &s.pendingDestruction)
+	stateSinkObject.Save(0, &s.MappableNoHugepages)
+	stateSinkObject.Save(1, &s.ShmRefs)
+	stateSinkObject.Save(2, &s.registry)
+	stateSinkObject.SaveUint32(3, &s.devID)
+	stateSinkObject.SaveUint64(4, &s.size)
+	stateSinkObject.SaveUint64(5, &s.effectiveSize)
+	stateSinkObject.Save(6, &s.fr)
+	stateSinkObject.Save(7, &s.obj)
+	stateSinkObject.Save(8, &s.attachTime)
+	stateSinkObject.Save(9, &s.detachTime)
+	stateSinkObject.Save(10, &s.changeTime)
+	stateSinkObject.SaveInt32(11, &s.creatorPID)
+	stateSinkObject.SaveInt32(12, &s.lastAttachDetachPID)
+	stateSinkObject.SaveBool(13, &s.pendingDestruction)
 }
 
 // +checklocksignore
 func (s *Shm) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &s.ShmRefs)
-	stateSourceObject.Load(1, &s.registry)
-	stateSourceObject.Load(2, &s.devID)
-	stateSourceObject.Load(3, &s.size)
-	stateSourceObject.Load(4, &s.effectiveSize)
-	stateSourceObject.Load(5, &s.fr)
-	stateSourceObject.Load(6, &s.obj)
-	stateSourceObject.Load(7, &s.attachTime)
-	stateSourceObject.Load(8, &s.detachTime)
-	stateSourceObject.Load(9, &s.changeTime)
-	stateSourceObject.Load(10, &s.creatorPID)
-	stateSourceObject.Load(11, &s.lastAttachDetachPID)
-	stateSourceObject.Load(12, &s.pendingDestruction)
-	stateSourceObject.AfterLoad(func() { s.afterLoad(ctx) })
+	stateSourceObject.Load(0, &s.MappableNoHugepages)
+	stateSourceObject.Load(1, &s.ShmRefs)
+	stateSourceObject.Load(2, &s.registry)
+	stateSourceObject.LoadUint32(3, &s.devID)
+	stateSourceObject.LoadUint64(4, &s.size)
+	stateSourceObject.LoadUint64(5, &s.effectiveSize)
+	stateSourceObject.Load(6, &s.fr)
+	stateSourceObject.Load(7, &s.obj)
+	stateSourceObject.Load(8, &s.attachTime)
+	stateSourceObject.Load(9, &s.detachTime)
+	stateSourceObject.Load(10, &s.changeTime)
+	stateSourceObject.LoadInt32(11, &s.creatorPID)
+	stateSourceObject.LoadInt32(12, &s.lastAttachDetachPID)
+	stateSourceObject.LoadBool(13, &s.pendingDestruction)
+	stateSourceObject.AfterLoadTo(s)
+}
+
+// +checklocksignore
+func (s *Shm) StateAfterLoad(ctx context.Context) {
+	s.afterLoad(ctx)
 }
 
 func (r *ShmRefs) StateTypeName() string {
@@ -120,11 +128,16 @@ func (r *ShmRefs) StateSave(stateSinkObject state.Sink) {
 // +checklocksignore
 func (r *ShmRefs) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
-	stateSourceObject.AfterLoad(func() { r.afterLoad(ctx) })
+	stateSourceObject.AfterLoadTo(r)
+}
+
+// +checklocksignore
+func (r *ShmRefs) StateAfterLoad(ctx context.Context) {
+	r.afterLoad(ctx)
 }
 
 func init() {
-	state.Register((*Registry)(nil))
-	state.Register((*Shm)(nil))
-	state.Register((*ShmRefs)(nil))
+	state.RegisterNoHooks((*Registry)(nil))
+	state.RegisterStruct((*Shm)(nil))
+	state.RegisterStruct((*ShmRefs)(nil))
 }
