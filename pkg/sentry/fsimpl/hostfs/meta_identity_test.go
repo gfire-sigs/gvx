@@ -42,6 +42,9 @@ type identityHost struct {
 	// entries when a call names them. See markNameless.
 	nameless func(name string) bool
 	bad      map[uint64]struct{}
+	// rewriteList, when set, rewrites the entries that a listing through a
+	// pinned handle returns.
+	rewriteList func(hostDirEntry) hostDirEntry
 	// scanExists answers existsByID with a walk of the tree, as a host that
 	// opens a file by identity does.
 	scanExists bool
@@ -70,6 +73,21 @@ func (h *identityHost) existsByID(key fileKey) (bool, error) {
 		return false
 	}
 	return walk("."), nil
+}
+
+func (h *identityHost) readDirAt(dir hostDirHandle) ([]hostDirEntry, error) {
+	entries, err := h.hostBackend.readDirAt(dir)
+	h.mu.Lock()
+	rewrite := h.rewriteList
+	h.mu.Unlock()
+	if err != nil || rewrite == nil {
+		return entries, err
+	}
+	out := make([]hostDirEntry, len(entries))
+	for i, e := range entries {
+		out[i] = rewrite(e)
+	}
+	return out, nil
 }
 
 func (h *identityHost) set(rewrite func(hostInfo) hostInfo) {
@@ -430,6 +448,79 @@ func TestReusedInodeNumberDoesNotInheritARecord(t *testing.T) {
 	if attr, _, err := ws.Stat("fresh"); err != nil || attr.Mode&0o7777 != 0o751 {
 		t.Fatalf("Stat(fresh) with the identity of the recorded file = (%+v, %v), want mode 751", attr, err)
 	}
+}
+
+// A file system can give the inode number of a deleted file to a new file. The
+// listing then shows the number of the recorded file, and only the birth time
+// tells the two files apart.
+func TestListedInodeNumberOfAReplacedFileDoesNotKeepTheRecordAlive(t *testing.T) {
+	if !keysCarryBirthTime {
+		t.Skip("the key holds no birth time here, and the inode number of a deleted file is never reused")
+	}
+	dir := resolvedTempDir(t)
+	ws, host := identityWS(t, dir)
+	if ws.caps.ExistsByID {
+		t.Skip("the host asks by identity and lists nothing")
+	}
+	mustWriteFile(t, ws, "doc", 0o751)
+	if err := ws.Chown("doc", 7, 8); err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := ws.host.lstat("doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An editor saves over doc.
+	if err := os.WriteFile(filepath.Join(dir, "doc.tmp"), []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "doc.tmp"), filepath.Join(dir, "doc")); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := ws.host.lstat("doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The new file reuses the inode number of the recorded file.
+	reused := recorded.fid
+	reused.btime++
+	host.set(func(info hostInfo) hostInfo {
+		if info.fid == fresh.fid {
+			info.fid = reused
+		}
+		return info
+	})
+	host.mu.Lock()
+	host.rewriteList = func(e hostDirEntry) hostDirEntry {
+		if e.name == "doc" {
+			e.ino = recorded.fid.ino
+		}
+		return e
+	}
+	host.mu.Unlock()
+	requireMode(t, ws, "doc", 0o751, 7)
+}
+
+func TestListedFileWithTheIdentityOfTheRecordKeepsTheRecordAlive(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws, _ := identityWS(t, dir)
+	if ws.caps.ExistsByID {
+		t.Skip("the host asks by identity and lists nothing")
+	}
+	mustWriteFile(t, ws, "doc", 0o751)
+	// The recorded file moves to another name of its directory, and a new file
+	// takes the name doc. The listing shows the recorded file with its full
+	// identity.
+	if err := os.Rename(filepath.Join(dir, "doc"), filepath.Join(dir, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "doc"), []byte("new"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if attr, _, err := ws.Stat("doc"); err != nil || attr.Mode&0o7777 == 0o751 {
+		t.Fatalf("Stat(doc) = (%+v, %v): the new file took the record of the moved file", attr, err)
+	}
+	requireMode(t, ws, "moved", 0o751, 0)
 }
 
 func TestVolumeWithoutFileIdentitiesKeepsRecordsByPath(t *testing.T) {

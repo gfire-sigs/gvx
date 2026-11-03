@@ -237,8 +237,12 @@ func (w *Workspace) rekeyLocked(oldKey, newKey recKey, r *rec, rel string) {
 // lives when the call found it, or empty when it is unknown. An answer that the
 // host cannot give counts as alive, because a record must survive a failed
 // check. The listing comes from a cache that lives for cacheTTL, so a stat of
-// each file of a directory that a host editor replaced lists it once. Callers
-// hold w.mu.
+// each file of a directory that a host editor replaced lists it once. An inode
+// number in the listing only selects a candidate, because a file system can
+// give the number of a deleted file to a new one. One stat of the candidate
+// compares the full identity. A candidate that vanished or that has another
+// identity is not the file. A candidate without an identity counts as the file.
+// Callers hold w.mu.
 func (w *Workspace) recordFileExists(key recKey, rel string) (bool, string) {
 	if w.caps.ExistsByID {
 		found, err := w.host.existsByID(w.rawID(key.id))
@@ -256,10 +260,20 @@ func (w *Workspace) recordFileExists(key recKey, rel string) (bool, string) {
 	if err != nil {
 		return true, ""
 	}
-	if name, ok := names[key.id.ino]; ok {
-		return true, joinRelPath(parent, name)
+	name, ok := names[key.id.ino]
+	if !ok {
+		return false, ""
 	}
-	return false, ""
+	info, err := w.host.lstatAt(pin.h, name.host)
+	switch {
+	case isNotExist(err):
+		return false, ""
+	case err != nil || !hasIdentity(info):
+		return true, joinRelPath(parent, name.guest)
+	case w.storedID(info.fid) != key.id:
+		return false, ""
+	}
+	return true, joinRelPath(parent, name.guest)
 }
 
 // knowsGuestPath reports whether the table holds a record that the guest saw

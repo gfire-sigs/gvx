@@ -80,7 +80,12 @@ func TestStatOfManyReplacedFilesListsTheDirectoryOnce(t *testing.T) {
 	if n := ch.got("readDirAt") + ch.got("readDir"); n > 3 {
 		t.Fatalf("%d stats of replaced files made %d directory listings %s, want at most 3", budgetFiles, n, ch.dump())
 	}
-	t.Logf("listings for %d stats: readDirAt=%d readDir=%d", budgetFiles, ch.got("readDirAt"), ch.got("readDir"))
+	// Each stat makes its own lookup, and a listed inode number costs one more
+	// lstatAt to confirm the candidate. The stats stay linear.
+	if n := ch.got("lstatAt"); n > 2*budgetFiles+10 {
+		t.Fatalf("%d stats of replaced files made %d lstatAt calls, want at most %d", budgetFiles, n, 2*budgetFiles+10)
+	}
+	t.Logf("calls for %d stats: readDirAt=%d readDir=%d lstatAt=%d", budgetFiles, ch.got("readDirAt"), ch.got("readDir"), ch.got("lstatAt"))
 }
 
 func TestCollectorBudgetFollowsRecordsAndDirectories(t *testing.T) {

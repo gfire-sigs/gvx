@@ -30,8 +30,15 @@ type dirInos struct {
 	rel string
 	// until is the time up to which the listing is trusted.
 	until int64
-	// names maps an inode number to the guest name of the entry.
-	names map[uint64]string
+	// names maps an inode number to the entry that carries it.
+	names map[uint64]inoName
+}
+
+// inoName names the entry of a listing. A file system can give the inode
+// number of a deleted file to a new one, so the number only selects a
+// candidate that the caller confirms with a stat of host.
+type inoName struct {
+	host, guest string
 }
 
 // inoCache holds the inode sets of directories, by directory identity. It
@@ -90,10 +97,10 @@ func (c *inoCache) dropAll() {
 	clear(c.dirs)
 }
 
-// dirInoNames returns the inode numbers of the directory rel with the guest
-// names of their entries. pin is the pinned handle of the directory. A
+// dirInoNames returns the inode numbers of the directory rel with the names of
+// their entries. pin is the pinned handle of the directory. A
 // directory without an identity has no cache entry, so each call lists it.
-func (w *Workspace) dirInoNames(pin *dirPin, rel string) (map[uint64]string, error) {
+func (w *Workspace) dirInoNames(pin *dirPin, rel string) (map[uint64]inoName, error) {
 	now := w.nowNano()
 	if !pin.key.isZero() {
 		if e := w.inos.get(pin.key, now); e != nil {
@@ -104,10 +111,10 @@ func (w *Workspace) dirInoNames(pin *dirPin, rel string) (map[uint64]string, err
 	if err != nil {
 		return nil, err
 	}
-	names := make(map[uint64]string, len(entries))
+	names := make(map[uint64]inoName, len(entries))
 	for _, e := range entries {
 		if _, ok := names[e.ino]; !ok {
-			names[e.ino] = w.codec.ToGuest(e.name)
+			names[e.ino] = inoName{host: e.name, guest: w.codec.ToGuest(e.name)}
 		}
 	}
 	if !pin.key.isZero() {
