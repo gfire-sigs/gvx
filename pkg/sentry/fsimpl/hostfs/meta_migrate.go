@@ -15,6 +15,8 @@
 package hostfs
 
 import (
+	"errors"
+	"io/fs"
 	"maps"
 	"slices"
 )
@@ -44,7 +46,11 @@ func (w *Workspace) importImage(img metaImage) (map[recKey]*rec, bool) {
 		return img.recs, false
 	}
 	// A record of the other kind converts through its hint, which names the
-	// guest path. A record of the wanted kind stays.
+	// guest path. A record of the wanted kind stays. A path record that the
+	// host could not answer for comes back from convertPaths as a path record,
+	// so the table can mix both kinds on a volume with identities. Every open
+	// finds such a record foreign and converts it again, and the collector
+	// leaves it alone.
 	paths := make(map[string]POSIXAttr)
 	out := make(map[recKey]*rec, len(img.recs))
 	for k, r := range img.recs {
@@ -67,48 +73,69 @@ func (w *Workspace) importImage(img metaImage) (map[recKey]*rec, bool) {
 
 // convertPaths builds the records for the guest paths of an earlier release.
 // A volume without identities keeps the paths as keys. A volume with identities
-// reads the identity of each path from the host. A path that no longer names a
-// file or directory gets no record, because the record had no owner. A virtual
-// symbolic link needs the identity of its parent directory. Hard links of one
-// file collapse into one record, and the record with the latest change time
-// wins.
+// reads the identity of each path from the host. A path that the host proves
+// absent, or that now names another kind of entry, gets no record, because the
+// record had no owner. A path that the host fails to answer for, such as one
+// below a directory that denies access, keeps its record as a path record.
+// The next open converts it again. Until then the lookups of a volume with
+// identities do not see it, since they key on identity. A virtual symbolic
+// link needs the identity of its parent directory. Hard links of one file
+// collapse into one record, and the record with the latest change time wins.
 func (w *Workspace) convertPaths(paths map[string]POSIXAttr) map[recKey]*rec {
 	out := make(map[recKey]*rec, len(paths))
+	pathRecord := func(p string, a POSIXAttr) {
+		if a.Symlink != "" {
+			parent, name := splitParent(p)
+			out[recKey{kind: kindPathName, path: parent, name: name}] = &rec{attr: a, hint: p}
+			return
+		}
+		out[recKey{kind: kindPath, path: p}] = &rec{attr: a, hint: p}
+	}
 	if w.pathKeys {
 		for p, a := range paths {
-			if a.Symlink != "" {
-				parent, name := splitParent(p)
-				out[recKey{kind: kindPathName, path: parent, name: name}] = &rec{attr: a, hint: p}
-				continue
-			}
-			out[recKey{kind: kindPath, path: p}] = &rec{attr: a, hint: p}
+			pathRecord(p, a)
 		}
 		return out
 	}
+	// An entry without an identity cannot key a record, so dirID and the loop
+	// below treat it like an entry of the wrong kind.
 	dirs := map[string]fileKey{".": w.rootKey.id}
-	dirID := func(rel string) (fileKey, bool) {
+	dirID := func(rel string) (fileKey, error) {
 		if id, ok := dirs[rel]; ok {
-			return id, true
+			return id, nil
 		}
 		info, err := w.statGuestPath(rel)
-		if err != nil || info.kind != hostKindDir || info.fid.isZero() {
-			return fileKey{}, false
+		switch {
+		case err != nil:
+			return fileKey{}, err
+		case info.kind != hostKindDir || info.fid.isZero():
+			return fileKey{}, errNotDir
 		}
 		id := w.storedID(info.fid)
 		dirs[rel] = id
-		return id, true
+		return id, nil
 	}
 	for _, p := range slices.Sorted(maps.Keys(paths)) {
 		a := paths[p]
 		if a.Symlink != "" {
 			parent, name := splitParent(p)
-			if id, ok := dirID(parent); ok {
+			id, err := dirID(parent)
+			switch {
+			case err == nil:
 				out[recKey{kind: kindName, id: id, name: name}] = &rec{attr: a, hint: p}
+			case !entryLost(err):
+				pathRecord(p, a)
 			}
 			continue
 		}
 		info, err := w.statGuestPath(p)
-		if err != nil || (info.kind != hostKindRegular && info.kind != hostKindDir) || info.fid.isZero() {
+		if err == nil && ((info.kind != hostKindRegular && info.kind != hostKindDir) || info.fid.isZero()) {
+			err = errNotDir
+		}
+		if err != nil {
+			if !entryLost(err) {
+				pathRecord(p, a)
+			}
 			continue
 		}
 		k := w.keyOf(p, info)
@@ -118,6 +145,13 @@ func (w *Workspace) convertPaths(paths map[string]POSIXAttr) map[recKey]*rec {
 		out[k] = &rec{attr: a, hint: p}
 	}
 	return out
+}
+
+// entryLost reports a host answer that proves that a path no longer names a
+// file or a directory: the path is absent, or a component is not a directory.
+// Any other error says nothing about the path.
+func entryLost(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotDir)
 }
 
 // statGuestPath reads the host metadata of the guest path rel by a walk from

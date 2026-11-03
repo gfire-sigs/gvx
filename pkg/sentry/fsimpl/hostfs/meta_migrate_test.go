@@ -22,6 +22,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -232,7 +233,6 @@ func TestOlderFormsKeepPathRecordsOnAVolumeWithoutIdentities(t *testing.T) {
 		t.Fatalf("records = %q, want the unresolved records kept for the collector", got)
 	}
 	ws.orphanPass()
-	ws.orphanPass()
 	if got := metaKeys(ws); !slices.Contains(got, "gone") {
 		t.Fatalf("records = %q: the collector ran before the first flush replaced the older file", got)
 	}
@@ -241,10 +241,79 @@ func TestOlderFormsKeepPathRecordsOnAVolumeWithoutIdentities(t *testing.T) {
 	}
 	mustSync(t, ws)
 	ws.orphanPass()
-	ws.orphanPass()
 	if got := metaKeys(ws); slices.Contains(got, "gone") || slices.Contains(got, "nodir/s") {
-		t.Fatalf("records after two passes = %q, want the dead records collected", got)
+		t.Fatalf("records after one pass = %q, want the dead records collected", got)
 	}
+}
+
+func TestConversionKeepsTheRecordOfAPathThatTheHostDeniedAccessTo(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("the test needs a directory that the process cannot search")
+	}
+	dir := resolvedTempDir(t)
+	locked := filepath.Join(dir, "locked")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"locked/f", "other"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(dir, MetaFileName)
+	old := encodeV3(map[string]POSIXAttr{
+		"locked/f": {Mode: linux.S_IFREG | 0o4755, UID: 42},
+		"other":    {Mode: linux.S_IFREG | 0o600},
+	})
+	if err := os.WriteFile(path, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	ws := plainWS(t, dir, workspaceOptions{})
+	if ws.pathKeys {
+		t.Skip("the volume has no usable file identities")
+	}
+	if err := ws.Chmod("other", 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, ws)
+	// The collector must not treat the foreign record as dead, however often
+	// it runs.
+	ws.orphanPass()
+	if err := ws.Chmod("other", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, ws)
+	if err := ws.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := parseMeta(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := img.recs[recKey{kind: kindPath, path: "locked/f"}]
+	if r == nil {
+		t.Fatalf("the table on disk lost the record of locked/f: %v", slices.Collect(maps.Keys(img.recs)))
+	}
+	if r.attr.Mode&0o7777 != 0o4755 || r.attr.UID != 42 {
+		t.Fatalf("record of locked/f = mode %o uid %d, want 4755 and 42", r.attr.Mode&0o7777, r.attr.UID)
+	}
+
+	if err := os.Chmod(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reopened := plainWS(t, dir, workspaceOptions{})
+	requireMode(t, reopened, "locked/f", 0o4755, 42)
+	requireMode(t, reopened, "other", 0o644, 0)
 }
 
 func TestTableConvertsWhenTheVolumeChangesItsKeyKind(t *testing.T) {

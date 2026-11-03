@@ -17,6 +17,7 @@ package hostfs
 import (
 	"errors"
 	"io/fs"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -33,16 +34,14 @@ const (
 	// orphanStepInterval is the pause between two steps of one pass. It caps
 	// the host load of a pass.
 	orphanStepInterval = 100 * time.Millisecond
-	// orphanPassInterval is the pause between two passes. A record needs two
-	// passes to die, so this is also the time that a host editor has to save
-	// a file by rename before hostfs drops the record that the new file adopts.
+	// orphanPassInterval is the pause between two passes.
 	orphanPassInterval = 10 * time.Minute
 
 	// orphanStepDirs is the number of directories that one walk step lists.
-	orphanStepDirs = 4
+	orphanStepDirs = 64
 	// orphanStepRecords is the number of records that one identity step asks
-	// the host about.
-	orphanStepRecords = 64
+	// the host about, and that one confirm step checks by guest path.
+	orphanStepRecords = 256
 )
 
 // isNotExist reports a host answer that proves the absence of an entry. A
@@ -56,12 +55,14 @@ func isNotExist(err error) bool {
 // directory leaves its records behind. Since records key on identity, a stale
 // record never applies to another file, so the collector only reclaims memory
 // and disk space. It never stops the guest: a step holds the Workspace lock for
-// the listing of one directory or the check of one record.
+// the check of one record, and for no longer than the acquire of one pin.
 //
-// A pass finds the records that have no host file. A record dies when two
-// passes in a row miss it, and a last check by the guest path confirms the
-// verdict. A host error ends a pass without a verdict, so a transient error
-// never deletes a record.
+// One complete pass finds the records that have no host file. A last check by
+// the guest path of each such record confirms the verdict, so a record dies
+// after one pass. A host error ends a pass without a verdict, so a transient
+// error never deletes a record. A directory or entry that the host denies
+// access to is skipped, not an error: its records stay, because the last check
+// cannot prove them dead.
 //
 // A volume that opens a file by identity (Windows) asks the host about each
 // record. Any other volume walks the tree through the pinned handles. The walk
@@ -86,10 +87,12 @@ type orphanCollector struct {
 	// keys and pos drive the identity pass over a copy of the table keys.
 	keys []recKey
 	pos  int
-	// dead holds the records that the identity pass found without a file.
+	// dead holds the records that the pass found without a host file. The
+	// confirm steps drain it.
 	dead []recKey
-	// missed holds the records that the previous complete pass missed.
-	missed map[recKey]struct{}
+	// confirming reports that the walk or the identity pass has ended and
+	// that the steps now check dead.
+	confirming bool
 }
 
 // startOrphanGC starts the background collector.
@@ -151,14 +154,21 @@ func (w *Workspace) orphanStep() bool {
 		}
 		c.begin(w)
 	}
-	var more bool
-	if w.useIDPass() {
-		more = w.identityStepLocked(c)
-	} else {
-		more = w.walkStepLocked(c)
+	if !c.confirming {
+		var more bool
+		if w.useIDPass() {
+			more = w.identityStep(c)
+		} else {
+			more = w.walkStep(c)
+		}
+		if more {
+			return true
+		}
+		w.endSearch(c)
 	}
+	more := w.confirmStep(c)
 	if !more {
-		w.finishPassLocked(c)
+		c.end()
 	}
 	return more
 }
@@ -178,42 +188,63 @@ func (w *Workspace) pendingConversion() bool {
 }
 
 func (c *orphanCollector) begin(w *Workspace) {
-	c.active, c.broken = true, false
+	c.active, c.broken, c.confirming = true, false, false
 	c.queue = append(c.queue[:0], ".")
 	c.seen = make(map[recKey]struct{})
 	c.keys, c.pos, c.dead = nil, 0, nil
 	if w.useIDPass() {
-		c.keys = w.meta.keys()
+		// A record of the other key kind has no identity to ask for. It waits
+		// for the loader to convert it.
+		c.keys = slices.DeleteFunc(w.meta.keys(), recKey.isPath)
 	}
 }
 
-// walkStepLocked lists the next directories of the walk. It reports whether
+// end drops the state of the pass.
+func (c *orphanCollector) end() {
+	c.active, c.confirming = false, false
+	c.queue, c.seen, c.keys, c.dead = nil, nil, nil, nil
+}
+
+// walkStep lists the next directories of the walk. It reports whether
 // directories remain.
-func (w *Workspace) walkStepLocked(c *orphanCollector) bool {
+func (w *Workspace) walkStep(c *orphanCollector) bool {
 	for range orphanStepDirs {
 		if len(c.queue) == 0 {
 			break
 		}
 		rel := c.queue[len(c.queue)-1]
 		c.queue = c.queue[:len(c.queue)-1]
-		w.mu.RLock()
-		if w.closed {
-			c.broken = true
-			c.queue = nil
-		} else {
-			w.visitDirLocked(c, rel)
-		}
-		w.mu.RUnlock()
+		w.visitDir(c, rel)
 	}
 	return len(c.queue) > 0
 }
 
-// visitDirLocked lists the directory rel, marks the records that name its
-// entries as alive, and queues its subdirectories. Callers hold w.mu.
-func (w *Workspace) visitDirLocked(c *orphanCollector, rel string) {
-	pin, err := w.acquirePin(rel)
-	if err != nil {
+// skipOrBreak ends the work on one directory or entry after a host error. A
+// permission error only skips it, because the guest cannot reach it either.
+// Any other error invalidates the pass.
+func (c *orphanCollector) skipOrBreak(err error) {
+	if !errors.Is(err, fs.ErrPermission) {
 		c.broken = true
+	}
+}
+
+// visitDir lists the directory rel, marks the records that name its entries as
+// alive, and queues its subdirectories. It holds w.mu only to check closed and
+// to acquire the pin. A listing can be long, and the guest must not wait for
+// it. The pin keeps the handle open until visitDir returns, and
+// Workspace.Close waits for the step before it closes the pins.
+func (w *Workspace) visitDir(c *orphanCollector, rel string) {
+	w.mu.RLock()
+	if w.closed {
+		w.mu.RUnlock()
+		c.broken = true
+		c.queue = nil
+		return
+	}
+	pin, err := w.acquirePin(rel)
+	w.mu.RUnlock()
+	if err != nil {
+		c.skipOrBreak(err)
 		return
 	}
 	defer w.releasePin(pin)
@@ -224,7 +255,7 @@ func (w *Workspace) visitDirLocked(c *orphanCollector, rel string) {
 	}
 	entries, err := w.host.readDirAt(pin.h)
 	if err != nil {
-		c.broken = true
+		c.skipOrBreak(err)
 		return
 	}
 	for _, e := range entries {
@@ -250,7 +281,7 @@ func (w *Workspace) visitDirLocked(c *orphanCollector, rel string) {
 		info, err := w.host.lstatAt(pin.h, e.name)
 		if err != nil {
 			if !isNotExist(err) {
-				c.broken = true
+				c.skipOrBreak(err)
 			}
 			continue
 		}
@@ -262,9 +293,9 @@ func (w *Workspace) visitDirLocked(c *orphanCollector, rel string) {
 	}
 }
 
-// identityStepLocked asks the host about the next records of the pass. It
-// reports whether records remain.
-func (w *Workspace) identityStepLocked(c *orphanCollector) bool {
+// identityStep asks the host about the next records of the pass. It reports
+// whether records remain.
+func (w *Workspace) identityStep(c *orphanCollector) bool {
 	for range orphanStepRecords {
 		if c.pos >= len(c.keys) {
 			break
@@ -295,51 +326,61 @@ func (w *Workspace) recordGoneByIDLocked(k recKey) (bool, error) {
 	return !found && err == nil, err
 }
 
-// finishPassLocked ends the pass. A complete pass confirms the records that
-// the previous pass missed too, and it remembers the new misses.
-func (w *Workspace) finishPassLocked(c *orphanCollector) {
-	defer func() {
-		c.active = false
-		c.queue, c.seen, c.keys, c.dead = nil, nil, nil, nil
-	}()
+// endSearch turns the end of the walk or of the identity pass into the list of
+// records to confirm. A pass that met a host error has no verdict.
+func (w *Workspace) endSearch(c *orphanCollector) {
+	c.confirming = true
 	if c.broken {
+		c.dead = nil
 		return
 	}
-	var missing []recKey
 	if w.useIDPass() {
-		missing = c.dead
-	} else {
-		for _, k := range w.meta.keys() {
-			if _, ok := c.seen[k]; !ok {
-				missing = append(missing, k)
-			}
+		return
+	}
+	c.dead = nil
+	for _, k := range w.meta.keys() {
+		if _, ok := c.seen[k]; !ok {
+			c.dead = append(c.dead, k)
 		}
 	}
-	next := make(map[recKey]struct{}, len(missing))
-	for _, k := range missing {
-		if _, again := c.missed[k]; !again {
-			next[k] = struct{}{}
-			continue
+}
+
+// confirmStep checks the next records of the list by their guest path and
+// deletes those that the check proves dead. A failed or inconclusive lookup
+// keeps the record, and the next pass asks again. It reports whether records
+// remain.
+func (w *Workspace) confirmStep(c *orphanCollector) bool {
+	for range orphanStepRecords {
+		if len(c.dead) == 0 {
+			break
 		}
+		k := c.dead[len(c.dead)-1]
+		c.dead = c.dead[:len(c.dead)-1]
 		w.mu.Lock()
-		if !w.closed && w.orphanedLocked(k) {
+		switch {
+		case w.closed:
+			c.dead = nil
+		case w.orphanedLocked(k):
 			w.meta.del(k)
-		} else {
-			// A failed or inconclusive lookup keeps the record, and the next
-			// pass asks again.
-			next[k] = struct{}{}
 		}
 		w.mu.Unlock()
 	}
-	c.missed = next
+	return len(c.dead) > 0
 }
 
 // orphanedLocked confirms that the record under k has lost its host object.
-// The walk and the identity pass both prove it twice. This last check goes
-// through the guest path of the record, so a file that moved while the passes
-// ran keeps its record. A host error, or an answer that shows the file, keeps
-// the record. Callers hold w.mu for writing.
+// The walk and the identity pass found no host file for it. This last check
+// goes through the guest path of the record, so a record whose path still
+// names its file survives a walk that missed the file. A host error, including
+// a permission error, or an answer that shows the file, keeps the record. A
+// record of the other key kind waits for the loader to convert it, so it never
+// dies here. A file that a host process moved to a directory that the walk had
+// listed already loses its record: the hint names the old path. Callers hold
+// w.mu for writing.
 func (w *Workspace) orphanedLocked(k recKey) bool {
+	if k.isPath() != w.pathKeys {
+		return false
+	}
 	r := w.meta.get(k)
 	if r == nil {
 		return false

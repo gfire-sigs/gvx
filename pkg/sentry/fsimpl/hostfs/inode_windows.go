@@ -47,6 +47,12 @@ type hostRoot struct {
 	// byIDErr is the error of the lookup of OpenFileById, or nil. existsByID
 	// needs the procedure, and the lockdown forbids loading it later.
 	byIDErr error
+	// volume is the serial number of the volume of the workspace root, in the
+	// form of fileKey.dev. It is zero when the query failed. rootPath is the
+	// normalized path of the root without the volume, or "" when the query
+	// failed. Both stay unchanged after newHostRoot. existsByID uses them.
+	volume   uint64
+	rootPath string
 }
 
 // fileShareAll lets other openers read, write, and delete the file while
@@ -139,7 +145,9 @@ func newHostRoot(root *os.Root) (*hostRoot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: pin workspace directory: %w", err)
 	}
-	return &hostRoot{dir: dir, handle: windows.Handle(dir.Fd()), byIDErr: procOpenFileByID.Find()}, nil
+	h := &hostRoot{dir: dir, handle: windows.Handle(dir.Fd()), byIDErr: procOpenFileByID.Find()}
+	h.volume, h.rootPath = rootLocation(h.handle)
+	return h, nil
 }
 
 func (h *hostRoot) close() error {
