@@ -17,6 +17,31 @@ This section records changes that no release contains yet.
 
 ### Behavior Changes
 
+- **`.gvx_meta` keys its records on file identity** (`hostfs`, journal version 4): a record belongs to a file and not to a path. The identity is the volume serial number and the 128-bit file id on Windows, and the device, the inode number, and the birth time on Linux and macOS. The birth time matters because ext4 reuses an inode number at the next create. Measured on an Apple M1 with APFS, with the benchmarks of `HOSTFS_BENCH=1`:
+
+  | Operation | Table size | Before | After |
+  | :--- | ---: | ---: | ---: |
+  | Listing of a directory with 100 files | 10,000 records | 216 us | 165 us |
+  | Listing of a directory with 100 files | 100,000 records | 789 us | 140 us |
+  | Rename of a directory with 2,000 children | 10,000 records | 527 us | 87 us |
+  | Rename of a directory with 2,000 children | 100,000 records | 1.8 ms | 73 us |
+  | `chmod` through one name of a file with 4 names | 10,000 records | 276 ms | 4 us |
+  | `chmod` through one name of a file with 4 names | 100,000 records | 2.5 s | 3 us |
+  | Flush of one change | 10,000 records | 4.9 ms | 4.0 ms |
+  | Flush of one change | 100,000 records | 5.0 ms | 4.0 ms |
+  | Open of a workspace | 10,000 records | 59 ms | 25 ms |
+  | Open of a workspace | 100,000 records | 450 ms | 165 ms |
+
+  - A host process that renames a file or a directory keeps the mode, the owner, and the extended attributes of the guest. A guest symbolic link follows its directory. Before, the record stayed behind at the old path.
+  - A new file that a host process creates at an old path no longer inherits the record of the old file. A host editor that saves by writing a temporary file and renaming it over the document keeps the record: the new file adopts the record of a file that vanished from that path.
+  - The names of a hard-linked file share one record. A `chmod`, `chown`, or `setxattr` makes no scan of the table, and a `link` needs no new record. A listing and a rename of a directory scan no table either.
+  - The open of a workspace no longer checks each record against the host. A background collector removes the records whose file is gone. It starts 30 s after the open and uses small steps. A record dies when two passes 10 minutes apart miss it.
+  - The cap of the table is now 128 MiB of estimated memory, about 300,000 plain records. The old cap was 262,144 records. A record with large extended attributes counts more than a plain record.
+  - A volume without trustworthy file identities keeps its records by guest path, as before. The probe at the open needs a real birth time on Linux and macOS, or `FILE_ID_INFO` on Windows, and an identity that stays the same across a write. `WorkspaceCaps.StableIDs` reports the result. A bind mount of one file keeps its records in memory only, as before.
+  - The sandbox now refuses a host directory that lies inside another mounted host directory, unless both mounts are read-only. The two `.gvx_meta` tables would otherwise drift apart for the same files. The error is an invalid configuration error at the start.
+  - `hostfs.ReadMeta` names each record by the path where it finds the file in the host tree, and it leaves out the record of a file that no longer exists.
+  - **Upgrade note**: the first write to a workspace or a volume that has an older `.gvx_meta` converts the file to version 4. The conversion reads the host once for each recorded path, drops the records of paths that name nothing, and merges the records of hard links. A release before this one cannot open a converted workspace: it fails with an error for the unsupported version. Keep a copy of `.gvx_meta` before you convert a workspace that an older release must open again. A session that changes nothing leaves the older file as it is.
+
 - **Faster `hostfs` and a journal for `.gvx_meta`**: `hostfs` serves `-workspace`, bind mounts, and `driver=hostfs` volumes. Measured on an Apple M1 with `hvf`, the guest creates 10,000 files in 1.2 s to 2.0 s (was 2.4 s to 2.6 s), runs `ls -lR` over them in 0.4 s (was 1.0 s), extracts a tree of 2,000 files with `tar x` in 0.7 s (was 1.6 s), and runs 300 rounds of `dd conv=fsync` plus `mv` in 3.8 s (was 10.4 s). A `docker pull nginx:alpine` on `hostfs` went from 44 s to 41 s, because the host file system dominates that workload.
   - Every lookup, mutation, and directory listing now goes through the pinned handle of the directory. A `create`, `rename`, `chmod`, `utimensat`, or `link` at depth 5 made 7 to 34 host system calls and now makes 2 to 8.
   - A directory listing reads the entry type and the inode number from the directory record, and no longer stats each entry. A `stat` of each entry after an `ls` makes no host call. Metadata that a host process changes for an existing entry shows up after 1 s, as for every other host change.

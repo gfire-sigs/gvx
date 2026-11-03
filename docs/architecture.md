@@ -500,7 +500,7 @@ The sandbox applies the image settings with Docker rules. The `Entrypoint` and `
 
 ### 3.7 Secure Host File System Driver: `pkg/sentry/fsimpl/hostfs`
 
-`fsimpl/hostfs` replaces `pkg/sentry/fsimpl/gofer` (`lisafs`) to mount the host `/workspace` directory on Windows and macOS without spawning an external file-server process. It also runs on Linux, where it uses `os.Root` and `openat` in the same way. A run can mount many host directories. The mount at `/workspace` is one of them, and the `-v` bind mounts and the named volumes are the others. Each directory has its own `os.Root` handle and its own `.gvx_meta` writer. A bind mount can also name one host file. See "Single-File Mount" below.
+`fsimpl/hostfs` replaces `pkg/sentry/fsimpl/gofer` (`lisafs`) to mount the host `/workspace` directory on Windows and macOS without spawning an external file-server process. It also runs on Linux, where it uses `os.Root` and `openat` in the same way. A run can mount many host directories. The mount at `/workspace` is one of them, and the `-v` bind mounts and the named volumes are the others. Each directory has its own `os.Root` handle and its own `.gvx_meta` writer. The sandbox refuses a host directory that lies inside another mounted host directory, because two tables would then describe the same files. A bind mount can also name one host file. See "Single-File Mount" below.
 
 #### Handle-Scoped Traversal and POSIX Adaptation (Descriptive Module)
 
@@ -536,7 +536,7 @@ On Windows and on a volume that folds case, `NameCodec` keeps ordinary names unc
 
 On APFS, a lookup that misses the exact name falls back to the NFC form of the name. A listing shows an NFD name as NFC, unless `.gvx_meta` records the NFD name that the guest created.
 
-`hostfs` hides `.DS_Store`, `._*` AppleDouble files, `Thumbs.db`, and its own `~gvx~tmp.*` and `~gvx~swap.*` files from the guest. The `rmdir` call removes verified clutter files from a directory that has no other entry. `OpenWorkspace` deletes the internal files that a killed process left behind. It also prunes the `.gvx_meta` records whose host object is gone.
+`hostfs` hides `.DS_Store`, `._*` AppleDouble files, `Thumbs.db`, and its own `~gvx~tmp.*` and `~gvx~swap.*` files from the guest. The `rmdir` call removes verified clutter files from a directory that has no other entry. `OpenWorkspace` deletes the internal files that a killed process left behind. A background collector removes the `.gvx_meta` records whose host object is gone. See "Metadata Records and File Identity" below.
 
 #### Single-File Mount (Descriptive Module)
 
@@ -560,6 +560,28 @@ A guest mutation must not echo. A mutation of names removes the name from the ne
 
 The cap is visible to the guest. Before `inotify_add_watch(2)` adds a watch, the syscall layer calls `AdmitInotifyWatch` on a dentry that implements it. The seam is in `pkg/sentry/syscalls/linux/sys_inotify.go`. The hostfs dentry attaches the host watch and returns `ENOSPC` when the workspace already watches 8,192 other objects. An object that has a host watch always passes, so a mask update or a second `inotify` instance never fails. A host error other than `ENOSPC` leaves the guest watch without host events, and the watcher logs it once.
 
+#### Metadata Records and File Identity (Descriptive Module)
+
+`.gvx_meta` holds one record for each file and directory that the guest created. A record keys on the identity of the host file and not on its path. A host process that renames a file or a directory keeps the record. A new file that takes an old path gets no record.
+
+| Host | Identity of a file | Guard against reuse |
+| :--- | :--- | :--- |
+| Windows | Volume serial number and the 128-bit file id of `FILE_ID_INFO` | NTFS and ReFS never reuse the pair while the volume lives. |
+| Linux | Device, inode number, and the `statx` birth time | The birth time, because ext4 reuses an inode number at the next create. |
+| macOS | Device, inode number, and the APFS birth time | The birth time. |
+
+The device of the workspace root is stored as zero, so a volume that gets another device number after a reboot keeps its records. A virtual symbolic link has no host object. Its record keys on the identity of the parent directory and on the link name. The table indexes the links of each directory, so a listing reads the entries of that directory only.
+
+The names of a hard-linked file share one record. A `chmod`, `chown`, or `setxattr` through one name changes the record once, and every name shows the change. The record dies with the last name. A rename keeps the record and updates its path hint. A rename of a directory therefore writes one record, whatever the number of entries below it. A listing, a rename, and a change through a hard link make the same host calls and scan no table at any table size.
+
+Each record carries a hint: the guest path where the guest last saw the file. The hint never selects a record. A host editor saves a file by writing a temporary file and renaming it over the old file. The new file has no record. When the hint of a record names the path of the new file and the host no longer holds the recorded file, the new file adopts the record. Windows asks the host with `OpenFileById`. Linux and macOS look for the inode number in the listing of the directory. A recorded file that still exists keeps its record, and the new file starts with the defaults of a host file. On Linux and macOS, a host process that moves a file into another directory and then creates a new file at the old path gives the record to the new file.
+
+`OpenWorkspace` probes the volume before the lockdown. The probe needs a real birth time on Linux and macOS, or `FILE_ID_INFO` on Windows, and an identity that stays the same across a write. `WorkspaceCaps.StableIDs` reports the result. A volume that fails the probe keeps its records by guest path, as earlier releases did, and so does the single-file mode. A table with path keys scans the table at a directory rename and at a change through a hard link. A record then follows a path and not a file.
+
+A background collector removes the records whose file is gone. It starts 30 s after the open, and a table with an older file form waits for the first flush. Windows asks the host with `OpenFileById` for each record. Linux and macOS walk the tree through the pinned handles. The walk lists each directory once, and it stats only an entry whose inode number a record names. A step handles 4 directories or 64 records every 100 ms, and a pass waits 10 minutes before the next one. A record dies when two passes in a row miss it and a lookup by the hint path confirms the loss. A host error ends a pass without a verdict.
+
+The table may use 128 MiB of estimated memory, which fits about 300,000 plain records. A mutation that needs a new record above that cap fails with `ENOSPC`. A hard link needs no new record on a volume with identities.
+
 #### Extended Operations and Durability (Descriptive Module)
 
 A guest symbolic link lives only in `.gvx_meta`. The host never receives a link, so any target is valid except the empty string and a string with a NUL byte. The Sentry resolves the target in the guest namespace. `RENAME_EXCHANGE` uses `renameat2` on Linux and `renameatx_np` on macOS. Windows swaps two names with three renames through a `~gvx~swap` file, under `Workspace.mu`. `RENAME_WHITEOUT` moves the source and creates a character device `0:0` at the old name.
@@ -568,7 +590,7 @@ A guest symbolic link lives only in `.gvx_meta`. The host never receives a link,
 
 Metadata mutations reach `.gvx_meta` after 250 ms. `fsync`, `fdatasync`, `sync`, and writes with `O_SYNC` or `O_DSYNC` skip that delay. They flush the mapped pages, the host file, the directory entry, and the table. A table without changes costs no host call.
 
-`.gvx_meta` is an append-only journal of table changes. The file starts with the header `GVXMETA` and the version byte 3. Each flush appends one frame: a 4-byte length, a 4-byte CRC-32C of the payload, and the payload. The payload holds one operation for each changed path: `set` with the JSON record, or `delete`. One frame for each flush keeps the flush atomic, so a crash keeps the whole flush or none of it. The loader ignores a frame that is incomplete or fails its checksum, and it ignores the bytes after that frame. The next flush then rewrites the file.
+`.gvx_meta` is an append-only journal of table changes. The file starts with the header `GVXMETA` and the version byte 4. Each flush appends one frame: a 4-byte length, a 4-byte CRC-32C of the payload, and the payload. The payload holds one operation for each changed record: `put` with a binary record body, or `delete`. The key of an operation is the identity of a file, or the identity of a directory with a link name, or a guest path on a volume without identities. One frame for each flush keeps the flush atomic, so a crash keeps the whole flush or none of it. The loader ignores a frame that is incomplete or fails its checksum, and it ignores the bytes after that frame. The next flush then rewrites the file.
 
 A flush appends one frame and flushes the file. It rewrites the file, which this document calls a compaction, in four cases:
 
@@ -577,9 +599,9 @@ A flush appends one frame and flushes the file. It rewrites the file, which this
 - The journal holds more than twice the live records plus 1,024 operations.
 - The file passes 64 MiB.
 
-A compaction writes a snapshot to `.gvx_meta.tmp`, flushes it, renames it over `.gvx_meta`, and flushes the workspace directory. A failed flush keeps its records pending, and the next flush retries them. The prune of records whose host object is gone runs before a flush, and it locks the table for one record at a time. It deletes a record only when a lookup through the pinned handle and a second lookup by a walk from the workspace root both report the entry missing, because a replaced directory can leave a stale pinned handle.
+A compaction copies the record pointers under the table lock. It encodes the snapshot and writes it to `.gvx_meta.tmp` after it releases the lock. It flushes the file, renames it over `.gvx_meta`, and flushes the workspace directory. A failed flush keeps its records pending, and the next flush retries them. A flush never checks a record against the host.
 
-Earlier releases wrote the table as one JSON document and rewrote it at each flush. The loader still reads that form. The first flush with a change converts the file, and a session without changes leaves it as it is. An earlier release fails to open a workspace that has the journal form, with a parse error for `.gvx_meta`. `hostfs.ReadMeta` reads both forms for tools.
+Earlier releases keyed the records on guest paths: version 3 as a journal with JSON bodies, and older releases as one JSON document. The loader reads both forms and converts them at open time. The conversion reads the host once for each recorded path. It drops a record whose path holds no file or directory, and it merges the records of hard links into one. The first flush with a change writes version 4, and a session without changes leaves the older file as it is. An earlier release fails to open a workspace that has version 4, with an error for the unsupported version. `hostfs.ReadMeta` reads every form for tools. It names each identity-keyed record by the path where it finds the file in the host tree, and it leaves out the record of a file that no longer exists.
 
 #### Special Files and Extended Attributes (Descriptive Module)
 
@@ -591,7 +613,7 @@ On Linux, the `user.*` attributes of regular files and directories live on the h
 
 A `hostfs` or `ext4lite` directory can serve as the upper layer of a guest overlay mount, and as a lower layer. The overlay reads the POSIX ACLs of each layer on mount and on every lookup, so both drivers report no ACL instead of an error. A whiteout is a device node 0:0, and the opaque flag is the `trusted.overlay.opaque` attribute. `ext4lite` stores both in its image. `hostfs` stores both in `.gvx_meta`, so a whiteout on a host directory is an empty host file. The overlay keeps the `Mappable` of a layer file after the first `mmap`, and it calls `AddMapping` for later maps without `ConfigureMMap`. The `hostfs` file data therefore opens a new handle in `AddMapping` when the last unmap dropped the old one.
 
-The meta store holds at most 4 KiB of names and values for one inode, and it fails with `ENOSPC` above that size. A single value above 64 KiB fails with `E2BIG`. The names of a hard-linked file share one set of attributes. The `.gvx_meta` table holds at most 262,144 records. A mutation that needs a new record above that limit fails with `ENOSPC`.
+The meta store holds at most 4 KiB of names and values for one inode, and it fails with `ENOSPC` above that size. A single value above 64 KiB fails with `E2BIG`. The names of a hard-linked file share one set of attributes. The memory cap of the `.gvx_meta` table applies to the attributes too, as "Metadata Records and File Identity" describes.
 
 ### 3.8 Volume File System: `pkg/sentry/fsimpl/ext4lite`
 
