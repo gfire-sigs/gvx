@@ -401,12 +401,13 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	ino := d.inode
 	if !keepSize && limits.FromContext(ctx) != nil && (op == allocReserve || op == allocZero && offset+length > ino.size()) {
 		// Like Linux, a call that grows the file past RLIMIT_FSIZE fails whole.
+		// The system call turns the error into SIGXFSZ and EFBIG.
 		limit, err := vfs.CheckLimit(ctx, int64(offset), int64(length))
 		if err != nil {
 			return err
 		}
 		if limit < int64(length) {
-			return linuxerr.EFBIG
+			return linuxerr.ErrExceedsFileSizeLimit
 		}
 	}
 	return d.fs.writeOp(fd.vfsfd.Mount(), func() error { return fd.allocateLocked(ino, op, offset, length, keepSize) })
@@ -449,19 +450,15 @@ func (fd *regularFD) allocateLocked(ino *inode, op allocOp, offset, length uint6
 		ino.data.Punched(offset, length)
 		ino.data.truncated(old, ino.size())
 	case allocCollapse, allocInsert:
-		// Every byte from the offset on moves, so the mapped pages from there
-		// on go away. A mapping reads them again from the engine.
-		if err := ino.data.FlushRange(offset, math.MaxUint64); err != nil {
-			return toLinuxErr(err)
-		}
+		// Every byte from the offset on moves. The cache writes back, changes,
+		// and reloads under its own locks, so a mapped store never falls between.
 		change := ino.n.collapseRange
 		if op == allocInsert {
 			change = ino.n.insertRange
 		}
-		if err := change(offset, length); err != nil {
+		if err := ino.data.ShiftFrom(offset, func() error { return change(offset, length) }); err != nil {
 			return toLinuxErr(err)
 		}
-		ino.data.InvalidateFrom(offset)
 	default:
 		if err := ino.n.preallocate(offset, length, keepSize); err != nil {
 			return toLinuxErr(err)

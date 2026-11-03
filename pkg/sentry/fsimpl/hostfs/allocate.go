@@ -74,7 +74,7 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 			return err
 		}
 		if limit < int64(length) {
-			return linuxerr.EFBIG
+			return linuxerr.ErrExceedsFileSizeLimit
 		}
 	}
 	d := fd.dentry

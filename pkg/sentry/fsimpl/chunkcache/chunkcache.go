@@ -523,23 +523,47 @@ func (c *Cache) InvalidateShrink(size uint64, dropped []*Chunk) {
 	}
 }
 
-// InvalidateFrom drops every chunk that overlaps [start, infinity) and
-// invalidates the mappings of that range. A mapping then loads the bytes again
-// from the backend. A backend calls it after a change that moves the bytes of a
-// file, such as a collapse or an insert of a range, and it writes back the dirty
-// chunks of the range before.
-func (c *Cache) InvalidateFrom(start uint64) {
+// ShiftFrom runs change, which moves the bytes of the file from start on, such
+// as a collapse or an insert of a range. It keeps the cache coherent with the
+// move. The caller holds the lock that orders writers of the backend.
+//
+// Under MapsMu and DataMu the call writes back the dirty chunks of the range,
+// runs change, and then reloads the cache. No store through a mapping and no
+// write-back of a removed mapping falls between the write-back and the change.
+// A chunk that starts at or after start is dropped. The chunk that straddles
+// start stays, because mappings of its lower pages still use it: the call
+// clears its bytes from start on and loads them again from the backend. Then the
+// mappings from the page of start on are invalidated, and they load the new
+// bytes at their next access. When change fails, the cache keeps its chunks.
+func (c *Cache) ShiftFrom(start uint64, change func() error) error {
 	if !c.Active.Load() {
-		return
+		return change()
 	}
 	c.MapsMu.Lock()
 	defer c.MapsMu.Unlock()
 	c.DataMu.Lock()
+	if err := c.backend.FlushLocked(start, math.MaxUint64); err != nil {
+		c.DataMu.Unlock()
+		return err
+	}
+	if err := change(); err != nil {
+		c.DataMu.Unlock()
+		return err
+	}
 	var dropped []*Chunk
+	var refill error
 	for idx, ch := range c.Chunks {
-		if idx<<ChunkShift+ChunkSize > start {
+		base := idx << ChunkShift
+		switch {
+		case base >= start:
 			dropped = append(dropped, ch)
 			delete(c.Chunks, idx)
+		case base+ChunkSize > start:
+			tail := ch.Buf[start-base:]
+			clear(tail)
+			if err := c.backend.ReadChunkAtLocked(tail, int64(start)); err != nil && !errors.Is(err, io.EOF) {
+				refill = errors.Join(refill, err)
+			}
 		}
 	}
 	c.DataMu.Unlock()
@@ -548,6 +572,7 @@ func (c *Cache) InvalidateFrom(start uint64) {
 	for _, ch := range dropped {
 		ch.Release()
 	}
+	return refill
 }
 
 // ChunkLocked returns the chunk at idx, loading it from the backend when absent.

@@ -27,8 +27,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
@@ -43,7 +45,7 @@ func main() {
 	var steps []func(dir string) error
 	switch os.Args[1] {
 	case "ext4lite":
-		steps = []func(string) error{tmpfileLink, rangeModes, rwFlags}
+		steps = []func(string) error{tmpfileLink, rangeModes, rwFlags, sizeLimit}
 	case "hostfs":
 		steps = []func(string) error{hostfsModes}
 	default:
@@ -193,6 +195,19 @@ func rangeModes(dir string) error {
 		return err
 	}
 
+	// A reservation behind the end of the file keeps the size. The image must
+	// stay clean for e2fsck, which the test checks after the guest exits.
+	if err := unix.Fallocate(fd, unix.FALLOC_FL_KEEP_SIZE, 0, 16*block); err != nil {
+		return fmt.Errorf("fallocate KEEP_SIZE: %w", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil || st.Size != int64(len(content)) {
+		return fmt.Errorf("size after KEEP_SIZE = %d, %v, want %d", st.Size, err, len(content))
+	}
+	if err := check("after the reservation", fd, content); err != nil {
+		return err
+	}
+
 	if err := unix.Fallocate(fd, unix.FALLOC_FL_ZERO_RANGE|unix.FALLOC_FL_KEEP_SIZE, 2*block, 3*block); err != nil {
 		return fmt.Errorf("fallocate ZERO_RANGE|KEEP_SIZE: %w", err)
 	}
@@ -323,4 +338,45 @@ func hostfsModes(dir string) error {
 		return fmt.Errorf("size after KEEP_SIZE = %d, %v, want %d", st.Size, err, len(content))
 	}
 	return wantErrno("ZERO_RANGE on hostfs", unix.Fallocate(fd, unix.FALLOC_FL_ZERO_RANGE, 0, block), unix.EOPNOTSUPP)
+}
+
+// sizeLimit checks that a fallocate call that grows a file past RLIMIT_FSIZE
+// fails with EFBIG and sends SIGXFSZ, for mode 0 and for ZERO_RANGE.
+func sizeLimit(dir string) error {
+	fd, err := unix.Open(filepath.Join(dir, "limited"), unix.O_CREAT|unix.O_RDWR|unix.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs, syscall.SIGXFSZ)
+	defer signal.Stop(sigs)
+	var old unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_FSIZE, &old); err != nil {
+		return err
+	}
+	if err := unix.Setrlimit(unix.RLIMIT_FSIZE, &unix.Rlimit{Cur: 4 * block, Max: old.Max}); err != nil {
+		return err
+	}
+	defer unix.Setrlimit(unix.RLIMIT_FSIZE, &old)
+	calls := []struct {
+		name         string
+		mode         uint32
+		offset, size int64
+	}{
+		{"mode 0", 0, 0, 8 * block},
+		{"ZERO_RANGE from below the limit", unix.FALLOC_FL_ZERO_RANGE, 0, 8 * block},
+		{"ZERO_RANGE from above the limit", unix.FALLOC_FL_ZERO_RANGE, 6 * block, block},
+	}
+	for _, c := range calls {
+		if err := wantErrno("fallocate "+c.name+" past RLIMIT_FSIZE", unix.Fallocate(fd, c.mode, c.offset, c.size), unix.EFBIG); err != nil {
+			return err
+		}
+		select {
+		case <-sigs:
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("fallocate %s past RLIMIT_FSIZE sent no SIGXFSZ", c.name)
+		}
+	}
+	return nil
 }

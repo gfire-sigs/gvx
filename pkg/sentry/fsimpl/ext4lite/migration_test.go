@@ -350,14 +350,18 @@ func TestMigrationReplicatesEveryWriteSite(t *testing.T) {
 			},
 		},
 		{
-			name: "preallocate zero-fills new blocks",
+			// A reservation maps unwritten blocks and writes none. The drain
+			// carries the data that a later write puts into them.
+			name: "write over a reservation",
 			setup: func(t *testing.T, v *volume, root *node) {
 				createChild(t, v, root, "a", modeRegular|0o644)
 			},
 			mutate: func(t *testing.T, v *volume, root *node) {
-				if err := lookupNode(t, v, root, "a").preallocate(0, 3<<20, false); err != nil {
+				a := lookupNode(t, v, root, "a")
+				if err := a.preallocate(0, 3<<20, false); err != nil {
 					t.Fatal(err)
 				}
+				writeAll(t, a, 0, pattern(5, 3<<20))
 			},
 		},
 		{

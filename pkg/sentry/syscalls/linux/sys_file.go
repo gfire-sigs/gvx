@@ -1744,7 +1744,7 @@ func Fallocate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		return 0, nil, linuxerr.EFBIG
 	}
 
-	return 0, nil, file.Allocate(t, mode, uint64(offset), uint64(length))
+	return 0, nil, handleSetSizeError(t, file.Allocate(t, mode, uint64(offset), uint64(length)))
 }
 
 // Flock implements linux syscall flock(2).

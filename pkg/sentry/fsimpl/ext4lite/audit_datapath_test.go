@@ -16,6 +16,7 @@ package ext4lite
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -393,8 +394,14 @@ func TestFallocateChecksFileSizeLimit(t *testing.T) {
 	}
 	defer func() { _, _ = testLimits.Set(limits.FileSize, old, true) }()
 
-	if err := fd.Allocate(d.e.ctx, 0, 0, 8*blockSize); !linuxerr.Equals(linuxerr.EFBIG, err) {
-		t.Errorf("fallocate past RLIMIT_FSIZE fails with %v, want EFBIG", err)
+	// The system call turns this error into SIGXFSZ and EFBIG.
+	if err := fd.Allocate(d.e.ctx, 0, 0, 8*blockSize); !errors.Is(err, linuxerr.ErrExceedsFileSizeLimit) {
+		t.Errorf("fallocate past RLIMIT_FSIZE fails with %v, want ErrExceedsFileSizeLimit", err)
+	}
+	for _, off := range []uint64{0, 6 * blockSize} {
+		if err := fd.Allocate(d.e.ctx, linux.FALLOC_FL_ZERO_RANGE, off, 8*blockSize); !errors.Is(err, linuxerr.ErrExceedsFileSizeLimit) {
+			t.Errorf("zero range at %d past RLIMIT_FSIZE fails with %v, want ErrExceedsFileSizeLimit", off, err)
+		}
 	}
 	if st := d.e.mustStat("/f"); st.Size != 0 || st.Blocks != 0 {
 		t.Errorf("the refused fallocate left size %d and %d sectors", st.Size, st.Blocks)

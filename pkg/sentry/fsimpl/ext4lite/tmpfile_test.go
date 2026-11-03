@@ -263,3 +263,21 @@ func TestCrashAfterLinkKeepsTheNamedFile(t *testing.T) {
 		t.Fatalf("nlink %d after the crash, want 1", st.Nlink)
 	}
 }
+
+// TestTmpfileLinkNeedsOwnershipOrAccess gives a user the descriptor of an
+// unnamed file that the user does not own. Like any hard link, the link of such
+// a file fails with EPERM when the user can neither read nor write it.
+func TestTmpfileLinkNeedsOwnershipOrAccess(t *testing.T) {
+	e := newEnv(t)
+	e.mustMkdir("d")
+	if err := e.setStat("d", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o777}); err != nil {
+		t.Fatal(err)
+	}
+	fd := e.mustOpenTmpfile("d", linux.O_RDWR, 0o600)
+	user := userCreds(1000, 1000)
+	old := &vfs.PathOperation{Root: e.root, Start: fd.VirtualDentry(), Path: fspath.Path{}}
+	wantErrno(t, "link of a file that the caller cannot use", e.vfsObj.LinkAt(e.ctx, user, old, e.pop("d/x")), linuxerr.EPERM)
+	if names := e.readdir("d"); len(names) != 0 {
+		t.Fatalf("the directory lists %v after the refused link", names)
+	}
+}

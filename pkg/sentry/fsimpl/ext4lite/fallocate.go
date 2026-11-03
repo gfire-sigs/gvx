@@ -109,9 +109,9 @@ func (n *node) zeroRange(off, length uint64, keepSize bool) error {
 	if first > last {
 		edges = edges[:1]
 	}
-	if err := n.clearEdgesLocked(edges); err != nil {
-		return err
-	}
+	// The mapping goes first, because it is the step that can fail for lack of
+	// space. A failed call then has changed no byte. The edge blocks lie outside
+	// the blocks that the mapping converts.
 	if first < last {
 		list, fresh, err := n.zeroMappingLocked(uint32(first), uint32(last))
 		if err != nil {
@@ -120,6 +120,10 @@ func (n *node) zeroRange(off, length uint64, keepSize bool) error {
 		if err := n.installMappingLocked(list, fresh, allBlocks); err != nil {
 			return err
 		}
+	}
+	if err := n.clearEdgesLocked(edges); err != nil {
+		n.markDirtyLocked()
+		return err
 	}
 	if !keepSize && end > n.size {
 		n.size = end
