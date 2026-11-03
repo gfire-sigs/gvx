@@ -555,7 +555,7 @@ A host editor can replace the file with an atomic rename. Each fresh open resolv
 
 #### Host Event Bridge (Descriptive Module)
 
-The host watcher turns a change that a host process makes into a guest `inotify` event. A host watch exists only for an object that a guest `inotify` instance watches. The first guest watch on a dentry attaches the host watch, and `OnZeroWatches` detaches it. One workspace watches at most 8,192 objects.
+The host watcher turns a change that a host process makes into a guest `inotify` event. A host watch exists only for an object that a guest `inotify` instance watches. The first guest watch on a dentry attaches the host watch, and `OnZeroWatches` detaches it. The host sets the cap of watched objects for one workspace. See "Cap of Watched Objects" below.
 
 Each platform uses a primitive that works after the lockdown. On Linux, a revalidator scans the watched directories and files every 200 ms with `fstatat` and `getdents64` through the pinned handles. It runs only while a watch exists, and it adds no system call to the seccomp allowlist. On macOS, `kqueue` with `EVFILT_VNODE` watches descriptors that `openat` opened below the pinned directories. It needs no `FSEvents` Mach service. On Windows, overlapped `ReadDirectoryChangesW` watches handles that `NtCreateFile` opened with `FILE_LIST_DIRECTORY`.
 
@@ -563,7 +563,21 @@ A backend only says when to look. The scan compares the state of the object with
 
 A guest mutation must not echo. A mutation of names removes the name from the next scan. A mutation of content or times records the host state that it produced, under a generation counter, and a scan that finds the same state sends nothing. A change that the guest did not make drops the clean chunks of the page cache and the cached metadata before the event leaves. A guest that reacts to the event therefore reads the new bytes through `read` and `mmap`. Chunks that a writable mapping dirtied stay.
 
-The cap is visible to the guest. Before `inotify_add_watch(2)` adds a watch, the syscall layer calls `AdmitInotifyWatch` on a dentry that implements it. The seam is in `pkg/sentry/syscalls/linux/sys_inotify.go`. The hostfs dentry attaches the host watch and returns `ENOSPC` when the workspace already watches 8,192 other objects. An object that has a host watch always passes, so a mask update or a second `inotify` instance never fails. A host error other than `ENOSPC` leaves the guest watch without host events, and the watcher logs it once.
+The cap is visible to the guest. Before `inotify_add_watch(2)` adds a watch, the syscall layer calls `AdmitInotifyWatch` on a dentry that implements it. The seam is in `pkg/sentry/syscalls/linux/sys_inotify.go`. The hostfs dentry attaches the host watch and returns `ENOSPC` when the workspace already watches as many other objects as the cap allows. Linux returns the same error above `fs.inotify.max_user_watches`. An object that has a host watch always passes, so a mask update or a second `inotify` instance never fails. A host error other than `ENOSPC` leaves the guest watch without host events, and the watcher logs it once.
+
+#### Cap of Watched Objects (Descriptive Module)
+
+The cap protects the host resources of a watch. `OpenWorkspace` sets it before the lockdown. The Linux filter does not allow `getrlimit` afterwards.
+
+| Host | Cost of one watched object | Cap |
+| :--- | :--- | :--- |
+| Linux | One pinned descriptor for a directory. | The soft `RLIMIT_NOFILE` minus 1,024 descriptors, between 2,048 and 65,536. A limit of 1,048,576 gives 65,536. |
+| macOS | One pinned descriptor for a directory, and up to 4,096 `kqueue` registrations for the whole workspace. | The soft `RLIMIT_NOFILE` minus 1,024 and minus 4,096 descriptors, between 2,048 and 65,536. The stock limit of 10,240 gives 5,120. |
+| Windows | One directory handle and one 4 KiB buffer. | 32,768 objects. The buffers take at most 128 MiB. |
+
+A cap above the descriptor limit makes every later open of the sandbox fail with `EMFILE`. A higher `ulimit -n` therefore raises the cap on Linux and macOS. Earlier releases used a fixed cap of 8,192 objects and the buffer of Windows held 64 KiB.
+
+The scans of the poll backend of Linux, and of the fallback timer of macOS for objects without a `kqueue` registration, take tens of microseconds for each directory. A pass over 65,536 directories would keep one core busy all the time. A pass that takes time `d` therefore waits for `3d` before the next pass, and never for less than 200 ms. The scans take at most a quarter of one core. A host change in a very large watch set shows up after seconds and not after 200 ms.
 
 #### Metadata Records and File Identity (Descriptive Module)
 
@@ -595,7 +609,11 @@ The table may use 128 MiB of estimated memory, which fits about 300,000 plain re
 
 A guest symbolic link lives only in `.gvx_meta`. The host never receives a link, so any target is valid except the empty string and a string with a NUL byte. The Sentry resolves the target in the guest namespace. `RENAME_EXCHANGE` uses `renameat2` on Linux and `renameatx_np` on macOS. Windows swaps two names with three renames through a `~gvx~swap` file, under `Workspace.mu`. `RENAME_WHITEOUT` moves the source and creates a character device `0:0` at the old name.
 
-`fallocate` supports mode 0, `FALLOC_FL_KEEP_SIZE`, and `FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`. A volume or a range that the host call cannot serve takes a zero-fill emulation. A linkable `O_TMPFILE` file keeps a hidden `~gvx~tmp` host file until the last reference ends. The host seccomp rule refuses `linkat` with `AT_EMPTY_PATH`. An `O_TMPFILE|O_EXCL` file uses native `O_TMPFILE` on Linux. A file with no name reports a link count of zero. A running program makes every write open, `truncate`, and writable shared mapping fail with `ETXTBSY`. `statfs` reports the host volume.
+`fallocate` supports mode 0, `FALLOC_FL_KEEP_SIZE`, and `FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`. A volume or a range that the host call cannot serve takes a zero-fill emulation. The system call forwards a mode other than 0 only to a file description that implements `ServesFallocateModes`. The seam is in `pkg/sentry/syscalls/linux/sys_file.go`. Other file systems keep the answer `ENOTSUP` for such a mode.
+
+On Windows, a punch marks the file sparse and calls `FSCTL_SET_ZERO_DATA`. NTFS then frees the whole clusters of the range, and the allocation size of the host file drops. The file stays sparse. The bytes of a partial cluster at an edge read as zeros and stay allocated. A volume without sparse files, such as FAT or exFAT, takes the zero-fill emulation. A file whose `$ATTRIBUTE_LIST` is full takes it too. Many holes in one file fragment that list, and NTFS stops at about 256 KiB of it with `ERROR_FILE_SYSTEM_LIMITATION` (see `docs/gvxip/gvxip-002-ext4lite-volume-engine.md`, section 2). Such a file keeps its holes, and its later punches write zeros. The `st_blocks` of the guest still shows the logical size on Windows.
+
+A linkable `O_TMPFILE` file keeps a hidden `~gvx~tmp` host file until the last reference ends. The host seccomp rule refuses `linkat` with `AT_EMPTY_PATH`. An `O_TMPFILE|O_EXCL` file uses native `O_TMPFILE` on Linux. A file with no name reports a link count of zero. A running program makes every write open, `truncate`, and writable shared mapping fail with `ETXTBSY`. `statfs` reports the host volume.
 
 Metadata mutations reach `.gvx_meta` after 250 ms. `fsync`, `fdatasync`, `sync`, and writes with `O_SYNC` or `O_DSYNC` skip that delay. They flush the mapped pages, the host file, the directory entry, and the table. A table without changes costs no host call.
 
@@ -672,11 +690,19 @@ A writable mount of a volume with a journal sets the recovery flag in the superb
 
 A guest can unlink a file and keep it open. The inode then has no link. The volume keeps these inodes in the orphan list of ext4: `s_last_orphan` names the first inode, and the field `i_dtime` of each inode names the next one. A mount frees every inode of the list.
 
+An `open` with `O_TMPFILE` creates an inode with no link and no directory entry. The orphan list already serves such an inode, so the last close frees it and a crash cannot leak it. `O_TMPFILE` without `O_EXCL` marks the inode linkable. A `linkat` with `AT_EMPTY_PATH`, or through `/proc/self/fd`, gives a linkable inode its first name. The transaction of the link removes the inode from the orphan list and clears its deletion time. A file with no link that `O_TMPFILE|O_EXCL` made, or that an `unlink` left, refuses `linkat` with `ENOENT`. The name that a link creates gets a new dentry. The dentry of the open descriptor stays out of the tree and reports `(deleted)`.
+
+`fallocate` serves a reservation (mode 0 and `FALLOC_FL_KEEP_SIZE`), `FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_ZERO_RANGE` with or without `FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_COLLAPSE_RANGE`, and `FALLOC_FL_INSERT_RANGE`. The checks and the error codes follow `vfs_fallocate` and `ext4_fallocate`. A mode with two operations, `FALLOC_FL_UNSHARE_RANGE`, and `FALLOC_FL_NO_HIDE_STALE` fail with `EOPNOTSUPP`.
+
+A zero range turns the whole blocks of the range into uninitialized extents, and a hole of the range gets new uninitialized blocks. The bytes of a partial block at an edge are cleared in place. A collapse and an insert need block-aligned arguments, or they fail with `EINVAL`. A collapse fails with `EINVAL` when its range reaches the end of the file. An insert fails with `EINVAL` at or past the end of the file, and with `EFBIG` when the new size exceeds the largest file. Each of these three calls changes only the extent list and the size of the inode, so one transaction of the journal holds it. A crash leaves the state before the call or the state after it. The mapped pages from the offset of a collapse or an insert go away, and a mapping reads them again from the volume.
+
+A read and a write accept the flags `RWF_HIPRI`, `RWF_DSYNC`, `RWF_SYNC`, `RWF_NOWAIT`, `RWF_APPEND`, and `RWF_NOAPPEND`. `RWF_APPEND` writes at the end of the file for one call. `RWF_NOAPPEND` writes at the offset for one call, also on a description with `O_APPEND`. The two flags together fail with `EINVAL`, and any other flag fails with `EOPNOTSUPP`. `RWF_NOWAIT` never returns `EAGAIN`, because no page cache lies between a call and the engine.
+
 #### Volumes Without a Journal (Descriptive Module)
 
 A volume of an older release has no journal. The first writable mount adds one when group 0 has a free run of 1024 blocks. A volume without that room stays without a journal. It writes the blocks of a flush in an order that `fsckLite` can repair. The order depends on the size change. A volume that grows writes the new group, then the superblock, then the inodes. A volume that shrinks writes the inodes, then the superblock, then the descriptors. Otherwise the superblock goes last. A writable mount clears the valid bit in block 0 and syncs it before the first guest write.
 
-A mount that finds the valid bit clear, or the error flag set, runs `fsckLite`. It walks the tree from the root inode and rebuilds the bitmaps and the link counts from what it reaches. It frees every inode that no directory names, and it frees the blocks of those inodes. It creates no `lost+found` directory. A damaged object below the root does not fail the mount. The walk drops the directory entry that names it, replaces a directory block that does not parse with an empty block, keeps the first name of a directory that two entries name, and keeps the first owner of a block that two inodes claim. A root inode that is not a directory fails with `EUCLEAN`. Without a journal, a rename across directories is not atomic, and a power loss can leave stale data in a new file.
+A mount that finds the valid bit clear, or the error flag set, runs `fsckLite`. It walks the tree from the root inode and rebuilds the bitmaps and the link counts from what it reaches. A directory entry can name an inode whose link count is zero on the disk, for example after the link of an `O_TMPFILE` file. The walk gives that inode the rebuilt count. `fsckLite` frees every inode that no directory names, and it frees the blocks of those inodes. It creates no `lost+found` directory. A damaged object below the root does not fail the mount. The walk drops the directory entry that names it, replaces a directory block that does not parse with an empty block, keeps the first name of a directory that two entries name, and keeps the first owner of a block that two inodes claim. A root inode that is not a directory fails with `EUCLEAN`. Without a journal, a rename across directories is not atomic, and a power loss can leave stale data in a new file.
 
 #### Live Migration Block Tracking (Descriptive Module)
 
