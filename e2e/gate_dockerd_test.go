@@ -165,6 +165,10 @@ func TestE2EDockerRunDindEngine(t *testing.T) {
 			expect("CONTROL-ALPINE-OK\n")
 			expect("CONTROL-GO-OK\n")
 			expect("MEASURE ")
+			expect("\n")
+			if i := strings.LastIndex(stdout.String()[:next], "MEASURE "); i >= 0 {
+				t.Logf("idle alpine container: %s", strings.TrimSpace(stdout.String()[i:next]))
+			}
 			expect("STATS-MEMORY ")
 			expect("IPTABLES-SAVE-OK\n")
 			expect("LIMITED-EXIT 137\n")
