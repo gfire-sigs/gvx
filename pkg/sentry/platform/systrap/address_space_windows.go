@@ -262,6 +262,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	var copied *anonSection
 	if fd := f.FD(); fd >= 0 {
 		var err error
+		as.p.watchHostWrites(f, uintptr(fd))
 		if sec, err = as.p.sections.get(windows.Handle(fd), fr.End, at.Write); err != nil {
 			sec = nil
 			if at.Write {
