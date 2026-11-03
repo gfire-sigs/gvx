@@ -64,6 +64,10 @@ type execBlock struct {
 	// stepSnap holds the bytes of the copy at the time a store step made the
 	// copy writable, or nil. storestep_windows.go explains the window.
 	stepSnap []byte
+	// stale is true when a write of the Sentry reached the frame while the
+	// window was open. The close drops the copy even if the store changed no
+	// byte.
+	stale bool
 }
 
 // copyHold counts the pages of an address space that still map a copied section.

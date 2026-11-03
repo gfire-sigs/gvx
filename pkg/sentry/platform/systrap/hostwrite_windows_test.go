@@ -21,6 +21,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 )
 
 // writeFrame writes code at the start of the frame the way a Sentry file
@@ -112,4 +113,53 @@ func TestSentryWriteLeavesOtherFramesAlone(t *testing.T) {
 	if got := r.p.HostWriteDrops(); got != 0 {
 		t.Errorf("frames that lost a copy = %d, want 0", got)
 	}
+}
+
+// wrappedFile hides the type of a memory file behind a wrapper, as the chunk
+// memory of hostfs and ext4lite does.
+type wrappedFile struct{ *pgalloc.MemoryFile }
+
+// TestWrapperOfAMemoryFileGetsOneObserver maps one memory file through the
+// file and through a wrapper of it. The platform must watch the file once,
+// and a Sentry write must still drop the copy.
+func TestWrapperOfAMemoryFileGetsOneObserver(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	fr, _ := r.allocFrames(2, gSyscall(41))
+	code := memmap.FileRange{Start: fr.Start, End: fr.Start + blockSize}
+	other := memmap.FileRange{Start: fr.Start + blockSize, End: fr.End}
+	if err := r.as.MapFile(rxVA, wrappedFile{r.mf}, code, execAccess, false); err != nil {
+		t.Fatalf("MapFile through the wrapper: %v", err)
+	}
+	r.mapRange(rxVA+blockSize, other, hostarch.Read)
+	r.program(gJump(rxVA))
+	r.wantCall(41)
+	if got := len(r.p.hostWrites.stops); got != 1 {
+		t.Errorf("the platform watches the file with %d observers, want 1", got)
+	}
+	writeFrame(t, r, code, 0, gSyscall(42))
+	r.ac.SetIP(codeVA)
+	r.wantCall(42)
+}
+
+// TestSentryWriteDuringAStoreWindowDropsTheCopy writes a frame from the Sentry
+// while a store step holds the copy of that frame open, and then closes the
+// window although the store changed no byte. The copy must not survive.
+func TestSentryWriteDuringAStoreWindowDropsTheCopy(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	fr, mem := r.allocFrames(1, gSyscall(41))
+	r.mapRange(codeVA, fr, rwxAccess)
+	r.mapStack()
+	r.wantCall(41)
+
+	w, res, err := r.as.openStoreWindow(codeVA+0x400, codeVA)
+	if err != nil || res != windowOpen {
+		t.Fatalf("openStoreWindow = (%v, %v), want an open window", res, err)
+	}
+	copy(mem, gSyscall(42))
+	r.mf.NoteHostWrite(fr)
+	if err := r.as.closeStoreStep(&storeStep{windows: []storeWindow{w}}); err != nil {
+		t.Fatalf("closeStoreStep: %v", err)
+	}
+	r.ac.SetIP(codeVA)
+	r.wantCall(42)
 }

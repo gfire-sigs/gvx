@@ -41,8 +41,9 @@ import (
 // Sentry file systems, and they write within the same call.
 
 // hostWriteSource is a memory file that reports the writes of Sentry code.
-// pgalloc.MemoryFile implements it on Windows. The type is a pointer type, so
-// it works as a map key.
+// pgalloc.MemoryFile implements it on Windows. A wrapper that embeds the file,
+// such as the chunk memory of hostfs, implements it too, so the platform keys
+// its observers by the host handle of the file and not by the value.
 type hostWriteSource interface {
 	ObserveHostWrites(fn func(memmap.FileRange)) (stop func())
 }
@@ -50,7 +51,7 @@ type hostWriteSource interface {
 // hostWriteWatch holds the observers that the platform registered.
 type hostWriteWatch struct {
 	mu     sync.Mutex
-	stops  map[hostWriteSource]func()
+	stops  map[uintptr]func()
 	closed bool
 }
 
@@ -68,15 +69,15 @@ func (p *Platform) watchHostWrites(f memmap.File, file uintptr) {
 	if w.closed {
 		return
 	}
-	if _, ok := w.stops[src]; ok {
+	if _, ok := w.stops[file]; ok {
 		return
 	}
 	copies := p.alias.copyCount(file)
 	stop := src.ObserveHostWrites(func(fr memmap.FileRange) { p.hostWrote(file, copies, fr) })
 	if w.stops == nil {
-		w.stops = make(map[hostWriteSource]func())
+		w.stops = make(map[uintptr]func())
 	}
-	w.stops[src] = stop
+	w.stops[file] = stop
 }
 
 // stopHostWrites removes every observer of the platform.

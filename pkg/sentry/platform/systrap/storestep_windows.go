@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"bytes"
 	"fmt"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -182,8 +183,8 @@ func (as *addressSpace) closeStoreWindowLocked(blk *execBlock) (frameKey, bool, 
 	if as.released || as.blocks[blk.base] != blk || blk.stepSnap == nil || blk.state != blockExec {
 		return frameKey{}, false, nil
 	}
-	snap := blk.stepSnap
-	blk.stepSnap = nil
+	snap, stale := blk.stepSnap, blk.stale
+	blk.stepSnap, blk.stale = nil, false
 	// Stores that land after this call fault, and the next step reopens a
 	// window. So every store that the diff misses faults again.
 	if err := as.win.Map(blk.base, blockSize, &blk.priv.chunk.ref, blk.priv.off, viewReadExec); err != nil {
@@ -197,7 +198,7 @@ func (as *addressSpace) closeStoreWindowLocked(blk *execBlock) (frameKey, bool, 
 			changed = true
 		}
 	}
-	if !changed {
+	if !changed && !stale {
 		return frameKey{}, false, nil
 	}
 	key, _ := blk.frameID()
@@ -298,6 +299,35 @@ func (th *thread) serveStoreFault(as *addressSpace, ev debugEvent, addr uint64) 
 	return running, true
 }
 
+// windowCodeChanged reports whether a store of the step changed the bytes that
+// the thread fetches next. The window runs the copy, and the copy of a changed
+// instruction is not patched, so the step must end and let the engine scan the
+// new bytes before the thread runs them.
+func (th *thread) windowCodeChanged(st *storeStep) bool {
+	as := th.sp.owner.Load()
+	if as == nil {
+		return false
+	}
+	pc := th.ctx.pc()
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	for _, w := range st.windows {
+		blk := w.blk
+		if blk == nil || blk.stepSnap == nil || blk.state != blockExec {
+			continue
+		}
+		lo, hi := max(pc, blk.base), min(pc+fetchWindow, blk.base+blockSize)
+		if lo >= hi {
+			continue
+		}
+		cur, snap := blk.priv.bytes(), blk.stepSnap
+		if !bytes.Equal(cur[lo-blk.base:hi-blk.base], snap[lo-blk.base:hi-blk.base]) {
+			return true
+		}
+	}
+	return false
+}
+
 // storeStepStop serves the single step that follows a store. It reports false
 // when the thread has no store step.
 func (th *thread) storeStepStop(ev debugEvent) (outcome, bool) {
@@ -306,7 +336,7 @@ func (th *thread) storeStepStop(ev debugEvent) (outcome, bool) {
 		return outcome{}, false
 	}
 	st.steps++
-	if th.ctx.pc() == st.pc && st.steps < storeRepeatLimit {
+	if th.ctx.pc() == st.pc && st.steps < storeRepeatLimit && !th.windowCodeChanged(st) {
 		// The instruction did not retire, as a REP store does after one
 		// iteration. The next iteration needs the window too.
 		if err := th.continueEvent(ev); err != nil {

@@ -67,6 +67,11 @@ type thread struct {
 	storeStep   *storeStep
 	storeFaults int
 
+	// staleAt and stale count the faults at one pc that the engine retried
+	// because the view already allowed the access. Callers hold mu.
+	staleAt uint64
+	stale   int
+
 	// closeOnce makes sure that the handle closes once. The stub process and
 	// the context can both release the thread, and a second CloseHandle could
 	// close a new object that reuses the handle value.
@@ -264,6 +269,7 @@ func (th *thread) start(ac *arch.Context64, loadFP bool) error {
 	th.stepping = false
 	th.lastExecPC, th.execRepeats = 0, 0
 	th.storeFaults = 0
+	th.stale = 0
 	// A step that an earlier stop left open would keep a page writable.
 	_ = th.closeStoreStepLocked()
 	return th.archStart(ac)

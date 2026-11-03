@@ -19,6 +19,8 @@ package systrap
 import (
 	"bytes"
 	"testing"
+
+	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 // TestRepStoreIntoTheExecutingPage fills 256 bytes of the executing page with
@@ -74,5 +76,30 @@ func TestStackInTheExecutingPage(t *testing.T) {
 				t.Errorf("the stack slot holds %#x, want the return address %#x", got, codeVA+uint64(len(toStack)+5))
 			}
 		})
+	}
+}
+
+// TestRepStoreThatOverwritesItselfRunsPatchedCode makes REP MOVSW copy the bytes
+// of a SYSCALL over its own prefix bytes. The thread then fetches the new
+// instruction from the window. The engine must end the step and scan the page,
+// so the system call reaches the Sentry. Run unscanned, it would reach the
+// kernel of the host.
+func TestRepStoreThatOverwritesItselfRunsPatchedCode(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	code := imm64([]byte{0x48, 0xBE}, dataVA) // mov rsi, dataVA
+	rdi := len(code)
+	code = append(code, imm64([]byte{0x48, 0xBF}, 0)...) // mov rdi, <rep>
+	code = append(code, 0xB9, 0x02, 0x00, 0x00, 0x00)    // mov ecx, 2
+	code = append(code, 0xB8, 77, 0x00, 0x00, 0x00)      // mov eax, 77
+	code = append(code, 0xFC)                            // cld
+	rep := len(code)
+	code = append(code, 0x66, 0xF3, 0xA5) // rep movsw
+	copy(code[rdi+2:], le64(codeVA+uint64(rep)))
+	r.mapPage(codeVA, rwxAccess, code)
+	r.mapPage(dataVA, hostarch.ReadWrite, []byte{0x0F, 0x05})
+	r.mapStack()
+	r.wantCall(77)
+	if got := regPC(r.ac); got != codeVA+uint64(rep)+2 {
+		t.Errorf("pc after the system call = %#x, want %#x", got, codeVA+uint64(rep)+2)
 	}
 }
