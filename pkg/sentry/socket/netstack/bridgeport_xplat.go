@@ -39,6 +39,12 @@ func (s *Stack) setBridgePortInfo(id tcpip.NICID, protinfo nlmsg.BytesView) *sys
 		// Linux accepts bridge port attributes only for bridge ports.
 		return syserr.ErrNotSupported
 	}
+	return checkBridgePortInfo(protinfo)
+}
+
+// checkBridgePortInfo validates the nested attributes of IFLA_PROTINFO. The
+// stack knows only the hairpin mode. As in Linux, any non-zero byte turns it on.
+func checkBridgePortInfo(protinfo nlmsg.BytesView) *syserr.Error {
 	attrs, ok := nlmsg.AttrsView(protinfo).Parse()
 	if !ok {
 		return syserr.ErrInvalidArgument
@@ -47,7 +53,7 @@ func (s *Stack) setBridgePortInfo(id tcpip.NICID, protinfo nlmsg.BytesView) *sys
 		if t&linux.NLA_TYPE_MASK != iflaBrportMode {
 			return syserr.ErrNotSupported
 		}
-		if len(v) != 1 || v[0] > 1 {
+		if len(v) != 1 {
 			return syserr.ErrInvalidArgument
 		}
 	}

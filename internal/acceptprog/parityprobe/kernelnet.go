@@ -54,7 +54,7 @@ const (
 	nlmFAck         = 0x4
 	nlmFExcl        = 0x200
 	nlmFCreate      = 0x400
-	linkStats64Size = 24 * 8
+	linkStats64Size = 25 * 8
 )
 
 // nlAlign rounds n up to a multiple of 4, the alignment of netlink.
@@ -187,6 +187,14 @@ func checkLinkConfDirectories() error {
 	if !slices.Contains(names, "probebr0") {
 		return fmt.Errorf("%s lists %v, want the new link probebr0", confDir, names)
 	}
+	readConf := func(link string) string {
+		got, err := os.ReadFile(confDir + "/" + link + "/route_localnet")
+		if err != nil {
+			return err.Error()
+		}
+		return string(got)
+	}
+	allBefore, loBefore := readConf("all"), readConf("lo")
 	path := confDir + "/probebr0/route_localnet"
 	for _, v := range []string{"1\n", "0\n"} {
 		if err := os.WriteFile(path, []byte(v), 0o644); err != nil {
@@ -196,6 +204,12 @@ func checkLinkConfDirectories() error {
 		if err != nil || string(got) != v {
 			return fmt.Errorf("read %s after writing %q = %q, %v", path, v, got, err)
 		}
+	}
+	if err := os.WriteFile(path, []byte("1\n"), 0o644); err != nil {
+		return err
+	}
+	if all, lo := readConf("all"), readConf("lo"); all != allBefore || lo != loBefore {
+		return fmt.Errorf("route_localnet of probebr0 changed conf/all %q to %q and conf/lo %q to %q", allBefore, all, loBefore, lo)
 	}
 	if err := deleteLink("probebr0"); err != nil {
 		return fmt.Errorf("delete bridge: %w", err)
@@ -241,8 +255,8 @@ func checkBridgePortHairpin() error {
 	if err := setHairpin(port, 0); err != nil {
 		return fmt.Errorf("hairpin off on a bridge port: %w", err)
 	}
-	if err := setHairpin(port, 2); !errors.Is(err, syscall.EINVAL) {
-		return fmt.Errorf("hairpin mode 2 = %v, want EINVAL", err)
+	if err := setHairpin(port, 2); err != nil {
+		return fmt.Errorf("hairpin mode 2 on a bridge port: %w, want success as for any non-zero byte", err)
 	}
 	peer, err := linkIndex("probepv1")
 	if err != nil {

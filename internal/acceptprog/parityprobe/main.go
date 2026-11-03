@@ -31,6 +31,7 @@
 //	                       print SYNCED, and sleep
 //	parityprobe overlay-verify DIR   verify the state that overlay-write left
 //	parityprobe memcg      run the memory cgroup checks, then print DONE
+//	parityprobe memcg-idle print the memory.stat usage of an idle probe process
 //	parityprobe memcg-hog MIB hold|exit   allocate MIB MiB in a cgroup that the
 //	                       parent set up; used by the memcg checks
 //	parityprobe sleep      sleep for one minute
@@ -86,6 +87,12 @@ func main() {
 		}
 	case "memcg":
 		ok := runMemcgChecks()
+		fmt.Println("DONE")
+		if !ok {
+			os.Exit(1)
+		}
+	case "memcg-idle":
+		ok := printIdleUsage()
 		fmt.Println("DONE")
 		if !ok {
 			os.Exit(1)

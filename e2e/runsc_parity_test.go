@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,46 @@ func TestE2EMemoryCgroupLimits(t *testing.T) {
 				if !strings.Contains(out, "PASS "+name+"\n") {
 					t.Errorf("check %s did not pass\n%s", name, out)
 				}
+			}
+		})
+	}
+}
+
+// TestE2EMemoryCgroupIdleUsage records the memory that memory.stat shows for an
+// idle Go process in a cgroup, and it fails when the unreclaimable part is more
+// than a typical container limit leaves room for. The enforcer of memory.max
+// compares that part with the limit, so a Go process such as runc init must
+// stay far below limits like 64m. Run it with -v to see the numbers.
+func TestE2EMemoryCgroupIdleUsage(t *testing.T) {
+	bin := acceptprog.BuildParityProbe(t, runtime.GOARCH)
+	const maxIdle = 48 << 20
+	for _, b := range fixedAddressBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireFixedAddressBackend(t, b)
+			if runtime.GOOS == "windows" && b.plat == gvx.PlatformSystrap {
+				t.Skip("memory cgroup accounting is incomplete under the Windows systrap engine")
+			}
+			code, out := runParityProbe(t, b, bin, false, "memcg-idle")
+			if code != 0 || !strings.Contains(out, "DONE") {
+				t.Fatalf("parityprobe memcg-idle exited with %d\n%s", code, out)
+			}
+			t.Logf("idle Go process on %s: %s", b.name, strings.TrimSpace(strings.SplitN(out, "DONE", 2)[0]))
+			var anon, shmem uint64
+			for _, f := range strings.Fields(out) {
+				if k, v, ok := strings.Cut(f, "="); ok && (k == "anon" || k == "shmem") {
+					n, err := strconv.ParseUint(v, 10, 64)
+					if err != nil {
+						t.Fatalf("parse %s: %v", f, err)
+					}
+					if k == "anon" {
+						anon = n
+					} else {
+						shmem = n
+					}
+				}
+			}
+			if anon == 0 || anon+shmem > maxIdle {
+				t.Errorf("idle Go process: anon + shmem = %d bytes, want between 1 and %d", anon+shmem, maxIdle)
 			}
 		})
 	}

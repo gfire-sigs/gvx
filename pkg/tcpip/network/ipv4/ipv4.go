@@ -84,6 +84,10 @@ var _ IGMPEndpoint = (*endpoint)(nil)
 // +checklocksalias:igmp.ep.mu=mu
 // +stateify savable
 type endpoint struct {
+	// allowMartianLoopback is the route_localnet setting of this endpoint. See
+	// martian_xplat.go.
+	allowMartianLoopback atomicbitops.Bool `state:"nosave"`
+
 	nic        stack.NetworkInterface
 	dispatcher stack.TransportDispatcher
 	protocol   *protocol
@@ -970,7 +974,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	defer hView.Release()
 
 	if !e.nic.IsLoopback() {
-		if !e.protocol.allowExternalLoopbackTraffic.Load() {
+		if !e.protocol.allowExternalLoopbackTraffic.Load() && !e.allowMartianLoopback.Load() {
 			if header.IsV4LoopbackAddress(h.SourceAddress()) {
 				martianPacketLogger.Infof("Martian packet dropped with loopback source address. If your traffic is unexpectedly dropped, you may want to allow martian packets.")
 				stats.InvalidSourceAddressesReceived.Increment()

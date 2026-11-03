@@ -24,9 +24,10 @@ import (
 )
 
 // rtnlLinkStats64Fields is the number of 64-bit counters in struct
-// rtnl_link_stats64 of Linux 6.x. netlink libraries cast the attribute to a
-// struct of this size, so a shorter attribute would make them read past it.
-const rtnlLinkStats64Fields = 24
+// rtnl_link_stats64 of Linux 6.8, which ends with rx_otherhost_dropped. netlink
+// libraries cast the attribute to a struct of this size, so a shorter attribute
+// would make them read past it.
+const rtnlLinkStats64Fields = 25
 
 // addNewLinkMessageWithStats is AddNewLinkMessage plus the IFLA_STATS64
 // attribute for the counters of the link. docker stats asks every container

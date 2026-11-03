@@ -18,6 +18,10 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -136,9 +140,42 @@ type oomState struct {
 	// the tree lock, before any reader can find the controller.
 	eventsFile *eventFile
 
+	// The fields below belong to the enforcer goroutine.
+
 	// pending holds the thread groups that the enforcer killed and that are
-	// still in the cgroup. Only the enforcer goroutine uses it.
+	// still in the cgroup.
 	pending map[*kernel.ThreadGroup]struct{}
+	gate    oomGate
+}
+
+// oomGate decides when the enforcer may kill again. After a kill, the memory of
+// the victim is not free until the Sentry released its pages. The gate waits
+// until a check sees the usage at or below the limit. If the usage stays above
+// the limit because the cgroup still holds tmpfs data, the gate lets the next
+// kill pass after two more checks above the limit.
+type oomGate struct {
+	disarmed   bool
+	overChecks int
+}
+
+// shouldKill reports whether the enforcer kills at a check. over is true when
+// the usage passes the limit, and pending counts the victims that still run.
+func (g *oomGate) shouldKill(over bool, pending int) bool {
+	if !over {
+		*g = oomGate{}
+		return false
+	}
+	if pending > 0 {
+		return false
+	}
+	if g.disarmed {
+		g.overChecks++
+		if g.overChecks < 2 {
+			return false
+		}
+	}
+	*g = oomGate{disarmed: true}
+	return true
 }
 
 // memoryEnforcer is the state of the goroutine that enforces memory.max.
@@ -147,49 +184,74 @@ type memoryEnforcer struct {
 	running atomic.Bool
 }
 
+// memoryEnforcers maps a cgroup2 filesystem to its enforcer. The Sentry has one
+// filesystem, so the map holds one entry.
+var memoryEnforcers sync.Map
+
 const (
-	// oomPollInterval is the shortest time between two checks of the limits.
+	// oomPollInterval is the shortest time between two checks while a cgroup
+	// uses at least half of its limit.
 	oomPollInterval = 5 * time.Millisecond
+	// oomIdlePollInterval is the time between two checks while every limited
+	// cgroup uses less than half of its limit. It makes 40 wakeups a second.
+	oomIdlePollInterval = 25 * time.Millisecond
 	// oomScanRatio limits the checks to 1/oomScanRatio of a CPU, as pgalloc
 	// limits its own scans of the memory file.
 	oomScanRatio = 4
+	// oomImmune is the oom_score_adj value that exempts a process, as in Linux.
+	oomImmune = -1000
 )
+
+// enforcerSupported reports whether the host counts memory for a memory cgroup
+// well enough to enforce a limit. The Windows systrap engine runs guest code in
+// stub processes, and the Sentry finds committed pages through its own working
+// set, so pages that only a stub wrote stay uncounted.
+func enforcerSupported(goos, platformType string) bool {
+	return !(goos == "windows" && strings.HasPrefix(platformType, "*systrap."))
+}
 
 // armMemoryEnforcer starts the goroutine that enforces memory.max if it does
 // not run. The goroutine ends when no cgroup has a limit or the guest has no
 // task. A later write of a limit starts it again.
 func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
-	if fs.memEnforcer.running.CompareAndSwap(false, true) {
-		go fs.enforceMemoryLimits(k)
+	if !enforcerSupported(runtime.GOOS, fmt.Sprintf("%T", k.Platform)) {
+		return
+	}
+	e, _ := memoryEnforcers.LoadOrStore(fs, &memoryEnforcer{})
+	if e.(*memoryEnforcer).running.CompareAndSwap(false, true) {
+		go fs.enforceMemoryLimits(k, e.(*memoryEnforcer))
 	}
 }
 
-// enforceMemoryLimits checks the limits every oomPollInterval. Linux checks at
-// each charge of a page. The Sentry sees a committed page only when it scans
-// the memory file, so a task can pass its limit by what it allocates between
-// two checks.
-func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel) {
+// enforceMemoryLimits checks the limits at intervals. Linux checks at each
+// charge of a page. The Sentry sees a committed page only when it scans the
+// memory file, so a task can pass its limit by what it allocates between two
+// checks.
+func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 	ctx := k.SupervisorContext()
-	delay := oomPollInterval
+	delay := oomIdlePollInterval
 	for {
 		time.Sleep(delay)
 		if k.RootPIDNamespace().NumTasks() == 0 {
-			fs.memEnforcer.running.Store(false)
+			e.running.Store(false)
 			return
 		}
 		limited := fs.limitedMemory()
 		if len(limited) == 0 {
-			fs.memEnforcer.running.Store(false)
+			e.running.Store(false)
 			// A write of a limit can see running == true just before the store
 			// above and then not start a goroutine.
-			if len(fs.limitedMemory()) == 0 || !fs.memEnforcer.running.CompareAndSwap(false, true) {
+			if len(fs.limitedMemory()) == 0 || !e.running.CompareAndSwap(false, true) {
 				return
 			}
 			continue
 		}
 		start := time.Now()
-		fs.checkMemoryLimits(ctx, k, limited)
-		delay = max(oomPollInterval, oomScanRatio*time.Since(start))
+		near := fs.checkMemoryLimits(ctx, k, limited)
+		delay = oomIdlePollInterval
+		if near {
+			delay = max(oomPollInterval, oomScanRatio*time.Since(start))
+		}
 	}
 }
 
@@ -213,9 +275,17 @@ func (fs *filesystem) limitedMemory() []*memory {
 	return limited
 }
 
+// unreclaimableUsage returns the memory that the enforcer compares with
+// memory.max: anonymous memory and tmpfs data. Page cache and mapped file
+// pages are reclaimable in Linux. System memory of a cgroup is memory that
+// the Sentry freed and that it has not decommitted yet.
+func unreclaimableUsage(s usage.MemoryStats) uint64 {
+	return s.Anonymous + s.Tmpfs + s.Ramdiskfs
+}
+
 // checkMemoryLimits kills in each cgroup of limited whose usage passes its
-// limit.
-func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, limited []*memory) {
+// limit. It returns true when a cgroup uses at least half of its limit.
+func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, limited []*memory) bool {
 	subtrees := make([]map[uint32]struct{}, len(limited))
 	all := make(map[uint32]struct{})
 	fs.treeMu.RLock()
@@ -228,44 +298,58 @@ func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, l
 
 	// One scan covers every limited subtree.
 	_ = k.MemoryFile().UpdateUsage(all)
+	near := false
 	for i, m := range limited {
-		s := sumUsageStats(subtrees[i])
-		total := s.System + s.Anonymous + s.PageCache + s.Tmpfs + s.Mapped + s.Ramdiskfs
-		if limit := m.maxBytes.Load(); limit != math.MaxInt64 && total > uint64(limit) {
-			m.oomKill(ctx, k)
-		}
+		used := unreclaimableUsage(sumUsageStats(subtrees[i]))
+		limit := uint64(m.maxBytes.Load())
+		near = near || used >= limit/2
+		m.oomCheck(ctx, k, used, limit)
 	}
+	return near
 }
 
 // oomCandidate is a process that the OOM killer can end.
 type oomCandidate struct {
 	group *kernel.ThreadGroup
+	// id orders candidates of equal score.
+	id kernel.ThreadID
 	// rss is the resident set size of the process in bytes.
 	rss uint64
+	// adj is the oom_score_adj of the process.
+	adj int32
 }
 
 // oomVictims returns the candidates that the OOM killer ends. With group set
-// it returns all of them. Otherwise it returns the candidate with the largest
-// resident set, and the first of several equal ones.
-func oomVictims(candidates []oomCandidate, group bool) []oomCandidate {
-	if group || len(candidates) <= 1 {
-		return candidates
+// it returns all of them. Otherwise it returns the candidate with the highest
+// score. The score is the resident set plus oom_score_adj per mille of limit,
+// as in Linux. Equal scores go to the lower ID.
+func oomVictims(candidates []oomCandidate, group bool, limit uint64) []oomCandidate {
+	sorted := slices.Clone(candidates)
+	slices.SortFunc(sorted, func(a, b oomCandidate) int { return int(int64(a.id) - int64(b.id)) })
+	if group || len(sorted) <= 1 {
+		return sorted
 	}
-	largest := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.rss > largest.rss {
+	score := func(c oomCandidate) int64 { return int64(c.rss) + int64(c.adj)*int64(limit)/1000 }
+	largest := sorted[0]
+	for _, c := range sorted[1:] {
+		if score(c) > score(largest) {
 			largest = c
 		}
 	}
 	return []oomCandidate{largest}
 }
 
-// oomKill ends tasks of the subtree of m, as the OOM killer of Linux does for a
-// cgroup that passed memory.max. With memory.oom.group set, it kills every
-// process. Otherwise it kills the process with the largest resident set. It
-// does nothing while an earlier victim still leaves the cgroup, because the
-// memory of that victim is not free yet.
-func (m *memory) oomKill(ctx context.Context, k *kernel.Kernel) {
+// oomCheck compares one controller with its limit and ends processes of the
+// subtree as the OOM killer of Linux does for a cgroup that passed memory.max.
+// It never ends the init process of the guest or a process with
+// oom_score_adj of -1000.
+func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uint64) {
+	over := used > limit
+	if !over {
+		m.oom.pending = nil
+		m.oom.gate.shouldKill(false, 0)
+		return
+	}
 	fs := m.c.fs
 	var tasks []*kernel.Task
 	fs.treeMu.RLock()
@@ -282,47 +366,58 @@ func (m *memory) oomKill(ctx context.Context, k *kernel.Kernel) {
 	fs.tasksMu.RUnlock()
 	fs.treeMu.RUnlock()
 
-	rss := make(map[*kernel.ThreadGroup]uint64)
+	rootNS := k.RootPIDNamespace()
+	candidates := make(map[*kernel.ThreadGroup]*oomCandidate)
 	present := make(map[*kernel.ThreadGroup]struct{})
 	for _, t := range tasks {
 		tg := t.ThreadGroup()
 		present[tg] = struct{}{}
-		if t.ExitState() != kernel.TaskExitNone {
+		if t.ExitState() != kernel.TaskExitNone || tg.IsInitIn(rootNS) {
 			continue
 		}
-		var size uint64
-		if mm := t.MemoryManager(); mm != nil {
-			size = mm.ResidentSetSize()
+		c, ok := candidates[tg]
+		if !ok {
+			c = &oomCandidate{group: tg, id: rootNS.IDOfThreadGroup(tg)}
+			if leader := tg.Leader(); leader != nil {
+				c.adj = leader.OOMScoreAdj()
+			}
+			candidates[tg] = c
 		}
-		rss[tg] = max(rss[tg], size)
+		if mm := t.MemoryManager(); mm != nil {
+			c.rss = max(c.rss, mm.ResidentSetSize())
+		}
 	}
-
 	for tg := range m.oom.pending {
 		if _, ok := present[tg]; !ok {
 			delete(m.oom.pending, tg)
 		}
 	}
-	if len(m.oom.pending) > 0 || len(rss) == 0 {
+	if !m.oom.gate.shouldKill(true, len(m.oom.pending)) {
 		return
 	}
-
-	candidates := make([]oomCandidate, 0, len(rss))
-	for tg, size := range rss {
-		candidates = append(candidates, oomCandidate{group: tg, rss: size})
+	var eligible []oomCandidate
+	for _, c := range candidates {
+		if c.adj > oomImmune {
+			eligible = append(eligible, *c)
+		}
 	}
 	group := m.oomGroup.Load()
-	victims := oomVictims(candidates, group)
-
+	victims := oomVictims(eligible, group, limit)
+	if len(victims) == 0 {
+		return
+	}
 	if m.oom.pending == nil {
 		m.oom.pending = make(map[*kernel.ThreadGroup]struct{})
 	}
+	killed := 0
 	for _, v := range victims {
 		if err := k.SendExternalSignalThreadGroup(v.group, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
 			continue
 		}
 		m.oom.pending[v.group] = struct{}{}
+		killed++
 	}
-	m.countOOMEvents(ctx, uint64(len(m.oom.pending)), group)
+	m.countOOMEvents(ctx, uint64(killed), group)
 }
 
 // countOOMEvents records one OOM event that killed n processes in m and in each

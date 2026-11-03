@@ -29,8 +29,8 @@ func TestLinkStats64FollowsTheKernelLayout(t *testing.T) {
 	dev[8], dev[9], dev[10], dev[11] = 2000, 20, 5, 6
 
 	b := linkStats64(dev)
-	if len(b) != 24*8 {
-		t.Fatalf("len(linkStats64) = %d, want 192, the size of struct rtnl_link_stats64", len(b))
+	if len(b) != 25*8 {
+		t.Fatalf("len(linkStats64) = %d, want 200, the size of struct rtnl_link_stats64", len(b))
 	}
 	field := func(i int) uint64 { return binary.NativeEndian.Uint64(b[i*8:]) }
 	// struct rtnl_link_stats64 starts with rx_packets, tx_packets, rx_bytes,
@@ -40,7 +40,7 @@ func TestLinkStats64FollowsTheKernelLayout(t *testing.T) {
 			t.Errorf("rtnl_link_stats64 field %d = %d, want %d", i, got, want)
 		}
 	}
-	for i := 9; i < 24; i++ {
+	for i := 9; i < 25; i++ {
 		if got := field(i); got != 0 {
 			t.Errorf("rtnl_link_stats64 field %d = %d, want 0 for a counter that the stack lacks", i, got)
 		}

@@ -87,10 +87,12 @@ seam pkg/sentry/fsimpl/proc/task_net.go
 seam pkg/sentry/socket/netstack/stack.go
 # Content seam: RTM_GETLINK reports IFLA_STATS64 (pkg/sentry/socket/netlink/route/link_stats_xplat.go).
 seam pkg/sentry/socket/netlink/route/protocol.go
-# Content seams: cgroup2 memory.stat, memory.events counters, and the enforcement of memory.max
+# Content seam: cgroup2 memory.stat, memory.events counters, and the enforcement of memory.max
 # (pkg/sentry/fsimpl/cgroup2fs/memory_xplat.go).
 seam pkg/sentry/fsimpl/cgroup2fs/memory.go
-seam pkg/sentry/fsimpl/cgroup2fs/filesystem.go
+# Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
+# conf/<link>/route_localnet must not change the martian filter of other links.
+seam pkg/tcpip/network/ipv4/ipv4.go
 
 # Content seam: inotify_add_watch(2) asks a dentry to admit the watch before it adds one
 # (pkg/sentry/syscalls/linux/sys_inotify.go). hostfs returns ENOSPC above 8192 watched objects.

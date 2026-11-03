@@ -56,6 +56,17 @@ echo GUEST-LOOPBACK-PORT-OK
 echo HOST-PORT-READY
 read -r _
 
+# Negative controls: ordinary containers must survive a typical limit. runc
+# init is a Go program that joins the cgroup before it runs the command.
+docker run --rm -m 128m alpine true || fail "alpine true under -m 128m"
+echo CONTROL-ALPINE-OK
+docker run --rm -m 64m -v /usr/local/bin/docker:/usr/local/bin/docker:ro alpine docker --version >/dev/null || fail "a Go binary under -m 64m"
+echo CONTROL-GO-OK
+id=$(docker run -d -m 512m alpine sleep 600) || fail "start the measured container"
+sleep 2
+echo "MEASURE alpine sleep: $(grep -E '^(anon|shmem|file|kernel) ' /sys/fs/cgroup/docker/$id/memory.stat | tr '\n' ' ')"
+docker rm -f "$id" >/dev/null
+
 docker run -d --name hog alpine sh -c 'dd if=/dev/zero of=/dev/shm/f bs=1M count=64 2>/dev/null; sleep 600' >/dev/null || fail "start hog"
 i=0
 while :; do
@@ -151,6 +162,9 @@ func TestE2EDockerRunDindEngine(t *testing.T) {
 				t.Fatalf("release the guest script: %v", err)
 			}
 
+			expect("CONTROL-ALPINE-OK\n")
+			expect("CONTROL-GO-OK\n")
+			expect("MEASURE ")
 			expect("STATS-MEMORY ")
 			expect("IPTABLES-SAVE-OK\n")
 			expect("LIMITED-EXIT 137\n")

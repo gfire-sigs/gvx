@@ -15,17 +15,21 @@
 package proc
 
 import (
-	"math"
+	"bytes"
+	"fmt"
+	"slices"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/kernfs"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sync"
+	"z.gfire.dev/gvx/pkg/usermem"
 )
 
 // The directories /proc/sys/net/ipv4/conf and /proc/sys/net/ipv6/conf have one
@@ -64,25 +68,63 @@ func (fs *filesystem) newSysSubdir(ctx context.Context, root *auth.Credentials, 
 }
 
 // netLinkDir is the conf directory of one network link. A path walk drops its
-// cached dentry when the link no longer exists.
+// cached dentry when the link no longer exists, or when a new link took the
+// name of the old one.
 type netLinkDir struct {
 	*lazySysDir
 
 	stack inet.Stack
+	// id is the index of the link. Link indexes never repeat. Immutable.
+	id int32
 	// link is the name of the link. Immutable.
 	link string
 }
 
 var _ kernfs.Inode = (*netLinkDir)(nil)
 
+// linkDirValid reports whether the link with index id still has the name. live
+// maps the indexes of the links to their names.
+func linkDirValid(live map[int32]string, id int32, name string) bool {
+	got, ok := live[id]
+	return ok && got == name
+}
+
+// liveLinks returns the names of the links of stack by index.
+func liveLinks(stack inet.Stack) map[int32]string {
+	live := make(map[int32]string)
+	for id, nic := range stack.Interfaces() {
+		live[id] = nic.Name
+	}
+	return live
+}
+
 // Valid implements kernfs.Inode.Valid.
 func (d *netLinkDir) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
-	for _, nic := range d.stack.Interfaces() {
-		if nic.Name == d.link {
-			return true
+	return linkDirValid(liveLinks(d.stack), d.id, d.link)
+}
+
+// diffLinkDirs compares the link directories of a conf directory with the live
+// links. have maps the names of the directories to the indexes of their links.
+// stale lists the directories to remove: their link is gone, or a link with
+// another index took the name. add maps the names of the directories to
+// create to the indexes of their links.
+func diffLinkDirs(have map[string]int32, live map[int32]string) (stale []string, add map[string]int32) {
+	add = make(map[string]int32)
+	for name, id := range have {
+		if !linkDirValid(live, id, name) {
+			stale = append(stale, name)
 		}
 	}
-	return false
+	for id, name := range live {
+		if name == "" || strings.Contains(name, "/") {
+			continue
+		}
+		if haveID, ok := have[name]; !ok || haveID != id {
+			add[name] = id
+		}
+	}
+	slices.Sort(stale)
+	return stale, add
 }
 
 // Lookup implements kernfs.Inode.Lookup.
@@ -104,35 +146,140 @@ func (d *netConfDir) syncLinks(ctx context.Context) {
 	d.syncMu.Lock()
 	defer d.syncMu.Unlock()
 
-	live := make(map[string]struct{})
-	for _, nic := range d.stack.Interfaces() {
-		live[nic.Name] = struct{}{}
-	}
-	var stale []string
-	have := make(map[string]struct{})
-	d.OrderedChildren.ForEachChild(func(name string, _ kernfs.Inode) {
-		have[name] = struct{}{}
-		if _, ok := live[name]; !ok && name != "all" && name != "default" {
-			stale = append(stale, name)
+	have := make(map[string]int32)
+	d.OrderedChildren.ForEachChild(func(name string, child kernfs.Inode) {
+		if link, ok := child.(*netLinkDir); ok {
+			have[name] = link.id
 		}
 	})
+	stale, add := diffLinkDirs(have, liveLinks(d.stack))
 	for _, name := range stale {
 		if d.OrderedChildren.RemoveStatic(ctx, name) == nil {
 			d.DecLinks()
 		}
 	}
-	for name := range live {
-		if _, ok := have[name]; ok || name == "" || strings.Contains(name, "/") {
-			continue
-		}
+	for name, id := range add {
 		child := &netLinkDir{
 			lazySysDir: d.fs.newLazySysDir(ctx, d.creds, d.k, d.path+"/"+name).(*lazySysDir),
 			stack:      d.stack,
+			id:         id,
 			link:       name,
 		}
+		child.OrderedChildren.Populate(d.fs.linkConfFiles(ctx, d.creds, d.stack, d.path, id))
+		child.populated.Store(true)
 		d.OrderedChildren.Populate(map[string]kernfs.Inode{name: child})
 		d.IncLinks(1)
 	}
+}
+
+// linkConfFiles returns the files of the conf directory of one link. confPath
+// is the path of the conf directory relative to /proc/sys.
+func (fs *filesystem) linkConfFiles(ctx context.Context, root *auth.Credentials, stack inet.Stack, confPath string, id int32) map[string]kernfs.Inode {
+	if confPath == netIPv4ConfPath {
+		return map[string]kernfs.Inode{
+			"route_localnet": fs.newInode(ctx, root, 0644, &routeLocalnetLinkData{stack: stack, id: id}),
+		}
+	}
+	acceptRA := new(atomicbitops.Int32)
+	acceptRA.Store(1)
+	return map[string]kernfs.Inode{
+		"accept_ra": fs.newInode(ctx, root, 0644, &atomicInt32File{val: acceptRA, min: 0, max: 2}),
+	}
+}
+
+// linkRouteLocalnet is the per-link route_localnet of a network stack. Linux
+// accepts martian loopback packets on a link when conf/all or the conf of the
+// link enables the setting.
+type linkRouteLocalnet interface {
+	LinkRouteLocalnet(id int32) (bool, error)
+	SetLinkRouteLocalnet(id int32, enable bool) error
+}
+
+// routeLocalnetLinkData implements vfs.WritableDynamicBytesSource for
+// /proc/sys/net/ipv4/conf/<link>/route_localnet. The value belongs to one link,
+// so a write does not change the martian filter of any other link.
+type routeLocalnetLinkData struct {
+	kernfs.DynamicBytesFile
+
+	stack inet.Stack
+	id    int32
+}
+
+var _ vfs.WritableDynamicBytesSource = (*routeLocalnetLinkData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (r *routeLocalnetLinkData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	s, ok := r.stack.(linkRouteLocalnet)
+	if !ok {
+		return linuxerr.EOPNOTSUPP
+	}
+	enabled, err := s.LinkRouteLocalnet(r.id)
+	if err != nil {
+		return err
+	}
+	if enabled {
+		buf.WriteString("1\n")
+	} else {
+		buf.WriteString("0\n")
+	}
+	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (r *routeLocalnetLinkData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		return 0, linuxerr.EINVAL
+	}
+	s, ok := r.stack.(linkRouteLocalnet)
+	if !ok {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+	buf := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, buf)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	if err := s.SetLinkRouteLocalnet(r.id, buf[0] != 0); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// boolSysctlFile is a sysctl file whose value is 0 or 1. A write of any other
+// non-zero number stores 1, as Linux does for the bridge-nf-call files.
+type boolSysctlFile struct {
+	kernfs.DynamicBytesFile
+
+	val *atomicbitops.Int32
+}
+
+var _ vfs.WritableDynamicBytesSource = (*boolSysctlFile)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (f *boolSysctlFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	fmt.Fprintf(buf, "%d\n", f.val.Load())
+	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (f *boolSysctlFile) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, buf)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	f.val.Store(boolToInt32(buf[0] != 0))
+	return n, nil
+}
+
+func boolToInt32(b bool) int32 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // sysBridgeNetfilterFiles returns the files of /proc/sys/net/bridge. dockerd
@@ -152,28 +299,18 @@ func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Cr
 	} {
 		val := new(atomicbitops.Int32)
 		val.Store(initial)
-		files[name] = fs.newInode(ctx, root, 0644, &atomicInt32File{val: val, min: math.MinInt32, max: math.MaxInt32})
+		files[name] = fs.newInode(ctx, root, 0644, &boolSysctlFile{val: val})
 	}
 	return files
 }
 
 // sysNetXplatFiles returns the files of the directories that this file adds to
-// /proc/sys/net: net/bridge and the conf directory of one network link. It
+// /proc/sys/net: net/bridge. It
 // reports false for any other path.
 func (fs *filesystem) sysNetXplatFiles(ctx context.Context, root *auth.Credentials, stack inet.Stack, path string) (map[string]kernfs.Inode, bool) {
 	switch {
 	case path == "net/bridge":
 		return fs.sysBridgeNetfilterFiles(ctx, root), true
-	case strings.HasPrefix(path, netIPv4ConfPath+"/"):
-		return map[string]kernfs.Inode{
-			"route_localnet": fs.newInode(ctx, root, 0644, &routeLocalnetData{stack: stack}),
-		}, true
-	case strings.HasPrefix(path, netIPv6ConfPath+"/"):
-		acceptRA := new(atomicbitops.Int32)
-		acceptRA.Store(1)
-		return map[string]kernfs.Inode{
-			"accept_ra": fs.newInode(ctx, root, 0644, &atomicInt32File{val: acceptRA, min: 0, max: 2}),
-		}, true
 	}
 	return nil, false
 }
