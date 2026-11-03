@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 )
@@ -220,7 +221,9 @@ func TestHostEditorSaveByRenameKeepsExtendedAttributes(t *testing.T) {
 	e, _, clock := newCountEnv(t)
 	e.writeFile("doc", []byte("v1"))
 	e.chmod("doc", 0o751)
-	e.mustSetXattr("doc", "user.tag", "kept")
+	// A Linux host stores user.* attributes on the host file, which the editor
+	// replaces. The meta store holds trusted.* attributes on every host.
+	e.mustSetXattr("doc", "trusted.tag", "kept")
 
 	if err := os.WriteFile(e.host("doc.tmp"), []byte("v2"), 0o600); err != nil {
 		t.Fatal(err)
@@ -233,8 +236,8 @@ func TestHostEditorSaveByRenameKeepsExtendedAttributes(t *testing.T) {
 	if st := e.mustStat("doc"); st.Mode&0o7777 != 0o751 {
 		t.Fatalf("mode of doc after the host save = %o, want 751", st.Mode&0o7777)
 	}
-	if got := e.mustGetXattr("doc", "user.tag"); got != "kept" {
-		t.Fatalf("attribute user.tag of doc after the host save = %q, want kept", got)
+	if got := e.mustGetXattr("doc", "trusted.tag"); got != "kept" {
+		t.Fatalf("attribute trusted.tag of doc after the host save = %q, want kept", got)
 	}
 }
 
@@ -371,6 +374,37 @@ func TestPathKeysShareAHardLinkChangeWithEveryName(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireMode(t, ws, "b", 0o600, 0)
+}
+
+func TestSettingAnEarlierModificationTimeKeepsTheRecord(t *testing.T) {
+	// APFS lowers the birth time of a file when a process sets an earlier
+	// modification time, as tar, cp -p, and git do. The identity of the file
+	// must not follow the birth time there.
+	past := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{})
+	mustWriteFile(t, ws, "guest", 0o751)
+	mustWriteFile(t, ws, "host", 0o750)
+	if err := ws.chtimes("guest", &past, &past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "host"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, ws, "guest", 0o751, 0)
+	requireMode(t, ws, "host", 0o750, 0)
+
+	// The record also survives a restart and a pass of the collector.
+	mustSync(t, ws)
+	if err := ws.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := plainWS(t, dir, workspaceOptions{})
+	for range 3 {
+		reopened.orphanPass()
+	}
+	requireMode(t, reopened, "guest", 0o751, 0)
+	requireMode(t, reopened, "host", 0o750, 0)
 }
 
 func TestHardLinkChangeShowsThroughEveryName(t *testing.T) {

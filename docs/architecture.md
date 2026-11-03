@@ -568,7 +568,7 @@ The cap is visible to the guest. Before `inotify_add_watch(2)` adds a watch, the
 | :--- | :--- | :--- |
 | Windows | Volume serial number and the 128-bit file id of `FILE_ID_INFO` | NTFS and ReFS never reuse the pair while the volume lives. |
 | Linux | Device, inode number, and the `statx` birth time | The birth time, because ext4 reuses an inode number at the next create. |
-| macOS | Device, inode number, and the APFS birth time | The birth time. |
+| macOS | Device and inode number of an APFS or HFS+ volume | APFS never reuses an inode number. The birth time stays out of the key, because APFS lowers it when a process sets an earlier modification time. |
 
 The device of the workspace root is stored as zero, so a volume that gets another device number after a reboot keeps its records. A virtual symbolic link has no host object. Its record keys on the identity of the parent directory and on the link name. The table indexes the links of each directory, so a listing reads the entries of that directory only.
 
@@ -576,7 +576,7 @@ The names of a hard-linked file share one record. A `chmod`, `chown`, or `setxat
 
 Each record carries a hint: the guest path where the guest last saw the file. The hint never selects a record. A host editor saves a file by writing a temporary file and renaming it over the old file. The new file has no record. When the hint of a record names the path of the new file and the host no longer holds the recorded file, the new file adopts the record. Windows asks the host with `OpenFileById`. Linux and macOS look for the inode number in the listing of the directory. A recorded file that still exists keeps its record, and the new file starts with the defaults of a host file. On Linux and macOS, a host process that moves a file into another directory and then creates a new file at the old path gives the record to the new file.
 
-`OpenWorkspace` probes the volume before the lockdown. The probe needs a real birth time on Linux and macOS, or `FILE_ID_INFO` on Windows, and an identity that stays the same across a write. `WorkspaceCaps.StableIDs` reports the result. A volume that fails the probe keeps its records by guest path, as earlier releases did, and so does the single-file mode. A table with path keys scans the table at a directory rename and at a change through a hard link. A record then follows a path and not a file.
+`OpenWorkspace` probes the volume before the lockdown. The probe needs a real birth time on Linux and macOS, or `FILE_ID_INFO` on Windows. On macOS the volume must also be APFS or HFS+. The identity must stay the same across a write. `WorkspaceCaps.StableIDs` reports the result. A volume that fails the probe keeps its records by guest path, as earlier releases did, and so does the single-file mode. A table with path keys scans the table at a directory rename and at a change through a hard link. A record then follows a path and not a file.
 
 A background collector removes the records whose file is gone. It starts 30 s after the open, and a table with an older file form waits for the first flush. Windows asks the host with `OpenFileById` for each record. Linux and macOS walk the tree through the pinned handles. The walk lists each directory once, and it stats only an entry whose inode number a record names. A step handles 4 directories or 64 records every 100 ms, and a pass waits 10 minutes before the next one. A record dies when two passes in a row miss it and a lookup by the hint path confirms the loss. A host error ends a pass without a verdict.
 

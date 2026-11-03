@@ -19,14 +19,15 @@ package hostfs
 // file by that identity. It sets caps.StableIDs and caps.ExistsByID.
 //
 // A volume qualifies when its files report a real identity (a birth time on
-// Linux and macOS, FILE_ID_INFO on Windows) and the identity of a file stays
-// the same across a write. The write test rejects a volume that fills the birth
+// Linux and macOS, FILE_ID_INFO on Windows), the platform trusts the volume
+// (APFS and HFS+ on macOS), and the identity of a file stays the same across a
+// write. The write test rejects a volume that fills the birth
 // time with the change time. A read-only workspace cannot create a probe file,
 // so it trusts the identity of the root. A volume that fails keeps its records
 // by guest path, as earlier releases did.
 func probeFileIDs(host hostBackend, root hostInfo, readOnly bool, caps *WorkspaceCaps) {
 	caps.StableIDs, caps.ExistsByID = false, false
-	if !root.fidOK || root.fid.isZero() {
+	if !root.fidOK || root.fid.isZero() || !volumeIDsTrusted(host) {
 		return
 	}
 	if readOnly {
