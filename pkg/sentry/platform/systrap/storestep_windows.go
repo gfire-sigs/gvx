@@ -281,6 +281,9 @@ func (th *thread) serveStoreFault(as *addressSpace, ev debugEvent, addr uint64) 
 	case windowNone:
 		return outcome{}, false
 	case windowRetry:
+		if !th.staleRetry(as, pc) {
+			return outcome{}, false
+		}
 		if err := th.continueUnchanged(ev); err != nil {
 			return fatal(err, unix.EFAULT), true
 		}

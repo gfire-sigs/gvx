@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
@@ -103,7 +104,28 @@ func (f *MemoryFile) MapInternalUnreported(fr memmap.FileRange, at hostarch.Acce
 	if !fr.WellFormed() || fr.Length() == 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
-	return f.mapInternal(fr, at)
+	if at.Execute {
+		return safemem.BlockSeq{}, linuxerr.EACCES
+	}
+	if amfl := f.asyncPageLoad.Load(); amfl != nil {
+		if err := amfl.awaitLoad(fr); err != nil {
+			return safemem.BlockSeq{}, err
+		}
+	}
+	// The tail of MapInternal.
+	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)
+	if chunks == 1 {
+		var seq safemem.BlockSeq
+		f.forEachMappingSlice(fr, func(bs []byte) {
+			seq = safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bs))
+		})
+		return seq, nil
+	}
+	blocks := make([]safemem.Block, 0, chunks)
+	f.forEachMappingSlice(fr, func(bs []byte) {
+		blocks = append(blocks, safemem.BlockFromSafeSlice(bs))
+	})
+	return safemem.BlockSeqFromSlice(blocks), nil
 }
 
 // NoteHostWrite tells the observers of f that Sentry code wrote fr.

@@ -392,7 +392,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			// can be stale: another thread mapped the executable copy first, or
 			// a store step swapped the view. The thread fetches again and does
 			// not count the fault.
-			stale := !patched && as.viewAllows(ev.Info[1], avExecute) && th.staleRetry(pc)
+			stale := !patched && as.viewAllows(ev.Info[1], avExecute) && th.staleRetry(as, pc)
 			if patched {
 				th.execRepeats = 0
 			} else if stale {
@@ -471,15 +471,17 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		}
 		// A writable data state means that another thread restored the block
 		// after this thread faulted, so the write retries. A block with an open
-		// store window accepts the write too.
-		if st, at, ok := as.blockStateOf(base); ok && at.Write && (st == blockData || as.storeWindowOpen(base) || (as.viewAllows(addr, avWrite) && th.staleRetry(pc))) {
+		// store window accepts the write too. An executable copy without a
+		// window means that the window closed unchanged after restoreData
+		// refused, and the repeated write faults again and restores the block.
+		if st, at, ok := as.blockStateOf(base); ok && at.Write && (st == blockData || as.storeWindowOpen(base) || ((st == blockExec || as.viewAllows(addr, avWrite)) && th.staleRetry(as, pc))) {
 			if err := continueFault(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running
 		}
 	}
-	if kind == avRead && ev.Code == statusAccessViol && as.viewAllows(addr, avRead) && th.staleRetry(pc) {
+	if kind == avRead && ev.Code == statusAccessViol && as.viewAllows(addr, avRead) && th.staleRetry(as, pc) {
 		// A write of the Sentry unmapped and mapped the page again while this
 		// thread read it. Linux gives no fault there.
 		if err := continueFault(ev); err != nil {
@@ -522,17 +524,19 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, ev debugEvent, kin
 }
 
 // staleRetryLimit is the number of stale faults at one pc that the engine
-// retries. A fault is stale when the view allows the access at the time the
-// handler runs. A view that the host refuses although the map allows it would
-// repeat the fault forever, so a long run of stale faults at one pc becomes a
-// signal.
+// retries while no view changed. A fault is stale when the view allows the
+// access at the time the handler runs. A view that the host refuses although
+// the map allows it would repeat the fault forever, so a long run of stale
+// faults at one pc with no change of a view becomes a signal.
 const staleRetryLimit = 4096
 
 // staleRetry counts a stale fault at pc and reports whether the thread may
-// retry it. Callers hold th.mu.
-func (th *thread) staleRetry(pc uint64) bool {
-	if th.staleAt != pc {
-		th.staleAt, th.stale = pc, 0
+// retry it. A fault after a change of a view starts a new count, because the
+// change explains it. Callers hold th.mu.
+func (th *thread) staleRetry(as *addressSpace, pc uint64) bool {
+	gen := as.win.generation()
+	if th.staleAt != pc || th.staleGen != gen {
+		th.staleAt, th.staleGen, th.stale = pc, gen, 0
 	}
 	th.stale++
 	return th.stale <= staleRetryLimit

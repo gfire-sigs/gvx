@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync/atomic"
 )
 
 // The Windows engine keeps the guest window of a stub process as one large
@@ -373,7 +374,13 @@ func (w *windowMap) Lookup(addr uint64) (viewInfo, uint64, bool) {
 // there. The memory manager does unmap ranges that cross the gap.
 type guestWindows struct {
 	maps []*windowMap
+	// gen counts the calls that changed a view. A reader without the lock of
+	// the address space uses it to see that a view changed since it looked.
+	gen atomic.Uint64
 }
+
+// generation returns the number of changes of the views so far.
+func (g *guestWindows) generation() uint64 { return g.gen.Load() }
 
 func newGuestWindows(maps ...*windowMap) *guestWindows {
 	return &guestWindows{maps: slices.Clone(maps)}
@@ -392,6 +399,7 @@ func (g *guestWindows) window(addr uint64) *windowMap {
 // Map replaces [addr, addr+size) with a view of backing at off. The range must
 // lie in one window.
 func (g *guestWindows) Map(addr, size uint64, backing viewBacking, off uint64, prot viewProt) error {
+	defer g.gen.Add(1)
 	w := g.window(addr)
 	if w == nil {
 		return fmt.Errorf("window range %#x+%#x starts outside every window", addr, size)
@@ -402,6 +410,7 @@ func (g *guestWindows) Map(addr, size uint64, backing viewBacking, off uint64, p
 // Unmap turns the parts of [addr, addr+size) that lie in a window into
 // placeholders. It ignores the parts outside every window.
 func (g *guestWindows) Unmap(addr, size uint64) error {
+	defer g.gen.Add(1)
 	end := addr + size
 	for _, w := range g.maps {
 		lo, hi := max(addr, w.base), min(end, w.limit)
@@ -418,6 +427,7 @@ func (g *guestWindows) Unmap(addr, size uint64) error {
 // Protect changes the protection of [addr, addr+size). The range must lie in
 // one window, and every page of it must belong to a view.
 func (g *guestWindows) Protect(addr, size uint64, prot viewProt) error {
+	defer g.gen.Add(1)
 	w := g.window(addr)
 	if w == nil {
 		return fmt.Errorf("window range %#x+%#x starts outside every window", addr, size)

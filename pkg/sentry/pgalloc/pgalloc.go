@@ -1511,16 +1511,11 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 	if !fr.WellFormed() || fr.Length() == 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
-	if at.Write {
-		f.noteHostWrite(fr)
-	}
-	return f.mapInternal(fr, at)
-}
-
-// mapInternal is MapInternal without the report of a write request.
-func (f *MemoryFile) mapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	if at.Execute {
 		return safemem.BlockSeq{}, linuxerr.EACCES
+	}
+	if at.Write {
+		f.noteHostWrite(fr)
 	}
 
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
