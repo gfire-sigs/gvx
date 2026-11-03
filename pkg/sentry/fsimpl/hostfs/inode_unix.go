@@ -47,6 +47,10 @@ const (
 	// hostRenameReplacesDir reports whether the host rename replaces an empty
 	// destination directory atomically.
 	hostRenameReplacesDir = true
+
+	// hostCountsDirLinks reports whether the link count of a host directory
+	// follows the Linux rule: 2 plus one for each subdirectory.
+	hostCountsDirLinks = true
 )
 
 type hostRoot struct {

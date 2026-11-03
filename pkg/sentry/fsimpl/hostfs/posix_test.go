@@ -37,6 +37,67 @@ func (e *env) setStat(p string, stat linux.Statx) error {
 	return e.vfsObj.SetStatAt(e.ctx, e.creds, e.pop(p), &vfs.SetStatOptions{Stat: stat})
 }
 
+// TestDirectoryLinkCountFollowsSubdirectories checks the Linux rule that a
+// directory has 2 links plus one for each subdirectory, through stat by path
+// and through an open directory, across mkdir, rename, and rmdir. NTFS reports
+// one link for every directory, so hostfs counts the subdirectories there.
+func TestDirectoryLinkCountFollowsSubdirectories(t *testing.T) {
+	e := newEnv(t)
+	e.mustMkdir("src")
+	e.mustMkdir("dst")
+	e.mustMkdir("src/child")
+	wantLinks := func(when, p string, want uint32) {
+		t.Helper()
+		if got := e.mustStat(p).Nlink; got != want {
+			t.Errorf("%s: stat %q nlink = %d, want %d", when, p, got, want)
+		}
+		fd := e.mustOpen(p, linux.O_RDONLY|linux.O_DIRECTORY)
+		defer fd.DecRef(e.ctx)
+		st, err := fd.Stat(e.ctx, vfs.StatOptions{Mask: linux.STATX_NLINK})
+		if err != nil {
+			t.Fatalf("%s: fstat %q: %v", when, p, err)
+		}
+		if st.Nlink != want {
+			t.Errorf("%s: fstat %q nlink = %d, want %d", when, p, st.Nlink, want)
+		}
+	}
+	wantLinks("after mkdir", "src", 3)
+	wantLinks("after mkdir", "dst", 2)
+
+	if err := e.rename("src/child", "dst/moved"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	wantLinks("after rename", "src", 2)
+	wantLinks("after rename", "dst", 3)
+
+	if err := e.vfsObj.RmdirAt(e.ctx, e.creds, e.pop("dst/moved")); err != nil {
+		t.Fatalf("rmdir: %v", err)
+	}
+	wantLinks("after rmdir", "dst", 2)
+}
+
+// TestTruncateAboveFreeSpaceLeavesAHole checks that truncate extends a file
+// with a hole, as on Linux, even when the size exceeds the free space of the
+// host volume. NTFS allocates the clusters of a dense file, so hostfs makes
+// the file sparse there.
+func TestTruncateAboveFreeSpaceLeavesAHole(t *testing.T) {
+	e := newEnv(t)
+	e.writeFile("big", []byte("head"))
+	const size = 1 << 40
+	if err := e.setStat("big", linux.Statx{Mask: linux.STATX_SIZE, Size: size}); err != nil {
+		t.Fatalf("truncate to 1 TiB: %v", err)
+	}
+	if got := e.mustStat("big").Size; got != size {
+		t.Fatalf("size = %d, want %d", got, size)
+	}
+	if err := e.setStat("big", linux.Statx{Mask: linux.STATX_SIZE, Size: 4}); err != nil {
+		t.Fatalf("truncate back to 4 bytes: %v", err)
+	}
+	if got := string(e.readFile("big")); got != "head" {
+		t.Fatalf("content = %q, want %q", got, "head")
+	}
+}
+
 func TestHardLinkSharesInodeAndAttributes(t *testing.T) {
 	e := newEnv(t)
 	e.writeFile("a", []byte("one"))

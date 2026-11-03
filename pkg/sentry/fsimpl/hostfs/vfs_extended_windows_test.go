@@ -23,11 +23,25 @@ import (
 
 	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
 
 // The portable tests of vfs_extended_ops_test.go run on Windows with the real
 // capabilities of the volume. These tests check the Windows branches that
 // no other host reaches.
+
+// TestWindowsTruncateAboveTheNTFSLimitFailsWithEFBIG checks that a size above
+// the largest NTFS file fails with EFBIG, the Linux error, and leaves the file
+// unchanged.
+func TestWindowsTruncateAboveTheNTFSLimitFailsWithEFBIG(t *testing.T) {
+	e := newEnv(t)
+	e.writeFile("f", []byte("data"))
+	err := e.setStat("f", linux.Statx{Mask: linux.STATX_SIZE, Size: 999999999999999})
+	wantErrno(t, "truncate above the NTFS limit", err, linuxerr.EFBIG)
+	if got := e.mustStat("f").Size; got != 4 {
+		t.Fatalf("size = %d, want 4", got)
+	}
+}
 
 func TestWindowsUsesTheTranslationPaths(t *testing.T) {
 	e := newEnv(t)

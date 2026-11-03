@@ -362,7 +362,7 @@ func (i *inode) truncate(d *dentry, h *hostHandle, size int64) error {
 		i.guestEnd(hostInfo{}, false)
 		return translateHostError(err)
 	}
-	truncErr := f.Truncate(size)
+	truncErr := setFileSize(f, size)
 	i.guestEndFile(f)
 	h.release()
 	if truncErr != nil {

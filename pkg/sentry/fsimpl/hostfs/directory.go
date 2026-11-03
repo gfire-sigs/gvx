@@ -74,7 +74,10 @@ func (fd *dirFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, e
 	if err := d.refresh(); err != nil {
 		return linux.Statx{}, err
 	}
-	return d.inode.statxFor(d.inode.snapshot(), d.fs.devMinor), nil
+	e := d.inode.snapshot()
+	stat := d.inode.statxFor(e, d.fs.devMinor)
+	stat.Nlink = d.dirLinks(e, stat.Nlink)
+	return stat, nil
 }
 
 func direntType(kind hostKind) uint8 {

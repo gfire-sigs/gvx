@@ -1805,7 +1805,7 @@ func (w *Workspace) Truncate(relPath string, size int64) error {
 	if err != nil {
 		return err
 	}
-	truncErr := f.Truncate(size)
+	truncErr := setFileSize(f, size)
 	closeErr := f.Close()
 	return errors.Join(truncErr, closeErr)
 }

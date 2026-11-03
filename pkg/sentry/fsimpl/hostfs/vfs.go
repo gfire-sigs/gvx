@@ -269,6 +269,10 @@ type inode struct {
 	// host watcher uses it to tell a guest write from a host write. See
 	// watcher.go.
 	guest guestState
+
+	// dirLinks caches the counted link count of a directory on a host that
+	// does not count directory links. See dirlinks.go.
+	dirLinks dirLinkCache
 }
 
 func (i *inode) snapshot() entry {
@@ -1678,7 +1682,11 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		fs.unlock(ctx)
 		return linux.Statx{}, err
 	}
-	stat := d.inode.statx(fs.devMinor)
+	e := d.inode.snapshot()
+	stat := d.inode.statxFor(e, fs.devMinor)
+	if e.isDir() {
+		stat.Nlink = d.dirLinks(e, stat.Nlink)
+	}
 	fs.unlock(ctx)
 	rp.AddMountRootAttr(&d.vfsd, &stat)
 	return stat, nil
@@ -1686,11 +1694,6 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 
 func statxTimestamp(t time.Time) linux.StatxTimestamp {
 	return linux.StatxTimestamp{Sec: t.Unix(), Nsec: uint32(t.Nanosecond())}
-}
-
-// statx builds the stat result from the last observed state.
-func (i *inode) statx(devMinor uint32) linux.Statx {
-	return i.statxFor(i.snapshot(), devMinor)
 }
 
 // statxFor builds the stat result for entry e of this inode.
