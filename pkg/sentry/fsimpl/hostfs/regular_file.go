@@ -132,7 +132,9 @@ func (fd *regularFD) OnClose(ctx context.Context) error {
 // count from the open handle, so it stays correct after rename and unlink.
 func (fd *regularFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	d := fd.dentry
-	if err := d.refresh(); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+	// The handle gives the size and the times, so a write leaves nothing to
+	// refresh.
+	if err := d.refreshIdentity(); err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
 		return linux.Statx{}, err
 	}
 	e := d.inode.snapshot()
@@ -220,7 +222,7 @@ type handleWriter struct {
 func (w *handleWriter) Write(p []byte) (int, error) {
 	n, err := w.fd.h.writeAt(p, w.off)
 	if n > 0 {
-		w.fd.dentry.inode.invalidateMeta()
+		w.fd.dentry.inode.markDataChanged()
 		w.fd.dentry.inode.data.writeThrough(w.off, p[:n])
 		w.off += int64(n)
 	}

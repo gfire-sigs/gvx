@@ -825,3 +825,35 @@ func TestCaseRulesHoldAcrossMutationsOnFoldingHost(t *testing.T) {
 		t.Fatalf("listing = %v, want [file other]", got)
 	}
 }
+
+func TestStatOfOpenFileAfterWriteNeedsNoLookup(t *testing.T) {
+	e, ch, _ := newCountEnv(t)
+	e.writeFile("f", []byte("x"))
+	fd := e.mustOpen("f", linux.O_RDWR)
+	defer fd.DecRef(e.ctx)
+	before := e.mustStat("f")
+
+	if _, err := fd.Write(e.ctx, usermem.BytesIOSequence([]byte("more data")), vfs.WriteOptions{}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ch.reset()
+	st, err := fd.Stat(e.ctx, vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+	if err != nil {
+		t.Fatalf("fstat: %v", err)
+	}
+	if st.Size != 9 {
+		t.Fatalf("fstat size after the write = %d, want 9", st.Size)
+	}
+	if n := ch.got("lstatAt"); n != 0 {
+		t.Fatalf("fstat after a write made %d lstatAt calls %s, want 0", n, ch.dump())
+	}
+
+	// A stat of the path must still read the host: the host chose the new times.
+	after := e.mustStat("f")
+	if after.Size != 9 {
+		t.Fatalf("stat size after the write = %d, want 9", after.Size)
+	}
+	if after.Mtime.Sec < before.Mtime.Sec {
+		t.Fatalf("stat mtime went back from %v to %v", before.Mtime, after.Mtime)
+	}
+}
