@@ -116,7 +116,9 @@ func diffLinkDirs(have map[string]int32, live map[int32]string) (stale []string,
 		}
 	}
 	for id, name := range live {
-		if name == "" || strings.Contains(name, "/") {
+		// The directories all and default belong to the conf directory. A link
+		// with one of these names has no directory of its own.
+		if name == "" || name == "all" || name == "default" || strings.Contains(name, "/") {
 			continue
 		}
 		if haveID, ok := have[name]; !ok || haveID != id {

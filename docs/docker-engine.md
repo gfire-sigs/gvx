@@ -166,7 +166,7 @@ A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentr
 
 | Property | Value |
 | :--- | :--- |
-| Poll interval | 5 ms at least, and 4 times the duration of the last check, while a limited container uses half of its limit or more. Otherwise 25 ms, which makes 40 wakeups a second for each sandbox that has a limit. |
+| Poll interval | 5 ms at least, and 4 times the duration of the last check, while a limited container uses half of its limit or more. Otherwise 25 ms, and also at least 4 times the duration of the last check, so a slow scan of untouched memory cannot repeat without bound. An idle sandbox with a limit makes 40 wakeups a second. |
 | Overshoot | A container can pass its limit by what it allocates between two checks. A container that uses less than half of its limit is checked every 25 ms, so it can pass the limit by 25 ms of allocation. The scan of the memory file on macOS costs time in proportion to the new pages, so one check can see hundreds of MiB more than the check before. |
 | Victim | The process with the highest score: its resident set plus `oom_score_adj` per mille of the limit, as in Linux. Equal scores go to the lower PID. A process with `oom_score_adj` of -1000 and the init process of the guest are never ended. With `memory.oom.group` set, every other process of the container. |
 | Result | Exit code 137, `OOMKilled: true` in `docker inspect`, and `oom_kill` in `memory.events`. Other containers and `dockerd` keep running. |

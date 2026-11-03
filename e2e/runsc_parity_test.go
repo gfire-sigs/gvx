@@ -70,7 +70,7 @@ func TestE2ERunscParityKernelFeatures(t *testing.T) {
 		"tmpfs-percent-size", "cgroup2-mounted", "mqueue-mounted", "mq-open",
 		"dev-fuse", "dev-net-tun", "uevent-socket", "loopback-named",
 		"new-netns-has-lo", "pivot-root", "keyring-link", "overlay-dentry-cache", "mnt-ns-setns",
-		"link-conf-directories", "bridge-port-hairpin", "link-stats64", "ip-tables-names", "bridge-nf-call-iptables",
+		"link-conf-directories", "link-named-like-conf-directory", "bridge-port-hairpin", "link-stats64", "ip-tables-names", "bridge-nf-call-iptables",
 	}
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {

@@ -375,3 +375,30 @@ func checkBridgeNetfilterSysctl() error {
 	}
 	return nil
 }
+
+// checkLinkNamedLikeConfDirectory creates a bridge named default and lists the
+// conf directories. The names all and default belong to the directories of
+// /proc/sys/net/ipv4/conf and ipv6/conf, so a link of that name must not make
+// the Sentry fail.
+func checkLinkNamedLikeConfDirectory() error {
+	if err := createLink("default", "bridge", nil); err != nil {
+		return fmt.Errorf("create bridge named default: %w", err)
+	}
+	defer deleteLink("default")
+	for _, dir := range []string{"/proc/sys/net/ipv4/conf", "/proc/sys/net/ipv6/conf"} {
+		names, err := confDirNames(dir)
+		if err != nil {
+			return fmt.Errorf("list %s: %w", dir, err)
+		}
+		for _, want := range []string{"all", "default"} {
+			if !slices.Contains(names, want) {
+				return fmt.Errorf("%s lists %v, want %s", dir, names, want)
+			}
+		}
+	}
+	path := "/proc/sys/net/ipv4/conf/default/route_localnet"
+	if _, err := os.ReadFile(path); err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	return nil
+}

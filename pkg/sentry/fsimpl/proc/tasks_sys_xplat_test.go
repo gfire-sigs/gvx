@@ -36,6 +36,8 @@ func TestDiffLinkDirsFollowsLinkLifecycle(t *testing.T) {
 		{name: "link recreated under the same name", have: map[string]int32{"docker0": 2}, live: map[int32]string{7: "docker0"},
 			wantStale: []string{"docker0"}, wantAdd: map[string]int32{"docker0": 7}},
 		{name: "no change", have: map[string]int32{"lo": 1}, live: map[int32]string{1: "lo"}, wantAdd: map[string]int32{}},
+		{name: "links named like the built-in directories are skipped", have: map[string]int32{"lo": 1},
+			live: map[int32]string{1: "lo", 8: "all", 9: "default"}, wantAdd: map[string]int32{}},
 		{name: "unusable names are skipped", have: map[string]int32{}, live: map[int32]string{3: "", 4: "a/b"}, wantAdd: map[string]int32{}},
 	}
 	for _, tc := range tests {

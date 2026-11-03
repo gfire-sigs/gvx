@@ -174,19 +174,23 @@ func TestUnreclaimableUsageIgnoresReclaimableAndFreedMemory(t *testing.T) {
 	}
 }
 
+type countingPlatform bool
+
+func (c countingPlatform) CountsCgroupMemory() bool { return bool(c) }
+
 func TestEnforcerSupported(t *testing.T) {
 	tests := []struct {
-		goos, platform string
-		want           bool
+		name     string
+		platform any
+		want     bool
 	}{
-		{"linux", "*systrap.Systrap", true},
-		{"darwin", "*hvf.HVF", true},
-		{"windows", "*whpx.WHPX", true},
-		{"windows", "*systrap.Systrap", false},
+		{"a platform without the method counts memory", struct{}{}, true},
+		{"a platform that counts memory", countingPlatform(true), true},
+		{"a platform that cannot count memory", countingPlatform(false), false},
 	}
 	for _, tc := range tests {
-		if got := enforcerSupported(tc.goos, tc.platform); got != tc.want {
-			t.Errorf("enforcerSupported(%q, %q) = %t, want %t", tc.goos, tc.platform, got, tc.want)
+		if got := enforcerSupported(tc.platform); got != tc.want {
+			t.Errorf("%s: enforcerSupported = %t, want %t", tc.name, got, tc.want)
 		}
 	}
 }
@@ -201,8 +205,8 @@ func TestCountOOMEventsCountsInEveryAncestor(t *testing.T) {
 	leaf.countOOMEvents(context.Background(), 0, true)
 
 	for name, m := range map[string]*memory{"leaf": leaf, "mid": mid, "root": root} {
-		if got := m.oom.oom.Load(); got != 2 {
-			t.Errorf("%s oom = %d, want 2 events", name, got)
+		if got := m.oom.oom.Load(); got != 3 {
+			t.Errorf("%s oom = %d, want 3 events, one of them without a kill", name, got)
 		}
 		if got := m.oom.oomKill.Load(); got != 3 {
 			t.Errorf("%s oom_kill = %d, want 3 kills", name, got)

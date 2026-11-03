@@ -276,6 +276,12 @@ func (p *Platform) Close() error {
 func (*Platform) MapUnit() uint64 { return 0 }
 
 // MinUserAddress implements platform.Platform.MinUserAddress.
+// CountsCgroupMemory reports that the Sentry cannot count the pages of guest
+// memory for a memory cgroup. Guest code runs in stub processes, and the Sentry
+// finds committed pages through the working set of its own process. The cgroup2
+// filesystem then leaves memory.max unenforced.
+func (p *Platform) CountsCgroupMemory() bool { return false }
+
 func (p *Platform) MinUserAddress() hostarch.Addr { return hostarch.Addr(p.userMin) }
 
 // NewAddressSpace implements platform.Platform.NewAddressSpace. The platform

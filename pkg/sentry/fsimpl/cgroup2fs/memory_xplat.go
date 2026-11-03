@@ -18,9 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"runtime"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -202,19 +200,28 @@ const (
 	oomImmune = -1000
 )
 
-// enforcerSupported reports whether the host counts memory for a memory cgroup
-// well enough to enforce a limit. The Windows systrap engine runs guest code in
-// stub processes, and the Sentry finds committed pages through its own working
-// set, so pages that only a stub wrote stay uncounted.
-func enforcerSupported(goos, platformType string) bool {
-	return !(goos == "windows" && strings.HasPrefix(platformType, "*systrap."))
+// cgroupMemoryCounter is implemented by a platform that knows whether the
+// Sentry can count the pages of guest memory for a memory cgroup. A platform
+// without the method counts them. The Windows systrap engine runs guest code
+// in stub processes, and the Sentry finds committed pages through the working
+// set of its own process, so pages that only a stub wrote stay uncounted. The
+// systrap tests check that this engine implements the method.
+type cgroupMemoryCounter interface {
+	CountsCgroupMemory() bool
+}
+
+// enforcerSupported reports whether the platform counts memory for a memory
+// cgroup well enough to enforce a limit.
+func enforcerSupported(p any) bool {
+	c, ok := p.(cgroupMemoryCounter)
+	return !ok || c.CountsCgroupMemory()
 }
 
 // armMemoryEnforcer starts the goroutine that enforces memory.max if it does
 // not run. The goroutine ends when no cgroup has a limit or the guest has no
 // task. A later write of a limit starts it again.
 func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
-	if !enforcerSupported(runtime.GOOS, fmt.Sprintf("%T", k.Platform)) {
+	if !enforcerSupported(k.Platform) {
 		return
 	}
 	e, _ := memoryEnforcers.LoadOrStore(fs, &memoryEnforcer{})
@@ -248,10 +255,14 @@ func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 		}
 		start := time.Now()
 		near := fs.checkMemoryLimits(ctx, k, limited)
+		// The scan of a large anonymous range that no task touched costs time on
+		// hosts that cannot ask for the committed pages cheaply, so the delay
+		// grows with the duration of the check in both cases.
 		delay = oomIdlePollInterval
 		if near {
-			delay = max(oomPollInterval, oomScanRatio*time.Since(start))
+			delay = oomPollInterval
 		}
+		delay = max(delay, oomScanRatio*time.Since(start))
 	}
 }
 
@@ -404,6 +415,8 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 	group := m.oomGroup.Load()
 	victims := oomVictims(eligible, group, limit)
 	if len(victims) == 0 {
+		// Linux counts the event when no process can be killed.
+		m.countOOMEvents(ctx, 0, false)
 		return
 	}
 	if m.oom.pending == nil {
@@ -421,16 +434,14 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 }
 
 // countOOMEvents records one OOM event that killed n processes in m and in each
-// ancestor memory controller, and wakes the readers of memory.events.
+// ancestor memory controller, and wakes the readers of memory.events. An event
+// without a kill (n is 0) still counts in oom and max, as in Linux.
 func (m *memory) countOOMEvents(ctx context.Context, n uint64, group bool) {
-	if n == 0 {
-		return
-	}
 	for cur := m; cur != nil; cur = cur.parent {
 		cur.oom.hitMax.Add(1)
 		cur.oom.oom.Add(1)
 		cur.oom.oomKill.Add(n)
-		if group {
+		if group && n > 0 {
 			cur.oom.oomGroupKill.Add(1)
 		}
 		if cur.oom.eventsFile != nil {

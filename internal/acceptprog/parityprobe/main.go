@@ -159,6 +159,7 @@ func runChecks() {
 		{"mnt-ns-setns", checkMountNamespaceSetns},
 		{"link-conf-directories", checkLinkConfDirectories},
 		{"bridge-port-hairpin", checkBridgePortHairpin},
+		{"link-named-like-conf-directory", checkLinkNamedLikeConfDirectory},
 		{"link-stats64", checkLinkStats64},
 		{"ip-tables-names", checkIPTablesNames},
 		{"bridge-nf-call-iptables", checkBridgeNetfilterSysctl},
