@@ -141,7 +141,7 @@ func (w *Workspace) recOf(rel string, info hostInfo) *rec {
 // that still exists elsewhere keeps its record, and the new file starts without
 // one.
 func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
-	if w.readOnly || info.nlink > 1 || (info.kind != hostKindRegular && info.kind != hostKindDir) {
+	if w.readOnly || (info.kind != hostKindRegular && info.kind != hostKindDir) {
 		return nil
 	}
 	oldKey, old := w.meta.byHint(rel)
@@ -149,6 +149,17 @@ func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
 		return nil
 	}
 	if (old.attr.Mode&linux.S_IFMT == linux.S_IFDIR) != (info.kind == hostKindDir) {
+		return nil
+	}
+	if sameInodeEarlierBirth(oldKey.id, k.id) {
+		// APFS lowers the birth time of a file when a process sets an earlier
+		// modification time, as tar, cp -p, and git do. The file is the same.
+		// A new file that reuses the inode number has a later birth time.
+		w.meta.del(oldKey)
+		w.meta.put(k, old.withHint(rel))
+		return old
+	}
+	if info.nlink > 1 {
 		return nil
 	}
 	// A file that is older than the record cannot replace the recorded file.
@@ -164,6 +175,13 @@ func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
 	w.meta.del(oldKey)
 	w.meta.put(k, adopted)
 	return adopted
+}
+
+// sameInodeEarlierBirth reports whether now names the inode of old with a birth
+// time that is earlier than the recorded one.
+func sameInodeEarlierBirth(old, now fileKey) bool {
+	return old.dev == now.dev && old.ino == now.ino && old.ino2 == now.ino2 &&
+		now.btime != 0 && now.btime < old.btime
 }
 
 // recordFileExists reports whether the file of the record under key still

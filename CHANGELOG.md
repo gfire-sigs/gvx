@@ -17,7 +17,7 @@ This section records changes that no release contains yet.
 
 ### Behavior Changes
 
-- **`.gvx_meta` keys its records on file identity** (`hostfs`, journal version 4): a record belongs to a file and not to a path. The identity is the volume serial number and the 128-bit file id on Windows, the device and the inode number on macOS, and the device, the inode number, and the birth time on Linux. The birth time matters on Linux because ext4 reuses an inode number at the next create. It stays out of the macOS key because APFS lowers the birth time when a process sets an earlier modification time. Measured on an Apple M1 with APFS, with the benchmarks of `HOSTFS_BENCH=1`:
+- **`.gvx_meta` keys its records on file identity** (`hostfs`, journal version 4): a record belongs to a file and not to a path. The identity is the volume serial number and the 128-bit file id on Windows, and the device, the inode number, and the birth time on Linux and macOS. The birth time tells a new file from an old one with the same inode number, which ext4 reuses at the next create. APFS lowers the birth time when a process sets an earlier modification time. `hostfs` detects that case and keeps the record. Measured on an Apple M1 with APFS, with the benchmarks of `HOSTFS_BENCH=1`:
 
   | Operation | Table size | Before | After |
   | :--- | ---: | ---: | ---: |

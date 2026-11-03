@@ -568,7 +568,7 @@ The cap is visible to the guest. Before `inotify_add_watch(2)` adds a watch, the
 | :--- | :--- | :--- |
 | Windows | Volume serial number and the 128-bit file id of `FILE_ID_INFO` | NTFS and ReFS never reuse the pair while the volume lives. |
 | Linux | Device, inode number, and the `statx` birth time | The birth time, because ext4 reuses an inode number at the next create. |
-| macOS | Device and inode number of an APFS or HFS+ volume | APFS never reuses an inode number. The birth time stays out of the key, because APFS lowers it when a process sets an earlier modification time. |
+| macOS | Device, inode number, and the APFS or HFS+ birth time | The birth time. APFS lowers it when a process sets an earlier modification time, and `hostfs` then re-keys the record of the same inode number. |
 
 The device of the workspace root is stored as zero, so a volume that gets another device number after a reboot keeps its records. A virtual symbolic link has no host object. Its record keys on the identity of the parent directory and on the link name. The table indexes the links of each directory, so a listing reads the entries of that directory only.
 
