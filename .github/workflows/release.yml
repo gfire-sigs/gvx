@@ -33,10 +33,10 @@ jobs:
         include:
           - { goos: linux, goarch: amd64, runner: ubuntu-24.04 }
           - { goos: linux, goarch: arm64, runner: ubuntu-24.04 }
-          - { goos: windows, goarch: amd64, runner: ubuntu-24.04 }
-          - { goos: windows, goarch: arm64, runner: ubuntu-24.04 }
           # The hypervisor entitlement needs codesign, which only macOS has.
           - { goos: darwin, goarch: arm64, runner: macos-15 }
+          - { goos: windows, goarch: amd64, runner: ubuntu-24.04 }
+          - { goos: windows, goarch: arm64, runner: ubuntu-24.04 }
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}

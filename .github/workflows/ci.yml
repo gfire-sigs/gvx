@@ -134,7 +134,7 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./e2e/
-      - name: Build rungv and smoke guest
+      - name: Build rungv and the smoke guest
         env:
           CGO_ENABLED: "0"
         run: |
@@ -209,16 +209,19 @@ jobs:
           Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List FeatureName, State
           Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
+      - name: Build rungv and the smoke guest
+        shell: bash
+        run: |
+          go build -o rungv.exe ./cmd/rungv
+          go run ./internal/testelf/cmd/mkelf -o smoke.elf
       # The runner has the Windows Hypervisor Platform, so whpx must start.
       # GVX_DEBUG_LOG prints the Sentry log, which names the reason of a guest
       # crash.
-      - name: Smoke test rungv guest on whpx
+      - name: Run smoke guest on whpx
         shell: bash
         env:
           GVX_DEBUG_LOG: "1"
         run: |
-          go build -o rungv.exe ./cmd/rungv
-          go run ./internal/testelf/cmd/mkelf -o smoke.elf
           ./rungv.exe run -platform=whpx -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out

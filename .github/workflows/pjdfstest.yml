@@ -46,7 +46,7 @@ env:
 
 jobs:
   select:
-    name: select drivers
+    name: select pjdfstest drivers
     runs-on: ubuntu-24.04
     outputs:
       fs: ${{ steps.pick.outputs.fs }}
@@ -92,7 +92,7 @@ jobs:
           echo "fs=[$list]" >>"$GITHUB_OUTPUT"
 
   bundle:
-    name: bundle linux/${{ matrix.arch }}
+    name: build pjdfstest bundle linux/${{ matrix.arch }}
     needs: select
     if: needs.select.outputs.fs != '[]'
     runs-on: ${{ matrix.runner }}
@@ -129,7 +129,7 @@ jobs:
           path: bundle/
 
   linux:
-    name: pjdfstest ${{ matrix.fs }} linux/${{ matrix.arch }}
+    name: test pjdfstest ${{ matrix.fs }} linux/${{ matrix.arch }}
     needs: [select, bundle]
     if: needs.select.outputs.fs != '[]' && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux')
     runs-on: ${{ matrix.runner }}
@@ -180,7 +180,7 @@ jobs:
           path: out/worker_*.log
 
   windows:
-    name: pjdfstest ${{ matrix.fs }} windows/${{ matrix.arch }}
+    name: test pjdfstest ${{ matrix.fs }} windows/${{ matrix.arch }}
     needs: [select, bundle]
     if: needs.select.outputs.fs != '[]' && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows')
     runs-on: ${{ matrix.runner }}
@@ -204,14 +204,14 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - name: Build rungv
+        shell: bash
+        run: go build -o rungv.exe ./cmd/rungv
       - name: Download pjdfstest bundle
         uses: actions/download-artifact@v8
         with:
           name: pjdfstest-bundle-${{ matrix.arch }}
           path: bundle
-      - name: Build rungv
-        shell: bash
-        run: go build -o rungv.exe ./cmd/rungv
       - name: Run pjdfstest inside guests
         shell: bash
         run: ./scripts/pjdfstest/run.sh ./rungv.exe ./cache ./bundle ${{ matrix.fs }} tmp ./out
