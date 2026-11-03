@@ -16,7 +16,6 @@ package hostfs
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -1410,18 +1409,11 @@ func TestCoalesceWindowIs250Milliseconds(t *testing.T) {
 // rel, and whether it records an entry.
 func (e *env) metaOnDisk(rel string) (mode uint32, ok bool) {
 	e.t.Helper()
-	raw, err := os.ReadFile(filepath.Join(e.dir, MetaFileName))
-	if errors.Is(err, os.ErrNotExist) {
+	path := filepath.Join(e.dir, MetaFileName)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return 0, false
 	}
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	var store metaStoreFile
-	if err := json.Unmarshal(raw, &store); err != nil {
-		e.t.Fatalf("parse %s: %v", MetaFileName, err)
-	}
-	m, ok := store.Entries[rel]
+	m, ok := readMetaTable(e.t, path)[rel]
 	return m.Mode, ok
 }
 
@@ -1564,17 +1556,17 @@ func TestFsyncReportsEveryFailure(t *testing.T) {
 	}
 }
 
-// TestFsyncSurvivesACrashInTheTableWrite uses the crash model of the table
-// flush: the hook stops a flush between the write of the temporary file and the
-// rename. The old table stays complete, and the next sync succeeds.
+// TestFsyncSurvivesACrashInTheTableWrite models a crash in the append of a
+// journal frame: half of the frame reaches the file. The old table stays
+// complete, and the next sync succeeds.
 func TestFsyncSurvivesACrashInTheTableWrite(t *testing.T) {
-	crash := errors.New("crash before the rename")
+	crash := errors.New("crash during the append")
 	var armed bool
-	e := newSlowFlushEnv(t, workspaceOptions{beforeMetaRename: func() error {
+	e := newSlowFlushEnv(t, workspaceOptions{appendFault: func(frame []byte) (int, error) {
 		if armed {
-			return crash
+			return len(frame) / 2, crash
 		}
-		return nil
+		return len(frame), nil
 	}})
 	e.writeFile("f", []byte("x"))
 	e.chmod("f", 0o600)
@@ -1592,9 +1584,6 @@ func TestFsyncSurvivesACrashInTheTableWrite(t *testing.T) {
 	wantErrno(t, "fsync that crashes in the table write", fd.Sync(e.ctx), linuxerr.EIO)
 	if mode, _ := e.metaOnDisk("f"); mode&0o7777 != 0o600 {
 		t.Fatalf("table after the crash = mode %o, want the complete old table with 600", mode&0o7777)
-	}
-	if _, err := os.Lstat(filepath.Join(e.dir, metaTempName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the crashed flush left %s behind: %v", metaTempName, err)
 	}
 	armed = false
 	if err := fd.Sync(e.ctx); err != nil {

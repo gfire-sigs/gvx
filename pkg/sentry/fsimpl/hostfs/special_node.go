@@ -144,8 +144,7 @@ func (w *Workspace) mknodLocked(rel string, mode, uid, gid uint32, rdev uint64) 
 		_ = w.host.unlink(hostRel)
 		return err
 	}
-	w.meta[rel] = POSIXAttr{Mode: mode&linux.S_IFMT | mode&0o7777, UID: uid, GID: gid, Rdev: rdev}
-	w.markDirtyLocked()
+	w.setMetaLocked(rel, POSIXAttr{Mode: mode&linux.S_IFMT | mode&0o7777, UID: uid, GID: gid, Rdev: rdev})
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)

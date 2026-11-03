@@ -34,8 +34,10 @@ var flushNeedsWrite = runtime.GOOS == "windows"
 //  1. the dirty mapped pages of the file (fileData.syncData),
 //  2. the host file (hostHandle.sync),
 //  3. the directory entry of the file (Workspace.syncDir of the parent), and
-//  4. the metadata table (Workspace.Sync), which flushes the workspace
-//     directory after its own atomic rename.
+//  4. the metadata table (Workspace.Sync), which appends the changed records
+//     to the .gvx_meta journal and flushes the file. A compaction of the
+//     journal flushes the workspace directory after its own atomic rename.
+//     A table without pending changes costs no host call.
 //
 // A write with O_SYNC or O_DSYNC flushes the directory entry only on the first
 // such write of a file description. The entry cannot change through the

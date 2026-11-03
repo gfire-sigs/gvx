@@ -249,8 +249,15 @@ func TestHostfsMetaFlushBench(t *testing.T) {
 				}
 				_ = f.Close()
 			}
-			if err := ws.Sync(); err != nil {
-				t.Fatalf("Sync: %v", err)
+			// The flush of a large backlog of dirty host files would dominate
+			// the first measured iterations, so drain it first.
+			for i := range 50 {
+				if err := ws.Chmod("f0", uint32(0o600+i%8)); err != nil {
+					t.Fatalf("Chmod: %v", err)
+				}
+				if err := ws.Sync(); err != nil {
+					t.Fatalf("Sync: %v", err)
+				}
 			}
 			res := testing.Benchmark(func(b *testing.B) {
 				for i := range b.N {

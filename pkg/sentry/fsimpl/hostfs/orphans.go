@@ -47,31 +47,58 @@ func (w *Workspace) pruneOrphansLocked(limit int) int {
 	if w.readOnly {
 		return 0
 	}
+	removed := 0
+	parentGone := make(map[string]bool)
+	for checked := 0; checked < limit && w.pruneNextLocked(parentGone, &removed); checked++ {
+	}
+	return removed
+}
+
+// pruneOrphans is pruneOrphansLocked for a caller that holds no lock. It takes
+// w.mu for one record at a time, so a batch never stalls the guest for longer
+// than one host lookup. The check and the removal of a record happen under one
+// lock hold, so a record that the guest recreates meanwhile survives.
+func (w *Workspace) pruneOrphans(limit int) {
+	if w.readOnly {
+		return
+	}
+	removed := 0
+	parentGone := make(map[string]bool)
+	for checked := 0; checked < limit; checked++ {
+		w.mu.Lock()
+		more := !w.closed && w.pruneNextLocked(parentGone, &removed)
+		w.mu.Unlock()
+		if !more {
+			return
+		}
+	}
+}
+
+// pruneNextLocked checks the next record of the prune cycle and removes it
+// when its host object is gone. It adds one to removed for a removal, and it
+// reports false when the table is empty. A cycle reads the keys once and
+// resumes where the last call stopped, so every record gets checked in turn.
+// parentGone caches the verdict for parent directories. Callers hold w.mu for
+// writing.
+func (w *Workspace) pruneNextLocked(parentGone map[string]bool, removed *int) bool {
 	if w.pruneCursor >= len(w.pruneKeys) {
 		w.pruneKeys = w.pruneKeys[:0]
 		for k := range w.meta {
 			w.pruneKeys = append(w.pruneKeys, k)
 		}
 		w.pruneCursor = 0
-	}
-	removed := 0
-	parentGone := make(map[string]bool)
-	for checked := 0; checked < limit && w.pruneCursor < len(w.pruneKeys); checked++ {
-		k := w.pruneKeys[w.pruneCursor]
-		w.pruneCursor++
-		m, ok := w.meta[k]
-		if !ok {
-			continue
-		}
-		if w.recordOrphanLocked(k, m, parentGone) {
-			delete(w.meta, k)
-			removed++
+		if len(w.pruneKeys) == 0 {
+			return false
 		}
 	}
-	if removed > 0 {
-		w.markDirtyLocked()
+	k := w.pruneKeys[w.pruneCursor]
+	w.pruneCursor++
+	m, ok := w.meta[k]
+	if ok && w.recordOrphanLocked(k, m, parentGone) {
+		w.delMetaLocked(k)
+		*removed++
 	}
-	return removed
+	return true
 }
 
 // recordOrphanLocked reports whether the record of key k has lost its host

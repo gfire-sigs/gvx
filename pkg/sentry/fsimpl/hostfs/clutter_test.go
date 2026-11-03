@@ -16,7 +16,6 @@ package hostfs
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -412,16 +411,8 @@ func TestFlushPrunesRecordsOfMissingHostObjects(t *testing.T) {
 	if err := e.ws.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(e.host(MetaFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
 	var keys []string
-	for k := range parsed.Entries {
+	for k := range readMetaTable(t, e.host(MetaFileName)) {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
@@ -448,16 +439,9 @@ func TestMetaSchemaVersionOneStillLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeEnv()
-	raw, err := os.ReadFile(dir + "/" + MetaFileName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Version != 2 {
-		t.Fatalf("version after the first write = %d, want 2", parsed.Version)
+	table := readMetaTable(t, dir+"/"+MetaFileName)
+	if got := table["f"]; got.UID != 7 || got.GID != 8 || got.Mode&0o7777 != 0o600 {
+		t.Fatalf("record of f after the first write = %+v, want uid 7 gid 8 mode 600", got)
 	}
 }
 
@@ -483,15 +467,8 @@ func TestMetaSchemaVersionTwoKeepsXattrs(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeEnv()
-	raw, err := os.ReadFile(dir + "/" + MetaFileName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if got := string(parsed.Entries["f"].Xattrs["user.k"]); parsed.Version != 2 || got != "val" {
-		t.Fatalf("after the rewrite: version %d, xattr %q, want 2 and val", parsed.Version, got)
+	table := readMetaTable(t, dir+"/"+MetaFileName)
+	if got := string(table["f"].Xattrs["user.k"]); got != "val" || table["f"].Mode&0o7777 != 0o640 {
+		t.Fatalf("after the rewrite: xattr %q mode %o, want val and 640", got, table["f"].Mode&0o7777)
 	}
 }
