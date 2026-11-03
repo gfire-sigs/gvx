@@ -46,6 +46,10 @@ func (e *env) mkdirChain(dir string) {
 	for _, part := range strings.Split(dir, "/") {
 		cur = joinRelPath(cur, part)
 		e.mustMkdir(cur)
+		// A Windows host lists a directory at its first stat to count its
+		// links, so the stat belongs to the fixture and not to the measured
+		// operation.
+		e.mustStat(cur)
 	}
 }
 

@@ -548,6 +548,61 @@ func TestWindowsHostPinnedMutationsStayInsideTheDirectory(t *testing.T) {
 	}
 }
 
+func TestWindowsHostPinnedCallsRefuseReparsePoints(t *testing.T) {
+	for _, kind := range []string{"symlink", "junction"} {
+		t.Run(kind, func(t *testing.T) {
+			h, dir := winTestHost(t)
+			if err := h.mkdir("real"); err != nil {
+				t.Fatalf("mkdir(real) = %v", err)
+			}
+			winTestWrite(t, h, "real/file.txt", "inside")
+			if err := h.mkdir("d"); err != nil {
+				t.Fatalf("mkdir(d) = %v", err)
+			}
+			// A link at the root: a pinned open must refuse it.
+			// A link inside d: the final component of a pinned call.
+			for _, link := range []string{"via", "d/lnk"} {
+				if kind == "symlink" {
+					winTestSymlink(t, filepath.Join(dir, "real"), filepath.Join(dir, filepath.FromSlash(link)))
+				} else {
+					winTestJunction(t, filepath.Join(dir, filepath.FromSlash(link)), filepath.Join(dir, "real"))
+				}
+			}
+			if _, _, err := h.openDirAt(h.rootDir(), "via"); !errors.Is(err, ErrPathTraversal) {
+				t.Errorf("openDirAt through a %s = %v, want ErrPathTraversal", kind, err)
+			}
+			pin, _, err := h.openDirAt(h.rootDir(), "d")
+			if err != nil {
+				t.Fatalf("openDirAt(d) = %v", err)
+			}
+			defer func() { _ = h.closeDir(pin) }()
+			if _, _, err := h.openDirAt(pin, "lnk"); !errors.Is(err, ErrPathTraversal) {
+				t.Errorf("openDirAt of the %s inside d = %v, want ErrPathTraversal", kind, err)
+			}
+
+			before, err := h.lstat("real")
+			if err != nil {
+				t.Fatal(err)
+			}
+			when := time.Unix(1_000_000, 0)
+			if err := h.chtimesAt(pin, "lnk", &when, &when); err != nil {
+				t.Fatalf("chtimesAt of a %s = %v", kind, err)
+			}
+			if after, err := h.lstat("real"); err != nil || !after.mtime.Equal(before.mtime) {
+				t.Errorf("chtimesAt followed the %s: target mtime %v then %v (%v)", kind, before.mtime, after.mtime, err)
+			}
+			winTestErrno(t, h.mkdirAt(pin, "lnk"), linuxerr.EEXIST)
+			winTestErrno(t, h.rmdirAt(pin, "lnk"), linuxerr.ENOTDIR)
+			if err := h.unlinkAt(pin, "lnk"); err != nil {
+				t.Fatalf("unlinkAt of a %s = %v", kind, err)
+			}
+			if _, err := h.lstat("real/file.txt"); err != nil {
+				t.Errorf("unlinkAt of a %s removed content of the target: %v", kind, err)
+			}
+		})
+	}
+}
+
 func TestWindowsHostRefusesInvalidNames(t *testing.T) {
 	h, _ := winTestHost(t)
 	for _, rel := range []string{"NUL", "nul.txt", "a:stream", "a:b:$DATA", "trailing.", "trailing ", `back\slash`, "q?", "COM1"} {
