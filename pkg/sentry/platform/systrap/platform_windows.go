@@ -38,6 +38,8 @@ import (
 	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 )
 
+var _ platform.AddressHolePlatform = (*Platform)(nil)
+
 // Platform implements platform.Platform with stub processes that run the guest
 // natively. The Sentry is the debugger of every stub, so no code of the stub
 // runs when the guest traps or faults.
@@ -237,14 +239,14 @@ func (p *Platform) selectLowWindow() *stubProc {
 	return nil
 }
 
-// UserAddressHole implements platform.AddressHolePlatform.UserAddressHole. The
+// UserAddressHoles implements platform.AddressHolePlatform.UserAddressHoles. The
 // range between the low window and the high window belongs to the stub
 // process.
-func (p *Platform) UserAddressHole() hostarch.AddrRange {
+func (p *Platform) UserAddressHoles() []hostarch.AddrRange {
 	if !p.lowWindow {
-		return hostarch.AddrRange{}
+		return nil
 	}
-	return hostarch.AddrRange{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(winBase)}
+	return []hostarch.AddrRange{{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(winBase)}}
 }
 
 // Close terminates every stub process and frees the Sentry-side memory. It is

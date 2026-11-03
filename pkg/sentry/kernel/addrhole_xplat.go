@@ -19,13 +19,15 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// UserAddressHole implements platform.AddressHolePlatform. The memory manager
+var _ platform.AddressHolePlatform = (*Kernel)(nil)
+
+// UserAddressHoles implements platform.AddressHolePlatform. The memory manager
 // takes the kernel as its platform, and the kernel embeds the platform as an
 // interface. The optional methods of the concrete platform are therefore not
-// visible through the kernel, so the kernel forwards the address hole.
-func (k *Kernel) UserAddressHole() hostarch.AddrRange {
+// visible through the kernel, so the kernel forwards the address holes.
+func (k *Kernel) UserAddressHoles() []hostarch.AddrRange {
 	if hp, ok := k.Platform.(platform.AddressHolePlatform); ok {
-		return hp.UserAddressHole()
+		return hp.UserAddressHoles()
 	}
-	return hostarch.AddrRange{}
+	return nil
 }

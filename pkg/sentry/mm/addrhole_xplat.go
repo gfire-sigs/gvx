@@ -15,66 +15,85 @@
 package mm
 
 import (
+	"slices"
+
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// addressHole returns the gap inside the guest address range that no mapping
-// may use. A platform that has no gap returns an empty range.
-func (mm *MemoryManager) addressHole() hostarch.AddrRange {
+// addressHoles returns the gaps inside the guest address range that no mapping
+// may use, in ascending order. A platform that has no gap returns none.
+func (mm *MemoryManager) addressHoles() []hostarch.AddrRange {
 	if hp, ok := mm.p.(platform.AddressHolePlatform); ok {
-		return hp.UserAddressHole()
+		return hp.UserAddressHoles()
 	}
-	return hostarch.AddrRange{}
+	return nil
 }
 
-// overlapsHole reports whether ar overlaps the address hole of the platform.
-func (mm *MemoryManager) overlapsHole(ar hostarch.AddrRange) bool {
-	hole := mm.addressHole()
-	return hole.Length() != 0 && ar.Overlaps(hole)
+// overlapsHole reports whether ar overlaps one of the holes.
+func overlapsHole(ar hostarch.AddrRange, holes []hostarch.AddrRange) bool {
+	return slices.ContainsFunc(holes, ar.Overlaps)
 }
 
 // isHostBlockPlatform reports whether the platform maps guest memory in 16KB
-// host blocks.
-func (mm *MemoryManager) isHostBlockPlatform() bool {
+// host blocks. holes are the address holes of the platform.
+func (mm *MemoryManager) isHostBlockPlatform(holes []hostarch.AddrRange) bool {
 	if mm.layout.MinAddr >= 0x4_0000_0000 {
 		return true
 	}
-	return mm.addressHole().End >= 0x4000_0000_0000
+	return len(holes) != 0 && holes[len(holes)-1].End >= 0x4000_0000_0000
+}
+
+// maxHoles is the number of holes that a search handles without an allocation.
+const maxHoles = 4
+
+// appendRangesAvoiding appends the parts of bounds that no hole covers to dst,
+// in ascending order. holes must be in ascending order and must not overlap.
+func appendRangesAvoiding(dst []hostarch.AddrRange, bounds hostarch.AddrRange, holes []hostarch.AddrRange) []hostarch.AddrRange {
+	next := bounds.Start
+	for _, hole := range holes {
+		if hole.End <= next {
+			continue
+		}
+		if hole.Start >= bounds.End {
+			break
+		}
+		if hole.Start > next {
+			dst = append(dst, hostarch.AddrRange{Start: next, End: hole.Start})
+		}
+		next = hole.End
+	}
+	if next < bounds.End {
+		dst = append(dst, hostarch.AddrRange{Start: next, End: bounds.End})
+	}
+	return dst
 }
 
 // findAvoidingHoleLocked searches bounds like findLowestAvailableLocked, or
 // like findHighestAvailableLocked when highest is true, but never returns a
-// range inside the address hole. The part of bounds on the preferred side of
-// the hole comes first.
+// range inside one of the holes. The part of bounds on the preferred side comes
+// first: the lowest part, or the highest part when highest is true.
 //
 // +checklocksread:mm.mappingMu
-func (mm *MemoryManager) findAvoidingHoleLocked(length, alignment uint64, bounds hostarch.AddrRange, highest bool) (hostarch.Addr, error) {
+func (mm *MemoryManager) findAvoidingHoleLocked(length, alignment uint64, bounds hostarch.AddrRange, holes []hostarch.AddrRange, highest bool) (hostarch.Addr, error) {
 	const hostBlockAlign = 0x4000
-	hole := mm.addressHole()
-	if mm.isHostBlockPlatform() && alignment < hostBlockAlign {
+	if mm.isHostBlockPlatform(holes) && alignment < hostBlockAlign {
 		alignment = hostBlockAlign
 	}
 	find := mm.findLowestAlignedLocked
 	if highest {
 		find = mm.findHighestAlignedLocked
 	}
-	if hole.Length() == 0 || !bounds.Overlaps(hole) {
+	if !slices.ContainsFunc(holes, bounds.Overlaps) {
 		return find(length, alignment, bounds)
 	}
-	var below, above hostarch.AddrRange
-	if bounds.Start < hole.Start {
-		below = hostarch.AddrRange{Start: bounds.Start, End: hole.Start}
-	}
-	if bounds.End > hole.End {
-		above = hostarch.AddrRange{Start: hole.End, End: bounds.End}
-	}
-	first, second := below, above
+	var buf [maxHoles + 1]hostarch.AddrRange
+	parts := appendRangesAvoiding(buf[:0], bounds, holes)
 	if highest {
-		first, second = above, below
+		slices.Reverse(parts)
 	}
-	for _, part := range []hostarch.AddrRange{first, second} {
+	for _, part := range parts {
 		if uint64(part.Length()) < length {
 			continue
 		}

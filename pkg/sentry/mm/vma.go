@@ -182,9 +182,10 @@ const (
 //
 // +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOpts) (hostarch.Addr, error) {
+	holes := mm.addressHoles()
 	if opts.Fixed {
 		opts.Map32Bit = false
-	} else if opts.Addr != 0 && mm.isHostBlockPlatform() {
+	} else if opts.Addr != 0 && mm.isHostBlockPlatform(holes) {
 		opts.Addr &^= 0x3fff
 	}
 	allowedAR := mm.applicationAddrRange()
@@ -194,7 +195,7 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 
 	// Does the provided suggestion work?
 	if ar, ok := opts.Addr.ToRange(length); ok {
-		if allowedAR.IsSupersetOf(ar) && !mm.overlapsHole(ar) {
+		if allowedAR.IsSupersetOf(ar) && !overlapsHole(ar, holes) {
 			if opts.Unmap {
 				return ar.Start, nil
 			}
@@ -230,7 +231,7 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 		if hugeStart, ok := hostarch.HugePageRoundUp(opts.Offset); ok && hugeStart < hugeEnd {
 			if paddedLen := length + hostarch.HugePageSize - hostarch.PageSize; length < paddedLen {
 				if hugePaddedLen, ok := hostarch.HugePageRoundUp(paddedLen); ok {
-					if addr, err := mm.findAlignedAvailableLocked(hugePaddedLen, hostarch.HugePageSize, allowedAR, opts); err == nil {
+					if addr, err := mm.findAlignedAvailableLocked(hugePaddedLen, hostarch.HugePageSize, allowedAR, holes, opts); err == nil {
 						return addr + hostarch.Addr(hostarch.HugePageOffset(opts.Offset)), nil
 					}
 				}
@@ -244,7 +245,7 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 	if hostarch.IsHugePageAligned(length) && opts.Mappable == nil && !opts.GrowsDown && !opts.Stack {
 		alignment = uint64(hostarch.HugePageSize)
 	}
-	return mm.findAlignedAvailableLocked(length, alignment, allowedAR, opts)
+	return mm.findAlignedAvailableLocked(length, alignment, allowedAR, holes, opts)
 }
 
 func (mm *MemoryManager) applicationAddrRange() hostarch.AddrRange {
@@ -252,14 +253,14 @@ func (mm *MemoryManager) applicationAddrRange() hostarch.AddrRange {
 }
 
 // +checklocksread:mm.mappingMu
-func (mm *MemoryManager) findAlignedAvailableLocked(length, alignment uint64, allowedAR hostarch.AddrRange, opts findAvailableOpts) (hostarch.Addr, error) {
+func (mm *MemoryManager) findAlignedAvailableLocked(length, alignment uint64, allowedAR hostarch.AddrRange, holes []hostarch.AddrRange, opts findAvailableOpts) (hostarch.Addr, error) {
 	if opts.Map32Bit {
-		return mm.findAvoidingHoleLocked(length, alignment, allowedAR, false)
+		return mm.findAvoidingHoleLocked(length, alignment, allowedAR, holes, false)
 	}
 	if mm.layout.DefaultDirection == arch.MmapBottomUp {
-		return mm.findAvoidingHoleLocked(length, alignment, hostarch.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr}, false)
+		return mm.findAvoidingHoleLocked(length, alignment, hostarch.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr}, holes, false)
 	}
-	return mm.findAvoidingHoleLocked(length, alignment, hostarch.AddrRange{mm.layout.MinAddr, mm.layout.TopDownBase}, true)
+	return mm.findAvoidingHoleLocked(length, alignment, hostarch.AddrRange{mm.layout.MinAddr, mm.layout.TopDownBase}, holes, true)
 }
 
 // +checklocksread:mm.mappingMu

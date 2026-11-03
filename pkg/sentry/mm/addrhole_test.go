@@ -15,6 +15,7 @@
 package mm
 
 import (
+	"slices"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -23,13 +24,13 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// holePlatform is a platform whose guest range has a gap.
+// holePlatform is a platform whose guest range has gaps.
 type holePlatform struct {
 	platform.Platform
-	hole hostarch.AddrRange
+	holes []hostarch.AddrRange
 }
 
-func (p holePlatform) UserAddressHole() hostarch.AddrRange { return p.hole }
+func (p holePlatform) UserAddressHoles() []hostarch.AddrRange { return p.holes }
 
 // plainPlatform is a platform that has no gap.
 type plainPlatform struct{ platform.Platform }
@@ -64,7 +65,7 @@ func holeBlocks(ar hostarch.AddrRange) bool {
 
 func TestFixedMappingsNeverOverlapTheAddressHole(t *testing.T) {
 	hole := hostarch.AddrRange{Start: holeStart, End: holeEnd}
-	mm := newHoleMM(holePlatform{hole: hole}, arch.MmapTopDown, holeEnd, topDownLow)
+	mm := newHoleMM(holePlatform{holes: []hostarch.AddrRange{hole}}, arch.MmapTopDown, holeEnd, topDownLow)
 	for _, tc := range []struct {
 		name string
 		addr hostarch.Addr
@@ -96,7 +97,7 @@ func TestFixedMappingsNeverOverlapTheAddressHole(t *testing.T) {
 
 func TestAddressHintInsideTheHoleMovesOutside(t *testing.T) {
 	hole := hostarch.AddrRange{Start: holeStart, End: holeEnd}
-	mm := newHoleMM(holePlatform{hole: hole}, arch.MmapTopDown, holeEnd, topDownLow)
+	mm := newHoleMM(holePlatform{holes: []hostarch.AddrRange{hole}}, arch.MmapTopDown, holeEnd, topDownLow)
 	got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{Addr: holeStart + holePage*16})
 	if err != nil {
 		t.Fatalf("hint inside the hole: %v", err)
@@ -108,7 +109,7 @@ func TestAddressHintInsideTheHoleMovesOutside(t *testing.T) {
 
 func TestTopDownSearchFallsBelowTheHoleOnlyWhenTheHighPartIsTooSmall(t *testing.T) {
 	hole := hostarch.AddrRange{Start: holeStart, End: holeEnd}
-	mm := newHoleMM(holePlatform{hole: hole}, arch.MmapTopDown, holeEnd, topDownLow)
+	mm := newHoleMM(holePlatform{holes: []hostarch.AddrRange{hole}}, arch.MmapTopDown, holeEnd, topDownLow)
 
 	got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{})
 	if err != nil || got != topDownLow-holePage {
@@ -133,7 +134,7 @@ func TestTopDownSearchFallsBelowTheHoleOnlyWhenTheHighPartIsTooSmall(t *testing.
 
 func TestBottomUpSearchSkipsTheHole(t *testing.T) {
 	hole := hostarch.AddrRange{Start: holeStart, End: holeEnd}
-	mm := newHoleMM(holePlatform{hole: hole}, arch.MmapBottomUp, holeStart-0x1000_0000, topDownLow)
+	mm := newHoleMM(holePlatform{holes: []hostarch.AddrRange{hole}}, arch.MmapBottomUp, holeStart-0x1000_0000, topDownLow)
 
 	got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{})
 	if err != nil || got != holeStart-0x1000_0000 {
@@ -152,5 +153,169 @@ func TestPlatformWithoutHoleKeepsEveryAddress(t *testing.T) {
 	got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{Addr: addr, Fixed: true})
 	if err != nil || got != addr {
 		t.Fatalf("fixed mapping at %#x without a hole = (%#x, %v), want the requested address", uint64(addr), uint64(got), err)
+	}
+}
+
+// A platform with a middle window has two holes. The windows of these tests
+// are [holeMin, 3 GiB), [4 GiB, 6 GiB), and [7 GiB, 8 GiB). The sizes shrink
+// toward the top, so each search order reaches a different window.
+const (
+	twoHolesFirstStart  = 3 << 30
+	twoHolesFirstEnd    = 4 << 30
+	twoHolesSecondStart = 6 << 30
+	twoHolesSecondEnd   = 7 << 30
+	twoHolesMax         = 8 << 30
+)
+
+func newTwoHolesMM(dir arch.MmapDirection, bottomUpBase hostarch.Addr) *MemoryManager {
+	mm := newHoleMM(holePlatform{holes: []hostarch.AddrRange{
+		{Start: twoHolesFirstStart, End: twoHolesFirstEnd},
+		{Start: twoHolesSecondStart, End: twoHolesSecondEnd},
+	}}, dir, bottomUpBase, twoHolesMax)
+	mm.layout.MaxAddr = twoHolesMax
+	return mm
+}
+
+func TestTwoHolesFixedMappingsNeverOverlap(t *testing.T) {
+	mm := newTwoHolesMM(arch.MmapTopDown, twoHolesSecondEnd)
+	for _, tc := range []struct {
+		name string
+		addr hostarch.Addr
+		size uint64
+		ok   bool
+	}{
+		{"the lowest window", holeMin, uint64(holePage), true},
+		{"the middle window", twoHolesFirstEnd, uint64(holePage) * 4, true},
+		{"the whole middle window", twoHolesFirstEnd, twoHolesSecondStart - twoHolesFirstEnd, true},
+		{"the highest window", twoHolesSecondEnd, uint64(holePage), true},
+		{"inside the first hole", twoHolesFirstStart + holePage, uint64(holePage), false},
+		{"inside the second hole", twoHolesSecondStart + holePage, uint64(holePage), false},
+		{"leaves the middle window upward", twoHolesSecondStart - holePage, uint64(holePage) * 2, false},
+		{"enters the middle window from below", twoHolesFirstEnd - holePage, uint64(holePage) * 2, false},
+		{"spans the middle window and both holes", twoHolesFirstStart - holePage, twoHolesSecondEnd - twoHolesFirstStart + uint64(holePage)*2, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mm.findAvailableLocked(tc.size, findAvailableOpts{Addr: tc.addr, Fixed: true})
+			if tc.ok {
+				if err != nil || got != tc.addr {
+					t.Fatalf("fixed mapping at %#x+%#x = (%#x, %v), want the requested address", uint64(tc.addr), tc.size, uint64(got), err)
+				}
+				return
+			}
+			if !linuxerr.Equals(linuxerr.ENOMEM, err) {
+				t.Fatalf("fixed mapping at %#x+%#x = (%#x, %v), want ENOMEM", uint64(tc.addr), tc.size, uint64(got), err)
+			}
+		})
+	}
+}
+
+func TestTwoHolesHintInTheMiddleWindowIsHonored(t *testing.T) {
+	mm := newTwoHolesMM(arch.MmapTopDown, twoHolesSecondEnd)
+	hint := hostarch.Addr(twoHolesFirstEnd + holeGiB/4)
+	got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{Addr: hint})
+	if err != nil || got != hint {
+		t.Fatalf("hint in the middle window = (%#x, %v), want %#x", uint64(got), err, uint64(hint))
+	}
+}
+
+func TestTwoHolesTopDownSearchWalksDownThroughTheWindows(t *testing.T) {
+	mm := newTwoHolesMM(arch.MmapTopDown, twoHolesSecondEnd)
+	for _, tc := range []struct {
+		name string
+		size uint64
+		want hostarch.Addr
+	}{
+		{"small", holeSmall, twoHolesMax - holePage},
+		{"1 GiB and a page leave the top window", holeGiB + holeSmall, twoHolesSecondStart - hostarch.Addr(holeGiB+holeSmall)},
+		{"2 GiB and a page leave the middle window", 2*holeGiB + holeSmall, twoHolesFirstStart - hostarch.Addr(2*holeGiB+holeSmall)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mm.findAvailableLocked(tc.size, findAvailableOpts{})
+			if err != nil || got != tc.want {
+				t.Fatalf("top-down search of %#x bytes = (%#x, %v), want %#x", tc.size, uint64(got), err, uint64(tc.want))
+			}
+		})
+	}
+	if _, err := mm.findAvailableLocked(3*holeGiB, findAvailableOpts{}); !linuxerr.Equals(linuxerr.ENOMEM, err) {
+		t.Fatalf("search that fits no window = %v, want ENOMEM", err)
+	}
+}
+
+func TestTwoHolesBottomUpSearchVisitsEachWindow(t *testing.T) {
+	// The base lies 256 MiB below the first hole.
+	mm := newTwoHolesMM(arch.MmapBottomUp, twoHolesFirstStart-hostarch.Addr(holeGiB/4))
+	got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{})
+	if err != nil || got != twoHolesFirstStart-hostarch.Addr(holeGiB/4) {
+		t.Fatalf("small bottom-up search = (%#x, %v), want the base", uint64(got), err)
+	}
+	got, err = mm.findAvailableLocked(holeGiB/2, findAvailableOpts{})
+	if err != nil || got != twoHolesFirstEnd {
+		t.Fatalf("512 MiB bottom-up search = (%#x, %v), want the start of the middle window, %#x", uint64(got), err, uint64(twoHolesFirstEnd))
+	}
+	// 1.5 GiB fits in the middle window and in no earlier part.
+	got, err = mm.findAvailableLocked(holeGiB+holeGiB/2, findAvailableOpts{})
+	if err != nil || got != twoHolesFirstEnd {
+		t.Fatalf("1.5 GiB bottom-up search = (%#x, %v), want the start of the middle window", uint64(got), err)
+	}
+	// A base 256 MiB below the second hole leaves the top window for 512 MiB.
+	mm = newTwoHolesMM(arch.MmapBottomUp, twoHolesSecondStart-hostarch.Addr(holeGiB/4))
+	got, err = mm.findAvailableLocked(holeGiB/2, findAvailableOpts{})
+	if err != nil || got != twoHolesSecondEnd {
+		t.Fatalf("512 MiB bottom-up search below the second hole = (%#x, %v), want the start of the top window, %#x", uint64(got), err, uint64(twoHolesSecondEnd))
+	}
+}
+
+func TestAppendRangesAvoidingHoles(t *testing.T) {
+	r := func(a, b hostarch.Addr) hostarch.AddrRange { return hostarch.AddrRange{Start: a, End: b} }
+	holes := []hostarch.AddrRange{r(10, 20), r(30, 40)}
+	for _, tc := range []struct {
+		name   string
+		bounds hostarch.AddrRange
+		want   []hostarch.AddrRange
+	}{
+		{"no overlap", r(0, 5), []hostarch.AddrRange{r(0, 5)}},
+		{"both holes", r(0, 50), []hostarch.AddrRange{r(0, 10), r(20, 30), r(40, 50)}},
+		{"starts inside a hole", r(15, 50), []hostarch.AddrRange{r(20, 30), r(40, 50)}},
+		{"ends inside a hole", r(0, 35), []hostarch.AddrRange{r(0, 10), r(20, 30)}},
+		{"inside one hole", r(12, 18), nil},
+		{"between the holes", r(22, 28), []hostarch.AddrRange{r(22, 28)}},
+		{"touches a hole", r(20, 30), []hostarch.AddrRange{r(20, 30)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := appendRangesAvoiding(nil, tc.bounds, holes)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("appendRangesAvoiding(%v) = %v, want %v", tc.bounds, got, tc.want)
+			}
+		})
+	}
+}
+
+// A search runs for every mmap of a guest, so it must not allocate.
+func TestTwoHolesSearchesDoNotAllocate(t *testing.T) {
+	hint := hostarch.Addr(twoHolesFirstEnd + holeGiB/4)
+	for _, tc := range []struct {
+		name string
+		dir  arch.MmapDirection
+		opts findAvailableOpts
+	}{
+		{"top-down search", arch.MmapTopDown, findAvailableOpts{}},
+		{"bottom-up search", arch.MmapBottomUp, findAvailableOpts{}},
+		{"hint in a window", arch.MmapTopDown, findAvailableOpts{Addr: hint}},
+		{"fixed mapping", arch.MmapTopDown, findAvailableOpts{Addr: hint, Fixed: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mm := newTwoHolesMM(tc.dir, twoHolesFirstStart-hostarch.Addr(holeGiB/4))
+			if _, err := mm.findAvailableLocked(holeSmall, tc.opts); err != nil {
+				t.Fatalf("search: %v", err)
+			}
+			allocs := testing.AllocsPerRun(100, func() {
+				if _, err := mm.findAvailableLocked(holeSmall, tc.opts); err != nil {
+					t.Fatalf("search: %v", err)
+				}
+			})
+			if allocs != 0 {
+				t.Errorf("allocations per search = %v, want 0", allocs)
+			}
+		})
 	}
 }
