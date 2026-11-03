@@ -51,7 +51,10 @@ type dirPin struct {
 
 	refs    int
 	lastUse int64
-	retired bool
+	// checkedAt is the time at which the host last confirmed that the parent
+	// directory holds this directory under this name.
+	checkedAt int64
+	retired   bool
 }
 
 // acquirePin returns the pinned handle of the directory rel and the caller
@@ -64,15 +67,30 @@ type dirPin struct {
 // and never opens an unbound host path.
 //
 // The pin of rel stands for the directory that rel named when the pin opened.
-// A caller passes only a directory path that it resolved and verified before.
+// A pin older than cacheTTL gets one lstatAt call in its parent before the
+// next use, and a pin whose name now holds another object retires with its
+// subtree and opens again. A host swap of a directory therefore reaches
+// lookups, mutations, and the Workspace methods after cacheTTL at the latest.
+// A descriptor that the guest opened below the directory before the swap
+// keeps the old directory, as an openat on an open directory does on POSIX.
 // Workspace.pinMu is a leaf lock: no pin call takes Workspace.mu.
 func (w *Workspace) acquirePin(rel string) (*dirPin, error) {
 	w.pinMu.Lock()
 	defer w.pinMu.Unlock()
-	return w.acquirePinLocked(rel)
+	return w.acquirePinLocked(rel, false)
 }
 
-func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
+// acquirePinHeld is acquirePin for a caller that holds w.mu. The name
+// resolution then reads .gvx_meta without a try-lock.
+func (w *Workspace) acquirePinHeld(rel string) (*dirPin, error) {
+	w.pinMu.Lock()
+	defer w.pinMu.Unlock()
+	return w.acquirePinLocked(rel, true)
+}
+
+// acquirePinLocked is acquirePin for a caller that holds w.pinMu. heldMu
+// reports that the caller holds w.mu as well.
+func (w *Workspace) acquirePinLocked(rel string, heldMu bool) (*dirPin, error) {
 	if w.pinsClosed {
 		return nil, os.ErrClosed
 	}
@@ -80,17 +98,28 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 		return &w.rootPin, nil
 	}
 	now := w.nowNano()
-	if p := w.pins[rel]; p != nil {
+	p := w.pins[rel]
+	if p != nil && now-p.checkedAt < int64(cacheTTL) {
 		p.refs++
 		p.lastUse = now
 		return p, nil
 	}
 	parentRel, name := splitParent(rel)
-	parent, err := w.acquirePinLocked(parentRel)
+	parent, err := w.acquirePinLocked(parentRel, heldMu)
 	if err != nil {
 		return nil, err
 	}
-	h, info, err := w.openDirNamed(parentRel, parent, name)
+	if p != nil {
+		if w.pinStillNamedLocked(parentRel, parent, name, p, heldMu) {
+			w.releasePinLocked(parent)
+			p.checkedAt = now
+			p.refs++
+			p.lastUse = now
+			return p, nil
+		}
+		w.retireSubtreeLocked(rel)
+	}
+	h, info, err := w.openDirNamed(parentRel, parent, name, heldMu)
 	w.releasePinLocked(parent)
 	if err != nil {
 		return nil, err
@@ -100,18 +129,29 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 		return nil, errNotDir
 	}
 	w.evictPinsLocked()
-	p := &dirPin{h: h, id: info.id, refs: 1, lastUse: now}
+	p = &dirPin{h: h, id: info.id, refs: 1, lastUse: now, checkedAt: now}
 	w.pins[rel] = p
 	w.armSweepLocked()
 	return p, nil
+}
+
+// pinStillNamedLocked reports whether the directory name below the pinned
+// directory parent is still the directory that p holds open. A host process
+// can move a directory away and put another one under its name. The caller
+// holds w.pinMu.
+func (w *Workspace) pinStillNamedLocked(parentRel string, parent *dirPin, name string, p *dirPin, heldMu bool) bool {
+	probe, err := w.locateIn(parentRel, name, parent, heldMu, func(leaf string) (hostInfo, error) {
+		return w.host.lstatAt(parent.h, leaf)
+	})
+	return err == nil && probe.found && !probe.hidden && probe.info.kind == hostKindDir && probe.info.id == p.id
 }
 
 // openDirNamed opens the directory name of the guest directory parentRel
 // through the pinned handle parent. It resolves the stored host name and fails
 // when the host stores the directory under another case or form. The caller
 // holds w.pinMu, and the name resolution takes only the lock of the name
-// snapshots.
-func (w *Workspace) openDirNamed(parentRel string, parent *dirPin, name string) (h hostDirHandle, info hostInfo, err error) {
+// snapshots. heldMu reports that the caller holds w.mu.
+func (w *Workspace) openDirNamed(parentRel string, parent *dirPin, name string, heldMu bool) (h hostDirHandle, info hostInfo, err error) {
 	opened := false
 	closeOpened := func() {
 		if opened {
@@ -119,7 +159,7 @@ func (w *Workspace) openDirNamed(parentRel string, parent *dirPin, name string) 
 			opened = false
 		}
 	}
-	probe, err := w.locateIn(parentRel, name, parent, false, func(leaf string) (hostInfo, error) {
+	probe, err := w.locateIn(parentRel, name, parent, heldMu, func(leaf string) (hostInfo, error) {
 		closeOpened()
 		oh, oinfo, oerr := w.host.openDirAt(parent.h, leaf)
 		if oerr != nil {
@@ -217,8 +257,15 @@ func (w *Workspace) retireSubtreeLocked(rel string) {
 func (w *Workspace) checkPin(rel string, id hostID, isDir bool) {
 	w.pinMu.Lock()
 	defer w.pinMu.Unlock()
-	if p := w.pins[rel]; p != nil && (!isDir || p.id != id) {
+	p := w.pins[rel]
+	switch {
+	case p == nil:
+	case !isDir || p.id != id:
 		w.retireSubtreeLocked(rel)
+	default:
+		// The lookup went through a confirmed parent pin and found the same
+		// directory under the name, so the pin needs no check of its own.
+		p.checkedAt = w.nowNano()
 	}
 }
 
@@ -301,7 +348,7 @@ func (w *Workspace) lookupIn(parentRel, name string) (entry, error) {
 	if isReservedPath(rel) {
 		return entry{}, fs.ErrNotExist
 	}
-	pin, err := w.acquirePin(parentRel)
+	pin, err := w.acquirePinHeld(parentRel)
 	if err != nil {
 		return entry{}, err
 	}
@@ -357,15 +404,51 @@ func (w *Workspace) openRegularWithAttrLocked(rel string, e entry, flags int) (*
 	if e.isSymlink() {
 		return nil, ErrPathTraversal
 	}
+	if rel == "." {
+		// The root has no directory that holds it. In single-file mode it is
+		// the bound file, which the host backend opens by its stored name.
+		return w.host.open(rel, flags&^(os.O_CREATE|os.O_EXCL), 0)
+	}
 	parent, name := splitParent(rel)
 	leaf, err := w.hostLeaf(parent, name)
 	if err != nil {
 		return nil, err
 	}
-	pin, err := w.acquirePin(parent)
+	pin, err := w.acquirePinHeld(parent)
 	if err != nil {
 		return nil, err
 	}
 	defer w.releasePin(pin)
 	return w.host.openChildAt(pin.h, leaf, flags&^(os.O_CREATE|os.O_EXCL), 0)
+}
+
+// locateLocked finds the host entry of the guest path rel through the pinned
+// handle of its directory. It does not handle the workspace root. A missing
+// or unusable directory fails like a missing entry. Callers hold w.mu.
+func (w *Workspace) locateLocked(rel string) (hostProbe, error) {
+	parent, name := splitParent(rel)
+	pin, err := w.acquirePinHeld(parent)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return hostProbe{}, err
+		}
+		// A missing directory holds no entry.
+		leaf, lerr := w.hostLeaf(parent, name)
+		if lerr != nil {
+			return hostProbe{}, lerr
+		}
+		return hostProbe{collided: errors.Is(err, errNameMismatch), create: leaf, err: err}, nil
+	}
+	defer w.releasePin(pin)
+	return w.locateIn(parent, name, pin, true, func(leaf string) (hostInfo, error) {
+		return w.host.lstatAt(pin.h, leaf)
+	})
+}
+
+// parentPinLocked returns the pinned handle of the directory that holds rel.
+// A successful call proves that the directory exists and that it is a
+// directory. The caller MUST call releasePin and holds w.mu.
+func (w *Workspace) parentPinLocked(rel string) (*dirPin, error) {
+	parent, _ := splitParent(rel)
+	return w.acquirePinHeld(parent)
 }

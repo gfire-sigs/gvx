@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"sync"
@@ -462,7 +463,7 @@ func TestHostSymlinksNeverTraversed(t *testing.T) {
 }
 
 func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
-	e := newEnv(t)
+	e, _, clock := newCountEnv(t)
 	e.mustMkdir("d")
 	e.writeFile("d/f", []byte("inside"))
 	outside := t.TempDir()
@@ -477,14 +478,23 @@ func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
 	if err := os.Symlink(outside, e.host("d")); err != nil {
 		t.Skipf("host cannot create symbolic links: %v", err)
 	}
-	if _, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); !errors.Is(err, ErrPathTraversal) {
-		t.Fatalf("OpenFile through swapped directory = %v, want ErrPathTraversal", err)
+	// Within the cache lifetime the pinned handle may still name the directory
+	// that the guest saw. It must never reach the outside file.
+	if f, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); err == nil {
+		raw, rerr := io.ReadAll(f)
+		_ = f.Close()
+		if rerr != nil || string(raw) != "inside" {
+			t.Fatalf("OpenFile through swapped directory read (%q, %v), want the content inside the workspace", raw, rerr)
+		}
+	} else if !errors.Is(err, ErrPathTraversal) {
+		t.Fatalf("OpenFile through swapped directory = %v, want ErrPathTraversal or the pinned directory", err)
 	}
-	// A lookup stays valid for cacheTTL, and the guest opened d before the swap,
-	// so the open may still reach the directory that the guest saw: the pinned
-	// handle names that object, not the path. It must never reach the outside
-	// file. TestHostSwapOfPinnedDirectoryIsNoticedAfterTheCacheLifetime covers
-	// the refusal after the cache expires.
+
+	// After the cache lifetime the pin checks its name and refuses the link.
+	clock.advance(cacheTTL + time.Millisecond)
+	if _, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); !errors.Is(err, ErrPathTraversal) {
+		t.Fatalf("OpenFile through swapped directory after the cache lifetime = %v, want ErrPathTraversal", err)
+	}
 	fd, err := e.open("d/f", linux.O_RDONLY, 0)
 	if err != nil {
 		wantErrno(t, "vfs open through swapped directory", err, linuxerr.EACCES)
@@ -1077,8 +1087,15 @@ func testMappedWriteBackFailureSurfacesAtSyncAndClose(t *testing.T, e *env) {
 
 func TestMetadataFlushIsAtomicUnderCrash(t *testing.T) {
 	dir := t.TempDir()
-	crash := errors.New("simulated crash before rename")
-	ws, err := openWorkspace(dir, false, workspaceOptions{})
+	crash := errors.New("simulated crash during the append")
+	armed := false
+	ws, err := openWorkspace(dir, false, workspaceOptions{appendFault: func(frame []byte) (int, error) {
+		if armed {
+			// All of the frame but its last byte reaches the file.
+			return len(frame) - 1, crash
+		}
+		return len(frame), nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1088,8 +1105,11 @@ func TestMetadataFlushIsAtomicUnderCrash(t *testing.T) {
 	if err := ws.Sync(); err != nil {
 		t.Fatalf("first Sync: %v", err)
 	}
-	ws.beforeMetaRename = func() error { return crash }
+	armed = true
 	if err := ws.Chmod("f", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.Chmod("f", 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := ws.Sync(); !errors.Is(err, crash) {
@@ -1110,12 +1130,12 @@ func TestMetadataFlushIsAtomicUnderCrash(t *testing.T) {
 	}
 	_ = again.Close()
 
-	// The crash left a torn temporary file. It never replaces the table, and
-	// the next successful flush overwrites it.
-	if err := os.WriteFile(dir+"/"+metaTempName, []byte(`{"version":1,"entr`), 0o600); err != nil {
+	// A crash during a compaction leaves a torn temporary file. It never
+	// replaces the table, and the next successful flush overwrites it.
+	if err := os.WriteFile(dir+"/"+metaTempName, []byte("GVXMETA\x03torn"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ws.beforeMetaRename = nil
+	armed = false
 	if err := ws.Sync(); err != nil {
 		t.Fatalf("Sync after crash: %v", err)
 	}
@@ -1127,8 +1147,8 @@ func TestMetadataFlushIsAtomicUnderCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = final.Close() }()
-	if attr, _, err := final.Stat("f"); err != nil || attr.Mode&0o7777 != 0o600 {
-		t.Fatalf("final mode = (%+v, %v), want 0600", attr, err)
+	if attr, _, err := final.Stat("f"); err != nil || attr.Mode&0o7777 != 0o644 {
+		t.Fatalf("final mode = (%+v, %v), want 0644", attr, err)
 	}
 	if _, err := os.Stat(dir + "/" + metaTempName); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temporary file remains after a successful flush: %v", err)

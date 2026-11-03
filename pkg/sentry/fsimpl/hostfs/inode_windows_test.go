@@ -170,19 +170,20 @@ func TestWindowsHostParseSymlinkReparse(t *testing.T) {
 	}
 }
 
-func winTestDirEntry(attrs, eaSize uint32, name string, last bool) []byte {
+func winTestDirEntry(attrs, eaSize uint32, fileID uint64, name string, last bool) []byte {
 	units := utf16.Encode([]rune(name))
 	nameBytes := len(units) * 2
-	size := (dirInfoNameOffset + nameBytes + 7) &^ 7
+	size := (idDirInfoNameOffset + nameBytes + 7) &^ 7
 	buf := make([]byte, size)
 	if !last {
 		binary.LittleEndian.PutUint32(buf[0:], uint32(size))
 	}
-	binary.LittleEndian.PutUint32(buf[dirInfoAttributesOffset:], attrs)
-	binary.LittleEndian.PutUint32(buf[dirInfoNameLengthOffset:], uint32(nameBytes))
-	binary.LittleEndian.PutUint32(buf[dirInfoEaSizeOffset:], eaSize)
+	binary.LittleEndian.PutUint32(buf[idDirInfoAttributesOffset:], attrs)
+	binary.LittleEndian.PutUint32(buf[idDirInfoNameLengthOffset:], uint32(nameBytes))
+	binary.LittleEndian.PutUint32(buf[idDirInfoEaSizeOffset:], eaSize)
+	binary.LittleEndian.PutUint64(buf[idDirInfoFileIDOffset:], fileID)
 	for i, u := range units {
-		binary.LittleEndian.PutUint16(buf[dirInfoNameOffset+2*i:], u)
+		binary.LittleEndian.PutUint16(buf[idDirInfoNameOffset+2*i:], u)
 	}
 	return buf
 }
@@ -193,35 +194,35 @@ func TestWindowsHostParseDirBuffer(t *testing.T) {
 		dirAttr = windows.FILE_ATTRIBUTE_DIRECTORY
 	)
 	var buf []byte
-	buf = append(buf, winTestDirEntry(dirAttr, 0, ".", false)...)
-	buf = append(buf, winTestDirEntry(dirAttr, 0, "..", false)...)
-	buf = append(buf, winTestDirEntry(windows.FILE_ATTRIBUTE_ARCHIVE, 0, "a.txt", false)...)
-	buf = append(buf, winTestDirEntry(dirAttr, 7, "dir", false)...)
-	buf = append(buf, winTestDirEntry(reparse, windows.IO_REPARSE_TAG_SYMLINK, "link", false)...)
-	buf = append(buf, winTestDirEntry(reparse|dirAttr, windows.IO_REPARSE_TAG_SYMLINK, "dirlink", false)...)
-	buf = append(buf, winTestDirEntry(reparse|dirAttr, windows.IO_REPARSE_TAG_MOUNT_POINT, "junction", false)...)
-	buf = append(buf, winTestDirEntry(0, 0, "bad:name", false)...)
-	buf = append(buf, winTestDirEntry(0, 0, "NUL", false)...)
-	buf = append(buf, winTestDirEntry(0, 0, "tail", true)...)
+	buf = append(buf, winTestDirEntry(dirAttr, 0, 0, ".", false)...)
+	buf = append(buf, winTestDirEntry(dirAttr, 0, 0, "..", false)...)
+	buf = append(buf, winTestDirEntry(windows.FILE_ATTRIBUTE_ARCHIVE, 0, 101, "a.txt", false)...)
+	buf = append(buf, winTestDirEntry(dirAttr, 7, 102, "dir", false)...)
+	buf = append(buf, winTestDirEntry(reparse, windows.IO_REPARSE_TAG_SYMLINK, 103, "link", false)...)
+	buf = append(buf, winTestDirEntry(reparse|dirAttr, windows.IO_REPARSE_TAG_SYMLINK, 104, "dirlink", false)...)
+	buf = append(buf, winTestDirEntry(reparse|dirAttr, windows.IO_REPARSE_TAG_MOUNT_POINT, 105, "junction", false)...)
+	buf = append(buf, winTestDirEntry(0, 0, 106, "bad:name", false)...)
+	buf = append(buf, winTestDirEntry(0, 0, 107, "NUL", false)...)
+	buf = append(buf, winTestDirEntry(0, 0, 108, "tail", true)...)
 
 	got, err := parseDirBuffer(buf, nil)
 	if err != nil {
 		t.Fatalf("parseDirBuffer() = %v", err)
 	}
 	want := []hostDirEntry{
-		{name: "a.txt", kind: hostKindRegular},
-		{name: "dir", kind: hostKindDir},
-		{name: "link", kind: hostKindSymlink},
-		{name: "dirlink", kind: hostKindSymlink},
-		{name: "junction", kind: hostKindOther},
-		{name: "tail", kind: hostKindRegular},
+		{name: "a.txt", kind: hostKindRegular, ino: 101},
+		{name: "dir", kind: hostKindDir, ino: 102},
+		{name: "link", kind: hostKindSymlink, ino: 103},
+		{name: "dirlink", kind: hostKindSymlink, ino: 104},
+		{name: "junction", kind: hostKindOther, ino: 105},
+		{name: "tail", kind: hostKindRegular, ino: 108},
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("parseDirBuffer() = %v, want %v", got, want)
 	}
 
-	lastSize := len(winTestDirEntry(0, 0, "tail", true))
-	for _, cut := range []int{10, dirInfoNameOffset + 1, len(buf) - lastSize + dirInfoNameOffset + 3} {
+	lastSize := len(winTestDirEntry(0, 0, 108, "tail", true))
+	for _, cut := range []int{10, idDirInfoNameOffset + 1, len(buf) - lastSize + idDirInfoNameOffset + 3} {
 		if _, err := parseDirBuffer(buf[:cut], nil); !errors.Is(err, errMalformedDirBuffer) {
 			t.Errorf("parseDirBuffer(buf[:%d]) = %v, want errMalformedDirBuffer", cut, err)
 		}
@@ -427,14 +428,16 @@ func TestWindowsHostBasicOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readDir(.) = %v", err)
 	}
-	if want := []hostDirEntry{{name: "d", kind: hostKindDir}}; !slices.Equal(entries, want) {
+	checkListedIDs(t, h, ".", entries)
+	if want := []hostDirEntry{{name: "d", kind: hostKindDir}}; !slices.Equal(withoutIno(entries), want) {
 		t.Errorf("readDir(.) = %v, want %v", entries, want)
 	}
 	entries, err = h.readDir("d")
 	if err != nil {
 		t.Fatalf("readDir(d) = %v", err)
 	}
-	if want := []hostDirEntry{{name: "f.txt", kind: hostKindRegular}}; !slices.Equal(entries, want) {
+	checkListedIDs(t, h, "d", entries)
+	if want := []hostDirEntry{{name: "f.txt", kind: hostKindRegular}}; !slices.Equal(withoutIno(entries), want) {
 		t.Errorf("readDir(d) = %v, want %v", entries, want)
 	}
 	if _, err := h.readDir("d/f.txt"); err == nil {
@@ -464,6 +467,140 @@ func TestWindowsHostBasicOperations(t *testing.T) {
 		t.Errorf("syncDir(.) = %v", err)
 	}
 	winTestErrno(t, h.syncDir("missing"), linuxerr.ENOENT)
+}
+
+// withoutIno returns a copy of entries with every inode number cleared.
+func withoutIno(entries []hostDirEntry) []hostDirEntry {
+	out := slices.Clone(entries)
+	for i := range out {
+		out[i].ino = 0
+	}
+	return out
+}
+
+// checkListedIDs verifies that a listing reports the same inode number as an
+// lstat of each entry, so a caller needs no lookup to learn it.
+func checkListedIDs(t *testing.T, h *hostRoot, dir string, entries []hostDirEntry) {
+	t.Helper()
+	for _, ent := range entries {
+		info, err := h.lstat(joinRelPath(dir, ent.name))
+		if err != nil {
+			t.Fatalf("lstat(%s/%s) = %v", dir, ent.name, err)
+		}
+		if ent.ino == 0 || ent.ino != info.id.ino {
+			t.Errorf("listing of %s reports inode %d for %s, lstat says %d", dir, ent.ino, ent.name, info.id.ino)
+		}
+	}
+}
+
+func TestWindowsHostPinnedMutationsStayInsideTheDirectory(t *testing.T) {
+	h, _ := winTestHost(t)
+	if err := h.mkdir("d"); err != nil {
+		t.Fatalf("mkdir(d) = %v", err)
+	}
+	dir, _, err := h.openDirAt(h.rootDir(), "d")
+	if err != nil {
+		t.Fatalf("openDirAt(d) = %v", err)
+	}
+	defer func() { _ = h.closeDir(dir) }()
+	if err := h.mkdirAt(dir, "sub"); err != nil {
+		t.Fatalf("mkdirAt(sub) = %v", err)
+	}
+	f, err := h.openChildAt(dir, "f.txt", os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("openChildAt(f.txt) = %v", err)
+	}
+	_ = f.Close()
+	if err := h.renameAt(dir, "f.txt", dir, "g.txt"); err != nil {
+		t.Fatalf("renameAt = %v", err)
+	}
+	if err := h.linkAt(dir, "g.txt", dir, "h.txt"); err != nil {
+		t.Fatalf("linkAt = %v", err)
+	}
+	if err := h.unlinkAt(dir, "h.txt"); err != nil {
+		t.Fatalf("unlinkAt(h.txt) = %v", err)
+	}
+	when := time.Unix(1_000_000, 0)
+	if err := h.chtimesAt(dir, "g.txt", &when, &when); err != nil {
+		t.Fatalf("chtimesAt = %v", err)
+	}
+	if info, err := h.lstat("d/g.txt"); err != nil || !info.mtime.Equal(when) {
+		t.Fatalf("lstat(d/g.txt) = (%+v, %v), want mtime %v", info, err, when)
+	}
+	entries, err := h.readDirAt(dir)
+	if err != nil {
+		t.Fatalf("readDirAt = %v", err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("readDirAt = %v, want sub and g.txt", entries)
+	}
+	for _, leaf := range []string{`..\escape`, `a\b`, "a/b", ".."} {
+		if err := h.mkdirAt(dir, leaf); err == nil {
+			t.Errorf("mkdirAt(%q) succeeded, want an error", leaf)
+		}
+	}
+	if err := h.unlinkAt(dir, "g.txt"); err != nil {
+		t.Fatalf("unlinkAt = %v", err)
+	}
+	winTestErrno(t, h.unlinkAt(dir, "sub"), linuxerr.EISDIR)
+	if err := h.rmdirAt(dir, "sub"); err != nil {
+		t.Fatalf("rmdirAt = %v", err)
+	}
+}
+
+func TestWindowsHostPinnedCallsRefuseReparsePoints(t *testing.T) {
+	for _, kind := range []string{"symlink", "junction"} {
+		t.Run(kind, func(t *testing.T) {
+			h, dir := winTestHost(t)
+			if err := h.mkdir("real"); err != nil {
+				t.Fatalf("mkdir(real) = %v", err)
+			}
+			winTestWrite(t, h, "real/file.txt", "inside")
+			if err := h.mkdir("d"); err != nil {
+				t.Fatalf("mkdir(d) = %v", err)
+			}
+			// A link at the root: a pinned open must refuse it.
+			// A link inside d: the final component of a pinned call.
+			for _, link := range []string{"via", "d/lnk"} {
+				if kind == "symlink" {
+					winTestSymlink(t, filepath.Join(dir, "real"), filepath.Join(dir, filepath.FromSlash(link)))
+				} else {
+					winTestJunction(t, filepath.Join(dir, filepath.FromSlash(link)), filepath.Join(dir, "real"))
+				}
+			}
+			if _, _, err := h.openDirAt(h.rootDir(), "via"); !errors.Is(err, ErrPathTraversal) {
+				t.Errorf("openDirAt through a %s = %v, want ErrPathTraversal", kind, err)
+			}
+			pin, _, err := h.openDirAt(h.rootDir(), "d")
+			if err != nil {
+				t.Fatalf("openDirAt(d) = %v", err)
+			}
+			defer func() { _ = h.closeDir(pin) }()
+			if _, _, err := h.openDirAt(pin, "lnk"); !errors.Is(err, ErrPathTraversal) {
+				t.Errorf("openDirAt of the %s inside d = %v, want ErrPathTraversal", kind, err)
+			}
+
+			before, err := h.lstat("real")
+			if err != nil {
+				t.Fatal(err)
+			}
+			when := time.Unix(1_000_000, 0)
+			if err := h.chtimesAt(pin, "lnk", &when, &when); err != nil {
+				t.Fatalf("chtimesAt of a %s = %v", kind, err)
+			}
+			if after, err := h.lstat("real"); err != nil || !after.mtime.Equal(before.mtime) {
+				t.Errorf("chtimesAt followed the %s: target mtime %v then %v (%v)", kind, before.mtime, after.mtime, err)
+			}
+			winTestErrno(t, h.mkdirAt(pin, "lnk"), linuxerr.EEXIST)
+			winTestErrno(t, h.rmdirAt(pin, "lnk"), linuxerr.ENOTDIR)
+			if err := h.unlinkAt(pin, "lnk"); err != nil {
+				t.Fatalf("unlinkAt of a %s = %v", kind, err)
+			}
+			if _, err := h.lstat("real/file.txt"); err != nil {
+				t.Errorf("unlinkAt of a %s removed content of the target: %v", kind, err)
+			}
+		})
+	}
 }
 
 func TestWindowsHostRefusesInvalidNames(t *testing.T) {
@@ -636,7 +773,7 @@ func TestWindowsHostCaseMismatchIsNotExist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readDir(Dir) = %v", err)
 	}
-	if want := []hostDirEntry{{name: "Case.txt", kind: hostKindRegular}}; !slices.Equal(entries, want) {
+	if want := []hostDirEntry{{name: "Case.txt", kind: hostKindRegular}}; !slices.Equal(withoutIno(entries), want) {
 		t.Errorf("readDir(Dir) = %v, want %v", entries, want)
 	}
 }
@@ -725,7 +862,7 @@ func TestWindowsHostRefusesReparseComponents(t *testing.T) {
 			if err != nil {
 				t.Fatalf("readDir(.) = %v", err)
 			}
-			if want := []hostDirEntry{{name: "real", kind: hostKindDir}, {name: "via", kind: wantKind}}; !slices.Equal(entries, want) {
+			if want := []hostDirEntry{{name: "real", kind: hostKindDir}, {name: "via", kind: wantKind}}; !slices.Equal(withoutIno(entries), want) {
 				t.Errorf("readDir(.) = %v, want %v", entries, want)
 			}
 

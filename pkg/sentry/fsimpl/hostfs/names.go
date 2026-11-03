@@ -370,9 +370,11 @@ func (p hostProbe) missingError(rel string) error {
 	return fs.ErrNotExist
 }
 
-// locateLocked finds the host entry of the guest path rel. It does not handle
-// the workspace root.
-func (w *Workspace) locateLocked(rel string) (hostProbe, error) {
+// locatePathLocked finds the host entry of the guest path rel by a walk from
+// the workspace root. It never depends on a pinned handle, so it sees a
+// directory that a host process replaced. It does not handle the workspace
+// root. Callers hold w.mu.
+func (w *Workspace) locatePathLocked(rel string) (hostProbe, error) {
 	parent, name := splitParent(rel)
 	hostDir, err := w.hostPath(parent)
 	if err != nil {

@@ -229,11 +229,19 @@ type inode struct {
 	// changes the inode calls invalidateMeta, which also advances metaSeq.
 	// A lookup that started before the mutation then cannot mark the older
 	// entry valid again, because commitMeta compares metaSeq.
-	attrMu    sync.Mutex
-	cur       entry
-	metaValid bool
-	metaUntil int64
-	metaSeq   uint64
+	//
+	// A write changes only the size, the times, and the block count, and the
+	// host decides the new times. markDataChanged sets timesStale instead of
+	// clearing metaValid: the identity, the mode, and the owner in cur stay
+	// valid, but a stat of the path reads the host again. An open file
+	// description reads size and times from its handle, so its stat needs no
+	// host call for the path.
+	attrMu     sync.Mutex
+	cur        entry
+	metaValid  bool
+	timesStale bool
+	metaUntil  int64
+	metaSeq    uint64
 
 	// negChildren holds the names that a lookup in this directory did not
 	// find, so a repeated lookup makes no host call. negUntil ends the life of
@@ -287,11 +295,29 @@ func (i *inode) update(e entry) {
 	i.attrMu.Unlock()
 }
 
-// metaFresh reports whether cur is valid at time now.
+// metaFresh reports whether cur is valid at time now, with current size and
+// times.
 func (i *inode) metaFresh(now int64) bool {
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
+	return i.metaValid && !i.timesStale && now < i.metaUntil
+}
+
+// identityFresh reports whether cur names the right host object, with the
+// right mode and owner, at time now. The size and the times can be stale.
+func (i *inode) identityFresh(now int64) bool {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
 	return i.metaValid && now < i.metaUntil
+}
+
+// markDataChanged records that a write changed the size and the times of the
+// host file. See attrMu.
+func (i *inode) markDataChanged() {
+	i.attrMu.Lock()
+	i.timesStale = true
+	i.metaSeq++
+	i.attrMu.Unlock()
 }
 
 // invalidateMeta marks cur as stale. Callers invoke it after every host
@@ -320,6 +346,7 @@ func (i *inode) commitMeta(e entry, seq uint64, until int64) {
 	i.cur = e
 	if i.metaSeq == seq {
 		i.metaValid = true
+		i.timesStale = false
 		i.metaUntil = until
 	}
 	i.attrMu.Unlock()
@@ -649,9 +676,10 @@ func (fs *filesystem) attachChildLocked(parent *dentry, name, rel string, e entr
 //
 // Consistency contract: a result that this filesystem produced or confirmed
 // stays valid for cacheTTL without a host call. A guest mutation of the entry,
-// of a hard link to it, or of its parent drops the result at once, and so
-// does a listing of the parent. A change by a host process, or through another
-// mount of the same host directory, shows up after cacheTTL at the latest.
+// of a hard link to it, or of its parent drops the result at once. A listing
+// of the parent drops the missing names and the entries that now name another
+// host object. A change by a host process, or through another mount of the
+// same host directory, shows up after cacheTTL at the latest.
 func (fs *filesystem) lookupChildLocked(parent *dentry, name string) (*dentry, error) {
 	now := fs.ws.nowNano()
 	child := parent.children[name]
@@ -1656,11 +1684,21 @@ func (d *dentry) setAttr(mode, uid, gid *uint32) error {
 // refresh updates the inode snapshot from the host after a change. It makes
 // no host call while the cached snapshot is valid.
 func (d *dentry) refresh() error {
+	return d.refreshAs(false)
+}
+
+// refreshIdentity is refresh for a caller that takes the size and the times
+// from an open handle. A write leaves the cached snapshot valid for it.
+func (d *dentry) refreshIdentity() error {
+	return d.refreshAs(true)
+}
+
+func (d *dentry) refreshAs(identityOnly bool) error {
 	if d.isDead() {
 		return nil
 	}
 	now := d.fs.ws.nowNano()
-	if d.inode.metaFresh(now) {
+	if identityOnly && d.inode.identityFresh(now) || !identityOnly && d.inode.metaFresh(now) {
 		return nil
 	}
 	seq := d.inode.beginMeta()

@@ -147,25 +147,13 @@ func requireEntries(t *testing.T, got map[string]wsEntry, prefix string, want ma
 	}
 }
 
-// metaTable is the on-disk form of .gvx_meta.
-type metaTable struct {
-	Version int                         `json:"version"`
-	Entries map[string]hostfs.POSIXAttr `json:"entries"`
-}
-
-// readMetaTable parses the .gvx_meta file of dir. A torn write fails the parse.
-func readMetaTable(t *testing.T, dir string) metaTable {
+// readMetaTable reads the .gvx_meta file of dir. A torn tail of the journal
+// drops out, as it does when hostfs loads the file.
+func readMetaTable(t *testing.T, dir string) map[string]hostfs.POSIXAttr {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(dir, hostfs.MetaFileName))
+	table, err := hostfs.ReadMeta(filepath.Join(dir, hostfs.MetaFileName))
 	if err != nil {
 		t.Fatalf("read %s: %v", hostfs.MetaFileName, err)
-	}
-	var table metaTable
-	if err := json.Unmarshal(raw, &table); err != nil {
-		t.Fatalf("%s is not a complete JSON table (%d bytes): %v", hostfs.MetaFileName, len(raw), err)
-	}
-	if table.Version != 2 {
-		t.Fatalf("%s version = %d, want 2", hostfs.MetaFileName, table.Version)
 	}
 	return table
 }
@@ -181,12 +169,12 @@ func requireMetaConsistent(t *testing.T, dir, prefix string) {
 		return prefix == "" || name == prefix || strings.HasPrefix(name, prefix+"/")
 	}
 	var problems []string
-	for name, attr := range table.Entries {
+	for name, attr := range table {
 		if !inScope(name) {
 			continue
 		}
 		if parent := filepath.ToSlash(filepath.Dir(name)); parent != "." {
-			if p, ok := table.Entries[parent]; !ok || p.Mode&linux.S_IFMT != linux.S_IFDIR {
+			if p, ok := table[parent]; !ok || p.Mode&linux.S_IFMT != linux.S_IFDIR {
 				problems = append(problems, fmt.Sprintf("record %s has no directory record for its parent %s", name, parent))
 			}
 		}
@@ -224,7 +212,7 @@ func requireMetaConsistent(t *testing.T, dir, prefix string) {
 		if rel == "." || strings.HasPrefix(rel, hostfs.MetaFileName) {
 			return nil
 		}
-		if _, ok := table.Entries[rel]; !ok {
+		if _, ok := table[rel]; !ok {
 			problems = append(problems, fmt.Sprintf("host path %s has no %s record", rel, hostfs.MetaFileName))
 		}
 		return nil
@@ -606,7 +594,7 @@ func TestE2EGateM4MetaSurvivesSigkill(t *testing.T) {
 			// a torn one, and the synced state is in it.
 			table := readMetaTable(t, workspace)
 			for name, w := range killPhase1Want() {
-				attr, ok := table.Entries[name]
+				attr, ok := table[name]
 				if !ok {
 					t.Errorf("%s lost from the table after SIGKILL", name)
 					continue

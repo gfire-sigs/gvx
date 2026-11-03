@@ -68,11 +68,17 @@ const (
 	// dirBufferSize is the buffer size for one directory listing call.
 	dirBufferSize = 64 * 1024
 
-	// Offsets of the FILE_FULL_DIR_INFO fields that readDir reads.
-	dirInfoAttributesOffset = 56
+	// Offsets of the FILE_FULL_DIR_INFO fields that storedNameIn reads.
 	dirInfoNameLengthOffset = 60
-	dirInfoEaSizeOffset     = 64
 	dirInfoNameOffset       = 68
+
+	// Offsets of the FILE_ID_BOTH_DIR_INFO fields that readDir reads. The
+	// short name sits between EaSize and FileId, and FileId is 8-byte aligned.
+	idDirInfoAttributesOffset = 56
+	idDirInfoNameLengthOffset = 60
+	idDirInfoEaSizeOffset     = 64
+	idDirInfoFileIDOffset     = 96
+	idDirInfoNameOffset       = 104
 
 	// filetimeToUnixSeconds is the distance in seconds between the FILETIME
 	// epoch (1601-01-01) and the Unix epoch.
@@ -289,7 +295,13 @@ func (h *hostRoot) openAny(op, rel string, access uint32) (windows.Handle, error
 		return 0, err
 	}
 	defer parent.release()
-	handle, err := openAt(parent.handle, parent.name, access, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
+	return openAnyIn(op, parent.handle, parent.name, rel, access)
+}
+
+// openAnyIn is openAny for the entry name inside the directory handle dir. The
+// path rel only labels errors.
+func openAnyIn(op string, dir windows.Handle, name, rel string, access uint32) (windows.Handle, error) {
+	handle, err := openAt(dir, name, access, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
 	if err != nil {
 		return 0, hostError(op, rel, err)
 	}
@@ -739,7 +751,20 @@ func (h *hostRoot) mkdir(rel string) error {
 		return err
 	}
 	defer parent.release()
-	handle, err := openAt(parent.handle, parent.name, windows.FILE_READ_ATTRIBUTES, windows.FILE_ATTRIBUTE_NORMAL,
+	return mkdirIn(parent.handle, parent.name, rel)
+}
+
+func (h *hostRoot) mkdirAt(dir hostDirHandle, name string) error {
+	if err := validateWindowsName(name); err != nil {
+		return hostError("mkdir", name, err)
+	}
+	return mkdirIn(windows.Handle(dir), name, name)
+}
+
+// mkdirIn creates the directory name inside the directory handle dir. The path
+// rel only labels errors.
+func mkdirIn(dir windows.Handle, name, rel string) error {
+	handle, err := openAt(dir, name, windows.FILE_READ_ATTRIBUTES, windows.FILE_ATTRIBUTE_NORMAL,
 		windows.FILE_CREATE, windows.FILE_DIRECTORY_FILE)
 	if err != nil {
 		return hostError("mkdir", rel, err)
@@ -816,32 +841,35 @@ func (h *hostRoot) readlink(rel string) (string, error) {
 // FILE_FULL_DIR_INFO layout. It has no Linux equivalent, so callers see EIO.
 var errMalformedDirBuffer = errors.New("hostfs: malformed directory listing buffer")
 
-// parseDirBuffer appends the entries of one FILE_FULL_DIR_INFO buffer to out.
-// It skips "." and "..". It also skips names that validateWindowsName rejects,
-// because hostfs refuses to resolve such a name and a guest could not use it.
-// With FILE_ATTRIBUTE_REPARSE_POINT set, EaSize holds the reparse tag.
-// Source: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/e8d926d1-3a22-4654-be9c-58317a85540b
+// parseDirBuffer appends the entries of one FILE_ID_BOTH_DIR_INFO buffer to
+// out. It skips "." and "..". It also skips names that validateWindowsName
+// rejects, because hostfs refuses to resolve such a name and a guest could not
+// use it. The file ID gives the inode number, so a listing needs no stat for
+// each entry. With FILE_ATTRIBUTE_REPARSE_POINT set, EaSize holds the reparse
+// tag.
+// Source: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_both_dir_info
 func parseDirBuffer(buf []byte, out []hostDirEntry) ([]hostDirEntry, error) {
 	off := 0
 	for {
-		if off < 0 || off+dirInfoNameOffset > len(buf) {
+		if off < 0 || off+idDirInfoNameOffset > len(buf) {
 			return out, errMalformedDirBuffer
 		}
 		entry := buf[off:]
 		next := int(binary.LittleEndian.Uint32(entry))
-		attrs := binary.LittleEndian.Uint32(entry[dirInfoAttributesOffset:])
-		nameLen := int(binary.LittleEndian.Uint32(entry[dirInfoNameLengthOffset:]))
-		eaSize := binary.LittleEndian.Uint32(entry[dirInfoEaSizeOffset:])
-		if nameLen%2 != 0 || dirInfoNameOffset+nameLen > len(entry) {
+		attrs := binary.LittleEndian.Uint32(entry[idDirInfoAttributesOffset:])
+		nameLen := int(binary.LittleEndian.Uint32(entry[idDirInfoNameLengthOffset:]))
+		eaSize := binary.LittleEndian.Uint32(entry[idDirInfoEaSizeOffset:])
+		fileID := binary.LittleEndian.Uint64(entry[idDirInfoFileIDOffset:])
+		if nameLen%2 != 0 || idDirInfoNameOffset+nameLen > len(entry) {
 			return out, errMalformedDirBuffer
 		}
 		units := make([]uint16, nameLen/2)
 		for i := range units {
-			units[i] = binary.LittleEndian.Uint16(entry[dirInfoNameOffset+2*i:])
+			units[i] = binary.LittleEndian.Uint16(entry[idDirInfoNameOffset+2*i:])
 		}
 		name := windows.UTF16ToString(units)
 		if name != "." && name != ".." && validateWindowsName(name) == nil {
-			out = append(out, hostDirEntry{name: name, kind: dirEntryKind(attrs, eaSize)})
+			out = append(out, hostDirEntry{name: name, kind: dirEntryKind(attrs, eaSize), ino: fileID})
 		}
 		if next == 0 {
 			return out, nil
@@ -882,7 +910,7 @@ func readDirHandle(handle windows.Handle, rel string) ([]hostDirEntry, error) {
 	backing := make([]uint64, dirBufferSize/8)
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), dirBufferSize)
 	var out []hostDirEntry
-	class := uint32(windows.FileFullDirectoryRestartInfo)
+	class := uint32(windows.FileIdBothDirectoryRestartInfo)
 	for {
 		err := windows.GetFileInformationByHandleEx(handle, class, &buf[0], uint32(len(buf)))
 		if err == windows.ERROR_NO_MORE_FILES {
@@ -890,13 +918,13 @@ func readDirHandle(handle windows.Handle, rel string) ([]hostDirEntry, error) {
 		}
 		// Some file systems answer the first query of an empty directory with
 		// ERROR_FILE_NOT_FOUND instead of listing "." and "..".
-		if err == windows.ERROR_FILE_NOT_FOUND && class == windows.FileFullDirectoryRestartInfo {
+		if err == windows.ERROR_FILE_NOT_FOUND && class == windows.FileIdBothDirectoryRestartInfo {
 			break
 		}
 		if err != nil {
 			return nil, hostError("read directory", rel, err)
 		}
-		class = windows.FileFullDirectoryInfo
+		class = windows.FileIdBothDirectoryInfo
 		if out, err = parseDirBuffer(buf, out); err != nil {
 			return nil, hostError("read directory", rel, err)
 		}
@@ -920,30 +948,77 @@ func (h *hostRoot) syncDir(rel string) error {
 }
 
 func (h *hostRoot) chtimes(rel string, atime, mtime *time.Time) error {
-	var atimeFT, mtimeFT *windows.Filetime
-	if atime != nil {
-		ft, err := timeToFiletime(*atime)
-		if err != nil {
-			return hostError("set times", rel, err)
-		}
-		atimeFT = &ft
-	}
-	if mtime != nil {
-		ft, err := timeToFiletime(*mtime)
-		if err != nil {
-			return hostError("set times", rel, err)
-		}
-		mtimeFT = &ft
+	atimeFT, mtimeFT, err := setTimesArgs(rel, atime, mtime)
+	if err != nil {
+		return err
 	}
 	handle, err := h.openAny("set times", rel, windows.FILE_WRITE_ATTRIBUTES)
 	if err != nil {
 		return err
 	}
 	defer closeHandle(handle)
-	// A nil pointer leaves that time unchanged. The creation time stays as is.
-	// Source: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime
-	if err := windows.SetFileTime(handle, nil, atimeFT, mtimeFT); err != nil {
+	return setHandleTimes(handle, rel, atimeFT, mtimeFT)
+}
+
+func (h *hostRoot) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
+	if err := validateWindowsName(name); err != nil {
+		return hostError("set times", name, err)
+	}
+	atimeFT, mtimeFT, err := setTimesArgs(name, atime, mtime)
+	if err != nil {
+		return err
+	}
+	handle, err := openAnyIn("set times", windows.Handle(dir), name, name, windows.FILE_WRITE_ATTRIBUTES)
+	if err != nil {
+		return err
+	}
+	defer closeHandle(handle)
+	return setHandleTimes(handle, name, atimeFT, mtimeFT)
+}
+
+// setTimesArgs converts the times of a chtimes call. A nil time stays nil.
+func setTimesArgs(rel string, atime, mtime *time.Time) (atimeFT, mtimeFT *windows.Filetime, err error) {
+	if atime != nil {
+		ft, err := timeToFiletime(*atime)
+		if err != nil {
+			return nil, nil, hostError("set times", rel, err)
+		}
+		atimeFT = &ft
+	}
+	if mtime != nil {
+		ft, err := timeToFiletime(*mtime)
+		if err != nil {
+			return nil, nil, hostError("set times", rel, err)
+		}
+		mtimeFT = &ft
+	}
+	return atimeFT, mtimeFT, nil
+}
+
+// setHandleTimes sets the times of an open handle. A nil pointer leaves that
+// time unchanged. The creation time stays as is.
+// Source: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime
+func setHandleTimes(handle windows.Handle, rel string, atime, mtime *windows.Filetime) error {
+	if err := windows.SetFileTime(handle, nil, atime, mtime); err != nil {
 		return hostError("set times", rel, err)
 	}
+	return nil
+}
+
+// readDirAt lists the directory that dir names through a second handle, so a
+// listing never shares the query state of the pinned handle.
+func (h *hostRoot) readDirAt(dir hostDirHandle) ([]hostDirEntry, error) {
+	handle, err := openAt(windows.Handle(dir), "", windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE)
+	if err != nil {
+		return nil, hostError("read directory", ".", err)
+	}
+	defer closeHandle(handle)
+	return readDirHandle(handle, ".")
+}
+
+// syncDirAt does nothing: a pinned handle proves that the directory exists, and
+// Windows offers no directory flush. See syncDir.
+func (h *hostRoot) syncDirAt(dir hostDirHandle) error {
 	return nil
 }

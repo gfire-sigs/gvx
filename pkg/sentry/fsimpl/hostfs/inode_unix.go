@@ -359,6 +359,19 @@ func (h *hostRoot) mkdir(rel string) error {
 		return err
 	}
 	defer release()
+	return mkdirIn(parent, name, rel)
+}
+
+func (h *hostRoot) mkdirAt(dir hostDirHandle, name string) error {
+	if err := checkChildName(name); err != nil {
+		return err
+	}
+	return mkdirIn(int(dir), name, name)
+}
+
+// mkdirIn creates the directory name inside the descriptor parent. The path
+// rel only labels errors.
+func mkdirIn(parent int, name, rel string) error {
 	// Host directories stay owner-only: guest permissions are virtual and the
 	// sentry process must always be able to traverse what it created.
 	if err := retryEINTR(func() error { return unix.Mkdirat(parent, name, 0o700) }); err != nil {
@@ -384,6 +397,26 @@ func (h *hostRoot) unlinkat(rel string, flags int) error {
 		return err
 	}
 	defer release()
+	return unlinkIn(parent, name, rel, flags)
+}
+
+func (h *hostRoot) unlinkAt(dir hostDirHandle, name string) error {
+	if err := checkChildName(name); err != nil {
+		return err
+	}
+	return unlinkIn(int(dir), name, name, 0)
+}
+
+func (h *hostRoot) rmdirAt(dir hostDirHandle, name string) error {
+	if err := checkChildName(name); err != nil {
+		return err
+	}
+	return unlinkIn(int(dir), name, name, unix.AT_REMOVEDIR)
+}
+
+// unlinkIn removes the entry name inside the descriptor parent. The path rel
+// only labels errors.
+func unlinkIn(parent int, name, rel string, flags int) error {
 	if err := retryEINTR(func() error { return unix.Unlinkat(parent, name, flags) }); err != nil {
 		return fmt.Errorf("hostfs: remove %q: %w", rel, err)
 	}
@@ -415,10 +448,37 @@ func (h *hostRoot) rename(oldRel, newRel string) error {
 }
 
 func (h *hostRoot) link(oldRel, newRel string) error {
-	// Flags 0 links a symbolic link itself and never its target.
-	return h.withTwoParents("link", "to", oldRel, newRel, unix.EPERM, func(oldDir int, oldName string, newDir int, newName string) error {
-		return unix.Linkat(oldDir, oldName, newDir, newName, 0)
+	return h.withTwoParents("link", "to", oldRel, newRel, unix.EPERM, linkNoFollow)
+}
+
+// linkNoFollow links a symbolic link itself and never its target, because
+// flags 0 mean no AT_SYMLINK_FOLLOW.
+func linkNoFollow(oldDir int, oldName string, newDir int, newName string) error {
+	return unix.Linkat(oldDir, oldName, newDir, newName, 0)
+}
+
+func (h *hostRoot) renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	return pinnedTwoNames("rename", "to", oldName, newName, func() error {
+		return unix.Renameat(int(oldDir), oldName, int(newDir), newName)
 	})
+}
+
+func (h *hostRoot) linkAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	return pinnedTwoNames("link", "to", oldName, newName, func() error {
+		return linkNoFollow(int(oldDir), oldName, int(newDir), newName)
+	})
+}
+
+// pinnedTwoNames validates both names and runs one call that takes two
+// directory descriptors.
+func pinnedTwoNames(op, prep, oldName, newName string, call func() error) error {
+	if err := errors.Join(checkChildName(oldName), checkChildName(newName)); err != nil {
+		return err
+	}
+	if err := retryEINTR(call); err != nil {
+		return fmt.Errorf("hostfs: %s %q %s %q: %w", op, oldName, prep, newName, err)
+	}
+	return nil
 }
 
 func (h *hostRoot) readlink(rel string) (string, error) {
@@ -449,43 +509,6 @@ func (h *hostRoot) readlink(rel string) (string, error) {
 	}
 }
 
-func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error) {
-	dir, err := h.openDir(rel)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = dir.Close()
-	}()
-	names, err := dir.Readdirnames(-1)
-	if err != nil {
-		return nil, fmt.Errorf("hostfs: read directory %q: %w", rel, err)
-	}
-	out := make([]hostDirEntry, 0, len(names))
-	if err := withFileFD(dir, func(fd int) error {
-		for _, name := range names {
-			var st unix.Stat_t
-			serr := retryEINTR(func() error { return unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW) })
-			if errors.Is(serr, unix.ENOENT) {
-				// The entry vanished after listing: a concurrent unlink.
-				continue
-			}
-			if serr != nil {
-				return fmt.Errorf("hostfs: lstat %q in %q: %w", name, rel, serr)
-			}
-			info := statToHostInfo(&st)
-			out = append(out, hostDirEntry{name: name, kind: info.kind, ino: info.id.ino})
-		}
-		return nil
-	}); err != nil {
-		if strings.HasPrefix(err.Error(), "hostfs: lstat ") {
-			return nil, err
-		}
-		return nil, fmt.Errorf("hostfs: read directory %q: %w", rel, err)
-	}
-	return out, nil
-}
-
 func (h *hostRoot) syncDir(rel string) error {
 	dir, err := h.openDir(rel)
 	if err != nil {
@@ -500,6 +523,24 @@ func (h *hostRoot) syncDir(rel string) error {
 }
 
 func (h *hostRoot) chtimes(rel string, atime, mtime *time.Time) error {
+	parent, name, release, err := h.walkParent(rel)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return chtimesIn(parent, name, rel, atime, mtime)
+}
+
+func (h *hostRoot) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
+	if err := checkChildName(name); err != nil {
+		return err
+	}
+	return chtimesIn(int(dir), name, name, atime, mtime)
+}
+
+// chtimesIn sets the times of the entry name inside the descriptor parent. A
+// nil time stays unchanged. The path rel only labels errors.
+func chtimesIn(parent int, name, rel string, atime, mtime *time.Time) error {
 	omit := unix.Timespec{Sec: 0, Nsec: unix.UTIME_OMIT}
 	ts := []unix.Timespec{omit, omit}
 	if atime != nil {
@@ -508,11 +549,6 @@ func (h *hostRoot) chtimes(rel string, atime, mtime *time.Time) error {
 	if mtime != nil {
 		ts[1] = unix.NsecToTimespec(mtime.UnixNano())
 	}
-	parent, name, release, err := h.walkParent(rel)
-	if err != nil {
-		return err
-	}
-	defer release()
 	if err := retryEINTR(func() error { return unix.UtimesNanoAt(parent, name, ts, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
 		return fmt.Errorf("hostfs: set times of %q: %w", rel, err)
 	}

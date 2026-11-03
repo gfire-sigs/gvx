@@ -146,7 +146,6 @@ func (w *Workspace) exchangeLocked(aRel, bRel string) error {
 			return err
 		}
 	}
-	w.markDirtyLocked()
 	return nil
 }
 
@@ -156,12 +155,12 @@ func (w *Workspace) exchangeLocked(aRel, bRel string) error {
 // old name of the host entry.
 func (w *Workspace) exchangeVirtualLocked(hostRel, virtRel string) error {
 	saved := w.meta[virtRel]
-	delete(w.meta, virtRel)
+	w.delMetaLocked(virtRel)
 	if err := w.renameLocked(hostRel, virtRel); err != nil {
-		w.meta[virtRel] = saved
+		w.setMetaLocked(virtRel, saved)
 		return err
 	}
-	w.meta[hostRel] = saved
+	w.setMetaLocked(hostRel, saved)
 	return nil
 }
 
@@ -261,12 +260,11 @@ func (w *Workspace) swapMetaLocked(aRel, bRel string) {
 		default:
 			continue
 		}
-		delete(w.meta, k)
+		w.delMetaLocked(k)
 	}
 	for k, m := range moved {
-		w.meta[k] = m
+		w.setMetaLocked(k, m)
 	}
-	w.markDirtyLocked()
 }
 
 // swapFiles swaps the paths of the open handles of the two files aRel and bRel.

@@ -37,6 +37,10 @@ type countingHost struct {
 
 	mu    sync.Mutex
 	calls map[string]int
+	// steps sums the path components of the path-based calls. Such a call
+	// opens each parent directory in turn, so it costs about one host system
+	// call per component. A pinned call costs one.
+	steps int
 
 	insensitive *bool
 	verified    *bool
@@ -51,11 +55,48 @@ func (c *countingHost) count(name string) {
 	c.calls[name]++
 }
 
+// countPath counts a path-based call and the components that it walks.
+func (c *countingHost) countPath(name string, rels ...string) {
+	c.count(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, rel := range rels {
+		c.steps += len(strings.Split(rel, "/"))
+	}
+}
+
 // reset forgets the calls so far.
 func (c *countingHost) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls = nil
+	c.steps = 0
+}
+
+// syscalls estimates the host system calls of the counted calls: a pinned
+// call makes one, and a path-based call makes one for each path component.
+func (c *countingHost) syscalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.steps
+	for name, v := range c.calls {
+		if !pathCalls[name] {
+			n += v
+		}
+	}
+	return n
+}
+
+// listings counts the directory listings, by path and through a pinned handle.
+func (c *countingHost) listings() int {
+	return c.got("readDir") + c.got("readDirAt")
+}
+
+// pathCalls names the counted calls that take a workspace path.
+var pathCalls = map[string]bool{
+	"open": true, "openDir": true, "lstat": true, "mkdir": true, "unlink": true,
+	"rmdir": true, "rename": true, "link": true, "readlink": true, "readDir": true,
+	"syncDir": true, "chtimes": true,
 }
 
 func (c *countingHost) got(name string) int {
@@ -87,17 +128,17 @@ func (c *countingHost) dump() string {
 }
 
 func (c *countingHost) open(rel string, flags int, perm os.FileMode) (*os.File, error) {
-	c.count("open")
+	c.countPath("open", rel)
 	return c.hostBackend.open(rel, flags, perm)
 }
 
 func (c *countingHost) openDir(rel string) (*os.File, error) {
-	c.count("openDir")
+	c.countPath("openDir", rel)
 	return c.hostBackend.openDir(rel)
 }
 
 func (c *countingHost) lstat(rel string) (hostInfo, error) {
-	c.count("lstat")
+	c.countPath("lstat", rel)
 	return c.hostBackend.lstat(rel)
 }
 
@@ -107,47 +148,47 @@ func (c *countingHost) fstat(f *os.File) (hostInfo, error) {
 }
 
 func (c *countingHost) mkdir(rel string) error {
-	c.count("mkdir")
+	c.countPath("mkdir", rel)
 	return c.hostBackend.mkdir(rel)
 }
 
 func (c *countingHost) unlink(rel string) error {
-	c.count("unlink")
+	c.countPath("unlink", rel)
 	return c.hostBackend.unlink(rel)
 }
 
 func (c *countingHost) rmdir(rel string) error {
-	c.count("rmdir")
+	c.countPath("rmdir", rel)
 	return c.hostBackend.rmdir(rel)
 }
 
 func (c *countingHost) rename(oldRel, newRel string) error {
-	c.count("rename")
+	c.countPath("rename", oldRel, newRel)
 	return c.hostBackend.rename(oldRel, newRel)
 }
 
 func (c *countingHost) link(oldRel, newRel string) error {
-	c.count("link")
+	c.countPath("link", oldRel, newRel)
 	return c.hostBackend.link(oldRel, newRel)
 }
 
 func (c *countingHost) readlink(rel string) (string, error) {
-	c.count("readlink")
+	c.countPath("readlink", rel)
 	return c.hostBackend.readlink(rel)
 }
 
 func (c *countingHost) readDir(rel string) ([]hostDirEntry, error) {
-	c.count("readDir")
+	c.countPath("readDir", rel)
 	return c.hostBackend.readDir(rel)
 }
 
 func (c *countingHost) syncDir(rel string) error {
-	c.count("syncDir")
+	c.countPath("syncDir", rel)
 	return c.hostBackend.syncDir(rel)
 }
 
 func (c *countingHost) chtimes(rel string, atime, mtime *time.Time) error {
-	c.count("chtimes")
+	c.countPath("chtimes", rel)
 	return c.hostBackend.chtimes(rel, atime, mtime)
 }
 
@@ -188,6 +229,46 @@ func (c *countingHost) lstatAt(dir hostDirHandle, name string) (hostInfo, error)
 func (c *countingHost) openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error) {
 	c.count("openChildAt")
 	return c.hostBackend.openChildAt(dir, name, flags, perm)
+}
+
+func (c *countingHost) mkdirAt(dir hostDirHandle, name string) error {
+	c.count("mkdirAt")
+	return c.hostBackend.mkdirAt(dir, name)
+}
+
+func (c *countingHost) unlinkAt(dir hostDirHandle, name string) error {
+	c.count("unlinkAt")
+	return c.hostBackend.unlinkAt(dir, name)
+}
+
+func (c *countingHost) rmdirAt(dir hostDirHandle, name string) error {
+	c.count("rmdirAt")
+	return c.hostBackend.rmdirAt(dir, name)
+}
+
+func (c *countingHost) renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	c.count("renameAt")
+	return c.hostBackend.renameAt(oldDir, oldName, newDir, newName)
+}
+
+func (c *countingHost) linkAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	c.count("linkAt")
+	return c.hostBackend.linkAt(oldDir, oldName, newDir, newName)
+}
+
+func (c *countingHost) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
+	c.count("chtimesAt")
+	return c.hostBackend.chtimesAt(dir, name, atime, mtime)
+}
+
+func (c *countingHost) readDirAt(dir hostDirHandle) ([]hostDirEntry, error) {
+	c.count("readDirAt")
+	return c.hostBackend.readDirAt(dir)
+}
+
+func (c *countingHost) syncDirAt(dir hostDirHandle) error {
+	c.count("syncDirAt")
+	return c.hostBackend.syncDirAt(dir)
 }
 
 // testClock is the monotonic clock of the cache expiry in tests.
@@ -294,7 +375,7 @@ func TestUncachedOpenUsesResolvedEntryAndPinnedDirectory(t *testing.T) {
 		t.Fatalf("open of a stale entry made host calls %s, want one lstatAt and one openChildAt", ch.dump())
 	}
 	// A path walk would show as a path call. The open must make none.
-	for _, name := range []string{"lstat", "open", "openDir", "readDir"} {
+	for name := range pathCalls {
 		if n := ch.got(name); n != 0 {
 			t.Fatalf("open made %d %s calls %s, want 0: the open must not walk the path", n, name, ch.dump())
 		}
@@ -567,14 +648,18 @@ func TestHostChangesBecomeVisibleAfterTheCacheLifetime(t *testing.T) {
 	}
 }
 
-func TestListingRevalidatesCachedEntries(t *testing.T) {
+func TestListingRevalidatesNamesAndReplacedEntries(t *testing.T) {
 	e, _, _ := newCountEnv(t)
 	e.writeFile("grow", []byte("one"))
 	e.mustStat("grow")
 	_, err := e.stat("late")
 	wantErrno(t, "stat of a name that does not exist yet", err, linuxerr.ENOENT)
 
-	if err := os.WriteFile(e.host("grow"), []byte("longer content"), 0o600); err != nil {
+	// A host process replaces grow with another file and creates late.
+	if err := os.WriteFile(e.host("grow.new"), []byte("longer content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(e.host("grow.new"), e.host("grow")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(e.host("late"), []byte("l"), 0o600); err != nil {
@@ -584,10 +669,28 @@ func TestListingRevalidatesCachedEntries(t *testing.T) {
 	// The clock does not move: only the listing can reveal the changes.
 	e.readdir(".")
 	if st := e.mustStat("grow"); st.Size != 14 {
-		t.Fatalf("size after a listing = %d, want 14", st.Size)
+		t.Fatalf("size of the replaced file after a listing = %d, want 14", st.Size)
 	}
 	if _, err := e.stat("late"); err != nil {
 		t.Fatalf("stat of a host-created name after a listing: %v", err)
+	}
+}
+
+func TestListingKeepsMetadataOfUnchangedEntries(t *testing.T) {
+	e, ch, _ := newCountEnv(t)
+	for i := range 20 {
+		e.writeFile(fmt.Sprintf("f%d", i), []byte("x"))
+	}
+	for _, name := range e.readdir(".") {
+		e.mustStat(name)
+	}
+
+	ch.reset()
+	for _, name := range e.readdir(".") {
+		e.mustStat(name)
+	}
+	if got := ch.got("lstatAt"); got != 0 {
+		t.Fatalf("listing and stat of 20 unchanged entries made %d lstatAt calls %s, want 0", got, ch.dump())
 	}
 }
 
@@ -634,10 +737,10 @@ func TestBackendThatVerifiesCaseSkipsTheListing(t *testing.T) {
 		e.mustStat("dir")
 		return ch
 	}
-	if ch := run(t, true); ch.got("readDir") != 0 || ch.got("fstatDir") != 0 {
+	if ch := run(t, true); ch.listings() != 0 || ch.got("fstatDir") != 0 {
 		t.Fatalf("a backend that verifies case still listed or stat the directory %s", ch.dump())
 	}
-	if ch := run(t, false); ch.got("readDir") == 0 {
+	if ch := run(t, false); ch.listings() == 0 {
 		t.Fatalf("a case-insensitive backend without verification never listed the directory %s", ch.dump())
 	}
 }
@@ -654,7 +757,7 @@ func TestDirectoryListingFollowsMutationsInPlace(t *testing.T) {
 	// The first lookup of an existing name lists the workspace root for the
 	// name dir, and lists dir for the name first.
 	e.mustStat("dir/first")
-	if got := ch.got("readDir"); got != 2 {
+	if got := ch.listings(); got != 2 {
 		t.Fatalf("first lookups listed directories %d times, want 2", got)
 	}
 
@@ -679,7 +782,7 @@ func TestDirectoryListingFollowsMutationsInPlace(t *testing.T) {
 			}
 		}
 	}
-	if got := ch.got("readDir"); got != 0 {
+	if got := ch.listings(); got != 0 {
 		t.Fatalf("single-entry mutations caused %d directory listings, want 0", got)
 	}
 
@@ -720,5 +823,37 @@ func TestCaseRulesHoldAcrossMutationsOnFoldingHost(t *testing.T) {
 	wantErrno(t, "stat with the case of the removed name", err, linuxerr.ENOENT)
 	if got := e.readdir("."); fmt.Sprint(got) != "[file other]" {
 		t.Fatalf("listing = %v, want [file other]", got)
+	}
+}
+
+func TestStatOfOpenFileAfterWriteNeedsNoLookup(t *testing.T) {
+	e, ch, _ := newCountEnv(t)
+	e.writeFile("f", []byte("x"))
+	fd := e.mustOpen("f", linux.O_RDWR)
+	defer fd.DecRef(e.ctx)
+	before := e.mustStat("f")
+
+	if _, err := fd.Write(e.ctx, usermem.BytesIOSequence([]byte("more data")), vfs.WriteOptions{}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ch.reset()
+	st, err := fd.Stat(e.ctx, vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+	if err != nil {
+		t.Fatalf("fstat: %v", err)
+	}
+	if st.Size != 9 {
+		t.Fatalf("fstat size after the write = %d, want 9", st.Size)
+	}
+	if n := ch.got("lstatAt"); n != 0 {
+		t.Fatalf("fstat after a write made %d lstatAt calls %s, want 0", n, ch.dump())
+	}
+
+	// A stat of the path must still read the host: the host chose the new times.
+	after := e.mustStat("f")
+	if after.Size != 9 {
+		t.Fatalf("stat size after the write = %d, want 9", after.Size)
+	}
+	if after.Mtime.Sec < before.Mtime.Sec {
+		t.Fatalf("stat mtime went back from %v to %v", before.Mtime, after.Mtime)
 	}
 }

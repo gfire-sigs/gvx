@@ -17,7 +17,7 @@ package hostfs
 import "errors"
 
 // maxMetaEntries is the most entries that Workspace.meta holds. The table
-// lives in memory and in one JSON file, so a guest that creates records
+// lives in memory and in the .gvx_meta journal, so a guest that creates records
 // without end would exhaust host memory.
 const maxMetaEntries = 262144
 

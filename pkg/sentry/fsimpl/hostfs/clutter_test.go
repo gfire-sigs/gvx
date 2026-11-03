@@ -16,11 +16,11 @@ package hostfs
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -351,17 +351,29 @@ func TestOpenWorkspacePrunesRecordsOfMissingHostObjects(t *testing.T) {
 	}
 }
 
-// failLstatHost fails the lstat of one path with a transient error.
+// failLstatHost fails the lstat of one workspace-root entry with a transient
+// error, by path and through the pinned root directory. It counts the failures
+// that it injected.
 type failLstatHost struct {
 	hostBackend
-	rel string
+	name string
+	hits *atomic.Int32
 }
 
 func (f failLstatHost) lstat(rel string) (hostInfo, error) {
-	if rel == f.rel {
+	if rel == f.name {
+		f.hits.Add(1)
 		return hostInfo{}, fmt.Errorf("lstat %q: %w", rel, fs.ErrPermission)
 	}
 	return f.hostBackend.lstat(rel)
+}
+
+func (f failLstatHost) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
+	if dir == f.hostBackend.rootDir() && name == f.name {
+		f.hits.Add(1)
+		return hostInfo{}, fmt.Errorf("lstat %q: %w", name, fs.ErrPermission)
+	}
+	return f.hostBackend.lstatAt(dir, name)
 }
 
 func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
@@ -374,8 +386,9 @@ func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var hits atomic.Int32
 	flaky := opts
-	flaky.wrapHost = func(b hostBackend) hostBackend { return failLstatHost{b, "b"} }
+	flaky.wrapHost = func(b hostBackend) hostBackend { return failLstatHost{b, "b", &hits} }
 	ws, err := openWorkspace(e.dir, false, flaky)
 	if err != nil {
 		t.Fatal(err)
@@ -383,6 +396,9 @@ func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
 	defer func() { _ = ws.Close() }()
 	// The lstat of "b" failed with a permission error, so its record stays.
 	// The record of the missing file goes.
+	if hits.Load() == 0 {
+		t.Fatal("the prune never looked up b, so the test proves nothing")
+	}
 	if got := metaKeys(ws); !slices.Equal(got, []string{"b"}) {
 		t.Fatalf("records after open = %q, want [b]", got)
 	}
@@ -412,16 +428,8 @@ func TestFlushPrunesRecordsOfMissingHostObjects(t *testing.T) {
 	if err := e.ws.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(e.host(MetaFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
 	var keys []string
-	for k := range parsed.Entries {
+	for k := range readMetaTable(t, e.host(MetaFileName)) {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
@@ -448,16 +456,9 @@ func TestMetaSchemaVersionOneStillLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeEnv()
-	raw, err := os.ReadFile(dir + "/" + MetaFileName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Version != 2 {
-		t.Fatalf("version after the first write = %d, want 2", parsed.Version)
+	table := readMetaTable(t, dir+"/"+MetaFileName)
+	if got := table["f"]; got.UID != 7 || got.GID != 8 || got.Mode&0o7777 != 0o600 {
+		t.Fatalf("record of f after the first write = %+v, want uid 7 gid 8 mode 600", got)
 	}
 }
 
@@ -483,15 +484,8 @@ func TestMetaSchemaVersionTwoKeepsXattrs(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeEnv()
-	raw, err := os.ReadFile(dir + "/" + MetaFileName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if got := string(parsed.Entries["f"].Xattrs["user.k"]); parsed.Version != 2 || got != "val" {
-		t.Fatalf("after the rewrite: version %d, xattr %q, want 2 and val", parsed.Version, got)
+	table := readMetaTable(t, dir+"/"+MetaFileName)
+	if got := string(table["f"].Xattrs["user.k"]); got != "val" || table["f"].Mode&0o7777 != 0o640 {
+		t.Fatalf("after the rewrite: xattr %q mode %o, want val and 640", got, table["f"].Mode&0o7777)
 	}
 }

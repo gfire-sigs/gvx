@@ -205,8 +205,7 @@ func (w *Workspace) linkTmp(t *tmpFile, rel string, attr POSIXAttr) error {
 		return err
 	}
 	w.handles.moveFile(oldRel, rel)
-	w.meta[rel] = attr
-	w.markDirtyLocked()
+	w.setMetaLocked(rel, attr)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)

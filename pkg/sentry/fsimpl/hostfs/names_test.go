@@ -15,7 +15,6 @@
 package hostfs
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -135,21 +134,11 @@ func TestMetaKeysAreGuestPaths(t *testing.T) {
 	if err := e.ws.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(e.host(MetaFileName))
-	if err != nil {
-		t.Fatal(err)
+	entries := readMetaTable(t, e.host(MetaFileName))
+	if m, ok := entries["aux.c"]; !ok || m.Mode&0o7777 != 0o640 {
+		t.Fatalf("meta entries = %+v, want a record under the guest path aux.c", entries)
 	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Version != metaVersion {
-		t.Fatalf("meta version = %d, want %d", parsed.Version, metaVersion)
-	}
-	if m, ok := parsed.Entries["aux.c"]; !ok || m.Mode&0o7777 != 0o640 {
-		t.Fatalf("meta entries = %+v, want a record under the guest path aux.c", parsed.Entries)
-	}
-	for k := range parsed.Entries {
+	for k := range entries {
 		if strings.Contains(k, codecPrefix) {
 			t.Fatalf("meta key %q holds a host name", k)
 		}

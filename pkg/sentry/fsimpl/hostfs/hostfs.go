@@ -16,19 +16,19 @@
 // host access goes through a directory handle pinned by os.OpenRoot before
 // sandbox lockdown. Windows uses NtCreateFile relative to that handle and
 // macOS uses openat with O_NOFOLLOW relative to its descriptor. POSIX
-// permissions, ownership, and symbolic links live in an atomically replaced
-// .gvx_meta table.
+// permissions, ownership, and symbolic links live in the .gvx_meta journal.
 //
-// Crash consistency of .gvx_meta: the table is written to .gvx_meta.tmp,
-// flushed to stable storage, and renamed over .gvx_meta. A crash at any point
-// leaves either the previous complete table or the new complete table.
-// Mutations reach disk within a short coalescing window. Workspace.Sync and
-// Workspace.Close flush before they return, so a successful Sync guarantees
-// durability of every earlier mutation.
+// Crash consistency of .gvx_meta: a flush appends one checksummed frame with
+// the changed records and flushes the file, and a compaction writes a snapshot
+// to .gvx_meta.tmp, flushes it, and renames it over .gvx_meta. A crash at any
+// point leaves every flush that completed, and a torn last frame drops out at
+// the next load. See metastore.go. Mutations reach disk within a short
+// coalescing window. Workspace.Sync and Workspace.Close flush before they
+// return, so a successful Sync guarantees durability of every earlier
+// mutation.
 package hostfs
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -166,7 +166,7 @@ type dirNames struct {
 // Workspace wraps a pre-opened Go 1.25+ *os.Root directory handle and enforces
 // symlink-safe traversal and POSIX metadata persistence.
 type Workspace struct {
-	// mu protects meta, metaGen, and closed. Lock order: Workspace.mu, then
+	// mu protects meta, metaDirty, and closed. Lock order: Workspace.mu, then
 	// pinMu, then nameMu. filesystem.mu is always taken before Workspace.mu.
 	mu       sync.RWMutex
 	rootPath string
@@ -177,13 +177,14 @@ type Workspace struct {
 	closed   bool
 	closing  bool
 
-	// metaGen counts mutations. metaFlushedGen is the metaGen of the table
-	// last written to disk. Both are protected by mu.
-	metaGen        uint64
-	metaFlushedGen uint64
+	// metaDirty holds the keys of the records that changed since the last
+	// flush. mu protects it. See metastore.go.
+	metaDirty map[string]struct{}
 
 	// flushMu serialises table writes so a slow disk never blocks mutations.
+	// It also protects journal.
 	flushMu sync.Mutex
+	journal metaJournal
 
 	nameMu    sync.Mutex
 	nameCache map[string]*dirNames
@@ -217,9 +218,13 @@ type Workspace struct {
 	// watcher.go.
 	watch hostWatcher
 
-	// beforeMetaRename lets tests stop a flush between the temporary file
-	// write and the rename, which models a crash.
+	// beforeMetaRename lets tests stop a compaction between the temporary
+	// file write and the rename, which models a crash.
 	beforeMetaRename func() error
+	// appendFault lets tests model a crash in the append of a journal frame.
+	// It receives the frame and returns how many bytes reach the file and
+	// the error that ends the flush.
+	appendFault func(frame []byte) (int, error)
 
 	// caps records the capabilities of the host volume. The fields below it
 	// follow from caps and never change after openWorkspace returns.
@@ -255,6 +260,8 @@ type Workspace struct {
 type workspaceOptions struct {
 	coalesce         time.Duration
 	beforeMetaRename func() error
+	// appendFault is Workspace.appendFault.
+	appendFault func(frame []byte) (int, error)
 	// wrapHost replaces the host backend with a wrapper. Tests use it to
 	// count host calls.
 	wrapHost func(hostBackend) hostBackend
@@ -268,6 +275,9 @@ type workspaceOptions struct {
 	// maxMeta replaces the limit of .gvx_meta entries. Tests use it to reach
 	// the limit with few files.
 	maxMeta int
+	// journalSlack replaces the slack of the journal bound. Tests use it to
+	// reach a compaction with few records.
+	journalSlack int
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files.
@@ -347,17 +357,20 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		host:             host,
 		readOnly:         readOnly,
 		meta:             make(map[string]POSIXAttr),
+		metaDirty:        make(map[string]struct{}),
 		nameCache:        make(map[string]*dirNames),
 		pins:             make(map[string]*dirPin),
 		rootPin:          dirPin{h: host.rootDir(), root: true},
 		clock:            clock,
 		coalesce:         opts.coalesce,
 		beforeMetaRename: opts.beforeMetaRename,
+		appendFault:      opts.appendFault,
 		caps:             caps,
 		codec:            newNameCodec(caps),
 		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
 		clutter:          clutterRulesFor(hostOS),
 		maxMeta:          metaLimit(opts.maxMeta),
+		journal:          metaJournal{slack: opts.journalSlack},
 		dirTimes:         make(map[string]int64),
 		single:           single,
 	}
@@ -419,6 +432,9 @@ func (w *Workspace) Close() error {
 		<-w.done
 	}
 	flushErr := w.flushMeta()
+	w.flushMu.Lock()
+	journalErr := w.closeJournal()
+	w.flushMu.Unlock()
 
 	w.mu.Lock()
 	w.closed = true
@@ -426,7 +442,7 @@ func (w *Workspace) Close() error {
 	pinErr := w.closePins()
 	hostErr := w.host.close()
 	rootErr := w.root.Close()
-	return errors.Join(flushErr, pinErr, hostErr, rootErr)
+	return errors.Join(flushErr, journalErr, pinErr, hostErr, rootErr)
 }
 
 // Sync writes every pending metadata mutation to stable storage. After Sync
@@ -476,159 +492,6 @@ func joinRelPath(parentRel, comp string) string {
 // ignores case because a case-insensitive host volume would alias such a name.
 func isReservedPath(rel string) bool {
 	return strings.EqualFold(rel, MetaFileName) || strings.EqualFold(rel, metaTempName)
-}
-
-func (w *Workspace) loadMeta() error {
-	f, err := w.host.open(MetaFileName, os.O_RDONLY, 0)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("hostfs: open %s: %w", MetaFileName, err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-	raw, err := io.ReadAll(f)
-	if err != nil {
-		return fmt.Errorf("hostfs: read %s: %w", MetaFileName, err)
-	}
-	if len(raw) == 0 {
-		return nil
-	}
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return fmt.Errorf("hostfs: parse %s: %w", MetaFileName, err)
-	}
-	if parsed.Version != metaVersion && parsed.Version != metaVersionV1 {
-		return fmt.Errorf("hostfs: %s has unsupported version %d", MetaFileName, parsed.Version)
-	}
-	for k, v := range parsed.Entries {
-		cleanKey, kErr := CleanRelativePath(k)
-		if kErr != nil || cleanKey == "." || isReservedPath(cleanKey) {
-			continue
-		}
-		w.meta[cleanKey] = v
-	}
-	// Records of host files that vanished while no guest ran are dead state.
-	w.pruneOrphansLocked(len(w.meta))
-	w.pruneKeys, w.pruneCursor = nil, 0
-	return nil
-}
-
-// markDirtyLocked records a metadata mutation and wakes the background
-// flusher. Callers hold w.mu for writing.
-func (w *Workspace) markDirtyLocked() {
-	w.metaGen++
-	if w.kick != nil {
-		select {
-		case w.kick <- struct{}{}:
-		default:
-		}
-	}
-}
-
-// flushLoop coalesces bursts of mutations into one table write. It runs until
-// Close stops it. A failed write stays pending: the next mutation, Sync, or
-// Close retries and reports the error.
-func (w *Workspace) flushLoop() {
-	defer close(w.done)
-	for {
-		select {
-		case <-w.stop:
-			return
-		case <-w.kick:
-		}
-		timer := time.NewTimer(w.coalesce)
-		select {
-		case <-w.stop:
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-		_ = w.flushMeta()
-	}
-}
-
-// flushMeta writes the table if it changed since the last write. The payload
-// is built under the read lock and written without it.
-func (w *Workspace) flushMeta() error {
-	if w.readOnly || w.single != "" {
-		// A single-file workspace owns no directory, so it keeps its metadata
-		// in memory and never writes .gvx_meta.
-		return nil
-	}
-	w.flushMu.Lock()
-	defer w.flushMu.Unlock()
-
-	w.mu.RLock()
-	dirty := w.metaGen != w.metaFlushedGen
-	w.mu.RUnlock()
-	if !dirty {
-		return nil
-	}
-	// Drop the records whose host object vanished before the table goes to
-	// disk. One batch per flush keeps the pause short.
-	w.mu.Lock()
-	if !w.closed {
-		w.pruneOrphansLocked(pruneBatch)
-	}
-	w.mu.Unlock()
-
-	w.mu.RLock()
-	gen := w.metaGen
-	payload, err := json.Marshal(metaStoreFile{Version: metaVersion, Entries: w.meta})
-	w.mu.RUnlock()
-	if err != nil {
-		return fmt.Errorf("hostfs: encode %s: %w", MetaFileName, err)
-	}
-
-	if err := w.writeMetaFile(payload); err != nil {
-		return err
-	}
-	w.mu.Lock()
-	w.metaFlushedGen = gen
-	w.mu.Unlock()
-	return nil
-}
-
-// writeMetaFile replaces .gvx_meta atomically. The temporary file lives in the
-// same directory so the final rename never crosses a volume.
-func (w *Workspace) writeMetaFile(payload []byte) (err error) {
-	f, err := w.host.open(metaTempName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("hostfs: create %s: %w", metaTempName, err)
-	}
-	renamed := false
-	defer func() {
-		if !renamed {
-			_ = w.host.unlink(metaTempName)
-		}
-	}()
-	if _, werr := f.Write(payload); werr != nil {
-		_ = f.Close()
-		return fmt.Errorf("hostfs: write %s: %w", metaTempName, werr)
-	}
-	if serr := f.Sync(); serr != nil {
-		_ = f.Close()
-		return fmt.Errorf("hostfs: sync %s: %w", metaTempName, serr)
-	}
-	if cerr := f.Close(); cerr != nil {
-		return fmt.Errorf("hostfs: close %s: %w", metaTempName, cerr)
-	}
-	if w.beforeMetaRename != nil {
-		if herr := w.beforeMetaRename(); herr != nil {
-			return herr
-		}
-	}
-	if rerr := w.host.rename(metaTempName, MetaFileName); rerr != nil {
-		return fmt.Errorf("hostfs: replace %s: %w", MetaFileName, rerr)
-	}
-	renamed = true
-	if derr := w.host.syncDir("."); derr != nil {
-		return fmt.Errorf("hostfs: sync workspace directory: %w", derr)
-	}
-	return nil
 }
 
 // nowNano returns monotonic nanoseconds for cache expiry.
@@ -689,11 +552,16 @@ func (w *Workspace) snapshotDir(parent string, pin *dirPin, forceRead bool) (*di
 		}
 		w.nameMu.Unlock()
 	}
-	hostDir, err := w.hostPath(parent)
-	if err != nil {
-		return nil, false, err
+	var entries []hostDirEntry
+	if pin != nil {
+		entries, err = w.host.readDirAt(pin.h)
+	} else {
+		var hostDir string
+		if hostDir, err = w.hostPath(parent); err != nil {
+			return nil, false, err
+		}
+		entries, err = w.host.readDir(hostDir)
 	}
-	entries, err := w.host.readDir(hostDir)
 	if err != nil {
 		return nil, false, err
 	}
@@ -854,15 +722,15 @@ func (w *Workspace) touchDirLocked(dir string, now int64) {
 	if m, ok := w.meta[dir]; ok && m.Symlink == "" {
 		m.Mtime = now
 		m.Ctime = now
-		w.meta[dir] = m
+		w.setMetaLocked(dir, m)
 	} else {
 		w.dirTimes[dir] = now
 	}
 }
 
-// lookupLocked resolves rel to its effective state without following links.
-// It walks the path from the workspace root on every call, so the result
-// never depends on a pinned handle. Callers hold w.mu.
+// lookupLocked resolves rel to its effective state without following links. It
+// reads the entry through the pinned handle of its directory. Callers hold
+// w.mu.
 func (w *Workspace) lookupLocked(rel string) (entry, error) {
 	e, _, err := w.lookupProbeLocked(rel)
 	return e, err
@@ -878,18 +746,12 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 		return entry{}, hostProbe{}, fs.ErrNotExist
 	}
 	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
-		parent, _ := splitParent(rel)
-		hostDir, err := w.hostPath(parent)
+		// An open pin proves that the parent is a directory.
+		pin, err := w.parentPinLocked(rel)
 		if err != nil {
 			return entry{}, hostProbe{}, err
 		}
-		pinfo, err := w.host.lstat(hostDir)
-		if err != nil {
-			return entry{}, hostProbe{}, err
-		}
-		if pinfo.kind != hostKindDir {
-			return entry{}, hostProbe{}, errNotDir
-		}
+		w.releasePin(pin)
 		return virtualEntry(m), hostProbe{}, nil
 	}
 	if rel == "." {
@@ -989,20 +851,14 @@ func (w *Workspace) checkWritableLocked(rels ...string) error {
 	return nil
 }
 
-// checkParentDirLocked verifies that the parent of rel is a host directory.
+// checkParentDirLocked verifies that the parent of rel is a host directory. It
+// opens or finds the pinned handle of that directory.
 func (w *Workspace) checkParentDirLocked(rel string) error {
-	parent, _ := splitParent(rel)
-	hostDir, err := w.hostPath(parent)
+	pin, err := w.parentPinLocked(rel)
 	if err != nil {
 		return err
 	}
-	pinfo, err := w.host.lstat(hostDir)
-	if err != nil {
-		return err
-	}
-	if pinfo.kind != hostKindDir {
-		return errNotDir
-	}
+	w.releasePin(pin)
 	return nil
 }
 
@@ -1026,10 +882,16 @@ func (w *Workspace) createTargetLocked(rel string) (hostRel, leaf string, err er
 		if err != nil {
 			return "", "", err
 		}
-		if err := w.host.unlink(hostRel); err != nil && !isNotExist(err) {
+		leaf = leafOf(hostRel)
+		pin, err := w.parentPinLocked(rel)
+		if err != nil {
 			return "", "", err
 		}
-		return hostRel, leafOf(hostRel), nil
+		defer w.releasePin(pin)
+		if err := w.host.unlinkAt(pin.h, leaf); err != nil && !isNotExist(err) {
+			return "", "", err
+		}
+		return hostRel, leaf, nil
 	}
 	if p.collided && !w.stateful {
 		// The host holds the name under another case, and hostfs cannot tell
@@ -1092,14 +954,7 @@ func (w *Workspace) openRegularLocked(rel string, flags int) (*os.File, entry, e
 	if e.isDir() {
 		return nil, entry{}, errIsDir
 	}
-	if e.isSymlink() {
-		return nil, entry{}, ErrPathTraversal
-	}
-	hostRel, err := w.hostPath(rel)
-	if err != nil {
-		return nil, entry{}, err
-	}
-	f, err := w.host.open(hostRel, flags&^(os.O_CREATE|os.O_EXCL), 0)
+	f, err := w.openRegularWithAttrLocked(rel, e, flags)
 	if err != nil {
 		return nil, entry{}, err
 	}
@@ -1126,23 +981,27 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return nil, entry{}, err
 	}
-	hostRel, leaf, err := w.createTargetLocked(rel)
+	_, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return nil, entry{}, err
 	}
-	f, err := w.host.open(hostRel, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return nil, entry{}, err
+	}
+	defer w.releasePin(pin)
+	f, err := w.host.openChildAt(pin.h, leaf, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, entry{}, err
 	}
 	info, err := w.host.fstat(f)
 	if err != nil {
 		_ = f.Close()
-		_ = w.host.unlink(hostRel)
+		_ = w.host.unlinkAt(pin.h, leaf)
 		return nil, entry{}, err
 	}
 	attr := POSIXAttr{Mode: linux.S_IFREG | perm&0o7777, UID: uid, GID: gid}
-	w.meta[rel] = attr
-	w.markDirtyLocked()
+	w.setMetaLocked(rel, attr)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)
@@ -1238,15 +1097,19 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return err
 	}
-	hostRel, leaf, err := w.createTargetLocked(rel)
+	_, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return err
 	}
-	if err := w.host.mkdir(hostRel); err != nil {
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
 		return err
 	}
-	w.meta[rel] = POSIXAttr{Mode: linux.S_IFDIR | mode&0o7777, UID: uid, GID: gid}
-	w.markDirtyLocked()
+	defer w.releasePin(pin)
+	if err := w.host.mkdirAt(pin.h, leaf); err != nil {
+		return err
+	}
+	w.setMetaLocked(rel, POSIXAttr{Mode: linux.S_IFDIR | mode&0o7777, UID: uid, GID: gid})
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)
@@ -1305,8 +1168,7 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 			cur.GID = *gid
 		}
 		cur.Ctime = now
-		w.meta[rel] = cur
-		w.markDirtyLocked()
+		w.setMetaLocked(rel, cur)
 		return nil
 	}
 	if e.isSymlink() {
@@ -1326,13 +1188,12 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return err
 	}
-	w.meta[rel] = cur
+	w.setMetaLocked(rel, cur)
 	if e.info.nlink > 1 && !e.isDir() {
 		if err := w.propagateLinkAttrLocked(rel, e.info.id, cur); err != nil {
 			return err
 		}
 	}
-	w.markDirtyLocked()
 	return nil
 }
 
@@ -1355,7 +1216,7 @@ func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAt
 			return err
 		}
 		if info.id == id && info.kind == hostKindRegular {
-			w.meta[k] = attr
+			w.setMetaLocked(k, attr)
 		}
 	}
 	return nil
@@ -1395,7 +1256,7 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 		return err
 	}
 	now := time.Now().UnixNano()
-	w.meta[rel] = POSIXAttr{
+	w.setMetaLocked(rel, POSIXAttr{
 		Mode:    linux.S_IFLNK | 0o777,
 		UID:     uid,
 		GID:     gid,
@@ -1403,10 +1264,9 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 		Atime:   now,
 		Mtime:   now,
 		Ctime:   now,
-	}
+	})
 	parent, _ := splitParent(rel)
 	w.touchDirLocked(parent, now)
-	w.markDirtyLocked()
 	return nil
 }
 
@@ -1584,7 +1444,7 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 		if src.isDir() {
 			quiesced = w.handles.quiesce(oldRel)
 		}
-		if err := w.host.rename(srcPath, dstPath); err != nil {
+		if err := w.renameHostLocked(oldRel, newRel, leafOf(srcPath), dstLeaf); err != nil {
 			_ = quiesced.finish(false, "")
 			return err
 		}
@@ -1621,12 +1481,12 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 	// Table update: the destination record dies, the source record and every
 	// record below it move.
 	now := time.Now().UnixNano()
-	delete(w.meta, newRel)
+	w.delMetaLocked(newRel)
 	delete(w.dirTimes, newRel)
 	if m, ok := w.meta[oldRel]; ok {
-		delete(w.meta, oldRel)
+		w.delMetaLocked(oldRel)
 		m.Ctime = now
-		w.meta[newRel] = m
+		w.setMetaLocked(newRel, m)
 	}
 	delete(w.dirTimes, oldRel)
 	if src.virtual {
@@ -1635,18 +1495,9 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 			w.touchDirLocked(newParent, now)
 		}
 	}
-	prefix := oldRel + "/"
-	var moved []string
-	for k := range w.meta {
-		if strings.HasPrefix(k, prefix) {
-			moved = append(moved, k)
-		}
+	if src.isDir() {
+		w.moveMetaTreeLocked(oldRel, newRel)
 	}
-	for _, k := range moved {
-		w.meta[newRel+"/"+strings.TrimPrefix(k, prefix)] = w.meta[k]
-		delete(w.meta, k)
-	}
-	w.markDirtyLocked()
 	return nil
 }
 
@@ -1668,22 +1519,24 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	if err := w.checkParentDirLocked(newRel); err != nil {
 		return err
 	}
-	srcPath, err := w.hostPath(oldRel)
+	oldParent, oldName := splitParent(oldRel)
+	srcLeaf, err := w.hostLeaf(oldParent, oldName)
 	if err != nil {
 		return err
 	}
 	if err := w.checkMetaRoomLocked(newRel); err != nil {
 		return err
 	}
-	dstPath, leaf, err := w.createTargetLocked(newRel)
+	_, leaf, err := w.createTargetLocked(newRel)
 	if err != nil {
 		return err
 	}
-	if err := w.host.link(srcPath, dstPath); err != nil {
+	if err := w.pinnedPairLocked(oldRel, newRel, func(oldDir, newDir hostDirHandle) error {
+		return w.host.linkAt(oldDir, srcLeaf, newDir, leaf)
+	}); err != nil {
 		return err
 	}
-	w.meta[newRel] = src.attr
-	w.markDirtyLocked()
+	w.setMetaLocked(newRel, src.attr)
 	parent, name := splitParent(newRel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)
@@ -1725,24 +1578,23 @@ func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
 		return false, errIsDir
 	}
 	if !e.virtual {
-		hostRel, err := w.hostPath(rel)
+		parent, name := splitParent(rel)
+		leaf, err := w.hostLeaf(parent, name)
 		if err != nil {
 			return false, err
 		}
-		if err := w.host.unlink(hostRel); err != nil {
+		if err := w.unlinkHostLocked(rel, leaf, false); err != nil {
 			return false, err
 		}
 		last = e.info.nlink <= 1
 		w.handles.detach(rel)
-		parent, name := splitParent(rel)
-		w.removeDirNameLocked(parent, name, leafOf(hostRel))
+		w.removeDirNameLocked(parent, name, leaf)
 		w.dropAlt(parent, name)
 	} else {
 		parent, _ := splitParent(rel)
 		w.touchDirLocked(parent, time.Now().UnixNano())
 	}
-	delete(w.meta, rel)
-	w.markDirtyLocked()
+	w.delMetaLocked(rel)
 	return last, nil
 }
 
@@ -1780,11 +1632,10 @@ func (w *Workspace) rmdir(rel string) error {
 	}
 	// Windows refuses to remove a directory that has an open handle.
 	w.closeSubtreeHandlesLocked(rel)
-	if err := w.host.rmdir(hostRel); err != nil {
+	if err := w.unlinkHostLocked(rel, leafOf(hostRel), true); err != nil {
 		return err
 	}
-	delete(w.meta, rel)
-	w.markDirtyLocked()
+	w.delMetaLocked(rel)
 	parent, name := splitParent(rel)
 	w.removeDirNameLocked(parent, name, leafOf(hostRel))
 	w.dropDirNamesLocked(rel)
@@ -1818,11 +1669,12 @@ func (w *Workspace) syncDir(rel string) error {
 	if w.closed {
 		return os.ErrClosed
 	}
-	hostRel, err := w.hostPath(rel)
+	pin, err := w.acquirePinHeld(rel)
 	if err != nil {
 		return err
 	}
-	return w.host.syncDir(hostRel)
+	defer w.releasePin(pin)
+	return w.host.syncDirAt(pin.h)
 }
 
 // chtimes sets host timestamps of a host file, or the recorded timestamps of
@@ -1846,23 +1698,17 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 			m.Mtime = mtime.UnixNano()
 		}
 		m.Ctime = time.Now().UnixNano()
-		w.meta[rel] = m
-		w.markDirtyLocked()
+		w.setMetaLocked(rel, m)
 		return nil
 	}
-	hostRel, err := w.hostPath(rel)
-	if err != nil {
-		return err
-	}
-	if err := w.host.chtimes(hostRel, atime, mtime); err != nil {
+	if err := w.chtimesHostLocked(rel, atime, mtime); err != nil {
 		return err
 	}
 	if mtime != nil {
 		delete(w.dirTimes, rel)
 		if m, ok := w.meta[rel]; ok && m.Mtime != 0 {
 			m.Mtime = 0
-			w.meta[rel] = m
-			w.markDirtyLocked()
+			w.setMetaLocked(rel, m)
 		}
 	}
 	return nil
@@ -1902,7 +1748,12 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	entries, err := w.host.readDir(hostDir)
+	pin, err := w.acquirePinHeld(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer w.releasePin(pin)
+	entries, err := w.host.readDirAt(pin.h)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1924,7 +1775,7 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 		if w.clutter.candidate(e.name) {
 			info := hostInfo{kind: e.kind}
 			if e.kind == hostKindRegular && w.clutter.needsContent(e.name) {
-				fi, err := w.host.lstat(hostChild(hostDir, e.name))
+				fi, err := w.host.lstatAt(pin.h, e.name)
 				if err != nil {
 					continue
 				}
@@ -2038,4 +1889,80 @@ func (w *Workspace) ReadDirChildren(relPath string) ([]DirChild, error) {
 		out = append(out, DirChild{Name: c.name, Attr: e.attr, Size: e.info.size})
 	}
 	return out, nil
+}
+
+// renameHostLocked renames the stored entry srcLeaf of the guest path oldRel
+// to dstLeaf below the directory of newRel, through the pinned handles of
+// both directories. Callers hold w.mu for writing.
+func (w *Workspace) renameHostLocked(oldRel, newRel, srcLeaf, dstLeaf string) error {
+	return w.pinnedPairLocked(oldRel, newRel, func(oldDir, newDir hostDirHandle) error {
+		return w.host.renameAt(oldDir, srcLeaf, newDir, dstLeaf)
+	})
+}
+
+// pinnedPairLocked runs fn with the pinned handles of the directories that
+// hold oldRel and newRel. Callers hold w.mu.
+func (w *Workspace) pinnedPairLocked(oldRel, newRel string, fn func(oldDir, newDir hostDirHandle) error) error {
+	oldPin, err := w.parentPinLocked(oldRel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(oldPin)
+	newPin, err := w.parentPinLocked(newRel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(newPin)
+	return fn(oldPin.h, newPin.h)
+}
+
+// unlinkHostLocked removes the stored entry leaf of the guest path rel from
+// its host directory, through the pinned handle of that directory. Callers
+// hold w.mu for writing.
+func (w *Workspace) unlinkHostLocked(rel, leaf string, dir bool) error {
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(pin)
+	if dir {
+		return w.host.rmdirAt(pin.h, leaf)
+	}
+	return w.host.unlinkAt(pin.h, leaf)
+}
+
+// chtimesHostLocked sets the host times of rel through the pinned handle of its
+// directory. The workspace root has no such directory, so it takes the path
+// call. Callers hold w.mu for writing.
+func (w *Workspace) chtimesHostLocked(rel string, atime, mtime *time.Time) error {
+	if rel == "." {
+		return w.host.chtimes(rel, atime, mtime)
+	}
+	parent, name := splitParent(rel)
+	leaf, err := w.hostLeaf(parent, name)
+	if err != nil {
+		return err
+	}
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(pin)
+	return w.host.chtimesAt(pin.h, leaf, atime, mtime)
+}
+
+// moveMetaTreeLocked moves every record below the directory oldRel to the same
+// place below newRel. Callers hold w.mu for writing.
+func (w *Workspace) moveMetaTreeLocked(oldRel, newRel string) {
+	prefix := oldRel + "/"
+	var moved []string
+	for k := range w.meta {
+		if strings.HasPrefix(k, prefix) {
+			moved = append(moved, k)
+		}
+	}
+	for _, k := range moved {
+		w.setMetaLocked(newRel+"/"+strings.TrimPrefix(k, prefix), w.meta[k])
+		w.delMetaLocked(k)
+	}
 }

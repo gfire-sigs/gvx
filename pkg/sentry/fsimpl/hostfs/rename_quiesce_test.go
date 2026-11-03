@@ -424,6 +424,13 @@ func (h *failRenameHost) rename(oldRel, newRel string) error {
 	return h.hostBackend.rename(oldRel, newRel)
 }
 
+func (h *failRenameHost) renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	if h.fail.Load() {
+		return fs.ErrPermission
+	}
+	return h.hostBackend.renameAt(oldDir, oldName, newDir, newName)
+}
+
 func (h *failRenameHost) open(rel string, flags int, perm os.FileMode) (*os.File, error) {
 	if h.fail.Load() {
 		h.reopens.Add(1)

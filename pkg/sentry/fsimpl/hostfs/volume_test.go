@@ -340,6 +340,70 @@ func (v *volumeHost) openChildAt(dir hostDirHandle, name string, flags int, perm
 	return v.hostBackend.openChildAt(dir, s, flags, perm)
 }
 
+func (v *volumeHost) mkdirAt(dir hostDirHandle, name string) error {
+	_, s, err := v.storedIn(dir, name, true)
+	if err != nil {
+		return err
+	}
+	return v.hostBackend.mkdirAt(dir, s)
+}
+
+func (v *volumeHost) unlinkAt(dir hostDirHandle, name string) error {
+	_, s, err := v.storedIn(dir, name, false)
+	if err != nil {
+		return err
+	}
+	return v.hostBackend.unlinkAt(dir, s)
+}
+
+func (v *volumeHost) rmdirAt(dir hostDirHandle, name string) error {
+	_, s, err := v.storedIn(dir, name, false)
+	if err != nil {
+		return err
+	}
+	return v.hostBackend.rmdirAt(dir, s)
+}
+
+func (v *volumeHost) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
+	_, s, err := v.storedIn(dir, name, false)
+	if err != nil {
+		return err
+	}
+	return v.hostBackend.chtimesAt(dir, s, atime, mtime)
+}
+
+func (v *volumeHost) renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	oldBase, oldStored, err := v.storedIn(oldDir, oldName, false)
+	if err != nil {
+		return err
+	}
+	newBase := v.dirPath(newDir)
+	newStored, exact, err := v.stored(newBase, newName)
+	if err != nil {
+		return err
+	}
+	if !exact && joinRelPath(newBase, newStored) != joinRelPath(oldBase, oldStored) {
+		// A rename onto another name that folds to the same name replaces it.
+		if err := v.hostBackend.unlinkAt(newDir, newStored); err != nil {
+			return err
+		}
+	}
+	// The stored name becomes the requested name.
+	return v.hostBackend.renameAt(oldDir, oldStored, newDir, newName)
+}
+
+func (v *volumeHost) linkAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	_, oldStored, err := v.storedIn(oldDir, oldName, false)
+	if err != nil {
+		return err
+	}
+	_, newStored, err := v.storedIn(newDir, newName, true)
+	if err != nil {
+		return err
+	}
+	return v.hostBackend.linkAt(oldDir, oldStored, newDir, newStored)
+}
+
 // volumeOptions builds the options of a workspace on a modeled volume.
 func volumeOptions(caps WorkspaceCaps, fold, verified, win bool) workspaceOptions {
 	return workspaceOptions{

@@ -75,6 +75,21 @@ type hostBackend interface {
 	lstatAt(dir hostDirHandle, name string) (hostInfo, error)
 	// openChildAt is open for name inside dir.
 	openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error)
+	// mkdirAt, unlinkAt, rmdirAt, renameAt, linkAt, and chtimesAt are the
+	// mutations mkdir, unlink, rmdir, rename, link, and chtimes for names
+	// inside pinned directories. They make one host call at any depth.
+	mkdirAt(dir hostDirHandle, name string) error
+	unlinkAt(dir hostDirHandle, name string) error
+	rmdirAt(dir hostDirHandle, name string) error
+	renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error
+	linkAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error
+	chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error
+	// readDirAt lists the directory that dir names. The listing carries the
+	// type of each entry, and the inode number where the host reports it.
+	readDirAt(dir hostDirHandle) ([]hostDirEntry, error)
+	// syncDirAt flushes the directory that dir names, as syncDir does for a
+	// path.
+	syncDirAt(dir hostDirHandle) error
 
 	// hostOps holds the host calls of the extended operations of GVXIP-001
 	// section 4.3. See host_ops.go.
@@ -131,8 +146,8 @@ type hostInfo struct {
 type hostDirEntry struct {
 	name string
 	kind hostKind
-	// ino is the host inode number, or zero when the platform layer does not
-	// report it during listing.
+	// ino is the host inode number, or zero when the host does not report it
+	// during listing.
 	ino uint64
 }
 

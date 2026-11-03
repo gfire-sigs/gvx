@@ -176,7 +176,7 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 	rec := e.attr
 	rec.Xattrs = next
 	rec.Ctime = now
-	w.meta[t.rel] = rec
+	w.setMetaLocked(t.rel, rec)
 	// The snapshot of the inode follows the record, so an open descriptor of
 	// a file that the guest unlinks later still sees the attributes.
 	t.ino.attrMu.Lock()
@@ -188,7 +188,6 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 			return translateHostError(err)
 		}
 	}
-	w.markDirtyLocked()
 	return nil
 }
 
