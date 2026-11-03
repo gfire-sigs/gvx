@@ -203,9 +203,6 @@ func (w *Workspace) linkTmp(t *tmpFile, rel string, attr POSIXAttr) error {
 	if err != nil {
 		return err
 	}
-	if !w.keyed(info) {
-		return errMissingIdentity
-	}
 	dst, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return err

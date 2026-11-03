@@ -22,10 +22,17 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
+// keysCarryBirthTime reports whether the identity that a stat returns holds the
+// birth time. APFS lowers the birth time of a file when a process sets an
+// earlier modification time, so the macOS key holds the device and the inode
+// number only.
+const keysCarryBirthTime = false
+
 // volumeIDsTrusted reports whether the volume of the workspace root gives its
 // files inode numbers that outlive a rename and that no later file reuses.
-// APFS and HFS+ do. FAT, exFAT, and network volumes derive the number from the
-// directory entry or invent it, and they fail the test.
+// APFS does: its next object identifier only grows. HFS+ can reuse a number
+// after its 32-bit counter wraps. FAT, exFAT, and network volumes derive the
+// number from the directory entry or invent it. They all keep records by path.
 func volumeIDsTrusted(host hostBackend, _ bool) bool {
 	var st unix.Statfs_t
 	if err := unix.Fstatfs(int(host.rootDir()), &st); err != nil {
@@ -38,5 +45,5 @@ func volumeIDsTrusted(host hostBackend, _ bool) bool {
 		}
 		name = append(name, byte(c))
 	}
-	return bytes.Equal(name, []byte("apfs")) || bytes.Equal(name, []byte("hfs"))
+	return bytes.Equal(name, []byte("apfs"))
 }

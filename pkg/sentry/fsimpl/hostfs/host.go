@@ -135,18 +135,22 @@ type hostID struct {
 //
 // On Windows the key holds the volume serial number and the 128-bit file id of
 // FILE_ID_INFO in dev, ino, and ino2. NTFS and ReFS never reuse the pair while
-// the volume lives. On Linux and macOS the key holds the device, the inode
-// number, and the birth time in nanoseconds in btime. The birth time tells a
-// new file from an old one that had the same inode number. ext4 reuses an
-// inode number at the next create, so the inode number alone is not enough.
+// the volume lives. On macOS the key holds the device and the inode number.
+// APFS never reuses an inode number, and it lowers the birth time of a file
+// when a process sets an earlier modification time, so the birth time stays out
+// of the key. On Linux the key also holds the birth time in nanoseconds in
+// btime. It tells a new file from an old one that had the same inode number,
+// because ext4 reuses an inode number at the next create.
 //
 // A backend stores the raw device number in dev. The Workspace replaces the
 // device of the workspace root with zero before it stores a key, so a volume
 // that gets another device number after a reboot keeps its records.
 type fileKey struct {
-	dev   uint64
-	ino   uint64
-	ino2  uint64
+	dev  uint64
+	ino  uint64
+	ino2 uint64
+	// btime is the birth time in nanoseconds, or zero on a platform whose
+	// keys hold none. See keysCarryBirthTime.
 	btime int64
 }
 
@@ -165,8 +169,9 @@ type hostInfo struct {
 	// fid.
 	fid fileKey
 	// fidOK reports that fid is trustworthy on this host: the birth time is a
-	// real birth time on Linux and macOS, and FILE_ID_INFO answered on
-	// Windows. A volume whose files report false keeps its records by path.
+	// real birth time on Linux, the inode number is not zero on macOS, and
+	// FILE_ID_INFO answered on Windows. A volume whose files report false keeps
+	// its records by path.
 	fidOK bool
 	size  int64
 	// blocks is the allocation size in 512-byte units.

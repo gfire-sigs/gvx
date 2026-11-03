@@ -415,6 +415,32 @@ func TestCollectorKeepsTheRecordOfAFileThatAHostProcessMoved(t *testing.T) {
 	requireMode(t, ws, "elsewhere/moved", 0o751, 0)
 }
 
+// A host editor can save between two passes. The confirming lookup finds a
+// new file at the hint, so the record moves to it.
+func TestCollectorAdoptsTheFileOfAHostEditorSave(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{})
+	if ws.pathKeys {
+		t.Skip("a volume with path keys keeps the record under the path")
+	}
+	mustWriteFile(t, ws, "doc", 0o751)
+	if err := ws.Chown("doc", 7, 8); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, ws)
+	if err := os.WriteFile(filepath.Join(dir, "doc.tmp"), []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "doc.tmp"), filepath.Join(dir, "doc")); err != nil {
+		t.Fatal(err)
+	}
+	ws.orphanPass()
+	requireMode(t, ws, "doc", 0o751, 7)
+	if got := metaKeys(ws); !slices.Equal(got, []string{"doc"}) {
+		t.Fatalf("records = %q, want [doc]", got)
+	}
+}
+
 func TestCollectorKeepsRecordsOfADirectoryThatAHostProcessMovedAway(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("NTFS refuses a host rename of a directory that holds an open handle of hostfs")

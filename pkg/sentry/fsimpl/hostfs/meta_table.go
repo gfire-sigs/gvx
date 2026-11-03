@@ -43,8 +43,15 @@ type metaTable struct {
 	inos    map[uint64]int
 	special map[uint64]int
 	names   int
-	bytes   int64
-	dirty   map[recKey]struct{}
+	// pathRecs counts the records that key on a guest path.
+	pathRecs int
+	bytes    int64
+	dirty    map[recKey]struct{}
+	// repaired holds the keys whose hint, parent, or leaf a read repaired.
+	// The repair is not a change: no flush starts for it, and a table whose
+	// only pending work is a repair writes nothing. A flush that a change
+	// starts takes the repaired records along. See setLoc.
+	repaired map[recKey]struct{}
 	// scans counts the operations that visit every record. A guest call never
 	// needs one, and tests read the counter to prove it.
 	scans atomic.Int64
@@ -69,13 +76,14 @@ type leafKey struct {
 
 func newMetaTable() *metaTable {
 	return &metaTable{
-		recs:    make(map[recKey]*rec),
-		kids:    make(map[recKey]map[string]struct{}),
-		hints:   make(map[string]recKey),
-		leaves:  make(map[leafKey]recKey),
-		inos:    make(map[uint64]int),
-		special: make(map[uint64]int),
-		dirty:   make(map[recKey]struct{}),
+		recs:     make(map[recKey]*rec),
+		kids:     make(map[recKey]map[string]struct{}),
+		hints:    make(map[string]recKey),
+		leaves:   make(map[leafKey]recKey),
+		inos:     make(map[uint64]int),
+		special:  make(map[uint64]int),
+		dirty:    make(map[recKey]struct{}),
+		repaired: make(map[recKey]struct{}),
 	}
 }
 
@@ -95,8 +103,8 @@ func (t *metaTable) put(k recKey, r *rec) {
 	t.wake()
 }
 
-// load stores r under k without a write. The loader and the repair of a hint
-// use it, because the file already holds the record.
+// load stores r under k without a write. The loader uses it, because the file
+// already holds the record.
 func (t *metaTable) load(k recKey, r *rec) {
 	t.mu.Lock()
 	t.putLocked(k, r)
@@ -171,7 +179,10 @@ func (t *metaTable) indexLocked(k recKey, r *rec) {
 	case kindName:
 		t.inos[k.id.ino]++
 		t.addKidLocked(k)
+	case kindPath:
+		t.pathRecs++
 	case kindPathName:
+		t.pathRecs++
 		t.addKidLocked(k)
 	}
 }
@@ -192,7 +203,10 @@ func (t *metaTable) unindexLocked(k recKey, r *rec) {
 	case kindName:
 		dec(t.inos, k.id.ino)
 		t.dropKidLocked(k)
+	case kindPath:
+		t.pathRecs--
 	case kindPathName:
+		t.pathRecs--
 		t.dropKidLocked(k)
 	}
 }
@@ -231,10 +245,10 @@ func (t *metaTable) dropKidLocked(k recKey) {
 	}
 }
 
-// setLoc replaces the hint, the parent, and the leaf of the record under k
-// without scheduling a write. The file keeps the old values until a change of
-// the record writes the new ones. It does nothing when the record changed
-// meanwhile.
+// setLoc replaces the hint, the parent, and the leaf of the record under k.
+// The file keeps the old values until a flush that a change starts. The repair
+// itself starts no flush and makes no table pending, so a read never writes. It
+// does nothing when the record changed meanwhile.
 func (t *metaTable) setLoc(k recKey, from *rec, hint string, parent fileKey, leaf string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -242,6 +256,7 @@ func (t *metaTable) setLoc(k recKey, from *rec, hint string, parent fileKey, lea
 		return
 	}
 	t.putLocked(k, from.withLoc(hint, parent, leaf))
+	t.repaired[k] = struct{}{}
 }
 
 // byLeaf returns the record that the guest last saw as the entry name of the
@@ -269,6 +284,14 @@ func (t *metaTable) kidsOf(dir recKey) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// hasPathRecs reports whether the table holds a record that keys on a guest
+// path. A rename or a swap of a directory must then move those records.
+func (t *metaTable) hasPathRecs() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.pathRecs > 0
 }
 
 // hasNames reports whether the table holds any virtual symbolic link.
@@ -366,16 +389,22 @@ func (t *metaTable) keys() []recKey {
 }
 
 // takeBatch hands out the pending changes as journal operations and resets the
-// pending set. With full set it hands out a snapshot of every record instead,
+// pending set. The records that a read repaired join the batch. With full set it hands out a snapshot of every record instead,
 // because a snapshot already holds each pending change. The copy holds only
 // pointers: the caller encodes the operations after the call, outside the
 // lock. The result dirty lists the keys that the caller must put back when its
 // write fails.
 func (t *metaTable) takeBatch(full bool) (ops []metaOp, dirty []recKey) {
-	if full {
-	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if len(t.dirty) > 0 {
+		for k := range t.repaired {
+			if t.recs[k] != nil {
+				t.dirty[k] = struct{}{}
+			}
+		}
+	}
+	clear(t.repaired)
 	dirty = make([]recKey, 0, len(t.dirty))
 	for k := range t.dirty {
 		dirty = append(dirty, k)
@@ -406,7 +435,7 @@ func (t *metaTable) restore(keys []recKey) {
 
 // moveTree re-keys every path record below the directory oldRel to the same
 // place below newRel, and the virtual symbolic links that oldRel holds. The
-// record of oldRel itself stays. Only a table that keys on paths calls it. The
+// record of oldRel itself stays. Only a table with path records calls it. The
 // operation scans the whole table, which is the cost of path keys.
 func (t *metaTable) moveTree(oldRel, newRel string) {
 	prefix := oldRel + "/"
@@ -440,7 +469,7 @@ func (t *metaTable) moveTree(oldRel, newRel string) {
 }
 
 // swapTree exchanges the path records at or below aRel and bRel. The two
-// directories cannot nest. Only a table that keys on paths calls it.
+// directories cannot nest. Only a table with path records calls it.
 func (t *metaTable) swapTree(aRel, bRel string) {
 	aPrefix, bPrefix := aRel+"/", bRel+"/"
 	t.mu.Lock()

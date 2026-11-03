@@ -15,18 +15,81 @@
 package hostfs
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
+// writeBirthTimeKeys rewrites the journal at path so that every key and every
+// parent identity carries a birth time, as an earlier build wrote them on
+// macOS.
+func writeBirthTimeKeys(t *testing.T, path string) {
+	t.Helper()
+	const birth = 1_700_000_000_123_456_789
+	var payload []byte
+	for k, r := range rawRecords(t, path) {
+		if k.kind == kindInode || k.kind == kindName {
+			k.id.btime = birth
+		}
+		r = r.withLoc(r.hint, fileKey{dev: r.parent.dev, ino: r.parent.ino, btime: birth}, r.leaf)
+		payload = appendOp(payload, metaOp{key: k, r: r})
+	}
+	raw := appendFrame(append([]byte(journalMagic), journalVersion), payload)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecordsKeyedOnTheBirthTimeByAnEarlierBuildStillApply(t *testing.T) {
+	// A build that keyed macOS records on the birth time wrote tables whose
+	// keys never match a stat now. Without the match, the directory that holds
+	// a guest created tree shows the 0700 mode of its host directory, and a
+	// guest user other than the owner cannot enter it.
+	if keysCarryBirthTime {
+		t.Skip("the key of this platform holds the birth time")
+	}
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{})
+	if err := ws.Mkdir("d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.Chown("d", 1234, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.Symlink("tgt", "d/l"); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, ws, "d/f", 0o751)
+	mustSync(t, ws)
+	if err := ws.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeBirthTimeKeys(t, filepath.Join(dir, MetaFileName))
+
+	reopened := plainWS(t, dir, workspaceOptions{})
+	requireMode(t, reopened, "d", 0o755, 1234)
+	requireMode(t, reopened, "d/f", 0o751, 0)
+	if target, err := reopened.Readlink("d/l"); err != nil || target != "tgt" {
+		t.Fatalf("Readlink(d/l) = (%q, %v), want tgt", target, err)
+	}
+	// A host editor save below the directory finds the leaf of the record
+	// through the identity of its parent, which no longer has a birth time.
+	if err := os.WriteFile(filepath.Join(dir, "d", "f.tmp"), []byte("v2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "d", "f.tmp"), filepath.Join(dir, "d", "f")); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, reopened, "d/f", 0o751, 0)
+}
+
 var epoch2020 = time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 
 func TestSettingTimesBeforeCreationKeepsTheLinksOfADirectory(t *testing.T) {
 	// tar x, cp -a, and rsync -a set the times of a directory after they fill
-	// it. APFS lowers the birth time then, and the links key on the directory.
+	// it. APFS lowers the birth time then. The key holds no birth time on
+	// macOS, so the links of the directory keep their key.
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
 	if err := ws.Mkdir("d", 0o755); err != nil {
@@ -56,7 +119,8 @@ func TestSettingTimesBeforeCreationKeepsTheLinksOfADirectory(t *testing.T) {
 
 func TestSettingTimesBeforeCreationThenRenamingAnAncestorKeepsTheFileRecord(t *testing.T) {
 	// A package manager extracts to a staging directory, sets the times, and
-	// renames the directory.
+	// renames the directory. APFS lowers the birth times of the entries, and
+	// the records keep their keys.
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
 	if err := ws.Mkdir("stage", 0o755); err != nil {
@@ -83,33 +147,6 @@ func TestSettingTimesBeforeCreationThenRenamingAnAncestorKeepsTheFileRecord(t *t
 	requireMode(t, plainWS(t, dir, workspaceOptions{}), "pkg/f", 0o755, 1234)
 }
 
-func TestHostLoweredBirthTimeOfADirectoryKeepsItsLinks(t *testing.T) {
-	dir := resolvedTempDir(t)
-	ws, host := identityWS(t, dir)
-	if err := ws.Mkdir("d", 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := ws.Symlink("tgt", "d/l"); err != nil {
-		t.Fatal(err)
-	}
-	before, err := ws.host.lstat("d")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A host tool sets an earlier time on the directory: same inode number,
-	// earlier birth time.
-	host.set(func(info hostInfo) hostInfo {
-		if info.fid.ino == before.fid.ino && info.kind == hostKindDir {
-			info.fid.btime -= int64(time.Hour)
-		}
-		return info
-	})
-	requireMode(t, ws, "d", 0o750, 0)
-	if target, err := ws.Readlink("d/l"); err != nil || target != "tgt" {
-		t.Fatalf("Readlink(d/l) after the host lowered the birth time = (%q, %v), want tgt", target, err)
-	}
-}
-
 func TestHostMoveToAnotherDirectoryKeepsTheRecordAtTheNewPath(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
@@ -123,6 +160,48 @@ func TestHostMoveToAnotherDirectoryKeepsTheRecordAtTheNewPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireMode(t, ws, "b/x", 0o751, 0)
+}
+
+func TestRepairedHintReachesTheFileWithTheNextFlushOfAChange(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{})
+	for _, d := range []string{"a", "b"} {
+		if err := ws.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWriteFile(t, ws, "a/x", 0o751)
+	mustSync(t, ws)
+	diskHint := func() string {
+		for _, r := range rawRecords(t, filepath.Join(dir, MetaFileName)) {
+			if r.attr.Mode&0o7777 == 0o751 {
+				return r.hint
+			}
+		}
+		t.Fatal("no record with mode 751 on disk")
+		return ""
+	}
+
+	if err := os.Rename(filepath.Join(dir, "a", "x"), filepath.Join(dir, "b", "x")); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, ws, "b/x", 0o751, 0)
+	if _, r := ws.meta.byHint("b/x"); r == nil {
+		t.Fatal("the read did not repair the hint of the moved file in memory")
+	}
+	if n := ws.meta.pending(); n != 0 {
+		t.Fatalf("a repaired hint made %d records pending, want 0", n)
+	}
+	mustSync(t, ws)
+	if got := diskHint(); got != "a/x" {
+		t.Fatalf("hint on disk after a flush without a change = %q, want a/x", got)
+	}
+
+	mustWriteFile(t, ws, "other", 0o600)
+	mustSync(t, ws)
+	if got := diskHint(); got != "b/x" {
+		t.Fatalf("hint on disk after the flush of another change = %q, want b/x", got)
+	}
 }
 
 func TestHostFileAtAnOldNameNeverGainsSetuid(t *testing.T) {
@@ -157,6 +236,27 @@ func TestHostFileAtAnOldNameNeverGainsSetuid(t *testing.T) {
 				t.Fatalf("Stat(x) = (%+v, %v), want no set-user-ID and no set-group-ID bit on a file that a host process wrote", attr, err)
 			}
 		})
+	}
+}
+
+func TestHostDirectoryAtAnOldNameNeverGainsSetgid(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{})
+	if err := ws.Mkdir("d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.Chmod("d", 0o2775); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "d")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	attr, _, err := ws.Stat("d")
+	if err != nil || attr.Mode&0o6000 != 0 {
+		t.Fatalf("Stat(d) = (%+v, %v), want no set-group-ID bit on a directory that a host process made", attr, err)
 	}
 }
 
@@ -198,27 +298,4 @@ func TestDirectoryRenameDoesNotBreakAdoptionBelowIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireMode(t, ws, "e/doc", 0o751, 0)
-}
-
-func TestCreateFailsForAnEntryWithoutAnIdentity(t *testing.T) {
-	dir := resolvedTempDir(t)
-	ws, host := identityWS(t, dir)
-	host.set(func(info hostInfo) hostInfo {
-		info.fidOK = false
-		return info
-	})
-	if err := ws.WriteFile("f", []byte("x"), 0o644); !errors.Is(err, errMissingIdentity) {
-		t.Fatalf("WriteFile on a file system without identities = %v, want errMissingIdentity", err)
-	}
-	if err := ws.Mkdir("d", 0o755); !errors.Is(err, errMissingIdentity) {
-		t.Fatalf("Mkdir on a file system without identities = %v, want errMissingIdentity", err)
-	}
-	for _, name := range []string{"f", "d"} {
-		if _, err := os.Lstat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Errorf("host entry %s survived a refused create: %v", name, err)
-		}
-	}
-	if n := ws.meta.size(); n != 0 {
-		t.Fatalf("the table holds %d records after refused creates, want 0", n)
-	}
 }

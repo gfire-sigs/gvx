@@ -85,7 +85,7 @@ Host desktop shells inject hidden metadata files into mounted directories. Finde
 - **Host Clutter Hiding**: Unless `.gvx_meta` owns the entry, `listDir`, `lookupLocked`, and `hostWatcher` ignore `.DS_Store` on macOS and `Thumbs.db` on Windows. They also ignore `._*` files on macOS only when the file is `<= 64 KiB` and starts with the 4-byte AppleDouble magic `0x00051607`. Filtering these names in `hostWatcher` prevents Finder or Explorer folder clicks from triggering guest `inotify` rebuilds.
 - **Auto-Purge on `rmdir`**: When a guest calls `rmdir` on a directory with zero guest-visible entries, `Workspace.rmdir` unlinks any verified host clutter files first. It then calls `w.host.rmdir`, preventing spurious `ENOTEMPTY` failures during `rm -rf`.
 - **Ephemeral File Sweep**: During `OpenWorkspace`, `hostfs` unlinks any leftover `~gvx~tmp.*` (`O_TMPFILE`) and `~gvx~swap.*` (`RENAME_EXCHANGE`) files left behind by a previously terminated process.
-- **`.gvx_meta` Orphan Collection**: A background collector removes records whose host files no longer exist. It also removes virtual symlinks whose parent directories no longer exist. A record dies when two complete passes in a row miss it and a lookup by its hint path confirms the loss. `loadMeta` and the flush compare no record with the host.
+- **`.gvx_meta` Orphan Collection**: A background collector removes records whose host files no longer exist. It also removes virtual symlinks whose parent directories no longer exist. A record dies when two complete passes in a row miss it and a lookup by its hint path confirms the loss. When that lookup finds a new file of the same kind, the record moves to it, as in a guest lookup. `loadMeta` and the flush compare no record with the host.
 
 ---
 
@@ -239,7 +239,7 @@ When a guest writes or renames a file, the VFS method in `pkg/sentry/fsimpl/host
 
 `hostfs` stores POSIX metadata in `.gvx_meta` at the workspace root. Ordinary metadata mutations (`chmod`, `chown`, `symlink`, `setxattr`) update `Workspace.meta` in memory and trigger a background coalesced write every `250ms` (`defaultCoalesceWindow`). Guest databases and applications require strict durability when they call `fsync`, `fdatasync`, `sync`, or write with `O_SYNC` or `O_DSYNC`. On those calls, `regularFD.Sync` and `directoryFD.Sync` bypass the coalesce timer. They synchronously flush dirty mapped pages (`inode.data.syncData`), the host file (`fd.h.sync`), `.gvx_meta` (`ws.Sync`), and the parent directory (`ws.syncDir`).
 
-The file form of `.gvx_meta` is an append-only journal with periodic compaction. A record keys on the identity of the host file, so a host rename keeps it. `docs/architecture.md`, section 3.7, describes both.
+The file form of `.gvx_meta` is an append-only journal with periodic compaction. A record keys on the identity of the host file, so a host rename keeps it. An entry without a trustworthy identity keys on its guest path. `docs/architecture.md`, section 3.7, describes both.
 
 ```go
 // POSIXAttr holds the persisted POSIX metadata of one host file or virtual

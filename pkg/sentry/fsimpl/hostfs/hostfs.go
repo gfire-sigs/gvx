@@ -764,9 +764,6 @@ func (w *Workspace) touchDirLocked(dir string, now int64) {
 		return
 	}
 	defer w.releasePin(pin)
-	if !w.pathKeys && pin.key.isZero() {
-		return
-	}
 	key := w.dirKeyOf(pin, dir)
 	if r := w.meta.get(key); r != nil {
 		next := *r
@@ -1041,9 +1038,6 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 		return nil, entry{}, err
 	}
 	info, err := w.host.fstat(f)
-	if err == nil && !w.keyed(info) {
-		err = errMissingIdentity
-	}
 	if err != nil {
 		_ = f.Close()
 		_ = w.host.unlinkAt(pin.h, leaf)
@@ -1163,9 +1157,9 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if !w.pathKeys {
 		// mkdir returns no identity, so one stat of the new directory reads it.
 		info, err := w.host.lstatAt(pin.h, leaf)
-		if err != nil || !w.keyed(info) {
+		if err != nil {
 			_ = w.host.rmdirAt(pin.h, leaf)
-			return errors.Join(err, errMissingIdentity)
+			return err
 		}
 		key = w.keyOf(rel, info)
 	}
@@ -1206,9 +1200,9 @@ func (w *Workspace) Chown(relPath string, uid, gid uint32) error {
 }
 
 // setAttr changes virtual attributes. A hard-linked file keeps one set of
-// attributes: all its names share one record, except on a volume without file
-// identities, where setAttr copies the change to every other recorded path of
-// the same host file.
+// attributes: all its names share one record, except for an entry without a
+// file identity, where setAttr copies the change to every other recorded path
+// of the same host file.
 func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1250,7 +1244,7 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 		return err
 	}
 	w.putRec(e.key, cur, rel)
-	if w.pathKeys && e.info.nlink > 1 && !e.isDir() {
+	if e.key.isPath() && e.info.nlink > 1 && !e.isDir() {
 		if err := w.propagateLinkAttrLocked(rel, e.info.id, cur); err != nil {
 			return err
 		}
@@ -1259,10 +1253,14 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 }
 
 // propagateLinkAttrLocked copies attr to every other recorded path that names
-// the same host file. Only a volume without file identities needs it. Every
-// other volume shares one record among the names of a file. The scan of the
-// table and the host call for each record are the price of path keys.
+// the same host file. Only entries without file identities need it. Every
+// other entry shares one record among the names of a file. The scan of the
+// table and the host call for each record are the price of path keys. A host
+// that reports no file number gives the names no link to follow.
 func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAttr) error {
+	if id == (hostID{}) {
+		return nil
+	}
 	for _, k := range w.meta.keys() {
 		if k.kind != kindPath || k.path == skip {
 			continue
@@ -1559,17 +1557,19 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 // moveRecordLocked updates the table after a rename. The record of the
 // replaced destination dies with its last name. The record of the source
 // follows the file, which keeps its identity through the rename, so only its
-// change time and hint change, and nothing below a directory changes. A table
-// that keys on paths must re-key the source record and every record below a
-// directory. Callers hold w.mu for writing.
+// change time and hint change, and nothing below a directory changes. A source
+// that keys on its path must re-key its record. A directory rename must also
+// re-key every path record below the directory, because an entry without an
+// identity can sit below a directory that has one. Callers hold w.mu for
+// writing.
 func (w *Workspace) moveRecordLocked(src, dst entry, dstExists bool, oldRel, newRel string, now int64) {
 	if dstExists {
-		if w.pathKeys || dst.virtual || dst.isDir() || dst.info.nlink <= 1 {
+		if dst.key.isPath() || dst.virtual || dst.isDir() || dst.info.nlink <= 1 {
 			w.meta.del(dst.key)
 		}
 		delete(w.dirTimes, dst.key)
 	}
-	if w.pathKeys {
+	if src.key.isPath() {
 		// A stale record at the new path dies with the replaced entry.
 		w.meta.del(recKey{kind: kindPath, path: newRel})
 	}
@@ -1587,13 +1587,13 @@ func (w *Workspace) moveRecordLocked(src, dst entry, dstExists bool, oldRel, new
 		attr := r.attr
 		attr.Ctime = now
 		nk := src.key
-		if w.pathKeys {
+		if nk.isPath() {
 			w.meta.del(src.key)
 			nk = recKey{kind: kindPath, path: newRel}
 		}
 		w.putRec(nk, attr, newRel)
 	}
-	if w.pathKeys && src.isDir() {
+	if src.isDir() && w.meta.hasPathRecs() {
 		w.meta.moveTree(oldRel, newRel)
 	}
 }
@@ -1621,7 +1621,7 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	if err != nil {
 		return err
 	}
-	if w.pathKeys {
+	if src.key.isPath() {
 		if err := w.checkMetaRoom(recKey{}); err != nil {
 			return err
 		}
@@ -1635,9 +1635,9 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	}); err != nil {
 		return err
 	}
-	if w.pathKeys {
-		// Every name of a file has a record of its own on a volume without
-		// file identities. Elsewhere the names share the record of the file.
+	if src.key.isPath() {
+		// Every name of a file without an identity has a record of its own.
+		// Elsewhere the names share the record of the file.
 		w.putRec(recKey{kind: kindPath, path: newRel}, src.attr, newRel)
 	}
 	parent, name := splitParent(newRel)
@@ -1694,8 +1694,8 @@ func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
 		w.removeDirNameLocked(parent, name, leaf)
 		w.dropAlt(parent, name)
 		// The names of a file share one record, so the record dies with the
-		// last name. A table that keys on paths holds a record for each name.
-		if last || w.pathKeys {
+		// last name. A path key holds a record for each name.
+		if last || e.key.isPath() {
 			w.meta.del(e.key)
 		}
 		return last, nil
@@ -1820,31 +1820,8 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 			a.Mtime = 0
 			w.putRec(e.key, a, rel)
 		}
-		w.rekeyAfterTimesLocked(rel, e, *mtime)
 	}
 	return nil
-}
-
-// rekeyAfterTimesLocked follows the identity of the entry rel after a guest set
-// its modification time to mtime. APFS lowers the birth time of a file to an
-// earlier modification time, as tar, cp -a, and rsync -a cause for each file
-// and directory that they extract. The birth time is part of the key, so the
-// record and, for a directory, its guest links must move to the new key at
-// once. A later lookup would move them too, but only while the hint still
-// names the entry, and a rename of an ancestor directory comes first in the
-// extract-then-rename flow of package managers. Callers hold w.mu for writing.
-func (w *Workspace) rekeyAfterTimesLocked(rel string, before entry, mtime time.Time) {
-	if w.pathKeys || runtime.GOOS != "darwin" || before.key.id.btime == 0 || mtime.UnixNano() >= before.key.id.btime {
-		return
-	}
-	after, err := w.lookupLocked(rel)
-	if err != nil || after.key == before.key {
-		return
-	}
-	if t, ok := w.dirTimes[before.key]; ok {
-		w.dirTimes[after.key] = t
-		delete(w.dirTimes, before.key)
-	}
 }
 
 // dirListing is one directory entry with its type and the host inode number
@@ -2080,17 +2057,14 @@ func (w *Workspace) chtimesHostLocked(rel string, atime, mtime *time.Time) error
 // whose inode number a special record names gets a stat. A table without
 // special records costs nothing. Callers hold w.mu.
 func (w *Workspace) placeholderOfLocked(pin *dirPin, rel, guest string, e hostDirEntry) uint32 {
-	if w.pathKeys {
-		if r := w.meta.get(recKey{kind: kindPath, path: joinRelPath(rel, guest)}); r != nil {
-			return specialFileType(r.attr.Mode)
-		}
-		return 0
+	if r := w.meta.get(recKey{kind: kindPath, path: joinRelPath(rel, guest)}); r != nil {
+		return specialFileType(r.attr.Mode)
 	}
-	if e.ino == 0 || !w.meta.hasSpecialIno(e.ino) {
+	if w.pathKeys || e.ino == 0 || !w.meta.hasSpecialIno(e.ino) {
 		return 0
 	}
 	info, err := w.host.lstatAt(pin.h, e.name)
-	if err != nil || !w.keyed(info) {
+	if err != nil || !hasIdentity(info) {
 		return 0
 	}
 	if r := w.meta.get(w.keyOf("", info)); r != nil {

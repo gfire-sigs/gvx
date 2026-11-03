@@ -34,11 +34,13 @@ const (
 	// kindName is a virtual symbolic link. The host holds no object for it, so
 	// the key is the identity of the parent directory and the name.
 	kindName
-	// kindPath is kindInode on a volume without trustworthy identities. The
-	// key is the guest path.
+	// kindPath is kindInode for an entry without a trustworthy identity: any
+	// entry of a volume without identities, and an entry of a file system that
+	// the guest mounts inside a workspace with identities. The key is the guest
+	// path.
 	kindPath
-	// kindPathName is kindName on such a volume. The key is the guest path of
-	// the parent directory and the name.
+	// kindPathName is kindName in a directory without a trustworthy identity.
+	// The key is the guest path of the parent directory and the name.
 	kindPathName
 )
 
@@ -60,7 +62,7 @@ func (k recKey) isName() bool {
 	return k.kind == kindName || k.kind == kindPathName
 }
 
-// isPath reports whether k belongs to a table that keys on guest paths.
+// isPath reports whether k keys on a guest path.
 func (k recKey) isPath() bool {
 	return k.kind == kindPath || k.kind == kindPathName
 }
@@ -271,8 +273,15 @@ func (r *byteReader) str() string {
 	return string(r.bytes())
 }
 
+// fileKey decodes an identity. A platform whose keys hold no birth time reads
+// the birth time as zero. An earlier build keyed macOS records on the birth
+// time, and the key of such a record must reach the key that a stat builds now.
 func (r *byteReader) fileKey() fileKey {
-	return fileKey{dev: r.uvarint(), ino: r.uvarint(), ino2: r.uvarint(), btime: r.varint()}
+	k := fileKey{dev: r.uvarint(), ino: r.uvarint(), ino2: r.uvarint(), btime: r.varint()}
+	if !keysCarryBirthTime {
+		k.btime = 0
+	}
+	return k
 }
 
 // readKey decodes one key. It returns false for a malformed key and for an

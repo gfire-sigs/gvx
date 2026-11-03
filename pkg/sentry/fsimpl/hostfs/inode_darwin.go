@@ -61,19 +61,19 @@ func fstatInfo(fd int) (hostInfo, error) {
 	return statToHostInfo(&st), nil
 }
 
-// statToHostInfo converts a stat result. The identity holds the device, the
-// inode number, and the birth time, which tells a new file from an old one that
-// had the same inode number. APFS lowers the birth time when a process sets an
-// earlier modification time, and Workspace.adopt re-keys the record then. A
-// zero birth time marks a volume that keeps none, which keeps no trustworthy
-// inode numbers either.
+// statToHostInfo converts a stat result. The identity holds the device and the
+// inode number only. APFS lowers the birth time of a file when a process sets
+// an earlier modification time, as tar, cp -p, and git do, so a birth time in
+// the key would give the file a new identity. The inode numbers of an APFS
+// volume come from a counter that never goes back, so no later file reuses
+// one. The probe in volumeIDsTrusted admits only that volume. The birth time
+// stays in btime for display.
 func statToHostInfo(st *unix.Stat_t) hostInfo {
-	btime := int64(st.Btim.Sec)*int64(time.Second) + int64(st.Btim.Nsec)
 	return hostInfo{
 		kind:   hostKindOfMode(st.Mode),
 		id:     hostID{dev: uint64(st.Dev), ino: uint64(st.Ino)},
-		fid:    fileKey{dev: uint64(st.Dev), ino: uint64(st.Ino), btime: btime},
-		fidOK:  btime != 0,
+		fid:    fileKey{dev: uint64(st.Dev), ino: uint64(st.Ino)},
+		fidOK:  st.Ino != 0,
 		size:   st.Size,
 		blocks: st.Blocks,
 		nlink:  uint32(st.Nlink),

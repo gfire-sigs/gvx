@@ -146,10 +146,6 @@ func (w *Workspace) mknodLocked(rel string, mode, uid, gid uint32, rdev uint64) 
 		_ = w.host.unlink(hostRel)
 		return err
 	}
-	if !w.keyed(info) {
-		_ = w.host.unlink(hostRel)
-		return errMissingIdentity
-	}
 	w.putRec(w.keyOf(rel, info), POSIXAttr{Mode: mode&linux.S_IFMT | mode&0o7777, UID: uid, GID: gid, Rdev: rdev}, rel)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)

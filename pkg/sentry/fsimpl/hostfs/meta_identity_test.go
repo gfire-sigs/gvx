@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +36,40 @@ type identityHost struct {
 
 	mu      sync.Mutex
 	rewrite func(hostInfo) hostInfo
+	// nameless, when set, picks the leaf names whose entries report no
+	// identity, as an entry of a child file system does. So does every entry
+	// below such a directory. The host learns the inode numbers of these
+	// entries when a call names them. See markNameless.
+	nameless func(name string) bool
+	bad      map[uint64]struct{}
+	// scanExists answers existsByID with a walk of the tree, as a host that
+	// opens a file by identity does.
+	scanExists bool
+}
+
+func (h *identityHost) existsByID(key fileKey) (bool, error) {
+	if !h.scanExists {
+		return h.hostBackend.existsByID(key)
+	}
+	var walk func(dir string) bool
+	walk = func(dir string) bool {
+		entries, err := h.hostBackend.readDir(dir)
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			rel := hostChild(dir, e.name)
+			info, err := h.hostBackend.lstat(rel)
+			if err != nil {
+				continue
+			}
+			if info.fid == key || (e.kind == hostKindDir && walk(rel)) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk("."), nil
 }
 
 func (h *identityHost) set(rewrite func(hostInfo) hostInfo) {
@@ -49,15 +84,78 @@ func (h *identityHost) apply(info hostInfo, err error) (hostInfo, error) {
 	}
 	h.mu.Lock()
 	rewrite := h.rewrite
+	_, bad := h.bad[info.fid.ino]
 	h.mu.Unlock()
 	if rewrite != nil {
 		info = rewrite(info)
 	}
+	if bad {
+		info.fidOK = false
+	}
 	return info, nil
 }
 
+// markNameless records the inode number of the entry that the call named when
+// the entry is nameless itself or sits below a nameless directory.
+func (h *identityHost) markNameless(parentIno uint64, rels []string, ino uint64) {
+	if h.nameless == nil || ino == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, below := h.bad[parentIno]
+	for _, name := range rels {
+		below = below || h.nameless(name)
+	}
+	if below {
+		if h.bad == nil {
+			h.bad = make(map[uint64]struct{})
+		}
+		h.bad[ino] = struct{}{}
+	}
+}
+
+func (h *identityHost) markPath(rel string, info hostInfo) {
+	h.markNameless(0, strings.Split(rel, "/"), info.fid.ino)
+}
+
+func (h *identityHost) markAt(dir hostDirHandle, name string, info hostInfo) {
+	if h.nameless == nil {
+		return
+	}
+	parent, err := h.hostBackend.fstatDir(dir)
+	if err != nil {
+		return
+	}
+	h.markNameless(parent.fid.ino, []string{name}, info.fid.ino)
+}
+
+func (h *identityHost) open(rel string, flags int, perm os.FileMode) (*os.File, error) {
+	f, err := h.hostBackend.open(rel, flags, perm)
+	if err == nil {
+		if info, serr := h.hostBackend.fstat(f); serr == nil {
+			h.markPath(rel, info)
+		}
+	}
+	return f, err
+}
+
+func (h *identityHost) openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error) {
+	f, err := h.hostBackend.openChildAt(dir, name, flags, perm)
+	if err == nil {
+		if info, serr := h.hostBackend.fstat(f); serr == nil {
+			h.markAt(dir, name, info)
+		}
+	}
+	return f, err
+}
+
 func (h *identityHost) lstat(rel string) (hostInfo, error) {
-	return h.apply(h.hostBackend.lstat(rel))
+	info, err := h.hostBackend.lstat(rel)
+	if err == nil && rel != "." {
+		h.markPath(rel, info)
+	}
+	return h.apply(info, err)
 }
 
 func (h *identityHost) fstat(f *os.File) (hostInfo, error) {
@@ -69,7 +167,11 @@ func (h *identityHost) fstatDir(dir hostDirHandle) (hostInfo, error) {
 }
 
 func (h *identityHost) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
-	return h.apply(h.hostBackend.lstatAt(dir, name))
+	info, err := h.hostBackend.lstatAt(dir, name)
+	if err == nil {
+		h.markAt(dir, name, info)
+	}
+	return h.apply(info, err)
 }
 
 func (h *identityHost) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hostInfo, error) {
@@ -77,6 +179,7 @@ func (h *identityHost) openDirAt(dir hostDirHandle, name string) (hostDirHandle,
 	if err != nil {
 		return handle, info, err
 	}
+	h.markAt(dir, name, info)
 	info, _ = h.apply(info, nil)
 	return handle, info, nil
 }
@@ -87,6 +190,31 @@ func (h *identityHost) openDirAt(dir hostDirHandle, name string) (hostDirHandle,
 func identityWS(t testing.TB, dir string) (*Workspace, *identityHost) {
 	t.Helper()
 	host := &identityHost{}
+	ws := journalWS(t, dir, workspaceOptions{
+		noOrphanGC: true,
+		wrapHost: func(b hostBackend) hostBackend {
+			host.hostBackend = b
+			return host
+		},
+	})
+	return ws, host
+}
+
+// mixedWS opens a workspace on dir whose entries named with the prefix "np",
+// and every entry below a directory with such a name, report no file identity.
+// They key their records on the guest path, as the entries of a file system
+// that the guest mounts inside the workspace do. Every other entry keeps its
+// identity.
+func mixedWS(t testing.TB, dir string) *Workspace {
+	t.Helper()
+	ws, _ := mixedWSHost(t, dir)
+	return ws
+}
+
+// mixedWSHost is mixedWS that also returns the host wrapper.
+func mixedWSHost(t testing.TB, dir string) (*Workspace, *identityHost) {
+	t.Helper()
+	host := &identityHost{nameless: func(name string) bool { return strings.HasPrefix(name, "np") }}
 	ws := journalWS(t, dir, workspaceOptions{
 		noOrphanGC: true,
 		wrapHost: func(b hostBackend) hostBackend {

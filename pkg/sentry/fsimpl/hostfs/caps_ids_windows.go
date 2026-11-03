@@ -16,6 +16,11 @@
 
 package hostfs
 
+// keysCarryBirthTime reports whether the identity that a stat returns holds the
+// birth time. The Windows file identifier is unique for the life of the volume,
+// so the key holds no birth time.
+const keysCarryBirthTime = false
+
 // volumeIDsTrusted reports whether the volume of the workspace root passes the
 // platform test for file identities. Windows decides from the
 // identity of each file, so every volume passes here.

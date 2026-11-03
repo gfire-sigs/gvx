@@ -80,7 +80,10 @@ func isNotExist(err error) bool {
 // A volume that opens a file by identity (Windows) asks the host about each
 // record. Any other volume walks the tree through the pinned handles. The walk
 // lists each directory once and stats only the entries whose inode number a
-// record names.
+// record names. A record that keys on a guest path, which an entry without an
+// identity has, belongs to the walk on every volume: the walk marks it alive
+// when it meets the path. A volume that asks by identity walks as well while
+// the table holds such a record.
 type orphanCollector struct {
 	// mu serializes steps. The goroutine and the tests both call them.
 	mu sync.Mutex
@@ -93,6 +96,9 @@ type orphanCollector struct {
 	active bool
 	// broken reports that a host error invalidated the pass.
 	broken bool
+	// walk reports that the pass lists directories. A pass that asks the host
+	// by identity walks only when the table holds path records.
+	walk bool
 	// queue holds the directories that the walk has to list.
 	queue []string
 	// seen holds the records that the walk proved alive.
@@ -180,11 +186,12 @@ func (w *Workspace) orphanStep() bool {
 		c.begin(w)
 	}
 	if !c.confirming {
-		var more bool
-		if w.useIDPass() {
-			more = w.identityStep(c)
-		} else {
+		more := false
+		if c.walk {
 			more = w.walkStep(c)
+		}
+		if w.useIDPass() {
+			more = w.identityStep(c) || more
 		}
 		if more {
 			return true
@@ -216,7 +223,11 @@ func (w *Workspace) pendingConversion() bool {
 func (c *orphanCollector) begin(w *Workspace) {
 	c.active, c.broken, c.confirming = true, false, false
 	c.second = c.pending != nil
-	c.queue = append(c.queue[:0], ".")
+	c.walk = !w.useIDPass() || w.meta.hasPathRecs()
+	c.queue = c.queue[:0]
+	if c.walk {
+		c.queue = append(c.queue, ".")
+	}
 	c.seen = make(map[recKey]struct{})
 	c.keys, c.pos, c.dead = nil, 0, nil
 	if w.useIDPass() {
@@ -296,10 +307,10 @@ func (w *Workspace) visitDir(c *orphanCollector, rel string) {
 		if e.kind == hostKindDir {
 			c.queue = append(c.queue, child)
 		}
-		if w.pathKeys {
-			if k := (recKey{kind: kindPath, path: child}); w.meta.has(k) {
-				c.seen[k] = struct{}{}
-			}
+		if k := (recKey{kind: kindPath, path: child}); w.meta.has(k) {
+			c.seen[k] = struct{}{}
+		}
+		if w.pathKeys || w.useIDPass() {
 			continue
 		}
 		if e.ino != 0 && !w.meta.hasIno(e.ino) {
@@ -312,10 +323,8 @@ func (w *Workspace) visitDir(c *orphanCollector, rel string) {
 			}
 			continue
 		}
-		if w.keyed(info) {
-			if k := w.keyOf(child, info); w.meta.has(k) {
-				c.seen[k] = struct{}{}
-			}
+		if k := w.keyOf(child, info); w.meta.has(k) {
+			c.seen[k] = struct{}{}
 		}
 	}
 }
@@ -363,10 +372,14 @@ func (w *Workspace) endSearch(c *orphanCollector) {
 		c.dead, c.pending = nil, nil
 		return
 	}
+	// An identity pass has its verdicts already. Its walk adds the path
+	// records that no directory listing met.
 	if !w.useIDPass() {
 		c.dead = nil
+	}
+	if c.walk {
 		for _, k := range w.meta.keys() {
-			if _, ok := c.seen[k]; !ok {
+			if _, ok := c.seen[k]; !ok && (k.isPath() || !w.useIDPass()) {
 				c.dead = append(c.dead, k)
 			}
 		}
@@ -417,19 +430,16 @@ func (w *Workspace) confirmStep(c *orphanCollector) bool {
 // goes through the guest path of the record, so a record whose path still
 // names its file survives a walk that missed the file. A host error, including
 // a permission error, or an answer that shows the file, keeps the record. A
-// record of the other key kind waits for the loader to convert it, so it never
-// dies here. A file that a host process moved keeps its record only when the
-// second pass finds it, because the hint names the old path. Callers hold w.mu
-// for writing.
+// file that a host process moved keeps its record only when the
+// second pass finds it, because the hint names the old path. A new file of the
+// same kind at the hint takes the record over, as recOf does for the guest.
+// The lookup can write the table, so callers hold w.mu for writing.
 func (w *Workspace) orphanedLocked(k recKey) bool {
-	if k.isPath() != w.pathKeys {
-		return false
-	}
 	r := w.meta.get(k)
 	if r == nil {
 		return false
 	}
-	if w.pathKeys {
+	if k.isPath() {
 		// A link lives in a directory, so the directory decides for it.
 		return k.path != "." && w.entryGoneLocked(k.path)
 	}
@@ -457,7 +467,17 @@ func (w *Workspace) orphanedLocked(k recKey) bool {
 		}
 		info = p.info
 	}
-	return w.keyed(info) && w.keyOf(hint, info).id != k.id
+	if !hasIdentity(info) || w.keyOf(hint, info).id == k.id {
+		return false
+	}
+	if k.isName() {
+		return true
+	}
+	// An unrecorded file of the same kind at the hint is probably a host
+	// editor save between two passes. The record moves to it, unless adopt
+	// declines.
+	w.recOf(hint, info)
+	return w.meta.get(k) != nil
 }
 
 // entryGoneLocked reports whether the host proves that the guest path rel does

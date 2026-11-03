@@ -22,7 +22,10 @@ import (
 )
 
 func sampleRecords() []metaOp {
-	id := fileKey{dev: 0, ino: 1 << 40, ino2: 17, btime: 1_700_000_000_123_456_789}
+	id := fileKey{dev: 0, ino: 1 << 40, ino2: 17}
+	if keysCarryBirthTime {
+		id.btime = 1_700_000_000_123_456_789
+	}
 	full := &rec{
 		attr: POSIXAttr{
 			Mode: linux.S_IFREG | 0o751, UID: 1000, GID: 2000, Rdev: 5<<32 | 6,

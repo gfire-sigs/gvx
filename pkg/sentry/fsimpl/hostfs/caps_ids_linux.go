@@ -16,7 +16,13 @@
 
 package hostfs
 
-import "z.gfire.dev/gvx/internal/xsys/unix"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"z.gfire.dev/gvx/internal/xsys/unix"
+)
 
 // Magic numbers of file systems whose inode numbers do not identify a file
 // across a rename or a remount: the number comes from the position of the
@@ -34,10 +40,16 @@ const (
 	fsMagic9P    = 0x01021997
 )
 
+// keysCarryBirthTime reports whether the identity that a stat returns holds the
+// birth time. ext4 reuses an inode number at the next create, and utimensat
+// never changes the birth time, so the Linux key holds it.
+const keysCarryBirthTime = true
+
 // reuseProbeRounds is the number of create and unlink rounds that the identity
 // probe runs. ext4 reuses an inode number at the next create, and it stamps the
 // birth time from a clock that can be coarse on an older kernel. Two files
-// with one inode number and one birth time would share a key.
+// with one inode number and one birth time would share a key. A round costs
+// four system calls: open, statx, close, and unlink.
 const reuseProbeRounds = 64
 
 // volumeIDsTrusted reports whether the volume of the workspace root gives its
@@ -57,12 +69,15 @@ func volumeIDsTrusted(host hostBackend, readOnly bool) bool {
 }
 
 // noRepeatedKeys creates and removes probe files and reports whether every key
-// is new. A read-only workspace cannot create probe files, so it skips the loop.
+// is new. The probe runs once for each open of a writable workspace. A
+// read-only workspace cannot create probe files, so it skips the loop. The
+// probe files have an internal name that the guest never sees, and the sweep at
+// the next open removes the file of a killed process.
 func noRepeatedKeys(host hostBackend) bool {
-	base := probeBase()
+	name := fmt.Sprintf("%sprobe.%x.%x", ephemeralTmpPrefix, os.Getpid(), time.Now().UnixNano())
 	seen := make(map[fileKey]struct{}, reuseProbeRounds)
 	for range reuseProbeRounds {
-		f, remove, err := createProbeFile(host, base+"r")
+		f, remove, err := createProbeFile(host, name)
 		if err != nil {
 			return true
 		}

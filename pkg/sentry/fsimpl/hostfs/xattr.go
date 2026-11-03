@@ -154,18 +154,21 @@ func (w *Workspace) metaXattrsLocked(t xattrTarget) map[string][]byte {
 
 // targetKeyLocked returns the key of the record of the named object t. A file
 // reads its identity from the inode, which a rename never changes. A virtual
-// symbolic link and a table that keys on paths read the path of the call.
+// symbolic link and an object that keys on its path read the path of the call.
 // Callers hold w.mu.
 func (w *Workspace) targetKeyLocked(t xattrTarget) recKey {
-	if t.ino.virtual || w.pathKeys {
-		if t.ino.virtual {
-			k, _ := w.nameKeyLocked(t.rel)
-			return k
-		}
+	if t.ino.virtual {
+		k, _ := w.nameKeyLocked(t.rel)
+		return k
+	}
+	if w.pathKeys {
 		return recKey{kind: kindPath, path: t.rel}
 	}
-	if k := t.ino.snapshot().key; k != (recKey{}) {
+	switch k := t.ino.snapshot().key; k.kind {
+	case kindInode:
 		return k
+	case kindPath:
+		return recKey{kind: kindPath, path: t.rel}
 	}
 	if e, err := w.lookupLocked(t.rel); err == nil {
 		return e.key
@@ -207,7 +210,7 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 	t.ino.cur.attr.Xattrs = next
 	t.ino.cur.attr.Ctime = now
 	t.ino.attrMu.Unlock()
-	if w.pathKeys && e.info.nlink > 1 && !e.isDir() && !e.virtual {
+	if e.key.isPath() && e.info.nlink > 1 && !e.isDir() && !e.virtual {
 		if err := w.propagateLinkAttrLocked(t.rel, e.info.id, attr); err != nil {
 			return translateHostError(err)
 		}
