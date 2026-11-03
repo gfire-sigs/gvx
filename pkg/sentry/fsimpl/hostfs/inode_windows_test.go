@@ -718,7 +718,7 @@ func TestWindowsHostCaseMismatchIsNotExist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readDir(Dir) = %v", err)
 	}
-	if want := []hostDirEntry{{name: "Case.txt", kind: hostKindRegular}}; !slices.Equal(entries, want) {
+	if want := []hostDirEntry{{name: "Case.txt", kind: hostKindRegular}}; !slices.Equal(withoutIno(entries), want) {
 		t.Errorf("readDir(Dir) = %v, want %v", entries, want)
 	}
 }
@@ -807,7 +807,7 @@ func TestWindowsHostRefusesReparseComponents(t *testing.T) {
 			if err != nil {
 				t.Fatalf("readDir(.) = %v", err)
 			}
-			if want := []hostDirEntry{{name: "real", kind: hostKindDir}, {name: "via", kind: wantKind}}; !slices.Equal(entries, want) {
+			if want := []hostDirEntry{{name: "real", kind: hostKindDir}, {name: "via", kind: wantKind}}; !slices.Equal(withoutIno(entries), want) {
 				t.Errorf("readDir(.) = %v, want %v", entries, want)
 			}
 
