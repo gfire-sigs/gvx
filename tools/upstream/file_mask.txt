@@ -83,6 +83,7 @@ PROTECT pkg/memutil/*_xplat*
 PROTECT pkg/sentry/kernel/*_xplat*
 PROTECT pkg/sentry/mm/*_xplat*
 PROTECT pkg/sentry/platform/*_xplat*
+PROTECT pkg/sentry/syscalls/linux/*_xplat*
 PROTECT pkg/sync/*_xplat*
 PROTECT pkg/syserr/*_xplat*
 

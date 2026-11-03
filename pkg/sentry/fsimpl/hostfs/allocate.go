@@ -46,6 +46,10 @@ import (
 // zeroChunk is the write size of the zero-fill emulation.
 const zeroChunk = 64 << 10
 
+// ServesFallocateModes marks the description for the fallocate system call. The
+// call forwards a mode other than 0 only to a description with this method.
+func (fd *regularFD) ServesFallocateModes() {}
+
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	const supported = linux.FALLOC_FL_KEEP_SIZE | linux.FALLOC_FL_PUNCH_HOLE

@@ -98,6 +98,11 @@ seam pkg/tcpip/network/ipv4/ipv4.go
 # (pkg/sentry/syscalls/linux/sys_inotify.go). hostfs returns ENOSPC above 8192 watched objects.
 seam pkg/sentry/syscalls/linux/sys_inotify.go
 
+# Content seam: fallocate(2) forwards a mode other than 0 to a file description that serves it
+# (pkg/sentry/syscalls/linux/sys_file.go and sys_file_xplat.go). ext4lite and hostfs serve the
+# modes KEEP_SIZE, PUNCH_HOLE, and, on ext4lite, ZERO_RANGE, COLLAPSE_RANGE, and INSERT_RANGE.
+seam pkg/sentry/syscalls/linux/sys_file.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin

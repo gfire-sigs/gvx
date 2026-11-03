@@ -1722,8 +1722,8 @@ func Fallocate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	if !file.IsWritable() {
 		return 0, nil, linuxerr.EBADF
 	}
-	if mode != 0 {
-		return 0, nil, linuxerr.ENOTSUP
+	if err := checkFallocateMode(file, mode, offset, length); err != nil {
+		return 0, nil, err
 	}
 	if offset < 0 || length <= 0 {
 		return 0, nil, linuxerr.EINVAL
@@ -1734,7 +1734,9 @@ func Fallocate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		return 0, nil, linuxerr.EFBIG
 	}
 	limit := limits.FromContext(t).Get(limits.FileSize).Cur
-	if uint64(size) >= limit {
+	// A mode other than 0 checks the limit itself, because only a call that grows
+	// the file reaches it.
+	if mode == 0 && uint64(size) >= limit {
 		t.SendSignal(&linux.SignalInfo{
 			Signo: int32(linux.SIGXFSZ),
 			Code:  linux.SI_USER,
