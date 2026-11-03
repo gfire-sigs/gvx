@@ -74,10 +74,6 @@ import (
 //     inotify_add_watch on the same file brings it back.
 
 const (
-	// maxWatchedDentries bounds the objects that one Workspace watches on the
-	// host. Each directory costs a descriptor on Unix.
-	maxWatchedDentries = 8192
-
 	// defaultPollInterval is the time between two scans of the poll backend.
 	defaultPollInterval = 200 * time.Millisecond
 
@@ -156,6 +152,8 @@ type hostWatcher struct {
 	factory func(*hostWatcher) (watchBackend, error)
 }
 
+// limitLocked returns the cap of watched objects. OpenWorkspace sets it from the
+// host. A zero value stands for the largest cap.
 func (hw *hostWatcher) limitLocked() int {
 	if hw.limit == 0 {
 		return maxWatchedDentries

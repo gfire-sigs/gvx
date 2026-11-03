@@ -50,6 +50,12 @@ func (v *volume) updateOrphans(p *flushPlan, dirty []*node) {
 			delete(v.orphans, n.ino)
 			n.mu.Lock()
 			n.orphan = false
+			if !n.deleted {
+				// A linkat gave the node a name again. An inode in use has no
+				// deletion time, and the snapshot above wrote the old one.
+				n.dtime = 0
+				p.inodes = append(p.inodes, n.serializeLocked())
+			}
 			n.mu.Unlock()
 			changed = true
 		}

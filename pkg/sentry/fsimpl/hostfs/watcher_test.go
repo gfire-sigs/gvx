@@ -720,14 +720,21 @@ func TestHostWatcherCapRefusesTheExtraWatch(t *testing.T) {
 	}
 }
 
-// TestHostWatcherDefaultCapIs8192 fills a workspace to the real cap with
-// placeholder entries. The 8193rd object gets ENOSPC and a watched one passes.
-func TestHostWatcherDefaultCapIs8192(t *testing.T) {
-	if maxWatchedDentries != 8192 {
-		t.Fatalf("maxWatchedDentries = %d, want 8192", maxWatchedDentries)
-	}
+// TestHostWatcherDefaultCapComesFromTheHost fills a workspace to the cap that a
+// real open gives it, with placeholder entries. The next object gets ENOSPC and a
+// watched one passes.
+func TestHostWatcherDefaultCapComesFromTheHost(t *testing.T) {
 	w := newWatchEnv(t)
 	hw := &w.ws.watch
+	hw.mu.Lock()
+	limit := hw.limitLocked()
+	hw.mu.Unlock()
+	if want := hostWatchLimit(); limit != want {
+		t.Fatalf("cap of a new workspace = %d, want %d from the host", limit, want)
+	}
+	if limit < minWatchedDentries || limit > maxWatchedDentries {
+		t.Fatalf("cap %d lies outside [%d, %d]", limit, minWatchedDentries, maxWatchedDentries)
+	}
 	w.mustMkdir("a")
 	w.mustMkdir("b")
 	if err := w.admit("a"); err != nil {
@@ -735,7 +742,7 @@ func TestHostWatcherDefaultCapIs8192(t *testing.T) {
 	}
 	fill := make(map[*inode]*watchEntry)
 	hw.mu.Lock()
-	for len(hw.entries) < maxWatchedDentries {
+	for len(hw.entries) < limit {
 		ino := new(inode)
 		e := new(watchEntry)
 		hw.entries[ino] = e
@@ -751,10 +758,53 @@ func TestHostWatcherDefaultCapIs8192(t *testing.T) {
 	})
 
 	if err := w.admit("b"); !linuxerr.Equals(linuxerr.ENOSPC, err) {
-		t.Fatalf("admit of watch 8193 = %v, want ENOSPC", err)
+		t.Fatalf("admit of watch %d = %v, want ENOSPC", limit+1, err)
 	}
 	if err := w.admit("a"); err != nil {
-		t.Fatalf("admit of a watched object at 8192 = %v, want nil", err)
+		t.Fatalf("admit of a watched object at the cap = %v, want nil", err)
+	}
+}
+
+func TestWatchLimitFollowsTheDescriptorLimit(t *testing.T) {
+	tests := []struct {
+		name     string
+		soft     uint64
+		reserved int
+		want     int
+	}{
+		{"low limit keeps the minimum", 1024, 1024, minWatchedDentries},
+		{"limit below the reserve keeps the minimum", 100, 1024, minWatchedDentries},
+		{"limit between the bounds", 10240, 1024 + 4096, 5120},
+		{"limit with a small reserve", 4096, 1024, 3072},
+		{"large limit takes the maximum", 1 << 20, 1024, maxWatchedDentries},
+		{"unlimited takes the maximum", ^uint64(0), 1024, maxWatchedDentries},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := watchLimitFromNofile(tc.soft, tc.reserved); got != tc.want {
+				t.Fatalf("watchLimitFromNofile(%d, %d) = %d, want %d", tc.soft, tc.reserved, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPollDelayBoundsTheShareOfTheScans(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	tests := []struct {
+		name string
+		pass time.Duration
+		want time.Duration
+	}{
+		{"short pass keeps the interval", 10 * time.Millisecond, interval},
+		{"pass at the break even keeps the interval", interval / pollDutyFactor, interval},
+		{"long pass stretches the delay", 2 * time.Second, pollDutyFactor * 2 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pollDelay(interval, tc.pass); got != tc.want {
+				t.Fatalf("pollDelay(%v, %v) = %v, want %v", interval, tc.pass, got, tc.want)
+			}
+		})
 	}
 }
 

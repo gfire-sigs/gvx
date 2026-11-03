@@ -220,7 +220,7 @@ sequenceDiagram
 
 ### 5.1 Lockdown-Compliant Host Watcher Backends
 
-Every host watcher backend must operate after `hostlockdown.Apply()` without spawning child processes, calling Mach services, or opening unbound paths. `hostWatcher` caps active watched dentries at `8,192` per workspace (`linuxerr.ENOSPC` when exceeded) to prevent host descriptor exhaustion.
+Every host watcher backend must operate after `hostlockdown.Apply()` without spawning child processes, calling Mach services, or opening unbound paths. `hostWatcher` caps active watched dentries per workspace (`linuxerr.ENOSPC` when exceeded) to prevent host descriptor exhaustion. The cap follows `RLIMIT_NOFILE` on Linux and macOS, and it is 32,768 on Windows. See `docs/architecture.md`, "Cap of Watched Objects".
 
 | Host Platform | Kernel Primitive | Lockdown Compliance Mechanism (`pkg/hostlockdown`) | Event Translation to Linux `inotify` |
 | :--- | :--- | :--- | :--- |

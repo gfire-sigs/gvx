@@ -46,6 +46,10 @@ type fsckInode struct {
 	subdirs uint32
 	parent  uint32
 	dotdot  uint32
+	// unlinked is the node of an inode whose link count is zero on the disk.
+	// The home block cannot load such an inode, so the repair installs this node
+	// with the rebuilt count.
+	unlinked *node
 }
 
 // fsckDrop names a directory entry that the repair removes.
@@ -156,6 +160,7 @@ func (v *volume) fsckLite() error {
 	// The loads of neighbouring inodes share one inode table block.
 	var table [blockSize]byte
 	tableBlock := ^uint64(0)
+	zeroOnDisk := make(map[uint32]bool)
 	load := func(ino uint32) (*node, error) {
 		if ino != rootIno && (ino < firstIno || ino > nGroups*inodesPerGroup) {
 			return nil, corrupt("directory entry names inode %d", ino)
@@ -170,9 +175,12 @@ func (v *volume) fsckLite() error {
 		raw := slices.Clone(table[off : off+inodeSize])
 		// A directory entry names the inode, so the inode lives. A crash between
 		// the write of a deleted inode and the write of its directory leaves
-		// such an entry, and the link count is rebuilt below.
+		// such an entry. A crash between the write of a directory entry and the
+		// write of the inode that a link of an unnamed file changed leaves one
+		// too. The link count is rebuilt below.
 		if le.Uint16(raw[inLinks:]) == 0 {
 			le.PutUint16(raw[inLinks:], 1)
+			zeroOnDisk[ino] = true
 		}
 		n, err := v.parseInode(ino, raw)
 		if err != nil {
@@ -208,7 +216,11 @@ func (v *volume) fsckLite() error {
 		if n.fileACL != 0 {
 			xattrOwned[n.fileACL] = true
 		}
-		seen[n.ino] = &fsckInode{mode: n.mode, links: n.links, parent: parent}
+		info := &fsckInode{mode: n.mode, links: n.links, parent: parent}
+		if zeroOnDisk[n.ino] {
+			info.links, info.unlinked = 0, n
+		}
+		seen[n.ino] = info
 		return nil
 	}
 
@@ -375,8 +387,20 @@ func (v *volume) rebuildFromWalk(seen map[uint32]*fsckInode, claimed []bitmap) e
 			return linuxerr.EMLINK
 		}
 		if info.links != want {
-			ino, want := ino, want
+			ino, want, unlinked := ino, want, info.unlinked
 			v.fixups = append(v.fixups, func() error {
+				if unlinked != nil {
+					unlinked.mu.Lock()
+					unlinked.links = want
+					unlinked.markDirtyLocked()
+					unlinked.mu.Unlock()
+					v.nodeMu.Lock()
+					defer v.nodeMu.Unlock()
+					if v.nodes[ino] == nil {
+						v.nodes[ino] = unlinked
+					}
+					return nil
+				}
 				n, err := v.getNode(ino)
 				if err != nil {
 					return err

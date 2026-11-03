@@ -52,6 +52,9 @@ type env struct {
 	fs     *filesystem
 	path   string
 	done   bool
+	// owned holds the descriptions that own registered, until closeOwned
+	// closes them.
+	owned []*vfs.FileDescription
 }
 
 // cookieContext supplies the inotify cookie, the resource limits, and the
@@ -1128,10 +1131,7 @@ func TestFallocate(t *testing.T) {
 	if pos, err := fd.Seek(e.ctx, 0, linux.SEEK_HOLE); err != nil || pos != blockSize {
 		t.Fatalf("SEEK_HOLE after punch = (%d, %v), want %d", pos, err, blockSize)
 	}
-	// Unsupported modes.
-	for _, mode := range []uint64{linux.FALLOC_FL_PUNCH_HOLE, linux.FALLOC_FL_ZERO_RANGE, linux.FALLOC_FL_COLLAPSE_RANGE, linux.FALLOC_FL_INSERT_RANGE} {
-		wantErrno(t, fmt.Sprintf("fallocate mode %#x", mode), fd.Allocate(e.ctx, mode, 0, blockSize), linuxerr.EOPNOTSUPP)
-	}
+	wantErrno(t, "fallocate of a punch without KEEP_SIZE", fd.Allocate(e.ctx, linux.FALLOC_FL_PUNCH_HOLE, 0, blockSize), linuxerr.EOPNOTSUPP)
 	wantErrno(t, "fallocate of length 0", fd.Allocate(e.ctx, 0, 0, 0), linuxerr.EINVAL)
 	ro := e.mustOpen("f", linux.O_RDONLY)
 	defer ro.DecRef(e.ctx)

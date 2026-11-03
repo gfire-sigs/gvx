@@ -405,6 +405,9 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		single:           single,
 		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
 	}
+	// The query runs here because the Linux filter after the lockdown does not
+	// allow getrlimit.
+	w.watch.limit = hostWatchLimit()
 	if w.pathKeys {
 		w.rootKey = recKey{kind: kindPath, path: "."}
 	} else {

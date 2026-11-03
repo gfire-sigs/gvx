@@ -17,6 +17,8 @@
 package hostfs
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"testing"
 	"unsafe"
@@ -165,5 +167,137 @@ func TestWindowsExchangeLeavesNoSwapFile(t *testing.T) {
 		if isEphemeralName(name) {
 			t.Fatalf("host entry %q is left behind", name)
 		}
+	}
+}
+
+// hostAllocation returns the allocation size and the end of file that NTFS
+// reports for the host file p, and whether the file is sparse.
+func hostAllocation(t *testing.T, e *env, p string) (allocation, size int64, sparse bool) {
+	t.Helper()
+	f, err := os.Open(e.host(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	var info fileStandardInfo
+	if err := windows.GetFileInformationByHandleEx(windows.Handle(f.Fd()), windows.FileStandardInfo,
+		(*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		t.Fatal(err)
+	}
+	var basic fileBasicInfo
+	if err := windows.GetFileInformationByHandleEx(windows.Handle(f.Fd()), windows.FileBasicInfo,
+		(*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic))); err != nil {
+		t.Fatal(err)
+	}
+	return info.AllocationSize, info.EndOfFile, basic.FileAttributes&windows.FILE_ATTRIBUTE_SPARSE_FILE != 0
+}
+
+// requireSparseVolume skips the test on a volume without sparse files.
+func requireSparseVolume(t *testing.T, e *env) {
+	t.Helper()
+	f, err := os.Open(e.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	var flags uint32
+	if err := windows.GetVolumeInformationByHandle(windows.Handle(f.Fd()), nil, 0, nil, nil, &flags, nil, 0); err != nil {
+		t.Fatalf("GetVolumeInformationByHandle: %v", err)
+	}
+	if flags&windows.FILE_SUPPORTS_SPARSE_FILES == 0 {
+		t.Skip("the volume of the test directory has no sparse files")
+	}
+}
+
+// TestWindowsPunchHoleFreesTheClusters punches a hole of whole clusters and
+// reads the allocation size of the host file before and after. The size must
+// drop by the length of the hole, and the file must keep its end of file and
+// its bytes outside the hole.
+func TestWindowsPunchHoleFreesTheClusters(t *testing.T) {
+	e := newEnv(t)
+	requireSparseVolume(t, e)
+	const (
+		length  = 4 << 20
+		holeOff = 1 << 20
+		holeLen = 2 << 20
+		// NTFS frees a sparse file in units of 64 KiB, so a hole between two
+		// aligned offsets frees all of it.
+		slack = 64 << 10
+	)
+	content := bytes.Repeat([]byte{0xAB}, length)
+	e.writeFile("f", content)
+	fd := e.mustOpen("f", linux.O_RDWR)
+	defer fd.DecRef(e.ctx)
+	before, _, sparse := hostAllocation(t, e, "f")
+	if sparse {
+		t.Fatal("the file is sparse before the punch")
+	}
+	if before < length {
+		t.Fatalf("allocation size %d before the punch, want at least %d: the test needs a dense file", before, length)
+	}
+
+	if err := allocate(e, fd, punch, holeOff, holeLen); err != nil {
+		t.Fatalf("punch of whole clusters: %v", err)
+	}
+	after, size, sparse := hostAllocation(t, e, "f")
+	if !sparse {
+		t.Error("the file is not sparse after the punch")
+	}
+	if size != length {
+		t.Errorf("end of file %d after the punch, want %d", size, length)
+	}
+	if freed := before - after; freed < holeLen-slack {
+		t.Errorf("the punch freed %d bytes, want about %d: the hole must release its clusters", freed, holeLen)
+	}
+	want := bytes.Clone(content)
+	clear(want[holeOff : holeOff+holeLen])
+	if got := e.pread(fd, 0, length); !bytes.Equal(got, want) {
+		t.Fatal("the content after the punch differs: the hole must read as zeros and the rest must stay")
+	}
+}
+
+// TestWindowsPunchHolePastTheEndKeepsTheSize punches a range that runs past
+// the end of file. The call frees what the file holds and does not move the end
+// of file.
+func TestWindowsPunchHolePastTheEndKeepsTheSize(t *testing.T) {
+	e := newEnv(t)
+	requireSparseVolume(t, e)
+	const length = 1 << 20
+	e.writeFile("f", bytes.Repeat([]byte{0xCD}, length))
+	fd := e.mustOpen("f", linux.O_RDWR)
+	defer fd.DecRef(e.ctx)
+	if err := allocate(e, fd, punch, length/2, 8<<20); err != nil {
+		t.Fatalf("punch past the end: %v", err)
+	}
+	if _, size, _ := hostAllocation(t, e, "f"); size != length {
+		t.Fatalf("end of file %d after the punch, want %d", size, length)
+	}
+	if got := e.mustStat("f").Size; got != length {
+		t.Fatalf("size %d after the punch, want %d", got, length)
+	}
+}
+
+// TestWindowsPunchHoleErrorsSelectTheFallback checks which host errors send a
+// punch to the zero-fill emulation. A volume without sparse files and a file
+// with a full attribute list take it. Any other failure reaches the guest.
+func TestWindowsPunchHoleErrorsSelectTheFallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		fallback bool
+	}{
+		{"volume without sparse files", windows.ERROR_INVALID_FUNCTION, true},
+		{"operation not supported", windows.ERROR_NOT_SUPPORTED, true},
+		{"attribute list is full", windows.ERROR_FILE_SYSTEM_LIMITATION, true},
+		{"wrapped attribute list error", fmt.Errorf("zero data: %w", windows.ERROR_FILE_SYSTEM_LIMITATION), true},
+		{"volume is full", windows.ERROR_DISK_FULL, false},
+		{"access denied", windows.ERROR_ACCESS_DENIED, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sparseUnsupported(tc.err); got != tc.fallback {
+				t.Fatalf("sparseUnsupported(%v) = %v, want %v", tc.err, got, tc.fallback)
+			}
+		})
 	}
 }

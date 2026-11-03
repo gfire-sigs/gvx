@@ -52,6 +52,10 @@ const (
 	// kqueueMaxRegistrations bounds the descriptors that the backend holds.
 	kqueueMaxRegistrations = 4096
 
+	// watchBackendDescriptors is the number of descriptors that the backend
+	// can hold besides the pinned handles. See watchLimitFromNofile.
+	watchBackendDescriptors = kqueueMaxRegistrations
+
 	// vnodeNotes is the set of vnode changes that wake a scan.
 	vnodeNotes = unix.NOTE_WRITE | unix.NOTE_EXTEND | unix.NOTE_ATTRIB | unix.NOTE_DELETE |
 		unix.NOTE_RENAME | unix.NOTE_LINK | unix.NOTE_REVOKE
@@ -357,7 +361,8 @@ func (b *kqBackend) run() {
 				due[r.e] = struct{}{}
 			}
 		}
-		if polling && !time.Now().Before(next) {
+		polled := polling && !time.Now().Before(next)
+		if polled {
 			for e := range b.fallback {
 				due[e] = struct{}{}
 			}
@@ -369,6 +374,7 @@ func (b *kqBackend) run() {
 			list = append(list, e)
 		}
 		slices.SortFunc(list, func(x, y *watchEntry) int { return cmp.Compare(x.seq, y.seq) })
+		start := time.Now()
 		for _, e := range list {
 			b.mu.Lock()
 			closed := b.closed
@@ -377,6 +383,10 @@ func (b *kqBackend) run() {
 				return
 			}
 			e.rescan()
+		}
+		if polled {
+			// The scans of the fallback set take a bounded share of one core.
+			next = time.Now().Add(pollDelay(interval, time.Since(start)))
 		}
 	}
 }

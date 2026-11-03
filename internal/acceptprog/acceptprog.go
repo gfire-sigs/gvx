@@ -54,6 +54,7 @@ const (
 
 	goStaticPackage    = "z.gfire.dev/gvx/internal/acceptprog/gostatic"
 	volTreePackage     = "z.gfire.dev/gvx/internal/acceptprog/voltree"
+	fsFeaturesPackage  = "z.gfire.dev/gvx/internal/acceptprog/fsfeatures"
 	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
 	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
@@ -202,6 +203,26 @@ func BuildVolumeTree(tb testing.TB, goarch string) string {
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
 	if msg, err := cmd.CombinedOutput(); err != nil {
 		tb.Fatalf("build the volume guest for linux/%s: %v\n%s", goarch, err, msg)
+	}
+	return out
+}
+
+// BuildFSFeatures compiles the guest program fsfeatures for the Linux
+// architecture goarch and returns the path of the executable. The program
+// checks O_TMPFILE, the fallocate modes, and the flags of preadv2 and pwritev2
+// on a mounted file system.
+func BuildFSFeatures(tb testing.TB, goarch string) string {
+	tb.Helper()
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
+	}
+	out := filepath.Join(tb.TempDir(), "fsfeatures")
+	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags=-linkmode=internal", fsFeaturesPackage)
+	cmd.Dir = moduleRoot(tb)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		tb.Fatalf("build the file system feature guest for linux/%s: %v\n%s", goarch, err, msg)
 	}
 	return out
 }

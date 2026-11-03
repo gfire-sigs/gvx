@@ -364,9 +364,9 @@ type mapPlan struct {
 
 // planLocked plans the mapping of the file blocks that [start, end) covers. A
 // hole takes fresh blocks. The fresh blocks are zeroed where the range covers
-// them only in part, or everywhere when zeroAll is set. An uninitialized block
-// in the range becomes initialized, unless zeroAll is set. The caller holds
-// n.mu for writing.
+// them only in part. With zeroAll, the fresh blocks are uninitialized and
+// nothing is zeroed or initialized. Without it, an uninitialized block in the
+// range becomes initialized. The caller holds n.mu for writing.
 func (n *node) planLocked(start, end uint64, zeroAll bool) mapPlan {
 	lb0, lb1 := uint32(start/blockSize), uint32((end+blockSize-1)/blockSize)
 	p := mapPlan{limit: end}
@@ -411,13 +411,24 @@ func (n *node) planLocked(start, end uint64, zeroAll bool) mapPlan {
 // ends at holeEnd. It records the run in p and returns the next file block. On
 // failure it records the error and the limit, and it returns cur.
 func (n *node) fillLocked(p *mapPlan, cur, holeEnd uint32, start, end uint64, zeroAll bool) uint32 {
+	if zeroAll {
+		// A reservation maps uninitialized blocks, as Linux does. They read as
+		// zeros without a write, and e2fsck accepts them behind the end of file.
+		blk, got, err := n.v.allocBlocks(n.goalLocked(p.fresh, cur), min(holeEnd-cur, maxUninitExtentLen))
+		if err != nil {
+			p.stop(cur, err)
+			return cur
+		}
+		p.fresh = append(p.fresh, extent{lblk: cur, n: got, pblk: blk, uninit: true})
+		return cur + got
+	}
 	blk, got, err := n.v.allocBlocks(n.goalLocked(p.fresh, cur), min(holeEnd-cur, maxExtentLen))
 	if err != nil {
 		p.stop(cur, err)
 		return cur
 	}
 	e := extent{lblk: cur, n: got, pblk: blk}
-	if err := n.zeroEdges(e, start, end, zeroAll); err != nil {
+	if err := n.zeroEdges(e, start, end); err != nil {
 		p.stop(cur, joinCleanup(err, n.v.freeBlocks(blk, got)))
 		return cur
 	}
@@ -454,19 +465,8 @@ func (n *node) goalLocked(fresh []extent, cur uint32) uint64 {
 
 // zeroEdges clears the first and the last block of a new extent when the write
 // range [start, end) covers that block only in part. The blocks in the
-// middle of the write get all their bytes from the write. With zeroAll, it
-// clears every block of the extent, as fallocate needs.
-func (n *node) zeroEdges(e extent, start, end uint64, zeroAll bool) error {
-	if zeroAll {
-		zero := make([]byte, 1<<20)
-		for off := uint64(0); off < uint64(e.n)*blockSize; off += uint64(len(zero)) {
-			chunk := zero[:min(uint64(len(zero)), uint64(e.n)*blockSize-off)]
-			if _, err := n.v.hf.WriteAt(chunk, int64(e.pblk)*blockSize+int64(off)); err != nil {
-				return hostError(err)
-			}
-		}
-		return nil
-	}
+// middle of the write get all their bytes from the write.
+func (n *node) zeroEdges(e extent, start, end uint64) error {
 	zero := make([]byte, blockSize)
 	for _, l := range []uint32{e.lblk, e.end() - 1} {
 		bs, be := uint64(l)*blockSize, uint64(l+1)*blockSize
@@ -642,7 +642,7 @@ func (n *node) punchHole(off, length uint64) error {
 	return nil
 }
 
-// preallocate maps blocks for [off, off+length) and fills new blocks with
+// preallocate maps uninitialized blocks for [off, off+length), which read as
 // zeros. The size grows unless keepSize is set. A failed allocation keeps the
 // blocks that it mapped, as Linux does, and it leaves the size as it was.
 func (n *node) preallocate(off, length uint64, keepSize bool) error {

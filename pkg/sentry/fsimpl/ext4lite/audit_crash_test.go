@@ -94,7 +94,9 @@ func auRecoveredProblems(res *auResult, durable, final *auModel, relaxed bool) [
 		}
 		ok := false
 		for id := range ids {
-			if auOwnBytes(e.data, id) {
+			// A collapse and an insert move bytes to other offsets of the same
+			// file, so the offset rule of auOwnBytes does not hold for it.
+			if final.loose[id] || auOwnBytes(e.data, id) {
 				ok = true
 				break
 			}
@@ -419,6 +421,8 @@ var auCrashTests = []auCrashCase{
 			auRandomOps(d, auSeed("mixed-random-crash"), 70, true)
 		},
 	},
+	auFallocateCase(),
+	auTmpfileCase(),
 }
 
 // TestAuditCrashProcess crashes after every call that reaches the host file.
