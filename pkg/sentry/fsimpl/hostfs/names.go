@@ -370,6 +370,21 @@ func (p hostProbe) missingError(rel string) error {
 	return fs.ErrNotExist
 }
 
+// locatePathLocked finds the host entry of the guest path rel by a walk from
+// the workspace root. It never depends on a pinned handle, so it sees a
+// directory that a host process replaced. It does not handle the workspace
+// root. Callers hold w.mu.
+func (w *Workspace) locatePathLocked(rel string) (hostProbe, error) {
+	parent, name := splitParent(rel)
+	hostDir, err := w.hostPath(parent)
+	if err != nil {
+		return hostProbe{}, err
+	}
+	return w.locateIn(parent, name, nil, true, func(leaf string) (hostInfo, error) {
+		return w.host.lstat(hostChild(hostDir, leaf))
+	})
+}
+
 // storedMatch is the answer of resolveStored.
 type storedMatch struct {
 	found    bool

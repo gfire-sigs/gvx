@@ -41,8 +41,8 @@ func isNotExist(err error) bool {
 // object no longer exists: a record of a file or directory whose host entry is
 // gone, and a virtual symlink whose parent directory is gone. A record
 // survives every other host answer, because a transient host error must never
-// delete state. It returns the number of removed records. Callers hold w.mu
-// for writing.
+// delete state. A call stops at the end of one cycle through the table. It
+// returns the number of removed records. Callers hold w.mu for writing.
 func (w *Workspace) pruneOrphansLocked(limit int) int {
 	if w.readOnly {
 		return 0
@@ -56,17 +56,17 @@ func (w *Workspace) pruneOrphansLocked(limit int) int {
 
 // pruneOrphans is pruneOrphansLocked for a caller that holds no lock. It takes
 // w.mu for one record at a time, so a batch never stalls the guest for longer
-// than one host lookup. The check and the removal of a record happen under one
-// lock hold, so a record that the guest recreates meanwhile survives.
+// than one record check. The check and the removal of a record happen under
+// one lock hold, so a record that the guest recreates meanwhile survives.
 func (w *Workspace) pruneOrphans(limit int) {
 	if w.readOnly {
 		return
 	}
 	removed := 0
-	parentGone := make(map[string]bool)
 	for checked := 0; checked < limit; checked++ {
 		w.mu.Lock()
-		more := !w.closed && w.pruneNextLocked(parentGone, &removed)
+		// A verdict about a parent directory holds only for this lock hold.
+		more := !w.closed && w.pruneNextLocked(make(map[string]bool), &removed)
 		w.mu.Unlock()
 		if !more {
 			return
@@ -75,11 +75,11 @@ func (w *Workspace) pruneOrphans(limit int) {
 }
 
 // pruneNextLocked checks the next record of the prune cycle and removes it
-// when its host object is gone. It adds one to removed for a removal, and it
-// reports false when the table is empty. A cycle reads the keys once and
-// resumes where the last call stopped, so every record gets checked in turn.
-// parentGone caches the verdict for parent directories. Callers hold w.mu for
-// writing.
+// when its host object is gone. It adds one to removed for a removal. It
+// reports whether the cycle has more records. A cycle reads the keys once and
+// resumes where the last call stopped, so every record gets checked in turn,
+// and a small table costs one check for each record at most. parentGone caches
+// the verdict for parent directories. Callers hold w.mu for writing.
 func (w *Workspace) pruneNextLocked(parentGone map[string]bool, removed *int) bool {
 	if w.pruneCursor >= len(w.pruneKeys) {
 		w.pruneKeys = w.pruneKeys[:0]
@@ -98,15 +98,14 @@ func (w *Workspace) pruneNextLocked(parentGone map[string]bool, removed *int) bo
 		w.delMetaLocked(k)
 		*removed++
 	}
-	return true
+	return w.pruneCursor < len(w.pruneKeys)
 }
 
 // recordOrphanLocked reports whether the record of key k has lost its host
 // object. parentGone caches the verdict for parent directories.
 func (w *Workspace) recordOrphanLocked(k string, m POSIXAttr, parentGone map[string]bool) bool {
 	if m.Symlink == "" {
-		p, err := w.locateLocked(k)
-		return err == nil && !p.found && !p.collided && isNotExist(p.err)
+		return w.entryGoneLocked(k)
 	}
 	parent, _ := splitParent(k)
 	if parent == "." {
@@ -114,11 +113,25 @@ func (w *Workspace) recordOrphanLocked(k string, m POSIXAttr, parentGone map[str
 	}
 	gone, known := parentGone[parent]
 	if !known {
-		p, err := w.locateLocked(parent)
-		gone = err == nil && !p.found && !p.collided && isNotExist(p.err)
+		gone = w.entryGoneLocked(parent)
 		parentGone[parent] = gone
 	}
 	return gone
+}
+
+// entryGoneLocked reports whether the host proves that the guest path rel does
+// not exist. The check goes through the pinned directory first. A cached pin
+// can name a directory that a host process replaced, and its answer then
+// misses a live entry. A deletion needs more than that answer, so a missing
+// entry gets a second check by a walk from the workspace root. Callers hold
+// w.mu.
+func (w *Workspace) entryGoneLocked(rel string) bool {
+	p, err := w.locateLocked(rel)
+	if err != nil || p.found || p.collided || !isNotExist(p.err) {
+		return false
+	}
+	p, err = w.locatePathLocked(rel)
+	return err == nil && !p.found && !p.collided && isNotExist(p.err)
 }
 
 // sweepEphemeral unlinks the internal files that a killed process left

@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"os"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -350,17 +351,29 @@ func TestOpenWorkspacePrunesRecordsOfMissingHostObjects(t *testing.T) {
 	}
 }
 
-// failLstatHost fails the lstat of one path with a transient error.
+// failLstatHost fails the lstat of one workspace-root entry with a transient
+// error, by path and through the pinned root directory. It counts the failures
+// that it injected.
 type failLstatHost struct {
 	hostBackend
-	rel string
+	name string
+	hits *atomic.Int32
 }
 
 func (f failLstatHost) lstat(rel string) (hostInfo, error) {
-	if rel == f.rel {
+	if rel == f.name {
+		f.hits.Add(1)
 		return hostInfo{}, fmt.Errorf("lstat %q: %w", rel, fs.ErrPermission)
 	}
 	return f.hostBackend.lstat(rel)
+}
+
+func (f failLstatHost) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
+	if dir == f.hostBackend.rootDir() && name == f.name {
+		f.hits.Add(1)
+		return hostInfo{}, fmt.Errorf("lstat %q: %w", name, fs.ErrPermission)
+	}
+	return f.hostBackend.lstatAt(dir, name)
 }
 
 func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
@@ -373,8 +386,9 @@ func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var hits atomic.Int32
 	flaky := opts
-	flaky.wrapHost = func(b hostBackend) hostBackend { return failLstatHost{b, "b"} }
+	flaky.wrapHost = func(b hostBackend) hostBackend { return failLstatHost{b, "b", &hits} }
 	ws, err := openWorkspace(e.dir, false, flaky)
 	if err != nil {
 		t.Fatal(err)
@@ -382,6 +396,9 @@ func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
 	defer func() { _ = ws.Close() }()
 	// The lstat of "b" failed with a permission error, so its record stays.
 	// The record of the missing file goes.
+	if hits.Load() == 0 {
+		t.Fatal("the prune never looked up b, so the test proves nothing")
+	}
 	if got := metaKeys(ws); !slices.Equal(got, []string{"b"}) {
 		t.Fatalf("records after open = %q, want [b]", got)
 	}
