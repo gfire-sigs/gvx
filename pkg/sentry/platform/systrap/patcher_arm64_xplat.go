@@ -25,14 +25,14 @@ import (
 
 // The arm64 patcher rewrites four instruction classes of a Linux guest.
 //
-// The macOS kernel runs a guest `svc #0` as a host system call and clobbers
-// TPIDR_EL0 on every preemption, so each of those instructions needs a
-// replacement. `svc #0` and `msr tpidr_el0, xN` become a branch to a trap slot
-// that spills the guest state to the Sentry. `mrs xN, tpidr_el0` becomes a
-// branch to a slot that reads the virtual TLS word of the thread. A Linux
-// kernel lets EL0 read CTR_EL0, and compilers and JIT engines read it to size
-// their cache maintenance loops. macOS raises SIGILL on that read, so
-// `mrs xN, ctr_el0` becomes a branch to a slot that loads a constant.
+// The host kernel runs a guest `svc #0` as a host system call, so the
+// instruction needs a replacement. `svc #0` becomes a branch to a trap slot
+// that spills the guest state to the Sentry. `msr tpidr_el0, xN` becomes a
+// trap, and `mrs xN, tpidr_el0` becomes a branch to a slot that reads the
+// virtual TLS word of the thread. A Linux kernel lets EL0 read CTR_EL0, and
+// compilers and JIT engines read it to size their cache maintenance loops. The
+// host raises an illegal instruction on that read, so `mrs xN, ctr_el0`
+// becomes a branch to a slot that loads a constant.
 const (
 	arm64SVC0       = hvcommon.SVC0
 	arm64MRSTPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
@@ -46,11 +46,12 @@ const (
 	arm64MRSTPIDRRO = 0xd53bd060 // mrs xN, tpidrro_el0
 	arm64ANDxMinus8 = 0x927df000 // and xN, xN, #0xfffffffffffffff8
 
-	// arm64ScratchReg is the hardware x18 register, which holds no guest value
-	// on macOS because scanX18 moves guest x18 accesses to sysmsg.X18.
+	// arm64ScratchReg is the register that the slots of encodeTrapSlot use to
+	// name the sysmsg.
 	arm64ScratchReg = 18
 
-	// trapScratchOffset is the byte offset of sysmsg.Scratch on macOS arm64.
+	// trapScratchOffset is the byte offset of sysmsg.Scratch in the sysmsg that
+	// encodeTrapSlot names.
 	trapScratchOffset = 928
 
 	// arm64BranchRange is the reach of a B instruction: plus or minus 128MiB.
