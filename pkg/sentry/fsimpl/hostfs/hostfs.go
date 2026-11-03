@@ -235,6 +235,10 @@ type Workspace struct {
 	// plain encoding of its guest name: the volume folds case or normalizes
 	// Unicode.
 	stateful bool
+	// countsDirLinks reports that hostfs counts the subdirectories of a
+	// directory for its link count, because the host does not. See
+	// dirlinks.go.
+	countsDirLinks bool
 	// clutter selects the host shell files that guest listings hide.
 	clutter clutterRules
 	// handles tracks the open regular-file handles when the host locks an
@@ -278,6 +282,9 @@ type workspaceOptions struct {
 	// journalSlack replaces the slack of the journal bound. Tests use it to
 	// reach a compaction with few records.
 	journalSlack int
+	// countDirLinks makes hostfs count directory links on every host, as it
+	// does on NTFS.
+	countDirLinks bool
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files.
@@ -368,6 +375,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		caps:             caps,
 		codec:            newNameCodec(caps),
 		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
+		countsDirLinks:   !hostCountsDirLinks || opts.countDirLinks,
 		clutter:          clutterRulesFor(hostOS),
 		maxMeta:          metaLimit(opts.maxMeta),
 		journal:          metaJournal{slack: opts.journalSlack},
