@@ -99,5 +99,5 @@ jobs:
           go test -count=1 -timeout 80m \
             -run '^(TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)|TestE2EStdioReopenThroughDeviceNames)$/^whpx$' \
             ./e2e
-          go test -count=1 -timeout 30m -run '^TestE2EDockerRun.*$/^whpx$' ./e2e
+          go test -count=1 -timeout 30m -run '^(TestE2EDockerRun.*|TestE2EMemoryCgroup.*)$/^whpx$' ./e2e
           go test -count=1 -timeout 40m -run '^TestE2EGateETExec.*$/^whpx$' ./e2e

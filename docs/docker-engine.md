@@ -151,10 +151,27 @@ Use the `ext4lite` volume unless you need the files as host files. The volume im
 | Published host ports | Fixed at the start. A container port outside the published range is reachable only inside the sandbox. |
 | Guest architecture | The engine runs images for the host architecture. On Apple Silicon, it runs `linux/arm64` images. |
 | `10.0.2.15` from a container | A `bridge` container cannot connect to the `eth0` address of the sandbox. Use the container address or a user-defined network. |
-| `--userland-proxy=false` | `dockerd` fails to start with it. Keep the default. |
-| `docker stats` | Shows `0B` for the memory of a container. |
-| `iptables-legacy-save` | Prints nothing. Use `iptables-legacy -S`. |
+| `docker stats` | Shows the memory, the CPU time, and the network counters of a container. The memory is `memory.current`, which counts page cache and mapped pages too. A container that wrote 64 MiB showed 64 MiB on `hvf` and 101 MiB on Linux systrap. `BLOCK I/O` stays at `0B / 0B`, because the guest has no `io` controller. |
+| `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the highest score when the use passes the limit. Section 6.4 gives the details. |
+| `--memory-reservation`, `--memory-swap`, `--cpus`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
+| `--icc=false` | `dockerd` starts with it, but the bridge does not pass frames through `iptables`. Two containers of one bridge can still reach each other. |
 
 ### 6.3 Security
 
 The privileges of `--privileged` stay inside the sandbox. A container with `docker run --privileged` gets them only inside the sandbox too. A raw packet reaches only the network stack of the sandbox. The NAT forwarder relays only TCP and UDP connections, through host sockets. The API socket on the host has the mode `0600`, so only your user can open it. Any program of your user can therefore control the engine, as with a local Docker Engine.
+
+### 6.4 Memory Limits of Containers
+
+A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentry cannot count a page at the moment of its allocation. It counts a page after a scan of the memory file, so it polls. The poll starts with the first finite limit and ends when no cgroup has a limit.
+
+| Property | Value |
+| :--- | :--- |
+| Poll interval | 5 ms at least, and 4 times the duration of the last check, while a limited container uses half of its limit or more. Otherwise 25 ms, and also at least 4 times the duration of the last check, so a slow scan of untouched memory cannot repeat without bound. An idle sandbox with a limit makes 40 wakeups a second. |
+| Overshoot | A container can pass its limit by what it allocates between two checks. A container that uses less than half of its limit is checked every 25 ms, so it can pass the limit by 25 ms of allocation. The scan of the memory file on macOS costs time in proportion to the new pages, so one check can see hundreds of MiB more than the check before. |
+| Victim | The process with the highest score: its resident set plus `oom_score_adj` per mille of the limit, as in Linux. Equal scores go to the lower PID. A process with `oom_score_adj` of -1000 and the init process of the guest are never ended. With `memory.oom.group` set, every other process of the container. |
+| Result | Exit code 137, `OOMKilled: true` in `docker inspect`, and `oom_kill` in `memory.events`. Other containers and `dockerd` keep running. |
+| Not caught | A process that allocates and frees more than the limit between two checks. A one-shot `dd if=/dev/zero bs=128M count=1` is an example: its buffer lives about 30 ms. On macOS, a test that held 128 MiB for 30 ms showed only 2 MiB in `memory.current` in 4 of 6 runs, so the scan of the memory file missed most of the pages. Linux counts each page at its first write and kills such a process. A process that holds its memory for longer than 100 ms is found. Memory that a process maps but never writes is not charged, as on Linux. |
+| Held after the kill | Data in `tmpfs` files stays charged to the container. The enforcer waits for the usage to drop to the limit after a kill. When tmpfs data keeps the usage above the limit, it kills the next process after two more checks. |
+| Counted memory | The enforcer compares anonymous memory plus tmpfs data with the limit. Page cache, mapped file pages, and freed pages that the Sentry has not decommitted yet do not count, as they are reclaimable or free in Linux. `memory.current` and `docker stats` still show every kind, so they read higher than the enforced value. Measured idle values: an idle Go process holds 1.8 MiB (`linux/amd64` systrap), 1.5 MiB (`linux/arm64` systrap), and 2.7 MiB (`hvf`) of this memory. An `alpine` container that runs `sleep` holds 40 KiB to 60 KiB. `whpx` is not measured. |
+| Windows `systrap` | The enforcer stays off. The engine runs guest code in stub processes, and the Sentry counts a page through the working set of its own process, so a page that only a stub wrote can stay uncounted. `memory.stat` and `memory.current` can show too little. `memory.max` is stored and not enforced. |
+| Not enforced | `memory.high`, `cpu.max`, `cpu.weight`, and `memory.swap.*`. |

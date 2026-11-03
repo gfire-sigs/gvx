@@ -181,6 +181,10 @@ type guestSpec struct {
 	readOnlyRoot  bool
 	publishAll    bool
 	netRaw        bool
+	// packetWrite and allowSUID are the other two privileges of rungv
+	// --privileged. dockerd needs all three.
+	packetWrite bool
+	allowSUID   bool
 }
 
 func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
@@ -189,29 +193,31 @@ func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
 		netMode = gvx.NetModeNone
 	}
 	return gvx.Config{
-		Platform:            g.plat,
-		NetworkMode:         netMode,
-		PortForwards:        g.forwards,
-		OCIImage:            g.image,
-		OCICacheDir:         cache,
-		WorkspacePath:       g.workspace,
-		Argv:                g.argv,
-		Cmd:                 g.cmd,
-		Entrypoint:          g.entrypoint,
-		EntrypointSet:       g.entrypointSet,
-		Envv:                g.envv,
-		User:                g.user,
-		Hostname:            g.hostname,
-		Resources:           g.resources,
-		Mounts:              g.mounts,
-		ReadOnlyRoot:        g.readOnlyRoot,
-		PublishAll:          g.publishAll,
-		NetRaw:              g.netRaw,
-		Stdin:               g.stdin,
-		Stdout:              stdout,
-		Stderr:              stderr,
-		TTY:                 g.tty,
-		DisableHostLockdown: true,
+		Platform:               g.plat,
+		NetworkMode:            netMode,
+		PortForwards:           g.forwards,
+		OCIImage:               g.image,
+		OCICacheDir:            cache,
+		WorkspacePath:          g.workspace,
+		Argv:                   g.argv,
+		Cmd:                    g.cmd,
+		Entrypoint:             g.entrypoint,
+		EntrypointSet:          g.entrypointSet,
+		Envv:                   g.envv,
+		User:                   g.user,
+		Hostname:               g.hostname,
+		Resources:              g.resources,
+		Mounts:                 g.mounts,
+		ReadOnlyRoot:           g.readOnlyRoot,
+		PublishAll:             g.publishAll,
+		NetRaw:                 g.netRaw,
+		AllowPacketSocketWrite: g.packetWrite,
+		AllowSUID:              g.allowSUID,
+		Stdin:                  g.stdin,
+		Stdout:                 stdout,
+		Stderr:                 stderr,
+		TTY:                    g.tty,
+		DisableHostLockdown:    true,
 	}
 }
 

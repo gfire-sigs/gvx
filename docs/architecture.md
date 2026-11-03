@@ -805,6 +805,26 @@ The isolated `tools/shiminterop` module compiles real SDK lifecycle code with co
 The installed containerd `2.2.4` smoke verifies native creation rejection and cleanup only. It does not demonstrate a successfully created sandbox.
 Containerd `2.3` binary bootstrap, CRI, guest workloads, and successful native sandbox creation remain outside this adapter.
 
+### 3.11 Guest Kernel Interfaces for the Docker Engine (Descriptive Module)
+
+`dockerd`, `containerd`, and `runc` read and write kernel files that upstream gVisor does not provide. Each addition lives in an `_xplat.go` file next to the upstream file that calls it. The table lists the additions and their owners.
+
+| Interface | Owner | Behavior |
+| :--- | :--- | :--- |
+| `/proc/sys/net/ipv4/conf/<link>/route_localnet` and `/proc/sys/net/ipv6/conf/<link>/accept_ra` | `fsimpl/proc/tasks_sys_xplat.go`, `tcpip/network/ipv4/martian_xplat.go` | `conf` has one directory for each link of the root network stack. A lookup or an open of `conf` adds the directories of new links and removes those of deleted links. A directory stays valid only for the same link index, so a recreated link starts with fresh values. `route_localnet` of a link is a flag of that IPv4 endpoint. The endpoint accepts martian loopback packets when that flag or `conf/all` is set. |
+| `/proc/sys/net/bridge/bridge-nf-call-*` | `fsimpl/proc/tasks_sys_xplat.go` | The files store their values. The bridge of the stack forwards Ethernet frames and does not run them through iptables. |
+| RTM_SETLINK with `IFLA_PROTINFO` and `IFLA_BRPORT_MODE` | `socket/netstack/bridgeport_xplat.go` | The stack accepts the hairpin mode for a bridge port and refuses it for any other link. The bridge already writes each frame of its own IP layer to every port, including the sender. |
+| RTM_GETLINK with `IFLA_STATS64` | `socket/netlink/route/link_stats_xplat.go` | The attribute carries the counters of `/proc/net/dev`. `docker stats` drops the whole answer for a container when a link has no counters. |
+| `/proc/net/ip_tables_names` and `ip6_tables_names` | `fsimpl/proc/task_net_xplat.go` | The files list the four tables that the stack always has. `iptables-legacy-save` reads them. |
+| `memory.stat` of a cgroup | `fsimpl/cgroup2fs/memory_xplat.go` | The fields follow from the memory kinds that `usage.MemoryAccounting` counts for the memory cgroup IDs of the subtree. |
+| `memory.max` enforcement and `memory.events` counters | `fsimpl/cgroup2fs/memory_xplat.go` | See the next paragraphs. |
+
+The Sentry counts a page for a memory cgroup only after a scan of the memory file. One goroutine per cgroup tree checks every cgroup with a finite `memory.max`. It starts at the first write of a finite limit, and it ends when no cgroup has a limit or the guest has no task. It stays off under the Windows `systrap` engine, which cannot count the pages of its stub processes. The goroutine runs one scan for all limited cgroups, then compares the anonymous memory plus the tmpfs data of each subtree with its limit. Page cache, mapped file pages, and freed pages are not unreclaimable and do not count. It waits 5 ms while a cgroup uses half of its limit, and 25 ms otherwise. In both cases it waits at least 4 times the duration of the last check. A kill without a candidate, because every process is immune, still counts in `oom` and `max`.
+
+When a subtree passes its limit, the goroutine kills the process with the highest score with SIGKILL. The score is the resident set plus `oom_score_adj` per mille of the limit. The init process and processes with `oom_score_adj` of -1000 are immune. With `memory.oom.group` set, it kills every other process of the subtree. It kills again only after a check saw the usage at or below the limit, or after two more checks above it. Each kill adds to `oom`, `oom_kill`, and `max` in `memory.events` of the cgroup and its ancestors, and it wakes the readers of the file. `containerd` reads that file through `inotify` and reports the kill, so `docker inspect` shows `OOMKilled: true`.
+
+On macOS, the block count of the memory file can trail the commit of a page by seconds. The scan of a single memory cgroup therefore always runs, as `pgalloc.MemoryFile.UpdateUsage` does for hosts other than Linux.
+
 ---
 
 ## 4. Milestone Roadmap and Verification Criteria

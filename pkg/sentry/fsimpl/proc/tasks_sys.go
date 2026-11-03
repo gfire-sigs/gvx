@@ -155,7 +155,7 @@ func sysSubdirs(path string) []string {
 	case "kernel":
 		return []string{"random", "yama", "keys"}
 	case "net":
-		return []string{"ipv4", "core", "ipv6"}
+		return []string{"ipv4", "core", "ipv6", "bridge"}
 	case "net/ipv4", "net/ipv6":
 		return []string{"conf"}
 	case "net/ipv4/conf", "net/ipv6/conf":
@@ -192,7 +192,7 @@ func (fs *filesystem) sysDirChildren(ctx context.Context, root *auth.Credentials
 		if path != "" {
 			subdir = path + "/" + name
 		}
-		children[name] = fs.newLazySysDir(ctx, root, k, subdir)
+		children[name] = fs.newSysSubdir(ctx, root, k, stack, subdir)
 	}
 	return children
 }
@@ -340,6 +340,9 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		return map[string]kernfs.Inode{
 			"forwarding": fs.newInode(ctx, root, 0644, &atomicInt32File{val: new(atomicbitops.Int32), min: 0, max: 1}),
 		}
+	}
+	if files, ok := fs.sysNetXplatFiles(ctx, root, stack, path); ok {
+		return files
 	}
 	panic(fmt.Sprintf("unknown /proc/sys directory %q", path))
 }

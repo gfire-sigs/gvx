@@ -219,6 +219,7 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 				}
 			}
 		case linux.IFLA_MASTER:
+		case linux.IFLA_PROTINFO, linux.IFLA_PROTINFO | linux.NLA_F_NESTED:
 		case linux.IFLA_LINKINFO:
 		case linux.IFLA_ADDRESS:
 		case linux.IFLA_MTU:
@@ -424,6 +425,10 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 			changed = true
 		case linux.IFLA_TXQLEN:
 			// TODO(b/340388892): support IFLA_TXQLEN.
+		case linux.IFLA_PROTINFO, linux.IFLA_PROTINFO | linux.NLA_F_NESTED:
+			if err := src.setBridgePortInfo(id, v); err != nil {
+				return err
+			}
 		}
 	}
 
