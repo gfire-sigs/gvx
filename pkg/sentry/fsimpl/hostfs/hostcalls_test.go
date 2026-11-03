@@ -58,6 +58,39 @@ func TestOperationsStayWithinHostCallBudget(t *testing.T) {
 	}
 }
 
+// firstTouchBudget is the most host system calls of the first run of a
+// benchCase operation on a cold workspace. The first run opens the pinned
+// handles and reads the directory listing that a lookup of a name needs, which
+// the steady budget leaves out. A change that adds a call to the cold path, as
+// a check of the table against the host would, fails here.
+var firstTouchBudget = map[string]int{
+	"create small file at depth 5": 6,
+	"rename at depth 5":            11,
+	"chmod at depth 5":             7,
+	"utimens at depth 5":           9,
+	"hard link at depth 5":         10,
+	"symlink at depth 5":           4,
+	"append 4 KiB and fsync":       15,
+}
+
+func TestFirstRunStaysWithinHostCallBudget(t *testing.T) {
+	for _, c := range benchCases(benchDepth) {
+		budget, ok := firstTouchBudget[c.name]
+		if !ok {
+			continue
+		}
+		t.Run(c.name, func(t *testing.T) {
+			e, ch, _ := newCountEnv(t)
+			c.setup(e)
+			ch.reset()
+			c.op(e, 0)
+			if got := ch.syscalls(); got > budget {
+				t.Fatalf("%s made about %d host system calls %s on a cold workspace, want at most %d", c.name, got, ch.dump(), budget)
+			}
+		})
+	}
+}
+
 // syscallsOf returns the host system calls of the third run of the benchCase
 // operation name at the given depth.
 func syscallsOf(t *testing.T, name string, depth int) int {

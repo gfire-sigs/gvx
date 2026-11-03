@@ -26,7 +26,7 @@ import (
 // files inode numbers that outlive a rename and that no later file reuses.
 // APFS and HFS+ do. FAT, exFAT, and network volumes derive the number from the
 // directory entry or invent it, and they fail the test.
-func volumeIDsTrusted(host hostBackend) bool {
+func volumeIDsTrusted(host hostBackend, _ bool) bool {
 	var st unix.Statfs_t
 	if err := unix.Fstatfs(int(host.rootDir()), &st); err != nil {
 		return false

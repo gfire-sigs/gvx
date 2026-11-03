@@ -487,11 +487,9 @@ func TestCompactionKeepsEveryRecord(t *testing.T) {
 		t.Fatalf("journal is %d bytes after compactions, want at most 3 times the %d-byte snapshot", got, snapshot)
 	}
 	requireSameTable(t, "table on disk", readMetaTable(t, path), metaSnapshot(t, ws))
-	for _, gone := range []string{"d", "d/f1", "d/f2"} {
-		if _, ok := readMetaTable(t, path)[gone]; ok {
-			t.Errorf("record %s is on disk after it moved or died", gone)
-		}
-	}
+	// The journal holds exactly the records of the table, so no record of the
+	// unlinked file or of the replaced directory leaked into it.
+	requireDiskMatchesMemory(t, ws, path)
 	for _, kept := range []string{"moved", "moved/f0", "moved/renamed", "link"} {
 		if _, ok := readMetaTable(t, path)[kept]; !ok {
 			t.Errorf("record %s is missing from disk", kept)

@@ -27,7 +27,7 @@ package hostfs
 // by guest path, as earlier releases did.
 func probeFileIDs(host hostBackend, root hostInfo, readOnly bool, caps *WorkspaceCaps) {
 	caps.StableIDs, caps.ExistsByID = false, false
-	if !root.fidOK || root.fid.isZero() || !volumeIDsTrusted(host) {
+	if !root.fidOK || root.fid.isZero() || !volumeIDsTrusted(host, readOnly) {
 		return
 	}
 	if readOnly {

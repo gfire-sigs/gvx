@@ -39,6 +39,7 @@ type metaTable struct {
 	recs    map[recKey]*rec
 	kids    map[recKey]map[string]struct{}
 	hints   map[string]recKey
+	leaves  map[leafKey]recKey
 	inos    map[uint64]int
 	special map[uint64]int
 	names   int
@@ -52,11 +53,26 @@ type metaTable struct {
 	kick chan struct{}
 }
 
+// scanLocked returns the records for a loop over the whole table and counts the
+// scan. Every loop over all records goes through it, so a test that reads
+// scans proves that a guest call visits no record. Callers hold t.mu.
+func (t *metaTable) scanLocked() map[recKey]*rec {
+	t.scans.Add(1)
+	return t.recs
+}
+
+// leafKey names an entry by the identity of its directory and its name.
+type leafKey struct {
+	parent fileKey
+	name   string
+}
+
 func newMetaTable() *metaTable {
 	return &metaTable{
 		recs:    make(map[recKey]*rec),
 		kids:    make(map[recKey]map[string]struct{}),
 		hints:   make(map[string]recKey),
+		leaves:  make(map[leafKey]recKey),
 		inos:    make(map[uint64]int),
 		special: make(map[uint64]int),
 		dirty:   make(map[recKey]struct{}),
@@ -149,6 +165,9 @@ func (t *metaTable) indexLocked(k recKey, r *rec) {
 		if r.hint != "" {
 			t.hints[r.hint] = k
 		}
+		if r.leaf != "" {
+			t.leaves[leafKey{r.parent, r.leaf}] = k
+		}
 	case kindName:
 		t.inos[k.id.ino]++
 		t.addKidLocked(k)
@@ -166,6 +185,9 @@ func (t *metaTable) unindexLocked(k recKey, r *rec) {
 		}
 		if r.hint != "" && t.hints[r.hint] == k {
 			delete(t.hints, r.hint)
+		}
+		if lk := (leafKey{r.parent, r.leaf}); r.leaf != "" && t.leaves[lk] == k {
+			delete(t.leaves, lk)
 		}
 	case kindName:
 		dec(t.inos, k.id.ino)
@@ -209,16 +231,29 @@ func (t *metaTable) dropKidLocked(k recKey) {
 	}
 }
 
-// setHint replaces the hint of the record under k without scheduling a write.
-// The file keeps the old hint until a change of the record writes the new one.
-// It does nothing when the record changed meanwhile.
-func (t *metaTable) setHint(k recKey, from *rec, hint string) {
+// setLoc replaces the hint, the parent, and the leaf of the record under k
+// without scheduling a write. The file keeps the old values until a change of
+// the record writes the new ones. It does nothing when the record changed
+// meanwhile.
+func (t *metaTable) setLoc(k recKey, from *rec, hint string, parent fileKey, leaf string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.recs[k] != from {
 		return
 	}
-	t.putLocked(k, from.withHint(hint))
+	t.putLocked(k, from.withLoc(hint, parent, leaf))
+}
+
+// byLeaf returns the record that the guest last saw as the entry name of the
+// directory parent, and its key.
+func (t *metaTable) byLeaf(parent fileKey, name string) (recKey, *rec) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	k, ok := t.leaves[leafKey{parent, name}]
+	if !ok {
+		return recKey{}, nil
+	}
+	return k, t.recs[k]
 }
 
 // kidsOf returns the names of the virtual symbolic links of the directory dir.
@@ -302,11 +337,10 @@ func (t *metaTable) pending() int {
 // volume with identities, and the key of a record on a volume with paths. A
 // record without a path adds nothing.
 func (t *metaTable) paths() []string {
-	t.scans.Add(1)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := make([]string, 0, len(t.recs))
-	for k, r := range t.recs {
+	for k, r := range t.scanLocked() {
 		switch {
 		case k.kind == kindPath:
 			out = append(out, k.path)
@@ -322,11 +356,10 @@ func (t *metaTable) paths() []string {
 // keys returns a copy of every key. A caller that walks a large table takes
 // the copy once, so the walk holds no lock.
 func (t *metaTable) keys() []recKey {
-	t.scans.Add(1)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := make([]recKey, 0, len(t.recs))
-	for k := range t.recs {
+	for k := range t.scanLocked() {
 		out = append(out, k)
 	}
 	return out
@@ -340,7 +373,6 @@ func (t *metaTable) keys() []recKey {
 // write fails.
 func (t *metaTable) takeBatch(full bool) (ops []metaOp, dirty []recKey) {
 	if full {
-		t.scans.Add(1)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -351,7 +383,7 @@ func (t *metaTable) takeBatch(full bool) (ops []metaOp, dirty []recKey) {
 	clear(t.dirty)
 	if full {
 		ops = make([]metaOp, 0, len(t.recs))
-		for k, r := range t.recs {
+		for k, r := range t.scanLocked() {
 			ops = append(ops, metaOp{key: k, r: r})
 		}
 		return ops, dirty
@@ -377,12 +409,11 @@ func (t *metaTable) restore(keys []recKey) {
 // record of oldRel itself stays. Only a table that keys on paths calls it. The
 // operation scans the whole table, which is the cost of path keys.
 func (t *metaTable) moveTree(oldRel, newRel string) {
-	t.scans.Add(1)
 	prefix := oldRel + "/"
 	rebase := func(p string) string { return newRel + strings.TrimPrefix(p, oldRel) }
 	t.mu.Lock()
 	var moved []recKey
-	for k := range t.recs {
+	for k := range t.scanLocked() {
 		switch {
 		case k.kind == kindPath && strings.HasPrefix(k.path, prefix):
 			moved = append(moved, k)
@@ -411,7 +442,6 @@ func (t *metaTable) moveTree(oldRel, newRel string) {
 // swapTree exchanges the path records at or below aRel and bRel. The two
 // directories cannot nest. Only a table that keys on paths calls it.
 func (t *metaTable) swapTree(aRel, bRel string) {
-	t.scans.Add(1)
 	aPrefix, bPrefix := aRel+"/", bRel+"/"
 	t.mu.Lock()
 	type move struct {
@@ -432,7 +462,7 @@ func (t *metaTable) swapTree(aRel, bRel string) {
 		}
 		return "", false
 	}
-	for k, r := range t.recs {
+	for k, r := range t.scanLocked() {
 		if !k.isPath() {
 			continue
 		}

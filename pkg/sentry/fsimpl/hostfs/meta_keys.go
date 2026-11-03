@@ -56,9 +56,12 @@ func (w *Workspace) keyOf(rel string, info hostInfo) recKey {
 	return recKey{kind: kindInode, id: w.storedID(info.fid)}
 }
 
-// keyed reports whether info carries what keyOf needs.
+// keyed reports whether info carries what keyOf needs: a trustworthy identity.
+// The probe at open checks the root volume only. A file system that the guest
+// mounts inside the workspace can report no birth time, or on Windows only a
+// 64-bit file index, and then its entries have no key and no record.
 func (w *Workspace) keyed(info hostInfo) bool {
-	return w.pathKeys || !info.fid.isZero()
+	return w.pathKeys || (info.fidOK && !info.fid.isZero())
 }
 
 // dirKeyOf returns the key of the directory rel whose pinned handle is pin.
@@ -82,6 +85,9 @@ func (w *Workspace) nameKeyLocked(rel string) (recKey, error) {
 		return recKey{}, err
 	}
 	defer w.releasePin(pin)
+	if pin.key.isZero() {
+		return recKey{}, errMissingIdentity
+	}
 	_, name := splitParent(rel)
 	return recKey{kind: kindName, id: pin.key, name: name}, nil
 }
@@ -103,7 +109,7 @@ func (w *Workspace) virtualAtLocked(rel string) (recKey, *rec) {
 // virtualIn is virtualAtLocked for the entry name of the directory parentRel,
 // whose pinned handle the caller holds.
 func (w *Workspace) virtualIn(pin *dirPin, parentRel, name string) (recKey, *rec) {
-	if !w.meta.hasNames() {
+	if !w.meta.hasNames() || (!w.pathKeys && pin.key.isZero()) {
 		return recKey{}, nil
 	}
 	k := w.dirKeyOf(pin, parentRel).withName(name)
@@ -123,8 +129,10 @@ func (w *Workspace) recOf(rel string, info hostInfo) *rec {
 		// A host process that moved the file, or a rename of a parent
 		// directory, leaves the hint behind. A file with several names has
 		// no single path, so its hint stays.
-		if !w.pathKeys && r.hint != rel && info.nlink <= 1 {
-			w.meta.setHint(k, r, rel)
+		if !w.pathKeys && (r.hint != rel || r.parent.isZero()) && info.nlink <= 1 {
+			if parent, leaf := w.locOf(rel); !parent.isZero() {
+				w.meta.setLoc(k, r, rel, parent, leaf)
+			}
 		}
 		return r
 	}
@@ -134,17 +142,47 @@ func (w *Workspace) recOf(rel string, info hostInfo) *rec {
 	return w.adopt(rel, k, info)
 }
 
+// locOf returns the identity of the directory that holds rel and the entry
+// name. The parent is zero when the directory has no identity or does not
+// exist. Callers hold w.mu.
+func (w *Workspace) locOf(rel string) (parent fileKey, leaf string) {
+	dir, leaf := splitParent(rel)
+	pin, err := w.acquirePin(dir)
+	if err != nil {
+		return fileKey{}, leaf
+	}
+	defer w.releasePin(pin)
+	return pin.key, leaf
+}
+
 // adopt gives the file at rel the record of a file that has vanished from rel.
 // A host editor saves a file by writing a temporary file and renaming it over
-// the old one, which leaves the new file without a record. The record that
-// last sat at rel moves to the new file when its file is gone for good. A file
-// that still exists elsewhere keeps its record, and the new file starts without
-// one.
+// the old one, which leaves the new file without a record. The record that the
+// guest last saw under the same directory and the same name moves to the new
+// file when its file is gone. The match uses the identity of the directory, so
+// a rename of an ancestor directory does not break it, and a file at the same
+// name in another directory never matches. A file that still exists elsewhere
+// keeps its record.
+//
+// The adoption cannot tell an atomic save from a host process that deleted the
+// file and created another one under the same name, and on Linux and macOS it
+// cannot tell it from a move to another directory followed by a create. The
+// new file gets the record then, without the set-user-ID and set-group-ID bits,
+// because a host file must never gain privilege from a record that it did not
+// earn. Windows asks the host by identity, which is exact.
+//
+// The one case that is certain is a file whose birth time APFS lowered: the
+// inode number is the same and the birth time is earlier. The record moves to
+// the new key, together with the links of a directory.
 func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
-	if w.readOnly || (info.kind != hostKindRegular && info.kind != hostKindDir) {
+	if w.readOnly || !w.keyed(info) || (info.kind != hostKindRegular && info.kind != hostKindDir) {
 		return nil
 	}
-	oldKey, old := w.meta.byHint(rel)
+	parent, leaf := w.locOf(rel)
+	if parent.isZero() {
+		return nil
+	}
+	oldKey, old := w.meta.byLeaf(parent, leaf)
 	if old == nil || oldKey == k || oldKey.id.dev != k.id.dev {
 		return nil
 	}
@@ -152,12 +190,9 @@ func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
 		return nil
 	}
 	if sameInodeEarlierBirth(oldKey.id, k.id) {
-		// APFS lowers the birth time of a file when a process sets an earlier
-		// modification time, as tar, cp -p, and git do. The file is the same.
-		// A new file that reuses the inode number has a later birth time.
-		w.meta.del(oldKey)
-		w.meta.put(k, old.withHint(rel))
-		return old
+		moved := old.withLoc(rel, parent, leaf)
+		w.rekeyLocked(oldKey, k, moved, rel)
+		return moved
 	}
 	if info.nlink > 1 {
 		return nil
@@ -168,13 +203,37 @@ func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
 	}
 	alive, where := w.recordFileExists(oldKey, rel)
 	if alive {
-		w.meta.setHint(oldKey, old, where)
+		if where != "" {
+			w.meta.setLoc(oldKey, old, where, old.parent, old.leaf)
+		}
 		return nil
 	}
-	adopted := old.withHint(rel)
-	w.meta.del(oldKey)
-	w.meta.put(k, adopted)
+	adopted := old.withLoc(rel, parent, leaf)
+	adopted.attr.Mode &^= linux.S_ISUID | linux.S_ISGID
+	w.rekeyLocked(oldKey, k, adopted, rel)
 	return adopted
+}
+
+// rekeyLocked moves the record r from oldKey to newKey. The links of a
+// directory key on the identity of the directory, so they move with it. The
+// pinned handle of the directory holds the old key, so it retires and opens
+// again with the new one. Callers hold w.mu.
+func (w *Workspace) rekeyLocked(oldKey, newKey recKey, r *rec, rel string) {
+	w.meta.del(oldKey)
+	w.meta.put(newKey, r)
+	if r.attr.Mode&linux.S_IFMT != linux.S_IFDIR {
+		return
+	}
+	for _, name := range w.meta.kidsOf(oldKey) {
+		from := oldKey.withName(name)
+		if kid := w.meta.get(from); kid != nil {
+			w.meta.del(from)
+			w.meta.put(newKey.withName(name), kid)
+		}
+	}
+	w.pinMu.Lock()
+	w.retireSubtreeLocked(rel)
+	w.pinMu.Unlock()
 }
 
 // sameInodeEarlierBirth reports whether now names the inode of old with a birth
@@ -239,9 +298,14 @@ func (w *Workspace) ownsEntry(dirRel, leaf string, info hostInfo) bool {
 }
 
 // putRec stores a record for the host entry or link under k. It keeps the
-// guest path as the hint.
+// guest path as the hint, and the identity of the directory with the entry name
+// for adoption.
 func (w *Workspace) putRec(k recKey, attr POSIXAttr, hint string) {
-	w.meta.put(k, &rec{attr: attr, hint: hint})
+	r := &rec{attr: attr, hint: hint}
+	if !w.pathKeys && k.kind == kindInode {
+		r.parent, r.leaf = w.locOf(hint)
+	}
+	w.meta.put(k, r)
 }
 
 // checkMetaRoom fails with errMetaFull when the table has no memory left for a
@@ -254,4 +318,13 @@ func (w *Workspace) checkMetaRoom(k recKey) error {
 		return nil
 	}
 	return errMetaFull
+}
+
+// pinKey returns the stored identity for a pinned directory, or zero when the
+// directory has no trustworthy identity.
+func (w *Workspace) pinKey(info hostInfo) fileKey {
+	if w.pathKeys || !w.keyed(info) {
+		return fileKey{}
+	}
+	return w.storedID(info.fid)
 }

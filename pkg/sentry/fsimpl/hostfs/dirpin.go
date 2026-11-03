@@ -123,7 +123,7 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 		return nil, errNotDir
 	}
 	w.evictPinsLocked()
-	p = &dirPin{h: h, id: info.id, key: w.storedID(info.fid), refs: 1, lastUse: now, checkedAt: now}
+	p = &dirPin{h: h, id: info.id, key: w.pinKey(info), refs: 1, lastUse: now, checkedAt: now}
 	w.pins[rel] = p
 	w.armSweepLocked()
 	return p, nil

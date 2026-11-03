@@ -85,7 +85,7 @@ Host desktop shells inject hidden metadata files into mounted directories. Finde
 - **Host Clutter Hiding**: Unless `.gvx_meta` owns the entry, `listDir`, `lookupLocked`, and `hostWatcher` ignore `.DS_Store` on macOS and `Thumbs.db` on Windows. They also ignore `._*` files on macOS only when the file is `<= 64 KiB` and starts with the 4-byte AppleDouble magic `0x00051607`. Filtering these names in `hostWatcher` prevents Finder or Explorer folder clicks from triggering guest `inotify` rebuilds.
 - **Auto-Purge on `rmdir`**: When a guest calls `rmdir` on a directory with zero guest-visible entries, `Workspace.rmdir` unlinks any verified host clutter files first. It then calls `w.host.rmdir`, preventing spurious `ENOTEMPTY` failures during `rm -rf`.
 - **Ephemeral File Sweep**: During `OpenWorkspace`, `hostfs` unlinks any leftover `~gvx~tmp.*` (`O_TMPFILE`) and `~gvx~swap.*` (`RENAME_EXCHANGE`) files left behind by a previously terminated process.
-- **`.gvx_meta` Orphan Collection**: A background collector removes records whose host files no longer exist. It also removes virtual symlinks whose parent directories no longer exist. A record dies after two passes that miss it. `loadMeta` and the flush compare no record with the host.
+- **`.gvx_meta` Orphan Collection**: A background collector removes records whose host files no longer exist. It also removes virtual symlinks whose parent directories no longer exist. A record dies after one pass misses it and a lookup by its hint path confirms the loss. `loadMeta` and the flush compare no record with the host.
 
 ---
 

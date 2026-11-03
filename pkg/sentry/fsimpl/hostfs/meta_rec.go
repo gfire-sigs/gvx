@@ -94,12 +94,26 @@ type rec struct {
 	// the record of a file that a host editor replaced by a rename, and it
 	// names the record for tools.
 	hint string
+	// parent and leaf are the identity of the directory that held the file and
+	// the entry name, when the guest last saw it. A host editor that saves by
+	// rename gives the new file the same parent and leaf, and a rename of an
+	// ancestor directory changes neither. Adoption matches on them and not on
+	// the path. They are zero on a volume with guest paths.
+	parent fileKey
+	leaf   string
 }
 
 // withHint returns a copy of r with the given hint.
 func (r *rec) withHint(hint string) *rec {
 	c := *r
 	c.hint = hint
+	return &c
+}
+
+// withLoc returns a copy of r with the given hint, parent directory, and leaf.
+func (r *rec) withLoc(hint string, parent fileKey, leaf string) *rec {
+	c := *r
+	c.hint, c.parent, c.leaf = hint, parent, leaf
 	return &c
 }
 
@@ -110,7 +124,7 @@ const recOverhead = 320
 // recSize returns the estimated memory in bytes of one record. The estimate
 // drives the table cap, so it only needs to grow with the real size.
 func recSize(k recKey, r *rec) int64 {
-	n := recOverhead + len(k.path) + len(k.name) + len(r.hint) + len(r.attr.Symlink)
+	n := recOverhead + len(k.path) + len(k.name) + len(r.hint) + len(r.leaf) + len(r.attr.Symlink)
 	for name, v := range r.attr.Xattrs {
 		n += len(name) + len(v) + 64
 	}
@@ -194,7 +208,8 @@ func appendBody(buf []byte, r *rec) []byte {
 		buf = binary.AppendUvarint(buf, uint64(len(v)))
 		buf = append(buf, v...)
 	}
-	return buf
+	buf = appendFileKey(buf, r.parent)
+	return appendString(buf, r.leaf)
 }
 
 // byteReader decodes the fields of a record. The first malformed field sets
@@ -310,6 +325,10 @@ func readBody(body []byte) (*rec, bool) {
 			}
 			a.Xattrs[name] = slices.Clone(v)
 		}
+	}
+	if len(r.b) > 0 {
+		out.parent = r.fileKey()
+		out.leaf = r.str()
 	}
 	return out, !r.bad
 }

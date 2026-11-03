@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !darwin
+//go:build windows
 
 package hostfs
 
 // volumeIDsTrusted reports whether the volume of the workspace root passes the
-// platform test for file identities. Linux and Windows decide from the
+// platform test for file identities. Windows decides from the
 // identity of each file, so every volume passes here.
-func volumeIDsTrusted(hostBackend) bool {
+func volumeIDsTrusted(hostBackend, bool) bool {
 	return true
 }

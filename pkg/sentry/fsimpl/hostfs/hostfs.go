@@ -760,12 +760,15 @@ func (w *Workspace) touchDirLocked(dir string, now int64) {
 		return
 	}
 	defer w.releasePin(pin)
+	if !w.pathKeys && pin.key.isZero() {
+		return
+	}
 	key := w.dirKeyOf(pin, dir)
 	if r := w.meta.get(key); r != nil {
-		a := r.attr
-		a.Mtime = now
-		a.Ctime = now
-		w.meta.put(key, &rec{attr: a, hint: dir})
+		next := *r
+		next.attr.Mtime = now
+		next.attr.Ctime = now
+		w.meta.put(key, &next)
 		return
 	}
 	w.dirTimes[key] = now
@@ -1034,6 +1037,9 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 		return nil, entry{}, err
 	}
 	info, err := w.host.fstat(f)
+	if err == nil && !w.keyed(info) {
+		err = errMissingIdentity
+	}
 	if err != nil {
 		_ = f.Close()
 		_ = w.host.unlinkAt(pin.h, leaf)
@@ -1153,7 +1159,7 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if !w.pathKeys {
 		// mkdir returns no identity, so one stat of the new directory reads it.
 		info, err := w.host.lstatAt(pin.h, leaf)
-		if err != nil || info.fid.isZero() {
+		if err != nil || !w.keyed(info) {
 			_ = w.host.rmdirAt(pin.h, leaf)
 			return errors.Join(err, errMissingIdentity)
 		}
@@ -1808,10 +1814,33 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 		if r := w.meta.get(e.key); r != nil && r.attr.Mtime != 0 {
 			a := r.attr
 			a.Mtime = 0
-			w.putRec(e.key, a, r.hint)
+			w.putRec(e.key, a, rel)
 		}
+		w.rekeyAfterTimesLocked(rel, e, *mtime)
 	}
 	return nil
+}
+
+// rekeyAfterTimesLocked follows the identity of the entry rel after a guest set
+// its modification time to mtime. APFS lowers the birth time of a file to an
+// earlier modification time, as tar, cp -a, and rsync -a cause for each file
+// and directory that they extract. The birth time is part of the key, so the
+// record and, for a directory, its guest links must move to the new key at
+// once. A later lookup would move them too, but only while the hint still
+// names the entry, and a rename of an ancestor directory comes first in the
+// extract-then-rename flow of package managers. Callers hold w.mu for writing.
+func (w *Workspace) rekeyAfterTimesLocked(rel string, before entry, mtime time.Time) {
+	if w.pathKeys || runtime.GOOS != "darwin" || before.key.id.btime == 0 || mtime.UnixNano() >= before.key.id.btime {
+		return
+	}
+	after, err := w.lookupLocked(rel)
+	if err != nil || after.key == before.key {
+		return
+	}
+	if t, ok := w.dirTimes[before.key]; ok {
+		w.dirTimes[after.key] = t
+		delete(w.dirTimes, before.key)
+	}
 }
 
 // dirListing is one directory entry with its type and the host inode number

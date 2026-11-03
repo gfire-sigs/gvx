@@ -15,6 +15,7 @@
 package hostfs
 
 import (
+	"os"
 	"slices"
 	"testing"
 )
@@ -84,4 +85,42 @@ func metaKeys(w *Workspace) []string {
 	paths := w.meta.paths()
 	slices.Sort(paths)
 	return paths
+}
+
+// rawRecords reads the records that the .gvx_meta file at path holds, without
+// the host tree. ReadMeta resolves records through the tree and leaves out the
+// record of a file that is gone, so a test that must see a leaked or a wrong
+// record on disk reads the journal itself.
+func rawRecords(t testing.TB, path string) map[recKey]*rec {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := parseMeta(raw)
+	if err != nil {
+		t.Fatalf("parseMeta(%s): %v", path, err)
+	}
+	return img.recs
+}
+
+// requireDiskMatchesMemory fails when the journal and the table of the
+// workspace hold different keys or different modes.
+func requireDiskMatchesMemory(t testing.TB, ws *Workspace, path string) {
+	t.Helper()
+	disk := rawRecords(t, path)
+	mem := ws.meta.keys()
+	for _, k := range mem {
+		d, ok := disk[k]
+		if !ok {
+			t.Errorf("record %+v is in memory and not on disk", k)
+			continue
+		}
+		if m := ws.meta.get(k); m.attr.Mode != d.attr.Mode || m.attr.UID != d.attr.UID {
+			t.Errorf("record %+v has mode %o uid %d on disk and %o uid %d in memory", k, d.attr.Mode, d.attr.UID, m.attr.Mode, m.attr.UID)
+		}
+	}
+	if len(disk) != len(mem) {
+		t.Errorf("the journal holds %d records and the table %d: a record leaked or is missing", len(disk), len(mem))
+	}
 }
