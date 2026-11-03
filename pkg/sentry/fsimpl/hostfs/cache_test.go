@@ -240,6 +240,11 @@ func makeDeepFile(t *testing.T, e *env) {
 	e.writeFile(deepPath, []byte("x"))
 	// The creation invalidated the metadata of the directory and the file.
 	e.mustStat(deepPath)
+	// On a host that does not count directory links, the first stat of a
+	// directory lists it once (dirlinks.go).
+	for _, d := range []string{"a", "a/b", "a/b/c", "a/b/c/d"} {
+		e.mustStat(d)
+	}
 }
 
 func TestWarmLookupOfDeepPathMakesNoHostCalls(t *testing.T) {
@@ -620,6 +625,10 @@ func TestBackendThatVerifiesCaseSkipsTheListing(t *testing.T) {
 		}
 		e.mustMkdir("dir")
 		e.writeFile("dir/f", []byte("x"))
+		// On a host that does not count directory links, the first stat of
+		// a directory lists it once (dirlinks.go). That listing is not the
+		// case check that this test measures.
+		e.mustStat("dir")
 		ch.reset()
 		e.mustStat("dir/f")
 		e.mustStat("dir")

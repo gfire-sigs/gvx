@@ -1,0 +1,10 @@
+# Known pjdfstest failures that a host file system cannot avoid.
+#
+# Format: <fs> <os> <file>:<test|*> <reason>
+#   fs:   ext4lite or hostfs
+#   os:   linux, windows, or darwin (the host OS of the run)
+#   test: a test number of the file, or * for every failure of the file
+#
+# internal/pjdfsreport fails a run on a failure that this file does not list,
+# and on a listed failure that did not occur. Add an entry only for a host
+# limit, never for a gvx defect.

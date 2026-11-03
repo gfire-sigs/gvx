@@ -149,3 +149,7 @@ var errNameMismatch = errors.New("hostfs: the stored name differs from the reque
 // errHostUnsupported reports an operation that the host file system cannot
 // perform, such as a hard link on a volume without hard link support.
 var errHostUnsupported = errors.New("hostfs: operation not supported by the host file system")
+
+// errFileTooLarge reports a file size above the largest file that the host
+// file system can hold. translateHostError maps it to EFBIG.
+var errFileTooLarge = errors.New("hostfs: file size exceeds the host file system limit")

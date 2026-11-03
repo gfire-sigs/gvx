@@ -1,17 +1,25 @@
 name: pjdfstest
 
-# Runs the POSIX filesystem conformance suite (pjdfstest) inside a rungv guest
-# mounted on an ext4lite volume across all five target platforms whenever
-# pkg/sentry/fsimpl/ext4lite changes (on push, pull_request, or manual dispatch).
+# Runs the POSIX file system conformance suite (pjdfstest) inside rungv guests
+# on linux/amd64, linux/arm64, windows/amd64, and windows/arm64. The select job
+# picks the drivers from the changed paths: ext4lite volumes for
+# pkg/sentry/fsimpl/ext4lite, hostfs volumes for pkg/sentry/fsimpl/hostfs, and
+# both for the harness. scripts/pjdfstest/known-failures.txt lists host limits.
 on:
   push:
     branches: [main]
     paths:
       - "pkg/sentry/fsimpl/ext4lite/**"
+      - "pkg/sentry/fsimpl/hostfs/**"
+      - "scripts/pjdfstest/**"
+      - "internal/pjdfsreport/**"
       - ".github/workflows/pjdfstest.yml"
   pull_request:
     paths:
       - "pkg/sentry/fsimpl/ext4lite/**"
+      - "pkg/sentry/fsimpl/hostfs/**"
+      - "scripts/pjdfstest/**"
+      - "internal/pjdfsreport/**"
       - ".github/workflows/pjdfstest.yml"
   workflow_dispatch:
     inputs:
@@ -20,6 +28,11 @@ on:
         type: choice
         default: all
         options: [all, linux, windows]
+      fs:
+        description: "File system driver: all, ext4lite, or hostfs"
+        type: choice
+        default: all
+        options: [all, ext4lite, hostfs]
 
 concurrency:
   group: pjdfstest-${{ github.ref }}
@@ -32,11 +45,58 @@ env:
   GOFLAGS: -mod=readonly
 
 jobs:
-  linux:
-    name: pjdfstest linux/${{ matrix.arch }}
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux' || inputs.only == 'windows'
+  select:
+    name: select drivers
+    runs-on: ubuntu-24.04
+    outputs:
+      fs: ${{ steps.pick.outputs.fs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Pick drivers from the changed paths
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_FS: ${{ inputs.fs }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            case "$INPUT_FS" in
+              ext4lite) echo 'fs=["ext4lite"]' >>"$GITHUB_OUTPUT" ;;
+              hostfs) echo 'fs=["hostfs"]' >>"$GITHUB_OUTPUT" ;;
+              *) echo 'fs=["ext4lite","hostfs"]' >>"$GITHUB_OUTPUT" ;;
+            esac
+            exit 0
+          fi
+          # A pull request checks out its merge commit, whose first parent is the base.
+          base=HEAD^1
+          if [ "$EVENT" = push ]; then
+            git fetch --depth=1 origin "$BEFORE"
+            base=$BEFORE
+          fi
+          changed=$(git diff --name-only "$base" HEAD)
+          printf '%s\n' "$changed"
+          ext4lite=false
+          hostfs=false
+          if printf '%s\n' "$changed" | grep -qE '^(scripts/pjdfstest/|internal/pjdfsreport/|\.github/workflows/pjdfstest\.yml$)'; then
+            ext4lite=true
+            hostfs=true
+          fi
+          if printf '%s\n' "$changed" | grep -q '^pkg/sentry/fsimpl/ext4lite/'; then ext4lite=true; fi
+          if printf '%s\n' "$changed" | grep -q '^pkg/sentry/fsimpl/hostfs/'; then hostfs=true; fi
+          list=""
+          if [ "$ext4lite" = true ]; then list='"ext4lite"'; fi
+          if [ "$hostfs" = true ]; then list="${list:+$list,}\"hostfs\""; fi
+          echo "fs=[$list]" >>"$GITHUB_OUTPUT"
+
+  bundle:
+    name: bundle linux/${{ matrix.arch }}
+    needs: select
+    if: needs.select.outputs.fs != '[]'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -60,147 +120,76 @@ jobs:
         env:
           GOMAXPROCS: "1"
         run: |
-          mkdir -p "$PWD/bundle" "$PWD/cache"
-          ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle" -v pjdfs_build:/mnt/vol alpine:3.20 sh -c '
-            set -e
-            apk add --no-cache git build-base autoconf automake perl perl-utils >/dev/null
-            git clone --depth=1 https://github.com/pjd/pjdfstest.git /mnt/vol/pjdfstest
-            cd /mnt/vol/pjdfstest
-            autoreconf -ifs
-            CFLAGS="-O2 -Wl,-z,max-page-size=65536" ./configure >/dev/null
-            make pjdfstest >/dev/null
-            cp -r /mnt/vol/pjdfstest/* /workspace/
-          '
-          cat > "$PWD/bundle/tests/conf" <<'EOF'
-          os="Linux"
-          GREP="grep"
-          fs="EXT4"
-          EOF
-          sed -i 's/dir=`dirname \$0`/dir=${0%\/*}/g' "$PWD/bundle/tests"/*/*.t
-          sed -i '/^confdir=/,/^fstest=/c\confdir="${dir}/.."\nmaindir="${dir}/../.."\nfstest="${maindir}/pjdfstest"' "$PWD/bundle/tests/misc.sh"
-          cat >> "$PWD/bundle/tests/misc.sh" <<'EOF'
-
-          _nl='
-          '
-          expect()
-          {
-          	e="${1}"
-          	shift
-          	r=$(${fstest} $* 2>/dev/null)
-          	r=${r##*$_nl}
-          	_m=1
-          	case "${e}" in
-          	*'('*|*'*'*|*'['*|*'.'*|*'+'*|*'?'*|*'^'*|*'$'*)
-          		echo "${r}" | ${GREP} -Eq '^'${e}'$' && _m=0
-          		;;
-          	*)
-          		case "|${e}|" in
-          		*"|${r}|"*) _m=0 ;;
-          		esac
-          		;;
-          	esac
-          	if [ $_m -eq 0 ]; then
-          		if [ -z "${todomsg}" ]; then
-          			echo "ok ${ntest}"
-          		else
-          			echo "ok ${ntest} # TODO ${todomsg}"
-          		fi
-          	else
-          		if [ -z "${todomsg}" ]; then
-          			echo "not ok ${ntest} - tried '$*', expected ${e}, got ${r}"
-          		else
-          			echo "not ok ${ntest} # TODO ${todomsg}"
-          		fi
-          	fi
-          	todomsg=""
-          	: $(( ntest += 1 ))
-          }
-
-          namegen()
-          {
-          	read _u < /proc/sys/kernel/random/uuid
-          	while [ "${_u#*-}" != "$_u" ]; do _u="${_u%%-*}${_u#*-}"; done
-          	echo "pjdfstest_${_u}"
-          }
-
-          namegen_len()
-          {
-          	len="${1}"
-          	name=""
-          	while [ ${#name} -lt ${len} ]; do
-          		read _u < /proc/sys/kernel/random/uuid
-          		while [ "${_u#*-}" != "$_u" ]; do _u="${_u%%-*}${_u#*-}"; done
-          		name="${name}${_u}"
-          	done
-          	while [ ${#name} -gt ${len} ]; do
-          		name="${name%?}"
-          	done
-          	printf "%s" "${name}"
-          }
-          EOF
+          ./scripts/pjdfstest/build-bundle.sh ./rungv "$PWD/cache" "$PWD/bundle"
           e2fsck -fn "$PWD/cache/volumes/pjdfs_build.ext4"
       - name: Upload guest-built pjdfstest bundle
         uses: actions/upload-artifact@v7
         with:
           name: pjdfstest-bundle-${{ matrix.arch }}
           path: bundle/
-      - name: Run pjdfstest inside guest on ext4lite volumes
-        if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
+
+  linux:
+    name: pjdfstest ${{ matrix.fs }} linux/${{ matrix.arch }}
+    needs: [select, bundle]
+    if: needs.select.outputs.fs != '[]' && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: ${{ fromJSON(needs.select.outputs.fs) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build rungv
+        env:
+          CGO_ENABLED: "0"
+        run: go build -o rungv ./cmd/rungv
+      - name: Download pjdfstest bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: pjdfstest-bundle-${{ matrix.arch }}
+          path: bundle
+      - name: Run pjdfstest inside guests
         env:
           GOMAXPROCS: "1"
+        run: ./scripts/pjdfstest/run.sh ./rungv "$PWD/cache" "$PWD/bundle" ${{ matrix.fs }} vol "$PWD/out"
+      - name: Compare with the known failures
+        run: go run ./internal/pjdfsreport -fs ${{ matrix.fs }} -os linux -known scripts/pjdfstest/known-failures.txt out/worker_*.log
+      - name: Check the ext4lite volumes
+        if: matrix.fs == 'ext4lite'
         run: |
-          run_worker() {
-            w="$1"
-            shift
-            cp -r "$PWD/bundle" "$PWD/bundle_$w"
-            ./rungv run -platform=systrap -cache-dir="$PWD/cache" -workspace="$PWD/bundle_$w" -ro -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
-              set -e
-              cp -r /workspace /mnt/vol/pjdfstest
-              chmod +x /mnt/vol/pjdfstest/pjdfstest
-              for suite in "$@"; do
-                [ -d "/mnt/vol/pjdfstest/tests/$suite" ] || continue
-                mkdir -p "/mnt/vol/work/$suite"
-                cd "/mnt/vol/work/$suite"
-                for t in /mnt/vol/pjdfstest/tests/"$suite"/*.t; do
-                  rc=0
-                  out=$(sh "$t") || rc=$?
-                  plan=$(printf "%s\n" "$out" | sed -n "s/^1\.\.\([0-9][0-9]*\).*/\1/p" | head -n 1)
-                  ok_cnt=$(printf "%s\n" "$out" | grep -cE "^(ok |not ok [0-9]+ # TODO)" || true)
-                  bad=$(printf "%s\n" "$out" | grep -E "^not ok" | grep -v "# TODO" || true)
-                  if [ "$rc" -ne 0 ] || [ -z "$plan" ] || [ -n "$bad" ] || [ "$ok_cnt" -ne "$plan" ]; then
-                    echo "FAIL: $t (rc=$rc plan=$plan ok=$ok_cnt)"
-                    printf "%s\n" "$bad"
-                    exit 1
-                  fi
-                  echo "PASS: $t ($ok_cnt/$plan)"
-                done
-              done
-            ' sh "$@"
-          }
-          run_worker 1 chown &
-          p1=$!
-          run_worker 2 rename &
-          p2=$!
-          run_worker 3 chmod link mknod open ftruncate &
-          p3=$!
-          run_worker 4 chflags mkdir mkfifo posix_fallocate rmdir symlink truncate unlink utimensat &
-          p4=$!
-          rc=0
-          for p in $p1 $p2 $p3 $p4; do wait "$p" || rc=1; done
-          [ "$rc" -eq 0 ]
           for w in 1 2 3 4; do
             e2fsck -fn "$PWD/cache/volumes/pjdfs_vol_$w.ext4"
           done
+      - name: Upload guest logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pjdfstest-logs-${{ matrix.fs }}-linux-${{ matrix.arch }}
+          path: out/worker_*.log
 
   windows:
-    name: pjdfstest windows/${{ matrix.arch }}
-    needs: linux
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    name: pjdfstest ${{ matrix.fs }} windows/${{ matrix.arch }}
+    needs: [select, bundle]
+    if: needs.select.outputs.fs != '[]' && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        fs: ${{ fromJSON(needs.select.outputs.fs) }}
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: windows-latest
@@ -223,47 +212,15 @@ jobs:
       - name: Build rungv
         shell: bash
         run: go build -o rungv.exe ./cmd/rungv
-      - name: Run pjdfstest on ext4lite volume
+      - name: Run pjdfstest inside guests
         shell: bash
-        run: |
-          mkdir -p ./cache
-          ./rungv.exe pull -cache-dir=./cache alpine:3.20
-          run_worker() {
-            w="$1"
-            shift
-            cp -r ./bundle "./bundle_$w"
-            ./rungv.exe run -platform=systrap -cache-dir=./cache -workspace="./bundle_$w" -ro -v "pjdfs_vol_$w:/mnt/vol" alpine:3.20 sh -c '
-              set -e
-              cp -r /workspace /tmp/pjdfstest
-              chmod +x /tmp/pjdfstest/pjdfstest
-              for suite in "$@"; do
-                [ -d "/tmp/pjdfstest/tests/$suite" ] || continue
-                mkdir -p "/mnt/vol/work/$suite"
-                cd "/mnt/vol/work/$suite"
-                for t in /tmp/pjdfstest/tests/"$suite"/*.t; do
-                  rc=0
-                  out=$(sh "$t") || rc=$?
-                  plan=$(printf "%s\n" "$out" | sed -n "s/^1\.\.\([0-9][0-9]*\).*/\1/p" | head -n 1)
-                  ok_cnt=$(printf "%s\n" "$out" | grep -cE "^(ok |not ok [0-9]+ # TODO)" || true)
-                  bad=$(printf "%s\n" "$out" | grep -E "^not ok" | grep -v "# TODO" || true)
-                  if [ "$rc" -ne 0 ] || [ -z "$plan" ] || [ -n "$bad" ] || [ "$ok_cnt" -ne "$plan" ]; then
-                    echo "FAIL: $t (rc=$rc plan=$plan ok=$ok_cnt)"
-                    printf "%s\n" "$bad"
-                    exit 1
-                  fi
-                  echo "PASS: $t ($ok_cnt/$plan)"
-                done
-              done
-            ' sh "$@"
-          }
-          run_worker 1 chown &
-          p1=$!
-          run_worker 2 rename &
-          p2=$!
-          run_worker 3 chmod link mknod open ftruncate &
-          p3=$!
-          run_worker 4 chflags mkdir mkfifo posix_fallocate rmdir symlink truncate unlink utimensat &
-          p4=$!
-          rc=0
-          for p in $p1 $p2 $p3 $p4; do wait "$p" || rc=1; done
-          [ "$rc" -eq 0 ]
+        run: ./scripts/pjdfstest/run.sh ./rungv.exe ./cache ./bundle ${{ matrix.fs }} tmp ./out
+      - name: Compare with the known failures
+        shell: bash
+        run: go run ./internal/pjdfsreport -fs ${{ matrix.fs }} -os windows -known scripts/pjdfstest/known-failures.txt out/worker_*.log
+      - name: Upload guest logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pjdfstest-logs-${{ matrix.fs }}-windows-${{ matrix.arch }}
+          path: out/worker_*.log

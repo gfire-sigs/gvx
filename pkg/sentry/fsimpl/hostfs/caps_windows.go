@@ -26,6 +26,10 @@ const (
 	// when the destination is a directory, so hostfs removes the empty
 	// destination first.
 	hostRenameReplacesDir = false
+
+	// hostCountsDirLinks reports whether the link count of a host directory
+	// follows the Linux rule. NTFS reports one link for every directory.
+	hostCountsDirLinks = false
 )
 
 // platformCaps probes the volume of the workspace root on Windows. NTFS

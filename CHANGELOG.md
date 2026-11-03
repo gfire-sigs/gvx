@@ -2,6 +2,15 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This section records changes that no release contains yet.
+
+### Bug Fixes
+
+- **Directory link count on Windows `hostfs`**: `stat` of a directory reported 2 links on NTFS for every directory. It now reports 2 plus the number of subdirectories, as Linux does. Tools such as `find` use that count.
+- **Large `truncate` on Windows `hostfs`**: a growth above the free disk space failed with `ENOSPC`, and a size above the NTFS file limit failed with `EIO`. The growth now leaves a hole, as on Linux, and the size above the limit fails with `EFBIG`.
+
 ## [v0.6.10002026110200] - 2026-11-03
 
 This release updates the Sentry to gVisor `release-20261102.0` and introduces a new version format. `AGENTS.md`, section 5.2, defines the format.
