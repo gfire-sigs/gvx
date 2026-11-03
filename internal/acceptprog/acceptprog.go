@@ -59,6 +59,7 @@ const (
 	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
 	membarrierPackage  = "z.gfire.dev/gvx/internal/acceptprog/membarrierprobe"
+	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -255,6 +256,14 @@ func BuildMicroBench(tb testing.TB, goarch string) string {
 func BuildMembarrierProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, membarrierPackage, "membarrierprobe", goarch, 0)
+}
+
+// BuildCodeWrite compiles the guest codewrite, which changes the code that it
+// runs by every write path of a program and of the kernel, for the Linux
+// architecture goarch and returns the path of the static ET_EXEC executable.
+func BuildCodeWrite(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, codeWritePackage, "codewrite", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel
