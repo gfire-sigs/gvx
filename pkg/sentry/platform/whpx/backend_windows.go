@@ -32,20 +32,21 @@ import (
 var (
 	modWinHvPlatform = windows.NewLazySystemDLL("WinHvPlatform.dll")
 
-	procGetCapability          = modWinHvPlatform.NewProc("WHvGetCapability")
-	procCreatePartition        = modWinHvPlatform.NewProc("WHvCreatePartition")
-	procSetupPartition         = modWinHvPlatform.NewProc("WHvSetupPartition")
-	procDeletePartition        = modWinHvPlatform.NewProc("WHvDeletePartition")
-	procGetPartitionProperty   = modWinHvPlatform.NewProc("WHvGetPartitionProperty")
-	procSetPartitionProperty   = modWinHvPlatform.NewProc("WHvSetPartitionProperty")
-	procMapGpaRange            = modWinHvPlatform.NewProc("WHvMapGpaRange")
-	procUnmapGpaRange          = modWinHvPlatform.NewProc("WHvUnmapGpaRange")
-	procCreateVirtualProcessor = modWinHvPlatform.NewProc("WHvCreateVirtualProcessor")
-	procDeleteVirtualProcessor = modWinHvPlatform.NewProc("WHvDeleteVirtualProcessor")
-	procRunVirtualProcessor    = modWinHvPlatform.NewProc("WHvRunVirtualProcessor")
-	procCancelRunVP            = modWinHvPlatform.NewProc("WHvCancelRunVirtualProcessor")
-	procGetVPRegisters         = modWinHvPlatform.NewProc("WHvGetVirtualProcessorRegisters")
-	procSetVPRegisters         = modWinHvPlatform.NewProc("WHvSetVirtualProcessorRegisters")
+	procGetCapability            = modWinHvPlatform.NewProc("WHvGetCapability")
+	procCreatePartition          = modWinHvPlatform.NewProc("WHvCreatePartition")
+	procSetupPartition           = modWinHvPlatform.NewProc("WHvSetupPartition")
+	procDeletePartition          = modWinHvPlatform.NewProc("WHvDeletePartition")
+	procGetPartitionProperty     = modWinHvPlatform.NewProc("WHvGetPartitionProperty")
+	procSetPartitionProperty     = modWinHvPlatform.NewProc("WHvSetPartitionProperty")
+	procMapGpaRange              = modWinHvPlatform.NewProc("WHvMapGpaRange")
+	procUnmapGpaRange            = modWinHvPlatform.NewProc("WHvUnmapGpaRange")
+	procCreateVirtualProcessor   = modWinHvPlatform.NewProc("WHvCreateVirtualProcessor")
+	procDeleteVirtualProcessor   = modWinHvPlatform.NewProc("WHvDeleteVirtualProcessor")
+	procRunVirtualProcessor      = modWinHvPlatform.NewProc("WHvRunVirtualProcessor")
+	procCancelRunVP              = modWinHvPlatform.NewProc("WHvCancelRunVirtualProcessor")
+	procFlushProcessWriteBuffers = windows.NewLazySystemDLL("kernel32.dll").NewProc("FlushProcessWriteBuffers")
+	procGetVPRegisters           = modWinHvPlatform.NewProc("WHvGetVirtualProcessorRegisters")
+	procSetVPRegisters           = modWinHvPlatform.NewProc("WHvSetVirtualProcessorRegisters")
 
 	// The state calls replace the XSAVE calls on newer builds. Windows 10
 	// version 1809 and later export the XSAVE calls.
@@ -315,6 +316,10 @@ func (b *winBackend) run(index uint32, exit []byte) error {
 
 func (b *winBackend) cancel(index uint32) error {
 	return call(procCancelRunVP, "WHvCancelRunVirtualProcessor", b.partition, uintptr(index), 0)
+}
+
+func (b *winBackend) flushProcessWriteBuffers() {
+	procFlushProcessWriteBuffers.Call()
 }
 
 func (b *winBackend) getRegs(index uint32, rb *regBatch) error {

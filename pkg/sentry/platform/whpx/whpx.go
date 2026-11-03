@@ -337,9 +337,9 @@ func (*Platform) HaveGlobalMemoryBarrier() bool { return true }
 
 // GlobalMemoryBarrier implements platform.Platform.GlobalMemoryBarrier. It
 // cancels every processor that runs guest code and waits until each one left
-// its Switch call. Guest code runs only on these processors, so no other thread
-// needs a barrier. A processor outside Switch needs no kick, because its next
-// enter comes after the call began.
+// its Switch call. A processor outside Switch needs no kick, because its next
+// enter comes after the call began. Threads of the Sentry also pass a barrier,
+// because they access guest memory for system calls in progress.
 //
 // WHY: WHvCancelRunVirtualProcessor makes a running processor exit to the host
 // and the documentation promises no memory ordering for it. The order comes from
@@ -350,6 +350,7 @@ func (*Platform) HaveGlobalMemoryBarrier() bool { return true }
 // wait is longer than a barrier needs, because a cancel in user mode ends
 // Switch with ErrContextInterrupt and the kernel runs the task again.
 func (p *Platform) GlobalMemoryBarrier() error {
+	p.be.flushProcessWriteBuffers()
 	p.mu.Lock()
 	vps := slices.Clone(p.vps)
 	p.mu.Unlock()

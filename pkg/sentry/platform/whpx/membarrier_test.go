@@ -26,6 +26,22 @@ func TestPlatformReportsGlobalMemoryBarrier(t *testing.T) {
 	}
 }
 
+func TestGlobalMemoryBarrierFlushesSentryThreadsOncePerCall(t *testing.T) {
+	fb := newFakeBackend()
+	p := newTestPlatform(t, fb, Options{})
+	for range 3 {
+		if err := p.GlobalMemoryBarrier(); err != nil {
+			t.Fatalf("GlobalMemoryBarrier = %v", err)
+		}
+	}
+	fb.mu.Lock()
+	flushes := fb.flushes
+	fb.mu.Unlock()
+	if flushes != 3 {
+		t.Fatalf("%d flushes of the Sentry write buffers for 3 barriers, want 3", flushes)
+	}
+}
+
 func TestGlobalMemoryBarrierWaitsForRunningProcessors(t *testing.T) {
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})

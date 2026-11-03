@@ -112,10 +112,13 @@ func (*Platform) HaveGlobalMemoryBarrier() bool {
 
 // GlobalMemoryBarrier implements platform.Platform.GlobalMemoryBarrier. It
 // returns after every vCPU that ran guest code at the call has left the guest
-// at least once. Guest code does not run in any other thread, so no further
-// work is needed. A guest thread inside a system call runs Sentry code on a
-// Sentry thread, which the call does not order: the entry to and the return
-// from the system call order the guest side.
+// at least once.
+//
+// The guarantee is narrower than platform.Platform promises. The call orders
+// guest code only. It does not order a Sentry thread that accesses guest memory
+// for a system call in progress, because macOS has no call that forces a barrier
+// on every thread of a process. The entry to and the return from the system call
+// order the guest side. whpx and Windows systrap add FlushProcessWriteBuffers.
 func (p *Platform) GlobalMemoryBarrier() error {
 	p.vm.memoryBarrier()
 	return nil

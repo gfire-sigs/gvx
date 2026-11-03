@@ -70,6 +70,9 @@ type fakeBackend struct {
 	runErr    error
 	info      partitionInfo
 
+	// flushes counts the calls of flushProcessWriteBuffers.
+	flushes int
+
 	// cfg is the configuration of the last createPartition call.
 	cfg partitionConfig
 	// dropXsave lists the XSAVE features that the partition refuses.
@@ -346,6 +349,12 @@ func (fb *fakeBackend) cancel(index uint32) error {
 	vp.cancels++
 	fb.cond.Broadcast()
 	return nil
+}
+
+func (fb *fakeBackend) flushProcessWriteBuffers() {
+	fb.mu.Lock()
+	fb.flushes++
+	fb.mu.Unlock()
 }
 
 func (fb *fakeBackend) getRegs(index uint32, b *regBatch) error {
