@@ -16,6 +16,8 @@ package hostfs
 
 import (
 	"errors"
+	"slices"
+	"strings"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
@@ -112,14 +114,11 @@ func direntTypeOf(l dirListing) uint8 {
 func (fd *dirFD) load() ([]vfs.Dirent, error) {
 	d := fd.dentry
 	fs := d.fs
-	// A listing is a revalidation point: drop what the guest learned about
-	// the entries, so the next lookup asks the host again. See
+	// A listing is a revalidation point for the names: drop the names that
+	// the guest found missing, so the next lookup asks the host again. See
 	// lookupChildLocked for the consistency contract.
 	fs.mu.Lock()
 	d.inode.negChildren = nil
-	for _, c := range d.children {
-		c.inode.invalidateMeta()
-	}
 	fs.mu.Unlock()
 	children, err := fs.ws.listDir(d.path())
 	if err != nil {
@@ -129,6 +128,16 @@ func (fd *dirFD) load() ([]vfs.Dirent, error) {
 	parentIno := d.inode.ino
 	if d.parent != nil {
 		parentIno = d.parent.inode.ino
+	}
+	// A cached entry that the listing shows with the same identity keeps its
+	// metadata until the cache lifetime ends. Any other entry is stale now.
+	for name, c := range d.children {
+		i, found := slices.BinarySearchFunc(children, name, func(l dirListing, name string) int {
+			return strings.Compare(l.name, name)
+		})
+		if !found || !c.inode.matchesListing(children[i]) {
+			c.inode.invalidateMeta()
+		}
 	}
 	fs.mu.Unlock()
 	snap := make([]vfs.Dirent, 0, len(children)+2)
@@ -185,4 +194,18 @@ func (fd *dirFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 		errs = append(errs, err)
 	}
 	return translateHostError(errors.Join(errs...))
+}
+
+// matchesListing reports whether the listing entry l names the same host
+// object as i: the same kind and the same inode number. A listing that carries
+// no inode number matches on the kind alone.
+func (i *inode) matchesListing(l dirListing) bool {
+	if i.virtual || l.virtual {
+		return i.virtual == l.virtual
+	}
+	kind := l.kind
+	if l.special != 0 {
+		kind = hostKindSpecial
+	}
+	return i.kind == kind && (l.ino == 0 || l.ino == i.id.ino)
 }

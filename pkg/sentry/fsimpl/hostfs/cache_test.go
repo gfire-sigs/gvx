@@ -648,14 +648,18 @@ func TestHostChangesBecomeVisibleAfterTheCacheLifetime(t *testing.T) {
 	}
 }
 
-func TestListingRevalidatesCachedEntries(t *testing.T) {
+func TestListingRevalidatesNamesAndReplacedEntries(t *testing.T) {
 	e, _, _ := newCountEnv(t)
 	e.writeFile("grow", []byte("one"))
 	e.mustStat("grow")
 	_, err := e.stat("late")
 	wantErrno(t, "stat of a name that does not exist yet", err, linuxerr.ENOENT)
 
-	if err := os.WriteFile(e.host("grow"), []byte("longer content"), 0o600); err != nil {
+	// A host process replaces grow with another file and creates late.
+	if err := os.WriteFile(e.host("grow.new"), []byte("longer content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(e.host("grow.new"), e.host("grow")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(e.host("late"), []byte("l"), 0o600); err != nil {
@@ -665,10 +669,28 @@ func TestListingRevalidatesCachedEntries(t *testing.T) {
 	// The clock does not move: only the listing can reveal the changes.
 	e.readdir(".")
 	if st := e.mustStat("grow"); st.Size != 14 {
-		t.Fatalf("size after a listing = %d, want 14", st.Size)
+		t.Fatalf("size of the replaced file after a listing = %d, want 14", st.Size)
 	}
 	if _, err := e.stat("late"); err != nil {
 		t.Fatalf("stat of a host-created name after a listing: %v", err)
+	}
+}
+
+func TestListingKeepsMetadataOfUnchangedEntries(t *testing.T) {
+	e, ch, _ := newCountEnv(t)
+	for i := range 20 {
+		e.writeFile(fmt.Sprintf("f%d", i), []byte("x"))
+	}
+	for _, name := range e.readdir(".") {
+		e.mustStat(name)
+	}
+
+	ch.reset()
+	for _, name := range e.readdir(".") {
+		e.mustStat(name)
+	}
+	if got := ch.got("lstatAt"); got != 0 {
+		t.Fatalf("listing and stat of 20 unchanged entries made %d lstatAt calls %s, want 0", got, ch.dump())
 	}
 }
 

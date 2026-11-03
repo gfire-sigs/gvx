@@ -23,7 +23,7 @@ import "testing"
 var syscallBudget = map[string]int{
 	"create small file at depth 5":    5,
 	"stat warm at depth 5":            0,
-	"readdir and stat of 100 entries": 101,
+	"readdir and stat of 100 entries": 1,
 	"rename at depth 5":               8,
 	"chmod at depth 5":                2,
 	"utimens at depth 5":              3,

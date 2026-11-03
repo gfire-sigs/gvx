@@ -649,9 +649,10 @@ func (fs *filesystem) attachChildLocked(parent *dentry, name, rel string, e entr
 //
 // Consistency contract: a result that this filesystem produced or confirmed
 // stays valid for cacheTTL without a host call. A guest mutation of the entry,
-// of a hard link to it, or of its parent drops the result at once, and so
-// does a listing of the parent. A change by a host process, or through another
-// mount of the same host directory, shows up after cacheTTL at the latest.
+// of a hard link to it, or of its parent drops the result at once. A listing
+// of the parent drops the missing names and the entries that now name another
+// host object. A change by a host process, or through another mount of the
+// same host directory, shows up after cacheTTL at the latest.
 func (fs *filesystem) lookupChildLocked(parent *dentry, name string) (*dentry, error) {
 	now := fs.ws.nowNano()
 	child := parent.children[name]
