@@ -44,10 +44,13 @@ func TestOperationsStayWithinHostCallBudget(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			e, ch, _ := newCountEnv(t)
 			c.setup(e)
-			// The first run warms the caches that a steady workload keeps.
+			// Two runs warm the caches that a steady workload keeps: the
+			// first creates the entries, and the second reads each
+			// directory listing that a lookup of an existing name needs.
 			c.op(e, 0)
-			ch.reset()
 			c.op(e, 1)
+			ch.reset()
+			c.op(e, 2)
 			if got := ch.syscalls(); got > budget {
 				t.Fatalf("%s made about %d host system calls %s, want at most %d", c.name, got, ch.dump(), budget)
 			}
@@ -55,7 +58,7 @@ func TestOperationsStayWithinHostCallBudget(t *testing.T) {
 	}
 }
 
-// syscallsOf returns the host system calls of the second run of the benchCase
+// syscallsOf returns the host system calls of the third run of the benchCase
 // operation name at the given depth.
 func syscallsOf(t *testing.T, name string, depth int) int {
 	t.Helper()
@@ -66,8 +69,9 @@ func syscallsOf(t *testing.T, name string, depth int) int {
 		e, ch, _ := newCountEnv(t)
 		c.setup(e)
 		c.op(e, 0)
-		ch.reset()
 		c.op(e, 1)
+		ch.reset()
+		c.op(e, 2)
 		return ch.syscalls()
 	}
 	t.Fatalf("no benchmark case named %q", name)

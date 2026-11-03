@@ -33,9 +33,8 @@ func TestMacAndWindowsKeepEveryXattrInTheMetaStore(t *testing.T) {
 	e.mustSetXattr("f", "user.k", "v")
 	e.mustSetXattr("d", "user.d", "dv")
 	for _, tc := range []struct{ path, name, want string }{{"f", "user.k", "v"}, {"d", "user.d", "dv"}} {
-		e.ws.mu.RLock()
-		got := e.ws.meta[tc.path].Xattrs[tc.name]
-		e.ws.mu.RUnlock()
+		attr, _ := metaRecordAt(e.ws, tc.path)
+		got := attr.Xattrs[tc.name]
 		if string(got) != tc.want {
 			t.Errorf("record of %s holds %q for %s, want %q", tc.path, got, tc.name, tc.want)
 		}

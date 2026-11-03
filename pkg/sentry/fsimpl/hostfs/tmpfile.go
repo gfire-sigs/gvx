@@ -190,12 +190,21 @@ func (w *Workspace) linkTmp(t *tmpFile, rel string, attr POSIXAttr) error {
 	if err := w.checkParentDirLocked(rel); err != nil {
 		return err
 	}
-	if err := w.checkMetaRoomLocked(rel); err != nil {
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return err
 	}
 	oldRel, oldHost, err := w.tmpPaths(t)
 	if err != nil {
 		return err
+	}
+	// The file keeps its identity through the rename, so one stat before it
+	// names the record.
+	info, err := w.host.lstat(oldHost)
+	if err != nil {
+		return err
+	}
+	if !w.keyed(info) {
+		return errMissingIdentity
 	}
 	dst, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
@@ -205,7 +214,7 @@ func (w *Workspace) linkTmp(t *tmpFile, rel string, attr POSIXAttr) error {
 		return err
 	}
 	w.handles.moveFile(oldRel, rel)
-	w.setMetaLocked(rel, attr)
+	w.putRec(w.keyOf(rel, info), attr, rel)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)

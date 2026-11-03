@@ -83,9 +83,7 @@ func (r clutterRules) needsContent(leaf string) bool {
 // isClutterLocked reports whether the host entry leaf in the directory dirRel
 // is host clutter that .gvx_meta does not own. A zero info.kind means that the
 // caller cannot read the entry, for example after a delete event. The verdict
-// then follows the name. A directory is never clutter, and the check returns
-// before it reads .gvx_meta, so a pin open that holds no lock stays safe.
-// Callers hold w.mu, except for a call with a non-regular, known kind.
+// then follows the name. A directory is never clutter.
 func (w *Workspace) isClutterLocked(dirRel, leaf string, info hostInfo) bool {
 	if !w.clutter.candidate(leaf) {
 		return false
@@ -93,7 +91,7 @@ func (w *Workspace) isClutterLocked(dirRel, leaf string, info hostInfo) bool {
 	if info.kind != 0 && info.kind != hostKindRegular {
 		return false
 	}
-	if _, owned := w.meta[joinRelPath(dirRel, w.codec.ToGuest(leaf))]; owned {
+	if w.ownsEntry(dirRel, leaf, info) {
 		return false
 	}
 	if info.kind == 0 {

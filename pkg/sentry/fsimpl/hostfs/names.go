@@ -237,27 +237,17 @@ func leafOf(hostPath string) string {
 
 // mayHaveAlt reports whether a missing entry can still exist under another
 // stored name: .gvx_meta or the alternate-name table knows the name, or the
-// volume treats Unicode forms alike and the name has non-ASCII bytes. A caller
-// that does not hold w.mu passes locked false. The check then reads
-// .gvx_meta only when a try-lock succeeds, because the caller holds pinMu and
-// the lock order puts w.mu first.
-func (w *Workspace) mayHaveAlt(parentRel, name string, locked bool) bool {
+// volume treats Unicode forms alike and the name has non-ASCII bytes. The meta
+// table has its own leaf lock, so a caller that holds pinMu can read it.
+func (w *Workspace) mayHaveAlt(parentRel, name string) bool {
 	if !w.stateful {
 		return false
 	}
 	if w.caps.UnicodeNormalized && !isASCII(name) {
 		return true
 	}
-	if locked {
-		if _, ok := w.meta[joinRelPath(parentRel, name)]; ok {
-			return true
-		}
-	} else if w.mu.TryRLock() {
-		_, ok := w.meta[joinRelPath(parentRel, name)]
-		w.mu.RUnlock()
-		if ok {
-			return true
-		}
+	if w.knowsGuestPath(joinRelPath(parentRel, name)) {
+		return true
 	}
 	_, ok := w.altLeaf(parentRel, name)
 	return ok
@@ -268,10 +258,9 @@ func (w *Workspace) mayHaveAlt(parentRel, name string, locked bool) bool {
 type statLeaf func(leaf string) (hostInfo, error)
 
 // locateIn finds the host entry of the guest name below parentRel. pin is the
-// pinned handle of the directory, or nil. The flag locked reports that the
-// caller holds w.mu. The watcher opens pins without that lock, and a pin opens
-// directories only.
-func (w *Workspace) locateIn(parentRel, name string, pin *dirPin, locked bool, stat statLeaf) (hostProbe, error) {
+// pinned handle of the directory, or nil. The watcher opens pins without
+// w.mu, and a pin opens directories only.
+func (w *Workspace) locateIn(parentRel, name string, pin *dirPin, stat statLeaf) (hostProbe, error) {
 	leaf, err := w.hostLeaf(parentRel, name)
 	if err != nil {
 		return hostProbe{}, err
@@ -296,7 +285,7 @@ func (w *Workspace) locateIn(parentRel, name string, pin *dirPin, locked bool, s
 	case errors.Is(statErr, errNameMismatch):
 		collided = true
 	case errors.Is(statErr, fs.ErrNotExist):
-		if !w.mayHaveAlt(parentRel, name, locked) {
+		if !w.mayHaveAlt(parentRel, name) {
 			return hostProbe{create: leaf, err: statErr}, nil
 		}
 	default:
@@ -380,7 +369,7 @@ func (w *Workspace) locatePathLocked(rel string) (hostProbe, error) {
 	if err != nil {
 		return hostProbe{}, err
 	}
-	return w.locateIn(parent, name, nil, true, func(leaf string) (hostInfo, error) {
+	return w.locateIn(parent, name, nil, func(leaf string) (hostInfo, error) {
 		return w.host.lstat(hostChild(hostDir, leaf))
 	})
 }
@@ -487,7 +476,7 @@ func (w *Workspace) listName(dirRel, leaf string) string {
 	}
 	if w.caps.UnicodeNormalized && !isASCII(leaf) {
 		if n := norm.NFC.String(leaf); n != leaf {
-			if _, explicit := w.meta[joinRelPath(dirRel, leaf)]; !explicit {
+			if !w.knowsGuestPath(joinRelPath(dirRel, leaf)) {
 				return n
 			}
 		}

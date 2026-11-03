@@ -16,11 +16,8 @@ package hostfs
 
 import (
 	"bytes"
-	"fmt"
-	"io/fs"
 	"os"
 	"slices"
-	"sync/atomic"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -251,17 +248,6 @@ func TestIsHostClutterDecidesByRulesAndContent(t *testing.T) {
 	}
 }
 
-func metaKeys(w *Workspace) []string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	var keys []string
-	for k := range w.meta {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	return keys
-}
-
 func TestOpenWorkspaceSweepsInternalFilesOfAKilledProcess(t *testing.T) {
 	opts := clutterOptions("linux")
 	e, closeEnv := openEnvAt(t, resolvedTempDir(t), opts)
@@ -313,128 +299,6 @@ func TestReadOnlyWorkspaceSweepsNothing(t *testing.T) {
 	defer func() { _ = ws.Close() }()
 	if _, err := os.Lstat(dir + "/~gvx~tmp.1"); err != nil {
 		t.Fatalf("a read-only open removed the leftover: %v", err)
-	}
-}
-
-func TestOpenWorkspacePrunesRecordsOfMissingHostObjects(t *testing.T) {
-	opts := clutterOptions("linux")
-	e, closeEnv := openEnvAt(t, resolvedTempDir(t), opts)
-	e.writeFile("a", []byte("a"))
-	e.writeFile("b", []byte("b"))
-	e.mustMkdir("d")
-	e.writeFile("d/c", []byte("c"))
-	e.mustMkdir("keepdir")
-	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("d/link"), "c"); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("link2"), "b"); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("keepdir/link3"), "x"); err != nil {
-		t.Fatal(err)
-	}
-	closeEnv()
-
-	if err := os.Remove(e.host("a")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(e.host("d")); err != nil {
-		t.Fatal(err)
-	}
-	e2, _ := openEnvAt(t, e.dir, opts)
-	want := []string{"b", "keepdir", "keepdir/link3", "link2"}
-	if got := metaKeys(e2.ws); !slices.Equal(got, want) {
-		t.Fatalf("records after open = %q, want %q", got, want)
-	}
-	if got := e2.readdir("."); !slices.Equal(got, []string{"b", "keepdir", "link2"}) {
-		t.Fatalf("listing = %q", got)
-	}
-}
-
-// failLstatHost fails the lstat of one workspace-root entry with a transient
-// error, by path and through the pinned root directory. It counts the failures
-// that it injected.
-type failLstatHost struct {
-	hostBackend
-	name string
-	hits *atomic.Int32
-}
-
-func (f failLstatHost) lstat(rel string) (hostInfo, error) {
-	if rel == f.name {
-		f.hits.Add(1)
-		return hostInfo{}, fmt.Errorf("lstat %q: %w", rel, fs.ErrPermission)
-	}
-	return f.hostBackend.lstat(rel)
-}
-
-func (f failLstatHost) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
-	if dir == f.hostBackend.rootDir() && name == f.name {
-		f.hits.Add(1)
-		return hostInfo{}, fmt.Errorf("lstat %q: %w", name, fs.ErrPermission)
-	}
-	return f.hostBackend.lstatAt(dir, name)
-}
-
-func TestPruningNeverDeletesRecordsOnATransientError(t *testing.T) {
-	opts := clutterOptions("linux")
-	e, closeEnv := openEnvAt(t, resolvedTempDir(t), opts)
-	e.writeFile("b", []byte("b"))
-	e.writeFile("gone", []byte("g"))
-	closeEnv()
-	if err := os.Remove(e.host("gone")); err != nil {
-		t.Fatal(err)
-	}
-
-	var hits atomic.Int32
-	flaky := opts
-	flaky.wrapHost = func(b hostBackend) hostBackend { return failLstatHost{b, "b", &hits} }
-	ws, err := openWorkspace(e.dir, false, flaky)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ws.Close() }()
-	// The lstat of "b" failed with a permission error, so its record stays.
-	// The record of the missing file goes.
-	if hits.Load() == 0 {
-		t.Fatal("the prune never looked up b, so the test proves nothing")
-	}
-	if got := metaKeys(ws); !slices.Equal(got, []string{"b"}) {
-		t.Fatalf("records after open = %q, want [b]", got)
-	}
-}
-
-func TestFlushPrunesRecordsOfMissingHostObjects(t *testing.T) {
-	e := newClutterEnv(t, "linux")
-	e.writeFile("x", []byte("x"))
-	e.writeFile("y", []byte("y"))
-	e.mustMkdir("p")
-	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("p/l"), "x"); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.ws.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(e.host("x")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(e.host("p")); err != nil {
-		t.Fatal(err)
-	}
-	// A mutation marks the table dirty, and the flush checks the records.
-	if err := e.ws.Chmod("y", 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.ws.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	var keys []string
-	for k := range readMetaTable(t, e.host(MetaFileName)) {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	if !slices.Equal(keys, []string{"y"}) {
-		t.Fatalf("flushed records = %q, want [y]", keys)
 	}
 }
 

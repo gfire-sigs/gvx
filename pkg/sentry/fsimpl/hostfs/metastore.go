@@ -16,7 +16,6 @@ package hostfs
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -31,11 +30,13 @@ import (
 // Workspace.meta. The file is an append-only journal of table changes with
 // periodic compaction, in this layout:
 //
-//	header   "GVXMETA" and one version byte
+//	header   "GVXMETA" and one version byte (4)
 //	frame    length (u32, little endian), CRC-32C of the payload (u32), payload
 //	payload  a sequence of operations
-//	set      0x01, key length (uvarint), key, attribute length (uvarint), JSON
-//	delete   0x02, key length (uvarint), key
+//	put      0x01, key, body length (uvarint), body
+//	delete   0x02, key
+//	key      kind byte, then the fields of the kind (see recKind)
+//	body     binary fields of one record (see appendBody)
 //
 // One flush appends one frame, so a crash keeps the whole flush or none of it.
 // A frame whose length runs past the end of the file, or whose checksum fails,
@@ -47,18 +48,21 @@ import (
 // workspace directory. It runs when the journal holds more than
 // journalCompactFactor times the live records plus journalCompactSlack, when
 // the file passes journalMaxBytes, when no journal exists yet, and after a torn
-// tail.
+// tail. The snapshot holds only record pointers, so the table lock covers a
+// pointer copy and never the encoding or the disk write.
 //
-// Earlier releases wrote the whole table as one JSON document. The reader still
-// loads that form. The first flush after such a load writes the journal form,
-// which an earlier release cannot read.
+// Earlier releases wrote the table keyed by guest path: version 3 as a
+// journal with JSON bodies, and older ones as one JSON document. The reader
+// loads both. The loader converts them to the current form at open time, and
+// the first flush of a changed session writes the current form, which an
+// earlier release cannot read.
 
 const (
-	// journalMagic opens every journal file. The legacy JSON form opens with
+	// journalMagic opens every journal file. The oldest JSON form opens with
 	// a brace, so the first byte tells the two forms apart.
 	journalMagic = "GVXMETA"
 	// journalVersion is the version byte that follows journalMagic.
-	journalVersion = 3
+	journalVersion = 4
 	journalHeader  = len(journalMagic) + 1
 
 	frameHeader = 8
@@ -67,9 +71,6 @@ const (
 	maxFrameBytes = 32 << 20
 	// snapshotFrameOps is the number of records in one frame of a snapshot.
 	snapshotFrameOps = 2048
-
-	opSet    = 1
-	opDelete = 2
 
 	// journalCompactFactor and journalCompactSlack bound the journal: it
 	// compacts when its operations exceed factor times the live records
@@ -98,17 +99,24 @@ type metaJournal struct {
 	size int64
 	// ops is the number of operations in the file.
 	ops int
-	// compact marks a table on disk that the next flush must replace: a
-	// legacy JSON file, a torn tail, or a failed append.
+	// compact marks a table on disk that the next flush must replace: an
+	// older form, a torn tail, or a failed append.
 	compact bool
+	// converted marks a table that the loader built from an older form or
+	// from the other key kind. The file keeps that form until the first
+	// flush of a change, so a session without changes leaves it untouched.
+	converted bool
 	// slack replaces journalCompactSlack when positive. Tests set it.
 	slack int
 }
 
-// metaImage is the table that a .gvx_meta file holds.
+// metaImage is the content of a .gvx_meta file.
 type metaImage struct {
-	entries map[string]POSIXAttr
-	// legacy reports the JSON form of earlier releases.
+	// recs holds the records of the current form.
+	recs map[recKey]*rec
+	// paths holds the records of an older form, by guest path.
+	paths map[string]POSIXAttr
+	// legacy reports that the file has an older form.
 	legacy bool
 	// size is the length of the valid part of a journal.
 	size int64
@@ -118,72 +126,33 @@ type metaImage struct {
 	torn bool
 }
 
-// ReadMeta reads the .gvx_meta file at path and returns its records by
-// workspace-relative path. It reads the journal form and the JSON form of
-// earlier releases, and it ignores a torn tail as hostfs does.
-func ReadMeta(path string) (map[string]POSIXAttr, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("hostfs: read %s: %w", path, err)
-	}
-	img, err := parseMeta(raw)
-	if err != nil {
-		return nil, err
-	}
-	return img.entries, nil
-}
-
 // parseMeta decodes the content of a .gvx_meta file.
 func parseMeta(raw []byte) (metaImage, error) {
 	if len(raw) == 0 {
-		return metaImage{entries: map[string]POSIXAttr{}}, nil
+		return metaImage{recs: map[recKey]*rec{}}, nil
 	}
 	if raw[0] == '{' {
-		return parseLegacyMeta(raw)
+		return parseLegacyJSON(raw)
 	}
 	return parseJournal(raw)
-}
-
-func parseLegacyMeta(raw []byte) (metaImage, error) {
-	var parsed metaStoreFile
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return metaImage{}, fmt.Errorf("hostfs: parse %s: %w", MetaFileName, err)
-	}
-	if parsed.Version != metaVersion && parsed.Version != metaVersionV1 {
-		return metaImage{}, fmt.Errorf("hostfs: %s has unsupported version %d", MetaFileName, parsed.Version)
-	}
-	img := metaImage{entries: make(map[string]POSIXAttr, len(parsed.Entries)), legacy: true}
-	for k, v := range parsed.Entries {
-		if key, ok := metaKey(k); ok {
-			img.entries[key] = v
-		}
-	}
-	return img, nil
-}
-
-// metaKey returns the normalized record key for k. It reports false for a key
-// that hostfs does not honor: one that escapes the workspace, names the root,
-// or names a hidden metadata file.
-func metaKey(k string) (string, bool) {
-	clean, err := CleanRelativePath(k)
-	if err != nil || clean == "." || isReservedPath(clean) {
-		return "", false
-	}
-	return clean, true
 }
 
 func parseJournal(raw []byte) (metaImage, error) {
 	if len(raw) < journalHeader && strings.HasPrefix(journalMagic+string(rune(journalVersion)), string(raw)) {
 		// A prefix of the header holds no record. The next flush replaces it.
-		return metaImage{entries: map[string]POSIXAttr{}, torn: true}, nil
+		return metaImage{recs: map[recKey]*rec{}, torn: true}, nil
 	}
 	if len(raw) < journalHeader || string(raw[:len(journalMagic)]) != journalMagic {
 		return metaImage{}, fmt.Errorf("hostfs: %s has an unknown format", MetaFileName)
 	}
-	if v := raw[len(journalMagic)]; v != journalVersion {
+	switch v := raw[len(journalMagic)]; v {
+	case journalVersionV3:
+		return parseJournalV3(raw)
+	case journalVersion:
+	default:
 		return metaImage{}, fmt.Errorf("hostfs: %s has unsupported version %d", MetaFileName, v)
 	}
-	img := metaImage{entries: make(map[string]POSIXAttr), size: int64(journalHeader)}
+	img := metaImage{recs: make(map[recKey]*rec), size: int64(journalHeader)}
 	off := journalHeader
 	for off < len(raw) {
 		payload, ok := nextFrame(raw[off:])
@@ -191,7 +160,7 @@ func parseJournal(raw []byte) (metaImage, error) {
 			img.torn = true
 			break
 		}
-		n, err := applyFrame(payload, img.entries)
+		n, err := applyFrame(payload, img.recs)
 		if err != nil {
 			return metaImage{}, err
 		}
@@ -202,93 +171,24 @@ func parseJournal(raw []byte) (metaImage, error) {
 	return img, nil
 }
 
-// nextFrame returns the payload of the frame at the start of b. It reports
-// false when the frame is incomplete or its checksum fails.
-func nextFrame(b []byte) ([]byte, bool) {
-	if len(b) < frameHeader {
-		return nil, false
-	}
-	n := binary.LittleEndian.Uint32(b)
-	sum := binary.LittleEndian.Uint32(b[4:])
-	if n > maxFrameBytes || int(n) > len(b)-frameHeader {
-		return nil, false
-	}
-	payload := b[frameHeader : frameHeader+int(n)]
-	if crc32.Checksum(payload, castagnoli) != sum {
-		return nil, false
-	}
-	return payload, true
-}
-
-// applyFrame applies the operations of one frame to entries. It returns the
+// applyFrame applies the operations of one frame to recs. It returns the
 // number of operations.
-func applyFrame(payload []byte, entries map[string]POSIXAttr) (int, error) {
+func applyFrame(payload []byte, recs map[recKey]*rec) (int, error) {
 	ops := 0
 	for len(payload) > 0 {
-		op := payload[0]
-		payload = payload[1:]
-		key, rest, ok := cutBytes(payload)
-		if !ok || (op != opSet && op != opDelete) {
+		op, rest, ok := readOp(payload)
+		if !ok {
 			return ops, errMetaCorrupt
 		}
 		payload = rest
-		k := string(key)
-		switch op {
-		case opSet:
-			body, rest, ok := cutBytes(payload)
-			if !ok {
-				return ops, errMetaCorrupt
-			}
-			payload = rest
-			var attr POSIXAttr
-			if err := json.Unmarshal(body, &attr); err != nil {
-				return ops, fmt.Errorf("%w: %w", errMetaCorrupt, err)
-			}
-			if key, ok := metaKey(k); ok {
-				entries[key] = attr
-			}
-		case opDelete:
-			if key, ok := metaKey(k); ok {
-				delete(entries, key)
-			}
+		if op.r == nil {
+			delete(recs, op.key)
+		} else {
+			recs[op.key] = op.r
 		}
 		ops++
 	}
 	return ops, nil
-}
-
-// cutBytes splits a length-prefixed byte string off the front of b.
-func cutBytes(b []byte) (field, rest []byte, ok bool) {
-	n, w := binary.Uvarint(b)
-	if w <= 0 || n > uint64(len(b)-w) {
-		return nil, nil, false
-	}
-	return b[w : w+int(n)], b[w+int(n):], true
-}
-
-// metaOp is one journal operation: a record to set, or a key to delete.
-type metaOp struct {
-	key   string
-	attr  POSIXAttr
-	erase bool
-}
-
-// appendOp encodes op at the end of buf.
-func appendOp(buf []byte, op metaOp) ([]byte, error) {
-	if op.erase {
-		buf = append(buf, opDelete)
-		buf = binary.AppendUvarint(buf, uint64(len(op.key)))
-		return append(buf, op.key...), nil
-	}
-	body, err := json.Marshal(op.attr)
-	if err != nil {
-		return buf, fmt.Errorf("hostfs: encode %s record %q: %w", MetaFileName, op.key, err)
-	}
-	buf = append(buf, opSet)
-	buf = binary.AppendUvarint(buf, uint64(len(op.key)))
-	buf = append(buf, op.key...)
-	buf = binary.AppendUvarint(buf, uint64(len(body)))
-	return append(buf, body...), nil
 }
 
 // appendFrame wraps payload in a frame at the end of buf.
@@ -298,39 +198,10 @@ func appendFrame(buf, payload []byte) []byte {
 	return append(buf, payload...)
 }
 
-// setMetaLocked stores the record of rel and schedules its write. Callers hold
-// w.mu for writing.
-func (w *Workspace) setMetaLocked(rel string, attr POSIXAttr) {
-	w.meta[rel] = attr
-	w.markMetaLocked(rel)
-}
-
-// delMetaLocked removes the record of rel and schedules the removal. A key
-// without a record needs no write. Callers hold w.mu for writing.
-func (w *Workspace) delMetaLocked(rel string) {
-	if _, ok := w.meta[rel]; !ok {
-		if _, pending := w.metaDirty[rel]; !pending {
-			return
-		}
-	}
-	delete(w.meta, rel)
-	w.markMetaLocked(rel)
-}
-
-// markMetaLocked records that the record of rel changed since the last flush
-// and wakes the background flusher. Callers hold w.mu for writing.
-func (w *Workspace) markMetaLocked(rel string) {
-	w.metaDirty[rel] = struct{}{}
-	if w.kick != nil {
-		select {
-		case w.kick <- struct{}{}:
-		default:
-		}
-	}
-}
-
-// loadMeta reads .gvx_meta into w.meta. A torn tail of the journal drops out,
-// and the next flush replaces the file.
+// loadMeta reads .gvx_meta into the table. A torn tail of the journal drops
+// out, and the next flush replaces the file. A file of an older form, or of the
+// other key kind, converts in memory and stays on disk until the next flush of
+// a change.
 func (w *Workspace) loadMeta() error {
 	f, err := w.host.open(MetaFileName, os.O_RDONLY, 0)
 	if err != nil {
@@ -352,12 +223,16 @@ func (w *Workspace) loadMeta() error {
 	if err != nil {
 		return err
 	}
-	w.meta = img.entries
 	w.journal.size, w.journal.ops = img.size, img.ops
 	w.journal.compact = len(raw) == 0 || img.legacy || img.torn
-	// Records of host files that vanished while no guest ran are dead state.
-	w.pruneOrphansLocked(len(w.meta))
-	w.pruneKeys, w.pruneCursor = nil, 0
+	recs, converted := w.importImage(img)
+	if converted {
+		w.journal.compact = true
+		w.journal.converted = true
+	}
+	for k, r := range recs {
+		w.meta.load(k, r)
+	}
 	return nil
 }
 
@@ -395,76 +270,44 @@ func (w *Workspace) flushMeta() error {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 
-	w.mu.RLock()
-	pending := len(w.metaDirty) > 0
-	w.mu.RUnlock()
-	if !pending {
+	pending := w.meta.pending()
+	if pending == 0 {
 		return nil
 	}
-	// Drop the records whose host object vanished before they go to disk.
-	// One batch per flush keeps the pause short, and the batch locks the
-	// table for one record at a time.
-	w.pruneOrphans(pruneBatch)
-
-	w.mu.Lock()
-	dirty := w.metaDirty
-	w.metaDirty = make(map[string]struct{})
-	compact := w.journal.compact || w.journalFullLocked(len(dirty))
-	var ops []metaOp
-	if compact {
-		// Every record lands in the snapshot, so the dirty keys need no
-		// operation of their own. The copy is shallow: the xattr maps are
-		// immutable.
-		ops = make([]metaOp, 0, len(w.meta))
-		for k, v := range w.meta {
-			ops = append(ops, metaOp{key: k, attr: v})
-		}
-	} else {
-		ops = make([]metaOp, 0, len(dirty))
-		for k := range dirty {
-			v, ok := w.meta[k]
-			ops = append(ops, metaOp{key: k, attr: v, erase: !ok})
-		}
-	}
-	w.mu.Unlock()
+	full := w.journal.compact || w.journalFull(pending)
+	ops, dirty := w.meta.takeBatch(full)
 
 	var err error
-	if compact {
+	if full {
 		err = w.compactMeta(ops)
 	} else {
 		err = w.appendMeta(ops)
 		if errors.Is(err, errFrameTooLarge) {
 			// The batch cannot stay atomic in one frame. A snapshot can.
-			w.mu.RLock()
-			ops = ops[:0]
-			for k, v := range w.meta {
-				ops = append(ops, metaOp{key: k, attr: v})
-			}
-			w.mu.RUnlock()
+			var more []recKey
+			ops, more = w.meta.takeBatch(true)
+			dirty = append(dirty, more...)
 			err = w.compactMeta(ops)
 		}
 	}
 	if err != nil {
 		// The changes stay pending. The records are read again at the next
 		// flush, so a later change of the same key wins.
-		w.mu.Lock()
-		for k := range dirty {
-			w.metaDirty[k] = struct{}{}
-		}
-		w.mu.Unlock()
+		w.meta.restore(dirty)
 		return err
 	}
+	w.journal.converted = false
 	return nil
 }
 
-// journalFullLocked reports whether the journal, with n more operations, passes
-// its bound. Callers hold w.mu and w.flushMu.
-func (w *Workspace) journalFullLocked(n int) bool {
+// journalFull reports whether the journal, with n more operations, passes its
+// bound. Callers hold w.flushMu.
+func (w *Workspace) journalFull(n int) bool {
 	slack := journalCompactSlack
 	if w.journal.slack > 0 {
 		slack = w.journal.slack
 	}
-	return w.journal.ops+n > journalCompactFactor*len(w.meta)+slack || w.journal.size > journalMaxBytes
+	return w.journal.ops+n > journalCompactFactor*w.meta.size()+slack || w.journal.size > journalMaxBytes
 }
 
 var errFrameTooLarge = errors.New("hostfs: metadata batch exceeds one frame")
@@ -474,10 +317,7 @@ var errFrameTooLarge = errors.New("hostfs: metadata batch exceeds one frame")
 func (w *Workspace) appendMeta(ops []metaOp) error {
 	var payload []byte
 	for _, op := range ops {
-		var err error
-		if payload, err = appendOp(payload, op); err != nil {
-			return err
-		}
+		payload = appendOp(payload, op)
 		if len(payload) > maxFrameBytes {
 			return errFrameTooLarge
 		}
@@ -545,7 +385,7 @@ func (w *Workspace) compactMeta(ops []metaOp) (err error) {
 			return herr
 		}
 	}
-	w.closeJournal()
+	_ = w.closeJournal()
 	if rerr := w.host.rename(metaTempName, MetaFileName); rerr != nil {
 		return fmt.Errorf("hostfs: replace %s: %w", MetaFileName, rerr)
 	}
@@ -586,10 +426,7 @@ func writeSnapshot(f *os.File, ops []metaOp) (int64, error) {
 		return err
 	}
 	for i, op := range ops {
-		var err error
-		if payload, err = appendOp(payload, op); err != nil {
-			return size, err
-		}
+		payload = appendOp(payload, op)
 		if (i+1)%snapshotFrameOps == 0 || len(payload) > maxFrameBytes/2 {
 			if err := flush(); err != nil {
 				return size, err

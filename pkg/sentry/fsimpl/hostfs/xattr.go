@@ -146,7 +146,31 @@ func (w *Workspace) metaXattrsLocked(t xattrTarget) map[string][]byte {
 	if t.rel == "" {
 		return t.ino.snapshot().attr.Xattrs
 	}
-	return w.meta[t.rel].Xattrs
+	if r := w.meta.get(w.targetKeyLocked(t)); r != nil {
+		return r.attr.Xattrs
+	}
+	return nil
+}
+
+// targetKeyLocked returns the key of the record of the named object t. A file
+// reads its identity from the inode, which a rename never changes. A virtual
+// symbolic link and a table that keys on paths read the path of the call.
+// Callers hold w.mu.
+func (w *Workspace) targetKeyLocked(t xattrTarget) recKey {
+	if t.ino.virtual || w.pathKeys {
+		if t.ino.virtual {
+			k, _ := w.nameKeyLocked(t.rel)
+			return k
+		}
+		return recKey{kind: kindPath, path: t.rel}
+	}
+	if k := t.ino.snapshot().key; k != (recKey{}) {
+		return k
+	}
+	if e, err := w.lookupLocked(t.rel); err == nil {
+		return e.key
+	}
+	return recKey{}
 }
 
 // storeXattrsLocked replaces the attributes that the meta store holds for t.
@@ -169,22 +193,22 @@ func (w *Workspace) storeXattrsLocked(t xattrTarget, next map[string][]byte) err
 		// A host symbolic link has no record, and a record would hide it.
 		return linuxerr.EOPNOTSUPP
 	}
-	if err := w.checkMetaRoomLocked(t.rel); err != nil {
+	if err := w.checkMetaRoom(e.key); err != nil {
 		return translateHostError(err)
 	}
 	now := time.Now().UnixNano()
-	rec := e.attr
-	rec.Xattrs = next
-	rec.Ctime = now
-	w.setMetaLocked(t.rel, rec)
+	attr := e.attr
+	attr.Xattrs = next
+	attr.Ctime = now
+	w.putRec(e.key, attr, t.rel)
 	// The snapshot of the inode follows the record, so an open descriptor of
 	// a file that the guest unlinks later still sees the attributes.
 	t.ino.attrMu.Lock()
 	t.ino.cur.attr.Xattrs = next
 	t.ino.cur.attr.Ctime = now
 	t.ino.attrMu.Unlock()
-	if e.info.nlink > 1 && !e.isDir() && !e.virtual {
-		if err := w.propagateLinkAttrLocked(t.rel, e.info.id, rec); err != nil {
+	if w.pathKeys && e.info.nlink > 1 && !e.isDir() && !e.virtual {
+		if err := w.propagateLinkAttrLocked(t.rel, e.info.id, attr); err != nil {
 			return translateHostError(err)
 		}
 	}

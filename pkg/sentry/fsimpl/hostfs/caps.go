@@ -43,6 +43,16 @@ type WorkspaceCaps struct {
 	NativeRenameSwap bool
 	// NativeFallocate reports that the host preallocates file space.
 	NativeFallocate bool
+	// StableIDs reports that each file of the volume has an identity that
+	// outlives a rename and that no later file reuses: a birth time with the
+	// inode number on Linux and macOS, FILE_ID_INFO on Windows. A volume
+	// with StableIDs keys the .gvx_meta records on the identity. Any other
+	// volume keys them on the guest path.
+	StableIDs bool
+	// ExistsByID reports that the host opens a file by its identity, so
+	// hostfs can tell whether the file of a record still exists without
+	// walking the tree. Only Windows has it.
+	ExistsByID bool
 }
 
 // Caps returns the capabilities of the host volume that the probe recorded.
