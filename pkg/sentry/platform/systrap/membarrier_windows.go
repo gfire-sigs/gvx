@@ -63,10 +63,9 @@ func (*Platform) HaveGlobalMemoryBarrier() bool { return true }
 //
 // The call holds th.mu of every thread from before the first suspension until
 // after the last resume, like every other operation on a suspend count, so it
-// cannot leave a thread with the wrong count. Two calls would lock the threads
-// in different orders, so barrierMu serializes them. The call locks every
-// thread before it suspends any, so a suspended guest thread never waits for a
-// lock that another operation holds.
+// cannot leave a thread with the wrong count. barrierMu serializes the calls.
+// The call locks every thread before it suspends any, so a suspended guest
+// thread never waits for a lock that another operation holds.
 //
 // Suspending all threads first and reading the contexts afterwards overlaps
 // the time that each thread needs to leave user mode.
@@ -81,17 +80,7 @@ func (p *Platform) GlobalMemoryBarrier() error {
 	p.barrierMu.Lock()
 	defer p.barrierMu.Unlock()
 
-	var held []*thread
-	for _, sp := range p.dbg.stubs() {
-		sp.mu.Lock()
-		for _, th := range sp.threads {
-			held = append(held, th)
-		}
-		sp.mu.Unlock()
-	}
-	for _, th := range held {
-		th.mu.Lock()
-	}
+	held := lockAllThreads(p.dbg.stubs())
 	defer func() {
 		for _, th := range held {
 			th.mu.Unlock()
@@ -123,6 +112,43 @@ func (p *Platform) GlobalMemoryBarrier() error {
 		return unix.EAGAIN
 	}
 	return nil
+}
+
+// lockAllThreads locks th.mu of every thread of the stubs. It never waits for
+// one lock while it holds another: a thread that waits for an event of the
+// debug pump while it holds its lock needs the Switch of another thread to
+// reply, and that Switch needs its own lock. When a lock is busy, the call
+// releases every lock it holds, waits until the busy lock is free, and starts
+// again.
+func lockAllThreads(stubs []*stubProc) []*thread {
+	var all []*thread
+	for _, sp := range stubs {
+		sp.mu.Lock()
+		for _, th := range sp.threads {
+			all = append(all, th)
+		}
+		sp.mu.Unlock()
+	}
+	held := make([]*thread, 0, len(all))
+	for {
+		held = held[:0]
+		var busy *thread
+		for _, th := range all {
+			if !th.mu.TryLock() {
+				busy = th
+				break
+			}
+			held = append(held, th)
+		}
+		if busy == nil {
+			return held
+		}
+		for _, th := range held {
+			th.mu.Unlock()
+		}
+		busy.mu.Lock()
+		busy.mu.Unlock()
+	}
 }
 
 // mayRunGuest reports whether the thread can run guest code. A parked thread,
