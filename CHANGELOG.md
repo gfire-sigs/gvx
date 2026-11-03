@@ -15,6 +15,15 @@ This section records changes that no release contains yet.
   - On `windows/arm64`, a fast `svc` overwrote a live `x18` of the guest with a stale value, unless the guest set `x18` with `mov x18, xN`. The `svc` slot now saves `x18` first, so every `svc` keeps it. A guest whose stack pointer is invalid still gets its system call through the debug path. The patcher no longer rewrites `mov x18, xN`, which leaves 289 rewritten encodings instead of 320.
   - On `windows/arm64`, every `ic ivau` of a guest cost one debug stop. The engine now replaces the instruction with `nop`, and `CTR_EL0` reports `DIC` and `IDC` for the guest. Guests that obey these bits, such as V8, skip the instruction.
 
+### Behavior Changes
+
+- **Faster `hostfs` and a journal for `.gvx_meta`**: `hostfs` serves `-workspace`, bind mounts, and `driver=hostfs` volumes. Measured on an Apple M1 with `hvf`, the guest creates 10,000 files in 1.2 s to 2.0 s (was 2.4 s to 2.6 s), runs `ls -lR` over them in 0.4 s (was 1.0 s), extracts a tree of 2,000 files with `tar x` in 0.7 s (was 1.6 s), and runs 300 rounds of `dd conv=fsync` plus `mv` in 3.8 s (was 10.4 s). A `docker pull nginx:alpine` on `hostfs` went from 44 s to 41 s, because the host file system dominates that workload.
+  - Every lookup, mutation, and directory listing now goes through the pinned handle of the directory. A `create`, `rename`, `chmod`, `utimensat`, or `link` at depth 5 made 7 to 34 host system calls and now makes 2 to 8.
+  - A directory listing reads the entry type and the inode number from the directory record, and no longer stats each entry. A `stat` of each entry after an `ls` makes no host call. Metadata that a host process changes for an existing entry shows up after 1 s, as for every other host change.
+  - A write no longer drops the cached identity of a file, so an `fstat` of an open file makes no path lookup.
+  - `.gvx_meta` is an append-only journal with checksummed frames and periodic compaction. A flush with 100,000 records took 83 ms and now takes about 5 ms, which is the cost of the host flush call. `fsync`, `fdatasync`, `sync`, and writes with `O_SYNC` keep their durability, and a table without changes costs no host call. A crash can leave a torn last frame, which the next start ignores.
+  - **Upgrade note**: the first write to a workspace or a volume that has a JSON `.gvx_meta` converts the file to the journal form. A release before this one cannot open a converted workspace: it fails with a parse error for `.gvx_meta`. Keep a copy of `.gvx_meta` before you convert a workspace that an older release must open again. A session that changes nothing leaves the JSON file as it is.
+
 ## [v0.6.10002026110200] - 2026-11-03
 
 This release updates the Sentry to gVisor `release-20261102.0` and introduces a new version format. `AGENTS.md`, section 5.2, defines the format.

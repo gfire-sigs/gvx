@@ -506,9 +506,15 @@ The sandbox applies the image settings with Docker rules. The `Entrypoint` and `
 
 `hostfs` anchors the workspace mount using `os.OpenRoot(hostWorkspacePath)` before sandbox lockdown. On Windows (`inode_windows.go`), every file open invokes `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` pinned to the `os.Root` handle and enforces `FILE_OPEN_REPARSE_POINT`. On macOS (`inode_darwin.go`), `os.OpenRoot` uses `openat(dirfd, ..., O_NOFOLLOW | O_SYMLINK)` so the XNU kernel never traverses symbolic links or firmlinks pointing outside `/workspace`.
 
-On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` on open files via `NtSetInformationFile(FileRenameInformationEx)` with `FILE_RENAME_POSIX_SEMANTICS`, and `unlink(2)` via `FileDispositionInfoEx`. NTFS refuses to rename a directory that has an open descendant, so `hostfs` closes and reopens the descendant handles around the rename. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table atomically to `.gvx_meta`.
+On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` on open files via `NtSetInformationFile(FileRenameInformationEx)` with `FILE_RENAME_POSIX_SEMANTICS`, and `unlink(2)` via `FileDispositionInfoEx`. NTFS refuses to rename a directory that has an open descendant, so `hostfs` closes and reopens the descendant handles around the rename. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table to `.gvx_meta` as an append-only journal. See "Extended Operations and Durability" below.
 
 `hostfs` opens a child through a pinned handle of its parent directory, with `NtCreateFile` and `RootDirectory` on Windows and `openat` on Unix. A lookup of one name then makes one host call, and a path of depth `D` no longer walks from the root at each level. A `Workspace` owns the pinned handles, caps them at 256, and closes idle handles after 5 seconds. It closes the handles in a subtree before a directory rename or a directory removal. Windows refuses to rename or remove a directory with an open handle.
+
+Every lookup, mutation, and listing of an entry uses the pinned handle of the directory that holds it. The host backend takes the handle and one name for `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`, `utimensat`, and the listing, and it refuses a name with a separator. These calls make one host call for the name at any depth. A handle follows its directory when a host process moves it. A host swap of a directory therefore shows up after the cache lifetime, as every other host change does.
+
+A listing reads the type and the inode number of each entry from the directory record: `d_type` and `d_ino` of `getdents` on Unix, and `FILE_ID_BOTH_DIR_INFO` on Windows. An entry of unknown type costs one `lstat`. A listing drops the cached missing names and the cached entries that now name another host object or kind. It keeps the cached metadata of every other entry until the cache lifetime ends.
+
+A write changes only the size and the times of the host file, and the host picks the new times. The inode keeps its cached identity, mode, and owner valid and marks the times stale. An `fstat` of an open file reads size and times from its handle and makes no path lookup. A `stat` of the path reads the host again.
 
 A host volume that sets `LocksOpenDirMove` gets a registry of the open regular-file handles (`winHandleRegistry`). Every read, write, and mapped-page write-back reaches the host file through a `hostHandle` lock. A directory rename holds `Workspace.mu`, flushes the mapped pages, and takes the lock of each handle below the directory in path order. It closes the files, renames the directory, and reopens each file at the new path with the original access mode. It verifies the host identity of each reopened file.
 
@@ -560,7 +566,20 @@ A guest symbolic link lives only in `.gvx_meta`. The host never receives a link,
 
 `fallocate` supports mode 0, `FALLOC_FL_KEEP_SIZE`, and `FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`. A volume or a range that the host call cannot serve takes a zero-fill emulation. A linkable `O_TMPFILE` file keeps a hidden `~gvx~tmp` host file until the last reference ends. The host seccomp rule refuses `linkat` with `AT_EMPTY_PATH`. An `O_TMPFILE|O_EXCL` file uses native `O_TMPFILE` on Linux. A file with no name reports a link count of zero. A running program makes every write open, `truncate`, and writable shared mapping fail with `ETXTBSY`. `statfs` reports the host volume.
 
-Metadata mutations reach `.gvx_meta` after 250 ms. `fsync`, `fdatasync`, `sync`, and writes with `O_SYNC` or `O_DSYNC` skip that delay. They flush the mapped pages, the host file, the directory entry, and the table.
+Metadata mutations reach `.gvx_meta` after 250 ms. `fsync`, `fdatasync`, `sync`, and writes with `O_SYNC` or `O_DSYNC` skip that delay. They flush the mapped pages, the host file, the directory entry, and the table. A table without changes costs no host call.
+
+`.gvx_meta` is an append-only journal of table changes. The file starts with the header `GVXMETA` and the version byte 3. Each flush appends one frame: a 4-byte length, a 4-byte CRC-32C of the payload, and the payload. The payload holds one operation for each changed path: `set` with the JSON record, or `delete`. One frame for each flush keeps the flush atomic, so a crash keeps the whole flush or none of it. The loader ignores a frame that is incomplete or fails its checksum, and it ignores the bytes after that frame. The next flush then rewrites the file.
+
+A flush appends one frame and flushes the file. It rewrites the file, which this document calls a compaction, in four cases:
+
+- No journal exists yet.
+- The journal has a torn tail.
+- The journal holds more than twice the live records plus 1,024 operations.
+- The file passes 64 MiB.
+
+A compaction writes a snapshot to `.gvx_meta.tmp`, flushes it, renames it over `.gvx_meta`, and flushes the workspace directory. A failed flush keeps its records pending, and the next flush retries them. The prune of records whose host object is gone runs before a flush, and it locks the table for one record at a time.
+
+Earlier releases wrote the table as one JSON document and rewrote it at each flush. The loader still reads that form. The first flush with a change converts the file, and a session without changes leaves it as it is. An earlier release fails to open a workspace that has the journal form, with a parse error for `.gvx_meta`. `hostfs.ReadMeta` reads both forms for tools.
 
 #### Special Files and Extended Attributes (Descriptive Module)
 

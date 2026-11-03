@@ -239,6 +239,8 @@ When a guest writes or renames a file, the VFS method in `pkg/sentry/fsimpl/host
 
 `hostfs` stores POSIX metadata in `.gvx_meta` at the workspace root. Ordinary metadata mutations (`chmod`, `chown`, `symlink`, `setxattr`) update `Workspace.meta` in memory and trigger a background coalesced write every `250ms` (`defaultCoalesceWindow`). Guest databases and applications require strict durability when they call `fsync`, `fdatasync`, `sync`, or write with `O_SYNC` or `O_DSYNC`. On those calls, `regularFD.Sync` and `directoryFD.Sync` bypass the coalesce timer. They synchronously flush dirty mapped pages (`inode.data.syncData`), the host file (`fd.h.sync`), `.gvx_meta` (`ws.Sync`), and the parent directory (`ws.syncDir`).
 
+The file form of `.gvx_meta` is an append-only journal with periodic compaction. `docs/architecture.md`, section 3.7, describes it.
+
 ```go
 // POSIXAttr holds the persisted POSIX metadata of one workspace-relative entry
 // in .gvx_meta (schema version 2).
