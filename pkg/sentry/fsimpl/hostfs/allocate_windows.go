@@ -39,12 +39,13 @@ type fileStandardInfo struct {
 // allocateNative serves a fallocate request on Windows. Mode 0 and KEEP_SIZE
 // raise the allocation size of the handle, which reserves the clusters. Mode 0
 // then raises the end of file. Neither call ever shrinks the file, because a
-// smaller allocation size would truncate it. A punch needs a sparse file, so
-// the host reports it as unsupported and the caller writes zeros.
+// smaller allocation size would truncate it. A punch makes the file sparse and
+// frees the clusters (see punchNative). A volume that cannot do it reports the
+// punch as unsupported, and the caller writes zeros.
 // Source: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_allocation_info
 func allocateNative(f *os.File, mode uint64, off, length int64) error {
 	if mode&linux.FALLOC_FL_PUNCH_HOLE != 0 {
-		return fmt.Errorf("hostfs: fallocate: punch hole: %w", errHostUnsupported)
+		return punchNative(f, off, length)
 	}
 	if err := withFileHandle(f, func(handle windows.Handle) error {
 		return reserve(handle, mode&linux.FALLOC_FL_KEEP_SIZE == 0, off+length)
