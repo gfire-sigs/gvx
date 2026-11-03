@@ -361,8 +361,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			as.blocks[base] = &execBlock{base: base, src: srcs[i], srcSec: sec, srcOff: secOff + uint64(i)*blockSize, at: at, state: blockData}
 		}
 	}
-	as.aliasMappedLocked(guest, fr.Length(), sec, secOff, at, keep)
-	return nil
+	return as.aliasMappedLocked(guest, fr.Length(), sec, secOff, at, keep)
 }
 
 // mapErr reports a dead stub as such.
@@ -548,12 +547,17 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	var entry *copyEntry
 	if key, ok := blk.frameID(); ok {
 		entry = &copyEntry{as: as, base: base, key: key}
-		lowerHits(as.p.alias.begin(entry), key)
+		hits := as.p.alias.begin(entry)
 		defer func() {
 			if entry != nil {
 				as.p.alias.remove(entry)
 			}
 		}()
+		// A view that stays writable next to a copy can run stale code, so a
+		// failure stops the patch.
+		if err := lowerHits(hits, key); err != nil {
+			return err
+		}
 	}
 
 	// The guest can write the original frame while this copy runs when the
@@ -652,8 +656,8 @@ func (as *addressSpace) restoreData(base uint64) (bool, error) {
 		return false, err
 	}
 	if aliased {
-		for _, e := range as.p.alias.invalidate(key) {
-			e.as.dropExecCopy(e)
+		if err := as.p.alias.dropAll(key); err != nil {
+			return false, err
 		}
 	}
 	return true, nil
@@ -679,7 +683,7 @@ func (as *addressSpace) returnToDataLocked(blk *execBlock) error {
 		blk.entry = nil
 	}
 	if key, ok := blk.frameID(); ok && blk.at.Write {
-		as.relowerLocked(blk.base, key)
+		return as.relowerLocked(blk.base, key)
 	}
 	return nil
 }

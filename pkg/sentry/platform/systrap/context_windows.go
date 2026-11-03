@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync/atomic"
@@ -195,6 +196,9 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
+	if f := th.fast.Load(); f != nil {
+		f.stops.Add(1)
+	}
 	if traceEvents {
 		kind := kindOf(ev)
 		stopStats.count[kind].Add(1)
@@ -354,15 +358,26 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			// names an address in the next block, and pc stays in the block
 			// that is already executable. The loop patches every block that
 			// the fetch window of the instruction touches.
-			patched := false
+			patched, raced := false, false
 			for base := blockRound(pc); base < pc+fetchWindow; base += blockSize {
 				if st, _, ok := as.blockStateOf(base); !ok || st != blockData {
 					continue
 				}
-				if err := as.patchBlock(ctx, mm, base); err != nil {
+				if err := as.patchBlock(ctx, mm, base); errors.Is(err, errPatchRaced) {
+					// Writes through another view of the frame kept changing it
+					// while the engine copied it. The thread fetches again.
+					raced = true
+					continue
+				} else if err != nil {
 					return fatal(fmt.Errorf("patch the code page at %#x: %w", base, err), unix.ENOMEM)
 				}
 				patched = true
+			}
+			if raced && !patched {
+				if err := th.continueUnchanged(ev); err != nil {
+					return fatal(err, unix.EFAULT)
+				}
+				return running
 			}
 			if patched {
 				th.execRepeats = 0
@@ -393,7 +408,17 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			}
 		}
 	case avWrite:
-		if as.aliasWriteFault(addr) {
+		if as.lowersOwnFrame(addr, th.guestPC(pc)) {
+			// The guest writes the frame that it runs, through another view.
+			// Dropping the copy would send the thread back to this store, and
+			// the fetch would copy the page and lower the view again. The
+			// engine reports the fault instead, as for a store into the page
+			// that the thread executes.
+			break
+		}
+		if handled, err := as.aliasWriteFault(addr); err != nil {
+			return fatal(err, unix.ENOMEM)
+		} else if handled {
 			// The write hit a view that the engine lowered because another view
 			// holds a patched copy of the frame. The copy is gone now.
 			if err := continueFault(ev); err != nil {

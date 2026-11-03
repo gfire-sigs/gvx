@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"fmt"
 	"slices"
 	"sort"
 	"sync"
@@ -176,33 +177,37 @@ func (x *aliasIndex) removeLocked(e *copyEntry) {
 	x.dropIfEmptyLocked(bk, b)
 }
 
-// invalidate poisons the pending copies of a frame and removes its installed
-// copies. It returns the installed copies, which the owners must drop.
+// invalidate poisons the pending copies of a frame and returns its installed
+// copies, which the owners must drop. An installed copy stays in the index until
+// its owner drops it. A second writer then still sees a live copy and keeps its
+// view lowered until the first drop finishes.
 func (x *aliasIndex) invalidate(key frameKey) []*copyEntry {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	bk := frameBucket(key)
-	b := x.buckets[bk]
+	b := x.buckets[frameBucket(key)]
 	if b == nil {
 		return nil
 	}
-	var dropped []*copyEntry
-	var keep []*copyEntry
+	var installed []*copyEntry
 	for _, e := range b.copies[key.off] {
 		if e.installed {
-			dropped = append(dropped, e)
-			continue
+			installed = append(installed, e)
+		} else {
+			e.poisoned = true
 		}
-		e.poisoned = true
-		keep = append(keep, e)
 	}
-	if len(keep) == 0 {
-		delete(b.copies, key.off)
-	} else {
-		b.copies[key.off] = keep
+	return installed
+}
+
+// dropAll drops every installed copy of key and reports the first failure.
+func (x *aliasIndex) dropAll(key frameKey) error {
+	var first error
+	for _, e := range x.invalidate(key) {
+		if err := e.as.dropExecCopy(e); err != nil && first == nil {
+			first = err
+		}
 	}
-	x.dropIfEmptyLocked(bk, b)
-	return dropped
+	return first
 }
 
 // otherCopy reports whether a live copy of key exists that is not the copy of
@@ -292,51 +297,57 @@ func (blk *execBlock) frameID() (frameKey, bool) {
 }
 
 // lowerAliasLocked makes the view page at va read-only when it is a writable
-// view of the frame key. Callers hold as.mu.
-func (as *addressSpace) lowerAliasLocked(va uint64, key frameKey) {
+// view of the frame key. A failure leaves a writable view next to a copy, which
+// can run stale code, so the caller must not install the copy. Callers hold
+// as.mu.
+func (as *addressSpace) lowerAliasLocked(va uint64, key frameKey) error {
 	if as.released || as.sp.dead.Load() {
-		return
+		return nil
 	}
 	vi, _, ok := as.win.Lookup(va)
 	if !ok || vi.prot != viewReadWrite || vi.off != key.off {
-		return
+		return nil
 	}
 	if sec, ok := vi.backing.(*sectionRef); !ok || sec.file != key.file {
-		return
+		return nil
 	}
 	if err := as.win.Protect(va, blockSize, viewRead); err != nil {
-		if traceEvents {
-			tracef("lower the view at %#x: %v", va, err)
-		}
-		return
+		return as.mapErr(fmt.Errorf("lower the view at %#x: %w", va, err))
 	}
 	if as.aliasProt == nil {
 		as.aliasProt = make(map[uint64]frameKey)
 	}
 	as.aliasProt[va] = key
+	return nil
 }
 
-// lowerHits lowers the writable views that begin found.
-func lowerHits(hits []viewHit, key frameKey) {
+// lowerHits lowers the writable views that begin found. It reports the first
+// failure.
+func lowerHits(hits []viewHit, key frameKey) error {
+	var first error
 	for _, h := range hits {
 		h.as.mu.Lock()
-		h.as.lowerAliasLocked(h.va, key)
+		if err := h.as.lowerAliasLocked(h.va, key); err != nil && first == nil {
+			first = err
+		}
 		h.as.mu.Unlock()
 	}
+	return first
 }
 
 // relowerLocked lowers the writable view at va again when another copy of its
 // frame exists. A block that returns to data state needs it. Callers hold as.mu.
-func (as *addressSpace) relowerLocked(va uint64, key frameKey) {
+func (as *addressSpace) relowerLocked(va uint64, key frameKey) error {
 	if as.p.alias.otherCopy(key, as, va) {
-		as.lowerAliasLocked(va, key)
+		return as.lowerAliasLocked(va, key)
 	}
+	return nil
 }
 
 // aliasMappedLocked updates the index for a MapFile call. [guest, guest+length)
 // now maps the file range that starts at off. A page with keep set kept its
 // earlier view. Callers hold as.mu.
-func (as *addressSpace) aliasMappedLocked(guest, length uint64, sec *sectionRef, off uint64, at hostarch.AccessType, keep []bool) {
+func (as *addressSpace) aliasMappedLocked(guest, length uint64, sec *sectionRef, off uint64, at hostarch.AccessType, keep []bool) error {
 	for i, k := range keep {
 		if !k {
 			delete(as.aliasProt, guest+uint64(i)*blockSize)
@@ -344,7 +355,7 @@ func (as *addressSpace) aliasMappedLocked(guest, length uint64, sec *sectionRef,
 	}
 	as.removeWriteViewsLocked(guest, guest+length)
 	if !at.Write || sec.file == 0 {
-		return
+		return nil
 	}
 	v := &writeView{as: as, va: guest, file: sec.file, off: off, size: length}
 	i := sort.Search(len(as.wviews), func(i int) bool { return as.wviews[i].va > guest })
@@ -353,14 +364,15 @@ func (as *addressSpace) aliasMappedLocked(guest, length uint64, sec *sectionRef,
 
 	// A copy of a frame in the new range already exists. Lower its page now, in
 	// runs, because each protection change can split the view.
+	var failed error
 	runStart, runLen := uint64(0), uint64(0)
 	flush := func() {
 		if runLen == 0 {
 			return
 		}
 		if err := as.win.Protect(runStart, runLen, viewRead); err != nil {
-			if traceEvents {
-				tracef("lower [%#x, %#x): %v", runStart, runStart+runLen, err)
+			if failed == nil {
+				failed = as.mapErr(fmt.Errorf("lower [%#x, %#x): %w", runStart, runStart+runLen, err))
 			}
 		} else {
 			if as.aliasProt == nil {
@@ -387,6 +399,7 @@ func (as *addressSpace) aliasMappedLocked(guest, length uint64, sec *sectionRef,
 		runLen += blockSize
 	}
 	flush()
+	return failed
 }
 
 // removeWriteViewsLocked removes the part of every writable view record that
@@ -447,8 +460,10 @@ func (as *addressSpace) releaseAliasLocked() {
 // aliasWriteFault serves a write fault on a page that the engine lowered
 // because a copy of its frame exists. It drops the copies, restores the write
 // permission, and returns true so that the thread repeats the write. It
-// returns false for any other fault.
-func (as *addressSpace) aliasWriteFault(addr uint64) bool {
+// returns false for any other fault. An error means that a copy or a view
+// stayed in a state that the thread cannot leave, and the caller must stop the
+// guest.
+func (as *addressSpace) aliasWriteFault(addr uint64) (bool, error) {
 	page := blockRound(addr)
 	as.mu.Lock()
 	key, ok := as.aliasProt[page]
@@ -458,34 +473,51 @@ func (as *addressSpace) aliasWriteFault(addr uint64) bool {
 	}
 	as.mu.Unlock()
 	if !ok {
-		return false
+		return false, nil
 	}
 	as.aliasFaults.Add(1)
-	for _, e := range as.p.alias.invalidate(key) {
-		e.as.dropExecCopy(e)
+	if err := as.p.alias.dropAll(key); err != nil {
+		return true, err
 	}
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if k, ok := as.aliasProt[page]; !ok || k != key || !as.aliasStillLoweredLocked(page, key) {
 		// Another call changed the page. The write repeats and faults again if
 		// it still needs the engine.
-		return true
+		return true, nil
 	}
 	x := &as.p.alias
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if x.otherCopyLocked(key, as, page) {
-		// A new copy appeared after the invalidation. The write faults again.
-		return true
+		// A new copy appeared after the drop. The write faults again.
+		return true, nil
 	}
 	if err := as.win.Protect(page, blockSize, viewReadWrite); err != nil {
-		if traceEvents {
-			tracef("restore the view at %#x: %v", page, err)
-		}
-		return true
+		return true, as.mapErr(fmt.Errorf("restore the view at %#x: %w", page, err))
 	}
 	delete(as.aliasProt, page)
-	return true
+	return true, nil
+}
+
+// lowersOwnFrame reports whether the page at addr is a lowered view of the
+// frame that the block at pc copies. A thread that stores through such a view
+// would drop the copy that it runs, fetch the page again, lower the view
+// again, and fault on the same store forever. The engine reports SIGSEGV for
+// that store, as it does for a store into the page that the thread executes.
+func (as *addressSpace) lowersOwnFrame(addr, pc uint64) bool {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	key, ok := as.aliasProt[blockRound(addr)]
+	if !ok {
+		return false
+	}
+	blk := as.blocks[blockRound(pc)]
+	if blk == nil {
+		return false
+	}
+	k, ok := blk.frameID()
+	return ok && k == key
 }
 
 // aliasStillLoweredLocked reports whether the page still maps key as a
@@ -500,16 +532,16 @@ func (as *addressSpace) aliasStillLoweredLocked(page uint64, key frameKey) bool 
 }
 
 // dropExecCopy returns the block of an installed copy to data state, as
-// restoreData does for a write through the block itself. The entry is already
-// out of the index.
-func (as *addressSpace) dropExecCopy(e *copyEntry) {
+// restoreData does for a write through the block itself. It is safe to call
+// again for a copy that another call already dropped.
+func (as *addressSpace) dropExecCopy(e *copyEntry) error {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	blk := as.blocks[e.base]
 	if as.released || blk == nil || blk.entry != e || blk.state != blockExec {
-		return
+		// The block changed or left, so the entry is stale.
+		as.p.alias.remove(e)
+		return nil
 	}
-	if err := as.returnToDataLocked(blk); err != nil && traceEvents {
-		tracef("drop the copy at %#x: %v", e.base, err)
-	}
+	return as.returnToDataLocked(blk)
 }

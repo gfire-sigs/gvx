@@ -251,6 +251,8 @@ type fastThread struct {
 	traps atomic.Uint64
 	// colds counts the resumes that ended in a debug stop.
 	colds atomic.Uint64
+	// stops counts the exceptions that the debug path served for the thread.
+	stops atomic.Uint64
 }
 
 var errNoFastSlot = fmt.Errorf("the stub process already has %d fast threads", winMaxThreads)

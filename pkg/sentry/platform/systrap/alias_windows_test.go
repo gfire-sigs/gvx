@@ -19,7 +19,9 @@ package systrap
 import (
 	"reflect"
 	"testing"
+	"time"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
@@ -127,10 +129,10 @@ func TestWriteViewFaultsOnlyWhileACopyExists(t *testing.T) {
 	step(codeVA, 10, 2, "write while the second copy exists")
 }
 
-func TestAliasIndexInvalidateDropsInstalledAndPoisonsPending(t *testing.T) {
+func TestAliasIndexInvalidateKeepsInstalledCopiesUntilTheOwnerDropsThem(t *testing.T) {
 	var x aliasIndex
 	key := frameKey{file: 7, off: 0x3000}
-	as1, as2 := &addressSpace{}, &addressSpace{}
+	as1, as2, as3 := &addressSpace{}, &addressSpace{}, &addressSpace{}
 	installed := &copyEntry{as: as1, base: 0x1000, key: key}
 	pending := &copyEntry{as: as2, base: 0x9000, key: key}
 	x.begin(installed)
@@ -143,11 +145,20 @@ func TestAliasIndexInvalidateDropsInstalledAndPoisonsPending(t *testing.T) {
 	if !reflect.DeepEqual(dropped, []*copyEntry{installed}) {
 		t.Fatalf("invalidate returned %v, want only the installed copy", dropped)
 	}
+	// A second writer must still see the installed copy, so that it keeps its
+	// view lowered until the owner finishes the drop.
+	if !x.otherCopy(key, as3, 0x5000) {
+		t.Error("the installed copy left the index before its owner dropped it")
+	}
+	if got := x.invalidate(key); !reflect.DeepEqual(got, []*copyEntry{installed}) {
+		t.Errorf("a second invalidate returned %v, want the installed copy again", got)
+	}
 	if x.install(pending) {
 		t.Error("install accepted a copy that a write poisoned")
 	}
-	if x.otherCopy(key, nil, 0) {
-		t.Error("the index still holds a live copy after the invalidation")
+	x.remove(installed)
+	if x.otherCopy(key, as3, 0x5000) {
+		t.Error("the index still holds a live copy after the owner dropped it")
 	}
 	if len(x.buckets) != 0 {
 		t.Errorf("the index keeps %d buckets after every entry left", len(x.buckets))
@@ -209,5 +220,111 @@ func TestAliasIndexRemoveViewForgetsEveryBucket(t *testing.T) {
 	x.removeView(v)
 	if len(x.buckets) != 0 {
 		t.Errorf("%d buckets remain after the view left", len(x.buckets))
+	}
+}
+
+// TestStoreIntoTheExecutedFrameThroughAnotherViewFaults runs code that stores
+// into the frame that it executes, through a second view. Dropping the copy
+// would send the thread back to the store, and the fetch would copy the page
+// and lower the view again, so the engine reports SIGSEGV as it does for a store
+// into the page that the thread executes. The test fails by timeout when the
+// thread loops.
+func TestStoreIntoTheExecutedFrameThroughAnotherViewFaults(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	fr, _ := r.allocFrames(1, storeCode(rwVA+0x800, gSyscall(42)), gSyscall(41))
+	r.mapRange(rxVA, fr, execAccess)
+	r.mapRange(rwVA, fr, hostarch.ReadWrite)
+	r.program(gJump(rxVA))
+
+	type result struct {
+		si  *linux.SignalInfo
+		at  hostarch.AccessType
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		si, at, err := r.run()
+		done <- result{si, at, err}
+	}()
+	select {
+	case res := <-done:
+		wantSignal(t, res.si, res.err, linux.SIGSEGV)
+		if res.at != hostarch.Write || res.si.Addr() != rwVA+0x800 {
+			t.Errorf("fault = access %v addr %#x, want a write at %#x", res.at, res.si.Addr(), uint64(rwVA+0x800))
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("a store into the executed frame through another view does not stop")
+	}
+}
+
+// TestWriteThroughTheExecuteViewDropsCopiesInOtherAddressSpaces maps one frame
+// as read-write-execute in one address space and as read-execute in another. A
+// thread of the first space rewrites the frame through its own execute view, and
+// the second space must run the new bytes.
+func TestWriteThroughTheExecuteViewDropsCopiesInOtherAddressSpaces(t *testing.T) {
+	runner := newRig(t, newPlatform(t))
+	writer := newRigOn(t, runner.p, runner.mf)
+	fr, _ := runner.allocFrames(1, gSyscall(41))
+	runner.mapRange(rxVA, fr, execAccess)
+	writer.mapRange(rxVA, fr, hostarch.AccessType{Read: true, Write: true, Execute: true})
+	runner.program(gJump(rxVA))
+	code := writer.program(gJump(rxVA))
+	copy(code[stepOff:], append(storeCode(rxVA, gSyscall(42)), gSyscall(99)...))
+
+	si, _, err := writer.run()
+	mustSyscall(t, si, err, 41, writer.ac)
+	si, _, err = runner.run()
+	mustSyscall(t, si, err, 41, runner.ac)
+
+	writer.ac.SetIP(codeVA + stepOff)
+	si, _, err = writer.run()
+	mustSyscall(t, si, err, 99, writer.ac)
+	runner.ac.SetIP(codeVA)
+	si, _, err = runner.run()
+	mustSyscall(t, si, err, 42, runner.ac)
+}
+
+// TestUnmapForgetsTheCopyOfAFrame unmaps the execute view of a frame. A write
+// view that the guest maps afterwards must stay writable, because no copy of the
+// frame exists any more.
+func TestUnmapForgetsTheCopyOfAFrame(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	fr, _ := r.allocFrames(1, gSyscall(41))
+	r.mapRange(rxVA, fr, execAccess)
+	code := r.program(gJump(rxVA))
+	copy(code[stepOff:], append(storeCode(rwVA, gSyscall(41)), gSyscall(10)...))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 41, r.ac)
+
+	r.as.Unmap(rxVA, blockSize)
+	r.mapRange(rwVA, fr, hostarch.ReadWrite)
+	r.ac.SetIP(codeVA + stepOff)
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 10, r.ac)
+	if got := r.as.AliasFaults(); got != 0 {
+		t.Errorf("writes that dropped a copy = %d after the copy left, want 0", got)
+	}
+}
+
+// TestReleaseForgetsTheCopiesOfAnAddressSpace releases the address space that
+// holds a copy of a frame. A write view that another address space maps
+// afterwards must stay writable.
+func TestReleaseForgetsTheCopiesOfAnAddressSpace(t *testing.T) {
+	runner := newRig(t, newPlatform(t))
+	writer := newRigOn(t, runner.p, runner.mf)
+	fr, _ := runner.allocFrames(1, gSyscall(41))
+	runner.mapRange(rxVA, fr, execAccess)
+	runner.program(gJump(rxVA))
+	si, _, err := runner.run()
+	mustSyscall(t, si, err, 41, runner.ac)
+	runner.ctx.Release()
+	runner.as.Release()
+
+	writer.mapRange(rwVA, fr, hostarch.ReadWrite)
+	writer.program(storeCode(rwVA, gSyscall(41)), gSyscall(10))
+	si, _, err = writer.run()
+	mustSyscall(t, si, err, 10, writer.ac)
+	if got := writer.as.AliasFaults(); got != 0 {
+		t.Errorf("writes that dropped a copy = %d after the owner released, want 0", got)
 	}
 }
