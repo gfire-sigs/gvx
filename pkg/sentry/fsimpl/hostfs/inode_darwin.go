@@ -18,6 +18,7 @@ package hostfs
 
 import (
 	"os"
+	"sync"
 	"time"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -40,6 +41,117 @@ func probeCaseInsensitive(dir *os.File) (bool, error) {
 		return false, err
 	}
 	return sensitive == 0, nil
+}
+
+// volumeTrust decides which devices below the workspace root give their files
+// identities that hostfs can key records on. The probe in volumeIDsTrusted
+// admits the volume of the root only. A guest can mount another file system
+// inside the workspace, such as a FAT or network volume, and its inode numbers
+// can repeat or move. An entry of another device keeps its identity only when
+// the file system of that device is APFS. Any other entry gets path records,
+// as an entry without an identity does.
+type volumeTrust struct {
+	rootDev uint64
+	// fsType returns the file system type name of the volume behind fd.
+	fsType func(fd int) (string, error)
+
+	mu sync.Mutex
+	// apfs holds the verdict for each other device that a call proved. A call
+	// that failed leaves no verdict, so the next one asks again. The device
+	// number of a volume that the host unmounted and mounted again stays
+	// valid for the verdict, because the kernel gives a mount a new number.
+	apfs map[uint64]bool
+}
+
+func newVolumeTrust(root *os.File) (*volumeTrust, error) {
+	var info hostInfo
+	if err := withFileFD(root, func(fd int) error {
+		var err error
+		info, err = fstatInfo(fd)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return &volumeTrust{rootDev: info.id.dev, fsType: fsTypeOfFD, apfs: make(map[uint64]bool)}, nil
+}
+
+// fsTypeOfFD returns the file system type name of the volume behind fd.
+func fsTypeOfFD(fd int) (string, error) {
+	var st unix.Statfs_t
+	if err := retryEINTR(func() error { return unix.Fstatfs(fd, &st) }); err != nil {
+		return "", err
+	}
+	name := make([]byte, 0, len(st.Fstypename))
+	for _, c := range st.Fstypename {
+		if c == 0 {
+			break
+		}
+		name = append(name, byte(c))
+	}
+	return string(name), nil
+}
+
+// known returns the verdict for dev when one exists. The device of the root is
+// always trusted.
+func (v *volumeTrust) known(dev uint64) (trusted, ok bool) {
+	if dev == v.rootDev {
+		return true, true
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	trusted, ok = v.apfs[dev]
+	return trusted, ok
+}
+
+// trusts reports whether the entries of the device dev keep their identity.
+// fd is a descriptor on that volume, or negative when the caller has none. A
+// call without a verdict and without a descriptor, or with an error from
+// fstatfs, distrusts the device for this call only.
+func (v *volumeTrust) trusts(dev uint64, fd int) bool {
+	if trusted, ok := v.known(dev); ok {
+		return trusted
+	}
+	if fd < 0 {
+		return false
+	}
+	typ, err := v.fsType(fd)
+	if err != nil {
+		return false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.apfs[dev] = typ == "apfs"
+	return v.apfs[dev]
+}
+
+// markVolumeFD drops the identity of info when the entry that fd names lives
+// on a device that hostfs does not trust.
+func (h *hostRoot) markVolumeFD(info hostInfo, fd int) hostInfo {
+	if info.fidOK && !h.vol.trusts(info.id.dev, fd) {
+		info.fidOK = false
+	}
+	return info
+}
+
+// markVolumeAt is markVolumeFD for the entry name of the directory dirfd, which
+// no descriptor names. An entry of an unknown device opens once so that
+// fstatfs can name its volume. An entry that cannot open leaves the device
+// without a verdict and counts as untrusted.
+func (h *hostRoot) markVolumeAt(info hostInfo, dirfd int, name string) hostInfo {
+	if !info.fidOK {
+		return info
+	}
+	if trusted, ok := h.vol.known(info.id.dev); ok {
+		info.fidOK = trusted
+		return info
+	}
+	fd, err := openatRetry(dirfd, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_SYMLINK, 0)
+	if err != nil {
+		info.fidOK = false
+		return info
+	}
+	defer func() { _ = unix.Close(fd) }()
+	return h.markVolumeFD(info, fd)
 }
 
 // lstatatInfo reads the metadata of name inside the directory dirfd without

@@ -56,6 +56,9 @@ const (
 type hostRoot struct {
 	dir      *os.File
 	caseFold bool
+	// vol decides per device whether an entry keeps its identity. It does
+	// nothing on Linux.
+	vol *volumeTrust
 }
 
 func newHostRoot(root *os.Root) (*hostRoot, error) {
@@ -69,6 +72,10 @@ func newHostRoot(root *os.Root) (*hostRoot, error) {
 	if probeErr != nil {
 		_ = dir.Close()
 		return nil, fmt.Errorf("hostfs: probe workspace volume case sensitivity: %w", probeErr)
+	}
+	if h.vol, probeErr = newVolumeTrust(dir); probeErr != nil {
+		_ = dir.Close()
+		return nil, fmt.Errorf("hostfs: stat workspace root: %w", probeErr)
 	}
 	return h, nil
 }
@@ -202,7 +209,7 @@ func (h *hostRoot) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hos
 		_ = unix.Close(fd)
 		return -1, hostInfo{}, fmt.Errorf("hostfs: fstat directory %q: %w", name, err)
 	}
-	return hostDirHandle(fd), info, nil
+	return hostDirHandle(fd), h.markVolumeFD(info, fd), nil
 }
 
 // existsByID reports errHostUnsupported. No Unix call opens a file by device
@@ -220,7 +227,7 @@ func (h *hostRoot) fstatDir(dir hostDirHandle) (hostInfo, error) {
 	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: fstat directory: %w", err)
 	}
-	return info, nil
+	return h.markVolumeFD(info, int(dir)), nil
 }
 
 func (h *hostRoot) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
@@ -231,7 +238,7 @@ func (h *hostRoot) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
 	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", name, err)
 	}
-	return info, nil
+	return h.markVolumeAt(info, int(dir), name), nil
 }
 
 func (h *hostRoot) openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error) {
@@ -321,7 +328,7 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", rel, err)
 	}
-	return info, nil
+	return h.markVolumeAt(info, parent, name), nil
 }
 
 // withFileFD runs fn with the descriptor of f and keeps f open until fn
@@ -343,6 +350,7 @@ func (h *hostRoot) fstat(f *os.File) (hostInfo, error) {
 	if err := withFileFD(f, func(fd int) error {
 		var err error
 		info, err = fstatInfo(fd)
+		info = h.markVolumeFD(info, fd)
 		return err
 	}); err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: fstat: %w", err)

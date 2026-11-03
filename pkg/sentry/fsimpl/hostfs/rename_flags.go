@@ -258,9 +258,10 @@ func (w *Workspace) swapThroughTemp(aHost, bHost string) error {
 
 // swapRecordsLocked updates the table after the host swapped the entries a and
 // b, which sat at aRel and bRel. A record that keys on an identity follows its
-// file, so only the hint changes. A table with path records swaps the path
-// records of both entries and of every entry below them. Callers hold w.mu for
-// writing.
+// file, so its hint, parent directory, and leaf change to the new position. The
+// host swapped the entries already, so the position of each new path is valid.
+// A table with path records swaps the path records of both entries and of every
+// entry below them. Callers hold w.mu for writing.
 func (w *Workspace) swapRecordsLocked(a, b entry, aRel, bRel string) {
 	if w.meta.hasPathRecs() {
 		w.meta.swapTree(aRel, bRel)
@@ -273,7 +274,8 @@ func (w *Workspace) swapRecordsLocked(a, b entry, aRel, bRel string) {
 			continue
 		}
 		if r := w.meta.get(e.key); r != nil {
-			w.meta.put(e.key, r.withHint(e.now))
+			parent, leaf := w.locOf(e.now)
+			w.meta.put(e.key, r.withLoc(e.now, parent, leaf))
 		}
 	}
 }

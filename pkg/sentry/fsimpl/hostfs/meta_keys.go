@@ -116,6 +116,14 @@ func (w *Workspace) virtualIn(pin *dirPin, parentRel, name string) (recKey, *rec
 // at a path where a vanished file left one takes that record over. See adopt.
 // Callers hold w.mu.
 func (w *Workspace) recOf(rel string, info hostInfo) *rec {
+	return w.recOfGone(rel, info, recKey{})
+}
+
+// recOfGone is recOf for a caller that knows the record under gone has no host
+// file. The orphan collector knows it after two complete passes. The adoption
+// then takes that record without a listing of the directory. A zero gone
+// proves nothing.
+func (w *Workspace) recOfGone(rel string, info hostInfo, gone recKey) *rec {
 	k := w.keyOf(rel, info)
 	if r := w.meta.get(k); r != nil {
 		// A host process that moved the file, or a rename of a parent
@@ -131,7 +139,7 @@ func (w *Workspace) recOf(rel string, info hostInfo) *rec {
 	if k.isPath() {
 		return nil
 	}
-	return w.adopt(rel, k, info)
+	return w.adopt(rel, k, info, gone)
 }
 
 // locOf returns the identity of the directory that holds rel and the entry
@@ -162,7 +170,10 @@ func (w *Workspace) locOf(rel string) (parent fileKey, leaf string) {
 // new file gets the record then, without the set-user-ID and set-group-ID bits,
 // because a host file must never gain privilege from a record that it did not
 // earn. Windows asks the host by identity, which is exact.
-func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
+//
+// gone names a record whose file the caller proved absent. The adoption skips
+// the existence test for that record only. Every other guard stays.
+func (w *Workspace) adopt(rel string, k recKey, info hostInfo, gone recKey) *rec {
 	if w.readOnly || k.kind != kindInode || (info.kind != hostKindRegular && info.kind != hostKindDir) {
 		return nil
 	}
@@ -184,12 +195,14 @@ func (w *Workspace) adopt(rel string, k recKey, info hostInfo) *rec {
 	if oldKey.id.btime != 0 && k.id.btime != 0 && k.id.btime < oldKey.id.btime {
 		return nil
 	}
-	alive, where := w.recordFileExists(oldKey, rel)
-	if alive {
-		if where != "" {
-			w.meta.setLoc(oldKey, old, where, old.parent, old.leaf)
+	if oldKey != gone {
+		alive, where := w.recordFileExists(oldKey, rel)
+		if alive {
+			if where != "" {
+				w.meta.setLoc(oldKey, old, where, old.parent, old.leaf)
+			}
+			return nil
 		}
-		return nil
 	}
 	adopted := old.withLoc(rel, parent, leaf)
 	adopted.attr.Mode &^= linux.S_ISUID | linux.S_ISGID
@@ -223,7 +236,9 @@ func (w *Workspace) rekeyLocked(oldKey, newKey recKey, r *rec, rel string) {
 // exists on the host. The second result is the guest path at which the file
 // lives when the call found it, or empty when it is unknown. An answer that the
 // host cannot give counts as alive, because a record must survive a failed
-// check. Callers hold w.mu.
+// check. The listing comes from a cache that lives for cacheTTL, so a stat of
+// each file of a directory that a host editor replaced lists it once. Callers
+// hold w.mu.
 func (w *Workspace) recordFileExists(key recKey, rel string) (bool, string) {
 	if w.caps.ExistsByID {
 		found, err := w.host.existsByID(w.rawID(key.id))
@@ -237,14 +252,12 @@ func (w *Workspace) recordFileExists(key recKey, rel string) (bool, string) {
 		return true, ""
 	}
 	defer w.releasePin(pin)
-	entries, err := w.host.readDirAt(pin.h)
+	names, err := w.dirInoNames(pin, parent)
 	if err != nil {
 		return true, ""
 	}
-	for _, e := range entries {
-		if e.ino == key.id.ino {
-			return true, joinRelPath(parent, w.codec.ToGuest(e.name))
-		}
+	if name, ok := names[key.id.ino]; ok {
+		return true, joinRelPath(parent, name)
 	}
 	return false, ""
 }

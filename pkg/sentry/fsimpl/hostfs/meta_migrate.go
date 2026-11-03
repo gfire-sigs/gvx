@@ -52,7 +52,8 @@ func (w *Workspace) importImage(img metaImage) (map[recKey]*rec, bool) {
 	// again, and a table that the conversion leaves as it is stays unchanged
 	// on disk. A path record whose entry is absent stays too, because the
 	// entry can sit on a file system that is not mounted yet. The collector
-	// removes it later.
+	// removes it only when two complete passes miss it and the lookup by its
+	// hint path confirms that the path is absent.
 	paths := make(map[string]POSIXAttr)
 	out := make(map[recKey]*rec, len(img.recs))
 	for k, r := range img.recs {

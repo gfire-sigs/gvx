@@ -29,6 +29,16 @@ func probeCaseInsensitive(*os.File) (bool, error) {
 	return false, nil
 }
 
+// volumeTrust has no state on Linux. The birth time check in statxToHostInfo
+// decides for each entry whether it has an identity.
+type volumeTrust struct{}
+
+func newVolumeTrust(*os.File) (*volumeTrust, error) { return &volumeTrust{}, nil }
+
+func (h *hostRoot) markVolumeFD(info hostInfo, _ int) hostInfo { return info }
+
+func (h *hostRoot) markVolumeAt(info hostInfo, _ int, _ string) hostInfo { return info }
+
 // statxMask asks for the fields of stat and the birth time. The kernel clears
 // STATX_BTIME in the result when the file system keeps no birth time.
 const statxMask = unix.STATX_BASIC_STATS | unix.STATX_BTIME

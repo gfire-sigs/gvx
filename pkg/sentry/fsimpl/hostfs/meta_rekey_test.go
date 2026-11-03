@@ -299,3 +299,42 @@ func TestDirectoryRenameDoesNotBreakAdoptionBelowIt(t *testing.T) {
 	}
 	requireMode(t, ws, "e/doc", 0o751, 0)
 }
+
+// An exchange moves each record to the other name, so the directory and the
+// leaf of the record must follow. A host editor that saves over one of the
+// names adopts by that position.
+func TestExchangeThenHostEditorSaveKeepsBothRecords(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{})
+	if ws.pathKeys {
+		t.Skip("a volume with path keys keeps the record under the path")
+	}
+	for _, d := range []string{"a", "b"} {
+		if err := ws.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWriteFile(t, ws, "a/x", 0o751)
+	if err := ws.Chown("a/x", 7, 8); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, ws, "b/y", 0o640)
+	if err := ws.Chown("b/y", 9, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.exchange("a/x", "b/y"); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, ws, "a/x", 0o640, 9)
+	requireMode(t, ws, "b/y", 0o751, 7)
+
+	// An editor saves over a/x.
+	if err := os.WriteFile(filepath.Join(dir, "a", "x.tmp"), []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "a", "x.tmp"), filepath.Join(dir, "a", "x")); err != nil {
+		t.Fatal(err)
+	}
+	requireMode(t, ws, "a/x", 0o640, 9)
+	requireMode(t, ws, "b/y", 0o751, 7)
+}

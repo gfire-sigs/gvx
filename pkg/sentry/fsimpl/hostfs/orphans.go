@@ -404,8 +404,8 @@ func (w *Workspace) endSearch(c *orphanCollector) {
 
 // confirmStep checks the next records of the list by their guest path and
 // deletes those that the check proves dead. A failed or inconclusive lookup
-// keeps the record, and the next pass asks again. It reports whether records
-// remain.
+// keeps the record, and the next pass asks again. It holds w.mu for one record
+// at a time. It reports whether records remain.
 func (w *Workspace) confirmStep(c *orphanCollector) bool {
 	for range orphanStepRecords {
 		if len(c.dead) == 0 {
@@ -432,8 +432,12 @@ func (w *Workspace) confirmStep(c *orphanCollector) bool {
 // a permission error, or an answer that shows the file, keeps the record. A
 // file that a host process moved keeps its record only when the
 // second pass finds it, because the hint names the old path. A new file of the
-// same kind at the hint takes the record over, as recOf does for the guest.
-// The lookup can write the table, so callers hold w.mu for writing.
+// same kind at the hint takes the record over, as recOf does for the guest, but
+// without the directory listing that recOf uses to test the old file. The two
+// passes proved its absence. The lookup of the hint reads a cached listing of
+// the directory at most, so the cost of a step follows the number of records
+// and not the size of the directories. The lookup can write the table, so
+// callers hold w.mu for writing.
 func (w *Workspace) orphanedLocked(k recKey) bool {
 	r := w.meta.get(k)
 	if r == nil {
@@ -476,7 +480,7 @@ func (w *Workspace) orphanedLocked(k recKey) bool {
 	// An unrecorded file of the same kind at the hint is probably a host
 	// editor save between two passes. The record moves to it, unless adopt
 	// declines.
-	w.recOf(hint, info)
+	w.recOfGone(hint, info, k)
 	return w.meta.get(k) != nil
 }
 

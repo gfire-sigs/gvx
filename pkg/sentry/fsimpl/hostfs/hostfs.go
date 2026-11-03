@@ -189,6 +189,10 @@ type Workspace struct {
 	flushMu sync.Mutex
 	journal metaJournal
 
+	// inos holds the inode sets of directories for adoption. It has its own
+	// leaf lock. See dirinos.go.
+	inos inoCache
+
 	nameMu    sync.Mutex
 	nameCache map[string]*dirNames
 	// altNames holds the stored host names that differ from the plain
@@ -657,6 +661,7 @@ func (w *Workspace) removeDirNameLocked(dir, name, hostName string) {
 
 func (w *Workspace) updateDirName(dir, name, hostName string, present bool) {
 	w.watchNoteName(dir, name)
+	w.inos.dropDir(dir)
 	if !w.tracksDirNames() {
 		return
 	}
@@ -700,6 +705,7 @@ func (w *Workspace) updateDirName(dir, name, hostName string, present bool) {
 // directory below it. A directory rename or removal changes whole subtrees,
 // which the in-place updates cannot express. Callers hold w.mu for writing.
 func (w *Workspace) dropDirNamesLocked(rel string) {
+	w.inos.dropAll()
 	if !w.tracksDirNames() {
 		return
 	}
