@@ -102,6 +102,18 @@ func gSpin() []byte { return wordBytes(0x14000000) } // b .
 // gCountSpin increments the return register forever.
 func gCountSpin() []byte { return wordBytes(0x91000400, 0x17ffffff) } // add x0, x0, #1; b -4
 
+// gCountInMemory increments the word at addr forever. The Sentry reads the
+// word to see that the guest runs.
+func gCountInMemory(addr uint64) []byte {
+	c := gConst(1, addr)
+	return append(c, wordBytes(
+		0xf9400020, // loop: ldr x0, [x1]
+		0x91000400, // add x0, x0, #1
+		0xf9000020, // str x0, [x1]
+		0x17fffffd, // b loop
+	)...)
+}
+
 // gTraceBreak executes a BRK that the patcher never planted.
 func gTraceBreak() []byte { return wordBytes(0xd4200000 | 0x7b<<5) } // brk #0x7b
 

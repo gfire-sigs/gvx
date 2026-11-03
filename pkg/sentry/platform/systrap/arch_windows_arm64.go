@@ -288,6 +288,15 @@ func (th *thread) emulateARM64MRS(as *addressSpace, pc uint64) bool {
 	return true
 }
 
+// archNoStoreStep reports whether the instruction at pc cannot run as a store
+// step. A store exclusive fails each time it restarts after the fault of the
+// step, so the guest loop around it would never end. The engine reports the
+// fault instead.
+func (th *thread) archNoStoreStep(as *addressSpace, pc uint64) bool {
+	b := as.codeBytes(pc, 4)
+	return len(b) == 4 && isStoreExclusive(binary.LittleEndian.Uint32(b))
+}
+
 // archFault reports whether the engine repaired a fault. arm64 has no FS base.
 func (th *thread) archFault(*addressSpace, *arch.Context64, debugEvent) bool { return false }
 

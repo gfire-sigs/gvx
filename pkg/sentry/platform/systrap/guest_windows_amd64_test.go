@@ -83,6 +83,13 @@ func gSpin() []byte { return []byte{0xEB, 0xFE} }
 // gCountSpin increments the accumulator forever.
 func gCountSpin() []byte { return []byte{0x48, 0xFF, 0xC3, 0xEB, 0xFB} } // inc rbx; jmp -5
 
+// gCountInMemory increments the word at addr forever. The Sentry reads the
+// word to see that the guest runs.
+func gCountInMemory(addr uint64) []byte {
+	c := imm64([]byte{0x48, 0xB8}, addr)           // mov rax, addr
+	return append(c, 0x48, 0xFF, 0x00, 0xEB, 0xFB) // loop: inc qword [rax]; jmp loop
+}
+
 // gTraceBreak executes an INT3 that the patcher never planted.
 func gTraceBreak() []byte { return []byte{0xCC} }
 

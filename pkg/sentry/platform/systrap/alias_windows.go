@@ -543,5 +543,10 @@ func (as *addressSpace) dropExecCopy(e *copyEntry) error {
 		as.p.alias.remove(e)
 		return nil
 	}
+	if blk.stepSnap != nil {
+		// A thread single-steps a store through this copy. It drops the copy
+		// when it closes the window, and then the write that called us repeats.
+		return nil
+	}
 	return as.returnToDataLocked(blk)
 }

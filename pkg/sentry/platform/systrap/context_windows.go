@@ -211,6 +211,11 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if out, ok := th.archEvent(as, ac, ev); ok {
 		return out
 	}
+	if ev.State == dbgStateSingleStep || ev.Code == statusSingleStep {
+		if out, ok := th.storeStepStop(ev); ok {
+			return out
+		}
+	}
 	switch ev.State {
 	case dbgStateSingleStep:
 		return c.stepStop(th, ac, ev)
@@ -257,8 +262,12 @@ func (th *thread) traceStop(as *addressSpace, ev debugEvent) {
 // stopAndPull parks the thread at an exception and copies its registers into
 // ac. Callers hold th.mu and have read the full context.
 func (th *thread) stopAndPull(ac *arch.Context64, ev debugEvent) error {
-	if th.stepping {
-		// The forced stop set the flag. The guest never sees it.
+	stored := th.storeStep != nil
+	if err := th.closeStoreStepLocked(); err != nil {
+		return err
+	}
+	if th.stepping || stored {
+		// A forced stop or a store step set the flag. The guest never sees it.
 		th.ctx.setSingleStep(false)
 	}
 	if err := th.park(ev); err != nil {
@@ -379,8 +388,15 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 				}
 				return running
 			}
+			// A fault of a thread that waited for the lock of the address space
+			// can be stale: another thread mapped the executable copy first, or
+			// a store step swapped the view. The thread fetches again and does
+			// not count the fault.
+			stale := !patched && as.executableView(ev.Info[1])
 			if patched {
 				th.execRepeats = 0
+			} else if stale {
+				th.lastExecPC = pc
 			} else if th.lastExecPC == pc {
 				th.execRepeats++
 			} else {
@@ -390,7 +406,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			// patched the block after this thread faulted, so the thread retries.
 			// A fault that repeats means that the fetch reaches a block that
 			// the guest did not map for execution.
-			if patched || th.execRepeats <= execRetryLimit {
+			if patched || stale || th.execRepeats <= execRetryLimit {
 				if next := th.resumePC(pc); next != pc {
 					th.ctx.setPC(next)
 					if err := th.continueEvent(ev); err != nil {
@@ -408,12 +424,19 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			}
 		}
 	case avWrite:
+		if !fromSlot {
+			if out, ok := th.serveStoreFault(as, ev, addr); ok {
+				return out
+			}
+		}
 		if as.lowersOwnFrame(addr, th.guestPC(pc)) {
-			// The guest writes the frame that it runs, through another view.
-			// Dropping the copy would send the thread back to this store, and
-			// the fetch would copy the page and lower the view again. The
-			// engine reports the fault instead, as for a store into the page
-			// that the thread executes.
+			// The guest writes the frame that it runs, through another view,
+			// and no store step can serve the write: the store comes from a
+			// trampoline slot, the thread already spent its faults on this
+			// store, or the instruction cannot run twice. Dropping the copy
+			// would send the thread back to this store, and the fetch would
+			// copy the page and lower the view again. The engine reports the
+			// fault instead.
 			break
 		}
 		if handled, err := as.aliasWriteFault(addr); err != nil {
@@ -428,11 +451,14 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		}
 		base := blockRound(addr)
 		if blockRound(th.guestPC(pc)) == base {
-			// The guest writes to the page that it executes. Restoring the
-			// original frame removes the execute permission under the
-			// instruction, and the next fetch maps the patched copy that
-			// removes the write permission again. The thread would loop, so the
-			// engine reports the fault instead.
+			// The guest writes to the page that it executes, and no store step
+			// can serve the write. It comes from a trampoline slot, the page is
+			// not writable, the thread already spent its faults on this store,
+			// or the instruction cannot run twice. Restoring the original frame
+			// removes the execute permission under the instruction, and the
+			// next fetch maps the patched copy that removes the write permission
+			// again. The thread would loop, so the engine reports the fault
+			// instead.
 			break
 		}
 		if ok, err := as.restoreData(base); err != nil {
@@ -444,8 +470,9 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			return running
 		}
 		// A writable data state means that another thread restored the block
-		// after this thread faulted, so the write retries.
-		if st, at, ok := as.blockStateOf(base); ok && st == blockData && at.Write {
+		// after this thread faulted, so the write retries. A block with an open
+		// store window accepts the write too.
+		if st, at, ok := as.blockStateOf(base); ok && at.Write && (st == blockData || as.storeWindowOpen(base)) {
 			if err := continueFault(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
@@ -484,6 +511,14 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, ev debugEvent, kin
 	si := &linux.SignalInfo{Signo: int32(sig), Code: code}
 	si.SetAddr(addr)
 	return outcome{done: true, si: si, at: at, err: platform.ErrContextSignal}
+}
+
+// executableView reports whether the view at addr allows execution.
+func (as *addressSpace) executableView(addr uint64) bool {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	vi, _, ok := as.win.Lookup(addr)
+	return ok && (vi.prot == viewReadExec || vi.prot == viewReadWriteExec)
 }
 
 // mapped reports whether addr lies in a view of the window.
