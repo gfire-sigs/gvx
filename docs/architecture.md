@@ -297,6 +297,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | **`arm64` Syscall Trap (`bluepill_arm64.go`, `stubgen_a64.go`)** | EL0 `SVC #0` enters EL1 vectors and spills registers to `CommPage`. An EL1 load from unbacked GPA zero returns to the host. | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. |
 | **`amd64` Vector State** | Sets `ProcessorXsaveFeatures` before `WHvSetupPartition`. XCR0 enables x87, SSE, AVX, and AVX-512 when the hypervisor and the Sentry image hold them. `WHvGetVirtualProcessorState` moves the compacted XSAVE state on the cold path. | Not applicable (`darwin/amd64` dropped). |
 | **Read-only File Mappings** | Maps read-only host views directly into the partition. | `hv_vm_map` rejects the read-only descriptor of an EROFS image. `hvf` copies those pages into immutable slab pages, and pgalloc memory files map directly. |
+| **`membarrier` Global and Private Expedited** | `GlobalMemoryBarrier` cancels each virtual processor that runs guest code and waits until its `Switch` call returns. A processor outside the guest needs no cancel. | `GlobalMemoryBarrier` cancels each vCPU that runs guest code and waits for one exit of `hv_vcpu_run`. A cancel that finds no guest to stop resumes the guest, so the guest task keeps running. |
 | **Unknown Exit Reason** | Not applicable. | `HV_EXIT_REASON_UNKNOWN` carries no information. The worker resumes the vCPU as it does after a cancellation, and `Switch` fails after 4096 consecutive unknown exits. |
 
 ```mermaid
@@ -357,6 +358,10 @@ On `amd64`, `New` reads the XSAVE state of one probe vCPU and checks its compact
 [`systrap-windows.md`](systrap-windows.md) records the measured Windows behavior and the `winsystrap` design. The table below follows that document.
 
 The macOS engine `darwinsystrap` was removed because of compatibility problems. It forced 16KB guest pages, so executables with 4KB-aligned segments failed. macOS also reserves a 4GB `PAGEZERO` in every `arm64` task, so non-PIE executables that link below 4GB failed. `hvf` runs both kinds natively.
+
+#### `membarrier` on `systrap` (Descriptive Module)
+
+The guest threads of `winsystrap` run in stub processes, so `FlushProcessWriteBuffers` in the Sentry cannot order them. `GlobalMemoryBarrier` suspends each stub thread that can run guest code, reads its context, and resumes it. The context call returns after the thread left user mode. A thread that the engine parked, or that waits in the spill routine for the Sentry, runs no guest code and needs no stop. The call holds the per-thread lock of the engine, so it never changes a suspend count that another operation owns. [`systrap-windows.md`](systrap-windows.md) section 9 gives the reasoning and the limits.
 
 #### Multi-Process Hardware Page-Table (`CR3` / `TTBR0_EL1`) Isolation and `sysmsg` IPC (Descriptive Module)
 

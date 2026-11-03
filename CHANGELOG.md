@@ -8,6 +8,7 @@ This section records changes that no release contains yet.
 
 ### Bug Fixes
 
+- **`membarrier` on `hvf`, `whpx`, and Windows `systrap`**: the global and private expedited commands of `membarrier(2)` returned `EINVAL`, and `MEMBARRIER_CMD_QUERY` reported none of them. The commands now succeed, and the query reports them. A call returns after every guest thread that ran guest code at the call has left the guest or stopped once. Idle threads cost nothing. The call does not order a Sentry thread that copies data for a system call in progress. On `whpx`, a running guest task returns from `Switch` once for each call and the kernel runs it again. `hvf` and Windows `systrap` resume the guest without a return. Linux platforms keep the host `membarrier`.
 - **Directory link count on Windows `hostfs`**: `stat` of a directory reported 2 links on NTFS for every directory. It now reports 2 plus the number of subdirectories, as Linux does. Tools such as `find` use that count.
 - **Large `truncate` on Windows `hostfs`**: a growth above the free disk space failed with `ENOSPC`, and a size above the NTFS file limit failed with `EIO`. The growth now leaves a hole, as on Linux, and the size above the limit fails with `EFBIG`.
 - **Windows `systrap` engine errata** (`windows/amd64` and `windows/arm64`): three defects of the engine are fixed.
