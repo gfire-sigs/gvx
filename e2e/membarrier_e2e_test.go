@@ -24,10 +24,10 @@ import (
 	"z.gfire.dev/gvx/internal/acceptprog"
 )
 
-// TestE2EMembarrierCommands checks that membarrier(2) reports and runs the
-// global and the private expedited commands on every backend, with the
-// registration rules of the Linux system call.
-func TestE2EMembarrierCommands(t *testing.T) {
+// TestE2EMembarrierCommandABI checks the interface of membarrier(2) on every
+// backend: the query result, the registration rules, and the success of the
+// global and the private expedited commands. It does not check memory ordering.
+func TestE2EMembarrierCommandABI(t *testing.T) {
 	bin := acceptprog.BuildMembarrierProbe(t, runtime.GOARCH)
 	want := []string{
 		"query-reports-expedited-commands", "unknown-arguments-fail",
@@ -53,10 +53,10 @@ func TestE2EMembarrierCommands(t *testing.T) {
 	}
 }
 
-// TestE2EMembarrierStressCompletes checks that membarrier(2) calls from three
+// TestE2EMembarrierStressLiveness checks that membarrier(2) calls from three
 // threads finish while other guest threads make system calls or run without
-// any.
-func TestE2EMembarrierStressCompletes(t *testing.T) {
+// any. It checks liveness, not memory ordering.
+func TestE2EMembarrierStressLiveness(t *testing.T) {
 	bin := acceptprog.BuildMembarrierProbe(t, runtime.GOARCH)
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
