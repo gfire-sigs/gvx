@@ -35,51 +35,54 @@ const (
 	eflagsArithMask = eflagCF | eflagPF | eflagAF | eflagZF | eflagSF | eflagOF
 )
 
-// gsEmulOutcome describes the result of emulating a GS-prefixed instruction.
-type gsEmulOutcome struct {
+// segEmulOutcome describes the result of emulating a segment-prefixed
+// instruction.
+type segEmulOutcome struct {
 	ok         bool
 	fault      bool
 	faultAddr  uint64
 	faultWrite bool
 }
 
-// emulateGSMemInsn decodes and emulates the GS-prefixed memory instruction at
-// the start of code against the 16 general-purpose registers in regs (indexed
-// in hardware order RAX=0..R15=15) and eflags.
-func emulateGSMemInsn(
+// emulateSegMemInsn decodes and emulates the memory instruction at the start
+// of code that addresses memory through segment seg (x86asm.FS or x86asm.GS)
+// with base segBase. It works on the 16 general-purpose registers in regs
+// (indexed in hardware order RAX=0..R15=15) and eflags.
+func emulateSegMemInsn(
 	code []byte,
-	gsBase uint64,
+	seg x86asm.Reg,
+	segBase uint64,
 	regs *[16]uint64,
 	eflags *uint32,
 	readMem func(addr uint64, buf []byte) bool,
 	writeMem func(addr uint64, buf []byte) bool,
-) gsEmulOutcome {
+) segEmulOutcome {
 	inst, err := decodeX86(code)
 	if err != nil || inst.Len == 0 {
-		return gsEmulOutcome{}
+		return segEmulOutcome{}
 	}
 	memIdx := -1
 	var memArg x86asm.Mem
 	for i, arg := range inst.Args {
-		if m, ok := arg.(x86asm.Mem); ok && m.Segment == x86asm.GS {
+		if m, ok := arg.(x86asm.Mem); ok && m.Segment == seg {
 			memIdx = i
 			memArg = m
 			break
 		}
 	}
 	if memIdx < 0 {
-		return gsEmulOutcome{}
+		return segEmulOutcome{}
 	}
-	addr, addrOK := evalGSMemAddr(memArg, gsBase, uintptr(inst.Len), regs)
+	addr, addrOK := evalSegMemAddr(memArg, segBase, regs)
 	if !addrOK {
-		return gsEmulOutcome{}
+		return segEmulOutcome{}
 	}
 	memBytes := inst.MemBytes
 	if memBytes == 0 {
-		memBytes = inferGSMemBytes(inst)
+		memBytes = inferMemBytes(inst)
 	}
 	if memBytes != 1 && memBytes != 2 && memBytes != 4 && memBytes != 8 {
-		return gsEmulOutcome{}
+		return segEmulOutcome{}
 	}
 
 	readVal := func(n int) (uint64, bool) {
@@ -100,106 +103,106 @@ func emulateGSMemInsn(
 		if memIdx == 1 {
 			dstReg, ok := inst.Args[0].(x86asm.Reg)
 			if !ok {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
 			v, ok := readVal(memBytes)
 			if !ok {
-				return gsEmulOutcome{fault: true, faultAddr: addr}
+				return segEmulOutcome{fault: true, faultAddr: addr}
 			}
 			if !writeX86Reg(regs, dstReg, v) {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
-			return gsEmulOutcome{ok: true}
+			return segEmulOutcome{ok: true}
 		}
 		if memIdx == 0 {
 			srcVal, ok := evalX86Src(inst.Args[1], memBytes, regs)
 			if !ok {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
 			if !writeVal(memBytes, srcVal) {
-				return gsEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
+				return segEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
 			}
-			return gsEmulOutcome{ok: true}
+			return segEmulOutcome{ok: true}
 		}
 
 	case x86asm.MOVZX:
 		if memIdx != 1 {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		dstReg, ok := inst.Args[0].(x86asm.Reg)
 		if !ok {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		v, ok := readVal(memBytes)
 		if !ok {
-			return gsEmulOutcome{fault: true, faultAddr: addr}
+			return segEmulOutcome{fault: true, faultAddr: addr}
 		}
 		if !writeX86Reg(regs, dstReg, v) {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
-		return gsEmulOutcome{ok: true}
+		return segEmulOutcome{ok: true}
 
 	case x86asm.MOVSX, x86asm.MOVSXD:
 		if memIdx != 1 {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		dstReg, ok := inst.Args[0].(x86asm.Reg)
 		if !ok {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		v, ok := readVal(memBytes)
 		if !ok {
-			return gsEmulOutcome{fault: true, faultAddr: addr}
+			return segEmulOutcome{fault: true, faultAddr: addr}
 		}
 		ext := uint64(signExtendTo64(v, memBytes))
 		if !writeX86Reg(regs, dstReg, ext) {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
-		return gsEmulOutcome{ok: true}
+		return segEmulOutcome{ok: true}
 
 	case x86asm.ADD, x86asm.SUB, x86asm.AND, x86asm.OR, x86asm.XOR, x86asm.CMP, x86asm.TEST:
 		if memIdx == 1 {
 			dstReg, ok := inst.Args[0].(x86asm.Reg)
 			if !ok {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
 			lhs, width, ok := readX86Reg(regs, dstReg)
 			if !ok || width != memBytes {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
 			rhs, ok := readVal(memBytes)
 			if !ok {
-				return gsEmulOutcome{fault: true, faultAddr: addr}
+				return segEmulOutcome{fault: true, faultAddr: addr}
 			}
 			res, writeBack := evalX86ALU(inst.Op, lhs, rhs, memBytes, eflags)
 			if writeBack && !writeX86Reg(regs, dstReg, res) {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
-			return gsEmulOutcome{ok: true}
+			return segEmulOutcome{ok: true}
 		}
 		if memIdx == 0 {
 			rhs, ok := evalX86Src(inst.Args[1], memBytes, regs)
 			if !ok {
-				return gsEmulOutcome{}
+				return segEmulOutcome{}
 			}
 			lhs, ok := readVal(memBytes)
 			if !ok {
-				return gsEmulOutcome{fault: true, faultAddr: addr}
+				return segEmulOutcome{fault: true, faultAddr: addr}
 			}
 			res, writeBack := evalX86ALU(inst.Op, lhs, rhs, memBytes, eflags)
 			if writeBack && !writeVal(memBytes, res) {
-				return gsEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
+				return segEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
 			}
-			return gsEmulOutcome{ok: true}
+			return segEmulOutcome{ok: true}
 		}
 
 	case x86asm.INC, x86asm.DEC:
 		if memIdx != 0 {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		lhs, ok := readVal(memBytes)
 		if !ok {
-			return gsEmulOutcome{fault: true, faultAddr: addr}
+			return segEmulOutcome{fault: true, faultAddr: addr}
 		}
 		oldCF := *eflags & eflagCF
 		op := x86asm.ADD
@@ -209,65 +212,85 @@ func emulateGSMemInsn(
 		res, _ := evalX86ALU(op, lhs, 1, memBytes, eflags)
 		*eflags = (*eflags &^ eflagCF) | oldCF
 		if !writeVal(memBytes, res) {
-			return gsEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
+			return segEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
 		}
-		return gsEmulOutcome{ok: true}
+		return segEmulOutcome{ok: true}
 
 	case x86asm.XCHG:
 		otherIdx := 1 - memIdx
 		regArg, ok := inst.Args[otherIdx].(x86asm.Reg)
 		if !ok {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		regVal, width, ok := readX86Reg(regs, regArg)
 		if !ok || width != memBytes {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		memVal, ok := readVal(memBytes)
 		if !ok {
-			return gsEmulOutcome{fault: true, faultAddr: addr}
+			return segEmulOutcome{fault: true, faultAddr: addr}
 		}
 		if !writeVal(memBytes, regVal) {
-			return gsEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
+			return segEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
 		}
 		if !writeX86Reg(regs, regArg, memVal) {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
-		return gsEmulOutcome{ok: true}
+		return segEmulOutcome{ok: true}
 
 	case x86asm.CMPXCHG:
 		if memIdx != 0 {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		srcReg, ok := inst.Args[1].(x86asm.Reg)
 		if !ok {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		srcVal, width, ok := readX86Reg(regs, srcReg)
 		if !ok || width != memBytes {
-			return gsEmulOutcome{}
+			return segEmulOutcome{}
 		}
 		memVal, ok := readVal(memBytes)
 		if !ok {
-			return gsEmulOutcome{fault: true, faultAddr: addr}
+			return segEmulOutcome{fault: true, faultAddr: addr}
 		}
 		mask := widthMask(memBytes)
 		acc := regs[0] & mask
 		evalX86ALU(x86asm.CMP, acc, memVal, memBytes, eflags)
 		if acc == (memVal & mask) {
 			if !writeVal(memBytes, srcVal) {
-				return gsEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
+				return segEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
 			}
 		} else {
 			writeX86Acc(regs, memBytes, memVal)
 		}
-		return gsEmulOutcome{ok: true}
+		return segEmulOutcome{ok: true}
 	}
-	return gsEmulOutcome{}
+	return segEmulOutcome{}
 }
 
-func evalGSMemAddr(m x86asm.Mem, gsBase uint64, instLen uintptr, regs *[16]uint64) (uint64, bool) {
-	addr := gsBase + uint64(m.Disp)
+// isAtomicMemInsn reports whether inst changes memory atomically: it has a LOCK
+// prefix, or it is an exchange that locks the bus without one. A read and a
+// write from the Sentry cannot replace such an instruction while other guest
+// threads run.
+func isAtomicMemInsn(inst x86asm.Inst) bool {
+	switch inst.Op {
+	case x86asm.XCHG, x86asm.CMPXCHG, x86asm.CMPXCHG8B, x86asm.CMPXCHG16B, x86asm.XADD:
+		return true
+	}
+	for _, p := range inst.Prefix {
+		if p == 0 {
+			break
+		}
+		if p&0xFF == x86asm.PrefixLOCK {
+			return true
+		}
+	}
+	return false
+}
+
+func evalSegMemAddr(m x86asm.Mem, segBase uint64, regs *[16]uint64) (uint64, bool) {
+	addr := segBase + uint64(m.Disp)
 	if m.Base != 0 {
 		if m.Base == x86asm.RIP {
 			return 0, false
@@ -289,11 +312,10 @@ func evalGSMemAddr(m x86asm.Mem, gsBase uint64, instLen uintptr, regs *[16]uint6
 		}
 		addr += v * scale
 	}
-	_ = instLen
 	return addr, true
 }
 
-func inferGSMemBytes(inst x86asm.Inst) int {
+func inferMemBytes(inst x86asm.Inst) int {
 	for _, arg := range inst.Args {
 		if r, ok := arg.(x86asm.Reg); ok {
 			if _, w, ok := x86RegIndexWidth(r); ok {

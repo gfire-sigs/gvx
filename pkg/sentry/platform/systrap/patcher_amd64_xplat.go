@@ -67,6 +67,14 @@ const (
 	// amd64SweepCount is the number of linear decode sweeps of one scan.
 	amd64SweepCount = amd64MaxInsnLen + 1
 
+	// amd64ScanLead is the number of bytes before a page that the patcher
+	// gives the scan. The sweeps start at the first 16 of them, so that a
+	// sweep that starts inside an instruction finds the real boundaries before
+	// it reaches the page. With only 15 bytes, the wrong sweeps of a page of
+	// Node.js 20 out-voted the right ones and found a GS instruction inside a
+	// `lea`.
+	amd64ScanLead = 64
+
 	// amd64INT3 and amd64NOP are the filler opcodes of a patched site.
 	amd64INT3 = 0xCC
 	amd64NOP  = 0x90
@@ -137,7 +145,7 @@ type amd64Sweep struct {
 // that holds the start of the site reports it with a positive Offset.
 //
 // The scan runs up to 16 linear sweeps with the x86asm decoder. Sweep k starts
-// at 15-k bytes before the page, clamped to the start of before. A sweep skips
+// at byte k of before, clamped to the start of page. A sweep skips
 // each byte that it cannot decode, and a sweep that skips more bytes than
 // another sweep probably lost the instruction boundaries. Wrong sweeps
 // resynchronize with the real instruction boundaries after a few instructions.
@@ -185,7 +193,7 @@ func scanAMD64GS(before, page, after []byte, gsMem bool) []amd64Site {
 	fewest := -1
 	prevStart := -1
 	for k := 0; k < amd64SweepCount; k++ {
-		start := max(pageStart-amd64MaxInsnLen+k, 0)
+		start := min(k, pageStart)
 		if start == prevStart {
 			continue
 		}

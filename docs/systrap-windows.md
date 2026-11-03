@@ -264,14 +264,16 @@ The `x86-64` `syscall` instruction is two bytes. A same-size replacement fits ev
 
 The 5-byte `jmp rel32` patterns of the SPEC are harder. The engine uses two forms. The post-window form overwrites the `syscall` and the bytes after it. The pre-window form overwrites the instructions that end at the `syscall`, and it keeps `CC 90` at the `syscall`. A patcher must move the overwritten instructions into a trampoline and prove that no branch lands inside the window. That work needs exact instruction boundaries. The default engine uses neither form. The optional fast path of section 6.8 uses them, and it keeps `CC 90` where it cannot prove the window.
 
-Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps that start at different offsets. A sweep that cannot decode a byte skips it, and only the sweeps with the fewest skipped bytes vote. The engine patches a site only when more than half of those sweeps agree. The decoder gives no guarantee for four kinds of code:
+Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps that start at different offsets in the 64 bytes before the page. A sweep that cannot decode a byte skips it, and only the sweeps with the fewest skipped bytes vote. The engine patches a site only when more than half of those sweeps agree. The decoder gives no guarantee for four kinds of code:
 
 - Data that sits inside executable sections, such as tables and padding.
 - Hand-written assembly with computed jumps.
 - Just-in-time compiled code with no symbols.
 - Code that a guest writes after the scan.
 
-The engine limits the first kind with the section headers of the backing ELF file. It scans a page again each time the page becomes executable, which covers the last kind.
+The engine limits the first kind with the section headers of the backing ELF file. On `amd64`, it does not patch a writable and executable page that no ELF or PE image backs, such as the anonymous memory of a JIT compiler. V8 puts data beside its code in such a page, and the guest reads the bytes of the copy that runs. A patch of a false site in that data changed pointers and tables of V8, and Node.js guests crashed (issue #24). A system call in such a page therefore runs as an NT service, like a hidden system call. A writable segment of an ELF file stays patched. The engine scans a page again each time the page becomes executable, which covers code that a guest writes after the scan. On `arm64`, a site is an aligned word with an exact pattern, and the engine patches every page.
+
+The sweeps start 49 to 64 bytes before the page, so that a sweep that starts inside an instruction finds the real boundaries before it reaches the page. With sweeps that started in the last 15 bytes, the wrong sweeps out-voted the right ones at the start of a page of Node.js 20. They reported a GS instruction inside `lea rsp, [rbp-0x28]`, and the patch made the `lea` an illegal instruction.
 
 The `x86asm` decoder has one more defect. It reads a ModRM byte for `vzeroupper` and `vzeroall`, which have none. The length that it returns is then 1 to 5 bytes too long. The engine decodes these two instructions itself, in `decodeX86`. Before this correction, the scan of Node 22 found a GS memory instruction inside a `lea`. The patch then made the `lea` an illegal instruction, and the guest received SIGILL.
 
@@ -318,7 +320,7 @@ The memory file is a temporary file. `sectionCache` creates a section of that fi
 
 1. Map a guest page without execute permission. The view shows the original frame.
 2. Receive the execute fault through the debug object.
-3. Copy the frame, scan the copy, and replace the sites (section 6.5 and 6.6 list them).
+3. Copy the frame. Scan the copy and replace the sites (section 6.5 and 6.6 list them). On `amd64`, skip the replacement for a writable page that no image backs.
 4. Map the copy as execute-read from a private section, and call `FlushInstructionCache`.
 5. Continue the thread.
 6. After a write fault to a writable and executable page, map the original frame again.
@@ -372,7 +374,13 @@ mov rax, [rip+d1]     ; load the guest rax from the slot
 jmp [rip+d2]          ; jump to the guest rip from the slot
 ```
 
-A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address, and if it has an FS prefix, runs the trampoline again. Eight repairs in a row at one address with identical registers count as a real fault, because a repair that works changes the registers. A loop that waits in the kernel on each pass can need a repair on each pass. A wait on a page of a file view is an example. The engine allows 512 threads in one stub.
+A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address. If the instruction has an FS prefix, the Sentry runs it with the guest FS base and moves `RIP` past it. The thread then continues through the trampoline, which loads the base again. Each repair therefore makes progress, also when Windows resets the base again before the thread runs.
+
+The Sentry reads guest memory with `ReadProcessMemory`. It writes guest memory only when `VirtualQueryEx` shows a writable view, because `WriteProcessMemory` makes a read-only page writable. A write must fault in that case, so that the memory manager can copy the page, or the engine can map the original frame of a code block. The Sentry does not run an atomic instruction, because other guest threads run during the stop.
+
+For an instruction that the Sentry does not run, the thread runs the instruction again after the trampoline. Eight such repairs in a row at one address with identical registers count as a real fault. The engine allows 512 threads in one stub.
+
+Before the Sentry ran the instruction, every repair used the trampoline. With many busy threads, the thread lost the base again before it reached the instruction, and its registers did not change. Node.js guests then hit the limit of eight repairs at loads such as `mov rax, fs:[0x28]` and received SIGSEGV (issue #24).
 
 ### 6.7 Confinement
 
@@ -562,8 +570,8 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | Writing to the executing page | A guest that writes to the page that it executes gets SIGSEGV. |
 | GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
 | Workspace files | `pkg/gvx` passes the kernel memory file to `hostfs` and `ext4lite` via `SetChunkMemory`, so writable shared mappings work. A custom `memmap.File` without a host handle maps read-only through a copy and rejects writable shared mappings with `ENODEV`. |
-| Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. |
-| JIT engines | Node 22 (V8) passes its two gates on both runners. A JVM is untested. |
+| Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. On `amd64`, a `syscall` in writable and executable anonymous memory also runs as an NT service. |
+| JIT engines | On `windows-latest`, Node 22 and 24 (V8) run `npm install`, `tsc`, esbuild, swc, a Vite build, and a `docker build` in `docker:dind`. Node 20 runs `npm install` and the TypeScript compiler (issue #24). A JVM is untested. |
 | Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |
 | Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
 

@@ -308,8 +308,10 @@ type siteInfo struct {
 // patchPage replaces the instructions that Windows cannot run with BRK or
 // NOP. page is a copy of the original frame. With the fast path, each `svc #0`
 // becomes a branch to a trampoline slot, and a site without a slot keeps the
-// BRK.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, []winSlotRef, error) {
+// BRK. A site is an aligned word with an exact pattern, so the data beside the
+// code of a JIT compiler rarely holds one, and the patcher ignores writable.
+// The code of a JIT compiler can read TPIDR_EL0, which the fast path moves.
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool) (map[uint16]siteInfo, []winSlotRef, error) {
 	sites := make(map[uint16]siteInfo)
 	var slots []winSlotRef
 	for _, s := range scanARM64(page) {

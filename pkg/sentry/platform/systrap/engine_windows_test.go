@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -351,6 +352,38 @@ func TestWritableExecutableBlockRepatches(t *testing.T) {
 	mustSyscall(t, si, err, 12, r.ac)
 	if got := r.as.PatchedBlocks(); got < 3 {
 		t.Errorf("patched blocks = %d, want at least 3 (code page, data page, data page after the write)", got)
+	}
+}
+
+// anonMM reports every guest address as anonymous memory, as the memory
+// manager of the Sentry does for a private anonymous mapping.
+type anonMM struct{ *testMM }
+
+func (anonMM) ExecImageAt(context.Context, hostarch.Addr) platform.ExecImage {
+	return platform.ExecImage{Kind: platform.MappingAnonymous}
+}
+
+func TestAnonymousWritableExecutablePageReadsUnpatched(t *testing.T) {
+	// A JIT compiler puts data beside its code in writable and executable
+	// anonymous memory, and the guest reads the bytes of the copy that runs.
+	// The data at 0x400 holds a system call sequence that the scan would patch.
+	// The guest runs code in the page, loads the end of that sequence, and must
+	// read the original bytes.
+	if runtime.GOARCH != "amd64" {
+		t.Skip("the arm64 patcher patches writable pages")
+	}
+	r := newRig(t, newPlatform(t))
+	page := r.program(gJump(dataVA))
+	copy(page[0x800:], gSyscall(21))
+	data := gSyscall(60)
+	tail := dataVA + 0x400 + uint64(len(data)) - 8
+	run := append(gLoadFrom(tail), gJump(codeVA+0x800)...)
+	rwx := r.mapPage(dataVA, hostarch.AccessType{Read: true, Write: true, Execute: true}, run)
+	copy(rwx[0x400:], data)
+	si, _, err := r.ctx.Switch(r.rctx, anonMM{r.mm}, r.ac, -1)
+	mustSyscall(t, si, err, 21, r.ac)
+	if got, want := regAcc(r.ac), load64(data[len(data)-8:]); got != want {
+		t.Errorf("the guest read %#x at %#x, want the original bytes %#x", got, tail, want)
 	}
 }
 

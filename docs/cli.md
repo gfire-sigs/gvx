@@ -231,7 +231,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
-| A store into the page of the storing instruction | A `systrap` engine gives a page write access or execute access, never both. The Sentry runs a store from a writable and executable page into the same page. It writes both copies of the page. The Sentry decodes the single and pair stores of general and vector registers. Exclusive and atomic stores, a store across the page edge, and a store over an instruction that the patcher changed end with SIGSEGV. The Sentry log names the instruction. |
+| A store into the page of the storing instruction | The Windows `systrap` engine gives a page write access or execute access, never both. A store from a writable and executable page into the same page ends with SIGSEGV. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
 
 ## 8. Examples
