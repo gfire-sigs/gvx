@@ -94,6 +94,8 @@ type Platform struct {
 	// barrierFence is the target of the full barrier that GlobalMemoryBarrier
 	// runs before it reads any thread state.
 	barrierFence atomic.Uint64
+	// barrierMu serializes the calls of GlobalMemoryBarrier.
+	barrierMu sync.Mutex
 
 	closeOnce sync.Once
 	closeErr  error

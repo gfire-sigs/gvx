@@ -18,12 +18,18 @@ package systrap
 
 import (
 	"errors"
-	"maps"
-	"slices"
+
+	"golang.org/x/sys/windows"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 
 	"z.gfire.dev/gvx/pkg/log"
+)
+
+// NT statuses of a call on a thread or a process that is ending.
+const (
+	statusThreadIsTerminating  = 0xC000004B
+	statusProcessIsTerminating = 0xC000010A
 )
 
 // HaveGlobalMemoryBarrier implements platform.Platform.HaveGlobalMemoryBarrier.
@@ -31,8 +37,9 @@ func (*Platform) HaveGlobalMemoryBarrier() bool { return true }
 
 // GlobalMemoryBarrier implements platform.Platform.GlobalMemoryBarrier. It
 // returns after every guest thread that ran guest code at the call has stopped
-// once. A thread that waits in the spill routine or that the engine parked
-// runs no guest code and needs no stop.
+// once, and after every Sentry thread passed a barrier. A guest thread that
+// waits in the spill routine or that the engine parked runs no guest code and
+// needs no stop.
 //
 // WHY: guest threads run in stub processes, so FlushProcessWriteBuffers in the
 // Sentry misses them, and the call cannot reach into a stub. The call stops a
@@ -52,16 +59,64 @@ func (*Platform) HaveGlobalMemoryBarrier() bool { return true }
 // the initial thread of the stub stays parked at the loader breakpoint. No
 // test covers that exit path. The suspension needs no new thread, so the host
 // lockdown and the one-process job limit do not matter. It adds no debug
-// event, so it never waits for the pump. It holds th.mu like every other
-// operation on a suspend count, so it cannot leave a thread with the wrong
-// count.
+// event, so it never waits for the pump.
+//
+// The call holds th.mu of every thread from before the first suspension until
+// after the last resume, like every other operation on a suspend count, so it
+// cannot leave a thread with the wrong count. Two calls would lock the threads
+// in different orders, so barrierMu serializes them. The call locks every
+// thread before it suspends any, so a suspended guest thread never waits for a
+// lock that another operation holds.
+//
+// Suspending all threads first and reading the contexts afterwards overlaps
+// the time that each thread needs to leave user mode.
 func (p *Platform) GlobalMemoryBarrier() error {
 	// The full barrier orders the stores of the calling task before the reads
 	// of the thread states below.
 	p.barrierFence.Add(1)
-	var errs []error
+	// Threads of the Sentry pass a barrier here. The guest threads need the
+	// stops below.
+	procFlushProcessWriteBuffers.Call()
+
+	p.barrierMu.Lock()
+	defer p.barrierMu.Unlock()
+
+	var held []*thread
 	for _, sp := range p.dbg.stubs() {
-		errs = append(errs, sp.memoryBarrier())
+		sp.mu.Lock()
+		for _, th := range sp.threads {
+			held = append(held, th)
+		}
+		sp.mu.Unlock()
+	}
+	for _, th := range held {
+		th.mu.Lock()
+	}
+	defer func() {
+		for _, th := range held {
+			th.mu.Unlock()
+		}
+	}()
+
+	var errs []error
+	var stopped []*thread
+	for _, th := range held {
+		if !th.mayRunGuest() {
+			continue
+		}
+		if err := ntSuspendThread(th.h); err != nil {
+			errs = append(errs, th.stopErr(err))
+			continue
+		}
+		stopped = append(stopped, th)
+	}
+	// The thread context request waits until the thread is off the processor.
+	for _, th := range stopped {
+		errs = append(errs, th.stopErr(th.getContext(ctxFlagControl)))
+	}
+	for _, th := range stopped {
+		th.barrierStops.Add(1)
+		errs = append(errs, th.stopErr(ntResumeThread(th.h)))
 	}
 	if err := errors.Join(errs...); err != nil {
 		log.Warningf("systrap: memory barrier: %v", err)
@@ -70,47 +125,34 @@ func (p *Platform) GlobalMemoryBarrier() error {
 	return nil
 }
 
-// memoryBarrier stops every running thread of the stub once.
-func (sp *stubProc) memoryBarrier() error {
-	sp.mu.Lock()
-	threads := slices.Collect(maps.Values(sp.threads))
-	sp.mu.Unlock()
-	var errs []error
-	for _, th := range threads {
-		errs = append(errs, th.memoryBarrier())
-	}
-	return errors.Join(errs...)
-}
-
-// memoryBarrier stops the thread once when it can run guest code. A thread that
-// died with its stub needs no stop.
-func (th *thread) memoryBarrier() error {
-	th.mu.Lock()
-	defer th.mu.Unlock()
+// mayRunGuest reports whether the thread can run guest code. A parked thread,
+// a thread that waits in the spill routine, the initial thread of the stub, a
+// thread of a dead stub, and a thread that destroy removed need no stop.
+// Callers hold th.mu.
+func (th *thread) mayRunGuest() bool {
 	if th.ctx == nil || th.parked || th.sp.dead.Load() {
-		return nil
+		return false
 	}
 	if f := th.fast.Load(); f != nil && f.inSpill {
-		return nil
+		return false
 	}
-	if th.sp.thread(th.tid) != th {
-		// destroy removed the thread before it closed the handle.
-		return nil
-	}
-	if err := ntSuspendThread(th.h); err != nil {
-		return th.stopErr(err)
-	}
-	// The thread context request waits until the thread is off the processor.
-	err := th.getContext(ctxFlagControl)
-	if rerr := ntResumeThread(th.h); rerr != nil {
-		err = errors.Join(err, rerr)
-	}
-	return th.stopErr(err)
+	// destroy removes the thread before it closes the handle.
+	return th.sp.thread(th.tid) == th
 }
 
-// stopErr drops an error that the death of the stub caused.
+// stopErr drops an error that the end of the thread or of its stub caused. The
+// thread runs no guest code then.
 func (th *thread) stopErr(err error) error {
-	if err != nil && th.sp.dead.Load() {
+	if err == nil || th.sp.dead.Load() {
+		return nil
+	}
+	var nt *ntError
+	if errors.As(err, &nt) && (nt.Status == statusThreadIsTerminating || nt.Status == statusProcessIsTerminating) {
+		return nil
+	}
+	// GetThreadContext reports a Win32 error that names no cause. A thread
+	// object in the signaled state has exited.
+	if ev, werr := windows.WaitForSingleObject(th.h, 0); werr == nil && ev == windows.WAIT_OBJECT_0 {
 		return nil
 	}
 	return err

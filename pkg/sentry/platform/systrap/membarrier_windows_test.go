@@ -59,32 +59,29 @@ func waitRunning(t testing.TB, c *Context) {
 	}
 }
 
-func TestGlobalMemoryBarrierLeavesASpinningThreadRunning(t *testing.T) {
-	p := newPlatform(t)
-	r := newRig(t, p)
-	r.program(gCountSpin())
-	type result struct {
-		si  *linux.SignalInfo
-		err error
-	}
-	done := make(chan result, 1)
+type spinResult struct {
+	si  *linux.SignalInfo
+	err error
+}
+
+// startSpin runs the guest of r in the background and returns when its thread
+// runs guest code.
+func startSpin(t testing.TB, r *rig) <-chan spinResult {
+	t.Helper()
+	done := make(chan spinResult, 1)
 	go func() {
 		si, _, err := r.run()
-		done <- result{si, err}
+		done <- spinResult{si, err}
 	}()
 	waitRunning(t, r.ctx)
-	for i := range 50 {
-		if err := p.GlobalMemoryBarrier(); err != nil {
-			t.Fatalf("barrier %d: %v", i, err)
-		}
-	}
-	select {
-	case res := <-done:
-		t.Fatalf("Switch returned (%s, %v) after the barriers: a barrier must not stop the guest", describe(res.si), res.err)
-	default:
-	}
-	// A thread that a barrier left suspended never raises the single-step stop,
-	// so this interrupt would not end the run.
+	return done
+}
+
+// stopSpin interrupts a spinning guest and checks that the run ends. A thread
+// that a barrier left suspended never raises the single-step stop, so the
+// interrupt would not end its run.
+func stopSpin(t testing.TB, r *rig, done <-chan spinResult) {
+	t.Helper()
 	r.ctx.Interrupt()
 	select {
 	case res := <-done:
@@ -96,13 +93,70 @@ func TestGlobalMemoryBarrierLeavesASpinningThreadRunning(t *testing.T) {
 	}
 }
 
-func TestGlobalMemoryBarrierWithAThreadInASystemCall(t *testing.T) {
+func barrierStops(r *rig) uint64 { return r.ctx.th.Load().barrierStops.Load() }
+
+func TestGlobalMemoryBarrierStopsARunningThreadOncePerCall(t *testing.T) {
+	const barriers = 50
+	p := newPlatform(t)
+	r := newRig(t, p)
+	r.program(gCountSpin())
+	done := startSpin(t, r)
+	before := barrierStops(r)
+	for i := range barriers {
+		if err := p.GlobalMemoryBarrier(); err != nil {
+			t.Fatalf("barrier %d: %v", i, err)
+		}
+	}
+	if got := barrierStops(r) - before; got != barriers {
+		t.Fatalf("%d stops of the spinning thread for %d barriers, want one for each", got, barriers)
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("Switch returned (%s, %v) after the barriers: a barrier must not stop the guest", describe(res.si), res.err)
+	default:
+	}
+	stopSpin(t, r, done)
+}
+
+func TestGlobalMemoryBarrierStopsOnlyThreadsThatRunGuestCode(t *testing.T) {
+	const barriers = 10
+	p := newPlatform(t)
+	a := newRig(t, p)
+	a.program(gCountSpin())
+	b := a.newThread()
+	b.ac.SetIP(codeVA)
+	b.ac.SetStack(stackVA + blockSize/2)
+	c := a.newThread()
+	a.mapPage(dataVA, execAccess, gSyscall(7))
+	c.ac.SetIP(dataVA)
+	c.ac.SetStack(stackVA + blockSize/4)
+
+	doneA := startSpin(t, a)
+	doneB := startSpin(t, b)
+	// The thread of c waits in the Sentry for the result of its call.
+	si, _, err := c.run()
+	mustSyscall(t, si, err, 7, c.ac)
+
+	before := [3]uint64{barrierStops(a), barrierStops(b), barrierStops(c)}
+	for i := range barriers {
+		if err := p.GlobalMemoryBarrier(); err != nil {
+			t.Fatalf("barrier %d: %v", i, err)
+		}
+	}
+	got := [3]uint64{barrierStops(a) - before[0], barrierStops(b) - before[1], barrierStops(c) - before[2]}
+	if want := [3]uint64{barriers, barriers, 0}; got != want {
+		t.Fatalf("stops of the two spinning threads and of the thread in a system call = %v, want %v", got, want)
+	}
+	stopSpin(t, a, doneA)
+	stopSpin(t, b, doneB)
+}
+
+func TestGlobalMemoryBarrierResumesAThreadInASystemCall(t *testing.T) {
 	p := newPlatform(t)
 	r := newRig(t, p)
 	r.program(gSyscall(41), gSyscall(42))
 	si, _, err := r.run()
 	mustSyscall(t, si, err, 41, r.ac)
-	// The thread waits in the Sentry for the result of the first call.
 	for i := range 10 {
 		if err := p.GlobalMemoryBarrier(); err != nil {
 			t.Fatalf("barrier %d: %v", i, err)

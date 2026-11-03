@@ -74,6 +74,8 @@ type thread struct {
 	// evQueued counts the events in the channel, so that a Sentry thread that
 	// polls the handoff word sees a stop that the debugger delivered.
 	evQueued atomic.Int32
+	// barrierStops counts the stops that GlobalMemoryBarrier made.
+	barrierStops atomic.Uint64
 
 	archThread
 }
