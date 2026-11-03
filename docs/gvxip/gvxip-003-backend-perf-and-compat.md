@@ -6,10 +6,20 @@ This specification defines the engineering work order for four core subsystems i
 | :--- | :--- |
 | **Document ID** | `GVXIP-003` |
 | **Title** | Cross-Platform Execution Engine Stability, Compatibility, and Fast-Path Architecture |
-| **Status** | Active Specification and Work Order |
+| **Status** | Completed or obsolete (see the status table below) |
 | **Isolation Tier** | Tier 1 (`pkg/sentry/platform/whpx`, `pkg/sentry/fsimpl/hostfs`, `e2e`) and Tier 2 (`pkg/sentry/platform/systrap/*_{darwin,windows}.go`) |
 | **Target Platforms** | `darwin/arm64`, `darwin/amd64`, `windows/amd64`, `windows/arm64`, `linux/amd64`, `linux/arm64` |
 | **Companion Specs** | [`gvxip-001-better-posix-hostfs.md`](gvxip-001-better-posix-hostfs.md), [`gvxip-002-ext4lite-volume-engine.md`](gvxip-002-ext4lite-volume-engine.md) |
+
+The tracks below keep the text of the original work order. This table records the state of the code.
+
+| Track | State |
+| :--- | :--- |
+| Track 1: `whpx` triple fault | Implemented. The address space invalidates the recorded state of each virtual processor and reloads the root table (`whpx/address_space.go`, `whpx/context.go`). |
+| Track 2: `hostfs` handle pinning | Implemented with at most 256 pinned directories and a 5-second idle close (`hostfs/dirpin.go`). |
+| Track 3A: `darwinsystrap` spin-polling | Obsolete. The project removed the macOS `systrap` engine. |
+| Track 3B and 3C: `winsystrap` fast path | Implemented as the default fast path with `winSysmsg` pages. See [`systrap-windows.md`](../systrap-windows.md), section 6.8. |
+| Track 4: `darwinsystrap` 16KB pages | Obsolete. The project removed the macOS `systrap` engine. |
 
 ---
 
