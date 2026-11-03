@@ -17,8 +17,11 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/internal/acceptprog"
 	"z.gfire.dev/gvx/internal/hvtest"
@@ -60,6 +63,54 @@ func TestE2ESystrapCodeWrites(t *testing.T) {
 			}
 			if code != 0 || !strings.Contains(stdout, "CODEWRITE-OK") {
 				t.Fatalf("codewrite on %s exited with %d\nstdout:\n%s\nstderr:\n%s", b.name, code, stdout, stderr)
+			}
+		})
+	}
+}
+
+// TestE2ESystrapCodeWritesInMountedFiles runs the code of a shared file mapping
+// on a bind mount and on a volume, then overwrites it with read(2) and write(2).
+// These file systems keep the mapped pages in the memory file through their
+// chunk cache, which the engine learns about through a wrapper of that file.
+func TestE2ESystrapCodeWritesInMountedFiles(t *testing.T) {
+	bin := acceptprog.BuildCodeWrite(t, hostArch())
+	for _, b := range fixedAddressBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			if (b.plat == gvx.PlatformHVF || b.plat == gvx.PlatformWHPX) && !hvtest.Available() {
+				t.Skip("no hardware hypervisor on this host")
+			}
+			requireFixedAddressBackend(t, b)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			var out, errOut bytes.Buffer
+			sb, err := gvx.New(ctx, gvx.Config{
+				Platform:            b.plat,
+				NetworkMode:         gvx.NetModeNone,
+				OCICacheDir:         sharedCacheDir(t),
+				BinaryPath:          bin,
+				Argv:                []string{"/bin/codewrite", "dir=/workspace", "dir=/mnt/vol"},
+				WorkspacePath:       t.TempDir(),
+				Mounts:              []gvx.Mount{{Kind: gvx.MountVolume, VolumeName: "codevol", GuestPath: "/mnt/vol"}},
+				Stdout:              &out,
+				Stderr:              &errOut,
+				DisableHostLockdown: true,
+			})
+			skipWhenFixedAddressRefused(t, "New(codewrite)", err)
+			defer func() {
+				if err := sb.Close(); err != nil {
+					t.Errorf("Close(%s): %v", b.name, err)
+				}
+			}()
+			code, err := sb.Run(ctx)
+			skipWhenFixedAddressRefused(t, "Run(codewrite)", err)
+			t.Logf("guest output on %s:\n%s", b.name, out.String())
+			for _, dir := range []string{"/workspace", "/mnt/vol"} {
+				if !strings.Contains(out.String(), "PASS shared-file-writes:"+dir+"\n") {
+					t.Errorf("the file checks of %s did not pass on %s", dir, b.name)
+				}
+			}
+			if err != nil || code != 0 {
+				t.Fatalf("codewrite on %s = (%d, %v)\nstderr:\n%s", b.name, code, err, errOut.String())
 			}
 		})
 	}

@@ -23,14 +23,16 @@
 //   - a store through a second view of the executing frame,
 //   - read(2) into a mapped region,
 //   - write(2) to a file that another mapping executes,
-//   - process_vm_writev(2) into another process.
+//   - process_vm_writev(2) into another process,
+//   - read(2) and write(2) into a shared mapping of a file on each directory
+//     that a dir= argument names, for example a bind mount and a volume.
 //
 // Each check prints "PASS name" or "FAIL name: reason", and the program prints
 // "CODEWRITE-OK" when all pass. The program runs as the only guest process.
 //
 // Usage:
 //
-//	codewrite            run every check
+//	codewrite [dir=DIR...]  run every check, and the file checks in each DIR
 //	codewrite pvw-child  serve the process_vm_writev check, started by the parent
 package main
 
@@ -73,6 +75,16 @@ func main() {
 		{"read-into-code", checkReadIntoCode},
 		{"write-to-executed-file", checkWriteToExecutedFile},
 		{"process-vm-writev", checkProcessVMWritev},
+	}
+	for _, arg := range os.Args[1:] {
+		dir, ok := strings.CutPrefix(arg, "dir=")
+		if !ok {
+			continue
+		}
+		checks = append(checks, struct {
+			name string
+			fn   func() error
+		}{"shared-file-writes:" + dir, func() error { return checkSharedFileWrites(dir) }})
 	}
 	failed := false
 	for _, c := range checks {
@@ -267,6 +279,60 @@ func checkWriteToExecutedFile() error {
 		}
 	}
 	return nil
+}
+
+// checkSharedFileWrites runs code from a shared mapping of a file in dir, which
+// a file system of the Sentry backs, and replaces the code with read(2) into a
+// second shared mapping and with write(2) to the file.
+func checkSharedFileWrites(dir string) error {
+	f, err := os.OpenFile(dir+"/codewrite.bin", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("create the file: %w", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	fd := int(f.Fd())
+	if err := syscall.Ftruncate(fd, pageSize); err != nil {
+		return fmt.Errorf("ftruncate: %w", err)
+	}
+	rw, err := syscall.Mmap(fd, 0, pageSize, protRW, syscall.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("mmap rw view: %w", err)
+	}
+	defer syscall.Munmap(rw)
+	rx, err := syscall.Mmap(fd, 0, pageSize, protRX, syscall.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("mmap rx view: %w", err)
+	}
+	defer syscall.Munmap(rx)
+	if _, err := syscall.Pwrite(fd, codeReturn(7), 0); err != nil {
+		return fmt.Errorf("pwrite: %w", err)
+	}
+	if err := want("the first function", run(rx, 0), 7); err != nil {
+		return err
+	}
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
+		return fmt.Errorf("pipe: %w", err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	for _, n := range []uint32{9, 11} {
+		code := codeReturn(n)
+		if _, err := syscall.Write(fds[1], code); err != nil {
+			return fmt.Errorf("write to the pipe: %w", err)
+		}
+		if got, err := syscall.Read(fds[0], rw[:len(code)]); err != nil || got != len(code) {
+			return fmt.Errorf("read into the mapping = (%d, %v), want %d bytes", got, err, len(code))
+		}
+		if err := want("the function after read(2)", run(rx, 0), n); err != nil {
+			return err
+		}
+	}
+	if _, err := syscall.Pwrite(fd, codeReturn(13), 0); err != nil {
+		return fmt.Errorf("pwrite: %w", err)
+	}
+	return want("the function after write(2)", run(rx, 0), 13)
 }
 
 func memfdCreate(name string) (int, error) {
