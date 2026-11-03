@@ -584,17 +584,40 @@ func lexicallyInside(inner, outer string) bool {
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// alignedNesting reports whether the inner mount sits over the outer mount's
+// own copy of the inner directory: the guest path of the inner mount equals the
+// guest path of the outer mount joined with the host path of the inner
+// directory relative to the outer one. The guest then reaches those files
+// through the inner mount only, because the inner mount covers the outer copy.
+// Compose layouts such as "-v $PWD:/app -v $PWD/node_modules:/app/node_modules"
+// are aligned.
+func alignedNesting(outerHost, outerGuest, innerHost, innerGuest string) bool {
+	rel, err := filepath.Rel(outerHost, innerHost)
+	if err != nil {
+		return false
+	}
+	return path.Join(outerGuest, filepath.ToSlash(rel)) == path.Clean(innerGuest)
+}
+
 // rejectNestedWorkspace fails when the directory mount key lies inside, or
 // contains, the host directory of an earlier mount, and one of the two can
-// write. A read-only mount never writes .gvx_meta, so two read-only mounts keep
-// their tables apart without a conflict. Two mounts of one directory share a
+// write, unless the guest paths line up as alignedNesting describes. A
+// read-only mount never writes .gvx_meta, so two read-only mounts keep their
+// tables apart without a conflict. Two mounts of one directory share a
 // workspace, and a mount of a file keeps no table.
 func rejectNestedWorkspace(dirs map[workspaceKey]string, key workspaceKey, guestPath string) error {
 	for other, otherGuest := range dirs {
 		if !nestedKeys(key, other) || (key.readOnly && other.readOnly) {
 			continue
 		}
-		return fmt.Errorf("gvx: mount %s from %q overlaps mount %s from %q: a host directory inside another mounted directory would get a second .gvx_meta table: %w",
+		outerHost, outerGuest, innerHost, innerGuest := other.path, otherGuest, key.path, guestPath
+		if lexicallyInside(other.path, key.path) {
+			outerHost, outerGuest, innerHost, innerGuest = key.path, guestPath, other.path, otherGuest
+		}
+		if alignedNesting(outerHost, outerGuest, innerHost, innerGuest) {
+			continue
+		}
+		return fmt.Errorf("gvx: mount %s from %q overlaps mount %s from %q: the guest could reach the same files through both mounts, and each mount keeps its own .gvx_meta table. Mount the inner directory at the guest path that the outer mount gives it: %w",
 			guestPath, key.path, otherGuest, other.path, ErrInvalidConfig)
 	}
 	return nil
@@ -606,8 +629,9 @@ func rejectNestedWorkspace(dirs map[workspaceKey]string, key workspaceKey, guest
 // two mounts share with the same access and the same kind (directory or
 // file) shares one workspace, so two flush loops never write the same
 // metadata file. A host directory that lies inside another mounted host
-// directory is refused, because the two workspaces would keep diverging
-// tables for the same files. openMounts must run before the host lockdown.
+// directory is refused unless the guest paths line up (see alignedNesting),
+// because the two workspaces would keep diverging tables for the same files.
+// openMounts must run before the host lockdown.
 func (s *Sandbox) openMounts() error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	dirMounts := make(map[workspaceKey]string)

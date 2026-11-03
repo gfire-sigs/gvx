@@ -674,6 +674,80 @@ func TestOpenMountsRejectsDirectoryInsideAnotherMountedDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenMountsAcceptsNestedDirectoriesThatLineUpInTheGuest(t *testing.T) {
+	root := t.TempDir()
+	inner := filepath.Join(root, "node_modules")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "compose layout through the workspace",
+			cfg:  Config{WorkspacePath: root, Mounts: []Mount{{Kind: MountBind, HostPath: inner, GuestPath: "/workspace/node_modules"}}},
+		},
+		{
+			name: "compose layout through two bind mounts",
+			cfg: Config{Mounts: []Mount{
+				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
+				{Kind: MountBind, HostPath: inner, GuestPath: "/app/node_modules"},
+			}},
+		},
+		{
+			name: "inner mount listed first",
+			cfg: Config{Mounts: []Mount{
+				{Kind: MountBind, HostPath: inner, GuestPath: "/app/node_modules"},
+				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.cfg.normalize(); err != nil {
+				t.Fatal(err)
+			}
+			sb := &Sandbox{cfg: tc.cfg}
+			t.Cleanup(func() { _ = sb.closeMounts() })
+			if err := sb.openMounts(); err != nil {
+				t.Fatalf("openMounts() = %v, want success: the inner mount covers the outer copy of its directory", err)
+			}
+		})
+	}
+}
+
+func TestOpenMountsRejectsNestedDirectoriesThatAliasInTheGuest(t *testing.T) {
+	root := t.TempDir()
+	inner := filepath.Join(root, "node_modules")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, guest := range map[string]string{
+		"inner mount elsewhere":             "/elsewhere",
+		"inner mount below another name":    "/app/other",
+		"inner mount one level too shallow": "/node_modules",
+		"inner mount at the outer mount":    "/app",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Config{Mounts: []Mount{
+				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
+				{Kind: MountBind, HostPath: inner, GuestPath: guest},
+			}}
+			if guest == "/app" {
+				cfg.Mounts[0].GuestPath = "/outer"
+			}
+			if err := cfg.normalize(); err != nil {
+				t.Fatal(err)
+			}
+			sb := &Sandbox{cfg: cfg}
+			t.Cleanup(func() { _ = sb.closeMounts() })
+			if err := sb.openMounts(); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("openMounts() = %v, want ErrInvalidConfig for a layout that aliases the files", err)
+			}
+		})
+	}
+}
+
 func TestOpenMountsAcceptsReadOnlyOverlapAndSiblingDirectories(t *testing.T) {
 	root := t.TempDir()
 	inner := filepath.Join(root, "inner")
