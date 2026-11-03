@@ -43,17 +43,6 @@ func readMetaTable(t testing.TB, path string) map[string]POSIXAttr {
 	return table
 }
 
-// metaSnapshot returns a copy of the table that a workspace holds in memory.
-func metaSnapshot(w *Workspace) map[string]POSIXAttr {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	out := make(map[string]POSIXAttr, len(w.meta))
-	for k, v := range w.meta {
-		out[k] = v
-	}
-	return out
-}
-
 // requireSameTable fails when the tables differ in a key or in a record.
 func requireSameTable(t testing.TB, what string, got, want map[string]POSIXAttr) {
 	t.Helper()
@@ -330,8 +319,12 @@ func TestTornTailHealsOnTheNextWrite(t *testing.T) {
 	if img.torn {
 		t.Fatalf("the file still has a torn tail after a write")
 	}
+	hints := make(map[string]bool)
+	for _, r := range img.recs {
+		hints[r.hint] = true
+	}
 	for _, name := range []string{"a", "b", "d"} {
-		if _, ok := img.entries[name]; !ok {
+		if !hints[name] {
 			t.Errorf("record %s lost after the torn tail healed", name)
 		}
 	}
@@ -493,12 +486,10 @@ func TestCompactionKeepsEveryRecord(t *testing.T) {
 	if got := fileSize(t, path); got > 3*snapshot {
 		t.Fatalf("journal is %d bytes after compactions, want at most 3 times the %d-byte snapshot", got, snapshot)
 	}
-	requireSameTable(t, "table on disk", readMetaTable(t, path), metaSnapshot(ws))
-	for _, gone := range []string{"d", "d/f1", "d/f2"} {
-		if _, ok := readMetaTable(t, path)[gone]; ok {
-			t.Errorf("record %s is on disk after it moved or died", gone)
-		}
-	}
+	requireSameTable(t, "table on disk", readMetaTable(t, path), metaSnapshot(t, ws))
+	// The journal holds exactly the records of the table, so no record of the
+	// unlinked file or of the replaced directory leaked into it.
+	requireDiskMatchesMemory(t, ws, path)
 	for _, kept := range []string{"moved", "moved/f0", "moved/renamed", "link"} {
 		if _, ok := readMetaTable(t, path)[kept]; !ok {
 			t.Errorf("record %s is missing from disk", kept)
@@ -600,7 +591,7 @@ func TestConcurrentMutationsAndCompactionsKeepTheTable(t *testing.T) {
 	close(stop)
 	<-syncDone
 	mustSync(t, ws)
-	want := metaSnapshot(ws)
+	want := metaSnapshot(t, ws)
 	requireSameTable(t, "table on disk", readMetaTable(t, filepath.Join(dir, MetaFileName)), want)
 	if err := ws.Close(); err != nil {
 		t.Fatal(err)
@@ -610,7 +601,7 @@ func TestConcurrentMutationsAndCompactionsKeepTheTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	requireSameTable(t, "table after reopen", metaSnapshot(reopened), want)
+	requireSameTable(t, "table after reopen", metaSnapshot(t, reopened), want)
 }
 
 func TestReopenRestoresTheTableAfterRandomMutations(t *testing.T) {
@@ -667,7 +658,7 @@ func TestReopenRestoresTheTableAfterRandomMutations(t *testing.T) {
 			mustSync(t, ws)
 		}
 	}
-	want := metaSnapshot(ws)
+	want := metaSnapshot(t, ws)
 	if err := ws.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -676,15 +667,17 @@ func TestReopenRestoresTheTableAfterRandomMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	requireSameTable(t, "table after reopen", metaSnapshot(reopened), want)
+	requireSameTable(t, "table after reopen", metaSnapshot(t, reopened), want)
 }
 
 func TestRecordCapStillBoundsTheTable(t *testing.T) {
 	dir := t.TempDir()
-	ws := journalWS(t, dir, workspaceOptions{maxMeta: 3})
+	ws := journalWS(t, dir, workspaceOptions{})
 	for i := range 3 {
 		mustWriteFile(t, ws, fmt.Sprintf("f%d", i), 0o644)
 	}
+	// The cap counts memory, so the memory of three records is the cap here.
+	ws.maxMetaBytes = ws.meta.memBytes()
 	err := ws.WriteFile("f3", []byte("x"), 0o644)
 	if !errors.Is(err, errMetaFull) {
 		t.Fatalf("WriteFile beyond the cap = %v, want errMetaFull", err)

@@ -102,9 +102,8 @@ func hostGetXattr(path, name string) (string, error) {
 }
 
 func (e *env) metaXattrs(rel string) map[string][]byte {
-	e.ws.mu.RLock()
-	defer e.ws.mu.RUnlock()
-	return e.ws.meta[rel].Xattrs
+	attr, _ := metaRecordAt(e.ws, rel)
+	return attr.Xattrs
 }
 
 func TestNativeXattrStoresUserAttributesOnTheHost(t *testing.T) {

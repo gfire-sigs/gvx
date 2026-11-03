@@ -12,23 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !darwin && !windows
+//go:build windows
 
 package hostfs
 
-import (
-	"os"
-	"time"
+// keysCarryBirthTime reports whether the identity that a stat returns holds the
+// birth time. The Windows file identifier is unique for the life of the volume,
+// so the key holds no birth time.
+const keysCarryBirthTime = false
 
-	"z.gfire.dev/gvx/internal/xsys/unix"
-)
-
-// probeCaseInsensitive reports false: the Linux development build runs on
-// case-sensitive file systems. It exists so that the package builds on Linux.
-func probeCaseInsensitive(*os.File) (bool, error) {
-	return false, nil
-}
-
-func birthTime(st *unix.Stat_t) time.Time {
-	return time.Unix(int64(st.Ctim.Sec), int64(st.Ctim.Nsec))
+// volumeIDsTrusted reports whether the volume of the workspace root passes the
+// platform test for file identities. Windows decides from the
+// identity of each file, so every volume passes here.
+func volumeIDsTrusted(hostBackend, bool) bool {
+	return true
 }

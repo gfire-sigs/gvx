@@ -15,6 +15,7 @@
 package hostfs
 
 import (
+	"errors"
 	iofs "io/fs"
 	"os"
 
@@ -129,7 +130,7 @@ func (w *Workspace) mknodLocked(rel string, mode, uid, gid uint32, rdev uint64) 
 	if rel == "." {
 		return iofs.ErrExist
 	}
-	if err := w.checkMetaRoomLocked(rel); err != nil {
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return err
 	}
 	hostRel, leaf, err := w.createTargetLocked(rel)
@@ -140,11 +141,12 @@ func (w *Workspace) mknodLocked(rel string, mode, uid, gid uint32, rdev uint64) 
 	if err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
+	info, statErr := w.host.fstat(f)
+	if err := errors.Join(statErr, f.Close()); err != nil {
 		_ = w.host.unlink(hostRel)
 		return err
 	}
-	w.setMetaLocked(rel, POSIXAttr{Mode: mode&linux.S_IFMT | mode&0o7777, UID: uid, GID: gid, Rdev: rdev})
+	w.putRec(w.keyOf(rel, info), POSIXAttr{Mode: mode&linux.S_IFMT | mode&0o7777, UID: uid, GID: gid, Rdev: rdev}, rel)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)

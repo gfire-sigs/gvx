@@ -123,6 +123,8 @@ A file mount writes no `.gvx_meta` file. The mode, the owner, and the extended a
 
 On Windows, the sandbox puts the Low integrity label and an access entry for the logon session on the mounted file only. It also gives the logon session the traverse right (`FILE_TRAVERSE`) on the parent directory, with no inheritance. The restricted token has no `SeChangeNotifyPrivilege`, so the system needs that right to open the file through the parent. The right gives no listing and no creation of files. The sibling files keep their own security descriptors and stay closed. The entry stays on the parent directory after the run.
 
+Each mounted host directory has one `.gvx_meta` table. Two mounts of one directory with the same access share the table. A host directory nested inside another mounted directory gets its own table. When the guest reaches the same file through both mounts, as in a non-aligned layout such as `-v $PWD:/app -v $PWD/logs:/var/log/app`, the two views can show different mode, owner, and attributes for that file. An aligned layout, as in `-v $PWD:/app -v $PWD/node_modules:/app/node_modules`, has no such overlap, because the inner mount covers the outer copy. A bind mount of one file keeps no table, so it can sit inside a mounted directory.
+
 The guest path of a mount is absolute and clean. It is not `/`. It is not `/proc`, `/sys`, `/dev`, or a path below them, except a path below `/dev/shm`. Two mounts cannot share a guest path. A mount at `/workspace` conflicts with `-workspace`.
 
 The tmpfs options are `size`, `ro`, and `rw`. The option `size` takes a number with a binary unit. Any other tmpfs option stops the run with an error that names it.

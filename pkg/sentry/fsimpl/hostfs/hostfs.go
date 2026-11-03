@@ -54,11 +54,6 @@ const (
 	MetaFileName = ".gvx_meta"
 	metaTempName = ".gvx_meta.tmp"
 
-	// metaVersion is the schema version that hostfs writes. metaVersionV1 is
-	// the schema before the xattr field. The reader accepts both.
-	metaVersion   = 2
-	metaVersionV1 = 1
-
 	// defaultCoalesceWindow is the delay between the first unflushed
 	// metadata mutation and the background flush. Later mutations in the
 	// window share one flush. Sync bypasses the window. See section 6 of
@@ -103,12 +98,14 @@ var (
 )
 
 // POSIXAttr stores virtual POSIX permissions, ownership, symlink target, and
-// extended attributes in .gvx_meta for a workspace-relative path. It is the
-// record of schema version 2.
+// extended attributes in .gvx_meta for one host file or virtual symlink. The
+// JSON tags describe the records of earlier releases, which ReadMeta and the
+// loader still read.
 //
 // Atime, Mtime, and Ctime hold Unix nanoseconds. They apply to virtual
-// symlinks only, which have no host file to carry timestamps. Xattrs holds the
-// extended attributes that the host cannot store. A record whose Mode names a
+// symlinks, which have no host file to carry timestamps. A regular file or a
+// directory keeps the change time of its last metadata mutation. Xattrs holds
+// the extended attributes that the host cannot store. A record whose Mode names a
 // socket, a FIFO, or a device stands for an empty placeholder file on the
 // host. Rdev holds the device number of a device record: the major number in
 // the high 32 bits and the minor number in the low 32 bits.
@@ -124,11 +121,6 @@ type POSIXAttr struct {
 	Rdev    uint64            `json:"rdev,omitempty"`
 }
 
-type metaStoreFile struct {
-	Version int                  `json:"version"`
-	Entries map[string]POSIXAttr `json:"entries"`
-}
-
 // entry is the effective state of one workspace path: the virtual attributes
 // layered over the host metadata.
 type entry struct {
@@ -136,6 +128,9 @@ type entry struct {
 	info hostInfo
 	// virtual marks a symlink that exists only in .gvx_meta.
 	virtual bool
+	// key is the key under which a record of the entry lives, whether or not
+	// one exists. It is zero for a host symbolic link, which has no record.
+	key recKey
 }
 
 func (e *entry) isDir() bool {
@@ -166,25 +161,37 @@ type dirNames struct {
 // Workspace wraps a pre-opened Go 1.25+ *os.Root directory handle and enforces
 // symlink-safe traversal and POSIX metadata persistence.
 type Workspace struct {
-	// mu protects meta, metaDirty, and closed. Lock order: Workspace.mu, then
-	// pinMu, then nameMu. filesystem.mu is always taken before Workspace.mu.
+	// mu protects closed and orders the guest calls. Lock order:
+	// Workspace.mu, then pinMu, then nameMu. filesystem.mu is always taken
+	// before Workspace.mu. The metaTable has its own lock, which is a leaf.
 	mu       sync.RWMutex
 	rootPath string
 	root     *os.Root
 	host     hostBackend
 	readOnly bool
-	meta     map[string]POSIXAttr
 	closed   bool
 	closing  bool
 
-	// metaDirty holds the keys of the records that changed since the last
-	// flush. mu protects it. See metastore.go.
-	metaDirty map[string]struct{}
+	// meta holds the records of .gvx_meta. See meta_table.go.
+	meta *metaTable
+	// pathKeys selects the key kind of the records: guest paths on a volume
+	// without trustworthy file identities and in single-file mode, file
+	// identities everywhere else. It never changes after openWorkspace
+	// returns. See recKind.
+	pathKeys bool
+	// rootDev is the device number of the workspace root. storedID replaces
+	// it with zero. rootKey is the key of the root directory.
+	rootDev uint64
+	rootKey recKey
 
 	// flushMu serialises table writes so a slow disk never blocks mutations.
 	// It also protects journal.
 	flushMu sync.Mutex
 	journal metaJournal
+
+	// inos holds the inode sets of directories for adoption. It has its own
+	// leaf lock. See dirinos.go.
+	inos inoCache
 
 	nameMu    sync.Mutex
 	nameCache map[string]*dirNames
@@ -246,15 +253,13 @@ type Workspace struct {
 	// handle_registry.go.
 	handles *winHandleRegistry
 
-	// pruneKeys and pruneCursor drive the incremental check of the .gvx_meta
-	// records against the host. mu protects them.
-	pruneKeys   []string
-	pruneCursor int
-	// maxMeta is the most entries that meta may hold. See checkMetaRoomLocked.
-	maxMeta int
+	// maxMetaBytes is the memory that meta may use. See checkMetaRoom.
+	maxMetaBytes int64
 	// dirTimes records the last virtual symlink mutation time in a directory
 	// that has no .gvx_meta record of its own. mu protects it.
-	dirTimes map[string]int64
+	dirTimes map[recKey]int64
+	// orphans collects the records whose host file is gone. See orphans.go.
+	orphans orphanCollector
 	// single is the host name of the bound file in single-file mode, or empty
 	// for a directory workspace. It never changes after openWorkspace
 	// returns. See single_file.go.
@@ -276,9 +281,18 @@ type workspaceOptions struct {
 	caps *WorkspaceCaps
 	// hostOS replaces runtime.GOOS where hostfs picks the host clutter rules.
 	hostOS string
-	// maxMeta replaces the limit of .gvx_meta entries. Tests use it to reach
-	// the limit with few files.
-	maxMeta int
+	// maxMetaBytes replaces the memory cap of the .gvx_meta table. Tests use
+	// it to reach the cap with few files.
+	maxMetaBytes int64
+	// noOrphanGC stops the background collector of orphan records. Tests
+	// drive the collector by hand.
+	noOrphanGC bool
+	// orphanDirsPerStep replaces orphanStepDirs. Tests use it to stop a walk
+	// between two directories.
+	orphanDirsPerStep int
+	// pathKeys keys the records on guest paths, as on a volume without
+	// trustworthy file identities. Tests use it to model such a volume.
+	pathKeys bool
 	// journalSlack replaces the slack of the journal bound. Tests use it to
 	// reach a compaction with few records.
 	journalSlack int
@@ -342,6 +356,12 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		start := time.Now()
 		clock = func() int64 { return int64(time.Since(start)) }
 	}
+	rootInfo, err := host.lstat(".")
+	if err != nil {
+		_ = host.close()
+		_ = root.Close()
+		return nil, fmt.Errorf("hostfs: stat workspace root %q: %w", pinDir, err)
+	}
 	var caps WorkspaceCaps
 	if opts.caps != nil {
 		caps = *opts.caps
@@ -349,6 +369,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		// The probe of a writable workspace creates files. A single-file
 		// workspace must not write into the directory of the user.
 		caps = platformCaps(host, readOnly || single != "")
+		probeFileIDs(host, rootInfo, readOnly || single != "", &caps)
 	}
 	if single != "" {
 		// The attributes of the guest stay in memory.
@@ -363,8 +384,9 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		root:             root,
 		host:             host,
 		readOnly:         readOnly,
-		meta:             make(map[string]POSIXAttr),
-		metaDirty:        make(map[string]struct{}),
+		meta:             newMetaTable(),
+		pathKeys:         opts.pathKeys || !caps.StableIDs || single != "",
+		rootDev:          rootInfo.fid.dev,
 		nameCache:        make(map[string]*dirNames),
 		pins:             make(map[string]*dirPin),
 		rootPin:          dirPin{h: host.rootDir(), root: true},
@@ -377,10 +399,17 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		stateful:         !caps.CaseSensitive || caps.UnicodeNormalized,
 		countsDirLinks:   !hostCountsDirLinks || opts.countDirLinks,
 		clutter:          clutterRulesFor(hostOS),
-		maxMeta:          metaLimit(opts.maxMeta),
+		maxMetaBytes:     metaLimit(opts.maxMetaBytes),
 		journal:          metaJournal{slack: opts.journalSlack},
-		dirTimes:         make(map[string]int64),
+		dirTimes:         make(map[recKey]int64),
 		single:           single,
+		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
+	}
+	if w.pathKeys {
+		w.rootKey = recKey{kind: kindPath, path: "."}
+	} else {
+		w.rootKey = recKey{kind: kindInode, id: w.storedID(rootInfo.fid)}
+		w.rootPin.key = w.rootKey.id
 	}
 	if caps.LocksOpenDirMove {
 		w.handles = newWinHandleRegistry(workspaceHandleOps{w})
@@ -401,9 +430,13 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	}
 	if !readOnly && w.coalesce > 0 {
 		w.kick = make(chan struct{}, 1)
+		w.meta.kick = w.kick
 		w.stop = make(chan struct{})
 		w.done = make(chan struct{})
 		go w.flushLoop()
+	}
+	if !readOnly && !opts.noOrphanGC {
+		w.startOrphanGC()
 	}
 	return w, nil
 }
@@ -435,6 +468,7 @@ func (w *Workspace) Close() error {
 	w.mu.Unlock()
 
 	w.watchShutdown()
+	w.stopOrphanGC()
 	if w.stop != nil {
 		close(w.stop)
 		<-w.done
@@ -627,6 +661,7 @@ func (w *Workspace) removeDirNameLocked(dir, name, hostName string) {
 
 func (w *Workspace) updateDirName(dir, name, hostName string, present bool) {
 	w.watchNoteName(dir, name)
+	w.inos.dropDir(dir)
 	if !w.tracksDirNames() {
 		return
 	}
@@ -670,6 +705,7 @@ func (w *Workspace) updateDirName(dir, name, hostName string, present bool) {
 // directory below it. A directory rename or removal changes whole subtrees,
 // which the in-place updates cannot express. Callers hold w.mu for writing.
 func (w *Workspace) dropDirNamesLocked(rel string) {
+	w.inos.dropAll()
 	if !w.tracksDirNames() {
 		return
 	}
@@ -697,7 +733,9 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 	default:
 		typ = linux.S_IFREG
 	}
-	if m, ok := w.meta[rel]; ok {
+	key := w.keyOf(rel, info)
+	if r := w.recOf(rel, info); r != nil {
+		m := r.attr
 		a := POSIXAttr{
 			Mode:   typ | m.Mode&0o7777,
 			UID:    m.UID,
@@ -709,14 +747,14 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 		if st := placeholderType(info, m); st != 0 {
 			a.Mode, a.Rdev = st|m.Mode&0o7777, m.Rdev
 		}
-		if t := w.dirTimes[rel]; t > 0 {
+		if t := w.dirTimes[key]; t > 0 {
 			a.Mtime = max(a.Mtime, t)
 			a.Ctime = max(a.Ctime, t)
 		}
 		return a
 	}
 	a := POSIXAttr{Mode: typ | defaultPerm(info)}
-	if t := w.dirTimes[rel]; t > 0 {
+	if t := w.dirTimes[key]; t > 0 {
 		a.Mtime = t
 		a.Ctime = t
 	}
@@ -727,13 +765,20 @@ func (w *Workspace) effectiveAttr(rel string, info hostInfo) POSIXAttr {
 // virtual symlink changes inside it without a host directory mutation. Callers
 // hold w.mu for writing.
 func (w *Workspace) touchDirLocked(dir string, now int64) {
-	if m, ok := w.meta[dir]; ok && m.Symlink == "" {
-		m.Mtime = now
-		m.Ctime = now
-		w.setMetaLocked(dir, m)
-	} else {
-		w.dirTimes[dir] = now
+	pin, err := w.acquirePin(dir)
+	if err != nil {
+		return
 	}
+	defer w.releasePin(pin)
+	key := w.dirKeyOf(pin, dir)
+	if r := w.meta.get(key); r != nil {
+		next := *r
+		next.attr.Mtime = now
+		next.attr.Ctime = now
+		w.meta.put(key, &next)
+		return
+	}
+	w.dirTimes[key] = now
 }
 
 // lookupLocked resolves rel to its effective state without following links. It
@@ -753,14 +798,8 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 	if isReservedPath(rel) || (w.single != "" && rel != ".") {
 		return entry{}, hostProbe{}, fs.ErrNotExist
 	}
-	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
-		// An open pin proves that the parent is a directory.
-		pin, err := w.parentPinLocked(rel)
-		if err != nil {
-			return entry{}, hostProbe{}, err
-		}
-		w.releasePin(pin)
-		return virtualEntry(m), hostProbe{}, nil
+	if k, r := w.virtualAtLocked(rel); r != nil {
+		return virtualEntry(k, r), hostProbe{}, nil
 	}
 	if rel == "." {
 		info, err := w.host.lstat(rel)
@@ -790,7 +829,7 @@ func (w *Workspace) entryFromInfo(rel string, info hostInfo) (entry, error) {
 		if specialFileType(attr.Mode) != 0 {
 			info.kind, info.size, info.blocks = hostKindSpecial, 0, 0
 		}
-		return entry{attr: attr, info: info}, nil
+		return entry{attr: attr, info: info, key: w.keyOf(rel, info)}, nil
 	case hostKindSymlink:
 		hostRel, err := w.hostPath(rel)
 		if err != nil {
@@ -815,11 +854,13 @@ func nameMismatch(rel string) error {
 	return fmt.Errorf("hostfs: lookup %q: %w: %w", rel, errNameMismatch, fs.ErrNotExist)
 }
 
-func virtualEntry(m POSIXAttr) entry {
+func virtualEntry(k recKey, r *rec) entry {
+	m := r.attr
 	ts := time.Unix(0, m.Ctime)
 	return entry{
 		attr:    m,
 		virtual: true,
+		key:     k,
 		info: hostInfo{
 			kind:  hostKindSymlink,
 			size:  int64(len(m.Symlink)),
@@ -875,7 +916,7 @@ func (w *Workspace) checkParentDirLocked(rel string) error {
 // virtual symlink, holds the name. A hidden host clutter file at the name goes
 // away first. Callers hold w.mu for writing.
 func (w *Workspace) createTargetLocked(rel string) (hostRel, leaf string, err error) {
-	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
+	if _, r := w.virtualAtLocked(rel); r != nil {
 		return "", "", fs.ErrExist
 	}
 	p, err := w.locateLocked(rel)
@@ -986,7 +1027,7 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 	if rel == "." {
 		return nil, entry{}, errIsDir
 	}
-	if err := w.checkMetaRoomLocked(rel); err != nil {
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return nil, entry{}, err
 	}
 	_, leaf, err := w.createTargetLocked(rel)
@@ -1009,11 +1050,12 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 		return nil, entry{}, err
 	}
 	attr := POSIXAttr{Mode: linux.S_IFREG | perm&0o7777, UID: uid, GID: gid}
-	w.setMetaLocked(rel, attr)
+	key := w.keyOf(rel, info)
+	w.putRec(key, attr, rel)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)
-	return f, entry{attr: attr, info: info}, nil
+	return f, entry{attr: attr, info: info, key: key}, nil
 }
 
 // WriteFile writes data to relPath inside the workspace root and records mode
@@ -1102,7 +1144,7 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if rel == "." {
 		return fs.ErrExist
 	}
-	if err := w.checkMetaRoomLocked(rel); err != nil {
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return err
 	}
 	_, leaf, err := w.createTargetLocked(rel)
@@ -1117,7 +1159,17 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if err := w.host.mkdirAt(pin.h, leaf); err != nil {
 		return err
 	}
-	w.setMetaLocked(rel, POSIXAttr{Mode: linux.S_IFDIR | mode&0o7777, UID: uid, GID: gid})
+	key := recKey{kind: kindPath, path: rel}
+	if !w.pathKeys {
+		// mkdir returns no identity, so one stat of the new directory reads it.
+		info, err := w.host.lstatAt(pin.h, leaf)
+		if err != nil {
+			_ = w.host.rmdirAt(pin.h, leaf)
+			return err
+		}
+		key = w.keyOf(rel, info)
+	}
+	w.putRec(key, POSIXAttr{Mode: linux.S_IFDIR | mode&0o7777, UID: uid, GID: gid}, rel)
 	parent, name := splitParent(rel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)
@@ -1154,8 +1206,9 @@ func (w *Workspace) Chown(relPath string, uid, gid uint32) error {
 }
 
 // setAttr changes virtual attributes. A hard-linked file keeps one set of
-// attributes: setAttr copies the change to every other recorded path of the
-// same host file.
+// attributes: all its names share one record, except for an entry without a
+// file identity, where setAttr copies the change to every other recorded path
+// of the same host file.
 func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1176,7 +1229,7 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 			cur.GID = *gid
 		}
 		cur.Ctime = now
-		w.setMetaLocked(rel, cur)
+		w.putRec(e.key, cur, rel)
 		return nil
 	}
 	if e.isSymlink() {
@@ -1193,11 +1246,11 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 		cur.GID = *gid
 	}
 	cur.Ctime = now
-	if err := w.checkMetaRoomLocked(rel); err != nil {
+	if err := w.checkMetaRoom(e.key); err != nil {
 		return err
 	}
-	w.setMetaLocked(rel, cur)
-	if e.info.nlink > 1 && !e.isDir() {
+	w.putRec(e.key, cur, rel)
+	if e.key.isPath() && e.info.nlink > 1 && !e.isDir() {
 		if err := w.propagateLinkAttrLocked(rel, e.info.id, cur); err != nil {
 			return err
 		}
@@ -1206,13 +1259,19 @@ func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
 }
 
 // propagateLinkAttrLocked copies attr to every other recorded path that names
-// the same host file.
+// the same host file. Only entries without file identities need it. Every
+// other entry shares one record among the names of a file. The scan of the
+// table and the host call for each record are the price of path keys. A host
+// that reports no file number gives the names no link to follow.
 func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAttr) error {
-	for k, m := range w.meta {
-		if k == skip || m.Symlink != "" {
+	if id == (hostID{}) {
+		return nil
+	}
+	for _, k := range w.meta.keys() {
+		if k.kind != kindPath || k.path == skip {
 			continue
 		}
-		hostRel, err := w.hostPath(k)
+		hostRel, err := w.hostPath(k.path)
 		if err != nil {
 			continue
 		}
@@ -1224,7 +1283,7 @@ func (w *Workspace) propagateLinkAttrLocked(skip string, id hostID, attr POSIXAt
 			return err
 		}
 		if info.id == id && info.kind == hostKindRegular {
-			w.setMetaLocked(k, attr)
+			w.putRec(k, attr, k.path)
 		}
 	}
 	return nil
@@ -1257,14 +1316,18 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 	if err := w.checkParentDirLocked(rel); err != nil {
 		return err
 	}
-	if err := w.checkMetaRoomLocked(rel); err != nil {
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return err
 	}
 	if _, _, err := w.createTargetLocked(rel); err != nil {
 		return err
 	}
+	key, err := w.nameKeyLocked(rel)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UnixNano()
-	w.setMetaLocked(rel, POSIXAttr{
+	w.putRec(key, POSIXAttr{
 		Mode:    linux.S_IFLNK | 0o777,
 		UID:     uid,
 		GID:     gid,
@@ -1272,7 +1335,7 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 		Atime:   now,
 		Mtime:   now,
 		Ctime:   now,
-	})
+	}, rel)
 	parent, _ := splitParent(rel)
 	w.touchDirLocked(parent, now)
 	return nil
@@ -1486,27 +1549,59 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 		}
 	}
 
-	// Table update: the destination record dies, the source record and every
-	// record below it move.
 	now := time.Now().UnixNano()
-	w.delMetaLocked(newRel)
-	delete(w.dirTimes, newRel)
-	if m, ok := w.meta[oldRel]; ok {
-		w.delMetaLocked(oldRel)
-		m.Ctime = now
-		w.setMetaLocked(newRel, m)
-	}
-	delete(w.dirTimes, oldRel)
+	w.moveRecordLocked(src, dst, dstExists, oldRel, newRel, now)
 	if src.virtual {
 		w.touchDirLocked(oldParent, now)
 		if !dstExists || dst.virtual {
 			w.touchDirLocked(newParent, now)
 		}
 	}
-	if src.isDir() {
-		w.moveMetaTreeLocked(oldRel, newRel)
-	}
 	return nil
+}
+
+// moveRecordLocked updates the table after a rename. The record of the
+// replaced destination dies with its last name. The record of the source
+// follows the file, which keeps its identity through the rename, so only its
+// change time and hint change, and nothing below a directory changes. A source
+// that keys on its path must re-key its record. A directory rename must also
+// re-key every path record below the directory, because an entry without an
+// identity can sit below a directory that has one. Callers hold w.mu for
+// writing.
+func (w *Workspace) moveRecordLocked(src, dst entry, dstExists bool, oldRel, newRel string, now int64) {
+	if dstExists {
+		if dst.key.isPath() || dst.virtual || dst.isDir() || dst.info.nlink <= 1 {
+			w.meta.del(dst.key)
+		}
+		delete(w.dirTimes, dst.key)
+	}
+	if src.key.isPath() {
+		// A stale record at the new path dies with the replaced entry.
+		w.meta.del(recKey{kind: kindPath, path: newRel})
+	}
+	delete(w.dirTimes, src.key)
+	if src.virtual {
+		w.meta.del(src.key)
+		if nk, err := w.nameKeyLocked(newRel); err == nil {
+			attr := src.attr
+			attr.Ctime = now
+			w.putRec(nk, attr, newRel)
+		}
+		return
+	}
+	if r := w.meta.get(src.key); r != nil {
+		attr := r.attr
+		attr.Ctime = now
+		nk := src.key
+		if nk.isPath() {
+			w.meta.del(src.key)
+			nk = recKey{kind: kindPath, path: newRel}
+		}
+		w.putRec(nk, attr, newRel)
+	}
+	if src.isDir() && w.meta.hasPathRecs() {
+		w.meta.moveTree(oldRel, newRel)
+	}
 }
 
 // link creates a hard link. The new path shares the host file and its
@@ -1532,8 +1627,10 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	if err != nil {
 		return err
 	}
-	if err := w.checkMetaRoomLocked(newRel); err != nil {
-		return err
+	if src.key.isPath() {
+		if err := w.checkMetaRoom(recKey{}); err != nil {
+			return err
+		}
 	}
 	_, leaf, err := w.createTargetLocked(newRel)
 	if err != nil {
@@ -1544,7 +1641,11 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	}); err != nil {
 		return err
 	}
-	w.setMetaLocked(newRel, src.attr)
+	if src.key.isPath() {
+		// Every name of a file without an identity has a record of its own.
+		// Elsewhere the names share the record of the file.
+		w.putRec(recKey{kind: kindPath, path: newRel}, src.attr, newRel)
+	}
 	parent, name := splitParent(newRel)
 	w.setAlt(parent, name, leaf)
 	w.addDirNameLocked(parent, name, leaf)
@@ -1598,11 +1699,16 @@ func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
 		w.handles.detach(rel)
 		w.removeDirNameLocked(parent, name, leaf)
 		w.dropAlt(parent, name)
-	} else {
-		parent, _ := splitParent(rel)
-		w.touchDirLocked(parent, time.Now().UnixNano())
+		// The names of a file share one record, so the record dies with the
+		// last name. A path key holds a record for each name.
+		if last || e.key.isPath() {
+			w.meta.del(e.key)
+		}
+		return last, nil
 	}
-	w.delMetaLocked(rel)
+	parent, _ := splitParent(rel)
+	w.touchDirLocked(parent, time.Now().UnixNano())
+	w.meta.del(e.key)
 	return last, nil
 }
 
@@ -1643,7 +1749,8 @@ func (w *Workspace) rmdir(rel string) error {
 	if err := w.unlinkHostLocked(rel, leafOf(hostRel), true); err != nil {
 		return err
 	}
-	w.delMetaLocked(rel)
+	w.meta.del(e.key)
+	delete(w.dirTimes, e.key)
 	parent, name := splitParent(rel)
 	w.removeDirNameLocked(parent, name, leafOf(hostRel))
 	w.dropDirNamesLocked(rel)
@@ -1677,7 +1784,7 @@ func (w *Workspace) syncDir(rel string) error {
 	if w.closed {
 		return os.ErrClosed
 	}
-	pin, err := w.acquirePinHeld(rel)
+	pin, err := w.acquirePin(rel)
 	if err != nil {
 		return err
 	}
@@ -1706,17 +1813,18 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 			m.Mtime = mtime.UnixNano()
 		}
 		m.Ctime = time.Now().UnixNano()
-		w.setMetaLocked(rel, m)
+		w.putRec(e.key, m, rel)
 		return nil
 	}
 	if err := w.chtimesHostLocked(rel, atime, mtime); err != nil {
 		return err
 	}
 	if mtime != nil {
-		delete(w.dirTimes, rel)
-		if m, ok := w.meta[rel]; ok && m.Mtime != 0 {
-			m.Mtime = 0
-			w.setMetaLocked(rel, m)
+		delete(w.dirTimes, e.key)
+		if r := w.meta.get(e.key); r != nil && r.attr.Mtime != 0 {
+			a := r.attr
+			a.Mtime = 0
+			w.putRec(e.key, a, rel)
 		}
 	}
 	return nil
@@ -1756,11 +1864,12 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	pin, err := w.acquirePinHeld(rel)
+	pin, err := w.acquirePin(rel)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer w.releasePin(pin)
+	dirKey := w.dirKeyOf(pin, rel)
 	entries, err := w.host.readDirAt(pin.h)
 	if err != nil {
 		return nil, nil, err
@@ -1782,7 +1891,7 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 		}
 		if w.clutter.candidate(e.name) {
 			info := hostInfo{kind: e.kind}
-			if e.kind == hostKindRegular && w.clutter.needsContent(e.name) {
+			if e.kind == hostKindRegular && (w.clutter.needsContent(e.name) || !w.pathKeys) {
 				fi, err := w.host.lstatAt(pin.h, e.name)
 				if err != nil {
 					continue
@@ -1797,7 +1906,7 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 		guest := w.listName(rel, e.name)
 		if e.kind == hostKindSymlink {
 			full := joinRelPath(rel, guest)
-			if _, ok := w.meta[full]; ok {
+			if w.meta.has(dirKey.withName(guest)) {
 				continue
 			}
 			target, err := w.host.readlink(hostChild(hostDir, e.name))
@@ -1814,23 +1923,12 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 		}
 		l := dirListing{name: guest, kind: e.kind, ino: e.ino, leaf: e.name}
 		if e.kind == hostKindRegular {
-			l.special = specialFileType(w.meta[joinRelPath(rel, guest)].Mode)
+			l.special = w.placeholderOfLocked(pin, rel, guest, e)
 		}
 		byName[guest] = l
 	}
-	prefix := rel + "/"
-	if rel == "." {
-		prefix = ""
-	}
-	for k, m := range w.meta {
-		if m.Symlink == "" || !strings.HasPrefix(k, prefix) {
-			continue
-		}
-		rest := k[len(prefix):]
-		if rest == "" || strings.Contains(rest, "/") {
-			continue
-		}
-		byName[rest] = dirListing{name: rest, kind: hostKindSymlink, virtual: true}
+	for _, name := range w.meta.kidsOf(dirKey) {
+		byName[name] = dirListing{name: name, kind: hostKindSymlink, virtual: true}
 	}
 	out := make([]dirListing, 0, len(byName))
 	for _, l := range byName {
@@ -1959,18 +2057,24 @@ func (w *Workspace) chtimesHostLocked(rel string, atime, mtime *time.Time) error
 	return w.host.chtimesAt(pin.h, leaf, atime, mtime)
 }
 
-// moveMetaTreeLocked moves every record below the directory oldRel to the same
-// place below newRel. Callers hold w.mu for writing.
-func (w *Workspace) moveMetaTreeLocked(oldRel, newRel string) {
-	prefix := oldRel + "/"
-	var moved []string
-	for k := range w.meta {
-		if strings.HasPrefix(k, prefix) {
-			moved = append(moved, k)
-		}
+// placeholderOfLocked returns the file type of a socket, FIFO, or device
+// record that the host entry e of the directory rel, shown as guest, stands for, or zero. A
+// listing carries no identity, so on a volume with identities only an entry
+// whose inode number a special record names gets a stat. A table without
+// special records costs nothing. Callers hold w.mu.
+func (w *Workspace) placeholderOfLocked(pin *dirPin, rel, guest string, e hostDirEntry) uint32 {
+	if r := w.meta.get(recKey{kind: kindPath, path: joinRelPath(rel, guest)}); r != nil {
+		return specialFileType(r.attr.Mode)
 	}
-	for _, k := range moved {
-		w.setMetaLocked(newRel+"/"+strings.TrimPrefix(k, prefix), w.meta[k])
-		w.delMetaLocked(k)
+	if w.pathKeys || e.ino == 0 || !w.meta.hasSpecialIno(e.ino) {
+		return 0
 	}
+	info, err := w.host.lstatAt(pin.h, e.name)
+	if err != nil || !hasIdentity(info) {
+		return 0
+	}
+	if r := w.meta.get(w.keyOf("", info)); r != nil {
+		return placeholderType(info, r.attr)
+	}
+	return 0
 }

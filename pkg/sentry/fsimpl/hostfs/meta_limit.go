@@ -16,31 +16,23 @@ package hostfs
 
 import "errors"
 
-// maxMetaEntries is the most entries that Workspace.meta holds. The table
-// lives in memory and in the .gvx_meta journal, so a guest that creates records
-// without end would exhaust host memory.
-const maxMetaEntries = 262144
+// maxMetaBytes is the memory that the records of one Workspace may use. The
+// table lives in memory and in the .gvx_meta journal, so a guest that creates
+// records without end would exhaust host memory. The cap counts the estimated
+// size of each record (see recSize), so a table of small records holds more
+// entries than a table of records with large attributes. About 300,000 plain
+// records fit.
+const maxMetaBytes = 128 << 20
 
 // errMetaFull reports that a mutation would add a record to a full table.
 // translateHostError maps it to ENOSPC.
 var errMetaFull = errors.New("hostfs: the .gvx_meta table is full")
 
-// metaLimit returns the entry limit for a workspace. A zero override selects
-// the default.
-func metaLimit(override int) int {
+// metaLimit returns the memory cap in bytes for a workspace. A zero override
+// selects the default.
+func metaLimit(override int64) int64 {
 	if override > 0 {
 		return override
 	}
-	return maxMetaEntries
-}
-
-// checkMetaRoomLocked fails with errMetaFull when the table has no room for a
-// record at rel. A record that exists already needs no room. Every mutation
-// that can add a record calls it before the first host change, so a refused
-// mutation leaves no host file without a record. Callers hold w.mu.
-func (w *Workspace) checkMetaRoomLocked(rel string) error {
-	if _, ok := w.meta[rel]; ok || len(w.meta) < w.maxMeta {
-		return nil
-	}
-	return errMetaFull
+	return maxMetaBytes
 }

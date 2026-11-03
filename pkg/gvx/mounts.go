@@ -569,7 +569,9 @@ func newWorkspaceKey(hostPath string, file, readOnly bool) workspaceKey {
 // and records the mounts in the order that the guest mounts them. A path that
 // two mounts share with the same access and the same kind (directory or
 // file) shares one workspace, so two flush loops never write the same
-// metadata file. openMounts must run before the host lockdown.
+// metadata file. A host directory that lies inside another mounted host
+// directory gets its own workspace and its own table. openMounts must run
+// before the host lockdown.
 func (s *Sandbox) openMounts() error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	volumes := make(map[string]bool)

@@ -2037,10 +2037,7 @@ func TestUnlinkOfSocketRemovesPlaceholderAndRecord(t *testing.T) {
 	if _, err := os.Lstat(e.host("sock")); !os.IsNotExist(err) {
 		t.Fatalf("host placeholder after unlink: %v, want it removed", err)
 	}
-	e.ws.mu.RLock()
-	_, ok := e.ws.meta["sock"]
-	e.ws.mu.RUnlock()
-	if ok {
+	if _, ok := metaRecordAt(e.ws, "sock"); ok {
 		t.Fatalf("the .gvx_meta record of the socket survived the unlink")
 	}
 	_, err := e.stat("sock")
@@ -2329,7 +2326,15 @@ func TestMknodRegularFileStaysAnOrdinaryFile(t *testing.T) {
 }
 
 func TestMetaTableLimitRefusesNewRecords(t *testing.T) {
-	e := newEnvOpts(t, workspaceOptions{coalesce: defaultCoalesceWindow, maxMeta: 5})
+	t.Run("file identities", func(t *testing.T) { testMetaTableLimit(t, false) })
+	t.Run("guest paths", func(t *testing.T) { testMetaTableLimit(t, true) })
+}
+
+// testMetaTableLimit fills the table to its memory cap. A volume with file
+// identities shares one record among the names of a file, so a link needs no
+// room there. A volume with guest paths keeps one record for each name.
+func testMetaTableLimit(t *testing.T, pathKeys bool) {
+	e := newEnvOpts(t, workspaceOptions{coalesce: defaultCoalesceWindow, pathKeys: pathKeys})
 	hostOnly := e.host("hostfile")
 	if err := os.WriteFile(hostOnly, []byte("h"), 0o644); err != nil {
 		t.Fatal(err)
@@ -2342,12 +2347,11 @@ func TestMetaTableLimitRefusesNewRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.mustMknod("n1", linux.S_IFIFO|0o600)
-	e.ws.mu.RLock()
-	count := len(e.ws.meta)
-	e.ws.mu.RUnlock()
-	if count != 5 {
+	if count := e.ws.meta.size(); count != 5 {
 		t.Fatalf("the table holds %d records, want 5", count)
 	}
+	// The cap counts memory, so the memory of five records is the cap here.
+	e.ws.maxMetaBytes = e.ws.meta.memBytes()
 
 	_, err := e.open("f3", linux.O_CREAT|linux.O_WRONLY, 0o644)
 	wantErrno(t, "create at the limit", err, linuxerr.ENOSPC)
@@ -2355,15 +2359,29 @@ func TestMetaTableLimitRefusesNewRecords(t *testing.T) {
 	wantErrno(t, "symlink at the limit", e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("l2"), "t"), linuxerr.ENOSPC)
 	wantErrno(t, "mknod FIFO at the limit", e.mknod("n2", linux.S_IFIFO|0o600, 0, 0, nil), linuxerr.ENOSPC)
 	wantErrno(t, "mknod device at the limit", e.mknod("n3", linux.S_IFCHR|0o600, 1, 1, nil), linuxerr.ENOSPC)
-	wantErrno(t, "link at the limit", e.link("f1", "f1link"), linuxerr.ENOSPC)
+	if pathKeys {
+		wantErrno(t, "link at the limit", e.link("f1", "f1link"), linuxerr.ENOSPC)
+	}
 	wantErrno(t, "chmod of a file without a record", e.setStat("hostfile", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}), linuxerr.ENOSPC)
 	wantErrno(t, "chown of a file without a record", e.setStat("hostfile", linux.Statx{Mask: linux.STATX_UID, UID: 5}), linuxerr.ENOSPC)
 	wantErrno(t, "setxattr on a file without a record", e.setXattr("hostfile", "trusted.k", "v", 0), linuxerr.ENOSPC)
 
 	// A refused mutation leaves no host object behind.
-	for _, name := range []string{"f3", "d2", "l2", "n2", "n3", "f1link"} {
+	refused := []string{"f3", "d2", "l2", "n2", "n3"}
+	if pathKeys {
+		refused = append(refused, "f1link")
+	}
+	for _, name := range refused {
 		if _, err := os.Lstat(e.host(name)); !os.IsNotExist(err) {
 			t.Errorf("host entry %q exists after a refused mutation: %v", name, err)
+		}
+	}
+	if !pathKeys {
+		if err := e.link("f1", "f1link"); err != nil {
+			t.Fatalf("link at the limit: %v, want success because the names of a file share one record", err)
+		}
+		if err := e.unlink("f1link"); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -2799,7 +2817,7 @@ func TestXattrHardLinksShareAttributes(t *testing.T) {
 	if got := e.listXattr("a"); !slices.Equal(got, e.listXattr("b")) {
 		t.Fatalf("listxattr a = %v, b = %v, want equal", got, e.listXattr("b"))
 	}
-	// A third name joins the set, and the table holds one map for each name.
+	// A third name joins the set, and the names share one record.
 	if err := e.link("b", "c"); err != nil {
 		t.Fatal(err)
 	}
@@ -2824,10 +2842,8 @@ func TestXattrHardLinksShareAttributes(t *testing.T) {
 	if got := e.mustGetXattr("renamed", "user.after"); got != "4" {
 		t.Fatalf("attribute through the renamed link = %q", got)
 	}
-	e.ws.mu.RLock()
-	_, goneRecord := e.ws.meta["a"]
-	_, movedRecord := e.ws.meta["renamed"]
-	e.ws.mu.RUnlock()
+	_, goneRecord := metaRecordOf(e.ws, "a")
+	_, movedRecord := metaRecordOf(e.ws, "renamed")
 	if goneRecord || !movedRecord {
 		t.Fatalf("records after unlink and rename: a=%v renamed=%v, want a gone and renamed present", goneRecord, movedRecord)
 	}
@@ -2884,9 +2900,7 @@ func TestXattrFollowsRenameAndUnlink(t *testing.T) {
 	if got := e.listXattr("target"); len(got) != 0 {
 		t.Fatalf("a new file starts with attributes %v", got)
 	}
-	e.ws.mu.RLock()
-	rec := e.ws.meta["target"]
-	e.ws.mu.RUnlock()
+	rec, _ := metaRecordAt(e.ws, "target")
 	if len(rec.Xattrs) != 0 {
 		t.Fatalf("the record of a new file holds attributes %v", rec.Xattrs)
 	}
@@ -2978,10 +2992,7 @@ func TestXattrThroughFileDescriptors(t *testing.T) {
 	if err := fd.RemoveXattr(e.ctx, "user.fd"); err != nil {
 		t.Fatalf("fremovexattr on an unlinked file: %v", err)
 	}
-	e.ws.mu.RLock()
-	_, ok := e.ws.meta["f"]
-	e.ws.mu.RUnlock()
-	if ok {
+	if _, ok := metaRecordAt(e.ws, "f"); ok {
 		t.Fatalf("an xattr call on an unlinked file created a record for its old name")
 	}
 }
@@ -3013,17 +3024,15 @@ func TestXattrMetaTableHoldsTheValues(t *testing.T) {
 	e := newMetaEnv(t)
 	e.writeFile("f", nil)
 	e.mustSetXattr("f", "user.k", "v")
-	e.ws.mu.RLock()
-	got := maps.Clone(e.ws.meta["f"].Xattrs)
-	e.ws.mu.RUnlock()
+	rec, _ := metaRecordAt(e.ws, "f")
+	got := maps.Clone(rec.Xattrs)
 	if len(got) != 1 || string(got["user.k"]) != "v" {
 		t.Fatalf("the record holds %v, want user.k=v", got)
 	}
 	if err := e.ws.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(e.host(MetaFileName))
-	if err != nil || !strings.Contains(string(raw), `"user.k"`) {
-		t.Fatalf(".gvx_meta = (%q, %v), want it to hold user.k", raw, err)
+	if got := string(readMetaTable(t, e.host(MetaFileName))["f"].Xattrs["user.k"]); got != "v" {
+		t.Fatalf(".gvx_meta holds user.k = %q for f, want v", got)
 	}
 }

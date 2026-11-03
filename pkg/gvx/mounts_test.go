@@ -635,6 +635,57 @@ func TestOpenMountsSharesOneWorkspacePerDirectoryAndAccess(t *testing.T) {
 	}
 }
 
+// Each directory mount keeps its own table, so no layout is refused. A layout
+// that does not line up in the guest works as it did before the tables.
+func TestOpenMountsAllowsNestedDirectories(t *testing.T) {
+	root := t.TempDir()
+	inner := filepath.Join(root, "node_modules")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "compose layout through the workspace",
+			cfg:  Config{WorkspacePath: root, Mounts: []Mount{{Kind: MountBind, HostPath: inner, GuestPath: "/workspace/node_modules"}}},
+		},
+		{
+			name: "compose layout through two bind mounts",
+			cfg: Config{Mounts: []Mount{
+				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
+				{Kind: MountBind, HostPath: inner, GuestPath: "/app/node_modules"},
+			}},
+		},
+		{
+			name: "layout that does not line up in the guest",
+			cfg: Config{Mounts: []Mount{
+				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
+				{Kind: MountBind, HostPath: inner, GuestPath: "/var/log/app"},
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.cfg.normalize(); err != nil {
+				t.Fatal(err)
+			}
+			sb := &Sandbox{cfg: tc.cfg}
+			t.Cleanup(func() {
+				if err := sb.closeMounts(); err != nil {
+					t.Errorf("closeMounts() failed: %v", err)
+				}
+			})
+			if err := sb.openMounts(); err != nil {
+				t.Fatalf("openMounts() = %v, want success", err)
+			}
+			if got := len(sb.workspaces); got != 2 {
+				t.Fatalf("openMounts() opened %d workspaces, want 2: the inner directory keeps its own table", got)
+			}
+		})
+	}
+}
+
 func TestOpenMountsFailsForMissingBindSourceAndReleasesHandles(t *testing.T) {
 	dir := t.TempDir()
 	sb := &Sandbox{cfg: Config{WorkspacePath: dir, Mounts: []Mount{{Kind: MountBind, HostPath: filepath.Join(dir, "gone"), GuestPath: "/gone"}}}}

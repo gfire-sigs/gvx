@@ -56,6 +56,9 @@ const (
 type hostRoot struct {
 	dir      *os.File
 	caseFold bool
+	// vol decides per device whether an entry keeps its identity. It does
+	// nothing on Linux.
+	vol *volumeTrust
 }
 
 func newHostRoot(root *os.Root) (*hostRoot, error) {
@@ -69,6 +72,10 @@ func newHostRoot(root *os.Root) (*hostRoot, error) {
 	if probeErr != nil {
 		_ = dir.Close()
 		return nil, fmt.Errorf("hostfs: probe workspace volume case sensitivity: %w", probeErr)
+	}
+	if h.vol, probeErr = newVolumeTrust(dir); probeErr != nil {
+		_ = dir.Close()
+		return nil, fmt.Errorf("hostfs: stat workspace root: %w", probeErr)
 	}
 	return h, nil
 }
@@ -197,12 +204,18 @@ func (h *hostRoot) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hos
 		}
 		return -1, hostInfo{}, fmt.Errorf("hostfs: open directory %q: %w", name, err)
 	}
-	var st unix.Stat_t
-	if err := retryEINTR(func() error { return unix.Fstat(fd, &st) }); err != nil {
+	info, err := fstatInfo(fd)
+	if err != nil {
 		_ = unix.Close(fd)
 		return -1, hostInfo{}, fmt.Errorf("hostfs: fstat directory %q: %w", name, err)
 	}
-	return hostDirHandle(fd), statToHostInfo(&st), nil
+	return hostDirHandle(fd), h.markVolumeFD(info, fd), nil
+}
+
+// existsByID reports errHostUnsupported. No Unix call opens a file by device
+// and inode number without a path.
+func (h *hostRoot) existsByID(fileKey) (bool, error) {
+	return false, errHostUnsupported
 }
 
 func (h *hostRoot) closeDir(dir hostDirHandle) error {
@@ -210,22 +223,22 @@ func (h *hostRoot) closeDir(dir hostDirHandle) error {
 }
 
 func (h *hostRoot) fstatDir(dir hostDirHandle) (hostInfo, error) {
-	var st unix.Stat_t
-	if err := retryEINTR(func() error { return unix.Fstat(int(dir), &st) }); err != nil {
+	info, err := fstatInfo(int(dir))
+	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: fstat directory: %w", err)
 	}
-	return statToHostInfo(&st), nil
+	return h.markVolumeFD(info, int(dir)), nil
 }
 
 func (h *hostRoot) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
 	if err := checkChildName(name); err != nil {
 		return hostInfo{}, err
 	}
-	var st unix.Stat_t
-	if err := retryEINTR(func() error { return unix.Fstatat(int(dir), name, &st, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+	info, err := lstatatInfo(int(dir), name)
+	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", name, err)
 	}
-	return statToHostInfo(&st), nil
+	return h.markVolumeAt(info, int(dir), name), nil
 }
 
 func (h *hostRoot) openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error) {
@@ -285,48 +298,37 @@ func (h *hostRoot) openDir(rel string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), rel), nil
 }
 
-func statToHostInfo(st *unix.Stat_t) hostInfo {
-	info := hostInfo{
-		id:     hostID{dev: uint64(st.Dev), ino: uint64(st.Ino)},
-		size:   st.Size,
-		blocks: st.Blocks,
-		nlink:  uint32(st.Nlink),
-		perm:   st.Mode & 0o7777,
-		atime:  time.Unix(int64(st.Atim.Sec), int64(st.Atim.Nsec)),
-		mtime:  time.Unix(int64(st.Mtim.Sec), int64(st.Mtim.Nsec)),
-		ctime:  time.Unix(int64(st.Ctim.Sec), int64(st.Ctim.Nsec)),
-		btime:  birthTime(st),
-	}
-	switch st.Mode & unix.S_IFMT {
+// hostKindOfMode maps the file type bits of st_mode.
+func hostKindOfMode(mode uint32) hostKind {
+	switch mode & unix.S_IFMT {
 	case unix.S_IFREG:
-		info.kind = hostKindRegular
+		return hostKindRegular
 	case unix.S_IFDIR:
-		info.kind = hostKindDir
+		return hostKindDir
 	case unix.S_IFLNK:
-		info.kind = hostKindSymlink
-	default:
-		info.kind = hostKindOther
+		return hostKindSymlink
 	}
-	return info
+	return hostKindOther
 }
 
 func (h *hostRoot) lstat(rel string) (hostInfo, error) {
-	var st unix.Stat_t
 	if rel == "." {
-		if err := retryEINTR(func() error { return unix.Fstat(h.rootFD(), &st) }); err != nil {
+		info, err := fstatInfo(h.rootFD())
+		if err != nil {
 			return hostInfo{}, fmt.Errorf("hostfs: fstat workspace root: %w", err)
 		}
-		return statToHostInfo(&st), nil
+		return info, nil
 	}
 	parent, name, release, err := h.walkParent(rel)
 	if err != nil {
 		return hostInfo{}, err
 	}
 	defer release()
-	if err := retryEINTR(func() error { return unix.Fstatat(parent, name, &st, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+	info, err := lstatatInfo(parent, name)
+	if err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", rel, err)
 	}
-	return statToHostInfo(&st), nil
+	return h.markVolumeAt(info, parent, name), nil
 }
 
 // withFileFD runs fn with the descriptor of f and keeps f open until fn
@@ -344,13 +346,16 @@ func withFileFD(f *os.File, fn func(fd int) error) error {
 }
 
 func (h *hostRoot) fstat(f *os.File) (hostInfo, error) {
-	var st unix.Stat_t
+	var info hostInfo
 	if err := withFileFD(f, func(fd int) error {
-		return retryEINTR(func() error { return unix.Fstat(fd, &st) })
+		var err error
+		info, err = fstatInfo(fd)
+		info = h.markVolumeFD(info, fd)
+		return err
 	}); err != nil {
 		return hostInfo{}, fmt.Errorf("hostfs: fstat: %w", err)
 	}
-	return statToHostInfo(&st), nil
+	return info, nil
 }
 
 func (h *hostRoot) mkdir(rel string) error {

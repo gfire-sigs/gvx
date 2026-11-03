@@ -82,7 +82,7 @@ func (w *Workspace) renameWhiteout(oldRel, newRel string) error {
 	if err := w.checkWritableLocked(oldRel, newRel); err != nil {
 		return err
 	}
-	if err := w.checkMetaRoomLocked(oldRel); err != nil {
+	if err := w.checkMetaRoom(recKey{}); err != nil {
 		return err
 	}
 	if err := w.renameLocked(oldRel, newRel); err != nil {
@@ -132,7 +132,7 @@ func (w *Workspace) exchangeLocked(aRel, bRel string) error {
 	}
 	switch {
 	case a.virtual && b.virtual:
-		w.swapMetaLocked(aRel, bRel)
+		w.swapVirtualLocked(a, b, aRel, bRel)
 	case a.virtual:
 		if err := w.exchangeVirtualLocked(bRel, aRel); err != nil {
 			return err
@@ -142,7 +142,7 @@ func (w *Workspace) exchangeLocked(aRel, bRel string) error {
 			return err
 		}
 	default:
-		if err := w.exchangeHostLocked(aRel, bRel, a.isDir(), b.isDir()); err != nil {
+		if err := w.exchangeHostLocked(a, b, aRel, bRel); err != nil {
 			return err
 		}
 	}
@@ -154,19 +154,34 @@ func (w *Workspace) exchangeLocked(aRel, bRel string) error {
 // the two. The host entry moves to the name of the link, and the link takes the
 // old name of the host entry.
 func (w *Workspace) exchangeVirtualLocked(hostRel, virtRel string) error {
-	saved := w.meta[virtRel]
-	w.delMetaLocked(virtRel)
+	virtKey, saved := w.virtualAtLocked(virtRel)
+	if saved == nil {
+		return fs.ErrNotExist
+	}
+	w.meta.del(virtKey)
 	if err := w.renameLocked(hostRel, virtRel); err != nil {
-		w.setMetaLocked(virtRel, saved)
+		w.meta.put(virtKey, saved)
 		return err
 	}
-	w.setMetaLocked(hostRel, saved)
+	key, err := w.nameKeyLocked(hostRel)
+	if err != nil {
+		return err
+	}
+	w.putRec(key, saved.attr, hostRel)
 	return nil
+}
+
+// swapVirtualLocked swaps two virtual symbolic links. A link is a record, so
+// the swap exchanges the two records. Callers hold w.mu for writing.
+func (w *Workspace) swapVirtualLocked(a, b entry, aRel, bRel string) {
+	w.putRec(a.key, b.attr, aRel)
+	w.putRec(b.key, a.attr, bRel)
 }
 
 // exchangeHostLocked swaps two host entries. aDir and bDir tell which of them
 // is a directory.
-func (w *Workspace) exchangeHostLocked(aRel, bRel string, aDir, bDir bool) error {
+func (w *Workspace) exchangeHostLocked(a, b entry, aRel, bRel string) error {
+	aDir, bDir := a.isDir(), b.isDir()
 	aParent, aName := splitParent(aRel)
 	bParent, bName := splitParent(bRel)
 	aHost, err := w.hostPath(aRel)
@@ -208,7 +223,7 @@ func (w *Workspace) exchangeHostLocked(aRel, bRel string, aDir, bDir bool) error
 	w.handles.swapFiles(aRel, bRel)
 	_ = qa.finish(true, bRel)
 	_ = qb.finish(true, aRel)
-	w.swapMetaLocked(aRel, bRel)
+	w.swapRecordsLocked(a, b, aRel, bRel)
 	return nil
 }
 
@@ -241,29 +256,27 @@ func (w *Workspace) swapThroughTemp(aHost, bHost string) error {
 	return nil
 }
 
-// swapMetaLocked swaps the .gvx_meta records of the entries aRel and bRel and
-// of every entry below them. The entries cannot nest. Callers hold w.mu for
-// writing.
-func (w *Workspace) swapMetaLocked(aRel, bRel string) {
-	aPrefix, bPrefix := aRel+"/", bRel+"/"
-	moved := make(map[string]POSIXAttr)
-	for k, m := range w.meta {
-		switch {
-		case k == aRel:
-			moved[bRel] = m
-		case k == bRel:
-			moved[aRel] = m
-		case strings.HasPrefix(k, aPrefix):
-			moved[bRel+"/"+strings.TrimPrefix(k, aPrefix)] = m
-		case strings.HasPrefix(k, bPrefix):
-			moved[aRel+"/"+strings.TrimPrefix(k, bPrefix)] = m
-		default:
+// swapRecordsLocked updates the table after the host swapped the entries a and
+// b, which sat at aRel and bRel. A record that keys on an identity follows its
+// file, so its hint, parent directory, and leaf change to the new position. The
+// host swapped the entries already, so the position of each new path is valid.
+// A table with path records swaps the path records of both entries and of every
+// entry below them. Callers hold w.mu for writing.
+func (w *Workspace) swapRecordsLocked(a, b entry, aRel, bRel string) {
+	if w.meta.hasPathRecs() {
+		w.meta.swapTree(aRel, bRel)
+	}
+	for _, e := range []struct {
+		entry
+		now string
+	}{{a, bRel}, {b, aRel}} {
+		if e.key.isPath() {
 			continue
 		}
-		w.delMetaLocked(k)
-	}
-	for k, m := range moved {
-		w.setMetaLocked(k, m)
+		if r := w.meta.get(e.key); r != nil {
+			parent, leaf := w.locOf(e.now)
+			w.meta.put(e.key, r.withLoc(e.now, parent, leaf))
+		}
 	}
 }
 

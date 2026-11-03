@@ -200,13 +200,14 @@ func TestHostfsBench(t *testing.T) {
 		t.Skip("set HOSTFS_BENCH=1 to run the hostfs benchmarks")
 	}
 	for _, c := range benchCases(benchDepth) {
-		// A counting env measures the host calls of one operation after a
-		// warm-up run, so the counts match what a steady workload pays.
+		// A counting env measures the host calls of one operation after two
+		// warm-up runs, so the counts match what a steady workload pays.
 		ce, ch, _ := newCountEnv(t)
 		c.setup(ce)
 		c.op(ce, 0)
-		ch.reset()
 		c.op(ce, 1)
+		ch.reset()
+		c.op(ce, 2)
 		calls, syscalls, dump := ch.total(), ch.syscalls(), ch.dump()
 
 		e := newEnv(t)

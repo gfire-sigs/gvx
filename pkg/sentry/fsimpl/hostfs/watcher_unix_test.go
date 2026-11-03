@@ -44,7 +44,7 @@ func hostCtime(t *testing.T, path string) int64 {
 	if err := unix.Stat(path, &st); err != nil {
 		t.Fatal(err)
 	}
-	return statToHostInfo(&st).ctime.UnixNano()
+	return time.Unix(int64(st.Ctim.Sec), int64(st.Ctim.Nsec)).UnixNano()
 }
 
 // changeCtime changes the permission bits of a host file until the change

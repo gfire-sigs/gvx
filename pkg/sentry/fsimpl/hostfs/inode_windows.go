@@ -44,6 +44,15 @@ type hostRoot struct {
 	// dir owns the handle. Closing dir closes handle.
 	dir    *os.File
 	handle windows.Handle
+	// byIDErr is the error of the lookup of OpenFileById, or nil. existsByID
+	// needs the procedure, and the lockdown forbids loading it later.
+	byIDErr error
+	// volume is the serial number of the volume of the workspace root, in the
+	// form of fileKey.dev. It is zero when the query failed. rootPath is the
+	// normalized path of the root without the volume, or "" when the query
+	// failed. Both stay unchanged after newHostRoot. existsByID uses them.
+	volume   uint64
+	rootPath string
 }
 
 // fileShareAll lets other openers read, write, and delete the file while
@@ -92,6 +101,13 @@ type fileAttributeTagInfo struct {
 	ReparseTag     uint32
 }
 
+// fileIDInfo is FILE_ID_INFO. NTFS and ReFS fill all 128 bits of FileID. Other
+// volumes reject the query.
+type fileIDInfo struct {
+	VolumeSerialNumber uint64
+	FileID             [16]byte
+}
+
 // fileBasicInfo is FILE_BASIC_INFO. The explicit padding matches the C
 // layout, where the structure ends on an 8-byte boundary.
 type fileBasicInfo struct {
@@ -129,7 +145,9 @@ func newHostRoot(root *os.Root) (*hostRoot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hostfs: pin workspace directory: %w", err)
 	}
-	return &hostRoot{dir: dir, handle: windows.Handle(dir.Fd())}, nil
+	h := &hostRoot{dir: dir, handle: windows.Handle(dir.Fd()), byIDErr: procOpenFileByID.Find()}
+	h.volume, h.rootPath = rootLocation(h.handle)
+	return h, nil
 }
 
 func (h *hostRoot) close() error {
@@ -584,7 +602,29 @@ func statHandle(handle windows.Handle) (hostInfo, error) {
 	if bhfi.FileAttributes&windows.FILE_ATTRIBUTE_READONLY != 0 {
 		info.perm &^= 0o222
 	}
+	info.fid, info.fidOK = fileIdentity(handle, bhfi)
 	return info, nil
+}
+
+// fileIdentity returns the key of .gvx_meta records for an open handle. It
+// reports false when the volume does not answer FILE_ID_INFO, for example
+// FAT, exFAT, or a network share. The key then holds the 64-bit file index of
+// the handle, which is not stable on such a volume, and the caller keeps its
+// records by path. A failed query never fails the stat.
+func fileIdentity(handle windows.Handle, bhfi windows.ByHandleFileInformation) (fileKey, bool) {
+	var id fileIDInfo
+	if err := windows.GetFileInformationByHandleEx(handle, windows.FileIdInfo,
+		(*byte)(unsafe.Pointer(&id)), uint32(unsafe.Sizeof(id))); err != nil {
+		return fileKey{
+			dev: uint64(bhfi.VolumeSerialNumber),
+			ino: uint64(bhfi.FileIndexHigh)<<32 | uint64(bhfi.FileIndexLow),
+		}, false
+	}
+	return fileKey{
+		dev:  id.VolumeSerialNumber,
+		ino:  binary.LittleEndian.Uint64(id.FileID[0:8]),
+		ino2: binary.LittleEndian.Uint64(id.FileID[8:16]),
+	}, true
 }
 
 // finalPathByHandle calls GetFinalPathNameByHandle with the given flags and
