@@ -419,6 +419,7 @@ func (c *fileData) init(ino *inode) {
 func (c *fileData) ChunkMemory() chunkcache.ChunkMemory { return c.ino.fs.ws.chunkMemory() }
 func (c *fileData) FileSizeLocked() uint64              { return uint64(c.size) }
 func (c *fileData) TranslateError(err error) error      { return translateHostError(err) }
+func (c *fileData) MayUseHugepages() bool               { return false }
 
 func (c *fileData) CanTranslateLocked(write bool) error {
 	if c.mh == nil {

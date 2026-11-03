@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"syscall"
 
@@ -37,9 +38,9 @@ import (
 	"z.gfire.dev/gvx/runsc/config"
 	"z.gfire.dev/gvx/runsc/container"
 	"z.gfire.dev/gvx/runsc/flag"
-	"z.gfire.dev/gvx/runsc/fsgofer"
-	"z.gfire.dev/gvx/runsc/fsgofer/extension"
-	"z.gfire.dev/gvx/runsc/fsgofer/filter"
+	fsgofer "z.gfire.dev/gvx/runsc/gofer/fs"
+	"z.gfire.dev/gvx/runsc/gofer/fs/extension"
+	"z.gfire.dev/gvx/runsc/gofer/fs/filter"
 	"z.gfire.dev/gvx/runsc/gvisorbinaries"
 	"z.gfire.dev/gvx/runsc/profile"
 	"z.gfire.dev/gvx/runsc/specutils"
@@ -188,7 +189,6 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	willReexec := g.applyCaps && (config.CgoEnabled || g.syncFDs.usernsFD >= 0)
 
 	specFile := os.NewFile(uintptr(g.specFD), "spec file")
-	defer specFile.Close()
 	spec, err := specutils.ReadSpecFromFile(g.bundleDir, specFile, specutils.SpecOpts{Conf: conf})
 	if err != nil {
 		util.Fatalf("reading spec: %v", err)
@@ -266,9 +266,15 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 		args := sandboxsetup.PrepareArgs(g.Name(), f, overrides)
 		util.Fatalf("setCapsAndCallSelf(%v, %v): %v", args, capsToApply, sandboxsetup.SetCapsAndCallSelf(args, capsToApply))
+		// Prevent the specFile finalizer from closing specFD before re-exec.
+		runtime.KeepAlive(specFile)
 		panic("unreachable")
 	}
-	// No re-exec from here on out.
+	// No re-exec from here on out. Close specFile so the spec memfd is not
+	// held open inside the chroot for the lifetime of the container.
+	if err := specFile.Close(); err != nil {
+		util.Fatalf("closing specFile: %v", err)
+	}
 
 	// Start profiling. This will be a noop if no profiling arguments were passed.
 	// This *must* happen while procfs is still mounted (need `/proc/self/maps`).
@@ -483,6 +489,7 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		HostUDS:            conf.GetHostUDS(),
 		HostFifo:           conf.HostFifo,
 		CharDevicePolicy:   conf.CharacterDevicePolicy,
+		InodeNumbers:       conf.InodeNumbers,
 		DonateMountPointFD: conf.DirectFS,
 		RUID:               ruid,
 		EUID:               euid,

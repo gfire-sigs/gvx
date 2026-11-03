@@ -756,65 +756,42 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 		// Try to recycle waste pages, since this avoids the overhead of
 		// decommitting and then committing them again.
 		var uwgap unwasteGapIterator
-		if alloc.opts.Dir == BottomUp {
-			uwgap = unwaste.FirstLargeEnoughGap(alloc.length)
-		} else {
-			uwgap = unwaste.LastLargeEnoughGap(alloc.length)
-		}
+		uwgap, fr = findRecyclable(unwaste, alloc)
 		if uwgap.Ok() {
-			var ok bool
-			if alloc.huge {
-				ok = true
-				if alloc.opts.Dir == BottomUp {
-					fr = memmap.FileRange{
-						Start: uwgap.Start(),
-						End:   uwgap.Start() + alloc.length,
+			alloc.recycled = true
+			unwaste.Insert(uwgap, fr, unwasteInfo{})
+			// Update reference count for these pages from 0 to 1.
+			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
+				uf := ufseg.ValuePtr()
+				if uf.refs != 0 {
+					panic(fmt.Sprintf("waste pages %v have unexpected refcount %d during recycling of %v\n%s", ufseg.Range(), uf.refs, fr, f.stringLocked()))
+				}
+				uf.refs = 1
+				return true
+			})
+			// These pages should all be unknown-commitment or known-committed;
+			// mark them unknown-commitment, for consistency with non-recycling
+			// allocations (below).
+			f.memAcct.MutateFullRange(fr, func(maseg memAcctIterator) bool {
+				ma := maseg.ValuePtr()
+				malen := maseg.Range().Length()
+				if ma.knownCommitted {
+					if ma.kind != usage.System {
+						panic(fmt.Sprintf("waste pages %v have unexpected kind %v\n%s", maseg.Range(), ma.kind, f.stringLocked()))
 					}
-				} else {
-					fr = memmap.FileRange{
-						Start: uwgap.End() - alloc.length,
-						End:   uwgap.End(),
+					ma.knownCommitted = false
+					ma.commitSeq = f.commitSeq
+					f.knownCommittedBytes -= malen
+					if !f.opts.DisableMemoryAccounting {
+						usage.MemoryAccounting.Dec(malen, usage.System, ma.memCgID)
 					}
 				}
-			} else {
-				fr, ok = alignSmallAllocRange(uwgap.Range(), alloc.length, alloc.opts.Dir)
-			}
-			if ok {
-				alloc.recycled = true
-				unwaste.Insert(uwgap, fr, unwasteInfo{})
-				// Update reference count for these pages from 0 to 1.
-				unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
-					uf := ufseg.ValuePtr()
-					if uf.refs != 0 {
-						panic(fmt.Sprintf("waste pages %v have unexpected refcount %d during recycling of %v\n%s", ufseg.Range(), uf.refs, fr, f.stringLocked()))
-					}
-					uf.refs = 1
-					return true
-				})
-				// These pages should all be unknown-commitment or known-committed;
-				// mark them unknown-commitment, for consistency with non-recycling
-				// allocations (below).
-				f.memAcct.MutateFullRange(fr, func(maseg memAcctIterator) bool {
-					ma := maseg.ValuePtr()
-					malen := maseg.Range().Length()
-					if ma.knownCommitted {
-						if ma.kind != usage.System {
-							panic(fmt.Sprintf("waste pages %v have unexpected kind %v\n%s", maseg.Range(), ma.kind, f.stringLocked()))
-						}
-						ma.knownCommitted = false
-						ma.commitSeq = f.commitSeq
-						f.knownCommittedBytes -= malen
-						if !f.opts.DisableMemoryAccounting {
-							usage.MemoryAccounting.Dec(malen, usage.System, ma.memCgID)
-						}
-					}
-					ma.kind = alloc.opts.Kind
-					ma.memCgID = alloc.opts.MemCgID
-					ma.wasteOrReleasing = false
-					return true
-				})
-				return
-			}
+				ma.kind = alloc.opts.Kind
+				ma.memCgID = alloc.opts.MemCgID
+				ma.wasteOrReleasing = false
+				return true
+			})
+			return
 		}
 	}
 
@@ -880,6 +857,68 @@ retryFree:
 		commitSeq:      f.commitSeq,
 	})
 	return
+}
+
+// findRecyclable returns a gap in unwaste that is large enough for alloc, and
+// the range within it that alloc should recycle. Huge allocations must be
+// hugepage-aligned to be backed by huge pages, but waste is only page-aligned,
+// so if the first large enough gap can't fit an aligned range, a gap large
+// enough to contain one is used instead.
+func findRecyclable(unwaste *unwasteSet, alloc *allocState) (unwasteGapIterator, memmap.FileRange) {
+	uwgap := largeEnoughGap(unwaste, alloc, alloc.length)
+	if !uwgap.Ok() {
+		return uwgap, memmap.FileRange{}
+	}
+	fr, ok := recycleRange(uwgap, alloc)
+	if !ok && alloc.huge {
+		// A gap this large always contains a hugepage-aligned range of
+		// alloc.length bytes.
+		minSize := alloc.length + uint64(hostarch.HugePageSize) - uint64(hostarch.PageSize)
+		if minSize < alloc.length { // overflow
+			return unwasteGapIterator{}, memmap.FileRange{}
+		}
+		if uwgap = largeEnoughGap(unwaste, alloc, minSize); !uwgap.Ok() {
+			return uwgap, memmap.FileRange{}
+		}
+		fr, ok = recycleRange(uwgap, alloc)
+	}
+	if !ok {
+		return unwasteGapIterator{}, memmap.FileRange{}
+	}
+	return uwgap, fr
+}
+
+func largeEnoughGap(unwaste *unwasteSet, alloc *allocState, minSize uint64) unwasteGapIterator {
+	if alloc.opts.Dir == BottomUp {
+		return unwaste.FirstLargeEnoughGap(minSize)
+	}
+	return unwaste.LastLargeEnoughGap(minSize)
+}
+
+// recycleRange returns the range in uwgap that alloc should recycle, and
+// whether uwgap can fit it.
+func recycleRange(uwgap unwasteGapIterator, alloc *allocState) (memmap.FileRange, bool) {
+	if !alloc.huge {
+		return alignSmallAllocRange(uwgap.Range(), alloc.length, alloc.opts.Dir)
+	}
+	var fr memmap.FileRange
+	if alloc.opts.Dir == BottomUp {
+		fr.Start = uwgap.Start()
+		if alloc.huge {
+			var ok bool
+			if fr.Start, ok = hostarch.HugePageRoundUp(fr.Start); !ok {
+				return fr, false
+			}
+		}
+		fr.End = fr.Start + alloc.length
+	} else {
+		fr.End = uwgap.End()
+		if alloc.huge {
+			fr.End = hostarch.HugePageRoundDown(fr.End)
+		}
+		fr.Start = fr.End - alloc.length
+	}
+	return fr, uwgap.Range().IsSupersetOf(fr)
 }
 
 // Preconditions: f.mu must be locked.

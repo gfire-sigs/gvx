@@ -17,7 +17,12 @@
 package time
 
 import (
+	_ "runtime" // For facts in assembly files.
+
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
+// vdsoClockGettime invokes clock_gettime via the host VDSO when available,
+// falling back to the clock_gettime syscall. It returns 0 on success or a
+// negative errno value on failure.
 func vdsoClockGettime(clockid ClockID, ts *unix.Timespec) int

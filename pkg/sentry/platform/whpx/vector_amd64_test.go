@@ -49,7 +49,7 @@ func testHostFeatures() cpuid.FeatureSet {
 // /proc/cpuinfo for fs.
 func cpuinfoFlags(fs cpuid.FeatureSet) string {
 	var b bytes.Buffer
-	fs.WriteCPUInfoTo(0, 1, &b)
+	fs.WriteCPUInfoTo(0, 1, fs.CPUFreqMHz(), &b)
 	for line := range strings.Lines(b.String()) {
 		if strings.HasPrefix(line, "flags") {
 			return " " + strings.TrimSpace(line[strings.Index(line, ":")+1:]) + " "

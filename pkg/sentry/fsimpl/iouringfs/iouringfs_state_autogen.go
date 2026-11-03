@@ -37,7 +37,7 @@ func (fd *FileDescription) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(5, &fd.sqemf)
 	stateSinkObject.Save(6, &fd.running)
 	stateSinkObject.Save(7, &fd.ioRings)
-	stateSinkObject.Save(8, &fd.remap)
+	stateSinkObject.SaveBool(8, &fd.remap)
 }
 
 // +checklocksignore
@@ -50,8 +50,13 @@ func (fd *FileDescription) StateLoad(ctx context.Context, stateSourceObject stat
 	stateSourceObject.Load(5, &fd.sqemf)
 	stateSourceObject.Load(6, &fd.running)
 	stateSourceObject.Load(7, &fd.ioRings)
-	stateSourceObject.Load(8, &fd.remap)
-	stateSourceObject.AfterLoad(func() { fd.afterLoad(ctx) })
+	stateSourceObject.LoadBool(8, &fd.remap)
+	stateSourceObject.AfterLoadTo(fd)
+}
+
+// +checklocksignore
+func (fd *FileDescription) StateAfterLoad(ctx context.Context) {
+	fd.afterLoad(ctx)
 }
 
 func (sqemf *sqEntriesFile) StateTypeName() string {
@@ -61,6 +66,7 @@ func (sqemf *sqEntriesFile) StateTypeName() string {
 func (sqemf *sqEntriesFile) StateFields() []string {
 	return []string{
 		"MappableNoTrackMappings",
+		"MappableNoHugepages",
 		"fr",
 	}
 }
@@ -71,7 +77,8 @@ func (sqemf *sqEntriesFile) beforeSave() {}
 func (sqemf *sqEntriesFile) StateSave(stateSinkObject state.Sink) {
 	sqemf.beforeSave()
 	stateSinkObject.Save(0, &sqemf.MappableNoTrackMappings)
-	stateSinkObject.Save(1, &sqemf.fr)
+	stateSinkObject.Save(1, &sqemf.MappableNoHugepages)
+	stateSinkObject.Save(2, &sqemf.fr)
 }
 
 func (sqemf *sqEntriesFile) afterLoad(context.Context) {}
@@ -79,7 +86,8 @@ func (sqemf *sqEntriesFile) afterLoad(context.Context) {}
 // +checklocksignore
 func (sqemf *sqEntriesFile) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &sqemf.MappableNoTrackMappings)
-	stateSourceObject.Load(1, &sqemf.fr)
+	stateSourceObject.Load(1, &sqemf.MappableNoHugepages)
+	stateSourceObject.Load(2, &sqemf.fr)
 }
 
 func (rbmf *ringsBufferFile) StateTypeName() string {
@@ -89,6 +97,7 @@ func (rbmf *ringsBufferFile) StateTypeName() string {
 func (rbmf *ringsBufferFile) StateFields() []string {
 	return []string{
 		"MappableNoTrackMappings",
+		"MappableNoHugepages",
 		"fr",
 	}
 }
@@ -99,7 +108,8 @@ func (rbmf *ringsBufferFile) beforeSave() {}
 func (rbmf *ringsBufferFile) StateSave(stateSinkObject state.Sink) {
 	rbmf.beforeSave()
 	stateSinkObject.Save(0, &rbmf.MappableNoTrackMappings)
-	stateSinkObject.Save(1, &rbmf.fr)
+	stateSinkObject.Save(1, &rbmf.MappableNoHugepages)
+	stateSinkObject.Save(2, &rbmf.fr)
 }
 
 func (rbmf *ringsBufferFile) afterLoad(context.Context) {}
@@ -107,11 +117,12 @@ func (rbmf *ringsBufferFile) afterLoad(context.Context) {}
 // +checklocksignore
 func (rbmf *ringsBufferFile) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &rbmf.MappableNoTrackMappings)
-	stateSourceObject.Load(1, &rbmf.fr)
+	stateSourceObject.Load(1, &rbmf.MappableNoHugepages)
+	stateSourceObject.Load(2, &rbmf.fr)
 }
 
 func init() {
-	state.Register((*FileDescription)(nil))
-	state.Register((*sqEntriesFile)(nil))
-	state.Register((*ringsBufferFile)(nil))
+	state.RegisterStruct((*FileDescription)(nil))
+	state.RegisterNoHooks((*sqEntriesFile)(nil))
+	state.RegisterNoHooks((*ringsBufferFile)(nil))
 }

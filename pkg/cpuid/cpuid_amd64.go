@@ -43,21 +43,39 @@ type FeatureSet struct {
 	//
 	// This is exported to allow direct calls of the underlying CPUID
 	// function, where required.
-	Function `state:".(Static)"`
+	Function `state:".([]byte)"`
 	// hwCap stores HWCAP1/2 exposed from the elf auxiliary vector.
 	hwCap hwCap
 }
 
-// saveFunction saves the function as a static query.
-func (fs *FeatureSet) saveFunction() Static {
-	if s, ok := fs.Function.(Static); ok {
-		return s
+// saveFunction saves the function as a static query, in the compact form of
+// Static.appendMarshal prefixed by a version byte.
+func (fs *FeatureSet) saveFunction() []byte {
+	if fs.Function == nil {
+		return nil
 	}
-	return fs.ToStatic()
+	s, ok := fs.Function.(Static)
+	if !ok {
+		s = fs.ToStatic()
+		s.normalize()
+	}
+	return s.appendMarshal(append(make([]byte, 0, 1+len(s)*staticEntrySize), 1))
 }
 
-// loadFunction saves the function as a static query.
-func (fs *FeatureSet) loadFunction(_ context.Context, s Static) {
+// loadFunction loads the function saved by saveFunction.
+func (fs *FeatureSet) loadFunction(_ context.Context, b []byte) {
+	if len(b) == 0 {
+		fs.Function = nil
+		return
+	}
+	if b[0] != 1 {
+		panic(fmt.Sprintf("unsupported CPUID function encoding version %d", b[0]))
+	}
+	s, err := unmarshalStatic(b[1:])
+	if err != nil {
+		panic(err)
+	}
+	s.normalize()
 	fs.Function = s
 }
 
@@ -336,10 +354,17 @@ func x86Family(sig uint32) uint32 {
 	return family
 }
 
-// WriteCPUInfoTo is to generate a section of one cpu in /proc/cpuinfo. This is
+// CPUFreqMHz returns the host CPU frequency to report in /proc/cpuinfo. It is
+// measured on the host when the process starts, before seccomps are installed.
+func (fs FeatureSet) CPUFreqMHz() float64 {
+	return cpuFreqMHz
+}
+
+// WriteCPUInfoTo is used to generate a section of one cpu in /proc/cpuinfo. This is
 // a minimal /proc/cpuinfo, it is missing some fields like "microcode" that are
-// not always printed in Linux. Several fields are simply made up.
-func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
+// not always printed in Linux. Several fields are simply made up. freqMHz is
+// reported as the CPU frequency.
+func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, freqMHz float64, w io.Writer) {
 	// Avoid many redundant calls here, since this can occasionally appear
 	// in the hot path. Read all basic information up front, see above.
 	ax, _, _, _ := fs.query(featureInfo)
@@ -351,7 +376,7 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	fmt.Fprintf(w, "model\t\t: %d\n", ((em<<4)&0xff)|m)
 	fmt.Fprintf(w, "model name\t: %s\n", "unknown") // Unknown for now.
 	fmt.Fprintf(w, "stepping\t: %s\n", "unknown")   // Unknown for now.
-	fmt.Fprintf(w, "cpu MHz\t\t: %.3f\n", cpuFreqMHz)
+	fmt.Fprintf(w, "cpu MHz\t\t: %.3f\n", freqMHz)
 	// Pretend the CPU has 8192 KB of cache. Note that real /proc/cpuinfo exposes total L3 cache
 	// size on Intel and per-core L2 cache size on AMD (as of Linux 6.1.0), so the value of this
 	// field is not really important in practice. Any value that is chosen here will be wrong
@@ -370,7 +395,7 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	fmt.Fprintf(w, "cpuid level\t: %d\n", uint32(xSaveInfo)) // Same as ax in vendorID.
 	fmt.Fprintf(w, "wp\t\t: yes\n")
 	fmt.Fprintf(w, "flags\t\t: %s\n", fs.FlagString())
-	fmt.Fprintf(w, "bogomips\t: %.02f\n", cpuFreqMHz) // It's bogus anyway.
+	fmt.Fprintf(w, "bogomips\t: %.02f\n", freqMHz) // It's bogus anyway.
 	fmt.Fprintf(w, "clflush size\t: %d\n", fs.CacheLine())
 	fmt.Fprintf(w, "cache_alignment\t: %d\n", fs.CacheLine())
 	fmt.Fprintf(w, "address sizes\t: %d bits physical, %d bits virtual\n", 46, 48)

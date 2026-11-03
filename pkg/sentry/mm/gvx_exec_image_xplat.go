@@ -157,7 +157,7 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 		if segOff != firstOff+uint64(cur-blockAR.Start) {
 			alreadyAligned = false
 		}
-		if err := seg.getInternalMappingsLocked(); err != nil {
+		if _, err := seg.getInternalMappingsLocked(seg.Range()); err != nil {
 			return nil, false
 		}
 		if seg.End() >= blockAR.End {
@@ -188,7 +188,11 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 	}
 	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
 		subAR := seg.Range().Intersect(blockAR)
-		srcs := mm.internalMappingsLocked(seg, subAR)
+		srcs, err := mm.internalMappingsLocked(seg, subAR)
+		if err != nil {
+			mm.mf.DecRef(fr)
+			return nil, false
+		}
 		subDsts := dsts.DropFirst64(uint64(subAR.Start - blockAR.Start)).TakeFirst64(uint64(subAR.Length()))
 		if _, err := safemem.CopySeq(subDsts, srcs); err != nil {
 			mm.mf.DecRef(fr)

@@ -118,6 +118,11 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 	}
 	isDir := ino.Stat.Mode&linux.FileTypeMask == linux.ModeDirectory
 	inoKey := inoKeyFromStatx(&ino.Stat)
+	devMinor, err := fs.devMinorFromKey(inoKey)
+	if err != nil {
+		fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
+		return nil, err
+	}
 	// Common case. Performance hack which is used to allocate the dentry
 	// and its inode together in the heap. This will help reduce allocations and memory
 	// fragmentation. This is more cache friendly too.
@@ -131,14 +136,19 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 	// This also avoids a correctness issue when a directory is bind-mounted on the host:
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
+	var cacheHit bool
 	temp.d.inode = fs.getOrCreateInode(inoKey /* dontCache = */, isDir,
-		func() { fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */) },
+		func() {
+			cacheHit = true
+			fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
+		},
 		func() *inode {
 			temp.i = lisafsInode{
 				inode: inode{
 					fs:        fs,
 					inoKey:    inoKey,
 					ino:       fs.inoFromKey(inoKey),
+					devMinor:  devMinor,
 					rdevMajor: ino.Stat.RdevMajor,
 					rdevMinor: ino.Stat.RdevMinor,
 					mode:      atomicbitops.FromUint32(uint32(ino.Stat.Mode)),
@@ -196,6 +206,12 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 			}
 			return inode
 		})
+	if cacheHit && !temp.d.inode.cachedMetadataAuthoritative() {
+		i := temp.d.inode.impl.(*lisafsInode)
+		i.metadataMu.Lock()
+		i.updateMetadataFromStatxLocked(&ino.Stat)
+		i.metadataMu.Unlock()
+	}
 
 	temp.d.init()
 	// If this dentry adopted a cached inode that already carries a bound-socket
@@ -620,23 +636,8 @@ func (i *lisafsInode) statfs(ctx context.Context) (linux.Statfs, error) {
 
 func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opts *vfs.CompleteRestoreOptions, d *dentry) error {
 	i.controlFD = i.fs.client.NewFD(inode.ControlFD)
-
-	// Gofers do not preserve inoKey across checkpoint/restore, so:
-	//
-	//	- We must assume that the remote filesystem did not change in a way that
-	//		would invalidate dentries, since we can't revalidate dentries by
-	//		checking inoKey.
-	//
-	//	- We need to associate the new inoKey with the existing i.ino.
-	i.inoKey = inoKeyFromStatx(&inode.Stat)
-	i.fs.inoMu.Lock()
-	i.fs.inoByKey[i.inoKey] = i.ino
-	i.fs.inoMu.Unlock()
-	// inodeByKey contains non-directory inodes only.
-	if !d.isDir() {
-		i.fs.inodeMu.Lock()
-		i.fs.inodeByKey[i.inoKey] = &i.inode
-		i.fs.inodeMu.Unlock()
+	if err := i.restoreInoKey(inoKeyFromStatx(&inode.Stat)); err != nil {
+		return err
 	}
 
 	// Check metadata stability before updating metadata.

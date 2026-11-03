@@ -107,6 +107,7 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 		devMinor: devMinor,
 	}
 	procfs.MaxCachedDentries = maxCachedDentries
+	procfs.NoNegativeDentries = true
 	procfs.VFSFilesystem().Init(vfsObj, &ft, procfs)
 
 	var internalData *InternalData
@@ -187,6 +188,12 @@ type InternalData struct {
 	// GVisorMarkerFile indicates whether a file named gvisor/kernel_is_gvisor
 	// should exist in the procfs.
 	GVisorMarkerFile bool
+
+	// ContainerName is the container this procfs belongs to. ContainerUID and
+	// ContainerGID are the IDs of its initial process.
+	ContainerName string
+	ContainerUID  auth.KUID
+	ContainerGID  auth.KGID
 
 	// OverrideProcs is a list of proc files to override with stubs. The
 	// /proc/ prefix is removed (e.g., this contains filenames like

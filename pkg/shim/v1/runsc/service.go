@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	cgroups "github.com/containerd/cgroups/v3"
 	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
@@ -259,9 +260,6 @@ func hasPodCgroupParent(bundle, cgPath string) bool {
 //
 // +checklocksexclude:s.mu
 func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (*task.CreateTaskResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
 		ID:                 rfs.Create.ID,
 		Bundle:             rfs.Create.Bundle,
@@ -278,7 +276,9 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		return nil, err
 	}
 
+	s.mu.Lock()
 	s.containers[rfs.Create.ID] = c
+	s.mu.Unlock()
 
 	p, err := c.Process("")
 	if err != nil {
@@ -761,7 +761,12 @@ func (s *runscService) getContainerPids(ctx context.Context, c *Container) ([]ui
 	if err != nil {
 		return nil, err
 	}
-	ps, err := p.(*proc.Init).Runtime().Ps(ctx, c.ID)
+	var ps []int
+	err = p.(*proc.Init).RuntimeCall(ctx, func(ctx context.Context, runtime *runsccmd.Runsc) error {
+		var err error
+		ps, err = runtime.Ps(ctx, c.ID)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -936,9 +941,6 @@ func (g *GvisorTaskServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		return nil, fmt.Errorf("process is not init process")
 	}
 
-	// Set debug options on the runtime for this execution
-	runsc := setDebug(initProc.Runtime(), req.GetDebug())
-
 	opts := &runsccmd.CheckpointOpts{
 		ImagePath:                 req.GetImagePath(),
 		LeaveRunning:              req.GetLeaveRunning(),
@@ -953,14 +955,14 @@ func (g *GvisorTaskServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		FSPath:                    req.GetFsPath(),
 	}
 
-	if req.GetFsCheckpoint() {
-		if err := runsc.FSCheckpoint(ctx, c.ID, opts); err != nil {
-			return nil, err
+	if err := initProc.Checkpoint(ctx, func(ctx context.Context, runtime *runsccmd.Runsc) error {
+		runtime = setDebug(runtime, req.GetDebug())
+		if req.GetFsCheckpoint() {
+			return runtime.FSCheckpoint(ctx, c.ID, opts)
 		}
-	} else {
-		if err := runsc.Checkpoint(ctx, c.ID, opts); err != nil {
-			return nil, err
-		}
+		return runtime.Checkpoint(ctx, c.ID, opts)
+	}); err != nil {
+		return nil, err
 	}
 
 	return &pb.CheckpointResponse{}, nil
@@ -1016,8 +1018,10 @@ func (g *GvisorTaskServer) State(ctx context.Context, req *pb.StateRequest) (*pb
 	if c, err := g.s.getContainer(req.GetId()); err == nil {
 		if p, err := c.Process(""); err == nil {
 			if initProc, ok := p.(*proc.Init); ok {
-				runsc := setDebug(initProc.Runtime(), req.GetDebug())
-				if _, err := runsc.State(ctx, c.ID); err != nil {
+				if err := initProc.RuntimeCall(ctx, func(ctx context.Context, runtime *runsccmd.Runsc) error {
+					_, err := setDebug(runtime, req.GetDebug()).State(ctx, c.ID)
+					return err
+				}); err != nil {
 					log.L.Debugf("State with debug failed: %v", err)
 				}
 			}
@@ -1054,11 +1058,14 @@ func (g *GvisorTaskServer) State(ctx context.Context, req *pb.StateRequest) (*pb
 
 // Version implements taskServer.GvisorTaskServiceExt.
 func (g *GvisorTaskServer) Version(ctx context.Context, req *pb.VersionRequest) (*pb.VersionResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	command := runsccmd.DefaultCommand
 	if configured := g.s.versionCommand.Load(); configured != nil && *configured != "" {
 		command = *configured
 	}
-	cmd := exec.Command(command, "-version")
+	cmd := exec.CommandContext(ctx, command, "-version")
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get runsc version: %w, output: %s", err, string(out))

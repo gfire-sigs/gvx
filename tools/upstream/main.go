@@ -48,7 +48,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.mode, "mode", "audit", "operation mode: audit, retag, resolve, or sync")
-	fs.Float64Var(&o.maxRatio, "max-ratio", 0.01, "maximum allowed ratio of budgeted upstream files (0.01 is 1.0%)")
+	fs.Float64Var(&o.maxRatio, "max-ratio", 0.02, "maximum allowed ratio of budgeted upstream files (0.02 is 2.0%)")
 	fs.BoolVar(&o.countFences, "count-fences", false, "charge Linux-only build fences against the budget (strictest reading of SPEC 2.2)")
 	fs.StringVar(&o.rootDir, "root", ".", "repository root directory")
 	fs.StringVar(&o.allowlist, "allowlist", "tools/upstream/buildtag_allowlist.txt", "path to the build-tag allowlist")

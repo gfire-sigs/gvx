@@ -95,6 +95,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Metrics flags.
 	flagSet.String("metric-server", "", "if set, export metrics on this address. This may either be 1) 'addr:port' to export metrics on a specific network interface address, 2) ':port' for exporting metrics on all interfaces, or 3) an absolute path to a Unix Domain Socket. The substring '%RUNTIME_ROOT%' will be replaced by the root directory. This flag must be specified in both `runsc metric-server` and `runsc create`, and their values must match.")
 	flagSet.String("final-metrics-log", "", "if set, write all metric data to this file upon sandbox termination")
+	flagSet.String("boot-times-log", "", "if set, write the startup timeline of the sandbox to this file as JSON when the sandbox starts")
 	flagSet.String("profiling-metrics", "", "comma separated list of metric names which are going to be written to the profiling-metrics-log file from within the sentry in CSV format. profiling-metrics will be snapshotted at a rate specified by profiling-metrics-rate-us. Requires profiling-metrics-log to be set. (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profiling-metrics-log", "", "file name to use for profiling-metrics output; use the special value '-' to write to the user-visible logs. (DO NOT USE IN PRODUCTION)")
 	flagSet.Int("profiling-metrics-rate-us", 1000, "the target rate (in microseconds) at which profiling metrics will be snapshotted.")
@@ -157,6 +158,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")
 	flagSet.Var(charDevicePolicyPtr(CharDevEmulatedOnly), "character-device-policy", "controls how character device files on gofer mounts (rootfs and bind mounts) are handled. 'emulated-only' serves devices implemented by the sentry and fails opens of other devices with ENXIO (default and more secure); 'prefer-emulated' serves sentry-implemented devices from the sentry and opens the rest through the host; 'passthrough' opens all of them through the host. Values: emulated-only|prefer-emulated|passthrough, default: emulated-only")
+	flagSet.Var(inodeNumbersPtr(InodeNumbersPassthrough), "inode-numbers", "controls inode numbers on gofer mounts: 'passthrough' reports host inode numbers; 'virtual' assigns sandbox-private sequential numbers, which costs memory per file seen and a stat(2) per getdents(2) entry. Values: passthrough|virtual, default: passthrough")
 	flagSet.Bool("gvisor-marker-file", false, "enable the presence of the /proc/gvisor/kernel_is_gvisor file that can be used by applications to detect that gVisor is in use")
 	flagSet.String("override-procs", "", "comma-separated list of proc files to override with stubs (e.g. kallsyms)")
 
@@ -192,6 +194,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool(flagNetDisconnectOK, true, "Indicates whether open network connections and open unix domain sockets should be disconnected upon save.")
 	flagSet.Bool(flagPauseExternalNetworking, false, "Start the sandbox with external networking disabled. Only supported when using the sandbox network type. The network can be unpaused manually after the sandbox is running.")
 	flagSet.Bool(flagAllowConnectedOnSave, false, "Allow network connections to stay established on save.")
+	flagSet.Var(StateEngineGraph.Ptr(), "state-engine", "selects the state serialization engine used when saving checkpoints: graph (default) or wire.")
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "LEGACY: enable support for Nvidia GPUs. GPU support gets automatically enabled if Nvidia devices are present in the OCI spec.")
@@ -354,6 +357,10 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 		if isFlagExplicitlySet(flagSet, name) {
 			conf.explicitlySet[name] = struct{}{}
 		}
+	}
+	if _, ok := conf.explicitlySet["state-engine"]; ok {
+		v := conf.StateEngine
+		conf.cliStateEngine = &v
 	}
 
 	if len(conf.RootDir) == 0 {
@@ -558,6 +565,26 @@ func getVal(field reflect.Value) string {
 	default:
 		panic("unknown type " + field.Kind().String())
 	}
+}
+
+// IsFlagExplicitlySet reports whether the given flag name was explicitly set on
+// the command line when this Config was created via NewFromFlags.
+func (c *Config) IsFlagExplicitlySet(name string) bool {
+	if c.explicitlySet == nil {
+		return false
+	}
+	_, ok := c.explicitlySet[name]
+	return ok
+}
+
+// CLIStateEngine returns the --state-engine policy explicitly passed on the
+// command line when this Config was created via NewFromFlags, unaffected by
+// subsequent OCI annotation or bundle overrides.
+func (c *Config) CLIStateEngine() (StateEnginePolicy, bool) {
+	if c.cliStateEngine == nil {
+		return 0, false
+	}
+	return *c.cliStateEngine, true
 }
 
 // IsFlagSafeToOverride returns true if the given flag name is in the override

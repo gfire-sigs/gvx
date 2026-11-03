@@ -930,7 +930,7 @@ func (s *Socket) SendResponse(ctx context.Context, ms *nlmsg.MessageSet) *syserr
 		})
 
 		// Add the dump_done_errno payload.
-		m.Put(primitive.AllocateInt64(0))
+		m.Put(primitive.AllocateInt32(0))
 
 		if err := s.sendBufs(ctx, [][]byte{m.Finalize()}, cms, 0 /* srcPort */); err != nil {
 			return err
@@ -984,7 +984,9 @@ func (s *Socket) ProcessMessages(ctx context.Context, buf []byte) *syserr.Error 
 		ms := nlmsg.NewMessageSet(s.GetPortID(), hdr.Seq)
 		if err := s.protocol.ProcessMessage(ctx, s, msg, ms); err != nil {
 			DumpErrorMessage(hdr, ms, err)
-		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK {
+		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK && !ms.Multi {
+			// Linux does not ack a dump that started. See
+			// net/netlink/af_netlink.c:netlink_rcv_skb.
 			DumpAckMessage(hdr, ms)
 		}
 

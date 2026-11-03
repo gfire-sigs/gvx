@@ -51,7 +51,7 @@ func TestBogoMIPS(t *testing.T) {
 	} {
 		var b bytes.Buffer
 		fs := FeatureSet{cpuFreqMHz: bogoMIPS(tc.cntfrq)}
-		fs.WriteCPUInfoTo(0, 1, &b)
+		fs.WriteCPUInfoTo(0, 1, fs.CPUFreqMHz(), &b)
 		if want := "BogoMIPS\t: " + tc.want + "\n"; !strings.Contains(b.String(), want) {
 			t.Errorf("cntfrq %d: cpuinfo lacks %q:\n%s", tc.cntfrq, want, b.String())
 		}
@@ -62,7 +62,7 @@ func TestSetCPUInfoFillsEveryField(t *testing.T) {
 	var fs FeatureSet
 	setCPUInfo(&fs, 0x610f0000, 24_000_000)
 	var b bytes.Buffer
-	fs.WriteCPUInfoTo(0, 1, &b)
+	fs.WriteCPUInfoTo(0, 1, fs.CPUFreqMHz(), &b)
 	for _, want := range []string{
 		"BogoMIPS\t: 48.00\n",
 		"CPU implementer\t: 0x61\n",

@@ -71,6 +71,11 @@ type congestionControl interface {
 	// HandleRTOExpired is invoked when the retransmit timer expires.
 	HandleRTOExpired()
 
+	// HandleWindowRestart is invoked when the sender reduces its window
+	// after an idle period (RFC 5681 section 4.1). Linux tcp_cwnd_restart()
+	// notifies congestion control with CA_EVENT_CWND_RESTART.
+	HandleWindowRestart()
+
 	// Update is invoked when processing inbound acks. It's passed the
 	// number of packet's that were acked by the most recent cumulative
 	// acknowledgement.  rtt is the round-trip time, or is set to unknownRTT
@@ -1119,6 +1124,7 @@ func (s *sender) sendData() {
 	if !s.FastRecovery.Active && s.state != tcpip.RTORecovery && s.ep.stack.Clock().NowMonotonic().Sub(s.LastSendTime) > s.RTO {
 		if s.SndCwnd > InitialCwnd {
 			s.SndCwnd = InitialCwnd
+			s.cc.HandleWindowRestart()
 		}
 	}
 
@@ -1735,8 +1741,9 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		// Clear SACK information for all acked data.
 		s.ep.scoreboard.Delete(s.SndUna)
 
-		// Detect if the sender entered recovery spuriously.
-		if s.inRecovery() {
+		// Eifel compares the ACK's echo to the retransmission time (RFC 3522, section 3.2).
+		// Like Linux, treat a zero echo as unavailable for this comparison.
+		if s.inRecovery() && s.ep.SendTSOk && rcvdSeg.parsedOptions.TS && rcvdSeg.parsedOptions.TSEcr != 0 {
 			s.detectSpuriousRecovery(hasDSACK, rcvdSeg.parsedOptions.TSEcr)
 		}
 

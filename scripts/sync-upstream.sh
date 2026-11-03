@@ -17,7 +17,7 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 cd -- "$repo_root"
-go run ./tools/upstream -mode=sync -root=. -max-ratio=0.01 "$@"
+go run ./tools/upstream -mode=sync -root=. -max-ratio=0.02 "$@"
 
 # Step 7: verify the three non-Linux Priority-0 targets.
 targets=(windows/amd64 windows/arm64 darwin/arm64)

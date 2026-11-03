@@ -10,7 +10,7 @@ Targets: darwin/arm64, windows/amd64, windows/arm64, linux/amd64, linux/arm64. E
 
 Components (name version SPDX-id):
 std go1.27.3 BSD-3-Clause
-github.com/google/gvisor 90a2f3f7b8d16016a7b0219d4c9b74f2610094f2 Apache-2.0
+github.com/google/gvisor 1cea747efe8d81d69ec1fb06199d7f166b82912e Apache-2.0
 github.com/google/btree v1.1.2 Apache-2.0
 github.com/klauspost/compress v1.18.0 Apache-2.0 AND BSD-3-Clause AND MIT
 golang.org/x/arch v0.32.0 BSD-3-Clause
@@ -386,7 +386,7 @@ License text 2 of 5: Apache-2.0
    limitations under the License.
 
 Components that use this text:
-  github.com/google/gvisor 90a2f3f7b8d16016a7b0219d4c9b74f2610094f2
+  github.com/google/gvisor 1cea747efe8d81d69ec1fb06199d7f166b82912e
       note: covers this repository (z.gfire.dev/gvx) and the upstream gVisor code that it contains
       Copyright 2026 The gVisor Authors.
       Copyright 2018 The gVisor Authors.

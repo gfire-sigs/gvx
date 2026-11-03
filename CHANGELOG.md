@@ -2,6 +2,15 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This section records changes that no release contains yet.
+
+### Behavior Changes
+
+- **Upstream gVisor `release-20261102.0`**: the Sentry now comes from the `go` branch commit `1cea747e`. That commit is the first merge that contains the release commit `7a675ac6`. The guest vDSO reads a new `CLOCK_BOOTTIME` offset from the parameter page.
+- **Upstream diff budget**: `tools/upstream -mode=audit` accepts a charged share of up to 2.0% of upstream files. The old limit was 1.0%.
+
 ## [v0.5.2] - 2026-11-03
 
 This release lets Node.js build TypeScript and JavaScript projects on the Windows `amd64` `systrap` engine. The engine runs when the host has no Windows Hypervisor Platform, or with `-platform=systrap`.

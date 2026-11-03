@@ -27,6 +27,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"z.gfire.dev/gvx/internal/xsys/unix"
+
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/context"
@@ -41,6 +42,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/host"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/proc"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/socket/hostinet"
@@ -206,13 +208,19 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	return saveOpts, nil
 }
 
-func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalData {
-	return &proc.InternalData{
+func newProcInternalData(conf *config.Config, spec *specs.Spec, containerName string) *proc.InternalData {
+	data := &proc.InternalData{
 		GVisorMarkerFile:    conf.GVisorMarkerFile,
 		OverrideProcs:       procFiles(conf),
 		SaveTriggerEnabled:  specutils.AnnotationToBool(spec, annotationCheckpointEnable),
 		FSCheckpointEnabled: specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
+		ContainerName:       containerName,
 	}
+	if spec.Process != nil {
+		data.ContainerUID = auth.KUID(spec.Process.User.UID)
+		data.ContainerGID = auth.KGID(spec.Process.User.GID)
+	}
+	return data
 }
 
 // restorer manages a restore session for a sandbox. It stores information about
@@ -395,6 +403,16 @@ func (r *restorer) restore(l *Loader) error {
 		log.Warningf("Platform %q does not support TSC offsetting; host TSC is behind snapshot base cycle, timestamps will go backwards", l.root.conf.Platform)
 	}
 
+	// Calibrating the clocks takes two samples. Take the first sample now,
+	// so that the second sample, which the kernel takes when it starts to
+	// use the clocks once loaded, completes the calibration. This lets the
+	// application read the time through the VDSO, without system calls, as
+	// soon as it resumes, rather than up to ApproxUpdateInterval later.
+	//
+	// The platform is created first, as it can change the TSC domain.
+	clocks := time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(l.root.spec, l.root.conf))
+	clocks.Update(false)
+
 	// Start the old watchdog before replacing it with a new one below.
 	l.watchdog.Start()
 
@@ -543,7 +561,6 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Load the state.
-	clocks := time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(l.root.spec, l.root.conf))
 	r.timer.Reached("loading kernel")
 	if r.extractRootFsMode {
 		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, clocks, r.rootFsOutputTar); err != nil {
@@ -661,6 +678,7 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	l.lifecycleCPUs.releaseForRestore()
 	r.timer.Reached("Starting sandbox")
 	if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
