@@ -140,8 +140,10 @@ type vcpuWorker struct {
 	exited atomic.Bool
 
 	// State that other goroutines read to stop a vCPU that runs a table.
-	curPT      atomic.Pointer[stage1Tables]
-	inGuest    atomic.Bool
+	curPT   atomic.Pointer[stage1Tables]
+	inGuest atomic.Bool
+	// exits counts the returns of hv_vcpu_run. memoryBarrier waits on it.
+	exits      atomic.Uint64
 	enterTLB   atomic.Uint64
 	cancelErr  atomic.Pointer[error]
 	destroyed  atomic.Bool
@@ -168,6 +170,19 @@ func (w *vcpuWorker) quiesce(pt *stage1Tables, target uint64) {
 		if !cancelled || i&0x3ff == 0 {
 			w.cancel()
 			cancelled = true
+		}
+		runtime.Gosched()
+	}
+}
+
+// awaitExit returns when the vCPU leaves the guest. The caller read exits
+// while the vCPU ran guest code. awaitExit sends the cancel again at
+// intervals, because a cancel that arrives between two entries ends only the
+// next run.
+func (w *vcpuWorker) awaitExit(exits uint64) {
+	for i := 1; w.inGuest.Load() && w.exits.Load() == exits; i++ {
+		if i&0x3ff == 0 {
+			w.cancel()
 		}
 		runtime.Gosched()
 	}
@@ -283,6 +298,9 @@ type workerPool struct {
 	max int
 	// slots[i] is the worker with CommPage i. Readers need no lock.
 	slots [kernelCommPages]atomic.Pointer[vcpuWorker]
+
+	// fence is the target of the full barrier that memoryBarrier runs first.
+	fence atomic.Uint64
 
 	mu        sync.Mutex
 	stopping  bool
@@ -464,6 +482,49 @@ func (p *workerPool) quiesce(pt *stage1Tables) {
 			w.quiesce(pt, target)
 		}
 	}
+}
+
+// memoryBarrier returns after every vCPU that runs guest code has left the
+// guest at least once. A vCPU outside the guest needs no kick: its next entry
+// comes after the call began.
+//
+// WHY: Hypervisor.framework documents no memory ordering for hv_vcpus_exit, so
+// the ordering comes from the atomics around hv_vcpu_run. A vCPU that exits
+// runs exits.Add after hv_vcpu_run returned, and the program order of that
+// thread covers its guest accesses. A vCPU that enters runs inGuest.Swap before
+// hv_vcpu_run, and a read-modify-write with acquire and release ordering keeps
+// the guest accesses after it. The caller runs a full barrier before it reads
+// any vCPU state. Per vCPU, either the caller reads inGuest as false before the
+// entry swap, so the entry orders the guest after the call began, or it reads
+// true and waits for an exit that follows its barrier.
+func (p *workerPool) memoryBarrier() {
+	p.fence.Add(1)
+	type pending struct {
+		w     *vcpuWorker
+		exits uint64
+	}
+	var buf [kernelCommPages]pending
+	waits := buf[:0]
+	for i := range p.slots[:p.max] {
+		w := p.slots[i].Load()
+		if w == nil {
+			continue
+		}
+		exits := w.exits.Load()
+		if !w.inGuest.Load() {
+			continue
+		}
+		w.cancel()
+		waits = append(waits, pending{w, exits})
+	}
+	for _, c := range waits {
+		c.w.awaitExit(c.exits)
+	}
+}
+
+// memoryBarrier implements Platform.GlobalMemoryBarrier.
+func (v *vmState) memoryBarrier() {
+	v.pool.memoryBarrier()
 }
 
 // quiesce implements the Unmap guarantee: after it returns, no vCPU

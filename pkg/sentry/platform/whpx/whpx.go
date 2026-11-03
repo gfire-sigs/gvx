@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -81,7 +82,6 @@ var errClosed = errors.New("whpx: platform is closed")
 type Platform struct {
 	platform.NoCPUPreemptionDetection
 	platform.NoCPUNumbers
-	platform.UseHostProcessMemoryBarrier
 
 	be      backend
 	opts    Options
@@ -331,6 +331,37 @@ func (p *Platform) anyBusy(vps []*vcpu) bool {
 // The Sentry reads and writes guest memory through the host mappings of the
 // memory file, so the address space has no copy methods.
 func (*Platform) SupportsAddressSpaceIO() bool { return false }
+
+// HaveGlobalMemoryBarrier implements platform.Platform.HaveGlobalMemoryBarrier.
+func (*Platform) HaveGlobalMemoryBarrier() bool { return true }
+
+// GlobalMemoryBarrier implements platform.Platform.GlobalMemoryBarrier. It
+// cancels every processor that runs guest code and waits until each one left
+// its Switch call. A processor outside Switch needs no kick, because its next
+// enter comes after the call began. Threads of the Sentry also pass a barrier,
+// because they access guest memory for system calls in progress.
+//
+// WHY: WHvCancelRunVirtualProcessor makes a running processor exit to the host
+// and the documentation promises no memory ordering for it. The order comes from
+// runMu. leave and enter lock and unlock it, and each of those is a full barrier
+// on the thread that runs the processor. kickAndWait reads inGuest under the
+// same mutex, so either it sees the processor outside the guest and the later
+// enter follows the call, or it waits for a leave that follows the call. The
+// wait is longer than a barrier needs, because a cancel in user mode ends
+// Switch with ErrContextInterrupt and the kernel runs the task again.
+func (p *Platform) GlobalMemoryBarrier() error {
+	p.be.flushProcessWriteBuffers()
+	p.mu.Lock()
+	vps := slices.Clone(p.vps)
+	p.mu.Unlock()
+	for _, v := range vps {
+		v.kickRunning()
+	}
+	for _, v := range vps {
+		v.kickAndWait()
+	}
+	return nil
+}
 
 // MapUnit implements platform.Platform.MapUnit. One fault maps up to 2 MiB.
 // MapFile registers host memory in the partition once. It writes one run of

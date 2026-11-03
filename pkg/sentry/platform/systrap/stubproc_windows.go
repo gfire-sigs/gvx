@@ -352,6 +352,10 @@ func (sp *stubProc) newGuestThread() (*thread, error) {
 		return nil, err
 	}
 	th := newThread(sp, h, tid)
+	// th.mu covers the bring-up, so GlobalMemoryBarrier never sees the thread
+	// before parked is set. The pump, waitEvent, and dbg.reply take no th.mu.
+	th.mu.Lock()
+	defer th.mu.Unlock()
 	sp.mu.Lock()
 	if sp.closed {
 		sp.mu.Unlock()

@@ -66,6 +66,8 @@ func (*vmState) releaseMemory(*regionUser) {}
 
 func (*vmState) quiesce(*stage1Tables) {}
 
+func (*vmState) memoryBarrier() {}
+
 func (*vmState) retire(pt *stage1Tables) {
 	pt.markDead()
 	pt.release()

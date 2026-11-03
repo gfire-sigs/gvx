@@ -57,6 +57,7 @@ const (
 	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
 	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
+	membarrierPackage  = "z.gfire.dev/gvx/internal/acceptprog/membarrierprobe"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -225,6 +226,14 @@ func BuildCompatProbeAt(tb testing.TB, goarch string, textAddr uint64) string {
 func BuildMicroBench(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, microBenchPackage, "microbench", goarch, 0)
+}
+
+// BuildMembarrierProbe compiles the guest membarrierprobe, which runs the
+// membarrier(2) commands from several threads, for the Linux architecture
+// goarch and returns the path of the static ET_EXEC executable.
+func BuildMembarrierProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, membarrierPackage, "membarrierprobe", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel

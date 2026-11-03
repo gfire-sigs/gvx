@@ -66,6 +66,11 @@ type backend interface {
 	// arrives while the processor is not running ends the next run.
 	cancel(index uint32) error
 
+	// flushProcessWriteBuffers makes every thread of the Sentry process pass a
+	// memory barrier. The threads that run Sentry code need it, because they
+	// access guest memory for system calls in progress.
+	flushProcessWriteBuffers()
+
 	getRegs(index uint32, b *regBatch) error
 	setRegs(index uint32, b *regBatch) error
 
