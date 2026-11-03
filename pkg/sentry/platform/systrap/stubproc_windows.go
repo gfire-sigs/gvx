@@ -51,6 +51,27 @@ const (
 	lowBase  = uint64(0x10000)
 	lowLimit = uint64(0x7FFE0000)
 
+	// midBase and midLimit bound the middle guest window. HotSpot on arm64
+	// places the compressed class space and the CDS archive at a multiple of
+	// 4 GiB below 32 GiB or at a multiple of 32 GiB below 1 TiB, and it exits
+	// when the guest refuses all 38 places. The window holds 8 of the places
+	// and the area where HotSpot puts a zero-based heap, below 32 GiB.
+	//
+	// The kernel creates two private regions in every stub before the Sentry
+	// can reserve anything: one of 1 MiB and one of 2 MiB. It places them at a
+	// random address between 4 GiB and 1 TiB. A window in that range therefore
+	// meets them with a probability of about its size divided by 1 TiB. The
+	// Sentry throws such a stub away and starts a new one. Nothing else lies
+	// between 4 GiB and 1 TiB in a new stub (docs/systrap-windows.md,
+	// section 3.10).
+	midBase  = uint64(4) << 30
+	midLimit = uint64(64) << 30
+
+	// windowAttempts is the number of stubs that one request tries before it
+	// reports that a window is taken. The middle window is taken in 6% to 8% of
+	// the stubs, so twelve attempts fail in fewer than one request in 10^10.
+	windowAttempts = 12
+
 	// codeSize is the size of the executable part of the engine pages. The
 	// data pages follow it.
 	codeSize = winCodeSize
@@ -65,6 +86,33 @@ var (
 	errWindowTaken  = errors.New("the guest window is not free in the new stub process")
 	errStubReleased = errors.New("the stub process is released")
 )
+
+const (
+	windowLow  = "low"
+	windowMid  = "middle"
+	windowHigh = "high"
+)
+
+// windowTakenError reports the window that the loader or the kernel already
+// used in a new stub. It matches errWindowTaken.
+type windowTakenError struct {
+	window string
+	err    error
+}
+
+func (e *windowTakenError) Error() string {
+	return fmt.Sprintf("%v: %s window: %v", errWindowTaken, e.window, e.err)
+}
+
+func (e *windowTakenError) Unwrap() []error { return []error{errWindowTaken, e.err} }
+
+// optionalWindows are the guest windows that a host can refuse, in ascending
+// order. The platform drops a window that is taken in every attempt. The high
+// window is not optional.
+var optionalWindows = []guestRange{
+	{windowLow, lowBase, lowLimit},
+	{windowMid, midBase, midLimit},
+}
 
 // stubProc is one stub process. A stub holds the guest address space of one
 // Linux process and one thread for each guest thread.
@@ -135,6 +183,7 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	if err != nil {
 		return nil, err
 	}
+	bringUpStats.attempts.Add(1)
 	bringUpStats.hostNs.Add(uint64(time.Since(t0)))
 	sp := &stubProc{
 		p: p, pid: sh.pid, proc: sh.proc, main: sh.thread, level: sh.level,
@@ -152,12 +201,13 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	sp.threads[sh.tid] = th0
 	p.dbg.register(sp)
 	t1 := time.Now()
-	if err := virtualAllocPlaceholder(sp.proc, uintptr(winBase), uintptr(winLimit-winBase)); err != nil {
-		return fail(fmt.Errorf("%w: %v", errWindowTaken, err))
-	}
-	if p.lowWindow {
-		if err := virtualAllocPlaceholder(sp.proc, uintptr(lowBase), uintptr(lowLimit-lowBase)); err != nil {
-			return fail(fmt.Errorf("%w: low window: %v", errWindowTaken, err))
+	// The layout is in ascending order, so the middle window, which can meet
+	// the stack of the stub, is reserved before the large high window.
+	for _, w := range p.layout {
+		if err := virtualAllocPlaceholder(sp.proc, uintptr(w.base), uintptr(w.limit-w.base)); err != nil {
+			bringUpStats.windowNs.Add(uint64(time.Since(t1)))
+			bringUpStats.discarded.Add(1)
+			return fail(&windowTakenError{window: w.name, err: err})
 		}
 	}
 	bringUpStats.windowNs.Add(uint64(time.Since(t1)))
@@ -285,11 +335,12 @@ func (p *Platform) newStubProc() (*stubProc, error) {
 	return p.newStubProcFresh()
 }
 
-// newStubProcFresh creates a stub. The reservation of the guest window can fail
-// when the loader placed something there, so the call retries with a new stub.
+// newStubProcFresh creates a stub. The reservation of a guest window can fail
+// when the kernel or the loader placed something there, so the call retries
+// with a new stub.
 func (p *Platform) newStubProcFresh() (*stubProc, error) {
 	var err error
-	for attempt := 0; attempt < 4; attempt++ {
+	for range windowAttempts {
 		var sp *stubProc
 		if sp, err = p.bringUpStub(); err == nil {
 			return sp, nil

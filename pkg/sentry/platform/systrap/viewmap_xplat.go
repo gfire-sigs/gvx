@@ -368,10 +368,11 @@ func (w *windowMap) Lookup(addr uint64) (viewInfo, uint64, bool) {
 	return viewInfo{e.view.backing, e.view.off + (addr - e.addr), e.view.prot}, e.addr, true
 }
 
-// guestWindows holds the window maps of one stub, which do not overlap. A stub
-// has one window, or two when the platform also reserves the low window. The
-// host owns the range between two windows, and the memory manager never maps
-// there. The memory manager does unmap ranges that cross the gap.
+// guestWindows holds the window maps of one stub, which do not overlap, in
+// ascending order. A stub has one window, or more when the platform also
+// reserves a low or a middle window. The host owns the ranges between the
+// windows, and the memory manager never maps there. The memory manager does
+// unmap ranges that cross a gap.
 type guestWindows struct {
 	maps []*windowMap
 	// gen counts the calls that changed a view. A reader without the lock of

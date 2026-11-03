@@ -348,3 +348,74 @@ func TestWindowMapUnmapCoalescesAdjacentPlaceholders(t *testing.T) {
 		t.Errorf("after Unmap extents = %d, host regions = %d, want 1", len(w.ext), len(host.regions))
 	}
 }
+
+const (
+	midTestBase  = uint64(0x1_0000_0000)
+	midTestLimit = midTestBase + 32*0x1000
+)
+
+// TestGuestWindowsRouteThreeWindows checks a stub with a low, a middle, and a
+// high window. Each call goes to the window that owns the address, a call in
+// either gap fails, and an unmap across both gaps clears all three windows.
+func TestGuestWindowsRouteThreeWindows(t *testing.T) {
+	hosts := []*fakeHost{
+		newFakeHost(lowTestBase, lowTestLimit),
+		newFakeHost(midTestBase, midTestLimit),
+		newFakeHost(testBase, testLimit),
+	}
+	g := newGuestWindows(
+		newWindowMap(hosts[0], lowTestBase, lowTestLimit),
+		newWindowMap(hosts[1], midTestBase, midTestLimit),
+		newWindowMap(hosts[2], testBase, testLimit),
+	)
+	maps := []struct {
+		name string
+		addr uint64
+	}{{"low", lowTestBase}, {"mid", midTestBase + 0x1000}, {"high", testBase + 0x2000}}
+	for _, m := range maps {
+		if err := g.Map(m.addr, 0x2000, m.name, 0, viewReadWrite); err != nil {
+			t.Fatalf("map in the %s window: %v", m.name, err)
+		}
+	}
+	for i, m := range maps {
+		if v, start, ok := g.Lookup(m.addr + 0x1000); !ok || v.backing != m.name || start != m.addr {
+			t.Errorf("Lookup in the %s window = (%v, %#x, %v), want the view that starts at %#x", m.name, v.backing, start, ok, m.addr)
+		}
+		for j, h := range hosts {
+			if _, ok := h.pageState(m.addr); ok != (i == j) {
+				t.Errorf("host %d has a view at the %s address: %v", j, m.name, ok)
+			}
+		}
+	}
+
+	for _, gap := range []struct {
+		name string
+		addr uint64
+	}{
+		{"between low and middle", lowTestLimit + 0x1000},
+		{"just below the middle window", midTestBase - 0x1000},
+		{"between middle and high", midTestLimit},
+	} {
+		if err := g.Map(gap.addr, 0x1000, "gap", 0, viewRead); err == nil {
+			t.Errorf("a mapping %s succeeded", gap.name)
+		}
+		if _, _, ok := g.Lookup(gap.addr); ok {
+			t.Errorf("Lookup %s found a view", gap.name)
+		}
+	}
+	if err := g.Map(midTestLimit-0x1000, 0x2000, "span", 0, viewRead); err == nil {
+		t.Error("a mapping that runs past the end of the middle window succeeded")
+	}
+
+	if err := g.Unmap(lowTestBase, testLimit-lowTestBase); err != nil {
+		t.Fatalf("unmap across both gaps: %v", err)
+	}
+	for i, m := range maps {
+		if _, ok := hosts[i].pageState(m.addr); ok {
+			t.Errorf("the %s view survived an unmap that covers it", m.name)
+		}
+		if len(hosts[i].regions) != 1 {
+			t.Errorf("the %s host has %d regions after the full unmap, want 1", m.name, len(hosts[i].regions))
+		}
+	}
+}

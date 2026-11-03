@@ -23,6 +23,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,10 +79,12 @@ type Platform struct {
 	// userMin and userMax bound the guest address range.
 	userMin, userMax uint64
 
-	// lowWindow tells whether every stub also reserves the low guest window.
-	// New decides it once, because the guest range of the platform must not
-	// change while guests run.
-	lowWindow bool
+	// layout lists the guest windows that every stub reserves. New decides it
+	// once, because the guest range of the platform must not change while
+	// guests run.
+	layout windowLayout
+	// holes are the gaps between the windows of layout.
+	holes []hostarch.AddrRange
 
 	// fast tells whether the platform runs system calls through the fast path.
 	// New decides it once, before the first address space.
@@ -181,9 +184,9 @@ func open(fast bool) (*Platform, error) {
 		host:      host,
 		dbg:       dbg,
 		breakAddr: breakAddr,
-		userMin:   winBase,
 		userMax:   internalBase,
 	}
+	p.setLayout(nil)
 	if fast {
 		if err := p.prepareFast(); err != nil {
 			dbg.close()
@@ -192,7 +195,7 @@ func open(fast bool) (*Platform, error) {
 		}
 	}
 	tLow := time.Now()
-	first := p.selectLowWindow()
+	first := p.selectWindows(optionalWindows)
 	tPool := time.Now()
 	p.startPool()
 	if first != nil {
@@ -220,34 +223,49 @@ func open(fast bool) (*Platform, error) {
 	return p, nil
 }
 
-// selectLowWindow decides whether the stubs of the platform reserve the low
-// guest window. It brings up one stub with both windows. If that works, the
-// platform keeps the low window, and the stub goes to the pool. If it fails,
-// the host places something in the low range. The platform then keeps only the
-// high window, and the first guest reports the cause of a failure that is not
-// about the window.
-func (p *Platform) selectLowWindow() *stubProc {
-	p.lowWindow, p.userMin = true, lowBase
-	sp, err := p.newStubProcFresh()
-	if err == nil {
-		return sp
-	}
-	if traceEvents {
-		tracef("systrap: no low guest window: %v", err)
-	}
-	p.lowWindow, p.userMin = false, winBase
-	return nil
+// setLayout sets the windows of the stubs to the optional windows and the high
+// window, and sets the lowest guest address.
+func (p *Platform) setLayout(optional []guestRange) {
+	p.layout = append(slices.Clone(optional), guestRange{windowHigh, winBase, winLimit})
+	p.userMin = p.layout.min()
+	p.holes = p.layout.holes()
 }
 
-// UserAddressHoles implements platform.AddressHolePlatform.UserAddressHoles. The
-// range between the low window and the high window belongs to the stub
-// process.
-func (p *Platform) UserAddressHoles() []hostarch.AddrRange {
-	if !p.lowWindow {
+// selectWindows decides which of the optional guest windows the stubs of the
+// platform reserve. It brings up one stub with all of them. If a window is
+// taken in every attempt, the host places something there. The platform then
+// drops that window and tries again. If a stub fails for another reason, the
+// platform keeps only the high window, and the first guest reports the cause.
+// The stub that works goes to the pool.
+func (p *Platform) selectWindows(optional []guestRange) *stubProc {
+	optional = slices.Clone(optional)
+	for {
+		p.setLayout(optional)
+		sp, err := p.newStubProcFresh()
+		if err == nil {
+			return sp
+		}
+		var taken *windowTakenError
+		if errors.As(err, &taken) {
+			if i := slices.IndexFunc(optional, func(w guestRange) bool { return w.name == taken.window }); i >= 0 {
+				if traceEvents {
+					tracef("systrap: no %s guest window: %v", taken.window, err)
+				}
+				optional = slices.Delete(optional, i, i+1)
+				continue
+			}
+		}
+		if traceEvents {
+			tracef("systrap: no optional guest windows: %v", err)
+		}
+		p.setLayout(nil)
 		return nil
 	}
-	return []hostarch.AddrRange{{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(winBase)}}
 }
+
+// UserAddressHoles implements platform.AddressHolePlatform.UserAddressHoles.
+// The ranges between the windows belong to the stub process.
+func (p *Platform) UserAddressHoles() []hostarch.AddrRange { return p.holes }
 
 // Close terminates every stub process and frees the Sentry-side memory. It is
 // idempotent. No AddressSpace of this Platform may be used afterwards.

@@ -114,18 +114,23 @@ var stopStats struct {
 // bringUpStats adds up the time of each phase of a stub bring-up, in
 // nanoseconds, for the watch trace.
 var bringUpStats struct {
-	stubs                                         atomic.Uint64
+	// attempts counts the stubs that the host created, stubs counts the ready
+	// stubs, and discarded counts the stubs that a taken window sent back.
+	// hostNs and windowNs add up over every attempt, and the other times over
+	// the ready stubs.
+	attempts, stubs, discarded                    atomic.Uint64
 	hostNs, windowNs, loaderNs, pagesNs, threadNs atomic.Uint64
 }
 
 func bringUpLine() string {
-	n := bringUpStats.stubs.Load()
-	if n == 0 {
+	n, attempts := bringUpStats.stubs.Load(), bringUpStats.attempts.Load()
+	if n == 0 || attempts == 0 {
 		return "no stub"
 	}
-	avg := func(a *atomic.Uint64) float64 { return float64(a.Load()) / float64(n) / 1e6 }
-	return fmt.Sprintf("%d stubs, ms for each: host %.1f, window %.1f, loader %.1f, engine pages %.1f, first thread %.1f",
-		n, avg(&bringUpStats.hostNs), avg(&bringUpStats.windowNs), avg(&bringUpStats.loaderNs), avg(&bringUpStats.pagesNs), avg(&bringUpStats.threadNs))
+	avg := func(a *atomic.Uint64, count uint64) float64 { return float64(a.Load()) / float64(count) / 1e6 }
+	return fmt.Sprintf("%d stubs from %d attempts (%d discarded), ms for each attempt: host %.1f, window %.1f; ms for each stub: loader %.1f, engine pages %.1f, first thread %.1f",
+		n, attempts, bringUpStats.discarded.Load(), avg(&bringUpStats.hostNs, attempts), avg(&bringUpStats.windowNs, attempts),
+		avg(&bringUpStats.loaderNs, n), avg(&bringUpStats.pagesNs, n), avg(&bringUpStats.threadNs, n))
 }
 
 func kindOf(ev debugEvent) stopKind {

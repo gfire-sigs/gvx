@@ -188,9 +188,7 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 	if va < p.userMin || va+blockSize > p.userMax {
 		return false
 	}
-	inLow := p.lowWindow && va >= lowBase && va+blockSize <= lowLimit
-	inHigh := va >= winBase
-	return inLow || inHigh
+	return p.layout.contains(va, blockSize)
 }
 
 // installSlot allocates a slot of rec.size bytes within reach of rec.site, lets
