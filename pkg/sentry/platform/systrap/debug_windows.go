@@ -18,8 +18,10 @@ package systrap
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -283,6 +285,13 @@ func (d *debugger) unregister(pid uint32) {
 	d.mu.Lock()
 	delete(d.procs, pid)
 	d.mu.Unlock()
+}
+
+// stubs returns the stub processes that the debugger knows.
+func (d *debugger) stubs() []*stubProc {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Collect(maps.Values(d.procs))
 }
 
 func (d *debugger) lookup(pid uint32) *stubProc {
