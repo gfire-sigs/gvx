@@ -88,6 +88,18 @@ func (s *singleHost) readDir(rel string) ([]hostDirEntry, error) {
 	return s.hostBackend.readDir(rel)
 }
 
+// readDirAt lists nothing: the pinned directory is the parent of the file, and
+// the mount shows no sibling.
+func (s *singleHost) readDirAt(hostDirHandle) ([]hostDirEntry, error) {
+	return nil, nil
+}
+
+// syncDirAt does nothing, because the parent directory is not part of the
+// mount.
+func (s *singleHost) syncDirAt(hostDirHandle) error {
+	return nil
+}
+
 // syncDir does nothing for ".", because the parent directory is not part of
 // the mount.
 func (s *singleHost) syncDir(rel string) error {

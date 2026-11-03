@@ -57,9 +57,10 @@ type benchCase struct {
 	op    func(e *env, i int)
 }
 
-// benchCases returns the operations that the guest workloads repeat most.
-func benchCases() []benchCase {
-	deep := benchDir(benchDepth)
+// benchCases returns the operations that the guest workloads repeat most, on
+// paths that have depth directory components.
+func benchCases(depth int) []benchCase {
+	deep := benchDir(depth)
 	file := deep + "/f"
 	payload := make([]byte, 100)
 	return []benchCase{
@@ -194,7 +195,7 @@ func TestHostfsBench(t *testing.T) {
 	if os.Getenv("HOSTFS_BENCH") == "" {
 		t.Skip("set HOSTFS_BENCH=1 to run the hostfs benchmarks")
 	}
-	for _, c := range benchCases() {
+	for _, c := range benchCases(benchDepth) {
 		// A counting env measures the host calls of one operation after a
 		// warm-up run, so the counts match what a steady workload pays.
 		ce, ch, _ := newCountEnv(t)

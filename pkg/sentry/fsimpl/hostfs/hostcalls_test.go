@@ -21,14 +21,14 @@ import "testing"
 // system call for each path component, and a pinned call counts one. See
 // countingHost.syscalls.
 var syscallBudget = map[string]int{
-	"create small file at depth 5":    15,
+	"create small file at depth 5":    5,
 	"stat warm at depth 5":            0,
 	"readdir and stat of 100 entries": 101,
-	"rename at depth 5":               34,
-	"chmod at depth 5":                7,
-	"utimens at depth 5":              13,
-	"hard link at depth 5":            33,
-	"symlink at depth 5":              13,
+	"rename at depth 5":               8,
+	"chmod at depth 5":                2,
+	"utimens at depth 5":              3,
+	"hard link at depth 5":            7,
+	"symlink at depth 5":              3,
 	"append 4 KiB and fsync":          5,
 }
 
@@ -36,7 +36,7 @@ var syscallBudget = map[string]int{
 // operation that a guest repeats. A change that adds a host call or a path
 // walk to one of these operations fails here.
 func TestOperationsStayWithinHostCallBudget(t *testing.T) {
-	for _, c := range benchCases() {
+	for _, c := range benchCases(benchDepth) {
 		budget, ok := syscallBudget[c.name]
 		if !ok {
 			continue
@@ -50,6 +50,47 @@ func TestOperationsStayWithinHostCallBudget(t *testing.T) {
 			c.op(e, 1)
 			if got := ch.syscalls(); got > budget {
 				t.Fatalf("%s made about %d host system calls %s, want at most %d", c.name, got, ch.dump(), budget)
+			}
+		})
+	}
+}
+
+// syscallsOf returns the host system calls of the second run of the benchCase
+// operation name at the given depth.
+func syscallsOf(t *testing.T, name string, depth int) int {
+	t.Helper()
+	for _, c := range benchCases(depth) {
+		if c.name != name {
+			continue
+		}
+		e, ch, _ := newCountEnv(t)
+		c.setup(e)
+		c.op(e, 0)
+		ch.reset()
+		c.op(e, 1)
+		return ch.syscalls()
+	}
+	t.Fatalf("no benchmark case named %q", name)
+	return 0
+}
+
+// TestMutationCostDoesNotGrowWithDepth proves that a mutation resolves its
+// directory through a pinned handle: a path that is seven levels deeper adds no
+// host system call.
+func TestMutationCostDoesNotGrowWithDepth(t *testing.T) {
+	for _, name := range []string{
+		"create small file at depth 5",
+		"rename at depth 5",
+		"chmod at depth 5",
+		"utimens at depth 5",
+		"hard link at depth 5",
+		"symlink at depth 5",
+		"stat warm at depth 5",
+	} {
+		t.Run(name, func(t *testing.T) {
+			shallow, deep := syscallsOf(t, name, 2), syscallsOf(t, name, 9)
+			if deep > shallow {
+				t.Fatalf("%s made %d host system calls at depth 9 and %d at depth 2, want no growth", name, deep, shallow)
 			}
 		})
 	}

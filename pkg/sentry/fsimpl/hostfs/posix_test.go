@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"sync"
@@ -477,14 +478,20 @@ func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
 	if err := os.Symlink(outside, e.host("d")); err != nil {
 		t.Skipf("host cannot create symbolic links: %v", err)
 	}
-	if _, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); !errors.Is(err, ErrPathTraversal) {
-		t.Fatalf("OpenFile through swapped directory = %v, want ErrPathTraversal", err)
+	// The guest opened d before the swap, so a lookup within cacheTTL may still
+	// reach the directory that the guest saw: the pinned handle names that
+	// object, not the path. It must never reach the outside file.
+	// TestHostSwapOfPinnedDirectoryIsNoticedAfterTheCacheLifetime covers the
+	// refusal after the cache expires.
+	if f, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); err == nil {
+		raw, rerr := io.ReadAll(f)
+		_ = f.Close()
+		if rerr != nil || string(raw) != "inside" {
+			t.Fatalf("OpenFile through swapped directory read (%q, %v), want the content inside the workspace", raw, rerr)
+		}
+	} else if !errors.Is(err, ErrPathTraversal) {
+		t.Fatalf("OpenFile through swapped directory = %v, want ErrPathTraversal or the pinned directory", err)
 	}
-	// A lookup stays valid for cacheTTL, and the guest opened d before the swap,
-	// so the open may still reach the directory that the guest saw: the pinned
-	// handle names that object, not the path. It must never reach the outside
-	// file. TestHostSwapOfPinnedDirectoryIsNoticedAfterTheCacheLifetime covers
-	// the refusal after the cache expires.
 	fd, err := e.open("d/f", linux.O_RDONLY, 0)
 	if err != nil {
 		wantErrno(t, "vfs open through swapped directory", err, linuxerr.EACCES)

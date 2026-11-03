@@ -689,11 +689,16 @@ func (w *Workspace) snapshotDir(parent string, pin *dirPin, forceRead bool) (*di
 		}
 		w.nameMu.Unlock()
 	}
-	hostDir, err := w.hostPath(parent)
-	if err != nil {
-		return nil, false, err
+	var entries []hostDirEntry
+	if pin != nil {
+		entries, err = w.host.readDirAt(pin.h)
+	} else {
+		var hostDir string
+		if hostDir, err = w.hostPath(parent); err != nil {
+			return nil, false, err
+		}
+		entries, err = w.host.readDir(hostDir)
 	}
-	entries, err := w.host.readDir(hostDir)
 	if err != nil {
 		return nil, false, err
 	}
@@ -860,9 +865,9 @@ func (w *Workspace) touchDirLocked(dir string, now int64) {
 	}
 }
 
-// lookupLocked resolves rel to its effective state without following links.
-// It walks the path from the workspace root on every call, so the result
-// never depends on a pinned handle. Callers hold w.mu.
+// lookupLocked resolves rel to its effective state without following links. It
+// reads the entry through the pinned handle of its directory. Callers hold
+// w.mu.
 func (w *Workspace) lookupLocked(rel string) (entry, error) {
 	e, _, err := w.lookupProbeLocked(rel)
 	return e, err
@@ -878,18 +883,12 @@ func (w *Workspace) lookupProbeLocked(rel string) (entry, hostProbe, error) {
 		return entry{}, hostProbe{}, fs.ErrNotExist
 	}
 	if m, ok := w.meta[rel]; ok && m.Symlink != "" {
-		parent, _ := splitParent(rel)
-		hostDir, err := w.hostPath(parent)
+		// An open pin proves that the parent is a directory.
+		pin, err := w.parentPinLocked(rel)
 		if err != nil {
 			return entry{}, hostProbe{}, err
 		}
-		pinfo, err := w.host.lstat(hostDir)
-		if err != nil {
-			return entry{}, hostProbe{}, err
-		}
-		if pinfo.kind != hostKindDir {
-			return entry{}, hostProbe{}, errNotDir
-		}
+		w.releasePin(pin)
 		return virtualEntry(m), hostProbe{}, nil
 	}
 	if rel == "." {
@@ -989,20 +988,14 @@ func (w *Workspace) checkWritableLocked(rels ...string) error {
 	return nil
 }
 
-// checkParentDirLocked verifies that the parent of rel is a host directory.
+// checkParentDirLocked verifies that the parent of rel is a host directory. It
+// opens or finds the pinned handle of that directory.
 func (w *Workspace) checkParentDirLocked(rel string) error {
-	parent, _ := splitParent(rel)
-	hostDir, err := w.hostPath(parent)
+	pin, err := w.parentPinLocked(rel)
 	if err != nil {
 		return err
 	}
-	pinfo, err := w.host.lstat(hostDir)
-	if err != nil {
-		return err
-	}
-	if pinfo.kind != hostKindDir {
-		return errNotDir
-	}
+	w.releasePin(pin)
 	return nil
 }
 
@@ -1026,10 +1019,16 @@ func (w *Workspace) createTargetLocked(rel string) (hostRel, leaf string, err er
 		if err != nil {
 			return "", "", err
 		}
-		if err := w.host.unlink(hostRel); err != nil && !isNotExist(err) {
+		leaf = leafOf(hostRel)
+		pin, err := w.parentPinLocked(rel)
+		if err != nil {
 			return "", "", err
 		}
-		return hostRel, leafOf(hostRel), nil
+		defer w.releasePin(pin)
+		if err := w.host.unlinkAt(pin.h, leaf); err != nil && !isNotExist(err) {
+			return "", "", err
+		}
+		return hostRel, leaf, nil
 	}
 	if p.collided && !w.stateful {
 		// The host holds the name under another case, and hostfs cannot tell
@@ -1092,14 +1091,7 @@ func (w *Workspace) openRegularLocked(rel string, flags int) (*os.File, entry, e
 	if e.isDir() {
 		return nil, entry{}, errIsDir
 	}
-	if e.isSymlink() {
-		return nil, entry{}, ErrPathTraversal
-	}
-	hostRel, err := w.hostPath(rel)
-	if err != nil {
-		return nil, entry{}, err
-	}
-	f, err := w.host.open(hostRel, flags&^(os.O_CREATE|os.O_EXCL), 0)
+	f, err := w.openRegularWithAttrLocked(rel, e, flags)
 	if err != nil {
 		return nil, entry{}, err
 	}
@@ -1126,18 +1118,23 @@ func (w *Workspace) createFileLocked(rel string, perm, uid, gid uint32) (*os.Fil
 	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return nil, entry{}, err
 	}
-	hostRel, leaf, err := w.createTargetLocked(rel)
+	_, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return nil, entry{}, err
 	}
-	f, err := w.host.open(hostRel, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return nil, entry{}, err
+	}
+	defer w.releasePin(pin)
+	f, err := w.host.openChildAt(pin.h, leaf, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, entry{}, err
 	}
 	info, err := w.host.fstat(f)
 	if err != nil {
 		_ = f.Close()
-		_ = w.host.unlink(hostRel)
+		_ = w.host.unlinkAt(pin.h, leaf)
 		return nil, entry{}, err
 	}
 	attr := POSIXAttr{Mode: linux.S_IFREG | perm&0o7777, UID: uid, GID: gid}
@@ -1238,11 +1235,16 @@ func (w *Workspace) mkdir(rel string, mode, uid, gid uint32) error {
 	if err := w.checkMetaRoomLocked(rel); err != nil {
 		return err
 	}
-	hostRel, leaf, err := w.createTargetLocked(rel)
+	_, leaf, err := w.createTargetLocked(rel)
 	if err != nil {
 		return err
 	}
-	if err := w.host.mkdir(hostRel); err != nil {
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(pin)
+	if err := w.host.mkdirAt(pin.h, leaf); err != nil {
 		return err
 	}
 	w.meta[rel] = POSIXAttr{Mode: linux.S_IFDIR | mode&0o7777, UID: uid, GID: gid}
@@ -1584,7 +1586,7 @@ func (w *Workspace) renameLocked(oldRel, newRel string) error {
 		if src.isDir() {
 			quiesced = w.handles.quiesce(oldRel)
 		}
-		if err := w.host.rename(srcPath, dstPath); err != nil {
+		if err := w.renameHostLocked(oldRel, newRel, leafOf(srcPath), dstLeaf); err != nil {
 			_ = quiesced.finish(false, "")
 			return err
 		}
@@ -1668,18 +1670,21 @@ func (w *Workspace) link(oldRel, newRel string) error {
 	if err := w.checkParentDirLocked(newRel); err != nil {
 		return err
 	}
-	srcPath, err := w.hostPath(oldRel)
+	oldParent, oldName := splitParent(oldRel)
+	srcLeaf, err := w.hostLeaf(oldParent, oldName)
 	if err != nil {
 		return err
 	}
 	if err := w.checkMetaRoomLocked(newRel); err != nil {
 		return err
 	}
-	dstPath, leaf, err := w.createTargetLocked(newRel)
+	_, leaf, err := w.createTargetLocked(newRel)
 	if err != nil {
 		return err
 	}
-	if err := w.host.link(srcPath, dstPath); err != nil {
+	if err := w.pinnedPairLocked(oldRel, newRel, func(oldDir, newDir hostDirHandle) error {
+		return w.host.linkAt(oldDir, srcLeaf, newDir, leaf)
+	}); err != nil {
 		return err
 	}
 	w.meta[newRel] = src.attr
@@ -1725,17 +1730,17 @@ func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
 		return false, errIsDir
 	}
 	if !e.virtual {
-		hostRel, err := w.hostPath(rel)
+		parent, name := splitParent(rel)
+		leaf, err := w.hostLeaf(parent, name)
 		if err != nil {
 			return false, err
 		}
-		if err := w.host.unlink(hostRel); err != nil {
+		if err := w.unlinkHostLocked(rel, leaf, false); err != nil {
 			return false, err
 		}
 		last = e.info.nlink <= 1
 		w.handles.detach(rel)
-		parent, name := splitParent(rel)
-		w.removeDirNameLocked(parent, name, leafOf(hostRel))
+		w.removeDirNameLocked(parent, name, leaf)
 		w.dropAlt(parent, name)
 	} else {
 		parent, _ := splitParent(rel)
@@ -1780,7 +1785,7 @@ func (w *Workspace) rmdir(rel string) error {
 	}
 	// Windows refuses to remove a directory that has an open handle.
 	w.closeSubtreeHandlesLocked(rel)
-	if err := w.host.rmdir(hostRel); err != nil {
+	if err := w.unlinkHostLocked(rel, leafOf(hostRel), true); err != nil {
 		return err
 	}
 	delete(w.meta, rel)
@@ -1818,11 +1823,12 @@ func (w *Workspace) syncDir(rel string) error {
 	if w.closed {
 		return os.ErrClosed
 	}
-	hostRel, err := w.hostPath(rel)
+	pin, err := w.acquirePinHeld(rel)
 	if err != nil {
 		return err
 	}
-	return w.host.syncDir(hostRel)
+	defer w.releasePin(pin)
+	return w.host.syncDirAt(pin.h)
 }
 
 // chtimes sets host timestamps of a host file, or the recorded timestamps of
@@ -1850,11 +1856,7 @@ func (w *Workspace) chtimes(rel string, atime, mtime *time.Time) error {
 		w.markDirtyLocked()
 		return nil
 	}
-	hostRel, err := w.hostPath(rel)
-	if err != nil {
-		return err
-	}
-	if err := w.host.chtimes(hostRel, atime, mtime); err != nil {
+	if err := w.chtimesHostLocked(rel, atime, mtime); err != nil {
 		return err
 	}
 	if mtime != nil {
@@ -1902,7 +1904,12 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	entries, err := w.host.readDir(hostDir)
+	pin, err := w.acquirePinHeld(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer w.releasePin(pin)
+	entries, err := w.host.readDirAt(pin.h)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1924,7 +1931,7 @@ func (w *Workspace) listDirLocked(rel string) ([]dirListing, []string, error) {
 		if w.clutter.candidate(e.name) {
 			info := hostInfo{kind: e.kind}
 			if e.kind == hostKindRegular && w.clutter.needsContent(e.name) {
-				fi, err := w.host.lstat(hostChild(hostDir, e.name))
+				fi, err := w.host.lstatAt(pin.h, e.name)
 				if err != nil {
 					continue
 				}
@@ -2038,4 +2045,64 @@ func (w *Workspace) ReadDirChildren(relPath string) ([]DirChild, error) {
 		out = append(out, DirChild{Name: c.name, Attr: e.attr, Size: e.info.size})
 	}
 	return out, nil
+}
+
+// renameHostLocked renames the stored entry srcLeaf of the guest path oldRel
+// to dstLeaf below the directory of newRel, through the pinned handles of
+// both directories. Callers hold w.mu for writing.
+func (w *Workspace) renameHostLocked(oldRel, newRel, srcLeaf, dstLeaf string) error {
+	return w.pinnedPairLocked(oldRel, newRel, func(oldDir, newDir hostDirHandle) error {
+		return w.host.renameAt(oldDir, srcLeaf, newDir, dstLeaf)
+	})
+}
+
+// pinnedPairLocked runs fn with the pinned handles of the directories that
+// hold oldRel and newRel. Callers hold w.mu.
+func (w *Workspace) pinnedPairLocked(oldRel, newRel string, fn func(oldDir, newDir hostDirHandle) error) error {
+	oldPin, err := w.parentPinLocked(oldRel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(oldPin)
+	newPin, err := w.parentPinLocked(newRel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(newPin)
+	return fn(oldPin.h, newPin.h)
+}
+
+// unlinkHostLocked removes the stored entry leaf of the guest path rel from
+// its host directory, through the pinned handle of that directory. Callers
+// hold w.mu for writing.
+func (w *Workspace) unlinkHostLocked(rel, leaf string, dir bool) error {
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(pin)
+	if dir {
+		return w.host.rmdirAt(pin.h, leaf)
+	}
+	return w.host.unlinkAt(pin.h, leaf)
+}
+
+// chtimesHostLocked sets the host times of rel through the pinned handle of its
+// directory. The workspace root has no such directory, so it takes the path
+// call. Callers hold w.mu for writing.
+func (w *Workspace) chtimesHostLocked(rel string, atime, mtime *time.Time) error {
+	if rel == "." {
+		return w.host.chtimes(rel, atime, mtime)
+	}
+	parent, name := splitParent(rel)
+	leaf, err := w.hostLeaf(parent, name)
+	if err != nil {
+		return err
+	}
+	pin, err := w.parentPinLocked(rel)
+	if err != nil {
+		return err
+	}
+	defer w.releasePin(pin)
+	return w.host.chtimesAt(pin.h, leaf, atime, mtime)
 }

@@ -370,19 +370,6 @@ func (p hostProbe) missingError(rel string) error {
 	return fs.ErrNotExist
 }
 
-// locateLocked finds the host entry of the guest path rel. It does not handle
-// the workspace root.
-func (w *Workspace) locateLocked(rel string) (hostProbe, error) {
-	parent, name := splitParent(rel)
-	hostDir, err := w.hostPath(parent)
-	if err != nil {
-		return hostProbe{}, err
-	}
-	return w.locateIn(parent, name, nil, true, func(leaf string) (hostInfo, error) {
-		return w.host.lstat(hostChild(hostDir, leaf))
-	})
-}
-
 // storedMatch is the answer of resolveStored.
 type storedMatch struct {
 	found    bool

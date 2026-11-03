@@ -87,6 +87,11 @@ func (c *countingHost) syscalls() int {
 	return n
 }
 
+// listings counts the directory listings, by path and through a pinned handle.
+func (c *countingHost) listings() int {
+	return c.got("readDir") + c.got("readDirAt")
+}
+
 // pathCalls names the counted calls that take a workspace path.
 var pathCalls = map[string]bool{
 	"open": true, "openDir": true, "lstat": true, "mkdir": true, "unlink": true,
@@ -226,6 +231,46 @@ func (c *countingHost) openChildAt(dir hostDirHandle, name string, flags int, pe
 	return c.hostBackend.openChildAt(dir, name, flags, perm)
 }
 
+func (c *countingHost) mkdirAt(dir hostDirHandle, name string) error {
+	c.count("mkdirAt")
+	return c.hostBackend.mkdirAt(dir, name)
+}
+
+func (c *countingHost) unlinkAt(dir hostDirHandle, name string) error {
+	c.count("unlinkAt")
+	return c.hostBackend.unlinkAt(dir, name)
+}
+
+func (c *countingHost) rmdirAt(dir hostDirHandle, name string) error {
+	c.count("rmdirAt")
+	return c.hostBackend.rmdirAt(dir, name)
+}
+
+func (c *countingHost) renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	c.count("renameAt")
+	return c.hostBackend.renameAt(oldDir, oldName, newDir, newName)
+}
+
+func (c *countingHost) linkAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	c.count("linkAt")
+	return c.hostBackend.linkAt(oldDir, oldName, newDir, newName)
+}
+
+func (c *countingHost) chtimesAt(dir hostDirHandle, name string, atime, mtime *time.Time) error {
+	c.count("chtimesAt")
+	return c.hostBackend.chtimesAt(dir, name, atime, mtime)
+}
+
+func (c *countingHost) readDirAt(dir hostDirHandle) ([]hostDirEntry, error) {
+	c.count("readDirAt")
+	return c.hostBackend.readDirAt(dir)
+}
+
+func (c *countingHost) syncDirAt(dir hostDirHandle) error {
+	c.count("syncDirAt")
+	return c.hostBackend.syncDirAt(dir)
+}
+
 // testClock is the monotonic clock of the cache expiry in tests.
 type testClock struct {
 	ns atomic.Int64
@@ -330,7 +375,7 @@ func TestUncachedOpenUsesResolvedEntryAndPinnedDirectory(t *testing.T) {
 		t.Fatalf("open of a stale entry made host calls %s, want one lstatAt and one openChildAt", ch.dump())
 	}
 	// A path walk would show as a path call. The open must make none.
-	for _, name := range []string{"lstat", "open", "openDir", "readDir"} {
+	for name := range pathCalls {
 		if n := ch.got(name); n != 0 {
 			t.Fatalf("open made %d %s calls %s, want 0: the open must not walk the path", n, name, ch.dump())
 		}
@@ -670,10 +715,10 @@ func TestBackendThatVerifiesCaseSkipsTheListing(t *testing.T) {
 		e.mustStat("dir")
 		return ch
 	}
-	if ch := run(t, true); ch.got("readDir") != 0 || ch.got("fstatDir") != 0 {
+	if ch := run(t, true); ch.listings() != 0 || ch.got("fstatDir") != 0 {
 		t.Fatalf("a backend that verifies case still listed or stat the directory %s", ch.dump())
 	}
-	if ch := run(t, false); ch.got("readDir") == 0 {
+	if ch := run(t, false); ch.listings() == 0 {
 		t.Fatalf("a case-insensitive backend without verification never listed the directory %s", ch.dump())
 	}
 }
@@ -690,7 +735,7 @@ func TestDirectoryListingFollowsMutationsInPlace(t *testing.T) {
 	// The first lookup of an existing name lists the workspace root for the
 	// name dir, and lists dir for the name first.
 	e.mustStat("dir/first")
-	if got := ch.got("readDir"); got != 2 {
+	if got := ch.listings(); got != 2 {
 		t.Fatalf("first lookups listed directories %d times, want 2", got)
 	}
 
@@ -715,7 +760,7 @@ func TestDirectoryListingFollowsMutationsInPlace(t *testing.T) {
 			}
 		}
 	}
-	if got := ch.got("readDir"); got != 0 {
+	if got := ch.listings(); got != 0 {
 		t.Fatalf("single-entry mutations caused %d directory listings, want 0", got)
 	}
 

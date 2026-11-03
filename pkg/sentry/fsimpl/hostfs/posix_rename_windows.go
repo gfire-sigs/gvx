@@ -17,6 +17,7 @@
 package hostfs
 
 import (
+	"errors"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -62,11 +63,32 @@ func (h *hostRoot) remove(op, rel string, wantDir bool) error {
 		return err
 	}
 	defer parent.release()
+	return removeIn(op, parent.handle, parent.name, rel, wantDir)
+}
+
+func (h *hostRoot) unlinkAt(dir hostDirHandle, name string) error {
+	return h.removeAt("unlink", dir, name, false)
+}
+
+func (h *hostRoot) rmdirAt(dir hostDirHandle, name string) error {
+	return h.removeAt("rmdir", dir, name, true)
+}
+
+func (h *hostRoot) removeAt(op string, dir hostDirHandle, name string, wantDir bool) error {
+	if err := validateWindowsName(name); err != nil {
+		return hostError(op, name, err)
+	}
+	return removeIn(op, windows.Handle(dir), name, name, wantDir)
+}
+
+// removeIn is remove for the entry name inside the directory handle dir. The
+// path rel only labels errors.
+func removeIn(op string, dir windows.Handle, name, rel string, wantDir bool) error {
 	var options uint32
 	if wantDir {
 		options = windows.FILE_DIRECTORY_FILE
 	}
-	handle, err := openAt(parent.handle, parent.name, windows.DELETE|windows.FILE_READ_ATTRIBUTES,
+	handle, err := openAt(dir, name, windows.DELETE|windows.FILE_READ_ATTRIBUTES,
 		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, options)
 	if err != nil {
 		return hostError(op, rel, err)
@@ -105,15 +127,7 @@ func (h *hostRoot) remove(op, rel string, wantDir bool) error {
 // access error, which hostfs reports as EACCES.
 // Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
 func (h *hostRoot) rename(oldRel, newRel string) error {
-	return h.setTargetName(
-		"rename",
-		oldRel,
-		newRel,
-		windows.ERROR_SHARING_VIOLATION,
-		windows.DELETE|windows.FILE_READ_ATTRIBUTES,
-		windows.FILE_RENAME_REPLACE_IF_EXISTS|windows.FILE_RENAME_POSIX_SEMANTICS,
-		fd.FileRenameInformationEx,
-	)
+	return h.setTargetName("rename", oldRel, newRel, windows.ERROR_SHARING_VIOLATION, renameTarget)
 }
 
 // link creates a hard link newRel to the entry oldRel. The source open uses
@@ -124,19 +138,49 @@ func (h *hostRoot) rename(oldRel, newRel string) error {
 // own error, which hostErrno maps to EOPNOTSUPP. The function never copies.
 // Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_link_information
 func (h *hostRoot) link(oldRel, newRel string) error {
-	// ReplaceIfExists stays zero: an existing destination returns EEXIST.
-	return h.setTargetName(
-		"link",
-		oldRel,
-		newRel,
-		windows.ERROR_PRIVILEGE_NOT_HELD,
-		windows.FILE_WRITE_ATTRIBUTES,
-		0,
-		fileLinkInformation,
-	)
+	return h.setTargetName("link", oldRel, newRel, windows.ERROR_PRIVILEGE_NOT_HELD, linkTarget)
 }
 
-func (h *hostRoot) setTargetName(op, oldRel, newRel string, rootErr error, access, flags, infoClass uint32) error {
+// targetOp describes one rename-like operation of setTargetName.
+type targetOp struct {
+	access    uint32
+	flags     uint32
+	infoClass uint32
+}
+
+var (
+	// renameTarget replaces an existing destination.
+	renameTarget = targetOp{
+		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES,
+		flags:     windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS,
+		infoClass: fd.FileRenameInformationEx,
+	}
+	// linkTarget keeps ReplaceIfExists at zero: an existing destination
+	// returns EEXIST.
+	linkTarget = targetOp{
+		access:    windows.FILE_WRITE_ATTRIBUTES,
+		infoClass: fileLinkInformation,
+	}
+)
+
+func (h *hostRoot) renameAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	return h.setTargetNameAt("rename", oldDir, oldName, newDir, newName, renameTarget)
+}
+
+func (h *hostRoot) linkAt(oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string) error {
+	return h.setTargetNameAt("link", oldDir, oldName, newDir, newName, linkTarget)
+}
+
+func (h *hostRoot) setTargetNameAt(op string, oldDir hostDirHandle, oldName string, newDir hostDirHandle, newName string, t targetOp) error {
+	if err := errors.Join(validateWindowsName(oldName), validateWindowsName(newName)); err != nil {
+		return hostError2(op, oldName, newName, err)
+	}
+	return setTargetNameIn(op, oldName, newName,
+		parentDir{handle: windows.Handle(oldDir), name: oldName},
+		parentDir{handle: windows.Handle(newDir), name: newName}, t)
+}
+
+func (h *hostRoot) setTargetName(op, oldRel, newRel string, rootErr error, t targetOp) error {
 	if oldRel == "." || newRel == "." {
 		return hostError2(op, oldRel, newRel, rootErr)
 	}
@@ -150,13 +194,19 @@ func (h *hostRoot) setTargetName(op, oldRel, newRel string, rootErr error, acces
 		return err
 	}
 	defer newParent.release()
-	src, err := openAt(oldParent.handle, oldParent.name, access,
+	return setTargetNameIn(op, oldRel, newRel, oldParent, newParent, t)
+}
+
+// setTargetNameIn gives the entry oldParent.name the name newParent.name. The
+// paths oldRel and newRel only label errors.
+func setTargetNameIn(op, oldRel, newRel string, oldParent, newParent parentDir, t targetOp) error {
+	src, err := openAt(oldParent.handle, oldParent.name, t.access,
 		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
 	if err != nil {
 		return hostError2(op, oldRel, newRel, err)
 	}
 	defer closeHandle(src)
-	if err := fd.SetFileTargetName(src, newParent.handle, newParent.name, flags, infoClass); err != nil {
+	if err := fd.SetFileTargetName(src, newParent.handle, newParent.name, t.flags, t.infoClass); err != nil {
 		return hostError2(op, oldRel, newRel, err)
 	}
 	return nil

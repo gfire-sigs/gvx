@@ -1459,15 +1459,45 @@ func TestFsyncBypassesTheCoalesceWindow(t *testing.T) {
 	}
 }
 
-// syncRecorder records the directories that the workspace flushes.
+// syncRecorder records the directories that the workspace flushes. The
+// workspace flushes a directory through its pinned handle, so the recorder
+// names a handle by the host identity of the directory. The test registers
+// the directories that it expects through known.
 type syncRecorder struct {
 	hostBackend
-	dirs []string
+	dirs  []string
+	names map[hostID]string
 }
 
 func (s *syncRecorder) syncDir(rel string) error {
 	s.dirs = append(s.dirs, rel)
 	return s.hostBackend.syncDir(rel)
+}
+
+func (s *syncRecorder) syncDirAt(dir hostDirHandle) error {
+	if info, err := s.hostBackend.fstatDir(dir); err == nil {
+		name, ok := s.names[info.id]
+		if !ok {
+			name = fmt.Sprintf("unknown directory %v", info.id)
+		}
+		s.dirs = append(s.dirs, name)
+	}
+	return s.hostBackend.syncDirAt(dir)
+}
+
+// known tells the recorder the workspace directories to report by name.
+func (s *syncRecorder) known(t *testing.T, rels ...string) {
+	t.Helper()
+	if s.names == nil {
+		s.names = make(map[hostID]string)
+	}
+	for _, rel := range rels {
+		info, err := s.hostBackend.lstat(rel)
+		if err != nil {
+			t.Fatalf("lstat %q: %v", rel, err)
+		}
+		s.names[info.id] = rel
+	}
 }
 
 func (s *syncRecorder) take() []string {
@@ -1485,6 +1515,7 @@ func TestFsyncFlushesDataFileDirectoryAndTable(t *testing.T) {
 	e.mustMkdir("d")
 	e.writeFile("d/f", []byte("one"))
 	e.chmod("d/f", 0o600)
+	rec.known(t, "d")
 	fd := e.mustOpen("d/f", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
 	h := fd.Impl().(*regularFD).h
@@ -1583,6 +1614,7 @@ func TestDirectoryFsyncFlushesTheTable(t *testing.T) {
 	e.mustMkdir("p")
 	e.mustMkdir("p/d")
 	e.chmod("p/d", 0o700)
+	rec.known(t, "p", "p/d")
 	dir := e.mustOpen("p/d", linux.O_RDONLY|linux.O_DIRECTORY)
 	defer dir.DecRef(e.ctx)
 	rec.take()
@@ -1610,6 +1642,7 @@ func TestSynchronousWritesBypassTheWindow(t *testing.T) {
 		e.mustMkdir("d")
 		e.writeFile("d/f", []byte("x"))
 		e.chmod("d/f", 0o600)
+		rec.known(t, "d")
 		fd := e.mustOpen("d/f", linux.O_WRONLY|flag)
 		h := fd.Impl().(*regularFD).h
 		hostSyncs := 0
