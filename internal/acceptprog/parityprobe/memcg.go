@@ -219,7 +219,8 @@ func hogMain(size int, hold bool) {
 }
 
 // limitAbove sets memory.max to the memory of n idle hogs plus extra bytes. An
-// idle hog is a probe process that holds nothing. Its memory.current differs
+// idle hog is a probe process that holds 1 MiB. Hogs share the pages of the
+// executable, so n is 1 even for tests that run two hogs. Its memory.current differs
 // by host: the Sentry charges whole allocation units, so a Go process counts
 // far more than its 16 MiB on Linux.
 func limitAbove(n int, extra uint64) error {
@@ -278,7 +279,7 @@ func checkMemcgStat() error {
 }
 
 func checkMemcgUnderLimit() error {
-	if err := limitAbove(2, 64*mib); err != nil {
+	if err := limitAbove(1, 64*mib); err != nil {
 		return err
 	}
 	h, err := startHog(8*mib, false)
@@ -349,7 +350,7 @@ func checkMemcgOverLimitKills() error {
 }
 
 func checkMemcgKillsLargestOnly() error {
-	if err := limitAbove(2, 24*mib); err != nil {
+	if err := limitAbove(1, 24*mib); err != nil {
 		return err
 	}
 	small, err := startHog(8*mib, true)
@@ -384,7 +385,7 @@ func checkMemcgKillsLargestOnly() error {
 }
 
 func checkMemcgOOMGroup() error {
-	if err := limitAbove(2, 24*mib); err != nil {
+	if err := limitAbove(1, 24*mib); err != nil {
 		return err
 	}
 	if err := writeControl("memory.oom.group", "1"); err != nil {
