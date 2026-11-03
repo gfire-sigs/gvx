@@ -102,7 +102,7 @@ func (p *Protocol) dumpLinks(ctx context.Context, s *netlink.Socket, msg *nlmsg.
 
 	ifaces := stack.Interfaces()
 	for _, idx := range stack.InterfaceIDs() {
-		p.AddNewLinkMessage(ms, idx, ifaces[idx])
+		p.addNewLinkMessageWithStats(ms, stack, idx, ifaces[idx])
 	}
 
 	return nil
@@ -159,7 +159,7 @@ func (p *Protocol) getLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 			return syserr.ErrInvalidArgument
 		}
 
-		p.AddNewLinkMessage(ms, idx, i)
+		p.addNewLinkMessageWithStats(ms, stack, idx, i)
 		found = true
 		break
 	}

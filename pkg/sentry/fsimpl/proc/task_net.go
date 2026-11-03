@@ -85,6 +85,8 @@ func (fs *filesystem) newTaskNetDir(ctx context.Context, task *kernel.Task) kern
 			"unix":   fs.newInode(ctx, root, 0444, &netUnixData{kernel: k}),
 		}
 
+		fs.addNetfilterNameFiles(ctx, root, stack, contents)
+
 		if stack.SupportsIPv6() {
 			contents["if_inet6"] = fs.newInode(ctx, root, 0444, &ifinet6{stack: stack})
 			contents["ipv6_route"] = fs.newInode(ctx, root, 0444, newStaticFile(""))
