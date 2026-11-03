@@ -313,7 +313,14 @@ func TestCollectorTreatsPathRecordsByTheWalk(t *testing.T) {
 	}
 	requireMode(t, ws, "idfile", 0o753, 0)
 
-	// Deleting the directory with its contents removes the rest.
+	// Deleting the directory with its contents removes the rest. Windows keeps
+	// a deleted directory in a delete-pending state while a handle of hostfs is
+	// open on it, and a lookup then fails with an access error and not with a
+	// missing name. The pinned handles of the directory close first, as they do
+	// before a guest rmdir.
+	ws.mu.Lock()
+	ws.closeSubtreeHandlesLocked("npdir")
+	ws.mu.Unlock()
 	if err := os.RemoveAll(filepath.Join(dir, "npdir")); err != nil {
 		t.Fatal(err)
 	}
