@@ -393,6 +393,14 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			}
 		}
 	case avWrite:
+		if as.aliasWriteFault(addr) {
+			// The write hit a view that the engine lowered because another view
+			// holds a patched copy of the frame. The copy is gone now.
+			if err := continueFault(ev); err != nil {
+				return fatal(err, unix.EFAULT)
+			}
+			return running
+		}
 		base := blockRound(addr)
 		if blockRound(th.guestPC(pc)) == base {
 			// The guest writes to the page that it executes. Restoring the

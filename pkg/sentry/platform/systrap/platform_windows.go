@@ -57,6 +57,10 @@ type Platform struct {
 	// images caches the headers of the files that guests map as code.
 	images imageCache
 
+	// alias records the executable copies and the writable views of each frame
+	// of the memory file, in every address space of the platform.
+	alias aliasIndex
+
 	// cleanCode maps the address of a read-only MemoryFile page to the SHA-256
 	// digest of the bytes that a scan found to need zero patches. A page is
 	// clean only while its bytes still have that digest.
@@ -409,6 +413,10 @@ func (*Platform) ConcurrencyCount() int { return math.MaxInt }
 
 // PatchedBlocks returns how many code blocks this address space patched.
 func (as *addressSpace) PatchedBlocks() uint64 { return as.patchedBlocks.Load() }
+
+// AliasFaults returns how many writes through a view of this address space
+// dropped the patched copies of the frame that the view maps.
+func (as *addressSpace) AliasFaults() uint64 { return as.aliasFaults.Load() }
 
 // PreFork implements platform.AddressSpace.PreFork.
 func (*addressSpace) PreFork() {}
