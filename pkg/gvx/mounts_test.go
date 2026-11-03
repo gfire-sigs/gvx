@@ -635,46 +635,9 @@ func TestOpenMountsSharesOneWorkspacePerDirectoryAndAccess(t *testing.T) {
 	}
 }
 
-func TestOpenMountsRejectsDirectoryInsideAnotherMountedDirectory(t *testing.T) {
-	root := t.TempDir()
-	inner := filepath.Join(root, "inner")
-	if err := os.Mkdir(inner, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name string
-		cfg  Config
-	}{
-		{
-			name: "workspace and a bind mount of its subdirectory",
-			cfg:  Config{WorkspacePath: root, Mounts: []Mount{{Kind: MountBind, HostPath: inner, GuestPath: "/inner"}}},
-		},
-		{
-			name: "writable outer and read-only inner",
-			cfg:  Config{WorkspacePath: root, Mounts: []Mount{{Kind: MountBind, HostPath: inner, GuestPath: "/inner", ReadOnly: true}}},
-		},
-		{
-			name: "bind mount listed before its parent",
-			cfg: Config{Mounts: []Mount{
-				{Kind: MountBind, HostPath: inner, GuestPath: "/inner"},
-				{Kind: MountBind, HostPath: root, GuestPath: "/outer"},
-			}},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.cfg.normalize(); err != nil {
-				t.Fatal(err)
-			}
-			sb := &Sandbox{cfg: tc.cfg}
-			t.Cleanup(func() { _ = sb.closeMounts() })
-			if err := sb.openMounts(); !errors.Is(err, ErrInvalidConfig) {
-				t.Fatalf("openMounts() = %v, want ErrInvalidConfig for overlapping host directories", err)
-			}
-		})
-	}
-}
-
-func TestOpenMountsAcceptsNestedDirectoriesThatLineUpInTheGuest(t *testing.T) {
+// Each directory mount keeps its own table, so no layout is refused. A layout
+// that does not line up in the guest works as it did before the tables.
+func TestOpenMountsAllowsNestedDirectories(t *testing.T) {
 	root := t.TempDir()
 	inner := filepath.Join(root, "node_modules")
 	if err := os.Mkdir(inner, 0o755); err != nil {
@@ -696,10 +659,10 @@ func TestOpenMountsAcceptsNestedDirectoriesThatLineUpInTheGuest(t *testing.T) {
 			}},
 		},
 		{
-			name: "inner mount listed first",
+			name: "layout that does not line up in the guest",
 			cfg: Config{Mounts: []Mount{
-				{Kind: MountBind, HostPath: inner, GuestPath: "/app/node_modules"},
 				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
+				{Kind: MountBind, HostPath: inner, GuestPath: "/var/log/app"},
 			}},
 		},
 	} {
@@ -708,71 +671,18 @@ func TestOpenMountsAcceptsNestedDirectoriesThatLineUpInTheGuest(t *testing.T) {
 				t.Fatal(err)
 			}
 			sb := &Sandbox{cfg: tc.cfg}
-			t.Cleanup(func() { _ = sb.closeMounts() })
+			t.Cleanup(func() {
+				if err := sb.closeMounts(); err != nil {
+					t.Errorf("closeMounts() failed: %v", err)
+				}
+			})
 			if err := sb.openMounts(); err != nil {
-				t.Fatalf("openMounts() = %v, want success: the inner mount covers the outer copy of its directory", err)
+				t.Fatalf("openMounts() = %v, want success", err)
+			}
+			if got := len(sb.workspaces); got != 2 {
+				t.Fatalf("openMounts() opened %d workspaces, want 2: the inner directory keeps its own table", got)
 			}
 		})
-	}
-}
-
-func TestOpenMountsRejectsNestedDirectoriesThatAliasInTheGuest(t *testing.T) {
-	root := t.TempDir()
-	inner := filepath.Join(root, "node_modules")
-	if err := os.Mkdir(inner, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, guest := range map[string]string{
-		"inner mount elsewhere":             "/elsewhere",
-		"inner mount below another name":    "/app/other",
-		"inner mount one level too shallow": "/node_modules",
-		"inner mount at the outer mount":    "/app",
-	} {
-		t.Run(name, func(t *testing.T) {
-			cfg := Config{Mounts: []Mount{
-				{Kind: MountBind, HostPath: root, GuestPath: "/app"},
-				{Kind: MountBind, HostPath: inner, GuestPath: guest},
-			}}
-			if guest == "/app" {
-				cfg.Mounts[0].GuestPath = "/outer"
-			}
-			if err := cfg.normalize(); err != nil {
-				t.Fatal(err)
-			}
-			sb := &Sandbox{cfg: cfg}
-			t.Cleanup(func() { _ = sb.closeMounts() })
-			if err := sb.openMounts(); !errors.Is(err, ErrInvalidConfig) {
-				t.Fatalf("openMounts() = %v, want ErrInvalidConfig for a layout that aliases the files", err)
-			}
-		})
-	}
-}
-
-func TestOpenMountsAcceptsReadOnlyOverlapAndSiblingDirectories(t *testing.T) {
-	root := t.TempDir()
-	inner := filepath.Join(root, "inner")
-	sibling := filepath.Join(root, "inner-sibling")
-	for _, d := range []string{inner, sibling} {
-		if err := os.Mkdir(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	cfg := Config{Mounts: []Mount{
-		{Kind: MountBind, HostPath: root, GuestPath: "/outer", ReadOnly: true},
-		{Kind: MountBind, HostPath: inner, GuestPath: "/inner", ReadOnly: true},
-		{Kind: MountBind, HostPath: sibling, GuestPath: "/sibling", ReadOnly: true},
-	}}
-	if err := cfg.normalize(); err != nil {
-		t.Fatal(err)
-	}
-	sb := &Sandbox{cfg: cfg}
-	t.Cleanup(func() {
-		if err := sb.closeMounts(); err != nil {
-			t.Errorf("closeMounts() failed: %v", err)
-		}
-	})
-	if err := sb.openMounts(); err != nil {
-		t.Fatalf("openMounts() = %v, want success: read-only mounts never write a table, and a sibling that shares a name prefix is no overlap", err)
 	}
 }
 
