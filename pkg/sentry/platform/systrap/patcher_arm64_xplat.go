@@ -177,6 +177,7 @@ func slotSizeFor(k siteKind) int {
 func encodeTrapSysmsgSlot(buf []byte, slotVA, retPC, spill uint64, save, restore []uint32) error {
 	tailOff := (len(save) + 3) * 4
 	litOff := (len(save) + 3 + len(restore) + 1) * 4
+	litOff = (litOff + 7) &^ 7
 	if len(buf) < litOff+8 {
 		return fmt.Errorf("trap slot buffer has %d bytes", len(buf))
 	}

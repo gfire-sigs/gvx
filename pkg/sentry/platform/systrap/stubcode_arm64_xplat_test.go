@@ -65,6 +65,8 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{a64DMBISH, "DMB ISH"},
 		{a64YIELD, "YIELD "},
 		{hvcommon.BRK(brkFastExit), "BRK #0x5c5"},
+		{a64sturX(18, a64SP, -winSlotSpillOffset), "STUR X18, [SP,#-64]"},
+		{a64ldurX(16, a64SP, -winSlotSpillOffset), "LDUR X16, [SP,#-64]"},
 	} {
 		var b [4]byte
 		binary.LittleEndian.PutUint32(b[:], c.word)
@@ -467,12 +469,14 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	}
 	// Run the slot. It ends in a BR to the spill routine, which it entered
 	// with x17 set to the tail.
+	// The shadow word holds a stale value, as it does when the guest changed x18
+	// with an instruction that the engine does not rewrite.
 	const guestX18 = 0x1818_1818_1818_1818
 	m := newA64Machine(buf, slot)
 	m.sp = rigStack
 	m.tpidr = rigSysm
 	m.x[16], m.x[17], m.x[18] = rigGuestX16, rigGuestX17, guestX18
-	m.put64(rigSysm+winOffX18, guestX18)
+	m.put64(rigSysm+winOffX18, 0xdead_beef)
 	for i, b := range buf {
 		m.mem[slot+uint64(i)] = b
 	}
@@ -487,6 +491,12 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	}
 	if m.x[18] != guestX18 {
 		t.Fatalf("x18 = %#x at the jump, want %#x", m.x[18], uint64(guestX18))
+	}
+	if got := m.get64(rigSysm + winOffX18); got != guestX18 {
+		t.Fatalf("the shadow x18 = %#x at the jump, want the guest value %#x", got, uint64(guestX18))
+	}
+	if m.sp != rigStack {
+		t.Fatalf("sp = %#x at the jump, want %#x", m.sp, uint64(rigStack))
 	}
 	if m.get64(rigSysm+winOffScratch) != rigGuestX16 || m.get64(rigSysm+winOffScratch+8) != rigGuestX17 {
 		t.Fatal("the slot did not save x16 and x17 in the sysmsg scratch words")
@@ -505,39 +515,42 @@ func TestWinSlotReachesSpillAndReturnsAfterSite(t *testing.T) {
 	}
 }
 
-func TestWinX18SetSlotUpdatesSysmsgAndHardwareX18(t *testing.T) {
+// TestWinSlotKeepsTheWordsThatGuestsKeepAroundTheStackPointer covers the words
+// at and above the stack pointer, which every guest owns, and the three words
+// below it that the child of a Go clone keeps across its first system call.
+func TestWinSlotKeepsTheWordsThatGuestsKeepAroundTheStackPointer(t *testing.T) {
 	const (
-		site = 0x7ff0_1000_0240
-		slot = 0x7ff0_1100_0140
+		site = 0x7ff0_1000_0100
+		slot = 0x7ff0_1100_0040
 	)
-	for _, reg := range []uint8{0, 1, 17, 20, 31} {
-		buf := make([]byte, winTLSSlotSize)
-		if err := encodeWinX18SetSlot(buf, slot, site, reg); err != nil {
-			t.Fatalf("x%d: %v", reg, err)
-		}
-		m := newA64Machine(buf, slot)
-		for i := range m.x {
-			m.x[i] = 0x9000 + uint64(i)
-		}
-		var wantX18 uint64
-		if reg != 31 {
-			wantX18 = m.x[reg]
-		}
-		want := m.x
-		want[18] = wantX18
-		m.sp = rigStack
-		m.tpidr = rigSysm
-		if err := m.run(10); err != nil {
-			t.Fatalf("x%d: %v", reg, err)
-		}
-		if m.exit.jump != site+winSiteLen {
-			t.Errorf("x%d: the slot returns to %#x, want %#x", reg, m.exit.jump, uint64(site+winSiteLen))
-		}
-		if m.x != want {
-			t.Errorf("x%d: registers mismatch: got x18=%#x want=%#x", reg, m.x[18], wantX18)
-		}
-		if got := m.get64(rigSysm + winOffX18); got != wantX18 {
-			t.Errorf("x%d: sysmsg.X18 = %#x, want %#x", reg, got, wantX18)
+	buf := make([]byte, winSlotSize)
+	if err := encodeWinSlot(buf, slot, site, rigCode); err != nil {
+		t.Fatal(err)
+	}
+	m := newA64Machine(buf, slot)
+	m.sp = rigStack
+	m.tpidr = rigSysm
+	m.x[18] = 0x1818
+	words := map[uint64]uint64{
+		rigStack + 8:  0x2222,
+		rigStack:      0x1111,
+		rigStack - 8:  0x3333,
+		rigStack - 16: 0x4444,
+		rigStack - 24: 0x5555,
+		rigStack - 32: 0x6666,
+	}
+	for addr, v := range words {
+		m.put64(addr, v)
+	}
+	for i, b := range buf {
+		m.mem[slot+uint64(i)] = b
+	}
+	if err := m.run(100); err != nil {
+		t.Fatal(err)
+	}
+	for addr, want := range words {
+		if got := m.get64(addr); got != want {
+			t.Errorf("word at sp%+d = %#x after the slot, want %#x", int64(addr)-rigStack, got, want)
 		}
 	}
 }

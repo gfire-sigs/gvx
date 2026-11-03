@@ -76,6 +76,16 @@ func a64cmpW(rn, imm uint32) uint32         { return 0x7100001f | imm<<10 | rn<<
 func a64addX(rd, rn, rm uint32) uint32      { return 0x8b000000 | rm<<16 | rn<<5 | rd }
 func a64cmpX(rn, rm uint32) uint32          { return 0xeb00001f | rm<<16 | rn<<5 }
 
+// a64sturX encodes STUR Xt, [Xn, #off] with an unscaled signed offset.
+func a64sturX(rt, rn uint32, off int32) uint32 {
+	return 0xf8000000 | uint32(off)&0x1ff<<12 | rn<<5 | rt
+}
+
+// a64ldurX encodes LDUR Xt, [Xn, #off] with an unscaled signed offset.
+func a64ldurX(rt, rn uint32, off int32) uint32 {
+	return 0xf8400000 | uint32(off)&0x1ff<<12 | rn<<5 | rt
+}
+
 // a64Asm collects words and resolves branches to labels.
 type a64Asm struct {
 	words  []uint32
@@ -354,11 +364,30 @@ func restoreCommon(base int) []uint32 {
 }
 
 // encodeWinSlot encodes the trap slot for a patched `svc #0` at site.
+//
+// The slot needs a register that holds the address of the sysmsg, and it can
+// use only x18 for that, because x16 and x17 hold guest values too. A guest on
+// Linux can keep a live value in x18, so the slot first stores x18 in stack
+// memory below the guest stack pointer. A Linux AArch64 guest has no red zone,
+// and the Sentry never builds a signal frame while a thread runs a slot. A
+// guest can still keep data just below its stack pointer across a system call,
+// because the kernel never writes there. The child of a Go clone keeps three
+// words at sp-8 to sp-32 across its first call, so the slot writes at
+// winSlotSpillOffset below the pointer. The slot then copies the stored value
+// to the shadow word X18 of the sysmsg. The shadow always equals the guest x18
+// at a trap, and the tail of the slot loads x18 from it.
+//
+// The first store faults when the stack pointer is invalid, unaligned, or next
+// to an unmapped page. No register has changed at that point, so the Sentry
+// serves the call through the debug path (svcSlotFault).
 func encodeWinSlot(buf []byte, slotVA, site, spill uint64) error {
 	save := []uint32{
+		a64sturX(18, a64SP, -winSlotSpillOffset),
 		arm64MRSTPIDR | 18,
 		hvcommon.STPX(18, 16, 17, winOffScratch),
-		hvcommon.LDRX(18, 18, winOffX18),
+		a64ldurX(16, a64SP, -winSlotSpillOffset),
+		hvcommon.STRX(18, 16, winOffX18),
+		hvcommon.MOVReg(18, 16),
 	}
 	restore := []uint32{
 		arm64MRSTPIDR | 18,
@@ -374,26 +403,6 @@ const winTLSSlotSize = loadSlotSize
 // encodeWinTLSSlot writes the slot that replaces `mrs xN, tpidr_el0` at site.
 func encodeWinTLSSlot(buf []byte, slotVA, site uint64, reg uint8) error {
 	return encodeLoadSysmsgSlot(buf, slotVA, winSiteReturn(site), reg, arm64MRSTPIDR, false, winOffTLS)
-}
-
-// encodeWinX18SetSlot writes the slot that replaces `mov x18, xN` at site.
-func encodeWinX18SetSlot(buf []byte, slotVA, site uint64, reg uint8) error {
-	if len(buf) < winTLSSlotSize {
-		return fmt.Errorf("X18 slot buffer has %d bytes", len(buf))
-	}
-	if reg == 18 || reg > 31 {
-		return fmt.Errorf("X18 slot register %d", reg)
-	}
-	back, err := encodeBranch(slotVA+12, winSiteReturn(site))
-	if err != nil {
-		return err
-	}
-	r := int(reg)
-	binary.LittleEndian.PutUint32(buf[0:], arm64MRSTPIDR|18)
-	binary.LittleEndian.PutUint32(buf[4:], hvcommon.STRX(18, r, winOffX18))
-	binary.LittleEndian.PutUint32(buf[8:], hvcommon.MOVReg(18, r))
-	binary.LittleEndian.PutUint32(buf[12:], back)
-	return nil
 }
 
 // probeProgram returns the guest code of Probe: calls system calls with

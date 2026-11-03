@@ -61,13 +61,18 @@ const (
 	winOffFpcr = winOffFpsr + 8
 
 	// winSlotSize is the size of one trampoline slot.
-	winSlotSize = 48
+	winSlotSize = 64
 	// winSlotTailOffset is the offset of the slot tail. The slot passes its
 	// address to the spill routine in x17.
-	winSlotTailOffset = 24
+	winSlotTailOffset = 36
 	// winSlotLitOffset is the offset of the 8-byte literal that holds the
 	// address of the spill routine.
-	winSlotLitOffset = 40
+	winSlotLitOffset = 56
+	// winSlotSpillOffset is the distance below the guest stack pointer of the
+	// word where the slot stores the guest x18 before it clobbers the register.
+	// The Go runtime keeps three words at sp-8 to sp-32 across the first system
+	// call of a new thread, so the word lies below them.
+	winSlotSpillOffset = 64
 	// winSiteLen is the length of the patched instruction, and the offset from
 	// the site to the instruction that follows it.
 	winSiteLen = 4
