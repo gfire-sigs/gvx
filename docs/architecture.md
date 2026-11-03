@@ -627,9 +627,9 @@ The meta store holds at most 4 KiB of names and values for one inode, and it fai
 
 The image uses the ext4 on-disk format with 4KiB blocks. A block group has 4096 blocks and 4096 inodes of 256 bytes, so one group takes 16MiB. Group `g` covers the blocks `4096*g` to `4096*g+4095`. The first data block is 0, and the superblock sits at byte 1024 of block 0. The groups 0, 1, and every power of 3, 5, or 7 hold a copy of the superblock.
 
-A group with a superblock copy starts with 65 header blocks. These are the superblock and 64 blocks for the group descriptors. The 64 blocks hold the descriptors that the volume needs now and reserved descriptor blocks for growth. The sum stays 64, so a volume grows to 4096 groups (64GiB) without moving any block. The resize inode (inode 7) lists the reserved blocks, as `resize_inode` requires. In group 0, the block bitmap is block 65, the inode bitmap is block 66, and the inode table is blocks 67 to 322.
+The volume uses `meta_bg`. Each meta-group of 64 block groups keeps its descriptor block in its first group, with copies in its second and last groups. A group starts with its superblock copy, if it has one, and then its descriptor block, if it has one. Growth adds meta-groups at the end, so a volume grows to 64TiB without moving any block. In group 0, the descriptor block is block 1, the block bitmap is block 2, the inode bitmap is block 3, and the inode table is blocks 4 to 259. Groups past the 32-bit inode limit hold data blocks only.
 
-The volume enables `ext_attr`, `resize_inode`, `filetype`, `extents`, `64bit`, `inline_data`, `sparse_super`, `large_file`, `extra_isize`, and `has_journal`. It has no directory index and no checksums. `e2fsck -fn` accepts a clean image, and the Linux kernel can mount it.
+The volume enables `ext_attr`, `filetype`, `meta_bg`, `extents`, `64bit`, `inline_data`, `sparse_super`, `large_file`, `extra_isize`, and `has_journal`. It has no directory index and no checksums. `e2fsck -fn` accepts a clean image, and the Linux kernel can mount it.
 
 The journal is inode 8. It takes 1024 blocks of group 0 and never grows. A volume of an older release gets a journal at the first writable mount, when group 0 has a free run of 1024 blocks. Without such a run, the volume runs without a journal and never grows the host file for one.
 

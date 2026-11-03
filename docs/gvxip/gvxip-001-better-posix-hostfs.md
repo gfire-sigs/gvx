@@ -6,10 +6,20 @@ This specification defines the `hostfs` v2 architecture in `pkg/sentry/fsimpl/ho
 | :--- | :--- |
 | **Document ID** | `GVXIP-001` |
 | **Title** | Adaptive POSIX Translation and Host Event Bridge for `hostfs` |
-| **Status** | Draft Specification |
+| **Status** | Implemented (see the status table below) |
 | **Isolation Tier** | Tier 1 (`pkg/sentry/fsimpl/hostfs`, `pkg/gvx`, `pkg/hostlockdown`) |
 | **Target Platforms** | `darwin/arm64`, `darwin/amd64`, `windows/amd64`, `windows/arm64`, `linux/amd64`, `linux/arm64` |
 | **Companion Spec** | [`gvxip-002-ext4lite-volume-engine.md`](gvxip-002-ext4lite-volume-engine.md) |
+
+The sections below keep the text of the original proposal, so they describe the old defects in the present tense. This table records the state of the code. [`architecture.md`](../architecture.md), section 3.7, describes the current driver.
+
+| Section | State |
+| :--- | :--- |
+| 2.2 APFS Unicode normalization | Implemented. A lookup that misses the exact bytes retries with the NFC form (`names.go`). |
+| 3 Windows open-handle quiescing | Implemented (`handle_registry.go`). |
+| 4.1 Virtual symlink targets | Implemented. A guest symlink accepts any non-empty target without NUL (`symlink_rules.go`). Host symlinks stay unfollowed. |
+| 5 Host event bridge | Implemented with kqueue on macOS, IOCP on Windows, and polling elsewhere (`watcher_*.go`). |
+| `.gvx_meta` store | Replaced by an append-only journal of records keyed on file identity (format v4). See `architecture.md`, section 3.7. |
 
 ---
 
