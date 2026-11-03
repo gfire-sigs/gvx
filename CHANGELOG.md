@@ -9,6 +9,7 @@ This section records changes that no release contains yet.
 ### Behavior Changes
 
 - **Upstream gVisor `release-20261102.0`**: the Sentry now comes from the `go` branch commit `1cea747e`. That commit is the first merge that contains the release commit `7a675ac6`. The guest vDSO reads a new `CLOCK_BOOTTIME` offset from the parameter page.
+- **Upstream diff budget**: `tools/upstream -mode=audit` accepts a charged share of up to 2.0% of upstream files. The old limit was 1.0%.
 
 ## [v0.5.2] - 2026-11-03
 

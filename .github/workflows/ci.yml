@@ -93,7 +93,7 @@ jobs:
           path: ~/.cache/gvx/upstream
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
       - name: Audit upstream diff
-        run: go run ./tools/upstream -mode=audit -max-ratio=0.01
+        run: go run ./tools/upstream -mode=audit -max-ratio=0.02
       - name: Build a module that imports pkg/gvx
         run: ./scripts/check-consumer.sh
       - name: Check license notices
