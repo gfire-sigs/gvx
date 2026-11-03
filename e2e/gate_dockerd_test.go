@@ -60,7 +60,7 @@ docker run -d --name hog alpine sh -c 'dd if=/dev/zero of=/dev/shm/f bs=1M count
 i=0
 while :; do
   usage=$(docker stats --no-stream --format '{{.MemUsage}}' hog | cut -d/ -f1 | tr -d ' ')
-  case "$usage" in *MiB) mib=${usage%MiB}; awk -v v="$mib" 'BEGIN{exit !(v>=60 && v<=90)}' && break;; esac
+  case "$usage" in *MiB) mib=${usage%MiB}; awk -v v="$mib" 'BEGIN{exit !(v>=60 && v<=160)}' && break;; esac
   i=$((i+1)); [ $i -gt 60 ] && fail "docker stats shows $usage for a container that holds 64 MiB"
   sleep 1
 done

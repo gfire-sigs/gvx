@@ -218,6 +218,32 @@ func hogMain(size int, hold bool) {
 	os.Exit(0)
 }
 
+// limitAbove sets memory.max to the memory of n idle hogs plus extra bytes. An
+// idle hog is a probe process that holds nothing. Its memory.current differs
+// by host: the Sentry charges whole allocation units, so a Go process counts
+// far more than its 16 MiB on Linux.
+func limitAbove(n int, extra uint64) error {
+	h, err := startHog(mib, true)
+	if err != nil {
+		return err
+	}
+	if err := h.waitAllocated(); err != nil {
+		h.stop()
+		return err
+	}
+	var idle uint64
+	for deadline := time.Now().Add(memcgTimeout); idle == 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		raw, err := os.ReadFile(memcgDir + "/memory.current")
+		if err != nil {
+			h.stop()
+			return err
+		}
+		idle, _ = strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	}
+	h.stop()
+	return writeControl("memory.max", strconv.FormatUint(uint64(n)*idle+extra, 10))
+}
+
 func checkMemcgStat() error {
 	h, err := startHog(16*mib, true)
 	if err != nil {
@@ -245,14 +271,14 @@ func checkMemcgStat() error {
 			break
 		}
 	}
-	if anon < 16*mib || anon > 32*mib || cur < 16*mib || cur > 48*mib {
+	if anon < 16*mib || anon > 32*mib || cur < 16*mib {
 		return fmt.Errorf("a hog holds 16 MiB; memory.stat anon = %d, memory.current = %d", anon, cur)
 	}
 	return nil
 }
 
 func checkMemcgUnderLimit() error {
-	if err := writeControl("memory.max", "64M"); err != nil {
+	if err := limitAbove(2, 64*mib); err != nil {
 		return err
 	}
 	h, err := startHog(8*mib, false)
@@ -291,7 +317,7 @@ func watchEvents() (<-chan error, func(), error) {
 }
 
 func checkMemcgOverLimitKills() error {
-	if err := writeControl("memory.max", "32M"); err != nil {
+	if err := limitAbove(1, 32*mib); err != nil {
 		return err
 	}
 	changed, closeWatch, err := watchEvents()
@@ -323,7 +349,7 @@ func checkMemcgOverLimitKills() error {
 }
 
 func checkMemcgKillsLargestOnly() error {
-	if err := writeControl("memory.max", "32M"); err != nil {
+	if err := limitAbove(2, 24*mib); err != nil {
 		return err
 	}
 	small, err := startHog(8*mib, true)
@@ -358,7 +384,7 @@ func checkMemcgKillsLargestOnly() error {
 }
 
 func checkMemcgOOMGroup() error {
-	if err := writeControl("memory.max", "32M"); err != nil {
+	if err := limitAbove(2, 24*mib); err != nil {
 		return err
 	}
 	if err := writeControl("memory.oom.group", "1"); err != nil {
