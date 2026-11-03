@@ -170,6 +170,6 @@ A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentr
 | Overshoot | A container can pass its limit by what it allocates between two checks. At 1 GB/s of fresh writes, 5 ms is about 5 MB. |
 | Victim | The process with the largest resident set. With `memory.oom.group` set, every process of the container. |
 | Result | Exit code 137, `OOMKilled: true` in `docker inspect`, and `oom_kill` in `memory.events`. Other containers and `dockerd` keep running. |
-| Not caught | A process that allocates and frees more than the limit between two checks. Memory that a process maps but never writes. |
+| Not caught | A process that allocates and frees more than the limit between two checks. A one-shot `dd if=/dev/zero bs=128M count=1` is an example: its buffer lives about 30 ms. On macOS, a test that held 128 MiB for 30 ms showed only 2 MiB in `memory.current` in 4 of 6 runs, so the scan of the memory file missed most of the pages. Linux counts each page at its first write and kills such a process. A process that holds its memory for longer than 100 ms is found. Memory that a process maps but never writes is not charged, as on Linux. |
 | Held after the kill | Data in `tmpfs` files stays charged to the container. A new process in that container is ended at the next check while the data still counts. |
 | Not enforced | `memory.high`, `cpu.max`, `cpu.weight`, and `memory.swap.*`. |
