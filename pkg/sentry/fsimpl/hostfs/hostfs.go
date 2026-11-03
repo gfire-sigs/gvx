@@ -16,15 +16,16 @@
 // host access goes through a directory handle pinned by os.OpenRoot before
 // sandbox lockdown. Windows uses NtCreateFile relative to that handle and
 // macOS uses openat with O_NOFOLLOW relative to its descriptor. POSIX
-// permissions, ownership, and symbolic links live in an atomically replaced
-// .gvx_meta table.
+// permissions, ownership, and symbolic links live in the .gvx_meta journal.
 //
-// Crash consistency of .gvx_meta: the table is written to .gvx_meta.tmp,
-// flushed to stable storage, and renamed over .gvx_meta. A crash at any point
-// leaves either the previous complete table or the new complete table.
-// Mutations reach disk within a short coalescing window. Workspace.Sync and
-// Workspace.Close flush before they return, so a successful Sync guarantees
-// durability of every earlier mutation.
+// Crash consistency of .gvx_meta: a flush appends one checksummed frame with
+// the changed records and flushes the file, and a compaction writes a snapshot
+// to .gvx_meta.tmp, flushes it, and renames it over .gvx_meta. A crash at any
+// point leaves every flush that completed, and a torn last frame drops out at
+// the next load. See metastore.go. Mutations reach disk within a short
+// coalescing window. Workspace.Sync and Workspace.Close flush before they
+// return, so a successful Sync guarantees durability of every earlier
+// mutation.
 package hostfs
 
 import (

@@ -240,20 +240,47 @@ func TestTornTailIsIgnoredAtEveryCutPoint(t *testing.T) {
 	dir := t.TempDir()
 	// Each file is one flush, so one frame. The first flush is the snapshot.
 	full := writeTable(t, dir, "a", "b", "c")
-	lastFrame := frameStart(t, full, 2)
-	for cut := lastFrame; cut < len(full); cut += max(1, (len(full)-lastFrame)/12) {
-		t.Run(fmt.Sprintf("cut at %d of %d", cut, len(full)), func(t *testing.T) {
-			if err := os.WriteFile(filepath.Join(dir, MetaFileName), full[:cut], 0o600); err != nil {
-				t.Fatal(err)
+	ends := []int{frameStart(t, full, 1), frameStart(t, full, 2), len(full)}
+	path := filepath.Join(dir, MetaFileName)
+	for cut := 1; cut <= len(full); cut++ {
+		if err := os.WriteFile(path, full[:cut], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The table holds the records of the frames that the file still holds
+		// completely.
+		var want []string
+		for i, name := range []string{"a", "b", "c"} {
+			if cut >= ends[i] {
+				want = append(want, name)
 			}
-			table := readMetaTable(t, filepath.Join(dir, MetaFileName))
-			if _, ok := table["b"]; !ok {
-				t.Fatalf("a torn last frame hid record b, which an earlier frame holds: %v", table)
-			}
-			if _, ok := table["c"]; ok {
-				t.Fatalf("a torn last frame still applied record c")
-			}
-		})
+		}
+		table, err := ReadMeta(path)
+		if err != nil {
+			t.Fatalf("cut at %d of %d bytes: ReadMeta: %v", cut, len(full), err)
+		}
+		var got []string
+		for name := range table {
+			got = append(got, name)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Fatalf("cut at %d of %d bytes: records %v, want %v", cut, len(full), got, want)
+		}
+	}
+}
+
+func TestTornHeaderOpensAsAnEmptyTableAndHeals(t *testing.T) {
+	dir := t.TempDir()
+	full := writeTable(t, dir, "a")
+	path := filepath.Join(dir, MetaFileName)
+	if err := os.WriteFile(path, full[:journalHeader-2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ws := journalWS(t, dir, workspaceOptions{})
+	mustWriteFile(t, ws, "b", 0o600)
+	mustSync(t, ws)
+	if got := readMetaTable(t, path); len(got) == 0 || got["b"].Mode&0o7777 != 0o600 {
+		t.Fatalf("table after the first write over a torn header = %v, want the record of b", got)
 	}
 }
 
@@ -680,5 +707,110 @@ func TestSnapshotKeepsDirectoryAndSymlinkRecords(t *testing.T) {
 	}
 	if table["s"].Symlink != "elsewhere" {
 		t.Fatalf("record s = %+v, want the symlink target", table["s"])
+	}
+}
+
+func TestCrashDuringConversionKeepsTheLegacyFile(t *testing.T) {
+	dir := resolvedTempDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"version":2,"entries":{"a":{"mode":33152,"uid":1,"gid":2}}}`
+	path := filepath.Join(dir, MetaFileName)
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	crash := errors.New("simulated crash before the rename")
+	armed := true
+	ws := journalWS(t, dir, workspaceOptions{beforeMetaRename: func() error {
+		if armed {
+			return crash
+		}
+		return nil
+	}})
+	if err := ws.Chmod("a", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.Sync(); !errors.Is(err, crash) {
+		t.Fatalf("Sync = %v, want the simulated crash", err)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != legacy {
+		t.Fatalf("the crashed conversion changed the legacy file: (%q, %v)", raw, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, metaTempName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the crashed conversion left %s behind: %v", metaTempName, err)
+	}
+	// A new process sees the table as it was before the crash.
+	crashed, err := OpenWorkspace(dir, true)
+	if err != nil {
+		t.Fatalf("reopen after the crash: %v", err)
+	}
+	if attr, _, err := crashed.Stat("a"); err != nil || attr.UID != 1 || attr.Mode&0o7777 != 0o600 {
+		t.Fatalf("Stat(a) after the crash = (%+v, %v), want the legacy record", attr, err)
+	}
+	_ = crashed.Close()
+
+	armed = false
+	mustSync(t, ws)
+	if !isJournal(t, path) {
+		t.Fatal("the retry after the crash did not convert the file")
+	}
+	if got := readMetaTable(t, path)["a"]; got.Mode&0o7777 != 0o700 || got.UID != 1 {
+		t.Fatalf("record a after the retry = %+v, want mode 700 owner 1", got)
+	}
+}
+
+// failSyncDirHost fails the flush of the workspace directory while fail is set.
+type failSyncDirHost struct {
+	hostBackend
+	fail atomic.Bool
+}
+
+func (f *failSyncDirHost) syncDir(rel string) error {
+	if f.fail.Load() && rel == "." {
+		return errors.New("injected directory flush failure")
+	}
+	return f.hostBackend.syncDir(rel)
+}
+
+func TestFailedDirectoryFlushKeepsTheCompactionPending(t *testing.T) {
+	dir := t.TempDir()
+	var compactions atomic.Int32
+	host := &failSyncDirHost{}
+	ws := journalWS(t, dir, workspaceOptions{
+		wrapHost: func(b hostBackend) hostBackend {
+			host.hostBackend = b
+			return host
+		},
+		beforeMetaRename: func() error {
+			compactions.Add(1)
+			return nil
+		},
+	})
+	mustWriteFile(t, ws, "a", 0o644)
+	host.fail.Store(true)
+	if err := ws.Sync(); err == nil {
+		t.Fatal("Sync succeeded although the directory flush failed")
+	}
+	host.fail.Store(false)
+	// The rename may not be durable, so the next flush writes the whole
+	// table again instead of appending to the renamed file.
+	if err := ws.Chmod("a", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, ws)
+	if n := compactions.Load(); n != 2 {
+		t.Fatalf("%d compactions after a failed directory flush, want 2", n)
+	}
+	if got := readMetaTable(t, filepath.Join(dir, MetaFileName))["a"].Mode & 0o7777; got != 0o600 {
+		t.Fatalf("record a on disk has mode %o, want 600", got)
+	}
+	// With the directory flushed, appends resume.
+	if err := ws.Chmod("a", 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, ws)
+	if n := compactions.Load(); n != 2 {
+		t.Fatalf("%d compactions after the directory flush recovered, want 2", n)
 	}
 }

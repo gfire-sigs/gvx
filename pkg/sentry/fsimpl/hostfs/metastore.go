@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -172,6 +173,10 @@ func metaKey(k string) (string, bool) {
 }
 
 func parseJournal(raw []byte) (metaImage, error) {
+	if len(raw) < journalHeader && strings.HasPrefix(journalMagic+string(rune(journalVersion)), string(raw)) {
+		// A prefix of the header holds no record. The next flush replaces it.
+		return metaImage{entries: map[string]POSIXAttr{}, torn: true}, nil
+	}
 	if len(raw) < journalHeader || string(raw[:len(journalMagic)]) != journalMagic {
 		return metaImage{}, fmt.Errorf("hostfs: %s has an unknown format", MetaFileName)
 	}
@@ -545,10 +550,16 @@ func (w *Workspace) compactMeta(ops []metaOp) (err error) {
 		return fmt.Errorf("hostfs: replace %s: %w", MetaFileName, rerr)
 	}
 	renamed = true
-	w.journal.size, w.journal.ops, w.journal.compact = size, len(ops), false
+	w.journal.size, w.journal.ops = size, len(ops)
+	// The new file is not durable until the directory entry is. A failed
+	// flush of the directory keeps the compaction pending, so the next flush
+	// writes the file again instead of appending to a name that a crash can
+	// still resolve to the old file.
+	w.journal.compact = true
 	if derr := w.host.syncDir("."); derr != nil {
 		return fmt.Errorf("hostfs: sync workspace directory: %w", derr)
 	}
+	w.journal.compact = false
 	return nil
 }
 
