@@ -19,6 +19,7 @@ package mm
 import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 // Only the Windows systrap engine needs to learn of writes that the Sentry
@@ -31,4 +32,8 @@ func (mm *MemoryManager) hostWriteWrap(_ hostarch.AddrRange, f func(safemem.Bloc
 
 func (mm *MemoryManager) hostWriteWrapVec(_ hostarch.AddrRangeSeq, f func(safemem.BlockSeq) (uint64, error)) func(safemem.BlockSeq) (uint64, error) {
 	return f
+}
+
+func mapInternalOf(file memmap.File, fr memmap.FileRange, perms hostarch.AccessType) (safemem.BlockSeq, error) {
+	return file.MapInternal(fr, perms)
 }

@@ -1092,7 +1092,7 @@ func (pseg pmaIterator) internalMappingsOfLocked(ar hostarch.AddrRange) (safemem
 	perms := pma.maxPerms
 	// We will never execute application code through an internal mapping.
 	perms.Execute = false
-	return pma.file.MapInternal(pseg.fileRangeOf(ar), perms)
+	return mapInternalOf(pma.file, pseg.fileRangeOf(ar), perms)
 }
 
 // internalMappingsUncached returns true if internal mappings for pseg should

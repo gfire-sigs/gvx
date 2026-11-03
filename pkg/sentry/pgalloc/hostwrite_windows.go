@@ -17,8 +17,11 @@
 package pgalloc
 
 import (
+	"fmt"
 	"sync/atomic"
 
+	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sync"
 )
@@ -90,6 +93,17 @@ func (f *MemoryFile) ObserveHostWrites(fn func(memmap.FileRange)) (stop func()) 
 			hostWriteObservers.Add(-1)
 		})
 	}
+}
+
+// MapInternalUnreported is MapInternal that does not report a request for
+// write access. The memory manager maps a whole pma with its maximum
+// permissions before it knows whether the access writes, and it reports each
+// write itself.
+func (f *MemoryFile) MapInternalUnreported(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	if !fr.WellFormed() || fr.Length() == 0 {
+		panic(fmt.Sprintf("invalid range: %v", fr))
+	}
+	return f.mapInternal(fr, at)
 }
 
 // NoteHostWrite tells the observers of f that Sentry code wrote fr.
