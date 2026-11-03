@@ -77,13 +77,13 @@ func (b *pollBackend) run(stop <-chan struct{}, interval time.Duration) {
 		b.running.Add(-1)
 		b.wg.Done()
 	}()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-stop:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 		b.mu.Lock()
 		list := make([]*watchEntry, 0, len(b.entries))
@@ -92,7 +92,11 @@ func (b *pollBackend) run(stop <-chan struct{}, interval time.Duration) {
 		}
 		b.mu.Unlock()
 		slices.SortFunc(list, func(x, y *watchEntry) int { return cmp.Compare(x.seq, y.seq) })
+		start := time.Now()
 		b.hw.rescanEntries(list, stop)
+		// A long pass stretches the wait, so the scans take a bounded share of
+		// one core however many objects are watched.
+		timer.Reset(pollDelay(interval, time.Since(start)))
 	}
 }
 

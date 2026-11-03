@@ -16,6 +16,10 @@
 
 package hostfs
 
+// watchBackendDescriptors is the number of descriptors that the backend holds
+// besides the pinned handles: none. See watchLimitFromNofile.
+const watchBackendDescriptors = 0
+
 // newWatchBackend returns the host watcher backend when no native backend is
 // used. It is the revalidator of watcher_poll.go. On Linux, the seccomp rule
 // set that the Sentry installs after hostlockdown.Apply allows openat with

@@ -52,8 +52,10 @@ import (
 
 const (
 	// watchBufferSize is the size of the buffer of one ReadDirectoryChangesW
-	// call.
-	watchBufferSize = 64 * 1024
+	// call. A completion only wakes a scan, and an overflow wakes a scan of the
+	// whole directory, so the buffer never needs the names of the changes. A
+	// small buffer keeps the memory of a large cap low.
+	watchBufferSize = 4 * 1024
 
 	// watchFilter selects the changes that wake a scan.
 	watchFilter = windows.FILE_NOTIFY_CHANGE_FILE_NAME | windows.FILE_NOTIFY_CHANGE_DIR_NAME |
