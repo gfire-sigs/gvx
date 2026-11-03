@@ -91,6 +91,11 @@ type hostBackend interface {
 	// path.
 	syncDirAt(dir hostDirHandle) error
 
+	// existsByID reports whether the host still holds a file with the
+	// identity key, without a path. It returns errHostUnsupported on a host
+	// or a volume that cannot open a file by identity. See fileKey.
+	existsByID(key fileKey) (bool, error)
+
 	// hostOps holds the host calls of the extended operations of GVXIP-001
 	// section 4.3. See host_ops.go.
 	hostOps
@@ -124,12 +129,46 @@ type hostID struct {
 	ino uint64
 }
 
+// fileKey identifies one host file for as long as the file exists. A record
+// of .gvx_meta keys on it, so a host process that renames the file keeps the
+// record, and a new file that reuses an inode number gets none.
+//
+// On Windows the key holds the volume serial number and the 128-bit file id of
+// FILE_ID_INFO in dev, ino, and ino2. NTFS and ReFS never reuse the pair while
+// the volume lives. On Linux and macOS the key holds the device, the inode
+// number, and the birth time in nanoseconds in btime. The birth time tells a
+// new file from an old one that had the same inode number. ext4 reuses an
+// inode number at the next create, so the inode number alone is not enough.
+//
+// A backend stores the raw device number in dev. The Workspace replaces the
+// device of the workspace root with zero before it stores a key, so a volume
+// that gets another device number after a reboot keeps its records.
+type fileKey struct {
+	dev   uint64
+	ino   uint64
+	ino2  uint64
+	btime int64
+}
+
+// isZero reports whether k names no file.
+func (k fileKey) isZero() bool {
+	return k == fileKey{}
+}
+
 // hostInfo is the host metadata of one entry, obtained without following
 // symbolic links.
 type hostInfo struct {
 	kind hostKind
 	id   hostID
-	size int64
+	// fid is the identity that .gvx_meta records key on. A backend sets it on
+	// every successful stat. A listing entry that was not stat-ed has a zero
+	// fid.
+	fid fileKey
+	// fidOK reports that fid is trustworthy on this host: the birth time is a
+	// real birth time on Linux and macOS, and FILE_ID_INFO answered on
+	// Windows. A volume whose files report false keeps its records by path.
+	fidOK bool
+	size  int64
 	// blocks is the allocation size in 512-byte units.
 	blocks int64
 	nlink  uint32

@@ -144,8 +144,7 @@ func parseDirents(dirfd int, buf []byte, out []hostDirEntry) ([]hostDirEntry, er
 		}
 		kind, ok := direntKind(rec[direntTypeOffset])
 		if !ok {
-			var st unix.Stat_t
-			serr := retryEINTR(func() error { return unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) })
+			info, serr := lstatatInfo(dirfd, name)
 			if errors.Is(serr, unix.ENOENT) {
 				// The entry vanished after the listing: a concurrent unlink.
 				continue
@@ -153,7 +152,6 @@ func parseDirents(dirfd int, buf []byte, out []hostDirEntry) ([]hostDirEntry, er
 			if serr != nil {
 				return out, fmt.Errorf("hostfs: lstat %q: %w", name, serr)
 			}
-			info := statToHostInfo(&st)
 			out = append(out, hostDirEntry{name: name, kind: info.kind, ino: info.id.ino})
 			continue
 		}

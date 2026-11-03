@@ -42,6 +42,42 @@ func probeCaseInsensitive(dir *os.File) (bool, error) {
 	return sensitive == 0, nil
 }
 
-func birthTime(st *unix.Stat_t) time.Time {
-	return time.Unix(int64(st.Btim.Sec), int64(st.Btim.Nsec))
+// lstatatInfo reads the metadata of name inside the directory dirfd without
+// following a link.
+func lstatatInfo(dirfd int, name string) (hostInfo, error) {
+	var st unix.Stat_t
+	if err := retryEINTR(func() error { return unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+		return hostInfo{}, err
+	}
+	return statToHostInfo(&st), nil
+}
+
+// fstatInfo reads the metadata of the open descriptor fd.
+func fstatInfo(fd int) (hostInfo, error) {
+	var st unix.Stat_t
+	if err := retryEINTR(func() error { return unix.Fstat(fd, &st) }); err != nil {
+		return hostInfo{}, err
+	}
+	return statToHostInfo(&st), nil
+}
+
+// statToHostInfo converts a stat result. APFS and HFS+ always report a birth
+// time, so the identity key is trustworthy whenever the birth time is not
+// zero.
+func statToHostInfo(st *unix.Stat_t) hostInfo {
+	btime := int64(st.Btim.Sec)*int64(time.Second) + int64(st.Btim.Nsec)
+	return hostInfo{
+		kind:   hostKindOfMode(st.Mode),
+		id:     hostID{dev: uint64(st.Dev), ino: uint64(st.Ino)},
+		fid:    fileKey{dev: uint64(st.Dev), ino: uint64(st.Ino), btime: btime},
+		fidOK:  btime != 0,
+		size:   st.Size,
+		blocks: st.Blocks,
+		nlink:  uint32(st.Nlink),
+		perm:   st.Mode & 0o7777,
+		atime:  time.Unix(int64(st.Atim.Sec), int64(st.Atim.Nsec)),
+		mtime:  time.Unix(int64(st.Mtim.Sec), int64(st.Mtim.Nsec)),
+		ctime:  time.Unix(int64(st.Ctim.Sec), int64(st.Ctim.Nsec)),
+		btime:  time.Unix(int64(st.Btim.Sec), int64(st.Btim.Nsec)),
+	}
 }
