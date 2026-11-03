@@ -37,6 +37,10 @@ type countingHost struct {
 
 	mu    sync.Mutex
 	calls map[string]int
+	// steps sums the path components of the path-based calls. Such a call
+	// opens each parent directory in turn, so it costs about one host system
+	// call per component. A pinned call costs one.
+	steps int
 
 	insensitive *bool
 	verified    *bool
@@ -51,11 +55,43 @@ func (c *countingHost) count(name string) {
 	c.calls[name]++
 }
 
+// countPath counts a path-based call and the components that it walks.
+func (c *countingHost) countPath(name string, rels ...string) {
+	c.count(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, rel := range rels {
+		c.steps += len(strings.Split(rel, "/"))
+	}
+}
+
 // reset forgets the calls so far.
 func (c *countingHost) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls = nil
+	c.steps = 0
+}
+
+// syscalls estimates the host system calls of the counted calls: a pinned
+// call makes one, and a path-based call makes one for each path component.
+func (c *countingHost) syscalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.steps
+	for name, v := range c.calls {
+		if !pathCalls[name] {
+			n += v
+		}
+	}
+	return n
+}
+
+// pathCalls names the counted calls that take a workspace path.
+var pathCalls = map[string]bool{
+	"open": true, "openDir": true, "lstat": true, "mkdir": true, "unlink": true,
+	"rmdir": true, "rename": true, "link": true, "readlink": true, "readDir": true,
+	"syncDir": true, "chtimes": true,
 }
 
 func (c *countingHost) got(name string) int {
@@ -87,17 +123,17 @@ func (c *countingHost) dump() string {
 }
 
 func (c *countingHost) open(rel string, flags int, perm os.FileMode) (*os.File, error) {
-	c.count("open")
+	c.countPath("open", rel)
 	return c.hostBackend.open(rel, flags, perm)
 }
 
 func (c *countingHost) openDir(rel string) (*os.File, error) {
-	c.count("openDir")
+	c.countPath("openDir", rel)
 	return c.hostBackend.openDir(rel)
 }
 
 func (c *countingHost) lstat(rel string) (hostInfo, error) {
-	c.count("lstat")
+	c.countPath("lstat", rel)
 	return c.hostBackend.lstat(rel)
 }
 
@@ -107,47 +143,47 @@ func (c *countingHost) fstat(f *os.File) (hostInfo, error) {
 }
 
 func (c *countingHost) mkdir(rel string) error {
-	c.count("mkdir")
+	c.countPath("mkdir", rel)
 	return c.hostBackend.mkdir(rel)
 }
 
 func (c *countingHost) unlink(rel string) error {
-	c.count("unlink")
+	c.countPath("unlink", rel)
 	return c.hostBackend.unlink(rel)
 }
 
 func (c *countingHost) rmdir(rel string) error {
-	c.count("rmdir")
+	c.countPath("rmdir", rel)
 	return c.hostBackend.rmdir(rel)
 }
 
 func (c *countingHost) rename(oldRel, newRel string) error {
-	c.count("rename")
+	c.countPath("rename", oldRel, newRel)
 	return c.hostBackend.rename(oldRel, newRel)
 }
 
 func (c *countingHost) link(oldRel, newRel string) error {
-	c.count("link")
+	c.countPath("link", oldRel, newRel)
 	return c.hostBackend.link(oldRel, newRel)
 }
 
 func (c *countingHost) readlink(rel string) (string, error) {
-	c.count("readlink")
+	c.countPath("readlink", rel)
 	return c.hostBackend.readlink(rel)
 }
 
 func (c *countingHost) readDir(rel string) ([]hostDirEntry, error) {
-	c.count("readDir")
+	c.countPath("readDir", rel)
 	return c.hostBackend.readDir(rel)
 }
 
 func (c *countingHost) syncDir(rel string) error {
-	c.count("syncDir")
+	c.countPath("syncDir", rel)
 	return c.hostBackend.syncDir(rel)
 }
 
 func (c *countingHost) chtimes(rel string, atime, mtime *time.Time) error {
-	c.count("chtimes")
+	c.countPath("chtimes", rel)
 	return c.hostBackend.chtimes(rel, atime, mtime)
 }
 
