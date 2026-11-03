@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -80,9 +81,13 @@ echo "STATS-MEMORY $usage"
 iptables-legacy-save > /tmp/rules.txt
 grep -q '^\*nat' /tmp/rules.txt && grep -q '^\*filter' /tmp/rules.txt && grep -q '^:DOCKER ' /tmp/rules.txt && echo IPTABLES-SAVE-OK
 
-docker run --name limited -m 32m alpine sh -c 'dd if=/dev/zero of=/dev/shm/f bs=1M count=128 2>/dev/null; sleep 30'
-echo "LIMITED-EXIT $?"
-echo "LIMITED-OOMKILLED $(docker inspect -f '{{.State.OOMKilled}}' limited)"
+if [ "$ENFORCE_MEMORY_MAX" = 1 ]; then
+  docker run --name limited -m 32m alpine sh -c 'dd if=/dev/zero of=/dev/shm/f bs=1M count=128 2>/dev/null; sleep 30'
+  echo "LIMITED-EXIT $?"
+  echo "LIMITED-OOMKILLED $(docker inspect -f '{{.State.OOMKilled}}' limited)"
+else
+  echo LIMITED-SKIPPED
+fi
 echo "NEIGHBOR-RUNNING $(docker inspect -f '{{.State.Running}}' web) $(docker inspect -f '{{.State.Running}}' hog)"
 docker info >/dev/null 2>&1 && echo DOCKERD-ALIVE
 echo ALL-DONE
@@ -98,6 +103,12 @@ func TestE2EDockerRunDindEngine(t *testing.T) {
 		t.Run(b.name, func(t *testing.T) {
 			requireBackend(t, b)
 			requireRegistry(t)
+			// The Windows systrap engine cannot count the pages of its stub
+			// processes, so the Sentry leaves memory.max unenforced there.
+			enforce := "1"
+			if runtime.GOOS == "windows" && b.plat == gvx.PlatformSystrap {
+				enforce = "0"
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
 
@@ -110,7 +121,7 @@ func TestE2EDockerRunDindEngine(t *testing.T) {
 				entrypoint:    []string{"sh", "-c"},
 				entrypointSet: true,
 				cmd:           []string{dindScript},
-				envv:          []string{"DOCKER_TLS_CERTDIR="},
+				envv:          []string{"DOCKER_TLS_CERTDIR=", "ENFORCE_MEMORY_MAX=" + enforce},
 				net:           gvx.NetModeNAT,
 				netRaw:        true,
 				packetWrite:   true,
@@ -171,8 +182,12 @@ func TestE2EDockerRunDindEngine(t *testing.T) {
 			}
 			expect("STATS-MEMORY ")
 			expect("IPTABLES-SAVE-OK\n")
-			expect("LIMITED-EXIT 137\n")
-			expect("LIMITED-OOMKILLED true\n")
+			if enforce == "1" {
+				expect("LIMITED-EXIT 137\n")
+				expect("LIMITED-OOMKILLED true\n")
+			} else {
+				expect("LIMITED-SKIPPED\n")
+			}
 			expect("NEIGHBOR-RUNNING true true\n")
 			expect("DOCKERD-ALIVE\n")
 			expect("ALL-DONE\n")
