@@ -122,7 +122,7 @@ func TestOpenKeepsTheRecordsOfMissingHostObjectsUntilTheCollectorRuns(t *testing
 		reopened.orphanPass()
 		want := []string{"b", "keepdir", "keepdir/link3", "link2"}
 		if got := metaKeys(reopened); !slices.Equal(got, want) {
-			t.Fatalf("records after one pass = %q, want %q", got, want)
+			t.Fatalf("records after the passes = %q, want %q", got, want)
 		}
 		if got := listNames(t, reopened, "."); !slices.Equal(got, []string{"b", "keepdir", "link2"}) {
 			t.Fatalf("listing = %q", got)
@@ -229,7 +229,7 @@ func TestCollectorKeepsARecordWhenTheLastLookupFails(t *testing.T) {
 		if err := os.Remove(filepath.Join(dir, "gone")); err != nil {
 			t.Fatal(err)
 		}
-		// The pass misses the record of gone. The confirming lookup of its
+		// Both passes miss the record of gone. The confirming lookup of its
 		// path then fails with a permission error, which proves nothing.
 		host.failName.Store("gone")
 		ws.orphanPass()
@@ -242,6 +242,160 @@ func TestCollectorKeepsARecordWhenTheLastLookupFails(t *testing.T) {
 			t.Fatalf("records = %q, want [kept] once the lookup works", got)
 		}
 	})
+}
+
+// stepUntilPending runs steps until a pass has ended with misses and a
+// confirming pass is due.
+func stepUntilPending(t *testing.T, ws *Workspace) {
+	t.Helper()
+	for range 100 {
+		if !ws.orphanStep() {
+			t.Fatal("the collector stopped before it queued a confirming pass")
+		}
+		if !ws.orphans.active && len(ws.orphans.pending) > 0 {
+			return
+		}
+	}
+	t.Fatal("the first pass did not end")
+}
+
+func TestCollectorNeedsTwoPassesInARowToDeleteARecord(t *testing.T) {
+	forEachKeyKind(t, func(t *testing.T, opts workspaceOptions) {
+		dir := resolvedTempDir(t)
+		ws := plainWS(t, dir, opts)
+		mustWriteFile(t, ws, "gone", 0o644)
+		mustWriteFile(t, ws, "kept", 0o644)
+		if err := os.Remove(filepath.Join(dir, "gone")); err != nil {
+			t.Fatal(err)
+		}
+		stepUntilPending(t, ws)
+		if got := metaKeys(ws); !slices.Equal(got, []string{"gone", "kept"}) {
+			t.Fatalf("records after the first pass = %q, want both", got)
+		}
+		if len(ws.orphans.pending) != 1 {
+			t.Fatalf("misses of the first pass = %d, want 1", len(ws.orphans.pending))
+		}
+		for ws.orphanStep() {
+		}
+		if got := metaKeys(ws); !slices.Equal(got, []string{"kept"}) {
+			t.Fatalf("records after the confirming pass = %q, want [kept]", got)
+		}
+		if ws.orphans.pending != nil {
+			t.Fatal("the confirming pass left misses behind")
+		}
+	})
+}
+
+// A host process moves a file from a directory that the walk has not listed
+// into one that it has listed. The first pass misses the record, and the hint
+// names the old path. The confirming pass lists the new place and keeps the
+// record.
+func TestCollectorKeepsTheRecordOfAFileMovedIntoAListedDirectory(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{orphanDirsPerStep: 1})
+	if ws.pathKeys || ws.useIDPass() {
+		t.Skip("the test needs records by identity and a pass that walks the tree")
+	}
+	for _, d := range []string{"a", "b"} {
+		if err := ws.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWriteFile(t, ws, d+"/f", 0o751)
+	}
+	records := ws.meta.size()
+
+	// The first step lists the root and queues both directories. The walk
+	// pops the last one next, so the other one stays unlisted.
+	if !ws.orphanStep() {
+		t.Fatal("the walk ended after the root")
+	}
+	c := &ws.orphans
+	if len(c.queue) != 2 {
+		t.Fatalf("queue = %q, want both directories", c.queue)
+	}
+	listed, unlisted := c.queue[1], c.queue[0]
+	if !ws.orphanStep() {
+		t.Fatal("the walk ended after one directory")
+	}
+	if len(c.queue) != 1 || c.queue[0] != unlisted {
+		t.Fatalf("queue = %q, want [%s]", c.queue, unlisted)
+	}
+	if err := os.Rename(filepath.Join(dir, unlisted, "f"), filepath.Join(dir, listed, "moved")); err != nil {
+		t.Fatal(err)
+	}
+
+	stepUntilPending(t, ws)
+	if len(c.pending) != 1 {
+		t.Fatalf("misses of the first pass = %d, want the moved file", len(c.pending))
+	}
+	for ws.orphanStep() {
+	}
+	requireMode(t, ws, listed+"/moved", 0o751, 0)
+	requireMode(t, ws, listed+"/f", 0o751, 0)
+	if got := ws.meta.size(); got != records {
+		t.Fatalf("records after both passes = %d, want %d", got, records)
+	}
+}
+
+func TestCollectorDropsTheMissesOfAPassThatMetAHostError(t *testing.T) {
+	dir := resolvedTempDir(t)
+	host := &flakyHost{}
+	ws := plainWS(t, dir, workspaceOptions{wrapHost: func(b hostBackend) hostBackend {
+		host.hostBackend = b
+		return host
+	}})
+	mustWriteFile(t, ws, "gone", 0o644)
+	mustWriteFile(t, ws, "kept", 0o644)
+	if err := os.Remove(filepath.Join(dir, "gone")); err != nil {
+		t.Fatal(err)
+	}
+	stepUntilPending(t, ws)
+	host.failListing.Store(true)
+	host.failIDs.Store(true)
+	for ws.orphanStep() {
+	}
+	if ws.orphans.pending != nil {
+		t.Fatal("a pass that met a host error kept the misses of the first pass")
+	}
+	if got := metaKeys(ws); !slices.Equal(got, []string{"gone", "kept"}) {
+		t.Fatalf("records = %q, want both", got)
+	}
+	host.failListing.Store(false)
+	host.failIDs.Store(false)
+	// The failed pass was the confirming one. Two clean passes are due again.
+	ws.orphanPass()
+	if got := metaKeys(ws); !slices.Equal(got, []string{"kept"}) {
+		t.Fatalf("records = %q, want [kept]", got)
+	}
+}
+
+// A volume with path keys has no identity to follow a moved file. A name that
+// is absent in the first pass and present in the second one keeps its record.
+func TestCollectorKeepsThePathRecordOfANameThatTheSecondPassFinds(t *testing.T) {
+	dir := resolvedTempDir(t)
+	ws := plainWS(t, dir, workspaceOptions{pathKeys: true})
+	mustWriteFile(t, ws, "late", 0o751)
+	mustWriteFile(t, ws, "gone", 0o644)
+	if err := os.Remove(filepath.Join(dir, "gone")); err != nil {
+		t.Fatal(err)
+	}
+	late, hidden := filepath.Join(dir, "late"), filepath.Join(dir, "late.tmp")
+	if err := os.Rename(late, hidden); err != nil {
+		t.Fatal(err)
+	}
+	stepUntilPending(t, ws)
+	if len(ws.orphans.pending) != 2 {
+		t.Fatalf("misses of the first pass = %d, want 2", len(ws.orphans.pending))
+	}
+	if err := os.Rename(hidden, late); err != nil {
+		t.Fatal(err)
+	}
+	for ws.orphanStep() {
+	}
+	if got := metaKeys(ws); !slices.Equal(got, []string{"late"}) {
+		t.Fatalf("records = %q, want [late]", got)
+	}
+	requireMode(t, ws, "late", 0o751, 0)
 }
 
 func TestCollectorKeepsTheRecordOfAFileThatAHostProcessMoved(t *testing.T) {
@@ -352,8 +506,8 @@ func TestCollectorLeavesARecordThatTheGuestRecreated(t *testing.T) {
 			t.Fatal(err)
 		}
 		ws.orphanPass()
-		// The first pass collected the old record. The guest creates the name
-		// again, and the next pass must keep the new record.
+		// The passes collected the old record. The guest creates the name
+		// again, and the next passes must keep the new record.
 		if err := ws.Unlink("f"); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			t.Fatal(err)
 		}
@@ -403,7 +557,7 @@ func TestCollectorSkipsADirectoryThatTheHostDeniesAccessTo(t *testing.T) {
 	})
 }
 
-func TestOnePassBoundsTheTableAfterAMassDeletion(t *testing.T) {
+func TestCollectorBoundsTheTableAfterAMassDeletion(t *testing.T) {
 	const files = 2000
 	forEachKeyKind(t, func(t *testing.T, opts workspaceOptions) {
 		dir := resolvedTempDir(t)
@@ -421,7 +575,7 @@ func TestOnePassBoundsTheTableAfterAMassDeletion(t *testing.T) {
 		}
 		ws.orphanPass()
 		if got := ws.meta.size(); got != 0 {
-			t.Fatalf("records after one pass = %d, want 0", got)
+			t.Fatalf("records after the passes = %d, want 0", got)
 		}
 	})
 }
@@ -443,7 +597,7 @@ func TestShortSessionCollectsTheRecordOfAFileThatTheHostDeleted(t *testing.T) {
 		}
 		ws.orphanPass()
 		if got := metaKeys(ws); !slices.Equal(got, []string{"kept"}) {
-			t.Fatalf("records after one pass of a session without a guest write = %q, want [kept]", got)
+			t.Fatalf("records after the passes of a session without a guest write = %q, want [kept]", got)
 		}
 	})
 }

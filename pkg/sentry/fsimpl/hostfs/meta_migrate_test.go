@@ -242,7 +242,7 @@ func TestOlderFormsKeepPathRecordsOnAVolumeWithoutIdentities(t *testing.T) {
 	mustSync(t, ws)
 	ws.orphanPass()
 	if got := metaKeys(ws); slices.Contains(got, "gone") || slices.Contains(got, "nodir/s") {
-		t.Fatalf("records after one pass = %q, want the dead records collected", got)
+		t.Fatalf("records after the passes = %q, want the dead records collected", got)
 	}
 }
 

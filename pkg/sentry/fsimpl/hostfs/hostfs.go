@@ -283,6 +283,9 @@ type workspaceOptions struct {
 	// noOrphanGC stops the background collector of orphan records. Tests
 	// drive the collector by hand.
 	noOrphanGC bool
+	// orphanDirsPerStep replaces orphanStepDirs. Tests use it to stop a walk
+	// between two directories.
+	orphanDirsPerStep int
 	// pathKeys keys the records on guest paths, as on a volume without
 	// trustworthy file identities. Tests use it to model such a volume.
 	pathKeys bool
@@ -396,6 +399,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		journal:          metaJournal{slack: opts.journalSlack},
 		dirTimes:         make(map[recKey]int64),
 		single:           single,
+		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
 	}
 	if w.pathKeys {
 		w.rootKey = recKey{kind: kindPath, path: "."}
