@@ -23,6 +23,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -564,14 +565,52 @@ func newWorkspaceKey(hostPath string, file, readOnly bool) workspaceKey {
 	return workspaceKey{path: hostPath, file: file, readOnly: readOnly}
 }
 
+// nestedKeys reports whether one of the host directories lies inside the
+// other. Two such mounts would keep two .gvx_meta tables for the files of the
+// inner directory, and the tables would drift apart. Case folds on the hosts
+// that fold it.
+func nestedKeys(a, b workspaceKey) bool {
+	if a.path == b.path {
+		return false
+	}
+	return lexicallyInside(a.path, b.path) || lexicallyInside(b.path, a.path)
+}
+
+func lexicallyInside(inner, outer string) bool {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		inner, outer = strings.ToLower(inner), strings.ToLower(outer)
+	}
+	rel, err := filepath.Rel(outer, inner)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// rejectNestedWorkspace fails when the directory mount key lies inside, or
+// contains, the host directory of an earlier mount, and one of the two can
+// write. A read-only mount never writes .gvx_meta, so two read-only mounts keep
+// their tables apart without a conflict. Two mounts of one directory share a
+// workspace, and a mount of a file keeps no table.
+func rejectNestedWorkspace(dirs map[workspaceKey]string, key workspaceKey, guestPath string) error {
+	for other, otherGuest := range dirs {
+		if !nestedKeys(key, other) || (key.readOnly && other.readOnly) {
+			continue
+		}
+		return fmt.Errorf("gvx: mount %s from %q overlaps mount %s from %q: a host directory inside another mounted directory would get a second .gvx_meta table: %w",
+			guestPath, key.path, otherGuest, other.path, ErrInvalidConfig)
+	}
+	return nil
+}
+
 // openMounts prepares the host paths, opens one hostfs workspace for each
 // bind mount and each hostfs volume, opens the image of each ext4lite volume,
 // and records the mounts in the order that the guest mounts them. A path that
 // two mounts share with the same access and the same kind (directory or
 // file) shares one workspace, so two flush loops never write the same
-// metadata file. openMounts must run before the host lockdown.
+// metadata file. A host directory that lies inside another mounted host
+// directory is refused, because the two workspaces would keep diverging
+// tables for the same files. openMounts must run before the host lockdown.
 func (s *Sandbox) openMounts() error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
+	dirMounts := make(map[workspaceKey]string)
 	volumes := make(map[string]bool)
 	for _, m := range s.cfg.mountList() {
 		if m.Kind == MountVolume {
@@ -610,6 +649,12 @@ func (s *Sandbox) openMounts() error {
 			sm.hostPath = hostPath
 			sm.hostFile = isFile
 			key := newWorkspaceKey(hostPath, isFile, m.ReadOnly)
+			if !isFile {
+				if err := rejectNestedWorkspace(dirMounts, key, m.GuestPath); err != nil {
+					return err
+				}
+				dirMounts[key] = m.GuestPath
+			}
 			ws, ok := shared[key]
 			if !ok {
 				if ws, err = hostfs.OpenWorkspace(hostPath, m.ReadOnly); err != nil {

@@ -635,6 +635,73 @@ func TestOpenMountsSharesOneWorkspacePerDirectoryAndAccess(t *testing.T) {
 	}
 }
 
+func TestOpenMountsRejectsDirectoryInsideAnotherMountedDirectory(t *testing.T) {
+	root := t.TempDir()
+	inner := filepath.Join(root, "inner")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "workspace and a bind mount of its subdirectory",
+			cfg:  Config{WorkspacePath: root, Mounts: []Mount{{Kind: MountBind, HostPath: inner, GuestPath: "/inner"}}},
+		},
+		{
+			name: "writable outer and read-only inner",
+			cfg:  Config{WorkspacePath: root, Mounts: []Mount{{Kind: MountBind, HostPath: inner, GuestPath: "/inner", ReadOnly: true}}},
+		},
+		{
+			name: "bind mount listed before its parent",
+			cfg: Config{Mounts: []Mount{
+				{Kind: MountBind, HostPath: inner, GuestPath: "/inner"},
+				{Kind: MountBind, HostPath: root, GuestPath: "/outer"},
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.cfg.normalize(); err != nil {
+				t.Fatal(err)
+			}
+			sb := &Sandbox{cfg: tc.cfg}
+			t.Cleanup(func() { _ = sb.closeMounts() })
+			if err := sb.openMounts(); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("openMounts() = %v, want ErrInvalidConfig for overlapping host directories", err)
+			}
+		})
+	}
+}
+
+func TestOpenMountsAcceptsReadOnlyOverlapAndSiblingDirectories(t *testing.T) {
+	root := t.TempDir()
+	inner := filepath.Join(root, "inner")
+	sibling := filepath.Join(root, "inner-sibling")
+	for _, d := range []string{inner, sibling} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := Config{Mounts: []Mount{
+		{Kind: MountBind, HostPath: root, GuestPath: "/outer", ReadOnly: true},
+		{Kind: MountBind, HostPath: inner, GuestPath: "/inner", ReadOnly: true},
+		{Kind: MountBind, HostPath: sibling, GuestPath: "/sibling", ReadOnly: true},
+	}}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	sb := &Sandbox{cfg: cfg}
+	t.Cleanup(func() {
+		if err := sb.closeMounts(); err != nil {
+			t.Errorf("closeMounts() failed: %v", err)
+		}
+	})
+	if err := sb.openMounts(); err != nil {
+		t.Fatalf("openMounts() = %v, want success: read-only mounts never write a table, and a sibling that shares a name prefix is no overlap", err)
+	}
+}
+
 func TestOpenMountsFailsForMissingBindSourceAndReleasesHandles(t *testing.T) {
 	dir := t.TempDir()
 	sb := &Sandbox{cfg: Config{WorkspacePath: dir, Mounts: []Mount{{Kind: MountBind, HostPath: filepath.Join(dir, "gone"), GuestPath: "/gone"}}}}
