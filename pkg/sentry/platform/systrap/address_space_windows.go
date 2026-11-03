@@ -175,9 +175,9 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create a stub process: %w", err)
 	}
-	wins := []*windowMap{newWindowMap(stubView{sp.proc}, winBase, winLimit)}
-	if p.lowWindow {
-		wins = append(wins, newWindowMap(stubView{sp.proc}, lowBase, lowLimit))
+	wins := make([]*windowMap, 0, len(p.layout))
+	for _, w := range p.layout {
+		wins = append(wins, newWindowMap(stubView{sp.proc}, w.base, w.limit))
 	}
 	as := &addressSpace{
 		p:        p,

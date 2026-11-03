@@ -45,6 +45,7 @@ The engine needs 4KB mappings of a shared memory file in the address space of an
 | A view that starts as `PAGE_READWRITE`, then changes to execute | fails with `ERROR_INVALID_PARAMETER` | fails |
 | Reserve 110 TiB (`0x100000000000` to `0x7ee000000000`) as one placeholder before the loader runs | succeeds in every stub of the probe and of the engine tests | same |
 | Reserve `0x10000` to `0x7ffe0000` as one placeholder before the loader runs | free in 60 of 60 suspended processes; the loader never used it; 64KB views mapped at `0x10000`, `0x400000`, and `0x7ffc0000` | same |
+| Reserve 4 GiB to 64 GiB as one placeholder before the loader runs | taken in 19 of 260 stubs; free in the others (section 3.10) | taken in 15 of 260 stubs |
 | Remote 4KB split, map, protect, unmap | 4.0, 2.6, 2.0, 2.9 µs | 1.7, 1.4, 1.8, 7.2 µs |
 
 The window map in section 6.2 follows these rules. A mapping of arbitrary size becomes one view. A partial unmap unmaps the whole view and maps the surviving parts again.
@@ -250,6 +251,26 @@ The micro-benchmarks showed that a guest `fork` or `fork` and `exec` sometimes n
 
 The one hang on `windows-latest` has the same cause. The goroutine dump of that run showed `Switch` and the interrupter in `stopThread`, as on `arm64`. The thread had one event queued, and its program counter stood at the first instruction of the tail of a slot. The relocated instruction had faulted, so the thread was frozen at an exception inside the island. The test `TestStopThreadReturnsWhenTheThreadFaultsInASlot` makes the relocated MOV of a slot fault. It fails without the fix, and it passes with it. A fault in a relocated instruction of a post-window slot still reports an island address to the guest. The pre-window form translates the address, and the post-window form does not.
 
+### 3.10 Stub Address Space Between 4 GiB and 16 TiB
+
+HotSpot 21 on `arm64` needs address space between 4 GiB and 1 TiB (section 6.2). `TestProbeStubLayout` creates stubs through the engine path: the stub host, `CreateProcessAsUser`, and the debug object. It walks the address space of each stub with `VirtualQueryEx`, once while the stub is suspended and once after the loader ran. Set `GVX_PROBE_LAYOUT=<count>` to run it. The first run used 60 stubs and the second run used 200 stubs on each runner, so 260 stubs each.
+
+| Finding | `amd64` | `arm64` |
+| :--- | :--- | :--- |
+| Regions between 4 GiB and 1 TiB in a suspended stub | two private regions in every stub: 1 MiB and 2 MiB, with a gap of up to 1 MiB between them | same |
+| Regions added in that range by the loader | none | none |
+| Position of the pair | uniform; the lowest start is 14.7 GiB, the highest is 1023.7 GiB, the median is 505 GiB | the lowest start is 4.0 GiB, the highest is 1019.5 GiB, the median is 503 GiB |
+| Stubs with the whole range from 4 GiB to 1 TiB free | 0 of 200 | 0 of 200 |
+| Stubs where the range from 4 GiB to 64 GiB holds a region | 19 of 260 (7.3%) | 15 of 260 (5.8%) |
+| Stubs in which at least one of the 38 HotSpot places is free for 1 GiB | 200 of 200 | 200 of 200 |
+| Fewest stubs in which one place is free for 1 GiB | 199 of 200 | 198 of 200 |
+| Highest end of a region below 16 TiB after the loader ran | 2.86 TiB | 2.92 TiB |
+| Regions between 1 TiB and 3 TiB | the PEB, the TEBs, and the process heaps | same |
+
+The kernel creates the pair before the Sentry can reserve anything, and the pair lies at a random address. The author did not find the cause. The 1 MiB region has a guard page next to one committed page, which matches the initial thread stack. This is inference. A placeholder over the whole range from 4 GiB to 1 TiB cannot succeed, but a placeholder over a part of it fails only when the pair lands in that part. The windows of section 6.2 follow from this.
+
+Temurin 25 (HotSpot 25) started on `windows-11-arm` without the middle window. It maps the CDS archive at `0x3ff800000000` and places the class space behind it, in the high window. The log of `-Xshare:off` shows `Reserving compressed class space anywhere`, and the class space went to `0x38000000` in the low window. HotSpot 21 on the same host printed `Randomizing compressed class space: start from 22 out of 38 locations` and then `Could not allocate compressed class space: 1073741824 bytes`. The cause is `Metaspace::reserve_address_space_for_compressed_classes` in the `jdk-21.0.13-ga` source. On `AARCH64` it tries 4 GiB, 8 GiB, up to 28 GiB, then 32 GiB, 64 GiB, up to 992 GiB, in a ring from a random start. It never asks for another address, and it returns an empty space when the guest refuses all 38. The source comment says that these bases let HotSpot decode a class pointer with one `MOVK` instruction.
+
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
 
 The SPEC lists `ProcessInstrumentationCallback` (information class 40) as the "Unpatched Syscall Safety Net". The kernel calls the callback when it returns to user mode. By then the kernel has already run the NT service. The callback sees the return address in `R10` and can detect a `0F 05` at `R10 - 2`.
@@ -306,11 +327,17 @@ The guest window of a stub is `[0x100000000000, 0x7ee000000000)`. It starts at 1
 
 `windowMap` turns each `MapFile`, `Unmap`, and protection request into the five operations that Windows allows on placeholders. It keeps one extent for each placeholder or view. A mapping of any size becomes one view. A partial change unmaps the whole view and maps the surviving parts again. A randomized test checks the map against a reference model with a fake host that enforces the Windows rules. The code runs on macOS too, so the logic has a fast test on the development host.
 
-The low window is `[0x10000, 0x7ffe0000)`. It holds a non-PIE `ET_EXEC` image at the address that it links to. Go links an `arm64` program at `0x10000`, and most other linkers use `0x400000`. `0x10000` is the lowest user address of Windows, and `0x7ffe0000` is the page of `KUSER_SHARED_DATA`. The range between the two windows belongs to the stub. The platform reports it through `platform.AddressHolePlatform`, the kernel forwards it, and the memory manager never maps there.
+The low window is `[0x10000, 0x7ffe0000)`. It holds a non-PIE `ET_EXEC` image at the address that it links to. Go links an `arm64` program at `0x10000`, and most other linkers use `0x400000`. `0x10000` is the lowest user address of Windows, and `0x7ffe0000` is the page of `KUSER_SHARED_DATA`. 
 
-`windowMap` stays the same. `guestWindows` routes each call to the window that owns the address. An unmap that crosses the hole clears both windows.
+The middle window is `[4 GiB, 64 GiB)`. HotSpot on `arm64` places the compressed class space and the CDS archive at a multiple of 4 GiB below 32 GiB, or at a multiple of 32 GiB below 1 TiB, because it decodes a class pointer with one `MOVK` instruction. It exits when the guest refuses all 38 places. The window holds 8 of them (4 GiB to 28 GiB, and 32 GiB), and the area below 32 GiB where HotSpot puts a zero-based heap. HotSpot asks for these addresses with a requested address, and the memory manager honors a request that lies in a window. `amd64` HotSpot accepts any base and passed without the window. It gets the same layout, which keeps the two engines equal.
 
-`New` decides once whether the platform uses the low window. It brings up one stub with both windows. If that fails, the platform keeps only the high window, and `MinUserAddress` stays at 16 TiB. The decision cannot change later, because the memory manager reads the guest range when a process starts.
+The kernel puts a pair of private regions in a stub at a random address between 4 GiB and 1 TiB before the Sentry can reserve anything (section 3.10). The middle window is therefore taken in about 6% of the stubs. The engine tests discarded 41 of 529 stub starts on `arm64` and 34 of 520 on `amd64`. The Sentry reserves the middle window before the high window. When the reservation fails, it terminates the stub and starts another. One request tries `windowAttempts` = 12 stubs, so it fails in fewer than one case in 10^10. The window is small to keep the number of discarded stubs low: a window of 256 GiB would discard one stub in four. The pool hides the cost of the discarded stubs. `GVX_SYSTRAP_TRACE=3` prints their count.
+
+The platform reports the ranges between the windows through `platform.AddressHolePlatform.UserAddressHoles`, the kernel forwards them, and the memory manager never maps there. With all three windows, the holes are `[0x7ffe0000, 4 GiB)` and `[64 GiB, 16 TiB)`.
+
+`windowMap` stays the same. `guestWindows` routes each call to the window that owns the address. An unmap that crosses a hole clears each window that it touches. The window list of a platform never changes after `New`, so a forked process has the layout of its parent.
+
+`New` decides once which optional windows the platform uses. It brings up one stub with the low window, the middle window, and the high window. If every attempt finds the same optional window taken, the platform drops that window and tries again. If a stub fails for another reason, the platform keeps only the high window, and the first guest reports the cause. `MinUserAddress` is the base of the lowest window that remains. The decision cannot change later, because the memory manager reads the guest range when a process starts.
 
 The repair of a lost FS base treats a small positive offset from zero as a candidate. With the low window, that offset stops at `0x10000`, the lowest guest address. An access above it is a real guest access, for example to the TLS block of a static executable at `0x400000`.
 
@@ -581,6 +608,7 @@ State this limit in every user-facing document for the engine. Do not describe t
 | `address_space_windows.go`, `section_windows.go` | The address space, lazy patching, sections, and the private page pool. |
 | `alias_windows.go` | The index of the copies and the writable views of each frame, and the handler for a write through another view. |
 | `viewmap_xplat.go` | The window map. |
+| `windowlayout_xplat.go` | The list of windows of a platform, and the holes between them. |
 | `context_windows.go` | `Context.Switch`, event classification, and signals. |
 | `platform_windows.go`, `probe_windows.go` | `New`, `Close`, and `Probe`. |
 | `arch_windows_arm64.go`, `arch_windows_amd64.go` | Patching, TLS or FS base, and site emulation for each architecture. |
@@ -601,7 +629,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | Item | State |
 | :--- | :--- |
 | Fast path | Implemented and on by default (section 6.8). The fast path tests pass on `windows-latest` and `windows-11-arm`. The design target is an event round trip of 12 to 27 µs, against 70 to 190 µs for a stop. |
-| Guest addresses outside the two windows | No guest mapping can use an address below `0x10000` or between `0x7ffe0000` and 16 TiB. The memory manager treats the second range as a hole. |
+| Guest addresses outside the windows | No guest mapping can use an address below `0x10000`, between `0x7ffe0000` and 4 GiB, or between 64 GiB and 16 TiB. The memory manager treats the last two ranges as holes. A guest that asks for an address in a hole gets another address, as it does for a busy hint. Go guests, which hint at 768 GiB, take the next hint and run. HotSpot on `arm64` needs one free place in the middle window. A guest that fills the middle window before HotSpot reserves its class space makes HotSpot exit as before. |
 | Writing to the executing page | A store into the page that the thread executes, or into the frame that it executes through a second view, completes through a store step (section 6.4). The page runs the new bytes after the store. Each such store costs three debug stops. Two cases end with SIGSEGV: a store exclusive on `arm64`, and a store from a trampoline slot. |
 | Writes of the Sentry into guest memory | `write(2)` to a shared file mapping, `process_vm_writev`, `ptrace`, and the copy-out of a system call such as `read`, `pread`, or `recv` use the Sentry mapping of the memory file. The memory manager, `MapInternal` with write access, and the chunk cache of `hostfs` and `ext4lite` report each such write to the platform, which drops the copies of the written frames (section 6.3). A caller that gets a raw pointer from `MapInternal` and writes later is reported when it asks for the pointer. A fetch of the page between the request and the store can keep the old bytes until the next report. The Sentry file systems write within the same call. |
 | `arm64` words below the stack pointer | The fast `svc` slot writes one word at `sp - 64`. A guest that keeps data deeper than 32 bytes below `sp` across a system call loses that word. A guest with a stack pointer within 64 bytes of the lowest address of its stack writes outside the stack. No guest that the project runs does either. |
@@ -610,7 +638,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | GS base | A guest sets it with `arch_prctl(ARCH_SET_GS)`. Windows keeps the host `%gs` for the TEB, so the patcher rewrites every `%gs:` memory instruction and every `RDGSBASE` and `WRGSBASE` site, and the engine serves them with the GS base of the guest. `UserModifiedGS` therefore needs no change of the address space. |
 | Workspace files | `pkg/gvx` passes the kernel memory file to `hostfs` and `ext4lite` via `SetChunkMemory`, so writable shared mappings work. A custom `memmap.File` without a host handle maps read-only through a copy and rejects writable shared mappings with `ENODEV`. |
 | Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. On `amd64`, a `syscall` in writable and executable anonymous memory also runs as an NT service. |
-| JIT engines | On `windows-latest`, Node 22 and 24 (V8) run `npm install`, `tsc`, esbuild, swc, a Vite build, and a `docker build` in `docker:dind`. Node 20 runs `npm install` and the TypeScript compiler (issue #24). A JVM is untested. |
+| JIT engines | On `windows-latest`, Node 22 and 24 (V8) run `npm install`, `tsc`, esbuild, swc, a Vite build, and a `docker build` in `docker:dind`. Node 20 runs `npm install` and the TypeScript compiler (issue #24). Temurin 21 (HotSpot with C2, eight threads, the garbage collector, parallel streams, and `membarrier`) passes `TestE2EGateJVM` on `windows-latest` and `windows-11-arm` with `systrap`. Without the middle window, HotSpot 21 exits on `windows-11-arm` (section 3.10). Temurin 25 starts there without it. Other JVMs and the `javac` of other versions are untested. |
 | Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |
 | Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
 
@@ -637,6 +665,12 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | `39903063365`, `39903065819` | `amd64`, `arm64` | The low window end to end. Executables at `0x10000` and `0x400000` run. The `amd64` build of herdr (static-PIE) and the `arm64` build (`ET_EXEC` at `0x400000`) print their version and their API schema. |
 | `39903271799` | both | The registry gates fail in both Node gates. The kernel did not forward the address hole, and the address hints of V8 placed memory in it. |
 | `39904398745`, `39905154834` | both, all platforms | The registry gates pass with the low window and the kernel forwarder. |
+| `41719959049` | `arm64` | HotSpot 21 exits with `Could not allocate compressed class space` after it tried the places of section 3.10. Temurin 25 starts. |
+| `41719899003`, `41719904452`, `41720814637`, `41720819408` | `arm64`, `amd64` | The layout of 60 and of 200 new stubs on each runner (section 3.10). |
+| `41722971559`, `41722976828` | `arm64`, `amd64` | The engine tests with the middle window: 41 of 529 and 34 of 520 stub starts discarded (section 6.2). |
+| `41723555819`, `41723560894` | `arm64`, `amd64` | The window tests, 15 runs each: all pass. |
+| `41723984750`, `41723989723` | `arm64`, `amd64` | The same tests without the middle window: `TestPlatformReservesEveryOptionalWindowOnTheCIHosts` and `TestMiddleWindowServesTheHotSpotPlaces` fail. |
+| `41726792306` | all four jobs | `e2e-images` with `TestE2EGateJVM`: Temurin 21 passes on Windows `systrap` (`amd64` and `arm64`), Windows `whpx`, and Linux. |
 
 The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
 
@@ -651,6 +685,12 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 4. Run `go build` in the probe directory with Go 1.24 or newer.
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
+
+To see which ranges of a new stub the kernel and the loader use, run the workflow `diagnose` on each runner with this script. The probe prints a line that starts with `PROBELAYOUT` for each region between 4 GiB and 16 TiB, `PROBEREGION` with the attributes of every region of the first three stubs, `PROBECAND` for each of the 38 HotSpot places, and `PROBESUMMARY`.
+
+```bash
+GVX_PROBE_LAYOUT=200 go test -count=1 -v -run TestProbeStubLayout ./pkg/sentry/platform/systrap/ | grep PROBE
+```
 
 To compare the backends, run the workflow `diagnose` with this script. The test prints one line that starts with `MBRESULT` or `MBSUMMARY` for each number. Add `GVX_E2E_BENCH_ONLY=fork_wait` to run one benchmark, and `GVX_E2E_BENCH_REPEAT=8` to change the number of runs. On Linux, add `CGO_ENABLED=0`.
 

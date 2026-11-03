@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"slices"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -23,30 +24,33 @@ import (
 
 type holePlatform struct {
 	platform.Platform
-	hole hostarch.AddrRange
+	holes []hostarch.AddrRange
 }
 
-func (p holePlatform) UserAddressHole() hostarch.AddrRange { return p.hole }
+func (p holePlatform) UserAddressHoles() []hostarch.AddrRange { return p.holes }
 
 type plainPlatform struct{ platform.Platform }
 
-// TestKernelForwardsThePlatformAddressHole checks the view that the memory
-// manager has. It takes the kernel as its platform, so a hole that only the
+// TestKernelForwardsThePlatformAddressHoles checks the view that the memory
+// manager has. It takes the kernel as its platform, so holes that only the
 // concrete platform reports would stay invisible, and a guest could map
-// memory in it.
-func TestKernelForwardsThePlatformAddressHole(t *testing.T) {
-	hole := hostarch.AddrRange{Start: 0x7ffe0000, End: 0x1000_0000_0000}
-	var p platform.Platform = (&Kernel{Platform: holePlatform{hole: hole}})
+// memory in them.
+func TestKernelForwardsThePlatformAddressHoles(t *testing.T) {
+	holes := []hostarch.AddrRange{
+		{Start: 0x7ffe0000, End: 0x1_0000_0000},
+		{Start: 0x10_0000_0000, End: 0x1000_0000_0000},
+	}
+	var p platform.Platform = (&Kernel{Platform: holePlatform{holes: holes}})
 	hp, ok := p.(platform.AddressHolePlatform)
 	if !ok {
 		t.Fatal("the kernel does not implement platform.AddressHolePlatform")
 	}
-	if got := hp.UserAddressHole(); got != hole {
-		t.Errorf("UserAddressHole() = %v, want the hole of the platform, %v", got, hole)
+	if got := hp.UserAddressHoles(); !slices.Equal(got, holes) {
+		t.Errorf("UserAddressHoles() = %v, want the holes of the platform, %v", got, holes)
 	}
 
 	plain := &Kernel{Platform: plainPlatform{}}
-	if got := plain.UserAddressHole(); got.Length() != 0 {
-		t.Errorf("UserAddressHole() of a platform without a hole = %v, want an empty range", got)
+	if got := plain.UserAddressHoles(); len(got) != 0 {
+		t.Errorf("UserAddressHoles() of a platform without holes = %v, want none", got)
 	}
 }

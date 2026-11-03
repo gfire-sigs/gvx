@@ -18,11 +18,13 @@ import "z.gfire.dev/gvx/pkg/hostarch"
 
 // AddressHolePlatform is an optional interface of a Platform. A platform
 // implements it when its guest address range [MinUserAddress, MaxUserAddress)
-// has one gap that the host owns, so that no guest mapping can use it. The
+// has gaps that the host owns, so that no guest mapping can use them. The
 // guest runs inside a host process, and the host process keeps its own
-// structures in the gap.
+// structures in the gaps.
 type AddressHolePlatform interface {
-	// UserAddressHole returns the gap inside the guest address range. An
-	// empty range means that the range has no gap.
-	UserAddressHole() hostarch.AddrRange
+	// UserAddressHoles returns the gaps inside the guest address range, in
+	// ascending order. The gaps do not overlap, and none is empty. A platform
+	// without gaps returns no ranges. The result does not change while the
+	// platform runs.
+	UserAddressHoles() []hostarch.AddrRange
 }
