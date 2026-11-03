@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"golang.org/x/arch/x86/x86asm"
 	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/internal/xsys/unix"
 
@@ -384,16 +385,8 @@ func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debu
 		regs[i] = th.ctx.u64(ctxOffRax + 8*i)
 	}
 	eflags := th.ctx.u32(ctxOffEFlags)
-	readMem := func(addr uint64, buf []byte) bool {
-		if len(buf) == 0 || addr < as.p.userMin || addr+uint64(len(buf)) > as.p.userMax {
-			return false
-		}
-		var n uintptr
-		err := windows.ReadProcessMemory(th.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
-		return err == nil && n == uintptr(len(buf))
-	}
 	writeMem := func(addr uint64, buf []byte) bool {
-		if len(buf) == 0 || addr < as.p.userMin || addr+uint64(len(buf)) > as.p.userMax {
+		if !as.inGuestRange(addr, len(buf)) {
 			return false
 		}
 		base := blockRound(addr)
@@ -404,7 +397,7 @@ func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debu
 		err := windows.WriteProcessMemory(th.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
 		return err == nil && n == uintptr(len(buf))
 	}
-	res := emulateGSMemInsn(code, ac.StateData().Regs.Gs_base, &regs, &eflags, readMem, writeMem)
+	res := emulateSegMemInsn(code, x86asm.GS, ac.StateData().Regs.Gs_base, &regs, &eflags, as.readGuest, writeMem)
 	if res.fault {
 		th.ctx.setPC(ev.Addr)
 		if err := th.stopAndPull(ac, ev); err != nil {
@@ -436,12 +429,86 @@ func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debu
 	return running, true
 }
 
+// inGuestRange reports whether the n bytes at addr lie in the guest range.
+func (as *addressSpace) inGuestRange(addr uint64, n int) bool {
+	return n > 0 && addr >= as.p.userMin && addr+uint64(n) <= as.p.userMax
+}
+
+// readGuest reads the guest memory at addr into buf through the stub process.
+func (as *addressSpace) readGuest(addr uint64, buf []byte) bool {
+	if !as.inGuestRange(addr, len(buf)) {
+		return false
+	}
+	var n uintptr
+	err := windows.ReadProcessMemory(as.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
+	return err == nil && n == uintptr(len(buf))
+}
+
+// writeGuestWritable writes buf to the guest memory at addr when the stub view
+// of every byte allows writes. It reports false and writes nothing for any
+// other view. WriteProcessMemory makes a read-only page writable for the write.
+// That would skip the write fault that the memory manager needs for copy on
+// write, and the restore of a patched code block. as.mu keeps the views stable
+// between the query and the write.
+func (as *addressSpace) writeGuestWritable(addr uint64, buf []byte) bool {
+	if !as.inGuestRange(addr, len(buf)) {
+		return false
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released {
+		return false
+	}
+	var mbi windows.MemoryBasicInformation
+	if err := windows.VirtualQueryEx(as.sp.proc, uintptr(addr), &mbi, unsafe.Sizeof(mbi)); err != nil {
+		return false
+	}
+	if mbi.State != windows.MEM_COMMIT || (mbi.Protect != windows.PAGE_READWRITE && mbi.Protect != windows.PAGE_EXECUTE_READWRITE) {
+		return false
+	}
+	if uint64(mbi.BaseAddress)+uint64(mbi.RegionSize) < addr+uint64(len(buf)) {
+		return false
+	}
+	var n uintptr
+	err := windows.WriteProcessMemory(as.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
+	return err == nil && n == uintptr(len(buf))
+}
+
+// emulateFSAccess runs the memory instruction at pc, which addresses memory
+// through %fs, in the Sentry with the guest FS base fs. On success, it updates
+// th.ctx and moves the program counter past the instruction. It reports false
+// and leaves th.ctx unchanged for an instruction that it cannot emulate, an
+// atomic one, or an access that the stub views do not allow. The thread then
+// runs the instruction itself.
+func (th *thread) emulateFSAccess(as *addressSpace, pc, fs uint64, code []byte) bool {
+	inst, err := decodeX86(code)
+	if err != nil || inst.Len == 0 || isAtomicMemInsn(inst) {
+		return false
+	}
+	var regs [16]uint64
+	for i := range regs {
+		regs[i] = th.ctx.u64(ctxOffRax + 8*i)
+	}
+	eflags := th.ctx.u32(ctxOffEFlags)
+	if res := emulateSegMemInsn(code, x86asm.FS, fs, &regs, &eflags, as.readGuest, as.writeGuestWritable); !res.ok {
+		return false
+	}
+	for i := range regs {
+		th.ctx.put64(ctxOffRax+8*i, regs[i])
+	}
+	th.ctx.put32(ctxOffEFlags, eflags)
+	th.ctx.setPC(th.resumePC(pc + uint64(inst.Len)))
+	return true
+}
+
 // illegalSignal classifies an illegal-instruction exception.
 func (th *thread) illegalSignal(*addressSpace, uint64) (linuxSig, int32) { return sigILL, illIllOpc }
 
 // archFault repairs a guest access through %fs that faulted because Windows
-// reset the FS base. It returns true when it changed th.ctx so that the thread
-// loads the base and runs the instruction again.
+// reset the FS base. It returns true when it changed th.ctx. The Sentry runs
+// the instruction when it can, so that every repair makes progress. Otherwise
+// the thread runs the instruction again after it loads the base. In both cases
+// the thread continues through the trampoline that loads the base.
 func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent) bool {
 	fs := ac.StateData().Regs.Fs_base
 	pc := th.ctx.pc()
@@ -456,16 +523,28 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		}
 		return false
 	}
-	sum := th.ctx.registerSum()
-	if th.fsFix.pc == pc && th.fsFix.sum == sum && th.fsFix.n >= fsRepairLimit {
-		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x without progress", th.sp.pid, th.tid, th.fsFix.n, pc)
-		return false
-	}
 	code := as.codeBytes(pc, 15)
 	if !hasFSPrefix(code) {
 		if traceEvents && ev.Info[1] < 0x10000 {
 			tracef("pid %d thread %d: no FS repair, no FS prefix at pc %#x, fault at %#x, code % x", th.sp.pid, th.tid, pc, ev.Info[1], code)
 		}
+		return false
+	}
+	if th.emulateFSAccess(as, pc, fs, code) {
+		// A failed trampoline only costs the next FS access one more stop.
+		if err := th.goThroughTrampoline(fs); err != nil {
+			tracef("pid %d thread %d: FS access emulated at pc %#x, no base reload: %v", th.sp.pid, th.tid, pc, err)
+		}
+		if traceAll {
+			tracef("pid %d thread %d: FS access emulated at pc %#x, fault at %#x, access %d", th.sp.pid, th.tid, pc, ev.Info[1], ev.Info[0])
+		}
+		th.fsFix.n = 0
+		th.sp.fsRepairs.Add(1)
+		return true
+	}
+	sum := th.ctx.registerSum()
+	if th.fsFix.pc == pc && th.fsFix.sum == sum && th.fsFix.n >= fsRepairLimit {
+		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x without progress", th.sp.pid, th.tid, th.fsFix.n, pc)
 		return false
 	}
 	if err := th.goThroughTrampoline(fs); err != nil {
@@ -548,14 +627,23 @@ func archStatsLine() string {
 // traps. page is a copy of the original frame. With the fast path, a SYSCALL
 // whose following instructions can move becomes a JMP to a trampoline slot,
 // and every other SYSCALL keeps the trap.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, []winSlotRef, error) {
-	before := as.neighborBytes(base, true, amd64MaxInsnLen)
+//
+// A writable page without an ELF image behind it stays unpatched. Such a page
+// holds the output of a JIT compiler, such as V8, and the data that the
+// compiler keeps beside its code. The guest reads the bytes of the copy that
+// runs, and the scan finds false sites in that data, so a patch would change
+// the data.
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, writable bool) (map[uint16]siteInfo, []winSlotRef, error) {
+	before := as.neighborBytes(base, true, amd64ScanLead)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
 	found := scanAMD64GS(before, page, after, true)
 	if len(found) == 0 {
 		return nil, nil, nil
 	}
 	scope := as.p.scopeOf(ctx, mm, base)
+	if writable && scope.none {
+		return nil, nil, nil
+	}
 	var plan *jmpPlanner
 	if as.p.fast {
 		// The plan reads the original bytes, because an earlier patch changes

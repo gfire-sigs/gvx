@@ -517,7 +517,8 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		return nil
 	}
 	src := blk.src
-	readOnly := !blk.at.Write && src != 0
+	writable := blk.at.Write
+	readOnly := !writable && src != 0
 	as.mu.Unlock()
 
 	// The guest can write the original frame while this copy runs when the
@@ -542,7 +543,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	}
 	if !cleanHit {
 		var err error
-		sites, slots, err = as.patchPage(ctx, mm, base, copyBuf)
+		sites, slots, err = as.patchPage(ctx, mm, base, copyBuf, writable)
 		if err != nil {
 			return err
 		}
@@ -592,7 +593,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 }
 
 // restoreData maps the original frame of a block again, so that a guest write
-// to a writable and executable block succeeds. The next fetch patches again.
+// to a writable and executable block succeeds. The next fetch maps a new copy.
 func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	as.mu.Lock()
 	defer as.mu.Unlock()

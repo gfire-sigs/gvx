@@ -2,6 +2,15 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Node.js on the Windows `amd64` `systrap` engine** (issue #24): `npm install`, `tsc`, `transpileModule()`, esbuild, and `vite build` ended with SIGSEGV (exit code 139), SIGTRAP (exit code 133), or SIGILL (exit code 132) in Node.js 20, 22, and 24. Three engine defects caused this:
+  - The repair of a lost FS base ran the faulting `%fs` instruction again, and Windows could reset the base again first. After eight repairs, the engine reported SIGSEGV. The Sentry now runs the instruction and moves past it, so each repair makes progress.
+  - The engine patched false system call and GS sites in the data that V8 keeps beside its code in writable and executable anonymous memory. V8 then read changed pointers. On `amd64`, such pages now run unpatched. A writable segment of an ELF file stays patched.
+  - The scan saw only 15 bytes before a page, and it found a GS instruction inside a `lea` of Node.js 20. The scan now starts 64 bytes before the page.
+
 ## [v0.5.1] - 2026-11-02
 
 This release lets the unmodified `docker:dind` image run as a persistent Docker Engine that the `docker` command of the host controls. `docs/docker-engine.md` describes the setup on macOS and Windows.

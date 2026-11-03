@@ -22,6 +22,8 @@ import (
 	"math/rand"
 	"reflect"
 	"testing"
+
+	"golang.org/x/arch/x86/x86asm"
 )
 
 // syscallSite returns the expected amd64 SYSCALL site at off.
@@ -138,6 +140,35 @@ func TestScanAMD64SweepsOutvoteWrongStart(t *testing.T) {
 	}
 	if got := scanAMD64(stream[split-15:split], page, nil); !reflect.DeepEqual(got, want) {
 		t.Fatalf("scanAMD64 = %+v, want %+v", got, want)
+	}
+}
+
+func TestScanAMD64LeadFindsBoundariesBeforePage(t *testing.T) {
+	// The end of one page and the start of the next in the node binary of
+	// node:20-alpine on amd64. The page starts with `movzx edx, word [rax+0x28]`,
+	// and `lea rsp, [rbp-0x28]` (48 8d 65 d8) follows at offset 11. Sweeps that
+	// start in the last 15 bytes of the lead mostly decode `8b 90 00 00 00 0f`
+	// as one instruction, and they out-vote the real boundaries. They then report
+	// a GS instruction at the 65 byte of the lea. Its patch made the lea an
+	// illegal instruction.
+	lead := []byte{
+		0x89, 0xc6, 0x6a, 0x00, 0xe8, 0xc7, 0xf0, 0xff, 0xff, 0x48, 0x83, 0xc4, 0x20, 0x41, 0x80, 0x3c,
+		0x24, 0x00, 0x74, 0x4c, 0x48, 0x8b, 0x53, 0x38, 0x31, 0xc9, 0x48, 0x89, 0x02, 0x48, 0x8d, 0x50,
+		0x18, 0x48, 0x89, 0x53, 0x38, 0x0f, 0xb7, 0x50, 0x28, 0x66, 0x85, 0xd2, 0x79, 0x0c, 0x83, 0xe2,
+		0x0f, 0x83, 0xea, 0x07, 0x80, 0xfa, 0x03, 0x0f, 0x96, 0xc1, 0x08, 0x8b, 0x90, 0x00, 0x00, 0x00,
+	}
+	page := catBytes([]byte{
+		0x0f, 0xb7, 0x50, 0x28, 0x80, 0xce, 0x04, 0x66, 0x89, 0x50, 0x28, 0x48, 0x8d, 0x65, 0xd8, 0x5b,
+		0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc3,
+	}, nops(64))
+	if len(lead) != amd64ScanLead {
+		t.Fatalf("lead has %d bytes, want amd64ScanLead = %d", len(lead), amd64ScanLead)
+	}
+	if got := scanAMD64GS(lead[len(lead)-amd64MaxInsnLen:], page, nil, true); len(got) == 0 {
+		t.Fatalf("a lead of %d bytes found no site: the test input is too easy", amd64MaxInsnLen)
+	}
+	if got := scanAMD64GS(lead, page, nil, true); len(got) != 0 {
+		t.Fatalf("scanAMD64GS = %+v, want no site", got)
 	}
 }
 
@@ -431,7 +462,109 @@ func TestPatchAMD64Errors(t *testing.T) {
 	}
 }
 
-func TestScanAMD64GSAndEmulateGSMemInsn(t *testing.T) {
+// TestEmulateSegMemInsnFSAccesses runs the %fs instructions that faulted in
+// Node.js guests on windows/amd64 after Windows reset the FS base: the stack
+// canary load and check, and glibc TLS loads at negative offsets.
+func TestEmulateSegMemInsnFSAccesses(t *testing.T) {
+	const fsBase = 0x7f0000001000
+	tls := make([]byte, 0x2000) // guest memory [fsBase-0x1000, fsBase+0x1000)
+	lo := uint64(fsBase - 0x1000)
+	binary.LittleEndian.PutUint64(tls[0x1000+0x28:], 0x1122334455667788)  // fs:[0x28]
+	binary.LittleEndian.PutUint64(tls[0x1000-0x1b8:], 0xaaaabbbbccccdddd) // fs:[-0x1b8]
+	binary.LittleEndian.PutUint32(tls[0x1000+0x2d0:], 0x80000001)         // fs:[0x2d0]
+	readMem := func(addr uint64, buf []byte) bool {
+		if addr < lo || addr+uint64(len(buf)) > lo+uint64(len(tls)) {
+			return false
+		}
+		copy(buf, tls[addr-lo:])
+		return true
+	}
+	writeMem := func(addr uint64, buf []byte) bool {
+		if addr < lo || addr+uint64(len(buf)) > lo+uint64(len(tls)) {
+			return false
+		}
+		copy(tls[addr-lo:], buf)
+		return true
+	}
+	const (
+		rax = 0
+		rdx = 2
+		rbx = 3
+		rbp = 5
+		r12 = 12
+	)
+	cases := []struct {
+		name    string
+		code    []byte
+		set     map[int]uint64
+		reg     int
+		want    uint64
+		wantZF  bool
+		checkZF bool
+	}{
+		{name: "mov rax, fs:[0x28]", code: []byte{0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}, reg: rax, want: 0x1122334455667788},
+		{name: "mov rdx, fs:[r12] with a negative r12", code: []byte{0x64, 0x49, 0x8b, 0x14, 0x24}, set: map[int]uint64{r12: 0xfffffffffffffe48}, reg: rdx, want: 0xaaaabbbbccccdddd},
+		{name: "mov eax, fs:[0x2d0] clears the upper half", code: []byte{0x64, 0x8b, 0x04, 0x25, 0xd0, 0x02, 0x00, 0x00}, set: map[int]uint64{rax: ^uint64(0)}, reg: rax, want: 0x80000001},
+		{name: "mov ebp, fs:[rbx]", code: []byte{0x64, 0x8b, 0x2b}, set: map[int]uint64{rbx: 0x28}, reg: rbp, want: 0x55667788},
+		{name: "sub rax, fs:[0x28] with an intact canary", code: []byte{0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}, set: map[int]uint64{rax: 0x1122334455667788}, reg: rax, want: 0, checkZF: true, wantZF: true},
+		{name: "sub rax, fs:[0x28] with a smashed canary", code: []byte{0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}, set: map[int]uint64{rax: 0x1122334455667789}, reg: rax, want: 1, checkZF: true, wantZF: false},
+	}
+	for _, c := range cases {
+		var regs [16]uint64
+		for r, v := range c.set {
+			regs[r] = v
+		}
+		var eflags uint32
+		out := emulateSegMemInsn(c.code, x86asm.FS, fsBase, &regs, &eflags, readMem, writeMem)
+		if !out.ok || out.fault {
+			t.Errorf("%s: outcome %+v, want ok", c.name, out)
+			continue
+		}
+		if regs[c.reg] != c.want {
+			t.Errorf("%s: register %d = %#x, want %#x", c.name, c.reg, regs[c.reg], c.want)
+		}
+		if c.checkZF && (eflags&eflagZF != 0) != c.wantZF {
+			t.Errorf("%s: ZF = %v, want %v", c.name, eflags&eflagZF != 0, c.wantZF)
+		}
+	}
+
+	// A GS instruction does not address memory through %fs.
+	var regs [16]uint64
+	var eflags uint32
+	gsLoad := []byte{0x65, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}
+	if out := emulateSegMemInsn(gsLoad, x86asm.FS, fsBase, &regs, &eflags, readMem, writeMem); out.ok {
+		t.Errorf("mov rax, gs:[0x28] emulated through %%fs")
+	}
+}
+
+// TestIsAtomicMemInsn verifies that the FS repair leaves bus-locked
+// instructions to the hardware.
+func TestIsAtomicMemInsn(t *testing.T) {
+	cases := []struct {
+		name string
+		code []byte
+		want bool
+	}{
+		{"mov rax, fs:[0x28]", []byte{0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}, false},
+		{"add fs:[rax], ecx", []byte{0x64, 0x01, 0x08}, false},
+		{"lock add fs:[rax], ecx", []byte{0xf0, 0x64, 0x01, 0x08}, true},
+		{"fs lock add [rax], ecx", []byte{0x64, 0xf0, 0x01, 0x08}, true},
+		{"xchg fs:[rax], rcx", []byte{0x64, 0x48, 0x87, 0x08}, true},
+		{"lock cmpxchg fs:[rdx], rcx", []byte{0xf0, 0x64, 0x48, 0x0f, 0xb1, 0x0a}, true},
+		{"xadd fs:[rdx], ecx", []byte{0x64, 0x0f, 0xc1, 0x0a}, true},
+	}
+	for _, c := range cases {
+		inst, err := decodeX86(c.code)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", c.name, err)
+		}
+		if got := isAtomicMemInsn(inst); got != c.want {
+			t.Errorf("%s: isAtomicMemInsn = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestScanAMD64GSAndEmulateSegMemInsn(t *testing.T) {
 	// Wine64 TEB sequence:
 	//   rdgsbase r8                (f3 49 0f ae c8, len 5)
 	//   mov rax, gs:[0x30]         (65 48 8b 04 25 30 00 00 00, len 9)
@@ -486,7 +619,7 @@ func TestScanAMD64GSAndEmulateGSMemInsn(t *testing.T) {
 	regs[2] = 0xfeedfacecafebabe // RDX
 
 	// 1. mov rax, gs:[0x30]
-	if out := emulateGSMemInsn(code[5:14], gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+	if out := emulateSegMemInsn(code[5:14], x86asm.GS, gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
 		t.Fatalf("emulate mov load = %+v", out)
 	}
 	if regs[0] != gsBase {
@@ -494,12 +627,12 @@ func TestScanAMD64GSAndEmulateGSMemInsn(t *testing.T) {
 	}
 
 	// 2. mov gs:[rcx+0x1480], rdx
-	if out := emulateGSMemInsn(code[14:22], gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+	if out := emulateSegMemInsn(code[14:22], x86asm.GS, gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
 		t.Fatalf("emulate mov store = %+v", out)
 	}
 	// Verify with mov r9, gs:[0x1488] (65 4c 8b 0c 25 88 14 00 00)
 	loadSlot1 := []byte{0x65, 0x4c, 0x8b, 0x0c, 0x25, 0x88, 0x14, 0x00, 0x00}
-	if out := emulateGSMemInsn(loadSlot1, gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+	if out := emulateSegMemInsn(loadSlot1, x86asm.GS, gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
 		t.Fatalf("emulate mov slot1 load = %+v", out)
 	}
 	if regs[9] != 0xfeedfacecafebabe {
@@ -507,7 +640,7 @@ func TestScanAMD64GSAndEmulateGSMemInsn(t *testing.T) {
 	}
 
 	// 3. add qword ptr gs:[0x10], 7
-	if out := emulateGSMemInsn(code[22:32], gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
+	if out := emulateSegMemInsn(code[22:32], x86asm.GS, gsBase, &regs, &eflags, readMem, writeMem); !out.ok || out.fault {
 		t.Fatalf("emulate add = %+v", out)
 	}
 	if teb[0x10] != 42 {
@@ -516,7 +649,7 @@ func TestScanAMD64GSAndEmulateGSMemInsn(t *testing.T) {
 
 	// 4. Out-of-bounds access reports a fault at the target address.
 	badLoad := []byte{0x65, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x40, 0x00, 0x00}
-	if out := emulateGSMemInsn(badLoad, gsBase, &regs, &eflags, readMem, writeMem); !out.fault || out.faultAddr != gsBase+0x4000 {
+	if out := emulateSegMemInsn(badLoad, x86asm.GS, gsBase, &regs, &eflags, readMem, writeMem); !out.fault || out.faultAddr != gsBase+0x4000 {
 		t.Fatalf("emulate out-of-bounds load = %+v, want fault at %#x", out, gsBase+0x4000)
 	}
 }
