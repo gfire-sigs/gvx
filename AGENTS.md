@@ -132,3 +132,32 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_E2E_REQUIRE_NETWORK=1` | Fails, and does not skip, when the registry is unreachable. |
 | `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. The value `2` also prints debug lines, such as each fault that the Sentry cannot resolve. |
 | `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop and the state of each stub. The value `3` prints only the state, the count of each kind of stop, and the count of `amd64` `syscall` sites by patch outcome. The value `4` also samples the program counter and prints the hottest addresses. |
+
+### 5.2 Release Version Rule (Reference Module)
+
+Each release tag has the form `vMAJOR.MINOR.PATCH`. The workflow `release.yml` rejects a tag that differs from the Go module version, so every field obeys SemVer 2.0 and has no leading zero. The PATCH field records the `gvx` release counter and the synced upstream gVisor release.
+
+| Field | Current value | Rule |
+| :--- | :--- | :--- |
+| `MAJOR` | `0` | Keep `0`. |
+| `MINOR` | `6` | Increase by 1 when a release adds a feature or changes behavior. An upstream sync alone does not increase `MINOR`. |
+| `PATCH` | `10002026110200` | Join the four parts of the next table as decimal digits, in table order. |
+
+| PATCH part | Digits | Value in `v0.6.10002026110200` | Rule |
+| :--- | ---: | :--- | :--- |
+| Fixed digit | 1 | `1` | Always `1`. It prevents a leading zero when the counter is `000`. |
+| Release counter | 3 | `000` | Set to `000` when `MINOR` increases. Increase by 1 for every other release, including an upstream sync. |
+| Upstream date | 8 | `20261102` | The `YYYYMMDD` of `release_tag` (`release-YYYYMMDD.N`) in `tools/upstream/sync_manifest.json`. |
+| Upstream suffix | 2 | `00` | The `N` of that `release_tag`, padded to two digits. |
+
+The counter comes before the upstream date, so each later release in one `MINOR` version has a larger PATCH. One `MINOR` version holds at most 1000 releases. After `v0.6.10002026110200`, a fix without an upstream sync is `v0.6.10012026110200`. A later sync to `release-20261109.0` is `v0.6.10022026110900`. A tag with a hyphen, such as `v0.6.10012026110200-rc.1`, publishes a pre-release.
+
+### 5.3 Release Procedure (Procedural Module)
+
+Run this procedure on `main` after CI passes for the last merge. The workflow `release.yml` reads the release notes from `CHANGELOG.md`.
+
+1. Compute the next tag with the rule of Section 5.2.
+2. Rename the `## [Unreleased]` heading of `CHANGELOG.md` to `## [<tag>] - <YYYY-MM-DD>`.
+3. Commit the change as `docs(changelog): release <tag>` and push `main`.
+4. Create the annotated tag `<tag>` on that commit and push it.
+5. Verify that the `release` workflow publishes the archives of the tag.
