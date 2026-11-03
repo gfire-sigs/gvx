@@ -209,3 +209,44 @@ func TestFastPathKeepsTheWordsBelowTheStackPointer(t *testing.T) {
 		}
 	}
 }
+
+// TestFastPathServesSystemCallWhenTheStackPointerIsMisaligned runs a system call
+// with a stack pointer that is not 16-byte aligned. Whether Windows faults on the
+// store of the slot or lets it pass, the guest gets its call and its x18.
+func TestFastPathServesSystemCallWhenTheStackPointerIsMisaligned(t *testing.T) {
+	const value = 0x3838_3838_3838_3838
+	r := newRig(t, newFastPlatform(t))
+	r.program(gConst(18, value), gSyscall(172), movX0FromX18, gSyscall(93))
+	r.ac.SetStack(uintptr(stackVA + blockSize - 0x100 + 8))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 172, r.ac)
+	if got := r.ac.StateData().Regs.Regs[18]; got != value {
+		t.Errorf("x18 at the system call = %#x, want %#x", got, uint64(value))
+	}
+	setRet(r.ac, 1000)
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 93, r.ac)
+	if got := regRet(r.ac); got != value {
+		t.Errorf("x18 after the system call = %#x, want %#x", got, uint64(value))
+	}
+}
+
+// TestInvalidateICacheCostsNoStop runs `ic ivau` between two system calls. The
+// engine replaces the instruction with a nop, so the thread makes no debug stop
+// for it and the second call takes the fast path through a hot resume.
+func TestInvalidateICacheCostsNoStop(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	r.program(gSyscall(1), gInvalidateICache(), gSyscall(2))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	f := fastStats(t, r)
+	stops := f.stops.Load()
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 2, r.ac)
+	if got := f.stops.Load(); got != stops {
+		t.Errorf("debug stops between the two system calls = %d, want %d", got, stops)
+	}
+	if got := f.traps.Load(); got != 2 {
+		t.Errorf("the fast path served %d of 2 system calls", got)
+	}
+}
