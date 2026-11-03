@@ -619,6 +619,7 @@ func (c *fileData) invalidateCleanChunks() {
 			delete(c.Chunks, idx)
 		case base < c.size && base+chunkSize > c.size:
 			clear(ch.Buf[c.size-base:])
+			ch.NoteWrite(int(c.size-base), chunkSize)
 		}
 	}
 	c.DataMu.Unlock()
