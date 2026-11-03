@@ -86,6 +86,7 @@ jobs:
             ./e2e
           go test -count=1 -timeout 30m -run 'TestE2EDockerRun.*/systrap' ./e2e
           go test -count=1 -timeout 40m -run 'TestE2EGateETExec.*/systrap' ./e2e
+          go test -count=1 -timeout 40m -run 'TestE2EGateJVM/systrap' ./e2e
       # Each -run value has one slash, so the pattern before it selects the
       # test and the pattern after it selects the subtest. The step fails
       # instead of skipping when whpx does not start, because
@@ -101,3 +102,4 @@ jobs:
             ./e2e
           go test -count=1 -timeout 30m -run '^(TestE2EDockerRun.*|TestE2EMemoryCgroup.*)$/^whpx$' ./e2e
           go test -count=1 -timeout 40m -run '^TestE2EGateETExec.*$/^whpx$' ./e2e
+          go test -count=1 -timeout 40m -run '^TestE2EGateJVM$/^whpx$' ./e2e
