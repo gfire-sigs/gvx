@@ -1654,7 +1654,7 @@ func (f *MemoryFile) UpdateUsage(memCgIDs map[uint32]struct{}) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if currentUsage == f.knownCommittedBytes {
+	if currentUsage == f.knownCommittedBytes && canSkipUsageScan(memCgIDs) {
 		return nil
 	}
 

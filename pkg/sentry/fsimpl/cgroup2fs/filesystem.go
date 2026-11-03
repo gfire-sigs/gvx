@@ -248,6 +248,10 @@ type filesystem struct {
 	// nextMemCgroupID is used to allocate unique IDs to memory controllers.
 	nextMemCgroupID atomicbitops.Uint32
 
+	// memEnforcer is the state of the goroutine that enforces memory.max. See
+	// memory_xplat.go.
+	memEnforcer memoryEnforcer `state:"nosave"`
+
 	// treeMu protects controller hierarchy enablement traversals, and tracking of owned controllers.
 	treeMu treeRWMutex `state:"nosave"`
 

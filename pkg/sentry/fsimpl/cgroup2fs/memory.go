@@ -47,6 +47,10 @@ type memory struct {
 	// oomGroup is the memory.oom.group setting.
 	// +checkatomic
 	oomGroup atomicbitops.Bool
+
+	// oom holds the counters of memory.events and the state of the enforcer
+	// of maxBytes. See memory_xplat.go.
+	oom oomState `state:"nosave"`
 }
 
 // canEnter implements controller.canEnter.
@@ -81,8 +85,17 @@ func (m *memory) attach(ctx context.Context, actx *attachCtx) {
 // interfaceFiles implements controller.interfaceFiles.
 func (m *memory) interfaceFiles() []interfaceFile {
 	return []interfaceFile{
-		{name: "memory.events", source: &memoryEvents{m: m}, perm: 0444},
+		{
+			name:    "memory.events",
+			source:  &memoryEvents{m: m},
+			perm:    0444,
+			isEvent: true,
+			onEventCreated: func(inode *eventFile) {
+				m.oom.eventsFile = inode
+			},
+		},
 		{name: "memory.current", source: &memoryCurrent{m: m}, perm: 0444},
+		{name: "memory.stat", source: &memoryStat{m: m}, perm: 0444},
 		{name: "memory.max", source: &memoryMax{m: m}, perm: 0644},
 		{name: "memory.high", source: &memoryHigh{m: m}, perm: 0644},
 		{name: "memory.oom.group", source: &memoryOOMGroup{m: m}, perm: 0644, nsDelegatable: true},
@@ -91,7 +104,7 @@ func (m *memory) interfaceFiles() []interfaceFile {
 
 // interfaceFileNames implements controller.interfaceFileNames.
 func (m *memory) interfaceFileNames() []string {
-	return []string{"memory.events", "memory.current", "memory.max", "memory.high", "memory.oom.group"}
+	return []string{"memory.events", "memory.current", "memory.stat", "memory.max", "memory.high", "memory.oom.group"}
 }
 
 // +stateify savable
@@ -101,7 +114,9 @@ type memoryEvents struct {
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (me *memoryEvents) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	buf.WriteString("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0\n")
+	o := &me.m.oom
+	fmt.Fprintf(buf, "low 0\nhigh 0\nmax %d\noom %d\noom_kill %d\noom_group_kill %d\nsock_throttled 0\n",
+		o.hitMax.Load(), o.oom.Load(), o.oomKill.Load(), o.oomGroupKill.Load())
 	return nil
 }
 
@@ -166,7 +181,8 @@ func (mm *memoryMax) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 //
-// Note: Although memory.max is writable and remembers the value, nothing is enforced.
+// A finite limit starts the goroutine that kills tasks of the cgroup when the
+// usage passes the limit. See memory_xplat.go.
 func (mm *memoryMax) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if src.NumBytes() > 1024 {
 		return 0, linuxerr.EINVAL
@@ -181,6 +197,9 @@ func (mm *memoryMax) Write(ctx context.Context, _ *vfs.FileDescription, src user
 		return 0, linuxerr.EINVAL
 	}
 	mm.m.maxBytes.Store(val)
+	if val != math.MaxInt64 {
+		mm.m.c.fs.armMemoryEnforcer(kernel.KernelFromContext(ctx))
+	}
 	return int64(len(buf)), nil
 }
 
@@ -237,8 +256,8 @@ func (mo *memoryOOMGroup) Generate(ctx context.Context, buf *bytes.Buffer) error
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 //
-// Note: Although memory.oom.group is writable and remembers the value, there
-// is no OOM killer to act on it.
+// With memory.oom.group set, the enforcer of memory.max kills every process of
+// the cgroup and not only the largest.
 func (mo *memoryOOMGroup) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if src.NumBytes() > 1024 {
 		return 0, linuxerr.EINVAL
