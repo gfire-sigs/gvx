@@ -251,7 +251,7 @@ func TestHostfsMetaFlushBench(t *testing.T) {
 			}
 			// The flush of a large backlog of dirty host files would dominate
 			// the first measured iterations, so drain it first.
-			for i := range 50 {
+			for i := range 200 {
 				if err := ws.Chmod("f0", uint32(0o600+i%8)); err != nil {
 					t.Fatalf("Chmod: %v", err)
 				}
