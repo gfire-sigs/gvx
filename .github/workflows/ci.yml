@@ -126,6 +126,8 @@ jobs:
           EXT4LITE_REQUIRE_E2FSCK: "1"
           EXT4LITE_REQUIRE_LOOPMOUNT: "1"
         run: go test -race -count=1 $OWNED
+      - name: Test address hole search
+        run: go test -count=1 -run Hole ./pkg/sentry/mm/ ./pkg/sentry/kernel/
       # The upstream systrap platform hangs while it starts in a cgo build, and
       # the race detector needs cgo. The steps below build without cgo.
       - name: Test systrap engine and end-to-end suite
@@ -190,6 +192,9 @@ jobs:
       - name: Test owned packages
         shell: bash
         run: go test -count=1 $OWNED
+      - name: Test address hole search
+        shell: bash
+        run: go test -count=1 -run Hole ./pkg/sentry/mm/ ./pkg/sentry/kernel/
       - name: Test systrap engine and end-to-end suite
         shell: bash
         env:

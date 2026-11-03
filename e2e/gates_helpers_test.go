@@ -60,12 +60,14 @@ type gateBackend struct {
 }
 
 // gateBackends lists the hardware backend of the host and systrap. Systrap
-// subtests skip only when the engine reports a missing prerequisite.
+// subtests skip only when the engine reports a missing prerequisite. On Linux
+// the automatic backend is systrap, so the list holds it once.
 func gateBackends() []gateBackend {
-	return []gateBackend{
-		{string(autoPlatform()), autoPlatform()},
-		{"systrap", gvx.PlatformSystrap},
+	backends := []gateBackend{{string(autoPlatform()), autoPlatform()}}
+	if autoPlatform() != gvx.PlatformSystrap {
+		backends = append(backends, gateBackend{"systrap", gvx.PlatformSystrap})
 	}
+	return backends
 }
 
 // requireBackend skips the calling subtest when the backend cannot start for
