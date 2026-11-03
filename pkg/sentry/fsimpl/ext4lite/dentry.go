@@ -55,6 +55,11 @@ type inode struct {
 	// refs counts the dentries that name this inode. fs.mu protects it.
 	refs int
 
+	// tmpLinkable is true while the inode has no link, and open(2) created it
+	// with O_TMPFILE and without O_EXCL. Such an inode accepts linkat. fs.mu
+	// protects it.
+	tmpLinkable bool
+
 	locks      vfs.FileLocks
 	watches    vfs.Watches
 	writeCount vfs.WriteCount

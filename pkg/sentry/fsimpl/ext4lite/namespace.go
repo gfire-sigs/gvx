@@ -134,15 +134,15 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return nil, linuxerr.EXDEV
 		}
 		src := vd.Dentry().Impl().(*dentry)
-		if src.dead {
-			return nil, linuxerr.ENOENT
-		}
 		si := src.inode
 		if si.isDir() {
 			return nil, linuxerr.EPERM
 		}
 		a := si.attr()
-		if a.links == 0 {
+		// A file with no link has no name to link, unless O_TMPFILE made it
+		// without O_EXCL. A dead dentry of a file with other names links as
+		// well, as in Linux.
+		if a.links == 0 && !si.tmpLinkable {
 			return nil, linuxerr.ENOENT
 		}
 		if a.links >= maxLinks {
@@ -155,6 +155,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return nil, toLinuxErr(err)
 		}
 		si.addLinks(1)
+		si.tmpLinkable = false
 		parent.inode.touchMCtime()
 		si.watches.Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
 		return si, nil

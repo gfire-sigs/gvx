@@ -67,16 +67,19 @@ type auModel struct {
 	nextID uint32
 	// ids records every identity that ever lived at a path.
 	ids map[string]map[uint32]bool
+	// loose marks the identities whose bytes moved to other offsets of the
+	// file, so that the bytes no longer follow auByte.
+	loose map[uint32]bool
 }
 
 func newAuModel() *auModel {
-	m := &auModel{nodes: map[string]*auMNode{"/": {id: 1, dir: true}}, nextID: 1, ids: map[string]map[uint32]bool{}}
+	m := &auModel{nodes: map[string]*auMNode{"/": {id: 1, dir: true}}, nextID: 1, ids: map[string]map[uint32]bool{}, loose: map[uint32]bool{}}
 	return m
 }
 
 // clone copies the model, including the content of every file.
 func (m *auModel) clone() *auModel {
-	c := &auModel{nodes: make(map[string]*auMNode, len(m.nodes)), nextID: m.nextID, ids: map[string]map[uint32]bool{}}
+	c := &auModel{nodes: make(map[string]*auMNode, len(m.nodes)), nextID: m.nextID, ids: map[string]map[uint32]bool{}, loose: maps2(m.loose)}
 	copied := map[*auMNode]*auMNode{}
 	for p, n := range m.nodes {
 		if cn, ok := copied[n]; ok {

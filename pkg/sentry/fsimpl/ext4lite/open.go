@@ -25,7 +25,7 @@ import (
 // OpenAt implements vfs.FilesystemImpl.OpenAt.
 func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	if opts.Flags&linux.O_TMPFILE != 0 {
-		return nil, linuxerr.EOPNOTSUPP
+		return fs.openTmpfile(ctx, rp, opts)
 	}
 
 	if opts.Flags&linux.O_CREAT == 0 {

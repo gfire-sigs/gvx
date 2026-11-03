@@ -108,8 +108,8 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
 	}
-	if opts.Flags&^linux.RWF_HIPRI != 0 {
-		return 0, linuxerr.EOPNOTSUPP
+	if err := checkRWFlags(opts.Flags); err != nil {
+		return 0, err
 	}
 	n := dst.NumBytes()
 	if n == 0 {
@@ -197,8 +197,8 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 		return 0, offset, linuxerr.EINVAL
 	}
 	// RWF_DSYNC and RWF_SYNC behave as O_DSYNC and O_SYNC for this call.
-	if opts.Flags&^(linux.RWF_HIPRI|linux.RWF_DSYNC|linux.RWF_SYNC) != 0 {
-		return 0, offset, linuxerr.EOPNOTSUPP
+	if err := checkRWFlags(opts.Flags); err != nil {
+		return 0, offset, err
 	}
 	d := fd.dentry
 	if d.fs.readOnly {
@@ -250,7 +250,7 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
 
-	if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 {
+	if appendsWrite(fd.vfsfd.StatusFlags(), opts.Flags) {
 		ino.n.mu.RLock()
 		offset = int64(ino.n.size)
 		ino.n.mu.RUnlock()
@@ -381,25 +381,25 @@ func (fd *regularFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 	return fd.dentry.fs.syncInode(ino)
 }
 
-// Allocate implements vfs.FileDescriptionImpl.Allocate. It supports mode 0,
-// FALLOC_FL_KEEP_SIZE, and FALLOC_FL_PUNCH_HOLE with FALLOC_FL_KEEP_SIZE.
+// Allocate implements vfs.FileDescriptionImpl.Allocate. It serves the modes of
+// ext4: a reservation (mode 0 and FALLOC_FL_KEEP_SIZE), FALLOC_FL_PUNCH_HOLE
+// with FALLOC_FL_KEEP_SIZE, FALLOC_FL_ZERO_RANGE with or without
+// FALLOC_FL_KEEP_SIZE, FALLOC_FL_COLLAPSE_RANGE, and FALLOC_FL_INSERT_RANGE.
+// The checks and their order follow vfs_fallocate and ext4_fallocate.
 func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
-	const supported = linux.FALLOC_FL_KEEP_SIZE | linux.FALLOC_FL_PUNCH_HOLE
-	if mode&^supported != 0 {
-		return linuxerr.EOPNOTSUPP
-	}
-	punch := mode&linux.FALLOC_FL_PUNCH_HOLE != 0
-	keepSize := mode&linux.FALLOC_FL_KEEP_SIZE != 0
-	if punch && !keepSize {
-		return linuxerr.EOPNOTSUPP
-	}
 	if length == 0 || offset > math.MaxInt64 || length > math.MaxInt64 {
 		return linuxerr.EINVAL
 	}
-	if offset+length < offset || offset+length > math.MaxInt64 {
+	op, keepSize, err := parseAllocMode(mode)
+	if err != nil {
+		return err
+	}
+	if offset+length < offset || offset+length > maxFileSize {
 		return linuxerr.EFBIG
 	}
-	if !keepSize && limits.FromContext(ctx) != nil {
+	d := fd.dentry
+	ino := d.inode
+	if !keepSize && limits.FromContext(ctx) != nil && (op == allocReserve || op == allocZero && offset+length > ino.size()) {
 		// Like Linux, a call that grows the file past RLIMIT_FSIZE fails whole.
 		limit, err := vfs.CheckLimit(ctx, int64(offset), int64(length))
 		if err != nil {
@@ -409,19 +409,29 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 			return linuxerr.EFBIG
 		}
 	}
-	d := fd.dentry
-	ino := d.inode
-	return d.fs.writeOp(fd.vfsfd.Mount(), func() error { return fd.allocateLocked(ino, offset, length, punch, keepSize) })
+	return d.fs.writeOp(fd.vfsfd.Mount(), func() error { return fd.allocateLocked(ino, op, offset, length, keepSize) })
+}
+
+// ServesFallocateModes marks the description for the fallocate system call. The
+// call forwards a mode other than 0 only to a description with this method.
+func (fd *regularFD) ServesFallocateModes() {}
+
+// size returns the size of the file.
+func (i *inode) size() uint64 {
+	i.n.mu.RLock()
+	defer i.n.mu.RUnlock()
+	return i.n.size
 }
 
 // allocateLocked runs a validated fallocate in the operation gate. The gate
-// comes before wmu, as in every operation.
-func (fd *regularFD) allocateLocked(ino *inode, offset, length uint64, punch, keepSize bool) error {
+// comes before wmu, as in every operation. Dirty mapped pages in the range reach
+// the engine first, so the engine change covers them as well.
+func (fd *regularFD) allocateLocked(ino *inode, op allocOp, offset, length uint64, keepSize bool) error {
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
-	if punch {
-		// Dirty mapped pages in the range reach the engine first, so the punch
-		// removes them as well.
+	old := ino.size()
+	switch op {
+	case allocPunch:
 		if err := ino.data.FlushRange(offset, offset+length); err != nil {
 			return toLinuxErr(err)
 		}
@@ -429,19 +439,35 @@ func (fd *regularFD) allocateLocked(ino *inode, offset, length uint64, punch, ke
 			return toLinuxErr(err)
 		}
 		ino.data.Punched(offset, length)
-		ino.touchMCtime()
-		return nil
+	case allocZero:
+		if err := ino.data.FlushRange(offset, offset+length); err != nil {
+			return toLinuxErr(err)
+		}
+		if err := ino.n.zeroRange(offset, length, keepSize); err != nil {
+			return toLinuxErr(err)
+		}
+		ino.data.Punched(offset, length)
+		ino.data.truncated(old, ino.size())
+	case allocCollapse, allocInsert:
+		// Every byte from the offset on moves, so the mapped pages from there
+		// on go away. A mapping reads them again from the engine.
+		if err := ino.data.FlushRange(offset, math.MaxUint64); err != nil {
+			return toLinuxErr(err)
+		}
+		change := ino.n.collapseRange
+		if op == allocInsert {
+			change = ino.n.insertRange
+		}
+		if err := change(offset, length); err != nil {
+			return toLinuxErr(err)
+		}
+		ino.data.InvalidateFrom(offset)
+	default:
+		if err := ino.n.preallocate(offset, length, keepSize); err != nil {
+			return toLinuxErr(err)
+		}
+		ino.data.truncated(old, ino.size())
 	}
-	ino.n.mu.RLock()
-	old := ino.n.size
-	ino.n.mu.RUnlock()
-	if err := ino.n.preallocate(offset, length, keepSize); err != nil {
-		return toLinuxErr(err)
-	}
-	ino.n.mu.RLock()
-	size := ino.n.size
-	ino.n.mu.RUnlock()
-	ino.data.truncated(old, size)
 	ino.touchMCtime()
 	return nil
 }

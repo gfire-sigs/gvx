@@ -523,6 +523,33 @@ func (c *Cache) InvalidateShrink(size uint64, dropped []*Chunk) {
 	}
 }
 
+// InvalidateFrom drops every chunk that overlaps [start, infinity) and
+// invalidates the mappings of that range. A mapping then loads the bytes again
+// from the backend. A backend calls it after a change that moves the bytes of a
+// file, such as a collapse or an insert of a range, and it writes back the dirty
+// chunks of the range before.
+func (c *Cache) InvalidateFrom(start uint64) {
+	if !c.Active.Load() {
+		return
+	}
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
+	c.DataMu.Lock()
+	var dropped []*Chunk
+	for idx, ch := range c.Chunks {
+		if idx<<ChunkShift+ChunkSize > start {
+			dropped = append(dropped, ch)
+			delete(c.Chunks, idx)
+		}
+	}
+	c.DataMu.Unlock()
+	pgstart := hostarch.PageRoundDown(start)
+	c.Mappings.Invalidate(memmap.MappableRange{Start: pgstart, End: math.MaxUint64}, memmap.InvalidateOpts{})
+	for _, ch := range dropped {
+		ch.Release()
+	}
+}
+
 // ChunkLocked returns the chunk at idx, loading it from the backend when absent.
 func (c *Cache) ChunkLocked(idx uint64) (*Chunk, error) {
 	if ch, ok := c.Chunks[idx]; ok {
