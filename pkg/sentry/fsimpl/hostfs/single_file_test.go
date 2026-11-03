@@ -432,3 +432,40 @@ func TestOpenWorkspaceOfAFilePinsTheParent(t *testing.T) {
 func runtimeHasUnixModes() bool {
 	return runtime.GOOS != "windows"
 }
+
+func TestSingleFileWorkspaceMethodsReachTheBoundFile(t *testing.T) {
+	dir := resolvedTempDir(t)
+	file := filepath.Join(dir, singleName)
+	if err := os.WriteFile(file, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := OpenWorkspace(file, false)
+	if err != nil {
+		t.Fatalf("OpenWorkspace of a file: %v", err)
+	}
+	defer func() { _ = ws.Close() }()
+
+	got, err := ws.ReadFile(".")
+	if err != nil || string(got) != "content" {
+		t.Fatalf("ReadFile(.) = (%q, %v), want the bound file", got, err)
+	}
+	if err := ws.Truncate(".", 3); err != nil {
+		t.Fatalf("Truncate(.): %v", err)
+	}
+	f, err := ws.OpenFile(".", os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile(.) for writing: %v", err)
+	}
+	if _, err := f.WriteAt([]byte("X"), 0); err != nil {
+		t.Fatalf("write through OpenFile(.): %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(file); err != nil || string(raw) != "Xon" {
+		t.Fatalf("host file = (%q, %v), want Xon", raw, err)
+	}
+	if _, err := ws.ReadFile("sibling.txt"); err == nil {
+		t.Fatal("ReadFile of a sibling name succeeded in single-file mode")
+	}
+}

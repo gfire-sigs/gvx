@@ -463,7 +463,7 @@ func TestHostSymlinksNeverTraversed(t *testing.T) {
 }
 
 func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
-	e := newEnv(t)
+	e, _, clock := newCountEnv(t)
 	e.mustMkdir("d")
 	e.writeFile("d/f", []byte("inside"))
 	outside := t.TempDir()
@@ -478,11 +478,8 @@ func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
 	if err := os.Symlink(outside, e.host("d")); err != nil {
 		t.Skipf("host cannot create symbolic links: %v", err)
 	}
-	// The guest opened d before the swap, so a lookup within cacheTTL may still
-	// reach the directory that the guest saw: the pinned handle names that
-	// object, not the path. It must never reach the outside file.
-	// TestHostSwapOfPinnedDirectoryIsNoticedAfterTheCacheLifetime covers the
-	// refusal after the cache expires.
+	// Within the cache lifetime the pinned handle may still name the directory
+	// that the guest saw. It must never reach the outside file.
 	if f, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); err == nil {
 		raw, rerr := io.ReadAll(f)
 		_ = f.Close()
@@ -491,6 +488,12 @@ func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
 		}
 	} else if !errors.Is(err, ErrPathTraversal) {
 		t.Fatalf("OpenFile through swapped directory = %v, want ErrPathTraversal or the pinned directory", err)
+	}
+
+	// After the cache lifetime the pin checks its name and refuses the link.
+	clock.advance(cacheTTL + time.Millisecond)
+	if _, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); !errors.Is(err, ErrPathTraversal) {
+		t.Fatalf("OpenFile through swapped directory after the cache lifetime = %v, want ErrPathTraversal", err)
 	}
 	fd, err := e.open("d/f", linux.O_RDONLY, 0)
 	if err != nil {

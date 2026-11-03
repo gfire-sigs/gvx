@@ -18,6 +18,7 @@ package hostfs
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"testing"
@@ -234,4 +235,133 @@ func TestHostSwapOfPinnedDirectoryIsNoticedAfterTheCacheLifetime(t *testing.T) {
 		_, err := e.stat("d/f")
 		wantErrno(t, "stat through the swapped directory", err, linuxerr.EACCES)
 	})
+}
+
+// swapDirectory makes a host process replace the directory d: it moves d to
+// d.old and creates a new d with the files f, src, and victim. The guest then
+// waits out the cache lifetime. The pin of d stays in the table until the next
+// use finds it expired.
+func swapDirectory(t *testing.T) (*env, *testClock) {
+	t.Helper()
+	e, _, clock := newCountEnv(t)
+	e.mustMkdir("d")
+	e.writeFile("d/f", []byte("old"))
+	e.mustStat("d/f")
+	if err := os.Rename(e.host("d"), e.host("d.old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(e.host("d"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"f", "src", "victim"} {
+		if err := os.WriteFile(e.host("d/"+name), []byte("new"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock.advance(100 * cacheTTL)
+	return e, clock
+}
+
+func TestWorkspaceCallsReachTheNewDirectoryAfterAHostSwap(t *testing.T) {
+	for name, op := range map[string]struct {
+		run   func(t *testing.T, e *env) error
+		check func(t *testing.T, e *env)
+	}{
+		"WriteFile": {
+			run: func(t *testing.T, e *env) error { return e.ws.WriteFile("d/created", []byte("x"), 0o644) },
+			check: func(t *testing.T, e *env) {
+				requireHostFile(t, e.host("d/created"), true)
+				requireHostFile(t, e.host("d.old/created"), false)
+			},
+		},
+		"Mkdir": {
+			run: func(t *testing.T, e *env) error { return e.ws.Mkdir("d/sub", 0o755) },
+			check: func(t *testing.T, e *env) {
+				requireHostFile(t, e.host("d/sub"), true)
+				requireHostFile(t, e.host("d.old/sub"), false)
+			},
+		},
+		"Rename": {
+			run: func(t *testing.T, e *env) error { return e.ws.Rename("d/src", "d/dst") },
+			check: func(t *testing.T, e *env) {
+				requireHostFile(t, e.host("d/dst"), true)
+				requireHostFile(t, e.host("d/src"), false)
+				requireHostFile(t, e.host("d.old/dst"), false)
+			},
+		},
+		"Unlink": {
+			run: func(t *testing.T, e *env) error { return e.ws.Unlink("d/victim") },
+			check: func(t *testing.T, e *env) {
+				requireHostFile(t, e.host("d/victim"), false)
+				requireHostFile(t, e.host("d/f"), true)
+				requireHostFile(t, e.host("d.old/f"), true)
+			},
+		},
+		"link": {
+			run: func(t *testing.T, e *env) error { return e.ws.link("d/src", "d/hard") },
+			check: func(t *testing.T, e *env) {
+				requireHostFile(t, e.host("d/hard"), true)
+				requireHostFile(t, e.host("d.old/hard"), false)
+			},
+		},
+		"Chmod": {
+			run: func(t *testing.T, e *env) error { return e.ws.Chmod("d/src", 0o611) },
+			check: func(t *testing.T, e *env) {
+				if attr, _, err := e.ws.Stat("d/src"); err != nil || attr.Mode&0o7777 != 0o611 {
+					t.Fatalf("Stat(d/src) = (%+v, %v), want mode 611", attr, err)
+				}
+			},
+		},
+		"OpenFile": {
+			run: func(t *testing.T, e *env) error {
+				f, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = f.Close() }()
+				raw, err := io.ReadAll(f)
+				if err != nil || string(raw) != "new" {
+					t.Fatalf("OpenFile(d/f) read (%q, %v), want the file of the new directory", raw, err)
+				}
+				return nil
+			},
+			check: func(t *testing.T, e *env) {},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e, _ := swapDirectory(t)
+			if err := op.run(t, e); err != nil {
+				t.Fatalf("%s after a host swap of d: %v", name, err)
+			}
+			op.check(t, e)
+		})
+	}
+}
+
+func TestVFSCallsReachTheNewDirectoryAfterAHostSwap(t *testing.T) {
+	e, _ := swapDirectory(t)
+	e.mustMkdir("d/sub")
+	e.writeFile("d/created", []byte("x"))
+	if err := e.rename("d/src", "d/dst"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := e.unlink("d/victim"); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	if err := e.link("d/f", "d/hard"); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	for _, name := range []string{"sub", "created", "dst", "hard"} {
+		requireHostFile(t, e.host("d/"+name), true)
+		requireHostFile(t, e.host("d.old/"+name), false)
+	}
+}
+
+// requireHostFile fails when the existence of the host path differs from want.
+func requireHostFile(t *testing.T, path string, want bool) {
+	t.Helper()
+	_, err := os.Lstat(path)
+	if got := err == nil; got != want {
+		t.Fatalf("host path %s exists = %v (%v), want %v", path, got, err, want)
+	}
 }
