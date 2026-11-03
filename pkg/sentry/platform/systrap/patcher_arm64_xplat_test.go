@@ -245,6 +245,31 @@ func TestCtrSlotLoadsTheConstantAndReturns(t *testing.T) {
 	}
 }
 
+func TestIsStoreExclusive(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		word uint32
+		want bool
+	}{
+		{"stxr w2, x1, [x0]", 0xc8027c01, true},
+		{"stxrb w2, w1, [x0]", 0x08027c01, true},
+		{"stlxr w2, x1, [x0]", 0xc802fc01, true},
+		{"stxp w3, x1, x2, [x0]", 0xc8230801, true},
+		{"stlxp w3, x1, x2, [x0]", 0xc8238801, true},
+		{"ldxr x1, [x0]", 0xc85f7c01, false},
+		{"ldaxr x1, [x0]", 0xc85ffc01, false},
+		{"stlr x1, [x0]", 0xc89ffc01, false},
+		{"str x1, [x0]", 0xf9000001, false},
+		{"stp x1, x2, [x0]", 0xa9000801, false},
+		{"cas x1, x2, [x0]", 0xc8a17c02, false},
+		{"nop", 0xd503201f, false},
+	} {
+		if got := isStoreExclusive(tc.word); got != tc.want {
+			t.Errorf("isStoreExclusive(%#x), %s = %v, want %v", tc.word, tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestIsDataCacheMaintenance(t *testing.T) {
 	for _, tc := range []struct {
 		name string

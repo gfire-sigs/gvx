@@ -95,6 +95,25 @@ type Chunk struct {
 	// Go heap memory.
 	Mem ChunkMemory
 	FR  memmap.FileRange
+
+	// hostWritten reports a write into Buf to the memory file, or is nil. A
+	// platform that runs guest code from copies of memory-file pages needs the
+	// report, because a write through Buf passes no mapping of the guest.
+	hostWritten func(memmap.FileRange)
+}
+
+// hostWriteNoter is implemented by a memory file whose platform watches writes
+// of the Sentry.
+type hostWriteNoter interface {
+	NoteHostWrite(fr memmap.FileRange)
+}
+
+// NoteWrite reports that the Sentry changed Buf[lo:hi]. A caller that writes
+// Buf itself calls it after the write.
+func (ch *Chunk) NoteWrite(lo, hi int) {
+	if ch.hostWritten != nil && hi > lo {
+		ch.hostWritten(memmap.FileRange{Start: ch.FR.Start + uint64(lo), End: ch.FR.Start + uint64(hi)})
+	}
 }
 
 // Release returns shared memory to its owner. The memory stays valid for the
@@ -103,6 +122,7 @@ func (ch *Chunk) Release() {
 	if ch.Mem != nil {
 		ch.Mem.DecRef(ch.FR)
 		ch.Mem = nil
+		ch.hostWritten = nil
 	}
 }
 
@@ -126,7 +146,11 @@ func NewChunk(mem ChunkMemory) (*Chunk, error) {
 		mem.DecRef(fr)
 		return nil, fmt.Errorf("chunkcache: the chunk memory maps %d blocks of %d bytes, want one block of %d", bs.NumBlocks(), bs.NumBytes(), ChunkSize)
 	}
-	return &Chunk{Buf: bs.Head().ToSlice(), Mem: mem, FR: fr}, nil
+	ch := &Chunk{Buf: bs.Head().ToSlice(), Mem: mem, FR: fr}
+	if n, ok := mem.(hostWriteNoter); ok {
+		ch.hostWritten = n.NoteHostWrite
+	}
+	return ch, nil
 }
 
 // newChunkBuf allocates one chunk aligned to ChunkAlign. Go heap memory never
@@ -465,6 +489,7 @@ func (c *Cache) CopyThroughLocked(off int64, p []byte) {
 		n := min(len(p), ChunkSize-within)
 		if ch, ok := c.Chunks[idx]; ok {
 			copy(ch.Buf[within:within+n], p[:n])
+			ch.NoteWrite(within, within+n)
 		}
 		off += int64(n)
 		p = p[n:]
@@ -485,6 +510,7 @@ func (c *Cache) ZeroLocked(start, end uint64) {
 		lo := max(start, base) - base
 		hi := min(end, base+ChunkSize) - base
 		clear(ch.Buf[lo:hi])
+		ch.NoteWrite(int(lo), int(hi))
 	}
 }
 
@@ -509,6 +535,7 @@ func (c *Cache) ShrinkLocked(size uint64) []*Chunk {
 			delete(c.Chunks, idx)
 		case base+ChunkSize > size:
 			clear(ch.Buf[size-base:])
+			ch.NoteWrite(int(size-base), ChunkSize)
 		}
 	}
 	return dropped

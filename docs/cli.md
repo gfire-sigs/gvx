@@ -235,7 +235,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
-| A store into the page of the storing instruction | The Windows `systrap` engine gives a page write access or execute access, never both. A store from a writable and executable page into the same page ends with SIGSEGV. |
+| A store into the page of the storing instruction | The Windows `systrap` engine completes the store with a single step, and the page runs the new bytes. Each such store costs three debug stops. On `arm64`, a store exclusive (`stxr`, `stlxr`, `stxp`, `stlxp`) into its own page ends with SIGSEGV. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
 
 ## 8. Examples

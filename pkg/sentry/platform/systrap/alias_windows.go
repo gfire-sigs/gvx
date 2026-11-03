@@ -21,6 +21,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
@@ -36,8 +37,7 @@ import (
 // writable view of its frame to read-only. A write then faults. The fault
 // handler drops the copies of the frame, restores the write permission, and
 // resumes the write. A write that does not pass through a stub view, such as a
-// write(2) into a shared file, is not seen (section 9 of
-// docs/systrap-windows.md).
+// write(2) into a shared file, reaches the index through hostwrite_windows.go.
 //
 // Lock order: an address space lock (addressSpace.mu) comes before the lock of
 // the index. Code that holds the lock of the index never takes another lock.
@@ -98,6 +98,19 @@ type aliasBucket struct {
 type aliasIndex struct {
 	mu      sync.Mutex
 	buckets map[bucketKey]*aliasBucket
+	// fileCopies maps the handle of a host file to the number of copies that
+	// the index holds for its frames. A report of a Sentry write reads it
+	// without the lock.
+	fileCopies sync.Map
+}
+
+// copyCount returns the counter of the copies of file.
+func (x *aliasIndex) copyCount(file uintptr) *atomic.Int64 {
+	if n, ok := x.fileCopies.Load(file); ok {
+		return n.(*atomic.Int64)
+	}
+	n, _ := x.fileCopies.LoadOrStore(file, new(atomic.Int64))
+	return n.(*atomic.Int64)
 }
 
 func (x *aliasIndex) bucketLocked(k bucketKey) *aliasBucket {
@@ -130,6 +143,7 @@ func (x *aliasIndex) begin(e *copyEntry) []viewHit {
 	bk := frameBucket(e.key)
 	b := x.bucketLocked(bk)
 	b.copies[e.key.off] = append(b.copies[e.key.off], e)
+	x.copyCount(e.key.file).Add(1)
 	var hits []viewHit
 	for _, v := range b.views {
 		if v.file != e.key.file || e.key.off < v.off || e.key.off-v.off >= v.size {
@@ -168,7 +182,11 @@ func (x *aliasIndex) removeLocked(e *copyEntry) {
 	if b == nil {
 		return
 	}
-	list := slices.DeleteFunc(b.copies[e.key.off], func(o *copyEntry) bool { return o == e })
+	old := b.copies[e.key.off]
+	list := slices.DeleteFunc(old, func(o *copyEntry) bool { return o == e })
+	if gone := len(old) - len(list); gone != 0 {
+		x.copyCount(e.key.file).Add(-int64(gone))
+	}
 	if len(list) == 0 {
 		delete(b.copies, e.key.off)
 	} else {
@@ -259,6 +277,18 @@ func (x *aliasIndex) copiesIn(file uintptr, off, length uint64) []*copyEntry {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].key.off < out[j].key.off })
 	return out
+}
+
+// framesIn returns the keys of the frames in [off, off+length) of file that
+// have a live copy, in the order of their offsets.
+func (x *aliasIndex) framesIn(file uintptr, off, length uint64) []frameKey {
+	var keys []frameKey
+	for _, e := range x.copiesIn(file, off, length) {
+		if n := len(keys); n == 0 || keys[n-1] != e.key {
+			keys = append(keys, e.key)
+		}
+	}
+	return keys
 }
 
 func (x *aliasIndex) addView(v *writeView) {
@@ -541,6 +571,12 @@ func (as *addressSpace) dropExecCopy(e *copyEntry) error {
 	if as.released || blk == nil || blk.entry != e || blk.state != blockExec {
 		// The block changed or left, so the entry is stale.
 		as.p.alias.remove(e)
+		return nil
+	}
+	if blk.stepSnap != nil {
+		// A thread single-steps a store through this copy. It drops the copy
+		// when it closes the window, and then the write that called us repeats.
+		blk.stale = true
 		return nil
 	}
 	return as.returnToDataLocked(blk)

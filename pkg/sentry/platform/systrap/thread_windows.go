@@ -61,6 +61,18 @@ type thread struct {
 	lastExecPC  uint64
 	execRepeats int
 
+	// storeStep is the store that the thread single-steps through a page that
+	// it also executes, or nil. storeFaults counts the write faults that opened
+	// a window since the last completed step. Callers hold mu.
+	storeStep   *storeStep
+	storeFaults int
+
+	// staleAt and stale count the faults at one pc that the engine retried
+	// because the view already allowed the access. Callers hold mu.
+	staleAt  uint64
+	staleGen uint64
+	stale    int
+
 	// closeOnce makes sure that the handle closes once. The stub process and
 	// the context can both release the thread, and a second CloseHandle could
 	// close a new object that reuses the handle value.
@@ -193,6 +205,11 @@ func (th *thread) resumeParked() error {
 // continueEvent applies th.ctx to a thread that waits at an exception and
 // lets it run on. Callers hold mu.
 func (th *thread) continueEvent(ev debugEvent) error {
+	if th.storeStep != nil {
+		// The trap clears the single-step flag, and the step needs it until
+		// the store retires.
+		th.ctx.setSingleStep(true)
+	}
 	if err := th.setContext(); err != nil {
 		return err
 	}
@@ -206,6 +223,9 @@ func (th *thread) continueEvent(ev debugEvent) error {
 // resolved without a change to the registers. The kernel context of the thread
 // already equals th.ctx, so the call skips NtSetContextThread. Callers hold mu.
 func (th *thread) continueUnchanged(ev debugEvent) error {
+	if th.storeStep != nil {
+		return th.continueEvent(ev)
+	}
 	if err := th.sp.p.dbg.reply(ev); err != nil {
 		return th.ctxErr("NtDebugContinue", err)
 	}
@@ -227,6 +247,7 @@ func (th *thread) destroy() {
 	}
 	delete(sp.threads, th.tid)
 	sp.mu.Unlock()
+	th.abortStoreStep()
 	th.releaseArch()
 	if !sp.dead.Load() {
 		_ = ntTerminateThread(th.h)
@@ -242,12 +263,15 @@ func (th *thread) destroy() {
 func (th *thread) start(ac *arch.Context64, loadFP bool) error {
 	th.mu.Lock()
 	defer th.mu.Unlock()
+	th.storeFaults, th.stale = 0, 0
 	if f := th.fast.Load(); f != nil && f.inSpill {
 		return th.fastStart(f, ac, loadFP)
 	}
 	th.ctx.loadFrom(ac, loadFP)
 	th.stepping = false
 	th.lastExecPC, th.execRepeats = 0, 0
+	// A step that an earlier stop left open would keep a page writable.
+	_ = th.closeStoreStepLocked()
 	return th.archStart(ac)
 }
 

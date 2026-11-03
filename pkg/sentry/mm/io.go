@@ -622,6 +622,9 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 // +checklocksexclude:mm.mappingMu
 // +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
+	if at.Write {
+		f = mm.hostWriteWrap(ar, f)
+	}
 	// If pmas are already available, we can do IO without touching mm.vmas or
 	// mm.mappingMu.
 	mm.activeMu.RLock()
@@ -706,6 +709,9 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	// to iterator invalidation between AddrRanges). Use it if possible.
 	if ars.NumRanges() == 1 {
 		return mm.withInternalMappings(ctx, ars.Head(), at, ignorePermissions, f)
+	}
+	if at.Write {
+		f = mm.hostWriteWrapVec(ars, f)
 	}
 
 	// If pmas are already available, we can do IO without touching mm.vmas or

@@ -143,6 +143,12 @@ func isDataCacheMaintenance(w uint32) bool {
 	return false
 }
 
+// isStoreExclusive reports whether w is STXR, STLXR, STXP, or STLXP. A store
+// exclusive succeeds only while the local monitor from the earlier load
+// exclusive is set. Every exception clears the monitor, so the instruction
+// fails each time it restarts after a fault.
+func isStoreExclusive(w uint32) bool { return w&0x3fc00000 == 0x08000000 }
+
 // encodeBranch returns the B instruction at address from that jumps to to.
 func encodeBranch(from, to uint64) (uint32, error) {
 	if from&3 != 0 || to&3 != 0 {

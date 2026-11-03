@@ -61,6 +61,13 @@ type execBlock struct {
 	sites map[uint16]siteInfo
 	// slots holds the island slots that this executable copy occupies.
 	slots []winSlotRef
+	// stepSnap holds the bytes of the copy at the time a store step made the
+	// copy writable, or nil. storestep_windows.go explains the window.
+	stepSnap []byte
+	// stale is true when a write of the Sentry reached the frame while the
+	// window was open. The close drops the copy even if the store changed no
+	// byte.
+	stale bool
 }
 
 // copyHold counts the pages of an address space that still map a copied section.
@@ -259,6 +266,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	var copied *anonSection
 	if fd := f.FD(); fd >= 0 {
 		var err error
+		as.p.watchHostWrites(f, uintptr(fd))
 		if sec, err = as.p.sections.get(windows.Handle(fd), fr.End, at.Write); err != nil {
 			sec = nil
 			if at.Write {
@@ -645,7 +653,9 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 func (as *addressSpace) restoreData(base uint64) (bool, error) {
 	as.mu.Lock()
 	blk := as.blocks[base]
-	if as.released || blk == nil || blk.state != blockExec || !blk.at.Write {
+	if as.released || blk == nil || blk.state != blockExec || !blk.at.Write || blk.stepSnap != nil {
+		// A block with an open store window already accepts writes. The thread
+		// that opened the window drops the copy when it closes the window.
 		as.mu.Unlock()
 		return false, nil
 	}

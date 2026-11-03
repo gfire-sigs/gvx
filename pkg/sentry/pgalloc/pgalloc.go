@@ -56,6 +56,11 @@ type MemoryFile struct {
 	memmap.DefaultMemoryType
 	memmap.NoBufferedIOFallback
 
+	// hostWrites tells a platform that runs guest code from copies of
+	// memory-file pages about writes of the Sentry. It is empty on hosts whose
+	// platforms map the pages themselves.
+	hostWrites hostWriteHooks
+
 	// MemoryFile owns a single backing file. Each page in the backing file is
 	// considered "committed" or "uncommitted". A page is committed if the host
 	// kernel is spending resources to store its contents and uncommitted
@@ -1508,6 +1513,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 	}
 	if at.Execute {
 		return safemem.BlockSeq{}, linuxerr.EACCES
+	}
+	if at.Write {
+		f.noteHostWrite(fr)
 	}
 
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {

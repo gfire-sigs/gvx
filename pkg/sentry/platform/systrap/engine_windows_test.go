@@ -387,22 +387,6 @@ func TestAnonymousWritableExecutablePageReadsUnpatched(t *testing.T) {
 	}
 }
 
-func TestSelfWritingPageFaults(t *testing.T) {
-	// A guest that writes to the page it executes would make the engine swap
-	// the write permission and the execute permission forever. The engine
-	// reports SIGSEGV instead.
-	r := newRig(t, newPlatform(t))
-	r.mapPage(codeVA, hostarch.AccessType{Read: true, Write: true, Execute: true}, gStoreTo(codeVA+0x400, 1))
-	r.mapPage(stackVA, hostarch.ReadWrite)
-	r.ac.SetIP(codeVA)
-	r.ac.SetStack(stackVA + blockSize - 0x100)
-	si, at, err := r.run()
-	wantSignal(t, si, err, linux.SIGSEGV)
-	if at != hostarch.Write {
-		t.Errorf("access = %v, want a write", at)
-	}
-}
-
 func TestRegisterPreservation(t *testing.T) {
 	// The vector registers live in the thread, and the Sentry reads and writes
 	// them through the CONTEXT record at every stop.

@@ -501,6 +501,10 @@ func (th *thread) emulateFSAccess(as *addressSpace, pc, fs uint64, code []byte) 
 	return true
 }
 
+// archNoStoreStep reports whether the instruction at pc cannot run as a store
+// step. Every amd64 store restarts cleanly, so none is excluded.
+func (th *thread) archNoStoreStep(*addressSpace, uint64) bool { return false }
+
 // illegalSignal classifies an illegal-instruction exception.
 func (th *thread) illegalSignal(*addressSpace, uint64) (linuxSig, int32) { return sigILL, illIllOpc }
 

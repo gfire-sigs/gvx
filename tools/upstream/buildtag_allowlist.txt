@@ -74,6 +74,8 @@ seam pkg/sentry/loader/elf.go
 # sub-pages into whole host pages before punching holes (pkg/sentry/pgalloc/pgalloc.go).
 # UpdateUsage also scans a single memory cgroup on hosts where the file block count lags
 # (pkg/sentry/pgalloc/usage_scan_xplat.go).
+# MapInternal also reports a write request to the observers of the Windows systrap engine
+# (pkg/sentry/pgalloc/hostwrite_windows.go and memory_file_xplat.go).
 seam pkg/sentry/pgalloc/pgalloc.go
 
 # Content seams: Docker with --userland-proxy=false, docker stats, and iptables-legacy-save.
@@ -93,6 +95,11 @@ seam pkg/sentry/fsimpl/cgroup2fs/memory.go
 # Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
 # conf/<link>/route_localnet must not change the martian filter of other links.
 seam pkg/tcpip/network/ipv4/ipv4.go
+
+# Content seam: the memory manager reports each Sentry write into guest memory to the memory
+# file after it completes, so that the Windows systrap engine drops the patched copies of the
+# written pages (pkg/sentry/mm/hostwrite_windows.go and hostwrite_xplat.go).
+seam pkg/sentry/mm/io.go
 
 # Content seam: inotify_add_watch(2) asks a dentry to admit the watch before it adds one
 # (pkg/sentry/syscalls/linux/sys_inotify.go). hostfs returns ENOSPC above 8192 watched objects.

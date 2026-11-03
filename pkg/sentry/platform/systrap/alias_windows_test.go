@@ -19,9 +19,7 @@ package systrap
 import (
 	"reflect"
 	"testing"
-	"time"
 
-	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
@@ -220,40 +218,6 @@ func TestAliasIndexRemoveViewForgetsEveryBucket(t *testing.T) {
 	x.removeView(v)
 	if len(x.buckets) != 0 {
 		t.Errorf("%d buckets remain after the view left", len(x.buckets))
-	}
-}
-
-// TestStoreIntoTheExecutedFrameThroughAnotherViewFaults runs code that stores
-// into the frame that it executes, through a second view. Dropping the copy
-// would send the thread back to the store, and the fetch would copy the page
-// and lower the view again, so the engine reports SIGSEGV as it does for a store
-// into the page that the thread executes. The test fails by timeout when the
-// thread loops.
-func TestStoreIntoTheExecutedFrameThroughAnotherViewFaults(t *testing.T) {
-	r := newRig(t, newPlatform(t))
-	fr, _ := r.allocFrames(1, storeCode(rwVA+0x800, gSyscall(42)), gSyscall(41))
-	r.mapRange(rxVA, fr, execAccess)
-	r.mapRange(rwVA, fr, hostarch.ReadWrite)
-	r.program(gJump(rxVA))
-
-	type result struct {
-		si  *linux.SignalInfo
-		at  hostarch.AccessType
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		si, at, err := r.run()
-		done <- result{si, at, err}
-	}()
-	select {
-	case res := <-done:
-		wantSignal(t, res.si, res.err, linux.SIGSEGV)
-		if res.at != hostarch.Write || res.si.Addr() != rwVA+0x800 {
-			t.Errorf("fault = access %v addr %#x, want a write at %#x", res.at, res.si.Addr(), uint64(rwVA+0x800))
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("a store into the executed frame through another view does not stop")
 	}
 }
 

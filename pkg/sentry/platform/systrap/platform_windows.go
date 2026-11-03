@@ -59,6 +59,10 @@ type Platform struct {
 	// alias records the executable copies and the writable views of each frame
 	// of the memory file, in every address space of the platform.
 	alias aliasIndex
+	// hostWrites watches the memory files for writes of the Sentry, and
+	// hostWriteDrops counts the frames that such writes freed of copies.
+	hostWrites     hostWriteWatch
+	hostWriteDrops atomic.Uint64
 
 	// cleanCode maps the address of a read-only MemoryFile page to the SHA-256
 	// digest of the bytes that a scan found to need zero patches. A page is
@@ -254,6 +258,7 @@ func (p *Platform) Close() error {
 			}
 		}
 		t0 := time.Now()
+		p.stopHostWrites()
 		p.stopPool()
 		t1 := time.Now()
 		p.dbg.close()
