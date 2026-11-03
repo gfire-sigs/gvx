@@ -69,6 +69,7 @@ func TestE2ERunscParityKernelFeatures(t *testing.T) {
 		"tmpfs-percent-size", "cgroup2-mounted", "mqueue-mounted", "mq-open",
 		"dev-fuse", "dev-net-tun", "uevent-socket", "loopback-named",
 		"new-netns-has-lo", "pivot-root", "keyring-link", "overlay-dentry-cache", "mnt-ns-setns",
+		"link-conf-directories", "bridge-port-hairpin", "link-stats64", "ip-tables-names", "bridge-nf-call-iptables",
 	}
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
@@ -84,6 +85,31 @@ func TestE2ERunscParityKernelFeatures(t *testing.T) {
 			}
 			if strings.Contains(out, "FAIL ") {
 				t.Errorf("failed checks:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestE2EMemoryCgroupLimits checks memory.stat and the enforcement of
+// memory.max for a cgroup that the guest creates, as runc does for a container.
+// The guest has no image, so it needs no registry.
+func TestE2EMemoryCgroupLimits(t *testing.T) {
+	bin := acceptprog.BuildParityProbe(t, runtime.GOARCH)
+	want := []string{
+		"memcg-stat-counts-anonymous-memory", "memcg-under-limit-keeps-task", "memcg-over-limit-kills-task",
+		"memcg-over-limit-kills-largest-task-only", "memcg-oom-group-kills-every-task",
+	}
+	for _, b := range fixedAddressBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireFixedAddressBackend(t, b)
+			code, out := runParityProbe(t, b, bin, false, "memcg")
+			if code != 0 || !strings.Contains(out, "DONE") {
+				t.Fatalf("parityprobe memcg exited with %d\n%s", code, out)
+			}
+			for _, name := range want {
+				if !strings.Contains(out, "PASS "+name+"\n") {
+					t.Errorf("check %s did not pass\n%s", name, out)
+				}
 			}
 		})
 	}

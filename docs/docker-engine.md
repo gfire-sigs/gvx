@@ -151,10 +151,25 @@ Use the `ext4lite` volume unless you need the files as host files. The volume im
 | Published host ports | Fixed at the start. A container port outside the published range is reachable only inside the sandbox. |
 | Guest architecture | The engine runs images for the host architecture. On Apple Silicon, it runs `linux/arm64` images. |
 | `10.0.2.15` from a container | A `bridge` container cannot connect to the `eth0` address of the sandbox. Use the container address or a user-defined network. |
-| `--userland-proxy=false` | `dockerd` fails to start with it. Keep the default. |
-| `docker stats` | Shows `0B` for the memory of a container. |
-| `iptables-legacy-save` | Prints nothing. Use `iptables-legacy -S`. |
+| `docker stats` | Shows the memory, the CPU time, and the network counters of a container. `BLOCK I/O` stays at `0B / 0B`, because the guest has no `io` controller. |
+| `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the largest resident set when the use passes the limit. Section 6.4 gives the details. |
+| `--memory-reservation`, `--memory-swap`, `--cpus`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
+| `--icc=false` | `dockerd` starts with it, but the bridge does not pass frames through `iptables`. Two containers of one bridge can still reach each other. |
 
 ### 6.3 Security
 
 The privileges of `--privileged` stay inside the sandbox. A container with `docker run --privileged` gets them only inside the sandbox too. A raw packet reaches only the network stack of the sandbox. The NAT forwarder relays only TCP and UDP connections, through host sockets. The API socket on the host has the mode `0600`, so only your user can open it. Any program of your user can therefore control the engine, as with a local Docker Engine.
+
+### 6.4 Memory Limits of Containers
+
+A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentry cannot count a page at the moment of its allocation. It counts a page after a scan of the memory file, so it polls. The poll starts with the first finite limit and ends when no cgroup has a limit.
+
+| Property | Value |
+| :--- | :--- |
+| Poll interval | At least 5 ms, and at least 4 times the duration of the last check. |
+| Overshoot | A container can pass its limit by what it allocates between two checks. At 1 GB/s of fresh writes, 5 ms is about 5 MB. |
+| Victim | The process with the largest resident set. With `memory.oom.group` set, every process of the container. |
+| Result | Exit code 137, `OOMKilled: true` in `docker inspect`, and `oom_kill` in `memory.events`. Other containers and `dockerd` keep running. |
+| Not caught | A process that allocates and frees more than the limit between two checks. Memory that a process maps but never writes. |
+| Held after the kill | Data in `tmpfs` files stays charged to the container. A new process in that container is ended at the next check while the data still counts. |
+| Not enforced | `memory.high`, `cpu.max`, `cpu.weight`, and `memory.swap.*`. |

@@ -6,6 +6,13 @@ This file records the observable changes of each `gvx` release. The release work
 
 This section records changes that no release contains yet.
 
+### Features
+
+- **`dockerd --userland-proxy=false`**: `docker:dind` now starts with the option. The guest has `/proc/sys/net/ipv4/conf/<link>/route_localnet` and `/proc/sys/net/ipv6/conf/<link>/accept_ra` for each link, `/proc/sys/net/bridge/bridge-nf-call-*`, and the hairpin mode of a bridge port. A connection to `127.0.0.1` and a published port reaches the container in the guest, and the host port still works. The bridge does not pass frames through `iptables`, so `--icc=false` does not separate containers of one bridge.
+- **`docker stats`**: the command shows the memory, the CPU time, and the network counters of a container. The guest now reports `IFLA_STATS64` for each link, and `memory.stat` exists in each memory cgroup. A container that holds 64 MiB shows about 64 MiB. `BLOCK I/O` stays at `0B`.
+- **`iptables-legacy-save`**: the command prints the rules of the tables `filter`, `nat`, `mangle`, and `raw`. The guest has `/proc/net/ip_tables_names` and `/proc/net/ip6_tables_names`.
+- **`memory.max` of nested cgroups**: `docker run -m 32m` ends the process with the largest resident set with SIGKILL when the container passes the limit. The exit code is 137, `docker inspect` shows `OOMKilled: true`, and `memory.events` counts `oom` and `oom_kill`. `memory.oom.group` ends every process. The Sentry checks every 5 ms or more, so a container can pass the limit by what it allocates between two checks. `memory.high`, `cpu.max`, and `cpu.weight` stay unenforced. See `docs/docker-engine.md`, section 6.4.
+
 ### Bug Fixes
 
 - **`membarrier` on `hvf`, `whpx`, and Windows `systrap`**: the global and private expedited commands of `membarrier(2)` returned `EINVAL`, and `MEMBARRIER_CMD_QUERY` reported none of them. The commands now succeed, and the query reports them. A call returns after every guest thread that ran guest code at the call has left the guest or stopped once. Idle threads cost nothing. On Windows (`whpx` and `systrap`), the call also orders the Sentry threads with `FlushProcessWriteBuffers`. On macOS, the call orders guest code only and does not order a Sentry thread that copies data for a system call in progress. On `whpx`, a running guest task returns from `Switch` once for each call and the kernel runs it again. `hvf` and Windows `systrap` resume the guest without a return. Linux platforms keep the host `membarrier`.

@@ -30,6 +30,9 @@
 //	parityprobe overlay-write DIR [hold]   write that state; with hold, sync it,
 //	                       print SYNCED, and sleep
 //	parityprobe overlay-verify DIR   verify the state that overlay-write left
+//	parityprobe memcg      run the memory cgroup checks, then print DONE
+//	parityprobe memcg-hog MIB hold|exit   allocate MIB MiB in a cgroup that the
+//	                       parent set up; used by the memcg checks
 //	parityprobe sleep      sleep for one minute
 //	parityprobe poweroff   call reboot(2) with LINUX_REBOOT_CMD_POWER_OFF
 //	parityprobe restart    call reboot(2) with LINUX_REBOOT_CMD_RESTART
@@ -81,6 +84,23 @@ func main() {
 		if !runOverlayUpper(os.Args[1], os.Args[2], hold) {
 			os.Exit(1)
 		}
+	case "memcg":
+		ok := runMemcgChecks()
+		fmt.Println("DONE")
+		if !ok {
+			os.Exit(1)
+		}
+	case "memcg-hog":
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: parityprobe memcg-hog MIB hold|exit")
+			os.Exit(2)
+		}
+		size, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "memcg-hog:", err)
+			os.Exit(2)
+		}
+		hogMain(size*mib, os.Args[3] == "hold")
 	case "ids":
 		fmt.Printf("uid=%d euid=%d\n", os.Getuid(), os.Geteuid())
 	case "sleep":
@@ -130,6 +150,11 @@ func runChecks() {
 		{"keyring-link", checkKeyringLink},
 		{"overlay-dentry-cache", checkOverlayDentries},
 		{"mnt-ns-setns", checkMountNamespaceSetns},
+		{"link-conf-directories", checkLinkConfDirectories},
+		{"bridge-port-hairpin", checkBridgePortHairpin},
+		{"link-stats64", checkLinkStats64},
+		{"ip-tables-names", checkIPTablesNames},
+		{"bridge-nf-call-iptables", checkBridgeNetfilterSysctl},
 	}
 	for _, c := range checks {
 		if err := c.fn(); err != nil {
