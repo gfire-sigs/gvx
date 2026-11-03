@@ -77,6 +77,63 @@ func TestDirectoryLinkCountFollowsSubdirectories(t *testing.T) {
 	wantLinks("after rmdir", "dst", 2)
 }
 
+// frozenTimesHost reports one fixed modification time for every directory, as
+// NTFS does for changes inside one tick of the system clock.
+type frozenTimesHost struct{ hostBackend }
+
+var frozenTime = time.Unix(1700000000, 0)
+
+func freezeDirTime(info hostInfo, err error) (hostInfo, error) {
+	if err == nil && info.kind == hostKindDir {
+		info.mtime = frozenTime
+	}
+	return info, err
+}
+
+func (h frozenTimesHost) lstat(rel string) (hostInfo, error) {
+	return freezeDirTime(h.hostBackend.lstat(rel))
+}
+
+func (h frozenTimesHost) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
+	return freezeDirTime(h.hostBackend.lstatAt(dir, name))
+}
+
+func (h frozenTimesHost) fstatDir(dir hostDirHandle) (hostInfo, error) {
+	return freezeDirTime(h.hostBackend.fstatDir(dir))
+}
+
+// TestCountedDirectoryLinksFollowChangesWithinOneClockTick checks the link
+// count that hostfs counts itself, when guest changes leave the modification
+// time of the directory unchanged.
+func TestCountedDirectoryLinksFollowChangesWithinOneClockTick(t *testing.T) {
+	e := newEnvOpts(t, workspaceOptions{
+		coalesce:      defaultCoalesceWindow,
+		countDirLinks: true,
+		wrapHost:      func(b hostBackend) hostBackend { return frozenTimesHost{b} },
+	})
+	e.mustMkdir("d")
+	e.mustMkdir("d/a")
+	e.writeFile("d/file", []byte("x"))
+	steps := []struct {
+		do   func() error
+		want uint32
+	}{
+		{func() error { return nil }, 3},
+		{func() error { return e.vfsObj.RmdirAt(e.ctx, e.creds, e.pop("d/a")) }, 2},
+		{func() error { return e.mkdir("d/b") }, 3},
+		{func() error { return e.mkdir("d/c") }, 4},
+		{func() error { return e.rename("d/b", "moved") }, 3},
+	}
+	for i, s := range steps {
+		if err := s.do(); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		if got := e.mustStat("d").Nlink; got != s.want {
+			t.Fatalf("step %d: nlink = %d, want %d", i, got, s.want)
+		}
+	}
+}
+
 // TestTruncateAboveFreeSpaceLeavesAHole checks that truncate extends a file
 // with a hole, as on Linux, even when the size exceeds the free space of the
 // host volume. NTFS allocates the clusters of a dense file, so hostfs makes
