@@ -252,6 +252,7 @@ func (w *vcpuWorker) runLoop(c *Context, pt *stage1Tables, ac *arch.Context64) (
 			continue
 		}
 		runErr := hvVCPURun(w.id)
+		w.exits.Add(1)
 		w.inGuest.Store(false)
 		if runErr != nil {
 			w.invalidateState()
@@ -316,7 +317,8 @@ func (w *vcpuWorker) prepareEntry(pt *stage1Tables) error {
 // again, so the flush flags cover the newer generation.
 func (w *vcpuWorker) beginRun(pt *stage1Tables) bool {
 	w.enterTLB.Store(w.entry.tlb)
-	w.inGuest.Store(true)
+	// Swap, not Store: memoryBarrier needs a full barrier before the guest runs.
+	w.inGuest.Swap(true)
 	if pt.tlbGen.Load() != w.entry.tlb || pt.dead.Load() {
 		w.inGuest.Store(false)
 		return false

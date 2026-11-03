@@ -47,7 +47,6 @@ const (
 type Platform struct {
 	platform.NoCPUPreemptionDetection
 	platform.NoCPUNumbers
-	platform.UseHostProcessMemoryBarrier
 
 	vm        *vmState
 	closeOnce sync.Once
@@ -105,6 +104,22 @@ func (*Platform) SupportsAddressSpaceIO() bool {
 // one Stage-2 lookup and up to 512 Stage-1 descriptors. It is a power-of-two
 // multiple of hostarch.PageSize, which is 4KB.
 const mapUnit = 2 << 20
+
+// HaveGlobalMemoryBarrier implements platform.Platform.HaveGlobalMemoryBarrier.
+func (*Platform) HaveGlobalMemoryBarrier() bool {
+	return true
+}
+
+// GlobalMemoryBarrier implements platform.Platform.GlobalMemoryBarrier. It
+// returns after every vCPU that ran guest code at the call has left the guest
+// at least once. Guest code does not run in any other thread, so no further
+// work is needed. A guest thread inside a system call runs Sentry code on a
+// Sentry thread, which the call does not order: the entry to and the return
+// from the system call order the guest side.
+func (p *Platform) GlobalMemoryBarrier() error {
+	p.vm.memoryBarrier()
+	return nil
+}
 
 // MapUnit implements platform.Platform.MapUnit.
 func (*Platform) MapUnit() uint64 {
