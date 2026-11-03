@@ -2,14 +2,15 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.6.10002026110200] - 2026-11-03
 
-This section records changes that no release contains yet.
+This release updates the Sentry to gVisor `release-20261102.0` and introduces a new version format. `AGENTS.md`, section 5.2, defines the format.
 
 ### Behavior Changes
 
 - **Upstream gVisor `release-20261102.0`**: the Sentry now comes from the `go` branch commit `1cea747e`. That commit is the first merge that contains the release commit `7a675ac6`. The guest vDSO reads a new `CLOCK_BOOTTIME` offset from the parameter page.
 - **Upstream diff budget**: `tools/upstream -mode=audit` accepts a charged share of up to 2.0% of upstream files. The old limit was 1.0%.
+- **Version format**: the PATCH field of a release tag joins the digit `1`, a three-digit release counter, the upstream release date, and the two-digit upstream release suffix. `v0.6.10002026110200` is the first release in `0.6` and contains gVisor `release-20261102.0`.
 
 ## [v0.5.2] - 2026-11-03
 
