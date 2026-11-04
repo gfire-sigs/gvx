@@ -54,6 +54,10 @@ const (
 	shortWindow = 3 * time.Second
 	settle      = 300 * time.Millisecond
 
+	// startLimit is the time that a busy-loop child has to report its first
+	// loop count after it started.
+	startLimit = 30 * time.Second
+
 	// resumeLimit is the time that a held-back task has to run again after the
 	// Sentry releases it.
 	resumeLimit = 500 * time.Millisecond
@@ -303,6 +307,19 @@ func moveTo(dir string, pid int) error {
 	return nil
 }
 
+// waitProgress waits until the child reported a loop count, and it fails after
+// limit.
+func (s *spinner) waitProgress(limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for s.count.Load() == 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("a child made no progress in %v after it started", limit)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil
+}
+
 // stop kills the child and waits until it ended.
 func (s *spinner) stop() {
 	_ = s.stdin.Close()
@@ -347,6 +364,13 @@ func runSpinners(dir string, n int, d time.Duration) (window, error) {
 			return window{}, err
 		}
 		started = append(started, s)
+	}
+	// A child can take seconds to start on a loaded host. The window opens
+	// only after each child has reported its first loop count.
+	for _, s := range started {
+		if err := s.waitProgress(startLimit); err != nil {
+			return window{}, err
+		}
 	}
 	time.Sleep(settle)
 	var first *spinner
