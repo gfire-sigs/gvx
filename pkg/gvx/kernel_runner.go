@@ -915,6 +915,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 	defer mf.Destroy()
 
+	hostRAM, _ := hostMemory()
+	if s.cfg.Resources.MemoryBytes > 0 {
+		defer setReportedMemory(reportedMemory(s.cfg.Resources.MemoryBytes, hostRAM))()
+	}
+
 	k := &kernel.Kernel{
 		Platform:  s.plat,
 		AllowSUID: s.cfg.AllowSUID,
@@ -1149,7 +1154,6 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}()
 
 	var memoryExceeded atomic.Bool
-	hostRAM, _ := hostMemory()
 	if limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM); limit > 0 {
 		guard := memoryGuard{
 			limit: limit,

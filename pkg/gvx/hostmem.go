@@ -48,6 +48,31 @@ var applyHostMemoryDefaults = sync.OnceFunc(func() {
 	usage.MaximumTotalMemoryBytes = total
 })
 
+// reportedMemory returns the total memory that the guest sees in
+// /proc/meminfo and sysinfo(2). A limit below the host RAM wins, so tools in
+// the guest, such as the kubelet, size the node from the limit. A limit above
+// the host RAM reports the host RAM.
+func reportedMemory(configured int64, hostRAM uint64) uint64 {
+	if configured > 0 && (hostRAM == 0 || uint64(configured) < hostRAM) {
+		return uint64(configured)
+	}
+	return hostRAM
+}
+
+// setReportedMemory sets the total memory that the Sentry reports and returns a
+// function that restores the previous values. The values are process-wide, as
+// those of applyHostMemoryDefaults. The caller restores them after the guest
+// ends, so a later sandbox in the same process starts with the old values.
+func setReportedMemory(total uint64) (restore func()) {
+	oldMin, oldMax := usage.MinimumTotalMemoryBytes, usage.MaximumTotalMemoryBytes
+	usage.MinimumTotalMemoryBytes = total
+	usage.MaximumTotalMemoryBytes = total
+	return func() {
+		usage.MinimumTotalMemoryBytes = oldMin
+		usage.MaximumTotalMemoryBytes = oldMax
+	}
+}
+
 // effectiveMemoryLimit returns the memory limit that the guard enforces and
 // its poll interval. A limit that the caller sets wins. Without one, the
 // guard stops a guest that passes the RAM of the host. Zero means no guard.
