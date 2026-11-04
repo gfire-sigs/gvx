@@ -32,10 +32,19 @@ func (p *protocol) setKeepaliveDefaults(v tcpip.TCPKeepaliveDefaultsOption) tcpi
 	return nil
 }
 
-// getKeepaliveDefaults returns the keepalive parameters of new endpoints.
+// getKeepaliveDefaults returns the keepalive parameters of new endpoints. The
+// field is zero until a write sets it, and after a restore from a saved state,
+// because state saving skips it. A zero field gives the built-in defaults.
 func (p *protocol) getKeepaliveDefaults() tcpip.TCPKeepaliveDefaultsOption {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if p.keepaliveDefaults == (tcpip.TCPKeepaliveDefaultsOption{}) {
+		return tcpip.TCPKeepaliveDefaultsOption{
+			Idle:     DefaultKeepaliveIdle,
+			Interval: DefaultKeepaliveInterval,
+			Count:    DefaultKeepaliveCount,
+		}
+	}
 	return p.keepaliveDefaults
 }
 

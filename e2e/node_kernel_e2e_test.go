@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,14 +101,16 @@ func forEachNodeBackend(t *testing.T, body func(t *testing.T, b gateBackend, bin
 	}
 }
 
-// TestE2ENodeKernelA1DevKmsg checks that /dev/kmsg opens, that SEEK_END returns
-// 0, that a non-blocking read returns EAGAIN, and that a write returns its length.
+// TestE2ENodeKernelA1DevKmsg checks that /dev/kmsg opens, that the seek calls
+// with offset 0 return 0 and the others fail as on Linux, that a non-blocking
+// read returns EAGAIN, and that a write returns its length.
 func TestE2ENodeKernelA1DevKmsg(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		code, out := runNodeProbe(t, b, bin, nil, "kmsg")
 		requireNodeChecks(t, code, out,
 			"kmsg-is-char-device-1-11", "kmsg-open-read-write", "kmsg-seek-end-returns-0",
-			"kmsg-nonblocking-read-returns-eagain", "kmsg-poll-reports-no-record", "kmsg-write-returns-length")
+			"kmsg-seek-set-and-data-return-0", "kmsg-seek-with-offset-fails-with-espipe",
+			"kmsg-seek-with-invalid-whence-fails-with-einval", "kmsg-nonblocking-read-returns-eagain", "kmsg-poll-reports-no-record", "kmsg-write-returns-length")
 	})
 }
 
@@ -133,16 +136,18 @@ func TestE2ENodeKernelA2StoredSysctls(t *testing.T) {
 }
 
 // TestE2ENodeKernelA3UnprivilegedPortStart checks the bind rule of
-// ip_unprivileged_port_start for TCP and UDP over IPv4 and IPv6, and that each
-// network namespace has its own value.
+// ip_unprivileged_port_start for TCP and UDP over IPv4 and IPv6. The root
+// network namespace of the sandbox starts at 0, a namespace that the guest
+// creates starts at 1024, and each namespace keeps its own value.
 func TestE2ENodeKernelA3UnprivilegedPortStart(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		code, out := runNodeProbe(t, b, bin, nil, "portstart")
 		requireNodeChecks(t, code, out,
-			"port-start-default-1024", "nobody-bind-below-1024-fails-with-eacces", "nobody-bind-1024-succeeds",
-			"start-0-lets-nobody-bind-port-80", "start-1024-again-refuses-nobody",
-			"child-netns-write-keeps-parent-value", "child-netns-start-0-lets-nobody-bind",
-			"parent-netns-still-refuses-nobody")
+			"root-netns-starts-at-0", "root-netns-lets-nobody-bind-port-80",
+			"start-1024-refuses-nobody-below-1024", "start-1024-lets-nobody-bind-1024",
+			"start-0-lets-nobody-bind-port-80", "child-netns-starts-at-1024",
+			"child-netns-refuses-nobody-below-1024", "child-netns-write-keeps-parent-value",
+			"child-netns-value-leaves-parent-binds")
 	})
 }
 
@@ -167,17 +172,22 @@ func TestE2ENodeKernelA4SafeSysctls(t *testing.T) {
 }
 
 // TestE2ENodeKernelA5Forwarding checks that three network namespaces A, R, and B
-// pass ICMP echo from A to B only while R forwards, and that conf/all/forwarding,
-// conf/default/forwarding, and ip_forward each switch forwarding.
+// pass ICMP echo from A to B only while R forwards. ip_forward and
+// conf/all/forwarding switch the links that exist. conf/default/forwarding
+// switches only the links that R creates later. A new network namespace gets
+// the IPv4 switches of the root namespace.
 func TestE2ENodeKernelA5Forwarding(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		code, out := runNodeProbe(t, b, bin, nil, "forwarding")
 		var names []string
-		for _, f := range []string{"conf/all/forwarding", "conf/default/forwarding", "ip_forward"} {
+		for _, f := range []string{"conf/all/forwarding", "ip_forward"} {
 			path := "/proc/sys/net/ipv4/" + f
 			names = append(names, "forwarding-off-blocks-a-to-b via "+path, "forwarding-on-lets-a-reach-b via "+path)
 		}
-		names = append(names, "veth-pairs-link-the-namespaces", "a-reaches-r", "router-starts-with-forwarding-off")
+		names = append(names, "veth-pairs-link-the-namespaces", "a-reaches-r", "router-starts-with-forwarding-off",
+			"new-netns-inherits-ipv4-forwarding-of-the-root", "new-netns-starts-with-ipv6-forwarding-off",
+			"new-netns-follows-the-root-when-forwarding-is-off",
+			"default-forwarding-leaves-existing-links-off", "links-created-after-default-forwarding-forward")
 		requireNodeChecks(t, code, out, names...)
 	})
 }
@@ -246,28 +256,65 @@ func TestE2ENodeKernelA6MemTotalIsPerSandbox(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		const small, large = 1 << 30, 2 << 30
 		limits := []struct {
-			name  string
-			limit int64
-		}{{"1g", small}, {"2g", large}, {"none", 0}}
+			name    string
+			limit   int64
+			writeMB int
+		}{{"1g", small, 4}, {"2g", large, 16}, {"none", 0, 0}}
 		got := make([]uint64, len(limits))
+		sectors := make([]uint64, len(limits))
+		ran := make([]bool, len(limits))
+		// Each guest prints MemTotal and then waits for the end of its input. The
+		// host closes the inputs after every sandbox printed or ended, so the
+		// three guests run at the same time. A subtest that skips ends without a
+		// line and still releases the others.
+		readers := make([]*io.PipeReader, len(limits))
+		writers := make([]*io.PipeWriter, len(limits))
+		ready := make([]chan struct{}, len(limits))
+		var readyOnce [3]sync.Once
+		for i := range limits {
+			readers[i], writers[i] = io.Pipe()
+			ready[i] = make(chan struct{})
+		}
+		release := func(i int) { readyOnce[i].Do(func() { close(ready[i]) }) }
+		go func() {
+			for i := range limits {
+				select {
+				case <-ready[i]:
+				case <-time.After(2 * time.Minute):
+				}
+			}
+			for _, w := range writers {
+				w.Close()
+			}
+		}()
 		t.Run("sandboxes", func(t *testing.T) {
 			for i, l := range limits {
 				t.Run(l.name, func(t *testing.T) {
 					t.Parallel()
+					defer release(i)
 					code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
 						cfg.Resources = gvx.Resources{MemoryBytes: l.limit}
-					}, "memtotal")
-					requireNodeChecks(t, code, out, "memtotal-stays-while-other-sandboxes-run")
+						cfg.Stdin = readers[i]
+						cfg.Stdout = io.MultiWriter(cfg.Stdout, lineWatcher{marker: "MEMTOTAL ", found: func() { release(i) }})
+					}, "memtotal", strconv.Itoa(l.writeMB))
+					requireNodeChecks(t, code, out, "memtotal-stays-while-other-sandboxes-run", "diskstats-count-only-this-sandbox")
 					_, rest, ok := strings.Cut(out, "MEMTOTAL ")
 					if !ok {
 						return
 					}
 					first, _, _ := strings.Cut(rest, "\n")
 					got[i], _ = strconv.ParseUint(first, 10, 64)
+					_, rest, ok = strings.Cut(out, "SECTORS ")
+					if !ok {
+						return
+					}
+					written, _, _ := strings.Cut(rest, "\n")
+					sectors[i], _ = strconv.ParseUint(written, 10, 64)
+					ran[i] = true
 				})
 			}
 		})
-		if t.Failed() || t.Skipped() {
+		if t.Failed() || !(ran[0] && ran[1] && ran[2]) {
 			return
 		}
 		if got[0] != small || got[1] != large {
@@ -276,5 +323,27 @@ func TestE2ENodeKernelA6MemTotalIsPerSandbox(t *testing.T) {
 		if got[2] <= large {
 			t.Errorf("MemTotal without a limit = %d, want the RAM of the host, above 2 GiB", got[2])
 		}
+		// A sandbox counts its own writes: at least what it wrote, and less than
+		// that plus 1 MiB, which the other sandboxes would add on top.
+		for i, l := range limits {
+			wrote := uint64(l.writeMB) << 20 / 512
+			if sectors[i] < wrote || sectors[i] >= wrote+(1<<20)/512 {
+				t.Errorf("sandbox %s: /proc/diskstats shows %d sectors written, want from %d to %d", l.name, sectors[i], wrote, wrote+(1<<20)/512)
+			}
+		}
 	})
+}
+
+// lineWatcher is a writer that calls found when the text that it receives
+// holds marker. It keeps no text.
+type lineWatcher struct {
+	marker string
+	found  func()
+}
+
+func (w lineWatcher) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.marker) {
+		w.found()
+	}
+	return len(p), nil
 }

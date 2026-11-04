@@ -17,7 +17,6 @@ package kernel
 import (
 	"fmt"
 
-	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/mqfs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/nsfs"
@@ -49,10 +48,6 @@ type IPCNamespace struct {
 	// Unlike SysV utilities, mq.Registry is not map-based, but is backed by
 	// a virtual filesystem.
 	posixQueues *mq.Registry
-
-	// shmRmidForced is kernel.shm_rmid_forced of the namespace. See
-	// ipc_namespace_xplat.go.
-	shmRmidForced atomicbitops.Int32 `state:"nosave"`
 }
 
 // NewIPCNamespace creates a new IPC namespace.

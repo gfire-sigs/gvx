@@ -114,18 +114,89 @@ func addDefaultRoute(name, gateway string) error {
 	return nil
 }
 
-// forwardingFiles are the files that each switch forwarding for the namespace
-// of the reader.
-var forwardingFiles = []string{
-	"/proc/sys/net/ipv4/conf/all/forwarding",
-	"/proc/sys/net/ipv4/conf/default/forwarding",
-	"/proc/sys/net/ipv4/ip_forward",
+// forwardingFiles are the files that switch forwarding of the links that exist.
+// conf/default/forwarding sets only the links that the guest creates later.
+var forwardingFiles = []string{forwardingAllFile, ipForwardFile}
+
+// addLinkPair creates a veth pair on the thread of near and moves the far end
+// into the namespace of peer.
+func addLinkPair(near *nsThread, nearName, farName string, peer *nsThread) error {
+	return near.do(func() error {
+		veth := &netlink.Veth{
+			LinkAttrs:     netlink.LinkAttrs{Name: nearName},
+			PeerName:      farName,
+			PeerNamespace: netlink.NsFd(peer.fd),
+		}
+		if err := netlink.LinkAdd(veth); err != nil {
+			return fmt.Errorf("create %s and %s: %w", nearName, farName, err)
+		}
+		return nil
+	})
+}
+
+// addRoute sends the destination network to gateway through the link.
+func addRoute(name, dst, gateway string) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	_, network, err := net.ParseCIDR(dst)
+	if err != nil {
+		return err
+	}
+	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: network, Gw: net.ParseIP(gateway)}); err != nil {
+		return fmt.Errorf("add the route to %s through %s: %w", dst, gateway, err)
+	}
+	return nil
+}
+
+// inheritChecks checks that a new network namespace gets the IPv4 forwarding
+// switches of the root namespace, and the default of 0 for IPv6.
+func inheritChecks() []check {
+	const ipv6All = "/proc/sys/net/ipv6/conf/all/forwarding"
+	childValues := func(files map[string]string) error {
+		return inNewNetns(func() error {
+			for file, want := range files {
+				if err := expectValue(file, want); err != nil {
+					return fmt.Errorf("in a new namespace: %w", err)
+				}
+			}
+			return nil
+		})
+	}
+	return []check{
+		{"new-netns-inherits-ipv4-forwarding-of-the-root", func() error {
+			// All on and default off: the new namespace gets the same pair.
+			if err := writeValue(ipForwardFile, "1"); err != nil {
+				return err
+			}
+			defer writeValue(ipForwardFile, "0")
+			if err := writeAndExpect(forwardingDefaultFile, "0", "0"); err != nil {
+				return err
+			}
+			return childValues(map[string]string{forwardingAllFile: "1", ipForwardFile: "1", forwardingDefaultFile: "0"})
+		}},
+		{"new-netns-starts-with-ipv6-forwarding-off", func() error {
+			if err := writeValue(ipv6All, "1"); err != nil {
+				return err
+			}
+			defer writeValue(ipv6All, "0")
+			return childValues(map[string]string{ipv6All: "0"})
+		}},
+		{"new-netns-follows-the-root-when-forwarding-is-off", func() error {
+			if err := writeAndExpect(ipForwardFile, "0", "0"); err != nil {
+				return err
+			}
+			return childValues(map[string]string{forwardingAllFile: "0", forwardingDefaultFile: "0"})
+		}},
+	}
 }
 
 func forwardingChecks() []check {
 	var a, r, b *nsThread
 	target := net.IPv4(10, 2, 0, 2)
-	checks := []check{
+	checks := inheritChecks()
+	checks = append(checks, []check{
 		{"three-namespaces-start", func() error {
 			var err error
 			for _, t := range []**nsThread{&a, &r, &b} {
@@ -137,22 +208,10 @@ func forwardingChecks() []check {
 		}},
 		{"veth-pairs-link-the-namespaces", func() error {
 			// R creates both pairs and moves the far ends into A and B.
-			return r.do(func() error {
-				for _, p := range []struct {
-					near, far string
-					peer      *nsThread
-				}{{"r0", "a0", a}, {"r1", "b0", b}} {
-					veth := &netlink.Veth{
-						LinkAttrs:     netlink.LinkAttrs{Name: p.near},
-						PeerName:      p.far,
-						PeerNamespace: netlink.NsFd(p.peer.fd),
-					}
-					if err := netlink.LinkAdd(veth); err != nil {
-						return fmt.Errorf("create %s and %s: %w", p.near, p.far, err)
-					}
-				}
-				return nil
-			})
+			if err := addLinkPair(r, "r0", "a0", a); err != nil {
+				return err
+			}
+			return addLinkPair(r, "r1", "b0", b)
 		}},
 		{"addresses-and-routes", func() error {
 			steps := []struct {
@@ -175,12 +234,12 @@ func forwardingChecks() []check {
 			return nil
 		}},
 		{"router-starts-with-forwarding-off", func() error {
-			return r.do(func() error { return expectValue(forwardingFiles[0], "0") })
+			return r.do(func() error { return expectValue(forwardingAllFile, "0") })
 		}},
 		{"a-reaches-r", func() error {
 			return a.do(func() error { return ping(net.IPv4(10, 1, 0, 1), 5*time.Second) })
 		}},
-	}
+	}...)
 	for _, file := range forwardingFiles {
 		checks = append(checks,
 			check{"forwarding-off-blocks-a-to-b via " + file, func() error {
@@ -200,5 +259,52 @@ func forwardingChecks() []check {
 			}},
 		)
 	}
+	newTarget := net.IPv4(10, 4, 0, 2)
+	checks = append(checks,
+		check{"default-forwarding-leaves-existing-links-off", func() error {
+			err := r.do(func() error {
+				if err := writeAndExpect(forwardingAllFile, "0", "0"); err != nil {
+					return err
+				}
+				if err := writeAndExpect(forwardingDefaultFile, "1", "1"); err != nil {
+					return err
+				}
+				return expectValue(forwardingAllFile, "0")
+			})
+			if err != nil {
+				return err
+			}
+			if err := a.do(func() error { return ping(target, 1500*time.Millisecond) }); err == nil {
+				return fmt.Errorf("A reached %s over links that existed before conf/default/forwarding changed", target)
+			}
+			return nil
+		}},
+		check{"links-created-after-default-forwarding-forward", func() error {
+			// Both new links of R take forwarding from the default of R.
+			if err := addLinkPair(r, "r2", "a1", a); err != nil {
+				return err
+			}
+			if err := addLinkPair(r, "r3", "b1", b); err != nil {
+				return err
+			}
+			steps := []struct {
+				t  *nsThread
+				fn func() error
+			}{
+				{a, func() error { return configureLink("a1", "10.3.0.2/24") }},
+				{a, func() error { return addRoute("a1", "10.4.0.0/24", "10.3.0.1") }},
+				{b, func() error { return configureLink("b1", "10.4.0.2/24") }},
+				{b, func() error { return addRoute("b1", "10.3.0.0/24", "10.4.0.1") }},
+				{r, func() error { return configureLink("r2", "10.3.0.1/24") }},
+				{r, func() error { return configureLink("r3", "10.4.0.1/24") }},
+			}
+			for _, s := range steps {
+				if err := s.t.do(s.fn); err != nil {
+					return err
+				}
+			}
+			return a.do(func() error { return ping(newTarget, 5*time.Second) })
+		}},
+	)
 	return checks
 }

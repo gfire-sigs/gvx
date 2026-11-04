@@ -57,6 +57,45 @@ func kmsgChecks() []check {
 			}
 			return nil
 		}},
+		{"kmsg-seek-set-and-data-return-0", func() error {
+			fd, err := unix.Open(path, unix.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer unix.Close(fd)
+			for name, whence := range map[string]int{"SEEK_SET": unix.SEEK_SET, "SEEK_DATA": unix.SEEK_DATA} {
+				if off, err := unix.Seek(fd, 0, whence); err != nil || off != 0 {
+					return fmt.Errorf("lseek(%s) = %d, %v, want 0", name, off, err)
+				}
+			}
+			return nil
+		}},
+		{"kmsg-seek-with-offset-fails-with-espipe", func() error {
+			fd, err := unix.Open(path, unix.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer unix.Close(fd)
+			for _, whence := range []int{unix.SEEK_SET, unix.SEEK_DATA, unix.SEEK_END} {
+				if off, err := unix.Seek(fd, 1, whence); !errors.Is(err, syscall.ESPIPE) {
+					return fmt.Errorf("lseek(1, whence %d) = %d, %v, want ESPIPE", whence, off, err)
+				}
+			}
+			return nil
+		}},
+		{"kmsg-seek-with-invalid-whence-fails-with-einval", func() error {
+			fd, err := unix.Open(path, unix.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer unix.Close(fd)
+			for _, whence := range []int{unix.SEEK_CUR, unix.SEEK_HOLE, 99} {
+				if off, err := unix.Seek(fd, 0, whence); !errors.Is(err, syscall.EINVAL) {
+					return fmt.Errorf("lseek(0, whence %d) = %d, %v, want EINVAL", whence, off, err)
+				}
+			}
+			return nil
+		}},
 		{"kmsg-nonblocking-read-returns-eagain", func() error {
 			fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK, 0)
 			if err != nil {

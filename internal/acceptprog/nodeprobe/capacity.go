@@ -19,11 +19,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -127,19 +127,29 @@ func capacityChecks(mem uint64, cpus int) []check {
 	}
 }
 
-// memTotalChecks prints MemTotal, waits, and checks that the value stays. The
-// test starts several sandboxes at once, so the wait makes their runs overlap.
-func memTotalChecks() []check {
+// memTotalChecks writes writeMiB MiB to a file, prints MemTotal, waits for the
+// end of the standard input, and checks that the value stays. Then it prints the
+// sectors that /proc/diskstats shows as written. The test closes the input of
+// every sandbox only after all of them printed their value, so the runs overlap,
+// and each sandbox must count only its own writes.
+func memTotalChecks(writeMiB int) []check {
 	var first uint64
 	return []check{
 		{"memtotal-first-read", func() error {
+			if writeMiB > 0 {
+				if err := os.WriteFile("/tmp/diskfile", make([]byte, writeMiB<<20), 0o644); err != nil {
+					return err
+				}
+			}
 			var err error
 			first, err = meminfoTotal()
 			fmt.Printf("MEMTOTAL %d\n", first)
 			return err
 		}},
 		{"memtotal-stays-while-other-sandboxes-run", func() error {
-			time.Sleep(2 * time.Second)
+			if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
+				return err
+			}
 			got, err := meminfoTotal()
 			if err != nil {
 				return err
@@ -155,6 +165,11 @@ func memTotalChecks() []check {
 				return fmt.Errorf("sysinfo totalram = %d, MemTotal = %d", total, first)
 			}
 			return nil
+		}},
+		{"diskstats-count-only-this-sandbox", func() error {
+			_, written, err := diskSectors()
+			fmt.Printf("SECTORS %d\n", written)
+			return err
 		}},
 	}
 }

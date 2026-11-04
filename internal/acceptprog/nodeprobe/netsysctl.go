@@ -74,8 +74,8 @@ func netSysctlChecks() []check {
 				if err != nil {
 					return err
 				}
-				if s.def != unknownDefault && got != s.def {
-					return fmt.Errorf("%s reads %q, want the default %q", s.name, got, s.def)
+				if s.def != unknownDefault && got != s.rootDefault() {
+					return fmt.Errorf("%s reads %q, want the default %q of the root namespace", s.name, got, s.rootDefault())
 				}
 				parentBefore[s.name] = got
 			}
@@ -106,6 +106,11 @@ func netSysctlChecks() []check {
 	for _, s := range netSysctls {
 		checks = append(checks, check{"child-netns-writes " + s.name, func() error {
 			err := child.do(func() error {
+				for _, text := range s.accepted {
+					if err := writeAndExpect(netIPv4+s.name, text, text); err != nil {
+						return err
+					}
+				}
 				if err := writeAndExpect(netIPv4+s.name, s.write+"\n", s.want); err != nil {
 					return err
 				}

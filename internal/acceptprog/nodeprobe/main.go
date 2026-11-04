@@ -29,7 +29,8 @@
 //	nodeprobe netsysctls             check the sysctls of a network namespace
 //	nodeprobe forwarding             check forwarding between three namespaces
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
-//	nodeprobe memtotal               print MemTotal, wait, and check that it stays
+//	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
+//	                                 the end of the input, and check that it stays
 //	nodeprobe stats HOST:PORT        check link and disk statistics; the probe
 //	                                 reads from a TCP server at HOST:PORT
 package main
@@ -92,7 +93,16 @@ func main() {
 		}
 		checks = capacityChecks(mem, cpus)
 	case "memtotal":
-		checks = memTotalChecks()
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe memtotal WRITE_MIB")
+			os.Exit(2)
+		}
+		mib, err := strconv.Atoi(os.Args[2])
+		if err != nil || mib < 0 {
+			fmt.Fprintln(os.Stderr, "memtotal: WRITE_MIB must be a number")
+			os.Exit(2)
+		}
+		checks = memTotalChecks(mib)
 	case "stats":
 		if len(os.Args) != 3 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe stats HOST:PORT")

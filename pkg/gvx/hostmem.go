@@ -34,9 +34,12 @@ var hostMemory = sync.OnceValues(hostMemoryBytes)
 
 // applyHostMemoryDefaults sets the process-wide memory values of the Sentry
 // from the RAM of the host, as runsc does. A tmpfs mount without a size option
-// then gets half of that RAM, size=N% resolves, and MemTotal in /proc/meminfo
-// and sysinfo(2) reports that RAM. New calls it before the host lockdown. When
-// the host does not report its RAM, the Sentry keeps its built-in values.
+// then gets half of that RAM, size=N% resolves against it, and MemTotal in
+// /proc/meminfo and sysinfo(2) reports that RAM. A memory limit of the sandbox
+// changes only the reported total, which belongs to the kernel (see
+// reportedMemory); the tmpfs sizes still follow the host RAM. New calls it
+// before the host lockdown. When the host does not report its RAM, the Sentry
+// keeps its built-in values.
 var applyHostMemoryDefaults = sync.OnceFunc(func() {
 	total, err := hostMemory()
 	if err != nil || total == 0 {

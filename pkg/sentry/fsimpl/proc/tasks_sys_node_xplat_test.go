@@ -18,6 +18,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
@@ -80,7 +81,7 @@ func TestIntVecParserAppliesLinuxRanges(t *testing.T) {
 }
 
 func TestIntVecParserKeepsTheRestOfAVector(t *testing.T) {
-	pingGroups := intVecParser(2, 0, math.MaxInt32, fixPingGroupRange)
+	pingGroups := intVecParser(2, 0, maxGroupID, fixPingGroupRange)
 	tests := []struct {
 		name, text, cur, want string
 	}{
@@ -88,6 +89,7 @@ func TestIntVecParserKeepsTheRestOfAVector(t *testing.T) {
 		{"first value only", "5", "1\t9", "5\t9"},
 		{"reversed range becomes empty", "10 5", "100\t200", "1\t0"},
 		{"white space changes nothing", "\n", "100\t200", "100\t200"},
+		{"largest group ID", "0 4294967294", "1\t0", "0\t4294967294"},
 	}
 	for _, tc := range tests {
 		got, err := pingGroups(tc.text, tc.cur)
@@ -97,5 +99,16 @@ func TestIntVecParserKeepsTheRestOfAVector(t *testing.T) {
 	}
 	if got, err := pingGroups("1 2 3", "1\t0"); !errors.Is(err, linuxerr.EINVAL) {
 		t.Errorf("three values = %q, %v, want EINVAL", got, err)
+	}
+	if got, err := pingGroups("0 4294967295", "1\t0"); !errors.Is(err, linuxerr.EINVAL) {
+		t.Errorf("group ID 4294967295 = %q, %v, want EINVAL", got, err)
+	}
+}
+
+func TestStackSecondsAcceptsLinuxZero(t *testing.T) {
+	for seconds, want := range map[int]time.Duration{0: time.Second, 1: time.Second, 75: 75 * time.Second} {
+		if got := stackSeconds(seconds); got != want {
+			t.Errorf("stackSeconds(%d) = %v, want %v", seconds, got, want)
+		}
 	}
 }

@@ -32,11 +32,11 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
-	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
@@ -77,7 +77,7 @@ type sysctlSpec struct {
 	parse func(text, cur string) (string, error)
 	// apply sets a knob of the network stack from the stored values. It runs
 	// after the store changed. A failure restores the old value.
-	apply func(ns *inet.Namespace) error
+	apply func(stack inet.Stack, st sysctlStore) error
 }
 
 // sysctlWriteMu serializes every write of a stored sysctl. A write reads the old
@@ -183,15 +183,17 @@ func sysctlStack(ctx context.Context, fallback inet.Stack) inet.Stack {
 }
 
 // withStore runs f with the store that holds the value of the spec for the
-// caller. The network namespace is nil for the other scopes.
-func (s *sysctlSpec) withStore(ctx context.Context, f func(st sysctlStore, ns *inet.Namespace) error) error {
+// caller. The network stack is nil for the other scopes. The store of a network
+// sysctl is the network stack of the network namespace of the caller.
+func (s *sysctlSpec) withStore(ctx context.Context, f func(st sysctlStore, stack inet.Stack) error) error {
 	switch s.scope {
 	case scopeNet:
-		ns := sysctlNamespace(ctx)
-		if ns == nil {
+		stack := sysctlStack(ctx, nil)
+		st, ok := stack.(sysctlStore)
+		if !ok {
 			return linuxerr.ENOENT
 		}
-		return f(ns, ns)
+		return f(st, stack)
 	case scopeIPC:
 		ns := kernel.IPCNamespaceFromContext(ctx)
 		if ns == nil {
@@ -219,7 +221,7 @@ var _ vfs.WritableDynamicBytesSource = (*sysctlFile)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *sysctlFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	return f.spec.withStore(ctx, func(st sysctlStore, _ *inet.Namespace) error {
+	return f.spec.withStore(ctx, func(st sysctlStore, _ inet.Stack) error {
 		v, ok := st.SysctlValue(f.spec.key)
 		if !ok {
 			v = f.spec.def
@@ -241,7 +243,7 @@ func (f *sysctlFile) Write(ctx context.Context, _ *vfs.FileDescription, src user
 	}
 	sysctlWriteMu.Lock()
 	defer sysctlWriteMu.Unlock()
-	err = f.spec.withStore(ctx, func(st sysctlStore, ns *inet.Namespace) error {
+	err = f.spec.withStore(ctx, func(st sysctlStore, stack inet.Stack) error {
 		old, had := st.SysctlValue(f.spec.key)
 		cur := old
 		if !had {
@@ -252,10 +254,10 @@ func (f *sysctlFile) Write(ctx context.Context, _ *vfs.FileDescription, src user
 			return err
 		}
 		st.SetSysctlValue(f.spec.key, val)
-		if f.spec.apply == nil || ns == nil {
+		if f.spec.apply == nil || stack == nil {
 			return nil
 		}
-		if err := f.spec.apply(ns); err != nil {
+		if err := f.spec.apply(stack, st); err != nil {
 			st.SetSysctlValue(f.spec.key, cur)
 			return err
 		}
@@ -363,8 +365,10 @@ func fixPingGroupRange(vals []int64) {
 // Limits of Linux for the sysctls below. A time in seconds must fit in jiffies
 // at 250 ticks per second.
 const (
-	maxSysctlSeconds   = math.MaxInt32 / 250
-	maxKeepaliveProbes = 127
+	maxSysctlSeconds = math.MaxInt32 / 250
+	// maxGroupID is the largest group ID of ping_group_range (gid_t is 32 bits,
+	// and Linux keeps 4294967295 for "no group").
+	maxGroupID = math.MaxUint32 - 1
 )
 
 // nodeSysctlSpecs lists the stored sysctl files by the directory of
@@ -384,14 +388,14 @@ var nodeSysctlSpecs = map[string][]*sysctlSpec{
 		{scope: scopeNode, name: "root_maxbytes", key: "kernel/keys/root_maxbytes", def: "25000000", parse: intVecParser(1, 1, math.MaxInt32, nil)},
 	},
 	"net/ipv4": {
-		{scope: scopeNet, name: "ip_unprivileged_port_start", key: inet.UnprivilegedPortStartKey, def: strconv.Itoa(inet.DefaultUnprivilegedPortStart), parse: intVecParser(1, 0, math.MaxUint16, nil)},
+		{scope: scopeNet, name: "ip_unprivileged_port_start", key: netstack.UnprivilegedPortStartKey, def: strconv.Itoa(netstack.DefaultUnprivilegedPortStart), parse: intVecParser(1, 0, math.MaxUint16, nil)},
 		{scope: scopeNet, name: "tcp_syncookies", key: "ipv4/tcp_syncookies", def: "1", parse: intVecParser(1, 0, 2, nil), apply: applySynCookies},
-		{scope: scopeNet, name: "ping_group_range", key: "ipv4/ping_group_range", def: "1\t0", parse: intVecParser(2, 0, math.MaxInt32, fixPingGroupRange)},
+		{scope: scopeNet, name: "ping_group_range", key: "ipv4/ping_group_range", def: "1\t0", parse: intVecParser(2, 0, maxGroupID, fixPingGroupRange)},
 		{scope: scopeNet, name: "ip_local_reserved_ports", key: "ipv4/ip_local_reserved_ports", def: "", parse: parseReservedPorts},
-		{scope: scopeNet, name: "tcp_keepalive_time", key: keepaliveTimeKey, def: "7200", parse: intVecParser(1, 1, maxSysctlSeconds, nil), apply: applyKeepalive},
-		{scope: scopeNet, name: "tcp_keepalive_intvl", key: keepaliveIntvlKey, def: "75", parse: intVecParser(1, 1, maxSysctlSeconds, nil), apply: applyKeepalive},
-		{scope: scopeNet, name: "tcp_keepalive_probes", key: keepaliveProbesKey, def: "9", parse: intVecParser(1, 1, maxKeepaliveProbes, nil), apply: applyKeepalive},
-		{scope: scopeNet, name: "tcp_fin_timeout", key: "ipv4/tcp_fin_timeout", def: "60", parse: intVecParser(1, 1, maxSysctlSeconds, nil), apply: applyFinTimeout},
+		{scope: scopeNet, name: "tcp_keepalive_time", key: keepaliveTimeKey, def: "7200", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyKeepalive},
+		{scope: scopeNet, name: "tcp_keepalive_intvl", key: keepaliveIntvlKey, def: "75", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyKeepalive},
+		{scope: scopeNet, name: "tcp_keepalive_probes", key: keepaliveProbesKey, def: "9", parse: intVecParser(1, 1, math.MaxInt32, nil), apply: applyKeepalive},
+		{scope: scopeNet, name: "tcp_fin_timeout", key: "ipv4/tcp_fin_timeout", def: "60", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyFinTimeout},
 	},
 	"net/netfilter": {
 		{scope: scopeNet, name: "nf_conntrack_max", key: "netfilter/nf_conntrack_max", def: "262144", parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil)},
@@ -406,9 +410,9 @@ const (
 	keepaliveProbesKey = "ipv4/tcp_keepalive_probes"
 )
 
-// storedInt returns the integer that the namespace stores for key, or def.
-func storedInt(ns *inet.Namespace, key string, def int) int {
-	if text, ok := ns.SysctlValue(key); ok {
+// storedInt returns the integer that the store holds for key, or def.
+func storedInt(st sysctlStore, key string, def int) int {
+	if text, ok := st.SysctlValue(key); ok {
 		if v, err := strconv.Atoi(text); err == nil {
 			return v
 		}
@@ -419,63 +423,78 @@ func storedInt(ns *inet.Namespace, key string, def int) int {
 // applySynCookies sets the SYN cookie mode of the stack. The value 2 sends a
 // cookie for every SYN. The stack sends cookies only when the accept queue is
 // full for the values 0 and 1, so 0 does not turn cookies off.
-func applySynCookies(ns *inet.Namespace) error {
-	st, ok := ns.Stack().(interface{ SetTCPAlwaysUseSynCookies(bool) error })
+func applySynCookies(stack inet.Stack, st sysctlStore) error {
+	s, ok := stack.(interface{ SetTCPAlwaysUseSynCookies(bool) error })
 	if !ok {
 		return nil
 	}
-	return st.SetTCPAlwaysUseSynCookies(storedInt(ns, "ipv4/tcp_syncookies", 1) == 2)
+	return s.SetTCPAlwaysUseSynCookies(storedInt(st, "ipv4/tcp_syncookies", 1) == 2)
 }
 
+// stackSeconds converts a stored time in seconds to a duration that the stack
+// accepts. Linux takes 0 and larger values, and the stack needs at least one
+// second, so a smaller value counts as one second.
+func stackSeconds(seconds int) time.Duration {
+	return time.Duration(max(seconds, 1)) * time.Second
+}
+
+// maxStackKeepaliveProbes is the largest probe count that the stack gets. A
+// larger stored value stays in the file and counts as this value.
+const maxStackKeepaliveProbes = 127
+
 // applyKeepalive sets the keepalive parameters that new TCP sockets start with.
-func applyKeepalive(ns *inet.Namespace) error {
-	st, ok := ns.Stack().(interface {
+// The stored values keep the range of Linux, and the stack gets them within
+// the range that it accepts.
+func applyKeepalive(stack inet.Stack, st sysctlStore) error {
+	s, ok := stack.(interface {
 		SetTCPKeepaliveDefaults(idle, interval time.Duration, probes int) error
 	})
 	if !ok {
 		return nil
 	}
-	return st.SetTCPKeepaliveDefaults(
-		time.Duration(storedInt(ns, keepaliveTimeKey, 7200))*time.Second,
-		time.Duration(storedInt(ns, keepaliveIntvlKey, 75))*time.Second,
-		storedInt(ns, keepaliveProbesKey, 9))
+	return s.SetTCPKeepaliveDefaults(
+		stackSeconds(storedInt(st, keepaliveTimeKey, 7200)),
+		stackSeconds(storedInt(st, keepaliveIntvlKey, 75)),
+		min(max(storedInt(st, keepaliveProbesKey, 9), 1), maxStackKeepaliveProbes))
 }
 
 // applyFinTimeout sets the FIN-WAIT-2 timeout of the stack.
-func applyFinTimeout(ns *inet.Namespace) error {
-	st, ok := ns.Stack().(interface{ SetTCPFinTimeout(time.Duration) error })
+func applyFinTimeout(stack inet.Stack, st sysctlStore) error {
+	s, ok := stack.(interface{ SetTCPFinTimeout(time.Duration) error })
 	if !ok {
 		return nil
 	}
-	return st.SetTCPFinTimeout(time.Duration(storedInt(ns, "ipv4/tcp_fin_timeout", 60)) * time.Second)
+	return s.SetTCPFinTimeout(stackSeconds(storedInt(st, "ipv4/tcp_fin_timeout", 60)))
 }
 
 // addNodeSysctlFiles adds the stored sysctl files of the /proc/sys directory at
-// path to files. The forwarding files of the IPv4 conf directories act as
-// ip_forward does for the network namespace of the reader.
+// path to files. conf/all/forwarding shares its value with ip_forward, and
+// conf/default/forwarding has a value of its own.
 func (fs *filesystem) addNodeSysctlFiles(ctx context.Context, root *auth.Credentials, k *kernel.Kernel, stack inet.Stack, path string, files map[string]kernfs.Inode) {
 	for _, spec := range nodeSysctlSpecs[path] {
 		files[spec.name] = fs.newInode(ctx, root, 0644, &sysctlFile{spec: spec})
 	}
 	switch path {
-	case "net/ipv4/conf/all", "net/ipv4/conf/default":
+	case "net/ipv4/conf/all":
 		files["forwarding"] = fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv4.ProtocolNumber})
+	case "net/ipv4/conf/default":
+		files["forwarding"] = fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv4.ProtocolNumber, isDefault: true})
 	}
 }
 
-// forwardingKey is the key of the forwarding value of the network namespace for
-// an IP family.
-func forwardingKey(protocol tcpip.NetworkProtocolNumber) string {
-	if protocol == ipv6.ProtocolNumber {
-		return "ipv6/forwarding"
-	}
-	return "ipv4/forwarding"
+// forwardingStack is a network stack that keeps the forwarding switches of its
+// network namespace. See netstack.Stack.SetForwardingSwitch.
+type forwardingStack interface {
+	Forwarding(protocol tcpip.NetworkProtocolNumber, isDefault bool) bool
+	SetForwardingSwitch(protocol tcpip.NetworkProtocolNumber, isDefault, enable bool) error
 }
 
 // nsForwarding implements vfs.WritableDynamicBytesSource for ip_forward and the
 // forwarding files of the conf directories. It does what ipForwarding does, but
-// the value belongs to the network namespace of the caller, and the files
-// ip_forward, conf/all/forwarding, and conf/default/forwarding share it.
+// the values belong to the network namespace of the caller. ip_forward and
+// conf/all/forwarding are one switch. A write to it sets conf/default/forwarding
+// and every link, as on Linux. A write to conf/default/forwarding changes only
+// the links that the guest creates later.
 type nsForwarding struct {
 	kernfs.DynamicBytesFile
 
@@ -483,23 +502,30 @@ type nsForwarding struct {
 	// has no network namespace of its own.
 	stack    inet.Stack
 	protocol tcpip.NetworkProtocolNumber
+	// isDefault selects conf/default/forwarding.
+	isDefault bool
 }
 
 var _ vfs.WritableDynamicBytesSource = (*nsForwarding)(nil)
 
+// switches returns the forwarding switches of the network namespace of the caller.
+func (f *nsForwarding) switches(ctx context.Context) (forwardingStack, error) {
+	s, ok := sysctlStack(ctx, f.stack).(forwardingStack)
+	if !ok {
+		return nil, linuxerr.ENOENT
+	}
+	return s, nil
+}
+
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *nsForwarding) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	ns := sysctlNamespace(ctx)
-	if ns == nil {
-		return linuxerr.ENOENT
+	s, err := f.switches(ctx)
+	if err != nil {
+		return err
 	}
-	val := "0\n"
-	if v, ok := ns.SysctlValue(forwardingKey(f.protocol)); ok && v == "1" {
-		// Linux preserves the written integer; this file reports a boolean,
-		// so a nonzero value such as "2" is read back as "1".
-		val = "1\n"
-	}
-	buf.WriteString(val)
+	// Linux preserves the written integer; this file reports a boolean, so a
+	// nonzero value such as "2" is read back as "1".
+	fmt.Fprintf(buf, "%d\n", boolToInt32(s.Forwarding(f.protocol, f.isDefault)))
 	return nil
 }
 
@@ -514,16 +540,14 @@ func (f *nsForwarding) Write(ctx context.Context, _ *vfs.FileDescription, src us
 	if err != nil || n == 0 {
 		return 0, err
 	}
-	ns := sysctlNamespace(ctx)
-	if ns == nil {
-		return 0, linuxerr.ENOENT
-	}
-	enabled := buf[0] != 0
-	sysctlWriteMu.Lock()
-	defer sysctlWriteMu.Unlock()
-	if err := sysctlStack(ctx, f.stack).SetForwarding(f.protocol, enabled); err != nil {
+	s, err := f.switches(ctx)
+	if err != nil {
 		return 0, err
 	}
-	ns.SetSysctlValue(forwardingKey(f.protocol), strconv.Itoa(int(boolToInt32(enabled))))
+	sysctlWriteMu.Lock()
+	defer sysctlWriteMu.Unlock()
+	if err := s.SetForwardingSwitch(f.protocol, f.isDefault, buf[0] != 0); err != nil {
+		return 0, err
+	}
 	return n, nil
 }

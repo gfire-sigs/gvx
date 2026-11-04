@@ -137,39 +137,64 @@ func storedSysctlChecks() []check {
 	return checks
 }
 
-// forwardingFilesAgree checks that conf/all/forwarding, conf/default/forwarding,
-// and ip_forward show one value for the namespace.
+const (
+	ipForwardFile         = "/proc/sys/net/ipv4/ip_forward"
+	forwardingAllFile     = "/proc/sys/net/ipv4/conf/all/forwarding"
+	forwardingDefaultFile = "/proc/sys/net/ipv4/conf/default/forwarding"
+)
+
+// forwardingFilesAgree checks the forwarding files as Linux has them.
+// ip_forward and conf/all/forwarding are one switch, and a write to it also
+// sets conf/default/forwarding. A write to conf/default/forwarding leaves the
+// switch of ip_forward alone.
 func forwardingFilesAgree() error {
-	files := []string{
-		"/proc/sys/net/ipv4/ip_forward",
-		"/proc/sys/net/ipv4/conf/all/forwarding",
-		"/proc/sys/net/ipv4/conf/default/forwarding",
-	}
-	for _, writer := range files {
+	for _, writer := range []string{ipForwardFile, forwardingAllFile} {
 		for _, v := range []string{"1", "0"} {
 			if err := writeValue(writer, v); err != nil {
 				return fmt.Errorf("write %q to %s: %w", v, writer, err)
 			}
-			for _, reader := range files {
+			for _, reader := range []string{ipForwardFile, forwardingAllFile, forwardingDefaultFile} {
 				if err := expectValue(reader, v); err != nil {
 					return fmt.Errorf("after the write of %q to %s: %w", v, writer, err)
 				}
 			}
 		}
 	}
-	return nil
+	if err := writeValue(forwardingDefaultFile, "1"); err != nil {
+		return err
+	}
+	for reader, want := range map[string]string{ipForwardFile: "0", forwardingAllFile: "0", forwardingDefaultFile: "1"} {
+		if err := expectValue(reader, want); err != nil {
+			return fmt.Errorf("after the write of 1 to conf/default/forwarding: %w", err)
+		}
+	}
+	return writeAndExpect(forwardingDefaultFile, "0", "0")
 }
 
 // netSysctl describes a sysctl of a network namespace.
 type netSysctl struct {
 	name string
-	// def is the value of a new namespace. The value unknownDefault means that the
-	// check skips the default.
+	// def is the value of a namespace that the guest creates. The value
+	// unknownDefault means that the check skips the default.
 	def string
+	// rootDef is the value of the root namespace of the sandbox, when it differs
+	// from def.
+	rootDef string
+	// accepted lists texts at the edge of the range of Linux that a write must
+	// accept. The check writes them before it writes the text of write.
+	accepted []string
 	// write is the text that the check writes. The file then reads want.
 	write, want string
 	// invalid lists texts that must fail with EINVAL.
 	invalid []string
+}
+
+// rootDefault returns the value that the root namespace has before a write.
+func (s netSysctl) rootDefault() string {
+	if s.rootDef != "" {
+		return s.rootDef
+	}
+	return s.def
 }
 
 const (
@@ -178,13 +203,13 @@ const (
 )
 
 var netSysctls = []netSysctl{
-	{name: "ip_unprivileged_port_start", def: "1024", write: "0", want: "0", invalid: []string{"65536", "-1", "x"}},
+	{name: "ip_unprivileged_port_start", def: "1024", rootDef: "0", accepted: []string{"65535"}, write: "2000", want: "2000", invalid: []string{"65536", "-1", "x"}},
 	{name: "ip_local_port_range", def: unknownDefault, write: "40000 40010", want: "40000 40010", invalid: []string{"x"}},
 	{name: "tcp_syncookies", def: "1", write: "2", want: "2", invalid: []string{"3", "-1", "x"}},
-	{name: "ping_group_range", def: "1 0", write: "100 200", want: "100 200", invalid: []string{"x"}},
+	{name: "ping_group_range", def: "1 0", accepted: []string{"0 4294967294"}, write: "100 200", want: "100 200", invalid: []string{"x", "0 4294967295"}},
 	{name: "ip_local_reserved_ports", def: "", write: "8000-8010,80,81", want: "80-81,8000-8010", invalid: []string{"70000", "10-5", "x"}},
-	{name: "tcp_keepalive_time", def: "7200", write: "1800", want: "1800", invalid: []string{"x"}},
-	{name: "tcp_keepalive_intvl", def: "75", write: "30", want: "30", invalid: []string{"x"}},
-	{name: "tcp_keepalive_probes", def: "9", write: "5", want: "5", invalid: []string{"x"}},
-	{name: "tcp_fin_timeout", def: "60", write: "30", want: "30", invalid: []string{"x"}},
+	{name: "tcp_keepalive_time", def: "7200", accepted: []string{"0"}, write: "1800", want: "1800", invalid: []string{"x"}},
+	{name: "tcp_keepalive_intvl", def: "75", accepted: []string{"0"}, write: "30", want: "30", invalid: []string{"x"}},
+	{name: "tcp_keepalive_probes", def: "9", accepted: []string{"128", "255"}, write: "5", want: "5", invalid: []string{"x"}},
+	{name: "tcp_fin_timeout", def: "60", accepted: []string{"0"}, write: "30", want: "30", invalid: []string{"x"}},
 }

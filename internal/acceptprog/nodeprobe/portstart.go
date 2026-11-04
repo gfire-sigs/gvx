@@ -21,12 +21,14 @@ import "syscall"
 const portStartFile = netIPv4 + "ip_unprivileged_port_start"
 
 // portStartChecks checks that a bind below ip_unprivileged_port_start needs
-// CAP_NET_BIND_SERVICE, and that each network namespace has its own value.
+// CAP_NET_BIND_SERVICE, and that each network namespace has its own value. The
+// root namespace of the sandbox is the namespace of the container, so it starts
+// at 0, as in a Docker container. A namespace that the guest creates starts at
+// 1024, as on Linux.
 func portStartChecks() []check {
-	var nobody, child *nsThread
+	var nobody, childNobody, child *nsThread
 	return []check{
-		{"port-start-default-1024", func() error { return expectValue(portStartFile, "1024") }},
-		{"root-binds-port-80", func() error { return expectBind(80, nil) }},
+		{"root-netns-starts-at-0", func() error { return expectValue(portStartFile, "0") }},
 		{"start-nobody-thread", func() error {
 			// The thread runs in the namespace of the probe, as nobody.
 			t, err := newThread(false, true)
@@ -36,7 +38,13 @@ func portStartChecks() []check {
 			nobody = t
 			return nil
 		}},
-		{"nobody-bind-below-1024-fails-with-eacces", func() error {
+		{"root-netns-lets-nobody-bind-port-80", func() error {
+			return nobody.do(func() error { return expectBind(80, nil) })
+		}},
+		{"start-1024-refuses-nobody-below-1024", func() error {
+			if err := writeAndExpect(portStartFile, "1024", "1024"); err != nil {
+				return err
+			}
 			return nobody.do(func() error {
 				if err := expectBind(80, syscall.EACCES); err != nil {
 					return err
@@ -44,43 +52,43 @@ func portStartChecks() []check {
 				return expectBind(1023, syscall.EACCES)
 			})
 		}},
-		{"nobody-bind-1024-succeeds", func() error { return nobody.do(func() error { return expectBind(1024, nil) }) }},
+		{"start-1024-lets-nobody-bind-1024", func() error { return nobody.do(func() error { return expectBind(1024, nil) }) }},
+		{"root-binds-port-80-at-1024", func() error { return expectBind(80, nil) }},
 		{"start-0-lets-nobody-bind-port-80", func() error {
 			if err := writeAndExpect(portStartFile, "0", "0"); err != nil {
 				return err
 			}
 			return nobody.do(func() error { return expectBind(80, nil) })
 		}},
-		{"start-1024-again-refuses-nobody", func() error {
-			if err := writeAndExpect(portStartFile, "1024", "1024"); err != nil {
+		{"child-netns-starts-at-1024", func() error {
+			t, err := newThread(true, true)
+			if err != nil {
 				return err
 			}
-			return nobody.do(func() error { return expectBind(80, syscall.EACCES) })
+			childNobody = t
+			return childNobody.do(func() error { return expectValue(portStartFile, "1024") })
 		}},
-		{"child-netns-starts-at-1024", func() error {
+		{"child-netns-refuses-nobody-below-1024", func() error {
+			return childNobody.do(func() error {
+				if err := expectBind(80, syscall.EACCES); err != nil {
+					return err
+				}
+				return expectBind(1024, nil)
+			})
+		}},
+		{"child-netns-write-keeps-parent-value", func() error {
 			t, err := newNsThread()
 			if err != nil {
 				return err
 			}
 			child = t
-			return child.do(func() error { return expectValue(portStartFile, "1024") })
-		}},
-		{"child-netns-write-keeps-parent-value", func() error {
-			if err := child.do(func() error { return writeAndExpect(portStartFile, "0", "0") }); err != nil {
+			if err := child.do(func() error { return writeAndExpect(portStartFile, "2000", "2000") }); err != nil {
 				return err
 			}
-			return expectValue(portStartFile, "1024")
+			return expectValue(portStartFile, "0")
 		}},
-		{"child-netns-start-0-lets-nobody-bind", func() error {
-			return child.do(func() error {
-				if err := dropPrivileges(); err != nil {
-					return err
-				}
-				return expectBind(80, nil)
-			})
-		}},
-		{"parent-netns-still-refuses-nobody", func() error {
-			return nobody.do(func() error { return expectBind(80, syscall.EACCES) })
+		{"child-netns-value-leaves-parent-binds", func() error {
+			return nobody.do(func() error { return expectBind(80, nil) })
 		}},
 	}
 }

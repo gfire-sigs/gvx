@@ -334,7 +334,7 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 	case "net/ipv6/conf/default":
 		// Stub for conf/default/forwarding.
 		return map[string]kernfs.Inode{
-			"forwarding": fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv6.ProtocolNumber}),
+			"forwarding": fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv6.ProtocolNumber, isDefault: true}),
 		}
 	}
 	if files, ok := fs.sysNetXplatFiles(ctx, root, stack, path); ok {

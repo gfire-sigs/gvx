@@ -37,7 +37,8 @@ func (s *sock) checkPrivilegedPort(t *kernel.Task, addr tcpip.FullAddress) *syse
 	if s.protocol != int(header.TCPProtocolNumber) && s.protocol != int(header.UDPProtocolNumber) {
 		return nil
 	}
-	if addr.Port == 0 || int(addr.Port) >= s.namespace.UnprivilegedPortStart() {
+	stack, ok := s.namespace.Stack().(*Stack)
+	if !ok || addr.Port == 0 || int(addr.Port) >= stack.UnprivilegedPortStart() {
 		return nil
 	}
 	if t.HasCapabilityIn(linux.CAP_NET_BIND_SERVICE, s.namespace.UserNamespace()) {

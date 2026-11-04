@@ -943,6 +943,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	var rootNetNS *inet.Namespace
 	if s.netStack != nil {
 		inetStack := netstack.NewStack(s.netStack, k.UniqueID())
+		// The root network namespace is the network namespace of the container,
+		// where Docker and containerd set ip_unprivileged_port_start to 0. A
+		// namespace that the guest creates starts at 1024, as on Linux.
+		inetStack.SetUnprivilegedPortStart(0)
 		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
 	}
 
@@ -1217,7 +1221,15 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	return netstack.NewStack(st, c.k.UniqueID()), nil
+	stack := netstack.NewStack(st, c.k.UniqueID())
+	// Linux gives a new network namespace the IPv4 forwarding switches of the
+	// root namespace and the defaults for IPv6.
+	if root, ok := c.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
+		if err := stack.InheritForwarding(root); err != nil {
+			return nil, fmt.Errorf("gvx: copy the forwarding switches to a new network namespace: %w", err)
+		}
+	}
+	return stack, nil
 }
 
 // buildKernelRootMountNamespace creates the mount namespace of the guest. As

@@ -19,13 +19,14 @@ import (
 	"fmt"
 
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/sentry/usage"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
 )
 
 // The Sentry has no block layer, so /proc/diskstats describes one disk, vda,
-// that stands for the root file system. Its counters come from usage.TotalIO,
-// the read and write system calls of all tasks. The counts grow with every
-// read and write, and they include sockets, pipes, and terminals.
+// that stands for the root file system. Its counters come from the kernel
+// (Kernel.IOTotals): the read and write system calls of all its tasks,
+// including the tasks that exited. The counts grow with every read and write,
+// and they include sockets, pipes, and terminals.
 
 const (
 	diskstatsDevice = "vda"
@@ -45,9 +46,10 @@ var _ dynamicInode = (*diskstatsData)(nil)
 // fields of Linux 5.5 and later. The Sentry has no merged, discarded, or
 // flushed requests and no latency, so those fields stay 0.
 func (*diskstatsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	io := kernel.KernelFromContext(ctx).IOTotals()
 	fmt.Fprintf(buf, "%4d %7d %s %d 0 %d 0 %d 0 %d 0 0 0 0 0 0 0 0 0 0\n",
 		diskstatsMajor, 0, diskstatsDevice,
-		usage.TotalIO.ReadSyscalls.Load(), usage.TotalIO.CharsRead.Load()/diskSectorSize,
-		usage.TotalIO.WriteSyscalls.Load(), usage.TotalIO.CharsWritten.Load()/diskSectorSize)
+		io.ReadSyscalls, io.CharsRead/diskSectorSize,
+		io.WriteSyscalls, io.CharsWritten/diskSectorSize)
 	return nil
 }

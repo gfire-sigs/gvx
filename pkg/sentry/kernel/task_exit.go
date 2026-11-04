@@ -819,6 +819,7 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 	}
 	if t.exitTracerAcked && t.exitParentAcked {
 		t.advanceExitStateLocked(TaskExitZombie, TaskExitDead)
+		t.accountExitedIO()
 		for ns := t.tg.pidns; ns != nil; ns = ns.parent {
 			ns.deleteTask(t)
 		}
