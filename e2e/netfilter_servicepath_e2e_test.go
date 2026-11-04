@@ -37,6 +37,13 @@ import (
 // install the tools.
 func runServicePathGuest(t *testing.T, b gateBackend, probes map[string]string, script string) string {
 	t.Helper()
+	return runServicePathGuestFor(t, b, probes, script, 5*time.Minute)
+}
+
+// runServicePathGuestFor is runServicePathGuest with its own time limit for the
+// guest.
+func runServicePathGuestFor(t *testing.T, b gateBackend, probes map[string]string, script string, timeout time.Duration) string {
+	t.Helper()
 	dir := t.TempDir()
 	for name, build := range probes {
 		data, err := os.ReadFile(build)
@@ -54,7 +61,7 @@ func runServicePathGuest(t *testing.T, b gateBackend, probes map[string]string, 
 		workspace: dir,
 		net:       gvx.NetModeNAT,
 		netRaw:    true,
-		timeout:   5 * time.Minute,
+		timeout:   timeout,
 	})
 }
 

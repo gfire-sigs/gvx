@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/internal/acceptprog"
 )
@@ -27,15 +28,16 @@ import (
 // the options of the file that flannel generates for a node. The root
 // namespace forwards IP packets as on a node, so each new namespace does too.
 //
-// The script sends five pings from the first pod to the second pod and to the
-// gateway, and from the host to the first pod. It counts the duplicate replies,
-// which a pod that forwards a frame for another host causes. Then it removes the
-// sixth pod while the host still holds its neighbor entry, and the host sends
-// connections to the address of that pod. The bridge floods them, because it no
-// longer knows the link address. The script counts the duplicates again and
-// sends 200 pings and 200 TCP connections between the first two pods, from each
-// of them to the gateway, and from the host to each of them. It counts the
-// failures.
+// The script runs svcprobe loop: it sends echo requests and opens TCP
+// connections one after the other, and it counts the failures and the
+// duplicate echo replies, which a pod that forwards a frame for another host
+// causes. It does so from the first pod to the second pod and to the gateway,
+// and from the host to the first pod. Then it removes the sixth pod while the
+// host still holds its neighbor entry, and the host sends connections to the
+// address of that pod. The bridge floods them, because it no longer knows the
+// link address. The script then repeats the loops with 200 requests and 200
+// connections between the first two pods, from each of them to the gateway,
+// and from the host to each of them.
 const cniBridgeScript = `set -e
 apk add --no-cache iptables iptables-legacy iproute2 cni-plugins >/dev/null
 ln -sf iptables-legacy /sbin/iptables
@@ -60,26 +62,13 @@ done
 ip1=10.244.0.2; ip2=10.244.0.3; gw=10.244.0.1; ip6=10.244.0.7
 svcprobe serve [::]:8080 gw &
 for i in $(seq 1 60); do svcprobe dial [::1]:8080 >/dev/null 2>&1 && break; sleep 0.5; done
-dups() {
-  if [ "$2" = host ]; then out=$(ping -c5 -W1 $3); else out=$(ip netns exec $2 ping -c5 -W1 $3); fi
-  echo "DUPLICATES $1 $2-to-$3 $(echo "$out" | grep -c DUP || true)"
+probe() {
+  if [ "$2" = host ]; then out=$(svcprobe loop $3 8080 $4); else out=$(ip netns exec $2 svcprobe loop $3 8080 $4); fi
+  echo "$1 $2-to-$3 $out"
 }
-loss() {
-  pf=0; tf=0
-  for i in $(seq 1 200); do
-    if [ "$1" = host ]; then
-      ping -c1 -W2 $2 >/dev/null 2>&1 || pf=$((pf+1))
-      svcprobe dial $2:8080 >/dev/null 2>&1 || tf=$((tf+1))
-    else
-      ip netns exec $1 ping -c1 -W2 $2 >/dev/null 2>&1 || pf=$((pf+1))
-      ip netns exec $1 svcprobe dial $2:8080 >/dev/null 2>&1 || tf=$((tf+1))
-    fi
-  done
-  echo "LOSS $1-to-$2 ping=$pf tcp=$tf"
-}
-dups before-stale ns1 $ip2
-dups before-stale ns1 $gw
-dups before-stale host $ip1
+probe BEFORE-STALE ns1 $ip2 20
+probe BEFORE-STALE ns1 $gw 20
+probe BEFORE-STALE host $ip1 20
 ip netns exec ns6 svcprobe serve [::]:8080 ns6 &
 for i in $(seq 1 60); do ip netns exec ns6 svcprobe dial [::1]:8080 >/dev/null 2>&1 && break; sleep 0.5; done
 svcprobe dial $ip6:8080 >/dev/null
@@ -87,15 +76,12 @@ ping -c1 -W2 $ip6 >/dev/null
 CNI_COMMAND=DEL CNI_CONTAINERID=pod6 CNI_NETNS=/var/run/netns/ns6 CNI_IFNAME=eth0 CNI_PATH=/usr/libexec/cni /usr/libexec/cni/bridge </tmp/cni.conf
 ip netns del ns6
 for i in $(seq 1 10); do svcprobe dial $ip6:8080 >/dev/null 2>&1 || true; done
-dups after-stale ns1 $ip2
-dups after-stale ns1 $gw
-dups after-stale host $ip1
-loss ns1 $ip2
-loss ns2 $ip1
-loss ns1 $gw
-loss ns2 $gw
-loss host $ip1
-loss host $ip2
+probe AFTER-STALE ns1 $ip2 200
+probe AFTER-STALE ns2 $ip1 200
+probe AFTER-STALE ns1 $gw 200
+probe AFTER-STALE ns2 $gw 200
+probe AFTER-STALE host $ip1 200
+probe AFTER-STALE host $ip2 200
 `
 
 // TestE2ECNIBridgeLossless checks that namespaces which the real bridge and
@@ -110,21 +96,19 @@ func TestE2ECNIBridgeLossless(t *testing.T) {
 		t.Run(b.name, func(t *testing.T) {
 			requireBackend(t, b)
 			requireRegistry(t)
-			out := runServicePathGuest(t, b, map[string]string{"svcprobe": acceptprog.BuildSvcProbe(t, hostArch())}, cniBridgeScript)
+			out := runServicePathGuestFor(t, b, map[string]string{"svcprobe": acceptprog.BuildSvcProbe(t, hostArch())}, cniBridgeScript, 15*time.Minute)
 			t.Logf("guest output:\n%s", out)
+			const clean = "LOOP ping_lost=0 tcp_failed=0 duplicates=0\n"
 			requireContains(t, "guest output", out,
-				"LOSS ns1-to-10.244.0.3 ping=0 tcp=0\n",
-				"LOSS ns2-to-10.244.0.2 ping=0 tcp=0\n",
-				"LOSS ns1-to-10.244.0.1 ping=0 tcp=0\n",
-				"LOSS ns2-to-10.244.0.1 ping=0 tcp=0\n",
-				"LOSS host-to-10.244.0.2 ping=0 tcp=0\n",
-				"LOSS host-to-10.244.0.3 ping=0 tcp=0\n",
-				"DUPLICATES before-stale ns1-to-10.244.0.3 0\n",
-				"DUPLICATES before-stale ns1-to-10.244.0.1 0\n",
-				"DUPLICATES before-stale host-to-10.244.0.2 0\n",
-				"DUPLICATES after-stale ns1-to-10.244.0.3 0\n",
-				"DUPLICATES after-stale ns1-to-10.244.0.1 0\n",
-				"DUPLICATES after-stale host-to-10.244.0.2 0\n")
+				"BEFORE-STALE ns1-to-10.244.0.3 "+clean,
+				"BEFORE-STALE ns1-to-10.244.0.1 "+clean,
+				"BEFORE-STALE host-to-10.244.0.2 "+clean,
+				"AFTER-STALE ns1-to-10.244.0.3 "+clean,
+				"AFTER-STALE ns2-to-10.244.0.2 "+clean,
+				"AFTER-STALE ns1-to-10.244.0.1 "+clean,
+				"AFTER-STALE ns2-to-10.244.0.1 "+clean,
+				"AFTER-STALE host-to-10.244.0.2 "+clean,
+				"AFTER-STALE host-to-10.244.0.3 "+clean)
 		})
 	}
 }

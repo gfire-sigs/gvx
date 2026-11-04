@@ -24,9 +24,15 @@
 //	svcprobe dial ADDR [PORT]  connect to ADDR and print one line:
 //	                           "REPLY NAME from=PEER" or "ERROR reason"
 //	                           PORT binds the local port of the client
+//	svcprobe loop HOST PORT N  send N ICMP echo requests to HOST and open N TCP
+//	                           connections to HOST:PORT, one after the other,
+//	                           and print one line:
+//	                           "LOOP ping_lost=P tcp_failed=T duplicates=D"
+//	                           A duplicate is a second echo reply for a request.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -41,6 +47,13 @@ func main() {
 	switch {
 	case len(os.Args) == 4 && os.Args[1] == "serve":
 		serve(os.Args[2], os.Args[3])
+	case len(os.Args) == 5 && os.Args[1] == "loop":
+		n, err := strconv.Atoi(os.Args[4])
+		if err != nil || n < 1 {
+			fmt.Fprintf(os.Stderr, "svcprobe: invalid count %q\n", os.Args[4])
+			os.Exit(2)
+		}
+		loop(os.Args[2], os.Args[3], n)
 	case len(os.Args) == 3 && os.Args[1] == "dial":
 		dial(os.Args[2], 0)
 	case len(os.Args) == 4 && os.Args[1] == "dial":
@@ -51,7 +64,7 @@ func main() {
 		}
 		dial(os.Args[2], port)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: svcprobe serve ADDR NAME | svcprobe dial ADDR [PORT]")
+		fmt.Fprintln(os.Stderr, "usage: svcprobe serve ADDR NAME | svcprobe dial ADDR [PORT] | svcprobe loop HOST PORT N")
 		os.Exit(2)
 	}
 }
@@ -77,21 +90,32 @@ func serve(addr, name string) {
 // dial connects to addr and prints the answer. A positive localPort binds the
 // source port of the connection.
 func dial(addr string, localPort int) {
+	reply, err := dialOnce(addr, localPort)
+	if err != nil {
+		fmt.Println("ERROR", err)
+		os.Exit(1)
+	}
+	fmt.Printf("REPLY %s", reply)
+}
+
+// dialOnce connects to addr and returns the answer of the server.
+func dialOnce(addr string, localPort int) ([]byte, error) {
 	d := net.Dialer{Timeout: dialTimeout}
 	if localPort > 0 {
 		d.LocalAddr = &net.TCPAddr{Port: localPort}
 	}
 	conn, err := d.Dial("tcp", addr)
 	if err != nil {
-		fmt.Println("ERROR", err)
-		os.Exit(1)
+		return nil, err
 	}
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(dialTimeout))
 	reply, err := io.ReadAll(conn)
-	if err != nil || len(reply) == 0 {
-		fmt.Println("ERROR read:", err)
-		os.Exit(1)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
 	}
-	fmt.Printf("REPLY %s", reply)
+	if len(reply) == 0 {
+		return nil, errors.New("read: empty answer")
+	}
+	return reply, nil
 }
