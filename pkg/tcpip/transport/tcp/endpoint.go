@@ -447,6 +447,10 @@ type Endpoint struct {
 	boundBindToDevice tcpip.NICID
 	boundPortFlags    ports.Flags
 	boundDest         tcpip.FullAddress
+	// boundWildcard is true when Bind reserved the port for the wildcard
+	// address. Connect later sets the local address of the endpoint, but the
+	// reservation keeps the wildcard address until the endpoint releases it.
+	boundWildcard bool
 
 	// effectiveNetProtos contains the network protocols actually in use. In
 	// most cases it will only contain "netProto", but in cases like IPv6
@@ -1124,7 +1128,7 @@ func (e *Endpoint) closeNoShutdownLocked() {
 		portRes := ports.Reservation{
 			Networks:     e.effectiveNetProtos,
 			Transport:    ProtocolNumber,
-			Addr:         e.TransportEndpointInfo.ID.LocalAddress,
+			Addr:         e.reservedAddr(),
 			Port:         e.TransportEndpointInfo.ID.LocalPort,
 			Flags:        e.boundPortFlags,
 			BindToDevice: e.boundBindToDevice,
@@ -1135,6 +1139,7 @@ func (e *Endpoint) closeNoShutdownLocked() {
 		e.boundBindToDevice = 0
 		e.boundPortFlags = ports.Flags{}
 		e.boundDest = tcpip.FullAddress{}
+		e.boundWildcard = false
 	}
 
 	// Mark endpoint as closed.
@@ -1235,7 +1240,7 @@ func (e *Endpoint) cleanupLocked() {
 		portRes := ports.Reservation{
 			Networks:     e.effectiveNetProtos,
 			Transport:    ProtocolNumber,
-			Addr:         e.TransportEndpointInfo.ID.LocalAddress,
+			Addr:         e.reservedAddr(),
 			Port:         e.TransportEndpointInfo.ID.LocalPort,
 			Flags:        e.boundPortFlags,
 			BindToDevice: e.boundBindToDevice,
@@ -1247,6 +1252,7 @@ func (e *Endpoint) cleanupLocked() {
 	e.boundBindToDevice = 0
 	e.boundPortFlags = ports.Flags{}
 	e.boundDest = tcpip.FullAddress{}
+	e.boundWildcard = false
 
 	if e.route != nil {
 		e.route.Release()
@@ -2936,6 +2942,7 @@ func (e *Endpoint) bindLocked(addr tcpip.FullAddress) (err tcpip.Error) {
 	// TODO(gvisor.dev/issue/3691): Add test to verify boundNICID is correct.
 	e.boundNICID = nic
 	e.isPortReserved = true
+	e.boundWildcard = addr.Addr.Len() == 0
 	e.effectiveNetProtos = netProtos
 	e.TransportEndpointInfo.ID.LocalPort = port
 
