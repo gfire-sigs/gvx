@@ -31,6 +31,8 @@
 //	nodeprobe genl                   check NETLINK_GENERIC and the controller family
 //	nodeprobe wireguard              check the wireguard link between two namespaces
 //	nodeprobe wglimits               check the rules and limits of the wireguard link
+//	nodeprobe vxlan                  check the vxlan link, neighbors, and the FDB
+//	                                 with the calls of flannel between two namespaces
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
@@ -89,6 +91,8 @@ func main() {
 		checks = wireguardChecks()
 	case "wglimits":
 		checks = wgLimitsChecks()
+	case "vxlan":
+		checks = vxlanChecks()
 	case "wgchild":
 		if err := wgChild(); err != nil {
 			fmt.Fprintln(os.Stderr, "wgchild:", err)
