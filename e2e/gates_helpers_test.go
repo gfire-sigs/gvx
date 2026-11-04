@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/pkg/gvx"
 )
@@ -74,8 +75,11 @@ func gateBackends() []gateBackend {
 // a documented reason.
 func requireBackend(t *testing.T, b gateBackend) {
 	t.Helper()
-	if b.plat == gvx.PlatformSystrap {
+	switch b.plat {
+	case gvx.PlatformSystrap:
 		systraptest.Require(t)
+	case gvx.PlatformHVF, gvx.PlatformWHPX:
+		hvtest.Require(t)
 	}
 }
 
