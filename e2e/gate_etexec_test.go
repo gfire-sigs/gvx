@@ -128,6 +128,30 @@ func TestE2EGateETExecGoStatic(t *testing.T) {
 	}
 }
 
+// TestE2EGateETExecBrkGrowth moves the break of an ET_EXEC program up by
+// 1 GiB. The engine must not place its own mappings above the executable,
+// where the brk heap grows. Go links an arm64 program at 0x10000, where no
+// address lies below the code, so that default runs only on amd64.
+func TestE2EGateETExecBrkGrowth(t *testing.T) {
+	type link struct {
+		name string
+		text uint64
+	}
+	links := []link{{"text at 16 MiB", 0x1001000}}
+	if hostArch() == "amd64" {
+		links = append(links, link{"default link address", 0})
+	}
+	for _, b := range fixedAddressBackends() {
+		for _, l := range links {
+			t.Run(b.name+"/"+l.name, func(t *testing.T) {
+				requireFixedAddressBackend(t, b)
+				path := acceptprog.BuildBrkGrow(t, hostArch(), l.text)
+				expectProgramOutput(t, b, path, nil, nil, acceptprog.BrkGrowWant)
+			})
+		}
+	}
+}
+
 var (
 	cStaticOnce sync.Once
 	cStaticPath string

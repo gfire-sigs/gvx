@@ -492,21 +492,32 @@ func (as *addressSpace) dropReservation(base uint64) {
 	as.mu.Unlock()
 }
 
+// islandMinOffset is the smallest distance between near and a new island.
+const islandMinOffset = 2 << 20
+
 // newIslandAt reserves a sealed mapping within islandReach of near through the
 // memory manager and installs a private page of slots at the stub address that
-// candToStub returns.
+// candToStub returns. The first half of the tries look below near. The brk
+// heap grows up from the end of the executable, and an island above the code
+// would stop it there.
 func (as *addressSpace) newIslandAt(ctx context.Context, mm platform.MemoryManager, near uint64, candToStub func(cand uint64) (uint64, bool)) error {
 	var lastErr error
-	for range 128 {
-		off := (uint64(rand.Int64N(islandReach-(4<<20))) + 2<<20) &^ (blockSize - 1)
-		var cand uint64
-		if rand.IntN(2) == 0 {
-			if near < off {
-				continue
-			}
+	// roomBelow is the width of the random draw below near. With
+	// islandMinOffset added, an offset keeps cand at or above userMin.
+	var roomBelow uint64
+	if lowest := as.p.userMin + islandMinOffset + blockSize; near > lowest {
+		roomBelow = near - as.p.userMin - islandMinOffset
+	}
+	for i := range 128 {
+		below := roomBelow != 0 && (i < 64 || rand.IntN(2) == 0)
+		span := uint64(islandReach - 2*islandMinOffset)
+		if below {
+			span = min(span, roomBelow)
+		}
+		off := (uint64(rand.Int64N(int64(span))) + islandMinOffset) &^ (blockSize - 1)
+		cand := near + off
+		if below {
 			cand = near - off
-		} else {
-			cand = near + off
 		}
 		cand = blockRound(cand)
 		stubCand, ok := candToStub(cand)

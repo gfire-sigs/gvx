@@ -60,6 +60,7 @@ const (
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
 	membarrierPackage  = "z.gfire.dev/gvx/internal/acceptprog/membarrierprobe"
 	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
+	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -95,6 +96,52 @@ func BuildGoStatic(tb testing.TB, goarch string) string {
 	defer f.Close()
 	if f.Type != elf.ET_EXEC {
 		tb.Fatalf("the static Go program has type %v, want ET_EXEC", f.Type)
+	}
+	return out
+}
+
+// BrkGrowWant is the output of the brk program when the break moves by 1 GiB.
+const BrkGrowWant = "brk grew 1024 MiB\n"
+
+// BuildBrkGrow compiles the brk program for the Linux architecture goarch and
+// returns the path of the executable. The image links at a fixed address
+// (ET_EXEC). textAddr is the start of the text, which the Go linker puts
+// 0x1000 above the image base. A textAddr of zero keeps the default image
+// base: 0x400000 on amd64 and 0x10000 on arm64.
+func BuildBrkGrow(tb testing.TB, goarch string, textAddr uint64) string {
+	tb.Helper()
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
+	}
+	out := filepath.Join(tb.TempDir(), "brkgrow")
+	ldflags := "-linkmode=internal"
+	if textAddr != 0 {
+		ldflags += fmt.Sprintf(" -T %#x", textAddr)
+	}
+	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags="+ldflags, brkGrowPackage)
+	cmd.Dir = moduleRoot(tb)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		tb.Fatalf("build the brk program for linux/%s: %v\n%s", goarch, err, msg)
+	}
+	f, err := elf.Open(out)
+	if err != nil {
+		tb.Fatalf("open the brk program: %v", err)
+	}
+	defer f.Close()
+	if f.Type != elf.ET_EXEC {
+		tb.Fatalf("the brk program has type %v, want ET_EXEC", f.Type)
+	}
+	if textAddr != 0 {
+		for _, p := range f.Progs {
+			if p.Type == elf.PT_LOAD {
+				if p.Vaddr != textAddr-0x1000 {
+					tb.Fatalf("the brk program loads at %#x, want %#x", p.Vaddr, textAddr-0x1000)
+				}
+				break
+			}
+		}
 	}
 	return out
 }
