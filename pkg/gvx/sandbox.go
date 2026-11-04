@@ -33,6 +33,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvf"
 	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
@@ -424,6 +425,9 @@ func (s *Sandbox) Close() error {
 	}
 
 	if s.netStack != nil {
+		// Stack.Close leaves the link endpoints open. Close the links that
+		// the guest created, such as wireguard devices.
+		netstack.RemoveRegisteredLinks(s.netStack)
 		s.netStack.Close()
 		s.netStack = nil
 	}
