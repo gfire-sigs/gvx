@@ -19,6 +19,8 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
@@ -37,6 +39,12 @@ type NewLinkRequest struct {
 
 	// Name is the interface name of the new link.
 	Name string
+
+	// UserNS is the user namespace of the network namespace of the calling
+	// task. A link that keeps sockets in Stack checks the CAP_NET_ADMIN of a
+	// later caller against it, as Linux checks the creating namespace. It is
+	// nil when the context has no task.
+	UserNS *auth.UserNamespace
 
 	// Data holds the attributes of IFLA_INFO_DATA. It is nil when the request
 	// has none.
@@ -108,8 +116,12 @@ func (s *Stack) newRegisteredLink(ctx context.Context, kind string, linkAttrs, l
 	if ifname == "" {
 		ifname = s.allocDeviceName(k.NamePrefix, dstNs)
 	}
+	var userNS *auth.UserNamespace
+	if t := kernel.TaskFromContext(ctx); t != nil {
+		userNS = t.NetworkNamespace().UserNamespace()
+	}
 	id := s.Stack.NextNICID()
-	ep, sysErr := k.New(ctx, &NewLinkRequest{Stack: s, ID: id, Name: ifname, Data: data})
+	ep, sysErr := k.New(ctx, &NewLinkRequest{Stack: s, ID: id, Name: ifname, Data: data, UserNS: userNS})
 	if sysErr != nil {
 		return sysErr
 	}

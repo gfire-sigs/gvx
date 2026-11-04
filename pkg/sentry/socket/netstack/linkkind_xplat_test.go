@@ -29,7 +29,10 @@ func newNothing(context.Context, *NewLinkRequest) (stack.LinkEndpoint, *syserr.E
 
 func TestRegisterLinkKindRejectsInvalidKinds(t *testing.T) {
 	good := LinkKind{NamePrefix: "t", New: newNothing}
-	RegisterLinkKind("test-kind", good)
+	// -count=2 runs the test twice in one process, so the kind leaves with it.
+	const kind = "test-kind"
+	RegisterLinkKind(kind, good)
+	t.Cleanup(func() { delete(linkKinds, kind) })
 	for name, tc := range map[string]struct {
 		kind string
 		k    LinkKind
@@ -39,7 +42,7 @@ func TestRegisterLinkKindRejectsInvalidKinds(t *testing.T) {
 		"no name prefix":   {"test-noprefix", LinkKind{New: newNothing}},
 		"kind of the veth": {"veth", good},
 		"kind of bridge":   {"bridge", good},
-		"duplicate kind":   {"test-kind", good},
+		"duplicate kind":   {kind, good},
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer func() {
