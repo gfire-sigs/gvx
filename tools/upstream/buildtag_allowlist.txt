@@ -125,6 +125,10 @@ seam pkg/sentry/kernel/ipc_namespace.go
 seam pkg/sentry/socket/netstack/netstack.go
 # /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
 seam pkg/sentry/fsimpl/sys/sys.go
+# /proc/diskstats (pkg/sentry/fsimpl/proc/diskstats_xplat.go) reads the totals that
+# the read and write system calls add (pkg/sentry/usage/io_xplat.go).
+seam pkg/sentry/fsimpl/proc/tasks.go
+seam pkg/sentry/usage/io.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin

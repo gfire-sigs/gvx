@@ -59,6 +59,7 @@ func (i *IO) Clone(other *IO) {
 
 // AccountReadSyscall does the accounting for a read syscall.
 func (i *IO) AccountReadSyscall(bytes int64) {
+	accountTotalRead(bytes)
 	i.ReadSyscalls.Add(1)
 	if bytes > 0 {
 		i.CharsRead.Add(uint64(bytes))
@@ -67,6 +68,7 @@ func (i *IO) AccountReadSyscall(bytes int64) {
 
 // AccountWriteSyscall does the accounting for a write syscall.
 func (i *IO) AccountWriteSyscall(bytes int64) {
+	accountTotalWrite(bytes)
 	i.WriteSyscalls.Add(1)
 	if bytes > 0 {
 		i.CharsWritten.Add(uint64(bytes))
