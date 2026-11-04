@@ -262,11 +262,20 @@ k wait --for=condition=Ready pod/burn --timeout=300s >/dev/null 2>&1
 sleep 2
 # Each read takes the usage and the uptime of the guest in one exec. The exec of a
 # process takes seconds on some hosts, so the wall time between the reads is not 5 s.
-burn_sample() { k exec burn -- sh -c "grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d' ' -f2; cut -d' ' -f1 /proc/uptime | tr -d ."; }
+# A failed exec gives an empty output, so the sample tries up to five times.
+burn_sample() {
+  for i in 1 2 3 4 5; do
+    out=$(k exec burn -- sh -c "grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d' ' -f2; cut -d' ' -f1 /proc/uptime | tr -d ." 2>/dev/null)
+    [ "$(echo $out | wc -w)" = 2 ] && break
+    sleep 2
+  done
+  echo $out
+}
 set -- $(burn_sample); u0=$1; t0=$2
 sleep 5
 set -- $(burn_sample); u1=$1; t1=$2
-milli=$(( (u1 - u0) / ((t1 - t0) * 10) ))
+milli=0
+if [ -n "$u0" ] && [ -n "$u1" ] && [ "$t1" -gt "$t0" ]; then milli=$(( (u1 - u0) / ((t1 - t0) * 10) )); fi
 if [ "$milli" -le 600 ] && [ "$milli" -gt 0 ]; then log "B9-CPU-OK $milli"; else fail "B9 cpu ${milli}m"; fi
 if [ "$ENFORCE_MEMORY_MAX" = 1 ]; then
   for i in $(seq 1 60); do
