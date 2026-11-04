@@ -361,6 +361,25 @@ type stackBinder interface {
 	bindStack(stk *stack.Stack)
 }
 
+// stackReleaser is implemented by matchers that hold state of the Stack. A
+// matcher of a replaced table gives the state back, as the destroy function
+// of a Linux match does.
+type stackReleaser interface {
+	releaseStack()
+}
+
+// releaseMatcherStacks calls releaseStack for every matcher in rules that
+// implements it.
+func releaseMatcherStacks(rules []stack.Rule) {
+	for _, rule := range rules {
+		for _, m := range rule.Matchers {
+			if r, ok := m.(stackReleaser); ok {
+				r.releaseStack()
+			}
+		}
+	}
+}
+
 // bindMatcherStacks gives the Stack to every matcher in rules that needs it.
 func bindMatcherStacks(stk *stack.Stack, rules []stack.Rule) {
 	for _, rule := range rules {
