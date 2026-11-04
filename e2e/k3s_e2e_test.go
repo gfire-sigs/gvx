@@ -220,8 +220,19 @@ if wget -q -T 5 -O - http://127.0.0.1:18080/hostname | grep -q web-; then log "B
 kill $pf 2>/dev/null
 
 # B8: the pod sees its sysctls.
-v1=$(k exec sysctls -- cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)
-v2=$(k exec sysctls -- cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null | tr -s ' \t' ' ')
+# kubectl exec of a command that ends at once can return an empty output when the
+# stream closes before the data arrives, so each read tries up to three times.
+sysctl_read() {
+  for i in 1 2 3; do
+    out=$(k exec sysctls -- cat "$1" 2>/tmp/b8.err | tr -s ' \t' ' ')
+    [ -n "$out" ] && break
+    echo "B8-RETRY $1 attempt $i: $(cat /tmp/b8.err)"
+    sleep 2
+  done
+  echo "$out"
+}
+v1=$(sysctl_read /proc/sys/net/ipv4/ip_unprivileged_port_start)
+v2=$(sysctl_read /proc/sys/net/ipv4/ip_local_port_range)
 if [ "$v1" = 0 ] && [ "$v2" = "40000 50000" ]; then log "B8-OK"; else fail "B8 sysctls '$v1' '$v2'"; fi
 
 # B9: a CPU limit of 500m and a memory limit.
@@ -249,10 +260,13 @@ spec:
 EOF
 k wait --for=condition=Ready pod/burn --timeout=300s >/dev/null 2>&1
 sleep 2
-u0=$(k exec burn -- sh -c "grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d' ' -f2")
+# Each read takes the usage and the uptime of the guest in one exec. The exec of a
+# process takes seconds on some hosts, so the wall time between the reads is not 5 s.
+burn_sample() { k exec burn -- sh -c "grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d' ' -f2; cut -d' ' -f1 /proc/uptime | tr -d ."; }
+set -- $(burn_sample); u0=$1; t0=$2
 sleep 5
-u1=$(k exec burn -- sh -c "grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d' ' -f2")
-milli=$(( (u1 - u0) / 5000 ))
+set -- $(burn_sample); u1=$1; t1=$2
+milli=$(( (u1 - u0) / ((t1 - t0) * 10) ))
 if [ "$milli" -le 600 ] && [ "$milli" -gt 0 ]; then log "B9-CPU-OK $milli"; else fail "B9 cpu ${milli}m"; fi
 if [ "$ENFORCE_MEMORY_MAX" = 1 ]; then
   for i in $(seq 1 60); do
