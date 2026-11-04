@@ -133,6 +133,37 @@ func TestFastPathInterruptStopsGuestAfterSystemCall(t *testing.T) {
 	}
 }
 
+// TestInterruptAfterHotResumeStopsTheGuest interrupts a guest at many points
+// after a hot resume. A hot resume runs the tail of a slot, which is engine
+// code, before the guest loop. An interrupt that lands there steps the thread on
+// through engine code. The step exception clears the single-step flag, so the
+// engine must set it again. Without that, the thread runs on with no pending
+// stop, and every later interrupt returns without a stop.
+func TestInterruptAfterHotResumeStopsTheGuest(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	r.program(gSyscall(1), gCountSpin())
+	for i := range 200 {
+		r.ac.SetIP(codeVA)
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 1, r.ac)
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := r.run()
+			done <- err
+		}()
+		time.Sleep(time.Duration(i%25) * 4 * time.Microsecond)
+		r.ctx.Interrupt()
+		select {
+		case err := <-done:
+			if !errors.Is(err, platform.ErrContextInterrupt) {
+				t.Fatalf("round %d: Switch = %v, want an interrupt", i, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: an interrupt did not stop the guest after a hot resume", i)
+		}
+	}
+}
+
 func TestFastPathInterruptBeforeSwitchKeepsTheTrap(t *testing.T) {
 	r := newRig(t, newFastPlatform(t))
 	r.program(gSyscall(3), gSyscall(4))

@@ -14,10 +14,6 @@
 
 package kernel
 
-import (
-	"z.gfire.dev/gvx/pkg/abi/linux"
-)
-
 // CPUBandwidthProvider is the optional interface of a Cgroup2 node that has
 // a CPU budget. The node returns the budget of its nearest ancestor with the
 // cpu controller, or nil when it has none.
@@ -39,19 +35,39 @@ func (t *Task) cpuBandwidth() *CPUBandwidth {
 }
 
 // accountCPUBandwidth runs once for each CPU clock tick while a cgroup has a
-// quota. It charges the tick to the budget of each task that the tick
-// accounted as running, and it interrupts the tasks that run application code
-// in a throttled cgroup. The interrupted task returns to its run loop, which
-// blocks it in throttleCPUBandwidth.
+// quota. It charges the time that each task ran since its last charge to the
+// budget of the cgroup of the task, and to the budget of every ancestor with a
+// limit. It then interrupts the tasks that run application code in a throttled
+// cgroup. The interrupted task returns to its run loop, which blocks it in
+// throttleCPUBandwidth.
 //
 // A task in a system call is not interrupted. It stops when it returns to the
 // application, as in Linux, so system time counts toward the quota.
 //
 // Preconditions: The caller must be the CPU clock ticker.
-func (k *Kernel) accountCPUBandwidth(charged, all []*Task) {
-	for _, t := range charged {
+func (k *Kernel) accountCPUBandwidth(all []*Task) {
+	now := meterNow()
+	gen := cpuBillingGeneration.Load()
+	for _, t := range all {
+		m := &t.cpuMeter
+		running := t.running()
+		if !running && m.total.Load() == m.billed {
+			continue
+		}
+		cur := m.measured(now, running)
+		if m.billedGen != gen {
+			// The first limit appeared after the task last ran under a limit.
+			// The time before then belongs to no budget.
+			m.billed, m.billedGen = cur, gen
+			continue
+		}
+		if cur <= m.billed {
+			continue
+		}
+		delta := cur - m.billed
+		m.billed = cur
 		if bw := t.cpuBandwidth(); bw != nil {
-			bw.charge(linux.ClockTick.Nanoseconds())
+			bw.charge(now, delta)
 		}
 	}
 	if cpuBandwidthThrottled.Load() == 0 {
@@ -65,6 +81,13 @@ func (k *Kernel) accountCPUBandwidth(charged, all []*Task) {
 			t.interrupt()
 		}
 	}
+}
+
+// WakeCPUBandwidth makes t read the CPU budget of its cgroup again. A task that
+// moves to another cgroup calls it, so that the task does not wait for the
+// period end of the budget that it left.
+func (t *Task) WakeCPUBandwidth() {
+	t.interrupt()
 }
 
 // throttleCPUBandwidth blocks t while its cgroup has no CPU quota left. It

@@ -15,12 +15,38 @@
 package cgroup2fs
 
 import (
+	"bytes"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
+
+// newTestCPU returns a cpu controller in the state that newController makes,
+// below parent. The test removes the limit at its end, so the global count of
+// limited nodes returns to its old value.
+func newTestCPU(t *testing.T, parent *cpu) *cpu {
+	t.Helper()
+	cc := &cpu{c: &cgroup{}, parent: parent}
+	cc.weight.Store(100)
+	cc.maxUSec.Store(math.MaxInt64)
+	cc.periodUSec.Store(100000)
+	t.Cleanup(cc.releaseBandwidth)
+	return cc
+}
+
+func requireLimit(t *testing.T, cc *cpu, wantQuota, wantPeriod time.Duration, wantLimited bool) {
+	t.Helper()
+	quota, period, limited := cc.bandwidthNode().Limit()
+	if limited != wantLimited || (limited && (quota != wantQuota || period != wantPeriod)) {
+		t.Errorf("budget limit = (%v, %v, %v), want (%v, %v, %v)", quota, period, limited, wantQuota, wantPeriod, wantLimited)
+	}
+}
 
 func TestValidateCPUMaxFollowsLinuxLimits(t *testing.T) {
 	tests := []struct {
@@ -60,5 +86,131 @@ func TestBandwidthLimitsConvertsMicroseconds(t *testing.T) {
 	quota, period = bandwidthLimits(cpuMaxUnlimited, 200000)
 	if quota >= 0 || period != 200*time.Millisecond {
 		t.Errorf("bandwidthLimits(max, 200000) = (%v, %v), want a negative quota and 200ms", quota, period)
+	}
+}
+
+func TestSetMaxLimitsOnlyTheWrittenController(t *testing.T) {
+	parent := newTestCPU(t, nil)
+	child := newTestCPU(t, parent)
+
+	if err := child.setMax(50000, 100000); err != nil {
+		t.Fatalf("setMax: %v", err)
+	}
+	requireLimit(t, child, 50*time.Millisecond, 100*time.Millisecond, true)
+	requireLimit(t, parent, 0, 0, false)
+}
+
+func TestSetMaxRejectsABadValueAndKeepsTheOldLimit(t *testing.T) {
+	cc := newTestCPU(t, nil)
+	if err := cc.setMax(50000, 100000); err != nil {
+		t.Fatalf("setMax: %v", err)
+	}
+	if err := cc.setMax(500, 100000); !errors.Is(err, linuxerr.EINVAL) {
+		t.Fatalf("setMax(500, 100000) = %v, want EINVAL", err)
+	}
+	requireLimit(t, cc, 50*time.Millisecond, 100*time.Millisecond, true)
+	var buf bytes.Buffer
+	if err := (&cpuMax{cc: cc}).Generate(context.Background(), &buf); err != nil || buf.String() != "50000 100000\n" {
+		t.Errorf("cpu.max = %q (%v), want \"50000 100000\\n\"", buf.String(), err)
+	}
+}
+
+func TestSetMaxMaxRemovesTheLimit(t *testing.T) {
+	cc := newTestCPU(t, nil)
+	if err := cc.setMax(50000, 100000); err != nil {
+		t.Fatalf("setMax: %v", err)
+	}
+	if err := cc.setMax(math.MaxInt64, 100000); err != nil {
+		t.Fatalf("setMax(max): %v", err)
+	}
+	requireLimit(t, cc, 0, 0, false)
+}
+
+func TestBandwidthNodeLinksToTheNodeOfTheParentController(t *testing.T) {
+	parent := newTestCPU(t, nil)
+	mid := newTestCPU(t, parent)
+	leaf := newTestCPU(t, mid)
+
+	// The leaf node comes first. The chain must still end at the root.
+	leafNode := leaf.bandwidthNode()
+	if leaf.bandwidthNode() != leafNode {
+		t.Error("bandwidthNode returned two nodes for one controller")
+	}
+	if err := parent.setMax(30000, 100000); err != nil {
+		t.Fatalf("setMax: %v", err)
+	}
+	// A charge on the leaf reaches the limit of the ancestor.
+	requireLimit(t, parent, 30*time.Millisecond, 100*time.Millisecond, true)
+	if !leafHasAncestorLimit(leafNode) {
+		t.Error("the node of the leaf does not see the limit of its grandparent")
+	}
+}
+
+// leafHasAncestorLimit reports whether a node has a limit of its own or an
+// ancestor, through the public interface of the budget.
+func leafHasAncestorLimit(n *kernel.CPUBandwidth) bool {
+	for ; n != nil; n = n.Parent() {
+		if _, _, limited := n.Limit(); limited {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSetMaxBeforeFirstUseAppliesTheStoredLimit(t *testing.T) {
+	cc := newTestCPU(t, nil)
+	cc.maxUSec.Store(20000)
+	cc.periodUSec.Store(200000)
+	requireLimit(t, cc, 20*time.Millisecond, 200*time.Millisecond, true)
+}
+
+func TestDetachRemovesTheLimitAndLaterWritesOnlyStore(t *testing.T) {
+	cc := newTestCPU(t, nil)
+	if err := cc.setMax(50000, 100000); err != nil {
+		t.Fatalf("setMax: %v", err)
+	}
+	cc.detach()
+	requireLimit(t, cc, 0, 0, false)
+	if err := cc.setMax(40000, 100000); err != nil {
+		t.Fatalf("setMax after detach: %v", err)
+	}
+	requireLimit(t, cc, 0, 0, false)
+	if got := cc.maxUSec.Load(); got != 40000 {
+		t.Errorf("stored quota = %d, want 40000", got)
+	}
+}
+
+func TestRemovedCgroupReleasesItsLimit(t *testing.T) {
+	cc := newTestCPU(t, nil)
+	if err := cc.setMax(50000, 100000); err != nil {
+		t.Fatalf("setMax: %v", err)
+	}
+	cc.c.ctrls[kernel.Cgroup2CPU] = cc
+	cc.c.releaseCPUBandwidth()
+	requireLimit(t, cc, 0, 0, false)
+}
+
+func TestCgroupBandwidthIsTheBudgetOfTheClosestCPUController(t *testing.T) {
+	cc := newTestCPU(t, nil)
+	owner := &cgroup{}
+	owner.closestCtrls.Store(&ctrlSet{kernel.Cgroup2CPU: cc})
+	if owner.CPUBandwidth() != cc.bandwidthNode() {
+		t.Error("CPUBandwidth is not the budget of the closest cpu controller")
+	}
+	bare := &cgroup{}
+	bare.closestCtrls.Store(&ctrlSet{})
+	if bare.CPUBandwidth() != nil {
+		t.Error("a cgroup without a cpu controller has a budget")
+	}
+}
+
+func TestCPUStatUSecKeepsTheUsageAndClampsTheParts(t *testing.T) {
+	usage1, user, sys := cpuStatUSec(usage.CPUStats{UserTime: 700 * time.Microsecond, SysTime: 300 * time.Microsecond})
+	if usage1 != 1000 || user != 700 || sys != 300 {
+		t.Errorf("cpuStatUSec = (%d, %d, %d), want (1000, 700, 300)", usage1, user, sys)
+	}
+	usage2, user, sys := cpuStatUSec(usage.CPUStats{UserTime: 1500 * time.Microsecond, SysTime: -500 * time.Microsecond})
+	if usage2 != 1000 || user != 1000 || sys != 0 {
+		t.Errorf("cpuStatUSec with a negative part = (%d, %d, %d), want (1000, 1000, 0)", usage2, user, sys)
 	}
 }

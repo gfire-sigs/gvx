@@ -75,7 +75,7 @@ func (cc *cpu) cancelEnter(ctx context.Context, t *kernel.Task) {}
 func (cc *cpu) enter(ctx context.Context, t *kernel.Task) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	cc.baselineCharges[t] = t.CPUStats()
+	cc.baselineCharges[t] = taskCPUStats(t)
 }
 
 func (cc *cpu) commitTaskCharges(t *kernel.Task, charge usage.CPUStats) {
@@ -88,7 +88,7 @@ func (cc *cpu) commitTaskCharges(t *kernel.Task, charge usage.CPUStats) {
 
 // exit implements controller.exit.
 func (cc *cpu) exit(ctx context.Context, t *kernel.Task) {
-	cc.commitTaskCharges(t, t.CPUStats())
+	cc.commitTaskCharges(t, taskCPUStats(t))
 }
 
 // canAttach implements controller.canAttach.
@@ -117,7 +117,7 @@ func migrateTaskCPU(t *kernel.Task, oldCPU, newCPU *cpu) {
 	if oldCPU == newCPU {
 		return
 	}
-	charge := t.CPUStats()
+	charge := taskCPUStats(t)
 	if oldCPU != nil {
 		oldCPU.commitTaskCharges(t, charge)
 	}
@@ -126,6 +126,7 @@ func migrateTaskCPU(t *kernel.Task, oldCPU, newCPU *cpu) {
 		newCPU.baselineCharges[t] = charge
 		newCPU.mu.Unlock()
 	}
+	wakeMigratedTask(t, oldCPU)
 }
 
 // +checklocksread:cc.c.fs.treeMu
@@ -144,7 +145,7 @@ func (cc *cpu) collectCPUStatsLocked(acc *usage.CPUStats) {
 // +checklocksread:c.fs.tasksMu
 func (cc *cpu) accumulateDomainLocked(c *cgroup, acc *usage.CPUStats) {
 	for t := range c.tasks {
-		charge := t.CPUStats()
+		charge := taskCPUStats(t)
 		cc.mu.Lock()
 		outstandingCharge := charge.DifferenceSince(cc.baselineCharges[t])
 		cc.mu.Unlock()
@@ -238,9 +239,7 @@ type cpuStat struct {
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (cstat *cpuStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	cs := cstat.cc.collectCPUStats()
-	usageUSec := (cs.UserTime + cs.SysTime).Microseconds()
-	userUSec := cs.UserTime.Microseconds()
-	sysUSec := cs.SysTime.Microseconds()
+	usageUSec, userUSec, sysUSec := cpuStatUSec(cs)
 	bw := cstat.cc.bandwidthNode().Stats()
 	fmt.Fprintf(buf, "usage_usec %d\nuser_usec %d\nsystem_usec %d\nnice_usec 0\nnr_periods %d\nnr_throttled %d\nthrottled_usec %d\nnr_bursts 0\nburst_usec 0\n", usageUSec, userUSec, sysUSec, bw.Periods, bw.Throttled, bw.ThrottledTime.Microseconds())
 	return nil

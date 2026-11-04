@@ -22,6 +22,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 // This file enforces cpu.max and reports the throttle counters of cpu.stat. The
@@ -147,5 +148,37 @@ func (c *cgroup) CPUBandwidth() *kernel.CPUBandwidth {
 func (c *cgroup) releaseCPUBandwidth() {
 	if cc, ok := c.ctrls[kernel.Cgroup2CPU].(*cpu); ok { // +checklocksforce: caller holds the tree lock
 		cc.releaseBandwidth()
+	}
+}
+
+// taskCPUStats returns the CPU time of t for the accounting of cpu.stat. The
+// total is the wall time that the task goroutine ran. The CPU clocks of the task
+// count whole ticks of sampled tasks, so a thread that runs little can read
+// a full tick, and a Go program with an idle second thread reads above one CPU.
+// The Sentry cannot measure the split between user and system time exactly, so
+// the system time is the tick count of the clocks, capped at the total.
+func taskCPUStats(t *kernel.Task) usage.CPUStats {
+	s := t.CPUStats()
+	total := t.CPUTimeMeasured()
+	sys := min(s.SysTime, total)
+	s.SysTime = sys
+	s.UserTime = total - sys
+	return s
+}
+
+// cpuStatUSec returns the usage, user, and system time of cpu.stat in
+// microseconds. The split of a sum over tasks can drift by a tick, so each part
+// stays above 0 and the usage stays the sum of the measured times.
+func cpuStatUSec(cs usage.CPUStats) (usageUSec, userUSec, sysUSec int64) {
+	usageUSec = (cs.UserTime + cs.SysTime).Microseconds()
+	sysUSec = min(max(cs.SysTime.Microseconds(), 0), usageUSec)
+	return usageUSec, usageUSec - sysUSec, sysUSec
+}
+
+// wakeMigratedTask makes a task that left a throttled cgroup read the budget of
+// its new cgroup now. Without it the task waits for the end of the old period.
+func wakeMigratedTask(t *kernel.Task, oldCPU *cpu) {
+	if oldCPU != nil && oldCPU.bandwidthNode().Throttled() {
+		t.WakeCPUBandwidth()
 	}
 }

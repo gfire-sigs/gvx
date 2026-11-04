@@ -708,6 +708,10 @@ type Task struct {
 	// memCgID is the memory cgroup id.
 	memCgID atomicbitops.Uint32
 
+	// cpuMeter measures the time that the task goroutine runs. See
+	// cpu_meter_xplat.go.
+	cpuMeter cpuMeter `state:"nosave"`
+
 	// userCounters is a pointer to a set of user counters.
 	//
 	// The userCounters pointer is exclusive to the task goroutine, but the

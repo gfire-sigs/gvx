@@ -41,7 +41,18 @@ var (
 	// Sentry without a spent quota pays one load for each return to the
 	// application.
 	cpuBandwidthThrottled atomic.Int32
+
+	// cpuBillingGeneration changes each time the first finite quota appears.
+	// A task that last ran under an older generation starts a new account, so
+	// the time before the first quota is never charged.
+	cpuBillingGeneration atomic.Int32
 )
+
+// bandwidthSlackNS is the debt that a node tolerates before it throttles. The
+// CPU clock ticker charges each task once for each tick, and a task that runs
+// without a pause then owes up to one tick of rounding at each period end. A
+// debt carries into the next period, so the slack does not change the average.
+const bandwidthSlackNS = int64(time.Millisecond)
 
 // bandwidthClock is the source of time and of timers for a CPUBandwidth.
 type bandwidthClock struct {
@@ -114,13 +125,19 @@ type CPUBandwidth struct {
 
 // CPUBandwidthStats are the counters that cpu.stat reports.
 type CPUBandwidthStats struct {
-	// Periods counts the periods in which the node took a charge.
+	// Periods counts the periods that ended while the node was active, as
+	// nr_periods does in Linux. A node is active from its first charge until
+	// one period without a charge.
 	Periods uint64
 
-	// Throttled counts the throttles of the node.
+	// Throttled counts the periods that ended while the node throttled, as
+	// nr_throttled does in Linux.
 	Throttled uint64
 
-	// ThrottledTime is the total time that the node held its tasks back.
+	// ThrottledTime is the time in which the node held its tasks back. It is
+	// one wall-clock interval for the whole node. Linux sums the time of every
+	// CPU run queue of the cgroup, so it reports more on a cgroup with tasks on
+	// several CPUs.
 	ThrottledTime time.Duration
 }
 
@@ -155,13 +172,27 @@ func (b *CPUBandwidth) SetLimits(quota, period time.Duration) {
 	b.charged = false
 	switch isLimited := quotaNS >= 0; {
 	case isLimited && !wasLimited:
-		cpuBandwidthLimited.Add(1)
+		if cpuBandwidthLimited.Add(1) == 1 {
+			cpuBillingGeneration.Add(1)
+		}
 	case !isLimited && wasLimited:
 		cpuBandwidthLimited.Add(-1)
 	}
 	if b.throttled.Load() {
 		b.endThrottleLocked(now)
 	}
+}
+
+// Parent returns the node of the nearest ancestor, or nil at the root.
+func (b *CPUBandwidth) Parent() *CPUBandwidth { return b.parent }
+
+// Limit returns the quota and the period of the node. Limited is false when the
+// node has no quota.
+func (b *CPUBandwidth) Limit() (quota, period time.Duration, limited bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	q := b.quotaNS.Load()
+	return time.Duration(q), time.Duration(b.periodNS), q >= 0
 }
 
 // Stats returns the counters of the node. A throttle in progress counts as
@@ -181,31 +212,39 @@ func (b *CPUBandwidth) Stats() CPUBandwidthStats {
 }
 
 // charge takes ns nanoseconds of CPU time from the node and from every
-// ancestor with a limit. A node that runs out of quota starts to throttle.
-func (b *CPUBandwidth) charge(ns int64) {
+// ancestor with a limit. The time ran in the interval that ends at end. A node
+// that runs out of quota starts to throttle.
+func (b *CPUBandwidth) charge(end, ns int64) {
 	for n := b; n != nil; n = n.parent {
 		if n.quotaNS.Load() >= 0 {
-			n.chargeOne(ns)
+			n.chargeOne(end, ns)
 		}
 	}
 }
 
-func (b *CPUBandwidth) chargeOne(ns int64) {
+func (b *CPUBandwidth) chargeOne(end, ns int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.quotaNS.Load() < 0 {
 		return
 	}
-	now := b.clock.now()
-	b.refillLocked(now)
-	b.charged = true
+	now := end
+	if now >= b.periodEnd {
+		// The charge covers the time up to end, and part of it lies in the new
+		// period. The old period takes the part before its end.
+		after := min(ns, now-b.periodEnd)
+		b.remainingNS -= ns - after
+		b.charged = b.charged || ns > after
+		b.refillLocked(now)
+		ns = after
+	}
+	b.charged = b.charged || ns > 0
 	b.remainingNS -= ns
-	if b.remainingNS <= 0 && !b.throttled.Load() {
+	if b.remainingNS < -bandwidthSlackNS && !b.throttled.Load() {
 		b.throttled.Store(true)
 		b.throttleStart = now
-		b.nrThrottled++
 		cpuBandwidthThrottled.Add(1)
-		b.armRefillLocked(now)
+		b.armRefillLocked(b.clock.now())
 	}
 }
 
@@ -273,21 +312,26 @@ func (b *CPUBandwidth) refillLocked(now int64) {
 	quotaNS := b.quotaNS.Load()
 	elapsed := (now-b.periodEnd)/b.periodNS + 1
 	active := b.charged || b.throttled.Load()
-	if active {
-		b.nrPeriods++
+	if b.throttled.Load() {
+		// Every period that ended in the gap ended while throttled.
+		b.nrPeriods += uint64(elapsed)
+		b.nrThrottled += uint64(elapsed)
+	} else if active {
+		// A node that went idle stops counting after one more period.
+		b.nrPeriods += uint64(min(elapsed, 2))
 	}
 	if active && elapsed == 1 {
 		b.periodEnd += b.periodNS
 	} else {
 		b.periodEnd = now + b.periodNS
 	}
-	if b.remainingNS > 0 || elapsed > 1 {
+	if b.remainingNS >= 0 || elapsed > 1 {
 		b.remainingNS = quotaNS
 	} else {
 		b.remainingNS = min(b.remainingNS+quotaNS, quotaNS)
 	}
 	b.charged = false
-	if b.throttled.Load() && b.remainingNS > 0 {
+	if b.throttled.Load() && b.remainingNS >= -bandwidthSlackNS {
 		b.endThrottleLocked(now)
 	}
 }
