@@ -23,10 +23,20 @@
 //	-d 127.0.0.2 -p udp --dport 9000 -j DNAT --to-destination 127.0.0.1:9001
 //	-d 127.0.0.2 -p tcp --dport 9100 -j DNAT --to-destination 127.0.0.1:9101
 //
+// The bulk modes use one more rule that sends 10000 ports of one virtual
+// address to the same ports of the loopback address, so the table holds one
+// flow for each datagram:
+//
+//	-d 127.0.0.2 -p udp --dport 20000:29999 -j DNAT --to-destination 127.0.0.1
+//
 // Usage:
 //
 //	ctprobe kubeproxy    list the flows, delete the UDP flow with a filter, and
 //	                     send again
+//	ctprobe bulk create  send one datagram to each of 5000 ports
+//	ctprobe bulk list    list the table and require the 5000 flows
+//	ctprobe bulk delete  delete the 5000 flows with a filter and require an
+//	                     empty table
 package main
 
 import (
@@ -55,8 +65,11 @@ type check struct {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "bulk" {
+		os.Exit(runBulk(os.Args[2]))
+	}
 	if len(os.Args) != 2 || os.Args[1] != "kubeproxy" {
-		fmt.Fprintln(os.Stderr, "usage: ctprobe kubeproxy")
+		fmt.Fprintln(os.Stderr, "usage: ctprobe kubeproxy | ctprobe bulk create|list|delete")
 		os.Exit(2)
 	}
 	s := &scenario{}

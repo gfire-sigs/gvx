@@ -155,3 +155,184 @@ func TestConnTrackSYNReopensClosedTCP(t *testing.T) {
 		})
 	}
 }
+
+// ctUDPPacket builds the IPv4 packet of a UDP datagram from the client to the
+// server, from the given client port.
+func ctUDPPacket(clientPort uint16) *PacketBuffer {
+	pkt := NewPacketBuffer(PacketBufferOptions{
+		ReserveHeaderBytes: header.IPv4MinimumSize + header.UDPMinimumSize,
+	})
+	udp := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
+	udp.Encode(&header.UDPFields{SrcPort: clientPort, DstPort: ctServerPort, Length: header.UDPMinimumSize})
+	ip := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
+	ip.Encode(&header.IPv4Fields{
+		TotalLength: header.IPv4MinimumSize + header.UDPMinimumSize,
+		Protocol:    uint8(header.UDPProtocolNumber),
+		TTL:         64,
+		SrcAddr:     ctClientAddr,
+		DstAddr:     ctServerAddr,
+	})
+	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
+	pkt.TransportProtocolNumber = header.UDPProtocolNumber
+	return pkt
+}
+
+// newConntrackStack returns a stack that holds only a connection table with
+// one UDP flow for each of flows client ports, and it returns the original
+// tuples of the flows.
+func newConntrackStack(t *testing.T, flows int) (*Stack, []ConntrackTuple) {
+	t.Helper()
+	s := &Stack{tables: &IPTables{}}
+	ct := &s.tables.connections
+	ct.clock = faketime.NewManualClock()
+	ct.init()
+	var originals []ConntrackTuple
+	for i := range flows {
+		port := uint16(10000 + i)
+		pkt := ctUDPPacket(port)
+		tup := ct.getConnAndUpdate(pkt, true /* skipChecksumValidation */)
+		if tup == nil || !tup.conn.finalize() {
+			t.Fatalf("flow %d has no connection", i)
+		}
+		pkt.DecRef()
+		originals = append(originals, ConntrackTuple{
+			NetProto:   header.IPv4ProtocolNumber,
+			TransProto: header.UDPProtocolNumber,
+			Src:        ctClientAddr,
+			Dst:        ctServerAddr,
+			SrcPort:    port,
+			DstPort:    ctServerPort,
+		})
+	}
+	return s, originals
+}
+
+// scanAll reads the whole table with a ConntrackScan and returns the source
+// ports of the connections, one count for each port.
+func scanAll(s *Stack, afterBucket func(scanned int)) map[uint16]int {
+	ports := make(map[uint16]int)
+	scan := s.ConntrackScanner()
+	for scanned := 1; ; scanned++ {
+		entries, more := scan(nil)
+		for _, e := range entries {
+			ports[e.Original.SrcPort]++
+		}
+		if afterBucket != nil {
+			afterBucket(scanned)
+		}
+		if !more {
+			return ports
+		}
+	}
+}
+
+func TestConntrackScanReturnsEachConnectionOnce(t *testing.T) {
+	const flows = 2000
+	s, _ := newConntrackStack(t, flows)
+	ports := scanAll(s, nil)
+	if len(ports) != flows {
+		t.Fatalf("scan found %d connections, want %d", len(ports), flows)
+	}
+	for port, n := range ports {
+		if n != 1 {
+			t.Errorf("port %d appeared %d times, want once", port, n)
+		}
+	}
+	scan := s.ConntrackScanner()
+	for range numBuckets {
+		scan(nil)
+	}
+	if entries, more := scan(nil); len(entries) != 0 || more {
+		t.Errorf("scan past the last bucket = %d entries and more %t, want none", len(entries), more)
+	}
+}
+
+func TestConntrackScanKeepsConnectionsThatSurviveTableChanges(t *testing.T) {
+	const flows = 1000
+	s, tuples := newConntrackStack(t, flows)
+	ct := &s.tables.connections
+	deleted := map[uint16]bool{}
+	extra := 0
+	ports := scanAll(s, func(scanned int) {
+		// Between two buckets, expire a connection and add a new one.
+		if scanned%1000 != 0 {
+			return
+		}
+		victim := tuples[len(deleted)]
+		if _, ok := s.ConntrackDeleteTuple(victim, nil); !ok {
+			t.Fatalf("connection %d does not exist", victim.SrcPort)
+		}
+		deleted[victim.SrcPort] = true
+		pkt := ctUDPPacket(uint16(30000 + extra))
+		defer pkt.DecRef()
+		extra++
+		if tup := ct.getConnAndUpdate(pkt, true); tup == nil || !tup.conn.finalize() {
+			t.Fatal("the new flow has no connection")
+		}
+	})
+	for _, tuple := range tuples {
+		if deleted[tuple.SrcPort] {
+			continue
+		}
+		if ports[tuple.SrcPort] != 1 {
+			t.Errorf("connection %d that lived through the scan appeared %d times, want once", tuple.SrcPort, ports[tuple.SrcPort])
+		}
+	}
+}
+
+func TestConntrackLookupFindsEitherDirection(t *testing.T) {
+	s, tuples := newConntrackStack(t, 50)
+	original := tuples[7]
+	reply := ConntrackTuple{
+		NetProto:   original.NetProto,
+		TransProto: original.TransProto,
+		Src:        original.Dst,
+		Dst:        original.Src,
+		SrcPort:    original.DstPort,
+		DstPort:    original.SrcPort,
+	}
+	for name, tuple := range map[string]ConntrackTuple{"original": original, "reply": reply} {
+		e, ok := s.ConntrackLookup(tuple)
+		if !ok || e.Original != original || e.Reply != reply {
+			t.Errorf("lookup of the %s tuple = %+v, %t, want the connection with both tuples", name, e, ok)
+		}
+	}
+	missing := original
+	missing.SrcPort = 1
+	if _, ok := s.ConntrackLookup(missing); ok {
+		t.Error("lookup of an unknown tuple found a connection")
+	}
+}
+
+func TestConntrackDeleteTupleExpiresOnlyThatConnection(t *testing.T) {
+	s, tuples := newConntrackStack(t, 50)
+	victim := tuples[7]
+	reply := ConntrackTuple{
+		NetProto:   victim.NetProto,
+		TransProto: victim.TransProto,
+		Src:        victim.Dst,
+		Dst:        victim.Src,
+		SrcPort:    victim.DstPort,
+		DstPort:    victim.SrcPort,
+	}
+	refuse := func(ConntrackEntry) bool { return false }
+	if _, ok := s.ConntrackDeleteTuple(victim, refuse); ok {
+		t.Fatal("a refused delete expired the connection")
+	}
+	if _, ok := s.ConntrackLookup(victim); !ok {
+		t.Fatal("a refused delete removed the connection")
+	}
+	e, ok := s.ConntrackDeleteTuple(reply, nil)
+	if !ok || e.Original != victim {
+		t.Fatalf("delete by reply tuple = %+v, %t, want the connection of %+v", e, ok, victim)
+	}
+	if _, ok := s.ConntrackLookup(victim); ok {
+		t.Error("the connection still exists after the delete")
+	}
+	if _, ok := s.ConntrackDeleteTuple(victim, nil); ok {
+		t.Error("a second delete found the connection")
+	}
+	if got := len(s.ConntrackEntries()); got != len(tuples)-1 {
+		t.Errorf("table holds %d connections, want %d", got, len(tuples)-1)
+	}
+}

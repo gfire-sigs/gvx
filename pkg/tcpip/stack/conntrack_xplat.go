@@ -165,29 +165,62 @@ func (cn *conn) expire(now tcpip.MonotonicTime) {
 	cn.lastUsed = now.Add(-(establishedTimeout + unestablishedTimeout + time.Second))
 }
 
+// forEachConfirmedInBucket calls visit for each connection whose original
+// tuple is in the bucket, that has both tuples in the table, and that has not
+// expired. It stops when visit returns false and then reports false. visit
+// holds the lock of the bucket, so it must not call the connection table.
+func (bkt *bucket) forEachConfirmedInBucket(now tcpip.MonotonicTime, visit func(cn *conn, now tcpip.MonotonicTime) bool) bool {
+	bkt.mu.RLock()
+	defer bkt.mu.RUnlock()
+	for t := bkt.tuples.Front(); t != nil; t = t.Next() {
+		cn := t.conn
+		if t.reply || cn.getFinalizeResult() != finalizeResultSuccess || cn.timedOut(now) {
+			continue
+		}
+		if !visit(cn, now) {
+			return false
+		}
+	}
+	return true
+}
+
+// tableBuckets returns the bucket slice. Only a restore changes the slice, so
+// the caller can use it without the lock of the table.
+func (ct *ConnTrack) tableBuckets() []bucket {
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+	return ct.buckets
+}
+
 // forEachConfirmed calls visit for each connection that has both tuples in the
 // table and has not expired. It stops when visit returns false. visit holds a
 // lock of the table, so it must not call the connection table.
 func (ct *ConnTrack) forEachConfirmed(visit func(cn *conn, now tcpip.MonotonicTime) bool) {
-	ct.mu.RLock()
-	buckets := ct.buckets
-	ct.mu.RUnlock()
+	buckets := ct.tableBuckets()
 	now := ct.clock.NowMonotonic()
 	for i := range buckets {
-		bkt := &buckets[i]
-		bkt.mu.RLock()
-		for t := bkt.tuples.Front(); t != nil; t = t.Next() {
-			cn := t.conn
-			if t.reply || cn.getFinalizeResult() != finalizeResultSuccess || cn.timedOut(now) {
-				continue
-			}
-			if !visit(cn, now) {
-				bkt.mu.RUnlock()
-				return
-			}
+		if !buckets[i].forEachConfirmedInBucket(now, visit) {
+			return
 		}
-		bkt.mu.RUnlock()
 	}
+}
+
+// confirmedForTuple returns the connection that owns the tuple in either
+// direction. It looks in the one bucket that the hash of the tuple selects. It
+// returns nil when no confirmed connection owns the tuple.
+func (ct *ConnTrack) confirmedForTuple(t ConntrackTuple) *conn {
+	tup := ct.connForTID(tupleID{
+		srcAddr:                   t.Src,
+		srcPortOrEchoRequestIdent: t.SrcPort,
+		dstAddr:                   t.Dst,
+		dstPortOrEchoReplyIdent:   t.DstPort,
+		transProto:                t.TransProto,
+		netProto:                  t.NetProto,
+	})
+	if tup == nil || tup.conn.getFinalizeResult() != finalizeResultSuccess {
+		return nil
+	}
+	return tup.conn
 }
 
 // ConntrackEntries returns a snapshot of every confirmed connection of the
@@ -201,20 +234,60 @@ func (s *Stack) ConntrackEntries() []ConntrackEntry {
 	return entries
 }
 
+// ConntrackScan reads the connection table one bucket at a time. Each call
+// appends to dst a snapshot of each confirmed connection in the next bucket.
+// It reports false when the call read the last bucket, and then it returns no
+// entry on any later call. A ConntrackScan is for one goroutine at a time.
+type ConntrackScan func(dst []ConntrackEntry) (entries []ConntrackEntry, more bool)
+
+// ConntrackScanner starts a scan of the connection table at its first bucket.
+// A connection belongs to the bucket of its original tuple for its whole life.
+// A connection that exists from the start of a scan to its end therefore
+// appears in the result of the scan, however the table changes in between.
+func (s *Stack) ConntrackScanner() ConntrackScan {
+	ct := &s.tables.connections
+	buckets := ct.tableBuckets()
+	next := 0
+	return func(dst []ConntrackEntry) ([]ConntrackEntry, bool) {
+		if next >= len(buckets) {
+			return dst, false
+		}
+		buckets[next].forEachConfirmedInBucket(ct.clock.NowMonotonic(), func(cn *conn, now tcpip.MonotonicTime) bool {
+			dst = append(dst, cn.snapshot(now))
+			return true
+		})
+		next++
+		return dst, next < len(buckets)
+	}
+}
+
 // ConntrackLookup returns the connection that owns the tuple in either
 // direction. It reports false when no confirmed connection owns it.
 func (s *Stack) ConntrackLookup(t ConntrackTuple) (ConntrackEntry, bool) {
-	var found ConntrackEntry
-	var ok bool
-	s.tables.connections.forEachConfirmed(func(cn *conn, now tcpip.MonotonicTime) bool {
-		e := cn.snapshot(now)
-		if e.Original == t || e.Reply == t {
-			found, ok = e, true
-			return false
-		}
-		return true
-	})
-	return found, ok
+	cn := s.tables.connections.confirmedForTuple(t)
+	if cn == nil {
+		return ConntrackEntry{}, false
+	}
+	return cn.snapshot(s.tables.connections.clock.NowMonotonic()), true
+}
+
+// ConntrackDeleteTuple expires the connection that owns the tuple in either
+// direction when accept returns true for its snapshot. A nil accept accepts
+// every connection. It returns the snapshot and reports whether the
+// connection exists and was expired.
+func (s *Stack) ConntrackDeleteTuple(t ConntrackTuple, accept func(ConntrackEntry) bool) (ConntrackEntry, bool) {
+	ct := &s.tables.connections
+	cn := ct.confirmedForTuple(t)
+	if cn == nil {
+		return ConntrackEntry{}, false
+	}
+	now := ct.clock.NowMonotonic()
+	e := cn.snapshot(now)
+	if accept != nil && !accept(e) {
+		return e, false
+	}
+	cn.expire(now)
+	return e, true
 }
 
 // ConntrackDelete expires every confirmed connection for which match returns

@@ -55,10 +55,6 @@ const (
 	// nlaTypeMask removes the NLA_F_NESTED and NLA_F_NET_BYTEORDER flags.
 	nlaTypeMask = 0x3fff
 
-	// maxDumpBytes bounds the size of one dump. maxDatagramBytes bounds one datagram.
-	maxDumpBytes     = 192 << 10
-	maxDatagramBytes = 3 << 10
-
 	conntrackProtocolICMP  = 1
 	conntrackProtocolICMP6 = 58
 )
@@ -126,7 +122,7 @@ func (p *Protocol) processXplat(ctx context.Context, s *netlink.Socket, msg *nlm
 	}
 	switch hdr.NetFilterSubsysID() {
 	case linux.NFNL_SUBSYS_CTNETLINK:
-		return processConntrack(ctx, s, msg, ms), true
+		return processConntrack(s, msg, ms), true
 	case linux.NFNL_SUBSYS_CTNETLINK_EXP:
 		return processExpect(msg, ms), true
 	case linux.NFNL_SUBSYS_NFTABLES, linux.NFNL_SUBSYS_NFT_COMPAT:
@@ -161,8 +157,27 @@ func processExpect(msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	return nil
 }
 
+// conntrackTable is the part of the stack that ctnetlink reads and changes.
+type conntrackTable interface {
+	ConntrackScanner() stack.ConntrackScan
+	ConntrackLookup(stack.ConntrackTuple) (stack.ConntrackEntry, bool)
+	ConntrackDeleteTuple(stack.ConntrackTuple, func(stack.ConntrackEntry) bool) (stack.ConntrackEntry, bool)
+	ConntrackDelete(func(stack.ConntrackEntry) bool) int
+}
+
+// dumpStarter is the part of the netlink socket that starts a dump.
+type dumpStarter interface {
+	StartDump(netlink.Dumper) *syserr.Error
+}
+
 // processConntrack handles one message of the subsystem CTNETLINK.
-func processConntrack(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+func processConntrack(s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	return serveConntrack(s.Stack().(*netstack.Stack).Stack, s, msg, ms)
+}
+
+// serveConntrack answers one message of the subsystem CTNETLINK from the table.
+// A request for a dump registers the dump with dumps.
+func serveConntrack(table conntrackTable, dumps dumpStarter, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	hdr := msg.Header()
 	var gen linux.NetFilterGenMsg
 	view, ok := msg.GetData(&gen)
@@ -173,16 +188,15 @@ func processConntrack(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message
 	if !ok {
 		return syserr.ErrInvalidArgument
 	}
-	stk := s.Stack().(*netstack.Stack).Stack
 
 	switch hdr.Type & 0xff {
 	case ipctnlMsgCtGet, ipctnlMsgCtGetCtrZero:
 		if hdr.Flags&linux.NLM_F_DUMP == linux.NLM_F_DUMP {
-			return dumpConntrack(ctx, s, stk, hdr, gen.Family, attrs, ms)
+			return dumpConntrack(dumps, table, gen.Family, attrs)
 		}
-		return getConntrack(stk, hdr, attrs, ms)
+		return getConntrack(table, attrs, ms)
 	case ipctnlMsgCtDelete:
-		return deleteConntrack(stk, gen.Family, attrs)
+		return deleteConntrack(table, gen.Family, attrs)
 	}
 	log.Debugf("Netfilter netlink: conntrack message %d is not supported", hdr.Type&0xff)
 	return syserr.ErrNotSupported
@@ -403,37 +417,53 @@ func (f *connFilter) matches(e stack.ConntrackEntry) bool {
 	return !f.hasID || f.id == e.ID
 }
 
-// find returns the one entry that a full tuple names.
-func findEntry(stk *stack.Stack, f *connFilter) (stack.ConntrackEntry, *syserr.Error) {
+// fullTuple returns the tuple that the filter names in full. It fails with
+// EINVAL when the original tuple of the filter, or the reply tuple when the
+// filter has no original tuple, does not name every field.
+func (f *connFilter) fullTuple() (stack.ConntrackTuple, *syserr.Error) {
 	spec := f.orig
 	if spec == nil {
 		spec = f.reply
 	}
 	if spec == nil || !spec.full() {
-		return stack.ConntrackEntry{}, syserr.ErrInvalidArgument
+		return stack.ConntrackTuple{}, syserr.ErrInvalidArgument
 	}
-	tuple := stack.ConntrackTuple{
+	return stack.ConntrackTuple{
 		NetProto:   spec.netProto,
 		TransProto: tcpip.TransportProtocolNumber(spec.protocol),
 		Src:        spec.src,
 		Dst:        spec.dst,
 		SrcPort:    spec.srcPort,
 		DstPort:    spec.dstPort,
+	}, nil
+}
+
+// acceptsID reports whether an entry has the ID that the filter names. A
+// filter with no ID accepts every entry.
+func (f *connFilter) acceptsID(e stack.ConntrackEntry) bool {
+	return !f.hasID || f.id == e.ID
+}
+
+// findEntry returns the one entry that a full tuple names.
+func findEntry(table conntrackTable, f *connFilter) (stack.ConntrackEntry, *syserr.Error) {
+	tuple, err := f.fullTuple()
+	if err != nil {
+		return stack.ConntrackEntry{}, err
 	}
-	e, ok := stk.ConntrackLookup(tuple)
-	if !ok || (f.hasID && f.id != e.ID) {
+	e, ok := table.ConntrackLookup(tuple)
+	if !ok || !f.acceptsID(e) {
 		return stack.ConntrackEntry{}, syserr.ErrNoFileOrDir
 	}
 	return e, nil
 }
 
 // getConntrack answers IPCTNL_MSG_CT_GET for one tuple.
-func getConntrack(stk *stack.Stack, hdr linux.NetlinkMessageHeader, attrs map[uint16][]byte, ms *nlmsg.MessageSet) *syserr.Error {
+func getConntrack(table conntrackTable, attrs map[uint16][]byte, ms *nlmsg.MessageSet) *syserr.Error {
 	f, err := parseFilter(afUnspec, attrs)
 	if err != nil {
 		return err
 	}
-	e, err := findEntry(stk, f)
+	e, err := findEntry(table, f)
 	if err != nil {
 		return err
 	}
@@ -444,78 +474,97 @@ func getConntrack(stk *stack.Stack, hdr linux.NetlinkMessageHeader, attrs map[ui
 // deleteConntrack answers IPCTNL_MSG_CT_DELETE. A full tuple deletes one
 // connection and fails with ENOENT when it does not exist. A partial tuple, or
 // none, deletes every connection that passes the filter.
-func deleteConntrack(stk *stack.Stack, family uint8, attrs map[uint16][]byte) *syserr.Error {
+func deleteConntrack(table conntrackTable, family uint8, attrs map[uint16][]byte) *syserr.Error {
 	f, err := parseFilter(family, attrs)
 	if err != nil {
 		return err
 	}
 	for _, spec := range []*tupleSpec{f.orig, f.reply} {
 		if spec != nil && spec.full() {
-			e, err := findEntry(stk, f)
+			tuple, err := f.fullTuple()
 			if err != nil {
 				return err
 			}
-			stk.ConntrackDelete(func(c stack.ConntrackEntry) bool { return c.ID == e.ID && c.Original == e.Original })
+			if _, ok := table.ConntrackDeleteTuple(tuple, f.acceptsID); !ok {
+				return syserr.ErrNoFileOrDir
+			}
 			return nil
 		}
 	}
-	stk.ConntrackDelete(f.matches)
+	table.ConntrackDelete(f.matches)
 	return nil
 }
 
-// dumpConntrack answers IPCTNL_MSG_CT_GET with NLM_F_DUMP. The receive queue of
-// a netlink socket holds about 208 KiB, and the socket drops what does not fit,
-// so a dump stops at maxDumpBytes and sets NLM_F_DUMP_INTR on its messages. The
-// clients treat that flag as an incomplete result. Each datagram stays below
-// the buffer of the smallest client.
-func dumpConntrack(ctx context.Context, s *netlink.Socket, stk *stack.Stack, hdr linux.NetlinkMessageHeader, family uint8, attrs map[uint16][]byte, ms *nlmsg.MessageSet) *syserr.Error {
+// dumpConntrack answers IPCTNL_MSG_CT_GET with NLM_F_DUMP. It registers a
+// dump that the socket resumes with each read, so the answer has no size limit.
+func dumpConntrack(dumps dumpStarter, table conntrackTable, family uint8, attrs map[uint16][]byte) *syserr.Error {
 	f, err := parseFilter(family, attrs)
 	if err != nil {
 		return err
 	}
-	var entries []stack.ConntrackEntry
-	for _, e := range stk.ConntrackEntries() {
-		if f.matches(e) {
-			entries = append(entries, e)
-		}
-	}
+	return dumps.StartDump(&conntrackDump{scan: table.ConntrackScanner(), filter: f})
+}
 
-	// Measure the messages to find how many fit.
-	scratch := nlmsg.NewMessageSet(s.GetPortID(), hdr.Seq)
-	total, fit := 0, len(entries)
-	for i, e := range entries {
-		m := scratch.AddMessage(linux.NetlinkMessageHeader{Type: ctnetlinkNewMsgType, Flags: linux.NLM_F_MULTI})
-		putEntry(m, e)
-		total += len(m.Buffer())
-		if total > maxDumpBytes {
-			fit = i
-			break
-		}
-	}
-	var flags uint16 = linux.NLM_F_MULTI
-	if fit < len(entries) {
-		flags |= linux.NLM_F_DUMP_INTR
-	}
+// conntrackDump is the state of a dump of the connection table. It scans the
+// table one bucket at a time. A connection stays in the bucket of its original
+// tuple, so a connection that exists for the whole dump always appears, and
+// a connection that a bucket scan sees once never appears again.
+type conntrackDump struct {
+	scan   stack.ConntrackScan
+	filter *connFilter
+	// scanned holds the connections of the buckets that the dump scanned and
+	// passed the filter. next is the first of them that the dump has not sent.
+	scanned []stack.ConntrackEntry
+	next    int
+	// scratch is the buffer of one bucket scan.
+	scratch []stack.ConntrackEntry
+	// scanDone is true after the scan of the last bucket.
+	scanDone bool
+}
 
-	// Send full datagrams now. The last datagram and the end of the dump go
-	// through ms.
-	ms.Multi = true
-	chunk := nlmsg.NewMessageSet(s.GetPortID(), hdr.Seq)
-	chunkBytes := 0
-	for _, e := range entries[:fit] {
-		if chunkBytes >= maxDatagramBytes {
-			if err := s.SendResponse(ctx, chunk); err != nil {
-				return err
+var _ netlink.Dumper = (*conntrackDump)(nil)
+
+// DumpChunk implements netlink.Dumper.DumpChunk.
+func (d *conntrackDump) DumpChunk(_ context.Context, chunk *nlmsg.MessageSet, limit int) (bool, *syserr.Error) {
+	size := 0
+	for {
+		for d.next < len(d.scanned) {
+			m := chunk.AddMessage(linux.NetlinkMessageHeader{Type: ctnetlinkNewMsgType})
+			putEntry(m, d.scanned[d.next])
+			size += netlink.MessageSize(m)
+			if size > limit && len(chunk.Messages) > 1 {
+				chunk.Messages = chunk.Messages[:len(chunk.Messages)-1]
+				return true, nil
 			}
-			chunk = nlmsg.NewMessageSet(s.GetPortID(), hdr.Seq)
-			chunkBytes = 0
+			d.next++
+			if size >= limit {
+				return true, nil
+			}
 		}
-		m := chunk.AddMessage(linux.NetlinkMessageHeader{Type: ctnetlinkNewMsgType, Flags: flags})
-		putEntry(m, e)
-		chunkBytes += len(m.Buffer())
+		if d.scanDone {
+			return false, nil
+		}
+		d.scanBucket()
 	}
-	ms.Messages = chunk.Messages
-	return nil
+}
+
+// scanBucket replaces the connections that the dump sent with the connections
+// of the next bucket that pass the filter.
+func (d *conntrackDump) scanBucket() {
+	var more bool
+	d.scratch, more = d.scan(d.scratch[:0])
+	d.scanDone = !more
+	d.scanned, d.next = d.scanned[:0], 0
+	for _, e := range d.scratch {
+		if d.filter.matches(e) {
+			d.scanned = append(d.scanned, e)
+		}
+	}
+}
+
+// DumpDone implements netlink.Dumper.DumpDone.
+func (d *conntrackDump) DumpDone() {
+	d.scanned, d.scratch = nil, nil
 }
 
 // putEntry appends the attributes of a connection to m, in the order that
