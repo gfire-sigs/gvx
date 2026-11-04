@@ -118,9 +118,9 @@ func TestWriteFaultAfterPrefixTranslationBreaksCopyOnWrite(t *testing.T) {
 				hugeBoundary = 0x40_0000
 				fileBytes    = pages * hostarch.PageSize
 			)
-			mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+			mf, err := newCOWTestMemoryFile()
 			if err != nil {
-				t.Fatalf("NewDefaultMemoryFile: %v", err)
+				t.Fatalf("newCOWTestMemoryFile: %v", err)
 			}
 			t.Cleanup(mf.Destroy)
 			ls := linuxLimits(t)
