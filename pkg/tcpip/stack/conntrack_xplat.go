@@ -230,3 +230,38 @@ func (s *Stack) ConntrackDelete(match func(ConntrackEntry) bool) int {
 	})
 	return deleted
 }
+
+// closedTCP reports whether the TCP state of the connection is TIME_WAIT or
+// CLOSE: both streams sent a FIN, or one side sent a RST.
+func (cn *conn) closedTCP() bool {
+	cn.stateMu.RLock()
+	defer cn.stateMu.RUnlock()
+	switch cn.tcb.State() {
+	case tcpconntrack.ResultClosedByOriginator, tcpconntrack.ResultClosedByResponder, tcpconntrack.ResultReset:
+		return true
+	}
+	return false
+}
+
+// expireClosedOnSYN lets a SYN reopen a closed TCP tuple. The state machine of
+// Linux (nf_conntrack_proto_tcp) treats a SYN on a connection in TIME_WAIT or
+// CLOSE as the start of a new connection: it destroys the old entry, and the
+// packet creates an entry that runs the NAT rules again. Without this, a new
+// connection with the same five values keeps the NAT target of the old one
+// until the entry times out. A SYN with another flag set, such as the SYN-ACK
+// of a reply, never reopens a tuple.
+func (ct *ConnTrack) expireClosedOnSYN(pkt *PacketBuffer, tid tupleID, bkt *bucket, now tcpip.MonotonicTime) {
+	// An ICMP error about a TCP connection has the tuple of that connection but
+	// carries no TCP header of its own.
+	if pkt.TransportProtocolNumber != header.TCPProtocolNumber {
+		return
+	}
+	tcpHeader := header.TCP(pkt.TransportHeader().Slice())
+	const flags = header.TCPFlagSyn | header.TCPFlagAck | header.TCPFlagRst | header.TCPFlagFin
+	if len(tcpHeader) < header.TCPMinimumSize || tcpHeader.Flags()&flags != header.TCPFlagSyn {
+		return
+	}
+	if t := bkt.connForTID(tid, now); t != nil && t.conn.closedTCP() {
+		t.conn.expire(now)
+	}
+}

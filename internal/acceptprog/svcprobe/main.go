@@ -21,8 +21,9 @@
 // Usage:
 //
 //	svcprobe serve ADDR NAME   listen on ADDR (HOST:PORT) until the process ends
-//	svcprobe dial ADDR         connect to ADDR and print one line:
+//	svcprobe dial ADDR [PORT]  connect to ADDR and print one line:
 //	                           "REPLY NAME from=PEER" or "ERROR reason"
+//	                           PORT binds the local port of the client
 package main
 
 import (
@@ -30,6 +31,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -40,9 +42,16 @@ func main() {
 	case len(os.Args) == 4 && os.Args[1] == "serve":
 		serve(os.Args[2], os.Args[3])
 	case len(os.Args) == 3 && os.Args[1] == "dial":
-		dial(os.Args[2])
+		dial(os.Args[2], 0)
+	case len(os.Args) == 4 && os.Args[1] == "dial":
+		port, err := strconv.Atoi(os.Args[3])
+		if err != nil || port < 1 || port > 65535 {
+			fmt.Fprintf(os.Stderr, "svcprobe: invalid local port %q\n", os.Args[3])
+			os.Exit(2)
+		}
+		dial(os.Args[2], port)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: svcprobe serve ADDR NAME | svcprobe dial ADDR")
+		fmt.Fprintln(os.Stderr, "usage: svcprobe serve ADDR NAME | svcprobe dial ADDR [PORT]")
 		os.Exit(2)
 	}
 }
@@ -65,8 +74,14 @@ func serve(addr, name string) {
 	}
 }
 
-func dial(addr string) {
-	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+// dial connects to addr and prints the answer. A positive localPort binds the
+// source port of the connection.
+func dial(addr string, localPort int) {
+	d := net.Dialer{Timeout: dialTimeout}
+	if localPort > 0 {
+		d.LocalAddr = &net.TCPAddr{Port: localPort}
+	}
+	conn, err := d.Dial("tcp", addr)
 	if err != nil {
 		fmt.Println("ERROR", err)
 		os.Exit(1)

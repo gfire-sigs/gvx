@@ -48,11 +48,10 @@ const (
 // statisticScriptHead installs the tools, copies the probe, and defines the
 // helpers that the phase scripts use. The first nat OUTPUT rule holds the
 // statistic match and sends matching connections to listener A. The second
-// rule sends every other connection to listener B. Each phase passes its own
-// range of source ports to the probe. The connection tracking of the guest
-// keeps the NAT target of a closed connection for up to two minutes, and a new
-// connection with the same addresses and ports reuses that target instead of
-// asking the rules again.
+// rule sends every other connection to listener B. Every phase uses the
+// default ephemeral source ports, so a new connection can reuse the five values
+// of a closed one. The connection tracking of the guest then starts a new entry
+// and asks the rules again, as Linux does for a SYN in TIME_WAIT.
 const statisticScriptHead = `set -e
 apk add --no-cache iptables iptables-legacy >/dev/null
 cp /workspace/statprobe /usr/local/bin/statprobe
@@ -62,7 +61,7 @@ svc='-d 127.0.0.2 -p tcp --dport 80'
 toA='-j DNAT --to-destination 127.0.0.1:8081'
 toB='-j DNAT --to-destination 127.0.0.1:8082'
 rule_b() { $ipt -t nat -A OUTPUT $svc $toB; }
-probe() { echo "PHASE $1"; statprobe split ` + statServiceAddr + ` ` + statTargetA + ` ` + statTargetB + ` $2 tcp $3; }
+probe() { echo "PHASE $1"; statprobe split ` + statServiceAddr + ` ` + statTargetA + ` ` + statTargetB + ` $2 tcp; }
 `
 
 // statResultPattern matches the output of one phase of the probe.
@@ -139,13 +138,13 @@ $ipt -t nat -A OUTPUT $svc -m statistic --mode random --probability 0.5 $toA
 rule_b
 $ipt -t nat -S OUTPUT
 $ipt -t nat -C OUTPUT $svc -m statistic --mode random --probability 0.5 $toA && echo CHECK-RANDOM-OK
-probe half 2000 20000
+probe half 2000
 $ipt -t nat -R OUTPUT 1 $svc -m statistic --mode random --probability 1 $toA
 $ipt -t nat -S OUTPUT
-probe all 200 30000
+probe all 200
 $ipt -t nat -R OUTPUT 1 $svc -m statistic --mode random --probability 0 $toA
 $ipt -t nat -S OUTPUT
-probe none 200 31000
+probe none 200
 `
 			out := runStatisticGuest(t, b, script)
 			t.Logf("guest output:\n%s", out)
@@ -184,15 +183,15 @@ $ipt -t nat -A OUTPUT $svc -m statistic --mode nth --every 3 --packet 0 $toA
 rule_b
 $ipt -t nat -S OUTPUT
 $ipt -t nat -C OUTPUT $svc -m statistic --mode nth --every 3 --packet 0 $toA && echo CHECK-NTH-OK
-probe packet0 30 20000
+probe packet0 30
 $ipt -t nat -R OUTPUT 1 $svc -m statistic --mode nth --every 3 --packet 1 $toA
-probe packet1 30 21000
+probe packet1 30
 $ipt -t nat -R OUTPUT 1 $svc -m statistic --mode nth --every 3 --packet 2 $toA
-probe packet2 30 22000
+probe packet2 30
 $ipt -t nat -R OUTPUT 1 $svc -m statistic --mode nth ! --every 3 --packet 0 $toA
 $ipt -t nat -S OUTPUT
 $ipt -t nat -C OUTPUT $svc -m statistic --mode nth ! --every 3 --packet 0 $toA && echo CHECK-INVERTED-OK
-probe inverted 30 23000
+probe inverted 30
 `
 			out := runStatisticGuest(t, b, script)
 			t.Logf("guest output:\n%s", out)

@@ -539,6 +539,7 @@ func (ct *ConnTrack) getConnAndUpdate(pkt *PacketBuffer, skipChecksumValidation 
 		ct.mu.RUnlock()
 
 		now := ct.clock.NowMonotonic()
+		ct.expireClosedOnSYN(pkt, tid, bkt, now)
 		if t := bkt.connForTID(tid, now); t != nil {
 			return t
 		}

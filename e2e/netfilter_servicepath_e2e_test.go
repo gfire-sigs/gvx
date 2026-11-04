@@ -255,6 +255,46 @@ ctprobe kubeproxy
 	}
 }
 
+// reopenScript sends one TCP connection from the fixed client port 41000 to a
+// virtual address. A DNAT rule in the OUTPUT chain sends it to the listener a.
+// The script lets the connection close, moves the rule to the listener b, and
+// sends a second connection from the same port. The second connection has the
+// same five values as the first one.
+const reopenScript = `set -e
+apk add --no-cache iptables iptables-legacy >/dev/null
+cp /workspace/svcprobe /usr/local/bin/svcprobe
+chmod 755 /usr/local/bin/svcprobe
+ipt=iptables-legacy
+svcprobe serve 127.0.0.1:8081 a &
+svcprobe serve 127.0.0.1:8082 b &
+for i in $(seq 1 60); do svcprobe dial 127.0.0.1:8081 >/dev/null 2>&1 && svcprobe dial 127.0.0.1:8082 >/dev/null 2>&1 && break; sleep 0.5; done
+$ipt -t nat -A OUTPUT -d 127.0.0.2 -p tcp --dport 80 -j DNAT --to-destination 127.0.0.1:8081
+echo "first $(svcprobe dial 127.0.0.2:80 41000)"
+sleep 1
+$ipt -t nat -R OUTPUT 1 -d 127.0.0.2 -p tcp --dport 80 -j DNAT --to-destination 127.0.0.1:8082
+echo "second $(svcprobe dial 127.0.0.2:80 41000)"
+sleep 1
+echo "third $(svcprobe dial 127.0.0.2:80 41000)"
+`
+
+// TestE2ENetfilterConntrackReopensClosedTCP checks that a SYN on the tuple of a
+// closed TCP connection starts a new connection that runs the NAT rules again.
+// A connection through a DNAT rule closes, the rule changes its target, and a
+// new connection from the same source port reaches the new target.
+func TestE2ENetfilterConntrackReopensClosedTCP(t *testing.T) {
+	for _, b := range gateBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireBackend(t, b)
+			requireRegistry(t)
+			out := runServicePathGuest(t, b, map[string]string{"svcprobe": acceptprog.BuildSvcProbe(t, hostArch())}, reopenScript)
+			requireContains(t, "guest output", out,
+				"first REPLY a from=",
+				"second REPLY b from=",
+				"third REPLY b from=")
+		})
+	}
+}
+
 // iccScript starts dockerd with the option in $1 and connects from one
 // container to a server container of the same bridge.
 const iccScript = `dockerd-entrypoint.sh --tls=false $1 >/tmp/dockerd.log 2>&1 &

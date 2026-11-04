@@ -22,7 +22,7 @@
 //
 // Usage:
 //
-//	statprobe split ADDR TARGET_A TARGET_B N [tcp|udp [BASE_PORT]]
+//	statprobe split ADDR TARGET_A TARGET_B N [tcp|udp]
 //
 // The probe listens on TARGET_A and TARGET_B (HOST:PORT), opens N flows to
 // ADDR one after the other, and prints one line:
@@ -33,12 +33,6 @@
 // The probe prints it only when N is at most 60. A run with N above 60 uses 16
 // concurrent workers, so the order of the flows is not defined. A failed flow
 // adds a line "ERRORS <count> first: <reason>" and makes the exit code 1.
-//
-// Without BASE_PORT the kernel picks the source port of each flow. With
-// BASE_PORT the flow number i (from 0) uses the source port BASE_PORT+i. The
-// NAT state of a closed flow stays for up to two minutes and a new flow with
-// the same addresses and ports reuses it, so a caller that runs the probe
-// more than once in a sandbox gives each run its own range of ports.
 package main
 
 import (
@@ -81,14 +75,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "statprobe: unknown protocol %q\n", network)
 		os.Exit(2)
 	}
-	basePort := 0
-	if len(os.Args) > 7 {
-		basePort, err = strconv.Atoi(os.Args[7])
-		if err != nil || basePort < 1 || basePort+n > 65535 {
-			fmt.Fprintf(os.Stderr, "statprobe: invalid base port %q for %d flows\n", os.Args[7], n)
-			os.Exit(2)
-		}
-	}
 
 	stop, err := listen(network, targetA, targetB)
 	if err != nil {
@@ -97,7 +83,7 @@ func main() {
 	}
 	defer stop()
 
-	order, errs := runFlows(network, addr, n, basePort)
+	order, errs := runFlows(network, addr, n)
 	a, b := strings.Count(string(order), "A"), strings.Count(string(order), "B")
 	line := fmt.Sprintf("RESULT a=%d b=%d", a, b)
 	if n <= orderLimit {
@@ -178,8 +164,7 @@ func serveUDP(pc net.PacketConn, answer byte) {
 
 // runFlows opens n flows to addr and returns the answer bytes in flow order
 // and the errors of the failed flows. A failed flow leaves '?' in its slot.
-// A positive basePort gives flow i the source port basePort+i.
-func runFlows(network, addr string, n, basePort int) ([]byte, []error) {
+func runFlows(network, addr string, n int) ([]byte, []error) {
 	order := make([]byte, n)
 	workers := 1
 	if n > orderLimit {
@@ -196,11 +181,7 @@ func runFlows(network, addr string, n, basePort int) ([]byte, []error) {
 		go func() {
 			defer wg.Done()
 			for i := range next {
-				srcPort := 0
-				if basePort > 0 {
-					srcPort = basePort + i
-				}
-				answer, err := oneFlow(network, addr, srcPort)
+				answer, err := oneFlow(network, addr)
 				mu.Lock()
 				if err != nil {
 					order[i] = '?'
@@ -221,16 +202,9 @@ func runFlows(network, addr string, n, basePort int) ([]byte, []error) {
 }
 
 // oneFlow opens one connection or one UDP socket to addr and returns the byte
-// that the selected listener answers. A non-zero srcPort sets the source port.
-func oneFlow(network, addr string, srcPort int) (byte, error) {
+// that the selected listener answers.
+func oneFlow(network, addr string) (byte, error) {
 	d := net.Dialer{Timeout: flowTimeout}
-	if srcPort != 0 {
-		if network == "tcp" {
-			d.LocalAddr = &net.TCPAddr{Port: srcPort}
-		} else {
-			d.LocalAddr = &net.UDPAddr{Port: srcPort}
-		}
-	}
 	c, err := d.Dial(network, addr)
 	if err != nil {
 		return 0, err
