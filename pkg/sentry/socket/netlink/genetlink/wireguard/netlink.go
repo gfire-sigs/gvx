@@ -198,8 +198,8 @@ func (d *deviceDumper) rollover() *syserr.Error {
 	return d.begin(nil)
 }
 
-// peer adds one peer. It splits a peer with many allowed IP addresses
-// across messages.
+// peer adds one peer. It splits the allowed IP addresses of a peer
+// across messages when they exceed the message limit.
 func (d *deviceDumper) peer(p *peerInfo) *syserr.Error {
 	head := encodePeer(p)
 	if pieceSize(head, 0, 0) > d.room() && len(d.peers) > 0 {

@@ -103,7 +103,7 @@ func (r *Reply) Message(cmd uint8) *nlmsg.Message {
 }
 
 // Dump sends the messages of a command with the NLM_F_DUMP flag. Each message
-// leaves in its own datagram, so a reader with a small buffer does not
+// leaves in its own datagram, so a reader with a 4,096-byte buffer does not
 // truncate it.
 type Dump struct {
 	family *Family
