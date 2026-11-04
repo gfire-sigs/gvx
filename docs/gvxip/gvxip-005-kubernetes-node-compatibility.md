@@ -15,7 +15,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 
 | Phase | Content | State |
 | :--- | :--- | :--- |
-| P1 | Kernel interfaces of `kubelet` and the container runtime | Not started |
+| P1 | Kernel interfaces of `kubelet` and the container runtime | A1 to A7 pass on every platform. The B tests are not automated yet. |
 | P2 | Service data path (`statistic`, bridge netfilter, `ctnetlink`) | Not started |
 | P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Not started |
 | P4 | Enforcement of `cpu.max` | Not started |
@@ -136,7 +136,7 @@ These tests check one kernel behavior each. A Go program without an image runs t
 
 | ID | Behavior | Pass criterion |
 | :--- | :--- | :--- |
-| A1 | `/dev/kmsg` | The open succeeds. `lseek(SEEK_END)` returns 0. A non-blocking read returns `EAGAIN`. A write of `<6>x` returns 6. |
+| A1 | `/dev/kmsg` | The open succeeds. `lseek(SEEK_END)` returns 0. A non-blocking read returns `EAGAIN`. A write of `<6>x` returns 4, the length of the text. |
 | A2 | Stored sysctls | Each file of section 3.1 returns the value that the test wrote. `overcommit_memory` rejects 3 with `EINVAL`. |
 | A3 | `ip_unprivileged_port_start` | At 1024, a bind to port 80 without `CAP_NET_BIND_SERVICE` fails with `EACCES`. At 0, it succeeds. A change in a child network namespace leaves the parent value. |
 | A4 | Safe sysctls | Each network value is writable in a network namespace and keeps its old value in the parent namespace. |
