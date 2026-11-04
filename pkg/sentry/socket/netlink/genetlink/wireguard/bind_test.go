@@ -26,6 +26,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
@@ -237,4 +238,62 @@ func TestNewLinkConfiguresAndClosesTheDevice(t *testing.T) {
 // hexKey returns the hexadecimal form of a 32-byte key with every byte b.
 func hexKey(b byte) string {
 	return hex.EncodeToString(bytes.Repeat([]byte{b}, 32))
+}
+
+func TestBindProbeFindsABusyPortAndReleasesAFreeOne(t *testing.T) {
+	st := newLoopbackStack(t)
+	owner := newBind(st)
+	_, port, err := owner.Open(0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := owner.localPort(); got != port {
+		t.Errorf("localPort = %d, want %d", got, port)
+	}
+	other := newBind(st)
+	var be *bindError
+	if err := other.probe(port); !errors.As(err, &be) || be.err != syserr.ErrPortInUse {
+		t.Fatalf("probe of the busy port %d = %v, want a port in use error", port, err)
+	}
+	owner.Close()
+	if got := owner.localPort(); got != 0 {
+		t.Errorf("localPort after Close = %d, want 0", got)
+	}
+	if err := other.probe(port); err != nil {
+		t.Fatalf("probe of the free port %d = %v", port, err)
+	}
+	// The probe released the port.
+	if _, _, err := other.Open(port); err != nil {
+		t.Fatalf("Open(%d) after the probe = %v", port, err)
+	}
+	other.Close()
+}
+
+func TestAcquireLinkStopsAtTheLimit(t *testing.T) {
+	k := &kernel.Kernel{}
+	other := &kernel.Kernel{}
+	for i := range maxLinks {
+		if !acquireLink(k) {
+			t.Fatalf("acquireLink failed for link %d, want success up to %d", i, maxLinks)
+		}
+	}
+	if acquireLink(k) {
+		t.Errorf("acquireLink succeeded beyond %d links", maxLinks)
+	}
+	if !acquireLink(other) {
+		t.Error("the links of one sandbox count against another sandbox")
+	}
+	releaseLink(k)
+	if !acquireLink(k) {
+		t.Error("acquireLink failed after a release")
+	}
+	for range maxLinks {
+		releaseLink(k)
+	}
+	releaseLink(other)
+	linkCounts.Lock()
+	defer linkCounts.Unlock()
+	if len(linkCounts.n) != 0 {
+		t.Errorf("the counts keep %d entries after every release", len(linkCounts.n))
+	}
 }

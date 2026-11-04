@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/genetlink"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
@@ -34,19 +35,24 @@ var errNoDeviceSelector = syserr.FromError(linuxerr.EBADR)
 
 // lookupDevice finds the wireguard link that the request names with
 // WGDEVICE_A_IFINDEX or WGDEVICE_A_IFNAME in the network namespace of the
-// socket. The index wins when both are present. From
+// socket. A request with both attributes or with neither fails with EBADR. From
 // drivers/net/wireguard/netlink.c:lookup_interface.
 func lookupDevice(req *genetlink.Request, attrs map[uint16]nlmsg.BytesView) (*linkEndpoint, tcpip.NICID, string, *syserr.Error) {
 	st, ok := req.Socket.NetworkNamespace().Stack().(*netstack.Stack)
 	if !ok {
 		return nil, 0, "", syserr.ErrNoDevice
 	}
+	idxAttr, haveIdx := attrs[deviceAttrIfindex]
+	nameAttr, haveName := attrs[deviceAttrIfname]
+	if haveIdx == haveName {
+		return nil, 0, "", errNoDeviceSelector
+	}
 	var (
 		id   tcpip.NICID
 		name string
 	)
-	if v, ok := attrs[deviceAttrIfindex]; ok {
-		idx, ok := v.Uint32()
+	if haveIdx {
+		idx, ok := idxAttr.Uint32()
 		if !ok {
 			return nil, 0, "", syserr.ErrInvalidArgument
 		}
@@ -55,8 +61,8 @@ func lookupDevice(req *genetlink.Request, attrs map[uint16]nlmsg.BytesView) (*li
 			return nil, 0, "", syserr.ErrNoDevice
 		}
 		id, name = tcpip.NICID(idx), info.Name
-	} else if v, ok := attrs[deviceAttrIfname]; ok {
-		want := v.String()
+	} else {
+		want := nameAttr.String()
 		for nid, info := range st.Stack.NICInfo() {
 			if info.Name == want {
 				id, name = nid, info.Name
@@ -66,8 +72,6 @@ func lookupDevice(req *genetlink.Request, attrs map[uint16]nlmsg.BytesView) (*li
 		if name == "" {
 			return nil, 0, "", syserr.ErrNoDevice
 		}
-	} else {
-		return nil, 0, "", errNoDeviceSelector
 	}
 	ep, ok := st.Stack.GetLinkEndpointByName(name).(*linkEndpoint)
 	if !ok {
@@ -76,9 +80,29 @@ func lookupDevice(req *genetlink.Request, attrs map[uint16]nlmsg.BytesView) (*li
 	return ep, id, name, nil
 }
 
+// state returns the configuration that wireguard-go holds.
+func (e *linkEndpoint) state() (*deviceInfo, *syserr.Error) {
+	text, err := e.dev.IpcGet()
+	if err != nil {
+		return nil, syserr.ErrIO
+	}
+	info, err := parseIpcGet(text)
+	if err != nil {
+		return nil, syserr.ErrIO
+	}
+	return info, nil
+}
+
 // setDevice answers WG_CMD_SET_DEVICE. It validates the whole request, then
 // hands it to wireguard-go as one configuration text.
-func setDevice(_ context.Context, req *genetlink.Request, _ *genetlink.Reply) *syserr.Error {
+//
+// A request that sets the listen port or the mark needs CAP_NET_ADMIN in the
+// user namespace of the namespace that created the link, because the socket of
+// the link belongs to that namespace. A port that the device does not own yet
+// must be free: the call binds it first and answers EADDRINUSE before it changes
+// anything, because wireguard-go closes the old socket before it opens the new
+// one.
+func setDevice(ctx context.Context, req *genetlink.Request, _ *genetlink.Reply) *syserr.Error {
 	attrs, ok := req.ParseAttrs()
 	if !ok {
 		return syserr.ErrInvalidArgument
@@ -87,14 +111,29 @@ func setDevice(_ context.Context, req *genetlink.Request, _ *genetlink.Reply) *s
 	if err != nil {
 		return err
 	}
-	conf, err := parseSetDevice(attrs)
+	cur, err := ep.state()
 	if err != nil {
 		return err
 	}
-	if conf == "" {
+	plan, err := parseSetDevice(attrs, cur)
+	if err != nil {
+		return err
+	}
+	if plan.changesSocket && ep.userNS != nil && !auth.CredentialsFromContext(ctx).HasCapabilityIn(linux.CAP_NET_ADMIN, ep.userNS) {
+		return syserr.ErrNotPermitted
+	}
+	if plan.peers > maxPeers {
+		return syserr.ErrNoMemory
+	}
+	if plan.probePort != 0 {
+		if err := ep.bind.probe(plan.probePort); err != nil {
+			return bindSyserr(err)
+		}
+	}
+	if plan.conf == "" {
 		return nil
 	}
-	if ipcErr := ep.dev.IpcSet(conf); ipcErr != nil {
+	if ipcErr := ep.dev.IpcSet(plan.conf); ipcErr != nil {
 		return bindSyserr(ipcErr)
 	}
 	return nil
@@ -112,13 +151,9 @@ func getDevice(_ context.Context, req *genetlink.Request, dump *genetlink.Dump) 
 	if err != nil {
 		return err
 	}
-	text, ipcErr := ep.dev.IpcGet()
-	if ipcErr != nil {
-		return syserr.ErrIO
-	}
-	info, parseErr := parseIpcGet(text)
-	if parseErr != nil {
-		return syserr.ErrIO
+	info, err := ep.state()
+	if err != nil {
+		return err
 	}
 
 	d := &deviceDumper{dump: dump, ifindex: uint32(id), name: name, limit: dump.MessageLimit()}

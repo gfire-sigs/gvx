@@ -24,6 +24,8 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"z.gfire.dev/gvx/pkg/buffer"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
@@ -51,6 +53,13 @@ type linkEndpoint struct {
 	*channel.Endpoint
 	tun *tunDevice
 
+	bind *netBind
+	// userNS is the user namespace of the network namespace that created the
+	// link. A request that changes the socket needs CAP_NET_ADMIN in it.
+	userNS *auth.UserNamespace
+	// kernel is the sandbox that counts the link.
+	kernel *kernel.Kernel
+
 	closeOnce sync.Once
 	// dev is set before the stack sees the endpoint.
 	dev *device.Device
@@ -71,6 +80,7 @@ func (e *linkEndpoint) Close() {
 	e.closeOnce.Do(func() {
 		e.Endpoint.Close()
 		e.dev.Close()
+		releaseLink(e.kernel)
 	})
 }
 

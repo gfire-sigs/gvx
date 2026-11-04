@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/genetlink"
@@ -146,129 +147,205 @@ func decodeKey(dst *[keyLen]byte, value string) error {
 	return nil
 }
 
-// parseSetDevice validates the attributes of WG_CMD_SET_DEVICE and returns
-// the equivalent configuration text of wireguard-go. It validates the whole
-// request before the caller applies any part of it. The errors follow
-// drivers/net/wireguard/netlink.c:wg_set_device.
-func parseSetDevice(attrs map[uint16]nlmsg.BytesView) (string, *syserr.Error) {
+// errProtocolVersion is EPFNOSUPPORT, the answer of Linux to a peer with a
+// protocol version other than 1.
+var errProtocolVersion = syserr.FromError(linuxerr.EPFNOSUPPORT)
+
+// peerOp is one peer entry of a set request.
+type peerOp struct {
+	key        [keyLen]byte
+	remove     bool
+	updateOnly bool
+}
+
+// setPlan is a validated WG_CMD_SET_DEVICE request.
+type setPlan struct {
+	// conf is the configuration text for wireguard-go.
+	conf string
+
+	// changesSocket is true when the request sets the listen port or the
+	// mark. Linux then checks CAP_NET_ADMIN in the creating namespace.
+	changesSocket bool
+
+	// probePort is the port that the device must be able to bind, or 0 when
+	// the request keeps the current port or asks for a free one.
+	probePort uint16
+
+	// peers is the count of peers after the request.
+	peers int
+}
+
+// parseSetDevice validates the attributes of WG_CMD_SET_DEVICE against the
+// current state and returns the plan. It validates the whole request before
+// the caller applies any part of it. The errors follow
+// drivers/net/wireguard/netlink.c:wg_set_device, and so does the order of the
+// lines: the mark, the port, the removal of every peer, the private key, and
+// the peers.
+func parseSetDevice(attrs map[uint16]nlmsg.BytesView, cur *deviceInfo) (*setPlan, *syserr.Error) {
 	var b strings.Builder
+	plan := &setPlan{}
+	var replacePeers bool
 	if v, ok := attrs[deviceAttrFlags]; ok {
 		flags, ok := v.Uint32()
 		if !ok {
-			return "", syserr.ErrInvalidArgument
+			return nil, syserr.ErrInvalidArgument
 		}
 		if flags&^deviceFlagReplacePeers != 0 {
-			return "", syserr.ErrNotSupported
+			return nil, syserr.ErrNotSupported
 		}
-		if flags&deviceFlagReplacePeers != 0 {
-			b.WriteString("replace_peers=true\n")
-		}
+		replacePeers = flags&deviceFlagReplacePeers != 0
 	}
 	if v, ok := attrs[deviceAttrFwmark]; ok {
 		mark, ok := v.Uint32()
 		if !ok {
-			return "", syserr.ErrInvalidArgument
+			return nil, syserr.ErrInvalidArgument
 		}
 		fmt.Fprintf(&b, "fwmark=%d\n", mark)
+		plan.changesSocket = true
 	}
 	if v, ok := attrs[deviceAttrListenPort]; ok {
 		port, ok := v.Uint16()
 		if !ok {
-			return "", syserr.ErrInvalidArgument
+			return nil, syserr.ErrInvalidArgument
 		}
-		fmt.Fprintf(&b, "listen_port=%d\n", port)
+		plan.changesSocket = true
+		// The same port needs no rebind. Port 0 asks for a new free port.
+		if port == 0 || port != cur.listenPort {
+			fmt.Fprintf(&b, "listen_port=%d\n", port)
+			plan.probePort = port
+		}
+	}
+	if replacePeers {
+		b.WriteString("replace_peers=true\n")
 	}
 	if v, ok := attrs[deviceAttrPrivateKey]; ok {
 		if len(v) != keyLen {
-			return "", syserr.ErrInvalidArgument
+			return nil, syserr.ErrInvalidArgument
 		}
 		fmt.Fprintf(&b, "private_key=%x\n", []byte(v))
 	}
+	var ops []peerOp
 	if v, ok := attrs[deviceAttrPeers]; ok {
-		if err := parsePeers(&b, nlmsg.AttrsView(v)); err != nil {
-			return "", err
+		var err *syserr.Error
+		if ops, err = parsePeers(&b, nlmsg.AttrsView(v)); err != nil {
+			return nil, err
 		}
 	}
-	return b.String(), nil
+	plan.conf = b.String()
+	plan.peers = countPeers(cur, replacePeers, ops)
+	return plan, nil
 }
 
-// parsePeers appends the configuration text of each peer in the nested list.
-func parsePeers(b *strings.Builder, list nlmsg.AttrsView) *syserr.Error {
+// countPeers returns the count of peers after the request.
+func countPeers(cur *deviceInfo, replacePeers bool, ops []peerOp) int {
+	set := make(map[[keyLen]byte]struct{})
+	if !replacePeers {
+		for i := range cur.peers {
+			set[cur.peers[i].publicKey] = struct{}{}
+		}
+	}
+	for _, op := range ops {
+		_, exists := set[op.key]
+		switch {
+		case op.remove:
+			delete(set, op.key)
+		case op.updateOnly && !exists:
+		default:
+			set[op.key] = struct{}{}
+		}
+	}
+	return len(set)
+}
+
+// parsePeers appends the configuration text of each peer in the nested list
+// and returns the peer entries.
+func parsePeers(b *strings.Builder, list nlmsg.AttrsView) ([]peerOp, *syserr.Error) {
+	var ops []peerOp
 	for !list.Empty() {
 		_, value, rest, ok := list.ParseFirst()
 		if !ok {
-			return syserr.ErrInvalidArgument
+			return nil, syserr.ErrInvalidArgument
 		}
 		list = rest
 		attrs, ok := genetlink.ParseAttrs(nlmsg.AttrsView(value))
 		if !ok {
-			return syserr.ErrInvalidArgument
+			return nil, syserr.ErrInvalidArgument
 		}
-		if err := parsePeer(b, attrs); err != nil {
-			return err
+		op, err := parsePeer(b, attrs)
+		if err != nil {
+			return nil, err
 		}
+		ops = append(ops, op)
 	}
-	return nil
+	return ops, nil
 }
 
 // parsePeer appends the configuration text of one peer. wireguard-go needs
 // "update_only" right after the key and "replace_allowed_ips" before the
 // first allowed IP address.
-func parsePeer(b *strings.Builder, attrs map[uint16]nlmsg.BytesView) *syserr.Error {
+func parsePeer(b *strings.Builder, attrs map[uint16]nlmsg.BytesView) (peerOp, *syserr.Error) {
+	var op peerOp
 	key, ok := attrs[peerAttrPublicKey]
 	if !ok || len(key) != keyLen {
-		return syserr.ErrInvalidArgument
+		return op, syserr.ErrInvalidArgument
 	}
+	copy(op.key[:], key)
 	var flags uint32
 	if v, ok := attrs[peerAttrFlags]; ok {
 		if flags, ok = v.Uint32(); !ok {
-			return syserr.ErrInvalidArgument
+			return op, syserr.ErrInvalidArgument
 		}
 		if flags&^(peerFlagRemoveMe|peerFlagReplaceAllowedIP|peerFlagUpdateOnly) != 0 {
-			return syserr.ErrNotSupported
+			return op, syserr.ErrNotSupported
 		}
 	}
 	fmt.Fprintf(b, "public_key=%x\n", []byte(key))
 	if flags&peerFlagRemoveMe != 0 {
 		// Linux skips the other attributes of a peer that it removes.
 		b.WriteString("remove=true\n")
-		return nil
+		op.remove = true
+		return op, nil
 	}
 	if flags&peerFlagUpdateOnly != 0 {
 		b.WriteString("update_only=true\n")
+		op.updateOnly = true
 	}
 	if v, ok := attrs[peerAttrPresharedKey]; ok {
 		if len(v) != keyLen {
-			return syserr.ErrInvalidArgument
+			return op, syserr.ErrInvalidArgument
 		}
 		fmt.Fprintf(b, "preshared_key=%x\n", []byte(v))
 	}
 	if v, ok := attrs[peerAttrEndpoint]; ok {
 		ep, err := decodeEndpoint(v)
 		if err != nil {
-			return err
+			return op, err
 		}
 		fmt.Fprintf(b, "endpoint=%s\n", ep)
 	}
 	if v, ok := attrs[peerAttrKeepalive]; ok {
 		secs, ok := v.Uint16()
 		if !ok {
-			return syserr.ErrInvalidArgument
+			return op, syserr.ErrInvalidArgument
 		}
 		fmt.Fprintf(b, "persistent_keepalive_interval=%d\n", secs)
 	}
 	if v, ok := attrs[peerAttrProtoVersion]; ok {
-		if version, ok := v.Uint32(); !ok || version != 1 {
-			return syserr.ErrInvalidArgument
+		version, ok := v.Uint32()
+		if !ok {
+			return op, syserr.ErrInvalidArgument
+		}
+		if version != 1 {
+			return op, errProtocolVersion
 		}
 	}
 	if flags&peerFlagReplaceAllowedIP != 0 {
 		b.WriteString("replace_allowed_ips=true\n")
 	}
 	if v, ok := attrs[peerAttrAllowedIPs]; ok {
-		return parseAllowedIPs(b, nlmsg.AttrsView(v))
+		return op, parseAllowedIPs(b, nlmsg.AttrsView(v))
 	}
-	return nil
+	return op, nil
 }
 
 // decodeEndpoint decodes a struct sockaddr_in or struct sockaddr_in6.

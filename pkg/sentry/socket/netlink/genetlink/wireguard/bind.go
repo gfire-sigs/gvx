@@ -53,7 +53,8 @@ type netBind struct {
 
 	mu      sync.Mutex
 	session *bindSession
-	mark    uint32
+	// port is the port of the open generation, or 0 while the bind is closed.
+	port uint16
 }
 
 // bindSession is one Open generation with its UDP endpoints.
@@ -105,11 +106,39 @@ func (b *netBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 	}
 	b.session = s
+	b.port = actual
 	fns := []conn.ReceiveFunc{receive(s, s.v4)}
 	if s.v6 != nil {
 		fns = append(fns, receive(s, s.v6))
 	}
 	return fns, actual, nil
+}
+
+// localPort returns the port of the open generation, or 0 while the bind is
+// closed.
+func (b *netBind) localPort() uint16 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.port
+}
+
+// probe binds the port for both IP families and releases it at once. A caller
+// uses it to find a busy port before it closes the open generation, because a
+// failed rebind would leave the device without a socket.
+func (b *netBind) probe(port uint16) error {
+	v4, _, err := b.listen(ipv4.ProtocolNumber, port)
+	if err != nil {
+		return err
+	}
+	defer v4.Close()
+	if !b.stack.CheckNetworkProtocol(ipv6.ProtocolNumber) {
+		return nil
+	}
+	v6, _, err := b.listen(ipv6.ProtocolNumber, port)
+	if err != nil {
+		return err
+	}
+	return v6.Close()
 }
 
 // listen opens a UDP endpoint of one IP family on the wildcard address.
@@ -168,6 +197,7 @@ func (b *netBind) Close() error {
 	b.mu.Lock()
 	s := b.session
 	b.session = nil
+	b.port = 0
 	b.mu.Unlock()
 	if s == nil {
 		return nil
@@ -180,14 +210,9 @@ func (b *netBind) Close() error {
 	return nil
 }
 
-// SetMark stores the mark. Netstack has no socket marks, so the mark changes
-// no routing. The device reports the value in the next WG_CMD_GET_DEVICE.
-func (b *netBind) SetMark(mark uint32) error {
-	b.mu.Lock()
-	b.mark = mark
-	b.mu.Unlock()
-	return nil
-}
+// SetMark accepts every mark and changes nothing. Netstack has no socket
+// marks. wireguard-go keeps the value, and WG_CMD_GET_DEVICE reports it.
+func (b *netBind) SetMark(uint32) error { return nil }
 
 // Send writes each buffer as one datagram to ep from the UDP endpoint of the
 // address family of ep.

@@ -94,13 +94,15 @@ func TestParseSetDeviceBuildsTheConfigurationText(t *testing.T) {
 		attrBytes(deviceAttrFlags, le32(deviceFlagReplacePeers)),
 		attrBytes(deviceAttrPeers|linux.NLA_F_NESTED, attrBytes(0|linux.NLA_F_NESTED, peer)),
 	)
-	got, err := parseSetDevice(attrs)
+	plan, err := parseSetDevice(attrs, &deviceInfo{})
 	if err != nil {
 		t.Fatalf("parseSetDevice = %v", err)
 	}
-	want := "replace_peers=true\n" +
-		"fwmark=77\n" +
+	got := plan.conf
+	// The order is the order of wg_set_device in Linux.
+	want := "fwmark=77\n" +
 		"listen_port=51821\n" +
+		"replace_peers=true\n" +
 		"private_key=" + hexKey(0x11) + "\n" +
 		"public_key=" + hexKey(0xaa) + "\n" +
 		"update_only=true\n" +
@@ -114,6 +116,60 @@ func TestParseSetDeviceBuildsTheConfigurationText(t *testing.T) {
 	if got != want {
 		t.Errorf("parseSetDevice =\n%s\nwant\n%s", got, want)
 	}
+	if !plan.changesSocket || plan.probePort != 51821 || plan.peers != 0 {
+		t.Errorf("plan = %+v, want a socket change, the probe of port 51821, and 0 peers (update only of an unknown peer)", plan)
+	}
+}
+
+func TestParseSetDeviceKeepsTheCurrentPort(t *testing.T) {
+	attrs := setAttrs(t, attrBytes(deviceAttrListenPort, le16(51820)))
+	plan, err := parseSetDevice(attrs, &deviceInfo{listenPort: 51820})
+	if err != nil || plan.conf != "" || plan.probePort != 0 || !plan.changesSocket {
+		t.Errorf("parseSetDevice with the current port = (%+v, %v), want no line, no probe, and a socket change", plan, err)
+	}
+	plan, err = parseSetDevice(attrs, &deviceInfo{listenPort: 4000})
+	if err != nil || plan.conf != "listen_port=51820\n" || plan.probePort != 51820 {
+		t.Errorf("parseSetDevice with a new port = (%+v, %v), want the line and a probe", plan, err)
+	}
+	plan, err = parseSetDevice(setAttrs(t, attrBytes(deviceAttrListenPort, le16(0))), &deviceInfo{listenPort: 4000})
+	if err != nil || plan.conf != "listen_port=0\n" || plan.probePort != 0 {
+		t.Errorf("parseSetDevice with port 0 = (%+v, %v), want the line and no probe", plan, err)
+	}
+}
+
+func TestParseSetDeviceCountsThePeersAfterTheRequest(t *testing.T) {
+	cur := &deviceInfo{peers: []peerInfo{{publicKey: [keyLen]byte(key(1))}, {publicKey: [keyLen]byte(key(2))}}}
+	peers := func(entries ...[]byte) map[uint16]nlmsg.BytesView {
+		var list []byte
+		for _, e := range entries {
+			list = append(list, attrBytes(0, e)...)
+		}
+		return setAttrs(t, attrBytes(deviceAttrPeers, list))
+	}
+	entry := func(k byte, flags uint32) []byte {
+		return slices.Concat(attrBytes(peerAttrPublicKey, key(k)), attrBytes(peerAttrFlags, le32(flags)))
+	}
+	for _, tc := range []struct {
+		name  string
+		attrs map[uint16]nlmsg.BytesView
+		want  int
+	}{
+		{"no peers in the request", setAttrs(t), 2},
+		{"a new peer", peers(entry(3, 0)), 3},
+		{"a known peer", peers(entry(1, 0)), 2},
+		{"a removed peer", peers(entry(1, peerFlagRemoveMe)), 1},
+		{"a removal of an unknown peer", peers(entry(9, peerFlagRemoveMe)), 2},
+		{"update only of an unknown peer", peers(entry(9, peerFlagUpdateOnly)), 2},
+		{"update only of a known peer", peers(entry(1, peerFlagUpdateOnly)), 2},
+		{"replace and one peer", setAttrs(t, attrBytes(deviceAttrFlags, le32(deviceFlagReplacePeers)), attrBytes(deviceAttrPeers, attrBytes(0, entry(1, 0)))), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := parseSetDevice(tc.attrs, cur)
+			if err != nil || plan.peers != tc.want {
+				t.Errorf("parseSetDevice = (%+v, %v), want %d peers", plan, err, tc.want)
+			}
+		})
+	}
 }
 
 func TestParseSetDeviceRemoveMeSkipsTheOtherAttributes(t *testing.T) {
@@ -122,12 +178,12 @@ func TestParseSetDeviceRemoveMeSkipsTheOtherAttributes(t *testing.T) {
 		attrBytes(peerAttrFlags, le32(peerFlagRemoveMe)),
 		attrBytes(peerAttrEndpoint, []byte{1, 2, 3}), // invalid, and ignored
 	)
-	got, err := parseSetDevice(setAttrs(t, attrBytes(deviceAttrPeers, attrBytes(0, peer))))
+	plan, err := parseSetDevice(setAttrs(t, attrBytes(deviceAttrPeers, attrBytes(0, peer))), &deviceInfo{})
 	if err != nil {
 		t.Fatalf("parseSetDevice = %v", err)
 	}
-	if want := "public_key=" + hexKey(0xaa) + "\nremove=true\n"; got != want {
-		t.Errorf("parseSetDevice = %q, want %q", got, want)
+	if want := "public_key=" + hexKey(0xaa) + "\nremove=true\n"; plan.conf != want {
+		t.Errorf("parseSetDevice = %q, want %q", plan.conf, want)
 	}
 }
 
@@ -149,7 +205,7 @@ func TestParseSetDeviceRejectsInvalidRequests(t *testing.T) {
 		{"short preshared key", peerWith(attrBytes(peerAttrPresharedKey, key(1)[:3])), syserr.ErrInvalidArgument},
 		{"endpoint of the wrong size", peerWith(attrBytes(peerAttrEndpoint, make([]byte, 20))), syserr.ErrInvalidArgument},
 		{"endpoint of another family", peerWith(attrBytes(peerAttrEndpoint, append(le16(linux.AF_UNIX), make([]byte, 14)...))), syserr.ErrInvalidArgument},
-		{"protocol version 2", peerWith(attrBytes(peerAttrProtoVersion, le32(2))), syserr.ErrInvalidArgument},
+		{"protocol version 2", peerWith(attrBytes(peerAttrProtoVersion, le32(2))), errProtocolVersion},
 		{"IPv4 prefix of 33 bits", peerWith(attrBytes(peerAttrAllowedIPs, allowedIPAttr(linux.AF_INET, []byte{1, 2, 3, 4}, 33))), syserr.ErrInvalidArgument},
 		{"IPv6 prefix of 129 bits", peerWith(attrBytes(peerAttrAllowedIPs, allowedIPAttr(linux.AF_INET6, make([]byte, 16), 129))), syserr.ErrInvalidArgument},
 		{"IPv4 family with an IPv6 address", peerWith(attrBytes(peerAttrAllowedIPs, allowedIPAttr(linux.AF_INET, make([]byte, 16), 8))), syserr.ErrInvalidArgument},
@@ -157,8 +213,8 @@ func TestParseSetDeviceRejectsInvalidRequests(t *testing.T) {
 		{"unknown allowed IP flag", peerWith(attrBytes(peerAttrAllowedIPs, allowedIPAttr(linux.AF_INET, []byte{1, 2, 3, 4}, 8, 2))), syserr.ErrInvalidArgument},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, err := parseSetDevice(tc.attrs); err != tc.want {
-				t.Errorf("parseSetDevice = (%q, %v), want %v", got, err, tc.want)
+			if plan, err := parseSetDevice(tc.attrs, &deviceInfo{}); err != tc.want {
+				t.Errorf("parseSetDevice = (%+v, %v), want %v", plan, err, tc.want)
 			}
 		})
 	}
