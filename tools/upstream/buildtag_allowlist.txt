@@ -87,6 +87,7 @@ seam pkg/sentry/fsimpl/proc/task_net.go
 # Content seams: RTM_SETLINK accepts the hairpin mode of a bridge port
 # (pkg/sentry/socket/netstack/bridgeport_xplat.go), and RTM_NEWLINK of a link kind
 # that the stack does not create calls the registry of pkg/sentry/socket/netstack/linkkind_xplat.go.
+# newVeth wraps each veth end with newHostFilterEndpoint (pkg/sentry/socket/netstack/hostfilter_xplat.go).
 seam pkg/sentry/socket/netstack/stack.go
 # Content seam: RTM_GETLINK reports IFLA_STATS64 (pkg/sentry/socket/netlink/route/link_stats_xplat.go).
 seam pkg/sentry/socket/netlink/route/protocol.go
@@ -123,6 +124,8 @@ seam pkg/sentry/syscalls/linux/sys_file.go
 # Content seams: New TCP endpoints start with the keepalive defaults of the stack, which
 # net.ipv4.tcp_keepalive_time, tcp_keepalive_intvl, and tcp_keepalive_probes set
 # (pkg/tcpip/transport/tcp/keepalive_xplat.go and pkg/tcpip/keepalive_xplat.go).
+# An endpoint that bound the wildcard address releases its port under that address after connect
+# (pkg/tcpip/transport/tcp/bindaddr_xplat.go).
 seam pkg/tcpip/transport/tcp/protocol.go
 seam pkg/tcpip/transport/tcp/endpoint.go
 
@@ -139,6 +142,22 @@ seam pkg/sentry/kernel/task_exit.go
 # limit sets for its own kernel (pkg/sentry/kernel/total_memory_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks_files.go
 seam pkg/sentry/syscalls/linux/sys_sysinfo.go
+
+# Content seams: the service data path of a Kubernetes node (GVXIP-005, P2).
+# A bridge that forwards an IP frame runs the iptables hooks first when bridge-nf-call-iptables is 1
+# (pkg/tcpip/stack/bridge_netfilter_xplat.go). The forwarding decisions of the bridge live in
+# pkg/tcpip/stack/bridge_forward_xplat.go.
+seam pkg/tcpip/stack/bridge.go
+# A SYN on a TCP connection in TIME_WAIT or CLOSE starts a new connection
+# (pkg/tcpip/stack/conntrack_xplat.go). The seam is one call in getConnAndUpdate.
+seam pkg/tcpip/stack/conntrack.go
+# NETLINK_NETFILTER opens without nftables and serves the subsystem CTNETLINK
+# (pkg/sentry/socket/netlink/netfilter/ctnetlink_xplat.go).
+seam pkg/sentry/socket/netlink/netfilter/protocol.go
+# A netlink dump sends one chunk for each datagram that a reader consumes, as Linux does
+# (pkg/sentry/socket/netlink/dump_xplat.go). The seams are the dump field of the socket, one call
+# each in Release, Read, and RecvMsg, and the start of a dump in ProcessMessages.
+seam pkg/sentry/socket/netlink/socket.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin

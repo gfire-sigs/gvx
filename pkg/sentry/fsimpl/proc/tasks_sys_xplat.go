@@ -29,6 +29,8 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sync"
+	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
@@ -284,13 +286,75 @@ func boolToInt32(b bool) int32 {
 	return 0
 }
 
+// bridgeNetfilterStack is a network stack whose bridges pass the IP frames that
+// they forward through the iptables hooks. See stack.Stack.SetBridgeNetfilter.
+type bridgeNetfilterStack interface {
+	BridgeNetfilter(protocol tcpip.NetworkProtocolNumber) bool
+	SetBridgeNetfilter(protocol tcpip.NetworkProtocolNumber, enable bool)
+}
+
+// nsBridgeNetfilter is bridge-nf-call-iptables or bridge-nf-call-ip6tables. The
+// value belongs to the network namespace of the caller. At 1, a bridge of that
+// namespace passes the IP frames that it forwards between two ports through
+// the iptables hooks. Any non-zero write stores 1, as on Linux.
+type nsBridgeNetfilter struct {
+	kernfs.DynamicBytesFile
+
+	// stack is the stack of the root network namespace. It serves a caller that
+	// has no network namespace of its own.
+	stack    inet.Stack
+	protocol tcpip.NetworkProtocolNumber
+}
+
+var _ vfs.WritableDynamicBytesSource = (*nsBridgeNetfilter)(nil)
+
+func (f *nsBridgeNetfilter) bridgeStack(ctx context.Context) (bridgeNetfilterStack, error) {
+	s, ok := sysctlStack(ctx, f.stack).(bridgeNetfilterStack)
+	if !ok {
+		return nil, linuxerr.ENOENT
+	}
+	return s, nil
+}
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (f *nsBridgeNetfilter) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	s, err := f.bridgeStack(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(buf, "%d\n", boolToInt32(s.BridgeNetfilter(f.protocol)))
+	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (f *nsBridgeNetfilter) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, buf)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	s, err := f.bridgeStack(ctx)
+	if err != nil {
+		return 0, err
+	}
+	s.SetBridgeNetfilter(f.protocol, buf[0] != 0)
+	return n, nil
+}
+
 // sysBridgeNetfilterFiles returns the files of /proc/sys/net/bridge. dockerd
 // requires bridge-nf-call-iptables when it runs without the userland proxy.
-// The values are stored only. The bridge of the stack forwards Ethernet frames
-// and does not pass them through iptables, so these values do not change how
-// the guest filters bridged traffic.
-func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Credentials) map[string]kernfs.Inode {
+// The files for iptables and ip6tables switch the iptables hooks for the
+// bridged IP frames of the network namespace. The other files store their
+// values only.
+func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Credentials, stack inet.Stack) map[string]kernfs.Inode {
 	files := make(map[string]kernfs.Inode)
+	if _, ok := stack.(bridgeNetfilterStack); ok {
+		files["bridge-nf-call-iptables"] = fs.newInode(ctx, root, 0644, &nsBridgeNetfilter{stack: stack, protocol: header.IPv4ProtocolNumber})
+		files["bridge-nf-call-ip6tables"] = fs.newInode(ctx, root, 0644, &nsBridgeNetfilter{stack: stack, protocol: header.IPv6ProtocolNumber})
+	}
 	for name, initial := range map[string]int32{
 		"bridge-nf-call-arptables":      1,
 		"bridge-nf-call-ip6tables":      1,
@@ -299,6 +363,9 @@ func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Cr
 		"bridge-nf-filter-vlan-tagged":  0,
 		"bridge-nf-pass-vlan-input-dev": 0,
 	} {
+		if _, ok := files[name]; ok {
+			continue
+		}
 		val := new(atomicbitops.Int32)
 		val.Store(initial)
 		files[name] = fs.newInode(ctx, root, 0644, &boolSysctlFile{val: val})
@@ -312,7 +379,7 @@ func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Cr
 func (fs *filesystem) sysNetXplatFiles(ctx context.Context, root *auth.Credentials, stack inet.Stack, path string) (map[string]kernfs.Inode, bool) {
 	switch {
 	case path == "net/bridge":
-		return fs.sysBridgeNetfilterFiles(ctx, root), true
+		return fs.sysBridgeNetfilterFiles(ctx, root, stack), true
 	case path == "net/netfilter":
 		return make(map[string]kernfs.Inode), true
 	}

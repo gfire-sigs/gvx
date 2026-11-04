@@ -104,6 +104,10 @@ type Socket struct {
 	// sent to userspace.
 	connection transport.Sender
 
+	// dump runs the request with the NLM_F_DUMP flag in chunks, one for each
+	// datagram that a reader consumes (dump_xplat.go).
+	dump dumpState `state:"nosave"`
+
 	// netns is the network namespace associated with the socket.
 	// A netlink socket is immutably bound to a network namespace.
 	netns *inet.Namespace
@@ -187,6 +191,7 @@ func (s *Socket) NetworkNamespace() *inet.Namespace {
 // Release implements vfs.FileDescriptionImpl.Release.
 // +checklocksignore: we don't have to hold locks during Release.
 func (s *Socket) Release(ctx context.Context) {
+	s.cancelDump()
 	if s.groups.Load() != 0 {
 		s.netns.NetlinkMcastTable().WithTableLocked(func() {
 			s.netns.NetlinkMcastTable().RemoveSocket(s)
@@ -231,6 +236,7 @@ func (s *Socket) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.Read
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
+	defer s.dumpAfterRecv(ctx, int(dst.NumBytes()), true /* consumed */)
 	r := unix.EndpointReader{
 		Endpoint: s.ep,
 	}
@@ -794,6 +800,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 	fromLen := uint32(from.SizeBytes())
 
 	trunc := flags&linux.MSG_TRUNC != 0
+	defer s.dumpAfterRecv(t, int(dst.NumBytes()), flags&linux.MSG_PEEK == 0)
 
 	r := unix.EndpointReader{
 		Ctx:      t,
@@ -982,9 +989,10 @@ func (s *Socket) ProcessMessages(ctx context.Context, buf []byte) *syserr.Error 
 		}
 
 		ms := nlmsg.NewMessageSet(s.GetPortID(), hdr.Seq)
-		if err := s.protocol.ProcessMessage(ctx, s, msg, ms); err != nil {
+		dumping, err := s.startDump(ctx, hdr, s.protocol.ProcessMessage(ctx, s, msg, ms))
+		if err != nil {
 			DumpErrorMessage(hdr, ms, err)
-		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK && !ms.Multi {
+		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK && !ms.Multi && !dumping {
 			// Linux does not ack a dump that started. See
 			// net/netlink/af_netlink.c:netlink_rcv_skb.
 			DumpAckMessage(hdr, ms)
