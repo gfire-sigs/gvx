@@ -36,6 +36,8 @@
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
+//	nodeprobe tput HOST:PORT MIB     measure the TCP download and upload rate of
+//	                                 MIB MiB against a server at HOST:PORT
 //	nodeprobe stats HOST:PORT        check link and disk statistics; the probe
 //	                                 reads from a TCP server at HOST:PORT
 package main
@@ -93,6 +95,17 @@ func main() {
 		checks = wgLimitsChecks()
 	case "vxlan":
 		checks = vxlanChecks()
+	case "tput":
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe tput HOST:PORT MIB")
+			os.Exit(2)
+		}
+		mib, err := strconv.Atoi(os.Args[3])
+		if err != nil || mib <= 0 {
+			fmt.Fprintln(os.Stderr, "tput: MIB must be a positive number")
+			os.Exit(2)
+		}
+		checks = tputChecks(os.Args[2], mib)
 	case "wgchild":
 		if err := wgChild(); err != nil {
 			fmt.Fprintln(os.Stderr, "wgchild:", err)
