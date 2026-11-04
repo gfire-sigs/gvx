@@ -123,6 +123,10 @@ type protocol struct {
 	maxRetries uint32
 	// +checklocks:mu
 	synRetries uint8
+	// keepaliveDefaults holds the keepalive parameters of new endpoints. See
+	// keepalive_xplat.go.
+	// +checklocks:mu
+	keepaliveDefaults tcpip.TCPKeepaliveDefaultsOption `state:"nosave"`
 
 	dispatcher dispatcher
 
@@ -346,6 +350,9 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 		p.mu.Unlock()
 		return nil
 
+	case *tcpip.TCPKeepaliveDefaultsOption:
+		return p.setKeepaliveDefaults(*v)
+
 	case *tcpip.TCPTimeWaitTimeoutOption:
 		p.mu.Lock()
 		if *v < 0 {
@@ -479,6 +486,10 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 		p.mu.RLock()
 		*v = tcpip.TCPLingerTimeoutOption(p.lingerTimeout)
 		p.mu.RUnlock()
+		return nil
+
+	case *tcpip.TCPKeepaliveDefaultsOption:
+		*v = p.getKeepaliveDefaults()
 		return nil
 
 	case *tcpip.TCPTimeWaitTimeoutOption:
@@ -629,6 +640,11 @@ func newProtocol(s *stack.Stack, cc string, probe TCPProbeFunc) stack.TransportP
 		seqnumSecret:               seqnumSecret,
 		tsOffsetSecret:             tsOffsetSecret,
 		probe:                      probe,
+	}
+	p.keepaliveDefaults = tcpip.TCPKeepaliveDefaultsOption{
+		Idle:     DefaultKeepaliveIdle,
+		Interval: DefaultKeepaliveInterval,
+		Count:    DefaultKeepaliveCount,
 	}
 	p.dispatcher.init(s.InsecureRNG(), gomaxprocs.Base())
 	return &p

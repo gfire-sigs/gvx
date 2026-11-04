@@ -110,6 +110,12 @@ seam pkg/sentry/syscalls/linux/sys_inotify.go
 # modes KEEP_SIZE, PUNCH_HOLE, and, on ext4lite, ZERO_RANGE, COLLAPSE_RANGE, and INSERT_RANGE.
 seam pkg/sentry/syscalls/linux/sys_file.go
 
+# Content seams: New TCP endpoints start with the keepalive defaults of the stack, which
+# net.ipv4.tcp_keepalive_time, tcp_keepalive_intvl, and tcp_keepalive_probes set
+# (pkg/tcpip/transport/tcp/keepalive_xplat.go and pkg/tcpip/keepalive_xplat.go).
+seam pkg/tcpip/transport/tcp/protocol.go
+seam pkg/tcpip/transport/tcp/endpoint.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin
