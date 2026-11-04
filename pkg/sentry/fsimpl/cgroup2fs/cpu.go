@@ -59,6 +59,10 @@ type cpu struct {
 	// periodUSec is the CPU period limit representing the cpu.max period.
 	// +checkatomic
 	periodUSec atomicbitops.Int64
+
+	// bandwidth is the CPU budget that enforces maxUSec and periodUSec. See
+	// cpu_xplat.go.
+	bandwidth cpuBandwidth `state:"nosave"`
 }
 
 // canEnter implements controller.canEnter.
@@ -237,7 +241,8 @@ func (cstat *cpuStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	usageUSec := (cs.UserTime + cs.SysTime).Microseconds()
 	userUSec := cs.UserTime.Microseconds()
 	sysUSec := cs.SysTime.Microseconds()
-	fmt.Fprintf(buf, "usage_usec %d\nuser_usec %d\nsystem_usec %d\nnice_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n", usageUSec, userUSec, sysUSec)
+	bw := cstat.cc.bandwidthNode().Stats()
+	fmt.Fprintf(buf, "usage_usec %d\nuser_usec %d\nsystem_usec %d\nnice_usec 0\nnr_periods %d\nnr_throttled %d\nthrottled_usec %d\nnr_bursts 0\nburst_usec 0\n", usageUSec, userUSec, sysUSec, bw.Periods, bw.Throttled, bw.ThrottledTime.Microseconds())
 	return nil
 }
 
@@ -260,7 +265,7 @@ func (cm *cpuMax) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 //
-// Note: Although cpu.max is writable and remembers the value, nothing is enforced.
+// The Sentry enforces the value with the CPU bandwidth model of Linux. See cpu_xplat.go.
 func (cm *cpuMax) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if src.NumBytes() > 1024 {
 		return 0, linuxerr.EINVAL
@@ -297,8 +302,9 @@ func (cm *cpuMax) Write(ctx context.Context, _ *vfs.FileDescription, src usermem
 		period = cm.cc.periodUSec.Load()
 	}
 
-	cm.cc.maxUSec.Store(quota)
-	cm.cc.periodUSec.Store(period)
+	if err := cm.cc.setMax(quota, period); err != nil {
+		return 0, err
+	}
 	return int64(len(buf)), nil
 }
 
@@ -339,6 +345,7 @@ func (cw *cpuWeight) Write(ctx context.Context, _ *vfs.FileDescription, src user
 // detach implements controller.detach.
 func (cc *cpu) detach() {
 	cc.detached.Store(true)
+	cc.releaseBandwidth()
 }
 
 // isActive implements controller.isActive.
