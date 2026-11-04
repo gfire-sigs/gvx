@@ -231,7 +231,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `--name` | Sets the container ID of the kernel and nothing else. |
 | Image with a Docker manifest schema 1 | Refused with a message. Docker 28 and later also refuse it. Rebuild or re-push the image. |
 | `docker save` of any image | The command needs the registry that the image came from. |
-| Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. In the guest, `memory.max` of a nested cgroup ends processes with a delay. The Windows `systrap` engine does not enforce it. `memory.high`, `cpu.max`, and `cpu.weight` of a nested cgroup are not enforced. |
+| Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. In the guest, `memory.max` of a nested cgroup ends processes with a delay. The Windows `systrap` engine does not enforce it. `cpu.max` of a nested cgroup holds on every engine. `memory.high` and `cpu.weight` of a nested cgroup are not enforced. |
 | Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
