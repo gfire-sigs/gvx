@@ -59,6 +59,8 @@ This release adds the Linux kernel interfaces that the `kubelet`, `containerd`, 
 - **Busy loops that cannot stop on the Windows `systrap` engine**: `Interrupt` stops a running thread with the single-step flag. The step exception clears that flag. When the step landed in engine code, the engine continued the thread without the flag. The thread then ran on, and every later `Interrupt` returned without a stop.
   - A guest loop without system calls then ignored `SIGKILL`, and the sandbox did not exit. The engine now sets the flag again before it continues the thread.
   - The code is shared by `windows/amd64` and `windows/arm64`. The hang showed on `windows/amd64`.
+- **A write to a private mapping of a file on a volume or bind mount stopped the Sentry on Windows**: the first write to a private file mapping on a `hostfs` or `ext4lite` file ended with `panic: invalid allocation length: 0x0`. The Windows `systrap` engine keeps each 64 KiB chunk of such a file in its own range of the memory file, so the file returns one translation for each chunk. A translation can end before the faulting page. The Sentry then broke copy-on-write for that translation and asked for a copy of 0 bytes.
+  - A `k3s` server on `windows/arm64` ended with this panic. The Sentry now breaks copy-on-write only for the translation that holds the faulting page. Other platforms keep a chunk in one range and never showed the panic.
 
 ### Behavior Changes
 

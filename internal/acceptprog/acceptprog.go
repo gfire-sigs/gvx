@@ -63,6 +63,7 @@ const (
 	cpuMaxPackage      = "z.gfire.dev/gvx/internal/acceptprog/cpumaxprobe"
 	eintrPackage       = "z.gfire.dev/gvx/internal/acceptprog/eintrprobe"
 	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
+	cowProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/cowprobe"
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
@@ -330,6 +331,14 @@ func BuildCPUMaxProbe(tb testing.TB, goarch string) string {
 func BuildCodeWrite(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, codeWritePackage, "codewrite", goarch, 0)
+}
+
+// BuildCOWProbe compiles the guest cowprobe, which writes first to a private file
+// mapping at a chunk boundary of its file, for the Linux architecture goarch
+// and returns the path of the static ET_EXEC executable.
+func BuildCOWProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, cowProbePackage, "cowprobe", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel
