@@ -66,8 +66,14 @@ ready=$(( $(date +%s) - start ))
 node=$(k get nodes -o jsonpath='{.items[0].metadata.name}')
 log "NODE-READY $node $ready"
 
-wait_ready() { # namespace selector timeout
-  k -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="$3" >/dev/null 2>&1
+# wait_ready waits until pods of the selector exist and are Ready.
+wait_ready() { # namespace selector seconds
+  t0=$(date +%s)
+  until [ -n "$(k -n "$1" get pods -l "$2" -o name 2>/dev/null)" ]; do
+    [ $(( $(date +%s) - t0 )) -ge "$3" ] && return 1
+    sleep 2
+  done
+  k -n "$1" wait --for=condition=Ready pod -l "$2" --timeout="$(( $3 - ($(date +%s) - t0) ))s" >/dev/null 2>&1
 }
 
 if [ "$PHASE" = 2 ]; then
@@ -79,11 +85,12 @@ fi
 
 if [ "$ready" -le 120 ]; then log "B1-OK"; else fail "B1 Ready after ${ready}s"; fi
 
-if wait_ready kube-system k8s-app=kube-dns 300s && wait_ready kube-system app=local-path-provisioner 300s; then
+if wait_ready kube-system k8s-app=kube-dns 300 && wait_ready kube-system app=local-path-provisioner 300; then
   log "B2-SYSTEM-OK"
 else
-  fail "B2 system pods"; k get pods -A
+  fail "B2 system pods"; k get pods -A -o wide; k -n kube-system describe pod -l k8s-app=kube-dns | tail -30
 fi
+until k get serviceaccount default >/dev/null 2>&1; do sleep 1; done
 
 cat <<'EOF' | k apply -f - >/dev/null
 apiVersion: apps/v1
@@ -165,7 +172,7 @@ else
   fail "B2 web not ready"; k get pods -o wide
 fi
 k rollout status deploy/solo --timeout=300s >/dev/null 2>&1
-wait_ready default 'app!=web,app!=solo' 300s
+wait_ready default 'app!=web,app!=solo' 300
 
 # B3: both endpoints answer within 50 requests.
 names=$(k exec client -- sh -c 'for i in $(seq 1 50); do curl -s -m 3 http://web/hostname; echo; done' | sort -u | grep -c .)
@@ -193,7 +200,7 @@ read -r go
 # B6: name resolution works again within 10 seconds after a CoreDNS restart.
 k -n kube-system delete pod -l k8s-app=kube-dns --wait=false >/dev/null
 sleep 2
-wait_ready kube-system k8s-app=kube-dns 300s
+wait_ready kube-system k8s-app=kube-dns 300
 t0=$(date +%s)
 ok=0
 while [ $(( $(date +%s) - t0 )) -le 10 ]; do
@@ -265,7 +272,7 @@ for i in $(seq 1 90); do
   if k top node >/dev/null 2>&1 && k top pod -A >/dev/null 2>&1; then ok=1; break; fi
   sleep 2
 done
-if [ "$ok" = 1 ]; then log "B10-OK"; else fail "B10 metrics"; k top node; fi
+if [ "$ok" = 1 ]; then log "B10-OK"; else fail "B10 metrics"; k top node; k -n kube-system logs deploy/metrics-server --tail=20; k get --raw /api/v1/nodes/$node/proxy/stats/summary | head -c 600; echo; fi
 
 log "PHASE1-DONE"
 `
