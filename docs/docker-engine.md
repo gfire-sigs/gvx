@@ -153,7 +153,8 @@ Use the `ext4lite` volume unless you need the files as host files. The volume im
 | `10.0.2.15` from a container | A `bridge` container cannot connect to the `eth0` address of the sandbox. Use the container address or a user-defined network. |
 | `docker stats` | Shows the memory, the CPU time, and the network counters of a container. The memory is `memory.current`, which counts page cache and mapped pages too. A container that wrote 64 MiB showed 64 MiB on `hvf` and 101 MiB on Linux systrap. `BLOCK I/O` stays at `0B / 0B`, because the guest has no `io` controller. |
 | `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the highest score when the use passes the limit. Section 6.4 gives the details. |
-| `--memory-reservation`, `--memory-swap`, `--cpus`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
+| `docker run --cpus` | `--cpus` becomes `cpu.max`, and the Sentry enforces it. Section 6.5 gives the details. |
+| `--memory-reservation`, `--memory-swap`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
 | `--icc=false` | `dockerd` starts with it, but the bridge does not pass frames through `iptables`. Two containers of one bridge can still reach each other. |
 
 ### 6.3 Security
@@ -174,4 +175,21 @@ A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentr
 | Held after the kill | Data in `tmpfs` files stays charged to the container. The enforcer waits for the usage to drop to the limit after a kill. When tmpfs data keeps the usage above the limit, it kills the next process after two more checks. |
 | Counted memory | The enforcer compares anonymous memory plus tmpfs data with the limit. Page cache, mapped file pages, and freed pages that the Sentry has not decommitted yet do not count, as they are reclaimable or free in Linux. `memory.current` and `docker stats` still show every kind, so they read higher than the enforced value. Measured idle values: an idle Go process holds 1.8 MiB (`linux/amd64` systrap), 1.5 MiB (`linux/arm64` systrap), and 2.7 MiB (`hvf`) of this memory. An `alpine` container that runs `sleep` holds 40 KiB to 60 KiB. `whpx` is not measured. |
 | Windows `systrap` | The enforcer stays off. The engine runs guest code in stub processes, and the Sentry counts a page through the working set of its own process, so a page that only a stub wrote can stay uncounted. `memory.stat` and `memory.current` can show too little. `memory.max` is stored and not enforced. |
-| Not enforced | `memory.high`, `cpu.max`, `cpu.weight`, and `memory.swap.*`. |
+| Not enforced | `memory.high`, `cpu.weight`, and `memory.swap.*`. |
+
+### 6.5 CPU Limits of Containers
+
+A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value is `N * 100000` microseconds of quota for each period of 100000 microseconds. The tasks of the container, and of its child cgroups, use the quota together on all CPUs. A task that spends the quota stops at its next return to guest code. It runs again when the next period starts. A child cgroup obeys the quota of every ancestor.
+
+| Property | Value |
+| :--- | :--- |
+| Accounting | The Sentry bills CPU time in ticks of 10 ms. A tick goes to each running task that the Sentry samples, up to one task for each CPU that the guest sees. `cpu.stat` and `cpu.max` use the same ticks. |
+| Result | `cpu.stat` reports `nr_periods`, `nr_throttled`, and `throttled_usec` for each cgroup that has a limit. A cgroup without its own limit reports 0 throttles, because only the cgroup with the limit throttles. |
+| Measured | A busy loop in a cgroup with `cpu.max` at `50000 100000` used 0.50 CPU over 5 seconds by `usage_usec`, with a spread of 0.498 to 0.502, on `hvf`, `whpx`, Linux `systrap` (`amd64` and `arm64`), and Windows `systrap` (`amd64` and `arm64`). A child with `max` under a parent at `50000 100000` used 0.50 CPU too. |
+| Cost | The system call `getpid` on `hvf` took 1,217 ns before the change and 1,203 ns after it, as the median of 9 runs averaged over 3 rounds. A finite limit in another cgroup left it at 1,204 ns. While a busy loop in another cgroup was throttled, it took 1,231 ns (+2.3%). |
+| Granularity | A tick is 10 ms. The quota ends at a tick, so a task can run less than the quota in a period. In the runs above, `throttled_usec` was 2.66 s to 2.84 s of the 5 seconds, so the loop ran 0.43 to 0.47 of the wall time while `usage_usec` read 0.50. |
+| System time | A task in a system call keeps running, as in Linux. The system call counts toward the quota, and the task stops when it returns to guest code. |
+| Period and quota | Linux limits apply. A period is 1 ms to 1 s, and a quota is 1 ms or more. Other values give `EINVAL`. |
+| Write to `cpu.max` | A new value starts a new period with a full quota and releases a throttled task at once. |
+| Unlimited | `max` removes the limit. A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. |
+| Not enforced | `cpu.weight` and `cpu.max.burst`. |

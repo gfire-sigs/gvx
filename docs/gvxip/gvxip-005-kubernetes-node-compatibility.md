@@ -18,7 +18,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 | P1 | Kernel interfaces of `kubelet` and the container runtime | A1 to A7 pass on every platform. The B tests are not automated yet. |
 | P2 | Service data path (`statistic`, bridge netfilter, `ctnetlink`) | Not started |
 | P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Not started |
-| P4 | Enforcement of `cpu.max` | Not started |
+| P4 | Enforcement of `cpu.max` | A14 passes on every platform of section 4.4. B9 and B10 wait for `k3s`. |
 
 ---
 
