@@ -302,6 +302,59 @@ func TestE2ENetfilterConntrackReopensClosedTCP(t *testing.T) {
 	}
 }
 
+// bridgeLocalDNATScript builds a bridge with two network namespaces. ns2 answers
+// the neighbor request for the virtual address 10.0.0.100, so ns1 sends the
+// frames of its connection to the Ethernet address of ns2, and the bridge
+// forwards them. A DNAT rule moves 10.0.0.100 port 80 to the port 8080 of the
+// bridge address 10.0.0.1, where the root namespace serves.
+const bridgeLocalDNATScript = `set -e
+apk add --no-cache iptables iptables-legacy iproute2 conntrack-tools >/dev/null
+cp /workspace/svcprobe /usr/local/bin/svcprobe
+chmod 755 /usr/local/bin/svcprobe
+ipt=iptables-legacy
+ip link add br0 type bridge
+ip addr add 10.0.0.1/24 dev br0
+ip link set br0 up
+for n in 1 2; do
+  ip netns add ns$n
+  ip link add v$n type veth peer name p$n
+  ip link set p$n netns ns$n
+  ip link set v$n master br0
+  ip link set v$n up
+  ip netns exec ns$n ip addr add 10.0.0.$((n+1))/24 dev p$n
+  ip netns exec ns$n ip link set p$n up
+done
+ip netns exec ns2 ip addr add 10.0.0.100/32 dev p2
+svcprobe serve [::]:8080 root &
+for i in $(seq 1 60); do svcprobe dial [::1]:8080 >/dev/null 2>&1 && break; sleep 0.5; done
+$ipt -t nat -A PREROUTING -d 10.0.0.100 -p tcp --dport 80 -j DNAT --to-destination 10.0.0.1:8080
+for i in 1 2 3; do echo "dial$i $(ip netns exec ns1 svcprobe dial 10.0.0.100:80 || true)"; done
+echo "CONNTRACK $(conntrack -L -p tcp 2>&1)"
+`
+
+// TestE2ENetfilterBridgeDNATToBridgeAddress checks that a DNAT rule moves a
+// bridged connection to an address of the bridge itself. The connection
+// succeeds, the server sees the client address, and the connection table lists
+// the flow with the virtual address as its original destination.
+func TestE2ENetfilterBridgeDNATToBridgeAddress(t *testing.T) {
+	for _, b := range gateBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireBackend(t, b)
+			requireRegistry(t)
+			out := runServicePathGuest(t, b, map[string]string{"svcprobe": acceptprog.BuildSvcProbe(t, hostArch())}, bridgeLocalDNATScript)
+			requireContains(t, "guest output", out,
+				"dial1 REPLY root from=10.0.0.2\n",
+				"dial2 REPLY root from=10.0.0.2\n",
+				"dial3 REPLY root from=10.0.0.2\n",
+				"dst=10.0.0.100 sport=",
+				"dport=80 ")
+			if strings.Contains(out, "dial1 ERROR") {
+				t.Errorf("the first connection failed; guest output:\n%s", out)
+			}
+		})
+	}
+}
+
 // iccScript starts dockerd with the option in $1 and connects from one
 // container to a server container of the same bridge.
 const iccScript = `dockerd-entrypoint.sh --tls=false $1 >/tmp/dockerd.log 2>&1 &
