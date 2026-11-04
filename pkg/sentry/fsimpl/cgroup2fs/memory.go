@@ -95,7 +95,7 @@ func (m *memory) interfaceFiles() []interfaceFile {
 			},
 		},
 		{name: "memory.current", source: &memoryCurrent{m: m}, perm: 0444},
-		{name: "memory.stat", source: &memoryStat{m: m}, perm: 0444},
+		{name: "memory.stat", source: &memoryStat{m: m}, perm: 0444, showAtRoot: true},
 		{name: "memory.max", source: &memoryMax{m: m}, perm: 0644},
 		{name: "memory.high", source: &memoryHigh{m: m}, perm: 0644},
 		{name: "memory.oom.group", source: &memoryOOMGroup{m: m}, perm: 0644, nsDelegatable: true},

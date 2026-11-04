@@ -40,6 +40,9 @@ func TestE2ECPUMaxEnforcement(t *testing.T) {
 		"cpu-max-small-quota-bills-and-delivers-the-same-time",
 		"cpu-max-raised-to-max-resumes-task", "cpu-max-moving-task-to-free-cgroup-resumes-it",
 		"cpu-max-disabling-controller-resumes-task",
+		"cpu-stat-usage-of-parent-includes-children",
+		"cpu-stat-usage-of-parent-keeps-removed-children",
+		"memory-stat-exists-at-root",
 	}
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {

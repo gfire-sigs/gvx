@@ -143,12 +143,31 @@ func (c *cgroup) CPUBandwidth() *kernel.CPUBandwidth {
 }
 
 // releaseCPUBandwidth removes the CPU limit of a cgroup that the user removes.
+// It also adds the CPU time that the cgroup counted to the nearest cpu controller
+// above it, as Linux does: the usage of a parent includes the usage of the
+// cgroups that it had.
 //
 // +checklocksread:c.fs.treeMu
 func (c *cgroup) releaseCPUBandwidth() {
-	if cc, ok := c.ctrls[kernel.Cgroup2CPU].(*cpu); ok { // +checklocksforce: caller holds the tree lock
-		cc.releaseBandwidth()
+	cc, ok := c.ctrls[kernel.Cgroup2CPU].(*cpu) // +checklocksforce: caller holds the tree lock
+	if !ok {
+		return
 	}
+	cc.releaseBandwidth()
+	if c.parent == nil {
+		return
+	}
+	newCPU, ok := c.parent.closestCtrls.Load()[kernel.Cgroup2CPU].(*cpu)
+	if !ok {
+		return
+	}
+	cc.mu.Lock()
+	removed := cc.usage
+	cc.usage = usage.CPUStats{}
+	cc.mu.Unlock()
+	newCPU.mu.Lock()
+	newCPU.usage.Accumulate(removed)
+	newCPU.mu.Unlock()
 }
 
 // taskCPUStats returns the CPU time of t for the accounting of cpu.stat. The
