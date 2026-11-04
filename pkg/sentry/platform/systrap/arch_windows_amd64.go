@@ -548,7 +548,11 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	}
 	sum := th.ctx.registerSum()
 	if th.fsFix.pc == pc && th.fsFix.sum == sum && th.fsFix.n >= fsRepairLimit {
-		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x without progress", th.sp.pid, th.tid, th.fsFix.n, pc)
+		text := "undecodable"
+		if inst, err := decodeX86(code); err == nil {
+			text = x86asm.GNUSyntax(inst, pc, nil)
+		}
+		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x without progress: fs %#x, fault at %#x, access %d, code % x (%s)", th.sp.pid, th.tid, th.fsFix.n, pc, fs, ev.Info[1], ev.Info[0], code, text)
 		return false
 	}
 	if err := th.goThroughTrampoline(fs); err != nil {
