@@ -38,6 +38,12 @@ import (
 // registry. The tests set no flag and use no setting that is specific to
 // Kubernetes.
 
+// nodeProbeNewMu serializes the creation of sandboxes, so that the tests that
+// run several sandboxes at once start the runs together and not the creation.
+// Two whpx partitions that a process creates at the same time can fail in
+// WHvMapGpaRange.
+var nodeProbeNewMu sync.Mutex
+
 // runNodeProbe runs nodeprobe with args in a sandbox. setup changes the
 // configuration, or is nil.
 func runNodeProbe(t *testing.T, b gateBackend, bin string, setup func(*gvx.Config), args ...string) (int, string) {
@@ -58,7 +64,9 @@ func runNodeProbe(t *testing.T, b gateBackend, bin string, setup func(*gvx.Confi
 	if setup != nil {
 		setup(&cfg)
 	}
+	nodeProbeNewMu.Lock()
 	sb, err := gvx.New(ctx, cfg)
+	nodeProbeNewMu.Unlock()
 	skipWhenFixedAddressRefused(t, "New(nodeprobe)", err)
 	defer func() {
 		if err := sb.Close(); err != nil {
