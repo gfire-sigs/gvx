@@ -984,6 +984,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err := memdev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register memdev: %w", err)
 	}
+	if err := memdev.RegisterKmsg(vfsObj); err != nil {
+		return 1, fmt.Errorf("gvx: register /dev/kmsg: %w", err)
+	}
 	if err := ttydev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register ttydev: %w", err)
 	}
