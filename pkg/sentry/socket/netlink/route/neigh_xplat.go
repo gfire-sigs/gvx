@@ -43,6 +43,8 @@ const (
 	ndaIfindex   = 8
 	ndaMaster    = 9
 	ndmsgSize    = 12
+	ifinfoSize   = 16
+	iflaMaster   = 10
 	afBridge     = 7
 	rtnUnicast   = 1
 	nudIncomp    = 0x01
@@ -84,6 +86,12 @@ func isNeighMessage(typ uint16) bool {
 }
 
 // parseNdmsg returns the header and the attributes of a neighbor message.
+//
+// A dump request of the family AF_BRIDGE can also carry struct ifinfomsg, which
+// is longer than struct ndmsg. iproute2 sends that form for "bridge fdb show".
+// The two forms share the position of the family and the interface index, so
+// the check of fdb_valid_dump_legacy in Linux tells them apart by the length:
+// struct ndmsg, alone or with one IFLA_MASTER attribute, is the short form.
 func parseNdmsg(msg *nlmsg.Message) (ndmsg, map[uint16]nlmsg.BytesView, bool) {
 	buf := msg.Buffer()
 	if len(buf) < linux.NetlinkMessageHeaderSize+ndmsgSize {
@@ -97,8 +105,32 @@ func parseNdmsg(msg *nlmsg.Message) (ndmsg, map[uint16]nlmsg.BytesView, bool) {
 		flags:   b[10],
 		typ:     b[11],
 	}
-	attrs, ok := nlmsg.AttrsView(b[ndmsgSize:]).Parse()
+	bodyEnd := ndmsgSize
+	if msg.Header().Type == linux.RTM_GETNEIGH && nd.family == afBridge && !isShortFDBDump(b) {
+		if len(b) < ifinfoSize {
+			return nd, nil, false
+		}
+		nd.state, nd.flags, nd.typ = 0, 0, 0
+		bodyEnd = ifinfoSize
+	}
+	attrs, ok := nlmsg.AttrsView(b[bodyEnd:]).Parse()
+	if _, master := attrs[iflaMaster]; master && bodyEnd == ndmsgSize {
+		// The short form names the bridge in IFLA_MASTER, as the long form does.
+		attrs[ndaMaster] = attrs[iflaMaster]
+	}
 	return nd, attrs, ok
+}
+
+// isShortFDBDump reports whether the body of a dump request of the family
+// AF_BRIDGE is struct ndmsg, with or without one IFLA_MASTER attribute.
+func isShortFDBDump(body []byte) bool {
+	switch len(body) {
+	case ndmsgSize:
+		return true
+	case ndmsgSize + 8:
+		return binary.NativeEndian.Uint16(body[ndmsgSize+2:]) == iflaMaster
+	}
+	return false
 }
 
 // processNeigh answers RTM_NEWNEIGH, RTM_DELNEIGH, and RTM_GETNEIGH. The
@@ -292,12 +324,22 @@ func dumpNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, m
 			only = tcpip.NICID(idx)
 		}
 	}
+	var master tcpip.NICID
+	if v, ok := attrs[ndaMaster]; ok {
+		if idx, ok := v.Uint32(); ok {
+			master = tcpip.NICID(idx)
+		}
+	}
 	nics := st.Stack.NICInfo()
 	ids := make([]tcpip.NICID, 0, len(nics))
 	for id := range nics {
-		if only == 0 || only == id {
-			ids = append(ids, id)
+		if only != 0 && only != id {
+			continue
 		}
+		if coordinator, _ := st.Stack.GetNICCoordinatorID(id); master != 0 && coordinator != master {
+			continue
+		}
+		ids = append(ids, id)
 	}
 	slices.Sort(ids)
 	for _, id := range ids {
