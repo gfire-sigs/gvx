@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // The vxlan checks build two network namespaces A and B that a veth pair
@@ -146,6 +147,48 @@ func findNeigh(list []netlink.Neigh, ip string, mac net.HardwareAddr) *netlink.N
 		}
 	}
 	return nil
+}
+
+// pingPayload sends ICMP echo requests with payload bytes of data to dst and
+// waits for a reply. The IP packet has payload+28 bytes. It returns nil when a
+// reply arrives within the timeout.
+func pingPayload(dst net.IP, payload int, timeout time.Duration) error {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMP)
+	if err != nil {
+		return fmt.Errorf("socket: %w", err)
+	}
+	defer syscall.Close(fd)
+	tv := syscall.NsecToTimeval(int64(400 * time.Millisecond))
+	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
+		return fmt.Errorf("SO_RCVTIMEO: %w", err)
+	}
+	var to syscall.SockaddrInet4
+	copy(to.Addr[:], dst.To4())
+	buf := make([]byte, payload+64)
+	deadline := time.Now().Add(timeout)
+	for seq := 1; time.Now().Before(deadline); seq++ {
+		req := make([]byte, 8+payload)
+		req[0], req[5], req[6], req[7] = 8, 1, byte(seq>>8), byte(seq)
+		for i := 8; i < len(req); i++ {
+			req[i] = byte(i)
+		}
+		sum := icmpChecksum(req)
+		req[2], req[3] = byte(sum>>8), byte(sum)
+		if err := syscall.Sendto(fd, req, 0, &to); err != nil {
+			return fmt.Errorf("send %d bytes: %w", len(req)+20, err)
+		}
+		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) {
+				continue
+			}
+			return fmt.Errorf("receive: %w", err)
+		}
+		if n == len(req) && buf[0] == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("no echo reply with %d bytes from %s in %v", payload+28, dst, timeout)
 }
 
 func vxlanPing(from *nsThread, dst string, timeout time.Duration) error {
@@ -352,6 +395,78 @@ func vxlanChecks() []check {
 				return wantErrno("mixed address families", err, syscall.EINVAL)
 			})
 		}},
+		{"changing-an-existing-link-is-refused", func() error {
+			return a.do(func() error {
+				err := netlink.LinkModify(&netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "flannel.1"}, VxlanId: 1, Port: 8472, Learning: true})
+				if e := wantErrno("a change of the attributes", err, syscall.EOPNOTSUPP); e != nil {
+					return e
+				}
+				v, err := vxlanByName("flannel.1")
+				if err != nil {
+					return err
+				}
+				if v.Learning || v.VxlanId != 1 {
+					return fmt.Errorf("flannel.1 = %+v after the refused change, want the old attributes", *v)
+				}
+				// A change of the MTU or the address has no IFLA_INFO_DATA and works.
+				return nil
+			})
+		}},
+		{"mtu-stays-in-the-range-of-the-link", func() error {
+			return a.do(func() error {
+				l, err := netlink.LinkByName("flannel.1")
+				if err != nil {
+					return err
+				}
+				for _, mtu := range []int{67, 65486, 70000} {
+					if e := wantErrno(fmt.Sprintf("MTU %d", mtu), netlink.LinkSetMTU(l, mtu), syscall.EINVAL); e != nil {
+						return e
+					}
+				}
+				for _, mtu := range []int{68, 65485, 1450} {
+					if err := netlink.LinkSetMTU(l, mtu); err != nil {
+						return fmt.Errorf("MTU %d: %w", mtu, err)
+					}
+				}
+				v, err := vxlanByName("flannel.1")
+				if err != nil {
+					return err
+				}
+				if v.MTU != 1450 {
+					return fmt.Errorf("MTU = %d, want 1450", v.MTU)
+				}
+				return nil
+			})
+		}},
+		{"fdb-limit-answers-enospc", func() error {
+			return a.do(func() error {
+				link := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "vxlim"}, VxlanId: 12, SrcAddr: net.ParseIP(vxNodeA), Port: 4792, Limit: 3}
+				if err := netlink.LinkAdd(link); err != nil {
+					return err
+				}
+				v, err := vxlanByName("vxlim")
+				if err != nil {
+					return err
+				}
+				add := func(i int) error {
+					mac := net.HardwareAddr{2, 0, 0, 0, 0, byte(i)}
+					return vxlanFDB(v.Index, mac, "10.1.0.70")
+				}
+				for i := range 3 {
+					if err := add(i); err != nil {
+						return fmt.Errorf("entry %d: %w", i, err)
+					}
+				}
+				if e := wantErrno("the fourth entry with the limit 3", add(3), syscall.ENOSPC); e != nil {
+					return e
+				}
+				// A change of an existing entry needs no new slot.
+				if err := vxlanFDB(v.Index, net.HardwareAddr{2, 0, 0, 0, 0, 1}, "10.1.0.71"); err != nil {
+					return fmt.Errorf("a change at the limit: %w", err)
+				}
+				return netlink.LinkDel(v)
+			})
+		}},
 		{"flannel-setup-adds-neighbor-fdb-and-onlink-route", func() error {
 			if err := a.do(func() error {
 				if err := vxlanAddress("flannel.1", vxOverlayA); err != nil {
@@ -427,6 +542,15 @@ func vxlanChecks() []check {
 				return fmt.Errorf("B to A: %w", err)
 			}
 			return nil
+		}},
+		{"ping-with-the-full-mtu-crosses-the-vxlan", func() error {
+			// The vxlan MTU is 1450, so the IP packet of 1450 bytes is a full
+			// frame. The outer packet exceeds the veth MTU and the underlay
+			// fragments it.
+			if err := a.do(func() error { return pingPayload(net.ParseIP(vxOverlayB), 1450-28, 10*time.Second) }); err != nil {
+				return fmt.Errorf("A to B: %w", err)
+			}
+			return b.do(func() error { return pingPayload(net.ParseIP(vxOverlayA), 1450-28, 10*time.Second) })
 		}},
 		{"tcp-transfer-crosses-the-vxlan", func() error {
 			return vxlanTCP(a, b, vxOverlayB+":9000")
@@ -700,6 +824,42 @@ func vxlanChecks() []check {
 					return fmt.Errorf("FDB of the new link = %+v, %v, want empty", fdb, err)
 				}
 				return nil
+			})
+		}},
+		{"neighbor-table-is-bounded", func() error {
+			return a.do(func() error {
+				h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+				if err != nil {
+					return err
+				}
+				defer h.Close()
+				mac1, _ := net.ParseMAC("02:00:00:00:00:44")
+				entry := func(i int) *netlink.Neigh {
+					return &netlink.Neigh{
+						LinkIndex: underlayAIdx, State: netlink.NUD_PERMANENT,
+						IP: net.IPv4(10, 2+byte(i>>16), byte(i>>8), byte(i)), HardwareAddr: mac1,
+					}
+				}
+				const limit = 65536
+				for i := range limit {
+					if err := h.NeighSet(entry(i)); err != nil {
+						return fmt.Errorf("entry %d: %w", i, err)
+					}
+				}
+				extra := entry(limit)
+				if e := wantErrno("the entry after the limit", h.NeighSet(extra), syscall.ENOBUFS); e != nil {
+					return e
+				}
+				// A change of an existing entry needs no new slot.
+				changed := entry(5)
+				changed.HardwareAddr, _ = net.ParseMAC("02:00:00:00:00:45")
+				if err := h.NeighSet(changed); err != nil {
+					return fmt.Errorf("a change at the limit: %w", err)
+				}
+				if err := h.NeighDel(entry(0)); err != nil {
+					return err
+				}
+				return h.NeighSet(extra)
 			})
 		}},
 		{"namespaces-end", func() error {

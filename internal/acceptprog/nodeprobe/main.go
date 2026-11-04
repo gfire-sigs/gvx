@@ -36,6 +36,8 @@
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
+//	nodeprobe natmtu                 check the MTU of eth0 and of the tunnels on it
+//	                                 in a sandbox with the NAT network
 //	nodeprobe tput HOST:PORT MIB     measure the TCP download and upload rate of
 //	                                 MIB MiB against a server at HOST:PORT
 //	nodeprobe stats HOST:PORT        check link and disk statistics; the probe
@@ -95,6 +97,8 @@ func main() {
 		checks = wgLimitsChecks()
 	case "vxlan":
 		checks = vxlanChecks()
+	case "natmtu":
+		checks = natMTUChecks()
 	case "tput":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe tput HOST:PORT MIB")

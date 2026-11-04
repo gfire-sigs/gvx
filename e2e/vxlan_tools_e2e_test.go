@@ -68,11 +68,15 @@ if ip netns exec na ping -c 3 -W 3 10.244.2.0 >/dev/null; then echo PING-AB-OK; 
 if ip netns exec nb ping -c 3 -W 3 10.244.1.0 >/dev/null; then echo PING-BA-OK; else echo PING-BA-FAILED; fi
 head -c 262144 /dev/urandom > /tmp/data
 ip netns exec nb nc -l -p 9000 > /tmp/in &
-sleep 1
+for i in $(seq 1 100); do
+	if ip netns exec nb netstat -ltn | grep -q ':9000 '; then break; fi
+	sleep 0.1
+done
 ip netns exec na nc -w 5 10.244.2.0 9000 < /tmp/data
 wait
 echo SUM-SENT $(sha256sum < /tmp/data)
 echo SUM-GOT $(sha256sum < /tmp/in)
+if ip -n na link set flannel.1 type vxlan nolearning 2>/tmp/change-err; then echo CHANGE-ACCEPTED; else echo CHANGE-REFUSED $(cat /tmp/change-err); fi
 bridge -n na fdb del $MACB dev flannel.1 dst 10.1.0.2
 echo FDB-AFTER-DEL $(bridge -n na fdb show dev flannel.1 | grep -c "$MACB" || true)
 if ip netns exec na ping -c 2 -W 2 10.244.2.0 >/dev/null 2>&1; then echo PING-AFTER-DEL-REACHED; else echo PING-AFTER-DEL-BLOCKED; fi
@@ -107,6 +111,7 @@ if ip -n na link show flannel.1 >/dev/null 2>&1; then echo LINK-STILL-THERE; els
 			requireContains(t, "ip neigh show", field("NEIGH"), "10.244.2.0 lladdr", "PERMANENT")
 			requireContains(t, "bridge fdb show", field("FDB"), "dst 10.1.0.2", "self", "permanent")
 			requireContains(t, "ip route show", field("ROUTE"), "10.244.2.0/24 via 10.244.2.0")
+			requireContains(t, "change of a link", out, "CHANGE-REFUSED RTNETLINK answers: Not supported\n")
 			requireContains(t, "traffic", out, "PING-AB-OK\n", "PING-BA-OK\n", "PING-AFTER-DEL-BLOCKED\n", "PING-ZERO-OK\n")
 			if sent, got := field("SUM-SENT"), field("SUM-GOT"); sent != got || len(strings.Fields(sent)[0]) != 64 {
 				t.Errorf("the listener received sha256 %q, the sender sent %q", got, sent)

@@ -18,6 +18,8 @@ package e2e
 
 import (
 	"testing"
+
+	"z.gfire.dev/gvx/pkg/gvx"
 )
 
 // GVXIP-005 section 4.1 test A13 checks the "vxlan" link, the neighbor
@@ -36,10 +38,29 @@ func TestE2EVxlanA13OneSandbox(t *testing.T) {
 		code, out := runNodeProbe(t, b, bin, nil, "vxlan")
 		requireNodeChecks(t, code, out,
 			"namespaces-and-veth", "flannel-links-report-kind-mtu-and-attributes", "link-attributes-round-trip",
-			"invalid-and-duplicate-requests-fail", "flannel-setup-adds-neighbor-fdb-and-onlink-route",
-			"neighbor-and-fdb-lists-return-what-was-set", "ping-crosses-the-vxlan", "tcp-transfer-crosses-the-vxlan",
+			"invalid-and-duplicate-requests-fail", "changing-an-existing-link-is-refused",
+			"mtu-stays-in-the-range-of-the-link", "fdb-limit-answers-enospc",
+			"flannel-setup-adds-neighbor-fdb-and-onlink-route",
+			"neighbor-and-fdb-lists-return-what-was-set", "ping-crosses-the-vxlan",
+			"ping-with-the-full-mtu-crosses-the-vxlan", "tcp-transfer-crosses-the-vxlan",
 			"neighbor-requests-follow-linux", "fdb-requests-follow-linux", "deleting-the-fdb-entry-stops-the-traffic",
 			"all-zeros-entry-carries-unknown-destinations", "learning-link-learns-the-peer",
-			"deleting-the-link-frees-the-port", "namespaces-end")
+			"deleting-the-link-frees-the-port", "neighbor-table-is-bounded", "namespaces-end")
+	})
+}
+
+// TestE2EVxlanA13NATLinkMTU checks the MTU of eth0 in a sandbox with the NAT
+// network, and the MTU that flannel derives from it. eth0 has 1500 and lo keeps
+// 65536, as on Linux. A vxlan link on eth0 gets 1450, and a WireGuard link set
+// to the MTU of eth0 minus 80 reads 1420. A larger MTU of eth0 would give
+// tunnel datagrams that the NAT relay cannot send through a host UDP socket.
+func TestE2EVxlanA13NATLinkMTU(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
+			cfg.NetworkMode = gvx.NetModeNAT
+		}, "natmtu")
+		requireNodeChecks(t, code, out,
+			"eth0-has-the-ethernet-mtu-and-lo-keeps-65536", "vxlan-over-eth0-gets-1450",
+			"wireguard-over-eth0-with-the-formula-of-flannel-gets-1420")
 	})
 }
