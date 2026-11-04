@@ -28,6 +28,8 @@
 //	nodeprobe portstart              check ip_unprivileged_port_start
 //	nodeprobe netsysctls             check the sysctls of a network namespace
 //	nodeprobe forwarding             check forwarding between three namespaces
+//	nodeprobe genl                   check NETLINK_GENERIC and the controller family
+//	nodeprobe wireguard              check the wireguard link between two namespaces
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
@@ -80,6 +82,10 @@ func main() {
 		checks = netSysctlChecks()
 	case "forwarding":
 		checks = forwardingChecks()
+	case "genl":
+		checks = genlChecks()
+	case "wireguard":
+		checks = wireguardChecks()
 	case "capacity":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe capacity MEM_BYTES CPUS")
