@@ -43,10 +43,6 @@ var _ netlink.Protocol = (*Protocol)(nil)
 
 // NewProtocol creates a NETLINK_NETFILTER netlink.Protocol.
 func NewProtocol(t *kernel.Task) (netlink.Protocol, *syserr.Error) {
-	if !nftables.IsNFTablesEnabled() {
-		return nil, syserr.ErrProtocolNotSupported
-	}
-
 	return &Protocol{}, nil
 }
 
@@ -75,6 +71,10 @@ func (p *Protocol) Receive(ctx context.Context, s *netlink.Socket, buf []byte) *
 	// the error to the caller.
 	if !s.NetworkNamespace().HasCapability(ctx, linux.CAP_NET_ADMIN) {
 		return syserr.ErrNotPermittedNet
+	}
+
+	if err, handled := p.rejectBatch(ctx, s, hdr); handled {
+		return err
 	}
 
 	// TODO: b/434785410 - Support batch messages.
@@ -1207,6 +1207,10 @@ func netlinkMsgPayloadSize(h *linux.NetlinkMessageHeader) int {
 //     are dropped, Go's garbage collector should reclaim it.
 func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	hdr := msg.Header()
+
+	if err, handled := p.processXplat(ctx, s, msg, ms); handled {
+		return err
+	}
 
 	// Netlink message payloads must be of at least the size of the genmsg.
 	// Return early if it is not, from linux/net/netfilter/nfnetlink.c.
