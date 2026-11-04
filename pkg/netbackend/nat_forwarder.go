@@ -111,6 +111,11 @@ type NATConfig struct {
 	// which a UDP session ends. When zero, it is 30 seconds.
 	UDPIdleTimeout time.Duration
 
+	// MaxUDPSessions is the largest count of UDP sessions that live at once. A
+	// new session beyond the limit ends the session with the oldest datagram.
+	// When zero, it is 512.
+	MaxUDPSessions int
+
 	// Logger receives forwarder diagnostics. When nil, the forwarder discards them.
 	Logger *slog.Logger
 
@@ -131,6 +136,7 @@ type NATForwarder struct {
 	log         *slog.Logger
 	upstreamDNS []string
 	udpIdle     time.Duration
+	udpSessions *udpSessionTable
 	ctx         context.Context
 	cancel      context.CancelFunc
 
@@ -232,9 +238,13 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 }
 
 // natLinkMTU is the MTU of the in-memory link between the guest stack and the
-// host stack. It equals the MTU of the loopback device, so a TCP segment of
-// the guest needs no fragmentation.
-const natLinkMTU = 65536
+// host stack, so the MTU of eth0. It is the MTU of an Ethernet link, as on a
+// Linux node and in a Docker container. Software in the guest derives the MTU of
+// its tunnels from it: flannel uses the MTU of eth0 minus 50 for vxlan and minus
+// 80 for WireGuard. A larger value gives tunnel datagrams that the host sockets
+// cannot send. macOS limits a UDP datagram to net.inet.udp.maxdgram, which is
+// 9216 bytes by default. The loopback device keeps the MTU of 65536.
+const natLinkMTU = 1500
 
 // hostNICID is the NIC of the host stack that connects to the guest eth0.
 const hostNICID tcpip.NICID = 1
@@ -365,6 +375,7 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		log:         log,
 		upstreamDNS: upstream,
 		udpIdle:     idle,
+		udpSessions: newUDPSessionTable(cfg.MaxUDPSessions),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -562,11 +573,14 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 	}
 
 	guestConn := gonet.NewUDPConn(&wq, ep)
+	sess := &udpSession{guest: guestConn, host: hostConn, clock: newActivityClock()}
+	nf.udpSessions.add(sess)
 	if !nf.spawn(func() {
-		relayDatagrams(nf.ctx, guestConn, hostConn, nf.udpIdle)
+		defer nf.udpSessions.remove(sess)
+		relayDatagramsWithClock(nf.ctx, guestConn, hostConn, nf.udpIdle, sess.clock)
 	}) {
-		_ = guestConn.Close()
-		_ = hostConn.Close()
+		nf.udpSessions.remove(sess)
+		sess.close()
 		return false
 	}
 	return true
@@ -643,6 +657,14 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
+// datagramBuffers holds the read buffers of the UDP relays. A pump takes one
+// when it starts and returns it when it ends, so a session that ends leaves its
+// buffer to the next session, and the buffers of idle table slots cost nothing.
+var datagramBuffers = sync.Pool{New: func() any {
+	b := make([]byte, maxUDPDatagram)
+	return &b
+}}
+
 // pumpDatagrams reads datagrams from src and passes each one to send until the
 // session expires or src closes. A timeout ends the loop only when the shared
 // clock shows no activity in the other direction either. A read error from a
@@ -650,7 +672,9 @@ func isTimeout(err error) bool {
 // message, does not end the loop. A send error drops one datagram, except that
 // net.ErrClosed ends the loop.
 func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, idle time.Duration) {
-	buf := make([]byte, maxUDPDatagram)
+	bp := datagramBuffers.Get().(*[]byte)
+	defer datagramBuffers.Put(bp)
+	buf := *bp
 	transient := 0
 	for {
 		if err := src.SetReadDeadline(clock.deadline(idle)); err != nil {
@@ -685,6 +709,12 @@ func pumpDatagrams(src net.Conn, send func([]byte) error, clock *activityClock, 
 // directions stay idle for idle, either connection closes, or ctx ends. It
 // closes both connections and returns after both pump goroutines return.
 func relayDatagrams(ctx context.Context, guestConn, hostConn net.Conn, idle time.Duration) {
+	relayDatagramsWithClock(ctx, guestConn, hostConn, idle, newActivityClock())
+}
+
+// relayDatagramsWithClock is relayDatagrams with the activity clock of the
+// session, which the session table reads to find the oldest session.
+func relayDatagramsWithClock(ctx context.Context, guestConn, hostConn net.Conn, idle time.Duration, clock *activityClock) {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
@@ -695,7 +725,6 @@ func relayDatagrams(ctx context.Context, guestConn, hostConn net.Conn, idle time
 	stop := context.AfterFunc(ctx, closeBoth)
 	defer stop()
 
-	clock := newActivityClock()
 	var wg sync.WaitGroup
 	pump := func(dst, src net.Conn) {
 		defer wg.Done()

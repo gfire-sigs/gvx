@@ -31,9 +31,15 @@
 //	nodeprobe genl                   check NETLINK_GENERIC and the controller family
 //	nodeprobe wireguard              check the wireguard link between two namespaces
 //	nodeprobe wglimits               check the rules and limits of the wireguard link
+//	nodeprobe vxlan                  check the vxlan link, neighbors, and the FDB
+//	                                 with the calls of flannel between two namespaces
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
+//	nodeprobe natmtu                 check the MTU of eth0 and of the tunnels on it
+//	                                 in a sandbox with the NAT network
+//	nodeprobe tput HOST:PORT MIB     measure the TCP download and upload rate of
+//	                                 MIB MiB against a server at HOST:PORT
 //	nodeprobe stats HOST:PORT        check link and disk statistics; the probe
 //	                                 reads from a TCP server at HOST:PORT
 package main
@@ -89,6 +95,21 @@ func main() {
 		checks = wireguardChecks()
 	case "wglimits":
 		checks = wgLimitsChecks()
+	case "vxlan":
+		checks = vxlanChecks()
+	case "natmtu":
+		checks = natMTUChecks()
+	case "tput":
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe tput HOST:PORT MIB")
+			os.Exit(2)
+		}
+		mib, err := strconv.Atoi(os.Args[3])
+		if err != nil || mib <= 0 {
+			fmt.Fprintln(os.Stderr, "tput: MIB must be a positive number")
+			os.Exit(2)
+		}
+		checks = tputChecks(os.Args[2], mib)
 	case "wgchild":
 		if err := wgChild(); err != nil {
 			fmt.Fprintln(os.Stderr, "wgchild:", err)

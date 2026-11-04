@@ -177,6 +177,9 @@ func (p *Protocol) newLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		return syserr.ErrProtocolNotSupported
 	}
 
+	if err := changeLinkInfo(ctx, s, msg); err != nil {
+		return err
+	}
 	return stack.SetInterface(ctx, msg)
 }
 
@@ -192,6 +195,9 @@ func (p *Protocol) setLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		return syserr.ErrInvalidArgument
 	}
 
+	if err := changeLinkInfo(ctx, s, msg); err != nil {
+		return err
+	}
 	return stack.SetInterface(ctx, msg)
 }
 
@@ -236,7 +242,7 @@ func (p *Protocol) delLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 	return syserr.FromError(stack.RemoveInterface(ctx, ifinfomsg.Index))
 }
 
-func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface) {
+func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Stack) {
 	m.Put(&linux.InterfaceInfoMessage{
 		Family: linux.AF_UNSPEC,
 		Type:   i.DeviceType,
@@ -270,6 +276,7 @@ func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface) {
 	if i.Kind != "" {
 		var nestedAttrs nlmsg.NestedAttr
 		nestedAttrs.PutAttrString(linux.IFLA_INFO_KIND, i.Kind)
+		putLinkInfoData(&nestedAttrs, stack, idx, i)
 		m.PutNestedAttr(linux.IFLA_LINKINFO, nestedAttrs)
 	}
 
@@ -283,7 +290,7 @@ func (p *Protocol) AddNewLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Int
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.RTM_NEWLINK,
 	})
-	writeLinkInfo(m, idx, i)
+	writeLinkInfo(m, idx, i, nil)
 }
 
 // AddDelLinkMessage appends an RTM_DELLINK message for the given interface into
@@ -293,7 +300,7 @@ func (p *Protocol) AddDelLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Int
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.RTM_DELLINK,
 	})
-	writeLinkInfo(m, idx, i)
+	writeLinkInfo(m, idx, i, nil)
 }
 
 // dumpAddrs handles RTM_GETADDR dump requests.
@@ -711,6 +718,10 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 		if !s.NetworkNamespace().HasCapability(ctx, linux.CAP_NET_ADMIN) {
 			return syserr.ErrNotPermittedNet
 		}
+	}
+
+	if isNeighMessage(hdr.Type) {
+		return p.processNeigh(ctx, s, msg, ms)
 	}
 
 	if typeKind(hdr.Type) == kindGet && hdr.Flags&(linux.NLM_F_DUMP|linux.NLM_F_ROOT) != 0 {

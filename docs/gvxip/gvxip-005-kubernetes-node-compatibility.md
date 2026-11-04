@@ -17,7 +17,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 | :--- | :--- | :--- |
 | P1 | Kernel interfaces of `kubelet` and the container runtime | A1 to A7 pass on every platform. The B tests are not automated yet. |
 | P2 | Service data path (`statistic`, bridge netfilter, `ctnetlink`) | Not started |
-| P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | In progress. Generic netlink and the `wireguard` link pass A12 on every platform. The `vxlan` link and the neighbor and FDB netlink are not started. |
+| P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | In progress. Generic netlink and the `wireguard` link pass A12 on every platform. The `vxlan` link and the neighbor and FDB netlink pass A13. C1, C2, and C3 wait for `k3s`. |
 | P4 | Enforcement of `cpu.max` | A14 passes on every platform of section 4.4. B9 and B10 wait for `k3s`. |
 
 ---
@@ -102,8 +102,8 @@ These items connect the guest to other nodes with standard tools. The Sentry has
 | :--- | :--- | :--- |
 | Generic netlink | `NETLINK_GENERIC` sockets and the controller family (`CTRL_CMD_GETFAMILY`). A registry lets other families plug in. | `pkg/sentry/socket/netlink/genetlink/genetlink.go` and `controller.go` (Tier 1) |
 | `wireguard` link | `RTM_NEWLINK` with the kind `wireguard`, and the WireGuard generic netlink family (`WG_CMD_GET_DEVICE`, `WG_CMD_SET_DEVICE`). The device uses `wireguard-go` and sends UDP from the network namespace of the guest. A sandbox has at most 256 such links, and a device has at most 4,096 peers. | `pkg/sentry/socket/netlink/genetlink/wireguard` (Tier 1); the registry of link kinds in `pkg/sentry/socket/netstack/linkkind_xplat.go`, with one seam in `stack.go` |
-| `vxlan` link | `RTM_NEWLINK` with the kind `vxlan`: VNI, destination port, local address, `nolearning`, and an MTU of 1450 by default | `pkg/tcpip/link/vxlan` (Tier 1). The link registers with `RegisterLinkKind`, so it needs no new seam. |
-| Neighbor and FDB netlink | `RTM_NEWNEIGH`, `RTM_DELNEIGH`, and `RTM_GETNEIGH` for permanent IPv4 and IPv6 entries, and for FDB entries of the family `AF_BRIDGE` on a `vxlan` link | A `_xplat.go` file in `pkg/sentry/socket/netlink/route` |
+| `vxlan` link | `RTM_NEWLINK` with the kind `vxlan`: VNI, destination port, local address, `nolearning`, and an MTU of 1450 by default. `RTM_GETLINK` reports the attributes in `IFLA_INFO_DATA`. | `pkg/tcpip/link/vxlan` (Tier 1) for the endpoint and the FDB. The link kind registers from `pkg/sentry/socket/netstack/vxlan_xplat.go` with `RegisterLinkKind`, so it needs no new seam. |
+| Neighbor and FDB netlink | `RTM_NEWNEIGH`, `RTM_DELNEIGH`, and `RTM_GETNEIGH` for permanent IPv4 and IPv6 entries, and for FDB entries of the family `AF_BRIDGE` on a `vxlan` link | `pkg/sentry/socket/netlink/route/neigh_xplat.go`, with one call in `ProcessMessage` of `protocol.go`, a file that the audit already counts |
 
 ### 3.4 P4: Enforcement of `cpu.max`
 
@@ -148,7 +148,7 @@ These tests check one kernel behavior each. A Go program without an image runs t
 | A10 | Bridge netfilter | Two namespaces on one bridge connect over TCP through a DNAT rule for a virtual address when `bridge-nf-call-iptables` is 1. With 0, the DNAT rule does not apply to bridged frames. |
 | A11 | `ctnetlink` | `conntrack -L` lists a UDP flow. After `conntrack -D` for the flow, the next packet follows the new DNAT target. |
 | A12 | `wireguard` | `ip link add` and `wg set` configure a device, and `wg show` prints the configuration. Two sandboxes on one host exchange ICMP echo over `wg0`, once with a published UDP port and once with a keepalive only. After `wg set ... peer ... remove`, the traffic stops. |
-| A13 | `vxlan` and FDB | Two sandboxes exchange ICMP echo over `vxlan1` with the setup of `flannel`: an FDB entry and a permanent neighbor entry. The MTU is 1450. |
+| A13 | `vxlan` and FDB | Two sandboxes exchange ICMP echo over `vxlan1` with the setup of `flannel`: an FDB entry and a permanent neighbor entry. The MTU is 1450. Two namespaces of one guest do the same on `whpx`. After `bridge fdb del`, the traffic stops. |
 | A14 | `cpu.max` | With `cpu.max` at `50000 100000`, a busy loop uses 0.5 ± 0.1 CPU over 5 seconds, and `nr_throttled` grows. |
 
 ### 4.2 Single-Node `k3s` (B)
