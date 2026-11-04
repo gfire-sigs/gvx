@@ -128,8 +128,8 @@ func (it *IPTables) hasRules() bool {
 // then forwards the frame without the hooks.
 //
 // A frame that goes to the bridge, or to a host behind another route after a
-// DNAT, enters the IP layer of the stack. That layer runs the hooks again for
-// the packet.
+// DNAT, enters the IP layer of the stack as it arrived. That layer runs its own
+// hooks and reuses the connection that the bridge created.
 func (p *bridgePort) netfilterForward(protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) bool {
 	if protocol != header.IPv4ProtocolNumber && protocol != header.IPv6ProtocolNumber {
 		return false
@@ -187,7 +187,7 @@ func (p *bridgePort) netfilterForward(protocol tcpip.NetworkProtocolNumber, pkt 
 	// A destination on the bridge gets a new Ethernet address from the neighbor
 	// cache of the bridge. Any other destination goes up to the IP layer.
 	if stk.CheckLocalAddress(0, protocol, newDst) != 0 {
-		p.netfilterDeliverUp(dispatcher, protocol, work)
+		p.netfilterDeliverUp(dispatcher, protocol, pkt, work)
 		return true
 	}
 	r, err := stk.FindRoute(bridgeNIC.id, tcpip.Address{}, newDst, protocol, false /* multicastLoop */)
@@ -197,7 +197,7 @@ func (p *bridgePort) netfilterForward(protocol tcpip.NetworkProtocolNumber, pkt 
 	}
 	if r.OutgoingNIC() != bridgeNIC.id || (r.NextHop().BitLen() != 0 && r.NextHop() != newDst) {
 		r.Release()
-		p.netfilterDeliverUp(dispatcher, protocol, work)
+		p.netfilterDeliverUp(dispatcher, protocol, pkt, work)
 		return true
 	}
 
@@ -327,11 +327,16 @@ func (p *bridgePort) netfilterFinish(bridgeNIC *nic, addressEP AddressableEndpoi
 	p.bridge.forwardFrame(p, work)
 }
 
-// netfilterDeliverUp gives the frame to the IP layer of the bridge. It takes
-// the ownership of work.
-func (p *bridgePort) netfilterDeliverUp(d NetworkDispatcher, protocol tcpip.NetworkProtocolNumber, work *PacketBuffer) {
-	defer work.DecRef()
-	up := NewPacketBuffer(PacketBufferOptions{Payload: work.ToBuffer()})
+// netfilterDeliverUp gives the original frame to the IP layer of the bridge. It
+// takes the ownership of work, the rewritten copy, and drops it.
+//
+// The IP layer must see the frame as it arrived. Its PREROUTING hook then
+// finds the connection that the bridge created for the original tuple and
+// applies the same DNAT. A frame with the rewritten destination would start a
+// second connection with the new tuple, and the replies would miss the NAT.
+func (p *bridgePort) netfilterDeliverUp(d NetworkDispatcher, protocol tcpip.NetworkProtocolNumber, orig, work *PacketBuffer) {
+	work.DecRef()
+	up := NewPacketBuffer(PacketBufferOptions{Payload: orig.ToBuffer()})
 	defer up.DecRef()
 	if _, ok := up.LinkHeader().Consume(header.EthernetMinimumSize); !ok {
 		return
