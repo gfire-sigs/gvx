@@ -347,22 +347,11 @@ func (b *BridgeEndpoint) forwardFrame(from *bridgePort, frame *PacketBuffer) {
 	src, dst := eth.SourceAddress(), eth.DestinationAddress()
 
 	b.mu.RLock()
-	_, known := b.fdbTable[BridgeFDBKey(src)]
-	entry, found := b.fdbTable[BridgeFDBKey(dst)]
-	var targets []*bridgePort
-	switch {
-	case !found:
-		for _, port := range b.ports {
-			if port != from {
-				targets = append(targets, port)
-			}
-		}
-	case entry.port != from:
-		targets = []*bridgePort{entry.port}
-	}
+	learn := b.needsLearningLocked(src, from)
+	targets := b.forwardTargetsLocked(from, dst)
 	b.mu.RUnlock()
 
-	if !known && !header.IsMulticastEthernetAddress(src) {
+	if learn {
 		b.mu.Lock()
 		// The port may have left the bridge while the frame waited for the
 		// neighbor cache.

@@ -57,7 +57,6 @@ func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, 
 	}
 	bridge := p.bridge
 	eth := header.Ethernet(pkt.LinkHeader().Slice())
-	updateFDB := false
 	bridge.mu.RLock()
 	// Add an entry at the bridge FDB, it maps a MAC address
 	// to a bridge port where the traffic is received when
@@ -66,31 +65,15 @@ func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, 
 	// will be forwarded to the bridge port that is stored in
 	// the FDB table.
 	sourceAddress := eth.SourceAddress()
-	if _, hasSourceFDB := bridge.fdbTable[BridgeFDBKey(sourceAddress)]; !header.IsMulticastEthernetAddress(sourceAddress) && !hasSourceFDB {
-		updateFDB = true
-	}
+	updateFDB := bridge.needsLearningLocked(sourceAddress, p)
 	destAddress := eth.DestinationAddress()
 	isMulticast := header.IsMulticastEthernetAddress(destAddress)
-	if entry, exist := bridge.fdbTable[BridgeFDBKey(destAddress)]; !exist {
-		// When no FDB entry is found, send the packet to all ports.
-		for _, port := range bridge.ports {
-			if p == port {
-				continue
-			}
-			newPkt := NewPacketBuffer(PacketBufferOptions{
-				ReserveHeaderBytes: int(port.nic.MaxHeaderLength()),
-				Payload:            pkt.ToBuffer(),
-			})
-			port.nic.writeRawPacket(newPkt)
-			newPkt.DecRef()
-		}
-	} else if entry.port != p {
-		destPort := entry.port
+	for _, port := range bridge.forwardTargetsLocked(p, destAddress) {
 		newPkt := NewPacketBuffer(PacketBufferOptions{
-			ReserveHeaderBytes: int(destPort.nic.MaxHeaderLength()),
+			ReserveHeaderBytes: int(port.nic.MaxHeaderLength()),
 			Payload:            pkt.ToBuffer(),
 		})
-		destPort.nic.writeRawPacket(newPkt)
+		port.nic.writeRawPacket(newPkt)
 		newPkt.DecRef()
 	}
 
@@ -154,8 +137,8 @@ func (b *BridgeEndpoint) WritePackets(pkts PacketBufferList) (int, tcpip.Error) 
 
 	pktsSlice := pkts.AsSlice()
 	n := len(pktsSlice)
-	for _, p := range b.ports {
-		for _, pkt := range pktsSlice {
+	for _, pkt := range pktsSlice {
+		for _, p := range b.egressTargetsLocked(pkt.EgressRoute.RemoteLinkAddress) {
 			// In order to properly loop back to the inbound side we must create a
 			// fresh packet that only contains the underlying payload with no headers
 			// or struct fields set.
