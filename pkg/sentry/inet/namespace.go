@@ -49,6 +49,10 @@ type Namespace struct {
 
 	// netlinkMcastTable manages multicast group membership for netlink sockets.
 	netlinkMcastTable *McastTable
+
+	// sysctls stores the /proc/sys/net values that the network stack does not
+	// own. See sysctl_xplat.go.
+	sysctls sysctlValues `state:"nosave"`
 }
 
 // NewRootNamespace creates the root network namespace, with creator

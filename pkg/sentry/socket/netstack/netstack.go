@@ -870,7 +870,7 @@ func (s *sock) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.E
 
 // Bind implements the linux syscall bind(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *sock) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
+func (s *sock) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 	if len(sockaddr) < 2 {
 		return syserr.ErrInvalidArgument
 	}
@@ -912,6 +912,10 @@ func (s *sock) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
 		}
 
 		addr = s.mapFamily(addr, family)
+	}
+
+	if err := s.checkPrivilegedPort(t, addr); err != nil {
+		return err
 	}
 
 	// Issue the bind request to the endpoint.
