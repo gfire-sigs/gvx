@@ -30,9 +30,11 @@ const (
 	// winBase and winLimit bound the guest window of a stub process. The window
 	// is one placeholder that the Sentry reserves before the loader runs, so
 	// the loader and the kernel place the stack, the heaps, and the system DLLs
-	// elsewhere. The range sat free in every one of the stub processes that the
-	// probes created on windows-latest and windows-11-arm (docs/systrap-windows.md).
-	winBase  = uint64(0x100000000000) // 16 TiB
+	// elsewhere. The kernel puts the process parameters, the API set map, and
+	// the activation context data between 1 TiB and 3 TiB. The loader adds the
+	// heaps there. The highest end in the probes was 2.97 TiB, so the window
+	// starts 1 TiB above 3 TiB.
+	winBase  = uint64(0x40000000000) // 4 TiB
 	winLimit = uint64(0x7EE000000000)
 
 	// internalSize is the part of the window that the engine keeps for itself,
@@ -51,25 +53,34 @@ const (
 	lowBase  = uint64(0x10000)
 	lowLimit = uint64(0x7FFE0000)
 
-	// midBase and midLimit bound the middle guest window. HotSpot on arm64
-	// places the compressed class space and the CDS archive at a multiple of
-	// 4 GiB below 32 GiB or at a multiple of 32 GiB below 1 TiB, and it exits
-	// when the guest refuses all 38 places. The window holds 8 of the places
-	// and the area where HotSpot puts a zero-based heap, below 32 GiB.
+	// midBase and midLimit bound the middle guest window. KUSER_SHARED_DATA
+	// and one more kernel page lie in [0x7FFE0000, 0x7FFF0000), and nothing
+	// else lies below 4 GiB in a new stub. HotSpot on arm64 places the
+	// compressed class space and the CDS archive at one of 38 places: a
+	// multiple of 4 GiB below 32 GiB, or a multiple of 32 GiB below 1 TiB. It
+	// exits when the guest refuses all of them. The window holds 9 of the
+	// places and the area where HotSpot puts a zero-based heap, below 32 GiB.
+	// The HotSpot windows in optionalWindows hold the other 29.
 	//
 	// The kernel creates two private regions in every stub before the Sentry
-	// can reserve anything: one of 1 MiB and one of 2 MiB. It places them at a
-	// random address between 4 GiB and 1 TiB. A window in that range therefore
-	// meets them with a probability of about its size divided by 1 TiB. The
-	// Sentry throws such a stub away and starts a new one. Nothing else lies
-	// between 4 GiB and 1 TiB in a new stub (docs/systrap-windows.md,
-	// section 3.10).
-	midBase  = uint64(4) << 30
-	midLimit = uint64(64) << 30
+	// can reserve anything. One is the initial stack of 1 MiB. The other holds
+	// the PEB and the TEB in 2 MiB. The kernel places them at a random address
+	// between 4 GiB and 1 TiB, and it refuses to free the PEB region. A window
+	// in that range therefore meets them with a probability of about its size
+	// divided by 1 TiB. The Sentry throws such a stub away and starts a new
+	// one (docs/systrap-windows.md, section 3.10).
+	midBase  = lowLimit + 0x10000
+	midLimit = uint64(66) << 30
+
+	// hotSpotSize is the size of each window at a HotSpot place above the
+	// middle window. It holds the CDS archive and the default class space of
+	// 1 GiB.
+	hotSpotSize = uint64(2) << 30
 
 	// windowAttempts is the number of stubs that one request tries before it
-	// reports that a window is taken. The middle window is taken in 6% to 8% of
-	// the stubs, so twelve attempts fail in fewer than one request in 10^10.
+	// reports that a window is taken. The kernel regions meet the middle
+	// window or a HotSpot window in 11% to 13% of the stubs. Twelve attempts
+	// therefore fail in fewer than one request in 10^10.
 	windowAttempts = 12
 
 	// codeSize is the size of the executable part of the engine pages. The
@@ -88,9 +99,10 @@ var (
 )
 
 const (
-	windowLow  = "low"
-	windowMid  = "middle"
-	windowHigh = "high"
+	windowLow     = "low"
+	windowMid     = "middle"
+	windowHotSpot = "hotspot"
+	windowHigh    = "high"
 )
 
 // windowTakenError reports the window that the loader or the kernel already
@@ -107,12 +119,18 @@ func (e *windowTakenError) Error() string {
 func (e *windowTakenError) Unwrap() []error { return []error{errWindowTaken, e.err} }
 
 // optionalWindows are the guest windows that a host can refuse, in ascending
-// order. The platform drops a window that is taken in every attempt. The high
-// window is not optional.
-var optionalWindows = []guestRange{
-	{windowLow, lowBase, lowLimit},
-	{windowMid, midBase, midLimit},
-}
+// order. The platform drops the windows of a name when one of them is taken
+// in every attempt. The high window is not optional.
+var optionalWindows = func() []guestRange {
+	ws := []guestRange{
+		{windowLow, lowBase, lowLimit},
+		{windowMid, midBase, midLimit},
+	}
+	for a := uint64(96) << 30; a < 1<<40; a += 32 << 30 {
+		ws = append(ws, guestRange{windowHotSpot, a, a + hotSpotSize})
+	}
+	return ws
+}()
 
 // stubProc is one stub process. A stub holds the guest address space of one
 // Linux process and one thread for each guest thread.
@@ -201,8 +219,9 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	sp.threads[sh.tid] = th0
 	p.dbg.register(sp)
 	t1 := time.Now()
-	// The layout is in ascending order, so the middle window, which can meet
-	// the stack of the stub, is reserved before the large high window.
+	// The layout is in ascending order, so the windows below 1 TiB, which can
+	// meet the stack and the PEB of the stub, come before the large high
+	// window.
 	for _, w := range p.layout {
 		if err := virtualAllocPlaceholder(sp.proc, uintptr(w.base), uintptr(w.limit-w.base)); err != nil {
 			bringUpStats.windowNs.Add(uint64(time.Since(t1)))

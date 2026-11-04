@@ -46,7 +46,8 @@ func (mm *MemoryManager) isHostBlockPlatform(holes []hostarch.AddrRange) bool {
 }
 
 // maxHoles is the number of holes that a search handles without an allocation.
-const maxHoles = 4
+// The Windows systrap layout has 31 holes.
+const maxHoles = 32
 
 // appendRangesAvoiding appends the parts of bounds that no hole covers to dst,
 // in ascending order. holes must be in ascending order and must not overlap.

@@ -370,7 +370,7 @@ func (w *windowMap) Lookup(addr uint64) (viewInfo, uint64, bool) {
 
 // guestWindows holds the window maps of one stub, which do not overlap, in
 // ascending order. A stub has one window, or more when the platform also
-// reserves a low or a middle window. The host owns the ranges between the
+// reserves the optional windows. The host owns the ranges between the
 // windows, and the memory manager never maps there. The memory manager does
 // unmap ranges that cross a gap.
 type guestWindows struct {

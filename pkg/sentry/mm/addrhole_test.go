@@ -319,3 +319,40 @@ func TestTwoHolesSearchesDoNotAllocate(t *testing.T) {
 		})
 	}
 }
+
+// The Windows systrap layout has 31 holes. A search across that many holes
+// still avoids each hole and needs no allocation.
+func TestManyHolesSearchesDoNotAllocate(t *testing.T) {
+	var holes []hostarch.AddrRange
+	for k := range uint64(31) {
+		start := hostarch.Addr((2 + 2*k) * holeGiB)
+		holes = append(holes, hostarch.AddrRange{Start: start, End: start + hostarch.Addr(holeGiB)})
+	}
+	top := hostarch.Addr(64 * holeGiB)
+	for _, tc := range []struct {
+		name         string
+		dir          arch.MmapDirection
+		bottomUpBase hostarch.Addr
+		want         hostarch.Addr
+	}{
+		{"top-down search", arch.MmapTopDown, holeMin, top - holePage},
+		{"bottom-up search from inside a hole", arch.MmapBottomUp, holes[15].Start + holePage, holes[15].End},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mm := newHoleMM(holePlatform{holes: holes}, tc.dir, tc.bottomUpBase, top)
+			mm.layout.MaxAddr = top
+			got, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{})
+			if err != nil || got != tc.want {
+				t.Fatalf("search = (%#x, %v), want (%#x, nil)", got, err, tc.want)
+			}
+			allocs := testing.AllocsPerRun(100, func() {
+				if _, err := mm.findAvailableLocked(holeSmall, findAvailableOpts{}); err != nil {
+					t.Fatalf("search: %v", err)
+				}
+			})
+			if allocs != 0 {
+				t.Errorf("allocations per search = %v, want 0", allocs)
+			}
+		})
+	}
+}
