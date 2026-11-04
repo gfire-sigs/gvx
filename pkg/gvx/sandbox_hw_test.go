@@ -387,7 +387,7 @@ func staticBase() uint64 {
 }
 
 // systrapBase returns a link address that every systrap engine of the host
-// allows. The Windows engine holds 16TB and up in its high window, and the
+// allows. The Windows engine holds 4TB and up in its high window, and the
 // classic addresses in its low window. The test of the low window is
 // TestSandboxStartsStaticExecutablesAtLowAddresses. The upstream Linux
 // platform accepts the classic 0x400000.

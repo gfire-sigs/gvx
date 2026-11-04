@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"unsafe"
@@ -38,21 +39,25 @@ func stopPoolForTest(p *Platform) {
 
 func TestPlatformReservesEveryOptionalWindowOnTheCIHosts(t *testing.T) {
 	p := newPlatform(t)
-	want := windowLayout{
+	want := append(windowLayout{
 		{windowLow, lowBase, lowLimit},
 		{windowMid, midBase, midLimit},
-		{windowHigh, winBase, winLimit},
-	}
+	}, hotSpotLayout()...)
+	want = append(want, guestRange{windowHigh, winBase, winLimit})
 	if !slices.Equal(p.layout, want) {
 		t.Fatalf("layout = %v, want %v", p.layout, want)
 	}
 	if got, want := uint64(p.MinUserAddress()), lowBase; got != want {
 		t.Errorf("MinUserAddress = %#x, want %#x", got, want)
 	}
-	wantHoles := []hostarch.AddrRange{
-		{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(midBase)},
-		{Start: hostarch.Addr(midLimit), End: hostarch.Addr(winBase)},
+	// Only KUSER_SHARED_DATA separates the low and the middle windows.
+	wantHoles := []hostarch.AddrRange{{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(lowLimit + 0x10000)}}
+	prev := midLimit
+	for _, w := range hotSpotLayout() {
+		wantHoles = append(wantHoles, hostarch.AddrRange{Start: hostarch.Addr(prev), End: hostarch.Addr(w.base)})
+		prev = w.limit
 	}
+	wantHoles = append(wantHoles, hostarch.AddrRange{Start: hostarch.Addr(prev), End: hostarch.Addr(winBase)})
 	if got := p.UserAddressHoles(); !slices.Equal(got, wantHoles) {
 		t.Errorf("UserAddressHoles = %v, want %v", got, wantHoles)
 	}
@@ -91,8 +96,9 @@ func TestEveryStubHoldsEachWindowAsOnePlaceholder(t *testing.T) {
 // closes, so a second rig of one platform can map the section of the first.
 func TestGuestRunsInEveryWindow(t *testing.T) {
 	const value = 0x1122334455667788
-	for _, w := range append(slices.Clone(optionalWindows), guestRange{windowHigh, winBase, winLimit}) {
-		t.Run(w.name, func(t *testing.T) {
+	hs := hotSpotLayout()
+	for _, w := range []guestRange{optionalWindows[0], optionalWindows[1], hs[0], hs[len(hs)-1], {windowHigh, winBase, winLimit}} {
+		t.Run(fmt.Sprintf("%s@%#x", w.name, w.base), func(t *testing.T) {
 			r := newRig(t, newPlatform(t))
 			code, data, stack := w.base+0x200000, w.base+0x300000, w.base+0x400000
 			r.mapPage(code, execAccess, gStoreTo(data, value), gLoadFrom(data), gSyscall(93))
@@ -113,19 +119,19 @@ func TestGuestRunsInEveryWindow(t *testing.T) {
 }
 
 // HotSpot on arm64 tries the multiples of 4 GiB below 32 GiB for the class
-// space, then multiples of 32 GiB. The middle window must serve a page at each
-// of the places that it covers and at its last page, and nothing outside it.
-func TestMiddleWindowServesTheHotSpotPlaces(t *testing.T) {
+// space, then multiples of 32 GiB below 1 TiB. The guest windows serve a page
+// at each of the 38 places and at the last page of each HotSpot window. They
+// serve nothing between the windows.
+func TestGuestWindowsServeEveryHotSpotPlace(t *testing.T) {
 	p := newPlatform(t)
 	r := newRig(t, p)
 	var places []uint64
-	for a := midBase; a < 32<<30; a += 4 << 30 {
+	for a := uint64(4 << 30); a < 32<<30; a += 4 << 30 {
 		places = append(places, a)
 	}
-	for a := uint64(32 << 30); a < midLimit; a += 32 << 30 {
-		places = append(places, a)
+	for a := uint64(32 << 30); a < 1<<40; a += 32 << 30 {
+		places = append(places, a, a+hotSpotSize-blockSize)
 	}
-	places = append(places, midLimit-blockSize)
 
 	code, stack := uint64(codeVA), uint64(stackVA)
 	var prog []byte
@@ -145,7 +151,7 @@ func TestMiddleWindowServesTheHotSpotPlaces(t *testing.T) {
 			t.Errorf("page at %#x: the guest read %d, want %d", a, got, i+1)
 		}
 	}
-	for _, a := range []uint64{midLimit, midBase - blockSize, lowLimit, winBase - blockSize} {
+	for _, a := range []uint64{midLimit, midBase - blockSize, lowLimit, winBase - blockSize, 96<<30 + hotSpotSize, 96<<30 - blockSize} {
 		fr, _ := r.allocFrames(1)
 		if err := r.as.MapFile(hostarch.Addr(a), r.mf, fr, hostarch.ReadWrite, false); err == nil {
 			t.Errorf("MapFile at %#x, in a hole, succeeded", a)
@@ -175,15 +181,17 @@ func TestTakenWindowIsReportedAfterTheAttempts(t *testing.T) {
 	}
 }
 
-// The platform drops a window that no stub can reserve and keeps the others.
-func TestSelectWindowsDropsOnlyTheTakenWindow(t *testing.T) {
+// The platform drops every window of the name that no stub can reserve and
+// keeps the windows of the other names. Only the first clash window covers
+// KUSER_SHARED_DATA; the second one is free.
+func TestSelectWindowsDropsEveryWindowOfTheTakenName(t *testing.T) {
 	p := newPlatform(t)
 	stopPoolForTest(p)
-	clash := guestRange{"clash", lowLimit - 0x10000, lowLimit + 0x1000}
 	optional := []guestRange{
 		{windowLow, lowBase, lowLimit - 0x10000},
-		clash,
+		{"clash", lowLimit - 0x10000, lowLimit + 0x1000},
 		{windowMid, midBase, midLimit},
+		{"clash", 96 << 30, 98 << 30},
 	}
 	sp := p.selectWindows(optional)
 	if sp == nil {
@@ -218,4 +226,15 @@ func TestSelectWindowsFallsBackToTheHighWindow(t *testing.T) {
 	if got := p.userMin; got != winBase {
 		t.Errorf("userMin = %#x, want %#x", got, winBase)
 	}
+}
+
+// hotSpotLayout returns the HotSpot windows of optionalWindows.
+func hotSpotLayout() []guestRange {
+	var out []guestRange
+	for _, w := range optionalWindows {
+		if w.name == windowHotSpot {
+			out = append(out, w)
+		}
+	}
+	return out
 }

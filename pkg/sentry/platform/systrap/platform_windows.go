@@ -32,6 +32,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -234,7 +235,8 @@ func (p *Platform) setLayout(optional []guestRange) {
 // selectWindows decides which of the optional guest windows the stubs of the
 // platform reserve. It brings up one stub with all of them. If a window is
 // taken in every attempt, the host places something there. The platform then
-// drops that window and tries again. If a stub fails for another reason, the
+// drops every window of that name, writes a warning to the log, and tries
+// again. If a stub fails for another reason, the
 // platform keeps only the high window, and the first guest reports the cause.
 // The stub that works goes to the pool.
 func (p *Platform) selectWindows(optional []guestRange) *stubProc {
@@ -247,17 +249,14 @@ func (p *Platform) selectWindows(optional []guestRange) *stubProc {
 		}
 		var taken *windowTakenError
 		if errors.As(err, &taken) {
-			if i := slices.IndexFunc(optional, func(w guestRange) bool { return w.name == taken.window }); i >= 0 {
-				if traceEvents {
-					tracef("systrap: no %s guest window: %v", taken.window, err)
-				}
-				optional = slices.Delete(optional, i, i+1)
+			kept := slices.DeleteFunc(slices.Clone(optional), func(w guestRange) bool { return w.name == taken.window })
+			if len(kept) < len(optional) {
+				optional = kept
+				log.Warningf("systrap: the host holds a part of the %s guest windows in every new stub; the guests run without them: %v", taken.window, err)
 				continue
 			}
 		}
-		if traceEvents {
-			tracef("systrap: no optional guest windows: %v", err)
-		}
+		log.Warningf("systrap: the guests run without the optional guest windows: %v", err)
 		p.setLayout(nil)
 		return nil
 	}
