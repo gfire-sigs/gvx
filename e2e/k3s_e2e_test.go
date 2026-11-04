@@ -255,7 +255,7 @@ spec:
   containers:
   - name: hog
     image: busybox:1.36
-    command: ["sh", "-c", "head -c 200m /dev/zero | tail > /dev/null; sleep 60"]
+    command: ["sh", "-c", "a=$(head -c 120m /dev/zero | tr '\\0' x); sleep 60"]
     resources: {limits: {memory: 64Mi}}
 EOF
 k wait --for=condition=Ready pod/burn --timeout=300s >/dev/null 2>&1
