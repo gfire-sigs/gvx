@@ -33,11 +33,17 @@ import (
 // pods run on the one gvx node. The test passes SONOBUOY_ARGS and E2E_FOCUS. The script
 // prints the result summary of sonobuoy and the name of each failed test.
 const c5Script = `
+mkdir -p /usr/local/bin
 cp /workspace/sonobuoy /usr/local/bin/sonobuoy
 k3s server --disable=traefik,servicelb --flannel-backend=host-gw --write-kubeconfig-mode=644 >/tmp/k3s.log 2>&1 &
 t0=$(date +%s)
 until k get nodes 2>/dev/null | grep -q " Ready"; do
   if [ $(( $(date +%s) - t0 )) -gt 600 ]; then fail "node not Ready"; dump; exit 1; fi
+  sleep 2
+done
+# kubectl wait fails at once when the pod does not exist yet.
+until k -n kube-system get pod -l k8s-app=kube-dns -o name 2>/dev/null | grep -q .; do
+  if [ $(( $(date +%s) - t0 )) -gt 600 ]; then fail "coredns pod missing"; dump; exit 1; fi
   sleep 2
 done
 if ! k -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=600s >/dev/null 2>&1; then

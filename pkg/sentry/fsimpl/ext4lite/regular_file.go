@@ -301,9 +301,17 @@ func (i *inode) killCapability() error {
 // syncInode writes the dirty mapped data of ino to the engine and then flushes
 // the volume in the strict order. It is the path of fsync, fdatasync, and of a
 // write on an O_SYNC or O_DSYNC descriptor.
+//
+// The write-back of mapped data needs ino.wmu. The flush of the volume runs
+// without it. The flush waits until no operation runs in the gate, and a write
+// that already entered the gate waits for ino.wmu, so a flush under ino.wmu
+// would wait for that write without end.
 func (fs *filesystem) syncInode(ino *inode) error {
 	var errs []error
-	if err := ino.data.SyncData(); err != nil {
+	ino.wmu.Lock()
+	err := ino.data.SyncData()
+	ino.wmu.Unlock()
+	if err != nil {
 		errs = append(errs, err)
 	}
 	if err := fs.v.sync(); err != nil {
@@ -375,10 +383,7 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 // the dirty mapped data first and then flush the volume in the strict order,
 // so a directory entry never points to an inode that the host file lacks.
 func (fd *regularFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
-	ino := fd.dentry.inode
-	ino.wmu.Lock()
-	defer ino.wmu.Unlock()
-	return fd.dentry.fs.syncInode(ino)
+	return fd.dentry.fs.syncInode(fd.dentry.inode)
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate. It serves the modes of
