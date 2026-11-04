@@ -120,7 +120,7 @@ echo "$WG_KEY" > /tmp/key
 func TestE2EWireGuardA12ToolConfiguration(t *testing.T) {
 	for _, b := range gateBackends() {
 		t.Run(b.name, func(t *testing.T) {
-			requireBackend(t, b)
+			requireFixedAddressBackend(t, b)
 			requireRegistry(t)
 			script := `set -e
 apk add --no-cache wireguard-tools wireguard-tools-wg-quick iproute2 bash >/dev/null
@@ -221,7 +221,7 @@ func wgTwoSandboxes(t *testing.T, b gateBackend, aScript, bScript string) (a, bg
 	if b.plat == gvx.PlatformWHPX {
 		t.Skip("the whpx backend cannot hold two running sandboxes in one process")
 	}
-	requireBackend(t, b)
+	requireFixedAddressBackend(t, b)
 	requireRegistry(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	t.Cleanup(cancel)
