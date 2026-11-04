@@ -34,7 +34,7 @@ import (
 // prints the result summary of sonobuoy and the name of each failed test.
 const c5Script = `
 mkdir -p /usr/local/bin
-cp /workspace/sonobuoy /usr/local/bin/sonobuoy
+cp /workspace/sonobuoy /usr/local/bin/sonobuoy && chmod 755 /usr/local/bin/sonobuoy
 k3s server --disable=traefik,servicelb --flannel-backend=host-gw --write-kubeconfig-mode=644 >/tmp/k3s.log 2>&1 &
 t0=$(date +%s)
 until k get nodes 2>/dev/null | grep -q " Ready"; do

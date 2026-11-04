@@ -6,7 +6,7 @@ This specification defines how a `gvx` sandbox can join a real multi-node Kubern
 | :--- | :--- |
 | **Document ID** | `GVXIP-005` |
 | **Title** | Kubernetes Node Compatibility |
-| **Status** | In progress |
+| **Status** | Implemented |
 | **Isolation Tier** | Tier 2 (`_xplat.go` siblings in upstream packages) and Tier 1 (new directories that `tools/upstream` lists in `tier1Prefixes`) |
 | **Target Platforms** | `darwin/arm64` (`hvf`), `windows/amd64` (`whpx`, `systrap`), `windows/arm64` (`systrap`), `linux/amd64` and `linux/arm64` (`systrap`) |
 | **Companion Specs** | [`../docker-engine.md`](../docker-engine.md), [`../architecture.md`](../architecture.md) |
@@ -15,10 +15,10 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 
 | Phase | Content | State |
 | :--- | :--- | :--- |
-| P1 | Kernel interfaces of `kubelet` and the container runtime | A1 to A7 pass on every platform. The B tests are not automated yet. |
-| P2 | Service data path (`statistic`, bridge netfilter, `ctnetlink`) | Not started |
-| P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | In progress. Generic netlink and the `wireguard` link pass A12 on every platform. The `vxlan` link and the neighbor and FDB netlink pass A13. C1, C2, and C3 wait for `k3s`. |
-| P4 | Enforcement of `cpu.max` | A14 passes on every platform of section 4.4. B9 and B10 wait for `k3s`. |
+| P1 | Kernel interfaces of `kubelet` and the container runtime | Done. A1 to A7 and B1, B2, B7, B8, and B11 pass on every platform of section 4.4. |
+| P2 | Service data path (`statistic`, `recent`, bridge netfilter, `ctnetlink`) | Done. A8 to A11 and B3 to B6 pass on every platform of section 4.4. |
+| P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Done. A12, A13, C1, C2, and C3 pass on every platform of section 4.4. |
+| P4 | Enforcement of `cpu.max` | Done. A14, B9, B10, C4, and C5 pass on every platform of section 4.4. |
 
 ---
 
@@ -186,7 +186,7 @@ Several sandboxes on one host form the clusters, so CI can run these tests. C3 a
 | ID | Behavior | Pass criterion |
 | :--- | :--- | :--- |
 | C1 | T1 join | Setup: a server sandbox and an agent sandbox with NAT and `flannel` `wireguard-native`. The agent reaches `Ready`, and pods on the two nodes connect by pod address. A service with endpoints on both nodes answers. `kubectl logs` and `exec` work for a pod on the agent. |
-| C2 | T2 join | Setup: `wg-quick` in each guest, `flannel` VXLAN over `wg0`, and `--node-ip` set to the `wg0` address. The agent tunnel is off. Pods on the two nodes connect, and the API server reaches the `kubelet` directly. |
+| C2 | T2 join | Setup: a `wg0` link in each guest, made with `ip link` and `wg set`, `flannel` VXLAN over `wg0`, and `--node-ip` set to the `wg0` address. The agent tunnel is off. Pods on the two nodes connect, and the API server reaches the `kubelet` directly. |
 | C3 | Mixed kernels | A native `k3s` server on a Linux runner and a `gvx` agent on the same runner pass the criteria of C1. |
 | C4 | Control plane | Three server sandboxes with embedded etcd: after the end of the leader sandbox, the API answers again within 30 seconds. The test records the output of `etcdctl check perf`. |
 | C5 | Conformance | `sonobuoy --mode quick` and the `[sig-network] Services` conformance tests pass with the test pods on the `gvx` node. |
@@ -197,9 +197,12 @@ Hosted runners cover Linux and Windows. The hosted macOS runner cannot run `hvf`
 
 | Platform | Where | Tests |
 | :--- | :--- | :--- |
-| Linux `systrap` (`amd64`, `arm64`) | CI | A, B, C |
-| Windows `systrap` (`amd64`, `arm64`) and `whpx` (`amd64`) | CI | A, B, C1, C2 |
-| `hvf` | Development host, by hand | A, B, C1 |
+| Linux `systrap` (`amd64`, `arm64`) | CI | A, B, C. C5 runs on `amd64` only. |
+| Windows `systrap` (`amd64`, `arm64`) | CI | A, B, C1, C2 |
+| Windows `whpx` (`amd64`) | CI | A, B |
+| `hvf` | Development host, by hand | A, B, C1, C2, C4, C5 |
+
+The `whpx` backend runs one partition in each host process, and a test runs its sandboxes in one process. The tests with several sandboxes therefore skip `whpx`.
 
 ---
 

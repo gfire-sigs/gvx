@@ -401,6 +401,13 @@ func (s *Sandbox) Close() error {
 	}
 	s.closed = true
 
+	if s.netStack != nil {
+		// Stack.Close leaves the link endpoints open. Close the links that
+		// the guest created, such as wireguard devices, in every network
+		// mode.
+		netstack.RemoveRegisteredLinks(s.netStack)
+	}
+
 	var errs []error
 	if s.portForwarder != nil {
 		if err := s.portForwarder.Close(); err != nil {
@@ -425,9 +432,6 @@ func (s *Sandbox) Close() error {
 	}
 
 	if s.netStack != nil {
-		// Stack.Close leaves the link endpoints open. Close the links that
-		// the guest created, such as wireguard devices.
-		netstack.RemoveRegisteredLinks(s.netStack)
 		s.netStack.Close()
 		s.netStack = nil
 	}

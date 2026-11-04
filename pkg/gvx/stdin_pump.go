@@ -67,6 +67,12 @@ func (p *stdinPump) read(ctx context.Context, dst usermem.IOSequence) (int64, er
 		p.buf = p.buf[n:]
 		p.mu.Unlock()
 		copied, err := dst.CopyOut(ctx, chunk)
+		if copied < len(chunk) {
+			// Bytes that did not reach the guest stay unread, as in a pipe.
+			p.mu.Lock()
+			p.buf = append(chunk[copied:len(chunk):len(chunk)], p.buf...)
+			p.mu.Unlock()
+		}
 		return int64(copied), err
 	}
 	if p.err != nil {

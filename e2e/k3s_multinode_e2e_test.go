@@ -254,7 +254,28 @@ func dumpOnFailure(t *testing.T, g *runningGuest) {
 		if !t.Failed() {
 			return
 		}
-		if _, err := g.stdin.Write([]byte("dump\n")); err != nil {
+		select {
+		case <-g.finished:
+			return
+		default:
+		}
+		// The pipe write blocks until the guest reads it, and a guest that
+		// does not read never returns it. The cleanup that closes the pipe
+		// ends the goroutine.
+		written := make(chan error, 1)
+		go func() {
+			_, err := g.stdin.Write([]byte("dump\n"))
+			written <- err
+		}()
+		select {
+		case err := <-written:
+			if err != nil {
+				return
+			}
+		case <-g.finished:
+			return
+		case <-time.After(30 * time.Second):
+			t.Logf("guest did not read the dump request")
 			return
 		}
 		// The guest may be stuck, so the wait is a bounded poll and not a

@@ -53,7 +53,11 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test end-to-end registry gates
-        run: go test -count=1 -timeout 50m ./e2e
+        run: go test -count=1 -timeout 50m -skip '^TestE2EK3s' ./e2e
+      # The k3s tests of GVXIP-005 sections 4.2 and 4.3 run in their own step,
+      # so that their time does not count against the other gates.
+      - name: Test k3s nodes
+        run: go test -count=1 -timeout 100m -run '^TestE2EK3s(SingleNode|MultiNode(T1Join|T2Join|ControlPlaneFailover))$' ./e2e
       # C3 installs k3s on the runner with sudo. The step joins a gvx agent
       # to that server. GVXIP-005 section 4.3 names the test.
       - name: Test a gvx agent against a native k3s server
@@ -72,7 +76,7 @@ jobs:
     name: test windows/${{ matrix.arch }}
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +104,11 @@ jobs:
           go test -count=1 -timeout 30m -run 'TestE2EDockerRun.*/systrap' ./e2e
           go test -count=1 -timeout 40m -run 'TestE2EGateETExec.*/systrap' ./e2e
           go test -count=1 -timeout 40m -run 'TestE2EGateJVM/systrap' ./e2e
-          go test -count=1 -timeout 40m -run 'TestE2EK3sMultiNode(T1Join|T2Join)/systrap' ./e2e
+      # The whpx backend runs one partition in each process, so the tests with
+      # several sandboxes run on systrap only.
+      - name: Test k3s nodes
+        shell: bash
+        run: go test -count=1 -timeout 60m -run '^TestE2EK3s(SingleNode|MultiNode(T1Join|T2Join))$/^systrap$' ./e2e
       # Each -run value has one slash, so the pattern before it selects the
       # test and the pattern after it selects the subtest. The step fails
       # instead of skipping when whpx does not start, because
@@ -117,3 +125,4 @@ jobs:
           go test -count=1 -timeout 30m -run '^(TestE2EDockerRun.*|TestE2EMemoryCgroup.*)$/^whpx$' ./e2e
           go test -count=1 -timeout 40m -run '^TestE2EGateETExec.*$/^whpx$' ./e2e
           go test -count=1 -timeout 40m -run '^TestE2EGateJVM$/^whpx$' ./e2e
+          go test -count=1 -timeout 40m -run '^TestE2EK3sSingleNode$/^whpx$' ./e2e

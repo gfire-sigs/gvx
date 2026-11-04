@@ -152,7 +152,7 @@ The test `TestE2EK3sSingleNode` runs these checks on each backend.
 
 ### 4.2 Verified Behavior of a Cluster
 
-The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` start several sandboxes on one host. Each test uses only the flags of `k3s` and of the official images.
+The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` run their sandboxes on one host. The tests change no image and use no `gvx`-specific option. C2 and C4 copy the `wg` tool of Alpine into the guests, C4 copies `etcdctl`, and C5 copies `sonobuoy`.
 
 | Test | Topology | Result |
 | :--- | :--- | :--- |
