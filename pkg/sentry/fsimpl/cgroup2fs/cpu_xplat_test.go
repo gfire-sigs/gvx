@@ -214,3 +214,27 @@ func TestCPUStatUSecKeepsTheUsageAndClampsTheParts(t *testing.T) {
 		t.Errorf("cpuStatUSec with a negative part = (%d, %d, %d), want (1000, 1000, 0)", usage2, user, sys)
 	}
 }
+
+func TestRemovedCgroupAddsItsUsageToTheNearestParentController(t *testing.T) {
+	parentCPU := newTestCPU(t, nil)
+	parentCgroup := &cgroup{}
+	parentCgroup.closestCtrls.Store(&ctrlSet{kernel.Cgroup2CPU: parentCPU})
+	parentCPU.usage = usage.CPUStats{UserTime: 100 * time.Millisecond}
+
+	child := newTestCPU(t, parentCPU)
+	child.usage = usage.CPUStats{UserTime: 300 * time.Millisecond, SysTime: 50 * time.Millisecond}
+	child.c.parent = parentCgroup
+	child.c.ctrls[kernel.Cgroup2CPU] = child
+
+	child.c.releaseCPUBandwidth()
+
+	if got, want := parentCPU.usage.UserTime, 400*time.Millisecond; got != want {
+		t.Errorf("parent user time = %v, want %v", got, want)
+	}
+	if got, want := parentCPU.usage.SysTime, 50*time.Millisecond; got != want {
+		t.Errorf("parent system time = %v, want %v", got, want)
+	}
+	if child.usage != (usage.CPUStats{}) {
+		t.Errorf("the removed cgroup keeps usage %+v", child.usage)
+	}
+}

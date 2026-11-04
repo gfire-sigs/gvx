@@ -122,6 +122,9 @@ func runChecks() bool {
 		{"cpu-max-raised-to-max-resumes-task", checkRaisedToMax},
 		{"cpu-max-moving-task-to-free-cgroup-resumes-it", checkMigration},
 		{"cpu-max-disabling-controller-resumes-task", checkDisableController},
+		{"cpu-stat-usage-of-parent-includes-children", checkHierarchicalUsage},
+		{"cpu-stat-usage-of-parent-keeps-removed-children", checkRemovedChildUsage},
+		{"memory-stat-exists-at-root", checkRootMemoryStat},
 	}
 	// The sandbox does not enable controllers for the children of the root
 	// cgroup. The init script of docker:dind and of k3s does it, and so does
@@ -585,4 +588,139 @@ func checkDisableController() error {
 			return waitCPU(probeDir, resumeCPU, resumeLimit)
 		})
 	})
+}
+
+// usageTolerance is the difference that two readings of cpu.stat can have,
+// because the cgroups are read one after the other while the loops run.
+const usageTolerance = 150 * time.Millisecond
+
+// checkHierarchicalUsage runs one loop in each of two children and reads
+// usage_usec of the parent and of the children. The usage of the parent
+// includes its descendants, as in Linux. The probe reads the parent last, so the
+// parent can only read more than the sum.
+func checkHierarchicalUsage() error {
+	return withCgroup(probeDir, func() error {
+		if err := writeFile(probeDir, "cgroup.subtree_control", "+cpu"); err != nil {
+			return err
+		}
+		dirs := []string{probeDir + "/a", probeDir + "/b"}
+		return withCgroups(dirs, func() error {
+			var spinners []*spinner
+			defer func() {
+				for _, s := range spinners {
+					s.stop()
+				}
+			}()
+			for _, d := range dirs {
+				s, err := startSpinner(d)
+				if err != nil {
+					return err
+				}
+				spinners = append(spinners, s)
+			}
+			time.Sleep(2 * time.Second)
+			var sum uint64
+			for _, d := range dirs {
+				st, err := readStat(d)
+				if err != nil {
+					return err
+				}
+				sum += st.usageUSec
+			}
+			parent, err := readStat(probeDir)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("INFO parent usage %d us, children %d us\n", parent.usageUSec, sum)
+			if parent.usageUSec+uint64(usageTolerance.Microseconds()) < sum {
+				return fmt.Errorf("usage_usec of the parent is %d, below the %d of its children", parent.usageUSec, sum)
+			}
+			if parent.usageUSec < 2*uint64(time.Second.Microseconds()) {
+				return fmt.Errorf("usage_usec of the parent is %d, want at least 2 s from two busy loops in 2 s", parent.usageUSec)
+			}
+			return nil
+		})
+	})
+}
+
+// checkRemovedChildUsage removes a child cgroup that used CPU time. Linux keeps
+// the time in the usage of the parent.
+func checkRemovedChildUsage() error {
+	return withCgroup(probeDir, func() error {
+		if err := writeFile(probeDir, "cgroup.subtree_control", "+cpu"); err != nil {
+			return err
+		}
+		childDir := probeDir + "/" + childName
+		var before uint64
+		err := withCgroup(childDir, func() error {
+			s, err := startSpinner(childDir)
+			if err != nil {
+				return err
+			}
+			time.Sleep(time.Second)
+			s.stop()
+			st, err := readStat(probeDir)
+			if err != nil {
+				return err
+			}
+			before = st.usageUSec
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		after, err := readStat(probeDir)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("INFO parent usage %d us before and %d us after the removal of its child\n", before, after.usageUSec)
+		if before < 800_000 {
+			return fmt.Errorf("the parent showed %d us for a loop that ran 1 s", before)
+		}
+		if after.usageUSec+uint64(usageTolerance.Microseconds()) < before {
+			return fmt.Errorf("usage_usec of the parent fell from %d to %d when its child was removed", before, after.usageUSec)
+		}
+		return nil
+	})
+}
+
+// withCgroups makes the cgroups dirs, runs fn, and removes them.
+func withCgroups(dirs []string, fn func() error) error {
+	if len(dirs) == 0 {
+		return fn()
+	}
+	return withCgroup(dirs[0], func() error { return withCgroups(dirs[1:], fn) })
+}
+
+// checkRootMemoryStat reads memory.stat of the root cgroup, which the cAdvisor
+// of the kubelet reads for the memory of the node. The root accounts all memory,
+// so a running guest has anonymous and file memory.
+func checkRootMemoryStat() error {
+	data, err := os.ReadFile(rootDir + "/memory.stat")
+	if err != nil {
+		return err
+	}
+	fields := map[string]uint64{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if k, v, ok := strings.Cut(line, " "); ok {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				fields[k] = n
+			}
+		}
+	}
+	for _, k := range []string{"anon", "file", "kernel", "shmem", "file_mapped", "inactive_file", "active_file"} {
+		if _, ok := fields[k]; !ok {
+			return fmt.Errorf("memory.stat of the root has no key %s:\n%s", k, data)
+		}
+	}
+	fmt.Printf("INFO root memory.stat: anon %d file %d kernel %d\n", fields["anon"], fields["file"], fields["kernel"])
+	if fields["anon"]+fields["file"] == 0 {
+		return fmt.Errorf("anon + file of the root is 0:\n%s", data)
+	}
+	for _, name := range []string{"memory.current", "memory.max"} {
+		if _, err := os.Stat(rootDir + "/" + name); err == nil {
+			return fmt.Errorf("the root cgroup has %s, which Linux does not create", name)
+		}
+	}
+	return nil
 }

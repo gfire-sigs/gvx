@@ -100,7 +100,14 @@ func (ms *memoryStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	collectMemCgIDs(ms.m.c, memCgIDs)
 	ms.m.c.fs.treeMu.RUnlock()
 
-	memoryStatFor(getUsageStats(k, memCgIDs)).writeTo(buf)
+	stats := getUsageStats(k, memCgIDs)
+	if ms.m.c.parent == nil {
+		// The root cgroup accounts all memory of the sandbox, also the memory of
+		// tasks that no memory cgroup owns. Linux has memory.stat at the root for
+		// this, and the cAdvisor of the kubelet reads it for the memory of the node.
+		stats, _ = usage.MemoryAccounting.CopyPerCg(0)
+	}
+	memoryStatFor(stats).writeTo(buf)
 	return nil
 }
 
