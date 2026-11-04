@@ -459,7 +459,7 @@ A guest access through `%fs` can still fault when Windows resets the base during
 
 The Sentry reads guest memory with `ReadProcessMemory`. It writes guest memory only when `VirtualQueryEx` shows a writable view, because `WriteProcessMemory` makes a read-only page writable. A write must fault in that case, so that the memory manager can copy the page, or the engine can map the original frame of a code block. The Sentry does not run an atomic instruction, because other guest threads run during the stop.
 
-For an instruction that the Sentry does not run, the thread runs the instruction again after the trampoline. Eight such repairs in a row at one address with identical registers count as a real fault. The engine allows 512 threads in one stub.
+For an instruction that the Sentry does not run, the thread runs the instruction again after the trampoline. Eight such repairs in a row at one address with identical registers count as a real fault. The engine then reports SIGSEGV to that guest thread, with the near-zero address of the lost base. It does not stop the Sentry, and it does not end the process of the thread. The guest process dies when the signal has no handler, as in a Go program. The trace line `no FS repair, 8 repairs at pc` names the FS base, the fault address, the access, and the bytes and text of the instruction. The engine allows 512 threads in one stub.
 
 Before the Sentry ran the instruction, every repair used the trampoline. With many busy threads, the thread lost the base again before it reached the instruction, and its registers did not change. Node.js guests then hit the limit of eight repairs at loads such as `mov rax, fs:[0x28]` and received SIGSEGV (issue #24).
 
