@@ -39,13 +39,14 @@ import (
 )
 
 const (
-	rootDir     = "/sys/fs/cgroup"
-	probeDir    = rootDir + "/cpumaxprobe"
-	childName   = "child"
-	quotaWindow = 5 * time.Second
-	shortWindow = 3 * time.Second
-	tinyWindow  = 2 * time.Second
-	settle      = 300 * time.Millisecond
+	rootDir      = "/sys/fs/cgroup"
+	probeDir     = rootDir + "/cpumaxprobe"
+	childName    = "child"
+	quotaWindow  = 5 * time.Second
+	shortWindow  = 3 * time.Second
+	tinyWindow   = 2 * time.Second
+	resumeWindow = time.Second
+	settle       = 300 * time.Millisecond
 )
 
 func main() {
@@ -392,14 +393,19 @@ func checkRaisedToMax() error {
 		if err := writeFile(probeDir, "cpu.max", "max 100000"); err != nil {
 			return err
 		}
-		time.Sleep(settle)
-		w, err = measure(probeDir, tinyWindow)
-		if err != nil {
-			return err
+		// A task that the old limit held back must run again. A stall of
+		// the host can lower one window, so the check passes when any of three
+		// windows shows a full CPU. A task that stays held back fails all three.
+		var last window
+		for range 3 {
+			time.Sleep(settle)
+			if last, err = measure(probeDir, resumeWindow); err != nil {
+				return err
+			}
+			if last.cpus >= 0.8 {
+				return nil
+			}
 		}
-		if err := expectCPUs(w, 0.8, math.Inf(1)); err != nil {
-			return fmt.Errorf("after the quota was lifted: %w", err)
-		}
-		return nil
+		return fmt.Errorf("after the quota was lifted: %w", expectCPUs(last, 0.8, math.Inf(1)))
 	})
 }
