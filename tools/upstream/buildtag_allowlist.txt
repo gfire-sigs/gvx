@@ -98,6 +98,7 @@ seam pkg/sentry/fsimpl/cgroup2fs/memory.go
 # (pkg/sentry/kernel/task_cpu_bandwidth_xplat.go, pkg/sentry/fsimpl/cgroup2fs/cpu_xplat.go).
 seam pkg/sentry/fsimpl/cgroup2fs/cpu.go
 seam pkg/sentry/fsimpl/cgroup2fs/cgroup.go
+seam pkg/sentry/kernel/task.go
 seam pkg/sentry/kernel/task_run.go
 seam pkg/sentry/kernel/task_sched.go
 # Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
