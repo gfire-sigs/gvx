@@ -155,7 +155,6 @@ Use the `ext4lite` volume unless you need the files as host files. The volume im
 | `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the highest score when the use passes the limit. Section 6.4 gives the details. |
 | `docker run --cpus` | `--cpus` becomes `cpu.max`, and the Sentry enforces it. Section 6.5 gives the details. |
 | `--memory-reservation`, `--memory-swap`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
-| `--icc=false` | `dockerd` starts with it, but the bridge does not pass frames through `iptables`. Two containers of one bridge can still reach each other. |
 
 ### 6.3 Security
 
