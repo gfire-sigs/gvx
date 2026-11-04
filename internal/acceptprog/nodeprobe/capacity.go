@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -120,6 +121,38 @@ func capacityChecks(mem uint64, cpus int) []check {
 			}
 			if got != cpus {
 				return fmt.Errorf("/proc/cpuinfo lists %d processors, want %d", got, cpus)
+			}
+			return nil
+		}},
+	}
+}
+
+// memTotalChecks prints MemTotal, waits, and checks that the value stays. The
+// test starts several sandboxes at once, so the wait makes their runs overlap.
+func memTotalChecks() []check {
+	var first uint64
+	return []check{
+		{"memtotal-first-read", func() error {
+			var err error
+			first, err = meminfoTotal()
+			fmt.Printf("MEMTOTAL %d\n", first)
+			return err
+		}},
+		{"memtotal-stays-while-other-sandboxes-run", func() error {
+			time.Sleep(2 * time.Second)
+			got, err := meminfoTotal()
+			if err != nil {
+				return err
+			}
+			if got != first {
+				return fmt.Errorf("MemTotal changed from %d to %d", first, got)
+			}
+			var si unix.Sysinfo_t
+			if err := unix.Sysinfo(&si); err != nil {
+				return err
+			}
+			if total := uint64(si.Totalram) * uint64(si.Unit); total+uint64(os.Getpagesize()) < first || total > first+uint64(os.Getpagesize()) {
+				return fmt.Errorf("sysinfo totalram = %d, MemTotal = %d", total, first)
 			}
 			return nil
 		}},

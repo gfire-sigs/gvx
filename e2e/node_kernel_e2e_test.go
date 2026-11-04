@@ -238,3 +238,43 @@ func serveStream(ln net.Listener, size int) {
 		}()
 	}
 }
+
+// TestE2ENodeKernelA6MemTotalIsPerSandbox starts three sandboxes of one process
+// at once, with the limits 1 GiB and 2 GiB and with no limit. Each guest must
+// see its own MemTotal for the whole time that the others run.
+func TestE2ENodeKernelA6MemTotalIsPerSandbox(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		const small, large = 1 << 30, 2 << 30
+		limits := []struct {
+			name  string
+			limit int64
+		}{{"1g", small}, {"2g", large}, {"none", 0}}
+		got := make([]uint64, len(limits))
+		t.Run("sandboxes", func(t *testing.T) {
+			for i, l := range limits {
+				t.Run(l.name, func(t *testing.T) {
+					t.Parallel()
+					code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
+						cfg.Resources = gvx.Resources{MemoryBytes: l.limit}
+					}, "memtotal")
+					requireNodeChecks(t, code, out, "memtotal-stays-while-other-sandboxes-run")
+					_, rest, ok := strings.Cut(out, "MEMTOTAL ")
+					if !ok {
+						return
+					}
+					first, _, _ := strings.Cut(rest, "\n")
+					got[i], _ = strconv.ParseUint(first, 10, 64)
+				})
+			}
+		})
+		if t.Failed() || t.Skipped() {
+			return
+		}
+		if got[0] != small || got[1] != large {
+			t.Errorf("MemTotal with limits 1 GiB and 2 GiB = %d and %d, want %d and %d", got[0], got[1], uint64(small), uint64(large))
+		}
+		if got[2] <= large {
+			t.Errorf("MemTotal without a limit = %d, want the RAM of the host, above 2 GiB", got[2])
+		}
+	})
+}

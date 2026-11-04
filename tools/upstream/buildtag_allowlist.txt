@@ -129,6 +129,10 @@ seam pkg/sentry/fsimpl/sys/sys.go
 # the read and write system calls add (pkg/sentry/usage/io_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks.go
 seam pkg/sentry/usage/io.go
+# /proc/meminfo and sysinfo(2) ask the kernel for the total memory, which a sandbox with a memory
+# limit sets for its own kernel (pkg/sentry/kernel/total_memory_xplat.go).
+seam pkg/sentry/fsimpl/proc/tasks_files.go
+seam pkg/sentry/syscalls/linux/sys_sysinfo.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin

@@ -916,15 +916,14 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	defer mf.Destroy()
 
 	hostRAM, _ := hostMemory()
-	if s.cfg.Resources.MemoryBytes > 0 {
-		defer setReportedMemory(reportedMemory(s.cfg.Resources.MemoryBytes, hostRAM))()
-	}
-
 	k := &kernel.Kernel{
 		Platform:  s.plat,
 		AllowSUID: s.cfg.AllowSUID,
 	}
 	k.SetMemoryFile(mf)
+	if s.cfg.Resources.MemoryBytes > 0 {
+		k.SetReportedMemory(reportedMemory(s.cfg.Resources.MemoryBytes, hostRAM))
+	}
 
 	vdso, err := loader.PrepareVDSO(mf)
 	if err != nil {

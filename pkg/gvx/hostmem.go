@@ -59,20 +59,6 @@ func reportedMemory(configured int64, hostRAM uint64) uint64 {
 	return hostRAM
 }
 
-// setReportedMemory sets the total memory that the Sentry reports and returns a
-// function that restores the previous values. The values are process-wide, as
-// those of applyHostMemoryDefaults. The caller restores them after the guest
-// ends, so a later sandbox in the same process starts with the old values.
-func setReportedMemory(total uint64) (restore func()) {
-	oldMin, oldMax := usage.MinimumTotalMemoryBytes, usage.MaximumTotalMemoryBytes
-	usage.MinimumTotalMemoryBytes = total
-	usage.MaximumTotalMemoryBytes = total
-	return func() {
-		usage.MinimumTotalMemoryBytes = oldMin
-		usage.MaximumTotalMemoryBytes = oldMax
-	}
-}
-
 // effectiveMemoryLimit returns the memory limit that the guard enforces and
 // its poll interval. A limit that the caller sets wins. Without one, the
 // guard stops a guest that passes the RAM of the host. Zero means no guard.

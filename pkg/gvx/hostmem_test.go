@@ -17,8 +17,6 @@ package gvx
 import (
 	"testing"
 	"time"
-
-	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 func TestEffectiveMemoryLimit(t *testing.T) {
@@ -63,22 +61,5 @@ func TestReportedMemoryFollowsTheLimitBelowTheHostRAM(t *testing.T) {
 				t.Errorf("reportedMemory(%d, %d) = %d, want %d", tc.configured, tc.hostRAM, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestSetReportedMemoryRestoresTheSentryValues(t *testing.T) {
-	const total = 3 << 30
-	beforeMin, beforeMax := usage.MinimumTotalMemoryBytes, usage.MaximumTotalMemoryBytes
-	restore := setReportedMemory(total)
-	if got := usage.TotalMemory(1<<20, 0); got != total {
-		t.Errorf("TotalMemory with a small memory file = %d, want the reported %d", got, uint64(total))
-	}
-	if got := usage.TotalMemory(1<<40, 0); got != total {
-		t.Errorf("TotalMemory with a huge memory file = %d, want the reported %d", got, uint64(total))
-	}
-	restore()
-	if usage.MinimumTotalMemoryBytes != beforeMin || usage.MaximumTotalMemoryBytes != beforeMax {
-		t.Errorf("limits after restore = %d and %d, want %d and %d",
-			usage.MinimumTotalMemoryBytes, usage.MaximumTotalMemoryBytes, beforeMin, beforeMax)
 	}
 }
