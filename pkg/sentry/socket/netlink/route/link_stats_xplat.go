@@ -37,7 +37,7 @@ func (p *Protocol) addNewLinkMessageWithStats(ms *nlmsg.MessageSet, stack inet.S
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.RTM_NEWLINK,
 	})
-	writeLinkInfo(m, idx, i)
+	writeLinkInfo(m, idx, i, stack)
 
 	var dev inet.StatDev
 	if err := stack.Statistics(&dev, i.Name); err != nil {
