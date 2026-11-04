@@ -61,6 +61,7 @@ const (
 	nodeProbePackage   = "z.gfire.dev/gvx/internal/acceptprog/nodeprobe"
 	membarrierPackage  = "z.gfire.dev/gvx/internal/acceptprog/membarrierprobe"
 	cpuMaxPackage      = "z.gfire.dev/gvx/internal/acceptprog/cpumaxprobe"
+	eintrPackage       = "z.gfire.dev/gvx/internal/acceptprog/eintrprobe"
 	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
@@ -305,6 +306,14 @@ func BuildMicroBench(tb testing.TB, goarch string) string {
 func BuildMembarrierProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, membarrierPackage, "membarrierprobe", goarch, 0)
+}
+
+// BuildEINTRProbe compiles the guest eintrprobe, which sends signals to threads
+// that block in socket calls, for the Linux architecture goarch and returns the
+// path of the static ET_EXEC executable.
+func BuildEINTRProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, eintrPackage, "eintrprobe", goarch, 0)
 }
 
 // BuildCPUMaxProbe compiles the guest cpumaxprobe, which makes cgroups with a

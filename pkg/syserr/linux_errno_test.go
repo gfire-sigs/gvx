@@ -174,3 +174,27 @@ func TestToErrorOfNotConnectedRoundTrips(t *testing.T) {
 		t.Fatalf("round trip gave %d, want %d", got.ToLinux(), errno.ENOTCONN)
 	}
 }
+
+// TestInterruptedErrorConvertsToRestart checks that a blocking socket call that
+// an interrupt ends still gets the restart error. The socket calls translate the
+// result of Error.ToError with linuxerr.ConvertIntr. A missed translation shows
+// the guest EINTR, also when the guest signal handler has SA_RESTART or when no
+// signal arrived. Linux returns EINTR to the guest only for a handler without
+// SA_RESTART.
+func TestInterruptedErrorConvertsToRestart(t *testing.T) {
+	for name, in := range map[string]error{
+		"ErrInterrupted": linuxerr.ErrInterrupted,
+		"EINTR":          linuxerr.EINTR,
+	} {
+		e := FromError(in)
+		if e.ToLinux() != errno.EINTR {
+			t.Fatalf("%s: FromError gave errno %d, want EINTR", name, e.ToLinux())
+		}
+		if got := linuxerr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS); got != linuxerr.ERESTARTSYS {
+			t.Errorf("%s: ConvertIntr(ToError()) = %v, want ERESTARTSYS", name, got)
+		}
+	}
+	if got := linuxerr.ConvertIntr(ErrInterrupted.ToError(), linuxerr.ERESTARTSYS); got != linuxerr.ERESTARTSYS {
+		t.Errorf("ConvertIntr(ErrInterrupted.ToError()) = %v, want ERESTARTSYS", got)
+	}
+}
