@@ -60,9 +60,17 @@ func fromLinuxErrno(n errno.Errno) *Error {
 // would then look up a Linux number in the host table and panic. For example,
 // Linux ENOTCONN (107) has no entry in the macOS table. A linuxerr error keeps
 // the Linux number on every host. ExtractErrno and FromError both accept it.
+//
+// EINTR gets linuxerr.ErrInterrupted, the value that blocking calls return when
+// an interrupt ends them. linuxerr.ConvertIntr matches that value and
+// unix.EINTR, but not linuxerr.EINTR. A different value turns a restartable
+// call, such as recvmsg(2), into a call that fails with EINTR.
 func backwardsError(e *Error) error {
 	if runtime.GOOS == "linux" {
 		return unix.Errno(e.errno)
+	}
+	if e.errno == errno.EINTR {
+		return linuxerr.ErrInterrupted
 	}
 	if le := lookupLinuxerr(e.errno); le != nil {
 		return le

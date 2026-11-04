@@ -52,6 +52,9 @@ This release adds the Linux kernel interfaces that the `kubelet`, `containerd`, 
 
 ### Bug Fixes
 
+- **`EINTR` from a blocked socket call on Windows and macOS**: a signal ended a blocked `recvfrom`, `recvmsg`, `accept`, or `connect` with `EINTR`, also when the handler had `SA_RESTART`. Linux restarts the call. A signal that the Go runtime sends, such as `SIGURG` or `SIGCHLD`, is enough. `kubectl exec` then failed at random with `unable to start container process: reading from parent failed: fetch packet length from socket: interrupted system call`, because `runc` reads its sync socket with `recvfrom`.
+  - `Error.ToError` returned `linuxerr.EINTR` on those hosts, and `linuxerr.ConvertIntr` does not match that value. It now returns `linuxerr.ErrInterrupted`. A handler without `SA_RESTART` still gives `EINTR`.
+  - The error came with the fix for the host panic on `ENOTCONN`. It showed on `windows/arm64` in 6 of 40 `kubectl exec` runs. `darwin` had the same fault.
 - **Busy loops that cannot stop on the Windows `systrap` engine**: `Interrupt` stops a running thread with the single-step flag. The step exception clears that flag. When the step landed in engine code, the engine continued the thread without the flag. The thread then ran on, and every later `Interrupt` returned without a stop.
   - A guest loop without system calls then ignored `SIGKILL`, and the sandbox did not exit. The engine now sets the flag again before it continues the thread.
   - The code is shared by `windows/amd64` and `windows/arm64`. The hang showed on `windows/amd64`.
