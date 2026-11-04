@@ -63,11 +63,78 @@ These steps start a `k3s` server and connect `kubectl` on the host to it. You ne
 
 A Service of the type `NodePort` with a port from 30000 to 30019 is then reachable at `127.0.0.1:<port>` on the host.
 
-## 3. Reference
+## 3. Start a Cluster with Two Nodes (Procedural Module)
+
+These steps start a server and an agent in two sandboxes on one host. The agent reaches the server through the published port on the host, which a guest sees at `10.0.2.2`. `flannel` carries the pod traffic between the nodes in WireGuard over the published UDP port 51820.
+
+> [!IMPORTANT]
+> Stop the single-node server of section 2 first. Both setups publish the host port 6443.
+
+1. Create a directory for the kubeconfig.
+
+   ```sh
+   mkdir -p ~/.gvx/k3s
+   ```
+
+2. Start the server in a terminal. Replace `my-token` with a secret of your choice.
+
+   ```sh
+   rungv run \
+     -e IPTABLES_MODE=legacy \
+     --hostname server \
+     -p 127.0.0.1:6443:6443 \
+     -p 127.0.0.1:51820:51820/udp \
+     -v k3s-server:/var/lib/rancher \
+     --mount type=bind,src=$HOME/.gvx/k3s,dst=/output \
+     rancher/k3s:v1.31.4-k3s1 server \
+     --token my-token \
+     --tls-san 10.0.2.2 \
+     --advertise-address 10.0.2.2 \
+     --advertise-port 6443 \
+     --node-external-ip 10.0.2.2 \
+     --flannel-backend=wireguard-native \
+     --flannel-external-ip \
+     --disable=traefik,servicelb \
+     --write-kubeconfig=/output/kubeconfig.yaml \
+     --write-kubeconfig-mode=644
+   ```
+
+3. Wait for the line `k3s is up and running`.
+
+4. Start the agent in a second terminal. Use the same token.
+
+   ```sh
+   rungv run \
+     -e IPTABLES_MODE=legacy \
+     --hostname agent \
+     -v k3s-agent:/var/lib/rancher \
+     rancher/k3s:v1.31.4-k3s1 agent \
+     --server https://10.0.2.2:6443 \
+     --token my-token \
+     --node-external-ip 192.0.2.1
+   ```
+
+5. Point `kubectl` at the cluster in a third terminal.
+
+   ```sh
+   export KUBECONFIG=$HOME/.gvx/k3s/kubeconfig.yaml
+   ```
+
+6. Verify the nodes.
+
+   ```sh
+   kubectl get nodes
+   ```
+
+   Both nodes show the status `Ready`.
+
+The agent publishes no port. It starts the WireGuard handshake, so the server learns the endpoint of the agent. The agent needs `--node-external-ip` because `k3s agent` refuses `--flannel-external-ip`, and the address `192.0.2.1` is a placeholder. Both nodes show the internal address `10.0.2.15`. `kubectl logs` and `kubectl exec` reach the agent through the tunnel of `k3s`.
+
+## 4. Reference
 
 The tables below list the behavior that the tests prove and the limits of a `gvx` node.
 
-### 3.1 Verified Behavior
+### 4.1 Verified Behavior of a Single Node
 
 The test `TestE2EK3sSingleNode` runs these checks on each backend.
 
@@ -83,7 +150,19 @@ The test `TestE2EK3sSingleNode` runs these checks on each backend.
 | Metrics | `kubectl top node` and `kubectl top pod` print values |
 | Restart | The node returns with the same name after a restart, and its pods start again |
 
-### 3.2 Known Limits
+### 4.2 Verified Behavior of a Cluster
+
+The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` start several sandboxes on one host. Each test uses only the flags of `k3s` and of the official images.
+
+| Test | Topology | Result |
+| :--- | :--- | :--- |
+| C1 | Section 3: the agent joins through the published API port, and `flannel` uses `wireguard-native` | Both nodes are `Ready`. Pods on the two nodes reach each other, a service with an endpoint on each node, and the DNS name of that service. `kubectl logs` and `kubectl exec` reach the agent. |
+| C2 | A WireGuard mesh `wg0` between the guests, set up with `ip` and `wg`. `k3s` uses the `wg0` addresses with `--flannel-iface wg0` and `--egress-selector-mode disabled` | The C1 checks pass, and the API server connects to the kubelet of the agent directly over `wg0`. |
+| C3 | A `gvx` agent joins a server that runs natively on a Linux host | The C1 checks pass. |
+| C4 | Three servers with embedded `etcd` over the WireGuard mesh, joined one at a time | The cluster keeps working when the `etcd` leader stops. A surviving server accepts a write within 30 seconds. The tests measured 5 to 9 seconds. |
+| C5 | `sonobuoy` with the `e2e` plugin | The quick mode passes. The `[sig-network] Services` tests pass. |
+
+### 4.3 Known Limits
 
 These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reasons.
 
