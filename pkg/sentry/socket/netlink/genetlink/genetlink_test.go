@@ -15,7 +15,9 @@
 package genetlink
 
 import (
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -26,13 +28,34 @@ import (
 
 func noop(context.Context, *Request, *Reply) *syserr.Error { return nil }
 
-func TestRegisterFamilyAssignsIDsAfterTheController(t *testing.T) {
-	f := &Family{Name: "test-assign", Version: 3, Ops: []Op{{Cmd: 1, Do: noop}}}
+// testRuns makes the family names unique for each run, so that -count=2 does
+// not register a name twice.
+var testRuns atomic.Int32
+
+// uniqueName returns a family name that no other run of the tests uses.
+func uniqueName(base string) string {
+	return fmt.Sprintf("%s-%d", base, testRuns.Add(1))
+}
+
+// registerTestFamily registers f and removes it when the test ends.
+func registerTestFamily(t *testing.T, f *Family) {
+	t.Helper()
 	RegisterFamily(f)
+	t.Cleanup(func() {
+		registryMu.Lock()
+		defer registryMu.Unlock()
+		delete(byID, f.id)
+		delete(byName, f.Name)
+	})
+}
+
+func TestRegisterFamilyAssignsIDsAfterTheController(t *testing.T) {
+	f := &Family{Name: uniqueName("test-assign"), Version: 3, Ops: []Op{{Cmd: 1, Do: noop}}}
+	registerTestFamily(t, f)
 	if f.ID() <= ControllerID {
 		t.Errorf("ID = %#x, want an ID above %#x", f.ID(), ControllerID)
 	}
-	if lookupID(f.ID()) != f || lookupName("test-assign") != f {
+	if lookupID(f.ID()) != f || lookupName(f.Name) != f {
 		t.Error("the registry does not find the family by ID and by name")
 	}
 	if c := lookupName("nlctrl"); c == nil || c.ID() != ControllerID {
@@ -48,12 +71,13 @@ func TestRegisterFamilyAssignsIDsAfterTheController(t *testing.T) {
 }
 
 func TestRegisterFamilyRejectsInvalidFamilies(t *testing.T) {
-	RegisterFamily(&Family{Name: "test-twice"})
+	twice := uniqueName("test-twice")
+	registerTestFamily(t, &Family{Name: twice})
 	for name, f := range map[string]*Family{
-		"duplicate name":  {Name: "test-twice"},
+		"duplicate name":  {Name: twice},
 		"empty name":      {},
 		"name too long":   {Name: strings.Repeat("x", maxNameLen)},
-		"command no code": {Name: "test-nocode", Ops: []Op{{Cmd: 1}}},
+		"command no code": {Name: uniqueName("test-nocode"), Ops: []Op{{Cmd: 1}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer func() {

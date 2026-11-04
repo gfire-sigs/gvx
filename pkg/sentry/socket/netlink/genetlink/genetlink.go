@@ -54,6 +54,14 @@ const (
 	// previous message in its own datagram. It is the size of one socket
 	// buffer page of libmnl, less room for the header of the next message.
 	dumpMessageLimit = 3584
+
+	// dumpByteLimit is the size of all messages of one dump. A netlink socket
+	// buffers 208 KiB of answers, and it drops a datagram when the buffer is
+	// full. The Sentry builds a dump at once and has no way to wait for the
+	// reader, so a dump that would pass the limit fails with ENOBUFS. A dump
+	// then never ends with NLMSG_DONE after a lost message. The limit leaves
+	// 16 KiB for the end of the dump.
+	dumpByteLimit = 192 << 10
 )
 
 // OpFlags are the GENL_* command flags of include/uapi/linux/genetlink.h.
@@ -110,6 +118,8 @@ type Dump struct {
 	socket *netlink.Socket
 	ctx    context.Context
 	ms     *nlmsg.MessageSet
+	// sent is the size of the messages that the dump already sent.
+	sent int
 }
 
 // Message starts a dump message for the command cmd. The previous message of
@@ -133,9 +143,32 @@ func (d *Dump) flush() *syserr.Error {
 	if len(d.ms.Messages) == 0 {
 		return nil
 	}
+	if err := d.account(); err != nil {
+		return err
+	}
+	d.sent += d.pending()
 	part := &nlmsg.MessageSet{PortID: d.ms.PortID, Seq: d.ms.Seq, Messages: d.ms.Messages}
 	d.ms.Clear()
 	return d.socket.SendResponse(d.ctx, part)
+}
+
+// pending returns the size of the messages that the dump holds, with the
+// alignment that the socket adds.
+func (d *Dump) pending() int {
+	n := 0
+	for _, m := range d.ms.Messages {
+		n += (len(m.Buffer()) + linux.NLMSG_ALIGNTO - 1) &^ (linux.NLMSG_ALIGNTO - 1)
+	}
+	return n
+}
+
+// account fails with ENOBUFS when the held messages would take the dump past
+// dumpByteLimit.
+func (d *Dump) account() *syserr.Error {
+	if d.sent+d.pending() > dumpByteLimit {
+		return syserr.ErrNoBufferSpace
+	}
+	return nil
 }
 
 // newMessage adds a message with the generic netlink header to ms.
@@ -321,7 +354,12 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 			return syserr.ErrNotSupported
 		}
 		ms.Multi = true
-		if err := op.Dump(ctx, req, &Dump{family: f, socket: s, ctx: ctx, ms: ms}); err != nil {
+		d := &Dump{family: f, socket: s, ctx: ctx, ms: ms}
+		err := op.Dump(ctx, req, d)
+		if err == nil {
+			err = d.account()
+		}
+		if err != nil {
 			// Drop the unfinished message. The socket then sends only the error.
 			ms.Clear()
 			ms.Multi = false
