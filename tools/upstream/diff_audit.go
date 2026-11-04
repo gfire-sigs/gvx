@@ -121,6 +121,7 @@ var tier1Prefixes = []string{
 	"pkg/sentry/fsimpl/ext4lite/",
 	"pkg/sentry/fsimpl/chunkcache/",
 	"pkg/sentry/socket/netlink/genetlink/",
+	"pkg/tcpip/link/vxlan/",
 	"pkg/sentry/platform/hvcommon/",
 	"e2e/",
 	"tools/upstream/",
