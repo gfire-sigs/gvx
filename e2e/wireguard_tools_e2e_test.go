@@ -63,6 +63,18 @@ type runningGuest struct {
 	stdin    *io.PipeWriter
 	finished chan struct{}
 	res      guestResult
+	// stop cancels the Run of the guest. The cleanup of the test calls it
+	// too, and a second call has no effect.
+	stop context.CancelFunc
+}
+
+// end closes the input of the guest, cancels its Run, and waits until Run
+// returns. A guest that waits for input in a read of its stdin pipe ignores
+// the cancel until the pipe closes, so the pipe closes first.
+func (g *runningGuest) end() {
+	g.stdin.Close()
+	g.stop()
+	<-g.finished
 }
 
 // startGuest creates the sandbox of spec and runs it in the background. The
@@ -79,14 +91,13 @@ func startGuest(t *testing.T, ctx context.Context, spec guestSpec) *runningGuest
 	}
 	g.sb = sb
 	runCtx, stop := context.WithCancel(ctx)
+	g.stop = stop
 	go func() {
 		defer close(g.finished)
 		g.res.code, g.res.err = sb.Run(runCtx)
 	}()
 	t.Cleanup(func() {
-		stdinW.Close()
-		stop()
-		<-g.finished
+		g.end()
 		if t.Failed() {
 			t.Logf("guest output:\n%s", g.out.String())
 		}
