@@ -175,8 +175,8 @@ Several sandboxes on one host form the clusters, so CI can run these tests. C3 a
 
 | ID | Behavior | Pass criterion |
 | :--- | :--- | :--- |
-| C1 | T1 join | A server sandbox and an agent sandbox with NAT and `flannel` `wireguard-native`: the agent reaches `Ready`, pods on the two nodes connect by pod address, a service with endpoints on both nodes answers, and `kubectl logs` and `exec` work for a pod on the agent. |
-| C2 | T2 join | `wg-quick` in each guest, `flannel` VXLAN over `wg0`, `--node-ip` set to the `wg0` address, and the agent tunnel off: pods on the two nodes connect, and the API server reaches the `kubelet` directly. |
+| C1 | T1 join | Setup: a server sandbox and an agent sandbox with NAT and `flannel` `wireguard-native`. The agent reaches `Ready`, and pods on the two nodes connect by pod address. A service with endpoints on both nodes answers. `kubectl logs` and `exec` work for a pod on the agent. |
+| C2 | T2 join | Setup: `wg-quick` in each guest, `flannel` VXLAN over `wg0`, and `--node-ip` set to the `wg0` address. The agent tunnel is off. Pods on the two nodes connect, and the API server reaches the `kubelet` directly. |
 | C3 | Mixed kernels | A native `k3s` server on a Linux runner and a `gvx` agent on the same runner pass the criteria of C1. |
 | C4 | Control plane | Three server sandboxes with embedded etcd: after the end of the leader sandbox, the API answers again within 30 seconds. The test records the output of `etcdctl check perf`. |
 | C5 | Conformance | `sonobuoy --mode quick` and the `[sig-network] Services` conformance tests pass with the test pods on the `gvx` node. |
