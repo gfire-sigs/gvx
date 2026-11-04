@@ -63,10 +63,9 @@ func TestParseNdmsgReadsTheShortAndTheLongFormOfAnFDBDump(t *testing.T) {
 		if tc.long && (nd.state != 0 || nd.flags != 0) {
 			t.Errorf("%s: state %#x and flags %#x come from ifi_flags, want 0", tc.name, nd.state, nd.flags)
 		}
+		// dumpNeigh reads the bridge from the key ndaMaster.
 		var master uint32
 		if v, ok := attrs[ndaMaster]; ok {
-			master, _ = v.Uint32()
-		} else if v, ok := attrs[iflaMaster]; ok {
 			master, _ = v.Uint32()
 		}
 		if master != tc.wantMaster {

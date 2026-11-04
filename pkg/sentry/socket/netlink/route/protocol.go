@@ -177,6 +177,9 @@ func (p *Protocol) newLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		return syserr.ErrProtocolNotSupported
 	}
 
+	if err := changeLinkInfo(ctx, s, msg); err != nil {
+		return err
+	}
 	return stack.SetInterface(ctx, msg)
 }
 
@@ -192,6 +195,9 @@ func (p *Protocol) setLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		return syserr.ErrInvalidArgument
 	}
 
+	if err := changeLinkInfo(ctx, s, msg); err != nil {
+		return err
+	}
 	return stack.SetInterface(ctx, msg)
 }
 

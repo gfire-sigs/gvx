@@ -114,9 +114,10 @@ func parseNdmsg(msg *nlmsg.Message) (ndmsg, map[uint16]nlmsg.BytesView, bool) {
 		bodyEnd = ifinfoSize
 	}
 	attrs, ok := nlmsg.AttrsView(b[bodyEnd:]).Parse()
-	if _, master := attrs[iflaMaster]; master && bodyEnd == ndmsgSize {
-		// The short form names the bridge in IFLA_MASTER, as the long form does.
-		attrs[ndaMaster] = attrs[iflaMaster]
+	if v, master := attrs[iflaMaster]; master {
+		// Both forms name the bridge in IFLA_MASTER. A request of the type
+		// struct ndmsg names it in NDA_MASTER, which dumpNeigh reads.
+		attrs[ndaMaster] = v
 	}
 	return nd, attrs, ok
 }
@@ -226,18 +227,19 @@ func nudOf(s stack.NeighborState) uint16 {
 	return 0
 }
 
+// maxStaticNeighbors is the largest count of static entries in the neighbor
+// table of one link and one IP family. The table of the stack does not bound
+// them, and a guest could fill the memory of the sandbox otherwise. Linux
+// answers a full table with ENOBUFS.
+const maxStaticNeighbors = 65536
+
 // findNeigh returns the entry of the key, if the table of the link has one.
 func findNeigh(st *netstack.Stack, k neighKey) (stack.NeighborEntry, bool, *syserr.Error) {
-	entries, err := st.Stack.Neighbors(k.nic, k.proto)
+	e, ok, err := st.Stack.NeighborLookup(k.nic, k.proto, k.addr)
 	if err != nil {
 		return stack.NeighborEntry{}, false, syserr.TranslateNetstackError(err)
 	}
-	for _, e := range entries {
-		if e.Addr == k.addr {
-			return e, true, nil
-		}
-	}
-	return stack.NeighborEntry{}, false, nil
+	return e, ok, nil
 }
 
 // putNeigh appends one RTM_NEWNEIGH message for an entry of the neighbor table.
@@ -276,6 +278,15 @@ func newNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, fl
 		return nil
 	case !exists && flags&linux.NLM_F_CREATE == 0:
 		return syserr.ErrNoFileOrDir
+	}
+	if !exists {
+		n, terr := st.Stack.StaticNeighborCount(k.nic, k.proto)
+		if terr != nil {
+			return syserr.TranslateNetstackError(terr)
+		}
+		if n >= maxStaticNeighbors {
+			return syserr.ErrNoBufferSpace
+		}
 	}
 	return syserr.TranslateNetstackError(st.Stack.AddStaticNeighbor(k.nic, k.proto, k.addr, tcpip.LinkAddress(mac)))
 }

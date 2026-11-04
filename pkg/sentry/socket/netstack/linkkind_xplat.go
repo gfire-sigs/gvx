@@ -62,6 +62,16 @@ type LinkKind struct {
 	// mutex during the call. The stack closes the endpoint when it removes
 	// the link, and also when the creation fails after New returned.
 	New func(ctx context.Context, req *NewLinkRequest) (stack.LinkEndpoint, *syserr.Error)
+
+	// MTURange returns the smallest and the largest MTU that a later change of
+	// the MTU accepts for the endpoint that New returned. A zero bound means no
+	// bound. It is optional.
+	MTURange func(ep stack.LinkEndpoint) (min, max uint32)
+
+	// Change applies the IFLA_INFO_DATA of an RTM_NEWLINK request to an existing
+	// link of the kind. It is optional. A kind without it answers EOPNOTSUPP,
+	// as a Linux link kind without a changelink operation does.
+	Change func(ctx context.Context, ep stack.LinkEndpoint, data map[uint16]nlmsg.BytesView) *syserr.Error
 }
 
 // linkKinds maps each IFLA_INFO_KIND value to its creator. Registration runs
@@ -125,7 +135,11 @@ func (s *Stack) newRegisteredLink(ctx context.Context, kind string, linkAttrs, l
 	if sysErr != nil {
 		return sysErr
 	}
-	if err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{Name: ifname, Kind: kind}); err != nil {
+	opts := stack.NICOptions{Name: ifname, Kind: kind}
+	if k.MTURange != nil {
+		opts.MinMTU, opts.MaxMTU = k.MTURange(ep)
+	}
+	if err := s.Stack.CreateNICWithOptions(id, ep, opts); err != nil {
 		ep.Close()
 		return syserr.TranslateNetstackError(err)
 	}
@@ -134,4 +148,23 @@ func (s *Stack) newRegisteredLink(ctx context.Context, kind string, linkAttrs, l
 		return err
 	}
 	return nil
+}
+
+// ChangeRegisteredLink applies the IFLA_INFO_DATA of a request that changes an
+// existing link. It does nothing for a link that no registered kind created. A
+// registered kind without a Change function answers EOPNOTSUPP, so the request
+// does not report success for a change that it drops.
+func (s *Stack) ChangeRegisteredLink(ctx context.Context, id tcpip.NICID, data map[uint16]nlmsg.BytesView) *syserr.Error {
+	info, ok := s.Stack.SingleNICInfo(id)
+	if !ok {
+		return nil
+	}
+	k, ok := linkKinds[info.Kind]
+	if !ok {
+		return nil
+	}
+	if k.Change == nil {
+		return syserr.ErrNotSupported
+	}
+	return k.Change(ctx, s.Stack.GetLinkEndpointByName(info.Name), data)
 }

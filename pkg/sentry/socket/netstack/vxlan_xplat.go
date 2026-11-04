@@ -69,7 +69,7 @@ const (
 const vxlanDFInherit = 2
 
 func init() {
-	RegisterLinkKind("vxlan", LinkKind{NamePrefix: "vxlan", New: newVxlanLink})
+	RegisterLinkKind("vxlan", LinkKind{NamePrefix: "vxlan", New: newVxlanLink, MTURange: vxlanMTURange})
 }
 
 // vxlanAttrs reads the attributes of IFLA_INFO_DATA.
@@ -121,7 +121,7 @@ func (a vxlanAttrs) addr(typ uint16, size int) (tcpip.Address, *syserr.Error) {
 // attributes that it supports, and it ignores the others.
 func parseVxlanConfig(req *NewLinkRequest) (vxlan.Config, *syserr.Error) {
 	a := vxlanAttrs(req.Data)
-	cfg := vxlan.Config{ID: req.ID, Learning: true, UDPCsum: true, AgeingSeconds: vxlan.DefaultAgeing}
+	cfg := vxlan.Config{ID: req.ID, Learning: true, AgeingSeconds: vxlan.DefaultAgeing}
 	var err *syserr.Error
 
 	vni, ok, err := a.u32(iflaVxlanID)
@@ -263,6 +263,31 @@ func newVxlanLink(_ context.Context, req *NewLinkRequest) (stack.LinkEndpoint, *
 	return packetsocket.New(ep), nil
 }
 
+// vxlanMTURange returns the bounds of the MTU of a vxlan link, as ETH_MIN_MTU
+// and ETH_MAX_MTU minus the headroom in Linux.
+func vxlanMTURange(ep stack.LinkEndpoint) (uint32, uint32) {
+	if v := unwrapVxlan(ep); v != nil {
+		cfg := v.Config()
+		return vxlan.MinMTU, cfg.MaxMTU()
+	}
+	return 0, 0
+}
+
+// unwrapVxlan returns the vxlan endpoint inside the wrappers of ep, or nil.
+func unwrapVxlan(ep stack.LinkEndpoint) *vxlan.Endpoint {
+	for ep != nil {
+		switch e := ep.(type) {
+		case *vxlan.Endpoint:
+			return e
+		case interface{ Child() stack.LinkEndpoint }:
+			ep = e.Child()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 // vxlanSyserr returns the errno for an error of the vxlan package.
 func vxlanSyserr(err error) *syserr.Error {
 	var se *vxlan.StackError
@@ -275,6 +300,8 @@ func vxlanSyserr(err error) *syserr.Error {
 		return syserr.ErrNoFileOrDir
 	case errors.Is(err, vxlan.ErrNotSupported):
 		return syserr.ErrNotSupported
+	case errors.Is(err, vxlan.ErrNoSpace):
+		return syserr.ErrNoSpace
 	case errors.Is(err, vxlan.ErrBadAddress):
 		return syserr.ErrAddressFamilyNotSupported
 	}
@@ -292,18 +319,7 @@ func (s *Stack) VxlanLink(id tcpip.NICID) *vxlan.Endpoint {
 	if !ok || info.Kind != "vxlan" {
 		return nil
 	}
-	ep := s.Stack.GetLinkEndpointByName(info.Name)
-	for ep != nil {
-		switch e := ep.(type) {
-		case *vxlan.Endpoint:
-			return e
-		case interface{ Child() stack.LinkEndpoint }:
-			ep = e.Child()
-		default:
-			return nil
-		}
-	}
-	return nil
+	return unwrapVxlan(s.Stack.GetLinkEndpointByName(info.Name))
 }
 
 // VxlanInfoData appends IFLA_INFO_DATA with the configuration of the vxlan
