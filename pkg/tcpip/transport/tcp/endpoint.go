@@ -3056,22 +3056,7 @@ func (e *Endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 	}
 
 	if e.EndpointState().connecting() {
-		e.mu.Lock()
-		if e.h != nil && e.h.listenEP != nil {
-			lEP := e.h.listenEP
-			// Remove from listening endpoints pending list.
-			lEP.acceptMu.Lock()
-			delete(lEP.acceptQueue.pendingEndpoints, e)
-			lEP.acceptMu.Unlock()
-			lEP.stats.FailedConnectionAttempts.Increment()
-		}
-		e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
-		e.cleanupLocked()
-		e.hardError = err
-		e.setEndpointState(StateError)
-		e.mu.Unlock()
-		e.drainClosingSegmentQueue()
-		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+		e.failConnecting(err)
 	}
 }
 
