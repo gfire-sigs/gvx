@@ -915,11 +915,15 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}
 	defer mf.Destroy()
 
+	hostRAM, _ := hostMemory()
 	k := &kernel.Kernel{
 		Platform:  s.plat,
 		AllowSUID: s.cfg.AllowSUID,
 	}
 	k.SetMemoryFile(mf)
+	if s.cfg.Resources.MemoryBytes > 0 {
+		k.SetReportedMemory(reportedMemory(s.cfg.Resources.MemoryBytes, hostRAM))
+	}
 
 	vdso, err := loader.PrepareVDSO(mf)
 	if err != nil {
@@ -939,6 +943,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	var rootNetNS *inet.Namespace
 	if s.netStack != nil {
 		inetStack := netstack.NewStack(s.netStack, k.UniqueID())
+		// The root network namespace is the network namespace of the container,
+		// where Docker and containerd set ip_unprivileged_port_start to 0. A
+		// namespace that the guest creates starts at 1024, as on Linux.
+		inetStack.SetUnprivilegedPortStart(0)
 		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
 	}
 
@@ -983,6 +991,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	if err := memdev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register memdev: %w", err)
+	}
+	if err := memdev.RegisterKmsg(vfsObj); err != nil {
+		return 1, fmt.Errorf("gvx: register /dev/kmsg: %w", err)
 	}
 	if err := ttydev.Register(vfsObj); err != nil {
 		return 1, fmt.Errorf("gvx: register ttydev: %w", err)
@@ -1146,7 +1157,6 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}()
 
 	var memoryExceeded atomic.Bool
-	hostRAM, _ := hostMemory()
 	if limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM); limit > 0 {
 		guard := memoryGuard{
 			limit: limit,
@@ -1211,7 +1221,15 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	return netstack.NewStack(st, c.k.UniqueID()), nil
+	stack := netstack.NewStack(st, c.k.UniqueID())
+	// Linux gives a new network namespace the IPv4 forwarding switches of the
+	// root namespace and the defaults for IPv6.
+	if root, ok := c.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
+		if err := stack.InheritForwarding(root); err != nil {
+			return nil, fmt.Errorf("gvx: copy the forwarding switches to a new network namespace: %w", err)
+		}
+	}
+	return stack, nil
 }
 
 // buildKernelRootMountNamespace creates the mount namespace of the guest. As

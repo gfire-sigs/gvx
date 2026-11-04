@@ -922,6 +922,8 @@ func newEndpoint(s *stack.Stack, protocol *protocol, netProto tcpip.NetworkProto
 		e.maxSynRetries = uint8(synRetries)
 	}
 
+	e.keepalive.idle, e.keepalive.interval, e.keepalive.count = protocol.keepaliveParameters()
+
 	e.probe = protocol.probe
 	e.segmentQueue.ep = e
 

@@ -42,3 +42,24 @@ func TestEffectiveMemoryLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestReportedMemoryFollowsTheLimitBelowTheHostRAM(t *testing.T) {
+	const hostRAM = 8 << 30
+	for _, tc := range []struct {
+		name       string
+		configured int64
+		hostRAM    uint64
+		want       uint64
+	}{
+		{name: "limit below the host RAM", configured: 2 << 30, hostRAM: hostRAM, want: 2 << 30},
+		{name: "limit above the host RAM reports the host RAM", configured: 16 << 30, hostRAM: hostRAM, want: hostRAM},
+		{name: "limit equal to the host RAM", configured: hostRAM, hostRAM: hostRAM, want: hostRAM},
+		{name: "unknown host RAM keeps the limit", configured: 1 << 30, hostRAM: 0, want: 1 << 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reportedMemory(tc.configured, tc.hostRAM); got != tc.want {
+				t.Errorf("reportedMemory(%d, %d) = %d, want %d", tc.configured, tc.hostRAM, got, tc.want)
+			}
+		})
+	}
+}

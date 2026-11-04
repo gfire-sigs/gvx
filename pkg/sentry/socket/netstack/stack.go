@@ -54,6 +54,10 @@ type Stack struct {
 	// id is a unique identifier for this stack, it is currently only
 	// used for a deterministic lock ordering.
 	id uint64
+
+	// sysctls stores the /proc/sys/net values that the stack does not own. See
+	// sysctl_store_xplat.go.
+	sysctls sysctlValues `state:"nosave"`
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.

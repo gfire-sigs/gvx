@@ -34,9 +34,12 @@ var hostMemory = sync.OnceValues(hostMemoryBytes)
 
 // applyHostMemoryDefaults sets the process-wide memory values of the Sentry
 // from the RAM of the host, as runsc does. A tmpfs mount without a size option
-// then gets half of that RAM, size=N% resolves, and MemTotal in /proc/meminfo
-// and sysinfo(2) reports that RAM. New calls it before the host lockdown. When
-// the host does not report its RAM, the Sentry keeps its built-in values.
+// then gets half of that RAM, size=N% resolves against it, and MemTotal in
+// /proc/meminfo and sysinfo(2) reports that RAM. A memory limit of the sandbox
+// changes only the reported total, which belongs to the kernel (see
+// reportedMemory); the tmpfs sizes still follow the host RAM. New calls it
+// before the host lockdown. When the host does not report its RAM, the Sentry
+// keeps its built-in values.
 var applyHostMemoryDefaults = sync.OnceFunc(func() {
 	total, err := hostMemory()
 	if err != nil || total == 0 {
@@ -47,6 +50,17 @@ var applyHostMemoryDefaults = sync.OnceFunc(func() {
 	usage.MinimumTotalMemoryBytes = total
 	usage.MaximumTotalMemoryBytes = total
 })
+
+// reportedMemory returns the total memory that the guest sees in
+// /proc/meminfo and sysinfo(2). A limit below the host RAM wins, so tools in
+// the guest, such as the kubelet, size the node from the limit. A limit above
+// the host RAM reports the host RAM.
+func reportedMemory(configured int64, hostRAM uint64) uint64 {
+	if configured > 0 && (hostRAM == 0 || uint64(configured) < hostRAM) {
+		return uint64(configured)
+	}
+	return hostRAM
+}
 
 // effectiveMemoryLimit returns the memory limit that the guard enforces and
 // its poll interval. A limit that the caller sets wins. Without one, the

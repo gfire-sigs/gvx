@@ -15,7 +15,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 
 | Phase | Content | State |
 | :--- | :--- | :--- |
-| P1 | Kernel interfaces of `kubelet` and the container runtime | Not started |
+| P1 | Kernel interfaces of `kubelet` and the container runtime | A1 to A7 pass on every platform. The B tests are not automated yet. |
 | P2 | Service data path (`statistic`, bridge netfilter, `ctnetlink`) | Not started |
 | P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Not started |
 | P4 | Enforcement of `cpu.max` | Not started |
@@ -74,15 +74,15 @@ The `kubelet`, `containerd`, `runc`, and `k3s` read or write these files. The fi
 
 | Item | Behavior | Location |
 | :--- | :--- | :--- |
-| `/dev/kmsg` (character device 1:11) | Opens for read and write. `lseek` with `SEEK_END` returns 0. A non-blocking read with no new record returns `EAGAIN`. A write by root goes to the Sentry log and returns its length. | `pkg/sentry/devices/memdev/kmsg_xplat.go`; registration in `pkg/gvx` |
-| `vm/overcommit_memory` | Accepts 0, 1, and 2, and stores the value. Other values return `EINVAL`. | `pkg/sentry/fsimpl/proc/tasks_sys_xplat.go` |
-| `vm/panic_on_oom`, `kernel/panic`, `kernel/panic_on_oops`, `kernel/keys/root_maxkeys`, `kernel/keys/root_maxbytes` | Store an integer and return it. A value outside the Linux range returns `EINVAL`. | `tasks_sys_xplat.go` |
-| `net/ipv4/ip_unprivileged_port_start` | One value for each network namespace, 1024 by default. A bind below the value needs `CAP_NET_BIND_SERVICE`. | `tasks_sys_xplat.go` and a seam in the bind path |
-| Safe sysctls of Kubernetes | `net/ipv4/ip_local_port_range`, `tcp_syncookies`, `ping_group_range`, `ip_local_reserved_ports`, `tcp_keepalive_time`, `tcp_keepalive_intvl`, `tcp_keepalive_probes`, `tcp_fin_timeout`, and `kernel/shm_rmid_forced` are writable. The network values belong to each network namespace. | `tasks_sys_xplat.go` |
-| `net/ipv4/conf/all/forwarding`, `net/ipv4/conf/default/forwarding` | Behave as `ip_forward` does for the namespace. | `tasks_sys_xplat.go` |
-| `net/netfilter/nf_conntrack_max`, `nf_conntrack_tcp_timeout_established`, `nf_conntrack_tcp_timeout_close_wait`, `/sys/module/nf_conntrack/parameters/hashsize` | Store and return their values. | `tasks_sys_xplat.go`; a `_xplat.go` file in `pkg/sentry/fsimpl/sys` |
-| Node capacity | `MemTotal` follows `-m`, and the online CPUs, `sched_getaffinity`, and `/sys/devices/system/cpu/online` follow `--cpus`. Without the options, the values stay as they are. | Seams in `pkg/sentry/fsimpl/proc` and `pkg/sentry/fsimpl/sys` |
-| Statistics | `/sys/class/net/<link>/statistics/*` and `/proc/diskstats` exist, and their counters grow with traffic and I/O. | `_xplat.go` files in `pkg/sentry/fsimpl/sys` and `pkg/sentry/fsimpl/proc` |
+| `/dev/kmsg` (character device 1:11) | Opens for read and write. `lseek` with offset 0 returns 0 for `SEEK_SET`, `SEEK_DATA`, and `SEEK_END`. A non-zero offset returns `ESPIPE`, and another `whence` returns `EINVAL`. A non-blocking read with no new record returns `EAGAIN`. A write goes to the Sentry log and returns its length. | `pkg/sentry/devices/memdev/kmsg_xplat.go`; registration in `pkg/gvx/kernel_runner.go` |
+| `vm/overcommit_memory` | Accepts 0, 1, and 2, and stores the value. Other values return `EINVAL`. | `pkg/sentry/fsimpl/proc/tasks_sys_node_xplat.go` |
+| `vm/panic_on_oom`, `kernel/panic`, `kernel/panic_on_oops`, `kernel/keys/root_maxkeys`, `kernel/keys/root_maxbytes` | Store an integer and return it. A value outside the Linux range returns `EINVAL`. | `tasks_sys_node_xplat.go` |
+| `net/ipv4/ip_unprivileged_port_start` | One value for each network namespace. The root namespace of a sandbox is the container namespace and starts at 0, as in a Docker container. A namespace that the guest creates starts at 1024. A bind below the value needs `CAP_NET_BIND_SERVICE`. | `tasks_sys_node_xplat.go`; `pkg/sentry/socket/netstack/sysctl_store_xplat.go`; `bindport_xplat.go` and a seam in the bind path; the root value in `pkg/gvx/kernel_runner.go` |
+| Safe sysctls of Kubernetes | `net/ipv4/ip_local_port_range`, `tcp_syncookies`, `ping_group_range`, `ip_local_reserved_ports`, `tcp_keepalive_time`, `tcp_keepalive_intvl`, `tcp_keepalive_probes`, `tcp_fin_timeout`, and `kernel/shm_rmid_forced` are writable. The network values belong to each network namespace. | `tasks_sys_node_xplat.go`; `pkg/sentry/socket/netstack/sysctl_xplat.go`; `pkg/tcpip/transport/tcp/keepalive_xplat.go`; `pkg/sentry/kernel/ipc_namespace_xplat.go` |
+| `net/ipv4/ip_forward`, `net/ipv4/conf/all/forwarding`, `net/ipv4/conf/default/forwarding` | `ip_forward` and `conf/all/forwarding` are one switch for the namespace. A write to it also sets `conf/default/forwarding` and every link that exists. A write to `conf/default/forwarding` changes only the links that the guest creates later. A new network namespace gets the IPv4 switches of the root namespace, and its IPv6 switches start at 0. | `tasks_sys_node_xplat.go`; `tasks_sys.go`; `pkg/sentry/socket/netstack/sysctl_store_xplat.go`; `pkg/tcpip/stack/forwarding_xplat.go` |
+| `net/netfilter/nf_conntrack_max`, `nf_conntrack_tcp_timeout_established`, `nf_conntrack_tcp_timeout_close_wait`, `/sys/module/nf_conntrack/parameters/hashsize` | Store and return their values. | `tasks_sys_node_xplat.go`; `pkg/sentry/fsimpl/sys/netclass_xplat.go` |
+| Node capacity | `MemTotal` follows `-m`, and the online CPUs, `sched_getaffinity`, and `/sys/devices/system/cpu/online` follow `--cpus`. The total belongs to the kernel of each sandbox. Without the options, the values stay as they are. | `pkg/gvx/hostmem.go`; `pkg/sentry/kernel/total_memory_xplat.go`; seams in `pkg/sentry/fsimpl/proc` and `pkg/sentry/syscalls/linux` |
+| Statistics | `/sys/class/net/<link>/statistics/*` and `/proc/diskstats` exist, and their counters grow with traffic and I/O. The disk counters count the read and write system calls of the sandbox. | `pkg/sentry/fsimpl/sys/netclass_xplat.go`; `pkg/sentry/fsimpl/proc/diskstats_xplat.go`; `pkg/sentry/kernel/io_totals_xplat.go` |
 
 ### 3.2 P2: Service Data Path
 
@@ -136,11 +136,11 @@ These tests check one kernel behavior each. A Go program without an image runs t
 
 | ID | Behavior | Pass criterion |
 | :--- | :--- | :--- |
-| A1 | `/dev/kmsg` | The open succeeds. `lseek(SEEK_END)` returns 0. A non-blocking read returns `EAGAIN`. A write of `<6>x` returns 6. |
+| A1 | `/dev/kmsg` | The open succeeds. `lseek` returns 0 for `SEEK_SET`, `SEEK_DATA`, and `SEEK_END` with offset 0, `ESPIPE` for another offset, and `EINVAL` for another `whence`. A non-blocking read returns `EAGAIN`. A write of `<6>x` returns 4, the length of the text. |
 | A2 | Stored sysctls | Each file of section 3.1 returns the value that the test wrote. `overcommit_memory` rejects 3 with `EINVAL`. |
-| A3 | `ip_unprivileged_port_start` | At 1024, a bind to port 80 without `CAP_NET_BIND_SERVICE` fails with `EACCES`. At 0, it succeeds. A change in a child network namespace leaves the parent value. |
+| A3 | `ip_unprivileged_port_start` | The root namespace starts at 0, and a child namespace starts at 1024. At 1024, a bind to port 80 without `CAP_NET_BIND_SERVICE` fails with `EACCES`. At 0, it succeeds. A change in a child network namespace leaves the parent value. |
 | A4 | Safe sysctls | Each network value is writable in a network namespace and keeps its old value in the parent namespace. |
-| A5 | `conf/all/forwarding` | Three namespaces A, R, and B: with the value 1 in R, A reaches B with ICMP echo. With 0, it does not. |
+| A5 | `conf/all/forwarding` | Three namespaces A, R, and B: with the value 1 in R, A reaches B with ICMP echo. With 0, it does not. `conf/default/forwarding` changes only the links that R creates later. A new namespace gets the IPv4 values of the root namespace. |
 | A6 | Capacity | With `-m 2g --cpus 2`, `MemTotal` is 2 GiB within one page, `nproc` prints 2, and `cpu/online` reads `0-1`. |
 | A7 | Statistics | After traffic and disk I/O, `rx_bytes` of `eth0` and the line of the root disk in `/proc/diskstats` have grown. |
 | A8 | `statistic` random | With `--probability 0.5`, each of two targets gets 50% ± 5% of 2,000 connections. |

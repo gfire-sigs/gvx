@@ -307,12 +307,14 @@ func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Cr
 }
 
 // sysNetXplatFiles returns the files of the directories that this file adds to
-// /proc/sys/net: net/bridge. It
-// reports false for any other path.
+// /proc/sys/net: net/bridge and net/netfilter. It reports false for any other
+// path. The files of net/netfilter come from addNodeSysctlFiles.
 func (fs *filesystem) sysNetXplatFiles(ctx context.Context, root *auth.Credentials, stack inet.Stack, path string) (map[string]kernfs.Inode, bool) {
 	switch {
 	case path == "net/bridge":
 		return fs.sysBridgeNetfilterFiles(ctx, root), true
+	case path == "net/netfilter":
+		return make(map[string]kernfs.Inode), true
 	}
 	return nil, false
 }

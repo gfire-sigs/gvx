@@ -110,6 +110,26 @@ seam pkg/sentry/syscalls/linux/sys_inotify.go
 # modes KEEP_SIZE, PUNCH_HOLE, and, on ext4lite, ZERO_RANGE, COLLAPSE_RANGE, and INSERT_RANGE.
 seam pkg/sentry/syscalls/linux/sys_file.go
 
+# Content seams: New TCP endpoints start with the keepalive defaults of the stack, which
+# net.ipv4.tcp_keepalive_time, tcp_keepalive_intvl, and tcp_keepalive_probes set
+# (pkg/tcpip/transport/tcp/keepalive_xplat.go and pkg/tcpip/keepalive_xplat.go).
+seam pkg/tcpip/transport/tcp/protocol.go
+seam pkg/tcpip/transport/tcp/endpoint.go
+
+# Content seams: kernel interfaces of a Kubernetes node agent (GVXIP-005, P1).
+# bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
+seam pkg/sentry/socket/netstack/netstack.go
+# /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
+seam pkg/sentry/fsimpl/sys/sys.go
+# /proc/diskstats (pkg/sentry/fsimpl/proc/diskstats_xplat.go) reads the I/O totals of the kernel.
+# A dying task adds its counts to the totals (pkg/sentry/kernel/io_totals_xplat.go).
+seam pkg/sentry/fsimpl/proc/tasks.go
+seam pkg/sentry/kernel/task_exit.go
+# /proc/meminfo and sysinfo(2) ask the kernel for the total memory, which a sandbox with a memory
+# limit sets for its own kernel (pkg/sentry/kernel/total_memory_xplat.go).
+seam pkg/sentry/fsimpl/proc/tasks_files.go
+seam pkg/sentry/syscalls/linux/sys_sysinfo.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin

@@ -304,10 +304,14 @@ var _ dynamicInode = (*meminfoData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	mf := kernel.KernelFromContext(ctx).MemoryFile()
+	k := kernel.KernelFromContext(ctx)
+	mf := k.MemoryFile()
 	_ = mf.UpdateUsage(nil) // Best effort
 	snapshot, totalUsage := usage.MemoryAccounting.Copy()
 	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
+	if reported, ok := k.ReportedMemory(); ok {
+		totalSize = reported
+	}
 	anon := snapshot.Anonymous + snapshot.Tmpfs
 	file := snapshot.PageCache + snapshot.Mapped
 	// We don't actually have active/inactive LRUs, so just make up numbers.

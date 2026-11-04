@@ -58,6 +58,7 @@ const (
 	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
 	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
+	nodeProbePackage   = "z.gfire.dev/gvx/internal/acceptprog/nodeprobe"
 	membarrierPackage  = "z.gfire.dev/gvx/internal/acceptprog/membarrierprobe"
 	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
@@ -319,6 +320,14 @@ func BuildCodeWrite(tb testing.TB, goarch string) string {
 func BuildParityProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, parityProbePackage, "parityprobe", goarch, 0)
+}
+
+// BuildNodeProbe compiles the guest nodeprobe, which checks the kernel
+// interfaces of a Kubernetes node agent, for the Linux architecture goarch and
+// returns the path of the static ET_EXEC executable.
+func BuildNodeProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, nodeProbePackage, "nodeprobe", goarch, 0)
 }
 
 // buildStaticGuest compiles the package pkg for linux/goarch with the internal

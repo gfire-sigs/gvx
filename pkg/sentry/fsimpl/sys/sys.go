@@ -133,6 +133,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	classSub := map[string]kernfs.Inode{ // /sys/class
 		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"net":          fs.newNetClassDir(ctx, creds),
 	}
 	devicesSub := map[string]kernfs.Inode{} // /sys/devices
 	systemSub := map[string]kernfs.Inode{   // /sys/devices/system
@@ -242,7 +243,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"fs":       fs.newDir(ctx, creds, defaultSysDirMode, fsDirChildren),
 		"kernel":   fs.newDir(ctx, creds, defaultSysDirMode, kernelSub),
-		"module":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"module":   fs.newDir(ctx, creds, defaultSysDirMode, fs.newModuleDirChildren(ctx, creds)),
 		"power":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	})
 	fs.root = root.(*dir)

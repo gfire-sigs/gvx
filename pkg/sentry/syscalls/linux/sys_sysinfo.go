@@ -33,6 +33,9 @@ func Sysinfo(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	memStats, _ := usage.MemoryAccounting.Copy()
 	totalUsage := mfUsage + memStats.Mapped
 	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
+	if reported, ok := t.Kernel().ReportedMemory(); ok {
+		totalSize = reported
+	}
 	memFree := totalSize - totalUsage
 	if memFree > totalSize {
 		// Underflow.

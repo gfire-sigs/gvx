@@ -123,6 +123,11 @@ type protocol struct {
 	maxRetries uint32
 	// +checklocks:mu
 	synRetries uint8
+	// keepaliveDefaults holds the keepalive parameters of new endpoints. The
+	// zero value stands for the built-in defaults, so a restored protocol needs
+	// no initialization. See keepalive_xplat.go.
+	// +checklocks:mu
+	keepaliveDefaults tcpip.TCPKeepaliveDefaultsOption `state:"nosave"`
 
 	dispatcher dispatcher
 
@@ -346,6 +351,9 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 		p.mu.Unlock()
 		return nil
 
+	case *tcpip.TCPKeepaliveDefaultsOption:
+		return p.setKeepaliveDefaults(*v)
+
 	case *tcpip.TCPTimeWaitTimeoutOption:
 		p.mu.Lock()
 		if *v < 0 {
@@ -479,6 +487,10 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 		p.mu.RLock()
 		*v = tcpip.TCPLingerTimeoutOption(p.lingerTimeout)
 		p.mu.RUnlock()
+		return nil
+
+	case *tcpip.TCPKeepaliveDefaultsOption:
+		*v = p.getKeepaliveDefaults()
 		return nil
 
 	case *tcpip.TCPTimeWaitTimeoutOption:
