@@ -17,7 +17,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 | :--- | :--- | :--- |
 | P1 | Kernel interfaces of `kubelet` and the container runtime | A1 to A7 pass on every platform. The B tests are not automated yet. |
 | P2 | Service data path (`statistic`, bridge netfilter, `ctnetlink`) | Not started |
-| P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Not started |
+| P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | In progress. Generic netlink and the `wireguard` link pass A12 on every platform. The `vxlan` link and the neighbor and FDB netlink are not started. |
 | P4 | Enforcement of `cpu.max` | A14 passes on every platform of section 4.4. B9 and B10 wait for `k3s`. |
 
 ---
@@ -100,9 +100,9 @@ These items connect the guest to other nodes with standard tools. The Sentry has
 
 | Item | Behavior | Location |
 | :--- | :--- | :--- |
-| Generic netlink | `NETLINK_GENERIC` sockets and the controller family (`CTRL_CMD_GETFAMILY`) | `pkg/sentry/socket/netlink/genetlink` (Tier 1) |
-| `wireguard` link | `RTM_NEWLINK` with the kind `wireguard`, and the WireGuard generic netlink family (`WG_CMD_GET_DEVICE`, `WG_CMD_SET_DEVICE`). The device uses `wireguard-go` and sends UDP from the network namespace of the guest. | A `_xplat.go` file in `pkg/sentry/socket/netstack`, and `genetlink` |
-| `vxlan` link | `RTM_NEWLINK` with the kind `vxlan`: VNI, destination port, local address, `nolearning`, and an MTU of 1450 by default | `pkg/tcpip/link/vxlan` (Tier 1) and a `_xplat.go` file in `pkg/sentry/socket/netstack` |
+| Generic netlink | `NETLINK_GENERIC` sockets and the controller family (`CTRL_CMD_GETFAMILY`). A registry lets other families plug in. | `pkg/sentry/socket/netlink/genetlink/genetlink.go` and `controller.go` (Tier 1) |
+| `wireguard` link | `RTM_NEWLINK` with the kind `wireguard`, and the WireGuard generic netlink family (`WG_CMD_GET_DEVICE`, `WG_CMD_SET_DEVICE`). The device uses `wireguard-go` and sends UDP from the network namespace of the guest. A sandbox has at most 256 such links, and a device has at most 4,096 peers. | `pkg/sentry/socket/netlink/genetlink/wireguard` (Tier 1); the registry of link kinds in `pkg/sentry/socket/netstack/linkkind_xplat.go`, with one seam in `stack.go` |
+| `vxlan` link | `RTM_NEWLINK` with the kind `vxlan`: VNI, destination port, local address, `nolearning`, and an MTU of 1450 by default | `pkg/tcpip/link/vxlan` (Tier 1). The link registers with `RegisterLinkKind`, so it needs no new seam. |
 | Neighbor and FDB netlink | `RTM_NEWNEIGH`, `RTM_DELNEIGH`, and `RTM_GETNEIGH` for permanent IPv4 and IPv6 entries, and for FDB entries of the family `AF_BRIDGE` on a `vxlan` link | A `_xplat.go` file in `pkg/sentry/socket/netlink/route` |
 
 ### 3.4 P4: Enforcement of `cpu.max`

@@ -635,7 +635,7 @@ func (s *Stack) newInterface(ctx context.Context, msg *nlmsg.Message, linkAttrs 
 	case "veth":
 		return s.newVeth(ctx, linkAttrs, linkInfoAttrs)
 	}
-	return syserr.ErrNotSupported
+	return s.newRegisteredLink(ctx, kind, linkAttrs, linkInfoAttrs)
 }
 
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.
