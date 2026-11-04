@@ -140,6 +140,14 @@ seam pkg/sentry/kernel/task_exit.go
 seam pkg/sentry/fsimpl/proc/tasks_files.go
 seam pkg/sentry/syscalls/linux/sys_sysinfo.go
 
+# Content seams: the service data path of a Kubernetes node (GVXIP-005, P2).
+# A bridge that forwards an IP frame runs the iptables hooks first when bridge-nf-call-iptables is 1
+# (pkg/tcpip/stack/bridge_netfilter_xplat.go).
+seam pkg/tcpip/stack/bridge.go
+# NETLINK_NETFILTER opens without nftables and serves the subsystem CTNETLINK
+# (pkg/sentry/socket/netlink/netfilter/ctnetlink_xplat.go).
+seam pkg/sentry/socket/netlink/netfilter/protocol.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin

@@ -52,6 +52,9 @@ func (p *bridgePort) ParseHeader(pkt *PacketBuffer) bool {
 
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
 func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) {
+	if p.netfilterForward(protocol, pkt) {
+		return
+	}
 	bridge := p.bridge
 	eth := header.Ethernet(pkt.LinkHeader().Slice())
 	updateFDB := false
