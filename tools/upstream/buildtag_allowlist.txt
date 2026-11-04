@@ -119,6 +119,8 @@ seam pkg/tcpip/transport/tcp/endpoint.go
 # Content seams: kernel interfaces of a Kubernetes node agent (GVXIP-005, P1).
 # A network namespace keeps the stored values of /proc/sys/net (pkg/sentry/inet/sysctl_xplat.go).
 seam pkg/sentry/inet/namespace.go
+# An IPC namespace keeps kernel.shm_rmid_forced (pkg/sentry/kernel/ipc_namespace_xplat.go).
+seam pkg/sentry/kernel/ipc_namespace.go
 # bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
 seam pkg/sentry/socket/netstack/netstack.go
 
