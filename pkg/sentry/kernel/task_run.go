@@ -176,6 +176,11 @@ func (app *runApp) execute(t *Task) taskRunState {
 		return (*runInterrupt)(nil)
 	}
 
+	// Hold the task back while its cgroup has no CPU quota left (cpu.max).
+	if cpuBandwidthThrottled.Load() != 0 && t.throttleCPUBandwidth() {
+		return (*runApp)(nil)
+	}
+
 	// Execute any task work callbacks before returning to user space.
 	if t.taskWorkCount.Load() > 0 {
 		t.taskWorkMu.Lock()

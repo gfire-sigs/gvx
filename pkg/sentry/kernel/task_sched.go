@@ -332,6 +332,9 @@ func (k *Kernel) runCPUClockTicker() {
 				userSysTickInc++
 			}
 		}
+		if cpuBandwidthLimited.Load() != 0 {
+			k.accountCPUBandwidth(incTasks[:numIncTasks], allTasks)
+		}
 		if userTickInc != 0 {
 			k.userCPUClock.Add(userTickInc * linux.ClockTick.Nanoseconds())
 		}
