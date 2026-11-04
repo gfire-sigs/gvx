@@ -21,7 +21,10 @@
 //
 // Usage:
 //
-//	cpumaxprobe checks   run the checks, then print DONE
+//	cpumaxprobe checks [MINSHARE]
+//	                     run the checks, then print DONE. MINSHARE is the least
+//	                     share of its unlimited speed that a loop at a tenth of a
+//	                     CPU must keep. The default is 0.07.
 //	cpumaxprobe spin     the busy-loop child: wait for a line on stdin, then
 //	                     loop until the parent kills the process. The child
 //	                     prints its loop count on stdout after each 2^24 turns.
@@ -56,6 +59,10 @@ const (
 	resumeCPU = 100 * time.Millisecond
 )
 
+// minShare is the least share of its unlimited speed that a loop at a tenth of
+// a CPU keeps.
+var minShare = 0.07
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: cpumaxprobe checks|spin")
@@ -63,6 +70,11 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "checks":
+		if len(os.Args) > 2 {
+			if v, err := strconv.ParseFloat(os.Args[2], 64); err == nil {
+				minShare = v
+			}
+		}
 		ok := runChecks()
 		fmt.Println("DONE")
 		if !ok {
@@ -105,7 +117,7 @@ func runChecks() bool {
 		{"cpu-max-max-gives-one-cpu-to-one-thread", checkUnlimited},
 		{"cpu-max-of-parent-limits-child", checkParentLimit},
 		{"cpu-max-quota-is-shared-by-all-tasks", checkSharedQuota},
-		{"cpu-max-equal-to-period-never-throttles-one-thread", checkQuotaEqualsPeriod},
+		{"cpu-max-above-demand-never-throttles-one-thread", checkQuotaAboveDemand},
 		{"cpu-max-small-quota-bills-and-delivers-the-same-time", checkSmallQuota},
 		{"cpu-max-raised-to-max-resumes-task", checkRaisedToMax},
 		{"cpu-max-moving-task-to-free-cgroup-resumes-it", checkMigration},
@@ -387,11 +399,12 @@ func checkUnlimited() error {
 	})
 }
 
-// checkQuotaEqualsPeriod gives one thread a whole CPU as quota. The thread never
-// uses more, so it must not throttle.
-func checkQuotaEqualsPeriod() error {
+// checkQuotaAboveDemand gives a busy Go program 1.1 CPU. The program has a
+// second thread, the runtime monitor, so its demand is 1.01 CPU. A quota of
+// exactly one CPU would throttle it, as it would in Linux.
+func checkQuotaAboveDemand() error {
 	return withCgroup(probeDir, func() error {
-		if err := writeFile(probeDir, "cpu.max", "100000 100000"); err != nil {
+		if err := writeFile(probeDir, "cpu.max", "110000 100000"); err != nil {
 			return err
 		}
 		w, err := runSpinners(probeDir, 1, shortWindow)
@@ -402,7 +415,7 @@ func checkQuotaEqualsPeriod() error {
 			return err
 		}
 		if w.throttled != 0 {
-			return fmt.Errorf("nr_throttled grew by %d for one thread at quota == period", w.throttled)
+			return fmt.Errorf("nr_throttled grew by %d for one thread below its quota", w.throttled)
 		}
 		return nil
 	})
@@ -496,8 +509,8 @@ func checkSmallQuota() error {
 		if err := expectCPUs(w, 0.07, 0.13); err != nil {
 			return fmt.Errorf("billed time: %w", err)
 		}
-		if share := w.progress / base.progress; share < 0.07 || share > 0.13 {
-			return fmt.Errorf("the loop ran at %.3f of its unlimited speed, want 0.07 to 0.13", share)
+		if share := w.progress / base.progress; share < minShare || share > 0.13 {
+			return fmt.Errorf("the loop ran at %.3f of its unlimited speed, want %.2f to 0.13", share, minShare)
 		}
 		return nil
 	})
