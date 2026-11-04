@@ -68,6 +68,7 @@ func runServicePathGuest(t *testing.T, b gateBackend, probes map[string]string, 
 const bridgeNetfilterScript = `set -e
 apk add --no-cache iptables iptables-legacy iproute2 >/dev/null
 cp /workspace/svcprobe /usr/local/bin/svcprobe
+chmod 755 /usr/local/bin/svcprobe
 ipt=iptables-legacy; ipt6=ip6tables-legacy
 ip link add br0 type bridge
 ip addr add 10.0.0.1/24 dev br0
@@ -88,7 +89,9 @@ ip netns exec ns2 ip addr add 10.0.0.100/32 dev p2
 ip netns exec ns2 ip -6 addr add fd00::100/128 dev p2 nodad
 ip netns exec ns1 ip addr add 10.0.0.77/32 dev p1
 for n in 2 3; do ip netns exec ns$n svcprobe serve [::]:8080 ns$n & done
-sleep 1
+for n in 2 3; do
+  for i in $(seq 1 60); do ip netns exec ns$n svcprobe dial [::1]:8080 >/dev/null 2>&1 && break; sleep 0.5; done
+done
 $ipt -t nat -A PREROUTING -d 10.0.0.100 -p tcp --dport 80 -j DNAT --to-destination 10.0.0.4:8080
 $ipt6 -t nat -A PREROUTING -d fd00::100 -p tcp --dport 80 -j DNAT --to-destination [fd00::4]:8080
 $ipt -t nat -A POSTROUTING -s 10.0.0.2 -d 10.0.0.3 -p tcp --dport 8080 -j SNAT --to-source 10.0.0.77
@@ -163,7 +166,9 @@ done
 echo 1 > /proc/sys/net/ipv4/ip_forward
 $ipt -t nat -A PREROUTING -d 10.9.9.9 -p udp --dport 9000 -j DNAT --to-destination 10.0.2.2:9001
 for n in 2 3; do ip netns exec ns$n sh -c "nc -u -l -p 9001 > /tmp/recv$n &"; done
-sleep 1
+for n in 2 3; do
+  for i in $(seq 1 60); do ip netns exec ns$n grep -q ':2329 ' /proc/net/udp && break; sleep 0.5; done
+done
 send() { ip netns exec ns1 sh -c "echo $1 | nc -u -p 5555 -w1 10.9.9.9 9000"; sleep 1; }
 received() { echo "$1 recv2=[$(cat /tmp/recv2)] recv3=[$(cat /tmp/recv3)]"; }
 tuple='-p udp --orig-src 10.0.1.2 --orig-dst 10.9.9.9 --sport 5555 --dport 9000'
@@ -227,7 +232,9 @@ apk add --no-cache iptables iptables-legacy >/dev/null
 ipt=iptables-legacy
 $ipt -t nat -A OUTPUT -d 127.0.0.2 -p udp --dport 9000 -j DNAT --to-destination 127.0.0.1:9001
 $ipt -t nat -A OUTPUT -d 127.0.0.2 -p tcp --dport 9100 -j DNAT --to-destination 127.0.0.1:9101
-/workspace/ctprobe kubeproxy
+cp /workspace/ctprobe /usr/local/bin/ctprobe
+chmod 755 /usr/local/bin/ctprobe
+ctprobe kubeproxy
 `
 			out := runServicePathGuest(t, b, map[string]string{"ctprobe": acceptprog.BuildCtProbe(t, hostArch())}, script)
 			requireContains(t, "guest output", out,
