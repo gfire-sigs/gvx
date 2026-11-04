@@ -2,9 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.7.10002026110200] - 2026-11-04
 
-This section records changes that no release contains yet.
+This release adds Docker and `ext4lite` features and fixes HotSpot 21, `membarrier`, and `brk` on the Windows `systrap` engine. It also changes the format of `.gvx_meta`, so an older release cannot open a workspace that this release wrote. Read the upgrade note under Behavior Changes before the upgrade.
 
 ### Features
 
