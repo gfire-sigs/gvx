@@ -200,10 +200,10 @@ The next table lists the measured results of the test A14 and its companions. Ea
 | Case | `hvf` | Linux `systrap` | Windows `systrap` and `whpx` |
 | :--- | :--- | :--- | :--- |
 | `50000 100000`, 5 s | 0.50 CPU | 0.50 CPU | 0.50 CPU |
-| `max`, 3 s | 1.01 CPU | 1.02 to 1.03 CPU | see section 6.6 of GVXIP-005 |
-| `10000 100000`, billed time | 0.10 CPU | 0.10 CPU | not measured |
-| `10000 100000`, progress of the loop | 0.03 to 0.06 of full speed | 0.09 to 0.10 of full speed | not measured |
-| `110000 100000`, `nr_throttled` | 0 | 0 | not measured |
+| `max`, 3 s | 1.01 CPU | 1.00 to 1.03 CPU | 1.00 to 1.01 CPU |
+| `10000 100000`, billed time | 0.10 CPU | 0.10 CPU | 0.10 CPU |
+| `10000 100000`, progress of the loop | 0.03 to 0.08 of full speed | 0.09 to 0.10 of full speed | 0.09 to 0.10 of full speed |
+| `110000 100000`, `nr_throttled` | 0 | 0 | 0 |
 | `100000 100000`, `nr_throttled` | 14 in 3 s | 18 in 3 s | not measured |
 
-A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same. On `hvf`, resuming a throttled task costs several milliseconds inside the platform. A loop at a tenth of a CPU therefore keeps 0.03 to 0.06 of its speed.
+A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same. On `hvf`, resuming a throttled task costs several milliseconds inside the platform. A loop at a tenth of a CPU therefore keeps 0.03 to 0.08 of its speed.
