@@ -247,3 +247,46 @@ $ipt -t nat -A OUTPUT -d 127.0.0.2 -p tcp --dport 9100 -j DNAT --to-destination 
 		})
 	}
 }
+
+// iccScript starts dockerd with the option in $1 and connects from one
+// container to a server container of the same bridge.
+const iccScript = `dockerd-entrypoint.sh --tls=false $1 >/tmp/dockerd.log 2>&1 &
+for i in $(seq 1 120); do docker info >/dev/null 2>&1 && break; sleep 1; done
+docker info >/dev/null 2>&1 || { echo "DOCKERD-FAILED"; tail -n 20 /tmp/dockerd.log; exit 1; }
+docker run -d --name srv alpine sh -c 'while true; do echo hi | nc -l -p 8080; done' >/dev/null
+srv=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' srv)
+sleep 2
+echo "RESULT $1 $(docker run --rm alpine sh -c "nc -w 3 $srv 8080 </dev/null || echo BLOCKED")"
+`
+
+// TestE2EDockerIccSeparatesContainers checks that the FORWARD rule of dockerd
+// applies to the traffic between two containers of one bridge. With --icc=false
+// the connection fails. With --icc=true it succeeds.
+func TestE2EDockerIccSeparatesContainers(t *testing.T) {
+	for _, b := range gateBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireBackend(t, b)
+			requireRegistry(t)
+			for _, tc := range []struct{ arg, want string }{
+				{"--icc=false", "RESULT --icc=false BLOCKED\n"},
+				{"--icc=true", "RESULT --icc=true hi\n"},
+			} {
+				out := mustRunGuest(t, guestSpec{
+					plat:          b.plat,
+					image:         "docker:dind",
+					entrypoint:    []string{"sh", "-c"},
+					entrypointSet: true,
+					cmd:           []string{iccScript, "sh", tc.arg},
+					envv:          []string{"DOCKER_TLS_CERTDIR="},
+					net:           gvx.NetModeNAT,
+					netRaw:        true,
+					packetWrite:   true,
+					allowSUID:     true,
+					mounts:        []gvx.Mount{{Kind: gvx.MountTmpfs, GuestPath: "/var/lib/docker", TmpfsSizeBytes: 6 << 30}},
+					timeout:       10 * time.Minute,
+				})
+				requireContains(t, "guest output of "+tc.arg, out, tc.want)
+			}
+		})
+	}
+}
