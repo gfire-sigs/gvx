@@ -182,7 +182,7 @@ func TestCPUBandwidthIdleNodeStartsFreshPeriod(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
 	b.charge(clock.now, 30*ms)
-	clock.advance(10 * time.Second)
+	clock.advance(10*time.Second + 50*time.Millisecond)
 
 	b.charge(clock.now, 40*ms)
 	if b.Throttled() {
@@ -191,11 +191,103 @@ func TestCPUBandwidthIdleNodeStartsFreshPeriod(t *testing.T) {
 	if got := b.Stats().Periods; got != 2 {
 		t.Errorf("Periods = %d, want 2: the period with the charge and one idle period", got)
 	}
-	// The period of the new charge started at the charge. It ends 100 ms later.
-	clock.advance(60 * time.Millisecond)
-	b.charge(clock.now, 21*ms)
+	// The 40 ms ran inside the period that began at 10.0 s, so 10 ms are left.
+	b.charge(clock.now, 10*ms)
+	if b.Throttled() {
+		t.Fatal("throttled before the quota of the new period was spent")
+	}
+	b.charge(clock.now, 11*ms)
 	if !b.Throttled() {
-		t.Error("not throttled after 56 ms of charges in one period")
+		t.Error("not throttled after 61 ms of charges in one period")
+	}
+}
+
+func TestCPUBandwidthLateChargeOverManyPeriodsDoesNotThrottle(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+
+	// A stall of the ticker holds back all charges for one second. Then it
+	// bills the 1000 ms that one thread ran. Ten periods ended in that time, and
+	// the thread used less than its quota in each of them. The charge must not
+	// make a debt in the current period for the time of the periods before.
+	clock.advance(time.Second)
+	b.charge(clock.now, 1000*ms)
+	if b.Throttled() {
+		t.Fatal("throttled by a charge that lies in periods that ended")
+	}
+	if got := b.Stats().Throttled; got != 0 {
+		t.Errorf("Throttled = %d, want 0", got)
+	}
+	if got := b.Stats().Periods; got != 10 {
+		t.Errorf("Periods = %d, want 10: the thread was active in every period", got)
+	}
+	b.charge(clock.now, 100*ms)
+	if b.Throttled() {
+		t.Error("throttled although the current period used 100 ms of 110 ms")
+	}
+}
+
+func TestCPUBandwidthLateChargeCountsOnlyTimeInCurrentPeriod(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+
+	// The charge at 250 ms covers 200 ms of running. The periods end at 100 ms
+	// and at 200 ms, so 50 ms of the charge lie in the period that began at
+	// 200 ms. That period then has 60 ms left.
+	clock.advance(250 * time.Millisecond)
+	b.charge(clock.now, 200*ms)
+	b.charge(clock.now, 59*ms)
+	if b.Throttled() {
+		t.Fatal("throttled with 109 ms charged in a period of 110 ms")
+	}
+	b.charge(clock.now, 12*ms)
+	if !b.Throttled() {
+		t.Error("not throttled with 121 ms charged in a period of 110 ms")
+	}
+}
+
+func TestCPUBandwidthLateChargeRepaysTheDebtOfEveryPeriod(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
+
+	// A thread ran 350 ms without a pause, because a stall held back both the
+	// charge and the throttle. Each period gave it 50 ms, and it ran 100 ms in
+	// each of the three periods that ended. It used 150 ms more than the quota
+	// gave. The debt stays, as it would after charges on time.
+	clock.advance(350 * time.Millisecond)
+	b.charge(clock.now, 350*ms)
+	if !b.Throttled() {
+		t.Fatal("not throttled after the thread used 150 ms more than its quota")
+	}
+	// The refills at 400 ms, 500 ms, and 600 ms repay 50 ms each.
+	clock.advance(249 * time.Millisecond)
+	if !b.Throttled() {
+		t.Fatal("released before the periods repaid the debt")
+	}
+	clock.advance(time.Millisecond)
+	if b.Throttled() {
+		t.Error("still throttled after three refills repaid the debt of 150 ms")
+	}
+}
+
+func TestCPUBandwidthLateChargesOfManyTasksCountTogether(t *testing.T) {
+	var clock fakeBandwidthClock
+	one := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+	two := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+
+	// A stall holds back the charges for one second. A single thread that ran
+	// all the time used 100 ms in each period, and two such threads used 200 ms.
+	clock.advance(time.Second)
+	chargeBandwidthRuns(clock.now, []bandwidthRun{
+		{one, 1000 * ms},
+		{two, 1000 * ms},
+		{two, 1000 * ms},
+	})
+	if one.Throttled() {
+		t.Error("a node throttled with one thread below its quota in each period")
+	}
+	if !two.Throttled() {
+		t.Error("a node did not throttle with two threads above its quota in each period")
 	}
 }
 

@@ -37,7 +37,8 @@ func (t *Task) cpuBandwidth() *CPUBandwidth {
 // accountCPUBandwidth runs once for each CPU clock tick while a cgroup has a
 // quota. It charges the time that each task ran since its last charge to the
 // budget of the cgroup of the task, and to the budget of every ancestor with a
-// limit. It then interrupts the tasks that run application code in a throttled
+// limit. It gives all charges of one tick to the budgets together, so that a
+// stall of the ticker is split over the periods that it covers. It then interrupts the tasks that run application code in a throttled
 // cgroup. The interrupted task returns to its run loop, which blocks it in
 // throttleCPUBandwidth.
 //
@@ -48,6 +49,8 @@ func (t *Task) cpuBandwidth() *CPUBandwidth {
 func (k *Kernel) accountCPUBandwidth(all []*Task) {
 	now := meterNow()
 	gen := cpuBillingGeneration.Load()
+	var stack [32]bandwidthRun
+	runs := stack[:0]
 	for _, t := range all {
 		m := &t.cpuMeter
 		running := t.running()
@@ -66,10 +69,13 @@ func (k *Kernel) accountCPUBandwidth(all []*Task) {
 		}
 		delta := cur - m.billed
 		m.billed = cur
-		if bw := t.cpuBandwidth(); bw != nil {
-			bw.charge(now, delta)
+		for n := t.cpuBandwidth(); n != nil; n = n.parent {
+			if n.limited() {
+				runs = append(runs, bandwidthRun{node: n, ns: delta})
+			}
 		}
 	}
+	chargeBandwidthRuns(now, runs)
 	if cpuBandwidthThrottled.Load() == 0 {
 		return
 	}

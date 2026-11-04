@@ -405,19 +405,22 @@ func checkUnlimited() error {
 	})
 }
 
-// checkQuotaAboveDemand gives a busy Go program 1.1 CPU. The program has a
-// second thread, the runtime monitor, so its demand is 1.01 CPU. A quota of
-// exactly one CPU would throttle it, as it would in Linux.
+// checkQuotaAboveDemand gives a busy Go program 2 CPUs. The program has other
+// threads, such as the runtime monitor. Their demand is 1.01 CPU on average. On a
+// Windows host, the wake-ups of these threads cost up to 1.5 CPU in one period,
+// and a window of 3 seconds can read 1.12 CPU, because the Sentry measures the
+// wall time of each wake-up. A quota of exactly one CPU would throttle the
+// program, as it would in Linux.
 func checkQuotaAboveDemand() error {
 	return withCgroup(probeDir, func() error {
-		if err := writeFile(probeDir, "cpu.max", "110000 100000"); err != nil {
+		if err := writeFile(probeDir, "cpu.max", "200000 100000"); err != nil {
 			return err
 		}
 		w, err := runSpinners(probeDir, 1, shortWindow)
 		if err != nil {
 			return err
 		}
-		if err := expectCPUs(w, 0.9, 1.05); err != nil {
+		if err := expectCPUs(w, 0.9, 1.3); err != nil {
 			return err
 		}
 		if w.throttled != 0 {

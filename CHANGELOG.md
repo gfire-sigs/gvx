@@ -50,6 +50,7 @@ This release adds the Linux kernel interfaces that the `kubelet`, `containerd`, 
   - A write follows the Linux limits. A period must be 1 ms to 1 s, and a quota must be 1 ms or more. Any other value fails with `EINVAL`. A new value releases a throttled task at once. A task that moves to another cgroup stops waiting for the old period end.
   - `usage_usec` is now the measured time that the tasks ran. A busy Go program read 1.1 to 1.3 CPU before. The ticker billed a whole tick to each sampled thread. It reads 1.01 to 1.03 now.
   - A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. `cpu.weight` stays unenforced. The burst fields of Linux stay unenforced too.
+  - A stall of the Sentry can delay the charge of a task by many periods. The charge now counts for each period that it covers, and each period gives the quota again. Before, the whole charge counted against the current period. A task in a cgroup with enough quota then lost many periods to a debt that it never made. The test A14 on Windows `systrap` saw such a loop throttled for 8 periods.
 
 ### Bug Fixes
 

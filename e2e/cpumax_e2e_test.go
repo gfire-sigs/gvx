@@ -29,7 +29,7 @@ import (
 // backend (GVXIP-005, test A14). The guest program makes cgroups, runs busy-loop
 // children in them, and compares usage_usec of cpu.stat with the wall time.
 // With 50000 100000 a loop uses 0.5 +- 0.1 CPU over 5 seconds and nr_throttled
-// grows. With max, one thread uses one CPU, and below its quota it never throttles. A tenth of a CPU gives both the billed time and the progress of the loop a tenth. A child obeys the limit of its
+// grows. With max, one thread uses one CPU, and below its quota of 2 CPUs it never throttles. A tenth of a CPU gives both the billed time and the progress of the loop a tenth. A child obeys the limit of its
 // parent. The tasks of one cgroup share the quota across CPUs. A held-back task runs again at once when a write lifts the limit, when it moves to another cgroup, and when the cpu controller leaves its cgroup.
 func TestE2ECPUMaxEnforcement(t *testing.T) {
 	bin := acceptprog.BuildCPUMaxProbe(t, runtime.GOARCH)
