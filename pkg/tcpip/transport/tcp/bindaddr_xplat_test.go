@@ -23,6 +23,7 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -40,7 +41,7 @@ const (
 func newLoopbackStack(t *testing.T) (*stack.Stack, tcpip.Endpoint) {
 	t.Helper()
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 	if err := s.CreateNIC(1, loopback.New()); err != nil {
@@ -66,24 +67,38 @@ func newLoopbackStack(t *testing.T) (*stack.Stack, tcpip.Endpoint) {
 	return s, l
 }
 
-// connectFrom connects a new client endpoint that Bind gave the port
-// clientPort on the address bindAddr, lets the server close first, and closes
-// the client. It returns the error of the Bind call.
-func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, bindAddr tcpip.Address) tcpip.Error {
+// bindWithRetry binds c to addr. The release of a closed client endpoint runs in
+// the background, so a port that is in use gets a bounded number of retries.
+func bindWithRetry(c tcpip.Endpoint, addr tcpip.FullAddress) tcpip.Error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := c.Bind(addr)
+		if _, inUse := err.(*tcpip.ErrPortInUse); err == nil || !inUse || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// connectFrom connects a new client endpoint of the network protocol netProto
+// that Bind gave the port clientPort on the address bindAddr to peer, lets the
+// server close first, and closes the client. It returns the error of the Bind
+// call.
+func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, netProto tcpip.NetworkProtocolNumber, bindAddr, peer tcpip.Address) tcpip.Error {
 	t.Helper()
 	var wq waiter.Queue
-	c, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	c, err := s.NewEndpoint(tcp.ProtocolNumber, netProto, &wq)
 	if err != nil {
 		t.Fatalf("NewEndpoint: %s", err)
 	}
 	defer c.Close()
-	if err := c.Bind(tcpip.FullAddress{Addr: bindAddr, Port: clientPort}); err != nil {
+	if err := bindWithRetry(c, tcpip.FullAddress{Addr: bindAddr, Port: clientPort}); err != nil {
 		return err
 	}
 	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
 	wq.EventRegister(&we)
 	defer wq.EventUnregister(&we)
-	if err := c.Connect(tcpip.FullAddress{Addr: loopbackAddr, Port: serverPort}); err != nil {
+	if err := c.Connect(tcpip.FullAddress{Addr: peer, Port: serverPort}); err != nil {
 		if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 			t.Fatalf("Connect: %s", err)
 		}
@@ -118,24 +133,28 @@ func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, bindAddr tcpip.
 }
 
 // TestBindThenConnectReleasesPort checks that a client can bind the same port
-// again after its connection closed, for a wildcard address and for a specific
-// address. The client closes second, so it keeps no TIME_WAIT state.
+// again after its connection closed. The cases are a wildcard address and a
+// specific address of an IPv4 endpoint, and a wildcard address of a dual-stack
+// IPv6 endpoint that connects to an IPv4-mapped address. The client closes
+// second, so it keeps no TIME_WAIT state.
 func TestBindThenConnectReleasesPort(t *testing.T) {
+	mapped := tcpip.AddrFrom16([16]byte{10: 0xff, 11: 0xff, 12: 127, 15: 1})
 	for _, tc := range []struct {
-		name string
-		addr tcpip.Address
+		name     string
+		netProto tcpip.NetworkProtocolNumber
+		bind     tcpip.Address
+		peer     tcpip.Address
 	}{
-		{"wildcard address", tcpip.Address{}},
-		{"specific address", loopbackAddr},
+		{"IPv4 wildcard address", ipv4.ProtocolNumber, tcpip.Address{}, loopbackAddr},
+		{"IPv4 specific address", ipv4.ProtocolNumber, loopbackAddr, loopbackAddr},
+		{"dual-stack wildcard address to a mapped address", ipv6.ProtocolNumber, tcpip.Address{}, mapped},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, l := newLoopbackStack(t)
 			for i := 0; i < 3; i++ {
-				if err := connectFrom(t, s, l, tc.addr); err != nil {
+				if err := connectFrom(t, s, l, tc.netProto, tc.bind, tc.peer); err != nil {
 					t.Fatalf("connection %d: Bind: %s", i+1, err)
 				}
-				// Closing the client endpoint finishes in the background.
-				time.Sleep(200 * time.Millisecond)
 			}
 		})
 	}

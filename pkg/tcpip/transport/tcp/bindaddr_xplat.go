@@ -14,7 +14,10 @@
 
 package tcp
 
-import "z.gfire.dev/gvx/pkg/tcpip"
+import (
+	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
+)
 
 // reservedAddr returns the address under which the endpoint holds its port
 // reservation. A client that binds a port on the wildcard address and then
@@ -27,4 +30,25 @@ func (e *Endpoint) reservedAddr() tcpip.Address {
 		return tcpip.Address{}
 	}
 	return e.TransportEndpointInfo.ID.LocalAddress
+}
+
+// reservedNetworks returns the networks under which the endpoint holds its port
+// reservation.
+func (e *Endpoint) reservedNetworks() []tcpip.NetworkProtocolNumber {
+	if e.boundWildcard {
+		return e.boundNetworks
+	}
+	return e.effectiveNetProtos
+}
+
+// dropBoundV4 removes IPv4 from the networks of the bind reservation, after
+// connect released the IPv4 part of the reservation of a dual-stack endpoint.
+func (e *Endpoint) dropBoundV4() {
+	kept := make([]tcpip.NetworkProtocolNumber, 0, len(e.boundNetworks))
+	for _, n := range e.boundNetworks {
+		if n != header.IPv4ProtocolNumber {
+			kept = append(kept, n)
+		}
+	}
+	e.boundNetworks = kept
 }
