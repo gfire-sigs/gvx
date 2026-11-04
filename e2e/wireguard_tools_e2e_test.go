@@ -21,6 +21,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"regexp"
 	"strconv"
@@ -352,5 +353,56 @@ echo B-DONE
 				t.Errorf("A knew an endpoint of B before the keepalive, or traffic crossed after the removal\nA:\n%s\nB:\n%s", a.out.String(), bg.out.String())
 			}
 		})
+	}
+}
+
+// TestE2EWireGuardA12ToolLargeConfiguration sets a configuration with many
+// peers through "wg setconf" and reads it back with "wg show dump". A dump
+// that fits the receive queue of the netlink socket lists every peer. A larger
+// dump fails with an explicit error, and it never ends early with a partial
+// list.
+func TestE2EWireGuardA12ToolLargeConfiguration(t *testing.T) {
+	const script = `set -e
+apk add --no-cache wireguard-tools iproute2 >/dev/null
+ip link add wg0 type wireguard
+wg setconf wg0 /dev/stdin
+echo SETCONF-DONE
+rc=0
+wg show wg0 dump > /tmp/dump 2> /tmp/err || rc=$?
+echo DUMP-RC $rc
+echo DUMP-LINES $(wc -l < /tmp/dump)
+echo DUMP-ERR $(cat /tmp/err)
+`
+	for _, b := range gateBackends() {
+		for _, peers := range []int{700, 2000} {
+			t.Run(b.name+"/"+strconv.Itoa(peers), func(t *testing.T) {
+				requireFixedAddressBackend(t, b)
+				requireRegistry(t)
+				var conf strings.Builder
+				conf.WriteString("[Interface]\nPrivateKey = " + newWGKeys(t).private + "\nListenPort = 51820\n")
+				for i := range peers {
+					fmt.Fprintf(&conf, "[Peer]\nPublicKey = %s\nAllowedIPs = 172.%d.%d.%d/32\n", newWGKeys(t).public, 16+i>>16, i>>8&255, i&255)
+				}
+				out := mustRunGuest(t, guestSpec{
+					plat: b.plat, image: "alpine:3.20", argv: []string{"sh", "-c", script}, net: gvx.NetModeNAT, netRaw: true,
+					stdin: strings.NewReader(conf.String()),
+				})
+				requireContains(t, "setconf", out, "SETCONF-DONE\n")
+				rc := regexp.MustCompile(`(?m)^DUMP-RC (\d+)$`).FindStringSubmatch(out)
+				lines := regexp.MustCompile(`(?m)^DUMP-LINES (\d+)$`).FindStringSubmatch(out)
+				if rc == nil || lines == nil {
+					t.Fatalf("output lacks the dump result:\n%s", out)
+				}
+				switch {
+				case rc[1] == "0" && lines[1] == strconv.Itoa(peers+1):
+				case peers > 1000 && rc[1] != "0" && strings.Contains(out, "No buffer space available"):
+				default:
+					t.Errorf("the dump of %d peers ended with status %s and %s lines, want every line, or an error for more than 1,000 peers:\n%s", peers, rc[1], lines[1], out)
+				}
+				if peers == 700 && rc[1] != "0" {
+					t.Errorf("the dump of 700 peers failed:\n%s", out)
+				}
+			})
+		}
 	}
 }

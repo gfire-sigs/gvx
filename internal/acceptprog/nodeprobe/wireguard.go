@@ -89,6 +89,7 @@ type wgPeer struct {
 	keepalive *uint16
 	flags     uint32
 	allowed   []string // CIDR strings
+	proto     *uint32  // protocol version, or nil for 1
 }
 
 // wgConfig is a set request.
@@ -177,13 +178,20 @@ func u32(v uint32) []byte { return binary.LittleEndian.AppendUint32(nil, v) }
 // wgSet sends WG_CMD_SET_DEVICE for the link in the namespace of the calling
 // thread.
 func wgSet(ifname string, c wgConfig) error {
+	return wgSetWith(c, nl.NewRtAttr(wgDevIfname, nl.ZeroTerminated(ifname)))
+}
+
+// wgSetWith sends WG_CMD_SET_DEVICE with the given selector attributes.
+func wgSetWith(c wgConfig, selectors ...*nl.RtAttr) error {
 	fam, err := wgFamily()
 	if err != nil {
 		return err
 	}
 	req := nl.NewNetlinkRequest(int(fam), unix.NLM_F_ACK)
 	req.AddData(&nl.Genlmsg{Command: wgCmdSetDevice, Version: 1})
-	req.AddData(nl.NewRtAttr(wgDevIfname, nl.ZeroTerminated(ifname)))
+	for _, a := range selectors {
+		req.AddData(a)
+	}
 	if c.flags != 0 {
 		req.AddData(nl.NewRtAttr(wgDevFlags, u32(c.flags)))
 	}
@@ -217,7 +225,11 @@ func wgSet(ifname string, c wgConfig) error {
 			if p.keepalive != nil {
 				peer.AddRtAttr(wgPeerKeepalive, u16(*p.keepalive))
 			}
-			peer.AddRtAttr(wgPeerProtoVer, u32(1))
+			proto := uint32(1)
+			if p.proto != nil {
+				proto = *p.proto
+			}
+			peer.AddRtAttr(wgPeerProtoVer, u32(proto))
 			if len(p.allowed) > 0 {
 				ips := nested(wgPeerAllowedIPs)
 				for _, cidr := range p.allowed {
@@ -247,13 +259,20 @@ func wgSet(ifname string, c wgConfig) error {
 
 // wgGet sends WG_CMD_GET_DEVICE with NLM_F_DUMP and merges the messages.
 func wgGet(ifname string) (*wgState, error) {
+	return wgGetWith(nl.NewRtAttr(wgDevIfname, nl.ZeroTerminated(ifname)))
+}
+
+// wgGetWith sends WG_CMD_GET_DEVICE with the given selector attributes.
+func wgGetWith(selectors ...*nl.RtAttr) (*wgState, error) {
 	fam, err := wgFamily()
 	if err != nil {
 		return nil, err
 	}
 	req := nl.NewNetlinkRequest(int(fam), unix.NLM_F_DUMP|unix.NLM_F_ACK)
 	req.AddData(&nl.Genlmsg{Command: wgCmdGetDevice, Version: 1})
-	req.AddData(nl.NewRtAttr(wgDevIfname, nl.ZeroTerminated(ifname)))
+	for _, a := range selectors {
+		req.AddData(a)
+	}
 	msgs, err := req.Execute(unix.NETLINK_GENERIC, 0)
 	if err != nil {
 		return nil, err

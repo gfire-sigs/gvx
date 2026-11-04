@@ -57,3 +57,21 @@ func TestE2EWireGuardA12OneSandbox(t *testing.T) {
 			"deleting-the-link-removes-the-device", "namespaces-end")
 	})
 }
+
+// TestE2EWireGuardA12Limits checks the rules and the limits of the link in
+// one guest. A set request with a busy listen port fails with EADDRINUSE and
+// changes nothing, a caller without CAP_NET_ADMIN in the creating namespace
+// cannot set the port or the mark, and a dump either lists every peer or fails
+// with ENOBUFS. The link and the peer limits answer ENOMEM.
+func TestE2EWireGuardA12Limits(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, nil, "wglimits")
+		requireNodeChecks(t, code, out,
+			"pair-starts-with-two-peers-on-a", "busy-port-is-refused-before-any-change",
+			"set-to-the-current-port-succeeds", "set-to-a-free-port-moves-the-socket",
+			"lookup-needs-exactly-one-selector", "unsupported-protocol-version-is-epfnosupport",
+			"listen-port-needs-cap-net-admin-in-the-creating-namespace",
+			"dump-of-800-peers-is-complete", "dump-over-the-queue-fails-with-enobufs",
+			"peer-limit-is-enomem", "link-limit-is-enomem", "namespaces-end")
+	})
+}
