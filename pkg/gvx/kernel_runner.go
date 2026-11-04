@@ -74,6 +74,7 @@ import (
 
 	// Register Linux syscall tables and socket families in the Sentry kernel.
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink"
+	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/genetlink"
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/netfilter"
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/route"
 	_ "z.gfire.dev/gvx/pkg/sentry/socket/netlink/uevent"

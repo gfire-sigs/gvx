@@ -84,8 +84,9 @@ seam pkg/sentry/pgalloc/pgalloc.go
 # (pkg/sentry/fsimpl/proc/task_net_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks_sys.go
 seam pkg/sentry/fsimpl/proc/task_net.go
-# Content seam: RTM_SETLINK accepts the hairpin mode of a bridge port
-# (pkg/sentry/socket/netstack/bridgeport_xplat.go).
+# Content seams: RTM_SETLINK accepts the hairpin mode of a bridge port
+# (pkg/sentry/socket/netstack/bridgeport_xplat.go), and RTM_NEWLINK of a link kind
+# that the stack does not create calls the registry of pkg/sentry/socket/netstack/linkkind_xplat.go.
 seam pkg/sentry/socket/netstack/stack.go
 # Content seam: RTM_GETLINK reports IFLA_STATS64 (pkg/sentry/socket/netlink/route/link_stats_xplat.go).
 seam pkg/sentry/socket/netlink/route/protocol.go
