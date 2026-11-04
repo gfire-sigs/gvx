@@ -2,6 +2,24 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release adds the Linux kernel interfaces that the `kubelet`, `containerd`, `runc`, and `k3s` read and write (GVXIP-005, phase P1). It adds no flag and no SDK field.
+
+### Features
+
+- **`/dev/kmsg`**: the character device 1:11 opens for read and write. A non-blocking read returns `EAGAIN`, a blocking read waits, `lseek` with `SEEK_END` returns 0, and a write goes to the Sentry log and returns its length. The `kubelet` no longer exits with `open /dev/kmsg: no such file or directory`. The Sentry has no kernel ring buffer, so a reader never gets a record.
+- **Sysctls of the `kubelet` and the container runtime**: `vm/overcommit_memory` accepts 0, 1, and 2 and returns `EINVAL` for other values. `vm/panic_on_oom`, `kernel/panic`, `kernel/panic_on_oops`, `kernel/keys/root_maxkeys`, and `kernel/keys/root_maxbytes` store a value in the range of Linux. `net/netfilter/nf_conntrack_max`, `nf_conntrack_tcp_timeout_established`, `nf_conntrack_tcp_timeout_close_wait`, and `/sys/module/nf_conntrack/parameters/hashsize` store their values. The files change no behavior of the Sentry.
+- **`ip_unprivileged_port_start`**: each network namespace has the sysctl, and the default is 1024. A `bind` of a TCP or UDP socket of IPv4 or IPv6 to a lower port fails with `EACCES` unless the caller has `CAP_NET_BIND_SERVICE`. `runc` no longer fails every pod sandbox with `open /proc/sys/net/ipv4/ip_unprivileged_port_start: no such file or directory`.
+- **Safe sysctls of Kubernetes**: `net/ipv4/ip_local_port_range`, `tcp_syncookies`, `ping_group_range`, `ip_local_reserved_ports`, `tcp_keepalive_time`, `tcp_keepalive_intvl`, `tcp_keepalive_probes`, `tcp_fin_timeout`, and `kernel/shm_rmid_forced` are writable. The network values belong to the network namespace of the process, so a write in a pod namespace leaves the value of the node. The port range, the keepalive values of new sockets, the FIN-WAIT-2 time, and `tcp_syncookies=2` reach the network stack. `ping_group_range` and `ip_local_reserved_ports` only store their values, and `tcp_syncookies=0` still sends cookies when the accept queue is full.
+- **Capacity of the node**: with `-m`, `MemTotal` in `/proc/meminfo` and `totalram` of `sysinfo(2)` equal the memory limit when it is below the host RAM. With `--cpus`, the online CPUs, `sched_getaffinity`, `/sys/devices/system/cpu/online`, and `nproc` already showed the whole CPUs of the quota. Without the options nothing changes.
+- **Statistics**: `/sys/class/net/<link>` lists the links of the network namespace of the reader with `address`, `mtu`, `operstate`, `ifindex`, and the counters `statistics/{rx,tx}_{bytes,packets,errors,dropped}`. `/proc/diskstats` has one line for the disk `vda`. Its counters come from the read and write system calls of all processes, so they include sockets and pipes.
+
+### Behavior Changes
+
+- **Forwarding sysctls belong to the network namespace**: `/proc/sys/net/ipv4/ip_forward`, `conf/all/forwarding`, `conf/default/forwarding`, and the IPv6 `forwarding` files share one value for each IP family in the network namespace of the reader. Before, `ip_forward` showed the root namespace to every reader and `conf/all/forwarding` did not exist. `/proc/sys/net/ipv4/ip_local_port_range` also follows the namespace of the reader.
+- **`tcp_keepalive_*` and `ip_local_reserved_ports` are writable**: the files were read-only stubs that showed 0 for `tcp_keepalive_intvl` and `tcp_keepalive_probes`. They now show the defaults of Linux (75 and 9).
+
 ## [v0.7.10002026110200] - 2026-11-04
 
 This release adds Docker and `ext4lite` features and fixes HotSpot 21, `membarrier`, and `brk` on the Windows `systrap` engine. It also changes the format of `.gvx_meta`, so an older release cannot open a workspace that this release wrote. Read the upgrade note under Behavior Changes before the upgrade.
