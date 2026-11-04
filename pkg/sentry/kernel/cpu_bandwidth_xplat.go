@@ -49,10 +49,10 @@ var (
 )
 
 // bandwidthSlackNS is the debt that a node tolerates before it throttles. The
-// CPU clock ticker charges each task once for each tick, and a task that runs
-// without a pause then owes up to one tick of rounding at each period end. A
-// debt carries into the next period, so the slack does not change the average.
-const bandwidthSlackNS = int64(time.Millisecond)
+// CPU clock ticker charges each task once for each tick, and the threads of a
+// program together can run a little more than one CPU. A debt carries into the
+// next period, so the slack does not change the average.
+const bandwidthSlackNS = 10 * int64(time.Millisecond)
 
 // bandwidthClock is the source of time and of timers for a CPUBandwidth.
 type bandwidthClock struct {

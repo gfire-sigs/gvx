@@ -106,5 +106,6 @@ func (t *Task) throttleCPUBandwidth() bool {
 		return false
 	}
 	t.Block(wake)
+	t.cpuMeter.skipToApp = true
 	return true
 }

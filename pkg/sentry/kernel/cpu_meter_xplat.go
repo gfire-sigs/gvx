@@ -36,6 +36,11 @@ type cpuMeter struct {
 	// clock ticker uses it.
 	billed int64
 
+	// skipToApp is true after a throttled task woke. The time up to its next
+	// entry into application code is the cost of the wake, and it is not billed.
+	// Only the task goroutine uses it.
+	skipToApp bool
+
 	// billedGen is the value of cpuBillingGeneration when billed was set.
 	billedGen int32
 }
@@ -51,6 +56,13 @@ func (m *cpuMeter) stop(now int64) {
 	if s := m.runStart.Swap(0); s != 0 {
 		m.total.Add(max(now-s, 0))
 	}
+}
+
+// restart drops the unbilled time since the wake of a throttled task and starts
+// a new run.
+func (m *cpuMeter) restart(now int64) {
+	m.skipToApp = false
+	m.runStart.Store(now)
 }
 
 // measured returns the running time up to now. The argument running tells

@@ -107,6 +107,9 @@ func (t *Task) accountTaskGoroutineEnter(state TaskGoroutineState) {
 		panic(fmt.Sprintf("Task goroutine switching from state %v (expected %v) to %v", oldState, TaskGoroutineRunningSys, state))
 	}
 	t.setGostate(state)
+	if state == TaskGoroutineRunningApp && t.cpuMeter.skipToApp {
+		t.cpuMeter.restart(meterNow())
+	}
 	if state != TaskGoroutineRunningApp {
 		// Task is blocking/stopping.
 		t.k.decRunningTasks()
