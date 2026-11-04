@@ -321,24 +321,24 @@ func TestFDBUpdateSemantics(t *testing.T) {
 			t.Errorf("%s = %v, want %v", name, got, want)
 		}
 	}
-	check("update of a missing entry without create", tb.update(unicast, NUDPermanent, 0, r1, UpdateMode{}, now), ErrNotFound)
-	check("create", tb.update(unicast, NUDPermanent, 0, r1, UpdateMode{Create: true, Excl: true}, now), nil)
-	check("exclusive create of an existing entry", tb.update(unicast, NUDPermanent, 0, r1, UpdateMode{Create: true, Excl: true}, now), ErrExists)
-	check("append to a unicast entry changes nothing", tb.update(unicast, NUDPermanent, 0, r2, UpdateMode{Create: true, Append: true}, now), nil)
+	check("update of a missing entry without create", tb.update(unicast, NUDPermanent, 0, r1, UpdateMode{}, now, 0, 0), ErrNotFound)
+	check("create", tb.update(unicast, NUDPermanent, 0, r1, UpdateMode{Create: true, Excl: true}, now, 0, 0), nil)
+	check("exclusive create of an existing entry", tb.update(unicast, NUDPermanent, 0, r1, UpdateMode{Create: true, Excl: true}, now, 0, 0), ErrExists)
+	check("append to a unicast entry changes nothing", tb.update(unicast, NUDPermanent, 0, r2, UpdateMode{Create: true, Append: true}, now, 0, 0), nil)
 	if got := tb.entries[unicast].remotes; len(got) != 1 || got[0] != r1 {
 		t.Errorf("remotes after append to a unicast entry = %v, want only %v", got, r1)
 	}
-	check("replace", tb.update(unicast, NUDPermanent, 0, r2, UpdateMode{Create: true, Replace: true}, now), nil)
+	check("replace", tb.update(unicast, NUDPermanent, 0, r2, UpdateMode{Create: true, Replace: true}, now, 0, 0), nil)
 	if got := tb.entries[unicast].remotes; len(got) != 1 || got[0] != r2 {
 		t.Errorf("remotes after replace = %v, want only %v", got, r2)
 	}
-	check("first append to the all-zeros entry", tb.update(zeroMAC, NUDPermanent, 0, r1, UpdateMode{Create: true, Append: true}, now), nil)
-	check("second append", tb.update(zeroMAC, NUDPermanent, 0, r2, UpdateMode{Create: true, Append: true}, now), nil)
-	check("repeated append", tb.update(zeroMAC, NUDPermanent, 0, r2, UpdateMode{Create: true, Append: true}, now), nil)
+	check("first append to the all-zeros entry", tb.update(zeroMAC, NUDPermanent, 0, r1, UpdateMode{Create: true, Append: true}, now, 0, 0), nil)
+	check("second append", tb.update(zeroMAC, NUDPermanent, 0, r2, UpdateMode{Create: true, Append: true}, now, 0, 0), nil)
+	check("repeated append", tb.update(zeroMAC, NUDPermanent, 0, r2, UpdateMode{Create: true, Append: true}, now, 0, 0), nil)
 	if got := tb.entries[zeroMAC].remotes; len(got) != 2 {
 		t.Errorf("all-zeros remotes = %v, want two", got)
 	}
-	check("replace of the all-zeros entry", tb.update(zeroMAC, NUDPermanent, 0, r1, UpdateMode{Create: true, Replace: true}, now), ErrNotSupported)
+	check("replace of the all-zeros entry", tb.update(zeroMAC, NUDPermanent, 0, r1, UpdateMode{Create: true, Replace: true}, now, 0, 0), ErrNotSupported)
 	check("delete one remote", tb.remove(zeroMAC, r1), nil)
 	check("delete a missing remote", tb.remove(zeroMAC, r1), ErrNotFound)
 	check("delete the last remote", tb.remove(zeroMAC, r2), nil)
@@ -352,20 +352,20 @@ func TestLearningRules(t *testing.T) {
 	mac := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x09")
 	src1 := Remote{IP: ip4(10, 0, 0, 1)}
 	src2 := Remote{IP: ip4(10, 0, 0, 2)}
-	if !tb.learn(mac, src1, 0, now) || !tb.learn(mac, src2, 0, now) {
+	if !tb.learn(mac, src1, 0, now, 0) || !tb.learn(mac, src2, 0, now, 0) {
 		t.Fatal("learning dropped a frame of a dynamic entry")
 	}
 	if got := tb.entries[mac].remotes[0]; got != src2 {
 		t.Errorf("a moved address learned %v, want %v", got, src2)
 	}
 	static := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x0a")
-	if err := tb.update(static, NUDPermanent, 0, src1, UpdateMode{Create: true}, now); err != nil {
+	if err := tb.update(static, NUDPermanent, 0, src1, UpdateMode{Create: true}, now, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if tb.learn(static, src2, 0, now) {
+	if tb.learn(static, src2, 0, now, 0) {
 		t.Error("learning accepted a frame that moves a static entry")
 	}
-	if !tb.learn(static, src1, 0, now) {
+	if !tb.learn(static, src1, 0, now, 0) {
 		t.Error("learning dropped a frame from the remote of a static entry")
 	}
 	if got := tb.entries[static].remotes[0]; got != src1 {
@@ -373,7 +373,7 @@ func TestLearningRules(t *testing.T) {
 	}
 	// With a limit of 1 and one dynamic entry, a new address is not learned.
 	other := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x0b")
-	tb.learn(other, src1, 1, now)
+	tb.learn(other, src1, 1, now, 0)
 	if _, ok := tb.entries[other]; ok {
 		t.Error("learning exceeded the limit")
 	}
@@ -383,7 +383,7 @@ func TestDynamicEntriesAge(t *testing.T) {
 	var tb fdb
 	now := time.Now()
 	mac := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x09")
-	tb.learn(mac, Remote{IP: ip4(10, 0, 0, 1)}, 0, now)
+	tb.learn(mac, Remote{IP: ip4(10, 0, 0, 1)}, 0, now, 300*time.Second)
 	if got := tb.snapshot(now.Add(299*time.Second), 300*time.Second); len(got) != 1 {
 		t.Fatalf("entries after 299 s = %d, want 1", len(got))
 	}

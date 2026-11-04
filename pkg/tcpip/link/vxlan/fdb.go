@@ -46,6 +46,17 @@ var (
 	ErrBadAddress = errors.New("vxlan: remote address family does not match the link")
 	// ErrBadState means the state is neither permanent nor reachable.
 	ErrBadState = errors.New("vxlan: FDB state is neither permanent nor reachable")
+	// ErrNoSpace means the table or the list of remotes has reached its limit.
+	ErrNoSpace = errors.New("vxlan: FDB is full")
+)
+
+const (
+	// MaxFDBEntries is the largest count of entries in the table of one link,
+	// static and learned together. A link limit above it has no effect.
+	MaxFDBEntries = 65536
+
+	// MaxRemotes is the largest count of remotes of one entry.
+	MaxRemotes = 1024
 )
 
 // zeroMAC is the key of the entry that holds the destinations of frames with an
@@ -107,18 +118,50 @@ func (f *fdbEntry) static() bool { return f.state&(NUDPermanent|NUDNoARP) != 0 }
 type fdb struct {
 	mu      sync.Mutex
 	entries map[tcpip.LinkAddress]*fdbEntry
+	// nextExpiry is a lower bound of the time at which a dynamic entry can end.
+	// The zero value means that no dynamic entry exists, so a lookup scans the
+	// table only when an entry can be due.
+	nextExpiry time.Time
 }
 
-// expiredLocked removes the dynamic entries that nothing used for ageing.
-func (t *fdb) expiredLocked(now time.Time, ageing time.Duration) {
-	if ageing <= 0 {
+// noteDynamicLocked records that f is a dynamic entry that ends ageing after
+// its last use.
+func (t *fdb) noteDynamicLocked(f *fdbEntry, ageing time.Duration) {
+	if ageing <= 0 || f.static() {
 		return
 	}
+	if exp := f.used.Add(ageing); t.nextExpiry.IsZero() || exp.Before(t.nextExpiry) {
+		t.nextExpiry = exp
+	}
+}
+
+// limitOf returns the largest count of entries for a link limit.
+func limitOf(limit uint32) int {
+	if limit == 0 || limit > MaxFDBEntries {
+		return MaxFDBEntries
+	}
+	return int(limit)
+}
+
+// expiredLocked removes the dynamic entries that nothing used for ageing. It
+// scans the table only when an entry can be due.
+func (t *fdb) expiredLocked(now time.Time, ageing time.Duration) {
+	if ageing <= 0 || t.nextExpiry.IsZero() || now.Before(t.nextExpiry) {
+		return
+	}
+	var next time.Time
 	for mac, f := range t.entries {
-		if !f.static() && now.Sub(f.used) >= ageing {
+		if f.static() {
+			continue
+		}
+		exp := f.used.Add(ageing)
+		if !now.Before(exp) {
 			delete(t.entries, mac)
+		} else if next.IsZero() || exp.Before(next) {
+			next = exp
 		}
 	}
+	t.nextExpiry = next
 }
 
 func isMulticastOrZero(mac tcpip.LinkAddress) bool {
@@ -148,7 +191,7 @@ func (t *fdb) lookup(mac tcpip.LinkAddress, now time.Time, ageing time.Duration,
 // the replace flag changes the first remote of a unicast entry. The append
 // flag adds a remote to a multicast or all-zeros entry. A request that names a
 // remote already in the entry changes nothing.
-func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote, mode UpdateMode, now time.Time) error {
+func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote, mode UpdateMode, now time.Time, ageing time.Duration, limit uint32) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.entries == nil {
@@ -159,7 +202,13 @@ func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote,
 		if !mode.Create {
 			return ErrNotFound
 		}
-		t.entries[mac] = &fdbEntry{mac: mac, state: state, flags: flags, remotes: []Remote{r}, updated: now, used: now}
+		t.expiredLocked(now, ageing)
+		if len(t.entries) >= limitOf(limit) {
+			return ErrNoSpace
+		}
+		f = &fdbEntry{mac: mac, state: state, flags: flags, remotes: []Remote{r}, updated: now, used: now}
+		t.entries[mac] = f
+		t.noteDynamicLocked(f, ageing)
 		return nil
 	}
 	if mode.Excl {
@@ -167,6 +216,7 @@ func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote,
 	}
 	if f.state != state || f.flags != flags {
 		f.state, f.flags, f.updated = state, flags, now
+		t.noteDynamicLocked(f, ageing)
 	}
 	if mode.Replace {
 		if isMulticastOrZero(mac) {
@@ -178,6 +228,9 @@ func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote,
 		}
 	}
 	if mode.Append && isMulticastOrZero(mac) && !slices.Contains(f.remotes, r) {
+		if len(f.remotes) >= MaxRemotes {
+			return ErrNoSpace
+		}
 		f.remotes = append(f.remotes, r)
 		f.updated = now
 	}
@@ -234,14 +287,17 @@ func (t *fdb) snapshot(now time.Time, ageing time.Duration) []FDBEntry {
 
 // learn records that a frame from mac arrived from the outer address src. It
 // follows vxlan_snoop. It reports false when the frame must be dropped, which
-// holds for a static entry that names another remote.
-func (t *fdb) learn(mac tcpip.LinkAddress, src Remote, limit uint32, now time.Time) bool {
+// holds for a static entry that names another remote. A full table learns
+// nothing and drops no frame.
+func (t *fdb) learn(mac tcpip.LinkAddress, src Remote, limit uint32, now time.Time, ageing time.Duration) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.entries == nil {
 		t.entries = make(map[tcpip.LinkAddress]*fdbEntry)
 	}
+	t.expiredLocked(now, ageing)
 	if f := t.entries[mac]; f != nil {
+		f.used = now
 		if len(f.remotes) > 0 && f.remotes[0].IP == src.IP {
 			f.updated = now
 			return true
@@ -253,20 +309,14 @@ func (t *fdb) learn(mac tcpip.LinkAddress, src Remote, limit uint32, now time.Ti
 		f.updated = now
 		return true
 	}
-	if limit != 0 {
-		dynamic := 0
-		for _, f := range t.entries {
-			if !f.static() {
-				dynamic++
-			}
-		}
-		if uint32(dynamic) >= limit {
-			return true
-		}
+	if len(t.entries) >= limitOf(limit) {
+		return true
 	}
-	t.entries[mac] = &fdbEntry{
+	f := &fdbEntry{
 		mac: mac, state: NUDReachable, flags: NTFSelf,
 		remotes: []Remote{src}, updated: now, used: now,
 	}
+	t.entries[mac] = f
+	t.noteDynamicLocked(f, ageing)
 	return true
 }

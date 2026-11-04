@@ -28,12 +28,13 @@ import (
 // burst of full-size datagrams from a TCP sender fits.
 const receiveBufferSize = 4 << 20
 
-// socketKey names one UDP endpoint. Links of one network stack that listen on
-// the same address and port share the endpoint and differ in the VNI.
+// socketKey names one UDP endpoint. Links of one network stack with the same
+// address family and port share the endpoint and differ in the VNI, as in
+// Linux. The endpoint listens on the wildcard address, so the local address of
+// a link only selects the outer source address.
 type socketKey struct {
 	stack *stack.Stack
 	proto tcpip.NetworkProtocolNumber
-	local tcpip.Address
 	port  uint16
 }
 
@@ -63,7 +64,7 @@ type udpSocket struct {
 // opens the endpoint when the link is the first one. It returns ErrDuplicate
 // when another link uses the same VNI on that endpoint.
 func acquireSocket(e *Endpoint) (*udpSocket, error) {
-	key := socketKey{stack: e.stack, proto: e.proto, local: e.cfg.Local, port: e.cfg.Port}
+	key := socketKey{stack: e.stack, proto: e.proto, port: e.cfg.Port}
 	sockets.Lock()
 	defer sockets.Unlock()
 	s := sockets.m[key]
@@ -102,11 +103,7 @@ func openSocket(key socketKey) (*udpSocket, error) {
 		ep.SocketOptions().SetV6Only(true)
 	}
 	ep.SocketOptions().SetReceiveBufferSize(receiveBufferSize, false /* notify */)
-	addr := tcpip.FullAddress{Port: key.port}
-	if !key.local.Unspecified() {
-		addr.Addr = key.local
-	}
-	if terr := ep.Bind(addr); terr != nil {
+	if terr := ep.Bind(tcpip.FullAddress{Port: key.port}); terr != nil {
 		ep.Close()
 		return nil, &StackError{terr}
 	}

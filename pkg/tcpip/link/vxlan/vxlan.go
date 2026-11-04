@@ -58,8 +58,13 @@ const (
 	Overhead4 = 50
 	Overhead6 = 70
 
-	// DefaultMTU is the MTU of a link with no underlay link and no MTU.
-	DefaultMTU = 1500 - Overhead4
+	// MinMTU is the smallest MTU of a link, as ETH_MIN_MTU in Linux.
+	MinMTU = 68
+
+	// maxPacket is the largest size of an IP packet. An outer packet is the
+	// inner frame plus Overhead4 or Overhead6 bytes, so the MTU of the link
+	// stays at maxPacket minus that overhead.
+	maxPacket = 65535
 
 	headerLen = 8
 	// flagVNI is the I flag: the VNI field is valid.
@@ -87,8 +92,8 @@ type Config struct {
 	// remote names another port. 0 selects DefaultPort.
 	Port uint16
 
-	// Local is the outer source address and the address of the UDP endpoint. The
-	// unspecified address stands for any address.
+	// Local is the outer source address. The unspecified address lets the route
+	// of each packet choose it. The UDP endpoint listens on the wildcard address.
 	Local tcpip.Address
 
 	// Group is the remote of the all-zeros entry at creation. The unspecified
@@ -102,10 +107,13 @@ type Config struct {
 	// DefaultTTL.
 	TTL, TOS uint8
 
-	// TTLInherit and the three fields after it are stored and reported. The
-	// transmit path does not read them.
+	// DF is the DF bit policy of the outer packet: 0 leaves it clear, 1 sets
+	// it, and 2 (inherit) is stored and acts as 0.
+	DF uint8
+
+	// TTLInherit and Label are stored and reported. The transmit path does not
+	// read them.
 	TTLInherit bool
-	DF         uint8
 	Label      uint32
 
 	// Learning makes the link learn the source address of received frames.
@@ -125,8 +133,13 @@ type Config struct {
 
 	// UDPCsum makes an IPv4 outer packet carry a UDP checksum. An IPv6 outer
 	// packet always carries one unless UDPZeroCsum6Tx is set.
-	UDPCsum          bool
-	UDPZeroCsum6Tx   bool
+	UDPCsum        bool
+	UDPZeroCsum6Tx bool
+
+	// The fields below are stored and reported. The endpoint does not enforce
+	// them: it accepts a zero checksum on IPv6 receive whatever UDPZeroCsum6Rx
+	// says, it learns and sends the same with Proxy, RSC, L2Miss, and L3Miss,
+	// and it never builds or checks a remote checksum offload header.
 	UDPZeroCsum6Rx   bool
 	Proxy, RSC       bool
 	L2Miss, L3Miss   bool
@@ -145,6 +158,15 @@ type Config struct {
 	Address tcpip.LinkAddress
 }
 
+// MaxMTU returns the largest MTU of the link: the outer packet, which adds
+// the overhead to the inner frame, must fit in 65535 bytes.
+func (c *Config) MaxMTU() uint32 {
+	if c.IPv6() {
+		return maxPacket - Overhead6
+	}
+	return maxPacket - Overhead4
+}
+
 // IPv6 reports whether the outer packets use IPv6.
 func (c *Config) IPv6() bool {
 	return c.Local.Len() == header.IPv6AddressSize || c.Group.Len() == header.IPv6AddressSize
@@ -158,8 +180,12 @@ func (c *Config) anyAddress() tcpip.Address {
 	return tcpip.AddrFrom4([4]byte{})
 }
 
+// ErrBadMTU is the error of a configuration with an MTU below MinMTU or above
+// MaxMTU.
+var ErrBadMTU = errors.New("vxlan: MTU is outside the range of the link")
+
 // ErrDuplicate is the error of a link whose VNI and UDP port another link of
-// the stack already uses.
+// the stack already uses with the same address family.
 var ErrDuplicate = errors.New("vxlan: another link has the same VNI and port")
 
 // StackError carries an error of the network stack, for example from the bind
@@ -167,6 +193,19 @@ var ErrDuplicate = errors.New("vxlan: another link has the same VNI and port")
 type StackError struct{ Err tcpip.Error }
 
 func (e *StackError) Error() string { return "vxlan: " + e.Err.String() }
+
+// nicKey names an interface of one stack.
+type nicKey struct {
+	stack *stack.Stack
+	id    tcpip.NICID
+}
+
+// vxlanNICs holds the interfaces that are vxlan links. A packet whose outer
+// route leaves through one of them would enter another vxlan transmit on the
+// same goroutine. Two links that route through each other would recurse until
+// the stack overflows, so the endpoint drops such a packet. Linux limits the
+// nesting of transmit calls and drops the packet too.
+var vxlanNICs sync.Map
 
 // Endpoint is a VXLAN link endpoint.
 type Endpoint struct {
@@ -218,13 +257,16 @@ func New(s *stack.Stack, cfg Config) (*Endpoint, error) {
 		e.linkAddr = tcpip.GetRandMacAddr()
 	}
 	e.cfg.Address = e.linkAddr
+	if cfg.MTU != 0 && (cfg.MTU < MinMTU || cfg.MTU > cfg.MaxMTU()) {
+		return nil, ErrBadMTU
+	}
 	e.mtu.Store(e.initialMTU())
 	if !cfg.Group.Unspecified() {
 		if header.IsV4MulticastAddress(cfg.Group) || header.IsV6MulticastAddress(cfg.Group) {
 			return nil, ErrNotSupported
 		}
 		r := Remote{IP: cfg.Group, Port: cfg.Port, VNI: cfg.VNI, Link: cfg.Link}
-		if err := e.table.update(zeroMAC, NUDReachable|NUDPermanent, NTFSelf, r, UpdateMode{Create: true, Excl: true}, time.Now()); err != nil {
+		if err := e.table.update(zeroMAC, NUDReachable|NUDPermanent, NTFSelf, r, UpdateMode{Create: true, Excl: true}, time.Now(), 0, cfg.Limit); err != nil {
 			return nil, err
 		}
 	}
@@ -233,6 +275,7 @@ func New(s *stack.Stack, cfg Config) (*Endpoint, error) {
 		return nil, err
 	}
 	e.sock = sock
+	vxlanNICs.Store(nicKey{s, cfg.ID}, struct{}{})
 	return e, nil
 }
 
@@ -242,13 +285,14 @@ func (e *Endpoint) initialMTU() uint32 {
 	if e.cfg.MTU != 0 {
 		return e.cfg.MTU
 	}
+	capMTU := e.cfg.MaxMTU()
 	overhead := uint32(Overhead4)
 	if e.cfg.IPv6() {
 		overhead = Overhead6
 	}
 	if e.cfg.Link != 0 {
 		if info, ok := e.stack.SingleNICInfo(e.cfg.Link); ok && info.MTU > overhead {
-			return info.MTU - overhead
+			return min(info.MTU-overhead, capMTU)
 		}
 	}
 	return 1500 - overhead
@@ -292,7 +336,7 @@ func (e *Endpoint) FDBUpdate(mac tcpip.LinkAddress, state uint16, flags uint8, r
 	if err != nil {
 		return err
 	}
-	return e.table.update(mac, state, flags, r, mode, time.Now())
+	return e.table.update(mac, state, flags, r, mode, time.Now(), e.ageing(), e.cfg.Limit)
 }
 
 // FDBDelete removes the remote from the entry for mac, or the whole entry when
@@ -341,8 +385,8 @@ func (e *Endpoint) send(frame *buffer.Buffer, r Remote, sport uint16) {
 		return
 	}
 	defer route.Release()
-	if route.OutgoingNIC() == e.cfg.ID {
-		// The route loops through this link, as Linux reports in vxlan_xmit_one.
+	if _, loop := vxlanNICs.Load(nicKey{e.stack, route.OutgoingNIC()}); loop {
+		// The outer route leaves through a vxlan link, this one or another.
 		return
 	}
 	payload := frame.Clone()
@@ -445,7 +489,7 @@ func (e *Endpoint) receive(frame []byte, src tcpip.Address) {
 		mac := eth.SourceAddress()
 		if mac != zeroMAC && !header.IsMulticastEthernetAddress(mac) {
 			r := Remote{IP: src, Port: e.cfg.Port, VNI: e.cfg.VNI}
-			if !e.table.learn(mac, r, e.cfg.Limit, time.Now()) {
+			if !e.table.learn(mac, r, e.cfg.Limit, time.Now(), e.ageing()) {
 				return
 			}
 		}
@@ -592,6 +636,7 @@ func (e *Endpoint) SetOnCloseAction(action func()) {
 func (e *Endpoint) Close() {
 	e.closeOnce.Do(func() {
 		if e.sock != nil {
+			vxlanNICs.Delete(nicKey{e.stack, e.cfg.ID})
 			e.sock.release(e)
 		}
 	})
