@@ -596,6 +596,9 @@ type stdioFD struct {
 	reader io.Reader
 	writer io.Writer
 	tty    *ttyState
+	// pump serves reads of a stream without a terminal. It is nil for a
+	// terminal and for a stream without a reader.
+	pump *stdinPump
 	// mu serializes the host reader or writer that every file description of
 	// the stream shares.
 	mu *sync.Mutex
@@ -607,6 +610,9 @@ func (f *stdioFD) EventRegister(e *waiter.Entry) error {
 	if f.tty != nil {
 		f.tty.wq.EventRegister(e)
 	}
+	if f.pump != nil {
+		f.pump.register(e)
+	}
 	return nil
 }
 
@@ -614,9 +620,15 @@ func (f *stdioFD) EventUnregister(e *waiter.Entry) {
 	if f.tty != nil {
 		f.tty.wq.EventUnregister(e)
 	}
+	if f.pump != nil {
+		f.pump.wq.EventUnregister(e)
+	}
 }
 
 func (f *stdioFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	if f.pump != nil {
+		return f.pump.readiness() & mask
+	}
 	if f.tty == nil {
 		return waiter.ReadableEvents | waiter.WritableEvents
 	}
@@ -631,7 +643,7 @@ func (f *stdioFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 func (f *stdioFD) Epollable() bool {
-	return f.tty != nil
+	return f.tty != nil || f.pump != nil
 }
 
 func (f *stdioFD) Stat(_ gvcontext.Context, _ vfs.StatOptions) (linux.Statx, error) {
@@ -666,6 +678,9 @@ func (f *stdioFD) Read(ctx gvcontext.Context, dst usermem.IOSequence, _ vfs.Read
 	}
 	if f.tty != nil {
 		return f.tty.read(ctx, dst)
+	}
+	if f.pump != nil {
+		return f.pump.read(ctx, dst)
 	}
 	if dst.NumBytes() == 0 {
 		return 0, nil

@@ -332,7 +332,8 @@ func TestE2EK3sMultiNodeControlPlaneFailover(t *testing.T) {
 			survivor := guests[leaderIndex%len(guests)]
 			t.Logf("the etcd leader is node %d; ending its sandbox", leaderIndex)
 
-			guests[leaderIndex-1].end()
+			guests[leaderIndex-1].stop()
+			<-guests[leaderIndex-1].finished
 			if _, err := survivor.stdin.Write([]byte("failover\n")); err != nil {
 				t.Fatalf("ask the surviving node for its API write: %v", err)
 			}

@@ -68,15 +68,6 @@ type runningGuest struct {
 	stop context.CancelFunc
 }
 
-// end closes the input of the guest, cancels its Run, and waits until Run
-// returns. A guest that waits for input in a read of its stdin pipe ignores
-// the cancel until the pipe closes, so the pipe closes first.
-func (g *runningGuest) end() {
-	g.stdin.Close()
-	g.stop()
-	<-g.finished
-}
-
 // startGuest creates the sandbox of spec and runs it in the background. The
 // cleanup of the test ends the guest and closes the sandbox.
 func startGuest(t *testing.T, ctx context.Context, spec guestSpec) *runningGuest {
@@ -97,7 +88,9 @@ func startGuest(t *testing.T, ctx context.Context, spec guestSpec) *runningGuest
 		g.res.code, g.res.err = sb.Run(runCtx)
 	}()
 	t.Cleanup(func() {
-		g.end()
+		stdinW.Close()
+		stop()
+		<-g.finished
 		if t.Failed() {
 			t.Logf("guest output:\n%s", g.out.String())
 		}

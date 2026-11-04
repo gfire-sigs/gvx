@@ -44,13 +44,15 @@ type stdioDevice struct {
 	reader io.Reader
 	writer io.Writer
 	tty    *ttyState
+	// pump serves the reads of a stream without a terminal.
+	pump *stdinPump
 	// mu serializes host I/O of every file description of the stream.
 	mu *sync.Mutex
 }
 
 // Open implements vfs.Device.Open.
 func (d stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd := &stdioFD{reader: d.reader, writer: d.writer, tty: d.tty, mu: d.mu}
+	fd := &stdioFD{reader: d.reader, writer: d.writer, tty: d.tty, pump: d.pump, mu: d.mu}
 	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
 		SpecialFile: d.tty != nil,
 	}); err != nil {
@@ -68,6 +70,9 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 		{reader: in},
 		{writer: out},
 		{writer: errw},
+	}
+	if in != nil && tty == nil {
+		devs[0].pump = newStdinPump(in)
 	}
 	names := [3]string{"stdin", "stdout", "stderr"}
 	flags := [3]uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_WRONLY}
