@@ -107,9 +107,13 @@ func (t *Task) accountTaskGoroutineEnter(state TaskGoroutineState) {
 		panic(fmt.Sprintf("Task goroutine switching from state %v (expected %v) to %v", oldState, TaskGoroutineRunningSys, state))
 	}
 	t.setGostate(state)
+	if state == TaskGoroutineRunningApp && t.cpuMeter.skipToApp {
+		t.cpuMeter.restart(meterNow())
+	}
 	if state != TaskGoroutineRunningApp {
 		// Task is blocking/stopping.
 		t.k.decRunningTasks()
+		t.cpuMeter.stop(meterNow())
 	}
 	if state == TaskGoroutineBlockedUninterruptible {
 		// Task is entering uninterruptible sleep.
@@ -125,6 +129,7 @@ func (t *Task) accountTaskGoroutineLeave(state TaskGoroutineState) {
 	if state != TaskGoroutineRunningApp {
 		// Task is unblocking/continuing.
 		t.k.incRunningTasks()
+		t.cpuMeter.start(meterNow())
 	}
 	if state == TaskGoroutineBlockedUninterruptible {
 		// Task is leaving uninterruptible sleep.
@@ -331,6 +336,9 @@ func (k *Kernel) runCPUClockTicker() {
 				t.tg.appSysCPUClock.Add(linux.ClockTick)
 				userSysTickInc++
 			}
+		}
+		if cpuBandwidthLimited.Load() != 0 {
+			k.accountCPUBandwidth(allTasks)
 		}
 		if userTickInc != 0 {
 			k.userCPUClock.Add(userTickInc * linux.ClockTick.Nanoseconds())

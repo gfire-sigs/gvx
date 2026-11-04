@@ -92,6 +92,15 @@ seam pkg/sentry/socket/netlink/route/protocol.go
 # Content seam: cgroup2 memory.stat, memory.events counters, and the enforcement of memory.max
 # (pkg/sentry/fsimpl/cgroup2fs/memory_xplat.go).
 seam pkg/sentry/fsimpl/cgroup2fs/memory.go
+# Content seam: cgroup2 cpu.max enforcement and the cpu.stat throttle counters. The budget lives
+# in pkg/sentry/kernel/cpu_bandwidth_xplat.go. The CPU clock ticker charges it, and the run loop
+# of a task blocks a task whose cgroup spent its quota
+# (pkg/sentry/kernel/task_cpu_bandwidth_xplat.go, pkg/sentry/fsimpl/cgroup2fs/cpu_xplat.go).
+seam pkg/sentry/fsimpl/cgroup2fs/cpu.go
+seam pkg/sentry/fsimpl/cgroup2fs/cgroup.go
+seam pkg/sentry/kernel/task.go
+seam pkg/sentry/kernel/task_run.go
+seam pkg/sentry/kernel/task_sched.go
 # Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
 # conf/<link>/route_localnet must not change the martian filter of other links.
 seam pkg/tcpip/network/ipv4/ipv4.go

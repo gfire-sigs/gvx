@@ -60,6 +60,7 @@ const (
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
 	nodeProbePackage   = "z.gfire.dev/gvx/internal/acceptprog/nodeprobe"
 	membarrierPackage  = "z.gfire.dev/gvx/internal/acceptprog/membarrierprobe"
+	cpuMaxPackage      = "z.gfire.dev/gvx/internal/acceptprog/cpumaxprobe"
 	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
@@ -304,6 +305,14 @@ func BuildMicroBench(tb testing.TB, goarch string) string {
 func BuildMembarrierProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, membarrierPackage, "membarrierprobe", goarch, 0)
+}
+
+// BuildCPUMaxProbe compiles the guest cpumaxprobe, which makes cgroups with a
+// cpu.max limit and measures the CPU time of busy-loop children, for the Linux
+// architecture goarch and returns the path of the static ET_EXEC executable.
+func BuildCPUMaxProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, cpuMaxPackage, "cpumaxprobe", goarch, 0)
 }
 
 // BuildCodeWrite compiles the guest codewrite, which changes the code that it

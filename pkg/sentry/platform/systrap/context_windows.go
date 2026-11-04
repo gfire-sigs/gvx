@@ -285,7 +285,11 @@ func (c *Context) stepStop(th *thread, ac *arch.Context64, ev debugEvent) outcom
 	if th.stepping && !th.rewindToSite() && th.inEngineCode(th.ctx.pc()) {
 		// The thread runs engine code that the Sentry planted. Step on until
 		// it reaches guest code, where its registers are the guest registers.
-		if err := th.continueUnchanged(ev); err != nil {
+		// The step exception cleared the single-step flag, so set it again.
+		// Without it the thread runs on, th.stepping stays true, and every
+		// later Interrupt returns at once without a stop.
+		th.ctx.setSingleStep(true)
+		if err := th.continueEvent(ev); err != nil {
 			return fatal(err, unix.EFAULT)
 		}
 		return running

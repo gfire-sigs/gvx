@@ -314,6 +314,7 @@ func (c *cgroup) RmDir(ctx context.Context, name string, child kernfs.Inode) err
 
 	delete(c.children, childCgroup)
 	childCgroup.deleted.Store(true) // +checklocksforce: c.fs.treeMu is locked
+	childCgroup.releaseCPUBandwidth()
 
 	// Walk up the ancestry to keep nrDescendants up to date.
 	for curr := c; curr != nil; curr = curr.parent {
