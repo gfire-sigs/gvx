@@ -123,6 +123,8 @@ seam pkg/sentry/inet/namespace.go
 seam pkg/sentry/kernel/ipc_namespace.go
 # bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
 seam pkg/sentry/socket/netstack/netstack.go
+# /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
+seam pkg/sentry/fsimpl/sys/sys.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
