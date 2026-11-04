@@ -414,8 +414,13 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						return pstart, pgap, err
 					}
 					// Rewind pseg to the first pma inserted and continue the
-					// loop to check if we need to break copy-on-write.
-					pseg, pgap = mm.findOrSeekPrevUpperBoundPMA(vseg.addrRangeOf(ts[0].Source).Start, pgap), pmaGapIterator{}
+					// loop to check if we need to break copy-on-write. A
+					// translation can start before vsegAR when the Mappable
+					// returns one translation for each chunk of its optional
+					// range. A pma that ends before vsegAR.Start does not
+					// need a copy, and its copy range would be empty.
+					rewindStart := max(vseg.addrRangeOf(ts[0].Source).Start, vsegAR.Start)
+					pseg, pgap = mm.findOrSeekPrevUpperBoundPMA(rewindStart, pgap), pmaGapIterator{}
 					continue
 				}
 
