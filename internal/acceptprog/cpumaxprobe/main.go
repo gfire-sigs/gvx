@@ -32,11 +32,13 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -122,6 +124,7 @@ func runChecks() bool {
 		{"cpu-max-raised-to-max-resumes-task", checkRaisedToMax},
 		{"cpu-max-moving-task-to-free-cgroup-resumes-it", checkMigration},
 		{"cpu-max-disabling-controller-resumes-task", checkDisableController},
+		{"cpu-max-limits-loop-without-system-calls", checkNoSyscallLoop},
 		{"cpu-stat-usage-of-parent-includes-children", checkHierarchicalUsage},
 		{"cpu-stat-usage-of-parent-keeps-removed-children", checkRemovedChildUsage},
 		{"memory-stat-exists-at-root", checkRootMemoryStat},
@@ -723,4 +726,102 @@ func checkRootMemoryStat() error {
 		}
 	}
 	return nil
+}
+
+// loopELF returns a static executable that jumps to itself. It makes no system
+// call and uses no runtime, so only the interrupt of the engine can stop it.
+func loopELF() []byte {
+	const hdr = 64 + 56
+	const base = 0x400000
+	var code []byte
+	var machine uint16
+	switch runtime.GOARCH {
+	case "amd64":
+		machine, code = 62, []byte{0xeb, 0xfe} // jmp .
+	default:
+		machine, code = 183, []byte{0x00, 0x00, 0x00, 0x14} // b .
+	}
+	size := hdr + len(code)
+	b := make([]byte, size)
+	copy(b, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	le := binary.LittleEndian
+	le.PutUint16(b[16:], 2) // ET_EXEC
+	le.PutUint16(b[18:], machine)
+	le.PutUint32(b[20:], 1)
+	le.PutUint64(b[24:], base+hdr)
+	le.PutUint64(b[32:], 64)
+	le.PutUint16(b[52:], 64)
+	le.PutUint16(b[54:], 56)
+	le.PutUint16(b[56:], 1)
+	ph := b[64:]
+	le.PutUint32(ph[0:], 1) // PT_LOAD
+	le.PutUint32(ph[4:], 5) // R+X
+	le.PutUint64(ph[16:], base)
+	le.PutUint64(ph[24:], base)
+	le.PutUint64(ph[32:], uint64(size))
+	le.PutUint64(ph[40:], uint64(size))
+	le.PutUint64(ph[48:], 0x1000)
+	copy(b[hdr:], code)
+	return b
+}
+
+// startLoop starts the loop program and moves it into the cgroup dir. The
+// program runs from its start, so the cgroup counts only the time after the move.
+func startLoop(dir string) (*exec.Cmd, error) {
+	f, err := os.CreateTemp("", "loop-*")
+	if err != nil {
+		return nil, err
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if _, err := f.Write(loopELF()); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Chmod(0o755); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(path)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	if err := moveTo(dir, cmd.Process.Pid); err != nil {
+		_ = cmd.Process.Kill()
+		return nil, err
+	}
+	return cmd, nil
+}
+
+// checkNoSyscallLoop limits a program that makes no system call. The Sentry never
+// sees such a program, so the engine must interrupt it to throttle it.
+func checkNoSyscallLoop() error {
+	return withCgroup(probeDir, func() error {
+		if err := writeFile(probeDir, "cpu.max", "50000 100000"); err != nil {
+			return err
+		}
+		cmd, err := startLoop(probeDir)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}()
+		time.Sleep(settle)
+		w, err := measure(probeDir, nil, quotaWindow)
+		if err != nil {
+			return err
+		}
+		if err := expectCPUs(w, 0.4, 0.6); err != nil {
+			return err
+		}
+		if w.throttled == 0 {
+			return errors.New("nr_throttled did not grow")
+		}
+		return nil
+	})
 }

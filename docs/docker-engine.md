@@ -191,6 +191,8 @@ A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value i
 | Period and quota | A period is 1 ms to 1 s, and a quota is 1 ms or more. Other values give `EINVAL`. |
 | Write to `cpu.max` | A new value starts a new period with a full quota. It releases a throttled task at once. |
 | Move to another cgroup | A throttled task reads the budget of its new cgroup at once. Without a limit there, it runs within 110 ms on every backend. |
+| Loop without system calls | A task that makes no system call is interrupted by the engine, not by the Sentry. A static program that only jumps to itself used 0.50 CPU at `50000 100000` on `hvf`, `whpx`, Linux `systrap`, and Windows `systrap` (`amd64` and `arm64`). |
+| Measuring from a container | `kubectl exec` starts a process in the cgroup of the container, and that process shares the quota. On Windows `systrap`, an exec takes seconds. Divide the change of `usage_usec` by the change of `/proc/uptime`, read in the same exec, and not by the sleep time. |
 | Unlimited | `max` removes the limit. A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. |
 | Not enforced | `cpu.weight` and the burst limit of Linux. |
 
