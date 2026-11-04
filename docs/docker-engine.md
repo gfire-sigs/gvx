@@ -183,13 +183,27 @@ A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value i
 
 | Property | Value |
 | :--- | :--- |
-| Accounting | The Sentry bills CPU time in ticks of 10 ms. A tick goes to each running task that the Sentry samples, up to one task for each CPU that the guest sees. `cpu.stat` and `cpu.max` use the same ticks. |
-| Result | `cpu.stat` reports `nr_periods`, `nr_throttled`, and `throttled_usec` for each cgroup that has a limit. A cgroup without its own limit reports 0 throttles, because only the cgroup with the limit throttles. |
-| Measured | A busy loop in a cgroup with `cpu.max` at `50000 100000` used 0.50 CPU over 5 seconds by `usage_usec`, with a spread of 0.498 to 0.502, on `hvf`, `whpx`, Linux `systrap` (`amd64` and `arm64`), and Windows `systrap` (`amd64` and `arm64`). A child with `max` under a parent at `50000 100000` used 0.50 CPU too. |
-| Cost | The system call `getpid` on `hvf` took 1,217 ns before the change and 1,203 ns after it, as the median of 9 runs averaged over 3 rounds. A finite limit in another cgroup left it at 1,204 ns. While a busy loop in another cgroup was throttled, it took 1,231 ns (+2.3%). |
-| Granularity | A tick is 10 ms. The quota ends at a tick, so a task can run less than the quota in a period. In the runs above, `throttled_usec` was 2.66 s to 2.84 s of the 5 seconds, so the loop ran 0.43 to 0.47 of the wall time while `usage_usec` read 0.50. |
-| System time | A task in a system call keeps running, as in Linux. The system call counts toward the quota, and the task stops when it returns to guest code. |
-| Period and quota | Linux limits apply. A period is 1 ms to 1 s, and a quota is 1 ms or more. Other values give `EINVAL`. |
-| Write to `cpu.max` | A new value starts a new period with a full quota and releases a throttled task at once. |
+| Accounting | A meter measures the wall time that each task runs in guest and Sentry code. The Sentry charges that time every 10 ms. `usage_usec` of `cpu.stat` is the same measured time. |
+| Counters | `nr_periods` counts the periods that end while the cgroup is active. `nr_throttled` counts the periods that end while it throttles. Both follow Linux. |
+| `throttled_usec` | One wall-clock interval for the whole cgroup. Linux sums the time of each CPU, so it reports more for a cgroup with tasks on several CPUs. |
+| Split of usage | `user_usec` and `system_usec` still come from the tick clocks of the tasks. Their sum is the measured time. |
+| System time | A task in a system call keeps running, as in Linux. The call counts toward the quota, and the task stops when it returns to guest code. |
+| Debt | A task can run up to one tick past the quota before it stops. The next period repays that time. A cgroup throttles only after a debt of more than 10 ms. |
+| Period and quota | A period is 1 ms to 1 s, and a quota is 1 ms or more. Other values give `EINVAL`. |
+| Write to `cpu.max` | A new value starts a new period with a full quota. It releases a throttled task at once. |
+| Move to another cgroup | A throttled task reads the budget of its new cgroup at once. Without a limit there, it runs within 110 ms on every backend. |
 | Unlimited | `max` removes the limit. A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. |
-| Not enforced | `cpu.weight` and `cpu.max.burst`. |
+| Not enforced | `cpu.weight` and the burst limit of Linux. |
+
+The next table lists the measured results of the test A14 and its companions. Each row is one busy Go loop. The loop has a second thread, the runtime monitor, so its demand is 1.01 to 1.03 CPU.
+
+| Case | `hvf` | Linux `systrap` | Windows `systrap` and `whpx` |
+| :--- | :--- | :--- | :--- |
+| `50000 100000`, 5 s | 0.50 CPU | 0.50 CPU | 0.50 CPU |
+| `max`, 3 s | 1.01 CPU | 1.02 to 1.03 CPU | see section 6.6 of GVXIP-005 |
+| `10000 100000`, billed time | 0.10 CPU | 0.10 CPU | not measured |
+| `10000 100000`, progress of the loop | 0.03 to 0.06 of full speed | 0.09 to 0.10 of full speed | not measured |
+| `110000 100000`, `nr_throttled` | 0 | 0 | not measured |
+| `100000 100000`, `nr_throttled` | 14 in 3 s | 18 in 3 s | not measured |
+
+A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same. On `hvf`, resuming a throttled task costs several milliseconds inside the platform. A loop at a tenth of a CPU therefore keeps 0.03 to 0.06 of its speed.

@@ -844,6 +844,7 @@ Containerd `2.3` binary bootstrap, CRI, guest workloads, and successful native s
 | `/proc/net/ip_tables_names` and `ip6_tables_names` | `fsimpl/proc/task_net_xplat.go` | The files list the four tables that the stack always has. `iptables-legacy-save` reads them. |
 | `memory.stat` of a cgroup | `fsimpl/cgroup2fs/memory_xplat.go` | The fields follow from the memory kinds that `usage.MemoryAccounting` counts for the memory cgroup IDs of the subtree. |
 | `memory.max` enforcement and `memory.events` counters | `fsimpl/cgroup2fs/memory_xplat.go` | See the next paragraphs. |
+| `cpu.max` enforcement and `cpu.stat` throttle counters | `fsimpl/cgroup2fs/cpu_xplat.go`, `kernel/cpu_bandwidth_xplat.go`, `kernel/cpu_meter_xplat.go`, `kernel/task_cpu_bandwidth_xplat.go` | The tasks of a subtree use at most the quota in each period on all CPUs. A child obeys every ancestor. See the last paragraphs. |
 | `/dev/kmsg` (character device 1:11, mode 0644) | `devices/memdev/kmsg_xplat.go`, `pkg/gvx/kernel_runner.go` | The Sentry has no kernel ring buffer, so a reader never gets a record. A non-blocking read returns `EAGAIN`. A blocking read waits, and `poll` reports only `POLLOUT`. `lseek` with offset 0 and `SEEK_SET`, `SEEK_DATA`, or `SEEK_END` returns 0. A non-zero offset returns `ESPIPE`, and other values of `whence` return `EINVAL`. A write of at most 1,024 bytes goes to the Sentry log and returns its length. |
 | `vm/overcommit_memory`, `vm/panic_on_oom`, `kernel/panic`, `kernel/panic_on_oops`, `kernel/keys/root_maxkeys`, `kernel/keys/root_maxbytes` | `fsimpl/proc/tasks_sys_node_xplat.go` | Each file stores the last written integer for the kernel and returns it. The range of Linux applies. It is 0 to 2 for `overcommit_memory` and `panic_on_oom`, and 1 to 2,147,483,647 for the two key limits. The other two take any 32-bit integer. A value outside the range returns `EINVAL`. The values change no behavior of the Sentry. |
 | `kernel/shm_rmid_forced` | `tasks_sys_node_xplat.go`, `kernel/ipc_namespace_xplat.go` | The value (0 or 1) belongs to the IPC namespace of the reader. The shm registry does not read it. |
@@ -861,6 +862,14 @@ The Sentry counts a page for a memory cgroup only after a scan of the memory fil
 When a subtree passes its limit, the goroutine kills the process with the highest score with SIGKILL. The score is the resident set plus `oom_score_adj` per mille of the limit. The init process and processes with `oom_score_adj` of -1000 are immune. With `memory.oom.group` set, it kills every other process of the subtree. It kills again only after a check saw the usage at or below the limit, or after two more checks above it. Each kill adds to `oom`, `oom_kill`, and `max` in `memory.events` of the cgroup and its ancestors, and it wakes the readers of the file. `containerd` reads that file through `inotify` and reports the kill, so `docker inspect` shows `OOMKilled: true`.
 
 On macOS, the block count of the memory file can trail the commit of a page by seconds. The scan of a single memory cgroup therefore always runs, as `pgalloc.MemoryFile.UpdateUsage` does for hosts other than Linux.
+
+A meter reads the wall clock when a task goroutine blocks and when it resumes. It gives the time that the task ran in application and Sentry code. The CPU clock ticker charges that time, since the last charge, to the budget of the cgroup. It also charges the budget of each ancestor with a limit.
+
+A budget below zero by more than one tick throttles its subtree. The ticker then interrupts the tasks that run guest code. The run loop blocks each task at its next return to guest code. A task in a system call keeps running, so system time counts toward the quota, as in Linux.
+
+A timer ends the throttle at the end of the period. A write to `cpu.max` starts a new period with a full quota and wakes the tasks. A task that moves to another cgroup reads the new budget at once. Time over the quota is a debt that the next period repays.
+
+A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. `cpu.stat` reports the measured time as `usage_usec`. The split between `user_usec` and `system_usec` still comes from the tick clocks.
 
 ---
 

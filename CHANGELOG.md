@@ -15,6 +15,19 @@ This release adds the Linux kernel interfaces that the `kubelet`, `containerd`, 
 - **Capacity of the node**: with `-m`, `MemTotal` in `/proc/meminfo` and `totalram` of `sysinfo(2)` equal the memory limit when it is below the host RAM. The value belongs to each sandbox, so several sandboxes in one process, such as in the SDK, each see their own limit. A tmpfs mount without a size and `size=N%` still follow the host RAM. With `--cpus`, the online CPUs, `sched_getaffinity`, `/sys/devices/system/cpu/online`, and `nproc` already showed the whole CPUs of the quota. Without the options nothing changes.
 - **Statistics**: `/sys/class/net/<link>` lists the links of the network namespace of the reader. Each link has `address`, `mtu`, `operstate`, `ifindex`, and the counters `statistics/{rx,tx}_{bytes,packets,errors,dropped}`. `/proc/diskstats` has one line for the disk `vda`. Its counters come from the read and write system calls of the processes of the sandbox, so they include sockets and pipes. A sandbox does not count the calls of another sandbox.
 
+- **`cpu.max` of cgroup v2**: the tasks of a cgroup subtree use at most the quota in each period, on all CPUs together. `docker run --cpus 0.5` becomes `cpu.max` at `50000 100000`. A busy loop in that cgroup used 0.50 CPU over 5 seconds on every backend. `max` removes the limit, and a child obeys the limit of every ancestor.
+  - A task that spent the quota stops at its next return to guest code. It runs again at the next period. System calls count toward the quota, as in Linux.
+  - `cpu.stat` reports `nr_periods`, `nr_throttled`, and `throttled_usec`. The first two follow the period ends of Linux. `throttled_usec` is one wall-clock interval for the cgroup. Linux sums the time of each CPU.
+  - A write follows the Linux limits: a period of 1 ms to 1 s and a quota of 1 ms or more, or `EINVAL`. A new value releases a throttled task at once. A task that moves to another cgroup stops waiting for the old period end.
+  - `usage_usec` is now the measured time that the tasks ran. A busy Go program read 1.1 to 1.3 CPU before, because the ticker billed a whole tick to each sampled thread. It reads 1.01 to 1.03 now.
+  - A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. `cpu.weight` and the burst fields of Linux stay unenforced.
+
+### Bug Fixes
+
+- **Busy loops that cannot stop on the Windows `systrap` engine**: `Interrupt` stops a running thread with the single-step flag. The step exception clears that flag. When the step landed in engine code, the engine continued the thread without the flag. The thread then ran on, and every later `Interrupt` returned without a stop.
+  - A guest loop without system calls then ignored `SIGKILL`, and the sandbox did not exit. The engine now sets the flag again before it continues the thread.
+  - The code is shared by `windows/amd64` and `windows/arm64`. The hang showed on `windows/amd64`.
+
 ### Behavior Changes
 
 - **Forwarding sysctls belong to the network namespace**: `/proc/sys/net/ipv4/ip_forward`, `conf/all/forwarding`, `conf/default/forwarding`, and the IPv6 `forwarding` files show the values of the network namespace of the reader. Before, `ip_forward` showed the root namespace to every reader. For each IP family, `ip_forward` and `conf/all/forwarding` are one switch, and a write to it also sets `conf/default/forwarding` and every link that exists. A write to `conf/default/forwarding` changes only the links that the guest creates later. A new network namespace gets the IPv4 switches of the root namespace, and its IPv6 switches start at 0. `/proc/sys/net/ipv4/ip_local_port_range` also follows the namespace of the reader.
