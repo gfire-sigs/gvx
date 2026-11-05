@@ -1792,6 +1792,9 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 						return r, nil
 					}
 				}
+				if r := s.weakHostRouteRLocked(aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
+					return r, nil
+				}
 			}
 
 			return nil, &tcpip.ErrNetworkUnreachable{}
