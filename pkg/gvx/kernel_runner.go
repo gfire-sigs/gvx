@@ -1260,6 +1260,9 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 		if err := stack.InheritForwarding(root); err != nil {
 			return nil, fmt.Errorf("gvx: copy the forwarding switches to a new network namespace: %w", err)
 		}
+		// The module parameters of xt_recent belong to the kernel, so all
+		// network namespaces share them.
+		netfilter.ShareRecentModule(st, root.Stack)
 	}
 	return stack, nil
 }

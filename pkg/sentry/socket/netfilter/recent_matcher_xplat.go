@@ -72,10 +72,6 @@ const (
 	// recentSideDest is XT_RECENT_DEST. Any other value selects the source.
 	recentSideDest uint8 = 1
 
-	// recentListTotal is the default of the module parameter ip_list_tot:
-	// the count of addresses in one list.
-	recentListTotal = 100
-
 	// recentMaxStamps is XT_RECENT_MAX_NSTAMPS. A hit count must be smaller.
 	recentMaxStamps = 65536
 
@@ -169,16 +165,20 @@ func (m *RecentMatcher) check() error {
 }
 
 // stampCount returns the count of time stamps that the rule needs for each
-// address, a power of two as in recent_mt_check.
-func (m *RecentMatcher) stampCount() int {
-	if m.hitCount == 0 {
-		return recentDefaultStamps
+// address, a power of two. It follows recent_mt_check: a rule with a hit count
+// below ip_pkt_list_tot (pktListTot) gets ip_pkt_list_tot stamps. Another rule
+// gets its hit count, or 32 stamps without a hit count.
+func (m *RecentMatcher) stampCount(pktListTot uint32) int {
+	n := recentDefaultStamps
+	switch {
+	case pktListTot != 0 && m.hitCount < pktListTot:
+		n = int(pktListTot)
+	case m.hitCount != 0:
+		n = int(m.hitCount)
+	default:
+		return n
 	}
-	n := 1
-	for n < int(m.hitCount) {
-		n <<= 1
-	}
-	return n
+	return 1 << bits.Len(uint(n-1))
 }
 
 // RecentMatcher matches packets by the history of their address in a named
@@ -210,7 +210,7 @@ func (m *RecentMatcher) revision() uint8 { return m.rev }
 // bindStack implements stackBinder.bindStack. Rules of one stack that name the
 // same list share it.
 func (m *RecentMatcher) bindStack(stk *stack.Stack) *syserr.Error {
-	t := recentTables.registry(stk).acquire(m.listName, m.mask, m.stampCount())
+	t := recentTables.registry(stk).acquire(m.listName, m.mask, m.stampCount)
 	m.table = t
 	// The cleanup releases the list if the rule is lost without a
 	// replacement of its table, for example with its network stack.
@@ -370,7 +370,8 @@ func (t *recentTable) match(m *RecentMatcher, proto tcpip.NetworkProtocolNumber,
 
 // insert adds a new entry with one stamp. A full list drops its oldest entry.
 func (t *recentTable) insert(key recentKey, ttl uint8, now time.Duration) {
-	if len(t.entries) >= recentListTotal {
+	// recent_entry_init removes the oldest entry at ip_list_tot entries.
+	if uint64(len(t.entries)) >= uint64(t.owner.module.ListTot()) {
 		t.remove(t.lru.Front().Value.(*recentEntry))
 	}
 	e := &recentEntry{key: key, ttl: ttl, stamps: make([]time.Duration, t.stamps), nstamps: 1, index: 1}
@@ -418,18 +419,26 @@ type recentRegistry struct {
 	mu     sync.Mutex
 	tables map[string]*recentTable
 	clock  func() time.Duration
+	// module holds the module parameters that all registries of a kernel
+	// share.
+	module *RecentModule
 }
 
 // acquire returns the list name and counts one more rule that uses it. A new
 // list takes mask. A rule that needs more stamps than the list has grows the
-// list and empties it, as recent_mt_check does.
-func (r *recentRegistry) acquire(name string, mask [16]byte, stamps int) *recentTable {
+// list and empties it, as recent_mt_check does. stampsFor gets the value of
+// ip_pkt_list_tot, which no write can change while the rule holds a list.
+func (r *recentRegistry) acquire(name string, mask [16]byte, stampsFor func(pktListTot uint32) int) *recentTable {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.module.mu.Lock()
+	defer r.module.mu.Unlock()
+	stamps := stampsFor(r.module.PktListTot())
 	t := r.tables[name]
 	if t == nil {
 		t = &recentTable{owner: r, name: name, clock: r.clock, mask: mask, stamps: stamps, entries: make(map[recentKey]*recentEntry)}
 		r.tables[name] = t
+		r.module.lists++
 	}
 	t.refs++
 	if stamps > t.stamps {
@@ -450,6 +459,9 @@ func (r *recentRegistry) release(t *recentTable) {
 	t.refs--
 	if t.refs == 0 && r.tables[t.name] == t {
 		delete(r.tables, t.name)
+		r.module.mu.Lock()
+		r.module.lists--
+		r.module.mu.Unlock()
 	}
 }
 
@@ -474,6 +486,7 @@ func (s *recentStacks) registry(stk *stack.Stack) *recentRegistry {
 	r := &recentRegistry{
 		tables: make(map[string]*recentTable),
 		clock:  func() time.Duration { return clock.NowMonotonic().Sub(epoch) },
+		module: RecentModuleOf(stk),
 	}
 	s.stacks[key] = r
 	runtime.AddCleanup(stk, func(key weak.Pointer[stack.Stack]) {

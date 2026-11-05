@@ -288,8 +288,8 @@ func (f *hashsizeFile) Write(ctx context.Context, _ *vfs.FileDescription, src us
 }
 
 // newModuleDirChildren returns the children of /sys/module: the parameters of
-// the connection tracker that kube-proxy reads and writes, and the parameter of
-// the IP sets.
+// the connection tracker that kube-proxy reads and writes, the parameter of the
+// IP sets, and the parameters of the recent match.
 func (fs *filesystem) newModuleDirChildren(ctx context.Context, creds *auth.Credentials) map[string]kernfs.Inode {
 	hashsize := &hashsizeFile{}
 	hashsize.size.Store(defaultConntrackHashsize)
@@ -301,5 +301,6 @@ func (fs *filesystem) newModuleDirChildren(ctx context.Context, creds *auth.Cred
 				"hashsize": hashsize,
 			}),
 		}),
+		"xt_recent": fs.newXtRecentDir(ctx, creds),
 	}
 }

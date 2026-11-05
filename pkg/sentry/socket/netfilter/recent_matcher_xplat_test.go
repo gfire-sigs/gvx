@@ -17,7 +17,9 @@ package netfilter
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -76,12 +78,12 @@ func parseRecent(t *testing.T, reg *recentRegistry, info recentInfo) *RecentMatc
 		t.Fatalf("parseMatchers(%+v): %v", info, err)
 	}
 	m := parsed[0].(*RecentMatcher)
-	m.table = reg.acquire(m.listName, m.mask, m.stampCount())
+	m.table = reg.acquire(m.listName, m.mask, m.stampCount)
 	return m
 }
 
 func newRecentRegistry(c *fakeClock) *recentRegistry {
-	return &recentRegistry{tables: make(map[string]*recentTable), clock: c.read}
+	return &recentRegistry{tables: make(map[string]*recentTable), clock: c.read, module: new(RecentModule)}
 }
 
 func matches(t *testing.T, m *RecentMatcher, src string) bool {
@@ -197,11 +199,11 @@ func TestRecentFullListDropsTheOldestEntry(t *testing.T) {
 	reg := newRecentRegistry(&fakeClock{})
 	set := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentSet, name: "full"})
 	check := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentCheck, name: "full"})
-	for i := 0; i <= recentListTotal; i++ {
+	for i := 0; i <= RecentDefaultListTot; i++ {
 		matches(t, set, fmt.Sprintf("10.1.%d.%d", i/250, i%250+1))
 	}
 	if matches(t, check, "10.1.0.1") {
-		t.Fatal("the oldest of 201 entries stayed in a list of 200")
+		t.Fatal("the oldest of 101 entries stayed in a list of 100")
 	}
 	if !matches(t, check, "10.1.0.2") {
 		t.Fatal("the second oldest entry was dropped")
@@ -340,5 +342,202 @@ func TestRecentConcurrentRulesKeepEveryAddress(t *testing.T) {
 	wg.Wait()
 	if got := len(set.table.entries); got != 80 {
 		t.Errorf("the list has %d addresses, want 80", got)
+	}
+}
+
+// registryWithModule returns a registry that uses the module parameters.
+func registryWithModule(m *RecentModule) *recentRegistry {
+	r := newRecentRegistry(&fakeClock{})
+	r.module = m
+	return r
+}
+
+func TestRecentModuleStartsAtTheLinuxDefaults(t *testing.T) {
+	var m RecentModule
+	if m.ListTot() != 100 || m.PktListTot() != 0 {
+		t.Errorf("defaults = ip_list_tot %d, ip_pkt_list_tot %d, want 100 and 0", m.ListTot(), m.PktListTot())
+	}
+}
+
+// TestRecentModuleRefusesTheValuesOfRecentMtInit checks the conditions of
+// recent_mt_init: ip_list_tot must not be 0, and ip_pkt_list_tot must stay
+// below XT_RECENT_MAX_NSTAMPS.
+func TestRecentModuleRefusesTheValuesOfRecentMtInit(t *testing.T) {
+	var m RecentModule
+	if err := m.SetListTot(0); !errors.Is(err, ErrRecentParam) {
+		t.Errorf("SetListTot(0) = %v, want ErrRecentParam", err)
+	}
+	if err := m.SetPktListTot(65536); !errors.Is(err, ErrRecentParam) {
+		t.Errorf("SetPktListTot(65536) = %v, want ErrRecentParam", err)
+	}
+	if err := m.SetPktListTot(65535); err != nil || m.PktListTot() != 65535 {
+		t.Errorf("SetPktListTot(65535) = %v, value %d, want success", err, m.PktListTot())
+	}
+	if err := m.SetListTot(math.MaxUint32); err != nil || m.ListTot() != math.MaxUint32 {
+		t.Errorf("SetListTot(MaxUint32) = %v, value %d, want success", err, m.ListTot())
+	}
+	if m.ListTot() == 100 {
+		t.Error("the large value reads as the default")
+	}
+}
+
+func TestRecentListTotSetsTheSizeOfTheList(t *testing.T) {
+	var mod RecentModule
+	if err := mod.SetListTot(2); err != nil {
+		t.Fatal(err)
+	}
+	reg := registryWithModule(&mod)
+	set := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentSet, name: "tiny"})
+	check := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentCheck, name: "tiny"})
+	for _, src := range []string{"10.1.0.1", "10.1.0.2", "10.1.0.3"} {
+		matches(t, set, src)
+	}
+	if matches(t, check, "10.1.0.1") {
+		t.Error("the oldest address stayed in a list of 2 entries")
+	}
+	for _, src := range []string{"10.1.0.2", "10.1.0.3"} {
+		if !matches(t, check, src) {
+			t.Errorf("%s left a list of 2 entries too early", src)
+		}
+	}
+}
+
+func TestRecentListTotAboveTheOldLimitKeepsEveryAddress(t *testing.T) {
+	var mod RecentModule
+	if err := mod.SetListTot(1000); err != nil {
+		t.Fatal(err)
+	}
+	reg := registryWithModule(&mod)
+	set := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentSet, name: "big"})
+	check := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentCheck, name: "big"})
+	for i := range 1000 {
+		matches(t, set, fmt.Sprintf("10.2.%d.%d", i/250, i%250+1))
+	}
+	if !matches(t, check, "10.2.0.1") {
+		t.Error("the oldest of 1000 addresses left a list of 1000 entries")
+	}
+}
+
+// TestRecentParametersAreFixedWhileAListExists checks that a write fails while a
+// rule holds a list, and that it works again after the last rule went away.
+func TestRecentParametersAreFixedWhileAListExists(t *testing.T) {
+	var mod RecentModule
+	reg := registryWithModule(&mod)
+	m := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentSet, name: "pinned"})
+	if err := mod.SetListTot(5); !errors.Is(err, ErrRecentModuleBusy) {
+		t.Errorf("SetListTot with a list = %v, want ErrRecentModuleBusy", err)
+	}
+	if err := mod.SetPktListTot(5); !errors.Is(err, ErrRecentModuleBusy) {
+		t.Errorf("SetPktListTot with a list = %v, want ErrRecentModuleBusy", err)
+	}
+	if mod.ListTot() != 100 || mod.PktListTot() != 0 {
+		t.Errorf("a refused write changed the parameters to %d and %d", mod.ListTot(), mod.PktListTot())
+	}
+	// A second rule that names the same list keeps it.
+	m2 := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentCheck, name: "pinned"})
+	m.table.owner.release(m.table)
+	if err := mod.SetListTot(5); !errors.Is(err, ErrRecentModuleBusy) {
+		t.Errorf("SetListTot with a rule left = %v, want ErrRecentModuleBusy", err)
+	}
+	m2.table.owner.release(m2.table)
+	if err := mod.SetListTot(5); err != nil {
+		t.Errorf("SetListTot after the last rule = %v, want success", err)
+	}
+}
+
+// TestRecentPktListTotSetsTheStampCount follows the mask computation of
+// recent_mt_check.
+func TestRecentPktListTotSetsTheStampCount(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pktListTot uint32
+		hitCount   uint32
+		want       int
+	}{
+		{"default without a hit count", 0, 0, 32},
+		{"default with a hit count", 0, 5, 8},
+		{"hit count of one", 0, 1, 1},
+		{"hit count that is a power of two", 0, 64, 64},
+		{"ip_pkt_list_tot above the hit count", 100, 5, 128},
+		{"ip_pkt_list_tot without a hit count", 100, 0, 128},
+		{"hit count at ip_pkt_list_tot", 20, 20, 32},
+		{"hit count above ip_pkt_list_tot", 20, 40, 64},
+		{"ip_pkt_list_tot of one", 1, 0, 1},
+	} {
+		m := &RecentMatcher{hitCount: tc.hitCount}
+		if got := m.stampCount(tc.pktListTot); got != tc.want {
+			t.Errorf("%s: stampCount(%d) with hit count %d = %d, want %d", tc.name, tc.pktListTot, tc.hitCount, got, tc.want)
+		}
+	}
+}
+
+// TestRecentPktListTotKeepsTheListWhenARuleWithMoreHitsJoins checks the effect
+// that a user sees. A rule that needs more stamps than the list has empties the
+// list, as recent_mt_check does. ip_pkt_list_tot gives the list room for the
+// later rule.
+func TestRecentPktListTotKeepsTheListWhenARuleWithMoreHitsJoins(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pktListTot uint32
+		wantKept   bool
+	}{
+		{"default", 0, false},
+		{"ip_pkt_list_tot of 100", 100, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mod RecentModule
+			if err := mod.SetPktListTot(tc.pktListTot); err != nil {
+				t.Fatal(err)
+			}
+			reg := registryWithModule(&mod)
+			set := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentSet, name: "grow"})
+			check := parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentCheck, name: "grow"})
+			matches(t, set, "192.0.2.1")
+			// The default list keeps 32 stamps for each address, and a rule with
+			// 50 hits needs 64.
+			parseRecent(t, reg, recentInfo{rev: 1, checkSet: recentCheck, name: "grow", hitCount: 50})
+			if kept := matches(t, check, "192.0.2.1"); kept != tc.wantKept {
+				t.Errorf("address kept after a rule with 50 hits joined = %v, want %v", kept, tc.wantKept)
+			}
+		})
+	}
+}
+
+// TestRecentModuleIsSharedByTheStacksOfAKernel binds rules of a child stack and
+// checks that the parameters of the parent stack apply, and that a write fails
+// while a rule of either stack holds a list.
+func TestRecentModuleIsSharedByTheStacksOfAKernel(t *testing.T) {
+	parent, child, stranger := stack.New(stack.Options{}), stack.New(stack.Options{}), stack.New(stack.Options{})
+	for _, s := range []*stack.Stack{parent, child, stranger} {
+		t.Cleanup(s.Destroy)
+	}
+	ShareRecentModule(child, parent)
+	if RecentModuleOf(child) != RecentModuleOf(parent) {
+		t.Fatal("a child stack does not share the parameters of its parent")
+	}
+	if RecentModuleOf(stranger) == RecentModuleOf(parent) {
+		t.Fatal("a stack that no call linked shares the parameters of another kernel")
+	}
+	if err := RecentModuleOf(parent).SetListTot(2); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(recentInfo{rev: 1, checkSet: recentSet, name: "shared"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindMatcherStacks(child, []stack.Rule{{Matchers: parsed}})
+	set := parsed[0].(*RecentMatcher)
+	if err := RecentModuleOf(parent).SetListTot(7); !errors.Is(err, ErrRecentModuleBusy) {
+		t.Errorf("write with a list in a child namespace = %v, want ErrRecentModuleBusy", err)
+	}
+	for _, src := range []string{"10.3.0.1", "10.3.0.2", "10.3.0.3"} {
+		matches(t, set, src)
+	}
+	if got := len(set.table.entries); got != 2 {
+		t.Errorf("entries of a list with ip_list_tot 2 = %d, want 2", got)
+	}
+	releaseMatcherStacks([]stack.Rule{{Matchers: parsed}})
+	if err := RecentModuleOf(parent).SetListTot(7); err != nil {
+		t.Errorf("write after the list went away = %v, want success", err)
 	}
 }
