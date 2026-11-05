@@ -23,7 +23,10 @@
 //
 // Usage:
 //
-//	nodeprobe kmsg                   check /dev/kmsg
+//	nodeprobe kmsg                   check /dev/kmsg, syslog(2), and the sysctls of
+//	                                 the kernel log; the check of kernel.dmesg_restrict
+//	                                 runs the mode kmsg-unpriv as an ordinary user
+//	nodeprobe kmsg-size BYTES        check that SIZE_BUFFER of syslog(2) returns BYTES
 //	nodeprobe sysctls                check the stored sysctls
 //	nodeprobe portstart              check ip_unprivileged_port_start
 //	nodeprobe netsysctls             check the sysctls of a network namespace
@@ -88,6 +91,20 @@ func main() {
 	switch os.Args[1] {
 	case "kmsg":
 		checks = kmsgChecks()
+	case "kmsg-size":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe kmsg-size BYTES")
+			os.Exit(2)
+		}
+		want, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "kmsg-size: BYTES must be a number")
+			os.Exit(2)
+		}
+		checks = kmsgSizeChecks(want)
+	case "kmsg-unpriv":
+		kmsgUnprivileged()
+		return
 	case "sysctls":
 		checks = storedSysctlChecks()
 	case "portstart":
