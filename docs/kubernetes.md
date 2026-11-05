@@ -184,4 +184,4 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |
-| MTU | `eth0` has the MTU 1500, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. |
+| MTU | `eth0` has the MTU 1500 at the start, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. Set `--tune net.nat.mtu=N` to start with another value. A node can change it later with `ip link set dev eth0 mtu N` from 68 to 65535, and `flannel` follows the new value at the next start. |
