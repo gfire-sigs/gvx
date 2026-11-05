@@ -50,6 +50,8 @@ func runMemcgChecks() bool {
 		{"memcg-over-limit-kills-task", checkMemcgOverLimitKills},
 		{"memcg-over-limit-kills-largest-task-only", checkMemcgKillsLargestOnly},
 		{"memcg-oom-group-kills-every-task", checkMemcgOOMGroup},
+		{"memcg-kill-counts-in-cgroup-of-victim", checkMemcgKillCountsInVictimCgroup},
+		{"memcg-oom-group-of-child-kills-its-tasks", checkMemcgOOMGroupOfChild},
 	}
 	// The sandbox does not enable controllers for the children of the root
 	// cgroup. The init script of docker:dind does it, and so does this write.
@@ -87,7 +89,13 @@ func writeControl(name, value string) error {
 
 // controlValue returns the value of key in a flat-keyed control file.
 func controlValue(file, key string) (uint64, error) {
-	data, err := os.ReadFile(memcgDir + "/" + file)
+	return controlValueIn(memcgDir, file, key)
+}
+
+// controlValueIn returns the value of key in a flat-keyed control file of the
+// cgroup at dir.
+func controlValueIn(dir, file, key string) (uint64, error) {
+	data, err := os.ReadFile(dir + "/" + file)
 	if err != nil {
 		return 0, err
 	}
@@ -113,6 +121,11 @@ type hog struct {
 // startHog starts a child that allocates size bytes after it joined the cgroup.
 // With hold set, the child then waits until stdin closes. Otherwise it exits.
 func startHog(size int, hold bool) (*hog, error) {
+	return startHogIn(memcgDir, size, hold)
+}
+
+// startHogIn is startHog for the cgroup at dir.
+func startHogIn(dir string, size int, hold bool) (*hog, error) {
 	mode := "exit"
 	if hold {
 		mode = "hold"
@@ -155,7 +168,7 @@ func startHog(size int, hold bool) (*hog, error) {
 		h.status = cmd.ProcessState.Sys().(syscall.WaitStatus)
 		close(h.done)
 	}()
-	if err := writeControl("cgroup.procs", strconv.Itoa(cmd.Process.Pid)); err != nil {
+	if err := os.WriteFile(dir+"/cgroup.procs", []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
 		h.stop()
 		return nil, fmt.Errorf("move the hog into the cgroup: %w", err)
 	}
@@ -465,6 +478,105 @@ func checkMemcgOOMGroup() error {
 	}
 	if n, err := controlValue("memory.events", "oom_group_kill"); err != nil || n != 1 {
 		return fmt.Errorf("memory.events oom_group_kill = %d, %v; want 1", n, err)
+	}
+	return nil
+}
+
+// checkMemcgKillCountsInVictimCgroup passes the limit of a parent cgroup with
+// a hog in a child cgroup without a limit. Linux counts the OOM event in the
+// parent and the kill in the child and its ancestors. The OOM monitor of
+// containerd reads the cgroup of the container, which is such a child when
+// the limit of the pod cgroup is reached first.
+func checkMemcgKillCountsInVictimCgroup() error {
+	// limitAbove runs a probe process in the parent, so it comes before the
+	// parent gets a child with the memory controller.
+	if err := limitAbove(1, 32*mib); err != nil {
+		return err
+	}
+	child := memcgDir + "/victim"
+	if err := writeControl("cgroup.subtree_control", "+memory"); err != nil {
+		return err
+	}
+	if err := os.Mkdir(child, 0o755); err != nil {
+		return err
+	}
+	defer os.Remove(child)
+	h, err := startHogIn(child, 128*mib, true)
+	if err != nil {
+		return err
+	}
+	defer h.stop()
+	killed, err := h.waitKilled()
+	if err != nil {
+		return err
+	}
+	if !killed {
+		return errors.New("a hog 96 MiB over the limit of its parent did not end with SIGKILL")
+	}
+	// The parent can count more than one OOM event before the kill takes
+	// effect, so its oom count needs only to be positive.
+	if n, err := controlValueIn(memcgDir, "memory.events", "oom"); err != nil || n == 0 {
+		return fmt.Errorf("%s memory.events oom = %d, %v; want at least 1", memcgDir, n, err)
+	}
+	for _, want := range []struct {
+		dir, key string
+		n        uint64
+	}{
+		{memcgDir, "oom_kill", 1}, {child, "oom", 0}, {child, "oom_kill", 1},
+	} {
+		if n, err := controlValueIn(want.dir, "memory.events", want.key); err != nil || n != want.n {
+			return fmt.Errorf("%s memory.events %s = %d, %v; want %d", want.dir, want.key, n, err, want.n)
+		}
+	}
+	return nil
+}
+
+// checkMemcgOOMGroupOfChild passes the limit of a parent cgroup with two hogs
+// in a child cgroup that has memory.oom.group set, as the kubelet sets it for
+// a container. Linux ends every process of the child and counts the group
+// kill in the child.
+func checkMemcgOOMGroupOfChild() error {
+	if err := limitAbove(2, 24*mib); err != nil {
+		return err
+	}
+	child := memcgDir + "/group"
+	if err := writeControl("cgroup.subtree_control", "+memory"); err != nil {
+		return err
+	}
+	if err := os.Mkdir(child, 0o755); err != nil {
+		return err
+	}
+	defer os.Remove(child)
+	if err := os.WriteFile(child+"/memory.oom.group", []byte("1"), 0o644); err != nil {
+		return err
+	}
+	first, err := startHogIn(child, 8*mib, true)
+	if err != nil {
+		return err
+	}
+	defer first.stop()
+	if err := first.waitAllocated(); err != nil {
+		return err
+	}
+	second, err := startHogIn(child, 40*mib, true)
+	if err != nil {
+		return err
+	}
+	defer second.stop()
+	for name, h := range map[string]*hog{"smaller": first, "larger": second} {
+		killed, err := h.waitKilled()
+		if err != nil {
+			return fmt.Errorf("%s hog: %w", name, err)
+		}
+		if !killed {
+			return fmt.Errorf("the %s hog did not end with SIGKILL", name)
+		}
+	}
+	if n, err := controlValueIn(child, "memory.events", "oom_group_kill"); err != nil || n != 1 {
+		return fmt.Errorf("%s memory.events oom_group_kill = %d, %v; want 1", child, n, err)
+	}
+	if n, err := controlValueIn(child, "memory.events", "oom_kill"); err != nil || n != 2 {
+		return fmt.Errorf("%s memory.events oom_kill = %d, %v; want 2", child, n, err)
 	}
 	return nil
 }

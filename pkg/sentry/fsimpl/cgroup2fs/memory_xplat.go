@@ -317,11 +317,18 @@ func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, l
 	// One scan covers every limited subtree.
 	_ = k.MemoryFile().UpdateUsage(all)
 	near := false
-	for i, m := range limited {
+	// Linux charges a page from the cgroup of the task upward and fails at
+	// the first cgroup over its limit. limited lists a parent before its
+	// children, so the loop runs backward and checks a child first. A process
+	// that a check of this pass killed frees its memory for the checks of
+	// its ancestors too.
+	killed := make(map[*kernel.ThreadGroup]struct{})
+	for i := len(limited) - 1; i >= 0; i-- {
+		m := limited[i]
 		used := unreclaimableUsage(sumUsageStats(subtrees[i]))
 		limit := uint64(m.maxBytes.Load())
 		near = near || used >= limit/2
-		m.oomCheck(ctx, k, used, limit)
+		m.oomCheck(ctx, k, used, limit, killed)
 	}
 	return near
 }
@@ -335,6 +342,10 @@ type oomCandidate struct {
 	rss uint64
 	// adj is the oom_score_adj of the process.
 	adj int32
+	// mem is the memory controller of the cgroup of the process. The kill
+	// counts in its memory.events, as Linux counts it in the cgroup of the
+	// victim.
+	mem *memory
 }
 
 // oomVictims returns the candidates that the OOM killer ends. With group set
@@ -360,8 +371,9 @@ func oomVictims(candidates []oomCandidate, group bool, limit uint64) []oomCandid
 // oomCheck compares one controller with its limit and ends processes of the
 // subtree as the OOM killer of Linux does for a cgroup that passed memory.max.
 // It never ends the init process of the guest or a process with
-// oom_score_adj of -1000.
-func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uint64) {
+// oom_score_adj of -1000. killed holds the processes that the checks of the
+// current pass ended. A subtree with such a process waits for the next pass.
+func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uint64, killed map[*kernel.ThreadGroup]struct{}) {
 	over := used > limit
 	if !over {
 		m.oom.pending = nil
@@ -369,15 +381,26 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 		return
 	}
 	fs := m.c.fs
-	var tasks []*kernel.Task
+	type taskInCgroup struct {
+		t   *kernel.Task
+		mem *memory
+	}
+	var tasks []taskInCgroup
+	closestMemory := func(c *cgroup) *memory {
+		if mem, ok := c.closestCtrls.Load()[kernel.Cgroup2Memory].(*memory); ok {
+			return mem
+		}
+		return m
+	}
 	fs.treeMu.RLock()
 	fs.tasksMu.RLock()
 	for t := range m.c.tasks {
-		tasks = append(tasks, t)
+		tasks = append(tasks, taskInCgroup{t, m})
 	}
 	m.c.walkSubtreeLocked(func(c *cgroup) bool {
+		mem := closestMemory(c)
 		for t := range c.tasks { // +checklocksforce: fs.tasksMu is locked
-			tasks = append(tasks, t)
+			tasks = append(tasks, taskInCgroup{t, mem})
 		}
 		return true
 	})
@@ -387,7 +410,8 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 	rootNS := k.RootPIDNamespace()
 	candidates := make(map[*kernel.ThreadGroup]*oomCandidate)
 	present := make(map[*kernel.ThreadGroup]struct{})
-	for _, t := range tasks {
+	for _, tc := range tasks {
+		t := tc.t
 		tg := t.ThreadGroup()
 		present[tg] = struct{}{}
 		if t.ExitState() != kernel.TaskExitNone || tg.IsInitIn(rootNS) {
@@ -395,7 +419,7 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 		}
 		c, ok := candidates[tg]
 		if !ok {
-			c = &oomCandidate{group: tg, id: rootNS.IDOfThreadGroup(tg)}
+			c = &oomCandidate{group: tg, id: rootNS.IDOfThreadGroup(tg), mem: tc.mem}
 			if leader := tg.Leader(); leader != nil {
 				c.adj = leader.OOMScoreAdj()
 			}
@@ -410,6 +434,11 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 			delete(m.oom.pending, tg)
 		}
 	}
+	for tg := range candidates {
+		if _, ok := killed[tg]; ok {
+			return
+		}
+	}
 	if !m.oom.gate.shouldKill(true, len(m.oom.pending)) {
 		return
 	}
@@ -419,40 +448,101 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 			eligible = append(eligible, *c)
 		}
 	}
-	group := m.oomGroup.Load()
-	victims := oomVictims(eligible, group, limit)
+	// Linux records the OOM event in the cgroup that passed its limit before
+	// it kills. The event counts also when no process can be killed.
+	m.countOOMEvent(ctx)
+	victims := oomVictims(eligible, m.oomGroup.Load(), limit)
 	if len(victims) == 0 {
-		// Linux counts the event when no process can be killed.
-		m.countOOMEvents(ctx, 0, false)
 		return
+	}
+	// As mem_cgroup_get_oom_group does, the highest cgroup with
+	// memory.oom.group between the victim and m loses all its processes. The
+	// kubelet sets memory.oom.group in each container cgroup.
+	groupMem := oomGroupOf(victims[0].mem, m)
+	if groupMem != nil {
+		victims = oomGroupMembers(eligible, groupMem)
 	}
 	if m.oom.pending == nil {
 		m.oom.pending = make(map[*kernel.ThreadGroup]struct{})
 	}
-	killed := 0
+	sent := false
 	for _, v := range victims {
+		// Each kill counts in the cgroup of the victim and its ancestors
+		// before the signal, as in __oom_kill_process. The OOM monitor of
+		// containerd reads the cgroup of the container, which can lie below
+		// the cgroup that passed its limit.
+		v.mem.countOOMKill(ctx)
 		if err := k.SendExternalSignalThreadGroup(v.group, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
 			continue
 		}
 		m.oom.pending[v.group] = struct{}{}
-		killed++
+		killed[v.group] = struct{}{}
+		sent = true
 	}
-	m.countOOMEvents(ctx, uint64(killed), group)
+	if groupMem != nil && sent {
+		groupMem.countOOMGroupKill(ctx)
+	}
 }
 
-// countOOMEvents records one OOM event that killed n processes in m and in each
-// ancestor memory controller, and wakes the readers of memory.events. An event
-// without a kill (n is 0) still counts in oom and max, as in Linux.
-func (m *memory) countOOMEvents(ctx context.Context, n uint64, group bool) {
+// oomGroupOf returns the highest memory controller with memory.oom.group set
+// on the path from mem up to top, or nil.
+func oomGroupOf(mem, top *memory) *memory {
+	var group *memory
+	for cur := mem; cur != nil; cur = cur.parent {
+		if cur.oomGroup.Load() {
+			group = cur
+		}
+		if cur == top {
+			break
+		}
+	}
+	return group
+}
+
+// oomGroupMembers returns the candidates in the subtree of group.
+func oomGroupMembers(candidates []oomCandidate, group *memory) []oomCandidate {
+	var members []oomCandidate
+	for _, c := range candidates {
+		for cur := c.mem; cur != nil; cur = cur.parent {
+			if cur == group {
+				members = append(members, c)
+				break
+			}
+		}
+	}
+	return members
+}
+
+// countOOMEvent records one OOM event in oom and max of m and of each ancestor
+// memory controller, and wakes the readers of memory.events.
+func (m *memory) countOOMEvent(ctx context.Context) {
 	for cur := m; cur != nil; cur = cur.parent {
 		cur.oom.hitMax.Add(1)
 		cur.oom.oom.Add(1)
-		cur.oom.oomKill.Add(n)
-		if group && n > 0 {
-			cur.oom.oomGroupKill.Add(1)
-		}
-		if cur.oom.eventsFile != nil {
-			cur.oom.eventsFile.Notify(ctx)
-		}
+		cur.notifyEvents(ctx)
+	}
+}
+
+// countOOMKill records one killed process in oom_kill of m and of each
+// ancestor memory controller, and wakes the readers of memory.events.
+func (m *memory) countOOMKill(ctx context.Context) {
+	for cur := m; cur != nil; cur = cur.parent {
+		cur.oom.oomKill.Add(1)
+		cur.notifyEvents(ctx)
+	}
+}
+
+// countOOMGroupKill records one kill of a whole group in oom_group_kill of m
+// and of each ancestor memory controller.
+func (m *memory) countOOMGroupKill(ctx context.Context) {
+	for cur := m; cur != nil; cur = cur.parent {
+		cur.oom.oomGroupKill.Add(1)
+		cur.notifyEvents(ctx)
+	}
+}
+
+func (m *memory) notifyEvents(ctx context.Context) {
+	if m.oom.eventsFile != nil {
+		m.oom.eventsFile.Notify(ctx)
 	}
 }
