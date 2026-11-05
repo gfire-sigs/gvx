@@ -156,6 +156,7 @@ The table below lists the available `rungv` subcommands.
 | `save` / `load` | `rungv save -o FILE IMAGE...` / `rungv load -i FILE` | Export images to a `.tar` archive or import them on another machine. |
 | `login` / `logout` | `rungv login [SERVER]` / `rungv logout [SERVER]` | Save or remove registry credentials in the Docker config store. |
 | `stub` | `rungv stub` | Check whether the `systrap` engine is ready on the current host. |
+| `tune` | `rungv tune list` | List the host-side tunables that `--tune` and `--tune-file` set. |
 | `version` / `license` | `rungv version` / `rungv license` | Print build version information or embedded open-source license notices. |
 
 ### 3.3 Embed in Go (`pkg/gvx`)
