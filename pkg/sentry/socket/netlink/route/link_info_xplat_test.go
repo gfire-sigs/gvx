@@ -46,11 +46,17 @@ func linkAttrs(t *testing.T, i inet.Interface) map[uint16]nlmsg.BytesView {
 }
 
 func TestLinkWithoutLinkLayerHasNoAddressAttributes(t *testing.T) {
-	none := linkAttrs(t, inet.Interface{Name: "wg0", DeviceType: linux.ARPHRD_NONE})
+	registerNoLayerKind()
+	none := linkAttrs(t, inet.Interface{Name: "wg0", Kind: noLayerKind, DeviceType: linux.ARPHRD_NONE})
 	for _, typ := range []uint16{linux.IFLA_ADDRESS, linux.IFLA_BROADCAST} {
 		if v, ok := none[typ]; ok {
 			t.Errorf("a link of type ARPHRD_NONE has attribute %d = %x, want it absent, as on Linux", typ, []byte(v))
 		}
+	}
+	// A link of type ARPHRD_NONE without such a kind, as eth0 of the NAT link,
+	// keeps its zero address.
+	if v, ok := linkAttrs(t, inet.Interface{Name: "eth0", DeviceType: linux.ARPHRD_NONE})[linux.IFLA_ADDRESS]; !ok || len(v) != 6 {
+		t.Errorf("IFLA_ADDRESS of eth0 = %x, want 6 zero bytes", []byte(v))
 	}
 	lo := linkAttrs(t, inet.Interface{Name: "lo", DeviceType: linux.ARPHRD_LOOPBACK})
 	if v, ok := lo[linux.IFLA_ADDRESS]; !ok || len(v) != 6 {
@@ -63,6 +69,22 @@ func TestLinkWithoutLinkLayerHasNoAddressAttributes(t *testing.T) {
 }
 
 var registerKind sync.Once
+
+const noLayerKind = "test-no-layer"
+
+var registerNoLayer sync.Once
+
+func registerNoLayerKind() {
+	registerNoLayer.Do(func() {
+		netstack.RegisterLinkKind(noLayerKind, netstack.LinkKind{
+			NamePrefix: "tn",
+			New: func(context.Context, *netstack.NewLinkRequest) (stack.LinkEndpoint, *syserr.Error) {
+				return nil, syserr.ErrNotSupported
+			},
+			NoLinkLayer: true,
+		})
+	})
+}
 
 func TestOperStateOfAKindWithoutCarrierIsUnknownWhileUp(t *testing.T) {
 	const kind = "test-oper-unknown"

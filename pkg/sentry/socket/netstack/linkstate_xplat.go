@@ -170,3 +170,10 @@ func (s *Stack) checkLinkUp(id tcpip.NICID) *syserr.Error {
 	}
 	return nil
 }
+
+// LinkHasNoLinkLayer reports whether links of the kind have no link-layer
+// address, as the links of type ARPHRD_NONE of Linux.
+func LinkHasNoLinkLayer(kind string) bool {
+	k, ok := linkKinds[kind]
+	return ok && k.NoLinkLayer
+}

@@ -123,6 +123,7 @@ func init() {
 		NamePrefix:       "wg",
 		New:              newLink,
 		AdminState:       true,
+		NoLinkLayer:      true,
 		MTURange:         func(stack.LinkEndpoint) (uint32, uint32) { return minMTU, maxMTU },
 		Flags:            linux.IFF_POINTOPOINT | linux.IFF_NOARP,
 		OperStateUnknown: true,

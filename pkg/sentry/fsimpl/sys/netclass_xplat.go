@@ -216,7 +216,7 @@ func (fs *filesystem) newNetLinkDir(ctx context.Context, creds *auth.Credentials
 		"address": fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, _ int32, nic inet.Interface, _ inet.StatDev) {
 			addr := net.HardwareAddr(nic.Addr)
 			if len(addr) == 0 {
-				if nic.DeviceType == linux.ARPHRD_NONE {
+				if netstack.LinkHasNoLinkLayer(nic.Kind) {
 					// A link without a link layer has an empty address.
 					fmt.Fprintf(buf, "\n")
 					return

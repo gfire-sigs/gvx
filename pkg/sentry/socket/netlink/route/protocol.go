@@ -267,7 +267,7 @@ func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Sta
 
 	// A link of type ARPHRD_NONE has no link-layer address, so Linux sends
 	// neither IFLA_ADDRESS nor IFLA_BROADCAST, and "ip link" prints "link/none".
-	if i.DeviceType != linux.ARPHRD_NONE || len(i.Addr) > 0 {
+	if !netstack.LinkHasNoLinkLayer(i.Kind) || len(i.Addr) > 0 {
 		mac := make([]byte, 6)
 		brd := mac
 		if len(i.Addr) > 0 {

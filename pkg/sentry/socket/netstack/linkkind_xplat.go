@@ -80,6 +80,11 @@ type LinkKind struct {
 	// and IFF_NOARP.
 	Flags uint32
 
+	// NoLinkLayer marks a link of type ARPHRD_NONE, such as wireguard. Linux
+	// reports no IFLA_ADDRESS and an empty sysfs address for it. Another link
+	// with that type, such as eth0 of the NAT link, keeps a zero address.
+	NoLinkLayer bool
+
 	// OperStateUnknown makes the link report IF_OPER_UNKNOWN, and not
 	// IF_OPER_UP, while it is up. A Linux device that never calls
 	// netif_carrier_off or netif_dormant_on has that operstate.
