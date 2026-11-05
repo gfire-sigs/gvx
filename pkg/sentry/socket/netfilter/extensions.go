@@ -81,7 +81,14 @@ func marshalMatcher(mr stack.Matcher) []byte {
 	if !ok {
 		panic(fmt.Sprintf("Unknown matcher of type %T.", matcher))
 	}
-	return matchMaker.marshal(matcher)
+	buf := matchMaker.marshal(matcher)
+	// iptables reads the revision of a match back from the entry. A match that
+	// the marshal function leaves at revision 0 prints as "unsupported revision",
+	// and the next insert fails to parse the rule.
+	if len(buf) > revisionOffset {
+		buf[revisionOffset] = matcher.revision()
+	}
+	return buf
 }
 
 // marshalEntryMatch creates a marshalled XTEntryMatch with the given name and

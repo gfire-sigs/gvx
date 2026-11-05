@@ -44,6 +44,9 @@ seam pkg/sentry/fsimpl/overlay/overlay.go
 # Content seam: SetEntries gives the Stack to the matchers that need it
 # (pkg/sentry/socket/netfilter/addrtype_matcher_xplat.go). stack.Matcher.Match gets only the packet.
 seam pkg/sentry/socket/netfilter/netfilter.go
+# Content seam: marshalMatcher writes the revision of the match into the entry, so that iptables
+# reads the revision of the matches mark and multiport back.
+seam pkg/sentry/socket/netfilter/extensions.go
 
 # Content seam: getEntries4 and getEntries6 report the inverted input interface flag ("! -i").
 seam pkg/sentry/socket/netfilter/ipv4.go
