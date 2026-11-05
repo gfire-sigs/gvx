@@ -195,24 +195,36 @@ func TestEnforcerSupported(t *testing.T) {
 	}
 }
 
-func TestCountOOMEventsCountsInEveryAncestor(t *testing.T) {
+func TestOOMKillCountsInTheCgroupOfTheVictim(t *testing.T) {
 	root := &memory{}
-	mid := &memory{parent: root}
-	leaf := &memory{parent: mid}
+	pod := &memory{parent: root}
+	victim := &memory{parent: pod}
+	sibling := &memory{parent: pod}
+	ctx := context.Background()
 
-	leaf.countOOMEvents(context.Background(), 2, false)
-	leaf.countOOMEvents(context.Background(), 1, true)
-	leaf.countOOMEvents(context.Background(), 0, true)
+	// The pod passed its limit, and the kill ended a process of one child.
+	pod.countOOMEvent(ctx)
+	victim.countOOMKill(ctx)
+	pod.countOOMGroupKill(ctx)
 
-	for name, m := range map[string]*memory{"leaf": leaf, "mid": mid, "root": root} {
-		if got := m.oom.oom.Load(); got != 3 {
-			t.Errorf("%s oom = %d, want 3 events, one of them without a kill", name, got)
+	for _, tc := range []struct {
+		name                string
+		m                   *memory
+		oom, kill, groupOOM uint64
+	}{
+		{"root", root, 1, 1, 1},
+		{"pod", pod, 1, 1, 1},
+		{"victim", victim, 0, 1, 0},
+		{"sibling", sibling, 0, 0, 0},
+	} {
+		if got := tc.m.oom.oom.Load(); got != tc.oom {
+			t.Errorf("%s oom = %d, want %d", tc.name, got, tc.oom)
 		}
-		if got := m.oom.oomKill.Load(); got != 3 {
-			t.Errorf("%s oom_kill = %d, want 3 kills", name, got)
+		if got := tc.m.oom.oomKill.Load(); got != tc.kill {
+			t.Errorf("%s oom_kill = %d, want %d", tc.name, got, tc.kill)
 		}
-		if got := m.oom.oomGroupKill.Load(); got != 1 {
-			t.Errorf("%s oom_group_kill = %d, want 1", name, got)
+		if got := tc.m.oom.oomGroupKill.Load(); got != tc.groupOOM {
+			t.Errorf("%s oom_group_kill = %d, want %d", tc.name, got, tc.groupOOM)
 		}
 	}
 }
