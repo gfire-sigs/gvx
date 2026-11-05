@@ -123,7 +123,8 @@ type Config struct {
 	// every entry.
 	AgeingSeconds uint32
 
-	// Limit is the largest count of learned entries, or 0 for no limit.
+	// Limit is the largest count of FDB entries, static and learned together, or
+	// 0 for no limit. It is IFLA_VXLAN_LIMIT (vxlan->cfg.addrmax in Linux).
 	Limit uint32
 
 	// PortLow and PortHigh are the range of outer source ports. The endpoint

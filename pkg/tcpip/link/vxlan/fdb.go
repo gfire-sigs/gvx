@@ -46,17 +46,8 @@ var (
 	ErrBadAddress = errors.New("vxlan: remote address family does not match the link")
 	// ErrBadState means the state is neither permanent nor reachable.
 	ErrBadState = errors.New("vxlan: FDB state is neither permanent nor reachable")
-	// ErrNoSpace means the table or the list of remotes has reached its limit.
+	// ErrNoSpace means the table has as many entries as the link limit.
 	ErrNoSpace = errors.New("vxlan: FDB is full")
-)
-
-const (
-	// MaxFDBEntries is the largest count of entries in the table of one link,
-	// static and learned together. A link limit above it has no effect.
-	MaxFDBEntries = 65536
-
-	// MaxRemotes is the largest count of remotes of one entry.
-	MaxRemotes = 1024
 )
 
 // zeroMAC is the key of the entry that holds the destinations of frames with an
@@ -135,13 +126,9 @@ func (t *fdb) noteDynamicLocked(f *fdbEntry, ageing time.Duration) {
 	}
 }
 
-// limitOf returns the largest count of entries for a link limit.
-func limitOf(limit uint32) int {
-	if limit == 0 || limit > MaxFDBEntries {
-		return MaxFDBEntries
-	}
-	return int(limit)
-}
+// full reports whether a table of n entries has reached the link limit. A limit
+// of 0 means no limit, as vxlan->cfg.addrmax does in vxlan_fdb_create.
+func full(n int, limit uint32) bool { return limit != 0 && uint64(n) >= uint64(limit) }
 
 // expiredLocked removes the dynamic entries that nothing used for ageing. It
 // scans the table only when an entry can be due.
@@ -203,7 +190,7 @@ func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote,
 			return ErrNotFound
 		}
 		t.expiredLocked(now, ageing)
-		if len(t.entries) >= limitOf(limit) {
+		if full(len(t.entries), limit) {
 			return ErrNoSpace
 		}
 		f = &fdbEntry{mac: mac, state: state, flags: flags, remotes: []Remote{r}, updated: now, used: now}
@@ -228,9 +215,6 @@ func (t *fdb) update(mac tcpip.LinkAddress, state uint16, flags uint8, r Remote,
 		}
 	}
 	if mode.Append && isMulticastOrZero(mac) && !slices.Contains(f.remotes, r) {
-		if len(f.remotes) >= MaxRemotes {
-			return ErrNoSpace
-		}
 		f.remotes = append(f.remotes, r)
 		f.updated = now
 	}
@@ -309,7 +293,7 @@ func (t *fdb) learn(mac tcpip.LinkAddress, src Remote, limit uint32, now time.Ti
 		f.updated = now
 		return true
 	}
-	if len(t.entries) >= limitOf(limit) {
+	if full(len(t.entries), limit) {
 		return true
 	}
 	f := &fdbEntry{
