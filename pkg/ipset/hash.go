@@ -137,14 +137,20 @@ func (st *store) insert(s *Set, e entry) *entry {
 	return &st.entries[len(st.entries)-1]
 }
 
-// remove deletes the element at slot i.
+// remove deletes the element at slot i and compacts the slots. A caller that
+// holds slot numbers uses removeSlot instead.
 func (st *store) remove(s *Set, i int) {
+	st.removeSlot(s, i)
+	st.compact()
+}
+
+// removeSlot deletes the element at slot i and keeps every other slot number.
+func (st *store) removeSlot(s *Set, i int) {
 	e := &st.entries[i]
 	delete(st.index, e.key)
 	st.track(s, &e.key, false)
 	*e = entry{}
 	st.live--
-	st.compact()
 }
 
 // track updates the prefix counts for a network component.
@@ -202,9 +208,11 @@ func (st *store) purgeExpired(s *Set, now time.Duration) {
 	}
 	for i := range st.entries {
 		if e := &st.entries[i]; e.live && s.expired(&e.extensionData, now) {
-			st.remove(s, i)
+			st.removeSlot(s, i)
 		}
 	}
+	// Compaction moves the slots, so it runs once after the loop.
+	st.compact()
 	st.purgeAt = max(1024, 2*st.live)
 }
 
@@ -407,6 +415,10 @@ type dimension struct {
 	to     uint32
 	ranged bool
 	blocks bool
+	// step is the distance between two hosts of a range. It is 1, except for a
+	// set with the create option netmask, which has one element for each
+	// network of the netmask.
+	step uint32
 }
 
 // each calls yield for every component of the dimension until yield returns
@@ -428,11 +440,12 @@ func (d *dimension) each(yield func(component) bool) bool {
 			from = last + 1
 		}
 	}
-	for a := d.from; ; a++ {
+	step := max(d.step, 1)
+	for a := d.from; ; a += step {
 		if !yield(component{addr4(a), 0}) {
 			return false
 		}
-		if a == d.to {
+		if d.to-a < step {
 			return true
 		}
 	}
@@ -487,8 +500,22 @@ func (s *Set) newDimension(adt Adt, ip, ipTo Addr, hasTo bool, cidr uint8, hasCI
 		from &= mask
 		to = from | ^mask
 	}
-	return dimension{from: from, to: to, ranged: true}, 0
+	step := uint32(1)
+	if s.spec.netmask && s.netmask < 32 {
+		// A set with netmask N has one element for each network of N bits, so a
+		// range starts at a network and steps from network to network, as
+		// hash_ip4_uadt does.
+		from &= ^uint32(0) << (32 - uint(s.netmask))
+		step = 1 << (32 - uint(s.netmask))
+	}
+	return dimension{from: from, to: to, ranged: true, step: step}, 0
 }
+
+// rangeChunk is the count of elements that a range operation changes in one
+// hold of the lock of the set. It is IPSET_MAX_RANGE of Linux. A longer range
+// goes on in the next hold, so a packet that tests the set waits for one chunk
+// at most.
+const rangeChunk = 1 << 14
 
 // hashUadt is the uadt function of the hash types: it runs the operation on
 // the element that a request names.
@@ -559,7 +586,13 @@ func (s *Set) hashUadt(adt Adt, e *Element, flags uint32) int {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := 0
 	apply := func(a, b component, p uint16) int {
+		if changed++; changed%rangeChunk == 0 {
+			s.mu.Unlock()
+			s.mu.Lock()
+			now = s.now()
+		}
 		k := hashKey{ip: a.addr, ip2: b.addr, port: p, proto: proto}
 		if bitmask {
 			k.ip, k.ip2 = k.ip.and(s.bitmask), k.ip2.and(s.bitmask)

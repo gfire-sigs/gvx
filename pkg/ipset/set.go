@@ -250,7 +250,9 @@ func (s *Set) initExtensions(d *extensionData, x *ext, now time.Duration) {
 			d.packets = x.packets
 		}
 	}
-	if s.withComment {
+	// An element that a packet adds again keeps its comment, because the packet
+	// carries none.
+	if s.withComment && !x.target {
 		d.comment = x.comment
 	}
 	if s.withSkbinfo {
@@ -464,7 +466,9 @@ func (s *Set) sameSet(o *Set) bool {
 	}
 	switch s.spec.kind {
 	case kindHash:
-		return s.maxElem == o.maxElem && s.hashSize == o.hashSize &&
+		// hashsize is no part of the identity: the table of Linux grows, so two
+		// sets with equal contents rarely have equal sizes.
+		return s.maxElem == o.maxElem &&
 			s.netmask == o.netmask && s.bitmask == o.bitmask
 	case kindBitmapPort:
 		return s.portFrom == o.portFrom && s.portTo == o.portTo

@@ -287,6 +287,9 @@ func (s *Set) listKtest(ids []ID, pkt *Packet, o *KOpt, now time.Duration) int {
 		if s.reg.Test(id, pkt, &sub) <= 0 {
 			continue
 		}
+		// The member that matched gives its packet information. The list
+		// overwrites it when the list stores its own.
+		o.SkbInfo = sub.SkbInfo
 		s.mu.Lock()
 		hit := false
 		for i := range s.list {

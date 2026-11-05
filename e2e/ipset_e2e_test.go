@@ -235,6 +235,12 @@ reach 10.77.0.3 >/dev/null
 ! ipset test seen 10.77.0.3 >/dev/null 2>&1 && ok SET-DEL-OK || bad "SET --del-set"
 $ipt -F INPUT
 
+# The target LOG takes a rule, keeps it for iptables-save, and lets the traffic pass.
+$ipt -A INPUT -p tcp --dport 9000 -j LOG --log-prefix "t: " --log-level 3
+reach 10.77.0.3 && ok LOG-PASSES-OK || bad "LOG blocked the traffic"
+$ipt -S INPUT | grep -q -- '-j LOG --log-prefix "t: " --log-level 3' && ok LOG-SAVE-OK || { bad "LOG save"; $ipt -S INPUT; }
+$ipt -F INPUT
+
 # A set in the IPv6 tables.
 ipset create blocked6 hash:ip family inet6
 ip6tables-legacy -w -A INPUT -m set --match-set blocked6 src -j DROP
@@ -262,7 +268,7 @@ func TestE2EIPSetNetfilter(t *testing.T) {
 				"BASELINE-OK\n", "MEMBER-BLOCKED-OK\n", "NONMEMBER-PASSES-OK\n", "SAVE-MATCH-OK\n", "SAVE-OK\n",
 				"RULE-HOLDS-SET-OK\n", "DEL-UNBLOCKS-OK\n", "COUNTER-MATCH-OK\n", "IPPORT-MATCH-OK\n",
 				"NEGATED-MATCH-OK\n", "NOMATCH-OK\n", "RETURN-NOMATCH-OK\n", "SET-ADD-OK\n", "SET-SAVE-OK\n",
-				"SET-DEL-OK\n", "IPV6-RULE-OK\n", "IPSET-NETFILTER-DONE\n")
+				"SET-DEL-OK\n", "LOG-PASSES-OK\n", "LOG-SAVE-OK\n", "IPV6-RULE-OK\n", "IPSET-NETFILTER-DONE\n")
 			if strings.Contains(out, "FAIL ") {
 				t.Errorf("guest reported failures:\n%s", out)
 			}

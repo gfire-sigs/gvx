@@ -139,6 +139,7 @@ The Sentry stores `cpu.max` today and does not enforce it. P4 adds the CFS bandw
 | `-m limit` | The match is a token bucket for each rule. | `pkg/sentry/socket/netfilter/limit_matcher_xplat.go` |
 | `-m physdev` | The match knows the frames that a bridge switches between two ports. A packet that the IP layer routes through the bridge is not bridged. | `pkg/sentry/socket/netfilter/physdev_matcher_xplat.go`; the bridge code marks the packet in `pkg/tcpip/stack/bridge_netfilter_xplat.go` |
 | `-j NFLOG` | The target accepts the rule and does nothing, because no listener of an `nflog` group exists. | `pkg/sentry/socket/netfilter/nflog_target_xplat.go` |
+| `-j LOG` | The target takes `--log-level` and `--log-prefix`. It writes the line to the log of the Sentry, because `/dev/kmsg` holds no records yet. | `pkg/sentry/socket/netfilter/log_target_xplat.go` |
 
 The match `set` of a rule keeps the index of its set. `ipset swap` exchanges the sets and the names behind the two indexes, so a rule sees the new data at once. A swap of two sets with different types fails. A destroy of a set fails with `EBUSY` while a rule, a `list:set` set, or a running listing refers to it.
 

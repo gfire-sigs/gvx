@@ -826,3 +826,150 @@ func TestRangeToCIDR(t *testing.T) {
 		}
 	}
 }
+
+// TestPurgeOfExpiredElementsKeepsTheStoreIntact adds an element to a full set of
+// expired elements. The purge once compacted the slots while it walked them and
+// panicked with an index out of range.
+func TestPurgeOfExpiredElementsKeepsTheStoreIntact(t *testing.T) {
+	r, clock := newTestRegistry(t)
+	create(t, r, "ttl", "hash:ip", FamilyIPv4, func(p *CreateParams) {
+		p.Given |= GivenTimeout | GivenMaxElem
+		p.Timeout, p.MaxElem = 1, 100
+	})
+	for i := range 100 {
+		if got := uadt(r, "ttl", AdtAdd, hostElem(fmt.Sprintf("10.0.0.%d", i+1)), 0); got != 0 {
+			t.Fatalf("add %d = %d", i, got)
+		}
+	}
+	clock.now += 5 * time.Second
+	if got := uadt(r, "ttl", AdtAdd, hostElem("10.9.9.9"), 0); got != 0 {
+		t.Fatalf("add after the expiry = %d, want 0", got)
+	}
+	if n := len(listAll(t, r, "ttl")); n != 1 {
+		t.Errorf("listing holds %d elements, want 1", n)
+	}
+}
+
+func TestNetmaskSetsStepFromNetworkToNetwork(t *testing.T) {
+	r, _ := newTestRegistry(t)
+	create(t, r, "masked", "hash:ip", FamilyIPv4, func(p *CreateParams) {
+		p.Given |= GivenNetmask
+		p.Netmask = 24
+	})
+	if got := uadt(r, "masked", AdtAdd, netElem("10.0.0.0", 24), 0); got != 0 {
+		t.Fatalf("add cidr = %d", got)
+	}
+	if n := len(listAll(t, r, "masked")); n != 1 {
+		t.Errorf("a /24 in a set with netmask 24 gives %d elements, want 1", n)
+	}
+	rng := Element{Has: HasIP | HasIPTo, IP: ip4("10.1.0.77"), IPTo: ip4("10.1.2.3")}
+	if got := uadt(r, "masked", AdtAdd, rng, 0); got != 0 {
+		t.Fatalf("add range = %d", got)
+	}
+	// 10.1.0.0, 10.1.1.0, and 10.1.2.0 from the range, and 10.0.0.0.
+	if n := len(listAll(t, r, "masked")); n != 4 {
+		t.Errorf("listing holds %d elements, want 4", n)
+	}
+}
+
+func TestCreateExistIgnoresTheHashSize(t *testing.T) {
+	r, _ := newTestRegistry(t)
+	create(t, r, "s", "hash:ip", FamilyIPv4, func(p *CreateParams) {
+		p.Given |= GivenHashSize
+		p.HashSize = 128
+	})
+	_, hi, _ := FindType("hash:ip", FamilyIPv4)
+	again := &CreateParams{Name: "s", TypeName: "hash:ip", Family: FamilyIPv4, Revision: hi, Exist: true,
+		Given: GivenHashSize, HashSize: 4096}
+	if err := r.Create(again); err != nil {
+		t.Errorf("create with exist and another hashsize: %v", err)
+	}
+}
+
+func TestPacketAddKeepsTheCommentOfTheElement(t *testing.T) {
+	r, _ := newTestRegistry(t)
+	create(t, r, "c", "hash:ip", FamilyIPv4, func(p *CreateParams) {
+		p.Given |= GivenCadtFlags
+		p.CadtFlags = CadtWithComment
+	})
+	e := hostElem("10.0.0.1")
+	e.Has |= HasComment
+	e.Comment = "web"
+	uadt(r, "c", AdtAdd, e, 0)
+	id, _, _ := r.Lookup("c")
+	pkt := &Packet{Family: FamilyIPv4, Src: ip4("10.0.0.1")}
+	opt := &KOpt{Dim: 1, Flags: KDimOneSrc, CmdFlags: FlagExist, Timeout: NoTimeout}
+	if got := r.Add(id, pkt, opt); got != 0 {
+		t.Fatalf("Add = %d", got)
+	}
+	if got := listAll(t, r, "c"); len(got) != 1 || got[0].Comment != "web" {
+		t.Errorf("listing = %+v, want the comment web", got)
+	}
+}
+
+func TestListSetGivesTheSkbInfoOfTheMatchingMember(t *testing.T) {
+	r, _ := newTestRegistry(t)
+	create(t, r, "m", "hash:ip", FamilyIPv4, func(p *CreateParams) {
+		p.Given |= GivenCadtFlags
+		p.CadtFlags = CadtWithSkbinfo
+	})
+	create(t, r, "all", "list:set", FamilyUnspec, nil)
+	e := hostElem("10.0.0.1")
+	e.Has |= HasSkbMark
+	e.SkbMark = 0x2a<<32 | 0xff
+	uadt(r, "m", AdtAdd, e, 0)
+	uadt(r, "all", AdtAdd, Element{Has: HasName, Name: "m"}, 0)
+	id, _, _ := r.Lookup("all")
+	pkt := &Packet{Family: FamilyIPv4, Src: ip4("10.0.0.1")}
+	opt := &KOpt{Dim: 1, Flags: KDimOneSrc, Timeout: NoTimeout}
+	if r.Test(id, pkt, opt) <= 0 {
+		t.Fatal("the list does not match")
+	}
+	if opt.SkbInfo.Mark != 0x2a || opt.SkbInfo.MarkMask != 0xff {
+		t.Errorf("skbinfo = %+v, want mark 0x2a and mask 0xff", opt.SkbInfo)
+	}
+}
+
+// TestHugeRangeDoesNotBlockPackets deletes a range of 16 million addresses. The
+// operation once held the lock of the set until it ended, so a packet test of
+// the same set waited for seconds.
+func TestHugeRangeDoesNotBlockPackets(t *testing.T) {
+	if testing.Short() {
+		t.Skip("the range walk takes seconds")
+	}
+	r, _ := newTestRegistry(t)
+	create(t, r, "s", "hash:ip", FamilyIPv4, nil)
+	uadt(r, "s", AdtAdd, hostElem("10.0.0.1"), 0)
+	id, _, _ := r.Lookup("s")
+
+	done := make(chan int)
+	go func() {
+		e := Element{Has: HasIP | HasCIDR, IP: ip4("11.0.0.0"), CIDR: 8}
+		done <- uadt(r, "s", AdtDel, e, FlagExist)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	pkt := &Packet{Family: FamilyIPv4, Src: ip4("10.0.0.1")}
+	opt := &KOpt{Dim: 1, Flags: KDimOneSrc, Timeout: NoTimeout}
+	var worst time.Duration
+	running := true
+	for i := 0; i < 20 && running; i++ {
+		start := time.Now()
+		if r.Test(id, pkt, opt) <= 0 {
+			t.Fatal("the member does not match")
+		}
+		worst = max(worst, time.Since(start))
+		select {
+		case <-done:
+			running = false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if running {
+		if got := <-done; got != 0 {
+			t.Errorf("range delete = %d, want 0", got)
+		}
+	}
+	if worst > 100*time.Millisecond {
+		t.Errorf("a packet test waited %v for a range operation", worst)
+	}
+}
