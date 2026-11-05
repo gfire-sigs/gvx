@@ -32,6 +32,7 @@ PROTECT pkg/sentry/platform/systrap/*_darwin*
 PROTECT pkg/sentry/platform/systrap/*_xplat*
 PROTECT pkg/sentry/fsimpl/chunkcache/**
 PROTECT pkg/sentry/socket/netlink/genetlink/**
+PROTECT pkg/ipset/**
 PROTECT pkg/tcpip/link/vxlan/**
 PROTECT pkg/sentry/fsimpl/hostfs/**
 PROTECT pkg/sentry/fsimpl/ext4lite/**
