@@ -2,6 +2,19 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **New connections from a pod to an address of the node timed out at random**: on a node that forwards packets, a pod that connected to an address of `eth0` (the API server at `10.0.2.15:6443`, or the cluster IP `10.43.0.1:443` that `kube-proxy` rewrites to it) got no answer to its SYN for up to 127 seconds. Established connections and connections from the host were not affected. In a `k3s` node about 1 run in 4 had this fault, and 1 to 4 tests of the `[sig-network] Services` conformance group failed, with a `dial tcp 10.43.0.1:443: i/o timeout` or a `service is not reachable` message.
+  - The stack gave a packet for a local address of another NIC to the first NIC that owned the address. Several NICs own such an address, because the loopback NIC holds a temporary copy of every local address that a local route uses, and the stack lists the NICs in random order. The TCP listener then built the SYN-ACK route for that NIC. The route table of a NIC that owns the source address chose the default route through `eth0`, and the SYN-ACK left the sandbox instead of the bridge. The share of lost SYN-ACKs depended on the number of NICs and on the local connections of the node, so a run had a high or a low rate for its whole time.
+  - The stack now delivers such a packet on the NIC where it arrived, as Linux does. It still marks a packet to a broadcast address of the owner as a broadcast, and it still drops a packet from a broadcast source address of the owner.
+  - A reply with a local address of another NIC now uses the route table, as in Linux. A route through the NIC of the packet wins. Without such a route, the first matching route decides, so a host with two NICs still answers through the other NIC.
+
+### Known limitations
+
+- **IPv6 pods**: IPv6 has the same random choice of the NIC for a packet to a local address of another NIC, so a SYN-ACK can leave through the wrong NIC. `k3s` uses IPv4 by default, and the C5 tests use IPv4 only. [`docs/kubernetes.md`](docs/kubernetes.md), section 4.3, lists the limit.
+
 ## [v0.8.10002026110200] - 2026-11-05
 
 This release lets an unmodified `k3s` node run in a sandbox (GVXIP-005). It adds the Linux kernel interfaces that the `kubelet`, `containerd`, `runc`, and `k3s` read and write (phase P1). It adds the service data path of `kube-proxy` in the iptables mode (phase P2), the `wireguard` and `vxlan` links between nodes (phase P3), and the enforcement of `cpu.max` (phase P4). It adds no flag and no SDK field. [`docs/kubernetes.md`](docs/kubernetes.md) shows how to start a single node and a cluster with two nodes.

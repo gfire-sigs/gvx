@@ -921,7 +921,7 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 			}
 		}
 
-		e.deliverForwardedLocally(h, pkt)
+		e.deliverForwardedLocally(ep, h, pkt)
 		return nil
 	}
 

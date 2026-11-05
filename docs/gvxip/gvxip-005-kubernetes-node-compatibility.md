@@ -131,6 +131,7 @@ These items stay outside this specification. The documentation of the feature li
 | `nftables` (`iptables-nft`) | The upstream implementation is marked `TESTONLY`. The `k3s` image reads `IPTABLES_MODE=legacy`, which is a setting of `k3s`. |
 | `ipset` and NetworkPolicy | A later specification |
 | IPVS, eBPF, and kernel modules | The Sentry does not provide these interfaces. |
+| IPv6 reply routes of a forwarding node | The IPv4 stack delivers a forwarded packet for a local address of another NIC on the NIC where it arrived, and the reply follows the route table. IPv6 still gives the packet to a random owner of the address. The fix needs a seam in `pkg/tcpip/network/ipv6/ipv6.go`, and the upstream budget of the audit is full (50 of 2526 files). A later specification takes it. |
 | `memory.max` on Windows `systrap` | A separate engine change. The documentation tells the user to taint such a node. |
 
 ---
