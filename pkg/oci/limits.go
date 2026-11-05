@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 )
 
 // ErrLimitExceeded marks every error that reports an exceeded size budget.
@@ -61,6 +62,9 @@ type Limits struct {
 	MaxArchiveEntries int64
 	// MaxZstdWindowBytes bounds the zstd window, and so the decoder memory.
 	MaxZstdWindowBytes uint64
+	// RegistryIdleTimeout is how long a registry request may go without data
+	// before it fails. Zero selects the default of the registry of tunables.
+	RegistryIdleTimeout time.Duration
 }
 
 // DefaultLimits returns the limits that production pulls use.
@@ -70,14 +74,15 @@ func DefaultLimits() Limits {
 		gib = int64(1) << 30
 	)
 	return Limits{
-		MaxJSONBytes:       8 * mib,
-		MaxBlobBytes:       32 * gib,
-		MaxLayerBytes:      64 * gib,
-		MaxImageBytes:      128 * gib,
-		MaxEntryBytes:      32 * gib,
-		MaxEntries:         2_000_000,
-		MaxArchiveEntries:  1_000_000,
-		MaxZstdWindowBytes: 128 * uint64(mib),
+		MaxJSONBytes:        8 * mib,
+		MaxBlobBytes:        32 * gib,
+		MaxLayerBytes:       64 * gib,
+		MaxImageBytes:       128 * gib,
+		MaxEntryBytes:       32 * gib,
+		MaxEntries:          2_000_000,
+		MaxArchiveEntries:   1_000_000,
+		MaxZstdWindowBytes:  128 * uint64(mib),
+		RegistryIdleTimeout: defaultIdleTimeout,
 	}
 }
 
@@ -97,6 +102,9 @@ func (l Limits) validate() error {
 	}
 	if l.MaxZstdWindowBytes == 0 {
 		return errors.New("oci: limit MaxZstdWindowBytes must be positive")
+	}
+	if l.RegistryIdleTimeout < 0 {
+		return fmt.Errorf("oci: limit RegistryIdleTimeout must not be negative, got %s", l.RegistryIdleTimeout)
 	}
 	return nil
 }

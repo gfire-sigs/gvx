@@ -18,15 +18,11 @@ import (
 	"sync"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/tmpfs"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
-
-// hostMemoryGuardInterval is the poll interval of the memory guard when the
-// limit is the RAM of the host. That limit needs less precision than a limit
-// that the caller sets.
-const hostMemoryGuardInterval = 100 * time.Millisecond
 
 // hostMemory returns the physical RAM of the host. It reads the value one time,
 // before the host lockdown, and returns the cached value after that.
@@ -63,14 +59,17 @@ func reportedMemory(configured int64, hostRAM uint64) uint64 {
 }
 
 // effectiveMemoryLimit returns the memory limit that the guard enforces and
-// its poll interval. A limit that the caller sets wins. Without one, the
-// guard stops a guest that passes the RAM of the host. Zero means no guard.
-func effectiveMemoryLimit(configured int64, hostRAM uint64) (uint64, time.Duration) {
+// its poll interval. A limit that the caller sets wins, and the tunable
+// memory.guard.poll_interval sets the interval. Without a limit, the guard
+// stops a guest that passes the RAM of the host. That limit needs less
+// precision, so the tunable memory.guard.host_poll_interval sets the interval.
+// Zero means no guard.
+func effectiveMemoryLimit(configured int64, hostRAM uint64, t tuning.Values) (uint64, time.Duration) {
 	if configured > 0 {
-		return uint64(configured), memoryPollInterval
+		return uint64(configured), t.Duration(tuning.MemoryGuardPollInterval)
 	}
 	if hostRAM > 0 {
-		return hostRAM, hostMemoryGuardInterval
+		return hostRAM, t.Duration(tuning.MemoryGuardHostPollInterval)
 	}
 	return 0, 0
 }

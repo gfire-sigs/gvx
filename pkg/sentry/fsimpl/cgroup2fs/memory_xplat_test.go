@@ -16,14 +16,19 @@ package cgroup2fs
 
 import (
 	"bytes"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/ktime"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 func parseMemoryStat(t *testing.T, text string) map[string]uint64 {
@@ -253,5 +258,69 @@ func TestOOMGroupIsTheHighestGroupBelowTheLimitedCgroup(t *testing.T) {
 	}
 	if !slices.Equal(ids, []kernel.ThreadID{1, 2}) {
 		t.Errorf("members of the container group = %v, want [1 2]", ids)
+	}
+}
+
+func TestMemoryEnforcerOptionsKeepSetFieldsAndFillTheRest(t *testing.T) {
+	def := DefaultMemoryEnforcerOptions()
+	if def.PollInterval != oomPollInterval || def.IdlePollInterval != oomIdlePollInterval || def.ScanRatio != oomScanRatio {
+		t.Errorf("defaults = %+v, want the built-in constants", def)
+	}
+	got := MemoryEnforcerOptions{PollInterval: 50 * time.Millisecond, ScanRatio: 9}.withDefaults()
+	if got.PollInterval != 50*time.Millisecond || got.ScanRatio != 9 || got.IdlePollInterval != oomIdlePollInterval {
+		t.Errorf("options = %+v, want the set fields and the default idle interval", got)
+	}
+}
+
+type fixedClock struct{}
+
+func (fixedClock) Now() ktime.Time                     { return ktime.FromNanoseconds(1_700_000_000_000_000_000) }
+func (fixedClock) NewTimer(ktime.Listener) ktime.Timer { panic("fixedClock has no timers") }
+
+func newTestFilesystem(t *testing.T, opts MemoryEnforcerOptions) *filesystem {
+	t.Helper()
+	ctx := context.WithValues(context.Background(), map[any]any{ktime.CtxRealtimeClock: fixedClock{}})
+	k := &kernel.Kernel{}
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("VirtualFilesystem.Init: %v", err)
+	}
+	vfsfs, err := NewFilesystemWithMemoryOptions(opts)(ctx, k, vfsObj)
+	if err != nil {
+		t.Fatalf("NewFilesystemWithMemoryOptions: %v", err)
+	}
+	return vfsfs.Impl().(*filesystem)
+}
+
+func TestNewFilesystemKeepsTheOptionsOnTheFilesystem(t *testing.T) {
+	want := MemoryEnforcerOptions{PollInterval: 3 * time.Millisecond, IdlePollInterval: 7 * time.Millisecond, ScanRatio: 2}
+	if got := newTestFilesystem(t, want).memEnforcer.opts; got != want {
+		t.Errorf("enforcer options = %+v, want %+v", got, want)
+	}
+	if got := newTestFilesystem(t, MemoryEnforcerOptions{}).memEnforcer.opts.withDefaults(); got != DefaultMemoryEnforcerOptions() {
+		t.Errorf("enforcer options of a zero value = %+v, want the defaults", got)
+	}
+}
+
+// TestFilesystemsAreFreeAfterTheLastReference creates many filesystems, as
+// many sandboxes do, and drops them. No package-level value may keep one, or a
+// host that creates sandboxes in a loop would hold the memory of every kernel.
+func TestFilesystemsAreFreeAfterTheLastReference(t *testing.T) {
+	const count = 64
+	var refs []weak.Pointer[filesystem]
+	for range count {
+		refs = append(refs, weak.Make(newTestFilesystem(t, MemoryEnforcerOptions{PollInterval: time.Millisecond})))
+	}
+	for range 5 {
+		runtime.GC()
+	}
+	leaked := 0
+	for _, r := range refs {
+		if r.Value() != nil {
+			leaked++
+		}
+	}
+	if leaked != 0 {
+		t.Errorf("%d of %d filesystems stay reachable after the last reference is gone", leaked, count)
 	}
 }

@@ -264,6 +264,8 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/oci"}, "github.com/klauspost/compress/*", "zstd-compressed OCI layers"},
 	{[]string{"pkg/oci"}, "github.com/cespare/xxhash/*", "content-addressed layer cache keys"},
 	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "the Windows layer cache opens files with full sharing and renames with POSIX semantics"},
+	{[]string{"cmd/rungv"}, "pkg/gvx/tuning", "--tune, --tune-file, and rungv tune list build and print the registry of tunables, which is a leaf package of pkg/gvx"},
+	{[]string{"pkg/netbackend"}, "pkg/gvx/tuning", "the registry of tunables is a leaf package that holds the defaults of the NAT, DNS, and forwarder limits"},
 }
 
 // boundaryTestExceptions apply to _test.go files only.

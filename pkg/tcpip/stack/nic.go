@@ -311,6 +311,9 @@ func (n *nic) enable() tcpip.Error {
 	}
 
 	for _, ep := range n.networkEndpoints {
+		if n.ipv6Blocked(ep.NetworkProtocolNumber()) {
+			continue
+		}
 		if err := ep.Enable(); err != nil {
 			return err
 		}
@@ -545,6 +548,10 @@ func (n *nic) addAddress(protocolAddress tcpip.ProtocolAddress, properties Addre
 	ep := n.getNetworkEndpoint(protocolAddress.Protocol)
 	if ep == nil {
 		return &tcpip.ErrUnknownProtocol{}
+	}
+
+	if n.ipv6Blocked(protocolAddress.Protocol) {
+		return &tcpip.ErrInvalidOptionValue{}
 	}
 
 	addressableEndpoint, ok := ep.(AddressableEndpoint)

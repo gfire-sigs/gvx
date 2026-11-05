@@ -96,6 +96,8 @@ seam pkg/sentry/fsimpl/proc/task_net.go
 # (pkg/sentry/socket/netstack/bridgeport_xplat.go), and RTM_NEWLINK of a link kind
 # that the stack does not create calls the registry of pkg/sentry/socket/netstack/linkkind_xplat.go.
 # newVeth wraps each veth end with newHostFilterEndpoint (pkg/sentry/socket/netstack/hostfilter_xplat.go).
+# newVeth and newBridge set the Linux MTU range of the link, and newVeth counts the Ethernet header
+# in the MTU of the pair (pkg/sentry/socket/netstack/linkmtu_xplat.go).
 seam pkg/sentry/socket/netstack/stack.go
 # Content seam: RTM_GETLINK reports IFLA_STATS64 (pkg/sentry/socket/netlink/route/link_stats_xplat.go).
 seam pkg/sentry/socket/netlink/route/protocol.go
@@ -108,6 +110,9 @@ seam pkg/sentry/fsimpl/cgroup2fs/memory.go
 # (pkg/sentry/kernel/task_cpu_bandwidth_xplat.go, pkg/sentry/fsimpl/cgroup2fs/cpu_xplat.go).
 seam pkg/sentry/fsimpl/cgroup2fs/cpu.go
 seam pkg/sentry/fsimpl/cgroup2fs/cgroup.go
+# The enforcer of memory.max belongs to the filesystem, so it ends with the kernel
+# (pkg/sentry/fsimpl/cgroup2fs/memory_xplat.go). The seam is one field of the filesystem.
+seam pkg/sentry/fsimpl/cgroup2fs/filesystem.go
 seam pkg/sentry/kernel/task.go
 seam pkg/sentry/kernel/task_run.go
 seam pkg/sentry/kernel/task_sched.go
@@ -170,6 +175,10 @@ seam pkg/tcpip/stack/conntrack.go
 # packet to a local address of another NIC lives in pkg/tcpip/network/ipv4/local_delivery_xplat.go
 # (the seam in pkg/tcpip/network/ipv4/ipv4.go).
 seam pkg/tcpip/stack/stack.go
+# A NIC with MTU bounds loses IPv6 below an MTU of 1280, as in Linux
+# (pkg/tcpip/stack/nic_mtu_xplat.go). The seams are one call in SetNICMTU (stack.go), one test
+# in enable, and one in addAddress (nic.go).
+seam pkg/tcpip/stack/nic.go
 # Content seam: the IPv6 delivery of a forwarded packet to a local address of another NIC keeps the
 # receiving NIC (pkg/tcpip/network/ipv6/local_delivery_xplat.go). The seam is one call in
 # forwardUnicastPacket.

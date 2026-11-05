@@ -27,6 +27,7 @@ Run `rungv help` to print this list.
 | `login` | Store the credentials of a registry. |
 | `logout` | Remove the credentials of a registry. |
 | `stub` | Probe the `systrap` engine of this host. |
+| `tune` | List the host-side tunables. Section 3.3 describes them. |
 | `license` | Print the license texts of `gvx`, of its upstream code, and of the libraries in the binary. Section 9 describes it. |
 | `version` | Print the version, the source commit, and the Go toolchain of the binary. Section 10 describes it. |
 
@@ -80,6 +81,78 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `-registry-url URL` | Override the registry of the image reference. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
+| `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, and `tag` take it. |
+| `--tune-file FILE` | Read host-side tunables from a JSON object. A `--tune` flag wins over the file. The same eight commands take it. |
+
+### 3.3 Tunables
+
+A tunable is a limit or a time value of the host process that Linux has no knob for. The guest sets every Linux limit itself, through a `sysctl` file, a module parameter under `/sys/module`, or a netlink request. A tunable never replaces one of those. One registry in `pkg/gvx/tuning` holds all tunables. The SDK field `gvx.Config.Tuning`, the flags `--tune` and `--tune-file`, the command `rungv tune list`, and the table of this section come from that registry.
+
+A duration has the form of a Go duration, such as `250ms` or `30s`. A size is a number of bytes with an optional binary suffix, such as `64MiB`. Each value in a `--tune-file` file is a string or a number. A `--tune` flag wins over the file. An unknown key, a value that does not parse, or a value outside the range is an error. The error names the key and the range.
+
+To set a tunable:
+
+1. Run `rungv tune list` to print the table.
+2. Choose a key and a value inside its range.
+3. Add `--tune net.nat.mtu=9000` to the command. Repeat the flag for each key.
+4. Add `--tune-file FILE` instead to read the keys from a JSON file, such as `{"net.nat.mtu": 9000, "net.dns.timeout": "8s"}`.
+5. Add the same flags to an image command, such as `rungv pull`, to set an `oci.*` key.
+
+The test `TestDocsMatchRegistry` of `pkg/gvx/tuning` fails when this table differs from the registry.
+
+To rewrite the table after a change of the registry, run `go test ./pkg/gvx/tuning -run TestDocsMatchRegistry -update`.
+
+<!-- tuning:begin -->
+| Key | Type | Default | Range | Unit | Description |
+| :--- | :--- | ---: | :--- | :--- | :--- |
+| `net.nat.mtu` | int | 1500 | 68 to 65535 | bytes | MTU of eth0 in the nat network mode at the start of the guest. |
+| `net.nat.udp_sessions` | int | 512 | 1 to 1048576 | sessions | Number of guest UDP flows that the NAT relays at once; a new flow ends the oldest one. |
+| `net.udp.idle_timeout` | duration | 30s | 10ms to 24h | time | Time without a datagram in either direction after which the NAT or a published UDP port ends a session. |
+| `net.nat.dial_timeout` | duration | 10s | 100ms to 10m | time | Time that the NAT waits for a host TCP connection before it refuses the guest connection. |
+| `net.nat.syn_backlog` | int | 1024 | 1 to 1048576 | connections | Number of guest TCP connection requests that the NAT holds while it dials the host. |
+| `net.dns.timeout` | duration | 4s | 100ms to 1m | time | Time that the DNS relay at 10.0.2.3 waits for a guest query, a host lookup, and a reply. |
+| `net.dns.upstream_timeout` | duration | 2s | 100ms to 1m | time | Time that one exchange of the DNS relay with one host DNS server may take. |
+| `net.forward.udp_sessions` | int | 1024 | 1 to 1048576 | sessions | Number of host client sessions that one published UDP port relays at once. |
+| `net.forward.guest_dial_window` | duration | 3s | 10ms to 10m | time | Time that a published TCP port waits for the guest to listen before it closes the host client. |
+| `net.forward.guest_dial_interval` | duration | 15ms | 1ms to 10s | time | Pause between two attempts of a published TCP port to reach the guest listener. |
+| `net.forward.max_port_range` | int | 1024 | 1 to 65535 | ports | Largest number of ports in one range of a publish specification, such as 30000-32767. |
+| `net.wg.queue_length` | int | 512 | 1 to 1048576 | packets | Number of packets that the eth0 queue holds in the wg network mode. |
+| `net.wg.resolve_timeout` | duration | 10s | 100ms to 10m | time | Time that the sandbox waits to resolve the host name of the WireGuard peer endpoint. |
+| `memory.guard.poll_interval` | duration | 5ms | 1ms to 10s | time | Time between two readings of the guest memory use when the sandbox has a memory limit. |
+| `memory.guard.host_poll_interval` | duration | 100ms | 1ms to 10s | time | Time between two readings of the guest memory use when the limit is the RAM of the host. |
+| `memory.cgroup.poll_interval` | duration | 5ms | 1ms to 10s | time | Shortest time between two checks of memory.max while a cgroup uses half of its limit. |
+| `memory.cgroup.idle_poll_interval` | duration | 25ms | 1ms to 10s | time | Time between two checks of memory.max while every limited cgroup uses less than half of its limit. |
+| `memory.cgroup.scan_ratio` | int | 4 | 1 to 1000 | ratio | The checks of memory.max use at most one over this number of a CPU. |
+| `oci.max_json_bytes` | size | 8MiB | 64KiB to 1GiB | bytes | Largest index, manifest, or config body that a pull accepts. |
+| `oci.max_blob_bytes` | size | 32GiB | 1MiB to 1TiB | bytes | Largest compressed layer that a pull accepts. |
+| `oci.max_layer_bytes` | size | 64GiB | 1MiB to 1TiB | bytes | Largest decompressed tar stream of one layer. |
+| `oci.max_image_bytes` | size | 128GiB | 1MiB to 1TiB | bytes | Largest sum of the decompressed layers of one image. |
+| `oci.max_entry_bytes` | size | 32GiB | 1KiB to 1TiB | bytes | Largest regular file in a layer. |
+| `oci.max_entries` | int | 2000000 | 1 to 1099511627776 | entries | Largest number of tar entries in one layer. |
+| `oci.max_archive_entries` | int | 1000000 | 1 to 1099511627776 | entries | Largest number of members in an image archive. |
+| `oci.max_zstd_window_bytes` | size | 128MiB | 1MiB to 16GiB | bytes | Largest zstd window that a layer may ask for; the decoder allocates this much memory. |
+| `oci.registry_idle_timeout` | duration | 1m | 1s to 24h | time | Time that a registry request may go without data before the pull fails. |
+<!-- tuning:end -->
+
+The key `net.nat.mtu` sets the first MTU of `eth0` in the `nat` network mode. In the `wg` network mode, `eth0` starts with the `MTU` key of the `[Interface]` section of the WireGuard file, which is 1420 by default. Each link type accepts its own range of MTU values, and a value outside the range fails with `EINVAL`, as on Linux. A caller needs `CAP_NET_ADMIN`. Each end of a veth pair has its own MTU.
+
+A link with an MTU below 1280 has no IPv6, as on Linux. The link loses its IPv6 addresses and routes. It accepts no new IPv6 address while the MTU stays below 1280. When the MTU returns to 1280 or more, the link accepts IPv6 addresses again.
+
+| Link | MTU range |
+| :--- | :--- |
+| `eth0` in the `nat` network mode | 68 to 65535 |
+| `eth0` in the `wg` network mode on Linux and macOS | 68 to 65503 |
+| `eth0` in the `wg` network mode on Windows | 68 to 1984 |
+| A veth link or a bridge that the guest creates | 68 to 65535 |
+| `lo` | The link accepts a request and keeps 65536. Linux changes the value. |
+
+To change the MTU of a link in the guest:
+
+1. Run `ip link set dev eth0 mtu 1400`. Both `ip` of iproute2 and `ip` of busybox work.
+2. Run `ifconfig eth0 mtu 1400` when the guest has only the busybox `ifconfig`.
+3. Read the value in `/sys/class/net/eth0/mtu` or with `ip link show dev eth0`.
+
+Software in the guest derives the MTU of its tunnels from `eth0`. `flannel` uses the MTU of `eth0` minus 50 for `vxlan` and minus 80 for WireGuard. The NAT relay sends datagrams of every size that the MTU allows. On macOS, the relay raises the send buffer of its host UDP sockets. The default `net.inet.udp.maxdgram` of 9216 bytes would refuse a larger datagram.
 
 ## 4. Rules of `run`
 
@@ -142,11 +215,11 @@ A volume with the `ext4lite` driver needs no lockdown rule for a host path. The 
 
 ### 4.5 Resource limits
 
-`--memory` sets a limit on the memory use of the guest. A guard reads the memory accounting of the Sentry and kills the guest with SIGKILL when the use passes the limit. The exit code is 137, and `rungv` prints a message. The guard reads the use at short intervals, so a guest can pass the limit by the amount that it allocates between two readings. Without `--memory`, the limit is the physical RAM of the host, and the guard reads the use every 100 ms.
+`--memory` sets a limit on the memory use of the guest. A guard reads the memory accounting of the Sentry and kills the guest with SIGKILL when the use passes the limit. The exit code is 137, and `rungv` prints a message. The guard reads the use at short intervals, so a guest can pass the limit by the amount that it allocates between two readings. Without `--memory`, the limit is the physical RAM of the host, and the guard reads the use every 100 ms. The keys `memory.guard.poll_interval` and `memory.guard.host_poll_interval` set the two intervals.
 
 The guest kernel takes its memory size from the physical RAM of the host, as runsc does. `MemTotal` in `/proc/meminfo` and `totalram` of `sysinfo(2)` equal `--memory` when it is below that RAM, and that RAM otherwise. A tmpfs mount without a size option, such as `/dev/shm`, gets half of the host RAM, as on Linux, also with `--memory`. A guest mount with `size=N%` gets N percent of the host RAM. The tmpfs that holds the writes to the root file system has no size limit of its own. The memory guard limits it.
 
-A program in the guest can also limit a cgroup with `memory.max`, as `docker run -m` does in `docker:dind`. The Sentry checks each cgroup with a finite limit every 5 ms or more while it uses half of its limit, and every 25 ms otherwise. It compares the anonymous memory plus the tmpfs data of the subtree with the limit. When the use passes the limit, the Sentry ends the process with the highest score with SIGKILL, but never the init process of the guest or a process with `oom_score_adj` of -1000. With `memory.oom.group` set, it ends every other process of the subtree. The Windows `systrap` engine does not enforce the limit. The counters `oom` and `oom_kill` in `memory.events` grow, and the file reports a change through `inotify`. A process can pass the limit by what it allocates between two checks, and a process that frees its memory before the next check is not found. The limits `memory.high`, `cpu.max`, and `cpu.weight` are accepted and stored, but nothing enforces them. [`docker-engine.md`](docker-engine.md), section 6.4, lists the details.
+A program in the guest can also limit a cgroup with `memory.max`, as `docker run -m` does in `docker:dind`. The Sentry checks each cgroup with a finite limit every 5 ms or more while it uses half of its limit, and every 25 ms otherwise. The keys `memory.cgroup.poll_interval` and `memory.cgroup.idle_poll_interval` set these times. It compares the anonymous memory plus the tmpfs data of the subtree with the limit. When the use passes the limit, the Sentry ends the process with the highest score with SIGKILL, but never the init process of the guest or a process with `oom_score_adj` of -1000. With `memory.oom.group` set, it ends every other process of the subtree. The Windows `systrap` engine does not enforce the limit. The counters `oom` and `oom_kill` in `memory.events` grow, and the file reports a change through `inotify`. A process can pass the limit by what it allocates between two checks, and a process that frees its memory before the next check is not found. The limits `memory.high`, `cpu.max`, and `cpu.weight` are accepted and stored, but nothing enforces them. [`docker-engine.md`](docker-engine.md), section 6.4, lists the details.
 
 `--cpus` sets the number of CPUs that the guest sees, rounded up. Windows also caps the CPU time of the host process with a hard cap on the containment job. The other host OSes have no such cap, and `rungv` prints a warning. On Windows with `-platform=systrap`, the guest runs in stub processes that the cap does not cover.
 

@@ -59,10 +59,15 @@ type channelTUN struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// events never receives a value. wireguard-go ranges over it, so Close
+	// events carries the MTU events. wireguard-go ranges over it, so Close
 	// must close it to stop the event goroutine.
 	events    chan tun.Event
 	closeOnce sync.Once
+
+	// mu orders notifyMTU and Close, so that notifyMTU never sends on the
+	// closed events channel.
+	mu     sync.Mutex
+	closed bool
 }
 
 var _ tun.Device = (*channelTUN)(nil)
@@ -73,7 +78,21 @@ func newChannelTUN(ep *channel.Endpoint) *channelTUN {
 		ep:     ep,
 		ctx:    ctx,
 		cancel: cancel,
-		events: make(chan tun.Event),
+		events: make(chan tun.Event, 1),
+	}
+}
+
+// notifyMTU queues one MTU event, so that wireguard-go reads the new MTU. A
+// queued event already covers a second change.
+func (t *channelTUN) notifyMTU() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	select {
+	case t.events <- tun.EventMTUUpdate:
+	default:
 	}
 }
 
@@ -86,7 +105,7 @@ func (t *channelTUN) Name() (string, error) { return wgTUNName, nil }
 // MTU returns the current MTU of the channel endpoint.
 func (t *channelTUN) MTU() (int, error) { return int(t.ep.MTU()), nil }
 
-// Events returns a channel that stays empty until Close closes it.
+// Events returns the channel of MTU events. Close closes it.
 func (t *channelTUN) Events() <-chan tun.Event { return t.events }
 
 // BatchSize returns the largest packet count of one Read or Write call.
@@ -194,7 +213,10 @@ func ipPacketProtocol(packet []byte) (tcpip.NetworkProtocolNumber, error) {
 func (t *channelTUN) Close() error {
 	t.closeOnce.Do(func() {
 		t.cancel()
+		t.mu.Lock()
+		t.closed = true
 		close(t.events)
+		t.mu.Unlock()
 	})
 	return nil
 }

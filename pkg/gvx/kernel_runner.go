@@ -35,6 +35,7 @@ import (
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
@@ -984,7 +985,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		RootPIDNamespace:     kernel.NewRootPIDNamespace(creds.UserNamespace),
 		MaxFDLimit:           kernel.MaxFdLimit,
-		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
+		Cgroup2FSInit: cgroup2fs.NewFilesystemWithMemoryOptions(cgroup2fs.MemoryEnforcerOptions{
+			PollInterval:     s.cfg.Tuning.Duration(tuning.MemoryCgroupPollInterval),
+			IdlePollInterval: s.cfg.Tuning.Duration(tuning.MemoryCgroupIdlePollInterval),
+			ScanRatio:        s.cfg.Tuning.Int(tuning.MemoryCgroupScanRatio),
+		}),
 	}); err != nil {
 		return 1, fmt.Errorf("gvx: init Sentry kernel: %w", err)
 	}
@@ -1174,7 +1179,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}()
 
 	var memoryExceeded atomic.Bool
-	if limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM); limit > 0 {
+	if limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM, s.cfg.Tuning); limit > 0 {
 		guard := memoryGuard{
 			limit: limit,
 			// The accounting counts a committed page only after a scan of the

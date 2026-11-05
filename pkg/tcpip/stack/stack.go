@@ -1242,7 +1242,9 @@ func (s *Stack) SetNICMTU(id tcpip.NICID, mtu uint32) tcpip.Error {
 	if mtu < nic.minMTU || (nic.maxMTU != 0 && mtu > nic.maxMTU) {
 		return &tcpip.ErrInvalidOptionValue{}
 	}
+	oldMTU := nic.NetworkLinkEndpoint.MTU()
 	nic.NetworkLinkEndpoint.SetMTU(mtu)
+	nic.ipv6MTUChanged(oldMTU)
 	return nil
 }
 

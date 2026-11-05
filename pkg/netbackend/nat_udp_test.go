@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -382,8 +383,12 @@ func TestNATUDPSessionCarriesMultipleRepliesAndExpires(t *testing.T) {
 	host := newUDPEndpoint(t)
 	var dialed sync.Once
 	hostSide := make(chan *recordedConn, 1)
+	tuned, err := tuning.Values{}.WithDuration(tuning.UDPIdleTimeout, 300*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, nf, err := NewNATStack(NATConfig{
-		UDPIdleTimeout: 300 * time.Millisecond,
+		Tuning: tuned,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 			if err != nil {

@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 )
@@ -47,7 +48,7 @@ func TestParsePortForwardSpecsRangesAndSockets(t *testing.T) {
 		{"unix:~/.gvx/docker.sock:2375/tcp", []PortForwardRule{{Proto: "tcp", GuestIP: DefaultGuestIPv4, GuestPort: 2375, HostSocket: "~/.gvx/docker.sock"}}},
 		{`unix:C:\Users\me\docker.sock:2375`, []PortForwardRule{{Proto: "tcp", GuestIP: DefaultGuestIPv4, GuestPort: 2375, HostSocket: `C:\Users\me\docker.sock`}}},
 	} {
-		got, err := ParsePortForwardSpecs(tc.spec, true, true)
+		got, err := ParsePortForwardSpecs(tc.spec, true, true, tuning.Values{})
 		if err != nil || !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("ParsePortForwardSpecs(%q) = (%+v, %v), want %+v", tc.spec, got, err, tc.want)
 		}
@@ -58,12 +59,12 @@ func TestParsePortForwardSpecsRangesAndSockets(t *testing.T) {
 		"8000-8002:9000-9001",     // ranges of different lengths
 		"8002-8000:8002-8000",     // descending range
 		"0-1:0-1",                 // port zero
-		"1-2000",                  // longer than maxPortRange
+		"1-2000",                  // longer than net.forward.max_port_range
 		"unix:/tmp/x.sock",        // no guest port
 		"unix:/tmp/x.sock:53/udp", // Unix sockets forward tcp only
 		"unix::2375",              // empty path
 	} {
-		if got, err := ParsePortForwardSpecs(spec, true, true); err == nil {
+		if got, err := ParsePortForwardSpecs(spec, true, true, tuning.Values{}); err == nil {
 			t.Errorf("ParsePortForwardSpecs(%q) = %+v, want an error", spec, got)
 		}
 	}
@@ -92,7 +93,7 @@ func TestPortForwarderUnixSocketForwardsToGuestTCP(t *testing.T) {
 	stale.(*net.UnixListener).SetUnlinkOnClose(false)
 	_ = stale.Close()
 
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	t.Cleanup(func() { _ = pf.Close() })
 	if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", GuestPort: 2375, HostSocket: sock}}); err != nil {
 		t.Fatalf("PreBind over a stale socket: %v", err)
@@ -123,7 +124,7 @@ func TestPortForwarderUnixSocketRefusesARegularFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	defer pf.Close()
 	if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", GuestPort: 2375, HostSocket: path}}); err == nil {
 		t.Fatal("PreBind replaced a regular file with a socket")

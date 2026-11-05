@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -462,8 +463,27 @@ func TestDNSRelayStopsWaitingWhenContextEnds(t *testing.T) {
 		if dnsRCode(resp) != dnsRCodeSrv {
 			t.Fatalf("rcode = %d, want SERVFAIL after cancellation", dnsRCode(resp))
 		}
-	case <-time.After(dnsUpstreamTimeout / 2):
+	case <-time.After(tuning.Values{}.Duration(tuning.DNSUpstreamTimeout) / 2):
 		t.Fatal("relay kept waiting for the upstream after the context ended")
+	}
+}
+
+func TestDNSUpstreamTimeoutComesFromTheTunable(t *testing.T) {
+	silent := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
+	tuned, err := tuning.Values{}.WithDuration(tuning.DNSUpstreamTimeout, 150*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nf := newTestForwarder(t, NATConfig{Tuning: tuned}, silent.addr)
+	start := time.Now()
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(1, "slow.test", dnsTypeA))
+	if dnsRCode(resp) != dnsRCodeSrv {
+		t.Fatalf("rcode = %d, want SERVFAIL after the timeout", dnsRCode(resp))
+	}
+	// One exchange over UDP, with the same timeout, ends in SERVFAIL. The default of 2 s
+	// would take more than 10 times as long.
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("the relay waited %v with a 150 ms upstream timeout", took)
 	}
 }
 

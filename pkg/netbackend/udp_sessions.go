@@ -19,12 +19,6 @@ import (
 	"sync"
 )
 
-// defaultMaxUDPSessions is the largest count of NAT UDP sessions that live at
-// once when NATConfig sets no limit. A session holds one host socket and one
-// goroutine for each direction. Each direction also holds one read buffer of
-// 64 KiB while it runs, so the buffers of a full table take 64 MiB.
-const defaultMaxUDPSessions = 512
-
 // udpSession is one relayed UDP flow of the guest.
 type udpSession struct {
 	guest, host net.Conn
@@ -47,10 +41,10 @@ type udpSessionTable struct {
 	sessions map[*udpSession]struct{}
 }
 
+// newUDPSessionTable returns a table for at most max live sessions. A session
+// holds one host socket and one goroutine for each direction. Each direction
+// also holds one read buffer of 64 KiB while it runs.
 func newUDPSessionTable(max int) *udpSessionTable {
-	if max <= 0 {
-		max = defaultMaxUDPSessions
-	}
 	return &udpSessionTable{max: max, sessions: make(map[*udpSession]struct{})}
 }
 

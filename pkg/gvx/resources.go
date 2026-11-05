@@ -28,10 +28,6 @@ import (
 // uses the same minimum.
 const MinMemoryLimit = 6 << 20
 
-// memoryPollInterval is the time between two readings of the memory use. A guest
-// can pass the limit by what it allocates in one interval before the kill.
-const memoryPollInterval = 5 * time.Millisecond
-
 // ErrMemoryLimit reports that the guest passed its memory limit and that the
 // sandbox killed it.
 var ErrMemoryLimit = errors.New("gvx: the guest passed its memory limit")

@@ -197,6 +197,8 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	fs.Var(&mountFlags, "mount", "Mount with Docker syntax: type=bind|volume|tmpfs,src=...,dst=...,readonly[,driver=ext4lite|hostfs]; a volume src with a path separator names an image file")
 	fs.Var(&tmpfsFlags, "tmpfs", "Mount a tmpfs: /path[:size=64m,ro]")
 
+	tuneFlag := addTuneFlags(fs)
+
 	var portSpecs multiStringFlag
 	alias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
@@ -238,9 +240,14 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		return usageError("specify -image=<image>, -bin=<elf>, or a positional target")
 	}
 
+	tuned, err := tuneFlag.values()
+	if err != nil {
+		return usageError("%v", err)
+	}
+
 	var portForwards []gvx.PortForward
 	for _, spec := range portSpecs {
-		pfs, err := gvx.ParsePortForwards(spec)
+		pfs, err := gvx.ParsePortForwardsWith(spec, tuned)
 		if err != nil {
 			return usageError("%v", err)
 		}
@@ -356,6 +363,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		Hostname:               strings.TrimSpace(hostnameFlag),
 		Name:                   strings.TrimSpace(*nameFlag),
 		Resources:              resources,
+		Tuning:                 tuned,
 		Stdin:                  stdin,
 		Stdout:                 stdout,
 		Stderr:                 stderr,

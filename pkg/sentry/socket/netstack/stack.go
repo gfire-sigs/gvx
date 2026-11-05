@@ -30,8 +30,6 @@ import (
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
-	"z.gfire.dev/gvx/pkg/tcpip/link/ethernet"
-	"z.gfire.dev/gvx/pkg/tcpip/link/packetsocket"
 	"z.gfire.dev/gvx/pkg/tcpip/link/veth"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
@@ -527,9 +525,11 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	if ifname == "" {
 		ifname = s.allocDeviceName("veth", dstNs)
 	}
-	err := s.Stack.CreateNICWithOptions(id, newHostFilterEndpoint(packetsocket.New(ethernet.New(ep))), stack.NICOptions{
-		Name: ifname,
-		Kind: "veth",
+	err := s.Stack.CreateNICWithOptions(id, newVethNICEndpoint(ep), stack.NICOptions{
+		Name:   ifname,
+		Kind:   "veth",
+		MinMTU: ethernetMinMTU,
+		MaxMTU: ethernetMaxMTU,
 	})
 	if err != nil {
 		s.unlockSrcAndDst(ctx, dstNs)
@@ -554,9 +554,11 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 		peerName = peerStack.allocDeviceName("veth", peerDstNs)
 	}
 
-	err = peerStack.Stack.CreateNICWithOptions(peerID, newHostFilterEndpoint(packetsocket.New(ethernet.New(peerEP))), stack.NICOptions{
-		Name: peerName,
-		Kind: "veth",
+	err = peerStack.Stack.CreateNICWithOptions(peerID, newVethNICEndpoint(peerEP), stack.NICOptions{
+		Name:   peerName,
+		Kind:   "veth",
+		MinMTU: ethernetMinMTU,
+		MaxMTU: ethernetMaxMTU,
 	})
 	if err != nil {
 		peerEP.Close()
@@ -591,8 +593,10 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 	ep := stack.NewBridgeEndpoint(defaultMTU)
 	id := s.Stack.NextNICID()
 	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
-		Name: ifname,
-		Kind: "bridge",
+		Name:   ifname,
+		Kind:   "bridge",
+		MinMTU: ethernetMinMTU,
+		MaxMTU: ethernetMaxMTU,
 	})
 	if err != nil {
 		return syserr.TranslateNetstackError(err)

@@ -36,8 +36,15 @@
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
-//	nodeprobe natmtu                 check the MTU of eth0 and of the tunnels on it
-//	                                 in a sandbox with the NAT network
+//	nodeprobe natmtu [MTU]           check the MTU of eth0 and of the tunnels on it
+//	                                 in a sandbox with the NAT network; MTU is
+//	                                 the expected MTU of eth0, 1500 by default
+//	nodeprobe mtuset HOST:PORT       change the MTU of eth0 and of a veth link
+//	                                 with netlink and with SIOCSIFMTU, check the
+//	                                 range, the capability, the MTU of each veth
+//	                                 end, and IPv6 below 1280, and move data
+//	                                 through the NAT after a change; HOST:PORT is
+//	                                 a throughput server
 //	nodeprobe tput HOST:PORT MIB     measure the TCP download and upload rate of
 //	                                 MIB MiB against a server at HOST:PORT
 //	nodeprobe stats HOST:PORT        check link and disk statistics; the probe
@@ -98,7 +105,21 @@ func main() {
 	case "vxlan":
 		checks = vxlanChecks()
 	case "natmtu":
-		checks = natMTUChecks()
+		want := natEthernetMTU
+		if len(os.Args) == 3 {
+			var err error
+			if want, err = strconv.Atoi(os.Args[2]); err != nil {
+				fmt.Fprintln(os.Stderr, "natmtu: MTU must be a number")
+				os.Exit(2)
+			}
+		}
+		checks = natMTUChecks(want)
+	case "mtuset":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe mtuset HOST:PORT")
+			os.Exit(2)
+		}
+		checks = mtuSetChecks(os.Args[2])
 	case "tput":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe tput HOST:PORT MIB")

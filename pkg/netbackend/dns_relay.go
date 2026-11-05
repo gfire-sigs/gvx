@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -54,11 +55,7 @@ const (
 	dnsRCodeNX    = 3
 	dnsRCodeRefus = 5
 
-	defaultDNSTTL     = 60
-	defaultDNSTimeout = 4 * time.Second
-
-	// dnsUpstreamTimeout is the time that one exchange with one upstream server may take.
-	dnsUpstreamTimeout = 2 * time.Second
+	defaultDNSTTL = 60
 
 	// maxDNSMessage is the largest DNS message that a UDP or TCP exchange carries.
 	maxDNSMessage = 65535
@@ -75,6 +72,7 @@ type dnsQuestion struct {
 }
 
 func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
+	timeout := nf.cfg.Tuning.Duration(tuning.DNSTimeout)
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -82,14 +80,14 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 
 	buf := make([]byte, 4096)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(defaultDNSTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buf)
 		if err != nil {
 			return
 		}
 		resp := nf.handleDNSQuery(ctx, buf[:n])
 		if len(resp) > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(defaultDNSTimeout))
+			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 			if _, err := conn.Write(resp); err != nil {
 				nf.log.Debug("netbackend: write DNS response to guest", "error", err)
 			}
@@ -98,10 +96,10 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 }
 
 func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
-	serveTCPDNSConn(ctx, conn, nf.handleDNSQuery)
+	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), nf.handleDNSQuery)
 }
 
-func serveTCPDNSConn(ctx context.Context, conn net.Conn, handle func(context.Context, []byte) []byte) {
+func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, handle func(context.Context, []byte) []byte) {
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -111,7 +109,7 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, handle func(context.Con
 	}()
 	var lenBuf [2]byte
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(defaultDNSTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
 			return
 		}
@@ -130,7 +128,7 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, handle func(context.Con
 		out := make([]byte, 2+len(resp))
 		binary.BigEndian.PutUint16(out[0:2], uint16(len(resp)))
 		copy(out[2:], resp)
-		_ = conn.SetWriteDeadline(time.Now().Add(defaultDNSTimeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 		if _, err := conn.Write(out); err != nil {
 			return
 		}
@@ -145,6 +143,7 @@ type dnsRelay struct {
 	servers    []string
 	dials      []func(ctx context.Context, network, addr string) (net.Conn, error)
 	log        *slog.Logger
+	tune       tuning.Values
 }
 
 func (nf *NATForwarder) dnsRelay() dnsRelay {
@@ -157,6 +156,7 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		servers:    nf.upstreamDNS,
 		dials:      []func(context.Context, string, string) (net.Conn, error){d.DialContext},
 		log:        nf.log,
+		tune:       nf.cfg.Tuning,
 	}
 }
 
@@ -183,6 +183,7 @@ func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
 		servers:    w.upstreamDNS,
 		dials:      dials,
 		log:        log,
+		tune:       w.cfg.Tuning,
 	}
 }
 
@@ -265,7 +266,7 @@ func (r dnsRelay) lookupLocalAddrs(ctx context.Context, qname string) (addrs []n
 	if r.lookupHost == nil {
 		return nil, false, false, nil
 	}
-	rctx, cancel := context.WithTimeout(ctx, defaultDNSTimeout)
+	rctx, cancel := context.WithTimeout(ctx, r.tune.Duration(tuning.DNSTimeout))
 	defer cancel()
 
 	addrs, err = r.lookupHost(rctx, clean)
@@ -289,9 +290,9 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req)
+			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, r.tune.Duration(tuning.DNSUpstreamTimeout))
 			if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
-				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req)
+				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, r.tune.Duration(tuning.DNSUpstreamTimeout))
 			}
 			if err != nil {
 				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
@@ -308,8 +309,8 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
-func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, dnsUpstreamTimeout)
+func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	conn, err := dial(ctx, network, server)
 	if err != nil {
@@ -449,7 +450,7 @@ func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn
 			defer w.dnsWG.Done()
 			resp := w.dnsRelay(log).handleQuery(ctx, pkt)
 			if len(resp) > 0 {
-				_ = conn.SetWriteDeadline(time.Now().Add(defaultDNSTimeout))
+				_ = conn.SetWriteDeadline(time.Now().Add(w.cfg.Tuning.Duration(tuning.DNSTimeout)))
 				_, _ = conn.WriteTo(resp, peer)
 			}
 		}(req, addr)
@@ -470,7 +471,7 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 		w.dnsWG.Add(1)
 		go func(c net.Conn) {
 			defer w.dnsWG.Done()
-			serveTCPDNSConn(ctx, c, w.dnsRelay(log).handleQuery)
+			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), w.dnsRelay(log).handleQuery)
 		}(conn)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"runtime"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/netbackend"
 )
 
@@ -100,7 +101,13 @@ func ParsePortForward(spec string) (PortForward, error) {
 // ranges must have the same length. "unix:PATH:GUEST" forwards a host Unix
 // socket to a guest TCP port.
 func ParsePortForwards(spec string) ([]PortForward, error) {
-	rules, err := netbackend.ParsePortForwardSpecs(spec, true, true)
+	return ParsePortForwardsWith(spec, tuning.Values{})
+}
+
+// ParsePortForwardsWith is ParsePortForwards with the tunables of a Config. The
+// tunable net.forward.max_port_range sets the longest range.
+func ParsePortForwardsWith(spec string, t tuning.Values) ([]PortForward, error) {
+	rules, err := netbackend.ParsePortForwardSpecs(spec, true, true, t)
 	if err != nil {
 		return nil, fmt.Errorf("gvx: %w", err)
 	}
@@ -254,6 +261,13 @@ type Config struct {
 
 	// Resources limits the memory and the CPU of the guest.
 	Resources Resources
+
+	// Tuning sets the host-side limits and time values that Linux has no knob
+	// for, such as the MTU of eth0 at the start (net.nat.mtu) and the number of
+	// NAT UDP sessions (net.nat.udp_sessions). The zero value selects the
+	// defaults. Build a value with tuning.Parse, tuning.ParseJSON, or the Set
+	// and With methods of tuning.Values. The package tuning lists every key.
+	Tuning tuning.Values
 
 	// PublishAll publishes every port that the image declares with EXPOSE to a
 	// free port of 127.0.0.1. It needs the nat network mode and an image.

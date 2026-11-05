@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/fd"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/oci"
 )
@@ -39,7 +40,37 @@ import (
 // multiple of its page size. Callers that pull or run images through gvx must
 // use this constructor so that both sides agree on the format.
 func NewLayerCache(dir string) (*oci.LayerCache, error) {
-	return oci.NewLayerCacheWithOptions(dir, oci.CacheOptions{BlockSize: hostarch.PageSize})
+	return NewLayerCacheWithTuning(dir, tuning.Values{})
+}
+
+// NewLayerCacheWithTuning is NewLayerCache with the oci.* tunables of t. They
+// set the size budgets that a pull and a layer compilation obey.
+func NewLayerCacheWithTuning(dir string, t tuning.Values) (*oci.LayerCache, error) {
+	cache, err := oci.NewLayerCacheWithOptions(dir, oci.CacheOptions{BlockSize: hostarch.PageSize})
+	if err != nil {
+		return nil, err
+	}
+	if err := cache.SetLimits(limitsFromTuning(t)); err != nil {
+		return nil, err
+	}
+	return cache, nil
+}
+
+// limitsFromTuning returns the size budgets that the oci.* tunables of t set.
+// pkg/oci does not import the registry, so its DefaultLimits repeat the
+// defaults, and a test keeps both equal.
+func limitsFromTuning(t tuning.Values) oci.Limits {
+	return oci.Limits{
+		MaxJSONBytes:        t.Size(tuning.OCIMaxJSONBytes),
+		MaxBlobBytes:        t.Size(tuning.OCIMaxBlobBytes),
+		MaxLayerBytes:       t.Size(tuning.OCIMaxLayerBytes),
+		MaxImageBytes:       t.Size(tuning.OCIMaxImageBytes),
+		MaxEntryBytes:       t.Size(tuning.OCIMaxEntryBytes),
+		MaxEntries:          int64(t.Int(tuning.OCIMaxEntries)),
+		MaxArchiveEntries:   int64(t.Int(tuning.OCIMaxArchiveEntries)),
+		MaxZstdWindowBytes:  uint64(t.Size(tuning.OCIMaxZstdWindowBytes)),
+		RegistryIdleTimeout: t.Duration(tuning.OCIRegistryIdleTimeout),
+	}
 }
 
 // elfMachine maps a Linux architecture name to its ELF e_machine value.
@@ -102,7 +133,7 @@ func elfLayerTar(elfData []byte) ([]byte, error) {
 // reopens the same path, and the SameFile check rejects a path swapped
 // between the two opens.
 func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
-	cache, err := NewLayerCache(s.cfg.OCICacheDir)
+	cache, err := NewLayerCacheWithTuning(s.cfg.OCICacheDir, s.cfg.Tuning)
 	if err != nil {
 		return err
 	}

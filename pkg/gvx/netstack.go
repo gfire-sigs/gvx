@@ -56,6 +56,7 @@ func (s *Sandbox) initNetstack() error {
 			IsolateLAN:        s.cfg.IsolateLAN,
 			StreamInterceptor: s.cfg.StreamInterceptor,
 			Stack:             s.stackOptions(),
+			Tuning:            s.cfg.Tuning,
 		})
 		if err != nil {
 			return err
@@ -65,7 +66,7 @@ func (s *Sandbox) initNetstack() error {
 
 		s.forwards = s.effectivePortForwards()
 		if len(s.forwards) > 0 {
-			pf := netbackend.NewPortForwarder()
+			pf := netbackend.NewPortForwarder(s.cfg.Tuning)
 			rules := make([]netbackend.PortForwardRule, 0, len(s.forwards))
 			for _, pfSpec := range s.forwards {
 				hostIP := pfSpec.BindAddress
@@ -129,6 +130,7 @@ func (s *Sandbox) initNetstack() error {
 		}
 		wgConfig := *wgCfg
 		wgConfig.Stack = s.stackOptions()
+		wgConfig.Tuning = s.cfg.Tuning
 		wgEP, err := netbackend.NewWireGuardEndpoint(wgConfig)
 		if err != nil {
 			return err

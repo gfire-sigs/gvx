@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/device"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -47,10 +48,8 @@ const (
 	// The wildcard address lets remote peers reach the socket.
 	DefaultWireGuardListenAddr = ":0"
 
-	wgChannelQueueSize = 512
 	wgMinMTU           = 576
 	wgMinMTUWithIPv6   = header.IPv6MinimumMTU
-	wgEndpointTimeout  = 10 * time.Second
 	wgMaxKeepaliveSecs = 1<<16 - 1
 )
 
@@ -76,7 +75,9 @@ type WireGuardConfig struct {
 	// PersistentKeepalive is the keepalive interval in whole seconds. Zero
 	// disables it. A non-zero value also starts the handshake at Start.
 	PersistentKeepalive time.Duration
-	// MTU is the L3 MTU of eth0. The default is DefaultWireGuardMTU.
+	// MTU is the L3 MTU of eth0 at the start. It is the MTU key of the
+	// [Interface] section of wg-quick. The default is DefaultWireGuardMTU. The
+	// guest can change it with "ip link set dev eth0 mtu N".
 	MTU uint32
 	// ListenUDPAddr is the address of the pre-bound UDP socket. The default
 	// is DefaultWireGuardListenAddr.
@@ -93,6 +94,10 @@ type WireGuardConfig struct {
 	Logger *slog.Logger
 	// Stack selects the optional features of the guest network stack.
 	Stack StackOptions
+	// Tuning sets the packet queue of eth0 and the time limits of the DNS
+	// relay and of the lookup of the peer endpoint. The zero value selects the
+	// defaults of the registry.
+	Tuning tuning.Values
 }
 
 // WireGuardEndpoint attaches a Netstack channel.Endpoint (MTU 1420) to the
@@ -151,7 +156,7 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 		upstreamDNS = discoverHostDNSServers()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), wgEndpointTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Tuning.Duration(tuning.WGResolveTimeout))
 	defer cancel()
 	peerEndpoint, err := resolveWireGuardPeerEndpoint(ctx, cfg.PeerEndpoint, net.DefaultResolver.LookupNetIP)
 	if err != nil {
@@ -270,6 +275,7 @@ func (w *WireGuardEndpoint) preBindLocked() error {
 	if err != nil {
 		return fmt.Errorf("netbackend: bind WireGuard UDP socket %q: %w", w.cfg.ListenUDPAddr, err)
 	}
+	widenUDPSend(pc)
 	w.udpConn = pc
 	return nil
 }
@@ -298,17 +304,19 @@ func (w *WireGuardEndpoint) Start() (*stack.Stack, error) {
 		return w.stack, nil
 	}
 
-	s, chEP, err := w.newStackLocked()
+	s, tn, err := w.newStackLocked()
 	if err != nil {
 		return nil, err
 	}
+	chEP := tn.ep
 	bind, err := newPreboundBind(w.udpConn)
 	if err != nil {
 		s.Close()
 		chEP.Close()
+		_ = tn.Close()
 		return nil, err
 	}
-	dev := device.NewDevice(newChannelTUN(chEP), bind, newWireGuardLogger(w.cfg.Logger))
+	dev := device.NewDevice(tn, bind, newWireGuardLogger(w.cfg.Logger))
 	if err := dev.IpcSet(wireGuardIPCConfig(w.cfg, w.peerEndpoint)); err != nil {
 		dev.Close()
 		s.Close()
@@ -379,6 +387,16 @@ func (w *WireGuardEndpoint) startDNSRelayLocked(s *stack.Stack) error {
 type wgLinkEndpoint struct {
 	*channel.Endpoint
 	dnsAddr tcpip.Address
+	// tun is the device that reads the packets of the endpoint. SetMTU tells
+	// it about a new MTU.
+	tun *channelTUN
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU. It tells wireguard-go about the
+// new MTU, which sets the padding limit of the encrypted packets.
+func (e *wgLinkEndpoint) SetMTU(mtu uint32) {
+	e.Endpoint.SetMTU(mtu)
+	e.tun.notifyMTU()
 }
 
 func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
@@ -412,24 +430,26 @@ func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.E
 	return n + looped, err
 }
 
-func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, error) {
+func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channelTUN, error) {
 	s, err := NewLoopbackStack(w.cfg.Stack)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	chEP := channel.New(wgChannelQueueSize, w.cfg.MTU, "")
-	fail := func(err error) (*stack.Stack, *channel.Endpoint, error) {
+	chEP := channel.New(w.cfg.Tuning.Int(tuning.WGQueueLength), w.cfg.MTU, "")
+	tn := newChannelTUN(chEP)
+	fail := func(err error) (*stack.Stack, *channelTUN, error) {
 		s.Close()
 		chEP.Close()
+		_ = tn.Close()
 		return nil, nil, err
 	}
 	dnsAddr := netip.MustParseAddr(HostDNSIPv4)
-	linkEP := &wgLinkEndpoint{Endpoint: chEP}
+	linkEP := &wgLinkEndpoint{Endpoint: chEP, tun: tn}
 	if w.cfg.GuestIPv4.Addr() != dnsAddr {
 		linkEP.dnsAddr = tcpip.AddrFrom4(dnsAddr.As4())
 	}
-	if err := createNamedNIC(s, Eth0NICID, Eth0NICName, linkEP); err != nil {
+	if err := createNamedNICWithMTURange(s, Eth0NICID, Eth0NICName, linkEP, header.IPv4MinimumMTU, device.MaxContentSize); err != nil {
 		return fail(err)
 	}
 	v4 := tcpip.ProtocolAddress{
@@ -472,7 +492,7 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channel.Endpoint, e
 		routes = append(routes, tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: Eth0NICID})
 	}
 	s.SetRouteTable(routes)
-	return s, chEP, nil
+	return s, tn, nil
 }
 
 // wireGuardIPCConfig renders cfg in the wireguard-go UAPI "set" format.
