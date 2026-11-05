@@ -185,3 +185,6 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |
 | MTU | `eth0` has the MTU 1500 at the start, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. Set `--tune net.nat.mtu=N` to start with another value. A node can change it later with `ip link set dev eth0 mtu N` from 68 to 65535, and `flannel` follows the new value at the next start. |
+| WireGuard policy routing | The guest has no `ip rule` and no routing table besides the main one. `wg-quick up` with `AllowedIPs = 0.0.0.0/0` fails at `ip route add ... table`. Set `Table = off` and add the routes with `ip route`. The mark of the link (`fwmark`) reaches iptables, but it cannot choose a table. |
+| WireGuard reply address | A `wireguard` link answers from the address that the route picks, and not from the address that the peer used. The two differ on an interface with several addresses. |
+| WireGuard link-local endpoints | An IPv6 endpoint loses its `sin6_scope_id`. Use a global address. |
