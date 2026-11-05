@@ -19,11 +19,13 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
-// deliverForwardedLocally delivers a packet to the transport layer when its
-// destination address belongs to another NIC of the stack. Linux does the same
-// for a packet that arrives on one interface for an address of another
-// interface: the packet stays on the interface where it arrived, and the route
-// table picks the interface of the reply.
+// deliverForOtherNIC delivers a packet to the transport layer when its
+// destination address belongs to another NIC of the stack. Linux uses the weak
+// host model: a packet for any local address is local, whatever the interface
+// where it arrives. It passes PREROUTING and INPUT, but not FORWARD, and it
+// needs no forwarding, no TTL left, and no IP option update. The packet stays
+// on the interface where it arrived, and the route table picks the interface
+// of the reply.
 //
 // The NIC of the packet stays the receiving NIC. The owner of the address is
 // not a good choice. Several NICs can own the address, for example the
@@ -34,7 +36,7 @@ import (
 // owner is a NIC that owns the destination address. It tells whether the
 // destination is a broadcast address, and it checks the source address, as
 // handleValidatedPacket does for a packet that arrives on the owner.
-func (e *endpoint) deliverForwardedLocally(owner *endpoint, h header.IPv4, pkt *stack.PacketBuffer) {
+func (e *endpoint) deliverForOtherNIC(owner *endpoint, h header.IPv4, pkt *stack.PacketBuffer) {
 	srcAddr := h.SourceAddress()
 	dstAddr := h.DestinationAddress()
 	if addressEndpoint := owner.AcquireAssignedAddress(srcAddr, false /* allowTemp */, stack.NeverPrimaryEndpoint, true /* readOnly */); addressEndpoint != nil {

@@ -175,6 +175,10 @@ seam pkg/tcpip/stack/conntrack.go
 # packet to a local address of another NIC lives in pkg/tcpip/network/ipv4/local_delivery_xplat.go
 # (the seam in pkg/tcpip/network/ipv4/ipv4.go).
 seam pkg/tcpip/stack/stack.go
+# Content seam: a weak host reply route may leave through another NIC than the NIC of its local
+# address without forwarding, as in Linux. The seam is the field Route.weakHost and one condition
+# in isValidForOutgoingRLocked; route_xplat.go sets the field.
+seam pkg/tcpip/stack/route.go
 # A NIC with MTU bounds loses IPv6 below an MTU of 1280, as in Linux
 # (pkg/tcpip/stack/nic_mtu_xplat.go). The seams are one call in SetNICMTU (stack.go), one test
 # in enable, and one in addAddress (nic.go).

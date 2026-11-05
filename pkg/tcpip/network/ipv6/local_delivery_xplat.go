@@ -15,14 +15,26 @@
 package ipv6
 
 import (
+	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
-// deliverForwardedLocally delivers a packet to the transport layer when its
-// destination address belongs to another NIC of the stack. Linux keeps such a
-// packet on the interface where it arrived, and the route table picks the
-// interface of the reply.
+// ownerOfOtherNICAddress returns the endpoint of another NIC that owns addr,
+// or nil. Linux delivers a packet for a global address of any interface
+// locally, but a link-local address belongs to its own link only.
+func (e *endpoint) ownerOfOtherNICAddress(addr tcpip.Address) *endpoint {
+	if header.IsV6LinkLocalUnicastAddress(addr) {
+		return nil
+	}
+	return e.protocol.findEndpointWithAddress(addr)
+}
+
+// deliverForOtherNIC delivers a packet to the transport layer when its
+// destination address belongs to another NIC of the stack. Linux treats such a
+// packet as local: it passes PREROUTING and INPUT, but not FORWARD, and it
+// needs no forwarding and no hop limit left. The packet stays on the interface
+// where it arrived, and the route table picks the interface of the reply.
 //
 // The NIC of the packet stays the receiving NIC. Several NICs can own the
 // address, for example the loopback NIC with a temporary address, and the
@@ -30,6 +42,6 @@ import (
 // NIC that owned the address instead of the route to the peer. The receiving
 // NIC already counted the packet and checked its source address, and IPv6 has
 // no broadcast address, so the owner adds no check.
-func (e *endpoint) deliverForwardedLocally(h header.IPv6, pkt *stack.PacketBuffer) {
+func (e *endpoint) deliverForOtherNIC(h header.IPv6, pkt *stack.PacketBuffer) {
 	e.deliverPacketLocally(h, pkt, e.nic.Name())
 }

@@ -209,17 +209,19 @@ func TestSynOnSecondNICAnswersThroughTheRouteTable(t *testing.T) {
 	}
 }
 
-// TestForwardedSynIsNotAnsweredWithoutForwarding checks that the change keeps
-// the old limit of the stack: without forwarding, a packet for an address of
-// another NIC is not delivered.
-func TestForwardedSynIsNotAnsweredWithoutForwarding(t *testing.T) {
+// TestSynForAnotherNICIsAnsweredWithoutForwarding checks the weak host model
+// of Linux: a packet for an address of another NIC is local, so the stack
+// answers it also when forwarding is off.
+func TestSynForAnotherNICIsAnsweredWithoutForwarding(t *testing.T) {
 	n := newNode(t, false, false)
 	n.bridge.InjectInbound(ipv4.ProtocolNumber, synPacket(nodePodAddr, nodeEthAddr, 40000, nodePort))
-	if pkt := readWithin(n.bridge, 500*time.Millisecond); pkt != nil {
-		t.Fatalf("the stack answered through the bridge without forwarding")
+	pkt := readWithin(n.bridge, 5*time.Second)
+	if pkt == nil {
+		t.Fatalf("the stack did not answer through the bridge without forwarding; eth0 sent %d packets", n.eth.Drain())
 	}
+	pkt.DecRef()
 	if got := n.eth.Drain(); got != 0 {
-		t.Errorf("eth0 sent %d packets without forwarding, want 0", got)
+		t.Errorf("eth0 sent %d packets, want 0", got)
 	}
 }
 
@@ -247,4 +249,31 @@ func synPacket(src, dst tcpip.Address, srcPort, dstPort uint16) *stack.PacketBuf
 	xsum := header.PseudoHeaderChecksum(tcp.ProtocolNumber, src, dst, header.TCPMinimumSize)
 	th.SetChecksum(^th.CalculateChecksum(xsum))
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(b)})
+}
+
+// TestPinnedRouteDoesNotLeaveThroughAnotherNICWithoutForwarding checks the
+// SO_BINDTODEVICE case: a lookup pinned to eth1 with the address of eth0 and a
+// remote that only eth0 reaches fails without forwarding, as in Linux.
+func TestPinnedRouteDoesNotLeaveThroughAnotherNICWithoutForwarding(t *testing.T) {
+	n := newNode(t, false, true)
+	sender := tcpip.AddrFrom4([4]byte{8, 8, 8, 8})
+	r, err := n.s.FindRoute(nodeEth1ID, nodeEthAddr, sender, ipv4.ProtocolNumber, false)
+	if err == nil {
+		defer r.Release()
+		t.Fatalf("FindRoute(eth1, %s, %s) = route through NIC %d, want an error", nodeEthAddr, sender, r.OutgoingNIC())
+	}
+}
+
+// TestPacketForAddressOfDisabledNICIsNotLocal checks that an address of a NIC
+// that is down is not local, as Linux removes its local route.
+func TestPacketForAddressOfDisabledNICIsNotLocal(t *testing.T) {
+	n := newNode(t, false, false)
+	if err := n.s.DisableNIC(nodeEthID); err != nil {
+		t.Fatalf("DisableNIC: %v", err)
+	}
+	n.bridge.InjectInbound(ipv4.ProtocolNumber, synPacket(nodePodAddr, nodeEthAddr, 40000, nodePort))
+	if pkt := readWithin(n.bridge, 500*time.Millisecond); pkt != nil {
+		pkt.DecRef()
+		t.Fatalf("the stack answered a SYN for the address of a disabled NIC")
+	}
 }
