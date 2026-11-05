@@ -51,6 +51,7 @@ func runMemcgChecks() bool {
 		{"memcg-over-limit-kills-largest-task-only", checkMemcgKillsLargestOnly},
 		{"memcg-oom-group-kills-every-task", checkMemcgOOMGroup},
 		{"memcg-kill-counts-in-cgroup-of-victim", checkMemcgKillCountsInVictimCgroup},
+		{"memcg-oom-group-of-child-kills-its-tasks", checkMemcgOOMGroupOfChild},
 	}
 	// The sandbox does not enable controllers for the children of the root
 	// cgroup. The init script of docker:dind does it, and so does this write.
@@ -526,6 +527,56 @@ func checkMemcgKillCountsInVictimCgroup() error {
 		if n, err := controlValueIn(want.dir, "memory.events", want.key); err != nil || n != want.n {
 			return fmt.Errorf("%s memory.events %s = %d, %v; want %d", want.dir, want.key, n, err, want.n)
 		}
+	}
+	return nil
+}
+
+// checkMemcgOOMGroupOfChild passes the limit of a parent cgroup with two hogs
+// in a child cgroup that has memory.oom.group set, as the kubelet sets it for
+// a container. Linux ends every process of the child and counts the group
+// kill in the child.
+func checkMemcgOOMGroupOfChild() error {
+	if err := limitAbove(2, 24*mib); err != nil {
+		return err
+	}
+	child := memcgDir + "/group"
+	if err := writeControl("cgroup.subtree_control", "+memory"); err != nil {
+		return err
+	}
+	if err := os.Mkdir(child, 0o755); err != nil {
+		return err
+	}
+	defer os.Remove(child)
+	if err := os.WriteFile(child+"/memory.oom.group", []byte("1"), 0o644); err != nil {
+		return err
+	}
+	first, err := startHogIn(child, 8*mib, true)
+	if err != nil {
+		return err
+	}
+	defer first.stop()
+	if err := first.waitAllocated(); err != nil {
+		return err
+	}
+	second, err := startHogIn(child, 40*mib, true)
+	if err != nil {
+		return err
+	}
+	defer second.stop()
+	for name, h := range map[string]*hog{"smaller": first, "larger": second} {
+		killed, err := h.waitKilled()
+		if err != nil {
+			return fmt.Errorf("%s hog: %w", name, err)
+		}
+		if !killed {
+			return fmt.Errorf("the %s hog did not end with SIGKILL", name)
+		}
+	}
+	if n, err := controlValueIn(child, "memory.events", "oom_group_kill"); err != nil || n != 1 {
+		return fmt.Errorf("%s memory.events oom_group_kill = %d, %v; want 1", child, n, err)
+	}
+	if n, err := controlValueIn(child, "memory.events", "oom_kill"); err != nil || n != 2 {
+		return fmt.Errorf("%s memory.events oom_kill = %d, %v; want 2", child, n, err)
 	}
 	return nil
 }

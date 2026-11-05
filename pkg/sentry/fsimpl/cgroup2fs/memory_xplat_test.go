@@ -16,6 +16,7 @@ package cgroup2fs
 
 import (
 	"bytes"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -226,5 +227,31 @@ func TestOOMKillCountsInTheCgroupOfTheVictim(t *testing.T) {
 		if got := tc.m.oom.oomGroupKill.Load(); got != tc.groupOOM {
 			t.Errorf("%s oom_group_kill = %d, want %d", tc.name, got, tc.groupOOM)
 		}
+	}
+}
+
+func TestOOMGroupIsTheHighestGroupBelowTheLimitedCgroup(t *testing.T) {
+	root := &memory{}
+	pod := &memory{parent: root}
+	ctrA := &memory{parent: pod}
+	ctrB := &memory{parent: pod}
+	nested := &memory{parent: ctrA}
+	ctrA.oomGroup.Store(true)
+	nested.oomGroup.Store(true)
+	root.oomGroup.Store(true)
+
+	if got := oomGroupOf(nested, pod); got != ctrA {
+		t.Errorf("oomGroupOf(nested, pod) = %p, want the container %p", got, ctrA)
+	}
+	if got := oomGroupOf(ctrB, pod); got != nil {
+		t.Errorf("oomGroupOf(ctrB, pod) = %p, want nil: a group above the limited cgroup does not count", got)
+	}
+	candidates := []oomCandidate{{id: 1, mem: nested}, {id: 2, mem: ctrA}, {id: 3, mem: ctrB}}
+	var ids []kernel.ThreadID
+	for _, c := range oomGroupMembers(candidates, ctrA) {
+		ids = append(ids, c.id)
+	}
+	if !slices.Equal(ids, []kernel.ThreadID{1, 2}) {
+		t.Errorf("members of the container group = %v, want [1 2]", ids)
 	}
 }
