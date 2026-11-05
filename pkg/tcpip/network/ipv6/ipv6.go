@@ -1148,28 +1148,6 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 
 	dstAddr := h.DestinationAddress()
 
-	// Check if the destination is owned by the stack.
-	if ep := e.protocol.findEndpointWithAddress(dstAddr); ep != nil {
-		inNicName := stk.FindNICNameFromID(e.nic.ID())
-		outNicName := stk.FindNICNameFromID(ep.nic.ID())
-		if ok := stk.IPTables().CheckForward(pkt, inNicName, outNicName); !ok {
-			// iptables is telling us to drop the packet.
-			e.stats.ip.IPTablesForwardDropped.Increment()
-			return nil
-		}
-
-		if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
-
-			if !nft.CheckForward(pkt, nil, stack.IP6) {
-				// nftables is telling us to drop the packet.
-				return nil
-			}
-		}
-
-		e.deliverForwardedLocally(h, pkt)
-		return nil
-	}
-
 	// Check extension headers for any errors requiring action during forwarding.
 	if err := e.processExtensionHeaders(h, pkt, true /* forwarding */); err != nil {
 		return &ip.ErrParameterProblem{}
@@ -1561,6 +1539,8 @@ func (e *endpoint) handleValidatedPacket(h header.IPv6, pkt *stack.PacketBuffer,
 	// packet. Otherwise, attempt to forward the packet.
 	if addressEndpoint := e.AcquireAssignedAddress(dstAddr, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint, true /* readOnly */); addressEndpoint != nil {
 		e.deliverPacketLocally(h, pkt, inNICName)
+	} else if owner := e.ownerOfOtherNICAddress(dstAddr); owner != nil {
+		e.deliverForOtherNIC(h, pkt)
 	} else if e.Forwarding() {
 		e.handleForwardingError(e.forwardUnicastPacket(pkt))
 	} else {

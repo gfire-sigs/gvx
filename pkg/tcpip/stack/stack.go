@@ -1794,18 +1794,24 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 						return r, nil
 					}
 				}
-				if r := s.weakHostRouteRLocked(aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
-					return r, nil
-				}
 			}
-
-			return nil, &tcpip.ErrNetworkUnreachable{}
 		}
 
 		if id == 0 {
 			// If an interface is not specified, try to find a NIC that holds the local
 			// address endpoint to construct a route.
 			if r := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(nic, localAddr, remoteAddr, chosenRoute.SourceHint, gateway, netProto, multicastLoop, chosenRoute.MTU); r != nil {
+				return r, nil
+			}
+		}
+	}
+
+	// A reply to a packet for an address of another NIC pins the NIC where the
+	// packet arrived. Linux uses the weak host model for it with or without
+	// forwarding.
+	if id != 0 {
+		if aNIC, ok := s.nics[id]; ok {
+			if r := s.weakHostRouteRLocked(aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
 				return r, nil
 			}
 		}

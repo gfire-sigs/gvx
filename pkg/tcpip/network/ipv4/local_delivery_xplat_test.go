@@ -209,17 +209,19 @@ func TestSynOnSecondNICAnswersThroughTheRouteTable(t *testing.T) {
 	}
 }
 
-// TestForwardedSynIsNotAnsweredWithoutForwarding checks that the change keeps
-// the old limit of the stack: without forwarding, a packet for an address of
-// another NIC is not delivered.
-func TestForwardedSynIsNotAnsweredWithoutForwarding(t *testing.T) {
+// TestSynForAnotherNICIsAnsweredWithoutForwarding checks the weak host model
+// of Linux: a packet for an address of another NIC is local, so the stack
+// answers it also when forwarding is off.
+func TestSynForAnotherNICIsAnsweredWithoutForwarding(t *testing.T) {
 	n := newNode(t, false, false)
 	n.bridge.InjectInbound(ipv4.ProtocolNumber, synPacket(nodePodAddr, nodeEthAddr, 40000, nodePort))
-	if pkt := readWithin(n.bridge, 500*time.Millisecond); pkt != nil {
-		t.Fatalf("the stack answered through the bridge without forwarding")
+	pkt := readWithin(n.bridge, 5*time.Second)
+	if pkt == nil {
+		t.Fatalf("the stack did not answer through the bridge without forwarding; eth0 sent %d packets", n.eth.Drain())
 	}
+	pkt.DecRef()
 	if got := n.eth.Drain(); got != 0 {
-		t.Errorf("eth0 sent %d packets without forwarding, want 0", got)
+		t.Errorf("eth0 sent %d packets, want 0", got)
 	}
 }
 

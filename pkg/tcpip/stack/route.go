@@ -59,6 +59,11 @@ type Route struct {
 	// If mtu is 0, this field is ignored and the MTU of the outgoing NIC
 	// is used for egress packets.
 	mtu uint32
+
+	// weakHost is set for a reply route of the weak host model (route_xplat.go).
+	// Such a route may leave through another NIC than the NIC of its local
+	// address also without forwarding, as in Linux.
+	weakHost bool
 }
 
 // +stateify savable
@@ -494,7 +499,7 @@ func (r *Route) isValidForOutgoingRLocked() bool {
 
 	// If the source NIC and outgoing NIC are different, make sure the stack has
 	// forwarding enabled, or the packet will be handled locally.
-	if r.outgoingNIC != r.localAddressNIC && !isNICForwarding(r.localAddressNIC, r.NetProto()) && (!r.outgoingNIC.stack.handleLocal || !r.outgoingNIC.hasAddress(r.NetProto(), r.RemoteAddress())) {
+	if r.outgoingNIC != r.localAddressNIC && !r.weakHost && !isNICForwarding(r.localAddressNIC, r.NetProto()) && (!r.outgoingNIC.stack.handleLocal || !r.outgoingNIC.hasAddress(r.NetProto(), r.RemoteAddress())) {
 		return false
 	}
 

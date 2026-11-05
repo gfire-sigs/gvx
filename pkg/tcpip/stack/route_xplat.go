@@ -76,5 +76,9 @@ func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Ad
 	if !ok {
 		return nil
 	}
-	return s.findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoing, localAddr, remoteAddr, r.SourceHint, r.Gateway, netProto, multicastLoop, r.MTU)
+	route := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoing, localAddr, remoteAddr, r.SourceHint, r.Gateway, netProto, multicastLoop, r.MTU)
+	if route != nil {
+		route.weakHost = true
+	}
+	return route
 }
