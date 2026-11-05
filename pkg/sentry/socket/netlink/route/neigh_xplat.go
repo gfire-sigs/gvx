@@ -153,7 +153,7 @@ func (p *Protocol) processNeigh(_ context.Context, s *netlink.Socket, msg *nlmsg
 	switch hdr.Type {
 	case linux.RTM_GETNEIGH:
 		if hdr.Flags&(linux.NLM_F_DUMP|linux.NLM_F_ROOT) != 0 {
-			return dumpNeigh(st, nd, attrs, ms)
+			return dumpNeigh(s, st, nd, attrs)
 		}
 		return getNeigh(st, nd, attrs, ms)
 	case linux.RTM_NEWNEIGH:
@@ -313,9 +313,10 @@ func getNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, ms
 
 // dumpNeigh lists the neighbor entries of the links, or the FDB entries of the
 // vxlan links for the family AF_BRIDGE. A request with an interface index lists
-// only that link. A family without a table lists nothing.
-func dumpNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, ms *nlmsg.MessageSet) *syserr.Error {
-	ms.Multi = true
+// only that link. A family without a table lists nothing. The socket sends the
+// answer in chunks (see neighDump), because a table has no size limit.
+func dumpNeigh(s *netlink.Socket, st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	var items []func(*nlmsg.MessageSet)
 	only := tcpip.NICID(nd.ifindex)
 	if v, ok := attrs[ndaIfindex]; ok {
 		if idx, ok := v.Uint32(); ok {
@@ -343,7 +344,7 @@ func dumpNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, m
 	for _, id := range ids {
 		if nd.family == afBridge {
 			if ep := st.VxlanLink(id); ep != nil {
-				putFDB(ms, id, ep)
+				items = appendFDBItems(items, id, ep)
 			}
 			continue
 		}
@@ -359,11 +360,11 @@ func dumpNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, m
 			}
 			slices.SortFunc(entries, func(a, b stack.NeighborEntry) int { return slices.Compare(a.Addr.AsSlice(), b.Addr.AsSlice()) })
 			for _, e := range entries {
-				putNeigh(ms, family, id, e)
+				items = append(items, func(ms *nlmsg.MessageSet) { putNeigh(ms, family, id, e) })
 			}
 		}
 	}
-	return nil
+	return s.StartDump(&neighDump{items: items})
 }
 
 // fdbRequest is a parsed FDB request.
@@ -471,9 +472,10 @@ func delFDB(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView) *sys
 	return nil
 }
 
-// putFDB appends one RTM_NEWNEIGH message of the family AF_BRIDGE for each
-// remote of each entry of the link. An entry with no remote gets one message.
-func putFDB(ms *nlmsg.MessageSet, id tcpip.NICID, ep *vxlan.Endpoint) {
+// appendFDBItems appends one dump item for each remote of each entry of the
+// link. An entry with no remote gets one item. Each item adds one
+// RTM_NEWNEIGH message of the family AF_BRIDGE.
+func appendFDBItems(items []func(*nlmsg.MessageSet), id tcpip.NICID, ep *vxlan.Endpoint) []func(*nlmsg.MessageSet) {
 	cfg := ep.Config()
 	for _, e := range ep.FDB() {
 		remotes := e.Remotes
@@ -481,23 +483,26 @@ func putFDB(ms *nlmsg.MessageSet, id tcpip.NICID, ep *vxlan.Endpoint) {
 			remotes = []vxlan.Remote{{}}
 		}
 		for _, r := range remotes {
-			m := ms.AddMessage(linux.NetlinkMessageHeader{Type: linux.RTM_NEWNEIGH})
-			m.Put(primitive.AsByteSlice(ndmsg{family: afBridge, ifindex: int32(id), state: e.State, flags: e.Flags | ntfSelf, typ: rtnUnicast}.bytes()))
-			m.PutAttr(ndaLLAddr, primitive.AsByteSlice([]byte(e.MAC)))
-			if r.IP.Len() != 0 && !r.IP.Unspecified() {
-				m.PutAttr(ndaDst, primitive.AsByteSlice(r.IP.AsSlice()))
-			}
-			if r.IP.Len() != 0 && r.Port != cfg.Port {
-				m.PutAttr(ndaPort, primitive.AsByteSlice(binary.BigEndian.AppendUint16(nil, r.Port)))
-			}
-			if r.IP.Len() != 0 && r.VNI != cfg.VNI {
-				m.PutAttr(ndaVNI, primitive.AllocateUint32(r.VNI))
-			}
-			if r.Link != 0 {
-				m.PutAttr(ndaIfindex, primitive.AllocateUint32(uint32(r.Link)))
-			}
+			items = append(items, func(ms *nlmsg.MessageSet) {
+				m := ms.AddMessage(linux.NetlinkMessageHeader{Type: linux.RTM_NEWNEIGH})
+				m.Put(primitive.AsByteSlice(ndmsg{family: afBridge, ifindex: int32(id), state: e.State, flags: e.Flags | ntfSelf, typ: rtnUnicast}.bytes()))
+				m.PutAttr(ndaLLAddr, primitive.AsByteSlice([]byte(e.MAC)))
+				if r.IP.Len() != 0 && !r.IP.Unspecified() {
+					m.PutAttr(ndaDst, primitive.AsByteSlice(r.IP.AsSlice()))
+				}
+				if r.IP.Len() != 0 && r.Port != cfg.Port {
+					m.PutAttr(ndaPort, primitive.AsByteSlice(binary.BigEndian.AppendUint16(nil, r.Port)))
+				}
+				if r.IP.Len() != 0 && r.VNI != cfg.VNI {
+					m.PutAttr(ndaVNI, primitive.AllocateUint32(r.VNI))
+				}
+				if r.Link != 0 {
+					m.PutAttr(ndaIfindex, primitive.AllocateUint32(uint32(r.Link)))
+				}
+			})
 		}
 	}
+	return items
 }
 
 // putLinkInfoData appends IFLA_INFO_DATA for the links whose kind has one. The
