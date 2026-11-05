@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **IPv6 replies of a node that forwards packets**: an IPv6 packet for a local address of another NIC went to a random owner of the address, as IPv4 packets did before v0.8.10012026110200. A SYN-ACK to a pod could then leave through the default route instead of the bridge, and the pod got no answer. The stack now delivers such a packet on the NIC where it arrived, and the reply follows the route table, as in Linux.
+
 ## [v0.8.10012026110200] - 2026-11-05
 
 ### Bug Fixes
