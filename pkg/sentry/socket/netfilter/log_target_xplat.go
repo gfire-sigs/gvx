@@ -244,9 +244,30 @@ func dumpIPv6(b *strings.Builder, pkt *stack.PacketBuffer) {
 		return
 	}
 	class, label := hdr.TOS()
-	fmt.Fprintf(b, "SRC=%s DST=%s LEN=%d TC=0x%02X HOPLIMIT=%d FLOWLBL=%d ",
-		hdr.SourceAddress(), hdr.DestinationAddress(), int(hdr.PayloadLength())+header.IPv6MinimumSize, class, hdr.HopLimit(), label)
-	dumpTransport(b, pkt, hdr.TransportProtocol(), false, true)
+	fmt.Fprintf(b, "SRC=%s DST=%s LEN=%d TC=%d HOPLIMIT=%d FLOWLBL=%d ",
+		fullIPv6(hdr.SourceAddress()), fullIPv6(hdr.DestinationAddress()), int(hdr.PayloadLength())+header.IPv6MinimumSize, class, hdr.HopLimit(), label)
+	// The next header of the fixed header can name an extension header. The
+	// network layer parsed the extension headers, and it set the protocol of
+	// the transport header.
+	proto := pkt.TransportProtocolNumber
+	if proto == 0 {
+		proto = hdr.TransportProtocol()
+	}
+	dumpTransport(b, pkt, proto, false, true)
+}
+
+// fullIPv6 formats an address as %pI6 of Linux does: eight groups of four
+// lower-case hex digits, without the compression of "::".
+func fullIPv6(a tcpip.Address) string {
+	raw := a.AsSlice()
+	var b strings.Builder
+	for i := 0; i+1 < len(raw); i += 2 {
+		if i > 0 {
+			b.WriteByte(':')
+		}
+		fmt.Fprintf(&b, "%02x%02x", raw[i], raw[i+1])
+	}
+	return b.String()
 }
 
 // dumpTransport writes PROTO= and the fields of the transport header. A
@@ -307,10 +328,19 @@ func (t *logTarget) Action(pkt *stack.PacketBuffer, hook stack.Hook, r *stack.Ro
 // ActionOnInterfaces implements stack.InterfaceTarget.ActionOnInterfaces. It
 // writes the log line and has no other side effect.
 func (t *logTarget) ActionOnInterfaces(pkt *stack.PacketBuffer, _ stack.Hook, _ *stack.Route, _ stack.AddressableEndpoint, in, out string) (stack.RuleVerdict, int) {
+	// Format the line only for a reader: the kernel log, or the debug log of
+	// the Sentry. A rule of a stack without a log function and without debug
+	// logging costs a packet nothing.
+	debug := log.IsLogging(log.Debug)
+	if t.log == nil && !debug {
+		return stack.RuleContinue, 0
+	}
 	line := t.line(pkt, in, out)
 	if t.log != nil {
 		t.log(t.level(), line)
 	}
-	log.Debugf("netfilter LOG: %s", line)
+	if debug {
+		log.Debugf("netfilter LOG: %s", line)
+	}
 	return stack.RuleContinue, 0
 }

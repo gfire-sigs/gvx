@@ -29,6 +29,7 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -968,7 +969,8 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		inetStack.SetUnprivilegedPortStart(0)
 		// Linux logs the LOG target of iptables only in the initial network
 		// namespace, which is the root namespace of the guest.
-		netfilter.SetStackLog(inetStack.Stack, func(level int, line string) { k.KernelLog().Printk(level, line) })
+		netfilter.SetStackLog(inetStack.Stack, kernelLogFunc(k))
+		defer netfilter.SetStackLog(inetStack.Stack, nil)
 		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
 	}
 
@@ -1654,4 +1656,18 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 
 func makeFPath(p string) fspath.Path {
 	return fspath.Parse(p)
+}
+
+// kernelLogFunc returns the log function of the LOG rules of the root network
+// stack. The function holds the kernel weakly. The registry of the log
+// functions is global and the network stack, its key, is reachable from the
+// kernel. A strong reference from the registry would keep the kernel and the
+// stack alive for the life of the process.
+func kernelLogFunc(k *kernel.Kernel) netfilter.LogFunc {
+	weakKernel := weak.Make(k)
+	return func(level int, line string) {
+		if live := weakKernel.Value(); live != nil {
+			live.KernelLog().Printk(level, line)
+		}
+	}
 }
