@@ -160,7 +160,7 @@ The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and 
 | C2 | A WireGuard mesh `wg0` between the guests, set up with `ip` and `wg`. `k3s` uses the `wg0` addresses with `--flannel-iface wg0` and `--egress-selector-mode disabled` | The C1 checks pass, and the API server connects to the kubelet of the agent directly over `wg0`. |
 | C3 | A `gvx` agent joins a server that runs natively on a Linux host | The C1 checks pass. |
 | C4 | Three servers with embedded `etcd` over the WireGuard mesh, joined one at a time | The cluster keeps working when the `etcd` leader stops. A surviving server accepts a write within 30 seconds. The tests measured 5 to 9 seconds. |
-| C5 | `sonobuoy` with the `e2e` plugin | The quick mode passes. The `[sig-network] Services` tests pass. |
+| C5 | `sonobuoy` with the `e2e` plugin | The quick mode passes. The 21 `[sig-network] Services` tests pass in most runs. On `hvf`, 2 of 4 runs had 1 or 2 failed tests. Section 4.3 describes the failure. |
 
 ### 4.3 Known Limits
 
@@ -173,4 +173,5 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |
+| New connections from pods | Sometimes new connections that a pod starts time out for 30 to 120 seconds, while established connections and connections from the host work. The `[sig-network] Services` tests then fail at random. The cause is under investigation. |
 | MTU | `eth0` has the MTU 1500, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. |
