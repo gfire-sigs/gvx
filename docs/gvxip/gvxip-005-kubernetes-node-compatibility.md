@@ -18,7 +18,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 | P1 | Kernel interfaces of `kubelet` and the container runtime | Done. A1 to A7 and B1, B2, B7, B8, and B11 pass on every platform of section 4.4. |
 | P2 | Service data path (`statistic`, `recent`, bridge netfilter, `ctnetlink`) | Done. A8 to A11 and B3 to B6 pass on every platform of section 4.4. |
 | P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Done. A12, A13, C1, C2, and C3 pass on every platform of section 4.4. |
-| P4 | Enforcement of `cpu.max` | Done. A14, B9, B10, and C4 pass on every platform of section 4.4. C5 passes in most runs. Sometimes new connections from pods time out, and 1 or 2 Services tests fail. The cause is under investigation. |
+| P4 | Enforcement of `cpu.max` | Done. A14, B9, B10, C4, and C5 pass on every platform of section 4.4. |
 
 ---
 

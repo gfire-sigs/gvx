@@ -921,8 +921,7 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 			}
 		}
 
-		// The packet originally arrived on e so provide its NIC as the input NIC.
-		ep.handleValidatedPacket(h, pkt, e.nic.Name() /* inNICName */)
+		e.deliverForwardedLocally(h, pkt)
 		return nil
 	}
 
