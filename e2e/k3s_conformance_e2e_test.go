@@ -56,9 +56,25 @@ t1=$(date +%s)
 if [ -n "$E2E_FOCUS" ]; then set -- "--e2e-focus=$E2E_FOCUS"; else set --; fi
 sonobuoy run $SONOBUOY_ARGS "$@" --kubernetes-version=v1.31.4 --wait=45 --wait-output=Progress >/tmp/sonobuoy.log 2>&1 &
 run=$!
+# When the progress stays the same for five minutes, the script prints the state
+# of the cluster and the tail of the log of the e2e plugin, once for each five
+# minutes, so a stalled run shows which test it waits in.
+stall() {
+  echo STALL-BEGIN
+  sonobuoy status --json 2>&1 | cut -c1-1500
+  k -n sonobuoy get pods -o wide 2>&1
+  k -n sonobuoy logs -l sonobuoy-plugin=e2e --tail=8 2>&1 | cut -c1-400
+  k get pods -A -o wide 2>&1 | grep -v ' Running '
+  echo STALL-END
+}
+last=""; same=0
 while kill -0 "$run" 2>/dev/null; do
   sleep 30
-  log "SONOBUOY-PROGRESS $(tail -n 1 /tmp/sonobuoy.log | tr '\r' '\n' | tail -n 1)"
+  now=$(tail -n 1 /tmp/sonobuoy.log | tr '\r' '\n' | tail -n 1)
+  log "SONOBUOY-PROGRESS $now"
+  if [ "$now" = "$last" ]; then same=$((same+1)); else same=0; fi
+  last=$now
+  if [ "$same" -gt 0 ] && [ $((same % 10)) -eq 0 ]; then stall; fi
 done
 wait "$run"
 log "SONOBUOY-RUN-EXIT $? $(( $(date +%s) - t1 ))"
