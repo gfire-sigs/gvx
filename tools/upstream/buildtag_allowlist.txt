@@ -165,7 +165,9 @@ seam pkg/tcpip/network/ipv6/ipv6.go
 seam pkg/sentry/socket/netlink/netfilter/protocol.go
 # A netlink dump sends one chunk for each datagram that a reader consumes, as Linux does
 # (pkg/sentry/socket/netlink/dump_xplat.go). The seams are the dump field of the socket, one call
-# each in Release, Read, and RecvMsg, and the start of a dump in ProcessMessages.
+# each in Release, Read, and RecvMsg, and the start of a dump in ProcessMessages. ProcessMessages
+# sends no acknowledgement after an error message that a handler wrote itself, as the subsystem
+# IPSET does (pkg/sentry/socket/netlink/netfilter/ipset_xplat.go).
 seam pkg/sentry/socket/netlink/socket.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.

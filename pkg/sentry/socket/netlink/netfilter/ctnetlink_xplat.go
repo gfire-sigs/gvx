@@ -125,6 +125,8 @@ func (p *Protocol) processXplat(ctx context.Context, s *netlink.Socket, msg *nlm
 		return processConntrack(s, msg, ms), true
 	case linux.NFNL_SUBSYS_CTNETLINK_EXP:
 		return processExpect(msg, ms), true
+	case linux.NFNL_SUBSYS_IPSET:
+		return processIPSet(ctx, s, msg, ms), true
 	case linux.NFNL_SUBSYS_NFTABLES, linux.NFNL_SUBSYS_NFT_COMPAT:
 		if nftables.IsNFTablesEnabled() {
 			return nil, false

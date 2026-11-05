@@ -992,8 +992,9 @@ func (s *Socket) ProcessMessages(ctx context.Context, buf []byte) *syserr.Error 
 		dumping, err := s.startDump(ctx, hdr, s.protocol.ProcessMessage(ctx, s, msg, ms))
 		if err != nil {
 			DumpErrorMessage(hdr, ms, err)
-		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK && !ms.Multi && !dumping {
-			// Linux does not ack a dump that started. See
+		} else if hdr.Flags&linux.NLM_F_ACK == linux.NLM_F_ACK && !ms.Multi && !dumping && !ms.ContainsError {
+			// Linux does not ack a dump that started. A handler that wrote its
+			// own error message has answered the request. See
 			// net/netlink/af_netlink.c:netlink_rcv_skb.
 			DumpAckMessage(hdr, ms)
 		}
