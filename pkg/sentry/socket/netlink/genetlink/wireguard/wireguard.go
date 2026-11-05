@@ -32,6 +32,7 @@ import (
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/genetlink"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
 const (
@@ -44,6 +45,14 @@ const (
 
 	// defaultMTU is the MTU of a new link, as in drivers/net/wireguard.
 	defaultMTU = 1420
+
+	// minMTU is ETH_MIN_MTU, the default dev->min_mtu of a Linux device.
+	minMTU = 68
+
+	// maxMTU is dev->max_mtu of wg_setup: INT_MAX rounded down to
+	// MESSAGE_PADDING_MULTIPLE (16), less the overhead of 80 bytes. The overhead is
+	// the 32 bytes of the smallest message, the UDP header, and the IPv6 header.
+	maxMTU = 2147483632 - 80
 )
 
 // Commands of wg_cmd.
@@ -114,6 +123,7 @@ func init() {
 		NamePrefix:       "wg",
 		New:              newLink,
 		AdminState:       true,
+		MTURange:         func(stack.LinkEndpoint) (uint32, uint32) { return minMTU, maxMTU },
 		Flags:            linux.IFF_POINTOPOINT | linux.IFF_NOARP,
 		OperStateUnknown: true,
 		StackEnded:       stackEnded,

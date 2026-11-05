@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
@@ -235,5 +236,91 @@ func TestRemoveRegisteredLinksCallsStackEnded(t *testing.T) {
 	RemoveRegisteredLinks(st)
 	if len(ended) != 1 || ended[0] != st {
 		t.Errorf("StackEnded ran for %v, want the stack that ended", ended)
+	}
+}
+
+// registerAdminKindWithMTU is registerAdminKind with an MTU range, so that a
+// request with a small MTU fails.
+func registerAdminKindWithMTU(t *testing.T, kind string) (*Stack, *adminEndpoint, tcpip.NICID) {
+	t.Helper()
+	ep := &adminEndpoint{Endpoint: channel.New(8, 1420, "")}
+	RegisterLinkKind(kind, LinkKind{
+		NamePrefix: "tm",
+		New:        func(context.Context, *NewLinkRequest) (stack.LinkEndpoint, *syserr.Error) { return ep, nil },
+		AdminState: true,
+		MTURange:   func(stack.LinkEndpoint) (uint32, uint32) { return 68, 1500 },
+	})
+	t.Cleanup(func() { delete(linkKinds, kind) })
+	st := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+	t.Cleanup(func() { st.Close(); st.Wait() })
+	s := NewStack(st, 1)
+	attrs := map[uint16]nlmsg.BytesView{linux.IFLA_IFNAME: nlmsg.BytesView("tm0\x00")}
+	if err := s.newRegisteredLink(context.Background(), kind, false, attrs, map[uint16]nlmsg.BytesView{}); err != nil {
+		t.Fatalf("newRegisteredLink = %v", err)
+	}
+	for id, info := range st.NICInfo() {
+		if info.Name == "tm0" {
+			return s, ep, id
+		}
+	}
+	t.Fatal("the new link is missing")
+	return nil, nil, 0
+}
+
+func TestFlagsComeAfterTheOtherChangesOfARequest(t *testing.T) {
+	s, ep, id := registerAdminKindWithMTU(t, "test-admin-order")
+	mtu := func(v uint32) map[uint16]nlmsg.BytesView {
+		return map[uint16]nlmsg.BytesView{linux.IFLA_MTU: nlmsg.BytesView(hostarch.ByteOrder.AppendUint32(nil, v))}
+	}
+	// "ip link set wg0 mtu 10 up" fails and does not bring the link up.
+	if err := s.setLinkLockedState(context.Background(), id, mtu(10), nil, linkState{up: true, change: true}); err == nil {
+		t.Fatal("a request with MTU 10 succeeded, want an error")
+	}
+	if ep.up != 0 || linuxFlags(infoOf(t, s, id))&linux.IFF_UP != 0 {
+		t.Errorf("the failed request brought the link up (LinkUp ran %d times)", ep.up)
+	}
+	// A valid request changes the MTU and then brings the link up.
+	if err := s.setLinkLockedState(context.Background(), id, mtu(1400), nil, linkState{up: true, change: true}); err != nil {
+		t.Fatalf("request = %v", err)
+	}
+	info := infoOf(t, s, id)
+	if info.MTU != 1400 || linuxFlags(info)&linux.IFF_UP == 0 || ep.up != 1 {
+		t.Errorf("after the request MTU = %d, up calls = %d, flags = %#x, want 1400, 1, and IFF_UP", info.MTU, ep.up, linuxFlags(info))
+	}
+	// A failing request with down keeps the link up.
+	if err := s.setLinkLockedState(context.Background(), id, mtu(10), nil, linkState{up: false, change: true}); err == nil || ep.down != 0 {
+		t.Errorf("a failed request with down = %v and %d LinkDown calls, want an error and none", err, ep.down)
+	}
+}
+
+func TestNewRouteOnADownLinkFailsWithENETDOWN(t *testing.T) {
+	s, _, id := registerAdminKind(t, "test-admin-route")
+	if err := s.checkLinkUp(id); err != syserr.ErrNetworkDown {
+		t.Errorf("checkLinkUp of a link that is down = %v, want ENETDOWN", err)
+	}
+	if err := s.checkLinkUp(0); err != nil {
+		t.Errorf("checkLinkUp without a link = %v, want success", err)
+	}
+	if err := s.setLinkAdminState(context.Background(), id, true); err != nil {
+		t.Fatalf("up = %v", err)
+	}
+	if err := s.checkLinkUp(id); err != nil {
+		t.Errorf("checkLinkUp of a link that is up = %v, want success", err)
+	}
+}
+
+func TestLinkOperStateNameFollowsTheNetlinkState(t *testing.T) {
+	s, _, id := registerAdminKind(t, "test-admin-opername")
+	if got, ok := LinkOperStateName("test-admin-opername", linuxFlags(infoOf(t, s, id))); !ok || got != "down" {
+		t.Errorf("operstate while down = %q, %v, want down", got, ok)
+	}
+	if err := s.setLinkAdminState(context.Background(), id, true); err != nil {
+		t.Fatalf("up = %v", err)
+	}
+	if got, ok := LinkOperStateName("test-admin-opername", linuxFlags(infoOf(t, s, id))); !ok || got != "unknown" {
+		t.Errorf("operstate while up = %q, %v, want unknown", got, ok)
+	}
+	if _, ok := LinkOperStateName("veth", linux.IFF_UP); ok {
+		t.Error("a veth has a rule of its own, want none")
 	}
 }

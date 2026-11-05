@@ -836,3 +836,31 @@ func TestEndpointRoamsToTheSourceOfAnAuthenticatedPacket(t *testing.T) {
 		t.Fatal("no datagram arrived")
 	}
 }
+
+func TestClosedDeviceRefusesRequestsAndChargesNothing(t *testing.T) {
+	old := usage.MemoryAccounting
+	usage.MemoryAccounting = &usage.MemoryLocked{RTMemoryStats: &usage.RTMemoryStats{}}
+	t.Cleanup(func() { usage.MemoryAccounting = old })
+	st := newLoopbackStackOf(t)
+	ep, sysErr := newLink(context.Background(), &netstack.NewLinkRequest{Stack: st, ID: 2, Name: "wg0"})
+	if sysErr != nil {
+		t.Fatalf("newLink = %v", sysErr)
+	}
+	link := ep.(*linkEndpoint)
+	link.Close()
+	if got := usage.MemoryAccounting.Total(); got != 0 {
+		t.Fatalf("accounting after Close = %d, want 0", got)
+	}
+	if err := link.set(t, peerList(peerAttrs(1))); err != syserr.ErrNoDevice {
+		t.Errorf("set on a closed device = %v, want ENODEV", err)
+	}
+	if _, err := link.snapshot(); err != syserr.ErrNoDevice {
+		t.Errorf("dump of a closed device = %v, want ENODEV", err)
+	}
+	if _, ok := link.LinkUp().(*tcpip.ErrUnknownDevice); !ok {
+		t.Error("LinkUp on a closed device succeeded, want an unknown device error")
+	}
+	if got := usage.MemoryAccounting.Total(); got != 0 {
+		t.Errorf("accounting after the refused requests = %d, want 0: a closed device charged memory again", got)
+	}
+}

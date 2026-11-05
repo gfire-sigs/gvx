@@ -105,6 +105,9 @@ func setDevice(ctx context.Context, req *genetlink.Request, _ *genetlink.Reply) 
 func (e *linkEndpoint) applySet(attrs map[uint16]nlmsg.BytesView, canSetSocket bool) *syserr.Error {
 	e.updateMu.Lock()
 	defer e.updateMu.Unlock()
+	if e.closed {
+		return syserr.ErrNoDevice
+	}
 	var flags uint32
 	if v, ok := attrs[deviceAttrFlags]; ok {
 		flags, _ = v.Uint32()

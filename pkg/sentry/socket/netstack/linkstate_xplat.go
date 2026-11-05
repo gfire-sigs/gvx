@@ -93,6 +93,12 @@ func (s *Stack) disableMovedLink(id tcpip.NICID, kind string) {
 	}
 }
 
+// linkState is the administrative state that a request asks for. A request
+// that leaves the state as it is has change false.
+type linkState struct {
+	up, change bool
+}
+
 // requestedUp reports the state that an RTM_NEWLINK request asks for with
 // ifi_flags and ifi_change. The first result is false when the request leaves
 // the state as it is. A request with ifi_change 0 takes the whole of ifi_flags,
@@ -122,6 +128,19 @@ func linuxFlags(ni *stack.NICInfo) uint32 {
 	return flags | k.Flags
 }
 
+// LinkOperStateName returns the content of /sys/class/net/NAME/operstate for
+// an interface of the kind, or false when the kind has no rule of its own.
+func LinkOperStateName(kind string, flags uint32) (string, bool) {
+	st, ok := LinkOperState(kind, flags)
+	if !ok {
+		return "", false
+	}
+	if st == linux.IF_OPER_DOWN {
+		return "down", true
+	}
+	return "unknown", true
+}
+
 // LinkOperState returns the IFLA_OPERSTATE of an interface of the kind with
 // the flags. The second result is false when the kind has no rule of its own,
 // and the caller then derives the state from IFF_UP.
@@ -134,4 +153,20 @@ func LinkOperState(kind string, flags uint32) (uint8, bool) {
 		return linux.IF_OPER_DOWN, true
 	}
 	return linux.IF_OPER_UNKNOWN, true
+}
+
+// checkLinkUp fails with ENETDOWN when a new route names a link that is down,
+// as fib_check_nh and ip6_route_info_create do. A route without a link passes.
+func (s *Stack) checkLinkUp(id tcpip.NICID) *syserr.Error {
+	if id == 0 {
+		return nil
+	}
+	info, ok := s.Stack.SingleNICInfo(id)
+	if !ok {
+		return nil
+	}
+	if linuxFlags(info)&linux.IFF_UP == 0 {
+		return syserr.ErrNetworkDown
+	}
+	return nil
 }

@@ -101,6 +101,9 @@ type linkEndpoint struct {
 	updateMu sync.Mutex
 	// up is true between LinkUp and LinkDown. It is netif_running.
 	up bool
+	// closed is true after Close. A request that finds it answers ENODEV,
+	// because a closed device must not charge memory or open a socket again.
+	closed bool
 	// fwmark is the mark of the sockets, as WGDEVICE_A_FWMARK reports it.
 	fwmark uint32
 	// hasKey and public describe the static identity of the device.
@@ -137,6 +140,7 @@ func (e *linkEndpoint) Close() {
 		e.dev.Close()
 		e.unregister()
 		e.updateMu.Lock()
+		e.closed = true
 		e.releaseMemory()
 		e.updateMu.Unlock()
 	})
@@ -149,6 +153,9 @@ func (e *linkEndpoint) Close() {
 func (e *linkEndpoint) LinkUp() tcpip.Error {
 	e.updateMu.Lock()
 	defer e.updateMu.Unlock()
+	if e.closed {
+		return &tcpip.ErrUnknownDevice{}
+	}
 	if e.up {
 		return nil
 	}

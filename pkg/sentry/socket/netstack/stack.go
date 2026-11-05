@@ -262,12 +262,10 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		return err
 	}
 	defer s.unlockSrcAndDst(ctx, dstNs)
-	if up, change := requestedUp(&ifinfomsg); change {
-		if err := s.setLinkAdminState(ctx, tcpip.NICID(ifinfomsg.Index), up); err != nil {
-			return err
-		}
-	}
-	return s.setLinkLocked(ctx, tcpip.NICID(ifinfomsg.Index), attrs, dstNs)
+	// Linux applies the namespace, the name, the address, and the MTU first and
+	// the flags last, so a request that fails keeps the link as it was.
+	up, change := requestedUp(&ifinfomsg)
+	return s.setLinkLockedState(ctx, tcpip.NICID(ifinfomsg.Index), attrs, dstNs, linkState{up: up, change: change})
 }
 
 // If the linkAttrs map contains IFLA_NET_NS_FD, locks the source and
@@ -350,6 +348,12 @@ func (s *Stack) unlockSrcAndDst(ctx context.Context, ns *inet.Namespace) {
 // precondition: s.linkLock is held. If dstNs is not nil, dstNs.Stack.linkMu is
 // also held.
 func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView, dstNs *inet.Namespace) *syserr.Error {
+	return s.setLinkLockedState(ctx, id, linkAttrs, dstNs, linkState{})
+}
+
+// setLinkLockedState is setLinkLocked with an administrative state that it
+// applies after every other change, as do_setlink does.
+func (s *Stack) setLinkLockedState(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView, dstNs *inet.Namespace, state linkState) *syserr.Error {
 	src := s
 	changed := false
 	nicInfo, ok := src.Stack.SingleNICInfo(id)
@@ -447,6 +451,14 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 		}
 	}
 
+	if state.change {
+		if err := src.setLinkAdminState(ctx, id, state.up); err != nil {
+			if changed {
+				src.sendChangeEvent(ctx, id)
+			}
+			return err
+		}
+	}
 	if changed {
 		src.sendChangeEvent(ctx, id)
 	}
@@ -1224,6 +1236,9 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	localRoute, err := s.localRoute(msg)
 	if err != nil {
+		return err
+	}
+	if err := s.checkLinkUp(localRoute.NIC); err != nil {
 		return err
 	}
 	if err := s.checkGateway(msg, &localRoute); err != nil {

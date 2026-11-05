@@ -50,6 +50,9 @@ func getDevice(_ gvxcontext.Context, req *genetlink.Request) (genetlink.Dumper, 
 func (e *linkEndpoint) snapshot() (*deviceDump, *syserr.Error) {
 	e.updateMu.Lock()
 	defer e.updateMu.Unlock()
+	if e.closed {
+		return nil, syserr.ErrNoDevice
+	}
 	text, err := e.dev.IpcGet()
 	if err != nil {
 		return nil, syserr.ErrIO

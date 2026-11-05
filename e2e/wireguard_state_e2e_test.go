@@ -296,3 +296,38 @@ echo PEERS-AFTER-REMOVE $(wg show wg0 peers | wc -l)
 		})
 	}
 }
+
+// TestE2EWireGuardA12ToolLinkRequests checks the order of a link request and
+// the state files of the link. A request with an invalid MTU and "up" fails and
+// leaves the link down, because Linux applies the flags last. A route through a
+// link that is down fails with ENETDOWN, and works after the up. The files in
+// /sys/class/net report the state "unknown" while the link is up, and an empty
+// address.
+func TestE2EWireGuardA12ToolLinkRequests(t *testing.T) {
+	const script = `
+apk add --no-cache iproute2 >/dev/null
+ip link add wg0 type wireguard
+echo OPER-DOWN $(cat /sys/class/net/wg0/operstate)
+echo ADDRESS-LEN $(wc -c < /sys/class/net/wg0/address)
+if ip link set wg0 mtu 10 up 2>/dev/null; then echo BADMTU-OK; else echo BADMTU-FAILED; fi
+echo FLAGS-AFTER-BADMTU $(ip -o link show wg0 | grep -c '[<,]UP[,>]')
+echo MTU-AFTER-BADMTU $(cat /sys/class/net/wg0/mtu)
+echo ROUTE-DOWN $(ip route add 10.5.0.0/24 dev wg0 2>&1)
+ip link set wg0 mtu 1400 up
+echo OPER-UP $(cat /sys/class/net/wg0/operstate)
+ip route add 10.5.0.0/24 dev wg0 && echo ROUTE-UP-OK
+echo MTU-AFTER-GOOD $(cat /sys/class/net/wg0/mtu)
+`
+	for _, b := range gateBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireFixedAddressBackend(t, b)
+			requireRegistry(t)
+			out := mustRunGuest(t, guestSpec{
+				plat: b.plat, image: "alpine:3.20", argv: []string{"sh", "-c", script}, net: gvx.NetModeNAT, netRaw: true,
+			})
+			requireContains(t, "output", out, "OPER-DOWN down\n", "ADDRESS-LEN 1\n", "BADMTU-FAILED\n",
+				"FLAGS-AFTER-BADMTU 0\n", "MTU-AFTER-BADMTU 1420\n", "Network is down", "OPER-UP unknown\n",
+				"ROUTE-UP-OK\n", "MTU-AFTER-GOOD 1400\n")
+		})
+	}
+}
