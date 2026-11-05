@@ -19,6 +19,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
+	"runtime"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -78,6 +80,152 @@ func rejectLinkMTU(name string, mtu int) error {
 	return nil
 }
 
+// ioctlMTU sends SIOCGIFMTU or SIOCSIFMTU for the link name, as the busybox
+// tools "ifconfig" and "ip" do. The value of a get request is the result.
+func ioctlMTU(req uint, name string, mtu uint32) (uint32, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(fd)
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		return 0, err
+	}
+	if req == unix.SIOCSIFMTU {
+		ifr.SetUint32(mtu)
+	}
+	if err := unix.IoctlIfreq(fd, req, ifr); err != nil {
+		return 0, err
+	}
+	return ifr.Uint32(), nil
+}
+
+// ioctlSetMTU sets the MTU with SIOCSIFMTU and checks it with SIOCGIFMTU,
+// netlink, and sysfs.
+func ioctlSetMTU(name string, mtu int) error {
+	if _, err := ioctlMTU(unix.SIOCSIFMTU, name, uint32(mtu)); err != nil {
+		return fmt.Errorf("SIOCSIFMTU %s %d: %w", name, mtu, err)
+	}
+	got, err := ioctlMTU(unix.SIOCGIFMTU, name, 0)
+	if err != nil || int(got) != mtu {
+		return fmt.Errorf("SIOCGIFMTU %s = %d, %v after SIOCSIFMTU %d", name, got, err, mtu)
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	if link.Attrs().MTU != mtu {
+		return fmt.Errorf("netlink MTU of %s = %d after SIOCSIFMTU %d", name, link.Attrs().MTU, mtu)
+	}
+	if sys, err := sysfsMTU(name); err != nil || sys != mtu {
+		return fmt.Errorf("/sys/class/net/%s/mtu = %d, %v after SIOCSIFMTU %d", name, sys, err, mtu)
+	}
+	return nil
+}
+
+// ioctlRejectsMTU checks that SIOCSIFMTU fails with want and leaves the MTU.
+func ioctlRejectsMTU(name string, mtu uint32, want error) error {
+	before, err := sysfsMTU(name)
+	if err != nil {
+		return err
+	}
+	if _, err := ioctlMTU(unix.SIOCSIFMTU, name, mtu); !errors.Is(err, want) {
+		return fmt.Errorf("SIOCSIFMTU %s %d = %v, want %v", name, int32(mtu), err, want)
+	}
+	if got, err := sysfsMTU(name); err != nil || got != before {
+		return fmt.Errorf("/sys/class/net/%s/mtu = %d, %v after the refused change, want %d", name, got, err, before)
+	}
+	return nil
+}
+
+// ioctlNeedsNetAdmin drops CAP_NET_ADMIN from the effective set of one thread
+// and checks that SIOCSIFMTU fails with EPERM there. The thread never returns
+// to the pool, because it keeps the lower set.
+func ioctlNeedsNetAdmin(name string) error {
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+		var data [2]unix.CapUserData
+		if err := unix.Capget(&hdr, &data[0]); err != nil {
+			done <- fmt.Errorf("capget: %w", err)
+			return
+		}
+		data[0].Effective &^= 1 << unix.CAP_NET_ADMIN
+		if err := unix.Capset(&hdr, &data[0]); err != nil {
+			done <- fmt.Errorf("capset: %w", err)
+			return
+		}
+		done <- ioctlRejectsMTU(name, 1400, unix.EPERM)
+	}()
+	return <-done
+}
+
+// ipv6Addrs returns the IPv6 addresses of a link.
+func ipv6Addrs(link netlink.Link) ([]netlink.Addr, error) {
+	return netlink.AddrList(link, netlink.FAMILY_V6)
+}
+
+// ipv6StopsBelow1280 checks the Linux rule for IPv6 and a low MTU on a link:
+// the IPv6 addresses go, the link accepts no new one, and the link accepts one
+// again when the MTU is 1280. The Sentry makes no link-local address, so the
+// check expects one at 1280 only when the link had one before.
+func ipv6StopsBelow1280(name string) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	if err := setLinkMTU(name, natEthernetMTU); err != nil {
+		return err
+	}
+	global := &netlink.Addr{IPNet: &net.IPNet{IP: net.ParseIP("fd00:1::1"), Mask: net.CIDRMask(64, 128)}}
+	if err := netlink.AddrAdd(link, global); err != nil {
+		return fmt.Errorf("add an IPv6 address at MTU %d: %w", natEthernetMTU, err)
+	}
+	before, err := ipv6Addrs(link)
+	if err != nil {
+		return err
+	}
+	hadLinkLocal := false
+	for _, a := range before {
+		hadLinkLocal = hadLinkLocal || a.IP.IsLinkLocalUnicast()
+	}
+
+	if err := setLinkMTU(name, 1279); err != nil {
+		return err
+	}
+	if left, err := ipv6Addrs(link); err != nil || len(left) != 0 {
+		return fmt.Errorf("IPv6 addresses at MTU 1279 = %v, %v, want none", left, err)
+	}
+	if err := netlink.AddrAdd(link, global); !errors.Is(err, unix.EINVAL) {
+		return fmt.Errorf("add an IPv6 address at MTU 1279 = %v, want EINVAL", err)
+	}
+	v4 := &netlink.Addr{IPNet: &net.IPNet{IP: net.IPv4(10, 77, 0, 1), Mask: net.CIDRMask(24, 32)}}
+	if err := netlink.AddrAdd(link, v4); err != nil {
+		return fmt.Errorf("add an IPv4 address at MTU 1279: %w", err)
+	}
+
+	if err := setLinkMTU(name, 1280); err != nil {
+		return err
+	}
+	after, err := ipv6Addrs(link)
+	if err != nil {
+		return err
+	}
+	gotLinkLocal := false
+	for _, a := range after {
+		gotLinkLocal = gotLinkLocal || a.IP.IsLinkLocalUnicast()
+	}
+	if hadLinkLocal && !gotLinkLocal {
+		return fmt.Errorf("the link-local address did not return at MTU 1280: %v", after)
+	}
+	if err := netlink.AddrAdd(link, global); err != nil {
+		return fmt.Errorf("add an IPv6 address at MTU 1280: %w", err)
+	}
+	return nil
+}
+
 func mtuSetChecks(addr string) []check {
 	transfer := func(mtu int) check {
 		return check{fmt.Sprintf("tcp-transfer-at-mtu-%d", mtu), func() error {
@@ -127,6 +275,56 @@ func mtuSetChecks(addr string) []check {
 			}
 			return setLinkMTU("mtuv0", linuxMinMTU)
 		}},
+		check{"veth-ends-have-their-own-mtu", func() error {
+			// mtuv0 has MTU 68 from the check above, and mtuv1 never changed.
+			for name, want := range map[string]int{"mtuv0": linuxMinMTU, "mtuv1": natEthernetMTU} {
+				if got, err := sysfsMTU(name); err != nil || got != want {
+					return fmt.Errorf("MTU of %s = %d, %v, want %d: the other end changed it", name, got, err, want)
+				}
+			}
+			if err := setLinkMTU("mtuv1", 9000); err != nil {
+				return err
+			}
+			if got, err := sysfsMTU("mtuv0"); err != nil || got != linuxMinMTU {
+				return fmt.Errorf("MTU of mtuv0 = %d, %v after the change of mtuv1, want %d", got, err, linuxMinMTU)
+			}
+			return setLinkMTU("mtuv0", 1400)
+		}},
+		check{"siocsifmtu-sets-eth0-and-siocgifmtu-reads-it", func() error {
+			if err := ioctlSetMTU("eth0", 1400); err != nil {
+				return err
+			}
+			if err := ioctlSetMTU("eth0", linuxMaxMTU); err != nil {
+				return err
+			}
+			return ioctlSetMTU("eth0", natEthernetMTU)
+		}},
+		check{"siocsifmtu-sets-a-veth-end", func() error { return ioctlSetMTU("mtuv1", 1300) }},
+		check{"siocsifmtu-follows-the-linux-range", func() error {
+			for _, bad := range []uint32{linuxMinMTU - 1, linuxMaxMTU + 1, ^uint32(0)} {
+				if err := ioctlRejectsMTU("eth0", bad, unix.EINVAL); err != nil {
+					return err
+				}
+			}
+			if _, err := ioctlMTU(unix.SIOCSIFMTU, "no-such-link", 1400); !errors.Is(err, unix.ENODEV) {
+				return fmt.Errorf("SIOCSIFMTU on a link that does not exist = %v, want ENODEV", err)
+			}
+			return nil
+		}},
+		check{"siocsifmtu-needs-cap-net-admin", func() error { return ioctlNeedsNetAdmin("eth0") }},
+		check{"tcp-transfer-after-siocsifmtu", func() error {
+			if err := ioctlSetMTU("eth0", 1200); err != nil {
+				return err
+			}
+			if _, err := tputDownload(addr, mtuSetMiB); err != nil {
+				return fmt.Errorf("download: %w", err)
+			}
+			if _, err := tputUpload(addr, mtuSetMiB); err != nil {
+				return fmt.Errorf("upload: %w", err)
+			}
+			return ioctlSetMTU("eth0", natEthernetMTU)
+		}},
+		check{"ipv6-stops-below-1280-and-returns-at-1280", func() error { return ipv6StopsBelow1280("mtuv0") }},
 	)
 	return checks
 }

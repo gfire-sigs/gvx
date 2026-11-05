@@ -39,10 +39,12 @@
 //	nodeprobe natmtu [MTU]           check the MTU of eth0 and of the tunnels on it
 //	                                 in a sandbox with the NAT network; MTU is
 //	                                 the expected MTU of eth0, 1500 by default
-//	nodeprobe mtuset HOST:PORT       change the MTU of eth0 and of a veth link,
-//	                                 check the range, and move data through the
-//	                                 NAT after each change; HOST:PORT is a
-//	                                 throughput server
+//	nodeprobe mtuset HOST:PORT       change the MTU of eth0 and of a veth link
+//	                                 with netlink and with SIOCSIFMTU, check the
+//	                                 range, the capability, the MTU of each veth
+//	                                 end, and IPv6 below 1280, and move data
+//	                                 through the NAT after a change; HOST:PORT is
+//	                                 a throughput server
 //	nodeprobe tput HOST:PORT MIB     measure the TCP download and upload rate of
 //	                                 MIB MiB against a server at HOST:PORT
 //	nodeprobe stats HOST:PORT        check link and disk statistics; the probe

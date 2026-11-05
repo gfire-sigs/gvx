@@ -61,9 +61,11 @@ func TestE2ENATLinkMTUTunable(t *testing.T) {
 }
 
 // TestE2ENATLinkMTUChangeKeepsTCPWorking changes the MTU of eth0 from the
-// guest with RTM_SETLINK, as "ip link set dev eth0 mtu N" does. After each
-// change the guest reads the new MTU in netlink and sysfs and moves 1 MiB in
-// each direction through the NAT. The test also checks the Linux range.
+// guest with RTM_SETLINK, as "ip link set dev eth0 mtu N" does, and with the
+// ioctl SIOCSIFMTU, as the busybox tools do. After each change the guest reads
+// the new MTU in netlink and sysfs and moves 1 MiB in each direction through
+// the NAT. The test also checks the Linux range, the capability, the MTU of
+// each end of a veth pair, and the loss of IPv6 below an MTU of 1280.
 func TestE2ENATLinkMTUChangeKeepsTCPWorking(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -83,7 +85,10 @@ func TestE2ENATLinkMTUChangeKeepsTCPWorking(t *testing.T) {
 			"set-eth0-mtu-9000", "tcp-transfer-at-mtu-9000",
 			"set-eth0-mtu-65535", "tcp-transfer-at-mtu-65535",
 			"eth0-refuses-mtu-below-68", "eth0-refuses-mtu-above-65535", "eth0-accepts-the-minimum-68",
-			"veth-follows-the-same-range")
+			"veth-follows-the-same-range", "veth-ends-have-their-own-mtu",
+			"siocsifmtu-sets-eth0-and-siocgifmtu-reads-it", "siocsifmtu-sets-a-veth-end",
+			"siocsifmtu-follows-the-linux-range", "siocsifmtu-needs-cap-net-admin",
+			"tcp-transfer-after-siocsifmtu", "ipv6-stops-below-1280-and-returns-at-1280")
 	})
 }
 
@@ -142,6 +147,80 @@ echo SENT
 			requireContains(t, "MTU before the change", out, "SYSFS-BEFORE 9000\n", "mtu 9000")
 			requireContains(t, "MTU after the change", out, "SYSFS-AFTER 1400\n", "mtu 1400")
 			requireContains(t, "range checks", out, "LOW-REFUSED RTNETLINK answers: Invalid argument\n", "HIGH-REFUSED RTNETLINK answers: Invalid argument\n")
+			var sent string
+			for _, l := range strings.Split(out, "\n") {
+				if rest, ok := strings.CutPrefix(l, "SUM-SENT "); ok {
+					sent = rest
+				}
+			}
+			select {
+			case got := <-sums:
+				if got != sent || len(sent) != 64 {
+					t.Errorf("the host received sha256 %q, the guest sent %q", got, sent)
+				}
+			case <-time.After(time.Minute):
+				t.Fatal("the host received no data")
+			}
+		})
+	}
+}
+
+// TestE2ENATLinkMTUWithBusybox runs the busybox "ifconfig" and the busybox "ip"
+// of Alpine, which change the MTU with the ioctl SIOCSIFMTU and read nothing
+// through netlink. The test checks the new value in sysfs, the range, and a
+// transfer of 1 MiB through the NAT. The host listener checks the hash.
+func TestE2ENATLinkMTUWithBusybox(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on the host: %v", err)
+	}
+	defer ln.Close()
+	const size = 1 << 20
+	sums := make(chan string, 4)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				h := sha256.New()
+				_ = conn.SetReadDeadline(time.Now().Add(time.Minute))
+				if _, err := io.CopyN(h, conn, size); err == nil {
+					sums <- hex.EncodeToString(h.Sum(nil))
+				}
+			}()
+		}
+	}()
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	script := `ip() { busybox ip "$@"; }
+echo IFCONFIG-BEFORE $(ifconfig eth0 | grep -o 'MTU:[0-9]*')
+ifconfig eth0 mtu 1400
+echo SYSFS-IFCONFIG $(cat /sys/class/net/eth0/mtu)
+echo IFCONFIG-AFTER $(ifconfig eth0 | grep -o 'MTU:[0-9]*')
+ip link set dev eth0 mtu 1300
+echo SYSFS-IP $(cat /sys/class/net/eth0/mtu)
+if ifconfig eth0 mtu 67 2>/tmp/err; then echo LOW-ACCEPTED; else echo LOW-REFUSED $(cat /tmp/err); fi
+if ip link set dev eth0 mtu 65536 2>/tmp/err; then echo HIGH-ACCEPTED; else echo HIGH-REFUSED $(cat /tmp/err); fi
+echo SYSFS-AFTER-REFUSED $(cat /sys/class/net/eth0/mtu)
+head -c 1048576 /dev/urandom > /tmp/data
+echo SUM-SENT $(sha256sum < /tmp/data | cut -d' ' -f1)
+nc -w 10 10.0.2.2 ` + port + ` < /tmp/data
+echo SENT
+`
+	for _, b := range gateBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireFixedAddressBackend(t, b)
+			requireRegistry(t)
+			out := mustRunGuest(t, guestSpec{
+				plat: b.plat, image: "alpine:3.20", argv: []string{"sh", "-c", script}, net: gvx.NetModeNAT, netRaw: true,
+			})
+			t.Log(out)
+			requireContains(t, "MTU before the change", out, "IFCONFIG-BEFORE MTU:1500\n")
+			requireContains(t, "ifconfig", out, "SYSFS-IFCONFIG 1400\n", "IFCONFIG-AFTER MTU:1400\n")
+			requireContains(t, "ip", out, "SYSFS-IP 1300\n")
+			requireContains(t, "range checks", out, "LOW-REFUSED", "HIGH-REFUSED", "Invalid argument", "SYSFS-AFTER-REFUSED 1300\n")
 			var sent string
 			for _, l := range strings.Split(out, "\n") {
 				if rest, ok := strings.CutPrefix(l, "SUM-SENT "); ok {
