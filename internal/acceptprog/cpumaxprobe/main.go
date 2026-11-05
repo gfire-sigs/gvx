@@ -54,6 +54,10 @@ const (
 	shortWindow = 3 * time.Second
 	settle      = 300 * time.Millisecond
 
+	// startLimit is the time that a busy-loop child has to report its first
+	// loop count after it started.
+	startLimit = 30 * time.Second
+
 	// resumeLimit is the time that a held-back task has to run again after the
 	// Sentry releases it.
 	resumeLimit = 500 * time.Millisecond
@@ -303,6 +307,19 @@ func moveTo(dir string, pid int) error {
 	return nil
 }
 
+// waitProgress waits until the child reported a loop count, and it fails after
+// limit.
+func (s *spinner) waitProgress(limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for s.count.Load() == 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("a child made no progress in %v after it started", limit)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil
+}
+
 // stop kills the child and waits until it ended.
 func (s *spinner) stop() {
 	_ = s.stdin.Close()
@@ -347,6 +364,13 @@ func runSpinners(dir string, n int, d time.Duration) (window, error) {
 			return window{}, err
 		}
 		started = append(started, s)
+	}
+	// A child can take seconds to start on a loaded host. The window opens
+	// only after each child has reported its first loop count.
+	for _, s := range started {
+		if err := s.waitProgress(startLimit); err != nil {
+			return window{}, err
+		}
 	}
 	time.Sleep(settle)
 	var first *spinner
@@ -405,19 +429,22 @@ func checkUnlimited() error {
 	})
 }
 
-// checkQuotaAboveDemand gives a busy Go program 1.1 CPU. The program has a
-// second thread, the runtime monitor, so its demand is 1.01 CPU. A quota of
-// exactly one CPU would throttle it, as it would in Linux.
+// checkQuotaAboveDemand gives a busy Go program 2 CPUs. The program has other
+// threads, such as the runtime monitor. Their demand is 1.01 CPU on average. On a
+// Windows host, the wake-ups of these threads cost up to 1.5 CPU in one period,
+// and a window of 3 seconds can read 1.12 CPU, because the Sentry measures the
+// wall time of each wake-up. A quota of exactly one CPU would throttle the
+// program, as it would in Linux.
 func checkQuotaAboveDemand() error {
 	return withCgroup(probeDir, func() error {
-		if err := writeFile(probeDir, "cpu.max", "110000 100000"); err != nil {
+		if err := writeFile(probeDir, "cpu.max", "200000 100000"); err != nil {
 			return err
 		}
 		w, err := runSpinners(probeDir, 1, shortWindow)
 		if err != nil {
 			return err
 		}
-		if err := expectCPUs(w, 0.9, 1.05); err != nil {
+		if err := expectCPUs(w, 0.9, 1.3); err != nil {
 			return err
 		}
 		if w.throttled != 0 {

@@ -183,11 +183,12 @@ A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value i
 | Property | Value |
 | :--- | :--- |
 | Accounting | A meter measures the wall time that each task runs in guest and Sentry code. The Sentry charges that time every 10 ms. `usage_usec` of `cpu.stat` is the same measured time. |
-| Counters | `nr_periods` counts the periods that end while the cgroup is active. `nr_throttled` counts the periods that end while it throttles. Both follow Linux. |
-| `throttled_usec` | One wall-clock interval for the whole cgroup. Linux sums the time of each CPU, so it reports more for a cgroup with tasks on several CPUs. |
+| Counters | `nr_periods` counts the periods that end while the cgroup is active. `nr_throttled` counts the periods that end while it throttles, and the periods of a late charge that end in debt of more than 10 ms. Both follow Linux. |
+| `throttled_usec` | One wall-clock interval for the whole cgroup. Linux sums the time of each CPU, so it reports more for a cgroup with tasks on several CPUs. A late charge adds the estimated stop time of each period that ends in debt. |
 | Split of usage | `user_usec` and `system_usec` still come from the tick clocks of the tasks. Their sum is the measured time. |
 | System time | A task in a system call keeps running, as in Linux. The call counts toward the quota, and the task stops when it returns to guest code. |
 | Debt | A task can run up to one tick past the quota before it stops. The next period repays that time. A cgroup throttles only after a debt of more than 10 ms. |
+| Late charge | A stall of the Sentry can delay the charge of a task by many periods. The charge spreads the running time of the task evenly over the time since its last charge, so a task that paused keeps its duty cycle. Each period takes its part and gives the quota again. A task that stayed below its quota in each period makes no debt. A task that stayed above it pays the debt later. A charge covers at most 1024 periods. |
 | Period and quota | A period is 1 ms to 1 s, and a quota is 1 ms or more. Other values give `EINVAL`. |
 | Write to `cpu.max` | A new value starts a new period with a full quota. It releases a throttled task at once. |
 | Move to another cgroup | A throttled task reads the budget of its new cgroup at once. Without a limit there, it runs within 110 ms on every backend. |
@@ -196,7 +197,7 @@ A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value i
 | Unlimited | `max` removes the limit. A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. |
 | Not enforced | `cpu.weight` and the burst limit of Linux. |
 
-The next table lists the measured results of the test A14 and its companions. Each row is one busy Go loop. The loop has a second thread, the runtime monitor, so its demand is 1.01 to 1.03 CPU.
+The next table lists the measured results of the test A14 and its companions. Each row is one busy Go loop. The loop has other threads, such as the runtime monitor, so its demand is 1.01 to 1.03 CPU on average. On a Windows host, the wake-ups of those threads cost up to 1.5 CPU in one period.
 
 | Case | `hvf` | Linux `systrap` | Windows `systrap` and `whpx` |
 | :--- | :--- | :--- | :--- |
@@ -204,7 +205,7 @@ The next table lists the measured results of the test A14 and its companions. Ea
 | `max`, 3 s | 1.01 CPU | 1.00 to 1.03 CPU | 1.00 to 1.01 CPU |
 | `10000 100000`, billed time | 0.10 CPU | 0.10 CPU | 0.10 CPU |
 | `10000 100000`, progress of the loop | 0.03 to 0.08 of full speed | 0.09 to 0.10 of full speed | 0.09 to 0.10 of full speed |
-| `110000 100000`, `nr_throttled` | 0 | 0 | 0 |
+| `200000 100000`, `nr_throttled` | 0 | 0 | 0 |
 | `100000 100000`, `nr_throttled` | 14 in 3 s | 18 in 3 s | not measured |
 
 A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same. On `hvf`, resuming a throttled task costs several milliseconds inside the platform. A loop at a tenth of a CPU therefore keeps 0.03 to 0.08 of its speed.

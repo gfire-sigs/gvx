@@ -82,19 +82,31 @@ func newTestBandwidth(t *testing.T, c *fakeBandwidthClock, parent *CPUBandwidth,
 	return b
 }
 
+// ran charges the node with a task that ran ns nanoseconds without a pause up to
+// now. It uses the path of the CPU clock ticker, including the ancestors.
+func ran(c *fakeBandwidthClock, node *CPUBandwidth, ns int64) {
+	chargeBandwidthRuns(c.now, appendBandwidthRuns(nil, node, c.now-ns, ns))
+}
+
+// ranWithPauses charges the node with a task that ran ns nanoseconds in the
+// interval that starts at from and ends now. The task paused in that interval.
+func ranWithPauses(c *fakeBandwidthClock, node *CPUBandwidth, from, ns int64) {
+	chargeBandwidthRuns(c.now, appendBandwidthRuns(nil, node, from, ns))
+}
+
 func TestCPUBandwidthThrottlesWhenQuotaIsSpent(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
 
-	b.charge(clock.now, 40*ms)
+	ran(&clock, b, 40*ms)
 	if b.Throttled() {
 		t.Fatal("throttled after 40 ms of a 50 ms quota")
 	}
-	b.charge(clock.now, 10*ms)
+	ran(&clock, b, 10*ms)
 	if b.Throttled() {
 		t.Fatal("throttled at the quota, inside the slack of one tick")
 	}
-	b.charge(clock.now, 11*ms)
+	ran(&clock, b, 11*ms)
 	if !b.Throttled() {
 		t.Fatal("not throttled after 56 ms of a 50 ms quota")
 	}
@@ -110,7 +122,7 @@ func TestCPUBandwidthThrottlesWhenQuotaIsSpent(t *testing.T) {
 func TestCPUBandwidthRefillEndsThrottleAtPeriodEnd(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
-	b.charge(clock.now, 61*ms)
+	ran(&clock, b, 61*ms)
 	wake := b.throttleWake()
 	if wake == nil {
 		t.Fatal("throttleWake returned nil for a throttled node")
@@ -141,7 +153,7 @@ func TestCPUBandwidthRefillEndsThrottleAtPeriodEnd(t *testing.T) {
 	}
 
 	// The new period holds 39 ms: 50 ms of quota less the 11 ms debt.
-	b.charge(clock.now, 50*ms)
+	ran(&clock, b, 50*ms)
 	if !b.Throttled() {
 		t.Error("the new period did not take the debt of the old one")
 	}
@@ -156,7 +168,7 @@ func TestCPUBandwidthDebtCarriesIntoNextPeriod(t *testing.T) {
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
 
 	// Tasks on several CPUs charge 120 ms: 70 ms more than the quota.
-	b.charge(clock.now, 120*ms)
+	ran(&clock, b, 120*ms)
 	clock.advance(100 * time.Millisecond)
 	if !b.Throttled() {
 		t.Fatal("released after one period with a debt of 70 ms and a quota of 50 ms")
@@ -168,11 +180,11 @@ func TestCPUBandwidthDebtCarriesIntoNextPeriod(t *testing.T) {
 
 	// The first period repaid 50 ms of the debt and the second period repaid
 	// the last 20 ms. It left 30 ms of its quota.
-	b.charge(clock.now, 30*ms)
+	ran(&clock, b, 30*ms)
 	if b.Throttled() {
 		t.Fatal("throttled before the debt-adjusted quota was spent")
 	}
-	b.charge(clock.now, 11*ms)
+	ran(&clock, b, 11*ms)
 	if !b.Throttled() {
 		t.Fatal("not throttled after the debt-adjusted quota was spent")
 	}
@@ -181,28 +193,176 @@ func TestCPUBandwidthDebtCarriesIntoNextPeriod(t *testing.T) {
 func TestCPUBandwidthIdleNodeStartsFreshPeriod(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
-	b.charge(clock.now, 30*ms)
-	clock.advance(10 * time.Second)
+	ran(&clock, b, 30*ms)
+	clock.advance(10*time.Second + 50*time.Millisecond)
 
-	b.charge(clock.now, 40*ms)
+	ran(&clock, b, 40*ms)
 	if b.Throttled() {
 		t.Fatal("throttled although the idle time restored the full quota")
 	}
 	if got := b.Stats().Periods; got != 2 {
 		t.Errorf("Periods = %d, want 2: the period with the charge and one idle period", got)
 	}
-	// The period of the new charge started at the charge. It ends 100 ms later.
-	clock.advance(60 * time.Millisecond)
-	b.charge(clock.now, 21*ms)
+	// The 40 ms ran inside the period that began at 10.0 s, so 10 ms are left.
+	ran(&clock, b, 10*ms)
+	if b.Throttled() {
+		t.Fatal("throttled before the quota of the new period was spent")
+	}
+	ran(&clock, b, 11*ms)
 	if !b.Throttled() {
-		t.Error("not throttled after 56 ms of charges in one period")
+		t.Error("not throttled after 61 ms of charges in one period")
+	}
+}
+
+func TestCPUBandwidthLateChargeOverManyPeriodsDoesNotThrottle(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+
+	// A stall of the ticker holds back all charges for one second. Then it
+	// bills the 1000 ms that one thread ran. Ten periods ended in that time, and
+	// the thread used less than its quota in each of them. The charge must not
+	// make a debt in the current period for the time of the periods before.
+	clock.advance(time.Second)
+	ran(&clock, b, 1000*ms)
+	if b.Throttled() {
+		t.Fatal("throttled by a charge that lies in periods that ended")
+	}
+	if got := b.Stats().Throttled; got != 0 {
+		t.Errorf("Throttled = %d, want 0", got)
+	}
+	if got := b.Stats().Periods; got != 10 {
+		t.Errorf("Periods = %d, want 10: the thread was active in every period", got)
+	}
+	ran(&clock, b, 100*ms)
+	if b.Throttled() {
+		t.Error("throttled although the current period used 100 ms of 110 ms")
+	}
+}
+
+func TestCPUBandwidthLateChargeSpreadsTheTimeOfAPausedTask(t *testing.T) {
+	cases := []struct {
+		name string
+		// ranNS is the time that the thread ran in the stall of 1000 ms.
+		ranNS int64
+	}{
+		{"duty cycle of 30 percent", 300 * ms},
+		{"exactly the quota", 500 * ms},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var clock fakeBandwidthClock
+			b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
+
+			// A stall of the ticker holds back the charge for one second. The
+			// thread ran in short bursts with pauses, and it never used more
+			// than its quota in any period. The charge must not bill the
+			// time of the bursts as one run at the end of the stall.
+			clock.advance(time.Second)
+			ranWithPauses(&clock, b, 0, tc.ranNS)
+			if b.Throttled() {
+				t.Error("throttled although the thread stayed within its quota in every period")
+			}
+			if got := b.Stats(); got.Throttled != 0 || got.ThrottledTime != 0 {
+				t.Errorf("Stats = %+v, want no throttle", got)
+			}
+			// The current period starts at 1000 ms and has used none of it.
+			ran(&clock, b, 59*ms)
+			if b.Throttled() {
+				t.Error("the stall left a debt: 59 ms is inside the slack over a quota of 50 ms")
+			}
+		})
+	}
+}
+
+func TestCPUBandwidthLateChargeCountsOnlyTimeInCurrentPeriod(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+
+	// The charge at 250 ms covers 200 ms of running. The periods end at 100 ms
+	// and at 200 ms, so 50 ms of the charge lie in the period that began at
+	// 200 ms. That period then has 60 ms left.
+	clock.advance(250 * time.Millisecond)
+	ran(&clock, b, 200*ms)
+	ran(&clock, b, 59*ms)
+	if b.Throttled() {
+		t.Fatal("throttled with 109 ms charged in a period of 110 ms")
+	}
+	ran(&clock, b, 12*ms)
+	if !b.Throttled() {
+		t.Error("not throttled with 121 ms charged in a period of 110 ms")
+	}
+}
+
+func TestCPUBandwidthLateChargeRepaysTheDebtOfEveryPeriod(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
+
+	// A thread ran 350 ms without a pause, because a stall held back both the
+	// charge and the throttle. Each period gave it 50 ms, and it ran 100 ms in
+	// each of the three periods that ended. It used 150 ms more than the quota
+	// gave. The debt stays, as it would after charges on time.
+	clock.advance(350 * time.Millisecond)
+	ran(&clock, b, 350*ms)
+	if !b.Throttled() {
+		t.Fatal("not throttled after the thread used 150 ms more than its quota")
+	}
+	// The refills at 400 ms, 500 ms, and 600 ms repay 50 ms each.
+	clock.advance(249 * time.Millisecond)
+	if !b.Throttled() {
+		t.Fatal("released before the periods repaid the debt")
+	}
+	clock.advance(time.Millisecond)
+	if b.Throttled() {
+		t.Error("still throttled after three refills repaid the debt of 150 ms")
+	}
+}
+
+func TestCPUBandwidthLateChargeCountsThrottledPeriods(t *testing.T) {
+	var clock fakeBandwidthClock
+	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
+
+	// A thread ran 1000 ms without a pause at a quota of 50 ms for each
+	// period. It would have used the quota and stopped in each of the ten
+	// periods. The charge on time makes ten throttled periods, and so must the
+	// late charge.
+	clock.advance(time.Second)
+	ran(&clock, b, 1000*ms)
+	stats := b.Stats()
+	if stats.Periods != 10 || stats.Throttled != 10 {
+		t.Errorf("Periods = %d and Throttled = %d, want 10 and 10", stats.Periods, stats.Throttled)
+	}
+	// The thread used the quota in the first half of the first period, so it
+	// stopped for the second half. Debt makes it stop for the whole period in
+	// each later period.
+	if want := 950 * time.Millisecond; stats.ThrottledTime != want {
+		t.Errorf("ThrottledTime = %v, want %v", stats.ThrottledTime, want)
+	}
+}
+
+func TestCPUBandwidthLateChargesOfManyTasksCountTogether(t *testing.T) {
+	var clock fakeBandwidthClock
+	one := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+	two := newTestBandwidth(t, &clock, nil, 110*time.Millisecond)
+
+	// A stall holds back the charges for one second. A single thread that ran
+	// all the time used 100 ms in each period, and two such threads used 200 ms.
+	clock.advance(time.Second)
+	runs := appendBandwidthRuns(nil, one, 0, 1000*ms)
+	runs = appendBandwidthRuns(runs, two, 0, 1000*ms)
+	runs = appendBandwidthRuns(runs, two, 0, 1000*ms)
+	chargeBandwidthRuns(clock.now, runs)
+	if one.Throttled() {
+		t.Error("a node throttled with one thread below its quota in each period")
+	}
+	if !two.Throttled() {
+		t.Error("a node did not throttle with two threads above its quota in each period")
 	}
 }
 
 func TestCPUBandwidthUnlimitedNodeNeverThrottles(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newCPUBandwidth(nil, clock.clock())
-	b.charge(clock.now, 10*int64(time.Second))
+	ran(&clock, b, 10*int64(time.Second))
 	if b.Throttled() {
 		t.Error("an unlimited node throttled")
 	}
@@ -216,13 +376,13 @@ func TestCPUBandwidthChildObeysLimitOfAncestor(t *testing.T) {
 	parent := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
 	child := newCPUBandwidth(parent, clock.clock())
 
-	child.charge(clock.now, 30*ms)
+	ran(&clock, child, 30*ms)
 	if child.Throttled() {
 		t.Fatal("child throttled before the parent quota ran out")
 	}
 	// A sibling shares the quota of the parent.
 	sibling := newCPUBandwidth(parent, clock.clock())
-	sibling.charge(clock.now, 31*ms)
+	ran(&clock, sibling, 31*ms)
 	if !child.Throttled() || !sibling.Throttled() {
 		t.Fatal("children keep running although they spent the quota of the parent together")
 	}
@@ -244,7 +404,7 @@ func TestCPUBandwidthTighterChildLimitsBeforeParent(t *testing.T) {
 	parent := newTestBandwidth(t, &clock, nil, 80*time.Millisecond)
 	child := newTestBandwidth(t, &clock, parent, 20*time.Millisecond)
 
-	child.charge(clock.now, 31*ms)
+	ran(&clock, child, 31*ms)
 	if !child.Throttled() {
 		t.Fatal("child not throttled at its own quota")
 	}
@@ -256,7 +416,7 @@ func TestCPUBandwidthTighterChildLimitsBeforeParent(t *testing.T) {
 func TestCPUBandwidthSetLimitsReleasesThrottle(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
-	b.charge(clock.now, 61*ms)
+	ran(&clock, b, 61*ms)
 	wake := b.throttleWake()
 	before := cpuBandwidthThrottled.Load()
 
@@ -277,17 +437,17 @@ func TestCPUBandwidthSetLimitsReleasesThrottle(t *testing.T) {
 func TestCPUBandwidthRaisedQuotaStartsFullPeriod(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
-	b.charge(clock.now, 61*ms)
+	ran(&clock, b, 61*ms)
 
 	b.SetLimits(80*time.Millisecond, period)
 	if b.Throttled() {
 		t.Fatal("still throttled after the quota grew")
 	}
-	b.charge(clock.now, 79*ms)
+	ran(&clock, b, 79*ms)
 	if b.Throttled() {
 		t.Error("throttled before the new quota of 80 ms ran out")
 	}
-	b.charge(clock.now, 12*ms)
+	ran(&clock, b, 12*ms)
 	if !b.Throttled() {
 		t.Error("not throttled after the new quota of 80 ms ran out")
 	}
@@ -312,7 +472,7 @@ func TestCPUBandwidthLimitCountTracksFiniteQuotas(t *testing.T) {
 func TestCPUBandwidthStatsIncludeThrottleInProgress(t *testing.T) {
 	var clock fakeBandwidthClock
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
-	b.charge(clock.now, 61*ms)
+	ran(&clock, b, 61*ms)
 	clock.advance(30 * time.Millisecond)
 	if got := b.Stats().ThrottledTime; got != 30*time.Millisecond {
 		t.Errorf("ThrottledTime = %v during a throttle, want 30ms", got)
@@ -327,11 +487,11 @@ func TestCPUBandwidthChargeSpansPeriodEnd(t *testing.T) {
 	// 40 ms belong to the old period, which has 50 ms. The last 10 ms start the
 	// new period.
 	clock.advance(110 * time.Millisecond)
-	b.charge(clock.now, 50*ms)
+	ran(&clock, b, 50*ms)
 	if b.Throttled() {
 		t.Fatal("throttled although 40 ms fell in the old period and 10 ms in the new one")
 	}
-	b.charge(clock.now, 39*ms)
+	ran(&clock, b, 39*ms)
 	if b.Throttled() {
 		t.Error("throttled with 49 ms charged in the new period of 50 ms")
 	}
@@ -345,7 +505,7 @@ func TestCPUBandwidthFullSpeedThreadAtQuotaEqualsPeriodNeverThrottles(t *testing
 	step := 10400 * time.Microsecond
 	for range 400 {
 		clock.advance(step)
-		b.charge(clock.now, step.Nanoseconds())
+		ran(&clock, b, step.Nanoseconds())
 		if b.Throttled() {
 			t.Fatalf("a thread that runs without a pause throttled at %v", time.Duration(clock.now))
 		}
