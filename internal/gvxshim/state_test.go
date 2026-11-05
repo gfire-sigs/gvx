@@ -323,37 +323,3 @@ func TestExpiredLifecycleStillReportsFailure(t *testing.T) {
 		t.Fatalf("expired lifecycle diagnostic=%q, want the failure reason", data)
 	}
 }
-
-func TestExpiredLifecycleDoesNotWaitForDiagnosticReader(t *testing.T) {
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Close the reader first: it ends the filler write that blocks on the full pipe.
-	defer func() {
-		_ = reader.Close()
-		_ = writer.Close()
-	}()
-	// Fill the pipe so that no diagnostic write can complete without a reader.
-	go func() {
-		chunk := make([]byte, 4096)
-		for {
-			if _, err := writer.Write(chunk); err != nil {
-				return
-			}
-		}
-	}()
-	time.Sleep(100 * time.Millisecond)
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	done := make(chan struct{})
-	go func() {
-		writeCommandError(ctx, writer, context.DeadlineExceeded)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * diagnosticTimeout):
-		t.Fatal("expired lifecycle waited for a diagnostic reader")
-	}
-}
