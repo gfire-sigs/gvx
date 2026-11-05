@@ -173,5 +173,4 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |
-| IPv6 pods | The same SYN-ACK misroute can happen: a packet for a local address of another NIC gets a random NIC, and the reply can leave through the wrong NIC. `k3s` uses IPv4 by default, and the tests use IPv4 only. |
 | MTU | `eth0` has the MTU 1500, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. |
