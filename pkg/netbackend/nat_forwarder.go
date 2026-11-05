@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -65,12 +66,6 @@ const (
 	HostDNSIPv4 = "10.0.2.3"
 
 	defaultTCPReceiveWindow = 0
-	defaultMaxInFlightSYNs  = 1024
-	defaultDialTimeout      = 10 * time.Second
-
-	// defaultUDPIdleTimeout is the time without a datagram in either
-	// direction after which a UDP session ends.
-	defaultUDPIdleTimeout = 30 * time.Second
 
 	// maxUDPDatagram is the largest UDP payload that a relay reads.
 	maxUDPDatagram = 65535
@@ -107,14 +102,10 @@ type NATConfig struct {
 	// Windows. When the host has none, the relay answers SERVFAIL.
 	DNSServers []string
 
-	// UDPIdleTimeout is the time without a datagram in either direction after
-	// which a UDP session ends. When zero, it is 30 seconds.
-	UDPIdleTimeout time.Duration
-
-	// MaxUDPSessions is the largest count of UDP sessions that live at once. A
-	// new session beyond the limit ends the session with the oldest datagram.
-	// When zero, it is 512.
-	MaxUDPSessions int
+	// Tuning sets the MTU of eth0, the UDP session limit and idle time, the
+	// dial time, the SYN backlog, and the DNS time limits. The zero value
+	// selects the defaults of the registry.
+	Tuning tuning.Values
 
 	// Logger receives forwarder diagnostics. When nil, the forwarder discards them.
 	Logger *slog.Logger
@@ -152,6 +143,21 @@ var discardLogger = slog.New(slog.DiscardHandler)
 type natLinkEndpoint struct {
 	stack.LinkEndpoint
 	nf *NATForwarder
+
+	// peer is the host end of the link. SetMTU gives it the MTU of eth0, as
+	// the two ends of one cable share one MTU. Without that, the host stack
+	// would announce the MSS of its own MTU, and every TCP stream would keep
+	// to it.
+	peer stack.LinkEndpoint
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU. It sets the MTU of both ends of
+// the link.
+func (e *natLinkEndpoint) SetMTU(mtu uint32) {
+	e.LinkEndpoint.SetMTU(mtu)
+	if e.peer != nil {
+		e.peer.SetMTU(mtu)
+	}
 }
 
 func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
@@ -221,14 +227,18 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	guestEP, hostEP := pipe.New("", "", natLinkMTU)
+	// eth0 has the MTU of an Ethernet link by default, as on a Linux node and
+	// in a Docker container. Software in the guest derives the MTU of its
+	// tunnels from it: flannel uses the MTU of eth0 minus 50 for vxlan and
+	// minus 80 for WireGuard. The loopback device keeps the MTU of 65536.
+	guestEP, hostEP := pipe.New("", "", uint32(cfg.Tuning.Int(tuning.NATMTU)))
 	hostStack, err := newNATHostStack(checksumOffloadEndpoint{hostEP})
 	if err != nil {
 		s.Close()
 		return nil, nil, err
 	}
 	fwd := newNATForwarder(hostStack, cfg)
-	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, fwd); err != nil {
+	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, fwd); err != nil {
 		_ = fwd.Close()
 		s.Close()
 		return nil, nil, err
@@ -236,15 +246,6 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	registerNATTransportHandlers(hostStack, fwd)
 	return s, fwd, nil
 }
-
-// natLinkMTU is the MTU of the in-memory link between the guest stack and the
-// host stack, so the MTU of eth0. It is the MTU of an Ethernet link, as on a
-// Linux node and in a Docker container. Software in the guest derives the MTU of
-// its tunnels from it: flannel uses the MTU of eth0 minus 50 for vxlan and minus
-// 80 for WireGuard. A larger value gives tunnel datagrams that the host sockets
-// cannot send. macOS limits a UDP datagram to net.inet.udp.maxdgram, which is
-// 9216 bytes by default. The loopback device keeps the MTU of 65536.
-const natLinkMTU = 1500
 
 // hostNICID is the NIC of the host stack that connects to the guest eth0.
 const hostNICID tcpip.NICID = 1
@@ -319,12 +320,13 @@ func configureLoopbackNIC(s *stack.Stack, nicID tcpip.NICID) error {
 	return nil
 }
 
-func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep stack.LinkEndpoint, nf *NATForwarder) error {
+func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep, peer stack.LinkEndpoint, nf *NATForwarder) error {
 	linkEP := &natLinkEndpoint{
 		LinkEndpoint: ep,
 		nf:           nf,
+		peer:         peer,
 	}
-	if err := createNamedNIC(s, nicID, Eth0NICName, linkEP); err != nil {
+	if err := createNamedNICWithMTURange(s, nicID, Eth0NICName, linkEP, header.IPv4MinimumMTU, MaxLinkMTU); err != nil {
 		return err
 	}
 	ethAddr := tcpip.ProtocolAddress{
@@ -353,16 +355,12 @@ func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep stack.LinkEndpoint, n
 
 func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 	if cfg.DialContext == nil {
-		dialer := &net.Dialer{Timeout: defaultDialTimeout}
+		dialer := &net.Dialer{Timeout: cfg.Tuning.Duration(tuning.NATDialTimeout)}
 		cfg.DialContext = dialer.DialContext
 	}
 	upstream := cfg.DNSServers
 	if len(upstream) == 0 {
 		upstream = discoverHostDNSServers()
-	}
-	idle := cfg.UDPIdleTimeout
-	if idle <= 0 {
-		idle = defaultUDPIdleTimeout
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -374,15 +372,15 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		cfg:         cfg,
 		log:         log,
 		upstreamDNS: upstream,
-		udpIdle:     idle,
-		udpSessions: newUDPSessionTable(cfg.MaxUDPSessions),
+		udpIdle:     cfg.Tuning.Duration(tuning.UDPIdleTimeout),
+		udpSessions: newUDPSessionTable(cfg.Tuning.Int(tuning.NATUDPSessions)),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 }
 
 func registerNATTransportHandlers(s *stack.Stack, nf *NATForwarder) {
-	tcpFwd := tcp.NewForwarder(s, defaultTCPReceiveWindow, defaultMaxInFlightSYNs, nf.handleTCP)
+	tcpFwd := tcp.NewForwarder(s, defaultTCPReceiveWindow, nf.cfg.Tuning.Int(tuning.NATSynBacklog), nf.handleTCP)
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
 	udpFwd := udp.NewForwarder(s, nf.handleUDP)
@@ -564,6 +562,7 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 		nf.log.Debug("netbackend: dial host UDP target", "target", targetAddr, "error", err)
 		return false
 	}
+	widenUDPSend(hostConn)
 
 	var wq waiter.Queue
 	ep, tcpErr := r.CreateEndpoint(&wq)

@@ -32,6 +32,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/checksum"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -150,7 +151,7 @@ func newTestStack(t *testing.T, mtu uint32, addrs ...netip.Prefix) (*stack.Stack
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
-	ep := channel.New(wgChannelQueueSize, mtu, "")
+	ep := channel.New(tuning.Values{}.Int(tuning.WGQueueLength), mtu, "")
 	const nic tcpip.NICID = 1
 	if err := s.CreateNIC(nic, ep); err != nil {
 		t.Fatalf("CreateNIC: %v", err)

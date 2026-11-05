@@ -20,6 +20,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
 // newTestSession returns a session over two pipes. Its clock shows activity at
@@ -70,9 +72,26 @@ func TestUDPSessionTableFreesTheSlotOfARemovedSession(t *testing.T) {
 	}
 }
 
-func TestUDPSessionTableDefaultLimit(t *testing.T) {
-	if got := newUDPSessionTable(0).max; got != defaultMaxUDPSessions {
-		t.Errorf("limit = %d, want %d", got, defaultMaxUDPSessions)
+func TestNATSessionLimitComesFromTheTunables(t *testing.T) {
+	s, fwd, err := NewNATStack(NATConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fwd.Close(); s.Close() }()
+	if got, want := fwd.udpSessions.max, tuning.NATUDPSessions; got != (tuning.Values{}).Int(want) || got != 512 {
+		t.Errorf("default session limit = %d, want 512", got)
+	}
+	tuned, err := tuning.Values{}.WithInt(tuning.NATUDPSessions, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, fwd2, err := NewNATStack(NATConfig{Tuning: tuned})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fwd2.Close(); s2.Close() }()
+	if got := fwd2.udpSessions.max; got != 7 {
+		t.Errorf("tuned session limit = %d, want 7", got)
 	}
 }
 

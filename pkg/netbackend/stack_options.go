@@ -108,10 +108,21 @@ func newStack(opts StackOptions) (*stack.Stack, error) {
 // veth link that the guest creates later through netlink then gets the next
 // free ID.
 func createNamedNIC(s *stack.Stack, id tcpip.NICID, name string, ep stack.LinkEndpoint) error {
+	return createNamedNICWithMTURange(s, id, name, ep, 0, 0)
+}
+
+// MaxLinkMTU is the largest MTU that the guest can set on eth0. It is the
+// largest IPv4 packet, which is also the largest MTU of a Linux Ethernet link.
+const MaxLinkMTU = 65535
+
+// createNamedNICWithMTURange is createNamedNIC with bounds for the later
+// changes of the MTU. A change that the bounds forbid fails with EINVAL, as on
+// Linux. A zero bound leaves that side open.
+func createNamedNICWithMTURange(s *stack.Stack, id tcpip.NICID, name string, ep stack.LinkEndpoint, minMTU, maxMTU uint32) error {
 	if next := s.NextNICID(); next != id {
 		return fmt.Errorf("netbackend: %s NIC needs ID %d, the stack gives %d", name, id, next)
 	}
-	if err := s.CreateNICWithOptions(id, ep, stack.NICOptions{Name: name}); err != nil {
+	if err := s.CreateNICWithOptions(id, ep, stack.NICOptions{Name: name, MinMTU: minMTU, MaxMTU: maxMTU}); err != nil {
 		return fmt.Errorf("netbackend: create %s NIC: %s", name, err)
 	}
 	return nil

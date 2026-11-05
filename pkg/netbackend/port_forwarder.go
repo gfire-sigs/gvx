@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -34,17 +35,6 @@ import (
 )
 
 const (
-	// guestDialWindow is the time that a forwarded TCP client waits for the
-	// guest to start listening on the target port.
-	guestDialWindow = 3 * time.Second
-
-	// guestDialRetryInterval is the pause between guest dial attempts.
-	guestDialRetryInterval = 15 * time.Millisecond
-
-	// defaultMaxUDPForwardSessions is the number of concurrent client sessions
-	// per UDP rule. The forwarder drops a new client while the rule is at the limit.
-	defaultMaxUDPForwardSessions = 1024
-
 	// acceptBackoffMin and acceptBackoffMax bound the pause after a failed Accept.
 	acceptBackoffMin = 5 * time.Millisecond
 	acceptBackoffMax = time.Second
@@ -67,17 +57,14 @@ type PortForwardRule struct {
 // unixSocketPrefix starts a publish specification for a host Unix socket.
 const unixSocketPrefix = "unix:"
 
-// maxPortRange is the largest number of ports in one range specification.
-// Each port takes one host socket.
-const maxPortRange = 1024
-
 // ParsePortForwardSpecs parses a publish specification that can name more
 // than one forward. It accepts every form of ParsePortForwardSpec, a port
 // range on the host side and the guest side ("8000-8009:8000-8009",
 // "127.0.0.1:8000-8009:9000-9009", or a guest range alone, "8000-8009"), and
 // a host Unix socket ("unix:/path/docker.sock:2375"). Two ranges must have the
-// same length.
-func ParsePortForwardSpecs(spec string, allowSinglePort, strictBindIP bool) ([]PortForwardRule, error) {
+// same length. Each port of a range takes one host socket, so the tunable
+// net.forward.max_port_range limits the length of a range.
+func ParsePortForwardSpecs(spec string, allowSinglePort, strictBindIP bool, t tuning.Values) ([]PortForwardRule, error) {
 	spec = strings.TrimSpace(spec)
 	if strings.HasPrefix(spec, unixSocketPrefix) {
 		rule, err := parseUnixSocketSpec(spec)
@@ -135,8 +122,8 @@ func ParsePortForwardSpecs(spec string, allowSinglePort, strictBindIP bool) ([]P
 		}
 		hostLo = lo
 	}
-	if count > maxPortRange {
-		return nil, fmt.Errorf("netbackend: invalid port forward %q: a range has at most %d ports", spec, maxPortRange)
+	if maxRange := t.Int(tuning.ForwardMaxPortRange); count > maxRange {
+		return nil, fmt.Errorf("netbackend: invalid port forward %q: a range has at most %d ports (tunable net.forward.max_port_range)", spec, maxRange)
 	}
 
 	rules := make([]PortForwardRule, 0, count)
@@ -343,20 +330,31 @@ type PortForwarder struct {
 
 	// udpIdle is the time without a datagram after which a UDP session ends.
 	udpIdle time.Duration
-	// udpMaxSessions is the session limit of each UDP rule.
+	// udpMaxSessions is the session limit of each UDP rule. The forwarder
+	// drops a new client while the rule is at the limit.
 	udpMaxSessions int
-	log            *slog.Logger
+	// guestDialWindow is the time that a forwarded TCP client waits for the
+	// guest to start listening on the target port.
+	guestDialWindow time.Duration
+	// guestDialInterval is the pause between guest dial attempts.
+	guestDialInterval time.Duration
+	log               *slog.Logger
 }
 
-// NewPortForwarder constructs an empty PortForwarder ready for PreBind.
-func NewPortForwarder() *PortForwarder {
+// NewPortForwarder constructs an empty PortForwarder ready for PreBind. The
+// tunables net.udp.idle_timeout, net.forward.udp_sessions,
+// net.forward.guest_dial_window, and net.forward.guest_dial_interval set its
+// limits.
+func NewPortForwarder(t tuning.Values) *PortForwarder {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PortForwarder{
-		ctx:            ctx,
-		cancel:         cancel,
-		udpIdle:        defaultUDPIdleTimeout,
-		udpMaxSessions: defaultMaxUDPForwardSessions,
-		log:            discardLogger,
+		ctx:               ctx,
+		cancel:            cancel,
+		udpIdle:           t.Duration(tuning.UDPIdleTimeout),
+		udpMaxSessions:    t.Int(tuning.ForwardUDPSessions),
+		guestDialWindow:   t.Duration(tuning.ForwardGuestDialWindow),
+		guestDialInterval: t.Duration(tuning.ForwardGuestDialInterval),
+		log:               discardLogger,
 	}
 }
 
@@ -429,6 +427,7 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 				_ = pc.Close()
 				return fmt.Errorf("netbackend: bind udp %s: socket is %T, want *net.UDPConn", bindAddr, pc)
 			}
+			widenUDPSend(udpConn)
 			actualPort := uint16(udpConn.LocalAddr().(*net.UDPAddr).Port)
 			pf.udpList = append(pf.udpList, &boundUDPForward{
 				rule: PortForwardRule{
@@ -518,11 +517,11 @@ func (pf *PortForwarder) serveTCP(s *stack.Stack, b *boundTCPForward) {
 
 // relayTCPClient connects hostConn to the guest endpoint and relays both
 // streams. The guest may start listening after the host client connects, so
-// the dial retries during guestDialWindow.
+// the dial retries during the guest dial window.
 func (pf *PortForwarder) relayTCPClient(s *stack.Stack, guestAddr tcpip.FullAddress, hostConn net.Conn) {
 	defer func() { _ = hostConn.Close() }()
 
-	ctx, cancel := context.WithTimeout(pf.ctx, guestDialWindow)
+	ctx, cancel := context.WithTimeout(pf.ctx, pf.guestDialWindow)
 	defer cancel()
 	var guestConn *gonet.TCPConn
 	for {
@@ -535,7 +534,7 @@ func (pf *PortForwarder) relayTCPClient(s *stack.Stack, guestAddr tcpip.FullAddr
 		case <-ctx.Done():
 			pf.log.Debug("netbackend: dial guest for forwarded connection", "guest", guestAddr.Addr, "port", guestAddr.Port, "error", err)
 			return
-		case <-time.After(guestDialRetryInterval):
+		case <-time.After(pf.guestDialInterval):
 		}
 	}
 	defer func() { _ = guestConn.Close() }()

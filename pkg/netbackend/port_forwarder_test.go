@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -50,7 +51,7 @@ func guestFullAddr(port uint16) tcpip.FullAddress {
 // preBoundUDPForward binds one UDP rule on a free loopback port.
 func preBoundUDPForward(t *testing.T, guestPort uint16) (*PortForwarder, *net.UDPAddr) {
 	t.Helper()
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	t.Cleanup(func() { _ = pf.Close() })
 	if err := pf.PreBind([]PortForwardRule{{Proto: "udp", HostIP: "127.0.0.1", GuestPort: guestPort}}); err != nil {
 		t.Fatalf("PreBind: %v", err)
@@ -318,7 +319,7 @@ func TestPortForwarderTCPRetriesAcceptErrors(t *testing.T) {
 	}
 	ln.accepts <- acceptResult{conn: relayEnd}
 
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	pf.tcpList = []*boundTCPForward{{rule: PortForwardRule{Proto: "tcp", GuestIP: DefaultGuestIPv4, GuestPort: 8080}, listener: ln}}
 	pf.Start(s)
 
@@ -379,7 +380,7 @@ func (l *scriptListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127,
 
 func TestPortForwarderTCPWaitsForGuestListener(t *testing.T) {
 	s := newForwardStack(t)
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	t.Cleanup(func() { _ = pf.Close() })
 	if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", HostIP: "127.0.0.1", GuestPort: 8081}}); err != nil {
 		t.Fatal(err)
@@ -409,7 +410,7 @@ func TestPortForwarderCloseEndsActiveTCPRelays(t *testing.T) {
 		t.Fatal(err)
 	}
 	tcpEchoServer(t, guestLn)
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", HostIP: "127.0.0.1", GuestPort: 8082}}); err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +442,7 @@ func TestPortForwarderCloseEndsActiveTCPRelays(t *testing.T) {
 }
 
 func TestPortForwarderLifecycleErrors(t *testing.T) {
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	if err := pf.PreBind([]PortForwardRule{{Proto: "sctp", HostIP: "127.0.0.1"}}); err == nil {
 		t.Fatal("PreBind accepted protocol sctp")
 	}
@@ -476,7 +477,7 @@ func TestPortForwarderLifecycleErrors(t *testing.T) {
 
 func TestPortForwarderStartRunsOnce(t *testing.T) {
 	s := newForwardStack(t)
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	t.Cleanup(func() { _ = pf.Close() })
 	if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", HostIP: "127.0.0.1", GuestPort: 8083}}); err != nil {
 		t.Fatal(err)

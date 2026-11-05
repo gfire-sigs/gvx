@@ -28,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // This file adds two parts of the memory controller that runc, containerd, and
@@ -187,6 +188,53 @@ func (g *oomGate) shouldKill(over bool, pending int) bool {
 type memoryEnforcer struct {
 	// running is true while the goroutine runs or starts.
 	running atomic.Bool
+
+	// opts holds the time limits of the checks. Zero fields hold the defaults.
+	opts MemoryEnforcerOptions
+}
+
+// MemoryEnforcerOptions sets the time limits of the checks of memory.max. A
+// zero field selects the default.
+type MemoryEnforcerOptions struct {
+	// PollInterval is the shortest time between two checks while a cgroup uses
+	// at least half of its limit. The default is 5 ms.
+	PollInterval time.Duration
+	// IdlePollInterval is the time between two checks while every limited
+	// cgroup uses less than half of its limit. The default is 25 ms.
+	IdlePollInterval time.Duration
+	// ScanRatio limits the checks to 1/ScanRatio of a CPU. The default is 4.
+	ScanRatio int
+}
+
+// DefaultMemoryEnforcerOptions returns the values that a zero field selects.
+func DefaultMemoryEnforcerOptions() MemoryEnforcerOptions {
+	return MemoryEnforcerOptions{}.withDefaults()
+}
+
+func (o MemoryEnforcerOptions) withDefaults() MemoryEnforcerOptions {
+	if o.PollInterval <= 0 {
+		o.PollInterval = oomPollInterval
+	}
+	if o.IdlePollInterval <= 0 {
+		o.IdlePollInterval = oomIdlePollInterval
+	}
+	if o.ScanRatio <= 0 {
+		o.ScanRatio = oomScanRatio
+	}
+	return o
+}
+
+// NewFilesystemWithMemoryOptions is NewFilesystem with the time limits of the
+// checks of memory.max. The enforcer of the new filesystem reads them.
+func NewFilesystemWithMemoryOptions(opts MemoryEnforcerOptions) func(context.Context, *kernel.Kernel, *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
+	return func(ctx context.Context, k *kernel.Kernel, vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
+		vfsfs, err := NewFilesystem(ctx, k, vfsObj)
+		if err != nil {
+			return nil, err
+		}
+		memoryEnforcers.Store(vfsfs.Impl().(*filesystem), &memoryEnforcer{opts: opts.withDefaults()})
+		return vfsfs, nil
+	}
 }
 
 // memoryEnforcers maps a cgroup2 filesystem to its enforcer. The Sentry has one
@@ -200,8 +248,9 @@ const (
 	// oomIdlePollInterval is the time between two checks while every limited
 	// cgroup uses less than half of its limit. It makes 40 wakeups a second.
 	oomIdlePollInterval = 25 * time.Millisecond
-	// oomScanRatio limits the checks to 1/oomScanRatio of a CPU, as pgalloc
-	// limits its own scans of the memory file.
+	// oomScanRatio is the default of ScanRatio: it limits the checks to
+	// 1/oomScanRatio of a CPU, as pgalloc limits its own scans of the memory
+	// file.
 	oomScanRatio = 4
 	// oomImmune is the oom_score_adj value that exempts a process, as in Linux.
 	oomImmune = -1000
@@ -231,7 +280,7 @@ func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
 	if !enforcerSupported(k.Platform) {
 		return
 	}
-	e, _ := memoryEnforcers.LoadOrStore(fs, &memoryEnforcer{})
+	e, _ := memoryEnforcers.LoadOrStore(fs, &memoryEnforcer{opts: MemoryEnforcerOptions{}.withDefaults()})
 	if e.(*memoryEnforcer).running.CompareAndSwap(false, true) {
 		go fs.enforceMemoryLimits(k, e.(*memoryEnforcer))
 	}
@@ -243,7 +292,8 @@ func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
 // checks.
 func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 	ctx := k.SupervisorContext()
-	delay := oomIdlePollInterval
+	opts := e.opts
+	delay := opts.IdlePollInterval
 	for {
 		time.Sleep(delay)
 		if k.RootPIDNamespace().NumTasks() == 0 {
@@ -265,11 +315,11 @@ func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 		// The scan of a large anonymous range that no task touched costs time on
 		// hosts that cannot ask for the committed pages cheaply, so the delay
 		// grows with the duration of the check in both cases.
-		delay = oomIdlePollInterval
+		delay = opts.IdlePollInterval
 		if near {
-			delay = oomPollInterval
+			delay = opts.PollInterval
 		}
-		delay = max(delay, oomScanRatio*time.Since(start))
+		delay = max(delay, time.Duration(opts.ScanRatio)*time.Since(start))
 	}
 }
 

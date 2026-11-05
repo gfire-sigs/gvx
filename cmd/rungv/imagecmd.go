@@ -30,19 +30,25 @@ import (
 type imageCacheFlags struct {
 	cacheDir *string
 	arch     *string
+	tune     *tuneFlags
 }
 
 func addImageCacheFlags(fs *flag.FlagSet) imageCacheFlags {
 	return imageCacheFlags{
 		cacheDir: fs.String("cache-dir", "", "EROFS layer cache directory"),
 		arch:     fs.String("arch", runtime.GOARCH, "Target Linux architecture (amd64 or arm64)"),
+		tune:     addTuneFlags(fs),
 	}
 }
 
 // open opens the layer cache that the flags name and returns it with the
 // architecture.
 func (f imageCacheFlags) open() (*oci.LayerCache, string, error) {
-	cache, err := gvx.NewLayerCache(strings.TrimSpace(*f.cacheDir))
+	tuned, err := f.tune.values()
+	if err != nil {
+		return nil, "", err
+	}
+	cache, err := gvx.NewLayerCacheWithTuning(strings.TrimSpace(*f.cacheDir), tuned)
 	if err != nil {
 		return nil, "", err
 	}

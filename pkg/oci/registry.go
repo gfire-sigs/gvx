@@ -92,7 +92,11 @@ func newRegistryClient(client *http.Client, baseURL, repo string, lim Limits) (*
 	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return nil, fmt.Errorf("oci: registry URL %q must be an http or https URL with a host", baseURL)
 	}
-	rc := &registryClient{baseURL: u, repo: repo, lim: lim, idle: defaultIdleTimeout}
+	idle := lim.RegistryIdleTimeout
+	if idle == 0 {
+		idle = defaultIdleTimeout
+	}
+	rc := &registryClient{baseURL: u, repo: repo, lim: lim, idle: idle}
 	if client == nil {
 		client = newDefaultHTTPClient()
 		rc.owned = true

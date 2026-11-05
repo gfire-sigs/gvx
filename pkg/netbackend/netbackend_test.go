@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -114,7 +115,7 @@ func TestNATForwarderHostGatewayAndInboundPortForward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParsePortForwardRule failed: %v", err)
 	}
-	pf := NewPortForwarder()
+	pf := NewPortForwarder(tuning.Values{})
 	defer func() {
 		_ = pf.Close()
 	}()

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
@@ -253,5 +254,16 @@ func TestOOMGroupIsTheHighestGroupBelowTheLimitedCgroup(t *testing.T) {
 	}
 	if !slices.Equal(ids, []kernel.ThreadID{1, 2}) {
 		t.Errorf("members of the container group = %v, want [1 2]", ids)
+	}
+}
+
+func TestMemoryEnforcerOptionsKeepSetFieldsAndFillTheRest(t *testing.T) {
+	def := DefaultMemoryEnforcerOptions()
+	if def.PollInterval != oomPollInterval || def.IdlePollInterval != oomIdlePollInterval || def.ScanRatio != oomScanRatio {
+		t.Errorf("defaults = %+v, want the built-in constants", def)
+	}
+	got := MemoryEnforcerOptions{PollInterval: 50 * time.Millisecond, ScanRatio: 9}.withDefaults()
+	if got.PollInterval != 50*time.Millisecond || got.ScanRatio != 9 || got.IdlePollInterval != oomIdlePollInterval {
+		t.Errorf("options = %+v, want the set fields and the default idle interval", got)
 	}
 }
