@@ -36,7 +36,7 @@ import (
 const c5Script = `
 mkdir -p /usr/local/bin
 cp /workspace/sonobuoy /usr/local/bin/sonobuoy && chmod 755 /usr/local/bin/sonobuoy
-k3s server --disable=traefik,servicelb --flannel-backend=host-gw --write-kubeconfig-mode=644 >/tmp/k3s.log 2>&1 &
+k3s server --disable=traefik,servicelb --flannel-backend=host-gw --write-kubeconfig-mode=644 $K3S_EXTRA_ARGS >/tmp/k3s.log 2>&1 &
 t0=$(date +%s)
 until k get nodes 2>/dev/null | grep -q " Ready"; do
   if [ $(( $(date +%s) - t0 )) -gt 600 ]; then fail "node not Ready"; dump; exit 1; fi
@@ -54,6 +54,51 @@ log "CLUSTER-READY $(( $(date +%s) - t0 ))"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 t1=$(date +%s)
 if [ -n "$E2E_FOCUS" ]; then set -- "--e2e-focus=$E2E_FOCUS"; else set --; fi
+# With C5_PROBE set, a pod of the script opens a connection to the API server
+# every second, once through the address of the Service and once directly, and
+# the node calls the pod every second. A failed connection prints its time. The
+# script prints the state of the network of the node when the pod fails, and
+# once at the start for comparison.
+netstate() {
+  echo "NETSTATE-BEGIN $1 $(date +%T)"
+  ip -o addr 2>&1 | grep -v inet6
+  ip route 2>&1
+  ip neigh 2>&1
+  ip -s link 2>&1 | grep -E '^[0-9]+:|RX|TX|^ +[0-9]' | head -n 60
+  conntrack -S 2>&1 | head -n 4
+  conntrack -L 2>/dev/null | awk '{print $1, $4}' | sort | uniq -c | sort -rn | head -n 12
+  conntrack -L 2>/dev/null | grep SYN_RECV | head -n 12
+  awk 'NR>1 {c[$4]++} END {for (s in c) print "tcp-state", s, c[s]}' /proc/net/tcp
+  awk 'NR>1 && $4=="0A" {print "listen", $2, "queues", $5}' /proc/net/tcp | head -n 20
+  iptables-save -c 2>&1 | grep -E 'DROP|REJECT' | head -n 20
+  grep -E '^(Ip|Tcp|Udp|Icmp):' /proc/net/snmp
+  cat /proc/net/netstat
+  echo NETSTATE-END
+}
+probe() {
+  k run c5-probe --image=registry.k8s.io/e2e-test-images/agnhost:2.47 --restart=Never --command -- /bin/sh -c '
+    /agnhost netexec --http-port=8080 >/dev/null 2>&1 &
+    while :; do
+      t=$(date +%T)
+      /agnhost connect 10.43.0.1:443 --timeout=2s >/dev/null 2>&1 || echo "POD-VIP-FAIL $t"
+      /agnhost connect 10.0.2.15:6443 --timeout=2s >/dev/null 2>&1 || echo "POD-DIRECT-FAIL $t"
+      sleep 1
+    done' >/dev/null 2>&1
+  k wait --for=condition=Ready pod/c5-probe --timeout=300s >/dev/null 2>&1
+  ip=$(k get pod c5-probe -o jsonpath='{.status.podIP}')
+  k logs -f c5-probe 2>&1 | sed 's/^/PROBE /' &
+  sleep 20
+  netstate baseline
+  next=8; dumps=0
+  while :; do
+    t=$(date +%T)
+    wget -q -T 2 -O /dev/null "http://$ip:8080/hostname" 2>/dev/null || echo "PROBE NODE-POD-FAIL $t"
+    n=$(k logs c5-probe 2>/dev/null | grep -c FAIL)
+    if [ "$dumps" -lt 3 ] && [ "$n" -ge "$next" ]; then next=$((next*8)); netstate pod-failures; dumps=$((dumps+1)); k exec c5-probe -- cat /proc/net/arp 2>&1 | sed 's/^/NETSTATE pod-arp /'; fi
+    sleep 1
+  done
+}
+if [ -n "$C5_PROBE" ]; then probe & fi
 sonobuoy run $SONOBUOY_ARGS "$@" --kubernetes-version=v1.31.4 --wait=45 --wait-output=Progress >/tmp/sonobuoy.log 2>&1 &
 run=$!
 # When the progress stays the same for five minutes, the script prints the state
@@ -85,10 +130,10 @@ grep -E '"status": ?"failed"' /tmp/detailed.json | cut -c1-300 | sed 's/^/FAILED
 # The failure message of a test is in the detailed results and in e2e.log of the
 # plugin. Both go to the transcript for each failed run.
 if grep -qE '"status": ?"failed"' /tmp/detailed.json; then
-  grep -E '"failure": ?"' /tmp/detailed.json | cut -c1-3000 | sed 's/^/FAILURE-MESSAGE /'
+  grep -E '"failure": ?"' /tmp/detailed.json | sed 's/"system-err".*//' | cut -c1-3000 | sed 's/^/FAILURE-MESSAGE /'
   mkdir -p /tmp/results && tar -xzf "$tarball" -C /tmp/results
   e2elog=$(find /tmp/results -name e2e.log | head -n 1)
-  grep -n -B2 -A14 -E '\[(FAILED|PANICKED)\]' "$e2elog" | cut -c1-400 | head -n 600 | sed 's/^/FAILURE-LOG /'
+  sed -n '/^• \[\(FAILED\|PANICKED\)\]/,/<< Timeline/p' "$e2elog" | cut -c1-400 | head -n 1200 | sed 's/^/FAILURE-LOG /'
 fi
 log "SONOBUOY-DONE"
 serve
@@ -117,15 +162,19 @@ func runConformance(t *testing.T, b gateBackend, args, focus string, minPassed i
 		t.Fatalf("copy sonobuoy into the workspace: %v", err)
 	}
 	node := startK3sNode(t, ctx, b, k3sNodeSpec{
-		hostname:  multiNodeServerName,
-		env:       []string{"SONOBUOY_ARGS=" + args, "E2E_FOCUS=" + focus},
+		hostname: multiNodeServerName,
+		env: []string{
+			"SONOBUOY_ARGS=" + args, "E2E_FOCUS=" + focus,
+			"C5_PROBE=" + os.Getenv("GVX_E2E_CONFORMANCE_PROBE"),
+			"K3S_EXTRA_ARGS=" + os.Getenv("GVX_E2E_CONFORMANCE_K3S_ARGS"),
+		},
 		script:    c5Script,
 		workspace: dir,
 	})
 	node.wait(t, "CLUSTER-READY ", 12*time.Minute)
 	node.wait(t, "SONOBUOY-DONE", 50*time.Minute)
 	out := node.out.String()
-	t.Logf("sonobuoy result:\n%s", linesWithPrefix(out, "RESULT ", "FAILED-TEST ", "FAILURE-MESSAGE ", "FAILURE-LOG ", "SONOBUOY-RUN-EXIT "))
+	t.Logf("sonobuoy result:\n%s", linesWithPrefix(out, "RESULT ", "FAILED-TEST ", "FAILURE-MESSAGE ", "FAILURE-LOG ", "PROBE ", "NETSTATE", "SONOBUOY-RUN-EXIT "))
 	field := func(name string) string {
 		m := regexp.MustCompile(`(?m)^RESULT ` + name + `: (.*)$`).FindStringSubmatch(out)
 		if m == nil {
