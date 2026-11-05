@@ -78,7 +78,7 @@ func makeInterfaceInfo(ni *stack.NICInfo) inet.Interface {
 	return inet.Interface{
 		Name:       ni.Name,
 		Addr:       []byte(ni.LinkAddress),
-		Flags:      uint32(nicStateFlagsToLinux(ni.Flags)),
+		Flags:      linuxFlags(ni),
 		DeviceType: toLinuxARPHardwareType(ni.ARPHardwareType),
 		MTU:        ni.MTU,
 		Master:     uint32(ni.Primary),
@@ -253,7 +253,8 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 			ctx.Warningf("Unsupported ifi_flags: %x", ifinfomsg.Flags)
 			return syserr.ErrInvalidArgument
 		}
-		// Netstack interfaces are always up.
+		// Netstack interfaces are always up, except the links of a kind
+		// with an administrative state.
 	}
 
 	dstNs, err := s.lockSrcAndDst(ctx, attrs)
@@ -261,6 +262,11 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		return err
 	}
 	defer s.unlockSrcAndDst(ctx, dstNs)
+	if up, change := requestedUp(&ifinfomsg); change {
+		if err := s.setLinkAdminState(ctx, tcpip.NICID(ifinfomsg.Index), up); err != nil {
+			return err
+		}
+	}
 	return s.setLinkLocked(ctx, tcpip.NICID(ifinfomsg.Index), attrs, dstNs)
 }
 
@@ -358,10 +364,16 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 	if dst != src {
 		var err tcpip.Error
 		oldID := id
+		// Linux closes a device before it moves the device to another network
+		// namespace, so the link is down in the new namespace.
+		if err := src.setLinkAdminState(ctx, id, false); err != nil {
+			return err
+		}
 		id, err = src.Stack.SetNICStack(id, dst.Stack)
 		if err != nil {
 			return syserr.TranslateNetstackError(err)
 		}
+		dst.disableMovedLink(id, nicInfo.Kind)
 
 		src.sendDeleteEvent(ctx, oldID, nicInfo) // inform about exit from old ns
 		changed = true                           // inform about entry into new ns
@@ -640,7 +652,12 @@ func (s *Stack) newInterface(ctx context.Context, msg *nlmsg.Message, linkAttrs 
 	case "veth":
 		return s.newVeth(ctx, linkAttrs, linkInfoAttrs)
 	}
-	return s.newRegisteredLink(ctx, kind, linkAttrs, linkInfoAttrs)
+	var ifi linux.InterfaceInfoMessage
+	if _, ok := msg.GetData(&ifi); !ok {
+		return syserr.ErrInvalidArgument
+	}
+	up, _ := requestedUp(&ifi)
+	return s.newRegisteredLink(ctx, kind, up, linkAttrs, linkInfoAttrs)
 }
 
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.

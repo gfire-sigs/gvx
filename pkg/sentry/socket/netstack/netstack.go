@@ -3791,7 +3791,7 @@ func interfaceStatusFlags(stack inet.Stack, name string) (uint32, *syserr.Error)
 	// Find the NIC corresponding to this interface.
 	for _, info := range epstack.Stack.NICInfo() {
 		if info.Name == name {
-			return nicStateFlagsToLinux(info.Flags), nil
+			return linuxFlags(&info), nil
 		}
 	}
 	return 0, syserr.ErrNoDevice
