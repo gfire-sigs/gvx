@@ -31,7 +31,8 @@ import (
 
 // c5Script starts a single k3s server and runs sonobuoy against it. All test
 // pods run on the one gvx node. The test passes SONOBUOY_ARGS and E2E_FOCUS. The script
-// prints the result summary of sonobuoy and the name of each failed test.
+// prints the result summary of sonobuoy, and the name, the message, and the log
+// excerpt of each failed test.
 const c5Script = `
 mkdir -p /usr/local/bin
 cp /workspace/sonobuoy /usr/local/bin/sonobuoy && chmod 755 /usr/local/bin/sonobuoy
@@ -63,7 +64,16 @@ wait "$run"
 log "SONOBUOY-RUN-EXIT $? $(( $(date +%s) - t1 ))"
 tarball=$(sonobuoy retrieve /tmp 2>/dev/null)
 sonobuoy results "$tarball" | sed 's/^/RESULT /'
-sonobuoy results "$tarball" --plugin e2e --mode detailed | grep -E '"status": ?"failed"' | cut -c1-300 | sed 's/^/FAILED-TEST /'
+sonobuoy results "$tarball" --plugin e2e --mode detailed >/tmp/detailed.json 2>&1
+grep -E '"status": ?"failed"' /tmp/detailed.json | cut -c1-300 | sed 's/^/FAILED-TEST /'
+# The failure message of a test is in the detailed results and in e2e.log of the
+# plugin. Both go to the transcript for each failed run.
+if grep -qE '"status": ?"failed"' /tmp/detailed.json; then
+  grep -E '"failure": ?"' /tmp/detailed.json | cut -c1-3000 | sed 's/^/FAILURE-MESSAGE /'
+  mkdir -p /tmp/results && tar -xzf "$tarball" -C /tmp/results
+  e2elog=$(find /tmp/results -name e2e.log | head -n 1)
+  grep -n -B2 -A14 -E '\[(FAILED|PANICKED)\]' "$e2elog" | cut -c1-400 | head -n 600 | sed 's/^/FAILURE-LOG /'
+fi
 log "SONOBUOY-DONE"
 serve
 `
@@ -99,7 +109,7 @@ func runConformance(t *testing.T, b gateBackend, args, focus string, minPassed i
 	node.wait(t, "CLUSTER-READY ", 12*time.Minute)
 	node.wait(t, "SONOBUOY-DONE", 50*time.Minute)
 	out := node.out.String()
-	t.Logf("sonobuoy result:\n%s", linesWithPrefix(out, "RESULT ", "FAILED-TEST ", "SONOBUOY-RUN-EXIT "))
+	t.Logf("sonobuoy result:\n%s", linesWithPrefix(out, "RESULT ", "FAILED-TEST ", "FAILURE-MESSAGE ", "FAILURE-LOG ", "SONOBUOY-RUN-EXIT "))
 	field := func(name string) string {
 		m := regexp.MustCompile(`(?m)^RESULT ` + name + `: (.*)$`).FindStringSubmatch(out)
 		if m == nil {
@@ -145,12 +155,18 @@ func TestE2EK3sConformanceQuick(t *testing.T) {
 
 // TestE2EK3sConformanceServices runs the conformance tests of the
 // "[sig-network] Services" group, which is the second part of C5 of
-// GVXIP-005. The test pods run on the only node, a gvx sandbox.
+// GVXIP-005. The test pods run on the only node, a gvx sandbox. The variable
+// GVX_E2E_CONFORMANCE_FOCUS replaces the focus expression, for a fast run of a
+// few tests.
 func TestE2EK3sConformanceServices(t *testing.T) {
 	requireConformance(t)
 	for _, b := range gateBackends() {
 		t.Run(b.name, func(t *testing.T) {
-			runConformance(t, b, "--plugin e2e", `\[sig-network\] Services.*\[Conformance\]`, 10)
+			focus, minPassed := `\[sig-network\] Services.*\[Conformance\]`, 10
+			if f := os.Getenv("GVX_E2E_CONFORMANCE_FOCUS"); f != "" {
+				focus, minPassed = f, 1
+			}
+			runConformance(t, b, "--plugin e2e", focus, minPassed)
 		})
 	}
 }
