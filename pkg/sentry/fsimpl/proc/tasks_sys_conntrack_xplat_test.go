@@ -210,6 +210,18 @@ func TestConntrackMaxFileSharesOneKernelValue(t *testing.T) {
 			t.Errorf("write %q = %v, want EINVAL", text, err)
 		}
 	}
+	// White space alone changes nothing. It must not remove the limit.
+	if err := write("1000"); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"\n", " ", " \n"} {
+		if err := write(text); err != nil {
+			t.Fatalf("write %q: %v", text, err)
+		}
+		if got := read(); got != "1000\n" {
+			t.Errorf("nf_conntrack_max after a write of %q = %q, want 1000", text, got)
+		}
+	}
 	if err := write("0"); err != nil {
 		t.Fatal(err)
 	}

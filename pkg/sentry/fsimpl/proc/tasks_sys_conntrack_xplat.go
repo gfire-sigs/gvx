@@ -175,7 +175,9 @@ func (f *conntrackMaxFile) Write(ctx context.Context, _ *vfs.FileDescription, sr
 	}
 	sysctlWriteMu.Lock()
 	defer sysctlWriteMu.Unlock()
-	val, err := intVecParser(1, math.MinInt32, math.MaxInt32, nil)(text, "")
+	// A write of white space only changes nothing, so the parser starts from the
+	// current value.
+	val, err := intVecParser(1, math.MinInt32, math.MaxInt32, nil)(text, strconv.Itoa(int(s.ConntrackMax())))
 	if err != nil {
 		return 0, err
 	}
