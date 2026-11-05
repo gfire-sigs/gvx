@@ -157,6 +157,9 @@ func (o commandOptions) identity() (instanceIdentity, error) {
 	return id, validateIdentity(id)
 }
 
+// diagnosticTimeout bounds one write of a failure reason to standard error.
+const diagnosticTimeout = time.Second
+
 var (
 	errPositiveTimeout   = errors.New("timeout must be positive")
 	errOneAction         = errors.New("exactly one action is required: start, serve, delete")
@@ -170,7 +173,10 @@ func commandFailure(ctx context.Context, diagnostics *os.File, err error) proces
 }
 
 func writeCommandError(ctx context.Context, diagnostics *os.File, err error) {
-	// An expired lifecycle cannot wait for a diagnostic reader.
+	// An expired lifecycle deadline must not suppress the failure reason.
+	// A separate bound keeps a stalled diagnostic reader from blocking exit.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diagnosticTimeout)
+	defer cancel()
 	_ = boundedFileIO(ctx, diagnostics, func(stream io.ReadWriter) error {
 		_, writeError := fmt.Fprintln(stream, err)
 		return writeError

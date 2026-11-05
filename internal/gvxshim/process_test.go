@@ -29,6 +29,9 @@ import (
 
 const processReexecEnv = "GVX_SHIM_TEST_REEXEC"
 
+// cleanupTimeout is the minimum lifecycle timeout of the cleanup delete action.
+const cleanupTimeout = 5 * time.Second
+
 func TestMain(m *testing.M) {
 	if os.Getenv(processReexecEnv) == "1" {
 		gate, err := processServeGate()
@@ -78,7 +81,11 @@ func newProcessFixture(t *testing.T) *processFixture {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		out, stderr, err := f.command(ctx, "delete", nil)
+		// The test body can set a short lifecycle timeout. Cleanup must not
+		// inherit it: on a loaded host, identity setup alone can exceed 250 ms.
+		cleanup := *f
+		cleanup.timeout = max(f.timeout, cleanupTimeout)
+		out, stderr, err := cleanup.command(ctx, "delete", nil)
 		if err != nil {
 			t.Errorf("cleanup shim %s: %v; stderr=%s", f.id, err, stderr)
 			return
@@ -406,6 +413,20 @@ func TestProcessOptionsPipeExpires(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.bundle, ".gvx-shim")); !os.IsNotExist(err) {
 		t.Errorf("options validation created resources before EOF: %v", err)
+	}
+}
+
+func TestProcessExpiredDeleteReportsReason(t *testing.T) {
+	f := newProcessFixture(t)
+	f.timeout = time.Nanosecond
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	out, stderr, err := f.command(ctx, "delete", nil)
+	if err == nil {
+		t.Fatalf("delete succeeded after its deadline: stdout=%q", out)
+	}
+	if !strings.Contains(stderr, context.DeadlineExceeded.Error()) {
+		t.Errorf("expired delete stderr=%q, want %q", stderr, context.DeadlineExceeded)
 	}
 }
 

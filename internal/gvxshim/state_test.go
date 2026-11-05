@@ -302,7 +302,7 @@ func TestPrivateFramePreservesRedirectedFilePosition(t *testing.T) {
 	}
 }
 
-func TestExpiredLifecycleDoesNotWaitForDiagnosticReader(t *testing.T) {
+func TestExpiredLifecycleStillReportsFailure(t *testing.T) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -311,12 +311,49 @@ func TestExpiredLifecycleDoesNotWaitForDiagnosticReader(t *testing.T) {
 	defer writer.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	writeCommandError(ctx, writer, context.DeadlineExceeded)
+	writeCommandError(ctx, writer, errors.New("delete failed"))
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	var data [1]byte
-	if n, err := reader.Read(data[:]); n != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("expired lifecycle attempted diagnostic output: n=%d err=%v", n, err)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "delete failed\n" {
+		t.Fatalf("expired lifecycle diagnostic=%q, want the failure reason", data)
+	}
+}
+
+func TestExpiredLifecycleDoesNotWaitForDiagnosticReader(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close the reader first: it ends the filler write that blocks on the full pipe.
+	defer func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	}()
+	// Fill the pipe so that no diagnostic write can complete without a reader.
+	go func() {
+		chunk := make([]byte, 4096)
+		for {
+			if _, err := writer.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		writeCommandError(ctx, writer, context.DeadlineExceeded)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * diagnosticTimeout):
+		t.Fatal("expired lifecycle waited for a diagnostic reader")
 	}
 }
