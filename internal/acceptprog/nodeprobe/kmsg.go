@@ -331,17 +331,35 @@ func kmsgSemanticsChecks() []check {
 				return nil
 			})
 		}},
-		{"kmsg-read-into-a-small-buffer-fails-with-einval", func() error {
+		{"kmsg-read-into-a-small-buffer-fails-with-einval-and-skips-the-record", func() error {
 			return withReader(func(fd int) error {
 				if err := writeKmsg("probe-small-buffer"); err != nil {
+					return err
+				}
+				if err := writeKmsg("probe-after-small-buffer"); err != nil {
 					return err
 				}
 				if _, err := unix.Read(fd, make([]byte, 8)); !errors.Is(err, syscall.EINVAL) {
 					return fmt.Errorf("read into 8 bytes: %v, want EINVAL", err)
 				}
+				// As in Linux, the failed read moved past the record.
 				rec, err := readKmsgRecord(fd)
-				if err != nil || rec.text != "probe-small-buffer" {
-					return fmt.Errorf("the read after EINVAL = %+v, %v, want the same record", rec, err)
+				if err != nil || rec.text != "probe-after-small-buffer" {
+					return fmt.Errorf("the read after EINVAL = %+v, %v, want the next record", rec, err)
+				}
+				return nil
+			})
+		}},
+		{"kmsg-read-of-an-escaped-record-is-at-most-2048-bytes", func() error {
+			return withReader(func(fd int) error {
+				// 1000 control bytes escape to 4000 bytes.
+				if err := writeKmsg(strings.Repeat("\x01", 1000)); err != nil {
+					return err
+				}
+				buf := make([]byte, 8192)
+				n, err := unix.Read(fd, buf)
+				if err != nil || n > 2048 || n < 2040 || buf[n-1] != '\n' {
+					return fmt.Errorf("read = %d bytes, %v, want 2040 to 2048 bytes ending with a newline", n, err)
 				}
 				return nil
 			})
@@ -415,17 +433,19 @@ func kmsgSemanticsChecks() []check {
 				if err != nil {
 					return err
 				}
-				defer unix.Close(w)
 				for i := 0; i < 15; i++ {
 					if n, err := unix.Write(w, []byte(fmt.Sprintf("probe-rl-%d", i))); err != nil || n != len(fmt.Sprintf("probe-rl-%d", i)) {
+						unix.Close(w)
 						return fmt.Errorf("write %d = %d, %v: a dropped write must still succeed", i, n, err)
 					}
 				}
 				if err := writeKmsg("probe-rl-other"); err != nil {
+					unix.Close(w)
 					return err
 				}
 				recs, err := drainKmsg(fd)
 				if err != nil {
+					unix.Close(w)
 					return err
 				}
 				count := 0
@@ -433,35 +453,56 @@ func kmsgSemanticsChecks() []check {
 					if strings.HasPrefix(r.text, "probe-rl-") {
 						count++
 					}
+					if strings.Contains(r.text, "suppressed") {
+						unix.Close(w)
+						return fmt.Errorf("record %q appeared before the file closed", r.text)
+					}
 				}
 				if count != 11 {
+					unix.Close(w)
 					return fmt.Errorf("%d records, want 10 from the first file and 1 from the second", count)
+				}
+				// Closing the file reports the 5 dropped writes, as Linux does.
+				unix.Close(w)
+				recs, err = drainKmsg(fd)
+				if err != nil {
+					return err
+				}
+				if len(recs) != 1 || recs[0].prio != 4 || !strings.HasSuffix(recs[0].text, ": 5 output lines suppressed due to ratelimiting") {
+					return fmt.Errorf("records after the close = %+v, want the notice about 5 suppressed lines at level 4", recs)
 				}
 				return nil
 			})
 		}},
-		{"kmsg-printk-devkmsg-off-drops-writes-and-on-keeps-all", func() error {
-			if err := withDevkmsgMode("off", func() error {
-				return withReader(func(fd int) error {
-					if err := writeKmsg("probe-off"); err != nil {
-						return err
+		{"kmsg-printk-devkmsg-off-refuses-opens-and-drops-writes-and-on-keeps-all", func() error {
+			// Descriptors that were open before the switch keep working.
+			return withReader(func(fd int) error {
+				w, err := unix.Open(kmsgPath, unix.O_WRONLY, 0)
+				if err != nil {
+					return err
+				}
+				defer unix.Close(w)
+				if err := withDevkmsgMode("off", func() error {
+					if n, err := unix.Write(w, []byte("probe-off")); err != nil || n != len("probe-off") {
+						return fmt.Errorf("mode off: write = %d, %v, want success", n, err)
 					}
 					recs, err := drainKmsg(fd)
 					if err != nil || len(recs) != 0 {
 						return fmt.Errorf("mode off: records %+v, %v, want none", recs, err)
 					}
-					return nil
-				})
-			}); err != nil {
-				return err
-			}
-			return withDevkmsgMode("on", func() error {
-				return withReader(func(fd int) error {
-					w, err := unix.Open(kmsgPath, unix.O_WRONLY, 0)
-					if err != nil {
-						return err
+					for _, flags := range []int{unix.O_RDONLY, unix.O_WRONLY, unix.O_RDWR} {
+						if opened, err := unix.Open(kmsgPath, flags, 0); !errors.Is(err, syscall.EPERM) {
+							if err == nil {
+								unix.Close(opened)
+							}
+							return fmt.Errorf("mode off: open with flags %#o = %v, want EPERM", flags, err)
+						}
 					}
-					defer unix.Close(w)
+					return nil
+				}); err != nil {
+					return err
+				}
+				return withDevkmsgMode("on", func() error {
 					for i := 0; i < 30; i++ {
 						if _, err := unix.Write(w, []byte("probe-on")); err != nil {
 							return err
@@ -789,8 +830,12 @@ func syslogChecks() []check {
 			}{
 				{"CONSOLE_LEVEL 3", func() error { return setLevel(3) }, "3"},
 				{"CONSOLE_OFF", func() error { _, err := unix.Klogctl(syslogConsoleOff, nil); return err }, "1"},
-				{"CONSOLE_ON", func() error { _, err := unix.Klogctl(syslogConsoleOn, nil); return err }, "7"},
+				{"CONSOLE_ON restores the saved level", func() error { _, err := unix.Klogctl(syslogConsoleOn, nil); return err }, "3"},
+				{"CONSOLE_ON without a saved level", func() error { _, err := unix.Klogctl(syslogConsoleOn, nil); return err }, "3"},
 				{"CONSOLE_LEVEL 8", func() error { return setLevel(8) }, "8"},
+				{"CONSOLE_OFF again", func() error { _, err := unix.Klogctl(syslogConsoleOff, nil); return err }, "1"},
+				{"CONSOLE_LEVEL 5 drops the saved level", func() error { return setLevel(5) }, "5"},
+				{"CONSOLE_ON after CONSOLE_LEVEL", func() error { _, err := unix.Klogctl(syslogConsoleOn, nil); return err }, "5"},
 			} {
 				if err := tc.do(); err != nil {
 					return fmt.Errorf("%s: %w", tc.name, err)

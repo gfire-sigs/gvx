@@ -214,7 +214,7 @@ func TestWriteDevkmsgParsesThePrefix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			l, _ := newTestLog(KernelLogDefaultBufLen)
 			l.SetDevkmsgMode(DevkmsgOn)
-			if err := l.WriteDevkmsg(&LogRateLimit{}, "sh", []byte(tc.data)); err != nil {
+			if err := l.WriteDevkmsg(&LogRateLimit{}, []byte(tc.data)); err != nil {
 				t.Fatal(err)
 			}
 			rec, ok := l.Lookup(0)
@@ -228,7 +228,7 @@ func TestWriteDevkmsgParsesThePrefix(t *testing.T) {
 func TestWriteDevkmsgUsesDefaultMessageLogLevel(t *testing.T) {
 	l, _ := newTestLog(KernelLogDefaultBufLen)
 	l.SetLevels([4]int{7, 2, 1, 7})
-	if err := l.WriteDevkmsg(&LogRateLimit{}, "sh", []byte("x")); err != nil {
+	if err := l.WriteDevkmsg(&LogRateLimit{}, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	if rec, _ := l.Lookup(0); rec.Level != 2 {
@@ -238,7 +238,7 @@ func TestWriteDevkmsgUsesDefaultMessageLogLevel(t *testing.T) {
 
 func TestWriteDevkmsgSplitsAtNewlines(t *testing.T) {
 	l, _ := newTestLog(KernelLogDefaultBufLen)
-	if err := l.WriteDevkmsg(&LogRateLimit{}, "sh", []byte("<5>a\nb\nc\n")); err != nil {
+	if err := l.WriteDevkmsg(&LogRateLimit{}, []byte("<5>a\nb\nc\n")); err != nil {
 		t.Fatal(err)
 	}
 	if got := texts(l, 0); strings.Join(got, "|") != "a|b|c" {
@@ -253,11 +253,11 @@ func TestWriteDevkmsgSplitsAtNewlines(t *testing.T) {
 
 func TestWriteDevkmsgRejectsMoreThanOneRecordOfBytes(t *testing.T) {
 	l, _ := newTestLog(KernelLogDefaultBufLen)
-	err := l.WriteDevkmsg(&LogRateLimit{}, "sh", make([]byte, KernelLogRecordMax+1))
+	err := l.WriteDevkmsg(&LogRateLimit{}, make([]byte, KernelLogRecordMax+1))
 	if !linuxerr.Equals(linuxerr.EINVAL, err) {
 		t.Errorf("WriteDevkmsg(1025 bytes) = %v, want EINVAL", err)
 	}
-	if err := l.WriteDevkmsg(&LogRateLimit{}, "sh", make([]byte, KernelLogRecordMax)); err != nil {
+	if err := l.WriteDevkmsg(&LogRateLimit{}, make([]byte, KernelLogRecordMax)); err != nil {
 		t.Errorf("WriteDevkmsg(1024 bytes) = %v, want nil", err)
 	}
 }
@@ -265,7 +265,7 @@ func TestWriteDevkmsgRejectsMoreThanOneRecordOfBytes(t *testing.T) {
 func TestWriteDevkmsgOffDropsTheWriteAndSucceeds(t *testing.T) {
 	l, _ := newTestLog(KernelLogDefaultBufLen)
 	l.SetDevkmsgMode(DevkmsgOff)
-	if err := l.WriteDevkmsg(&LogRateLimit{}, "sh", []byte("x")); err != nil {
+	if err := l.WriteDevkmsg(&LogRateLimit{}, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	if l.NextSeq() != 0 {
@@ -277,7 +277,7 @@ func TestWriteDevkmsgRateLimitAllowsTenWritesInFiveSeconds(t *testing.T) {
 	l, clock := newTestLog(KernelLogDefaultBufLen)
 	rl := &LogRateLimit{}
 	for i := 0; i < 15; i++ {
-		if err := l.WriteDevkmsg(rl, "sh", []byte(fmt.Sprintf("w%d", i))); err != nil {
+		if err := l.WriteDevkmsg(rl, []byte(fmt.Sprintf("w%d", i))); err != nil {
 			t.Fatal(err)
 		}
 		clock.now += 100 * time.Millisecond
@@ -286,17 +286,38 @@ func TestWriteDevkmsgRateLimitAllowsTenWritesInFiveSeconds(t *testing.T) {
 		t.Fatalf("records = %q, want w0 to w9", got)
 	}
 
-	// The next period starts after 5 seconds. The write reports the 5 drops.
+	// A new period of 5 seconds allows 10 more writes. It adds no notice: the
+	// limit reports the drops once, when the descriptor closes.
 	clock.now = 5*time.Second + time.Millisecond
-	if err := l.WriteDevkmsg(rl, "sh", []byte("again")); err != nil {
+	if err := l.WriteDevkmsg(rl, []byte("again")); err != nil {
 		t.Fatal(err)
 	}
-	got := texts(l, 0)
-	if len(got) != 12 || got[10] != "sh: 5 callbacks suppressed" || got[11] != "again" {
-		t.Errorf("records after the period = %q", got[10:])
+	if got := texts(l, 0); len(got) != 11 || got[10] != "again" {
+		t.Errorf("records after the period = %q, want again and no notice", got[10:])
 	}
-	if rec, _ := l.Lookup(10); rec.Facility != LogFacilityKern || rec.Level != LogWarning {
+	if rl.Missed() != 5 {
+		t.Errorf("Missed = %d, want 5: a new period keeps the count", rl.Missed())
+	}
+
+	l.ReleaseDevkmsg(rl, "sh")
+	got := texts(l, 0)
+	if len(got) != 12 || got[11] != "sh: 5 output lines suppressed due to ratelimiting" {
+		t.Errorf("records after the release = %q", got[11:])
+	}
+	if rec, _ := l.Lookup(11); rec.Facility != LogFacilityKern || rec.Level != LogWarning {
 		t.Errorf("the notice has facility %d level %d, want kernel warning", rec.Facility, rec.Level)
+	}
+}
+
+func TestReleaseDevkmsgWithoutDroppedWritesAddsNothing(t *testing.T) {
+	l, _ := newTestLog(KernelLogDefaultBufLen)
+	rl := &LogRateLimit{}
+	if err := l.WriteDevkmsg(rl, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	l.ReleaseDevkmsg(rl, "sh")
+	if got := texts(l, 0); len(got) != 1 {
+		t.Errorf("records = %q, want only x", got)
 	}
 }
 
@@ -304,10 +325,10 @@ func TestWriteDevkmsgRateLimitIsPerDescriptor(t *testing.T) {
 	l, _ := newTestLog(KernelLogDefaultBufLen)
 	a, b := &LogRateLimit{}, &LogRateLimit{}
 	for i := 0; i < 10; i++ {
-		_ = l.WriteDevkmsg(a, "sh", []byte("a"))
+		_ = l.WriteDevkmsg(a, []byte("a"))
 	}
-	_ = l.WriteDevkmsg(a, "sh", []byte("dropped"))
-	_ = l.WriteDevkmsg(b, "sh", []byte("b"))
+	_ = l.WriteDevkmsg(a, []byte("dropped"))
+	_ = l.WriteDevkmsg(b, []byte("b"))
 	got := texts(l, 0)
 	if len(got) != 11 || got[10] != "b" {
 		t.Errorf("records = %q, want ten a and one b", got)
@@ -319,7 +340,7 @@ func TestWriteDevkmsgOnIgnoresTheRateLimit(t *testing.T) {
 	l.SetDevkmsgMode(DevkmsgOn)
 	rl := &LogRateLimit{}
 	for i := 0; i < 50; i++ {
-		_ = l.WriteDevkmsg(rl, "sh", []byte("x"))
+		_ = l.WriteDevkmsg(rl, []byte("x"))
 	}
 	if l.NextSeq() != 50 {
 		t.Errorf("records = %d, want 50", l.NextSeq())
@@ -456,5 +477,75 @@ func TestConsoleLevels(t *testing.T) {
 	l.SetLevels([4]int{5, 4, 2, 7})
 	if !l.SetConsoleLevel(1) || l.Levels()[0] != 2 {
 		t.Errorf("a level below the minimum gave %d, want the minimum 2", l.Levels()[0])
+	}
+}
+
+func TestConsoleOnRestoresTheLevelThatConsoleOffSaved(t *testing.T) {
+	l, _ := newTestLog(KernelLogDefaultBufLen)
+	level := func() int { return l.Levels()[0] }
+	l.SetConsoleLevel(3)
+	l.ConsoleOff()
+	if level() != 1 {
+		t.Fatalf("level after off = %d, want 1", level())
+	}
+	// A second off keeps the first saved level.
+	l.ConsoleOff()
+	l.ConsoleOn()
+	if level() != 3 {
+		t.Errorf("level after off, off, on = %d, want the saved 3", level())
+	}
+	// With nothing saved, on changes nothing.
+	l.SetConsoleLevel(5)
+	l.ConsoleOn()
+	if level() != 5 {
+		t.Errorf("level after on without off = %d, want 5", level())
+	}
+	// A new level drops the saved one.
+	l.ConsoleOff()
+	l.SetConsoleLevel(6)
+	l.ConsoleOn()
+	if level() != 6 {
+		t.Errorf("level after off, level 6, on = %d, want 6", level())
+	}
+}
+
+func TestSyslogLenEqualsTheLengthOfTheFormattedLine(t *testing.T) {
+	for _, rec := range []KernelLogRecord{
+		{Text: ""},
+		{Time: 999 * time.Millisecond, Facility: 1, Level: 6, Text: "x"},
+		{Time: 12*time.Second + 345*time.Microsecond, Facility: 3, Level: 4, Text: "hello"},
+		{Time: 123456*time.Second + 7*time.Microsecond, Facility: 255, Level: 7, Text: strings.Repeat("y", 1000)},
+	} {
+		if got, want := rec.syslogLen(), len(rec.AppendSyslog(nil)); got != want {
+			t.Errorf("syslogLen(%+v) = %d, want %d", rec, got, want)
+		}
+	}
+}
+
+func TestKmsgRecordIsAtMostPrintkMessageMax(t *testing.T) {
+	// 1024 bytes of backslashes escape to 4096 bytes.
+	rec := KernelLogRecord{Seq: 1, Text: strings.Repeat("\\", KernelLogRecordMax)}
+	line := rec.AppendKmsg(nil)
+	if len(line) > KernelLogMessageMax || len(line) < KernelLogMessageMax-4 {
+		t.Fatalf("len = %d, want at most %d and within one escape of it", len(line), KernelLogMessageMax)
+	}
+	if line[len(line)-1] != '\n' {
+		t.Errorf("the cut record does not end with a newline")
+	}
+	body := strings.TrimSuffix(string(line), "\n")
+	body = body[strings.Index(body, ";")+1:]
+	if len(body)%4 != 0 || strings.Count(body, `\x5c`) != len(body)/4 {
+		t.Errorf("the cut record holds a partial escape: %q", body[max(0, len(body)-8):])
+	}
+}
+
+func TestReadAllWalksBackAndFormatsOnlyTheRecordsThatFit(t *testing.T) {
+	l, _ := newTestLog(KernelLogDefaultBufLen)
+	for i := 0; i < 3000; i++ {
+		l.Printk(LogInfo, fmt.Sprintf("record %04d", i))
+	}
+	got := string(l.ReadAll(2*len("<6>[    0.000000] record 0000\n")+1, false))
+	if got != "<6>[    0.000000] record 2998\n<6>[    0.000000] record 2999\n" {
+		t.Errorf("ReadAll = %q, want the last two records", got)
 	}
 }

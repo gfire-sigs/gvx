@@ -23,6 +23,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -59,15 +60,58 @@ func TestKmsgReadReturnsOneRecordInTheDocumentedFormat(t *testing.T) {
 	}
 }
 
-func TestKmsgReadWithASmallBufferFailsAndKeepsThePosition(t *testing.T) {
+func TestKmsgReadWithASmallBufferFailsAndSkipsTheRecord(t *testing.T) {
 	fd, l := newKmsgFD(kernel.KernelLogDefaultBufLen)
 	l.Printk(kernel.LogInfo, "0123456789")
+	l.Printk(kernel.LogInfo, "next")
 	line := "6,0,7000000,-;0123456789\n"
 	if _, err := fd.readInto(len(line) - 1); !linuxerr.Equals(linuxerr.EINVAL, err) {
 		t.Fatalf("read into a small buffer: err = %v, want EINVAL", err)
 	}
-	if got, err := fd.readInto(len(line)); err != nil || got != line {
-		t.Errorf("read after EINVAL = %q, %v, want %q", got, err, line)
+	// As in Linux, the failed read moved the position past the record.
+	if got, err := fd.readInto(8192); err != nil || got != "6,1,7000000,-;next\n" {
+		t.Errorf("read after EINVAL = %q, %v, want the next record", got, err)
+	}
+}
+
+func TestKmsgReadOfAnEscapedRecordIsAtMost2048Bytes(t *testing.T) {
+	fd, l := newKmsgFD(kernel.KernelLogDefaultBufLen)
+	l.Printk(kernel.LogInfo, strings.Repeat("\x01", kernel.KernelLogRecordMax))
+	got, err := fd.readInto(8192)
+	if err != nil || len(got) > kernel.KernelLogMessageMax {
+		t.Errorf("read = %d bytes, %v, want at most %d", len(got), err, kernel.KernelLogMessageMax)
+	}
+	if _, err := fd.readInto(kernel.KernelLogMessageMax); !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Errorf("a buffer of 2048 bytes did not hold the whole read: %v", err)
+	}
+}
+
+func TestKmsgOpenFailsWithEPERMInTheModeOffForEveryOpener(t *testing.T) {
+	k := &kernel.Kernel{}
+	k.KernelLog().SetDevkmsgMode(kernel.DevkmsgOff)
+	ctx := context.WithValues(context.Background(), map[any]any{
+		kernel.CtxKernel:    k,
+		auth.CtxCredentials: auth.NewRootCredentials(auth.NewRootUserNamespace()),
+	})
+	for _, flags := range []uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_RDWR} {
+		_, err := kmsgDevice{}.Open(ctx, nil, nil, vfs.OpenOptions{Flags: flags})
+		if !linuxerr.Equals(linuxerr.EPERM, err) {
+			t.Errorf("Open(flags %#o) in the mode off: err = %v, want EPERM", flags, err)
+		}
+	}
+}
+
+func TestKmsgReleaseRecordsTheWritesThatTheRateLimitDropped(t *testing.T) {
+	fd, l := newKmsgFD(kernel.KernelLogDefaultBufLen)
+	for i := 0; i < 13; i++ {
+		if _, err := fd.writeString("x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fd.Release(context.Background())
+	rec, ok := l.Lookup(l.NextSeq() - 1)
+	if !ok || rec.Text != "kernel: 3 output lines suppressed due to ratelimiting" || rec.Level != kernel.LogWarning {
+		t.Errorf("last record = %+v, want the notice about 3 suppressed lines", rec)
 	}
 }
 

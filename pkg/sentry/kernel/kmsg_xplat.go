@@ -67,6 +67,10 @@ const (
 	// KernelLogMaxBufLen is LOG_BUF_LEN_MAX of Linux.
 	KernelLogMaxBufLen = 1 << 31
 
+	// KernelLogMessageMax is the longest read of /dev/kmsg, PRINTK_MESSAGE_MAX
+	// of Linux. A longer record loses the end of its text.
+	KernelLogMessageMax = 2048
+
 	// KernelLogRecordMax is the longest text of a record and the longest
 	// write to /dev/kmsg, PRINTKRB_RECORD_MAX of Linux.
 	KernelLogRecordMax = 1024
@@ -161,8 +165,11 @@ func (r KernelLogRecord) blockSize() int {
 // AppendKmsg appends the record in the format of a read of /dev/kmsg:
 // "prio,seq,usec,flag;text\n". The text escapes each byte below 0x20, each
 // byte above 0x7e, and the backslash as \xNN. Documentation/ABI/testing/dev-kmsg
-// of Linux describes the format.
+// of Linux describes the format. The record is at most KernelLogMessageMax
+// bytes, with its newline. An escape that does not fit is not cut: the record
+// ends before it.
 func (r KernelLogRecord) AppendKmsg(dst []byte) []byte {
+	start := len(dst)
 	dst = strconv.AppendInt(dst, int64(r.Priority()), 10)
 	dst = append(dst, ',')
 	dst = strconv.AppendUint(dst, r.Seq, 10)
@@ -172,7 +179,16 @@ func (r KernelLogRecord) AppendKmsg(dst []byte) []byte {
 	const hex = "0123456789abcdef"
 	for i := range len(r.Text) {
 		c := r.Text[i]
-		if c < ' ' || c >= 127 || c == '\\' {
+		escaped := c < ' ' || c >= 127 || c == '\\'
+		width := 1
+		if escaped {
+			width = 4
+		}
+		// Keep one byte for the newline.
+		if len(dst)-start+width > KernelLogMessageMax-1 {
+			break
+		}
+		if escaped {
 			dst = append(dst, '\\', 'x', hex[c>>4], hex[c&15])
 			continue
 		}
@@ -187,6 +203,20 @@ func (r KernelLogRecord) AppendSyslog(dst []byte) []byte {
 	dst = fmt.Appendf(dst, "<%d>[%5d.%06d] ", r.Priority(), int64(r.Time/time.Second), int64(r.Time%time.Second/time.Microsecond))
 	dst = append(dst, r.Text...)
 	return append(dst, '\n')
+}
+
+// syslogLen returns len(AppendSyslog) without the format.
+func (r KernelLogRecord) syslogLen() int {
+	digits := func(n int64) int {
+		d := 1
+		for ; n >= 10; n /= 10 {
+			d++
+		}
+		return d
+	}
+	// "<prio>[", the seconds with a width of 5, ".", 6 digits, "] ", the text,
+	// and the newline.
+	return 1 + digits(int64(r.Priority())) + 2 + max(5, digits(int64(r.Time/time.Second))) + 1 + 6 + 2 + len(r.Text) + 1
 }
 
 // KernelLog is the kernel log ring of one kernel. All methods are safe for
@@ -229,7 +259,13 @@ type KernelLog struct {
 	// minimum_console_loglevel, and default_console_loglevel, in the order of
 	// /proc/sys/kernel/printk.
 	levels [4]int
+	// savedConsole is the console level that SYSLOG_ACTION_CONSOLE_OFF
+	// replaced, or noSavedConsole.
+	savedConsole int
 }
+
+// noSavedConsole is LOGLEVEL_DEFAULT of Linux in the field savedConsole.
+const noSavedConsole = -1
 
 // NewKernelLog returns an empty kernel log. bufLen is the size of the ring in
 // bytes. As in Linux, the log rounds it up to a power of two, and a value
@@ -241,10 +277,11 @@ func NewKernelLog(bufLen int, now func() time.Duration) *KernelLog {
 		size <<= 1
 	}
 	return &KernelLog{
-		now:        now,
-		bufLen:     size,
-		maxRecords: size >> logAvgRecordBits,
-		levels:     [4]int{defaultConsoleLogLevel, defaultMessageLogLevel, minimumConsoleLogLevel, defaultConsoleLogLevel},
+		now:          now,
+		bufLen:       size,
+		maxRecords:   size >> logAvgRecordBits,
+		levels:       [4]int{defaultConsoleLogLevel, defaultMessageLogLevel, minimumConsoleLogLevel, defaultConsoleLogLevel},
+		savedConsole: noSavedConsole,
 	}
 }
 
@@ -424,8 +461,9 @@ func (l *KernelLog) SetLevels(levels [4]int) {
 }
 
 // SetConsoleLevel implements SYSLOG_ACTION_CONSOLE_LEVEL. level is a value from
-// 1 to 8. A level below minimum_console_loglevel becomes that minimum. It
-// returns false for a level outside 1 to 8.
+// 1 to 8. A level below minimum_console_loglevel becomes that minimum. The call
+// also drops the level that CONSOLE_OFF saved. It returns false for a level
+// outside 1 to 8.
 func (l *KernelLog) SetConsoleLevel(level int) bool {
 	if level < 1 || level > 8 {
 		return false
@@ -433,51 +471,59 @@ func (l *KernelLog) SetConsoleLevel(level int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.levels[0] = max(level, l.levels[2])
+	l.savedConsole = noSavedConsole
 	return true
 }
 
-// ConsoleOff implements SYSLOG_ACTION_CONSOLE_OFF.
+// ConsoleOff implements SYSLOG_ACTION_CONSOLE_OFF. It saves the console level
+// unless a previous call saved one, and sets the minimum level.
 func (l *KernelLog) ConsoleOff() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.savedConsole == noSavedConsole {
+		l.savedConsole = l.levels[0]
+	}
 	l.levels[0] = l.levels[2]
 }
 
-// ConsoleOn implements SYSLOG_ACTION_CONSOLE_ON.
+// ConsoleOn implements SYSLOG_ACTION_CONSOLE_ON. It restores the level that
+// CONSOLE_OFF saved, and does nothing when no level is saved.
 func (l *KernelLog) ConsoleOn() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.levels[0] = l.levels[3]
+	if l.savedConsole != noSavedConsole {
+		l.levels[0] = l.savedConsole
+		l.savedConsole = noSavedConsole
+	}
 }
 
 // ReadAll implements SYSLOG_ACTION_READ_ALL and SYSLOG_ACTION_READ_CLEAR. It
 // returns the newest records since the last clear, in the text form of
 // syslog(2), whole records only, and at most size bytes. With clear set, it
-// then clears the log.
+// then clears the log. The call walks back from the newest record and stops at
+// size, and it formats the records after it releases the lock, so its cost
+// under the lock does not grow with the ring.
 func (l *KernelLog) ReadAll(size int, clear bool) []byte {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	start := max(l.clearSeq, l.firstSeqLocked())
-	var lines [][]byte
+	var newestFirst []KernelLogRecord
 	total := 0
-	for seq := start; seq < l.nextSeq; seq++ {
-		rec, _ := l.lookupLocked(seq)
-		line := rec.AppendSyslog(nil)
-		lines = append(lines, line)
-		total += len(line)
-	}
-	// Drop the oldest records until the rest fits.
-	skip := 0
-	for skip < len(lines) && total > size {
-		total -= len(lines[skip])
-		skip++
-	}
-	out := make([]byte, 0, total)
-	for _, line := range lines[skip:] {
-		out = append(out, line...)
+	for seq := l.nextSeq; seq > start; seq-- {
+		rec, _ := l.lookupLocked(seq - 1)
+		n := rec.syslogLen()
+		if total+n > size {
+			break
+		}
+		total += n
+		newestFirst = append(newestFirst, rec)
 	}
 	if clear {
 		l.clearSeq = l.nextSeq
+	}
+	l.mu.Unlock()
+	out := make([]byte, 0, total)
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		out = newestFirst[i].AppendSyslog(out)
 	}
 	return out
 }
@@ -493,33 +539,47 @@ func (l *KernelLog) skipGoneLocked() {
 	}
 }
 
+// syslogSegment is the part of one record that a Read returns.
+type syslogSegment struct {
+	rec        KernelLogRecord
+	skip, take int
+}
+
 // Read implements SYSLOG_ACTION_READ. It returns up to size bytes of the
 // records after the read position, in the text form of syslog(2), and moves the
 // position. It returns a partial record when the next record does not fit and
-// no byte was returned before. It returns nil when no record is unread.
+// no byte was returned before. It returns nil when no record is unread. The
+// call moves the position under the lock and formats after it.
 func (l *KernelLog) Read(size int) []byte {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	var out []byte
-	for size > len(out) {
+	var segments []syslogSegment
+	got := 0
+	for size > got {
 		l.skipGoneLocked()
 		rec, ok := l.lookupLocked(l.syslogSeq)
 		if !ok {
 			break
 		}
-		line := rec.AppendSyslog(nil)[l.syslogPartial:]
-		room := size - len(out)
-		if len(line) <= room {
-			out = append(out, line...)
+		n := rec.syslogLen() - l.syslogPartial
+		room := size - got
+		if n <= room {
+			segments = append(segments, syslogSegment{rec, l.syslogPartial, n})
+			got += n
 			l.syslogSeq = rec.Seq + 1
 			l.syslogPartial = 0
 			continue
 		}
-		if len(out) == 0 {
-			out = append(out, line[:room]...)
+		if got == 0 {
+			segments = append(segments, syslogSegment{rec, l.syslogPartial, room})
+			got = room
 			l.syslogPartial += room
 		}
 		break
+	}
+	l.mu.Unlock()
+	out := make([]byte, 0, got)
+	for _, seg := range segments {
+		out = append(out, seg.rec.AppendSyslog(nil)[seg.skip:seg.skip+seg.take]...)
 	}
 	return out
 }
@@ -533,7 +593,7 @@ func (l *KernelLog) UnreadSize() int {
 	total := 0
 	for seq := l.syslogSeq; seq < l.nextSeq; seq++ {
 		rec, _ := l.lookupLocked(seq)
-		total += len(rec.AppendSyslog(nil))
+		total += rec.syslogLen()
 	}
 	return total - l.syslogPartial
 }
@@ -549,10 +609,11 @@ type LogRateLimit struct {
 	missed  int
 }
 
-// Allow reports whether a write at the time since boot may pass. suppressed is
-// the number of writes that the limit dropped in the period that just ended. It
-// is not zero at most once for each period.
-func (r *LogRateLimit) Allow(now time.Duration) (ok bool, suppressed int) {
+// Allow reports whether a write at the time since boot may pass. A period
+// starts at the first write and ends after 5 seconds. The limit counts the writes
+// that it drops, and it does not reset that count at the end of a period, as
+// Linux does with RATELIMIT_MSG_ON_RELEASE. Missed returns the count.
+func (r *LogRateLimit) Allow(now time.Duration) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.started {
@@ -560,28 +621,33 @@ func (r *LogRateLimit) Allow(now time.Duration) (ok bool, suppressed int) {
 		r.begin = now
 	}
 	if now-r.begin > logRateInterval {
-		suppressed, r.missed = r.missed, 0
 		r.begin = now
 		r.printed = 0
 	}
 	if r.printed < logRateBurst {
 		r.printed++
-		return true, suppressed
+		return true
 	}
 	r.missed++
-	return false, suppressed
+	return false
+}
+
+// Missed returns the number of writes that the limit dropped.
+func (r *LogRateLimit) Missed() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.missed
 }
 
 // WriteDevkmsg implements a write of data to /dev/kmsg, as devkmsg_write of
 // Linux does. It returns EINVAL for more than KernelLogRecordMax bytes. In the
 // mode "off" it drops the data, and in the mode "ratelimit" it drops the data
-// that passes the limit rl of the descriptor. Both drops succeed. comm names the
-// writer in the notice about suppressed writes.
+// that passes the limit rl of the descriptor. Both drops succeed.
 //
 // The data may start with "<N>", where N is the facility shifted by three bits,
 // ORed with the level. Without the prefix, the level is
 // default_message_loglevel. Without a facility, the facility is LogFacilityUser.
-func (l *KernelLog) WriteDevkmsg(rl *LogRateLimit, comm string, data []byte) error {
+func (l *KernelLog) WriteDevkmsg(rl *LogRateLimit, data []byte) error {
 	if len(data) > KernelLogRecordMax {
 		return linuxerr.EINVAL
 	}
@@ -589,11 +655,7 @@ func (l *KernelLog) WriteDevkmsg(rl *LogRateLimit, comm string, data []byte) err
 	case DevkmsgOff:
 		return nil
 	case DevkmsgRatelimit:
-		ok, suppressed := rl.Allow(l.now())
-		if suppressed > 0 {
-			l.Printkf(LogWarning, "%s: %d callbacks suppressed", comm, suppressed)
-		}
-		if !ok {
+		if !rl.Allow(l.now()) {
 			return nil
 		}
 	}
@@ -616,6 +678,16 @@ func (l *KernelLog) WriteDevkmsg(rl *LogRateLimit, comm string, data []byte) err
 	}
 	l.Emit(facility, level, text)
 	return nil
+}
+
+// ReleaseDevkmsg runs when a /dev/kmsg descriptor closes. As ratelimit_state_exit
+// of Linux does, it records "comm: N output lines suppressed due to
+// ratelimiting" when the limit rl dropped N writes. comm names the closing
+// process.
+func (l *KernelLog) ReleaseDevkmsg(rl *LogRateLimit, comm string) {
+	if n := rl.Missed(); n > 0 {
+		l.Printkf(LogWarning, "%s: %d output lines suppressed due to ratelimiting", comm, n)
+	}
 }
 
 // CanReadKernelLog reports whether creds may read the kernel log while
@@ -653,10 +725,10 @@ func (k *Kernel) KernelLog() *KernelLog {
 	return k.syslog.log
 }
 
-// uptime returns the time since boot. It is zero before the timekeeper has
-// clocks.
+// uptime returns the time since boot. It is zero before the kernel has a
+// timekeeper with clocks.
 func (k *Kernel) uptime() time.Duration {
-	if k.timekeeper.monotonicClock == nil {
+	if k.timekeeper == nil || k.timekeeper.monotonicClock == nil {
 		return 0
 	}
 	return time.Duration(k.timekeeper.monotonicClock.Now().Nanoseconds())

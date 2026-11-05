@@ -42,8 +42,9 @@ func RegisterKmsg(vfsObj *vfs.VirtualFilesystem) error {
 // kmsgDevice implements vfs.Device for /dev/kmsg.
 type kmsgDevice struct{}
 
-// Open implements vfs.Device.Open. Like devkmsg_open, it lets every opener
-// write. A read needs CAP_SYSLOG when kernel.dmesg_restrict is 1. A reader
+// Open implements vfs.Device.Open. Like devkmsg_open, it fails with EPERM for
+// every opener while kernel.printk_devkmsg is "off". Otherwise it lets every
+// opener write. A read needs CAP_SYSLOG when kernel.dmesg_restrict is 1. A reader
 // starts at the oldest record.
 func (kmsgDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	k := kernel.KernelFromContext(ctx)
@@ -52,6 +53,10 @@ func (kmsgDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, op
 	}
 	creds := auth.CredentialsFromContext(ctx)
 	klog := k.KernelLog()
+	// As devkmsg_open does, refuse every opener in the mode "off".
+	if klog.DevkmsgMode() == kernel.DevkmsgOff {
+		return nil, linuxerr.EPERM
+	}
 	if opts.Flags&linux.O_ACCMODE != linux.O_WRONLY && klog.DmesgRestrict() && !kernel.CanReadKernelLog(creds, k) {
 		return nil, linuxerr.EPERM
 	}
@@ -84,8 +89,15 @@ type kmsgFD struct {
 	seq uint64
 }
 
-// Release implements vfs.FileDescriptionImpl.Release.
-func (fd *kmsgFD) Release(context.Context) {}
+// Release implements vfs.FileDescriptionImpl.Release. It records the writes
+// that the rate limit of the descriptor dropped.
+func (fd *kmsgFD) Release(ctx context.Context) {
+	comm := "kernel"
+	if t := kernel.TaskFromContext(ctx); t != nil {
+		comm = t.Name()
+	}
+	fd.log.ReleaseDevkmsg(&fd.limit, comm)
+}
 
 // Readiness implements waiter.Waitable.Readiness. As devkmsg_poll does, it
 // reports a record to read, and it adds an error when the ring dropped the
@@ -124,7 +136,9 @@ func (fd *kmsgFD) Epollable() bool {
 // record is left, so a blocking descriptor waits for the next record and a
 // non-blocking descriptor gets EAGAIN. It returns EPIPE once when the ring
 // dropped the record at the position, and moves to the oldest record. It
-// returns EINVAL, without moving, when the buffer is smaller than the record.
+// returns EINVAL when the buffer is smaller than the record, and the record is
+// then lost to this descriptor. A record is at most kernel.KernelLogMessageMax
+// bytes.
 func (fd *kmsgFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
@@ -137,15 +151,13 @@ func (fd *kmsgFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.Rea
 		return 0, linuxerr.EPIPE
 	}
 	line := rec.AppendKmsg(nil)
+	// As devkmsg_read does, move past the record before the checks that fail.
+	fd.seq = rec.Seq + 1
 	if int64(len(line)) > dst.NumBytes() {
 		return 0, linuxerr.EINVAL
 	}
 	n, err := dst.CopyOut(ctx, line)
-	if err != nil {
-		return int64(n), err
-	}
-	fd.seq = rec.Seq + 1
-	return int64(n), nil
+	return int64(n), err
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -170,11 +182,7 @@ func (fd *kmsgFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.Wr
 	if _, err := src.CopyIn(ctx, buf); err != nil {
 		return 0, err
 	}
-	comm := "kernel"
-	if t := kernel.TaskFromContext(ctx); t != nil {
-		comm = t.Name()
-	}
-	if err := fd.log.WriteDevkmsg(&fd.limit, comm, buf); err != nil {
+	if err := fd.log.WriteDevkmsg(&fd.limit, buf); err != nil {
 		return 0, err
 	}
 	return n, nil
