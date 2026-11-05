@@ -67,7 +67,14 @@ This release adds the Linux kernel interfaces that the `kubelet`, `containerd`, 
 
 - **MTU of `eth0` with `-net=nat`**: `eth0` has the MTU 1500, as on a Linux node or in a Docker container. It had 65,536. The loopback device keeps 65,536. Software that derives tunnel MTUs from `eth0` now gets the Linux values: `flannel` uses 1450 for `vxlan` and 1420 for WireGuard.
   - With 65,536, tunnel datagrams exceeded the 9,216 bytes that macOS sends through a UDP socket, and the NAT relay lost them.
-  - A guest TCP transfer through the NAT link is slower with the smaller MTU. The PR description lists the measured rates.
+  - A guest TCP transfer through the NAT link is slower with the smaller MTU. The table lists the measured rates in MiB/s, as download and upload.
+
+    | Backend | MTU 65,536 | MTU 9,000 | MTU 1,500 |
+    | :--- | :--- | :--- | :--- |
+    | `hvf` | 1,307 / 2,086 | 844 / 1,339 | 341 / 355 |
+    | Linux `systrap` (`ubuntu-24.04`) | 653 / 2,258 | 378 / 551 | 181 / 190 |
+    | Windows `whpx` | 363 / 1,213 | 147 / 463 | 175 / 224 |
+    | Windows `systrap` | 686 / 1,300 | 633 / 759 | 217 / 232 |
 - **UDP sessions of the NAT relay**: the relay keeps at most 512 UDP sessions. A new session beyond the limit ends the session with the oldest datagram. Before, the count had no limit, and each session held two 64 KiB buffers from its start. The buffers now come from a pool.
 - **Bridged IP frames pass the iptables hooks**: `bridge-nf-call-iptables` and `bridge-nf-call-ip6tables` started at 1 and stored their values. They now switch the hooks, so the rules of the guest apply to the traffic between two ports of a bridge. Before, `docker run --icc=false` did not separate two containers of one bridge. It now does, because the `FORWARD` rule of `dockerd` applies. The switches only take effect after the guest writes an iptables table.
 - **`NETLINK_NETFILTER` sockets open without `nftables`**: `socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER)` failed with `EPROTONOSUPPORT`. It now succeeds. A message of a subsystem that the guest lacks, such as `nfacct` or `nftables`, fails with `EINVAL`, and a batch of such a subsystem fails with `EOPNOTSUPP`, as on Linux. `conntrack` no longer prints `mnl_socket_open: Protocol not supported`.
