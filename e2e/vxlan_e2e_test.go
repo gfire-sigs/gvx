@@ -60,7 +60,8 @@ func TestE2EVxlanA13NATLinkMTU(t *testing.T) {
 			cfg.NetworkMode = gvx.NetModeNAT
 		}, "natmtu")
 		requireNodeChecks(t, code, out,
-			"eth0-has-the-ethernet-mtu-and-lo-keeps-65536", "vxlan-over-eth0-gets-1450",
-			"wireguard-over-eth0-with-the-formula-of-flannel-gets-1420")
+			"eth0-has-the-expected-mtu-and-lo-keeps-65536", "sysfs-shows-the-mtu-of-eth0",
+			"vxlan-over-eth0-gets-mtu-minus-50",
+			"wireguard-over-eth0-with-the-formula-of-flannel-gets-mtu-minus-80")
 	})
 }

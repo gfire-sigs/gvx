@@ -30,6 +30,7 @@ import (
 	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
 var (
@@ -187,6 +188,8 @@ type guestSpec struct {
 	readOnlyRoot  bool
 	publishAll    bool
 	netRaw        bool
+	// tuning sets the host-side tunables of the sandbox.
+	tuning tuning.Values
 	// packetWrite and allowSUID are the other two privileges of rungv
 	// --privileged. dockerd needs all three.
 	packetWrite bool
@@ -219,6 +222,7 @@ func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
 		NetRaw:                 g.netRaw,
 		AllowPacketSocketWrite: g.packetWrite,
 		AllowSUID:              g.allowSUID,
+		Tuning:                 g.tuning,
 		Stdin:                  g.stdin,
 		Stdout:                 stdout,
 		Stderr:                 stderr,

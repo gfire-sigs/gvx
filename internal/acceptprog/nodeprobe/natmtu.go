@@ -18,14 +18,18 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 )
 
 // The natmtu checks run in a sandbox with the NAT network. They check that
-// eth0 has the MTU of an Ethernet link, and that the tunnels that flannel
-// builds on eth0 get the MTU that flannel derives on Linux: eth0 minus 50 for
-// vxlan, and eth0 minus 80 for WireGuard.
+// eth0 has the expected MTU, and that the tunnels that flannel builds on eth0
+// get the MTU that flannel derives on Linux: eth0 minus 50 for vxlan, and eth0
+// minus 80 for WireGuard. The default MTU of eth0 is 1500. The tunable
+// net.nat.mtu changes it, and the probe takes the value as its argument.
 
 const (
 	natEthernetMTU = 1500
@@ -34,10 +38,19 @@ const (
 	flannelWG      = 80
 )
 
-func natMTUChecks() []check {
+// sysfsMTU reads /sys/class/net/<name>/mtu.
+func sysfsMTU(name string) (int, error) {
+	raw, err := os.ReadFile("/sys/class/net/" + name + "/mtu")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(raw)))
+}
+
+func natMTUChecks(wantMTU int) []check {
 	var eth0 netlink.Link
 	return []check{
-		{"eth0-has-the-ethernet-mtu-and-lo-keeps-65536", func() error {
+		{"eth0-has-the-expected-mtu-and-lo-keeps-65536", func() error {
 			var err error
 			if eth0, err = netlink.LinkByName("eth0"); err != nil {
 				return err
@@ -46,12 +59,22 @@ func natMTUChecks() []check {
 			if err != nil {
 				return err
 			}
-			if eth0.Attrs().MTU != natEthernetMTU || lo.Attrs().MTU != natLoopbackMTU {
-				return fmt.Errorf("eth0 has MTU %d and lo has MTU %d, want %d and %d", eth0.Attrs().MTU, lo.Attrs().MTU, natEthernetMTU, natLoopbackMTU)
+			if eth0.Attrs().MTU != wantMTU || lo.Attrs().MTU != natLoopbackMTU {
+				return fmt.Errorf("eth0 has MTU %d and lo has MTU %d, want %d and %d", eth0.Attrs().MTU, lo.Attrs().MTU, wantMTU, natLoopbackMTU)
 			}
 			return nil
 		}},
-		{"vxlan-over-eth0-gets-1450", func() error {
+		{"sysfs-shows-the-mtu-of-eth0", func() error {
+			got, err := sysfsMTU("eth0")
+			if err != nil {
+				return err
+			}
+			if got != wantMTU {
+				return fmt.Errorf("/sys/class/net/eth0/mtu = %d, want %d", got, wantMTU)
+			}
+			return nil
+		}},
+		{"vxlan-over-eth0-gets-mtu-minus-50", func() error {
 			addrs, err := netlink.AddrList(eth0, netlink.FAMILY_V4)
 			if err != nil || len(addrs) == 0 {
 				return fmt.Errorf("addresses of eth0 = %v, %v", addrs, err)
@@ -61,7 +84,7 @@ func natMTUChecks() []check {
 			if err != nil {
 				return err
 			}
-			if want := eth0.Attrs().MTU - flannelVxlan; v.MTU != want || v.MTU != 1450 {
+			if want := eth0.Attrs().MTU - flannelVxlan; v.MTU != want {
 				return fmt.Errorf("flannel.1 has MTU %d, want %d", v.MTU, want)
 			}
 			if v.Port != 8472 || v.VtepDevIndex != eth0.Attrs().Index || !v.SrcAddr.Equal(addrs[0].IP) {
@@ -69,7 +92,7 @@ func natMTUChecks() []check {
 			}
 			return nil
 		}},
-		{"wireguard-over-eth0-with-the-formula-of-flannel-gets-1420", func() error {
+		{"wireguard-over-eth0-with-the-formula-of-flannel-gets-mtu-minus-80", func() error {
 			if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: "flannel-wg"}}); err != nil {
 				return err
 			}
@@ -83,8 +106,8 @@ func natMTUChecks() []check {
 			if wg, err = netlink.LinkByName("flannel-wg"); err != nil {
 				return err
 			}
-			if wg.Attrs().MTU != 1420 {
-				return fmt.Errorf("flannel-wg has MTU %d, want 1420", wg.Attrs().MTU)
+			if want := wantMTU - flannelWG; wg.Attrs().MTU != want {
+				return fmt.Errorf("flannel-wg has MTU %d, want %d", wg.Attrs().MTU, want)
 			}
 			return nil
 		}},

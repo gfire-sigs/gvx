@@ -521,15 +521,17 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	if sysErr != nil {
 		return sysErr
 	}
-	ep, peerEP := veth.NewPair(defaultMTU, veth.DefaultBacklogSize)
+	ep, peerEP := veth.NewPair(vethPairMTU(defaultMTU), veth.DefaultBacklogSize)
 	id := s.Stack.NextNICID()
 	peerID := peerStack.Stack.NextNICID()
 	if ifname == "" {
 		ifname = s.allocDeviceName("veth", dstNs)
 	}
-	err := s.Stack.CreateNICWithOptions(id, newHostFilterEndpoint(packetsocket.New(ethernet.New(ep))), stack.NICOptions{
-		Name: ifname,
-		Kind: "veth",
+	err := s.Stack.CreateNICWithOptions(id, newHostFilterEndpoint(packetsocket.New(ethernet.New(vethLink{ep}))), stack.NICOptions{
+		Name:   ifname,
+		Kind:   "veth",
+		MinMTU: ethernetMinMTU,
+		MaxMTU: ethernetMaxMTU,
 	})
 	if err != nil {
 		s.unlockSrcAndDst(ctx, dstNs)
@@ -554,9 +556,11 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 		peerName = peerStack.allocDeviceName("veth", peerDstNs)
 	}
 
-	err = peerStack.Stack.CreateNICWithOptions(peerID, newHostFilterEndpoint(packetsocket.New(ethernet.New(peerEP))), stack.NICOptions{
-		Name: peerName,
-		Kind: "veth",
+	err = peerStack.Stack.CreateNICWithOptions(peerID, newHostFilterEndpoint(packetsocket.New(ethernet.New(vethLink{peerEP}))), stack.NICOptions{
+		Name:   peerName,
+		Kind:   "veth",
+		MinMTU: ethernetMinMTU,
+		MaxMTU: ethernetMaxMTU,
 	})
 	if err != nil {
 		peerEP.Close()
@@ -591,8 +595,10 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 	ep := stack.NewBridgeEndpoint(defaultMTU)
 	id := s.Stack.NextNICID()
 	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
-		Name: ifname,
-		Kind: "bridge",
+		Name:   ifname,
+		Kind:   "bridge",
+		MinMTU: ethernetMinMTU,
+		MaxMTU: ethernetMaxMTU,
 	})
 	if err != nil {
 		return syserr.TranslateNetstackError(err)

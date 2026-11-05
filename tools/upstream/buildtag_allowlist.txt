@@ -96,6 +96,8 @@ seam pkg/sentry/fsimpl/proc/task_net.go
 # (pkg/sentry/socket/netstack/bridgeport_xplat.go), and RTM_NEWLINK of a link kind
 # that the stack does not create calls the registry of pkg/sentry/socket/netstack/linkkind_xplat.go.
 # newVeth wraps each veth end with newHostFilterEndpoint (pkg/sentry/socket/netstack/hostfilter_xplat.go).
+# newVeth and newBridge set the Linux MTU range of the link, and newVeth counts the Ethernet header
+# in the MTU of the pair (pkg/sentry/socket/netstack/linkmtu_xplat.go).
 seam pkg/sentry/socket/netstack/stack.go
 # Content seam: RTM_GETLINK reports IFLA_STATS64 (pkg/sentry/socket/netlink/route/link_stats_xplat.go).
 seam pkg/sentry/socket/netlink/route/protocol.go
