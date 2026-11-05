@@ -27,6 +27,7 @@ import (
 
 	bitsutil "z.gfire.dev/gvx/pkg/bits"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -208,12 +209,13 @@ func (m *RecentMatcher) revision() uint8 { return m.rev }
 
 // bindStack implements stackBinder.bindStack. Rules of one stack that name the
 // same list share it.
-func (m *RecentMatcher) bindStack(stk *stack.Stack) {
+func (m *RecentMatcher) bindStack(stk *stack.Stack) *syserr.Error {
 	t := recentTables.registry(stk).acquire(m.listName, m.mask, m.stampCount())
 	m.table = t
 	// The cleanup releases the list if the rule is lost without a
 	// replacement of its table, for example with its network stack.
 	runtime.AddCleanup(m, func(r *recentRelease) { r.run() }, &recentRelease{table: t, released: &m.released})
+	return nil
 }
 
 // releaseStack implements stackReleaser.releaseStack.

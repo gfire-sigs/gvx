@@ -16,6 +16,7 @@ package stack_test
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 	"time"
 
@@ -80,7 +81,7 @@ func newNFStack(t *testing.T, dnat tcpip.FullAddress) *nfStack {
 	for i := range b.hosts {
 		near, far := veth.NewPair(1500, 64)
 		id := tcpip.NICID(10 + i)
-		if err := s.CreateNIC(id, ethernet.New(near)); err != nil {
+		if err := s.CreateNICWithOptions(id, ethernet.New(near), stack.NICOptions{Name: fmt.Sprintf("port%d", i)}); err != nil {
 			t.Fatalf("CreateNIC(port %d): %s", i, err)
 		}
 		if err := s.SetNICCoordinator(id, bridgeNICID); err != nil {
@@ -173,9 +174,14 @@ func mustSubnet(t *testing.T, addr tcpip.Address, prefix int) tcpip.Subnet {
 // the Ethernet address of host 1, as a host that resolved the virtual address
 // with ARP would send it.
 func (n *nfStack) sendDatagram(dst tcpip.Address, dport uint16, payload string) {
+	n.sendDatagramTo(macs[1], dst, dport, payload)
+}
+
+// sendDatagramTo is sendDatagram with the Ethernet destination ethDst.
+func (n *nfStack) sendDatagramTo(ethDst tcpip.LinkAddress, dst tcpip.Address, dport uint16, payload string) {
 	udpLen := header.UDPMinimumSize + len(payload)
 	frame := make([]byte, header.EthernetMinimumSize+header.IPv4MinimumSize+udpLen)
-	header.Ethernet(frame).Encode(&header.EthernetFields{SrcAddr: macs[0], DstAddr: macs[1], Type: header.IPv4ProtocolNumber})
+	header.Ethernet(frame).Encode(&header.EthernetFields{SrcAddr: macs[0], DstAddr: ethDst, Type: header.IPv4ProtocolNumber})
 	ip := header.IPv4(frame[header.EthernetMinimumSize:])
 	ip.Encode(&header.IPv4Fields{
 		TotalLength: uint16(header.IPv4MinimumSize + udpLen),

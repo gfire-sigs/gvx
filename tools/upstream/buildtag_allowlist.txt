@@ -43,7 +43,15 @@ seam pkg/sentry/fsimpl/overlay/overlay.go
 
 # Content seam: SetEntries gives the Stack to the matchers that need it
 # (pkg/sentry/socket/netfilter/addrtype_matcher_xplat.go). stack.Matcher.Match gets only the packet.
+# A bind can fail, as the match set fails for a set that does not exist
+# (pkg/sentry/socket/netfilter/set_matcher_xplat.go), and a rule revision with a registered
+# maker selects that maker.
+# SetEntries also gives each matcher the set of hooks that reach its rule, as the physdev match needs
+# (pkg/sentry/socket/netfilter/physdev_matcher_xplat.go).
 seam pkg/sentry/socket/netfilter/netfilter.go
+# Content seam: marshalMatcher writes the revision of the match into the entry, so that iptables
+# reads the revision of the matches mark and multiport back.
+seam pkg/sentry/socket/netfilter/extensions.go
 
 # Content seam: getEntries4 and getEntries6 report the inverted input interface flag ("! -i").
 seam pkg/sentry/socket/netfilter/ipv4.go
@@ -131,6 +139,8 @@ seam pkg/tcpip/transport/tcp/endpoint.go
 
 # Content seams: kernel interfaces of a Kubernetes node agent (GVXIP-005, P1).
 # bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
+# getsockopt(SOL_IP, SO_IP_SET) resolves set names for iptables
+# (pkg/sentry/socket/netfilter/ipset_sockopt_xplat.go).
 seam pkg/sentry/socket/netstack/netstack.go
 # /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
 seam pkg/sentry/fsimpl/sys/sys.go
@@ -148,6 +158,10 @@ seam pkg/sentry/syscalls/linux/sys_sysinfo.go
 # (pkg/tcpip/stack/bridge_netfilter_xplat.go). The forwarding decisions of the bridge live in
 # pkg/tcpip/stack/bridge_forward_xplat.go.
 seam pkg/tcpip/stack/bridge.go
+# A bridged frame carries the port names that the physdev match reads, in three fields of
+# PacketBuffer (pkg/sentry/socket/netfilter/physdev_matcher_xplat.go). The bridge sets them in
+# pkg/tcpip/stack/bridge_netfilter_xplat.go.
+seam pkg/tcpip/stack/packet_buffer.go
 # A SYN on a TCP connection in TIME_WAIT or CLOSE starts a new connection
 # (pkg/tcpip/stack/conntrack_xplat.go). The seam is one call in getConnAndUpdate.
 seam pkg/tcpip/stack/conntrack.go
@@ -165,7 +179,9 @@ seam pkg/tcpip/network/ipv6/ipv6.go
 seam pkg/sentry/socket/netlink/netfilter/protocol.go
 # A netlink dump sends one chunk for each datagram that a reader consumes, as Linux does
 # (pkg/sentry/socket/netlink/dump_xplat.go). The seams are the dump field of the socket, one call
-# each in Release, Read, and RecvMsg, and the start of a dump in ProcessMessages.
+# each in Release, Read, and RecvMsg, and the start of a dump in ProcessMessages. ProcessMessages
+# sends no acknowledgement after an error message that a handler wrote itself, as the subsystem
+# IPSET does (pkg/sentry/socket/netlink/netfilter/ipset_xplat.go).
 seam pkg/sentry/socket/netlink/socket.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.

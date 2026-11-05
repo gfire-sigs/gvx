@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/bits"
+	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -278,8 +279,9 @@ func (am *AddrtypeMatcher) revision() uint8 {
 }
 
 // bindStack implements stackBinder.bindStack.
-func (am *AddrtypeMatcher) bindStack(stk *stack.Stack) {
+func (am *AddrtypeMatcher) bindStack(stk *stack.Stack) *syserr.Error {
 	am.resolver = stackResolver{stk: stk}
+	return nil
 }
 
 // Match implements stack.Matcher.Match.
@@ -354,39 +356,69 @@ func (unboundResolver) subnetBroadcast(tcpip.NICID, tcpip.NetworkProtocolNumber,
 	return false
 }
 
-// stackBinder is implemented by matchers that need the Stack at match time.
-// The parsed rule does not carry the Stack, because stack.Matcher.Match gets
-// only the packet.
+// stackBinder is implemented by matchers and targets that need the Stack at
+// match time. The parsed rule does not carry the Stack, because
+// stack.Matcher.Match gets only the packet. A failed bind returns the error
+// of the check function of the Linux extension and holds no state.
 type stackBinder interface {
-	bindStack(stk *stack.Stack)
+	bindStack(stk *stack.Stack) *syserr.Error
 }
 
-// stackReleaser is implemented by matchers that hold state of the Stack. A
-// matcher of a replaced table gives the state back, as the destroy function
-// of a Linux match does.
+// stackReleaser is implemented by matchers and targets that hold state of the
+// Stack. An extension of a replaced table gives the state back, as the
+// destroy function of a Linux extension does.
 type stackReleaser interface {
 	releaseStack()
 }
 
-// releaseMatcherStacks calls releaseStack for every matcher in rules that
-// implements it.
+// releaseMatcherStacks calls releaseStack for every matcher and target in
+// rules that implements it.
 func releaseMatcherStacks(rules []stack.Rule) {
 	for _, rule := range rules {
-		for _, m := range rule.Matchers {
-			if r, ok := m.(stackReleaser); ok {
-				r.releaseStack()
-			}
+		releaseMatchers(rule.Matchers)
+		if r, ok := rule.Target.(stackReleaser); ok {
+			r.releaseStack()
 		}
 	}
 }
 
-// bindMatcherStacks gives the Stack to every matcher in rules that needs it.
-func bindMatcherStacks(stk *stack.Stack, rules []stack.Rule) {
-	for _, rule := range rules {
-		for _, m := range rule.Matchers {
-			if b, ok := m.(stackBinder); ok {
-				b.bindStack(stk)
+func releaseMatchers(matchers []stack.Matcher) {
+	for _, m := range matchers {
+		if r, ok := m.(stackReleaser); ok {
+			r.releaseStack()
+		}
+	}
+}
+
+// bindMatcherStacks gives the Stack to every matcher and target in rules that
+// needs it. When one bind fails, it releases the extensions that it bound
+// before and returns the error.
+func bindMatcherStacks(stk *stack.Stack, rules []stack.Rule) *syserr.Error {
+	for i, rule := range rules {
+		if err := bindRuleStack(stk, rule); err != nil {
+			releaseMatcherStacks(rules[:i])
+			return err
+		}
+	}
+	return nil
+}
+
+// bindRuleStack binds the matchers and the target of one rule. On failure it
+// releases the matchers that it bound.
+func bindRuleStack(stk *stack.Stack, rule stack.Rule) *syserr.Error {
+	for i, m := range rule.Matchers {
+		if b, ok := m.(stackBinder); ok {
+			if err := b.bindStack(stk); err != nil {
+				releaseMatchers(rule.Matchers[:i])
+				return err
 			}
 		}
 	}
+	if b, ok := rule.Target.(stackBinder); ok {
+		if err := b.bindStack(stk); err != nil {
+			releaseMatchers(rule.Matchers)
+			return err
+		}
+	}
+	return nil
 }

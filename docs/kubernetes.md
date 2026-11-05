@@ -150,6 +150,16 @@ The test `TestE2EK3sSingleNode` runs these checks on each backend.
 | Metrics | `kubectl top node` and `kubectl top pod` print values |
 | Restart | The node returns with the same name after a restart, and its pods start again |
 
+The test `TestE2EK3sNetworkPolicy` checks NetworkPolicy on each backend. The network policy controller of `k3s` (`kube-router`) needs the `ipset` tool and the iptables match `set`, and the guest provides both.
+
+| Check | Result |
+| :--- | :--- |
+| Controller start | `k3s` does not log `Skipping network policy controller start, ipset save failed` |
+| Deny all | A NetworkPolicy that selects a server pod and allows no ingress stops a client pod from reaching the server pod |
+| Allow by label | A second policy that names the client label lets that client reach the server pod, and another client stays blocked |
+| Sets and rules | The kernel of the guest holds the `KUBE-*` IP sets and a rule with `-m set --match-set` |
+| Policy removal | Traffic returns after the policies end |
+
 ### 4.2 Verified Behavior of a Cluster
 
 The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` run their sandboxes on one host. The tests change no image and use no `gvx`-specific option. C2 and C4 copy the `wg` tool of Alpine into the guests, C4 copies `etcdctl`, and C5 copies `sonobuoy`.
@@ -169,7 +179,8 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | Limit | Effect |
 | :--- | :--- |
 | `nftables` | Set `IPTABLES_MODE=legacy`. A component that needs `iptables-nft` fails. |
-| NetworkPolicy | The guest has no `ipset`. `k3s` logs `Skipping network policy controller start, ipset save failed` and continues. The API server accepts a NetworkPolicy, but the policy does not block traffic. |
+| Calico | The tests run `kube-router`, the controller of `k3s`. The guest has the IP sets, the match `set`, and the target `SET` that the iptables mode of Calico uses. No test runs Calico itself, so other matches of Felix can still fail. |
+| NFLOG | `-j NFLOG` accepts a rule, but no group receives a packet, because the guest has no `nflog` listener. |
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |

@@ -170,6 +170,9 @@ func (p *bridgePort) netfilterForward(protocol tcpip.NetworkProtocolNumber, pkt 
 	// From here the bridge owns the frame. Every path ends with work.DecRef.
 	work.InputNICID = bridgeNIC.id
 	work.NICID = bridgeNIC.id
+	// The physdev match sees the port of arrival from the PREROUTING hook on.
+	work.Bridged = true
+	work.BridgedFrom = p.nic.Name()
 	oldDst := work.Network().DestinationAddress()
 	name := bridgeNIC.Name()
 	it := stk.IPTables()
@@ -316,6 +319,7 @@ func (p *bridgePort) netfilterFinish(bridgeNIC *nic, addressEP AddressableEndpoi
 	defer work.DecRef()
 	it := p.nic.stack.IPTables()
 	name := bridgeNIC.Name()
+	work.BridgedTo = p.egressPortName(work)
 	if !it.CheckForward(work, name, name) {
 		return
 	}
@@ -325,6 +329,23 @@ func (p *bridgePort) netfilterFinish(bridgeNIC *nic, addressEP AddressableEndpoi
 		return
 	}
 	p.bridge.forwardFrame(p, work)
+}
+
+// egressPortName returns the name of the port that receives the frame, or an
+// empty name when the frame goes to no port or to many ports. Linux decides the
+// port before the FORWARD hook, so the physdev match of the hook can name it.
+// A frame that goes to many ports has no single port for the match. Linux runs
+// the hook once for each port.
+func (p *bridgePort) egressPortName(work *PacketBuffer) string {
+	dst := header.Ethernet(work.LinkHeader().Slice()).DestinationAddress()
+	b := p.bridge
+	b.mu.RLock()
+	targets := b.forwardTargetsLocked(p, dst)
+	b.mu.RUnlock()
+	if len(targets) != 1 {
+		return ""
+	}
+	return targets[0].nic.Name()
 }
 
 // netfilterDeliverUp gives the original frame to the IP layer of the bridge. It

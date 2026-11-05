@@ -330,8 +330,13 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 	if err := checkTargetHooks(table, ipv6); err != nil {
 		return err
 	}
+	if err := checkMatcherHooks(table, ipv6); err != nil {
+		return err
+	}
 
-	bindMatcherStacks(stk, table.Rules)
+	if err := bindMatcherStacks(stk, table.Rules); err != nil {
+		return err
+	}
 
 	id := nameToID[replace.Name.String()]
 	old := stk.IPTables().GetTable(id, ipv6)
@@ -394,6 +399,12 @@ func unmarshalMatcherRevs(mapper IDMapper, match *linux.XTEntryMatch, filter sta
 		matcher stack.Matcher
 		err     error
 	)
+
+	// Revisions with equal size need the revision of the rule, for example
+	// revisions 3 and 4 of the "set" match.
+	if _, ok := matchMakers[matchKey{name: match.Name.String(), revision: match.Revision}]; ok {
+		return unmarshalMatcher(mapper, match, filter, optVal[linux.SizeOfXTEntryMatch:match.MatchSize])
+	}
 
 	// Get the highest supported revision for the matcher.
 	maxRev, found := matchMakerRevision(match.Name.String(), 0)
