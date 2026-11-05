@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -189,7 +188,8 @@ type memoryEnforcer struct {
 	// running is true while the goroutine runs or starts.
 	running atomic.Bool
 
-	// opts holds the time limits of the checks. Zero fields hold the defaults.
+	// opts holds the time limits of the checks. A zero field selects the
+	// default.
 	opts MemoryEnforcerOptions
 }
 
@@ -232,14 +232,10 @@ func NewFilesystemWithMemoryOptions(opts MemoryEnforcerOptions) func(context.Con
 		if err != nil {
 			return nil, err
 		}
-		memoryEnforcers.Store(vfsfs.Impl().(*filesystem), &memoryEnforcer{opts: opts.withDefaults()})
+		vfsfs.Impl().(*filesystem).memEnforcer.opts = opts
 		return vfsfs, nil
 	}
 }
-
-// memoryEnforcers maps a cgroup2 filesystem to its enforcer. The Sentry has one
-// filesystem, so the map holds one entry.
-var memoryEnforcers sync.Map
 
 const (
 	// oomPollInterval is the shortest time between two checks while a cgroup
@@ -280,9 +276,8 @@ func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
 	if !enforcerSupported(k.Platform) {
 		return
 	}
-	e, _ := memoryEnforcers.LoadOrStore(fs, &memoryEnforcer{opts: MemoryEnforcerOptions{}.withDefaults()})
-	if e.(*memoryEnforcer).running.CompareAndSwap(false, true) {
-		go fs.enforceMemoryLimits(k, e.(*memoryEnforcer))
+	if fs.memEnforcer.running.CompareAndSwap(false, true) {
+		go fs.enforceMemoryLimits(k, &fs.memEnforcer)
 	}
 }
 
@@ -292,7 +287,7 @@ func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
 // checks.
 func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 	ctx := k.SupervisorContext()
-	opts := e.opts
+	opts := e.opts.withDefaults()
 	delay := opts.IdlePollInterval
 	for {
 		time.Sleep(delay)

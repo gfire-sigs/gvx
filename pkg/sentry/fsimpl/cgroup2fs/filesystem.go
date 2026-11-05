@@ -254,6 +254,9 @@ type filesystem struct {
 	// tasksMu protects the task-to-cgroup mapping (the c.tasks map across all cgroups)
 	// and population bubbling.
 	tasksMu tasksRWMutex `state:"nosave"`
+
+	// memEnforcer enforces memory.max. It lives and ends with the filesystem.
+	memEnforcer memoryEnforcer `state:"nosave"`
 }
 
 // EverMounted implements EverMounted.
