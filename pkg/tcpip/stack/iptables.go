@@ -431,7 +431,7 @@ func (it *IPTables) CheckPrerouting(pkt *PacketBuffer, addressEP AddressableEndp
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Prerouting, pkt, nil /* route */, addressEP, inNicName, "" /* outNicName */) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -471,7 +471,7 @@ func (it *IPTables) CheckInput(pkt *PacketBuffer, inNicName string) bool {
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Input, pkt, nil /* route */, nil /* addressEP */, inNicName, "" /* outNicName */) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -511,7 +511,7 @@ func (it *IPTables) CheckForward(pkt *PacketBuffer, inNicName, outNicName string
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Forward, pkt, nil /* route */, nil /* addressEP */, inNicName, outNicName) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -562,7 +562,7 @@ func (it *IPTables) CheckOutput(pkt *PacketBuffer, r *Route, outNicName string) 
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Output, pkt, r, nil /* addressEP */, "" /* inNicName */, outNicName) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -598,7 +598,7 @@ func (it *IPTables) CheckPostrouting(pkt *PacketBuffer, r *Route, addressEP Addr
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Postrouting, pkt, r, addressEP, "" /* inNicName */, outNicName) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 

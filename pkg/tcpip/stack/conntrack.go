@@ -243,9 +243,6 @@ func (cn *conn) update(pkt *PacketBuffer, reply bool) {
 	}
 
 	now := cn.ct.clock.NowMonotonic()
-	if reply {
-		cn.replySeen = true
-	}
 
 	if pkt.TransportProtocolNumber == header.TCPProtocolNumber {
 		tcpHeader := header.TCP(pkt.TransportHeader().Slice())
@@ -265,7 +262,11 @@ func (cn *conn) update(pkt *PacketBuffer, reply bool) {
 
 	// Mark the connection as having been used recently so it isn't reaped, and
 	// give it the timeout of its new state.
-	cn.trackLocked(pkt, reply, now)
+	if cn.trackLocked(pkt, reply, now) && reply {
+		// Linux sets IPS_SEEN_REPLY after it handled the packet, so the first
+		// reply is still tracked as the packet of a connection without reply.
+		cn.replySeen = true
+	}
 }
 
 type connTrackRNG interface {

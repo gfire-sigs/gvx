@@ -144,6 +144,10 @@ type tcpSeen struct {
 	// unacked tells that the sender sent data that the receiver did not
 	// acknowledge yet.
 	unacked bool
+	// maxAck is the highest acknowledgment that the sender sent, when ackSet
+	// is true.
+	maxAck uint32
+	ackSet bool
 }
 
 // tcpTrack is the Linux view of the state of a TCP connection. The stack
@@ -154,7 +158,9 @@ type tcpTrack struct {
 	state uint8
 	// simultaneousOpen tells that both ends sent a SYN.
 	simultaneousOpen bool
-	seen             [2]tcpSeen
+	// pickedUp tells that the first packet of the connection was not a SYN.
+	pickedUp bool
+	seen     [2]tcpSeen
 	// retrans counts the repeats of the last ACK packet.
 	retrans uint8
 	// lastDir, lastSeq, lastAck, lastEnd, and lastWin describe the last ACK
@@ -195,15 +201,19 @@ func (cn *conn) refreshLocked(now tcpip.MonotonicTime, timeout time.Duration) {
 }
 
 // trackLocked moves the connection to the state that the packet causes and
-// sets the timeout of the connection. The caller holds stateMu, has set
-// replySeen for a packet of the reply direction, and has updated the TCB.
+// sets the timeout of the connection. The caller holds stateMu and has updated
+// the TCB. The caller sets replySeen after this call, as Linux sets
+// IPS_SEEN_REPLY after nf_conntrack_handle_packet. The packet that is the first
+// reply therefore still counts as a packet of a connection without a reply. The
+// function reports false for a packet that Linux calls invalid. Such a packet
+// does not set replySeen.
 //
 // +checklocks:cn.stateMu
-func (cn *conn) trackLocked(pkt *PacketBuffer, reply bool, now tcpip.MonotonicTime) {
+func (cn *conn) trackLocked(pkt *PacketBuffer, reply bool, now tcpip.MonotonicTime) bool {
 	cfg := cn.ct.config()
 	switch pkt.TransportProtocolNumber {
 	case header.TCPProtocolNumber:
-		cn.trackTCPLocked(cfg, pkt, reply, now)
+		return cn.trackTCPLocked(cfg, pkt, reply, now)
 	case header.UDPProtocolNumber:
 		cn.trackUDPLocked(cfg, now)
 	case header.ICMPv4ProtocolNumber:
@@ -213,6 +223,7 @@ func (cn *conn) trackLocked(pkt *PacketBuffer, reply bool, now tcpip.MonotonicTi
 	default:
 		cn.refreshLocked(now, cfg.timeouts[ConntrackTimeoutGeneric])
 	}
+	return true
 }
 
 // trackUDPLocked sets the timeout of a UDP flow. A flow without a reply uses
@@ -236,7 +247,7 @@ func (cn *conn) trackUDPLocked(cfg *conntrackConfig, now tcpip.MonotonicTime) {
 // trackTCPLocked is nf_conntrack_tcp_packet.
 //
 // +checklocks:cn.stateMu
-func (cn *conn) trackTCPLocked(cfg *conntrackConfig, pkt *PacketBuffer, reply bool, now tcpip.MonotonicTime) {
+func (cn *conn) trackTCPLocked(cfg *conntrackConfig, pkt *PacketBuffer, reply bool, now tcpip.MonotonicTime) bool {
 	tr := &cn.proto.tcp
 	hdr := header.TCP(pkt.TransportHeader().Slice())
 	flags := hdr.Flags()
@@ -247,15 +258,21 @@ func (cn *conn) trackTCPLocked(cfg *conntrackConfig, pkt *PacketBuffer, reply bo
 	class := tcpClass(flags)
 	old := tr.state
 	next := tcpTransitions[dir][class][old]
+	if old == sNO {
+		// A first packet that is not a SYN picks up a connection in mid-stream.
+		tr.pickedUp = class != tcpSyn
+	}
 
 	switch next {
-	case tcpInvalid, tcpIgnore:
-		return
+	case tcpInvalid:
+		return false
+	case tcpIgnore:
+		return true
 	case sSS:
 		// A SYN on a closed connection reopens the tuple. The caller replaced
 		// that connection before this packet, so the state does not occur.
 		if old >= sTW {
-			return
+			return true
 		}
 	case sS2:
 		tr.simultaneousOpen = true
@@ -264,8 +281,15 @@ func (cn *conn) trackTCPLocked(cfg *conntrackConfig, pkt *PacketBuffer, reply bo
 			next = sES
 		}
 	case sCL:
-		if class == tcpRst && !cn.rstEndsConnLocked(reply, old) {
-			return
+		if class == tcpRst {
+			switch cn.rstVerdictLocked(hdr, reply, old) {
+			case rstInvalid:
+				return false
+			case rstIgnore:
+				return true
+			case rstKeepState:
+				next = old
+			}
 		}
 	}
 
@@ -290,13 +314,13 @@ func (cn *conn) trackTCPLocked(cfg *conntrackConfig, pkt *PacketBuffer, reply bo
 			// The only answer to the SYN is a RST: the connection never
 			// existed, so Linux deletes it at once.
 			cn.dying = true
-			return
+			return true
 		}
 		if class == tcpSyn && old == sSS {
 			// A repeated SYN does not renew the timeout. A client that
 			// reuses its port would keep the entry, and its NAT target,
 			// alive for ever.
-			return
+			return true
 		}
 		// A connection that Linux picked up in mid-stream has no reply
 		// yet. It must not get the long ESTABLISHED timeout.
@@ -307,19 +331,61 @@ func (cn *conn) trackTCPLocked(cfg *conntrackConfig, pkt *PacketBuffer, reply bo
 		cn.proto.assured = true
 	}
 	cn.refreshLocked(now, timeout)
+	return true
 }
 
-// rstEndsConnLocked reports whether a RST closes the connection. The window
-// state of the TCB decides: a RST outside the window leaves the connection
-// open, as Linux does for a RST that fails the window check. A RST of the
-// sender in SYN_SENT has no window yet, and Linux accepts it.
+// rstVerdict tells what a RST does to the state of a connection.
+type rstVerdict int
+
+const (
+	// rstClose moves the connection to CLOSE.
+	rstClose rstVerdict = iota
+	// rstKeepState keeps the state and gives the connection the CLOSE timeout.
+	// The RST may be the answer to a forged segment, so the end can send a
+	// challenge ACK.
+	rstKeepState
+	// rstIgnore leaves the connection as it is.
+	rstIgnore
+	// rstInvalid is a RST that Linux refuses: its sequence number is before
+	// the last acknowledgment of the other end.
+	rstInvalid
+)
+
+// rstVerdictLocked decides what a RST does. For a connection that the tracker
+// saw from its SYN, the window state of the TCB decides: a RST outside the
+// window leaves the connection open. A RST of the sender in SYN_SENT has no
+// window yet, and Linux accepts it.
+//
+// A connection that the tracker picked up in mid-stream has no valid TCB, so
+// the sequence numbers that the tracker saw decide, as in the CLOSE case of
+// nf_conntrack_tcp_packet. The sequence number of the RST is compared with the
+// highest acknowledgment of the other end.
 //
 // +checklocks:cn.stateMu
-func (cn *conn) rstEndsConnLocked(reply bool, old uint8) bool {
-	if cn.tcb.State() == tcpconntrack.ResultReset {
-		return true
+func (cn *conn) rstVerdictLocked(hdr header.TCP, reply bool, old uint8) rstVerdict {
+	tr := &cn.proto.tcp
+	if !tr.pickedUp {
+		if cn.tcb.State() == tcpconntrack.ResultReset || (!reply && old == sSS) {
+			return rstClose
+		}
+		return rstIgnore
 	}
-	return !reply && old == sSS
+	dir := tcpDirOriginal
+	if reply {
+		dir = tcpDirReply
+	}
+	peer := &tr.seen[1-dir]
+	if !peer.ackSet {
+		return rstClose
+	}
+	seq := hdr.SequenceNumber()
+	switch {
+	case tcpAfter(peer.maxAck, seq):
+		return rstInvalid
+	case seq == peer.maxAck || old != sES:
+		return rstClose
+	}
+	return rstKeepState
 }
 
 // trackWindowLocked records the data that the sender sent and the receiver
@@ -351,6 +417,9 @@ func (cn *conn) trackWindowLocked(hdr header.TCP, dataLen, dir, class int) {
 	case tcpAfter(end, sender.end):
 		sender.end = end
 		sender.unacked = true
+	}
+	if flags&header.TCPFlagAck != 0 && (!sender.ackSet || tcpAfter(ack, sender.maxAck)) {
+		sender.maxAck, sender.ackSet = ack, true
 	}
 	if receiver.init && ack == receiver.end {
 		receiver.unacked = false

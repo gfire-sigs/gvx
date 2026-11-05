@@ -42,11 +42,16 @@ type ctSegment struct {
 	payload int
 	// clientPort is the port of the client, or ctClientPort when it is 0.
 	clientPort uint16
+	// server is the address of the server, or ctServerAddr when it is empty.
+	server tcpip.Address
 }
 
 // ctPacket builds the IPv4 packet of a segment.
 func ctPacket(s ctSegment) *PacketBuffer {
 	src, dst := ctClientAddr, ctServerAddr
+	if s.server.Len() != 0 {
+		dst = s.server
+	}
 	srcPort, dstPort := uint16(ctClientPort), uint16(ctServerPort)
 	if s.clientPort != 0 {
 		srcPort = s.clientPort

@@ -361,3 +361,36 @@ func (ct *ConnTrack) removeConn(cn *conn) bool {
 	ct.release(cn)
 	return true
 }
+
+// dropUnconfirmed ends the connection of a packet that a hook drops, and it
+// returns false so that the hook can return it. A connection that no packet has
+// confirmed lives only for that packet. Linux frees it when it frees the
+// packet, so a flood of dropped packets cannot fill nf_conntrack_max. A
+// confirmed connection stays, because a dropped packet does not end it.
+func (ct *ConnTrack) dropUnconfirmed(pkt *PacketBuffer) bool {
+	if t := pkt.tuple; t != nil {
+		pkt.tuple = nil
+		ct.discardUnconfirmed(t.conn)
+	}
+	return false
+}
+
+// discardUnconfirmed removes the original tuple of a connection that was not
+// finalized and gives its place back to the count. It does nothing when the
+// connection was finalized or discarded. A later packet that holds the
+// connection fails to finalize it, as it does after a tuple conflict.
+func (ct *ConnTrack) discardUnconfirmed(cn *conn) {
+	cn.finalizeOnce.Do(func() {
+		cn.finalizeResult.Store(uint32(finalizeResultConflict))
+		buckets := ct.tableBuckets()
+		bkt := &buckets[ct.bucketWithTableLength(cn.original.tupleID, len(buckets))]
+		bkt.mu.Lock()
+		// The reaper may have removed an unconfirmed connection that timed
+		// out. It removes the tuple and releases the place under this lock.
+		if cn.released.Load() == 0 {
+			bkt.tuples.Remove(&cn.original)
+			ct.release(cn)
+		}
+		bkt.mu.Unlock()
+	})
+}

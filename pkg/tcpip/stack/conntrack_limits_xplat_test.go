@@ -15,6 +15,8 @@
 package stack
 
 import (
+	"math/rand"
+	"slices"
 	"testing"
 	"time"
 
@@ -549,5 +551,168 @@ func TestConntrackLinuxDefaultTimeouts(t *testing.T) {
 		if got := DefaultConntrackTimeout(timeout); got != d {
 			t.Errorf("default of timeout %d = %v, want %v", timeout, got, d)
 		}
+	}
+}
+
+// newDropStack returns tables that drop the packets for the address blocked in
+// the PREROUTING hook of the mangle table, and accept every other packet.
+func newDropStack(blocked tcpip.Address, limit uint32) (*IPTables, *faketime.ManualClock) {
+	clock := faketime.NewManualClock()
+	it := DefaultTables(clock, rand.New(rand.NewSource(1)))
+	mangle := it.v4Tables[MangleID]
+	rules := slices.Clone(mangle.Rules)
+	filter := EmptyFilter4()
+	filter.CheckProtocol, filter.Protocol = true, header.TCPProtocolNumber
+	filter.Dst, filter.DstMask = blocked, tcpip.AddrFrom4([4]byte{255, 255, 255, 255})
+	rules = slices.Insert(rules, 0, Rule{Filter: filter, Target: &DropTarget{NetworkProtocol: header.IPv4ProtocolNumber}})
+	mangle.Rules = rules
+	for h := range mangle.BuiltinChains {
+		if mangle.BuiltinChains[h] != HookUnset {
+			mangle.BuiltinChains[h]++
+		}
+		if mangle.Underflows[h] != HookUnset {
+			mangle.Underflows[h]++
+		}
+	}
+	mangle.BuiltinChains[Prerouting] = 0
+	it.ReplaceTable(MangleID, mangle, false)
+	it.connections.limit.Store(NewConntrackLimit(limit))
+	return it, clock
+}
+
+func TestConnTrackDroppedPacketsDoNotFillTheTable(t *testing.T) {
+	blocked := tcpip.AddrFrom4([4]byte{10, 0, 0, 66})
+	const limit = 4
+	it, _ := newDropStack(blocked, limit)
+	defer it.reaper.Stop()
+
+	send := func(port uint16, server tcpip.Address) bool {
+		pkt := ctPacket(ctSegment{fromClient: true, flags: header.TCPFlagSyn, seq: 1000, clientPort: port, server: server})
+		defer pkt.DecRef()
+		pkt.RXChecksumValidated = true
+		if !it.CheckPrerouting(pkt, nil, "eth0") {
+			return false
+		}
+		return it.CheckInput(pkt, "eth0")
+	}
+	for port := uint16(40000); port < 40000+3*limit; port++ {
+		if send(port, blocked) {
+			t.Fatalf("SYN to the blocked address from port %d passed", port)
+		}
+	}
+	if got := it.connections.count.Load(); got != 0 {
+		t.Errorf("count after %d dropped SYNs = %d, want 0: a dropped packet left its connection", 3*limit, got)
+	}
+	for port := uint16(41000); port < 41000+limit; port++ {
+		if !send(port, ctServerAddr) {
+			t.Fatalf("SYN to the allowed address from port %d was dropped after the flood", port)
+		}
+	}
+	if got := it.connections.count.Load(); got != limit {
+		t.Errorf("count after %d allowed flows = %d, want %d", limit, got, limit)
+	}
+	// The table is now full of confirmed connections. Another flow is dropped.
+	if send(42000, ctServerAddr) {
+		t.Error("a flow beyond nf_conntrack_max passed")
+	}
+}
+
+func TestConnTrackDropKeepsConfirmedConnection(t *testing.T) {
+	blocked := tcpip.AddrFrom4([4]byte{10, 0, 0, 66})
+	it, _ := newDropStack(blocked, 100)
+	defer it.reaper.Stop()
+	seg := ctSegment{fromClient: true, flags: header.TCPFlagSyn, seq: 1000, server: blocked}
+	// A connection to the blocked address exists because it was confirmed
+	// before the rule.
+	cn := ctSend(t, &it.connections, ctSegment{fromClient: true, flags: header.TCPFlagSyn, seq: 1000, server: blocked})
+	pkt := ctPacket(seg)
+	defer pkt.DecRef()
+	pkt.RXChecksumValidated = true
+	if it.CheckPrerouting(pkt, nil, "eth0") {
+		t.Fatal("the packet to the blocked address passed")
+	}
+	if got := it.connections.count.Load(); got != 1 {
+		t.Errorf("count = %d, want 1: a drop removed a confirmed connection", got)
+	}
+	if cn.timedOut(it.connections.clock.NowMonotonic()) {
+		t.Error("the confirmed connection is gone")
+	}
+}
+
+func TestConnTrackFirstReplyIsTrackedWithoutReply(t *testing.T) {
+	t.Run("RST answers the first SYN", func(t *testing.T) {
+		ct := newLimitsConnTrack(64)
+		cn := ctSend(t, ct, ctHandshake[0])
+		cn = ctSend(t, ct, ctSegment{fromClient: false, flags: header.TCPFlagRst | header.TCPFlagAck, seq: 0, ack: 1001})
+		if !cn.timedOut(ct.clock.NowMonotonic()) {
+			t.Error("a RST that answers the first SYN left the connection in the table")
+		}
+	})
+	t.Run("first UDP reply after two seconds", func(t *testing.T) {
+		ct := newLimitsConnTrack(64)
+		clock := ct.clock.(*faketime.ManualClock)
+		send := func(reply bool) *conn {
+			pkt := ctUDPPacket(10000)
+			defer pkt.DecRef()
+			if reply {
+				ip := header.IPv4(pkt.NetworkHeader().Slice())
+				udp := header.UDP(pkt.TransportHeader().Slice())
+				src, dst := ip.SourceAddress(), ip.DestinationAddress()
+				ip.SetSourceAddress(dst)
+				ip.SetDestinationAddress(src)
+				udp.SetSourcePort(ctServerPort)
+				udp.SetDestinationPort(10000)
+			}
+			tup, _ := ct.trackPacket(pkt, true)
+			tup.conn.finalize()
+			return tup.conn
+		}
+		send(false)
+		clock.Advance(5 * time.Second)
+		cn := send(true)
+		e := cn.snapshot(clock.NowMonotonic())
+		if e.Timeout != 21*time.Second || e.Status&ConntrackStatusAssured != 0 || e.Status&ConntrackStatusSeenReply == 0 {
+			t.Errorf("first reply: timeout %v, status %#x, want 21s, seen reply, not assured", e.Timeout, e.Status)
+		}
+		clock.Advance(time.Second)
+		e = send(true).snapshot(clock.NowMonotonic())
+		if e.Timeout != 22*time.Second || e.Status&ConntrackStatusAssured == 0 {
+			t.Errorf("second reply: timeout %v, status %#x, want 22s and assured", e.Timeout, e.Status)
+		}
+	})
+	t.Run("first reply of a picked up connection", func(t *testing.T) {
+		ct := newLimitsConnTrack(64)
+		ct.updateConfig(func(c *conntrackConfig) { c.timeouts[ConntrackTimeoutTCPUnacknowledged] = 7 * time.Second })
+		ctSend(t, ct, ctSegment{fromClient: true, flags: header.TCPFlagAck, seq: 1001, ack: 5001})
+		cn := ctSend(t, ct, ctSegment{fromClient: false, flags: header.TCPFlagAck, seq: 5001, ack: 1001})
+		e := cn.snapshot(ct.clock.NowMonotonic())
+		if e.TCPState != ConntrackTCPEstablished || e.Timeout != 7*time.Second || e.Status&ConntrackStatusAssured != 0 {
+			t.Errorf("first reply: state %d, timeout %v, status %#x, want ESTABLISHED, 7s, not assured", e.TCPState, e.Timeout, e.Status)
+		}
+		cn = ctSend(t, ct, ctSegment{fromClient: true, flags: header.TCPFlagAck, seq: 1001, ack: 5001})
+		if e := cn.snapshot(ct.clock.NowMonotonic()); e.Timeout != 13*time.Second || e.Status&ConntrackStatusAssured == 0 {
+			t.Errorf("next ACK: timeout %v, status %#x, want 13s and assured", e.Timeout, e.Status)
+		}
+	})
+}
+
+func TestConnTrackRSTClosesPickedUpConnection(t *testing.T) {
+	ct := newLimitsConnTrack(64)
+	ctSend(t, ct, ctSegment{fromClient: true, flags: header.TCPFlagAck, seq: 1001, ack: 5001})
+	ctSend(t, ct, ctSegment{fromClient: false, flags: header.TCPFlagAck, seq: 5001, ack: 1001})
+	cn := ctSend(t, ct, ctSegment{fromClient: true, flags: header.TCPFlagAck, seq: 1001, ack: 5001})
+	if e := cn.snapshot(ct.clock.NowMonotonic()); e.TCPState != ConntrackTCPEstablished {
+		t.Fatalf("state before the RST = %d, want ESTABLISHED", e.TCPState)
+	}
+	// A RST with a sequence number below the acknowledgment of the server is
+	// invalid, and Linux leaves the connection alone.
+	ctSend(t, ct, ctSegment{fromClient: true, flags: header.TCPFlagRst, seq: 500})
+	if e := cn.snapshot(ct.clock.NowMonotonic()); e.TCPState != ConntrackTCPEstablished || e.Timeout != 13*time.Second {
+		t.Errorf("after an invalid RST: state %d, timeout %v, want ESTABLISHED and 13s", e.TCPState, e.Timeout)
+	}
+	ctSend(t, ct, ctSegment{fromClient: true, flags: header.TCPFlagRst, seq: 1001})
+	e := cn.snapshot(ct.clock.NowMonotonic())
+	if e.TCPState != ConntrackTCPClose || e.Timeout != 18*time.Second {
+		t.Errorf("after the RST: state %d, timeout %v, want CLOSE and 18s", e.TCPState, e.Timeout)
 	}
 }
