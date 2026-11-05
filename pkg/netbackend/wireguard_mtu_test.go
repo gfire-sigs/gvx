@@ -16,11 +16,14 @@ package netbackend
 
 import (
 	"testing"
+
+	"golang.zx2c4.com/wireguard/device"
 )
 
 // TestWireGuardEth0TakesTheMTURangeOfTheTunnel checks the range that the guest
 // can set on eth0 in the wg network mode. wireguard-go carries a packet of at
-// most 65503 bytes, so that value is the largest MTU.
+// most device.MaxContentSize bytes, so that value is the largest MTU: 65503 on
+// Linux and macOS, and 1984 on Windows.
 func TestWireGuardEth0TakesTheMTURangeOfTheTunnel(t *testing.T) {
 	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
 	w, err := NewWireGuardEndpoint(WireGuardConfig{PrivateKey: guestKey.private, PeerPublicKey: peerKey.public})
@@ -32,12 +35,12 @@ func TestWireGuardEth0TakesTheMTURangeOfTheTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	for _, mtu := range []uint32{67, 65504, 65535} {
+	for _, mtu := range []uint32{67, device.MaxContentSize + 1, 65535} {
 		if err := s.SetNICMTU(Eth0NICID, mtu); err == nil {
 			t.Errorf("SetNICMTU(%d) succeeded, want an error", mtu)
 		}
 	}
-	for _, mtu := range []uint32{68, 65503, DefaultWireGuardMTU} {
+	for _, mtu := range []uint32{68, device.MaxContentSize, DefaultWireGuardMTU} {
 		if err := s.SetNICMTU(Eth0NICID, mtu); err != nil {
 			t.Errorf("SetNICMTU(%d) = %v, want success", mtu, err)
 		}

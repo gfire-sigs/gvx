@@ -141,7 +141,8 @@ A link with an MTU below 1280 has no IPv6, as on Linux. The link loses its IPv6 
 | Link | MTU range |
 | :--- | :--- |
 | `eth0` in the `nat` network mode | 68 to 65535 |
-| `eth0` in the `wg` network mode | 68 to 65503 |
+| `eth0` in the `wg` network mode on Linux and macOS | 68 to 65503 |
+| `eth0` in the `wg` network mode on Windows | 68 to 1984 |
 | A veth link or a bridge that the guest creates | 68 to 65535 |
 | `lo` | The link accepts a request and keeps 65536. Linux changes the value. |
 

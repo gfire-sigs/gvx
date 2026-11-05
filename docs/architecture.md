@@ -470,9 +470,9 @@ In `-net=nat` mode, the guest `eth0` is one end of an in-memory `pipe` link. The
 
 The guest `eth0` starts with the MTU 1500, as on a Linux node or in a Docker container. The tunable `net.nat.mtu` sets the first MTU. The loopback device keeps 65,536. Software in the guest derives the MTU of its tunnels from `eth0`: `flannel` uses 1450 for `vxlan` and 1420 for WireGuard.
 
-The guest changes the MTU of `eth0`, of a veth link, and of a bridge with `RTM_SETLINK` (`ip link set dev eth0 mtu N`) or with `ioctl(SIOCSIFMTU)`, which the busybox `ip` and `ifconfig` use. `eth0` accepts 68 to 65535, or 68 to 65503 in the `wg` network mode. A veth link and a bridge accept 68 to 65535. A value outside the range fails with `EINVAL`, as on Linux. The host end of the `eth0` link takes the new MTU, so the TCP streams use the new segment size.
+The guest changes the MTU of `eth0`, of a veth link, and of a bridge with `RTM_SETLINK` (`ip link set dev eth0 mtu N`) or with `ioctl(SIOCSIFMTU)`, which the busybox `ip` and `ifconfig` use. `eth0` accepts 68 to 65535. In the `wg` network mode it accepts 68 to 65503, or 68 to 1984 on Windows, because `wireguard-go` limits a packet there to 2016 bytes. A veth link and a bridge accept 68 to 65535. A value outside the range fails with `EINVAL`, as on Linux.
 
-Each end of a veth pair has its own MTU. A link with an MTU below 1280 loses its IPv6 addresses and routes, and it accepts no IPv6 address until the MTU returns to 1280, as `addrconf_notify` does in Linux. A request to change `lo` succeeds and keeps 65,536.
+Each end of a veth pair has its own MTU. The host end of the `eth0` link takes the new MTU, so the TCP streams use the new segment size. A link with an MTU below 1280 loses its IPv6 addresses and routes, and it accepts no IPv6 address until the MTU returns to 1280, as `addrconf_notify` does in Linux. A request to change `lo` succeeds and keeps 65,536.
 
 macOS limits a datagram to the send buffer of a UDP socket, which starts at `net.inet.udp.maxdgram`, or 9216 bytes. A guest with a larger MTU builds larger tunnel datagrams. The NAT relay and the published UDP ports therefore raise the send buffer of their host UDP sockets to 128 KiB on macOS. Linux and Windows need no change.
 
