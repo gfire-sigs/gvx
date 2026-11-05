@@ -216,6 +216,10 @@ type Stack struct {
 	// allowConnectedOnSave indicates whether connections should be
 	// allowed to remain connected during save.
 	allowConnectedOnSave bool
+
+	// neighborTables hold the gc_thresh values and the entry counts of the
+	// ARP and NDP tables. See neighbor_gc_xplat.go.
+	neighborTables neighborTables `state:"nosave"`
 }
 
 // NetworkProtocolFactory instantiates a network protocol.

@@ -339,6 +339,8 @@ func (n *nic) remove(closeLinkEndpoint bool) (func(), tcpip.Error) {
 
 	n.enableDisableMu.Unlock()
 
+	n.unregisterNeighborCaches()
+
 	// Drain and drop any packets pending link resolution.
 	// We must not hold n.enableDisableMu here.
 	n.linkResQueue.cancel()

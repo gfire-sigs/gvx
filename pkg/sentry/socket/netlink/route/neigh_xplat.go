@@ -227,12 +227,6 @@ func nudOf(s stack.NeighborState) uint16 {
 	return 0
 }
 
-// maxStaticNeighbors is the largest count of static entries in the neighbor
-// table of one link and one IP family. The table of the stack does not bound
-// them, and a guest could fill the memory of the sandbox otherwise. Linux
-// answers a full table with ENOBUFS.
-const maxStaticNeighbors = 65536
-
 // findNeigh returns the entry of the key, if the table of the link has one.
 func findNeigh(st *netstack.Stack, k neighKey) (stack.NeighborEntry, bool, *syserr.Error) {
 	e, ok, err := st.Stack.NeighborLookup(k.nic, k.proto, k.addr)
@@ -254,7 +248,9 @@ func putNeigh(ms *nlmsg.MessageSet, family uint8, nic tcpip.NICID, e stack.Neigh
 
 // newNeigh adds or changes an entry of the neighbor table. A static entry
 // (state NUD_PERMANENT or NUD_NOARP) needs the Ethernet address. A dynamic
-// state is not supported, because the table has no way to set it.
+// state is not supported, because the table has no way to set it. A static
+// entry has no limit, as in Linux, where NUD_PERMANENT entries stay off the
+// garbage collection list that gc_thresh1 to gc_thresh3 bound.
 func newNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, flags uint16) *syserr.Error {
 	k, err := parseNeighKey(st, nd, attrs)
 	if err != nil {
@@ -278,15 +274,6 @@ func newNeigh(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView, fl
 		return nil
 	case !exists && flags&linux.NLM_F_CREATE == 0:
 		return syserr.ErrNoFileOrDir
-	}
-	if !exists {
-		n, terr := st.Stack.StaticNeighborCount(k.nic, k.proto)
-		if terr != nil {
-			return syserr.TranslateNetstackError(terr)
-		}
-		if n >= maxStaticNeighbors {
-			return syserr.ErrNoBufferSpace
-		}
 	}
 	return syserr.TranslateNetstackError(st.Stack.AddStaticNeighbor(k.nic, k.proto, k.addr, tcpip.LinkAddress(mac)))
 }
