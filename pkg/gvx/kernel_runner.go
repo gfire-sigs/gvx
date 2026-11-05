@@ -64,6 +64,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/loader"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/sentry/strace"
 	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
@@ -965,6 +966,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		// where Docker and containerd set ip_unprivileged_port_start to 0. A
 		// namespace that the guest creates starts at 1024, as on Linux.
 		inetStack.SetUnprivilegedPortStart(0)
+		// Linux logs the LOG target of iptables only in the initial network
+		// namespace, which is the root namespace of the guest.
+		netfilter.SetStackLog(inetStack.Stack, func(level int, line string) { k.KernelLog().Printk(level, line) })
 		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
 	}
 

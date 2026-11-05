@@ -16,11 +16,16 @@ package netfilter
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"runtime"
 	"slices"
+	"strings"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -32,11 +37,20 @@ import (
 // kernel log. Calico and kube-router use the target for the log actions of
 // their policies.
 //
-// /dev/kmsg of the Sentry cannot hold records yet, so the target writes the
-// line to the log of the Sentry, at the level info. The line starts with the
-// prefix of the rule and has the fields SRC, DST, LEN, and PROTO. When
-// /dev/kmsg can hold records, this function must write the line there.
-// Ref: struct ipt_log_info in include/uapi/linux/netfilter_ipv4/ipt_LOG.h.
+// The line has the format of nf_log_syslog (net/netfilter/nf_log_syslog.c): the
+// prefix of the rule, IN= and OUT= with the names of the interfaces, MAC= for a
+// packet that came in, the fields of the IP header, and the fields of the
+// transport header. The record has the level of the rule and the facility
+// kernel. The line omits the optional fields that the flags of the rule
+// select: the TCP sequence numbers, the TCP and IP options, and the UID and
+// GID of the socket owner.
+//
+// A rule logs through the log function of its network stack. Linux logs only
+// from the initial network namespace unless the sysctl nf_log_all_netns is set,
+// so the owner of the root network namespace sets the function with
+// SetStackLog, and a rule of another stack writes only to the log of the
+// Sentry. Ref: struct ipt_log_info in
+// include/uapi/linux/netfilter_ipv4/ipt_LOG.h.
 
 // LogTargetName is the name of the LOG target.
 const LogTargetName = "LOG"
@@ -53,6 +67,43 @@ const (
 	logOffPrefix = linux.SizeOfXTEntryTarget + 2
 	logPrefixLen = 30
 )
+
+// LogFunc writes one line to the kernel log at a syslog level from 0 to 7.
+type LogFunc func(level int, line string)
+
+// stackLogs maps a network stack to its log function. The map holds the stacks
+// weakly, so a stack that a test drops frees its entry.
+var stackLogs = struct {
+	mu sync.Mutex
+	m  map[weak.Pointer[stack.Stack]]LogFunc
+}{m: make(map[weak.Pointer[stack.Stack]]LogFunc)}
+
+// SetStackLog sets the function that the LOG rules of stk write their lines
+// to. A nil function removes it. The function applies to the rules that a later
+// SetEntries request creates.
+func SetStackLog(stk *stack.Stack, fn LogFunc) {
+	key := weak.Make(stk)
+	stackLogs.mu.Lock()
+	defer stackLogs.mu.Unlock()
+	if fn == nil {
+		delete(stackLogs.m, key)
+		return
+	}
+	if _, ok := stackLogs.m[key]; !ok {
+		runtime.AddCleanup(stk, func(key weak.Pointer[stack.Stack]) {
+			stackLogs.mu.Lock()
+			defer stackLogs.mu.Unlock()
+			delete(stackLogs.m, key)
+		}, key)
+	}
+	stackLogs.m[key] = fn
+}
+
+func stackLog(stk *stack.Stack) LogFunc {
+	stackLogs.mu.Lock()
+	defer stackLogs.mu.Unlock()
+	return stackLogs.m[weak.Make(stk)]
+}
 
 func init() {
 	registerTargetMaker(&logTargetMaker{networkProtocol: header.IPv4ProtocolNumber})
@@ -101,10 +152,30 @@ type logTarget struct {
 	networkProtocol tcpip.NetworkProtocolNumber
 	// raw is the whole user target as parsed. Marshal returns it unchanged.
 	raw []byte
+	// log writes the line to the kernel log. bindStack sets it before the rule
+	// is published, so Action reads it without a lock. It is nil for a rule of
+	// a stack without a log function.
+	log LogFunc
 }
+
+var (
+	_ stackBinder           = (*logTarget)(nil)
+	_ stack.InterfaceTarget = (*logTarget)(nil)
+)
 
 func (t *logTarget) id() targetID {
 	return targetID{name: LogTargetName, networkProtocol: t.networkProtocol, revision: logTargetRevision}
+}
+
+// bindStack implements stackBinder.bindStack.
+func (t *logTarget) bindStack(stk *stack.Stack) *syserr.Error {
+	t.log = stackLog(stk)
+	return nil
+}
+
+// level returns the syslog level of the rule.
+func (t *logTarget) level() int {
+	return int(t.raw[logOffLevel])
 }
 
 // prefix returns the prefix of the rule.
@@ -116,25 +187,130 @@ func (t *logTarget) prefix() string {
 	return string(p)
 }
 
-// line returns the log line of a packet.
-func (t *logTarget) line(pkt *stack.PacketBuffer) string {
-	src, dst, ok := packetAddresses(pkt)
-	if !ok {
-		return t.prefix() + "(packet without an IP header)"
+// line returns the log line of a packet. in and out are the names of the
+// interfaces, or empty.
+func (t *logTarget) line(pkt *stack.PacketBuffer, in, out string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%sIN=%s OUT=%s ", t.prefix(), in, out)
+	if in != "" {
+		b.WriteString("MAC=")
+		for i, c := range pkt.LinkHeader().Slice() {
+			if i > 0 {
+				b.WriteByte(':')
+			}
+			fmt.Fprintf(&b, "%02x", c)
+		}
+		b.WriteByte(' ')
 	}
-	var proto tcpip.TransportProtocolNumber
 	switch pkt.NetworkProtocolNumber {
 	case header.IPv4ProtocolNumber:
-		proto = header.IPv4(pkt.NetworkHeader().Slice()).TransportProtocol()
+		dumpIPv4(&b, pkt)
 	case header.IPv6ProtocolNumber:
-		proto = header.IPv6(pkt.NetworkHeader().Slice()).TransportProtocol()
+		dumpIPv6(&b, pkt)
+	default:
+		b.WriteString("(packet without an IP header)")
 	}
-	return fmt.Sprintf("%sSRC=%s DST=%s LEN=%d PROTO=%d", t.prefix(), src, dst, pkt.Size(), proto)
+	return b.String()
 }
 
-// Action implements stack.Target.Action. It writes the log line and has no
-// other side effect.
-func (t *logTarget) Action(pkt *stack.PacketBuffer, _ stack.Hook, _ *stack.Route, _ stack.AddressableEndpoint) (stack.RuleVerdict, int) {
-	log.Infof("netfilter LOG: %s", t.line(pkt))
+// dumpIPv4 writes the fields of dump_ipv4_packet.
+func dumpIPv4(b *strings.Builder, pkt *stack.PacketBuffer) {
+	hdr := header.IPv4(pkt.NetworkHeader().Slice())
+	if len(hdr) < header.IPv4MinimumSize {
+		b.WriteString("(truncated IPv4 header)")
+		return
+	}
+	tos, _ := hdr.TOS()
+	fmt.Fprintf(b, "SRC=%s DST=%s LEN=%d TOS=0x%02X PREC=0x%02X TTL=%d ID=%d ",
+		hdr.SourceAddress(), hdr.DestinationAddress(), hdr.TotalLength(), tos&0x1e, tos&0xe0, hdr.TTL(), hdr.ID())
+	if hdr.Flags()&header.IPv4FlagDontFragment != 0 {
+		b.WriteString("DF ")
+	}
+	if hdr.Flags()&header.IPv4FlagMoreFragments != 0 {
+		b.WriteString("MF ")
+	}
+	frag := hdr.FragmentOffset()
+	if frag != 0 {
+		fmt.Fprintf(b, "FRAG:%d ", frag/8)
+	}
+	dumpTransport(b, pkt, hdr.TransportProtocol(), frag != 0, false)
+}
+
+// dumpIPv6 writes the fields of dump_ipv6_packet.
+func dumpIPv6(b *strings.Builder, pkt *stack.PacketBuffer) {
+	hdr := header.IPv6(pkt.NetworkHeader().Slice())
+	if len(hdr) < header.IPv6MinimumSize {
+		b.WriteString("(truncated IPv6 header)")
+		return
+	}
+	class, label := hdr.TOS()
+	fmt.Fprintf(b, "SRC=%s DST=%s LEN=%d TC=0x%02X HOPLIMIT=%d FLOWLBL=%d ",
+		hdr.SourceAddress(), hdr.DestinationAddress(), int(hdr.PayloadLength())+header.IPv6MinimumSize, class, hdr.HopLimit(), label)
+	dumpTransport(b, pkt, hdr.TransportProtocol(), false, true)
+}
+
+// dumpTransport writes PROTO= and the fields of the transport header. A
+// fragment after the first has no transport header.
+func dumpTransport(b *strings.Builder, pkt *stack.PacketBuffer, proto tcpip.TransportProtocolNumber, laterFragment, ipv6 bool) {
+	th := pkt.TransportHeader().Slice()
+	switch proto {
+	case header.TCPProtocolNumber:
+		b.WriteString("PROTO=TCP ")
+		if laterFragment || len(th) < header.TCPMinimumSize {
+			return
+		}
+		tcp := header.TCP(th)
+		fmt.Fprintf(b, "SPT=%d DPT=%d WINDOW=%d RES=0x%02x ", tcp.SourcePort(), tcp.DestinationPort(), tcp.WindowSize(), (th[12]&0x0f)<<2)
+		flags := tcp.Flags()
+		for _, f := range []struct {
+			bit  header.TCPFlags
+			name string
+		}{
+			{header.TCPFlagCwr, "CWR "}, {header.TCPFlagEce, "ECE "}, {header.TCPFlagUrg, "URG "}, {header.TCPFlagAck, "ACK "},
+			{header.TCPFlagPsh, "PSH "}, {header.TCPFlagRst, "RST "}, {header.TCPFlagSyn, "SYN "}, {header.TCPFlagFin, "FIN "},
+		} {
+			if flags&f.bit != 0 {
+				b.WriteString(f.name)
+			}
+		}
+		fmt.Fprintf(b, "URGP=%d ", tcp.UrgentPointer())
+	case header.UDPProtocolNumber:
+		b.WriteString("PROTO=UDP ")
+		if laterFragment || len(th) < header.UDPMinimumSize {
+			return
+		}
+		udp := header.UDP(th)
+		fmt.Fprintf(b, "SPT=%d DPT=%d LEN=%d ", udp.SourcePort(), udp.DestinationPort(), udp.Length())
+	case header.ICMPv4ProtocolNumber, header.ICMPv6ProtocolNumber:
+		name, echoRequest, echoReply := "ICMP", byte(header.ICMPv4Echo), byte(header.ICMPv4EchoReply)
+		if ipv6 {
+			name, echoRequest, echoReply = "ICMPv6", byte(header.ICMPv6EchoRequest), byte(header.ICMPv6EchoReply)
+		}
+		fmt.Fprintf(b, "PROTO=%s ", name)
+		if laterFragment || len(th) < 4 {
+			return
+		}
+		fmt.Fprintf(b, "TYPE=%d CODE=%d ", th[0], th[1])
+		if (th[0] == echoRequest || th[0] == echoReply) && len(th) >= 8 {
+			fmt.Fprintf(b, "ID=%d SEQ=%d ", binary.BigEndian.Uint16(th[4:]), binary.BigEndian.Uint16(th[6:]))
+		}
+	default:
+		fmt.Fprintf(b, "PROTO=%d ", proto)
+	}
+}
+
+// Action implements stack.Target.Action for a hook that knows no interface.
+func (t *logTarget) Action(pkt *stack.PacketBuffer, hook stack.Hook, r *stack.Route, addressEP stack.AddressableEndpoint) (stack.RuleVerdict, int) {
+	return t.ActionOnInterfaces(pkt, hook, r, addressEP, "", "")
+}
+
+// ActionOnInterfaces implements stack.InterfaceTarget.ActionOnInterfaces. It
+// writes the log line and has no other side effect.
+func (t *logTarget) ActionOnInterfaces(pkt *stack.PacketBuffer, _ stack.Hook, _ *stack.Route, _ stack.AddressableEndpoint, in, out string) (stack.RuleVerdict, int) {
+	line := t.line(pkt, in, out)
+	if t.log != nil {
+		t.log(t.level(), line)
+	}
+	log.Debugf("netfilter LOG: %s", line)
 	return stack.RuleContinue, 0
 }

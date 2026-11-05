@@ -799,7 +799,7 @@ func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx
 	}
 
 	// All the matchers matched, so run the target.
-	return rule.Target.Action(pkt, hook, r, addressEP)
+	return runTarget(rule.Target, pkt, hook, r, addressEP, inNicName, outNicName)
 }
 
 // OriginalDst returns the original destination of redirected connections. It

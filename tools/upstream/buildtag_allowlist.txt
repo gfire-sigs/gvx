@@ -165,6 +165,9 @@ seam pkg/sentry/kernel/kernel_state_autogen.go
 seam pkg/sentry/kernel/syslog.go
 seam pkg/sentry/syscalls/linux/sys_syslog.go
 seam pkg/sentry/syscalls/linux/linux64.go
+# A target that logs the interfaces of a packet runs through InterfaceTarget
+# (pkg/tcpip/stack/iptables_target_xplat.go). The seam is one call in checkRule.
+seam pkg/tcpip/stack/iptables.go
 
 # Content seams: the service data path of a Kubernetes node (GVXIP-005, P2).
 # A bridge that forwards an IP frame runs the iptables hooks first when bridge-nf-call-iptables is 1
