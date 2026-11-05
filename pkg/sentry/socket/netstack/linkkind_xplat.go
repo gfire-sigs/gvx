@@ -168,3 +168,15 @@ func (s *Stack) ChangeRegisteredLink(ctx context.Context, id tcpip.NICID, data m
 	}
 	return k.Change(ctx, s.Stack.GetLinkEndpointByName(info.Name), data)
 }
+
+// RemoveRegisteredLinks removes every link of stk that a registered kind
+// created, so that the link endpoint closes. Stack.Close does not close link
+// endpoints. A wireguard link would keep its device goroutines and its UDP
+// sockets after the network stack ends.
+func RemoveRegisteredLinks(stk *stack.Stack) {
+	for id, info := range stk.NICInfo() {
+		if _, ok := linkKinds[info.Kind]; ok {
+			stk.RemoveNIC(id)
+		}
+	}
+}

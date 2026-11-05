@@ -125,6 +125,7 @@ func (s *Stack) sendRouteEvent(ctx context.Context, rt tcpip.Route, added bool, 
 // Destroy implements inet.Stack.Destroy.
 func (s *Stack) Destroy() {
 	if s.Stack != nil {
+		RemoveRegisteredLinks(s.Stack)
 		s.Stack.Close()
 		refs.CleanupSync.Add(1)
 		go func() {
