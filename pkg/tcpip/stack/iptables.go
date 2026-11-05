@@ -424,7 +424,10 @@ func (it *IPTables) CheckPrerouting(pkt *PacketBuffer, addressEP AddressableEndp
 		return true
 	}
 
-	pkt.tuple = it.connections.getConnAndUpdate(pkt, false /* skipChecksumValidation */)
+	var full bool
+	if pkt.tuple, full = it.connections.trackPacket(pkt, false /* skipChecksumValidation */); full {
+		return false
+	}
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Prerouting, pkt, nil /* route */, addressEP, inNicName, "" /* outNicName */) {
@@ -552,7 +555,10 @@ func (it *IPTables) CheckOutput(pkt *PacketBuffer, r *Route, outNicName string) 
 
 	// We don't need to validate the checksum in the Output path: we can assume
 	// we calculate it correctly, plus checksumming may be deferred due to GSO.
-	pkt.tuple = it.connections.getConnAndUpdate(pkt, true /* skipChecksumValidation */)
+	var full bool
+	if pkt.tuple, full = it.connections.trackPacket(pkt, true /* skipChecksumValidation */); full {
+		return false
+	}
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Output, pkt, r, nil /* addressEP */, "" /* inNicName */, outNicName) {

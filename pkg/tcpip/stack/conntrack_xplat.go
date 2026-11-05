@@ -19,7 +19,6 @@ import (
 
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
-	"z.gfire.dev/gvx/pkg/tcpip/transport/tcpconntrack"
 )
 
 // This file gives ctnetlink access to the connection table. A caller reads a
@@ -52,6 +51,9 @@ const (
 	ConntrackTCPLastAck
 	ConntrackTCPTimeWait
 	ConntrackTCPClose
+	// ConntrackTCPSynSent2 is the state after the SYN of the reply direction
+	// of a simultaneous open.
+	ConntrackTCPSynSent2
 )
 
 // ConntrackTuple is one direction of a tracked connection. For ICMP echo, the
@@ -100,8 +102,8 @@ func (cn *conn) snapshot(now tcpip.MonotonicTime) ConntrackEntry {
 	cn.mu.RUnlock()
 
 	cn.stateMu.RLock()
-	lastUsed, replySeen := cn.lastUsed, cn.replySeen
-	tcbState := cn.tcb.State()
+	lastUsed, timeout, dying := cn.lastUsed, cn.timeout, cn.dying
+	replySeen, assured, tcpState := cn.replySeen, cn.proto.assured, cn.proto.tcp.state
 	cn.stateMu.RUnlock()
 
 	e := ConntrackEntry{
@@ -126,31 +128,14 @@ func (cn *conn) snapshot(now tcpip.MonotonicTime) ConntrackEntry {
 		e.Status |= ConntrackStatusDstNATDone
 	}
 
-	timeout := unestablishedTimeout
 	if e.Original.TransProto == header.TCPProtocolNumber {
 		e.HasTCPState = true
-		switch tcbState {
-		case tcpconntrack.ResultConnecting:
-			e.TCPState = ConntrackTCPSynSent
-			if replySeen {
-				e.TCPState = ConntrackTCPSynRecv
-			}
-		case tcpconntrack.ResultAlive:
-			e.TCPState = ConntrackTCPEstablished
-			e.Status |= ConntrackStatusAssured
-			timeout = establishedTimeout
-		case tcpconntrack.ResultClosedByOriginator, tcpconntrack.ResultClosedByResponder:
-			e.TCPState = ConntrackTCPTimeWait
-			e.Status |= ConntrackStatusAssured
-		case tcpconntrack.ResultReset:
-			e.TCPState = ConntrackTCPClose
-		default:
-			e.TCPState = ConntrackTCPNone
-		}
-	} else if replySeen {
+		e.TCPState = tcpState
+	}
+	if assured {
 		e.Status |= ConntrackStatusAssured
 	}
-	if left := timeout - now.Sub(lastUsed); left > 0 {
+	if left := lastUsed.Add(timeout).Sub(now); left > 0 && !dying {
 		e.Timeout = left
 	}
 	return e
@@ -158,11 +143,12 @@ func (cn *conn) snapshot(now tcpip.MonotonicTime) ConntrackEntry {
 
 // expire makes the connection invisible to lookups and lets the reaper remove
 // it. The next packet of the flow then starts a new connection, which runs the
-// NAT rules again. A packet that already holds the connection keeps it.
-func (cn *conn) expire(now tcpip.MonotonicTime) {
+// NAT rules again. A packet that already holds the connection keeps it, but
+// the packet does not renew the timeout.
+func (cn *conn) expire() {
 	cn.stateMu.Lock()
 	defer cn.stateMu.Unlock()
-	cn.lastUsed = now.Add(-(establishedTimeout + unestablishedTimeout + time.Second))
+	cn.dying = true
 }
 
 // forEachConfirmedInBucket calls visit for each connection whose original
@@ -286,7 +272,7 @@ func (s *Stack) ConntrackDeleteTuple(t ConntrackTuple, accept func(ConntrackEntr
 	if accept != nil && !accept(e) {
 		return e, false
 	}
-	cn.expire(now)
+	cn.expire()
 	return e, true
 }
 
@@ -296,7 +282,7 @@ func (s *Stack) ConntrackDelete(match func(ConntrackEntry) bool) int {
 	deleted := 0
 	s.tables.connections.forEachConfirmed(func(cn *conn, now tcpip.MonotonicTime) bool {
 		if match(cn.snapshot(now)) {
-			cn.expire(now)
+			cn.expire()
 			deleted++
 		}
 		return true
@@ -309,11 +295,7 @@ func (s *Stack) ConntrackDelete(match func(ConntrackEntry) bool) int {
 func (cn *conn) closedTCP() bool {
 	cn.stateMu.RLock()
 	defer cn.stateMu.RUnlock()
-	switch cn.tcb.State() {
-	case tcpconntrack.ResultClosedByOriginator, tcpconntrack.ResultClosedByResponder, tcpconntrack.ResultReset:
-		return true
-	}
-	return false
+	return cn.proto.tcp.state == ConntrackTCPTimeWait || cn.proto.tcp.state == ConntrackTCPClose
 }
 
 // expireClosedOnSYN lets a SYN reopen a closed TCP tuple. The state machine of
@@ -335,6 +317,6 @@ func (ct *ConnTrack) expireClosedOnSYN(pkt *PacketBuffer, tid tupleID, bkt *buck
 		return
 	}
 	if t := bkt.connForTID(tid, now); t != nil && t.conn.closedTCP() {
-		t.conn.expire(now)
+		t.conn.expire()
 	}
 }
