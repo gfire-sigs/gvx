@@ -23,8 +23,6 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/faketime"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
-	"z.gfire.dev/gvx/pkg/tcpip/link/ethernet"
-	"z.gfire.dev/gvx/pkg/tcpip/link/packetsocket"
 	"z.gfire.dev/gvx/pkg/tcpip/link/veth"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -86,7 +84,7 @@ func newHostFilterStack(t *testing.T) (*stack.Stack, *hostFilterNIC) {
 		Clock:              faketime.NewManualClock(),
 	})
 	near, far := veth.NewPair(1500, 64)
-	if err := s.CreateNIC(1, newHostFilterEndpoint(packetsocket.New(ethernet.New(near)))); err != nil {
+	if err := s.CreateNIC(1, newVethNICEndpoint(near)); err != nil {
 		t.Fatalf("CreateNIC: %s", err)
 	}
 	addr := tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: hostFilterNICAddr.WithPrefix()}
@@ -167,7 +165,7 @@ func TestHostFilterKeepsBridgePortsForwarding(t *testing.T) {
 	for i := range far {
 		near, f := veth.NewPair(1500, 64)
 		id := tcpip.NICID(10 + i)
-		if err := s.CreateNIC(id, newHostFilterEndpoint(packetsocket.New(ethernet.New(near)))); err != nil {
+		if err := s.CreateNIC(id, newVethNICEndpoint(near)); err != nil {
 			t.Fatalf("CreateNIC(port %d): %s", i, err)
 		}
 		if err := s.SetNICCoordinator(id, 1); err != nil {
