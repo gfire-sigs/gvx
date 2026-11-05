@@ -200,7 +200,13 @@ read -r go
 # B6: name resolution works again within 10 seconds after a CoreDNS restart.
 k -n kube-system delete pod -l k8s-app=kube-dns --wait=false >/dev/null
 sleep 2
-wait_ready kube-system k8s-app=kube-dns 300
+# kubectl wait on the label also waits for the deleted pod, which never becomes
+# Ready, so the loop looks only at pods without a deletion time stamp.
+t0=$(date +%s)
+until [ "$(k -n kube-system get pods -l k8s-app=kube-dns -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" = True ]; do
+  [ $(( $(date +%s) - t0 )) -ge 300 ] && break
+  sleep 1
+done
 t0=$(date +%s)
 ok=0
 while [ $(( $(date +%s) - t0 )) -le 10 ]; do
