@@ -4,8 +4,23 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
+### Features
+
+- **IP sets, the match `set`, and the target `SET`**: the `ipset` tool, `kube-router`, and Calico create and use IP sets in the guest, and `k3s` now enforces a NetworkPolicy. Before this release `k3s` logged `Skipping network policy controller start, ipset save failed`, and a NetworkPolicy had no effect.
+  - The subsystem `NFNL_SUBSYS_IPSET` of `NETLINK_NETFILTER` serves the protocol versions 6 and 7: `PROTOCOL`, `CREATE`, `DESTROY`, `FLUSH`, `RENAME`, `SWAP`, `LIST`, `SAVE`, `ADD`, `DEL`, `TEST`, `HEADER`, `TYPE`, `GET_BYNAME`, and `GET_BYINDEX`. `ipset restore`, batches of elements, and `-exist` work. An error message carries the request, as in Linux, so the tool decodes it. A listing has no size limit, because the socket sends one message for each read.
+  - The set types are `hash:ip`, `hash:net`, `hash:ip,port`, `hash:net,port`, `hash:ip,port,ip`, `hash:ip,port,net`, `hash:net,net`, `bitmap:port`, and `list:set`, with the revisions of Linux 7.0. The options are `family inet` and `inet6`, `timeout`, `counters`, `comment`, `skbinfo`, `forceadd`, `maxelem`, `hashsize`, `bucketsize`, `netmask`, `bitmask`, and `nomatch` for the net types. A net set tests the longest prefix first, so a `nomatch` element of a longer prefix wins over a covering net. An element with a timeout expires. The sets belong to the network namespace.
+  - Linux limits follow the Linux knobs. The default `maxelem` is 65536. The file `/sys/module/ip_set/parameters/max_sets` (default 256) sets the first size of the table of sets of each network namespace that starts after a write, and the table grows by 64 sets, as in Linux.
+  - `-m set --match-set NAME src,dst` (revisions 1 to 4, with `!`, `--return-nomatch`, and the counter conditions of the revisions 3 and 4) and `-j SET` with `--add-set`, `--del-set`, `--exist`, `--timeout`, and `--map-set` (revisions 1 to 3) work for IPv4 and IPv6. `iptables-save` prints the rules back unchanged. A rule keeps a reference to its set, so `ipset destroy` fails with `Set cannot be destroyed: it is in use by a kernel component` until the rule ends. `iptables` finds a set by name through `getsockopt(SO_IP_SET)`.
+  - `ipset swap` exchanges the data behind two names. A rule that names a set sees the new data at once, as in Linux.
+- **`iptables` matches `icmp`, `icmp6`, `limit`, and `physdev`, and the target `NFLOG`**: `kube-router` and Calico Felix program these rules, and each one made `iptables-restore` fail with `Invalid argument` or `No chain/target/match by that name`. The whole network policy sync then failed.
+  - `-p icmp --icmp-type` and `-p icmpv6 --icmpv6-type` select ICMP packets by type and code range, with `!` inversion. A fragment with an offset never matches, and a packet with a truncated ICMP header is dropped, as in Linux. The type `any` matches every IPv4 ICMP type. The IPv6 match has no wildcard, as in Linux.
+  - `-m limit --limit N/unit --limit-burst B` is a token bucket for each rule. It uses the monotonic clock of the network stack. `iptables-save` prints `--limit` and `--limit-burst` again.
+  - `-m physdev` matches a frame that a bridge switches between two of its ports, with `--physdev-in`, `--physdev-out`, `--physdev-is-in`, `--physdev-is-out`, `--physdev-is-bridged`, and `!`. A packet that the IP layer routes through the bridge is not bridged. Linux rejects `--physdev-out` and `--physdev-is-out` in a chain that the OUTPUT hook reaches, unless `--physdev-is-bridged` is also set. The stack rejects them as well.
+  - `-j NFLOG --nflog-group N` accepts the rule, checks the size, flags, and prefix as Linux does, and keeps the rule for `iptables-save`. The stack has no NFLOG listener, so no group receives a packet, and the target never drops or changes one.
+
 ### Bug Fixes
 
+- **`iptables` could not read back the matches `mark` and `multiport`**: `iptables -S` printed `[unsupported revision]` for these matches, and an `iptables -I` on a table with a `multiport` rule broke the table. The later commands failed with `can't initialize iptables table 'filter': Incompatible with this kernel`. The table now reports the revision of each match, as in Linux. `kube-router` hit this fault at its first sync.
 - **IPv6 replies of a node that forwards packets**: an IPv6 packet for a local address of another NIC went to a random owner of the address, as IPv4 packets did before v0.8.10012026110200. A SYN-ACK to a pod could then leave through the default route instead of the bridge, and the pod got no answer. The stack now delivers such a packet on the NIC where it arrived, and the reply follows the route table, as in Linux.
 
 ## [v0.8.10012026110200] - 2026-11-05

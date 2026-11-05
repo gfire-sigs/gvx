@@ -19,6 +19,7 @@ The phases below have a fixed order. A phase ends when every test of its exit cr
 | P2 | Service data path (`statistic`, `recent`, bridge netfilter, `ctnetlink`) | Done. A8 to A11 and B3 to B6 pass on every platform of section 4.4. |
 | P3 | Links between nodes (generic netlink, `wireguard`, `vxlan`, neighbor and FDB netlink) | Done. A12, A13, C1, C2, and C3 pass on every platform of section 4.4. |
 | P4 | Enforcement of `cpu.max` | Done. A14, B9, B10, C4, and C5 pass on every platform of section 4.4. |
+| P5 | IP sets and NetworkPolicy (`ipset`, `set` match, `SET` target, `icmp`, `limit`, `physdev`, `NFLOG`) | Done. A15, A16, and B12 pass on the platforms that the CHANGELOG lists. |
 
 ---
 
@@ -122,14 +123,35 @@ The Sentry stores `cpu.max` today and does not enforce it. P4 adds the CFS bandw
 | :--- | :--- | :--- |
 | `cpu.max` | The tasks of a cgroup run for at most the quota in each period. `cpu.stat` reports `nr_periods`, `nr_throttled`, and `throttled_usec`. | `_xplat.go` files in `pkg/sentry/kernel`, and a seam in `pkg/sentry/fsimpl/cgroup2fs/cpu.go` |
 
-### 3.5 Out of Scope
+### 3.5 P5: IP Sets and NetworkPolicy
+
+`k3s` runs the network policy controller of `kube-router`. It keeps the pod addresses of each policy in IP sets, and it matches them in iptables rules with the match `set`. Calico uses the same kernel interfaces. Before P5 the guest had no `ipset`, so `k3s` logged `Skipping network policy controller start, ipset save failed`, and a NetworkPolicy had no effect.
+
+| Item | Behavior | Location |
+| :--- | :--- | :--- |
+| IP sets | A registry holds the named sets of one network namespace. The types are `hash:ip`, `hash:net`, `hash:ip,port`, `hash:net,port`, `hash:ip,port,ip`, `hash:ip,port,net`, `hash:net,net`, `bitmap:port`, and `list:set`, with the revision ranges of Linux 7.0. The options are `family`, `timeout`, `counters`, `comment`, `skbinfo`, `forceadd`, `maxelem`, `hashsize`, `bucketsize`, `netmask`, `bitmask`, and `nomatch`. A net set tests the longest prefix first. A set with a timeout drops an element at its time. | `pkg/ipset` (Tier 1) |
+| `NFNL_SUBSYS_IPSET` | `NETLINK_NETFILTER` serves the protocol versions 6 and 7: `PROTOCOL`, `CREATE`, `DESTROY`, `FLUSH`, `RENAME`, `SWAP`, `LIST`, `SAVE`, `ADD`, `DEL`, `TEST`, `HEADER`, `TYPE`, `GET_BYNAME`, and `GET_BYINDEX`. An error message carries the request and, in a batch, the line number of the failed element, as in Linux. A listing sends one message for each read of the socket, so it has no size limit. | `pkg/sentry/socket/netlink/netfilter/ipset_xplat.go` and a seam in `pkg/sentry/socket/netlink/socket.go` |
+| Limits | The limits follow Linux. The default `maxelem` is 65536. The file `/sys/module/ip_set/parameters/max_sets` has the default 256. A network namespace that starts after a write takes that size for its table of sets. The table grows by 64 sets when it is full, up to the 16-bit index space. | `pkg/ipset/registry.go`; `pkg/sentry/fsimpl/sys/ipset_xplat.go` |
+| `-m set` | The revisions 1 to 4 take `--match-set NAME flags`, `!`, `--return-nomatch`, and the counter conditions. The match holds a reference to its set until the table that holds the rule goes away. A rule for a set that does not exist fails with `ENOENT`. `iptables-save` prints the rule back unchanged. | `pkg/sentry/socket/netfilter/set_matcher_xplat.go` |
+| `-j SET` | The revisions 1 to 3 take `--add-set`, `--del-set`, `--exist`, `--timeout`, and `--map-set`. | `pkg/sentry/socket/netfilter/set_target_xplat.go` |
+| `SO_IP_SET` | `iptables` resolves a set name to its index with `getsockopt(SOL_IP, SO_IP_SET)`: `IP_SET_OP_VERSION`, `GET_BYNAME`, `GET_BYINDEX`, and `GET_FNAME`. | `pkg/sentry/socket/netfilter/ipset_sockopt_xplat.go` and a seam in `pkg/sentry/socket/netstack/netstack.go` |
+| `-m icmp`, `-m icmp6` | The matches select a packet by ICMP type and code, with `!` inversion. | `pkg/sentry/socket/netfilter/icmp_matcher_xplat.go` |
+| `-m limit` | The match is a token bucket for each rule. | `pkg/sentry/socket/netfilter/limit_matcher_xplat.go` |
+| `-m physdev` | The match knows the frames that a bridge switches between two ports. A packet that the IP layer routes through the bridge is not bridged. | `pkg/sentry/socket/netfilter/physdev_matcher_xplat.go`; the bridge code marks the packet in `pkg/tcpip/stack/bridge_netfilter_xplat.go` |
+| `-j NFLOG` | The target accepts the rule and does nothing, because no listener of an `nflog` group exists. | `pkg/sentry/socket/netfilter/nflog_target_xplat.go` |
+
+The match `set` of a rule keeps the index of its set. `ipset swap` exchanges the sets and the names behind the two indexes, so a rule sees the new data at once. A swap of two sets with different types fails. A destroy of a set fails with `EBUSY` while a rule, a `list:set` set, or a running listing refers to it.
+
+The marshaled entries now carry the revision of each match. Before P5, `iptables -S` printed `[unsupported revision]` for the matches `mark` and `multiport`. An `iptables -I` on a table with such a rule then broke the table, and the later commands failed with `can't initialize iptables table 'filter': Incompatible with this kernel`. `kube-router` hit this fault at its first sync.
+
+### 3.6 Out of Scope
 
 These items stay outside this specification. The documentation of the feature lists each one as a limit.
 
 | Item | Reason and replacement |
 | :--- | :--- |
 | `nftables` (`iptables-nft`) | The upstream implementation is marked `TESTONLY`. The `k3s` image reads `IPTABLES_MODE=legacy`, which is a setting of `k3s`. |
-| `ipset` and NetworkPolicy | A later specification |
+| `nflog` listeners | No netlink group of `NFNL_SUBSYS_ULOG` or `NFNL_SUBSYS_QUEUE` exists. |
 | IPVS, eBPF, and kernel modules | The Sentry does not provide these interfaces. |
 | `memory.max` on Windows `systrap` | A separate engine change. The documentation tells the user to taint such a node. |
 
@@ -160,6 +182,8 @@ These tests check one kernel behavior each. A Go program without an image runs t
 | A12 | `wireguard` | `ip link add` and `wg set` configure a device, and `wg show` prints the configuration. Two sandboxes on one host exchange ICMP echo over `wg0`, once with a published UDP port and once with a keepalive only. After `wg set ... peer ... remove`, the traffic stops. |
 | A13 | `vxlan` and FDB | Two sandboxes exchange ICMP echo over `vxlan1` with the setup of `flannel`: an FDB entry and a permanent neighbor entry. The MTU is 1450. Two namespaces of one guest do the same on `whpx`. After `bridge fdb del`, the traffic stops. |
 | A14 | `cpu.max` | With `cpu.max` at `50000 100000`, a busy loop uses 0.5 ± 0.1 CPU over 5 seconds, and `nr_throttled` grows. |
+| A15 | `ipset` tool | A set of each type takes `add`, `test`, and `del`. `ipset save` and `ipset restore` give the same sets back. `swap`, `rename`, a timeout, a listing of 6,000 elements, and the error messages of the tool work. `/sys/module/ip_set/parameters/max_sets` reads 256. |
+| A16 | `set` match and `SET` target | A rule `-m set --match-set S src -j DROP` drops the traffic of a member and not of a non-member. `iptables-save` prints the rule back. `ipset destroy` fails while the rule exists. `--return-nomatch`, a counter condition, `!`, and `-j SET --add-set` and `--del-set` work, and a rule for IPv6 loads. |
 
 ### 4.2 Single-Node `k3s` (B)
 
@@ -178,6 +202,7 @@ These tests run `rancher/k3s` with `IPTABLES_MODE=legacy` and no other setting o
 | B9 | Resource limits | A pod with a CPU limit of 500m uses at most 0.6 CPU. A pod above its memory limit ends with `OOMKilled`, except on Windows `systrap`. |
 | B10 | Metrics | `kubectl top node` and `kubectl top pod` print values. |
 | B11 | Restart | After a stop and a start of the sandbox, the node returns to `Ready` with the same name, and the pods start again. |
+| B12 | NetworkPolicy | `k3s` starts its network policy controller without the `ipset` warning. A policy that denies all ingress to a server pod stops two client pods. A second policy that names one client lets only that client through. After the policies end, both clients reach the server again. |
 
 ### 4.3 Multiple Nodes (C)
 
@@ -216,6 +241,7 @@ Each phase ends when its tests pass on every platform of section 4.4. The table 
 | P2 | A8 to A11, B3 to B6 |
 | P3 | A12, A13, C1, C2, C3 |
 | P4 | A14, B9, B10, then C4 and C5 |
+| P5 | A15, A16, B12 |
 
 ---
 
