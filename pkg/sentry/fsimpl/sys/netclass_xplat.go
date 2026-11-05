@@ -277,12 +277,14 @@ func (f *hashsizeFile) Write(ctx context.Context, _ *vfs.FileDescription, src us
 }
 
 // newModuleDirChildren returns the children of /sys/module: the parameters of
-// the connection tracker that kube-proxy reads and writes.
+// the connection tracker that kube-proxy reads and writes, and the parameter of
+// the IP sets.
 func (fs *filesystem) newModuleDirChildren(ctx context.Context, creds *auth.Credentials) map[string]kernfs.Inode {
 	hashsize := &hashsizeFile{}
 	hashsize.size.Store(defaultConntrackHashsize)
 	hashsize.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), hashsize, 0644)
 	return map[string]kernfs.Inode{
+		"ip_set": fs.newIPSetModuleDir(ctx, creds),
 		"nf_conntrack": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"parameters": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 				"hashsize": hashsize,
