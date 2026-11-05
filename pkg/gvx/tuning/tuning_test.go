@@ -119,16 +119,52 @@ func TestTypedSettersObeyTheRange(t *testing.T) {
 	}
 }
 
-func TestBoolKindParsesAndFormats(t *testing.T) {
-	e := Entry{Name: "x.flag", Kind: Bool, Default: 0, Max: 1}
-	if n, err := parseValue(e, "true"); err != nil || n != 1 {
-		t.Errorf("parse true = %d, %v", n, err)
+func TestSetReportsAnIntegerThatOverflowsAsTooLarge(t *testing.T) {
+	for _, tc := range []struct{ key, text string }{
+		{"net.nat.mtu", "99999999999999999999"},
+		{"oci.max_json_bytes", "99999999999999999999"},
+		{"oci.max_json_bytes", "99999999999999999999KiB"},
+	} {
+		_, err := Values{}.Set(tc.key, tc.text)
+		if err == nil || !strings.Contains(err.Error(), "too large") || !strings.Contains(err.Error(), tc.key) {
+			t.Errorf("Set(%s, %s) error = %v, want one that names the key and says too large", tc.key, tc.text, err)
+		}
 	}
-	if _, err := parseValue(e, "maybe"); err == nil {
-		t.Error("parse maybe returned no error")
+}
+
+func TestFailedSettersReturnTheReceiverUnchanged(t *testing.T) {
+	base, err := Values{}.Set("net.nat.mtu", "9000")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := e.Format(1); got != "true" {
-		t.Errorf("format 1 = %q", got)
+	for name, try := range map[string]func() (Values, error){
+		"Set unknown key": func() (Values, error) { return base.Set("nope", "1") },
+		"Set bad text":    func() (Values, error) { return base.Set("net.dns.timeout", "soon") },
+		"Set range":       func() (Values, error) { return base.Set("net.nat.mtu", "1") },
+		"WithInt":         func() (Values, error) { return base.WithInt(NATMTU, 1) },
+		"WithDuration":    func() (Values, error) { return base.WithDuration(NATDialTimeout, time.Nanosecond) },
+		"WithSize":        func() (Values, error) { return base.WithSize(OCIMaxBlobBytes, 1) },
+	} {
+		got, err := try()
+		if err == nil {
+			t.Errorf("%s returned no error", name)
+		}
+		if got.Int(NATMTU) != 9000 {
+			t.Errorf("%s dropped the earlier setting: net.nat.mtu = %d, want 9000", name, got.Int(NATMTU))
+		}
+	}
+}
+
+func TestParseJSONReportsBadValuesInTheOrderOfTheNames(t *testing.T) {
+	const text = `{"net.nat.udp_sessions": [1], "net.nat.mtu": null, "net.dns.timeout": {}}`
+	want := `tuning: net.dns.timeout: want a string or a number
+tuning: net.nat.mtu: want a string or a number
+tuning: net.nat.udp_sessions: want a string or a number`
+	for range 20 {
+		_, err := ParseJSON([]byte(text))
+		if err == nil || err.Error() != want {
+			t.Fatalf("ParseJSON error = %v, want\n%s", err, want)
+		}
 	}
 }
 
@@ -144,7 +180,7 @@ func TestParseReportsEveryBadPair(t *testing.T) {
 	}
 }
 
-func TestParseJSONAcceptsStringsNumbersAndBooleans(t *testing.T) {
+func TestParseJSONAcceptsStringsAndNumbers(t *testing.T) {
 	v, err := ParseJSON([]byte(`{"net.nat.mtu": 9000, "net.dns.timeout": "3s", "oci.max_blob_bytes": "2GiB"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +196,7 @@ func TestParseJSONAcceptsStringsNumbersAndBooleans(t *testing.T) {
 		"out of range":  `{"net.nat.mtu": 1}`,
 		"trailing data": `{} {}`,
 		"fraction":      `{"net.nat.mtu": 1500.5}`,
+		"boolean":       `{"net.nat.mtu": true}`,
 	} {
 		if _, err := ParseJSON([]byte(text)); err == nil {
 			t.Errorf("%s: ParseJSON(%s) returned no error", name, text)

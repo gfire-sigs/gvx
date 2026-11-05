@@ -48,8 +48,6 @@ const (
 	Int Kind = iota + 1
 	// Duration is a time span. The text form is a Go duration, such as "250ms".
 	Duration
-	// Bool is a switch. The text form is "true" or "false".
-	Bool
 	// Size is a byte count. The text form accepts a binary suffix, such as "64MiB".
 	Size
 )
@@ -61,8 +59,6 @@ func (k Kind) String() string {
 		return "int"
 	case Duration:
 		return "duration"
-	case Bool:
-		return "bool"
 	case Size:
 		return "size"
 	}
@@ -70,8 +66,7 @@ func (k Kind) String() string {
 }
 
 // Entry describes one tunable. Default, Min, and Max use the unit of the
-// kind: the count for Int, nanoseconds for Duration, 0 or 1 for Bool, and
-// bytes for Size.
+// kind: the count for Int, nanoseconds for Duration, and bytes for Size.
 type Entry struct {
 	Name    string
 	Kind    Kind
@@ -111,9 +106,6 @@ type IntKey struct{ slot int }
 
 // DurationKey is the typed handle of a Duration tunable.
 type DurationKey struct{ slot int }
-
-// BoolKey is the typed handle of a Bool tunable.
-type BoolKey struct{ slot int }
 
 // SizeKey is the typed handle of a Size tunable.
 type SizeKey struct{ slot int }
@@ -164,9 +156,6 @@ func (v Values) Int(k IntKey) int { return int(v.get(k.slot)) }
 // Duration returns the value of a Duration tunable.
 func (v Values) Duration(k DurationKey) time.Duration { return time.Duration(v.get(k.slot)) }
 
-// Bool returns the value of a Bool tunable.
-func (v Values) Bool(k BoolKey) bool { return v.get(k.slot) != 0 }
-
 // Size returns the value of a Size tunable in bytes.
 func (v Values) Size(k SizeKey) int64 { return v.get(k.slot) }
 
@@ -182,21 +171,23 @@ func (v Values) Get(name string) (int64, bool) {
 
 // Set returns a copy of v with the tunable name set to the value that text
 // holds. It rejects an unknown name, a text that does not parse, and a value
-// outside the range of the entry. The error names the key.
+// outside the range of the entry. The error names the key. On an error, Set
+// returns v unchanged.
 func (v Values) Set(name, text string) (Values, error) {
 	i, ok := index[name]
 	if !ok {
-		return Values{}, fmt.Errorf("tuning: unknown key %q", name)
+		return v, fmt.Errorf("tuning: unknown key %q", name)
 	}
 	e := registry[i]
 	n, err := parseValue(e, text)
 	if err != nil {
-		return Values{}, fmt.Errorf("tuning: %s: %w", name, err)
+		return v, fmt.Errorf("tuning: %s: %w", name, err)
 	}
 	return v.store(e, n)
 }
 
-// WithInt returns a copy of v with an Int tunable set.
+// WithInt returns a copy of v with an Int tunable set. The With methods
+// return v unchanged when the value is outside the range of the entry.
 func (v Values) WithInt(k IntKey, n int) (Values, error) {
 	return v.store(registry[k.slot], int64(n))
 }
@@ -206,15 +197,6 @@ func (v Values) WithDuration(k DurationKey, d time.Duration) (Values, error) {
 	return v.store(registry[k.slot], int64(d))
 }
 
-// WithBool returns a copy of v with a Bool tunable set.
-func (v Values) WithBool(k BoolKey, b bool) (Values, error) {
-	n := int64(0)
-	if b {
-		n = 1
-	}
-	return v.store(registry[k.slot], n)
-}
-
 // WithSize returns a copy of v with a Size tunable set, in bytes.
 func (v Values) WithSize(k SizeKey, bytes int64) (Values, error) {
 	return v.store(registry[k.slot], bytes)
@@ -222,7 +204,7 @@ func (v Values) WithSize(k SizeKey, bytes int64) (Values, error) {
 
 func (v Values) store(e Entry, n int64) (Values, error) {
 	if n < e.Min || n > e.Max {
-		return Values{}, fmt.Errorf("tuning: %s: %s is outside the range %s to %s", e.Name, e.format(n), e.format(e.Min), e.format(e.Max))
+		return v, fmt.Errorf("tuning: %s: %s is outside the range %s to %s", e.Name, e.format(n), e.format(e.Min), e.format(e.Max))
 	}
 	out := Values{set: maps.Clone(v.set)}
 	if out.set == nil {
@@ -249,8 +231,9 @@ func Parse(assignments map[string]string) (Values, error) {
 }
 
 // ParseJSON builds Values from a JSON object that maps names to values. A
-// value is a JSON string, number, or boolean. The string form is the text
-// form of the entry, so a Duration is "250ms" and a Size may be "64MiB".
+// value is a JSON string or number. The string form is the text form of the
+// entry, so a Duration is "250ms" and a Size may be "64MiB". It reports every
+// bad pair, in the order of the names.
 func ParseJSON(data []byte) (Values, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -262,17 +245,19 @@ func ParseJSON(data []byte) (Values, error) {
 		return Values{}, errors.New("tuning: unexpected data after the JSON object")
 	}
 	text := make(map[string]string, len(raw))
-	for name, val := range raw {
-		switch x := val.(type) {
+	var errs []error
+	for _, name := range slices.Sorted(maps.Keys(raw)) {
+		switch x := raw[name].(type) {
 		case string:
 			text[name] = x
 		case json.Number:
 			text[name] = x.String()
-		case bool:
-			text[name] = strconv.FormatBool(x)
 		default:
-			return Values{}, fmt.Errorf("tuning: %s: want a string, a number, or a boolean", name)
+			errs = append(errs, fmt.Errorf("tuning: %s: want a string or a number", name))
 		}
+	}
+	if len(errs) > 0 {
+		return Values{}, errors.Join(errs...)
 	}
 	return Parse(text)
 }
@@ -282,6 +267,9 @@ func parseValue(e Entry, text string) (int64, error) {
 	switch e.Kind {
 	case Int:
 		n, err := strconv.ParseInt(text, 10, 64)
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("%q is too large", text)
+		}
 		if err != nil {
 			return 0, fmt.Errorf("%q is not an integer", text)
 		}
@@ -292,15 +280,6 @@ func parseValue(e Entry, text string) (int64, error) {
 			return 0, fmt.Errorf("%q is not a duration such as 250ms or 30s", text)
 		}
 		return int64(d), nil
-	case Bool:
-		b, err := strconv.ParseBool(text)
-		if err != nil {
-			return 0, fmt.Errorf("%q is not true or false", text)
-		}
-		if b {
-			return 1, nil
-		}
-		return 0, nil
 	case Size:
 		return parseSize(text)
 	}
@@ -328,6 +307,9 @@ func parseSize(text string) (int64, error) {
 		return 0, fmt.Errorf("%q has an unknown unit %q: use b, k, m, g, or t", text, unit)
 	}
 	n, err := strconv.ParseInt(num, 10, 64)
+	if errors.Is(err, strconv.ErrRange) {
+		return 0, fmt.Errorf("%q is too large", text)
+	}
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("%q is not a size such as 4096 or 64MiB", text)
 	}
@@ -344,8 +326,6 @@ func (e Entry) format(n int64) string {
 	switch e.Kind {
 	case Duration:
 		return formatDuration(time.Duration(n))
-	case Bool:
-		return strconv.FormatBool(n != 0)
 	case Size:
 		return formatSize(n)
 	}
@@ -380,9 +360,6 @@ func (e Entry) DefaultText() string { return e.format(e.Default) }
 
 // RangeText returns the range of the entry as "min to max".
 func (e Entry) RangeText() string {
-	if e.Kind == Bool {
-		return "true or false"
-	}
 	return e.format(e.Min) + " to " + e.format(e.Max)
 }
 
