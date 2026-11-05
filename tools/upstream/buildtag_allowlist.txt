@@ -43,6 +43,9 @@ seam pkg/sentry/fsimpl/overlay/overlay.go
 
 # Content seam: SetEntries gives the Stack to the matchers that need it
 # (pkg/sentry/socket/netfilter/addrtype_matcher_xplat.go). stack.Matcher.Match gets only the packet.
+# A bind can fail, as the match set fails for a set that does not exist
+# (pkg/sentry/socket/netfilter/set_matcher_xplat.go), and a rule revision with a registered
+# maker selects that maker.
 seam pkg/sentry/socket/netfilter/netfilter.go
 # Content seam: marshalMatcher writes the revision of the match into the entry, so that iptables
 # reads the revision of the matches mark and multiport back.
@@ -134,6 +137,8 @@ seam pkg/tcpip/transport/tcp/endpoint.go
 
 # Content seams: kernel interfaces of a Kubernetes node agent (GVXIP-005, P1).
 # bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
+# getsockopt(SOL_IP, SO_IP_SET) resolves set names for iptables
+# (pkg/sentry/socket/netfilter/ipset_sockopt_xplat.go).
 seam pkg/sentry/socket/netstack/netstack.go
 # /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
 seam pkg/sentry/fsimpl/sys/sys.go

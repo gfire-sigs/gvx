@@ -1872,6 +1872,17 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 		}
 		return &ret, nil
 
+	case netfilter.SO_IP_SET:
+		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
+			return nil, syserr.ErrNotPermitted
+		}
+
+		stk := inet.StackFromContext(t)
+		if stk == nil {
+			return nil, syserr.ErrNoDevice
+		}
+		return netfilter.IPSetSockOpt(t, stk.(*Stack).Stack, outPtr, outLen)
+
 	case linux.IP_MTU_DISCOVER:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
