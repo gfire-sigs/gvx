@@ -227,7 +227,8 @@ func TestDocsMatchRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc := string(raw)
+	// A Windows checkout can turn the line feeds of the file into CR LF.
+	doc := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	begin := strings.Index(doc, tableBegin)
 	end := strings.Index(doc, tableEnd)
 	if begin < 0 || end < begin {
