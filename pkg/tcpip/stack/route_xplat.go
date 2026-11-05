@@ -76,8 +76,16 @@ func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Ad
 	if !ok {
 		return nil
 	}
+	// A route through the pinned NIC may take the local address of another NIC
+	// without forwarding, as Linux does for a reply and for SO_BINDTODEVICE. A
+	// route through another NIC would break SO_BINDTODEVICE, so it needs
+	// forwarding on the pinned NIC, as before the weak host model.
+	sameNIC := outgoing == pinned
+	if !sameNIC && !isNICForwarding(pinned, netProto) {
+		return nil
+	}
 	route := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoing, localAddr, remoteAddr, r.SourceHint, r.Gateway, netProto, multicastLoop, r.MTU)
-	if route != nil {
+	if route != nil && sameNIC {
 		route.weakHost = true
 	}
 	return route

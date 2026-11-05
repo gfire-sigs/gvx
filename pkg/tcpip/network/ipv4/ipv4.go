@@ -1281,7 +1281,7 @@ func (e *endpoint) handleValidatedPacket(h header.IPv4, pkt *stack.PacketBuffer,
 		subnet := addressEndpoint.AddressWithPrefix().Subnet()
 		pkt.NetworkPacketInfo.LocalAddressBroadcast = subnet.IsBroadcast(dstAddr) || dstAddr == header.IPv4Broadcast
 		e.deliverPacketLocally(h, pkt, inNICName)
-	} else if owner := e.protocol.findEndpointWithAddress(dstAddr); owner != nil {
+	} else if owner := e.protocol.findEndpointWithAddress(dstAddr); owner != nil && owner.Enabled() {
 		e.deliverForOtherNIC(owner, h, pkt)
 	} else if e.Forwarding() {
 		e.handleForwardingError(e.forwardUnicastPacket(pkt))
