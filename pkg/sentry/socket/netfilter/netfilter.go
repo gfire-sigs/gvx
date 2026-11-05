@@ -330,6 +330,9 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 	if err := checkTargetHooks(table, ipv6); err != nil {
 		return err
 	}
+	if err := checkMatcherHooks(table, ipv6); err != nil {
+		return err
+	}
 
 	if err := bindMatcherStacks(stk, table.Rules); err != nil {
 		return err

@@ -46,6 +46,8 @@ seam pkg/sentry/fsimpl/overlay/overlay.go
 # A bind can fail, as the match set fails for a set that does not exist
 # (pkg/sentry/socket/netfilter/set_matcher_xplat.go), and a rule revision with a registered
 # maker selects that maker.
+# SetEntries also gives each matcher the set of hooks that reach its rule, as the physdev match needs
+# (pkg/sentry/socket/netfilter/physdev_matcher_xplat.go).
 seam pkg/sentry/socket/netfilter/netfilter.go
 # Content seam: marshalMatcher writes the revision of the match into the entry, so that iptables
 # reads the revision of the matches mark and multiport back.
@@ -156,6 +158,10 @@ seam pkg/sentry/syscalls/linux/sys_sysinfo.go
 # (pkg/tcpip/stack/bridge_netfilter_xplat.go). The forwarding decisions of the bridge live in
 # pkg/tcpip/stack/bridge_forward_xplat.go.
 seam pkg/tcpip/stack/bridge.go
+# A bridged frame carries the port names that the physdev match reads, in three fields of
+# PacketBuffer (pkg/sentry/socket/netfilter/physdev_matcher_xplat.go). The bridge sets them in
+# pkg/tcpip/stack/bridge_netfilter_xplat.go.
+seam pkg/tcpip/stack/packet_buffer.go
 # A SYN on a TCP connection in TIME_WAIT or CLOSE starts a new connection
 # (pkg/tcpip/stack/conntrack_xplat.go). The seam is one call in getConnAndUpdate.
 seam pkg/tcpip/stack/conntrack.go

@@ -172,6 +172,15 @@ type PacketBuffer struct {
 	// Mark is the mark value of this packet.
 	Mark uint32
 
+	// Bridged, BridgedFrom, and BridgedTo describe a frame that a bridge
+	// switches between two of its ports while the iptables hooks run
+	// (pkg/tcpip/stack/bridge_netfilter_xplat.go). They are the nf_bridge
+	// information of Linux that the physdev match reads. The fields are
+	// transient and not saved.
+	Bridged     bool   `state:"nosave"`
+	BridgedFrom string `state:"nosave"`
+	BridgedTo   string `state:"nosave"`
+
 	tuple *tuple
 
 	// onRelease is a function to be run when the packet buffer is no longer
@@ -393,6 +402,9 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	newPk.Hash = pk.Hash
 	newPk.Owner = pk.Owner
 	newPk.Mark = pk.Mark
+	newPk.Bridged = pk.Bridged
+	newPk.BridgedFrom = pk.BridgedFrom
+	newPk.BridgedTo = pk.BridgedTo
 	newPk.GSOOptions = pk.GSOOptions
 	newPk.EgressRoute = pk.EgressRoute
 	newPk.NetworkProtocolNumber = pk.NetworkProtocolNumber
