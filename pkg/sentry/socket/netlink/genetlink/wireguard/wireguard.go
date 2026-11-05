@@ -28,6 +28,7 @@ import (
 	"fmt"
 
 	"golang.zx2c4.com/wireguard/device"
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/genetlink"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
@@ -96,24 +97,41 @@ const (
 // keyLen is NOISE_PUBLIC_KEY_LEN, the length of every WireGuard key.
 const keyLen = 32
 
+// family is the registered WireGuard family. Its ID is only known after the
+// registration.
+var family = &genetlink.Family{
+	Name:    familyName,
+	Version: familyVersion,
+	MaxAttr: deviceAttrPeers,
+	Ops: []genetlink.Op{
+		{Cmd: cmdGetDevice, Flags: genetlink.OpNetAdmin, Dump: getDevice},
+		{Cmd: cmdSetDevice, Flags: genetlink.OpNetAdmin, Do: setDevice},
+	},
+}
+
 func init() {
-	netstack.RegisterLinkKind(kind, netstack.LinkKind{NamePrefix: "wg", New: newLink})
-	genetlink.RegisterFamily(&genetlink.Family{
-		Name:    familyName,
-		Version: familyVersion,
-		MaxAttr: deviceAttrPeers,
-		Ops: []genetlink.Op{
-			{Cmd: cmdGetDevice, Flags: genetlink.OpNetAdmin, Dump: getDevice},
-			{Cmd: cmdSetDevice, Flags: genetlink.OpNetAdmin, Do: setDevice},
-		},
+	netstack.RegisterLinkKind(kind, netstack.LinkKind{
+		NamePrefix:       "wg",
+		New:              newLink,
+		AdminState:       true,
+		Flags:            linux.IFF_POINTOPOINT | linux.IFF_NOARP,
+		OperStateUnknown: true,
+		StackEnded:       stackEnded,
 	})
+	genetlink.RegisterFamily(family)
 }
 
 // newLogger returns the logger of one wireguard-go device. Both levels go to
 // the Sentry log, which stays off unless the user sets GVX_DEBUG_LOG.
 func newLogger(name string) *device.Logger {
 	return &device.Logger{
-		Verbosef: func(format string, args ...any) { log.Debugf("wireguard %s: %s", name, fmt.Sprintf(format, args...)) },
-		Errorf:   func(format string, args ...any) { log.Warningf("wireguard %s: %s", name, fmt.Sprintf(format, args...)) },
+		Verbosef: func(format string, args ...any) {
+			// wireguard-go logs several lines for each peer. Skip the formatting
+			// of a line that nobody reads.
+			if log.IsLogging(log.Debug) {
+				log.Debugf("wireguard %s: %s", name, fmt.Sprintf(format, args...))
+			}
+		},
+		Errorf: func(format string, args ...any) { log.Warningf("wireguard %s: %s", name, fmt.Sprintf(format, args...)) },
 	}
 }

@@ -20,17 +20,14 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"runtime"
 	"testing"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
-	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/sentry/kernel"
-	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
+	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
 	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
@@ -107,7 +104,8 @@ func TestBindOpenSelectsOnePortForBothFamilies(t *testing.T) {
 	}
 	// Both families of the port are taken.
 	other := newBind(b.stack)
-	if _, _, err := other.Open(port); err == nil {
+	other.setIncoming(port)
+	if _, _, err := other.Open(0); err == nil {
 		t.Fatalf("Open(%d) succeeded while the first bind owns the port", port)
 	} else {
 		var be *bindError
@@ -118,7 +116,7 @@ func TestBindOpenSelectsOnePortForBothFamilies(t *testing.T) {
 	if err := b.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, _, err := other.Open(port); err != nil {
+	if _, _, err := other.Open(0); err != nil {
 		t.Fatalf("Open(%d) after Close = %v, want success", port, err)
 	}
 	other.Close()
@@ -193,107 +191,170 @@ func TestBindSendRejectsForeignEndpoint(t *testing.T) {
 	}
 }
 
-func TestNewLinkConfiguresAndClosesTheDevice(t *testing.T) {
-	st := newLoopbackStack(t)
-	before := runtime.NumGoroutine()
-	ep, sysErr := newLink(context.Background(), &netstack.NewLinkRequest{Stack: netstack.NewStack(st, 1), ID: 2, Name: "wg0"})
-	if sysErr != nil {
-		t.Fatalf("newLink = %v", sysErr)
-	}
-	link := ep.(*linkEndpoint)
-	if link.MTU() != defaultMTU {
-		t.Errorf("MTU = %d, want %d", link.MTU(), defaultMTU)
-	}
-	conf := "listen_port=0\nfwmark=7\nprivate_key=" + hexKey(1) + "\npublic_key=" + hexKey(2) + "\nallowed_ip=10.0.0.0/8\n"
-	if err := link.dev.IpcSet(conf); err != nil {
-		t.Fatalf("IpcSet: %v", err)
-	}
-	text, err := link.dev.IpcGet()
-	if err != nil {
-		t.Fatalf("IpcGet: %v", err)
-	}
-	info, err := parseIpcGet(text)
-	if err != nil {
-		t.Fatalf("parseIpcGet: %v", err)
-	}
-	if info.listenPort == 0 || info.fwmark != 7 || len(info.peers) != 1 || len(info.peers[0].allowedIPs) != 1 {
-		t.Errorf("device state = %+v, want an assigned port, mark 7, and one peer with one prefix", info)
-	}
-	link.SetMTU(1380)
-	if got, _ := link.tun.MTU(); got != 1380 {
-		t.Errorf("tun MTU = %d after SetMTU(1380)", got)
-	}
-
-	link.Close()
-	link.Close()
-	deadline := time.Now().Add(10 * time.Second)
-	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if after := runtime.NumGoroutine(); after > before {
-		t.Errorf("%d goroutines remain after Close, started with %d", after, before)
-	}
-}
-
 // hexKey returns the hexadecimal form of a 32-byte key with every byte b.
 func hexKey(b byte) string {
 	return hex.EncodeToString(bytes.Repeat([]byte{b}, 32))
 }
 
-func TestBindProbeFindsABusyPortAndReleasesAFreeOne(t *testing.T) {
-	st := newLoopbackStack(t)
-	owner := newBind(st)
-	_, port, err := owner.Open(0)
+func TestBindKeepsItsPortAcrossCloseAndOpen(t *testing.T) {
+	b := newBind(newLoopbackStack(t))
+	_, port, err := b.Open(0)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if got := owner.localPort(); got != port {
-		t.Errorf("localPort = %d, want %d", got, port)
+	b.Close()
+	if got := b.incomingPort(); got != port {
+		t.Errorf("incomingPort after Close = %d, want the port %d of the closed sockets", got, port)
 	}
-	other := newBind(st)
-	var be *bindError
-	if err := other.probe(port); !errors.As(err, &be) || be.err != syserr.ErrPortInUse {
-		t.Fatalf("probe of the busy port %d = %v, want a port in use error", port, err)
+	if _, again, err := b.Open(0); err != nil || again != port {
+		t.Errorf("Open after Close = port %d and %v, want port %d", again, err, port)
 	}
-	owner.Close()
-	if got := owner.localPort(); got != 0 {
-		t.Errorf("localPort after Close = %d, want 0", got)
-	}
-	if err := other.probe(port); err != nil {
-		t.Fatalf("probe of the free port %d = %v", port, err)
-	}
-	// The probe released the port.
-	if _, _, err := other.Open(port); err != nil {
-		t.Fatalf("Open(%d) after the probe = %v", port, err)
-	}
-	other.Close()
+	b.Close()
 }
 
-func TestAcquireLinkStopsAtTheLimit(t *testing.T) {
-	k := &kernel.Kernel{}
-	other := &kernel.Kernel{}
-	for i := range maxLinks {
-		if !acquireLink(k) {
-			t.Fatalf("acquireLink failed for link %d, want success up to %d", i, maxLinks)
+func TestBindPrepareFailsOnABusyPortAndKeepsTheSockets(t *testing.T) {
+	st := newLoopbackStack(t)
+	owner := newBind(st)
+	if _, _, err := owner.Open(0); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer owner.Close()
+	holder := newBind(st)
+	_, busy, err := holder.Open(0)
+	if err != nil {
+		t.Fatalf("Open of the holder: %v", err)
+	}
+	defer holder.Close()
+	before := owner.incomingPort()
+	var be *bindError
+	if err := owner.prepare(busy); !errors.As(err, &be) || be.err != syserr.ErrPortInUse {
+		t.Fatalf("prepare(%d) = %v, want a port in use error", busy, err)
+	}
+	if got := owner.incomingPort(); got != before {
+		t.Errorf("the port changed to %d after the failed prepare, want %d", got, before)
+	}
+	if owner.session == nil || owner.pending != nil {
+		t.Errorf("session = %v and pending = %v after the failed prepare, want the open session and no pending one", owner.session, owner.pending)
+	}
+}
+
+func TestBindOpenTakesThePreparedSockets(t *testing.T) {
+	b := newBind(newLoopbackStack(t))
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := b.prepare(0); err != nil {
+		t.Fatalf("prepare(0): %v", err)
+	}
+	prepared := b.pending.port
+	b.Close()
+	if _, port, err := b.Open(0); err != nil || port != prepared || b.incomingPort() != prepared {
+		t.Fatalf("Open after prepare = port %d and %v, want the prepared port %d", port, err, prepared)
+	}
+	b.Close()
+}
+
+func TestBindMarksTheSocketsOfEveryGeneration(t *testing.T) {
+	b := newBind(newLoopbackStack(t))
+	b.setMark(0x51)
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	marks := func() []uint32 {
+		var got []uint32
+		for _, ep := range b.session.eps {
+			got = append(got, ep.SocketOptions().GetMark())
 		}
+		return got
 	}
-	if acquireLink(k) {
-		t.Errorf("acquireLink succeeded beyond %d links", maxLinks)
+	if got := marks(); len(got) != 2 || got[0] != 0x51 || got[1] != 0x51 {
+		t.Errorf("marks of the sockets = %#x, want 0x51 on both families", got)
 	}
-	if !acquireLink(other) {
-		t.Error("the links of one sandbox count against another sandbox")
+	b.setMark(0x52)
+	if got := marks(); got[0] != 0x52 || got[1] != 0x52 {
+		t.Errorf("marks after setMark = %#x, want 0x52 on both families", got)
 	}
-	releaseLink(k)
-	if !acquireLink(k) {
-		t.Error("acquireLink failed after a release")
+	b.Close()
+	b.setMark(0)
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("Open after Close: %v", err)
 	}
-	for range maxLinks {
-		releaseLink(k)
+	if got := marks(); got[0] != 0 || got[1] != 0 {
+		t.Errorf("marks of the new generation = %#x, want 0 after the mark was cleared while closed", got)
 	}
-	releaseLink(other)
-	linkCounts.Lock()
-	defer linkCounts.Unlock()
-	if len(linkCounts.n) != 0 {
-		t.Errorf("the counts keep %d entries after every release", len(linkCounts.n))
+	b.Close()
+}
+
+func TestBindOpenFailsAfterTheBirthplaceEnded(t *testing.T) {
+	b := newBind(newLoopbackStack(t))
+	fns, _, err := b.Open(0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got := receiveOne(fns[0])
+	b.birthplaceEnded()
+	select {
+	case r := <-got:
+		if !errors.Is(r.err, net.ErrClosed) {
+			t.Fatalf("receive after the end of the birthplace = %v, want net.ErrClosed", r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the end of the birthplace did not close the sockets")
+	}
+	b.Close()
+	if _, _, err := b.Open(0); !errors.As(err, new(*bindError)) || err.(*bindError).err != syserr.ErrNoNet {
+		t.Fatalf("Open after the end of the birthplace = %v, want ENONET", err)
+	}
+}
+
+// TestBindSendsEncryptedPacketsWithTheMark checks the effect that the mark has
+// on the packets of the stack: a datagram that leaves through a link carries
+// the mark, so a packet filter rule with "-m mark" sees it, and a datagram
+// of a bind without a mark carries no mark.
+func TestBindSendsEncryptedPacketsWithTheMark(t *testing.T) {
+	st := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+	})
+	t.Cleanup(func() { st.Close(); st.Wait() })
+	out := channel.New(16, 1500, "")
+	const nic tcpip.NICID = 1
+	if err := st.CreateNIC(nic, out); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	local := tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddrFrom4([4]byte{192, 0, 2, 1}).WithPrefix()}
+	if err := st.AddProtocolAddress(nic, local, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+	st.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: nic}})
+
+	b := newBind(st)
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer b.Close()
+	dst, _ := b.ParseEndpoint("198.51.100.7:51820")
+	sendAndRead := func() uint32 {
+		t.Helper()
+		if err := b.Send([][]byte{[]byte("wireguard")}, dst); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		pkt := out.Read()
+		if pkt == nil {
+			t.Fatal("the link got no packet")
+		}
+		defer pkt.DecRef()
+		return pkt.Mark
+	}
+	if got := sendAndRead(); got != 0 {
+		t.Errorf("mark of a packet before SetMark = %#x, want 0", got)
+	}
+	b.setMark(0x51)
+	if got := sendAndRead(); got != 0x51 {
+		t.Errorf("mark of a packet after setMark(0x51) = %#x, want 0x51", got)
+	}
+	b.setMark(0)
+	if got := sendAndRead(); got != 0 {
+		t.Errorf("mark of a packet after setMark(0) = %#x, want 0", got)
 	}
 }

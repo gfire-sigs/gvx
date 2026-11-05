@@ -21,76 +21,173 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/syserr"
+	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
-const (
-	// maxLinks is the largest count of wireguard links in one sandbox. A
-	// device runs one goroutine for each CPU for each of three workers, and it
-	// owns two UDP endpoints.
-	maxLinks = 256
+// birthplaces lists the live links by the network stack that created them. The
+// sockets of a link belong to that stack, also when the link moves to another
+// network namespace. The end of the stack closes the sockets of every link that
+// it created, as wg_netns_exit_rtnl does, and the links that moved away keep
+// their configuration.
+var birthplaces struct {
+	sync.Mutex
+	links map[*stack.Stack]map[*linkEndpoint]struct{}
+}
 
-	// maxPeers is the largest count of peers of one device. A peer owns
-	// timers and goroutines. A dump of more than about 1,100 peers is larger
-	// than the receive queue of a netlink socket, so it fails with ENOBUFS.
-	maxPeers = 4096
+// register records e as a link that its birthplace stack created.
+func (e *linkEndpoint) register() {
+	birthplaces.Lock()
+	defer birthplaces.Unlock()
+	if birthplaces.links == nil {
+		birthplaces.links = make(map[*stack.Stack]map[*linkEndpoint]struct{})
+	}
+	set := birthplaces.links[e.bind.stack]
+	if set == nil {
+		set = make(map[*linkEndpoint]struct{})
+		birthplaces.links[e.bind.stack] = set
+	}
+	set[e] = struct{}{}
+}
+
+// unregister removes e from the links of its birthplace.
+func (e *linkEndpoint) unregister() {
+	birthplaces.Lock()
+	defer birthplaces.Unlock()
+	set := birthplaces.links[e.bind.stack]
+	delete(set, e)
+	if len(set) == 0 {
+		delete(birthplaces.links, e.bind.stack)
+	}
+}
+
+// stackEnded closes the sockets of every link that stk created and that still
+// exists. It runs after the stack removed its own links, so only the links that
+// moved to another namespace remain.
+func stackEnded(stk *stack.Stack) {
+	birthplaces.Lock()
+	links := make([]*linkEndpoint, 0, len(birthplaces.links[stk]))
+	for e := range birthplaces.links[stk] {
+		links = append(links, e)
+	}
+	birthplaces.Unlock()
+	for _, e := range links {
+		e.bind.birthplaceEnded()
+	}
+}
+
+// linkEndpoint is the link endpoint of a wireguard link in the stack. Packets
+// that the stack routes to the link wait in the channel queue, and the tun
+// adapter hands them to wireguard-go. Closing the endpoint closes the device.
+//
+// The link starts down and owns no socket. LinkUp opens the UDP endpoints on
+// the stored port, and LinkDown closes them, as wg_open and wg_stop do.
+type linkEndpoint struct {
+	*channel.Endpoint
+	tun *tunDevice
+
+	bind *netBind
+	// userNS is the user namespace of the network namespace that created the
+	// link. A request that changes the socket needs CAP_NET_ADMIN in it.
+	userNS *auth.UserNamespace
+
+	// updateMu serializes the requests that change the device and the changes
+	// of the link state, as device_update_lock does in Linux. It protects the
+	// fields below.
+	updateMu sync.Mutex
+	// up is true between LinkUp and LinkDown. It is netif_running.
+	up bool
+	// fwmark is the mark of the sockets, as WGDEVICE_A_FWMARK reports it.
+	fwmark uint32
+	// hasKey and public describe the static identity of the device.
+	hasKey bool
+	public [keyLen]byte
+	// peers lists the peers of the device in the order of their creation.
+	peers peerSet
+	// charged is the memory that the device and its peers hold against the
+	// memory accounting of the sandbox.
+	charged uint64
+
+	closeOnce sync.Once
+	// dev is set before the stack sees the endpoint.
+	dev *device.Device
+}
+
+var (
+	_ stack.LinkEndpoint         = (*linkEndpoint)(nil)
+	_ netstack.LinkStateListener = (*linkEndpoint)(nil)
 )
 
-// linkCounts counts the live wireguard links of each kernel, so that one
-// sandbox cannot exhaust the host. A sandbox is one kernel.
-var linkCounts struct {
-	sync.Mutex
-	n map[*kernel.Kernel]int
+// SetMTU implements stack.LinkEndpoint.SetMTU. It tells wireguard-go about
+// the new MTU, which sets the padding limit of the encrypted packets.
+func (e *linkEndpoint) SetMTU(mtu uint32) {
+	e.Endpoint.SetMTU(mtu)
+	e.tun.notifyMTU()
 }
 
-// acquireLink counts one more link of the kernel. It reports false at the limit.
-func acquireLink(k *kernel.Kernel) bool {
-	linkCounts.Lock()
-	defer linkCounts.Unlock()
-	if linkCounts.n[k] >= maxLinks {
-		return false
-	}
-	if linkCounts.n == nil {
-		linkCounts.n = make(map[*kernel.Kernel]int)
-	}
-	linkCounts.n[k]++
-	return true
+// Close implements stack.LinkEndpoint.Close. It stops every goroutine of the
+// device and closes its UDP endpoints before it returns.
+func (e *linkEndpoint) Close() {
+	e.closeOnce.Do(func() {
+		e.Endpoint.Close()
+		e.dev.Close()
+		e.unregister()
+		e.updateMu.Lock()
+		e.releaseMemory()
+		e.updateMu.Unlock()
+	})
 }
 
-// releaseLink counts one link of the kernel less.
-func releaseLink(k *kernel.Kernel) {
-	linkCounts.Lock()
-	defer linkCounts.Unlock()
-	if linkCounts.n[k]--; linkCounts.n[k] <= 0 {
-		delete(linkCounts.n, k)
+// LinkUp implements netstack.LinkStateListener. It opens the UDP endpoints of
+// the device on the stored port, and a stored port of 0 becomes the port that
+// the stack picks. It starts the peers and sends the keepalives. A failure
+// leaves the device down, as a failed wg_open leaves the link down.
+func (e *linkEndpoint) LinkUp() tcpip.Error {
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
+	if e.up {
+		return nil
 	}
+	if err := e.dev.Up(); err != nil {
+		return bindTCPIPError(err)
+	}
+	e.up = true
+	return nil
+}
+
+// LinkDown implements netstack.LinkStateListener. It closes the UDP endpoints
+// and stops the peers. The device keeps its configuration, and also the port
+// that LinkUp picked.
+func (e *linkEndpoint) LinkDown() {
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
+	if !e.up {
+		return
+	}
+	e.dev.Down()
+	e.up = false
 }
 
 // newLink creates the link endpoint and the wireguard-go device of a new
-// "wireguard" link. The device starts up, so it owns a UDP port at once. On
-// Linux the port appears when the link goes up, but a netstack link has no
-// down state. It fails with ENOMEM beyond maxLinks links in one sandbox.
-func newLink(ctx context.Context, req *netstack.NewLinkRequest) (stack.LinkEndpoint, *syserr.Error) {
-	var k *kernel.Kernel
-	if t := kernel.TaskFromContext(ctx); t != nil {
-		k = t.Kernel()
-	}
-	if !acquireLink(k) {
-		return nil, syserr.ErrNoMemory
+// "wireguard" link. The link starts down, so the device owns no UDP port until
+// the link goes up. The memory of the device counts against the memory
+// accounting of the sandbox, and a device that does not fit fails with ENOMEM.
+func newLink(_ context.Context, req *netstack.NewLinkRequest) (stack.LinkEndpoint, *syserr.Error) {
+	charged := deviceBytes()
+	if err := chargeMemory(charged); err != nil {
+		return nil, err
 	}
 	ch := channel.New(queueSize, defaultMTU, "")
 	tunDev := newTUN(ch, req.Name)
 	bind := newBind(req.Stack.Stack)
-	ep := &linkEndpoint{Endpoint: ch, tun: tunDev, bind: bind, userNS: req.UserNS, kernel: k}
+	ep := &linkEndpoint{Endpoint: ch, tun: tunDev, bind: bind, userNS: req.UserNS, charged: charged}
+	ep.peers.init()
 	ep.dev = device.NewDevice(tunDev, bind, newLogger(req.Name))
-	if err := ep.dev.Up(); err != nil {
-		ep.Close()
-		return nil, bindSyserr(err)
-	}
+	ep.register()
 	return ep, nil
 }
 
@@ -111,4 +208,13 @@ func bindSyserr(err error) *syserr.Error {
 		}
 	}
 	return syserr.ErrInvalidArgument
+}
+
+// bindTCPIPError returns the error of the stack for an error from wireguard-go.
+func bindTCPIPError(err error) tcpip.Error {
+	var be *bindError
+	if errors.As(err, &be) && be.terr != nil {
+		return be.terr
+	}
+	return &tcpip.ErrInvalidOptionValue{}
 }
