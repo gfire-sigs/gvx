@@ -33,6 +33,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
@@ -255,9 +256,10 @@ type hashsizeFile struct {
 
 var _ vfs.WritableDynamicBytesSource = (*hashsizeFile)(nil)
 
-// defaultConntrackHashsize is the table size that goes with the default
-// nf_conntrack_max of 262144 (four entries for each bucket).
-const defaultConntrackHashsize = 65536
+// defaultConntrackHashsize is the first value of the file: the number of
+// buckets of the connection table of the network stack. It is the value of
+// /proc/sys/net/netfilter/nf_conntrack_buckets.
+const defaultConntrackHashsize = stack.ConntrackBucketCount
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *hashsizeFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
