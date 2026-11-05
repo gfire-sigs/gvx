@@ -916,7 +916,9 @@ A budget below zero by more than one tick throttles its subtree. The ticker then
 
 A timer ends the throttle at the end of the period. A write to `cpu.max` starts a new period with a full quota and wakes the tasks. A task that moves to another cgroup reads the new budget at once. Time over the quota is a debt that the next period repays.
 
-The periods of a budget follow a fixed grid from the last write to `cpu.max`. A stall of the Sentry can delay a charge by many periods. The budget then takes the part of each run that lies in each period, and it refills the quota between the periods, as if the charge had come on time in small parts. A task below its quota in each period makes no debt. A task above it pays the debt in the next periods. The ticker gives the charges of one tick to a budget together, so that the runs of many tasks count for the same periods.
+The periods of a budget follow a fixed grid from the last write to `cpu.max`. A stall of the Sentry can delay a charge by many periods. The budget spreads the running time of each task evenly over the time since the last charge of that task. Each period takes its part, and the quota refills between the periods, as if the charges had come on time. A task below its quota in each period makes no debt. A task above it pays the debt in the next periods.
+
+A period that ends in debt of more than 10 ms counts in `nr_throttled`, as it does for charges on time. `throttled_usec` grows by the time that a task at an even rate would have stayed stopped. The ticker gives the charges of one tick to a budget together, so that the runs of many tasks count for the same periods. A charge covers at most 1024 periods.
 
 A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. `cpu.stat` reports the measured time as `usage_usec`. The split between `user_usec` and `system_usec` still comes from the tick clocks.
 

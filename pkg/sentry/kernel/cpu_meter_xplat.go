@@ -36,6 +36,11 @@ type cpuMeter struct {
 	// clock ticker uses it.
 	billed int64
 
+	// billedAt is the time of the last reading of the ticker. The next charge
+	// spreads the unbilled time over the interval since then. Only the CPU
+	// clock ticker uses it.
+	billedAt int64
+
 	// skipToApp is true after a throttled task woke. The time up to its next
 	// entry into application code is the cost of the wake, and it is not billed.
 	// Only the task goroutine uses it.

@@ -37,10 +37,14 @@ func (t *Task) cpuBandwidth() *CPUBandwidth {
 // accountCPUBandwidth runs once for each CPU clock tick while a cgroup has a
 // quota. It charges the time that each task ran since its last charge to the
 // budget of the cgroup of the task, and to the budget of every ancestor with a
-// limit. It gives all charges of one tick to the budgets together, so that a
-// stall of the ticker is split over the periods that it covers. It then interrupts the tasks that run application code in a throttled
-// cgroup. The interrupted task returns to its run loop, which blocks it in
-// throttleCPUBandwidth.
+// limit. A task can pause between two charges, so the budgets spread its time
+// over the interval since the last charge. The function gives all charges of
+// one tick to the budgets together, so that a stall of the ticker is split over
+// the periods that it covers.
+//
+// The function then interrupts the tasks that run application code in a
+// throttled cgroup. The interrupted task returns to its run loop, which blocks
+// it in throttleCPUBandwidth.
 //
 // A task in a system call is not interrupted. It stops when it returns to the
 // application, as in Linux, so system time counts toward the quota.
@@ -55,25 +59,22 @@ func (k *Kernel) accountCPUBandwidth(all []*Task) {
 		m := &t.cpuMeter
 		running := t.running()
 		if !running && m.total.Load() == m.billed {
+			m.billedAt = now
 			continue
 		}
 		cur := m.measured(now, running)
 		if m.billedGen != gen {
 			// The first limit appeared after the task last ran under a limit.
 			// The time before then belongs to no budget.
-			m.billed, m.billedGen = cur, gen
+			m.billed, m.billedGen, m.billedAt = cur, gen, now
 			continue
 		}
 		if cur <= m.billed {
+			m.billedAt = now
 			continue
 		}
-		delta := cur - m.billed
-		m.billed = cur
-		for n := t.cpuBandwidth(); n != nil; n = n.parent {
-			if n.limited() {
-				runs = append(runs, bandwidthRun{node: n, ns: delta})
-			}
-		}
+		runs = appendBandwidthRuns(runs, t.cpuBandwidth(), m.billedAt, cur-m.billed)
+		m.billed, m.billedAt = cur, now
 	}
 	chargeBandwidthRuns(now, runs)
 	if cpuBandwidthThrottled.Load() == 0 {

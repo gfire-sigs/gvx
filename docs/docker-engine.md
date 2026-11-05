@@ -183,12 +183,12 @@ A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value i
 | Property | Value |
 | :--- | :--- |
 | Accounting | A meter measures the wall time that each task runs in guest and Sentry code. The Sentry charges that time every 10 ms. `usage_usec` of `cpu.stat` is the same measured time. |
-| Counters | `nr_periods` counts the periods that end while the cgroup is active. `nr_throttled` counts the periods that end while it throttles. Both follow Linux. |
-| `throttled_usec` | One wall-clock interval for the whole cgroup. Linux sums the time of each CPU, so it reports more for a cgroup with tasks on several CPUs. |
+| Counters | `nr_periods` counts the periods that end while the cgroup is active. `nr_throttled` counts the periods that end while it throttles, and the periods of a late charge that end in debt of more than 10 ms. Both follow Linux. |
+| `throttled_usec` | One wall-clock interval for the whole cgroup. Linux sums the time of each CPU, so it reports more for a cgroup with tasks on several CPUs. A late charge adds the estimated stop time of each period that ends in debt. |
 | Split of usage | `user_usec` and `system_usec` still come from the tick clocks of the tasks. Their sum is the measured time. |
 | System time | A task in a system call keeps running, as in Linux. The call counts toward the quota, and the task stops when it returns to guest code. |
 | Debt | A task can run up to one tick past the quota before it stops. The next period repays that time. A cgroup throttles only after a debt of more than 10 ms. |
-| Late charge | A stall of the Sentry can delay the charge of a task by many periods. The charge counts for each period that it covers, as if the task ran at a steady rate. A period gives the quota again, so a task that stayed below its quota in each period makes no debt. A task that stayed above it pays the debt later. |
+| Late charge | A stall of the Sentry can delay the charge of a task by many periods. The charge spreads the running time of the task evenly over the time since its last charge, so a task that paused keeps its duty cycle. Each period takes its part and gives the quota again. A task that stayed below its quota in each period makes no debt. A task that stayed above it pays the debt later. A charge covers at most 1024 periods. |
 | Period and quota | A period is 1 ms to 1 s, and a quota is 1 ms or more. Other values give `EINVAL`. |
 | Write to `cpu.max` | A new value starts a new period with a full quota. It releases a throttled task at once. |
 | Move to another cgroup | A throttled task reads the budget of its new cgroup at once. Without a limit there, it runs within 110 ms on every backend. |
