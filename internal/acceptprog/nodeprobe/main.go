@@ -119,6 +119,8 @@ func main() {
 		checks = wireguardChecks()
 	case "wglimits":
 		checks = wgLimitsChecks()
+	case "wgstate":
+		checks = wgStateChecks()
 	case "vxlan":
 		checks = vxlanChecks()
 	case "natmtu":

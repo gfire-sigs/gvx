@@ -58,11 +58,11 @@ func TestE2EWireGuardA12OneSandbox(t *testing.T) {
 	})
 }
 
-// TestE2EWireGuardA12Limits checks the rules and the limits of the link in
-// one guest. A set request with a busy listen port fails with EADDRINUSE and
-// changes nothing, a caller without CAP_NET_ADMIN in the creating namespace
-// cannot set the port or the mark, and a dump either lists every peer or fails
-// with ENOBUFS. The link and the peer limits answer ENOMEM.
+// TestE2EWireGuardA12Limits checks the rules of the link in one guest. A set
+// request with a busy listen port fails with EADDRINUSE and changes nothing, a
+// caller without CAP_NET_ADMIN in the creating namespace cannot set the port or
+// the mark, and a dump lists every one of 10,000 peers. Linux has no limit on
+// the count of links, so 300 links in one namespace work.
 func TestE2EWireGuardA12Limits(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		code, out := runNodeProbe(t, b, bin, nil, "wglimits")
@@ -71,7 +71,27 @@ func TestE2EWireGuardA12Limits(t *testing.T) {
 			"set-to-the-current-port-succeeds", "set-to-a-free-port-moves-the-socket",
 			"lookup-needs-exactly-one-selector", "unsupported-protocol-version-is-epfnosupport",
 			"listen-port-needs-cap-net-admin-in-the-creating-namespace",
-			"dump-of-800-peers-is-complete", "dump-over-the-queue-fails-with-enobufs",
-			"peer-limit-is-enomem", "link-limit-is-enomem", "namespaces-end")
+			"dump-of-800-peers-is-complete", "dump-of-10000-peers-is-complete",
+			"peers-replace-in-one-request-at-any-count", "more-than-256-links-in-one-namespace",
+			"namespaces-end")
+	})
+}
+
+// TestE2EWireGuardA12LinkState checks the state of the link. A new link is
+// down and owns no UDP socket. "ip link set up" opens the socket on the listen
+// port, and a port of 0 becomes a port that stays for later ups. "ip link set
+// down" stops the traffic and frees the port, and "up" restores both. A busy
+// port fails the up. The socket belongs to the namespace that created the link,
+// also after the link moves to another namespace.
+func TestE2EWireGuardA12LinkState(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, nil, "wgstate")
+		requireNodeChecks(t, code, out,
+			"namespaces-and-veth", "new-link-is-down-and-owns-no-port", "up-opens-the-listen-port",
+			"tunnel-carries-traffic-while-both-links-are-up", "down-stops-the-traffic-and-frees-the-port",
+			"up-restores-the-traffic", "longest-prefix-wins-and-an-allowed-ip-moves-between-peers",
+			"port-zero-becomes-a-port-at-the-first-up-and-stays",
+			"busy-port-fails-the-up-and-the-link-stays-down", "socket-stays-in-the-namespace-of-the-creation",
+			"namespaces-end")
 	})
 }

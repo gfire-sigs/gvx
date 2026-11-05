@@ -730,11 +730,13 @@ func wireguardChecks() []check {
 		}},
 		{"invalid-requests-fail", func() error {
 			return a.do(func() error {
-				if err := wgSet("wg0", wgConfig{flags: 0x80}); !errors.Is(err, syscall.EOPNOTSUPP) {
-					return fmt.Errorf("unknown device flag = %v, want EOPNOTSUPP", err)
+				// The policy of Linux (NLA_POLICY_MASK) rejects an unknown flag
+				// with EINVAL.
+				if err := wgSet("wg0", wgConfig{flags: 0x80}); !errors.Is(err, syscall.EINVAL) {
+					return fmt.Errorf("unknown device flag = %v, want EINVAL", err)
 				}
-				if err := wgSet("wg0", wgConfig{peers: []wgPeer{{pub: pubB, flags: 0x80}}}); !errors.Is(err, syscall.EOPNOTSUPP) {
-					return fmt.Errorf("unknown peer flag = %v, want EOPNOTSUPP", err)
+				if err := wgSet("wg0", wgConfig{peers: []wgPeer{{pub: pubB, flags: 0x80}}}); !errors.Is(err, syscall.EINVAL) {
+					return fmt.Errorf("unknown peer flag = %v, want EINVAL", err)
 				}
 				if err := wgSet("wg0", wgConfig{peers: []wgPeer{{pub: pubB, allowed: []string{"10.0.0.0/33"}}}}); err == nil {
 					return errors.New("a /33 prefix succeeded, want an error")
