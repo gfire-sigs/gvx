@@ -475,6 +475,10 @@ func (fs *filesystem) addNodeSysctlFiles(ctx context.Context, root *auth.Credent
 		files[spec.name] = fs.newInode(ctx, root, 0644, &sysctlFile{spec: spec})
 	}
 	switch path {
+	case "kernel":
+		for name, inode := range fs.kmsgSysctlFiles(ctx, root) {
+			files[name] = inode
+		}
 	case "net/ipv4/conf/all":
 		files["forwarding"] = fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv4.ProtocolNumber})
 	case "net/ipv4/conf/default":

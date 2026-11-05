@@ -216,7 +216,7 @@ type Kernel struct {
 	// publication rule or carry that contract into a Value callback.
 	globalInit *ThreadGroup
 
-	// syslog is the kernel log.
+	// syslog holds the kernel log. See KernelLog in kmsg_xplat.go.
 	syslog syslog
 
 	runningTasksMu runningTasksMutex `state:"nosave"`
@@ -2221,11 +2221,6 @@ func (k *Kernel) MonotonicRawClock() ktime.SampledClock {
 		return k.timekeeper.monotonicRawClock
 	}
 	return k.timekeeper.monotonicClock
-}
-
-// Syslog returns the syslog.
-func (k *Kernel) Syslog() *syslog {
-	return &k.syslog
 }
 
 // GenerateInotifyCookie generates a unique inotify event cookie.

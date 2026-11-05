@@ -240,6 +240,8 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/time", "the spin windows of the Windows fast path read the cycle counter and the performance counter"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/seccomp/precompiledseccomp", "stubfilter_lookup_xplat.go builds the seccomp programs of the Linux stubs on arm64, where the checked-in precompiled programs do not apply"},
 	{[]string{"pkg/sentry/kernel"}, "pkg/hostarch", "addrhole_xplat.go lists the address holes of a platform as hostarch.AddrRange values"},
+	{[]string{"pkg/sentry/kernel"}, "pkg/errors/linuxerr", "kmsg_xplat.go returns EINVAL for a write to /dev/kmsg of more than 1,024 bytes, as devkmsg_write does"},
+	{[]string{"pkg/sentry/kernel"}, "pkg/waiter", "kmsg_xplat.go notifies the readers of /dev/kmsg and syslog(2) through a waiter.Queue"},
 
 	// pkg/gvx boots the Sentry. The kernel constructors take these types.
 	{[]string{"pkg/gvx"}, "pkg/abi/linux", "Linux ABI constants for guest syscall numbers and errno values"},

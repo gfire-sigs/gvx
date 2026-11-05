@@ -993,6 +993,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	}); err != nil {
 		return 1, fmt.Errorf("gvx: init Sentry kernel: %w", err)
 	}
+	if !k.SetKernelLogBufLen(int(s.cfg.Tuning.Size(tuning.KernelLogBufLen))) {
+		return 1, errors.New("gvx: the kernel log exists before its size is set")
+	}
+	k.KernelLog().WriteBootMessages()
 
 	vfsObj := k.VFS()
 	vfsObj.MustRegisterFilesystemType("erofs", erofs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
