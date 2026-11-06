@@ -237,7 +237,11 @@ jobs:
     name: test windows/arm64
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-11-arm
-    timeout-minutes: 30
+    timeout-minutes: 40
+    # The hosted runner has no hypervisor. The job runs the same tests as
+    # windows/amd64 on the systrap engine, and the whpx subtests skip.
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -245,16 +249,30 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # The hosted runner has no hypervisor, so the systrap engine is the only
-      # backend that runs guests here.
-      - name: Test shim control plane
+      - name: Test owned packages
         shell: bash
-        run: go test -count=1 ./internal/gvxshim/ ./cmd/containerd-shim-gvx-v2/
+        run: go test -count=1 $OWNED
+      - name: Test address hole search
+        shell: bash
+        run: go test -count=1 -run Hole ./pkg/sentry/mm/ ./pkg/sentry/kernel/
       - name: Test execution backends
         shell: bash
         run: go test -count=1 ./pkg/sentry/platform/whpx/ ./pkg/sentry/platform/systrap/
-      - name: Test systrap end-to-end suite
+      - name: Build rungv and the smoke guest
+        shell: bash
+        run: |
+          go build -o rungv.exe ./cmd/rungv
+          go run ./internal/testelf/cmd/mkelf -o smoke.elf
+      - name: Run smoke guest on systrap
+        shell: bash
+        env:
+          GVX_DEBUG_LOG: "1"
+        run: |
+          ./rungv.exe run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
+          cat smoke.out
+          grep -q gvx-smoke-ok smoke.out
+      - name: Test end-to-end suite
         shell: bash
         env:
           GVX_E2E_OFFLINE: "1"
-        run: go test -count=1 -run 'Systrap|systrap|Stub|HostLockdown' ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+        run: go test -count=1 -timeout 25m ./pkg/gvx/ ./cmd/rungv/ ./e2e/
