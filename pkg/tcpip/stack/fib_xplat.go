@@ -116,6 +116,11 @@ type fibState struct {
 	// rpFilter is the policy for the reverse path check of received IPv4
 	// packets. See rpfilter_xplat.go.
 	rpFilter atomic.Pointer[RPFilterPolicy]
+
+	// hostAddrGen and hostAddrs hold the snapshot of the IPv4 addresses of the
+	// NICs. See hostaddr_xplat.go.
+	hostAddrGen atomic.Uint64
+	hostAddrs   atomic.Pointer[hostAddrSnapshot]
 }
 
 var (
@@ -688,7 +693,7 @@ const (
 func (s *Stack) ReversePathValid(inNIC tcpip.NICID, src, dst tcpip.Address, mark uint32, proto tcpip.NetworkProtocolNumber, mode ReversePathMode, acceptLocal bool) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.reversePathHostAddress(src, proto) {
+	if s.hostAddress(src, proto) {
 		return acceptLocal
 	}
 	s.routeMu.RLock()
@@ -710,20 +715,6 @@ func (s *Stack) ReversePathValid(inNIC tcpip.NICID, src, dst tcpip.Address, mark
 			continue
 		}
 		return mode == ReversePathLoose || route.NIC == inNIC
-	}
-	return false
-}
-
-// reversePathHostAddress reports whether addr belongs to a NIC. Linux gives the
-// address of the host the route type "local", which a reverse path check
-// rejects.
-//
-// +checklocksread:s.mu
-func (s *Stack) reversePathHostAddress(addr tcpip.Address, proto tcpip.NetworkProtocolNumber) bool {
-	for _, nic := range s.nics {
-		if nic.hasAddress(proto, addr) {
-			return true
-		}
 	}
 	return false
 }

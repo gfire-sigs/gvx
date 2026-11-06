@@ -91,7 +91,12 @@ func (m *RPFilterMatcher) Match(_ stack.Hook, pkt *stack.PacketBuffer, inNicName
 	if m.stack == nil {
 		return invert, false
 	}
-	inNIC := m.stack.NICIDByName(inNicName)
+	// The receive path sets the input NIC of the packet before PREROUTING, so a
+	// packet needs no search by name.
+	inNIC := pkt.InputNICID
+	if inNIC == 0 {
+		inNIC = m.stack.NICIDByName(inNicName)
+	}
 	if inNIC == 0 || m.stack.NICIsLoopback(inNIC) {
 		return !invert, false
 	}

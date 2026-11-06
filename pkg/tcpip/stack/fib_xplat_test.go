@@ -565,3 +565,86 @@ func TestProxyARPSkipsProbesMulticastAndLoopback(t *testing.T) {
 		}
 	}
 }
+
+// TestReversePathSeesAddressChanges checks that the reverse path check follows
+// the addresses of the NICs. An address of the host is not a valid source, and
+// the stack remembers the addresses between packets, so a change must reach the
+// next check.
+func TestReversePathSeesAddressChanges(t *testing.T) {
+	s := newFibStack(t)
+	src := fibAddr(10, 0, 0, 77)
+	valid := func() bool {
+		return s.ReversePathValid(fibEth0, src, fibAddr(10, 0, 0, 2), 0, ipv4.ProtocolNumber, stack.ReversePathStrict, false)
+	}
+	if !valid() {
+		t.Fatalf("a source on the subnet of eth0 is not valid before the address exists")
+	}
+	pa := tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddressWithPrefix{Address: src, PrefixLen: 32}}
+	if err := s.AddProtocolAddress(fibWG0, pa, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+	if valid() {
+		t.Errorf("a source that wg0 owns is valid, want invalid")
+	}
+	if err := s.RemoveAddress(fibWG0, src); err != nil {
+		t.Fatalf("RemoveAddress: %v", err)
+	}
+	if !valid() {
+		t.Errorf("a source that no NIC owns any more is invalid, want valid")
+	}
+	if err := s.AddProtocolAddress(fibWG0, pa, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+	if valid() {
+		t.Fatalf("a source that wg0 owns is valid, want invalid")
+	}
+	if err := s.RemoveNIC(fibWG0); err != nil {
+		t.Fatalf("RemoveNIC: %v", err)
+	}
+	if !valid() {
+		t.Errorf("a source of a removed NIC is invalid, want valid")
+	}
+}
+
+// newCalicoStack returns a stack like a Calico node: eth0 with an address, and
+// count links without an address, each with a host route to one pod.
+func newCalicoStack(tb testing.TB, count int) *stack.Stack {
+	tb.Helper()
+	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+	tb.Cleanup(func() { s.Close() })
+	if err := s.CreateNICWithOptions(1, channel.New(8, 1500, ""), stack.NICOptions{Name: "eth0"}); err != nil {
+		tb.Fatalf("CreateNIC eth0: %v", err)
+	}
+	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddressWithPrefix{Address: fibAddr(10, 0, 2, 15), PrefixLen: 24}}, stack.AddressProperties{}); err != nil {
+		tb.Fatalf("AddProtocolAddress: %v", err)
+	}
+	s.AddRoute(tcpip.Route{Destination: tcpip.AddressWithPrefix{Address: fibAddr(10, 0, 2, 0), PrefixLen: 24}.Subnet(), NIC: 1})
+	s.AddRoute(tcpip.Route{Destination: tcpip.AddressWithPrefix{Address: fibAddr(0, 0, 0, 0), PrefixLen: 0}.Subnet(), Gateway: fibAddr(10, 0, 2, 2), NIC: 1})
+	s.AddRoute(tcpip.Route{Destination: tcpip.AddressWithPrefix{Address: fibAddr(10, 42, 0, 0), PrefixLen: 26}.Subnet(), RouteAttrs: tcpip.RouteAttrs{Type: tcpip.RouteTypeBlackhole}})
+	for i := 0; i < count; i++ {
+		id := tcpip.NICID(i + 2)
+		if err := s.CreateNICWithOptions(id, channel.New(8, 1500, ""), stack.NICOptions{Name: "cali" + string(rune('a'+i%26)) + string(rune('a'+i/26))}); err != nil {
+			tb.Fatalf("CreateNIC: %v", err)
+		}
+		if _, err := s.SetNICForwarding(id, ipv4.ProtocolNumber, true); err != nil {
+			tb.Fatalf("SetNICForwarding: %v", err)
+		}
+		s.AddRoute(tcpip.Route{Destination: tcpip.AddressWithPrefix{Address: fibAddr(10, 42, 0, byte(i)), PrefixLen: 32}.Subnet(), NIC: id})
+	}
+	return s
+}
+
+// BenchmarkReversePathValid measures the reverse path check of one packet from
+// a pod on a node with 200 pod links, as every packet of a pod passes it.
+func BenchmarkReversePathValid(b *testing.B) {
+	s := newCalicoStack(b, 200)
+	src, dst := fibAddr(10, 42, 0, 100), fibAddr(10, 0, 2, 15)
+	in := tcpip.NICID(102)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !s.ReversePathValid(in, src, dst, 0, ipv4.ProtocolNumber, stack.ReversePathStrict, false) {
+			b.Fatal("the source of a pod is not valid")
+		}
+	}
+}
