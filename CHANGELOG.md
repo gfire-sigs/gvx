@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.9.10002026110200] - 2026-11-06
+
+This release makes a `gvx` node a fuller Linux node for Kubernetes. NetworkPolicy works with `kube-router` and Calico through IP sets. The `wireguard` link, the connection tracker, the kernel log, `/proc/diskstats`, and policy routing follow Linux. Limits without a Linux knob are gone, and host-side values are tunable with `--tune`. It also adds `--host-ca-certs` and fixes several bugs of nested and overlay use.
 
 ### Features
 
