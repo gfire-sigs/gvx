@@ -122,6 +122,14 @@ func (h fibRuleHdr) bytes() []byte {
 // fib_rule_hdr.
 func parseRuleMessage(msg *nlmsg.Message, withAttrs bool) (fibRuleHdr, map[uint16]nlmsg.BytesView, bool) {
 	buf := msg.Buffer()
+	if !withAttrs {
+		// fib_nl_dumprule reads no header. A caller with struct rtgenmsg, as
+		// busybox sends, gives one byte of family.
+		if len(buf) <= linux.NetlinkMessageHeaderSize {
+			return fibRuleHdr{}, nil, false
+		}
+		return fibRuleHdr{family: buf[linux.NetlinkMessageHeaderSize]}, nil, true
+	}
 	if len(buf) < linux.NetlinkMessageHeaderSize+fibRuleHdrSize {
 		return fibRuleHdr{}, nil, false
 	}
@@ -129,9 +137,6 @@ func parseRuleMessage(msg *nlmsg.Message, withAttrs bool) (fibRuleHdr, map[uint1
 	h := fibRuleHdr{
 		family: b[0], dstLen: b[1], srcLen: b[2], tos: b[3], table: b[4], action: b[7],
 		flags: binary.NativeEndian.Uint32(b[8:]),
-	}
-	if !withAttrs {
-		return h, nil, true
 	}
 	attrs, ok := nlmsg.AttrsView(b[fibRuleHdrSize:]).Parse()
 	return h, attrs, ok

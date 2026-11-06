@@ -88,6 +88,8 @@ sleep 2
 # The default rules of Linux.
 echo RULES4 $(ip rule show | tr '\t\n' '  ')
 echo RULES6 $(ip -6 rule show | tr '\t\n' '  ')
+# busybox asks for the rules with struct rtgenmsg, a body of one byte.
+echo BUSYBOX-RULES $(busybox ip rule list | tr '\t\n' '  ')
 
 ip route replace default via 10.1.0.2
 ip route add default via 10.2.0.2 table 200
@@ -203,6 +205,7 @@ func TestE2EPolicyRouting(t *testing.T) {
 				return ""
 			}
 			requireContains(t, "ip rule", field("RULES4"), "0: from all lookup local", "32766: from all lookup main", "32767: from all lookup default")
+			requireContains(t, "busybox ip rule", field("BUSYBOX-RULES"), "0:", "32766:", "32767:")
 			requireContains(t, "ip -6 rule", field("RULES6"), "0: from all lookup local", "32766: from all lookup main")
 			if strings.Contains(field("RULES6"), "32767") {
 				t.Errorf("IPv6 rules = %q, want no rule for the table default", field("RULES6"))
