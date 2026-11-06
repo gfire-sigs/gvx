@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
+	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
@@ -469,5 +470,55 @@ func TestRouteOfNamedSourceFollowsTheMostSpecificRoute(t *testing.T) {
 	}
 	if got := r.LocalAddress(); got != fibAddr(10, 0, 0, 2) {
 		t.Errorf("the source address is %s, want 10.0.0.2", got)
+	}
+}
+
+// TestSourceAddressOfARouteWithoutAddressIsStable checks the source address of
+// a packet that leaves through a link without an address. Linux takes the first
+// address in the order of the interface index and skips the loopback link, so
+// the answer is the same for each call.
+func TestSourceAddressOfARouteWithoutAddressIsStable(t *testing.T) {
+	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}})
+	t.Cleanup(func() { s.Close() })
+	for _, n := range []struct {
+		id       tcpip.NICID
+		name     string
+		loopback bool
+		addr     tcpip.AddressWithPrefix
+	}{
+		{1, "lo", true, tcpip.AddressWithPrefix{Address: fibAddr(127, 0, 0, 1), PrefixLen: 8}},
+		{2, "eth0", false, tcpip.AddressWithPrefix{Address: fibAddr(10, 0, 2, 15), PrefixLen: 24}},
+		{3, "q0", false, tcpip.AddressWithPrefix{Address: fibAddr(10, 6, 0, 1), PrefixLen: 24}},
+		{4, "cali0", false, tcpip.AddressWithPrefix{}},
+	} {
+		var ep stack.LinkEndpoint = channel.New(8, 1500, "")
+		if n.loopback {
+			ep = loopback.New()
+		}
+		if err := s.CreateNICWithOptions(n.id, ep, stack.NICOptions{Name: n.name}); err != nil {
+			t.Fatalf("CreateNIC %s: %v", n.name, err)
+		}
+		if n.addr.Address.BitLen() == 0 {
+			continue
+		}
+		if err := s.AddProtocolAddress(n.id, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: n.addr}, stack.AddressProperties{}); err != nil {
+			t.Fatalf("AddProtocolAddress %s: %v", n.name, err)
+		}
+	}
+	if _, err := s.SetNICForwarding(4, ipv4.ProtocolNumber, true); err != nil {
+		t.Fatalf("SetNICForwarding: %v", err)
+	}
+	s.AddRoute(tcpip.Route{Destination: fibSubnet(t, 10, 5, 0, 2, 32), NIC: 4})
+
+	for i := 0; i < 100; i++ {
+		r, err := s.FindRoute(0, tcpip.Address{}, fibAddr(10, 5, 0, 2), ipv4.ProtocolNumber, false)
+		if err != nil {
+			t.Fatalf("FindRoute = %v", err)
+		}
+		got := r.LocalAddress()
+		r.Release()
+		if got != fibAddr(10, 0, 2, 15) {
+			t.Fatalf("call %d: the source address is %s, want 10.0.2.15", i, got)
+		}
 	}
 }

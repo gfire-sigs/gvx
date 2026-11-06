@@ -1646,7 +1646,7 @@ func isNICForwarding(nic *nic, proto tcpip.NetworkProtocolNumber) bool {
 //
 // +checklocksread:s.mu
 func (s *Stack) findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoingNIC *nic, localAddr, remoteAddr, srcHint, gateway tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool, mtu uint32) *Route {
-	for _, aNIC := range s.nics {
+	for aNIC := s.nextSourceNICRLocked(nil); aNIC != nil; aNIC = s.nextSourceNICRLocked(aNIC) {
 		addressEndpoint := s.getAddressEP(aNIC, localAddr, remoteAddr, srcHint, netProto)
 		if addressEndpoint == nil {
 			continue

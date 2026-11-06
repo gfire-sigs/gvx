@@ -88,3 +88,33 @@ func (s *Stack) weakHostRouteRLocked(flow RouteFlow, pinned *nic, localAddr, rem
 	}
 	return route
 }
+
+// nextSourceNICRLocked returns the NIC after prev in the order that Linux uses
+// to pick a source address (inet_select_addr): the NICs in ascending order of
+// ID, and the loopback NICs last. A nil prev returns the first NIC. It returns
+// nil after the last NIC. The order does not depend on the iteration order of a
+// map, so the same host gets the same source address each time. It allocates
+// nothing.
+//
+// +checklocksread:s.mu
+func (s *Stack) nextSourceNICRLocked(prev *nic) *nic {
+	var next *nic
+	for _, n := range s.nics {
+		if prev != nil && !sourceNICLess(prev, n) {
+			continue
+		}
+		if next == nil || sourceNICLess(n, next) {
+			next = n
+		}
+	}
+	return next
+}
+
+// sourceNICLess reports whether a comes before b in the order of
+// nextSourceNICRLocked.
+func sourceNICLess(a, b *nic) bool {
+	if al, bl := a.IsLoopback(), b.IsLoopback(); al != bl {
+		return bl
+	}
+	return a.id < b.id
+}
