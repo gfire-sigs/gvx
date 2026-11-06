@@ -140,22 +140,22 @@ const (
 // TaskSize is the address space size.
 var TaskSize = func() uintptr {
 	pageSize := uintptr(unix.Getpagesize())
-	for _, s := range feasibleTaskSizes {
+	return searchTaskSize(pageSize, feasibleTaskSizes, func(size uintptr) bool {
 		// mmap returns ENOMEM if addr is greater than TASK_SIZE,
 		// otherwise it returns EINVAL, because addr isn't aligned to
 		// the page size.
 		_, _, errno := unix.RawSyscall6(
 			unix.SYS_MMAP,
-			s-pageSize-1,
+			size-pageSize-1,
 			512,
 			uintptr(unix.PROT_NONE),
 			uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED), 0, 0)
 		if errno == unix.EINVAL {
-			return s
+			return true
 		}
 		if errno != unix.ENOMEM {
 			panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
 		}
-	}
-	panic("None of the address space sizes could be successfully mmaped")
+		return false
+	})
 }()
