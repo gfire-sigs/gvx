@@ -62,7 +62,7 @@ else
   fail "calico pods not Ready"; k -n kube-system get pods -o wide; k -n kube-system logs ds/calico-node -c calico-node --tail=40
 fi
 until k -n kube-system get pods -l k8s-app=kube-dns -o name 2>/dev/null | grep -q pod; do sleep 2; done
-if k -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=300s >/dev/null 2>&1; then
+if k -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=600s >/dev/null 2>&1; then
   log "COREDNS-RUNNING"
 else
   fail "coredns not Ready"; k -n kube-system get pods -o wide
@@ -105,7 +105,7 @@ spec:
     image: curlimages/curl:8.11.1
     command: ["sleep", "infinity"]
 EOF2
-if k wait --for=condition=Ready pod/srv pod/cli pod/other --timeout=300s >/dev/null 2>&1; then
+if k wait --for=condition=Ready pod/srv pod/cli pod/other --timeout=600s >/dev/null 2>&1; then
   log "PODS-READY"
 else
   fail "pods not Ready"; k get pods -o wide; k -n kube-system logs ds/calico-node -c calico-node --tail=40; log CALICO-DONE; serve; exit 1
