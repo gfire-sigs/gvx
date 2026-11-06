@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -169,6 +170,18 @@ func NewRegistry(tb testing.TB, repo, tag string, images ...Image) string {
 // can stop it early.
 func NewRegistryServer(tb testing.TB, repo, tag string, images ...Image) *Registry {
 	tb.Helper()
+	return newRegistryServer(tb, nil, repo, tag, images...)
+}
+
+// NewTLSRegistryServer is like NewRegistryServer but serves HTTPS with cert.
+// The URL of the result starts with "https://".
+func NewTLSRegistryServer(tb testing.TB, cert tls.Certificate, repo, tag string, images ...Image) *Registry {
+	tb.Helper()
+	return newRegistryServer(tb, &cert, repo, tag, images...)
+}
+
+func newRegistryServer(tb testing.TB, cert *tls.Certificate, repo, tag string, images ...Image) *Registry {
+	tb.Helper()
 	r := &registry{
 		repo:      repo,
 		blobs:     make(map[string]blob),
@@ -193,7 +206,13 @@ func NewRegistryServer(tb testing.TB, repo, tag string, images ...Image) *Regist
 	}
 	r.addManifest(tag, indexBytes, index.MediaType)
 
-	srv := httptest.NewServer(r)
+	srv := httptest.NewUnstartedServer(r)
+	if cert != nil {
+		srv.TLS = &tls.Config{Certificates: []tls.Certificate{*cert}}
+		srv.StartTLS()
+	} else {
+		srv.Start()
+	}
 	tb.Cleanup(srv.Close)
 	return &Registry{URL: srv.URL, srv: srv}
 }
