@@ -31,6 +31,8 @@
 //	nodeprobe portstart              check ip_unprivileged_port_start
 //	nodeprobe netsysctls             check the sysctls of a network namespace
 //	nodeprobe forwarding             check forwarding between three namespaces
+//	nodeprobe ethtool                check SIOCETHTOOL on a veth pair, a vxlan link,
+//	                                 and lo, with the calls of Calico Felix
 //	nodeprobe genl                   check NETLINK_GENERIC and the controller family
 //	nodeprobe wireguard              check the wireguard link between two namespaces
 //	nodeprobe wglimits               check the rules and limits of the wireguard link
@@ -123,6 +125,8 @@ func main() {
 		checks = netSysctlChecks()
 	case "forwarding":
 		checks = forwardingChecks()
+	case "ethtool":
+		checks = ethtoolChecks()
 	case "genl":
 		checks = genlChecks()
 	case "wireguard":

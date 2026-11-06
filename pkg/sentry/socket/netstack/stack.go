@@ -56,6 +56,9 @@ type Stack struct {
 	// sysctls stores the /proc/sys/net values that the stack does not own. See
 	// sysctl_store_xplat.go.
 	sysctls sysctlValues `state:"nosave"`
+
+	// offloads keeps the ethtool features of the links. See ethtool_xplat.go.
+	offloads ethtoolState `state:"nosave"`
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.
@@ -96,6 +99,7 @@ func (s *Stack) sendChangeEvent(ctx context.Context, id tcpip.NICID) {
 }
 
 func (s *Stack) sendDeleteEvent(ctx context.Context, id tcpip.NICID, nicInfo *stack.NICInfo) {
+	s.dropLinkFeatures(id)
 	if s.eventSubscriber == nil {
 		return
 	}
@@ -379,6 +383,7 @@ func (s *Stack) setLinkLockedState(ctx context.Context, id tcpip.NICID, linkAttr
 		}
 		dst.disableMovedLink(id, nicInfo.Kind)
 
+		src.moveLinkFeatures(oldID, dst, id)
 		src.sendDeleteEvent(ctx, oldID, nicInfo) // inform about exit from old ns
 		changed = true                           // inform about entry into new ns
 

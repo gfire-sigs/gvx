@@ -3519,8 +3519,7 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		linux.SIOCGIFMTU,
 		linux.SIOCGIFNAME,
 		linux.SIOCGIFNETMASK,
-		linux.SIOCGIFTXQLEN,
-		linux.SIOCETHTOOL:
+		linux.SIOCGIFTXQLEN:
 
 		var ifr linux.IFReq
 		if _, err := ifr.CopyIn(t, args[2].Pointer()); err != nil {
@@ -3531,6 +3530,9 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		}
 		_, err := ifr.CopyOut(t, args[2].Pointer())
 		return 0, err
+
+	case linux.SIOCETHTOOL:
+		return ethtoolIoctl(ctx, t, args[2].Pointer())
 
 	case linux.SIOCSIFMTU:
 		var ifr linux.IFReq
@@ -3714,14 +3716,6 @@ func interfaceIoctl(ctx context.Context, _ usermem.IO, arg int, ifr *linux.IFReq
 			binary.BigEndian.PutUint32(ifr.Data[4:8], mask)
 			break
 		}
-
-	case linux.SIOCETHTOOL:
-		// Stubbed out for now, Ideally we should implement the required
-		// sub-commands for ETHTOOL
-		//
-		// See:
-		// https://github.com/torvalds/linux/blob/aa0c9086b40c17a7ad94425b3b70dd1fdd7497bf/net/core/dev_ioctl.c
-		return syserr.ErrEndpointOperation
 
 	default:
 		// Not a valid call.
