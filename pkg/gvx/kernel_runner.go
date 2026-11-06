@@ -1267,6 +1267,8 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 		// The module parameters of xt_recent belong to the kernel, so all
 		// network namespaces share them.
 		netfilter.ShareRecentModule(st, root.Stack)
+		// IPv4 also copies rp_filter of conf/all and conf/default.
+		stack.InheritRPFilter(root)
 	}
 	// nf_conntrack_max is one value for the kernel, as on Linux.
 	stack.InitConntrackLimit(root)

@@ -182,6 +182,7 @@ func (fs *filesystem) linkConfFiles(ctx context.Context, root *auth.Credentials,
 	if confPath == netIPv4ConfPath {
 		return map[string]kernfs.Inode{
 			"route_localnet": fs.newInode(ctx, root, 0644, &routeLocalnetLinkData{stack: stack, id: id}),
+			"rp_filter":      fs.newInode(ctx, root, 0644, &linkRPFilter{stack: stack, id: id}),
 		}
 	}
 	acceptRA := new(atomicbitops.Int32)

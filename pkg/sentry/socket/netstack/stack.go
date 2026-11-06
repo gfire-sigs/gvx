@@ -59,6 +59,9 @@ type Stack struct {
 
 	// offloads keeps the ethtool features of the links. See ethtool_xplat.go.
 	offloads ethtoolState `state:"nosave"`
+
+	// rpFilter keeps the rp_filter values. See rpfilter_xplat.go.
+	rpFilter rpFilterState `state:"nosave"`
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.
@@ -99,7 +102,7 @@ func (s *Stack) sendChangeEvent(ctx context.Context, id tcpip.NICID) {
 }
 
 func (s *Stack) sendDeleteEvent(ctx context.Context, id tcpip.NICID, nicInfo *stack.NICInfo) {
-	s.dropLinkFeatures(id)
+	s.dropLinkState(id)
 	if s.eventSubscriber == nil {
 		return
 	}
@@ -383,7 +386,7 @@ func (s *Stack) setLinkLockedState(ctx context.Context, id tcpip.NICID, linkAttr
 		}
 		dst.disableMovedLink(id, nicInfo.Kind)
 
-		src.moveLinkFeatures(oldID, dst, id)
+		src.moveLinkState(oldID, dst, id)
 		src.sendDeleteEvent(ctx, oldID, nicInfo) // inform about exit from old ns
 		changed = true                           // inform about entry into new ns
 
