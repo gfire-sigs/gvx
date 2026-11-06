@@ -189,6 +189,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	var memoryFlag string
 	alias([]string{"m", "memory"}, func(n string) { fs.StringVar(&memoryFlag, n, "", "Memory limit, such as 512m or 1g") })
 	cpusFlag := fs.String("cpus", "", "CPU quota, such as 1.5")
+	hostCACertsFlag := fs.Bool("host-ca-certs", false, "Make the guest trust the root certificates that the host trusts")
 	readOnlyRootFlag := fs.Bool("read-only", false, "Mount the root file system of the guest read-only")
 	var volumeFlags, mountFlags, tmpfsFlags listFlag
 	alias([]string{"v", "volume"}, func(n string) {
@@ -357,6 +358,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		WorkspaceReadOnly:      *readOnlyFlag,
 		Mounts:                 mounts,
 		ReadOnlyRoot:           *readOnlyRootFlag,
+		HostCACerts:            *hostCACertsFlag,
 		WorkDir:                strings.TrimSpace(workDirFlag),
 		Envv:                   envv,
 		User:                   strings.TrimSpace(userFlag),

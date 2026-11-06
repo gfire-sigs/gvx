@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/fd"
+	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/oci"
@@ -60,6 +61,9 @@ type Sandbox struct {
 	wgEndpoint    *netbackend.WireGuardEndpoint
 	wgPeerPort    uint16
 	lockdown      hostlockdown.Status
+	// hostCARoots holds the DER roots that Config.HostCACerts copies into the
+	// guest. New reads them before the lockdown.
+	hostCARoots [][]byte
 	// forwards holds the port forwards that initNetstack bound, in rule order:
 	// the caller list, then the ports that PublishAll added.
 	forwards []PortForward
@@ -78,6 +82,13 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 	applyHostMemoryDefaults()
 
 	sb := &Sandbox{cfg: cfg}
+	if cfg.HostCACerts {
+		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
+		if err != nil {
+			return nil, fmt.Errorf("gvx: read the host root certificates: %w", err)
+		}
+		sb.hostCARoots = roots
+	}
 
 	cleanup := func(cause error) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
