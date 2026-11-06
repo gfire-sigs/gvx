@@ -1118,6 +1118,7 @@ func TestE2ERealLinuxBusyboxPythonNodeAcrossBackends(t *testing.T) {
 	for _, plat := range platforms {
 		for _, tc := range workcases {
 			t.Run(string(plat)+"_"+tc.name, func(t *testing.T) {
+				requireAutoPlatform(t)
 				requireRegistry(t)
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 				defer cancel()

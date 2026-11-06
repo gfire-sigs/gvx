@@ -197,6 +197,7 @@ func requireStaticELF(t *testing.T, data []byte) {
 }
 
 func TestE2EGateM2BusyboxIsStatic(t *testing.T) {
+	requireAutoPlatform(t)
 	requireRegistry(t)
 	requireStaticELF(t, busyboxBinary(t, autoPlatform()))
 }
@@ -205,6 +206,7 @@ func TestE2EGateM2BusyboxIsStatic(t *testing.T) {
 // Config.Stdin. Each command waits for its own output and the next prompt, so
 // the test follows the guest instead of sleeping.
 func TestE2EGateM2BusyboxAshInteractive(t *testing.T) {
+	requireAutoPlatform(t)
 	requireRegistry(t)
 	for _, tc := range []struct {
 		name string
