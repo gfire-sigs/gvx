@@ -19,6 +19,10 @@ This file records the observable changes of each `gvx` release. The release work
 - **`TestE2ENestedRungvInRungv`**: runs `rungv` with `systrap` in a `rungv` guest.
 - **`TestE2EPtraceGSBaseKeepsPatchedThreadAlive`**: attaches to a running thread, sets its `GS` base with each ptrace request, and verifies that the thread keeps running its patched syscalls.
 
+## [v0.9.10012026110200] - 2026-11-07
+
+This release fixes the memory limit of a sandbox in a process with several sandboxes and a race of the Windows `systrap` engine. CI now runs the same tests on `windows/arm64` as on `windows/amd64`, with the race detector on `windows/amd64`.
+
 ### Bug Fixes
 
 - **Memory limit of a sandbox**: `Resources.MemoryBytes` now counts only the memory of its own sandbox. The limit counted the memory of every sandbox in the process, so an SDK user that ran several sandboxes in one process saw `ErrMemoryLimit` in a sandbox that stayed far below its limit.
