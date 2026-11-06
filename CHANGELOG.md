@@ -102,7 +102,6 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Known limitations
 
-- **`wireguard` and policy routing**: the stack has no `ip rule` and no routing table other than the main table. The mark of the link reaches the packet filter, but a rule with `fwmark` cannot choose a routing table. `wg-quick up` with a default route in `AllowedIPs` (`0.0.0.0/0`) fails at `ip route add ... table 51820` with `Not supported` and removes the link again. Use `Table = off` and add the routes with `ip route`. Policy routing needs its own change.
 - **`wireguard` source address of a reply**: Linux answers from the local address that the peer used. The device here binds the wildcard address, and the stack picks the source address from the route. The two differ on a host with several addresses on the interface of the route.
 - **`wireguard` endpoints with a scope identifier**: an IPv6 endpoint with `sin6_scope_id`, as a link-local address needs, loses the scope. Global addresses and IPv4 work.
 - **Capability of the opener of a netlink socket**: Linux checks `CAP_NET_ADMIN` for the process that opened the socket and for the process that sends. The Sentry checks the sender only, for every generic netlink command.
