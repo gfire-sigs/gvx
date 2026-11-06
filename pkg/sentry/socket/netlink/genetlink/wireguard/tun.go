@@ -21,11 +21,8 @@ import (
 	"os"
 	"sync"
 
-	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"z.gfire.dev/gvx/pkg/buffer"
-	"z.gfire.dev/gvx/pkg/sentry/kernel"
-	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
@@ -45,44 +42,6 @@ const (
 
 // errInvalidIPPacket reports a packet that is not a whole IPv4 or IPv6 packet.
 var errInvalidIPPacket = errors.New("wireguard: packet is not IPv4 or IPv6")
-
-// linkEndpoint is the link endpoint of a wireguard link in the stack. Packets
-// that the stack routes to the link wait in the channel queue, and the tun
-// adapter hands them to wireguard-go. Closing the endpoint closes the device.
-type linkEndpoint struct {
-	*channel.Endpoint
-	tun *tunDevice
-
-	bind *netBind
-	// userNS is the user namespace of the network namespace that created the
-	// link. A request that changes the socket needs CAP_NET_ADMIN in it.
-	userNS *auth.UserNamespace
-	// kernel is the sandbox that counts the link.
-	kernel *kernel.Kernel
-
-	closeOnce sync.Once
-	// dev is set before the stack sees the endpoint.
-	dev *device.Device
-}
-
-var _ stack.LinkEndpoint = (*linkEndpoint)(nil)
-
-// SetMTU implements stack.LinkEndpoint.SetMTU. It tells wireguard-go about
-// the new MTU, which sets the padding limit of the encrypted packets.
-func (e *linkEndpoint) SetMTU(mtu uint32) {
-	e.Endpoint.SetMTU(mtu)
-	e.tun.notifyMTU()
-}
-
-// Close implements stack.LinkEndpoint.Close. It stops every goroutine of the
-// device and closes its UDP endpoints before it returns.
-func (e *linkEndpoint) Close() {
-	e.closeOnce.Do(func() {
-		e.Endpoint.Close()
-		e.dev.Close()
-		releaseLink(e.kernel)
-	})
-}
 
 // tunDevice implements tun.Device on top of a channel.Endpoint. It has no
 // file descriptor. The channel endpoint belongs to the link endpoint.

@@ -68,6 +68,34 @@ type LinkKind struct {
 	// bound. It is optional.
 	MTURange func(ep stack.LinkEndpoint) (min, max uint32)
 
+	// AdminState makes the link follow IFF_UP, as a Linux device with an
+	// ndo_open operation does. The link starts down, "ip link set up" calls
+	// LinkUp of the endpoint that New returned, and "ip link set down" calls
+	// LinkDown. The endpoint MUST implement LinkStateListener. A link without
+	// AdminState is always up, as the other links of the stack are.
+	AdminState bool
+
+	// Flags are the IFF_* flags that the device sets in dev->flags at setup and
+	// that the stack does not report. The kind of wireguard sets IFF_POINTOPOINT
+	// and IFF_NOARP.
+	Flags uint32
+
+	// NoLinkLayer marks a link of type ARPHRD_NONE, such as wireguard. Linux
+	// reports no IFLA_ADDRESS and an empty sysfs address for it. Another link
+	// with that type, such as eth0 of the NAT link, keeps a zero address.
+	NoLinkLayer bool
+
+	// OperStateUnknown makes the link report IF_OPER_UNKNOWN, and not
+	// IF_OPER_UP, while it is up. A Linux device that never calls
+	// netif_carrier_off or netif_dormant_on has that operstate.
+	OperStateUnknown bool
+
+	// StackEnded runs when the network stack stk ends, after the stack removed
+	// the links that it holds. A kind whose links keep resources in the stack
+	// of their creation, also after they moved to another network namespace,
+	// frees the resources of the links that stk created. It is optional.
+	StackEnded func(stk *stack.Stack)
+
 	// Change applies the IFLA_INFO_DATA of an RTM_NEWLINK request to an existing
 	// link of the kind. It is optional. A kind without it answers EOPNOTSUPP,
 	// as a Linux link kind without a changelink operation does.
@@ -100,7 +128,10 @@ func RegisterLinkKind(kind string, k LinkKind) {
 // newRegisteredLink creates a link of a kind that RegisterLinkKind added. It
 // answers EOPNOTSUPP for an unknown kind, as the stack did before the
 // registry existed.
-func (s *Stack) newRegisteredLink(ctx context.Context, kind string, linkAttrs, linkInfoAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+//
+// up is true when the request has IFF_UP, as "ip link add wg0 up type wireguard"
+// sends. A kind with AdminState starts down otherwise.
+func (s *Stack) newRegisteredLink(ctx context.Context, kind string, up bool, linkAttrs, linkInfoAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
 	k, ok := linkKinds[kind]
 	if !ok {
 		return syserr.ErrNotSupported
@@ -135,13 +166,19 @@ func (s *Stack) newRegisteredLink(ctx context.Context, kind string, linkAttrs, l
 	if sysErr != nil {
 		return sysErr
 	}
-	opts := stack.NICOptions{Name: ifname, Kind: kind}
+	opts := stack.NICOptions{Name: ifname, Kind: kind, Disabled: k.AdminState}
 	if k.MTURange != nil {
 		opts.MinMTU, opts.MaxMTU = k.MTURange(ep)
 	}
 	if err := s.Stack.CreateNICWithOptions(id, ep, opts); err != nil {
 		ep.Close()
 		return syserr.TranslateNetstackError(err)
+	}
+	if up && k.AdminState {
+		if err := s.setLinkAdminState(ctx, id, true); err != nil {
+			s.Stack.RemoveNIC(id)
+			return err
+		}
 	}
 	if err := s.setLinkLocked(ctx, id, linkAttrs, dstNs); err != nil {
 		s.Stack.RemoveNIC(id)
@@ -177,6 +214,11 @@ func RemoveRegisteredLinks(stk *stack.Stack) {
 	for id, info := range stk.NICInfo() {
 		if _, ok := linkKinds[info.Kind]; ok {
 			stk.RemoveNIC(id)
+		}
+	}
+	for _, k := range linkKinds {
+		if k.StackEnded != nil {
+			k.StackEnded(stk)
 		}
 	}
 }

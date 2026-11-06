@@ -35,14 +35,10 @@ import (
 
 // The limits checks cover the rules of the wireguard link that the basic
 // checks leave out: the order and the atomicity of a set request, the lookup
-// of the device, the capability check of the creating namespace, the size of a
-// dump, and the limits of 256 links in a sandbox and 4,096 peers on a device.
-
-const (
-	// wgMaxLinks and wgMaxPeers are the limits of the guest kernel.
-	wgMaxLinks = 256
-	wgMaxPeers = 4096
-)
+// of the device, the capability check of the creating namespace, and the size
+// of a dump. Linux has no limit on the count of links, and the limit of
+// peers on a device is 1,048,576, so a dump of thousands of peers and more
+// than 256 links must work.
 
 // holdUDPPort binds a UDP socket to the wildcard address and keeps it open.
 func holdUDPPort(port int) (fd int, err error) {
@@ -243,56 +239,61 @@ func wgLimitsChecks() []check {
 			}
 			return nil
 		}},
-		{"dump-over-the-queue-fails-with-enobufs", func() error {
-			if err := addExtraPeers(a, "wg0", total-2, 1998); err != nil {
+		{"dump-of-10000-peers-is-complete", func() error {
+			// 10,000 peers are far above the 192 KiB of the old dump limit and the
+			// 4,096 peers of the old device limit.
+			if err := addExtraPeers(a, "wg0", total-2, 9998); err != nil {
 				return err
 			}
-			total = 2000
+			total = 10000
 			st, err := getA()
-			if err == nil {
-				// A complete answer is also correct. A short one is not.
-				if len(st.peers) != total {
-					return fmt.Errorf("the dump has %d peers and no error, want %d or an error", len(st.peers), total)
-				}
-				return nil
+			if err != nil {
+				return fmt.Errorf("dump of %d peers: %w", total, err)
 			}
-			if !errors.Is(err, syscall.ENOBUFS) {
-				return fmt.Errorf("dump of %d peers = %v, want ENOBUFS", total, err)
+			if len(st.peers) != total {
+				return fmt.Errorf("the dump has %d peers, want %d", len(st.peers), total)
+			}
+			// The peers come in the order of creation, so the two first peers
+			// of the pair come first.
+			if st.peers[0].pub != pubB {
+				return errors.New("the first peer of the dump is not the first peer that the test created")
+			}
+			seen := map[[32]byte]bool{}
+			for _, p := range st.peers {
+				if seen[p.pub] || len(p.allowed) == 0 {
+					return fmt.Errorf("the dump has a duplicate peer or a peer without an address: %+v", *p)
+				}
+				seen[p.pub] = true
 			}
 			return nil
 		}},
-		{"peer-limit-is-enomem", func() error {
-			if err := addExtraPeers(a, "wg0", total-2, wgMaxPeers-2); err != nil {
-				return err
-			}
-			total = wgMaxPeers
+		{"peers-replace-in-one-request-at-any-count", func() error {
 			var extra wgPeer
 			if _, err := rand.Read(extra.pub[:]); err != nil {
 				return err
 			}
-			err := a.do(func() error { return wgSet("wg0", wgConfig{peers: []wgPeer{extra}}) })
-			if !errors.Is(err, syscall.ENOMEM) {
-				return fmt.Errorf("peer %d = %v, want ENOMEM", wgMaxPeers+1, err)
+			extra.allowed = []string{"10.200.0.0/16"}
+			if err := a.do(func() error { return wgSet("wg0", wgConfig{peers: []wgPeer{extra}}) }); err != nil {
+				return fmt.Errorf("peer %d: %w", total+1, err)
 			}
-			// A request that replaces every peer is within the limit.
+			total++
 			return a.do(func() error {
 				return wgSet("wg0", wgConfig{flags: wgDeviceReplacePeers, peers: []wgPeer{extra}})
 			})
 		}},
-		{"link-limit-is-enomem", func() error {
-			// The pair holds two links. A third thread adds the rest.
+		{"more-than-256-links-in-one-namespace", func() error {
 			l, err := newNsThread()
 			if err != nil {
 				return err
 			}
 			defer l.close()
+			const links = 300
 			var names []string
-			var addErr error
 			err = l.do(func() error {
-				for i := range wgMaxLinks + 10 {
+				for i := range links {
 					name := fmt.Sprintf("wl%d", i)
-					if addErr = netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: name}}); addErr != nil {
-						return nil
+					if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: name}}); err != nil {
+						return fmt.Errorf("link %d: %w", i, err)
 					}
 					names = append(names, name)
 				}
@@ -301,11 +302,8 @@ func wgLimitsChecks() []check {
 			if err != nil {
 				return err
 			}
-			if !errors.Is(addErr, syscall.ENOMEM) || len(names) != wgMaxLinks-2 {
-				return fmt.Errorf("the links ended with %v after %d links, want ENOMEM after %d", addErr, len(names), wgMaxLinks-2)
-			}
 			return l.do(func() error {
-				for _, name := range names[:2] {
+				for _, name := range names {
 					link, err := netlink.LinkByName(name)
 					if err != nil {
 						return err
@@ -313,10 +311,6 @@ func wgLimitsChecks() []check {
 					if err := netlink.LinkDel(link); err != nil {
 						return err
 					}
-				}
-				// A deleted link frees its place.
-				if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: "wlx"}}); err != nil {
-					return fmt.Errorf("a link after two deletions: %w", err)
 				}
 				return nil
 			})

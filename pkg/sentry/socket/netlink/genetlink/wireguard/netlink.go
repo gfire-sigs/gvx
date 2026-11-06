@@ -16,11 +16,13 @@ package wireguard
 
 import (
 	"crypto/ecdh"
+	"fmt"
+	"strings"
 
+	"golang.zx2c4.com/wireguard/device"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/marshal/primitive"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/genetlink"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
@@ -52,10 +54,7 @@ func lookupDevice(req *genetlink.Request, attrs map[uint16]nlmsg.BytesView) (*li
 		name string
 	)
 	if haveIdx {
-		idx, ok := idxAttr.Uint32()
-		if !ok {
-			return nil, 0, "", syserr.ErrInvalidArgument
-		}
+		idx, _ := idxAttr.Uint32()
 		info, ok := st.Stack.SingleNICInfo(tcpip.NICID(idx))
 		if !ok {
 			return nil, 0, "", syserr.ErrNoDevice
@@ -80,204 +79,256 @@ func lookupDevice(req *genetlink.Request, attrs map[uint16]nlmsg.BytesView) (*li
 	return ep, id, name, nil
 }
 
-// state returns the configuration that wireguard-go holds.
-func (e *linkEndpoint) state() (*deviceInfo, *syserr.Error) {
-	text, err := e.dev.IpcGet()
-	if err != nil {
-		return nil, syserr.ErrIO
-	}
-	info, err := parseIpcGet(text)
-	if err != nil {
-		return nil, syserr.ErrIO
-	}
-	return info, nil
-}
-
-// setDevice answers WG_CMD_SET_DEVICE. It validates the whole request, then
-// hands it to wireguard-go as one configuration text.
+// setDevice answers WG_CMD_SET_DEVICE. The attributes pass the policy of the
+// command first. The request then runs in the order of Linux, and a failure in
+// the middle keeps the changes before it, as in Linux.
 //
 // A request that sets the listen port or the mark needs CAP_NET_ADMIN in the
 // user namespace of the namespace that created the link, because the socket of
-// the link belongs to that namespace. A port that the device does not own yet
-// must be free: the call binds it first and answers EADDRINUSE before it changes
-// anything, because wireguard-go closes the old socket before it opens the new
-// one.
+// the link belongs to that namespace.
 func setDevice(ctx context.Context, req *genetlink.Request, _ *genetlink.Reply) *syserr.Error {
-	attrs, ok := req.ParseAttrs()
-	if !ok {
-		return syserr.ErrInvalidArgument
+	attrs, err := parseWithPolicy(req.Attrs, setDevicePolicy)
+	if err != nil {
+		return err
 	}
 	ep, _, _, err := lookupDevice(req, attrs)
 	if err != nil {
 		return err
 	}
-	cur, err := ep.state()
-	if err != nil {
-		return err
+	canSetSocket := ep.userNS == nil || auth.CredentialsFromContext(ctx).HasCapabilityIn(linux.CAP_NET_ADMIN, ep.userNS)
+	return ep.applySet(attrs, canSetSocket)
+}
+
+// applySet runs a validated WG_CMD_SET_DEVICE request, as
+// drivers/net/wireguard/netlink.c:wg_set_device_doit does: the mark, the port,
+// the removal of every peer, the private key, and then the peers.
+func (e *linkEndpoint) applySet(attrs map[uint16]nlmsg.BytesView, canSetSocket bool) *syserr.Error {
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
+	if e.closed {
+		return syserr.ErrNoDevice
 	}
-	plan, err := parseSetDevice(attrs, cur)
-	if err != nil {
-		return err
+	var flags uint32
+	if v, ok := attrs[deviceAttrFlags]; ok {
+		flags, _ = v.Uint32()
 	}
-	if plan.changesSocket && ep.userNS != nil && !auth.CredentialsFromContext(ctx).HasCapabilityIn(linux.CAP_NET_ADMIN, ep.userNS) {
+	markAttr, haveMark := attrs[deviceAttrFwmark]
+	portAttr, havePort := attrs[deviceAttrListenPort]
+	if (haveMark || havePort) && !canSetSocket {
 		return syserr.ErrNotPermitted
 	}
-	if plan.peers > maxPeers {
-		return syserr.ErrNoMemory
+	if haveMark {
+		mark, _ := markAttr.Uint32()
+		e.fwmark = mark
+		e.bind.setMark(mark)
 	}
-	if plan.probePort != 0 {
-		if err := ep.bind.probe(plan.probePort); err != nil {
-			return bindSyserr(err)
+	if havePort {
+		port, _ := portAttr.Uint16()
+		if err := e.setPort(port); err != nil {
+			return err
 		}
 	}
-	if plan.conf == "" {
+	if flags&deviceFlagReplacePeers != 0 {
+		e.dev.RemoveAllPeers()
+		e.peers.clear()
+		e.resizeCharge()
+	}
+	if v, ok := attrs[deviceAttrPrivateKey]; ok {
+		if err := e.setPrivateKey(v); err != nil {
+			return err
+		}
+	}
+	if v, ok := attrs[deviceAttrPeers]; ok {
+		return e.setPeers(nlmsg.AttrsView(v))
+	}
+	return nil
+}
+
+// setPort changes the listen port. A port that the device already has needs no
+// change. A device that is down only stores the port. A device that is up binds
+// the new sockets first, so a busy port fails and leaves the old sockets in
+// place. From netlink.c:set_port.
+//
+// Preconditions: e.updateMu is held.
+func (e *linkEndpoint) setPort(port uint16) *syserr.Error {
+	if e.bind.incomingPort() == port {
 		return nil
 	}
-	if ipcErr := ep.dev.IpcSet(plan.conf); ipcErr != nil {
-		return bindSyserr(ipcErr)
+	if !e.up {
+		e.bind.setIncoming(port)
+		return nil
+	}
+	if err := e.bind.prepare(port); err != nil {
+		return bindSyserr(err)
+	}
+	if err := e.dev.BindUpdate(); err != nil {
+		return bindSyserr(err)
 	}
 	return nil
 }
 
-// getDevice answers WG_CMD_GET_DEVICE with NLM_F_DUMP. The first message holds
-// the device attributes and the peers that fit. Later messages hold the
-// remaining peers, and they repeat the public key of a peer that continues.
-func getDevice(_ context.Context, req *genetlink.Request, dump *genetlink.Dump) *syserr.Error {
-	attrs, ok := req.ParseAttrs()
-	if !ok {
+// setPrivateKey sets the private key. A key of zeros removes the identity, as
+// curve25519_generate_public of Linux reports for it. A peer with the public
+// key of the new identity leaves the device.
+//
+// Preconditions: e.updateMu is held.
+func (e *linkEndpoint) setPrivateKey(v nlmsg.BytesView) *syserr.Error {
+	var priv [keyLen]byte
+	copy(priv[:], v)
+	if err := e.dev.IpcSet(fmt.Sprintf("private_key=%x\n", priv)); err != nil {
+		return bindSyserr(err)
+	}
+	e.hasKey = priv != [keyLen]byte{}
+	e.public = [keyLen]byte{}
+	if e.hasKey {
+		key, err := ecdh.X25519().NewPrivateKey(priv[:])
+		if err != nil {
+			return syserr.ErrInvalidArgument
+		}
+		copy(e.public[:], key.PublicKey().Bytes())
+		e.syncPeer(e.public)
+		e.resizeCharge()
+	}
+	return nil
+}
+
+// syncPeer makes the peer list agree with the device after a change of the
+// peer with the key.
+//
+// Preconditions: e.updateMu is held.
+func (e *linkEndpoint) syncPeer(key [keyLen]byte) {
+	if e.dev.LookupPeer(device.NoisePublicKey(key)) != nil {
+		e.peers.add(key)
+	} else {
+		e.peers.remove(key)
+	}
+}
+
+// setPeers runs the peer entries of the request, one after the other.
+//
+// Preconditions: e.updateMu is held.
+func (e *linkEndpoint) setPeers(list nlmsg.AttrsView) *syserr.Error {
+	for !list.Empty() {
+		_, value, rest, ok := list.ParseFirst()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		list = rest
+		attrs, ok := genetlink.ParseAttrs(nlmsg.AttrsView(value))
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		if err := e.setPeer(attrs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setPeer runs one peer entry, in the order of netlink.c:set_peer. It writes
+// the lines for wireguard-go while it validates, and it applies the lines that
+// it wrote before an error, as Linux keeps the changes before a failure.
+//
+// Preconditions: e.updateMu is held.
+func (e *linkEndpoint) setPeer(attrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	keyAttr, ok := attrs[peerAttrPublicKey]
+	if !ok || len(keyAttr) != keyLen {
 		return syserr.ErrInvalidArgument
 	}
-	ep, id, name, err := lookupDevice(req, attrs)
-	if err != nil {
-		return err
+	var key [keyLen]byte
+	copy(key[:], keyAttr)
+	var flags uint32
+	if v, ok := attrs[peerAttrFlags]; ok {
+		flags, _ = v.Uint32()
 	}
-	info, err := ep.state()
-	if err != nil {
-		return err
+	if v, ok := attrs[peerAttrProtoVersion]; ok {
+		if version, _ := v.Uint32(); version != 1 {
+			return errProtocolVersion
+		}
 	}
+	exists := e.peers.has(key)
+	if !exists {
+		if flags&(peerFlagRemoveMe|peerFlagUpdateOnly) != 0 {
+			return nil
+		}
+		// A new peer has no allowed IP addresses to replace.
+		flags &^= peerFlagReplaceAllowedIP
+		if e.hasKey && key == e.public {
+			// Linux ignores a peer with the public key of the device without
+			// an error, so a caller can send one list of peers to every device.
+			return nil
+		}
+		if e.peers.len() >= peerLimit {
+			return syserr.ErrNoMemory
+		}
+		if err := chargeMemory(peerMemory); err != nil {
+			return err
+		}
+		e.charged += peerMemory
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "public_key=%x\n", key)
+	result := e.buildPeer(&b, attrs, flags)
+	if err := e.dev.IpcSet(b.String()); err != nil && result == nil {
+		result = bindSyserr(err)
+	}
+	e.syncPeer(key)
+	e.resizeCharge()
+	return result
+}
 
-	d := &deviceDumper{dump: dump, ifindex: uint32(id), name: name, limit: dump.MessageLimit()}
-	if err := d.begin(info); err != nil {
-		return err
+// buildPeer appends the lines for the attributes of a peer that exists. It
+// returns the first error and keeps the lines that come before it.
+func (e *linkEndpoint) buildPeer(b *strings.Builder, attrs map[uint16]nlmsg.BytesView, flags uint32) *syserr.Error {
+	if flags&peerFlagRemoveMe != 0 {
+		b.WriteString("remove=true\n")
+		return nil
 	}
-	for i := range info.peers {
-		if err := d.peer(&info.peers[i]); err != nil {
+	if v, ok := attrs[peerAttrPresharedKey]; ok {
+		fmt.Fprintf(b, "preshared_key=%x\n", []byte(v))
+	}
+	if v, ok := attrs[peerAttrEndpoint]; ok {
+		if ep, ok := endpointText(v); ok {
+			fmt.Fprintf(b, "endpoint=%s\n", ep)
+		}
+	}
+	if flags&peerFlagReplaceAllowedIP != 0 {
+		b.WriteString("replace_allowed_ips=true\n")
+	}
+	if v, ok := attrs[peerAttrAllowedIPs]; ok {
+		if err := appendAllowedIPs(b, nlmsg.AttrsView(v)); err != nil {
 			return err
 		}
 	}
-	d.end()
+	if v, ok := attrs[peerAttrKeepalive]; ok {
+		secs, _ := v.Uint16()
+		fmt.Fprintf(b, "persistent_keepalive_interval=%d\n", secs)
+	}
 	return nil
 }
 
-// deviceDumper packs peers into dump messages that stay below a size limit.
-type deviceDumper struct {
-	dump    *genetlink.Dump
-	ifindex uint32
-	name    string
-	limit   int
-
-	// m is the message under construction. prefix is its size before the
-	// list of peers, and peers is the content of that list.
-	m      *nlmsg.Message
-	prefix int
-	peers  nlmsg.NestedAttr
-}
-
-// begin starts a message. A message with info also carries the attributes
-// of the device.
-func (d *deviceDumper) begin(info *deviceInfo) *syserr.Error {
-	m, err := d.dump.Message(cmdGetDevice)
-	if err != nil {
-		return err
-	}
-	m.PutAttr(deviceAttrIfindex, primitive.AllocateUint32(d.ifindex))
-	m.PutAttrString(deviceAttrIfname, d.name)
-	if info != nil {
-		putDeviceAttrs(m, info)
-	}
-	d.m, d.prefix, d.peers = m, len(m.Buffer()), nil
-	return nil
-}
-
-// putDeviceAttrs adds the keys, the port, and the mark. Linux reports the
-// keys only when the device has a private key.
-func putDeviceAttrs(m *nlmsg.Message, info *deviceInfo) {
-	if info.privateKey != [keyLen]byte{} {
-		priv := primitive.ByteSlice(info.privateKey[:])
-		m.PutAttr(deviceAttrPrivateKey, &priv)
-		if key, err := ecdh.X25519().NewPrivateKey(info.privateKey[:]); err == nil {
-			pub := primitive.ByteSlice(key.PublicKey().Bytes())
-			m.PutAttr(deviceAttrPublicKey, &pub)
+// appendAllowedIPs appends one "allowed_ip" line for each entry of the list. It
+// stops at the first invalid entry and keeps the lines before it.
+func appendAllowedIPs(b *strings.Builder, list nlmsg.AttrsView) *syserr.Error {
+	for !list.Empty() {
+		_, value, rest, ok := list.ParseFirst()
+		if !ok {
+			return syserr.ErrInvalidArgument
 		}
-	}
-	m.PutAttr(deviceAttrListenPort, primitive.AllocateUint16(info.listenPort))
-	m.PutAttr(deviceAttrFwmark, primitive.AllocateUint32(info.fwmark))
-}
-
-// end closes the message under construction.
-func (d *deviceDumper) end() {
-	if len(d.peers) > 0 {
-		d.m.PutNestedAttr(deviceAttrPeers|linux.NLA_F_NESTED, d.peers)
-	}
-}
-
-// room returns the bytes that the list of peers can still take.
-func (d *deviceDumper) room() int {
-	return d.limit - d.prefix - linux.NetlinkAttrHeaderSize - len(d.peers)
-}
-
-// rollover closes the current message and starts one without device
-// attributes.
-func (d *deviceDumper) rollover() *syserr.Error {
-	d.end()
-	return d.begin(nil)
-}
-
-// peer adds one peer. It splits the allowed IP addresses of a peer
-// across messages when they exceed the message limit.
-func (d *deviceDumper) peer(p *peerInfo) *syserr.Error {
-	head := encodePeer(p)
-	if pieceSize(head, 0, 0) > d.room() && len(d.peers) > 0 {
-		if err := d.rollover(); err != nil {
+		list = rest
+		attrs, ok := genetlink.ParseAttrs(nlmsg.AttrsView(value))
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		prefix, remove, err := decodeAllowedIP(attrs)
+		if err != nil {
 			return err
 		}
-	}
-	var ips nlmsg.NestedAttr
-	for _, prefix := range p.allowedIPs {
-		enc := encodeAllowedIP(prefix)
-		for pieceSize(head, len(ips), len(enc)) > d.room() {
-			if len(d.peers) == 0 && len(ips) == 0 {
-				// The entry cannot fit anywhere else.
-				break
-			}
-			if len(ips) > 0 {
-				d.addPiece(head, ips)
-				head, ips = encodeKeyOnlyPeer(p), nil
-			}
-			if err := d.rollover(); err != nil {
-				return err
-			}
+		if remove {
+			fmt.Fprintf(b, "allowed_ip=-%s\n", prefix)
+		} else {
+			fmt.Fprintf(b, "allowed_ip=%s\n", prefix)
 		}
-		ips = append(ips, enc...)
 	}
-	d.addPiece(head, ips)
 	return nil
-}
-
-// pieceSize returns the size of one entry of the peer list that holds head
-// and ipsLen plus extra bytes of allowed IP addresses.
-func pieceSize(head nlmsg.NestedAttr, ipsLen, extra int) int {
-	n := len(head)
-	if ipsLen+extra > 0 {
-		n += linux.NetlinkAttrHeaderSize + ipsLen + extra
-	}
-	return linux.NetlinkAttrHeaderSize + n
-}
-
-// addPiece appends one entry to the list of peers.
-func (d *deviceDumper) addPiece(head, ips nlmsg.NestedAttr) {
-	if len(ips) > 0 {
-		head.PutAttr(peerAttrAllowedIPs|linux.NLA_F_NESTED, primitive.AsByteSlice(ips))
-	}
-	d.peers.PutAttr(0|linux.NLA_F_NESTED, primitive.AsByteSlice(head))
 }

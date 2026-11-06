@@ -361,10 +361,8 @@ echo B-DONE
 }
 
 // TestE2EWireGuardA12ToolLargeConfiguration sets a configuration with many
-// peers through "wg setconf" and reads it back with "wg show dump". A dump
-// that fits the receive queue of the netlink socket lists every peer. A larger
-// dump fails with an explicit error, and it never ends early with a partial
-// list.
+// peers through "wg setconf" and reads it back with "wg show dump". The dump
+// lists every peer, however many there are.
 func TestE2EWireGuardA12ToolLargeConfiguration(t *testing.T) {
 	const script = `set -e
 apk add --no-cache wireguard-tools iproute2 >/dev/null
@@ -378,7 +376,7 @@ echo DUMP-LINES $(wc -l < /tmp/dump)
 echo DUMP-ERR $(cat /tmp/err)
 `
 	for _, b := range gateBackends() {
-		for _, peers := range []int{700, 2000} {
+		for _, peers := range []int{700, 2000, 10000} {
 			t.Run(b.name+"/"+strconv.Itoa(peers), func(t *testing.T) {
 				requireFixedAddressBackend(t, b)
 				requireRegistry(t)
@@ -397,14 +395,8 @@ echo DUMP-ERR $(cat /tmp/err)
 				if rc == nil || lines == nil {
 					t.Fatalf("output lacks the dump result:\n%s", out)
 				}
-				switch {
-				case rc[1] == "0" && lines[1] == strconv.Itoa(peers+1):
-				case peers > 1000 && rc[1] != "0" && strings.Contains(out, "No buffer space available"):
-				default:
-					t.Errorf("the dump of %d peers ended with status %s and %s lines, want every line, or an error for more than 1,000 peers:\n%s", peers, rc[1], lines[1], out)
-				}
-				if peers == 700 && rc[1] != "0" {
-					t.Errorf("the dump of 700 peers failed:\n%s", out)
+				if rc[1] != "0" || lines[1] != strconv.Itoa(peers+1) {
+					t.Errorf("the dump of %d peers ended with status %s and %s lines, want status 0 and %d lines:\n%s", peers, rc[1], lines[1], peers+1, out)
 				}
 			})
 		}

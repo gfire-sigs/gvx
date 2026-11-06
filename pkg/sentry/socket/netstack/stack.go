@@ -78,7 +78,7 @@ func makeInterfaceInfo(ni *stack.NICInfo) inet.Interface {
 	return inet.Interface{
 		Name:       ni.Name,
 		Addr:       []byte(ni.LinkAddress),
-		Flags:      uint32(nicStateFlagsToLinux(ni.Flags)),
+		Flags:      linuxFlags(ni),
 		DeviceType: toLinuxARPHardwareType(ni.ARPHardwareType),
 		MTU:        ni.MTU,
 		Master:     uint32(ni.Primary),
@@ -253,7 +253,8 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 			ctx.Warningf("Unsupported ifi_flags: %x", ifinfomsg.Flags)
 			return syserr.ErrInvalidArgument
 		}
-		// Netstack interfaces are always up.
+		// Netstack interfaces are always up, except the links of a kind
+		// with an administrative state.
 	}
 
 	dstNs, err := s.lockSrcAndDst(ctx, attrs)
@@ -261,7 +262,10 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		return err
 	}
 	defer s.unlockSrcAndDst(ctx, dstNs)
-	return s.setLinkLocked(ctx, tcpip.NICID(ifinfomsg.Index), attrs, dstNs)
+	// Linux applies the namespace, the name, the address, and the MTU first and
+	// the flags last, so a request that fails keeps the link as it was.
+	up, change := requestedUp(&ifinfomsg)
+	return s.setLinkLockedState(ctx, tcpip.NICID(ifinfomsg.Index), attrs, dstNs, linkState{up: up, change: change})
 }
 
 // If the linkAttrs map contains IFLA_NET_NS_FD, locks the source and
@@ -344,6 +348,12 @@ func (s *Stack) unlockSrcAndDst(ctx context.Context, ns *inet.Namespace) {
 // precondition: s.linkLock is held. If dstNs is not nil, dstNs.Stack.linkMu is
 // also held.
 func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView, dstNs *inet.Namespace) *syserr.Error {
+	return s.setLinkLockedState(ctx, id, linkAttrs, dstNs, linkState{})
+}
+
+// setLinkLockedState is setLinkLocked with an administrative state that it
+// applies after every other change, as do_setlink does.
+func (s *Stack) setLinkLockedState(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView, dstNs *inet.Namespace, state linkState) *syserr.Error {
 	src := s
 	changed := false
 	nicInfo, ok := src.Stack.SingleNICInfo(id)
@@ -358,10 +368,16 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 	if dst != src {
 		var err tcpip.Error
 		oldID := id
+		// Linux closes a device before it moves the device to another network
+		// namespace, so the link is down in the new namespace.
+		if err := src.setLinkAdminState(ctx, id, false); err != nil {
+			return err
+		}
 		id, err = src.Stack.SetNICStack(id, dst.Stack)
 		if err != nil {
 			return syserr.TranslateNetstackError(err)
 		}
+		dst.disableMovedLink(id, nicInfo.Kind)
 
 		src.sendDeleteEvent(ctx, oldID, nicInfo) // inform about exit from old ns
 		changed = true                           // inform about entry into new ns
@@ -435,6 +451,14 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 		}
 	}
 
+	if state.change {
+		if err := src.setLinkAdminState(ctx, id, state.up); err != nil {
+			if changed {
+				src.sendChangeEvent(ctx, id)
+			}
+			return err
+		}
+	}
 	if changed {
 		src.sendChangeEvent(ctx, id)
 	}
@@ -640,7 +664,12 @@ func (s *Stack) newInterface(ctx context.Context, msg *nlmsg.Message, linkAttrs 
 	case "veth":
 		return s.newVeth(ctx, linkAttrs, linkInfoAttrs)
 	}
-	return s.newRegisteredLink(ctx, kind, linkAttrs, linkInfoAttrs)
+	var ifi linux.InterfaceInfoMessage
+	if _, ok := msg.GetData(&ifi); !ok {
+		return syserr.ErrInvalidArgument
+	}
+	up, _ := requestedUp(&ifi)
+	return s.newRegisteredLink(ctx, kind, up, linkAttrs, linkInfoAttrs)
 }
 
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.
@@ -1207,6 +1236,9 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	localRoute, err := s.localRoute(msg)
 	if err != nil {
+		return err
+	}
+	if err := s.checkLinkUp(localRoute.NIC); err != nil {
 		return err
 	}
 	if err := s.checkGateway(msg, &localRoute); err != nil {

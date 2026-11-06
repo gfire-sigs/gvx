@@ -49,19 +49,6 @@ const (
 
 	// maxNameLen is GENL_NAMSIZ, the size of a family name with its NUL byte.
 	maxNameLen = 16
-
-	// dumpMessageLimit is the size above which Dump.Message sends the
-	// previous message in its own datagram. It is the size of one socket
-	// buffer page of libmnl, less room for the header of the next message.
-	dumpMessageLimit = 3584
-
-	// dumpByteLimit is the size of all messages of one dump. A netlink socket
-	// buffers 208 KiB of answers, and it drops a datagram when the buffer is
-	// full. The Sentry builds a dump at once and has no way to wait for the
-	// reader, so a dump that would pass the limit fails with ENOBUFS. A dump
-	// then never ends with NLMSG_DONE after a lost message. The limit leaves
-	// 16 KiB for the end of the dump.
-	dumpByteLimit = 192 << 10
 )
 
 // OpFlags are the GENL_* command flags of include/uapi/linux/genetlink.h.
@@ -110,65 +97,98 @@ func (r *Reply) Message(cmd uint8) *nlmsg.Message {
 	return newMessage(r.ms, r.family, cmd)
 }
 
-// Dump sends the messages of a command with the NLM_F_DUMP flag. Each message
-// leaves in its own datagram, so a reader with a 4,096-byte buffer does not
-// truncate it.
-type Dump struct {
+// Chunk is the part of a dump that one datagram carries. A Dumper adds
+// messages to it until the chunk is full.
+type Chunk struct {
 	family *Family
-	socket *netlink.Socket
-	ctx    context.Context
 	ms     *nlmsg.MessageSet
-	// sent is the size of the messages that the dump already sent.
-	sent int
+	limit  int
 }
 
-// Message starts a dump message for the command cmd. The previous message of
-// the dump is complete at this point, and Message sends it. A message must
-// stay below MessageLimit bytes.
-func (d *Dump) Message(cmd uint8) (*nlmsg.Message, *syserr.Error) {
-	if err := d.flush(); err != nil {
-		return nil, err
+// NewChunk returns a chunk of the family f that adds its messages to ms. The
+// socket makes chunks itself. A test of a Dumper uses NewChunk to run the
+// Dumper without a socket.
+func NewChunk(f *Family, ms *nlmsg.MessageSet, limit int) *Chunk {
+	return &Chunk{family: f, ms: ms, limit: limit}
+}
+
+// Message starts a message for the command cmd in the chunk. The caller adds
+// the attributes to the returned message.
+func (c *Chunk) Message(cmd uint8) *nlmsg.Message {
+	return newMessage(c.ms, c.family, cmd)
+}
+
+// Limit returns the size at which the chunk is full. It is the size of the
+// buffer that the reader of the socket offered, within the bounds of Linux. A
+// reader with that buffer reads the chunk whole, so the Dumper SHOULD keep the
+// chunk within it.
+func (c *Chunk) Limit() int {
+	return c.limit
+}
+
+// Discard removes the last message of the chunk. A Dumper calls it for a
+// message that took the chunk over Limit, and it sends that message in the
+// next chunk. It does nothing for an empty chunk.
+func (c *Chunk) Discard() {
+	if n := len(c.ms.Messages); n > 0 {
+		c.ms.Messages[n-1] = nil
+		c.ms.Messages = c.ms.Messages[:n-1]
 	}
-	return newMessage(d.ms, d.family, cmd), nil
 }
 
-// MessageLimit returns the largest size of one dump message.
-func (d *Dump) MessageLimit() int {
-	return dumpMessageLimit
+// Count returns the count of messages in the chunk, with the message in
+// progress.
+func (c *Chunk) Count() int {
+	return len(c.ms.Messages)
 }
 
-// flush sends the messages that the dump holds, except the last message of
-// the whole dump, which the netlink socket sends before NLMSG_DONE.
-func (d *Dump) flush() *syserr.Error {
-	if len(d.ms.Messages) == 0 {
-		return nil
-	}
-	if err := d.account(); err != nil {
-		return err
-	}
-	d.sent += d.pending()
-	part := &nlmsg.MessageSet{PortID: d.ms.PortID, Seq: d.ms.Seq, Messages: d.ms.Messages}
-	d.ms.Clear()
-	return d.socket.SendResponse(d.ctx, part)
-}
-
-// pending returns the size of the messages that the dump holds, with the
-// alignment that the socket adds.
-func (d *Dump) pending() int {
+// Size returns the size of all messages of the chunk, with the padding of
+// each message and with the message in progress.
+func (c *Chunk) Size() int {
 	n := 0
-	for _, m := range d.ms.Messages {
-		n += (len(m.Buffer()) + linux.NLMSG_ALIGNTO - 1) &^ (linux.NLMSG_ALIGNTO - 1)
+	for _, m := range c.ms.Messages {
+		n += netlink.MessageSize(m)
 	}
 	return n
 }
 
-// account fails with ENOBUFS when the held messages would take the dump past
-// dumpByteLimit.
-func (d *Dump) account() *syserr.Error {
-	if d.sent+d.pending() > dumpByteLimit {
-		return syserr.ErrNoBufferSpace
-	}
-	return nil
+// Dumper produces the answer of one command with the NLM_F_DUMP flag. The
+// socket asks it for one chunk each time that the reader consumes a datagram,
+// so a dump of any size needs no more room than one chunk, and a slow reader
+// never makes the dump fail. The socket calls the methods of one Dumper one at
+// a time.
+type Dumper interface {
+	// DumpChunk adds messages to chunk. It SHOULD stop once chunk.Size()
+	// reaches chunk.Limit(), and it MUST add a message when it has one
+	// left, so that the dump makes progress. It reports true when a later
+	// call can add more messages. It reports false after the last message,
+	// and a call that adds nothing and reports false ends the dump. An error
+	// ends the dump too: the socket answers the request with it when the first
+	// chunk fails, and it sends the error in NLMSG_DONE otherwise.
+	DumpChunk(ctx context.Context, chunk *Chunk) (more bool, err *syserr.Error)
+
+	// DumpDone releases the state of the dump. The socket calls it once,
+	// after the last DumpChunk call or when the socket closes before the dump
+	// ends.
+	DumpDone()
+}
+
+// dumpAdapter runs a Dumper of a family as a netlink.Dumper.
+type dumpAdapter struct {
+	family *Family
+	dumper Dumper
+}
+
+var _ netlink.Dumper = (*dumpAdapter)(nil)
+
+// DumpChunk implements netlink.Dumper.DumpChunk.
+func (a *dumpAdapter) DumpChunk(ctx context.Context, ms *nlmsg.MessageSet, limit int) (bool, *syserr.Error) {
+	return a.dumper.DumpChunk(ctx, &Chunk{family: a.family, ms: ms, limit: limit})
+}
+
+// DumpDone implements netlink.Dumper.DumpDone.
+func (a *dumpAdapter) DumpDone() {
+	a.dumper.DumpDone()
 }
 
 // newMessage adds a message with the generic netlink header to ms.
@@ -191,9 +211,12 @@ type Op struct {
 	// command has no such form.
 	Do func(ctx context.Context, req *Request, reply *Reply) *syserr.Error
 
-	// Dump answers a request with the NLM_F_DUMP flag. It is nil when the
-	// command has no such form.
-	Dump func(ctx context.Context, req *Request, dump *Dump) *syserr.Error
+	// Dump starts the answer to a request with the NLM_F_DUMP flag. It
+	// returns the Dumper that produces the messages. It is nil when the
+	// command has no such form. Dump MUST NOT keep req after it returns,
+	// because the attributes of the request point into the buffer of the
+	// socket.
+	Dump func(ctx context.Context, req *Request) (Dumper, *syserr.Error)
 }
 
 // Family is one generic netlink family. A registered family never changes.
@@ -353,16 +376,12 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 		if op.Dump == nil {
 			return syserr.ErrNotSupported
 		}
-		ms.Multi = true
-		d := &Dump{family: f, socket: s, ctx: ctx, ms: ms}
-		err := op.Dump(ctx, req, d)
-		if err == nil {
-			err = d.account()
-		}
+		dumper, err := op.Dump(ctx, req)
 		if err != nil {
-			// Drop the unfinished message. The socket then sends only the error.
-			ms.Clear()
-			ms.Multi = false
+			return err
+		}
+		if err := s.StartDump(&dumpAdapter{family: f, dumper: dumper}); err != nil {
+			dumper.DumpDone()
 			return err
 		}
 		return nil

@@ -31,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
@@ -192,6 +193,11 @@ func linkOperState(nic inet.Interface) string {
 	if nic.DeviceType == linux.ARPHRD_LOOPBACK {
 		return "unknown"
 	}
+	// A link kind with its own rule, such as wireguard, shares it with the
+	// netlink attribute IFLA_OPERSTATE.
+	if name, ok := netstack.LinkOperStateName(nic.Kind, nic.Flags); ok {
+		return name
+	}
 	if nic.Flags&linux.IFF_UP != 0 && nic.Flags&linux.IFF_RUNNING != 0 {
 		return "up"
 	}
@@ -210,6 +216,11 @@ func (fs *filesystem) newNetLinkDir(ctx context.Context, creds *auth.Credentials
 		"address": fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, _ int32, nic inet.Interface, _ inet.StatDev) {
 			addr := net.HardwareAddr(nic.Addr)
 			if len(addr) == 0 {
+				if netstack.LinkHasNoLinkLayer(nic.Kind) {
+					// A link without a link layer has an empty address.
+					fmt.Fprintf(buf, "\n")
+					return
+				}
 				addr = make(net.HardwareAddr, 6)
 			}
 			fmt.Fprintf(buf, "%s\n", addr)

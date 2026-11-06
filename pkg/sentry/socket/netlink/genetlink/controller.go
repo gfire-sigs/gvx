@@ -114,16 +114,30 @@ func ctrlGetFamily(_ context.Context, req *Request, reply *Reply) *syserr.Error 
 
 // ctrlDumpFamilies answers CTRL_CMD_GETFAMILY with NLM_F_DUMP. It sends one
 // message for each registered family.
-func ctrlDumpFamilies(_ context.Context, _ *Request, dump *Dump) *syserr.Error {
-	for _, f := range families() {
-		m, err := dump.Message(ctrlCmdNewFamily)
-		if err != nil {
-			return err
-		}
-		fillFamily(m, f)
-	}
-	return nil
+func ctrlDumpFamilies(context.Context, *Request) (Dumper, *syserr.Error) {
+	return &familyDump{families: families()}, nil
 }
+
+// familyDump sends the registered families, as many as each chunk holds.
+type familyDump struct {
+	families []*Family
+}
+
+// DumpChunk implements Dumper.DumpChunk.
+func (d *familyDump) DumpChunk(_ context.Context, chunk *Chunk) (bool, *syserr.Error) {
+	for len(d.families) > 0 {
+		fillFamily(chunk.Message(ctrlCmdNewFamily), d.families[0])
+		if chunk.Size() > chunk.Limit() && chunk.Count() > 1 {
+			chunk.Discard()
+			return true, nil
+		}
+		d.families = d.families[1:]
+	}
+	return false, nil
+}
+
+// DumpDone implements Dumper.DumpDone.
+func (d *familyDump) DumpDone() { d.families = nil }
 
 // fillFamily adds the attributes of ctrl_fill_info to m. The family has no
 // multicast groups, so the message has no CTRL_ATTR_MCAST_GROUPS.

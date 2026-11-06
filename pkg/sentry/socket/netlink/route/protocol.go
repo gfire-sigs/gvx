@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
@@ -259,16 +260,23 @@ func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Sta
 	if i.Flags&linux.IFF_UP != 0 {
 		operState = linux.IF_OPER_UP
 	}
+	if kindState, ok := netstack.LinkOperState(i.Kind, i.Flags); ok {
+		operState = kindState
+	}
 	m.PutAttr(linux.IFLA_OPERSTATE, primitive.AllocateUint8(operState))
 
-	mac := make([]byte, 6)
-	brd := mac
-	if len(i.Addr) > 0 {
-		mac = i.Addr
-		brd = bytes.Repeat([]byte{0xff}, len(i.Addr))
+	// A link of type ARPHRD_NONE has no link-layer address, so Linux sends
+	// neither IFLA_ADDRESS nor IFLA_BROADCAST, and "ip link" prints "link/none".
+	if !netstack.LinkHasNoLinkLayer(i.Kind) || len(i.Addr) > 0 {
+		mac := make([]byte, 6)
+		brd := mac
+		if len(i.Addr) > 0 {
+			mac = i.Addr
+			brd = bytes.Repeat([]byte{0xff}, len(i.Addr))
+		}
+		m.PutAttr(linux.IFLA_ADDRESS, primitive.AsByteSlice(mac))
+		m.PutAttr(linux.IFLA_BROADCAST, primitive.AsByteSlice(brd))
 	}
-	m.PutAttr(linux.IFLA_ADDRESS, primitive.AsByteSlice(mac))
-	m.PutAttr(linux.IFLA_BROADCAST, primitive.AsByteSlice(brd))
 	if i.Master != 0 {
 		m.PutAttr(linux.IFLA_MASTER, primitive.AllocateUint32(i.Master))
 	}
