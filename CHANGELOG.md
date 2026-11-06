@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
+- **Memory limit of a sandbox**: `Resources.MemoryBytes` now counts only the memory of its own sandbox. The limit counted the memory of every sandbox in the process, so an SDK user that ran several sandboxes in one process saw `ErrMemoryLimit` in a sandbox that stayed far below its limit.
 - **Windows `systrap`**: a guest no longer stops with "the stub trapped from unknown slot" when one thread makes a system call while another thread changes the memory of the same code page. The Sentry kept no record of a freed trampoline slot, so it could not decode a trap that a thread published just before the free. A freed slot now keeps its record until a new slot reuses its bytes.
 
 ## [v0.9.10002026110200] - 2026-11-06
