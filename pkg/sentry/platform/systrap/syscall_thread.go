@@ -103,6 +103,11 @@ func (t *syscallThread) init(seccompNotify bool) error {
 		return err
 	}
 
+	if err = t.setStubGSBase(); err != nil {
+		t.destroy()
+		return err
+	}
+
 	if seccompNotify && seccompNotifyIsSupported {
 		if t.seccompNotify, err = t.installSeccompNotifyIfFree(); err != nil {
 			t.destroy()
