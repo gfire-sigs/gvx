@@ -222,36 +222,92 @@ func TestFDBLimit(t *testing.T) {
 	}
 }
 
-func TestFDBHardLimit(t *testing.T) {
+// TestFDBHasNoLimitByDefault adds more entries than the old fixed table size.
+// Linux sets vxlan->cfg.addrmax to 0 by default, and vxlan_fdb_create then
+// accepts every entry.
+func TestFDBHasNoLimitByDefault(t *testing.T) {
 	var tb fdb
 	now := time.Now()
 	r := Remote{IP: ip4(10, 0, 0, 1)}
 	mac := func(i int) tcpip.LinkAddress {
 		return tcpip.LinkAddress([]byte{2, 0, 0, byte(i >> 16), byte(i >> 8), byte(i)})
 	}
-	for i := range MaxFDBEntries {
-		// A link limit above the hard limit has no effect.
-		if err := tb.update(mac(i), NUDPermanent, 0, r, UpdateMode{Create: true}, now, 0, 1<<31); err != nil {
+	const count = 70000
+	for i := range count {
+		if err := tb.update(mac(i), NUDPermanent, 0, r, UpdateMode{Create: true}, now, 0, 0); err != nil {
 			t.Fatalf("entry %d: %v", i, err)
 		}
 	}
-	if err := tb.update(mac(MaxFDBEntries), NUDPermanent, 0, r, UpdateMode{Create: true}, now, 0, 0); !errors.Is(err, ErrNoSpace) {
-		t.Errorf("entry %d = %v, want ErrNoSpace", MaxFDBEntries, err)
+	if !tb.learn(mac(count), r, 0, now, 0) {
+		t.Error("learning in a large table dropped the frame")
+	}
+	if got := len(tb.entries); got != count+1 {
+		t.Errorf("entries = %d, want %d", got, count+1)
 	}
 }
 
-func TestRemoteLimit(t *testing.T) {
+// TestEndpointLimitCountsTheGroupEntry creates a link with IFLA_VXLAN_LIMIT=3
+// and a default remote. The all-zeros entry of the remote counts, as every
+// vxlan_fdb_create call counts in vxlan->addrcnt, so two more entries fit.
+func TestEndpointLimitCountsTheGroupEntry(t *testing.T) {
+	s := singleNode(t, 1514, ip4(10, 0, 0, 1))
+	ep, err := New(s, Config{ID: 2, VNI: 1, Link: 1, Group: ip4(10, 0, 0, 9), Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ep.Close()
+	mac := func(i int) tcpip.LinkAddress { return tcpip.LinkAddress([]byte{2, 0, 0, 0, 0, byte(i)}) }
+	create := UpdateMode{Create: true, Excl: true}
+	for i := range 2 {
+		if err := ep.FDBUpdate(mac(i), NUDPermanent, NTFSelf, Remote{IP: ip4(10, 0, 0, 2)}, create); err != nil {
+			t.Fatalf("entry %d: %v", i, err)
+		}
+	}
+	if err := ep.FDBUpdate(mac(2), NUDPermanent, NTFSelf, Remote{IP: ip4(10, 0, 0, 2)}, create); !errors.Is(err, ErrNoSpace) {
+		t.Errorf("fourth entry with limit 3 = %v, want ErrNoSpace", err)
+	}
+	if err := ep.FDBDelete(mac(0), Remote{IP: ip4(10, 0, 0, 2)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ep.FDBUpdate(mac(2), NUDPermanent, NTFSelf, Remote{IP: ip4(10, 0, 0, 2)}, create); err != nil {
+		t.Errorf("entry after a delete = %v, want success", err)
+	}
+}
+
+// TestFDBLimitAboveTheOldCapApplies sets a limit above the old fixed table
+// size. The limit is the only cap, so the table stops at the limit.
+func TestFDBLimitAboveTheOldCapApplies(t *testing.T) {
 	var tb fdb
 	now := time.Now()
-	for i := range MaxRemotes {
+	r := Remote{IP: ip4(10, 0, 0, 1)}
+	mac := func(i int) tcpip.LinkAddress {
+		return tcpip.LinkAddress([]byte{2, 0, 0, byte(i >> 16), byte(i >> 8), byte(i)})
+	}
+	const limit = 70000
+	for i := range limit {
+		if err := tb.update(mac(i), NUDPermanent, 0, r, UpdateMode{Create: true}, now, 0, limit); err != nil {
+			t.Fatalf("entry %d: %v", i, err)
+		}
+	}
+	if err := tb.update(mac(limit), NUDPermanent, 0, r, UpdateMode{Create: true}, now, 0, limit); !errors.Is(err, ErrNoSpace) {
+		t.Errorf("entry %d with limit %d = %v, want ErrNoSpace", limit, limit, err)
+	}
+}
+
+// TestEntryHasNoRemoteLimit appends more remotes than the old fixed list
+// size. Linux appends one vxlan_rdst per remote without a cap.
+func TestEntryHasNoRemoteLimit(t *testing.T) {
+	var tb fdb
+	now := time.Now()
+	const count = 3000
+	for i := range count {
 		r := Remote{IP: tcpip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})}
 		if err := tb.update(zeroMAC, NUDPermanent, 0, r, UpdateMode{Create: true, Append: true}, now, 0, 0); err != nil {
 			t.Fatalf("remote %d: %v", i, err)
 		}
 	}
-	r := Remote{IP: tcpip.AddrFrom4([4]byte{10, 1, 0, 0})}
-	if err := tb.update(zeroMAC, NUDPermanent, 0, r, UpdateMode{Create: true, Append: true}, now, 0, 0); !errors.Is(err, ErrNoSpace) {
-		t.Errorf("remote %d = %v, want ErrNoSpace", MaxRemotes, err)
+	if got := len(tb.entries[zeroMAC].remotes); got != count {
+		t.Errorf("remotes = %d, want %d", got, count)
 	}
 }
 

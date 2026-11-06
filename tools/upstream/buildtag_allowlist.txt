@@ -167,6 +167,8 @@ seam pkg/sentry/syscalls/linux/sys_syslog.go
 seam pkg/sentry/syscalls/linux/linux64.go
 # A target that logs the interfaces of a packet runs through InterfaceTarget
 # (pkg/tcpip/stack/iptables_target_xplat.go). The seam is one call in checkRule.
+# The OUTPUT and PREROUTING hooks drop a packet that needs a new connection when the table is
+# full (pkg/tcpip/stack/conntrack_limits_xplat.go). The seam is one call in each hook.
 seam pkg/tcpip/stack/iptables.go
 
 # Content seams: the service data path of a Kubernetes node (GVXIP-005, P2).
@@ -180,6 +182,9 @@ seam pkg/tcpip/stack/bridge.go
 seam pkg/tcpip/stack/packet_buffer.go
 # A SYN on a TCP connection in TIME_WAIT or CLOSE starts a new connection
 # (pkg/tcpip/stack/conntrack_xplat.go). The seam is one call in getConnAndUpdate.
+# Each connection has the timeout of its state (pkg/tcpip/stack/conntrack_proto_xplat.go) and
+# counts against nf_conntrack_max (pkg/tcpip/stack/conntrack_limits_xplat.go). The seams are the
+# fields of conn and ConnTrack, trackPacket, and the release of a removed connection.
 seam pkg/tcpip/stack/conntrack.go
 # A reply that the stack sends for a packet from another NIC uses the weak host model of Linux
 # (pkg/tcpip/stack/route_xplat.go). The seam is one call in FindRoute. The delivery of a forwarded
@@ -207,6 +212,14 @@ seam pkg/sentry/socket/netlink/netfilter/protocol.go
 # sends no acknowledgement after an error message that a handler wrote itself, as the subsystem
 # IPSET does (pkg/sentry/socket/netlink/netfilter/ipset_xplat.go).
 seam pkg/sentry/socket/netlink/socket.go
+
+# Content seams: the neighbor tables obey gc_thresh1 to gc_thresh3 as Linux does
+# (pkg/tcpip/stack/neighbor_gc_xplat.go). The neighbor cache asks the table of the stack before it
+# adds a dynamic entry, a NIC that goes away leaves the table (one call in remove, nic.go, under the
+# seam above), and the dynamic count of a cache is atomic. The stack_state_autogen.go change follows
+# that count type.
+seam pkg/tcpip/stack/neighbor_cache.go
+seam pkg/tcpip/stack/stack_state_autogen.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin

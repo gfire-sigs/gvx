@@ -36,6 +36,9 @@
 //	nodeprobe wglimits               check the rules and limits of the wireguard link
 //	nodeprobe vxlan                  check the vxlan link, neighbors, and the FDB
 //	                                 with the calls of flannel between two namespaces
+//	nodeprobe neighgc                check gc_thresh1 to gc_thresh3 of the neighbor
+//	                                 tables and their effect on dynamic entries
+//	nodeprobe recentparams           check the module parameters of xt_recent
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
 //	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
 //	                                 the end of the input, and check that it stays
@@ -139,6 +142,10 @@ func main() {
 			os.Exit(2)
 		}
 		checks = mtuSetChecks(os.Args[2])
+	case "neighgc":
+		checks = neighGCChecks()
+	case "recentparams":
+		checks = recentParamChecks()
 	case "tput":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe tput HOST:PORT MIB")

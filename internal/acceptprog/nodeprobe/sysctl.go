@@ -104,7 +104,21 @@ var storedSysctls = []storedSysctl{
 	{path: "/proc/sys/net/netfilter/nf_conntrack_max", def: "262144", write: "131072", want: "131072", invalid: []string{"x"}},
 	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established", def: "432000", write: "86400", want: "86400", invalid: []string{"x"}},
 	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait", def: "60", write: "3600", want: "3600", invalid: []string{"x"}},
-	{path: "/sys/module/nf_conntrack/parameters/hashsize", def: "65536", write: "32768", want: "32768", invalid: []string{"0", "x"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent", def: "120", write: "30", want: "30", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_recv", def: "60", write: "20", want: "20", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait", def: "120", write: "40", want: "40", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_last_ack", def: "30", write: "9", want: "9", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait", def: "120", write: "50", want: "50", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close", def: "10", write: "3", want: "3", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_max_retrans", def: "300", write: "100", want: "100", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_unacknowledged", def: "300", write: "100", want: "100", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_tcp_max_retrans", def: "3", write: "7", want: "7", invalid: []string{"x", "-1", "256"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_udp_timeout", def: "30", write: "12", want: "12", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream", def: "120", write: "60", want: "60", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_icmp_timeout", def: "30", write: "10", want: "10", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_icmpv6_timeout", def: "30", write: "10", want: "10", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/proc/sys/net/netfilter/nf_conntrack_generic_timeout", def: "600", write: "300", want: "300", invalid: []string{"x", "-1", "8589935"}},
+	{path: "/sys/module/nf_conntrack/parameters/hashsize", def: "16384", write: "32768", want: "32768", invalid: []string{"0", "x"}},
 }
 
 func storedSysctlChecks() []check {

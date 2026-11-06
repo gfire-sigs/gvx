@@ -49,15 +49,12 @@ func (s *Stack) NeighborLookup(nicID tcpip.NICID, protocol tcpip.NetworkProtocol
 	return entry.mu.neigh, true, nil
 }
 
-// StaticNeighborCount returns the count of static entries in the neighbor table
-// of a NIC. The table does not bound them, so callers that add entries on
-// behalf of a guest use the count to bound them.
-func (s *Stack) StaticNeighborCount(nicID tcpip.NICID, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	n, err := s.neighborCacheOf(nicID, protocol)
-	if err != nil {
-		return 0, err
+// unregisterNeighborCaches removes the neighbor caches of the NIC from the
+// neighbor tables of the stack, so the entries of a removed link stop counting.
+func (n *nic) unregisterNeighborCaches() {
+	for protocol, l := range n.linkAddrResolvers {
+		if t := n.stack.neighborTables.of(protocol); t != nil {
+			t.unregister(&l.neigh)
+		}
 	}
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return len(n.mu.cache) - int(n.mu.dynamic.count), nil
 }

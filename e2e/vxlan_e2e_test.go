@@ -39,13 +39,13 @@ func TestE2EVxlanA13OneSandbox(t *testing.T) {
 		requireNodeChecks(t, code, out,
 			"namespaces-and-veth", "flannel-links-report-kind-mtu-and-attributes", "link-attributes-round-trip",
 			"invalid-and-duplicate-requests-fail", "changing-an-existing-link-is-refused",
-			"mtu-stays-in-the-range-of-the-link", "fdb-limit-answers-enospc",
+			"mtu-stays-in-the-range-of-the-link", "fdb-limit-answers-enospc", "fdb-and-remotes-have-no-default-cap",
 			"flannel-setup-adds-neighbor-fdb-and-onlink-route",
 			"neighbor-and-fdb-lists-return-what-was-set", "ping-crosses-the-vxlan",
 			"ping-with-the-full-mtu-crosses-the-vxlan", "tcp-transfer-crosses-the-vxlan",
 			"neighbor-requests-follow-linux", "fdb-requests-follow-linux", "deleting-the-fdb-entry-stops-the-traffic",
 			"all-zeros-entry-carries-unknown-destinations", "learning-link-learns-the-peer",
-			"deleting-the-link-frees-the-port", "neighbor-table-is-bounded", "namespaces-end")
+			"deleting-the-link-frees-the-port", "static-neighbors-have-no-limit", "namespaces-end")
 	})
 }
 

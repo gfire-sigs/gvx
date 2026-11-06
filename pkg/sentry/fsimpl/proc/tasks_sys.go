@@ -157,7 +157,9 @@ func sysSubdirs(path string) []string {
 	case "net":
 		return []string{"ipv4", "core", "ipv6", "bridge", "netfilter"}
 	case "net/ipv4", "net/ipv6":
-		return []string{"conf"}
+		return []string{"conf", "neigh"}
+	case "net/ipv4/neigh", "net/ipv6/neigh":
+		return []string{"default"}
 	case "net/ipv4/conf", "net/ipv6/conf":
 		return []string{"all", "default"}
 	default:

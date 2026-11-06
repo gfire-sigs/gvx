@@ -971,6 +971,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		// namespace, which is the root namespace of the guest.
 		netfilter.SetStackLog(inetStack.Stack, kernelLogFunc(k))
 		defer netfilter.SetStackLog(inetStack.Stack, nil)
+		inetStack.InitConntrackLimit(nil)
 		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
 	}
 
@@ -1256,11 +1257,17 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 	stack := netstack.NewStack(st, c.k.UniqueID())
 	// Linux gives a new network namespace the IPv4 forwarding switches of the
 	// root namespace and the defaults for IPv6.
-	if root, ok := c.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
+	root, ok := c.k.RootNetworkNamespace().Stack().(*netstack.Stack)
+	if ok {
 		if err := stack.InheritForwarding(root); err != nil {
 			return nil, fmt.Errorf("gvx: copy the forwarding switches to a new network namespace: %w", err)
 		}
+		// The module parameters of xt_recent belong to the kernel, so all
+		// network namespaces share them.
+		netfilter.ShareRecentModule(st, root.Stack)
 	}
+	// nf_conntrack_max is one value for the kernel, as on Linux.
+	stack.InitConntrackLimit(root)
 	return stack, nil
 }
 

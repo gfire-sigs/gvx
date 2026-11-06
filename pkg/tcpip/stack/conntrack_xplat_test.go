@@ -17,6 +17,7 @@ package stack
 import (
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/faketime"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -37,18 +38,31 @@ type ctSegment struct {
 	fromClient bool
 	flags      header.TCPFlags
 	seq, ack   uint32
+	// payload is the number of data bytes.
+	payload int
+	// clientPort is the port of the client, or ctClientPort when it is 0.
+	clientPort uint16
+	// server is the address of the server, or ctServerAddr when it is empty.
+	server tcpip.Address
 }
 
 // ctPacket builds the IPv4 packet of a segment.
 func ctPacket(s ctSegment) *PacketBuffer {
 	src, dst := ctClientAddr, ctServerAddr
+	if s.server.Len() != 0 {
+		dst = s.server
+	}
 	srcPort, dstPort := uint16(ctClientPort), uint16(ctServerPort)
+	if s.clientPort != 0 {
+		srcPort = s.clientPort
+	}
 	if !s.fromClient {
 		src, dst = dst, src
 		srcPort, dstPort = dstPort, srcPort
 	}
 	pkt := NewPacketBuffer(PacketBufferOptions{
 		ReserveHeaderBytes: header.IPv4MinimumSize + header.TCPMinimumSize,
+		Payload:            buffer.MakeWithData(make([]byte, s.payload)),
 	})
 	tcp := header.TCP(pkt.TransportHeader().Push(header.TCPMinimumSize))
 	tcp.Encode(&header.TCPFields{
@@ -62,7 +76,7 @@ func ctPacket(s ctSegment) *PacketBuffer {
 	})
 	ip := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
 	ip.Encode(&header.IPv4Fields{
-		TotalLength: header.IPv4MinimumSize + header.TCPMinimumSize,
+		TotalLength: uint16(header.IPv4MinimumSize + header.TCPMinimumSize + s.payload),
 		Protocol:    uint8(header.TCPProtocolNumber),
 		TTL:         64,
 		SrcAddr:     src,

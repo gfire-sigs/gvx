@@ -424,11 +424,14 @@ func (it *IPTables) CheckPrerouting(pkt *PacketBuffer, addressEP AddressableEndp
 		return true
 	}
 
-	pkt.tuple = it.connections.getConnAndUpdate(pkt, false /* skipChecksumValidation */)
+	var full bool
+	if pkt.tuple, full = it.connections.trackPacket(pkt, false /* skipChecksumValidation */); full {
+		return false
+	}
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Prerouting, pkt, nil /* route */, addressEP, inNicName, "" /* outNicName */) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -468,7 +471,7 @@ func (it *IPTables) CheckInput(pkt *PacketBuffer, inNicName string) bool {
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Input, pkt, nil /* route */, nil /* addressEP */, inNicName, "" /* outNicName */) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -508,7 +511,7 @@ func (it *IPTables) CheckForward(pkt *PacketBuffer, inNicName, outNicName string
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Forward, pkt, nil /* route */, nil /* addressEP */, inNicName, outNicName) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -552,11 +555,14 @@ func (it *IPTables) CheckOutput(pkt *PacketBuffer, r *Route, outNicName string) 
 
 	// We don't need to validate the checksum in the Output path: we can assume
 	// we calculate it correctly, plus checksumming may be deferred due to GSO.
-	pkt.tuple = it.connections.getConnAndUpdate(pkt, true /* skipChecksumValidation */)
+	var full bool
+	if pkt.tuple, full = it.connections.trackPacket(pkt, true /* skipChecksumValidation */); full {
+		return false
+	}
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Output, pkt, r, nil /* addressEP */, "" /* inNicName */, outNicName) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 
@@ -592,7 +598,7 @@ func (it *IPTables) CheckPostrouting(pkt *PacketBuffer, r *Route, addressEP Addr
 
 	for _, table := range tables {
 		if !table.fn(it, table.table, Postrouting, pkt, r, addressEP, "" /* inNicName */, outNicName) {
-			return false
+			return it.connections.dropUnconfirmed(pkt)
 		}
 	}
 

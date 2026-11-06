@@ -397,11 +397,7 @@ var nodeSysctlSpecs = map[string][]*sysctlSpec{
 		{scope: scopeNet, name: "tcp_keepalive_probes", key: keepaliveProbesKey, def: "9", parse: intVecParser(1, 1, math.MaxInt32, nil), apply: applyKeepalive},
 		{scope: scopeNet, name: "tcp_fin_timeout", key: "ipv4/tcp_fin_timeout", def: "60", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyFinTimeout},
 	},
-	"net/netfilter": {
-		{scope: scopeNet, name: "nf_conntrack_max", key: "netfilter/nf_conntrack_max", def: "262144", parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil)},
-		{scope: scopeNet, name: "nf_conntrack_tcp_timeout_established", key: "netfilter/nf_conntrack_tcp_timeout_established", def: "432000", parse: intVecParser(1, 0, maxSysctlSeconds, nil)},
-		{scope: scopeNet, name: "nf_conntrack_tcp_timeout_close_wait", key: "netfilter/nf_conntrack_tcp_timeout_close_wait", def: "60", parse: intVecParser(1, 0, maxSysctlSeconds, nil)},
-	},
+	"net/netfilter": conntrackNetfilterSysctls,
 }
 
 const (
@@ -474,6 +470,7 @@ func (fs *filesystem) addNodeSysctlFiles(ctx context.Context, root *auth.Credent
 	for _, spec := range nodeSysctlSpecs[path] {
 		files[spec.name] = fs.newInode(ctx, root, 0644, &sysctlFile{spec: spec})
 	}
+	fs.addConntrackFiles(ctx, root, stack, path, files)
 	switch path {
 	case "kernel":
 		for name, inode := range fs.kmsgSysctlFiles(ctx, root) {

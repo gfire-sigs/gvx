@@ -384,3 +384,30 @@ func (w lineWatcher) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// TestE2ENodeKernelNeighborGCThresholds checks gc_thresh1 to gc_thresh3 of the
+// ARP and ND tables. The files start at 128, 512, and 1024, take 0 to 2147483647,
+// belong to the network namespace, and gc_thresh3 stops the dynamic entries of
+// the table while static entries do not count.
+func TestE2ENodeKernelNeighborGCThresholds(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, nil, "neighgc")
+		requireNodeChecks(t, code, out,
+			"gc-thresh-files-start-at-the-linux-defaults", "gc-thresh-files-accept-0-to-int-max",
+			"gc-thresh-files-belong-to-the-network-namespace", "link-and-sender",
+			"dynamic-entries-stop-at-gc-thresh3-and-static-entries-do-not-count", "namespaces-end")
+	})
+}
+
+// TestE2ENodeKernelXtRecentParameters checks ip_list_tot and ip_pkt_list_tot of
+// xt_recent in /sys/module/xt_recent/parameters: the defaults, mode 0400, the
+// values that recent_mt_init refuses, and the write of root while no list exists.
+func TestE2ENodeKernelXtRecentParameters(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, nil, "recentparams")
+		requireNodeChecks(t, code, out,
+			"parameters-start-at-the-linux-defaults", "parameters-have-mode-0400",
+			"values-that-recent_mt_init-refuses-fail-with-einval", "values-above-32-bits-fail-with-erange",
+			"root-writes-while-no-list-exists", "a-child-namespace-reads-the-same-values")
+	})
+}
