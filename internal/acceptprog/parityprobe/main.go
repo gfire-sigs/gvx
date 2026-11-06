@@ -108,6 +108,15 @@ func main() {
 			os.Exit(2)
 		}
 		hogMain(size*mib, os.Args[3] == "hold")
+	case "overlay-owner-child":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: parityprobe overlay-owner-child DIR")
+			os.Exit(2)
+		}
+		if err := overlayOwnerChild(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "overlay-owner-child:", err)
+			os.Exit(1)
+		}
 	case "ids":
 		fmt.Printf("uid=%d euid=%d\n", os.Getuid(), os.Geteuid())
 	case "sleep":

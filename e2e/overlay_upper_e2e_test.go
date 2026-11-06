@@ -40,6 +40,7 @@ var overlayUpperSteps = []string{
 	"overlay-rename-over-deleted", "overlay-rename-lower-file",
 	"overlay-opaque-directory", "overlay-copy-up-write", "overlay-hardlink-copy-up",
 	"overlay-awkward-names", "overlay-final-view", "overlay-umount", "overlay-exec-from-layers",
+	"overlay-nonroot-owns-new-files",
 }
 
 // overlayVerifySteps lists the steps that run after a new mount.
