@@ -99,8 +99,8 @@ loop:
 	MOVD R3, ret+16(FP)
 	RET
 
-// func asmProbeSIMDARM64(in, out *[32][2]uint64, faultPage uint64)
-TEXT ·asmProbeSIMDARM64(SB), NOSPLIT, $0-24
+// func asmProbeSIMDARM64(in, out *[32][2]uint64, faultPage uint64) (fpcr uint64)
+TEXT ·asmProbeSIMDARM64(SB), NOSPLIT, $0-32
 	MOVD in+0(FP), R0
 	FLDPQ 0(R0), (F0, F1)
 	FLDPQ 32(R0), (F2, F3)
@@ -125,6 +125,24 @@ TEXT ·asmProbeSIMDARM64(SB), NOSPLIT, $0-24
 	MOVD faultPage+16(FP), R1
 	MOVD $0xdeadbeef, R2
 	MOVD R2, (R1)
+	// Signal while V0..V31 and a non-default FPCR are live. The Go runtime
+	// handles SIGURG and returns with rt_sigreturn, which must restore both.
+	MOVD $0x00400000, R5 // FPCR.RMode: round towards plus infinity.
+	WORD $0xd51b4405     // MSR FPCR, X5
+	MOVD $172, R8        // getpid
+	SVC  $0
+	MOVD R0, R9
+	MOVD $178, R8        // gettid
+	SVC  $0
+	MOVD R0, R1
+	MOVD R9, R0
+	MOVD $23, R2         // SIGURG
+	MOVD $131, R8        // tgkill
+	SVC  $0
+	WORD $0xd53b4405     // MRS X5, FPCR
+	MOVD R5, fpcr+24(FP)
+	MOVD $0, R5
+	WORD $0xd51b4405     // MSR FPCR, X5
 	MOVD out+8(FP), R0
 	FSTPQ (F0, F1), 0(R0)
 	FSTPQ (F2, F3), 32(R0)

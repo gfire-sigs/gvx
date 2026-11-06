@@ -164,8 +164,8 @@ func (w *vcpuWorker) invalidateState() {
 // loads all registers: ac stays the single source of truth.
 func (w *vcpuWorker) loadContext(comm *CommPage, ac *arch.Context64) error {
 	fp := *ac.FloatingPointData()
-	if len(fp) < fpStateSize {
-		return fmt.Errorf("hvf: floating point state has %d bytes, want %d", len(fp), fpStateSize)
+	if len(fp) < arch.FPSIMDBodySize {
+		return fmt.Errorf("hvf: floating point state has %d bytes, want %d", len(fp), arch.FPSIMDBodySize)
 	}
 	r := &ac.StateData().Regs
 	comm.Regs = r.Regs
@@ -173,9 +173,9 @@ func (w *vcpuWorker) loadContext(comm *CommPage, ac *arch.Context64) error {
 	comm.PC = r.Pc
 	comm.Pstate = r.Pstate & pstateUserMask
 	comm.TLS = r.TPIDR_EL0
-	copy(vregBytes(comm), fp[:vregsSize])
-	comm.FPSR = uint64(nativeUint32(fp[vregsSize:]))
-	comm.FPCR = uint64(nativeUint32(fp[vregsSize+4:]))
+	copy(vregBytes(comm), fp[arch.FPSIMDOffV:arch.FPSIMDOffV+vregsSize])
+	comm.FPSR = uint64(nativeUint32(fp[arch.FPSIMDOffFPSR:]))
+	comm.FPCR = uint64(nativeUint32(fp[arch.FPSIMDOffFPCR:]))
 	return nil
 }
 
@@ -188,15 +188,13 @@ func (w *vcpuWorker) storeContext(comm *CommPage, ac *arch.Context64) {
 	r.Pstate = comm.Pstate & pstateUserMask
 	r.TPIDR_EL0 = comm.TLS
 	fp := *ac.FloatingPointData()
-	copy(fp[:vregsSize], vregBytes(comm))
-	putNativeUint32(fp[vregsSize:], uint32(comm.FPSR))
-	putNativeUint32(fp[vregsSize+4:], uint32(comm.FPCR))
+	copy(fp[arch.FPSIMDOffV:arch.FPSIMDOffV+vregsSize], vregBytes(comm))
+	putNativeUint32(fp[arch.FPSIMDOffFPSR:], uint32(comm.FPSR))
+	putNativeUint32(fp[arch.FPSIMDOffFPCR:], uint32(comm.FPCR))
 }
 
-const (
-	vregsSize   = 32 * 16
-	fpStateSize = vregsSize + 8 // V0..V31, FPSR, FPCR.
-)
+// vregsSize is the size of V0 to V31.
+const vregsSize = 32 * 16
 
 func vregBytes(comm *CommPage) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&comm.VRegs[0])), vregsSize)

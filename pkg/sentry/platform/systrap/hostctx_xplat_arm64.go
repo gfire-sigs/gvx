@@ -115,13 +115,12 @@ func (c *hostContext) setSingleStep(on bool) {
 	c.put32(ctxOffCpsr, v)
 }
 
-// fpsimdOffV is the offset of V0 inside the Linux fpsimd_context that
-// arch.Context64 keeps. The head has the magic and the size, then Fpsr and
-// Fpcr follow.
+// The offsets of FPSR, FPCR, and V0 in the floating point state of
+// arch.Context64. See arch.FPSIMDOffFPSR.
 const (
-	fpStateOffFpsr = 8
-	fpStateOffFpcr = 12
-	fpStateOffV    = 16
+	fpStateOffFpsr = arch.FPSIMDOffFPSR
+	fpStateOffFpcr = arch.FPSIMDOffFPCR
+	fpStateOffV    = arch.FPSIMDOffV
 )
 
 // copyFPFromArch copies V0..V31, FPSR, and FPCR from ac into vec (512 bytes).

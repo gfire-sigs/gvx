@@ -40,7 +40,7 @@ func asmSetTPIDRARM64(val uint64)
 func asmSetX18ARM64(val uint64)
 func asmReadX18ARM64() uint64
 func asmBenchTEBARM64(teb uint64, iters int) uint64
-func asmProbeSIMDARM64(in, out *[32][2]uint64, faultPage uint64)
+func asmProbeSIMDARM64(in, out *[32][2]uint64, faultPage uint64) (fpcr uint64)
 func asmCallEntryARM64(fn uintptr, arg, teb uint64) uint64
 func asmFlushICacheARM64(addr uintptr)
 
@@ -147,13 +147,16 @@ func probeSIMDFP() (string, string, error) {
 		in[i][0] = 0xa5a5a5a500000000 | uint64(i*2+1)
 		in[i][1] = 0x5a5a5a5a00000000 | uint64(i*2+2)
 	}
-	asmProbeSIMDARM64(&in, &out, uint64(uintptr(unsafe.Pointer(&faultMem[0]))))
+	fpcr := asmProbeSIMDARM64(&in, &out, uint64(uintptr(unsafe.Pointer(&faultMem[0]))))
 	if out != in {
 		return "", "", fmt.Errorf("V0..V31 mismatch: got %v want %v", out, in)
 	}
+	if fpcr != 0x00400000 {
+		return "", "", fmt.Errorf("FPCR after a signal = %#x, want 0x400000", fpcr)
+	}
 	xor := (out[0][0] & 0xffffffff00000000) | ((out[15][1] >> 32) & 0xffffffff)
 	digest := fmt.Sprintf("simd:128bit:lanes=ok:svc=ok:fault=ok:xor=%#016x", xor)
-	return digest, "V0..V31 128-bit NEON registers preserved across SVC and page fault", nil
+	return digest, "V0..V31 128-bit NEON registers and FPCR preserved across SVC, page fault, and signal", nil
 }
 
 func peMachineCode() (uint16, []byte) {

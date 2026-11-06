@@ -105,21 +105,33 @@ func signalFrameTrailer(esr uint64, haveESR bool) [sigFrameTrailerSize]byte {
 
 // fpStateToSignalFrame writes the floating point registers of c, and the
 // record header that Linux writes, into the reserved area of a signal frame.
-// The memory layout of fpu.State is the layout of struct fpsimd_context, so the
-// copy is one marshal call.
+// fpu.State holds the record body without the header; see
+// FPSIMDOffFPSR.
 func (c *Context64) fpStateToSignalFrame(frame *FpsimdContext) {
-	frame.UnmarshalBytes(c.fpState)
+	s := c.fpState
 	frame.Head = aarch64Ctx{Magic: fpsimdMagic, Size: fpsimdContextSize}
+	if len(s) < FPSIMDBodySize {
+		return
+	}
+	frame.Fpsr = binary.LittleEndian.Uint32(s[FPSIMDOffFPSR:])
+	frame.Fpcr = binary.LittleEndian.Uint32(s[FPSIMDOffFPCR:])
+	for i := range frame.Vregs {
+		frame.Vregs[i] = binary.LittleEndian.Uint64(s[FPSIMDOffV+8*i:])
+	}
 }
 
 // fpStateFromSignalFrame reads the floating point registers from the reserved
 // area of a signal frame into state. It keeps state unchanged when the frame
 // has no valid fpsimd record, as Linux ignores a frame without one.
 func fpStateFromSignalFrame(state fpu.State, frame *FpsimdContext) {
-	if frame.Head.Magic != fpsimdMagic || frame.Head.Size != fpsimdContextSize {
+	if frame.Head.Magic != fpsimdMagic || frame.Head.Size != fpsimdContextSize || len(state) < FPSIMDBodySize {
 		return
 	}
-	frame.MarshalBytes(state)
+	binary.LittleEndian.PutUint32(state[FPSIMDOffFPSR:], frame.Fpsr)
+	binary.LittleEndian.PutUint32(state[FPSIMDOffFPCR:], frame.Fpcr)
+	for i, v := range frame.Vregs {
+		binary.LittleEndian.PutUint64(state[FPSIMDOffV+8*i:], v)
+	}
 }
 
 // layoutTaskSize returns the largest address space size with an address layout

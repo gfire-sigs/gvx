@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **arm64 floating point state after a signal**: in `v0.10.10002026110200` a signal and its `sigreturn` corrupted the floating point registers of an arm64 guest. On a Linux host, FPSR and FPCR became `0x46508001` and `0x210`, so the divide-by-zero trap was on and `1.0/0.0` raised `SIGFPE` on a CPU that traps. On macOS, the low 64 bits of V0 changed. The signal frame code read the floating point state as a whole `fpsimd_context` record, but the platforms keep only its body, and `hvf` kept V0 to V31 first. Every arm64 platform now keeps FPSR, FPCR, and V0 to V31 in this order, and the signal frame code converts the fields one by one. `rungv` with `systrap` inside a `gvx` guest on arm64 also gets the right floating point state in its stub.
+
 ## [v0.10.10002026110200] - 2026-11-07
 
 This release runs `rungv` with the `systrap` engine inside a `gvx` guest on Linux amd64 and arm64, and inside upstream `runsc` on Linux amd64. The guest kernel now gives the signal frames, the fault information, the mmap errors, and the ptrace behavior that an inner Sentry needs, as Linux does.
