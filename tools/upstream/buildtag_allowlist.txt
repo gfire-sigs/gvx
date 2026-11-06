@@ -323,3 +323,15 @@ seam pkg/tcpip/transport/internal/network/endpoint.go
 # (pkg/tcpip/stack/proxyarp_xplat.go).
 seam pkg/sentry/socket/netfilter/targets.go
 seam pkg/tcpip/network/arp/arp.go
+
+# Content seams for a Sentry that runs inside another Sentry (docs/cli.md, section 11). The host
+# address space size is a search (pkg/abi/linux/mm_tasksize_xplat.go). An unaligned MAP_FIXED
+# mapping above the task size fails with ENOMEM, as in Linux. The arm64 signal frame holds the
+# fpsimd record, the ESR record, and the end marker (pkg/sentry/arch/signal_arm64_fpsimd_xplat.go).
+# The sysmsg thread may wake the Sentry with any val3.
+seam pkg/abi/linux/mm.go
+seam pkg/sentry/mm/syscalls.go
+seam pkg/sentry/arch/arch_aarch64.go
+seam pkg/sentry/arch/arch_arm64.go
+seam pkg/sentry/arch/signal_arm64.go
+seam pkg/sentry/platform/systrap/stubfilter/stubfilter.go
