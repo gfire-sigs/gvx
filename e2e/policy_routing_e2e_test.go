@@ -157,6 +157,11 @@ echo GET-UNREACHABLE $(ip route get 10.42.8.5 2>&1 | head -1)
 echo GET-PROHIBIT $(ip route get 10.42.9.5 2>&1 | head -1)
 echo DIAL-BLOCK-NEIGHBOR $(python3 /tmp/dial.py 10.42.7.70 0)
 if ip route add blackhole 10.42.7.0/26 2>/tmp/err; then bad "duplicate blackhole accepted"; else echo ROUTE-DUP $(cat /tmp/err); fi
+# fib_check_nh() refuses a gateway that a route of another type covers, and takes
+# one that a unicast route of another table covers.
+if ip route add 10.79.0.0/24 via 10.42.7.5 2>/tmp/err; then bad "gateway behind a blackhole accepted"; else echo GW-BLACKHOLE $(cat /tmp/err); fi
+if ip route add 10.79.1.0/24 via 10.1.0.2 table 300 2>/tmp/err; then ok GW-OTHER-TABLE-OK; else echo FAIL "gateway of the table main for table 300: $(cat /tmp/err)"; fi
+ip route flush table 300
 if ip route add blackhole 10.42.11.0/26 dev a0 2>/tmp/err; then bad "blackhole with a device accepted"; else echo BLACKHOLE-DEV $(cat /tmp/err); fi
 
 # The router answers for a forwarded packet as Linux does.
@@ -240,6 +245,8 @@ func TestE2EPolicyRouting(t *testing.T) {
 			requireContains(t, "route get of the tunnel socket", field("WG-GET-MARKED"), "1.2.3.4 via 10.1.0.2 dev a0")
 			requireContains(t, "route get of the local subnet", field("WG-GET-LOCAL-SUBNET"), "10.1.0.2 dev a0")
 			requireContains(t, "route dump", field("ROUTES"), "blackhole 10.42.7.0/26", "unreachable 10.42.8.0/26", "prohibit 10.42.9.0/26 proto 80")
+			requireContains(t, "gateway behind a blackhole", field("GW-BLACKHOLE"), "Invalid argument")
+			requireContains(t, "gateway through another table", out, "GW-OTHER-TABLE-OK\n")
 			requireContains(t, "throw dump", field("THROW-DUMP"), "throw 10.42.10.0/26")
 			requireContains(t, "local sender", out,
 				"DIAL-BLACKHOLE errno 22 EINVAL\n", "DIAL-UNREACHABLE errno 113 EHOSTUNREACH\n", "DIAL-PROHIBIT errno 13 EACCES\n")

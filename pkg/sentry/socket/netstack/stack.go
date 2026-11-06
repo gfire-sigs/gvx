@@ -1067,10 +1067,25 @@ func (s *Stack) checkGateway(msg *nlmsg.Message, route *tcpip.Route) *syserr.Err
 	if gw.Unspecified() || header.IsV6LinkLocalUnicastAddress(gw) || rtMsg.Flags&linux.RTNH_F_ONLINK != 0 {
 		return nil
 	}
-	for _, rt := range s.Stack.GetRouteTable() {
-		if rt.Gateway.Unspecified() && (route.NIC == 0 || rt.NIC == route.NIC) && rt.Destination.Contains(gw) {
-			route.NIC = rt.NIC
-			return nil
+	// fib_check_nh() looks for the gateway in the table of the route first and
+	// in every table after that. A route that is not a unicast route, such as a
+	// blackhole, makes the gateway invalid.
+	routes := s.Stack.GetRouteTable()
+	for _, ownTable := range []bool{true, false} {
+		for _, rt := range routes {
+			if ownTable && rt.TableID() != route.TableID() {
+				continue
+			}
+			if !rt.Gateway.Unspecified() || !rt.Destination.Contains(gw) {
+				continue
+			}
+			if rt.RouteType() != tcpip.RouteTypeUnicast {
+				return syserr.ErrInvalidArgument
+			}
+			if route.NIC == 0 || rt.NIC == route.NIC {
+				route.NIC = rt.NIC
+				return nil
+			}
 		}
 	}
 	nics := s.Stack.NICInfo()
