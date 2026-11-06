@@ -101,16 +101,47 @@ func forEachNodeBackend(t *testing.T, body func(t *testing.T, b gateBackend, bin
 	}
 }
 
-// TestE2ENodeKernelA1DevKmsg checks that /dev/kmsg opens, that the seek calls
-// with offset 0 return 0 and the others fail as on Linux, that a non-blocking
-// read returns EAGAIN, and that a write returns its length.
+// TestE2ENodeKernelA1DevKmsg checks the kernel log of the guest: /dev/kmsg
+// (the record format, the position of each open file, the sequence of errors
+// EINVAL, EPIPE, and EAGAIN, blocking reads, poll, the three seek calls, the
+// write prefix, the rate limit, and the mode printk_devkmsg), syslog(2), the
+// sysctls of the log, and the access that kernel.dmesg_restrict controls.
 func TestE2ENodeKernelA1DevKmsg(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		code, out := runNodeProbe(t, b, bin, nil, "kmsg")
 		requireNodeChecks(t, code, out,
+			"kmsg-boot-messages-are-in-the-ring", "kmsg-first-record-has-sequence-0",
 			"kmsg-is-char-device-1-11", "kmsg-open-read-write", "kmsg-seek-end-returns-0",
 			"kmsg-seek-set-and-data-return-0", "kmsg-seek-with-offset-fails-with-espipe",
-			"kmsg-seek-with-invalid-whence-fails-with-einval", "kmsg-nonblocking-read-returns-eagain", "kmsg-poll-reports-no-record", "kmsg-write-returns-length")
+			"kmsg-seek-with-invalid-whence-fails-with-einval", "kmsg-nonblocking-read-returns-eagain",
+			"kmsg-write-returns-length", "kmsg-write-of-more-than-1024-bytes-fails-with-einval", "kmsg-pread-fails-with-espipe",
+			"kmsg-write-splits-lines-into-records-with-the-prefix", "kmsg-write-without-prefix-has-user-facility-and-level-4",
+			"kmsg-read-into-a-small-buffer-fails-with-einval-and-skips-the-record", "kmsg-read-of-an-escaped-record-is-at-most-2048-bytes",
+			"kmsg-each-open-file-has-its-own-position",
+			"kmsg-blocking-read-waits-for-a-record", "kmsg-poll-reports-a-record-and-is-never-writable",
+			"kmsg-ratelimit-allows-ten-writes-for-each-open-file", "kmsg-printk-devkmsg-off-refuses-opens-and-drops-writes-and-on-keeps-all",
+			"kmsg-sysctls-show-and-set-the-values", "kmsg-overwrite-returns-epipe-once-then-continues",
+			"kmsg-seek-data-follows-syslog-clear", "kmsg-dmesg-restrict-needs-cap-syslog-to-read",
+			"syslog-size-buffer-is-the-ring-size", "syslog-read-all-returns-the-text-form",
+			"syslog-read-all-returns-only-whole-records-that-fit", "syslog-read-all-with-a-null-buffer-fails-with-einval",
+			"syslog-unknown-command-fails-with-einval", "syslog-read-clear-returns-the-log-and-clears-it",
+			"syslog-clear-hides-the-records-from-read-all", "syslog-read-consumes-and-size-unread-counts",
+			"syslog-read-blocks-until-a-record-arrives", "syslog-console-commands-set-console-loglevel")
+	})
+}
+
+// TestE2ENodeKernelA1KernelLogSize checks that the tunable kernel.log_buf_len
+// sets the ring size that syslog(2) reports, rounded up to a power of two.
+func TestE2ENodeKernelA1KernelLogSize(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
+			tuned, err := cfg.Tuning.Set("kernel.log_buf_len", "300KiB")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Tuning = tuned
+		}, "kmsg-size", "524288")
+		requireNodeChecks(t, code, out, "syslog-size-buffer-follows-the-tunable")
 	})
 }
 

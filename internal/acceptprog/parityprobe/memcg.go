@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -52,6 +53,7 @@ func runMemcgChecks() bool {
 		{"memcg-oom-group-kills-every-task", checkMemcgOOMGroup},
 		{"memcg-kill-counts-in-cgroup-of-victim", checkMemcgKillCountsInVictimCgroup},
 		{"memcg-oom-group-of-child-kills-its-tasks", checkMemcgOOMGroupOfChild},
+		{"memcg-kill-writes-the-oom-report-to-the-kernel-log", checkMemcgOOMKernelLog},
 	}
 	// The sandbox does not enable controllers for the children of the root
 	// cgroup. The init script of docker:dind does it, and so does this write.
@@ -408,6 +410,107 @@ func checkMemcgOverLimitKills() error {
 		if n, err := controlValue("memory.events", key); err != nil || n == 0 {
 			return fmt.Errorf("memory.events %s = %d, %v; want at least 1", key, n, err)
 		}
+	}
+	return nil
+}
+
+// The expressions of utils/oomparser of cAdvisor and the first line of the report
+// of mm/oom_kill.c.
+var (
+	oomInvokedLine   = regexp.MustCompile(`^(.+) invoked oom-killer: gfp_mask=0xcc0\(GFP_KERNEL\), order=0, oom_score_adj=(-?[0-9]+)$`)
+	oomContainerLine = regexp.MustCompile(`oom-kill:constraint=(.*),nodemask=(.*),cpuset=(.*),mems_allowed=(.*),oom_memcg=(.*),task_memcg=(.*),task=(.*),pid=(.*),uid=(.*)`)
+	oomKilledLine    = regexp.MustCompile(`^Memory cgroup out of memory: Killed process ([0-9]+) \((.+)\) total-vm:([0-9]+)kB, anon-rss:([0-9]+)kB, file-rss:([0-9]+)kB, shmem-rss:([0-9]+)kB, UID:([0-9]+) pgtables:([0-9]+)kB oom_score_adj:(-?[0-9]+)$`)
+)
+
+// kmsgTexts reads /dev/kmsg without blocking until it has no record, and
+// returns the priority and text of each record.
+func kmsgTexts(fd int) (prios []int, texts []string, err error) {
+	buf := make([]byte, 8192)
+	for {
+		n, err := syscall.Read(fd, buf)
+		if errors.Is(err, syscall.EAGAIN) {
+			return prios, texts, nil
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		header, text, ok := strings.Cut(strings.TrimSuffix(string(buf[:n]), "\n"), ";")
+		if !ok {
+			return nil, nil, fmt.Errorf("read %q, want prio,seq,usec,flag;text", buf[:n])
+		}
+		prio, _, _ := strings.Cut(header, ",")
+		p, err := strconv.Atoi(prio)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read %q: %w", buf[:n], err)
+		}
+		prios = append(prios, p)
+		texts = append(texts, text)
+	}
+}
+
+// checkMemcgOOMKernelLog kills a hog through memory.max and looks for the
+// three lines that the OOM killer of Linux writes to the kernel log. The lines
+// must come in this order, with the levels of mm/oom_kill.c, and the three
+// expressions of the OOM parser of cAdvisor must match them.
+func checkMemcgOOMKernelLog() error {
+	if err := limitAbove(1, 32*mib); err != nil {
+		return err
+	}
+	fd, err := syscall.Open("/dev/kmsg", syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if _, err := syscall.Seek(fd, 0, io.SeekEnd); err != nil {
+		return err
+	}
+	h, err := startHog(128*mib, true)
+	if err != nil {
+		return err
+	}
+	defer h.stop()
+	pid := h.cmd.Process.Pid
+	if killed, err := h.waitKilled(); err != nil || !killed {
+		return fmt.Errorf("the hog did not end with SIGKILL: %v", err)
+	}
+	var prios []int
+	var texts []string
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p, t, err := kmsgTexts(fd)
+		if err != nil {
+			return err
+		}
+		prios, texts = append(prios, p...), append(texts, t...)
+		if len(texts) >= 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(texts) < 3 {
+		return fmt.Errorf("the kernel log has %d records after the kill, want the three OOM lines: %q", len(texts), texts)
+	}
+	first := oomInvokedLine.FindStringSubmatch(texts[0])
+	if first == nil || prios[0] != 4 {
+		return fmt.Errorf("first record %q with priority %d, want the invoked oom-killer line with priority 4", texts[0], prios[0])
+	}
+	comm := first[1]
+	container := oomContainerLine.FindStringSubmatch(texts[1])
+	if container == nil || prios[1] != 6 {
+		return fmt.Errorf("second record %q with priority %d, want the oom-kill line with priority 6", texts[1], prios[1])
+	}
+	if container[1] != "CONSTRAINT_MEMCG" || container[2] != "(null)" || container[3] != "memcgprobe" || container[4] != "0" || container[5] != "/memcgprobe" || container[6] != "/memcgprobe" || container[7] != comm || container[8] != strconv.Itoa(pid) || container[9] != strconv.Itoa(os.Getuid()) {
+		return fmt.Errorf("oom-kill line %q: want constraint CONSTRAINT_MEMCG, nodemask (null), cpuset memcgprobe, mems_allowed 0, oom_memcg and task_memcg /memcgprobe, task %s, pid %d, uid %d", texts[1], comm, pid, os.Getuid())
+	}
+	killed := oomKilledLine.FindStringSubmatch(texts[2])
+	if killed == nil || prios[2] != 3 {
+		return fmt.Errorf("third record %q with priority %d, want the Killed process line with priority 3", texts[2], prios[2])
+	}
+	if killed[1] != strconv.Itoa(pid) || killed[2] != comm {
+		return fmt.Errorf("Killed process line %q: want pid %d and comm %s", texts[2], pid, comm)
+	}
+	if rss, _ := strconv.ParseUint(killed[4], 10, 64); rss < mib/1024 {
+		return fmt.Errorf("Killed process line %q: anon-rss %d kB is below the 1 MiB that the hog held", texts[2], rss)
 	}
 	return nil
 }

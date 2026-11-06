@@ -1712,9 +1712,7 @@ func (s *syslog) StateTypeName() string {
 }
 
 func (s *syslog) StateFields() []string {
-	return []string{
-		"msg",
-	}
+	return []string{}
 }
 
 func (s *syslog) beforeSave() {}
@@ -1722,14 +1720,12 @@ func (s *syslog) beforeSave() {}
 // +checklocksignore
 func (s *syslog) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	stateSinkObject.Save(0, &s.msg)
 }
 
 func (s *syslog) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (s *syslog) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &s.msg)
 }
 
 func (t *Task) StateTypeName() string {

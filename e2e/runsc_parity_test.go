@@ -100,6 +100,7 @@ func TestE2EMemoryCgroupLimits(t *testing.T) {
 		"memcg-stat-counts-anonymous-memory", "memcg-under-limit-keeps-task", "memcg-over-limit-kills-task",
 		"memcg-over-limit-kills-largest-task-only", "memcg-oom-group-kills-every-task",
 		"memcg-kill-counts-in-cgroup-of-victim", "memcg-oom-group-of-child-kills-its-tasks",
+		"memcg-kill-writes-the-oom-report-to-the-kernel-log",
 	}
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {

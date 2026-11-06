@@ -87,6 +87,10 @@ var (
 	MemoryCgroupScanRatio = defineInt("memory.cgroup.scan_ratio", 4, 1, 1000, "ratio",
 		"The checks of memory.max use at most one over this number of a CPU.")
 
+	// KernelLogBufLen is the size of the ring of the kernel log.
+	KernelLogBufLen = defineSize("kernel.log_buf_len", 128*kib, 4*kib, 2*gib,
+		"Size of the guest kernel log ring that /dev/kmsg and dmesg read, rounded up to a power of two.")
+
 	// OCIMaxJSONBytes bounds each index, manifest, and config body.
 	OCIMaxJSONBytes = defineSize("oci.max_json_bytes", 8*mib, 64*kib, gib,
 		"Largest index, manifest, or config body that a pull accepts.")

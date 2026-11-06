@@ -381,7 +381,8 @@ func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, l
 // oomCandidate is a process that the OOM killer can end.
 type oomCandidate struct {
 	group *kernel.ThreadGroup
-	// id orders candidates of equal score.
+	// id is the ID of the process in the root PID namespace. It orders
+	// candidates of equal score.
 	id kernel.ThreadID
 	// rss is the resident set size of the process in bytes.
 	rss uint64
@@ -391,6 +392,17 @@ type oomCandidate struct {
 	// counts in its memory.events, as Linux counts it in the cgroup of the
 	// victim.
 	mem *memory
+	// The fields below only feed the lines that the kill writes to the kernel
+	// log.
+
+	// comm is the name of the process.
+	comm string
+	// uid is the real user ID of the process in the root user namespace.
+	uid uint32
+	// vm is the size of the address space of the process in bytes.
+	vm uint64
+	// cgroup is the path of the cgroup of the process.
+	cgroup string
 }
 
 // oomVictims returns the candidates that the OOM killer ends. With group set
@@ -429,6 +441,7 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 	type taskInCgroup struct {
 		t   *kernel.Task
 		mem *memory
+		cg  *cgroup
 	}
 	var tasks []taskInCgroup
 	closestMemory := func(c *cgroup) *memory {
@@ -440,12 +453,12 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 	fs.treeMu.RLock()
 	fs.tasksMu.RLock()
 	for t := range m.c.tasks {
-		tasks = append(tasks, taskInCgroup{t, m})
+		tasks = append(tasks, taskInCgroup{t, m, m.c})
 	}
 	m.c.walkSubtreeLocked(func(c *cgroup) bool {
 		mem := closestMemory(c)
 		for t := range c.tasks { // +checklocksforce: fs.tasksMu is locked
-			tasks = append(tasks, taskInCgroup{t, mem})
+			tasks = append(tasks, taskInCgroup{t, mem, c})
 		}
 		return true
 	})
@@ -464,14 +477,17 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 		}
 		c, ok := candidates[tg]
 		if !ok {
-			c = &oomCandidate{group: tg, id: rootNS.IDOfThreadGroup(tg), mem: tc.mem}
+			c = &oomCandidate{group: tg, id: rootNS.IDOfThreadGroup(tg), mem: tc.mem, cgroup: tc.cg.Path()}
 			if leader := tg.Leader(); leader != nil {
 				c.adj = leader.OOMScoreAdj()
+				c.comm = leader.Name()
+				c.uid = uint32(leader.Credentials().RealKUID)
 			}
 			candidates[tg] = c
 		}
 		if mm := t.MemoryManager(); mm != nil {
 			c.rss = max(c.rss, mm.ResidentSetSize())
+			c.vm = max(c.vm, mm.VirtualMemorySize())
 		}
 	}
 	for tg := range m.oom.pending {
@@ -503,19 +519,26 @@ func (m *memory) oomCheck(ctx context.Context, k *kernel.Kernel, used, limit uin
 	// As mem_cgroup_get_oom_group does, the highest cgroup with
 	// memory.oom.group between the victim and m loses all its processes. The
 	// kubelet sets memory.oom.group in each container cgroup.
-	groupMem := oomGroupOf(victims[0].mem, m)
+	selected := victims[0]
+	groupMem := oomGroupOf(selected.mem, m)
 	if groupMem != nil {
 		victims = oomGroupMembers(eligible, groupMem)
 	}
+	klog := k.KernelLog()
+	logOOMContext(klog, m.c.Path(), selected)
 	if m.oom.pending == nil {
 		m.oom.pending = make(map[*kernel.ThreadGroup]struct{})
 	}
 	sent := false
-	for _, v := range victims {
+	for _, v := range orderVictims(victims, selected) {
 		// Each kill counts in the cgroup of the victim and its ancestors
 		// before the signal, as in __oom_kill_process. The OOM monitor of
 		// containerd reads the cgroup of the container, which can lie below
 		// the cgroup that passed its limit.
+		logOOMKill(klog, v)
+		if v.group == selected.group && groupMem != nil {
+			logOOMGroup(klog, groupMem.c.Path())
+		}
 		v.mem.countOOMKill(ctx)
 		if err := k.SendExternalSignalThreadGroup(v.group, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
 			continue
