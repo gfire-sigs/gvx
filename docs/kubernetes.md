@@ -179,7 +179,7 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | Limit | Effect |
 | :--- | :--- |
 | `nftables` | Set `IPTABLES_MODE=legacy`. A component that needs `iptables-nft` fails. |
-| Calico | The tests run `kube-router`, the controller of `k3s`. The guest has the IP sets, the match `set`, and the target `SET` that the iptables mode of Calico uses. No test runs Calico itself, so other matches of Felix can still fail. |
+| Calico | The tests run `kube-router`, the controller of `k3s`. The guest has the IP sets, the match `set`, and the target `SET` that the iptables mode of Calico uses. The guest also has `/sys/fs/bpf` with `mount -t bpf`, the `SIOCETHTOOL` calls that Felix uses to switch off the checksum offload of `vxlan.calico`, and the file `conf/default/rp_filter`. No test runs Calico itself, so other matches of Felix can still fail. |
 | NFLOG | `-j NFLOG` accepts a rule, but no group receives a packet, because the guest has no `nflog` listener. |
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
