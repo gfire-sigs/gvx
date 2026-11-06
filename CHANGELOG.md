@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.10.10002026110200] - 2026-11-07
+
+This release runs `rungv` with the `systrap` engine inside a `gvx` guest on Linux amd64 and arm64, and inside upstream `runsc` on Linux amd64. The guest kernel now gives the signal frames, the fault information, the mmap errors, and the ptrace behavior that an inner Sentry needs, as Linux does.
 
 ### Features
 
