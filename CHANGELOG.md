@@ -6,7 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Features
 
-- **`rungv` inside a `gvx` guest**: `rungv run -platform=systrap` runs inside a `gvx` guest on Linux arm64 and on macOS arm64 with `-platform=hvf`. `docs/cli.md` section 11 lists the flags, the results, and the limits. The guest kernel now meets what the stub of an inner Sentry needs:
+- **`rungv` inside a `gvx` guest**: `rungv run -platform=systrap` runs inside a `gvx` guest on Linux arm64 and on macOS arm64 with `-platform=hvf`. On Linux amd64 the inner Sentry reaches the guest start, and the guest does not run yet. `docs/cli.md` section 11 lists the flags, the results, and the limits. The guest kernel now meets what the stub of an inner Sentry needs:
   - An unaligned `MAP_FIXED` mmap above the task size fails with `ENOMEM`, as in Linux. The size probe of the inner Sentry depends on it.
   - The arm64 signal frame holds the `fpsimd_context` record, the `esr_context` record of a fault, and the end marker. `sigreturn` loads the floating point registers from the frame. Before this release the stub stopped with a wrong magic number, or looped for ever on the missing end marker.
   - The host address space size is a search, not a list. It works below the hardware size and on a host that is a Sentry.

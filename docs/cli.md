@@ -424,7 +424,7 @@ The outer `rungv` uses the engine `systrap` on a Linux host, or the engine `hvf`
 | Linux arm64, `-platform=systrap` | `-platform=systrap -bin /smoke` | Works. |
 | Linux arm64, `-platform=systrap`, image `alpine:3.20` | `-platform=systrap alpine:3.20 uname -a` | Works. The inner guest reports `aarch64`. |
 | macOS arm64, `-platform=hvf` | `-platform=systrap -bin /smoke` | Works. The run is slow. |
-| Linux amd64, `-platform=systrap` | `-platform=systrap -bin /smoke` | See the CHANGELOG entry for the result of the last run. |
+| Linux amd64, `-platform=systrap` | `-platform=systrap -bin /smoke` | Does not work yet. The inner Sentry starts its stub and the guest, then the guest never prints. The cause is open. |
 
 To run the nested smoke test:
 
@@ -441,7 +441,7 @@ The upstream runtime `runsc` is the host kernel of the inner `rungv` in this cas
 
 | Host | Failure |
 | :--- | :--- |
-| Linux amd64 | The probe of the address space size gets the wrong answer, because `runsc` checks the alignment of a fixed mapping before its range. The inner `rungv` panics with `failed to map stub` or `None of the address space sizes could be successfully mmaped`. The size search of this release reads the last page of the address space, and the CHANGELOG entry states the result. |
+| Linux amd64 | The probe of the address space size gets the wrong answer, because `runsc` checks the alignment of a fixed mapping before its range. The inner `rungv` panics with `failed to map stub` or `None of the address space sizes could be successfully mmaped`. The size search of this release maps the last page of the address space. The run of that fix on `runsc` did not finish, so the result is open. |
 | Linux arm64 | The inner `rungv` starts its stub thread. The signal frame of `runsc` has no `fpsimd_context` record, so the stub stops with `FP state context magic header (0) does not match expected FPSIMD_MAGIC`. The exit code is 137. |
 
 The fix for the arm64 failure belongs in gVisor: write the `fpsimd_context` record, the `esr_context` record, and the end marker in the arm64 signal frame, as `gvx` does since this release.
