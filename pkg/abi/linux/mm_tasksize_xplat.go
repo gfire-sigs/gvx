@@ -112,9 +112,11 @@ func searchTaskSize(pageSize uintptr, sizes []uintptr, fits func(size uintptr) b
 }
 
 // narrowTaskSize returns the largest page multiple in [fit, notFit) that fits.
-// A notFit of 0 means that no larger size exists, so fit is the answer.
+// A notFit of 0 means that no larger size exists, so fit is the answer. On a
+// host with a hardware size, the page above fit does not fit, so one probe
+// ends the search.
 func narrowTaskSize(pageSize, fit, notFit uintptr, fits func(size uintptr) bool) uintptr {
-	if notFit == 0 {
+	if notFit == 0 || !fits(fit+pageSize) {
 		return fit
 	}
 	for notFit-fit > pageSize {
