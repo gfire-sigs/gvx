@@ -151,7 +151,9 @@ var TaskSize = func() uintptr {
 			uintptr(unix.PROT_NONE),
 			uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED), 0, 0)
 		if errno == unix.EINVAL {
-			return true
+			// A Sentry as host kernel reports EINVAL for the unaligned address
+			// before it checks the range. Map the last page to find out.
+			return pageFits(size - pageSize)
 		}
 		if errno != unix.ENOMEM {
 			panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
@@ -159,3 +161,24 @@ var TaskSize = func() uintptr {
 		return false
 	})
 }()
+
+// pageFits reports whether the host maps the page at addr. It removes the page
+// again.
+func pageFits(addr uintptr) bool {
+	r, _, errno := unix.RawSyscall6(
+		unix.SYS_MMAP,
+		addr,
+		uintptr(unix.Getpagesize()),
+		uintptr(unix.PROT_NONE),
+		uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED_NOREPLACE), 0, 0)
+	switch errno {
+	case 0:
+		unix.RawSyscall(unix.SYS_MUNMAP, r, uintptr(unix.Getpagesize()), 0)
+		return true
+	case unix.EEXIST:
+		return true
+	case unix.ENOMEM:
+		return false
+	}
+	panic(fmt.Sprintf("mmap of the last page returned unexpected error: %d", errno))
+}
