@@ -81,6 +81,8 @@ type ConntrackEntry struct {
 	// ConntrackTCP* value.
 	HasTCPState bool
 	TCPState    uint8
+	// Mark is the connection mark, as the CONNMARK target sets it.
+	Mark uint32
 }
 
 func tupleOfID(id tupleID) ConntrackTuple {
@@ -111,6 +113,7 @@ func (cn *conn) snapshot(now tcpip.MonotonicTime) ConntrackEntry {
 		Original: tupleOfID(cn.original.tupleID),
 		Reply:    tupleOfID(replyID),
 		Status:   ConntrackStatusConfirmed,
+		Mark:     cn.mark.Load(),
 	}
 	if replySeen {
 		e.Status |= ConntrackStatusSeenReply
@@ -318,5 +321,41 @@ func (ct *ConnTrack) expireClosedOnSYN(pkt *PacketBuffer, tid tupleID, bkt *buck
 	}
 	if t := bkt.connForTID(tid, now); t != nil && t.conn.closedTCP() {
 		t.conn.expire()
+	}
+}
+
+// ConnMark returns the connection mark of the connection of the packet. A
+// packet without a tracked connection has the mark 0.
+func (pk *PacketBuffer) ConnMark() uint32 {
+	if !pk.IsConnTrackConfigured() {
+		return 0
+	}
+	return pk.tuple.conn.mark.Load()
+}
+
+// SetConnMark sets the connection mark of the connection of the packet. It
+// does nothing for a packet without a tracked connection.
+func (pk *PacketBuffer) SetConnMark(mark uint32) {
+	if !pk.IsConnTrackConfigured() {
+		return
+	}
+	pk.tuple.conn.mark.Store(mark)
+}
+
+// UpdateConnMark replaces the connection mark of the connection of the packet
+// with update(old) and returns the new mark. The update is atomic: two
+// packets of one connection never lose each other's change. It returns 0 and
+// does nothing for a packet without a tracked connection.
+func (pk *PacketBuffer) UpdateConnMark(update func(old uint32) uint32) uint32 {
+	if !pk.IsConnTrackConfigured() {
+		return 0
+	}
+	mark := &pk.tuple.conn.mark
+	for {
+		old := mark.Load()
+		next := update(old)
+		if mark.CompareAndSwap(old, next) {
+			return next
+		}
 	}
 }

@@ -205,6 +205,9 @@ type conn struct {
 	// released is 1 after the table removed the connection and gave back its
 	// place in the count of the table.
 	released atomicbitops.Uint32 `state:"nosave"`
+	// mark is the connection mark that the CONNMARK target and the connmark
+	// match use. The netstack does not save it.
+	mark atomicbitops.Uint32 `state:"nosave"`
 }
 
 // timedOut returns whether the connection timed out. A connection times out

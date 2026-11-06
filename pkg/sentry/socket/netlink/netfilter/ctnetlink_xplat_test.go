@@ -175,6 +175,9 @@ type request struct {
 	orig    *stack.ConntrackTuple
 	reply   *stack.ConntrackTuple
 	id      *uint32
+	// mark and markMask are CTA_MARK and CTA_MARK_MASK. A nil value omits the
+	// attribute.
+	mark, markMask *uint32
 	// partial removes the destination port from the original tuple.
 	partial bool
 }
@@ -205,6 +208,12 @@ func (r request) message(t *testing.T) *nlmsg.Message {
 	}
 	if r.id != nil {
 		m.PutAttr(ctaID, nlmsg.PutU32(*r.id))
+	}
+	if r.mark != nil {
+		m.PutAttr(ctaMark, nlmsg.PutU32(*r.mark))
+	}
+	if r.markMask != nil {
+		m.PutAttr(ctaMarkMask, nlmsg.PutU32(*r.markMask))
 	}
 	parsed, _, ok := nlmsg.ParseMessage(m.Finalize())
 	if !ok {
@@ -255,6 +264,7 @@ func wantSpec(t *testing.T, got tupleSpec, want stack.ConntrackTuple) {
 
 func TestCtnetlinkGetAnswersWithTheAttributesOfTheConnection(t *testing.T) {
 	udp, tcp := udpEntry(7, 40000), tcpEntry(8, 40001)
+	udp.Mark = 0xca6c
 	table := &fakeTable{entries: []stack.ConntrackEntry{udp, tcp}, perBucket: 10}
 	tests := []struct {
 		name string
@@ -290,6 +300,9 @@ func TestCtnetlinkGetAnswersWithTheAttributesOfTheConnection(t *testing.T) {
 			}
 			if timeout, _ := readU32(attrs[ctaTimeout]); time.Duration(timeout)*time.Second != tc.want.Timeout {
 				t.Errorf("timeout = %d s, want %v", timeout, tc.want.Timeout)
+			}
+			if mark, ok := readU32(attrs[ctaMark]); !ok || mark != tc.want.Mark {
+				t.Errorf("CTA_MARK = %#x (present %t), want %#x", mark, ok, tc.want.Mark)
 			}
 			if id, _ := readU32(attrs[ctaID]); id != tc.want.ID {
 				t.Errorf("id = %d, want %d", id, tc.want.ID)
@@ -598,6 +611,45 @@ func TestCtnetlinkDumpAppliesTheFamilyAndTheTupleFilter(t *testing.T) {
 			var dumps startedDump
 			tc.req.msgType, tc.req.flags = ipctnlMsgCtGet, linux.NLM_F_DUMP
 			if _, err := tc.req.serve(t, table, &dumps); err != nil {
+				t.Fatalf("serve = %v", err)
+			}
+			listed := 0
+			for _, chunk := range drainDump(t, dumps.dump, 3776, nil) {
+				listed += len(chunk)
+			}
+			if listed != tc.want {
+				t.Errorf("dump lists %d connections, want %d", listed, tc.want)
+			}
+		})
+	}
+}
+
+func TestCtnetlinkDumpFiltersByTheConnectionMark(t *testing.T) {
+	entries := manyEntries(12)
+	for i := range entries {
+		entries[i].Mark = uint32(i%3) << 8
+	}
+	table := &fakeTable{entries: entries, perBucket: 4}
+	tests := []struct {
+		name       string
+		mark, mask uint32
+		useMask    bool
+		want       int
+	}{
+		{"one mark without a mask", 0x100, 0, false, 4},
+		{"mark 0", 0, 0, false, 4},
+		{"mark under a mask that hides the difference", 0x1, 0xff, true, 0},
+		{"mark under a mask that selects one mark", 0x100, 0x300, true, 4},
+		{"empty mask selects all", 0x200, 0, true, 12},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var dumps startedDump
+			req := request{family: afUnspec, msgType: ipctnlMsgCtGet, flags: linux.NLM_F_DUMP, mark: &tc.mark}
+			if tc.useMask {
+				req.markMask = &tc.mask
+			}
+			if _, err := req.serve(t, table, &dumps); err != nil {
 				t.Fatalf("serve = %v", err)
 			}
 			listed := 0
