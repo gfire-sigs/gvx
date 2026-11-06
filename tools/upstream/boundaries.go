@@ -155,7 +155,7 @@ var boundaryRules = []importRule{
 		// implements the same VFS interfaces as hostfs, so it gets the same
 		// import surface, and it must not reach a platform backend.
 		pkg:       "pkg/sentry/fsimpl/ext4lite",
-		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/fsimpl/chunkcache", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/blockdev", "pkg/sentry/fsimpl/chunkcache", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
 		forbidden: []string{"pkg/sentry/platform/*", "cmd/*"},
 	},
 	{

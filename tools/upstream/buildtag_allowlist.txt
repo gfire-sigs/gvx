@@ -30,6 +30,9 @@ seam pkg/erofs/erofs.go
 seam pkg/erofs/erofs_state_autogen.go
 seam pkg/sentry/fsimpl/erofs/erofs.go
 seam pkg/sentry/fsimpl/erofs/filesystem.go
+# An image can count its file reads as the reads of a disk
+# (pkg/sentry/fsimpl/erofs/blockstats_xplat.go).
+seam pkg/sentry/fsimpl/erofs/regular_file.go
 
 # pkg/hostarch: darwin/arm64 has its own 4KB constants in hostarch_darwin_arm64_4k.go.
 # The upstream 4KB file excludes darwin so that exactly one of the page-size files applies.
@@ -40,6 +43,9 @@ expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !darwin && !pagesi
 # (pkg/sentry/fsimpl/overlay/dentry_cache_xplat.go). Upstream destroys a dentry at its
 # last reference, so every path resolution looks up each component in each layer again.
 seam pkg/sentry/fsimpl/overlay/overlay.go
+# The directories of an overlay can report the numbers of a disk
+# (pkg/sentry/fsimpl/overlay/dirdev_xplat.go).
+seam pkg/sentry/fsimpl/overlay/filesystem.go
 
 # Content seam: SetEntries gives the Stack to the matchers that need it
 # (pkg/sentry/socket/netfilter/addrtype_matcher_xplat.go). stack.Matcher.Match gets only the packet.
@@ -148,11 +154,15 @@ seam pkg/tcpip/transport/tcp/endpoint.go
 # (pkg/sentry/socket/netfilter/ipset_sockopt_xplat.go).
 seam pkg/sentry/socket/netstack/netstack.go
 # /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
+# /sys/block, /sys/class/block, and /sys/dev/block list the disks of the sandbox
+# (pkg/sentry/fsimpl/sys/blockclass_xplat.go).
 seam pkg/sentry/fsimpl/sys/sys.go
-# /proc/diskstats (pkg/sentry/fsimpl/proc/diskstats_xplat.go) reads the I/O totals of the kernel.
-# A dying task adds its counts to the totals (pkg/sentry/kernel/io_totals_xplat.go).
+# /proc/diskstats and /proc/partitions list the disks of the sandbox
+# (pkg/sentry/fsimpl/proc/diskstats_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks.go
-seam pkg/sentry/kernel/task_exit.go
+# /proc/mounts and mountinfo show the device of a file system on a disk as the mount source
+# (pkg/sentry/vfs/mount_source_xplat.go).
+seam pkg/sentry/vfs/mount.go
 # /proc/meminfo and sysinfo(2) ask the kernel for the total memory, which a sandbox with a memory
 # limit sets for its own kernel (pkg/sentry/kernel/total_memory_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks_files.go

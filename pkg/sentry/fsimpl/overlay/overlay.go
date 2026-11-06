@@ -86,6 +86,12 @@ type FilesystemOptions struct {
 	// LowerRoots contains the roots of the immutable lower layers of the
 	// overlay. LowerRoots is immutable.
 	LowerRoots []vfs.VirtualDentry
+
+	// DirDevMajor and DirDevMinor, when DirDevMajor is not 0, are the device
+	// numbers that the directories of the overlay report as st_dev. The
+	// default is an anonymous number. The root file system of a sandbox sets
+	// them to the number of its disk (see dirdev_xplat.go).
+	DirDevMajor, DirDevMinor uint32 `state:"nosave"`
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -115,6 +121,10 @@ type filesystem struct {
 	// dirDevMinor is the device minor number used for directories. dirDevMinor
 	// is immutable.
 	dirDevMinor uint32
+
+	// dirDevMajor is the device major number used for directories. It is
+	// immutable. A restored filesystem has the anonymous major number 0.
+	dirDevMajor uint32 `state:"nosave"`
 
 	// lowerDevMinors maps device numbers from lower layer filesystems to
 	// device minor numbers assigned to non-directory files originating from
@@ -325,7 +335,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	// Allocate dirDevMinor. lowerDevMinors are allocated dynamically.
-	dirDevMinor, err := vfsObj.GetAnonBlockDevMinor()
+	dirDevMajor, dirDevMinor, err := fsopts.dirDevice(vfsObj)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -351,6 +361,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		creds:          creds.Fork(),
 		xattrPrefix:    xattrPrefix,
 		xattrOpaque:    xattrPrefix + "opaque",
+		dirDevMajor:    dirDevMajor,
 		dirDevMinor:    dirDevMinor,
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
@@ -426,7 +437,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	root.uid = atomicbitops.FromUint32(rootStat.UID)
 	root.gid = atomicbitops.FromUint32(rootStat.GID)
 	if rootStat.Mode&linux.S_IFMT == linux.S_IFDIR {
-		root.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
+		root.devMajor = atomicbitops.FromUint32(fs.dirDevMajor)
 		root.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
 		// For root dir, it is okay to use top most level's stat to compute inode
 		// number because we don't allow copy ups on root dentries.
@@ -482,7 +493,9 @@ func clonePrivateMount(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.evictUnusedDentries(ctx)
 	vfsObj := fs.vfsfs.VirtualFilesystem()
-	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
+	if fs.dirDevMajor == linux.UNNAMED_MAJOR {
+		vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
+	}
 	for _, lowerDevMinor := range fs.lowerDevMinors {
 		vfsObj.PutAnonBlockDevMinor(lowerDevMinor)
 	}

@@ -89,7 +89,7 @@ The `kubelet`, `containerd`, `runc`, and `k3s` read or write these files. The fi
 | `net/ipv4/neigh/default/gc_thresh1` to `gc_thresh3`, and the IPv6 files | One value for each network namespace and IP family. They start at 128, 512, and 1024, and a write takes 0 to 2,147,483,647. A dynamic neighbor entry obeys `gc_thresh2` and `gc_thresh3` as `neigh_alloc` does. A static entry has no limit. | `tasks_sys_neigh_xplat.go`; `pkg/tcpip/stack/neighbor_gc_xplat.go`; seams in `neighbor_cache.go` and `nic.go` |
 | `/sys/module/xt_recent/parameters/ip_list_tot`, `ip_pkt_list_tot` | Mode 0400, values 100 and 0. The kernel owns them. A write by root works while no recent list exists, and it fails with `EINVAL` after that. | `pkg/sentry/fsimpl/sys/xtrecent_xplat.go`; `pkg/sentry/socket/netfilter/recent_module_xplat.go` |
 | Node capacity | `MemTotal` follows `-m`, and the online CPUs, `sched_getaffinity`, and `/sys/devices/system/cpu/online` follow `--cpus`. The total belongs to the kernel of each sandbox. Without the options, the values stay as they are. | `pkg/gvx/hostmem.go`; `pkg/sentry/kernel/total_memory_xplat.go`; seams in `pkg/sentry/fsimpl/proc` and `pkg/sentry/syscalls/linux` |
-| Statistics | `/sys/class/net/<link>/statistics/*` and `/proc/diskstats` exist, and their counters grow with traffic and I/O. The disk counters count the read and write system calls of the sandbox. | `pkg/sentry/fsimpl/sys/netclass_xplat.go`; `pkg/sentry/fsimpl/proc/diskstats_xplat.go`; `pkg/sentry/kernel/io_totals_xplat.go` |
+| Statistics | `/sys/class/net/<link>/statistics/*` exist, and their counters grow with traffic. `/proc/diskstats`, `/proc/partitions`, and `/sys/block/<disk>/{dev,size,stat}` list the root image and each volume as a disk (`vda`, `vdb`, and so on) with the device number that `stat` and `mountinfo` show for its files. The disk counters count the host I/O of the image file in sectors, and sockets and pipes change none. | `pkg/sentry/fsimpl/sys/netclass_xplat.go`; `pkg/sentry/fsimpl/sys/blockclass_xplat.go`; `pkg/sentry/fsimpl/proc/diskstats_xplat.go`; `pkg/sentry/blockdev`; `pkg/sentry/fsimpl/ext4lite/blockstats.go`; `pkg/sentry/fsimpl/erofs/blockstats_xplat.go` |
 
 ### 3.2 P2: Service Data Path
 
@@ -182,7 +182,7 @@ These tests check one kernel behavior each. A Go program without an image runs t
 | A4 | Safe sysctls | Each network value is writable in a network namespace and keeps its old value in the parent namespace. |
 | A5 | `conf/all/forwarding` | Three namespaces A, R, and B: with the value 1 in R, A reaches B with ICMP echo. With 0, it does not. `conf/default/forwarding` changes only the links that R creates later. A new namespace gets the IPv4 values of the root namespace. |
 | A6 | Capacity | With `-m 2g --cpus 2`, `MemTotal` is 2 GiB within one page, `nproc` prints 2, and `cpu/online` reads `0-1`. |
-| A7 | Statistics | After traffic and disk I/O, `rx_bytes` of `eth0` and the line of the root disk in `/proc/diskstats` have grown. |
+| A7 | Statistics | After traffic, `rx_bytes` of `eth0` has grown. A write of 64 MiB with `fsync` to a volume moves the sectors written of its disk by at least 64 MiB. A read of the file moves the sectors read. Traffic of sockets and pipes moves no disk counter. The device numbers of the volume agree in `stat`, `mountinfo`, `/proc/diskstats`, `/proc/partitions`, and `/sys/block`. |
 | A8 | `statistic` random | With `--probability 0.5`, each of two targets gets 50% ± 5% of 2,000 connections. |
 | A9 | `statistic` nth | With `--every 3 --packet 0`, exactly one connection in three matches. |
 | A9a | `recent` | With the session affinity rules of `kube-proxy`, 40 connections of one client reach one backend. Without the rules, the same split reaches both backends. |
@@ -213,7 +213,7 @@ These tests run `rancher/k3s` with `IPTABLES_MODE=legacy` and no other setting o
 | B7 | Pod access | `kubectl logs`, `kubectl exec`, and `kubectl port-forward` work. |
 | B8 | Pod sysctls | A pod with `securityContext.sysctls` sees the values inside the container. |
 | B9 | Resource limits | A pod with a CPU limit of 500m uses at most 0.6 CPU. A pod above its memory limit ends with `OOMKilled`, except on Windows `systrap`. |
-| B10 | Metrics | `kubectl top node` and `kubectl top pod` print values. |
+| B10 | Metrics | `kubectl top node` and `kubectl top pod` print values. cAdvisor lists the volume at `/var/lib/rancher` as the device `/dev/vdb`, with the limit and the write counters of its disk. The summary API of the kubelet gives a capacity and an inode count for the image file system. |
 | B11 | Restart | After a stop and a start of the sandbox, the node returns to `Ready` with the same name, and the pods start again. |
 | B12 | NetworkPolicy | `k3s` starts its network policy controller without the `ipset` warning. A policy that denies all ingress to a server pod stops two client pods. A second policy that names one client lets only that client through. After the policies end, both clients reach the server again. |
 

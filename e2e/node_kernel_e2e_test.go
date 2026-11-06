@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -240,8 +241,19 @@ func TestE2ENodeKernelA6Capacity(t *testing.T) {
 	})
 }
 
-// TestE2ENodeKernelA7Statistics checks that the counters of eth0 and of the root
-// disk grow with network traffic and file I/O.
+// withDataVolume mounts a new ext4lite volume at /data. The volume is a disk of
+// the guest, so the probe reads its counters in /proc/diskstats.
+func withDataVolume(t *testing.T, cfg *gvx.Config) {
+	t.Helper()
+	cfg.Mounts = append(cfg.Mounts, gvx.Mount{
+		Kind:      gvx.MountVolume,
+		ImagePath: filepath.Join(t.TempDir(), "data.ext4"),
+		GuestPath: "/data",
+	})
+}
+
+// TestE2ENodeKernelA7Statistics checks that the counters of eth0 grow with
+// network traffic.
 func TestE2ENodeKernelA7Statistics(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -256,7 +268,33 @@ func TestE2ENodeKernelA7Statistics(t *testing.T) {
 		}, "stats", net.JoinHostPort("10.0.2.2", strconv.Itoa(port)))
 		requireNodeChecks(t, code, out,
 			"link-directories-list-the-links", "link-attributes", "link-statistics-files-exist",
-			"eth0-counters-grow", "sysfs-agrees-with-proc-net-dev", "diskstats-counters-grow")
+			"eth0-counters-grow", "sysfs-agrees-with-proc-net-dev")
+	})
+}
+
+// TestE2ENodeKernelA7Disks checks that /proc/diskstats reports block I/O of the
+// disks of the guest. The root image is vda. A volume mounted at /data is the
+// next disk. The device numbers of the disk are the same in /proc/diskstats,
+// /proc/partitions, /sys/block, stat, and mountinfo. A write of 64 MiB with
+// fsync moves the sectors written of the volume by at least 64 MiB. Traffic of
+// sockets and pipes moves no counter.
+func TestE2ENodeKernelA7Disks(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen on the host: %v", err)
+		}
+		defer ln.Close()
+		go serveStream(ln, 16<<20)
+		port := ln.Addr().(*net.TCPAddr).Port
+		code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
+			cfg.NetworkMode = gvx.NetModeNAT
+			withDataVolume(t, cfg)
+		}, "disks", "/data", net.JoinHostPort("10.0.2.2", strconv.Itoa(port)))
+		requireNodeChecks(t, code, out,
+			"disk-numbers-agree-across-the-interfaces", "root-disk-is-a-read-only-image",
+			"write-sectors-grow-with-fsync", "read-sectors-grow-with-file-reads",
+			"no-request-stays-in-flight", "socket-and-pipe-traffic-does-not-count")
 	})
 }
 
@@ -331,9 +369,10 @@ func TestE2ENodeKernelA6MemTotalIsPerSandbox(t *testing.T) {
 					defer release(i)
 					code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
 						cfg.Resources = gvx.Resources{MemoryBytes: l.limit}
+						withDataVolume(t, cfg)
 						cfg.Stdin = readers[i]
 						cfg.Stdout = io.MultiWriter(cfg.Stdout, lineWatcher{marker: "MEMTOTAL ", found: func() { release(i) }})
-					}, "memtotal", strconv.Itoa(l.writeMB))
+					}, "memtotal", strconv.Itoa(l.writeMB), "/data")
 					requireNodeChecks(t, code, out, "memtotal-stays-while-other-sandboxes-run", "diskstats-count-only-this-sandbox")
 					_, rest, ok := strings.Cut(out, "MEMTOTAL ")
 					if !ok {

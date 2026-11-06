@@ -1788,7 +1788,7 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 		//
 		// The "needs dump" and "fsck order" flags are always 0, which
 		// is allowed.
-		fmt.Fprintf(buf, "%s %s %s %s %d %d\n", "none", path, mnt.fs.FilesystemType().Name(), opts, 0, 0)
+		fmt.Fprintf(buf, "%s %s %s %s %d %d\n", mountSource(mnt), path, mnt.fs.FilesystemType().Name(), opts, 0, 0)
 	}
 	return nil
 }
@@ -1934,7 +1934,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		fmt.Fprintf(buf, "%s ", mnt.fs.FilesystemType().Name())
 
 		// (10) Mount source: filesystem-specific information or "none".
-		fmt.Fprintf(buf, "none ")
+		fmt.Fprintf(buf, "%s ", mountSource(mnt))
 
 		// (11) Superblock options, and final newline.
 		fmt.Fprintf(buf, "%s\n", superBlockOpts(pathFromRoot, mnt))

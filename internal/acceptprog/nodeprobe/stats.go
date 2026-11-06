@@ -17,7 +17,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -43,35 +42,11 @@ func linkCounter(link, name string) (uint64, error) {
 	return strconv.ParseUint(text, 10, 64)
 }
 
-// diskSectors returns the sectors read and written of the disk vda in
-// /proc/diskstats.
-func diskSectors() (read, written uint64, err error) {
-	data, err := os.ReadFile("/proc/diskstats")
-	if err != nil {
-		return 0, 0, err
-	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 14 || f[2] != "vda" {
-			continue
-		}
-		if read, err = strconv.ParseUint(f[5], 10, 64); err != nil {
-			return 0, 0, err
-		}
-		written, err = strconv.ParseUint(f[9], 10, 64)
-		return read, written, err
-	}
-	return 0, 0, fmt.Errorf("/proc/diskstats has no line for vda:\n%s", data)
-}
-
-// statsChecks checks the link and disk statistics. The probe reads a stream
-// from the TCP server at addr to drive eth0, and it writes and reads a file to
-// drive the disk.
+// statsChecks checks the link statistics. The probe reads a stream from the TCP
+// server at addr to drive eth0.
 func statsChecks(addr string) []check {
 	var rxBefore, txBefore, rxPacketsBefore uint64
-	var readBefore, writtenBefore uint64
 	var received int64
-	const fileSize = 4 << 20
 	return []check{
 		{"link-directories-list-the-links", func() error {
 			entries, err := os.ReadDir("/sys/class/net")
@@ -130,9 +105,6 @@ func statsChecks(addr string) []check {
 			if rxPacketsBefore, err = linkCounter("eth0", "rx_packets"); err != nil {
 				return err
 			}
-			if readBefore, writtenBefore, err = diskSectors(); err != nil {
-				return err
-			}
 			return nil
 		}},
 		{"network-traffic", func() error {
@@ -153,20 +125,6 @@ func statsChecks(addr string) []check {
 				return fmt.Errorf("the server at %s sent no data", addr)
 			}
 			return nil
-		}},
-		{"disk-io", func() error {
-			path := "/tmp/statsfile"
-			if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, fileSize), 0o644); err != nil {
-				return err
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			if len(data) != fileSize {
-				return fmt.Errorf("read %d bytes, want %d", len(data), fileSize)
-			}
-			return os.Remove(path)
 		}},
 		{"eth0-counters-grow", func() error {
 			rx, err := linkCounter("eth0", "rx_bytes")
@@ -201,19 +159,6 @@ func statsChecks(addr string) []check {
 			// The two reads come one after the other, and the guest has no other traffic.
 			if rx < sys {
 				return fmt.Errorf("/proc/net/dev rx %d is below /sys/class/net rx_bytes %d", rx, sys)
-			}
-			return nil
-		}},
-		{"diskstats-counters-grow", func() error {
-			read, written, err := diskSectors()
-			if err != nil {
-				return err
-			}
-			if want := writtenBefore + fileSize/512; written < want {
-				return fmt.Errorf("sectors written grew from %d to %d, want at least %d", writtenBefore, written, want)
-			}
-			if want := readBefore + fileSize/512; read < want {
-				return fmt.Errorf("sectors read grew from %d to %d, want at least %d", readBefore, read, want)
 			}
 			return nil
 		}},

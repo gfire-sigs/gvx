@@ -19,21 +19,20 @@ import (
 	"fmt"
 
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 )
 
-// The Sentry has no block layer, so /proc/diskstats describes one disk, vda,
-// that stands for the root file system. Its counters come from the kernel
-// (Kernel.IOTotals): the read and write system calls of all its tasks,
-// including the tasks that exited. The counts grow with every read and write,
-// and they include sockets, pipes, and terminals.
+// /proc/diskstats and /proc/partitions list the disks of the sandbox. A disk is
+// the host file that backs a file system: the image of an ext4lite volume, and
+// the EROFS layers of the root file system. The counters come from the I/O that
+// the Sentry does against that host file (package blockdev), so a socket, a
+// pipe, a terminal, and a tmpfs file never change them.
 
-const (
-	diskstatsDevice = "vda"
-	// diskstatsMajor is the block major that virtio disks use.
-	diskstatsMajor = 254
-	diskSectorSize = 512
-)
+// disks returns the disks of the kernel of the reader.
+func disks(ctx context.Context) []*blockdev.Device {
+	return blockdev.Of(kernel.KernelFromContext(ctx).VFS()).Devices()
+}
 
 // diskstatsData implements vfs.DynamicBytesSource for /proc/diskstats.
 type diskstatsData struct {
@@ -42,14 +41,44 @@ type diskstatsData struct {
 
 var _ dynamicInode = (*diskstatsData)(nil)
 
-// Generate implements vfs.DynamicBytesSource.Generate. The line has the 20
-// fields of Linux 5.5 and later. The Sentry has no merged, discarded, or
-// flushed requests and no latency, so those fields stay 0.
+// Generate implements vfs.DynamicBytesSource.Generate. Each line has the 20
+// columns of Linux 5.5 and later: the device numbers, the name, and the 17
+// counters of Snapshot.
 func (*diskstatsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	io := kernel.KernelFromContext(ctx).IOTotals()
-	fmt.Fprintf(buf, "%4d %7d %s %d 0 %d 0 %d 0 %d 0 0 0 0 0 0 0 0 0 0\n",
-		diskstatsMajor, 0, diskstatsDevice,
-		io.ReadSyscalls, io.CharsRead/diskSectorSize,
-		io.WriteSyscalls, io.CharsWritten/diskSectorSize)
+	writeDiskstats(buf, disks(ctx))
 	return nil
+}
+
+// writeDiskstats writes the line of each disk in the format of /proc/diskstats.
+func writeDiskstats(buf *bytes.Buffer, disks []*blockdev.Device) {
+	for _, d := range disks {
+		fmt.Fprintf(buf, "%4d %7d %s", d.Major, d.Minor, d.Name)
+		for _, v := range d.Stats.Snapshot().Fields() {
+			fmt.Fprintf(buf, " %d", v)
+		}
+		buf.WriteByte('\n')
+	}
+}
+
+// partitionsData implements vfs.DynamicBytesSource for /proc/partitions.
+type partitionsData struct {
+	dynamicBytesFileSetAttr
+}
+
+var _ dynamicInode = (*partitionsData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate. The size is in blocks of
+// 1 KiB, as on Linux.
+func (*partitionsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	writePartitions(buf, disks(ctx))
+	return nil
+}
+
+// writePartitions writes the header and the line of each disk in the format of
+// /proc/partitions.
+func writePartitions(buf *bytes.Buffer, disks []*blockdev.Device) {
+	buf.WriteString("major minor  #blocks  name\n\n")
+	for _, d := range disks {
+		fmt.Fprintf(buf, "%4d  %7d %10d %s\n", d.Major, d.Minor, d.Sectors()/(1024/blockdev.SectorSize), d.Name)
+	}
 }

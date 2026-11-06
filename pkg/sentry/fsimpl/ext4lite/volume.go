@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 )
 
 // volumeOptions configures openVolume.
@@ -38,7 +39,9 @@ type volumeOptions struct {
 // The lock order is: node.mu, then volume.mu. flushMu is only held by flush,
 // which takes node.mu and volume.mu one after the other.
 type volume struct {
-	hf       hostFile
+	hf hostFile
+	// stats counts the host calls on hf as the requests of a block device.
+	stats    *blockdev.Stats
 	readOnly bool
 	now      func() time.Time
 
@@ -187,8 +190,16 @@ func checkSuperblock(sb []byte, hostSize int64) (groups uint32, err error) {
 // end cleanly. A writable mount clears the valid bit before it returns, so a
 // crash after that point triggers fsckLite at the next mount.
 func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
+	// Every host call goes through a countedFile. mountHostFile wraps the file
+	// before it formats it, so the counters include the writes of mkfs.
+	counted, ok := hf.(*countedFile)
+	if !ok {
+		counted = &countedFile{hostFile: hf, stats: blockdev.NewStats(nil)}
+		hf = counted
+	}
 	v := &volume{
 		hf:         hf,
+		stats:      counted.stats,
 		readOnly:   opts.readOnly,
 		now:        opts.now,
 		nodes:      make(map[uint32]*node),

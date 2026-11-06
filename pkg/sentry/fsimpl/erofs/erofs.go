@@ -40,6 +40,7 @@ import (
 	"z.gfire.dev/gvx/pkg/gomaxprocs"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/refs"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
@@ -87,6 +88,10 @@ type filesystem struct {
 	// mf implements memmap.File for this image.
 	mf imageMemmapFile
 
+	// touched holds the pages of the image that a read or a mapping took, or
+	// nil when the mount has no block counters. touched is immutable.
+	touched *blockdev.FirstTouch `state:"nosave"`
+
 	// memoryFile is the application memory file. memoryFile is immutable.
 	memoryFile *pgalloc.MemoryFile `state:"nosave"`
 
@@ -126,6 +131,11 @@ type InternalFilesystemOptions struct {
 	// If UniqueID is non-empty, it is used to reassociate the filesystem with
 	// a new image FD during restoration from checkpoint.
 	UniqueID checkpoint.ResourceID
+
+	// BlockStats, when non-nil, counts the file data that the file system
+	// reads from the image as the read requests of a disk. A restored
+	// filesystem has no counters.
+	BlockStats *blockdev.Stats `state:"nosave"`
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -188,6 +198,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		mf:                imageMemmapFile{image: image},
 		maxCachedDentries: defaultMaxCachedDentries,
 	}
+	fs.newBlockStats()
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 	cu.Add(func() { fs.vfsfs.DecRef(ctx) })
 
