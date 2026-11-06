@@ -17,6 +17,7 @@
 package hostlockdown
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
@@ -106,9 +107,32 @@ func denyOnlySIDsForMode(user *windows.SID, groups []windows.SIDAndAttributes, a
 }
 
 func isEveryoneSID(sid *windows.SID) bool {
-	return sid != nil && sid.IsValid() &&
-		sid.IdentifierAuthority() == windows.SECURITY_WORLD_SID_AUTHORITY &&
-		sid.SubAuthorityCount() == 1 && sid.SubAuthority(0) == 0
+	auth, subs, ok := sidFields(sid)
+	return ok && auth == windows.SECURITY_WORLD_SID_AUTHORITY && len(subs) == 1 && subs[0] == 0
+}
+
+// sidFields returns the identifier authority and the sub-authorities of a
+// valid SID. It reads the SID bytes directly. The accessors of
+// golang.org/x/sys/windows convert a returned uintptr into a pointer, and
+// the checkptr instrumentation of -race stops the process when that pointer
+// points into a SID in Go memory.
+func sidFields(sid *windows.SID) (windows.SidIdentifierAuthority, []uint32, bool) {
+	var auth windows.SidIdentifierAuthority
+	if sid == nil || !sid.IsValid() {
+		return auth, nil, false
+	}
+	// A SID is Revision (1 byte), SubAuthorityCount (1 byte),
+	// IdentifierAuthority (6 bytes), and SubAuthorityCount uint32 values.
+	b := unsafe.Slice((*byte)(unsafe.Pointer(sid)), sid.Len())
+	if len(b) < 8 || len(b) < 8+4*int(b[1]) {
+		return auth, nil, false
+	}
+	copy(auth.Value[:], b[2:8])
+	subs := make([]uint32, b[1])
+	for i := range subs {
+		subs[i] = binary.LittleEndian.Uint32(b[8+4*i:])
+	}
+	return auth, subs, true
 }
 
 type tokenDefaultDACL struct {
@@ -239,11 +263,8 @@ func lowerTokenIntegrityToLow(token windows.Token) error {
 }
 
 func isLowIntegritySID(sid *windows.SID) bool {
-	if sid == nil || !sid.IsValid() {
-		return false
-	}
-	n := sid.SubAuthorityCount()
-	return n > 0 && sid.IdentifierAuthority() == windows.SECURITY_MANDATORY_LABEL_AUTHORITY && sid.SubAuthority(uint32(n-1)) == lowIntegrityRID
+	auth, subs, ok := sidFields(sid)
+	return ok && len(subs) > 0 && auth == windows.SECURITY_MANDATORY_LABEL_AUTHORITY && subs[len(subs)-1] == lowIntegrityRID
 }
 
 // createRestrictedImpersonationToken copies the live token into an
