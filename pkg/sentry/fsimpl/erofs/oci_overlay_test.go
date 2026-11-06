@@ -40,6 +40,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/memutil"
 	"z.gfire.dev/gvx/pkg/oci"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/erofs"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/overlay"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/tmpfs"
@@ -64,6 +65,13 @@ type sentry struct {
 	vfs   *vfs.VirtualFilesystem
 	creds *auth.Credentials
 	root  vfs.VirtualDentry
+
+	// blockStats, when set, counts the reads of every EROFS layer that the
+	// sentry mounts.
+	blockStats *blockdev.Stats
+	// dirDevMajor and dirDevMinor, when dirDevMajor is not 0, are the device
+	// numbers of the directories of the overlay that the sentry mounts.
+	dirDevMajor, dirDevMinor uint32
 }
 
 func newSentry(t *testing.T) *sentry {
@@ -115,7 +123,8 @@ func (s *sentry) mountErofs(path string) vfs.VirtualDentry {
 		s.t.Fatal(err)
 	}
 	fs, rootDentry, err := erofs.FilesystemType{}.GetFilesystem(s.ctx, s.vfs, s.creds, "", vfs.GetFilesystemOptions{
-		Data: "ifd=" + strconv.Itoa(fd),
+		Data:         "ifd=" + strconv.Itoa(fd),
+		InternalData: erofs.InternalFilesystemOptions{BlockStats: s.blockStats},
 	})
 	if err != nil {
 		s.t.Fatalf("mount EROFS layer %s: %v", path, err)
@@ -143,7 +152,10 @@ func (s *sentry) mountOverlay(layerPaths ...string) {
 
 	mntns, err := s.vfs.NewMountNamespace(s.ctx, s.creds, "", "overlay", &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
-			InternalData: overlay.FilesystemOptions{UpperRoot: upper, LowerRoots: lowers},
+			InternalData: overlay.FilesystemOptions{
+				UpperRoot: upper, LowerRoots: lowers,
+				DirDevMajor: s.dirDevMajor, DirDevMinor: s.dirDevMinor,
+			},
 		},
 	}, nil)
 	if err != nil {

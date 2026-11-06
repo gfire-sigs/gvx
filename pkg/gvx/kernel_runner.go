@@ -43,6 +43,7 @@ import (
 	"z.gfire.dev/gvx/pkg/memutil"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/devices/memdev"
 	"z.gfire.dev/gvx/pkg/sentry/devices/ttydev"
 	"z.gfire.dev/gvx/pkg/sentry/devices/tundev"
@@ -1317,6 +1318,28 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 		return mnt, nil
 	}
 
+	// The EROFS layers are the root disk of the guest, as the image of a
+	// virtual machine is. Its reads show in /proc/diskstats as vda, and the
+	// directories of the root overlay report its device numbers. The writes of
+	// the guest go to the tmpfs upper layer, which is memory and not a disk.
+	rootStats := blockdev.NewStats(nil)
+	disks := blockdev.Of(vfsObj)
+	rootBytes := s.layerBytes
+	rootDisk, err := disks.Add(blockdev.Options{
+		Stats:    rootStats,
+		Sectors:  func() uint64 { return rootBytes / blockdev.SectorSize },
+		ReadOnly: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gvx: add the root disk: %w", err)
+	}
+	mounted := false
+	defer func() {
+		if !mounted {
+			disks.Remove(rootDisk)
+		}
+	}()
+
 	var lowerRoots []vfs.VirtualDentry
 	cleanupLowers := func() {
 		for _, lr := range lowerRoots {
@@ -1338,7 +1361,8 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 			return nil, fmt.Errorf("gvx: release dup EROFS layer handle: %w", err)
 		}
 		fs, rootDentry, err := erofs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
-			Data: fmt.Sprintf("ifd=%d", int(dupFD)),
+			Data:         fmt.Sprintf("ifd=%d", int(dupFD)),
+			InternalData: erofs.InternalFilesystemOptions{BlockStats: rootStats},
 		})
 		if err != nil {
 			cleanupLowers()
@@ -1361,8 +1385,10 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	mnt, err := vfsObj.MountDisconnected(sctx, creds, "overlay", "overlay", &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
 			InternalData: overlay.FilesystemOptions{
-				UpperRoot:  upperRoot,
-				LowerRoots: lowerRoots,
+				UpperRoot:   upperRoot,
+				LowerRoots:  lowerRoots,
+				DirDevMajor: rootDisk.Major,
+				DirDevMinor: rootDisk.Minor,
 			},
 		},
 	})
@@ -1371,6 +1397,7 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	if err != nil {
 		return nil, fmt.Errorf("gvx: create overlay root: %w", err)
 	}
+	mounted = true
 	return mnt, nil
 }
 

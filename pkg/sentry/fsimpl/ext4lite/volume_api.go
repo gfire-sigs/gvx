@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 )
 
@@ -69,6 +70,7 @@ func OpenVolume(f *os.File, opts VolumeOptions) (*Volume, error) {
 }
 
 func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
+	hf = &countedFile{hostFile: hf, stats: blockdev.NewStats(nil)}
 	size, err := hf.Size()
 	if err != nil {
 		return nil, hostError(err)

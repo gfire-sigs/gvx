@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/hostfd"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -82,6 +83,11 @@ func (r *regularFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 		within := r.off - e.Off
 		dst := dsts.TakeFirst64(min(e.Length-within, r.inode.Size()-r.off))
 		var n uint64
+		var req blockdev.Request
+		var fresh uint64
+		if e.Mapped {
+			fresh, req = r.inode.fs.beginRead(e.ImageOff+within, dst.NumBytes())
+		}
 		switch {
 		case !e.Mapped:
 			n, err = safemem.ZeroSeq(dst)
@@ -92,6 +98,9 @@ func (r *regularFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 			if data, err = r.inode.fs.image.BytesAt(e.ImageOff+within, dst.NumBytes()); err == nil {
 				n, err = safemem.CopySeq(dst, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data)))
 			}
+		}
+		if fresh > 0 {
+			r.inode.fs.endRead(req, fresh)
 		}
 		r.off += n
 		done += n
@@ -225,6 +234,8 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 			Perms:  hostarch.ReadExecute,
 		}
 		t.Offset = e.ImageOff + t.Source.Start - e.Off
+		start, end := max(t.Source.Start, required.Start), min(t.Source.End, required.End)
+		i.fs.countMappedRead(t.Offset+start-t.Source.Start, end-start)
 		ts = append(ts, t)
 		off = t.Source.End
 	}

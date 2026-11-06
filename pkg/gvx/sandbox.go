@@ -49,6 +49,7 @@ type Sandbox struct {
 	memFile       *pgalloc.MemoryFile
 	resolvedImg   *oci.ResolvedImage
 	layerHandles  []*fd.HostHandle
+	layerBytes    uint64
 	workspace     *hostfs.Workspace
 	workspaces    []*hostfs.Workspace
 	volumes       []*ext4lite.Volume

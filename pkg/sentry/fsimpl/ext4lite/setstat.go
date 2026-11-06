@@ -59,8 +59,8 @@ func (i *inode) statx() linux.Statx {
 		Mtime:    statxTimestamp(a.mtime),
 		Ctime:    statxTimestamp(a.ctime),
 		Btime:    statxTimestamp(a.crtime),
-		DevMajor: linux.UNNAMED_MAJOR,
-		DevMinor: i.fs.devMinor,
+		DevMajor: i.fs.dev.Major,
+		DevMinor: i.fs.dev.Minor,
 	}
 	if i.kind == modeChar || i.kind == modeBlock {
 		st.RdevMajor, st.RdevMinor = decodeRdev(a.rdev)

@@ -225,6 +225,11 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		if err := verifySameLayerFile(f, layerPaths[i]); err != nil {
 			return err
 		}
+		info, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("gvx: stat EROFS layer %q: %w", layerPaths[i], err)
+		}
+		s.layerBytes += uint64(info.Size())
 	}
 	return nil
 }

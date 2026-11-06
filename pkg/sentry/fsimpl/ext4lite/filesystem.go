@@ -28,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/refs"
+	"z.gfire.dev/gvx/pkg/sentry/blockdev"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/unix/transport"
@@ -102,22 +103,35 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		vol.mounted.Store(false)
 		return nil, nil, err
 	}
-	devMinor, err := vfsObj.GetAnonBlockDevMinor()
-	if err != nil {
-		return fail(err)
-	}
 	rootNode, err := vol.v.getNode(rootIno)
 	if err != nil {
-		vfsObj.PutAnonBlockDevMinor(devMinor)
 		return fail(toLinuxErr(err))
 	}
 	fs := &filesystem{
 		vol:      vol,
 		v:        vol.v,
 		readOnly: vol.v.readOnly,
-		devMinor: devMinor,
 		inodes:   make(map[uint32]*inode),
 		pruneAt:  pruneThreshold,
+	}
+	// The volume is a disk of the sandbox. The files of the file system report
+	// the number of the disk as st_dev, as the files of a file system on a
+	// block device do, so that /proc/diskstats and /sys/block name the same
+	// numbers.
+	//
+	// A disk has a fixed size. The size of the volume is the space that the
+	// file system can use now plus the room that the host volume gives it to
+	// grow, as statfs reports it, and that room changes with the free space of
+	// the host. The disk therefore keeps the size of the mount.
+	sectors := vol.v.statfs().blocks * (blockSize / blockdev.SectorSize)
+	registry := blockdev.Of(vfsObj)
+	fs.dev, err = registry.Add(blockdev.Options{
+		Stats:    vol.v.stats,
+		Sectors:  func() uint64 { return sectors },
+		ReadOnly: vol.v.readOnly,
+	})
+	if err != nil {
+		return fail(linuxerr.ENOSPC)
 	}
 	fs.vfsfs.Init(vfsObj, fsType, fs)
 	fs.mu.Lock()
@@ -140,7 +154,8 @@ type filesystem struct {
 	vol      *Volume
 	v        *volume
 	readOnly bool
-	devMinor uint32
+	// dev is the disk of the volume. It is immutable.
+	dev *blockdev.Device
 
 	// mu protects the dentry tree, the names of dentries, the inode map, and
 	// pending. Lock order: mu, then the locks of the engine nodes, then the
@@ -257,7 +272,12 @@ func (fs *filesystem) Release(ctx context.Context) {
 	if err := fs.vol.Close(); err != nil {
 		ctx.Warningf("ext4lite: unmount the volume: %v", err)
 	}
-	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+	blockdev.Of(fs.vfsfs.VirtualFilesystem()).Remove(fs.dev)
+}
+
+// MountSource implements vfs.MountSourceProvider.MountSource.
+func (fs *filesystem) MountSource() string {
+	return "/dev/" + fs.dev.Name
 }
 
 // Sync implements vfs.FilesystemImpl.Sync.

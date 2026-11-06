@@ -342,7 +342,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		}
 		child.ino.Store(fs.newDirIno(orig))
 		child.dirInoHash = orig
-		child.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
+		child.devMajor = atomicbitops.FromUint32(fs.dirDevMajor)
 		child.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
 	} else if !child.upperVD.Ok() {
 		childDevMinor, err := fs.getLowerDevMinor(child.devMajor.RacyLoad(), child.devMinor.RacyLoad())
