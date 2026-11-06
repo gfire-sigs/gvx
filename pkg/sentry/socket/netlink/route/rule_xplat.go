@@ -116,8 +116,11 @@ func (h fibRuleHdr) bytes() []byte {
 	return b
 }
 
-// parseRuleMessage returns the header and the attributes of a rule message.
-func parseRuleMessage(msg *nlmsg.Message) (fibRuleHdr, map[uint16]nlmsg.BytesView, bool) {
+// parseRuleMessage returns the header and, when withAttrs is set, the
+// attributes of a rule message. A dump request reads only the family: netlink
+// libraries send struct ifinfomsg there, which is longer than struct
+// fib_rule_hdr.
+func parseRuleMessage(msg *nlmsg.Message, withAttrs bool) (fibRuleHdr, map[uint16]nlmsg.BytesView, bool) {
 	buf := msg.Buffer()
 	if len(buf) < linux.NetlinkMessageHeaderSize+fibRuleHdrSize {
 		return fibRuleHdr{}, nil, false
@@ -126,6 +129,9 @@ func parseRuleMessage(msg *nlmsg.Message) (fibRuleHdr, map[uint16]nlmsg.BytesVie
 	h := fibRuleHdr{
 		family: b[0], dstLen: b[1], srcLen: b[2], tos: b[3], table: b[4], action: b[7],
 		flags: binary.NativeEndian.Uint32(b[8:]),
+	}
+	if !withAttrs {
+		return h, nil, true
 	}
 	attrs, ok := nlmsg.AttrsView(b[fibRuleHdrSize:]).Parse()
 	return h, attrs, ok
@@ -138,7 +144,7 @@ func (p *Protocol) processRule(_ context.Context, s *netlink.Socket, msg *nlmsg.
 		return syserr.ErrNotSupported
 	}
 	hdr := msg.Header()
-	h, attrs, ok := parseRuleMessage(msg)
+	h, attrs, ok := parseRuleMessage(msg, hdr.Type != linux.RTM_GETRULE)
 	if !ok {
 		return syserr.ErrInvalidArgument
 	}
