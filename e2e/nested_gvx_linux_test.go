@@ -51,6 +51,10 @@ func staticRungv(t *testing.T) string {
 // kernel. docs/cli.md section 11 lists the limits.
 func TestE2ENestedRungvInRungv(t *testing.T) {
 	systraptest.Require(t)
+	if runtime.GOARCH != "arm64" {
+		// The inner guest starts and then makes no progress on amd64.
+		t.Skip("nested systrap runs only on arm64; docs/cli.md section 11 lists the amd64 limit")
+	}
 	inner := staticRungv(t)
 	elfData, err := testelf.BuildDynamicGuestELF64(runtime.GOARCH, 0, "nested-ok\n")
 	if err != nil {
