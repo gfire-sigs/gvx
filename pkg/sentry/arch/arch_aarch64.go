@@ -24,6 +24,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch/fpu"
 	rpb "z.gfire.dev/gvx/pkg/sentry/arch/registers_go_proto"
 )
@@ -59,6 +60,10 @@ type State struct {
 
 	// OrigR0 stores the value of register R0.
 	OrigR0 uint64
+
+	// faultAccess is the access of the last user fault that became a signal.
+	// The signal frame reports it in the ESR record. See SetFaultAccess.
+	faultAccess hostarch.AccessType `state:"nosave"`
 }
 
 // Proto returns a protobuf representation of the system registers in State.

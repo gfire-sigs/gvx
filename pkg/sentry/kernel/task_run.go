@@ -356,7 +356,10 @@ func (app *runApp) execute(t *Task) taskRunState {
 			t.Debugf("Unhandled user fault: addr=%x ip=%x access=%v sig=%v err=%v", addr, t.Arch().IP(), at, sig, err)
 			t.DebugDumpState()
 
-			// Continue to signal handling.
+			// Continue to signal handling. The signal frame reports the
+			// access to a handler that reads it, such as the stub of a
+			// nested Sentry.
+			t.Arch().SetFaultAccess(at)
 			//
 			// Convert a BusError error to a SIGBUS from a SIGSEGV. All
 			// other info bits stay the same (address, etc.).
