@@ -225,6 +225,30 @@ func holdProcessLease(t *testing.T, record stateRecord) *ownedLock {
 	return lease
 }
 
+// holdCommandLock takes the command lock of an instance until the test ends.
+func holdCommandLock(t *testing.T, record stateRecord) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	paths, err := openPaths(ctx, record.Identity, inspectPaths)
+	if err != nil {
+		t.Fatalf("pin command lock: %v", err)
+	}
+	command, err := openLock(paths, commandLock)
+	closeErr := paths.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("open command lock: %v; close paths: %v", err, closeErr)
+	}
+	if err := lock(ctx, command); err != nil {
+		t.Fatalf("take command lock: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(unlock(command), command.Close()); err != nil {
+			t.Errorf("release command lock: %v", err)
+		}
+	})
+}
+
 func awaitProcessExit(t *testing.T, lease *ownedLock, record stateRecord) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
@@ -416,9 +440,14 @@ func TestProcessOptionsPipeExpires(t *testing.T) {
 	}
 }
 
+// TestProcessExpiredDeleteReportsReason holds the command lock, so delete
+// waits until its lifecycle deadline expires. A deadline of 1ns does not
+// expire reliably before the command ends: the Windows clock advances in
+// ticks, and the context timer fires only at the next tick.
 func TestProcessExpiredDeleteReportsReason(t *testing.T) {
 	f := newProcessFixture(t)
-	f.timeout = time.Nanosecond
+	holdCommandLock(t, f.start())
+	f.timeout = 250 * time.Millisecond
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	out, stderr, err := f.command(ctx, "delete", nil)
