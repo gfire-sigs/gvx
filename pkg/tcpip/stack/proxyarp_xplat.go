@@ -40,6 +40,13 @@ func (s *Stack) SetProxyARPPolicy(p ProxyARPPolicy) {
 // for the gateway 169.254.1.1, and the host answers because the default route
 // leads out of another NIC.
 func (s *Stack) ProxyARPReply(nicID tcpip.NICID, sender, target tcpip.Address) bool {
+	// arp_process() answers a probe from the address 0.0.0.0 (RFC 5227
+	// duplicate address detection) only for a local address, and it drops a
+	// request for a multicast or a loopback address before it asks the route
+	// table. So none of them gets a proxy reply.
+	if sender.Unspecified() || header.IsV4MulticastAddress(target) || header.IsV4LoopbackAddress(target) {
+		return false
+	}
 	policy := s.fib.proxyARP.Load()
 	if policy == nil || !(*policy)(nicID) {
 		return false

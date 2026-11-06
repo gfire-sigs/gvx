@@ -534,3 +534,34 @@ func TestSourceAddressOfARouteWithoutAddressIsStable(t *testing.T) {
 		}
 	}
 }
+
+// TestProxyARPSkipsProbesMulticastAndLoopback checks the requests that
+// arp_process() of Linux never answers for another host: a duplicate address
+// probe from 0.0.0.0, and a request for a multicast or loopback address.
+func TestProxyARPSkipsProbesMulticastAndLoopback(t *testing.T) {
+	s := newFibStack(t)
+	const cali = tcpip.NICID(3)
+	if err := s.CreateNICWithOptions(cali, channel.New(8, 1500, ""), stack.NICOptions{Name: "cali0"}); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if _, err := s.SetNICForwarding(cali, ipv4.ProtocolNumber, true); err != nil {
+		t.Fatalf("SetNICForwarding: %v", err)
+	}
+	s.SetProxyARPPolicy(func(id tcpip.NICID) bool { return id == cali })
+	pod := fibAddr(10, 5, 0, 2)
+	for _, tc := range []struct {
+		name           string
+		sender, target tcpip.Address
+		want           bool
+	}{
+		{"gateway of a pod", pod, fibAddr(169, 254, 1, 1), true},
+		{"host behind another NIC", pod, fibAddr(10, 0, 0, 77), true},
+		{"duplicate address probe", fibAddr(0, 0, 0, 0), fibAddr(169, 254, 1, 1), false},
+		{"multicast target", pod, fibAddr(224, 0, 0, 251), false},
+		{"loopback target", pod, fibAddr(127, 0, 0, 1), false},
+	} {
+		if got := s.ProxyARPReply(cali, tc.sender, tc.target); got != tc.want {
+			t.Errorf("%s: ProxyARPReply = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
