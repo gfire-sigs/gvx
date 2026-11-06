@@ -359,6 +359,12 @@ On `amd64`, `New` reads the XSAVE state of one probe vCPU and checks its compact
 
 The macOS engine `darwinsystrap` was removed because of compatibility problems. It forced 16KB guest pages, so executables with 4KB-aligned segments failed. macOS also reserves a 4GB `PAGEZERO` in every `arm64` task, so non-PIE executables that link below 4GB failed. `hvf` runs both kinds natively.
 
+#### Stub Thread Wake-Up on Linux (Descriptive Module)
+
+The Linux engine wakes a stub thread through a seccomp listener. The Sentry reads the notification of the thread and answers it. The kernel allows one listener in the filter chain of a task. A sandbox that runs inside another sandbox can have a listener in its chain already.
+
+The engine installs the listener of each new stub thread and reads the error from the kernel. On `EBUSY`, it writes one warning for the process and stops the attempt for every later stub. Those stub threads use the futex loop. The futex loop is slower. Any other error stops the start of the stub.
+
 #### `membarrier` on `systrap` (Descriptive Module)
 
 The guest threads of `winsystrap` run in stub processes, so `FlushProcessWriteBuffers` in the Sentry cannot order them. `GlobalMemoryBarrier` suspends each stub thread that can run guest code, reads its context, and resumes it. The context call returns after the thread left user mode. A thread that the engine parked, or that waits in the spill routine for the Sentry, runs no guest code and needs no stop. The call holds the per-thread lock of the engine, so it never changes a suspend count that another operation owns. It suspends all running threads first, reads their contexts, and then resumes them, so the threads leave user mode in parallel. `FlushProcessWriteBuffers` in the Sentry orders the Sentry threads. [`systrap-windows.md`](systrap-windows.md) section 9 gives the reasoning and the limits.
