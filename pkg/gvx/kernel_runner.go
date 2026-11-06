@@ -1196,10 +1196,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		guard := memoryGuard{
 			limit: limit,
 			// The accounting counts a committed page only after a scan of the
-			// memory file. UpdateUsage limits its own scan rate.
+			// memory file. UpdateUsage limits its own scan rate. The count
+			// covers this memory file only: usage.MemoryAccounting also holds
+			// the pages of the other sandboxes of the process.
 			used: func() uint64 {
 				_ = mf.UpdateUsage(nil)
-				return usage.MemoryAccounting.Total()
+				return mf.KnownCommittedBytes()
 			},
 			interval: interval,
 			kill: func() {

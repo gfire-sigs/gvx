@@ -84,6 +84,15 @@ func requireBackend(t *testing.T, b gateBackend) {
 	}
 }
 
+// requireAutoPlatform skips the calling test when the automatic backend is a
+// hardware hypervisor that does not start. A test that names the automatic
+// backend directly calls it, because the backend list of gateBackends is not
+// in the loop of that test.
+func requireAutoPlatform(t *testing.T) {
+	t.Helper()
+	requireBackend(t, gateBackend{string(autoPlatform()), autoPlatform()})
+}
+
 // outputLog is a concurrency-safe transcript of guest output. Waiters wake on
 // every write, so tests never poll with sleeps.
 type outputLog struct {

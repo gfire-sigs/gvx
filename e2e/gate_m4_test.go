@@ -644,6 +644,7 @@ echo REOPEN-OK`},
 // the CLI with the default lockdown, so the Seatbelt or JobObject profile
 // covers every workspace operation of the script.
 func TestE2EGateM4TortureUnderDefaultLockdown(t *testing.T) {
+	requireAutoPlatform(t)
 	requireRegistry(t)
 	rungv := toolPath(t, rungvPkg)
 	workspace := t.TempDir()

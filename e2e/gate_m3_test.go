@@ -282,6 +282,7 @@ func TestE2EGateM3NodeAlpine(t *testing.T) {
 // manifest, and a run for it fails on the hardware backends, because the
 // guest architecture must equal the host architecture there.
 func TestE2EGateM3ArchitectureSelection(t *testing.T) {
+	requireAutoPlatform(t)
 	requireRegistry(t)
 	rungv := toolPath(t, rungvPkg)
 	cacheDir := t.TempDir()
