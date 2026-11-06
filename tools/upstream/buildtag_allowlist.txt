@@ -314,3 +314,9 @@ seam pkg/sentry/inet/inet.go
 seam pkg/sentry/socket/hostinet/netlink.go
 seam pkg/syserr/netstack.go
 seam pkg/tcpip/transport/internal/network/endpoint.go
+
+# Content seams: a rule can be a goto (pkg/sentry/socket/netfilter/goto_xplat.go), and the
+# ARP endpoint answers for an address that the host routes through another link
+# (pkg/tcpip/stack/proxyarp_xplat.go).
+seam pkg/sentry/socket/netfilter/targets.go
+seam pkg/tcpip/network/arp/arp.go

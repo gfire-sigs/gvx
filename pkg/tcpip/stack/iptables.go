@@ -684,7 +684,7 @@ func (it *IPTables) check(table Table, hook Hook, pkt *PacketBuffer, r *Route, a
 			return true
 		case RuleDrop:
 			return false
-		case RuleJump, RuleReturn:
+		case RuleJump, RuleReturn, RuleGoto:
 			panic("Underflows should only return RuleAccept or RuleDrop.")
 		default:
 			panic(fmt.Sprintf("Unknown verdict: %d", v))
@@ -745,6 +745,10 @@ func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleId
 		case RuleContinue:
 			ruleIdx++
 			continue
+
+		case RuleGoto:
+			// The chain of a goto returns to the caller of this chain.
+			return it.checkChain(hook, pkt, table, jumpTo, r, addressEP, inNicName, outNicName, depth+1)
 
 		case RuleJump:
 			// "Jumping" to the next rule just means we're

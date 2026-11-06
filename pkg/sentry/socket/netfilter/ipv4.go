@@ -94,6 +94,7 @@ func getEntries4(table stack.Table, tablename linux.TableName) (linux.KernelIPTG
 		if rule.Filter.OutputInterfaceInvert {
 			entry.Entry.IP.InverseFlags |= linux.IPT_INV_VIA_OUT
 		}
+		entry.Entry.IP.Flags |= gotoFlags(rule.Target, iptFGoto)
 
 		for _, matcher := range rule.Matchers {
 			// Serialize the matcher and add it to the
@@ -191,6 +192,7 @@ func modifyEntries4(mapper IDMapper, optVal []byte, replace *linux.IPTReplace, t
 				nflog("failed to parse target: %v", err)
 				return nil, nil, err
 			}
+			markGoto(target, entry.IP.Flags, iptFGoto)
 			rule.Target = target
 		default:
 			targets[int(entryIdx)] = optVal[:targetSize]
@@ -247,7 +249,7 @@ func containsUnsupportedFields4(iptip linux.IPTIP) bool {
 	//	- The inverse destination IP check flag
 	//	- InputInterface, InputInterfaceMask and its inverse.
 	//	- OutputInterface, OutputInterfaceMask and its inverse.
-	const flagMask = 0
+	const flagMask = iptFGoto
 	// Disable any supported inverse flags.
 	const inverseMask = linux.IPT_INV_DSTIP | linux.IPT_INV_SRCIP |
 		linux.IPT_INV_VIA_IN | linux.IPT_INV_VIA_OUT

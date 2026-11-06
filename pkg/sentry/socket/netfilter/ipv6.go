@@ -94,6 +94,7 @@ func getEntries6(table stack.Table, tablename linux.TableName) (linux.KernelIP6T
 		if rule.Filter.OutputInterfaceInvert {
 			entry.Entry.IPv6.InverseFlags |= linux.IP6T_INV_VIA_OUT
 		}
+		entry.Entry.IPv6.Flags |= gotoFlags(rule.Target, linux.IP6T_F_GOTO)
 		if rule.Filter.CheckProtocol {
 			entry.Entry.IPv6.Flags |= linux.IP6T_F_PROTO
 		}
@@ -194,6 +195,7 @@ func modifyEntries6(mapper IDMapper, optVal []byte, replace *linux.IPTReplace, t
 				nflog("failed to parse target: %v", err)
 				return nil, nil, err
 			}
+			markGoto(target, entry.IPv6.Flags, linux.IP6T_F_GOTO)
 			rule.Target = target
 		default:
 			targets[int(entryIdx)] = optVal[:targetSize]
@@ -250,7 +252,7 @@ func containsUnsupportedFields6(iptip linux.IP6TIP) bool {
 	//	- The inverse destination IP check flag
 	//	- InputInterface, InputInterfaceMask and its inverse.
 	//	- OutputInterface, OutputInterfaceMask and its inverse.
-	const flagMask = linux.IP6T_F_PROTO
+	const flagMask = linux.IP6T_F_PROTO | linux.IP6T_F_GOTO
 	// Disable any supported inverse flags.
 	const inverseMask = linux.IP6T_INV_DSTIP | linux.IP6T_INV_SRCIP |
 		linux.IP6T_INV_VIA_IN | linux.IP6T_INV_VIA_OUT
