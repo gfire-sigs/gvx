@@ -740,6 +740,12 @@ func (d *netRouteData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 			continue
 		}
 
+		// /proc/net/route lists the table main only, as fib_route_seq_start
+		// does. A route with table 0 belongs to the table main.
+		if rt.Table != 0 && rt.Table != linux.RT_TABLE_MAIN {
+			continue
+		}
+
 		iface, ok := interfaces[rt.OutputInterface]
 		if !ok || iface.Name == "lo" {
 			continue
@@ -765,7 +771,7 @@ func (d *netRouteData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 			flags,
 			0, // RefCnt.
 			0, // Use.
-			0, // Metric.
+			rt.Priority,
 			(uint32(1)<<rt.DstLen)-1,
 			0, // MTU.
 			0, // Window.

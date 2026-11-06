@@ -27,6 +27,11 @@ type InterfaceTarget interface {
 	ActionOnInterfaces(pkt *PacketBuffer, hook Hook, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) (RuleVerdict, int)
 }
 
+// RuleGoto is the verdict of "-g chain". It enters the chain like RuleJump,
+// but the chain returns to the caller of the current chain, as Linux does when a
+// rule has IPT_F_GOTO. Only checkChain reads it.
+const RuleGoto RuleVerdict = RuleContinue + 1
+
 // runTarget runs the target of a rule that matched.
 func runTarget(target Target, pkt *PacketBuffer, hook Hook, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) (RuleVerdict, int) {
 	if t, ok := target.(InterfaceTarget); ok {

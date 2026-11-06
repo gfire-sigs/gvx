@@ -265,6 +265,7 @@ func (n *nic) disable() {
 //
 // +checklocks:n.enableDisableMu
 func (n *nic) disableLocked() {
+	defer n.stack.invalidateHostAddrs()
 	if !n.Enabled() {
 		return
 	}
@@ -305,6 +306,7 @@ func (n *nic) disableLocked() {
 func (n *nic) enable() tcpip.Error {
 	n.enableDisableMu.Lock()
 	defer n.enableDisableMu.Unlock()
+	defer n.stack.invalidateHostAddrs()
 
 	if !n.setEnabled(true) {
 		return nil
@@ -329,6 +331,7 @@ func (n *nic) enable() tcpip.Error {
 // It returns an action that has to be executed after releasing the Stack lock
 // and any error encountered.
 func (n *nic) remove(closeLinkEndpoint bool) (func(), tcpip.Error) {
+	defer n.stack.invalidateHostAddrs()
 	n.enableDisableMu.Lock()
 
 	n.disableLocked()
@@ -547,6 +550,7 @@ func (n *nic) getAddressOrCreateTempInner(protocol tcpip.NetworkProtocolNumber, 
 // addAddress adds a new address to n, so that it starts accepting packets
 // targeted at the given address (and network protocol).
 func (n *nic) addAddress(protocolAddress tcpip.ProtocolAddress, properties AddressProperties) tcpip.Error {
+	defer n.stack.invalidateHostAddrs()
 	ep := n.getNetworkEndpoint(protocolAddress.Protocol)
 	if ep == nil {
 		return &tcpip.ErrUnknownProtocol{}
@@ -629,6 +633,7 @@ func (n *nic) PrimaryAddress(proto tcpip.NetworkProtocolNumber) (tcpip.AddressWi
 
 // removeAddress removes an address from n.
 func (n *nic) removeAddress(addr tcpip.Address) tcpip.Error {
+	defer n.stack.invalidateHostAddrs()
 	for _, ep := range n.networkEndpoints {
 		addressableEndpoint, ok := ep.(AddressableEndpoint)
 		if !ok {

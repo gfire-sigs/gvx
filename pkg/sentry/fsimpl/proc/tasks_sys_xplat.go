@@ -40,8 +40,9 @@ import (
 // reads conf/<bridge>/accept_ra for IPv6 bridges.
 
 const (
-	netIPv4ConfPath = "net/ipv4/conf"
-	netIPv6ConfPath = "net/ipv6/conf"
+	netIPv4ConfPath  = "net/ipv4/conf"
+	netIPv6ConfPath  = "net/ipv6/conf"
+	netIPv4NeighPath = "net/ipv4/neigh"
 )
 
 // netConfDir is a conf directory whose link subdirectories follow the links of
@@ -63,7 +64,7 @@ var _ kernfs.Inode = (*netConfDir)(nil)
 // directories of a network stack.
 func (fs *filesystem) newSysSubdir(ctx context.Context, root *auth.Credentials, k *kernel.Kernel, stack inet.Stack, path string) kernfs.Inode {
 	dir := fs.newLazySysDir(ctx, root, k, path).(*lazySysDir)
-	if stack == nil || (path != netIPv4ConfPath && path != netIPv6ConfPath) {
+	if stack == nil || (path != netIPv4ConfPath && path != netIPv6ConfPath && path != netIPv4NeighPath) {
 		return dir
 	}
 	return &netConfDir{lazySysDir: dir, stack: stack}
@@ -179,10 +180,16 @@ func (d *netConfDir) syncLinks(ctx context.Context) {
 // linkConfFiles returns the files of the conf directory of one link. confPath
 // is the path of the conf directory relative to /proc/sys.
 func (fs *filesystem) linkConfFiles(ctx context.Context, root *auth.Credentials, stack inet.Stack, confPath string, id int32) map[string]kernfs.Inode {
+	if confPath == netIPv4NeighPath {
+		return fs.linkNeighFiles(ctx, root, stack, id)
+	}
 	if confPath == netIPv4ConfPath {
-		return map[string]kernfs.Inode{
+		files := map[string]kernfs.Inode{
 			"route_localnet": fs.newInode(ctx, root, 0644, &routeLocalnetLinkData{stack: stack, id: id}),
+			"rp_filter":      fs.newInode(ctx, root, 0644, &linkRPFilter{stack: stack, id: id}),
 		}
+		fs.addLinkConfValueFiles(ctx, root, stack, id, files)
+		return files
 	}
 	acceptRA := new(atomicbitops.Int32)
 	acceptRA.Store(1)

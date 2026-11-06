@@ -185,7 +185,8 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		stats.requestsReceived.Increment()
 		localAddr := tcpip.AddrFrom4Slice(h.ProtocolAddressTarget())
 
-		if !e.nic.CheckLocalAddress(header.IPv4ProtocolNumber, localAddr) {
+		if !e.nic.CheckLocalAddress(header.IPv4ProtocolNumber, localAddr) &&
+			!e.protocol.stack.ProxyARPReply(e.nic.ID(), tcpip.AddrFrom4Slice(h.ProtocolAddressSender()), localAddr) {
 			stats.requestsReceivedUnknownTargetAddress.Increment()
 			return // we have no useful answer, ignore the request
 		}
@@ -329,8 +330,12 @@ func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remot
 		}
 
 		if addr.Address.BitLen() == 0 {
-			stats.outgoingRequestInterfaceHasNoLocalAddressErrors.Increment()
-			return &tcpip.ErrNetworkUnreachable{}
+			from, ok := e.protocol.stack.FallbackARPSource(e.nic.ID())
+			if !ok {
+				stats.outgoingRequestInterfaceHasNoLocalAddressErrors.Increment()
+				return &tcpip.ErrNetworkUnreachable{}
+			}
+			addr.Address = from
 		}
 
 		localAddr = addr.Address

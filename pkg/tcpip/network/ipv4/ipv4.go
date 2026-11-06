@@ -904,7 +904,7 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 
 	stk := e.protocol.stack
 
-	r, err := stk.FindRoute(0, tcpip.Address{}, dstAddr, ProtocolNumber, false /* multicastLoop */)
+	r, err := stk.FindRouteFlow(stack.RouteFlow{Mark: pkt.Mark, InputNIC: pkt.NICID, Source: h.SourceAddress()}, 0, tcpip.Address{}, dstAddr, ProtocolNumber, false /* multicastLoop */)
 	switch err.(type) {
 	case nil:
 	case *tcpip.ErrNetworkUnreachable:
@@ -912,6 +912,15 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 		// the ICMP packet because the original error is more relevant to
 		// the caller.
 		_ = e.protocol.returnError(&icmpReasonNetworkUnreachable{}, pkt, false /* deliveredLocally */)
+		return &ip.ErrHostUnreachable{}
+	case *tcpip.ErrHostUnreachable:
+		_ = e.protocol.returnError(&icmpReasonHostUnreachable{}, pkt, false /* deliveredLocally */)
+		return &ip.ErrHostUnreachable{}
+	case *tcpip.ErrRouteProhibited:
+		_ = e.protocol.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, false /* deliveredLocally */)
+		return &ip.ErrHostUnreachable{}
+	case *tcpip.ErrRouteBlackhole:
+		// A blackhole route drops the packet without a reply.
 		return &ip.ErrHostUnreachable{}
 	default:
 		return &ip.ErrOther{Err: err}
@@ -993,6 +1002,14 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 				// nftables is telling us to drop the packet.
 				return
 			}
+		}
+
+		// The reverse path check follows the prerouting hooks, as the
+		// routing decision does in Linux.
+		h = header.IPv4(pkt.NetworkHeader().Slice())
+		if !stk.SourceAddressValid(nicID, h.SourceAddress(), h.DestinationAddress(), pkt.Mark, h.TransportProtocol()) {
+			stats.InvalidSourceAddressesReceived.Increment()
+			return
 		}
 	}
 	// CheckPrerouting can modify the backing storage of the packet, so refresh

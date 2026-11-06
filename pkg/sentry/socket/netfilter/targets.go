@@ -541,6 +541,9 @@ type JumpTarget struct {
 
 	// NetworkProtocol is the network protocol the target is used with.
 	NetworkProtocol tcpip.NetworkProtocolNumber
+
+	// Goto is set for "-g chain": the jump pushes no return address.
+	Goto bool
 }
 
 // ID implements Target.ID.
@@ -552,6 +555,9 @@ func (jt *JumpTarget) id() targetID {
 
 // Action implements stack.Target.Action.
 func (jt *JumpTarget) Action(*stack.PacketBuffer, stack.Hook, *stack.Route, stack.AddressableEndpoint) (stack.RuleVerdict, int) {
+	if jt.Goto {
+		return stack.RuleGoto, jt.RuleNum
+	}
 	return stack.RuleJump, jt.RuleNum
 }
 

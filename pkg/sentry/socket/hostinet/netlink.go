@@ -149,7 +149,7 @@ func extractRoutes(routeMsgs []syscall.NetlinkMessage) ([]inet.Route, error) {
 			DstLen:   ifRoute.DstLen,
 			SrcLen:   ifRoute.SrcLen,
 			TOS:      ifRoute.TOS,
-			Table:    ifRoute.Table,
+			Table:    uint32(ifRoute.Table),
 			Protocol: ifRoute.Protocol,
 			Scope:    ifRoute.Scope,
 			Type:     ifRoute.Type,

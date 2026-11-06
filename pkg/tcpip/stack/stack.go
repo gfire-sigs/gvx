@@ -92,6 +92,9 @@ type Stack struct {
 	// routeTable is a list of routes sorted by prefix length, longest (most specific) first.
 	// +checklocks:routeMu
 	routeTable tcpip.RouteList `state:"nosave"`
+	// fib holds the routing rules.
+	// +checklocks:routeMu
+	fib fibState `state:"nosave"`
 
 	mu stackRWMutex `state:"nosave"`
 	// +checklocks:mu
@@ -836,6 +839,7 @@ func (s *Stack) SetPortRange(start uint16, end uint16) tcpip.Error {
 func (s *Stack) SetRouteTable(table []tcpip.Route) {
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
+	s.fib.routesChanged()
 	s.routeTable.Reset()
 	for _, r := range table {
 		s.addRouteLocked(&r)
@@ -862,10 +866,11 @@ func (s *Stack) AddRoute(route tcpip.Route) {
 
 // +checklocks:s.routeMu
 func (s *Stack) addRouteLocked(route *tcpip.Route) {
+	s.fib.routesChanged()
 	routePrefix := route.Destination.Prefix()
 	n := s.routeTable.Front()
 	for ; n != nil; n = n.Next() {
-		if n.Destination.Prefix() < routePrefix {
+		if n.Destination.Prefix() < routePrefix || (n.Destination.Prefix() == routePrefix && n.Metric > route.Metric) {
 			s.routeTable.InsertBefore(n, route)
 			return
 		}
@@ -884,6 +889,7 @@ func (s *Stack) RemoveRoutes(match func(tcpip.Route) bool) int {
 
 // +checklocks:s.routeMu
 func (s *Stack) removeRoutesLocked(match func(tcpip.Route) bool) int {
+	s.fib.routesChanged()
 	count := 0
 	for route := s.routeTable.Front(); route != nil; {
 		next := route.Next()
@@ -1043,6 +1049,7 @@ func (s *Stack) CreateNICWithOptions(id tcpip.NICID, ep LinkEndpoint, opts NICOp
 		}
 	}
 	s.nics[id] = n
+	s.nicsChanged()
 	if n.kind == "tun" {
 		s.preservedNICs[id] = n
 	}
@@ -1142,6 +1149,7 @@ func (s *Stack) removeNICLocked(id tcpip.NICID, closeLinkEndpoint bool) (func(),
 		return nil, &tcpip.ErrUnknownNICID{}
 	}
 	delete(s.nics, id)
+	s.nicsChanged()
 	delete(s.preservedNICs, id)
 
 	if nic.Primary != nil {
@@ -1153,6 +1161,7 @@ func (s *Stack) removeNICLocked(id tcpip.NICID, closeLinkEndpoint bool) (func(),
 
 	// Remove routes in-place. n tracks the number of routes written.
 	s.routeMu.Lock()
+	s.fib.routesChanged()
 	for r := s.routeTable.Front(); r != nil; {
 		next := r.Next()
 		if r.NIC == id {
@@ -1643,17 +1652,24 @@ func isNICForwarding(nic *nic, proto tcpip.NetworkProtocolNumber) bool {
 //
 // +checklocksread:s.mu
 func (s *Stack) findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoingNIC *nic, localAddr, remoteAddr, srcHint, gateway tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool, mtu uint32) *Route {
-	for _, aNIC := range s.nics {
-		addressEndpoint := s.getAddressEP(aNIC, localAddr, remoteAddr, srcHint, netProto)
-		if addressEndpoint == nil {
-			continue
-		}
-
-		if r := constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, outgoingNIC, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop, mtu); r != nil {
+	for _, aNIC := range s.sourceNICOrderRLocked() {
+		if r := s.routeFromSourceNICRLocked(aNIC, outgoingNIC, localAddr, remoteAddr, srcHint, gateway, netProto, multicastLoop, mtu); r != nil {
 			return r
 		}
 	}
 	return nil
+}
+
+// routeFromSourceNICRLocked returns a route that takes its local address from
+// aNIC and leaves through outgoingNIC, or nil when aNIC has no usable address.
+//
+// +checklocksread:s.mu
+func (s *Stack) routeFromSourceNICRLocked(aNIC, outgoingNIC *nic, localAddr, remoteAddr, srcHint, gateway tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool, mtu uint32) *Route {
+	addressEndpoint := s.getAddressEP(aNIC, localAddr, remoteAddr, srcHint, netProto)
+	if addressEndpoint == nil {
+		return nil
+	}
+	return constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, outgoingNIC, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop, mtu)
 }
 
 // FindRoute creates a route to the given destination address, leaving through
@@ -1667,7 +1683,7 @@ func (s *Stack) findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoingNIC *nic, 
 // If no local address is provided, the stack will select a local address. If no
 // remote address is provided, the stack will use a remote address equal to the
 // local address.
-func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) (*Route, tcpip.Error) {
+func (s *Stack) FindRouteFlow(flow RouteFlow, id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) (*Route, tcpip.Error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1718,15 +1734,12 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 
 	// Find a route to the remote with the route table.
 	var chosenRoute tcpip.Route
+	lookup := newRouteLookup(flow, id, localAddr, remoteAddr, netProto)
 	if r := func() *Route {
 		s.routeMu.RLock()
 		defer s.routeMu.RUnlock()
 
-		for route := s.routeTable.Front(); route != nil; route = route.Next() {
-			if remoteAddr.BitLen() != 0 && !route.Destination.Contains(remoteAddr) {
-				continue
-			}
-
+		for route := range s.fibRoutes(&lookup) {
 			nic, ok := s.nics[route.NIC]
 			if !ok || !nic.Enabled() {
 				continue
@@ -1762,6 +1775,13 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 			if onlyGlobalAddresses && chosenRoute.Equal(tcpip.Route{}) && isNICForwarding(nic, netProto) {
 				if locallyGenerated {
 					chosenRoute = *route
+					// Linux picks the route by the destination, the mark, and
+					// the rules, and not by the NIC that owns the source
+					// address, so the first route is the one for a packet from
+					// an address that the caller named.
+					if localAddr.BitLen() != 0 {
+						return nil
+					}
 					continue
 				}
 
@@ -1812,13 +1832,20 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 
 	// A reply to a packet for an address of another NIC pins the NIC where the
 	// packet arrived. Linux uses the weak host model for it with or without
-	// forwarding.
+	// forwarding. The weak host lookup runs before the check of a reject route,
+	// because a route with a longer prefix can come before the reject route, as
+	// a host route to a pod comes before the blackhole route of its block.
 	if id != 0 {
 		if aNIC, ok := s.nics[id]; ok {
-			if r := s.weakHostRouteRLocked(aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
+			if r := s.weakHostRouteRLocked(flow, aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
 				return r, nil
 			}
 		}
+	}
+
+	// A reject route or rule decided the lookup, so no other NIC can carry it.
+	if lookup.err != nil {
+		return nil, lookup.err
 	}
 
 	if needRoute {
@@ -2219,6 +2246,7 @@ func (s *Stack) ReplaceConfig(st *Stack) {
 	for id, nic := range nics {
 		nic.stack = s
 		s.nics[id] = nic
+		s.nicsChanged()
 		if nic.IsLoopback() {
 			s.loopbackNIC = nic
 		} else if s.externalNetworkingDisabled {
@@ -2237,6 +2265,7 @@ func (s *Stack) Restore() {
 	for id, nic := range s.preservedNICs {
 		nic.stack = s
 		s.nics[id] = nic
+		s.nicsChanged()
 		nic.NetworkLinkEndpoint.SetOnCloseAction(func() {
 			s.RemoveNIC(id)
 		})

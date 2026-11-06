@@ -131,6 +131,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fsDirChildren["cgroup"] = fs.newCgroupDir(ctx, creds, defaultSysDirMode, nil)
 	}
 
+	// Linux creates /sys/fs/bpf as the mountpoint of bpffs, see
+	// kernel/bpf/inode.c:bpf_init().
+	fsDirChildren["bpf"] = fs.newBPFMountDir(ctx, creds)
+
 	classSub := map[string]kernfs.Inode{ // /sys/class
 		"block":        fs.newBlockListDir(ctx, creds, byDiskName),
 		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),

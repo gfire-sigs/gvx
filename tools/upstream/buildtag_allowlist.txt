@@ -22,7 +22,7 @@ pkg/sentry/arch/arch.go
 pkg/ring0/ring0.go
 pkg/sentry/vfs/vfs.go
 pkg/sentry/fsimpl/tmpfs/tmpfs.go
-pkg/tcpip/tcpip.go
+seam pkg/tcpip/tcpip.go
 
 # Content seams: EROFS inline xattr, device node, and listxattr support (SPEC 3.6).
 # Upstream rejects any inode with xattrs, which breaks OCI layers that carry capabilities.
@@ -304,3 +304,19 @@ linux-only webhook/**
 linux-only pkg/shim/**
 linux-only tools/xdp/**
 linux-only pkg/sentry/fsimpl/gofer/
+
+# Content seams: routing rules, route tables, and route types of the guest
+# (pkg/tcpip/stack/fib_xplat.go, pkg/tcpip/route_xplat.go). RouteAttrs joins tcpip.Route,
+# a lookup carries the mark of the socket, and a reject route has its own errors with
+# the errno of Linux. inet.Route gets the metric, the preferred source, and the MTU.
+# hostinet keeps its table of the host through the wider type.
+seam pkg/sentry/inet/inet.go
+seam pkg/sentry/socket/hostinet/netlink.go
+seam pkg/syserr/netstack.go
+seam pkg/tcpip/transport/internal/network/endpoint.go
+
+# Content seams: a rule can be a goto (pkg/sentry/socket/netfilter/goto_xplat.go), and the
+# ARP endpoint answers for an address that the host routes through another link
+# (pkg/tcpip/stack/proxyarp_xplat.go).
+seam pkg/sentry/socket/netfilter/targets.go
+seam pkg/tcpip/network/arp/arp.go

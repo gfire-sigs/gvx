@@ -1153,13 +1153,19 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 		return &ip.ErrParameterProblem{}
 	}
 
-	r, err := stk.FindRoute(0, tcpip.Address{}, dstAddr, ProtocolNumber, false /* multicastLoop */)
+	r, err := stk.FindRouteFlow(stack.RouteFlow{Mark: pkt.Mark, InputNIC: pkt.NICID, Source: h.SourceAddress()}, 0, tcpip.Address{}, dstAddr, ProtocolNumber, false /* multicastLoop */)
 	switch err.(type) {
 	case nil:
-	case *tcpip.ErrNetworkUnreachable, *tcpip.ErrBadLocalAddress:
+	case *tcpip.ErrNetworkUnreachable, *tcpip.ErrBadLocalAddress, *tcpip.ErrHostUnreachable:
 		// We return the original error rather than the result of returning the
 		// ICMP packet because the original error is more relevant to the caller.
 		_ = e.protocol.returnError(&icmpReasonNetUnreachable{}, pkt, false /* deliveredLocally */)
+		return &ip.ErrHostUnreachable{}
+	case *tcpip.ErrRouteProhibited:
+		_ = e.protocol.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, false /* deliveredLocally */)
+		return &ip.ErrHostUnreachable{}
+	case *tcpip.ErrRouteBlackhole:
+		// A blackhole route drops the packet without a reply.
 		return &ip.ErrHostUnreachable{}
 	default:
 		return &ip.ErrOther{Err: err}

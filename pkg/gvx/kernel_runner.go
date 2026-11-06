@@ -1012,6 +1012,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	vfsObj.MustRegisterFilesystemType("tmpfs", tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("proc", proc.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("sysfs", sys.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(sys.BPFName, sys.BPFFilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("devtmpfs", dev.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("devpts", &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
@@ -1266,6 +1267,8 @@ func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
 		// The module parameters of xt_recent belong to the kernel, so all
 		// network namespaces share them.
 		netfilter.ShareRecentModule(st, root.Stack)
+		// IPv4 also copies rp_filter of conf/all and conf/default.
+		stack.InheritRPFilter(root)
 	}
 	// nf_conntrack_max is one value for the kernel, as on Linux.
 	stack.InitConntrackLimit(root)

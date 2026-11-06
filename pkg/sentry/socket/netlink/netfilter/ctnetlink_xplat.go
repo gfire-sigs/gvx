@@ -401,8 +401,7 @@ func (f *connFilter) selectsFamily(proto tcpip.NetworkProtocolNumber) bool {
 	return true
 }
 
-// matches reports whether the entry passes every criterion of the filter. The
-// stack keeps no connection mark, so an entry has the mark 0.
+// matches reports whether the entry passes every criterion of the filter.
 func (f *connFilter) matches(e stack.ConntrackEntry) bool {
 	if !f.selectsFamily(e.Original.NetProto) {
 		return false
@@ -413,7 +412,7 @@ func (f *connFilter) matches(e stack.ConntrackEntry) bool {
 	if f.reply != nil && !f.reply.matches(e.Reply) {
 		return false
 	}
-	if f.hasMark && f.mark&f.markMask != 0&f.markMask {
+	if f.hasMark && f.mark&f.markMask != e.Mark&f.markMask {
 		return false
 	}
 	return !f.hasID || f.id == e.ID
@@ -584,7 +583,7 @@ func putEntry(m *nlmsg.Message, e stack.ConntrackEntry) {
 		info.PutAttr(ctaProtoInfoTCP|linux.NLA_F_NESTED, primitive.AsByteSlice(tcp))
 		m.PutNestedAttr(ctaProtoInfo|linux.NLA_F_NESTED, info)
 	}
-	m.PutAttr(ctaMark, nlmsg.PutU32(0))
+	m.PutAttr(ctaMark, nlmsg.PutU32(e.Mark))
 	m.PutAttr(ctaID, nlmsg.PutU32(e.ID))
 	m.PutAttr(ctaUse, nlmsg.PutU32(1))
 }

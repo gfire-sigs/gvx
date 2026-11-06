@@ -478,8 +478,10 @@ func (fs *filesystem) addNodeSysctlFiles(ctx context.Context, root *auth.Credent
 		}
 	case "net/ipv4/conf/all":
 		files["forwarding"] = fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv4.ProtocolNumber})
+		files["rp_filter"] = fs.newInode(ctx, root, 0644, &nsRPFilter{stack: stack})
 	case "net/ipv4/conf/default":
 		files["forwarding"] = fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv4.ProtocolNumber, isDefault: true})
+		files["rp_filter"] = fs.newInode(ctx, root, 0644, &nsRPFilter{stack: stack, isDefault: true})
 	}
 }
 

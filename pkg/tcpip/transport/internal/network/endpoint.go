@@ -654,7 +654,7 @@ func (e *Endpoint) connectRouteRLocked(nicID tcpip.NICID, localAddr tcpip.Addres
 	}
 
 	// Find a route to the desired destination.
-	r, err := e.stack.FindRoute(nicID, localAddr, addr.Addr, netProto, e.ops.GetMulticastLoop())
+	r, err := e.stack.FindRouteFlow(stack.RouteFlow{Mark: e.ops.GetMark()}, nicID, localAddr, addr.Addr, netProto, e.ops.GetMulticastLoop())
 	if err != nil {
 		return nil, 0, err
 	}

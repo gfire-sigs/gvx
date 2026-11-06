@@ -130,11 +130,43 @@ These steps start a server and an agent in two sandboxes on one host. The agent 
 
 The agent publishes no port. It starts the WireGuard handshake, so the server learns the endpoint of the agent. The agent needs `--node-external-ip` because `k3s agent` refuses `--flannel-external-ip`, and the address `192.0.2.1` is a placeholder. Both nodes show the internal address `10.0.2.15`. `kubectl logs` and `kubectl exec` reach the agent through the tunnel of `k3s`.
 
-## 4. Reference
+## 4. Run Calico Instead of flannel (Procedural Module)
+
+Calico replaces `flannel` as the CNI and enforces NetworkPolicy. The VXLAN mode with the legacy iptables back end runs in a `gvx` sandbox. The guest provides the routing rules, the route types, proxy ARP, the reverse path match `rpfilter`, and the ipsets that Felix uses.
+
+> [!IMPORTANT]
+> Start `k3s` after `mount --make-rshared /`. A Linux node with systemd has a shared root mount, and `calico-node` needs a shared `/sys/fs` mount. The guest has no init, so the command makes the root mount shared, as the entrypoint of kind does.
+
+1. Download the manifest `calico-vxlan.yaml` of the Calico release v3.28.2.
+2. Edit the manifest: set `CALICO_IPV4POOL_CIDR` to `10.42.0.0/16`, and add `FELIX_IPTABLESBACKEND` with the value `Legacy` to the environment of `calico-node`.
+3. Put the manifest in a directory that you mount in the guest, such as `/output`.
+4. Start the server. The shell command copies the manifest to the manifest directory of `k3s`.
+
+   ```sh
+   rungv run \
+     -e IPTABLES_MODE=legacy \
+     -p 127.0.0.1:6443:6443 \
+     -v k3s:/var/lib/rancher \
+     --mount type=bind,src=$HOME/.gvx/k3s,dst=/output \
+     --entrypoint /bin/sh \
+     rancher/k3s:v1.31.4-k3s1 -c '
+       mount --make-rshared /
+       mkdir -p /var/lib/rancher/k3s/server/manifests
+       cp /output/calico.yaml /var/lib/rancher/k3s/server/manifests/calico.yaml
+       exec k3s server --flannel-backend=none --disable-network-policy \
+         --cluster-cidr=10.42.0.0/16 --disable=traefik,servicelb \
+         --write-kubeconfig=/output/kubeconfig.yaml --write-kubeconfig-mode=644'
+   ```
+
+5. Wait until `kubectl -n kube-system get pods` shows `calico-node` and `calico-kube-controllers` as `Ready`.
+
+The test `TestE2EK3sCalico` runs these steps. It checks the Ready pods, `coredns`, the pod addresses, pod to pod and pod to service traffic, a deny-all NetworkPolicy, and an allow policy.
+
+## 5. Reference
 
 The tables below list the behavior that the tests prove and the limits of a `gvx` node.
 
-### 4.1 Verified Behavior of a Single Node
+### 5.1 Verified Behavior of a Single Node
 
 The test `TestE2EK3sSingleNode` runs these checks on each backend.
 
@@ -160,7 +192,18 @@ The test `TestE2EK3sNetworkPolicy` checks NetworkPolicy on each backend. The net
 | Sets and rules | The kernel of the guest holds the `KUBE-*` IP sets and a rule with `-m set --match-set` |
 | Policy removal | Traffic returns after the policies end |
 
-### 4.2 Verified Behavior of a Cluster
+The test `TestE2EK3sCalico` runs `k3s` with Calico 3.28.2 in the VXLAN mode. Section 4 gives the procedure.
+
+| Check | Result |
+| :--- | :--- |
+| Calico start | `calico-node` and `calico-kube-controllers` are `Ready`, and `coredns` runs |
+| Addresses | Each pod gets an address of `10.42.0.0/16` from the IP pool of Calico |
+| Traffic | A pod reaches another pod, a service by name, and a service by address |
+| Deny all | A NetworkPolicy that selects a server pod and allows no ingress blocks the clients, also through the service address |
+| Allow by label | A policy that names the client label lets that client through, and another client stays blocked |
+| Policy removal | Traffic returns after the policies end |
+
+### 5.2 Verified Behavior of a Cluster
 
 The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` run their sandboxes on one host. The tests change no image and use no `gvx`-specific option. C2 and C4 copy the `wg` tool of Alpine into the guests, C4 copies `etcdctl`, and C5 copies `sonobuoy`.
 
@@ -172,20 +215,19 @@ The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and 
 | C4 | Three servers with embedded `etcd` over the WireGuard mesh, joined one at a time | The cluster keeps working when the `etcd` leader stops. A surviving server accepts a write within 30 seconds. The tests measured 5 to 9 seconds. |
 | C5 | `sonobuoy` with the `e2e` plugin | The quick mode passes. The `[sig-network] Services` tests pass. |
 
-### 4.3 Known Limits
+### 5.3 Known Limits
 
 These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reasons.
 
 | Limit | Effect |
 | :--- | :--- |
 | `nftables` | Set `IPTABLES_MODE=legacy`. A component that needs `iptables-nft` fails. |
-| Calico | The tests run `kube-router`, the controller of `k3s`. The guest has the IP sets, the match `set`, and the target `SET` that the iptables mode of Calico uses. No test runs Calico itself, so other matches of Felix can still fail. |
+| Calico | `TestE2EK3sCalico` runs the VXLAN mode with the iptables legacy back end. The eBPF data plane and BGP with BIRD are not tested. The guest has no eBPF, so Felix logs warnings about XDP and BPF and goes on. Set `IPTABLES_MODE=legacy` and `FELIX_IPTABLESBACKEND=Legacy`. |
 | NFLOG | `-j NFLOG` accepts a rule, but no group receives a packet, because the guest has no `nflog` listener. |
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
 | Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |
 | MTU | `eth0` has the MTU 1500 at the start, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. Set `--tune net.nat.mtu=N` to start with another value. A node can change it later with `ip link set dev eth0 mtu N` from 68 to 65535, and `flannel` follows the new value at the next start. |
-| WireGuard policy routing | The guest has no `ip rule` and no routing table besides the main one. `wg-quick up` with `AllowedIPs = 0.0.0.0/0` fails at `ip route add ... table`. Set `Table = off` and add the routes with `ip route`. The mark of the link (`fwmark`) reaches iptables, but it cannot choose a table. |
 | WireGuard reply address | A `wireguard` link answers from the address that the route picks, and not from the address that the peer used. The two differ on an interface with several addresses. |
 | WireGuard link-local endpoints | An IPv6 endpoint loses its `sin6_scope_id`. Use a global address. |
 | Neighbor table | Static neighbors and VXLAN FDB entries have no limit, as in Linux. Dynamic neighbors follow `gc_thresh1` to `gc_thresh3` of each network namespace (128, 512, and 1024). The values belong to the namespace, where Linux shares one table for the kernel. `gc_thresh1` has no effect. Set `maxaddr` on a VXLAN link to bound its FDB. |

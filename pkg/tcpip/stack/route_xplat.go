@@ -15,6 +15,9 @@
 package stack
 
 import (
+	"cmp"
+	"slices"
+
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
@@ -36,7 +39,7 @@ import (
 // needs no route, such as a multicast address.
 //
 // +checklocksread:s.mu
-func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) *Route {
+func (s *Stack) weakHostRouteRLocked(flow RouteFlow, pinned *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) *Route {
 	if localAddr.BitLen() == 0 || remoteAddr.BitLen() == 0 {
 		return nil
 	}
@@ -47,11 +50,9 @@ func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Ad
 	}
 
 	var chosen *tcpip.Route
+	lookup := newRouteLookup(flow, 0, localAddr, remoteAddr, netProto)
 	s.routeMu.RLock()
-	for route := s.routeTable.Front(); route != nil; route = route.Next() {
-		if !route.Destination.Contains(remoteAddr) {
-			continue
-		}
+	for route := range s.fibRoutes(&lookup) {
 		if nic, ok := s.nics[route.NIC]; !ok || !nic.Enabled() {
 			continue
 		}
@@ -89,4 +90,48 @@ func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Ad
 		route.weakHost = true
 	}
 	return route
+}
+
+// sourceNICOrderRLocked returns the NICs in the order that Linux uses to pick a
+// source address (inet_select_addr): the NICs in ascending order of ID, and the
+// loopback NICs last. The order does not depend on the iteration order of a
+// map, so the same host gets the same source address each time. The stack
+// keeps the sorted slice between calls and sorts again after a NIC joins or
+// leaves, so a call allocates nothing. The caller must not change the slice.
+//
+// +checklocksread:s.mu
+func (s *Stack) sourceNICOrderRLocked() []*nic {
+	gen := s.fib.nicGen.Load()
+	snap := s.fib.nicOrder.Load()
+	if snap == nil || snap.gen != gen {
+		snap = &nicOrderSnapshot{gen: gen, nics: make([]*nic, 0, len(s.nics))}
+		for _, n := range s.nics {
+			snap.nics = append(snap.nics, n)
+		}
+		slices.SortFunc(snap.nics, func(a, b *nic) int {
+			if al, bl := a.IsLoopback(), b.IsLoopback(); al != bl {
+				if bl {
+					return -1
+				}
+				return 1
+			}
+			return cmp.Compare(a.id, b.id)
+		})
+		s.fib.nicOrder.Store(snap)
+	}
+	return snap.nics
+}
+
+// nicOrderSnapshot holds the NICs in the order of sourceNICOrderRLocked at the
+// generation gen.
+type nicOrderSnapshot struct {
+	gen  uint64
+	nics []*nic
+}
+
+// nicsChanged marks the snapshots that depend on the set of NICs stale. The
+// caller holds s.mu for writing.
+func (s *Stack) nicsChanged() {
+	s.fib.nicGen.Add(1)
+	s.invalidateHostAddrs()
 }

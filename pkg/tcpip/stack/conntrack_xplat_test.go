@@ -15,6 +15,7 @@
 package stack
 
 import (
+	"sync"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/buffer"
@@ -348,5 +349,79 @@ func TestConntrackDeleteTupleExpiresOnlyThatConnection(t *testing.T) {
 	}
 	if got := len(s.ConntrackEntries()); got != len(tuples)-1 {
 		t.Errorf("table holds %d connections, want %d", got, len(tuples)-1)
+	}
+}
+
+// ctTrack tracks the segment and returns the packet with its connection.
+func ctTrack(t *testing.T, ct *ConnTrack, s ctSegment) *PacketBuffer {
+	t.Helper()
+	pkt := ctPacket(s)
+	t.Cleanup(pkt.DecRef)
+	ct.GetConnAndUpdatePkt(pkt, true /* skipChecksumValidation */)
+	if !pkt.IsConnTrackConfigured() {
+		t.Fatalf("segment %+v has no connection", s)
+	}
+	return pkt
+}
+
+// TestConnMarkBelongsToTheConnectionInBothDirections checks that a packet of
+// the reply direction reads the mark that a packet of the original direction
+// set, and that the snapshot of the connection reports it.
+func TestConnMarkBelongsToTheConnectionInBothDirections(t *testing.T) {
+	ct := newTestConnTrack()
+	request := ctTrack(t, ct, ctHandshake[0])
+	if got := request.ConnMark(); got != 0 {
+		t.Fatalf("mark of a new connection = %#x, want 0", got)
+	}
+	request.SetConnMark(0xca6c)
+	// The reply tuple joins the table when the request leaves the stack.
+	request.FinalizeConnTrack()
+
+	reply := ctTrack(t, ct, ctHandshake[1])
+	if got := reply.ConnMark(); got != 0xca6c {
+		t.Errorf("mark seen by the reply = %#x, want 0xca6c", got)
+	}
+	if got := request.tuple.conn.snapshot(ct.clock.NowMonotonic()).Mark; got != 0xca6c {
+		t.Errorf("snapshot mark = %#x, want 0xca6c", got)
+	}
+
+	udp := ctUDPPacket(ctClientPort + 1)
+	defer udp.DecRef()
+	ct.GetConnAndUpdatePkt(udp, true /* skipChecksumValidation */)
+	if got := udp.ConnMark(); got != 0 {
+		t.Errorf("mark of another connection = %#x, want 0", got)
+	}
+}
+
+// TestConnMarkOfAPacketWithoutAConnectionIsZeroAndFixed checks the packet that
+// conntrack does not track.
+func TestConnMarkOfAPacketWithoutAConnectionIsZeroAndFixed(t *testing.T) {
+	pkt := ctPacket(ctHandshake[0])
+	defer pkt.DecRef()
+	pkt.SetConnMark(7)
+	if got := pkt.ConnMark(); got != 0 {
+		t.Errorf("ConnMark = %#x, want 0", got)
+	}
+	if got := pkt.UpdateConnMark(func(uint32) uint32 { return 9 }); got != 0 {
+		t.Errorf("UpdateConnMark = %#x, want 0", got)
+	}
+}
+
+// TestUpdateConnMarkKeepsEveryConcurrentChange checks that packets of one
+// connection that set different bits at the same time lose no bit.
+func TestUpdateConnMarkKeepsEveryConcurrentChange(t *testing.T) {
+	ct := newTestConnTrack()
+	pkt := ctTrack(t, ct, ctHandshake[0])
+	var wg sync.WaitGroup
+	for bit := range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pkt.UpdateConnMark(func(old uint32) uint32 { return old | 1<<bit })
+		}()
+	}
+	wg.Wait()
+	if got := pkt.ConnMark(); got != 0xffffffff {
+		t.Errorf("mark = %#x, want 0xffffffff", got)
 	}
 }

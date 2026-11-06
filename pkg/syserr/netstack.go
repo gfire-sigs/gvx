@@ -56,6 +56,8 @@ var (
 	ErrMissingRequiredFields        = New((&tcpip.ErrMissingRequiredFields{}).String(), errno.EINVAL)
 	ErrNoNet                        = New((&tcpip.ErrNoNet{}).String(), errno.ENONET)
 	ErrEndpointBusy                 = New((&tcpip.ErrEndpointBusy{}).String(), errno.EBUSY)
+	ErrRouteBlackhole               = New((&tcpip.ErrRouteBlackhole{}).String(), errno.EINVAL)
+	ErrRouteProhibited              = New((&tcpip.ErrRouteProhibited{}).String(), errno.EACCES)
 )
 
 // TranslateNetstackError converts an error from the tcpip package to a sentry
@@ -152,6 +154,10 @@ func TranslateNetstackError(err tcpip.Error) *Error {
 		return ErrMissingRequiredFields
 	case *tcpip.ErrEndpointBusy:
 		return ErrEndpointBusy
+	case *tcpip.ErrRouteBlackhole:
+		return ErrRouteBlackhole
+	case *tcpip.ErrRouteProhibited:
+		return ErrRouteProhibited
 	default:
 		panic(fmt.Sprintf("unknown error %T", err))
 	}

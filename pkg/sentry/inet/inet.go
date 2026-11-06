@@ -229,7 +229,7 @@ type Route struct {
 	TOS uint8
 
 	// Table is the routing table ID.
-	Table uint8
+	Table uint32
 
 	// Protocol is the route origin, a Linux RTPROT_* constant.
 	Protocol uint8
@@ -254,6 +254,16 @@ type Route struct {
 
 	// GatewayAddr is the route gateway address (RTA_GATEWAY).
 	GatewayAddr []byte
+
+	// Priority is the route metric (RTA_PRIORITY).
+	Priority uint32
+
+	// PrefSrc is the preferred source address of the route (RTA_PREFSRC).
+	PrefSrc []byte
+
+	// MTU is the route MTU (RTAX_MTU of RTA_METRICS). 0 means the MTU of the
+	// output interface.
+	MTU uint32
 }
 
 // Below SNMP metrics are from Linux/usr/include/linux/snmp.h.

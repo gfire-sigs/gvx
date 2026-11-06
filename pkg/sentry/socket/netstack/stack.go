@@ -56,14 +56,27 @@ type Stack struct {
 	// sysctls stores the /proc/sys/net values that the stack does not own. See
 	// sysctl_store_xplat.go.
 	sysctls sysctlValues `state:"nosave"`
+
+	// offloads keeps the ethtool features of the links. See ethtool_xplat.go.
+	offloads ethtoolState `state:"nosave"`
+
+	// rpFilter keeps the rp_filter values. See rpfilter_xplat.go.
+	rpFilter rpFilterState `state:"nosave"`
+
+	// linkConf keeps the conf and neigh values of the links. See
+	// linkconf_values_xplat.go.
+	linkConf linkConfState `state:"nosave"`
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.
 func NewStack(s *stack.Stack, id uint64) *Stack {
-	return &Stack{
+	st := &Stack{
 		Stack: s,
 		id:    id,
 	}
+	s.SetProxyARPPolicy(st.proxyARPEnabled)
+	s.SetRPFilterPolicy(st.rpFilterPolicy)
+	return st
 }
 
 // AddInterfaceEventSubscriber implements inet.InterfaceEventPublisher.AddInterfaceEventSubscriber.
@@ -96,6 +109,7 @@ func (s *Stack) sendChangeEvent(ctx context.Context, id tcpip.NICID) {
 }
 
 func (s *Stack) sendDeleteEvent(ctx context.Context, id tcpip.NICID, nicInfo *stack.NICInfo) {
+	s.dropLinkState(id)
 	if s.eventSubscriber == nil {
 		return
 	}
@@ -228,6 +242,9 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		case linux.IFLA_MTU:
 		case linux.IFLA_NET_NS_FD:
 		case linux.IFLA_TXQLEN:
+		case linux.IFLA_NUM_TX_QUEUES, linux.IFLA_NUM_RX_QUEUES, linux.IFLA_GSO_MAX_SEGS, linux.IFLA_GSO_MAX_SIZE, linux.IFLA_GROUP:
+			// A link has one queue here, and Linux accepts these values. The
+			// Calico CNI plugin sends the queue counts when it creates a veth.
 		default:
 			ctx.Warningf("unexpected attribute: %x", attr)
 			return syserr.ErrNotSupported
@@ -379,6 +396,7 @@ func (s *Stack) setLinkLockedState(ctx context.Context, id tcpip.NICID, linkAttr
 		}
 		dst.disableMovedLink(id, nicInfo.Kind)
 
+		src.moveLinkState(oldID, dst, id)
 		src.sendDeleteEvent(ctx, oldID, nicInfo) // inform about exit from old ns
 		changed = true                           // inform about entry into new ns
 
@@ -757,15 +775,11 @@ func (s *Stack) AddInterfaceAddr(ctx context.Context, idx int32, addr inet.Inter
 	s.sendAddressEvent(ctx, nicID, addr, true /* added */)
 
 	// Add route for local network if it doesn't exist already.
-	localRoute := tcpip.Route{
-		Destination: protocolAddress.AddressWithPrefix.Subnet(),
-		Gateway:     tcpip.Address{}, // No gateway for local network.
-		NIC:         nicID,
-	}
+	localRoute := prefixRoute(protocolAddress.AddressWithPrefix.Subnet(), nicID)
 
 	sameDst := false
 	for _, rt := range s.Stack.GetRouteTable() {
-		if rt.Equal(localRoute) {
+		if isPrefixRoute(rt, localRoute) {
 			return nil
 		}
 		if rt.Destination.Equal(localRoute.Destination) {
@@ -803,14 +817,10 @@ func (s *Stack) RemoveInterfaceAddr(ctx context.Context, idx int32, addr inet.In
 	s.sendAddressEvent(ctx, nicID, addr, false /* added */)
 
 	// Remove the corresponding local network route if it exists.
-	localRoute := tcpip.Route{
-		Destination: protocolAddress.AddressWithPrefix.Subnet(),
-		Gateway:     tcpip.Address{}, // No gateway for local network.
-		NIC:         nicID,
-	}
+	localRoute := prefixRoute(protocolAddress.AddressWithPrefix.Subnet(), nicID)
 	var removed []tcpip.Route
 	s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
-		if !rt.Equal(localRoute) {
+		if !isPrefixRoute(rt, localRoute) {
 			return false
 		}
 		removed = append(removed, rt)
@@ -1028,253 +1038,6 @@ func (s *Stack) Stats() tcpip.Stats {
 	return s.Stack.Stats()
 }
 
-// RouteTable implements inet.Stack.RouteTable.
-func (s *Stack) RouteTable() []inet.Route {
-	var routeTable []inet.Route
-
-	for _, rt := range s.Stack.GetRouteTable() {
-		if r, ok := makeInetRoute(rt); ok {
-			routeTable = append(routeTable, r)
-		}
-	}
-
-	return routeTable
-}
-
-// makeInetRoute converts a netstack route to the form reported by RTM_GETROUTE.
-func makeInetRoute(rt tcpip.Route) (inet.Route, bool) {
-	var family uint8
-	switch rt.Destination.ID().BitLen() {
-	case header.IPv4AddressSizeBits:
-		family = linux.AF_INET
-	case header.IPv6AddressSizeBits:
-		family = linux.AF_INET6
-	default:
-		log.Warningf("Unknown network protocol in route %+v", rt)
-		return inet.Route{}, false
-	}
-
-	dstAddr := rt.Destination.ID()
-	return inet.Route{
-		Family: family,
-		DstLen: uint8(rt.Destination.Prefix()), // The CIDR prefix for the destination.
-
-		// Always return unspecified protocol since we have no notion of
-		// protocol for routes.
-		Protocol: linux.RTPROT_UNSPEC,
-		// Set statically to LINK scope for now.
-		//
-		// TODO(gvisor.dev/issue/595): Set scope for routes.
-		Scope: linux.RT_SCOPE_LINK,
-		Type:  linux.RTN_UNICAST,
-
-		DstAddr:         dstAddr.AsSlice(),
-		OutputInterface: int32(rt.NIC),
-		GatewayAddr:     rt.Gateway.AsSlice(),
-	}, true
-}
-
-// localRoute constructs a local route from the netlink message.
-func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
-	var rtMsg linux.RouteMessage
-	attrs, ok := msg.GetData(&rtMsg)
-	if !ok {
-		return tcpip.Route{}, syserr.ErrInvalidArgument
-	}
-
-	route := inet.Route{
-		Family:   rtMsg.Family,
-		DstLen:   rtMsg.DstLen,
-		SrcLen:   rtMsg.SrcLen,
-		TOS:      rtMsg.TOS,
-		Table:    rtMsg.Table,
-		Protocol: rtMsg.Protocol,
-		Scope:    rtMsg.Scope,
-		Type:     rtMsg.Type,
-		Flags:    rtMsg.Flags,
-	}
-
-	for !attrs.Empty() {
-		ahdr, value, rest, ok := attrs.ParseFirst()
-		if !ok {
-			return tcpip.Route{}, syserr.ErrInvalidArgument
-		}
-		attrs = rest
-
-		switch ahdr.Type {
-		case linux.RTA_DST:
-			if len(value) < 1 {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			route.DstAddr = value
-		case linux.RTA_SRC:
-			if len(value) < 1 {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			route.SrcAddr = value
-		case linux.RTA_OIF:
-			oif := nlmsg.BytesView(value)
-			outputInterface, ok := oif.Int32()
-			if !ok {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			if _, exist := s.Interfaces()[outputInterface]; !exist {
-				return tcpip.Route{}, syserr.ErrNoDevice
-			}
-			route.OutputInterface = outputInterface
-		case linux.RTA_GATEWAY:
-			if len(value) < 1 {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			route.GatewayAddr = value
-		case linux.RTA_PRIORITY:
-		default:
-			log.Warningf("Unknown attribute: %v", ahdr.Type)
-			return tcpip.Route{}, syserr.ErrNotSupported
-		}
-	}
-	var zero []byte
-	switch route.Family {
-	case linux.AF_INET:
-		zero = tcpip.IPv4Zero
-	case linux.AF_INET6:
-		zero = tcpip.IPv6Zero
-	default:
-		return tcpip.Route{}, syserr.ErrNotSupported
-	}
-	if msg.Header().Type == linux.RTM_NEWROUTE {
-		switch route.Type {
-		case linux.RTN_UNICAST:
-		case linux.RTN_UNSPEC:
-			if route.Family == linux.AF_INET {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-		case linux.RTN_BLACKHOLE, linux.RTN_UNREACHABLE, linux.RTN_PROHIBIT, linux.RTN_THROW, linux.RTN_NAT, linux.RTN_XRESOLVE:
-			if route.Family == linux.AF_INET && (route.GatewayAddr != nil || route.OutputInterface != 0) {
-				return tcpip.Route{}, syserr.ErrInvalidArgument
-			}
-			return tcpip.Route{}, syserr.ErrNotSupported
-		case linux.RTN_LOCAL, linux.RTN_BROADCAST, linux.RTN_ANYCAST, linux.RTN_MULTICAST:
-			return tcpip.Route{}, syserr.ErrNotSupported
-		default:
-			return tcpip.Route{}, syserr.ErrInvalidArgument
-		}
-	}
-	if route.GatewayAddr != nil {
-		if len(route.GatewayAddr) < len(zero) {
-			return tcpip.Route{}, syserr.ErrRange
-		}
-		route.GatewayAddr = route.GatewayAddr[:len(zero)]
-	} else if route.DstAddr == nil && route.OutputInterface == 0 && msg.Header().Type == linux.RTM_NEWROUTE {
-		return tcpip.Route{}, syserr.ErrNoDevice
-	}
-	var dest tcpip.Subnet
-	// When no destination address is provided, the new route might be the default route.
-	if route.DstAddr == nil {
-		subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(zero), tcpip.MaskFromBytes(zero))
-		if err != nil {
-			return tcpip.Route{}, syserr.ErrInvalidArgument
-		}
-		dest = subnet
-	} else {
-		dst := make([]byte, len(zero))
-		if copy(dst, route.DstAddr)*8 < int(route.DstLen) {
-			return tcpip.Route{}, syserr.ErrInvalidArgument
-		}
-		dest = tcpip.AddressWithPrefix{
-			Address:   tcpip.AddrFromSlice(dst),
-			PrefixLen: int(route.DstLen)}.Subnet()
-	}
-
-	localRoute := tcpip.Route{
-		Destination: dest,
-		Gateway:     tcpip.AddrFromSlice(route.GatewayAddr),
-		NIC:         tcpip.NICID(route.OutputInterface),
-	}
-
-	if len(route.SrcAddr) != 0 {
-		localRoute.SourceHint = tcpip.AddrFromSlice(route.SrcAddr)
-	}
-
-	return localRoute, nil
-}
-
-// RemoveRoute implements inte.Stack.RemoveRoute.
-func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
-	localRoute, err := s.localRoute(msg)
-	if err != nil {
-		return err
-	}
-	found := false
-	var removedRoute tcpip.Route
-	if removed := s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
-		// Like Linux, remove only the first matching route.
-		if found {
-			return false
-		}
-		// Both gateway and NIC are compared with existing routes
-		// only when they are present in the netlink message.
-		if localRoute.Gateway.Len() > 0 && !localRoute.Gateway.Equal(rt.Gateway) {
-			return false
-		}
-		if localRoute.NIC > 0 && localRoute.NIC != rt.NIC {
-			return false
-		}
-		found = rt.Destination.Equal(localRoute.Destination)
-		if found {
-			removedRoute = rt
-		}
-		return found
-	}); removed == 0 {
-		return syserr.ErrNoProcess
-	}
-	s.sendRouteEvent(ctx, removedRoute, false /* added */, 0)
-	return nil
-}
-
-// NewRoute implements inet.Stack.NewRoute.
-func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
-	localRoute, err := s.localRoute(msg)
-	if err != nil {
-		return err
-	}
-	if err := s.checkLinkUp(localRoute.NIC); err != nil {
-		return err
-	}
-	if err := s.checkGateway(msg, &localRoute); err != nil {
-		return err
-	}
-	found := false
-	sameDst := false
-	for _, rt := range s.Stack.GetRouteTable() {
-		if rt.Destination.Equal(localRoute.Destination) {
-			sameDst = true
-		}
-		if localRoute.Equal(rt) {
-			found = true
-			break
-		}
-	}
-	flags := msg.Header().Flags
-	switch {
-	case !found && flags&linux.NLM_F_CREATE == linux.NLM_F_CREATE:
-		s.Stack.AddRoute(localRoute)
-	case found && flags&linux.NLM_F_REPLACE != linux.NLM_F_REPLACE:
-		return syserr.ErrExists
-	}
-	replace := flags&linux.NLM_F_REPLACE == linux.NLM_F_REPLACE
-	if replace {
-		s.Stack.ReplaceRoute(localRoute)
-	}
-	switch {
-	case found && replace:
-		s.sendRouteEvent(ctx, localRoute, true /* added */, linux.NLM_F_REPLACE)
-	case !found && (replace || flags&linux.NLM_F_CREATE == linux.NLM_F_CREATE):
-		s.sendRouteEvent(ctx, localRoute, true /* added */, newRouteFlags(localRoute, sameDst, flags))
-	}
-	return nil
-}
-
 // newRouteFlags returns the nlmsg_flags of the RTM_NEWROUTE notification for
 // rt, which was just added. reqFlags are the flags of the request that added
 // it. sameDst is whether another route to the same destination already
@@ -1304,10 +1067,25 @@ func (s *Stack) checkGateway(msg *nlmsg.Message, route *tcpip.Route) *syserr.Err
 	if gw.Unspecified() || header.IsV6LinkLocalUnicastAddress(gw) || rtMsg.Flags&linux.RTNH_F_ONLINK != 0 {
 		return nil
 	}
-	for _, rt := range s.Stack.GetRouteTable() {
-		if rt.Gateway.Unspecified() && (route.NIC == 0 || rt.NIC == route.NIC) && rt.Destination.Contains(gw) {
-			route.NIC = rt.NIC
-			return nil
+	// fib_check_nh() looks for the gateway in the table of the route first and
+	// in every table after that. A route that is not a unicast route, such as a
+	// blackhole, makes the gateway invalid.
+	routes := s.Stack.GetRouteTable()
+	for _, ownTable := range []bool{true, false} {
+		for _, rt := range routes {
+			if ownTable && rt.TableID() != route.TableID() {
+				continue
+			}
+			if !rt.Gateway.Unspecified() || !rt.Destination.Contains(gw) {
+				continue
+			}
+			if rt.RouteType() != tcpip.RouteTypeUnicast {
+				return syserr.ErrInvalidArgument
+			}
+			if route.NIC == 0 || rt.NIC == route.NIC {
+				route.NIC = rt.NIC
+				return nil
+			}
 		}
 	}
 	nics := s.Stack.NICInfo()
