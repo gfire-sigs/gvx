@@ -344,3 +344,9 @@ seam pkg/sentry/platform/systrap/subprocess.go
 # (pkg/sentry/kernel/ptrace_gs_xplat.go). The engine removes its syscall patches that use GS.
 seam pkg/sentry/kernel/ptrace.go
 seam pkg/sentry/kernel/ptrace_amd64.go
+
+# The amd64 signal frame of a SIGSEGV or SIGBUS from a user fault holds the trap number 14 and the
+# page fault error code, as in Linux (pkg/sentry/arch/signal_amd64_fault_xplat.go). A nested Sentry
+# reads them to learn the access of the fault.
+seam pkg/sentry/arch/arch_x86_impl.go
+seam pkg/sentry/arch/signal_amd64.go

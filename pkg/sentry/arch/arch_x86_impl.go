@@ -21,6 +21,7 @@ package arch
 import (
 	"context"
 
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch/fpu"
 )
 
@@ -34,6 +35,11 @@ type State struct {
 
 	// Our floating point state.
 	fpState fpu.State `state:"wait"`
+
+	// faultAccess is the access of the last user fault that became a signal.
+	// The signal frame reports it in the trap number and the error code. See
+	// SetFaultAccess.
+	faultAccess hostarch.AccessType `state:"nosave"`
 }
 
 // afterLoad is invoked by stateify.
