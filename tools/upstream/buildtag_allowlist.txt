@@ -323,3 +323,34 @@ seam pkg/tcpip/transport/internal/network/endpoint.go
 # (pkg/tcpip/stack/proxyarp_xplat.go).
 seam pkg/sentry/socket/netfilter/targets.go
 seam pkg/tcpip/network/arp/arp.go
+
+# Content seams for a Sentry that runs inside another Sentry (docs/cli.md, section 11). The host
+# address space size is a search in an init function (pkg/abi/linux/mm_tasksize_xplat.go). The upstream
+# initializer returns 0 where it panicked. An unaligned MAP_FIXED mapping above the task size fails with ENOMEM, as in Linux. The arm64 signal frame holds the
+# fpsimd record, the ESR record, and the end marker (pkg/sentry/arch/signal_arm64_fpsimd_xplat.go).
+# The sysmsg thread may wake the Sentry with any val3.
+seam pkg/abi/linux/mm.go
+seam pkg/sentry/mm/syscalls.go
+seam pkg/sentry/arch/arch_aarch64.go
+seam pkg/sentry/arch/arch_arm64.go
+seam pkg/sentry/arch/signal_arm64.go
+seam pkg/sentry/platform/systrap/stubfilter/stubfilter.go
+# A host kernel can seal a mapping that its Sentry owns. The stub of a nested Sentry then unmaps its
+# address space mapping by mapping (pkg/sentry/platform/systrap/unmap_regions_xplat.go).
+seam pkg/sentry/platform/systrap/subprocess.go
+
+# A tracer that sets the GS base of a tracee with PTRACE_SETREGS, PTRACE_SETREGSET, or
+# PTRACE_POKEUSER tells the address space, as arch_prctl(ARCH_SET_GS) does
+# (pkg/sentry/kernel/ptrace_gs_xplat.go). The engine removes its syscall patches that use GS.
+seam pkg/sentry/kernel/ptrace.go
+seam pkg/sentry/kernel/ptrace_amd64.go
+
+# The amd64 signal frame of a SIGSEGV or SIGBUS from a user fault holds the trap number 14 and the
+# page fault error code, as in Linux (pkg/sentry/arch/signal_amd64_fault_xplat.go). A nested Sentry
+# reads them to learn the access of the fault.
+seam pkg/sentry/arch/arch_x86_impl.go
+seam pkg/sentry/arch/signal_amd64.go
+
+# A host kernel that is a Sentry may give a page fault no error code or ESR value. The platform context
+# infers the access of such a fault (pkg/sentry/platform/systrap/fault_access_xplat.go).
+seam pkg/sentry/platform/systrap/systrap.go

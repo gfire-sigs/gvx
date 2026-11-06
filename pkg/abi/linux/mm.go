@@ -157,5 +157,7 @@ var TaskSize = func() uintptr {
 			panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
 		}
 	}
-	panic("None of the address space sizes could be successfully mmaped")
+	// A Sentry as host kernel can have less space than every listed size.
+	// The init function in mm_tasksize_xplat.go searches the real size.
+	return 0
 }()

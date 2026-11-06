@@ -144,12 +144,13 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 	}
 
 	// TODO(gvisor.dev/issue/159): Set SignalContext64.Err, Trapno, and Cr2
-	// based on the fault that caused the signal. For now, leave Err and
-	// Trapno unset and assume CR2 == info.Addr() for SIGSEGVs and
-	// SIGBUSes.
+	// based on the fault that caused the signal. For now, assume
+	// CR2 == info.Addr() for SIGSEGVs and SIGBUSes. A fault that the task
+	// records sets Trapno and Err.
 	if linux.Signal(info.Signo) == linux.SIGSEGV || linux.Signal(info.Signo) == linux.SIGBUS {
 		uc.MContext.Cr2 = info.Addr()
 	}
+	c.setFaultInSignalContext(&uc.MContext, info)
 
 	// "... the value (%rsp+8) is always a multiple of 16 (...) when
 	// control is transferred to the function entry point." - AMD64 ABI

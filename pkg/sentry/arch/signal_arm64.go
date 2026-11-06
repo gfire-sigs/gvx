@@ -92,13 +92,15 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 	if linux.Signal(info.Signo) == linux.SIGSEGV || linux.Signal(info.Signo) == linux.SIGBUS {
 		uc.MContext.FaultAddr = info.Addr()
 	}
+	c.fpStateToSignalFrame(&uc.MContext.Fpsimd64)
 
 	ucSize := uc.SizeBytes()
+	trailer := signalFrameTrailer(c.faultESR(info))
 
-	// frameSize = ucSize + sizeof(siginfo).
+	// frameSize = ucSize + trailer + sizeof(siginfo).
 	// sizeof(siginfo) == 128.
 	// R30 stores the restorer address.
-	frameSize := ucSize + 128
+	frameSize := ucSize + len(trailer) + 128
 	frameBottom := (sp - hostarch.Addr(frameSize)) & ^hostarch.Addr(15)
 	sp = frameBottom + hostarch.Addr(frameSize)
 	st.Bottom = sp
@@ -113,11 +115,15 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 	// Adjust the code.
 	info.FixSignalCodeForUser()
 
-	// Set up the stack frame.
+	// Set up the stack frame. The trailer sits between the ucontext and the
+	// siginfo, so it continues the reserved area of the ucontext.
 	if _, err := info.CopyOut(st, StackBottomMagic); err != nil {
 		return err
 	}
 	infoAddr := st.Bottom
+	if _, err := st.CopyOutBytes(StackBottomMagic, trailer[:]); err != nil {
+		return err
+	}
 	if _, err := uc.CopyOut(st, StackBottomMagic); err != nil {
 		return err
 	}
@@ -168,6 +174,7 @@ func (c *Context64) SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSe
 	if _, err := uc.CopyIn(st, StackBottomMagic); err != nil {
 		return 0, linux.SignalStack{}, err
 	}
+	st.Bottom += sigFrameTrailerSize
 	var info linux.SignalInfo
 	if _, err := info.CopyIn(st, StackBottomMagic); err != nil {
 		return 0, linux.SignalStack{}, err
@@ -183,10 +190,13 @@ func (c *Context64) SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSe
 		return 0, linux.SignalStack{}, unix.EFAULT
 	}
 
-	// Restore floating point state.
+	// Restore floating point state. The registers come from the frame, as in
+	// Linux, so a handler that edits the frame changes them. A nested Sentry
+	// switches the application context this way.
 	l := len(c.sigFPState)
 	if l > 0 {
 		c.fpState = c.sigFPState[l-1]
+		fpStateFromSignalFrame(c.fpState, &uc.MContext.Fpsimd64)
 		// NOTE(cl/133042258): State save requires that any slice
 		// elements from '[len:cap]' to be zero value.
 		c.sigFPState[l-1] = nil

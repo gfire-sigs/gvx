@@ -153,6 +153,9 @@ type platformContext struct {
 	// needToPullFullState indicates that the Sentry doesn't have a full
 	// state of the thread.
 	needToPullFullState bool
+
+	// faultAccess infers the access of a fault when the host reports none.
+	faultAccess faultAccessInferrer
 }
 
 // PullFullState implements platform.Context.PullFullState.

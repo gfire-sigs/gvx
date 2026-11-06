@@ -65,6 +65,7 @@ const (
 	codeWritePackage   = "z.gfire.dev/gvx/internal/acceptprog/codewrite"
 	cowProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/cowprobe"
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
+	ptraceGSPackage    = "z.gfire.dev/gvx/internal/acceptprog/ptracegs"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -315,6 +316,14 @@ func BuildMembarrierProbe(tb testing.TB, goarch string) string {
 func BuildEINTRProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, eintrPackage, "eintrprobe", goarch, 0)
+}
+
+// BuildPtraceGS compiles the guest ptracegs, which changes the GS base of a
+// running thread with ptrace, for the Linux architecture goarch and returns the
+// path of the static ET_EXEC executable.
+func BuildPtraceGS(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, ptraceGSPackage, "ptracegs", goarch, 0)
 }
 
 // BuildCPUMaxProbe compiles the guest cpumaxprobe, which makes cgroups with a

@@ -512,9 +512,9 @@ func (s *subprocess) mapPrivateRegions() {
 //
 // This will panic on failure (which should never happen).
 func (s *subprocess) unmap() {
-	s.Unmap(0, uint64(stubStart))
+	s.unmapRange(0, stubStart)
 	if maximumUserAddress != stubEnd {
-		s.Unmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
+		s.unmapRange(stubEnd, maximumUserAddress-stubEnd)
 	}
 }
 
@@ -936,6 +936,7 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 		shouldPatchSyscall = true
 	}
 	if ctxState == sysmsg.ContextStateSyscall || ctxState == sysmsg.ContextStateSyscallTrap {
+		c.faultAccess.reset()
 		if maybePatchSignalInfo(regs, &c.signalInfo) {
 			return false, false, hostarch.Execute, nil
 		}
@@ -948,6 +949,7 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	at = hostarch.NoAccess
 	if c.signalInfo.Signo == int32(linux.SIGSEGV) {
 		at = sigErrorToAccessType(ctx.shared.SigError)
+		at = c.faultAccess.infer(at, &ctx.shared.SigError, uint64(ac.IP()), &c.signalInfo)
 	}
 	return false, false, at, nil
 }

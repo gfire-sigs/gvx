@@ -2,6 +2,23 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Features
+
+- **`rungv` inside a `gvx` guest and in upstream `runsc`**: `rungv run -platform=systrap` runs inside a `gvx` guest on Linux amd64 and arm64, and on macOS arm64 with `-platform=hvf`. It also runs inside Docker with `runsc-kvm` and `runsc-systrap` on Linux amd64. The arm64 case in `runsc` does not run, because the arm64 signal frame of `runsc` has no `fpsimd_context` record. `docs/cli.md` section 11 lists the flags, the results, and the limits. The guest kernel now meets what the stub of an inner Sentry needs:
+  - An unaligned `MAP_FIXED` mmap above the task size fails with `ENOMEM`, as in Linux. The size probe of the inner Sentry depends on it.
+  - The arm64 signal frame holds the `fpsimd_context` record, the `esr_context` record of a fault, and the end marker. `sigreturn` loads the floating point registers from the frame. Before this release the stub stopped with a wrong magic number, or looped for ever on the missing end marker.
+  - The amd64 signal frame of a `SIGSEGV` or `SIGBUS` from a page fault holds the trap number 14 and the page fault error code, as in Linux.
+  - `PTRACE_SETREGS`, `PTRACE_SETREGSET`, and `PTRACE_POKEUSER` tell the address space when they change the `GS` base on amd64, as `arch_prctl` does. The `systrap` engine then removes its syscall patches that use `GS`. Before this release a thread that a tracer attached to died in a patched syscall.
+  - The host address space size is a search, not a list. It works below the hardware size and on a host that is a Sentry.
+  - The stub filter allows any `val3` in the futex wake of the sysmsg code.
+  - A stub unmaps its address space around a sealed mapping of the host kernel.
+  - The syscall thread of a stub on amd64 calls `arch_prctl(ARCH_SET_GS)` once, so that an upstream `runsc` host removes its syscall patches from the stub.
+  - A fault that a host reports with the error code 0 (amd64) or the ESR value 0 (arm64) gets an inferred access: an instruction fetch when the fault address equals the instruction pointer, a read first, and a write for the second fault at the same instruction and address. Linux never reports 0 for a page fault, so no other host takes this path.
+- **`TestE2ENestedRungvInRungv`**: runs `rungv` with `systrap` in a `rungv` guest.
+- **`TestE2EPtraceGSBaseKeepsPatchedThreadAlive`**: attaches to a running thread, sets its `GS` base with each ptrace request, and verifies that the thread keeps running its patched syscalls.
+
 ## [v0.9.10012026110200] - 2026-11-07
 
 This release fixes the memory limit of a sandbox in a process with several sandboxes and a race of the Windows `systrap` engine. CI now runs the same tests on `windows/arm64` as on `windows/amd64`, with the race detector on `windows/amd64`.

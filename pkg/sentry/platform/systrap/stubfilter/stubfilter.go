@@ -174,7 +174,7 @@ func SysmsgThread(vars precompiledseccomp.Values) *seccomp.Program {
 					seccomp.EqualTo(1),
 					seccomp.EqualTo(0),
 					seccomp.EqualTo(0),
-					seccomp.EqualTo(0),
+					seccomp.AnyValue{},                   // val3: FUTEX_WAKE ignores it.
 					seccomp.GreaterThan(stubSysmsgStart), // rip
 				},
 				seccomp.PerArg{

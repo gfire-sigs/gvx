@@ -137,7 +137,7 @@ var (
 //   - systrap: ConfigureAddressSpace(uintptr(linux.TaskSize))
 //   - KVM:     ConfigureAddressSpace(1 << 48)
 func ConfigureAddressSpace(taskSize uintptr) {
-	switch taskSize {
+	switch layoutTaskSize(taskSize) {
 	case 1 << 39:
 		maxAddr64 = maxAddr64VA39
 		maxMmapRand64 = maxMmapRand64VA39

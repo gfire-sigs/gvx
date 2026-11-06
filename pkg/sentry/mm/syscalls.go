@@ -105,6 +105,13 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 		// MAP_FIXED requires addr to be page-aligned; non-fixed mappings
 		// don't.
 		if opts.Fixed {
+			// Linux checks the range before the alignment, and nested
+			// Sentries rely on it: the host address-space size probe of
+			// pkg/abi/linux maps an unaligned address and expects ENOMEM
+			// above the task size.
+			if end, ok := opts.Addr.AddLength(opts.Length); !ok || end > mm.layout.MaxAddr {
+				return 0, linuxerr.ENOMEM
+			}
 			return 0, linuxerr.EINVAL
 		}
 		opts.Addr = opts.Addr.RoundDown()
