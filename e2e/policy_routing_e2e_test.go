@@ -254,3 +254,17 @@ func TestE2EPolicyRouting(t *testing.T) {
 		})
 	}
 }
+
+// TestE2EFelixRoutes sends the route requests of Calico Felix through
+// github.com/vishvananda/netlink: a blackhole, unreachable, prohibit, or throw
+// route without a device, with the protocol 80, the universe scope, and the
+// table 254. Felix then lists the routes with a filter on the table and the
+// protocol. The guest is the program nodeprobe, so the test needs no registry.
+func TestE2EFelixRoutes(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		code, out := runNodeProbe(t, b, bin, nil, "felixroutes")
+		requireNodeChecks(t, code, out,
+			"felixroutes-blackhole-without-device", "felixroutes-replace-and-duplicate",
+			"felixroutes-ipv6-blackhole-on-lo", "felixroutes-unicast-without-device-fails")
+	})
+}

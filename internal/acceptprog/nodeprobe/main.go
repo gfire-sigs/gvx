@@ -35,6 +35,7 @@
 //	                                 and lo, with the calls of Calico Felix
 //	nodeprobe rpfilter               check the rp_filter files of the conf directories
 //	                                 in the root namespace and in a child namespace
+//	nodeprobe felixroutes            send the route requests of Calico Felix: types without a device
 //	nodeprobe genl                   check NETLINK_GENERIC and the controller family
 //	nodeprobe wireguard              check the wireguard link between two namespaces
 //	nodeprobe wglimits               check the rules and limits of the wireguard link
@@ -131,6 +132,8 @@ func main() {
 		checks = ethtoolChecks()
 	case "rpfilter":
 		checks = rpFilterChecks()
+	case "felixroutes":
+		checks = felixRouteChecks()
 	case "genl":
 		checks = genlChecks()
 	case "wireguard":

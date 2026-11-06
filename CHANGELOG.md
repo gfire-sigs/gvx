@@ -73,6 +73,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
+- **A route without a device failed with `ENODEV`**: `github.com/vishvananda/netlink`, and so Calico Felix, sends `RTA_OIF` 0 for a route that names no device, and the guest took 0 as an unknown link. Felix logged `Failed to add route` for the blackhole route of its own pod block. The value 0 now means no device. An IPv6 route of a type without a device belongs to `lo`, as in Linux.
 - **The MTU of a veth link read 14 bytes too small**: a new veth link reported 1486 and not 1500, because the MTU of the pair counted the Ethernet header. A change of the MTU also read 14 bytes less than the value set. A veth link now reports and keeps the value that the guest sets, as Linux does.
 - **A guest with an MTU above 9216 lost UDP datagrams on macOS**: the host UDP sockets of the NAT relay, of the published UDP ports, and of the WireGuard socket refused a datagram above the default send buffer of 9216 bytes. The sockets now have a send buffer of 128 KiB on macOS.
 - **IP set fixes**: adding an element to a set that is full of expired elements crashed the Sentry. A range on a `hash:ip` set with `netmask` made one element for each address and not for each network. A range operation held the lock of the set until it ended, so a packet test of that set waited for seconds. `-j SET --exist` removed the comment of the element. `--map-set` lost the packet information of a `list:set` member. `ipset create -exist` failed when only `hashsize` differed.

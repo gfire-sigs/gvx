@@ -101,7 +101,10 @@ func (s *Stack) parseRouteRequest(msg *nlmsg.Message) (routeRequest, *syserr.Err
 			if !ok {
 				return routeRequest{}, syserr.ErrInvalidArgument
 			}
-			if _, exist := s.Interfaces()[v]; !exist {
+			// An output interface of 0 means that the request names no
+			// device. github.com/vishvananda/netlink, and so Calico Felix,
+			// sends RTA_OIF 0 for a route without a device.
+			if _, exist := s.Interfaces()[v]; v != 0 && !exist {
 				return routeRequest{}, syserr.ErrNoDevice
 			}
 			oif = v
@@ -219,7 +222,11 @@ func routeMTU(metrics []byte) (uint32, *syserr.Error) {
 
 // validateNewRoute applies the type checks of fib_create_info() to a new
 // route and sets the type of a route that names none.
-func (req *routeRequest) validateNewRoute() *syserr.Error {
+//
+// An IPv6 route of a type without a device belongs to the loopback link, as in
+// Linux, whatever device the request names. loopback is the index of that
+// link.
+func (req *routeRequest) validateNewRoute(loopback tcpip.NICID) *syserr.Error {
 	rt := &req.route
 	switch t := req.msgType; t {
 	case linux.RTN_UNICAST:
@@ -233,6 +240,9 @@ func (req *routeRequest) validateNewRoute() *syserr.Error {
 			return syserr.ErrInvalidArgument
 		}
 		rt.NIC = 0
+		if req.v6 {
+			rt.NIC = loopback
+		}
 		rt.Gateway = tcpip.Address{}
 	case linux.RTN_NAT, linux.RTN_XRESOLVE, linux.RTN_LOCAL, linux.RTN_BROADCAST, linux.RTN_ANYCAST, linux.RTN_MULTICAST:
 		return syserr.ErrNotSupported
@@ -243,6 +253,18 @@ func (req *routeRequest) validateNewRoute() *syserr.Error {
 		return syserr.ErrNoDevice
 	}
 	return nil
+}
+
+// loopbackID returns the index of the loopback link with the lowest index, or 0
+// when the stack has none.
+func (s *Stack) loopbackID() tcpip.NICID {
+	var id tcpip.NICID
+	for i, nic := range s.Interfaces() {
+		if nic.Flags&linux.IFF_LOOPBACK != 0 && (id == 0 || tcpip.NICID(i) < id) {
+			id = tcpip.NICID(i)
+		}
+	}
+	return id
 }
 
 // RouteTable implements inet.Stack.RouteTable.
@@ -327,7 +349,7 @@ func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error 
 	if err != nil {
 		return err
 	}
-	if err := req.validateNewRoute(); err != nil {
+	if err := req.validateNewRoute(s.loopbackID()); err != nil {
 		return err
 	}
 	route := req.route
