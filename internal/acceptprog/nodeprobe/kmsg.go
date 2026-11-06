@@ -414,14 +414,14 @@ func kmsgSemanticsChecks() []check {
 				return err
 			}
 			fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLOUT}}
-			n, err := unix.Poll(fds, 50)
+			n, err := pollRetry(fds, 50)
 			if err != nil || n != 0 {
 				return fmt.Errorf("poll at the end = %d events %#x, %v, want none", n, fds[0].Revents, err)
 			}
 			if err := writeKmsg("probe-poll"); err != nil {
 				return err
 			}
-			n, err = unix.Poll(fds, 1000)
+			n, err = pollRetry(fds, 1000)
 			if err != nil || n != 1 || fds[0].Revents&unix.POLLIN == 0 || fds[0].Revents&(unix.POLLOUT|unix.POLLERR) != 0 {
 				return fmt.Errorf("poll with a record = %d events %#x, %v, want POLLIN only", n, fds[0].Revents, err)
 			}
@@ -564,7 +564,7 @@ func kmsgSemanticsChecks() []check {
 					}
 				}
 				fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLPRI}}
-				if n, err := unix.Poll(fds, 1000); err != nil || n != 1 || fds[0].Revents&(unix.POLLERR|unix.POLLPRI) != unix.POLLERR|unix.POLLPRI {
+				if n, err := pollRetry(fds, 1000); err != nil || n != 1 || fds[0].Revents&(unix.POLLERR|unix.POLLPRI) != unix.POLLERR|unix.POLLPRI {
 					return fmt.Errorf("poll after the overwrite = %d events %#x, %v, want POLLERR and POLLPRI", n, fds[0].Revents, err)
 				}
 				buf := make([]byte, 8192)
@@ -867,5 +867,22 @@ func kmsgSizeChecks(want int) []check {
 			}
 			return nil
 		}},
+	}
+}
+
+// pollRetry calls poll(2) and calls it again with the time left when a signal
+// interrupts it. Linux returns EINTR from poll when a signal handler runs, and
+// the Go runtime sends SIGURG to preempt goroutines.
+func pollRetry(fds []unix.PollFd, timeoutMs int) (int, error) {
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for {
+		n, err := unix.Poll(fds, timeoutMs)
+		if !errors.Is(err, unix.EINTR) {
+			return n, err
+		}
+		timeoutMs = int(time.Until(deadline) / time.Millisecond)
+		if timeoutMs < 0 {
+			timeoutMs = 0
+		}
 	}
 }

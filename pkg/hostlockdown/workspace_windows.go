@@ -227,9 +227,8 @@ func sidEntry(sid *windows.SID, mask windows.ACCESS_MASK, mode windows.ACCESS_MO
 // isLogonSessionSID reports whether sid has the form S-1-5-5-X-Y of a logon
 // session SID (SECURITY_LOGON_IDS_RID).
 func isLogonSessionSID(sid *windows.SID) bool {
-	return sid != nil && sid.IsValid() &&
-		sid.IdentifierAuthority() == windows.SECURITY_NT_AUTHORITY &&
-		sid.SubAuthorityCount() == 3 && sid.SubAuthority(0) == securityLogonIDsRID
+	auth, subs, ok := sidFields(sid)
+	return ok && auth == windows.SECURITY_NT_AUTHORITY && len(subs) == 3 && subs[0] == securityLogonIDsRID
 }
 
 // securityLogonIDsRID is SECURITY_LOGON_IDS_RID, the first sub-authority of

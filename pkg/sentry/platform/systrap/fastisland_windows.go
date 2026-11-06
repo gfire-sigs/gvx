@@ -56,6 +56,11 @@ type island struct {
 	usedBits [winIslandUnits / 64]uint64
 	// slots maps the offset of each slot to its guest site and byte size.
 	slots map[uint32]islandSlot
+	// retired keeps the record of each freed slot until alloc reuses its
+	// bytes. A thread can enter a slot and publish a trap just before another
+	// thread drops the block of the slot. The Sentry then decodes the trap
+	// from the retired record.
+	retired map[uint32]islandSlot
 }
 
 // alloc reserves a contiguous run of size bytes on isl and returns its byte offset.
@@ -78,21 +83,33 @@ func (isl *island) alloc(size uint32) (uint32, bool) {
 			for k := start; k < start+need; k++ {
 				isl.usedBits[k/64] |= uint64(1) << (k % 64)
 			}
-			return uint32(start * winSlotUnit), true
+			off := uint32(start * winSlotUnit)
+			for roff, s := range isl.retired {
+				if roff < off+size && off < roff+s.size {
+					delete(isl.retired, roff)
+				}
+			}
+			return off, true
 		}
 	}
 	return 0, false
 }
 
-// free releases a slot range that alloc reserved and removes its site entry.
-// Callers hold as.mu.
+// free releases a slot range that alloc reserved and moves its site entry to
+// the retired records. Callers hold as.mu.
 func (isl *island) free(off, size uint32) {
 	start := int(off / winSlotUnit)
 	count := int((size + winSlotUnit - 1) / winSlotUnit)
 	for k := start; k < start+count && k < winIslandUnits; k++ {
 		isl.usedBits[k/64] &^= uint64(1) << (k % 64)
 	}
-	delete(isl.slots, off)
+	if s, ok := isl.slots[off]; ok {
+		if isl.retired == nil {
+			isl.retired = make(map[uint32]islandSlot)
+		}
+		isl.retired[off] = s
+		delete(isl.slots, off)
+	}
 }
 
 // freeSlotRefsLocked releases every island slot in refs. Callers hold as.mu.
@@ -155,6 +172,9 @@ func (as *addressSpace) slotStart(pc uint64) (islandSlot, bool) {
 		return islandSlot{}, false
 	}
 	s, ok := isl.slots[uint32(pc-isl.base)]
+	if !ok {
+		s, ok = isl.retired[uint32(pc-isl.base)]
+	}
 	return s, ok
 }
 
