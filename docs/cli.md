@@ -407,3 +407,45 @@ The command exits with 0 on success and with 2 when an argument is unexpected. T
 | `go VERSION OS/ARCH` | The Go toolchain and the target of the binary. |
 
 The command exits with 0 on success and with 2 when an argument is unexpected.
+
+## 11. Nested use
+
+This section states what runs when `rungv` runs inside another sandbox. The inner `rungv` needs ptrace, seccomp filters, shared memory, futex calls, and the signal frame of the architecture from the kernel of the outer sandbox. The tables list the measured results. Each result names the flags of the run.
+
+> [!IMPORTANT]
+> Copy a static Linux binary of `rungv` into the outer guest. Build it with `CGO_ENABLED=0 go build ./cmd/rungv`. A guest has no dynamic loader for the libc of the host.
+
+### 11.1 `rungv` inside `rungv`
+
+The outer `rungv` uses the engine `systrap` on a Linux host, or the engine `hvf` on macOS. The inner `rungv` uses `-platform=systrap`. The inner sandbox prints `seccomp user-space notification mechanism isn't supported` and uses the futex loop. This message is a warning, not a failure.
+
+| Outer host and flags | Inner flags | Result |
+| :--- | :--- | :--- |
+| Linux arm64, `-platform=systrap` | `-platform=systrap -bin /smoke` | Works. |
+| Linux arm64, `-platform=systrap`, image `alpine:3.20` | `-platform=systrap alpine:3.20 uname -a` | Works. The inner guest reports `aarch64`. |
+| macOS arm64, `-platform=hvf` | `-platform=systrap -bin /smoke` | Works. The run is slow. |
+| Linux amd64, `-platform=systrap` | `-platform=systrap -bin /smoke` | See the CHANGELOG entry for the result of the last run. |
+
+To run the nested smoke test:
+
+1. Run `go build -o rungv-static ./cmd/rungv` with `CGO_ENABLED=0`.
+2. Run `go run ./internal/testelf/cmd/mkelf -o smoke`.
+3. Run `rungv run -platform=systrap -v $PWD/smoke:/smoke:ro -bin ./rungv-static -- run -platform=systrap -bin /smoke`.
+4. Verify that the output is `gvx-smoke-ok`.
+
+The inner `rungv` has no root certificates when the outer guest comes from `-bin`. Pull an image in the inner guest only when the outer guest is an image with certificates, such as `alpine:3.20`, or when the outer run has `--host-ca-certs`.
+
+### 11.2 `rungv` inside Docker with the gVisor runtime
+
+The upstream runtime `runsc` is the host kernel of the inner `rungv` in this case. The flags `--privileged`, `--security-opt seccomp=unconfined`, and `--platform=ptrace` of `runsc` do not change the result. The first failure is in the kernel of `runsc`, so `gvx` cannot repair it.
+
+| Host | Failure |
+| :--- | :--- |
+| Linux amd64 | The probe of the address space size gets the wrong answer, because `runsc` checks the alignment of a fixed mapping before its range. The inner `rungv` panics with `failed to map stub` or `None of the address space sizes could be successfully mmaped`. The size search of this release reads the last page of the address space, and the CHANGELOG entry states the result. |
+| Linux arm64 | The inner `rungv` starts its stub thread. The signal frame of `runsc` has no `fpsimd_context` record, so the stub stops with `FP state context magic header (0) does not match expected FPSIMD_MAGIC`. The exit code is 137. |
+
+The fix for the arm64 failure belongs in gVisor: write the `fpsimd_context` record, the `esr_context` record, and the end marker in the arm64 signal frame, as `gvx` does since this release.
+
+### 11.3 Limits
+
+The stub processes of an inner Sentry keep the sealed syscall patching table of the outer Sentry on amd64. A guest mapping at `0x60000` to `0x65000` fails there. The engine `ptrace` and the hardware engines of the inner `rungv` need devices that the outer guest does not give.

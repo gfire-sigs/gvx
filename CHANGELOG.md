@@ -2,6 +2,18 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Features
+
+- **`rungv` inside a `gvx` guest**: `rungv run -platform=systrap` runs inside a `gvx` guest on Linux arm64 and on macOS arm64 with `-platform=hvf`. `docs/cli.md` section 11 lists the flags, the results, and the limits. The guest kernel now meets what the stub of an inner Sentry needs:
+  - An unaligned `MAP_FIXED` mmap above the task size fails with `ENOMEM`, as in Linux. The size probe of the inner Sentry depends on it.
+  - The arm64 signal frame holds the `fpsimd_context` record, the `esr_context` record of a fault, and the end marker. `sigreturn` loads the floating point registers from the frame. Before this release the stub stopped with a wrong magic number, or looped for ever on the missing end marker.
+  - The host address space size is a search, not a list. It works below the hardware size and on a host that is a Sentry.
+  - The stub filter allows any `val3` in the futex wake of the sysmsg code.
+  - A stub unmaps its address space around a sealed mapping of the host kernel.
+- **`TestE2ENestedRungvInRungv`**: runs `rungv` with `systrap` in a `rungv` guest.
+
 ## [v0.9.10002026110200] - 2026-11-06
 
 This release makes a `gvx` node a fuller Linux node for Kubernetes. NetworkPolicy works with `kube-router` and Calico through IP sets. The `wireguard` link, the connection tracker, the kernel log, `/proc/diskstats`, and policy routing follow Linux. Limits without a Linux knob are gone, and host-side values are tunable with `--tune`. It also adds `--host-ca-certs` and fixes several bugs of nested and overlay use.
