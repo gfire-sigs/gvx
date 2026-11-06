@@ -82,6 +82,7 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 		"cpuinfo":        fs.newInode(ctx, root, 0444, newCPUInfoData(k)),
 		"devices":        fs.newInode(ctx, root, 0444, &devicesData{}),
 		"diskstats":      fs.newInode(ctx, root, 0444, &diskstatsData{}),
+		"partitions":     fs.newInode(ctx, root, 0444, &partitionsData{}),
 		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
 		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
 		"sys":            fs.newSysDir(ctx, root, k),

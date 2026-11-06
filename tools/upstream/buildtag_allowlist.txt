@@ -154,11 +154,12 @@ seam pkg/tcpip/transport/tcp/endpoint.go
 # (pkg/sentry/socket/netfilter/ipset_sockopt_xplat.go).
 seam pkg/sentry/socket/netstack/netstack.go
 # /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
+# /sys/block, /sys/class/block, and /sys/dev/block list the disks of the sandbox
+# (pkg/sentry/fsimpl/sys/blockclass_xplat.go).
 seam pkg/sentry/fsimpl/sys/sys.go
-# /proc/diskstats (pkg/sentry/fsimpl/proc/diskstats_xplat.go) reads the I/O totals of the kernel.
-# A dying task adds its counts to the totals (pkg/sentry/kernel/io_totals_xplat.go).
+# /proc/diskstats and /proc/partitions list the disks of the sandbox
+# (pkg/sentry/fsimpl/proc/diskstats_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks.go
-seam pkg/sentry/kernel/task_exit.go
 # /proc/mounts and mountinfo show the device of a file system on a disk as the mount source
 # (pkg/sentry/vfs/mount_source_xplat.go).
 seam pkg/sentry/vfs/mount.go
