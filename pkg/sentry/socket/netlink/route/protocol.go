@@ -526,11 +526,7 @@ func (p *Protocol) dumpRoutes(ctx context.Context, s *netlink.Socket, msg *nlmsg
 		// We always send back an NLMSG_DONE.
 		ms.Multi = true
 	} else if hdr.Flags&linux.NLM_F_REQUEST != 0 {
-		family, dst, err := parseForDestination(msg)
-		if err != nil {
-			return err
-		}
-		route, err := fillRoute(routeTables, family, dst)
+		route, err := getRoute(stack, routeTables, msg)
 		if err != nil {
 			return err
 		}
@@ -572,9 +568,7 @@ func (p *Protocol) AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uin
 		SrcLen: rt.SrcLen,
 		TOS:    rt.TOS,
 
-		// Always return the main table since we don't have multiple
-		// routing tables.
-		Table:    linux.RT_TABLE_MAIN,
+		Table:    compatTable(rt.Table),
 		Protocol: rt.Protocol,
 		Scope:    rt.Scope,
 		Type:     rt.Type,
@@ -588,14 +582,26 @@ func (p *Protocol) AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uin
 	if rt.SrcLen > 0 {
 		m.PutAttr(linux.RTA_SRC, primitive.AsByteSlice(rt.SrcAddr))
 	}
+	m.PutAttr(linux.RTA_TABLE, primitive.AllocateUint32(tableOrMain(rt.Table)))
 	if rt.OutputInterface != 0 {
 		m.PutAttr(linux.RTA_OIF, primitive.AllocateInt32(rt.OutputInterface))
-		if len(prefSrc) > 0 {
-			m.PutAttr(linux.RTA_PREFSRC, primitive.AsByteSlice(prefSrc))
-		}
+	}
+	if len(rt.PrefSrc) > 0 {
+		prefSrc = rt.PrefSrc
+	}
+	if len(prefSrc) > 0 && (rt.OutputInterface != 0 || len(rt.PrefSrc) > 0) {
+		m.PutAttr(linux.RTA_PREFSRC, primitive.AsByteSlice(prefSrc))
 	}
 	if len(rt.GatewayAddr) > 0 {
 		m.PutAttr(linux.RTA_GATEWAY, primitive.AsByteSlice(rt.GatewayAddr))
+	}
+	if rt.Priority != 0 || rt.Family == linux.AF_INET6 {
+		m.PutAttr(linux.RTA_PRIORITY, primitive.AllocateUint32(rt.Priority))
+	}
+	if rt.MTU != 0 {
+		var metrics nlmsg.NestedAttr
+		metrics.PutAttr(rtaxMTU, primitive.AllocateUint32(rt.MTU))
+		m.PutNestedAttr(linux.RTA_METRICS, metrics)
 	}
 
 	// TODO(gvisor.dev/issue/578): There are many more attributes.
@@ -730,6 +736,10 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 
 	if isNeighMessage(hdr.Type) {
 		return p.processNeigh(ctx, s, msg, ms)
+	}
+
+	if isRuleMessage(hdr.Type) {
+		return p.processRule(ctx, s, msg, ms)
 	}
 
 	if typeKind(hdr.Type) == kindGet && hdr.Flags&(linux.NLM_F_DUMP|linux.NLM_F_ROOT) != 0 {
