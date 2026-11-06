@@ -160,6 +160,14 @@ if until_reach cli "$POD" open && until_reach other "$POD" blocked; then log "AL
 k delete networkpolicy deny-all allow-client >/dev/null
 if until_reach other "$POD" open; then log "RESTORE-OK"; else fail "traffic did not return after the policies ended"; fi
 
+# Felix programs a blackhole route for its own pod block. A refused route request
+# shows in its log as "Failed to add route".
+if k -n kube-system logs ds/calico-node -c calico-node 2>/dev/null | grep -q "Failed to add route"; then
+  fail "felix could not add a route: $(k -n kube-system logs ds/calico-node -c calico-node | grep -m3 'Failed to add route')"
+else
+  log "FELIX-ROUTES-OK"
+fi
+
 log "CALICO-DONE"
 serve
 `
@@ -207,7 +215,7 @@ func TestE2EK3sCalico(t *testing.T) {
 			out := node.out.String()
 			requireContains(t, "guest output", out,
 				"NODE-READY\n", "CALICO-READY\n", "COREDNS-RUNNING\n", "PODS-READY\n", "POD-IP-FROM-POOL\n",
-				"POD-TO-POD-OK\n", "POD-TO-SERVICE-DNS-OK\n", "POD-TO-SERVICE-IP-OK\n", "DENY-OK\n", "ALLOW-OK\n", "RESTORE-OK\n")
+				"POD-TO-POD-OK\n", "POD-TO-SERVICE-DNS-OK\n", "POD-TO-SERVICE-IP-OK\n", "DENY-OK\n", "ALLOW-OK\n", "RESTORE-OK\n", "FELIX-ROUTES-OK\n")
 			if strings.Contains(out, "FAIL ") {
 				t.Errorf("guest reported failures:\n%s", out)
 			}
