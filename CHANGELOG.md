@@ -2,6 +2,16 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Registry tests on a host without a hypervisor**: `TestE2EGateM2BusyboxIsStatic`, `TestE2EGateM2BusyboxAshInteractive`, `TestE2EGateM3ArchitectureSelection`, `TestE2EGateM4TortureUnderDefaultLockdown`, and `TestE2ERealLinuxBusyboxPythonNodeAcrossBackends` named the `whpx` backend and failed on the `windows-11-arm` runner, which has no hypervisor. They now skip there when `GVX_ALLOW_NO_HYPERVISOR=1`.
+
+### Tests
+
+- **Weekly Windows scope**: the Windows jobs of `e2e-images.yml` run every registry gate, as the Linux jobs do: one step for `go test ./e2e` without `TestE2EK3s*`, and one step for the k3s tests. `windows-latest` runs each gate on `systrap` and `whpx`. `TestE2EK3sMultiNodeMixedKernels` and `TestE2EK3sConformance*` stay Linux-only: the first needs a native k3s server, and the second runs on `linux/amd64` only because of its cost.
+
 ## [v0.9.10002026110200] - 2026-11-06
 
 This release makes a `gvx` node a fuller Linux node for Kubernetes. NetworkPolicy works with `kube-router` and Calico through IP sets. The `wireguard` link, the connection tracker, the kernel log, `/proc/diskstats`, and policy routing follow Linux. Limits without a Linux knob are gone, and host-side values are tunable with `--tune`. It also adds `--host-ca-certs` and fixes several bugs of nested and overlay use.
