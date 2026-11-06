@@ -4,6 +4,13 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
+### Added (Calico gaps, in progress)
+
+- Policy routing: `ip rule` (RTM_NEWRULE, RTM_DELRULE, RTM_GETRULE), several routing tables, route metrics, protocols, scopes, and the route types blackhole, unreachable, prohibit, and throw. The guest follows the lookup order of Linux, including `fwmark`, `suppress_prefixlength`, and `goto`.
+- SO_MARK of TCP, UDP, raw, and ICMP sockets and of the WireGuard link (`fwmark`) selects the route.
+- iptables: the match `rpfilter` and the goto flag of a rule (`-g chain`).
+- Proxy ARP, and the sysctl files `conf/*/proxy_arp`, `src_valid_mark`, `conf/<link>/forwarding`, and `neigh/*/proxy_delay`.
+
 ### Features
 
 - **`net/ipv4/conf/{all,default,<link>}/rp_filter`**: Calico reads `conf/default/rp_filter` at start. Before this release the file did not exist, and Calico failed with `could not determine default rp_filter setting`. The files store any integer and start at 0. A link follows `conf/default` until a write to its file, and a write to `conf/all` reaches no link, as in Linux. A new network namespace copies `all` and `default` from the root namespace, and later writes stay in each namespace. `netstack.Stack.EffectiveRPFilter` returns the larger of `all` and the link value. The guest does not check reverse paths yet.
