@@ -16,7 +16,6 @@ package linux
 
 import (
 	"fmt"
-	"runtime"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
@@ -141,50 +140,24 @@ const (
 // TaskSize is the address space size.
 var TaskSize = func() uintptr {
 	pageSize := uintptr(unix.Getpagesize())
-	return searchTaskSize(pageSize, feasibleTaskSizes, func(size uintptr) bool {
+	for _, s := range feasibleTaskSizes {
 		// mmap returns ENOMEM if addr is greater than TASK_SIZE,
 		// otherwise it returns EINVAL, because addr isn't aligned to
 		// the page size.
 		_, _, errno := unix.RawSyscall6(
 			unix.SYS_MMAP,
-			size-pageSize-1,
+			s-pageSize-1,
 			512,
 			uintptr(unix.PROT_NONE),
 			uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED), 0, 0)
 		if errno == unix.EINVAL {
-			// A Sentry as host kernel reports EINVAL for the unaligned address
-			// before it checks the range. Map the last page to find out.
-			return pageFits(size - pageSize)
+			return s
 		}
 		if errno != unix.ENOMEM {
 			panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
 		}
-		return false
-	})
+	}
+	// A Sentry as host kernel can have less space than every listed size.
+	// The init function in mm_tasksize_xplat.go searches the real size.
+	return 0
 }()
-
-// pageFits reports whether the host maps the page at addr. It removes the page
-// again.
-func pageFits(addr uintptr) bool {
-	if runtime.GOOS != "linux" {
-		// Only a Linux host has a size that a Sentry uses. The probe of the
-		// unaligned address is the whole answer elsewhere.
-		return true
-	}
-	r, _, errno := unix.RawSyscall6(
-		unix.SYS_MMAP,
-		addr,
-		uintptr(unix.Getpagesize()),
-		uintptr(unix.PROT_NONE),
-		uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED_NOREPLACE), 0, 0)
-	switch errno {
-	case 0:
-		unix.RawSyscall(unix.SYS_MUNMAP, r, uintptr(unix.Getpagesize()), 0)
-		return true
-	case unix.EEXIST:
-		return true
-	case unix.ENOMEM:
-		return false
-	}
-	panic(fmt.Sprintf("mmap of the last page returned unexpected error: %d", errno))
-}
