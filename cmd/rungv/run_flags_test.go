@@ -184,3 +184,26 @@ func TestRunFlagsPullPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestRunFlagsHostCACertsIsOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"default", []string{"-image=x"}, false},
+		{"single dash", []string{"-host-ca-certs", "-image=x"}, true},
+		{"double dash", []string{"--host-ca-certs", "-image=x"}, true},
+		{"explicit false", []string{"--host-ca-certs=false", "-image=x"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, _, done, stderr := parse(t, tc.args...)
+			if done {
+				t.Fatalf("parseRunArgs ended the command: %s", stderr)
+			}
+			if rc.cfg.HostCACerts != tc.want {
+				t.Errorf("HostCACerts = %v, want %v", rc.cfg.HostCACerts, tc.want)
+			}
+		})
+	}
+}

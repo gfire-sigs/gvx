@@ -248,6 +248,24 @@ type Config struct {
 	// Hostname is the hostname of the guest. The default is "gvx".
 	Hostname string
 
+	// HostCACerts makes the guest trust the root certificates that the host
+	// trusts. It is for a host behind a proxy that inspects TLS, and for a host
+	// that uses a private registry. New reads the roots before the host
+	// lockdown: from the SSL_CERT_FILE and SSL_CERT_DIR variables or the system
+	// bundle on Linux, from the keychains and the trust settings on macOS, and
+	// from the ROOT store on Windows. On macOS and Windows, SSL_CERT_FILE and
+	// SSL_CERT_DIR add roots. New fails when the host has no root.
+	//
+	// At the start of the guest, the sandbox adds the roots that an image
+	// bundle lacks to each bundle that exists (/etc/ssl/certs/ca-certificates.crt,
+	// /etc/ssl/cert.pem, and the RHEL and SUSE paths), and it writes them as
+	// anchor files for update-ca-certificates and update-ca-trust. The writes go
+	// to the layer of the guest, so the image stays unchanged. A path below a
+	// mount stays as the mount shows it. Only the processes of the guest trust
+	// the roots: a container that dockerd starts in the guest does not. The
+	// default is false.
+	HostCACerts bool
+
 	// AllowSUID makes the guest obey the set-user-ID and set-group-ID bits of
 	// executables, as the runsc flag --allow-suid does. sudo, su, and passwd
 	// need it when the guest user is not root. The SDK default ignores the

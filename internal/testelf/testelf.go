@@ -165,8 +165,8 @@ func buildELF64Binary(targetArch string, staticBaseVA uint64, exitCode int, stdo
 
 // BuildGuestCatELF64 synthesizes a position-independent (ET_DYN) Linux ELF64 executable for targetArch
 // ("arm64" or "amd64") that iterates over argv[1..], opens each file via
-// SYS_openat, copies its contents to stdout via SYS_read and SYS_write, and
-// exits with status 0 (or 1 if any file cannot be opened).
+// SYS_openat, copies its contents to stdout via SYS_read and SYS_write until
+// the end of the file, and exits with status 0 (or 1 if any file cannot be opened).
 func BuildGuestCatELF64(targetArch string) ([]byte, error) {
 	const codeOffset = 0x100
 	var code []byte
@@ -175,41 +175,45 @@ func BuildGuestCatELF64(targetArch string) ([]byte, error) {
 	switch targetArch {
 	case "arm64", "aarch64":
 		machine = uint16(elf.EM_AARCH64)
-		relLoop := int32(-23)
+		relRead, relLoop := int32(-12), int32(-26)
+		bRead := uint32(relRead) & 0x03ffffff
 		bLoop := uint32(relLoop) & 0x03ffffff
 		words := []uint32{
 			0x910043f3,             // 0: ADD X19, SP, #16 (&argv[1])
 			0xd11003ff,             // 1: SUB SP, SP, #1024
 			0xf9400261,             // 2 (loop): LDR X1, [X19]
 			0x91002273,             // 3: ADD X19, X19, #8
-			0xb4000001 | (22 << 5), // 4: CBZ X1, done_ok (26)
+			0xb4000001 | (25 << 5), // 4: CBZ X1, done_ok (29)
 			0x92800c60,             // 5: MOVN X0, #99 (AT_FDCWD = -100)
 			0xd2800002,             // 6: MOVZ X2, #0 (O_RDONLY)
 			0xd2800003,             // 7: MOVZ X3, #0
 			0xd2800708,             // 8: MOVZ X8, #56 (SYS_openat)
 			0xd4000001,             // 9: SVC #0
-			0xb7f80000 | (19 << 5), // 10: TBNZ X0, #63, done_err (29)
+			0xb7f80000 | (22 << 5), // 10: TBNZ X0, #63, done_err (32)
 			0xaa0003f4,             // 11: MOV X20, X0 (fd)
-			0x910003e1,             // 12: MOV X1, SP
-			0xd2808002,             // 13: MOVZ X2, #1024
-			0xd28007e8,             // 14: MOVZ X8, #63 (SYS_read)
-			0xd4000001,             // 15: SVC #0
-			0xb7f80000 | (13 << 5), // 16: TBNZ X0, #63, done_err (29)
-			0xaa0003e2,             // 17: MOV X2, X0
-			0xd2800020,             // 18: MOVZ X0, #1 (stdout)
-			0x910003e1,             // 19: MOV X1, SP
-			0xd2800808,             // 20: MOVZ X8, #64 (SYS_write)
-			0xd4000001,             // 21: SVC #0
-			0xaa1403e0,             // 22: MOV X0, X20 (fd)
-			0xd2800728,             // 23: MOVZ X8, #57 (SYS_close)
-			0xd4000001,             // 24: SVC #0
-			0x14000000 | bLoop,     // 25: B loop (2)
-			0xd2800000,             // 26 (done_ok): MOVZ X0, #0
-			0xd2800bc8,             // 27: MOVZ X8, #94 (SYS_exit_group)
-			0xd4000001,             // 28: SVC #0
-			0xd2800020,             // 29 (done_err): MOVZ X0, #1
+			0xaa1403e0,             // 12 (read): MOV X0, X20
+			0x910003e1,             // 13: MOV X1, SP
+			0xd2808002,             // 14: MOVZ X2, #1024
+			0xd28007e8,             // 15: MOVZ X8, #63 (SYS_read)
+			0xd4000001,             // 16: SVC #0
+			0xb7f80000 | (15 << 5), // 17: TBNZ X0, #63, done_err (32)
+			0xb4000000 | (7 << 5),  // 18: CBZ X0, close (25): end of file
+			0xaa0003e2,             // 19: MOV X2, X0
+			0xd2800020,             // 20: MOVZ X0, #1 (stdout)
+			0x910003e1,             // 21: MOV X1, SP
+			0xd2800808,             // 22: MOVZ X8, #64 (SYS_write)
+			0xd4000001,             // 23: SVC #0
+			0x14000000 | bRead,     // 24: B read (12)
+			0xaa1403e0,             // 25 (close): MOV X0, X20 (fd)
+			0xd2800728,             // 26: MOVZ X8, #57 (SYS_close)
+			0xd4000001,             // 27: SVC #0
+			0x14000000 | bLoop,     // 28: B loop (2)
+			0xd2800000,             // 29 (done_ok): MOVZ X0, #0
 			0xd2800bc8,             // 30: MOVZ X8, #94 (SYS_exit_group)
 			0xd4000001,             // 31: SVC #0
+			0xd2800020,             // 32 (done_err): MOVZ X0, #1
+			0xd2800bc8,             // 33: MOVZ X8, #94 (SYS_exit_group)
+			0xd4000001,             // 34: SVC #0
 		}
 		code = encodeARM64Words(words)
 
@@ -238,8 +242,9 @@ func BuildGuestCatELF64(targetArch string) ([]byte, error) {
 		)
 		jsErr1Pos := len(code)
 		code = append(code, 0x0f, 0x88, 0, 0, 0, 0) // JS done_err
+		code = append(code, 0x49, 0x89, 0xc4)       // MOV R12, RAX
+		readPos := len(code)
 		code = append(code,
-			0x49, 0x89, 0xc4, // MOV R12, RAX
 			0x4c, 0x89, 0xe7, // MOV RDI, R12
 			0x48, 0x89, 0xe6, // MOV RSI, RSP
 			0x48, 0xc7, 0xc2, 0x00, 0x04, 0x00, 0x00, // MOV RDX, 1024
@@ -249,12 +254,22 @@ func BuildGuestCatELF64(targetArch string) ([]byte, error) {
 		)
 		jsErr2Pos := len(code)
 		code = append(code, 0x0f, 0x88, 0, 0, 0, 0) // JS done_err
+		jzClosePos := len(code)
+		code = append(code, 0x0f, 0x84, 0, 0, 0, 0) // JZ close: end of file
 		code = append(code,
 			0x48, 0x89, 0xc2, // MOV RDX, RAX
 			0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // MOV RDI, 1
 			0x48, 0x89, 0xe6, // MOV RSI, RSP
 			0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1 (SYS_write)
 			0x0f, 0x05, // SYSCALL
+		)
+		jmpReadPos := len(code)
+		code = append(code, 0xe9, 0, 0, 0, 0) // JMP read
+		binary.LittleEndian.PutUint32(code[jmpReadPos+1:jmpReadPos+5], uint32(int32(readPos-(jmpReadPos+5))))
+
+		closePos := len(code)
+		binary.LittleEndian.PutUint32(code[jzClosePos+2:jzClosePos+6], uint32(int32(closePos-(jzClosePos+6))))
+		code = append(code,
 			0x4c, 0x89, 0xe7, // MOV RDI, R12
 			0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, // MOV RAX, 3 (SYS_close)
 			0x0f, 0x05, // SYSCALL

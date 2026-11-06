@@ -1488,6 +1488,9 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	if err := s.writeGuestHostFiles(sctx, vfsObj, creds, root); err != nil {
 		return err
 	}
+	if err := s.installHostCACerts(sctx, vfsObj, creds, root); err != nil {
+		return err
+	}
 
 	// s.mounts is ordered by increasing path depth, so a mount point below
 	// another mount exists in that mount before the guest mounts there.
@@ -1554,13 +1557,20 @@ func tmpfsMountData(sizeBytes int64) string {
 }
 
 func vfsWriteFile(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, guestPath string, data []byte, mode linux.FileMode) error {
+	return vfsWriteFileLinks(sctx, vfsObj, creds, root, guestPath, data, mode, false)
+}
+
+// vfsWriteFileLinks writes data to a file and creates the file when it is
+// missing. When followFinalLink is true and the path names a symbolic link, it
+// writes the file that the link names, as open(2) does.
+func vfsWriteFileLinks(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, guestPath string, data []byte, mode linux.FileMode, followFinalLink bool) error {
 	dir := path.Dir(guestPath)
 	if dir != "/" && dir != "." {
 		if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, dir, 0o755); err != nil {
 			return err
 		}
 	}
-	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(guestPath)}
+	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(guestPath), FollowFinalSymlink: followFinalLink}
 	fd, err := vfsObj.OpenAt(sctx, creds, &pop, &vfs.OpenOptions{
 		Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC,
 		Mode:  mode,

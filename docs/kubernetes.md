@@ -225,7 +225,7 @@ These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reaso
 | Calico | `TestE2EK3sCalico` runs the VXLAN mode with the iptables legacy back end. The eBPF data plane and BGP with BIRD are not tested. The guest has no eBPF, so Felix logs warnings about XDP and BPF and goes on. Set `IPTABLES_MODE=legacy` and `FELIX_IPTABLESBACKEND=Legacy`. |
 | NFLOG | `-j NFLOG` accepts a rule, but no group receives a packet, because the guest has no `nflog` listener. |
 | IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
-| Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 6.4, gives the intervals. |
+| Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 7.4, gives the intervals. |
 | Windows `systrap` | `memory.max` is stored and not enforced, so memory limits of pods do not hold. Taint such a node, or use `whpx`. |
 | MTU | `eth0` has the MTU 1500 at the start, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. Set `--tune net.nat.mtu=N` to start with another value. A node can change it later with `ip link set dev eth0 mtu N` from 68 to 65535, and `flannel` follows the new value at the next start. |
 | WireGuard reply address | A `wireguard` link answers from the address that the route picks, and not from the address that the peer used. The two differ on an interface with several addresses. |

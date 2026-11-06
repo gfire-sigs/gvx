@@ -188,6 +188,8 @@ type guestSpec struct {
 	readOnlyRoot  bool
 	publishAll    bool
 	netRaw        bool
+	// hostCACerts turns on gvx.Config.HostCACerts.
+	hostCACerts bool
 	// tuning sets the host-side tunables of the sandbox.
 	tuning tuning.Values
 	// packetWrite and allowSUID are the other two privileges of rungv
@@ -219,6 +221,7 @@ func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
 		Mounts:                 g.mounts,
 		ReadOnlyRoot:           g.readOnlyRoot,
 		PublishAll:             g.publishAll,
+		HostCACerts:            g.hostCACerts,
 		NetRaw:                 g.netRaw,
 		AllowPacketSocketWrite: g.packetWrite,
 		AllowSUID:              g.allowSUID,
