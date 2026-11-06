@@ -32,8 +32,9 @@ import (
 //   - A write to conf/all/rp_filter changes no link. The check of a packet takes
 //     the larger of the all value and the value of the link (IN_DEV_RPFILTER).
 //
-// The stack stores the values and gives them to the reverse path check through
-// EffectiveRPFilter. The initial value is 0, the default of the Linux kernel.
+// The stack stores the values and gives them to the reverse path check of the
+// IPv4 receive path through EffectiveRPFilter. The initial value is 0, the
+// default of the Linux kernel.
 
 // rpFilterState holds the rp_filter values of one network stack.
 type rpFilterState struct {
@@ -116,7 +117,7 @@ func (s *Stack) SetLinkRPFilter(id int32, v int32) error {
 // EffectiveRPFilter returns the value that the reverse path check of the link
 // with the index id uses: the larger of conf/all/rp_filter and the value of the
 // link. The value 0 turns the check off, 1 selects strict mode, and 2 selects
-// loose mode. The stack does not run the check yet.
+// loose mode.
 func (s *Stack) EffectiveRPFilter(id tcpip.NICID) int32 {
 	s.rpFilter.mu.RLock()
 	defer s.rpFilter.mu.RUnlock()

@@ -75,6 +75,7 @@ func NewStack(s *stack.Stack, id uint64) *Stack {
 		id:    id,
 	}
 	s.SetProxyARPPolicy(st.proxyARPEnabled)
+	s.SetRPFilterPolicy(st.rpFilterPolicy)
 	return st
 }
 

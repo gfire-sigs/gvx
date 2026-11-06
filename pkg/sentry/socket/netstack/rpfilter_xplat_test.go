@@ -199,3 +199,38 @@ func TestInheritRPFilterCopiesAllAndDefaultOnly(t *testing.T) {
 		t.Errorf("root all = %d after a write in the child, want 1", root.RPFilterAll())
 	}
 }
+
+// TestRPFilterPolicyFeedsTheReversePathCheck checks the policy that NewStack
+// installs: the larger rp_filter value of all and the link, and src_valid_mark
+// from conf/all or the link.
+func TestRPFilterPolicyFeedsTheReversePathCheck(t *testing.T) {
+	s := ethtoolStack(t, "veth", "vxlan")
+	check := func(step string, id tcpip.NICID, wantMode int32, wantMark bool) {
+		t.Helper()
+		mode, mark := s.rpFilterPolicy(id)
+		if mode != wantMode || mark != wantMark {
+			t.Errorf("%s: policy of link %d = (%d, %t), want (%d, %t)", step, id, mode, mark, wantMode, wantMark)
+		}
+	}
+	check("initial", 1, 0, false)
+
+	s.SetRPFilterAll(1)
+	check("all 1", 1, 1, false)
+	if err := s.SetLinkRPFilter(2, 2); err != nil {
+		t.Fatal(err)
+	}
+	check("link 2 at 2", 2, 2, false)
+	check("link 1 follows all", 1, 1, false)
+
+	s.SetSysctlValue(ConfDirIPv4+"/all/src_valid_mark", "1")
+	check("all src_valid_mark", 1, 1, true)
+	s.SetSysctlValue(ConfDirIPv4+"/all/src_valid_mark", "0")
+	if err := s.SetLinkConfValue(2, ConfDirIPv4, "src_valid_mark", 1); err != nil {
+		t.Fatal(err)
+	}
+	check("link src_valid_mark", 2, 2, true)
+	check("other link without the mark", 1, 1, false)
+
+	s.SetRPFilterAll(0)
+	check("all back to 0", 1, 0, false)
+}

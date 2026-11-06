@@ -124,6 +124,22 @@ func (s *Stack) proxyARPEnabled(id tcpip.NICID) bool {
 	return s.linkConfValue(id, ConfDirIPv4, "proxy_arp", 0) != 0
 }
 
+// rpFilterPolicy gives the reverse path check the rp_filter mode of the link
+// and src_valid_mark. conf/all/src_valid_mark or the value of the link turns
+// the mark on, as IN_DEV_SRC_VMARK of Linux does.
+func (s *Stack) rpFilterPolicy(id tcpip.NICID) (int32, bool) {
+	mode := s.EffectiveRPFilter(id)
+	if mode != 1 && mode != 2 {
+		return 0, false
+	}
+	if text, ok := s.SysctlValue(ConfDirIPv4 + "/all/src_valid_mark"); ok {
+		if v, err := strconv.ParseInt(text, 10, 32); err == nil && v != 0 {
+			return mode, true
+		}
+	}
+	return mode, s.linkConfValue(id, ConfDirIPv4, "src_valid_mark", 0) != 0
+}
+
 // LinkForwarding returns conf/<link>/forwarding of the IPv4 link with the index
 // id.
 func (s *Stack) LinkForwarding(id int32) (bool, error) {
