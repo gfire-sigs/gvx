@@ -417,14 +417,15 @@ This section states what runs when `rungv` runs inside another sandbox. The inne
 
 ### 11.1 `rungv` inside `rungv`
 
-The outer `rungv` uses the engine `systrap` on a Linux host, or the engine `hvf` on macOS. The inner `rungv` uses `-platform=systrap`. The inner sandbox prints `seccomp user-space notification mechanism isn't supported` and uses the futex loop. This message is a warning, not a failure.
+The outer `rungv` uses the engine `systrap` on a Linux host, or the engine `hvf` on macOS. The inner `rungv` uses `-platform=systrap`. The outer guest kernel tells the address space when a tracer sets `GS` and reports the page fault in the signal frame, as Linux does. The inner sandbox prints `seccomp user-space notification mechanism isn't supported` and uses the futex loop. This message is a warning, not a failure.
 
 | Outer host and flags | Inner flags | Result |
 | :--- | :--- | :--- |
 | Linux arm64, `-platform=systrap` | `-platform=systrap -bin /smoke` | Works. |
 | Linux arm64, `-platform=systrap`, image `alpine:3.20` | `-platform=systrap alpine:3.20 uname -a` | Works. The inner guest reports `aarch64`. |
 | macOS arm64, `-platform=hvf` | `-platform=systrap -bin /smoke` | Works. The run is slow. |
-| Linux amd64, `-platform=systrap` | `-platform=systrap -bin /smoke` | Does not work yet. The inner Sentry starts its stub and the guest, then the guest never prints. The cause is open. |
+| Linux amd64, `-platform=systrap` | `-platform=systrap -bin /smoke` | Works. |
+| Linux amd64, `-platform=systrap`, e2-micro host without KVM | `-platform=systrap -net=none -bin /smoke` | Works. The inner guest prints `gvx-smoke-ok`. |
 
 To run the nested smoke test:
 
@@ -437,14 +438,22 @@ The inner `rungv` has no root certificates when the outer guest comes from `-bin
 
 ### 11.2 `rungv` inside Docker with the gVisor runtime
 
-The upstream runtime `runsc` is the host kernel of the inner `rungv` in this case. The flags `--privileged`, `--security-opt seccomp=unconfined`, and `--platform=ptrace` of `runsc` do not change the result. The first failure is in the kernel of `runsc`, so `gvx` cannot repair it.
+The upstream runtime `runsc` is the host kernel of the inner `rungv` in this case. The release `release-20261102.0` of `runsc` gives the same results with `--platform=kvm` and with `--platform=systrap`. The flags `--privileged` and `--security-opt seccomp=unconfined` do not change the result.
 
-| Host | Failure |
-| :--- | :--- |
-| Linux amd64 | The probe of the address space size gets the wrong answer, because `runsc` checks the alignment of a fixed mapping before its range. The inner `rungv` panics with `failed to map stub` or `None of the address space sizes could be successfully mmaped`. The size search of this release maps the last page of the address space. The run of that fix on `runsc` did not finish, so the result is open. |
-| Linux arm64 | The inner `rungv` starts its stub thread. The signal frame of `runsc` has no `fpsimd_context` record, so the stub stops with `FP state context magic header (0) does not match expected FPSIMD_MAGIC`. The exit code is 137. |
+| Host | Inner flags | Result |
+| :--- | :--- | :--- |
+| Linux amd64, `runsc-kvm` | `-platform=systrap -net=none -lockdown=false -bin /n/smoke.elf` | Works. The exit code is 0. |
+| Linux amd64, `runsc-systrap` | `-platform=systrap -net=none -lockdown=false -bin /n/smoke.elf` | Works. The exit code is 0. |
+| Linux arm64, `runsc` with any platform | `-platform=systrap` | Does not work. The signal frame of `runsc` has no `fpsimd_context` record. The stub stops with `FP state context magic header (0) does not match expected FPSIMD_MAGIC`. The exit code is 137. |
 
-The fix for the arm64 failure belongs in gVisor: write the `fpsimd_context` record, the `esr_context` record, and the end marker in the arm64 signal frame, as `gvx` does since this release.
+The amd64 results depend on four differences between `runsc` and Linux. The inner `rungv` accepts each of them:
+
+- `runsc` checks the alignment of a fixed mapping before its range. The inner `rungv` maps the last page of the address space to measure the size.
+- `runsc` gives a page fault the error code 0 in the signal frame. The inner `rungv` infers an instruction fetch from the fault address. It treats a fault as a read first, and the second fault at the same instruction and address as a write.
+- `runsc` with the platform `systrap` patches the syscall instructions of the stub with jumps that use `GS`. It does not remove the patches when a tracer sets `GS`. The syscall thread of the stub calls `arch_prctl(ARCH_SET_GS)` once, so `runsc` removes the patches before the stub runs.
+- `runsc` with the platform `systrap` seals its table of syscall patches in the address space of the stub. A call that unmaps the whole range fails with `EPERM`. The inner `rungv` unmaps its address space mapping by mapping.
+
+The arm64 failure belongs in gVisor. Report it to the upstream project: write the `fpsimd_context` record, the `esr_context` record, and the end marker in the arm64 signal frame, as `gvx` does since this release. The same report can ask for the page fault error code in the amd64 signal frame, as Linux gives it.
 
 ### 11.3 Limits
 
