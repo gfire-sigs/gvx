@@ -62,14 +62,20 @@ type Stack struct {
 
 	// rpFilter keeps the rp_filter values. See rpfilter_xplat.go.
 	rpFilter rpFilterState `state:"nosave"`
+
+	// linkConf keeps the conf and neigh values of the links. See
+	// linkconf_values_xplat.go.
+	linkConf linkConfState `state:"nosave"`
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.
 func NewStack(s *stack.Stack, id uint64) *Stack {
-	return &Stack{
+	st := &Stack{
 		Stack: s,
 		id:    id,
 	}
+	s.SetProxyARPPolicy(st.proxyARPEnabled)
+	return st
 }
 
 // AddInterfaceEventSubscriber implements inet.InterfaceEventPublisher.AddInterfaceEventSubscriber.

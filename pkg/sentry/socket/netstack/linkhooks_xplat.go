@@ -25,6 +25,7 @@ import "z.gfire.dev/gvx/pkg/tcpip"
 func (s *Stack) dropLinkState(id tcpip.NICID) {
 	s.dropLinkFeatures(id)
 	s.dropLinkRPFilter(id)
+	s.dropLinkConf(id)
 }
 
 // moveLinkState hands the state of a link to the stack dst when the link
