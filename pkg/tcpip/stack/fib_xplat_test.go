@@ -533,6 +533,19 @@ func TestSourceAddressOfARouteWithoutAddressIsStable(t *testing.T) {
 			t.Fatalf("call %d: the source address is %s, want 10.0.2.15", i, got)
 		}
 	}
+	// The stack keeps the order of the NICs between calls, so a NIC that leaves
+	// must change the answer of the next call.
+	if err := s.RemoveNIC(2); err != nil {
+		t.Fatalf("RemoveNIC: %v", err)
+	}
+	r, err := s.FindRoute(0, tcpip.Address{}, fibAddr(10, 5, 0, 2), ipv4.ProtocolNumber, false)
+	if err != nil {
+		t.Fatalf("FindRoute after RemoveNIC = %v", err)
+	}
+	defer r.Release()
+	if got := r.LocalAddress(); got != fibAddr(10, 6, 0, 1) {
+		t.Errorf("the source address after eth0 left is %s, want 10.6.0.1", got)
+	}
 }
 
 // TestProxyARPSkipsProbesMulticastAndLoopback checks the requests that
@@ -646,5 +659,56 @@ func BenchmarkReversePathValid(b *testing.B) {
 		if !s.ReversePathValid(in, src, dst, 0, ipv4.ProtocolNumber, stack.ReversePathStrict, false) {
 			b.Fatal("the source of a pod is not valid")
 		}
+	}
+}
+
+// BenchmarkFindRoute measures a route lookup on a Calico node with 200 pod
+// routes. The default rule 0 names the table local, which holds no route, and
+// the lookup must not read the whole list for it.
+func BenchmarkFindRoute(b *testing.B) {
+	s := newCalicoStack(b, 200)
+	for _, tc := range []struct {
+		name string
+		dst  tcpip.Address
+	}{
+		{"pod_first", fibAddr(10, 42, 0, 0)},
+		{"pod_last", fibAddr(10, 42, 0, 199)},
+		{"internet", fibAddr(8, 8, 8, 8)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				r, err := s.FindRoute(0, fibAddr(10, 0, 2, 15), tc.dst, ipv4.ProtocolNumber, false)
+				if err != nil {
+					b.Fatalf("FindRoute: %v", err)
+				}
+				r.Release()
+			}
+		})
+	}
+}
+
+// TestRuleForAnEmptyTableChangesNoLookup checks that the skip of a table
+// without routes does not change a result, also when a route enters the table
+// or leaves it.
+func TestRuleForAnEmptyTableChangesNoLookup(t *testing.T) {
+	s := newFibStack(t)
+	if got, err := outgoingNIC(t, s, stack.RouteFlow{}, fibAddr(8, 8, 8, 8)); err != nil || got != fibEth0 {
+		t.Fatalf("lookup = (%d, %v), want NIC %d", got, err, fibEth0)
+	}
+	// A route in the table local, which has none at the start, must count at
+	// once, because rule 0 looks it up first.
+	local := tcpip.Route{Destination: fibSubnet(t, 8, 8, 8, 0, 24), NIC: fibWG0, RouteAttrs: tcpip.RouteAttrs{Table: tcpip.RouteTableLocal}}
+	if _, err := s.InsertRoute(local, stack.RouteInsert{Create: true}); err != nil {
+		t.Fatalf("InsertRoute: %v", err)
+	}
+	if got, err := outgoingNIC(t, s, stack.RouteFlow{}, fibAddr(8, 8, 8, 8)); err != nil || got != fibWG0 {
+		t.Errorf("lookup with a route in the table local = (%d, %v), want NIC %d", got, err, fibWG0)
+	}
+	if _, ok := s.DeleteRoute(stack.RouteMatch{Table: tcpip.RouteTableLocal, Destination: local.Destination}); !ok {
+		t.Fatalf("DeleteRoute found no route")
+	}
+	if got, err := outgoingNIC(t, s, stack.RouteFlow{}, fibAddr(8, 8, 8, 8)); err != nil || got != fibEth0 {
+		t.Errorf("lookup after the route left = (%d, %v), want NIC %d", got, err, fibEth0)
 	}
 }

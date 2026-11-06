@@ -839,6 +839,7 @@ func (s *Stack) SetPortRange(start uint16, end uint16) tcpip.Error {
 func (s *Stack) SetRouteTable(table []tcpip.Route) {
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
+	s.fib.routesChanged()
 	s.routeTable.Reset()
 	for _, r := range table {
 		s.addRouteLocked(&r)
@@ -865,6 +866,7 @@ func (s *Stack) AddRoute(route tcpip.Route) {
 
 // +checklocks:s.routeMu
 func (s *Stack) addRouteLocked(route *tcpip.Route) {
+	s.fib.routesChanged()
 	routePrefix := route.Destination.Prefix()
 	n := s.routeTable.Front()
 	for ; n != nil; n = n.Next() {
@@ -887,6 +889,7 @@ func (s *Stack) RemoveRoutes(match func(tcpip.Route) bool) int {
 
 // +checklocks:s.routeMu
 func (s *Stack) removeRoutesLocked(match func(tcpip.Route) bool) int {
+	s.fib.routesChanged()
 	count := 0
 	for route := s.routeTable.Front(); route != nil; {
 		next := route.Next()
@@ -1046,6 +1049,7 @@ func (s *Stack) CreateNICWithOptions(id tcpip.NICID, ep LinkEndpoint, opts NICOp
 		}
 	}
 	s.nics[id] = n
+	s.nicsChanged()
 	if n.kind == "tun" {
 		s.preservedNICs[id] = n
 	}
@@ -1145,6 +1149,7 @@ func (s *Stack) removeNICLocked(id tcpip.NICID, closeLinkEndpoint bool) (func(),
 		return nil, &tcpip.ErrUnknownNICID{}
 	}
 	delete(s.nics, id)
+	s.nicsChanged()
 	delete(s.preservedNICs, id)
 
 	if nic.Primary != nil {
@@ -1156,6 +1161,7 @@ func (s *Stack) removeNICLocked(id tcpip.NICID, closeLinkEndpoint bool) (func(),
 
 	// Remove routes in-place. n tracks the number of routes written.
 	s.routeMu.Lock()
+	s.fib.routesChanged()
 	for r := s.routeTable.Front(); r != nil; {
 		next := r.Next()
 		if r.NIC == id {
@@ -1646,17 +1652,24 @@ func isNICForwarding(nic *nic, proto tcpip.NetworkProtocolNumber) bool {
 //
 // +checklocksread:s.mu
 func (s *Stack) findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoingNIC *nic, localAddr, remoteAddr, srcHint, gateway tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool, mtu uint32) *Route {
-	for aNIC := s.nextSourceNICRLocked(nil); aNIC != nil; aNIC = s.nextSourceNICRLocked(aNIC) {
-		addressEndpoint := s.getAddressEP(aNIC, localAddr, remoteAddr, srcHint, netProto)
-		if addressEndpoint == nil {
-			continue
-		}
-
-		if r := constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, outgoingNIC, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop, mtu); r != nil {
+	for _, aNIC := range s.sourceNICOrderRLocked() {
+		if r := s.routeFromSourceNICRLocked(aNIC, outgoingNIC, localAddr, remoteAddr, srcHint, gateway, netProto, multicastLoop, mtu); r != nil {
 			return r
 		}
 	}
 	return nil
+}
+
+// routeFromSourceNICRLocked returns a route that takes its local address from
+// aNIC and leaves through outgoingNIC, or nil when aNIC has no usable address.
+//
+// +checklocksread:s.mu
+func (s *Stack) routeFromSourceNICRLocked(aNIC, outgoingNIC *nic, localAddr, remoteAddr, srcHint, gateway tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool, mtu uint32) *Route {
+	addressEndpoint := s.getAddressEP(aNIC, localAddr, remoteAddr, srcHint, netProto)
+	if addressEndpoint == nil {
+		return nil
+	}
+	return constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, outgoingNIC, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop, mtu)
 }
 
 // FindRoute creates a route to the given destination address, leaving through
@@ -2233,6 +2246,7 @@ func (s *Stack) ReplaceConfig(st *Stack) {
 	for id, nic := range nics {
 		nic.stack = s
 		s.nics[id] = nic
+		s.nicsChanged()
 		if nic.IsLoopback() {
 			s.loopbackNIC = nic
 		} else if s.externalNetworkingDisabled {
@@ -2251,6 +2265,7 @@ func (s *Stack) Restore() {
 	for id, nic := range s.preservedNICs {
 		nic.stack = s
 		s.nics[id] = nic
+		s.nicsChanged()
 		nic.NetworkLinkEndpoint.SetOnCloseAction(func() {
 			s.RemoveNIC(id)
 		})

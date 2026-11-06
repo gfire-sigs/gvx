@@ -121,6 +121,16 @@ type fibState struct {
 	// NICs. See hostaddr_xplat.go.
 	hostAddrGen atomic.Uint64
 	hostAddrs   atomic.Pointer[hostAddrSnapshot]
+
+	// routeGen counts the changes of the route list, and routeTables holds the
+	// count of routes in each table at one generation. See tablehas_xplat.go.
+	routeGen    atomic.Uint64
+	routeTables atomic.Pointer[routeTableCounts]
+
+	// nicGen counts the NICs that join or leave, and nicOrder holds the NICs in
+	// the order of the source address choice. See route_xplat.go.
+	nicGen   atomic.Uint64
+	nicOrder atomic.Pointer[nicOrderSnapshot]
 }
 
 var (
@@ -437,6 +447,13 @@ func (s *Stack) fibRoutes(l *routeLookup) iter.Seq[*tcpip.Route] {
 			}
 			switch r.Action {
 			case RuleActionToTable:
+				// A rule for a table without routes changes nothing. The
+				// table local, which the default rule 0 names, has none, and
+				// the scan of the list for it would cost as much as the
+				// whole list.
+				if !s.tableHasRoutes(r.Table) {
+					continue
+				}
 				if !s.walkTable(r.Table, r.SuppressPrefixLen, l, yield) {
 					return
 				}
@@ -582,6 +599,7 @@ func sameRouteNextHop(a, b *tcpip.Route) bool {
 //
 // +checklocks:s.routeMu
 func (s *Stack) insertRouteLocked(route *tcpip.Route, first bool) {
+	s.fib.routesChanged()
 	prefix := route.Destination.Prefix()
 	for n := s.routeTable.Front(); n != nil; n = n.Next() {
 		np := n.Destination.Prefix()
@@ -616,6 +634,7 @@ type RouteMatch struct {
 func (s *Stack) DeleteRoute(m RouteMatch) (tcpip.Route, bool) {
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
+	s.fib.routesChanged()
 	for r := s.routeTable.Front(); r != nil; r = r.Next() {
 		if !m.matches(r) {
 			continue

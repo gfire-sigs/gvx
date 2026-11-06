@@ -15,6 +15,9 @@
 package stack
 
 import (
+	"cmp"
+	"slices"
+
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
@@ -89,32 +92,46 @@ func (s *Stack) weakHostRouteRLocked(flow RouteFlow, pinned *nic, localAddr, rem
 	return route
 }
 
-// nextSourceNICRLocked returns the NIC after prev in the order that Linux uses
-// to pick a source address (inet_select_addr): the NICs in ascending order of
-// ID, and the loopback NICs last. A nil prev returns the first NIC. It returns
-// nil after the last NIC. The order does not depend on the iteration order of a
-// map, so the same host gets the same source address each time. It allocates
-// nothing.
+// sourceNICOrderRLocked returns the NICs in the order that Linux uses to pick a
+// source address (inet_select_addr): the NICs in ascending order of ID, and the
+// loopback NICs last. The order does not depend on the iteration order of a
+// map, so the same host gets the same source address each time. The stack
+// keeps the sorted slice between calls and sorts again after a NIC joins or
+// leaves, so a call allocates nothing. The caller must not change the slice.
 //
 // +checklocksread:s.mu
-func (s *Stack) nextSourceNICRLocked(prev *nic) *nic {
-	var next *nic
-	for _, n := range s.nics {
-		if prev != nil && !sourceNICLess(prev, n) {
-			continue
+func (s *Stack) sourceNICOrderRLocked() []*nic {
+	gen := s.fib.nicGen.Load()
+	snap := s.fib.nicOrder.Load()
+	if snap == nil || snap.gen != gen {
+		snap = &nicOrderSnapshot{gen: gen, nics: make([]*nic, 0, len(s.nics))}
+		for _, n := range s.nics {
+			snap.nics = append(snap.nics, n)
 		}
-		if next == nil || sourceNICLess(n, next) {
-			next = n
-		}
+		slices.SortFunc(snap.nics, func(a, b *nic) int {
+			if al, bl := a.IsLoopback(), b.IsLoopback(); al != bl {
+				if bl {
+					return -1
+				}
+				return 1
+			}
+			return cmp.Compare(a.id, b.id)
+		})
+		s.fib.nicOrder.Store(snap)
 	}
-	return next
+	return snap.nics
 }
 
-// sourceNICLess reports whether a comes before b in the order of
-// nextSourceNICRLocked.
-func sourceNICLess(a, b *nic) bool {
-	if al, bl := a.IsLoopback(), b.IsLoopback(); al != bl {
-		return bl
-	}
-	return a.id < b.id
+// nicOrderSnapshot holds the NICs in the order of sourceNICOrderRLocked at the
+// generation gen.
+type nicOrderSnapshot struct {
+	gen  uint64
+	nics []*nic
+}
+
+// nicsChanged marks the snapshots that depend on the set of NICs stale. The
+// caller holds s.mu for writing.
+func (s *Stack) nicsChanged() {
+	s.fib.nicGen.Add(1)
+	s.invalidateHostAddrs()
 }
