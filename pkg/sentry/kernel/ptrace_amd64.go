@@ -36,7 +36,11 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) err
 		return err
 
 	case linux.PTRACE_POKEUSR: // aka PTRACE_POKEUSER
-		return target.Arch().PtracePokeUser(uintptr(addr), uintptr(data))
+		oldGS := target.Arch().GS()
+		if err := target.Arch().PtracePokeUser(uintptr(addr), uintptr(data)); err != nil {
+			return err
+		}
+		return t.ptraceUserModifiedGS(target, oldGS)
 
 	case linux.PTRACE_GETREGS:
 		// "Copy the tracee's general-purpose ... registers ... to the address
@@ -59,6 +63,7 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) err
 		return err
 
 	case linux.PTRACE_SETREGS:
+		oldGS := target.Arch().GS()
 		_, err := target.Arch().PtraceSetRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
@@ -66,6 +71,7 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) err
 		})
 		if err == nil {
 			target.p.FullStateChanged()
+			err = t.ptraceUserModifiedGS(target, oldGS)
 		}
 		return err
 

@@ -1376,6 +1376,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 		}
 
 		ar := ars.Head()
+		oldGS := target.Arch().GS()
 		n, err := target.Arch().PtraceSetRegSet(uintptr(addr), &usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
@@ -1385,6 +1386,9 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 			return err
 		}
 		target.p.FullStateChanged()
+		if err := t.ptraceUserModifiedGS(target, oldGS); err != nil {
+			return err
+		}
 		ar.End -= hostarch.Addr(n)
 		return t.CopyOutIovecs(data, hostarch.AddrRangeSeqOf(ar))
 

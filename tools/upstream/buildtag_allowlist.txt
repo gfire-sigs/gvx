@@ -338,3 +338,9 @@ seam pkg/sentry/platform/systrap/stubfilter/stubfilter.go
 # A host kernel can seal a mapping that its Sentry owns. The stub of a nested Sentry then unmaps its
 # address space mapping by mapping (pkg/sentry/platform/systrap/unmap_regions_xplat.go).
 seam pkg/sentry/platform/systrap/subprocess.go
+
+# A tracer that sets the GS base of a tracee with PTRACE_SETREGS, PTRACE_SETREGSET, or
+# PTRACE_POKEUSER tells the address space, as arch_prctl(ARCH_SET_GS) does
+# (pkg/sentry/kernel/ptrace_gs_xplat.go). The engine removes its syscall patches that use GS.
+seam pkg/sentry/kernel/ptrace.go
+seam pkg/sentry/kernel/ptrace_amd64.go
