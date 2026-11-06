@@ -840,14 +840,17 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath) 
 	return d, nil
 }
 
-// newOwnerLocked returns the owner of a new child: the caller's credentials,
-// with the group inherited from a set-group-ID parent directory.
+// newOwner returns the owner of a new child: the filesystem IDs of the caller,
+// as inode_init_owner uses, with the group inherited from a set-group-ID
+// parent directory. The filesystem IDs differ from the effective IDs in an
+// overlay upper layer, where the mounter's credentials carry the fsuid of the
+// caller.
 func newOwner(parent *inode, creds *auth.Credentials) (auth.KUID, auth.KGID, bool) {
 	e := parent.snapshot()
 	if linux.FileMode(e.attr.Mode)&linux.ModeSetGID != 0 {
-		return creds.EffectiveKUID, auth.KGID(e.attr.GID), true
+		return creds.FilesystemKUID, auth.KGID(e.attr.GID), true
 	}
-	return creds.EffectiveKUID, creds.EffectiveKGID, false
+	return creds.FilesystemKUID, creds.FilesystemKGID, false
 }
 
 // doCreateAt checks that creating a file at rp is permitted, then calls create.

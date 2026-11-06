@@ -143,6 +143,7 @@ func overlayWriteSteps(p overlayUpperPaths) []overlayRun {
 		{"overlay-final-view", func() error { return checkFinalView(p) }},
 		{"overlay-umount", unmountOverlay},
 		{"overlay-exec-from-layers", func() error { return overlayExecFromLayers(p) }},
+		{"overlay-nonroot-owns-new-files", func() error { return overlayNonRootCreates(p) }},
 	}
 }
 

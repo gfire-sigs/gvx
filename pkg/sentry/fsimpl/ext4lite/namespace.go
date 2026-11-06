@@ -27,10 +27,13 @@ import (
 // reports that inheritance.
 func (i *inode) newOwner(creds *auth.Credentials) (auth.KUID, auth.KGID, bool) {
 	mode, _, gid := i.owner()
+	// A new node takes the filesystem IDs of the caller, as inode_init_owner
+	// does. They differ from the effective IDs in an overlay upper layer,
+	// where the mounter's credentials carry the fsuid of the caller.
 	if mode&linux.ModeSetGID != 0 {
-		return creds.EffectiveKUID, gid, true
+		return creds.FilesystemKUID, gid, true
 	}
-	return creds.EffectiveKUID, creds.EffectiveKGID, false
+	return creds.FilesystemKUID, creds.FilesystemKGID, false
 }
 
 // newChildLocked creates a node and links it into parent. The init function
