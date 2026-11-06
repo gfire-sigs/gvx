@@ -167,6 +167,8 @@ seam pkg/sentry/syscalls/linux/sys_syslog.go
 seam pkg/sentry/syscalls/linux/linux64.go
 # A target that logs the interfaces of a packet runs through InterfaceTarget
 # (pkg/tcpip/stack/iptables_target_xplat.go). The seam is one call in checkRule.
+# The OUTPUT and PREROUTING hooks drop a packet that needs a new connection when the table is
+# full (pkg/tcpip/stack/conntrack_limits_xplat.go). The seam is one call in each hook.
 seam pkg/tcpip/stack/iptables.go
 
 # Content seams: the service data path of a Kubernetes node (GVXIP-005, P2).
@@ -184,9 +186,6 @@ seam pkg/tcpip/stack/packet_buffer.go
 # counts against nf_conntrack_max (pkg/tcpip/stack/conntrack_limits_xplat.go). The seams are the
 # fields of conn and ConnTrack, trackPacket, and the release of a removed connection.
 seam pkg/tcpip/stack/conntrack.go
-# The OUTPUT and PREROUTING hooks drop a packet that needs a new connection when the table is
-# full (pkg/tcpip/stack/conntrack_limits_xplat.go). The seam is one call in each hook.
-seam pkg/tcpip/stack/iptables.go
 # A reply that the stack sends for a packet from another NIC uses the weak host model of Linux
 # (pkg/tcpip/stack/route_xplat.go). The seam is one call in FindRoute. The delivery of a forwarded
 # packet to a local address of another NIC lives in pkg/tcpip/network/ipv4/local_delivery_xplat.go
