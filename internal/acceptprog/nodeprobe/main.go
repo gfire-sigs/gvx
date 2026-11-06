@@ -40,8 +40,9 @@
 //	                                 tables and their effect on dynamic entries
 //	nodeprobe recentparams           check the module parameters of xt_recent
 //	nodeprobe capacity MEM CPUS      check MemTotal in bytes and the CPU count
-//	nodeprobe memtotal WRITE_MIB     write WRITE_MIB MiB, print MemTotal, wait for
-//	                                 the end of the input, and check that it stays
+//	nodeprobe memtotal WRITE_MIB DIR write WRITE_MIB MiB to the volume at DIR, print
+//	                                 MemTotal, wait for the end of the input, and
+//	                                 check that it stays
 //	nodeprobe natmtu [MTU]           check the MTU of eth0 and of the tunnels on it
 //	                                 in a sandbox with the NAT network; MTU is
 //	                                 the expected MTU of eth0, 1500 by default
@@ -53,8 +54,14 @@
 //	                                 a throughput server
 //	nodeprobe tput HOST:PORT MIB     measure the TCP download and upload rate of
 //	                                 MIB MiB against a server at HOST:PORT
-//	nodeprobe stats HOST:PORT        check link and disk statistics; the probe
-//	                                 reads from a TCP server at HOST:PORT
+//	nodeprobe stats HOST:PORT        check link statistics; the probe reads from a
+//	                                 TCP server at HOST:PORT
+//	nodeprobe disks DIR HOST:PORT    check /proc/diskstats, /proc/partitions, and
+//	                                 /sys/block against stat and mountinfo, and
+//	                                 check that file I/O on the volume at DIR moves
+//	                                 the counters and that socket and pipe traffic
+//	                                 does not; the probe reads from a TCP server at
+//	                                 HOST:PORT
 package main
 
 import (
@@ -176,8 +183,8 @@ func main() {
 		}
 		checks = capacityChecks(mem, cpus)
 	case "memtotal":
-		if len(os.Args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: nodeprobe memtotal WRITE_MIB")
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe memtotal WRITE_MIB DIR")
 			os.Exit(2)
 		}
 		mib, err := strconv.Atoi(os.Args[2])
@@ -185,7 +192,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "memtotal: WRITE_MIB must be a number")
 			os.Exit(2)
 		}
-		checks = memTotalChecks(mib)
+		checks = memTotalChecks(mib, os.Args[3])
+	case "disks":
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe disks DIR HOST:PORT")
+			os.Exit(2)
+		}
+		checks = disksChecks(os.Args[2], os.Args[3])
 	case "stats":
 		if len(os.Args) != 3 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe stats HOST:PORT")

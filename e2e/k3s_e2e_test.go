@@ -303,6 +303,29 @@ for i in $(seq 1 90); do
 done
 if [ "$ok" = 1 ]; then log "B10-OK"; else fail "B10 metrics"; k top node; k -n kube-system logs deploy/metrics-server --tail=20; k get --raw /api/v1/nodes/$node/proxy/stats/summary | head -c 600; echo; fi
 
+# B10-FS: cAdvisor in the kubelet maps the volume at /var/lib/rancher, which
+# is the disk /dev/vdb, to its disk statistics. The metrics of the node
+# container name the device /dev/vdb and count the writes of the disk, which
+# k3s makes all the time. The summary API gives a real capacity and a real
+# inode count for the image file system on that volume.
+capacity() { echo "$1" | grep -o '"capacityBytes":[0-9]*' | head -1 | cut -d: -f2; }
+inodes() { echo "$1" | grep -o '"inodes":[0-9]*' | head -1 | cut -d: -f2; }
+# positive tells whether a metric value is above 0. A metric value can have an
+# exponent, such as 6.0014358528e+10.
+positive() { awk -v v="$1" 'BEGIN { exit !(v + 0 > 0) }'; }
+fsok=0
+for i in $(seq 1 60); do
+  summary=$(k get --raw /api/v1/nodes/$node/proxy/stats/summary 2>/dev/null | tr -d ' \n\t')
+  imagefs=$(echo "$summary" | grep -o '"imageFs":{[^}]*}' | head -1)
+  metrics=$(k get --raw /api/v1/nodes/$node/proxy/metrics/cadvisor 2>/dev/null | grep 'device="/dev/vdb"' | grep 'id="/"')
+  limit=$(echo "$metrics" | grep '^container_fs_limit_bytes{' | head -1 | sed 's/^.*} //' | cut -d' ' -f1)
+  writes=$(echo "$metrics" | grep '^container_fs_writes_total{' | head -1 | sed 's/^.*} //' | cut -d' ' -f1)
+  cap=$(capacity "$imagefs"); ino=$(inodes "$imagefs")
+  if positive "$limit" && positive "$writes" && [ "${cap:-0}" -gt 0 ] && [ "${cap:-0}" -lt 4611686018427387904 ] && [ "${ino:-0}" -gt 0 ]; then fsok=1; break; fi
+  sleep 2
+done
+if [ "$fsok" = 1 ]; then log "B10-FS-OK limit=$limit writes=$writes imagefs=$cap inodes=$ino"; else fail "B10 fs: limit '$limit' writes '$writes' imageFs '$imagefs'"; echo "$metrics" | head -c 3000; echo; cat /proc/diskstats; fi
+
 log "PHASE1-DONE"
 `
 
@@ -324,7 +347,7 @@ func TestE2EK3sSingleNode(t *testing.T) {
 			out, node := runK3sPhase(t, b, volume, script, "1", "", enforce)
 			for _, want := range []string{
 				"B1-OK", "B2-SYSTEM-OK", "B2-WEB-OK", "B3-OK", "B4-OK", "B5-POD-OK", "B6-OK",
-				"B7-LOGS-OK", "B7-EXEC-OK", "B7-PORTFORWARD-OK", "B8-OK", "B9-CPU-OK", "B10-OK",
+				"B7-LOGS-OK", "B7-EXEC-OK", "B7-PORTFORWARD-OK", "B8-OK", "B9-CPU-OK", "B10-OK", "B10-FS-OK",
 			} {
 				requireContains(t, "phase 1 output", out, want)
 			}

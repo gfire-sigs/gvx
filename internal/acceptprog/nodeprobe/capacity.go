@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -127,17 +128,18 @@ func capacityChecks(mem uint64, cpus int) []check {
 	}
 }
 
-// memTotalChecks writes writeMiB MiB to a file, prints MemTotal, waits for the
-// end of the standard input, and checks that the value stays. Then it prints the
-// sectors that /proc/diskstats shows as written. The test closes the input of
-// every sandbox only after all of them printed their value, so the runs overlap,
-// and each sandbox must count only its own writes.
-func memTotalChecks(writeMiB int) []check {
+// memTotalChecks writes writeMiB MiB to a file on the volume at dir, prints
+// MemTotal, waits for the end of the standard input, and checks that the value
+// stays. Then it prints the sectors that /proc/diskstats shows as written for
+// the disk of the volume. The test closes the input of every sandbox only after
+// all of them printed their value, so the runs overlap, and each sandbox must
+// count only the writes to its own volume.
+func memTotalChecks(writeMiB int, dir string) []check {
 	var first uint64
 	return []check{
 		{"memtotal-first-read", func() error {
 			if writeMiB > 0 {
-				if err := os.WriteFile("/tmp/diskfile", make([]byte, writeMiB<<20), 0o644); err != nil {
+				if err := writeSynced(filepath.Join(dir, "diskfile"), writeMiB); err != nil {
 					return err
 				}
 			}
@@ -167,9 +169,12 @@ func memTotalChecks(writeMiB int) []check {
 			return nil
 		}},
 		{"diskstats-count-only-this-sandbox", func() error {
-			_, written, err := diskSectors()
-			fmt.Printf("SECTORS %d\n", written)
-			return err
+			d, err := diskOf(dir)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("SECTORS %d\n", d.fields[fieldSectorsWritten])
+			return nil
 		}},
 	}
 }
