@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.9.10012026110200] - 2026-11-07
+
+This release fixes the memory limit of a sandbox in a process with several sandboxes and a race of the Windows `systrap` engine. CI now runs the same tests on `windows/arm64` as on `windows/amd64`, with the race detector on `windows/amd64`.
 
 ### Bug Fixes
 
