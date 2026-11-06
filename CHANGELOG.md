@@ -4,12 +4,15 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-### Added (Calico gaps, in progress)
+### Added (Calico on k3s)
 
-- Policy routing: `ip rule` (RTM_NEWRULE, RTM_DELRULE, RTM_GETRULE), several routing tables, route metrics, protocols, scopes, and the route types blackhole, unreachable, prohibit, and throw. The guest follows the lookup order of Linux, including `fwmark`, `suppress_prefixlength`, and `goto`.
+- Calico 3.28 in the VXLAN mode with the legacy iptables back end runs on a k3s node (`TestE2EK3sCalico`). `docs/kubernetes.md` has the procedure and the limits.
+- Policy routing: `ip rule` (RTM_NEWRULE, RTM_DELRULE, RTM_GETRULE), several routing tables, route metrics, protocols, scopes, and the route types blackhole, unreachable, prohibit, and throw. The guest follows the lookup order of Linux, including `fwmark`, `suppress_prefixlength`, and `goto`. `wg-quick` with AllowedIPs 0.0.0.0/0 works.
 - SO_MARK of TCP, UDP, raw, and ICMP sockets and of the WireGuard link (`fwmark`) selects the route.
-- iptables: the match `rpfilter` and the goto flag of a rule (`-g chain`).
+- iptables: the match `rpfilter`, the goto flag of a rule (`-g chain`), a rule without a target, the target `CONNMARK` (revisions 1 and 2), and the match `connmark`. A tracked connection has a mark that `conntrack -L` and ctnetlink show.
+- `net.ipv4.conf.*.rp_filter` takes effect on IPv4 input (strict and loose), with `src_valid_mark`.
 - Proxy ARP, and the sysctl files `conf/*/proxy_arp`, `src_valid_mark`, `conf/<link>/forwarding`, and `neigh/*/proxy_delay`.
+- A new link accepts `IFLA_NUM_TX_QUEUES` and `IFLA_NUM_RX_QUEUES`.
 
 ### Features
 
