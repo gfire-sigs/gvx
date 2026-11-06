@@ -26,3 +26,13 @@ import "runtime"
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	return memCgIDs == nil || runtime.GOOS == "linux"
 }
+
+// KnownCommittedBytes returns the bytes of f that the last usage scan found
+// committed. Unlike usage.MemoryAccounting, which sums every memory file of
+// the process, it counts only f, so each sandbox of one process can compare
+// its own use with its limit.
+func (f *MemoryFile) KnownCommittedBytes() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.knownCommittedBytes
+}

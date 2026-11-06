@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
+- **Memory limit of a sandbox**: `Resources.MemoryBytes` now counts only the memory of its own sandbox. The limit counted the memory of every sandbox in the process, so an SDK user that ran several sandboxes in one process saw `ErrMemoryLimit` in a sandbox that stayed far below its limit.
 - **Registry tests on a host without a hypervisor**: `TestE2EGateM2BusyboxIsStatic`, `TestE2EGateM2BusyboxAshInteractive`, `TestE2EGateM3ArchitectureSelection`, `TestE2EGateM4TortureUnderDefaultLockdown`, and `TestE2ERealLinuxBusyboxPythonNodeAcrossBackends` named the `whpx` backend and failed on the `windows-11-arm` runner, which has no hypervisor. They now skip there when `GVX_ALLOW_NO_HYPERVISOR=1`.
 - **Windows `systrap`**: a guest no longer stops with "the stub trapped from unknown slot" when one thread makes a system call while another thread changes the memory of the same code page. The Sentry kept no record of a freed trampoline slot, so it could not decode a trap that a thread published just before the free. A freed slot now keeps its record until a new slot reuses its bytes.
 

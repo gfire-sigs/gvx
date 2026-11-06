@@ -128,6 +128,25 @@ func capacityChecks(mem uint64, cpus int) []check {
 	}
 }
 
+// holdChecks commits mib MiB of anonymous memory and keeps it until the input
+// ends. A test uses it to load one sandbox while another sandbox of the same
+// process runs with a memory limit.
+func holdChecks(mib int) []check {
+	return []check{{"hold-memory-until-input-ends", func() error {
+		mem, err := unix.Mmap(-1, 0, mib<<20, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+		if err != nil {
+			return err
+		}
+		defer unix.Munmap(mem)
+		for i := 0; i < len(mem); i += os.Getpagesize() {
+			mem[i] = 1
+		}
+		fmt.Println("HOLDING")
+		_, err = io.Copy(io.Discard, os.Stdin)
+		return err
+	}}}
+}
+
 // memTotalChecks writes writeMiB MiB to a file on the volume at dir, prints
 // MemTotal, waits for the end of the standard input, and checks that the value
 // stays. Then it prints the sectors that /proc/diskstats shows as written for
