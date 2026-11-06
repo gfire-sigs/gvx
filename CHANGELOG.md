@@ -4,18 +4,15 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-### Added (Calico on k3s)
-
-- Calico 3.28 in the VXLAN mode with the legacy iptables back end runs on a k3s node (`TestE2EK3sCalico`). `docs/kubernetes.md` has the procedure and the limits.
-- Policy routing: `ip rule` (RTM_NEWRULE, RTM_DELRULE, RTM_GETRULE), several routing tables, route metrics, protocols, scopes, and the route types blackhole, unreachable, prohibit, and throw. The guest follows the lookup order of Linux, including `fwmark`, `suppress_prefixlength`, and `goto`. `wg-quick` with AllowedIPs 0.0.0.0/0 works.
-- SO_MARK of TCP, UDP, raw, and ICMP sockets and of the WireGuard link (`fwmark`) selects the route.
-- iptables: the match `rpfilter`, the goto flag of a rule (`-g chain`), a rule without a target, the target `CONNMARK` (revisions 1 and 2), and the match `connmark`. A tracked connection has a mark that `conntrack -L` and ctnetlink show.
-- `net.ipv4.conf.*.rp_filter` takes effect on IPv4 input (strict and loose), with `src_valid_mark`.
-- Proxy ARP, and the sysctl files `conf/*/proxy_arp`, `src_valid_mark`, `conf/<link>/forwarding`, and `neigh/*/proxy_delay`.
-- A new link accepts `IFLA_NUM_TX_QUEUES` and `IFLA_NUM_RX_QUEUES`.
-
 ### Features
 
+- **Calico on k3s**: Calico 3.28 in the VXLAN mode with the legacy iptables back end runs on a k3s node (`TestE2EK3sCalico`). `docs/kubernetes.md` has the procedure and the limits.
+- **Policy routing**: `ip rule` (RTM_NEWRULE, RTM_DELRULE, RTM_GETRULE), several routing tables, route metrics, protocols, scopes, and the route types blackhole, unreachable, prohibit, and throw. The guest follows the lookup order of Linux, including `fwmark`, `suppress_prefixlength`, and `goto`. `wg-quick` with AllowedIPs 0.0.0.0/0 works.
+- **`SO_MARK` in the route lookup**: The mark of TCP, UDP, raw, and ICMP sockets and of the WireGuard link (`fwmark`) selects the route.
+- **iptables for Calico and `wg-quick`**: The match `rpfilter`, the goto flag of a rule (`-g chain`), a rule without a target, the target `CONNMARK` (revisions 1 and 2), and the match `connmark`. A tracked connection has a mark that `conntrack -L` and ctnetlink show.
+- **`rp_filter` on IPv4 input**: The sysctl `net.ipv4.conf.*.rp_filter` takes effect on IPv4 input (strict and loose), with `src_valid_mark`.
+- **Proxy ARP and conf sysctls**: A link answers proxy ARP requests. New sysctl files are `conf/*/proxy_arp`, `src_valid_mark`, `conf/<link>/forwarding`, and `neigh/*/proxy_delay`.
+- **Queue counts of a new link**: `RTM_NEWLINK` accepts `IFLA_NUM_TX_QUEUES` and `IFLA_NUM_RX_QUEUES`.
 - **`net/ipv4/conf/{all,default,<link>}/rp_filter`**: Calico reads `conf/default/rp_filter` at start. Before this release the file did not exist, and Calico failed with `could not determine default rp_filter setting`. The files store any integer and start at 0. A link follows `conf/default` until a write to its file, and a write to `conf/all` reaches no link, as in Linux. A new network namespace copies `all` and `default` from the root namespace, and later writes stay in each namespace. `netstack.Stack.EffectiveRPFilter` returns the larger of `all` and the link value. The guest does not check reverse paths yet.
 - **`ioctl(SIOCETHTOOL)` for offload features**: Calico Felix, the `ethtool` tool, `github.com/safchain/ethtool`, and `vishvananda/ethtool` read and change the offload features of a link. Before this release the ioctl returned `EOPNOTSUPP`, and Felix logged `failed to disable checksum offload: operation not supported` for `vxlan.calico`.
   - The commands are `ETHTOOL_GFEATURES`, `ETHTOOL_SFEATURES`, `ETHTOOL_GSSET_INFO` and `ETHTOOL_GSTRINGS` for `ETH_SS_FEATURES`, the get and set commands for checksum, scatter-gather, TSO, GSO, and GRO, `ETHTOOL_GFLAGS`, `ETHTOOL_SFLAGS`, `ETHTOOL_GDRVINFO`, `ETHTOOL_GLINK`, `ETHTOOL_GSET`, `ETHTOOL_GLINKSETTINGS`, `ETHTOOL_GPERMADDR`, and `ETHTOOL_GET_TS_INFO`. Other commands return `EOPNOTSUPP`, and a set command without `CAP_NET_ADMIN` returns `EPERM`.
