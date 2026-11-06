@@ -286,11 +286,23 @@ func TestAddRuleOrdersRulesAndRejectsDuplicates(t *testing.T) {
 	if got := s.DefaultRulePriority(ipv4.ProtocolNumber); got != 32764 {
 		t.Errorf("DefaultRulePriority after the first rule = %d, want 32764", got)
 	}
-	// A request without a priority matches the rule at any priority, as
-	// rule_find() of Linux does.
-	exists := &stack.RuleMatch{Action: stack.RuleActionToTable, Table: 100, HasTable: true}
-	if err := s.AddRule(ipv4.ProtocolNumber, rule, stack.RuleInsert{Excl: true, Exists: exists}); !errors.Is(err, stack.ErrRuleExists) {
+	if err := s.AddRule(ipv4.ProtocolNumber, rule, stack.RuleInsert{Excl: true}); !errors.Is(err, stack.ErrRuleExists) {
 		t.Errorf("duplicate rule with Excl = %v, want ErrRuleExists", err)
+	}
+	// rule_exists() compares the whole rule. A rule with another priority, mark,
+	// or interface is a new rule, although it names the same table.
+	for name, other := range map[string]stack.PolicyRule{
+		"another priority": {Priority: 32764, Action: stack.RuleActionToTable, Table: 100, SuppressPrefixLen: -1},
+		"a mark":           {Priority: 32765, Action: stack.RuleActionToTable, Table: 100, Mark: 7, MarkMask: 0xffffffff, SuppressPrefixLen: -1},
+		"an interface":     {Priority: 32765, Action: stack.RuleActionToTable, Table: 100, InputName: "eth0", SuppressPrefixLen: -1},
+		"a suppress":       {Priority: 32765, Action: stack.RuleActionToTable, Table: 100, SuppressPrefixLen: 0},
+	} {
+		if err := s.AddRule(ipv4.ProtocolNumber, other, stack.RuleInsert{Excl: true}); err != nil {
+			t.Errorf("rule with %s and Excl = %v, want success", name, err)
+		}
+		if _, err := s.DeleteRule(ipv4.ProtocolNumber, stack.RuleMatch{HasPrio: true, Priority: other.Priority, Action: other.Action, Mark: &other.Mark, InputName: &other.InputName, Suppress: &other.SuppressPrefixLen}); err != nil {
+			t.Fatalf("DeleteRule: %v", err)
+		}
 	}
 	if err := s.AddRule(ipv4.ProtocolNumber, rule, stack.RuleInsert{}); err != nil {
 		t.Errorf("duplicate rule without Excl = %v, want success", err)

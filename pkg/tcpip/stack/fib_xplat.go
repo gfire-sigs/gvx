@@ -163,12 +163,13 @@ func (s *Stack) Rules(proto tcpip.NetworkProtocolNumber) []PolicyRule {
 
 // RuleInsert tells AddRule how to treat an equal rule.
 type RuleInsert struct {
-	// Excl fails with ErrRuleExists when a rule matches Exists.
+	// Excl fails with ErrRuleExists when the table holds a rule that
+	// rule_exists() of Linux calls the same: the action, the table, the
+	// priority, the device names, the mark and its mask, the suppress length,
+	// the protocol, the inversion, and the goto target must be equal. The
+	// source, the destination, and the type of service count only when the new
+	// rule sets them.
 	Excl bool
-	// Exists selects the rules that Excl rejects. A field that the client left
-	// out matches every rule, as in rule_find() of Linux. A nil value matches
-	// no rule.
-	Exists *RuleMatch
 }
 
 // DefaultRulePriority returns the priority that a rule without a priority
@@ -192,7 +193,7 @@ func (s *Stack) AddRule(proto tcpip.NetworkProtocolNumber, r PolicyRule, mode Ru
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
 	rules := s.fib.rulesOf(v6)
-	if mode.Excl && mode.Exists != nil && slices.ContainsFunc(rules, func(have PolicyRule) bool { return mode.Exists.matches(&have) }) {
+	if mode.Excl && slices.ContainsFunc(rules, func(have PolicyRule) bool { return have.sameAs(&r) }) {
 		return ErrRuleExists
 	}
 	at := len(rules)
@@ -204,6 +205,29 @@ func (s *Stack) AddRule(proto tcpip.NetworkProtocolNumber, r PolicyRule, mode Ru
 	}
 	s.fib.setRules(v6, slices.Insert(slices.Clone(rules), at, r))
 	return nil
+}
+
+// sameAs reports whether the rule is the same as n in the sense of
+// rule_exists() and fib4_rule_compare() of Linux.
+func (r *PolicyRule) sameAs(n *PolicyRule) bool {
+	switch {
+	case r.Action != n.Action,
+		r.Table != n.Table,
+		r.Priority != n.Priority,
+		r.InputName != n.InputName,
+		r.OutputName != n.OutputName,
+		r.Mark != n.Mark,
+		r.MarkMask != n.MarkMask,
+		r.SuppressPrefixLen != n.SuppressPrefixLen,
+		r.Protocol != n.Protocol,
+		r.Invert != n.Invert,
+		n.Action == RuleActionGoto && r.Goto != n.Goto,
+		n.SrcLen != 0 && (r.SrcLen != n.SrcLen || !r.Src.Equal(n.Src)),
+		n.DstLen != 0 && (r.DstLen != n.DstLen || !r.Dst.Equal(n.Dst)),
+		n.TOS != 0 && r.TOS != n.TOS:
+		return false
+	}
+	return true
 }
 
 // RuleMatch selects the rule that DeleteRule removes. A field that the client

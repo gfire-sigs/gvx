@@ -105,7 +105,8 @@ echo GET-MARK6 $(ip route get 10.3.3.3 mark 6 | head -1)
 echo DIAL-PLAIN $(python3 /tmp/dial.py 10.3.3.3 0)
 echo DIAL-MARK7 $(python3 /tmp/dial.py 10.3.3.3 7)
 echo DIAL-MARK6 $(python3 /tmp/dial.py 10.3.3.3 6)
-if ip rule add fwmark 7 lookup 200 2>/tmp/dup-err; then bad "duplicate rule accepted"; else echo RULE-DUP $(cat /tmp/dup-err); fi
+# A rule without a priority gets a new one, so only the same priority is a duplicate.
+if ip rule add priority 32765 fwmark 7 lookup 200 2>/tmp/dup-err; then bad "duplicate rule accepted"; else echo RULE-DUP $(cat /tmp/dup-err); fi
 ip rule del fwmark 7 lookup 200
 echo RULE-DELETED $(ip rule show | grep -c fwmark || true)
 echo DIAL-AFTER-DEL $(python3 /tmp/dial.py 10.3.3.3 7)
@@ -115,6 +116,11 @@ if ip rule del fwmark 7 lookup 200 2>/tmp/del-err; then bad "missing rule delete
 ip rule add from 10.1.0.0/24 to 10.3.3.0/24 iif a0 lookup 200 priority 100
 echo RULE-SRC $(ip rule show | grep 'iif a0' | tr '\t' ' ')
 ip rule del priority 100
+# rule_exists() compares the mark, so a rule without the mark is a new rule.
+ip rule add priority 90 fwmark 5 iif a0 lookup 200
+if ip rule add priority 90 iif a0 lookup 200 2>/tmp/excl-err; then ok RULE-EXCL-MARK-DIFFERS; else echo FAIL "rule without the mark of an existing rule: $(cat /tmp/excl-err)"; fi
+ip rule del priority 90
+ip rule del priority 90
 ip rule add priority 50 goto 70
 ip rule add priority 60 blackhole
 ip rule add priority 70 fwmark 9 unreachable
@@ -226,6 +232,7 @@ func TestE2EPolicyRouting(t *testing.T) {
 			requireContains(t, "deleted rule", out, "RULE-DELETED 0\n")
 			requireContains(t, "missing rule", field("RULE-DEL-MISSING"), "No such file or directory")
 			requireContains(t, "source rule", field("RULE-SRC"), "100: from 10.1.0.0/24 to 10.3.3.0/24 iif a0 lookup 200")
+			requireContains(t, "rule that differs in the mark", out, "RULE-EXCL-MARK-DIFFERS\n")
 			requireContains(t, "goto rule", field("RULE-GOTO"), "50: from all goto 70")
 			requireContains(t, "route get through goto", field("GET-GOTO"), "Network unreachable")
 			requireContains(t, "wg-quick rules", field("WG-RULES"), "32765: not from all fwmark 0xca6c lookup 51820", "32764: from all lookup main suppress_prefixlength 0")

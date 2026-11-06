@@ -338,8 +338,7 @@ func newRule(ns *netstack.Stack, flags uint16, h fibRuleHdr, attrs map[uint16]nl
 	if ra.dst != nil {
 		r.Dst = *ra.dst
 	}
-	exists := ruleMatchOf(h, ra)
-	return translateRuleError(ns.Stack.AddRule(ra.proto, r, stack.RuleInsert{Excl: flags&linux.NLM_F_EXCL != 0, Exists: &exists}))
+	return translateRuleError(ns.Stack.AddRule(ra.proto, r, stack.RuleInsert{Excl: flags&linux.NLM_F_EXCL != 0}))
 }
 
 // deleteRule handles RTM_DELRULE like fib_nl_delrule(). A request that leaves a
@@ -354,8 +353,7 @@ func deleteRule(ns *netstack.Stack, h fibRuleHdr, attrs map[uint16]nlmsg.BytesVi
 	return translateRuleError(delErr)
 }
 
-// ruleMatchOf returns the selector of the rules that a request names. It
-// serves the delete request and the check for a rule that exists.
+// ruleMatchOf returns the selector of the rules that a delete request names.
 func ruleMatchOf(h fibRuleHdr, ra ruleAttrs) stack.RuleMatch {
 	m := stack.RuleMatch{
 		Action:    stack.RuleAction(h.action),
