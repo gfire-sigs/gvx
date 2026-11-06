@@ -10,7 +10,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Tests
 
-- **Weekly Windows scope**: the Windows jobs of `e2e-images.yml` run every registry gate, as the Linux jobs do: one step for `go test ./e2e` without `TestE2EK3s*`, and one step for the k3s tests. `windows-latest` runs each gate on `systrap` and `whpx`. `TestE2EK3sMultiNodeMixedKernels` and `TestE2EK3sConformance*` stay Linux-only: the first needs a native k3s server, and the second runs on `linux/amd64` only because of its cost.
+- **Weekly Windows scope**: the Windows jobs of `e2e-images.yml` run every registry gate, as the Linux jobs do: one step for `go test ./e2e` without `TestE2EK3s*`, and one step for the k3s tests. `windows-latest` runs each gate on `systrap` and `whpx`. `TestE2EK3sMultiNodeMixedKernels` and `TestE2EK3sConformance*` stay Linux-only: the first needs a native k3s server, and the second runs on `linux/amd64` only because of its cost. `TestE2EK3sMultiNodeControlPlaneFailover` does not run on `windows-11-arm`: it failed in every run there, because three k3s servers saturate the four cores and the first server loses its leader election when the second joins. It passes on `windows-latest`.
 
 ## [v0.9.10002026110200] - 2026-11-06
 
