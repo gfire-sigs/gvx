@@ -140,7 +140,12 @@ spec:
   podSelector: {matchLabels: {app: srv}}
   policyTypes: [Ingress]
 EOF2
-if until_reach cli "$POD" blocked && until_reach other "$POD" blocked && until_reach cli "http://$svcip/hostname" blocked; then log "DENY-OK"; else fail "deny-all did not block the clients"; fi
+if until_reach cli "$POD" blocked && until_reach other "$POD" blocked && until_reach cli "http://$svcip/hostname" blocked; then
+  log "DENY-OK"
+else
+  fail "deny-all did not block the clients: cli $(reach cli "$POD") other $(reach other "$POD") cli-service $(reach cli "http://$svcip/hostname")"
+  k -n kube-system exec ds/calico-node -c calico-node -- iptables-legacy -S 2>&1 | grep -E 'cali-(pi|po|tw|fw)-' | head -30
+fi
 
 cat <<'EOF2' | k apply -f - >/dev/null
 apiVersion: networking.k8s.io/v1
