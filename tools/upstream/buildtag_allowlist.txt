@@ -335,3 +335,6 @@ seam pkg/sentry/arch/arch_aarch64.go
 seam pkg/sentry/arch/arch_arm64.go
 seam pkg/sentry/arch/signal_arm64.go
 seam pkg/sentry/platform/systrap/stubfilter/stubfilter.go
+# A host kernel can seal a mapping that its Sentry owns. The stub of a nested Sentry then unmaps its
+# address space mapping by mapping (pkg/sentry/platform/systrap/unmap_regions_xplat.go).
+seam pkg/sentry/platform/systrap/subprocess.go

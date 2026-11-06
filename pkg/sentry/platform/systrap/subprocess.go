@@ -512,9 +512,9 @@ func (s *subprocess) mapPrivateRegions() {
 //
 // This will panic on failure (which should never happen).
 func (s *subprocess) unmap() {
-	s.Unmap(0, uint64(stubStart))
+	s.unmapRange(0, stubStart)
 	if maximumUserAddress != stubEnd {
-		s.Unmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
+		s.unmapRange(stubEnd, maximumUserAddress-stubEnd)
 	}
 }
 
