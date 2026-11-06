@@ -61,6 +61,9 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 
 // ReadlinkAt implements vfs.FilesystemImpl.ReadlinkAt.
 func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (string, error) {
+	// The mount options need the mount lock of the VFS. A mount operation holds
+	// that lock and waits for fs.mu, so read the options before fs.mu.
+	atimeOff := fs.atimeOff(rp.Mount())
 	fs.lock(ctx)
 	defer fs.unlock(ctx)
 	d, err := fs.resolveLocked(ctx, rp)
@@ -70,6 +73,8 @@ func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 	if !d.inode.isSymlink() {
 		return "", linuxerr.EINVAL
 	}
-	d.inode.touchAtime(rp.Mount())
+	if !atimeOff {
+		d.inode.setAtime(rp.Mount())
+	}
 	return d.inode.symlinkTarget()
 }

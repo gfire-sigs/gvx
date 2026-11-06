@@ -68,12 +68,27 @@ func (i *inode) statx() linux.Statx {
 	return st
 }
 
-// touchAtime sets the access time to now. A mount with noatime and a read-only
-// volume keep the old time.
+// atimeOff reports that the mount keeps the old access time: the volume is
+// read-only, or the mount has noatime. The call takes the mount lock of the
+// VFS, so the caller MUST NOT hold fs.mu. A mount operation holds the mount lock
+// while it asks the filesystem for fs.mu (IsDescendant). A caller that holds
+// fs.mu here would deadlock with that operation.
+func (fs *filesystem) atimeOff(mnt *vfs.Mount) bool {
+	return fs.readOnly || mnt.Options().Flags.NoATime
+}
+
+// touchAtime sets the access time to now, unless atimeOff reports true. The
+// caller MUST NOT hold fs.mu.
 func (i *inode) touchAtime(mnt *vfs.Mount) {
-	if i.fs.readOnly || mnt.Options().Flags.NoATime {
+	if i.fs.atimeOff(mnt) {
 		return
 	}
+	i.setAtime(mnt)
+}
+
+// setAtime sets the access time to now. It does not take the mount lock of the
+// VFS, so the caller can hold fs.mu.
+func (i *inode) setAtime(mnt *vfs.Mount) {
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return
 	}
