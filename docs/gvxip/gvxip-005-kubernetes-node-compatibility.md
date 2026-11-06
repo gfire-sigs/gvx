@@ -213,6 +213,7 @@ These tests check one kernel behavior each. A Go program without an image runs t
 | A26 | `rpfilter`, goto, and a rule without a target | The match `rpfilter` drops a spoofed source in the strict mode, passes a route through another link in the loose mode, and `iptables-save` shows the rules. A goto skips the rest of the calling chain. |
 | A27 | `rp_filter` on input | The values 0, 1, and 2 of `all` and of a link give the Linux results for spoofed sources, and `src_valid_mark` lets the mark take part. |
 | A28 | `CONNMARK` | A connection mark set, saved, and restored with masks reaches later packets of the flow. `conntrack -L` shows it. `wg-quick up` with AllowedIPs 0.0.0.0/0 works. |
+| A29 | Routes of Felix | `github.com/vishvananda/netlink` adds a blackhole, unreachable, prohibit, or throw route without a device, with the protocol 80, the table 254, and `RTA_OIF` 0, as Calico Felix does. The route lists with the type and with no device. An IPv6 route of such a type lists on `lo`. A second add fails with `EEXIST`, and a replace works. A unicast route without a device fails with `ENODEV`. |
 
 ### 4.2 Single-Node `k3s` (B)
 
