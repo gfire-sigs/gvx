@@ -163,8 +163,15 @@ func (as *addressSpace) releaseIslandsLocked() {
 }
 
 // slotStart returns the slot that starts at pc, if pc is the first address of
-// a slot.
+// a slot. A freed slot counts until a new slot reuses its bytes, because a
+// thread can have entered it before the free.
 func (as *addressSpace) slotStart(pc uint64) (islandSlot, bool) {
+	return as.slotAt(pc, true)
+}
+
+// slotAt returns the slot that starts at pc. It returns a freed slot only if
+// retired is true.
+func (as *addressSpace) slotAt(pc uint64, retired bool) (islandSlot, bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	isl := as.islands[blockRound(pc)]
@@ -172,7 +179,7 @@ func (as *addressSpace) slotStart(pc uint64) (islandSlot, bool) {
 		return islandSlot{}, false
 	}
 	s, ok := isl.slots[uint32(pc-isl.base)]
-	if !ok {
+	if !ok && retired {
 		s, ok = isl.retired[uint32(pc-isl.base)]
 	}
 	return s, ok
@@ -196,9 +203,18 @@ func (as *addressSpace) slotContaining(pc uint64) (s islandSlot, slotVA uint64, 
 	return islandSlot{}, 0, false
 }
 
-// slotAtTail returns the site of the slot whose tail is at tail.
+// slotAtTail returns the site of the slot whose tail is at tail. It decodes a
+// trap, so it also finds a freed slot.
 func (as *addressSpace) slotAtTail(tail uint64) (uint64, bool) {
 	s, ok := as.slotStart(tail - winSlotTailOffset)
+	return s.site, ok
+}
+
+// liveSlotAtTail returns the site of the slot whose tail is at tail, if the
+// slot is not freed. A hot resume runs the tail of the slot again, and a new
+// slot can overwrite the bytes of a freed slot at any time.
+func (as *addressSpace) liveSlotAtTail(tail uint64) (uint64, bool) {
+	s, ok := as.slotAt(tail-winSlotTailOffset, false)
 	return s.site, ok
 }
 

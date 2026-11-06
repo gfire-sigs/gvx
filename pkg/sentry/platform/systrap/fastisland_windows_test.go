@@ -33,9 +33,18 @@ func TestSlotAtTailDecodesAFreedSlotUntilReuse(t *testing.T) {
 	isl.slots[off] = islandSlot{site: site, size: winSlotSize, jmpVA: site}
 	tail := base + uint64(off) + winSlotTailOffset
 
+	if got, ok := as.liveSlotAtTail(tail); !ok || got != site {
+		t.Fatalf("liveSlotAtTail before free = (%#x, %v), want (%#x, true)", got, ok, uint64(site))
+	}
+
 	isl.free(off, winSlotSize)
 	if got, ok := as.slotAtTail(tail); !ok || got != site {
 		t.Fatalf("slotAtTail after free = (%#x, %v), want (%#x, true)", got, ok, uint64(site))
+	}
+	// A hot resume runs the tail again, and a new slot can overwrite the bytes
+	// of the freed slot at any time, so the resume must go cold.
+	if got, ok := as.liveSlotAtTail(tail); ok {
+		t.Fatalf("liveSlotAtTail after free = (%#x, true), want no live slot", got)
 	}
 
 	reuse, ok := isl.alloc(winSlotSize)
