@@ -307,6 +307,12 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 			nflog("failed to find a rule to jump to")
 			return syserr.ErrInvalidArgument
 		}
+		// A jump to the next rule is a rule without a target, such as a rule
+		// that only has a comment. The rule falls through.
+		if jumpTo == ruleIdx+1 {
+			jump.RuleNum = jumpTo
+			continue
+		}
 		// jumpTo points to the first rule inside the chain, so to find
 		// out whether target is a UserChain we need to look at the
 		// preceding header.
@@ -520,12 +526,15 @@ func checkChainDFS(table stack.Table, ruleIdx int, state []visitState, ipv6 bool
 			nflog("jump to out-of-bounds rule %d", jumpTo)
 			return syserr.ErrInvalidArgument
 		}
-		if !isUserChainTarget(table.Rules[jumpTo-1].Target) {
-			nflog("jump target %d is not a user chain (rule %d-1 target is %T)", jumpTo, jumpTo, table.Rules[jumpTo-1].Target)
-			return syserr.ErrInvalidArgument
-		}
-		if err := checkChainDFS(table, jumpTo, state, ipv6); err != nil {
-			return err
+		// A jump to the next rule falls through, so it enters no chain.
+		if jumpTo != ruleIdx+1 {
+			if !isUserChainTarget(table.Rules[jumpTo-1].Target) {
+				nflog("jump target %d is not a user chain (rule %d-1 target is %T)", jumpTo, jumpTo, table.Rules[jumpTo-1].Target)
+				return syserr.ErrInvalidArgument
+			}
+			if err := checkChainDFS(table, jumpTo, state, ipv6); err != nil {
+				return err
+			}
 		}
 	}
 

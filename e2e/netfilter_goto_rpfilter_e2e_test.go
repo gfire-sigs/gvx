@@ -71,6 +71,15 @@ $IPT -F INPUT
 $IPT -F A
 $IPT -X A
 
+# A rule without a target falls through, as Felix writes for a rule that only has
+# a comment. iptables-restore sends it as a jump to the next rule.
+printf '*filter\n:T - -\n-A T -m comment --comment "no target"\n-A T -j RETURN\n-A INPUT -j T\nCOMMIT\n' | iptables-legacy-restore -n
+echo NO-TARGET-SAVE $($IPT -S T | grep -c -- '-A T -m comment --comment "no target"$' || true)
+echo NO-TARGET-UDP $(try_udp)
+$IPT -F INPUT
+$IPT -F T
+$IPT -X T
+
 # rpfilter on the table raw: strict, loose, and inverted.
 ip netns add peer
 ip link add v0 type veth peer name v1
@@ -145,6 +154,7 @@ func TestE2ENetfilterGotoAndRPFilter(t *testing.T) {
 			})
 			t.Log(out)
 			requireContains(t, "jump and goto", out, "JUMP nothing\n", "GOTO received ping\n", "SAVE-GOTO 1\n")
+			requireContains(t, "rule without a target", out, "NO-TARGET-SAVE 1\n", "NO-TARGET-UDP received ping\n")
 			requireContains(t, "strict", out, "STRICT-REAL passed\n", "STRICT-SPOOF dropped\n", "SAVE-RPF 1\n", "STRICT-ROUTED passed\n", "STRICT-OTHER-LINK dropped\n")
 			requireContains(t, "loose", out, "LOOSE-OTHER-LINK passed\n", "SAVE-LOOSE 1\n", "LOOSE-NO-ROUTE dropped\n", "RPF-DONE\n")
 			if strings.Contains(out, "FAIL ") {
