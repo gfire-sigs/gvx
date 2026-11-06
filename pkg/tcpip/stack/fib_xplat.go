@@ -113,6 +113,9 @@ type fibState struct {
 
 	// proxyARP is the policy for proxy ARP. See proxyarp_xplat.go.
 	proxyARP atomic.Pointer[ProxyARPPolicy]
+	// rpFilter is the policy for the reverse path check of received IPv4
+	// packets. See rpfilter_xplat.go.
+	rpFilter atomic.Pointer[RPFilterPolicy]
 }
 
 var (

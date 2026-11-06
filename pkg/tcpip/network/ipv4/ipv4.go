@@ -1003,6 +1003,14 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 				return
 			}
 		}
+
+		// The reverse path check follows the prerouting hooks, as the
+		// routing decision does in Linux.
+		h = header.IPv4(pkt.NetworkHeader().Slice())
+		if !stk.SourceAddressValid(nicID, h.SourceAddress(), h.DestinationAddress(), pkt.Mark, h.TransportProtocol()) {
+			stats.InvalidSourceAddressesReceived.Increment()
+			return
+		}
 	}
 	// CheckPrerouting can modify the backing storage of the packet, so refresh
 	// the header.
