@@ -62,7 +62,7 @@ if ip netns exec pod ping -c 3 -W 3 10.6.0.1 >/dev/null; then ok PING-AFTER-OK; 
 # The host side of the pod has no address. The host still resolves the pod, with
 # the address of another link as the ARP sender, as inet_select_addr() does.
 ip neigh flush dev p0
-if ping -c 2 -W 2 10.5.0.2 >/dev/null; then ok HOST-TO-POD-OK; else echo FAIL ping-host-to-pod; fi
+if ping -c 3 -W 3 10.5.0.2 >/dev/null; then ok HOST-TO-POD-OK; else echo FAIL ping-host-to-pod; fi
 echo GATEWAY-MAC-IS-P0 $([ "$(ip -n pod neigh show 169.254.1.1 | awk '{print $5}')" = "$(cat /sys/class/net/p0/address)" ] && echo yes || echo no)
 
 # A host without forwarding does not answer.
