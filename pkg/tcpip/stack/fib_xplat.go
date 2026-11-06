@@ -18,6 +18,7 @@ import (
 	"errors"
 	"iter"
 	"slices"
+	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -109,6 +110,9 @@ var (
 // priority, and routeMu guards them.
 type fibState struct {
 	rules4, rules6 []PolicyRule
+
+	// proxyARP is the policy for proxy ARP. See proxyarp_xplat.go.
+	proxyARP atomic.Pointer[ProxyARPPolicy]
 }
 
 var (
@@ -632,4 +636,67 @@ func (s *Stack) LookupRoute(flow RouteFlow, outputNIC tcpip.NICID, src, dst tcpi
 		return tcpip.Route{}, l.err
 	}
 	return tcpip.Route{}, &tcpip.ErrNetworkUnreachable{}
+}
+
+// ReversePathMode selects how ReversePathValid compares the interface.
+type ReversePathMode int
+
+// Reverse path modes.
+const (
+	// ReversePathStrict needs the best route to the source address to leave
+	// through the interface that received the packet.
+	ReversePathStrict ReversePathMode = iota
+	// ReversePathLoose needs any route to the source address.
+	ReversePathLoose
+)
+
+// ReversePathValid reports whether a packet that arrived on inNIC with the
+// source address src and the destination address dst has a valid source, as
+// the xt_rpfilter match and fib_validate_source() of Linux decide it. It looks
+// up the route to src with the rules and the mark. It fails when no route
+// matches, when a reject route or rule matches, or, in the strict mode, when
+// the route leaves through another interface. A source address of the host is
+// valid only when acceptLocal is set. A link-local IPv6 source is valid only
+// for its own interface.
+func (s *Stack) ReversePathValid(inNIC tcpip.NICID, src, dst tcpip.Address, mark uint32, proto tcpip.NetworkProtocolNumber, mode ReversePathMode, acceptLocal bool) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.reversePathHostAddress(src, proto) {
+		return acceptLocal
+	}
+	s.routeMu.RLock()
+	defer s.routeMu.RUnlock()
+
+	// The flow is the reply: it goes to the source and leaves from the
+	// destination, as it enters through the loopback device.
+	var from tcpip.Address
+	if !header.IsV4MulticastAddress(dst) && !header.IsV6MulticastAddress(dst) && dst != header.IPv4Broadcast {
+		from = dst
+	}
+	l := newRouteLookup(RouteFlow{Mark: mark}, 0, from, src, proto)
+	linkLocal := header.IsV6LinkLocalUnicastAddress(src)
+	for route := range s.fibRoutes(&l) {
+		if _, ok := s.nics[route.NIC]; !ok {
+			continue
+		}
+		if linkLocal && route.NIC != inNIC {
+			continue
+		}
+		return mode == ReversePathLoose || route.NIC == inNIC
+	}
+	return false
+}
+
+// reversePathHostAddress reports whether addr belongs to a NIC. Linux gives the
+// address of the host the route type "local", which a reverse path check
+// rejects.
+//
+// +checklocksread:s.mu
+func (s *Stack) reversePathHostAddress(addr tcpip.Address, proto tcpip.NetworkProtocolNumber) bool {
+	for _, nic := range s.nics {
+		if nic.hasAddress(proto, addr) {
+			return true
+		}
+	}
+	return false
 }
