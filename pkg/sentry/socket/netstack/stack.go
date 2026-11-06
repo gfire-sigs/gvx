@@ -241,6 +241,9 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		case linux.IFLA_MTU:
 		case linux.IFLA_NET_NS_FD:
 		case linux.IFLA_TXQLEN:
+		case linux.IFLA_NUM_TX_QUEUES, linux.IFLA_NUM_RX_QUEUES, linux.IFLA_GSO_MAX_SEGS, linux.IFLA_GSO_MAX_SIZE, linux.IFLA_GROUP:
+			// A link has one queue here, and Linux accepts these values. The
+			// Calico CNI plugin sends the queue counts when it creates a veth.
 		default:
 			ctx.Warningf("unexpected attribute: %x", attr)
 			return syserr.ErrNotSupported
