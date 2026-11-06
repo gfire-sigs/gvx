@@ -148,3 +148,40 @@ func extractMember(archive, member, dst string) error {
 		return os.Rename(tmp.Name(), dst)
 	}
 }
+
+// calicoVXLANManifest is the manifest of Calico 3.28.2 for VXLAN without BIRD.
+// The digest is the SHA-256 of the file that the project publishes at the tag.
+var calicoVXLANManifest = struct{ url, sha256 string }{
+	"https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico-vxlan.yaml",
+	"41ccdbcbc13e5d79be2693df878faef1c11806bad04f779907ab71fcc474c83a",
+}
+
+// FetchCalicoVXLANManifest returns the path of the Calico 3.28.2 VXLAN
+// manifest. The host downloads the file, because the guest needs no TLS
+// client. It verifies the SHA-256 digest. The test skips when GVX_E2E_OFFLINE is
+// 1, or when the download fails and GVX_E2E_REQUIRE_NETWORK is empty.
+func FetchCalicoVXLANManifest(tb testing.TB) string {
+	tb.Helper()
+	dir := filepath.Join(os.TempDir(), "gvx-acceptprog-cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		tb.Fatalf("create the manifest cache directory: %v", err)
+	}
+	file := filepath.Join(dir, calicoVXLANManifest.sha256+"-calico-vxlan.yaml")
+	if fileDigest(file) == calicoVXLANManifest.sha256 {
+		return file
+	}
+	if os.Getenv("GVX_E2E_OFFLINE") == "1" {
+		tb.Skip("Calico manifest download is off (GVX_E2E_OFFLINE=1)")
+	}
+	if err := download(calicoVXLANManifest.url, file); err != nil {
+		if os.Getenv("GVX_E2E_REQUIRE_NETWORK") != "" {
+			tb.Fatalf("download the Calico manifest: %v", err)
+		}
+		tb.Skipf("download the Calico manifest: %v", err)
+	}
+	if got := fileDigest(file); got != calicoVXLANManifest.sha256 {
+		_ = os.Remove(file)
+		tb.Fatalf("Calico manifest digest = %s, want %s", got, calicoVXLANManifest.sha256)
+	}
+	return file
+}
