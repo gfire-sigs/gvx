@@ -1810,20 +1810,22 @@ func (s *Stack) FindRouteFlow(flow RouteFlow, id tcpip.NICID, localAddr, remoteA
 		}
 	}
 
-	// A reject route or rule decided the lookup, so no other NIC can carry it.
-	if lookup.err != nil {
-		return nil, lookup.err
-	}
-
 	// A reply to a packet for an address of another NIC pins the NIC where the
 	// packet arrived. Linux uses the weak host model for it with or without
-	// forwarding.
+	// forwarding. The weak host lookup runs before the check of a reject route,
+	// because a route with a longer prefix can come before the reject route, as
+	// a host route to a pod comes before the blackhole route of its block.
 	if id != 0 {
 		if aNIC, ok := s.nics[id]; ok {
 			if r := s.weakHostRouteRLocked(flow, aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
 				return r, nil
 			}
 		}
+	}
+
+	// A reject route or rule decided the lookup, so no other NIC can carry it.
+	if lookup.err != nil {
+		return nil, lookup.err
 	}
 
 	if needRoute {

@@ -415,3 +415,30 @@ func TestLookupRouteAnswersLikeRouteGet(t *testing.T) {
 		t.Errorf("unmarked LookupRoute = (%+v, %v), want NIC %d in the table main", rt, err, fibEth0)
 	}
 }
+
+// TestReplyToAPodUsesItsHostRouteBesideTheBlockBlackhole checks the lookup of a
+// reply from a node address to a pod. The link of the pod has no address, and
+// the reply pins that link. A host route to the pod comes before the blackhole
+// route of the pod block, so the reply goes out through the link of the pod, as
+// it does on Linux.
+func TestReplyToAPodUsesItsHostRouteBesideTheBlockBlackhole(t *testing.T) {
+	s := newFibStack(t)
+	const cali = tcpip.NICID(3)
+	if err := s.CreateNICWithOptions(cali, channel.New(8, 1500, ""), stack.NICOptions{Name: "cali0"}); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	s.AddRoute(tcpip.Route{Destination: fibSubnet(t, 10, 42, 0, 0, 26), RouteAttrs: tcpip.RouteAttrs{Type: tcpip.RouteTypeBlackhole}})
+	s.AddRoute(tcpip.Route{Destination: fibSubnet(t, 10, 42, 0, 7, 32), NIC: cali})
+
+	r, err := s.FindRoute(cali, fibAddr(10, 0, 0, 2), fibAddr(10, 42, 0, 7), ipv4.ProtocolNumber, false)
+	if err != nil {
+		t.Fatalf("FindRoute of the reply to the pod = %v, want a route through the link of the pod", err)
+	}
+	defer r.Release()
+	if r.NICID() != cali {
+		t.Errorf("the reply leaves through NIC %d, want %d", r.NICID(), cali)
+	}
+	if _, err := s.FindRoute(cali, fibAddr(10, 0, 0, 2), fibAddr(10, 42, 0, 8), ipv4.ProtocolNumber, false); err == nil {
+		t.Errorf("FindRoute of a reply to another address of the block succeeded, want the blackhole error")
+	}
+}
