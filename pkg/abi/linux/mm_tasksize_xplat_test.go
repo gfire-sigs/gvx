@@ -34,7 +34,7 @@ func TestSearchTaskSize(t *testing.T) {
 		{"arm64 with 39 bits", arm64, 1 << 39},
 		{"arm64 nested between 39 and 48 bits", arm64, 0xfe0000000000},
 		{"arm64 nested below 39 bits", arm64, 0x3f00000000},
-		{"smallest possible space", amd64, 2 * page},
+		{"smallest supported space", amd64, 1 << 32},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0

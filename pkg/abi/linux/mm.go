@@ -16,6 +16,7 @@ package linux
 
 import (
 	"fmt"
+	"runtime"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
@@ -165,6 +166,11 @@ var TaskSize = func() uintptr {
 // pageFits reports whether the host maps the page at addr. It removes the page
 // again.
 func pageFits(addr uintptr) bool {
+	if runtime.GOOS != "linux" {
+		// Only a Linux host has a size that a Sentry uses. The probe of the
+		// unaligned address is the whole answer elsewhere.
+		return true
+	}
 	r, _, errno := unix.RawSyscall6(
 		unix.SYS_MMAP,
 		addr,

@@ -31,8 +31,9 @@ func searchTaskSize(pageSize uintptr, sizes []uintptr, fits func(size uintptr) b
 		}
 		notFit = s
 	}
-	// The host has less space than the smallest listed size.
-	lo := 2 * pageSize
+	// The host has less space than the smallest listed size. A host kernel
+	// keeps the lowest pages for itself, so start above 4 GiB.
+	lo := uintptr(1) << 32
 	if !fits(lo) {
 		panic("None of the address space sizes could be successfully mmaped")
 	}
