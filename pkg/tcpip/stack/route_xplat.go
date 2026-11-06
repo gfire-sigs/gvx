@@ -36,7 +36,7 @@ import (
 // needs no route, such as a multicast address.
 //
 // +checklocksread:s.mu
-func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) *Route {
+func (s *Stack) weakHostRouteRLocked(flow RouteFlow, pinned *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) *Route {
 	if localAddr.BitLen() == 0 || remoteAddr.BitLen() == 0 {
 		return nil
 	}
@@ -47,11 +47,9 @@ func (s *Stack) weakHostRouteRLocked(pinned *nic, localAddr, remoteAddr tcpip.Ad
 	}
 
 	var chosen *tcpip.Route
+	lookup := newRouteLookup(flow, 0, localAddr, remoteAddr, netProto)
 	s.routeMu.RLock()
-	for route := s.routeTable.Front(); route != nil; route = route.Next() {
-		if !route.Destination.Contains(remoteAddr) {
-			continue
-		}
+	for route := range s.fibRoutes(&lookup) {
 		if nic, ok := s.nics[route.NIC]; !ok || !nic.Enabled() {
 			continue
 		}

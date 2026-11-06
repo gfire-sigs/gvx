@@ -92,6 +92,9 @@ type Stack struct {
 	// routeTable is a list of routes sorted by prefix length, longest (most specific) first.
 	// +checklocks:routeMu
 	routeTable tcpip.RouteList `state:"nosave"`
+	// fib holds the routing rules.
+	// +checklocks:routeMu
+	fib fibState `state:"nosave"`
 
 	mu stackRWMutex `state:"nosave"`
 	// +checklocks:mu
@@ -865,7 +868,7 @@ func (s *Stack) addRouteLocked(route *tcpip.Route) {
 	routePrefix := route.Destination.Prefix()
 	n := s.routeTable.Front()
 	for ; n != nil; n = n.Next() {
-		if n.Destination.Prefix() < routePrefix {
+		if n.Destination.Prefix() < routePrefix || (n.Destination.Prefix() == routePrefix && n.Metric > route.Metric) {
 			s.routeTable.InsertBefore(n, route)
 			return
 		}
@@ -1667,7 +1670,7 @@ func (s *Stack) findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoingNIC *nic, 
 // If no local address is provided, the stack will select a local address. If no
 // remote address is provided, the stack will use a remote address equal to the
 // local address.
-func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) (*Route, tcpip.Error) {
+func (s *Stack) FindRouteFlow(flow RouteFlow, id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) (*Route, tcpip.Error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1718,15 +1721,12 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 
 	// Find a route to the remote with the route table.
 	var chosenRoute tcpip.Route
+	lookup := newRouteLookup(flow, id, localAddr, remoteAddr, netProto)
 	if r := func() *Route {
 		s.routeMu.RLock()
 		defer s.routeMu.RUnlock()
 
-		for route := s.routeTable.Front(); route != nil; route = route.Next() {
-			if remoteAddr.BitLen() != 0 && !route.Destination.Contains(remoteAddr) {
-				continue
-			}
-
+		for route := range s.fibRoutes(&lookup) {
 			nic, ok := s.nics[route.NIC]
 			if !ok || !nic.Enabled() {
 				continue
@@ -1810,12 +1810,17 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 		}
 	}
 
+	// A reject route or rule decided the lookup, so no other NIC can carry it.
+	if lookup.err != nil {
+		return nil, lookup.err
+	}
+
 	// A reply to a packet for an address of another NIC pins the NIC where the
 	// packet arrived. Linux uses the weak host model for it with or without
 	// forwarding.
 	if id != 0 {
 		if aNIC, ok := s.nics[id]; ok {
-			if r := s.weakHostRouteRLocked(aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
+			if r := s.weakHostRouteRLocked(flow, aNIC, localAddr, remoteAddr, netProto, multicastLoop); r != nil {
 				return r, nil
 			}
 		}
