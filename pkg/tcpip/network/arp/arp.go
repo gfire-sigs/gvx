@@ -330,8 +330,12 @@ func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remot
 		}
 
 		if addr.Address.BitLen() == 0 {
-			stats.outgoingRequestInterfaceHasNoLocalAddressErrors.Increment()
-			return &tcpip.ErrNetworkUnreachable{}
+			from, ok := e.protocol.stack.FallbackARPSource(e.nic.ID())
+			if !ok {
+				stats.outgoingRequestInterfaceHasNoLocalAddressErrors.Increment()
+				return &tcpip.ErrNetworkUnreachable{}
+			}
+			addr.Address = from
 		}
 
 		localAddr = addr.Address

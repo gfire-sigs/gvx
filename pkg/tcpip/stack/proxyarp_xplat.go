@@ -15,6 +15,8 @@
 package stack
 
 import (
+	"slices"
+
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
@@ -51,4 +53,29 @@ func (s *Stack) ProxyARPReply(nicID tcpip.NICID, sender, target tcpip.Address) b
 	}
 	rt, err := s.LookupRoute(RouteFlow{InputNIC: nicID, Source: sender}, 0, tcpip.Address{}, target, header.IPv4ProtocolNumber)
 	return err == nil && rt.NIC != nicID && rt.RouteType() == tcpip.RouteTypeUnicast
+}
+
+// FallbackARPSource returns the primary IPv4 address of the first NIC, other
+// than exclude and the loopback NIC, that has one. An ARP request leaves a NIC
+// that has no IPv4 address with this address as its sender. Linux does the
+// same in inet_select_addr(): the host side of a Calico veth has no address, and
+// the host still resolves the address of the pod through it.
+func (s *Stack) FallbackARPSource(exclude tcpip.NICID) (tcpip.Address, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]tcpip.NICID, 0, len(s.nics))
+	for id := range s.nics {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		nic := s.nics[id]
+		if id == exclude || nic.IsLoopback() {
+			continue
+		}
+		if addr, err := nic.PrimaryAddress(header.IPv4ProtocolNumber); err == nil && addr.Address.BitLen() != 0 {
+			return addr.Address, true
+		}
+	}
+	return tcpip.Address{}, false
 }
