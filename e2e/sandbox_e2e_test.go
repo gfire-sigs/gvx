@@ -40,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/lockdownprobe"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
@@ -67,6 +68,16 @@ func autoPlatform() gvx.PlatformType {
 		return gvx.PlatformSystrap
 	}
 	return gvx.PlatformHVF
+}
+
+// resolvedAutoPlatform returns the backend that -platform=auto picks on this
+// host. Windows falls back to systrap when the Windows Hypervisor Platform is
+// absent, as on the windows-11-arm runner.
+func resolvedAutoPlatform() gvx.PlatformType {
+	if runtime.GOOS == "windows" && !hvtest.Available() {
+		return gvx.PlatformSystrap
+	}
+	return autoPlatform()
 }
 
 // foreignHypervisorPlatform returns the hardware backend of the other host OS.
@@ -243,16 +254,24 @@ func TestE2EStaticAndDynamicELF64AcrossBackends(t *testing.T) {
 		t.Fatalf("BuildDynamicGuestELF64 failed: %v", err)
 	}
 
-	// -platform=auto must resolve to the hardware backend of the host OS.
-	wantBackend := string(autoPlatform())
+	// -platform=auto must resolve to the hardware backend of the host OS, or
+	// to systrap on Windows without a hypervisor.
+	wantBackend := string(resolvedAutoPlatform())
 	for _, plat := range []gvx.PlatformType{gvx.PlatformAuto, autoPlatform()} {
+		requireExplicit := func(t *testing.T) {
+			if plat != gvx.PlatformAuto && plat != gvx.PlatformSystrap {
+				hvtest.Require(t)
+			}
+		}
 		t.Run(string(plat)+"_static", func(t *testing.T) {
+			requireExplicit(t)
 			code, stdout, backend := runELF(t, plat, staticELF)
 			if code != 0 || stdout != "e2e-static-ok\n" || backend != wantBackend {
 				t.Fatalf("static on %s = (code %d, stdout %q, backend %q), want (0, %q, %q)", plat, code, stdout, backend, "e2e-static-ok\n", wantBackend)
 			}
 		})
 		t.Run(string(plat)+"_dynamic", func(t *testing.T) {
+			requireExplicit(t)
 			code, stdout, backend := runELF(t, plat, dynamicELF)
 			if code != 7 || stdout != "e2e-dynamic-ok\n" || backend != wantBackend {
 				t.Fatalf("dynamic on %s = (code %d, stdout %q, backend %q), want (7, %q, %q)", plat, code, stdout, backend, "e2e-dynamic-ok\n", wantBackend)
@@ -319,7 +338,7 @@ func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("rungv run exit code = %d, want 0\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
-	if want := "rungv: platform=" + string(autoPlatform()); !strings.Contains(stderr, want) {
+	if want := "rungv: platform=" + string(resolvedAutoPlatform()); !strings.Contains(stderr, want) {
 		t.Fatalf("rungv run stderr = %q, want it to report %q", stderr, want)
 	}
 	if strings.Contains(stderr, "lockdown disabled") {
@@ -332,7 +351,7 @@ func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
 
 	// -lockdown=false is an explicit and loud opt-out.
 	_, stderr, code = runTool(t, rungv, "run",
-		"-lockdown=false", "-platform="+string(autoPlatform()), "-net=none",
+		"-lockdown=false", "-platform="+string(resolvedAutoPlatform()), "-net=none",
 		"-cache-dir="+t.TempDir(), "-workspace="+workspace,
 		elfPath)
 	if code != 0 {
