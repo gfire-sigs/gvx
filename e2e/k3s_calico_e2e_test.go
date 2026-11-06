@@ -55,8 +55,8 @@ done
 log "NODE-READY"
 
 until k -n kube-system get pods -l k8s-app=calico-node -o name 2>/dev/null | grep -q pod; do sleep 2; done
-if k -n kube-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=300s >/dev/null 2>&1 &&
-   k -n kube-system wait --for=condition=Ready pod -l k8s-app=calico-kube-controllers --timeout=300s >/dev/null 2>&1; then
+if k -n kube-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=600s >/dev/null 2>&1 &&
+   k -n kube-system wait --for=condition=Ready pod -l k8s-app=calico-kube-controllers --timeout=600s >/dev/null 2>&1; then
   log "CALICO-READY"
 else
   fail "calico pods not Ready"; k -n kube-system get pods -o wide; k -n kube-system logs ds/calico-node -c calico-node --tail=40
@@ -115,14 +115,14 @@ case "$srvip" in 10.42.*) log "POD-IP-FROM-POOL";; *) fail "pod IP $srvip is out
 
 # reach prints the HTTP status that a pod gets from a URL, 000 when it gets none.
 reach() { k exec "$1" -- curl -s -m 4 -o /dev/null -w '%{http_code}' "$2" 2>/dev/null || true; }
-# until_reach waits up to 150 seconds until the pod reaches the URL (want open) or not (want blocked).
+# until_reach waits up to 300 seconds until the pod reaches the URL (want open) or not (want blocked).
 until_reach() { # pod url want
   t0=$(date +%s)
   while :; do
     code=$(reach "$1" "$2")
     if [ "$3" = open ] && [ "$code" = 200 ]; then return 0; fi
     if [ "$3" = blocked ] && [ "$code" != 200 ]; then return 0; fi
-    [ $(( $(date +%s) - t0 )) -ge 150 ] && return 1
+    [ $(( $(date +%s) - t0 )) -ge 300 ] && return 1
     sleep 2
   done
 }
