@@ -104,7 +104,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 	}
 
 	if seccompNotify && seccompNotifyIsSupported {
-		if t.seccompNotify, err = t.installSeccompNotify(); err != nil {
+		if t.seccompNotify, err = t.installSeccompNotifyIfFree(); err != nil {
 			t.destroy()
 			return fmt.Errorf("failed to install seccomp notify rules: %w", err)
 		}
