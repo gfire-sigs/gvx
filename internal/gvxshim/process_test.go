@@ -509,13 +509,12 @@ func TestProcessLauncherDeathBeforeBootstrap(t *testing.T) {
 func testBlockedProcessBootstrap(t *testing.T, killLauncher bool) {
 	t.Helper()
 	f := newProcessFixture(t)
-	// The launcher-death case needs time to reach the kill on a loaded runner
-	// before the bootstrap deadline ends the launcher by itself. The child
-	// still exits long before the 15 second wait of awaitProcessExit.
-	f.timeout = 2 * time.Second
-	if killLauncher {
-		f.timeout = 6 * time.Second
-	}
+	// The child must publish a ready record before the lifecycle deadline
+	// rolls the start back, and the launcher-death case must also reach the
+	// kill before that deadline. A loaded windows/arm64 runner needed more
+	// than 2 seconds for the child. The child still exits long before the
+	// 15 second wait of awaitProcessExit.
+	f.timeout = 6 * time.Second
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	writer := fullProcessBootstrapPipe(t)

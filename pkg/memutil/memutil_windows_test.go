@@ -202,8 +202,10 @@ func TestCreateMemFDHandleSurvivesGC(t *testing.T) {
 	}
 }
 
+// TestMapSliceHonoursUnalignedFileOffset does not run in parallel: after
+// UnmapSlice it checks that the address is free, and a parallel test can map
+// a new view at the same address.
 func TestMapSliceHonoursUnalignedFileOffset(t *testing.T) {
-	t.Parallel()
 	fd, err := CreateMemFD("map", 0)
 	if err != nil {
 		t.Fatalf("CreateMemFD: %v", err)
