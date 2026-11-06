@@ -410,6 +410,50 @@ func TestE2ENodeKernelA6MemTotalIsPerSandbox(t *testing.T) {
 	})
 }
 
+// TestE2EMemoryLimitCountsOnlyItsSandbox runs a sandbox with a 256 MiB limit
+// while another sandbox of the same process holds 384 MiB. The limited
+// sandbox uses 16 MiB, so it must run to the end.
+func TestE2EMemoryLimitCountsOnlyItsSandbox(t *testing.T) {
+	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
+		if b.plat == gvx.PlatformWHPX {
+			t.Skip("the whpx backend cannot hold two running sandboxes in one process")
+		}
+		holdIn, holdEnd := io.Pipe()
+		holding := make(chan struct{})
+		var holdingOnce sync.Once
+		markHolding := func() { holdingOnce.Do(func() { close(holding) }) }
+		t.Run("pair", func(t *testing.T) {
+			t.Run("holder", func(t *testing.T) {
+				t.Parallel()
+				defer markHolding()
+				code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
+					cfg.Stdin = holdIn
+					cfg.Stdout = io.MultiWriter(cfg.Stdout, lineWatcher{marker: "HOLDING", found: markHolding})
+				}, "hold", "384")
+				requireNodeChecks(t, code, out, "hold-memory-until-input-ends")
+			})
+			t.Run("limited", func(t *testing.T) {
+				t.Parallel()
+				defer holdEnd.Close()
+				select {
+				case <-holding:
+				case <-time.After(2 * time.Minute):
+					t.Fatal("the holder sandbox did not commit its memory")
+				}
+				limitedIn, limitedEnd := io.Pipe()
+				// The guard reads the use every 5 ms, so 3 s cover many readings.
+				timer := time.AfterFunc(3*time.Second, func() { limitedEnd.Close() })
+				defer timer.Stop()
+				code, out := runNodeProbe(t, b, bin, func(cfg *gvx.Config) {
+					cfg.Resources = gvx.Resources{MemoryBytes: 256 << 20}
+					cfg.Stdin = limitedIn
+				}, "hold", "16")
+				requireNodeChecks(t, code, out, "hold-memory-until-input-ends")
+			})
+		})
+	})
+}
+
 // lineWatcher is a writer that calls found when the text that it receives
 // holds marker. It keeps no text.
 type lineWatcher struct {

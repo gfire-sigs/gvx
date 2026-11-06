@@ -48,6 +48,8 @@
 //	nodeprobe memtotal WRITE_MIB DIR write WRITE_MIB MiB to the volume at DIR, print
 //	                                 MemTotal, wait for the end of the input, and
 //	                                 check that it stays
+//	nodeprobe hold MIB               commit MIB MiB of anonymous memory, print
+//	                                 HOLDING, and keep it until the end of the input
 //	nodeprobe natmtu [MTU]           check the MTU of eth0 and of the tunnels on it
 //	                                 in a sandbox with the NAT network; MTU is
 //	                                 the expected MTU of eth0, 1500 by default
@@ -193,6 +195,16 @@ func main() {
 			os.Exit(2)
 		}
 		checks = capacityChecks(mem, cpus)
+	case "hold":
+		mib, err := 0, error(nil)
+		if len(os.Args) == 3 {
+			mib, err = strconv.Atoi(os.Args[2])
+		}
+		if len(os.Args) != 3 || err != nil || mib <= 0 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe hold MIB")
+			os.Exit(2)
+		}
+		checks = holdChecks(mib)
 	case "memtotal":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe memtotal WRITE_MIB DIR")
