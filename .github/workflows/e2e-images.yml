@@ -92,10 +92,15 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             allow-no-hypervisor: "1"
-            # TestE2EK3sMultiNodeControlPlaneFailover fails on this runner in
-            # every run: three k3s servers saturate its 4 cores, and the
-            # first server loses its leader election while the second server
-            # joins. The test passes on windows-latest and on Linux.
+            # TestE2EK3sMultiNodeControlPlaneFailover/systrap failed in 11 of
+            # 11 runs on this runner (e2e-images run 42198953085, diagnose
+            # runs 42206615696 and 42206619291, and 8 runs with extra logs).
+            # Node 2 does not join node 1: its etcd join or its
+            # server-bootstrap request times out, or node 1 loses its leader
+            # election, about 30 seconds after node 2 starts. The runner CPU
+            # is at 80 to 100 percent then. A wait of 90 or 240 seconds
+            # before the join and slower etcd timers did not help. The test
+            # passes on windows-latest and on Linux. The root cause is open.
             k3s-tests: 'SingleNode|NetworkPolicy|Calico|MultiNode(T1Join|T2Join)'
     env:
       GVX_ALLOW_NO_HYPERVISOR: ${{ matrix.allow-no-hypervisor }}
