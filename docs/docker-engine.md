@@ -129,9 +129,44 @@ A path in `docker run -v` names a path in the sandbox, not on the host. Mount a 
    docker run --rm -v /src/data:/data alpine ls /data
    ```
 
-## 6. Reference
+## 6. Trust a TLS-Inspecting Proxy (Procedural Module)
 
-### 6.1 Storage Choices
+A host behind a proxy that inspects TLS, or a host with a private registry, trusts a root certificate that the images do not hold. Add `--host-ca-certs` to the `rungv run` command of section 2. `dockerd` then trusts the roots of the host, and `docker pull` and `docker build` can reach the registries through the proxy. [`cli.md`](cli.md#410-host-root-certificates) lists the sources of the roots.
+
+> [!IMPORTANT]
+> Only the `dockerd` process and the other sandbox processes trust the roots. A container that `dockerd` starts has its own file system and does not trust them.
+
+1. Add the flag to the `rungv run` command of section 2.
+
+   ```sh
+   --host-ca-certs
+   ```
+
+2. Give a container the bundle of the sandbox. The path in `-v` names a path in the sandbox, as in section 5.
+
+   ```sh
+   docker run --rm -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro alpine wget -qO- https://example.com/
+   ```
+
+3. Give a build the root. Put the PEM file of the root, here `host-ca.crt`, next to the `Dockerfile`.
+
+   ```dockerfile
+   FROM alpine:3.20
+   COPY host-ca.crt /tmp/host-ca.crt
+   RUN cat /tmp/host-ca.crt >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/host-ca.crt
+   ```
+
+4. Build the image. The build steps after the `RUN` line trust the root.
+
+   ```sh
+   docker build -t app .
+   ```
+
+A private registry needs no step 2 or 3 when only `dockerd` pulls from it. Use `docker pull REGISTRY/IMAGE`.
+
+## 7. Reference
+
+### 7.1 Storage Choices
 
 The data of `dockerd` can stay in three places. The overlay storage driver works on each of them. The times are single runs on an Apple M1 with `hvf`.
 
@@ -144,7 +179,7 @@ The data of `dockerd` can stay in three places. The overlay storage driver works
 
 Use the `ext4lite` volume unless you need the files as host files. The volume image grows as `dockerd` writes, and a clean exit returns the unused tail to the host. Delete `gvx-docker.ext4` in the `volumes` directory next to the layer cache to remove all data of the engine.
 
-### 6.2 Known Limits
+### 7.2 Known Limits
 
 | Limit | Effect |
 | :--- | :--- |
@@ -152,15 +187,15 @@ Use the `ext4lite` volume unless you need the files as host files. The volume im
 | Guest architecture | The engine runs images for the host architecture. On Apple Silicon, it runs `linux/arm64` images. |
 | `10.0.2.15` from a container | A `bridge` container cannot connect to the `eth0` address of the sandbox. Use the container address or a user-defined network. |
 | `docker stats` | Shows the memory, the CPU time, and the network counters of a container. The memory is `memory.current`, which counts page cache and mapped pages too. A container that wrote 64 MiB showed 64 MiB on `hvf` and 101 MiB on Linux systrap. `BLOCK I/O` stays at `0B / 0B`, because the guest has no `io` controller. |
-| `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the highest score when the use passes the limit. Section 6.4 gives the details. |
-| `docker run --cpus` | `--cpus` becomes `cpu.max`, and the Sentry enforces it. Section 6.5 gives the details. |
+| `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the highest score when the use passes the limit. Section 7.4 gives the details. |
+| `docker run --cpus` | `--cpus` becomes `cpu.max`, and the Sentry enforces it. Section 7.5 gives the details. |
 | `--memory-reservation`, `--memory-swap`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
 
-### 6.3 Security
+### 7.3 Security
 
 The privileges of `--privileged` stay inside the sandbox. A container with `docker run --privileged` gets them only inside the sandbox too. A raw packet reaches only the network stack of the sandbox. The NAT forwarder relays only TCP and UDP connections, through host sockets. The API socket on the host has the mode `0600`, so only your user can open it. Any program of your user can therefore control the engine, as with a local Docker Engine.
 
-### 6.4 Memory Limits of Containers
+### 7.4 Memory Limits of Containers
 
 A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentry cannot count a page at the moment of its allocation. It counts a page after a scan of the memory file, so it polls. The poll starts with the first finite limit and ends when no cgroup has a limit.
 
@@ -176,7 +211,7 @@ A container with `docker run -m SIZE` gets `memory.max` in its cgroup. The Sentr
 | Windows `systrap` | The enforcer stays off. The engine runs guest code in stub processes, and the Sentry counts a page through the working set of its own process, so a page that only a stub wrote can stay uncounted. `memory.stat` and `memory.current` can show too little. `memory.max` is stored and not enforced. |
 | Not enforced | `memory.high`, `cpu.weight`, and `memory.swap.*`. |
 
-### 6.5 CPU Limits of Containers
+### 7.5 CPU Limits of Containers
 
 A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value is `N * 100000` microseconds of quota for each period of 100000 microseconds. The tasks of the container, and of its child cgroups, use the quota together on all CPUs. A task that spends the quota stops at its next return to guest code. It runs again when the next period starts. A child cgroup obeys the quota of every ancestor.
 

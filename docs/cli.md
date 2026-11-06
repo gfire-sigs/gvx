@@ -78,6 +78,7 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `--net-raw` | Let the guest open raw sockets and use `iptables`. `dockerd` needs it. The default comes from `--privileged`. |
 | `--allow-packet-socket-write` | Let the guest send on `AF_PACKET` sockets. It needs `--net-raw`. The default comes from `--privileged`, and it is off when `--net-raw` is off. |
 | `--allow-suid` | Obey the set-user-ID and set-group-ID bits of guest executables. `sudo`, `su`, and `passwd` need it for a user that is not root. The default comes from `--privileged`. |
+| `--host-ca-certs` | Make the guest trust the root certificates that the host trusts. Off by default. Section 4.10 describes the sources, the files, and the limits. |
 | `-registry-url URL` | Override the registry of the image reference. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
@@ -222,7 +223,7 @@ A volume with the `ext4lite` driver needs no lockdown rule for a host path. The 
 
 The guest kernel takes its memory size from the physical RAM of the host, as runsc does. `MemTotal` in `/proc/meminfo` and `totalram` of `sysinfo(2)` equal `--memory` when it is below that RAM, and that RAM otherwise. A tmpfs mount without a size option, such as `/dev/shm`, gets half of the host RAM, as on Linux, also with `--memory`. A guest mount with `size=N%` gets N percent of the host RAM. The tmpfs that holds the writes to the root file system has no size limit of its own. The memory guard limits it.
 
-A program in the guest can also limit a cgroup with `memory.max`, as `docker run -m` does in `docker:dind`. The Sentry checks each cgroup with a finite limit every 5 ms or more while it uses half of its limit, and every 25 ms otherwise. The keys `memory.cgroup.poll_interval` and `memory.cgroup.idle_poll_interval` set these times. It compares the anonymous memory plus the tmpfs data of the subtree with the limit. When the use passes the limit, the Sentry ends the process with the highest score with SIGKILL, but never the init process of the guest or a process with `oom_score_adj` of -1000. With `memory.oom.group` set, it ends every other process of the subtree. The Windows `systrap` engine does not enforce the limit. The counters `oom` and `oom_kill` in `memory.events` grow, and the file reports a change through `inotify`. A process can pass the limit by what it allocates between two checks, and a process that frees its memory before the next check is not found. The limits `memory.high`, `cpu.max`, and `cpu.weight` are accepted and stored, but nothing enforces them. [`docker-engine.md`](docker-engine.md), section 6.4, lists the details.
+A program in the guest can also limit a cgroup with `memory.max`, as `docker run -m` does in `docker:dind`. The Sentry checks each cgroup with a finite limit every 5 ms or more while it uses half of its limit, and every 25 ms otherwise. The keys `memory.cgroup.poll_interval` and `memory.cgroup.idle_poll_interval` set these times. It compares the anonymous memory plus the tmpfs data of the subtree with the limit. When the use passes the limit, the Sentry ends the process with the highest score with SIGKILL, but never the init process of the guest or a process with `oom_score_adj` of -1000. With `memory.oom.group` set, it ends every other process of the subtree. The Windows `systrap` engine does not enforce the limit. The counters `oom` and `oom_kill` in `memory.events` grow, and the file reports a change through `inotify`. A process can pass the limit by what it allocates between two checks, and a process that frees its memory before the next check is not found. The limits `memory.high`, `cpu.max`, and `cpu.weight` are accepted and stored, but nothing enforces them. [`docker-engine.md`](docker-engine.md), section 7.4, lists the details.
 
 `--cpus` sets the number of CPUs that the guest sees, rounded up. Windows also caps the CPU time of the host process with a hard cap on the containment job. The other host OSes have no such cap, and `rungv` prints a warning. On Windows with `-platform=systrap`, the guest runs in stub processes that the cap does not cover.
 
@@ -257,6 +258,44 @@ An unmodified `docker:dind` image starts with the default `--iptables=true`. [`d
 The exit code 137 has two causes that `rungv` tells apart. A guest that passes `--memory` gets the message about the memory limit. When the engine fails under the guest, the kernel ends the guest with SIGKILL, and `rungv` prints `the execution engine stopped the guest` with the cause. The SDK returns `ErrEngineFault` in that case. A stub process that a virus scanner ended is one example of an engine fault.
 
 `GVX_DEBUG_LOG=1` prints the log of the kernel to the standard error of `rungv`, and the value `2` also prints debug lines. Use it when a guest fails and no message names the cause. `GVX_STRACE=1` also prints each system call of the guest.
+
+### 4.10 Host root certificates
+
+A host behind a proxy that inspects TLS, or a host that uses a private registry, trusts a root that no image knows. The flag `--host-ca-certs` copies the roots of the host into the guest. The SDK field is `Config.HostCACerts`. Without the flag, the guest sees only the roots of its image. The sandbox never turns the flag on by itself.
+
+`rungv` reads the roots before the host lockdown, because the lockdown forbids a new host file and a child process. The table lists the sources of each host OS.
+
+| Host | Source of the roots |
+| :--- | :--- |
+| Linux | The file of `SSL_CERT_FILE`, or else the first system bundle that Go reads. Also the directories of `SSL_CERT_DIR`, or else `/etc/ssl/certs` and `/etc/pki/tls/certs`. |
+| macOS | The keychains `System.keychain`, `SystemRootCertificates.keychain`, and `login.keychain-db`. A certificate counts when the trust settings of the user, admin, or system domain accept it for TLS servers. A domain that denies it wins by its order: user, admin, system. |
+| Windows | The `ROOT` system store. The `CA` store holds intermediate certificates, so it is not a source. |
+
+On macOS and Windows, the files of `SSL_CERT_FILE` and `SSL_CERT_DIR` add roots. Use them for a root that is not in the system store. The run stops when the host has no root at all. A source that fails gives a warning on the standard error.
+
+At the start of the guest, the sandbox writes the roots into the layer above the image. The image stays unchanged. The sandbox does not mount a file over a bundle, so `update-ca-certificates` and `apk add ca-certificates` keep working. The table lists the writes.
+
+| Write | Detail |
+| :--- | :--- |
+| Image bundles | For each file in this list that exists, the sandbox appends the host roots that the file lacks: `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, and `/etc/ssl/ca-bundle.pem`. A root that the file holds is not added again. |
+| Image without a bundle | The sandbox creates `/etc/ssl/certs/ca-certificates.crt` with the host roots. |
+| Anchor files | Each host root that no image bundle holds becomes a file `gvx-host-*.crt`. The files go to `/usr/local/share/ca-certificates` (Debian and Alpine) and to `/etc/pki/ca-trust/source/anchors` (RHEL) when that directory exists. A later `update-ca-certificates` or `update-ca-trust` keeps the roots. |
+| Mounts | A path that is a mount point, or below one, stays as the mount shows it. |
+
+> [!WARNING]
+> Only the guest processes trust the roots. A container that `dockerd` starts in the guest does not trust them. `docs/docker-engine.md` shows how to give such a container the roots.
+
+Run an image behind an inspecting proxy:
+
+```sh
+rungv run --host-ca-certs alpine:3.20 wget -qO- https://example.com/
+```
+
+Add a root that the system store lacks. The variable works on every host OS:
+
+```sh
+SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO- https://registry.corp.example/
+```
 
 ## 5. Images and registries
 
