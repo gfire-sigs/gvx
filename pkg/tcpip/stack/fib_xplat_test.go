@@ -442,3 +442,32 @@ func TestReplyToAPodUsesItsHostRouteBesideTheBlockBlackhole(t *testing.T) {
 		t.Errorf("FindRoute of a reply to another address of the block succeeded, want the blackhole error")
 	}
 }
+
+// TestRouteOfNamedSourceFollowsTheMostSpecificRoute checks the lookup of a
+// packet from an address that the caller names. The address belongs to eth0,
+// and the default route leaves through eth0. A host route to the pod through a
+// link without an address is more specific, so the packet leaves through it,
+// as on Linux, where the source address does not choose the route.
+func TestRouteOfNamedSourceFollowsTheMostSpecificRoute(t *testing.T) {
+	s := newFibStack(t)
+	const cali = tcpip.NICID(3)
+	if err := s.CreateNICWithOptions(cali, channel.New(8, 1500, ""), stack.NICOptions{Name: "cali0"}); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if _, err := s.SetNICForwarding(cali, ipv4.ProtocolNumber, true); err != nil {
+		t.Fatalf("SetNICForwarding: %v", err)
+	}
+	s.AddRoute(tcpip.Route{Destination: fibSubnet(t, 10, 42, 0, 7, 32), NIC: cali})
+
+	r, err := s.FindRoute(0, fibAddr(10, 0, 0, 2), fibAddr(10, 42, 0, 7), ipv4.ProtocolNumber, false)
+	if err != nil {
+		t.Fatalf("FindRoute = %v", err)
+	}
+	defer r.Release()
+	if r.NICID() != cali {
+		t.Errorf("a packet from the address of eth0 to the pod leaves through NIC %d, want %d", r.NICID(), cali)
+	}
+	if got := r.LocalAddress(); got != fibAddr(10, 0, 0, 2) {
+		t.Errorf("the source address is %s, want 10.0.0.2", got)
+	}
+}

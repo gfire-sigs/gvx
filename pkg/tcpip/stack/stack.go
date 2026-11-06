@@ -1762,6 +1762,13 @@ func (s *Stack) FindRouteFlow(flow RouteFlow, id tcpip.NICID, localAddr, remoteA
 			if onlyGlobalAddresses && chosenRoute.Equal(tcpip.Route{}) && isNICForwarding(nic, netProto) {
 				if locallyGenerated {
 					chosenRoute = *route
+					// Linux picks the route by the destination, the mark, and
+					// the rules, and not by the NIC that owns the source
+					// address, so the first route is the one for a packet from
+					// an address that the caller named.
+					if localAddr.BitLen() != 0 {
+						return nil
+					}
 					continue
 				}
 
