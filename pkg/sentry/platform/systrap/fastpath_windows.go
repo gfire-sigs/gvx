@@ -482,7 +482,7 @@ func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) erro
 		as := th.sp.owner.Load()
 		if as == nil {
 			f.resume = winStateRunCold
-		} else if site, ok := as.slotAtTail(sm.Tail); !ok || site != f.trap.site || !th.archFastHot(ac) {
+		} else if site, ok := as.liveSlotAtTail(sm.Tail); !ok || site != f.trap.site || !th.archFastHot(ac) {
 			f.resume = winStateRunCold
 		}
 	}
