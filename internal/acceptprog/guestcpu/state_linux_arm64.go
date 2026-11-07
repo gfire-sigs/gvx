@@ -21,6 +21,13 @@ import "fmt"
 // Index of each general purpose register in State.X. X30 is the link register.
 const numGPR = 31
 
+// Control values that NewEditState uses: round towards minus infinity, default
+// NaN mode, and the flags DZC and OFC.
+const (
+	editFPCR = 0x02800000
+	editFPSR = 0x08000006
+)
+
 // Test values of the FP control state. FPCR selects round towards plus
 // infinity and flush-to-zero. FPSR holds the cumulative flags IOC, IXC, and QC.
 const (
@@ -85,6 +92,16 @@ func NewState(seed uint64) State {
 	}
 	s.FPCR = testFPCR
 	s.FPSR = testFPSR
+	return s
+}
+
+// NewEditState returns a State like NewState with FP control values that differ
+// from those of NewState. A frame edit with it shows that the kernel takes the
+// control registers from the frame.
+func NewEditState(seed uint64) State {
+	s := NewState(seed)
+	s.FPCR = editFPCR
+	s.FPSR = editFPSR
 	return s
 }
 
