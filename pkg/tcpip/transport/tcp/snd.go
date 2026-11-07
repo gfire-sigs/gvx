@@ -1097,11 +1097,12 @@ func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
 			s.schedulePTO()
 		} else if !s.resendTimer.enabled() {
 			s.probeTimer.disable()
-			if s.Outstanding > 0 {
-				// Enable the resend timer if it's not enabled yet and there is
-				// outstanding data.
-				s.resendTimer.enable(s.RTO)
-			}
+			// Enable the resend timer if it is not enabled yet and there is
+			// unacknowledged data. Do not test s.Outstanding here. It is an
+			// estimate, and loss recovery can leave it at zero while segments
+			// are unacked. No timer then runs, and a lost tail of the stream
+			// stalls the connection for ever (RFC 6298, section 5.1).
+			s.resendTimer.enable(s.RTO)
 		}
 	}
 }

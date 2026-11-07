@@ -156,6 +156,10 @@ seam pkg/sentry/syscalls/linux/sys_file.go
 # (pkg/tcpip/transport/tcp/bindaddr_xplat.go).
 seam pkg/tcpip/transport/tcp/protocol.go
 seam pkg/tcpip/transport/tcp/endpoint.go
+# Content seam: the sender starts the retransmit timer while it has unacked data, whatever the
+# estimate of outstanding packets says. The seam is one condition in postXmit. Loss recovery can
+# leave the estimate at zero, and no timer then runs for the lost tail of a stream.
+seam pkg/tcpip/transport/tcp/snd.go
 
 # Content seams: kernel interfaces of a Kubernetes node agent (GVXIP-005, P1).
 # bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
