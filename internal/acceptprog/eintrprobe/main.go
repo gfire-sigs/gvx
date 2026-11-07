@@ -182,6 +182,12 @@ func checkRestarts(c call, sig syscall.Signal, count int) error {
 	pid := os.Getpid()
 	for i := range count {
 		if err := unix.Tgkill(pid, tid, sig); err != nil {
+			if errors.Is(err, unix.ESRCH) {
+				// The thread ended, so the call returned before the release.
+				r := <-done
+				return fmt.Errorf("the call returned before signal %d of %d, before the release: n=%d, %w",
+					i+1, count, r.n, orNone(r.err))
+			}
 			return fmt.Errorf("tgkill: %w", err)
 		}
 		time.Sleep(signalGap)
@@ -221,16 +227,25 @@ func checkInterrupts(c call, sig syscall.Signal) error {
 	time.Sleep(enterWait)
 	pid := os.Getpid()
 	deadline := time.After(eintrWait)
+	result := func(r outcome) error {
+		if !errors.Is(r.err, syscall.EINTR) {
+			return fmt.Errorf("the call returned n=%d, %w, want EINTR", r.n, orNone(r.err))
+		}
+		return nil
+	}
 	for {
 		if err := unix.Tgkill(pid, tid, sig); err != nil {
+			// The thread ends when its goroutine returns, because the goroutine
+			// keeps the thread locked. A signal that arrives after the call
+			// returned finds no thread, so the result is already in done.
+			if errors.Is(err, unix.ESRCH) {
+				return result(<-done)
+			}
 			return fmt.Errorf("tgkill: %w", err)
 		}
 		select {
 		case r := <-done:
-			if !errors.Is(r.err, syscall.EINTR) {
-				return fmt.Errorf("the call returned n=%d, %w, want EINTR", r.n, orNone(r.err))
-			}
-			return nil
+			return result(r)
 		case <-deadline:
 			_ = release()
 			return errors.New("the call did not return EINTR for a handler without SA_RESTART")
