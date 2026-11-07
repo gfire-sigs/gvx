@@ -64,6 +64,12 @@ const (
 	fpXHeader = 512
 	fpYMMHi   = 576
 
+	// The bits of XSTATE_BV and of the xfeatures word, one for each component
+	// of the xsave area.
+	xstateX87 = 1 << 0
+	xstateSSE = 1 << 1
+	xstateAVX = 1 << 2
+
 	// faultInsnLen is the length of the instruction of runFault that faults.
 	faultInsnLen = 7
 
@@ -128,7 +134,7 @@ func parseFrame(c *capture, f *Frame) error {
 	for i := range f.Regs.Vec {
 		f.Regs.Vec[i][0] = le64(fp, fpXMM+16*i)
 		f.Regs.Vec[i][1] = le64(fp, fpXMM+16*i+8)
-		if hasAVX && a.XStateBV&4 != 0 {
+		if hasAVX && a.XStateBV&xstateAVX != 0 {
 			f.Regs.Vec[i][2] = le64(fp, fpYMMHi+16*i)
 			f.Regs.Vec[i][3] = le64(fp, fpYMMHi+16*i+8)
 		}
@@ -152,13 +158,14 @@ func (a *ArchFrame) validateXSave() error {
 	if a.Magic2 != FPXStateMagic2 {
 		return fmt.Errorf("the word behind the xsave area is %#x, want %#x", a.Magic2, FPXStateMagic2)
 	}
-	// A clear XSTATE_BV bit of x87 or SSE means the initial state, and the
-	// area still holds the register values, so the probe does not require
-	// those bits. It requires the AVX bit, because the decoder reads the upper
-	// halves of the YMM registers only when it is set.
-	want := uint64(0)
+	// Linux sets the XSTATE_BV bit of each component whose state is not the
+	// initial state. The registers of Run are not in their initial state, so
+	// x87 and SSE are set, and AVX is set when the CPU has it. XRSTOR in user
+	// code and a debugger treat a clear bit as the initial state, and they
+	// ignore the register values of the area.
+	want := uint64(xstateX87 | xstateSSE)
 	if hasAVX {
-		want = 4
+		want |= xstateAVX
 	}
 	if a.XStateBV&want != want {
 		return fmt.Errorf("XSTATE_BV = %#x, want bits %#x set", a.XStateBV, want)
