@@ -150,6 +150,23 @@ func storeXStateComponents(fp []byte, mask, have uint64, locate func(comp xstate
 	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], bv)
 }
 
+// markLegacyState sets the XSTATE_BV bits of x87 and SSE in the Linux XSAVE
+// image fp. The engine calls it after it wrote the legacy region from a
+// thread, and a thread always has x87 and SSE state.
+//
+// Linux sets the bit of each component whose saved state is not the initial
+// state. A consumer that honors XSTATE_BV treats a clear bit as the initial
+// state and ignores the register values in the area. XRSTOR in user code and a
+// debugger are such consumers. A component with the initial values keeps its
+// bit, and XRSTOR loads the initial values from it.
+func markLegacyState(fp []byte) {
+	if len(fp) < xsaveHeaderOffset+8 {
+		return
+	}
+	bv := binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
+	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], bv|winXsaveLegacy)
+}
+
 // ptr returns the address to pass to GetThreadContext and SetThreadContext.
 func (c *hostContext) ptr() uintptr { return uintptr(unsafe.Pointer(&c.buf[0])) }
 
@@ -254,6 +271,7 @@ func (c *hostContext) storeFP(ac *arch.Context64) {
 	if len(state) >= 512 {
 		copy(state[:512], c.buf[ctxOffFlt:ctxOffFlt+512])
 	}
+	markLegacyState(state)
 	c.storeXState(state)
 }
 
