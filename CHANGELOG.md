@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Tests
 
+- **Code rewrites from several threads**: the guest program `codewrite` has the new check `code-churn-threads`. Four threads rewrite a code page between `mprotect` calls, run it, and replace it by a new mapping at the same address. Two more threads change the permissions and the mapping of the pages beside the code pages. A swapper replaces the page that a runner thread executes by a mapping of one of two memory files with the same code. The code calls `getpid`, so an engine that patches system call instructions must patch and unpatch them under this load. Each run must return the result of the latest version. `TestE2ESystrapCodeWrites` runs the check on every backend.
 - **gVisor analyzers in CI**: the job `build, vet, and audit` now runs `checklocks`, `checkconst`, and `checklinkname` on every package for the five targets. A lock annotation violation, a changed assembly offset, or a mismatched `//go:linkname` fails CI. `scripts/gvisorlint.sh` runs the same check locally, and `docs/gvisorlint.md` states how to fix a finding. The first run reported annotation gaps and lock calls that tests skip. It led to the annotations `+checklocksacquire`, `+checklocksrelease`, and `+checklocksforce` on lock helpers, closures, and `TryLock` calls, and it split the atomic policies of `Stack.fib` from the rules that `routeMu` guards.
 
 ### Bug Fixes

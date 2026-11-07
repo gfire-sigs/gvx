@@ -39,6 +39,15 @@ func codeReturn(n uint32) []byte {
 	return append(c, 0xc3)                                 // ret
 }
 
+// codeSyscall returns code for a function that calls getpid and returns the
+// result plus n. The code holds a SYSCALL instruction, which an engine can
+// patch.
+func codeSyscall(n uint32) []byte {
+	c := []byte{0xb8, 39, 0, 0, 0, 0x0f, 0x05, 0x05} // mov eax, 39; syscall; add eax, imm32
+	c = binary.LittleEndian.AppendUint32(c, n)
+	return append(c, 0xc3) // ret
+}
+
 // codeSelfPatch returns code that writes 42 into the immediate of the next
 // instruction and runs it. The unpatched instruction returns 1.
 func codeSelfPatch() []byte {
