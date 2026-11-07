@@ -127,6 +127,8 @@ seam pkg/sentry/fsimpl/cgroup2fs/cgroup.go
 # (pkg/sentry/fsimpl/cgroup2fs/memory_xplat.go). The seam is one field of the filesystem.
 seam pkg/sentry/fsimpl/cgroup2fs/filesystem.go
 seam pkg/sentry/kernel/task.go
+# The run loop of a task keeps the cause of an engine fault in its kernel
+# (pkg/sentry/kernel/engine_fault_xplat.go), so a process with several sandboxes tells the faults apart.
 seam pkg/sentry/kernel/task_run.go
 seam pkg/sentry/kernel/task_sched.go
 # Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
