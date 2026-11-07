@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.10.10022026110200] - 2026-11-07
+
+This release hardens the engines and the CI process. CI now runs the gVisor analyzers `checklocks`, `checkconst`, and `checklinkname`, and guest probes that check registers, signal frames, `fork`, `exec`, and code rewrites on every backend. The probes and an audit of process-wide state found and fixed per-sandbox memory accounting, trampoline slot races of the Windows `systrap` engine, a half-patched system call site of the Linux `amd64` engine, TCP stalls after packet loss, and signal frame fields that differed from Linux.
 
 ### Tests
 
