@@ -53,6 +53,11 @@ type stdClock struct {
 	// https://golang.org/pkg/time/#Since.
 	baseTime time.Time `state:"nosave"`
 
+	// baseTicks is the host tick counter at the time of construction. A host
+	// whose time package reads a coarse clock gives a finer reading through
+	// hostTicks. See hostSince.
+	baseTicks int64 `state:"nosave"`
+
 	// monotonicOffset is the offset applied to the calculated monotonic time.
 	//
 	// monotonicOffset is assigned after restore so that the monotonic time
@@ -63,7 +68,8 @@ type stdClock struct {
 // NewStdClock returns an instance of a clock that uses the time package.
 func NewStdClock() Clock {
 	return &stdClock{
-		baseTime: time.Now(),
+		baseTime:  time.Now(),
+		baseTicks: hostTicks(),
 	}
 }
 
@@ -76,7 +82,7 @@ func (*stdClock) Now() time.Time {
 
 // NowMonotonic implements Clock.NowMonotonic.
 func (s *stdClock) NowMonotonic() MonotonicTime {
-	sinceBase := time.Since(s.baseTime)
+	sinceBase := hostSince(s.baseTime, s.baseTicks)
 	if sinceBase < 0 {
 		panic(fmt.Sprintf("got negative duration = %s since base time = %s", sinceBase, s.baseTime))
 	}

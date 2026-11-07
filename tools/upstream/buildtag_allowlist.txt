@@ -156,6 +156,11 @@ seam pkg/sentry/syscalls/linux/sys_file.go
 # (pkg/tcpip/transport/tcp/bindaddr_xplat.go).
 seam pkg/tcpip/transport/tcp/protocol.go
 seam pkg/tcpip/transport/tcp/endpoint.go
+# Content seams: the default clock of a stack reads a fine host counter on Windows
+# (pkg/tcpip/stdclock_xplat.go and pkg/tcpip/stdclock_windows.go). The seams are one field
+# and one call in stdclock.go, and one call in stdclock_state.go.
+seam pkg/tcpip/stdclock.go
+seam pkg/tcpip/stdclock_state.go
 
 # Content seams: kernel interfaces of a Kubernetes node agent (GVXIP-005, P1).
 # bind(2) checks ip_unprivileged_port_start (pkg/sentry/socket/netstack/bindport_xplat.go).
