@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Tests
 
+- **Register state across events**: the guest program `regprobe` fills every general purpose register, the vector registers, and the FP control registers with distinct values, then lets a system call, a page fault, or a signal happen. The signal arrives in user code, in a blocking call that returns `EINTR`, in a blocking call that restarts, and in a fault that a `SIGSEGV` handler resolves. The handler overwrites every register, so only a correct `sigreturn` restores them. `TestE2ESystrapRegisterState` runs it on every backend. The package `internal/acceptprog/guestcpu` holds the assembly for `linux/amd64` (RAX to R15, XMM0 to XMM15 and YMM0 to YMM15 when the CPU has AVX, MXCSR, and the x87 control word) and `linux/arm64` (X0 to X30, V0 to V31, FPSR, and FPCR).
 - **gVisor analyzers in CI**: the job `build, vet, and audit` now runs `checklocks`, `checkconst`, and `checklinkname` on every package for the five targets. A lock annotation violation, a changed assembly offset, or a mismatched `//go:linkname` fails CI. `scripts/gvisorlint.sh` runs the same check locally, and `docs/gvisorlint.md` states how to fix a finding. The first run reported annotation gaps and lock calls that tests skip. It led to the annotations `+checklocksacquire`, `+checklocksrelease`, and `+checklocksforce` on lock helpers, closures, and `TryLock` calls, and it split the atomic policies of `Stack.fib` from the rules that `routeMu` guards.
 
 ### Bug Fixes
