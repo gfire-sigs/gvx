@@ -100,13 +100,15 @@ func TestWindowsLogSinkCloseDoesNotWaitForStuckListener(t *testing.T) {
 }
 
 // TestWindowsPipeListenerCloseRacesPendingConnect uses the real go-winio
-// listener. Without pipeListener, a few Close calls in a thousand stay blocked
-// in win32PipeListener.Close and Accept returns ERROR_OPERATION_ABORTED.
+// listener. Without pipeListener, a Close call can stay blocked in
+// win32PipeListener.Close. The run name makes each pipe name unique, so a
+// listener that a failed iteration leaks does not fail the next run.
 func TestWindowsPipeListenerCloseRacesPendingConnect(t *testing.T) {
 	const iterations = 3000
 	const bound = 30 * time.Second
+	run := time.Now().UnixNano()
 	for i := range iterations {
-		address := fmt.Sprintf(`\\.\pipe\gvx-shim-close-race-%d-%d`, os.Getpid(), i)
+		address := fmt.Sprintf(`\\.\pipe\gvx-shim-close-race-%d-%d-%d`, os.Getpid(), run, i)
 		listener, err := listenProtectedPipe(address)
 		if err != nil {
 			t.Fatal(err)

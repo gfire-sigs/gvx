@@ -17,14 +17,18 @@ var errPipeListenerCloseTimeout = errors.New("named pipe listener did not close 
 
 // pipeListener makes Close of a go-winio pipe listener finish.
 //
-// go-winio v0.6.2 listenerRoutine takes one close request in
-// makeConnectedServerPipe. When the pending connect then fails with an error
-// other than nil or ErrFileClosed (Accept returned ERROR_OPERATION_ABORTED in
-// the failure on windows-latest), the routine does not record the close. It
-// returns to its top-level select and waits for a second close request. The
-// first Close then waits forever on doneCh. Each further Close call sends one
-// more request, so Close is repeated until one returns. The wait has an upper
-// bound because the operating system can also leave a connect pending.
+// In go-winio v0.6.2, the close branch of makeConnectedServerPipe takes one
+// close request. It maps only nil and ErrFileClosed to ErrPipeListenerClosed.
+// If the pending connect ends with another error, the listener routine does not
+// record the close. A raw ERROR_OPERATION_ABORTED returns to Accept, and the
+// routine goes back to its top-level select. ERROR_NO_DATA makes the routine
+// connect again. Both cases wait for a second close request, so the first Close
+// waits forever on doneCh.
+//
+// Each Close call sends one more request. Repeat Close until one call returns.
+// The operating system can also keep a connect pending, so the wait has an
+// upper bound. The inner Close error is dropped because go-winio always
+// returns nil.
 type pipeListener struct {
 	net.Listener
 	closing atomic.Bool
@@ -68,7 +72,12 @@ func (l *pipeListener) Close() error {
 		case <-ticker.C:
 			attempt()
 		case <-timer.C:
-			return errPipeListenerCloseTimeout
+			select {
+			case <-returned:
+				return nil
+			default:
+				return errPipeListenerCloseTimeout
+			}
 		}
 	}
 }

@@ -419,7 +419,17 @@ func serveInstance(startup context.Context, identity instanceIdentity, timeout t
 	} else {
 		result = errors.Join(result, transport.CloseConnections(), server.Close())
 	}
-	servedErr := <-served
+	var servedErr error
+	select {
+	case servedErr = <-served:
+	case <-drain.Done():
+		// A listener that cannot close leaves Serve in Accept.
+		select {
+		case servedErr = <-served:
+		case <-time.After(listenerExitGrace):
+			servedErr = errListenerStuck
+		}
+	}
 	if servedErr != nil && !errors.Is(servedErr, net.ErrClosed) && !errors.Is(servedErr, ttrpc.ErrServerClosed) {
 		result = errors.Join(result, servedErr)
 	}
@@ -444,6 +454,12 @@ func drainServer(ctx context.Context, state *controlState, server *ttrpc.Server,
 	transport.AwaitConnections(ctx)
 	return nil
 }
+
+// listenerExitGrace is the time that an accept loop gets to return after the
+// drain deadline. It equals the bound of pipeListener.Close.
+const listenerExitGrace = 5 * time.Second
+
+var errListenerStuck = errors.New("accept loop did not return after its listener closed")
 
 func closeListener(listener net.Listener) error {
 	err := listener.Close()

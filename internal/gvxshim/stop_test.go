@@ -112,3 +112,36 @@ func TestStopRejectsExcessConnections(t *testing.T) {
 		t.Fatalf("excess connection was not rejected before its deadline: %v", err)
 	}
 }
+
+// stuckListener models a listener whose Close failed and whose Accept never returns.
+type stuckListener struct{ release chan struct{} }
+
+func (l *stuckListener) Accept() (net.Conn, error) {
+	<-l.release
+	return nil, net.ErrClosed
+}
+
+func (l *stuckListener) Close() error { return errors.New("listener did not close") }
+
+func (l *stuckListener) Addr() net.Addr { return nil }
+
+func TestStopServerCloseEndsWhenAcceptStaysBlocked(t *testing.T) {
+	listener := &stuckListener{release: make(chan struct{})}
+	defer close(listener.release)
+	state := newControlState(time.Now().Add(time.Minute), time.Second)
+	server := newStopServer(listener, state, [32]byte{}, time.Minute)
+	server.exitGrace = 50 * time.Millisecond
+	state.RequestStop()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- server.close(ctx) }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, errListenerStuck) {
+			t.Fatalf("close returned %v, want errListenerStuck", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("close waited for a blocked Accept")
+	}
+}
