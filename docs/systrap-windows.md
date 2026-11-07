@@ -604,7 +604,52 @@ The design rests on facts that no Windows document states:
 | End to end | `fastpath_windows_test.go`, and the engine tests, which run with the fast path by default. `TestFastPathResumeBehindPatchedSyscall` covers a start behind a patched `syscall`. `TestFastPathPreWindowServesEverySystemCall` and the tests after it in `engine_windows_amd64_test.go` cover the pre-window form. The e2e tests `TestE2EVolumePersistsAcrossSandboxes` and `TestE2EGateETExecGoStatic` run real Go guests. Both hosted Windows runners pass them. |
 | Latency | `BenchmarkFastPathRoundTrip` measures it, and section 3.8 lists the numbers. On `amd64`, a spin hit takes 0.50 to 0.56 µs and a sleep takes 33 µs. |
 
-The engine reclaims island slots through a per-island bitmap when a code page unmaps or returns to data state. A thread count above 512 for one stub fails with an error.
+The engine reclaims island slots after a quiescent point of every thread (section 6.9). A thread count above 512 for one stub fails with an error.
+
+### 6.9 Island Slot Lifecycle
+
+A slot in an island page has bytes and a record. A thread runs the bytes, and the Sentry reads the record. The Sentry can free a slot while a thread is still inside it. This section states the rules that keep both readers safe. The comment at the top of `fastisland_windows.go` holds the same contract next to the code.
+
+| State | Meaning |
+| :--- | :--- |
+| Free | No thread runs the bytes, and no record exists. `alloc` can return the units. |
+| Allocated | `alloc` returned the units. The installer writes the bytes. No record exists, and no branch names the slot. |
+| Live | The installer recorded the slot. The block maps its page, so a thread enters the slot through the branch at the site. |
+| Quarantined | The block dropped its page, so no branch to the slot is visible. A thread that entered before the drop can still be inside. The bytes and the record stay as they were. |
+
+The only transitions are these. `alloc` makes a Free slot Allocated. `record` makes it Live. `discard` makes an Allocated or Live slot Free, and only for a slot whose branch never became visible. `retire` makes a Live slot Quarantined. `reclaim` makes a Quarantined slot Free.
+
+A block drops its slots in four cases. A mapping replaces the block, `munmap` removes it, a write or a protection change returns it to data state, or the address space ends. In each case the engine first removes the executable page that holds the branch. It then calls `retire`. A thread that resumes after `retire` cannot enter the slot.
+
+The readers obey these rules.
+
+| Reader | Rule |
+| :--- | :--- |
+| Decode of a trap (`fastTrapLocked`) | Reads the record of a Live or Quarantined slot. The thread that published the trap is online, or it holds the slot as its pin, so `reclaim` kept the slot. |
+| `rewindToSite`, `svcSlotFault`, `slotContaining` | Read the record of a Live or Quarantined slot for a thread that stopped in the slot. The thread is online, so `reclaim` kept the slot. |
+| Hot resume | The thread runs the tail of the slot of its trap, whether the slot is Live or Quarantined. The pin keeps the bytes until the next trap or park. The tail jumps to the code behind the patched bytes, which is a valid instruction address in every later patch of the same code. |
+| Installer | Writes the bytes of an Allocated slot only. No thread can be inside such a slot. |
+
+#### Reclamation
+
+Every guest thread has a reader with two words. The epoch word is the value of the epoch counter when the thread went online, or the offline marker. The pin word is the address of the slot whose tail the thread can still run, or 0. `retire` adds 1 to the counter and stamps the slot with the result.
+
+A thread is offline while it waits in the spill routine or while the engine parks it. An offline thread leaves only through the slot of its pin or through the Sentry, so it cannot be in the entry code of another slot. A thread is online when it runs guest code, so it can be inside a slot that a branch entered before the free.
+
+| Event | Reader change |
+| :--- | :--- |
+| The Sentry decodes a trap | The reader goes offline and takes the slot of the trap as its pin. |
+| The Sentry resumes the thread cold | The pin ends, and the reader goes online. |
+| The Sentry resumes the thread hot | The reader goes online and keeps the pin. The tail of the slot runs until the next trap or park. |
+| The engine parks the thread | The reader goes offline, and the pin ends. |
+| The engine starts a parked thread | The reader goes online. The engine first pins the slot of any island address that it sends the thread to, while it holds the lock of the address space. A clone child, a restart, and the retry of a fault do this. |
+| The thread is gone | The reader goes offline, and the pin ends. |
+
+`reclaim` frees a Quarantined slot in one case. Every reader is offline or went online after the stamp of the slot, and no reader has the slot as its pin. A thread that runs guest code and never traps blocks the reclaim of every slot that was freed after it went online. This is the price of the scheme. The engine cannot see the program counter of a running thread without a suspend.
+
+`alloc` takes only Free units, so a Quarantined slot keeps its bytes. `allocSlot` reclaims when no island has room, and it then creates an island. `allocSlot` fails when no island has room and the quarantine holds 4096 allocation units or more, which is 16 island pages. One drop can push the quarantine past that number. The site then keeps its trap, and the guest runs at the speed of the debug path until a thread passes a quiescent point.
+
+A signal frame that a guest wrote for a fault in a relocated instruction of a post-window slot can hold an island address. A guest that resumes there runs slot bytes that a later free can reuse. This case is outside the contract.
 
 ## 7. Security Model
 
