@@ -295,10 +295,10 @@ func TestVectorRegistersSurviveSyscallsAndOtherContexts(t *testing.T) {
 	fill := func(ac *arch.Context64, seed byte) {
 		fp := *ac.FloatingPointData()
 		for i := range 32 * 16 {
-			fp[i] = seed + byte(i)
+			fp[arch.FPSIMDOffV+i] = seed + byte(i)
 		}
-		binary.LittleEndian.PutUint32(fp[512:], 0x00000011) // FPSR.
-		binary.LittleEndian.PutUint32(fp[516:], 0x03000000) // FPCR: FZ and DN.
+		binary.LittleEndian.PutUint32(fp[arch.FPSIMDOffFPSR:], 0x00000011) // FPSR.
+		binary.LittleEndian.PutUint32(fp[arch.FPSIMDOffFPCR:], 0x03000000) // FPCR: FZ and DN.
 	}
 	fill(a.ac, 0x10)
 	fill(b.ac, 0xa0)
@@ -314,8 +314,9 @@ func TestVectorRegistersSurviveSyscallsAndOtherContexts(t *testing.T) {
 		t.Fatalf("a.Switch (second) = (%v, %v)", sig, err)
 	}
 	got := *a.ac.FloatingPointData()
-	// The guest copied V0 into V1: bytes 16..31 now equal bytes 0..15.
-	copy(aWant[16:32], aWant[0:16])
+	// The guest copied V0 into V1.
+	const v0, v1 = arch.FPSIMDOffV, arch.FPSIMDOffV + 16
+	copy(aWant[v1:v1+16], aWant[v0:v0+16])
 	for i := range aWant {
 		if got[i] != aWant[i] {
 			t.Fatalf("Context a FP state differs at byte %d: got %#x want %#x", i, got[i], aWant[i])
@@ -323,12 +324,12 @@ func TestVectorRegistersSurviveSyscallsAndOtherContexts(t *testing.T) {
 	}
 	bGot := *b.ac.FloatingPointData()
 	for i := range 16 {
-		if bGot[16+i] != bGot[i] {
-			t.Fatalf("Context b V1 byte %d = %#x, want V0 byte %#x", i, bGot[16+i], bGot[i])
+		if bGot[v1+i] != bGot[v0+i] {
+			t.Fatalf("Context b V1 byte %d = %#x, want V0 byte %#x", i, bGot[v1+i], bGot[v0+i])
 		}
 	}
-	if bGot[0] != 0xa0 {
-		t.Fatalf("Context b V0 = %#x, want 0xa0: a's registers leaked in", bGot[0])
+	if bGot[v0] != 0xa0 {
+		t.Fatalf("Context b V0 = %#x, want 0xa0: a's registers leaked in", bGot[v0])
 	}
 }
 
@@ -417,10 +418,10 @@ func TestInterruptInGuestCapturesFullState(t *testing.T) {
 	r.TPIDR_EL0 = 0x1234500
 	fp := *g.ac.FloatingPointData()
 	for i := range 512 {
-		fp[i] = byte(i*7 + 3)
+		fp[arch.FPSIMDOffV+i] = byte(i*7 + 3)
 	}
-	binary.LittleEndian.PutUint32(fp[512:], 0x1f) // FPSR cumulative flags.
-	binary.LittleEndian.PutUint32(fp[516:], 0x00400000)
+	binary.LittleEndian.PutUint32(fp[arch.FPSIMDOffFPSR:], 0x1f) // FPSR cumulative flags.
+	binary.LittleEndian.PutUint32(fp[arch.FPSIMDOffFPCR:], 0x00400000)
 	wantFP := append([]byte(nil), fp...)
 
 	for i := range 50 {
@@ -441,7 +442,7 @@ func TestInterruptInGuestCapturesFullState(t *testing.T) {
 			t.Fatalf("iteration %d: SP=%#x TLS=%#x PSTATE=%#x changed", i, r.Sp, r.TPIDR_EL0, r.Pstate)
 		}
 		gotFP := *g.ac.FloatingPointData()
-		for j := range wantFP[:520] {
+		for j := range wantFP[:arch.FPSIMDBodySize] {
 			if gotFP[j] != wantFP[j] {
 				t.Fatalf("iteration %d: FP state differs at byte %d: got %#x want %#x", i, j, gotFP[j], wantFP[j])
 			}

@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/arch/fpu"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
@@ -48,7 +49,7 @@ func deliverFaultWithFPRegs(t *testing.T, sig linux.Signal, at hostarch.AccessTy
 	for i := range fp.Vregs {
 		fp.Vregs[i] = 0x0101010101010101 * uint64(i+1)
 	}
-	fp.MarshalBytes(ctx.fpState)
+	putFPState(ctx.fpState, fp)
 
 	buf := make([]byte, 1<<14)
 	st := &Stack{Arch: ctx, IO: &usermem.BytesIO{Bytes: buf}, Bottom: hostarch.Addr(len(buf))}
@@ -58,6 +59,47 @@ func deliverFaultWithFPRegs(t *testing.T, sig linux.Signal, at hostarch.AccessTy
 		t.Fatalf("SignalSetup: %v", err)
 	}
 	return &signalFrameFixture{ctx: ctx, st: st, buf: buf, ucAddr: st.Bottom}
+}
+
+// putFPState writes the registers of fp into state in the layout that the
+// platforms use: FPSR, FPCR, then V0 to V31, without the record header.
+func putFPState(state fpu.State, fp FpsimdContext) {
+	binary.LittleEndian.PutUint32(state[FPSIMDOffFPSR:], fp.Fpsr)
+	binary.LittleEndian.PutUint32(state[FPSIMDOffFPCR:], fp.Fpcr)
+	for i, v := range fp.Vregs {
+		binary.LittleEndian.PutUint64(state[FPSIMDOffV+8*i:], v)
+	}
+}
+
+// getFPState reads the registers from state. See putFPState.
+func getFPState(state fpu.State) FpsimdContext {
+	var fp FpsimdContext
+	fp.Fpsr = binary.LittleEndian.Uint32(state[FPSIMDOffFPSR:])
+	fp.Fpcr = binary.LittleEndian.Uint32(state[FPSIMDOffFPCR:])
+	for i := range fp.Vregs {
+		fp.Vregs[i] = binary.LittleEndian.Uint64(state[FPSIMDOffV+8*i:])
+	}
+	return fp
+}
+
+// A signal and its sigreturn leave every floating point register as it was.
+// A record header written over the state once set FPCR to 0x210, which enables
+// the divide-by-zero trap, and FPSR to the magic number.
+func TestSignalRoundTripKeepsTheFloatingPointState(t *testing.T) {
+	f := deliverSignalWithFPRegs(t)
+	f.st.Bottom = f.ucAddr
+	if _, _, err := f.ctx.SignalRestore(f.st, true, cpuid.FeatureSet{}); err != nil {
+		t.Fatalf("SignalRestore: %v", err)
+	}
+	got := getFPState(f.ctx.fpState)
+	if got.Fpsr != 0x11 || got.Fpcr != 0x22 {
+		t.Errorf("fpsr, fpcr after sigreturn = %#x, %#x, want 0x11, 0x22", got.Fpsr, got.Fpcr)
+	}
+	for i, v := range got.Vregs {
+		if want := 0x0101010101010101 * uint64(i+1); v != want {
+			t.Fatalf("vregs[%d] after sigreturn = %#x, want %#x", i, v, want)
+		}
+	}
 }
 
 func (f *signalFrameFixture) frame() UContext64 {
@@ -98,8 +140,7 @@ func TestSigreturnLoadsTheFloatingPointRecordOfTheFrame(t *testing.T) {
 	if _, _, err := f.ctx.SignalRestore(f.st, true, cpuid.FeatureSet{}); err != nil {
 		t.Fatalf("SignalRestore: %v", err)
 	}
-	var got FpsimdContext
-	got.UnmarshalBytes(f.ctx.fpState)
+	got := getFPState(f.ctx.fpState)
 	if got.Vregs[3] != 0xdeadbeef || got.Fpcr != 0x33 {
 		t.Errorf("vregs[3], fpcr = %#x, %#x, want 0xdeadbeef, 0x33", got.Vregs[3], got.Fpcr)
 	}
@@ -119,8 +160,7 @@ func TestSigreturnKeepsTheFloatingPointStateWithoutARecord(t *testing.T) {
 	if _, _, err := f.ctx.SignalRestore(f.st, true, cpuid.FeatureSet{}); err != nil {
 		t.Fatalf("SignalRestore: %v", err)
 	}
-	var got FpsimdContext
-	got.UnmarshalBytes(f.ctx.fpState)
+	got := getFPState(f.ctx.fpState)
 	if got.Vregs[3] != 0x0101010101010101*4 || got.Fpsr != 0x11 || got.Fpcr != 0x22 {
 		t.Errorf("the saved registers changed: vregs[3], fpsr, fpcr = %#x, %#x, %#x", got.Vregs[3], got.Fpsr, got.Fpcr)
 	}

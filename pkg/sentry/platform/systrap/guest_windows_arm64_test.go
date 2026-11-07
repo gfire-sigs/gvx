@@ -160,14 +160,14 @@ func regPC(ac *arch.Context64) uint64         { return ac.StateData().Regs.Pc }
 func setTLSBase(ac *arch.Context64, v uint64) { ac.StateData().Regs.TPIDR_EL0 = v }
 
 // vectorLow reads the low quadword of V0 from the floating-point state of ac.
-// The state is a Linux fpsimd_context: a 16-byte header, then the vectors.
+// See arch.FPSIMDOffV.
 func vectorLow(ac *arch.Context64) uint64 {
-	return binary.LittleEndian.Uint64((*ac.FloatingPointData())[16:])
+	return binary.LittleEndian.Uint64((*ac.FloatingPointData())[arch.FPSIMDOffV:])
 }
 
 // setVectorLow writes the low quadword of V0.
 func setVectorLow(ac *arch.Context64, v uint64) {
-	binary.LittleEndian.PutUint64((*ac.FloatingPointData())[16:], v)
+	binary.LittleEndian.PutUint64((*ac.FloatingPointData())[arch.FPSIMDOffV:], v)
 }
 
 // gLiveVectorState writes V0. The arm64 routine saves and loads all 32 vector
