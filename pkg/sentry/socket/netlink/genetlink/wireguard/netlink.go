@@ -261,7 +261,7 @@ func (e *linkEndpoint) setPeer(attrs map[uint16]nlmsg.BytesView) *syserr.Error {
 		if e.peers.len() >= peerLimit {
 			return syserr.ErrNoMemory
 		}
-		if err := chargeMemory(peerMemory); err != nil {
+		if err := chargeMemory(e.acct, peerMemory); err != nil {
 			return err
 		}
 		e.charged += peerMemory

@@ -902,7 +902,10 @@ func createKernelMemoryFile() (*pgalloc.MemoryFile, error) {
 		return nil, fmt.Errorf("gvx: create memory backing file: %w", err)
 	}
 	memFile := os.NewFile(uintptr(memFD), memFileName)
-	mf, err := pgalloc.NewMemoryFile(memFile, pgalloc.MemoryFileOpts{})
+	// A sandbox counts its own memory. The global usage.MemoryAccounting sums
+	// every kernel of the process, and the memory cgroup IDs of two kernels
+	// overlap.
+	mf, err := pgalloc.NewMemoryFile(memFile, pgalloc.MemoryFileOpts{Accounting: usage.NewMemoryLocked()})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("gvx: init pgalloc.MemoryFile: %w", err), memFile.Close())
 	}
@@ -1195,12 +1198,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		guard := memoryGuard{
 			limit: limit,
 			// The accounting counts a committed page only after a scan of the
-			// memory file. UpdateUsage limits its own scan rate. The count
-			// covers this memory file only: usage.MemoryAccounting also holds
-			// the pages of the other sandboxes of the process.
+			// memory file. UpdateUsage limits its own scan rate. The accounting
+			// belongs to this memory file (see createKernelMemoryFile), so it
+			// does not hold the pages of the other sandboxes of the process.
 			used: func() uint64 {
 				_ = mf.UpdateUsage(nil)
-				return mf.KnownCommittedBytes()
+				return mf.Accounting().Total()
 			},
 			interval: interval,
 			kill: func() {

@@ -143,10 +143,16 @@ func deferDecRef[T decRefer](fs *filesystem, list []T) {
 	}
 }
 
+// lock takes fs.mu.
+//
+// +checklocksacquire:fs.mu
 func (fs *filesystem) lock() {
 	fs.mu.Lock()
 }
 
+// unlock releases fs.mu and drops the references that deferDecRef collected.
+//
+// +checklocksrelease:fs.mu
 func (fs *filesystem) unlock(ctx context.Context) {
 	pending := fs.pending
 	fs.pending = nil

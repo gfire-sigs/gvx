@@ -270,7 +270,7 @@ func (q *quiescedTree) finish(moved bool, newRel string) error {
 		q.r.mu.Unlock()
 	}
 	for i := len(q.held) - 1; i >= 0; i-- {
-		q.held[i].h.mu.Unlock()
+		q.held[i].h.mu.Unlock() // +checklocksforce: quiesce locked every handle in q.held
 	}
 	q.held = nil
 	return errors.Join(errs...)

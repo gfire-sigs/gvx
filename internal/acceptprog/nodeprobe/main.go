@@ -50,6 +50,12 @@
 //	                                 check that it stays
 //	nodeprobe hold MIB               commit MIB MiB of anonymous memory, print
 //	                                 HOLDING, and keep it until the end of the input
+//	nodeprobe memcg HOLD_MIB [MAX_MIB]
+//	                                 start a child in a new memory cgroup, commit
+//	                                 HOLD_MIB MiB in it, print HOLDING, and after the
+//	                                 end of the input check that memory.current,
+//	                                 memory.stat, and /proc/meminfo count only this
+//	                                 sandbox; MAX_MIB is an optional memory.max
 //	nodeprobe natmtu [MTU]           check the MTU of eth0 and of the tunnels on it
 //	                                 in a sandbox with the NAT network; MTU is
 //	                                 the expected MTU of eth0, 1500 by default
@@ -205,6 +211,30 @@ func main() {
 			os.Exit(2)
 		}
 		checks = holdChecks(mib)
+	case "memcg":
+		hold, limit, err := 0, 0, error(nil)
+		if len(os.Args) == 3 || len(os.Args) == 4 {
+			hold, err = strconv.Atoi(os.Args[2])
+		}
+		if err == nil && len(os.Args) == 4 {
+			limit, err = strconv.Atoi(os.Args[3])
+		}
+		if len(os.Args) < 3 || len(os.Args) > 4 || err != nil || hold <= 0 || limit < 0 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe memcg HOLD_MIB [MAX_MIB]")
+			os.Exit(2)
+		}
+		checks = memcgChecks(hold, limit)
+	case "memcg-hog":
+		mib, err := 0, error(nil)
+		if len(os.Args) == 3 {
+			mib, err = strconv.Atoi(os.Args[2])
+		}
+		if len(os.Args) != 3 || err != nil || mib <= 0 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe memcg-hog MIB")
+			os.Exit(2)
+		}
+		memcgHogMain(mib)
+		return
 	case "memtotal":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: nodeprobe memtotal WRITE_MIB DIR")

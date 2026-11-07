@@ -644,7 +644,7 @@ func (e *watchEntry) attach(be watchBackend) error {
 func (e *watchEntry) release() {
 	if e.scanMu.TryLock() {
 		e.releaseLocked()
-		e.scanMu.Unlock()
+		e.scanMu.Unlock() // +checklocksforce: TryLock succeeded
 		return
 	}
 	go func() {

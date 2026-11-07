@@ -25,7 +25,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/kernfs"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
-	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 // +stateify savable
@@ -137,7 +136,7 @@ func getUsage(k *kernel.Kernel, memCgIDs map[uint32]struct{}) uint64 {
 	k.MemoryFile().UpdateUsage(memCgIDs)
 	var totalBytes uint64
 	for id := range memCgIDs {
-		_, bytes := usage.MemoryAccounting.CopyPerCg(id)
+		_, bytes := k.MemoryFile().Accounting().CopyPerCg(id)
 		totalBytes += bytes
 	}
 	return totalBytes

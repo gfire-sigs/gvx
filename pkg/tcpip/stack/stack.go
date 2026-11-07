@@ -92,8 +92,11 @@ type Stack struct {
 	// routeTable is a list of routes sorted by prefix length, longest (most specific) first.
 	// +checklocks:routeMu
 	routeTable tcpip.RouteList `state:"nosave"`
-	// fib holds the routing rules.
+	// fibRules holds the routing rules.
 	// +checklocks:routeMu
+	fibRules fibRules `state:"nosave"`
+	// fib holds the atomic policies and snapshots that a reader uses without
+	// routeMu.
 	fib fibState `state:"nosave"`
 
 	mu stackRWMutex `state:"nosave"`
@@ -1740,7 +1743,7 @@ func (s *Stack) FindRouteFlow(flow RouteFlow, id tcpip.NICID, localAddr, remoteA
 		defer s.routeMu.RUnlock()
 
 		for route := range s.fibRoutes(&lookup) {
-			nic, ok := s.nics[route.NIC]
+			nic, ok := s.nics[route.NIC] // +checklocksforce: the loop body runs with s.mu held
 			if !ok || !nic.Enabled() {
 				continue
 			}
@@ -1785,7 +1788,7 @@ func (s *Stack) FindRouteFlow(flow RouteFlow, id tcpip.NICID, localAddr, remoteA
 					continue
 				}
 
-				if r := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(nic, localAddr, remoteAddr, route.SourceHint, route.Gateway, netProto, multicastLoop, route.MTU); r != nil {
+				if r := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(nic, localAddr, remoteAddr, route.SourceHint, route.Gateway, netProto, multicastLoop, route.MTU); r != nil { // +checklocksforce: the loop body runs with s.mu held
 					return r
 				}
 			}

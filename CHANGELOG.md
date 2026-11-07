@@ -4,8 +4,13 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
+### Tests
+
+- **gVisor analyzers in CI**: the job `build, vet, and audit` now runs `checklocks`, `checkconst`, and `checklinkname` on every package for the five targets. A lock annotation violation, a changed assembly offset, or a mismatched `//go:linkname` fails CI. `scripts/gvisorlint.sh` runs the same check locally, and `docs/gvisorlint.md` states how to fix a finding. The first run reported annotation gaps and lock calls that tests skip. It led to the annotations `+checklocksacquire`, `+checklocksrelease`, and `+checklocksforce` on lock helpers, closures, and `TryLock` calls, and it split the atomic policies of `Stack.fib` from the rules that `routeMu` guards.
+
 ### Bug Fixes
 
+- **Memory accounting of each sandbox**: a process that runs two sandboxes gave one memory accounting to both. The memory cgroups of two sandboxes have the same IDs, so `memory.current`, `memory.stat`, the root `memory.stat`, and `AnonPages` of `/proc/meminfo` showed the memory of both sandboxes. The `memory.max` enforcer of a sandbox ended a process that used less than its limit when another sandbox held memory in a cgroup with the same ID. Each sandbox now has an accounting that belongs to its memory file. The readers, the enforcer, the memory guard, and the WireGuard memory charge use it. `TestE2EMemoryAccountingIsPerSandbox` runs the case on every backend.
 - **Engine fault of the right sandbox**: the SDK kept the cause of the last engine fault in one variable for the whole process. A process that runs two sandboxes could return `ErrEngineFault` with the cause of the other sandbox. It could also return the exit code 137 without the error, because the other sandbox started and cleared the cause. The kernel of each sandbox now keeps its own cause (`kernel.Kernel.TakeEngineFault`), and the SDK reads it from the kernel of the sandbox that ended.
 
 ## [v0.10.10012026110200] - 2026-11-07

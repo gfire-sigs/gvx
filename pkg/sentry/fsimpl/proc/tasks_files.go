@@ -307,7 +307,7 @@ func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	k := kernel.KernelFromContext(ctx)
 	mf := k.MemoryFile()
 	_ = mf.UpdateUsage(nil) // Best effort
-	snapshot, totalUsage := usage.MemoryAccounting.Copy()
+	snapshot, totalUsage := mf.Accounting().Copy()
 	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
 	if reported, ok := k.ReportedMemory(); ok {
 		totalSize = reported
