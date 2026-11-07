@@ -165,7 +165,7 @@ func (t *neighborTable) snapshot() []*neighborCache {
 func (t *neighborTable) entries() int32 {
 	var total int32
 	for _, c := range t.snapshot() {
-		total += c.mu.dynamic.count.Load()
+		total += c.mu.dynamic.count.Load() // +checklocksforce: count is atomic, and the table reads it without the lock
 	}
 	return total
 }

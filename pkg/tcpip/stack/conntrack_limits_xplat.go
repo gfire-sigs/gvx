@@ -352,11 +352,11 @@ func (ct *ConnTrack) removeConn(cn *conn) bool {
 	if cn.released.Load() != 0 {
 		return false
 	}
-	buckets[orig].tuples.Remove(&cn.original)
+	buckets[orig].tuples.Remove(&cn.original) // +checklocksforce: orig is lo or hi, and this function holds both locks
 	// A connection that has the same original and reply tuple has no tuple
 	// of the reply in the table. See finalize.
 	if cn.original.tupleID != replyID {
-		buckets[repl].tuples.Remove(&cn.reply)
+		buckets[repl].tuples.Remove(&cn.reply) // +checklocksforce: repl is lo or hi, and this function holds both locks
 	}
 	ct.release(cn)
 	return true

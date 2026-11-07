@@ -105,12 +105,16 @@ var (
 	ErrRouteNotFound = errors.New("route not found")
 )
 
-// fibState holds the routing rules of a stack. A nil slice stands for the
+// fibRules holds the routing rules of a stack. A nil slice stands for the
 // default rules, so a stack needs no setup code. Both slices are sorted by
-// priority, and routeMu guards them.
-type fibState struct {
+// priority, and Stack.routeMu guards them.
+type fibRules struct {
 	rules4, rules6 []PolicyRule
+}
 
+// fibState holds the policies, the counters, and the snapshots of a stack that
+// a reader uses without routeMu. Every field is atomic.
+type fibState struct {
 	// proxyARP is the policy for proxy ARP. See proxyarp_xplat.go.
 	proxyARP atomic.Pointer[ProxyARPPolicy]
 	// rpFilter is the policy for the reverse path check of received IPv4
@@ -142,7 +146,7 @@ var (
 	defaultRules6 = defaultRules4[:2]
 )
 
-func (f *fibState) rulesOf(v6 bool) []PolicyRule {
+func (f *fibRules) rulesOf(v6 bool) []PolicyRule {
 	switch {
 	case v6 && f.rules6 != nil:
 		return f.rules6
@@ -154,7 +158,7 @@ func (f *fibState) rulesOf(v6 bool) []PolicyRule {
 	return defaultRules4
 }
 
-func (f *fibState) setRules(v6 bool, rules []PolicyRule) {
+func (f *fibRules) setRules(v6 bool, rules []PolicyRule) {
 	if rules == nil {
 		rules = []PolicyRule{}
 	}
@@ -173,7 +177,7 @@ func isV6Protocol(proto tcpip.NetworkProtocolNumber) bool {
 func (s *Stack) Rules(proto tcpip.NetworkProtocolNumber) []PolicyRule {
 	s.routeMu.RLock()
 	defer s.routeMu.RUnlock()
-	return slices.Clone(s.fib.rulesOf(isV6Protocol(proto)))
+	return slices.Clone(s.fibRules.rulesOf(isV6Protocol(proto)))
 }
 
 // RuleInsert tells AddRule how to treat an equal rule.
@@ -192,7 +196,7 @@ type RuleInsert struct {
 func (s *Stack) DefaultRulePriority(proto tcpip.NetworkProtocolNumber) uint32 {
 	s.routeMu.RLock()
 	defer s.routeMu.RUnlock()
-	rules := s.fib.rulesOf(isV6Protocol(proto))
+	rules := s.fibRules.rulesOf(isV6Protocol(proto))
 	if len(rules) > 1 && rules[1].Priority > 0 {
 		return rules[1].Priority - 1
 	}
@@ -207,7 +211,7 @@ func (s *Stack) AddRule(proto tcpip.NetworkProtocolNumber, r PolicyRule, mode Ru
 	}
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
-	rules := s.fib.rulesOf(v6)
+	rules := s.fibRules.rulesOf(v6)
 	if mode.Excl && slices.ContainsFunc(rules, func(have PolicyRule) bool { return have.sameAs(&r) }) {
 		return ErrRuleExists
 	}
@@ -218,7 +222,7 @@ func (s *Stack) AddRule(proto tcpip.NetworkProtocolNumber, r PolicyRule, mode Ru
 			break
 		}
 	}
-	s.fib.setRules(v6, slices.Insert(slices.Clone(rules), at, r))
+	s.fibRules.setRules(v6, slices.Insert(slices.Clone(rules), at, r))
 	return nil
 }
 
@@ -271,13 +275,13 @@ func (s *Stack) DeleteRule(proto tcpip.NetworkProtocolNumber, m RuleMatch) (Poli
 	v6 := isV6Protocol(proto)
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
-	rules := s.fib.rulesOf(v6)
+	rules := s.fibRules.rulesOf(v6)
 	i := slices.IndexFunc(rules, func(r PolicyRule) bool { return m.matches(&r) })
 	if i < 0 {
 		return PolicyRule{}, ErrRuleNotFound
 	}
 	removed := rules[i]
-	s.fib.setRules(v6, slices.Delete(slices.Clone(rules), i, i+1))
+	s.fibRules.setRules(v6, slices.Delete(slices.Clone(rules), i, i+1))
 	return removed, nil
 }
 
@@ -439,10 +443,10 @@ func rejectError(t tcpip.RouteType) tcpip.Error {
 // +checklocksread:s.routeMu
 func (s *Stack) fibRoutes(l *routeLookup) iter.Seq[*tcpip.Route] {
 	return func(yield func(*tcpip.Route) bool) {
-		rules := s.fib.rulesOf(l.v6)
+		rules := s.fibRules.rulesOf(l.v6) // +checklocksforce: the caller of fibRoutes holds s.routeMu
 		for i := 0; i < len(rules); i++ {
 			r := &rules[i]
-			if !s.ruleMatches(r, l) {
+			if !s.ruleMatches(r, l) { // +checklocksforce: the caller of fibRoutes holds s.mu
 				continue
 			}
 			switch r.Action {
@@ -451,10 +455,10 @@ func (s *Stack) fibRoutes(l *routeLookup) iter.Seq[*tcpip.Route] {
 				// table local, which the default rule 0 names, has none, and
 				// the scan of the list for it would cost as much as the
 				// whole list.
-				if !s.tableHasRoutes(r.Table) {
+				if !s.tableHasRoutes(r.Table) { // +checklocksforce: the caller of fibRoutes holds s.routeMu
 					continue
 				}
-				if !s.walkTable(r.Table, r.SuppressPrefixLen, l, yield) {
+				if !s.walkTable(r.Table, r.SuppressPrefixLen, l, yield) { // +checklocksforce: the caller of fibRoutes holds s.routeMu
 					return
 				}
 			case RuleActionGoto:
@@ -678,7 +682,7 @@ func (s *Stack) LookupRoute(flow RouteFlow, outputNIC tcpip.NICID, src, dst tcpi
 		if outputNIC != 0 && route.NIC != outputNIC {
 			continue
 		}
-		if nic, ok := s.nics[route.NIC]; !ok || !nic.Enabled() {
+		if nic, ok := s.nics[route.NIC]; !ok || !nic.Enabled() { // +checklocksforce: the loop body runs with s.mu held
 			continue
 		}
 		return *route, nil
@@ -727,7 +731,7 @@ func (s *Stack) ReversePathValid(inNIC tcpip.NICID, src, dst tcpip.Address, mark
 	l := newRouteLookup(RouteFlow{Mark: mark}, 0, from, src, proto)
 	linkLocal := header.IsV6LinkLocalUnicastAddress(src)
 	for route := range s.fibRoutes(&l) {
-		if _, ok := s.nics[route.NIC]; !ok {
+		if _, ok := s.nics[route.NIC]; !ok { // +checklocksforce: the loop body runs with s.mu held
 			continue
 		}
 		if linkLocal && route.NIC != inNIC {
