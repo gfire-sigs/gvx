@@ -4,6 +4,10 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
+### Tests
+
+- **gVisor analyzers in CI**: the job `build, vet, and audit` now runs `checklocks`, `checkconst`, and `checklinkname` on every package for the five targets. A lock annotation violation, a changed assembly offset, or a mismatched `//go:linkname` fails CI. `scripts/gvisorlint.sh` runs the same check locally, and `docs/gvisorlint.md` states how to fix a finding. The first run reported annotation gaps and lock calls that tests skip. It led to the annotations `+checklocksacquire`, `+checklocksrelease`, and `+checklocksforce` on lock helpers, closures, and `TryLock` calls, and it split the atomic policies of `Stack.fib` from the rules that `routeMu` guards.
+
 ### Bug Fixes
 
 - **arm64 floating point state after a signal**: in `v0.10.10002026110200` a signal and its `sigreturn` corrupted the floating point registers of an arm64 guest. On a Linux host, FPSR and FPCR became `0x46508001` and `0x210`, so the divide-by-zero trap was on and `1.0/0.0` raised `SIGFPE` on a CPU that traps. On macOS, the low 64 bits of V0 changed. The signal frame code read the floating point state as a whole `fpsimd_context` record, but the platforms keep only its body, and `hvf` kept V0 to V31 first. Every arm64 platform now keeps FPSR, FPCR, and V0 to V31 in this order, and the signal frame code converts the fields one by one. `rungv` with `systrap` inside a `gvx` guest on arm64 also gets the right floating point state in its stub.
