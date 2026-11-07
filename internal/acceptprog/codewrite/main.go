@@ -29,6 +29,9 @@
 //     threads change the permissions and the mapping of the pages beside them,
 //     and a swapper replaces the page that a runner executes by a mapping of
 //     a memory file,
+//   - threads that call the system call functions of the program while another
+//     thread makes their pages writable, writes a byte back to itself, and makes
+//     them executable only,
 //   - read(2) and write(2) into a shared mapping of a file on each directory
 //     that a dir= argument names, for example a bind mount and a volume.
 //
@@ -81,6 +84,7 @@ func main() {
 		{"write-to-executed-file", checkWriteToExecutedFile},
 		{"process-vm-writev", checkProcessVMWritev},
 		{"code-churn-threads", checkCodeChurn},
+		{"code-text-toggle", checkTextToggle},
 	}
 	for _, arg := range os.Args[1:] {
 		dir, ok := strings.CutPrefix(arg, "dir=")

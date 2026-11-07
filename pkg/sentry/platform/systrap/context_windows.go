@@ -134,10 +134,13 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 	}
 	for {
 		if c.kicked.Load() {
-			// The thread is parked and ac still holds its state.
+			// The thread is parked and ac still holds its state. It will not
+			// run at the address that start chose.
+			th.clearRestart()
 			return nil, hostarch.NoAccess, platform.ErrContextInterrupt
 		}
 		if err := th.run(); err != nil {
+			th.clearRestart()
 			return nil, hostarch.NoAccess, c.runErr(as, err)
 		}
 		// Switch tests the flag after it starts the thread, and a kick tests the
@@ -389,6 +392,13 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 				patched = true
 			}
 			if raced && !patched {
+				if next := th.resumePC(pc); next != pc {
+					th.ctx.setPC(next)
+					if err := th.continueEvent(ev); err != nil {
+						return fatal(err, unix.EFAULT)
+					}
+					return running
+				}
 				if err := th.continueUnchanged(ev); err != nil {
 					return fatal(err, unix.EFAULT)
 				}

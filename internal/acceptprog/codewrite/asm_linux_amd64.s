@@ -21,3 +21,11 @@ TEXT ·callCode(SB), NOSPLIT, $0-20
 	CALL AX
 	MOVL AX, ret+16(FP)
 	RET
+
+// func storeByte(addr uintptr, v byte)
+// storeByte stores v at addr without a load.
+TEXT ·storeByte(SB), NOSPLIT, $0-9
+	MOVQ addr+0(FP), AX
+	MOVB v+8(FP), CX
+	MOVB CX, (AX)
+	RET

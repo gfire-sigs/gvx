@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -103,6 +104,12 @@ type archThread struct {
 		sum uint64
 		n   int
 	}
+	// restartPC is the guest address where the Sentry continued the thread in
+	// place. The thread fetches its bytes later, from the block that is current
+	// then. A patch of the block must not cover a byte behind the first byte of
+	// this address with a JMP. It is zero when the thread continued in a slot,
+	// and after the thread stops. continueAt writes it under as.mu.
+	restartPC atomic.Uint64
 }
 
 func configureArch() {}
@@ -193,14 +200,7 @@ func (th *thread) archStart(ac *arch.Context64) error {
 // pre-window continues in the entry code of the slot. The Sentry sets that
 // program counter to restart a system call, after the relocated instructions
 // ran. The slot keeps a restart on the fast path.
-func (th *thread) startPC(pc uint64) uint64 {
-	if as := th.sp.owner.Load(); as != nil {
-		if entry, ok := as.relocatedEntry(pc, true, th.slotReader()); ok {
-			return entry
-		}
-	}
-	return th.resumePC(pc)
-}
+func (th *thread) startPC(pc uint64) uint64 { return th.continueAt(pc, true) }
 
 // resumePC returns the address where a thread continues for the guest program
 // counter pc. The return address of a SYSCALL that became a JMP lies inside the
@@ -210,29 +210,96 @@ func (th *thread) startPC(pc uint64) uint64 {
 // instructions of a pre-window lie inside the JMP too. A thread that starts at
 // one of them, for example after a fault in it, continues at the same
 // instruction in the slot.
-func (th *thread) resumePC(pc uint64) uint64 {
+func (th *thread) resumePC(pc uint64) uint64 { return th.continueAt(pc, false) }
+
+// continueAt returns the address where the thread continues for the guest
+// program counter pc. With syscall set, a thread at the SYSCALL of a pre-window
+// continues in the entry code of the slot.
+//
+// A thread that continues at pc itself fetches the bytes of pc later, from the
+// block that is current then. The block can have no patched copy now, and
+// another thread can patch it before the fetch. A JMP of that patch can cover
+// pc, and the thread would run the bytes of the JMP as code. continueAt
+// therefore records pc in the same critical section that decides the
+// translation, and the install of a patch reads the records under the same
+// lock (see restartInsideLocked).
+func (th *thread) continueAt(pc uint64, syscall bool) uint64 {
 	as := th.sp.owner.Load()
 	if as == nil {
 		return pc
 	}
-	if entry, ok := as.relocatedEntry(pc, false, th.slotReader()); ok {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	reader := th.slotReader()
+	if entry, ok := as.relocatedEntryLocked(pc, syscall, reader); ok {
+		th.restartPC.Store(0)
 		return entry
 	}
-	if tail, ok := as.jumpTail(pc, th.slotReader()); ok {
+	if tail, ok := as.jumpTailLocked(pc, reader); ok {
+		th.restartPC.Store(0)
 		return tail
 	}
+	th.restartPC.Store(pc)
 	return pc
 }
 
-// relocatedEntry returns the address in a pre-window slot where a thread
+// continuationsIn returns the addresses in the block at base where a thread
+// continues in place, or where the tail of a slot that a thread can still run
+// continues. A patch of the block must not cover a byte behind the first byte
+// of such an address with a JMP. The list is empty in almost every call.
+func (as *addressSpace) continuationsIn(base uint64) []uint64 {
+	var out []uint64
+	as.sp.mu.Lock()
+	for _, th := range as.sp.threads {
+		if pc := th.restartPC.Load(); pc-base < blockSize {
+			out = append(out, pc)
+		}
+	}
+	as.sp.mu.Unlock()
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	for _, isl := range as.islands {
+		isl.resumes(func(pc uint64) {
+			if pc-base < blockSize {
+				out = append(out, pc)
+			}
+		})
+	}
+	return out
+}
+
+// clearRestart ends the record of continueAt for a thread that does not run.
+func (th *thread) clearRestart() { th.restartPC.Store(0) }
+
+// restartInsideLocked reports whether a thread continues at an address inside
+// one of the spans of a patch for the block at base. Callers hold as.mu, which
+// also orders the records that continueAt writes.
+func (as *addressSpace) restartInsideLocked(base uint64, spans []patchSpan) bool {
+	if len(spans) == 0 {
+		return false
+	}
+	as.sp.mu.Lock()
+	defer as.sp.mu.Unlock()
+	for _, th := range as.sp.threads {
+		pc := th.restartPC.Load()
+		if pc-base >= blockSize {
+			continue
+		}
+		if slices.ContainsFunc(spans, func(s patchSpan) bool { return int(pc-base) >= s.lo && int(pc-base) < s.hi }) {
+			return true
+		}
+	}
+	return false
+}
+
+// relocatedEntryLocked returns the address in a pre-window slot where a thread
 // continues when it starts at the guest address pc. It returns false when pc is
 // not a relocated instruction of a pre-window. With syscall set, it also
 // returns the entry code of the slot for the SYSCALL of a pre-window. The
 // thread that starts at the entry holds the slot as its pin (reader), because a
-// drop and a reuse of the slot can follow before the thread runs.
-func (as *addressSpace) relocatedEntry(pc uint64, syscall bool, reader *epochReader) (uint64, bool) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
+// drop and a reuse of the slot can follow before the thread runs. Callers hold
+// as.mu.
+func (as *addressSpace) relocatedEntryLocked(pc uint64, syscall bool, reader *epochReader) (uint64, bool) {
 	blk := as.blocks[blockRound(pc)]
 	if blk == nil || blk.state != blockExec {
 		return 0, false
@@ -265,13 +332,12 @@ func (th *thread) guestPC(pc uint64) uint64 {
 	return pc
 }
 
-// jumpTail returns the slot tail for the return address pc of a SYSCALL that
-// became a JMP. The JMP overwrote the bytes at pc, so the thread must continue
-// in the slot instead. The thread that starts at the tail holds the slot as its
-// pin (reader), as relocatedEntry explains.
-func (as *addressSpace) jumpTail(pc uint64, reader *epochReader) (uint64, bool) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
+// jumpTailLocked returns the slot tail for the return address pc of a SYSCALL
+// that became a JMP. The JMP overwrote the bytes at pc, so the thread must
+// continue in the slot instead. The thread that starts at the tail holds the
+// slot as its pin (reader), as relocatedEntryLocked explains. Callers hold
+// as.mu.
+func (as *addressSpace) jumpTailLocked(pc uint64, reader *epochReader) (uint64, bool) {
 	blk := as.blocks[blockRound(pc)]
 	if blk == nil || blk.state != blockExec || pc-blk.base < winSiteLen {
 		return 0, false
@@ -303,6 +369,9 @@ func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) err
 
 // archEvent serves the stops that only amd64 has: the traps of patched sites.
 func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent) (outcome, bool) {
+	// The thread stopped, so it no longer runs at the address of its last
+	// start. A stop that continues the thread records the next address again.
+	th.restartPC.Store(0)
 	if ev.Code != statusBreakpoint || ev.State == dbgStateSingleStep {
 		return outcome{}, false
 	}
@@ -646,16 +715,16 @@ func archStatsLine() string {
 // compiler keeps beside its code. The guest reads the bytes of the copy that
 // runs, and the scan finds false sites in that data, so a patch would change
 // the data.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, writable bool) (map[uint16]siteInfo, []winSlotRef, error) {
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, writable bool, continuations []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, error) {
 	before := as.neighborBytes(base, true, amd64ScanLead)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
 	found := scanAMD64GS(before, page, after, true)
 	if len(found) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	scope := as.p.scopeOf(ctx, mm, base)
 	if writable && scope.none {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var plan *jmpPlanner
 	if as.p.fast {
@@ -665,9 +734,13 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		jmpBefore := as.neighborBytes(base, true, winJmpNeighborLen)
 		jmpAfter := as.neighborBytes(base, false, winJmpNeighborLen)
 		plan = newJmpPlanner(jmpBefore, append([]byte(nil), page...), jmpAfter)
+		for _, pc := range continuations {
+			plan.restartAt(int(pc - base))
+		}
 	}
 	var keep []amd64Site
 	var slots []winSlotRef
+	var spans []patchSpan
 	sites := make(map[uint16]siteInfo, len(found))
 	// jumpEnd is the end of the bytes that the last JMP patch owns. prevEnd is
 	// the end of every site that the loop met. A pre-window patch must not
@@ -701,12 +774,14 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 						jumpEnd = end
 						sites[uint16(s.Offset)] = siteInfo{kind: winSiteJump, tail: tail}
 						slots = append(slots, ref)
+						spans = append(spans, patchSpan{s.Offset + 1, end})
 						continue
 					}
 				case planPre:
 					if pw, ok := as.patchJumpBefore(ctx, mm, base, page, s.Offset, pl); ok {
 						jumpEnd = s.Offset
 						slots = append(slots, pw.ref)
+						spans = append(spans, patchSpan{pw.start + 1, s.Offset})
 						maps.Copy(sites, preWindowSites(pw.start, pw.slotVA, pw.insn, s))
 						keep = append(keep, s)
 						continue
@@ -717,6 +792,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			case amd64SiteRDFSBASE, amd64SiteRDGSBASE:
 				if ref, ok := as.patchTLSBaseJump(ctx, mm, base, plan, page, s); ok {
 					slots = append(slots, ref)
+					spans = append(spans, patchSpan{s.Offset + 1, s.Offset + s.Len})
 					continue
 				}
 			case amd64SiteGSMem:
@@ -731,6 +807,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 						disp:    gp.disp,
 					}
 					slots = append(slots, ref)
+					spans = append(spans, patchSpan{s.Offset + 1, s.Offset + s.Len})
 					continue
 				}
 			}
@@ -744,9 +821,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		as.mu.Lock()
 		discardSlotRefsLocked(slots)
 		as.mu.Unlock()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return sites, slots, nil
+	return sites, slots, spans, nil
 }
 
 // patchJump replaces the SYSCALL at offset off of page and the bytes behind it
@@ -755,7 +832,9 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 // when the site keeps its trap.
 func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, off int, reloc []byte) (int, uint64, winSlotRef, bool) {
 	site := base + uint64(off)
-	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winSlotSize), func(buf []byte, slotVA uint64) error {
+	rec := plainSlot(site, winSlotSize)
+	rec.resume = site + winSiteLen + uint64(len(reloc))
+	slotVA, ref, err := as.installSlot(ctx, mm, rec, func(buf []byte, slotVA uint64) error {
 		return encodeWinSlot(buf, slotVA, site, as.p.spillVA(), reloc)
 	})
 	if err == nil {
@@ -795,7 +874,7 @@ func (as *addressSpace) patchJumpBefore(ctx context.Context, mm platform.MemoryM
 		return preWindowPatch{}, false
 	}
 	site, jmpVA := base+uint64(off), base+uint64(pl.start)
-	rec := islandSlot{site: site, size: winSlotSize, jmpVA: jmpVA, insn: insn}
+	rec := islandSlot{site: site, size: winSlotSize, jmpVA: jmpVA, resume: site + winSiteLen, insn: insn}
 	slotVA, ref, err := as.installSlot(ctx, mm, rec, func(buf []byte, slotVA uint64) error {
 		return encodeWinPreSlot(buf, slotVA, site, as.p.spillVA(), pl.reloc)
 	})
@@ -910,7 +989,10 @@ func newWinTrap(site uint64, _ *winRegs) winTrap {
 }
 
 // archFastTrap adds the amd64 state to the registers of a fast trap.
-func (th *thread) archFastTrap(*arch.Context64) { th.fsFix.n = 0 }
+func (th *thread) archFastTrap(*arch.Context64) {
+	th.fsFix.n = 0
+	th.restartPC.Store(0)
+}
 
 // archFastHot reports whether the thread can resume without a debug stop. The
 // stub loads the FS base on every return.

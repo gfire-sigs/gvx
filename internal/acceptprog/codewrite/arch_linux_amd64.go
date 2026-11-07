@@ -89,3 +89,4 @@ func codeAliasPatch() []byte {
 func syncICache(uintptr, int) {}
 
 func callCode(fn, arg uintptr) uint32
+func storeByte(addr uintptr, v byte)

@@ -138,6 +138,17 @@ func (th *thread) archStart(ac *arch.Context64) error {
 // the instruction behind it.
 func (th *thread) resumePC(pc uint64) uint64 { return pc }
 
+// clearRestart does nothing on arm64, because a thread never continues inside
+// a patch.
+func (th *thread) clearRestart() {}
+
+// continuationsIn returns no address on arm64, because a patch is one word and
+// never covers an address where a thread continues.
+func (as *addressSpace) continuationsIn(uint64) []uint64 { return nil }
+
+// restartInsideLocked reports false on arm64 for the same reason.
+func (as *addressSpace) restartInsideLocked(uint64, []patchSpan) bool { return false }
+
 // guestPC returns pc unchanged on arm64, because a slot relocates no
 // instruction of the guest.
 func (th *thread) guestPC(pc uint64) uint64 { return pc }
@@ -319,7 +330,7 @@ type siteInfo struct {
 // aligned word has no marker that tells code from data. A data word that
 // equals one of the 289 patched encodings changes in the copy that the guest
 // reads. A word matches with a probability of 289 in 2^32 for uniform data.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool) (map[uint16]siteInfo, []winSlotRef, error) {
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool, _ []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, error) {
 	sites := make(map[uint16]siteInfo)
 	var slots []winSlotRef
 	for _, s := range scanARM64(page) {
@@ -366,7 +377,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			binary.LittleEndian.PutUint32(page[off:], arm64NOP)
 		}
 	}
-	return sites, slots, nil
+	return sites, slots, nil, nil
 }
 
 // fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and

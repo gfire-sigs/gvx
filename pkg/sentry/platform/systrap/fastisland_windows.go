@@ -77,8 +77,10 @@ import (
 //  6. A hot resume runs the tail of the slot of the trap, whether the slot is
 //     Live or Quarantined. Rule 5 keeps the bytes until the thread traps or
 //     parks again. The tail jumps to the code behind the patched bytes of the
-//     site. That address is valid in every later patch of the same code. The
-//     Sentry never turns a hot resume into a cold one because the block dropped.
+//     site (islandSlot.resume). A later patch of the block keeps that address
+//     valid while the slot is Live or Quarantined, because patchBlock gives the
+//     address to the planner. The Sentry never turns a hot resume into a cold
+//     one because the block dropped.
 //  7. allocSlot fails when no island has room and the quarantine holds
 //     winQuarantineLimit units or more. The site then keeps its trap. One drop
 //     can push the quarantine past the limit.

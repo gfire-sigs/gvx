@@ -1809,3 +1809,34 @@ func TestSpillAlwaysRestoreLoadsOnACleanHotSpinHit(t *testing.T) {
 		t.Error("the always-restore routine did not load the image on a clean hot spin hit")
 	}
 }
+
+// TestPlanSiteKeepsTheBytesWhereAThreadContinues checks that the plan treats an
+// address where a thread continues in place as a branch target: no patch
+// overwrites a byte behind the first byte of a JMP that covers it.
+func TestPlanSiteKeepsTheBytesWhereAThreadContinues(t *testing.T) {
+	const at = corpusDefaultAt
+	code := catBytes(nops(64), []byte{0x0F, 0x05}, []byte{0x48, 0xFF, 0xC3}, []byte{0xC3}) // syscall; inc rbx; ret
+	site := at + 64
+	for _, c := range []struct {
+		name    string
+		restart int
+		want    bool // the plan is a post window
+	}{
+		{"none", -1, true},
+		{"at the SYSCALL", site, true},
+		{"behind the SYSCALL", site + winSiteLen, false},
+		{"inside the JMP", site + winJmpLen - 1, false},
+		{"behind the JMP", site + winJmpLen, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := newJmpPlanner(nil, pageWith(at, code...), nil)
+			if c.restart >= 0 {
+				p.restartAt(c.restart)
+			}
+			got := p.planSite(site, 0)
+			if post := got.kind == planPost; post != c.want {
+				t.Errorf("plan = %s, want a post window: %v", got.kind, c.want)
+			}
+		})
+	}
+}
