@@ -27,6 +27,7 @@ import (
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/pinring"
+	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -217,6 +218,9 @@ type MemoryManager interface {
 	AddressSpace() AddressSpace
 	// FindVMAByName finds a vma with the specified name.
 	FindVMAByName(ar hostarch.AddrRange, hint string) (hostarch.Addr, uint64, error)
+	// WithPinnedMappings calls f with the internal mappings of a range while
+	// no call can unmap or replace the range.
+	WithPinnedMappings(ctx context.Context, addr hostarch.Addr, length int, f func(safemem.BlockSeq) error) error
 }
 
 // Context represents the execution context for a single thread.

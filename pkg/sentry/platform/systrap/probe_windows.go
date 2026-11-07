@@ -24,6 +24,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/usermem"
@@ -48,6 +49,12 @@ func (m *probeMM) AddressSpace() platform.AddressSpace { return m.as }
 
 func (*probeMM) FindVMAByName(hostarch.AddrRange, string) (hostarch.Addr, uint64, error) {
 	return 0, 0, unix.ENOENT
+}
+
+// WithPinnedMappings fails, because the probe has no memory manager that
+// holds mappings.
+func (*probeMM) WithPinnedMappings(context.Context, hostarch.Addr, int, func(safemem.BlockSeq) error) error {
+	return unix.ENOSYS
 }
 
 // installCode maps one page of guest code, patched at once, without a memory

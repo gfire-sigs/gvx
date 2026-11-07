@@ -33,6 +33,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
@@ -71,6 +72,10 @@ func (m *testMM) AddressSpace() platform.AddressSpace { return m.as }
 
 func (*testMM) FindVMAByName(hostarch.AddrRange, string) (hostarch.Addr, uint64, error) {
 	return 0, 0, unix.ENOENT
+}
+
+func (*testMM) WithPinnedMappings(context.Context, hostarch.Addr, int, func(safemem.BlockSeq) error) error {
+	return unix.ENOSYS
 }
 
 type rig struct {
