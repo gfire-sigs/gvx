@@ -334,14 +334,14 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 				ma.commitSeq = 0
 				f.knownCommittedBytes += amount
 				if !f.opts.DisableMemoryAccounting {
-					usage.MemoryAccounting.Inc(amount, ma.kind, ma.memCgID)
+					f.Accounting().Inc(amount, ma.kind, ma.memCgID)
 				}
 			} else {
 				ma.knownCommitted = false
 				ma.commitSeq = f.commitSeq
 				f.knownCommittedBytes -= amount
 				if !f.opts.DisableMemoryAccounting {
-					usage.MemoryAccounting.Dec(amount, ma.kind, ma.memCgID)
+					f.Accounting().Dec(amount, ma.kind, ma.memCgID)
 				}
 			}
 			maseg = f.memAcct.Unisolate(maseg)
@@ -1306,7 +1306,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		// over on accounting scans.
 		f.knownCommittedBytes += amount
 		if !f.opts.DisableMemoryAccounting {
-			usage.MemoryAccounting.Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
+			f.Accounting().Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
 		}
 	}
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)

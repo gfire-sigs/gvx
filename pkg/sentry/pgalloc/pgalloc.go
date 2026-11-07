@@ -394,8 +394,14 @@ type MemoryFileOpts struct {
 	AdviseNoHugepage bool
 
 	// If DisableMemoryAccounting is true, memory usage observed by the
-	// MemoryFile will not be reported in usage.MemoryAccounting.
+	// MemoryFile will not be reported in usage.MemoryAccounting or in
+	// Accounting.
 	DisableMemoryAccounting bool
+
+	// Accounting, if not nil, receives the memory usage observed by the
+	// MemoryFile instead of usage.MemoryAccounting. A process that runs more
+	// than one Sentry kernel gives each MemoryFile its own Accounting.
+	Accounting *usage.MemoryLocked
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -788,7 +794,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 					ma.commitSeq = f.commitSeq
 					f.knownCommittedBytes -= malen
 					if !f.opts.DisableMemoryAccounting {
-						usage.MemoryAccounting.Dec(malen, usage.System, ma.memCgID)
+						f.Accounting().Dec(malen, usage.System, ma.memCgID)
 					}
 				}
 				ma.kind = alloc.opts.Kind
@@ -1135,7 +1141,7 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 			malen := maseg.Range().Length()
 			f.knownCommittedBytes -= malen
 			if !f.opts.DisableMemoryAccounting {
-				usage.MemoryAccounting.Dec(malen, ma.kind, ma.memCgID)
+				f.Accounting().Dec(malen, ma.kind, ma.memCgID)
 			}
 		}
 		// Update commitSeq to invalidate any observations made by
@@ -1305,7 +1311,7 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 				f.memAcct.MutateFullRange(wasteFR, func(maseg memAcctIterator) bool {
 					ma := maseg.ValuePtr()
 					if !f.opts.DisableMemoryAccounting && ma.knownCommitted {
-						usage.MemoryAccounting.Move(maseg.Range().Length(), usage.System, ma.kind, ma.memCgID)
+						f.Accounting().Move(maseg.Range().Length(), usage.System, ma.kind, ma.memCgID)
 					}
 					ma.kind = usage.System
 					ma.wasteOrReleasing = true
@@ -1394,7 +1400,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 				malen := maseg.Range().Length()
 				f.knownCommittedBytes -= malen
 				if !f.opts.DisableMemoryAccounting {
-					usage.MemoryAccounting.Dec(malen, ma.kind, ma.memCgID)
+					f.Accounting().Dec(malen, ma.kind, ma.memCgID)
 				}
 			}
 			maseg = f.memAcct.Remove(maseg).NextSegment()
@@ -1822,7 +1828,7 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 						ma.commitSeq = 0
 						f.knownCommittedBytes += amount
 						if !f.opts.DisableMemoryAccounting {
-							usage.MemoryAccounting.Inc(amount, ma.kind, ma.memCgID)
+							f.Accounting().Inc(amount, ma.kind, ma.memCgID)
 						}
 						changedAny = true
 					}

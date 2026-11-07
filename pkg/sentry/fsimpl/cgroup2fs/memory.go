@@ -26,7 +26,6 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
-	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
@@ -143,7 +142,7 @@ func getUsage(k *kernel.Kernel, memCgIDs map[uint32]struct{}) uint64 {
 	k.MemoryFile().UpdateUsage(memCgIDs)
 	var totalBytes uint64
 	for id := range memCgIDs {
-		_, bytes := usage.MemoryAccounting.CopyPerCg(id)
+		_, bytes := k.MemoryFile().Accounting().CopyPerCg(id)
 		totalBytes += bytes
 	}
 	return totalBytes

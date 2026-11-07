@@ -30,7 +30,7 @@ func Sysinfo(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	if err != nil {
 		return 0, nil, err
 	}
-	memStats, _ := usage.MemoryAccounting.Copy()
+	memStats, _ := mf.Accounting().Copy()
 	totalUsage := mfUsage + memStats.Mapped
 	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
 	if reported, ok := t.Kernel().ReportedMemory(); ok {
