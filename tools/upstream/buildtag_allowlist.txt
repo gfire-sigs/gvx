@@ -372,6 +372,12 @@ seam pkg/sentry/arch/signal_amd64.go
 # A host kernel that is a Sentry may give a page fault no error code or ESR value. The platform context
 # infers the access of such a fault (pkg/sentry/platform/systrap/fault_access_xplat.go).
 seam pkg/sentry/platform/systrap/systrap.go
+# Content seam: the three writes of one syscall patch or unpatch all reach the frames that back the
+# site, even when another thread replaces the mapping between two writes (usertrap rewriteSite). The
+# call goes through platform.MemoryManager.WithPinnedMappings, which pkg/sentry/mm/pinned_xplat.go
+# implements.
+seam pkg/sentry/platform/platform.go
+seam pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go
 # Content seam: uc_stack.ss_flags of a signal frame has SS_ONSTACK only when the interrupted code
 # ran on the alternate stack, as __save_altstack in Linux sets it. The seam is in
 # deliverSignalToHandler.

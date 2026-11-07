@@ -28,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/memutil"
+	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -72,6 +73,10 @@ func (s *stubMemoryManager) AddressSpace() platform.AddressSpace { return s.as }
 
 func (s *stubMemoryManager) FindVMAByName(hostarch.AddrRange, string) (hostarch.Addr, uint64, error) {
 	return 0, 0, nil
+}
+
+func (s *stubMemoryManager) WithPinnedMappings(context.Context, hostarch.Addr, int, func(safemem.BlockSeq) error) error {
+	return nil
 }
 
 func newTestPlatform(t testing.TB) *Platform {
