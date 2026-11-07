@@ -25,10 +25,11 @@ type stopServer struct {
 	workers     sync.WaitGroup
 	accepted    chan struct{}
 	draining    chan struct{}
+	exitGrace   time.Duration
 }
 
 func newStopServer(listener net.Listener, state *controlState, token [32]byte, timeout time.Duration) *stopServer {
-	s := &stopServer{listener: listener, state: state, token: token, timeout: timeout, connections: make(map[net.Conn]time.Time), accepted: make(chan struct{}), draining: make(chan struct{})}
+	s := &stopServer{listener: listener, state: state, token: token, timeout: timeout, connections: make(map[net.Conn]time.Time), accepted: make(chan struct{}), draining: make(chan struct{}), exitGrace: listenerExitGrace}
 	go s.accept()
 	go func() {
 		defer close(s.draining)
@@ -105,7 +106,16 @@ func (s *stopServer) close(ctx context.Context) error {
 	if errors.Is(err, net.ErrClosed) {
 		err = nil
 	}
-	<-s.accepted
+	select {
+	case <-s.accepted:
+	case <-ctx.Done():
+		// A listener that cannot close leaves the accept goroutine in Accept.
+		select {
+		case <-s.accepted:
+		case <-time.After(s.exitGrace):
+			err = errors.Join(err, errListenerStuck)
+		}
+	}
 	<-s.draining
 	deadline, _ := ctx.Deadline()
 	s.mu.Lock()
