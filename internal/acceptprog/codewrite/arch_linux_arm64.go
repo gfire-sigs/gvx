@@ -52,6 +52,21 @@ func codeReturn(n uint32) []byte {
 	return words(0x52800000|n<<5, insnRet)
 }
 
+// codeSyscall returns code for a function that calls getpid and returns the
+// result plus n, which must not exceed maxCodeVersion. The code holds an SVC instruction,
+// which an engine can patch.
+func codeSyscall(n uint32) []byte {
+	if n > maxCodeVersion {
+		panic("codeSyscall: the version does not fit the immediate of ADD")
+	}
+	return words(
+		0xd2801588,       // movz x8, #172 (getpid)
+		0xd4000001,       // svc #0
+		0x11000000|n<<10, // add w0, w0, #n
+		insnRet,
+	)
+}
+
 // codeSelfPatch returns code that writes the instruction `movz w0, #42` over
 // the instruction at offset 36, cleans the caches, and runs it. The unpatched
 // instruction returns 1.

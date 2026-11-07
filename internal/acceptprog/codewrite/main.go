@@ -24,6 +24,11 @@
 //   - read(2) into a mapped region,
 //   - write(2) to a file that another mapping executes,
 //   - process_vm_writev(2) into another process,
+//   - several threads that rewrite code between mprotect(2) calls, and that
+//     replace a code page by a new mapping at the same address, while two more
+//     threads change the permissions and the mapping of the pages beside them,
+//     and a swapper replaces the page that a runner executes by a mapping of
+//     a memory file,
 //   - read(2) and write(2) into a shared mapping of a file on each directory
 //     that a dir= argument names, for example a bind mount and a volume.
 //
@@ -75,6 +80,7 @@ func main() {
 		{"read-into-code", checkReadIntoCode},
 		{"write-to-executed-file", checkWriteToExecutedFile},
 		{"process-vm-writev", checkProcessVMWritev},
+		{"code-churn-threads", checkCodeChurn},
 	}
 	for _, arg := range os.Args[1:] {
 		dir, ok := strings.CutPrefix(arg, "dir=")

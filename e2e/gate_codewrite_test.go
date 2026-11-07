@@ -37,6 +37,7 @@ var codeWriteChecks = []string{
 	"read-into-code",
 	"write-to-executed-file",
 	"process-vm-writev",
+	"code-churn-threads",
 }
 
 // TestE2ESystrapCodeWrites runs a guest that changes the code that it runs,
