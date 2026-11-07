@@ -649,6 +649,15 @@ A thread is offline while it waits in the spill routine or while the engine park
 
 `alloc` takes only Free units, so a Quarantined slot keeps its bytes. `allocSlot` reclaims when no island has room, and it then creates an island. `allocSlot` fails when no island has room and the quarantine holds 4096 allocation units or more, which is 16 island pages. One drop can push the quarantine past that number. The site then keeps its trap, and the guest runs at the speed of the debug path until a thread passes a quiescent point.
 
+| Check | Test |
+| :--- | :--- |
+| States, pins, and epochs, with random schedules | `TestModelNoThreadIsInsideAReusedSlot` runs on every host. |
+| Bookkeeping of the address space | `fastisland_windows_test.go`. |
+| A trap that the Sentry decodes after the block dropped and the page was patched again | `TestTrapFromADroppedSlotDecodesAfterThePageIsPatchedAgain`. |
+| A hot resume through a Quarantined slot | `TestHotResumeRunsTheTailOfAQuarantinedSlot`. |
+| Drop and patch again while six threads trap | `TestDropAndPatchAgainWhileThreadsTrapThroughTheSlots`. Set `GVX_SLOT_STRESS_SECONDS` to run it longer. |
+| Bound of the quarantine | `TestQuarantineStaysBoundedWhileAThreadRunsGuestCode`. |
+
 A signal frame that a guest wrote for a fault in a relocated instruction of a post-window slot can hold an island address. A guest that resumes there runs slot bytes that a later free can reuse. This case is outside the contract.
 
 ## 7. Security Model
@@ -713,6 +722,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | JIT engines | On `windows-latest`, Node 22 and 24 (V8) run `npm install`, `tsc`, esbuild, swc, a Vite build, and a `docker build` in `docker:dind`. Node 20 runs `npm install` and the TypeScript compiler (issue #24). Temurin 21 (HotSpot with C2, eight threads, the garbage collector, parallel streams, and `membarrier`) passes `TestE2EGateJVM` on `windows-latest` and `windows-11-arm` with `systrap`. Without the middle window, HotSpot 21 exits on `windows-11-arm` (section 3.10). Temurin 25 starts there without it. Other JVMs and the `javac` of other versions are untested. |
 | Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |
 | Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
+| Reuse of freed island slots | A thread that runs guest code and never traps blocks the reuse of slots that a block freed after the thread went online (section 6.9). When 4096 units are held, a patch leaves its sites on the debug path until that thread traps or stops. |
 
 ## 10. Evidence
 
