@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Shared budget of watched host objects**: the cap of watched objects of a `hostfs` workspace follows the descriptor limit of the whole process. A process with two sandboxes allowed twice that many pinned descriptors, so a guest that watched many directories could make every open of the other sandbox fail with `EMFILE`. All workspaces of a process now share one budget. A watch beyond the budget fails with `ENOSPC`, and a closed workspace gives its slots back.
+
 ## [v0.10.10012026110200] - 2026-11-07
 
 This release fixes a regression of `v0.10.10002026110200`: a signal corrupted the floating point registers of an arm64 guest on Linux and macOS hosts. It also stops the `TaskSize` search after one probe on a host with a hardware address space size.

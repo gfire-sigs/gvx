@@ -408,6 +408,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 	// The query runs here because the Linux filter after the lockdown does not
 	// allow getrlimit.
 	w.watch.limit = hostWatchLimit()
+	processWatches.limit.Store(int64(w.watch.limit))
 	if w.pathKeys {
 		w.rootKey = recKey{kind: kindPath, path: "."}
 	} else {

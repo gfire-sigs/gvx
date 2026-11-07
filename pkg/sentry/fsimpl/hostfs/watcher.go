@@ -135,6 +135,9 @@ type hostWatcher struct {
 	closed   bool
 	seq      uint64
 	warned   bool
+	// budgeted is the number of entries that hold a slot of the process
+	// budget (see processWatches).
+	budgeted int
 
 	// active is the number of watched objects. Guest mutations read it
 	// without a lock to skip all watcher work when it is zero.
@@ -271,6 +274,12 @@ func (w *Workspace) watchDentry(d *dentry) error {
 		hw.backend = be
 	}
 	be := hw.backend
+	if !processWatches.acquire() {
+		hw.rejected.Add(1)
+		hw.mu.Unlock()
+		return linuxerr.ENOSPC
+	}
+	hw.budgeted++
 	hw.seq++
 	e := &watchEntry{hw: hw, ws: w, ino: ino, d: d, isDir: ino.kind == hostKindDir, seq: hw.seq}
 	hw.entries[ino] = e
@@ -340,6 +349,8 @@ func (hw *hostWatcher) remove(e *watchEntry) bool {
 	}
 	delete(hw.entries, e.ino)
 	delete(hw.dirs, e)
+	hw.budgeted--
+	processWatches.release(1)
 	hw.active.Store(int32(len(hw.entries)))
 	be := hw.backend
 	var unused watchBackend
@@ -420,6 +431,8 @@ func (w *Workspace) watchShutdown() {
 	}
 	clear(hw.entries)
 	clear(hw.dirs)
+	processWatches.release(hw.budgeted)
+	hw.budgeted = 0
 	hw.active.Store(0)
 	be := hw.backend
 	hw.backend = nil

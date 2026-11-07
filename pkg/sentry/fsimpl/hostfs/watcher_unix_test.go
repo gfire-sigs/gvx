@@ -24,6 +24,7 @@ import (
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 )
 
 // openFDCount returns the number of descriptors of the process. The listing
@@ -141,4 +142,69 @@ func TestHostWatcherWatchedFilesShareTheDirectoryDescriptor(t *testing.T) {
 	if got := openFDCount(t); got != before {
 		t.Fatalf("descriptors with %d watched files = %d, want %d", files, got, before)
 	}
+}
+
+// TestTwoWorkspacesStayBelowTheDescriptorLimit lowers the descriptor limit of
+// the process so that the cap of one workspace is the room of the whole process.
+// The first workspace watches up to the cap. The second one must get ENOSPC for
+// its next watch, and the process must still open files. Without a budget that
+// the workspaces share, the second workspace pins descriptors until every open
+// of the process fails with EMFILE.
+func TestTwoWorkspacesStayBelowTheDescriptorLimit(t *testing.T) {
+	var old unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &old); err != nil {
+		t.Skipf("getrlimit: %v", err)
+	}
+	const dirs = minWatchedDentries
+	// The room of the process is the cap, and a second set of directories
+	// needs about the same number of descriptors again.
+	lowered := unix.Rlimit{Cur: uint64(openFDCount(t) + dirs + dirs/2), Max: old.Max}
+	if lowered.Cur >= old.Cur {
+		t.Skipf("the descriptor limit %d is too low to lower it further", old.Cur)
+	}
+	oldLimit := processWatches.limit.Load()
+	t.Cleanup(func() {
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &old); err != nil {
+			t.Errorf("restore the descriptor limit: %v", err)
+		}
+		processWatches.limit.Store(oldLimit)
+	})
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &lowered); err != nil {
+		t.Fatalf("lower the descriptor limit: %v", err)
+	}
+	// The cap and the budget follow the lowered limit, as OpenWorkspace sets them.
+	a, b := newWatchEnv(t), newWatchEnv(t)
+	limit := hostWatchLimit()
+	processWatches.limit.Store(int64(limit))
+	for _, w := range []*watchEnv{a, b} {
+		for i := range limit {
+			if err := os.Mkdir(w.host(fmt.Sprintf("d%d", i)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	for i := range limit {
+		if err := a.admit(fmt.Sprintf("d%d", i)); err != nil {
+			t.Fatalf("admit %d of the first workspace = %v", i, err)
+		}
+	}
+	for i := range limit {
+		err := b.admit(fmt.Sprintf("d%d", i))
+		if err == nil {
+			continue
+		}
+		if !linuxerr.Equals(linuxerr.ENOSPC, err) {
+			t.Errorf("admit %d of the second workspace = %v, want ENOSPC or no error", i, err)
+		}
+		break
+	}
+	if got := a.ws.watch.watchedCount() + b.ws.watch.watchedCount(); got > limit {
+		t.Errorf("the two workspaces watch %d objects, want at most %d", got, limit)
+	}
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open after the watches of two workspaces = %v", err)
+	}
+	f.Close()
 }

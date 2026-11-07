@@ -595,6 +595,8 @@ The cap protects the host resources of a watch. `OpenWorkspace` sets it before t
 
 A cap above the descriptor limit makes every later open of the sandbox fail with `EMFILE`. A higher `ulimit -n` therefore raises the cap on Linux and macOS. Earlier releases used a fixed cap of 8,192 objects and the buffer of Windows held 64 KiB.
 
+The descriptors belong to the host process, and one process can run several sandboxes. All workspaces of the process therefore share one budget of watched objects, and its size is the cap of the table. A watch that the budget refuses fails with `ENOSPC`, as one that the cap of the workspace refuses. A workspace gives its slots back when its watches end or when it closes. Without the shared budget, the caps of two workspaces together passed the descriptor limit, and a guest could make every open of the other sandbox fail with `EMFILE`.
+
 The scans of the poll backend of Linux, and of the fallback timer of macOS for objects without a `kqueue` registration, take tens of microseconds for each directory. A pass over 65,536 directories would keep one core busy all the time. A pass that takes time `d` therefore waits for `3d` before the next pass, and never for less than 200 ms. The scans take at most a quarter of one core. A host change in a very large watch set shows up after seconds and not after 200 ms.
 
 #### Metadata Records and File Identity (Descriptive Module)
