@@ -984,6 +984,41 @@ A period that ends in debt of more than 10 ms counts in `nr_throttled`, as it do
 
 A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. `cpu.stat` reports the measured time as `usage_usec`. The split between `user_usec` and `system_usec` still comes from the tick clocks.
 
+### 3.12 State That Sandboxes of One Process Share (Descriptive Module)
+
+The SDK, the end-to-end tests, and the shim run several sandboxes in one host process. Upstream gVisor assumes one Sentry kernel for each process, so it keeps some state in package variables. This section lists the state that stays process-wide and the reason. It also lists the state that each kernel owns.
+
+A guest must never see or change the state of another sandbox. State of the host, such as the RAM size or the address space, is the same for every sandbox. A process-wide variable is correct for it. State that a guest can read or limit must belong to one kernel. Reach it from the kernel, the memory file, or the network stack. Do not add a package variable for it.
+
+| Process-wide state | Owner | Reason that it is correct |
+| :--- | :--- | :--- |
+| `usage.MinimumTotalMemoryBytes`, `usage.MaximumTotalMemoryBytes`, `tmpfs.totalHostMem` | `usage`, `fsimpl/tmpfs`, `pkg/gvx/hostmem.go` | The host RAM is the same for every sandbox. A memory limit changes only the reported total of one kernel (`kernel.SetReportedMemory`). |
+| `usage.MemoryAccounting`, `usage.DirtyMemoryAccounting` | `usage` | The sandboxes of `gvx` charge the accounting of their own memory file (`pgalloc.MemoryFileOpts.Accounting`). The global objects count only the mapped pages of host files and the dirty pages of the gofer, which `gvx` does not mount. |
+| `systrap` `sealedHoles`, the dispatcher, and the thread budgets | `platform/systrap` | They describe the host address space and the host threads, which all sandboxes use together. |
+| `hvf` shared VM (`vmGlobal`) | `platform/hvf` | Hypervisor.framework allows one VM for each process. The platforms count references, and each address space has its own page tables. |
+| `systrap` `disableSyscallPatching` and `neverEnableFastPath` | `platform/systrap` | Only the options `DisableSyscallPatching` and `DisableFastPath` set them, and `gvx` sets neither. |
+| `pgalloc` `mlockDisabled` and `madvPopulateWriteDisabled`, and the capability flags of `kvm` | `pgalloc`, `platform/kvm` | They record what the host kernel refused. |
+| `memutil` arena registry, sequence counters of `hostfs`, `blockdev` clock | `memutil`, `fsimpl/hostfs`, `blockdev` | They index host address ranges, make unique host file names, or read the monotonic clock. |
+| `kernel.lastPIDNSID` | `kernel` | It makes the identifier of each PID namespace unique. No guest reads it. |
+| `time.tscOffset` | `time` | Only the restore of a KVM sandbox in `runsc` sets it. `gvx` never calls `SetTSCOffset`. |
+| `seccheck.Global`, `nftables.enableNFTables`, `afsSyscallPanic`, `gofer.globalDentryCache`, `netfilter.chainCounter`, the plugin network stack, and the RDMA snapshot | Sentry packages | The `runsc` boot code sets them, and `gvx` never does. Do not set them in a process that runs more than one sandbox. |
+| `tcpip.AsyncLoading`, `hostinet.restoredListeners`, `state.previousMetadata` | `tcpip`, `socket/hostinet`, `state` | Only save and restore use them, and `gvx` has no save or restore. |
+| `hostfs` budget of watched objects (`processWatches`) | `fsimpl/hostfs` | The descriptors belong to the host process. All workspaces draw from one budget (section 3.7). |
+| `seccompNotifyBusy`, `hostlockdown` state, `tuning` registry, the log target | `platform/systrap`, `pkg/hostlockdown`, `pkg/gvx` | They describe a host fact, a one-way lockdown of the process, or a table that never changes. |
+
+Each row of the next table is state that a guest can read or limit. Each kernel owns it, through one of three keys.
+
+| State owned by one kernel | Key |
+| :--- | :--- |
+| Usage accounting for `/proc/meminfo`, `sysinfo`, `memory.current`, `memory.stat`, the `memory.max` enforcer, and the WireGuard memory charge | The memory file of the kernel (`MemoryFile.Accounting`) |
+| Cause of an engine fault (`kernel.TakeEngineFault`), reported total memory, node sysctls, `shm_rmid_forced`, cgroup registry and cgroup IDs | The kernel or its namespace |
+| Bridge netfilter switches, netfilter logs, `xt_recent` tables, ipset registries, `vxlan` sockets and links, WireGuard links of a stack, disk registry | The network stack or the VFS |
+
+> [!IMPORTANT]
+> Add a package variable only for host state. Add a test that runs two sandboxes in one process for every guest-visible value that a new variable would hold.
+
+The tests `TestE2EMemoryAccountingIsPerSandbox`, `TestE2EMemoryLimitCountsOnlyItsSandbox`, and `TestE2ENodeKernelA6MemTotalIsPerSandbox` run two sandboxes at the same time. The probe `nodeprobe memcg` holds memory in a cgroup of each sandbox.
+
 ---
 
 ## 4. Milestone Roadmap and Verification Criteria
