@@ -16,7 +16,10 @@
 
 package guestcpu
 
-import "fmt"
+import (
+	"fmt"
+	"syscall"
+)
 
 // Index of each general purpose register in State.X. X30 is the link register.
 const numGPR = 31
@@ -66,9 +69,17 @@ const (
 	// X18, the platform register.
 	slotG        = 48
 	slotPlatform = 56
+	// slotChild is not zero in the child of Clone.
+	slotChild = 64
 	// frameSize is the size of the stack frame of Run. The stack pointer of
 	// arm64 stays 16-byte aligned.
-	frameSize = 64
+	frameSize = 80
+	// slotExecPath, slotExecArgv, and slotExecEnvp hold the arguments of the
+	// execve call that the child of Clone makes when ChildStack.SetExec set
+	// them. They are in the memory of the child stack, behind the frame.
+	slotExecPath = 80
+	slotExecArgv = 88
+	slotExecEnvp = 96
 )
 
 func restorerPC() uintptr { return 0 }
@@ -131,6 +142,18 @@ func (s *State) SetSyscall(nr uintptr, args ...uintptr) {
 // SetFaultAddr makes EventFault store to addr.
 func (s *State) SetFaultAddr(addr uintptr) { s.X[1] = uint64(addr) }
 
+// SetStackPointer sets the stack pointer that Compare expects.
+func (s *State) SetStackPointer(v uint64) { s.SP = v }
+
+// SetClone makes the State run clone with flags and the child stack stack.
+// The word that receives the thread ID in the parent and the word that the
+// kernel clears when the child exits are both tid. The thread-local storage
+// argument keeps its test value, so flags must not include CLONE_SETTLS.
+func (s *State) SetClone(flags, stack, tid uintptr) {
+	s.SetSyscall(syscall.SYS_CLONE, flags, stack)
+	s.X[2], s.X[4] = uint64(tid), uint64(tid)
+}
+
 // SetResult sets the register that holds the result of a system call.
 func (s *State) SetResult(v uint64) { s.X[0] = v }
 
@@ -174,3 +197,15 @@ func diffs(want, got *State, skip ...int) []string {
 	}
 	return out
 }
+
+// DefaultControl returns the FP control state that a new process has on Linux:
+// FPCR and FPSR.
+func DefaultControl() (fpcr, fpsr uint64) { return 0, 0 }
+
+// ControlMasks returns the bits of the two values of ReadControl that a
+// program can compare with DefaultControl. FPSR holds sticky flags that the
+// code of a program sets, so only FPCR counts.
+func ControlMasks() (first, second uint64) { return ^uint64(0), 0 }
+
+// ReadControl returns FPCR and FPSR of the calling thread.
+func ReadControl() (fpcr, fpsr uint64)

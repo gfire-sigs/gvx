@@ -355,3 +355,52 @@ TEXT ·handlerPC(SB), NOSPLIT|NOFRAME, $0-8
 	MOVD $·evilHandler(SB), R0
 	MOVD R0, ret+0(FP)
 	RET
+
+// func runClone(in, out *State)
+// The parent and the child load the same registers. The parent stores its
+// registers in out. The child, which has the stack of a ChildStack, stores its
+// registers in the State that its stack names, or calls execve when its stack
+// holds the arguments, and then exits.
+TEXT ·runClone(SB), NOSPLIT|NOFRAME, $0-16
+	ENTER
+	MOVD ZR, const_slotChild(RSP)
+	LOAD_CTL_VEC
+	LOAD_X
+	LOAD_X30
+	LOAD_X9
+	SVC  $0
+	CBNZ R0, store
+	STRSP(10, const_slotStash)
+	LDRSP(10, const_slotExecPath)
+	CBNZ R10, doexec
+	MOVD $1, R10
+	STRSP(10, const_slotChild)
+	LDRSP(10, const_slotStash)
+store:
+	STORE_STATE
+	LDRSP(10, const_slotChild)
+	CBNZ R10, childexit
+	LEAVE
+childexit:
+	MOVD $93, R8 // exit
+	MOVD $0, R0
+	SVC  $0
+	WORD $0xd4200000 // BRK #0
+doexec:
+	LDRSP(0, const_slotExecPath)
+	LDRSP(1, const_slotExecArgv)
+	LDRSP(2, const_slotExecEnvp)
+	MOVD $221, R8 // execve
+	SVC  $0
+	MOVD $93, R8 // exit
+	MOVD $127, R0
+	SVC  $0
+	WORD $0xd4200000 // BRK #0
+
+// func ReadControl() (fpcr, fpsr uint64)
+TEXT ·ReadControl(SB), NOSPLIT|NOFRAME, $0-16
+	MRS_FPCR(0)
+	MOVD R0, fpcr+0(FP)
+	MRS_FPSR(0)
+	MOVD R0, fpsr+8(FP)
+	RET

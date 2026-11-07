@@ -16,7 +16,10 @@
 
 package guestcpu
 
-import "fmt"
+import (
+	"fmt"
+	"syscall"
+)
 
 // Index of each general purpose register in State.GPR. RSP is not here: Run
 // keeps its own stack pointer.
@@ -47,6 +50,12 @@ var gprNames = [numGPR]string{"RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP",
 const (
 	editMXCSR = 0x5f82
 	editFCW   = 0x0a7f
+)
+
+// The Linux defaults of the FP control state of a new process.
+const (
+	defaultMXCSR = 0x1f80
+	defaultFCW   = 0x37f
 )
 
 // Test values of the FP control state. Both differ from the Linux defaults
@@ -81,8 +90,16 @@ const (
 	slotCtl = 0
 	// slotOut holds the address of the output State until the state is stored.
 	slotOut = 8
+	// slotChild is not zero in the child of Clone.
+	slotChild = 16
 	// frameSize is the size of the stack frame of Run.
-	frameSize = 16
+	frameSize = 24
+	// slotExecPath, slotExecArgv, and slotExecEnvp hold the arguments of the
+	// execve call that the child of Clone makes when ChildStack.SetExec set
+	// them. They are in the memory of the child stack, behind the frame.
+	slotExecPath = 24
+	slotExecArgv = 32
+	slotExecEnvp = 40
 )
 
 // hasAVX reports whether the CPU and the guest kernel support the YMM
@@ -153,8 +170,8 @@ func trashPattern() State {
 		}
 	}
 	// The Linux defaults differ from the test values.
-	s.MXCSR = 0x1f80
-	s.FCW = 0x37f
+	s.MXCSR = defaultMXCSR
+	s.FCW = defaultFCW
 	return s
 }
 
@@ -170,6 +187,17 @@ func (s *State) SetSyscall(nr uintptr, args ...uintptr) {
 
 // SetFaultAddr makes EventFault store to addr.
 func (s *State) SetFaultAddr(addr uintptr) { s.GPR[RSI] = uint64(addr) }
+
+// SetStackPointer sets the stack pointer that Compare expects.
+func (s *State) SetStackPointer(v uint64) { s.RSP = v }
+
+// SetClone makes the State run clone with flags and the child stack stack.
+// The word that receives the thread ID in the parent and the word that the
+// kernel clears when the child exits are both tid. The thread-local storage
+// argument keeps its test value, so flags must not include CLONE_SETTLS.
+func (s *State) SetClone(flags, stack, tid uintptr) {
+	s.SetSyscall(syscall.SYS_CLONE, flags, stack, tid, tid)
+}
 
 // SetResult sets the register that holds the result of a system call.
 func (s *State) SetResult(v uint64) { s.GPR[RAX] = v }
@@ -220,3 +248,15 @@ func diffs(want, got *State, skip ...int) []string {
 // SyscallClobbers returns the registers that a system call changes besides the
 // result register.
 func SyscallClobbers() []int { return clobberedBySyscall }
+
+// DefaultControl returns the FP control state that a new process has on Linux:
+// MXCSR and the x87 control word.
+func DefaultControl() (mxcsr, fcw uint64) { return defaultMXCSR, defaultFCW }
+
+// ControlMasks returns the bits of the two values of ReadControl that a
+// program can compare with DefaultControl. The six exception flags of MXCSR are
+// sticky, and the code of a program sets them.
+func ControlMasks() (first, second uint64) { return ^uint64(0x3f), ^uint64(0) }
+
+// ReadControl returns the MXCSR and the x87 control word of the calling thread.
+func ReadControl() (mxcsr, fcw uint64)

@@ -68,6 +68,7 @@ const (
 	ptraceGSPackage    = "z.gfire.dev/gvx/internal/acceptprog/ptracegs"
 	regProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/regprobe"
 	sigFramePackage    = "z.gfire.dev/gvx/internal/acceptprog/sigframeprobe"
+	forkProbePackage   = "z.gfire.dev/gvx/internal/acceptprog/forkprobe"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -366,6 +367,14 @@ func BuildRegProbe(tb testing.TB, goarch string) string {
 func BuildSigFrameProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, sigFramePackage, "sigframeprobe", goarch, 0)
+}
+
+// BuildForkProbe compiles the guest forkprobe, which checks the CPU state of a
+// new process, a new thread, and a new program, for the Linux architecture
+// goarch and returns the path of the static ET_EXEC executable.
+func BuildForkProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, forkProbePackage, "forkprobe", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel
