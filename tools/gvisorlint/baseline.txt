@@ -1,0 +1,14 @@
+# Baseline of the gvisorlint tool.
+#
+# Each line names one accepted finding: the analyzer, the repository path of the
+# file, and a regular expression for the message. The path "-" selects a
+# finding without a position. The tool compiles this file into its binary, so a
+# change here invalidates the cached results of `go vet`. Fix a finding in a
+# file that gvx owns. Add a line only for upstream code that gvx must not edit,
+# and state the reason in a comment above the line.
+
+
+# golang.org/x/sys/windows links syscall.compileCallback. The runtime declares
+# the first parameter as its own eface struct, and x/sys declares it as any, so
+# the simplified signatures differ although the layouts agree.
+checklinkname - ^symbol "compileCallback" has signature "func \(struct\{\}, bool\) \(uintptr\)", expected signature "func \(interface\{\}, bool\) \(uintptr\)"$
