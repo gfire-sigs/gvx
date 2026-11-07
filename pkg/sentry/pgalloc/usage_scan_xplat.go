@@ -14,7 +14,11 @@
 
 package pgalloc
 
-import "runtime"
+import (
+	"runtime"
+
+	"z.gfire.dev/gvx/pkg/sentry/usage"
+)
 
 // canSkipUsageScan reports whether UpdateUsage may skip its scan because the
 // usage of the memory file equals the committed bytes that it already knows.
@@ -27,12 +31,14 @@ func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	return memCgIDs == nil || runtime.GOOS == "linux"
 }
 
-// KnownCommittedBytes returns the bytes of f that the last usage scan found
-// committed. Unlike usage.MemoryAccounting, which sums every memory file of
-// the process, it counts only f, so each sandbox of one process can compare
-// its own use with its limit.
-func (f *MemoryFile) KnownCommittedBytes() uint64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.knownCommittedBytes
+// Accounting returns the memory usage accounting that f charges. It is
+// MemoryFileOpts.Accounting, or usage.MemoryAccounting when the option is nil.
+// A reader of the usage of one sandbox, such as /proc/meminfo or memory.current,
+// must read the accounting of the memory file of that sandbox. The global
+// usage.MemoryAccounting sums the memory of every kernel of the process.
+func (f *MemoryFile) Accounting() *usage.MemoryLocked {
+	if f.opts.Accounting != nil {
+		return f.opts.Accounting
+	}
+	return usage.MemoryAccounting
 }

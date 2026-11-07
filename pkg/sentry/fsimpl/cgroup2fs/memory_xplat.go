@@ -105,7 +105,7 @@ func (ms *memoryStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// The root cgroup accounts all memory of the sandbox, also the memory of
 		// tasks that no memory cgroup owns. Linux has memory.stat at the root for
 		// this, and the cAdvisor of the kubelet reads it for the memory of the node.
-		stats, _ = usage.MemoryAccounting.CopyPerCg(0)
+		stats, _ = k.MemoryFile().Accounting().CopyPerCg(0)
 	}
 	memoryStatFor(stats).writeTo(buf)
 	return nil
@@ -114,14 +114,16 @@ func (ms *memoryStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
 // getUsageStats returns the usage by kind for all cgroup IDs in memCgIDs.
 func getUsageStats(k *kernel.Kernel, memCgIDs map[uint32]struct{}) usage.MemoryStats {
 	_ = k.MemoryFile().UpdateUsage(memCgIDs)
-	return sumUsageStats(memCgIDs)
+	return sumUsageStats(k, memCgIDs)
 }
 
-// sumUsageStats adds the accounted usage of the cgroup IDs in memCgIDs.
-func sumUsageStats(memCgIDs map[uint32]struct{}) usage.MemoryStats {
+// sumUsageStats adds the usage of the cgroup IDs in memCgIDs that the memory
+// file of k accounted. The cgroup IDs of two kernels overlap, so the sum must
+// read the accounting of k and not the global one.
+func sumUsageStats(k *kernel.Kernel, memCgIDs map[uint32]struct{}) usage.MemoryStats {
 	var sum usage.MemoryStats
 	for id := range memCgIDs {
-		s, _ := usage.MemoryAccounting.CopyPerCg(id)
+		s, _ := k.MemoryFile().Accounting().CopyPerCg(id)
 		sum.System += s.System
 		sum.Anonymous += s.Anonymous
 		sum.PageCache += s.PageCache
@@ -370,7 +372,7 @@ func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, l
 	killed := make(map[*kernel.ThreadGroup]struct{})
 	for i := len(limited) - 1; i >= 0; i-- {
 		m := limited[i]
-		used := unreclaimableUsage(sumUsageStats(subtrees[i]))
+		used := unreclaimableUsage(sumUsageStats(k, subtrees[i]))
 		limit := uint64(m.maxBytes.Load())
 		near = near || used >= limit/2
 		m.oomCheck(ctx, k, used, limit, killed)
