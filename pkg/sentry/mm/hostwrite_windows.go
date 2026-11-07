@@ -57,7 +57,7 @@ func (mm *MemoryManager) hostWriteWrap(ar hostarch.AddrRange, f func(safemem.Blo
 	}
 	return func(bs safemem.BlockSeq) (uint64, error) {
 		n, err := f(bs)
-		mm.noteHostWrite(ar)
+		mm.noteHostWrite(ar) // +checklocksforce: withInternalMappings holds mm.activeMu while f runs
 		return n, err
 	}
 }
@@ -71,7 +71,7 @@ func (mm *MemoryManager) hostWriteWrapVec(ars hostarch.AddrRangeSeq, f func(safe
 		n, err := f(bs)
 		for rest := ars; !rest.IsEmpty(); rest = rest.Tail() {
 			if ar := rest.Head(); ar.Length() != 0 {
-				mm.noteHostWrite(ar)
+				mm.noteHostWrite(ar) // +checklocksforce: withInternalMappings holds mm.activeMu while f runs
 			}
 		}
 		return n, err
@@ -80,7 +80,9 @@ func (mm *MemoryManager) hostWriteWrapVec(ars hostarch.AddrRangeSeq, f func(safe
 
 // noteHostWrite reports ar to the memory file of every pma that overlaps it.
 //
-// Preconditions: mm.activeMu is locked.
+// Preconditions: mm.activeMu is locked for reading or writing.
+//
+// +checklocksread:mm.activeMu
 func (mm *MemoryManager) noteHostWrite(ar hostarch.AddrRange) {
 	for pseg := mm.pmas.LowerBoundSegment(ar.Start); pseg.Ok() && pseg.Start() < ar.End; pseg = pseg.NextSegment() {
 		if n, ok := pseg.ValuePtr().file.(hostWriteNoter); ok {

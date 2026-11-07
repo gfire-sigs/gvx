@@ -24,7 +24,6 @@ import (
 	"z.gfire.dev/gvx/pkg/metric"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	pb "z.gfire.dev/gvx/pkg/sentry/kernel/memevent/memory_events_go_proto"
-	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sync"
 )
 
@@ -106,7 +105,7 @@ func (m *MemoryEvents) emit() {
 		log.Warningf("Failed to fetch memory usage for memory events: %v", err)
 		return
 	}
-	snapshot, _ := usage.MemoryAccounting.Copy()
+	snapshot, _ := m.k.MemoryFile().Accounting().Copy()
 	total := totalPlatform + snapshot.Mapped
 
 	totalEvents.Increment()

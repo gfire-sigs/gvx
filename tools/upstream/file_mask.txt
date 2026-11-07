@@ -16,6 +16,7 @@ PROTECT .agents/**
 PROTECT docs/**
 PROTECT tools/upstream/**
 PROTECT tools/shiminterop/**
+PROTECT tools/gvisorlint/**
 PROTECT internal/xsys/**
 PROTECT scripts/**
 PROTECT cmd/rungv/**

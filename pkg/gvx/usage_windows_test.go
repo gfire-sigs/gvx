@@ -30,7 +30,7 @@ func TestMemoryAccountingInitializes(t *testing.T) {
 	if err := usage.Init(); err != nil {
 		t.Fatalf("usage.Init() = %v, want nil", err)
 	}
-	if usage.MemoryAccounting == nil || usage.MemoryAccounting.MemCgIDToMemStats == nil {
+	if usage.MemoryAccounting == nil || usage.MemoryAccounting.MemCgIDToMemStats == nil { // +checklocksforce: no goroutine uses the accounting yet
 		t.Fatalf("MemoryAccounting = %+v, want per-cgroup counters", usage.MemoryAccounting)
 	}
 }

@@ -235,7 +235,7 @@ func (th *thread) dumpState() {
 		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d busy, pending events %d\n", th.tid, len(th.events))
 		return
 	}
-	defer th.mu.Unlock()
+	defer th.mu.Unlock() // +checklocksforce: TryLock succeeded
 	if th.parked {
 		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d parked, pending events %d\n", th.tid, len(th.events))
 		return
@@ -434,7 +434,7 @@ func (th *thread) samplePC() {
 	if !th.mu.TryLock() {
 		return
 	}
-	defer th.mu.Unlock()
+	defer th.mu.Unlock() // +checklocksforce: TryLock succeeded
 	if th.parked || th.ctx == nil {
 		return
 	}

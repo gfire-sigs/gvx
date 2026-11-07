@@ -23,6 +23,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
@@ -111,8 +112,9 @@ type linkEndpoint struct {
 	public [keyLen]byte
 	// peers lists the peers of the device in the order of their creation.
 	peers peerSet
-	// charged is the memory that the device and its peers hold against the
-	// memory accounting of the sandbox.
+	// acct is the memory accounting of the kernel that created the link, and
+	// charged is the memory that the device and its peers hold against it.
+	acct    *usage.MemoryLocked
 	charged uint64
 
 	closeOnce sync.Once
@@ -183,15 +185,16 @@ func (e *linkEndpoint) LinkDown() {
 // "wireguard" link. The link starts down, so the device owns no UDP port until
 // the link goes up. The memory of the device counts against the memory
 // accounting of the sandbox, and a device that does not fit fails with ENOMEM.
-func newLink(_ context.Context, req *netstack.NewLinkRequest) (stack.LinkEndpoint, *syserr.Error) {
+func newLink(ctx context.Context, req *netstack.NewLinkRequest) (stack.LinkEndpoint, *syserr.Error) {
+	acct := accountingOf(ctx)
 	charged := deviceBytes()
-	if err := chargeMemory(charged); err != nil {
+	if err := chargeMemory(acct, charged); err != nil {
 		return nil, err
 	}
 	ch := channel.New(queueSize, defaultMTU, "")
 	tunDev := newTUN(ch, req.Name)
 	bind := newBind(req.Stack.Stack)
-	ep := &linkEndpoint{Endpoint: ch, tun: tunDev, bind: bind, userNS: req.UserNS, charged: charged}
+	ep := &linkEndpoint{Endpoint: ch, tun: tunDev, bind: bind, userNS: req.UserNS, acct: acct, charged: charged}
 	ep.peers.init()
 	ep.dev = device.NewDevice(tunDev, bind, newLogger(req.Name))
 	ep.register()

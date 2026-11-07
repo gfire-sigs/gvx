@@ -181,6 +181,8 @@ func (r *Registry) setAt(id ID) *Set {
 // registry.
 //
 // Preconditions: d.reg.mu is held for writing. pin releases it.
+//
+// +checklocksrelease:d.reg.mu
 func (d *Dump) pin(s *Set, id ID) (SetInfo, Head, bool, error) {
 	s.refNetlink++
 	references := s.ref

@@ -53,7 +53,7 @@ func (s *Stack) weakHostRouteRLocked(flow RouteFlow, pinned *nic, localAddr, rem
 	lookup := newRouteLookup(flow, 0, localAddr, remoteAddr, netProto)
 	s.routeMu.RLock()
 	for route := range s.fibRoutes(&lookup) {
-		if nic, ok := s.nics[route.NIC]; !ok || !nic.Enabled() {
+		if nic, ok := s.nics[route.NIC]; !ok || !nic.Enabled() { // +checklocksforce: the loop body runs with s.mu held
 			continue
 		}
 		if route.NIC == pinned.ID() {

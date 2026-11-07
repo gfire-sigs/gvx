@@ -174,11 +174,17 @@ type filesystem struct {
 	flusher *flusher
 }
 
+// lock takes fs.mu and prunes the dentries.
+//
+// +checklocksacquire:fs.mu
 func (fs *filesystem) lock(ctx context.Context) {
 	fs.mu.Lock()
 	fs.maybePruneLocked(ctx)
 }
 
+// unlock releases fs.mu and drops the references that deferDecRef collected.
+//
+// +checklocksrelease:fs.mu
 func (fs *filesystem) unlock(ctx context.Context) {
 	pending := fs.pending
 	fs.pending = nil
