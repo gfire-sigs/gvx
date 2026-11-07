@@ -403,3 +403,49 @@ TEXT ·xgetbv(SB), NOSPLIT, $0-4
 	XGETBV
 	MOVL AX, ret+0(FP)
 	RET
+
+// func runClone(in, out *State)
+// The parent and the child load the same registers. The parent stores its
+// registers in out. The child, which has the stack of a ChildStack, stores its
+// registers in the State that its stack names, or calls execve when its stack
+// holds the arguments, and then exits.
+TEXT ·runClone(SB), NOSPLIT, $const_frameSize-16
+	ENTER
+	MOVQ $0, const_slotChild(SP)
+	LOAD_STATE
+	SYSCALL
+	TESTQ AX, AX
+	JNZ   store
+	CMPQ  const_slotExecPath(SP), $0
+	JNE   doexec
+	MOVQ  $1, const_slotChild(SP)
+store:
+	STORE_STATE
+	CMPQ  const_slotChild(SP), $0
+	JNE   childexit
+	LEAVE
+childexit:
+	MOVL $60, AX // exit
+	XORL DI, DI
+	SYSCALL
+	INT  $3
+doexec:
+	MOVQ const_slotExecPath(SP), DI
+	MOVQ const_slotExecArgv(SP), SI
+	MOVQ const_slotExecEnvp(SP), DX
+	MOVL $59, AX // execve
+	SYSCALL
+	MOVL $60, AX // exit
+	MOVL $127, DI
+	SYSCALL
+	INT  $3
+
+// func ReadControl() (mxcsr, fcw uint64)
+TEXT ·ReadControl(SB), NOSPLIT, $8-16
+	STMXCSR 0(SP)
+	MOVL    0(SP), AX
+	MOVQ    AX, mxcsr+0(FP)
+	FSTCW   4(SP)
+	MOVWQZX 4(SP), AX
+	MOVQ    AX, fcw+8(FP)
+	RET
