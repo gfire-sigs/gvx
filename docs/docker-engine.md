@@ -241,10 +241,10 @@ The Sentry bills each run of a thread for its wall time. Each wake-up of the mon
 | `50000 100000`, 5 s | 0.50 CPU | 0.50 CPU | 0.50 CPU |
 | `max`, 3 s, static loop | 1.00 CPU | not measured | 1.00 CPU |
 | `10000 100000`, billed time | 0.10 CPU | 0.10 CPU | 0.10 CPU |
-| `10000 100000`, progress of the loop, as a share of a loop with the same duty cycle | 0.76 to 1.41 | not measured | 0.96 to 1.12 |
+| `10000 100000`, running time of a clock loop, as a share of the billed time | 0.86 to 0.96 | not measured | 0.89 to 0.98 |
 | `130000 100000`, `nr_throttled`, static loop | 0 | not measured | 0 |
 | `100000 100000`, `nr_throttled` | 14 in 3 s | 18 in 3 s | not measured |
 
 A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same.
 
-The duty-cycle loop sleeps 90 ms after each 10 ms of work, and it has no limit. On an Apple CPU, a native loop with that duty cycle runs at 0.21 of its full speed while it runs. It makes 0.02 of the iterations of a loop that never sleeps, and the ideal is 0.1. The CPU needs time to speed up after a sleep. A comparison with the full speed therefore measures the host CPU.
+The clock loop reads the clock of the guest after every 65536 turns. A gap of 2 ms or more between two readings is time in which the loop did not run. The test therefore measures running time in seconds, and not loop counts. A loop count depends on the speed of the host CPU. On an Apple CPU, a native loop that runs 10 ms and sleeps 90 ms makes 0.02 of the iterations of a loop without sleep. The ideal is 0.1. On `windows/amd64` runners, a reference loop with the same duty cycle made about half of the expected progress in two runs.

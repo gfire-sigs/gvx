@@ -24,13 +24,14 @@
 //	cpumaxprobe checks [NAME...]
 //	                     run the checks, then print DONE. With names, the
 //	                     program runs only the checks of those names.
-//	cpumaxprobe spin [duty]
+//	cpumaxprobe spin [clock]
 //	                     the busy-loop child: wait for a line on stdin, then
 //	                     loop until the parent kills the process. The child
 //	                     prints its loop count on stdout after each 2^24 turns.
-//	                     With duty, the child sleeps for 90 ms after each 10 ms
-//	                     of loop, so it has the duty cycle of a tenth of a CPU
-//	                     without a limit of cpu.max.
+//	                     With clock, the child prints instead the time in
+//	                     microseconds in which it ran, after each 2 ms of it.
+//	                     A gap of 2 ms or more between two readings of the
+//	                     clock is time in which the child did not run.
 package main
 
 import (
@@ -58,10 +59,17 @@ const (
 	shortWindow = 3 * time.Second
 	settle      = 300 * time.Millisecond
 
-	// dutyBusy and dutySleep give the duty loop the demand of a tenth of a
-	// CPU, with the period of the cpu.max value 10000 100000.
-	dutyBusy  = 10 * time.Millisecond
-	dutySleep = 90 * time.Millisecond
+	// clockGap is the gap between two readings of the clock that a running
+	// clock loop never reaches. A longer gap is time without a run.
+	clockGap = 2 * time.Millisecond
+
+	// clockReport is the running time between two reports of a clock loop.
+	clockReport = 2 * time.Millisecond
+
+	// minRanShare and maxRanShare bound the time in which a throttled clock
+	// loop runs, as a share of the time that the cgroup bills for it.
+	minRanShare = 0.75
+	maxRanShare = 1.2
 
 	// startLimit is the time that a busy-loop child has to report its first
 	// loop count after it started.
@@ -72,15 +80,6 @@ const (
 	resumeLimit = 500 * time.Millisecond
 	// resumeCPU is the CPU time that shows the task runs again.
 	resumeCPU = 100 * time.Millisecond
-)
-
-const (
-	// minShare is the least share of the progress of the duty-cycle loop that
-	// a loop at a tenth of a CPU keeps.
-	minShare = 0.5
-
-	// maxShare is the most share of that progress that the loop can keep.
-	maxShare = 1.8
 )
 
 func main() {
@@ -96,11 +95,15 @@ func main() {
 			os.Exit(1)
 		}
 	case "spin":
-		if len(os.Args) > 2 && os.Args[2] != "duty" {
-			fmt.Fprintln(os.Stderr, "unknown argument", os.Args[2])
+		switch {
+		case len(os.Args) == 2:
+			spin()
+		case len(os.Args) == 3 && os.Args[2] == "clock":
+			spinClock()
+		default:
+			fmt.Fprintln(os.Stderr, "unknown arguments", os.Args[2:])
 			os.Exit(2)
 		}
-		spin(len(os.Args) > 2)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command", os.Args[1])
 		os.Exit(2)
@@ -110,25 +113,52 @@ func main() {
 // spin waits for one line on stdin, so that the parent can move the process
 // into a cgroup first. It then counts without a system call, and it reports the
 // count on stdout after each 2^24 turns. The count measures the progress of the
-// process independently of the CPU time that the Sentry bills. A duty loop
-// sleeps for dutySleep after each dutyBusy of counting.
-func spin(duty bool) {
+// process independently of the CPU time that the Sentry bills.
+func spin() {
+	waitStart()
+	var n uint64
+	for {
+		n++
+		if n&(1<<24-1) == 0 {
+			os.Stdout.WriteString(strconv.FormatUint(n, 10) + "\n")
+		}
+	}
+}
+
+// spinClock waits for the start line, like spin. It then reads the clock after
+// each 2^16 turns and adds each gap below clockGap to its running time. It
+// prints the running time in microseconds after each clockReport. The running
+// time uses the clock of the guest, so it does not depend on the speed of the
+// host CPU. A task that the Sentry holds back reads one long gap.
+func spinClock() {
+	waitStart()
+	var n uint64
+	var ran, reported time.Duration
+	last := time.Now()
+	for {
+		n++
+		if n&(1<<16-1) != 0 {
+			continue
+		}
+		now := time.Now()
+		if gap := now.Sub(last); gap < clockGap {
+			ran += gap
+		}
+		last = now
+		if ran-reported >= clockReport {
+			reported = ran
+			os.Stdout.WriteString(strconv.FormatInt(ran.Microseconds(), 10) + "\n")
+		}
+	}
+}
+
+// waitStart waits for one line on stdin, so that the parent can move the
+// process into a cgroup first.
+func waitStart() {
 	var b [1]byte
 	for {
 		if _, err := os.Stdin.Read(b[:]); err != nil || b[0] == '\n' {
-			break
-		}
-	}
-	var n uint64
-	busyEnd := time.Now().Add(dutyBusy)
-	for {
-		n++
-		if duty && n&(1<<20-1) == 0 && !time.Now().Before(busyEnd) {
-			time.Sleep(dutySleep)
-			busyEnd = time.Now().Add(dutyBusy)
-		}
-		if n&(1<<24-1) == 0 {
-			os.Stdout.WriteString(strconv.FormatUint(n, 10) + "\n")
+			return
 		}
 	}
 }
@@ -221,11 +251,16 @@ type window struct {
 	// cpus is the CPU time of the cgroup divided by the wall time.
 	cpus float64
 
-	// progress is the loop count of the spinner for each second.
+	// progress is the growth of the count that the spinner reports, for each
+	// second. A plain spinner reports loop counts, and a clock spinner reports
+	// microseconds of running time.
 	progress float64
 
 	throttled, periods uint64
 	throttledUSec      uint64
+
+	// wall is the length of the window.
+	wall time.Duration
 }
 
 // measure reads cpu.stat of dir and the loop count of sp, waits for d, and
@@ -246,6 +281,7 @@ func measure(dir string, sp *spinner, d time.Duration) (window, error) {
 	}
 	wall := after.at.Sub(before.at)
 	w := window{
+		wall:          wall,
 		cpus:          float64(after.usageUSec-before.usageUSec) / float64(wall.Microseconds()),
 		throttled:     after.nrThrottled - before.nrThrottled,
 		periods:       after.nrPeriods - before.nrPeriods,
@@ -254,7 +290,7 @@ func measure(dir string, sp *spinner, d time.Duration) (window, error) {
 	if sp != nil {
 		w.progress = float64(sp.count.Load()-count0) / wall.Seconds()
 	}
-	fmt.Printf("INFO %s: %.3f CPU over %.2f s, %.0f loops/s, %d periods, %d throttles, %d us throttled\n",
+	fmt.Printf("INFO %s: %.3f CPU over %.2f s, %.0f progress/s, %d periods, %d throttles, %d us throttled\n",
 		dir, w.cpus, wall.Seconds(), w.progress, w.periods, w.throttled, w.throttledUSec)
 	return w, nil
 }
@@ -289,7 +325,7 @@ type spinner struct {
 	stdin io.WriteCloser
 	done  chan struct{}
 
-	// count is the last loop count that the child reported.
+	// count is the last count that the child reported.
 	count atomic.Uint64
 }
 
@@ -338,7 +374,7 @@ func moveTo(dir string, pid int) error {
 	return nil
 }
 
-// waitProgress waits until the child reported a loop count, and it fails after
+// waitProgress waits until the child reported a count, and it fails after
 // limit.
 func (s *spinner) waitProgress(limit time.Duration) error {
 	deadline := time.Now().Add(limit)
@@ -551,41 +587,23 @@ func checkSharedQuota() error {
 	})
 }
 
-// checkSmallQuota gives one thread a tenth of a CPU. The CPU time that the
-// Sentry bills must show a tenth of a CPU. The progress of the loop must match
-// the progress of a loop that sleeps 90 ms after each 10 ms of work, with no
-// limit in its cgroup.
+// checkSmallQuota gives one thread a tenth of a CPU. The Sentry must bill a
+// tenth of a CPU, hold the thread back for the rest of each period, and run the
+// thread for the time that it bills.
 //
-// A loop does not run at its full speed after a long sleep, because the host CPU
-// needs time to speed up. A native loop with this duty cycle runs at 0.2 of its
-// full speed while it runs, on an Apple CPU. A comparison with the full speed
-// measures the host CPU and not the Sentry.
+// The thread is a clock loop. It measures the time in which it runs with the
+// clock of the guest, so the result does not depend on the speed of the host
+// CPU. A comparison of loop counts did: a native loop that runs 10 ms and
+// sleeps 90 ms makes 0.02 of the iterations of a loop that never sleeps on an
+// Apple CPU. A reference loop with the same duty cycle made about half of the
+// expected progress in two Windows runs. The cause is probably a change in the
+// speed of the runner between two windows.
 func checkSmallQuota() error {
 	return withCgroup(probeDir, func() error {
-		if err := writeFile(probeDir, "cpu.max", "max 100000"); err != nil {
-			return err
-		}
-		duty, err := startSpinner(probeDir, "duty")
-		if err != nil {
-			return err
-		}
-		defer duty.stop()
-		if err := duty.waitProgress(startLimit); err != nil {
-			return err
-		}
-		time.Sleep(settle)
-		base, err := measure(probeDir, duty, quotaWindow)
-		if err != nil {
-			return err
-		}
-		if base.progress == 0 {
-			return errors.New("the duty loop made no progress")
-		}
-		duty.stop()
 		if err := writeFile(probeDir, "cpu.max", "10000 100000"); err != nil {
 			return err
 		}
-		s, err := startSpinner(probeDir)
+		s, err := startSpinner(probeDir, "clock")
 		if err != nil {
 			return err
 		}
@@ -598,11 +616,21 @@ func checkSmallQuota() error {
 		if err != nil {
 			return err
 		}
+		// The clock loop reports microseconds, so the progress is microseconds
+		// of running time for each second of wall time.
+		ran := w.progress / 1e6
+		fmt.Printf("INFO the clock loop ran %.3f of the wall time, %.3f of the billed time\n", ran, ran/w.cpus)
 		if err := expectCPUs(w, 0.07, 0.13); err != nil {
 			return fmt.Errorf("billed time: %w", err)
 		}
-		if share := w.progress / base.progress; share < minShare || share > maxShare {
-			return fmt.Errorf("the loop at a tenth of a CPU made %.3f of the progress of a loop with the same duty cycle, want %.2f to %.2f", share, minShare, maxShare)
+		if w.periods == 0 || float64(w.throttled) < 0.8*float64(w.periods) {
+			return fmt.Errorf("the cgroup throttled %d of %d periods, want at least 0.8", w.throttled, w.periods)
+		}
+		if held := float64(w.throttledUSec) / (w.wall.Seconds() * 1e6); held < 0.8 || held > 0.97 {
+			return fmt.Errorf("the cgroup held its thread back for %.3f of the wall time, want 0.80 to 0.97", held)
+		}
+		if share := ran / w.cpus; share < minRanShare || share > maxRanShare {
+			return fmt.Errorf("the thread ran for %.3f of the billed time, want %.2f to %.2f", share, minRanShare, maxRanShare)
 		}
 		return nil
 	})
