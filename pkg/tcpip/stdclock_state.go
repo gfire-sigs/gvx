@@ -27,4 +27,5 @@ func (s *stdClock) beforeSave() {
 // afterLoad is invoked by stateify.
 func (s *stdClock) afterLoad(context.Context) {
 	s.baseTime = time.Now()
+	s.baseTicks = hostTicks()
 }
