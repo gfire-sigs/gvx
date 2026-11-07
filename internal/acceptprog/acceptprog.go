@@ -66,6 +66,7 @@ const (
 	cowProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/cowprobe"
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
 	ptraceGSPackage    = "z.gfire.dev/gvx/internal/acceptprog/ptracegs"
+	regProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/regprobe"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -348,6 +349,14 @@ func BuildCodeWrite(tb testing.TB, goarch string) string {
 func BuildCOWProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, cowProbePackage, "cowprobe", goarch, 0)
+}
+
+// BuildRegProbe compiles the guest regprobe, which checks that every register
+// survives a system call, a page fault, and a signal, for the Linux
+// architecture goarch and returns the path of the static ET_EXEC executable.
+func BuildRegProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, regProbePackage, "regprobe", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel
