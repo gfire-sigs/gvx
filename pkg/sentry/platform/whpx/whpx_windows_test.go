@@ -156,3 +156,18 @@ func TestRealInterruptStopsALoop(t *testing.T) {
 		}
 	}
 }
+
+// TestRealPlatformsRunTogether keeps two platforms of one process alive and runs
+// guest code in both. A process that runs two sandboxes holds two partitions.
+func TestRealPlatformsRunTogether(t *testing.T) {
+	first := newRealPlatform(t)
+	second := newRealPlatform(t)
+	for _, p := range []*Platform{first, second, first} {
+		c, mm, ac := realGuest(t, p, guestSyscallCode)
+		sig, _, err := c.Switch(nil, mm, ac, -1)
+		if err != nil || sig != nil {
+			t.Fatalf("Switch returned %v, %v", sig, err)
+		}
+		checkSyscallExit(t, ac)
+	}
+}
