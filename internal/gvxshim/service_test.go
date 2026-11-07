@@ -2,10 +2,13 @@ package gvxshim
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +42,12 @@ func serviceIdentity(t *testing.T) instanceIdentity {
 }
 
 func newRPCFixture(t *testing.T) *rpcFixture {
+	t.Helper()
+	return newRPCFixtureConn(t, func(conn net.Conn) net.Conn { return conn })
+}
+
+// newRPCFixtureConn builds a fixture whose client reads and writes through wrap.
+func newRPCFixtureConn(t *testing.T, wrap func(net.Conn) net.Conn) *rpcFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
@@ -82,7 +91,7 @@ func newRPCFixture(t *testing.T) *rpcFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := ttrpc.NewClient(conn)
+	client := ttrpc.NewClient(wrap(conn))
 	t.Cleanup(func() {
 		if err := client.Close(); err != nil {
 			t.Errorf("close client: %v", err)
@@ -248,11 +257,7 @@ func TestShutdownReplyDrainsBeforeServerShutdown(t *testing.T) {
 						drained <- err
 						return
 					}
-					if err := f.state.WaitAndSeal(f.ctx); err != nil {
-						drained <- err
-						return
-					}
-					drained <- f.server.Shutdown(f.ctx)
+					drained <- drainThenCloseConnections(f)
 				}()
 				t.Cleanup(func() {
 					select {
@@ -275,8 +280,95 @@ func TestShutdownReplyDrainsBeforeServerShutdown(t *testing.T) {
 						t.Fatalf("ShutdownSandbox lost successful reply: %v", err)
 					}
 				}
+				if err := f.client.Close(); err != nil {
+					t.Fatal(err)
+				}
 			})
 		}
+	}
+}
+
+// drainThenCloseConnections runs the stop sequence of serveInstance: drain the
+// server, then close every connection that remains.
+func drainThenCloseConnections(f *rpcFixture) error {
+	err := drainServer(f.ctx, f.state, f.server, f.transport)
+	return errors.Join(err, f.transport.CloseConnections())
+}
+
+// lagConn models a client whose call goroutine is not scheduled for lag after
+// the ttRPC receive loop reads the response. The ttRPC client returns ErrClosed
+// when the shim closes the connection in that interval.
+type lagConn struct {
+	net.Conn
+	lag     time.Duration
+	mu      sync.Mutex
+	pending chan struct{}
+}
+
+func (c *lagConn) armed() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pending
+}
+
+func (c *lagConn) arm() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending = make(chan struct{})
+}
+
+func (c *lagConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 || err != nil {
+		c.mu.Lock()
+		pending := c.pending
+		c.pending = nil
+		c.mu.Unlock()
+		if pending != nil {
+			close(pending)
+		}
+	}
+	return n, err
+}
+
+func (c *lagConn) Write(p []byte) (int, error) {
+	pending := c.armed()
+	n, err := c.Conn.Write(p)
+	if pending != nil && err == nil {
+		<-pending
+		time.Sleep(c.lag)
+	}
+	return n, err
+}
+
+func TestShutdownReplySurvivesClientCallLag(t *testing.T) {
+	for i := range 20 {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			var lagged *lagConn
+			f := newRPCFixtureConn(t, func(conn net.Conn) net.Conn {
+				lagged = &lagConn{Conn: conn, lag: 20 * time.Millisecond}
+				return lagged
+			})
+			drained := make(chan error, 1)
+			go func() {
+				<-f.state.StopRequested()
+				if err := f.transport.Close(); err != nil {
+					drained <- err
+					return
+				}
+				drained <- drainThenCloseConnections(f)
+			}()
+			lagged.arm()
+			if _, err := f.task.Shutdown(f.namespaced(), &task.ShutdownRequest{ID: "test-id"}); err != nil {
+				t.Fatalf("Shutdown lost successful reply after client lag: %v", err)
+			}
+			if err := f.client.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-drained; err != nil {
+				t.Fatalf("drain server: %v", err)
+			}
+		})
 	}
 }
 

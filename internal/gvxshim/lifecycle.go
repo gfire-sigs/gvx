@@ -413,18 +413,7 @@ func serveInstance(startup context.Context, identity instanceIdentity, timeout t
 	drain, cancelDrain := context.WithDeadline(context.Background(), deadline)
 	defer cancelDrain()
 	result = errors.Join(result, closeListener(transport))
-	barrierErr := state.WaitAndSeal(drain)
-	if barrierErr == nil {
-		// Allow the ttRPC client receiveLoop to hit EAGAIN and wake dispatch
-		// before server.Shutdown sends EOF on the socket and cancels client.ctx.
-		timer := time.NewTimer(20 * time.Millisecond)
-		select {
-		case <-drain.Done():
-		case <-timer.C:
-		}
-		timer.Stop()
-		barrierErr = server.Shutdown(drain)
-	}
+	barrierErr := drainServer(drain, state, server, transport)
 	if barrierErr != nil {
 		result = errors.Join(result, barrierErr, transport.CloseConnections(), server.Close())
 	} else {
@@ -436,6 +425,24 @@ func serveInstance(startup context.Context, identity instanceIdentity, timeout t
 	}
 	result = errors.Join(result, stops.close(drain))
 	return exit, result
+}
+
+// drainServer waits until every counted shutdown response is on the wire and
+// every connection that carried bytes is closed by its peer or by the grace
+// time. The caller closes the transport listener first, and closes the
+// remaining connections with CloseConnections afterward. The order is the
+// invariant: the response barrier seals, then idle connections close, then the
+// wait for the peers to close. A wait that the drain deadline ends is not an
+// error, because all counted responses were written.
+func drainServer(ctx context.Context, state *controlState, server *ttrpc.Server, transport *taskTransport) error {
+	if err := state.WaitAndSeal(ctx); err != nil {
+		return err
+	}
+	if err := server.Shutdown(ctx); err != nil {
+		return err
+	}
+	transport.AwaitConnections(ctx)
+	return nil
 }
 
 func closeListener(listener net.Listener) error {

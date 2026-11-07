@@ -860,6 +860,8 @@ Conflicting resources or unresponsive serving loops cause an error and preserve 
 Shutdown closes listeners before draining accepted connections. The response barrier counts complete empty-success frames accepted by the underlying transport.
 The drain deadline bounds blocked writes and closes retained connections directly. Transport acceptance does not prove that the peer consumed a response.
 
+The ttRPC `1.2.7` client cancels its context when it reads end-of-file. A call that did not yet take its queued response from the stream can then return `ErrClosed`. A connection that wrote a response therefore stays open until the peer closes it or one second (`peerCloseGrace`) passes. The drain waits for these closes before the process exits. Every stop path waits, and a client that keeps its connection open delays the exit by up to one second.
+
 The root module retains containerd SDK `2.1.5`, API `1.10.0`, and ttRPC `1.2.7`. Bootstrap version `3` selects Task v3; the runtime-name suffix remains `v2`.
 The isolated `tools/shiminterop` module compiles real SDK lifecycle code with compatible telemetry dependencies. Root telemetry dependencies remain unchanged.
 The installed containerd `2.2.4` smoke verifies native creation rejection and cleanup only. It does not demonstrate a successfully created sandbox.
