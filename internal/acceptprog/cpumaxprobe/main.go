@@ -21,10 +21,11 @@
 //
 // Usage:
 //
-//	cpumaxprobe checks [MINSHARE]
+//	cpumaxprobe checks [MINSHARE [NAME...]]
 //	                     run the checks, then print DONE. MINSHARE is the least
 //	                     share of its unlimited speed that a loop at a tenth of a
-//	                     CPU must keep. The default is 0.07.
+//	                     CPU must keep. The default is 0.07. With names, the
+//	                     program runs only the checks of those names.
 //	cpumaxprobe spin     the busy-loop child: wait for a line on stdin, then
 //	                     loop until the parent kills the process. The child
 //	                     prints its loop count on stdout after each 2^24 turns.
@@ -39,6 +40,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -81,7 +83,11 @@ func main() {
 				minShare = v
 			}
 		}
-		ok := runChecks()
+		var only []string
+		if len(os.Args) > 3 {
+			only = os.Args[3:]
+		}
+		ok := runChecks(only)
 		fmt.Println("DONE")
 		if !ok {
 			os.Exit(1)
@@ -114,11 +120,14 @@ func spin() {
 	}
 }
 
-func runChecks() bool {
-	checks := []struct {
-		name string
-		fn   func() error
-	}{
+// check is one named check.
+type check struct {
+	name string
+	fn   func() error
+}
+
+func runChecks(only []string) bool {
+	checks := []check{
 		{"cpu-max-limits-busy-loop-to-half-cpu", checkHalfCPU},
 		{"cpu-max-max-gives-one-cpu-to-one-thread", checkUnlimited},
 		{"cpu-max-of-parent-limits-child", checkParentLimit},
@@ -140,8 +149,17 @@ func runChecks() bool {
 		fmt.Printf("FAIL cpu-enable-controller: %v\n", err)
 		return false
 	}
+	for _, name := range only {
+		if !slices.ContainsFunc(checks, func(c check) bool { return c.name == name }) {
+			fmt.Printf("FAIL unknown-check: no check named %q\n", name)
+			return false
+		}
+	}
 	ok := true
 	for _, c := range checks {
+		if len(only) > 0 && !slices.Contains(only, c.name) {
+			continue
+		}
 		if err := c.fn(); err != nil {
 			fmt.Printf("FAIL %s: %v\n", c.name, err)
 			ok = false
@@ -408,18 +426,25 @@ func checkHalfCPU() error {
 	})
 }
 
-// checkUnlimited runs one busy thread without a limit. The CPU time of the
-// cgroup is the measured time of its tasks, so it cannot pass one CPU by much.
+// checkUnlimited runs one busy thread without a limit. The thread is alone in
+// the cgroup, because the loop program has no runtime and no helper threads.
+// The Sentry bills the wall time of each run of a task. One thread therefore
+// cannot read more than the wall time.
+//
+// A Go child has a monitor thread that wakes many times each second. The Sentry
+// bills each wake-up for the time that the host takes to run it. That sum read
+// 1.15 CPU on a Windows runner and 1.5 CPU on a loaded macOS host. It is not
+// the usage of the busy thread.
 func checkUnlimited() error {
 	return withCgroup(probeDir, func() error {
 		if err := writeFile(probeDir, "cpu.max", "max 100000"); err != nil {
 			return err
 		}
-		w, err := runSpinners(probeDir, 1, shortWindow)
+		w, err := runLoop(probeDir, shortWindow)
 		if err != nil {
 			return err
 		}
-		if err := expectCPUs(w, 0.9, 1.05); err != nil {
+		if err := expectCPUs(w, 0.95, 1.02); err != nil {
 			return err
 		}
 		if w.throttled != 0 {
@@ -429,22 +454,25 @@ func checkUnlimited() error {
 	})
 }
 
-// checkQuotaAboveDemand gives a busy Go program 2 CPUs. The program has other
-// threads, such as the runtime monitor. Their demand is 1.01 CPU on average. On a
-// Windows host, the wake-ups of these threads cost up to 1.5 CPU in one period,
-// and a window of 3 seconds can read 1.12 CPU, because the Sentry measures the
-// wall time of each wake-up. A quota of exactly one CPU would throttle the
-// program, as it would in Linux.
+// checkQuotaAboveDemand gives one busy thread 1.3 CPUs. The thread is alone in
+// the cgroup, so its usage cannot pass 1 CPU and the cgroup never throttles. A
+// charge above 1.4 CPU in each period would throttle it, so a double charge
+// fails this check. The 0.1 CPU is the debt that the Sentry tolerates.
+//
+// A Go program has helper threads, and the Sentry bills each wake-up of those
+// threads for the time that the host takes to run it. A stall of a Windows
+// runner billed such a program 1.17 CPU in 3 seconds. One period then ended in
+// debt of more than 10 ms. A Go program cannot show the rule of this check.
 func checkQuotaAboveDemand() error {
 	return withCgroup(probeDir, func() error {
-		if err := writeFile(probeDir, "cpu.max", "200000 100000"); err != nil {
+		if err := writeFile(probeDir, "cpu.max", "130000 100000"); err != nil {
 			return err
 		}
-		w, err := runSpinners(probeDir, 1, shortWindow)
+		w, err := runLoop(probeDir, shortWindow)
 		if err != nil {
 			return err
 		}
-		if err := expectCPUs(w, 0.9, 1.3); err != nil {
+		if err := expectCPUs(w, 0.95, 1.02); err != nil {
 			return err
 		}
 		if w.throttled != 0 {
@@ -823,6 +851,21 @@ func startLoop(dir string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
+// runLoop starts the loop program in dir, lets it settle, and measures dir over
+// d. It stops the program before it returns.
+func runLoop(dir string, d time.Duration) (window, error) {
+	cmd, err := startLoop(dir)
+	if err != nil {
+		return window{}, err
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	time.Sleep(settle)
+	return measure(dir, nil, d)
+}
+
 // checkNoSyscallLoop limits a program that makes no system call. The Sentry never
 // sees such a program, so the engine must interrupt it to throttle it.
 func checkNoSyscallLoop() error {
@@ -830,16 +873,7 @@ func checkNoSyscallLoop() error {
 		if err := writeFile(probeDir, "cpu.max", "50000 100000"); err != nil {
 			return err
 		}
-		cmd, err := startLoop(probeDir)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}()
-		time.Sleep(settle)
-		w, err := measure(probeDir, nil, quotaWindow)
+		w, err := runLoop(probeDir, quotaWindow)
 		if err != nil {
 			return err
 		}
