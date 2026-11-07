@@ -89,12 +89,12 @@ type siteWrite struct {
 }
 
 // rewriteSite makes the writes, in order, into the jmpInstLen bytes at addr.
-// All writes reach the frames that back addr when the call starts, even if
-// another thread unmaps or replaces the mapping of addr during the call. Writes
-// that look up the frames again for each step would put the first step into
-// the old frame and the last steps into the new frame. That leaves the old
-// frame with the invalid instruction and no jump, and the new frame with a jump
-// instruction that has no operand.
+// All writes reach the frames that back addr when the call starts. Another
+// thread that unmaps or replaces the mapping of addr waits until the call
+// returns. Writes that look up the frames again for each step would put the
+// first step into the old frame and the last steps into the new frame. That
+// leaves the old frame with the invalid instruction and no jump, and the new
+// frame with a jump instruction that has no operand.
 //
 // If old is not nil, rewriteSite compares the bytes at addr with old first. It
 // returns false and writes nothing if they differ.
@@ -322,9 +322,10 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		return err
 	}
 
-	// Check that another thread has not patched this syscall yet.
-	// 0xb8 is the first byte of "mov sysno, %eax".
-	if prevCode[0] == movInstOpcode {
+	// Check that another thread has not patched this syscall yet, and that
+	// the bytes are the "mov sysno, %eax; syscall" that trapped.
+	prev := origSyscallCode(uint32(sysno))
+	if prevCode == prev {
 		ctx.Debugf("Found the pattern at ip %x:sysno %d", patchAddr, sysno)
 
 		trapAddr, err := s.addTrapLocked(ctx, ac, mm, uint32(sysno))
@@ -381,10 +382,8 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		// instruction.
 		//
 		// Another thread can replace the mapping of the site between the
-		// check above and the call. rewriteSite applies the patch only if
-		// the site still holds the "mov sysno, %eax; syscall" that
-		// trapped.
-		prev := origSyscallCode(uint32(sysno))
+		// read above and the call. rewriteSite reads the site again and
+		// applies the patch only if it still holds prev.
 		applied, err := rewriteSite(ctx, mm, hostarch.Addr(patchAddr), &prev,
 			siteWrite{off: int(faultInstOffset), data: faultInst[:]},
 			siteWrite{off: 1, data: newCode[1:]},

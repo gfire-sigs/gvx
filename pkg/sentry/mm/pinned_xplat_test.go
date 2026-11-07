@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package mm
 
 import (
@@ -54,15 +53,16 @@ func newPinnedTestMM(t *testing.T) (context.Context, *MemoryManager) {
 	if _, err := manager.SetMmapLayout(arch.New(arch.Host), ls); err != nil {
 		t.Fatalf("SetMmapLayout: %v", err)
 	}
-	mapPinnedTestPage(t, ctx, manager)
+	if err := mapPinnedTestPage(ctx, manager); err != nil {
+		t.Fatal(err)
+	}
 	return ctx, manager
 }
 
 // mapPinnedTestPage maps a new anonymous page at pinnedTestAddr over what is
 // there.
-func mapPinnedTestPage(t *testing.T, ctx context.Context, manager *MemoryManager) {
-	t.Helper()
-	if _, err := manager.MMap(ctx, memmap.MMapOpts{
+func mapPinnedTestPage(ctx context.Context, manager *MemoryManager) error {
+	_, err := manager.MMap(ctx, memmap.MMapOpts{
 		Addr:     pinnedTestAddr,
 		Fixed:    true,
 		Unmap:    true,
@@ -70,9 +70,8 @@ func mapPinnedTestPage(t *testing.T, ctx context.Context, manager *MemoryManager
 		Private:  true,
 		Perms:    hostarch.AnyAccess,
 		MaxPerms: hostarch.AnyAccess,
-	}); err != nil {
-		t.Fatalf("MMap: %v", err)
-	}
+	})
+	return err
 }
 
 func putByte(t *testing.T, ims safemem.BlockSeq, off int, b byte) {
@@ -106,7 +105,9 @@ func TestWithPinnedMappingsDelaysAReplacementOfTheRange(t *testing.T) {
 	replaced := make(chan struct{})
 	go func() {
 		defer close(replaced)
-		mapPinnedTestPage(t, ctx, manager)
+		if err := mapPinnedTestPage(ctx, manager); err != nil {
+			t.Errorf("MMap over the pinned page: %v", err)
+		}
 	}()
 	select {
 	case <-replaced:

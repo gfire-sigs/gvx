@@ -218,8 +218,9 @@ type MemoryManager interface {
 	AddressSpace() AddressSpace
 	// FindVMAByName finds a vma with the specified name.
 	FindVMAByName(ar hostarch.AddrRange, hint string) (hostarch.Addr, uint64, error)
-	// WithPinnedMappings calls f with the internal mappings of a range while
-	// no call can unmap or replace the range.
+	// WithPinnedMappings calls f with the internal mappings of a range. A call
+	// that unmaps or replaces the range waits until f returns, so f must not
+	// call back into the memory manager.
 	WithPinnedMappings(ctx context.Context, addr hostarch.Addr, length int, f func(safemem.BlockSeq) error) error
 }
 
