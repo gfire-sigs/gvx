@@ -26,6 +26,12 @@ type islandSlot struct {
 	// equals site, except for a pre-window slot, where the JMP starts in front
 	// of the SYSCALL.
 	jmpVA uint64
+	// resume is the address in the guest code where the tail of the slot
+	// continues. It is zero for a slot whose tail continues at an address that
+	// no patch of the code covers. The address lies behind the first byte of a
+	// JMP in a patch of another form, so a patch of the same code must keep it
+	// valid while a thread can still run the tail.
+	resume uint64
 	// insn holds the offset of each relocated instruction of a pre-window slot,
 	// counted from the start of the slot. The instruction at offset k of the
 	// slot is the instruction at jmpVA+k of the original code. The relocated

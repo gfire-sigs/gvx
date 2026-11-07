@@ -1003,11 +1003,20 @@ type jmpPlanner struct {
 	// position, so a decode inside another instruction adds false targets, which
 	// only make the planner more careful.
 	target []bool
+	// restarts holds the page offsets where a thread continues in place. The
+	// scan marks them as targets, as if a branch landed there.
+	restarts []int
 }
 
 func newJmpPlanner(before, page, after []byte) *jmpPlanner {
 	return &jmpPlanner{before: before, page: page, after: after}
 }
+
+// restartAt marks the page offset off as the address where a thread continues.
+// A thread that runs there needs the original bytes at off and after it, so no
+// plan overwrites the bytes behind the first byte of a patch that covers off.
+// A call after the first plan has no effect.
+func (p *jmpPlanner) restartAt(off int) { p.restarts = append(p.restarts, off) }
 
 // scan fills the target marks on first use.
 func (p *jmpPlanner) scan() {
@@ -1020,6 +1029,11 @@ func (p *jmpPlanner) scan() {
 	buf = append(buf, p.after...)
 	p.buf = buf
 	p.target = make([]bool, len(buf))
+	for _, off := range p.restarts {
+		if pos := len(p.before) + off; pos >= 0 && pos < len(buf) {
+			p.target[pos] = true
+		}
+	}
 	for pos := range buf {
 		inst, err := decodeX86(buf[pos:])
 		if err != nil || inst.Op == 0 || inst.Len == 0 {

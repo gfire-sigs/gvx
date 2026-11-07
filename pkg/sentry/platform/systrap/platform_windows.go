@@ -391,6 +391,7 @@ const (
 var (
 	errAddressSpaceReleased = errors.New("the address space is released")
 	errPatchRaced           = errors.New("the block changed while it was patched")
+	errPatchRestart         = fmt.Errorf("%w: a thread continues inside the patch", errPatchRaced)
 	errNoAddressSpace       = &platform.ContextError{Err: errors.New("no stub address space"), Errno: unix.EFAULT}
 )
 

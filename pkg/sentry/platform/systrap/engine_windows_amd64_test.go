@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -122,7 +123,10 @@ func TestFastPathResumeBehindPatchedSyscall(t *testing.T) {
 		t.Fatalf("the first pass counted %d, want %d", got, sites)
 	}
 	for i, ret := range returns {
-		if _, ok := r.as.jumpTail(ret, nil); !ok {
+		r.as.mu.Lock()
+		_, ok := r.as.jumpTailLocked(ret, nil)
+		r.as.mu.Unlock()
+		if !ok {
 			t.Fatalf("the SYSCALL before %#x did not become a JMP", ret)
 		}
 		// Continue at the return address, as the child of a clone does. The
@@ -500,5 +504,77 @@ func TestStopThreadReturnsWhenTheThreadFaultsInASlot(t *testing.T) {
 	out := r.ctx.handleEvent(r.rctx, r.mm, r.as, th, r.ac, ev)
 	if !out.done || !errors.Is(out.err, platform.ErrContextSignal) {
 		t.Fatalf("the fault ended with %+v, want a signal", out)
+	}
+}
+
+// TestPatchKeepsTheAddressWhereAThreadContinues drops and patches a block while
+// a thread of the stub continues at the return address of a SYSCALL. A
+// sigreturn to an interrupted system call, the child of clone, and the return
+// from a trap that the debugger served start a thread there. The Sentry cannot
+// translate the address for a block that has no patched copy, so the thread
+// runs the bytes at that address. A JMP over the SYSCALL covers them, and the
+// thread would run the bytes of the JMP as code. A real Go guest died with
+// SIGILL in syscall.rawSyscallNoError when another thread patched the page of
+// that function between the start and the first fetch.
+func TestPatchKeepsTheAddressWhereAThreadContinues(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	inc := []byte{0x48, 0xFF, 0xC3} // inc rbx
+	prog := append(gSyscall(1), inc...)
+	prog = append(prog, gSyscall(3)...)
+	ret := codeVA + uint64(len(gSyscall(1)))
+	site := uint16(ret - winSiteLen - codeVA)
+	r.program(prog)
+	// The first run patches the block and runs to the first system call.
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	th := r.ctx.th.Load()
+
+	drop := func() {
+		t.Helper()
+		r.as.mu.Lock()
+		defer r.as.mu.Unlock()
+		if blk := r.as.blocks[codeVA]; blk == nil || blk.state != blockExec {
+			t.Fatalf("the block is not executable before the drop")
+		} else if err := r.as.returnToDataLocked(blk); err != nil {
+			t.Fatalf("returnToDataLocked: %v", err)
+		}
+	}
+	// patched patches the block and returns the site and the bytes that the
+	// copy holds at ret.
+	patched := func() (siteInfo, []byte) {
+		t.Helper()
+		if err := r.as.patchBlock(r.rctx, r.mm, codeVA); err != nil {
+			t.Fatalf("patchBlock: %v", err)
+		}
+		r.as.mu.Lock()
+		defer r.as.mu.Unlock()
+		blk := r.as.blocks[codeVA]
+		return blk.sites[site], bytes.Clone(blk.priv.bytes()[ret-codeVA : ret-codeVA+uint64(len(inc))])
+	}
+
+	// A thread continues behind the SYSCALL in a block without a copy. The
+	// patch keeps the bytes behind the SYSCALL and the trap at the SYSCALL.
+	drop()
+	if got := th.continueAt(ret, false); got != ret {
+		t.Fatalf("continueAt(%#x) = %#x in a block without a copy, want the address itself", ret, got)
+	}
+	if s, got := patched(); s.kind == winSiteJump || !bytes.Equal(got, inc) {
+		t.Errorf("a patch covered the address %#x where a thread continues: site %+v, bytes % x, want the bytes % x", ret, s, got, inc)
+	}
+
+	// A thread that continues outside the bytes of the JMP does not matter.
+	for _, pc := range []uint64{codeVA, ret - winSiteLen, ret + uint64(len(inc))} {
+		drop()
+		th.restartPC.Store(pc)
+		if s, _ := patched(); s.kind != winSiteJump {
+			t.Errorf("a thread that continues at %#x kept the SYSCALL before %#x as a trap: site %+v", pc, ret, s)
+		}
+	}
+
+	// The stop of the thread ends its record, and the block gets its JMP.
+	drop()
+	th.restartPC.Store(0)
+	if s, _ := patched(); s.kind != winSiteJump {
+		t.Errorf("the SYSCALL before %#x stayed a trap after the thread stopped: site %+v", ret, s)
 	}
 }

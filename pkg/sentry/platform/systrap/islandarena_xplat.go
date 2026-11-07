@@ -170,6 +170,21 @@ func (a *slotArena) containing(rel uint32) (s islandSlot, off uint32, ok bool) {
 	return islandSlot{}, 0, false
 }
 
+// resumes calls fn with the resume address of each live and quarantined slot
+// that has one.
+func (a *slotArena) resumes(fn func(pc uint64)) {
+	for _, s := range a.live {
+		if s.resume != 0 {
+			fn(s.resume)
+		}
+	}
+	for _, q := range a.quarantine {
+		if q.rec.resume != 0 {
+			fn(q.rec.resume)
+		}
+	}
+}
+
 // readerOffline is the epoch of a reader that cannot be inside a slot.
 const readerOffline = ^uint64(0)
 

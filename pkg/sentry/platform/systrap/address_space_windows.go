@@ -493,6 +493,11 @@ func (as *addressSpace) Release() {
 
 // ----- lazy patching ------------------------------------------------------
 
+// patchSpan is the range of page offsets [lo, hi) behind the first byte of a
+// patch. A thread must not run there, because the bytes are part of a JMP or
+// follow it. An arm64 patch is one word and has no span.
+type patchSpan struct{ lo, hi int }
+
 // patchBlock patches the block that holds addr and maps the patched copy as
 // read and execute. It runs on the task goroutine, which is allowed to call
 // into the memory manager.
@@ -581,6 +586,12 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	copy(copyBuf, orig)
 	var sites map[uint16]siteInfo
 	var slots []winSlotRef
+	var spans []patchSpan
+	// The plan keeps every JMP away from the addresses where threads continue,
+	// and from the addresses where the tail of a slot of an earlier copy
+	// continues. The install below checks that no thread started to continue
+	// inside the plan since.
+	continuations := as.continuationsIn(base)
 	// A page that an earlier scan found clean needs no scan again. The cache
 	// holds the digest of the scanned bytes, and a hit needs the same digest.
 	// The address alone is no key: the memory file reuses a frame for other
@@ -595,7 +606,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	}
 	if !cleanHit {
 		var err error
-		sites, slots, err = as.patchPage(ctx, mm, base, copyBuf, writable)
+		sites, slots, spans, err = as.patchPage(ctx, mm, base, copyBuf, writable, continuations)
 		if err != nil {
 			return err
 		}
@@ -628,6 +639,11 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		discardSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return errPatchRaced
+	}
+	if as.restartInsideLocked(base, spans) {
+		discardSlotRefsLocked(slots)
+		as.p.priv.release(pg)
+		return errPatchRestart
 	}
 	if entry != nil && !as.p.alias.install(entry) {
 		discardSlotRefsLocked(slots)
