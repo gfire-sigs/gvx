@@ -116,6 +116,9 @@ func (h *hostHandle) acquire() (*os.File, error) {
 }
 
 // release ends a use that acquire began.
+//
+// +checklocksignore: acquire takes h.mu only when it returns a file, so no
+// annotation can describe the pair.
 func (h *hostHandle) release() {
 	h.mu.RUnlock()
 }

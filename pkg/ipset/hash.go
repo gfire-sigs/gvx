@@ -589,7 +589,7 @@ func (s *Set) hashUadt(adt Adt, e *Element, flags uint32) int {
 	changed := 0
 	apply := func(a, b component, p uint16) int {
 		if changed++; changed%rangeChunk == 0 {
-			s.mu.Unlock()
+			s.mu.Unlock() // +checklocksforce: the closure runs with s.mu held
 			s.mu.Lock()
 			now = s.now()
 		}

@@ -264,6 +264,7 @@ Refer to the guides below for full CLI flag documentation, release notes, securi
 | [`docs/docker-engine.md`](docs/docker-engine.md) | Run a Docker Engine in a sandbox with an `ext4lite` volume and control it from the host through a Docker context. |
 | [`docs/kubernetes.md`](docs/kubernetes.md) | Run an unmodified `k3s` node in a sandbox, alone or in a cluster with several nodes. |
 | [`docs/architecture.md`](docs/architecture.md) | Internal subsystem design, Windows and macOS kernel bindings, and contributor development guide. |
+| [`docs/gvisorlint.md`](docs/gvisorlint.md) | Run the gVisor analyzers `checklocks`, `checkconst`, and `checklinkname`, and fix their findings. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes, new features, and known limitations for each version. |
 | [`SECURITY.md`](SECURITY.md) | Security boundaries, supported versions, and private vulnerability reporting instructions. |
 

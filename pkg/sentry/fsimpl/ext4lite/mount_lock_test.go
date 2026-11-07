@@ -86,7 +86,7 @@ func TestReadlinkDoesNotTakeMountLockUnderFilesystemMutex(t *testing.T) {
 	}()
 	waitUntil(t, "readlink to hold fs.mu", func() bool {
 		if e.fs.mu.TryLock() {
-			e.fs.mu.Unlock()
+			e.fs.mu.Unlock() // +checklocksforce: TryLock succeeded
 			return false
 		}
 		return true

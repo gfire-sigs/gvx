@@ -559,7 +559,7 @@ func TestConntrackLinuxDefaultTimeouts(t *testing.T) {
 func newDropStack(blocked tcpip.Address, limit uint32) (*IPTables, *faketime.ManualClock) {
 	clock := faketime.NewManualClock()
 	it := DefaultTables(clock, rand.New(rand.NewSource(1)))
-	mangle := it.v4Tables[MangleID]
+	mangle := it.v4Tables[MangleID] // +checklocksforce: no other goroutine holds the new tables
 	rules := slices.Clone(mangle.Rules)
 	filter := EmptyFilter4()
 	filter.CheckProtocol, filter.Protocol = true, header.TCPProtocolNumber
