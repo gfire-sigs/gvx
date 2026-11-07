@@ -66,7 +66,7 @@ func (as *addressSpace) installCode(ctx context.Context, mm platform.MemoryManag
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if err := as.win.Map(base, blockSize, &pg.chunk.ref, pg.off, viewReadExec); err != nil {
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return err
 	}

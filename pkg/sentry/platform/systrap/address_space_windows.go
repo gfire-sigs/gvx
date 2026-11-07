@@ -101,6 +101,10 @@ type addressSpace struct {
 	// holds the island addresses that a pending mm.MMap call creates.
 	islands  map[uint64]*island
 	reserved map[uint64]struct{}
+	// epochs tracks the threads that a freed island slot waits for. The
+	// contract in fastisland_windows.go explains the rule. It has its own leaf
+	// lock, so a thread reads and writes it without mu.
+	epochs *slotEpochs
 
 	// wviews lists the guest ranges that map frames of a host file with write
 	// permission, sorted by address. aliasProt holds the pages that the engine
@@ -187,6 +191,7 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 		copies:   make(map[uint64]*copyHold),
 		islands:  make(map[uint64]*island),
 		reserved: make(map[uint64]struct{}),
+		epochs:   newSlotEpochs(),
 	}
 	sp.owner.Store(as)
 	pagesStart := time.Now()
@@ -383,7 +388,7 @@ func (as *addressSpace) mapErr(err error) error {
 // dropBlockLocked forgets the exec state of one block and frees its copy.
 func (as *addressSpace) dropBlockLocked(base uint64) {
 	if blk, ok := as.blocks[base]; ok {
-		freeSlotRefsLocked(blk.slots)
+		as.retireSlotsLocked(blk.slots)
 		blk.slots = nil
 		if blk.hasPriv {
 			as.p.priv.release(blk.priv)
@@ -602,7 +607,7 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	pg, err := as.p.priv.alloc()
 	if err != nil {
 		as.mu.Lock()
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.mu.Unlock()
 		return err
 	}
@@ -610,30 +615,33 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	if err := flushInstructionCache(windows.CurrentProcess(), uintptr(unsafe.Pointer(&pg.bytes()[0])), blockSize); err != nil {
 		as.p.priv.release(pg)
 		as.mu.Lock()
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.mu.Unlock()
 		return err
 	}
 
 	as.mu.Lock()
 	defer as.mu.Unlock()
+	// No branch to a slot is visible to the stub before the Map call below
+	// succeeds, so a failure before it discards the slots at once.
 	if cur := as.blocks[base]; as.released || cur != blk || blk.state != blockData || blk.src != src {
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return errPatchRaced
 	}
 	if entry != nil && !as.p.alias.install(entry) {
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return errPatchRaced
 	}
 	if err := as.win.Map(base, blockSize, &pg.chunk.ref, pg.off, viewReadExec); err != nil {
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.p.priv.release(pg)
 		return as.mapErr(err)
 	}
 	if err := flushInstructionCache(as.sp.proc, uintptr(base), blockSize); err != nil {
-		freeSlotRefsLocked(slots)
+		// The stub already sees the page.
+		as.retireSlotsLocked(slots)
 		return err
 	}
 	delete(as.aliasProt, base)
@@ -682,7 +690,7 @@ func (as *addressSpace) returnToDataLocked(blk *execBlock) error {
 	if err := as.win.Map(blk.base, blockSize, blk.srcSec, blk.srcOff, viewProtFor(blk.at)); err != nil {
 		return as.mapErr(err)
 	}
-	freeSlotRefsLocked(blk.slots)
+	as.retireSlotsLocked(blk.slots)
 	blk.slots = nil
 	as.p.priv.release(blk.priv)
 	blk.priv, blk.hasPriv = privPage{}, false

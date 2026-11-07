@@ -95,11 +95,15 @@ import (
 // margin covers the page size and the slot branch back.
 const winIslandReach = islandReach
 
-// winSlotUnit is the allocation quantum in bytes of an island page.
-const winSlotUnit = 16
+// An island page has the size of a block.
+const (
+	_ = uint(blockSize - winIslandBytes)
+	_ = uint(winIslandBytes - blockSize)
+)
 
-// winIslandUnits is the number of allocation units in one island page.
-const winIslandUnits = blockSize / winSlotUnit
+// errSlotsQuarantined is the error of allocSlot when no island has room and the
+// quarantine holds winQuarantineLimit units that a thread can still enter.
+var errSlotsQuarantined = errors.New("the freed trampoline slots are still in use by threads")
 
 // winSlotRef identifies a range of bytes that an execBlock occupies in an island.
 type winSlotRef struct {
@@ -112,71 +116,68 @@ type winSlotRef struct {
 type island struct {
 	base uint64
 	page privPage
-	// usedBits marks the 16-byte units of the page that slots occupy.
-	usedBits [winIslandUnits / 64]uint64
-	// slots maps the offset of each slot to its guest site and byte size.
-	slots map[uint32]islandSlot
-	// retired keeps the record of each freed slot until alloc reuses its
-	// bytes. A thread can enter a slot and publish a trap just before another
-	// thread drops the block of the slot. The Sentry then decodes the trap
-	// from the retired record.
-	retired map[uint32]islandSlot
+	slotArena
 }
 
-// alloc reserves a contiguous run of size bytes on isl and returns its byte offset.
-// Callers hold as.mu.
-func (isl *island) alloc(size uint32) (uint32, bool) {
-	need := int((size + winSlotUnit - 1) / winSlotUnit)
-	if need <= 0 || need > winIslandUnits {
-		return 0, false
+// retireSlotsLocked moves every slot in refs to the quarantine. The caller
+// removed the executable page that holds the branches first. Callers hold as.mu.
+func (as *addressSpace) retireSlotsLocked(refs []winSlotRef) {
+	if len(refs) == 0 {
+		return
 	}
-	run := 0
-	start := 0
-	for u := 0; u < winIslandUnits; u++ {
-		if isl.usedBits[u/64]&(uint64(1)<<(u%64)) != 0 {
-			run = 0
-			start = u + 1
-			continue
-		}
-		run++
-		if run == need {
-			for k := start; k < start+need; k++ {
-				isl.usedBits[k/64] |= uint64(1) << (k % 64)
-			}
-			off := uint32(start * winSlotUnit)
-			for roff, s := range isl.retired {
-				if roff < off+size && off < roff+s.size {
-					delete(isl.retired, roff)
-				}
-			}
-			return off, true
-		}
-	}
-	return 0, false
-}
-
-// free releases a slot range that alloc reserved and moves its site entry to
-// the retired records. Callers hold as.mu.
-func (isl *island) free(off, size uint32) {
-	start := int(off / winSlotUnit)
-	count := int((size + winSlotUnit - 1) / winSlotUnit)
-	for k := start; k < start+count && k < winIslandUnits; k++ {
-		isl.usedBits[k/64] &^= uint64(1) << (k % 64)
-	}
-	if s, ok := isl.slots[off]; ok {
-		if isl.retired == nil {
-			isl.retired = make(map[uint32]islandSlot)
-		}
-		isl.retired[off] = s
-		delete(isl.slots, off)
-	}
-}
-
-// freeSlotRefsLocked releases every island slot in refs. Callers hold as.mu.
-func freeSlotRefsLocked(refs []winSlotRef) {
+	at := as.epochs.retire()
 	for _, r := range refs {
-		r.isl.free(r.off, r.size)
+		r.isl.retire(r.off, r.size, at)
 	}
+}
+
+// discardSlotRefsLocked frees every slot in refs at once. Use it only for slots
+// whose branch never became visible to the stub. Callers hold as.mu.
+func discardSlotRefsLocked(refs []winSlotRef) {
+	for _, r := range refs {
+		r.isl.discard(r.off, r.size)
+	}
+}
+
+// pinSlotLocked makes reader hold the slot that contains pc, when there is one.
+// The Sentry calls it before it starts a thread at an island address, while it
+// still holds as.mu. A reclaim also holds as.mu, so it sees the pin. A nil
+// reader means that the thread has no fast slot, and the call does nothing.
+func (as *addressSpace) pinSlotLocked(reader *epochReader, pc uint64) {
+	if reader == nil {
+		return
+	}
+	isl := as.islands[blockRound(pc)]
+	if isl == nil {
+		return
+	}
+	if _, off, ok := isl.containing(uint32(pc - isl.base)); ok {
+		reader.setPin(isl.base + uint64(off))
+	}
+}
+
+// quarantineUnitsLocked returns the number of units that the quarantine holds.
+// Callers hold as.mu.
+func (as *addressSpace) quarantineUnitsLocked() int {
+	n := 0
+	for _, isl := range as.islands {
+		n += isl.quarantineUnits
+	}
+	return n
+}
+
+// reclaimSlotsLocked frees the quarantined slots that no thread can still
+// enter and returns the number of units that it freed. Callers hold as.mu.
+func (as *addressSpace) reclaimSlotsLocked() int {
+	if as.quarantineUnitsLocked() == 0 {
+		return 0
+	}
+	snap := as.epochs.snapshot()
+	freed := 0
+	for _, isl := range as.islands {
+		freed += isl.reclaim(isl.base, &snap)
+	}
+	return freed
 }
 
 // islandRange tells MapFile what to do with a mapping that touches an island.
@@ -222,31 +223,20 @@ func (as *addressSpace) releaseIslandsLocked() {
 	}
 }
 
-// slotStart returns the slot that starts at pc, if pc is the first address of
-// a slot. A freed slot counts until a new slot reuses its bytes, because a
-// thread can have entered it before the free.
+// slotStart returns the slot that starts at pc. A Quarantined slot counts,
+// because a thread can have entered it before the free.
 func (as *addressSpace) slotStart(pc uint64) (islandSlot, bool) {
-	return as.slotAt(pc, true)
-}
-
-// slotAt returns the slot that starts at pc. It returns a freed slot only if
-// retired is true.
-func (as *addressSpace) slotAt(pc uint64, retired bool) (islandSlot, bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	isl := as.islands[blockRound(pc)]
 	if isl == nil {
 		return islandSlot{}, false
 	}
-	s, ok := isl.slots[uint32(pc-isl.base)]
-	if !ok && retired {
-		s, ok = isl.retired[uint32(pc-isl.base)]
-	}
-	return s, ok
+	return isl.lookup(uint32(pc - isl.base))
 }
 
 // slotContaining returns the slot that contains pc and the start address of
-// the slot.
+// the slot. A Quarantined slot counts.
 func (as *addressSpace) slotContaining(pc uint64) (s islandSlot, slotVA uint64, ok bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
@@ -254,27 +244,18 @@ func (as *addressSpace) slotContaining(pc uint64) (s islandSlot, slotVA uint64, 
 	if isl == nil {
 		return islandSlot{}, 0, false
 	}
-	rel := uint32(pc - isl.base)
-	for off, s := range isl.slots {
-		if rel >= off && rel < off+s.size {
-			return s, isl.base + uint64(off), true
-		}
+	s, off, ok := isl.containing(uint32(pc - isl.base))
+	if !ok {
+		return islandSlot{}, 0, false
 	}
-	return islandSlot{}, 0, false
+	return s, isl.base + uint64(off), true
 }
 
 // slotAtTail returns the site of the slot whose tail is at tail. It decodes a
-// trap, so it also finds a freed slot.
+// trap. A thread that published the trap is online, or it holds the slot as its
+// pin, so the slot is Live or Quarantined.
 func (as *addressSpace) slotAtTail(tail uint64) (uint64, bool) {
 	s, ok := as.slotStart(tail - winSlotTailOffset)
-	return s.site, ok
-}
-
-// liveSlotAtTail returns the site of the slot whose tail is at tail, if the
-// slot is not freed. A hot resume runs the tail of the slot again, and a new
-// slot can overwrite the bytes of a freed slot at any time.
-func (as *addressSpace) liveSlotAtTail(tail uint64) (uint64, bool) {
-	s, ok := as.slotAt(tail-winSlotTailOffset, false)
 	return s.site, ok
 }
 
@@ -291,7 +272,8 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 // encode write the slot code, records rec for the slot, and returns the address
 // and reference of the slot. The page of the slot is the private page that the
 // stub maps for execution, so the slot is live as soon as the call returns and
-// the instruction cache of the stub is flushed.
+// the instruction cache of the stub is flushed. No branch names the slot yet,
+// so a failure frees the slot at once.
 func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, rec islandSlot, encode func(buf []byte, slotVA uint64) error) (uint64, winSlotRef, error) {
 	site, size := rec.site, rec.size
 	isl, off, err := as.allocSlot(ctx, mm, site, size)
@@ -302,16 +284,16 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 	slotVA := isl.base + uint64(off)
 	if err := encode(isl.page.bytes()[off:off+size], slotVA); err != nil {
 		as.mu.Lock()
-		isl.free(off, size)
+		isl.discard(off, size)
 		as.mu.Unlock()
 		return 0, winSlotRef{}, err
 	}
 	as.mu.Lock()
-	isl.slots[off] = rec
+	isl.record(off, rec)
 	as.mu.Unlock()
 	if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), uintptr(size)); err != nil {
 		as.mu.Lock()
-		isl.free(off, size)
+		isl.discard(off, size)
 		as.mu.Unlock()
 		return 0, winSlotRef{}, err
 	}
@@ -319,24 +301,42 @@ func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManag
 }
 
 // allocSlot returns space for a slot of size bytes within reach of site. It
-// creates an island through the memory manager when no island has room.
+// reclaims quarantined slots when no island has room, and it creates an island
+// through the memory manager when that is not enough. It fails with
+// errSlotsQuarantined when the quarantine is full.
 func (as *addressSpace) allocSlot(ctx context.Context, mm platform.MemoryManager, site uint64, size uint32) (*island, uint32, error) {
 	for range 3 {
 		as.mu.Lock()
-		for _, isl := range as.islands {
-			if absDiff(isl.base, site) < winIslandReach {
-				if off, ok := isl.alloc(size); ok {
-					as.mu.Unlock()
-					return isl, off, nil
-				}
-			}
+		isl, off, ok := as.allocNearLocked(site, size)
+		if !ok && as.reclaimSlotsLocked() > 0 {
+			isl, off, ok = as.allocNearLocked(site, size)
 		}
+		full := as.quarantineUnitsLocked() >= winQuarantineLimit
 		as.mu.Unlock()
+		if ok {
+			return isl, off, nil
+		}
+		if full {
+			return nil, 0, errSlotsQuarantined
+		}
 		if err := as.newIsland(ctx, mm, site); err != nil {
 			return nil, 0, err
 		}
 	}
 	return nil, 0, errors.New("no trampoline island has room")
+}
+
+// allocNearLocked allocates size bytes in an island within reach of site.
+// Callers hold as.mu.
+func (as *addressSpace) allocNearLocked(site uint64, size uint32) (*island, uint32, bool) {
+	for _, isl := range as.islands {
+		if absDiff(isl.base, site) < winIslandReach {
+			if off, ok := isl.alloc(size); ok {
+				return isl, off, true
+			}
+		}
+	}
+	return nil, 0, false
 }
 
 // newIsland reserves a sealed mapping within reach of near through the memory
@@ -365,6 +365,6 @@ func (as *addressSpace) installIsland(base uint64) error {
 		as.p.priv.release(pg)
 		return as.mapErr(err)
 	}
-	as.islands[base] = &island{base: base, page: pg, slots: make(map[uint32]islandSlot)}
+	as.islands[base] = &island{base: base, page: pg}
 	return flushInstructionCache(as.sp.proc, uintptr(base), blockSize)
 }

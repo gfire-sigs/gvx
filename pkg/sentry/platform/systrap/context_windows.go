@@ -270,12 +270,14 @@ func (th *thread) stopAndPull(ac *arch.Context64, ev debugEvent) error {
 		// A forced stop or a store step set the flag. The guest never sees it.
 		th.ctx.setSingleStep(false)
 	}
+	// The thread can be inside a slot. park ends the hold of a slot, so the
+	// conversion of a slot address to a guest address comes first.
+	th.ctx.storeTo(ac)
+	th.pullArch(ac)
 	if err := th.park(ev); err != nil {
 		return err
 	}
 	th.stepping = false
-	th.ctx.storeTo(ac)
-	th.pullArch(ac)
 	return nil
 }
 

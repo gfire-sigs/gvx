@@ -122,7 +122,7 @@ func TestFastPathResumeBehindPatchedSyscall(t *testing.T) {
 		t.Fatalf("the first pass counted %d, want %d", got, sites)
 	}
 	for i, ret := range returns {
-		if _, ok := r.as.jumpTail(ret); !ok {
+		if _, ok := r.as.jumpTail(ret, nil); !ok {
 			t.Fatalf("the SYSCALL before %#x did not become a JMP", ret)
 		}
 		// Continue at the return address, as the child of a clone does. The

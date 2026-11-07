@@ -379,7 +379,7 @@ func (as *addressSpace) fastTLSBranch(ctx context.Context, mm platform.MemoryMan
 	if err == nil {
 		if word, err = encodeBranch(site, slotVA); err != nil {
 			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
+			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
 		}
 	}
@@ -402,7 +402,7 @@ func (as *addressSpace) fastBranch(ctx context.Context, mm platform.MemoryManage
 	if err == nil {
 		if word, err = encodeBranch(site, slotVA); err != nil {
 			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
+			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
 		}
 	}
