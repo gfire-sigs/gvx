@@ -15,36 +15,10 @@
 package gvx
 
 import (
-	"bytes"
 	"errors"
 	"strings"
 	"testing"
 )
-
-func TestEngineFaultLogRecordsTheCauseAndForwardsEveryLine(t *testing.T) {
-	_ = takeEngineFault()
-	var sink bytes.Buffer
-	w := engineFaultLog{next: &sink}
-	lines := []string{
-		"W1028 05:54:34.089849    5068 cpuid.go:253] cpuid HWCap not initialized\n",
-		"W1028 05:54:35.000001    5068 task_run.go:364] [   1:   1] Unexpected SwitchToApp error: the stub died: exit code 0xc0000005\n",
-		"I1028 05:54:35.100000    5068 loader.go:270] Error loading ELF: out of memory\n",
-	}
-	for _, l := range lines {
-		if n, err := w.Write([]byte(l)); n != len(l) || err != nil {
-			t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(l))
-		}
-	}
-	if got := sink.String(); got != strings.Join(lines, "") {
-		t.Errorf("the writer changed the log: %q", got)
-	}
-	if got, want := takeEngineFault(), "the stub died: exit code 0xc0000005"; got != want {
-		t.Errorf("takeEngineFault = %q, want %q", got, want)
-	}
-	if got := takeEngineFault(); got != "" {
-		t.Errorf("a second takeEngineFault = %q, want it empty", got)
-	}
-}
 
 func TestEngineFaultErrorNamesTheCauseAndTheLogSwitch(t *testing.T) {
 	err := engineFaultError("the stub died")

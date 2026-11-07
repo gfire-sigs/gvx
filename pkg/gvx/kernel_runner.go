@@ -92,7 +92,7 @@ func init() {
 	if os.Getenv("GVX_DEBUG_LOG") == "" && os.Getenv("GVX_STRACE") == "" {
 		logDest = io.Discard
 	}
-	log.SetTarget(&log.Writer{Next: engineFaultLog{next: logDest}})
+	log.SetTarget(&log.Writer{Next: logDest})
 	if os.Getenv("GVX_DEBUG_LOG") == "2" {
 		log.SetLevel(log.Debug)
 	}
@@ -1184,7 +1184,6 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	dog.Start()
 	defer dog.Stop()
 
-	_ = takeEngineFault()
 	doneCh := make(chan struct{})
 	go func() {
 		select {
@@ -1237,7 +1236,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	ws := tg.ExitStatus()
 	if ws.Signaled() && ws.TerminationSignal() == linux.SIGKILL {
-		if cause := takeEngineFault(); cause != "" {
+		if cause := k.TakeEngineFault(); cause != "" {
 			return 128 + int(linux.SIGKILL), engineFaultError(cause)
 		}
 	}
