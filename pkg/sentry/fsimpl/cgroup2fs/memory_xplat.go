@@ -325,13 +325,13 @@ func (fs *filesystem) limitedMemory() []*memory {
 	defer fs.treeMu.RUnlock()
 	var limited []*memory
 	visit := func(c *cgroup) {
-		if m, ok := c.ctrls[kernel.Cgroup2Memory].(*memory); ok && m.isActive() && m.maxBytes.Load() != math.MaxInt64 {
+		if m, ok := c.ctrls[kernel.Cgroup2Memory].(*memory); ok && m.isActive() && m.maxBytes.Load() != math.MaxInt64 { // +checklocksforce: limitedMemory holds fs.treeMu while it walks
 			limited = append(limited, m)
 		}
 	}
 	root := fs.root.Inode().(*cgroup)
 	visit(root)
-	root.walkSubtreeLocked(func(c *cgroup) bool {
+	root.walkSubtreeLocked(func(c *cgroup) bool { // +checklocksforce: root.fs is fs
 		visit(c)
 		return true
 	})
@@ -354,8 +354,8 @@ func (fs *filesystem) checkMemoryLimits(ctx context.Context, k *kernel.Kernel, l
 	fs.treeMu.RLock()
 	for i, m := range limited {
 		subtrees[i] = make(map[uint32]struct{})
-		collectMemCgIDs(m.c, subtrees[i])
-		collectMemCgIDs(m.c, all)
+		collectMemCgIDs(m.c, subtrees[i]) // +checklocksforce: m.c.fs is fs
+		collectMemCgIDs(m.c, all)         // +checklocksforce: m.c.fs is fs
 	}
 	fs.treeMu.RUnlock()
 

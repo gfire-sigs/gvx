@@ -180,6 +180,7 @@ func TestDetachRemovesTheLimitAndLaterWritesOnlyStore(t *testing.T) {
 	}
 }
 
+// +checklocksignore: the test owns the cgroup and no other goroutine reads it.
 func TestRemovedCgroupReleasesItsLimit(t *testing.T) {
 	cc := newTestCPU(t, nil)
 	if err := cc.setMax(50000, 100000); err != nil {
@@ -215,6 +216,7 @@ func TestCPUStatUSecKeepsTheUsageAndClampsTheParts(t *testing.T) {
 	}
 }
 
+// +checklocksignore: the test owns the cgroups and no other goroutine reads them.
 func TestRemovedCgroupAddsItsUsageToTheNearestParentController(t *testing.T) {
 	parentCPU := newTestCPU(t, nil)
 	parentCgroup := &cgroup{}
