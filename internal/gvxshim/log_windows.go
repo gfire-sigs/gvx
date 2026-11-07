@@ -17,6 +17,7 @@ type windowsLogSink struct {
 	timeout     time.Duration
 	closed      bool
 	done        chan struct{}
+	abandoned   chan struct{}
 	closeOnce   sync.Once
 	readers     sync.WaitGroup
 	closeErr    error
@@ -35,7 +36,7 @@ func openLog(ctx context.Context, paths *instancePaths, diagnostics ownedEntry, 
 	if err != nil {
 		return logOutput{}, errors.Join(err, file.Close())
 	}
-	s := &windowsLogSink{listener: listener, diagnostics: file, timeout: writeTimeout, done: make(chan struct{})}
+	s := &windowsLogSink{listener: listener, diagnostics: file, timeout: writeTimeout, done: make(chan struct{}), abandoned: make(chan struct{})}
 	go s.accept()
 	return startBoundedLog(ctx, s), nil
 }
@@ -116,13 +117,20 @@ func (s *windowsLogSink) Close() error {
 		s.connection = nil
 		s.mu.Unlock()
 		listenerErr := s.listener.Close()
+		if errors.Is(listenerErr, errPipeListenerCloseTimeout) {
+			// The accept goroutine can stay in the listener; do not wait for it.
+			close(s.abandoned)
+		}
 		var connErr error
 		if conn != nil {
 			connErr = conn.Close()
 		}
 		s.closeErr = errors.Join(listenerErr, connErr, s.diagnostics.Close())
 	})
-	<-s.done
+	select {
+	case <-s.done:
+	case <-s.abandoned:
+	}
 	s.readers.Wait()
 	return s.closeErr
 }
