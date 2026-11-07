@@ -83,6 +83,12 @@ func newThread(newNet, drop bool) (*nsThread, error) {
 
 // do runs fn on the thread and returns its error.
 func (t *nsThread) do(fn func() error) error {
+	return t.doWithin(nsThreadTimeout, fn)
+}
+
+// doWithin runs fn on the thread and returns its error, or an error when fn
+// takes longer than timeout.
+func (t *nsThread) doWithin(timeout time.Duration, fn func() error) error {
 	done := make(chan error, 1)
 	t.tasks <- func() error {
 		done <- fn()
@@ -91,8 +97,8 @@ func (t *nsThread) do(fn func() error) error {
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(nsThreadTimeout):
-		return errors.New("the namespace thread gave no answer in 30s")
+	case <-time.After(timeout):
+		return fmt.Errorf("the namespace thread gave no answer in %v", timeout)
 	}
 }
 
