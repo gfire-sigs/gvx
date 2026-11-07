@@ -166,3 +166,18 @@ Run this procedure on `main` after CI passes for the last merge. The workflow `r
 3. Commit the change as `docs(changelog): release <tag>` and push `main`.
 4. Create the annotated tag `<tag>` on that commit and push it.
 5. Verify that the `release` workflow publishes the archives of the tag.
+
+---
+
+## 6. Change Size, Review, and Test Source Rules
+
+These rules come from regressions that passed CI: a frame code change that assumed one floating point layout (fixed in PR #84), a race fix that reused one lookup for two safety decisions (PR #81), and a limit that read a process-wide counter (PR #80). The table states each rule and the check that proves it.
+
+|Rule|Mandatory constraint|Check before merge|
+|:---|:---|:---|
+|**One behavior per Tier 3 PR**|A PR that changes Tier 3 files changes one behavior. Keep it below about 400 changed lines without tests and generated files. Split a larger change into PRs that each pass CI.|`gh pr diff <N> --name-only` and the PR body name the one behavior.|
+|**Independent review**|A PR that changes Tier 3 files, a platform engine, or a signal, memory, or lock path gets a review from a person or a reviewer agent that did not write it. Record the review result in the PR.|The PR has a review comment with findings or "no blocker".|
+|**Real producers in tests**|A test that checks data that crosses a boundary (register state, signal frames, shared memory, wire formats) gets the data from the real producer: the platform, the kernel, or a guest probe. A fixture that the test builds with the same assumption as the code is not proof.|The test fails when the producer and the consumer disagree. Show the failure before the fix.|
+|**One contract per shared format**|Define the layout of data that two packages share in one place, with named constants, and use those constants on both sides.|`rg` finds no literal offsets for the format outside its definition.|
+|**Invariant for each race fix**|A race fix names the invariant that it restores and checks every caller of each helper that it changes.|The PR body lists the invariant and the callers.|
+|**Per-sandbox state**|One host process can run several sandboxes. Do not read or write process-wide upstream state for a per-sandbox value. Record intentional process-wide state in `docs/architecture.md`.|A test runs two sandboxes in one process when the change touches accounting, limits, or IDs.|
