@@ -403,6 +403,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 	default:
 		// What happened? Can't continue.
 		t.Warningf("Unexpected SwitchToApp error: %v", err)
+		t.k.recordEngineFault(err)
 		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 		return (*runExit)(nil)
 	}

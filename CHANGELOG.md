@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Engine fault of the right sandbox**: the SDK kept the cause of the last engine fault in one variable for the whole process. A process that runs two sandboxes could return `ErrEngineFault` with the cause of the other sandbox. It could also return the exit code 137 without the error, because the other sandbox started and cleared the cause. The kernel of each sandbox now keeps its own cause (`kernel.Kernel.TakeEngineFault`), and the SDK reads it from the kernel of the sandbox that ended.
+
 ## [v0.10.10012026110200] - 2026-11-07
 
 This release fixes a regression of `v0.10.10002026110200`: a signal corrupted the floating point registers of an arm64 guest on Linux and macOS hosts. It also stops the `TaskSize` search after one probe on a host with a hardware address space size.
