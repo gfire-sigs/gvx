@@ -83,7 +83,7 @@ func (p *Platform) GlobalMemoryBarrier() error {
 	held := lockAllThreads(p.dbg.stubs())
 	defer func() {
 		for _, th := range held {
-			th.mu.Unlock()
+			th.mu.Unlock() // +checklocksforce: lockAllThreads locked every thread of held
 		}
 	}()
 
@@ -144,7 +144,7 @@ func lockAllThreads(stubs []*stubProc) []*thread {
 			return held
 		}
 		for _, th := range held {
-			th.mu.Unlock()
+			th.mu.Unlock() // +checklocksforce: the loop above locked every thread of held
 		}
 		busy.mu.Lock()
 		busy.mu.Unlock()
