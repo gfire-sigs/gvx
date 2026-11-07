@@ -14,7 +14,10 @@
 
 package hostfs
 
-import "time"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // The cap of watched objects plays the role of fs.inotify.max_user_watches on
 // Linux: inotify_add_watch fails with ENOSPC above it. The cap protects the
@@ -64,4 +67,43 @@ func watchLimitFromNofile(soft uint64, reserved int) int {
 // took pass. The delay never falls below the interval of the backend.
 func pollDelay(interval, pass time.Duration) time.Duration {
 	return max(interval, pollDutyFactor*pass)
+}
+
+// processWatches is the budget of watched objects that every workspace of the
+// process shares. The descriptors of the process are one resource. The cap of
+// one workspace follows the descriptor limit of the whole process, so the caps
+// of two workspaces together would pass that limit, and every later open of
+// every sandbox would fail with EMFILE. A watch that the budget refuses fails
+// with ENOSPC, as one that the cap of the workspace refuses.
+var processWatches processBudget
+
+// processBudget counts the watched objects of all workspaces.
+type processBudget struct {
+	// limit is the size of the budget. OpenWorkspace sets it from the host. A
+	// zero value stands for the largest cap.
+	limit atomic.Int64
+	// held is the number of watched objects of all workspaces.
+	held atomic.Int64
+}
+
+// acquire takes one slot of the budget. It reports false when none is free.
+func (b *processBudget) acquire() bool {
+	limit := b.limit.Load()
+	if limit == 0 {
+		limit = maxWatchedDentries
+	}
+	for {
+		held := b.held.Load()
+		if held >= limit {
+			return false
+		}
+		if b.held.CompareAndSwap(held, held+1) {
+			return true
+		}
+	}
+}
+
+// release gives n slots back.
+func (b *processBudget) release(n int) {
+	b.held.Add(-int64(n))
 }

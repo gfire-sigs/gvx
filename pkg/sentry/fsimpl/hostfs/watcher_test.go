@@ -765,6 +765,43 @@ func TestHostWatcherDefaultCapComesFromTheHost(t *testing.T) {
 	}
 }
 
+// TestWatchBudgetIsSharedByWorkspaces opens two workspaces of one process with a
+// budget of three watched objects. The second workspace gets only the slot that
+// the first one leaves, and a slot that a watch frees or a closed workspace
+// leaves goes back to the budget.
+func TestWatchBudgetIsSharedByWorkspaces(t *testing.T) {
+	oldLimit, oldHeld := processWatches.limit.Load(), processWatches.held.Load()
+	t.Cleanup(func() {
+		processWatches.limit.Store(oldLimit)
+		if got := processWatches.held.Load(); got != oldHeld {
+			t.Errorf("watched objects of the process after Close = %d, want %d", got, oldHeld)
+		}
+	})
+	a, b := newWatchEnv(t), newWatchEnv(t)
+	processWatches.limit.Store(oldHeld + 3)
+	for _, d := range []string{"a1", "a2"} {
+		a.mustMkdir(d)
+	}
+	for _, d := range []string{"b1", "b2"} {
+		b.mustMkdir(d)
+	}
+	wa1 := a.add("a1", hostEventMask)
+	a.add("a2", hostEventMask)
+	b.add("b1", hostEventMask)
+	if err := b.admit("b2"); !linuxerr.Equals(linuxerr.ENOSPC, err) {
+		t.Fatalf("admit of the fourth object of the process = %v, want ENOSPC", err)
+	}
+	if got := b.ws.watch.watchedCount(); got != 1 {
+		t.Errorf("watched objects of the second workspace = %d, want 1", got)
+	}
+
+	a.rm(wa1)
+	if err := b.admit("b2"); err != nil {
+		t.Fatalf("admit after the first workspace freed a slot = %v, want nil", err)
+	}
+	b.add("b2", hostEventMask)
+}
+
 func TestWatchLimitFollowsTheDescriptorLimit(t *testing.T) {
 	tests := []struct {
 		name     string
