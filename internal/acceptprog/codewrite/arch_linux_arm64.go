@@ -133,3 +133,4 @@ func syncICache(addr uintptr, n int) {
 
 func flushLine(addr uintptr)
 func callCode(fn, arg uintptr) uint32
+func storeByte(addr uintptr, v byte)

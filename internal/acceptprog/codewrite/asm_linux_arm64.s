@@ -36,3 +36,11 @@ TEXT ·callCode(SB), NOSPLIT, $0-20
 	CALL (R1)
 	MOVW R0, ret+16(FP)
 	RET
+
+// func storeByte(addr uintptr, v byte)
+// storeByte stores v at addr without a load.
+TEXT ·storeByte(SB), NOSPLIT, $0-9
+	MOVD  addr+0(FP), R0
+	MOVBU v+8(FP), R1
+	MOVB  R1, (R0)
+	RET
