@@ -197,12 +197,14 @@ func (m *winSysmsg) storeVector(ac *arch.Context64) { m.storeXsave(*ac.FloatingP
 
 // storeXsave copies the saved XSAVE image into the Linux XSAVE image fp. A
 // component that the saved image marks as initial becomes zeros, and its
-// XSTATE_BV bit becomes clear.
+// XSTATE_BV bit becomes clear. The x87 and SSE bits are always set, as
+// markLegacyState explains.
 func (m *winSysmsg) storeXsave(fp []byte) {
 	copy(fp[:min(len(fp), xsaveHeaderOffset)], m.Xsave[:xsaveHeaderOffset])
 	if len(fp) < xsaveHeaderOffset+8 {
 		return
 	}
+	markLegacyState(fp)
 	have := binary.LittleEndian.Uint64(m.Xsave[xsaveHeaderOffset:])
 	storeXStateComponents(fp, ^uint64(0), have, func(comp xstateComponent) []byte {
 		return m.Xsave[comp.offset : comp.offset+comp.size]

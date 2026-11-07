@@ -134,9 +134,9 @@ func TestWinSysmsgXsaveRoundTripsEveryComponent(t *testing.T) {
 			t.Errorf("storeXsave changed component %d on the way out of the sysmsg", comp.id)
 		}
 	}
-	// storeXsave sets the bits of the extended components and leaves the x87
-	// and SSE bits to the Sentry, as the Windows context path does.
-	if got, want := xsaveBV(dst), uint64(winXsaveMask&^winXsaveLegacy); got != want {
+	// storeXsave sets the bits of the extended components and the x87 and SSE
+	// bits, because the legacy region holds the registers of the thread.
+	if got, want := xsaveBV(dst), uint64(winXsaveMask); got != want {
 		t.Errorf("XSTATE_BV = %#x after storeXsave, want %#x", got, want)
 	}
 	for i := winXsaveSize; i < len(dst); i++ {
@@ -218,6 +218,30 @@ func TestWinSysmsgXsaveStoreClearsInitialComponents(t *testing.T) {
 	if !bytes.Equal(dst[1088:1088+64], make([]byte, 64)) {
 		t.Error("an initial component kept the old register contents in the Sentry image")
 	}
+}
+
+func TestStoreXsaveMarksX87AndSSEWhenTheImageMarksThemInitial(t *testing.T) {
+	var m winSysmsg
+	m.loadXsave(vectorImage(5), winXsaveMask)
+	// The processor can save an image with the x87 and SSE components marked
+	// as initial. The legacy region still holds the registers of the thread.
+	binary.LittleEndian.PutUint64(m.Xsave[xsaveHeaderOffset:], 1<<2)
+	fp := make([]byte, winXsaveSize)
+	m.storeXsave(fp)
+	if got, want := xsaveBV(fp), uint64(1<<2|winXsaveLegacy); got != want {
+		t.Errorf("XSTATE_BV = %#x, want %#x", got, want)
+	}
+}
+
+func TestMarkLegacyStateKeepsTheOtherBits(t *testing.T) {
+	fp := make([]byte, winXsaveSize)
+	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], 1<<2|1<<5)
+	markLegacyState(fp)
+	if got, want := xsaveBV(fp), uint64(1<<2|1<<5|winXsaveLegacy); got != want {
+		t.Errorf("XSTATE_BV = %#x, want %#x", got, want)
+	}
+	// An image without a header has no field to mark.
+	markLegacyState(fp[:xsaveHeaderOffset+4])
 }
 
 func TestWinSysmsgLoadVectorMarksTheImageDirty(t *testing.T) {
