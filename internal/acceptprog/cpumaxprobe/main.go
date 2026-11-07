@@ -21,13 +21,16 @@
 //
 // Usage:
 //
-//	cpumaxprobe checks [MINSHARE]
-//	                     run the checks, then print DONE. MINSHARE is the least
-//	                     share of its unlimited speed that a loop at a tenth of a
-//	                     CPU must keep. The default is 0.07.
-//	cpumaxprobe spin     the busy-loop child: wait for a line on stdin, then
+//	cpumaxprobe checks [NAME...]
+//	                     run the checks, then print DONE. With names, the
+//	                     program runs only the checks of those names.
+//	cpumaxprobe spin [duty]
+//	                     the busy-loop child: wait for a line on stdin, then
 //	                     loop until the parent kills the process. The child
 //	                     prints its loop count on stdout after each 2^24 turns.
+//	                     With duty, the child sleeps for 90 ms after each 10 ms
+//	                     of loop, so it has the duty cycle of a tenth of a CPU
+//	                     without a limit of cpu.max.
 package main
 
 import (
@@ -39,6 +42,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -54,6 +58,11 @@ const (
 	shortWindow = 3 * time.Second
 	settle      = 300 * time.Millisecond
 
+	// dutyBusy and dutySleep give the duty loop the demand of a tenth of a
+	// CPU, with the period of the cpu.max value 10000 100000.
+	dutyBusy  = 10 * time.Millisecond
+	dutySleep = 90 * time.Millisecond
+
 	// startLimit is the time that a busy-loop child has to report its first
 	// loop count after it started.
 	startLimit = 30 * time.Second
@@ -65,9 +74,14 @@ const (
 	resumeCPU = 100 * time.Millisecond
 )
 
-// minShare is the least share of its unlimited speed that a loop at a tenth of
-// a CPU keeps.
-var minShare = 0.07
+const (
+	// minShare is the least share of the progress of the duty-cycle loop that
+	// a loop at a tenth of a CPU keeps.
+	minShare = 0.5
+
+	// maxShare is the most share of that progress that the loop can keep.
+	maxShare = 1.8
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -76,18 +90,17 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "checks":
-		if len(os.Args) > 2 {
-			if v, err := strconv.ParseFloat(os.Args[2], 64); err == nil {
-				minShare = v
-			}
-		}
-		ok := runChecks()
+		ok := runChecks(os.Args[2:])
 		fmt.Println("DONE")
 		if !ok {
 			os.Exit(1)
 		}
 	case "spin":
-		spin()
+		if len(os.Args) > 2 && os.Args[2] != "duty" {
+			fmt.Fprintln(os.Stderr, "unknown argument", os.Args[2])
+			os.Exit(2)
+		}
+		spin(len(os.Args) > 2)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command", os.Args[1])
 		os.Exit(2)
@@ -97,8 +110,9 @@ func main() {
 // spin waits for one line on stdin, so that the parent can move the process
 // into a cgroup first. It then counts without a system call, and it reports the
 // count on stdout after each 2^24 turns. The count measures the progress of the
-// process independently of the CPU time that the Sentry bills.
-func spin() {
+// process independently of the CPU time that the Sentry bills. A duty loop
+// sleeps for dutySleep after each dutyBusy of counting.
+func spin(duty bool) {
 	var b [1]byte
 	for {
 		if _, err := os.Stdin.Read(b[:]); err != nil || b[0] == '\n' {
@@ -106,19 +120,27 @@ func spin() {
 		}
 	}
 	var n uint64
+	busyEnd := time.Now().Add(dutyBusy)
 	for {
 		n++
+		if duty && n&(1<<20-1) == 0 && !time.Now().Before(busyEnd) {
+			time.Sleep(dutySleep)
+			busyEnd = time.Now().Add(dutyBusy)
+		}
 		if n&(1<<24-1) == 0 {
 			os.Stdout.WriteString(strconv.FormatUint(n, 10) + "\n")
 		}
 	}
 }
 
-func runChecks() bool {
-	checks := []struct {
-		name string
-		fn   func() error
-	}{
+// check is one named check.
+type check struct {
+	name string
+	fn   func() error
+}
+
+func runChecks(only []string) bool {
+	checks := []check{
 		{"cpu-max-limits-busy-loop-to-half-cpu", checkHalfCPU},
 		{"cpu-max-max-gives-one-cpu-to-one-thread", checkUnlimited},
 		{"cpu-max-of-parent-limits-child", checkParentLimit},
@@ -140,8 +162,17 @@ func runChecks() bool {
 		fmt.Printf("FAIL cpu-enable-controller: %v\n", err)
 		return false
 	}
+	for _, name := range only {
+		if !slices.ContainsFunc(checks, func(c check) bool { return c.name == name }) {
+			fmt.Printf("FAIL unknown-check: no check named %q\n", name)
+			return false
+		}
+	}
 	ok := true
 	for _, c := range checks {
+		if len(only) > 0 && !slices.Contains(only, c.name) {
+			continue
+		}
 		if err := c.fn(); err != nil {
 			fmt.Printf("FAIL %s: %v\n", c.name, err)
 			ok = false
@@ -263,9 +294,9 @@ type spinner struct {
 }
 
 // startSpinner starts a busy-loop child, moves it into the cgroup dir, and
-// lets it run.
-func startSpinner(dir string) (*spinner, error) {
-	cmd := exec.Command("/proc/self/exe", "spin")
+// lets it run. The arguments follow "spin" on the command line of the child.
+func startSpinner(dir string, args ...string) (*spinner, error) {
+	cmd := exec.Command("/proc/self/exe", append([]string{"spin"}, args...)...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -408,18 +439,25 @@ func checkHalfCPU() error {
 	})
 }
 
-// checkUnlimited runs one busy thread without a limit. The CPU time of the
-// cgroup is the measured time of its tasks, so it cannot pass one CPU by much.
+// checkUnlimited runs one busy thread without a limit. The thread is alone in
+// the cgroup, because the loop program has no runtime and no helper threads.
+// The Sentry bills the wall time of each run of a task. One thread therefore
+// cannot read more than the wall time.
+//
+// A Go child has a monitor thread that wakes many times each second. The Sentry
+// bills each wake-up for the time that the host takes to run it. That sum read
+// 1.15 CPU on a Windows runner and 1.5 CPU on a loaded macOS host. It is not
+// the usage of the busy thread.
 func checkUnlimited() error {
 	return withCgroup(probeDir, func() error {
 		if err := writeFile(probeDir, "cpu.max", "max 100000"); err != nil {
 			return err
 		}
-		w, err := runSpinners(probeDir, 1, shortWindow)
+		w, err := runLoop(probeDir, shortWindow)
 		if err != nil {
 			return err
 		}
-		if err := expectCPUs(w, 0.9, 1.05); err != nil {
+		if err := expectCPUs(w, 0.95, 1.02); err != nil {
 			return err
 		}
 		if w.throttled != 0 {
@@ -429,22 +467,25 @@ func checkUnlimited() error {
 	})
 }
 
-// checkQuotaAboveDemand gives a busy Go program 2 CPUs. The program has other
-// threads, such as the runtime monitor. Their demand is 1.01 CPU on average. On a
-// Windows host, the wake-ups of these threads cost up to 1.5 CPU in one period,
-// and a window of 3 seconds can read 1.12 CPU, because the Sentry measures the
-// wall time of each wake-up. A quota of exactly one CPU would throttle the
-// program, as it would in Linux.
+// checkQuotaAboveDemand gives one busy thread 1.3 CPUs. The thread is alone in
+// the cgroup, so its usage cannot pass 1 CPU and the cgroup never throttles. A
+// charge above 1.4 CPU in each period would throttle it, so a double charge
+// fails this check. The 0.1 CPU is the debt that the Sentry tolerates.
+//
+// A Go program has helper threads, and the Sentry bills each wake-up of those
+// threads for the time that the host takes to run it. A stall of a Windows
+// runner billed such a program 1.17 CPU in 3 seconds. One period then ended in
+// debt of more than 10 ms. A Go program cannot show the rule of this check.
 func checkQuotaAboveDemand() error {
 	return withCgroup(probeDir, func() error {
-		if err := writeFile(probeDir, "cpu.max", "200000 100000"); err != nil {
+		if err := writeFile(probeDir, "cpu.max", "130000 100000"); err != nil {
 			return err
 		}
-		w, err := runSpinners(probeDir, 1, shortWindow)
+		w, err := runLoop(probeDir, shortWindow)
 		if err != nil {
 			return err
 		}
-		if err := expectCPUs(w, 0.9, 1.3); err != nil {
+		if err := expectCPUs(w, 0.95, 1.02); err != nil {
 			return err
 		}
 		if w.throttled != 0 {
@@ -511,11 +552,37 @@ func checkSharedQuota() error {
 }
 
 // checkSmallQuota gives one thread a tenth of a CPU. The CPU time that the
-// Sentry bills and the progress of the loop must both show a tenth of the speed
-// of the same loop without a limit.
+// Sentry bills must show a tenth of a CPU. The progress of the loop must match
+// the progress of a loop that sleeps 90 ms after each 10 ms of work, with no
+// limit in its cgroup.
+//
+// A loop does not run at its full speed after a long sleep, because the host CPU
+// needs time to speed up. A native loop with this duty cycle runs at 0.2 of its
+// full speed while it runs, on an Apple CPU. A comparison with the full speed
+// measures the host CPU and not the Sentry.
 func checkSmallQuota() error {
 	return withCgroup(probeDir, func() error {
 		if err := writeFile(probeDir, "cpu.max", "max 100000"); err != nil {
+			return err
+		}
+		duty, err := startSpinner(probeDir, "duty")
+		if err != nil {
+			return err
+		}
+		defer duty.stop()
+		if err := duty.waitProgress(startLimit); err != nil {
+			return err
+		}
+		time.Sleep(settle)
+		base, err := measure(probeDir, duty, quotaWindow)
+		if err != nil {
+			return err
+		}
+		if base.progress == 0 {
+			return errors.New("the duty loop made no progress")
+		}
+		duty.stop()
+		if err := writeFile(probeDir, "cpu.max", "10000 100000"); err != nil {
 			return err
 		}
 		s, err := startSpinner(probeDir)
@@ -523,15 +590,7 @@ func checkSmallQuota() error {
 			return err
 		}
 		defer s.stop()
-		time.Sleep(settle)
-		base, err := measure(probeDir, s, shortWindow)
-		if err != nil {
-			return err
-		}
-		if base.progress == 0 {
-			return errors.New("the loop made no progress without a limit")
-		}
-		if err := writeFile(probeDir, "cpu.max", "10000 100000"); err != nil {
+		if err := s.waitProgress(startLimit); err != nil {
 			return err
 		}
 		time.Sleep(time.Second)
@@ -542,8 +601,8 @@ func checkSmallQuota() error {
 		if err := expectCPUs(w, 0.07, 0.13); err != nil {
 			return fmt.Errorf("billed time: %w", err)
 		}
-		if share := w.progress / base.progress; share < minShare || share > 0.13 {
-			return fmt.Errorf("the loop ran at %.3f of its unlimited speed, want %.2f to 0.13", share, minShare)
+		if share := w.progress / base.progress; share < minShare || share > maxShare {
+			return fmt.Errorf("the loop at a tenth of a CPU made %.3f of the progress of a loop with the same duty cycle, want %.2f to %.2f", share, minShare, maxShare)
 		}
 		return nil
 	})
@@ -823,6 +882,21 @@ func startLoop(dir string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
+// runLoop starts the loop program in dir, lets it settle, and measures dir over
+// d. It stops the program before it returns.
+func runLoop(dir string, d time.Duration) (window, error) {
+	cmd, err := startLoop(dir)
+	if err != nil {
+		return window{}, err
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	time.Sleep(settle)
+	return measure(dir, nil, d)
+}
+
 // checkNoSyscallLoop limits a program that makes no system call. The Sentry never
 // sees such a program, so the engine must interrupt it to throttle it.
 func checkNoSyscallLoop() error {
@@ -830,16 +904,7 @@ func checkNoSyscallLoop() error {
 		if err := writeFile(probeDir, "cpu.max", "50000 100000"); err != nil {
 			return err
 		}
-		cmd, err := startLoop(probeDir)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}()
-		time.Sleep(settle)
-		w, err := measure(probeDir, nil, quotaWindow)
+		w, err := runLoop(probeDir, quotaWindow)
 		if err != nil {
 			return err
 		}

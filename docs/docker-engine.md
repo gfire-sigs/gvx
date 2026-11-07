@@ -232,15 +232,19 @@ A container with `docker run --cpus N` gets `cpu.max` in its cgroup. The value i
 | Unlimited | `max` removes the limit. A sandbox without a finite `cpu.max` pays one atomic load for each return to guest code. |
 | Not enforced | `cpu.weight` and the burst limit of Linux. |
 
-The next table lists the measured results of the test A14 and its companions. Each row is one busy Go loop. The loop has other threads, such as the runtime monitor, so its demand is 1.01 to 1.03 CPU on average. On a Windows host, the wake-ups of those threads cost up to 1.5 CPU in one period.
+The next table lists the measured results of the test A14 and its companions. The rows `max` and `130000 100000` run a static program with one thread and no runtime. The other rows run a busy Go loop. A Go loop has other threads, such as the runtime monitor. Its demand is 1.01 to 1.03 CPU on average.
+
+The Sentry bills each run of a thread for its wall time. Each wake-up of the monitor thread therefore bills the time that the host needs to run it. On a loaded host that sum is large. A Go loop read 1.17 CPU on a Windows runner and 1.5 CPU on a macOS host with busy processes. A static loop reads 1.00 CPU on the same hosts, so the tests use it for every claim about one thread.
 
 | Case | `hvf` | Linux `systrap` | Windows `systrap` and `whpx` |
 | :--- | :--- | :--- | :--- |
 | `50000 100000`, 5 s | 0.50 CPU | 0.50 CPU | 0.50 CPU |
-| `max`, 3 s | 1.01 CPU | 1.00 to 1.03 CPU | 1.00 to 1.01 CPU |
+| `max`, 3 s, static loop | 1.00 CPU | not measured | 1.00 CPU |
 | `10000 100000`, billed time | 0.10 CPU | 0.10 CPU | 0.10 CPU |
-| `10000 100000`, progress of the loop | 0.03 to 0.08 of full speed | 0.09 to 0.10 of full speed | 0.09 to 0.10 of full speed |
-| `200000 100000`, `nr_throttled` | 0 | 0 | 0 |
+| `10000 100000`, progress of the loop, as a share of a loop with the same duty cycle | 0.76 to 1.41 | not measured | 0.96 to 1.12 |
+| `130000 100000`, `nr_throttled`, static loop | 0 | not measured | 0 |
 | `100000 100000`, `nr_throttled` | 14 in 3 s | 18 in 3 s | not measured |
 
-A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same. On `hvf`, resuming a throttled task costs several milliseconds inside the platform. A loop at a tenth of a CPU therefore keeps 0.03 to 0.08 of its speed.
+A quota of exactly one CPU throttles a Go program, because its demand is above 1.0 CPU. Linux does the same.
+
+The duty-cycle loop sleeps 90 ms after each 10 ms of work, and it has no limit. On an Apple CPU, a native loop with that duty cycle runs at 0.21 of its full speed while it runs. It makes 0.02 of the iterations of a loop that never sleeps, and the ideal is 0.1. The CPU needs time to speed up after a sleep. A comparison with the full speed therefore measures the host CPU.
