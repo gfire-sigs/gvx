@@ -342,12 +342,24 @@ func TestFastPathIslandSlotsReclaimedOnRepatchAndUnmap(t *testing.T) {
 	}
 
 	r.as.Unmap(hostarch.Addr(dataVA), blockSize)
+	// The thread waits in the spill routine of the last trap, so it holds that
+	// slot as its pin. Reclaim must free every other slot of the block.
+	r.as.mu.Lock()
+	r.as.reclaimSlotsLocked()
+	held := r.as.quarantineUnitsLocked()
+	r.as.mu.Unlock()
+	if want := slotUnits(winSlotSize); held != want {
+		t.Fatalf("quarantine holds %d units after Unmap and reclaim, want %d for the pinned slot", held, want)
+	}
+	// A released thread holds no slot.
+	r.ctx.Release()
 	r.as.mu.Lock()
 	defer r.as.mu.Unlock()
+	r.as.reclaimSlotsLocked()
 	for base, isl := range r.as.islands {
-		for wIdx, bits := range isl.usedBits {
+		for wIdx, bits := range isl.used {
 			if bits != 0 {
-				t.Errorf("island %#x word %d has usedBits %#x after Unmap, want 0", base, wIdx, bits)
+				t.Errorf("island %#x word %d has used units %#x after Unmap and release of the thread, want 0", base, wIdx, bits)
 			}
 		}
 	}

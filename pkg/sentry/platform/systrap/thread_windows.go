@@ -183,6 +183,11 @@ func (th *thread) park(ev debugEvent) error {
 		return th.ctxErr("NtSuspendThread", err)
 	}
 	th.parked = true
+	if f := th.fast.Load(); f != nil {
+		// The thread is suspended, and resumeParked replaces its registers, so
+		// it cannot be inside a slot until it runs again.
+		f.slot.reader.goOffline(0)
+	}
 	if err := th.sp.p.dbg.reply(ev); err != nil {
 		return th.ctxErr("NtDebugContinue", err)
 	}
@@ -196,6 +201,9 @@ func (th *thread) resumeParked() error {
 		return err
 	}
 	th.parked = false
+	if f := th.fast.Load(); f != nil {
+		f.slot.reader.goOnline()
+	}
 	if err := ntResumeThread(th.h); err != nil {
 		return th.ctxErr("NtResumeThread", err)
 	}

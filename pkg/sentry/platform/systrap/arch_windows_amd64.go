@@ -195,7 +195,7 @@ func (th *thread) archStart(ac *arch.Context64) error {
 // ran. The slot keeps a restart on the fast path.
 func (th *thread) startPC(pc uint64) uint64 {
 	if as := th.sp.owner.Load(); as != nil {
-		if entry, ok := as.relocatedEntry(pc, true); ok {
+		if entry, ok := as.relocatedEntry(pc, true, th.slotReader()); ok {
 			return entry
 		}
 	}
@@ -215,10 +215,10 @@ func (th *thread) resumePC(pc uint64) uint64 {
 	if as == nil {
 		return pc
 	}
-	if entry, ok := as.relocatedEntry(pc, false); ok {
+	if entry, ok := as.relocatedEntry(pc, false, th.slotReader()); ok {
 		return entry
 	}
-	if tail, ok := as.jumpTail(pc); ok {
+	if tail, ok := as.jumpTail(pc, th.slotReader()); ok {
 		return tail
 	}
 	return pc
@@ -227,8 +227,10 @@ func (th *thread) resumePC(pc uint64) uint64 {
 // relocatedEntry returns the address in a pre-window slot where a thread
 // continues when it starts at the guest address pc. It returns false when pc is
 // not a relocated instruction of a pre-window. With syscall set, it also
-// returns the entry code of the slot for the SYSCALL of a pre-window.
-func (as *addressSpace) relocatedEntry(pc uint64, syscall bool) (uint64, bool) {
+// returns the entry code of the slot for the SYSCALL of a pre-window. The
+// thread that starts at the entry holds the slot as its pin (reader), because a
+// drop and a reuse of the slot can follow before the thread runs.
+func (as *addressSpace) relocatedEntry(pc uint64, syscall bool, reader *epochReader) (uint64, bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	blk := as.blocks[blockRound(pc)]
@@ -239,6 +241,7 @@ func (as *addressSpace) relocatedEntry(pc uint64, syscall bool) (uint64, bool) {
 	if !ok || s.entry == 0 || (s.kind == amd64SiteSyscall && !syscall) {
 		return 0, false
 	}
+	as.pinSlotLocked(reader, s.entry)
 	return s.entry, true
 }
 
@@ -264,8 +267,9 @@ func (th *thread) guestPC(pc uint64) uint64 {
 
 // jumpTail returns the slot tail for the return address pc of a SYSCALL that
 // became a JMP. The JMP overwrote the bytes at pc, so the thread must continue
-// in the slot instead.
-func (as *addressSpace) jumpTail(pc uint64) (uint64, bool) {
+// in the slot instead. The thread that starts at the tail holds the slot as its
+// pin (reader), as relocatedEntry explains.
+func (as *addressSpace) jumpTail(pc uint64, reader *epochReader) (uint64, bool) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	blk := as.blocks[blockRound(pc)]
@@ -276,6 +280,7 @@ func (as *addressSpace) jumpTail(pc uint64) (uint64, bool) {
 	if !ok || s.kind != winSiteJump {
 		return 0, false
 	}
+	as.pinSlotLocked(reader, s.tail)
 	return s.tail, true
 }
 
@@ -737,7 +742,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	}
 	if _, err := patchAMD64(page, keep); err != nil {
 		as.mu.Lock()
-		freeSlotRefsLocked(slots)
+		discardSlotRefsLocked(slots)
 		as.mu.Unlock()
 		return nil, nil, err
 	}
@@ -756,7 +761,7 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 	if err == nil {
 		if err = patchJmp(page, off, site, slotVA); err != nil {
 			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
+			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
 		}
 	}
@@ -797,7 +802,7 @@ func (as *addressSpace) patchJumpBefore(ctx context.Context, mm platform.MemoryM
 	if err == nil {
 		if err = patchJmpSite(page, pl.start, off-pl.start, jmpVA, slotVA); err != nil {
 			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
+			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
 		}
 	}
@@ -827,7 +832,7 @@ func (as *addressSpace) patchTLSBaseJump(ctx context.Context, mm platform.Memory
 	if err == nil {
 		if err = patchJmpSite(page, s.Offset, s.Len, site, slotVA); err != nil {
 			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
+			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
 		}
 	}
@@ -855,7 +860,7 @@ func (as *addressSpace) patchGSMovJump(ctx context.Context, mm platform.MemoryMa
 	if err == nil {
 		if err = patchJmpSite(page, s.Offset, s.Len, site, slotVA); err != nil {
 			as.mu.Lock()
-			ref.isl.free(ref.off, ref.size)
+			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
 		}
 	}

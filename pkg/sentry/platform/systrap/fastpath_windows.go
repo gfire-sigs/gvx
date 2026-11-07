@@ -199,6 +199,10 @@ type fastSlot struct {
 	va  uint64
 	sec *anonSection
 	sm  *winSysmsg
+	// reader is the quiescence state of the thread that owns the slot. The
+	// contract in fastisland_windows.go explains it. It is offline while no
+	// thread owns the slot.
+	reader *epochReader
 	// guest and host are the events in the Sentry process.
 	guest, host windows.Handle
 	// sleeps counts the sleeps of the Sentry on guest, and wakes counts the
@@ -315,7 +319,7 @@ func (as *addressSpace) newSlot(idx int) (*fastSlot, error) {
 		sec.close()
 		return nil, as.mapErr(err)
 	}
-	s := &fastSlot{index: idx, va: va, sec: sec, sm: (*winSysmsg)(unsafe.Pointer(&sec.local[0])), guest: ev.guest, host: ev.host}
+	s := &fastSlot{index: idx, va: va, sec: sec, sm: (*winSysmsg)(unsafe.Pointer(&sec.local[0])), reader: as.epochs.newReader(), guest: ev.guest, host: ev.host}
 	s.sm.GuestEvent = uint64(ev.stubGuest)
 	s.sm.HostEvent = uint64(ev.stubHost)
 	s.sm.NtSetEvent = as.p.ntSetEvent
@@ -333,6 +337,8 @@ func (sp *stubProc) putSlot(s *fastSlot) {
 		s.close()
 		return
 	}
+	// The thread is gone, so it cannot be inside a slot.
+	s.reader.goOffline(0)
 	hdr := s.sm.winSysmsgHeader
 	clear(s.sec.local[:winSysmsgSize])
 	s.sm.GuestEvent, s.sm.HostEvent = hdr.GuestEvent, hdr.HostEvent
@@ -390,6 +396,15 @@ func (as *addressSpace) attachFast(th *thread) error {
 		return err
 	}
 	th.fast.Store(&fastThread{slot: slot})
+	return nil
+}
+
+// slotReader returns the epoch reader of the thread, or nil when the thread has
+// no fast slot.
+func (th *thread) slotReader() *epochReader {
+	if f := th.fast.Load(); f != nil {
+		return f.slot.reader
+	}
 	return nil
 }
 
@@ -458,6 +473,9 @@ func (th *thread) fastTrapLocked(as *addressSpace, f *fastThread, ac *arch.Conte
 	if !ok {
 		return fmt.Errorf("the stub trapped from unknown slot %#x", sm.Tail)
 	}
+	// The thread waits in the spill routine and can leave only through the tail
+	// of this slot or through the Sentry. The pin keeps the slot until then.
+	f.slot.reader.goOffline(sm.Tail - winSlotTailOffset)
 	f.trap = newWinTrap(site, &sm.Regs)
 	sm.Regs.storeTo(ac, f.trap.ret)
 	th.archFastTrap(ac)
@@ -478,13 +496,8 @@ func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) erro
 	}
 	sm := f.slot.sm
 	f.resume = f.trap.resumeState(ac)
-	if f.resume == winStateRunHot {
-		as := th.sp.owner.Load()
-		if as == nil {
-			f.resume = winStateRunCold
-		} else if site, ok := as.liveSlotAtTail(sm.Tail); !ok || site != f.trap.site || !th.archFastHot(ac) {
-			f.resume = winStateRunCold
-		}
+	if f.resume == winStateRunHot && !th.archFastHot(ac) {
+		f.resume = winStateRunCold
 	}
 	sm.Regs.loadFrom(ac)
 	sm.Target = archPC(ac)
@@ -496,6 +509,12 @@ func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) erro
 // fastRun releases a thread that waits in the spill routine. Callers hold mu.
 func (th *thread) fastRun(f *fastThread) error {
 	f.inSpill = false
+	// A cold resume never runs the slot again, so the pin ends here. A hot
+	// resume keeps the pin until the thread traps or parks again.
+	if f.resume == winStateRunCold {
+		f.slot.reader.clearPin()
+	}
+	f.slot.reader.goOnline()
 	if _, err := f.slot.sm.winSysmsgHeader.release(f.resume, f.slot); err != nil {
 		return th.ctxErr("SetEvent", err)
 	}
