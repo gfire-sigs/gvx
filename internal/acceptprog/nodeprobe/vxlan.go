@@ -912,7 +912,10 @@ func vxlanChecks() []check {
 			// The old cap was 65,536 for each link and family. Linux keeps a
 			// NUD_PERMANENT entry off the garbage collection list, so it has no
 			// limit. The check covers an Ethernet link, a vxlan link, and IPv6.
-			return a.do(func() error {
+			// It makes 210,000 netlink requests, which take more than 30 s on
+			// a loaded runner with the whpx backend, where each system call
+			// exits the VM.
+			return a.doWithin(3*time.Minute, func() error {
 				h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 				if err != nil {
 					return err
