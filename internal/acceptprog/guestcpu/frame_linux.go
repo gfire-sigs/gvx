@@ -65,6 +65,8 @@ type Frame struct {
 	// StackSP and StackSize are the base and the size in uc_stack, the signal
 	// stack of the interrupted thread.
 	StackSP, StackSize uint64
+	// StackFlags is uc_stack.ss_flags.
+	StackFlags int32
 	// Sigmask is uc_sigmask, the signal mask of the interrupted thread.
 	Sigmask uint64
 	// Arch holds the fields that exist on one architecture only.
@@ -88,9 +90,10 @@ func CapturedFrame() (*Frame, error) {
 			Pid:   binary.LittleEndian.Uint32(c.Info[siAddr:]),
 			Addr:  binary.LittleEndian.Uint64(c.Info[siAddr:]),
 		},
-		StackSP:   binary.LittleEndian.Uint64(c.UC[ucStackSP:]),
-		StackSize: binary.LittleEndian.Uint64(c.UC[ucStackSize:]),
-		Sigmask:   binary.LittleEndian.Uint64(c.UC[ucSigmask:]),
+		StackSP:    binary.LittleEndian.Uint64(c.UC[ucStackSP:]),
+		StackSize:  binary.LittleEndian.Uint64(c.UC[ucStackSize:]),
+		StackFlags: int32(binary.LittleEndian.Uint32(c.UC[ucStackFlags:])),
+		Sigmask:    binary.LittleEndian.Uint64(c.UC[ucSigmask:]),
 	}
 	if int32(c.Sig) != f.Info.Signo {
 		return nil, errors.New("the signal number of the handler differs from si_signo")

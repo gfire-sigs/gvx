@@ -310,12 +310,11 @@ func (t *Task) deliverSignalToHandler(info *linux.SignalInfo, act linux.SigActio
 
 	// N.B. This is a *copy* of the alternate stack that the user's signal
 	// handler expects to see in its ucontext (even if it's not in use).
-	alt := t.signalStack
-	if act.Flags&linux.SA_ONSTACK != 0 && alt.IsEnabled() {
-		alt.Flags |= linux.SS_ONSTACK
-		if !alt.Contains(sp) {
-			sp = hostarch.Addr(alt.Top())
-		}
+	// As in Linux (__save_altstack), SS_ONSTACK in uc_stack tells whether
+	// the interrupted code ran on the alternate stack.
+	alt := t.SignalStack()
+	if act.Flags&linux.SA_ONSTACK != 0 && alt.IsEnabled() && !alt.Contains(sp) {
+		sp = hostarch.Addr(alt.Top())
 	}
 
 	mm := t.MemoryManager()

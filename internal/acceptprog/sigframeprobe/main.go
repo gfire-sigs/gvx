@@ -144,17 +144,17 @@ func sigmask() (uint64, error) {
 }
 
 // checkContext checks the fields of the frame that do not depend on the event:
-// the signal stack and the signal mask of the interrupted thread. It does not
-// compare uc_stack.ss_flags. Linux sets SS_ONSTACK there only when the
-// interrupted code ran on the signal stack, and the Sentry always sets it.
+// the signal stack and the signal mask of the interrupted thread. Linux sets
+// SS_ONSTACK in uc_stack.ss_flags only when the interrupted code ran on the
+// signal stack, so the flags equal what sigaltstack reports in that code.
 func checkContext(f *guestcpu.Frame) error {
-	sp, size, _, err := sigaltstack()
+	sp, size, flags, err := sigaltstack()
 	if err != nil {
 		return fmt.Errorf("sigaltstack: %w", err)
 	}
-	if f.StackSP != sp || f.StackSize != size {
-		return fmt.Errorf("uc_stack = {sp %#x, size %#x}, want the signal stack {sp %#x, size %#x}",
-			f.StackSP, f.StackSize, sp, size)
+	if f.StackSP != sp || f.StackSize != size || f.StackFlags != flags {
+		return fmt.Errorf("uc_stack = {sp %#x, size %#x, flags %#x}, want the signal stack {sp %#x, size %#x, flags %#x}",
+			f.StackSP, f.StackSize, f.StackFlags, sp, size, flags)
 	}
 	mask, err := sigmask()
 	if err != nil {

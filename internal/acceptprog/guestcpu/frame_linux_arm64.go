@@ -34,13 +34,14 @@ const (
 	// fpMax is zero: the FP record is part of the ucontext on arm64.
 	fpMax = 0
 
-	ucStackSP   = 16
-	ucStackSize = 32
-	ucSigmask   = 40
-	ucFaultAddr = 176
-	ucRegs      = 184
-	ucSP        = 432
-	ucPC        = 440
+	ucStackSP    = 16
+	ucStackFlags = 24
+	ucStackSize  = 32
+	ucSigmask    = 40
+	ucFaultAddr  = 176
+	ucRegs       = 184
+	ucSP         = 432
+	ucPC         = 440
 	// ucReserved is the start of the records. The first record is the
 	// fpsimd_context.
 	ucReserved = 464
