@@ -29,6 +29,66 @@ import (
 // the reach of the jump. The island is a sealed mapping that the memory manager
 // knows, so that the guest cannot map over it. The engine maps a private page
 // of slot code over the frame that the memory manager holds.
+//
+// # Slot lifecycle contract
+//
+// A slot is a range of bytes in an island page with a record (islandSlot). The
+// bytes hold the entry code, the call of the spill routine, and the tail. The
+// tail restores the registers and returns to the guest after a hot resume. A
+// slot is in one of four states. islandarena_xplat.go implements the states.
+//
+//	Free        No thread runs the bytes. No record exists. alloc can return the units.
+//	Allocated   alloc returned the units. The installer writes the bytes. No record
+//	            exists, and no branch names the slot.
+//	Live        The installer recorded the slot. The block of the slot maps its page,
+//	            so a thread enters the slot through the branch at the site.
+//	Quarantined The block dropped its page, so no branch to the slot is visible.
+//	            A thread that entered before the drop can still be inside the slot.
+//	            The bytes and the record stay as they were.
+//
+// Free becomes Allocated in alloc. Allocated becomes Live in record, and it
+// becomes Free in discard when the encoder fails. Live becomes Free in discard
+// only for a slot whose branch never became visible to the stub. Live becomes
+// Quarantined in retire, and Quarantined becomes Free in reclaim. No other
+// transition exists.
+//
+// Rules that every caller obeys:
+//
+//  1. retire runs after the stub lost the executable page that holds the
+//     branch: after MapFile replaced the block, after Unmap, after
+//     returnToDataLocked, or after the stub process ended. A thread that goes
+//     online after retire cannot enter the slot.
+//  2. Only the code that holds as.mu reads or writes a record. Decode
+//     (fastTrapLocked), rewindToSite, svcSlotFault, and slotContaining read the
+//     record of a Live or Quarantined slot, and copy it before they unlock. No
+//     code reads the record of a Free or Allocated slot.
+//  3. encode writes the bytes of an Allocated slot only. The page of the slot is
+//     executable in the stub while encode writes, so no thread can be inside the
+//     slot.
+//  4. A thread is inside a slot from the branch at the site until it leaves the
+//     tail or goes cold. The Sentry sees the thread leave when the thread traps
+//     again or parks. Both are quiescent points of the thread (epochReader).
+//  5. reclaim frees a Quarantined slot only when every thread is offline or went
+//     online after the retire, and no thread holds the slot as its pin. A thread
+//     that decoded a trap at the slot holds the pin until it resumes cold, traps
+//     again, or parks. A thread that the Sentry sends to an island address gets
+//     the pin while the Sentry holds as.mu. A clone child, a restart, and the
+//     retry of a fault do this.
+//  6. A hot resume runs the tail of the slot of the trap, whether the slot is
+//     Live or Quarantined. Rule 5 keeps the bytes until the thread traps or
+//     parks again. The tail jumps to the code behind the patched bytes of the
+//     site. That address is valid in every later patch of the same code. The
+//     Sentry never turns a hot resume into a cold one because the block dropped.
+//  7. allocSlot fails when no island has room and the quarantine holds
+//     winQuarantineLimit units or more. The site then keeps its trap. One drop
+//     can push the quarantine past the limit.
+//
+// A thread that stops inside a slot reports a guest address that the Sentry
+// converted (guestPC, svcSlotFault, rewindToSite) before it parked the thread,
+// or it continues in place without a park. One case has no conversion. A fault
+// in a relocated instruction of a post-window slot reports the address of the
+// slot. A signal handler of the guest can then resume inside the slot. That
+// case is outside the contract.
 
 // winIslandReach is the largest distance between a patched instruction and the
 // island that holds its slot. A B instruction reaches 128MiB on arm64. The
