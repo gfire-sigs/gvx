@@ -89,10 +89,6 @@ func main() {
 	fmt.Println("REGPROBE-OK")
 }
 
-// negErrno returns the value that a system call leaves in the result register
-// when it fails with e.
-func negErrno(e syscall.Errno) uint64 { return -uint64(e) }
-
 func checkSyscall() error {
 	in := guestcpu.NewState(1)
 	in.SetSyscall(syscall.SYS_GETPID)
@@ -188,7 +184,7 @@ func checkSignalInBlockingSyscall() error {
 		return fmt.Errorf("nanosleep left %v of %v", left, sleepLength)
 	}
 	want := in
-	want.SetResult(negErrno(syscall.EINTR))
+	want.SetResult(guestcpu.NegErrno(syscall.EINTR))
 	return guestcpu.Compare(&want, &out, guestcpu.SyscallClobbers()...)
 }
 
@@ -258,6 +254,6 @@ func checkSignalInUnrestartedSyscall() error {
 		return fmt.Errorf("the signal handler ran %d times, want 1", n)
 	}
 	want := in
-	want.SetResult(negErrno(syscall.EINTR))
+	want.SetResult(guestcpu.NegErrno(syscall.EINTR))
 	return guestcpu.Compare(&want, &out, guestcpu.SyscallClobbers()...)
 }

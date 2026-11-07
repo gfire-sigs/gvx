@@ -182,24 +182,177 @@ spin:
 TEXT ·runFault(SB), NOSPLIT, $const_frameSize-16
 	ENTER
 	LOAD_STATE
-	MOVQ $0, (SI)
+	// MOVQ $0, (SI) with a fixed length of const_faultInsnLen bytes.
+	BYTE $0x48; BYTE $0xc7; BYTE $0x06; LONG $0
 	STORE_STATE
 	LEAVE
+
+// EDIT_FRAME writes the State at R13 into the frame: the ucontext at R9 and
+// the xsave area that its fpstate field names. It leaves RSP and RIP alone.
+#define EDIT_FRAME \
+	MOVQ GPR(const_RAX)(R13), AX; \
+	MOVQ AX, const_ucRAX(R9); \
+	MOVQ GPR(const_RBX)(R13), AX; \
+	MOVQ AX, const_ucRBX(R9); \
+	MOVQ GPR(const_RCX)(R13), AX; \
+	MOVQ AX, const_ucRCX(R9); \
+	MOVQ GPR(const_RDX)(R13), AX; \
+	MOVQ AX, const_ucRDX(R9); \
+	MOVQ GPR(const_RSI)(R13), AX; \
+	MOVQ AX, const_ucRSI(R9); \
+	MOVQ GPR(const_RDI)(R13), AX; \
+	MOVQ AX, const_ucRDI(R9); \
+	MOVQ GPR(const_RBP)(R13), AX; \
+	MOVQ AX, const_ucRBP(R9); \
+	MOVQ GPR(const_R8)(R13), AX; \
+	MOVQ AX, const_ucR8(R9); \
+	MOVQ GPR(const_R9)(R13), AX; \
+	MOVQ AX, const_ucR9(R9); \
+	MOVQ GPR(const_R10)(R13), AX; \
+	MOVQ AX, const_ucR10(R9); \
+	MOVQ GPR(const_R11)(R13), AX; \
+	MOVQ AX, const_ucR11(R9); \
+	MOVQ GPR(const_R12)(R13), AX; \
+	MOVQ AX, const_ucR12(R9); \
+	MOVQ GPR(const_R13)(R13), AX; \
+	MOVQ AX, const_ucR13(R9); \
+	MOVQ GPR(const_R14)(R13), AX; \
+	MOVQ AX, const_ucR14(R9); \
+	MOVQ GPR(const_R15)(R13), AX; \
+	MOVQ AX, const_ucR15(R9); \
+	MOVQ const_ucFpstate(R9), R14; \
+	MOVOU VEC(0)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*0)(R14); \
+	MOVOU VEC(1)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*1)(R14); \
+	MOVOU VEC(2)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*2)(R14); \
+	MOVOU VEC(3)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*3)(R14); \
+	MOVOU VEC(4)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*4)(R14); \
+	MOVOU VEC(5)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*5)(R14); \
+	MOVOU VEC(6)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*6)(R14); \
+	MOVOU VEC(7)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*7)(R14); \
+	MOVOU VEC(8)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*8)(R14); \
+	MOVOU VEC(9)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*9)(R14); \
+	MOVOU VEC(10)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*10)(R14); \
+	MOVOU VEC(11)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*11)(R14); \
+	MOVOU VEC(12)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*12)(R14); \
+	MOVOU VEC(13)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*13)(R14); \
+	MOVOU VEC(14)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*14)(R14); \
+	MOVOU VEC(15)(R13), X0; \
+	MOVOU X0, (const_fpXMM+16*15)(R14); \
+	CMPB ·hasAVX(SB), $0; \
+	JEQ editnoymm; \
+	MOVOU (VEC(0)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*0)(R14); \
+	MOVOU (VEC(1)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*1)(R14); \
+	MOVOU (VEC(2)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*2)(R14); \
+	MOVOU (VEC(3)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*3)(R14); \
+	MOVOU (VEC(4)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*4)(R14); \
+	MOVOU (VEC(5)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*5)(R14); \
+	MOVOU (VEC(6)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*6)(R14); \
+	MOVOU (VEC(7)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*7)(R14); \
+	MOVOU (VEC(8)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*8)(R14); \
+	MOVOU (VEC(9)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*9)(R14); \
+	MOVOU (VEC(10)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*10)(R14); \
+	MOVOU (VEC(11)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*11)(R14); \
+	MOVOU (VEC(12)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*12)(R14); \
+	MOVOU (VEC(13)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*13)(R14); \
+	MOVOU (VEC(14)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*14)(R14); \
+	MOVOU (VEC(15)+16)(R13), X0; \
+	MOVOU X0, (const_fpYMMHi+16*15)(R14); \
+	editnoymm:; \
+	MOVL State_MXCSR(R13), AX; \
+	MOVL AX, (const_fpMXCSR)(R14); \
+	MOVW State_FCW(R13), AX; \
+	MOVW AX, (const_fpFCW)(R14)
 
 // func evilHandler()
 // The kernel calls the handler with DI = signal, SI = siginfo, DX = ucontext.
 TEXT ·evilHandler(SB), NOSPLIT, $0-0
+	CLD
+	MOVQ DI, R11 // signal
+	MOVQ SI, R10 // siginfo
+	MOVQ DX, R9  // ucontext
+	MOVL ·handlerMode(SB), R12
 	INCL ·sigCount(SB)
 	MOVL ·spinFlag(SB), AX
 	MOVL AX, ·flagSeen(SB)
-	CMPQ DI, $11 // SIGSEGV
+	TESTL $const_ModeCapture, R12
+	JZ    nocapture
+	LEAQ  ·captured(SB), R8
+	MOVQ  R11, capture_Sig(R8)
+	MOVQ  R9, capture_UCAddr(R8)
+	MOVQ  R10, SI
+	LEAQ  capture_Info(R8), DI
+	MOVQ  $(const_siBytes/8), CX
+	REP; MOVSQ
+	MOVQ  R9, SI
+	LEAQ  capture_UC(R8), DI
+	MOVQ  $(const_ucBytes/8), CX
+	REP; MOVSQ
+	MOVQ  const_ucFpstate(R9), SI
+	MOVQ  SI, capture_FPAddr(R8)
+	TESTQ SI, SI
+	JZ    nocapture
+	// The software bytes of the xsave area hold its size. Copy that size and
+	// the 4 bytes of magic2 behind it, but at most the buffer.
+	MOVL  (const_fpSWBytes+16)(SI), CX
+	ADDQ  $11, CX
+	SHRQ  $3, CX
+	CMPQ  CX, $(const_fpMax/8)
+	JLS   fpcopy
+	MOVQ  $(const_fpMax/8), CX
+fpcopy:
+	LEAQ  capture_FP(R8), DI
+	REP; MOVSQ
+nocapture:
+	TESTL $const_ModeEdit, R12
+	JZ    noedit
+	LEAQ  ·editState(SB), R13
+	EDIT_FRAME
+noedit:
+	CMPQ R11, $11 // SIGSEGV
 	JNE  trash
+	TESTL $const_ModeSkipFault, R12
+	JZ    fixpage
+	CMPL ·sigCount(SB), $1
+	JHI  fixpage
+	ADDQ $const_faultInsnLen, const_ucRIP(R9)
+	JMP  trash
+fixpage:
 	// A second SIGSEGV means that the first fix did not help. End the program,
 	// so that the run does not loop for ever.
 	CMPL ·sigCount(SB), $1
 	JHI  die
 	// Make the page of si_addr writable so that the faulting store succeeds.
-	MOVQ 16(SI), DI
+	MOVQ const_siAddr(R10), DI
 	ANDQ ·pageMask(SB), DI
 	MOVQ ·pageSize(SB), SI
 	MOVQ $3, DX // PROT_READ|PROT_WRITE

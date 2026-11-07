@@ -42,6 +42,13 @@ const (
 var gprNames = [numGPR]string{"RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP",
 	"R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15"}
 
+// Control values that NewEditState uses: round up, 53-bit precision, and the
+// denormal flag.
+const (
+	editMXCSR = 0x5f82
+	editFCW   = 0x0a7f
+)
+
 // Test values of the FP control state. Both differ from the Linux defaults
 // (MXCSR 0x1f80 and x87 control word 0x37f) in the rounding mode, the
 // precision control, the flush-to-zero bits, and the exception flags.
@@ -122,6 +129,16 @@ func NewState(seed uint64) State {
 	}
 	s.MXCSR = testMXCSR
 	s.FCW = testFCW
+	return s
+}
+
+// NewEditState returns a State like NewState with FP control values that differ
+// from those of NewState. A frame edit with it shows that the kernel takes the
+// control registers from the frame.
+func NewEditState(seed uint64) State {
+	s := NewState(seed)
+	s.MXCSR = editMXCSR
+	s.FCW = editFCW
 	return s
 }
 

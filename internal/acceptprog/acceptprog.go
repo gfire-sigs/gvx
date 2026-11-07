@@ -67,6 +67,7 @@ const (
 	brkGrowPackage     = "z.gfire.dev/gvx/internal/acceptprog/brkgrow"
 	ptraceGSPackage    = "z.gfire.dev/gvx/internal/acceptprog/ptracegs"
 	regProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/regprobe"
+	sigFramePackage    = "z.gfire.dev/gvx/internal/acceptprog/sigframeprobe"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -357,6 +358,14 @@ func BuildCOWProbe(tb testing.TB, goarch string) string {
 func BuildRegProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, regProbePackage, "regprobe", goarch, 0)
+}
+
+// BuildSigFrameProbe compiles the guest sigframeprobe, which checks the signal
+// frame that the kernel builds and reads back, for the Linux architecture
+// goarch and returns the path of the static ET_EXEC executable.
+func BuildSigFrameProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, sigFramePackage, "sigframeprobe", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel

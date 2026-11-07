@@ -192,11 +192,89 @@ TEXT ·runFault(SB), NOSPLIT|NOFRAME, $0-16
 	STORE_STATE
 	LEAVE
 
+// EDIT_FRAME writes the State at R13 into the ucontext at R10: X1 to X30, FPSR,
+// FPCR, and V0 to V31. It leaves X0, SP, and PC alone. The loop of runSpin uses
+// X0 as a pointer between two instructions, so a changed X0 would make it fault.
+#define EDIT_FRAME \
+	MOVD (State_X+8*1)(R13), R4; \
+	MOVD R4, (const_ucRegs+8*1)(R10); \
+	LDP (State_X+8*2)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*2)(R10); \
+	LDP (State_X+8*4)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*4)(R10); \
+	LDP (State_X+8*6)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*6)(R10); \
+	LDP (State_X+8*8)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*8)(R10); \
+	LDP (State_X+8*10)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*10)(R10); \
+	LDP (State_X+8*12)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*12)(R10); \
+	LDP (State_X+8*14)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*14)(R10); \
+	LDP (State_X+8*16)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*16)(R10); \
+	LDP (State_X+8*18)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*18)(R10); \
+	LDP (State_X+8*20)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*20)(R10); \
+	LDP (State_X+8*22)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*22)(R10); \
+	LDP (State_X+8*24)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*24)(R10); \
+	LDP (State_X+8*26)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*26)(R10); \
+	LDP (State_X+8*28)(R13), (R4, R5); \
+	STP (R4, R5), (const_ucRegs+8*28)(R10); \
+	MOVD (State_X+8*30)(R13), R4; \
+	MOVD R4, (const_ucRegs+8*30)(R10); \
+	MOVWU State_FPSR(R13), R4; \
+	MOVW R4, (const_ucFpsimd+const_fpsimdFPSR)(R10); \
+	MOVWU State_FPCR(R13), R4; \
+	MOVW R4, (const_ucFpsimd+const_fpsimdFPCR)(R10); \
+	FLDPQ (State_V+16*0)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*0)(R10); \
+	FLDPQ (State_V+16*2)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*2)(R10); \
+	FLDPQ (State_V+16*4)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*4)(R10); \
+	FLDPQ (State_V+16*6)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*6)(R10); \
+	FLDPQ (State_V+16*8)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*8)(R10); \
+	FLDPQ (State_V+16*10)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*10)(R10); \
+	FLDPQ (State_V+16*12)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*12)(R10); \
+	FLDPQ (State_V+16*14)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*14)(R10); \
+	FLDPQ (State_V+16*16)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*16)(R10); \
+	FLDPQ (State_V+16*18)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*18)(R10); \
+	FLDPQ (State_V+16*20)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*20)(R10); \
+	FLDPQ (State_V+16*22)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*22)(R10); \
+	FLDPQ (State_V+16*24)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*24)(R10); \
+	FLDPQ (State_V+16*26)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*26)(R10); \
+	FLDPQ (State_V+16*28)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*28)(R10); \
+	FLDPQ (State_V+16*30)(R13), (F0, F1); \
+	FSTPQ (F0, F1), (const_ucFpsimd+const_fpsimdVregs+16*30)(R10)
+
 // func evilHandler()
 // The kernel calls the handler with R0 = signal, R1 = siginfo, R2 = ucontext,
 // and R30 = the return address of the sigreturn trampoline. The handler does
 // not load R30.
 TEXT ·evilHandler(SB), NOSPLIT|NOFRAME, $0-0
+	MOVD  R0, R11 // signal
+	MOVD  R1, R9  // siginfo
+	MOVD  R2, R10 // ucontext
+	MOVD  $·handlerMode(SB), R3
+	MOVWU (R3), R12
 	MOVD  $·sigCount(SB), R3
 	MOVWU (R3), R4
 	ADD   $1, R4
@@ -205,8 +283,46 @@ TEXT ·evilHandler(SB), NOSPLIT|NOFRAME, $0-0
 	MOVWU (R3), R4
 	MOVD  $·flagSeen(SB), R3
 	MOVW  R4, (R3)
-	CMP   $11, R0 // SIGSEGV
+	TST   $const_ModeCapture, R12
+	BEQ   nocapture
+	MOVD  $·captured(SB), R8
+	MOVD  R11, capture_Sig(R8)
+	MOVD  R10, capture_UCAddr(R8)
+	ADD   $capture_Info, R8, R3
+	MOVD  R9, R1
+	MOVD  $(const_siBytes/16), R6
+infocopy:
+	LDP.P 16(R1), (R4, R5)
+	STP.P (R4, R5), 16(R3)
+	SUBS  $1, R6
+	BNE   infocopy
+	ADD   $capture_UC, R8, R3
+	MOVD  R10, R1
+	MOVD  $(const_ucBytes/16), R6
+uccopy:
+	LDP.P 16(R1), (R4, R5)
+	STP.P (R4, R5), 16(R3)
+	SUBS  $1, R6
+	BNE   uccopy
+nocapture:
+	TST   $const_ModeEdit, R12
+	BEQ   noedit
+	MOVD  $·editState(SB), R13
+	EDIT_FRAME
+noedit:
+	CMP   $11, R11 // SIGSEGV
 	BNE   trash
+	TST   $const_ModeSkipFault, R12
+	BEQ   fixpage
+	MOVD  $·sigCount(SB), R3
+	MOVWU (R3), R4
+	CMP   $1, R4
+	BHI   fixpage
+	MOVD  const_ucPC(R10), R4
+	ADD   $const_faultInsnLen, R4
+	MOVD  R4, const_ucPC(R10)
+	B     trash
+fixpage:
 	// A second SIGSEGV means that the first fix did not help. End the program,
 	// so that the run does not loop for ever.
 	MOVD  $·sigCount(SB), R3
@@ -214,7 +330,7 @@ TEXT ·evilHandler(SB), NOSPLIT|NOFRAME, $0-0
 	CMP   $1, R4
 	BHI   die
 	// Make the page of si_addr writable so that the faulting store succeeds.
-	MOVD  16(R1), R0
+	MOVD  const_siAddr(R9), R0
 	MOVD  $·pageMask(SB), R3
 	MOVD  (R3), R3
 	AND   R3, R0

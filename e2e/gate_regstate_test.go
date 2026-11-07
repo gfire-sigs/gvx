@@ -42,26 +42,33 @@ var regProbeChecks = []string{
 // backend that saves or restores part of the state fails a check. Linux
 // preserves the state in every case, so every backend must pass every check.
 func TestE2ESystrapRegisterState(t *testing.T) {
-	bin := acceptprog.BuildRegProbe(t, hostArch())
+	runCPUProbe(t, acceptprog.BuildRegProbe(t, hostArch()), "regprobe", "REGPROBE-OK", regProbeChecks)
+}
+
+// runCPUProbe runs the guest CPU probe at path on every backend. The probe
+// prints "PASS name" for each check in checks and okLine when all pass. Linux
+// gives each check the same result, so every backend must pass every check.
+func runCPUProbe(t *testing.T, path, program, okLine string, checks []string) {
+	t.Helper()
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			if (b.plat == gvx.PlatformHVF || b.plat == gvx.PlatformWHPX) && !hvtest.Available() {
 				t.Skip("no hardware hypervisor on this host")
 			}
 			requireFixedAddressBackend(t, b)
-			code, stdout, stderr, err := runHostProgram(t, b.plat, bin, []string{"/bin/regprobe"}, nil)
-			skipWhenFixedAddressRefused(t, "Run(regprobe)", err)
+			code, stdout, stderr, err := runHostProgram(t, b.plat, path, []string{"/bin/" + program}, nil)
+			skipWhenFixedAddressRefused(t, "Run("+program+")", err)
 			if err != nil {
-				t.Fatalf("Run(regprobe) on %s: %v\nstdout:\n%s\nstderr:\n%s", b.name, err, stdout, stderr)
+				t.Fatalf("Run(%s) on %s: %v\nstdout:\n%s\nstderr:\n%s", program, b.name, err, stdout, stderr)
 			}
 			t.Logf("guest output on %s:\n%s", b.name, stdout)
-			for _, name := range regProbeChecks {
+			for _, name := range checks {
 				if !strings.Contains(stdout, "PASS "+name+"\n") {
 					t.Errorf("check %s did not pass on %s", name, b.name)
 				}
 			}
-			if code != 0 || !strings.Contains(stdout, "REGPROBE-OK") {
-				t.Fatalf("regprobe on %s exited with %d\nstdout:\n%s\nstderr:\n%s", b.name, code, stdout, stderr)
+			if code != 0 || !strings.Contains(stdout, okLine) {
+				t.Fatalf("%s on %s exited with %d\nstdout:\n%s\nstderr:\n%s", program, b.name, code, stdout, stderr)
 			}
 		})
 	}

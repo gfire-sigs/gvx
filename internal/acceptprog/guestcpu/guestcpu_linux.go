@@ -71,8 +71,9 @@ func runSpin(in, out *State)
 func runFault(in, out *State)
 
 // evilHandler is the signal handler that destroys the state. It counts the
-// signal, records the spin flag, makes the page of a SIGSEGV writable, loads
-// trashState into every register, and returns to the restorer.
+// signal, records the spin flag, follows handlerMode, makes the page of a
+// SIGSEGV writable unless handlerMode says to skip the faulting instruction,
+// loads trashState into every register, and returns to the restorer.
 func evilHandler()
 
 // handlerPC returns the address of evilHandler.
@@ -92,7 +93,39 @@ var (
 	pageSize uint64
 	// trashState is the content of every register while evilHandler runs.
 	trashState State
+	// handlerMode holds the Mode bits that evilHandler obeys.
+	handlerMode uint32
+	// captured is the copy of the last signal frame that evilHandler saw.
+	captured capture
+	// editState is the register state that evilHandler writes into the frame
+	// in ModeEdit.
+	editState State
 )
+
+// Mode selects what evilHandler does in addition to its destruction of the
+// registers.
+type Mode uint32
+
+const (
+	// ModeCapture copies the siginfo, the ucontext, and the FP record of the
+	// frame, so that CapturedFrame can decode them.
+	ModeCapture Mode = 1 << iota
+	// ModeEdit overwrites the registers in the frame with the State that
+	// SetEdit sets. After the sigreturn, the thread has these values. On arm64
+	// the handler leaves X0 alone, because EventSpin uses it as scratch.
+	ModeEdit
+	// ModeSkipFault moves the program counter in the frame over the faulting
+	// instruction of EventFault, at the first SIGSEGV. A kernel that ignores
+	// the edit delivers a second SIGSEGV, and the handler ends the program.
+	ModeSkipFault
+)
+
+// SetMode sets the Mode bits that evilHandler obeys.
+func SetMode(m Mode) { handlerMode = uint32(m) }
+
+// SetEdit makes evilHandler write s into the frame. The mode must include
+// ModeEdit.
+func SetEdit(s *State) { editState = *s }
 
 const (
 	saSigInfo = 0x4
@@ -159,8 +192,11 @@ func BlockSignals(sigs ...syscall.Signal) (unblock func(), err error) {
 	}, nil
 }
 
-// ResetHandler clears the counters of evilHandler and the spin flag.
+// ResetHandler clears the counters of evilHandler, the spin flag, the mode, and
+// the captured frame.
 func ResetHandler() {
+	handlerMode = 0
+	captured = capture{}
 	atomic.StoreUint32(&sigCount, 0)
 	atomic.StoreUint32(&flagSeen, 0)
 	atomic.StoreUint32(&spinFlag, 0)
@@ -244,3 +280,26 @@ func Watchdog(d time.Duration) *time.Timer {
 		os.Exit(1)
 	})
 }
+
+// ReadMemory returns n bytes of the guest memory at addr. The kernel copies the
+// bytes through a pipe, so a wrong address returns EFAULT and does not crash.
+func ReadMemory(addr uintptr, n int) ([]byte, error) {
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
+		return nil, err
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, uintptr(fds[1]), addr, uintptr(n)); errno != 0 {
+		return nil, errno
+	}
+	buf := make([]byte, n)
+	if _, err := syscall.Read(fds[0], buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// NegErrno returns the value that a system call leaves in its result register
+// when it fails with e.
+func NegErrno(e syscall.Errno) uint64 { return -uint64(e) }
