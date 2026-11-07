@@ -360,7 +360,11 @@ func listenProtectedPipe(address string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	return winio.ListenPipe(address, &winio.PipeConfig{SecurityDescriptor: dacl, MessageMode: false, InputBufferSize: 4096, OutputBufferSize: 4096})
+	listener, err := winio.ListenPipe(address, &winio.PipeConfig{SecurityDescriptor: dacl, MessageMode: false, InputBufferSize: 4096, OutputBufferSize: 4096})
+	if err != nil {
+		return nil, err
+	}
+	return newPipeListener(listener), nil
 }
 
 func listenLocal(ctx context.Context, paths *instancePaths, kind endpointKind) (*ownedEndpoint, error) {
