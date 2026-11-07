@@ -18,6 +18,8 @@ import (
 	"runtime"
 	"sort"
 
+	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/syserr"
 )
@@ -25,10 +27,12 @@ import (
 // A link and a peer have no fixed limit, as in Linux. They hold memory of the
 // Sentry process, and not memory of the guest, so the accounting of the guest
 // would not count them. Each device and each peer therefore charges an estimate
-// of its memory to usage.MemoryAccounting as kernel memory. The memory guard of
-// the sandbox, and MemTotal of /proc/meminfo, then count the links and the
-// peers, and a guest that makes too many of them reaches the memory limit
-// like a guest that allocates the memory itself.
+// of its memory to the accounting of the memory file of its kernel as kernel
+// memory. The memory guard of the sandbox, and MemFree of /proc/meminfo, then
+// count the links and the peers, and a guest that makes too many of them
+// reaches the memory limit like a guest that allocates the memory itself. The
+// accounting belongs to one kernel, so the links of one sandbox never count
+// against another sandbox of the same process.
 const (
 	// peerMemory is the estimated memory of one peer. wireguard-go allocates the
 	// three packet queues, the timers, the handshake state, and two goroutines
@@ -56,12 +60,20 @@ func deviceBytes() uint64 {
 	return deviceBaseMemory + uint64(runtime.NumCPU())*cpuMemory
 }
 
-// chargeMemory adds n bytes to the memory accounting. It fails with ENOMEM when
-// the total would pass the memory of the host, which is the largest value that
-// the Sentry reports as total memory. An unset accounting charges nothing, as
-// in a process that does not run a sandbox.
-func chargeMemory(n uint64) *syserr.Error {
-	acct := usage.MemoryAccounting
+// accountingOf returns the memory accounting of the kernel that runs ctx. A
+// context without a kernel selects the global accounting.
+func accountingOf(ctx context.Context) *usage.MemoryLocked {
+	if k := kernel.KernelFromContext(ctx); k != nil {
+		return k.MemoryFile().Accounting()
+	}
+	return usage.MemoryAccounting
+}
+
+// chargeMemory adds n bytes to acct. It fails with ENOMEM when the total would
+// pass the memory of the host, which is the largest value that the Sentry
+// reports as total memory. A nil accounting charges nothing, as in a process
+// that does not run a sandbox.
+func chargeMemory(acct *usage.MemoryLocked, n uint64) *syserr.Error {
 	if acct == nil {
 		return nil
 	}
@@ -72,10 +84,10 @@ func chargeMemory(n uint64) *syserr.Error {
 	return nil
 }
 
-// refundMemory removes n bytes from the memory accounting.
-func refundMemory(n uint64) {
-	if usage.MemoryAccounting != nil && n > 0 {
-		usage.MemoryAccounting.Dec(n, usage.System, 0)
+// refundMemory removes n bytes from acct.
+func refundMemory(acct *usage.MemoryLocked, n uint64) {
+	if acct != nil && n > 0 {
+		acct.Dec(n, usage.System, 0)
 	}
 }
 
@@ -87,11 +99,11 @@ func (e *linkEndpoint) resizeCharge() *syserr.Error {
 	want := deviceBytes() + uint64(e.peers.len())*peerMemory
 	switch {
 	case want > e.charged:
-		if err := chargeMemory(want - e.charged); err != nil {
+		if err := chargeMemory(e.acct, want-e.charged); err != nil {
 			return err
 		}
 	case want < e.charged:
-		refundMemory(e.charged - want)
+		refundMemory(e.acct, e.charged-want)
 	}
 	e.charged = want
 	return nil
@@ -101,7 +113,7 @@ func (e *linkEndpoint) resizeCharge() *syserr.Error {
 //
 // Preconditions: e.updateMu is held.
 func (e *linkEndpoint) releaseMemory() {
-	refundMemory(e.charged)
+	refundMemory(e.acct, e.charged)
 	e.charged = 0
 }
 

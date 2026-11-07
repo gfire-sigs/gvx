@@ -6,7 +6,14 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
-- **Memory accounting of each sandbox**: a process that runs two sandboxes gave one memory accounting to both. The memory cgroups of two sandboxes have the same IDs, so `memory.current`, `memory.stat`, the root `memory.stat`, and `AnonPages` of `/proc/meminfo` showed the memory of both sandboxes. The `memory.max` enforcer of a sandbox ended a process that used less than its limit when another sandbox held memory in a cgroup with the same ID. Each sandbox now has an accounting that belongs to its memory file, and the readers, the enforcer, and the WireGuard memory charge use it. `TestE2EMemoryAccountingIsPerSandbox` runs the case on every backend.
+- **Memory accounting of each sandbox**: a process that runs two sandboxes gave one memory accounting to both. The memory cgroups of two sandboxes have the same IDs, so `memory.current`, `memory.stat`, the root `memory.stat`, and `AnonPages` of `/proc/meminfo` showed the memory of both sandboxes. The `memory.max` enforcer of a sandbox ended a process that used less than its limit when another sandbox held memory in a cgroup with the same ID. Each sandbox now has an accounting that belongs to its memory file. The readers, the enforcer, the memory guard, and the WireGuard memory charge use it. `TestE2EMemoryAccountingIsPerSandbox` runs the case on every backend.
+
+## [v0.10.10012026110200] - 2026-11-07
+
+This release fixes a regression of `v0.10.10002026110200`: a signal corrupted the floating point registers of an arm64 guest on Linux and macOS hosts. It also stops the `TaskSize` search after one probe on a host with a hardware address space size.
+
+### Bug Fixes
+
 - **arm64 floating point state after a signal**: in `v0.10.10002026110200` a signal and its `sigreturn` corrupted the floating point registers of an arm64 guest. On a Linux host, FPSR and FPCR became `0x46508001` and `0x210`, so the divide-by-zero trap was on and `1.0/0.0` raised `SIGFPE` on a CPU that traps. On macOS, the low 64 bits of V0 changed. The signal frame code read the floating point state as a whole `fpsimd_context` record, but the platforms keep only its body, and `hvf` kept V0 to V31 first. Every arm64 platform now keeps FPSR, FPCR, and V0 to V31 in this order, and the signal frame code converts the fields one by one. `rungv` with `systrap` inside a `gvx` guest on arm64 also gets the right floating point state in its stub.
 
 ## [v0.10.10002026110200] - 2026-11-07
