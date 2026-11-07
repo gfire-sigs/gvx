@@ -421,3 +421,108 @@ func TestFailedWriteCannotDischargeUnacceptedResponse(t *testing.T) {
 	}
 	requirePendingReply(t, state)
 }
+
+// replyLingerTransport accepts one connection whose writes always succeed.
+func replyLingerTransport(t *testing.T) (*taskTransport, net.Conn, net.Conn) {
+	t.Helper()
+	state := newControlState(time.Now().Add(time.Minute), time.Second)
+	listener := newQueuedListener()
+	raw, peer := net.Pipe()
+	listener.connections <- &controlledWriter{Conn: raw, write: func(p []byte) (int, error) { return len(p), nil }}
+	transport := newTaskTransport(listener, state)
+	t.Cleanup(func() {
+		transport.Close()
+		transport.CloseConnections()
+		peer.Close()
+	})
+	conn, err := transport.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return transport, conn, peer
+}
+
+func closeInBackground(conn net.Conn) <-chan error {
+	closed := make(chan error, 1)
+	go func() { closed <- conn.Close() }()
+	return closed
+}
+
+func requireStillOpen(t *testing.T, closed <-chan error, reason string) {
+	t.Helper()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) %s", err, reason)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWrittenConnectionStaysOpenUntilPeerCloses(t *testing.T) {
+	ctx := replyTestContext(t)
+	transport, conn, peer := replyLingerTransport(t)
+	if _, err := conn.Write(responseFrame(1, []byte{1})); err != nil {
+		t.Fatal(err)
+	}
+	closed := closeInBackground(conn)
+	requireStillOpen(t, closed, "before the peer closed")
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Close did not return after the peer closed")
+	}
+	transport.AwaitConnections(ctx)
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("AwaitConnections waited for a closed connection: %v", err)
+	}
+}
+
+func TestAbortInterruptsWaitForPeerClose(t *testing.T) {
+	ctx := replyTestContext(t)
+	transport, conn, peer := replyLingerTransport(t)
+	if _, err := conn.Write(responseFrame(1, []byte{1})); err != nil {
+		t.Fatal(err)
+	}
+	closed := closeInBackground(conn)
+	requireStillOpen(t, closed, "before the peer closed or an abort")
+	waiting, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	transport.AwaitConnections(waiting)
+	if waiting.Err() == nil {
+		t.Fatal("AwaitConnections returned while a connection was open")
+	}
+	if err := transport.CloseConnections(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("abort did not interrupt Close")
+	}
+	var b [1]byte
+	if _, err := peer.Read(b[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("peer read after abort = %v, want EOF", err)
+	}
+}
+
+func TestConnectionWithoutWrittenBytesClosesAtOnce(t *testing.T) {
+	ctx := replyTestContext(t)
+	transport, conn, _ := replyLingerTransport(t)
+	select {
+	case err := <-closeInBackground(conn):
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Close of a connection without written bytes waited for the peer")
+	}
+	transport.AwaitConnections(ctx)
+	if err := ctx.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
