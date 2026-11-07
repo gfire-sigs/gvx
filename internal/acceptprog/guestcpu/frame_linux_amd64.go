@@ -30,30 +30,31 @@ const (
 	// fpMax is the size of the buffer that holds the xsave area and magic2.
 	fpMax = 16384
 
-	ucStackSP   = 16
-	ucStackSize = 32
-	ucR8        = 40
-	ucR9        = 48
-	ucR10       = 56
-	ucR11       = 64
-	ucR12       = 72
-	ucR13       = 80
-	ucR14       = 88
-	ucR15       = 96
-	ucRDI       = 104
-	ucRSI       = 112
-	ucRBP       = 120
-	ucRBX       = 128
-	ucRDX       = 136
-	ucRAX       = 144
-	ucRCX       = 152
-	ucRSP       = 160
-	ucRIP       = 168
-	ucErr       = 192
-	ucTrapno    = 200
-	ucCR2       = 216
-	ucFpstate   = 224
-	ucSigmask   = 296
+	ucStackSP    = 16
+	ucStackFlags = 24
+	ucStackSize  = 32
+	ucR8         = 40
+	ucR9         = 48
+	ucR10        = 56
+	ucR11        = 64
+	ucR12        = 72
+	ucR13        = 80
+	ucR14        = 88
+	ucR15        = 96
+	ucRDI        = 104
+	ucRSI        = 112
+	ucRBP        = 120
+	ucRBX        = 128
+	ucRDX        = 136
+	ucRAX        = 144
+	ucRCX        = 152
+	ucRSP        = 160
+	ucRIP        = 168
+	ucErr        = 192
+	ucTrapno     = 200
+	ucCR2        = 216
+	ucFpstate    = 224
+	ucSigmask    = 296
 
 	// Offsets in the xsave area that fpstate points to.
 	fpFCW     = 0
