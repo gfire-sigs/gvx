@@ -17,8 +17,10 @@
 package systrap
 
 const (
-	// minIdleStubs is the lowest bound of the idle stub pool.
-	minIdleStubs = 8
+	// minIdleStubs is the lowest bound of the idle stub pool. A loop of 2000
+	// short guest processes with 4 parallel jobs ran as fast with 4 idle stubs
+	// as with an unbounded pool on a 4-CPU linux/arm64 host (GVXIP-006 B0-1).
+	minIdleStubs = 4
 	// maxIdleStubs is the highest bound of the idle stub pool.
 	maxIdleStubs = 32
 )
