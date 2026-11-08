@@ -40,6 +40,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -67,6 +68,7 @@ func main() {
 		block, err := reserveBlock()
 		if err == nil {
 			err = c.run(block)
+			err = errors.Join(err, releaseRegion())
 		}
 		if err != nil {
 			ok = false
@@ -81,18 +83,34 @@ func main() {
 	fmt.Println("SPAREPROBE-OK")
 }
 
+// region is a 32 KB range that reserveBlock maps, and regionBase is its
+// address. page takes its slices from region, so that no address converts
+// back to a pointer.
+var (
+	region     []byte
+	regionBase uintptr
+)
+
 // reserveBlock returns the address of a 16 KB block that no mapping uses. It
-// maps 32 KB, and unmaps all of it, so that the block is free.
+// maps a region of 32 KB without access, and unmaps the aligned block in it.
 func reserveBlock() (uintptr, error) {
-	addr, err := mmap(0, 2*blockSize, syscall.PROT_NONE, syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS)
+	mem, err := syscall.Mmap(-1, 0, 2*blockSize, syscall.PROT_NONE, syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("mmap the region: %w", err)
 	}
-	block := (addr + blockSize - 1) &^ (blockSize - 1)
-	if err := munmap(addr, 2*blockSize); err != nil {
+	region, regionBase = mem, uintptr(unsafe.Pointer(&mem[0]))
+	block := (regionBase + blockSize - 1) &^ (blockSize - 1)
+	if err := munmap(block, blockSize); err != nil {
 		return 0, err
 	}
 	return block, nil
+}
+
+// releaseRegion unmaps the region of the last reserveBlock.
+func releaseRegion() error {
+	err := munmap(regionBase, uintptr(len(region)))
+	region, regionBase = nil, 0
+	return err
 }
 
 func mmap(addr, length uintptr, prot, flags int) (uintptr, error) {
@@ -126,8 +144,10 @@ func mprotect(addr uintptr, prot int) error {
 	return nil
 }
 
+// page returns the page at addr, which lies in the region.
 func page(addr uintptr) []byte {
-	return unsafe.Slice((*byte)(unsafe.Pointer(addr)), pageSize)
+	off := addr - regionBase
+	return region[off : off+pageSize : off+pageSize]
 }
 
 // settle makes system calls, so that the engine prepares the address space
