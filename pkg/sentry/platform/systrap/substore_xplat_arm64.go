@@ -104,12 +104,12 @@ func (r storeRegs) vreg(n uint8) []byte {
 	return r.fp[off : off+16]
 }
 
-// decodeStore decodes the store forms that the Sentry runs: the single register
-// and register pair stores of general-purpose and vector registers in every
-// immediate and register offset addressing mode, the store exclusive and store
-// release forms, and their pair forms. It returns false for every other
-// instruction, including atomic read-modify-write operations, compare and swap,
-// and tagged stores.
+// decodeStore decodes the store forms that the Sentry runs. These are the
+// single register and register pair stores of general-purpose and vector
+// registers, in every immediate and register offset addressing mode. They also
+// include the store exclusive and store release forms and their pair forms.
+// It returns false for every other instruction, for example atomic operations,
+// compare and swap, and tagged stores.
 func decodeStore(insn uint32) (storeInsn, bool) {
 	s := storeInsn{base: uint8(insn >> 5 & 31), rt: uint8(insn & 31), rt2: uint8(insn >> 10 & 31)}
 	v := insn>>26&1 == 1
@@ -337,10 +337,10 @@ func encodeLEUint(v uint64, size int) []byte {
 	return out
 }
 
-// emulateAtomicOrCacheOp runs an AArch64 LSE atomic operation (LDADD, LDCLR,
-// LDEOR, LDSET, LDSMAX, LDSMIN, LDUMAX, LDUMIN, SWP, CAS, CASP) or an
-// address-based cache maintenance instruction (DC ZVA and cache clean or
-// invalidate ops).
+// emulateAtomicOrCacheOp runs an AArch64 LSE atomic operation. These operations
+// are LDADD, LDCLR, LDEOR, LDSET, LDSMAX, LDSMIN, LDUMAX, LDUMIN, SWP, CAS, and
+// CASP. It also runs an address-based cache maintenance instruction (DC ZVA and
+// cache clean or invalidate ops).
 func emulateAtomicOrCacheOp(
 	insn uint32,
 	r storeRegs,
@@ -671,9 +671,9 @@ func isCacheMaintenanceByAddress(insn uint32) bool {
 }
 
 // emulateGuestStore runs the instruction insn, which faulted on a store, for
-// the thread of env. It returns false, with no change to the thread or to
-// memory, for an instruction that it does not decode or for a range that the
-// guest cannot write.
+// the thread of env. It returns false for an instruction that it does not
+// decode or for a range that the guest cannot write. In both cases it changes
+// neither the thread nor memory.
 func emulateGuestStore(insn uint32, env storeEnv) bool {
 	if len(env.fpState) < arch.FPSIMDBodySize {
 		return false

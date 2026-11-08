@@ -1,0 +1,30 @@
+=== RUN   TestE2ESystrapCodeWrites
+=== RUN   TestE2ESystrapCodeWrites/systrap
+    gate_codewrite_test.go:60: guest output on systrap:
+        PASS self-patch
+        PASS data-in-code-page
+        PASS alias-store-into-executing-frame
+        PASS alias-rewrite-between-runs
+        PASS read-into-code
+        PASS write-to-executed-file
+        PASS process-vm-writev
+        FAIL code-churn-threads: the threads did not end within 1m0s
+    gate_codewrite_test.go:63: check code-churn-threads did not pass on systrap
+    gate_codewrite_test.go:63: check code-text-toggle did not pass on systrap
+    gate_codewrite_test.go:67: codewrite on systrap exited with 1
+        stdout:
+        PASS self-patch
+        PASS data-in-code-page
+        PASS alias-store-into-executing-frame
+        PASS alias-rewrite-between-runs
+        PASS read-into-code
+        PASS write-to-executed-file
+        PASS process-vm-writev
+        FAIL code-churn-threads: the threads did not end within 1m0s
+        
+        stderr:
+--- FAIL: TestE2ESystrapCodeWrites (281.42s)
+    --- FAIL: TestE2ESystrapCodeWrites/systrap (281.33s)
+FAIL
+FAIL	z.gfire.dev/gvx/e2e	281.430s
+FAIL

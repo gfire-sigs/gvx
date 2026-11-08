@@ -174,10 +174,10 @@ func (mm *MemoryManager) releaseHostBlocksActiveLocked(ar hostarch.AddrRange) {
 	}
 }
 
-// alignStackToHostBlock moves the end of the stack down to a host block, and
+// alignStackToHostBlock moves the end of the stack down to a host block. It
 // grows the size of the stack to a whole number of host blocks. The top of the
-// stack is then in a block that holds no other mapping, so the platform maps
-// the pages that the stack uses without a composite page. It returns the
+// stack is then in a block that holds no other mapping. The platform therefore
+// maps the pages that the stack uses without a composite page. It returns the
 // arguments unchanged on a platform that does not report a host block size.
 func (mm *MemoryManager) alignStackToHostBlock(end hostarch.Addr, size uint64) (hostarch.Addr, uint64) {
 	hbp, ok := mm.p.(platform.HostBlockPlatform)

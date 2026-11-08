@@ -378,10 +378,10 @@ func BuildForkProbe(tb testing.TB, goarch string) string {
 	return buildStaticGuest(tb, forkProbePackage, "forkprobe", goarch, 0)
 }
 
-// BuildSpareProbe compiles the guest spareprobe, which checks that the guest and
-// the kernel agree on the bytes of pages that share a 16 KB block with pages of
-// another mapping, for the Linux architecture goarch and returns the path of
-// the static ET_EXEC executable.
+// BuildSpareProbe compiles the guest spareprobe for the Linux architecture
+// goarch and returns the path of the static ET_EXEC executable. The guest
+// verifies that it and the kernel see the same bytes in pages of a 16 KB block
+// that holds pages of another mapping.
 func BuildSpareProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, spareProbePackage, "spareprobe", goarch, 0)

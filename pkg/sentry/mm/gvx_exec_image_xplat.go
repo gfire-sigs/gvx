@@ -194,7 +194,7 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 	if alreadyAligned && spare == 0 {
 		return nil, true
 	}
-	fr, err := mm.mf.Allocate(hostBlockSize, pgalloc.AllocOpts{
+	fr, err := mm.mf.AllocateAligned(hostBlockSize, hostBlockSize, pgalloc.AllocOpts{
 		Kind:    usage.Anonymous,
 		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
 		Mode:    pgalloc.AllocateAndWritePopulate,
@@ -202,15 +202,15 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 	if err != nil {
 		return nil, false
 	}
-	if fr.Start%hostBlockSize != 0 {
-		mm.mf.DecRef(fr)
-		return nil, false
-	}
 	dsts, err := mm.mf.MapInternal(fr, hostarch.Write)
 	if err != nil {
 		mm.mf.DecRef(fr)
 		return nil, false
 	}
+	// Another thread can store into the old pages through the platform
+	// until it unmaps them, so the copy comes after the unmap. A failed copy
+	// leaves the old pages, and the next fault maps them again.
+	mm.unmapASLocked(blockAR)
 	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
 		subAR := seg.Range().Intersect(blockAR)
 		srcs, err := mm.internalMappingsLocked(seg, subAR)
@@ -224,7 +224,6 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 			return nil, false
 		}
 	}
-	mm.unmapASLocked(blockAR)
 	if spare != 0 {
 		owner.AdoptHostBlock(blockAR.Start, mm.mf, fr, spare)
 	}

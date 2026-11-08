@@ -161,8 +161,8 @@ type platformContext struct {
 	// the thread resumed last (subblock_xplat.go).
 	subBlockSeq uint64
 	// subBlockChanges is the number of stub mapping changes of the sub-block
-	// layer when the thread resumed last, and subBlockRetries counts the
-	// SIGILLs in a row that the layer made the thread run again.
+	// layer when the thread resumed last. subBlockRetries counts the SIGILLs
+	// in a row that the layer made the thread run again.
 	subBlockChanges uint64
 	subBlockRetries int
 }

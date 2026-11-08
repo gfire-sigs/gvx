@@ -14,26 +14,27 @@
 
 //go:build linux
 
-// Command spareprobe checks that the guest and the guest kernel see the same
-// bytes in 4 KB pages that share a 16 KB block with pages of another mapping.
-// On a host with 16 KB pages, the Linux systrap engine can map such a block
-// directly and hold the pages of the block without a guest page as spare
-// pages. A change of the block must then end the use of the spare pages. Each
-// check maps single pages at fixed addresses in one 16 KB block:
+// Command spareprobe verifies that the guest and the guest kernel see the same
+// bytes. The bytes are in 4 KB pages that share a 16 KB block with pages of
+// another mapping. On a host with 16 KB pages, the Linux systrap engine can
+// map such a block directly. It holds the pages of the block that have no
+// guest page as spare pages. A change of the block must then end the use of
+// the spare pages. Each check maps single pages at fixed addresses in one
+// 16 KB block:
 //
 //   - remap-reads-zero: a page that the guest wrote, unmapped, and mapped
-//     again reads as zeros,
-//   - new-neighbor: a new page next to a written page reads as zeros, and the
-//     kernel reads the guest stores into it and the guest reads the kernel
-//     stores into it,
+//     again reads as zeros.
+//   - new-neighbor: a new page next to a written page reads as zeros. The
+//     kernel reads the guest stores into it. The guest reads the kernel
+//     stores into it.
 //   - guard-gains-access: a page without access next to a written page reads
-//     as zeros after mprotect gives it access, and the kernel and the guest
-//     agree on its bytes,
-//   - dontneed-reads-zero: a page reads as zeros after MADV_DONTNEED, and the
-//     other page of the block keeps its bytes,
+//     as zeros after mprotect gives it access. The kernel and the guest
+//     agree on its bytes.
+//   - dontneed-reads-zero: a page reads as zeros after MADV_DONTNEED. The
+//     other page of the block keeps its bytes.
 //   - fork-isolation: the stores of a forked child do not reach the parent.
 //
-// Each check prints "PASS name" or "FAIL name: reason", and the program prints
+// Each test prints "PASS name" or "FAIL name: reason". The program prints
 // "SPAREPROBE-OK" when all pass.
 package main
 
@@ -152,8 +153,8 @@ func checkZero(p []byte, what string) error {
 	return nil
 }
 
-// kernelAgrees checks that the kernel reads the guest bytes of p, and that the
-// guest reads the bytes that the kernel writes into p.
+// kernelAgrees verifies that the kernel reads the guest bytes of p, and that
+// the guest reads the bytes that the kernel writes into p.
 func kernelAgrees(p []byte, seed byte) error {
 	var fds [2]int
 	if err := syscall.Pipe(fds[:]); err != nil {

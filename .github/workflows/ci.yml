@@ -151,7 +151,9 @@ jobs:
         env:
           CGO_ENABLED: "0"
           GVX_SYSTRAP_SUBBLOCKS: "1"
-        run: go test -count=1 -run 'TestE2ESystrap|TestE2EGateETExec|TestE2EGateM2' ./e2e/
+        run: |
+          go test -count=1 ./pkg/sentry/platform/systrap/
+          go test -count=1 -run 'TestE2ESystrap|TestE2EGateETExec|TestE2EGateM2' ./e2e/
       - name: Build rungv and the smoke guest
         env:
           CGO_ENABLED: "0"

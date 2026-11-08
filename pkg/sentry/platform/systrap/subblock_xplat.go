@@ -38,7 +38,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
-// A host with 16 KB pages cannot map a 4 KB guest page: the address, the
+// A host with 16 KB pages cannot map a 4 KB guest page. The address, the
 // length, and the file offset of a host mapping must be multiples of the host
 // page size. The sub-block layer in this file keeps the guest pages at 4 KB.
 // It splits the guest address space into host blocks of 16 KB. Each block
@@ -57,18 +57,20 @@ import (
 //
 // Execute access is the union of the pages of a block: a block maps with
 // execute access when one page has it. A data page that shares a block with
-// code is executable, and a page without any access that shares a block with
-// a mapped page reads as zeros. A 16 KB host page cannot do better.
+// code is executable. A page without any access that shares a block with a
+// mapped page reads as zeros. A 16 KB host page cannot do better.
 //
-// A composite page holds copies, so a write that does not pass through the
-// layer must refresh it. beforeSwitch refreshes the guest-writable pages of a
-// composite page on each switch, because another address space can share
-// them. It refreshes a read-only page when the memory file reports a Sentry
-// write into it (pgalloc.MemoryFile.ObserveHostWrites), when a guest store
-// that the layer ran changed it through another block, and on each switch
-// while a writable direct block of the same address space maps it. A guest
-// store through a writable mapping of another address space does not reach a
-// read-only page of a composite page until the next change of the block.
+// A composite page holds copies. A write that does not pass through the layer
+// must therefore refresh it. beforeSwitch refreshes the guest-writable pages
+// of a composite page on each switch, because another address space can share
+// them. It refreshes a read-only page in three cases. In the first case, the
+// memory file reports a Sentry write into it
+// (pgalloc.MemoryFile.ObserveHostWrites). In the second case, a guest store
+// that the layer ran changed it through another block. In the third case, a
+// writable direct block of the same address space maps it. It then refreshes
+// the page on each switch. A guest store through a writable mapping of
+// another address space does not reach a read-only page of a composite page.
+// The page stays stale until the next change of the block.
 
 const (
 	// subBlockSize is the size of a host block.
@@ -79,9 +81,9 @@ const (
 	allSubPages = 1<<subPagesPerBlock - 1
 )
 
-// subBlocksForced makes the layer work on a host with 4 KB pages, so that CI
-// on such a host runs the code of a 16 KB host. GVX_SYSTRAP_SUBBLOCKS=1 sets
-// it for the whole process; AGENTS.md lists the variable for CI use only.
+// subBlocksForced makes the layer work on a host with 4 KB pages. CI on such a
+// host then runs the code of a 16 KB host. GVX_SYSTRAP_SUBBLOCKS=1 sets it for
+// the whole process. AGENTS.md lists the variable for CI use only.
 var subBlocksForced = os.Getenv("GVX_SYSTRAP_SUBBLOCKS") == "1"
 
 // subBlocksEnabled reports whether address spaces use the sub-block layer.
@@ -204,10 +206,12 @@ type hostBlock struct {
 	// that the Sentry ran for the guest (substore_xplat.go).
 	wseq [subPagesPerBlock]uint64
 
-	// dirty reports a Sentry write into a page of the block since the last
-	// refresh of its composite page. The observer of the memory file sets it
-	// without the lock of the layer.
-	dirty atomic.Bool
+	// dirty counts the refreshes of the composite page that a Sentry write
+	// into a page of the block still asks for. The observer of the memory
+	// file sets it without the lock of the layer. Some writers report a
+	// write before they copy the bytes, so a write asks for two refreshes:
+	// the second comes after the copy (beforeSwitch).
+	dirty atomic.Int32
 	// alwaysSync makes beforeSwitch refresh the composite page on each switch.
 	// rebuildSourcesLocked sets it.
 	alwaysSync bool
@@ -216,6 +220,9 @@ type hostBlock struct {
 	// (mapCompLocked).
 	compMapped, compExec bool
 }
+
+// dirtyRefreshes is the number of refreshes that a Sentry write asks for.
+const dirtyRefreshes = 2
 
 // srcRef is one page of a read-only composite page, by its offset in the
 // memory file.
@@ -226,8 +233,8 @@ type srcRef struct {
 
 // needsPopulate reports whether a block that the stub does not map directly
 // asks the memory manager for a populate call. A block that misses a guest
-// page does. So does a block whose pages are all writable and not executable:
-// the memory manager can coalesce the pages of private anonymous memory into
+// page does. So does a block whose pages are all writable and not executable.
+// The memory manager can coalesce the pages of private anonymous memory into
 // one file range, and then the block maps directly.
 func (hb *hostBlock) needsPopulate(direct bool) bool {
 	return !direct && (hb.mapped != allSubPages || (hb.write == allSubPages && hb.exec == 0))
@@ -279,9 +286,9 @@ func (hb *hostBlock) recompute() {
 }
 
 // directLocked returns the file offset and the descriptor that the stub can
-// map for the whole block, and false when the block needs a composite page.
-// A block that misses guest pages maps directly when the layer holds those
-// pages as spare pages, and the other pages allow the same access.
+// map for the whole block. It returns false when the block needs a composite
+// page. A block that misses guest pages maps directly when the layer holds
+// those pages as spare pages, and the other pages allow the same access.
 func (l *subBlockLayer) directLocked(base uintptr, hb *hostBlock) (uint64, int, bool) {
 	if off, ok := hb.direct(); ok {
 		return off, int(hb.subs[0].fd), true
@@ -484,14 +491,14 @@ func (l *subBlockLayer) noteHostWrite(f memmap.File, fr memmap.FileRange) {
 		return cmp.Compare(r.off+hostarch.PageSize, start+1)
 	})
 	for ; i < len(refs) && refs[i].off < fr.End; i++ {
-		refs[i].hb.dirty.Store(true)
+		refs[i].hb.dirty.Store(dirtyRefreshes)
 	}
 	if r := l.recent.Load(); r != nil {
 		for _, hb := range *r {
 			for j := range hb.subs {
 				sp := &hb.subs[j]
 				if sp.f == f && sp.off < fr.End && fr.Start < sp.off+hostarch.PageSize {
-					hb.dirty.Store(true)
+					hb.dirty.Store(dirtyRefreshes)
 					break
 				}
 			}
@@ -710,7 +717,7 @@ func (l *subBlockLayer) mapBlocksLocked(start, end uintptr, off uint64, src subP
 // A block that misses a guest page maps a composite page in which that page
 // reads as zeros. The memory manager can still map the missing page, for
 // example after a copy on write or a new mapping. Until beforeSwitch asks it
-// to populate the page, the stub does not map such a block: an access of a
+// to populate the page, the stub does not map such a block. An access of a
 // running thread faults, and the fault populates the block. beforeSwitch then
 // calls refreshLocked with mapPartial set.
 func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bool) error {
@@ -763,7 +770,6 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 		hb.comp, hb.hasComp = comp, true
 	}
 	l.addRecentLocked(hb)
-	hb.dirty.Store(false)
 	changed, err := hb.syncComp()
 	if err != nil {
 		return fmt.Errorf("fill the composite page for [%#x, %#x): %w", base, base+subBlockSize, err)
@@ -779,13 +785,13 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 // mapCompLocked maps the composite page of a block into the stub. changed
 // reports a change of the composite page since the stub mapped it.
 //
-// The I-cache of a host CPU can index lines by virtual address, so the
-// maintenance that the Sentry makes through its own mapping can miss the
-// lines of the stub mapping. The host kernel cleans the caches of a page that
-// write(2) changed when it maps the page with execute access. So a composite
-// page that can run, and that changed or gained execute access since the stub
-// mapped it, goes through write(2) on the memory file, and the stub maps it
-// again.
+// The I-cache of a host CPU can index lines by virtual address. The
+// maintenance that the Sentry makes through its own mapping can therefore miss
+// the lines of the stub mapping. The host kernel cleans the caches of a page
+// that write(2) changed when it maps the page with execute access. A
+// composite page goes through write(2) on the memory file if it can run. This
+// happens when the page changed or gained execute access since the stub mapped
+// it. The stub then maps it again.
 func (l *subBlockLayer) mapCompLocked(base uintptr, hb *hostBlock, changed bool) error {
 	clean := hb.exec != 0 && (changed || !hb.compExec || !hb.compMapped)
 	if clean {
@@ -824,11 +830,16 @@ func (l *subBlockLayer) dropBlockLocked(base uintptr, hb *hostBlock) error {
 	if hb.cur.kind != stubMapNone {
 		err = l.host.unmapRange(base, subBlockSize)
 	}
-	if err == nil {
-		// Otherwise the stub can still map the spare pages, and reset
-		// releases them.
-		l.disownLocked(base)
+	if err != nil {
+		// The stub can still map the composite page or the spare pages.
+		// The block stays in blocks, so that reset releases them.
+		hb.cur = stubMap{}
+		delete(l.comps, base)
+		delete(l.partial, base)
+		delete(l.deferred, base)
+		return err
 	}
+	l.disownLocked(base)
 	hb.cur = stubMap{}
 	l.freeCompLocked(base, hb)
 	delete(l.partial, base)
@@ -919,25 +930,47 @@ func (l *subBlockLayer) adopt(base uintptr, f memmap.File, fr memmap.FileRange, 
 func (l *subBlockLayer) release(ar hostarch.AddrRange) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.owned) == 0 {
-		return
-	}
 	defer l.updatePendingLocked()
+	// A block that misses a guest page reads that page as zeros or as a
+	// spare page. A new mapping there creates no PMA that the layer sees.
+	// Such a block stops its stub mapping until the next populate.
+	affected := func(base uintptr) bool {
+		if _, ok := l.owned[base]; ok {
+			return true
+		}
+		hb := l.blocks[base]
+		return hb != nil && hb.mapped != allSubPages && hb.cur.kind != stubMapNone
+	}
 	start := subBlockBase(uintptr(ar.Start))
 	end := uintptr(ar.End)
-	if n := (end - start + subBlockSize - 1) / subBlockSize; n > uintptr(len(l.owned)) {
+	var bases []uintptr
+	if n := (end - start + subBlockSize - 1) / subBlockSize; n > uintptr(len(l.blocks)+len(l.owned)) {
 		// The runtime of Go reserves large ranges, so a range can hold many
-		// more blocks than the layer owns.
-		for base := range l.owned {
-			if base >= start && base < end {
-				l.releaseOwnedLocked(base)
+		// more blocks than the layer tracks.
+		for base := range l.blocks {
+			if base >= start && base < end && affected(base) {
+				bases = append(bases, base)
 			}
 		}
-		return
+		for base := range l.owned {
+			if base >= start && base < end && l.blocks[base] == nil {
+				bases = append(bases, base)
+			}
+		}
+	} else {
+		for base := start; base < end; base += subBlockSize {
+			if affected(base) {
+				bases = append(bases, base)
+			}
+		}
 	}
-	for base := start; base < end; base += subBlockSize {
+	for _, base := range bases {
 		if _, ok := l.owned[base]; ok {
 			l.releaseOwnedLocked(base)
+			continue
+		}
+		if err := l.refreshLocked(base, l.blocks[base], false); err != nil && !errors.Is(err, errDeadSubprocess) {
+			log.Warningf("systrap: update the block at %#x after a new mapping: %v", base, err)
 		}
 	}
 }
@@ -992,11 +1025,11 @@ func (l *subBlockLayer) reset() {
 // beforeSwitch prepares the blocks before a thread of the address space runs.
 // It populates the guest pages that a mapped block misses, so that the guest
 // does not read zeros where memory exists. Then it copies the guest pages into
-// the composite pages, because the Sentry or another address space can change
-// a page that the stub reads through a copy. It returns the number of stores
-// that the Sentry ran so far. A store exclusive compares it with the number
-// of the last store to the same page, to find a store of another thread since
-// the thread resumed.
+// the composite pages. The Sentry or another address space can change a page
+// that the stub reads through a copy. It returns the number of stores that the
+// Sentry ran so far. A store exclusive compares it with the number of the last
+// store to the same page. This comparison finds a store of another thread
+// since the thread resumed.
 func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryManager) uint64 {
 	if l.pending.Load() == 0 {
 		return l.storeSeq.Load()
@@ -1028,7 +1061,11 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 		// A guest-writable page can be shared with another address space,
 		// whose stores the layer does not see, so it refreshes on each switch.
 		mask := hb.write
-		if hb.dirty.Swap(false) || all || hb.alwaysSync {
+		if d := hb.dirty.Load(); d > 0 {
+			hb.dirty.CompareAndSwap(d, d-1)
+			mask = allSubPages
+		}
+		if all || hb.alwaysSync {
 			mask = allSubPages
 		}
 		if mask == 0 {
@@ -1055,9 +1092,9 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 // has a mapping there.
 //
 // seen is the value of changes when the thread resumed. It returns true when
-// the thread must run the instruction again: the page is mapped now, and a
-// stub mapping changed since the thread resumed, so the SIGILL can come from
-// zeros or from old contents that the thread fetched before the change.
+// the thread must run the instruction again. A stub mapping changed since the
+// thread resumed. The SIGILL can therefore come from zeros or from old
+// contents that the thread fetched before the change.
 func (l *subBlockLayer) fixMissingPageFault(si *linux.SignalInfo, at *hostarch.AccessType, ac *arch.Context64, seen uint64) bool {
 	switch linux.Signal(si.Signo) {
 	case linux.SIGSEGV:
@@ -1070,29 +1107,34 @@ func (l *subBlockLayer) fixMissingPageFault(si *linux.SignalInfo, at *hostarch.A
 		defer l.mu.Unlock()
 		hb, _, present := l.pageLocked(pc)
 		switch {
-		case hb == nil:
-		case !present && hb.cur.kind != stubMapNone:
+		case hb != nil && !present:
+			// The block was mapped when the thread ran zeros there. Another
+			// thread can have unmapped it since then.
 			*si = linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvMaperr}
 			si.SetAddr(uint64(pc))
 			*at = hostarch.Execute
-		case present && l.changes.Load() != seen:
+		case l.changes.Load() != seen:
+			// Another thread changed or dropped the block since the thread
+			// resumed.
 			return true
 		}
 	}
 	return false
 }
 
-// missingPage reports whether addr lies in a guest page that a mapped block
-// misses. Such a page reads as zeros in the stub (refreshLocked).
+// missingPage reports whether addr lies in a guest page that a block misses.
+// Such a page reads as zeros while the stub maps the block (refreshLocked). A
+// fault there comes from such a mapping, even if the stub no longer maps the
+// block.
 func (l *subBlockLayer) missingPage(addr uintptr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	hb, _, ok := l.pageLocked(addr)
-	return hb != nil && !ok && hb.cur.kind != stubMapNone
+	return hb != nil && !ok
 }
 
 // populatePartial asks the memory manager to map the guest pages that blocks
-// miss. A block is checked once after each change of it.
+// miss. The layer verifies a block once after each change of the block.
 func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlockPopulator) {
 	var addrs []hostarch.Addr
 	l.mu.Lock()
@@ -1126,8 +1168,8 @@ func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlo
 		pop.PopulateSubBlock(ctx, addr)
 	}
 	// A populate that maps only some pages queues the block again. The next
-	// change of the block checks it, so that a block next to unmapped memory
-	// does not cost a check for each switch.
+	// change of the block verifies it, so that a block next to unmapped memory
+	// does not cost a verification for each switch.
 	l.mu.Lock()
 	for _, addr := range addrs {
 		delete(l.partial, subBlockBase(uintptr(addr)))

@@ -60,8 +60,8 @@ type ExecImage struct {
 // its MemoryManager to this interface.
 type ExecImageProvider interface {
 	// ExecImageAt reports what backs addr. For a file mapping it returns a
-	// reader of the whole file, not only of the mapped part, because section
-	// headers sit beyond the last mapped segment.
+	// reader of the whole file, not only of the mapped part. Section headers
+	// sit beyond the last mapped segment.
 	ExecImageAt(ctx context.Context, addr hostarch.Addr) ExecImage
 }
 
@@ -98,7 +98,7 @@ type HostBlockOwner interface {
 	AdoptHostBlock(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, spare uint8)
 
 	// ReleaseHostBlocks makes the address space stop the use of the spare
-	// pages in the host blocks that overlap ar, because a new guest mapping
-	// covers ar. The memory manager holds activeMu.
+	// pages in the host blocks that overlap ar. A new guest mapping covers
+	// ar. The memory manager holds activeMu.
 	ReleaseHostBlocks(ar hostarch.AddrRange)
 }

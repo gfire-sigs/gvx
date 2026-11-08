@@ -23,9 +23,9 @@ import (
 
 // hostPageSize is the page size of the host kernel. It is larger than
 // hostarch.PageSize on an Android device with 16 KB pages, where guest pages
-// stay 4 KB (docs/gvxip/gvxip-006-android-host-support.md). Every region that
-// the engine maps or protects for itself, such as the stub code, the seccomp
-// rules, and the shared queues, starts and ends on a host page.
+// stay 4 KB (docs/gvxip/gvxip-006-android-host-support.md). The engine maps or
+// protects some regions for itself, such as the stub code, the seccomp rules,
+// and the shared queues. Every such region starts and ends on a host page.
 var hostPageSize = uintptr(max(unix.Getpagesize(), hostarch.PageSize))
 
 // syscallStubMessageOff is the offset of the stub message of a syscall thread

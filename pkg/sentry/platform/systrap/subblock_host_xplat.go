@@ -63,13 +63,9 @@ func (h subprocessBlockHost) unmapRange(addr, length uintptr) error {
 // allocComp implements blockHost.allocComp.
 func (h subprocessBlockHost) allocComp() (compPage, error) {
 	mf := h.s.memoryFile
-	fr, err := mf.Allocate(subBlockSize, pgalloc.AllocOpts{Kind: usage.System})
+	fr, err := mf.AllocateAligned(subBlockSize, uint64(hostPageSize), pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		return compPage{}, err
-	}
-	if fr.Start%uint64(hostPageSize) != 0 {
-		mf.DecRef(fr)
-		return compPage{}, fmt.Errorf("the memory file range %v is not aligned to the host page", fr)
 	}
 	bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
 	if err != nil {

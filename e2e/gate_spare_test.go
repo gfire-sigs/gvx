@@ -34,9 +34,10 @@ var spareProbeChecks = []string{
 // TestE2ESystrapSparePages runs a guest that maps single pages in one 16 KB
 // block and changes them with munmap, mmap, mprotect, MADV_DONTNEED, and fork.
 // The Linux systrap engine on a host with 16 KB pages maps such a block
-// directly and holds its unused pages (GVX_SYSTRAP_SUBBLOCKS=1 runs that code
-// on a host with 4 KB pages). The guest and the guest kernel must agree on
-// every byte, as on Linux, so every backend must pass every check.
+// directly. It holds the unused pages of the block as spare pages.
+// GVX_SYSTRAP_SUBBLOCKS=1 runs that code on a host with 4 KB pages. The guest
+// and the guest kernel must agree on every byte, as on Linux, so every backend
+// must pass every check.
 func TestE2ESystrapSparePages(t *testing.T) {
 	runCPUProbe(t, acceptprog.BuildSpareProbe(t, hostArch()), "spareprobe", "SPAREPROBE-OK", spareProbeChecks)
 }

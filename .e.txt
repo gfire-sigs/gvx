@@ -1,0 +1,712 @@
+rungv: warning: host lockdown disabled
+SIGQUIT: quit
+PC=0x9e6ec m=0 sigcode=0
+
+goroutine 0 gp=0x237bf40 m=0 mp=0x237e1c0 [idle]:
+runtime.futex(0x237e318, 0x80, 0x0, 0x0, 0x0, 0x0)
+	/usr/local/go/src/runtime/sys_linux_arm64.s:665 +0x1c fp=0xffffe2d1e330 sp=0xffffe2d1e330 pc=0x9e6ec
+runtime.futexsleep(0x237bf40?, 0x237bf40?, 0xffffe2d1e3b8?)
+	/usr/local/go/src/runtime/os_linux.go:73 +0x28 fp=0xffffe2d1e380 sp=0xffffe2d1e330 pc=0x59fd8
+runtime.notesleep(0x237e318)
+	/usr/local/go/src/runtime/lock_futex.go:47 +0x8c fp=0xffffe2d1e3c0 sp=0xffffe2d1e380 pc=0x2deac
+runtime.mPark(...)
+	/usr/local/go/src/runtime/proc.go:1985
+runtime.stoplockedm()
+	/usr/local/go/src/runtime/proc.go:3278 +0x64 fp=0xffffe2d1e420 sp=0xffffe2d1e3c0 pc=0x65094
+runtime.schedule()
+	/usr/local/go/src/runtime/proc.go:4158 +0x34 fp=0xffffe2d1e460 sp=0xffffe2d1e420 pc=0x67864
+runtime.park_m(0x9bae6c21c20)
+	/usr/local/go/src/runtime/proc.go:4319 +0x23c fp=0xffffe2d1e4c0 sp=0xffffe2d1e460 pc=0x67d3c
+runtime.mcall()
+	/usr/local/go/src/runtime/asm_arm64.s:319 +0x54 fp=0xffffe2d1e4d0 sp=0xffffe2d1e4c0 pc=0x9b6e4
+
+goroutine 1 gp=0x9bae6a6e1e0 m=nil [sync.Cond.Wait, 1 minutes]:
+runtime.gopark(0x9bae6fd0948?, 0x93964?, 0x68?, 0x9?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae81aa8f0 sp=0x9bae81aa8d0 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+sync.runtime_notifyListWait(0x9bae6d351d0, 0x0)
+	/usr/local/go/src/runtime/sema.go:617 +0x194 fp=0x9bae81aa940 sp=0x9bae81aa8f0 pc=0x97a34
+sync.(*Cond).Wait(0x9bae6d351c0)
+	/usr/local/go/src/sync/cond.go:71 +0xa4 fp=0x9bae81aa970 sp=0x9bae81aa940 pc=0xa5fa4
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Kernel).WaitExited(0x9bae6ff4a08)
+	/src/pkg/sentry/kernel/kernel.go:1948 +0x70 fp=0x9bae81aa9b0 sp=0x9bae81aa970 pc=0x8f7870
+z.gfire.dev/gvx/pkg/gvx.(*Sandbox).runWithKernel(0x9bae6bba388, {0x22a9108, 0x9bae6b15500}, {0x9bae6baa050, 0x1, 0x1})
+	/src/pkg/gvx/kernel_runner.go:1226 +0x25bc fp=0x9bae81ab4a0 sp=0x9bae81aa9b0 pc=0xd815fc
+z.gfire.dev/gvx/pkg/gvx.(*Sandbox).Run(0x229cec8?, {0x22a9108?, 0x9bae6b15500?})
+	/src/pkg/gvx/sandbox.go:402 +0x60 fp=0x9bae81ab4e0 sp=0x9bae81ab4a0 pc=0xd8f250
+main.runSubcommand({0x22a9108, 0x9bae6b15500}, {0x9bae6aba200?, 0x7e?, 0x0?}, {0x229cee8?, 0x9bae6a6c038?}, {0x229cec8?, 0x9bae6a6c040?}, {0x229cec8, ...})
+	/src/cmd/rungv/run.go:436 +0x35c fp=0x9bae81abcb0 sp=0x9bae81ab4e0 pc=0xda389c
+main.init.7.func1({0x22a9108?, 0x9bae6b15500?}, {0x9bae6aba200?, 0x3?, 0x23a9300?}, {{0x229cee8, 0x9bae6a6c038}, {0x229cec8, 0x9bae6a6c040}, {0x229cec8, ...}})
+	/src/cmd/rungv/run.go:41 +0x40 fp=0x9bae81abd20 sp=0x9bae81abcb0 pc=0xda7550
+main.executeCLI({0x22a9108, 0x9bae6b15500}, {0x9bae6aba1f0, 0x5, 0x5}, {0x229cee8?, 0x9bae6a6c038?}, {0x229cec8?, 0x9bae6a6c040?}, {0x229cec8, ...})
+	/src/cmd/rungv/main.go:79 +0x348 fp=0x9bae81abe20 sp=0x9bae81abd20 pc=0xd9e508
+main.main()
+	/src/cmd/rungv/main.go:59 +0x100 fp=0x9bae81abea0 sp=0x9bae81abe20 pc=0xd9e170
+runtime.main()
+	/usr/local/go/src/runtime/proc.go:302 +0x380 fp=0x9bae81abfd0 sp=0x9bae81abea0 pc=0x5fcc0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae81abfd0 sp=0x9bae81abfd0 pc=0x9d684
+
+goroutine 2 gp=0x9bae6a6e780 m=nil [force gc (idle), 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae0f90 sp=0x9bae6ae0f70 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+runtime.forcegchelper()
+	/usr/local/go/src/runtime/proc.go:387 +0xb4 fp=0x9bae6ae0fd0 sp=0x9bae6ae0f90 pc=0x5ffa4
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae0fd0 sp=0x9bae6ae0fd0 pc=0x9d684
+created by runtime.init.7 in goroutine 1
+	/usr/local/go/src/runtime/proc.go:375 +0x24
+
+goroutine 3 gp=0x9bae6a6ed20 m=nil [GC sweep wait]:
+runtime.gopark(0x1?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae1770 sp=0x9bae6ae1750 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+runtime.bgsweep(0x9bae6b00000)
+	/usr/local/go/src/runtime/mgcsweep.go:324 +0x178 fp=0x9bae6ae17b0 sp=0x9bae6ae1770 pc=0x4a908
+runtime.gcenable.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:214 +0x20 fp=0x9bae6ae17d0 sp=0x9bae6ae17b0 pc=0x8c980
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae17d0 sp=0x9bae6ae17d0 pc=0x9d684
+created by runtime.gcenable in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:214 +0x6c
+
+goroutine 4 gp=0x9bae6a6ef00 m=nil [GC scavenge wait]:
+runtime.gopark(0x69201c?, 0x67c636?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae1f60 sp=0x9bae6ae1f40 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+runtime.(*scavengerState).park(0x237b560)
+	/usr/local/go/src/runtime/mgcscavenge.go:425 +0x5c fp=0x9bae6ae1f90 sp=0x9bae6ae1f60 pc=0x484ac
+runtime.bgscavenge(0x9bae6b00000)
+	/usr/local/go/src/runtime/mgcscavenge.go:658 +0xac fp=0x9bae6ae1fb0 sp=0x9bae6ae1f90 pc=0x48a1c
+runtime.gcenable.gowrap2()
+	/usr/local/go/src/runtime/mgc.go:215 +0x20 fp=0x9bae6ae1fd0 sp=0x9bae6ae1fb0 pc=0x8c940
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae1fd0 sp=0x9bae6ae1fd0 pc=0x9d684
+created by runtime.gcenable in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:215 +0xac
+
+goroutine 5 gp=0x9bae6a6f4a0 m=nil [GOMAXPROCS updater (idle), 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae0770 sp=0x9bae6ae0750 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+runtime.updateMaxProcsGoroutine()
+	/usr/local/go/src/runtime/proc.go:7146 +0xf4 fp=0x9bae6ae07d0 sp=0x9bae6ae0770 pc=0x6d8e4
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae07d0 sp=0x9bae6ae07d0 pc=0x9d684
+created by runtime.defaultGOMAXPROCSUpdateEnable in goroutine 1
+	/usr/local/go/src/runtime/proc.go:7134 +0x48
+
+goroutine 6 gp=0x9bae6a6f680 m=nil [finalizer wait, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae2580 sp=0x9bae6ae2560 pc=0x95eb8
+runtime.runFinalizers()
+	/usr/local/go/src/runtime/mfinal.go:210 +0x100 fp=0x9bae6ae27d0 sp=0x9bae6ae2580 pc=0x3b9d0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae27d0 sp=0x9bae6ae27d0 pc=0x9d684
+created by runtime.createfing in goroutine 1
+	/usr/local/go/src/runtime/mfinal.go:172 +0x78
+
+goroutine 7 gp=0x9bae6a6fc20 m=nil [cleanup wait, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae2f50 sp=0x9bae6ae2f30 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+runtime.(*cleanupQueue).dequeue(0x237bbc0)
+	/usr/local/go/src/runtime/mcleanup.go:522 +0x160 fp=0x9bae6ae2f90 sp=0x9bae6ae2f50 pc=0x38530
+runtime.runCleanups()
+	/usr/local/go/src/runtime/mcleanup.go:718 +0x40 fp=0x9bae6ae2fd0 sp=0x9bae6ae2f90 pc=0x38c80
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae2fd0 sp=0x9bae6ae2fd0 pc=0x9d684
+created by runtime.(*cleanupQueue).createGs in goroutine 1
+	/usr/local/go/src/runtime/mcleanup.go:672 +0x108
+
+goroutine 8 gp=0x9bae6c21c20 m=nil [select, 1 minutes, locked to thread]:
+runtime.gopark(0x9bae6b06fa0?, 0x2?, 0x98?, 0x6e?, 0x9bae6b06f8c?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b06e00 sp=0x9bae6b06de0 pc=0x95eb8
+runtime.selectgo(0x9bae6b06fa0, 0x9bae6b06f88, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6b06f40 sp=0x9bae6b06e00 pc=0x72348
+runtime.ensureSigM.func1()
+	/usr/local/go/src/runtime/signal_unix.go:1093 +0x17c fp=0x9bae6b06fd0 sp=0x9bae6b06f40 pc=0x907fc
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b06fd0 sp=0x9bae6b06fd0 pc=0x9d684
+created by runtime.ensureSigM in goroutine 1
+	/usr/local/go/src/runtime/signal_unix.go:1076 +0xcc
+
+goroutine 17 gp=0x9bae6b843c0 m=2 mp=0x9bae6ae4808 [syscall, 1 minutes]:
+runtime.notetsleepg(0x23a8520, 0xffffffffffffffff)
+	/usr/local/go/src/runtime/lock_futex.go:123 +0x34 fp=0x9bae6adc790 sp=0x9bae6adc760 pc=0x2e144
+os/signal.signal_recv()
+	/usr/local/go/src/runtime/sigqueue.go:152 +0x114 fp=0x9bae6adc7b0 sp=0x9bae6adc790 pc=0x983d4
+os/signal.loop()
+	/usr/local/go/src/os/signal/signal_unix.go:23 +0x1c fp=0x9bae6adc7d0 sp=0x9bae6adc7b0 pc=0x20181c
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6adc7d0 sp=0x9bae6adc7d0 pc=0x9d684
+created by os/signal.Notify.func2.1 in goroutine 1
+	/usr/local/go/src/os/signal/signal.go:164 +0x28
+
+goroutine 18 gp=0x9bae6b84960 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6adcf90?, 0x2?, 0x0?, 0x0?, 0x9bae6adcf84?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6adce00 sp=0x9bae6adcde0 pc=0x95eb8
+runtime.selectgo(0x9bae6adcf90, 0x9bae6adcf80, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6adcf40 sp=0x9bae6adce00 pc=0x72348
+os/signal.NotifyContext.func1()
+	/usr/local/go/src/os/signal/signal.go:304 +0x74 fp=0x9bae6adcfd0 sp=0x9bae6adcf40 pc=0x201c14
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6adcfd0 sp=0x9bae6adcfd0 pc=0x9d684
+created by os/signal.NotifyContext in goroutine 1
+	/usr/local/go/src/os/signal/signal.go:303 +0x144
+
+goroutine 9 gp=0x9bae6b84b40 m=nil [runnable]:
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.(*subPage).bytes(0x9bae6ce7c28)
+	/src/pkg/sentry/platform/systrap/subblock_xplat.go:145 +0x3f4 fp=0x9bae6ca7c30 sp=0x9bae6ca7c30 pc=0xcedbb4
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.(*hostBlock).syncCompPages(0x9bae6ce7b80, 0xf)
+	/src/pkg/sentry/platform/systrap/subblock_xplat.go:375 +0xa4 fp=0x9bae6ca7c90 sp=0x9bae6ca7c30 pc=0xcee054
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.(*subBlockLayer).beforeSwitch(0x9bae6b995f0, {0x22c2cd8?, 0x9bae811a008?}, {0x22c09b8?, 0x9bae6bd4008?})
+	/src/pkg/sentry/platform/systrap/subblock_xplat.go:1037 +0x3a4 fp=0x9bae6ca7dc0 sp=0x9bae6ca7c90 pc=0xcf1c34
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.(*platformContext).Switch(0x9bae6da55e0, {0x22c2cd8, 0x9bae811a008}, {0x22c09b8, 0x9bae6bd4008}, 0x9bae72c7b80, 0xe6add658?)
+	/src/pkg/sentry/platform/systrap/systrap.go:202 +0x118 fp=0x9bae6ca7e10 sp=0x9bae6ca7dc0 pc=0xcfe308
+z.gfire.dev/gvx/pkg/sentry/kernel.(*runApp).execute(0x9bae6bde510?, 0x9bae811a008)
+	/src/pkg/sentry/kernel/task_run.go:278 +0x6bc fp=0x9bae6ca7f10 sp=0x9bae6ca7e10 pc=0x937fac
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).run(0x9bae811a008, 0x2)
+	/src/pkg/sentry/kernel/task_run.go:90 +0x1a8 fp=0x9bae6ca7fb0 sp=0x9bae6ca7f10 pc=0x9375d8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start.gowrap1()
+	/src/pkg/sentry/kernel/task_start.go:582 +0x20 fp=0x9bae6ca7fd0 sp=0x9bae6ca7fb0 pc=0x955260
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ca7fd0 sp=0x9bae6ca7fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start in goroutine 51
+	/src/pkg/sentry/kernel/task_start.go:582 +0xc8
+
+goroutine 20 gp=0x9bae6b84d20 m=nil [sync.Cond.Wait]:
+runtime.gopark(0x9bae6added8?, 0x331310?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6addeb0 sp=0x9bae6adde90 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+sync.runtime_notifyListWait(0x9bae6bc6428, 0x8)
+	/usr/local/go/src/runtime/sema.go:617 +0x194 fp=0x9bae6addf00 sp=0x9bae6addeb0 pc=0x97a34
+sync.(*Cond).Wait(0x9bae6bc6418)
+	/usr/local/go/src/sync/cond.go:71 +0xa4 fp=0x9bae6addf30 sp=0x9bae6addf00 pc=0xa5fa4
+z.gfire.dev/gvx/pkg/sentry/pgalloc.(*MemoryFile).releaserMain(0x9bae6bc6008)
+	/src/pkg/sentry/pgalloc/pgalloc.go:1362 +0x38 fp=0x9bae6addfb0 sp=0x9bae6addf30 pc=0x334408
+z.gfire.dev/gvx/pkg/sentry/pgalloc.NewMemoryFile.gowrap1()
+	/src/pkg/sentry/pgalloc/pgalloc.go:478 +0x20 fp=0x9bae6addfd0 sp=0x9bae6addfb0 pc=0x34d060
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6addfd0 sp=0x9bae6addfd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/pgalloc.NewMemoryFile in goroutine 1
+	/src/pkg/sentry/pgalloc/pgalloc.go:478 +0x254
+
+goroutine 21 gp=0x9bae6b84f00 m=nil [GC worker (idle)]:
+runtime.gopark(0x1cd3830f3cb?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ade720 sp=0x9bae6ade700 pc=0x95eb8
+runtime.gcBgMarkWorker(0x9bae6efe540)
+	/usr/local/go/src/runtime/mgc.go:1807 +0xe0 fp=0x9bae6ade7b0 sp=0x9bae6ade720 pc=0x3ed20
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:1711 +0x20 fp=0x9bae6ade7d0 sp=0x9bae6ade7b0 pc=0x8ceb0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ade7d0 sp=0x9bae6ade7d0 pc=0x9d684
+created by runtime.gcBgMarkStartWorkers in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:1711 +0x130
+
+goroutine 22 gp=0x9bae6b850e0 m=nil [GC worker (idle)]:
+runtime.gopark(0x1cd3830f49c?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6adef20 sp=0x9bae6adef00 pc=0x95eb8
+runtime.gcBgMarkWorker(0x9bae6efe540)
+	/usr/local/go/src/runtime/mgc.go:1807 +0xe0 fp=0x9bae6adefb0 sp=0x9bae6adef20 pc=0x3ed20
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:1711 +0x20 fp=0x9bae6adefd0 sp=0x9bae6adefb0 pc=0x8ceb0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6adefd0 sp=0x9bae6adefd0 pc=0x9d684
+created by runtime.gcBgMarkStartWorkers in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:1711 +0x130
+
+goroutine 23 gp=0x9bae6b852c0 m=nil [GC worker (idle)]:
+runtime.gopark(0x1cd382f2cb7?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6adf720 sp=0x9bae6adf700 pc=0x95eb8
+runtime.gcBgMarkWorker(0x9bae6efe540)
+	/usr/local/go/src/runtime/mgc.go:1807 +0xe0 fp=0x9bae6adf7b0 sp=0x9bae6adf720 pc=0x3ed20
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:1711 +0x20 fp=0x9bae6adf7d0 sp=0x9bae6adf7b0 pc=0x8ceb0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6adf7d0 sp=0x9bae6adf7d0 pc=0x9d684
+created by runtime.gcBgMarkStartWorkers in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:1711 +0x130
+
+goroutine 24 gp=0x9bae6b854a0 m=nil [GC worker (idle)]:
+runtime.gopark(0x1cd3825913e?, 0x3?, 0x8a?, 0xb?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6adff20 sp=0x9bae6adff00 pc=0x95eb8
+runtime.gcBgMarkWorker(0x9bae6efe540)
+	/usr/local/go/src/runtime/mgc.go:1807 +0xe0 fp=0x9bae6adffb0 sp=0x9bae6adff20 pc=0x3ed20
+runtime.gcBgMarkStartWorkers.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:1711 +0x20 fp=0x9bae6adffd0 sp=0x9bae6adffb0 pc=0x8ceb0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6adffd0 sp=0x9bae6adffd0 pc=0x9d684
+created by runtime.gcBgMarkStartWorkers in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:1711 +0x130
+
+goroutine 33 gp=0x9bae6daa3c0 m=nil [chan receive, 1 minutes]:
+runtime.gopark(0x9bae7038380?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b6ded0 sp=0x9bae6b6deb0 pc=0x95eb8
+runtime.chanrecv(0x9bae6b165b0, 0x9bae6b6dfb8, 0x1)
+	/usr/local/go/src/runtime/chan.go:667 +0x470 fp=0x9bae6b6df50 sp=0x9bae6b6ded0 pc=0x28ed0
+runtime.chanrecv2(0x9bae6b7a6c8?, 0x216af20?)
+	/usr/local/go/src/runtime/chan.go:514 +0x14 fp=0x9bae6b6df80 sp=0x9bae6b6df50 pc=0x28a44
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.newSubprocess.func1()
+	/src/pkg/sentry/platform/systrap/subprocess.go:410 +0x48 fp=0x9bae6b6dfd0 sp=0x9bae6b6df80 pc=0xd00548
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b6dfd0 sp=0x9bae6b6dfd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/platform/systrap.newSubprocess in goroutine 1
+	/src/pkg/sentry/platform/systrap/subprocess.go:407 +0x37c
+
+goroutine 34 gp=0x9bae6daa5a0 m=nil [sleep]:
+runtime.gopark(0x1cdd5f9bd59?, 0x0?, 0x1?, 0xbf?, 0xce9370?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e3bf50 sp=0x9bae6e3bf30 pc=0x95eb8
+time.Sleep(0x61a80)
+	/usr/local/go/src/runtime/time.go:368 +0x150 fp=0x9bae6e3bfb0 sp=0x9bae6e3bf50 pc=0x99d30
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.controlFastPath()
+	/src/pkg/sentry/platform/systrap/metrics.go:365 +0x38 fp=0x9bae6e3bfd0 sp=0x9bae6e3bfb0 pc=0xce8a98
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e3bfd0 sp=0x9bae6e3bfd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/platform/systrap.New.func2 in goroutine 1
+	/src/pkg/sentry/platform/systrap/systrap.go:392 +0x24
+
+goroutine 25 gp=0x9bae6e06780 m=nil [select, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e3a690 sp=0x9bae6e3a670 pc=0x95eb8
+z.gfire.dev/gvx/pkg/sync.Gopark(...)
+	/src/pkg/sync/runtime_unsafe.go:34
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).nextWaker(0x9bae6ffe020, 0x1, 0x0?)
+	/src/pkg/sleep/sleep_unsafe.go:210 +0x74 fp=0x9bae6e3a6c0 sp=0x9bae6e3a690 pc=0x59f0f4
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).fetch(0x9bae6ffe020, 0x1, 0x0)
+	/src/pkg/sleep/sleep_unsafe.go:257 +0x2c fp=0x9bae6e3a6f0 sp=0x9bae6e3a6c0 pc=0x59f20c
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).Fetch(...)
+	/src/pkg/sleep/sleep_unsafe.go:280
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*processor).start(0x9bae6ffe008, 0x0?)
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:321 +0x94 fp=0x9bae6e3a7b0 sp=0x9bae6e3a6f0 pc=0x5ba1b4
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked.gowrap1()
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x20 fp=0x9bae6e3a7d0 sp=0x9bae6e3a7b0 pc=0x5df220
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e3a7d0 sp=0x9bae6e3a7d0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked in goroutine 1
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x48
+
+goroutine 26 gp=0x9bae6e06960 m=nil [select, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e3ae90 sp=0x9bae6e3ae70 pc=0x95eb8
+z.gfire.dev/gvx/pkg/sync.Gopark(...)
+	/src/pkg/sync/runtime_unsafe.go:34
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).nextWaker(0x9bae6ffe0b0, 0x1, 0x0?)
+	/src/pkg/sleep/sleep_unsafe.go:210 +0x74 fp=0x9bae6e3aec0 sp=0x9bae6e3ae90 pc=0x59f0f4
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).fetch(0x9bae6ffe0b0, 0x1, 0x0)
+	/src/pkg/sleep/sleep_unsafe.go:257 +0x2c fp=0x9bae6e3aef0 sp=0x9bae6e3aec0 pc=0x59f20c
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).Fetch(...)
+	/src/pkg/sleep/sleep_unsafe.go:280
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*processor).start(0x9bae6ffe098, 0x0?)
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:321 +0x94 fp=0x9bae6e3afb0 sp=0x9bae6e3aef0 pc=0x5ba1b4
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked.gowrap1()
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x20 fp=0x9bae6e3afd0 sp=0x9bae6e3afb0 pc=0x5df220
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e3afd0 sp=0x9bae6e3afd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked in goroutine 1
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x48
+
+goroutine 27 gp=0x9bae6e06b40 m=nil [select, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e3c690 sp=0x9bae6e3c670 pc=0x95eb8
+z.gfire.dev/gvx/pkg/sync.Gopark(...)
+	/src/pkg/sync/runtime_unsafe.go:34
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).nextWaker(0x9bae6ffe140, 0x1, 0x0?)
+	/src/pkg/sleep/sleep_unsafe.go:210 +0x74 fp=0x9bae6e3c6c0 sp=0x9bae6e3c690 pc=0x59f0f4
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).fetch(0x9bae6ffe140, 0x1, 0x0)
+	/src/pkg/sleep/sleep_unsafe.go:257 +0x2c fp=0x9bae6e3c6f0 sp=0x9bae6e3c6c0 pc=0x59f20c
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).Fetch(...)
+	/src/pkg/sleep/sleep_unsafe.go:280
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*processor).start(0x9bae6ffe128, 0x0?)
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:321 +0x94 fp=0x9bae6e3c7b0 sp=0x9bae6e3c6f0 pc=0x5ba1b4
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked.gowrap1()
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x20 fp=0x9bae6e3c7d0 sp=0x9bae6e3c7b0 pc=0x5df220
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e3c7d0 sp=0x9bae6e3c7d0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked in goroutine 1
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x48
+
+goroutine 28 gp=0x9bae6e06d20 m=nil [select, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e3ce90 sp=0x9bae6e3ce70 pc=0x95eb8
+z.gfire.dev/gvx/pkg/sync.Gopark(...)
+	/src/pkg/sync/runtime_unsafe.go:34
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).nextWaker(0x9bae6ffe1d0, 0x1, 0x0?)
+	/src/pkg/sleep/sleep_unsafe.go:210 +0x74 fp=0x9bae6e3cec0 sp=0x9bae6e3ce90 pc=0x59f0f4
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).fetch(0x9bae6ffe1d0, 0x1, 0x0)
+	/src/pkg/sleep/sleep_unsafe.go:257 +0x2c fp=0x9bae6e3cef0 sp=0x9bae6e3cec0 pc=0x59f20c
+z.gfire.dev/gvx/pkg/sleep.(*Sleeper).Fetch(...)
+	/src/pkg/sleep/sleep_unsafe.go:280
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*processor).start(0x9bae6ffe1b8, 0x0?)
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:321 +0x94 fp=0x9bae6e3cfb0 sp=0x9bae6e3cef0 pc=0x5ba1b4
+z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked.gowrap1()
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x20 fp=0x9bae6e3cfd0 sp=0x9bae6e3cfb0 pc=0x5df220
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e3cfd0 sp=0x9bae6e3cfd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/tcpip/transport/tcp.(*dispatcher).startLocked in goroutine 1
+	/src/pkg/tcpip/transport/tcp/dispatcher.go:436 +0x48
+
+goroutine 29 gp=0x9bae6e06f00 m=nil [sync.Cond.Wait]:
+runtime.gopark(0x9bae6b70ed8?, 0x331310?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b70eb0 sp=0x9bae6b70e90 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+sync.runtime_notifyListWait(0x9bae6bc7428, 0xdb)
+	/usr/local/go/src/runtime/sema.go:617 +0x194 fp=0x9bae6b70f00 sp=0x9bae6b70eb0 pc=0x97a34
+sync.(*Cond).Wait(0x9bae6bc7418)
+	/usr/local/go/src/sync/cond.go:71 +0xa4 fp=0x9bae6b70f30 sp=0x9bae6b70f00 pc=0xa5fa4
+z.gfire.dev/gvx/pkg/sentry/pgalloc.(*MemoryFile).releaserMain(0x9bae6bc7008)
+	/src/pkg/sentry/pgalloc/pgalloc.go:1362 +0x38 fp=0x9bae6b70fb0 sp=0x9bae6b70f30 pc=0x334408
+z.gfire.dev/gvx/pkg/sentry/pgalloc.NewMemoryFile.gowrap1()
+	/src/pkg/sentry/pgalloc/pgalloc.go:478 +0x20 fp=0x9bae6b70fd0 sp=0x9bae6b70fb0 pc=0x34d060
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b70fd0 sp=0x9bae6b70fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/pgalloc.NewMemoryFile in goroutine 1
+	/src/pkg/sentry/pgalloc/pgalloc.go:478 +0x254
+
+goroutine 30 gp=0x9bae6e070e0 m=nil [select]:
+runtime.gopark(0x9bae6b05f78?, 0x2?, 0x0?, 0x0?, 0x9bae6b05f6c?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b05de0 sp=0x9bae6b05dc0 pc=0x95eb8
+runtime.selectgo(0x9bae6b05f78, 0x9bae6b05f68, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6b05f20 sp=0x9bae6b05de0 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Timekeeper).startUpdater.func1()
+	/src/pkg/sentry/kernel/timekeeper.go:358 +0xb4 fp=0x9bae6b05fd0 sp=0x9bae6b05f20 pc=0x9564f4
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b05fd0 sp=0x9bae6b05fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Timekeeper).startUpdater in goroutine 1
+	/src/pkg/sentry/kernel/timekeeper.go:353 +0x1cc
+
+goroutine 31 gp=0x9bae6e072c0 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6b71f30?, 0x3?, 0xc8?, 0x35?, 0x9bae6b71f02?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b71d80 sp=0x9bae6b71d60 pc=0x95eb8
+runtime.selectgo(0x9bae6b71f30, 0x9bae6b71efc, 0xffffffffffffffff?, 0x0, 0x9bae6ae3718?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6b71ec0 sp=0x9bae6b71d80 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Timekeeper).runAfterFuncScheduler(0x9bae6b746c0, 0x9bae6b16850)
+	/src/pkg/sentry/kernel/timekeeper.go:723 +0x14c fp=0x9bae6b71f90 sp=0x9bae6b71ec0 pc=0x94aa6c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Timekeeper).startAfterFuncSchedulerLocked.func2()
+	/src/pkg/sentry/kernel/timekeeper.go:682 +0x48 fp=0x9bae6b71fd0 sp=0x9bae6b71f90 pc=0x956af8
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b71fd0 sp=0x9bae6b71fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Timekeeper).startAfterFuncSchedulerLocked in goroutine 1
+	/src/pkg/sentry/kernel/timekeeper.go:680 +0x10c
+
+goroutine 32 gp=0x9bae6e07680 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6ae3f88?, 0x2?, 0xfa?, 0xca?, 0x9bae6ae3f84?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ae3e00 sp=0x9bae6ae3de0 pc=0x95eb8
+runtime.selectgo(0x9bae6ae3f88, 0x9bae6ae3f80, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6ae3f40 sp=0x9bae6ae3e00 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).runGoroutine(0x9bae6b99560)
+	/src/pkg/sentry/ktime/sampled_timer.go:302 +0x6c fp=0x9bae6ae3fb0 sp=0x9bae6ae3f40 pc=0x76f6cc
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init.gowrap1()
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x20 fp=0x9bae6ae3fd0 sp=0x9bae6ae3fb0 pc=0x777380
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ae3fd0 sp=0x9bae6ae3fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init in goroutine 1
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x14c
+
+goroutine 49 gp=0x9bae6e07860 m=nil [chan receive, 1 minutes]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b6eed0 sp=0x9bae6b6eeb0 pc=0x95eb8
+runtime.chanrecv(0x9bae6b16b60, 0x9bae6b6efb8, 0x1)
+	/usr/local/go/src/runtime/chan.go:667 +0x470 fp=0x9bae6b6ef50 sp=0x9bae6b6eed0 pc=0x28ed0
+runtime.chanrecv2(0x9bae6b7b8c8?, 0x216af98?)
+	/usr/local/go/src/runtime/chan.go:514 +0x14 fp=0x9bae6b6ef80 sp=0x9bae6b6ef50 pc=0x28a44
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.newSubprocess.func1()
+	/src/pkg/sentry/platform/systrap/subprocess.go:410 +0x48 fp=0x9bae6b6efd0 sp=0x9bae6b6ef80 pc=0xd00548
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b6efd0 sp=0x9bae6b6efd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/platform/systrap.newSubprocess in goroutine 1
+	/src/pkg/sentry/platform/systrap/subprocess.go:407 +0x37c
+
+goroutine 50 gp=0x9bae6e07a40 m=nil [select]:
+runtime.gopark(0x9bae6b02f58?, 0x2?, 0x28?, 0x2e?, 0x9bae6b02eb4?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b02d30 sp=0x9bae6b02d10 pc=0x95eb8
+runtime.selectgo(0x9bae6b02f58, 0x9bae6b02eb0, 0x9bae6b02f38?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6b02e70 sp=0x9bae6b02d30 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Kernel).runCPUClockTicker(0x9bae6ff4a08)
+	/src/pkg/sentry/kernel/task_sched.go:262 +0x130 fp=0x9bae6b02fb0 sp=0x9bae6b02e70 pc=0x939070
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Kernel).Start.gowrap2()
+	/src/pkg/sentry/kernel/kernel.go:1661 +0x20 fp=0x9bae6b02fd0 sp=0x9bae6b02fb0 pc=0x94f9b0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b02fd0 sp=0x9bae6b02fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Kernel).Start in goroutine 1
+	/src/pkg/sentry/kernel/kernel.go:1661 +0x154
+
+goroutine 51 gp=0x9bae6e07c20 m=nil [sync.Mutex.Lock]:
+runtime.gopark(0x23891c0?, 0x3166c8?, 0xa0?, 0x22?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6ca3bc0 sp=0x9bae6ca3ba0 pc=0x95eb8
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:480
+runtime.semacquire1(0x9bae6b99614, 0x0, 0x3, 0x2, 0x16)
+	/usr/local/go/src/runtime/sema.go:192 +0x244 fp=0x9bae6ca3c10 sp=0x9bae6ca3bc0 pc=0x72e14
+internal/sync.runtime_SemacquireMutex(0x9bae6ca3c78?, 0x0?, 0x9bae6bc25a0?)
+	/usr/local/go/src/runtime/sema.go:95 +0x28 fp=0x9bae6ca3c50 sp=0x9bae6ca3c10 pc=0x97668
+internal/sync.(*Mutex).lockSlow(0x9bae6b99610)
+	/usr/local/go/src/internal/sync/mutex.go:149 +0x174 fp=0x9bae6ca3ca0 sp=0x9bae6ca3c50 pc=0xa5bf4
+internal/sync.(*Mutex).Lock(...)
+	/usr/local/go/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/usr/local/go/src/sync/mutex.go:46
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.(*subBlockLayer).emulateStore(0x9bae6b995f0, 0x9bae6fe5960, 0x9bae6f1c160)
+	/src/pkg/sentry/platform/systrap/substore_xplat.go:184 +0xc8 fp=0x9bae6ca3dc0 sp=0x9bae6ca3ca0 pc=0xcf9e08
+z.gfire.dev/gvx/pkg/sentry/platform/systrap.(*platformContext).Switch(0x9bae6fe5960, {0x22c2cd8, 0x9bae6c16008}, {0x22c09b8, 0x9bae6bd4008}, 0x9bae6f1c160, 0xe6e36658?)
+	/src/pkg/sentry/platform/systrap/systrap.go:232 +0x218 fp=0x9bae6ca3e10 sp=0x9bae6ca3dc0 pc=0xcfe408
+z.gfire.dev/gvx/pkg/sentry/kernel.(*runApp).execute(0x9bae6b99d40?, 0x9bae6c16008)
+	/src/pkg/sentry/kernel/task_run.go:278 +0x6bc fp=0x9bae6ca3f10 sp=0x9bae6ca3e10 pc=0x937fac
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).run(0x9bae6c16008, 0x1)
+	/src/pkg/sentry/kernel/task_run.go:90 +0x1a8 fp=0x9bae6ca3fb0 sp=0x9bae6ca3f10 pc=0x9375d8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start.gowrap1()
+	/src/pkg/sentry/kernel/task_start.go:582 +0x20 fp=0x9bae6ca3fd0 sp=0x9bae6ca3fb0 pc=0x955260
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6ca3fd0 sp=0x9bae6ca3fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start in goroutine 1
+	/src/pkg/sentry/kernel/task_start.go:582 +0xc8
+
+goroutine 53 gp=0x9bae6b85c20 m=nil [select]:
+runtime.gopark(0x9bae6b03f70?, 0x2?, 0x8?, 0x3e?, 0x9bae6b03f64?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b03de0 sp=0x9bae6b03dc0 pc=0x95eb8
+runtime.selectgo(0x9bae6b03f70, 0x9bae6b03f60, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6b03f20 sp=0x9bae6b03de0 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/watchdog.(*Watchdog).loop(0x9bae6b48600)
+	/src/pkg/sentry/watchdog/watchdog.go:290 +0xc8 fp=0x9bae6b03fb0 sp=0x9bae6b03f20 pc=0xcb5af8
+z.gfire.dev/gvx/pkg/sentry/watchdog.(*Watchdog).Start.gowrap2()
+	/src/pkg/sentry/watchdog/watchdog.go:221 +0x20 fp=0x9bae6b03fd0 sp=0x9bae6b03fb0 pc=0xcb6b00
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b03fd0 sp=0x9bae6b03fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/watchdog.(*Watchdog).Start in goroutine 1
+	/src/pkg/sentry/watchdog/watchdog.go:221 +0x200
+
+goroutine 54 gp=0x9bae6daa780 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6e37fa8?, 0x2?, 0x0?, 0x0?, 0x9bae6e37f8c?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e37e10 sp=0x9bae6e37df0 pc=0x95eb8
+runtime.selectgo(0x9bae6e37fa8, 0x9bae6e37f88, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6e37f50 sp=0x9bae6e37e10 pc=0x72348
+z.gfire.dev/gvx/pkg/gvx.(*Sandbox).runWithKernel.func4()
+	/src/pkg/gvx/kernel_runner.go:1189 +0x6c fp=0x9bae6e37fd0 sp=0x9bae6e37f50 pc=0xd93e7c
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e37fd0 sp=0x9bae6e37fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/gvx.(*Sandbox).runWithKernel in goroutine 1
+	/src/pkg/gvx/kernel_runner.go:1188 +0x2408
+
+goroutine 55 gp=0x9bae6daa960 m=nil [select]:
+runtime.gopark(0x9bae6b6ff40?, 0x2?, 0x2f?, 0x18?, 0x9bae6b6ff0c?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6b6fd80 sp=0x9bae6b6fd60 pc=0x95eb8
+runtime.selectgo(0x9bae6b6ff40, 0x9bae6b6ff08, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6b6fec0 sp=0x9bae6b6fd80 pc=0x72348
+z.gfire.dev/gvx/pkg/gvx.memoryGuard.run({0x0?, 0x9bae6baa850?, 0x0?, 0x9bae6be8d00?}, {0x22a8fb8, 0x9bae6b62190})
+	/src/pkg/gvx/resources.go:132 +0xb4 fp=0x9bae6b6ff70 sp=0x9bae6b6fec0 pc=0xd8ce34
+z.gfire.dev/gvx/pkg/gvx.(*Sandbox).runWithKernel.func7()
+	/src/pkg/gvx/kernel_runner.go:1218 +0x50 fp=0x9bae6b6ffd0 sp=0x9bae6b6ff70 pc=0xd93cc0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6b6ffd0 sp=0x9bae6b6ffd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/gvx.(*Sandbox).runWithKernel in goroutine 1
+	/src/pkg/gvx/kernel_runner.go:1216 +0x2588
+
+goroutine 56 gp=0x9bae6daab40 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6e38f88?, 0x2?, 0x9?, 0x94?, 0x9bae6e38f84?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e38e00 sp=0x9bae6e38de0 pc=0x95eb8
+runtime.selectgo(0x9bae6e38f88, 0x9bae6e38f80, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6e38f40 sp=0x9bae6e38e00 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).runGoroutine(0x9bae6b99d40)
+	/src/pkg/sentry/ktime/sampled_timer.go:302 +0x6c fp=0x9bae6e38fb0 sp=0x9bae6e38f40 pc=0x76f6cc
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init.gowrap1()
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x20 fp=0x9bae6e38fd0 sp=0x9bae6e38fb0 pc=0x777380
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e38fd0 sp=0x9bae6e38fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init in goroutine 51
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x14c
+
+goroutine 57 gp=0x9bae6c5f4a0 m=nil [select]:
+runtime.gopark(0x9bae6e38788?, 0x2?, 0x52?, 0x5e?, 0x9bae6e38784?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e38600 sp=0x9bae6e385e0 pc=0x95eb8
+runtime.selectgo(0x9bae6e38788, 0x9bae6e38780, 0x0?, 0x0, 0x0?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6e38740 sp=0x9bae6e38600 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).runGoroutine(0x9bae6bde510)
+	/src/pkg/sentry/ktime/sampled_timer.go:302 +0x6c fp=0x9bae6e387b0 sp=0x9bae6e38740 pc=0x76f6cc
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init.gowrap1()
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x20 fp=0x9bae6e387d0 sp=0x9bae6e387b0 pc=0x777380
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e387d0 sp=0x9bae6e387d0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init in goroutine 9
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x14c
+
+goroutine 10 gp=0x9bae6daad20 m=nil [select]:
+runtime.gopark(0x9bae6c89790?, 0x3?, 0x68?, 0x96?, 0x9bae6c89772?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6c895f0 sp=0x9bae6c895d0 pc=0x95eb8
+runtime.selectgo(0x9bae6c89790, 0x9bae6c8976c, 0xe02e3e?, 0x0, 0x9bae6c89788?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6c89730 sp=0x9bae6c895f0 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).block(0x9bae811ad88, 0x9bae8118150, 0x0)
+	/src/pkg/sentry/kernel/task_block.go:228 +0xf0 fp=0x9bae6c897e0 sp=0x9bae6c89730 pc=0x923240
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).BlockWithTimeout(0x9bae6d70a88?, 0x9bae6be4000?, 0x8?, 0x0)
+	/src/pkg/sentry/kernel/task_block.go:33 +0x1a4 fp=0x9bae6c89840 sp=0x9bae6c897e0 pc=0x922904
+z.gfire.dev/gvx/pkg/sentry/syscalls/linux.futexWaitDuration(0x9bae811ad88, 0x0, 0x1, 0x6b94d9436960, 0x1, 0x0, 0xffffffff)
+	/src/pkg/sentry/syscalls/linux/sys_futex.go:90 +0x88 fp=0x9bae6c898b0 sp=0x9bae6c89840 pc=0xc68728
+z.gfire.dev/gvx/pkg/sentry/syscalls/linux.Futex(0x9bae811ad88, 0xd05488?, {{0x6b94d9436960}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/syscalls/linux/sys_futex.go:192 +0x2d4 fp=0x9bae6c89940 sp=0x9bae6c898b0 pc=0xc68f14
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).executeSyscall(0x9bae811ad88, 0x62, {{0x6b94d9436960}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:143 +0x4bc fp=0x9bae6c89c80 sp=0x9bae6c89940 pc=0x94152c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscallInvoke(0x9bae811ad88, 0x62, {{0x6b94d9436960}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:327 +0x3c fp=0x9bae6c89ce0 sp=0x9bae6c89c80 pc=0x94228c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscallEnter(0x9bae811ad88, 0x62, {{0x6b94d9436960}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:287 +0x58 fp=0x9bae6c89d30 sp=0x9bae6c89ce0 pc=0x941fa8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscall(0x9bae6bec000?)
+	/src/pkg/sentry/kernel/task_syscall.go:262 +0x274 fp=0x9bae6c89e10 sp=0x9bae6c89d30 pc=0x941cc4
+z.gfire.dev/gvx/pkg/sentry/kernel.(*runApp).execute(0x9bae6bde000?, 0x9bae811ad88)
+	/src/pkg/sentry/kernel/task_run.go:295 +0xdf0 fp=0x9bae6c89f10 sp=0x9bae6c89e10 pc=0x9386e0
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).run(0x9bae811ad88, 0x3)
+	/src/pkg/sentry/kernel/task_run.go:90 +0x1a8 fp=0x9bae6c89fb0 sp=0x9bae6c89f10 pc=0x9375d8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start.gowrap1()
+	/src/pkg/sentry/kernel/task_start.go:582 +0x20 fp=0x9bae6c89fd0 sp=0x9bae6c89fb0 pc=0x955260
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6c89fd0 sp=0x9bae6c89fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start in goroutine 51
+	/src/pkg/sentry/kernel/task_start.go:582 +0xc8
+
+goroutine 11 gp=0x9bae6daaf00 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6e37788?, 0x2?, 0x25?, 0xc1?, 0x9bae6e37784?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e37600 sp=0x9bae6e375e0 pc=0x95eb8
+runtime.selectgo(0x9bae6e37788, 0x9bae6e37780, 0x100000000000000?, 0x0, 0x9bae7038460?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6e37740 sp=0x9bae6e37600 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).runGoroutine(0x9bae6bde000)
+	/src/pkg/sentry/ktime/sampled_timer.go:302 +0x6c fp=0x9bae6e377b0 sp=0x9bae6e37740 pc=0x76f6cc
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init.gowrap1()
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x20 fp=0x9bae6e377d0 sp=0x9bae6e377b0 pc=0x777380
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e377d0 sp=0x9bae6e377d0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init in goroutine 10
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x14c
+
+goroutine 12 gp=0x9bae6c5e000 m=nil [select]:
+runtime.gopark(0x9bae6c83790?, 0x3?, 0x68?, 0x36?, 0x9bae6c83772?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6c835f0 sp=0x9bae6c835d0 pc=0x95eb8
+runtime.selectgo(0x9bae6c83790, 0x9bae6c8376c, 0xe02e3e?, 0x0, 0x9bae6c83788?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6c83730 sp=0x9bae6c835f0 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).block(0x9bae811bb08, 0x9bae8118310, 0x0)
+	/src/pkg/sentry/kernel/task_block.go:228 +0xf0 fp=0x9bae6c837e0 sp=0x9bae6c83730 pc=0x923240
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).BlockWithTimeout(0x9bae6d70a88?, 0x9bae6bc2000?, 0x8?, 0x0)
+	/src/pkg/sentry/kernel/task_block.go:33 +0x1a4 fp=0x9bae6c83840 sp=0x9bae6c837e0 pc=0x922904
+z.gfire.dev/gvx/pkg/sentry/syscalls/linux.futexWaitDuration(0x9bae811bb08, 0x0, 0x1, 0x6b94d9437160, 0x1, 0x0, 0xffffffff)
+	/src/pkg/sentry/syscalls/linux/sys_futex.go:90 +0x88 fp=0x9bae6c838b0 sp=0x9bae6c83840 pc=0xc68728
+z.gfire.dev/gvx/pkg/sentry/syscalls/linux.Futex(0x9bae811bb08, 0xd05488?, {{0x6b94d9437160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/syscalls/linux/sys_futex.go:192 +0x2d4 fp=0x9bae6c83940 sp=0x9bae6c838b0 pc=0xc68f14
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).executeSyscall(0x9bae811bb08, 0x62, {{0x6b94d9437160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:143 +0x4bc fp=0x9bae6c83c80 sp=0x9bae6c83940 pc=0x94152c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscallInvoke(0x9bae811bb08, 0x62, {{0x6b94d9437160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:327 +0x3c fp=0x9bae6c83ce0 sp=0x9bae6c83c80 pc=0x94228c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscallEnter(0x9bae811bb08, 0x62, {{0x6b94d9437160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:287 +0x58 fp=0x9bae6c83d30 sp=0x9bae6c83ce0 pc=0x941fa8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscall(0x9bae6da4000?)
+	/src/pkg/sentry/kernel/task_syscall.go:262 +0x274 fp=0x9bae6c83e10 sp=0x9bae6c83d30 pc=0x941cc4
+z.gfire.dev/gvx/pkg/sentry/kernel.(*runApp).execute(0x9bae6db4000?, 0x9bae811bb08)
+	/src/pkg/sentry/kernel/task_run.go:295 +0xdf0 fp=0x9bae6c83f10 sp=0x9bae6c83e10 pc=0x9386e0
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).run(0x9bae811bb08, 0x4)
+	/src/pkg/sentry/kernel/task_run.go:90 +0x1a8 fp=0x9bae6c83fb0 sp=0x9bae6c83f10 pc=0x9375d8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start.gowrap1()
+	/src/pkg/sentry/kernel/task_start.go:582 +0x20 fp=0x9bae6c83fd0 sp=0x9bae6c83fb0 pc=0x955260
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6c83fd0 sp=0x9bae6c83fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start in goroutine 51
+	/src/pkg/sentry/kernel/task_start.go:582 +0xc8
+
+goroutine 13 gp=0x9bae6c5e1e0 m=nil [select]:
+runtime.gopark(0x9bae6e3df88?, 0x2?, 0x19?, 0xe8?, 0x9bae6e3df84?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e3de00 sp=0x9bae6e3dde0 pc=0x95eb8
+runtime.selectgo(0x9bae6e3df88, 0x9bae6e3df80, 0x9bae81181c0?, 0x0, 0x9bae6baa100?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6e3df40 sp=0x9bae6e3de00 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).runGoroutine(0x9bae6db4000)
+	/src/pkg/sentry/ktime/sampled_timer.go:302 +0x6c fp=0x9bae6e3dfb0 sp=0x9bae6e3df40 pc=0x76f6cc
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init.gowrap1()
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x20 fp=0x9bae6e3dfd0 sp=0x9bae6e3dfb0 pc=0x777380
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e3dfd0 sp=0x9bae6e3dfd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init in goroutine 12
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x14c
+
+goroutine 58 gp=0x9bae6c5e3c0 m=nil [select]:
+runtime.gopark(0x9bae6c85790?, 0x3?, 0x68?, 0x56?, 0x9bae6c85772?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6c855f0 sp=0x9bae6c855d0 pc=0x95eb8
+runtime.selectgo(0x9bae6c85790, 0x9bae6c8576c, 0xe02e3e?, 0x0, 0x9bae6c85788?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6c85730 sp=0x9bae6c855f0 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).block(0x9bae811c888, 0x9bae81184d0, 0x0)
+	/src/pkg/sentry/kernel/task_block.go:228 +0xf0 fp=0x9bae6c857e0 sp=0x9bae6c85730 pc=0x923240
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).BlockWithTimeout(0x9bae6d70a88?, 0x9bae6bc2300?, 0x8?, 0x0)
+	/src/pkg/sentry/kernel/task_block.go:33 +0x1a4 fp=0x9bae6c85840 sp=0x9bae6c857e0 pc=0x922904
+z.gfire.dev/gvx/pkg/sentry/syscalls/linux.futexWaitDuration(0x9bae811c888, 0x0, 0x1, 0x6b94d9480160, 0x1, 0x0, 0xffffffff)
+	/src/pkg/sentry/syscalls/linux/sys_futex.go:90 +0x88 fp=0x9bae6c858b0 sp=0x9bae6c85840 pc=0xc68728
+z.gfire.dev/gvx/pkg/sentry/syscalls/linux.Futex(0x9bae811c888, 0xd05488?, {{0x6b94d9480160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/syscalls/linux/sys_futex.go:192 +0x2d4 fp=0x9bae6c85940 sp=0x9bae6c858b0 pc=0xc68f14
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).executeSyscall(0x9bae811c888, 0x62, {{0x6b94d9480160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:143 +0x4bc fp=0x9bae6c85c80 sp=0x9bae6c85940 pc=0x94152c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscallInvoke(0x9bae811c888, 0x62, {{0x6b94d9480160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:327 +0x3c fp=0x9bae6c85ce0 sp=0x9bae6c85c80 pc=0x94228c
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscallEnter(0x9bae811c888, 0x62, {{0x6b94d9480160}, {0x80}, {0x0}, {0x0}, {0x0}, {0x0}})
+	/src/pkg/sentry/kernel/task_syscall.go:287 +0x58 fp=0x9bae6c85d30 sp=0x9bae6c85ce0 pc=0x941fa8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).doSyscall(0x9bae6da40e0?)
+	/src/pkg/sentry/kernel/task_syscall.go:262 +0x274 fp=0x9bae6c85e10 sp=0x9bae6c85d30 pc=0x941cc4
+z.gfire.dev/gvx/pkg/sentry/kernel.(*runApp).execute(0x9bae6db4090?, 0x9bae811c888)
+	/src/pkg/sentry/kernel/task_run.go:295 +0xdf0 fp=0x9bae6c85f10 sp=0x9bae6c85e10 pc=0x9386e0
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).run(0x9bae811c888, 0x5)
+	/src/pkg/sentry/kernel/task_run.go:90 +0x1a8 fp=0x9bae6c85fb0 sp=0x9bae6c85f10 pc=0x9375d8
+z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start.gowrap1()
+	/src/pkg/sentry/kernel/task_start.go:582 +0x20 fp=0x9bae6c85fd0 sp=0x9bae6c85fb0 pc=0x955260
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6c85fd0 sp=0x9bae6c85fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/kernel.(*Task).Start in goroutine 10
+	/src/pkg/sentry/kernel/task_start.go:582 +0xc8
+
+goroutine 59 gp=0x9bae6c5e5a0 m=nil [select, 1 minutes]:
+runtime.gopark(0x9bae6e36f88?, 0x2?, 0xd7?, 0x1d?, 0x9bae6e36f84?)
+	/usr/local/go/src/runtime/proc.go:474 +0xb8 fp=0x9bae6e36e00 sp=0x9bae6e36de0 pc=0x95eb8
+runtime.selectgo(0x9bae6e36f88, 0x9bae6e36f80, 0x9bae8118380?, 0x0, 0x9bae6baa100?, 0x1)
+	/usr/local/go/src/runtime/select.go:351 +0x838 fp=0x9bae6e36f40 sp=0x9bae6e36e00 pc=0x72348
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).runGoroutine(0x9bae6db4090)
+	/src/pkg/sentry/ktime/sampled_timer.go:302 +0x6c fp=0x9bae6e36fb0 sp=0x9bae6e36f40 pc=0x76f6cc
+z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init.gowrap1()
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x20 fp=0x9bae6e36fd0 sp=0x9bae6e36fb0 pc=0x777380
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_arm64.s:1039 +0x4 fp=0x9bae6e36fd0 sp=0x9bae6e36fd0 pc=0x9d684
+created by z.gfire.dev/gvx/pkg/sentry/ktime.(*SampledTimer).init in goroutine 58
+	/src/pkg/sentry/ktime/sampled_timer.go:116 +0x14c
+
+r0      0x237e318
+r1      0x80
+r2      0x0
+r3      0x0
+r4      0x0
+r5      0x0
+r6      0x0
+r7      0x0
+r8      0x62
+r9      0x0
+r10     0x0
+r11     0x0
+r12     0x0
+r13     0x0
+r14     0x22e3700
+r15     0x3
+r16     0xffffe2d0e8b0
+r17     0xffffe2d1e1d0
+r18     0x0
+r19     0x1378
+r20     0xffffe2d1e340
+r21     0x237e1c0
+r22     0x9bae6a70000
+r23     0x3bbcc3b4
+r24     0x0
+r25     0x0
+r26     0x22d2828
+r27     0x233d000
+r28     0x237bf40
+r29     0xffffe2d1e328
+lr      0x59fd8
+sp      0xffffe2d1e330
+pc      0x9e6ec
+fault   0x0

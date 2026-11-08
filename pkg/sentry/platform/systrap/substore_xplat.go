@@ -29,23 +29,24 @@ import (
 
 // A guest store into a composite page faults, because the stub maps the page
 // without write access. The Sentry runs the store for the guest. It writes the
-// bytes to the file page of the guest page and to the composite page, and it
+// bytes to the file page of the guest page and to the composite page. It then
 // moves the program counter past the store. The stub never sees the fault.
 //
 // A load exclusive does not fault, so the Sentry does not see it. The Sentry
-// models the exclusive monitor with the stores that it runs: a store exclusive
+// models the exclusive monitor with the stores that it runs. A store exclusive
 // fails when the Sentry ran another store to the same page after the thread
 // resumed. The loop of the guest then retries.
 //
 // Limits of the emulation:
 //   - A load exclusive in an earlier run of the thread is not known. A thread
 //     that a signal or a preemption interrupts between a load exclusive and its
-//     store exclusive can lose an update, when another thread stores to the
-//     same word at that time. The host monitor does not survive the interrupt.
+//     store exclusive can lose an update. This happens when another thread
+//     stores to the same word at that time. The host monitor does not survive
+//     the interrupt.
+//   - An instruction that the emulator does not decode ends in SIGSEGV.
 //   - The Sentry runs an atomic operation under the lock of the layer. It is
 //     not atomic with a store of another address space that maps the same
 //     file page directly.
-//   - An instruction that the emulator does not decode ends in SIGSEGV.
 
 // storeFaultResult says what the layer did with a fault.
 type storeFaultResult int
@@ -76,8 +77,8 @@ type storeEnv struct {
 	write func(addr uint64, b []byte)
 	// stale reports whether the Sentry ran a store to a page of
 	// [addr, addr+n) after the thread resumed. A store exclusive that follows
-	// such a store fails, as it does when another thread changes the word
-	// between the load exclusive and the store exclusive.
+	// such a store fails. It fails in the same way when another thread changes
+	// the word between the load exclusive and the store exclusive.
 	stale func(addr uint64, n int) bool
 }
 
