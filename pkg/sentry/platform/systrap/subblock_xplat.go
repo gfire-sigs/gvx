@@ -832,8 +832,8 @@ func (l *subBlockLayer) dropBlockLocked(base uintptr, hb *hostBlock) error {
 	}
 	if err != nil {
 		// The stub can still map the composite page or the spare pages.
-		// The block stays in blocks, so that reset releases them.
-		hb.cur = stubMap{}
+		// The block keeps cur and stays in blocks, so that a later drop
+		// unmaps it again and reset releases the pages.
 		delete(l.comps, base)
 		delete(l.partial, base)
 		delete(l.deferred, base)
@@ -939,7 +939,7 @@ func (l *subBlockLayer) release(ar hostarch.AddrRange) {
 			return true
 		}
 		hb := l.blocks[base]
-		return hb != nil && hb.mapped != allSubPages && hb.cur.kind != stubMapNone
+		return hb != nil && hb.mapped != allSubPages
 	}
 	start := subBlockBase(uintptr(ar.Start))
 	end := uintptr(ar.End)
@@ -1042,6 +1042,11 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 	// The populate calls mapped what the memory manager can map. A page that
 	// is still missing has no mapping of the guest, and it reads as zeros.
 	for base := range l.deferred {
+		if _, again := l.partial[base]; again {
+			// A new mapping in the block arrived after its populate call.
+			// The next switch populates the block again.
+			continue
+		}
 		if hb := l.blocks[base]; hb != nil {
 			if err := l.refreshLocked(base, hb, true); err != nil && !errors.Is(err, errDeadSubprocess) {
 				log.Warningf("systrap: map the block at %#x: %v", base, err)

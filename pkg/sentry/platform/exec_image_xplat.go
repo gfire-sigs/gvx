@@ -97,8 +97,9 @@ type HostBlockOwner interface {
 	// block, and it holds activeMu.
 	AdoptHostBlock(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, spare uint8)
 
-	// ReleaseHostBlocks makes the address space stop the use of the spare
-	// pages in the host blocks that overlap ar. A new guest mapping covers
-	// ar. The memory manager holds activeMu.
+	// ReleaseHostBlocks tells the address space that a new guest mapping, or
+	// new access, covers ar. The address space stops the use of the spare
+	// pages in the host blocks that overlap ar. It also maps again each such
+	// block that misses a guest page. The memory manager holds activeMu.
 	ReleaseHostBlocks(ar hostarch.AddrRange)
 }
