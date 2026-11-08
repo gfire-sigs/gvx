@@ -14,7 +14,10 @@
 
 //go:build linux && !cgo
 
-package systrap
+// Package rseqarea finds the rseq area that the C library registered for the
+// calling thread. A package that uses cgo cannot hold Go assembly, so the
+// lookup lives outside package systrap.
+package rseqarea
 
-// cgoBuild is false when the build does not link the C runtime.
-const cgoBuild = false
+// Thread returns a zero length: the Go runtime registers no rseq area.
+func Thread() (uintptr, uint32) { return 0, 0 }

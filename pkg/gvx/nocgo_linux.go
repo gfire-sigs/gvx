@@ -16,6 +16,6 @@
 
 package gvx
 
-// cgoBuild is false when the build has no C runtime, which the upstream systrap
-// platform needs.
+// cgoBuild is false when the build has no C runtime. The seccomp filter then
+// allows only the thread creation of the Go runtime.
 const cgoBuild = false

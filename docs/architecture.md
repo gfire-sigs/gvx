@@ -849,7 +849,7 @@ Seccomp reads no path. A workspace or a hostfs mount needs `openat` relative to 
 
 Seccomp cannot read a socket address. The filter cannot pin the WireGuard peer port the way the Seatbelt profile does. The `EPERM` rule set keeps the process alive where `runsc` kills it. Code in the embedding process then sees an error from `os/exec`, `os.Open`, or `net.Dial`. The Go runtime also opens cgroup files once a second to adjust `GOMAXPROCS`, and it accepts a failure.
 
-The upstream `systrap` platform hangs while it starts in a cgo build. `New` returns `ErrPlatformUnavailable` there, and race builds use cgo. Build with `CGO_ENABLED=0`. A missing rule kills the process. Run `scripts/seccomp-audit.sh` to list the calls that the allowlist lacks. It builds with the tag `gvx_seccomp_log`, which logs those calls and allows them.
+In a cgo build, the C library registers an rseq area for each thread, and the first stub inherits that of the Sentry thread that forks it. The stub unmaps that memory, and the kernel then sends `SIGSEGV` on each return to user mode. So the forking thread unregisters its area for the fork and registers it again after the fork (`rseq_xplat.go`, package `rseqarea`). The release still builds with `CGO_ENABLED=0`, so the binary needs no C library. A missing rule kills the process. Run `scripts/seccomp-audit.sh` to list the calls that the allowlist lacks. It builds with the tag `gvx_seccomp_log`, which logs those calls and allows them.
 
 ### 3.10 Optional Containerd Control Adapter (Descriptive Module)
 

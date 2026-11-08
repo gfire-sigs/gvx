@@ -44,7 +44,7 @@ jobs:
             runner: ubuntu-24.04-arm
     env:
       GVX_E2E_REQUIRE_NETWORK: "1"
-      # The upstream systrap platform hangs while it starts in a cgo build.
+      # The release builds without cgo, so the image tests do too.
       CGO_ENABLED: "0"
     steps:
       - name: Checkout repository

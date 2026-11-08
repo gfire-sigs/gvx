@@ -16,6 +16,6 @@
 
 package gvx
 
-// cgoBuild is true when the build links the C runtime. The upstream systrap
-// platform hangs while it starts in such a build, so the callers refuse it.
+// cgoBuild is true when the build links the C runtime. The seccomp filter then
+// allows the thread creation of the C library (syscallfilter_linux.go).
 const cgoBuild = true

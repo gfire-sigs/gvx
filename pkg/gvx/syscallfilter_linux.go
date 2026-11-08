@@ -21,6 +21,7 @@ import (
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/seccomp"
 	"z.gfire.dev/gvx/runsc/boot/filter/config"
 )
@@ -41,6 +42,9 @@ func (s *Sandbox) syscallFilter() func() error {
 			HostFilesystem: s.usesHostDirs(),
 			// gvx has no control server. No descriptor has this number.
 			ControllerFD: math.MaxUint32,
+			// The C library of a cgo build creates threads with clone3 or with
+			// its own clone flags.
+			CgoEnabled: cgoBuild,
 		}
 		rules, denyRules := config.Rules(opt)
 		rules.Merge(embedderRules(s.cfg, s.usesHostDirs(), len(s.volumes) > 0))
@@ -109,6 +113,32 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 	// The Go runtime reads the CPU affinity mask once a second to adjust
 	// GOMAXPROCS. The call reads one mask and has no side effect.
 	rules.Add(unix.SYS_SCHED_GETAFFINITY, seccomp.MatchAll{})
+	if cgoBuild {
+		// Bionic pthread_create calls clone with these flags. The cgo rules
+		// of runsc allow the flags of musl, which add CLONE_DETACHED. The
+		// flags create a thread only.
+		rules.Add(unix.SYS_CLONE, seccomp.PerArg{
+			seccomp.EqualTo(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES |
+				unix.CLONE_SIGHAND | unix.CLONE_THREAD | unix.CLONE_SYSVSEM |
+				unix.CLONE_SETTLS | unix.CLONE_PARENT_SETTID |
+				unix.CLONE_CHILD_CLEARTID),
+		})
+		// A new bionic thread resets its own pointer authentication key A.
+		rules.Add(unix.SYS_PRCTL, seccomp.PerArg{
+			seccomp.EqualTo(unix.PR_PAC_RESET_KEYS),
+			seccomp.EqualTo(unix.PR_PAC_APIAKEY),
+		})
+		// Bionic waits and wakes with the bitset forms of private futexes.
+		// The forms act on the futex word of the caller only.
+		for _, op := range []uintptr{linux.FUTEX_WAIT_BITSET, linux.FUTEX_WAKE_BITSET} {
+			for _, flags := range []uintptr{linux.FUTEX_PRIVATE_FLAG, linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_CLOCK_REALTIME} {
+				rules.Add(unix.SYS_FUTEX, seccomp.PerArg{
+					seccomp.AnyValue{},
+					seccomp.EqualTo(op | flags),
+				})
+			}
+		}
+	}
 	if hostDirs {
 		// os.Root.Rename calls renameat. The host filesystem rules of runsc
 		// have only renameat2.
