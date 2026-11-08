@@ -1,0 +1,58 @@
+# Runs the Android probe and the systrap guest probes on an Android 16 emulator
+# with 16 KB pages (GVXIP-006 P1-4). The hosted macOS runner is a virtual
+# machine without a hypervisor, so the emulator runs in software (-accel off)
+# and boots slowly. The workflow runs by hand, and on a pull request only when
+# this file changes.
+name: android
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/android.yml
+
+permissions:
+  contents: read
+
+jobs:
+  emulator:
+    name: emulator android-36 arm64 16 KB
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      ANDROID_IMAGE: system-images;android-36;google_apis_playstore_ps16k;arm64-v8a
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install the emulator and the system image
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_arm64"
+          sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          if [ ! -x "$sdk/cmdline-tools/latest/bin/sdkmanager" ]; then
+            mkdir -p "$sdk/cmdline-tools"
+            curl -fsSL -o tools.zip https://dl.google.com/android/repository/commandlinetools-mac-13114758_latest.zip
+            unzip -q tools.zip -d "$sdk/cmdline-tools"
+            mv "$sdk/cmdline-tools/cmdline-tools" "$sdk/cmdline-tools/latest"
+          fi
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$sdk/cmdline-tools/latest/bin/sdkmanager" emulator platform-tools "$ANDROID_IMAGE" > /dev/null
+          echo no | "$sdk/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$ANDROID_IMAGE" -d pixel_6
+          echo "ANDROID_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/platform-tools" >> "$GITHUB_PATH"
+      - name: Boot the emulator
+        run: |
+          "$ANDROID_SDK/emulator/emulator" -avd ci -accel off -no-window -no-audio -no-boot-anim \
+            -no-snapshot -gpu swiftshader_indirect -no-metrics > emulator.log 2>&1 &
+          adb wait-for-device
+          for i in $(seq 1 360); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && exit 0
+            sleep 10
+          done
+          tail -50 emulator.log
+          exit 1
+      - name: Run the probe and the guest probes
+        run: scripts/android/emulator-smoke.sh
