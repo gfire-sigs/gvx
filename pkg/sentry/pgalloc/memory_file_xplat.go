@@ -23,13 +23,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
-// hostWriteHooks is empty on hosts whose platforms map the pages of the memory
-// file themselves. Such a platform sees every write of the Sentry.
-type hostWriteHooks struct{}
-
-// noteHostWrite does nothing on this host.
-func (f *MemoryFile) noteHostWrite(memmap.FileRange) {}
-
 // expandReleaseRangeLocked extends fr to cover the start and end host pages
 // when their remaining 4KB sub-pages are already free in f.unfreeSmall. It
 // reserves the added sub-pages in f.unfreeSmall so no allocation takes them

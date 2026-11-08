@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !windows
+//go:build darwin
 
 package mm
 
@@ -22,9 +22,8 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
-// Only the Windows systrap engine needs to learn of writes that the Sentry
-// makes into guest memory. The other platforms map the same pages that the
-// Sentry writes, so these functions return f unchanged and cost nothing.
+// The macOS platforms map the same pages that the Sentry writes, so these
+// functions return f unchanged and cost nothing.
 
 func (mm *MemoryManager) hostWriteWrap(_ hostarch.AddrRange, f func(safemem.BlockSeq) (uint64, error)) func(safemem.BlockSeq) (uint64, error) {
 	return f

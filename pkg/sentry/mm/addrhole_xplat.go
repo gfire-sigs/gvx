@@ -148,3 +148,17 @@ func (mm *MemoryManager) findHighestAlignedLocked(length, alignment uint64, boun
 	}
 	return mm.findHighestAvailableLocked(length, alignment, bounds)
 }
+
+// alignStackToHostBlock moves the end of the stack down to a host block, and
+// grows the size of the stack to a whole number of host blocks. The top of the
+// stack is then in a block that holds no other mapping, so the platform maps
+// the pages that the stack uses without a composite page. It returns the
+// arguments unchanged on a platform that does not report a host block size.
+func (mm *MemoryManager) alignStackToHostBlock(end hostarch.Addr, size uint64) (hostarch.Addr, uint64) {
+	hbp, ok := mm.p.(platform.HostBlockPlatform)
+	if !ok || hbp.HostBlockSize() == 0 {
+		return end, size
+	}
+	mask := hbp.HostBlockSize() - 1
+	return end &^ hostarch.Addr(mask), (size + mask) &^ mask
+}

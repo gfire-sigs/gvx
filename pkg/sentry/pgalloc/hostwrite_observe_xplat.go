@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build windows
+//go:build windows || linux
 
 package pgalloc
 
@@ -28,9 +28,10 @@ import (
 )
 
 // The Windows systrap engine runs guest code from patched copies of memory-file
-// pages. A write of the Sentry into a page, for example the copy-out of
-// read(2) or the write(2) of a file that a guest maps, does not pass through a
-// view of the engine, so the engine learns of it only here.
+// pages, and the Linux systrap engine on a host with 16 KB pages runs guest
+// pages from composite copies. A write of the Sentry into a page, for example
+// the copy-out of read(2) or the write(2) of a file that a guest maps, does
+// not pass through a view of the engine, so the engine learns of it only here.
 //
 // The memory manager reports each write that goes through a cached internal
 // mapping with NoteHostWrite after the write. MapInternal reports a request for

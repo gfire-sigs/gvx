@@ -238,6 +238,8 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache"}, "pkg/sentry/kernel/pipe", "mknod FIFO files open through the VFS pipe implementation"},
 	{[]string{"pkg/sentry/platform/systrap"}, "golang.org/x/sys/*", "host memory and subprocess APIs on Windows and macOS (SPEC section 3.3)"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/time", "the spin windows of the Windows fast path read the cycle counter and the performance counter"},
+	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/pgalloc", "the sub-block layer of a host with 16 KB pages allocates its composite pages from the memory file of the platform"},
+	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/usage", "pgalloc.AllocOpts of a composite page takes a usage.MemoryKind"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/seccomp/precompiledseccomp", "stubfilter_lookup_xplat.go builds the seccomp programs of the Linux stubs on arm64, where the checked-in precompiled programs do not apply"},
 	{[]string{"pkg/sentry/kernel"}, "pkg/hostarch", "addrhole_xplat.go lists the address holes of a platform as hostarch.AddrRange values"},
 	{[]string{"pkg/sentry/kernel"}, "pkg/errors/linuxerr", "kmsg_xplat.go returns EINVAL for a write to /dev/kmsg of more than 1,024 bytes, as devkmsg_write does"},

@@ -301,6 +301,8 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 	// Determine the stack's desired location. Unlike Linux, address
 	// randomization can't be disabled.
 	stackEnd := mm.layout.MaxAddr - hostarch.Addr(rand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+	stackEnd, sz = mm.alignStackToHostBlock(stackEnd, sz)
+	szaddr = hostarch.Addr(sz)
 	if stackEnd < szaddr {
 		return hostarch.AddrRange{}, linuxerr.ENOMEM
 	}
