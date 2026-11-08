@@ -102,7 +102,7 @@ The idle stub pool gets a bound (F8). The bound applies to every Linux build, so
 | Build | `K` | Reason |
 | :--- | :--- | :--- |
 | `android` | 2 | F4 counts every live stub. |
-| `linux && !android` | `GOMAXPROCS`, clamped to 8 through 32 | A pooled stub holds up to `GOMAXPROCS + 1` host threads (F9). The bound keeps reuse for parallel builds and caps `pids.max` use. |
+| `linux && !android` | `GOMAXPROCS`, clamped to 4 through 32 | A pooled stub holds up to `GOMAXPROCS + 1` host threads (F9). The bound keeps reuse for parallel builds and caps `pids.max` use. B0-1 sets the floor (#122). |
 
 The pool is process-wide upstream state, because one stub pool serves every sandbox of the process. A per-sandbox tunable would conflict between two sandboxes, so `K` is a constant for each OS. Section 6 of [`../architecture.md`](../architecture.md) records this process-wide state.
 
@@ -144,7 +144,7 @@ Each work item lists its change, its files, its tier, and the check that proves 
 | P0-2 (PR 1) | `destroyIdle` kills the stub, stops its request loop, reaps it with `wait4`, closes the seccomp listener, and unmaps and releases its memory-file ranges. | new `subprocess_destroy_xplat.go` (`linux`) | Tier 2 | T0-2 |
 | P0-3 (PR 1) | Constant `K` for each build. | new `idle_stubs_xplat.go` (`linux && !android`), `idle_stubs_android_xplat.go` (`android`) | Tier 2 | T0-4 |
 | P0-4 (PR 1) | Record the process-wide pool in the architecture document and the change in `CHANGELOG.md`. | `docs/architecture.md`, `CHANGELOG.md` | Tier 1 | Review |
-| P0-5 (PR 2) | Measure `K` on `linux/arm64` and set the final values. | `idle_stubs_*_xplat.go` | Tier 2 | B0-1 |
+| P0-5 (PR 2) | Measure `K` on `linux/arm64` and set the final values. Result: the floor is 4 (#122). | `idle_stubs_*_xplat.go` | Tier 2 | B0-1 |
 
 The memory-file ranges of a stub are its context queue, its thread context region, its syscall thread message area, and one stack for each sysmsg thread.
 
