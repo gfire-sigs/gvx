@@ -367,9 +367,10 @@ An Android device can run a kernel with 16 KB pages, and a host mapping must the
 | :--- | :--- |
 | Four guest pages, contiguous in one file, aligned to 16 KB, one write permission | The file range itself |
 | Any other block with four guest pages | A composite page of the platform memory file with copies of the guest pages, without write access |
+| Private writable pages, and pages without a mapping or without access | One block of the memory file into which the memory manager moved the private pages; the address space holds the other pages of that block as spare pages |
 | A block that misses a guest page | None until the next switch, which asks the memory manager to populate the block; then a composite page in which the missing page reads as zeros |
 
-A guest store into a composite page faults, and the Sentry runs the store (`substore_xplat_arm64.go`). Execute access is the union of the four pages, and a page without a guest mapping that shares a block with a mapped page reads as zeros. A store fault or a SIGILL in such a page becomes a `SEGV_MAPERR` fault, as on Linux.
+The guest can read and write the spare pages without a fault, as on a Linux kernel with 16 KB pages. A new mapping or an `mprotect` that gives access in the block releases the spare pages first (`platform.HostBlockOwner`). A guest store into a composite page faults, and the Sentry runs the store (`substore_xplat_arm64.go`). Execute access is the union of the four pages, and a page without a guest mapping that shares a block with a mapped page reads as zeros. A store fault or a SIGILL in such a page becomes a `SEGV_MAPERR` fault, as on Linux.
 
 The copies stay current without a copy of every page on each switch. `pgalloc` and `mm` report Sentry writes on Linux as on Windows, and the layer refreshes only the composite pages that hold a written page. The guest-writable pages of a composite page refresh on each switch, because another address space can share them. A changed executable composite page goes through `pwrite(2)` and the stub maps it again, so that the host kernel cleans the I-cache lines of the stub mapping. The variable `GVX_SYSTRAP_SUBBLOCKS=1` runs the layer on a host with 4 KB pages, and CI uses it on `linux/arm64`.
 
