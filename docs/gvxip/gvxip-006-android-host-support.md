@@ -53,7 +53,7 @@ The facts below come from the `gvx` source tree, its Git history, and Android do
 | F14 | The commit that removed the macOS engine states no reason. The architecture document names the 16 KB pages and `PAGEZERO`. The session history of the removal records the instruction "non-PIE binaries and 4 KB page compatibility" and no test result. | Commit `54b7ad53`, `docs/architecture.md` section 3.3, session history |
 | F15 | The Linux engine starts no stub executable. `stubInit` copies the stub code into an anonymous mapping of the Sentry, and each stub is a clone of the source stub. No file path and no `execve` take part. | `stub_unsafe.go` (`stubInit`), `subprocess_linux.go` (`createStub`) |
 | F16 | Guest code pages are pages of the memory file, a `memfd` that `createMemoryFile` creates without `MFD_EXEC`. `MapFile` maps them into the stub with `PROT_EXEC`. | `systrap.go` (`createMemoryFile`), `subprocess.go` (`MapFile`) |
-| F17 | Linux 6.3 adds `vm.memfd_noexec`. At value 1, a `memfd` without `MFD_EXEC` is not executable; at value 2, the kernel refuses `MFD_EXEC`. An app with target SDK 29 or later cannot execute files in its data directory. | Linux `memfd_create(2)`, Android W^X policy |
+| F17 | Linux 6.3 adds `vm.memfd_noexec`. At value 1, `execve` of a `memfd` without `MFD_EXEC` fails; at value 2, the kernel refuses `MFD_EXEC`. A mapping with `PROT_EXEC` works at every value (section 2.5). An app with target SDK 29 or later cannot execute files in its data directory. | Linux `memfd_create(2)`, Android W^X policy |
 | F18 | A sysmsg thread of a stub is a separate host process: the clone has no `CLONE_THREAD`. A stub has up to `GOMAXPROCS` of them. | `subprocess.go` (`createSysmsgThreadLocked`), PR #116 review |
 
 ### 1.3 Probe Results
@@ -123,7 +123,7 @@ A stub executable that the Sentry writes to a path and then executes breaks the 
 
 The only executable host memory that the engine needs is the memory file (F16). The port makes this dependency explicit and gives it a fallback:
 
-- **Explicit flag:** the Android build creates the memory file with `MFD_EXEC`, so a kernel with `vm.memfd_noexec` at 1 keeps it executable. A kernel that does not know the flag returns `EINVAL`, and the call repeats without it.
+- **No flag:** `vm.memfd_noexec` controls only `execve` of a `memfd`, not a mapping with `PROT_EXEC`. In Docker `linux/arm64` (kernel 6.18), the smoke guest passes with the values 0, 1, and 2. A request for `MFD_EXEC` fails with `EACCES` at value 2, so the memory file keeps its flags (#121).
 - **Start check:** before the first stub starts, the Sentry maps one page of its memory file with `PROT_EXEC` in its own process. The stubs have the SELinux domain and the seccomp filter of the Sentry, so this map predicts the result in a stub.
 - **Copy mode:** when that map fails, the engine runs in copy mode. A stub maps memory-file pages without `PROT_EXEC`. For an executable guest page, it maps a private anonymous page, the Sentry copies the code into it, and the stub makes it read and execute only. A write by the Sentry drops the copy through the host-write reports of `pgalloc`. A write by the guest faults on the read-only copy, and the engine maps the writable memory-file page instead. The next instruction fetch makes a new copy. The Windows engine uses the same private code pages.
 
@@ -183,8 +183,8 @@ The items below are candidates. Phase P1 decides which items stay.
 | P2-2 | Pass DNS servers from the app to the sandbox, because Android has no `/etc/resolv.conf`. | `pkg/gvx` (`Config`), `pkg/netbackend` | Tier 1 | T2-2 |
 | P2-3 | Compare the host system calls of the Sentry with the app filter of Android, and remove or replace each call that the filter kills. | `scripts/seccomp-audit.sh`, affected packages | Tier 1 or Tier 2 | T1-1 (host system calls) |
 | P2-4 | Verify the file identity probe of `hostfs` on `f2fs` and `ext4` app storage. | `pkg/sentry/fsimpl/hostfs` | Tier 1 | T2-3 |
-| P2-5 | Create the memory file with `MFD_EXEC` on Android, with the `EINVAL` retry of section 2.5. | `pkg/sentry/platform/systrap` (Android sibling of `createMemoryFile`) | Tier 2 and a Tier 3 seam | T2-4 |
-| P2-6 | Map one memory-file page with `PROT_EXEC` before the first stub, and select copy mode on failure. | `pkg/sentry/platform/systrap` (Tier 2 file) | Tier 2 | T2-4 |
+| P2-5 | Verify that `vm.memfd_noexec` does not deny the mapping (section 2.5). Result: no change. | None | None | Docker smoke run |
+| P2-6 | Map one memory-file page with `PROT_EXEC` before the first stub, and report a denial with its cause. Copy mode follows only with P2-7. | `pkg/memutil`, `pkg/gvx` (#121) | Tier 1 and Tier 2 | T2-4 |
 | P2-7 | Copy mode of section 2.5. The engine builds it only when T1-1 or T2-4 shows a device that denies `PROT_EXEC` on a `memfd`. Linux CI forces it with a test hook. | `pkg/sentry/platform/systrap` (Tier 2 files), `pkg/sentry/pgalloc` (host-write reports) | Tier 2 | T2-5 |
 
 Section 1.3 shows `PROT_EXEC` on a `memfd` on the first image, so P2-7 waits for a device that denies it.
