@@ -54,6 +54,7 @@ The facts below come from the `gvx` source tree, its Git history, and Android do
 | F15 | The Linux engine starts no stub executable. `stubInit` copies the stub code into an anonymous mapping of the Sentry, and each stub is a clone of the source stub. No file path and no `execve` take part. | `stub_unsafe.go` (`stubInit`), `subprocess_linux.go` (`createStub`) |
 | F16 | Guest code pages are pages of the memory file, a `memfd` that `createMemoryFile` creates without `MFD_EXEC`. `MapFile` maps them into the stub with `PROT_EXEC`. | `systrap.go` (`createMemoryFile`), `subprocess.go` (`MapFile`) |
 | F17 | Linux 6.3 adds `vm.memfd_noexec`. At value 1, a `memfd` without `MFD_EXEC` is not executable; at value 2, the kernel refuses `MFD_EXEC`. An app with target SDK 29 or later cannot execute files in its data directory. | Linux `memfd_create(2)`, Android W^X policy |
+| F18 | A sysmsg thread of a stub is a separate host process: the clone has no `CLONE_THREAD`. A stub has up to `GOMAXPROCS` of them. | `subprocess.go` (`createSysmsgThreadLocked`), PR #116 review |
 
 ### 1.3 Probe Results
 
@@ -96,6 +97,8 @@ The idle stub pool gets a bound (F8). The bound applies to every Linux build, so
 The pool is process-wide upstream state, because one stub pool serves every sandbox of the process. A per-sandbox tunable would conflict between two sandboxes, so `K` is a constant for each OS. Section 6 of [`../architecture.md`](../architecture.md) records this process-wide state.
 
 The bound limits the stubs that wait in the pool. It does not limit the live stubs of a workload with more than about 31 concurrent guest processes. Phase P4 reports that case and names the switch of F6.
+
+Each sysmsg thread also counts as a phantom process (F18). The Android build therefore limits a stub to 2 sysmsg threads, so one live guest address space costs at most 3 phantom processes. A guest process with more threads shares those 2 sysmsg threads.
 
 ### 2.4 Devices with 16 KB Pages
 
