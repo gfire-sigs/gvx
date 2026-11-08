@@ -357,6 +357,11 @@ seam pkg/sentry/platform/systrap/stubfilter/stubfilter.go
 # A host kernel can seal a mapping that its Sentry owns. The stub of a nested Sentry then unmaps its
 # address space mapping by mapping (pkg/sentry/platform/systrap/unmap_regions_xplat.go).
 seam pkg/sentry/platform/systrap/subprocess.go
+# The pool of idle stubs keeps at most idleStubLimit() stubs, and a release that finds it full destroys
+# the stub (pkg/sentry/platform/systrap/subprocess_destroy_xplat.go, GVXIP-006 section 2.3).
+# interruptStub holds aliveMu for reading, so a late interrupt never touches a destroyed stub.
+seam pkg/sentry/platform/systrap/subprocess_pool.go
+seam pkg/sentry/platform/systrap/shared_context.go
 
 # A tracer that sets the GS base of a tracee with PTRACE_SETREGS, PTRACE_SETREGSET, or
 # PTRACE_POKEUSER tells the address space, as arch_prctl(ARCH_SET_GS) does

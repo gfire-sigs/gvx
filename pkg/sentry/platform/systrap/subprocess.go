@@ -184,6 +184,11 @@ type subprocess struct {
 	// user mode.
 	contextQueue *contextQueue
 
+	// contextQueueRange and threadContextRange are the memory file ranges
+	// behind contextQueue and threadContextRegion. destroyIdle releases them.
+	contextQueueRange  memmap.FileRange
+	threadContextRange memmap.FileRange
+
 	// aliveMu synchronizes active subprocess operations with termination.
 	aliveMu sync.RWMutex
 
@@ -403,6 +408,10 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 
 		// Wait for requests to create threads.
 		for req := range requests {
+			if stop, ok := req.(requestStop); ok {
+				close(stop.done)
+				return
+			}
 			sp.handlePtraceSyscallRequest(req)
 		}
 
@@ -462,6 +471,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	s.contextQueue = contextQueue
+	s.contextQueueRange = contextQueueFR
 
 	// Map thread context region into the sentry.
 	threadContextFR, err := s.memoryFile.Allocate(uint64(stubContextRegionLen), opts)
@@ -492,6 +502,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	s.threadContextRegion = sentryThreadContextRegionAddr
+	s.threadContextRange = threadContextFR
 }
 
 func (s *subprocess) mapPrivateRegions() {
@@ -529,7 +540,9 @@ func (s *subprocess) Release() {
 
 func (s *subprocess) release() {
 	if s.alive() {
-		globalPool.markAvailable(s)
+		if !globalPool.markAvailable(s) {
+			s.destroyIdle()
+		}
 		return
 	}
 	if s.syscallThread != nil {

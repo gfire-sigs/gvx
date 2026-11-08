@@ -365,6 +365,14 @@ The Linux engine wakes a stub thread through a seccomp listener. The Sentry read
 
 The engine installs the listener of each new stub thread and reads the error from the kernel. On `EBUSY`, it writes one warning for the process and stops the attempt for every later stub. Those stub threads use the futex loop. The futex loop is slower. Any other error stops the start of the stub.
 
+#### Idle Stub Pool on Linux (Descriptive Module)
+
+The Linux engine starts one stub process for each address space. When a Sentry releases an address space, the engine keeps the stub in the pool `globalPool` for the next address space. A pooled stub keeps its sysmsg threads. Each sysmsg thread is a host process that the stub owns.
+
+The pool is process-wide, because one pool serves every sandbox of the host process. Its bound is a constant of the build and not an option of one sandbox. The bound is 2 on `android`, and it is `GOMAXPROCS` clamped to the range from 8 to 32 on other Linux builds. A release that finds the pool full destroys the stub.
+
+Destroying a stub follows a fixed order. The engine kills the stub, stops its request goroutine, and reaps the stub with `wait4`. It then closes the seccomp listener and unmaps and releases the memory file ranges of the stub: the context queue, the thread context region, the message area of the syscall thread, and the stack of each sysmsg thread. The source stub of the pool is never destroyed. The limit applies to idle stubs only. A workload with many live guest processes keeps one stub for each live address space.
+
 #### `membarrier` on `systrap` (Descriptive Module)
 
 The guest threads of `winsystrap` run in stub processes, so `FlushProcessWriteBuffers` in the Sentry cannot order them. `GlobalMemoryBarrier` suspends each stub thread that can run guest code, reads its context, and resumes it. The context call returns after the thread left user mode. A thread that the engine parked, or that waits in the spill routine for the Sentry, runs no guest code and needs no stop. The call holds the per-thread lock of the engine, so it never changes a suspend count that another operation owns. It suspends all running threads first, reads their contexts, and then resumes them, so the threads leave user mode in parallel. `FlushProcessWriteBuffers` in the Sentry orders the Sentry threads. [`systrap-windows.md`](systrap-windows.md) section 9 gives the reasoning and the limits.
@@ -1001,6 +1009,7 @@ A guest must never see or change the state of another sandbox. State of the host
 | `usage.MinimumTotalMemoryBytes`, `usage.MaximumTotalMemoryBytes`, `tmpfs.totalHostMem` | `usage`, `fsimpl/tmpfs`, `pkg/gvx/hostmem.go` | The host RAM is the same for every sandbox. A memory limit changes only the reported total of one kernel (`kernel.SetReportedMemory`). |
 | `usage.MemoryAccounting`, `usage.DirtyMemoryAccounting` | `usage` | The sandboxes of `gvx` charge the accounting of their own memory file (`pgalloc.MemoryFileOpts.Accounting`). The global objects count only the mapped pages of host files and the dirty pages of the gofer, which `gvx` does not mount. |
 | `systrap` `sealedHoles`, the dispatcher, and the thread budgets | `platform/systrap` | They describe the host address space and the host threads, which all sandboxes use together. |
+| `systrap` idle stub pool (`globalPool`) and its bound (`idleStubLimit`) | `platform/systrap` | One pool serves every sandbox of the process, because the stubs are host processes. The bound is a constant of the build (2 on `android`, 8 to 32 on other Linux builds), so no sandbox can change what another sandbox reuses. See section 3.3. |
 | `hvf` shared VM (`vmGlobal`) | `platform/hvf` | Hypervisor.framework allows one VM for each process. The platforms count references, and each address space has its own page tables. |
 | `systrap` `disableSyscallPatching` and `neverEnableFastPath` | `platform/systrap` | Only the options `DisableSyscallPatching` and `DisableFastPath` set them, and `gvx` sets neither. |
 | `pgalloc` `mlockDisabled` and `madvPopulateWriteDisabled`, and the capability flags of `kvm` | `pgalloc`, `platform/kvm` | They record what the host kernel refused. |

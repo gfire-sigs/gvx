@@ -8,6 +8,10 @@ This file records the observable changes of each `gvx` release. The release work
 
 - **`--host-dns`**: `rungv run`, `rungv pull`, and `rungv save` take `--host-dns IP[:PORT]`, and `gvx.Config` has the field `HostDNSServers`. A host without `/etc/resolv.conf`, such as an Android app, could not resolve a registry name. `rungv run` failed with `lookup registry-1.docker.io on [::1]:53: connection refused`. The DNS relay of the guest answered `SERVFAIL`. The servers now replace the discovery of the host resolver for the relay in `-net=nat` and `-net=wg` modes. They do the same for the registry requests of an image pull. The registry client uses its own resolver, so no process-wide resolver changes. An embedder with its own layer cache calls `oci.LayerCache.SetDNSServers`. `docs/cli.md` section 5.2 states the rules.
 
+### Changes
+
+- **Bounded idle stub pool on Linux**: the `systrap` engine kept every released stub process for reuse, and nothing limited the pool. After a burst of guest processes, the host process kept up to one stub and one sysmsg process for each address space that the burst had used. The pool now keeps at most 8 to 32 idle stubs (`GOMAXPROCS` clamped to that range), and 2 on `android` builds. A release that finds the pool full kills the stub, reaps it with `wait4`, closes its seccomp listener, and releases its memory file ranges. A workload with more live guest processes than the bound still has one stub for each live address space. A build with many short guest processes can start more stubs than before, because it reuses fewer of them. `TestReleasedStubsStayWithinTheIdleBound`, `TestDestroyingEveryReleasedStubLeaksNothing`, `TestIdleBoundHoldsUnderConcurrentReleaseAndMapFile`, and `TestDefaultIdleBoundLimitsStubsToLivePlusBound` count the child processes, descriptors, mappings, and memory file usage of the host process.
+
 ## [v0.10.10032026110200] - 2026-11-08
 
 This release fixes two failures of a Chromium build in `rungv`. Compilers on an `ext4lite` volume no longer die with `SIGBUS` or fail a `write` with `EFAULT`. A guest can unpack about 1,000,000 files into a `hostfs` bind mount.
