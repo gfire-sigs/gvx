@@ -107,8 +107,8 @@ The memory-file ranges of a stub are its context queue, its thread context regio
 
 | Item | Change | Files | Tier | Proof |
 | :--- | :--- | :--- | :--- | :--- |
-| P1-1 (PR 3) | Build `GOOS=android GOARCH=arm64` and `amd64` in the job `build, vet, and audit`. Fix compile errors in owned packages. | `.github/workflows/ci.yml`, owned packages | Tier 1 | CI |
-| P1-2 (PR 3) | Accept the token `android` as a Tier 2 sibling in the upstream audit. | `tools/upstream` | Tier 1 | `go test ./tools/upstream` |
+| P1-1 (PR 3) | Build `GOOS=android GOARCH=arm64` in the job `build, vet, and audit`. The tree builds without changes. `android/amd64` executables need cgo, so the emulator workflow of P1-4 uses the NDK. | `.github/workflows/ci.yml` | Tier 1 | CI |
+| P1-2 | Name every Android sibling file `*_android_xplat.go` with an `android` build tag. The upstream audit counts the token `xplat` as Tier 2, so the audit needs no change. | None | None | Upstream audit |
 | P1-3 (PR 4) | Add a probe that runs inside an app as `untrusted_app`. It reports each item of section 3.2.1. | new `tools/androidprobe` (Go library and test APK) | Tier 1 | T1-1 |
 | P1-4 (PR 5) | Add a manual workflow that runs the probe and the `systrap` smoke tests on an Android emulator. | new `.github/workflows/android.yml` (`workflow_dispatch` only) | Tier 1 | T1-2 |
 
