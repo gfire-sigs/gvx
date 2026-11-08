@@ -12,8 +12,8 @@ Running Linux containers on Windows or macOS usually requires a Linux virtual ma
 
 | Runtime | Host OS | Cold Start | Memory Footprint | Admin or `sudo` Needed | Requires Background VM Daemon | Direct OCI Image Run |
 | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`gvx` (`whpx` / `hvf`)** | Windows (`amd64`, `arm64`) & macOS (`arm64`) | `~20 ms` | `~30 MiB` | No | No | Yes |
-| **`gvx` (`systrap`)** | Windows (`amd64`, `arm64`) & Linux (`amd64`, `arm64`) | `~25 to 65 ms` | `~31 MiB` | No | No | Yes |
+| **`gvx` (`whpx` / `hvf`)** | Windows (`amd64`, `arm64`) & macOS (`arm64`) | `~20 ms` | `~16 MiB` | No | No | Yes |
+| **`gvx` (`systrap`)** | Windows (`amd64`, `arm64`) & Linux (`amd64`, `arm64`) | `~25 to 65 ms` | `~16 MiB` | No | No | Yes |
 | **WSL2 / Docker Desktop** | Windows & macOS | `800 to 2500 ms` | `> 512 MiB` | Yes (Initial Setup) | Yes | Requires Daemon |
 | **QEMU (Full System)** | Windows & macOS | `1500 to 4000 ms` | `> 256 MiB` | No | No | Requires Disk Image |
 
