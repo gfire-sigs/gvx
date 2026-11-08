@@ -359,6 +359,20 @@ On `amd64`, `New` reads the XSAVE state of one probe vCPU and checks its compact
 
 The macOS engine `darwinsystrap` was removed because of compatibility problems. It forced 16KB guest pages, so executables with 4KB-aligned segments failed. macOS also reserves a 4GB `PAGEZERO` in every `arm64` task, so non-PIE executables that link below 4GB failed. `hvf` runs both kinds natively.
 
+#### Guest Pages of 4 KB on a Host with 16 KB Pages (Descriptive Module)
+
+An Android device can run a kernel with 16 KB pages, and a host mapping must then start and end on 16 KB. The Linux engine keeps guest pages at 4 KB with a sub-block layer (`subblock_xplat.go`). The layer splits the guest address space into blocks of 16 KB, and the regions of the engine itself start and end on host pages (`hostpage_xplat.go`).
+
+| Block state | Stub mapping |
+| :--- | :--- |
+| Four guest pages, contiguous in one file, aligned to 16 KB, one write permission | The file range itself |
+| Any other block with four guest pages | A composite page of the platform memory file with copies of the guest pages, without write access |
+| A block that misses a guest page | None until the next switch, which asks the memory manager to populate the block; then a composite page in which the missing page reads as zeros |
+
+A guest store into a composite page faults, and the Sentry runs the store (`substore_xplat_arm64.go`). Execute access is the union of the four pages, and a page without a guest mapping that shares a block with a mapped page reads as zeros. A store fault or a SIGILL in such a page becomes a `SEGV_MAPERR` fault, as on Linux.
+
+The copies stay current without a copy of every page on each switch. `pgalloc` and `mm` report Sentry writes on Linux as on Windows, and the layer refreshes only the composite pages that hold a written page. The guest-writable pages of a composite page refresh on each switch, because another address space can share them. A changed executable composite page goes through `pwrite(2)` and the stub maps it again, so that the host kernel cleans the I-cache lines of the stub mapping. The variable `GVX_SYSTRAP_SUBBLOCKS=1` runs the layer on a host with 4 KB pages, and CI uses it on `linux/arm64`.
+
 #### Stub Thread Wake-Up on Linux (Descriptive Module)
 
 The Linux engine wakes a stub thread through a seccomp listener. The Sentry reads the notification of the thread and answers it. The kernel allows one listener in the filter chain of a task. A sandbox that runs inside another sandbox can have a listener in its chain already.

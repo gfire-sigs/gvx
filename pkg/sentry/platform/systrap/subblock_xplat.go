@@ -21,6 +21,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -78,9 +79,10 @@ const (
 	allSubPages = 1<<subPagesPerBlock - 1
 )
 
-// subBlocksForced makes the layer work on a host with 4 KB pages. Only tests
-// set it, before they create a platform.
-var subBlocksForced bool
+// subBlocksForced makes the layer work on a host with 4 KB pages, so that CI
+// on such a host runs the code of a 16 KB host. GVX_SYSTRAP_SUBBLOCKS=1 sets
+// it for the whole process; AGENTS.md lists the variable for CI use only.
+var subBlocksForced = os.Getenv("GVX_SYSTRAP_SUBBLOCKS") == "1"
 
 // subBlocksEnabled reports whether address spaces use the sub-block layer.
 func subBlocksEnabled() bool {

@@ -144,6 +144,14 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./pkg/sentry/platform/systrap/ ./e2e/
+      # A hosted runner has 4 KB pages. The variable runs the sub-block layer
+      # of a 16 KB host (Android) under the guest probes.
+      - name: Test the systrap sub-block layer
+        if: matrix.arch == 'arm64'
+        env:
+          CGO_ENABLED: "0"
+          GVX_SYSTRAP_SUBBLOCKS: "1"
+        run: go test -count=1 -run 'TestE2ESystrap|TestE2EGateETExec|TestE2EGateM2' ./e2e/
       - name: Build rungv and the smoke guest
         env:
           CGO_ENABLED: "0"
