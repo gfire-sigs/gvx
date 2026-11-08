@@ -71,3 +71,11 @@ type SubBlockPopulator interface {
 	// mapped into the active AddressSpace.
 	PopulateSubBlock(ctx context.Context, addr hostarch.Addr) bool
 }
+
+// HostBlockPlatform is implemented by a Platform that maps guest memory into
+// the host in blocks that are larger than a guest page.
+type HostBlockPlatform interface {
+	// HostBlockSize returns the size of a host block in bytes, or zero when
+	// the host maps single guest pages.
+	HostBlockSize() uint64
+}

@@ -39,6 +39,9 @@ func overlapsHole(ar hostarch.AddrRange, holes []hostarch.AddrRange) bool {
 // isHostBlockPlatform reports whether the platform maps guest memory in 16KB
 // host blocks. holes are the address holes of the platform.
 func (mm *MemoryManager) isHostBlockPlatform(holes []hostarch.AddrRange) bool {
+	if hbp, ok := mm.p.(platform.HostBlockPlatform); ok && hbp.HostBlockSize() != 0 {
+		return true
+	}
 	if mm.layout.MinAddr >= 0x4_0000_0000 {
 		return true
 	}

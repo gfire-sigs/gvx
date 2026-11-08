@@ -163,6 +163,10 @@ type subprocess struct {
 	// trampolines.
 	usertrap *usertrap.State
 
+	// subBlocks maps guest pages of 4 KB on a host with larger pages. It is
+	// nil on a host with 4 KB pages (subblock_xplat.go).
+	subBlocks *subBlockLayer
+
 	syscallThreadMu sync.Mutex
 	syscallThread   *syscallThread
 
@@ -371,6 +375,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	if sp := globalPool.fetchAvailable(); sp != nil {
 		sp.subprocessRefs.InitRefs()
 		sp.usertrap = usertrap.New(disablePatching)
+		sp.initSubBlocks()
 		return sp, nil
 	}
 
@@ -420,6 +425,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 	}()
 
 	sp.unmap()
+	sp.initSubBlocks()
 	sp.usertrap = usertrap.New(disablePatching)
 	sp.mapSharedRegions()
 	sp.mapPrivateRegions()
@@ -535,6 +541,7 @@ func (s *subprocess) Release() {
 	if s.alive() {
 		s.unmap()
 	}
+	s.resetSubBlocks()
 	s.DecRef(s.release)
 }
 
@@ -1092,6 +1099,9 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	if s.subBlocks != nil {
+		return s.subBlocks.mapFile(addr, f, fr, at, precommit)
+	}
 	fd, err := f.DataFD(fr)
 	if err != nil {
 		return err
@@ -1113,6 +1123,10 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
+	if s.subBlocks != nil {
+		s.subBlocks.unmap(addr, length)
+		return
+	}
 	_, err := s.syscall(
 		unix.SYS_MUNMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},

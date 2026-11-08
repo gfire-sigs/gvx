@@ -189,6 +189,9 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 	}
 
 restart:
+	if s.subBlocks != nil {
+		s.subBlocks.beforeSwitch(ctx, mm)
+	}
 	isSyscall, needPatch, at, err := s.switchToApp(c, ac)
 	if err != nil {
 		return nil, hostarch.NoAccess, err
@@ -290,6 +293,9 @@ func (*Systrap) MinUserAddress() hostarch.Addr {
 
 // New returns a new seccomp-based implementation of the platform interface.
 func New(opts platform.Options) (*Systrap, error) {
+	if err := checkSubBlockHost(); err != nil {
+		return nil, err
+	}
 	mbCh := hostmm.Probe(false)
 	if !disableSyscallPatching {
 		disableSyscallPatching = opts.DisableSyscallPatching
