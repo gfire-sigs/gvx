@@ -78,7 +78,7 @@ This section states the design decisions and their reasons. Section 3 turns each
 
 Android runs the upstream Linux `systrap` engine, the engine that CI tests on `linux/arm64`. Android gives a store app no hypervisor (F2), and AVF exposes no vCPU interface (F3). This specification therefore uses no AVF mode. A rooted device with `/dev/kvm` could use the upstream KVM platform, but `gvx` does not connect it on Linux, and this specification leaves it out.
 
-The Sentry runs inside the app process through a Go library binding. This choice removes one phantom process (F4). It also removes the oldest phantom process, which Android kills first.
+The Sentry runs in its own process, which the app starts from the native library directory. That executable belongs to the package installer and the app cannot write it, so the start resolves no writable path. The separate process keeps the host lockdown: a seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC` in the app process would also bind the threads of the Android runtime, and the Go runtime would compete with the signal handlers of the Android runtime. The cost is one phantom process (F4).
 
 ### 2.2 Fixed-Address Executables
 
@@ -179,7 +179,7 @@ Section 1.3 shows `PROT_EXEC` on a `memfd` on the first image, so P2-7 waits for
 
 | Item | Change | Files | Tier | Proof |
 | :--- | :--- | :--- | :--- | :--- |
-| P3-1 | Export a binding API over `pkg/gvx`: run, stop, standard I/O streams, mounts, and volumes. The Sentry runs in the app process. | new `pkg/gvx/mobile` | Tier 1 | T3-1 |
+| P3-1 | Add a Java library that starts `librungv.so` from the native library directory, passes the arguments, the files and cache directories, and the DNS servers of the active network, and exposes the standard I/O streams and the exit code. | new `android/` library sources and their build script | Tier 1 | T3-1 |
 | P3-2 | Add a sample app with a foreground service (F5) and app storage paths for the OCI cache and volumes. | new `examples/android` | Tier 1 | T3-2 |
 | P3-3 | Build and attest the Android archive in the release workflow. | `.github/workflows/release.yml` | Tier 1 | Release run |
 
