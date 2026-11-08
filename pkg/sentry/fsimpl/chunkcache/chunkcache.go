@@ -129,28 +129,46 @@ func (ch *Chunk) Release() {
 // NewChunk allocates the memory of one chunk. With ChunkMemory, the chunk
 // lives in a memory file, which a platform can map into a guest process by
 // file descriptor. Without it, the chunk lives on the Go heap.
+//
+// A memory file maps its pages into the Sentry in large slices, such as the
+// 1 GiB slices of pgalloc. A range that crosses the end of a slice maps to
+// two blocks, and Buf must be one block. NewChunk keeps such a range allocated
+// while it allocates again, so the next range cannot cross that end. It frees the
+// skipped ranges before it returns.
 func NewChunk(mem ChunkMemory) (*Chunk, error) {
 	if mem == nil {
 		return &Chunk{Buf: newChunkBuf()}, nil
 	}
-	fr, err := mem.AllocateChunk(ChunkSize)
-	if err != nil {
-		return nil, err
+	var skipped []memmap.FileRange
+	defer func() {
+		for _, fr := range skipped {
+			mem.DecRef(fr)
+		}
+	}()
+	for {
+		fr, err := mem.AllocateChunk(ChunkSize)
+		if err != nil {
+			return nil, err
+		}
+		bs, err := mem.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			mem.DecRef(fr)
+			return nil, err
+		}
+		if bs.NumBytes() != ChunkSize {
+			mem.DecRef(fr)
+			return nil, fmt.Errorf("chunkcache: the chunk memory maps %d bytes, want %d", bs.NumBytes(), ChunkSize)
+		}
+		if bs.NumBlocks() != 1 {
+			skipped = append(skipped, fr)
+			continue
+		}
+		ch := &Chunk{Buf: bs.Head().ToSlice(), Mem: mem, FR: fr}
+		if n, ok := mem.(hostWriteNoter); ok {
+			ch.hostWritten = n.NoteHostWrite
+		}
+		return ch, nil
 	}
-	bs, err := mem.MapInternal(fr, hostarch.ReadWrite)
-	if err != nil {
-		mem.DecRef(fr)
-		return nil, err
-	}
-	if bs.NumBlocks() != 1 || bs.NumBytes() != ChunkSize {
-		mem.DecRef(fr)
-		return nil, fmt.Errorf("chunkcache: the chunk memory maps %d blocks of %d bytes, want one block of %d", bs.NumBlocks(), bs.NumBytes(), ChunkSize)
-	}
-	ch := &Chunk{Buf: bs.Head().ToSlice(), Mem: mem, FR: fr}
-	if n, ok := mem.(hostWriteNoter); ok {
-		ch.hostWritten = n.NoteHostWrite
-	}
-	return ch, nil
 }
 
 // newChunkBuf allocates one chunk aligned to ChunkAlign. Go heap memory never
