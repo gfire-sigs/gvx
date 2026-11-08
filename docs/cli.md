@@ -458,3 +458,27 @@ The arm64 failure belongs in gVisor. Report it to the upstream project: write th
 ### 11.3 Limits
 
 The stub processes of an inner Sentry keep the sealed syscall patching table of the outer Sentry on amd64. A guest mapping at `0x60000` to `0x65000` fails there. The engine `ptrace` and the hardware engines of the inner `rungv` need devices that the outer guest does not give.
+
+## 12. Android
+
+`rungv` runs on `android/arm64` with the `systrap` engine. An Android app cannot start a hardware hypervisor, so `-platform=auto` selects `systrap`. [`gvxip/gvxip-006-android-host-support.md`](gvxip/gvxip-006-android-host-support.md) records the design and the measured limits.
+
+### 12.1 Process Model (Descriptive Module)
+
+The app starts `librungv.so` from its native library directory. The Android library `dev.gfire.gvx.Gvx` does this and passes the DNS servers of the active network with `--host-dns`, because Android has no `/etc/resolv.conf`. The Sentry then runs in that child process with its host lockdown.
+
+Each live guest address space has one stub process and at most 2 sysmsg processes on Android. Android counts every child process of every app. Above 32 in total, it kills the oldest child processes of the app with the worst priority. A killed stub stops the sandbox, and `rungv` prints `the execution engine stopped the guest` with a note that names this limit. Android also kills a child process that uses much CPU while its app is in the background.
+
+| Android version | Switch for the limit of 32 | Switch for the CPU limit in the background |
+| :--- | :--- | :--- |
+| 12 | `adb shell device_config put activity_manager max_phantom_processes 2147483647` | None |
+| 12L and 13 | `adb shell settings put global settings_enable_monitor_phantom_procs false` | The same switch |
+| 14 and later | Developer options, "Disable child process restrictions" | The same switch |
+
+### 12.2 Keep a Long Guest Running (Procedural Module)
+
+Use this procedure for a guest that runs longer than a few seconds, such as a build.
+
+1. Start the guest from a foreground service of the app, as the sample app `android/sample` does.
+2. Keep the number of concurrent guest processes below 10.
+3. Turn off the limit with the switch of the table in section 12.1 when the guest needs more processes.

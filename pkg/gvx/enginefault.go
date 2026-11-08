@@ -28,5 +28,5 @@ var ErrEngineFault = errors.New("gvx: the execution engine stopped the guest")
 
 // engineFaultError wraps the cause of an engine fault in ErrEngineFault.
 func engineFaultError(cause string) error {
-	return fmt.Errorf("%w: %s (set GVX_DEBUG_LOG=1 for the log of the kernel)", ErrEngineFault, cause)
+	return fmt.Errorf("%w: %s%s (set GVX_DEBUG_LOG=1 for the log of the kernel)", ErrEngineFault, cause, engineFaultNote(cause))
 }
