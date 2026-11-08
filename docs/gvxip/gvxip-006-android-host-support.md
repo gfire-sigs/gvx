@@ -69,6 +69,15 @@ The probe of section 3.2.1 ran as `untrusted_app` on the emulator image `android
 | `SECCOMP_RET_TRAP` with `SECCOMP_FILTER_FLAG_TSYNC` | The child died by `SIGSYS` |
 | User notification listener | Installed |
 
+The next table records the guest results of the P5 engine on the same 16 KB image. The 4 KB image (`android-36`, `TaskSize` `0x8000000000`) passes the same guests without the sub-block layer.
+
+| Guest | Result on the 16 KB image |
+| :--- | :--- |
+| Built-in guests of the probe app, as `untrusted_app` | `guest-pie`, `guest-fixed-0x400000`, and `guest-shared-page` pass |
+| `regprobe`, `sigframeprobe`, `forkprobe`, `cowprobe`, `brkgrow`, `codewrite`, `spareprobe`, the static Go guest | Pass |
+| `alpine:3` and `python:3.13-alpine` with `--host-dns 10.0.2.3`, as `untrusted_app` | Pass, with network access |
+| `python3 -I -c 'print(2)'` | 52 s with composite copies only; 0.5 s with spare pages |
+
 ---
 
 ## 2. Method (Descriptive Module)
@@ -102,7 +111,9 @@ Each sysmsg thread also counts as a phantom process (F18). The Android build the
 
 ### 2.4 Devices with 16 KB Pages
 
-Phase P5 ports the sub-block engine of the macOS engine (F13) to Android as a sibling engine. Linux lets the Sentry single-step a stub thread with `ptrace`. The port therefore completes a store into the block of the storing instruction, as the Windows engine does. The history records no failure of the sub-block engine (F14), and the `PAGEZERO` part of the removal does not apply to Linux (F12).
+Phase P5 adds a sub-block layer to the Linux engine, with the design of the macOS engine (F13). The history records no failure of the sub-block engine (F14), and the `PAGEZERO` part of the removal does not apply to Linux (F12). The layer maps a 16 KB block directly when its pages are contiguous in one file. Otherwise it maps a composite copy without write access, and the Sentry runs each guest store into the copy. A store into the block of the storing instruction therefore needs no single step.
+
+The Sentry write reports of the memory file keep the copies current on Linux, as on Windows. A changed executable copy goes through `pwrite(2)`, so that the host kernel cleans the I-cache lines of the stub mapping. A block of private pages next to unmapped pages, or to a page without access, maps directly with spare pages. The guest can read and write those spare pages without a fault, as on a Linux kernel with 16 KB pages. A new mapping or an `mprotect` that gives access releases them first. [`../architecture.md`](../architecture.md) section 3.3 describes the layer.
 
 ### 2.5 Stub Start and Executable Memory
 
@@ -199,9 +210,10 @@ Section 1.3 shows `PROT_EXEC` on a `memfd` on the first image, so P2-7 waits for
 | Item | Change | Files | Tier | Proof |
 | :--- | :--- | :--- | :--- | :--- |
 | P5-1 | Find the reason for the removal of the macOS engine in the session history (F14). Stop P5 if the reason applies to Linux. | None | None | Written finding |
-| P5-2 | Restore the sub-block engine from commit `54b7ad53^` as an Android sibling. Remove the zone mode and the macOS code. | `pkg/sentry/platform/systrap/*_android_xplat.go`, `pkg/sentry/mm` (Tier 2 files) | Tier 2 | T5-1 |
-| P5-3 | Complete a store into the block of the storing instruction with `PTRACE_SINGLESTEP`. | Same | Tier 2 | T5-2 |
-| P5-4 | Enable the write reports of the memory file on Android, so private copies stay coherent with Sentry writes. | `pkg/sentry/pgalloc` (Tier 2 file) | Tier 2 | T5-3 |
+| P5-2 | Add the sub-block layer to the Linux engine, and place the regions of the engine on host pages. | `pkg/sentry/platform/systrap/{subblock,hostpage}_xplat.go`, `pkg/sentry/mm` (Tier 2 files and seams) | Tier 2 and Tier 3 seams | T5-1 |
+| P5-3 | Run a guest store into a composite copy in the Sentry, including the block of the storing instruction. | `pkg/sentry/platform/systrap/substore_xplat*.go` | Tier 2 | T5-2 |
+| P5-4 | Enable the write reports of the memory file on Linux, so composite copies stay coherent with Sentry writes. | `pkg/sentry/pgalloc`, `pkg/sentry/mm` (Tier 2 files) | Tier 2 | T5-3 |
+| P5-5 | Map a block of private pages next to unmapped pages directly, with spare pages. | `pkg/sentry/mm`, `pkg/sentry/platform` (Tier 2 files and seams) | Tier 2 and Tier 3 seams | T5-4 |
 
 ---
 
@@ -230,6 +242,7 @@ Each test uses the real producer of the data that it checks, as section 6 of `AG
 | T5-1 | `TestE2EGateETExec` passes on a 16 KB emulator image. | Guest programs | Sub-block mapping gaps |
 | T5-2 | A guest stores into the 4 KB page of its own code inside one 16 KB host page. | Guest program | The fault loop of F13 |
 | T5-3 | A guest maps a file shared, and a `write` system call changes it. The mapping shows the new bytes. | Guest program | Stale private copies |
+| T5-4 | `TestE2ESystrapSparePages` passes on the 16 KB emulator image and with `GVX_SYSTRAP_SUBBLOCKS=1` on `linux/arm64`. | Guest program | Spare pages that hide guest pages |
 
 ---
 
