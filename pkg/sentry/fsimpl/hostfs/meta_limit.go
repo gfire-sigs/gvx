@@ -20,9 +20,9 @@ import "errors"
 // table lives in memory and in the .gvx_meta journal, so a guest that creates
 // records without end would exhaust host memory. The cap counts the estimated
 // size of each record (see recSize), so a table of small records holds more
-// entries than a table of records with large attributes. About 300,000 plain
-// records fit.
-const maxMetaBytes = 128 << 20
+// entries than a table of records with large attributes. About 1,100,000 plain
+// records fit, twice the files and directories of a Chromium source tree.
+const maxMetaBytes = 512 << 20
 
 // errMetaFull reports that a mutation would add a record to a full table.
 // translateHostError maps it to ENOSPC.
