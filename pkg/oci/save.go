@@ -82,7 +82,7 @@ func (c *LayerCache) SaveImages(ctx context.Context, w io.Writer, client *http.C
 		if rc, ok := clients[key]; ok {
 			return rc, nil
 		}
-		rc, err := newRegistryClient(client, p.baseURL, p.repo, c.limits)
+		rc, err := newRegistryClient(client, p.baseURL, p.repo, c.limits, c.dnsServers)
 		if err != nil {
 			return nil, err
 		}

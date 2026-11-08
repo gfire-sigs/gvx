@@ -73,6 +73,10 @@ jobs:
             GOOS=${target%/*} GOARCH=${target#*/} go build ./...
             echo "::endgroup::"
           done
+          # Android uses the Linux code paths (docs/gvxip/gvxip-006-android-host-support.md).
+          echo "::group::build android/arm64"
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./...
+          echo "::endgroup::"
       - name: Vet all target platforms
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do

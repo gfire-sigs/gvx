@@ -300,8 +300,10 @@ func New(opts platform.Options) (*Systrap, error) {
 		archState.Init()
 		// Base GOMAXPROCS has been set at this point.
 		maxSysmsgThreads = gomaxprocs.Base()
-		// Account for syscall thread.
-		maxChildThreads = maxSysmsgThreads + 1
+		// Account for syscall thread. A stub creates at most
+		// sysmsgThreadLimit sysmsg threads; the fast-path heuristics keep
+		// the CPU-based maxSysmsgThreads.
+		maxChildThreads = sysmsgThreadLimit(maxSysmsgThreads) + 1
 	}
 
 	mf, err := createMemoryFile()

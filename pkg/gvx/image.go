@@ -137,6 +137,11 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	hostDNS, err := ParseHostDNSServers(s.cfg.HostDNSServers)
+	if err != nil {
+		return err
+	}
+	cache.SetDNSServers(hostDNS)
 
 	var layerFiles []*os.File
 	defer func() {

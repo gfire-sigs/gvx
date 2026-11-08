@@ -260,7 +260,8 @@ linux-only pkg/sentry/hostcpu/getcpu_arm64.s
 linux-only pkg/sentry/time/vdso.go
 linux-only pkg/sentry/time/vdso_asm_impl_amd64.s
 linux-only pkg/sentry/time/vdso_asm_impl_arm64.s
-linux-only pkg/sentry/platform/mmap_min_addr.go
+# Android denies apps the read of vm.mmap_min_addr, so mmap_min_addr_android_xplat.go measures it.
+expr pkg/sentry/platform/mmap_min_addr.go linux && !android
 linux-only pkg/rawfile/blockingpoll_amd64.s
 linux-only pkg/rawfile/blockingpoll_arm64.s
 linux-only pkg/ring0/pagetables/pcids_aarch64.go

@@ -624,7 +624,7 @@ func TestRegistryClientAnswersABasicChallengeWithHelperCredentials(t *testing.T)
 		"fake get": {out: `{"Username":"alice","Secret":"s3cret"}`},
 	}}
 	srv := loginRegistry(t, "alice", "s3cret")
-	rc, err := newRegistryClient(nil, srv.URL, testRepo, DefaultLimits())
+	rc, err := newRegistryClient(nil, srv.URL, testRepo, DefaultLimits(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

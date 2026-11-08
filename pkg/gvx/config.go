@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"regexp"
 	"runtime"
@@ -148,6 +149,16 @@ type Config struct {
 	// IsolateLAN blocks outbound NAT connections to RFC1918, loopback, and
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
+
+	// HostDNSServers lists the DNS servers of the host, each a bare IP or
+	// "ip:port". A bare IP uses port 53. When set, they replace the discovery
+	// of the host resolver configuration for two users: the DNS relay of the
+	// guest network (NAT and WireGuard modes) and the registry requests of an
+	// image pull. A host without a resolver configuration, such as an Android
+	// app, needs them: the embedder reads the servers from the system. When
+	// empty, the discovery of the host stays in force. A WireGuard config
+	// that names its own DNS servers keeps them for the guest relay.
+	HostDNSServers []string
 
 	// NetRaw lets the guest open raw IP sockets and use iptables, as the runsc
 	// flag --net-raw does. dockerd and its bridge network need it. A raw
@@ -330,6 +341,18 @@ var (
 	hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9.-]{1,64}$`)
 )
 
+// ParseHostDNSServers validates the entries of Config.HostDNSServers: a bare
+// IP, which uses port 53, or "ip:port". It skips empty entries. A bad entry
+// wraps ErrInvalidConfig. A caller that pulls images with its own layer cache
+// passes the result to oci.LayerCache.SetDNSServers.
+func ParseHostDNSServers(raw []string) ([]netip.AddrPort, error) {
+	servers, err := netbackend.ParseDNSServers(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: host DNS servers: %v", ErrInvalidConfig, err)
+	}
+	return servers, nil
+}
+
 // normalize applies defaults and rejects contradictory settings before New
 // opens any host handle. Every rejection wraps ErrInvalidConfig.
 func (c *Config) normalize() error {
@@ -341,6 +364,14 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.PullPolicy = policy
+	hostDNS, err := ParseHostDNSServers(c.HostDNSServers)
+	if err != nil {
+		return err
+	}
+	c.HostDNSServers = nil
+	for _, ap := range hostDNS {
+		c.HostDNSServers = append(c.HostDNSServers, ap.String())
+	}
 	switch c.Platform {
 	case PlatformAuto, PlatformWHPX, PlatformHVF, PlatformSystrap:
 	default:

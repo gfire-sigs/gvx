@@ -1060,7 +1060,7 @@ func (s *subprocess) kickSysmsgThread() bool {
 	}
 	numTimesStubKicked.Increment()
 	atomic.AddUint32(&s.contextQueue.numThreadsToWakeup, 1)
-	if s.numSysmsgThreads < maxSysmsgThreads && s.numSysmsgThreads < int(nrThreads) {
+	if s.numSysmsgThreads < sysmsgThreadLimit(maxSysmsgThreads) && s.numSysmsgThreads < int(nrThreads) {
 		s.numSysmsgThreads++
 		s.kickSysmsgMu.Unlock()
 		if err := s.createSysmsgThread(); err != nil {

@@ -44,6 +44,7 @@ func saveSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	var output string
 	fs.StringVar(&output, "o", "", "Write the archive to FILE instead of standard output")
 	fs.StringVar(&output, "output", "", "Write the archive to FILE instead of standard output")
+	hostDNS := addHostDNSFlag(fs)
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
@@ -53,7 +54,7 @@ func saveSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	if output == "" && oci.IsTerminal(stdout) {
 		return imageUsageError(stderr, "save", "refusing to write an archive to a terminal: use -o FILE or redirect standard output")
 	}
-	cache, arch, err := cacheFlags.open()
+	cache, arch, err := cacheFlags.openPullCache(*hostDNS)
 	if err != nil {
 		return imageFail(stderr, "save", err)
 	}

@@ -166,6 +166,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	})
 	cacheDirFlag := fs.String("cache-dir", "", "EROFS layer cache directory")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL")
+	hostDNSFlag := addHostDNSFlag(fs)
 	pullFlag := fs.String("pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
 	lockdownFlag := fs.Bool("lockdown", true, "Lock down the host process before guest entry (RestrictedToken and JobObject, or Seatbelt); use -lockdown=false to opt out")
 	ttyFlag := fs.Bool("t", false, "Allocate a pseudo-TTY for guest stdio")
@@ -244,6 +245,9 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	tuned, err := tuneFlag.values()
 	if err != nil {
 		return usageError("%v", err)
+	}
+	if _, err := gvx.ParseHostDNSServers(*hostDNSFlag); err != nil {
+		return usageError("--host-dns: %v", err)
 	}
 
 	var portForwards []gvx.PortForward
@@ -342,6 +346,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		Architecture:           arch,
 		NetworkMode:            netMode,
 		IsolateLAN:             *isolateLANFlag,
+		HostDNSServers:         *hostDNSFlag,
 		NetRaw:                 priv.netRaw,
 		AllowPacketSocketWrite: priv.packetWrite,
 		AllowSUID:              priv.allowSUID,
