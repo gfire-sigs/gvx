@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -40,6 +41,8 @@ import (
 // sharedPlatform is the one platform of the test binary. The source stub of
 // globalPool keeps the memory file of the first platform, so all tests use it.
 var sharedPlatform = sync.OnceValues(func() (*Systrap, error) {
+	// New reads the CPU features of the host on amd64.
+	cpuid.Initialize()
 	return New(platform.Options{})
 })
 
