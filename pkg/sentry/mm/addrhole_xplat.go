@@ -149,6 +149,31 @@ func (mm *MemoryManager) findHighestAlignedLocked(length, alignment uint64, boun
 	return mm.findHighestAvailableLocked(length, alignment, bounds)
 }
 
+// releaseHostBlocksLocked tells an address space with spare pages that a new
+// virtual memory area covers ar (platform.HostBlockOwner). A spare page in the
+// host block of ar must not hide the new pages from the memory manager.
+//
+// +checklocks:mm.mappingMu
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) releaseHostBlocksLocked(ar hostarch.AddrRange) {
+	if hbp, ok := mm.p.(platform.HostBlockPlatform); !ok || hbp.HostBlockSize() == 0 {
+		return
+	}
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+	mm.releaseHostBlocksActiveLocked(ar)
+}
+
+// releaseHostBlocksActiveLocked is releaseHostBlocksLocked for a caller that
+// holds activeMu. mprotect calls it when an area without access gains access.
+//
+// +checklocks:mm.activeMu
+func (mm *MemoryManager) releaseHostBlocksActiveLocked(ar hostarch.AddrRange) {
+	if owner, ok := mm.as.(platform.HostBlockOwner); ok {
+		owner.ReleaseHostBlocks(ar)
+	}
+}
+
 // alignStackToHostBlock moves the end of the stack down to a host block, and
 // grows the size of the stack to a whole number of host blocks. The top of the
 // stack is then in a block that holds no other mapping, so the platform maps

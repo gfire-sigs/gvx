@@ -139,6 +139,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 	}
 
 	vseg := mm.vmas.Insert(vgap, ar, v)
+	mm.releaseHostBlocksLocked(ar)
 	mm.usageAS += opts.Length
 	if v.isPrivateDataLocked() {
 		mm.dataAS += opts.Length

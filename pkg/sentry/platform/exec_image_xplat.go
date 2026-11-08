@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 // MappingKind says what backs the virtual memory area that holds an address.
@@ -78,4 +79,26 @@ type HostBlockPlatform interface {
 	// HostBlockSize returns the size of a host block in bytes, or zero when
 	// the host maps single guest pages.
 	HostBlockSize() uint64
+}
+
+// HostBlockOwner is implemented by an AddressSpace that can map a host block
+// directly when some guest pages of the block have no guest mapping.
+//
+// The memory manager moves the private pages of such a block into one host
+// block of its memory file. The pages of that range that back no guest page
+// are spare pages, and the address space holds them. The guest can then read
+// and write the spare pages without a fault, as on a Linux kernel with host
+// pages of that size.
+type HostBlockOwner interface {
+	// AdoptHostBlock gives the address space one reference on each spare
+	// page of fr, a host block of f that backs the host block at addr. Bit i
+	// of spare is set for the spare page at fr.Start + i*hostarch.PageSize.
+	// The memory manager calls it before it maps the guest pages of the
+	// block, and it holds activeMu.
+	AdoptHostBlock(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, spare uint8)
+
+	// ReleaseHostBlocks makes the address space stop the use of the spare
+	// pages in the host blocks that overlap ar, because a new guest mapping
+	// covers ar. The memory manager holds activeMu.
+	ReleaseHostBlocks(ar hostarch.AddrRange)
 }

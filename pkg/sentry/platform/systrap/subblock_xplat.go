@@ -224,13 +224,39 @@ type srcRef struct {
 	hb  *hostBlock
 }
 
-// needsPopulate reports whether the block asks the memory manager for a
-// populate call. A block that misses a guest page does. So does a block that
-// maps a composite page although every page is writable and none is
-// executable: the memory manager can coalesce the pages of private anonymous
-// memory into one file range, and then the block maps directly.
+// needsPopulate reports whether a block that the stub does not map directly
+// asks the memory manager for a populate call. A block that misses a guest
+// page does. So does a block whose pages are all writable and not executable:
+// the memory manager can coalesce the pages of private anonymous memory into
+// one file range, and then the block maps directly.
 func (hb *hostBlock) needsPopulate(direct bool) bool {
-	return hb.mapped != allSubPages || (!direct && hb.write == allSubPages && hb.exec == 0)
+	return !direct && (hb.mapped != allSubPages || (hb.write == allSubPages && hb.exec == 0))
+}
+
+// canCoalesce reports whether the memory manager can coalesce the mapped pages
+// of a block that misses guest pages: they all allow writes, and none allows
+// execution.
+func (hb *hostBlock) canCoalesce() bool {
+	return hb.mapped != 0 && hb.write == hb.mapped && hb.exec == 0
+}
+
+// ownedBlock is a host block of a memory file whose spare pages the layer
+// holds (platform.HostBlockOwner). The guest pages of the block come from fr,
+// and bit i of spare is set for a spare page at fr.Start + i*PageSize.
+type ownedBlock struct {
+	f     memmap.File
+	fr    memmap.FileRange
+	spare uint8
+}
+
+// release drops the references of the layer on the spare pages.
+func (ob ownedBlock) release() {
+	for i := range subPagesPerBlock {
+		if ob.spare&(1<<i) != 0 {
+			start := ob.fr.Start + uint64(i)*hostarch.PageSize
+			ob.f.DecRef(memmap.FileRange{Start: start, End: start + hostarch.PageSize})
+		}
+	}
 }
 
 // recompute updates the masks from the guest pages.
@@ -249,6 +275,48 @@ func (hb *hostBlock) recompute() {
 		if sp.at.Write {
 			hb.write |= bit
 		}
+	}
+}
+
+// directLocked returns the file offset and the descriptor that the stub can
+// map for the whole block, and false when the block needs a composite page.
+// A block that misses guest pages maps directly when the layer holds those
+// pages as spare pages, and the other pages allow the same access.
+func (l *subBlockLayer) directLocked(base uintptr, hb *hostBlock) (uint64, int, bool) {
+	if off, ok := hb.direct(); ok {
+		return off, int(hb.subs[0].fd), true
+	}
+	ob, ok := l.owned[base]
+	if !ok || hb.mapped == 0 || hb.exec != 0 || (hb.write != 0 && hb.write != hb.mapped) {
+		return 0, 0, false
+	}
+	fd := -1
+	for i := range hb.subs {
+		sp := &hb.subs[i]
+		if sp.f == nil {
+			if ob.spare&(1<<i) == 0 {
+				return 0, 0, false
+			}
+			continue
+		}
+		if sp.f != ob.f || sp.off != ob.fr.Start+uint64(i)*hostarch.PageSize {
+			return 0, 0, false
+		}
+		if fd < 0 {
+			fd = int(sp.fd)
+		} else if int(sp.fd) != fd {
+			return 0, 0, false
+		}
+	}
+	return ob.fr.Start, fd, true
+}
+
+// disownLocked releases the spare pages of a block. The stub must not map
+// them any more.
+func (l *subBlockLayer) disownLocked(base uintptr) {
+	if ob, ok := l.owned[base]; ok {
+		delete(l.owned, base)
+		ob.release()
 	}
 }
 
@@ -355,6 +423,8 @@ type subBlockLayer struct {
 	// deferred holds the blocks that miss a guest page and that the stub does
 	// not map. beforeSwitch maps them after it populates them (refreshLocked).
 	deferred map[uintptr]struct{}
+	// owned holds the blocks whose spare pages the layer holds.
+	owned map[uintptr]ownedBlock
 	// refusedLogged records that logRefusedLocked logged a store.
 	refusedLogged bool
 
@@ -388,6 +458,7 @@ func newSubBlockLayer(host blockHost) *subBlockLayer {
 		partial:      make(map[uintptr]struct{}),
 		comps:        make(map[uintptr]*hostBlock),
 		deferred:     make(map[uintptr]struct{}),
+		owned:        make(map[uintptr]ownedBlock),
 		observed:     make(map[memmap.File]func()),
 		immutable:    make(map[memmap.File]bool),
 		sourcesStale: true,
@@ -649,19 +720,22 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 	if hb.mapped == 0 {
 		return l.dropBlockLocked(base, hb)
 	}
-	if hb.mapped != allSubPages && !mapPartial {
-		var err error
+	off, fd, isDirect := l.directLocked(base, hb)
+	if !isDirect && hb.mapped != allSubPages && !mapPartial {
 		if hb.cur.kind != stubMapNone {
-			err = l.host.unmapRange(base, subBlockSize)
+			if err := l.host.unmapRange(base, subBlockSize); err != nil {
+				return err
+			}
 			hb.cur = stubMap{}
 		}
+		// The memory manager maps the pages of a block that it coalesced
+		// one range at a time, so the block keeps its spare pages here.
 		delete(l.comps, base)
 		l.partial[base] = struct{}{}
 		l.deferred[base] = struct{}{}
-		return err
+		return nil
 	}
 	delete(l.deferred, base)
-	off, isDirect := hb.direct()
 	if hb.needsPopulate(isDirect) && !mapPartial {
 		l.partial[base] = struct{}{}
 	} else {
@@ -670,10 +744,13 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 	if isDirect {
 		want := stubMap{kind: stubMapDirect, off: off, prot: hb.blockProt(true)}
 		if hb.cur != want {
-			if err := l.host.mapRange(base, subBlockSize, want.prot, false, int(hb.subs[0].fd), off); err != nil {
+			if err := l.host.mapRange(base, subBlockSize, want.prot, false, fd, off); err != nil {
 				return fmt.Errorf("map [%#x, %#x): %w", base, base+subBlockSize, err)
 			}
 			hb.cur = want
+		}
+		if ob, ok := l.owned[base]; ok && ob.fr.Start != off {
+			l.disownLocked(base)
 		}
 		l.freeCompLocked(base, hb)
 		return nil
@@ -692,7 +769,11 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 		return fmt.Errorf("fill the composite page for [%#x, %#x): %w", base, base+subBlockSize, err)
 	}
 	l.comps[base] = hb
-	return l.mapCompLocked(base, hb, changed)
+	if err := l.mapCompLocked(base, hb, changed); err != nil {
+		return err
+	}
+	l.disownLocked(base)
+	return nil
 }
 
 // mapCompLocked maps the composite page of a block into the stub. changed
@@ -743,6 +824,11 @@ func (l *subBlockLayer) dropBlockLocked(base uintptr, hb *hostBlock) error {
 	if hb.cur.kind != stubMapNone {
 		err = l.host.unmapRange(base, subBlockSize)
 	}
+	if err == nil {
+		// Otherwise the stub can still map the spare pages, and reset
+		// releases them.
+		l.disownLocked(base)
+	}
 	hb.cur = stubMap{}
 	l.freeCompLocked(base, hb)
 	delete(l.partial, base)
@@ -786,6 +872,8 @@ func (l *subBlockLayer) clearPagesLocked(va, end uintptr) {
 	if hb == nil {
 		return
 	}
+	// An unmapped page is not a spare page, so a block with spare pages
+	// stops its direct mapping here (directLocked).
 	for p := va; p < end; p += hostarch.PageSize {
 		hb.subs[(p-base)/hostarch.PageSize] = subPage{}
 	}
@@ -794,11 +882,72 @@ func (l *subBlockLayer) clearPagesLocked(va, end uintptr) {
 	}
 }
 
+// releaseOwnedLocked ends the use of the spare pages of a block, because a new
+// guest mapping covers one of them. A spare page would hide the pages of the
+// new mapping from the memory manager.
+func (l *subBlockLayer) releaseOwnedLocked(base uintptr) {
+	ob := l.owned[base]
+	delete(l.owned, base)
+	hb := l.blocks[base]
+	if hb == nil {
+		ob.release()
+		return
+	}
+	err := l.refreshLocked(base, hb, false)
+	if err != nil && !errors.Is(err, errDeadSubprocess) {
+		log.Warningf("systrap: update the block at %#x after a new mapping: %v", base, err)
+	}
+	if err != nil && hb.cur.kind == stubMapDirect && hb.cur.off == ob.fr.Start {
+		// The stub can still map the spare pages. reset releases them.
+		l.owned[base] = ob
+		return
+	}
+	ob.release()
+}
+
+// adopt implements platform.HostBlockOwner.AdoptHostBlock.
+func (l *subBlockLayer) adopt(base uintptr, f memmap.File, fr memmap.FileRange, spare uint8) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// The memory manager unmapped the block before the call, so the stub
+	// does not map old spare pages.
+	l.disownLocked(base)
+	l.owned[base] = ownedBlock{f: f, fr: fr, spare: spare}
+}
+
+// release implements platform.HostBlockOwner.ReleaseHostBlocks.
+func (l *subBlockLayer) release(ar hostarch.AddrRange) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.owned) == 0 {
+		return
+	}
+	defer l.updatePendingLocked()
+	start := subBlockBase(uintptr(ar.Start))
+	end := uintptr(ar.End)
+	if n := (end - start + subBlockSize - 1) / subBlockSize; n > uintptr(len(l.owned)) {
+		// The runtime of Go reserves large ranges, so a range can hold many
+		// more blocks than the layer owns.
+		for base := range l.owned {
+			if base >= start && base < end {
+				l.releaseOwnedLocked(base)
+			}
+		}
+		return
+	}
+	for base := start; base < end; base += subBlockSize {
+		if _, ok := l.owned[base]; ok {
+			l.releaseOwnedLocked(base)
+		}
+	}
+}
+
 // forgetBlocksLocked drops the records of the whole blocks in [start, end)
 // after the stub unmapped them.
 func (l *subBlockLayer) forgetBlocksLocked(start, end uintptr) {
 	forget := func(base uintptr, hb *hostBlock) {
 		hb.cur = stubMap{}
+		l.disownLocked(base)
 		l.freeCompLocked(base, hb)
 		delete(l.partial, base)
 		delete(l.deferred, base)
@@ -829,6 +978,10 @@ func (l *subBlockLayer) reset() {
 		hb.cur = stubMap{}
 		l.freeCompLocked(base, hb)
 	}
+	for _, ob := range l.owned {
+		ob.release()
+	}
+	clear(l.owned)
 	clear(l.blocks)
 	clear(l.partial)
 	clear(l.comps)
@@ -949,10 +1102,18 @@ func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlo
 			addrs = append(addrs, hostarch.Addr(base))
 			continue
 		}
+		first := -1
 		for i := range hb.subs {
 			if hb.subs[i].f == nil {
 				addrs = append(addrs, hostarch.Addr(base+uintptr(i)*hostarch.PageSize))
+			} else if first < 0 {
+				first = i
 			}
+		}
+		// After the missing pages, a call for a mapped page lets the memory
+		// manager coalesce the block with spare pages.
+		if hb.canCoalesce() {
+			addrs = append(addrs, hostarch.Addr(base+uintptr(first)*hostarch.PageSize))
 		}
 	}
 	clear(l.partial)

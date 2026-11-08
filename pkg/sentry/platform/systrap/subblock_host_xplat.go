@@ -22,7 +22,9 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
@@ -100,6 +102,24 @@ func (s *subprocess) initSubBlocks() {
 		s.subBlocks = nil
 	case s.subBlocks == nil:
 		s.subBlocks = newSubBlockLayer(subprocessBlockHost{s})
+	}
+}
+
+var _ platform.HostBlockOwner = (*subprocess)(nil)
+
+// AdoptHostBlock implements platform.HostBlockOwner.AdoptHostBlock.
+func (s *subprocess) AdoptHostBlock(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, spare uint8) {
+	if s.subBlocks == nil {
+		ownedBlock{f: f, fr: fr, spare: spare}.release()
+		return
+	}
+	s.subBlocks.adopt(uintptr(addr), f, fr, spare)
+}
+
+// ReleaseHostBlocks implements platform.HostBlockOwner.ReleaseHostBlocks.
+func (s *subprocess) ReleaseHostBlocks(ar hostarch.AddrRange) {
+	if s.subBlocks != nil {
+		s.subBlocks.release(ar)
 	}
 }
 
