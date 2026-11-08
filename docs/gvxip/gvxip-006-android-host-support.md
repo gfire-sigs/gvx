@@ -77,6 +77,7 @@ The next table records the guest results of the P5 engine on the same 16 KB imag
 | `regprobe`, `sigframeprobe`, `forkprobe`, `cowprobe`, `brkgrow`, `codewrite`, `spareprobe`, the static Go guest | Pass |
 | `alpine:3` and `python:3.13-alpine` with `--host-dns 10.0.2.3`, as `untrusted_app` | Pass, with network access |
 | `python3 -I -c 'print(2)'` | 52 s with composite copies only; 0.5 s with spare pages |
+| A `hostfs` workspace in the files directory of the app (`ext4`), as `untrusted_app` | Files, a directory of 200 files, a symbolic link, a FIFO, a rename, `chmod`, and `touch -d` keep their metadata in a second sandbox |
 
 ---
 
@@ -182,7 +183,7 @@ The items below are candidates. Phase P1 decides which items stay.
 | P2-1 | Read `mmap_min_addr` through an Android sibling that falls back to 32768 when SELinux denies the read. Register the build-tag change. | `pkg/sentry/platform/mmap_min_addr*.go`, `tools/upstream/buildtag_allowlist.txt` | Tier 2 and Tier 3 tag | T2-1 |
 | P2-2 | Pass DNS servers from the app to the sandbox, because Android has no `/etc/resolv.conf`. | `pkg/gvx` (`Config`), `pkg/netbackend` | Tier 1 | T2-2 |
 | P2-3 | Compare the host system calls of the Sentry with the app filter of Android, and remove or replace each call that the filter kills. | `scripts/seccomp-audit.sh`, affected packages | Tier 1 or Tier 2 | T1-1 (host system calls) |
-| P2-4 | Verify the file identity probe of `hostfs` on `f2fs` and `ext4` app storage. | `pkg/sentry/fsimpl/hostfs` | Tier 1 | T2-3 |
+| P2-4 | Verify the file identity probe of `hostfs` on `f2fs` and `ext4` app storage. Result: `ext4` of the emulator passes (section 1.3) with no change; `f2fs` needs a device. | `pkg/sentry/fsimpl/hostfs` | Tier 1 | T2-3 |
 | P2-5 | Verify that `vm.memfd_noexec` does not deny the mapping (section 2.5). Result: no change. | None | None | Docker smoke run |
 | P2-6 | Map one memory-file page with `PROT_EXEC` before the first stub, and report a denial with its cause. Copy mode follows only with P2-7. | `pkg/memutil`, `pkg/gvx` (#121) | Tier 1 and Tier 2 | T2-4 |
 | P2-7 | Copy mode of section 2.5. The engine builds it only when T1-1 or T2-4 shows a device that denies `PROT_EXEC` on a `memfd`. Linux CI forces it with a test hook. | `pkg/sentry/platform/systrap` (Tier 2 files), `pkg/sentry/pgalloc` (host-write reports) | Tier 2 | T2-5 |
