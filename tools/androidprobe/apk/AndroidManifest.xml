@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The probe app of GVXIP-006. Its instrumentation starts a native executable
+     from the native library directory, so the executable runs in the SELinux
+     domain and under the seccomp filter of an ordinary app. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.gfire.gvx.probe">
+    <uses-sdk android:minSdkVersion="31" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:label="gvx probe"
+        android:debuggable="true"
+        android:extractNativeLibs="true"
+        android:hasCode="true" />
+    <instrumentation
+        android:name=".Run"
+        android:targetPackage="dev.gfire.gvx.probe" />
+</manifest>

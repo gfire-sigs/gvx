@@ -50,7 +50,34 @@ The facts below come from the `gvx` source tree, its Git history, and Android do
 | F11 | The lowest guest address of the Linux engine is `/proc/sys/vm/mmap_min_addr`. The package `init` panics when it cannot read that file. | `pkg/sentry/platform/mmap_min_addr.go`, `systrap.go` (`MinUserAddress`) |
 | F12 | The zone mode of the removed macOS engine rewrote fixed-address code only because macOS reserves a 4 GB `PAGEZERO`. Linux has no such range. | Commits `95454d98`, `38b62d16` |
 | F13 | The removed macOS engine had a 4 KB sub-block engine for 16 KB host pages. It reported `SIGSEGV` for a store into the block of the storing instruction. The Windows engine completes that store with a single step. | Commits `132d9fe9`, `47ab2a62`, `95cda8e4` |
-| F14 | The commit that removed the macOS engine states no reason. The architecture document names the 16 KB pages and `PAGEZERO`. | Commit `54b7ad53`, `docs/architecture.md` section 3.3 |
+| F14 | The commit that removed the macOS engine states no reason. The architecture document names the 16 KB pages and `PAGEZERO`. The session history of the removal records the instruction "non-PIE binaries and 4 KB page compatibility" and no test result. | Commit `54b7ad53`, `docs/architecture.md` section 3.3, session history |
+| F15 | The Linux engine starts no stub executable. `stubInit` copies the stub code into an anonymous mapping of the Sentry, and each stub is a clone of the source stub. No file path and no `execve` take part. | `stub_unsafe.go` (`stubInit`), `subprocess_linux.go` (`createStub`) |
+| F16 | Guest code pages are pages of the memory file, a `memfd` that `createMemoryFile` creates without `MFD_EXEC`. `MapFile` maps them into the stub with `PROT_EXEC`. | `systrap.go` (`createMemoryFile`), `subprocess.go` (`MapFile`) |
+| F17 | Linux 6.3 adds `vm.memfd_noexec`. At value 1, `execve` of a `memfd` without `MFD_EXEC` fails; at value 2, the kernel refuses `MFD_EXEC`. A mapping with `PROT_EXEC` works at every value (section 2.5). An app with target SDK 29 or later cannot execute files in its data directory. | Linux `memfd_create(2)`, Android W^X policy |
+| F18 | A sysmsg thread of a stub is a separate host process: the clone has no `CLONE_THREAD`. A stub has up to `GOMAXPROCS` of them. | `subprocess.go` (`createSysmsgThreadLocked`), PR #116 review |
+
+### 1.3 Probe Results
+
+The probe of section 3.2.1 ran as `untrusted_app` on the emulator image `android-36;google_apis_playstore_ps16k;arm64-v8a` (Android 16, user build, SELinux enforcing, kernel 6.6).
+
+| Probe | Result |
+| :--- | :--- |
+| `mmap_min_addr` | Read denied (`permission denied`). The `adb shell` user is denied too. |
+| Page size, `TaskSize` | 16384; `0x800000000000` |
+| `memfd` with `PROT_EXEC` | Mapped |
+| `ptrace` single step | 16 steps of a traced child |
+| `SECCOMP_RET_TRAP` with `SECCOMP_FILTER_FLAG_TSYNC` | The child died by `SIGSYS` |
+| User notification listener | Installed |
+
+The next table records the guest results of the P5 engine on the same 16 KB image. The 4 KB image (`android-36`, `TaskSize` `0x8000000000`) passes the same guests without the sub-block layer.
+
+| Guest | Result on the 16 KB image |
+| :--- | :--- |
+| Built-in guests of the probe app, as `untrusted_app` | `guest-pie`, `guest-fixed-0x400000`, and `guest-shared-page` pass |
+| `regprobe`, `sigframeprobe`, `forkprobe`, `cowprobe`, `brkgrow`, `codewrite`, `spareprobe`, the static Go guest | Pass |
+| `alpine:3` and `python:3.13-alpine` with `--host-dns 10.0.2.3`, as `untrusted_app` | Pass, with network access |
+| `python3 -I -c 'print(2)'` | 52 s with composite copies only; 0.5 s with spare pages |
+| A `hostfs` workspace in the files directory of the app (`ext4`), as `untrusted_app` | Files, a directory of 200 files, a symbolic link, a FIFO, a rename, `chmod`, and `touch -d` keep their metadata in a second sandbox |
 
 ---
 
@@ -62,11 +89,11 @@ This section states the design decisions and their reasons. Section 3 turns each
 
 Android runs the upstream Linux `systrap` engine, the engine that CI tests on `linux/arm64`. Android gives a store app no hypervisor (F2), and AVF exposes no vCPU interface (F3). This specification therefore uses no AVF mode. A rooted device with `/dev/kvm` could use the upstream KVM platform, but `gvx` does not connect it on Linux, and this specification leaves it out.
 
-The Sentry runs inside the app process through a Go library binding. This choice removes one phantom process (F4). It also removes the oldest phantom process, which Android kills first.
+The Sentry runs in its own process, which the app starts from the native library directory. That executable belongs to the package installer and the app cannot write it, so the start resolves no writable path. The separate process keeps the host lockdown: a seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC` in the app process would also bind the threads of the Android runtime, and the Go runtime would compete with the signal handlers of the Android runtime. The cost is one phantom process (F4).
 
 ### 2.2 Fixed-Address Executables
 
-A non-PIE executable needs no rewrite on Android (F12). Go links `arm64` programs at `0x10000`, and GNU `ld` links at `0x400000`. Both addresses lie above the expected `mmap_min_addr` of 32768. Phase P1 verifies this value and the readability of the file on real devices (F11).
+A non-PIE executable needs no rewrite on Android (F12). Go links `arm64` programs at `0x10000`, and GNU `ld` links at `0x400000`. Both addresses lie above the expected `mmap_min_addr` of 32768. Android denies the read of that value (section 1.3), so the Android build measures it: it maps single pages upward from one page with `MAP_FIXED_NOREPLACE`, and the first success is the minimum.
 
 ### 2.3 Process Limit
 
@@ -81,9 +108,27 @@ The pool is process-wide upstream state, because one stub pool serves every sand
 
 The bound limits the stubs that wait in the pool. It does not limit the live stubs of a workload with more than about 31 concurrent guest processes. Phase P4 reports that case and names the switch of F6.
 
+Each sysmsg thread also counts as a phantom process (F18). The Android build therefore limits a stub to 2 sysmsg threads, so one live guest address space costs at most 3 phantom processes. A guest process with more threads shares those 2 sysmsg threads.
+
 ### 2.4 Devices with 16 KB Pages
 
-Phase P5 ports the sub-block engine of the macOS engine (F13) to Android as a sibling engine. Linux lets the Sentry single-step a stub thread with `ptrace`. The port therefore completes a store into the block of the storing instruction, as the Windows engine does. P5 starts only after the reason for the removal of the macOS engine is known (F14).
+Phase P5 adds a sub-block layer to the Linux engine, with the design of the macOS engine (F13). The history records no failure of the sub-block engine (F14), and the `PAGEZERO` part of the removal does not apply to Linux (F12). The layer maps a 16 KB block directly when its pages are contiguous in one file. Otherwise it maps a composite copy without write access, and the Sentry runs each guest store into the copy. A store into the block of the storing instruction therefore needs no single step.
+
+The Sentry write reports of the memory file keep the copies current on Linux, as on Windows. A changed executable copy goes through `pwrite(2)`, so that the host kernel cleans the I-cache lines of the stub mapping. A block of private pages next to unmapped pages, or to a page without access, maps directly with spare pages. The guest can read and write those spare pages without a fault, as on a Linux kernel with 16 KB pages. A new mapping or an `mprotect` that gives access releases them first. [`../architecture.md`](../architecture.md) section 3.3 describes the layer.
+
+### 2.5 Stub Start and Executable Memory
+
+A stub must start without a time-of-check to time-of-use gap. The Linux engine meets this rule today: it clones the source stub, and the stub code comes from memory of the Sentry (F15). No file name is resolved, and no other process can change the code between its copy and its use. The port keeps this method on Android.
+
+A stub executable that the Sentry writes to a path and then executes breaks the rule. Another process of the same app can replace the file between the write and the `execve`. Such a file also cannot run on Android, because an app with target SDK 29 or later cannot execute files in its data directory (F17). This specification therefore rejects that method.
+
+The only executable host memory that the engine needs is the memory file (F16). The port makes this dependency explicit and gives it a fallback:
+
+- **No flag:** `vm.memfd_noexec` controls only `execve` of a `memfd`, not a mapping with `PROT_EXEC`. In Docker `linux/arm64` (kernel 6.18), the smoke guest passes with the values 0, 1, and 2. A request for `MFD_EXEC` fails with `EACCES` at value 2, so the memory file keeps its flags (#121).
+- **Start check:** before the first stub starts, the Sentry maps one page of its memory file with `PROT_EXEC` in its own process. The stubs have the SELinux domain and the seccomp filter of the Sentry, so this map predicts the result in a stub.
+- **Copy mode:** when that map fails, the engine runs in copy mode. A stub maps memory-file pages without `PROT_EXEC`. For an executable guest page, it maps a private anonymous page, the Sentry copies the code into it, and the stub makes it read and execute only. A write by the Sentry drops the copy through the host-write reports of `pgalloc`. A write by the guest faults on the read-only copy, and the engine maps the writable memory-file page instead. The next instruction fetch makes a new copy. The Windows engine uses the same private code pages.
+
+An `exec`-based start is not planned. If a later change needs one, it must execute a sealed `memfd` (`F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`, and `F_SEAL_SEAL` after the write) with `execveat` and `AT_EMPTY_PATH`, or an `O_PATH` descriptor of an executable that the package installer placed in the native library directory. Both forms resolve no path that the app can write at the time of the `exec`.
 
 ---
 
@@ -125,6 +170,8 @@ The probe must run as an app, because the `adb shell` domain has other SELinux a
 | `memfd` | Can the app map a `memfd` with `PROT_EXEC` in itself and in a child? |
 | Stub start | Does the upstream stub start, unmap its address space, and run one guest system call? |
 | Host system calls | Does any system call of the Sentry hit the seccomp filter of the app? |
+| `memfd` flags | Does the kernel accept `MFD_EXEC`, and does a `memfd` without it map with `PROT_EXEC`? |
+| Anonymous code | Can the app map an anonymous page and change it to read and execute, as copy mode needs? |
 | Phantom count | How many `PhantomProcessRecord` entries does a burst of 40 guest processes create? |
 
 ### 3.3 P2: Host Adaptations
@@ -136,13 +183,18 @@ The items below are candidates. Phase P1 decides which items stay.
 | P2-1 | Read `mmap_min_addr` through an Android sibling that falls back to 32768 when SELinux denies the read. Register the build-tag change. | `pkg/sentry/platform/mmap_min_addr*.go`, `tools/upstream/buildtag_allowlist.txt` | Tier 2 and Tier 3 tag | T2-1 |
 | P2-2 | Pass DNS servers from the app to the sandbox, because Android has no `/etc/resolv.conf`. | `pkg/gvx` (`Config`), `pkg/netbackend` | Tier 1 | T2-2 |
 | P2-3 | Compare the host system calls of the Sentry with the app filter of Android, and remove or replace each call that the filter kills. | `scripts/seccomp-audit.sh`, affected packages | Tier 1 or Tier 2 | T1-1 (host system calls) |
-| P2-4 | Verify the file identity probe of `hostfs` on `f2fs` and `ext4` app storage. | `pkg/sentry/fsimpl/hostfs` | Tier 1 | T2-3 |
+| P2-4 | Verify the file identity probe of `hostfs` on `f2fs` and `ext4` app storage. Result: `ext4` of the emulator passes (section 1.3) with no change; `f2fs` needs a device. | `pkg/sentry/fsimpl/hostfs` | Tier 1 | T2-3 |
+| P2-5 | Verify that `vm.memfd_noexec` does not deny the mapping (section 2.5). Result: no change. | None | None | Docker smoke run |
+| P2-6 | Map one memory-file page with `PROT_EXEC` before the first stub, and report a denial with its cause. Copy mode follows only with P2-7. | `pkg/memutil`, `pkg/gvx` (#121) | Tier 1 and Tier 2 | T2-4 |
+| P2-7 | Copy mode of section 2.5. The engine builds it only when T1-1 or T2-4 shows a device that denies `PROT_EXEC` on a `memfd`. Linux CI forces it with a test hook. | `pkg/sentry/platform/systrap` (Tier 2 files), `pkg/sentry/pgalloc` (host-write reports) | Tier 2 | T2-5 |
+
+Section 1.3 shows `PROT_EXEC` on a `memfd` on the first image, so P2-7 waits for a device that denies it.
 
 ### 3.4 P3: SDK Package
 
 | Item | Change | Files | Tier | Proof |
 | :--- | :--- | :--- | :--- | :--- |
-| P3-1 | Export a binding API over `pkg/gvx`: run, stop, standard I/O streams, mounts, and volumes. The Sentry runs in the app process. | new `pkg/gvx/mobile` | Tier 1 | T3-1 |
+| P3-1 | Add a Java library that starts `librungv.so` from the native library directory, passes the arguments, the files and cache directories, and the DNS servers of the active network, and exposes the standard I/O streams and the exit code. | new `android/` library sources and their build script | Tier 1 | T3-1 |
 | P3-2 | Add a sample app with a foreground service (F5) and app storage paths for the OCI cache and volumes. | new `examples/android` | Tier 1 | T3-2 |
 | P3-3 | Build and attest the Android archive in the release workflow. | `.github/workflows/release.yml` | Tier 1 | Release run |
 
@@ -159,9 +211,10 @@ The items below are candidates. Phase P1 decides which items stay.
 | Item | Change | Files | Tier | Proof |
 | :--- | :--- | :--- | :--- | :--- |
 | P5-1 | Find the reason for the removal of the macOS engine in the session history (F14). Stop P5 if the reason applies to Linux. | None | None | Written finding |
-| P5-2 | Restore the sub-block engine from commit `54b7ad53^` as an Android sibling. Remove the zone mode and the macOS code. | `pkg/sentry/platform/systrap/*_android_xplat.go`, `pkg/sentry/mm` (Tier 2 files) | Tier 2 | T5-1 |
-| P5-3 | Complete a store into the block of the storing instruction with `PTRACE_SINGLESTEP`. | Same | Tier 2 | T5-2 |
-| P5-4 | Enable the write reports of the memory file on Android, so private copies stay coherent with Sentry writes. | `pkg/sentry/pgalloc` (Tier 2 file) | Tier 2 | T5-3 |
+| P5-2 | Add the sub-block layer to the Linux engine, and place the regions of the engine on host pages. | `pkg/sentry/platform/systrap/{subblock,hostpage}_xplat.go`, `pkg/sentry/mm` (Tier 2 files and seams) | Tier 2 and Tier 3 seams | T5-1 |
+| P5-3 | Run a guest store into a composite copy in the Sentry, including the block of the storing instruction. | `pkg/sentry/platform/systrap/substore_xplat*.go` | Tier 2 | T5-2 |
+| P5-4 | Enable the write reports of the memory file on Linux, so composite copies stay coherent with Sentry writes. | `pkg/sentry/pgalloc`, `pkg/sentry/mm` (Tier 2 files) | Tier 2 | T5-3 |
+| P5-5 | Map a block of private pages next to unmapped pages directly, with spare pages. | `pkg/sentry/mm`, `pkg/sentry/platform` (Tier 2 files and seams) | Tier 2 and Tier 3 seams | T5-4 |
 
 ---
 
@@ -181,6 +234,8 @@ Each test uses the real producer of the data that it checks, as section 6 of `AG
 | T2-1 | A guest maps `0x10000` after the fallback read of `mmap_min_addr`. | Guest program | Wrong lowest address |
 | T2-2 | A guest resolves a registry name and pulls an image. | Network | Missing DNS servers |
 | T2-3 | The `hostfs` metadata tests pass on app storage. | Host file system | Wrong file identity |
+| T2-4 | The start check reports executable memory on the emulator images, and a guest runs code from a page that it maps. | Android | A missing `MFD_EXEC`; a wrong start check |
+| T2-5 | With copy mode forced, `TestE2ESystrapCodeWrites` and `TestE2EGateETExec` pass on `linux/arm64`. | Guest programs | Stale code copies |
 | T3-1 | The binding runs a guest command and returns its exit code and output. | Guest program | Broken binding |
 | T3-2 | The sample app runs a guest for 10 minutes in the background with its foreground service. | Android | F5 kills |
 | T4-1 | Kill a stub with `SIGKILL` from outside. The fault message names the phantom process limit. | Host kernel | Silent "subprocess died" |
@@ -188,6 +243,7 @@ Each test uses the real producer of the data that it checks, as section 6 of `AG
 | T5-1 | `TestE2EGateETExec` passes on a 16 KB emulator image. | Guest programs | Sub-block mapping gaps |
 | T5-2 | A guest stores into the 4 KB page of its own code inside one 16 KB host page. | Guest program | The fault loop of F13 |
 | T5-3 | A guest maps a file shared, and a `write` system call changes it. The mapping shows the new bytes. | Guest program | Stale private copies |
+| T5-4 | `TestE2ESystrapSparePages` passes on the 16 KB emulator image and with `GVX_SYSTRAP_SUBBLOCKS=1` on `linux/arm64`. | Guest program | Spare pages that hide guest pages |
 
 ---
 
@@ -210,7 +266,7 @@ A phase ends when the tests below pass and the listed release step is complete.
 
 | ID | Risk or question | Phase that answers it |
 | :--- | :--- | :--- |
-| R1 | SELinux can deny `ptrace`, `memfd` execution, or the read of `mmap_min_addr` for `untrusted_app`. | P1 |
+| R1 | SELinux can deny `ptrace`, `memfd` execution, or the read of `mmap_min_addr` for `untrusted_app`. The first image allows the first two and denies the read (section 1.3). Other devices can differ. | P1, P2 |
 | R2 | The seccomp filter of the app can kill a host system call of the Sentry with `SIGSYS`. | P1, P2 |
 | R3 | Workloads with more than about 31 concurrent guest processes exceed F4 even with the pool bound. | P4 |
 | R4 | Google Play rules on downloaded executable code can block store distribution of an app that pulls OCI images. | P3 |
