@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +64,9 @@ type LayerCache struct {
 	dir       string
 	limits    Limits
 	blockSize int
+	// dnsServers are the resolvers of the registry requests that a pull or a
+	// save sends with its default HTTP client. Empty selects the host resolver.
+	dnsServers []netip.AddrPort
 
 	mu       sync.Mutex
 	verified map[string]verifiedLayer
@@ -153,6 +158,15 @@ func (c *LayerCache) SetLimits(l Limits) error {
 	}
 	c.limits = l
 	return nil
+}
+
+// SetDNSServers makes the registry requests of this cache resolve names
+// through servers, in place of the resolver of the host. It applies to a pull
+// or a save that gets no HTTP client from its caller. A host without a
+// resolver configuration, such as Android, needs it. Empty servers select the
+// resolver of the host again.
+func (c *LayerCache) SetDNSServers(servers []netip.AddrPort) {
+	c.dnsServers = slices.Clone(servers)
 }
 
 // Dir returns the backing directory path of the LayerCache.

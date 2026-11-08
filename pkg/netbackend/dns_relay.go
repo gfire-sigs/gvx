@@ -410,11 +410,17 @@ func parseDNSServerAddrPort(server string) (netip.AddrPort, error) {
 	return netip.AddrPortFrom(ip.Unmap(), port), nil
 }
 
-// normalizeDNSServers converts bare IP strings or host:port strings into
-// canonical ip:port entries. Non-IP tokens (such as search domains in wg-quick
-// DNS = lines) are skipped when skipInvalid is true.
-func normalizeDNSServers(raw []string, skipInvalid bool) ([]string, error) {
-	var out []string
+// ParseDNSServers converts bare IP strings or "ip:port" strings into
+// addresses. A bare IP uses DefaultDNSPort. It skips empty entries and
+// rejects every other entry that is not an IP address with an optional port.
+func ParseDNSServers(raw []string) ([]netip.AddrPort, error) {
+	return parseDNSServers(raw, false)
+}
+
+// parseDNSServers is ParseDNSServers. Non-IP tokens (such as search domains
+// in wg-quick DNS = lines) are skipped when skipInvalid is true.
+func parseDNSServers(raw []string, skipInvalid bool) ([]netip.AddrPort, error) {
+	var out []netip.AddrPort
 	for _, item := range raw {
 		s := strings.TrimSpace(item)
 		if s == "" {
@@ -427,6 +433,21 @@ func normalizeDNSServers(raw []string, skipInvalid bool) ([]string, error) {
 			}
 			return nil, fmt.Errorf("invalid DNS server %q: %w", s, err)
 		}
+		out = append(out, ap)
+	}
+	return out, nil
+}
+
+// normalizeDNSServers converts bare IP strings or host:port strings into
+// canonical ip:port entries. Non-IP tokens (such as search domains in wg-quick
+// DNS = lines) are skipped when skipInvalid is true.
+func normalizeDNSServers(raw []string, skipInvalid bool) ([]string, error) {
+	parsed, err := parseDNSServers(raw, skipInvalid)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, ap := range parsed {
 		out = append(out, ap.String())
 	}
 	return out, nil

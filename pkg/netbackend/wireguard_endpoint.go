@@ -86,6 +86,11 @@ type WireGuardConfig struct {
 	// virtual DNS relay at 10.0.2.3:53. When empty, the endpoint discovers
 	// host DNS servers before lockdown.
 	DNSServers []string
+	// HostDNSServers lists host DNS servers ("ip" or "ip:port") that the
+	// relay queries through the host network when DNSServers is empty. They
+	// replace the discovery of the host resolver configuration. A host without
+	// such a configuration, such as Android, needs them.
+	HostDNSServers []string
 	// LookupHost overrides DNS name resolution for the virtual DNS relay at
 	// 10.0.2.3:53 when non-nil.
 	LookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
@@ -152,6 +157,14 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 		return nil, fmt.Errorf("netbackend: %w", err)
 	}
 	cfg.DNSServers = upstreamDNS
+	hostDNS, err := normalizeDNSServers(cfg.HostDNSServers, false)
+	if err != nil {
+		return nil, fmt.Errorf("netbackend: host DNS servers: %w", err)
+	}
+	cfg.HostDNSServers = hostDNS
+	if len(upstreamDNS) == 0 {
+		upstreamDNS = hostDNS
+	}
 	if len(upstreamDNS) == 0 {
 		upstreamDNS = discoverHostDNSServers()
 	}

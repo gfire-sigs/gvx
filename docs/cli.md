@@ -80,6 +80,7 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `--allow-suid` | Obey the set-user-ID and set-group-ID bits of guest executables. `sudo`, `su`, and `passwd` need it for a user that is not root. The default comes from `--privileged`. |
 | `--host-ca-certs` | Make the guest trust the root certificates that the host trusts. Off by default. Section 4.10 describes the sources, the files, and the limits. |
 | `-registry-url URL` | Override the registry of the image reference. |
+| `--host-dns IP[:PORT]` | Name a DNS server of the host. The flag repeats. The servers replace the discovery of the host resolver for the DNS relay of the guest and for the registry requests. `pull` and `save` take it too. Section 5.2 gives the reason. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
 | `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, and `tag` take it. |
@@ -322,6 +323,19 @@ A credential helper is the program `docker-credential-NAME`. It has 30 seconds a
 With `always`, the cached image replaces a failed request in two cases. The first case is a registry that is unreachable. The second case is a registry that answers HTTP 401, 403, or 404, or demands credentials that the Docker configuration does not hold. `rungv` then prints one warning line to the standard error. Any other failure stops the run, and so does a missing cached image.
 
 The second case lets `rungv load -i img.tar` followed by `rungv run --pull=always mylocal/app:1` work. The name `mylocal/app:1` is unknown to Docker Hub. With the default `missing`, the run uses the loaded image without a registry request. `rungv pull` always asks the registry and never uses the cache after a 401, 403, or 404.
+
+### 5.2 Host DNS servers
+
+A host such as an Android app has no `/etc/resolv.conf`. The Go resolver then asks `[::1]:53` and fails with `connection refused`. The flag `--host-dns` names a DNS server of the host as `IP` or `IP:PORT`. A bare IP uses port 53. The flag repeats, and one value can hold a comma-separated list. The commands `run`, `pull`, and `save` take it. `rungv login` does not take it.
+
+The servers replace the discovery of the host resolver for two users. The first user is the DNS relay of the guest at `10.0.2.3`, in `-net=nat` and `-net=wg` modes. The second user is the registry client of an image pull. The registry client sends its queries to the servers and changes no process-wide resolver. Without the flag, both users keep the discovery of the host. A WireGuard config with its own `DNS =` servers keeps them for the guest relay.
+
+The SDK field is `Config.HostDNSServers`. An embedder that pulls with its own layer cache calls `LayerCache.SetDNSServers`. An Android app reads the servers with `ConnectivityManager`. The Android emulator uses `10.0.2.3`.
+
+```sh
+rungv run --host-dns 10.0.2.3 alpine:3.20 nslookup example.com
+rungv pull --host-dns 10.0.2.3 alpine:3.20
+```
 
 ## 6. The image store
 

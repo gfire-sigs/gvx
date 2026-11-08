@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -84,7 +85,10 @@ type registryClient struct {
 	credErr     error
 }
 
-func newRegistryClient(client *http.Client, baseURL, repo string, lim Limits) (*registryClient, error) {
+// newRegistryClient builds the client of one repository. A nil client selects
+// a default HTTP client that resolves names through dns when dns is not
+// empty. A caller-supplied client keeps its own resolver.
+func newRegistryClient(client *http.Client, baseURL, repo string, lim Limits, dns []netip.AddrPort) (*registryClient, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("oci: parse registry URL %q: %w", baseURL, err)
@@ -98,7 +102,7 @@ func newRegistryClient(client *http.Client, baseURL, repo string, lim Limits) (*
 	}
 	rc := &registryClient{baseURL: u, repo: repo, lim: lim, idle: idle}
 	if client == nil {
-		client = newDefaultHTTPClient()
+		client = newDefaultHTTPClient(dns)
 		rc.owned = true
 	}
 	clone := *client
@@ -125,10 +129,14 @@ func newRegistryClient(client *http.Client, baseURL, repo string, lim Limits) (*
 	return rc, nil
 }
 
-func newDefaultHTTPClient() *http.Client {
+func newDefaultHTTPClient(dns []netip.AddrPort) *http.Client {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	if len(dns) > 0 {
+		dialer.Resolver = newServerResolver(dns)
+	}
 	return &http.Client{Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          4,
 		IdleConnTimeout:       30 * time.Second,
