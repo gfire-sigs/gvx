@@ -29,7 +29,7 @@ import (
 func (t *syscallThread) initRequestReplyAddresses(sentryStackAddr uintptr) {
 	// These are safe as these addresses are mmapped and never moved/gced.
 	sentryMessage := (*syscallSentryMessage)(unsafe.Pointer(sentryStackAddr))
-	stubMessage := (*syscallStubMessage)(unsafe.Pointer(sentryStackAddr + syscallStubMessageOffset))
+	stubMessage := (*syscallStubMessage)(unsafe.Pointer(sentryStackAddr + syscallStubMessageOff))
 	atomic.StoreUint32(&sentryMessage.state, 0)
 
 	t.sentryMessage = sentryMessage

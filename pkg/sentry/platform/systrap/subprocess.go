@@ -58,7 +58,7 @@ var (
 	//
 	// Note: Tools like ThreadSanitizer don't like when the memory layout
 	// is changed significantly.
-	maxRandomOffsetOfStubAddress = (linux.TaskSize >> 7) & ^(uintptr(hostarch.PageSize) - 1)
+	maxRandomOffsetOfStubAddress = (linux.TaskSize >> 7) & ^(hostPageSize - 1)
 
 	// maxStubUserAddress is the largest possible user address for
 	// processes running inside gVisor. It is fixed because
@@ -1253,8 +1253,12 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 	}
 
 	// Map the stack into the BPF process.
+	// On a host with pages larger than the guard page, the private stack
+	// takes the whole host page around it (hostpage_xplat.go).
 	privateStackAddr := sysThread.sysmsgPerThreadMemAddr() + sysmsg.PerThreadPrivateStackOffset
-	err = sysThread.mapPrivateStack(privateStackAddr, sysmsg.PerThreadPrivateStackSize)
+	privateStackEnd := hostPageRoundUp(privateStackAddr + sysmsg.PerThreadPrivateStackSize)
+	privateStackAddr = hostPageRoundDown(privateStackAddr)
+	err = sysThread.mapPrivateStack(privateStackAddr, privateStackEnd-privateStackAddr)
 	if err != nil {
 		return fmt.Errorf("mmap failed: %w", err)
 	}

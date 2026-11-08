@@ -24,7 +24,6 @@ import (
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
-	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/seccomp"
@@ -36,7 +35,6 @@ import (
 )
 
 // The syscall message consists of sentry and stub messages.
-const syscallThreadMessageSize = hostarch.PageSize * 2
 
 // syscallThread implements the process of calling syscalls in a stub process.
 //
@@ -89,7 +87,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 		Kind: usage.System,
 		Dir:  pgalloc.TopDown,
 	}
-	fr, err := t.subproc.memoryFile.Allocate(syscallThreadMessageSize, opts)
+	fr, err := t.subproc.memoryFile.Allocate(uint64(syscallThreadMessageLen), opts)
 	if err != nil {
 		t.subproc.sysmsgStackPool.Put(t.thread.sysmsgStackID)
 		return err
@@ -119,7 +117,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 	sentryAddr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
-		syscallThreadMessageSize,
+		syscallThreadMessageLen,
 		unix.PROT_WRITE|unix.PROT_READ,
 		unix.MAP_SHARED|unix.MAP_FILE,
 		uintptr(t.subproc.memoryFile.FD()), uintptr(fr.Start))
@@ -138,7 +136,7 @@ func (t *syscallThread) destroy() {
 		errno := hostsyscall.RawSyscallErrno(
 			unix.SYS_MUNMAP,
 			t.sentryAddr,
-			syscallThreadMessageSize,
+			syscallThreadMessageLen,
 			0)
 		if errno != 0 {
 			panic(fmt.Sprintf("mumap failed: %v", errno))
@@ -147,7 +145,7 @@ func (t *syscallThread) destroy() {
 	if t.stubAddr != 0 {
 		_, err := t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, unix.SYS_MUNMAP,
 			arch.SyscallArgument{Value: t.stubAddr},
-			arch.SyscallArgument{Value: uintptr(syscallThreadMessageSize)})
+			arch.SyscallArgument{Value: syscallThreadMessageLen})
 		if err != nil {
 			t.thread.Warningf("munmap failed: %v", err)
 		}
@@ -176,7 +174,7 @@ func (t *syscallThread) mapMessageIntoStub() error {
 	// Map sentryMessage as read-only.
 	_, err := t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, unix.SYS_MMAP,
 		arch.SyscallArgument{Value: t.stubAddr},
-		arch.SyscallArgument{Value: uintptr(hostarch.PageSize)},
+		arch.SyscallArgument{Value: syscallStubMessageOff},
 		arch.SyscallArgument{Value: uintptr(unix.PROT_READ)},
 		arch.SyscallArgument{Value: unix.MAP_SHARED | unix.MAP_FILE | unix.MAP_FIXED},
 		arch.SyscallArgument{Value: uintptr(t.subproc.memoryFile.FD())},
@@ -186,12 +184,12 @@ func (t *syscallThread) mapMessageIntoStub() error {
 	}
 	// Map stubMessage as read-write.
 	_, err = t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, unix.SYS_MMAP,
-		arch.SyscallArgument{Value: t.stubAddr + syscallStubMessageOffset},
-		arch.SyscallArgument{Value: uintptr(hostarch.PageSize)},
+		arch.SyscallArgument{Value: t.stubAddr + syscallStubMessageOff},
+		arch.SyscallArgument{Value: syscallStubMessageOff},
 		arch.SyscallArgument{Value: uintptr(unix.PROT_READ | unix.PROT_WRITE)},
 		arch.SyscallArgument{Value: unix.MAP_SHARED | unix.MAP_FILE | unix.MAP_FIXED},
 		arch.SyscallArgument{Value: uintptr(t.subproc.memoryFile.FD())},
-		arch.SyscallArgument{Value: uintptr(t.stackRange.Start + hostarch.PageSize)})
+		arch.SyscallArgument{Value: uintptr(t.stackRange.Start) + syscallStubMessageOff})
 	return err
 }
 
