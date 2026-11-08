@@ -2,6 +2,14 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release bounds the idle stub pool of the Linux `systrap` engine. A Linux host now keeps fewer idle stub processes after a workload with many short guest processes.
+
+### Changes
+
+- **Bounded idle stub pool on Linux**: the `systrap` engine kept every released stub process for reuse, and nothing limited the pool. After a burst of guest processes, the host process kept up to one stub and one sysmsg process for each address space that the burst had used. The pool now keeps at most 8 to 32 idle stubs (`GOMAXPROCS` clamped to that range), and 2 on `android` builds. A release that finds the pool full kills the stub, reaps it with `wait4`, closes its seccomp listener, and releases its memory file ranges. A workload with more live guest processes than the bound still has one stub for each live address space. A build with many short guest processes can start more stubs than before, because it reuses fewer of them. `TestReleasedStubsStayWithinTheIdleBound`, `TestDestroyingEveryReleasedStubLeaksNothing`, `TestIdleBoundHoldsUnderConcurrentReleaseAndMapFile`, and `TestDefaultIdleBoundLimitsStubsToLivePlusBound` count the child processes, descriptors, mappings, and memory file usage of the host process.
+
 ## [v0.10.10032026110200] - 2026-11-08
 
 This release fixes two failures of a Chromium build in `rungv`. Compilers on an `ext4lite` volume no longer die with `SIGBUS` or fail a `write` with `EFAULT`. A guest can unpack about 1,000,000 files into a `hostfs` bind mount.

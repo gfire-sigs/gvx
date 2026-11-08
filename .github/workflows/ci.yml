@@ -139,7 +139,7 @@ jobs:
       - name: Test systrap engine and end-to-end suite
         env:
           CGO_ENABLED: "0"
-        run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./e2e/
+        run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./pkg/sentry/platform/systrap/ ./e2e/
       - name: Build rungv and the smoke guest
         env:
           CGO_ENABLED: "0"

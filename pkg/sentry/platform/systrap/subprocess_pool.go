@@ -38,11 +38,17 @@ type subprocessPool struct {
 	available []*subprocess
 }
 
-func (p *subprocessPool) markAvailable(s *subprocess) {
+// markAvailable adds s to the pool and returns true. It returns false and
+// does not add s when the pool holds idleStubLimit() stubs.
+func (p *subprocessPool) markAvailable(s *subprocess) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if len(p.available) >= idleStubLimit() {
+		return false
+	}
 	p.available = append(p.available, s)
+	return true
 }
 
 func (p *subprocessPool) fetchAvailable() *subprocess {

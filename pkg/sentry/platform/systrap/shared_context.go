@@ -127,7 +127,12 @@ func (sc *sharedContext) isActiveInSubprocess(s *subprocess) bool {
 }
 
 func (sc *sharedContext) interruptStub() (*thread, error) {
-	if sc.subprocess.dead.Load() {
+	// destroyIdle unmaps the shared memory below after it takes aliveMu for
+	// writing, so a late interrupt never writes to an unmapped slot.
+	s := sc.subprocess
+	s.aliveMu.RLock()
+	defer s.aliveMu.RUnlock()
+	if s.dead.Load() {
 		return nil, errDeadSubprocess
 	}
 	// If this context is not being worked on right now we need to mark it as
@@ -139,7 +144,6 @@ func (sc *sharedContext) interruptStub() (*thread, error) {
 	if threadID == invalidThreadID {
 		return nil, errNoStubThread
 	}
-	s := sc.subprocess
 	s.sysmsgThreadsMu.RLock()
 	defer s.sysmsgThreadsMu.RUnlock()
 	sysmsgThread, ok := s.sysmsgThreads[threadID]
