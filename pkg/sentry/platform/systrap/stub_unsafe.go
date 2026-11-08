@@ -205,42 +205,43 @@ func stubInit() {
 	procStubBegin := addrOfInitStubProcess()
 	procStubLen := int(safecopy.FindEndAddress(procStubBegin) - procStubBegin)
 	procStubSlice := unsafe.Slice((*byte)(unsafe.Pointer(procStubBegin)), procStubLen)
-	mapLen, _ := hostarch.PageRoundUp(uintptr(procStubLen))
+	// Every region boundary is a host page boundary (hostpage_xplat.go).
+	mapLen := hostPageRoundUp(uintptr(procStubLen))
 
 	stubSysmsgStart = mapLen
 	stubSysmsgLen := len(sysmsg.SighandlerBlob)
-	mapLen, _ = hostarch.PageRoundUp(mapLen + uintptr(stubSysmsgLen))
+	mapLen = hostPageRoundUp(mapLen + uintptr(stubSysmsgLen))
 	stubExecMapEnd := mapLen
 
 	stubSysmsgRules = mapLen
-	stubSysmsgRulesLen = hostarch.PageSize * 2
+	stubSysmsgRulesLen = hostPageRoundUp(hostarch.PageSize * 2)
 	mapLen += stubSysmsgRulesLen
 	stubSyscallRules = mapLen
-	stubSyscallRulesLen = hostarch.PageSize
+	stubSyscallRulesLen = hostPageRoundUp(hostarch.PageSize)
 	mapLen += stubSyscallRulesLen
 
 	stubROMapEnd = mapLen
 	// Add a guard page.
-	mapLen += hostarch.PageSize
+	mapLen += hostPageSize
 	stubSysmsgStack = mapLen
 
 	// Allocate maxGuestThreads plus ONE because each per-thread stack
 	// has to be aligned to sysmsg.PerThreadMemSize.
 	// Look at sysmsg/sighandler.c:sysmsg_addr() for more details.
-	mapLen, _ = hostarch.PageRoundUp(mapLen + sysmsg.PerThreadMemSize*(uintptr(maxChildThreads+1)))
+	mapLen = hostPageRoundUp(mapLen + sysmsg.PerThreadMemSize*(uintptr(maxChildThreads+1)))
 
 	// Allocate context queue region
 	stubContextQueueRegion = mapLen
-	stubContextQueueRegionLen, _ = hostarch.PageRoundUp(unsafe.Sizeof(contextQueue{}))
+	stubContextQueueRegionLen = hostPageRoundUp(unsafe.Sizeof(contextQueue{}))
 	mapLen += stubContextQueueRegionLen
 
 	stubSpinningThreadQueueAddr = mapLen
-	mapLen += sysmsg.SpinningQueueMemSize
+	mapLen += hostPageRoundUp(sysmsg.SpinningQueueMemSize)
 
 	// Allocate thread context region
 	stubContextRegion = mapLen
-	stubContextRegionLen = sysmsg.AllocatedSizeofThreadContextStruct * (maxGuestContexts + 1)
-	mapLen, _ = hostarch.PageRoundUp(mapLen + stubContextRegionLen)
+	stubContextRegionLen = hostPageRoundUp(sysmsg.AllocatedSizeofThreadContextStruct * (maxGuestContexts + 1))
+	mapLen = hostPageRoundUp(mapLen + stubContextRegionLen)
 
 	// Try a few times to avoid cases when new mappings are created.
 	for i := 0; i < 32; i++ {
@@ -248,7 +249,7 @@ func stubInit() {
 			// Randomize stubStart address.
 			randomOffset := uintptr(rand.Uint64() * hostarch.PageSize)
 			maxRandomOffset := maxRandomOffsetOfStubAddress - mapLen
-			stubStart = maxStubUserAddress + randomOffset%maxRandomOffset
+			stubStart = hostPageRoundDown(maxStubUserAddress + randomOffset%maxRandomOffset)
 		} else {
 			regions, err := parseMaps(maxStubUserAddress, maximumUserAddress-mapLen+stubROMapEnd, stubROMapEnd)
 			if err != nil {
@@ -259,7 +260,7 @@ func stubInit() {
 				panic("failed to map stub code")
 			}
 			r := regions[rand.Uint64()%uint64(n)]
-			stubStart = r.start + uintptr(rand.Uint64())*hostarch.PageSize%(r.end-r.start-stubROMapEnd)
+			stubStart = hostPageRoundUp(r.start + uintptr(rand.Uint64())*hostarch.PageSize%(r.end-r.start-stubROMapEnd))
 		}
 		// Map the target address for the stub.
 		addr, _ := hostsyscall.RawSyscall6(
@@ -281,7 +282,7 @@ func stubInit() {
 		panic("failed to map stub")
 	}
 	// Randomize stubSysmsgStack address.
-	gap := uintptr(rand.Uint64()) * hostarch.PageSize % (maximumUserAddress - stubStart - mapLen)
+	gap := hostPageRoundDown(uintptr(rand.Uint64()) * hostPageSize % (maximumUserAddress - stubStart - mapLen))
 	stubSysmsgStack += uintptr(gap)
 	stubContextQueueRegion += uintptr(gap)
 	stubSpinningThreadQueueAddr += uintptr(gap)

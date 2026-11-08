@@ -130,46 +130,71 @@ func (mm *MemoryManager) PopulateSubBlock(ctx context.Context, addr hostarch.Add
 	return err == nil
 }
 
-// coalescePrivateBlockLocked coalesces a 16KB host block whose 4KB sub-blocks
-// are all backed by private non-CoW writable MemoryFile PMAs into a single
-// 16KB-aligned MemoryFile range so the platform can map it directly.
+// coalescePrivateBlockLocked moves the pages of a 16KB host block into a single
+// 16KB-aligned MemoryFile range so the platform can map the block directly.
+// Each page of the block must be backed by a private non-CoW writable
+// MemoryFile PMA.
+//
+// A page of the block can also have no virtual memory area, when the address
+// space implements platform.HostBlockOwner. The page of the new range for it
+// is a spare page, and the address space receives its reference.
 //
 // +checklocksread:mm.mappingMu
 // +checklocks:mm.activeMu
 func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR hostarch.AddrRange) ([]memmap.FileRange, bool) {
 	const hostBlockSize = 0x4000
-	pseg := mm.pmas.LowerBoundSegment(blockAR.Start)
-	if !pseg.Ok() || pseg.Start() > blockAR.Start {
-		return nil, false
-	}
-	firstOff := pseg.ValuePtr().off + uint64(blockAR.Start-pseg.Start())
-	alreadyAligned := firstOff%hostBlockSize == 0
-	cur := blockAR.Start
-	for seg := pseg; cur < blockAR.End; seg = seg.NextSegment() {
-		if !seg.Ok() || seg.Start() > cur {
-			return nil, false
-		}
+	owner, canOwn := mm.as.(platform.HostBlockOwner)
+	// present has a bit for each page that a PMA backs.
+	var present uint8
+	alreadyAligned := true
+	var firstOff uint64
+	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
 		pma := seg.ValuePtr()
 		if pma.file != mm.mf || !pma.private || pma.needCOW || !pma.effectivePerms.Read || !pma.effectivePerms.Write || pma.effectivePerms.Execute {
 			return nil, false
 		}
-		segOff := pma.off + uint64(cur-seg.Start())
-		if segOff != firstOff+uint64(cur-blockAR.Start) {
-			alreadyAligned = false
+		sub := seg.Range().Intersect(blockAR)
+		for p := sub.Start; p < sub.End; p += hostarch.PageSize {
+			i := uint64(p-blockAR.Start) / hostarch.PageSize
+			off := pma.off + uint64(p-seg.Start())
+			if present == 0 {
+				firstOff = off - i*hostarch.PageSize
+				alreadyAligned = off >= i*hostarch.PageSize && firstOff%hostBlockSize == 0
+			} else if off != firstOff+i*hostarch.PageSize {
+				alreadyAligned = false
+			}
+			present |= 1 << i
 		}
-		if _, err := seg.getInternalMappingsLocked(seg.Range()); err != nil {
+		if _, err := seg.getInternalMappingsLocked(sub); err != nil {
 			return nil, false
 		}
-		if seg.End() >= blockAR.End {
-			cur = blockAR.End
-			break
-		}
-		cur = seg.End()
 	}
-	if alreadyAligned {
+	const allPages = 1<<(hostBlockSize/hostarch.PageSize) - 1
+	if present == 0 {
+		return nil, false
+	}
+	spare := allPages &^ present
+	if spare != 0 {
+		// A spare page must not hide a page that the guest can map later
+		// without a new virtual memory area or an mprotect. So a page without
+		// a PMA must have no area, or an area without access, such as the
+		// guard page of musl malloc. ReleaseHostBlocks covers both changes.
+		if !canOwn {
+			return nil, false
+		}
+		for i := uint64(0); i < hostBlockSize/hostarch.PageSize; i++ {
+			if spare&(1<<i) == 0 {
+				continue
+			}
+			if vseg := mm.vmas.FindSegment(blockAR.Start + hostarch.Addr(i*hostarch.PageSize)); vseg.Ok() && vseg.ValuePtr().effectivePerms.Any() {
+				return nil, false
+			}
+		}
+	}
+	if alreadyAligned && spare == 0 {
 		return nil, true
 	}
-	fr, err := mm.mf.Allocate(hostBlockSize, pgalloc.AllocOpts{
+	fr, err := mm.mf.AllocateAligned(hostBlockSize, hostBlockSize, pgalloc.AllocOpts{
 		Kind:    usage.Anonymous,
 		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
 		Mode:    pgalloc.AllocateAndWritePopulate,
@@ -177,15 +202,15 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 	if err != nil {
 		return nil, false
 	}
-	if fr.Start%hostBlockSize != 0 {
-		mm.mf.DecRef(fr)
-		return nil, false
-	}
 	dsts, err := mm.mf.MapInternal(fr, hostarch.Write)
 	if err != nil {
 		mm.mf.DecRef(fr)
 		return nil, false
 	}
+	// Another thread can store into the old pages through the platform
+	// until it unmaps them, so the copy comes after the unmap. A failed copy
+	// leaves the old pages, and the next fault maps them again.
+	mm.unmapASLocked(blockAR)
 	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
 		subAR := seg.Range().Intersect(blockAR)
 		srcs, err := mm.internalMappingsLocked(seg, subAR)
@@ -199,7 +224,9 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 			return nil, false
 		}
 	}
-	mm.unmapASLocked(blockAR)
+	if spare != 0 {
+		owner.AdoptHostBlock(blockAR.Start, mm.mf, fr, spare)
+	}
 	var oldFRs []memmap.FileRange
 	for seg := mm.pmas.LowerBoundSegment(blockAR.Start); seg.Ok() && seg.Start() < blockAR.End; seg = seg.NextSegment() {
 		seg = mm.pmas.Isolate(seg, blockAR)

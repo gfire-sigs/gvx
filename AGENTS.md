@@ -136,6 +136,7 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_E2E_OFFLINE=1` | Skips the tests that pull from a registry. |
 | `GVX_E2E_REQUIRE_NETWORK=1` | Fails, and does not skip, when the registry is unreachable. |
 | `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. The value `2` also prints debug lines, such as each fault that the Sentry cannot resolve. |
+| `GVX_SYSTRAP_SUBBLOCKS=1` | Runs the sub-block layer of the Linux `systrap` engine on a host with 4 KB pages. The layer maps 4 KB guest pages on a host with 16 KB pages, such as an Android device. |
 | `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop and the state of each stub. The value `3` prints only the state, the count of each kind of stop, and the count of `amd64` `syscall` sites by patch outcome. The value `4` also samples the program counter and prints the hottest addresses. |
 
 ### 5.2 Release Version Rule (Reference Module)

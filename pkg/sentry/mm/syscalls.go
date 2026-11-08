@@ -301,6 +301,8 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 	// Determine the stack's desired location. Unlike Linux, address
 	// randomization can't be disabled.
 	stackEnd := mm.layout.MaxAddr - hostarch.Addr(rand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+	stackEnd, sz = mm.alignStackToHostBlock(stackEnd, sz)
+	szaddr = hostarch.Addr(sz)
 	if stackEnd < szaddr {
 		return hostarch.AddrRange{}, linuxerr.ENOMEM
 	}
@@ -631,6 +633,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 			vma.id.IncRef()
 		}
 		vseg := mm.vmas.Insert(mm.vmas.FindGap(newAR.Start), newAR, vma)
+		mm.releaseHostBlocksLocked(newAR)
 		mm.usageAS += uint64(newAR.Length())
 		if vma.isPrivateDataLocked() {
 			mm.dataAS += uint64(newAR.Length())
@@ -660,6 +663,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	vma := vseg.ValuePtr().copy()
 	mm.vmas.Remove(vseg)
 	vseg = mm.vmas.Insert(mm.vmas.FindGap(newAR.Start), newAR, vma)
+	mm.releaseHostBlocksLocked(newAR)
 	mm.usageAS = mm.usageAS - uint64(oldAR.Length()) + uint64(newAR.Length())
 	if vma.isPrivateDataLocked() {
 		mm.dataAS = mm.dataAS - uint64(oldAR.Length()) + uint64(newAR.Length())
@@ -747,6 +751,9 @@ func (mm *MemoryManager) MProtect(addr hostarch.Addr, length uint64, realPerms h
 		mm.pmas.MergeInsideRange(ar)
 		mm.pmas.MergeOutsideRange(ar)
 	}()
+	if effectivePerms.Any() {
+		mm.releaseHostBlocksActiveLocked(ar)
+	}
 	pseg := mm.pmas.LowerBoundSegment(ar.Start)
 	var didUnmapAS bool
 	for {

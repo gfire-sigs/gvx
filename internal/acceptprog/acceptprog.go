@@ -69,6 +69,7 @@ const (
 	regProbePackage    = "z.gfire.dev/gvx/internal/acceptprog/regprobe"
 	sigFramePackage    = "z.gfire.dev/gvx/internal/acceptprog/sigframeprobe"
 	forkProbePackage   = "z.gfire.dev/gvx/internal/acceptprog/forkprobe"
+	spareProbePackage  = "z.gfire.dev/gvx/internal/acceptprog/spareprobe"
 	herdrReleaseURL    = "https://github.com/herdrdev/herdr/releases/download/v0.9.5/"
 )
 
@@ -375,6 +376,15 @@ func BuildSigFrameProbe(tb testing.TB, goarch string) string {
 func BuildForkProbe(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, forkProbePackage, "forkprobe", goarch, 0)
+}
+
+// BuildSpareProbe compiles the guest spareprobe for the Linux architecture
+// goarch and returns the path of the static ET_EXEC executable. The guest
+// verifies that it and the kernel see the same bytes in pages of a 16 KB block
+// that holds pages of another mapping.
+func BuildSpareProbe(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, spareProbePackage, "spareprobe", goarch, 0)
 }
 
 // BuildParityProbe compiles the guest parityprobe, which checks the kernel

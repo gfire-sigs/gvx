@@ -303,6 +303,10 @@ seam pkg/sentry/platform/systrap/stub_unsafe.go
 # Content seam: init installs the seccomp listener through installSeccompNotifyIfFree, which falls back to
 # the futex loop on EBUSY when a parent sandbox owns the only listener of the filter chain.
 seam pkg/sentry/platform/systrap/syscall_thread.go
+# Content seams: the regions of the engine start and end on host pages (hostpage_xplat.go), so stubInit,
+# the syscall thread messages, and the sysmsg private stacks work on a host with 16 KB pages (GVXIP-006).
+seam pkg/sentry/platform/systrap/syscall_thread_arm64.go
+seam pkg/sentry/platform/systrap/syscall_thread_unsafe.go
 # Seccomp filter builders of the stub processes: undefined: unix.SYS_CLONE and unix.PR_SET_PDEATHSIG on darwin.
 linux-only pkg/sentry/platform/kvm/mmapfilter/
 linux-only pkg/sentry/platform/ptrace/stubfilter/

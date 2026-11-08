@@ -39,6 +39,9 @@ func overlapsHole(ar hostarch.AddrRange, holes []hostarch.AddrRange) bool {
 // isHostBlockPlatform reports whether the platform maps guest memory in 16KB
 // host blocks. holes are the address holes of the platform.
 func (mm *MemoryManager) isHostBlockPlatform(holes []hostarch.AddrRange) bool {
+	if hbp, ok := mm.p.(platform.HostBlockPlatform); ok && hbp.HostBlockSize() != 0 {
+		return true
+	}
 	if mm.layout.MinAddr >= 0x4_0000_0000 {
 		return true
 	}
@@ -144,4 +147,43 @@ func (mm *MemoryManager) findHighestAlignedLocked(length, alignment uint64, boun
 		}
 	}
 	return mm.findHighestAvailableLocked(length, alignment, bounds)
+}
+
+// releaseHostBlocksLocked tells an address space with spare pages that a new
+// virtual memory area covers ar (platform.HostBlockOwner). A spare page in the
+// host block of ar must not hide the new pages from the memory manager.
+//
+// +checklocks:mm.mappingMu
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) releaseHostBlocksLocked(ar hostarch.AddrRange) {
+	if hbp, ok := mm.p.(platform.HostBlockPlatform); !ok || hbp.HostBlockSize() == 0 {
+		return
+	}
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+	mm.releaseHostBlocksActiveLocked(ar)
+}
+
+// releaseHostBlocksActiveLocked is releaseHostBlocksLocked for a caller that
+// holds activeMu. mprotect calls it when an area without access gains access.
+//
+// +checklocks:mm.activeMu
+func (mm *MemoryManager) releaseHostBlocksActiveLocked(ar hostarch.AddrRange) {
+	if owner, ok := mm.as.(platform.HostBlockOwner); ok {
+		owner.ReleaseHostBlocks(ar)
+	}
+}
+
+// alignStackToHostBlock moves the end of the stack down to a host block. It
+// grows the size of the stack to a whole number of host blocks. The top of the
+// stack is then in a block that holds no other mapping. The platform therefore
+// maps the pages that the stack uses without a composite page. It returns the
+// arguments unchanged on a platform that does not report a host block size.
+func (mm *MemoryManager) alignStackToHostBlock(end hostarch.Addr, size uint64) (hostarch.Addr, uint64) {
+	hbp, ok := mm.p.(platform.HostBlockPlatform)
+	if !ok || hbp.HostBlockSize() == 0 {
+		return end, size
+	}
+	mask := hbp.HostBlockSize() - 1
+	return end &^ hostarch.Addr(mask), (size + mask) &^ mask
 }

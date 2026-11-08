@@ -136,7 +136,7 @@ func (s *subprocess) freeSyscallThread() {
 		}
 	}
 	if t.sentryAddr != 0 {
-		unmapFromSentry(t.sentryAddr, syscallThreadMessageSize)
+		unmapFromSentry(t.sentryAddr, syscallThreadMessageLen)
 		t.sentryAddr = 0
 	}
 	s.memoryFile.DecRef(t.stackRange)
