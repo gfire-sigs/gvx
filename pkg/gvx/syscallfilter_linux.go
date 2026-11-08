@@ -48,22 +48,36 @@ func (s *Sandbox) syscallFilter() func() error {
 		}
 		rules, denyRules := config.Rules(opt)
 		rules.Merge(embedderRules(s.cfg, s.usesHostDirs(), len(s.volumes) > 0))
+		if cgoBuild {
+			// The cgo rules of runsc allow clone3 for any flags, because runsc
+			// cannot return ENOSYS. Seccomp cannot read the flags of clone3,
+			// so a cgo build answers it with ENOSYS. The C library then falls
+			// back to clone with the thread flags that embedderRules allows.
+			rules.Remove(unix.SYS_CLONE3)
+		}
+		sets := []seccomp.RuleSet{
+			{Rules: denyRules},
+			{Rules: rules, Action: seccomp.Allow},
+		}
+		if cgoBuild {
+			sets = append(sets, seccomp.RuleSet{
+				Rules:  seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{unix.SYS_CLONE3: seccomp.MatchAll{}}),
+				Action: seccomp.ReturnError.Code(uint16(unix.ENOSYS)),
+			})
+		}
+		// The calls that hostlockdown probes, and the calls that code in the
+		// embedding process may try, return EPERM. The Sentry kills the
+		// process for them, but a Go program that embeds gvx expects an error
+		// from os/exec or os.Open.
+		sets = append(sets, seccomp.RuleSet{Rules: rejectedRules(), Action: seccomp.ReturnError.Code(uint16(unix.EPERM))})
 
 		seccompOpts := config.SeccompOptions(opt)
 		if seccompLogOnly {
 			seccompOpts.DefaultAction = seccomp.Log
 		}
 		program := &seccomp.Program{
-			RuleSets: []seccomp.RuleSet{
-				{Rules: denyRules},
-				{Rules: rules, Action: seccomp.Allow},
-				// The calls that hostlockdown probes, and the calls that code
-				// in the embedding process may try, return EPERM. The Sentry
-				// kills the process for them, but a Go program that embeds gvx
-				// expects an error from os/exec or os.Open.
-				{Rules: rejectedRules(), Action: seccomp.ReturnError.Code(uint16(unix.EPERM))},
-			},
-			Options: seccompOpts,
+			RuleSets: sets,
+			Options:  seccompOpts,
 		}
 		return program.Install(nil)
 	}
@@ -114,9 +128,10 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 	// GOMAXPROCS. The call reads one mask and has no side effect.
 	rules.Add(unix.SYS_SCHED_GETAFFINITY, seccomp.MatchAll{})
 	if cgoBuild {
-		// Bionic pthread_create calls clone with these flags. The cgo rules
-		// of runsc allow the flags of musl, which add CLONE_DETACHED. The
-		// flags create a thread only.
+		// Bionic pthread_create calls clone with these flags, and so does
+		// glibc after clone3 fails with ENOSYS. The cgo rules of runsc allow
+		// the flags of musl, which add CLONE_DETACHED. The flags create a
+		// thread only.
 		rules.Add(unix.SYS_CLONE, seccomp.PerArg{
 			seccomp.EqualTo(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES |
 				unix.CLONE_SIGHAND | unix.CLONE_THREAD | unix.CLONE_SYSVSEM |
@@ -128,15 +143,13 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.EqualTo(unix.PR_PAC_RESET_KEYS),
 			seccomp.EqualTo(unix.PR_PAC_APIAKEY),
 		})
-		// Bionic waits and wakes with the bitset forms of private futexes.
-		// The forms act on the futex word of the caller only.
-		for _, op := range []uintptr{linux.FUTEX_WAIT_BITSET, linux.FUTEX_WAKE_BITSET} {
-			for _, flags := range []uintptr{linux.FUTEX_PRIVATE_FLAG, linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_CLOCK_REALTIME} {
-				rules.Add(unix.SYS_FUTEX, seccomp.PerArg{
-					seccomp.AnyValue{},
-					seccomp.EqualTo(op | flags),
-				})
-			}
+		// The C library waits with the bitset form of private futexes. The
+		// form acts on the futex word of the caller only.
+		for _, flags := range []uintptr{linux.FUTEX_PRIVATE_FLAG, linux.FUTEX_PRIVATE_FLAG | linux.FUTEX_CLOCK_REALTIME} {
+			rules.Add(unix.SYS_FUTEX, seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(linux.FUTEX_WAIT_BITSET | flags),
+			})
 		}
 	}
 	if hostDirs {

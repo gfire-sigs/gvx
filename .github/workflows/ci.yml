@@ -168,6 +168,17 @@ jobs:
           ./rungv run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
+      # A cgo build adds the thread start of the C library to the filter.
+      - name: Run smoke guest with lockdown in a cgo build
+        env:
+          CGO_ENABLED: "1"
+          GVX_DEBUG_LOG: "1"
+        run: |
+          go build -o rungv-cgo ./cmd/rungv
+          mkdir -p workspace-cgo
+          ./rungv-cgo run -platform=auto -net=none -workspace=workspace-cgo -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          cat smoke.out
+          grep -q gvx-smoke-ok smoke.out
       - name: Run smoke guest with lockdown
         env:
           GVX_DEBUG_LOG: "1"

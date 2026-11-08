@@ -27,13 +27,27 @@ package rseqarea
 extern const ptrdiff_t __rseq_offset __attribute__((weak));
 extern const unsigned int __rseq_size __attribute__((weak));
 
+// gvx_thread_pointer reads the thread pointer. GCC before 11 has no
+// __builtin_thread_pointer on x86, so the function reads the register.
+static void *gvx_thread_pointer(void) {
+	void *tp;
+#if defined(__x86_64__)
+	__asm__("mov %%fs:0, %0" : "=r"(tp));
+#elif defined(__aarch64__)
+	__asm__("mrs %0, tpidr_el0" : "=r"(tp));
+#else
+	tp = __builtin_thread_pointer();
+#endif
+	return tp;
+}
+
 static void gvx_rseq_area(void **area, unsigned int *size) {
 	*area = NULL;
 	*size = 0;
 	if (&__rseq_size == NULL || &__rseq_offset == NULL || __rseq_size == 0) {
 		return;
 	}
-	*area = (char *)__builtin_thread_pointer() + __rseq_offset;
+	*area = (char *)gvx_thread_pointer() + __rseq_offset;
 	*size = __rseq_size;
 }
 */
