@@ -7,6 +7,7 @@ This file records the observable changes of each `gvx` release. The release work
 ### Bug Fixes
 
 - **`SIGBUS` and `EFAULT` on mapped files of a volume or a bind mount on Linux and Windows**: a compiler that ran from an `ext4lite` volume sometimes died with `SIGBUS`, and a `write` from a mapped file sometimes failed with `EFAULT`. A Chromium build on a Linux `systrap` host hit both. The cache of mapped files keeps each 64 KiB chunk in the kernel memory file, which the Sentry maps in slices of 1 GiB. When the lowest free range crossed the end of a slice, the chunk mapped to two blocks, and the cache refused it. Every process that loaded a chunk then failed until another allocation filled that range. The cache now skips such a range and allocates again. `TestTranslateAcrossAMemoryFileMappingBoundary` places the free range across the end of a slice.
+- **`ENOSPC` while a guest unpacks a large tree into a bind mount**: `tar -xJf` of the Chromium source tarball, about 500,000 files, into a `hostfs` bind mount failed with `No space left on device` after about 300,000 entries. Every file and directory that the guest creates gets a `.gvx_meta` record, and the table of one workspace had a cap of 128 MiB of estimated memory. The cap is now 512 MiB, about 1,100,000 plain records. A guest that creates 400,000 files with Chromium-length paths got `ENOSPC` at file 280,000 before this release. A create beyond the new cap still fails with `ENOSPC`.
 
 ## [v0.10.10022026110200] - 2026-11-07
 
