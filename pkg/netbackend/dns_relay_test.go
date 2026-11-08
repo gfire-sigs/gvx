@@ -82,28 +82,44 @@ type fakeDNSServer struct {
 
 type dnsHandler func(req []byte, viaTCP bool) []byte
 
+// listenUDPAndTCP opens a UDP and a TCP socket on one loopback port. Windows
+// excludes different port ranges for UDP and TCP, and a hosted runner excludes
+// large parts of the ephemeral range. So the attempts alternate: the first
+// socket of an attempt takes a port that the OS allows for its protocol, and
+// the second socket binds to that port.
+func listenUDPAndTCP() (net.PacketConn, net.Listener, error) {
+	var err error
+	for i := range 100 {
+		if i%2 == 0 {
+			var ln net.Listener
+			if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+				return nil, nil, err
+			}
+			var pc net.PacketConn
+			if pc, err = net.ListenPacket("udp", ln.Addr().String()); err == nil {
+				return pc, ln, nil
+			}
+			_ = ln.Close()
+			continue
+		}
+		var pc net.PacketConn
+		if pc, err = net.ListenPacket("udp", "127.0.0.1:0"); err != nil {
+			return nil, nil, err
+		}
+		var ln net.Listener
+		if ln, err = net.Listen("tcp", pc.LocalAddr().String()); err == nil {
+			return pc, ln, nil
+		}
+		_ = pc.Close()
+	}
+	return nil, nil, err
+}
+
 // startFakeDNSServer listens on UDP and TCP at one loopback port. A handler
 // result of nil sends no answer.
 func startFakeDNSServer(t *testing.T, handler dnsHandler) *fakeDNSServer {
 	t.Helper()
-	var (
-		pc  net.PacketConn
-		ln  net.Listener
-		err error
-	)
-	// The UDP and TCP sockets must share a port. Listen on TCP first so the OS
-	// skips any Windows TCP excluded port ranges, then bind UDP to that port.
-	for range 50 {
-		ln, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		pc, err = net.ListenPacket("udp", ln.Addr().String())
-		if err == nil {
-			break
-		}
-		_ = ln.Close()
-	}
+	pc, ln, err := listenUDPAndTCP()
 	if err != nil {
 		t.Fatalf("no port is free for both UDP and TCP: %v", err)
 	}
