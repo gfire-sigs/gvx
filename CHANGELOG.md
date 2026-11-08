@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Features
 
+- **Early error for a host that denies executable memory**: the Linux `systrap` engine maps guest code from the memory file of the kernel with `PROT_EXEC`. On Linux and Android, `gvx.New` now maps one page of that file with `PROT_EXEC` before the first guest starts. A host whose seccomp or SELinux rules deny it gets an error that names the cause, not a guest crash. `vm.memfd_noexec` does not deny such a mapping: it controls only `execve` of a memfd, and the smoke guest passes with each of its values.
 - **`--host-dns`**: `rungv run`, `rungv pull`, and `rungv save` take `--host-dns IP[:PORT]`, and `gvx.Config` has the field `HostDNSServers`. A host without `/etc/resolv.conf`, such as an Android app, could not resolve a registry name. `rungv run` failed with `lookup registry-1.docker.io on [::1]:53: connection refused`. The DNS relay of the guest answered `SERVFAIL`. The servers now replace the discovery of the host resolver for the relay in `-net=nat` and `-net=wg` modes. They do the same for the registry requests of an image pull. The registry client uses its own resolver, so no process-wide resolver changes. An embedder with its own layer cache calls `oci.LayerCache.SetDNSServers`. `docs/cli.md` section 5.2 states the rules.
 
 ### Changes

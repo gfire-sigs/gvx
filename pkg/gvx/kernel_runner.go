@@ -902,6 +902,9 @@ func createKernelMemoryFile() (*pgalloc.MemoryFile, error) {
 		return nil, fmt.Errorf("gvx: create memory backing file: %w", err)
 	}
 	memFile := os.NewFile(uintptr(memFD), memFileName)
+	if err := memutil.VerifyExecMapping(memFD); err != nil {
+		return nil, errors.Join(fmt.Errorf("gvx: %w", err), memFile.Close())
+	}
 	// A sandbox counts its own memory. The global usage.MemoryAccounting sums
 	// every kernel of the process, and the memory cgroup IDs of two kernels
 	// overlap.
