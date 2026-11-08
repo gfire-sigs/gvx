@@ -90,9 +90,52 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The Android archive holds the library gvx-android.aar, which packs rungv as
+  # librungv.so, and the sample app (GVXIP-006). The sample app has a debug
+  # signature from this run.
+  android:
+    name: build android/arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install the Android build tools
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.1.0" "platforms;android-36" > /dev/null
+      # The hosted runner has JDK 17 at JAVA_HOME_17_X64.
+      - name: Build the Android archive
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          name="rungv-${GITHUB_REF_NAME}-android-arm64"
+          [ "$GITHUB_REF_TYPE" = tag ] || name="rungv-dryrun-android-arm64"
+          scripts/android/build-sdk.sh "dist/$name"
+          unzip -p "dist/$name/gvx-android.aar" jni/arm64-v8a/librungv.so > librungv.so
+          version=$(go version -m librungv.so | awk '$1 == "mod" { print $3 }')
+          rm librungv.so
+          echo "module version: $version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "module version $version differs from tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          cp LICENSE README.md cmd/rungv/licenses/THIRD_PARTY_LICENSES.txt "dist/$name/"
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          rm -r "$name"
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: publish
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
