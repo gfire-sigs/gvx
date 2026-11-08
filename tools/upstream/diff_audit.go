@@ -129,6 +129,7 @@ var tier1Prefixes = []string{
 	"tools/shiminterop/",
 	"tools/licenses/",
 	"tools/gvisorlint/",
+	"tools/androidprobe/",
 	"docs/",
 	"internal/",
 }
