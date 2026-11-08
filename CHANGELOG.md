@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Features
+
+- **`--host-dns`**: `rungv run`, `rungv pull`, and `rungv save` take `--host-dns IP[:PORT]`, and `gvx.Config` has the field `HostDNSServers`. A host without `/etc/resolv.conf`, such as an Android app, could not resolve a registry name. `rungv run` failed with `lookup registry-1.docker.io on [::1]:53: connection refused`. The DNS relay of the guest answered `SERVFAIL`. The servers now replace the discovery of the host resolver for the relay in `-net=nat` and `-net=wg` modes. They do the same for the registry requests of an image pull. The registry client uses its own resolver, so no process-wide resolver changes. An embedder with its own layer cache calls `oci.LayerCache.SetDNSServers`. `docs/cli.md` section 5.2 states the rules.
+
 ## [v0.10.10032026110200] - 2026-11-08
 
 This release fixes two failures of a Chromium build in `rungv`. Compilers on an `ext4lite` volume no longer die with `SIGBUS` or fail a `write` with `EFAULT`. A guest can unpack about 1,000,000 files into a `hostfs` bind mount.

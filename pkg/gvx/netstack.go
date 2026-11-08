@@ -54,6 +54,7 @@ func (s *Sandbox) initNetstack() error {
 	case NetModeNAT:
 		st, fwd, err := netbackend.NewNATStack(netbackend.NATConfig{
 			IsolateLAN:        s.cfg.IsolateLAN,
+			DNSServers:        s.cfg.HostDNSServers,
 			StreamInterceptor: s.cfg.StreamInterceptor,
 			Stack:             s.stackOptions(),
 			Tuning:            s.cfg.Tuning,
@@ -129,6 +130,9 @@ func (s *Sandbox) initNetstack() error {
 			return fmt.Errorf("%w: network mode %q with host lockdown needs a peer Endpoint to pin the outbound UDP port; set the Endpoint or DisableHostLockdown", ErrInvalidConfig, NetModeWireGuard)
 		}
 		wgConfig := *wgCfg
+		if len(s.cfg.HostDNSServers) > 0 {
+			wgConfig.HostDNSServers = s.cfg.HostDNSServers
+		}
 		wgConfig.Stack = s.stackOptions()
 		wgConfig.Tuning = s.cfg.Tuning
 		wgEP, err := netbackend.NewWireGuardEndpoint(wgConfig)

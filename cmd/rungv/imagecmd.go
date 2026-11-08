@@ -41,6 +41,33 @@ func addImageCacheFlags(fs *flag.FlagSet) imageCacheFlags {
 	}
 }
 
+// hostDNSUsage is the help text of --host-dns on every command that contacts a
+// registry.
+const hostDNSUsage = "DNS server of the host as IP or IP:PORT, repeatable; it replaces the discovery of the host resolver (for an Android app)"
+
+// addHostDNSFlag registers the repeatable --host-dns flag.
+func addHostDNSFlag(fs *flag.FlagSet) *multiStringFlag {
+	var servers multiStringFlag
+	fs.Var(&servers, "host-dns", hostDNSUsage)
+	return &servers
+}
+
+// openPullCache opens the layer cache that the flags name for a command that
+// pulls. The registry requests of the cache resolve names through hostDNS
+// when it is not empty.
+func (f imageCacheFlags) openPullCache(hostDNS []string) (*oci.LayerCache, string, error) {
+	servers, err := gvx.ParseHostDNSServers(hostDNS)
+	if err != nil {
+		return nil, "", fmt.Errorf("--host-dns: %w", err)
+	}
+	cache, arch, err := f.open()
+	if err != nil {
+		return nil, "", err
+	}
+	cache.SetDNSServers(servers)
+	return cache, arch, nil
+}
+
 // open opens the layer cache that the flags name and returns it with the
 // architecture.
 func (f imageCacheFlags) open() (*oci.LayerCache, string, error) {

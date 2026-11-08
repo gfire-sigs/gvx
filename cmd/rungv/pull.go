@@ -42,6 +42,7 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs := newImageFlagSet("pull", stderr)
 	cacheFlags := addImageCacheFlags(fs)
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL that replaces the registry of the reference")
+	hostDNS := addHostDNSFlag(fs)
 
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
@@ -54,7 +55,7 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	target := remaining[0]
 	registryURL := strings.TrimSpace(*registryURLFlag)
 
-	cache, arch, err := cacheFlags.open()
+	cache, arch, err := cacheFlags.openPullCache(*hostDNS)
 	if err != nil {
 		return imageFail(stderr, "pull", err)
 	}

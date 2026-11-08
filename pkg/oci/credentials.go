@@ -553,7 +553,7 @@ func Login(ctx context.Context, store CredentialStore, client *http.Client, serv
 	if err != nil {
 		return err
 	}
-	rc, err := newRegistryClient(client, baseURL, "", DefaultLimits())
+	rc, err := newRegistryClient(client, baseURL, "", DefaultLimits(), nil)
 	if err != nil {
 		return err
 	}

@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -539,5 +540,74 @@ func TestNATDNSRelayEndToEndThroughGuestSockets(t *testing.T) {
 	}
 	if got := answerIPs(t, resp); len(got) != 1 || got[0] != netip.MustParseAddr("198.51.100.42") {
 		t.Fatalf("TCP answer = %v", got)
+	}
+}
+
+func TestWireGuardDNSRelayForwardsToHostDNSServers(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.43"))
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	w, err := NewWireGuardEndpoint(WireGuardConfig{
+		PrivateKey:     guestKey.private,
+		PeerPublicKey:  peerKey.public,
+		HostDNSServers: []string{srv.addr},
+	})
+	if err != nil {
+		t.Fatalf("NewWireGuardEndpoint: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	s, err := w.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	dns := tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}), Port: 53}
+	u, err := gonet.DialUDP(s, nil, &dns, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	if _, err := u.Write(buildDNSQuery(0x4242, "service.example.test", dnsTypeA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 512)
+	n, err := u.Read(buf)
+	if err != nil {
+		t.Fatalf("UDP DNS read: %v", err)
+	}
+	if got := answerIPs(t, buf[:n]); len(got) != 1 || got[0] != netip.MustParseAddr("198.51.100.43") {
+		t.Fatalf("answer = %v, want [198.51.100.43] from the host DNS server %s", got, srv.addr)
+	}
+}
+
+func TestWireGuardRejectsAnInvalidHostDNSServer(t *testing.T) {
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	_, err := NewWireGuardEndpoint(WireGuardConfig{
+		PrivateKey:     guestKey.private,
+		PeerPublicKey:  peerKey.public,
+		HostDNSServers: []string{"dns.example.test"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "host DNS servers") {
+		t.Fatalf("NewWireGuardEndpoint with a host name as DNS server = %v, want a host DNS servers error", err)
+	}
+}
+
+func TestParseDNSServersAcceptsBareIPsAndRejectsNames(t *testing.T) {
+	got, err := ParseDNSServers([]string{" 10.0.2.3 ", "", "[2001:db8::1]:5353", "::1"})
+	if err != nil {
+		t.Fatalf("ParseDNSServers: %v", err)
+	}
+	want := []netip.AddrPort{
+		netip.MustParseAddrPort("10.0.2.3:53"),
+		netip.MustParseAddrPort("[2001:db8::1]:5353"),
+		netip.MustParseAddrPort("[::1]:53"),
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ParseDNSServers = %v, want %v", got, want)
+	}
+	if _, err := ParseDNSServers([]string{"dns.example.test"}); err == nil {
+		t.Error("ParseDNSServers accepted a host name")
 	}
 }

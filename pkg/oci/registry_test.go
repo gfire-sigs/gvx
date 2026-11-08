@@ -714,7 +714,7 @@ func TestRegistryClientFailsWhenTheBodyStalls(t *testing.T) {
 		return true
 	}
 	t.Cleanup(func() { close(release) })
-	rc, err := newRegistryClient(nil, reg.srv.URL, testRepo, DefaultLimits())
+	rc, err := newRegistryClient(nil, reg.srv.URL, testRepo, DefaultLimits(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

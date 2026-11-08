@@ -448,7 +448,7 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		}
 	}
 
-	rc, err := newRegistryClient(client, baseURL, repository, cache.limits)
+	rc, err := newRegistryClient(client, baseURL, repository, cache.limits, cache.dnsServers)
 	if err != nil {
 		return nil, err
 	}
