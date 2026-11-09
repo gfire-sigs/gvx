@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux && !cgo
+//go:build linux
 
-package systraptest
+package systrap
 
-// cgoBuild is false when the build has no C runtime, which the upstream systrap
-// platform needs.
-const cgoBuild = false
+// rseqSig is the RSEQ_SIG value that the C library uses on arm64. The kernel
+// unregisters an area only with the signature of its registration.
+const rseqSig = 0xd428bc00

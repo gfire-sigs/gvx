@@ -33,10 +33,6 @@ const linuxSystrapName = "systrap"
 // that the host kernel isolates. New calls it before the host lockdown,
 // because the platform forks its first stub process during construction.
 func openSystrap() (platform.Platform, string, error) {
-	if cgoBuild {
-		return nil, "", fmt.Errorf("%w: the %s backend needs a build with CGO_ENABLED=0, because the upstream platform hangs while it starts in a cgo build",
-			ErrPlatformUnavailable, linuxSystrapName)
-	}
 	p, err := systrap.New(platform.Options{})
 	if err != nil {
 		return nil, "", fmt.Errorf("gvx: %s backend: %w", linuxSystrapName, err)

@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Linux `systrap` in a cgo build**: the engine did not start in a build with cgo, and `gvx.New` refused such a build with `ErrPlatformUnavailable`. The C library registers an rseq area for each thread, and the first stub inherited that of the Sentry thread that forked it. The stub unmapped that memory, so the kernel sent it `SIGSEGV` on each return to user mode, and the engine waited forever. The forking thread now unregisters its area for the fork and registers it again after the fork. `gvx.New` accepts a cgo build, and the Linux race tests now start the engine. Release archives still build without cgo.
+
 ## [v0.11.10002026110200] - 2026-11-09
 
 This release adds Android hosts. `rungv` runs inside an Android app on `arm64` devices with 4 KB or 16 KB pages, and the release publishes an Android library with a sample app. The Linux `systrap` engine keeps fewer idle stubs, and a caller can name the DNS servers of the host.

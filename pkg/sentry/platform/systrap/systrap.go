@@ -369,7 +369,7 @@ func New(opts platform.Options) (*Systrap, error) {
 		// Create the source process for the global pool. This must be
 		// done before initializing any other processes.
 		usesSeccompNotify := false
-		source, err := newSubprocess(createStub, mf, usesSeccompNotify, disableSyscallPatching)
+		source, err := newSubprocess(createStubWithoutRseq, mf, usesSeccompNotify, disableSyscallPatching)
 		if err != nil {
 			stubErr = fmt.Errorf("initialize systrap: %w", err)
 			return

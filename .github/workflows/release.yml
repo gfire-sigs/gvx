@@ -40,7 +40,7 @@ jobs:
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
-      # The upstream systrap platform hangs while it starts in a cgo build.
+      # A binary without cgo needs no C library on the host.
       CGO_ENABLED: "0"
     steps:
       - name: Checkout repository

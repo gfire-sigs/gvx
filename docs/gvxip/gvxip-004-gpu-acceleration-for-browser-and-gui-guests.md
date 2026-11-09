@@ -88,7 +88,7 @@ The design must satisfy the rules of [`AGENTS.md`](../../AGENTS.md) and of the b
 | :--- | :--- | :--- |
 | No new host process after the lockdown | `hostlockdown.Apply` (Job object with one process on Windows, Seatbelt `deny process-fork` on macOS) | The renderer is a separate process that starts before the lockdown, like the `systrap` stub host. |
 | No win32k call after the lockdown | `AGENTS.md`, section 3.2 | Direct3D runs in the renderer process, never in the Sentry. |
-| Pure Go build | `release.yml` sets `CGO_ENABLED=0`; the upstream `systrap` platform hangs in a cgo build | `virglrenderer` and ANGLE live in the renderer binary. The Sentry talks to it through IPC. |
+| Pure Go build | `release.yml` sets `CGO_ENABLED=0`, so the binary needs no C library on the host | `virglrenderer` and ANGLE live in the renderer binary. The Sentry talks to it through IPC. |
 | Sockets of `hostfs` live in Sentry memory | `docs/architecture.md`, "Special Files and Extended Attributes"; `pkg/sentry/fsimpl/hostfs/host.go` (`hostKindOther`) | A guest cannot connect to a host Unix socket through a bind mount. A display bridge needs a new socket bridge or TCP. |
 | Guest memory differs on each backend | `hvf` (`hv_vm_map`, 16 KiB blocks), `whpx` (`WHvMapGpaRange`), Windows `systrap` (section views), Linux `systrap` (memory file) | A shared buffer of the renderer needs a new `memmap.File` for each backend. |
 | Hosted CI runners have no GPU | GitHub-hosted runners | CI runs function tests on WARP for Windows only. The hosted macOS runner cannot run `hvf` (`docs/architecture.md`, section 4.2), so macOS tests run by hand on an Apple Silicon host. CI cannot detect a performance regression. |

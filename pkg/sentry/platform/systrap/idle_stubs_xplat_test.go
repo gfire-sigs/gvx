@@ -52,9 +52,6 @@ const mapAddr = hostarch.Addr(1 << 28)
 
 func requirePlatform(t *testing.T) *Systrap {
 	t.Helper()
-	if cgoBuild {
-		t.Skip("the upstream systrap platform hangs while it starts in a cgo build (race builds use cgo)")
-	}
 	p, err := sharedPlatform()
 	if err != nil {
 		t.Skipf("systrap engine unavailable: %v", err)
