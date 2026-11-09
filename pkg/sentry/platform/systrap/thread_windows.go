@@ -19,6 +19,7 @@ package systrap
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -254,6 +255,7 @@ func (th *thread) destroy() {
 		return
 	}
 	delete(sp.threads, th.tid)
+	sp.freeThreads = slices.DeleteFunc(sp.freeThreads, func(o *thread) bool { return o == th })
 	sp.mu.Unlock()
 	th.abortStoreStep()
 	th.releaseArch()
@@ -262,6 +264,89 @@ func (th *thread) destroy() {
 	}
 	th.releaseFast()
 	th.closeHandle()
+}
+
+// releaseOrRecycle returns a clean, idle guest thread to sp.freeThreads for
+// reuse, or destroys the thread when the stub is closing or the thread has
+// pending debug state.
+func (th *thread) releaseOrRecycle() {
+	sp := th.sp
+	if sp.dead.Load() {
+		th.destroy()
+		return
+	}
+	th.mu.Lock()
+	f := th.fast.Load()
+	inSpill := f != nil && f.inSpill
+	clean := (th.parked || inSpill) &&
+		!th.stepping &&
+		th.storeStep == nil &&
+		th.evQueued.Load() == 0 &&
+		len(th.events) == 0 &&
+		(!sp.p.fast || f != nil)
+	if !clean {
+		th.mu.Unlock()
+		th.destroy()
+		return
+	}
+	th.lastExecPC, th.execRepeats = 0, 0
+	th.storeFaults = 0
+	th.staleAt, th.staleGen, th.stale = 0, 0, 0
+	th.barrierStops.Store(0)
+	th.clearRestart()
+	th.resetArch()
+	if f != nil {
+		f.slot.sm.sleepHint().Store(1)
+		f.slot.reader.goOffline(0)
+		f.trap = winTrap{}
+		f.resume = 0
+		f.recycled = inSpill
+		f.traps.Store(0)
+		f.colds.Store(0)
+		f.stops.Store(0)
+	}
+	sp.mu.Lock()
+	if sp.closed || sp.dead.Load() || len(sp.freeThreads) >= maxFreeThreads {
+		sp.mu.Unlock()
+		th.mu.Unlock()
+		th.destroy()
+		return
+	}
+	sp.freeThreads = append(sp.freeThreads, th)
+	sp.mu.Unlock()
+	th.mu.Unlock()
+}
+
+// acquireGuestThread returns a recycled guest thread from sp.freeThreads or
+// creates and attaches a new one.
+func (as *addressSpace) acquireGuestThread() (*thread, error) {
+	sp := as.sp
+	sp.mu.Lock()
+	if sp.closed || sp.dead.Load() {
+		sp.mu.Unlock()
+		return nil, sp.deathError()
+	}
+	if n := len(sp.freeThreads); n > 0 {
+		th := sp.freeThreads[n-1]
+		sp.freeThreads[n-1] = nil
+		sp.freeThreads = sp.freeThreads[:n-1]
+		sp.mu.Unlock()
+		return th, nil
+	}
+	sp.mu.Unlock()
+	th, err := sp.newGuestThread()
+	if err != nil {
+		return nil, err
+	}
+	if as.p.fast {
+		// Every thread of a stub that runs patched code needs its slot, because
+		// the spill routine finds the winSysmsg of the thread through the TEB.
+		if err := as.attachFast(th); err != nil {
+			th.destroy()
+			return nil, err
+		}
+	}
+	return th, nil
 }
 
 // start loads the guest registers of ac into the scratch record of a parked

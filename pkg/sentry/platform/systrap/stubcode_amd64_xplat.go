@@ -378,12 +378,15 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	a.movLoad32(x86RAX, base, winOffState)
 	a.emit(0x83, 0xF8, byte(winStateRunHot)) // cmp eax, RunHot
 	a.jcc8(x86CCAE, "run")
+	a.cmpMemImm8(base, winOffSleepHint, 0)
+	a.jcc8(x86CCNE, "sleep")
 	a.emit(0xF3, 0x90) // pause
 	a.rdtsc()
 	a.emit(0x48, 0x39, 0xD8) // cmp rax, rbx
 	a.jcc8(x86CCB, "poll")
 
 	a.label("sleep")
+	a.movStoreImm32(base, winOffSleepHint, 0)
 	a.movStoreImm32(base, winOffStubWaiter, 1)
 	a.emit(0x0F, 0xAE, 0xF0) // mfence
 	a.movLoad32(x86RAX, base, winOffState)

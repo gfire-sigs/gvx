@@ -1208,7 +1208,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 				_ = mf.UpdateUsage(nil)
 				return mf.Accounting().Total()
 			},
-			interval: interval,
+			flushScan:    mf.FlushCommitScan,
+			idleActivity: k.IdleTaskActivityChan,
+			interval:     interval,
 			kill: func() {
 				memoryExceeded.Store(true)
 				_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})

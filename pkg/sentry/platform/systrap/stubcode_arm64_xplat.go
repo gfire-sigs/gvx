@@ -257,6 +257,8 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 		a64cmpW(0, uint32(winStateRunHot)),
 	)
 	a.bCond(a64CondHS, "run")
+	a.emit(hvcommon.LDRW(base, 0, winOffSleepHint))
+	a.cbnzW(0, "sleep")
 	a.emit(
 		a64YIELD,
 		a64MRSCNTVCT|1,
@@ -266,6 +268,7 @@ func buildSpillWith(opts spillOptions) (winSpillCode, error) {
 	// Sleep until the Sentry sets HostEvent.
 	a.label("sleep")
 	a.emit(
+		hvcommon.STRW(base, a64XZR, winOffSleepHint),
 		hvcommon.MOVZW(0, 1),
 		hvcommon.STRW(base, 0, winOffStubWaiter),
 		a64DMBISH,

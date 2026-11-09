@@ -1,0 +1,144 @@
+name: benchmark
+
+# Runs the cross-platform micro-benchmark suite (TestE2EMicroBench) across
+# Linux, Windows, and macOS runners and records the latency and host CPU
+# utilization trend on the bench-results branch.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml", ".github/workflows/pjdfstest.yml"]
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Number of repetitions per benchmark (GVX_E2E_BENCH_REPEAT)"
+        default: "3"
+        type: string
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+  GVX_E2E_OFFLINE: "1"
+
+jobs:
+  bench:
+    name: bench ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+            allow_no_hv: "0"
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            allow_no_hv: "0"
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            allow_no_hv: "0"
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+            allow_no_hv: "1"
+          - os: darwin
+            arch: arm64
+            runner: macos-15
+            allow_no_hv: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run micro-benchmarks
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GVX_E2E_BENCH: "1"
+          GVX_E2E_BENCH_REPEAT: ${{ inputs.repeat || '3' }}
+          GVX_ALLOW_NO_HYPERVISOR: ${{ matrix.allow_no_hv }}
+        run: |
+          set -o pipefail
+          args=(-count=1 -timeout 25m -v -run TestE2EMicroBench)
+          if [ "$RUNNER_OS" = macOS ]; then
+            args+=(-exec "$PWD/scripts/codesign-exec.sh")
+          fi
+          go test "${args[@]}" ./e2e/ | tee "bench-${{ matrix.os }}-${{ matrix.arch }}.log"
+      - name: Upload benchmark log
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}-${{ matrix.arch }}
+          path: bench-${{ matrix.os }}-${{ matrix.arch }}.log
+          if-no-files-found: error
+
+  publish:
+    name: publish results to bench-results
+    needs: bench
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Download benchmark logs
+        uses: actions/download-artifact@v4
+        with:
+          path: bench-artifacts
+          merge-multiple: true
+      - name: Update bench-results branch
+        shell: bash
+        env:
+          BENCH_COMMIT: ${{ github.sha }}
+          BENCH_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch origin bench-results:bench-results 2>/dev/null || true
+          if git show-ref --verify --quiet refs/heads/bench-results; then
+            git worktree add bench-results-tree bench-results
+          else
+            git worktree add --detach bench-results-tree
+            (
+              cd bench-results-tree
+              git checkout --orphan bench-results
+              git rm -rf . >/dev/null 2>&1 || true
+            )
+          fi
+          go run ./internal/benchreport \
+            -input-dir bench-artifacts \
+            -outdir bench-results-tree \
+            -commit "$BENCH_COMMIT" \
+            -branch "$BENCH_BRANCH"
+          cd bench-results-tree
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.ndjson latest.json README.md
+          if git diff --cached --quiet; then
+            echo "No benchmark changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(bench): record benchmark results for ${BENCH_COMMIT:0:8}"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:refs/heads/bench-results; then
+              break
+            fi
+            git fetch origin bench-results
+            git rebase origin/bench-results
+          done

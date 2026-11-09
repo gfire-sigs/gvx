@@ -37,7 +37,10 @@ type winSysmsg struct {
 	Regs    winRegs
 	Scratch [2]uint64
 	X18     uint64
-	_       [winOffVec - winOffRegs - 36*8]byte
+	// SleepHint is set to 1 by the Sentry when the guest thread enters a
+	// blocking wait so the stub skips the remainder of its spin window.
+	SleepHint uint32
+	_         [winOffVec - winOffSleepHint - 4]byte
 	// Vec holds V0 to V31 of the trapped guest. Fpsr and Fpcr hold the
 	// floating-point status and control registers.
 	Vec  [32 * 16]byte
@@ -47,11 +50,12 @@ type winSysmsg struct {
 
 // Offsets of the registers in the winSysmsg.
 const (
-	winOffX       = winOffRegs
-	winOffSP      = winOffRegs + 31*8
-	winOffNZCV    = winOffSP + 8
-	winOffScratch = winOffNZCV + 8
-	winOffX18     = winOffScratch + 16
+	winOffX         = winOffRegs
+	winOffSP        = winOffRegs + 31*8
+	winOffNZCV      = winOffSP + 8
+	winOffScratch   = winOffNZCV + 8
+	winOffX18       = winOffScratch + 16
+	winOffSleepHint = winOffX18 + 8
 
 	// winOffVec is the offset of V0 to V31, 16 bytes each. A system call of
 	// Windows can clobber the volatile vector registers, so the spill routine
@@ -83,6 +87,7 @@ var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.SP)-31*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.NZCV)-32*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Scratch)-winOffScratch]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.X18)-winOffX18]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.SleepHint)-winOffSleepHint]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Vec)-winOffVec]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Fpsr)-winOffFpsr]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Fpcr)-winOffFpcr]

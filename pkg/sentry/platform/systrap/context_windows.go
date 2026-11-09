@@ -54,28 +54,28 @@ type Context struct {
 	fpInStub bool
 }
 
-// threadIn returns the thread of c in as. It creates the thread on first use
-// and replaces a thread of an earlier address space.
+// releaseThread detaches the thread of c and returns it to the stub pool when
+// clean.
+func (c *Context) releaseThread() {
+	c.fpInStub = false
+	if th := c.th.Swap(nil); th != nil {
+		th.releaseOrRecycle()
+	}
+}
+
+// threadIn returns the thread of c in as. It creates or reuses a thread on
+// first use and replaces a thread of an earlier address space.
 func (c *Context) threadIn(as *addressSpace) (*thread, error) {
 	th := c.th.Load()
 	if th != nil && th.sp == as.sp {
 		return th, nil
 	}
 	if th != nil {
-		c.th.Store(nil)
-		th.destroy()
+		c.releaseThread()
 	}
-	th, err := as.sp.newGuestThread()
+	th, err := as.acquireGuestThread()
 	if err != nil {
 		return nil, err
-	}
-	if as.p.fast {
-		// Every thread of a stub that runs patched code needs its slot, because
-		// the spill routine finds the winSysmsg of the thread through the TEB.
-		if err := as.attachFast(th); err != nil {
-			th.destroy()
-			return nil, err
-		}
 	}
 	c.th.Store(th)
 	c.needRestoreFP = true
@@ -120,29 +120,42 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 	if err != nil {
 		return nil, hostarch.NoAccess, &platform.ContextError{Err: err, Errno: unix.ENOMEM}
 	}
+	c.kicked.Store(false)
 	if !c.interrupt.Enable() {
 		return nil, hostarch.NoAccess, platform.ErrContextInterrupt
 	}
-	defer c.interrupt.Disable()
-	c.kicked.Store(false)
+	defer func() {
+		c.interrupt.Disable()
+		c.kicked.Store(false)
+	}()
 
 	loadFP := c.needRestoreFP
 	c.needRestoreFP = false
 	c.fpInStub = false
 	if err := th.start(ac, loadFP); err != nil {
+		if loadFP {
+			c.needRestoreFP = true
+		}
 		return nil, hostarch.NoAccess, c.runErr(as, err)
 	}
 	for {
 		if c.kicked.Load() {
 			// The thread is parked and ac still holds its state. It will not
 			// run at the address that start chose.
+			if loadFP {
+				c.needRestoreFP = true
+			}
 			th.clearRestart()
 			return nil, hostarch.NoAccess, platform.ErrContextInterrupt
 		}
 		if err := th.run(); err != nil {
+			if loadFP {
+				c.needRestoreFP = true
+			}
 			th.clearRestart()
 			return nil, hostarch.NoAccess, c.runErr(as, err)
 		}
+		loadFP = false
 		// Switch tests the flag after it starts the thread, and a kick tests the
 		// state of the thread after it sets the flag, so one of the two sees the other.
 		if c.kicked.Load() {
@@ -199,7 +212,7 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
-	if f := th.fast.Load(); f != nil {
+	if f := th.fast.Load(); f != nil && (!f.recycled || !th.isFastExit(ev)) {
 		f.stops.Add(1)
 	}
 	if traceEvents {

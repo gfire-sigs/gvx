@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -149,7 +150,45 @@ func benchHostColdStart(t *testing.T, b gateBackend, elfData []byte, reps int) {
 
 // benchNames lists the benchmarks of the guest. Each runs in its own sandbox,
 // so a crash in one of them costs only that number.
-var benchNames = []string{"getpid", "open_close", "pipe_pingpong", "futex_pingpong", "fork_wait", "fork_exec_true"}
+var benchNames = []string{"getpid", "open_close", "pipe_pingpong", "futex_pingpong", "fork_wait", "fork_exec_true", "shm_sparse_idle"}
+
+type benchSample struct {
+	nsPerOp float64
+	userMs  float64
+	sysMs   float64
+	cpuPct  float64
+}
+
+type benchOutputTap struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	hasStart  bool
+	hasEnd    bool
+	startWall time.Time
+	startUser time.Duration
+	startSys  time.Duration
+	endWall   time.Time
+	endUser   time.Duration
+	endSys    time.Duration
+}
+
+func (w *benchOutputTap) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	s := w.buf.String()
+	if !w.hasStart && strings.Contains(s, "MICROBENCH_WINDOW_START") {
+		w.startWall = time.Now()
+		w.startUser, w.startSys, _ = hostProcessCPUTime()
+		w.hasStart = true
+	}
+	if !w.hasEnd && strings.Contains(s, "MICROBENCH {") {
+		w.endWall = time.Now()
+		w.endUser, w.endSys, _ = hostProcessCPUTime()
+		w.hasEnd = true
+	}
+	return n, err
+}
 
 // benchGuest runs each benchmark of the microbench guest repeat times and
 // prints each result and the median of each benchmark. A run that fails is
@@ -163,8 +202,9 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 	failures := 0
 	for _, name := range names {
 		var samples []float64
+		var cpuSamples []float64
 		for rep := range repeat {
-			ns, detail, err := runBenchOnce(b, bin, name)
+			sample, detail, err := runBenchOnce(b, bin, name)
 			if err != nil {
 				if strings.Contains(err.Error(), "not position-independent") {
 					t.Skipf("this engine cannot hold the guest: %v", err)
@@ -173,11 +213,14 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 				t.Logf("MBFAIL backend=%s name=%s rep=%d %v%s", b.name, name, rep, err, detail)
 				continue
 			}
-			samples = append(samples, ns)
-			t.Logf("MBRESULT backend=%s name=%s rep=%d ns_per_op=%.0f", b.name, name, rep, ns)
+			samples = append(samples, sample.nsPerOp)
+			cpuSamples = append(cpuSamples, sample.cpuPct)
+			t.Logf("MBRESULT backend=%s name=%s rep=%d ns_per_op=%.0f host_user_ms=%.2f host_sys_ms=%.2f cpu_pct=%.2f",
+				b.name, name, rep, sample.nsPerOp, sample.userMs, sample.sysMs, sample.cpuPct)
 		}
 		if len(samples) > 0 {
-			t.Logf("MBSUMMARY backend=%s name=%s median_ns_per_op=%.0f runs=%d of %d", b.name, name, median(samples), len(samples), repeat)
+			t.Logf("MBSUMMARY backend=%s name=%s median_ns_per_op=%.0f median_cpu_pct=%.2f runs=%d of %d",
+				b.name, name, median(samples), median(cpuSamples), len(samples), repeat)
 		}
 	}
 	t.Logf("MBDONE backend=%s failures=%d", b.name, failures)
@@ -186,22 +229,28 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 // runBenchOnce runs one benchmark of the guest in a new sandbox and returns its
 // time for each operation. On failure, detail holds the head of the guest
 // error output.
-func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail string, err error) {
+func runBenchOnce(b gateBackend, bin, name string) (sample benchSample, detail string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), benchTimeout)
 	defer cancel()
-	var outBuf, errBuf bytes.Buffer
+	var outTap benchOutputTap
+	var errBuf bytes.Buffer
+	var memLimit int64
+	if name == "shm_sparse_idle" {
+		memLimit = 1 << 30
+	}
 	sb, err := gvx.New(ctx, gvx.Config{
 		Platform:            b.plat,
 		NetworkMode:         gvx.NetModeNone,
 		OCICacheDir:         os.TempDir(),
 		BinaryPath:          bin,
 		Argv:                []string{name},
-		Stdout:              &outBuf,
+		Stdout:              &outTap,
 		Stderr:              &errBuf,
+		Resources:           gvx.Resources{MemoryBytes: memLimit},
 		DisableHostLockdown: true,
 	})
 	if err != nil {
-		return 0, "", err
+		return benchSample{}, "", err
 	}
 	// Run does not return when the guest hangs, even after the context ends, so
 	// the benchmark waits for it in a goroutine and gives up when the time is
@@ -211,6 +260,8 @@ func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail stri
 		runErr   error
 		closeErr error
 	}
+	startWall := time.Now()
+	startUser, startSys, _ := hostProcessCPUTime()
 	done := make(chan runResult, 1)
 	go func() {
 		code, err := sb.Run(ctx)
@@ -220,15 +271,30 @@ func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail stri
 	select {
 	case rr = <-done:
 	case <-time.After(benchTimeout + 10*time.Second):
-		return 0, "", fmt.Errorf("hung: no result within %v", benchTimeout)
+		return benchSample{}, "", fmt.Errorf("hung: no result within %v", benchTimeout)
+	}
+	endWall := time.Now()
+	endUser, endSys, _ := hostProcessCPUTime()
+	if outTap.hasStart {
+		startWall, startUser, startSys = outTap.startWall, outTap.startUser, outTap.startSys
+	}
+	if outTap.hasEnd {
+		endWall, endUser, endSys = outTap.endWall, outTap.endUser, outTap.endSys
+	}
+	wallDur := endWall.Sub(startWall)
+	userDur := max(endUser-startUser, 0)
+	sysDur := max(endSys-startSys, 0)
+	var cpuPct float64
+	if wallDur > 0 {
+		cpuPct = 100 * float64(userDur+sysDur) / float64(wallDur)
 	}
 	code, runErr, closeErr := rr.code, rr.runErr, rr.closeErr
-	fail := func(format string, args ...any) (float64, string, error) {
+	fail := func(format string, args ...any) (benchSample, string, error) {
 		head := errBuf.String()
 		if len(head) > 600 {
 			head = head[:600]
 		}
-		return 0, "\nstderr: " + strings.ReplaceAll(head, "\n", " | "), fmt.Errorf(format, args...)
+		return benchSample{}, "\nstderr: " + strings.ReplaceAll(head, "\n", " | "), fmt.Errorf(format, args...)
 	}
 	if runErr != nil {
 		return fail("run: %v", runErr)
@@ -239,7 +305,7 @@ func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail stri
 	if closeErr != nil {
 		return fail("close: %v", closeErr)
 	}
-	for _, line := range strings.Split(outBuf.String(), "\n") {
+	for _, line := range strings.Split(outTap.buf.String(), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "MICROBENCH_ERR ") {
 			return fail("%s", line)
@@ -249,8 +315,13 @@ func runBenchOnce(b gateBackend, bin, name string) (nsPerOp float64, detail stri
 			if err := json.Unmarshal([]byte(rest), &r); err != nil {
 				return fail("parse %q: %v", line, err)
 			}
-			return r.NsPerOp, "", nil
+			return benchSample{
+				nsPerOp: r.NsPerOp,
+				userMs:  float64(userDur) / float64(time.Millisecond),
+				sysMs:   float64(sysDur) / float64(time.Millisecond),
+				cpuPct:  cpuPct,
+			}, "", nil
 		}
 	}
-	return fail("no result in the output %q", outBuf.String())
+	return fail("no result in the output %q", outTap.buf.String())
 }

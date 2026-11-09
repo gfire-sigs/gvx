@@ -179,19 +179,15 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create a stub process: %w", err)
 	}
-	wins := make([]*windowMap, 0, len(p.layout))
-	for _, w := range p.layout {
-		wins = append(wins, newWindowMap(stubView{sp.proc}, w.base, w.limit))
-	}
 	as := &addressSpace{
 		p:        p,
 		sp:       sp,
-		win:      newGuestWindows(wins...),
+		win:      sp.win,
 		blocks:   make(map[uint64]*execBlock),
 		copies:   make(map[uint64]*copyHold),
 		islands:  make(map[uint64]*island),
 		reserved: make(map[uint64]struct{}),
-		epochs:   newSlotEpochs(),
+		epochs:   sp.epochs,
 	}
 	sp.owner.Store(as)
 	pagesStart := time.Now()
@@ -206,6 +202,10 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 // setupInternal maps the engine pages: one page of code and the pages of the
 // per-thread data slots. The arch file writes the code.
 func (as *addressSpace) setupInternal() error {
+	if as.sp.internal != nil {
+		as.internal = as.sp.internal
+		return nil
+	}
 	sec, err := newAnonSection(winEnginePagesSize)
 	if err != nil {
 		return err
@@ -461,6 +461,46 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	as.aliasUnmappedLocked(start, end)
 }
 
+// canRecycleStub reports whether sp is alive and every guest thread of sp has
+// already been recycled into sp.freeThreads.
+func (as *addressSpace) canRecycleStub() bool {
+	p := as.p
+	sp := as.sp
+	if p.pool == nil || sp.dead.Load() {
+		return false
+	}
+	if sp.unknownThread.Load() != 0 || sp.droppedEvents.Load() != 0 || !sp.hasFastSlotHeadroom() {
+		return false
+	}
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return !sp.closed && !sp.dead.Load() && len(sp.freeThreads) > 0 && len(sp.threads) == 1+len(sp.freeThreads)
+}
+
+// publishRecycledStub returns sp to the pool after as has unmapped the guest
+// range and released all per-address-space state.
+func (as *addressSpace) publishRecycledStub() bool {
+	p := as.p
+	sp := as.sp
+	if !as.canRecycleStub() {
+		return false
+	}
+	sp.owner.Store(nil)
+	select {
+	case <-p.pool.stop:
+		return false
+	default:
+	}
+	select {
+	case <-p.pool.stop:
+		return false
+	case p.pool.reused <- sp:
+		return true
+	default:
+		return false
+	}
+}
+
 // Release implements platform.AddressSpace.Release.
 func (as *addressSpace) Release() {
 	as.mu.Lock()
@@ -471,24 +511,37 @@ func (as *addressSpace) Release() {
 	as.released = true
 	as.mu.Unlock()
 
-	// Terminating the process stops every thread, so no stub thread touches
-	// the pages that go back to the pool below.
-	as.sp.destroy()
-	as.sp.closeFast()
+	recycle := as.canRecycleStub()
+	if recycle {
+		as.mu.Lock()
+		err := as.win.Unmap(as.p.userMin, as.p.userMax-as.p.userMin)
+		as.mu.Unlock()
+		if err != nil {
+			recycle = false
+		}
+	}
+	if !recycle {
+		// Terminating the process stops every thread, so no stub thread touches
+		// the pages that go back to the pool below.
+		as.sp.destroy()
+		as.sp.closeFast()
+	}
 	as.mu.Lock()
-	defer as.mu.Unlock()
 	for base := range as.blocks {
 		as.dropBlockLocked(base)
 	}
-	if as.internal != nil {
-		as.internal.close()
-		as.internal = nil
-	}
+	as.internal = nil
 	for base := range as.copies {
 		as.dropCopyLocked(base)
 	}
 	as.releaseIslandsLocked()
 	as.releaseAliasLocked()
+	as.mu.Unlock()
+
+	if recycle && !as.publishRecycledStub() {
+		as.sp.destroy()
+		as.sp.closeFast()
+	}
 }
 
 // ----- lazy patching ------------------------------------------------------

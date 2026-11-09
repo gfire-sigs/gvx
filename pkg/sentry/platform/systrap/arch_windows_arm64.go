@@ -80,6 +80,8 @@ func configureArch() { arch.ConfigureAddressSpace(1 << 48) }
 
 func (th *thread) initArch() { th.spare = newHostContext() }
 
+func (th *thread) resetArch() {}
+
 func (th *thread) releaseArch() {}
 
 // writeInternalCode writes the TLS routine at the start of the code page.
@@ -442,6 +444,15 @@ func (th *thread) archFastHot(ac *arch.Context64) bool {
 		f.slot.sm.TLS = ac.StateData().Regs.TPIDR_EL0
 	}
 	return true
+}
+
+// archFastRecycleStart prepares a recycled thread that waits in the spill
+// routine to enter the new guest context through a cold resume.
+func (th *thread) archFastRecycleStart(_ *fastThread, ac *arch.Context64) uint32 {
+	if f := th.fast.Load(); f != nil {
+		f.slot.sm.TLS = ac.StateData().Regs.TPIDR_EL0
+	}
+	return winStateRunCold
 }
 
 // archPC returns the program counter of ac.

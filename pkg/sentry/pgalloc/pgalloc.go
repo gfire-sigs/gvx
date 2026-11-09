@@ -1759,10 +1759,7 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 			}
 		}
 
-		fr := maseg.Range()
-		if fr.Start < unscannedStart {
-			fr.Start = unscannedStart
-		}
+		fr := f.coalesceScanRangeLocked(maseg, unscannedStart, memCgIDs)
 		var checkErr error
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 			s := chunk.sliceAt(chunkFR)

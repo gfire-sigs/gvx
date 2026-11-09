@@ -16,8 +16,20 @@ package pgalloc
 
 import (
 	"runtime"
+	"time"
 
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
+)
+
+const (
+	// maxCoalescedScanWindow is the largest range that coalesceScanRangeLocked
+	// merges into one mincore call (16 MiB = 4096 4 KB pages).
+	maxCoalescedScanWindow = 16 << 20
+
+	// maxCoalescedScanBridge is the largest committed or releasing gap that
+	// coalesceScanRangeLocked bridges between two uncommitted segments.
+	maxCoalescedScanBridge = 64 << 10
 )
 
 // canSkipUsageScan reports whether UpdateUsage may skip its scan because the
@@ -29,6 +41,59 @@ import (
 // its tasks hold memory.
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	return memCgIDs == nil || runtime.GOOS == "linux"
+}
+
+// FlushCommitScan waits for any in-flight scan and clears the scan rate limit
+// so the next UpdateUsage(nil) call scans immediately before the caller parks
+// on kernel inactivity.
+func (f *MemoryFile) FlushCommitScan() {
+	for {
+		f.mu.Lock()
+		if !f.ongoingCommitScan.Load() {
+			f.nextCommitScan = time.Time{}
+			f.mu.Unlock()
+			return
+		}
+		f.mu.Unlock()
+		runtime.Gosched()
+	}
+}
+
+// coalesceScanRangeLocked extends the scan range of maseg across subsequent
+// uncommitted segments in the same 16 MiB window and chunk, bridging committed
+// gaps of up to 64 KiB so sparse page faults do not issue thousands of
+// single-segment mincore calls.
+//
+// +checklocks:f.mu
+func (f *MemoryFile) coalesceScanRangeLocked(maseg memAcctIterator, unscannedStart uint64, memCgIDs map[uint32]struct{}) memmap.FileRange {
+	fr := maseg.Range()
+	if fr.Start < unscannedStart {
+		fr.Start = unscannedStart
+	}
+	chunkEnd := (fr.Start &^ chunkMask) + chunkSize
+	maxEnd := min(chunkEnd, fr.Start+maxCoalescedScanWindow)
+	if fr.End >= maxEnd {
+		fr.End = maxEnd
+		return fr
+	}
+	for seg := maseg.NextSegment(); seg.Ok() && seg.Start() < maxEnd; seg = seg.NextSegment() {
+		ma := seg.ValuePtr()
+		needsScan := !ma.wasteOrReleasing && !ma.knownCommitted
+		if needsScan && memCgIDs != nil {
+			_, needsScan = memCgIDs[ma.memCgID]
+		}
+		if needsScan {
+			fr.End = min(seg.End(), maxEnd)
+			if seg.End() >= maxEnd {
+				break
+			}
+			continue
+		}
+		if seg.End() > maxEnd || seg.Range().Length() > maxCoalescedScanBridge {
+			break
+		}
+	}
+	return fr
 }
 
 // Accounting returns the memory usage accounting that f charges. It is

@@ -43,6 +43,7 @@ func TestWinSysmsgHeaderLayout(t *testing.T) {
 		{"Target", unsafe.Offsetof(h.Target), winOffTarget},
 		{"TLS", unsafe.Offsetof(h.TLS), winOffTLS},
 		{"SpinTicks", unsafe.Offsetof(h.SpinTicks), winOffSpinTicks},
+		{"SleepHint", unsafe.Offsetof(winSysmsg{}.SleepHint), winOffSleepHint},
 		{"size", unsafe.Sizeof(h), winOffRegs},
 	} {
 		if c.got != c.want {

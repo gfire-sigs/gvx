@@ -149,3 +149,54 @@ func TestMemoryGuardStopsWhenContextEnds(t *testing.T) {
 		}
 	})
 }
+
+func TestMemoryGuardParksWhileKernelIsIdle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var scans, flushes atomic.Int32
+		var use atomic.Uint64
+		activityCh := make(chan struct{})
+		var idle atomic.Bool
+		idle.Store(true)
+
+		g := memoryGuard{
+			limit: 100,
+			used: func() uint64 {
+				scans.Add(1)
+				return use.Load()
+			},
+			flushScan: func() {
+				flushes.Add(1)
+			},
+			idleActivity: func() (<-chan struct{}, bool) {
+				if idle.Load() {
+					return activityCh, true
+				}
+				return nil, false
+			},
+			interval: 10 * time.Millisecond,
+			kill:     func() {},
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan bool, 1)
+		go func() { result <- g.run(ctx) }()
+
+		// One post-idle scan runs at 10ms, then the guard parks on activityCh.
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		if got := scans.Load(); got != 1 {
+			t.Fatalf("scans during 500ms of idle = %d, want 1", got)
+		}
+		if got := flushes.Load(); got != 1 {
+			t.Fatalf("flushes during 500ms of idle = %d, want 1", got)
+		}
+
+		// Waking the kernel resumes periodic scans and catches an over-limit allocation.
+		idle.Store(false)
+		use.Store(101)
+		close(activityCh)
+		if exceeded := <-result; !exceeded {
+			t.Fatalf("run returned false after activity resumed over limit, want true")
+		}
+	})
+}

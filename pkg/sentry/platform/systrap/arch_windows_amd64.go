@@ -116,6 +116,14 @@ func configureArch() {}
 
 func (th *thread) initArch() {}
 
+func (th *thread) resetArch() {
+	th.fsFix = struct {
+		pc  uint64
+		sum uint64
+		n   int
+	}{}
+}
+
 func (th *thread) releaseArch() {
 	if th.slot != 0 {
 		th.sp.mu.Lock()
@@ -997,6 +1005,14 @@ func (th *thread) archFastTrap(*arch.Context64) {
 // archFastHot reports whether the thread can resume without a debug stop. The
 // stub loads the FS base on every return.
 func (th *thread) archFastHot(*arch.Context64) bool { return true }
+
+// archFastRecycleStart prepares a recycled thread that waits in the spill
+// routine to jump directly to the entry address of the new guest context
+// through the hot resume path without raising a debug trap.
+func (th *thread) archFastRecycleStart(f *fastThread, ac *arch.Context64) uint32 {
+	f.slot.sm.Tail = th.startPC(archPC(ac))
+	return winStateRunHot
+}
 
 // archPC returns the program counter of ac.
 func archPC(ac *arch.Context64) uint64 { return ac.StateData().Regs.Rip }

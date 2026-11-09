@@ -311,13 +311,15 @@ func (d *debugger) run() {
 	runtime.LockOSThread()
 	defer close(d.done)
 	// A failed open only costs the poll time at close.
+	waitTimeout := 50 * time.Millisecond
 	if h, err := windows.OpenThread(threadAlert, false, windows.GetCurrentThreadId()); err == nil {
 		d.pump = h
+		waitTimeout = 0
 	}
 	close(d.ready)
 	var rec [debugRecordSize]byte
 	for !d.stop.Load() {
-		ok, err := ntWaitForDebugEvent(d.obj, 50*time.Millisecond, &rec)
+		ok, err := ntWaitForDebugEvent(d.obj, waitTimeout, &rec)
 		if err != nil {
 			d.failAll(err)
 			return

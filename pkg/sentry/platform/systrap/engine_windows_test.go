@@ -798,6 +798,39 @@ func TestPooledStubServesNewAddressSpace(t *testing.T) {
 	t.Errorf("the address space runs in stub %d, which is not one of the pooled stubs %v", as.sp.pid, pooled)
 }
 
+func TestStubAndThreadRecycledAcrossAddressSpaces(t *testing.T) {
+	p := newPlatform(t)
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	t.Cleanup(mf.Destroy)
+
+	r1 := newRigOn(t, p, mf)
+	r1.program(gSyscall(401))
+	if si, _, err := r1.run(); si != nil || err != nil || regNr(r1.ac) != 401 {
+		t.Fatalf("r1 Switch = (%s, %v), number %d", describe(si), err, regNr(r1.ac))
+	}
+	pid1 := r1.as.sp.pid
+	tid1 := r1.ctx.th.Load().tid
+	r1.ctx.PrepareExit()
+	r1.as.Release()
+
+	r2 := newRigOn(t, p, mf)
+	r2.program(gSyscall(402))
+	if si, _, err := r2.run(); si != nil || err != nil || regNr(r2.ac) != 402 {
+		t.Fatalf("r2 Switch = (%s, %v), number %d", describe(si), err, regNr(r2.ac))
+	}
+	pid2 := r2.as.sp.pid
+	tid2 := r2.ctx.th.Load().tid
+	if pid2 != pid1 {
+		t.Errorf("second address space used stub pid %d, want recycled stub pid %d", pid2, pid1)
+	}
+	if tid2 != tid1 {
+		t.Errorf("second context used thread tid %d, want recycled thread tid %d", tid2, tid1)
+	}
+}
+
 func TestCloseTerminatesPooledStubs(t *testing.T) {
 	p, err := New()
 	if err != nil {

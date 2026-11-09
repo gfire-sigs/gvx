@@ -385,6 +385,41 @@ func TestSpillSleepsWhenSpinExpires(t *testing.T) {
 	r.checkHotExit(t, want, rigFlags)
 }
 
+func TestSpillSleepsEarlyWhenSleepHintIsSet(t *testing.T) {
+	r := newSpillRig(t, rigNop3)
+	m := r.m
+	want := r.guest
+	want[x86RAX] = 99
+	m.onYield = func(m *x86Machine) {
+		if m.pauses == 2 {
+			m.put32(rigSysm+winOffSleepHint, 1)
+		}
+	}
+	r.onCallee = func(m *x86Machine, target uint64) {
+		if target != rigWaitFn {
+			return
+		}
+		if r.stubWaiter() != 1 {
+			t.Error("the stub slept without StubWaiter")
+		}
+		if got := m.get32(rigSysm + winOffSleepHint); got != 0 {
+			t.Errorf("SleepHint at wait = %d, want 0", got)
+		}
+		r.setSaved(x86RAX, 99)
+		r.setState(winStateRunHot)
+	}
+	if err := m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if m.pauses != 2 {
+		t.Fatalf("the stub polled %d times after SleepHint at pause 2, want 2", m.pauses)
+	}
+	if len(r.callLog) != 1 || r.callLog[0] != "wait" {
+		t.Fatalf("calls = %v, want one NtWaitForSingleObject", r.callLog)
+	}
+	r.checkHotExit(t, want, rigFlags)
+}
+
 func TestSpillSkipsSleepWhenStateArrivesAfterFlag(t *testing.T) {
 	r := newSpillRig(t, rigNop3)
 	// The second fence follows the store of StubWaiter. The Sentry publishes
