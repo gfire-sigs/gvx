@@ -31,7 +31,7 @@ on:
         type: string
 
 # One run at a time for each ref. A new run waits and does not cancel the
-# running one, so every started run records its result.
+# running one. GitHub keeps only the newest waiting run.
 concurrency:
   group: benchmark-${{ github.ref }}
   cancel-in-progress: false
@@ -144,6 +144,7 @@ jobs:
               git worktree add --detach bench-results-tree origin/bench-results
             else
               git worktree add --detach bench-results-tree
+              git branch -D bench-results-new >/dev/null 2>&1 || true
               git -C bench-results-tree checkout --orphan bench-results-new
               git -C bench-results-tree rm -rf . >/dev/null 2>&1 || true
             fi

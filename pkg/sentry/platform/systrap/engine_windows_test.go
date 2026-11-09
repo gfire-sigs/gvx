@@ -826,7 +826,9 @@ func TestReleasedStubNeverServesAnotherAddressSpace(t *testing.T) {
 	if si, _, err := r2.run(); si != nil || err != nil || regNr(r2.ac) != 402 {
 		t.Fatalf("r2 Switch = (%s, %v), number %d", describe(si), err, regNr(r2.ac))
 	}
-	if r2.as.sp == sp1 || r2.as.sp.pid == sp1.pid {
+	// Windows can give the PID of the dead stub to a new process, so the test
+	// compares the stub objects.
+	if r2.as.sp == sp1 {
 		t.Errorf("the second address space runs in stub pid %d of the first address space", sp1.pid)
 	}
 }
