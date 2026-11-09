@@ -18,7 +18,7 @@ jobs:
   emulator:
     name: emulator android-36 arm64 16 KB
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 60
     env:
       ANDROID_IMAGE: system-images;android-36;google_apis_playstore_ps16k;arm64-v8a
     steps:
@@ -43,16 +43,35 @@ jobs:
           echo no | "$sdk/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$ANDROID_IMAGE" -d pixel_6
           echo "ANDROID_SDK=$sdk" >> "$GITHUB_ENV"
           echo "$sdk/platform-tools" >> "$GITHUB_PATH"
+      # adb wait-for-device has no time limit, so the step polls adb with a
+      # deadline. It fails at once when the emulator exits, and it prints the
+      # boot state and the emulator log every 5 minutes.
       - name: Boot the emulator
+        timeout-minutes: 40
         run: |
           "$ANDROID_SDK/emulator/emulator" -avd ci -accel off -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -no-metrics > emulator.log 2>&1 &
-          adb wait-for-device
-          for i in $(seq 1 360); do
-            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && exit 0
+          pid=$!
+          start=$(date +%s)
+          while :; do
+            if ! kill -0 "$pid" 2> /dev/null; then
+              echo "the emulator exited"
+              cat emulator.log
+              exit 1
+            fi
+            booted=$(adb shell getprop sys.boot_completed 2> /dev/null | tr -d '\r' || true)
+            [ "$booted" = 1 ] && exit 0
+            elapsed=$(( $(date +%s) - start ))
+            if [ $(( elapsed % 300 )) -lt 10 ]; then
+              echo "after ${elapsed}s: adb state $(adb get-state 2>&1 | tr -d '\r'), boot_completed '${booted}'"
+              tail -5 emulator.log
+            fi
+            if [ "$elapsed" -ge 2280 ]; then
+              echo "the emulator did not boot in ${elapsed}s"
+              tail -50 emulator.log
+              exit 1
+            fi
             sleep 10
           done
-          tail -50 emulator.log
-          exit 1
       - name: Run the probe and the guest probes
         run: scripts/android/emulator-smoke.sh
