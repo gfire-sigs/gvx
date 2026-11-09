@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Boots a Linux arm64 kernel with 16 KB pages in QEMU and runs the systrap
+# guest probes in it (GVXIP-006 P5). It builds rungv, the guest probes, and the
+# init program of scripts/linux16k/init.go for linux/arm64, packs them into an
+# initramfs, and fails unless init prints VMSMOKE-OK.
+#
+# KERNEL is the path of the kernel image. Without it, the script needs Docker
+# on an arm64 host, and it extracts the arm64-16k kernel of Debian trixie.
+# QEMU emulates the CPU (TCG), because a KVM host CPU can lack 16 KB pages.
+#
+# Usage: scripts/linux16k/run.sh
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/../.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cd "$root"
+
+build() { GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath "$@"; }
+mkdir -p "$work/root/guests"
+build -o "$work/root/init" scripts/linux16k/init.go
+build -o "$work/root/rungv" ./cmd/rungv
+for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe; do
+	build -o "$work/root/guests/$g" "./internal/acceptprog/$g"
+done
+(cd "$work/root" && find . | cpio -o -H newc --quiet) | gzip -1 > "$work/initramfs.gz"
+
+kernel=${KERNEL:-}
+if [ -z "$kernel" ]; then
+	# The metapackage linux-image-arm64-16k depends on the current kernel.
+	docker run --rm -v "$work:/out" debian:trixie-slim sh -ec '
+		apt-get -qq update
+		cd /tmp
+		apt-get -qq download "$(apt-cache depends linux-image-arm64-16k | sed -n "s/.*Depends: //p")"
+		dpkg-deb -x linux-image-*.deb x
+		cp x/boot/vmlinuz-* /out/vmlinuz'
+	kernel=$work/vmlinuz
+fi
+
+# Without lpa2=off, the kernel gives user space 52 address bits. The Sentry
+# then places guest memory above 48 bits, which Linux does only on request and
+# which the guest Go runtime does not accept. Android devices with 16 KB pages
+# have 39 or 47 bits.
+timeout 3000 qemu-system-aarch64 -machine virt -accel tcg -cpu max,lpa2=off -smp 2 -m 2048 -nographic -no-reboot \
+	-kernel "$kernel" -initrd "$work/initramfs.gz" \
+	-append "console=ttyAMA0 rdinit=/init panic=-1 quiet" | tee "$work/console.log" | tr -d '\r'
+grep -q VMSMOKE-OK "$work/console.log"

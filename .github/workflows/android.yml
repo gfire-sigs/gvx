@@ -1,0 +1,81 @@
+# Runs the Android probe and the systrap guest probes on an x86_64 Android 16
+# emulator (GVXIP-006 P1-4). Google ships no Linux arm64 emulator, and the
+# arm64 emulator of macOS needs Hypervisor.framework, which the hosted macOS
+# runner lacks. The Linux runner has KVM, so the x86_64 image boots there, and
+# rungv builds for android/amd64 with cgo. The workflow runs by hand, and on a
+# pull request only when this file or the smoke script changes.
+name: android
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/android.yml
+      - scripts/android/emulator-smoke.sh
+
+permissions:
+  contents: read
+
+jobs:
+  emulator:
+    name: emulator android-36 x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ANDROID_IMAGE: system-images;android-36;google_apis;x86_64
+      # avdmanager and the emulator search different default directories, so
+      # both use this one.
+      ANDROID_AVD_HOME: ${{ github.workspace }}/../avd
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install the emulator, the system image, and the NDK
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null
+          "$sdkmanager" emulator platform-tools "ndk;28.2.13676358" "$ANDROID_IMAGE" > /dev/null
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$ANDROID_IMAGE" -d pixel_6
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+      # adb wait-for-device has no time limit, so the step polls adb with a
+      # deadline. It fails at once when the emulator exits, and it prints the
+      # boot state and the emulator log every 2 minutes.
+      - name: Boot the emulator
+        timeout-minutes: 20
+        run: |
+          "$ANDROID_HOME/emulator/emulator" -avd ci -no-window -no-audio -no-boot-anim \
+            -no-snapshot -gpu swiftshader_indirect -no-metrics > emulator.log 2>&1 &
+          pid=$!
+          start=$(date +%s)
+          while :; do
+            if ! kill -0 "$pid" 2> /dev/null; then
+              echo "the emulator exited"
+              cat emulator.log
+              exit 1
+            fi
+            booted=$(timeout 10 adb shell getprop sys.boot_completed 2> /dev/null | tr -d '\r' || true)
+            [ "$booted" = 1 ] && exit 0
+            elapsed=$(( $(date +%s) - start ))
+            if [ $(( elapsed % 120 )) -lt 10 ]; then
+              echo "after ${elapsed}s: adb state $(timeout 10 adb get-state 2>&1 | tr -d '\r'), boot_completed '${booted}'"
+              tail -5 emulator.log
+            fi
+            if [ "$elapsed" -ge 1080 ]; then
+              echo "the emulator did not boot in ${elapsed}s"
+              tail -50 emulator.log
+              exit 1
+            fi
+            sleep 10
+          done
+      - name: Run the probe and the guest probes
+        run: scripts/android/emulator-smoke.sh

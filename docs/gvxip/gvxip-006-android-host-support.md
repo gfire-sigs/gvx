@@ -155,7 +155,7 @@ The memory-file ranges of a stub are its context queue, its thread context regio
 | P1-1 (PR 3) | Build `GOOS=android GOARCH=arm64` in the job `build, vet, and audit`. The tree builds without changes. `android/amd64` executables need cgo, so the emulator workflow of P1-4 uses the NDK. | `.github/workflows/ci.yml` | Tier 1 | CI |
 | P1-2 | Name every Android sibling file `*_android_xplat.go` with an `android` build tag. The upstream audit counts the token `xplat` as Tier 2, so the audit needs no change. | None | None | Upstream audit |
 | P1-3 (PR 4) | Add a probe that runs inside an app as `untrusted_app`. It reports each item of section 3.2.1. | new `tools/androidprobe` (Go library and test APK) | Tier 1 | T1-1 |
-| P1-4 (PR 5) | Add a manual workflow that runs the probe and the `systrap` smoke tests on an Android emulator. | new `.github/workflows/android.yml` (`workflow_dispatch` only) | Tier 1 | T1-2 |
+| P1-4 (PR 5) | Add a manual workflow that runs the probe and the `systrap` smoke tests on an Android emulator. Google ships no Linux `arm64` emulator, and the macOS `arm64` emulator exits with `HV_UNSUPPORTED` on the hosted runner, even with `-accel off`. The workflow therefore boots the x86_64 image with KVM on the hosted Linux runner, and `rungv` builds for `android/amd64` with cgo (#126). The 16 KB engine stays on the local emulator and on the `GVX_SYSTRAP_SUBBLOCKS=1` step of CI. | new `.github/workflows/android.yml` (`workflow_dispatch`), `scripts/android/emulator-smoke.sh` | Tier 1 | T1-2 |
 
 #### 3.2.1 Probe Items
 
@@ -244,6 +244,7 @@ Each test uses the real producer of the data that it checks, as section 6 of `AG
 | T5-2 | A guest stores into the 4 KB page of its own code inside one 16 KB host page. | Guest program | The fault loop of F13 |
 | T5-3 | A guest maps a file shared, and a `write` system call changes it. The mapping shows the new bytes. | Guest program | Stale private copies |
 | T5-4 | `TestE2ESystrapSparePages` passes on the 16 KB emulator image and with `GVX_SYSTRAP_SUBBLOCKS=1` on `linux/arm64`. | Guest program | Spare pages that hide guest pages |
+| T5-5 | The guest probes pass on the `arm64-16k` kernel of Debian trixie in QEMU (`linux16k.yml`). QEMU runs without LPA2: with 52 address bits, the Sentry places guest memory above 48 bits, and the guest Go runtime rejects it. | Guest programs | A 16 KB host gap outside the emulator |
 
 ---
 
