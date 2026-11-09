@@ -206,7 +206,8 @@ seam pkg/tcpip/stack/iptables.go
 seam pkg/tcpip/stack/bridge.go
 # A bridged frame carries the port names that the physdev match reads, in three fields of
 # PacketBuffer (pkg/sentry/socket/netfilter/physdev_matcher_xplat.go). The bridge sets them in
-# pkg/tcpip/stack/bridge_netfilter_xplat.go.
+# pkg/tcpip/stack/bridge_netfilter_xplat.go. DeepCopyForForwarding releases the BufferSince view and
+# reads header lengths without pulling up the source packet buffer.
 seam pkg/tcpip/stack/packet_buffer.go
 # A SYN on a TCP connection in TIME_WAIT or CLOSE starts a new connection
 # (pkg/tcpip/stack/conntrack_xplat.go). The seam is one call in getConnAndUpdate.

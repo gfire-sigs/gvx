@@ -829,7 +829,7 @@ func (n *nic) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Packe
 			// If a link header was populated in the original packet buffer, then
 			// populate it in the packet buffer we provide to packet endpoints as
 			// packet endpoints inspect link headers.
-			packetEPPkt.LinkHeader().Consume(len(pkt.LinkHeader().Slice()))
+			packetEPPkt.LinkHeader().Consume(pkt.headers[linkHeader].length)
 			packetEPPkt.PktType = pkt.PktType
 			// Assume the packet is for us if the packet type is unset.
 			// The packet type is set to PacketOutgoing when sending packets so

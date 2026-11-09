@@ -790,7 +790,6 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 //
 // This method should be invoked by the endpoint that received the pkt.
 func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketBuffer, updateOptions bool) ip.ForwardingError {
-	h := header.IPv4(pkt.NetworkHeader().Slice())
 	stk := e.protocol.stack
 
 	inNicName := stk.FindNICNameFromID(e.nic.ID())
@@ -829,7 +828,7 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		}
 	}
 
-	ttl := h.TTL()
+	ttl := header.IPv4(pkt.NetworkHeader().Slice()).TTL()
 	// As per RFC 791 page 30, Time to Live,
 	//
 	//   This field must be decreased at each point that the internet header
