@@ -2,6 +2,27 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release lowers the host CPU use of Windows sandboxes. An idle sandbox no longer scans its memory usage, and the Windows `systrap` engine spins less and keeps exited guest threads for the next clone. A new workflow records benchmark results of the five targets on the `bench-results` branch.
+
+### Features
+
+- **Benchmark workflow**: `.github/workflows/benchmark.yml` runs `TestE2EMicroBench` on `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. It runs once a week, by hand, and on a push to `main` that changes platform, memory, kernel, or benchmark code. Each benchmark reports the wall time of one operation and the host CPU time of the test process (`host_user_ms`, `host_sys_ms`, and `cpu_pct`). The new benchmark `shm_sparse_idle` maps 256 MB of `/dev/shm`, writes one byte in each 64 KB, and sleeps under a 1 GiB memory limit. `internal/benchreport` adds each run to `history.ndjson` and writes the tables of `README.md` on the `bench-results` branch.
+
+### Performance
+
+- **Idle memory guard**: the memory guard of `gvx.Resources` scanned the committed pages of the memory file at each interval, also when no task ran. On Windows, each scan called `K32QueryWorkingSetEx` for each uncommitted range. An idle sandbox with sparse `/dev/shm` or `tmpfs` pages used 8% to 19% of one core. The guard now completes one scan after the last task stops, and then waits until a task runs again (`Kernel.IdleTaskActivityChan`). The scan joins uncommitted ranges across committed gaps of up to 64 KB, to at most 16 MB for each call. The Windows scan uses a stack buffer or a pooled buffer for its query. On the hosted `windows/amd64` runner, `shm_sparse_idle` uses 0.0% of one core with `whpx` and 2.5% with `systrap`.
+- **Spin of the Windows `systrap` engine**: the Sentry and the stub each spin on the `winSysmsg` page before they sleep on an event. A stub kept its spin while the Sentry blocked in a long system call, a sleep, or a stop. The Sentry now sets the `SleepHint` word of the page before it blocks, and the stub then ends its spin and sleeps on its event. The word is a hint only; the wake protocol is unchanged.
+- **Guest threads of the Windows `systrap` engine**: a guest thread that exits or leaves for an exec now goes to a list of up to four free threads of its stub. The next clone in the same address space takes it, without a thread start and its first debug stop. A stub still serves one address space only, and `AddressSpace.Release` terminates it.
+- **Thread binding of the Windows lockdown**: `hostlockdown.BindThread` runs on each `Switch`. It now reads the restricted token atomically and looks up the thread in a cache without a lock.
+- **Debug pump of the Windows `systrap` engine**: the pump waits up to 1 second for a debug event, not 50 ms, when `Close` can alert it. An idle engine wakes once a second, not 20 times.
+
+### Bug Fixes
+
+- **Lost interrupt at the start of a Windows `systrap` switch**: `Context.Switch` cleared its interrupt flag after it enabled interrupt forwarding. An interrupt between the two steps was lost, and a guest that ran a tight loop did not stop until the next interrupt. `Switch` now clears the flag before it enables forwarding, and again after it disables forwarding.
+- **Vector registers after an interrupted Windows `systrap` switch**: `Context.Switch` marked the vector state as read before the thread ran. An interrupt or an error between the start and the run returned without the run. A signal frame then saved an old copy of the XMM or V registers, and the guest got that copy back after the handler. `Switch` now keeps the vector state where it is until the thread runs, and it loads the state of the Sentry again at the next start when it did not run.
+
 ## [v0.11.10012026110200] - 2026-11-09
 
 This release lets a Go program that embeds `gvx` and builds with cgo use the Linux `systrap` engine. The release archives still build without cgo, so `rungv` behaves as before.

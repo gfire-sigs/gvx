@@ -17,7 +17,6 @@
 package systrap
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -93,7 +92,7 @@ const (
 	startTimeout = 20 * time.Second
 
 	// maxFreeThreads is the maximum number of idle guest threads that a stub
-	// process retains for reuse across address spaces.
+	// process keeps for the next clone in the same address space.
 	maxFreeThreads = 4
 )
 
@@ -274,23 +273,24 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 const poolDepth = 6
 
 // stubPool keeps ready stubs, so that a fork or an exec does not wait for the
-// loader of a new process. reused holds stubs that an earlier address space
-// released with a warm guest thread; ready holds newly started stubs that the
-// background goroutine fills while the guests run.
+// loader of a new process. One goroutine fills the pool while the guests run.
+//
+// WHY: the pool holds only stubs that no guest ran in. A stub that served one
+// guest process never serves another. Guest code runs natively in the stub,
+// so it can start hidden threads, write ntdll pages, or leave registers in its
+// winSysmsg pages. An unmap of the guest range removes none of that.
 type stubPool struct {
-	reused chan *stubProc
-	ready  chan *stubProc
-	stop   chan struct{}
-	done   chan struct{}
+	ready chan *stubProc
+	stop  chan struct{}
+	done  chan struct{}
 }
 
 // startPool starts the goroutine that fills the pool.
 func (p *Platform) startPool() {
 	p.pool = &stubPool{
-		reused: make(chan *stubProc, poolDepth),
-		ready:  make(chan *stubProc, poolDepth),
-		stop:   make(chan struct{}),
-		done:   make(chan struct{}),
+		ready: make(chan *stubProc, poolDepth),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
 	}
 	go p.fillPool()
 }
@@ -337,9 +337,6 @@ func (p *Platform) stopPool() {
 	var idle []*stubProc
 	for {
 		select {
-		case sp := <-p.pool.reused:
-			idle = append(idle, sp)
-			continue
 		case sp := <-p.pool.ready:
 			idle = append(idle, sp)
 			continue
@@ -355,32 +352,10 @@ func (p *Platform) stopPool() {
 	}
 }
 
-// spillMatches reports whether the engine pages of sp hold the current spill
-// routine of p.
-func (p *Platform) spillMatches(sp *stubProc) bool {
-	if !p.fast || sp.internal == nil {
-		return true
-	}
-	code := p.spill.code
-	return bytes.Equal(sp.internal.local[winSpillOffset:winSpillOffset+len(code)], code)
-}
-
 // newStubProc returns a ready stub from the pool, or creates one when the pool
-// is empty. It prefers a recycled stub that already holds a warm guest thread.
+// is empty.
 func (p *Platform) newStubProc() (*stubProc, error) {
 	if p.pool != nil {
-		for {
-			select {
-			case sp := <-p.pool.reused:
-				if sp.dead.Load() || !p.spillMatches(sp) {
-					sp.destroy()
-					continue
-				}
-				return sp, nil
-			default:
-			}
-			break
-		}
 		for {
 			select {
 			case sp := <-p.pool.ready:

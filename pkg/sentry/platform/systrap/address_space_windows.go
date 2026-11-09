@@ -461,47 +461,8 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	as.aliasUnmappedLocked(start, end)
 }
 
-// canRecycleStub reports whether sp is alive and every guest thread of sp has
-// already been recycled into sp.freeThreads.
-func (as *addressSpace) canRecycleStub() bool {
-	p := as.p
-	sp := as.sp
-	if p.pool == nil || sp.dead.Load() {
-		return false
-	}
-	if sp.unknownThread.Load() != 0 || sp.droppedEvents.Load() != 0 || !sp.hasFastSlotHeadroom() {
-		return false
-	}
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-	return !sp.closed && !sp.dead.Load() && len(sp.freeThreads) > 0 && len(sp.threads) == 1+len(sp.freeThreads)
-}
-
-// publishRecycledStub returns sp to the pool after as has unmapped the guest
-// range and released all per-address-space state.
-func (as *addressSpace) publishRecycledStub() bool {
-	p := as.p
-	sp := as.sp
-	if !as.canRecycleStub() {
-		return false
-	}
-	sp.owner.Store(nil)
-	select {
-	case <-p.pool.stop:
-		return false
-	default:
-	}
-	select {
-	case <-p.pool.stop:
-		return false
-	case p.pool.reused <- sp:
-		return true
-	default:
-		return false
-	}
-}
-
-// Release implements platform.AddressSpace.Release.
+// Release implements platform.AddressSpace.Release. The stub process ends with
+// the address space and never serves another one (see stubPool).
 func (as *addressSpace) Release() {
 	as.mu.Lock()
 	if as.released {
@@ -511,21 +472,10 @@ func (as *addressSpace) Release() {
 	as.released = true
 	as.mu.Unlock()
 
-	recycle := as.canRecycleStub()
-	if recycle {
-		as.mu.Lock()
-		err := as.win.Unmap(as.p.userMin, as.p.userMax-as.p.userMin)
-		as.mu.Unlock()
-		if err != nil {
-			recycle = false
-		}
-	}
-	if !recycle {
-		// Terminating the process stops every thread, so no stub thread touches
-		// the pages that go back to the pool below.
-		as.sp.destroy()
-		as.sp.closeFast()
-	}
+	// Terminating the process stops every thread, so no stub thread touches
+	// the pages that go back to the pool below.
+	as.sp.destroy()
+	as.sp.closeFast()
 	as.mu.Lock()
 	for base := range as.blocks {
 		as.dropBlockLocked(base)
@@ -537,11 +487,6 @@ func (as *addressSpace) Release() {
 	as.releaseIslandsLocked()
 	as.releaseAliasLocked()
 	as.mu.Unlock()
-
-	if recycle && !as.publishRecycledStub() {
-		as.sp.destroy()
-		as.sp.closeFast()
-	}
 }
 
 // ----- lazy patching ------------------------------------------------------

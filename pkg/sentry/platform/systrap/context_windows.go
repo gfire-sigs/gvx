@@ -129,9 +129,11 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 		c.kicked.Store(false)
 	}()
 
+	// fpInStub stays as it is until the thread runs. A return before the run
+	// leaves the vector state where it was, so PullFullState must still read
+	// it from the thread.
 	loadFP := c.needRestoreFP
 	c.needRestoreFP = false
-	c.fpInStub = false
 	if err := th.start(ac, loadFP); err != nil {
 		if loadFP {
 			c.needRestoreFP = true
@@ -156,6 +158,7 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 			return nil, hostarch.NoAccess, c.runErr(as, err)
 		}
 		loadFP = false
+		c.fpInStub = false
 		// Switch tests the flag after it starts the thread, and a kick tests the
 		// state of the thread after it sets the flag, so one of the two sees the other.
 		if c.kicked.Load() {
