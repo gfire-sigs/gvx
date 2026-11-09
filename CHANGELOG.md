@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.11.10012026110200] - 2026-11-09
+
+This release lets a Go program that embeds `gvx` and builds with cgo use the Linux `systrap` engine. The release archives still build without cgo, so `rungv` behaves as before.
 
 ### Bug Fixes
 
