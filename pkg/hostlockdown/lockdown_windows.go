@@ -21,6 +21,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -32,10 +33,29 @@ import (
 // the containment job outlives every other reference to it.
 var (
 	handlesMu       sync.RWMutex
-	restrictedToken windows.Token
+	restrictedToken atomic.Uintptr
 	containmentJob  windows.Handle
+	boundTIDCache   [256]atomic.Uint32
 	boundTIDs       sync.Map
 )
+
+func recordBoundTID(tid uint32) {
+	if tid != 0 {
+		boundTIDCache[(tid^(tid>>8))&255].Store(tid)
+	}
+	boundTIDs.Store(tid, struct{}{})
+}
+
+func isBoundTID(tid uint32) bool {
+	if tid != 0 && boundTIDCache[(tid^(tid>>8))&255].Load() == tid {
+		return true
+	}
+	_, ok := boundTIDs.Load(tid)
+	if ok && tid != 0 {
+		boundTIDCache[(tid^(tid>>8))&255].Store(tid)
+	}
+	return ok
+}
 
 // applyOSLockdown runs the SPEC 3.8 Windows steps in order. Each step returns
 // its error. Status fields change only after the step succeeded and its effect
@@ -129,7 +149,7 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	st.UnboundFileOpenBlocked = true
 
 	handlesMu.Lock()
-	restrictedToken = restricted
+	restrictedToken.Store(uintptr(restricted))
 	containmentJob = job
 	handlesMu.Unlock()
 	keep = true
@@ -204,7 +224,7 @@ func bindProcessThreads(primary, token windows.Token) error {
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)
 	}
-	boundTIDs.Store(selfTID, struct{}{})
+	recordBoundTID(selfTID)
 	return nil
 }
 
@@ -242,7 +262,7 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 		if err := windows.SetThreadToken(&h, token); err != nil {
 			return fmt.Errorf("hostlockdown: SetThreadToken(peer thread): %w", err)
 		}
-		boundTIDs.Store(p.tid, struct{}{})
+		recordBoundTID(p.tid)
 	}
 	return nil
 }
@@ -273,19 +293,17 @@ func resolveMount(path string) (string, error) {
 // thread cannot read other user files. BindThread returns ErrNotLockedDown
 // before a successful Apply.
 func BindThread() error {
-	handlesMu.RLock()
-	token := restrictedToken
-	handlesMu.RUnlock()
+	token := windows.Token(restrictedToken.Load())
 	if token == 0 {
 		return ErrNotLockedDown
 	}
 	tid := windows.GetCurrentThreadId()
-	if _, ok := boundTIDs.Load(tid); ok {
+	if isBoundTID(tid) {
 		return nil
 	}
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken: %w", err)
 	}
-	boundTIDs.Store(tid, struct{}{})
+	recordBoundTID(tid)
 	return nil
 }

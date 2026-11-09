@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"time"
 
-	"z.gfire.dev/gvx/internal/xsys/unix"
 	"golang.org/x/time/rate"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"

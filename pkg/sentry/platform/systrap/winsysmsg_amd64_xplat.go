@@ -41,7 +41,10 @@ type winRegs struct {
 type winSysmsg struct {
 	winSysmsgHeader
 	Regs winRegs
-	_    [winOffXsave - winOffGsMemBase - 8]byte
+	// SleepHint is set to 1 by the Sentry when the guest thread enters a
+	// blocking wait so the stub skips the remainder of its spin window.
+	SleepHint uint32
+	_         [winOffXsave - winOffSleepHint - 4]byte
 	// Xsave holds the vector state of the trapped guest in the standard XSAVE
 	// format. A call into ntdll can clobber the volatile vector registers on
 	// Windows, so the spill routine saves them before its first call and loads
@@ -58,6 +61,7 @@ const (
 	winOffFsBase    = winOffRflags + 8
 	winOffGsBase    = winOffFsBase + 8
 	winOffGsMemBase = winOffGsBase + 8
+	winOffSleepHint = winOffGsMemBase + 8
 
 	// winNonCanonGSBase replaces a zero guest GS base in GsMemBase so a fast
 	// GS memory slot raises an access violation even when the low window maps
@@ -89,6 +93,7 @@ var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.Rflags)-16*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.FsBase)-17*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.GsBase)-18*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.GsMemBase)-19*8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.SleepHint)-winOffSleepHint]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Xsave)-winOffXsave]
 var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsg{})-(winOffXsave+winXsaveSize)]
 var _ = [1]struct{}{}[winOffXsave%64]

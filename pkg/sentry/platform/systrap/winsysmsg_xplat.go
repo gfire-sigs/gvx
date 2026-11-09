@@ -184,6 +184,10 @@ func (h *winSysmsgHeader) fpDirty() *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Pointer(&h.FPDirty))
 }
 
+func (m *winSysmsg) sleepHint() *atomic.Uint32 {
+	return (*atomic.Uint32)(unsafe.Pointer(&m.SleepHint))
+}
+
 // loadState reads the handoff word with acquire semantics.
 func (h *winSysmsgHeader) loadState() uint32 { return h.state().Load() }
 

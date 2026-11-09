@@ -309,6 +309,25 @@ func winMadvise(addr, length uintptr, advice int) Errno {
 	return ENOTSUP
 }
 
+// workingSetExInfo matches PSAPI_WORKING_SET_EX_INFORMATION: the virtual
+// address followed by the attribute word. Bit 0 of the attribute word is Valid.
+type workingSetExInfo struct {
+	virtualAddress    uintptr
+	virtualAttributes uintptr
+}
+
+const (
+	mincoreBatch      = 4096
+	mincoreStackLimit = 256
+)
+
+var workingSetInfoPool = sync.Pool{
+	New: func() any {
+		buf := make([]workingSetExInfo, mincoreBatch)
+		return &buf
+	},
+}
+
 // winMincore implements mincore(2) with QueryWorkingSetEx. A page counts as
 // resident when it is valid in the process working set. A page that Windows trimmed
 // from the working set but still holds in memory reports as not resident.
@@ -325,17 +344,20 @@ func winMincore(addr, length, vecAddr uintptr) Errno {
 	pages := int(winRoundUp(length, winPageSize) / winPageSize)
 	vec := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&vecAddr))), pages)
 
-	// PSAPI_WORKING_SET_EX_INFORMATION: the address, then the attribute word.
-	// Bit 0 of the attribute word is Valid.
-	type workingSetExInfo struct {
-		virtualAddress    uintptr
-		virtualAttributes uintptr
+	var (
+		stackBuf [mincoreStackLimit]workingSetExInfo
+		infos    []workingSetExInfo
+	)
+	if pages <= mincoreStackLimit {
+		infos = stackBuf[:pages]
+	} else {
+		pooled := workingSetInfoPool.Get().(*[]workingSetExInfo)
+		defer workingSetInfoPool.Put(pooled)
+		infos = *pooled
 	}
-	const batch = 4096
-	infos := make([]workingSetExInfo, min(pages, batch))
 	process := uintptr(windows.CurrentProcess())
 	for done := 0; done < pages; {
-		n := min(pages-done, batch)
+		n := min(pages-done, len(infos))
 		for i := 0; i < n; i++ {
 			infos[i] = workingSetExInfo{virtualAddress: addr + uintptr(done+i)*winPageSize}
 		}

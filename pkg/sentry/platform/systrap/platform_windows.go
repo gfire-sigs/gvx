@@ -574,24 +574,30 @@ func (*Context) Preempt() {}
 
 // Release implements platform.Context.Release.
 func (c *Context) Release() {
-	if th := c.th.Swap(nil); th != nil {
-		th.destroy()
+	c.releaseThread()
+}
+
+func (c *Context) hintStubSleep() {
+	if th := c.th.Load(); th != nil {
+		if f := th.fast.Load(); f != nil {
+			f.slot.sm.sleepHint().Store(1)
+		}
 	}
 }
 
 // PrepareSleep implements platform.Context.PrepareSleep.
-func (*Context) PrepareSleep() {}
+func (c *Context) PrepareSleep() { c.hintStubSleep() }
 
 // PrepareUninterruptibleSleep implements platform.Context.PrepareUninterruptibleSleep.
-func (*Context) PrepareUninterruptibleSleep() {}
+func (c *Context) PrepareUninterruptibleSleep() { c.hintStubSleep() }
 
 // PrepareStop implements platform.Context.PrepareStop.
-func (*Context) PrepareStop() {}
+func (c *Context) PrepareStop() { c.hintStubSleep() }
 
 // PrepareExecve implements platform.Context.PrepareExecve.
-func (*Context) PrepareExecve() {}
+func (c *Context) PrepareExecve() { c.releaseThread() }
 
 // PrepareExit implements platform.Context.PrepareExit.
-func (*Context) PrepareExit() {}
+func (c *Context) PrepareExit() { c.releaseThread() }
 
 var _ interrupt.Receiver = (*Context)(nil)

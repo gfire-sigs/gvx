@@ -316,6 +316,41 @@ func TestSpillSleepsWhenSpinExpires(t *testing.T) {
 	r.checkHotExit(t, want)
 }
 
+func TestSpillSleepsEarlyWhenSleepHintIsSet(t *testing.T) {
+	r := newSpillRig(t)
+	m := r.m
+	want := r.guest
+	want[0] = 99
+	m.onYield = func(m *a64Machine) {
+		if m.yields == 2 {
+			m.put32(rigSysm+winOffSleepHint, 1)
+		}
+	}
+	r.onCallee = func(m *a64Machine, target uint64) {
+		if target != rigWaitFn {
+			return
+		}
+		if r.stubWaiter() != 1 {
+			t.Error("the stub slept without StubWaiter")
+		}
+		if got := m.get32(rigSysm + winOffSleepHint); got != 0 {
+			t.Errorf("SleepHint at wait = %d, want 0", got)
+		}
+		m.put64(rigSysm+winOffX, 99)
+		r.setState(winStateRunHot)
+	}
+	if err := m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if m.yields != 2 {
+		t.Fatalf("the stub polled %d times after SleepHint at yield 2, want 2", m.yields)
+	}
+	if len(r.callLog) != 1 || r.callLog[0] != "wait" {
+		t.Fatalf("calls = %v, want one NtWaitForSingleObject", r.callLog)
+	}
+	r.checkHotExit(t, want)
+}
+
 // checkSaved2 verifies the registers that the routine saved, except x0, which
 // the test changes during the wait.
 func (r *spillRig) checkSaved2(t *testing.T) {

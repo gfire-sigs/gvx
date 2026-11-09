@@ -117,6 +117,12 @@ type memoryGuard struct {
 	limit uint64
 	// used returns the current use in bytes.
 	used func() uint64
+	// flushScan clears the commit-scan rate limit before the final scan that
+	// precedes an idle wait.
+	flushScan func()
+	// idleActivity reports whether all guest tasks are asleep and returns the
+	// channel that closes when a task becomes runnable again.
+	idleActivity func() (<-chan struct{}, bool)
 	// interval is the time between two readings.
 	interval time.Duration
 	// kill stops the guest. The guard calls it once.
@@ -124,19 +130,38 @@ type memoryGuard struct {
 }
 
 // run reads the use every interval until ctx ends or the use passes the limit.
-// It calls kill and returns true in the second case.
+// It calls kill and returns true in the second case. When every guest task is
+// asleep, run completes one unthrottled scan and parks until a task wakes.
 func (g memoryGuard) run(ctx context.Context) bool {
-	tick := time.NewTicker(g.interval)
-	defer tick.Stop()
+	timer := time.NewTimer(g.interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return false
-		case <-tick.C:
+		case <-timer.C:
+			var (
+				idleCh  <-chan struct{}
+				wasIdle bool
+			)
+			if g.idleActivity != nil {
+				idleCh, wasIdle = g.idleActivity()
+				if wasIdle && g.flushScan != nil {
+					g.flushScan()
+				}
+			}
 			if g.used() > g.limit {
 				g.kill()
 				return true
 			}
+			if wasIdle {
+				select {
+				case <-ctx.Done():
+					return false
+				case <-idleCh:
+				}
+			}
+			timer.Reset(g.interval)
 		}
 	}
 }

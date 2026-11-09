@@ -246,6 +246,9 @@ type fastThread struct {
 	// Sentry. The thread is not suspended then. Callers hold the mutex of the
 	// thread.
 	inSpill bool
+	// recycled is true when the thread was recycled while waiting in the spill
+	// routine and has not yet entered guest code in the new context.
+	recycled bool
 	// trap describes the trap that put the thread in the spill routine.
 	trap winTrap
 	// resume is the state that the next run publishes.
@@ -260,6 +263,17 @@ type fastThread struct {
 }
 
 var errNoFastSlot = fmt.Errorf("the stub process already has %d fast threads", winMaxThreads)
+
+// hasFastSlotHeadroom reports whether sp still has enough unused or free fast
+// slots to serve a recycled address space.
+func (sp *stubProc) hasFastSlotHeadroom() bool {
+	sp.fast.mu.Lock()
+	defer sp.fast.mu.Unlock()
+	if sp.fast.closed {
+		return false
+	}
+	return winMaxThreads-len(sp.fast.all)+len(sp.fast.free) >= 16
+}
 
 // takeSlot returns a free slot or creates a new one.
 func (as *addressSpace) takeSlot() (*fastSlot, error) {
@@ -495,9 +509,13 @@ func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) erro
 		}
 	}
 	sm := f.slot.sm
-	f.resume = f.trap.resumeState(ac)
-	if f.resume == winStateRunHot && !th.archFastHot(ac) {
-		f.resume = winStateRunCold
+	if f.recycled {
+		f.resume = th.archFastRecycleStart(f, ac)
+	} else {
+		f.resume = f.trap.resumeState(ac)
+		if f.resume == winStateRunHot && !th.archFastHot(ac) {
+			f.resume = winStateRunCold
+		}
 	}
 	sm.Regs.loadFrom(ac)
 	sm.Target = archPC(ac)
@@ -513,8 +531,11 @@ func (th *thread) fastRun(f *fastThread) error {
 	// resume keeps the pin until the thread traps or parks again.
 	if f.resume == winStateRunCold {
 		f.slot.reader.clearPin()
+	} else {
+		f.recycled = false
 	}
 	f.slot.reader.goOnline()
+	f.slot.sm.sleepHint().Store(0)
 	if _, err := f.slot.sm.winSysmsgHeader.release(f.resume, f.slot); err != nil {
 		return th.ctxErr("SetEvent", err)
 	}
@@ -526,7 +547,11 @@ func (th *thread) fastRun(f *fastThread) error {
 // target with the state that a normal start loads. Callers hold mu.
 func (th *thread) fastExit(ac *arch.Context64, ev debugEvent) outcome {
 	f := th.fast.Load()
-	f.colds.Add(1)
+	if f.recycled {
+		f.recycled = false
+	} else {
+		f.colds.Add(1)
+	}
 	th.ctx.setPC(f.slot.sm.Target)
 	if err := th.park(ev); err != nil {
 		return fatal(err, unix.EFAULT)

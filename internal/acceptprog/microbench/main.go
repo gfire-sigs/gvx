@@ -260,6 +260,33 @@ func forkExecTrue(path string) func(n int) error {
 	}
 }
 
+// shmSparseIdle maps 256 MiB, faults one page every 64 KiB, and sleeps for two
+// seconds so the host harness can measure idle CPU usage over the sleep window.
+func shmSparseIdle() {
+	const (
+		mapSize = 256 << 20
+		stride  = 64 << 10
+		idleDur = 2 * time.Second
+	)
+	data, err := syscall.Mmap(-1, 0, mapSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED|syscall.MAP_ANONYMOUS)
+	if err != nil {
+		fmt.Printf("MICROBENCH_ERR shm_sparse_idle: mmap: %v\n", err)
+		return
+	}
+	defer syscall.Munmap(data)
+	for off := 0; off < len(data); off += stride {
+		data[off] = 1
+	}
+	time.Sleep(300 * time.Millisecond)
+	fmt.Println("MICROBENCH_WINDOW_START")
+	start := time.Now()
+	time.Sleep(idleDur)
+	elapsed := time.Since(start)
+	r := result{Name: "shm_sparse_idle", Iters: 1, TotalNs: elapsed.Nanoseconds(), NsPerOp: float64(elapsed.Nanoseconds())}
+	line, _ := json.Marshal(r)
+	fmt.Printf("MICROBENCH %s\n", line)
+}
+
 // scratchDir returns a directory that the guest can write.
 func scratchDir() string {
 	for _, d := range []string{"/tmp", "/dev/shm", "/workspace"} {
@@ -315,5 +342,8 @@ func main() {
 	}
 	if run("fork_exec_true") && trueFile != "" {
 		measure("fork_exec_true", 1500*time.Millisecond, 400, forkExecTrue(trueFile))
+	}
+	if run("shm_sparse_idle") {
+		shmSparseIdle()
 	}
 }

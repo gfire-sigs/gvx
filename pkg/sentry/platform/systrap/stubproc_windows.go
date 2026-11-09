@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -90,6 +91,10 @@ const (
 	// startTimeout bounds the wait for a new stub process or thread to reach its
 	// first stop.
 	startTimeout = 20 * time.Second
+
+	// maxFreeThreads is the maximum number of idle guest threads that a stub
+	// process retains for reuse across address spaces.
+	maxFreeThreads = 4
 )
 
 var (
@@ -141,9 +146,10 @@ type stubProc struct {
 	main  windows.Handle
 	level confinement
 
-	mu      sync.Mutex
-	threads map[uint32]*thread
-	closed  bool
+	mu          sync.Mutex
+	threads     map[uint32]*thread
+	freeThreads []*thread
+	closed      bool
 
 	dead    atomic.Bool
 	deadCh  chan struct{}
@@ -154,6 +160,10 @@ type stubProc struct {
 	unknownThread atomic.Uint64
 	droppedEvents atomic.Uint64
 
+	// win tracks the placeholder and view mappings across the guest windows.
+	win *guestWindows
+	// epochs tracks the threads that freed trampoline slots wait for.
+	epochs *slotEpochs
 	// internal is the section behind the engine pages of the window.
 	internal *anonSection
 
@@ -222,13 +232,17 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	// The layout is in ascending order, so the windows below 1 TiB, which can
 	// meet the stack and the PEB of the stub, come before the large high
 	// window.
+	wins := make([]*windowMap, 0, len(p.layout))
 	for _, w := range p.layout {
 		if err := virtualAllocPlaceholder(sp.proc, uintptr(w.base), uintptr(w.limit-w.base)); err != nil {
 			bringUpStats.windowNs.Add(uint64(time.Since(t1)))
 			bringUpStats.discarded.Add(1)
 			return fail(&windowTakenError{window: w.name, err: err})
 		}
+		wins = append(wins, newWindowMap(stubView{sp.proc}, w.base, w.limit))
 	}
+	sp.win = newGuestWindows(wins...)
+	sp.epochs = newSlotEpochs()
 	bringUpStats.windowNs.Add(uint64(time.Since(t1)))
 	t2 := time.Now()
 	if err := ntResumeThread(sp.main); err != nil {
@@ -260,19 +274,23 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 const poolDepth = 6
 
 // stubPool keeps ready stubs, so that a fork or an exec does not wait for the
-// loader of a new process. One goroutine fills the pool while the guests run.
+// loader of a new process. reused holds stubs that an earlier address space
+// released with a warm guest thread; ready holds newly started stubs that the
+// background goroutine fills while the guests run.
 type stubPool struct {
-	ready chan *stubProc
-	stop  chan struct{}
-	done  chan struct{}
+	reused chan *stubProc
+	ready  chan *stubProc
+	stop   chan struct{}
+	done   chan struct{}
 }
 
 // startPool starts the goroutine that fills the pool.
 func (p *Platform) startPool() {
 	p.pool = &stubPool{
-		ready: make(chan *stubProc, poolDepth),
-		stop:  make(chan struct{}),
-		done:  make(chan struct{}),
+		reused: make(chan *stubProc, poolDepth),
+		ready:  make(chan *stubProc, poolDepth),
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 	go p.fillPool()
 }
@@ -319,6 +337,9 @@ func (p *Platform) stopPool() {
 	var idle []*stubProc
 	for {
 		select {
+		case sp := <-p.pool.reused:
+			idle = append(idle, sp)
+			continue
 		case sp := <-p.pool.ready:
 			idle = append(idle, sp)
 			continue
@@ -334,10 +355,32 @@ func (p *Platform) stopPool() {
 	}
 }
 
+// spillMatches reports whether the engine pages of sp hold the current spill
+// routine of p.
+func (p *Platform) spillMatches(sp *stubProc) bool {
+	if !p.fast || sp.internal == nil {
+		return true
+	}
+	code := p.spill.code
+	return bytes.Equal(sp.internal.local[winSpillOffset:winSpillOffset+len(code)], code)
+}
+
 // newStubProc returns a ready stub from the pool, or creates one when the pool
-// is empty.
+// is empty. It prefers a recycled stub that already holds a warm guest thread.
 func (p *Platform) newStubProc() (*stubProc, error) {
 	if p.pool != nil {
+		for {
+			select {
+			case sp := <-p.pool.reused:
+				if sp.dead.Load() || !p.spillMatches(sp) {
+					sp.destroy()
+					continue
+				}
+				return sp, nil
+			default:
+			}
+			break
+		}
 		for {
 			select {
 			case sp := <-p.pool.ready:
@@ -380,6 +423,8 @@ func (sp *stubProc) destroy() {
 		return
 	}
 	sp.closed = true
+	freeThreads := sp.freeThreads
+	sp.freeThreads = nil
 	threads := make([]*thread, 0, len(sp.threads))
 	for _, th := range sp.threads {
 		threads = append(threads, th)
@@ -392,6 +437,14 @@ func (sp *stubProc) destroy() {
 	_, _ = windows.WaitForSingleObject(sp.proc, 10_000)
 	sp.markDead(errStubReleased)
 	sp.p.dbg.unregister(sp.pid)
+	for _, th := range freeThreads {
+		th.releaseFast()
+	}
+	sp.closeFast()
+	if sp.internal != nil {
+		sp.internal.close()
+		sp.internal = nil
+	}
 	for _, th := range threads {
 		th.closeHandle()
 	}

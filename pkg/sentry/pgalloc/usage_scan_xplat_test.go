@@ -17,6 +17,10 @@ package pgalloc
 import (
 	"runtime"
 	"testing"
+	"time"
+
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 func TestCanSkipUsageScan(t *testing.T) {
@@ -26,5 +30,46 @@ func TestCanSkipUsageScan(t *testing.T) {
 	}
 	if got, want := canSkipUsageScan(cgroups), runtime.GOOS == "linux"; got != want {
 		t.Errorf("canSkipUsageScan(one cgroup) on %s = %t, want %t", runtime.GOOS, got, want)
+	}
+}
+
+func TestCoalesceScanRangeBridgesSmallCommittedIslands(t *testing.T) {
+	var f MemoryFile
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	const stride = 64 << 10
+	const page = 4 << 10
+	insert := func(r memmap.FileRange, committed bool) {
+		f.memAcct.Insert(f.memAcct.FindGap(r.Start), r, memAcctInfo{
+			kind:           usage.Anonymous,
+			knownCommitted: committed,
+		})
+	}
+	for i := uint64(0); i < 8; i++ {
+		base := i * stride
+		insert(memmap.FileRange{Start: base, End: base + page}, true)
+		insert(memmap.FileRange{Start: base + page, End: base + stride}, false)
+	}
+	// Add a large committed region (> 64 KiB) followed by another uncommitted page.
+	largeStart := uint64(8 * stride)
+	largeEnd := largeStart + (128 << 10)
+	insert(memmap.FileRange{Start: largeStart, End: largeEnd}, true)
+	insert(memmap.FileRange{Start: largeEnd, End: largeEnd + page}, false)
+
+	firstUncommitted := f.memAcct.LowerBoundSegment(page)
+	got := f.coalesceScanRangeLocked(firstUncommitted, 0, nil)
+	want := memmap.FileRange{Start: page, End: largeStart}
+	if got != want {
+		t.Fatalf("coalesceScanRangeLocked = %v, want %v", got, want)
+	}
+}
+
+func TestFlushCommitScanResetsNextScanTime(t *testing.T) {
+	var f MemoryFile
+	f.nextCommitScan = time.Now().Add(time.Minute)
+	f.FlushCommitScan()
+	if !f.nextCommitScan.IsZero() {
+		t.Fatalf("nextCommitScan = %v after FlushCommitScan, want zero time", f.nextCommitScan)
 	}
 }
