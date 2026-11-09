@@ -264,17 +264,6 @@ type fastThread struct {
 
 var errNoFastSlot = fmt.Errorf("the stub process already has %d fast threads", winMaxThreads)
 
-// hasFastSlotHeadroom reports whether sp still has enough unused or free fast
-// slots to serve a recycled address space.
-func (sp *stubProc) hasFastSlotHeadroom() bool {
-	sp.fast.mu.Lock()
-	defer sp.fast.mu.Unlock()
-	if sp.fast.closed {
-		return false
-	}
-	return winMaxThreads-len(sp.fast.all)+len(sp.fast.free) >= 16
-}
-
 // takeSlot returns a free slot or creates a new one.
 func (as *addressSpace) takeSlot() (*fastSlot, error) {
 	sp := as.sp

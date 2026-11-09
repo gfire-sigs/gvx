@@ -326,7 +326,7 @@ The host creates each stub with `CreateProcessAsUser`. It uses a copy of its own
 
 A stub reaches the ready state in four steps. The Sentry reserves each guest window as one placeholder while the stub is suspended. It resumes the initial thread, and the loader runs. The loader raises the initial breakpoint of a debuggee. The Sentry suspends the initial thread there, replies, and never resumes it. The stub is then fully initialized and idle.
 
-The platform keeps six ready stubs in a pool. One goroutine fills the pool while the guests run, and a fork or an exec takes a stub from it. When every guest thread of an address space exits or leaves for an exec, the engine parks up to four warm threads in `freeThreads`. `AddressSpace.Release` then unmaps the guest range and returns the stub and its warm threads to the pool. A next address space reuses that stub and its thread without a process start or a first thread stop. `Close` terminates the stubs that no guest took.
+The platform keeps six ready stubs in a pool. One goroutine fills the pool while the guests run, and a fork or an exec takes a stub from it. The pool holds only stubs that no guest ran in. `AddressSpace.Release` terminates the stub, because guest code runs natively in it and can leave threads, memory, or register values that an unmap does not remove. A guest thread that exits goes to a list of up to four free threads of its stub, and the next clone in the same address space takes it without a thread start or a first thread stop. `Close` terminates the stubs that no guest took.
 
 ### 6.2 Address Space
 

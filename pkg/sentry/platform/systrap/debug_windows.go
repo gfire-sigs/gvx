@@ -310,11 +310,13 @@ func (d *debugger) lookup(pid uint32) *stubProc {
 func (d *debugger) run() {
 	runtime.LockOSThread()
 	defer close(d.done)
-	// A failed open only costs the poll time at close.
+	// A failed open only costs the poll time at close. With the alert handle,
+	// close ends the wait at once, so the pump wakes once a second when no
+	// event comes. A failed alert then costs at most that second.
 	waitTimeout := 50 * time.Millisecond
 	if h, err := windows.OpenThread(threadAlert, false, windows.GetCurrentThreadId()); err == nil {
 		d.pump = h
-		waitTimeout = 0
+		waitTimeout = time.Second
 	}
 	close(d.ready)
 	var rec [debugRecordSize]byte

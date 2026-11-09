@@ -184,19 +184,13 @@ func parseDebugEvent(b *[debugRecordSize]byte) debugEvent {
 	return ev
 }
 
-// ntWaitForDebugEvent waits up to timeout for one event, or without a timeout
-// when timeout <= 0. It returns false on a timeout or an alert.
+// ntWaitForDebugEvent waits up to timeout for one event. It returns false on
+// a timeout or an alert.
 func ntWaitForDebugEvent(dbg windows.Handle, timeout time.Duration, buf *[debugRecordSize]byte) (bool, error) {
-	// A negative value is a relative time in 100ns units; a zero pointer waits
-	// until an event or an alert arrives. The wait is alertable, so
-	// NtAlertThread ends it at once and returns false.
-	var tp uintptr
-	var t int64
-	if timeout > 0 {
-		t = -int64(timeout / 100)
-		tp = uintptr(unsafe.Pointer(&t))
-	}
-	st, _, _ := procNtWaitForDebugEvent.Call(uintptr(dbg), 1, tp, uintptr(unsafe.Pointer(buf)))
+	// A negative value is a relative time in 100ns units. The wait is alertable,
+	// so NtAlertThread ends it at once. It then returns false.
+	t := -int64(timeout / 100)
+	st, _, _ := procNtWaitForDebugEvent.Call(uintptr(dbg), 1, uintptr(unsafe.Pointer(&t)), uintptr(unsafe.Pointer(buf)))
 	switch uint32(st) {
 	case 0:
 		return true, nil

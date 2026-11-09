@@ -798,7 +798,10 @@ func TestPooledStubServesNewAddressSpace(t *testing.T) {
 	t.Errorf("the address space runs in stub %d, which is not one of the pooled stubs %v", as.sp.pid, pooled)
 }
 
-func TestStubAndThreadRecycledAcrossAddressSpaces(t *testing.T) {
+// TestReleasedStubNeverServesAnotherAddressSpace checks that a stub process
+// ends with its address space. Guest code runs natively in the stub, so a
+// stub that served one guest process must not serve the next one.
+func TestReleasedStubNeverServesAnotherAddressSpace(t *testing.T) {
 	p := newPlatform(t)
 	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
 	if err != nil {
@@ -811,23 +814,42 @@ func TestStubAndThreadRecycledAcrossAddressSpaces(t *testing.T) {
 	if si, _, err := r1.run(); si != nil || err != nil || regNr(r1.ac) != 401 {
 		t.Fatalf("r1 Switch = (%s, %v), number %d", describe(si), err, regNr(r1.ac))
 	}
-	pid1 := r1.as.sp.pid
-	tid1 := r1.ctx.th.Load().tid
+	sp1 := r1.as.sp
 	r1.ctx.PrepareExit()
 	r1.as.Release()
+	if !sp1.dead.Load() {
+		t.Errorf("stub pid %d is alive after the release of its address space", sp1.pid)
+	}
 
 	r2 := newRigOn(t, p, mf)
 	r2.program(gSyscall(402))
 	if si, _, err := r2.run(); si != nil || err != nil || regNr(r2.ac) != 402 {
 		t.Fatalf("r2 Switch = (%s, %v), number %d", describe(si), err, regNr(r2.ac))
 	}
-	pid2 := r2.as.sp.pid
-	tid2 := r2.ctx.th.Load().tid
-	if pid2 != pid1 {
-		t.Errorf("second address space used stub pid %d, want recycled stub pid %d", pid2, pid1)
+	// Windows can give the PID of the dead stub to a new process, so the test
+	// compares the stub objects.
+	if r2.as.sp == sp1 {
+		t.Errorf("the second address space runs in stub pid %d of the first address space", sp1.pid)
 	}
-	if tid2 != tid1 {
-		t.Errorf("second context used thread tid %d, want recycled thread tid %d", tid2, tid1)
+}
+
+// TestThreadRecycledInsideAddressSpace checks that a guest thread that exits
+// serves the next context of the same address space.
+func TestThreadRecycledInsideAddressSpace(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	r.program(gSyscall(5))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 5, r.ac)
+	tid1 := r.ctx.th.Load().tid
+	r.ctx.PrepareExit()
+
+	t2 := r.newThread()
+	t2.ac.SetIP(codeVA)
+	t2.ac.SetStack(stackVA + blockSize/2)
+	si, _, err = t2.run()
+	mustSyscall(t, si, err, 5, t2.ac)
+	if got := t2.ctx.th.Load().tid; got != tid1 {
+		t.Errorf("the second context runs on thread %d, want the recycled thread %d", got, tid1)
 	}
 }
 

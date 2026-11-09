@@ -204,6 +204,8 @@ func (th *thread) resumeParked() error {
 	th.parked = false
 	if f := th.fast.Load(); f != nil {
 		f.slot.reader.goOnline()
+		// The Sentry waits for this thread now, so the next trap spins first.
+		f.slot.sm.sleepHint().Store(0)
 	}
 	if err := ntResumeThread(th.h); err != nil {
 		return th.ctxErr("NtResumeThread", err)

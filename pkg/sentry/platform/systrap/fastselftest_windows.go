@@ -45,7 +45,6 @@ func (p *Platform) selfTestFast() error {
 		return fmt.Errorf("%w: %v", errFastSelfTest, err)
 	}
 	defer as.Release()
-	defer as.sp.destroy()
 	const codeAddr, stackAddr = 0x5555_0000_0000, 0x7000_0000_0000
 	mm := &probeMM{as: as}
 	if err := as.installCode(context.Background(), mm, codeAddr, probeProgram(selfTestCalls)); err != nil {

@@ -6,7 +6,21 @@ name: benchmark
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**", "LICENSE", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml", ".github/workflows/pjdfstest.yml"]
+    # Run only for changes that can move the numbers. The weekly run covers
+    # the rest, and AGENTS.md section 5.1 asks for low CI usage.
+    paths:
+      - "pkg/sentry/platform/**"
+      - "pkg/sentry/pgalloc/**"
+      - "pkg/sentry/kernel/**"
+      - "pkg/sentry/mm/**"
+      - "pkg/hostlockdown/**"
+      - "pkg/gvx/**"
+      - "internal/xsys/**"
+      - "internal/acceptprog/microbench/**"
+      - "internal/benchreport/**"
+      - "e2e/microbench_e2e_test.go"
+      - "e2e/bench_cpu_*.go"
+      - ".github/workflows/benchmark.yml"
   schedule:
     - cron: "0 5 * * 1"
   workflow_dispatch:
@@ -16,9 +30,11 @@ on:
         default: "3"
         type: string
 
+# One run at a time for each ref. A new run waits and does not cancel the
+# running one. GitHub keeps only the newest waiting run.
 concurrency:
   group: benchmark-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -87,8 +103,14 @@ jobs:
   publish:
     name: publish results to bench-results
     needs: bench
+    # Publish the platforms that finished, also when one platform failed.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Runs of different refs share the one results branch.
+    concurrency:
+      group: benchmark-publish
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -110,35 +132,37 @@ jobs:
           BENCH_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          git fetch origin bench-results:bench-results 2>/dev/null || true
-          if git show-ref --verify --quiet refs/heads/bench-results; then
-            git worktree add bench-results-tree bench-results
-          else
-            git worktree add --detach bench-results-tree
-            (
-              cd bench-results-tree
-              git checkout --orphan bench-results
-              git rm -rf . >/dev/null 2>&1 || true
-            )
-          fi
-          go run ./internal/benchreport \
-            -input-dir bench-artifacts \
-            -outdir bench-results-tree \
-            -commit "$BENCH_COMMIT" \
-            -branch "$BENCH_BRANCH"
-          cd bench-results-tree
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add history.ndjson latest.json README.md
-          if git diff --cached --quiet; then
-            echo "No benchmark changes to commit."
-            exit 0
-          fi
-          git commit -m "chore(bench): record benchmark results for ${BENCH_COMMIT:0:8}"
+          go build -o benchreport ./internal/benchreport
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Each attempt builds the files again on top of the newest branch, so
+          # a push that lost a race never needs a merge of generated files.
           for attempt in 1 2 3; do
-            if git push origin HEAD:refs/heads/bench-results; then
-              break
+            rm -rf bench-results-tree
+            git worktree prune
+            if git fetch origin "+refs/heads/bench-results:refs/remotes/origin/bench-results" 2>/dev/null; then
+              git worktree add --detach bench-results-tree origin/bench-results
+            else
+              git worktree add --detach bench-results-tree
+              git branch -D bench-results-new >/dev/null 2>&1 || true
+              git -C bench-results-tree checkout --orphan bench-results-new
+              git -C bench-results-tree rm -rf . >/dev/null 2>&1 || true
             fi
-            git fetch origin bench-results
-            git rebase origin/bench-results
+            ./benchreport \
+              -input-dir bench-artifacts \
+              -outdir bench-results-tree \
+              -commit "$BENCH_COMMIT" \
+              -branch "$BENCH_BRANCH"
+            git -C bench-results-tree add history.ndjson latest.json README.md
+            if git -C bench-results-tree diff --cached --quiet; then
+              echo "No benchmark changes to commit."
+              exit 0
+            fi
+            git -C bench-results-tree commit -q -m "chore(bench): record benchmark results for ${BENCH_COMMIT:0:8}"
+            if git -C bench-results-tree push origin HEAD:refs/heads/bench-results; then
+              exit 0
+            fi
+            echo "push attempt $attempt lost a race; retrying" >&2
           done
+          echo "could not push to bench-results after 3 attempts" >&2
+          exit 1
