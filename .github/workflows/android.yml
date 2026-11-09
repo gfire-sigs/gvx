@@ -1,8 +1,9 @@
-# Runs the Android probe and the systrap guest probes on an Android 16 emulator
-# with 16 KB pages (GVXIP-006 P1-4). The hosted macOS runner is a virtual
-# machine without a hypervisor, so the emulator runs in software (-accel off)
-# and boots slowly. The workflow runs by hand, and on a pull request only when
-# this file changes.
+# Runs the Android probe and the systrap guest probes on an x86_64 Android 16
+# emulator (GVXIP-006 P1-4). Google ships no Linux arm64 emulator, and the
+# arm64 emulator of macOS needs Hypervisor.framework, which the hosted macOS
+# runner lacks. The Linux runner has KVM, so the x86_64 image boots there, and
+# rungv builds for android/amd64 with cgo. The workflow runs by hand, and on a
+# pull request only when this file or the smoke script changes.
 name: android
 
 on:
@@ -10,17 +11,18 @@ on:
   pull_request:
     paths:
       - .github/workflows/android.yml
+      - scripts/android/emulator-smoke.sh
 
 permissions:
   contents: read
 
 jobs:
   emulator:
-    name: emulator android-36 arm64 16 KB
-    runs-on: macos-15
-    timeout-minutes: 60
+    name: emulator android-36 x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
-      ANDROID_IMAGE: system-images;android-36;google_apis_playstore_ps16k;arm64-v8a
+      ANDROID_IMAGE: system-images;android-36;google_apis;x86_64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -28,28 +30,26 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Install the emulator and the system image
+      - name: Enable KVM
         run: |
-          export JAVA_HOME="$JAVA_HOME_17_arm64"
-          sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-          if [ ! -x "$sdk/cmdline-tools/latest/bin/sdkmanager" ]; then
-            mkdir -p "$sdk/cmdline-tools"
-            curl -fsSL -o tools.zip https://dl.google.com/android/repository/commandlinetools-mac-13114758_latest.zip
-            unzip -q tools.zip -d "$sdk/cmdline-tools"
-            mv "$sdk/cmdline-tools/cmdline-tools" "$sdk/cmdline-tools/latest"
-          fi
-          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
-          "$sdk/cmdline-tools/latest/bin/sdkmanager" emulator platform-tools "$ANDROID_IMAGE" > /dev/null
-          echo no | "$sdk/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$ANDROID_IMAGE" -d pixel_6
-          echo "ANDROID_SDK=$sdk" >> "$GITHUB_ENV"
-          echo "$sdk/platform-tools" >> "$GITHUB_PATH"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install the emulator, the system image, and the NDK
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null
+          "$sdkmanager" emulator platform-tools "ndk;28.2.13676358" "$ANDROID_IMAGE" > /dev/null
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$ANDROID_IMAGE" -d pixel_6
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
       # adb wait-for-device has no time limit, so the step polls adb with a
       # deadline. It fails at once when the emulator exits, and it prints the
-      # boot state and the emulator log every 5 minutes.
+      # boot state and the emulator log every 2 minutes.
       - name: Boot the emulator
-        timeout-minutes: 40
+        timeout-minutes: 20
         run: |
-          "$ANDROID_SDK/emulator/emulator" -avd ci -accel off -no-window -no-audio -no-boot-anim \
+          "$ANDROID_HOME/emulator/emulator" -avd ci -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -no-metrics > emulator.log 2>&1 &
           pid=$!
           start=$(date +%s)
@@ -59,14 +59,14 @@ jobs:
               cat emulator.log
               exit 1
             fi
-            booted=$(adb shell getprop sys.boot_completed 2> /dev/null | tr -d '\r' || true)
+            booted=$(timeout 10 adb shell getprop sys.boot_completed 2> /dev/null | tr -d '\r' || true)
             [ "$booted" = 1 ] && exit 0
             elapsed=$(( $(date +%s) - start ))
-            if [ $(( elapsed % 300 )) -lt 10 ]; then
-              echo "after ${elapsed}s: adb state $(adb get-state 2>&1 | tr -d '\r'), boot_completed '${booted}'"
+            if [ $(( elapsed % 120 )) -lt 10 ]; then
+              echo "after ${elapsed}s: adb state $(timeout 10 adb get-state 2>&1 | tr -d '\r'), boot_completed '${booted}'"
               tail -5 emulator.log
             fi
-            if [ "$elapsed" -ge 2280 ]; then
+            if [ "$elapsed" -ge 1080 ]; then
               echo "the emulator did not boot in ${elapsed}s"
               tail -50 emulator.log
               exit 1
