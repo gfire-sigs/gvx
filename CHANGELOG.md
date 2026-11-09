@@ -2,7 +2,7 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.12.10002026110200] - 2026-11-10
 
 This release lowers the host CPU use of Windows sandboxes. An idle sandbox no longer scans its memory usage, and the Windows `systrap` engine spins less and keeps exited guest threads for the next clone. A new workflow records benchmark results of the five targets on the `bench-results` branch.
 
