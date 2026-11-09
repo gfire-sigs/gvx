@@ -244,6 +244,7 @@ Each test uses the real producer of the data that it checks, as section 6 of `AG
 | T5-2 | A guest stores into the 4 KB page of its own code inside one 16 KB host page. | Guest program | The fault loop of F13 |
 | T5-3 | A guest maps a file shared, and a `write` system call changes it. The mapping shows the new bytes. | Guest program | Stale private copies |
 | T5-4 | `TestE2ESystrapSparePages` passes on the 16 KB emulator image and with `GVX_SYSTRAP_SUBBLOCKS=1` on `linux/arm64`. | Guest program | Spare pages that hide guest pages |
+| T5-5 | The guest probes pass on the `arm64-16k` kernel of Debian trixie in QEMU (`linux16k.yml`). QEMU runs without LPA2: with 52 address bits, the Sentry places guest memory above 48 bits, and the guest Go runtime rejects it. | Guest programs | A 16 KB host gap outside the emulator |
 
 ---
 

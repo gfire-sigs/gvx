@@ -1,0 +1,37 @@
+# Runs the systrap guest probes on a Linux arm64 kernel with 16 KB pages
+# (GVXIP-006 P5). The hosted runners have 4 KB pages, so the job boots the
+# arm64-16k kernel of Debian trixie in QEMU. The workflow runs by hand, and on
+# a pull request that changes the engine, the memory manager, or this job.
+name: linux16k
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/linux16k.yml
+      - scripts/linux16k/**
+      - pkg/sentry/platform/systrap/**
+      - pkg/sentry/mm/**
+      - pkg/sentry/pgalloc/**
+
+permissions:
+  contents: read
+
+jobs:
+  qemu:
+    name: qemu arm64 16 KB kernel
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install QEMU
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y qemu-system-arm cpio > /dev/null
+      - name: Run the guest probes on the 16 KB kernel
+        run: scripts/linux16k/run.sh
