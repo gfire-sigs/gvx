@@ -4,7 +4,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-This release fixes a packet race in the network stack and a gap in the thread binding of the Windows lockdown. It also makes a fork and an exec under the Windows `systrap` engine faster again. Version `v0.12.10002026110200` stopped the reuse of a stub across address spaces, which made them slower.
+This release fixes a packet race in the network stack and a gap in the thread binding of the Windows lockdown. It also makes a fork and an exec under the Windows `systrap` engine faster again. Version `v0.12.10002026110200` ended each stub with its address space, so a stub no longer serves a second address space. That change made a fork and an exec slower.
 
 ### Performance
 
@@ -30,7 +30,7 @@ This release lowers the host CPU use of Windows sandboxes. An idle sandbox no lo
 
 - **Idle memory guard**: the memory guard of `gvx.Resources` scanned the committed pages of the memory file at each interval, also when no task ran. On Windows, each scan called `K32QueryWorkingSetEx` for each uncommitted range. An idle sandbox with sparse shared memory or `tmpfs` pages used 8% to 19% of one core. The guard now completes one scan after the last task stops, and then waits until a task runs again (`Kernel.IdleTaskActivityChan`). The scan joins uncommitted ranges across committed gaps of up to 64 KiB, to at most 16 MiB for each call. The Windows scan uses a stack buffer or a pooled buffer for its query. On the hosted `windows/amd64` runner, `shm_sparse_idle` uses 0.0% of one core with `whpx` and 2.5% with `systrap`.
 - **Spin of the Windows `systrap` engine**: the Sentry and the stub each spin on the `winSysmsg` page before they sleep on an event. A stub kept its spin while the Sentry blocked in a long system call, a sleep, or a stop. The Sentry now sets the `SleepHint` word of the page before it blocks, and the stub then ends its spin and sleeps on its event. The word is a hint only; the wake protocol is unchanged.
-- **Guest threads of the Windows `systrap` engine**: a guest thread that exits or leaves for an exec now goes to a list of up to four free threads of its stub. The next clone in the same address space takes it, without a thread start and its first debug stop. A stub still serves one address space only, and `AddressSpace.Release` terminates it.
+- **Guest threads of the Windows `systrap` engine**: a guest thread that exits or leaves for an exec now goes to a list of up to four free threads of its stub. The next clone in the same address space takes it, without a thread start and its first debug stop. A stub now serves one address space only, and `AddressSpace.Release` terminates it. Earlier releases gave a released stub to the next address space.
 - **Thread binding of the Windows lockdown**: `hostlockdown.BindThread` runs on each `Switch`. It now reads the restricted token atomically and looks up the thread in a cache without a lock.
 - **Debug pump of the Windows `systrap` engine**: the pump waits up to 1 second for a debug event, not 50 ms, when `Close` can alert it. An idle engine wakes once a second, not 20 times.
 
