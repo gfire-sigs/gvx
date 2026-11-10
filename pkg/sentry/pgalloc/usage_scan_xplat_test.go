@@ -28,7 +28,7 @@ func TestCanSkipUsageScan(t *testing.T) {
 	if !canSkipUsageScan(nil) {
 		t.Error("canSkipUsageScan(nil) = false, want true: a scan of all memory trusts the block count")
 	}
-	if got, want := canSkipUsageScan(cgroups), runtime.GOOS == "linux"; got != want {
+	if got, want := canSkipUsageScan(cgroups), runtime.GOOS == "linux" || runtime.GOOS == "android"; got != want {
 		t.Errorf("canSkipUsageScan(one cgroup) on %s = %t, want %t", runtime.GOOS, got, want)
 	}
 }

@@ -22,11 +22,11 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
-// sharedChunkMemory is true on Linux and Windows and false on macOS. Both
-// Linux and Windows systrap platforms map writable guest pages by the host
-// descriptor or handle of the memory file, whereas macOS platforms map guest
-// pages by host pointer.
-const sharedChunkMemory = runtime.GOOS == "linux" || runtime.GOOS == "windows"
+// sharedChunkMemory is true on Linux, Android, and Windows, and false on macOS.
+// Linux, Android, and Windows systrap platforms map writable guest pages by the
+// host descriptor or handle of the memory file, whereas macOS platforms map
+// guest pages by host pointer.
+const sharedChunkMemory = runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "windows"
 
 // memoryFileChunks lets hostfs and ext4lite keep the chunks of mapped files in
 // the kernel memory file.

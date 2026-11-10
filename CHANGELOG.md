@@ -2,6 +2,17 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Shared file mappings on Android (`GOOS=android`)**: `pkg/gvx` enabled shared chunk memory only when `runtime.GOOS` was `"linux"` or `"windows"`. On Android (`runtime.GOOS == "android"`), `hostfs` and `ext4lite` kept mapped file chunks on the Go heap, which the `systrap` stub subprocess cannot map by file descriptor. `sharedChunkMemory`, `canSkipUsageScan`, `pageFits`, `backwardsError`, and the architecture check of `Config.Validate` now treat `"android"` like `"linux"`.
+- **Android host facility probe (`tools/androidprobe`)**: when SELinux denies the read of `/proc/sys/vm/mmap_min_addr` on Android, `androidprobe report` now measures the lowest mappable page up to `0x10000` with `MAP_FIXED_NOREPLACE` and checks that the page below it fails with `EPERM` or `EACCES`. In an initramfs without `/bin/sh`, the `ptrace_singlestep` check now traces the `androidprobe` executable itself.
+
+### Tests
+
+- **16 KB Linux and Android CI suites (`linux16k.yml` and `android.yml`)**: both workflows now verify zero exit codes, `androidprobe report`, fixed-address and shared-page ELF guests, `brkgrow`, `membarrierprobe`, `eintrprobe`, `codewrite` with shared file writes on `hostfs` and `ext4lite`, `fsfeatures` on `hostfs` and `ext4lite`, and two-sandbox `voltree` persistence. `scripts/android/emulator-smoke.sh` also builds and runs `probe.apk` (`dev.gfire.gvx.probe`) and `gvx-sample.apk` (`dev.gfire.gvx.sample/.RunService`) as `untrusted_app` on `x86_64` and `arm64-v8a`.
+
 ## [v0.12.10012026110200] - 2026-11-10
 
 This release fixes a packet race in the network stack and a gap in the thread binding of the Windows lockdown. It also makes a fork and an exec under the Windows `systrap` engine faster again. Version `v0.12.10002026110200` ended each stub with its address space, so a stub no longer serves a second address space. That change made a fork and an exec slower.

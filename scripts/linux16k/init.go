@@ -15,9 +15,11 @@
 //go:build ignore
 
 // Command init is process 1 of the initramfs that scripts/linux16k/run.sh
-// boots in QEMU on a Linux kernel with 16 KB pages. It runs rungv with each
-// guest probe in /guests, prints "PASS name" or "FAIL name" for each, prints
-// "VMSMOKE-OK" when all pass, and powers off the machine.
+// boots in QEMU on a Linux kernel with 16 KB pages. It runs androidprobe
+// report, generates the synthetic ELF guests in /tmp/elfguests, runs rungv
+// with each guest probe in /tmp/elfguests and /guests, prints "PASS name" or
+// "FAIL name" for each, prints "VMSMOKE-OK" when all pass, and powers off the
+// machine.
 package main
 
 import (
@@ -102,7 +104,9 @@ func main() {
 		}
 	}
 
-	ok := runProbeReport() && buildELFGuests()
+	reportOK := runProbeReport()
+	elvesOK := buildELFGuests()
+	ok := reportOK && elvesOK
 	for _, s := range steps {
 		if !runStep(s) {
 			ok = false
@@ -136,7 +140,7 @@ func buildELFGuests() bool {
 }
 
 func runStep(s step) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	var out bytes.Buffer
 	args := append([]string{"run", "-platform=systrap", "-net=none"}, s.args...)

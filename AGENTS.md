@@ -125,7 +125,7 @@ The workflow `.github/workflows/ci.yml` builds and vets all five targets, runs t
 The workflow `.github/workflows/pjdfstest.yml` runs the POSIX suite `pjdfstest` on `ext4lite` or `hostfs` volumes when that driver or the harness changes. Record a host limit in `scripts/pjdfstest/known-failures.txt`, and fix every other failure.
 The workflow `.github/workflows/release.yml` builds, attests, and publishes the archives of a `v*` tag. It runs on a pull request only when the workflow file changes.
 The workflow `.github/workflows/android.yml` runs `scripts/android/emulator-smoke.sh` on an x86_64 Android 16 emulator with KVM. The `arm64` emulator needs a hypervisor, which no hosted runner offers. Start it by hand.
-The workflow `.github/workflows/linux16k.yml` boots the `arm64-16k` kernel of Debian trixie in QEMU and runs `scripts/linux16k/run.sh`, which runs the guest probes on 16 KB pages. It runs on pull requests that change `systrap`, `mm`, or `pgalloc`.
+The workflow `.github/workflows/linux16k.yml` boots the `arm64-16k` kernel of Debian trixie in QEMU and runs `scripts/linux16k/run.sh`, which runs the host facility report and the guest probes on 16 KB pages. Both workflows run on pull requests that change `systrap`, `mm`, `pgalloc`, `hostlockdown`, `chunkcache`, `hostfs`, `ext4lite`, or their harnesses.
 
 Native shim tests reexecute production `Main` without `GVX_SHIM_BINARY`. The existing Windows/arm64 job runs the shim package explicitly.
 Explicit interoperability tests use `GVX_SHIM_BINARY`; the private external-daemon test also requires `GVX_CONTAINERD_BINARY`. The [README procedure](README.md#23-containerd-control-shim-procedural-module) separates those smoke tests from guest workloads.

@@ -12,27 +12,41 @@ android_jar="$android_sdk/platforms/${ANDROID_PLATFORM:-android-36}/android.jar"
 android_abi=${ANDROID_ABI:-arm64-v8a}
 android_java_bin=${JAVA_HOME:+$JAVA_HOME/bin/}
 
-# android_go_lib DIR NAME PKG builds the Go command PKG for android_abi as
-# DIR/lib/$android_abi/NAME, so Android extracts it to the native library
-# directory, where an app may run it.
-android_go_lib() {
-	local go_env
+# android_go_env sets android_arch and the array android_env for android_abi.
+android_go_env() {
 	case "$android_abi" in
 	arm64-v8a)
-		go_env=(GOOS=android GOARCH=arm64 CGO_ENABLED=0)
+		android_arch=arm64
+		android_env=(GOOS=android GOARCH=arm64 CGO_ENABLED=0)
 		;;
 	x86_64)
-		local ndk=${ANDROID_NDK_HOME:-$(ls -d "$android_sdk"/ndk/* | sort -V | tail -1)}
-		local host=$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64
-		go_env=(GOOS=android GOARCH=amd64 CGO_ENABLED=1 "CC=$ndk/toolchains/llvm/prebuilt/$host/bin/x86_64-linux-android31-clang")
+		android_arch=amd64
+		local ndk=${ANDROID_NDK_HOME:-}
+		if [ -z "$ndk" ] && [ -d "$android_sdk/ndk" ]; then
+			ndk=$(ls -d "$android_sdk"/ndk/* 2>/dev/null | sort -V | tail -1 || true)
+		fi
+		if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+			echo "ANDROID_ABI=x86_64 needs an NDK under ANDROID_NDK_HOME or $android_sdk/ndk" >&2
+			return 1
+		fi
+		local host
+		host=$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64
+		android_env=(GOOS=android GOARCH=amd64 CGO_ENABLED=1 "CC=$ndk/toolchains/llvm/prebuilt/$host/bin/x86_64-linux-android31-clang")
 		;;
 	*)
 		echo "unsupported ANDROID_ABI $android_abi" >&2
 		return 1
 		;;
 	esac
+}
+
+# android_go_lib DIR NAME PKG builds the Go command PKG for android_abi as
+# DIR/lib/$android_abi/NAME, so Android extracts it to the native library
+# directory, where an app may run it.
+android_go_lib() {
+	android_go_env
 	mkdir -p "$1/lib/$android_abi"
-	(cd "$android_root" && env "${go_env[@]}" \
+	(cd "$android_root" && env "${android_env[@]}" \
 		go build -trimpath -o "$1/lib/$android_abi/$2" "$3")
 }
 

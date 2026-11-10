@@ -15,22 +15,10 @@ trap 'rm -rf "$work"' EXIT
 dir=/data/local/tmp/gvx-smoke
 
 abi=$(adb shell getprop ro.product.cpu.abi | tr -d '\r')
-case "$abi" in
-arm64-v8a)
-	arch=arm64
-	android_env=(GOOS=android GOARCH=arm64 CGO_ENABLED=0)
-	;;
-x86_64)
-	arch=amd64
-	ndk=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:?set ANDROID_HOME}"/ndk/* | sort -V | tail -1)}
-	host=$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64
-	android_env=(GOOS=android GOARCH=amd64 CGO_ENABLED=1 "CC=$ndk/toolchains/llvm/prebuilt/$host/bin/x86_64-linux-android31-clang")
-	;;
-*)
-	echo "unsupported ABI $abi" >&2
-	exit 1
-	;;
-esac
+ANDROID_ABI=$abi
+source "$(dirname "$0")/lib.sh"
+android_go_env
+arch=$android_arch
 
 cd "$root"
 mkdir -p "$work/bins"
@@ -41,7 +29,7 @@ for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe
 done
 GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-linkmode=internal -T 0x1001000" -o "$work/bins/brkgrow" ./internal/acceptprog/brkgrow
 
-adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp $dir/cws $dir/fsws $dir/vws"
+adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp $dir/cws $dir/fsws"
 adb push "$work/bins"/* "$dir/" >/dev/null
 adb shell "getprop ro.build.version.release; getconf PAGE_SIZE; uname -rm"
 
@@ -61,11 +49,12 @@ fi
 # it exits with 0, prints no FAIL line, and prints each "|"-separated pattern
 # of WANT.
 run_guest() {
-	local label=$1 want=$2 out rc=0 pat
+	local label=$1 want=$2 out rc=0 pat cmd_args
 	shift 2
-	out=$(adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache timeout 900 ./rungv run -platform=systrap -net=none $* 2>&1" | tr -d '\r') || rc=$?
+	printf -v cmd_args ' %q' "$@"
+	out=$(adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache timeout 900 ./rungv run -platform=systrap -net=none$cmd_args 2>&1" | tr -d '\r') || rc=$?
 	local ok=1
-	if [ "$rc" -ne 0 ] || grep -qE '(^|\n)FAIL ' <<<"$out"; then
+	if [ "$rc" -ne 0 ] || grep -q '^FAIL ' <<<"$out"; then
 		ok=0
 	fi
 	IFS='|' read -ra pats <<<"$want"
@@ -78,7 +67,7 @@ run_guest() {
 		echo "PASS $label"
 	else
 		echo "FAIL $label (exit $rc)"
-		echo "$out" | tail -40
+		echo "$out" | head -60
 		failed=1
 	fi
 }
@@ -99,8 +88,9 @@ run_guest codewrite "PASS shared-file-writes:/workspace|PASS shared-file-writes:
 run_guest fsfeatures-hostfs "hostfs ok" "-workspace=$dir/fsws" -bin ./fsfeatures hostfs /workspace
 run_guest fsfeatures-ext4lite "ext4lite ok" "--mount=type=volume,src=$dir/fsvol.ext4,dst=/mnt,driver=ext4lite" \
 	-bin ./fsfeatures ext4lite /mnt
-run_guest voltree-write-hostfs "write ok" "-workspace=$dir/vws" -bin ./voltree write /workspace
-run_guest voltree-verify-hostfs "verify ok" "-workspace=$dir/vws" -bin ./voltree verify /workspace
+# Android SELinux neverallow forbids linkat hard links on shell_data_file and
+# app_data_file, so voltree runs on ext4lite here (and on both hostfs and
+# ext4lite in linux16k.yml).
 run_guest voltree-write-ext4lite "write ok" "--mount=type=volume,src=$dir/vvol.ext4,dst=/mnt,driver=ext4lite" \
 	-bin ./voltree write /mnt
 run_guest voltree-verify-ext4lite "verify ok" "--mount=type=volume,src=$dir/vvol.ext4,dst=/mnt,driver=ext4lite" \
@@ -110,7 +100,7 @@ echo "== probe APK (untrusted_app)"
 ANDROID_ABI=$abi scripts/android/build-probe-apk.sh "$work/probe.apk" >/dev/null
 adb install -r "$work/probe.apk" >/dev/null
 
-app_report=$(scripts/android/run-probe.sh libandroidprobe.so report | tr -d '\r')
+app_report=$(scripts/android/run-probe.sh libandroidprobe.so report | tr -d '\r') || true
 echo "$app_report"
 if grep -qF "exit code 0" <<<"$app_report" && ! grep -q " FAIL " <<<"$app_report"; then
 	echo "PASS app-probe-report"
@@ -119,19 +109,21 @@ else
 	failed=1
 fi
 
-app_guests_out=$(scripts/android/run-probe.sh libandroidprobe.so guests @FILES@/guests | tr -d '\r')
+app_guests_out=$(scripts/android/run-probe.sh libandroidprobe.so guests @FILES@/guests | tr -d '\r') || true
 if ! grep -qF "exit code 0" <<<"$app_guests_out"; then
 	echo "FAIL app-probe-guests"
 	echo "$app_guests_out"
 	failed=1
 fi
 
+# BuildSharedPageGuestELF64 emits arm64 instructions; linux16k.yml runs
+# guest-shared-page in CI, and an arm64-v8a Android target runs it here.
 app_elves=(guest-pie guest-fixed-0x10000 guest-fixed-0x400000)
 if [ "$abi" = arm64-v8a ]; then
 	app_elves+=(guest-shared-page)
 fi
 for g in "${app_elves[@]}"; do
-	out=$(scripts/android/run-probe.sh librungv.so run -platform=systrap -net=none -bin "@FILES@/guests/$g" | tr -d '\r')
+	out=$(scripts/android/run-probe.sh librungv.so run -platform=systrap -net=none -bin "@FILES@/guests/$g" | tr -d '\r') || true
 	if grep -qF "$g ok" <<<"$out" && grep -qF "exit code 0" <<<"$out"; then
 		echo "PASS app-$g"
 	else
@@ -161,7 +153,7 @@ if grep -qF "recover boom" <<<"$svc_log" && grep -qx "exit 0" <<<"$svc_log"; the
 else
 	echo "FAIL sample-service-gostatic"
 	echo "$svc_log"
-	adb logcat -d -s gvx:* AndroidRuntime:E | tail -40 || true
+	adb logcat -d -s 'gvx:*' AndroidRuntime:E | tail -40 || true
 	failed=1
 fi
 

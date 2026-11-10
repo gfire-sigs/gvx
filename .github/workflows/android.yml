@@ -20,11 +20,11 @@ on:
       - pkg/hostlockdown/*linux*
       - pkg/hostlockdown/*android*
       - pkg/hostlockdown/*xplat*
+      - pkg/gvx/**
+      - pkg/abi/linux/mm_tasksize*
+      - pkg/syserr/linux_errno*
       - pkg/sentry/platform/mmap_min_addr*
-      - pkg/sentry/platform/systrap/*linux*
-      - pkg/sentry/platform/systrap/*android*
-      - pkg/sentry/platform/systrap/*xplat*
-      - pkg/sentry/platform/systrap/subprocess*
+      - pkg/sentry/platform/systrap/**
       - pkg/sentry/mm/**
       - pkg/sentry/pgalloc/**
       - pkg/sentry/fsimpl/chunkcache/**

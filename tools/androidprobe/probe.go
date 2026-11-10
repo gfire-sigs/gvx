@@ -29,7 +29,6 @@ import (
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
-	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
 // The child modes run one host facility in a separate process, so a fatal
@@ -81,32 +80,44 @@ func report(w io.Writer) int {
 }
 
 // probeMMapMinAddr reads the lowest address that the host lets a process map.
-// When SELinux denies the read of /proc/sys/vm/mmap_min_addr on Android, it
-// checks that the address from platform.SystemMMapMinAddr maps one page.
+// On Android, SELinux denies the read of /proc/sys/vm/mmap_min_addr, so the
+// probe measures the lowest mappable page up to 0x10000 with
+// MAP_FIXED_NOREPLACE and checks that the page below it fails with EPERM or
+// EACCES.
 func probeMMapMinAddr() item {
-	const name = "mmap_min_addr"
+	const (
+		name  = "mmap_min_addr"
+		limit = 0x10000
+	)
 	b, err := os.ReadFile("/proc/sys/vm/mmap_min_addr")
 	if err == nil {
 		return item{name: name, ok: true, detail: strings.TrimSpace(string(b))}
 	}
-	min := uintptr(platform.SystemMMapMinAddr())
-	if min == 0 {
+	if runtime.GOOS != "android" {
 		return item{name: name, detail: err.Error()}
 	}
 	page := uintptr(os.Getpagesize())
-	got, _, errno := unix.RawSyscall6(unix.SYS_MMAP, min, page,
-		unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE, ^uintptr(0), 0)
-	switch {
-	case errno == unix.EEXIST:
-		return item{name: name, ok: true, detail: fmt.Sprintf("measured %#x (%v)", min, err)}
-	case errno != 0:
-		return item{name: name, detail: fmt.Sprintf("mmap %#x: %v (%v)", min, errno, err)}
+	var prevErrno syscall.Errno
+	for addr := page; addr <= limit; addr += page {
+		got, _, errno := unix.RawSyscall6(unix.SYS_MMAP, addr, page,
+			unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE, ^uintptr(0), 0)
+		switch {
+		case errno == 0:
+			unix.RawSyscall(unix.SYS_MUNMAP, got, page, 0)
+			if got != addr {
+				return item{name: name, detail: fmt.Sprintf("mmap %#x landed at %#x (%v)", addr, got, err)}
+			}
+		case errno == unix.EEXIST:
+		default:
+			prevErrno = errno
+			continue
+		}
+		if addr > page && prevErrno != unix.EPERM && prevErrno != unix.EACCES {
+			return item{name: name, detail: fmt.Sprintf("page below %#x failed with %v, want EPERM or EACCES (%v)", addr, prevErrno, err)}
+		}
+		return item{name: name, ok: true, detail: fmt.Sprintf("measured %#x (%v)", addr, err)}
 	}
-	unix.RawSyscall(unix.SYS_MUNMAP, got, page, 0)
-	if got != min {
-		return item{name: name, detail: fmt.Sprintf("mmap %#x landed at %#x (%v)", min, got, err)}
-	}
-	return item{name: name, ok: true, detail: fmt.Sprintf("measured %#x (%v)", min, err)}
+	return item{name: name, detail: fmt.Sprintf("no mappable page up to %#x (%v; %v)", limit, prevErrno, err)}
 }
 
 // probeMemfdExec maps a memfd with PROT_EXEC, as the systrap engine maps guest
@@ -211,16 +222,24 @@ func runChild(mode string) int {
 	return 0
 }
 
-// traceChild starts /system/bin/sh (or /bin/sh) under ptrace and single-steps
-// it, as the systrap engine single-steps a stub thread.
+// traceChild starts /system/bin/sh, /bin/sh, or this executable under ptrace
+// and single-steps it, as the systrap engine single-steps a stub thread.
 func traceChild() error {
-	shell := "/system/bin/sh"
-	if _, err := os.Stat(shell); err != nil {
-		shell = "/bin/sh"
+	var cmd *exec.Cmd
+	switch {
+	case fileExists("/system/bin/sh"):
+		cmd = exec.Command("/system/bin/sh", "-c", "exit 0")
+	case fileExists("/bin/sh"):
+		cmd = exec.Command("/bin/sh", "-c", "exit 0")
+	default:
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("locate traced child: %w", err)
+		}
+		cmd = exec.Command(exe)
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	cmd := exec.Command(shell, "-c", "exit 0")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start traced child: %w", err)
@@ -246,6 +265,11 @@ func traceChild() error {
 		}
 	}
 	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // sockFilter and sockFprog are the classic BPF program types of seccomp.

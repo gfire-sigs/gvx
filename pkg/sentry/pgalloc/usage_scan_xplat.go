@@ -41,7 +41,7 @@ const (
 // files memory.current and memory.stat must not show a cgroup as empty while
 // its tasks hold memory.
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
-	return memCgIDs == nil || runtime.GOOS == "linux"
+	return memCgIDs == nil || runtime.GOOS == "linux" || runtime.GOOS == "android"
 }
 
 // FlushCommitScan waits for any in-flight scan, clears the scan rate limit,
