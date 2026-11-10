@@ -289,10 +289,15 @@ func wgLimitsChecks() []check {
 			defer l.close()
 			const links = 300
 			var names []string
-			err = l.do(func() error {
+			err = l.doWithin(2*time.Minute, func() error {
+				h, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+				if err != nil {
+					return err
+				}
+				defer h.Close()
 				for i := range links {
 					name := fmt.Sprintf("wl%d", i)
-					if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: name}}); err != nil {
+					if err := h.LinkAdd(&netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: name}}); err != nil {
 						return fmt.Errorf("link %d: %w", i, err)
 					}
 					names = append(names, name)
@@ -302,13 +307,18 @@ func wgLimitsChecks() []check {
 			if err != nil {
 				return err
 			}
-			return l.do(func() error {
+			return l.doWithin(2*time.Minute, func() error {
+				h, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+				if err != nil {
+					return err
+				}
+				defer h.Close()
 				for _, name := range names {
-					link, err := netlink.LinkByName(name)
+					link, err := h.LinkByName(name)
 					if err != nil {
 						return err
 					}
-					if err := netlink.LinkDel(link); err != nil {
+					if err := h.LinkDel(link); err != nil {
 						return err
 					}
 				}

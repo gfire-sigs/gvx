@@ -480,58 +480,48 @@ func vxlanChecks() []check {
 			})
 		}},
 		{"fdb-and-remotes-have-no-default-cap", func() error {
-			// Each call of the namespace thread must end within its 30 second
-			// limit, so a slow host gets the work in short calls.
-			var v *netlink.Vxlan
-			if err := a.do(func() error {
-				link := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "vxfree"}, VxlanId: 13, SrcAddr: net.ParseIP(vxNodeA), Port: 4793}
-				if err := netlink.LinkAdd(link); err != nil {
+			// The old table held 65,536 entries, and an entry held 1,024 remotes.
+			// Reuse one netlink handle so the 67,100 requests do not open a new
+			// socket for each entry.
+			return a.doWithin(3*time.Minute, func() error {
+				h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+				if err != nil {
 					return err
 				}
-				var err error
-				if v, err = vxlanByName("vxfree"); err != nil {
+				defer h.Close()
+				link := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "vxfree"}, VxlanId: 13, SrcAddr: net.ParseIP(vxNodeA), Port: 4793}
+				if err := h.LinkAdd(link); err != nil {
+					return err
+				}
+				v, err := vxlanByName("vxfree")
+				if err != nil {
 					return err
 				}
 				if v.Limit != 0 {
 					return fmt.Errorf("a link without IFLA_VXLAN_LIMIT reports the limit %d, want 0 (no limit)", v.Limit)
 				}
-				return nil
-			}); err != nil {
-				return err
-			}
-			// The old table held 65,536 entries, and an entry held 1,024 remotes.
-			const entries, batch = 66000, 2000
-			for first := 0; first < entries; first += batch {
-				if err := a.do(func() error {
-					for i := first; i < min(first+batch, entries); i++ {
-						mac := net.HardwareAddr{2, 0, 0, byte(i >> 16), byte(i >> 8), byte(i)}
-						if err := vxlanFDB(v.Index, mac, "10.1.0.80"); err != nil {
-							return fmt.Errorf("entry %d: %w", i, err)
-						}
+				const entries = 66000
+				nodeIP := net.IPv4(10, 1, 0, 80)
+				for i := range entries {
+					mac := net.HardwareAddr{2, 0, 0, byte(i >> 16), byte(i >> 8), byte(i)}
+					if err := h.NeighSet(&netlink.Neigh{
+						LinkIndex: v.Index, State: netlink.NUD_PERMANENT, Family: syscall.AF_BRIDGE,
+						Flags: netlink.NTF_SELF, IP: nodeIP, HardwareAddr: mac,
+					}); err != nil {
+						return fmt.Errorf("entry %d: %w", i, err)
 					}
-					return nil
-				}); err != nil {
-					return err
 				}
-			}
-			const remotes = 1100
-			zero := net.HardwareAddr{0, 0, 0, 0, 0, 0}
-			if err := a.do(func() error {
+				const remotes = 1100
+				zero := net.HardwareAddr{0, 0, 0, 0, 0, 0}
 				for i := range remotes {
-					err := netlink.NeighAppend(&netlink.Neigh{
+					if err := h.NeighAppend(&netlink.Neigh{
 						LinkIndex: v.Index, State: netlink.NUD_PERMANENT, Family: syscall.AF_BRIDGE,
 						Flags: netlink.NTF_SELF, IP: net.IPv4(10, 3, byte(i>>8), byte(i)), HardwareAddr: zero,
-					})
-					if err != nil {
+					}); err != nil {
 						return fmt.Errorf("remote %d: %w", i, err)
 					}
 				}
-				return nil
-			}); err != nil {
-				return err
-			}
-			return a.do(func() error {
-				fdb, err := vxlanFDBList(v.Index)
+				fdb, err := h.NeighList(v.Index, syscall.AF_BRIDGE)
 				if err != nil {
 					return err
 				}
@@ -546,7 +536,7 @@ func vxlanChecks() []check {
 				if unicast != entries || zeroRemotes != remotes {
 					return fmt.Errorf("the FDB lists %d entries and %d remotes of the all-zeros entry, want %d and %d", unicast, zeroRemotes, entries, remotes)
 				}
-				return netlink.LinkDel(v)
+				return h.LinkDel(v)
 			})
 		}},
 		{"flannel-setup-adds-neighbor-fdb-and-onlink-route", func() error {
@@ -913,15 +903,15 @@ func vxlanChecks() []check {
 			// NUD_PERMANENT entry off the garbage collection list, so it has no
 			// limit. The check covers an Ethernet link, a vxlan link, and IPv6.
 			// It makes 210,000 netlink requests, which take more than 30 s on
-			// a loaded runner with the whpx backend, where each system call
-			// exits the VM.
-			return a.doWithin(3*time.Minute, func() error {
+			// a loaded runner with the whpx backend or under QEMU TCG.
+			return a.doWithin(6*time.Minute, func() error {
 				h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 				if err != nil {
 					return err
 				}
 				defer h.Close()
 				mac1, _ := net.ParseMAC("02:00:00:00:00:44")
+				mac2, _ := net.ParseMAC("02:00:00:00:00:45")
 				// An earlier check recreated flannel.1, so read its index again.
 				flannel, err := vxlanByName("flannel.1")
 				if err != nil {
@@ -930,9 +920,7 @@ func vxlanChecks() []check {
 				const count = 70000
 				v4 := func(i int) net.IP { return net.IPv4(10, 2+byte(i>>16), byte(i>>8), byte(i)) }
 				v6 := func(i int) net.IP {
-					ip := net.ParseIP("fd00::")
-					ip[12], ip[13], ip[14], ip[15] = byte(i>>24), byte(i>>16), byte(i>>8), byte(i)
-					return ip
+					return net.IP{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
 				}
 				for _, tc := range []struct {
 					name   string
@@ -953,7 +941,7 @@ func vxlanChecks() []check {
 						}
 					}
 					changed := entry(5)
-					changed.HardwareAddr, _ = net.ParseMAC("02:00:00:00:00:45")
+					changed.HardwareAddr = mac2
 					if err := h.NeighSet(changed); err != nil {
 						return fmt.Errorf("%s: change: %w", tc.name, err)
 					}
@@ -963,7 +951,7 @@ func vxlanChecks() []check {
 					}
 					n := 0
 					for _, e := range list {
-						if e.State&netlink.NUD_PERMANENT != 0 && (bytes.Equal(e.HardwareAddr, mac1) || e.HardwareAddr.String() == "02:00:00:00:00:45") {
+						if e.State&netlink.NUD_PERMANENT != 0 && (bytes.Equal(e.HardwareAddr, mac1) || bytes.Equal(e.HardwareAddr, mac2)) {
 							n++
 						}
 					}
