@@ -387,11 +387,16 @@ func (p *Platform) stopPool() {
 	}
 }
 
+// reapItem is one destroyed stub with the guest threads whose handles the
+// reaper closes.
 type reapItem struct {
 	sp      *stubProc
 	threads []*thread
 }
 
+// stubReaper closes the handles and the sections of destroyed stubs on one
+// goroutine, so that AddressSpace.Release does not wait for that work. The
+// stub process is gone before its item reaches the reaper.
 type stubReaper struct {
 	mu      sync.Mutex
 	stopped bool
@@ -399,6 +404,7 @@ type stubReaper struct {
 	done    chan struct{}
 }
 
+// startReaper starts the goroutine of the reaper.
 func (p *Platform) startReaper() {
 	r := &stubReaper{
 		ch:   make(chan reapItem, 64),
@@ -413,6 +419,8 @@ func (p *Platform) startReaper() {
 	}()
 }
 
+// enqueueReap gives sp to the reaper. It returns false when the reaper is
+// stopped or full; the caller then runs finishDestroy itself.
 func (p *Platform) enqueueReap(sp *stubProc, threads []*thread) bool {
 	r := p.reaper
 	if r == nil {
@@ -431,6 +439,7 @@ func (p *Platform) enqueueReap(sp *stubProc, threads []*thread) bool {
 	}
 }
 
+// stopReaper stops the reaper and waits until it closed every queued stub.
 func (p *Platform) stopReaper() {
 	r := p.reaper
 	if r == nil {
@@ -508,12 +517,15 @@ func (sp *stubProc) destroy() {
 	for _, th := range freeThreads {
 		th.releaseFast()
 	}
-	if sp.p != nil && sp.p.enqueueReap(sp, threads) {
+	if sp.p.enqueueReap(sp, threads) {
 		return
 	}
 	sp.finishDestroy(threads)
 }
 
+// finishDestroy closes the fast slots, the engine section, the thread
+// handles, and the process handle of a terminated stub, and tells the host to
+// release it.
 func (sp *stubProc) finishDestroy(threads []*thread) {
 	sp.closeFast()
 	if sp.internal != nil {
