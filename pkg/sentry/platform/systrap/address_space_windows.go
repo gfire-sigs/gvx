@@ -201,28 +201,40 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 
 // setupInternal maps the engine pages: one page of code and the pages of the
 // per-thread data slots. The arch file writes the code.
-func (as *addressSpace) setupInternal() error {
-	if as.sp.internal != nil {
-		as.internal = as.sp.internal
+func (sp *stubProc) setupInternal() error {
+	if sp.internal != nil {
 		return nil
 	}
 	sec, err := newAnonSection(winEnginePagesSize)
 	if err != nil {
 		return err
 	}
-	as.internal = sec
-	as.sp.internal = sec
 	writeInternalCode(sec.local[:codeSize])
-	if as.p.fast {
-		copy(sec.local[winSpillOffset:], as.p.spill.code)
+	if sp.p.fast {
+		copy(sec.local[winSpillOffset:], sp.p.spill.code)
 	}
-	if err := as.win.Map(internalBase, codeSize, &sec.ref, 0, viewReadExec); err != nil {
+	if err := sp.win.Map(internalBase, codeSize, &sec.ref, 0, viewReadExec); err != nil {
+		sec.close()
 		return err
 	}
-	if err := as.win.Map(internalBase+codeSize, winEnginePagesSize-codeSize, &sec.ref, codeSize, viewReadWrite); err != nil {
+	if err := sp.win.Map(internalBase+codeSize, winEnginePagesSize-codeSize, &sec.ref, codeSize, viewReadWrite); err != nil {
+		sec.close()
 		return err
 	}
-	return flushInstructionCache(as.sp.proc, uintptr(internalBase), codeSize)
+	if err := flushInstructionCache(sp.proc, uintptr(internalBase), codeSize); err != nil {
+		sec.close()
+		return err
+	}
+	sp.internal = sec
+	return nil
+}
+
+func (as *addressSpace) setupInternal() error {
+	if err := as.sp.setupInternal(); err != nil {
+		return err
+	}
+	as.internal = as.sp.internal
+	return nil
 }
 
 // viewProtFor converts guest access to the protection of an original frame.

@@ -104,6 +104,10 @@ type archThread struct {
 		sum uint64
 		n   int
 	}
+	// fsNonZero is true when the thread loaded a non-zero FS base since its
+	// last start with zero. A recycled parked thread uses it to clear a stale
+	// FS base when the next guest starts with Fs_base == 0.
+	fsNonZero bool
 	// restartPC is the guest address where the Sentry continued the thread in
 	// place. The thread fetches its bytes later, from the block that is current
 	// then. A patch of the block must not cover a byte behind the first byte of
@@ -198,8 +202,13 @@ func (th *thread) archStart(ac *arch.Context64) error {
 	}
 	fs := ac.StateData().Regs.Fs_base
 	if fs == 0 {
-		return nil
+		if !th.fsNonZero {
+			return nil
+		}
+		th.fsNonZero = false
+		return th.goThroughTrampoline(0)
 	}
+	th.fsNonZero = true
 	return th.goThroughTrampoline(fs)
 }
 
@@ -277,7 +286,12 @@ func (as *addressSpace) continuationsIn(base uint64) []uint64 {
 }
 
 // clearRestart ends the record of continueAt for a thread that does not run.
-func (th *thread) clearRestart() { th.restartPC.Store(0) }
+func (th *thread) clearRestart() {
+	th.restartPC.Store(0)
+	if f := th.fast.Load(); f != nil {
+		f.slot.reader.goOffline(0)
+	}
+}
 
 // restartInsideLocked reports whether a thread continues at an address inside
 // one of the spans of a patch for the block at base. Callers hold as.mu, which
@@ -997,9 +1011,12 @@ func newWinTrap(site uint64, _ *winRegs) winTrap {
 }
 
 // archFastTrap adds the amd64 state to the registers of a fast trap.
-func (th *thread) archFastTrap(*arch.Context64) {
+func (th *thread) archFastTrap(ac *arch.Context64) {
 	th.fsFix.n = 0
 	th.restartPC.Store(0)
+	if ac.StateData().Regs.Fs_base != 0 {
+		th.fsNonZero = true
+	}
 }
 
 // archFastHot reports whether the thread can resume without a debug stop. The

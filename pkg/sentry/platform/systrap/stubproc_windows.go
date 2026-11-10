@@ -217,6 +217,7 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 		threads: make(map[uint32]*thread),
 		deadCh:  make(chan struct{}),
 	}
+	sp.fast.initEvents = sh.events
 	fail := func(err error) (*stubProc, error) {
 		sp.destroy()
 		return nil, err
@@ -247,6 +248,20 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	if err := ntResumeThread(sp.main); err != nil {
 		return fail(err)
 	}
+	// Map the engine pages and the first fast slot while the Windows loader
+	// runs in the stub process.
+	pagesStart := time.Now()
+	if err := sp.setupInternal(); err != nil {
+		return fail(err)
+	}
+	if p.fast {
+		s, err := sp.takeSlot()
+		if err != nil {
+			return fail(err)
+		}
+		sp.putSlot(s)
+	}
+	bringUpStats.pagesNs.Add(uint64(time.Since(pagesStart)))
 	// The loader finishes and raises the initial breakpoint of a debuggee. The
 	// stub is then fully initialized, and nothing else of its image ever runs.
 	var abort <-chan struct{}
@@ -264,16 +279,34 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 		return fail(err)
 	}
 	bringUpStats.loaderNs.Add(uint64(time.Since(t2)))
+	th, err := sp.newGuestThreadUntil(abort)
+	if err != nil {
+		return fail(err)
+	}
+	if p.fast {
+		if err := sp.attachFast(th); err != nil {
+			th.destroy()
+			return fail(err)
+		}
+	}
+	sp.mu.Lock()
+	sp.freeThreads = append(sp.freeThreads, th)
+	sp.mu.Unlock()
 	bringUpStats.stubs.Add(1)
 	return sp, nil
 }
 
-// poolDepth is the number of ready stubs that the platform keeps. A stub takes
-// 10 to 20 ms to start, and each fork and each exec of a guest needs one.
-const poolDepth = 6
+// poolDepth is the number of ready stubs that the platform keeps, and
+// poolWorkers is the number of background goroutines that fill the pool in
+// parallel.
+const (
+	poolDepth   = 12
+	poolWorkers = 4
+)
 
 // stubPool keeps ready stubs, so that a fork or an exec does not wait for the
-// loader of a new process. One goroutine fills the pool while the guests run.
+// loader of a new process. Background goroutines fill the pool while the
+// guests run.
 //
 // WHY: the pool holds only stubs that no guest ran in. A stub that served one
 // guest process never serves another. Guest code runs natively in the stub,
@@ -282,22 +315,24 @@ const poolDepth = 6
 type stubPool struct {
 	ready chan *stubProc
 	stop  chan struct{}
-	done  chan struct{}
+	wg    sync.WaitGroup
 }
 
-// startPool starts the goroutine that fills the pool.
+// startPool starts the goroutines that fill the pool.
 func (p *Platform) startPool() {
 	p.pool = &stubPool{
 		ready: make(chan *stubProc, poolDepth),
 		stop:  make(chan struct{}),
-		done:  make(chan struct{}),
 	}
-	go p.fillPool()
+	for range poolWorkers {
+		p.pool.wg.Add(1)
+		go p.fillPool()
+	}
 }
 
 func (p *Platform) fillPool() {
 	pool := p.pool
-	defer close(pool.done)
+	defer pool.wg.Done()
 	for {
 		select {
 		case <-pool.stop:
@@ -324,8 +359,8 @@ func (p *Platform) fillPool() {
 	}
 }
 
-// stopPool stops the goroutine and terminates the stubs that no guest took. A
-// stub that the goroutine is still starting aborts at its next wait. The
+// stopPool stops the goroutines and terminates the stubs that no guest took. A
+// stub that a goroutine is still starting aborts at its next wait. The
 // processes terminate together, because each one takes a few milliseconds to
 // end, and the pool holds several.
 func (p *Platform) stopPool() {
@@ -333,7 +368,7 @@ func (p *Platform) stopPool() {
 		return
 	}
 	close(p.pool.stop)
-	<-p.pool.done
+	p.pool.wg.Wait()
 	var idle []*stubProc
 	for {
 		select {
@@ -350,6 +385,64 @@ func (p *Platform) stopPool() {
 	for _, sp := range idle {
 		sp.destroy()
 	}
+}
+
+type reapItem struct {
+	sp      *stubProc
+	threads []*thread
+}
+
+type stubReaper struct {
+	mu      sync.Mutex
+	stopped bool
+	ch      chan reapItem
+	done    chan struct{}
+}
+
+func (p *Platform) startReaper() {
+	r := &stubReaper{
+		ch:   make(chan reapItem, 64),
+		done: make(chan struct{}),
+	}
+	p.reaper = r
+	go func() {
+		defer close(r.done)
+		for item := range r.ch {
+			item.sp.finishDestroy(item.threads)
+		}
+	}()
+}
+
+func (p *Platform) enqueueReap(sp *stubProc, threads []*thread) bool {
+	r := p.reaper
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return false
+	}
+	select {
+	case r.ch <- reapItem{sp: sp, threads: threads}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Platform) stopReaper() {
+	r := p.reaper
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if !r.stopped {
+		r.stopped = true
+		close(r.ch)
+	}
+	r.mu.Unlock()
+	<-r.done
 }
 
 // newStubProc returns a ready stub from the pool, or creates one when the pool
@@ -415,6 +508,13 @@ func (sp *stubProc) destroy() {
 	for _, th := range freeThreads {
 		th.releaseFast()
 	}
+	if sp.p != nil && sp.p.enqueueReap(sp, threads) {
+		return
+	}
+	sp.finishDestroy(threads)
+}
+
+func (sp *stubProc) finishDestroy(threads []*thread) {
 	sp.closeFast()
 	if sp.internal != nil {
 		sp.internal.close()
@@ -435,6 +535,10 @@ func (sp *stubProc) destroy() {
 // ran once, on ARM64 at least. The first stop also proves that the thread and
 // the debug object work before any guest code exists.
 func (sp *stubProc) newGuestThread() (*thread, error) {
+	return sp.newGuestThreadUntil(nil)
+}
+
+func (sp *stubProc) newGuestThreadUntil(abort <-chan struct{}) (*thread, error) {
 	if sp.dead.Load() {
 		return nil, sp.deathError()
 	}
@@ -469,7 +573,7 @@ func (sp *stubProc) newGuestThread() (*thread, error) {
 	if err := ntResumeThread(h); err != nil {
 		return fail(err)
 	}
-	ev, err := th.waitEvent(startTimeout)
+	ev, err := th.waitEventUntil(startTimeout, abort)
 	if err != nil {
 		return fail(fmt.Errorf("wait for the start stop of a guest thread: %w", err))
 	}

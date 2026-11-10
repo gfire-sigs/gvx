@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
@@ -43,19 +44,31 @@ func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	return memCgIDs == nil || runtime.GOOS == "linux"
 }
 
-// FlushCommitScan waits for any in-flight scan and clears the scan rate limit
-// so the next UpdateUsage(nil) call scans immediately before the caller parks
-// on kernel inactivity.
+// FlushCommitScan waits for any in-flight scan, clears the scan rate limit,
+// and completes an immediate scan when f has a backing file before the caller
+// parks on kernel inactivity.
 func (f *MemoryFile) FlushCommitScan() {
-	for {
+	for spins := 0; ; spins++ {
 		f.mu.Lock()
 		if !f.ongoingCommitScan.Load() {
 			f.nextCommitScan = time.Time{}
+			if f.file != nil && !f.isSaving && !f.opts.DisableMemoryAccounting {
+				startTime := time.Now()
+				f.ongoingCommitScan.Store(true)
+				_ = f.updateUsageLocked(nil)
+				f.ongoingCommitScan.Store(false)
+				scanTime := time.Since(startTime)
+				f.nextCommitScan = startTime.Add(max(linux.ClockTick, scanTime*commitScanIntervalRatio))
+			}
 			f.mu.Unlock()
 			return
 		}
 		f.mu.Unlock()
-		runtime.Gosched()
+		if spins < 4 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
