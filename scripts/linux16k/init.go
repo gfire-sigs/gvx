@@ -137,7 +137,7 @@ func bringUpLoopback() {
 
 func runTestBinary(label, bin string, timeout time.Duration) bool {
 	fmt.Println("== " + label)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "-test.v", "-test.count=1", "-test.timeout="+timeout.String())
 	cmd.Stdout = os.Stdout

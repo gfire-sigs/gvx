@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/systrap"
@@ -28,12 +29,19 @@ import (
 // linuxSystrapName is the registration name of the upstream systrap platform.
 const linuxSystrapName = "systrap"
 
+// sharedSystrap holds the process-wide Linux systrap platform instance.
+// globalPool keeps the memory file of the first platform. Every sandbox in the
+// process shares that instance.
+var sharedSystrap = sync.OnceValues(func() (*systrap.Systrap, error) {
+	return systrap.New(platform.Options{})
+})
+
 // openSystrap starts the upstream gVisor systrap platform. Linux needs no
 // hypervisor backend: the upstream platform runs the guest in stub processes
 // that the host kernel isolates. New calls it before the host lockdown,
 // because the platform forks its first stub process during construction.
 func openSystrap() (platform.Platform, string, error) {
-	p, err := systrap.New(platform.Options{})
+	p, err := sharedSystrap()
 	if err != nil {
 		return nil, "", fmt.Errorf("gvx: %s backend: %w", linuxSystrapName, err)
 	}

@@ -55,5 +55,5 @@ fi
 # have 39 or 47 bits.
 timeout 3900 qemu-system-aarch64 -machine virt -accel tcg -cpu max,lpa2=off -smp 4 -m 4096 -nographic -no-reboot \
 	-kernel "$kernel" -initrd "$work/initramfs.gz" \
-	-append "console=ttyAMA0 rdinit=/init panic=-1 quiet" | tee "$work/console.log" | tr -d '\r'
+	-append "console=ttyAMA0 rdinit=/init panic=-1 quiet" | stdbuf -oL tr -d '\r' | tee "$work/console.log"
 grep -q VMSMOKE-OK "$work/console.log"
