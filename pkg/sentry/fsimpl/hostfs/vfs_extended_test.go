@@ -2335,6 +2335,9 @@ func TestMetaTableLimitRefusesNewRecords(t *testing.T) {
 // room there. A volume with guest paths keeps one record for each name.
 func testMetaTableLimit(t *testing.T, pathKeys bool) {
 	e := newEnvOpts(t, workspaceOptions{coalesce: defaultCoalesceWindow, pathKeys: pathKeys})
+	if !pathKeys && e.ws.pathKeys {
+		t.Skip("the volume of the temporary directory has no usable file identities")
+	}
 	hostOnly := e.host("hostfile")
 	if err := os.WriteFile(hostOnly, []byte("h"), 0o644); err != nil {
 		t.Fatal(err)

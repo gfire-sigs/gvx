@@ -63,7 +63,7 @@ fi
 run_test_suite() {
 	local label=$1 bin=$2 timeout=$3 keep=${4:-0} extra=${5:-} rc=0
 	echo "== $label"
-	adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout $extra 2>&1" | tr -d '\r' || rc=$?
+	adb shell "umask 022 && cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout $extra 2>&1" | tr -d '\r' || rc=$?
 	if [ "$keep" -eq 0 ]; then
 		adb shell "rm -f $dir/$bin" || true
 	fi
@@ -97,7 +97,7 @@ switch_adb_uid() {
 
 run_shell() {
 	local label=$1 want=$2 cmd=$3 out
-	out=$(adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache $cmd 2>&1" | tr -d '\r') || true
+	out=$(adb shell "umask 022 && cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache $cmd 2>&1" | tr -d '\r') || true
 	if grep -qF "$want" <<<"$out" && ! grep -qE '(^| )FAIL ' <<<"$out"; then
 		echo "PASS $label"
 	else

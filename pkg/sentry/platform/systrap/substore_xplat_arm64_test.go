@@ -20,10 +20,12 @@ import (
 	"bytes"
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
@@ -233,6 +235,14 @@ func (fakeCompBlockHost) freeComp(c compPage) {}
 
 func (fakeCompBlockHost) compFD() int { return 0 }
 
+type noopSubBlockPopulator struct {
+	platform.MemoryManager
+}
+
+func (noopSubBlockPopulator) PopulateSubBlock(context.Context, hostarch.Addr) bool {
+	return false
+}
+
 // TestCrossLayerSharedCompositeRefresh verifies that a read-only subpage of a
 // composite block in one subBlockLayer refreshes when another subBlockLayer
 // modifies the shared page in pgalloc.MemoryFile through an emulated store.
@@ -271,8 +281,9 @@ func TestCrossLayerSharedCompositeRefresh(t *testing.T) {
 		t.Fatalf("writer mapFile: %v", err)
 	}
 
-	reader.beforeSwitch(nil, nil)
-	writer.beforeSwitch(nil, nil)
+	pop := noopSubBlockPopulator{}
+	reader.beforeSwitch(nil, pop)
+	writer.beforeSwitch(nil, pop)
 
 	hb := reader.blocks[uintptr(readerAddr)]
 	if hb == nil || !hb.hasComp {
@@ -290,7 +301,7 @@ func TestCrossLayerSharedCompositeRefresh(t *testing.T) {
 		t.Fatalf("reader hb.dirty = %d after cross-layer writeLocked, want > 0", d)
 	}
 
-	reader.beforeSwitch(nil, nil)
+	reader.beforeSwitch(nil, pop)
 	if got := hb.comp.buf[:len(wantEmulated)]; !bytes.Equal(got, wantEmulated) {
 		t.Fatalf("composite page0 after emulated store = %v, want %v", got, wantEmulated)
 	}

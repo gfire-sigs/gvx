@@ -215,6 +215,7 @@ func identityWS(t testing.TB, dir string) (*Workspace, *identityHost) {
 			return host
 		},
 	})
+	requireStableIDs(t, ws)
 	return ws, host
 }
 
@@ -251,6 +252,15 @@ func plainWS(t testing.TB, dir string, opts workspaceOptions) *Workspace {
 	return journalWS(t, dir, opts)
 }
 
+// requireStableIDs skips the test when the temporary directory volume keys its
+// records by path.
+func requireStableIDs(t testing.TB, ws *Workspace) {
+	t.Helper()
+	if ws.pathKeys {
+		t.Skip("the volume of the temporary directory has no usable file identities")
+	}
+}
+
 // requireMode fails unless the path has the given permission bits and owner.
 func requireMode(t testing.TB, ws *Workspace, rel string, mode, uid uint32) {
 	t.Helper()
@@ -266,6 +276,7 @@ func requireMode(t testing.TB, ws *Workspace, rel string, mode, uid uint32) {
 func TestHostRenameOfAFileKeepsItsRecord(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	mustWriteFile(t, ws, "before", 0o751)
 	if err := ws.Chown("before", 7, 8); err != nil {
 		t.Fatal(err)
@@ -290,6 +301,7 @@ func TestHostRenameOfADirectoryKeepsTheRecordsBelowIt(t *testing.T) {
 	}
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	if err := ws.Mkdir("old", 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -322,6 +334,7 @@ func TestHostRenameOfADirectoryKeepsTheRecordsBelowIt(t *testing.T) {
 func TestNewHostFileAtAnOldPathDoesNotInheritTheRecord(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	mustWriteFile(t, ws, "name", 0o751)
 	if err := ws.Chown("name", 7, 8); err != nil {
 		t.Fatal(err)
@@ -390,6 +403,7 @@ func TestHostEditorSaveByRenameKeepsExtendedAttributes(t *testing.T) {
 func TestSaveByRenameDoesNotStealTheRecordOfAFileThatStillExists(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	mustWriteFile(t, ws, "a", 0o751)
 	// The host renames a to b, and a stranger file takes the name a.
 	if err := os.Rename(filepath.Join(dir, "a"), filepath.Join(dir, "b")); err != nil {
@@ -712,6 +726,7 @@ func TestDirectoryRenameCostDoesNotGrowWithItsSubtree(t *testing.T) {
 			ch.hostBackend = b
 			return ch
 		}})
+		requireStableIDs(t, ws)
 		if err := ws.Mkdir("d", 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -746,6 +761,7 @@ func TestHardLinkChangeCostDoesNotGrowWithTheTable(t *testing.T) {
 			ch.hostBackend = b
 			return ch
 		}})
+		requireStableIDs(t, ws)
 		mustWriteFile(t, ws, "a", 0o644)
 		for _, name := range []string{"b", "c", "d"} {
 			if err := ws.link("a", name); err != nil {
@@ -832,6 +848,7 @@ func TestVirtualLinkSurvivesAHostRenameOfItsDirectory(t *testing.T) {
 	}
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	if err := ws.Mkdir("d", 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -860,6 +877,7 @@ func TestReadMetaNamesRecordsByTheCurrentPath(t *testing.T) {
 	}
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	if err := ws.Mkdir("d", 0o750); err != nil {
 		t.Fatal(err)
 	}
