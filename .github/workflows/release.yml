@@ -45,6 +45,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -60,7 +62,7 @@ jobs:
           exe=rungv
           [ "$GOOS" = windows ] && exe=rungv.exe
           mkdir -p "dist/$name"
-          go build -trimpath -ldflags="-s -w" -o "dist/$name/$exe" ./cmd/rungv
+          ./scripts/repro-build.sh "dist/$name/$exe" ./cmd/rungv
           if [ "$GOOS" = darwin ]; then
             codesign --sign - --entitlements entitlements.plist --force "dist/$name/$exe"
             codesign --display --entitlements - "dist/$name/$exe" | grep -q com.apple.security.hypervisor
@@ -100,6 +102,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Set up Go
         uses: actions/setup-go@v7
         with:

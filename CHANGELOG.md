@@ -9,6 +9,7 @@ This release updates the Go toolchain to `1.27.4` across all modules and CI work
 ### Build
 
 - **Go 1.27.4 and stripped release binaries (`.github/workflows/release.yml`, `scripts/android/lib.sh`)**: `go.mod`, `tools/shiminterop/go.mod`, all GitHub Actions workflows, and embedded third-party license notices now use Go `1.27.4`. The release workflow and the build script of the Android SDK now pass `-ldflags="-s -w"` with `-trimpath`. Every `rungv`, `rungv.exe`, and `librungv.so` binary omits OS symbol tables and DWARF sections while keeping Go build metadata and line tables.
+- **Deterministic Go builds and `gvx` hash verification (`scripts/repro-build.sh`, `scripts/verify-repro-gvx.sh`, `.github/workflows/ci.yml`)**: `scripts/repro-build.sh` scrubs ambient environment variables and pins `GOTOOLCHAIN`, `GO111MODULE`, `GOPROXY`, `GOSUMDB`, `GOENV=off`, `GOWORK=off`, `GOFIPS140=off`, `GOAMD64=v1`, `GOARM64=v8.0`, `-pgo=off`, `-trimpath`, `-buildvcs`, and `-ldflags="-s -w -buildid="`. The `release` workflow and `scripts/android/lib.sh` call `scripts/repro-build.sh` for all release binaries. The `repro` job of `ci.yml` builds `rungv` on the host and inside `golang:1.27.4-bookworm` running on `gvx`, and verifies that both SHA-256 digests match.
 
 ## [v0.12.10022026110200] - 2026-11-10
 

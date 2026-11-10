@@ -101,19 +101,19 @@ Build the standalone `rungv` binary with Go 1.27.4 or newer, or download a prebu
 > [!IMPORTANT]
 > On macOS, sign the binary with `entitlements.plist` so it can access `Hypervisor.framework`. On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or pass `-platform=systrap` to run without a hypervisor. On Linux, build with `CGO_ENABLED=0`.
 
-1. Build the `rungv` binary for your operating system.
+1. Run `scripts/repro-build.sh` to build a deterministic `rungv` binary for your operating system.
 2. Apply the hypervisor entitlement signature when building on macOS.
 
 ```bash
 # macOS (Apple Silicon arm64)
-go build -trimpath -ldflags="-s -w" -o rungv ./cmd/rungv
+./scripts/repro-build.sh ./rungv ./cmd/rungv
 codesign --sign - --entitlements entitlements.plist --force ./rungv
 
-# Windows (amd64 or arm64)
-go build -trimpath -ldflags="-s -w" -o rungv.exe ./cmd/rungv
+# Windows (amd64 or arm64, in Git Bash)
+./scripts/repro-build.sh ./rungv.exe ./cmd/rungv
 
 # Linux (amd64 or arm64)
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o rungv ./cmd/rungv
+./scripts/repro-build.sh ./rungv ./cmd/rungv
 ```
 
 ### 3.2 Run Containers with `rungv`
