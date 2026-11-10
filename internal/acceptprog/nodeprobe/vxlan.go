@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -259,6 +260,115 @@ func wantErrno(what string, err error, want syscall.Errno) error {
 	return nil
 }
 
+// neighBatch packs RTM_NEWNEIGH requests into multi-message datagrams and
+// reads one acknowledgement for each batch.
+type neighBatch struct {
+	fd         int
+	seq        uint32
+	count      int
+	lastHdrOff int
+	buf        []byte
+	ack        [128]byte
+}
+
+func newNeighBatch() (*neighBatch, error) {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		return nil, err
+	}
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 256<<10)
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return &neighBatch{fd: fd, buf: make([]byte, 0, 16<<10)}, nil
+}
+
+func (b *neighBatch) close() {
+	unix.Close(b.fd)
+}
+
+func (b *neighBatch) add(flags uint16, n *netlink.Neigh) error {
+	ip := n.IP.To4()
+	family := uint8(n.Family)
+	if ip == nil {
+		ip = n.IP.To16()
+		if family == 0 {
+			family = unix.AF_INET6
+		}
+	} else if family == 0 {
+		family = unix.AF_INET
+	}
+	mac := []byte(n.HardwareAddr)
+	dstAttrLen := 4 + len(ip)
+	llAttrLen := 4 + len(mac)
+	llAttrAligned := (llAttrLen + 3) &^ 3
+	msgLen := 16 + 12 + dstAttrLen + llAttrAligned
+
+	b.seq++
+	b.lastHdrOff = len(b.buf)
+	var msg [64]byte
+	binary.NativeEndian.PutUint32(msg[0:4], uint32(msgLen))
+	binary.NativeEndian.PutUint16(msg[4:6], unix.RTM_NEWNEIGH)
+	binary.NativeEndian.PutUint16(msg[6:8], unix.NLM_F_REQUEST|flags)
+	binary.NativeEndian.PutUint32(msg[8:12], b.seq)
+	msg[16] = family
+	binary.NativeEndian.PutUint32(msg[20:24], uint32(n.LinkIndex))
+	binary.NativeEndian.PutUint16(msg[24:26], uint16(n.State))
+	msg[26] = uint8(n.Flags)
+	msg[27] = uint8(n.Type)
+	off := 28
+	binary.NativeEndian.PutUint16(msg[off:off+2], uint16(dstAttrLen))
+	binary.NativeEndian.PutUint16(msg[off+2:off+4], unix.NDA_DST)
+	copy(msg[off+4:], ip)
+	off += dstAttrLen
+	binary.NativeEndian.PutUint16(msg[off:off+2], uint16(llAttrLen))
+	binary.NativeEndian.PutUint16(msg[off+2:off+4], unix.NDA_LLADDR)
+	copy(msg[off+4:], mac)
+
+	b.buf = append(b.buf, msg[:msgLen]...)
+	b.count++
+	if b.count >= 250 {
+		return b.flush()
+	}
+	return nil
+}
+
+func (b *neighBatch) set(n *netlink.Neigh) error {
+	return b.add(unix.NLM_F_CREATE|unix.NLM_F_REPLACE, n)
+}
+
+func (b *neighBatch) append(n *netlink.Neigh) error {
+	return b.add(unix.NLM_F_CREATE|unix.NLM_F_APPEND, n)
+}
+
+func (b *neighBatch) flush() error {
+	if b.count == 0 {
+		return nil
+	}
+	flags := binary.NativeEndian.Uint16(b.buf[b.lastHdrOff+6 : b.lastHdrOff+8])
+	binary.NativeEndian.PutUint16(b.buf[b.lastHdrOff+6:b.lastHdrOff+8], flags|unix.NLM_F_ACK)
+	if err := unix.Sendto(b.fd, b.buf, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return err
+	}
+	n, _, err := unix.Recvfrom(b.fd, b.ack[:], 0)
+	if err != nil {
+		return err
+	}
+	if n < 20 {
+		return fmt.Errorf("short netlink ack (%d bytes)", n)
+	}
+	if typ := binary.NativeEndian.Uint16(b.ack[4:6]); typ != unix.NLMSG_ERROR {
+		return fmt.Errorf("netlink reply type %d, want NLMSG_ERROR", typ)
+	}
+	if errno := int32(binary.NativeEndian.Uint32(b.ack[16:20])); errno != 0 {
+		return syscall.Errno(-errno)
+	}
+	b.buf = b.buf[:0]
+	b.count = 0
+	return nil
+}
+
 func vxlanChecks() []check {
 	var (
 		a, b         *nsThread
@@ -481,14 +591,20 @@ func vxlanChecks() []check {
 		}},
 		{"fdb-and-remotes-have-no-default-cap", func() error {
 			// The old table held 65,536 entries, and an entry held 1,024 remotes.
-			// Reuse one netlink handle so the 67,100 requests do not open a new
-			// socket for each entry.
+			// Pack RTM_NEWNEIGH requests into multi-message netlink datagrams so
+			// the 67,100 entries finish within a few seconds even under software
+			// CPU emulation.
 			return a.doWithin(3*time.Minute, func() error {
 				h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 				if err != nil {
 					return err
 				}
 				defer h.Close()
+				batch, err := newNeighBatch()
+				if err != nil {
+					return err
+				}
+				defer batch.close()
 				link := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: "vxfree"}, VxlanId: 13, SrcAddr: net.ParseIP(vxNodeA), Port: 4793}
 				if err := h.LinkAdd(link); err != nil {
 					return err
@@ -504,7 +620,7 @@ func vxlanChecks() []check {
 				nodeIP := net.IPv4(10, 1, 0, 80)
 				for i := range entries {
 					mac := net.HardwareAddr{2, 0, 0, byte(i >> 16), byte(i >> 8), byte(i)}
-					if err := h.NeighSet(&netlink.Neigh{
+					if err := batch.set(&netlink.Neigh{
 						LinkIndex: v.Index, State: netlink.NUD_PERMANENT, Family: syscall.AF_BRIDGE,
 						Flags: netlink.NTF_SELF, IP: nodeIP, HardwareAddr: mac,
 					}); err != nil {
@@ -514,12 +630,15 @@ func vxlanChecks() []check {
 				const remotes = 1100
 				zero := net.HardwareAddr{0, 0, 0, 0, 0, 0}
 				for i := range remotes {
-					if err := h.NeighAppend(&netlink.Neigh{
+					if err := batch.append(&netlink.Neigh{
 						LinkIndex: v.Index, State: netlink.NUD_PERMANENT, Family: syscall.AF_BRIDGE,
 						Flags: netlink.NTF_SELF, IP: net.IPv4(10, 3, byte(i>>8), byte(i)), HardwareAddr: zero,
 					}); err != nil {
 						return fmt.Errorf("remote %d: %w", i, err)
 					}
+				}
+				if err := batch.flush(); err != nil {
+					return fmt.Errorf("flush: %w", err)
 				}
 				fdb, err := h.NeighList(v.Index, syscall.AF_BRIDGE)
 				if err != nil {
@@ -902,14 +1021,17 @@ func vxlanChecks() []check {
 			// The old cap was 65,536 for each link and family. Linux keeps a
 			// NUD_PERMANENT entry off the garbage collection list, so it has no
 			// limit. The check covers an Ethernet link, a vxlan link, and IPv6.
-			// It makes 210,000 netlink requests, which take more than 30 s on
-			// a loaded runner with the whpx backend or under QEMU TCG.
 			return a.doWithin(6*time.Minute, func() error {
 				h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 				if err != nil {
 					return err
 				}
 				defer h.Close()
+				batch, err := newNeighBatch()
+				if err != nil {
+					return err
+				}
+				defer batch.close()
 				mac1, _ := net.ParseMAC("02:00:00:00:00:44")
 				mac2, _ := net.ParseMAC("02:00:00:00:00:45")
 				// An earlier check recreated flannel.1, so read its index again.
@@ -936,9 +1058,12 @@ func vxlanChecks() []check {
 						return &netlink.Neigh{LinkIndex: tc.link, State: netlink.NUD_PERMANENT, IP: tc.ip(i), HardwareAddr: mac1}
 					}
 					for i := range count {
-						if err := h.NeighSet(entry(i)); err != nil {
+						if err := batch.set(entry(i)); err != nil {
 							return fmt.Errorf("%s: entry %d: %w", tc.name, i, err)
 						}
+					}
+					if err := batch.flush(); err != nil {
+						return fmt.Errorf("%s: flush: %w", tc.name, err)
 					}
 					changed := entry(5)
 					changed.HardwareAddr = mac2
