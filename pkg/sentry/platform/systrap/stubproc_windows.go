@@ -557,16 +557,17 @@ func (sp *stubProc) newGuestThreadUntil(abort <-chan struct{}) (*thread, error) 
 	// th.mu covers the bring-up, so GlobalMemoryBarrier never sees the thread
 	// before parked is set. The pump, waitEvent, and dbg.reply take no th.mu.
 	th.mu.Lock()
-	defer th.mu.Unlock()
 	sp.mu.Lock()
 	if sp.closed {
 		sp.mu.Unlock()
+		th.mu.Unlock()
 		th.closeHandle()
 		return nil, errStubReleased
 	}
 	sp.threads[tid] = th
 	sp.mu.Unlock()
 	fail := func(err error) (*thread, error) {
+		th.mu.Unlock()
 		th.destroy()
 		return nil, err
 	}
@@ -584,5 +585,6 @@ func (sp *stubProc) newGuestThreadUntil(abort <-chan struct{}) (*thread, error) 
 		return fail(err)
 	}
 	th.parked = true
+	th.mu.Unlock()
 	return th, nil
 }
