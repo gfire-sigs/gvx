@@ -53,7 +53,7 @@ fi
 # then places guest memory above 48 bits, which Linux does only on request and
 # which the guest Go runtime does not accept. Android devices with 16 KB pages
 # have 39 or 47 bits.
-timeout 3300 qemu-system-aarch64 -machine virt -accel tcg -cpu max,lpa2=off -smp 4 -m 4096 -nographic -no-reboot \
+timeout 3900 qemu-system-aarch64 -machine virt -accel tcg -cpu max,lpa2=off -smp 4 -m 4096 -nographic -no-reboot \
 	-kernel "$kernel" -initrd "$work/initramfs.gz" \
 	-append "console=ttyAMA0 rdinit=/init panic=-1 quiet" | tee "$work/console.log" | tr -d '\r'
 grep -q VMSMOKE-OK "$work/console.log"

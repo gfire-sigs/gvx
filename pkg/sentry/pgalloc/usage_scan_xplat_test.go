@@ -18,7 +18,10 @@ import (
 	"runtime"
 	"testing"
 	"time"
+	"unsafe"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
@@ -28,8 +31,47 @@ func TestCanSkipUsageScan(t *testing.T) {
 	if !canSkipUsageScan(nil) {
 		t.Error("canSkipUsageScan(nil) = false, want true: a scan of all memory trusts the block count")
 	}
-	if got, want := canSkipUsageScan(cgroups), runtime.GOOS == "linux" || runtime.GOOS == "android"; got != want {
+	want := (runtime.GOOS == "linux" || runtime.GOOS == "android") && unix.Getpagesize() <= hostarch.PageSize
+	if got := canSkipUsageScan(cgroups); got != want {
 		t.Errorf("canSkipUsageScan(one cgroup) on %s = %t, want %t", runtime.GOOS, got, want)
+	}
+}
+
+func TestMincoreExpandHostPages(t *testing.T) {
+	const hostPage = 16 << 10
+	const guestPage = hostarch.PageSize
+	raw := make([]byte, 3*hostPage)
+	rawAddr := uintptr(unsafe.Pointer(&raw[0]))
+	base := (rawAddr + hostPage - 1) &^ (hostPage - 1)
+	off := int(base - rawAddr)
+	arena := raw[off : off+2*hostPage]
+
+	// Query a 3-guest-page slice starting at sub-page 3 of host page 0 and
+	// spanning sub-pages 0 and 1 of host page 1.
+	sub := arena[3*guestPage : 6*guestPage]
+	buf := make([]byte, 3)
+	var gotBase, gotSpan uintptr
+	err := mincoreExpandHostPages(sub, buf, hostPage, func(qBase, qSpan uintptr, vec []byte) error {
+		gotBase = qBase
+		gotSpan = qSpan
+		if len(vec) != 2 {
+			t.Fatalf("len(vec) = %d, want 2 host pages", len(vec))
+		}
+		vec[0] = 1
+		vec[1] = 0
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mincoreExpandHostPages: %v", err)
+	}
+	if gotBase != base || gotSpan != 2*hostPage {
+		t.Fatalf("query range = (%#x, %#x), want (%#x, %#x)", gotBase, gotSpan, base, uintptr(2*hostPage))
+	}
+	want := []byte{1, 0, 0}
+	for i := range want {
+		if buf[i] != want[i] {
+			t.Fatalf("buf[%d] = %d, want %d (full buf = %v)", i, buf[i], want[i], buf)
+		}
 	}
 }
 

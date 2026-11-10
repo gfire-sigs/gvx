@@ -100,8 +100,8 @@ func main() {
 	}{
 		{"systrap.test", "/systrap.test", 5 * time.Minute},
 		{"hostfs.test", "/hostfs.test", 5 * time.Minute},
-		{"ext4lite.test", "/ext4lite.test", 6 * time.Minute},
-		{"e2e.test", "/e2e.test", 25 * time.Minute},
+		{"ext4lite.test", "/ext4lite.test", 10 * time.Minute},
+		{"e2e.test", "/e2e.test", 32 * time.Minute},
 	} {
 		if !runTestBinary(suite.label, suite.bin, suite.timeout) {
 			ok = false

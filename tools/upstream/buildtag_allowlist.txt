@@ -87,11 +87,13 @@ seam pkg/sentry/loader/elf.go
 # Content seam: MemoryFile splits decommits at host page boundaries and merges released
 # sub-pages into whole host pages before punching holes (pkg/sentry/pgalloc/pgalloc.go).
 # UpdateUsage also scans a single memory cgroup on hosts where the file block count lags
-# (pkg/sentry/pgalloc/usage_scan_xplat.go). A sandbox of a process with several sandboxes
-# charges the usage accounting of its own memory file, so the global accounting does not sum
-# the memory of every sandbox (MemoryFile.Accounting in pkg/sentry/pgalloc/usage_scan_xplat.go).
-# MapInternal also reports a write request to the observers of the Windows systrap engine
-# (pkg/sentry/pgalloc/hostwrite_windows.go and memory_file_xplat.go).
+# or the host page exceeds 4 KB. mincoreGuestPages expands host-page residency to 4 KB
+# guest pages (pkg/sentry/pgalloc/usage_scan_xplat.go). A sandbox of a process with
+# several sandboxes charges the usage accounting of its own memory file, so the global
+# accounting does not sum the memory of every sandbox (MemoryFile.Accounting in
+# pkg/sentry/pgalloc/usage_scan_xplat.go). MapInternal also reports a write request to
+# the observers of the Windows systrap engine (pkg/sentry/pgalloc/hostwrite_windows.go
+# and memory_file_xplat.go).
 seam pkg/sentry/pgalloc/pgalloc.go
 
 # Content seams: Docker with --userland-proxy=false, docker stats, and iptables-legacy-save.

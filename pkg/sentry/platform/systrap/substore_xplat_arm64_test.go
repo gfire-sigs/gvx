@@ -20,12 +20,10 @@ import (
 	"bytes"
 	"testing"
 
-	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
-	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
@@ -217,30 +215,6 @@ func TestEmulateAtomicOrCacheOp(t *testing.T) {
 	if ss.Regs[3] != 50 || decodeLEUint(mem[:8]) != 99 {
 		t.Fatalf("after cas: x3=%d mem=%d, want 50 and 99", ss.Regs[3], decodeLEUint(mem[:8]))
 	}
-}
-
-type fakeCompBlockHost struct{}
-
-func (fakeCompBlockHost) mapRange(addr, length uintptr, prot int, populate bool, fd int, off uint64) error {
-	return nil
-}
-
-func (fakeCompBlockHost) unmapRange(addr, length uintptr) error { return nil }
-
-func (fakeCompBlockHost) allocComp() (compPage, error) {
-	return compPage{buf: make([]byte, subBlockSize)}, nil
-}
-
-func (fakeCompBlockHost) freeComp(c compPage) {}
-
-func (fakeCompBlockHost) compFD() int { return 0 }
-
-type noopSubBlockPopulator struct {
-	platform.MemoryManager
-}
-
-func (noopSubBlockPopulator) PopulateSubBlock(context.Context, hostarch.Addr) bool {
-	return false
 }
 
 // TestCrossLayerSharedCompositeRefresh verifies that a read-only subpage of a
