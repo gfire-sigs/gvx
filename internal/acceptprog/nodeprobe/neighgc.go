@@ -167,6 +167,18 @@ func neighGCChecks() []check {
 				if err := writeValue(gcThreshPath("ipv4", 3), "3"); err != nil {
 					return err
 				}
+				// Static entries do not count, so 100 of them leave the limit alone.
+				// Add them before the dynamic probes so slow emulators do not age
+				// out the three-second incomplete timer during the netlink loop.
+				mac, _ := net.ParseMAC("02:00:00:00:00:77")
+				for i := range 100 {
+					err := netlink.NeighSet(&netlink.Neigh{
+						LinkIndex: link, State: netlink.NUD_PERMANENT, IP: net.IPv4(10, 60, 0, byte(i+1)), HardwareAddr: mac,
+					})
+					if err != nil {
+						return fmt.Errorf("static entry %d: %w", i, err)
+					}
+				}
 				// Nobody answers ARP, so the entries stay incomplete for about
 				// three seconds. A forced collection cannot remove them.
 				fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
@@ -179,23 +191,20 @@ func neighGCChecks() []check {
 						return fmt.Errorf("datagram %d: %w", i, err)
 					}
 				}
-				// Static entries do not count, so 100 of them leave the limit alone.
-				mac, _ := net.ParseMAC("02:00:00:00:00:77")
-				for i := range 100 {
-					err := netlink.NeighSet(&netlink.Neigh{
-						LinkIndex: link, State: netlink.NUD_PERMANENT, IP: net.IPv4(10, 60, 0, byte(i+1)), HardwareAddr: mac,
-					})
-					if err != nil {
-						return fmt.Errorf("static entry %d: %w", i, err)
-					}
-				}
 				// The datagram that needs a fourth entry is dropped. Linux logs
 				// "neighbor table overflow!", and the table keeps three entries.
 				_ = sendTo(fd, "10.50.0.21")
 				if n, err := dynamicNeighbors(link); err != nil || n != 3 {
 					return fmt.Errorf("the table holds %d dynamic entries (%v), want 3", n, err)
 				}
-				// Raising gc_thresh3 makes room at once.
+				// Raising gc_thresh2 and gc_thresh3 makes room at once without
+				// triggering a soft-threshold flush when more than five seconds
+				// elapsed since the overflow flush; even if the three incomplete
+				// entries reach NUD_FAILED after three seconds, they stay in the
+				// table and count as dynamic entries until a GC sweep runs.
+				if err := writeValue(gcThreshPath("ipv4", 2), "512"); err != nil {
+					return err
+				}
 				if err := writeValue(gcThreshPath("ipv4", 3), "1024"); err != nil {
 					return err
 				}

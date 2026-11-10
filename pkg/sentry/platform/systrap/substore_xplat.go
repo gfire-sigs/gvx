@@ -131,6 +131,11 @@ func (l *subBlockLayer) readLocked(addr uint64, n int) ([]byte, bool) {
 	return out, true
 }
 
+// hostWriteNoter is a memory file that reports Sentry writes to its observers.
+type hostWriteNoter interface {
+	NoteHostWrite(fr memmap.FileRange)
+}
+
 // writeLocked stores b at addr in the file pages of the guest and in the
 // composite pages that copy them. The range is writable.
 func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
@@ -155,10 +160,21 @@ func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
 		if hb.hasComp {
 			flushICache(uintptr(unsafe.Pointer(&hb.comp.buf[i*hostarch.PageSize+off])), uintptr(chunk))
 		}
-		// Another composite page of this address space can hold the same page.
+		// Another composite page of this address space or of another address
+		// space can hold the same page. NoteHostWrite runs the observers of
+		// sp.f without taking a lock (pgalloc.MemoryFile.NoteHostWrite), so
+		// calling it under l.mu cannot deadlock with another subBlockLayer.
 		sp := &hb.subs[i]
 		pageOff := sp.off + uint64(off)
-		l.noteHostWrite(sp.f, memmap.FileRange{Start: pageOff, End: pageOff + uint64(chunk)})
+		fr := memmap.FileRange{Start: pageOff, End: pageOff + uint64(chunk)}
+		if n, ok := sp.f.(hostWriteNoter); ok {
+			n.NoteHostWrite(fr)
+			if _, observed := l.observed[sp.f]; !observed {
+				l.noteHostWrite(sp.f, fr)
+			}
+		} else {
+			l.noteHostWrite(sp.f, fr)
+		}
 		addr += uint64(chunk)
 		b = b[chunk:]
 	}

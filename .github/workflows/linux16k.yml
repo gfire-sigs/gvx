@@ -1,9 +1,10 @@
-# Runs the host facility report, the synthetic ELF guest probes, the systrap
-# package tests, and the offline e2e test suite on a Linux arm64 kernel with
-# 16 KB pages (GVXIP-006 P5). The hosted runners have 4 KB pages, so the job
-# boots the arm64-16k kernel of Debian trixie in QEMU. The workflow runs by
-# hand and on pull requests that change the engine, memory management, host
-# lockdown, the file system drivers, the e2e suite, or this job.
+# Runs the host facility report, the synthetic ELF guest probes, the systrap,
+# hostfs, and ext4lite package tests, and the offline e2e test suite on a Linux
+# arm64 kernel with 16 KB pages (GVXIP-006 P5). The hosted runners have 4 KB
+# pages, so the job boots the arm64-16k kernel of Debian trixie in QEMU. The
+# workflow runs by hand and on pull requests that change the engine, memory
+# management, host lockdown, the file system drivers, the e2e suite, or this
+# job.
 name: linux16k
 
 on:

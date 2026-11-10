@@ -66,9 +66,10 @@ import (
 // them. It refreshes a read-only page in three cases. In the first case, the
 // memory file reports a Sentry write into it
 // (pgalloc.MemoryFile.ObserveHostWrites). In the second case, a guest store
-// that the layer ran changed it through another block. In the third case, a
-// writable direct block of the same address space maps it. It then refreshes
-// the page on each switch. A guest store through a writable mapping of
+// that any layer ran through a composite block changed it
+// (pgalloc.MemoryFile.NoteHostWrite). In the third case, a writable direct
+// block of the same address space maps it, and beforeSwitch then refreshes the
+// page on each switch. A guest store through a writable direct mapping of
 // another address space does not reach a read-only page of a composite page.
 // The page stays stale until the next change of the block.
 
@@ -155,8 +156,9 @@ func (sp *subPage) bytes() ([]byte, error) {
 	fr := memmap.FileRange{Start: sp.off, End: sp.off + hostarch.PageSize}
 	var bs safemem.BlockSeq
 	var err error
-	// The layer refreshes its own composite page after its own stores, so a
-	// mapping for them reports no write to the observer.
+	// MapInternal would report a write on every composite refresh that maps a
+	// guest-writable page, so bytes uses MapInternalUnreported; writeLocked
+	// reports emulated guest stores with NoteHostWrite.
 	if u, ok := sp.f.(interface {
 		MapInternalUnreported(memmap.FileRange, hostarch.AccessType) (safemem.BlockSeq, error)
 	}); ok {
@@ -177,8 +179,9 @@ func (sp *subPage) bytes() ([]byte, error) {
 // stubMap is what the stub maps for a block.
 type stubMap struct {
 	kind stubMapKind
-	// off is the offset of the mapping in its file.
+	// off is the offset of the mapping in its file, and fd is its descriptor.
 	off  uint64
+	fd   int
 	prot int
 }
 
@@ -704,7 +707,7 @@ func (l *subBlockLayer) mapBlocksLocked(start, end uintptr, off uint64, src subP
 			hb.subs[i] = sp
 		}
 		hb.recompute()
-		hb.cur = stubMap{kind: stubMapDirect, off: blockOff, prot: prot}
+		hb.cur = stubMap{kind: stubMapDirect, off: blockOff, fd: int(src.fd), prot: prot}
 		l.freeCompLocked(base, hb)
 		delete(l.partial, base)
 		delete(l.deferred, base)
@@ -749,7 +752,7 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 		delete(l.partial, base)
 	}
 	if isDirect {
-		want := stubMap{kind: stubMapDirect, off: off, prot: hb.blockProt(true)}
+		want := stubMap{kind: stubMapDirect, off: off, fd: fd, prot: hb.blockProt(true)}
 		if hb.cur != want {
 			if err := l.host.mapRange(base, subBlockSize, want.prot, false, fd, off); err != nil {
 				return fmt.Errorf("map [%#x, %#x): %w", base, base+subBlockSize, err)
@@ -799,7 +802,7 @@ func (l *subBlockLayer) mapCompLocked(base uintptr, hb *hostBlock, changed bool)
 			return fmt.Errorf("write the composite page for [%#x, %#x): %w", base, base+subBlockSize, err)
 		}
 	}
-	want := stubMap{kind: stubMapComp, off: hb.comp.fr.Start, prot: hb.blockProt(false)}
+	want := stubMap{kind: stubMapComp, off: hb.comp.fr.Start, fd: l.host.compFD(), prot: hb.blockProt(false)}
 	if hb.cur != want || clean {
 		l.changes.Add(1)
 		if err := l.host.mapRange(base, subBlockSize, want.prot, false, l.host.compFD(), want.off); err != nil {
@@ -1063,8 +1066,6 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 	}
 	all := l.allDirty.Swap(false)
 	for base, hb := range l.comps {
-		// A guest-writable page can be shared with another address space,
-		// whose stores the layer does not see, so it refreshes on each switch.
 		mask := hb.write
 		if d := hb.dirty.Load(); d > 0 {
 			hb.dirty.CompareAndSwap(d, d-1)

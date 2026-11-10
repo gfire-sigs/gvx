@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Boots a Linux arm64 kernel with 16 KB pages in QEMU and runs the host
-# facility report, the synthetic ELF guest probes, the systrap package tests,
-# and the offline e2e test suite in it (GVXIP-006 P5). It builds rungv, the
-# test binaries, the prebuilt guest probes, and the init program of
-# scripts/linux16k/init.go for linux/arm64, packs them into an initramfs, and
-# fails unless init prints VMSMOKE-OK.
+# facility report, the synthetic ELF guest probes, the systrap, hostfs, and
+# ext4lite package tests, and the offline e2e test suite in it (GVXIP-006 P5).
+# It builds rungv, the test binaries, the prebuilt guest probes, and the init
+# program of scripts/linux16k/init.go for linux/arm64, packs them into an
+# initramfs, and fails unless init prints VMSMOKE-OK.
 #
 # KERNEL is the path of the kernel image. Without it, the script needs Docker
 # on an arm64 host, and it extracts the arm64-16k kernel of Debian trixie.
@@ -28,6 +28,8 @@ build -ldflags="-s -w" -o "$work/root/guests/lockdownprobe" ./internal/lockdownp
 ln -s /rungv "$work/root/guests/rungv"
 ln -s /rungv "$work/root/guests/rungv-static"
 testbuild -o "$work/root/systrap.test" ./pkg/sentry/platform/systrap
+testbuild -o "$work/root/hostfs.test" ./pkg/sentry/fsimpl/hostfs
+testbuild -o "$work/root/ext4lite.test" ./pkg/sentry/fsimpl/ext4lite
 testbuild -o "$work/root/e2e.test" ./e2e
 for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow; do
 	build -ldflags=-linkmode=internal -o "$work/root/guests/$g" "./internal/acceptprog/$g"

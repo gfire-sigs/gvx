@@ -17,9 +17,9 @@
 // Command init is process 1 of the initramfs that scripts/linux16k/run.sh
 // boots in QEMU on a Linux kernel with 16 KB pages. It runs androidprobe
 // report, generates the synthetic ELF guests in /tmp/elfguests, runs rungv
-// with the synthetic ELF probes and hostfs voltree, runs the systrap and
-// offline e2e test suites, prints "PASS name" or "FAIL name" for each, prints
-// "VMSMOKE-OK" when all pass, and powers off the machine.
+// with the synthetic ELF probes and hostfs voltree, runs the systrap, hostfs,
+// ext4lite, and offline e2e test suites, prints "PASS name" or "FAIL name" for
+// each, prints "VMSMOKE-OK" when all pass, and powers off the machine.
 package main
 
 import (
@@ -93,14 +93,21 @@ func main() {
 			ok = false
 		}
 	}
-	if !runTestBinary("systrap.test", "/systrap.test", 10*time.Minute) {
-		ok = false
+	for _, suite := range []struct {
+		label   string
+		bin     string
+		timeout time.Duration
+	}{
+		{"systrap.test", "/systrap.test", 5 * time.Minute},
+		{"hostfs.test", "/hostfs.test", 5 * time.Minute},
+		{"ext4lite.test", "/ext4lite.test", 6 * time.Minute},
+		{"e2e.test", "/e2e.test", 25 * time.Minute},
+	} {
+		if !runTestBinary(suite.label, suite.bin, suite.timeout) {
+			ok = false
+		}
+		_ = os.Remove(suite.bin)
 	}
-	_ = os.Remove("/systrap.test")
-	if !runTestBinary("e2e.test", "/e2e.test", 35*time.Minute) {
-		ok = false
-	}
-	_ = os.Remove("/e2e.test")
 	if ok {
 		fmt.Println("VMSMOKE-OK")
 	} else {
@@ -164,7 +171,7 @@ func buildELFGuests() bool {
 }
 
 func runStep(s step) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	var out bytes.Buffer
 	args := append([]string{"run", "-platform=systrap", "-net=none"}, s.args...)

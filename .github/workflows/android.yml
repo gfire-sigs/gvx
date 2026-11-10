@@ -1,12 +1,12 @@
-# Runs the Android probe, the systrap package tests, the offline e2e test
-# suite, the untrusted_app probe APK, and the sample foreground-service APK on
-# an x86_64 Android 16 emulator (GVXIP-006 P1-4). Google ships no Linux arm64
-# emulator, and the arm64 emulator of macOS needs Hypervisor.framework, which
-# the hosted macOS runner lacks. The Linux runner has KVM, so the x86_64 image
-# boots there, and rungv and the test binaries build for android/amd64 with
-# cgo. The workflow runs by hand and on pull requests that change Android
-# support, the Linux systrap engine, memory management, the file system
-# drivers, or the e2e suite.
+# Runs the Android probe, the systrap, hostfs, and ext4lite package tests, the
+# offline e2e test suite, the untrusted_app probe APK, and the sample
+# foreground-service APK on an x86_64 Android 16 emulator (GVXIP-006 P1-4).
+# Google ships no Linux arm64 emulator, and the arm64 emulator of macOS needs
+# Hypervisor.framework, which the hosted macOS runner lacks. The Linux runner
+# has KVM, so the x86_64 image boots there, and rungv and the test binaries
+# build for android/amd64 with cgo. The workflow runs by hand and on pull
+# requests that change Android support, the Linux systrap engine, memory
+# management, the file system drivers, or the e2e suite.
 name: android
 
 on:
@@ -20,6 +20,7 @@ on:
       - internal/acceptprog/**
       - e2e/**
       - pkg/gvx/**
+      - pkg/cpuid/hwcap*
       - pkg/hostlockdown/*linux*
       - pkg/hostlockdown/*android*
       - pkg/hostlockdown/*xplat*

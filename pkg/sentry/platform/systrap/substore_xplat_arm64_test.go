@@ -20,7 +20,11 @@ import (
 	"bytes"
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 // runStore decodes insn and runs it against a state with fixed register values.
@@ -210,5 +214,84 @@ func TestEmulateAtomicOrCacheOp(t *testing.T) {
 	}
 	if ss.Regs[3] != 50 || decodeLEUint(mem[:8]) != 99 {
 		t.Fatalf("after cas: x3=%d mem=%d, want 50 and 99", ss.Regs[3], decodeLEUint(mem[:8]))
+	}
+}
+
+type fakeCompBlockHost struct{}
+
+func (fakeCompBlockHost) mapRange(addr, length uintptr, prot int, populate bool, fd int, off uint64) error {
+	return nil
+}
+
+func (fakeCompBlockHost) unmapRange(addr, length uintptr) error { return nil }
+
+func (fakeCompBlockHost) allocComp() (compPage, error) {
+	return compPage{buf: make([]byte, subBlockSize)}, nil
+}
+
+func (fakeCompBlockHost) freeComp(c compPage) {}
+
+func (fakeCompBlockHost) compFD() int { return 0 }
+
+// TestCrossLayerSharedCompositeRefresh verifies that a read-only subpage of a
+// composite block in one subBlockLayer refreshes when another subBlockLayer
+// modifies the shared page in pgalloc.MemoryFile through an emulated store.
+func TestCrossLayerSharedCompositeRefresh(t *testing.T) {
+	mf, err := createMemoryFile()
+	if err != nil {
+		t.Fatalf("createMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	reader := newSubBlockLayer(fakeCompBlockHost{})
+	defer reader.reset()
+	writer := newSubBlockLayer(fakeCompBlockHost{})
+	defer writer.reset()
+
+	const (
+		readerAddr = hostarch.Addr(0x10000)
+		writerAddr = hostarch.Addr(0x20000)
+	)
+	page0 := memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.PageSize}
+	page1 := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+
+	if err := reader.mapFile(readerAddr, mf, page0, hostarch.Read, false); err != nil {
+		t.Fatalf("reader mapFile page0: %v", err)
+	}
+	if err := reader.mapFile(readerAddr+hostarch.PageSize, mf, page1, hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("reader mapFile page1: %v", err)
+	}
+	if err := writer.mapFile(writerAddr, mf, fr, hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("writer mapFile: %v", err)
+	}
+
+	reader.beforeSwitch(nil, nil)
+	writer.beforeSwitch(nil, nil)
+
+	hb := reader.blocks[uintptr(readerAddr)]
+	if hb == nil || !hb.hasComp {
+		t.Fatalf("reader block at %#x is not composite", readerAddr)
+	}
+	if hb.alwaysSync {
+		t.Fatalf("reader composite block has alwaysSync set without a same-layer direct writable alias")
+	}
+
+	wantEmulated := []byte{1, 2, 3, 4}
+	writer.mu.Lock()
+	writer.writeLocked(uint64(writerAddr), wantEmulated)
+	writer.mu.Unlock()
+	if d := hb.dirty.Load(); d <= 0 {
+		t.Fatalf("reader hb.dirty = %d after cross-layer writeLocked, want > 0", d)
+	}
+
+	reader.beforeSwitch(nil, nil)
+	if got := hb.comp.buf[:len(wantEmulated)]; !bytes.Equal(got, wantEmulated) {
+		t.Fatalf("composite page0 after emulated store = %v, want %v", got, wantEmulated)
 	}
 }

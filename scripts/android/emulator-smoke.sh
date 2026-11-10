@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs the Android probe, the systrap package tests, the offline e2e test
-# suite, the untrusted_app probe APK, and the sample foreground-service APK on
-# the device that adb selects (GVXIP-006 P1-4).
+# Runs the Android probe, the systrap, hostfs, and ext4lite package tests, the
+# offline e2e test suite, the untrusted_app probe APK, and the sample
+# foreground-service APK on the device that adb selects (GVXIP-006 P1-4).
 #
 # Go links android/amd64 only with cgo, so an x86_64 device needs the NDK:
 # set ANDROID_NDK_HOME, or install an NDK under ANDROID_HOME/ndk. The script
@@ -15,7 +15,9 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
 cleanup() {
 	rm -rf "$work"
-	adb shell "settings delete global settings_enable_monitor_phantom_procs; device_config delete activity_manager max_phantom_processes; device_config set_sync_disabled_for_tests none" >/dev/null 2>&1 || true
+	adb shell "rm -rf /data/local/tmp/gvx-smoke; settings delete global settings_enable_monitor_phantom_procs; device_config delete activity_manager max_phantom_processes; device_config set_sync_disabled_for_tests none" >/dev/null 2>&1 || true
+	adb unroot >/dev/null 2>&1 || true
+	adb wait-for-device >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 dir=/data/local/tmp/gvx-smoke
@@ -32,6 +34,8 @@ env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv
 env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/lockdownprobe" ./internal/lockdownprobe/cmd/lockdownprobe
 env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/androidprobe" ./tools/androidprobe
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/systrap.test" ./pkg/sentry/platform/systrap
+env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/hostfs.test" ./pkg/sentry/fsimpl/hostfs
+env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/ext4lite.test" ./pkg/sentry/fsimpl/ext4lite
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/e2e.test" ./e2e
 GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv-static" ./cmd/rungv
 for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow; do
@@ -40,7 +44,7 @@ done
 GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-linkmode=internal -T 0x1001000" -o "$work/bins/brkgrow-0x1001000" ./internal/acceptprog/brkgrow
 
 adb shell "settings put global settings_enable_monitor_phantom_procs false; device_config set_sync_disabled_for_tests persistent; device_config put activity_manager max_phantom_processes 2147483647" >/dev/null 2>&1 || true
-adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp"
+adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp $dir/vws"
 adb push "$work/bins"/* "$dir/" >/dev/null
 adb shell "getprop ro.build.version.release; getconf PAGE_SIZE; uname -rm"
 
@@ -57,10 +61,12 @@ else
 fi
 
 run_test_suite() {
-	local label=$1 bin=$2 timeout=$3 rc=0
-	echo "== $label (shell)"
-	adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout 2>&1" | tr -d '\r' || rc=$?
-	adb shell "rm -f $dir/$bin" || true
+	local label=$1 bin=$2 timeout=$3 keep=${4:-0} extra=${5:-} rc=0
+	echo "== $label"
+	adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout $extra 2>&1" | tr -d '\r' || rc=$?
+	if [ "$keep" -eq 0 ]; then
+		adb shell "rm -f $dir/$bin" || true
+	fi
 	if [ "$rc" -eq 0 ]; then
 		echo "PASS $label"
 	else
@@ -69,8 +75,55 @@ run_test_suite() {
 	fi
 }
 
-run_test_suite systrap.test systrap.test 10m
-run_test_suite e2e.test e2e.test 30m
+run_test_suite "systrap.test (shell)" systrap.test 10m
+run_test_suite "ext4lite.test (shell)" ext4lite.test 10m
+run_test_suite "e2e.test (shell)" e2e.test 30m 1
+
+# Switch adbd to root only for the hostfs and overlay hard-link suites, because
+# Android's shell SELinux domain denies linkat(2) on /data/local/tmp.
+switch_adb_uid() {
+	local want_uid=$1 mode=$2 uid=""
+	adb "$mode" >/dev/null 2>&1 || return 1
+	for _ in $(seq 1 30); do
+		adb wait-for-device >/dev/null 2>&1 || true
+		uid=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
+		if [ "$uid" = "$want_uid" ]; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+run_shell() {
+	local label=$1 want=$2 cmd=$3 out
+	out=$(adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache $cmd 2>&1" | tr -d '\r') || true
+	if grep -qF "$want" <<<"$out" && ! grep -qE '(^| )FAIL ' <<<"$out"; then
+		echo "PASS $label"
+	else
+		echo "FAIL $label"
+		echo "$out" | head -n 40
+		failed=1
+	fi
+}
+
+if switch_adb_uid 0 root; then
+	run_shell voltree-write-hostfs "write ok" "./rungv run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- write /workspace"
+	run_shell voltree-verify-hostfs "verify ok" "./rungv run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- verify /workspace"
+	run_test_suite "hostfs.test (root)" hostfs.test 10m
+	run_test_suite "e2e.test hostfs overlay (root)" e2e.test 10m 0 "'-test.run=^TestE2EOverlayUpper/.*/hostfs-(bind|volume)$'"
+	adb shell "rm -rf $dir/cache $dir/tmp $dir/vws && mkdir -p $dir/cache $dir/tmp && chown -R shell:shell $dir" || true
+	if ! switch_adb_uid 2000 unroot; then
+		echo "FAIL adb-unroot"
+		failed=1
+	fi
+elif [ "${CI:-}" = true ]; then
+	echo "FAIL adb-root"
+	failed=1
+else
+	echo "SKIP root-hostfs-suites (adb root unavailable on user build)"
+	adb shell "rm -f $dir/hostfs.test $dir/e2e.test" || true
+fi
 
 echo "== probe APK (untrusted_app)"
 ANDROID_ABI=$abi scripts/android/build-probe-apk.sh "$work/probe.apk" >/dev/null

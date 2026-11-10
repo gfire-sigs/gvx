@@ -147,8 +147,8 @@ func TestE2EOverlayUpperLayers(t *testing.T) {
 	for _, b := range fixedAddressBackends() {
 		for _, layout := range overlayUpperLayouts() {
 			t.Run(b.name+"/"+layout.name, func(t *testing.T) {
-				if layout.hostfs && runtime.GOOS == "android" {
-					t.Skip("Android SELinux denies linkat hard links on app and shell data files")
+				if layout.hostfs && runtime.GOOS == "android" && os.Geteuid() != 0 {
+					t.Skip("Android SELinux denies linkat hard links on non-root shell data files")
 				}
 				requireFixedAddressBackend(t, b)
 				mount := layout.mount(t)
@@ -170,8 +170,8 @@ func TestE2EOverlayUpperPersistsAcrossSandboxes(t *testing.T) {
 				continue
 			}
 			t.Run(b.name+"/"+layout.name, func(t *testing.T) {
-				if layout.hostfs && runtime.GOOS == "android" {
-					t.Skip("Android SELinux denies linkat hard links on app and shell data files")
+				if layout.hostfs && runtime.GOOS == "android" && os.Geteuid() != 0 {
+					t.Skip("Android SELinux denies linkat hard links on non-root shell data files")
 				}
 				requireFixedAddressBackend(t, b)
 				mount := layout.mount(t)
@@ -204,8 +204,8 @@ func TestE2EOverlayUpperSurvivesSigkill(t *testing.T) {
 	for _, b := range fixedAddressBackends() {
 		for _, layout := range layouts {
 			t.Run(b.name+"/"+layout.name, func(t *testing.T) {
-				if layout.bind && runtime.GOOS == "android" {
-					t.Skip("Android SELinux denies linkat hard links on app and shell data files")
+				if layout.bind && runtime.GOOS == "android" && os.Geteuid() != 0 {
+					t.Skip("Android SELinux denies linkat hard links on non-root shell data files")
 				}
 				requireFixedAddressBackend(t, b)
 				src := layout.src(t)
