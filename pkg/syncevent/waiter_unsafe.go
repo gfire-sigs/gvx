@@ -81,8 +81,9 @@ func (w *Waiter) WaitFor(es Set) Set {
 			return p
 		}
 
-		// Indicate that we're preparing to go to sleep.
-		atomic.StoreUintptr(&w.g, preparingG)
+		// Use an atomic swap so that ARM64 and QEMU TCG emit a full barrier
+		// between writing w.g and reading w.r.Pending().
+		atomic.SwapUintptr(&w.g, preparingG)
 
 		// If an event is pending, abort the sleep.
 		if p := w.r.Pending(); p&es != NoEvents {
@@ -125,8 +126,9 @@ func (w *Waiter) WaitAndAckAll() Set {
 	}
 
 	for {
-		// Indicate that we're preparing to go to sleep.
-		atomic.StoreUintptr(&w.g, preparingG)
+		// Use an atomic swap so that ARM64 and QEMU TCG emit a full barrier
+		// between writing w.g and reading w.r.Pending().
+		atomic.SwapUintptr(&w.g, preparingG)
 
 		// If an event is pending, abort the sleep.
 		if w.r.Pending() != NoEvents {

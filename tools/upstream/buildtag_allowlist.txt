@@ -397,3 +397,9 @@ seam pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go
 # ran on the alternate stack, as __save_altstack in Linux sets it. The seam is in
 # deliverSignalToHandler.
 seam pkg/sentry/kernel/task_signals.go
+
+# Content seams: Waiter, Sleeper, and the systrap fast-path monitor use atomic RMW swaps before
+# their paired loads. QEMU TCG on arm64 then emits a full barrier between the store and the load.
+seam pkg/syncevent/waiter_unsafe.go
+seam pkg/sleep/sleep_unsafe.go
+seam pkg/sentry/platform/systrap/metrics.go
