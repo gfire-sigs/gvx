@@ -20,9 +20,11 @@ build() { GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath "$@"; }
 mkdir -p "$work/root/guests"
 build -o "$work/root/init" scripts/linux16k/init.go
 build -o "$work/root/rungv" ./cmd/rungv
-for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe; do
-	build -o "$work/root/guests/$g" "./internal/acceptprog/$g"
+build -o "$work/root/androidprobe" ./tools/androidprobe
+for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree; do
+	build -ldflags=-linkmode=internal -o "$work/root/guests/$g" "./internal/acceptprog/$g"
 done
+build -ldflags="-linkmode=internal -T 0x1001000" -o "$work/root/guests/brkgrow" ./internal/acceptprog/brkgrow
 (cd "$work/root" && find . | cpio -o -H newc --quiet) | gzip -1 > "$work/initramfs.gz"
 
 kernel=${KERNEL:-}

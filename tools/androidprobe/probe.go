@@ -29,6 +29,7 @@ import (
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
 // The child modes run one host facility in a separate process, so a fatal
@@ -80,13 +81,32 @@ func report(w io.Writer) int {
 }
 
 // probeMMapMinAddr reads the lowest address that the host lets a process map.
-// The Linux systrap engine panics at start when it cannot read this file.
+// When SELinux denies the read of /proc/sys/vm/mmap_min_addr on Android, it
+// checks that the address from platform.SystemMMapMinAddr maps one page.
 func probeMMapMinAddr() item {
+	const name = "mmap_min_addr"
 	b, err := os.ReadFile("/proc/sys/vm/mmap_min_addr")
-	if err != nil {
-		return item{name: "mmap_min_addr", detail: err.Error()}
+	if err == nil {
+		return item{name: name, ok: true, detail: strings.TrimSpace(string(b))}
 	}
-	return item{name: "mmap_min_addr", ok: true, detail: strings.TrimSpace(string(b))}
+	min := uintptr(platform.SystemMMapMinAddr())
+	if min == 0 {
+		return item{name: name, detail: err.Error()}
+	}
+	page := uintptr(os.Getpagesize())
+	got, _, errno := unix.RawSyscall6(unix.SYS_MMAP, min, page,
+		unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE, ^uintptr(0), 0)
+	switch {
+	case errno == unix.EEXIST:
+		return item{name: name, ok: true, detail: fmt.Sprintf("measured %#x (%v)", min, err)}
+	case errno != 0:
+		return item{name: name, detail: fmt.Sprintf("mmap %#x: %v (%v)", min, errno, err)}
+	}
+	unix.RawSyscall(unix.SYS_MUNMAP, got, page, 0)
+	if got != min {
+		return item{name: name, detail: fmt.Sprintf("mmap %#x landed at %#x (%v)", min, got, err)}
+	}
+	return item{name: name, ok: true, detail: fmt.Sprintf("measured %#x (%v)", min, err)}
 }
 
 // probeMemfdExec maps a memfd with PROT_EXEC, as the systrap engine maps guest

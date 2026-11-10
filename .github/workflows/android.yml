@@ -1,9 +1,11 @@
-# Runs the Android probe and the systrap guest probes on an x86_64 Android 16
-# emulator (GVXIP-006 P1-4). Google ships no Linux arm64 emulator, and the
-# arm64 emulator of macOS needs Hypervisor.framework, which the hosted macOS
-# runner lacks. The Linux runner has KVM, so the x86_64 image boots there, and
-# rungv builds for android/amd64 with cgo. The workflow runs by hand, and on a
-# pull request only when this file or the smoke script changes.
+# Runs the Android probe, the systrap guest probes, the untrusted_app probe APK,
+# and the sample foreground-service APK on an x86_64 Android 16 emulator
+# (GVXIP-006 P1-4). Google ships no Linux arm64 emulator, and the arm64 emulator
+# of macOS needs Hypervisor.framework, which the hosted macOS runner lacks. The
+# Linux runner has KVM, so the x86_64 image boots there, and rungv builds for
+# android/amd64 with cgo. The workflow runs by hand and on pull requests that
+# change Android support, the Linux systrap engine, memory management, or the
+# file system drivers that the smoke suite exercises.
 name: android
 
 on:
@@ -11,7 +13,23 @@ on:
   pull_request:
     paths:
       - .github/workflows/android.yml
-      - scripts/android/emulator-smoke.sh
+      - scripts/android/**
+      - android/**
+      - tools/androidprobe/**
+      - internal/acceptprog/**
+      - pkg/hostlockdown/*linux*
+      - pkg/hostlockdown/*android*
+      - pkg/hostlockdown/*xplat*
+      - pkg/sentry/platform/mmap_min_addr*
+      - pkg/sentry/platform/systrap/*linux*
+      - pkg/sentry/platform/systrap/*android*
+      - pkg/sentry/platform/systrap/*xplat*
+      - pkg/sentry/platform/systrap/subprocess*
+      - pkg/sentry/mm/**
+      - pkg/sentry/pgalloc/**
+      - pkg/sentry/fsimpl/chunkcache/**
+      - pkg/sentry/fsimpl/hostfs/**
+      - pkg/sentry/fsimpl/ext4lite/**
 
 permissions:
   contents: read
@@ -38,11 +56,11 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Install the emulator, the system image, and the NDK
+      - name: Install the emulator, the SDK platform, the system image, and the NDK
         run: |
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$sdkmanager" --licenses > /dev/null
-          "$sdkmanager" emulator platform-tools "ndk;28.2.13676358" "$ANDROID_IMAGE" > /dev/null
+          "$sdkmanager" emulator platform-tools "build-tools;36.1.0" "platforms;android-36" "ndk;28.2.13676358" "$ANDROID_IMAGE" > /dev/null
           mkdir -p "$ANDROID_AVD_HOME"
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n ci -k "$ANDROID_IMAGE" -d pixel_6
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"

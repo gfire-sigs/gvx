@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds the probe app of GVXIP-006 for android/arm64. The app packs
-# androidprobe and rungv as native libraries, and its instrumentation starts
-# one of them as untrusted_app.
+# Builds the probe app of GVXIP-006 for ANDROID_ABI (default arm64-v8a). The app
+# packs androidprobe and rungv as native libraries, and its instrumentation
+# starts one of them as untrusted_app.
 #
 # Usage: scripts/android/build-probe-apk.sh OUT.apk
 set -euo pipefail

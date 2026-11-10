@@ -10,9 +10,14 @@ on:
     paths:
       - .github/workflows/linux16k.yml
       - scripts/linux16k/**
+      - tools/androidprobe/**
+      - internal/acceptprog/**
       - pkg/sentry/platform/systrap/**
       - pkg/sentry/mm/**
       - pkg/sentry/pgalloc/**
+      - pkg/sentry/fsimpl/chunkcache/**
+      - pkg/sentry/fsimpl/hostfs/**
+      - pkg/sentry/fsimpl/ext4lite/**
 
 permissions:
   contents: read

@@ -31,16 +31,48 @@ import (
 	"time"
 )
 
-// guests maps each guest probe to the line that it prints when all its checks
-// pass.
-var guests = []struct{ name, want string }{
-	{"gostatic", "recover boom"},
-	{"regprobe", "REGPROBE-OK"},
-	{"sigframeprobe", "SIGFRAMEPROBE-OK"},
-	{"forkprobe", "FORKPROBE-OK"},
-	{"cowprobe", "COWPROBE-OK"},
-	{"codewrite", "CODEWRITE-OK"},
-	{"spareprobe", "SPAREPROBE-OK"},
+// step is one rungv invocation and the substrings that its output must contain.
+type step struct {
+	label string
+	args  []string
+	wants []string
+}
+
+var steps = []step{
+	{"guest-pie", []string{"-bin=/tmp/elfguests/guest-pie"}, []string{"guest-pie ok"}},
+	{"guest-fixed-0x10000", []string{"-bin=/tmp/elfguests/guest-fixed-0x10000"}, []string{"guest-fixed-0x10000 ok"}},
+	{"guest-fixed-0x400000", []string{"-bin=/tmp/elfguests/guest-fixed-0x400000"}, []string{"guest-fixed-0x400000 ok"}},
+	{"guest-shared-page", []string{"-bin=/tmp/elfguests/guest-shared-page"}, []string{"guest-shared-page ok"}},
+	{"gostatic", []string{"-bin=/guests/gostatic"}, []string{"recover boom"}},
+	{"regprobe", []string{"-bin=/guests/regprobe"}, []string{"REGPROBE-OK"}},
+	{"sigframeprobe", []string{"-bin=/guests/sigframeprobe"}, []string{"SIGFRAMEPROBE-OK"}},
+	{"forkprobe", []string{"-bin=/guests/forkprobe"}, []string{"FORKPROBE-OK"}},
+	{"cowprobe", []string{"-bin=/guests/cowprobe"}, []string{"COWPROBE-OK"}},
+	{"spareprobe", []string{"-bin=/guests/spareprobe"}, []string{"SPAREPROBE-OK"}},
+	{"brkgrow", []string{"-bin=/guests/brkgrow"}, []string{"brk grew 1024 MiB"}},
+	{"membarrierprobe", []string{"-bin=/guests/membarrierprobe", "checks"}, []string{"DONE"}},
+	{"eintrprobe", []string{"-bin=/guests/eintrprobe", "checks", "10"}, []string{"DONE"}},
+	{
+		"codewrite",
+		[]string{
+			"-workspace=/tmp/cws",
+			"--mount=type=volume,src=/tmp/cvol.ext4,dst=/mnt,driver=ext4lite",
+			"-bin=/guests/codewrite",
+			"dir=/workspace",
+			"dir=/mnt",
+		},
+		[]string{
+			"PASS shared-file-writes:/workspace",
+			"PASS shared-file-writes:/mnt",
+			"CODEWRITE-OK",
+		},
+	},
+	{"fsfeatures-hostfs", []string{"-workspace=/tmp/fsws", "-bin=/guests/fsfeatures", "hostfs", "/workspace"}, []string{"hostfs ok"}},
+	{"fsfeatures-ext4lite", []string{"--mount=type=volume,src=/tmp/fsvol.ext4,dst=/mnt,driver=ext4lite", "-bin=/guests/fsfeatures", "ext4lite", "/mnt"}, []string{"ext4lite ok"}},
+	{"voltree-write-hostfs", []string{"-workspace=/tmp/vws", "-bin=/guests/voltree", "write", "/workspace"}, []string{"write ok"}},
+	{"voltree-verify-hostfs", []string{"-workspace=/tmp/vws", "-bin=/guests/voltree", "verify", "/workspace"}, []string{"verify ok"}},
+	{"voltree-write-ext4lite", []string{"--mount=type=volume,src=/tmp/vvol.ext4,dst=/mnt,driver=ext4lite", "-bin=/guests/voltree", "write", "/mnt"}, []string{"write ok"}},
+	{"voltree-verify-ext4lite", []string{"--mount=type=volume,src=/tmp/vvol.ext4,dst=/mnt,driver=ext4lite", "-bin=/guests/voltree", "verify", "/mnt"}, []string{"verify ok"}},
 }
 
 func main() {
@@ -62,31 +94,71 @@ func main() {
 	_ = syscall.Uname(&uts)
 	fmt.Printf("page size %d, kernel %s\n", os.Getpagesize(), charsToString(uts.Release[:]))
 	os.Setenv("HOME", "/tmp")
+	os.Setenv("TMPDIR", "/tmp")
 	os.Setenv("XDG_CACHE_HOME", "/tmp/cache")
-
-	ok := true
-	for _, g := range guests {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-		var out bytes.Buffer
-		cmd := exec.CommandContext(ctx, "/rungv", "run", "-platform=systrap", "-net=none", "-bin=/guests/"+g.name)
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		err := cmd.Run()
-		cancel()
-		if strings.Contains(out.String(), g.want) {
-			fmt.Println("PASS", g.name)
-			continue
+	for _, d := range []string{"/tmp/cache", "/tmp/cws", "/tmp/fsws", "/tmp/vws"} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			fmt.Println("mkdir", d, err)
 		}
-		ok = false
-		fmt.Println("FAIL", g.name, err)
-		// A Go panic names its cause in the first lines.
-		fmt.Println(head(out.String(), 30))
+	}
+
+	ok := runProbeReport() && buildELFGuests()
+	for _, s := range steps {
+		if !runStep(s) {
+			ok = false
+		}
 	}
 	if ok {
 		fmt.Println("VMSMOKE-OK")
 	} else {
 		fmt.Println("VMSMOKE-FAIL")
 	}
+}
+
+func runProbeReport() bool {
+	out, err := exec.Command("/androidprobe", "report").CombinedOutput()
+	fmt.Print(string(out))
+	if err != nil || strings.Contains(string(out), " FAIL ") {
+		fmt.Println("FAIL androidprobe-report", err)
+		return false
+	}
+	fmt.Println("PASS androidprobe-report")
+	return true
+}
+
+func buildELFGuests() bool {
+	out, err := exec.Command("/androidprobe", "guests", "/tmp/elfguests").CombinedOutput()
+	if err != nil {
+		fmt.Println("FAIL androidprobe-guests", err, string(out))
+		return false
+	}
+	return true
+}
+
+func runStep(s step) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	var out bytes.Buffer
+	args := append([]string{"run", "-platform=systrap", "-net=none"}, s.args...)
+	cmd := exec.CommandContext(ctx, "/rungv", args...)
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	text := out.String()
+	passed := err == nil && !strings.HasPrefix(text, "FAIL ") && !strings.Contains(text, "\nFAIL ")
+	for _, w := range s.wants {
+		if !strings.Contains(text, w) {
+			passed = false
+		}
+	}
+	if passed {
+		fmt.Println("PASS", s.label)
+		return true
+	}
+	fmt.Println("FAIL", s.label, err)
+	// A Go panic names its cause in the first lines.
+	fmt.Println(head(text, 40))
+	return false
 }
 
 func charsToString(cs []int8) string {
