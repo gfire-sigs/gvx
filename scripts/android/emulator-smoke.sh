@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# Runs the Android probe, the systrap guest probes, the untrusted_app probe APK,
-# and the sample foreground-service APK on the device that adb selects
-# (GVXIP-006 P1-4).
+# Runs the Android probe, the systrap package tests, the offline e2e test
+# suite, the untrusted_app probe APK, and the sample foreground-service APK on
+# the device that adb selects (GVXIP-006 P1-4).
 #
 # Go links android/amd64 only with cgo, so an x86_64 device needs the NDK:
-# set ANDROID_NDK_HOME, or install an NDK under ANDROID_HOME/ndk.
+# set ANDROID_NDK_HOME, or install an NDK under ANDROID_HOME/ndk. The script
+# disables the Android phantom process killer during the test run and restores
+# the monitor setting in its EXIT trap.
 #
 # Usage: scripts/android/emulator-smoke.sh
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+cleanup() {
+	rm -rf "$work"
+	adb shell "settings delete global settings_enable_monitor_phantom_procs; device_config delete activity_manager max_phantom_processes; device_config set_sync_disabled_for_tests none" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 dir=/data/local/tmp/gvx-smoke
 
 abi=$(adb shell getprop ro.product.cpu.abi | tr -d '\r')
@@ -22,14 +28,19 @@ arch=$android_arch
 
 cd "$root"
 mkdir -p "$work/bins"
-env "${android_env[@]}" go build -trimpath -o "$work/bins/rungv" ./cmd/rungv
-env "${android_env[@]}" go build -trimpath -o "$work/bins/androidprobe" ./tools/androidprobe
-for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree; do
+env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv" ./cmd/rungv
+env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/lockdownprobe" ./internal/lockdownprobe/cmd/lockdownprobe
+env "${android_env[@]}" go build -trimpath -ldflags="-s -w" -o "$work/bins/androidprobe" ./tools/androidprobe
+env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/systrap.test" ./pkg/sentry/platform/systrap
+env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/e2e.test" ./e2e
+GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv-static" ./cmd/rungv
+for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow; do
 	GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags=-linkmode=internal -o "$work/bins/$g" "./internal/acceptprog/$g"
 done
-GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-linkmode=internal -T 0x1001000" -o "$work/bins/brkgrow" ./internal/acceptprog/brkgrow
+GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-linkmode=internal -T 0x1001000" -o "$work/bins/brkgrow-0x1001000" ./internal/acceptprog/brkgrow
 
-adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp $dir/cws $dir/fsws"
+adb shell "settings put global settings_enable_monitor_phantom_procs false; device_config set_sync_disabled_for_tests persistent; device_config put activity_manager max_phantom_processes 2147483647" >/dev/null 2>&1 || true
+adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp"
 adb push "$work/bins"/* "$dir/" >/dev/null
 adb shell "getprop ro.build.version.release; getconf PAGE_SIZE; uname -rm"
 
@@ -45,56 +56,21 @@ else
 	echo "PASS androidprobe-report-shell"
 fi
 
-# run_guest LABEL WANT ARG... runs rungv with ARG... as shell and checks that
-# it exits with 0, prints no FAIL line, and prints each "|"-separated pattern
-# of WANT.
-run_guest() {
-	local label=$1 want=$2 out rc=0 pat cmd_args
-	shift 2
-	printf -v cmd_args ' %q' "$@"
-	out=$(adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache timeout 900 ./rungv run -platform=systrap -net=none$cmd_args 2>&1" | tr -d '\r') || rc=$?
-	local ok=1
-	if [ "$rc" -ne 0 ] || grep -q '^FAIL ' <<<"$out"; then
-		ok=0
-	fi
-	IFS='|' read -ra pats <<<"$want"
-	for pat in "${pats[@]}"; do
-		if ! grep -qF -- "$pat" <<<"$out"; then
-			ok=0
-		fi
-	done
-	if [ "$ok" -eq 1 ]; then
+run_test_suite() {
+	local label=$1 bin=$2 timeout=$3 rc=0
+	echo "== $label (shell)"
+	adb shell "cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout 2>&1" | tr -d '\r' || rc=$?
+	adb shell "rm -f $dir/$bin" || true
+	if [ "$rc" -eq 0 ]; then
 		echo "PASS $label"
 	else
 		echo "FAIL $label (exit $rc)"
-		echo "$out" | head -60
 		failed=1
 	fi
 }
 
-echo "== guest probes (shell)"
-run_guest gostatic "recover boom" -bin ./gostatic
-run_guest regprobe "REGPROBE-OK" -bin ./regprobe
-run_guest sigframeprobe "SIGFRAMEPROBE-OK" -bin ./sigframeprobe
-run_guest forkprobe "FORKPROBE-OK" -bin ./forkprobe
-run_guest cowprobe "COWPROBE-OK" -bin ./cowprobe
-run_guest spareprobe "SPAREPROBE-OK" -bin ./spareprobe
-run_guest brkgrow "brk grew 1024 MiB" -bin ./brkgrow
-run_guest membarrierprobe "DONE" -bin ./membarrierprobe checks
-run_guest eintrprobe "DONE" -bin ./eintrprobe checks 10
-run_guest codewrite "PASS shared-file-writes:/workspace|PASS shared-file-writes:/mnt|CODEWRITE-OK" \
-	"-workspace=$dir/cws" "--mount=type=volume,src=$dir/cvol.ext4,dst=/mnt,driver=ext4lite" \
-	-bin ./codewrite dir=/workspace dir=/mnt
-run_guest fsfeatures-hostfs "hostfs ok" "-workspace=$dir/fsws" -bin ./fsfeatures hostfs /workspace
-run_guest fsfeatures-ext4lite "ext4lite ok" "--mount=type=volume,src=$dir/fsvol.ext4,dst=/mnt,driver=ext4lite" \
-	-bin ./fsfeatures ext4lite /mnt
-# Android SELinux neverallow forbids linkat hard links on shell_data_file and
-# app_data_file, so voltree runs on ext4lite here (and on both hostfs and
-# ext4lite in linux16k.yml).
-run_guest voltree-write-ext4lite "write ok" "--mount=type=volume,src=$dir/vvol.ext4,dst=/mnt,driver=ext4lite" \
-	-bin ./voltree write /mnt
-run_guest voltree-verify-ext4lite "verify ok" "--mount=type=volume,src=$dir/vvol.ext4,dst=/mnt,driver=ext4lite" \
-	-bin ./voltree verify /mnt
+run_test_suite systrap.test systrap.test 10m
+run_test_suite e2e.test e2e.test 30m
 
 echo "== probe APK (untrusted_app)"
 ANDROID_ABI=$abi scripts/android/build-probe-apk.sh "$work/probe.apk" >/dev/null
@@ -123,8 +99,12 @@ if [ "$abi" = arm64-v8a ]; then
 	app_elves+=(guest-shared-page)
 fi
 for g in "${app_elves[@]}"; do
+	want="$g ok"
+	if [ "$g" = guest-shared-page ]; then
+		want="shared-page-ok"
+	fi
 	out=$(scripts/android/run-probe.sh librungv.so run -platform=systrap -net=none -bin "@FILES@/guests/$g" | tr -d '\r') || true
-	if grep -qF "$g ok" <<<"$out" && grep -qF "exit code 0" <<<"$out"; then
+	if grep -qF "$want" <<<"$out" && grep -qF "exit code 0" <<<"$out"; then
 		echo "PASS app-$g"
 	else
 		echo "FAIL app-$g"

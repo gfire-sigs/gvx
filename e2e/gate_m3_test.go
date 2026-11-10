@@ -334,7 +334,7 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 		_, stderr, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+plat, "-net=none",
 			"-arch="+foreign, "-cache-dir="+cacheDir, "-image=alpine:3.20", "--", "/bin/true")
 		wantErr, wantTail := "guest architecture "+foreign+" needs -platform=systrap", "run only the host architecture"
-		if runtime.GOOS == "linux" {
+		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			wantErr, wantTail = "guest architecture "+foreign+" cannot run on a", "only the host architecture"
 		}
 		if code != 2 || !strings.Contains(stderr, wantErr) || !strings.Contains(stderr, wantTail) {

@@ -34,6 +34,15 @@ import (
 // loader for the host libc, so only a static binary runs in it.
 func staticRungv(t *testing.T) string {
 	t.Helper()
+	if dir := os.Getenv("GVX_PREBUILT_DIR"); dir != "" {
+		for _, name := range []string{"rungv-static", "rungv"} {
+			cand := filepath.Join(dir, name)
+			if info, err := os.Stat(cand); err == nil && info.Mode().IsRegular() {
+				return cand
+			}
+		}
+		t.Fatalf("GVX_PREBUILT_DIR=%s has no rungv-static or rungv binary", dir)
+	}
 	out := filepath.Join(t.TempDir(), "rungv-static")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

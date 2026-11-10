@@ -17,9 +17,9 @@
 // Command init is process 1 of the initramfs that scripts/linux16k/run.sh
 // boots in QEMU on a Linux kernel with 16 KB pages. It runs androidprobe
 // report, generates the synthetic ELF guests in /tmp/elfguests, runs rungv
-// with each guest probe in /tmp/elfguests and /guests, prints "PASS name" or
-// "FAIL name" for each, prints "VMSMOKE-OK" when all pass, and powers off the
-// machine.
+// with the synthetic ELF probes and hostfs voltree, runs the systrap and
+// offline e2e test suites, prints "PASS name" or "FAIL name" for each, prints
+// "VMSMOKE-OK" when all pass, and powers off the machine.
 package main
 
 import (
@@ -31,9 +31,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // step is one rungv invocation and the substrings that its output must contain.
+// The offline e2e suite runs the remaining acceptprog guest probes.
 type step struct {
 	label string
 	args  []string
@@ -44,61 +46,40 @@ var steps = []step{
 	{"guest-pie", []string{"-bin=/tmp/elfguests/guest-pie"}, []string{"guest-pie ok"}},
 	{"guest-fixed-0x10000", []string{"-bin=/tmp/elfguests/guest-fixed-0x10000"}, []string{"guest-fixed-0x10000 ok"}},
 	{"guest-fixed-0x400000", []string{"-bin=/tmp/elfguests/guest-fixed-0x400000"}, []string{"guest-fixed-0x400000 ok"}},
-	{"guest-shared-page", []string{"-bin=/tmp/elfguests/guest-shared-page"}, []string{"guest-shared-page ok"}},
-	{"gostatic", []string{"-bin=/guests/gostatic"}, []string{"recover boom"}},
-	{"regprobe", []string{"-bin=/guests/regprobe"}, []string{"REGPROBE-OK"}},
-	{"sigframeprobe", []string{"-bin=/guests/sigframeprobe"}, []string{"SIGFRAMEPROBE-OK"}},
-	{"forkprobe", []string{"-bin=/guests/forkprobe"}, []string{"FORKPROBE-OK"}},
-	{"cowprobe", []string{"-bin=/guests/cowprobe"}, []string{"COWPROBE-OK"}},
-	{"spareprobe", []string{"-bin=/guests/spareprobe"}, []string{"SPAREPROBE-OK"}},
-	{"brkgrow", []string{"-bin=/guests/brkgrow"}, []string{"brk grew 1024 MiB"}},
-	{"membarrierprobe", []string{"-bin=/guests/membarrierprobe", "checks"}, []string{"DONE"}},
-	{"eintrprobe", []string{"-bin=/guests/eintrprobe", "checks", "10"}, []string{"DONE"}},
-	{
-		"codewrite",
-		[]string{
-			"-workspace=/tmp/cws",
-			"--mount=type=volume,src=/tmp/cvol.ext4,dst=/mnt,driver=ext4lite",
-			"-bin=/guests/codewrite",
-			"dir=/workspace",
-			"dir=/mnt",
-		},
-		[]string{
-			"PASS shared-file-writes:/workspace",
-			"PASS shared-file-writes:/mnt",
-			"CODEWRITE-OK",
-		},
-	},
-	{"fsfeatures-hostfs", []string{"-workspace=/tmp/fsws", "-bin=/guests/fsfeatures", "hostfs", "/workspace"}, []string{"hostfs ok"}},
-	{"fsfeatures-ext4lite", []string{"--mount=type=volume,src=/tmp/fsvol.ext4,dst=/mnt,driver=ext4lite", "-bin=/guests/fsfeatures", "ext4lite", "/mnt"}, []string{"ext4lite ok"}},
+	{"guest-shared-page", []string{"-bin=/tmp/elfguests/guest-shared-page"}, []string{"shared-page-ok"}},
 	{"voltree-write-hostfs", []string{"-workspace=/tmp/vws", "-bin=/guests/voltree", "write", "/workspace"}, []string{"write ok"}},
 	{"voltree-verify-hostfs", []string{"-workspace=/tmp/vws", "-bin=/guests/voltree", "verify", "/workspace"}, []string{"verify ok"}},
-	{"voltree-write-ext4lite", []string{"--mount=type=volume,src=/tmp/vvol.ext4,dst=/mnt,driver=ext4lite", "-bin=/guests/voltree", "write", "/mnt"}, []string{"write ok"}},
-	{"voltree-verify-ext4lite", []string{"--mount=type=volume,src=/tmp/vvol.ext4,dst=/mnt,driver=ext4lite", "-bin=/guests/voltree", "verify", "/mnt"}, []string{"verify ok"}},
 }
 
 func main() {
 	defer powerOff()
-	for _, m := range []struct{ src, dst, fs string }{
-		{"proc", "/proc", "proc"},
-		{"sysfs", "/sys", "sysfs"},
-		{"devtmpfs", "/dev", "devtmpfs"},
-		{"tmpfs", "/tmp", "tmpfs"},
+	for _, m := range []struct{ src, dst, fs, opts string }{
+		{"proc", "/proc", "proc", ""},
+		{"sysfs", "/sys", "sysfs", ""},
+		{"devtmpfs", "/dev", "devtmpfs", ""},
+		{"tmpfs", "/dev/shm", "tmpfs", "mode=1777"},
+		{"tmpfs", "/tmp", "tmpfs", "size=2g,mode=1777"},
 	} {
 		if err := os.MkdirAll(m.dst, 0o755); err != nil {
 			fmt.Println("mkdir", m.dst, err)
 		}
-		if err := syscall.Mount(m.src, m.dst, m.fs, 0, ""); err != nil {
+		if err := syscall.Mount(m.src, m.dst, m.fs, 0, m.opts); err != nil {
 			fmt.Println("mount", m.dst, err)
 		}
 	}
+	bringUpLoopback()
 	var uts syscall.Utsname
 	_ = syscall.Uname(&uts)
 	fmt.Printf("page size %d, kernel %s\n", os.Getpagesize(), charsToString(uts.Release[:]))
 	os.Setenv("HOME", "/tmp")
 	os.Setenv("TMPDIR", "/tmp")
 	os.Setenv("XDG_CACHE_HOME", "/tmp/cache")
-	for _, d := range []string{"/tmp/cache", "/tmp/cws", "/tmp/fsws", "/tmp/vws"} {
+	os.Setenv("GVX_E2E_OFFLINE", "1")
+	os.Setenv("GVX_PREBUILT_DIR", "/guests")
+	// QEMU emulates the CPU with TCG, so checks of the throttle ratio against
+	// the wall clock see host TCG jitter; keep the deterministic cgroup checks.
+	os.Setenv("GVX_E2E_CPUMAX_CHECKS", "memory-stat-exists-at-root,cpu-stat-usage-of-parent-includes-children,cpu-stat-usage-of-parent-keeps-removed-children")
+	for _, d := range []string{"/tmp/cache", "/tmp/vws"} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			fmt.Println("mkdir", d, err)
 		}
@@ -112,11 +93,54 @@ func main() {
 			ok = false
 		}
 	}
+	if !runTestBinary("systrap.test", "/systrap.test", 10*time.Minute) {
+		ok = false
+	}
+	_ = os.Remove("/systrap.test")
+	if !runTestBinary("e2e.test", "/e2e.test", 35*time.Minute) {
+		ok = false
+	}
+	_ = os.Remove("/e2e.test")
 	if ok {
 		fmt.Println("VMSMOKE-OK")
 	} else {
 		fmt.Println("VMSMOKE-FAIL")
 	}
+}
+
+func bringUpLoopback() {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		fmt.Println("loopback socket:", err)
+		return
+	}
+	defer syscall.Close(fd)
+	var ifr [40]byte
+	copy(ifr[:16], "lo")
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
+		fmt.Println("loopback SIOCGIFFLAGS:", errno)
+		return
+	}
+	flags := *(*uint16)(unsafe.Pointer(&ifr[16])) | syscall.IFF_UP | syscall.IFF_RUNNING
+	*(*uint16)(unsafe.Pointer(&ifr[16])) = flags
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFFLAGS, uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
+		fmt.Println("loopback SIOCSIFFLAGS:", errno)
+	}
+}
+
+func runTestBinary(label, bin string, timeout time.Duration) bool {
+	fmt.Println("== " + label)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-test.v", "-test.count=1", "-test.timeout="+timeout.String())
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Println("FAIL", label, err)
+		return false
+	}
+	fmt.Println("PASS", label)
+	return true
 }
 
 func runProbeReport() bool {

@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -757,13 +758,19 @@ func tortureDir(dir string) error {
 		return fmt.Errorf("read open fd after unlink: got %q err %v", string(uBuf), err)
 	}
 
-	// 3. Hardlink, symlink, and fsync.
+	// 3. Hardlink, symlink, and fsync. Android SELinux denies linkat on app and
+	// shell data files with EACCES, so a workspace on Android links the symlink
+	// to f_old instead of f_hard.
+	symTarget := "f_hard"
 	pLink := filepath.Join(dir, "f_hard")
 	if err := os.Link(pOld, pLink); err != nil {
-		return err
+		if !errors.Is(err, syscall.EACCES) || !strings.HasPrefix(dir, "/workspace/") {
+			return err
+		}
+		symTarget = "f_old"
 	}
 	pSym := filepath.Join(dir, "f_sym")
-	if err := os.Symlink("f_hard", pSym); err != nil {
+	if err := os.Symlink(symTarget, pSym); err != nil {
 		return err
 	}
 	if got, err := os.ReadFile(pSym); err != nil || string(got) != "v2" {

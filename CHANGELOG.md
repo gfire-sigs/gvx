@@ -11,7 +11,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Tests
 
-- **16 KB Linux and Android CI suites (`linux16k.yml` and `android.yml`)**: both workflows now verify zero exit codes, `androidprobe report`, fixed-address and shared-page ELF guests, `brkgrow`, `membarrierprobe`, `eintrprobe`, `codewrite` with shared file writes on `hostfs` and `ext4lite`, `fsfeatures` on `hostfs` and `ext4lite`, and two-sandbox `voltree` persistence. `scripts/android/emulator-smoke.sh` also builds and runs `probe.apk` (`dev.gfire.gvx.probe`) and `gvx-sample.apk` (`dev.gfire.gvx.sample/.RunService`) as `untrusted_app` on `x86_64` and `arm64-v8a`.
+- **16 KB Linux and Android `systrap` and `e2e` CI suites (`linux16k.yml` and `android.yml`)**: both workflows now compile and run the `pkg/sentry/platform/systrap` unit tests and the offline `e2e` test suite (`GVX_E2E_OFFLINE=1`, `GVX_PREBUILT_DIR`) inside the 16 KB Linux kernel VM and the Android 16 emulator. `linux16k.yml` also runs `androidprobe report`, the synthetic ELF guests (`guest-pie`, `guest-fixed-0x10000`, `guest-fixed-0x400000`, and `guest-shared-page`), and two-sandbox `voltree` persistence on `hostfs`. `scripts/android/emulator-smoke.sh` runs `androidprobe report`, `systrap.test`, `e2e.test`, `probe.apk` (`dev.gfire.gvx.probe`), and `gvx-sample.apk` (`dev.gfire.gvx.sample/.RunService`) as `untrusted_app`. On Android (`GOOS=android`), `e2e` now selects `systrap` as `autoPlatform`, accounts for Android SELinux `neverallow` on `linkat` hard links under `/data/local/tmp`, and skips `TestE2ESystrapUnderForeignSeccompListener` when the kernel lacks `CONFIG_SECCOMP_USER_NOTIFICATION`.
 
 ## [v0.12.10012026110200] - 2026-11-10
 

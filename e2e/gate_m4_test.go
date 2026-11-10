@@ -712,7 +712,7 @@ func TestE2EGateM4LockdownDefaultBlocksSubprocess(t *testing.T) {
 			}
 			// The Linux seccomp filter cannot read paths, so a workspace keeps
 			// opens relative to a directory descriptor, and the status says so.
-			wantUnbound := runtime.GOOS != "linux"
+			wantUnbound := runtime.GOOS != "linux" && runtime.GOOS != "android"
 			if !rep.Lockdown.SubprocessBlocked || rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
 				t.Errorf("default run: lockdown status %+v, want a subprocess block and UnboundFileOpenBlocked=%v", rep.Lockdown, wantUnbound)
 			}

@@ -1,11 +1,12 @@
-# Runs the Android probe, the systrap guest probes, the untrusted_app probe APK,
-# and the sample foreground-service APK on an x86_64 Android 16 emulator
-# (GVXIP-006 P1-4). Google ships no Linux arm64 emulator, and the arm64 emulator
-# of macOS needs Hypervisor.framework, which the hosted macOS runner lacks. The
-# Linux runner has KVM, so the x86_64 image boots there, and rungv builds for
-# android/amd64 with cgo. The workflow runs by hand and on pull requests that
-# change Android support, the Linux systrap engine, memory management, or the
-# file system drivers that the smoke suite exercises.
+# Runs the Android probe, the systrap package tests, the offline e2e test
+# suite, the untrusted_app probe APK, and the sample foreground-service APK on
+# an x86_64 Android 16 emulator (GVXIP-006 P1-4). Google ships no Linux arm64
+# emulator, and the arm64 emulator of macOS needs Hypervisor.framework, which
+# the hosted macOS runner lacks. The Linux runner has KVM, so the x86_64 image
+# boots there, and rungv and the test binaries build for android/amd64 with
+# cgo. The workflow runs by hand and on pull requests that change Android
+# support, the Linux systrap engine, memory management, the file system
+# drivers, or the e2e suite.
 name: android
 
 on:
@@ -17,10 +18,11 @@ on:
       - android/**
       - tools/androidprobe/**
       - internal/acceptprog/**
+      - e2e/**
+      - pkg/gvx/**
       - pkg/hostlockdown/*linux*
       - pkg/hostlockdown/*android*
       - pkg/hostlockdown/*xplat*
-      - pkg/gvx/**
       - pkg/abi/linux/mm_tasksize*
       - pkg/syserr/linux_errno*
       - pkg/sentry/platform/mmap_min_addr*
@@ -38,7 +40,7 @@ jobs:
   emulator:
     name: emulator android-36 x86_64
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       ANDROID_IMAGE: system-images;android-36;google_apis;x86_64
       # avdmanager and the emulator search different default directories, so
@@ -71,7 +73,7 @@ jobs:
       - name: Boot the emulator
         timeout-minutes: 20
         run: |
-          "$ANDROID_HOME/emulator/emulator" -avd ci -no-window -no-audio -no-boot-anim \
+          "$ANDROID_HOME/emulator/emulator" -avd ci -cores 4 -memory 4096 -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -no-metrics > emulator.log 2>&1 &
           pid=$!
           start=$(date +%s)
@@ -95,5 +97,5 @@ jobs:
             fi
             sleep 10
           done
-      - name: Run the probe and the guest probes
+      - name: Run the probe, systrap, e2e, and APK suites
         run: scripts/android/emulator-smoke.sh

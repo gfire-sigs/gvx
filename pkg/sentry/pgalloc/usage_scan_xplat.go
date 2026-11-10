@@ -37,9 +37,9 @@ const (
 // usage of the memory file equals the committed bytes that it already knows.
 // The usage is the block count of the file. Linux updates the count when a
 // page commits. macOS updates it late, by up to 15 seconds in a measurement,
-// so the scan for memory cgroups always runs on hosts other than Linux. The
-// files memory.current and memory.stat must not show a cgroup as empty while
-// its tasks hold memory.
+// so the scan for memory cgroups always runs on hosts other than Linux and
+// Android. The files memory.current and memory.stat must not show a cgroup as
+// empty while its tasks hold memory.
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	return memCgIDs == nil || runtime.GOOS == "linux" || runtime.GOOS == "android"
 }
