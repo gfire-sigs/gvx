@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -60,6 +61,11 @@ func newEnvOpts(t *testing.T, opts workspaceOptions) *env {
 	dir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("Chmod: %v", err)
+		}
 	}
 	ws, err := openWorkspace(dir, false, opts)
 	if err != nil {

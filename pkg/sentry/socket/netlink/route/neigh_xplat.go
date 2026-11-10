@@ -200,7 +200,7 @@ func parseNeighKey(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesVie
 	if nd.ifindex <= 0 {
 		return neighKey{}, syserr.ErrInvalidArgument
 	}
-	if _, ok := st.Stack.SingleNICInfo(tcpip.NICID(nd.ifindex)); !ok {
+	if !st.Stack.HasNIC(tcpip.NICID(nd.ifindex)) {
 		return neighKey{}, syserr.ErrNoDevice
 	}
 	return neighKey{nic: tcpip.NICID(nd.ifindex), proto: proto, addr: tcpip.AddrFromSlice(dst)}, nil
@@ -386,7 +386,7 @@ func parseFDB(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView) (f
 		return r, syserr.ErrInvalidArgument
 	}
 	id := tcpip.NICID(nd.ifindex)
-	if _, ok := st.Stack.SingleNICInfo(id); !ok {
+	if !st.Stack.HasNIC(id) {
 		return r, syserr.ErrNoDevice
 	}
 	if nd.flags&ntfMaster != 0 && nd.flags&ntfSelf == 0 {
@@ -431,7 +431,7 @@ func parseFDB(st *netstack.Stack, nd ndmsg, attrs map[uint16]nlmsg.BytesView) (f
 			return r, syserr.ErrInvalidArgument
 		}
 		if idx != 0 {
-			if _, ok := st.Stack.SingleNICInfo(tcpip.NICID(idx)); !ok {
+			if !st.Stack.HasNIC(tcpip.NICID(idx)) {
 				return r, syserr.ErrAddressNotAvailable
 			}
 		}

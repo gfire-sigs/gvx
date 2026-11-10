@@ -17,12 +17,36 @@
 package cpuid
 
 import (
+	"encoding/binary"
 	"fmt"
+	"os"
 	"runtime"
 )
 
-// platformHWCap is called for hosts without /proc/self/auxv. The hosts in
-// this file have no HWCAP source, so the call fails.
+// platformHWCap reads /proc/self/auxv on Android and returns an error on
+// platforms without a registered HWCAP source.
 func platformHWCap() (hwCap, error) {
-	return hwCap{}, fmt.Errorf("readHwCap only supported on linux, not %s", runtime.GOOS)
+	if runtime.GOOS != "android" {
+		return hwCap{}, fmt.Errorf("no HWCAP source for %s", runtime.GOOS)
+	}
+	auxv, err := os.ReadFile("/proc/self/auxv")
+	if err != nil {
+		return hwCap{}, fmt.Errorf("failed to read file /proc/self/auxv: %w", err)
+	}
+	var c hwCap
+	l := len(auxv) / 16
+	for i := range l {
+		tag := binary.LittleEndian.Uint64(auxv[i*16:])
+		val := binary.LittleEndian.Uint64(auxv[i*16+8:])
+		switch tag {
+		case _AT_HWCAP:
+			c.hwCap1 = val
+		case _AT_HWCAP2:
+			c.hwCap2 = val
+		}
+		if c.hwCap1 != 0 && c.hwCap2 != 0 {
+			break
+		}
+	}
+	return c, nil
 }

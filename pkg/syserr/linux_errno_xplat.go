@@ -66,7 +66,7 @@ func fromLinuxErrno(n errno.Errno) *Error {
 // unix.EINTR, but not linuxerr.EINTR. A different value turns a restartable
 // call, such as recvmsg(2), into a call that fails with EINTR.
 func backwardsError(e *Error) error {
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		return unix.Errno(e.errno)
 	}
 	if e.errno == errno.EINTR {

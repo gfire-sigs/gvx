@@ -55,6 +55,8 @@ type overlayUpperLayout struct {
 	name string
 	// persistent is false for tmpfs, which loses its content at exit.
 	persistent bool
+	// hostfs is true when the upper layer uses hostfs on the host directory.
+	hostfs bool
 	// mount returns the mount of one sandbox. All calls of one test return
 	// the same host backing store.
 	mount func(t *testing.T) func() gvx.Mount
@@ -76,11 +78,11 @@ func overlayUpperLayouts() []overlayUpperLayout {
 				return gvx.Mount{Kind: gvx.MountVolume, ImagePath: image, GuestPath: "/data"}
 			}
 		}},
-		{name: "hostfs-bind", persistent: true, mount: func(t *testing.T) func() gvx.Mount {
+		{name: "hostfs-bind", persistent: true, hostfs: true, mount: func(t *testing.T) func() gvx.Mount {
 			dir := t.TempDir()
 			return func() gvx.Mount { return gvx.Mount{Kind: gvx.MountBind, HostPath: dir, GuestPath: "/data"} }
 		}},
-		{name: "hostfs-volume", persistent: true, mount: func(*testing.T) func() gvx.Mount {
+		{name: "hostfs-volume", persistent: true, hostfs: true, mount: func(*testing.T) func() gvx.Mount {
 			return func() gvx.Mount {
 				return gvx.Mount{Kind: gvx.MountVolume, VolumeName: "ovlupperhost", Driver: gvx.DriverHostfs, GuestPath: "/data"}
 			}
@@ -145,6 +147,9 @@ func TestE2EOverlayUpperLayers(t *testing.T) {
 	for _, b := range fixedAddressBackends() {
 		for _, layout := range overlayUpperLayouts() {
 			t.Run(b.name+"/"+layout.name, func(t *testing.T) {
+				if layout.hostfs && runtime.GOOS == "android" && os.Geteuid() != 0 {
+					t.Skip("Android SELinux denies linkat hard links on non-root shell data files")
+				}
 				requireFixedAddressBackend(t, b)
 				mount := layout.mount(t)
 				code, out := runOverlayProbe(t, b, bin, t.TempDir(), mount(), "overlay-upper", "/data")
@@ -165,6 +170,9 @@ func TestE2EOverlayUpperPersistsAcrossSandboxes(t *testing.T) {
 				continue
 			}
 			t.Run(b.name+"/"+layout.name, func(t *testing.T) {
+				if layout.hostfs && runtime.GOOS == "android" && os.Geteuid() != 0 {
+					t.Skip("Android SELinux denies linkat hard links on non-root shell data files")
+				}
 				requireFixedAddressBackend(t, b)
 				mount := layout.mount(t)
 				cacheDir := t.TempDir()
@@ -196,6 +204,9 @@ func TestE2EOverlayUpperSurvivesSigkill(t *testing.T) {
 	for _, b := range fixedAddressBackends() {
 		for _, layout := range layouts {
 			t.Run(b.name+"/"+layout.name, func(t *testing.T) {
+				if layout.bind && runtime.GOOS == "android" && os.Geteuid() != 0 {
+					t.Skip("Android SELinux denies linkat hard links on non-root shell data files")
+				}
 				requireFixedAddressBackend(t, b)
 				src := layout.src(t)
 				kind, mount := "volume", gvx.Mount{Kind: gvx.MountVolume, ImagePath: src, GuestPath: "/data"}

@@ -87,26 +87,7 @@ var herdrAssets = map[string]struct{ name, sha256 string }{
 // criterion needs one.
 func BuildGoStatic(tb testing.TB, goarch string) string {
 	tb.Helper()
-	goTool, err := exec.LookPath("go")
-	if err != nil {
-		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
-	}
-	out := filepath.Join(tb.TempDir(), "gostatic")
-	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags=-linkmode=internal", goStaticPackage)
-	cmd.Dir = moduleRoot(tb)
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
-	if msg, err := cmd.CombinedOutput(); err != nil {
-		tb.Fatalf("build the static Go program for linux/%s: %v\n%s", goarch, err, msg)
-	}
-	f, err := elf.Open(out)
-	if err != nil {
-		tb.Fatalf("open the static Go program: %v", err)
-	}
-	defer f.Close()
-	if f.Type != elf.ET_EXEC {
-		tb.Fatalf("the static Go program has type %v, want ET_EXEC", f.Type)
-	}
-	return out
+	return buildStaticGuest(tb, goStaticPackage, "gostatic", goarch, 0)
 }
 
 // BrkGrowWant is the output of the brk program when the break moves by 1 GiB.
@@ -119,40 +100,7 @@ const BrkGrowWant = "brk grew 1024 MiB\n"
 // base: 0x400000 on amd64 and 0x10000 on arm64.
 func BuildBrkGrow(tb testing.TB, goarch string, textAddr uint64) string {
 	tb.Helper()
-	goTool, err := exec.LookPath("go")
-	if err != nil {
-		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
-	}
-	out := filepath.Join(tb.TempDir(), "brkgrow")
-	ldflags := "-linkmode=internal"
-	if textAddr != 0 {
-		ldflags += fmt.Sprintf(" -T %#x", textAddr)
-	}
-	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags="+ldflags, brkGrowPackage)
-	cmd.Dir = moduleRoot(tb)
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
-	if msg, err := cmd.CombinedOutput(); err != nil {
-		tb.Fatalf("build the brk program for linux/%s: %v\n%s", goarch, err, msg)
-	}
-	f, err := elf.Open(out)
-	if err != nil {
-		tb.Fatalf("open the brk program: %v", err)
-	}
-	defer f.Close()
-	if f.Type != elf.ET_EXEC {
-		tb.Fatalf("the brk program has type %v, want ET_EXEC", f.Type)
-	}
-	if textAddr != 0 {
-		for _, p := range f.Progs {
-			if p.Type == elf.PT_LOAD {
-				if p.Vaddr != textAddr-0x1000 {
-					tb.Fatalf("the brk program loads at %#x, want %#x", p.Vaddr, textAddr-0x1000)
-				}
-				break
-			}
-		}
-	}
-	return out
+	return buildStaticGuest(tb, brkGrowPackage, "brkgrow", goarch, textAddr)
 }
 
 // FetchHerdr returns the path of the herdr release binary for goarch. It
@@ -250,18 +198,7 @@ func download(url, path string) error {
 // writes a tree into a volume and verifies it in a later sandbox.
 func BuildVolumeTree(tb testing.TB, goarch string) string {
 	tb.Helper()
-	goTool, err := exec.LookPath("go")
-	if err != nil {
-		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
-	}
-	out := filepath.Join(tb.TempDir(), "voltree")
-	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags=-linkmode=internal", volTreePackage)
-	cmd.Dir = moduleRoot(tb)
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
-	if msg, err := cmd.CombinedOutput(); err != nil {
-		tb.Fatalf("build the volume guest for linux/%s: %v\n%s", goarch, err, msg)
-	}
-	return out
+	return buildStaticGuest(tb, volTreePackage, "voltree", goarch, 0)
 }
 
 // BuildFSFeatures compiles the guest program fsfeatures for the Linux
@@ -270,18 +207,7 @@ func BuildVolumeTree(tb testing.TB, goarch string) string {
 // on a mounted file system.
 func BuildFSFeatures(tb testing.TB, goarch string) string {
 	tb.Helper()
-	goTool, err := exec.LookPath("go")
-	if err != nil {
-		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
-	}
-	out := filepath.Join(tb.TempDir(), "fsfeatures")
-	cmd := exec.Command(goTool, "build", "-o", out, "-ldflags=-linkmode=internal", fsFeaturesPackage)
-	cmd.Dir = moduleRoot(tb)
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+goarch, "CGO_ENABLED=0")
-	if msg, err := cmd.CombinedOutput(); err != nil {
-		tb.Fatalf("build the file system feature guest for linux/%s: %v\n%s", goarch, err, msg)
-	}
-	return out
+	return buildStaticGuest(tb, fsFeaturesPackage, "fsfeatures", goarch, 0)
 }
 
 // BuildCompatProbe compiles the guest compatibility, fingerprint, and
@@ -404,9 +330,15 @@ func BuildNodeProbe(tb testing.TB, goarch string) string {
 }
 
 // buildStaticGuest compiles the package pkg for linux/goarch with the internal
-// linker and returns the path of the executable, which has type ET_EXEC.
+// linker and returns the path of the executable, which has type ET_EXEC. When
+// GVX_PREBUILT_DIR is set and holds the binary for goarch, it returns that
+// file without running go build.
 func buildStaticGuest(tb testing.TB, pkg, name, goarch string, textAddr uint64) string {
 	tb.Helper()
+	if prebuilt := findPrebuiltGuest(tb, name, goarch, textAddr); prebuilt != "" {
+		verifyStaticGuestELF(tb, prebuilt, name, goarch, textAddr)
+		return prebuilt
+	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
 		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
@@ -422,7 +354,33 @@ func buildStaticGuest(tb testing.TB, pkg, name, goarch string, textAddr uint64) 
 	if msg, err := cmd.CombinedOutput(); err != nil {
 		tb.Fatalf("build %s for linux/%s: %v\n%s", name, goarch, err, msg)
 	}
-	f, err := elf.Open(out)
+	verifyStaticGuestELF(tb, out, name, goarch, textAddr)
+	return out
+}
+
+func findPrebuiltGuest(tb testing.TB, name, goarch string, textAddr uint64) string {
+	tb.Helper()
+	dir := os.Getenv("GVX_PREBUILT_DIR")
+	if dir == "" {
+		return ""
+	}
+	if goarch != runtime.GOARCH {
+		tb.Skipf("GVX_PREBUILT_DIR holds prebuilt guests for %s, not %s", runtime.GOARCH, goarch)
+	}
+	file := name
+	if textAddr != 0 {
+		file = fmt.Sprintf("%s-%#x", name, textAddr)
+	}
+	p := filepath.Join(dir, file)
+	if _, err := os.Stat(p); err != nil {
+		tb.Fatalf("prebuilt guest %s for linux/%s missing in GVX_PREBUILT_DIR=%s: %v", file, goarch, dir, err)
+	}
+	return p
+}
+
+func verifyStaticGuestELF(tb testing.TB, path, name, goarch string, textAddr uint64) {
+	tb.Helper()
+	f, err := elf.Open(path)
 	if err != nil {
 		tb.Fatalf("open %s: %v", name, err)
 	}
@@ -430,5 +388,19 @@ func buildStaticGuest(tb testing.TB, pkg, name, goarch string, textAddr uint64) 
 	if f.Type != elf.ET_EXEC {
 		tb.Fatalf("%s has type %v, want ET_EXEC", name, f.Type)
 	}
-	return out
+	wantLoad := uint64(0x400000)
+	if goarch == "arm64" {
+		wantLoad = 0x10000
+	}
+	if textAddr != 0 {
+		wantLoad = textAddr - 0x1000
+	}
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_LOAD {
+			if p.Vaddr != wantLoad {
+				tb.Fatalf("%s loads at %#x, want %#x", name, p.Vaddr, wantLoad)
+			}
+			break
+		}
+	}
 }

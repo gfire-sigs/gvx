@@ -17,6 +17,7 @@
 package e2e
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"runtime"
@@ -74,6 +75,9 @@ func installForeignListener(t *testing.T) {
 	}
 	flags := uintptr(linux.SECCOMP_FILTER_FLAG_NEW_LISTENER | linux.SECCOMP_FILTER_FLAG_TSYNC | unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH)
 	fd, _, errno := unix.Syscall(unix.SYS_SECCOMP, linux.SECCOMP_SET_MODE_FILTER, flags, uintptr(unsafe.Pointer(&prog)))
+	if errno == unix.ENOSYS || errno == unix.EINVAL {
+		t.Skipf("the host kernel does not support SECCOMP_FILTER_FLAG_NEW_LISTENER: %v", errno)
+	}
 	if errno != 0 {
 		t.Fatalf("seccomp(SET_MODE_FILTER, NEW_LISTENER|TSYNC): %v", errno)
 	}
@@ -104,6 +108,9 @@ func TestE2ESystrapUnderForeignSeccompListener(t *testing.T) {
 		t.Logf("helper output:\n%s", out)
 		if err != nil {
 			t.Fatalf("the guest did not run under a foreign seccomp listener: %v", err)
+		}
+		if bytes.Contains(out, []byte("--- SKIP:")) {
+			t.Skip("the helper skipped SECCOMP_FILTER_FLAG_NEW_LISTENER")
 		}
 		return
 	}

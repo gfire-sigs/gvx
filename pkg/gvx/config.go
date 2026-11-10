@@ -385,7 +385,7 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if c.Architecture != runtime.GOARCH {
-		if runtime.GOOS == "linux" {
+		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			return fmt.Errorf("%w: guest architecture %s cannot run on a %s Linux host: the upstream systrap platform runs only the host architecture", ErrInvalidConfig, c.Architecture, runtime.GOARCH)
 		}
 		if c.Platform != PlatformSystrap {

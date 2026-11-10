@@ -150,6 +150,7 @@ func TestSettingTimesBeforeCreationThenRenamingAnAncestorKeepsTheFileRecord(t *t
 func TestHostMoveToAnotherDirectoryKeepsTheRecordAtTheNewPath(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	for _, d := range []string{"a", "b"} {
 		if err := ws.Mkdir(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -165,6 +166,7 @@ func TestHostMoveToAnotherDirectoryKeepsTheRecordAtTheNewPath(t *testing.T) {
 func TestRepairedHintReachesTheFileWithTheNextFlushOfAChange(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	for _, d := range []string{"a", "b"} {
 		if err := ws.Mkdir(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -226,6 +228,7 @@ func TestHostFileAtAnOldNameNeverGainsSetuid(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dir := resolvedTempDir(t)
 			ws := plainWS(t, dir, workspaceOptions{})
+			requireStableIDs(t, ws)
 			mustWriteFile(t, ws, "x", 0o4755)
 			if err := ws.Chown("x", 1234, 0); err != nil {
 				t.Fatal(err)
@@ -242,6 +245,7 @@ func TestHostFileAtAnOldNameNeverGainsSetuid(t *testing.T) {
 func TestHostDirectoryAtAnOldNameNeverGainsSetgid(t *testing.T) {
 	dir := resolvedTempDir(t)
 	ws := plainWS(t, dir, workspaceOptions{})
+	requireStableIDs(t, ws)
 	if err := ws.Mkdir("d", 0o755); err != nil {
 		t.Fatal(err)
 	}

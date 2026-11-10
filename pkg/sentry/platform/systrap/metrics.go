@@ -302,7 +302,7 @@ func (s *fastPathState) recordActivity() {
 	// flips it false->true this period needs to write; later callers just read.
 	// All callers still run the wakeup check below.
 	if !s.recentActivity.Load() {
-		s.recentActivity.Store(true)
+		s.recentActivity.Swap(true)
 	}
 	// Pairs with the store of monitorParked in park(): if the monitor has
 	// announced it is parked, it is guaranteed to observe recentActivity (and
@@ -345,7 +345,7 @@ func (s *fastPathState) park() {
 	case <-s.monitorWakeup:
 	default:
 	}
-	s.monitorParked.Store(true)
+	s.monitorParked.Swap(true)
 	// Re-check for activity after announcing that we are parked. This closes
 	// the race with a concurrent recordActivity that set recentActivity before
 	// monitorParked became visible to it: such a call would not have sent a

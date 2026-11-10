@@ -62,7 +62,7 @@ func probeTaskSize() uintptr {
 // pageFits reports whether the host maps the page at addr. It removes the page
 // again.
 func pageFits(addr uintptr) bool {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		// Only a Linux host has a size that a Sentry uses. The probe of the
 		// unaligned address is the whole answer elsewhere.
 		return true

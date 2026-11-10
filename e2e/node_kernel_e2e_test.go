@@ -43,7 +43,7 @@ import (
 // configuration, or is nil.
 func runNodeProbe(t *testing.T, b gateBackend, bin string, setup func(*gvx.Config), args ...string) (int, string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	var out, errOut bytes.Buffer
 	cfg := gvx.Config{

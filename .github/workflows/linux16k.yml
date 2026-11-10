@@ -1,7 +1,10 @@
-# Runs the systrap guest probes on a Linux arm64 kernel with 16 KB pages
-# (GVXIP-006 P5). The hosted runners have 4 KB pages, so the job boots the
-# arm64-16k kernel of Debian trixie in QEMU. The workflow runs by hand, and on
-# a pull request that changes the engine, the memory manager, or this job.
+# Runs the host facility report, the synthetic ELF guest probes, the systrap,
+# hostfs, and ext4lite package tests, and the offline e2e test suite on a Linux
+# arm64 kernel with 16 KB pages (GVXIP-006 P5). The hosted runners have 4 KB
+# pages, so the job boots the arm64-16k kernel of Debian trixie in QEMU. The
+# workflow runs by hand and on pull requests that change the engine, memory
+# management, host lockdown, the file system drivers, the e2e suite, or this
+# job.
 name: linux16k
 
 on:
@@ -10,9 +13,21 @@ on:
     paths:
       - .github/workflows/linux16k.yml
       - scripts/linux16k/**
+      - tools/androidprobe/**
+      - internal/acceptprog/**
+      - e2e/**
+      - pkg/gvx/**
+      - pkg/hostlockdown/*linux*
+      - pkg/hostlockdown/*xplat*
+      - pkg/abi/linux/mm_tasksize*
+      - pkg/syserr/linux_errno*
+      - pkg/sentry/platform/mmap_min_addr*
       - pkg/sentry/platform/systrap/**
       - pkg/sentry/mm/**
       - pkg/sentry/pgalloc/**
+      - pkg/sentry/fsimpl/chunkcache/**
+      - pkg/sentry/fsimpl/hostfs/**
+      - pkg/sentry/fsimpl/ext4lite/**
 
 permissions:
   contents: read
@@ -21,7 +36,7 @@ jobs:
   qemu:
     name: qemu arm64 16 KB kernel
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 75
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -33,5 +48,5 @@ jobs:
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq install -y qemu-system-arm cpio > /dev/null
-      - name: Run the guest probes on the 16 KB kernel
+      - name: Run the smoke, systrap, and offline e2e suites on the 16 KB kernel
         run: scripts/linux16k/run.sh

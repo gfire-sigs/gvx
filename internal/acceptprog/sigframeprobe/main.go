@@ -52,7 +52,7 @@ import (
 )
 
 const (
-	sleepLength = 200 * time.Millisecond
+	sleepLength = 5 * time.Second
 	siTkill     = -6
 	segvMaperr  = 1
 	segvAccerr  = 2
@@ -353,7 +353,7 @@ func checkInterruptedSyscall() error {
 		return err
 	}
 	defer restore()
-	req := syscall.Timespec{Nsec: int64(sleepLength)}
+	req := syscall.NsecToTimespec(int64(sleepLength))
 	var rem syscall.Timespec
 	in := guestcpu.NewState(24)
 	in.SetSyscall(syscall.SYS_NANOSLEEP, uintptr(unsafe.Pointer(&req)), uintptr(unsafe.Pointer(&rem)))

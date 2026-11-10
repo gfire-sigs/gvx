@@ -66,9 +66,10 @@ import (
 // them. It refreshes a read-only page in three cases. In the first case, the
 // memory file reports a Sentry write into it
 // (pgalloc.MemoryFile.ObserveHostWrites). In the second case, a guest store
-// that the layer ran changed it through another block. In the third case, a
-// writable direct block of the same address space maps it. It then refreshes
-// the page on each switch. A guest store through a writable mapping of
+// that any layer ran through a composite block changed it
+// (pgalloc.MemoryFile.NoteHostWrite). In the third case, a writable direct
+// block of the same address space maps it, and beforeSwitch then refreshes the
+// page on each switch. A guest store through a writable direct mapping of
 // another address space does not reach a read-only page of a composite page.
 // The page stays stale until the next change of the block.
 
@@ -155,8 +156,9 @@ func (sp *subPage) bytes() ([]byte, error) {
 	fr := memmap.FileRange{Start: sp.off, End: sp.off + hostarch.PageSize}
 	var bs safemem.BlockSeq
 	var err error
-	// The layer refreshes its own composite page after its own stores, so a
-	// mapping for them reports no write to the observer.
+	// MapInternal would report a write on every composite refresh that maps a
+	// guest-writable page, so bytes uses MapInternalUnreported; writeLocked
+	// reports emulated guest stores with NoteHostWrite.
 	if u, ok := sp.f.(interface {
 		MapInternalUnreported(memmap.FileRange, hostarch.AccessType) (safemem.BlockSeq, error)
 	}); ok {
@@ -177,8 +179,9 @@ func (sp *subPage) bytes() ([]byte, error) {
 // stubMap is what the stub maps for a block.
 type stubMap struct {
 	kind stubMapKind
-	// off is the offset of the mapping in its file.
+	// off is the offset of the mapping in its file, and fd is its descriptor.
 	off  uint64
+	fd   int
 	prot int
 }
 
@@ -419,12 +422,23 @@ type subBlockLayer struct {
 	// storeSeq counts the stores that the Sentry ran for the guest.
 	storeSeq atomic.Uint64
 
+	// popMu serializes beforeSwitch across threads so no thread maps a
+	// deferred block with zero-filled sub-pages while another thread runs
+	// populatePartial without mu.
+	popMu sync.Mutex
+
 	mu sync.Mutex
 	// blocks holds the blocks that have a guest page.
 	blocks map[uintptr]*hostBlock
 	// partial holds the blocks that miss a guest page and that the next
 	// switch tries to populate.
 	partial map[uintptr]struct{}
+	// populating is 1 while populatePartial runs without mu, so pending
+	// stays positive until beforeSwitch finishes mapping deferred blocks.
+	populating int
+	// releaseGen counts release calls so populatePartial retries a block
+	// when a new guest mapping arrives during PopulateSubBlock.
+	releaseGen uint64
 	// comps holds the blocks that map a composite page.
 	comps map[uintptr]*hostBlock
 	// deferred holds the blocks that miss a guest page and that the stub does
@@ -602,7 +616,7 @@ func (l *subBlockLayer) rebuildSourcesLocked() {
 
 // updatePendingLocked publishes the number of blocks that beforeSwitch visits.
 func (l *subBlockLayer) updatePendingLocked() {
-	l.pending.Store(int32(len(l.partial) + len(l.comps) + len(l.deferred)))
+	l.pending.Store(int32(len(l.partial) + len(l.comps) + len(l.deferred) + l.populating))
 }
 
 // mapFile maps [addr, addr+fr.Length()) of f.
@@ -704,7 +718,7 @@ func (l *subBlockLayer) mapBlocksLocked(start, end uintptr, off uint64, src subP
 			hb.subs[i] = sp
 		}
 		hb.recompute()
-		hb.cur = stubMap{kind: stubMapDirect, off: blockOff, prot: prot}
+		hb.cur = stubMap{kind: stubMapDirect, off: blockOff, fd: int(src.fd), prot: prot}
 		l.freeCompLocked(base, hb)
 		delete(l.partial, base)
 		delete(l.deferred, base)
@@ -749,7 +763,7 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 		delete(l.partial, base)
 	}
 	if isDirect {
-		want := stubMap{kind: stubMapDirect, off: off, prot: hb.blockProt(true)}
+		want := stubMap{kind: stubMapDirect, off: off, fd: fd, prot: hb.blockProt(true)}
 		if hb.cur != want {
 			if err := l.host.mapRange(base, subBlockSize, want.prot, false, fd, off); err != nil {
 				return fmt.Errorf("map [%#x, %#x): %w", base, base+subBlockSize, err)
@@ -799,7 +813,7 @@ func (l *subBlockLayer) mapCompLocked(base uintptr, hb *hostBlock, changed bool)
 			return fmt.Errorf("write the composite page for [%#x, %#x): %w", base, base+subBlockSize, err)
 		}
 	}
-	want := stubMap{kind: stubMapComp, off: hb.comp.fr.Start, prot: hb.blockProt(false)}
+	want := stubMap{kind: stubMapComp, off: hb.comp.fr.Start, fd: l.host.compFD(), prot: hb.blockProt(false)}
 	if hb.cur != want || clean {
 		l.changes.Add(1)
 		if err := l.host.mapRange(base, subBlockSize, want.prot, false, l.host.compFD(), want.off); err != nil {
@@ -931,6 +945,7 @@ func (l *subBlockLayer) release(ar hostarch.AddrRange) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	defer l.updatePendingLocked()
+	l.releaseGen++
 	// A block that misses a guest page reads that page as zeros or as a
 	// spare page. A new mapping there creates no PMA that the layer sees.
 	// Such a block stops its stub mapping until the next populate.
@@ -1019,6 +1034,8 @@ func (l *subBlockLayer) reset() {
 	clear(l.partial)
 	clear(l.comps)
 	clear(l.deferred)
+	l.populating = 0
+	l.releaseGen++
 	l.updatePendingLocked()
 }
 
@@ -1034,6 +1051,8 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 	if l.pending.Load() == 0 {
 		return l.storeSeq.Load()
 	}
+	l.popMu.Lock()
+	defer l.popMu.Unlock()
 	if pop, ok := mm.(platform.SubBlockPopulator); ok {
 		l.populatePartial(ctx, pop)
 	}
@@ -1054,6 +1073,7 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 		}
 		delete(l.deferred, base)
 	}
+	l.populating = 0
 	l.updatePendingLocked()
 	// refreshLocked filled each composite page that changed, and a Sentry
 	// write after that marked it through recent. A Sentry write before the
@@ -1063,8 +1083,6 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 	}
 	all := l.allDirty.Swap(false)
 	for base, hb := range l.comps {
-		// A guest-writable page can be shared with another address space,
-		// whose stores the layer does not see, so it refreshes on each switch.
 		mask := hb.write
 		if d := hb.dirty.Load(); d > 0 {
 			hb.dirty.CompareAndSwap(d, d-1)
@@ -1141,44 +1159,63 @@ func (l *subBlockLayer) missingPage(addr uintptr) bool {
 // populatePartial asks the memory manager to map the guest pages that blocks
 // miss. The layer verifies a block once after each change of the block.
 func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlockPopulator) {
-	var addrs []hostarch.Addr
 	l.mu.Lock()
-	for base := range l.partial {
-		hb := l.blocks[base]
-		if hb.mapped == allSubPages {
-			addrs = append(addrs, hostarch.Addr(base))
-			continue
-		}
-		first := -1
-		for i := range hb.subs {
-			if hb.subs[i].f == nil {
-				addrs = append(addrs, hostarch.Addr(base+uintptr(i)*hostarch.PageSize))
-			} else if first < 0 {
-				first = i
-			}
-		}
-		// After the missing pages, a call for a mapped page lets the memory
-		// manager coalesce the block with spare pages.
-		if hb.canCoalesce() {
-			addrs = append(addrs, hostarch.Addr(base+uintptr(first)*hostarch.PageSize))
-		}
-	}
-	clear(l.partial)
-	l.updatePendingLocked()
-	l.mu.Unlock()
-	if len(addrs) == 0 {
+	if len(l.partial) == 0 {
+		l.mu.Unlock()
 		return
 	}
-	for _, addr := range addrs {
-		pop.PopulateSubBlock(ctx, addr)
-	}
-	// A populate that maps only some pages queues the block again. The next
-	// change of the block verifies it, so that a block next to unmapped memory
-	// does not cost a verification for each switch.
-	l.mu.Lock()
-	for _, addr := range addrs {
-		delete(l.partial, subBlockBase(uintptr(addr)))
-	}
+	l.populating = 1
 	l.updatePendingLocked()
-	l.mu.Unlock()
+	checked := make(map[uintptr]uint64, len(l.partial))
+	for {
+		gen := l.releaseGen
+		var addrs []hostarch.Addr
+		for base := range l.partial {
+			if checkedGen, ok := checked[base]; ok && checkedGen == gen {
+				delete(l.partial, base)
+				continue
+			}
+			checked[base] = gen
+			hb := l.blocks[base]
+			if hb == nil {
+				delete(l.partial, base)
+				continue
+			}
+			if hb.mapped == allSubPages {
+				addrs = append(addrs, hostarch.Addr(base))
+				continue
+			}
+			first := -1
+			for i := range hb.subs {
+				if hb.subs[i].f == nil {
+					addrs = append(addrs, hostarch.Addr(base+uintptr(i)*hostarch.PageSize))
+				} else if first < 0 {
+					first = i
+				}
+			}
+			// After the missing pages, a call for a mapped page lets the memory
+			// manager coalesce the block with spare pages.
+			if hb.canCoalesce() {
+				addrs = append(addrs, hostarch.Addr(base+uintptr(first)*hostarch.PageSize))
+			}
+		}
+		clear(l.partial)
+		l.updatePendingLocked()
+		l.mu.Unlock()
+		if len(addrs) == 0 {
+			return
+		}
+		for _, addr := range addrs {
+			pop.PopulateSubBlock(ctx, addr)
+		}
+		// A populate that maps only some pages queues the block again. The next
+		// change of the block verifies it, so that a block next to unmapped memory
+		// does not cost a verification for each switch.
+		l.mu.Lock()
+		if l.releaseGen == gen {
+			for _, addr := range addrs {
+				delete(l.partial, subBlockBase(uintptr(addr)))
+			}
+		}
+	}
 }

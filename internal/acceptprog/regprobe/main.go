@@ -45,7 +45,7 @@ import (
 )
 
 // sleepLength is the length of the sleep that a signal interrupts.
-const sleepLength = 200 * time.Millisecond
+const sleepLength = 5 * time.Second
 
 func main() {
 	// The thread that runs the event holds test values in registers. A garbage
@@ -169,7 +169,8 @@ func checkSignalInBlockingSyscall() error {
 	defer restore()
 	guestcpu.ResetHandler()
 	// The State holds the addresses as integers, so the buffers must not move.
-	req := &syscall.Timespec{Nsec: int64(sleepLength)}
+	reqVal := syscall.NsecToTimespec(int64(sleepLength))
+	req := &reqVal
 	rem := new(syscall.Timespec)
 	in := guestcpu.NewState(5)
 	in.SetSyscall(syscall.SYS_NANOSLEEP, uintptr(unsafe.Pointer(req)), uintptr(unsafe.Pointer(rem)))

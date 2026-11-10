@@ -2,6 +2,19 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Shared file mappings on Android (`GOOS=android`)**: `pkg/gvx` enabled shared chunk memory only when `runtime.GOOS` was `"linux"` or `"windows"`. On Android (`runtime.GOOS == "android"`), `hostfs` and `ext4lite` kept mapped file chunks on the Go heap, which the `systrap` stub subprocess cannot map by file descriptor. `sharedChunkMemory`, `canSkipUsageScan`, `pageFits`, `backwardsError`, and the architecture check of `Config.Validate` now treat `"android"` like `"linux"`.
+- **Android auxiliary vector hardware capabilities (`pkg/cpuid`)**: `platformHWCap` now reads `AT_HWCAP` and `AT_HWCAP2` from `/proc/self/auxv` when `runtime.GOOS` is `"android"`.
+- **Cross-address-space composite block refresh on 16 KB page hosts (`pkg/sentry/platform/systrap`)**: when an emulated store in one `subBlockLayer` modified a shared `pgalloc.MemoryFile` page, a read-only subpage of a composite block in a second address space kept stale bytes. `writeLocked` now notifies `NoteHostWrite` on the backing file so all observing address spaces refresh their composite copies, and `stubMap` now records the mapped file descriptor.
+- **Android host facility probe (`tools/androidprobe`)**: when SELinux denies the read of `/proc/sys/vm/mmap_min_addr` on Android, `androidprobe report` now measures the lowest mappable page up to `0x10000` with `MAP_FIXED_NOREPLACE` and checks that the page below it fails with `EPERM` or `EACCES`. In an initramfs without `/bin/sh`, the `ptrace_singlestep` check now traces the `androidprobe` executable itself.
+
+### Tests
+
+- **16 KB Linux and Android `systrap`, `hostfs`, `ext4lite`, and `e2e` CI suites (`linux16k.yml` and `android.yml`)**: both workflows now compile and run the `pkg/sentry/platform/systrap`, `pkg/sentry/fsimpl/hostfs`, and `pkg/sentry/fsimpl/ext4lite` unit tests and the offline `e2e` test suite (`GVX_E2E_OFFLINE=1`, `GVX_PREBUILT_DIR`) inside the 16 KB Linux kernel VM and the Android 16 emulator. `linux16k.yml` also runs `androidprobe report`, the synthetic ELF guests (`guest-pie`, `guest-fixed-0x10000`, `guest-fixed-0x400000`, and `guest-shared-page`), and two-sandbox `voltree` persistence on `hostfs`. `scripts/android/emulator-smoke.sh` runs `androidprobe report`, `systrap.test`, `ext4lite.test`, and `e2e.test` as `shell`, runs `voltree` on `hostfs`, `hostfs.test`, and the `hostfs-bind` overlay upper-layer tests under `adb root`, and runs `probe.apk` (`dev.gfire.gvx.probe`) and `gvx-sample.apk` (`dev.gfire.gvx.sample/.RunService`) as `untrusted_app`. `idle_stubs_xplat_test.go` falls back to `/proc/[pid]/stat` when `/proc/self/task/*/children` is absent on Android GKI kernels.
+
 ## [v0.12.10012026110200] - 2026-11-10
 
 This release fixes a packet race in the network stack and a gap in the thread binding of the Windows lockdown. It also makes a fork and an exec under the Windows `systrap` engine faster again. Version `v0.12.10002026110200` ended each stub with its address space, so a stub no longer serves a second address space. That change made a fork and an exec slower.

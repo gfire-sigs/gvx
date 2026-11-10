@@ -1072,9 +1072,11 @@ func (s *subprocess) kickSysmsgThread() bool {
 		s.kickSysmsgMu.Unlock()
 		if err := s.createSysmsgThread(); err != nil {
 			log.Warningf("Unable to create a new stub thread: %s", err)
+			atomic.AddUint32(&s.contextQueue.numThreadsToWakeup, ^uint32(0))
 			s.kickSysmsgMu.Lock()
 			s.numSysmsgThreads--
 			s.kickSysmsgMu.Unlock()
+			return false
 		}
 	} else {
 		s.kickSysmsgMu.Unlock()
@@ -1193,7 +1195,9 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 		return err
 	}
 
-	// Skip SIGSTOP.
+	// Skip SIGSTOP. If p.attach() ran before the clone entered group-stop,
+	// the kernel coalesced both SIGSTOP signals. PTRACE_CONT then resumes
+	// the clone at its done trap.
 	if errno := hostsyscall.RawSyscallErrno(unix.SYS_PTRACE, unix.PTRACE_CONT, uintptr(p.tid), 0); errno != 0 {
 		return fmt.Errorf("ptrace cont failed: %w", errno)
 	}
@@ -1201,8 +1205,8 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 	if err != nil {
 		return fmt.Errorf("error waiting for new clone: %w", err)
 	}
-	if sig != unix.SIGSTOP {
-		return fmt.Errorf("error waiting for new clone: expected SIGSTOP, got %v", sig)
+	if sig != unix.SIGSTOP && sig != unix.SIGTRAP {
+		return fmt.Errorf("error waiting for new clone: expected SIGSTOP or SIGTRAP, got %v", sig)
 	}
 
 	// Allocate a new stack for the BPF process.

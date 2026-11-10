@@ -479,7 +479,7 @@ The stub processes of an inner Sentry keep the sealed syscall patching table of 
 
 ### 12.1 Process Model (Descriptive Module)
 
-The app starts `librungv.so` from its native library directory. The Android library `dev.gfire.gvx.Gvx` does this and passes the DNS servers of the active network with `--host-dns`, because Android has no `/etc/resolv.conf`. The Sentry then runs in that child process with its host lockdown.
+The app starts `librungv.so` from its native library directory. The Android library `dev.gfire.gvx.Gvx` does this and passes the DNS servers of the active network with `--host-dns`, because Android has no `/etc/resolv.conf`. The Sentry then runs in that child process with its host lockdown. Android SELinux denies `linkat` hard links on app and shell data files with `EACCES`, so hard links in the guest work on `ext4lite` volumes and the root file system, not on a `hostfs` workspace.
 
 Each live guest address space has one stub process and at most 2 sysmsg processes on Android. Android counts every child process of every app. Above 32 in total, it kills the oldest child processes of the app with the worst priority. A killed stub stops the sandbox, and `rungv` prints `the execution engine stopped the guest` with a note that names this limit. Android also kills a child process that uses much CPU while its app is in the background.
 

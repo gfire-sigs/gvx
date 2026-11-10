@@ -56,9 +56,6 @@ func requirePlatform(t *testing.T) *Systrap {
 	if err != nil {
 		t.Skipf("systrap engine unavailable: %v", err)
 	}
-	if !procChildrenAvailable() {
-		t.Skip("the host kernel has no /proc/<tid>/children (CONFIG_PROC_CHILDREN)")
-	}
 	drainIdleStubs()
 	return p
 }
@@ -81,11 +78,6 @@ func drainIdleStubs() {
 	}
 }
 
-func procChildrenAvailable() bool {
-	files, _ := filepath.Glob("/proc/self/task/*/children")
-	return len(files) > 0
-}
-
 // childPIDs returns the child processes of the test process. A zombie that
 // the test process did not reap counts as a child.
 func childPIDs(t testing.TB) map[int]struct{} {
@@ -95,19 +87,53 @@ func childPIDs(t testing.TB) map[int]struct{} {
 		t.Fatalf("glob /proc/self/task/*/children: %v", err)
 	}
 	pids := make(map[int]struct{})
-	for _, f := range files {
-		b, err := os.ReadFile(f)
-		if os.IsNotExist(err) {
-			continue // The Go runtime ended this thread.
-		}
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		for _, field := range strings.Fields(string(b)) {
-			pid, err := strconv.Atoi(field)
-			if err != nil {
-				t.Fatalf("parse child pid %q in %s: %v", field, f, err)
+	if len(files) > 0 {
+		for _, f := range files {
+			b, err := os.ReadFile(f)
+			if os.IsNotExist(err) {
+				continue // The Go runtime ended this thread.
 			}
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
+			}
+			for _, field := range strings.Fields(string(b)) {
+				pid, err := strconv.Atoi(field)
+				if err != nil {
+					t.Fatalf("parse child pid %q in %s: %v", field, f, err)
+				}
+				pids[pid] = struct{}{}
+			}
+		}
+		return pids
+	}
+
+	selfPID := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatalf("read /proc: %v", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == selfPID {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		closeParen := strings.LastIndexByte(string(b), ')')
+		if closeParen < 0 {
+			continue
+		}
+		fields := strings.Fields(string(b[closeParen+1:]))
+		if len(fields) < 2 {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err == nil && ppid == selfPID {
 			pids[pid] = struct{}{}
 		}
 	}

@@ -59,12 +59,13 @@ const (
 )
 
 // autoPlatform returns the backend that -platform=auto selects: the hardware
-// hypervisor on Windows and macOS, and the upstream systrap platform on Linux.
+// hypervisor on Windows and macOS, and the upstream systrap platform on Linux
+// and Android.
 func autoPlatform() gvx.PlatformType {
 	switch runtime.GOOS {
 	case "windows":
 		return gvx.PlatformWHPX
-	case "linux":
+	case "linux", "android":
 		return gvx.PlatformSystrap
 	}
 	return gvx.PlatformHVF
@@ -119,7 +120,8 @@ func TestMain(m *testing.M) {
 }
 
 // toolPath builds the main package pkg once per test run and returns the
-// binary path. Darwin binaries get the ad-hoc hypervisor entitlement.
+// binary path. It uses GVX_PREBUILT_DIR/<name> when GVX_PREBUILT_DIR is set.
+// Darwin binaries get the ad-hoc hypervisor entitlement.
 func toolPath(t *testing.T, pkg string) string {
 	t.Helper()
 	toolsMu.Lock()
@@ -127,16 +129,24 @@ func toolPath(t *testing.T, pkg string) string {
 	if p, ok := tools[pkg]; ok {
 		return p
 	}
+	name := filepath.Base(pkg)
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	if dir := os.Getenv("GVX_PREBUILT_DIR"); dir != "" {
+		cand := filepath.Join(dir, name)
+		if info, err := os.Stat(cand); err == nil && info.Mode().IsRegular() {
+			tools[pkg] = cand
+			return cand
+		}
+		t.Fatalf("GVX_PREBUILT_DIR=%s has no binary %s for %s", dir, cand, pkg)
+	}
 	if toolsDir == "" {
 		dir, err := os.MkdirTemp("", "gvx-e2e-tools-*")
 		if err != nil {
 			t.Fatalf("create tool dir: %v", err)
 		}
 		toolsDir = dir
-	}
-	name := filepath.Base(pkg)
-	if runtime.GOOS == "windows" {
-		name += ".exe"
 	}
 	out := filepath.Join(toolsDir, name)
 
@@ -555,7 +565,7 @@ func TestE2EHostLockdownEnforcedByDefault(t *testing.T) {
 		}
 		// The Linux seccomp filter cannot read paths, so a workspace keeps
 		// opens relative to a directory descriptor, and the status says so.
-		wantUnbound := runtime.GOOS != "linux"
+		wantUnbound := runtime.GOOS != "linux" && runtime.GOOS != "android"
 		if !rep.Lockdown.SubprocessBlocked || rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
 			t.Errorf("Lockdown status = %+v, want SubprocessBlocked and UnboundFileOpenBlocked=%v", rep.Lockdown, wantUnbound)
 		}

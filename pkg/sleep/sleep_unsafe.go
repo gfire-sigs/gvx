@@ -182,8 +182,10 @@ func (s *Sleeper) nextWaker(block, wakepOrSleep bool) *Waker {
 			// Indicate to wakers that we're about to sleep,
 			// this allows them to abort the wait by setting
 			// waitingG back to zero (which we'll notice
-			// before committing the sleep).
-			atomic.StoreUintptr(&s.waitingG, preparingG)
+			// before committing the sleep). Use SwapUintptr so
+			// ARM64 and QEMU TCG emit a full barrier before
+			// loading s.sharedList.
+			atomic.SwapUintptr(&s.waitingG, preparingG)
 
 			// Check if something was queued while we were
 			// preparing to sleep. We need this interleaving

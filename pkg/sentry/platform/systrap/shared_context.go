@@ -137,9 +137,8 @@ func (sc *sharedContext) interruptStub() (*thread, error) {
 	}
 	// If this context is not being worked on right now we need to mark it as
 	// interrupted so the next executor does not start working on it.
-	atomic.StoreUint32(&sc.shared.Interrupt, 1)
-	// Read ThreadID exactly once to avoid TOCTOU — the guest can modify
-	// shared memory between reads.
+	atomic.SwapUint32(&sc.shared.Interrupt, 1)
+	// Read ThreadID once to avoid a race with guest writes to shared memory.
 	threadID := atomic.LoadUint32(&sc.shared.ThreadID)
 	if threadID == invalidThreadID {
 		return nil, errNoStubThread
