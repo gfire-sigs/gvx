@@ -430,6 +430,27 @@ func TestVectorStateReachesTheSentryAndBack(t *testing.T) {
 	}
 }
 
+func TestVectorStatePreservedWhenSwitchInterruptedBeforeRun(t *testing.T) {
+	// A Switch call that returns ErrContextInterrupt before the thread runs
+	// must keep fpInStub set so PullFullState still reads the vector registers
+	// from the stub thread.
+	r := newRig(t, newPlatform(t))
+	r.program(gSetVector(0x4242), gSyscall(1), gSyscall(2))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	r.ctx.Interrupt()
+	si, _, err = r.run()
+	if si != nil || !errors.Is(err, platform.ErrContextInterrupt) {
+		t.Fatalf("Switch = (%s, %v), want ErrContextInterrupt", describe(si), err)
+	}
+	if err := r.ctx.PullFullState(r.as, r.ac); err != nil {
+		t.Fatalf("PullFullState: %v", err)
+	}
+	if got := vectorLow(r.ac); got != 0x4242 {
+		t.Errorf("the Sentry read vector low %#x after an interrupted Switch, want 0x4242", got)
+	}
+}
+
 func TestThreadsShareAddressSpace(t *testing.T) {
 	r := newRig(t, newPlatform(t))
 	r.program(gSyscall(5))

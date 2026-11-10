@@ -623,7 +623,10 @@ func (c *Context) NotifyInterrupt() {
 // when an event is queued, or the two would wait for each other. Switch then
 // tests the flag again after it served the event.
 func (c *Context) stopThread(th *thread) {
-	for i := 0; !th.forceStop(); i++ {
+	for i := 0; !th.forceStop(c); i++ {
+		if c.th.Load() != th {
+			return
+		}
 		if f := th.fast.Load(); f != nil && f.slot.sm.loadState() == winStateTrapped {
 			return
 		}

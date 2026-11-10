@@ -232,10 +232,11 @@ func (s *fastSlot) wakeSentry() { _ = windows.SetEvent(s.guest) }
 // fastSlots holds the slots of one stub. A slot is never unmapped from the
 // stub before the stub dies, so a free slot keeps its mapping and its events.
 type fastSlots struct {
-	mu     sync.Mutex
-	all    []*fastSlot
-	free   []*fastSlot
-	closed bool
+	mu         sync.Mutex
+	all        []*fastSlot
+	free       []*fastSlot
+	initEvents eventHandles
+	closed     bool
 }
 
 // fastThread is the fast path state of one guest thread.
@@ -265,8 +266,7 @@ type fastThread struct {
 var errNoFastSlot = fmt.Errorf("the stub process already has %d fast threads", winMaxThreads)
 
 // takeSlot returns a free slot or creates a new one.
-func (as *addressSpace) takeSlot() (*fastSlot, error) {
-	sp := as.sp
+func (sp *stubProc) takeSlot() (*fastSlot, error) {
 	sp.fast.mu.Lock()
 	defer sp.fast.mu.Unlock()
 	if sp.fast.closed {
@@ -281,7 +281,7 @@ func (as *addressSpace) takeSlot() (*fastSlot, error) {
 	if idx >= winMaxThreads {
 		return nil, errNoFastSlot
 	}
-	s, err := as.newSlot(idx)
+	s, err := sp.newSlot(idx)
 	if err != nil {
 		return nil, err
 	}
@@ -292,42 +292,55 @@ func (as *addressSpace) takeSlot() (*fastSlot, error) {
 // newSlot creates the shared page and the events of slot idx and maps the page
 // into the stub. The host creates the events, so the Sentry needs no process
 // creation right and the stub gets only the handles that it uses.
-func (as *addressSpace) newSlot(idx int) (*fastSlot, error) {
-	sp := as.sp
+func (sp *stubProc) newSlot(idx int) (*fastSlot, error) {
 	sec, err := newAnonSection(winThreadMapSize)
 	if err != nil {
 		return nil, err
 	}
-	ev, err := as.p.host.newEvents(sp.pid)
-	if err != nil {
-		sec.close()
-		return nil, err
+	var ev eventHandles
+	if sp.fast.initEvents.guest != 0 {
+		ev = sp.fast.initEvents
+		sp.fast.initEvents = eventHandles{}
+	} else {
+		ev, err = sp.p.host.newEvents(sp.pid)
+		if err != nil {
+			sec.close()
+			return nil, err
+		}
 	}
 	closeEvents := func() {
 		_ = windows.CloseHandle(ev.guest)
 		_ = windows.CloseHandle(ev.host)
 	}
 	va := internalBase + winEnginePagesSize + uint64(idx)*winThreadAreaSize
-	as.mu.Lock()
-	if as.released {
+	if as := sp.owner.Load(); as != nil {
+		as.mu.Lock()
+		if as.released {
+			as.mu.Unlock()
+			closeEvents()
+			sec.close()
+			return nil, errAddressSpaceReleased
+		}
+		err = as.win.Map(va, winThreadMapSize, &sec.ref, 0, viewReadWrite)
 		as.mu.Unlock()
-		closeEvents()
-		sec.close()
-		return nil, errAddressSpaceReleased
+		if err != nil {
+			closeEvents()
+			sec.close()
+			return nil, as.mapErr(err)
+		}
+	} else {
+		if err := sp.win.Map(va, winThreadMapSize, &sec.ref, 0, viewReadWrite); err != nil {
+			closeEvents()
+			sec.close()
+			return nil, err
+		}
 	}
-	err = as.win.Map(va, winThreadMapSize, &sec.ref, 0, viewReadWrite)
-	as.mu.Unlock()
-	if err != nil {
-		closeEvents()
-		sec.close()
-		return nil, as.mapErr(err)
-	}
-	s := &fastSlot{index: idx, va: va, sec: sec, sm: (*winSysmsg)(unsafe.Pointer(&sec.local[0])), reader: as.epochs.newReader(), guest: ev.guest, host: ev.host}
+	s := &fastSlot{index: idx, va: va, sec: sec, sm: (*winSysmsg)(unsafe.Pointer(&sec.local[0])), reader: sp.epochs.newReader(), guest: ev.guest, host: ev.host}
 	s.sm.GuestEvent = uint64(ev.stubGuest)
 	s.sm.HostEvent = uint64(ev.stubHost)
-	s.sm.NtSetEvent = as.p.ntSetEvent
-	s.sm.NtWaitForSingleObject = as.p.ntWait
-	s.sm.SpinTicks = as.p.spin.stub
+	s.sm.NtSetEvent = sp.p.ntSetEvent
+	s.sm.NtWaitForSingleObject = sp.p.ntWait
+	s.sm.SpinTicks = sp.p.spin.stub
 	return s, nil
 }
 
@@ -369,6 +382,11 @@ func (sp *stubProc) closeFast() {
 		return
 	}
 	sp.fast.closed = true
+	if sp.fast.initEvents.guest != 0 {
+		_ = windows.CloseHandle(sp.fast.initEvents.guest)
+		_ = windows.CloseHandle(sp.fast.initEvents.host)
+		sp.fast.initEvents = eventHandles{}
+	}
 	for _, s := range sp.fast.free {
 		s.close()
 	}
@@ -389,17 +407,24 @@ func (sp *stubProc) wakeFastThreads() {
 
 // attachFast gives a new guest thread its slot and the register that names the
 // slot to the spill routine. The arch file decides which register that is.
-func (as *addressSpace) attachFast(th *thread) error {
-	slot, err := as.takeSlot()
+func (sp *stubProc) attachFast(th *thread) error {
+	if th.fast.Load() != nil {
+		return nil
+	}
+	slot, err := sp.takeSlot()
 	if err != nil {
 		return err
 	}
 	if err := th.archAttachFast(slot); err != nil {
-		as.sp.putSlot(slot)
+		sp.putSlot(slot)
 		return err
 	}
 	th.fast.Store(&fastThread{slot: slot})
 	return nil
+}
+
+func (as *addressSpace) attachFast(th *thread) error {
+	return as.sp.attachFast(th)
 }
 
 // slotReader returns the epoch reader of the thread, or nil when the thread has

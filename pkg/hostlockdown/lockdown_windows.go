@@ -22,45 +22,83 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
+const tlsOutOfIndexes = 0xffffffff
+
+var (
+	procTlsAlloc    = modKernel32.NewProc("TlsAlloc")
+	procTlsGetValue = modKernel32.NewProc("TlsGetValue")
+	procTlsSetValue = modKernel32.NewProc("TlsSetValue")
+)
+
 // OS handles that live for the whole process. The restricted token stays open so
 // BindThread can attach it to any thread later. The job handle stays open so
 // the containment job outlives every other reference to it.
+//
+// boundTLSSlotPlusOne holds the process-wide Windows TLS slot index plus one
+// (zero means unallocated). Each OS thread that attaches the restricted token
+// stores the token handle in its own TLS slot. Because the Windows kernel
+// zeroes TLS slots on every new thread, an exited OS thread whose numeric TID
+// is later reused by a new OS thread never causes BindThread to skip
+// SetThreadToken.
 var (
-	handlesMu       sync.RWMutex
-	restrictedToken atomic.Uintptr
-	containmentJob  windows.Handle
-	boundTIDCache   [256]atomic.Uint32
-	boundTIDs       sync.Map
+	handlesMu           sync.RWMutex
+	restrictedToken     atomic.Uintptr
+	containmentJob      windows.Handle
+	boundTLSSlotOnce    sync.Once
+	boundTLSSlotErr     error
+	boundTLSSlotPlusOne atomic.Uint32
 )
 
-func recordBoundTID(tid uint32) {
-	if tid != 0 {
-		boundTIDCache[(tid^(tid>>8))&255].Store(tid)
-	}
-	boundTIDs.Store(tid, struct{}{})
+func initBoundTLSSlot() error {
+	boundTLSSlotOnce.Do(func() {
+		for _, p := range []*windows.LazyProc{procTlsAlloc, procTlsGetValue, procTlsSetValue} {
+			if err := p.Find(); err != nil {
+				boundTLSSlotErr = fmt.Errorf("hostlockdown: resolve TLS proc: %w", err)
+				return
+			}
+		}
+		r1, _, callErr := syscall.SyscallN(procTlsAlloc.Addr())
+		slot := uint32(r1)
+		if slot == tlsOutOfIndexes {
+			boundTLSSlotErr = fmt.Errorf("hostlockdown: TlsAlloc: %w", callErr)
+			return
+		}
+		boundTLSSlotPlusOne.Store(slot + 1)
+	})
+	return boundTLSSlotErr
 }
 
-func isBoundTID(tid uint32) bool {
-	if tid != 0 && boundTIDCache[(tid^(tid>>8))&255].Load() == tid {
-		return true
+func markCurrentThreadBound(token windows.Token) {
+	slotPlusOne := boundTLSSlotPlusOne.Load()
+	if slotPlusOne == 0 || token == 0 {
+		return
 	}
-	_, ok := boundTIDs.Load(tid)
-	if ok && tid != 0 {
-		boundTIDCache[(tid^(tid>>8))&255].Store(tid)
+	_, _, _ = syscall.SyscallN(procTlsSetValue.Addr(), uintptr(slotPlusOne-1), uintptr(token))
+}
+
+func isCurrentThreadBound(token windows.Token) bool {
+	slotPlusOne := boundTLSSlotPlusOne.Load()
+	if slotPlusOne == 0 || token == 0 {
+		return false
 	}
-	return ok
+	v, _, _ := syscall.SyscallN(procTlsGetValue.Addr(), uintptr(slotPlusOne-1))
+	return v == uintptr(token)
 }
 
 // applyOSLockdown runs the SPEC 3.8 Windows steps in order. Each step returns
 // its error. Status fields change only after the step succeeded and its effect
 // was read back from the OS.
 func applyOSLockdown(opts Options) (st Status, err error) {
+	if err := initBoundTLSSlot(); err != nil {
+		return Status{}, err
+	}
 	if opts.AllowOutboundNet {
 		prewarmWinsock()
 	}
@@ -224,7 +262,7 @@ func bindProcessThreads(primary, token windows.Token) error {
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken(current thread): %w", err)
 	}
-	recordBoundTID(selfTID)
+	markCurrentThreadBound(token)
 	return nil
 }
 
@@ -237,14 +275,10 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 
 	var te windows.ThreadEntry32
 	te.Size = uint32(unsafe.Sizeof(te))
-	type peerHandle struct {
-		tid uint32
-		h   windows.Handle
-	}
-	var peers []peerHandle
+	var peers []windows.Handle
 	defer func() {
-		for _, p := range peers {
-			_ = windows.CloseHandle(p.h)
+		for _, h := range peers {
+			_ = windows.CloseHandle(h)
 		}
 	}()
 	for err := windows.Thread32First(snap, &te); err == nil; err = windows.Thread32Next(snap, &te) {
@@ -255,14 +289,13 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 		if openErr != nil {
 			continue
 		}
-		peers = append(peers, peerHandle{tid: te.ThreadID, h: h})
+		peers = append(peers, h)
 	}
-	for _, p := range peers {
-		h := p.h
-		if err := windows.SetThreadToken(&h, token); err != nil {
+	for _, h := range peers {
+		peer := h
+		if err := windows.SetThreadToken(&peer, token); err != nil {
 			return fmt.Errorf("hostlockdown: SetThreadToken(peer thread): %w", err)
 		}
-		recordBoundTID(p.tid)
 	}
 	return nil
 }
@@ -297,13 +330,12 @@ func BindThread() error {
 	if token == 0 {
 		return ErrNotLockedDown
 	}
-	tid := windows.GetCurrentThreadId()
-	if isBoundTID(tid) {
+	if isCurrentThreadBound(token) {
 		return nil
 	}
 	if err := windows.SetThreadToken(nil, token); err != nil {
 		return fmt.Errorf("hostlockdown: SetThreadToken: %w", err)
 	}
-	recordBoundTID(tid)
+	markCurrentThreadBound(token)
 	return nil
 }

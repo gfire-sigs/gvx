@@ -54,7 +54,10 @@ const (
 	hostReqSize = 16
 	// hostProtocolVersion is the version of the pipe protocol.
 	hostProtocolVersion = 1
-	hostRspSize         = 48
+	hostRspSize         = 72
+
+	hostPoolDepth   = 12
+	hostPoolWorkers = 2
 )
 
 // confinement names how much of the stub confinement the host applied.
@@ -76,6 +79,7 @@ type stubHandles struct {
 	proc     windows.Handle
 	thread   windows.Handle
 	level    confinement
+	events   eventHandles
 }
 
 func init() {
@@ -90,6 +94,43 @@ func init() {
 
 // ---- host side -------------------------------------------------------------
 
+type preparedStub struct {
+	pi        *windows.ProcessInformation
+	level     confinement
+	job       windows.Handle
+	evGuest   windows.Handle
+	evHost    windows.Handle
+	stubGuest windows.Handle
+	stubHost  windows.Handle
+}
+
+func (p *preparedStub) destroy() {
+	if p == nil {
+		return
+	}
+	if p.evGuest != 0 {
+		_ = windows.CloseHandle(p.evGuest)
+	}
+	if p.evHost != 0 {
+		_ = windows.CloseHandle(p.evHost)
+	}
+	if p.pi != nil {
+		if p.pi.Process != 0 {
+			_ = windows.TerminateProcess(p.pi.Process, 1)
+		}
+		if p.pi.Thread != 0 {
+			_ = windows.CloseHandle(p.pi.Thread)
+		}
+	}
+	if p.job != 0 {
+		_ = windows.CloseHandle(p.job)
+	}
+	if p.pi != nil && p.pi.Process != 0 {
+		_, _ = windows.WaitForSingleObject(p.pi.Process, 1000)
+		_ = windows.CloseHandle(p.pi.Process)
+	}
+}
+
 type stubHostLoop struct {
 	sentry windows.Handle
 	token  windows.Token
@@ -97,12 +138,18 @@ type stubHostLoop struct {
 	exe    string
 	// image is the locked file that the stubs run. It is nil when the host could
 	// not write it. The stubs then run a copy of the executable of the host.
-	image *stubImage
-	jobs  map[uint32]windows.Handle
+	imageMu sync.Mutex
+	image   *stubImage
+	jobs    map[uint32]windows.Handle
 	// procs holds a handle to each live stub, to duplicate event handles into it.
 	procs map[uint32]windows.Handle
 	// debug is the debug object of the Sentry, in the handle table of the host.
 	debug windows.Handle
+
+	poolOnce sync.Once
+	ready    chan *preparedStub
+	stopPool chan struct{}
+	poolWG   sync.WaitGroup
 }
 
 // runStubHost serves requests until the Sentry closes the pipe. It returns the
@@ -129,7 +176,12 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	if err != nil && traceEvents {
 		tracef("stub host: no stub image, the stubs run the executable of the host: %v", err)
 	}
-	defer h.image.close()
+	defer func() {
+		h.imageMu.Lock()
+		h.image.close()
+		h.imageMu.Unlock()
+	}()
+	defer h.shutdown()
 	if traceWatch {
 		// The age is the time from the creation of the process to this point. It
 		// covers the kernel, the loader, the Go runtime, and the package inits.
@@ -149,7 +201,6 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 		var req [hostReqSize]byte
 		if _, err := io.ReadFull(in, req[:]); err != nil {
 			// EOF means that the Sentry is gone.
-			h.shutdown()
 			return 0
 		}
 		if binary.LittleEndian.Uint32(req[0:]) != hostMagic {
@@ -158,6 +209,7 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 		switch binary.LittleEndian.Uint32(req[4:]) {
 		case opSetDebug:
 			h.debug = windows.Handle(binary.LittleEndian.Uint64(req[8:]))
+			h.startPool()
 			if err := writeHostReply(out, 0, nil, h.level); err != nil {
 				return 6
 			}
@@ -211,6 +263,10 @@ func writeHostReply(out io.Writer, errno uint32, sh *stubHandles, level confinem
 		binary.LittleEndian.PutUint32(rsp[12:], sh.tid)
 		binary.LittleEndian.PutUint64(rsp[16:], uint64(sh.proc))
 		binary.LittleEndian.PutUint64(rsp[24:], uint64(sh.thread))
+		binary.LittleEndian.PutUint64(rsp[40:], uint64(sh.events.stubGuest))
+		binary.LittleEndian.PutUint64(rsp[48:], uint64(sh.events.stubHost))
+		binary.LittleEndian.PutUint64(rsp[56:], uint64(sh.events.guest))
+		binary.LittleEndian.PutUint64(rsp[64:], uint64(sh.events.host))
 	}
 	binary.LittleEndian.PutUint32(rsp[32:], uint32(level))
 	_, err := out.Write(rsp[:])
@@ -414,10 +470,74 @@ func (h *stubHostLoop) release(pid uint32) {
 	}
 }
 
+// startPool launches background workers that prepare suspended stub processes,
+// job objects, and initial event pairs ahead of opNewStub requests.
+func (h *stubHostLoop) startPool() {
+	h.poolOnce.Do(func() {
+		h.ready = make(chan *preparedStub, hostPoolDepth)
+		h.stopPool = make(chan struct{})
+		for range hostPoolWorkers {
+			h.poolWG.Add(1)
+			go h.fillPool()
+		}
+	})
+}
+
+func (h *stubHostLoop) fillPool() {
+	defer h.poolWG.Done()
+	for {
+		select {
+		case <-h.stopPool:
+			return
+		default:
+		}
+		prep, err := h.prepareStub()
+		if err != nil {
+			select {
+			case <-h.stopPool:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+			continue
+		}
+		select {
+		case h.ready <- prep:
+		case <-h.stopPool:
+			prep.destroy()
+			return
+		}
+	}
+}
+
+func (h *stubHostLoop) takePrepared() (*preparedStub, error) {
+	if h.ready != nil {
+		select {
+		case prep := <-h.ready:
+			return prep, nil
+		default:
+		}
+	}
+	return h.prepareStub()
+}
+
 // shutdown ends every stub. Closing the last handle of a job kills its stub.
 // The host then waits for each stub to exit, because a stub that still maps the
 // image keeps the file of the image on disk.
 func (h *stubHostLoop) shutdown() {
+	if h.stopPool != nil {
+		close(h.stopPool)
+		h.poolWG.Wait()
+		for {
+			select {
+			case prep := <-h.ready:
+				prep.destroy()
+			default:
+				goto drained
+			}
+		}
+	drained:
+		h.stopPool = nil
+	}
 	for pid, job := range h.jobs {
 		_ = windows.CloseHandle(job)
 		delete(h.jobs, pid)
@@ -471,57 +591,107 @@ func (h *stubHostLoop) newEvents(pid uint32) (out eventHandles, err error) {
 	return out, nil
 }
 
-// newStub creates one confined, suspended stub process and returns handles in
-// the Sentry process.
-func (h *stubHostLoop) newStub() (*stubHandles, error) {
+func (h *stubHostLoop) prepareStub() (*preparedStub, error) {
 	pi, level, err := h.startStubProcess()
 	if err != nil {
 		return nil, err
 	}
-	keepProc := false
-	defer func() {
-		if !keepProc {
-			_ = windows.CloseHandle(pi.Process)
-		}
-	}()
-	defer windows.CloseHandle(pi.Thread)
-
+	prep := &preparedStub{pi: pi, level: level}
 	job, err := createStubJob()
 	if err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
+		prep.destroy()
 		return nil, err
 	}
+	prep.job = job
 	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
-		_ = windows.CloseHandle(job)
-		_ = windows.TerminateProcess(pi.Process, 1)
+		prep.destroy()
 		return nil, fmt.Errorf("AssignProcessToJobObject: %w", err)
 	}
-	h.jobs[pi.ProcessId] = job
+	self := windows.CurrentProcess()
+	evGuest, err := ntCreateAutoResetEvent()
+	if err != nil {
+		prep.destroy()
+		return nil, err
+	}
+	prep.evGuest = evGuest
+	if err := windows.DuplicateHandle(self, evGuest, pi.Process, &prep.stubGuest, eventStubAccess, false, 0); err != nil {
+		prep.destroy()
+		return nil, fmt.Errorf("DuplicateHandle(event to the stub): %w", err)
+	}
+	evHost, err := ntCreateAutoResetEvent()
+	if err != nil {
+		prep.destroy()
+		return nil, err
+	}
+	prep.evHost = evHost
+	if err := windows.DuplicateHandle(self, evHost, pi.Process, &prep.stubHost, eventStubAccess, false, 0); err != nil {
+		prep.destroy()
+		return nil, fmt.Errorf("DuplicateHandle(event to the stub): %w", err)
+	}
+	return prep, nil
+}
 
+// newStub creates one confined, suspended stub process and returns handles in
+// the Sentry process.
+func (h *stubHostLoop) newStub() (*stubHandles, error) {
 	// The host attaches the stub to the debug object of the Sentry. The Sentry
 	// then needs no right to debug a process, which a lockdown can remove.
 	if h.debug == 0 {
-		_ = windows.TerminateProcess(pi.Process, 1)
 		return nil, errors.New("the Sentry sent no debug object")
 	}
-	if err := ntDebugActiveProcess(pi.Process, h.debug); err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
+	prep, err := h.takePrepared()
+	if err != nil {
+		return nil, err
+	}
+	var inSentry []windows.Handle
+	ok := false
+	defer func() {
+		if !ok {
+			for _, hdl := range inSentry {
+				_ = windows.DuplicateHandle(h.sentry, hdl, 0, nil, 0, false, windows.DUPLICATE_CLOSE_SOURCE)
+			}
+			prep.destroy()
+		}
+	}()
+	if err := ntDebugActiveProcess(prep.pi.Process, h.debug); err != nil {
 		return nil, err
 	}
 
-	var proc, thread windows.Handle
+	var proc, thread, guest, host windows.Handle
 	self := windows.CurrentProcess()
-	if err := windows.DuplicateHandle(self, pi.Process, h.sentry, &proc, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		return nil, fmt.Errorf("DuplicateHandle(process): %w", err)
+	for _, d := range []struct{ src, dst *windows.Handle }{
+		{&prep.pi.Process, &proc},
+		{&prep.pi.Thread, &thread},
+		{&prep.evGuest, &guest},
+		{&prep.evHost, &host},
+	} {
+		if err := windows.DuplicateHandle(self, *d.src, h.sentry, d.dst, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			return nil, fmt.Errorf("DuplicateHandle(to the Sentry): %w", err)
+		}
+		inSentry = append(inSentry, *d.dst)
 	}
-	if err := windows.DuplicateHandle(self, pi.Thread, h.sentry, &thread, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		return nil, fmt.Errorf("DuplicateHandle(thread): %w", err)
-	}
-	h.procs[pi.ProcessId] = pi.Process
-	keepProc = true
-	return &stubHandles{pid: pi.ProcessId, tid: pi.ThreadId, proc: proc, thread: thread, level: level}, nil
+	_ = windows.CloseHandle(prep.pi.Thread)
+	prep.pi.Thread = 0
+	_ = windows.CloseHandle(prep.evGuest)
+	prep.evGuest = 0
+	_ = windows.CloseHandle(prep.evHost)
+	prep.evHost = 0
+	h.jobs[prep.pi.ProcessId] = prep.job
+	h.procs[prep.pi.ProcessId] = prep.pi.Process
+	ok = true
+	return &stubHandles{
+		pid:    prep.pi.ProcessId,
+		tid:    prep.pi.ThreadId,
+		proc:   proc,
+		thread: thread,
+		level:  prep.level,
+		events: eventHandles{
+			stubGuest: prep.stubGuest,
+			stubHost:  prep.stubHost,
+			guest:     guest,
+			host:      host,
+		},
+	}, nil
 }
 
 // startStubProcess creates the suspended process of one stub. It runs the small
@@ -531,18 +701,29 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 // image and runs a copy of its own executable for this stub and for every later
 // one.
 func (h *stubHostLoop) startStubProcess() (*windows.ProcessInformation, confinement, error) {
-	if h.image == nil {
+	h.imageMu.Lock()
+	img := h.image
+	var imgPath string
+	if img != nil {
+		imgPath = img.path
+	}
+	h.imageMu.Unlock()
+	if imgPath == "" {
 		return h.createProcessFor(h.exe)
 	}
-	pi, level, err := h.createProcessFor(h.image.path)
+	pi, level, err := h.createProcessFor(imgPath)
 	if err == nil {
 		return pi, level, nil
 	}
-	if traceEvents {
-		tracef("stub host: the stub image %s did not start, the stubs run the executable of the host: %v", h.image.path, err)
+	h.imageMu.Lock()
+	if h.image == img && h.image != nil {
+		if traceEvents {
+			tracef("stub host: the stub image %s did not start, the stubs run the executable of the host: %v", h.image.path, err)
+		}
+		h.image.close()
+		h.image = nil
 	}
-	h.image.close()
-	h.image = nil
+	h.imageMu.Unlock()
 	pi, level, exeErr := h.createProcessFor(h.exe)
 	if exeErr != nil {
 		return nil, 0, fmt.Errorf("%w (the stub image failed first: %v)", exeErr, err)
@@ -774,6 +955,12 @@ func (h *stubHost) newStub() (*stubHandles, error) {
 		proc:   windows.Handle(binary.LittleEndian.Uint64(rsp[16:])),
 		thread: windows.Handle(binary.LittleEndian.Uint64(rsp[24:])),
 		level:  confinement(binary.LittleEndian.Uint32(rsp[32:])),
+		events: eventHandles{
+			stubGuest: windows.Handle(binary.LittleEndian.Uint64(rsp[40:])),
+			stubHost:  windows.Handle(binary.LittleEndian.Uint64(rsp[48:])),
+			guest:     windows.Handle(binary.LittleEndian.Uint64(rsp[56:])),
+			host:      windows.Handle(binary.LittleEndian.Uint64(rsp[64:])),
+		},
 	}
 	h.level = sh.level
 	return sh, nil

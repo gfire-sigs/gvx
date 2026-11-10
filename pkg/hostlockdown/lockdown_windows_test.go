@@ -422,6 +422,39 @@ func runLockedChild(mode string) error {
 	}()
 	errs = append(errs, <-done...)
 
+	// Spawn and exit locked OS threads in sequence so the Go runtime terminates
+	// each OS thread and Windows reuses its TID. Every newly created OS thread
+	// must still attach the restricted impersonation token on BindThread.
+	for i := range 32 {
+		iterDone := make(chan error, 1)
+		go func(iter int) {
+			runtime.LockOSThread()
+			if err := BindThread(); err != nil {
+				iterDone <- fmt.Errorf("iter %d first BindThread: %w", iter, err)
+				return
+			}
+			if err := BindThread(); err != nil {
+				iterDone <- fmt.Errorf("iter %d second BindThread: %w", iter, err)
+				return
+			}
+			var tok windows.Token
+			if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &tok); err != nil {
+				iterDone <- fmt.Errorf("iter %d OpenThreadToken after BindThread: %w", iter, err)
+				return
+			}
+			_ = tok.Close()
+			if _, err := os.ReadFile(secret); !errors.Is(err, fs.ErrPermission) {
+				iterDone <- fmt.Errorf("iter %d read outside path = %v, want permission error", iter, err)
+				return
+			}
+			iterDone <- nil
+		}(i)
+		if err := <-iterDone; err != nil {
+			errs = append(errs, err)
+			break
+		}
+	}
+
 	// The job limit of one active process rejects child processes.
 	if err := exec.Command("cmd.exe", "/c", "echo", "forbidden").Run(); err == nil {
 		errs = append(errs, errors.New("cmd.exe ran after Apply"))

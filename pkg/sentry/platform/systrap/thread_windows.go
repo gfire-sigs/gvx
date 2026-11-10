@@ -390,9 +390,12 @@ func (th *thread) run() error {
 // has no signal to interrupt it. The step exception also reaches the Sentry
 // through the same event path as every other stop, so no stop can overtake an
 // exception that the thread raised before the Sentry suspended it.
-func (th *thread) forceStop() bool {
+func (th *thread) forceStop(c *Context) bool {
 	th.mu.Lock()
 	defer th.mu.Unlock()
+	if c != nil && c.th.Load() != th {
+		return true
+	}
 	if th.parked || th.stepping || th.sp.dead.Load() {
 		return true
 	}

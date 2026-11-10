@@ -52,7 +52,8 @@ type Platform struct {
 	host *stubHost
 	dbg  *debugger
 	// pool holds ready stubs. It is nil in a platform that did not start it.
-	pool *stubPool
+	pool   *stubPool
+	reaper *stubReaper
 
 	sections sectionCache
 	priv     privPool
@@ -121,7 +122,10 @@ func (p *Platform) SetThreadInit(fn func() error) {
 	p.threadInit.Store(&fn)
 }
 
-var configureOnce sync.Once
+var (
+	configureOnce      sync.Once
+	fastSelfTestPassed atomic.Bool
+)
 
 // New starts the stub host and returns a Platform. It must run before the
 // Sentry locks itself down, because the host is a child process.
@@ -187,9 +191,11 @@ func open(fast bool) (*Platform, error) {
 		breakAddr: breakAddr,
 		userMax:   internalBase,
 	}
+	p.startReaper()
 	p.setLayout(nil)
 	if fast {
 		if err := p.prepareFast(); err != nil {
+			p.stopReaper()
 			dbg.close()
 			_ = host.close()
 			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path is unavailable: %v", err)}
@@ -207,13 +213,14 @@ func open(fast bool) (*Platform, error) {
 		}
 	}
 	tSelf := time.Now()
-	if p.fast {
+	if p.fast && !fastSelfTestPassed.Load() {
 		// A short guest run proves the facts that the Windows documents do not
 		// state. A host that fails the run cannot use the fast path.
 		if err := p.selfTestFast(); err != nil {
 			_ = p.Close()
 			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path failed its self test: %v", err)}
 		}
+		fastSelfTestPassed.Store(true)
 	}
 	if traceWatch {
 		now := time.Now()
@@ -279,6 +286,7 @@ func (p *Platform) Close() error {
 		t0 := time.Now()
 		p.stopHostWrites()
 		p.stopPool()
+		p.stopReaper()
 		t1 := time.Now()
 		p.dbg.close()
 		t2 := time.Now()

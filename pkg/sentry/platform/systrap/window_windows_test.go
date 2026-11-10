@@ -67,8 +67,9 @@ func TestPlatformReservesEveryOptionalWindowOnTheCIHosts(t *testing.T) {
 	}
 }
 
-// Each stub holds every window as one placeholder before its loader runs, and
-// the kernel and the loader leave the windows alone.
+// Each stub holds every guest window as one placeholder after bring-up, and
+// the kernel and the loader leave the windows alone. The top of the high
+// window holds the mapped engine pages from internalBase to winLimit.
 func TestEveryStubHoldsEachWindowAsOnePlaceholder(t *testing.T) {
 	p := newPlatform(t)
 	for i := range 30 {
@@ -77,13 +78,17 @@ func TestEveryStubHoldsEachWindowAsOnePlaceholder(t *testing.T) {
 			t.Fatalf("stub %d: %v", i, err)
 		}
 		for _, w := range p.layout {
+			limit := w.limit
+			if w.name == windowHigh {
+				limit = internalBase
+			}
 			var mbi windows.MemoryBasicInformation
 			if err := windows.VirtualQueryEx(sp.proc, uintptr(w.base), &mbi, unsafe.Sizeof(mbi)); err != nil {
 				t.Fatalf("stub %d: VirtualQueryEx(%s window): %v", i, w.name, err)
 			}
-			if mbi.State != memReserve || uint64(mbi.AllocationBase) != w.base || uint64(mbi.RegionSize) != w.limit-w.base {
+			if mbi.State != memReserve || uint64(mbi.AllocationBase) != w.base || uint64(mbi.RegionSize) != limit-w.base {
 				t.Errorf("stub %d: the %s window is state %#x, allocation base %#x, size %#x; want one reserved region of [%#x, %#x)",
-					i, w.name, mbi.State, uint64(mbi.AllocationBase), uint64(mbi.RegionSize), w.base, w.limit)
+					i, w.name, mbi.State, uint64(mbi.AllocationBase), uint64(mbi.RegionSize), w.base, limit)
 			}
 		}
 		sp.destroy()
