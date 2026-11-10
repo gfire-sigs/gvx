@@ -277,3 +277,83 @@ func TestPacketForAddressOfDisabledNICIsNotLocal(t *testing.T) {
 		t.Fatalf("the stack answered a SYN for the address of a disabled NIC")
 	}
 }
+
+// TestForwardPacketPreservesTTLUnderConcurrentChunkReuse verifies that
+// DeepCopyForForwarding and IPv4 packet forwarding do not release the backing
+// chunk of an active header slice back to the chunk pool.
+func TestForwardPacketPreservesTTLUnderConcurrentChunkReuse(t *testing.T) {
+	pkt := synPacket(nodePodAddr, nodeEthAddr, 45000, nodePort)
+	defer pkt.DecRef()
+	if _, ok := pkt.NetworkHeader().Consume(header.IPv4MinimumSize); !ok {
+		t.Fatal("failed to consume IPv4 header")
+	}
+	if _, ok := pkt.TransportHeader().Consume(header.TCPMinimumSize); !ok {
+		t.Fatal("failed to consume TCP header")
+	}
+	pkt.NetworkProtocolNumber = ipv4.ProtocolNumber
+
+	h := header.IPv4(pkt.NetworkHeader().Slice())
+	copied := pkt.DeepCopyForForwarding(header.EthernetMinimumSize)
+	defer copied.DecRef()
+
+	fill := [64]byte{}
+	for i := range fill {
+		fill[i] = 0xfe
+	}
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		var views [32]*buffer.View
+		for i := range views {
+			views[i] = buffer.NewView(len(fill))
+			_, _ = views[i].Write(fill[:])
+		}
+		for _, v := range views {
+			v.Release()
+		}
+	}()
+	<-ch
+
+	if got := h.TTL(); got != 64 {
+		t.Fatalf("source header TTL after DeepCopyForForwarding and chunk allocation = %d, want 64", got)
+	}
+
+	n := newNode(t, true, false)
+	externalDst := tcpip.AddrFrom4([4]byte{10, 0, 2, 99})
+	done := make(chan struct{})
+	churnDone := make(chan struct{})
+	go func() {
+		defer close(churnDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				v := buffer.NewView(len(fill))
+				_, _ = v.Write(fill[:])
+				v.Release()
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		<-churnDone
+	}()
+
+	const packets = 64
+	for i := 0; i < packets; i++ {
+		in := synPacket(nodePodAddr, externalDst, uint16(46000+i), nodePort)
+		n.bridge.InjectInbound(ipv4.ProtocolNumber, in)
+		in.DecRef()
+
+		forwarded := readWithin(n.eth, 5*time.Second)
+		if forwarded == nil {
+			t.Fatalf("packet %d was not forwarded to eth0", i)
+		}
+		gotTTL := header.IPv4(forwarded.NetworkHeader().Slice()).TTL()
+		forwarded.DecRef()
+		if gotTTL != 63 {
+			t.Fatalf("forwarded packet %d TTL = %d, want 63", i, gotTTL)
+		}
+	}
+}

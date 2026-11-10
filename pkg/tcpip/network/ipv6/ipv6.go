@@ -1179,7 +1179,6 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 //
 // This method should be invoked by the endpoint that received the pkt.
 func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketBuffer) ip.ForwardingError {
-	h := header.IPv6(pkt.NetworkHeader().Slice())
 	stk := e.protocol.stack
 
 	inNicName := stk.FindNICNameFromID(e.nic.ID())
@@ -1197,7 +1196,7 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		}
 	}
 
-	hopLimit := h.HopLimit()
+	hopLimit := header.IPv6(pkt.NetworkHeader().Slice()).HopLimit()
 
 	// We need to do a deep copy of the IP packet because
 	// WriteHeaderIncludedPacket takes ownership of the packet buffer, but we do
