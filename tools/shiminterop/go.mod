@@ -1,6 +1,6 @@
 module z.gfire.dev/gvx/tools/shiminterop
 
-go 1.27.2
+go 1.27.4
 
 require (
 	github.com/containerd/containerd/api v1.10.0
