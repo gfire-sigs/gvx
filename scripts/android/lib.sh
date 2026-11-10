@@ -47,7 +47,7 @@ android_go_lib() {
 	android_go_env
 	mkdir -p "$1/lib/$android_abi"
 	(cd "$android_root" && env "${android_env[@]}" \
-		go build -trimpath -o "$1/lib/$android_abi/$2" "$3")
+		go build -trimpath -ldflags="-s -w" -o "$1/lib/$android_abi/$2" "$3")
 }
 
 # android_javac OUT SRC... compiles the Java sources under each SRC to OUT.

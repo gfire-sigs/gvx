@@ -96,7 +96,7 @@ You can run Linux containers from the terminal with the `rungv` CLI or embed a s
 
 ### 3.1 Build `rungv`
 
-Build the standalone `rungv` binary with Go 1.27 or newer, or download a prebuilt archive from the releases page.
+Build the standalone `rungv` binary with Go 1.27.4 or newer, or download a prebuilt archive from the releases page.
 
 > [!IMPORTANT]
 > On macOS, sign the binary with `entitlements.plist` so it can access `Hypervisor.framework`. On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or pass `-platform=systrap` to run without a hypervisor. On Linux, build with `CGO_ENABLED=0`.
@@ -106,14 +106,14 @@ Build the standalone `rungv` binary with Go 1.27 or newer, or download a prebuil
 
 ```bash
 # macOS (Apple Silicon arm64)
-go build -o rungv ./cmd/rungv
+go build -trimpath -ldflags="-s -w" -o rungv ./cmd/rungv
 codesign --sign - --entitlements entitlements.plist --force ./rungv
 
 # Windows (amd64 or arm64)
-go build -o rungv.exe ./cmd/rungv
+go build -trimpath -ldflags="-s -w" -o rungv.exe ./cmd/rungv
 
 # Linux (amd64 or arm64)
-CGO_ENABLED=0 go build -o rungv ./cmd/rungv
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o rungv ./cmd/rungv
 ```
 
 ### 3.2 Run Containers with `rungv`

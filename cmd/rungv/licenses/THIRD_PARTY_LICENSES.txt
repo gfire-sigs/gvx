@@ -5,11 +5,11 @@ This file lists the licenses of the components in the rungv binary.
 The generator "go run ./tools/licenses" writes this file. Do not edit it by hand.
 "rungv license" prints this file. "rungv license -list" prints the component index.
 
-Go version: go1.27.3
+Go version: go1.27.4
 Targets: darwin/arm64, windows/amd64, windows/arm64, linux/amd64, linux/arm64. Each target builds with CGO_ENABLED=0.
 
 Components (name version SPDX-id):
-std go1.27.3 BSD-3-Clause
+std go1.27.4 BSD-3-Clause
 github.com/google/gvisor 1cea747efe8d81d69ec1fb06199d7f166b82912e Apache-2.0
 github.com/google/btree v1.1.2 Apache-2.0
 github.com/klauspost/compress v1.18.0 Apache-2.0 AND BSD-3-Clause AND MIT
@@ -85,7 +85,7 @@ rights granted to you under this License for this implementation of Go
 shall terminate as of the date such litigation is filed.
 
 Components that use this text:
-  std go1.27.3
+  std go1.27.4
       note: includes the vendored packages golang.org/x/crypto, golang.org/x/net, golang.org/x/sys, golang.org/x/text, which carry the same license text
       Copyright 2009 The Go Authors.
       Copyright 2009 The Go Authors. All rights reserved.

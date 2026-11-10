@@ -182,7 +182,7 @@ INCLUDE pkg/**
 	}
 
 	root := t.TempDir()
-	writeTestFile(t, root, "go.mod", "module z.gfire.dev/gvx\n\ngo 1.27.2\n\nrequire golang.org/x/arch v0.32.0\n\nreplace golang.org/x/sys => ./internal/xsys\n")
+	writeTestFile(t, root, "go.mod", "module z.gfire.dev/gvx\n\ngo 1.27.4\n\nrequire golang.org/x/arch v0.32.0\n\nreplace golang.org/x/sys => ./internal/xsys\n")
 	writeTestFile(t, root, "go.sum", "example.com/local v1.0.0 h1:local\n")
 	archivePath := writeArchiveFile(t, map[string]string{
 		"README.md":                      "# upstream readme\n",
@@ -191,7 +191,7 @@ INCLUDE pkg/**
 		"pkg/sentry/kernel/BUILD":        "load()\n",
 		"pkg/sentry/kernel/kernel.go":    "package kernel\n\nimport _ \"gvisor.dev/gvisor/pkg/sync\"\n",
 		"pkg/hostsyscall/hostsyscall.go": "package hostsyscall\n",
-		"go.mod":                         "module gvisor.dev/gvisor\n\ngo 1.27.2\n\nrequire golang.org/x/mod v0.41.0\n",
+		"go.mod":                         "module gvisor.dev/gvisor\n\ngo 1.27.4\n\nrequire golang.org/x/mod v0.41.0\n",
 		"go.sum":                         "example.com/upstream v2.0.0 h1:up\n",
 	})
 

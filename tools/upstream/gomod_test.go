@@ -8,7 +8,7 @@ import (
 
 const upstreamGoMod = `module gvisor.dev/gvisor
 
-go 1.27.2
+go 1.27.4
 
 require (
 	golang.org/x/mod v0.41.0
@@ -22,7 +22,7 @@ func TestMergeGoModKeepsLocalPinsAndTakesNewerUpstream(t *testing.T) {
 
 	local := `module z.gfire.dev/gvx
 
-go 1.27.2
+go 1.27.4
 
 require (
 	github.com/shared/lib v1.9.0
@@ -60,7 +60,7 @@ func TestMergeGoModTakesXArchVersionFromUpstreamWhenListed(t *testing.T) {
 	t.Parallel()
 
 	up := upstreamGoMod + "\nrequire golang.org/x/arch v0.40.0\n"
-	local := "module z.gfire.dev/gvx\n\ngo 1.27.2\n\nrequire golang.org/x/arch v0.32.0\n"
+	local := "module z.gfire.dev/gvx\n\ngo 1.27.4\n\nrequire golang.org/x/arch v0.32.0\n"
 	out, err := MergeGoMod([]byte(up), []byte(local))
 	if err != nil {
 		t.Fatalf("MergeGoMod: %v", err)
@@ -73,7 +73,7 @@ func TestMergeGoModTakesXArchVersionFromUpstreamWhenListed(t *testing.T) {
 func TestMergeGoModNeverInventsXArchPin(t *testing.T) {
 	t.Parallel()
 
-	if _, err := MergeGoMod([]byte(upstreamGoMod), []byte("module z.gfire.dev/gvx\n\ngo 1.27.2\n")); !errors.Is(err, errMissingXArch) {
+	if _, err := MergeGoMod([]byte(upstreamGoMod), []byte("module z.gfire.dev/gvx\n\ngo 1.27.4\n")); !errors.Is(err, errMissingXArch) {
 		t.Fatalf("MergeGoMod err = %v, want %v", err, errMissingXArch)
 	}
 	if _, err := MergeGoMod([]byte(upstreamGoMod), nil); !errors.Is(err, errMissingXArch) {
@@ -97,8 +97,8 @@ func TestMergeGoModUsesGvxModulePathForFreshTree(t *testing.T) {
 func TestMergeGoModRaisesGoDirectiveToTheNewerOne(t *testing.T) {
 	t.Parallel()
 
-	up := strings.Replace(upstreamGoMod, "go 1.27.2", "go 1.28.0", 1) + "\nrequire golang.org/x/arch v0.32.0\n"
-	out, err := MergeGoMod([]byte(up), []byte("module z.gfire.dev/gvx\n\ngo 1.27.2\n\nrequire golang.org/x/arch v0.32.0\n"))
+	up := strings.Replace(upstreamGoMod, "go 1.27.4", "go 1.28.0", 1) + "\nrequire golang.org/x/arch v0.32.0\n"
+	out, err := MergeGoMod([]byte(up), []byte("module z.gfire.dev/gvx\n\ngo 1.27.4\n\nrequire golang.org/x/arch v0.32.0\n"))
 	if err != nil {
 		t.Fatalf("MergeGoMod: %v", err)
 	}

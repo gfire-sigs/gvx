@@ -2,6 +2,14 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release updates the Go toolchain to `1.27.4` across all modules and CI workflows. It also strips symbol tables and DWARF debug headers from every `rungv` and Android `librungv.so` release binary.
+
+### Build
+
+- **Go 1.27.4 and stripped release binaries (`.github/workflows/release.yml`, `scripts/android/lib.sh`)**: `go.mod`, `tools/shiminterop/go.mod`, all GitHub Actions workflows, and embedded third-party license notices now use Go `1.27.4`. The release workflow and the build script of the Android SDK now pass `-ldflags="-s -w"` with `-trimpath`. Every `rungv`, `rungv.exe`, and `librungv.so` binary omits OS symbol tables and DWARF sections while keeping Go build metadata and line tables.
+
 ## [v0.12.10022026110200] - 2026-11-10
 
 This release fixes shared file mappings on Android, composite sub-block coherence on 16 KB page hosts, and `systrap` wakeup and `ptrace` races (#134). It also expands the 16 KB Linux kernel and Android 16 CI workflows to run the `systrap`, `hostfs`, `ext4lite`, and offline `e2e` suites.

@@ -782,7 +782,7 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 1. Create an orphan branch with the probe directory and a workflow.
 2. Set the workflow trigger to `push` on that branch.
 3. Use the runner labels `windows-latest` and `windows-11-arm`.
-4. Run `go build` in the probe directory with Go 1.24 or newer.
+4. Run `go build` in the probe directory with Go 1.27.4 or newer.
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
 

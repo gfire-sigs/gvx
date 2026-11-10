@@ -60,7 +60,7 @@ jobs:
           exe=rungv
           [ "$GOOS" = windows ] && exe=rungv.exe
           mkdir -p "dist/$name"
-          go build -trimpath -o "dist/$name/$exe" ./cmd/rungv
+          go build -trimpath -ldflags="-s -w" -o "dist/$name/$exe" ./cmd/rungv
           if [ "$GOOS" = darwin ]; then
             codesign --sign - --entitlements entitlements.plist --force "dist/$name/$exe"
             codesign --display --entitlements - "dist/$name/$exe" | grep -q com.apple.security.hypervisor
