@@ -2,7 +2,7 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.12.10012026110200] - 2026-11-10
 
 This release fixes a packet race in the network stack and a gap in the thread binding of the Windows lockdown. It also makes a fork and an exec under the Windows `systrap` engine faster again. Version `v0.12.10002026110200` ended each stub with its address space, so a stub no longer serves a second address space. That change made a fork and an exec slower.
 
