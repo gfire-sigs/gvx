@@ -2,6 +2,22 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release fixes a packet race in the network stack and a gap in the thread binding of the Windows lockdown. It also makes a fork and an exec under the Windows `systrap` engine faster again. Version `v0.12.10002026110200` stopped the reuse of a stub across address spaces, which made them slower.
+
+### Performance
+
+- **Fork and exec under the Windows `systrap` engine**: the stub host now prepares up to 12 suspended stubs before the Sentry asks for them, and it returns a stub and its event pair in one pipe reply. The Sentry maps the engine pages and the first fast slot while the loader of a new stub runs. It also parks one guest thread in each ready stub. The platform pool keeps up to 12 ready stubs and fills them on four goroutines. A reaper goroutine closes the handles of a destroyed stub after `AddressSpace.Release` returns. A stub still serves one address space only. On the hosted `windows/amd64` runner, `fork_exec_true` takes 7.12 ms and `fork_wait` 8.64 ms, down from 9.61 ms and 10.87 ms in `v0.12.10002026110200`. On `windows/arm64`, `fork_wait` takes 12.41 ms, down from 16.44 ms, and `fork_exec_true` stays at about 16 ms. Both are still slower than before `v0.12.10002026110200`, when a stub served more than one address space. Each sandbox now keeps up to about 28 idle stub processes (`docs/systrap-windows.md`, section 6.1).
+
+### Bug Fixes
+
+- **Packet chunk race in forwarding** (#130): `PacketBuffer.DeepCopyForForwarding` read the header lengths through `Slice`. That call can pull up the source buffer and free its first chunk while the caller holds a header view. The IPv4 and IPv6 forwarding paths then read the TTL or the hop limit from a chunk that another packet reused. The copy now reads the header lengths from the packet metadata and releases its payload clone at once. The forwarding paths read the TTL and the hop limit after the copy. `TestForwardPacketPreservesTTLUnderConcurrentChunkReuse` runs the race.
+- **Thread binding of the Windows lockdown** (#129): `hostlockdown.BindThread` kept the IDs of bound threads in a cache that it never cleared. Windows gives the ID of an ended thread to a new thread, so a new locked thread could run without the restricted token. `BindThread` now keeps its marker in a thread local storage slot, which each new OS thread starts without.
+- **FS base of a recycled Windows `amd64` guest thread**: a recycled thread that had a non-zero FS base kept it when the next guest started with an FS base of 0. The engine now clears the FS base in that case.
+- **Forced stop of a recycled or closed Windows `systrap` thread**: a forced stop now checks under the thread lock that the context still owns the thread and that the thread handle is still open.
+- **Usage scan before an idle wait**: `MemoryFile.FlushCommitScan` now waits for a running scan and then completes one full scan before the memory guard waits for the next task.
+
 ## [v0.12.10002026110200] - 2026-11-10
 
 This release lowers the host CPU use of Windows sandboxes. An idle sandbox no longer scans its memory usage, and the Windows `systrap` engine spins less and keeps exited guest threads for the next clone. A new workflow records benchmark results of the five targets on the `bench-results` branch.

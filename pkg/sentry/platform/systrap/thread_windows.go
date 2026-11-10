@@ -78,6 +78,10 @@ type thread struct {
 	// the context can both release the thread, and a second CloseHandle could
 	// close a new object that reuses the handle value.
 	closeOnce sync.Once
+	// handleClosed is true after closeHandle closed h. A forced stop then
+	// does not use h, because Windows can give its value to a new object.
+	// Callers hold mu.
+	handleClosed bool
 
 	// fast is the fast path state of the thread. It is nil when the platform
 	// runs without the fast path.
@@ -244,8 +248,15 @@ func (th *thread) continueUnchanged(ev debugEvent) error {
 }
 
 // closeHandle closes the thread handle. It is safe to call more than once.
+// The caller must not hold th.mu. closeHandle takes th.mu, so a forced stop
+// never uses the handle while it closes or after it closed.
 func (th *thread) closeHandle() {
-	th.closeOnce.Do(func() { _ = windows.CloseHandle(th.h) })
+	th.closeOnce.Do(func() {
+		th.mu.Lock()
+		defer th.mu.Unlock()
+		th.handleClosed = true
+		_ = windows.CloseHandle(th.h)
+	})
 }
 
 // destroy terminates the thread and forgets it.
@@ -396,7 +407,7 @@ func (th *thread) forceStop(c *Context) bool {
 	if c != nil && c.th.Load() != th {
 		return true
 	}
-	if th.parked || th.stepping || th.sp.dead.Load() {
+	if th.parked || th.stepping || th.handleClosed || th.sp.dead.Load() {
 		return true
 	}
 	if f := th.fast.Load(); f != nil && f.inSpill {

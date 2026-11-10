@@ -56,6 +56,9 @@ const (
 	hostProtocolVersion = 1
 	hostRspSize         = 72
 
+	// hostPoolDepth is the number of suspended stubs that the host prepares
+	// before the Sentry asks for them. hostPoolWorkers is the number of
+	// goroutines that prepare them.
 	hostPoolDepth   = 12
 	hostPoolWorkers = 2
 )
@@ -94,6 +97,9 @@ func init() {
 
 // ---- host side -------------------------------------------------------------
 
+// preparedStub is a stub that the host created ahead of a request. The stub
+// is suspended and never ran, and it is not attached to the debug object yet.
+// The host holds its job, its process and thread handles, and one event pair.
 type preparedStub struct {
 	pi        *windows.ProcessInformation
 	level     confinement
@@ -483,8 +489,13 @@ func (h *stubHostLoop) startPool() {
 	})
 }
 
+// fillPool prepares stubs until the pool stops. A failed preparation waits
+// before the next try. The wait starts at 10 ms and doubles up to 2 s, so a
+// policy that refuses every stub does not keep the host busy.
 func (h *stubHostLoop) fillPool() {
 	defer h.poolWG.Done()
+	const minBackoff, maxBackoff = 10 * time.Millisecond, 2 * time.Second
+	backoff := minBackoff
 	for {
 		select {
 		case <-h.stopPool:
@@ -496,10 +507,12 @@ func (h *stubHostLoop) fillPool() {
 			select {
 			case <-h.stopPool:
 				return
-			case <-time.After(10 * time.Millisecond):
+			case <-time.After(backoff):
 			}
+			backoff = min(2*backoff, maxBackoff)
 			continue
 		}
+		backoff = minBackoff
 		select {
 		case h.ready <- prep:
 		case <-h.stopPool:
@@ -509,15 +522,30 @@ func (h *stubHostLoop) fillPool() {
 	}
 }
 
-func (h *stubHostLoop) takePrepared() (*preparedStub, error) {
+// attachPrepared takes a prepared stub and attaches it to the debug object of
+// the Sentry. A pooled stub can die while it waits, for example when another
+// program ends it. A failed attach of a pooled stub therefore tries once more
+// with a new stub.
+func (h *stubHostLoop) attachPrepared() (*preparedStub, error) {
 	if h.ready != nil {
 		select {
 		case prep := <-h.ready:
-			return prep, nil
+			if err := ntDebugActiveProcess(prep.pi.Process, h.debug); err == nil {
+				return prep, nil
+			}
+			prep.destroy()
 		default:
 		}
 	}
-	return h.prepareStub()
+	prep, err := h.prepareStub()
+	if err != nil {
+		return nil, err
+	}
+	if err := ntDebugActiveProcess(prep.pi.Process, h.debug); err != nil {
+		prep.destroy()
+		return nil, err
+	}
+	return prep, nil
 }
 
 // shutdown ends every stub. Closing the last handle of a job kills its stub.
@@ -639,7 +667,7 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 	if h.debug == 0 {
 		return nil, errors.New("the Sentry sent no debug object")
 	}
-	prep, err := h.takePrepared()
+	prep, err := h.attachPrepared()
 	if err != nil {
 		return nil, err
 	}
@@ -653,9 +681,6 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 			prep.destroy()
 		}
 	}()
-	if err := ntDebugActiveProcess(prep.pi.Process, h.debug); err != nil {
-		return nil, err
-	}
 
 	var proc, thread, guest, host windows.Handle
 	self := windows.CurrentProcess()
