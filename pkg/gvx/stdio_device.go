@@ -65,14 +65,11 @@ func (d stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentr
 // descriptions for stdin, stdout, and stderr. The device nodes live on a
 // private tmpfs that no mount namespace contains, so the guest sees the
 // streams only through its descriptor table.
-func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, in io.Reader, out, errw io.Writer, tty *ttyState) (fds [3]*vfs.FileDescription, err error) {
+func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, err error) {
 	devs := [3]stdioDevice{
-		{reader: in},
+		{reader: in, pump: pump},
 		{writer: out},
 		{writer: errw},
-	}
-	if in != nil && tty == nil {
-		devs[0].pump = newStdinPump(in)
 	}
 	names := [3]string{"stdin", "stdout", "stderr"}
 	flags := [3]uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_WRONLY}

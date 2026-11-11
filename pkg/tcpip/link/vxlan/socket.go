@@ -16,6 +16,7 @@ package vxlan
 
 import (
 	"sync"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -33,7 +34,7 @@ const receiveBufferSize = 4 << 20
 // Linux. The endpoint listens on the wildcard address, so the local address of
 // a link only selects the outer source address.
 type socketKey struct {
-	stack *stack.Stack
+	stack weak.Pointer[stack.Stack]
 	proto tcpip.NetworkProtocolNumber
 	port  uint16
 }
@@ -47,10 +48,11 @@ var sockets struct {
 // udpSocket is the UDP endpoint of one or more links and the goroutine that
 // reads it.
 type udpSocket struct {
-	key  socketKey
-	ep   tcpip.Endpoint
-	wq   waiter.Queue
-	done chan struct{}
+	key      socketKey
+	ep       tcpip.Endpoint
+	wq       waiter.Queue
+	stopOnce sync.Once
+	done     chan struct{}
 	// exited closes when the read goroutine returns.
 	exited chan struct{}
 
@@ -63,14 +65,14 @@ type udpSocket struct {
 // acquireSocket adds the link to the UDP endpoint for its address and port. It
 // opens the endpoint when the link is the first one. It returns ErrDuplicate
 // when another link uses the same VNI on that endpoint.
-func acquireSocket(e *Endpoint) (*udpSocket, error) {
+func acquireSocket(stk *stack.Stack, e *Endpoint) (*udpSocket, error) {
 	key := socketKey{stack: e.stack, proto: e.proto, port: e.cfg.Port}
 	sockets.Lock()
 	defer sockets.Unlock()
 	s := sockets.m[key]
 	if s == nil {
 		var err error
-		if s, err = openSocket(key); err != nil {
+		if s, err = openSocket(stk, key); err != nil {
 			return nil, err
 		}
 		if sockets.m == nil {
@@ -93,9 +95,9 @@ func acquireSocket(e *Endpoint) (*udpSocket, error) {
 }
 
 // openSocket binds the UDP endpoint and starts its read goroutine.
-func openSocket(key socketKey) (*udpSocket, error) {
+func openSocket(stk *stack.Stack, key socketKey) (*udpSocket, error) {
 	s := &udpSocket{key: key, links: make(map[uint32]*Endpoint), done: make(chan struct{}), exited: make(chan struct{})}
-	ep, terr := key.stack.NewEndpoint(udp.ProtocolNumber, key.proto, &s.wq)
+	ep, terr := stk.NewEndpoint(udp.ProtocolNumber, key.proto, &s.wq)
 	if terr != nil {
 		return nil, &StackError{terr}
 	}
@@ -114,8 +116,50 @@ func openSocket(key socketKey) (*udpSocket, error) {
 
 // stop closes the UDP endpoint and ends the read goroutine. It does not wait.
 func (s *udpSocket) stop() {
-	close(s.done)
-	s.ep.Close()
+	s.stopOnce.Do(func() {
+		close(s.done)
+		s.ep.Close()
+	})
+}
+
+// CloseStack closes every UDP socket that stk opened for VXLAN links, including
+// links that moved to another network namespace, and waits for their read
+// goroutines to exit.
+func CloseStack(stk *stack.Stack) {
+	ws := weak.Make(stk)
+	sockets.Lock()
+	var closing []*udpSocket
+	for k, s := range sockets.m {
+		if k.stack == ws {
+			delete(sockets.m, k)
+			s.stop()
+			closing = append(closing, s)
+		}
+	}
+	sockets.Unlock()
+	for _, s := range closing {
+		<-s.exited
+	}
+}
+
+func (s *udpSocket) evictClosed() {
+	sockets.Lock()
+	if sockets.m[s.key] == s {
+		delete(sockets.m, s.key)
+	}
+	s.mu.Lock()
+	links := make([]*Endpoint, 0, len(s.links))
+	for vni, e := range s.links {
+		links = append(links, e)
+		delete(s.links, vni)
+	}
+	s.refs = 0
+	s.mu.Unlock()
+	sockets.Unlock()
+	for _, e := range links {
+		e.cleanup.Stop()
+		vxlanNICs.Delete(nicKey{stack: e.stack, id: e.cfg.ID})
+	}
 }
 
 // release removes the link. The last link closes the UDP endpoint and waits for
@@ -153,6 +197,7 @@ func (w *sliceWriter) Write(p []byte) (int, error) {
 // link of its VNI.
 func (s *udpSocket) run() {
 	defer close(s.exited)
+	defer s.evictClosed()
 	we, notify := waiter.NewChannelEntry(waiter.ReadableEvents)
 	s.wq.EventRegister(&we)
 	defer s.wq.EventUnregister(&we)

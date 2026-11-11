@@ -16,6 +16,7 @@ package netbackend
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -59,10 +61,22 @@ const (
 
 	// maxDNSMessage is the largest DNS message that a UDP or TCP exchange carries.
 	maxDNSMessage = 65535
+
+	// maxDNSNameWireLen is the RFC 1035 maximum wire length of a domain name,
+	// including label length octets and the terminating root octet.
+	maxDNSNameWireLen = 255
+
+	// maxConcurrentDNS bounds concurrent in-flight DNS queries per endpoint.
+	maxConcurrentDNS = 64
 )
 
 // errNoDNSServers reports that the host has no resolver to forward a query to.
 var errNoDNSServers = errors.New("netbackend: no host DNS servers are configured")
+
+var (
+	dnsGatewayAddr = netip.MustParseAddr(HostGatewayIPv4)
+	dnsGuestAddr   = netip.MustParseAddr(DefaultGuestIPv4)
+)
 
 type dnsQuestion struct {
 	name   string
@@ -71,13 +85,38 @@ type dnsQuestion struct {
 	endOff int
 }
 
+func (nf *NATForwarder) dnsSemaphore() chan struct{} {
+	nf.mu.Lock()
+	defer nf.mu.Unlock()
+	if nf.dnsSem == nil {
+		nf.dnsSem = make(chan struct{}, maxConcurrentDNS)
+	}
+	return nf.dnsSem
+}
+
+func (w *WireGuardEndpoint) dnsSemaphore() chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.dnsSem == nil {
+		w.dnsSem = make(chan struct{}, maxConcurrentDNS)
+	}
+	return w.dnsSem
+}
+
 func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 	timeout := nf.cfg.Tuning.Duration(tuning.DNSTimeout)
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
-	defer stop()
+	var connWG sync.WaitGroup
+	defer func() {
+		connWG.Wait()
+		stop()
+		_ = conn.Close()
+	}()
 
+	sem := nf.dnsSemaphore()
+	var writeMu sync.Mutex
 	buf := make([]byte, 4096)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
@@ -85,13 +124,30 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		resp := nf.handleDNSQuery(ctx, buf[:n])
-		if len(resp) > 0 {
+		req := append([]byte(nil), buf[:n]...)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		connWG.Add(1)
+		go func(pkt []byte) {
+			defer func() {
+				<-sem
+				connWG.Done()
+			}()
+			resp := nf.dnsRelay().answerQuery(ctx, pkt)
+			if len(resp) == 0 {
+				return
+			}
+			writeMu.Lock()
 			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 			if _, err := conn.Write(resp); err != nil {
 				nf.log.Debug("netbackend: write DNS response to guest", "error", err)
 			}
-		}
+			_ = conn.SetWriteDeadline(time.Time{})
+			writeMu.Unlock()
+		}(req)
 	}
 }
 
@@ -99,7 +155,7 @@ func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
 	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), nf.handleDNSQuery)
 }
 
-func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, handle func(context.Context, []byte) []byte) {
+func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, answer func(context.Context, []byte) []byte) {
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -121,7 +177,7 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, 
 		if _, err := io.ReadFull(conn, req); err != nil {
 			return
 		}
-		resp := handle(ctx, req)
+		resp := answer(ctx, req)
 		if len(resp) == 0 {
 			return
 		}
@@ -191,7 +247,14 @@ func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
 // resolves A and AAAA queries through the LookupHost hook. It forwards every
 // other query to the host DNS servers and answers SERVFAIL when none replies.
 func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
-	return nf.dnsRelay().handleQuery(ctx, req)
+	sem := nf.dnsSemaphore()
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return nil
+	}
+	return nf.dnsRelay().answerQuery(ctx, req)
 }
 
 // forwardRawDNSUpstream sends the wire query to each host DNS server in turn
@@ -201,7 +264,7 @@ func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) (
 	return nf.dnsRelay().forwardRawUpstream(ctx, req)
 }
 
-func (r dnsRelay) handleQuery(ctx context.Context, req []byte) []byte {
+func (r dnsRelay) answerQuery(ctx context.Context, req []byte) []byte {
 	if len(req) < dnsHeaderSize {
 		return nil
 	}
@@ -277,12 +340,54 @@ func (r dnsRelay) lookupLocalAddrs(ctx context.Context, qname string) (addrs []n
 		}
 		return nil, false, false, err
 	}
+	if r.isolateLAN {
+		filtered := make([]netip.Addr, 0, len(addrs))
+		for _, addr := range addrs {
+			if !isBlockedHostAddr(addr) {
+				filtered = append(filtered, addr)
+			}
+		}
+		addrs = filtered
+	}
 	return addrs, true, true, nil
+}
+
+// isBlockedHostAddr reports whether addr targets a host loopback, unspecified,
+// private, link-local, multicast, guest, or gateway address that IsolateLAN
+// forbids reaching.
+func isBlockedHostAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return true
+	}
+	ip := addr.Unmap()
+	return ip == dnsGatewayAddr ||
+		ip == dnsGuestAddr ||
+		ip.IsLoopback() ||
+		ip.IsUnspecified() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast()
+}
+
+func randomDNSTxID() (uint16, error) {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(b[:]), nil
 }
 
 func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, error) {
 	if len(r.servers) == 0 {
 		return nil, errNoDNSServers
+	}
+	if len(req) < dnsHeaderSize || binary.BigEndian.Uint16(req[4:6]) == 0 {
+		return nil, errors.New("netbackend: invalid DNS query header")
+	}
+	wantQ, err := parseDNSQuestion(req, dnsHeaderSize)
+	if err != nil {
+		return nil, err
 	}
 	var errs []error
 	for _, server := range r.servers {
@@ -290,9 +395,9 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, r.tune.Duration(tuning.DNSUpstreamTimeout))
+			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
 			if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
-				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, r.tune.Duration(tuning.DNSUpstreamTimeout))
+				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
 			}
 			if err != nil {
 				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
@@ -309,7 +414,15 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
-func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, timeout time.Duration) ([]byte, error) {
+func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, wantQ dnsQuestion, timeout time.Duration) ([]byte, error) {
+	guestTxID := binary.BigEndian.Uint16(req[0:2])
+	upstreamTxID, err := randomDNSTxID()
+	if err != nil {
+		return nil, err
+	}
+	upstreamReq := append([]byte(nil), req...)
+	binary.BigEndian.PutUint16(upstreamReq[0:2], upstreamTxID)
+
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	conn, err := dial(ctx, network, server)
@@ -325,11 +438,10 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	txID := binary.BigEndian.Uint16(req[0:2])
 	if network == "tcp" {
-		framed := make([]byte, 2+len(req))
-		binary.BigEndian.PutUint16(framed[0:2], uint16(len(req)))
-		copy(framed[2:], req)
+		framed := make([]byte, 2+len(upstreamReq))
+		binary.BigEndian.PutUint16(framed[0:2], uint16(len(upstreamReq)))
+		copy(framed[2:], upstreamReq)
 		if _, err := conn.Write(framed); err != nil {
 			return nil, err
 		}
@@ -341,13 +453,14 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 		if _, err := io.ReadFull(conn, resp); err != nil {
 			return nil, err
 		}
-		if !validDNSResponse(resp, txID) {
+		if !validDNSResponse(resp, upstreamTxID, wantQ) {
 			return nil, errors.New("invalid DNS response")
 		}
+		binary.BigEndian.PutUint16(resp[0:2], guestTxID)
 		return resp, nil
 	}
 
-	if _, err := conn.Write(req); err != nil {
+	if _, err := conn.Write(upstreamReq); err != nil {
 		return nil, err
 	}
 	buf := make([]byte, maxDNSMessage)
@@ -357,9 +470,11 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 			return nil, err
 		}
 		// A connected UDP socket accepts datagrams from the server only. The
-		// ID check drops late answers to earlier queries on a reused port.
-		if validDNSResponse(buf[:n], txID) {
-			return buf[:n:n], nil
+		// ID and question checks drop late or mismatched answers on a reused port.
+		if validDNSResponse(buf[:n], upstreamTxID, wantQ) {
+			resp := append([]byte(nil), buf[:n]...)
+			binary.BigEndian.PutUint16(resp[0:2], guestTxID)
+			return resp, nil
 		}
 	}
 }
@@ -457,8 +572,13 @@ func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
-	defer stop()
+	defer func() {
+		stop()
+		_ = conn.Close()
+	}()
 
+	sem := w.dnsSemaphore()
+	var writeMu sync.Mutex
 	buf := make([]byte, 4096)
 	for {
 		n, addr, err := conn.ReadFrom(buf)
@@ -466,13 +586,24 @@ func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn
 			return
 		}
 		req := append([]byte(nil), buf[:n]...)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		w.dnsWG.Add(1)
 		go func(pkt []byte, peer net.Addr) {
-			defer w.dnsWG.Done()
-			resp := w.dnsRelay(log).handleQuery(ctx, pkt)
+			defer func() {
+				<-sem
+				w.dnsWG.Done()
+			}()
+			resp := w.dnsRelay(log).answerQuery(ctx, pkt)
 			if len(resp) > 0 {
+				writeMu.Lock()
 				_ = conn.SetWriteDeadline(time.Now().Add(w.cfg.Tuning.Duration(tuning.DNSTimeout)))
 				_, _ = conn.WriteTo(resp, peer)
+				_ = conn.SetWriteDeadline(time.Time{})
+				writeMu.Unlock()
 			}
 		}(req, addr)
 	}
@@ -484,6 +615,16 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 	})
 	defer stop()
 
+	sem := w.dnsSemaphore()
+	answer := func(qctx context.Context, req []byte) []byte {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-qctx.Done():
+			return nil
+		}
+		return w.dnsRelay(log).answerQuery(qctx, req)
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -492,15 +633,25 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 		w.dnsWG.Add(1)
 		go func(c net.Conn) {
 			defer w.dnsWG.Done()
-			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), w.dnsRelay(log).handleQuery)
+			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), answer)
 		}(conn)
 	}
 }
 
-func validDNSResponse(msg []byte, txID uint16) bool {
-	return len(msg) >= dnsHeaderSize &&
-		binary.BigEndian.Uint16(msg[0:2]) == txID &&
-		binary.BigEndian.Uint16(msg[2:4])&dnsFlagQR != 0
+func validDNSResponse(msg []byte, txID uint16, wantQ dnsQuestion) bool {
+	if len(msg) < dnsHeaderSize ||
+		binary.BigEndian.Uint16(msg[0:2]) != txID ||
+		binary.BigEndian.Uint16(msg[2:4])&dnsFlagQR == 0 ||
+		binary.BigEndian.Uint16(msg[4:6]) != 1 {
+		return false
+	}
+	gotQ, err := parseDNSQuestion(msg, dnsHeaderSize)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(gotQ.name, wantQ.name) &&
+		gotQ.qtype == wantQ.qtype &&
+		gotQ.qclass == wantQ.qclass
 }
 
 func parseDNSQuestion(msg []byte, offset int) (dnsQuestion, error) {
@@ -512,6 +663,9 @@ func parseDNSQuestion(msg []byte, offset int) (dnsQuestion, error) {
 		}
 		length := int(msg[cur])
 		cur++
+		if cur-offset > maxDNSNameWireLen {
+			return dnsQuestion{}, errors.New("DNS name exceeds 255 bytes")
+		}
 		if length == 0 {
 			break
 		}
@@ -520,6 +674,9 @@ func parseDNSQuestion(msg []byte, offset int) (dnsQuestion, error) {
 		}
 		if cur+length > len(msg) {
 			return dnsQuestion{}, errors.New("DNS label exceeds packet")
+		}
+		if cur+length-offset > maxDNSNameWireLen {
+			return dnsQuestion{}, errors.New("DNS name exceeds 255 bytes")
 		}
 		labels = append(labels, string(msg[cur:cur+length]))
 		cur += length

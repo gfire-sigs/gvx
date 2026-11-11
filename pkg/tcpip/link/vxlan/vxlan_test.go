@@ -16,8 +16,11 @@ package vxlan
 
 import (
 	"errors"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
@@ -389,5 +392,132 @@ func TestDynamicEntriesAge(t *testing.T) {
 	}
 	if got := tb.snapshot(now.Add(301*time.Second), 300*time.Second); len(got) != 0 {
 		t.Fatalf("entries after 301 s = %d, want 0", len(got))
+	}
+}
+
+func countGlobalVxlanEntriesForStacks(targets ...weak.Pointer[stack.Stack]) (nics, socks int) {
+	targetSet := make(map[weak.Pointer[stack.Stack]]struct{}, len(targets))
+	for _, w := range targets {
+		targetSet[w] = struct{}{}
+	}
+	vxlanNICs.Range(func(k, _ any) bool {
+		key := k.(nicKey)
+		if _, ok := targetSet[key.stack]; ok {
+			nics++
+		}
+		return true
+	})
+	sockets.Lock()
+	for k := range sockets.m {
+		if _, ok := targetSet[k.stack]; ok {
+			socks++
+		}
+	}
+	sockets.Unlock()
+	return nics, socks
+}
+
+func TestTwoSandboxesCloseActionAndZeroGlobalMapLeaks(t *testing.T) {
+	newSandboxStack := func() *stack.Stack {
+		s := stack.New(stack.Options{
+			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+		})
+		p1, p2 := pipe.New("\x02\x00\x00\x00\x01\x01", "\x02\x00\x00\x00\x01\x02", 1514)
+		_ = p2
+		if err := s.CreateNIC(underlayNIC, ethernet.New(p1)); err != nil {
+			t.Fatalf("CreateNIC(underlay): %v", err)
+		}
+		return s
+	}
+
+	var ws1, ws2 weak.Pointer[stack.Stack]
+	collected1 := make(chan struct{})
+	collected2 := make(chan struct{})
+	func() {
+		stk1 := newSandboxStack()
+		stk2 := newSandboxStack()
+		ws1 = weak.Make(stk1)
+		ws2 = weak.Make(stk2)
+		runtime.AddCleanup(stk1, func(ch chan struct{}) { close(ch) }, collected1)
+		runtime.AddCleanup(stk2, func(ch chan struct{}) { close(ch) }, collected2)
+
+		// Sandbox 1: NIC close via Endpoint.Close triggers stack's SetOnCloseAction
+		// without re-entrant deadlock, and custom SetOnCloseAction runs once.
+		ep1, err := New(stk1, Config{ID: overlayNIC, VNI: 101, Port: 4789})
+		if err != nil {
+			t.Fatalf("New(stk1, 101): %v", err)
+		}
+		if err := stk1.CreateNIC(overlayNIC, ep1); err != nil {
+			t.Fatalf("stk1.CreateNIC: %v", err)
+		}
+		if !stk1.HasNIC(overlayNIC) {
+			t.Fatal("stk1 missing overlayNIC before Close")
+		}
+
+		var customCalls atomic.Int32
+		ep1Custom, err := New(stk1, Config{ID: 3, VNI: 102, Port: 4789})
+		if err != nil {
+			t.Fatalf("New(stk1, 102): %v", err)
+		}
+		ep1Custom.SetOnCloseAction(func() {
+			customCalls.Add(1)
+		})
+
+		// Sandbox 2: open VXLAN endpoint on independent stack.
+		ep2, err := New(stk2, Config{ID: overlayNIC, VNI: 201, Port: 4789})
+		if err != nil {
+			t.Fatalf("New(stk2, 201): %v", err)
+		}
+		if err := stk2.CreateNIC(overlayNIC, ep2); err != nil {
+			t.Fatalf("stk2.CreateNIC: %v", err)
+		}
+
+		if nics, socks := countGlobalVxlanEntriesForStacks(ws1, ws2); nics != 3 || socks != 2 {
+			t.Fatalf("active global entries = (%d nics, %d sockets), want (3, 2)", nics, socks)
+		}
+
+		// Closing ep1 directly must run stk1's SetOnCloseAction and remove overlayNIC.
+		ep1.Close()
+		if stk1.HasNIC(overlayNIC) {
+			t.Fatal("ep1.Close() did not run stack SetOnCloseAction to remove overlayNIC")
+		}
+
+		ep1Custom.Close()
+		ep1Custom.Close()
+		if got := customCalls.Load(); got != 1 {
+			t.Fatalf("SetOnCloseAction ran %d times, want 1", got)
+		}
+
+		// Closing stk2 without calling ep2.Close() first must also evict sockets and vxlanNICs.
+		stk2.Close()
+		CloseStack(stk2)
+		ep2.Close()
+		stk1.Close()
+
+		if nics, socks := countGlobalVxlanEntriesForStacks(ws1, ws2); nics != 0 || socks != 0 {
+			t.Fatalf("leaked global entries after close = (%d nics, %d sockets), want (0, 0)", nics, socks)
+		}
+	}()
+
+	for range 8 {
+		runtime.GC()
+		runtime.Gosched()
+		if ws1.Value() == nil && ws2.Value() == nil {
+			break
+		}
+	}
+	select {
+	case <-collected1:
+	case <-time.After(time.Second):
+		t.Fatal("stk1 was not collected after GC")
+	}
+	select {
+	case <-collected2:
+	case <-time.After(time.Second):
+		t.Fatal("stk2 was not collected after GC")
+	}
+	if ws1.Value() != nil || ws2.Value() != nil {
+		t.Fatalf("closed stacks remained reachable after GC: stk1=%v stk2=%v", ws1.Value() != nil, ws2.Value() != nil)
 	}
 }

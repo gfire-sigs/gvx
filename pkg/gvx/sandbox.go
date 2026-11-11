@@ -66,8 +66,9 @@ type Sandbox struct {
 	hostCARoots [][]byte
 	// forwards holds the port forwards that initNetstack bound, in rule order:
 	// the caller list, then the ports that PublishAll added.
-	forwards []PortForward
-	closed   bool
+	forwards       []PortForward
+	detachDebugLog func()
+	closed         bool
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
@@ -76,12 +77,16 @@ type Sandbox struct {
 // Config.DisableHostLockdown is set. Every host handle exists before the
 // lockdown call because the lockdown denies new host file opens.
 func New(ctx context.Context, cfg Config) (*Sandbox, error) {
+	initRuntimeGlobals()
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
 	applyHostMemoryDefaults()
 
-	sb := &Sandbox{cfg: cfg}
+	sb := &Sandbox{
+		cfg:            cfg,
+		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
+	}
 	if cfg.HostCACerts {
 		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
 		if err != nil {
@@ -478,6 +483,11 @@ func (s *Sandbox) Close() error {
 			}
 		}
 		s.plat = nil
+	}
+
+	if s.detachDebugLog != nil {
+		s.detachDebugLog()
+		s.detachDebugLog = nil
 	}
 
 	return errors.Join(errs...)

@@ -87,26 +87,91 @@ import (
 	_ "z.gfire.dev/gvx/pkg/sentry/syscalls/linux"
 )
 
-func init() {
-	logDest := io.Writer(os.Stderr)
-	if os.Getenv("GVX_DEBUG_LOG") == "" && os.Getenv("GVX_STRACE") == "" {
-		logDest = io.Discard
+type logMultiplexer struct {
+	mu     sync.RWMutex
+	base   log.Emitter
+	nextID uint64
+	sinks  map[uint64]*log.Writer
+}
+
+func (m *logMultiplexer) setBase(e log.Emitter) {
+	m.mu.Lock()
+	m.base = e
+	m.mu.Unlock()
+}
+
+func (m *logMultiplexer) attach(w io.Writer) func() {
+	if w == nil {
+		return nil
 	}
-	log.SetTarget(&log.Writer{Next: logDest})
-	if os.Getenv("GVX_DEBUG_LOG") == "2" {
-		log.SetLevel(log.Debug)
+	m.mu.Lock()
+	if m.sinks == nil {
+		m.sinks = make(map[uint64]*log.Writer)
 	}
-	if os.Getenv("GVX_STRACE") != "" {
-		strace.Initialize()
-		strace.EnableAll(strace.SinkTypeLog)
-	}
-	cpuid.Initialize()
-	_ = usage.Init()
-	if usage.MemoryAccounting == nil {
-		usage.MemoryAccounting = &usage.MemoryLocked{
-			RTMemoryStats: &usage.RTMemoryStats{},
+	m.nextID++
+	id := m.nextID
+	m.sinks[id] = &log.Writer{Next: w}
+	m.mu.Unlock()
+	return sync.OnceFunc(func() {
+		m.mu.Lock()
+		delete(m.sinks, id)
+		m.mu.Unlock()
+	})
+}
+
+func (m *logMultiplexer) Emit(depth int, level log.Level, timestamp time.Time, format string, v ...any) {
+	m.mu.RLock()
+	base := m.base
+	var sinks []*log.Writer
+	if len(m.sinks) > 0 {
+		sinks = make([]*log.Writer, 0, len(m.sinks))
+		for _, sink := range m.sinks {
+			sinks = append(sinks, sink)
 		}
 	}
+	m.mu.RUnlock()
+
+	if base != nil {
+		base.Emit(depth+1, level, timestamp, format, v...)
+	}
+	for _, sink := range sinks {
+		sink.Emit(depth+1, level, timestamp, format, v...)
+	}
+}
+
+var (
+	runtimeGlobalsOnce sync.Once
+	runtimeLogMux      logMultiplexer
+)
+
+func initRuntimeGlobals() {
+	runtimeGlobalsOnce.Do(func() {
+		if os.Getenv("GVX_DEBUG_LOG") != "" || os.Getenv("GVX_STRACE") != "" {
+			runtimeLogMux.setBase(&log.Writer{Next: os.Stderr})
+		}
+		log.SetTarget(&runtimeLogMux)
+		if os.Getenv("GVX_DEBUG_LOG") == "2" {
+			log.SetLevel(log.Debug)
+		}
+		if os.Getenv("GVX_STRACE") != "" {
+			strace.Initialize()
+			strace.EnableAll(strace.SinkTypeLog)
+		}
+		cpuid.Initialize()
+		_ = usage.Init()
+		if usage.MemoryAccounting == nil {
+			usage.MemoryAccounting = usage.NewMemoryLocked()
+		}
+	})
+}
+
+func attachDebugLogSink(w io.Writer) func() {
+	initRuntimeGlobals()
+	return runtimeLogMux.attach(w)
+}
+
+func init() {
+	initRuntimeGlobals()
 }
 
 // guestFeatureSetter is a platform whose guests use fewer CPU features than
@@ -929,6 +994,13 @@ func createSandboxLimitSet() (*limits.LimitSet, error) {
 }
 
 func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error) {
+	initRuntimeGlobals()
+	if s.detachDebugLog == nil && s.cfg.DebugLog != nil {
+		detach := attachDebugLogSink(s.cfg.DebugLog)
+		if detach != nil {
+			defer detach()
+		}
+	}
 	if len(argv) == 0 {
 		return 1, fmt.Errorf("gvx: empty command vector")
 	}
@@ -1108,7 +1180,13 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		defer tty.stop()
 	}
 
-	stdio, err := openStdioFDs(sctx, vfsObj, creds, s.cfg.Stdin, s.cfg.Stdout, s.cfg.Stderr, tty)
+	var stdinPump *stdinPump
+	if s.cfg.Stdin != nil && tty == nil {
+		stdinPump = newStdinPump(s.cfg.Stdin)
+		defer stdinPump.stop()
+	}
+
+	stdio, err := openStdioFDs(sctx, vfsObj, creds, s.cfg.Stdin, s.cfg.Stdout, s.cfg.Stderr, tty, stdinPump)
 	if err != nil {
 		return 1, err
 	}

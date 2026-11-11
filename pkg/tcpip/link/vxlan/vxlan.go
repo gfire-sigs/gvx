@@ -27,9 +27,11 @@ package vxlan
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/tcpip"
@@ -195,9 +197,9 @@ type StackError struct{ Err tcpip.Error }
 
 func (e *StackError) Error() string { return "vxlan: " + e.Err.String() }
 
-// nicKey names an interface of one stack.
+// nicKey names an interface of one stack without retaining a dead stack.
 type nicKey struct {
-	stack *stack.Stack
+	stack weak.Pointer[stack.Stack]
 	id    tcpip.NICID
 }
 
@@ -208,22 +210,26 @@ type nicKey struct {
 // nesting of transmit calls and drops the packet too.
 var vxlanNICs sync.Map
 
+func deleteVxlanNIC(key nicKey) {
+	vxlanNICs.Delete(key)
+}
+
 // Endpoint is a VXLAN link endpoint.
 type Endpoint struct {
-	stack *stack.Stack
-	cfg   Config
-	proto tcpip.NetworkProtocolNumber
-	table fdb
-	sock  *udpSocket
+	stack   weak.Pointer[stack.Stack]
+	cfg     Config
+	proto   tcpip.NetworkProtocolNumber
+	table   fdb
+	sock    *udpSocket
+	cleanup runtime.Cleanup
 
-	mtu atomic.Uint32
+	mtu    atomic.Uint32
+	closed atomic.Bool
 
 	mu         sync.RWMutex
 	dispatcher stack.NetworkDispatcher
 	linkAddr   tcpip.LinkAddress
 	onClose    func()
-
-	closeOnce sync.Once
 }
 
 var _ stack.LinkEndpoint = (*Endpoint)(nil)
@@ -250,7 +256,8 @@ func New(s *stack.Stack, cfg Config) (*Endpoint, error) {
 			cfg.Group = unspecified
 		}
 	}
-	e := &Endpoint{stack: s, cfg: cfg, proto: header.IPv4ProtocolNumber, linkAddr: cfg.Address}
+	ws := weak.Make(s)
+	e := &Endpoint{stack: ws, cfg: cfg, proto: header.IPv4ProtocolNumber, linkAddr: cfg.Address}
 	if cfg.IPv6() {
 		e.proto = header.IPv6ProtocolNumber
 	}
@@ -261,7 +268,7 @@ func New(s *stack.Stack, cfg Config) (*Endpoint, error) {
 	if cfg.MTU != 0 && (cfg.MTU < MinMTU || cfg.MTU > cfg.MaxMTU()) {
 		return nil, ErrBadMTU
 	}
-	e.mtu.Store(e.initialMTU())
+	e.mtu.Store(e.initialMTU(s))
 	if !cfg.Group.Unspecified() {
 		if header.IsV4MulticastAddress(cfg.Group) || header.IsV6MulticastAddress(cfg.Group) {
 			return nil, ErrNotSupported
@@ -271,18 +278,20 @@ func New(s *stack.Stack, cfg Config) (*Endpoint, error) {
 			return nil, err
 		}
 	}
-	sock, err := acquireSocket(e)
+	sock, err := acquireSocket(s, e)
 	if err != nil {
 		return nil, err
 	}
 	e.sock = sock
-	vxlanNICs.Store(nicKey{s, cfg.ID}, struct{}{})
+	key := nicKey{stack: ws, id: cfg.ID}
+	vxlanNICs.Store(key, struct{}{})
+	e.cleanup = runtime.AddCleanup(s, deleteVxlanNIC, key)
 	return e, nil
 }
 
 // initialMTU returns the MTU of a new link: the one in the configuration, or
 // the MTU of the underlay link minus the overhead.
-func (e *Endpoint) initialMTU() uint32 {
+func (e *Endpoint) initialMTU(s *stack.Stack) uint32 {
 	if e.cfg.MTU != 0 {
 		return e.cfg.MTU
 	}
@@ -292,7 +301,7 @@ func (e *Endpoint) initialMTU() uint32 {
 		overhead = Overhead6
 	}
 	if e.cfg.Link != 0 {
-		if info, ok := e.stack.SingleNICInfo(e.cfg.Link); ok && info.MTU > overhead {
+		if info, ok := s.SingleNICInfo(e.cfg.Link); ok && info.MTU > overhead {
 			return min(info.MTU-overhead, capMTU)
 		}
 	}
@@ -377,16 +386,20 @@ func (e *Endpoint) send(frame *buffer.Buffer, r Remote, sport uint16) {
 	if r.IP.Unspecified() {
 		return
 	}
+	stk := e.stack.Value()
+	if stk == nil {
+		return
+	}
 	var local tcpip.Address
 	if !e.cfg.Local.Unspecified() {
 		local = e.cfg.Local
 	}
-	route, err := e.stack.FindRoute(0, local, r.IP, e.proto, false /* multicastLoop */)
+	route, err := stk.FindRoute(0, local, r.IP, e.proto, false /* multicastLoop */)
 	if err != nil {
 		return
 	}
 	defer route.Release()
-	if _, loop := vxlanNICs.Load(nicKey{e.stack, route.OutgoingNIC()}); loop {
+	if _, loop := vxlanNICs.Load(nicKey{stack: e.stack, id: route.OutgoingNIC()}); loop {
 		// The outer route leaves through a vxlan link, this one or another.
 		return
 	}
@@ -623,22 +636,32 @@ func (*Endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
 	return ok
 }
 
-// SetOnCloseAction implements stack.LinkEndpoint. The link never closes by
-// itself, so the action never runs.
+// SetOnCloseAction implements stack.LinkEndpoint. Close runs action once before
+// detaching the link from its UDP endpoint.
 func (e *Endpoint) SetOnCloseAction(action func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.onClose = action
 }
 
-// Close implements stack.LinkEndpoint. It detaches the link from its UDP
-// endpoint and closes that endpoint when no other link uses it. It waits until
-// the receive goroutine of a closed UDP endpoint ends.
+// Close implements stack.LinkEndpoint. It runs any registered close action,
+// detaches the link from its UDP endpoint, and closes that endpoint when no
+// other link uses it. It waits until the receive goroutine of a closed UDP
+// endpoint ends.
 func (e *Endpoint) Close() {
-	e.closeOnce.Do(func() {
-		if e.sock != nil {
-			vxlanNICs.Delete(nicKey{e.stack, e.cfg.ID})
-			e.sock.release(e)
-		}
-	})
+	if !e.closed.CompareAndSwap(false, true) {
+		return
+	}
+	e.cleanup.Stop()
+	e.mu.Lock()
+	action := e.onClose
+	e.onClose = nil
+	e.mu.Unlock()
+	if action != nil {
+		action()
+	}
+	if e.sock != nil {
+		vxlanNICs.Delete(nicKey{stack: e.stack, id: e.cfg.ID})
+		e.sock.release(e)
+	}
 }
