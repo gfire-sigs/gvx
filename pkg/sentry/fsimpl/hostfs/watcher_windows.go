@@ -27,6 +27,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/pkg/fd"
 )
 
 // The Windows backend posts overlapped ReadDirectoryChangesW calls on handles
@@ -133,6 +134,9 @@ func (b *winBackend) holdsPins() bool { return false }
 // that calls on the handle can run overlapped. The open shares every access
 // and never follows a reparse point.
 func openWatchHandle(dir windows.Handle) (windows.Handle, error) {
+	if b := fd.ActiveWindowsFileBroker(); b != nil {
+		return b.OpenWatchHandle(dir)
+	}
 	objectName, err := windows.NewNTUnicodeString("")
 	if err != nil {
 		return 0, err

@@ -515,6 +515,12 @@ var boundaryRules = []importRule{
 		forbidden: lowLevelTier2Bans,
 	},
 	{
+		pkg:       "pkg/safecopy",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/errors", "pkg/errors/linuxerr"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
 		pkg:       "pkg/sighandling",
 		tier:      Tier2Sibling,
 		allowed:   []string{xSysUnix},
@@ -532,18 +538,12 @@ var boundaryRules = []importRule{
 		allowed:   []string{xSysUnix, "pkg/abi/linux/errno", "pkg/errors", "pkg/errors/linuxerr"},
 		forbidden: lowLevelTier2Bans,
 	},
-	// Low-level Tier 3 safeguards keeping fsutil and safecopy free of Sentry imports.
+	// Low-level Tier 3 safeguard keeping fsutil free of Sentry imports.
 	{
 		pkg:       "pkg/fsutil",
 		tier:      Tier3Upstream,
 		subtree:   true,
 		allowed:   []string{xSysUnix},
-		forbidden: lowLevelTier2Bans,
-	},
-	{
-		pkg:       "pkg/safecopy",
-		tier:      Tier3Upstream,
-		subtree:   true,
 		forbidden: lowLevelTier2Bans,
 	},
 

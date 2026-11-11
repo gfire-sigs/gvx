@@ -17,6 +17,7 @@
 package hostlockdown
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -29,24 +30,23 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const tlsOutOfIndexes = 0xffffffff
-
-var (
-	procTlsAlloc    = modKernel32.NewProc("TlsAlloc")
-	procTlsGetValue = modKernel32.NewProc("TlsGetValue")
-	procTlsSetValue = modKernel32.NewProc("TlsSetValue")
+const (
+	tlsOutOfIndexes      = 0xffffffff
+	minPrewarmedThreads  = 128
+	prewarmThreadsPerCPU = 16
+	threadSweepInterval  = 2 * time.Millisecond
 )
 
-// OS handles that live for the whole process. The restricted token stays open so
-// BindThread can attach it to any thread later. The job handle stays open so
-// the containment job outlives every other reference to it.
-//
-// boundTLSSlotPlusOne holds the process-wide Windows TLS slot index plus one
-// (zero means unallocated). Each OS thread that attaches the restricted token
-// stores the token handle in its own TLS slot. Because the Windows kernel
-// zeroes TLS slots on every new thread, an exited OS thread whose numeric TID
-// is later reused by a new OS thread never causes BindThread to skip
-// SetThreadToken.
+var (
+	modNtdll            = windows.NewLazySystemDLL("ntdll.dll")
+	procNtGetNextThread = modNtdll.NewProc("NtGetNextThread")
+	procGetThreadId     = modKernel32.NewProc("GetThreadId")
+	procTlsAlloc        = modKernel32.NewProc("TlsAlloc")
+	procTlsGetValue     = modKernel32.NewProc("TlsGetValue")
+	procTlsSetValue     = modKernel32.NewProc("TlsSetValue")
+)
+
+// OS handles and state that live for the whole process after Apply succeeds.
 var (
 	handlesMu           sync.RWMutex
 	restrictedToken     atomic.Uintptr
@@ -54,7 +54,38 @@ var (
 	boundTLSSlotOnce    sync.Once
 	boundTLSSlotErr     error
 	boundTLSSlotPlusOne atomic.Uint32
+	hasNtGetNextThread  bool
+
+	// threadBindMu serializes initial peer-thread token binding with background
+	// thread sweeps.
+	threadBindMu sync.Mutex
+
+	excludedTIDsMu sync.RWMutex
+	excludedTIDs   = make(map[uint32]struct{})
+
+	wakeThreadSweep = make(chan struct{}, 1)
 )
+
+func excludeCurrentThread() uint32 {
+	tid := windows.GetCurrentThreadId()
+	excludedTIDsMu.Lock()
+	excludedTIDs[tid] = struct{}{}
+	excludedTIDsMu.Unlock()
+	return tid
+}
+
+func unexcludeThread(tid uint32) {
+	excludedTIDsMu.Lock()
+	delete(excludedTIDs, tid)
+	excludedTIDsMu.Unlock()
+}
+
+func isExcludedThread(tid uint32) bool {
+	excludedTIDsMu.RLock()
+	_, ok := excludedTIDs[tid]
+	excludedTIDsMu.RUnlock()
+	return ok
+}
 
 func initBoundTLSSlot() error {
 	boundTLSSlotOnce.Do(func() {
@@ -63,6 +94,9 @@ func initBoundTLSSlot() error {
 				boundTLSSlotErr = fmt.Errorf("hostlockdown: resolve TLS proc: %w", err)
 				return
 			}
+		}
+		if procNtGetNextThread.Find() == nil && procGetThreadId.Find() == nil {
+			hasNtGetNextThread = true
 		}
 		r1, _, callErr := syscall.SyscallN(procTlsAlloc.Addr())
 		slot := uint32(r1)
@@ -92,9 +126,8 @@ func isCurrentThreadBound(token windows.Token) bool {
 	return v == uintptr(token)
 }
 
-// applyOSLockdown runs the SPEC 3.8 Windows steps in order. Each step returns
-// its error. Status fields change only after the step succeeded and its effect
-// was read back from the OS.
+// applyOSLockdown runs the Windows host lockdown sequence in order without
+// modifying any DACL or mandatory label on the host filesystem.
 func applyOSLockdown(opts Options) (st Status, err error) {
 	if err := initBoundTLSSlot(); err != nil {
 		return Status{}, err
@@ -111,42 +144,70 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	if err != nil {
 		return Status{}, err
 	}
-	if err := grantLogonInDefaultDACL(primary, id.logon); err != nil {
+	if err := grantDefaultDACL(primary, id); err != nil {
 		return Status{}, err
 	}
 
-	// Step 1: Low-Integrity label and logon SID entry on every mount. A
-	// directory that two mounts name, or that lies below another mount, gets
-	// the rights of each mount. A file mount gets the label and the entry on
-	// that one file. Each grant only adds access, so the order of the mounts
-	// does not matter.
-	mountsReal := make([]string, 0, len(opts.Mounts))
-	for _, m := range opts.Mounts {
-		real, err := resolveMount(m.Path)
-		if err != nil {
-			return Status{}, err
-		}
-		if err := prepareWorkspace(real, id.logon, m.ReadOnly, m.File); err != nil {
-			return Status{}, err
-		}
-		mountsReal = append(mountsReal, real)
-	}
-
-	// Step 2: remove every privilege from the live primary token.
-	if err := removeAllTokenPrivileges(primary); err != nil {
-		return Status{}, err
-	}
-
-	// Step 3: restricted impersonation token (already lowered to Low integrity)
-	// for the process threads and BindThread. The live primary token stays at
-	// its original integrity until Step 9 binds all pre-existing peer threads
-	// so OpenThread(THREAD_SET_THREAD_TOKEN) does not fail MIC NO_WRITE_UP on
-	// threads spawned before Apply.
-	restricted, err := createRestrictedImpersonationToken(primary, id, opts.AllowOutboundNet)
+	// Step 1: resolve and pin mount handles in memory without changing NTFS ACLs.
+	sealedMounts, mountsReal, err := pinHostMounts(opts.Mounts)
 	if err != nil {
 		return Status{}, err
 	}
 	keep := false
+	defer func() {
+		if !keep {
+			sealedMounts.close()
+		}
+	}()
+
+	// Step 2: remove every privilege from the live primary token with SE_PRIVILEGE_REMOVED.
+	if err := removeAllTokenPrivileges(primary); err != nil {
+		return Status{}, err
+	}
+
+	// Step 3: start the pinned-root file broker, the thread-sweeper OS thread,
+	// and the optional Low-integrity NAT socket-broker pool before Apply lowers
+	// primary to Untrusted integrity.
+	fileBroker, _, err := startFileBroker(primary, sealedMounts)
+	if err != nil {
+		return Status{}, err
+	}
+	defer func() {
+		if !keep {
+			fileBroker.stop()
+		}
+	}()
+
+	sweeper, err := prepareThreadSweeper(primary, id)
+	if err != nil {
+		return Status{}, err
+	}
+	defer func() {
+		if !keep {
+			sweeper.stop()
+		}
+	}()
+
+	var netBroker *winNetBroker
+	if opts.AllowOutboundNet {
+		netBroker, err = startNetBroker(primary, id, opts.PreboundListeners)
+		if err != nil {
+			return Status{}, err
+		}
+		defer func() {
+			if !keep {
+				netBroker.stop()
+			}
+		}()
+	}
+
+	// Step 4: build the Untrusted NULL_SID restricted impersonation token and
+	// verify that both unlisted file opens and raw WSASocket calls fail on
+	// restricted threads.
+	restricted, err := createRestrictedImpersonationToken(primary, id)
+	if err != nil {
+		return Status{}, err
+	}
 	defer func() {
 		if !keep {
 			_ = restricted.Close()
@@ -155,41 +216,49 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	if err := probeRestrictedOpenBlocked(restricted, mountsReal); err != nil {
 		return Status{}, err
 	}
-	if !opts.AllowOutboundNet {
-		if err := probeRestrictedSocketBlocked(restricted); err != nil {
-			return Status{}, err
-		}
-		st.NetworkOutboundBlocked = true
+	if err := probeRestrictedSocketBlocked(restricted); err != nil {
+		return Status{}, err
 	}
+	st.NetworkOutboundBlocked = !opts.AllowOutboundNet
 
-	// Steps 5 to 7: containment job.
+	// Steps 5 to 7: create and assign the containment job object.
 	job, err := createContainmentJob(opts.CPUQuotaMillis)
 	if err != nil {
 		return Status{}, err
 	}
+	defer func() {
+		if !keep {
+			_ = windows.CloseHandle(job)
+		}
+	}()
 	st.SubprocessBlocked = true
 	st.CPUQuotaEnforced = opts.CPUQuotaMillis > 0
 
 	// Step 8: disallow win32k system calls.
 	if err := disableWin32kSystemCalls(); err != nil {
-		_ = windows.CloseHandle(job)
 		return Status{}, err
 	}
 	st.Win32kBlocked = true
 
-	// Step 9: attach the restricted impersonation token to every existing
-	// thread in the process and lower the live primary token to Low integrity.
+	// Step 9: pre-warm Go runtime OS threads, bind all non-broker threads to
+	// restricted, and lower primary to Untrusted integrity.
 	if err := bindProcessThreads(primary, restricted); err != nil {
-		_ = windows.CloseHandle(job)
 		return Status{}, err
 	}
 	st.IntegrityDowngraded = true
 	st.UnboundFileOpenBlocked = true
 
+	if netBroker != nil {
+		activeNetBroker.Store(netBroker)
+	}
+	activeFileBroker.Store(fileBroker)
+
 	handlesMu.Lock()
 	restrictedToken.Store(uintptr(restricted))
 	containmentJob = job
 	handlesMu.Unlock()
+
+	sweeper.activate(restricted)
 	keep = true
 	return st, nil
 }
@@ -245,7 +314,8 @@ func bindProcessThreads(primary, token windows.Token) error {
 
 	pid := windows.GetCurrentProcessId()
 	selfTID := windows.GetCurrentThreadId()
-	if err := prewarmOSThreads(max(runtime.GOMAXPROCS(0)*8, 64), func() error {
+	targetThreads := max(runtime.GOMAXPROCS(0)*prewarmThreadsPerCPU, minPrewarmedThreads)
+	if err := prewarmOSThreads(targetThreads, func() error {
 		return bindPeerThreadsOnce(pid, selfTID, token)
 	}); err != nil {
 		return err
@@ -253,7 +323,7 @@ func bindProcessThreads(primary, token windows.Token) error {
 	if err := bindPeerThreadsOnce(pid, selfTID, token); err != nil {
 		return err
 	}
-	if err := lowerTokenIntegrityToLow(primary); err != nil {
+	if err := lowerTokenIntegrityToUntrusted(primary); err != nil {
 		return err
 	}
 	if err := bindPeerThreadsOnce(pid, selfTID, token); err != nil {
@@ -267,6 +337,9 @@ func bindProcessThreads(primary, token windows.Token) error {
 }
 
 func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
+	threadBindMu.Lock()
+	defer threadBindMu.Unlock()
+
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
 		return fmt.Errorf("hostlockdown: CreateToolhelp32Snapshot: %w", err)
@@ -282,7 +355,7 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 		}
 	}()
 	for err := windows.Thread32First(snap, &te); err == nil; err = windows.Thread32Next(snap, &te) {
-		if te.OwnerProcessID != pid || te.ThreadID == selfTID {
+		if te.OwnerProcessID != pid || te.ThreadID == selfTID || isExcludedThread(te.ThreadID) {
 			continue
 		}
 		h, openErr := windows.OpenThread(windows.THREAD_SET_THREAD_TOKEN, false, te.ThreadID)
@@ -298,6 +371,158 @@ func bindPeerThreadsOnce(pid, selfTID uint32, token windows.Token) error {
 		}
 	}
 	return nil
+}
+
+type winThreadSweeper struct {
+	activateCh chan windows.Token
+	stopCh     chan struct{}
+}
+
+// prepareThreadSweeper locks one dedicated OS thread before Apply lowers
+// primary, attaches a Low-integrity NULL_SID restricted token, and closes the
+// sweeper token handle immediately. Activate starts periodic sweeping with the
+// Untrusted restricted token after bindProcessThreads finishes.
+func prepareThreadSweeper(primary windows.Token, id *tokenIdentity) (*winThreadSweeper, error) {
+	sweeperTok, err := createSweeperImpersonationToken(primary, id)
+	if err != nil {
+		return nil, err
+	}
+	s := &winThreadSweeper{
+		activateCh: make(chan windows.Token, 1),
+		stopCh:     make(chan struct{}),
+	}
+	pid := windows.GetCurrentProcessId()
+	ready := make(chan error, 1)
+	go func(tok windows.Token) {
+		runtime.LockOSThread()
+		tid := excludeCurrentThread()
+		setErr := windows.SetThreadToken(nil, tok)
+		_ = tok.Close()
+		if setErr != nil {
+			unexcludeThread(tid)
+			ready <- fmt.Errorf("hostlockdown: SetThreadToken(thread sweeper): %w", setErr)
+			return
+		}
+		ready <- nil
+
+		var restricted windows.Token
+		select {
+		case <-s.stopCh:
+			unexcludeThread(tid)
+			return
+		case restricted = <-s.activateCh:
+		}
+
+		ticker := time.NewTicker(threadSweepInterval)
+		defer ticker.Stop()
+		for {
+			sweepUnboundPeerThreads(pid, tid, restricted)
+			select {
+			case <-s.stopCh:
+				unexcludeThread(tid)
+				return
+			case <-wakeThreadSweep:
+			case <-ticker.C:
+			}
+		}
+	}(sweeperTok)
+
+	if err := <-ready; err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *winThreadSweeper) activate(restricted windows.Token) {
+	if s != nil {
+		s.activateCh <- restricted
+	}
+}
+
+func (s *winThreadSweeper) stop() {
+	if s != nil {
+		close(s.stopCh)
+	}
+}
+
+func sweepUnboundPeerThreads(pid, selfTID uint32, token windows.Token) {
+	threadBindMu.Lock()
+	defer threadBindMu.Unlock()
+
+	if hasNtGetNextThread && sweepViaNtGetNextThread(selfTID, token) {
+		return
+	}
+	sweepViaToolhelp(pid, selfTID, token)
+}
+
+func sweepViaNtGetNextThread(selfTID uint32, token windows.Token) bool {
+	const desiredAccess = windows.THREAD_SET_THREAD_TOKEN | windows.THREAD_QUERY_INFORMATION
+	proc := windows.CurrentProcess()
+	var prev windows.Handle
+	visited := 0
+	for {
+		var next windows.Handle
+		r1, _, _ := syscall.SyscallN(
+			procNtGetNextThread.Addr(),
+			uintptr(proc),
+			uintptr(prev),
+			uintptr(desiredAccess),
+			0,
+			0,
+			uintptr(unsafe.Pointer(&next)),
+		)
+		if prev != 0 {
+			_ = windows.CloseHandle(prev)
+			prev = 0
+		}
+		if r1 != 0 || next == 0 {
+			return visited > 0
+		}
+		visited++
+		tidR1, _, _ := syscall.SyscallN(procGetThreadId.Addr(), uintptr(next))
+		tid := uint32(tidR1)
+		if tid != 0 && tid != selfTID && !isExcludedThread(tid) {
+			attachIfUnbound(next, token)
+		}
+		prev = next
+	}
+}
+
+func sweepViaToolhelp(pid, selfTID uint32, token windows.Token) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(snap)
+
+	var te windows.ThreadEntry32
+	te.Size = uint32(unsafe.Sizeof(te))
+	const desiredAccess = windows.THREAD_SET_THREAD_TOKEN | windows.THREAD_QUERY_INFORMATION
+	for err := windows.Thread32First(snap, &te); err == nil; err = windows.Thread32Next(snap, &te) {
+		if te.OwnerProcessID != pid || te.ThreadID == selfTID || isExcludedThread(te.ThreadID) {
+			continue
+		}
+		h, openErr := windows.OpenThread(desiredAccess, false, te.ThreadID)
+		if openErr != nil {
+			continue
+		}
+		attachIfUnbound(h, token)
+		_ = windows.CloseHandle(h)
+	}
+}
+
+func attachIfUnbound(thread windows.Handle, token windows.Token) {
+	var existing windows.Token
+	err := windows.OpenThreadToken(thread, windows.TOKEN_QUERY, true, &existing)
+	if err == nil {
+		_ = existing.Close()
+		return
+	}
+	if !errors.Is(err, windows.ERROR_NO_TOKEN) {
+		return
+	}
+	peer := thread
+	_ = windows.SetThreadToken(&peer, token)
 }
 
 func openPrimaryToken() (windows.Token, error) {
@@ -322,9 +547,7 @@ func resolveMount(path string) (string, error) {
 // thread. Call it right after runtime.LockOSThread on every vCPU thread, and
 // keep the thread locked until the goroutine exits.
 //
-// The token lets the thread reach only the workspace, so a compromised vCPU
-// thread cannot read other user files. BindThread returns ErrNotLockedDown
-// before a successful Apply.
+// BindThread returns ErrNotLockedDown before a successful Apply.
 func BindThread() error {
 	token := windows.Token(restrictedToken.Load())
 	if token == 0 {
@@ -337,5 +560,9 @@ func BindThread() error {
 		return fmt.Errorf("hostlockdown: SetThreadToken: %w", err)
 	}
 	markCurrentThreadBound(token)
+	select {
+	case wakeThreadSweep <- struct{}{}:
+	default:
+	}
 	return nil
 }

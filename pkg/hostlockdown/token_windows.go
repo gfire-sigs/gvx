@@ -27,9 +27,24 @@ import (
 )
 
 const (
+	// untrustedIntegritySID is the Untrusted mandatory label SID (SECURITY_MANDATORY_UNTRUSTED_RID 0x0).
+	untrustedIntegritySID = "S-1-16-0"
+	untrustedIntegrityRID = 0x0
+
 	// lowIntegritySID is the Low mandatory label SID (SECURITY_MANDATORY_LOW_RID 0x1000).
 	lowIntegritySID = "S-1-16-4096"
 	lowIntegrityRID = 0x1000
+
+	// nullSIDString is NULL_SID. Restricted thread tokens carry only NULL_SID in
+	// RestrictedSids so every NTFS and named host object fails Pass 2 of SeAccessCheck.
+	nullSIDString = "S-1-0-0"
+
+	// everyoneSIDString is World / Everyone. Only the Low-integrity outbound
+	// socket broker token keeps Everyone when AllowOutboundNet is true.
+	everyoneSIDString = "S-1-1-0"
+
+	// localSystemSIDString is NT AUTHORITY\SYSTEM.
+	localSystemSIDString = "S-1-5-18"
 
 	// disableMaxPrivilege is the CreateRestrictedToken flag DISABLE_MAX_PRIVILEGE.
 	disableMaxPrivilege = 0x1
@@ -71,9 +86,7 @@ func readTokenIdentity(token windows.Token) (*tokenIdentity, error) {
 	return id, nil
 }
 
-// findLogonSID returns the logon session SID. The restricted token keeps it
-// as the only enabled and restricting SID, so a token without one cannot
-// reach the workspace.
+// findLogonSID returns the logon session SID from groups.
 func findLogonSID(groups []windows.SIDAndAttributes) (*windows.SID, error) {
 	for _, g := range groups {
 		if g.Attributes&windows.SE_GROUP_LOGON_ID == windows.SE_GROUP_LOGON_ID {
@@ -83,14 +96,15 @@ func findLogonSID(groups []windows.SIDAndAttributes) (*windows.SID, error) {
 	return nil, errors.New("hostlockdown: process token has no logon SID")
 }
 
-// denyOnlySIDs lists every enabled token SID that the restricted token turns
-// into a deny-only SID: the user SID and all groups except the logon SID, the
-// integrity label and groups that are already deny-only or disabled.
+// denyOnlySIDs lists every enabled token SID that the restricted thread token
+// converts to SE_GROUP_USE_FOR_DENY_ONLY: the user SID and all enabled groups
+// except the logon SID, the integrity label, and groups that are already
+// deny-only or disabled. Everyone (S-1-1-0) becomes deny-only in all modes.
 func denyOnlySIDs(user *windows.SID, groups []windows.SIDAndAttributes) []windows.SIDAndAttributes {
-	return denyOnlySIDsForMode(user, groups, false)
+	return buildDenyOnlySIDs(user, groups, false)
 }
 
-func denyOnlySIDsForMode(user *windows.SID, groups []windows.SIDAndAttributes, allowOutboundNet bool) []windows.SIDAndAttributes {
+func buildDenyOnlySIDs(user *windows.SID, groups []windows.SIDAndAttributes, keepEveryone bool) []windows.SIDAndAttributes {
 	out := []windows.SIDAndAttributes{{Sid: user, Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY}}
 	for _, g := range groups {
 		switch {
@@ -98,7 +112,7 @@ func denyOnlySIDsForMode(user *windows.SID, groups []windows.SIDAndAttributes, a
 		case g.Attributes&windows.SE_GROUP_INTEGRITY != 0:
 		case g.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY != 0:
 		case g.Attributes&windows.SE_GROUP_ENABLED == 0:
-		case allowOutboundNet && isEveryoneSID(g.Sid):
+		case keepEveryone && isEveryoneSID(g.Sid):
 		default:
 			out = append(out, windows.SIDAndAttributes{Sid: g.Sid, Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY})
 		}
@@ -139,11 +153,33 @@ type tokenDefaultDACL struct {
 	DefaultDACL *windows.ACL
 }
 
-// grantLogonInDefaultDACL adds the logon SID with GENERIC_ALL to the default
-// DACL of token so unnamed kernel objects created by the process (such as the
-// containment job, anonymous sections, events, and impersonation tokens) remain
-// accessible after threads bind the restricted token.
-func grantLogonInDefaultDACL(token windows.Token, logon *windows.SID) error {
+func sidEntry(sid *windows.SID, mask windows.ACCESS_MASK, mode windows.ACCESS_MODE, inherit uint32) windows.EXPLICIT_ACCESS {
+	return windows.EXPLICIT_ACCESS{
+		AccessPermissions: mask,
+		AccessMode:        mode,
+		Inheritance:       inherit,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm:  windows.TRUSTEE_IS_SID,
+			TrusteeType:  windows.TRUSTEE_IS_UNKNOWN,
+			TrusteeValue: windows.TrusteeValueFromSID(sid),
+		},
+	}
+}
+
+// grantDefaultDACL grants GENERIC_ALL to user, SYSTEM, logon, and NULL_SID in
+// the default DACL of token. Unnamed kernel objects created by the process
+// (such as waitable timers in Go runtime.minit, anonymous sections, and events)
+// then pass both Pass 1 (logon) and Pass 2 (NULL_SID) of SeAccessCheck while
+// named NTFS objects deny NULL_SID.
+func grantDefaultDACL(token windows.Token, id *tokenIdentity) error {
+	systemSID, err := windows.StringToSid(localSystemSIDString)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: parse %s: %w", localSystemSIDString, err)
+	}
+	nullSID, err := windows.StringToSid(nullSIDString)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: parse %s: %w", nullSIDString, err)
+	}
 	buf, err := tokenInformation(token, windows.TokenDefaultDacl)
 	if err != nil {
 		return fmt.Errorf("hostlockdown: GetTokenInformation(TokenDefaultDacl): %w", err)
@@ -151,9 +187,14 @@ func grantLogonInDefaultDACL(token windows.Token, logon *windows.SID) error {
 	tdd := (*tokenDefaultDACL)(unsafe.Pointer(&buf[0]))
 	var pin runtime.Pinner
 	defer pin.Unpin()
-	pin.Pin(logon)
+	for _, s := range []*windows.SID{id.user, systemSID, id.logon, nullSID} {
+		pin.Pin(s)
+	}
 	entries := []windows.EXPLICIT_ACCESS{
-		sidEntry(logon, windows.GENERIC_ALL, windows.GRANT_ACCESS, windows.NO_INHERITANCE),
+		sidEntry(id.user, windows.GENERIC_ALL, windows.GRANT_ACCESS, windows.NO_INHERITANCE),
+		sidEntry(systemSID, windows.GENERIC_ALL, windows.GRANT_ACCESS, windows.NO_INHERITANCE),
+		sidEntry(id.logon, windows.GENERIC_ALL, windows.GRANT_ACCESS, windows.NO_INHERITANCE),
+		sidEntry(nullSID, windows.GENERIC_ALL, windows.GRANT_ACCESS, windows.NO_INHERITANCE),
 	}
 	merged, err := windows.ACLFromEntries(entries, tdd.DefaultDACL)
 	if err != nil {
@@ -233,13 +274,23 @@ func verifyNoPrivileges(token windows.Token) error {
 // lowerTokenIntegrityToLow sets the live token to the Low mandatory level and
 // reads the level back.
 func lowerTokenIntegrityToLow(token windows.Token) error {
-	lowSID, err := windows.StringToSid(lowIntegritySID)
+	return lowerTokenIntegrity(token, lowIntegritySID, lowIntegrityRID)
+}
+
+// lowerTokenIntegrityToUntrusted sets the live token to the Untrusted mandatory
+// level and reads the level back.
+func lowerTokenIntegrityToUntrusted(token windows.Token) error {
+	return lowerTokenIntegrity(token, untrustedIntegritySID, untrustedIntegrityRID)
+}
+
+func lowerTokenIntegrity(token windows.Token, sidStr string, rid uint32) error {
+	targetSID, err := windows.StringToSid(sidStr)
 	if err != nil {
-		return fmt.Errorf("hostlockdown: parse %s: %w", lowIntegritySID, err)
+		return fmt.Errorf("hostlockdown: parse %s: %w", sidStr, err)
 	}
 	tml := windows.Tokenmandatorylabel{
 		Label: windows.SIDAndAttributes{
-			Sid:        lowSID,
+			Sid:        targetSID,
 			Attributes: windows.SE_GROUP_INTEGRITY,
 		},
 	}
@@ -256,26 +307,101 @@ func lowerTokenIntegrityToLow(token windows.Token) error {
 		return fmt.Errorf("hostlockdown: re-read TokenIntegrityLevel: %w", err)
 	}
 	label := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&buf[0]))
-	if !isLowIntegritySID(label.Label.Sid) {
-		return fmt.Errorf("hostlockdown: token integrity level is %s after lowering, want %s", label.Label.Sid, lowIntegritySID)
+	if !isIntegritySID(label.Label.Sid, rid) {
+		return fmt.Errorf("hostlockdown: token integrity level is %s after lowering, want %s", label.Label.Sid, sidStr)
 	}
 	return nil
 }
 
 func isLowIntegritySID(sid *windows.SID) bool {
-	auth, subs, ok := sidFields(sid)
-	return ok && len(subs) > 0 && auth == windows.SECURITY_MANDATORY_LABEL_AUTHORITY && subs[len(subs)-1] == lowIntegrityRID
+	return isIntegritySID(sid, lowIntegrityRID)
 }
 
-// createRestrictedImpersonationToken copies the live token into an
-// impersonation token with DISABLE_MAX_PRIVILEGE, deny-only SIDs and the
-// logon SID as the restricting SID (plus Everyone when allowOutboundNet is
-// true so Winsock may open \Device\Afd\Endpoint). The system grants access
-// only when both the enabled SIDs and the restricting SIDs allow it.
-//
-// The impersonation copy keeps TOKEN_IMPERSONATE access, which SetThreadToken
-// needs. WRITE_RESTRICTED stays off so that the restriction covers reads.
-func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity, allowOutboundNet bool) (windows.Token, error) {
+func isUntrustedIntegritySID(sid *windows.SID) bool {
+	return isIntegritySID(sid, untrustedIntegrityRID)
+}
+
+func isIntegritySID(sid *windows.SID, rid uint32) bool {
+	auth, subs, ok := sidFields(sid)
+	return ok && len(subs) > 0 && auth == windows.SECURITY_MANDATORY_LABEL_AUTHORITY && subs[len(subs)-1] == rid
+}
+
+// createBrokerImpersonationToken duplicates a privilege-stripped primary token
+// into an impersonation token before Apply lowers primary to Untrusted
+// integrity. The dedicated pinned-root file broker thread attaches this token
+// and closes the handle immediately so no handle remains in the process handle
+// table.
+func createBrokerImpersonationToken(primary windows.Token) (windows.Token, error) {
+	var imp windows.Token
+	if err := windows.DuplicateTokenEx(
+		primary,
+		windows.TOKEN_IMPERSONATE|windows.TOKEN_QUERY,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenImpersonation,
+		&imp,
+	); err != nil {
+		return 0, fmt.Errorf("hostlockdown: DuplicateTokenEx(broker): %w", err)
+	}
+	if err := verifyNoPrivileges(imp); err != nil {
+		_ = imp.Close()
+		return 0, err
+	}
+	return imp, nil
+}
+
+// createRestrictedImpersonationToken copies primary into an Untrusted-integrity
+// impersonation token with DISABLE_MAX_PRIVILEGE, deny-only user and group
+// SIDs (including Everyone), and NULL_SID (S-1-0-0) as the sole restricting
+// SID. Matching primary's Untrusted level preserves SecurityImpersonation on
+// threads bound after Apply lowers primary, while blocking every named NTFS
+// path and Winsock endpoint.
+func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity) (windows.Token, error) {
+	nullSID, err := windows.StringToSid(nullSIDString)
+	if err != nil {
+		return 0, fmt.Errorf("hostlockdown: parse %s: %w", nullSIDString, err)
+	}
+	deny := denyOnlySIDs(id.user, id.groups)
+	restrict := []windows.SIDAndAttributes{{Sid: nullSID}}
+	return buildRestrictedImpersonationToken(primary, deny, restrict, untrustedIntegritySID, untrustedIntegrityRID)
+}
+
+// createSweeperImpersonationToken builds a Low-integrity restricted
+// impersonation token with NULL_SID (S-1-0-0) and deny-only user and group
+// SIDs for the background thread-sweeper OS thread. Low integrity permits
+// OpenThread against peer threads created by Low-integrity net-broker workers
+// as well as Untrusted threads, while NULL_SID denies all NTFS and named
+// host-object access.
+func createSweeperImpersonationToken(primary windows.Token, id *tokenIdentity) (windows.Token, error) {
+	nullSID, err := windows.StringToSid(nullSIDString)
+	if err != nil {
+		return 0, fmt.Errorf("hostlockdown: parse %s: %w", nullSIDString, err)
+	}
+	deny := denyOnlySIDs(id.user, id.groups)
+	restrict := []windows.SIDAndAttributes{{Sid: nullSID}}
+	return buildRestrictedImpersonationToken(primary, deny, restrict, lowIntegritySID, lowIntegrityRID)
+}
+
+// createNetBrokerImpersonationToken builds a Low-integrity restricted
+// impersonation token for outbound NAT dials and TCP listener accepts when
+// AllowOutboundNet is true. User and group SIDs other than logon and Everyone
+// remain deny-only so broker threads cannot read user profile files or mutate
+// Medium-integrity host objects.
+func createNetBrokerImpersonationToken(primary windows.Token, id *tokenIdentity) (windows.Token, error) {
+	nullSID, err := windows.StringToSid(nullSIDString)
+	if err != nil {
+		return 0, fmt.Errorf("hostlockdown: parse %s: %w", nullSIDString, err)
+	}
+	everyoneSID, err := windows.StringToSid(everyoneSIDString)
+	if err != nil {
+		return 0, fmt.Errorf("hostlockdown: parse %s: %w", everyoneSIDString, err)
+	}
+	deny := buildDenyOnlySIDs(id.user, id.groups, true)
+	restrict := []windows.SIDAndAttributes{{Sid: nullSID}, {Sid: everyoneSID}}
+	return buildRestrictedImpersonationToken(primary, deny, restrict, lowIntegritySID, lowIntegrityRID)
+}
+
+func buildRestrictedImpersonationToken(primary windows.Token, deny, restrict []windows.SIDAndAttributes, integritySID string, integrityRID uint32) (windows.Token, error) {
 	var imp windows.Token
 	if err := windows.DuplicateTokenEx(
 		primary,
@@ -288,19 +414,19 @@ func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity
 		return 0, fmt.Errorf("hostlockdown: DuplicateTokenEx: %w", err)
 	}
 	defer imp.Close()
-	if err := lowerTokenIntegrityToLow(imp); err != nil {
+	if err := lowerTokenIntegrity(imp, integritySID, integrityRID); err != nil {
 		return 0, err
 	}
 
-	deny := denyOnlySIDsForMode(id.user, id.groups, allowOutboundNet)
-	restrict := []windows.SIDAndAttributes{{Sid: id.logon}}
-	if allowOutboundNet {
-		everyoneSID, err := windows.StringToSid("S-1-1-0")
-		if err != nil {
-			return 0, fmt.Errorf("hostlockdown: parse S-1-1-0: %w", err)
-		}
-		restrict = append(restrict, windows.SIDAndAttributes{Sid: everyoneSID})
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	for i := range deny {
+		pin.Pin(deny[i].Sid)
 	}
+	for i := range restrict {
+		pin.Pin(restrict[i].Sid)
+	}
+
 	var restricted windows.Token
 	r1, _, callErr := procCreateRestrictedToken.Call(
 		uintptr(imp),
@@ -317,6 +443,10 @@ func createRestrictedImpersonationToken(primary windows.Token, id *tokenIdentity
 		return 0, fmt.Errorf("hostlockdown: CreateRestrictedToken: %w", callErr)
 	}
 	if err := verifyRestrictedToken(restricted); err != nil {
+		_ = restricted.Close()
+		return 0, err
+	}
+	if err := verifyNoPrivileges(restricted); err != nil {
 		_ = restricted.Close()
 		return 0, err
 	}

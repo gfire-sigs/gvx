@@ -132,6 +132,7 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
 		}
 		sb.lockdown = st
+		installHostLockdownBridges()
 		if tb, ok := sb.plat.(interface{ SetThreadInit(func() error) }); ok {
 			tb.SetThreadInit(hostlockdown.BindThread)
 		}
@@ -242,6 +243,13 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
 		TTYPath:              ttyPath,
 		InstallSyscallFilter: s.syscallFilter(),
+	}
+	if s.portForwarder != nil {
+		for _, r := range s.portForwarder.BoundRules() {
+			if r.Proto == "tcp" {
+				opts.PreboundListeners++
+			}
+		}
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {
 		opts.OutboundUDPPorts = []uint16{s.wgPeerPort}

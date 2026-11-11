@@ -30,6 +30,7 @@ import (
 	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
+	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -219,11 +220,30 @@ func TestLockdownOptionsByNetworkMode(t *testing.T) {
 			}
 			opts := sb.lockdownOptions()
 			wantMounts := []hostlockdown.HostMount{{Path: "/ws", ReadOnly: true}, {Path: "/vols/data"}}
-			if opts.AllowOutboundNet != tc.wantOutbound || !slices.Equal(opts.Mounts, wantMounts) || !slices.Equal(opts.OutboundUDPPorts, tc.wantUDPPorts) {
-				t.Fatalf("lockdownOptions() = %+v, want AllowOutboundNet=%v Mounts=%v OutboundUDPPorts=%v", opts, tc.wantOutbound, wantMounts, tc.wantUDPPorts)
+			if opts.AllowOutboundNet != tc.wantOutbound || opts.PreboundListeners != 0 || !slices.Equal(opts.Mounts, wantMounts) || !slices.Equal(opts.OutboundUDPPorts, tc.wantUDPPorts) {
+				t.Fatalf("lockdownOptions() = %+v, want AllowOutboundNet=%v PreboundListeners=0 Mounts=%v OutboundUDPPorts=%v", opts, tc.wantOutbound, wantMounts, tc.wantUDPPorts)
 			}
 		})
 	}
+	t.Run("nat counts prebound tcp listeners", func(t *testing.T) {
+		var cfg Config
+		pf := netbackend.NewPortForwarder(cfg.Tuning)
+		defer pf.Close()
+		if err := pf.PreBind([]netbackend.PortForwardRule{
+			{Proto: "tcp", HostIP: "127.0.0.1", HostPort: 0, GuestPort: 80},
+			{Proto: "tcp", HostIP: "127.0.0.1", HostPort: 0, GuestPort: 443},
+			{Proto: "udp", HostIP: "127.0.0.1", HostPort: 0, GuestPort: 53},
+		}); err != nil {
+			t.Fatalf("PreBind: %v", err)
+		}
+		sb := &Sandbox{
+			cfg:           Config{NetworkMode: NetModeNAT},
+			portForwarder: pf,
+		}
+		if got := sb.lockdownOptions().PreboundListeners; got != 2 {
+			t.Fatalf("PreboundListeners = %d, want 2", got)
+		}
+	})
 }
 
 func TestWireGuardPeerPort(t *testing.T) {

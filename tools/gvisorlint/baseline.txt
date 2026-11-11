@@ -10,5 +10,5 @@
 
 # golang.org/x/sys/windows links syscall.compileCallback. The runtime declares
 # the first parameter as its own eface struct, and x/sys declares it as any, so
-# the simplified signatures differ although the layouts agree.
-checklinkname - ^symbol "compileCallback" has signature "func \(struct\{\}, bool\) \(uintptr\)", expected signature "func \(interface\{\}, bool\) \(uintptr\)"$
+# the simplified signatures differ in either merge order although layouts agree.
+checklinkname - ^symbol "compileCallback" has signature ("func \(struct\{\}, bool\) \(uintptr\)", expected signature "func \(interface\{\}, bool\) \(uintptr\)"|"func \(interface\{\}, bool\) \(uintptr\)", expected signature "func \(struct\{\}, bool\) \(uintptr\)")$

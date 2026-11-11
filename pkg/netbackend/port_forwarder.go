@@ -338,6 +338,7 @@ type PortForwarder struct {
 	guestDialWindow time.Duration
 	// guestDialInterval is the pause between guest dial attempts.
 	guestDialInterval time.Duration
+	accept            func(net.Listener) (net.Conn, error)
 	log               *slog.Logger
 }
 
@@ -461,6 +462,14 @@ func (pf *PortForwarder) BoundRules() []PortForwardRule {
 	return out
 }
 
+// SetAccept sets the accept function used for pre-bound TCP and Unix listeners.
+// When fn is nil, PortForwarder calls net.Listener.Accept directly.
+func (pf *PortForwarder) SetAccept(fn func(net.Listener) (net.Conn, error)) {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	pf.accept = fn
+}
+
 // Start launches background relay workers for all pre-bound TCP and UDP ports
 // targeting the given Netstack instance. It does nothing after Close and
 // after the first call.
@@ -489,10 +498,16 @@ func (pf *PortForwarder) spawn(fn func()) bool {
 
 func (pf *PortForwarder) serveTCP(s *stack.Stack, b *boundTCPForward) {
 	defer pf.wg.Done()
+	pf.mu.Lock()
+	acceptFn := pf.accept
+	pf.mu.Unlock()
+	if acceptFn == nil {
+		acceptFn = net.Listener.Accept
+	}
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
 	var backoff time.Duration
 	for {
-		hostConn, err := b.listener.Accept()
+		hostConn, err := acceptFn(b.listener)
 		if err != nil {
 			if pf.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return

@@ -30,6 +30,7 @@ func NewHostHandle(handle uintptr) (*HostHandle, error) {
 
 // OpenHostPath opens a host path on Windows with CreateFileW and returns an owned HostHandle.
 func OpenHostPath(path string, flags int, _ uint32) (*HostHandle, error) {
+	bindThreadIfLocked()
 	utf16Path, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, fmt.Errorf("utf16 path %s: %w", path, err)

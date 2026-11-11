@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -144,7 +143,9 @@ func run() int {
 
 	if *dialTarget != "" {
 		rep.DialAttempted = true
-		conn, err := net.DialTimeout("tcp", *dialTarget, 5*time.Second)
+		dialCtx, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := hostlockdown.DialContext(dialCtx, "tcp", *dialTarget)
+		cancelDial()
 		if err != nil {
 			rep.DialErr = err.Error()
 		} else if err := conn.Close(); err != nil {

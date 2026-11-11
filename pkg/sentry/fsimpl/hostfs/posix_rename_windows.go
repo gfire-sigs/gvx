@@ -84,6 +84,12 @@ func (h *hostRoot) removeAt(op string, dir hostDirHandle, name string, wantDir b
 // removeIn is remove for the entry name inside the directory handle dir. The
 // path rel only labels errors.
 func removeIn(op string, dir windows.Handle, name, rel string, wantDir bool) error {
+	if b := fd.ActiveWindowsFileBroker(); b != nil {
+		if err := b.RemoveAt(dir, name, wantDir); err != nil {
+			return hostError(op, rel, err)
+		}
+		return nil
+	}
 	var options uint32
 	if wantDir {
 		options = windows.FILE_DIRECTORY_FILE
@@ -200,6 +206,12 @@ func (h *hostRoot) setTargetName(op, oldRel, newRel string, rootErr error, t tar
 // setTargetNameIn gives the entry oldParent.name the name newParent.name. The
 // paths oldRel and newRel only label errors.
 func setTargetNameIn(op, oldRel, newRel string, oldParent, newParent parentDir, t targetOp) error {
+	if b := fd.ActiveWindowsFileBroker(); b != nil {
+		if err := b.SetTargetNameAt(oldParent.handle, oldParent.name, newParent.handle, newParent.name, t.access, t.flags, t.infoClass); err != nil {
+			return hostError2(op, oldRel, newRel, err)
+		}
+		return nil
+	}
 	src, err := openAt(oldParent.handle, oldParent.name, t.access,
 		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
 	if err != nil {
