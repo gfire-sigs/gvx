@@ -54,7 +54,7 @@ func versionSubcommand(_ context.Context, args []string, stdout, stderr io.Write
 }
 
 // formatVersion renders the module version, the VCS settings, and the
-// toolchain of info, one item per line.
+// toolchain and architecture level of info, one item per line.
 func formatVersion(info *debug.BuildInfo) string {
 	settings := make(map[string]string, len(info.Settings))
 	for _, s := range info.Settings {
@@ -71,5 +71,38 @@ func formatVersion(info *debug.BuildInfo) string {
 		}
 		out += "\n"
 	}
-	return out + fmt.Sprintf("go %s %s/%s\n", info.GoVersion, runtime.GOOS, runtime.GOARCH)
+	goos := settings["GOOS"]
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	goarch := settings["GOARCH"]
+	if goarch == "" {
+		goarch = runtime.GOARCH
+	}
+	line := fmt.Sprintf("go %s %s/%s", info.GoVersion, goos, goarch)
+	if level := archLevel(goarch, settings); level != "" {
+		line += " " + level
+	}
+	return out + line + "\n"
+}
+
+func archLevel(goarch string, settings map[string]string) string {
+	var key string
+	switch goarch {
+	case "amd64":
+		key = "GOAMD64"
+	case "arm64":
+		key = "GOARM64"
+	case "arm":
+		key = "GOARM"
+	case "386":
+		key = "GO386"
+	default:
+		return ""
+	}
+	val := settings[key]
+	if val == "" {
+		return ""
+	}
+	return key + "=" + val
 }

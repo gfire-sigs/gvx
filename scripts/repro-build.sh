@@ -2,9 +2,9 @@
 # Builds a deterministic Go executable from this repository.
 #
 # Usage: scripts/repro-build.sh OUTPUT [PACKAGE]
-# Reads GOOS and GOARCH from the environment and defaults to GOHOSTOS and
-# GOHOSTARCH. Scrubs ambient environment variables and pins the toolchain,
-# module proxy, architecture level, and linker flags.
+# Reads GOOS, GOARCH, GOAMD64, and GOARM64 from the environment and selects
+# per-OS defaults when unset. Scrubs ambient environment variables and pins the
+# toolchain, module proxy, architecture level, and linker flags.
 set -eu
 
 out=${1:?usage: repro-build.sh OUTPUT [PACKAGE]}
@@ -28,6 +28,27 @@ buildmode=exe
 if [ "$goos" = "android" ]; then
 	buildmode=pie
 fi
+case "$goos" in
+linux|windows)
+	default_goamd64=v2
+	;;
+*)
+	default_goamd64=v1
+	;;
+esac
+case "$goos" in
+darwin)
+	default_goarm64=v8.4
+	;;
+windows)
+	default_goarm64=v8.1
+	;;
+*)
+	default_goarm64=v8.0
+	;;
+esac
+goamd64=${GOAMD64:-$default_goamd64}
+goarm64=${GOARM64:-$default_goarm64}
 
 mkdir -p -- "$(dirname -- "$out")"
 out_abs="$(CDPATH= cd -- "$(dirname -- "$out")" && pwd)/$(basename -- "$out")"
@@ -54,8 +75,8 @@ set -- \
 	CGO_ENABLED=0 \
 	GOOS="$goos" \
 	GOARCH="$goarch" \
-	GOAMD64=v1 \
-	GOARM64=v8.0 \
+	GOAMD64="$goamd64" \
+	GOARM64="$goarm64" \
 	GO386=sse2 \
 	GOARM=7
 if [ -n "${SYSTEMROOT:-}" ]; then

@@ -2,6 +2,18 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+This release raises default Go microarchitecture baselines per target OS and adds an ARMv8.2 LSE release archive for Linux (#138). It also prints the compiled architecture level in `rungv version` and eliminates timing-sensitive flaky tests (#137, #138).
+
+### Build
+
+- **Per-target microarchitecture baselines and `linux/arm64v8.2` LSE archive** (#138): `scripts/repro-build.sh` defaults to `GOARM64=v8.4` on `darwin/arm64`, `GOARM64=v8.1` on `windows/arm64`, and `GOAMD64=v2` on `linux/amd64` and `windows/amd64`. `linux/arm64` and `android/arm64` remain at `GOARM64=v8.0`, and explicit `GOAMD64` or `GOARM64` variables override those defaults. `.github/workflows/release.yml` also publishes `rungv-<tag>-linux-arm64v8.2.tar.gz` (`GOARM64=v8.2`), and `rungv version` prints the architecture level.
+
+### Tests
+
+- **Flaky timing, port-reuse, and VMA assertions** (#137): unit tests and `e2e` probes now use deterministic clocks, bound UDP sockets, and explicit barriers. `idle_stubs_xplat_test.go` also verifies exact `memfd:` VMA line and byte counts.
+
 ## [v0.12.10032026110200] - 2026-11-11
 
 This release updates the Go toolchain to `1.27.4` across all modules and CI workflows (#135). It also enforces deterministic stripped Go builds and verifies SHA-256 parity inside a `gvx` container (#135, #136).

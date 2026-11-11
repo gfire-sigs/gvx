@@ -218,7 +218,7 @@ func main() {
 
 ### 3.4 Install from Release Archives
 
-Each GitHub release provides prebuilt archives for all five supported platforms, a `SHA256SUMS` file, and a Sigstore build provenance bundle (`rungv-TAG.sigstore.json`).
+Each GitHub release provides prebuilt archives for all five supported platforms, a `SHA256SUMS` file, and a Sigstore build provenance bundle (`rungv-TAG.sigstore.json`). Each release also publishes `rungv-TAG-linux-arm64v8.2.tar.gz` with inline LSE atomics for ARMv8.2+ Linux hosts.
 
 > [!IMPORTANT]
 > The macOS release binary uses an ad-hoc signature with the hypervisor entitlement rather than Apple notarization. Clear the macOS quarantine attribute with `xattr` after downloading the archive in a browser.
