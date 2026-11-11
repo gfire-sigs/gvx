@@ -50,7 +50,7 @@ type backend interface {
 	// mapGPA maps size bytes of host memory at host into the guest physical
 	// space at gpa. The range must not overlap an existing mapping. No caller
 	// replaces a mapping.
-	mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint32) error
+	mapGPA(host uintptr, gpa, size uint64, flags uint32) error
 
 	// unmapGPA removes the mapping that a call of mapGPA made at gpa. The
 	// size must equal the size of that call.
@@ -88,10 +88,11 @@ var errXsaveBufferSmall = errors.New("whpx: XSAVE state buffer is too small")
 
 // hostFeatures lists the capability facts that gate startup.
 type hostFeatures struct {
-	hypervisorPresent bool
-	arm64Support      bool
-	windowsBuild      uint32
-	windowsUBR        uint32
+	hypervisorPresent   bool
+	arm64Support        bool
+	windowsBuild        uint32
+	windowsUBR          uint32
+	physicalAddressBits uint32
 
 	// xsaveFeatures is the WHV_PROCESSOR_XSAVE_FEATURES capability of an
 	// amd64 host.
@@ -101,7 +102,8 @@ type hostFeatures struct {
 // partitionConfig lists the properties that createPartition sets before
 // WHvSetupPartition.
 type partitionConfig struct {
-	vpCount uint32
+	vpCount             uint32
+	physicalAddressBits uint32
 
 	// xsaveFeatures is the ProcessorXsaveFeatures property of an amd64
 	// partition.
@@ -114,7 +116,8 @@ type partitionConfig struct {
 
 // partitionInfo describes a created partition.
 type partitionInfo struct {
-	vpCount uint32
+	vpCount             uint32
+	physicalAddressBits uint32
 
 	// xsaveFeatures is the ProcessorXsaveFeatures property that an amd64
 	// partition reports after setup.

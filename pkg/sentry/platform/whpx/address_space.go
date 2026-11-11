@@ -25,19 +25,24 @@ import (
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
+// hostBlockFile allows unit tests to supply explicit 64-bit host virtual
+// addresses without constructing invalid Go pointers.
+type hostBlockFile interface {
+	hostBlocks(fr memmap.FileRange, at hostarch.AccessType) ([]hvcommon.HostBlock, error)
+}
+
 // AddressSpace implements platform.AddressSpace with its own guest page
-// tables.
+// tables and reference-counted Stage-2 region tracking.
 //
-// MapFile asks Platform.mem for the guest physical ranges of the host blocks.
-// The partition keeps those ranges mapped. MapFile then writes one run of
-// leaf entries for each contiguous range. Unmap only clears entries. The
-// kernel region comes from the shared upper half. Unmap and any change of an
-// existing entry stop every processor that may hold the old translation
-// before the call returns. The Sentry reuses a page only after its entry is
-// gone, so the guest cannot reach a reused page. The Sentry reads and writes
-// guest memory through its own host mappings, not through this type.
+// MapFile resolves Stage-2 GPA runs owned by each memmap.File through
+// Platform.mem and installs 4KB or 2MiB Stage-1 leaf entries. Persistent
+// ChunkedFile regions stay mapped across Unmap and Release until evicted or
+// closed. Non-persistent file regions release their Stage-2 mappings through
+// WHvUnmapGpaRange once all referencing guest page-table entries clear and all
+// active virtual processors flush their TLBs.
 type AddressSpace struct {
 	platform.NoAddressSpaceIO
 
@@ -46,8 +51,11 @@ type AddressSpace struct {
 	alloc *ptAllocator
 	pt    *pagetables.PageTables
 
-	// mu guards the page tables and released.
+	// mu guards pt, regions, and released. Callers acquire mu before
+	// Platform.mem.inner.mu so extent updates in regions and reference updates
+	// in RegionMap execute atomically.
 	mu       sync.Mutex
+	regions  hvcommon.RegionUser
 	released bool
 
 	// gen counts invalidations. A virtual processor flushes its TLB when its
@@ -121,17 +129,8 @@ func (as *AddressSpace) checkRange(addr hostarch.Addr, length uint64) error {
 	return nil
 }
 
-// chunkedFile is a memmap.File whose whole range stays mapped in host memory
-// with write access for the life of the file. pgalloc.MemoryFile is the only
-// implementation. The hvf backend recognizes it the same way.
-type chunkedFile interface {
-	memmap.File
-	// TotalSize returns the size of the host mapped range from offset 0.
-	TotalSize() uint64
-}
-
 func isChunkedFile(f memmap.File) bool {
-	_, ok := f.(chunkedFile)
+	_, ok := f.(hvcommon.ChunkedFile)
 	return ok
 }
 
@@ -143,28 +142,56 @@ func (as *AddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	if err := as.checkRange(addr, fr.Length()); err != nil {
 		return err
 	}
-	// A memory file keeps every chunk mapped with write access, whatever the
-	// guest may do with a page. The partition registers that memory once and
-	// writable, and the page-table entries of install enforce a read-only
-	// mapping. Any other file registers writable only when the request writes.
 	hostWrite := at.Write || isChunkedFile(f)
-	bs, err := f.MapInternal(fr, hostarch.AccessType{Read: true, Write: hostWrite})
-	if err != nil {
-		return err
-	}
-	if bs.NumBytes() != fr.Length() {
-		return fmt.Errorf("whpx: MapInternal returned %d bytes for a range of %d bytes", bs.NumBytes(), fr.Length())
-	}
-	var buf [4]gpaRun
-	runs := buf[:0]
-	for !bs.IsEmpty() {
-		runs, err = as.p.mem.resolve(bs.Head().ToSlice(), hostWrite, runs)
+	hostAT := hostarch.AccessType{Read: true, Write: hostWrite}
+
+	var (
+		blocks    []hvcommon.HostBlock
+		useBlocks bool
+	)
+	if hf, ok := f.(hostBlockFile); ok {
+		var err error
+		blocks, err = hf.hostBlocks(fr, hostAT)
 		if err != nil {
 			return err
 		}
-		bs = bs.Tail()
+		var total uint64
+		for _, b := range blocks {
+			total += uint64(b.Len)
+		}
+		if total != fr.Length() {
+			return fmt.Errorf("whpx: hostBlocks returned %d bytes for a range of %d bytes", total, fr.Length())
+		}
+		useBlocks = true
 	}
-	return as.install(addr, runs, at)
+
+	if !useBlocks {
+		mapped, err := f.MapInternal(fr, hostAT)
+		if err != nil {
+			return err
+		}
+		if mapped.NumBytes() != fr.Length() {
+			return fmt.Errorf("whpx: MapInternal returned %d bytes for a range of %d bytes", mapped.NumBytes(), fr.Length())
+		}
+		blocks = hvcommon.HostBlocksFromSeq(mapped)
+	}
+
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released {
+		return platform.SegmentationFault{Addr: addr}
+	}
+	runs, err := as.p.mem.resolvePinnedBlocks(&as.regions, f, blocks, hostWrite)
+	if err != nil {
+		return err
+	}
+	if err := as.installLocked(addr, runs, at); err != nil {
+		as.p.mem.finishPin(runs, nil, nil)
+		return err
+	}
+	acquired, dropped := as.regions.RecordRuns(uint64(addr), runs)
+	as.p.mem.finishPin(runs, acquired, dropped)
+	return nil
 }
 
 // mapHost maps a page-aligned host slice at addr. Tests use it to map memory
@@ -173,22 +200,21 @@ func (as *AddressSpace) mapHost(addr hostarch.Addr, data []byte, at hostarch.Acc
 	if err := as.checkRange(addr, uint64(len(data))); err != nil {
 		return err
 	}
-	runs, err := as.p.mem.resolve(data, at.Write, nil)
-	if err != nil {
-		return err
-	}
-	return as.install(addr, runs, at)
-}
-
-// install writes the page-table entries of runs, which cover consecutive
-// pages from addr. A change of an existing entry stops the processors before
-// install returns.
-func (as *AddressSpace) install(addr hostarch.Addr, runs []gpaRun, at hostarch.AccessType) error {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.released {
 		return platform.SegmentationFault{Addr: addr}
 	}
+	runs, err := as.p.mem.resolveRaw(&as.regions, data, at.Write)
+	if err != nil {
+		return err
+	}
+	return as.installLocked(addr, runs, at)
+}
+
+// installLocked writes the page-table entries of runs under as.mu. Any
+// overwritten entry flushes active processors before installLocked returns.
+func (as *AddressSpace) installLocked(addr hostarch.Addr, runs []gpaRun, at hostarch.AccessType) error {
 	if err := as.alloc.Reserve(ptReserveForRuns(runs)); err != nil {
 		return fmt.Errorf("whpx: reserve page tables: %w", err)
 	}
@@ -225,9 +251,6 @@ func (as *AddressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if end <= start {
 		return
 	}
-	// A range that starts or ends inside a large entry splits the entry. The
-	// split needs page-table pages. A failure here leaves entries that the
-	// guest can still use, so it stops the program.
 	if err := as.alloc.Reserve(ptSplitReserve); err != nil {
 		log.Warningf("whpx: %v", err)
 		panic(fmt.Sprintf("whpx: cannot reserve page tables to unmap guest memory: %v", err))
@@ -236,13 +259,15 @@ func (as *AddressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if removed || as.alloc.Quarantined() > 0 {
 		as.invalidate()
 	}
+	dropped := as.regions.ClearRange(start, end)
+	as.p.mem.releaseRegions(dropped)
 }
 
 // Release implements platform.AddressSpace.Release.
 func (as *AddressSpace) Release() {
 	as.mu.Lock()
-	defer as.mu.Unlock()
 	if as.released {
+		as.mu.Unlock()
 		return
 	}
 	as.released = true
@@ -251,6 +276,8 @@ func (as *AddressSpace) Release() {
 	as.invalidate()
 	as.forgetIdleRoots()
 	as.alloc.Drain()
+	as.p.mem.release(&as.regions)
+	as.mu.Unlock()
 }
 
 // forgetIdleRoots invalidates the state of every idle processor that still

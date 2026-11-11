@@ -140,17 +140,19 @@ const (
 
 // WHV_CAPABILITY_CODE and WHV_PARTITION_PROPERTY_CODE values.
 const (
-	capCodeHypervisorPresent uint32 = 0x00000000
-	capCodeFeatures          uint32 = 0x00000001
-	capCodeProcessorFeatures uint32 = 0x00001001
-	capCodeXsaveFeatures     uint32 = 0x00001003
-	capCodeGicLpiIntIdBits   uint32 = 0x00002011
+	capCodeHypervisorPresent    uint32 = 0x00000000
+	capCodeFeatures             uint32 = 0x00000001
+	capCodeProcessorFeatures    uint32 = 0x00001001
+	capCodeXsaveFeatures        uint32 = 0x00001003
+	capCodePhysicalAddressWidth uint32 = 0x0000100A
+	capCodeGicLpiIntIdBits      uint32 = 0x00002011
 
-	propCodeProcessorFeatures  uint32 = 0x00001001
-	propCodeXsaveFeatures      uint32 = 0x00001006
-	propCodeProcessorCount     uint32 = 0x00001FFF
-	propCodeLocalApicEmulation uint32 = 0x00001005
-	propCodeArm64IcParameters  uint32 = 0x00001012
+	propCodeProcessorFeatures    uint32 = 0x00001001
+	propCodeLocalApicEmulation   uint32 = 0x00001005
+	propCodeXsaveFeatures        uint32 = 0x00001006
+	propCodePhysicalAddressWidth uint32 = 0x00001011
+	propCodeArm64IcParameters    uint32 = 0x00001012
+	propCodeProcessorCount       uint32 = 0x00001FFF
 )
 
 // a64ICParameters follows WHV_ARM64_IC_PARAMETERS in WinHvPlatformDefs.h.

@@ -30,6 +30,8 @@ const regBatchCap = 48
 // archInit sets global state. The arm64 page tables need none.
 func archInit() {}
 
+func hostCPUPABits() uint32 { return 0 }
+
 // hostVectorState is the amd64 XSAVE source. An arm64 partition has no XSAVE
 // state, so newPlatform never calls it.
 func hostVectorState() (*xsaveLayout, int) { return nil, 0 }
@@ -80,7 +82,7 @@ func (v *vcpu) archBringUp() error {
 	b.reset()
 	b.add64(a64RegGicrBase, a64GicRedistBase+uint64(v.index)*a64GicRedistSize)
 	b.add64(a64RegMair, a64Mair)
-	b.add64(a64RegTcr, a64TCR)
+	b.add64(a64RegTcr, a64TCRForBits(p.gpaBits))
 	b.add64(a64RegTtbr0, p.kernel.pt.TTBR0_EL1(false, 0))
 	b.add64(a64RegTtbr1, p.kernel.pt.TTBR1_EL1(false, 0))
 	b.add64(a64RegCpacr, a64CpacrNoTrap)

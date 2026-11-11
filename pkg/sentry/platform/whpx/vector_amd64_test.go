@@ -58,6 +58,20 @@ func cpuinfoFlags(fs cpuid.FeatureSet) string {
 	return ""
 }
 
+func TestHostCPUPABitsInitializesCPUID(t *testing.T) {
+	bits := hostCPUPABits()
+	if bits < 36 || bits > 57 {
+		t.Fatalf("hostCPUPABits() = %d, want a physical address width in [36, 57]", bits)
+	}
+	fb := newFakeBackend()
+	fb.feats.physicalAddressBits = 48
+	p := newTestPlatform(t, fb, Options{xsaveLayout: testXsaveLayout(), fpLimit: testFPLimit})
+	wantEnd := uint64(1) << selectGPABits(false, 48, bits)
+	if p.gpaEnd != wantEnd {
+		t.Fatalf("p.gpaEnd = %#x, want %#x", p.gpaEnd, wantEnd)
+	}
+}
+
 func TestGuestFeatureSetMatchesTheAVX512Partition(t *testing.T) {
 	p := newTestPlatform(t, newFakeBackend(), Options{xsaveLayout: testXsaveLayout(), fpLimit: testFPLimit})
 	gfs := p.GuestFeatureSet(testHostFeatures())

@@ -106,21 +106,21 @@ func buildKernelRegion(be backend, gpa *gpaAllocator, pool *ptPool, arm64 bool, 
 	if kr.codeGPA, err = gpa.allocPage(); err != nil {
 		return kr, err
 	}
-	if err = be.mapGPA(unsafe.Pointer(&codePage[0]), kr.codeGPA, pageSize, mapFlagRead|mapFlagExecute); err != nil {
+	if err = be.mapGPA(uintptr(unsafe.Pointer(&codePage[0])), kr.codeGPA, pageSize, mapFlagRead|mapFlagExecute); err != nil {
 		return kr, fmt.Errorf("whpx: map stub code page: %w", err)
 	}
 	if !arm64 {
 		if kr.sysGPA, err = gpa.allocPage(); err != nil {
 			return kr, err
 		}
-		if err = be.mapGPA(unsafe.Pointer(&sysPage[0]), kr.sysGPA, pageSize, mapFlagRead); err != nil {
+		if err = be.mapGPA(uintptr(unsafe.Pointer(&sysPage[0])), kr.sysGPA, pageSize, mapFlagRead); err != nil {
 			return kr, fmt.Errorf("whpx: map descriptor table page: %w", err)
 		}
 	}
 	if kr.commGPA, err = gpa.allocRun(slots); err != nil {
 		return kr, err
 	}
-	if err = be.mapGPA(unsafe.Pointer(&kr.commMem[0]), kr.commGPA, uint64(slots)*pageSize, mapFlagRead|mapFlagWrite); err != nil {
+	if err = be.mapGPA(uintptr(unsafe.Pointer(&kr.commMem[0])), kr.commGPA, uint64(slots)*pageSize, mapFlagRead|mapFlagWrite); err != nil {
 		return kr, fmt.Errorf("whpx: map CommPages: %w", err)
 	}
 

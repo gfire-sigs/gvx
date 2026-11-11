@@ -37,7 +37,7 @@ func newFakeVM(t testing.TB) (*vmState, *fakeStage2) {
 	}
 	t.Cleanup(vm.releaseSlabs)
 	be := &fakeStage2{}
-	vm.regions.be = be
+	vm.regions.setBackend(be)
 	return vm, be
 }
 

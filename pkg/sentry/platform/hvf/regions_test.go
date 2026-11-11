@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 const (
@@ -88,21 +89,6 @@ func (f *fakeStage2) counts() (maps, unmaps int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.maps), len(f.unmaps)
-}
-
-// copyCount returns the number of regions that hold a private copy.
-func (m *regionMap) copyCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	n := 0
-	for _, o := range m.owners {
-		for _, r := range o.regions {
-			if r.copied != nil {
-				n++
-			}
-		}
-	}
-	return n
 }
 
 // alignedMem returns size bytes of host memory at a host page boundary.
@@ -376,15 +362,13 @@ func TestReadOnlyMemoryGetsACopyForReadsOnly(t *testing.T) {
 }
 
 // copiedRegion returns the only region of f, which must hold a private copy.
-func copiedRegion(t *testing.T, m *regionMap, f memmap.File) *region {
+func copiedRegion(t *testing.T, m *regionMap, f memmap.File) *hvcommon.Region {
 	t.Helper()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	o := m.owners[f]
-	if o == nil || len(o.regions) != 1 || o.regions[0].copied == nil {
-		t.Fatalf("want one region with a private copy, owner = %+v", o)
+	rs := m.inner.RegionsOfForTest(f)
+	if len(rs) != 1 || rs[0].Copied() == nil {
+		t.Fatalf("want one region with a private copy, regions = %+v", rs)
 	}
-	return o.regions[0]
+	return rs[0]
 }
 
 // patternMem returns host memory in which no byte is zero, so a copy of memory
@@ -418,17 +402,18 @@ func TestPrivateCopyHoldsOnlyTheBytesOfTheBlock(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 	r := copiedRegion(t, m, file)
-	off := uintptr(unsafe.Pointer(&mem[lo])) - r.host
-	if off != 4<<10 || r.size != testGranule {
-		t.Fatalf("the block lies at %#x in a region of %#x bytes, want %#x in %#x", off, r.size, 4<<10, testGranule)
+	off := uintptr(unsafe.Pointer(&mem[lo])) - r.Host()
+	if off != 4<<10 || r.Size() != testGranule {
+		t.Fatalf("the block lies at %#x in a region of %#x bytes, want %#x in %#x", off, r.Size(), 4<<10, testGranule)
 	}
-	if len(segs) != 1 || segs[0].GPA != r.ipa+uint64(off) || segs[0].Size != hi-lo {
-		t.Errorf("segments %+v, want one segment of the block at ipa %#x", segs, r.ipa+uint64(off))
+	if len(segs) != 1 || segs[0].GPA != r.GPA()+uint64(off) || segs[0].Size != hi-lo {
+		t.Errorf("segments %+v, want one segment of the block at ipa %#x", segs, r.GPA()+uint64(off))
 	}
-	if !bytes.Equal(r.copied[off:off+(hi-lo)], mem[lo:hi]) {
+	copied := r.Copied()
+	if !bytes.Equal(copied[off:off+(hi-lo)], mem[lo:hi]) {
 		t.Error("the copy differs from the block")
 	}
-	for i, b := range r.copied {
+	for i, b := range copied {
 		if uintptr(i) >= off && uintptr(i) < off+(hi-lo) {
 			continue
 		}
@@ -459,9 +444,10 @@ func TestAnotherBlockOfACopiedRegionGetsItsOwnBytes(t *testing.T) {
 		t.Fatalf("copies = %d, regions with a copy = %d, want one of each", be.copies, m.copyCount())
 	}
 	r := copiedRegion(t, m, file)
-	for page := uintptr(0); page < r.size; page += 4 << 10 {
+	copied := r.Copied()
+	for page := uintptr(0); page < r.Size(); page += 4 << 10 {
 		src := mem[16<<10+page : 16<<10+page+4<<10]
-		want := bytes.Equal(r.copied[page:page+4<<10], src)
+		want := bytes.Equal(copied[page:page+4<<10], src)
 		asked := page == 4<<10 || page == 8<<10
 		if want != asked {
 			t.Errorf("page %#x of the copy holds the memory = %v, want %v", page, want, asked)
@@ -545,19 +531,20 @@ func TestFreedGuestPhysicalRangesMerge(t *testing.T) {
 	m := newTestRegionMap(&fakeStage2{}, testIPABase+1<<30)
 	var ipas [3]uint64
 	for i := range ipas {
-		ipa, err := m.allocIPALocked(testGranule)
+		ipa, err := m.inner.AllocGPAForTest(testGranule)
 		if err != nil {
 			t.Fatal(err)
 		}
 		ipas[i] = ipa
 	}
-	m.freeIPALocked(ipas[0], testGranule)
-	m.freeIPALocked(ipas[2], testGranule)
-	m.freeIPALocked(ipas[1], testGranule)
-	if len(m.free) != 0 || m.next != testIPABase {
-		t.Errorf("free list %+v and next %#x, want an empty list and the base address: the ranges must merge", m.free, m.next)
+	m.inner.FreeGPAForTest(ipas[0], testGranule)
+	m.inner.FreeGPAForTest(ipas[2], testGranule)
+	m.inner.FreeGPAForTest(ipas[1], testGranule)
+	free, next := m.inner.AllocatorStateForTest()
+	if len(free) != 0 || next != testIPABase {
+		t.Errorf("free list %+v and next %#x, want an empty list and the base address: the ranges must merge", free, next)
 	}
-	if ipa, _ := m.allocIPALocked(3 * testGranule); ipa != testIPABase {
+	if ipa, _ := m.inner.AllocGPAForTest(3 * testGranule); ipa != testIPABase {
 		t.Errorf("a run of three granules starts at %#x, want %#x", ipa, testIPABase)
 	}
 }

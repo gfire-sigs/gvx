@@ -128,7 +128,7 @@ func TestNewPlatformMapsTheKernelRegion(t *testing.T) {
 		}
 	}
 	for gpa := range fb.mapped {
-		if gpa < gpaWindowBase || gpa >= gpaWindowEnd {
+		if gpa < gpaWindowBase || gpa >= p.gpaEnd {
 			t.Errorf("mapping at %#x is outside the guest physical window", gpa)
 		}
 	}

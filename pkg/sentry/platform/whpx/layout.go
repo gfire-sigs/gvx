@@ -33,24 +33,19 @@ const (
 	maxUserAddrX64 = hvcommon.MaxUserAddrX64
 	maxUserAddrA64 = hvcommon.MaxUserAddrA64
 
-	// Guest physical addresses stay below 64 GiB, so every host with a
-	// physical address width of 36 bits or more can back them. The first GiB
-	// contains no RAM, leaving space for interrupt controllers.
-	gpaWindowBase = 1 << 30
-	gpaWindowEnd  = 1 << 36
+	// gpaWindowBase leaves the first GiB of guest physical space unbacked by
+	// RAM for interrupt controllers and the EL1 notification page.
+	// minGPABits and maxGPABits bound the partition GPA width between 64 GiB
+	// and 1 TiB according to the host physical address width.
+	gpaWindowBase   = 1 << 30
+	minGPABits      = 36
+	maxGPABits      = 40
+	minGPAWindowEnd = 1 << minGPABits
+	maxGPAWindowEnd = 1 << maxGPABits
 
-	// gpaTableEnd ends the zone of the kernel region and of the page-table
-	// slabs. The zone is 4 GiB. The zone for guest memory follows it up to
-	// gpaWindowEnd. A multiple of arenaSize keeps every arena aligned.
+	// gpaTableEnd ends the 4 GiB zone for the kernel region and page-table
+	// slabs. Guest file and memory-file regions occupy [gpaTableEnd, gpaEnd).
 	gpaTableEnd = gpaWindowBase + 4<<30
-
-	// arenaShift and arenaSize set the host window of one arena. An arena
-	// owns a guest physical window of the same size and maps a host address
-	// to the same offset inside it. A host range inside one arena stays
-	// contiguous in guest physical memory.
-	arenaShift = 26
-	arenaSize  = 1 << arenaShift
-	arenaMask  = arenaSize - 1
 
 	// maxVPs caps the virtual processors of one partition.
 	maxVPs = 64
@@ -191,4 +186,21 @@ func (k kernelLayout) sys() uint64 { return k.base + kernelSysOff }
 // comm returns the address of the CommPage of virtual processor slot.
 func (k kernelLayout) comm(slot int) uint64 {
 	return k.base + kernelCommOff + uint64(slot)*pageSize
+}
+
+// selectGPABits chooses the partition guest physical address width in
+// [minGPABits, maxGPABits] from the hypervisor capability and CPU limit.
+func selectGPABits(arm64 bool, capBits, cpuBits uint32) uint32 {
+	bits := capBits
+	if bits == 0 {
+		bits = minGPABits
+	}
+	if cpuBits != 0 && cpuBits < bits {
+		bits = cpuBits
+	}
+	bits = min(max(bits, minGPABits), maxGPABits)
+	if arm64 && bits < 40 {
+		return minGPABits
+	}
+	return bits
 }
