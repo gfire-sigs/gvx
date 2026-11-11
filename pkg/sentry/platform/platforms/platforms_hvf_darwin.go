@@ -12,32 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build windows
+//go:build darwin
 
-package sighandling
+package platforms
 
 import (
-	"os"
-
-	"z.gfire.dev/gvx/internal/xsys/unix"
+	// Register the Hypervisor.framework platform backend.
+	_ "z.gfire.dev/gvx/pkg/sentry/platform/hvf"
 )
-
-// IgnoreChildStop is a no-op on Windows.
-func IgnoreChildStop() error {
-	return nil
-}
-
-// ReplaceSignalHandler records the requested handler on Windows where fault
-// interception uses AddVectoredExceptionHandler.
-func ReplaceSignalHandler(_ unix.Signal, handler uintptr, previous *uintptr) error {
-	if previous != nil {
-		*previous = handler
-	}
-	return nil
-}
-
-// KillItself terminates the current process immediately.
-func KillItself() error {
-	os.Exit(137)
-	return nil
-}

@@ -26,7 +26,7 @@ import (
 
 // linuxErrnoErrors maps a Linux errno to the Error that newWithHost registered
 // for it.
-var linuxErrnoErrors [maxErrno]*Error
+var linuxErrnoErrors [maxLinuxABI]*Error
 
 // registerLinuxErrno records e as the Error for a Linux errno. The first
 // registration of an errno wins, as it does for host translations.

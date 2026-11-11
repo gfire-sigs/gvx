@@ -95,7 +95,7 @@ type linuxBackwardsTranslation struct {
 }
 
 // TODO(b/34162363): Remove this.
-var linuxBackwardsTranslations [maxErrno]linuxBackwardsTranslation
+var linuxBackwardsTranslations [maxLinuxABI]linuxBackwardsTranslation
 
 // ToError translates an Error to a corresponding error value.
 //

@@ -15,12 +15,15 @@
 package syserr
 
 import (
+	"bytes"
 	"testing"
+	"unsafe"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux/errno"
 	"z.gfire.dev/gvx/pkg/errors"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/safecopy"
 )
 
 // linuxErrorFor returns the linuxerr error for a Linux errno, or nil when the
@@ -83,9 +86,9 @@ func TestFromErrorNamesTheCommonErrors(t *testing.T) {
 func TestFromErrorKeepsAnErrnoThatHasNoHostName(t *testing.T) {
 	// No syserr value owns errno 133 (EHWPOISON) on every host, so the lookup
 	// falls back to a dynamic error that still carries the number.
-	got := fromLinuxErrno(errno.Errno(maxErrno - 1))
-	if got.ToLinux() != errno.Errno(maxErrno-1) {
-		t.Fatalf("fromLinuxErrno(%d).ToLinux() = %d", maxErrno-1, got.ToLinux())
+	got := fromLinuxErrno(errno.Errno(maxLinuxABI - 1))
+	if got.ToLinux() != errno.Errno(maxLinuxABI-1) {
+		t.Fatalf("fromLinuxErrno(%d).ToLinux() = %d", maxLinuxABI-1, got.ToLinux())
 	}
 }
 
@@ -205,5 +208,40 @@ func TestInterruptedErrorConvertsToRestart(t *testing.T) {
 	}
 	if got := linuxerr.ConvertIntr(ErrInterrupted.ToError(), linuxerr.ERESTARTSYS); got != linuxerr.ERESTARTSYS {
 		t.Errorf("ConvertIntr(ErrInterrupted.ToError()) = %v, want ERESTARTSYS", got)
+	}
+}
+
+// TestSafecopyErrorsUnwrapToEFAULT verifies that fault errors from safecopy
+// unwrap to EFAULT and that CopyIn and CopyOut transfer bytes on every host.
+func TestSafecopyErrorsUnwrapToEFAULT(t *testing.T) {
+	var raw [2]uint32
+	_, alignErr := safecopy.LoadUint32(unsafe.Add(unsafe.Pointer(&raw[0]), 1))
+	if alignErr == nil {
+		t.Fatal("LoadUint32 on unaligned pointer succeeded, want AlignmentError")
+	}
+	errs := []error{
+		safecopy.SegvError{Addr: 0x1000},
+		safecopy.BusError{Addr: 0x2000},
+		alignErr,
+	}
+	for _, err := range errs {
+		if got, ok := linuxerr.TranslateError(err); !ok || got != linuxerr.EFAULT {
+			t.Errorf("linuxerr.TranslateError(%T) = (%v, %v), want (EFAULT, true)", err, got, ok)
+		}
+		if got := FromError(err).ToLinux(); got != errno.EFAULT {
+			t.Errorf("FromError(%T).ToLinux() = %d, want EFAULT", err, got)
+		}
+	}
+
+	src := []byte("safecopy-roundtrip")
+	dst := make([]byte, len(src))
+	n, err := safecopy.CopyIn(dst, unsafe.Pointer(&src[0]))
+	if err != nil || n != len(src) || !bytes.Equal(dst, src) {
+		t.Fatalf("CopyIn = (%d, %v), dst=%q, want (%d, nil), %q", n, err, dst, len(src), src)
+	}
+	clear(dst)
+	n, err = safecopy.CopyOut(unsafe.Pointer(&dst[0]), src)
+	if err != nil || n != len(src) || !bytes.Equal(dst, src) {
+		t.Fatalf("CopyOut = (%d, %v), dst=%q, want (%d, nil), %q", n, err, dst, len(src), src)
 	}
 }

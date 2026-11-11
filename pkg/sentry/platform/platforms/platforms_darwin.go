@@ -18,8 +18,3 @@
 package platforms
 
 // This file makes the platforms package buildable on Darwin.
-
-import (
-	// Register the Hypervisor.framework backend.
-	_ "z.gfire.dev/gvx/pkg/sentry/platform/hvf"
-)
