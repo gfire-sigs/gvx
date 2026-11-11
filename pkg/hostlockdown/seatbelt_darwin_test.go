@@ -14,12 +14,14 @@
 
 //go:build darwin
 
-package hostlockdown
+package hostlockdown_test
 
 import (
 	"slices"
 	"strings"
 	"testing"
+
+	. "z.gfire.dev/gvx/pkg/hostlockdown"
 )
 
 func profileLines(profile string) []string {

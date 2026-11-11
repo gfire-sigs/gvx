@@ -16,6 +16,7 @@ package systrap
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ func TestQuarantineStaysBoundedWhileAThreadRunsGuestCode(t *testing.T) {
 		if time.Now().After(waitOnline) {
 			t.Fatal("the spinning thread never went online")
 		}
-		time.Sleep(time.Millisecond)
+		runtime.Gosched()
 	}
 
 	fastTraps := func() uint64 { return fastStats(t, r).traps.Load() }

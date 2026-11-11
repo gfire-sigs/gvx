@@ -21,7 +21,6 @@ import (
 	"os"
 	"strconv"
 	"testing"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -264,7 +263,6 @@ func TestProbeStubLayout(t *testing.T) {
 			t.Fatal(err)
 		}
 		sp.destroy()
-		time.Sleep(time.Millisecond)
 	}
 	for k, c := range identity {
 		fmt.Printf("PROBEIDENT %s count=%d\n", k, c)

@@ -17,6 +17,7 @@ package systrap
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -195,7 +196,10 @@ func TestDropAndPatchAgainWhileThreadsTrapThroughTheSlots(t *testing.T) {
 			si, _, err := shifter.run()
 			mustSyscall(t, si, err, 77, shifter.ac)
 		}
-		time.Sleep(200 * time.Microsecond)
+		before := traps.Load()
+		for traps.Load() == before && time.Now().Before(deadline) && len(errs) == 0 {
+			runtime.Gosched()
+		}
 	}
 	stop.Store(true)
 	wg.Wait()

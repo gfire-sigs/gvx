@@ -16,6 +16,7 @@ package tcp_test
 
 import (
 	"io"
+	"runtime"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ const (
 
 // newLoopbackStack returns a stack with one loopback NIC and a listener on
 // serverPort.
-func newLoopbackStack(t *testing.T) (*stack.Stack, tcpip.Endpoint) {
+func newLoopbackStack(t *testing.T) (*stack.Stack, tcpip.Endpoint, *waiter.Queue) {
 	t.Helper()
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
@@ -52,8 +53,8 @@ func newLoopbackStack(t *testing.T) (*stack.Stack, tcpip.Endpoint) {
 		t.Fatalf("AddProtocolAddress: %s", err)
 	}
 	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
-	var wq waiter.Queue
-	l, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	wq := new(waiter.Queue)
+	l, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, wq)
 	if err != nil {
 		t.Fatalf("NewEndpoint: %s", err)
 	}
@@ -64,7 +65,7 @@ func newLoopbackStack(t *testing.T) (*stack.Stack, tcpip.Endpoint) {
 		t.Fatalf("Listen: %s", err)
 	}
 	t.Cleanup(l.Close)
-	return s, l
+	return s, l, wq
 }
 
 // bindWithRetry binds c to addr. The release of a closed client endpoint runs in
@@ -76,7 +77,7 @@ func bindWithRetry(c tcpip.Endpoint, addr tcpip.FullAddress) tcpip.Error {
 		if _, inUse := err.(*tcpip.ErrPortInUse); err == nil || !inUse || time.Now().After(deadline) {
 			return err
 		}
-		time.Sleep(10 * time.Millisecond)
+		runtime.Gosched()
 	}
 }
 
@@ -84,7 +85,7 @@ func bindWithRetry(c tcpip.Endpoint, addr tcpip.FullAddress) tcpip.Error {
 // that Bind gave the port clientPort on the address bindAddr to peer, lets the
 // server close first, and closes the client. It returns the error of the Bind
 // call.
-func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, netProto tcpip.NetworkProtocolNumber, bindAddr, peer tcpip.Address) tcpip.Error {
+func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, lwq *waiter.Queue, netProto tcpip.NetworkProtocolNumber, bindAddr, peer tcpip.Address) tcpip.Error {
 	t.Helper()
 	var wq waiter.Queue
 	c, err := s.NewEndpoint(tcp.ProtocolNumber, netProto, &wq)
@@ -95,7 +96,10 @@ func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, netProto tcpip.
 	if err := bindWithRetry(c, tcpip.FullAddress{Addr: bindAddr, Port: clientPort}); err != nil {
 		return err
 	}
-	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+	lwe, lch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	lwq.EventRegister(&lwe)
+	defer lwq.EventUnregister(&lwe)
+	we, ch := waiter.NewChannelEntry(waiter.WritableEvents | waiter.ReadableEvents | waiter.EventHUp | waiter.EventErr)
 	wq.EventRegister(&we)
 	defer wq.EventUnregister(&we)
 	if err := c.Connect(tcpip.FullAddress{Addr: peer, Port: serverPort}); err != nil {
@@ -109,25 +113,35 @@ func connectFrom(t *testing.T, s *stack.Stack, l tcpip.Endpoint, netProto tcpip.
 		}
 	}
 	var server tcpip.Endpoint
-	for i := 0; i < 500 && server == nil; i++ {
-		if ep, _, err := l.Accept(nil); err == nil {
+	for server == nil {
+		ep, _, err := l.Accept(nil)
+		if err == nil {
 			server = ep
-		} else {
-			time.Sleep(10 * time.Millisecond)
+			break
 		}
-	}
-	if server == nil {
-		t.Fatal("the listener accepted no connection")
+		if _, wouldBlock := err.(*tcpip.ErrWouldBlock); !wouldBlock {
+			t.Fatalf("Accept: %s", err)
+		}
+		select {
+		case <-lch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the listener accepted no connection")
+		}
 	}
 	// The server closes first, so the client never enters TIME_WAIT.
 	server.Close()
-	for i := 0; i < 500; i++ {
-		if _, err := c.Read(io.Discard, tcpip.ReadOptions{}); err != nil {
+	for {
+		_, err := c.Read(io.Discard, tcpip.ReadOptions{})
+		if err != nil {
 			if _, wouldBlock := err.(*tcpip.ErrWouldBlock); !wouldBlock {
 				break
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("client read did not observe peer close")
+		}
 	}
 	return nil
 }
@@ -150,9 +164,9 @@ func TestBindThenConnectReleasesPort(t *testing.T) {
 		{"dual-stack wildcard address to a mapped address", ipv6.ProtocolNumber, tcpip.Address{}, mapped},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, l := newLoopbackStack(t)
+			s, l, lwq := newLoopbackStack(t)
 			for i := 0; i < 3; i++ {
-				if err := connectFrom(t, s, l, tc.netProto, tc.bind, tc.peer); err != nil {
+				if err := connectFrom(t, s, l, lwq, tc.netProto, tc.bind, tc.peer); err != nil {
 					t.Fatalf("connection %d: Bind: %s", i+1, err)
 				}
 			}

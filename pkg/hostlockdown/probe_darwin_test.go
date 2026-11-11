@@ -26,6 +26,15 @@ import (
 // The probes must report failure on an unlocked process. A probe that passes
 // everywhere would let Apply report a lockdown it never enforced.
 
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(TempDir): %v", err)
+	}
+	return dir
+}
+
 func TestProbesRejectUnlockedProcess(t *testing.T) {
 	ws := realTempDir(t)
 	tests := []struct {

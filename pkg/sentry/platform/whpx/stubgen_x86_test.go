@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package whpx
+package whpx_test
 
 import (
 	"encoding/binary"
@@ -21,6 +21,7 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
+	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
 )
 
 // x86Inst is one decoded instruction with its offset in the code page.
@@ -75,7 +76,7 @@ var x86Gprs = map[int]x86asm.Reg{
 }
 
 func TestX64EntrySpillsEveryRegister(t *testing.T) {
-	s, err := buildX64Stubs(kernelBaseX64)
+	s, err := whpx.BuildX64StubsForTest(whpx.KernelBaseX64ForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,14 +93,14 @@ func TestX64EntrySpillsEveryRegister(t *testing.T) {
 	for _, in := range ins[1 : len(ins)-2] {
 		if d, r, ok := gsStore(in); ok {
 			if r == x86asm.RSP {
-				spillRSP = d == commOffSP
+				spillRSP = d == whpx.CommOffSPForTest
 				continue
 			}
 			stored[r] = d
 			continue
 		}
 		if d, r, ok := gsLoad(in); ok && r == x86asm.RSP {
-			loadStack = d == commOffRegs+4*8
+			loadStack = d == whpx.CommOffRegsForTest+4*8
 			continue
 		}
 		t.Errorf("unexpected instruction in the entry path: %v", in.inst)
@@ -111,8 +112,8 @@ func TestX64EntrySpillsEveryRegister(t *testing.T) {
 		t.Error("entry does not load the kernel stack from CommPage.Regs[4]")
 	}
 	for idx, reg := range x86Gprs {
-		if got, ok := stored[reg]; !ok || got != int64(commOffRegs+idx*8) {
-			t.Errorf("register %v is stored at %#x (present %v), want %#x", reg, got, ok, commOffRegs+idx*8)
+		if got, ok := stored[reg]; !ok || got != int64(whpx.CommOffRegsForTest+idx*8) {
+			t.Errorf("register %v is stored at %#x (present %v), want %#x", reg, got, ok, whpx.CommOffRegsForTest+idx*8)
 		}
 	}
 	// SYSCALL clobbers RCX and R11 before the first instruction, so the
@@ -121,16 +122,16 @@ func TestX64EntrySpillsEveryRegister(t *testing.T) {
 		t.Error("RCX is not spilled")
 	}
 	exit := ins[len(ins)-2]
-	if exit.inst.Op != x86asm.MOV || exit.inst.Args[1] != x86asm.Imm(ExitSyscall) {
+	if exit.inst.Op != x86asm.MOV || exit.inst.Args[1] != x86asm.Imm(whpx.ExitSyscall) {
 		t.Errorf("entry writes %v before HLT, want the syscall exit reason", exit.inst)
 	}
-	if m, ok := exit.inst.Args[0].(x86asm.Mem); !ok || m.Disp != commOffExitReason || m.Segment != x86asm.GS {
-		t.Errorf("exit reason is written to %v, want gs:[%#x]", exit.inst.Args[0], commOffExitReason)
+	if m, ok := exit.inst.Args[0].(x86asm.Mem); !ok || m.Disp != whpx.CommOffExitReasonForTest || m.Segment != x86asm.GS {
+		t.Errorf("exit reason is written to %v, want gs:[%#x]", exit.inst.Args[0], whpx.CommOffExitReasonForTest)
 	}
 }
 
 func TestX64ReloadReturnPaths(t *testing.T) {
-	s, err := buildX64Stubs(kernelBaseX64)
+	s, err := whpx.BuildX64StubsForTest(whpx.KernelBaseX64ForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,7 @@ func TestX64ReloadReturnPaths(t *testing.T) {
 	if ins[0].inst.Op != x86asm.TEST || ins[1].inst.Op != x86asm.JE {
 		t.Fatalf("reload starts with %v, %v", ins[0].inst, ins[1].inst)
 	}
-	if d, r, ok := gsLoad(ins[2]); !ok || r != x86asm.RAX || d != commOffRoot {
+	if d, r, ok := gsLoad(ins[2]); !ok || r != x86asm.RAX || d != whpx.CommOffRootForTest {
 		t.Errorf("root load is %v", ins[2].inst)
 	}
 	if ins[3].inst.Op != x86asm.MOV || ins[3].inst.Args[0] != x86asm.CR3 || ins[3].inst.Args[1] != x86asm.RAX {
@@ -175,7 +176,7 @@ func TestX64ReloadReturnPaths(t *testing.T) {
 	for ; i < iret; i++ {
 		if d, r, ok := gsLoad(ins[i]); ok {
 			if r == x86asm.RSP {
-				if d != commOffSP {
+				if d != whpx.CommOffSPForTest {
 					t.Errorf("sysret path loads RSP from %#x", d)
 				}
 				continue
@@ -189,8 +190,8 @@ func TestX64ReloadReturnPaths(t *testing.T) {
 		t.Fatalf("sysret path ends with %v, %v at %d (iret at %d)", ins[i].inst, ins[i+1].inst, i, iret)
 	}
 	for idx, reg := range x86Gprs {
-		if loads[reg] != int64(commOffRegs+idx*8) {
-			t.Errorf("sysret path loads %v from %#x, want %#x", reg, loads[reg], commOffRegs+idx*8)
+		if loads[reg] != int64(whpx.CommOffRegsForTest+idx*8) {
+			t.Errorf("sysret path loads %v from %#x, want %#x", reg, loads[reg], whpx.CommOffRegsForTest+idx*8)
 		}
 	}
 	if sysret := s.Code[ins[i+1].off : ins[i+1].off+3]; sysret[0] != 0x48 || sysret[1] != 0x0F || sysret[2] != 0x07 {
@@ -198,10 +199,10 @@ func TestX64ReloadReturnPaths(t *testing.T) {
 	}
 
 	// IRET path: kernel stack, five pushes in IRET order, registers, SWAPGS, IRETQ.
-	if d, r, ok := gsLoad(ins[iret]); !ok || r != x86asm.RSP || d != commOffRegs+4*8 {
+	if d, r, ok := gsLoad(ins[iret]); !ok || r != x86asm.RSP || d != whpx.CommOffRegsForTest+4*8 {
 		t.Errorf("iret path starts with %v", ins[iret].inst)
 	}
-	wantPush := []int64{commOffSS, commOffSP, commOffPstate, commOffCS, commOffPC}
+	wantPush := []int64{whpx.CommOffSSForTest, whpx.CommOffSPForTest, whpx.CommOffPstateForTest, whpx.CommOffCSForTest, whpx.CommOffPCForTest}
 	for k, want := range wantPush {
 		in := ins[iret+1+k].inst
 		m, ok := in.Args[0].(x86asm.Mem)
@@ -226,8 +227,8 @@ func TestX64ReloadReturnPaths(t *testing.T) {
 		iretLoads[r] = d
 	}
 	for idx, reg := range x86Gprs {
-		if iretLoads[reg] != int64(commOffRegs+idx*8) {
-			t.Errorf("iret path loads %v from %#x, want %#x", reg, iretLoads[reg], commOffRegs+idx*8)
+		if iretLoads[reg] != int64(whpx.CommOffRegsForTest+idx*8) {
+			t.Errorf("iret path loads %v from %#x, want %#x", reg, iretLoads[reg], whpx.CommOffRegsForTest+idx*8)
 		}
 	}
 	if _, ok := iretLoads[x86asm.RCX]; !ok {
@@ -236,13 +237,13 @@ func TestX64ReloadReturnPaths(t *testing.T) {
 }
 
 func TestX64ExceptionStubsAndCommonPath(t *testing.T) {
-	s, err := buildX64Stubs(kernelBaseX64)
+	s, err := whpx.BuildX64StubsForTest(whpx.KernelBaseX64ForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for v := range x64IDTVectors {
-		off := s.ExcStubs + v*x64ExcStubSize
-		ins := decodeX86(t, s.Code, off, off+x64ExcStubSize)
+	for v := range whpx.X64IDTVectorsForTest {
+		off := s.ExcStubs + v*whpx.X64ExcStubSizeForTest
+		ins := decodeX86(t, s.Code, off, off+whpx.X64ExcStubSizeForTest)
 		var pushes []int
 		var jmp *x86Inst
 		for k := range ins {
@@ -291,7 +292,15 @@ func TestX64ExceptionStubsAndCommonPath(t *testing.T) {
 		}
 		pops = append(pops, d)
 	}
-	want := []int64{commOffVector, commOffFaultCode, commOffPC, commOffCS, commOffPstate, commOffSP, commOffSS}
+	want := []int64{
+		whpx.CommOffVectorForTest,
+		whpx.CommOffFaultCodeForTest,
+		whpx.CommOffPCForTest,
+		whpx.CommOffCSForTest,
+		whpx.CommOffPstateForTest,
+		whpx.CommOffSPForTest,
+		whpx.CommOffSSForTest,
+	}
 	if len(pops) != len(want) {
 		t.Fatalf("common path pops into %v, want %v", pops, want)
 	}
@@ -318,31 +327,31 @@ func TestX64ExceptionStubsAndCommonPath(t *testing.T) {
 }
 
 func TestX64DescriptorTables(t *testing.T) {
-	const kb = kernelBaseX64
-	s, err := buildX64Stubs(kb)
+	const kb = whpx.KernelBaseX64ForTest
+	s, err := whpx.BuildX64StubsForTest(kb)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The selectors must match the values that pkg/sentry/arch uses for user
 	// mode (userCS 0x33, userDS 0x2b) and the SYSRET base rule.
-	if x64SelUserCS != 0x33 || x64SelUserSS != 0x2B {
-		t.Fatalf("user selectors are %#x, %#x", x64SelUserCS, x64SelUserSS)
+	if whpx.X64SelUserCSForTest != 0x33 || whpx.X64SelUserSSForTest != 0x2B {
+		t.Fatalf("user selectors are %#x, %#x", whpx.X64SelUserCSForTest, whpx.X64SelUserSSForTest)
 	}
-	if x64StarUserBase+16 != x64SelUserCS || x64StarUserBase+8 != x64SelUserSS {
-		t.Errorf("SYSRET base %#x does not produce CS %#x and SS %#x", x64StarUserBase, x64SelUserCS, x64SelUserSS)
+	if whpx.X64StarUserBaseForTest+16 != whpx.X64SelUserCSForTest || whpx.X64StarUserBaseForTest+8 != whpx.X64SelUserSSForTest {
+		t.Errorf("SYSRET base %#x does not produce CS %#x and SS %#x", whpx.X64StarUserBaseForTest, whpx.X64SelUserCSForTest, whpx.X64SelUserSSForTest)
 	}
-	desc := func(sel int) uint64 { return binary.LittleEndian.Uint64(s.Sys[x64SysOffGDT+sel&^7:]) }
+	desc := func(sel int) uint64 { return binary.LittleEndian.Uint64(s.Sys[whpx.X64SysOffGDTForTest+sel&^7:]) }
 	type segCheck struct {
 		sel              int
 		code, long, dpl3 bool
 		accessed         bool
 	}
 	for _, c := range []segCheck{
-		{x64SelKernelCS, true, true, false, true},
-		{x64SelKernelSS, false, false, false, true},
-		{x64SelUserCS32, true, false, true, true},
-		{x64SelUserSS, false, false, true, true},
-		{x64SelUserCS, true, true, true, true},
+		{whpx.X64SelKernelCSForTest, true, true, false, true},
+		{whpx.X64SelKernelSSForTest, false, false, false, true},
+		{whpx.X64SelUserCS32ForTest, true, false, true, true},
+		{whpx.X64SelUserSSForTest, false, false, true, true},
+		{whpx.X64SelUserCSForTest, true, true, true, true},
 	} {
 		d := desc(c.sel)
 		access := byte(d >> 40)
@@ -374,40 +383,43 @@ func TestX64DescriptorTables(t *testing.T) {
 		sel  int
 		want uint16
 	}{
-		{x64SelKernelCS, x64AttrKernelCS64}, {x64SelKernelSS, x64AttrKernelSS},
-		{x64SelUserCS32, x64AttrUserCS32}, {x64SelUserSS, x64AttrUserData}, {x64SelUserCS, x64AttrUserCS64},
+		{whpx.X64SelKernelCSForTest, whpx.X64AttrKernelCS64ForTest},
+		{whpx.X64SelKernelSSForTest, whpx.X64AttrKernelSSForTest},
+		{whpx.X64SelUserCS32ForTest, whpx.X64AttrUserCS32ForTest},
+		{whpx.X64SelUserSSForTest, whpx.X64AttrUserDataForTest},
+		{whpx.X64SelUserCSForTest, whpx.X64AttrUserCS64ForTest},
 	} {
 		if got := attr(c.sel); got != c.want {
 			t.Errorf("attributes of selector %#x are %#x, descriptor says %#x", c.sel, c.want, got)
 		}
 	}
-	if x64GDTLimit != 7*8-1 {
-		t.Errorf("GDT limit is %#x, want %#x", x64GDTLimit, 7*8-1)
+	if whpx.X64GDTLimitForTest != 7*8-1 {
+		t.Errorf("GDT limit is %#x, want %#x", whpx.X64GDTLimitForTest, 7*8-1)
 	}
 
-	for v := range x64IDTVectors {
-		g := s.Sys[x64SysOffIDT+v*16:]
+	for v := range whpx.X64IDTVectorsForTest {
+		g := s.Sys[whpx.X64SysOffIDTForTest+v*16:]
 		target := uint64(binary.LittleEndian.Uint16(g[0:])) |
 			uint64(binary.LittleEndian.Uint16(g[6:]))<<16 |
 			uint64(binary.LittleEndian.Uint32(g[8:]))<<32
-		want := kb + kernelCodeOff + uint64(s.ExcStubs+v*x64ExcStubSize)
+		want := kb + whpx.KernelCodeOffForTest + uint64(s.ExcStubs+v*whpx.X64ExcStubSizeForTest)
 		if target != want {
 			t.Errorf("IDT vector %d targets %#x, want %#x", v, target, want)
 		}
-		if sel := binary.LittleEndian.Uint16(g[2:]); sel != x64SelKernelCS {
+		if sel := binary.LittleEndian.Uint16(g[2:]); sel != whpx.X64SelKernelCSForTest {
 			t.Errorf("IDT vector %d uses selector %#x", v, sel)
 		}
 		if g[4] != 0 || g[5] != 0x8E {
 			t.Errorf("IDT vector %d has IST %d and type %#x, want an interrupt gate with DPL 0", v, g[4], g[5])
 		}
 	}
-	if x64IDTLimit != x64IDTVectors*16-1 {
-		t.Errorf("IDT limit is %#x", x64IDTLimit)
+	if whpx.X64IDTLimitForTest != whpx.X64IDTVectorsForTest*16-1 {
+		t.Errorf("IDT limit is %#x", whpx.X64IDTLimitForTest)
 	}
 }
 
 func TestX64StubsFitTheirRegions(t *testing.T) {
-	s, err := buildX64Stubs(kernelBaseX64)
+	s, err := whpx.BuildX64StubsForTest(whpx.KernelBaseX64ForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +430,7 @@ func TestX64StubsFitTheirRegions(t *testing.T) {
 	}{
 		{"entry", s.Entry, s.EntryEnd, s.Reload},
 		{"reload", s.Reload, s.ReloadEnd, s.ExcStubs},
-		{"common", s.Common, s.CommonEnd, pageSize},
+		{"common", s.Common, s.CommonEnd, whpx.PageSizeForTest},
 	} {
 		if r.start >= r.end || r.end > r.limit {
 			t.Errorf("%s spans [%#x, %#x) with limit %#x", r.name, r.start, r.end, r.limit)
@@ -427,14 +439,14 @@ func TestX64StubsFitTheirRegions(t *testing.T) {
 }
 
 func TestX64TSS(t *testing.T) {
-	page := make([]byte, pageSize)
-	c := overlayCommPage(page)
-	const va = kernelBaseX64 + kernelCommOff
-	x64InitTSS(c, va)
-	if got := binary.LittleEndian.Uint64(page[commTSSOff+4:]); got != va+commStackTop {
-		t.Errorf("TSS.RSP0 is %#x, want %#x", got, uint64(va+commStackTop))
+	page := make([]byte, whpx.PageSizeForTest)
+	c := whpx.OverlayCommPageForTest(page)
+	const va = whpx.KernelBaseX64ForTest + whpx.KernelCommOffForTest
+	whpx.X64InitTSSForTest(c, va)
+	if got := binary.LittleEndian.Uint64(page[whpx.CommTSSOffForTest+4:]); got != va+whpx.CommStackTopForTest {
+		t.Errorf("TSS.RSP0 is %#x, want %#x", got, uint64(va+whpx.CommStackTopForTest))
 	}
-	if got := binary.LittleEndian.Uint16(page[commTSSOff+102:]); got != commTSSSize {
-		t.Errorf("TSS I/O map base is %d, want %d so that no I/O bitmap exists", got, commTSSSize)
+	if got := binary.LittleEndian.Uint16(page[whpx.CommTSSOffForTest+102:]); got != whpx.CommTSSSizeForTest {
+		t.Errorf("TSS I/O map base is %d, want %d so that no I/O bitmap exists", got, whpx.CommTSSSizeForTest)
 	}
 }
