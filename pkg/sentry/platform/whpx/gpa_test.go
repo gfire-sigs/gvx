@@ -18,43 +18,66 @@ import (
 	"errors"
 	"testing"
 	"unsafe"
+
+	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 func newTestMemoryMap(fb *fakeBackend) *memoryMap {
-	return newMemoryMap(fb, gpaTableEnd, gpaWindowEnd)
+	return newMemoryMap(fb, gpaTableEnd, maxGPAWindowEnd)
 }
 
-// straddlingHost returns size bytes of host memory that cross a boundary
-// between two arenas. Half of the bytes lie on each side.
-func straddlingHost(t testing.TB, size int) []byte {
+// pageAlignedHost returns size bytes of page-aligned host memory.
+func pageAlignedHost(t testing.TB, size int) []byte {
 	t.Helper()
-	buf := make([]byte, arenaSize+size)
+	buf := make([]byte, size+pageSize)
 	base := uintptr(unsafe.Pointer(&buf[0]))
-	boundary := (base + arenaMask) &^ arenaMask
-	for boundary < base+uintptr(size/2) {
-		boundary += arenaSize
-	}
-	start := int(boundary-base) - size/2
-	if start < 0 || start+size > len(buf) || (base+uintptr(start))&pageMask != 0 {
-		t.Fatalf("no page-aligned straddling range in a buffer at %#x", base)
-	}
-	return buf[start : start+size : start+size]
+	skip := int(-base & pageMask)
+	return buf[skip : skip+size : skip+size]
 }
 
-// withinOneArena returns size bytes of host memory that stay inside one
-// arena.
-func withinOneArena(t testing.TB, size int) []byte {
-	t.Helper()
-	buf := make([]byte, 2*size)
-	base := uintptr(unsafe.Pointer(&buf[0]))
-	start := 0
-	if boundary := (base + arenaMask) &^ arenaMask; boundary > base && boundary < base+uintptr(size) {
-		start = int(boundary - base)
+// sliceMemmapFile is a non-persistent memmap.File backed by a single host slice.
+type sliceMemmapFile struct {
+	memmap.File
+	mem []byte
+}
+
+func (f *sliceMemmapFile) MapInternal(fr memmap.FileRange, _ hostarch.AccessType) (safemem.BlockSeq, error) {
+	return safemem.BlockSeqOf(safemem.BlockFromSafeSlice(f.mem[fr.Start:fr.End])), nil
+}
+
+// chunkedSliceFile is a persistent ChunkedFile backed by a single host slice.
+type chunkedSliceFile struct {
+	sliceMemmapFile
+}
+
+func (f *chunkedSliceFile) TotalSize() uint64 { return uint64(len(f.mem)) }
+
+var testResolveNextGVA uint64 = 0x1000_0000
+
+func resolveSlice(m *memoryMap, u *hvcommon.RegionUser, f memmap.File, data []byte, write bool) ([]gpaRun, error) {
+	if len(data) == 0 {
+		return nil, errors.New("empty slice")
 	}
-	if (base+uintptr(start))&pageMask != 0 {
-		t.Fatalf("buffer at %#x is not page aligned", base)
+	block := hvcommon.HostBlock{
+		Addr:  uintptr(unsafe.Pointer(unsafe.SliceData(data))),
+		Len:   uintptr(len(data)),
+		Slice: data,
 	}
-	return buf[start : start+size : start+size]
+	runs, err := m.inner.ResolvePinnedBlocks(u, f, []hvcommon.HostBlock{block}, write)
+	if err != nil {
+		return nil, err
+	}
+	gva := testResolveNextGVA
+	testResolveNextGVA += uint64(len(data)) + pageSize
+	var acq, drop []*hvcommon.Region
+	if u != nil {
+		acq, drop = u.RecordRuns(gva, runs)
+	}
+	m.inner.FinishPin(runs, acq, drop)
+	return runs, nil
 }
 
 func TestGPAAllocatorAlignedRuns(t *testing.T) {
@@ -106,43 +129,38 @@ func TestGPAAllocatorExhaustion(t *testing.T) {
 	}
 }
 
-func TestMemoryMapJoinsRangesInAnyOrder(t *testing.T) {
+func TestMemoryMapChunkedFileRegistersOnceInAnyOrder(t *testing.T) {
 	fb := newFakeBackend()
 	m := newTestMemoryMap(fb)
 	mem, _ := fb.allocHost(ptSlabSize)
+	f := &chunkedSliceFile{sliceMemmapFile: sliceMemmapFile{mem: mem[:16*pageSize]}}
 	page := func(from, to int) []byte { return mem[from*pageSize : to*pageSize] }
+	var u hvcommon.RegionUser
 
-	// A later call below the first one, as a top-down allocation does.
-	runs, err := m.resolve(page(8, 12), true, nil)
+	runs, err := resolveSlice(m, &u, f, page(8, 12), true)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("first resolve returned %v, %v", runs, err)
 	}
 	top := runs[0]
-	runs, err = m.resolve(page(4, 8), true, nil)
+	maps0, _ := fb.calls()
+
+	runs, err = resolveSlice(m, &u, f, page(4, 8), true)
 	if err != nil || len(runs) != 1 || runs[0].GPA+runs[0].Size != top.GPA {
-		t.Fatalf("a range below the first one got %v, want it to end at %#x (%v)", runs, top.GPA, err)
+		t.Fatalf("a range below the first one got %v, want end %#x (%v)", runs, top.GPA, err)
 	}
-	// A call above, as a bottom-up allocation does.
-	if runs, err = m.resolve(page(12, 16), true, nil); err != nil || len(runs) != 1 || runs[0].GPA != top.GPA+4*pageSize {
+	if runs, err = resolveSlice(m, &u, f, page(12, 16), true); err != nil || len(runs) != 1 || runs[0].GPA != top.GPA+4*pageSize {
 		t.Fatalf("a range above the first one got %v (%v)", runs, err)
 	}
-	// The whole range is one run now and needs no further call.
-	maps0, _ := fb.calls()
-	runs, err = m.resolve(page(4, 16), true, nil)
-	if err != nil || len(runs) != 1 || runs[0].Size != 12*pageSize || runs[0].GPA != top.GPA-4*pageSize {
-		t.Fatalf("the joined range got %v (%v)", runs, err)
-	}
-	// Only the gap below page 4 registers, and the whole range joins again.
-	runs, err = m.resolve(page(0, 16), true, nil)
+	runs, err = resolveSlice(m, &u, f, page(0, 16), true)
 	if err != nil || len(runs) != 1 || runs[0].Size != 16*pageSize {
 		t.Fatalf("the full range got %v (%v)", runs, err)
 	}
-	if maps, _ := fb.calls(); maps-maps0 != 1 {
-		t.Errorf("two resolves made %d map calls, want 1", maps-maps0)
+	if maps, _ := fb.calls(); maps != maps0 {
+		t.Errorf("subsequent resolves made %d map calls, want 0", maps-maps0)
 	}
 	host, ok := hostOf(fb, runs[0].GPA)
-	if !ok || host != unsafe.Pointer(&mem[0]) {
-		t.Errorf("the first guest page maps host %p, want %p", host, &mem[0])
+	if !ok || host != uintptr(unsafe.Pointer(&mem[0])) {
+		t.Errorf("the first guest page maps host %#x, want %p", host, &mem[0])
 	}
 }
 
@@ -150,8 +168,10 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 	fb := newFakeBackend()
 	m := newTestMemoryMap(fb)
 	mem, _ := fb.allocHost(ptSlabSize)
+	f := &sliceMemmapFile{mem: mem}
+	var u hvcommon.RegionUser
 
-	ro, err := m.resolve(mem[:2*pageSize], false, nil)
+	ro, err := resolveSlice(m, &u, f, mem[:2*pageSize], false)
 	if err != nil || len(ro) != 1 {
 		t.Fatalf("read-only resolve returned %v, %v", ro, err)
 	}
@@ -159,18 +179,16 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 		t.Errorf("a read-only request maps with flags %#x", mp.flags)
 	}
 
-	// A write request must not use the read-only range. It registers the
-	// same host memory again with write permission and keeps the old range.
 	maps0, unmaps0 := fb.calls()
-	rw, err := m.resolve(mem[:2*pageSize], true, nil)
+	rw, err := resolveSlice(m, &u, f, mem[:2*pageSize], true)
 	if err != nil || len(rw) != 1 {
 		t.Fatalf("writable resolve returned %v, %v", rw, err)
 	}
 	if rw[0].GPA == ro[0].GPA {
 		t.Fatal("a write request reuses the read-only guest range")
 	}
-	if mp, host, _ := fb.mappingOf(rw[0].GPA); mp.flags != mapFlagRead|mapFlagWrite|mapFlagExecute || host != unsafe.Pointer(&mem[0]) {
-		t.Errorf("a write request maps host %p with flags %#x", host, mp.flags)
+	if mp, host, _ := fb.mappingOf(rw[0].GPA); mp.flags != mapFlagRead|mapFlagWrite|mapFlagExecute || host != uintptr(unsafe.Pointer(&mem[0])) {
+		t.Errorf("a write request maps host %#x with flags %#x", host, mp.flags)
 	}
 	if mp, _, ok := fb.mappingOf(ro[0].GPA); !ok || mp.flags != mapFlagRead|mapFlagExecute {
 		t.Error("the read-only range changed when the writable range registered")
@@ -180,7 +198,7 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 	}
 
 	// A later read request reuses the writable range without a call.
-	again, err := m.resolve(mem[:2*pageSize], false, nil)
+	again, err := resolveSlice(m, &u, f, mem[:2*pageSize], false)
 	if err != nil || len(again) != 1 || again[0].GPA != rw[0].GPA {
 		t.Fatalf("read after write got %v, want the writable range (%v)", again, err)
 	}
@@ -190,7 +208,7 @@ func TestMemoryMapKeepsWritableAndReadOnlyRangesApart(t *testing.T) {
 
 	// A read request over a writable part and an unregistered part takes the
 	// first from the writable range and registers the rest read-only.
-	mixed, err := m.resolve(mem[:4*pageSize], false, nil)
+	mixed, err := resolveSlice(m, &u, f, mem[:4*pageSize], false)
 	if err != nil || len(mixed) != 2 {
 		t.Fatalf("mixed resolve returned %v, %v", mixed, err)
 	}
@@ -206,48 +224,22 @@ func TestMemoryMapFailedRegistrationChangesNothing(t *testing.T) {
 	fb := newFakeBackend()
 	m := newTestMemoryMap(fb)
 	mem, _ := fb.allocHost(ptSlabSize)
+	f := &sliceMemmapFile{mem: mem}
+	var u hvcommon.RegionUser
 
 	boom := errors.New("map refused")
 	fb.mapErr = func(uint64) error { return boom }
-	if _, err := m.resolve(mem[:pageSize], true, nil); !errors.Is(err, boom) {
+	if _, err := resolveSlice(m, &u, f, mem[:pageSize], true); !errors.Is(err, boom) {
 		t.Fatalf("resolve returned %v, want the backend error", err)
 	}
-	if len(m.arenas) != 0 || m.next != gpaTableEnd {
-		t.Errorf("a failed registration left %d arenas and moved the window to %#x", len(m.arenas), m.next)
+	free, next := m.inner.AllocatorStateForTest()
+	if m.inner.RegionCount() != 0 || len(free) != 0 || next != gpaTableEnd {
+		t.Errorf("a failed registration left %d regions, free=%+v, next=%#x", m.inner.RegionCount(), free, next)
 	}
 	fb.mapErr = nil
-	runs, err := m.resolve(mem[:pageSize], true, nil)
-	if err != nil || len(runs) != 1 || runs[0].GPA < gpaTableEnd || runs[0].GPA >= gpaTableEnd+arenaSize {
-		t.Fatalf("retry returned %v, %v, want the first arena", runs, err)
-	}
-}
-
-func TestMemoryMapSpansTwoArenas(t *testing.T) {
-	fb := newFakeBackend()
-	m := newTestMemoryMap(fb)
-	mem := straddlingHost(t, 4<<20)
-
-	maps0, _ := fb.calls()
-	runs, err := m.resolve(mem, true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if maps, _ := fb.calls(); maps-maps0 != 2 {
-		t.Errorf("a range over two arenas made %d map calls, want 2", maps-maps0)
-	}
-	// Two fresh arenas take neighbouring windows, so the range stays whole.
-	if len(runs) != 1 || runs[0].Size != uint64(len(mem)) {
-		t.Errorf("resolve returned %v, want one run of %d bytes", runs, len(mem))
-	}
-	host, ok := hostOf(fb, runs[0].GPA+uint64(len(mem))-pageSize)
-	if !ok || host != unsafe.Pointer(&mem[len(mem)-pageSize]) {
-		t.Errorf("the last guest page maps host %p, want %p", host, &mem[len(mem)-pageSize])
-	}
-
-	// With one window left, the second arena has no room.
-	m2 := newMemoryMap(newFakeBackend(), gpaTableEnd, gpaTableEnd+arenaSize)
-	if _, err := m2.resolve(mem, true, nil); !errors.Is(err, errGPAExhausted) {
-		t.Errorf("resolve past the last window returned %v", err)
+	runs, err := resolveSlice(m, &u, f, mem[:pageSize], true)
+	if err != nil || len(runs) != 1 || runs[0].GPA != gpaTableEnd {
+		t.Fatalf("retry returned %v, %v, want GPA %#x", runs, err, uint64(gpaTableEnd))
 	}
 }
 
@@ -255,11 +247,13 @@ func TestMemoryMapCloseUnmapsEveryRegistration(t *testing.T) {
 	fb := newFakeBackend()
 	m := newTestMemoryMap(fb)
 	mem, _ := fb.allocHost(ptSlabSize)
+	f := &sliceMemmapFile{mem: mem}
+	var u hvcommon.RegionUser
 	for _, c := range []struct {
 		from, to int
 		write    bool
 	}{{0, 2, true}, {4, 6, true}, {2, 4, true}, {8, 9, false}} {
-		if _, err := m.resolve(mem[c.from*pageSize:c.to*pageSize], c.write, nil); err != nil {
+		if _, err := resolveSlice(m, &u, f, mem[c.from*pageSize:c.to*pageSize], c.write); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -278,7 +272,7 @@ func TestMemoryMapCloseUnmapsEveryRegistration(t *testing.T) {
 	if _, unmaps := fb.calls(); unmaps != 4 {
 		t.Errorf("close made %d unmap calls, want 4", unmaps)
 	}
-	if _, err := m.resolve(mem[:pageSize], true, nil); !errors.Is(err, errClosed) {
+	if _, err := resolveSlice(m, &u, f, mem[:pageSize], true); !errors.Is(err, errClosed) {
 		t.Errorf("resolve after close returned %v", err)
 	}
 
@@ -286,7 +280,9 @@ func TestMemoryMapCloseUnmapsEveryRegistration(t *testing.T) {
 	fb2 := newFakeBackend()
 	m2 := newTestMemoryMap(fb2)
 	mem2, _ := fb2.allocHost(ptSlabSize)
-	if _, err := m2.resolve(mem2[:pageSize], true, nil); err != nil {
+	f2 := &sliceMemmapFile{mem: mem2}
+	var u2 hvcommon.RegionUser
+	if _, err := resolveSlice(m2, &u2, f2, mem2[:pageSize], true); err != nil {
 		t.Fatal(err)
 	}
 	fb2.unmapErr = func(uint64) error { return boom }
@@ -299,16 +295,79 @@ func TestMemoryMapRejectsBadSlices(t *testing.T) {
 	fb := newFakeBackend()
 	m := newTestMemoryMap(fb)
 	mem, _ := fb.allocHost(ptSlabSize)
-	if _, err := m.resolve(mem[:pageSize-1], false, nil); err == nil {
+	f := &sliceMemmapFile{mem: mem}
+	var u hvcommon.RegionUser
+	if _, err := resolveSlice(m, &u, f, mem[:pageSize-1], false); err == nil {
 		t.Error("short slice accepted")
 	}
-	if _, err := m.resolve(mem[1:1+pageSize], false, nil); err == nil {
+	if _, err := resolveSlice(m, &u, f, mem[1:1+pageSize], false); err == nil {
 		t.Error("misaligned slice accepted")
 	}
-	if _, err := m.resolve(nil, false, nil); err == nil {
+	if _, err := m.resolveRaw(&u, nil, false); err == nil {
 		t.Error("empty slice accepted")
 	}
 	if maps, _ := fb.calls(); maps != 0 {
 		t.Errorf("rejected slices made %d map calls", maps)
+	}
+}
+
+func TestSelectGPABitsAndDynamicGPAWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arm64   bool
+		capBits uint32
+		cpuBits uint32
+		want    uint32
+		wantIPS uint64
+	}{
+		{"zero defaults to 36", false, 0, 0, 36, 1},
+		{"zero capability ignores larger cpu width", false, 0, 48, 36, 1},
+		{"36-bit x64 host", false, 36, 36, 36, 1},
+		{"39-bit Intel client x64", false, 39, 39, 39, 1},
+		{"cpu caps hypervisor on x64", false, 48, 39, 39, 1},
+		{"48-bit x64 clamps to 40", false, 48, 48, 40, 2},
+		{"39-bit arm64 steps down to 36 IPS=1", true, 39, 0, 36, 1},
+		{"40-bit arm64 uses IPS=2", true, 40, 0, 40, 2},
+		{"48-bit arm64 clamps to 40 IPS=2", true, 48, 0, 40, 2},
+	} {
+		got := selectGPABits(tc.arm64, tc.capBits, tc.cpuBits)
+		if got != tc.want {
+			t.Errorf("%s: selectGPABits(%v, %d, %d) = %d, want %d", tc.name, tc.arm64, tc.capBits, tc.cpuBits, got, tc.want)
+		}
+		if tc.arm64 {
+			ips := (a64TCRForBits(got) >> 32) & 0x7
+			if ips != tc.wantIPS {
+				t.Errorf("%s: TCR_EL1.IPS = %d, want %d", tc.name, ips, tc.wantIPS)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		bits    uint32
+		wantIPS uint64
+	}{
+		{36, 1},
+		{37, 2},
+		{39, 2},
+		{40, 2},
+	} {
+		if got := (a64TCRForBits(tc.bits) >> 32) & 0x7; got != tc.wantIPS {
+			t.Errorf("a64TCRForBits(%d) IPS = %d, want %d", tc.bits, got, tc.wantIPS)
+		}
+	}
+
+	fb := newFakeBackend()
+	fb.feats.physicalAddressBits = 36
+	p36 := newTestPlatform(t, fb, Options{})
+	if p36.gpaEnd != minGPAWindowEnd {
+		t.Errorf("36-bit platform gpaEnd = %#x, want %#x", p36.gpaEnd, uint64(minGPAWindowEnd))
+	}
+
+	fb48 := newFakeBackend()
+	fb48.feats.physicalAddressBits = 48
+	p48 := newTestPlatform(t, fb48, Options{})
+	wantBits := selectGPABits(p48.arm64, 48, hostCPUPABits())
+	if p48.gpaEnd != uint64(1)<<wantBits {
+		t.Errorf("48-bit platform gpaEnd = %#x, want %#x", p48.gpaEnd, uint64(1)<<wantBits)
 	}
 }

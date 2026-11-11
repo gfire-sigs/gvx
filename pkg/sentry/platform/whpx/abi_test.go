@@ -70,7 +70,9 @@ func TestExitReasonsMatchTheHeader(t *testing.T) {
 		{"capability Features", capCodeFeatures, 1}, {"capability HypervisorPresent", capCodeHypervisorPresent, 0},
 		{"property ProcessorCount", propCodeProcessorCount, 0x1FFF},
 		{"capability ProcessorFeatures", capCodeProcessorFeatures, 0x1001}, {"capability ProcessorXsaveFeatures", capCodeXsaveFeatures, 0x1003},
+		{"capability PhysicalAddressWidth", capCodePhysicalAddressWidth, 0x100A},
 		{"property ProcessorFeatures", propCodeProcessorFeatures, 0x1001}, {"property ProcessorXsaveFeatures", propCodeXsaveFeatures, 0x1006},
+		{"property PhysicalAddressWidth", propCodePhysicalAddressWidth, 0x1011},
 		{"state type XsaveState", vpStateTypeXsave, 0x1001}, {"WHV_E_INSUFFICIENT_BUFFER", hrInsufficientBuffer, 0x80370301},
 		{"map Read", mapFlagRead, 1}, {"map Write", mapFlagWrite, 2}, {"map Execute", mapFlagExecute, 4},
 	} {

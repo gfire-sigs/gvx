@@ -26,7 +26,7 @@ import (
 
 // fakeMapping is one live WHvMapGpaRange call of the fake.
 type fakeMapping struct {
-	host  unsafe.Pointer
+	host  uintptr
 	size  uint64
 	flags uint32
 }
@@ -111,11 +111,12 @@ type fakeBackend struct {
 func newFakeBackend() *fakeBackend {
 	fb := &fakeBackend{
 		feats: hostFeatures{
-			hypervisorPresent: true,
-			arm64Support:      true,
-			windowsBuild:      26100,
-			windowsUBR:        3915,
-			xsaveFeatures:     testXsaveCapability,
+			hypervisorPresent:   true,
+			arm64Support:        true,
+			windowsBuild:        26100,
+			windowsUBR:          3915,
+			physicalAddressBits: maxGPABits,
+			xsaveFeatures:       testXsaveCapability,
 		},
 		mapped:      map[uint64]fakeMapping{},
 		hosts:       map[uintptr][]byte{},
@@ -139,6 +140,9 @@ func (fb *fakeBackend) createPartition(cfg partitionConfig) (partitionInfo, erro
 	fb.cfg = cfg
 	info := fb.info
 	info.vpCount = cfg.vpCount
+	if info.physicalAddressBits == 0 {
+		info.physicalAddressBits = cfg.physicalAddressBits
+	}
 	info.xsaveFeatures = cfg.xsaveFeatures &^ fb.dropXsave
 	return info, nil
 }
@@ -175,7 +179,7 @@ func (fb *fakeBackend) freeHost(mem []byte) error {
 	return nil
 }
 
-func (fb *fakeBackend) mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint32) error {
+func (fb *fakeBackend) mapGPA(host uintptr, gpa, size uint64, flags uint32) error {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	// Guest memory always maps with execute permission. Page-table slabs and
@@ -188,8 +192,8 @@ func (fb *fakeBackend) mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint3
 			return err
 		}
 	}
-	if gpa&pageMask != 0 || size&pageMask != 0 || size == 0 || uintptr(host)&pageMask != 0 {
-		return fmt.Errorf("unaligned map gpa=%#x size=%#x host=%p", gpa, size, host)
+	if gpa&pageMask != 0 || size&pageMask != 0 || size == 0 || host&pageMask != 0 {
+		return fmt.Errorf("unaligned map gpa=%#x size=%#x host=%#x", gpa, size, host)
 	}
 	for at, m := range fb.mapped {
 		if gpa < at+m.size && at < gpa+size {
@@ -219,15 +223,15 @@ func (fb *fakeBackend) unmapGPA(gpa, size uint64) error {
 
 // mappingOf returns the mapping that covers gpa and the host address that
 // gpa translates to.
-func (fb *fakeBackend) mappingOf(gpa uint64) (fakeMapping, unsafe.Pointer, bool) {
+func (fb *fakeBackend) mappingOf(gpa uint64) (fakeMapping, uintptr, bool) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	for at, m := range fb.mapped {
 		if gpa >= at && gpa < at+m.size {
-			return m, unsafe.Add(m.host, gpa-at), true
+			return m, m.host + uintptr(gpa-at), true
 		}
 	}
-	return fakeMapping{}, nil, false
+	return fakeMapping{}, 0, false
 }
 
 // calls returns the number of mapGPA and unmapGPA calls so far.

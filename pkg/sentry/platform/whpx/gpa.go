@@ -17,11 +17,11 @@ package whpx
 import (
 	"errors"
 	"fmt"
-	"slices"
-	"sort"
 	"sync"
 	"unsafe"
 
+	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
@@ -99,236 +99,82 @@ func partitionFlags(writable bool) uint32 {
 // gpaRun is a contiguous range of guest physical memory.
 type gpaRun = hvcommon.GPARun
 
-// appendRun adds a range to runs. It joins the range to the last run when
-// the two touch.
-func appendRun(runs []gpaRun, gpa, size uint64) []gpaRun {
-	return hvcommon.AppendGPARun(runs, gpa, size)
+type whpxStage2Backend struct {
+	be backend
 }
 
-// span is a range inside an arena. Both fields are byte offsets from the
-// start of the host window of the arena.
-type span struct {
-	lo, hi uint32
+func (w whpxStage2Backend) MapHost(host uintptr, gpa uint64, size uintptr, writable bool) error {
+	return w.be.mapGPA(host, gpa, uint64(size), partitionFlags(writable))
 }
 
-// arenaKey names one arena. The index is the host address divided by
-// arenaSize.
-type arenaKey struct {
-	index    uintptr
-	writable bool
+func (w whpxStage2Backend) UnmapGPA(gpa uint64, size uintptr) error {
+	return w.be.unmapGPA(gpa, uint64(size))
 }
 
-// arena is the registration state of one host window and one access level.
-// Its guest physical window starts at gpa. The span list holds the parts of
-// the host window that the partition maps, sorted and disjoint. Each span is
-// one backend mapGPA call, so close can unmap it with the same arguments.
-type arena struct {
-	gpa   uint64
-	spans []span
+func (whpxStage2Backend) RefusedMemory(error) bool          { return false }
+func (whpxStage2Backend) AllocCopy(uintptr) ([]byte, error) { return nil, errGPAExhausted }
+func (whpxStage2Backend) FreeCopy([]byte) error             { return nil }
+
+// rawHostFile owns test mappings installed through AddressSpace.mapHost.
+type rawHostFile struct {
+	memmap.File
 }
 
-// find returns the end of the span that contains off.
-func (a *arena) find(off uint32) (hi uint32, ok bool) {
-	i := sort.Search(len(a.spans), func(i int) bool { return a.spans[i].hi > off })
-	if i < len(a.spans) && a.spans[i].lo <= off {
-		return a.spans[i].hi, true
-	}
-	return 0, false
-}
+func (*rawHostFile) TotalSize() uint64 { return 0 }
 
-// nextStart returns the start of the first span after off. It returns
-// arenaSize when no span follows.
-func (a *arena) nextStart(off uint32) uint32 {
-	i := sort.Search(len(a.spans), func(i int) bool { return a.spans[i].lo > off })
-	if i < len(a.spans) {
-		return a.spans[i].lo
-	}
-	return arenaSize
-}
-
-func (a *arena) insert(s span) {
-	i := sort.Search(len(a.spans), func(i int) bool { return a.spans[i].lo > s.lo })
-	a.spans = slices.Insert(a.spans, i, s)
-}
-
-// hostView converts addresses inside one host slice to pointers. It lets the
-// code compute with uintptr and still hand a valid pointer to the backend.
-type hostView struct {
-	base  unsafe.Pointer
-	start uintptr
-}
-
-func (v hostView) at(addr uintptr) unsafe.Pointer {
-	return unsafe.Add(v.base, addr-v.start)
-}
-
-// memoryMap registers host memory in the partition and assigns guest
-// physical addresses to it.
-//
-// The partition maps a host range once and keeps it until close. The kvm
-// platform of upstream gVisor does the same with its memory regions. Address
-// spaces only change their own page tables.
-//
-// The host memory must stay mapped at its address until close. The hypervisor
-// binds the guest physical range to the pages that back the host range when
-// the call runs. The memory file of the Sentry never moves its chunks. The
-// erofs image mapping lives as long as the run.
-//
-// The host address space splits into arenas of arenaSize bytes. Each arena
-// has one guest physical window of the same size. A host address keeps its
-// offset inside that window. A range inside one arena stays contiguous in
-// guest physical memory, however many calls registered it.
-//
-// An arena has two access levels. The writable level maps host memory with
-// write permission. The read-only level maps it without write permission. A
-// request without write access can name a host view that lacks write
-// permission. A write request never uses the read-only level. When a host
-// range that registered read-only needs write access, the writable level
-// registers a second guest physical range for the same host pages. The
-// hypervisor backs both ranges with the same memory. The map never replaces
-// or removes a mapping, so no virtual processor loses a page that it may
-// still use.
+// memoryMap owns Stage-2 GPA mappings for a WHPX partition via hvcommon.RegionMap.
 type memoryMap struct {
-	mu     sync.Mutex
-	be     backend
-	next   uint64
-	end    uint64
-	arenas map[arenaKey]*arena
-	closed bool
+	inner   *hvcommon.RegionMap
+	rawFile *rawHostFile
 }
 
-// newMemoryMap creates a map that takes its guest physical windows from
-// [base, end). base must be a multiple of arenaSize.
 func newMemoryMap(be backend, base, end uint64) *memoryMap {
-	return &memoryMap{be: be, next: base, end: end, arenas: make(map[arenaKey]*arena)}
+	return &memoryMap{
+		inner: hvcommon.NewRegionMap(whpxStage2Backend{be: be}, hvcommon.RegionMapConfig{
+			Granule:          pageSize,
+			Base:             base,
+			Limit:            end,
+			SeparateReadOnly: true,
+			LogPrefix:        "whpx",
+			ErrClosed:        errClosed,
+			ErrExhausted:     errGPAExhausted,
+		}),
+		rawFile: &rawHostFile{},
+	}
 }
 
-// resolve returns the guest physical ranges of data in order and appends them
-// to runs. It registers the parts of data that the partition does not map
-// yet. write tells whether the host view accepts writes and the caller needs
-// write access. data must start on a page boundary and span whole pages.
-func (m *memoryMap) resolve(data []byte, write bool, runs []gpaRun) ([]gpaRun, error) {
-	if len(data) == 0 || len(data)&pageMask != 0 {
-		return runs, fmt.Errorf("whpx: host slice of %d bytes is not a whole number of pages", len(data))
+func (m *memoryMap) resolveRaw(u *hvcommon.RegionUser, data []byte, write bool) ([]gpaRun, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("whpx: empty host memory slice")
 	}
-	view := hostView{base: unsafe.Pointer(&data[0]), start: uintptr(unsafe.Pointer(&data[0]))}
-	if view.start&pageMask != 0 {
-		return runs, fmt.Errorf("whpx: host address %#x is not page aligned", view.start)
+	block := hvcommon.HostBlock{
+		Addr:  uintptr(unsafe.Pointer(unsafe.SliceData(data))),
+		Len:   uintptr(len(data)),
+		Slice: data,
 	}
-	cur, end := view.start, view.start+uintptr(len(data))
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed {
-		return runs, errClosed
-	}
-	for cur < end {
-		windowEnd := (cur | arenaMask) + 1
-		if windowEnd == 0 || windowEnd > end {
-			windowEnd = end
-		}
-		var err error
-		if runs, err = m.resolveWindow(view, cur, windowEnd, write, runs); err != nil {
-			return runs, err
-		}
-		cur = windowEnd
-	}
-	return runs, nil
+	return m.inner.ResolveBlocks(u, m.rawFile, []hvcommon.HostBlock{block}, write)
 }
 
-// resolveWindow resolves [cur, end), which lies inside one arena window.
-func (m *memoryMap) resolveWindow(view hostView, cur, end uintptr, write bool, runs []gpaRun) ([]gpaRun, error) {
-	index := cur >> arenaShift
-	rw := m.arenas[arenaKey{index: index, writable: true}]
-	var ro *arena
-	if !write {
-		ro = m.arenas[arenaKey{index: index}]
-	}
-	for cur < end {
-		off := uint32(cur & arenaMask)
-		if rw != nil {
-			if hi, ok := rw.find(off); ok {
-				n := min(uintptr(hi-off), end-cur)
-				runs = appendRun(runs, rw.gpa+uint64(off), uint64(n))
-				cur += n
-				continue
-			}
-		}
-		if ro != nil {
-			if hi, ok := ro.find(off); ok {
-				n := min(uintptr(hi-off), end-cur)
-				runs = appendRun(runs, ro.gpa+uint64(off), uint64(n))
-				cur += n
-				continue
-			}
-		}
-
-		// The gap ends where the next registered span of either level begins.
-		windowStart := cur - uintptr(off)
-		gapEnd := end
-		if rw != nil {
-			gapEnd = min(gapEnd, windowStart+uintptr(rw.nextStart(off)))
-		}
-		if ro != nil {
-			gapEnd = min(gapEnd, windowStart+uintptr(ro.nextStart(off)))
-		}
-		a, err := m.register(arenaKey{index: index, writable: write}, view.at(cur), off, gapEnd-cur, write)
-		if err != nil {
-			return runs, err
-		}
-		if write {
-			rw = a
-		} else {
-			ro = a
-		}
-		runs = appendRun(runs, a.gpa+uint64(off), uint64(gapEnd-cur))
-		cur = gapEnd
-	}
-	return runs, nil
+func (m *memoryMap) resolvePinned(u *hvcommon.RegionUser, f memmap.File, bs safemem.BlockSeq, write bool) ([]gpaRun, error) {
+	return m.inner.ResolvePinned(u, f, bs, write)
 }
 
-// register maps size bytes of host memory at host, which sits at offset off
-// of its arena. It creates the arena when none exists. A failed call changes
-// nothing.
-func (m *memoryMap) register(key arenaKey, host unsafe.Pointer, off uint32, size uintptr, write bool) (*arena, error) {
-	a := m.arenas[key]
-	fresh := a == nil
-	if fresh {
-		if m.next+arenaSize > m.end {
-			return nil, errGPAExhausted
-		}
-		a = &arena{gpa: m.next}
-	}
-	gpa := a.gpa + uint64(off)
-	if err := m.be.mapGPA(host, gpa, uint64(size), partitionFlags(write)); err != nil {
-		return nil, fmt.Errorf("whpx: map guest memory at %#x, %d bytes: %w", gpa, size, err)
-	}
-	if fresh {
-		m.next += arenaSize
-		m.arenas[key] = a
-	}
-	a.insert(span{lo: off, hi: off + uint32(size)})
-	return a, nil
+func (m *memoryMap) resolvePinnedBlocks(u *hvcommon.RegionUser, f memmap.File, blocks []hvcommon.HostBlock, write bool) ([]gpaRun, error) {
+	return m.inner.ResolvePinnedBlocks(u, f, blocks, write)
 }
 
-// close unmaps every registered range and makes later calls of resolve fail.
-// The caller stops every virtual processor first.
+func (m *memoryMap) finishPin(runs []gpaRun, acquired, dropped []*hvcommon.Region) {
+	m.inner.FinishPin(runs, acquired, dropped)
+}
+
+func (m *memoryMap) releaseRegions(dropped []*hvcommon.Region) {
+	m.inner.ReleaseRegions(dropped)
+}
+
+func (m *memoryMap) release(u *hvcommon.RegionUser) {
+	m.inner.Release(u)
+}
+
 func (m *memoryMap) close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed {
-		return nil
-	}
-	m.closed = true
-	var errs []error
-	for _, a := range m.arenas {
-		for _, s := range a.spans {
-			gpa := a.gpa + uint64(s.lo)
-			if err := m.be.unmapGPA(gpa, uint64(s.hi-s.lo)); err != nil {
-				errs = append(errs, fmt.Errorf("whpx: unmap guest memory at %#x: %w", gpa, err))
-			}
-		}
-	}
-	clear(m.arenas)
-	return errors.Join(errs...)
+	return m.inner.Close()
 }

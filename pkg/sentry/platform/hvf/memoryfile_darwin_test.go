@@ -20,8 +20,11 @@ import (
 	"encoding/binary"
 	"sync"
 	"testing"
+	"unsafe"
 
+	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
@@ -60,9 +63,7 @@ func (c *countingBackend) counts() (maps, unmaps int) {
 func TestMemoryFileRangeUsesOneStage2RegionOnARealVM(t *testing.T) {
 	plat := newTestPlatform(t)
 	counter := &countingBackend{stage2Backend: hvBackend{}}
-	plat.vm.regions.mu.Lock()
-	plat.vm.regions.be = counter
-	plat.vm.regions.mu.Unlock()
+	plat.vm.regions.setBackend(counter)
 
 	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
 	if err != nil {
@@ -124,5 +125,80 @@ func TestMemoryFileRangeUsesOneStage2RegionOnARealVM(t *testing.T) {
 	g.as.Release()
 	if maps, unmaps := counter.counts(); maps != maps0 || unmaps != unmaps0+1 {
 		t.Errorf("Release made %d hv_vm_map and %d hv_vm_unmap calls, want 0 and 1", maps-maps0, unmaps-unmaps0)
+	}
+}
+
+func TestReusedHostVirtualAddressMapsNewPhysicalPageOnARealVM(t *testing.T) {
+	plat := newTestPlatform(t)
+	counter := &countingBackend{stage2Backend: hvBackend{}}
+	plat.vm.regions.setBackend(counter)
+
+	slot, err := unix.Mmap(-1, 0, hostPageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("Mmap: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Munmap(slot); err != nil {
+			t.Errorf("Munmap: %v", err)
+		}
+	})
+	baseAddr := uintptr(unsafe.Pointer(&slot[0]))
+
+	const (
+		valA = uint64(0xAAAA_1111_2222_3333)
+		valB = uint64(0xBBBB_4444_5555_6666)
+		va   = hostarch.Addr(0x5000_0000)
+	)
+	binary.LittleEndian.PutUint64(slot[:8], valA)
+
+	fileA := &testFile{mem: slot[:pageSize4K]}
+	g1 := newGuest(t, plat, insnLdrX1X0, insnSVC0)
+	maps0, unmaps0 := counter.counts()
+	if err := g1.as.MapFile(va, fileA, memmap.FileRange{Start: 0, End: pageSize4K}, hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("MapFile fileA: %v", err)
+	}
+	if maps, _ := counter.counts(); maps != maps0+1 {
+		t.Fatalf("MapFile fileA made %d hv_vm_map calls, want 1", maps-maps0)
+	}
+	if got, sig, err := g1.read64(va); sig != nil || err != nil || got != valA {
+		t.Fatalf("guest read fileA = (%#x, %v, %v), want %#x", got, sig, err, valA)
+	}
+
+	// Release g1 so both its arena region and fileA drop to zero references and
+	// unmap from Stage-2 IPA space.
+	g1.as.Release()
+	if _, unmaps := counter.counts(); unmaps != unmaps0+2 {
+		t.Fatalf("Release after fileA made %d hv_vm_unmap calls, want 2", unmaps-unmaps0)
+	}
+
+	// Atomically replace the backing physical page at baseAddr via MAP_FIXED.
+	mappedAddr, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
+		baseAddr,
+		uintptr(hostPageSize),
+		uintptr(unix.PROT_READ|unix.PROT_WRITE),
+		uintptr(unix.MAP_ANON|unix.MAP_PRIVATE|unix.MAP_FIXED),
+		^uintptr(0),
+		0,
+	)
+	if errno != 0 || mappedAddr != baseAddr {
+		t.Fatalf("MAP_FIXED remap at %#x returned (%#x, %v)", baseAddr, mappedAddr, errno)
+	}
+	if got := binary.LittleEndian.Uint64(slot[:8]); got != 0 {
+		t.Fatalf("fresh MAP_FIXED page held %#x, want 0", got)
+	}
+	binary.LittleEndian.PutUint64(slot[:8], valB)
+
+	fileB := &testFile{mem: slot[:pageSize4K]}
+	g2 := newGuest(t, plat, insnLdrX1X0, insnSVC0)
+	maps1, _ := counter.counts()
+	if err := g2.as.MapFile(va, fileB, memmap.FileRange{Start: 0, End: pageSize4K}, hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("MapFile fileB: %v", err)
+	}
+	if maps, _ := counter.counts(); maps != maps1+1 {
+		t.Fatalf("MapFile fileB at reused host VA made %d hv_vm_map calls, want 1", maps-maps1)
+	}
+	if got, sig, err := g2.read64(va); sig != nil || err != nil || got != valB {
+		t.Fatalf("guest read fileB = (%#x, %v, %v), want %#x", got, sig, err, valB)
 	}
 }

@@ -60,6 +60,13 @@ const (
 // size (IPS 1), and top-byte-ignore for TTBR0.
 var a64TCR = hvcommon.TCR(1)
 
+func a64TCRForBits(gpaBits uint32) uint64 {
+	if gpaBits > 36 {
+		return hvcommon.TCR(2)
+	}
+	return a64TCR
+}
+
 // a64Stubs is the generated arm64 guest code.
 type a64Stubs struct {
 	Code      []byte

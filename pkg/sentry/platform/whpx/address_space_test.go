@@ -39,7 +39,7 @@ func translate(as *AddressSpace, va uint64) (gpa uint64, opts hostarch.AccessTyp
 
 // hostOf returns the host address that the partition backs guest physical
 // address gpa with.
-func hostOf(fb *fakeBackend, gpa uint64) (unsafe.Pointer, bool) {
+func hostOf(fb *fakeBackend, gpa uint64) (uintptr, bool) {
 	_, host, ok := fb.mappingOf(gpa)
 	return host, ok
 }
@@ -78,8 +78,8 @@ func TestMapHostBuildsExactPageTableEntries(t *testing.T) {
 		host, mapped := hostOf(fb, gpa)
 		if !mapped {
 			t.Errorf("guest page %#x of %#x is not mapped in the partition", gpa, c.va)
-		} else if host != unsafe.Pointer(&mem[i*pageSize]) {
-			t.Errorf("guest page %#x of %#x maps host %p, want %p", gpa, c.va, host, &mem[i*pageSize])
+		} else if host != uintptr(unsafe.Pointer(&mem[i*pageSize])) {
+			t.Errorf("guest page %#x of %#x maps host %#x, want %p", gpa, c.va, host, &mem[i*pageSize])
 		}
 	}
 	if _, _, _, ok := translate(as, 0x403000); ok {
@@ -113,10 +113,10 @@ func TestTwoAddressSpacesNeverAlias(t *testing.T) {
 	if ga == gb {
 		t.Fatalf("both address spaces map guest page %#x at 0x400000", ga)
 	}
-	if h, _ := hostOf(fb, ga); h != unsafe.Pointer(&memA[0]) {
+	if h, _ := hostOf(fb, ga); h != uintptr(unsafe.Pointer(&memA[0])) {
 		t.Error("a guest page maps the wrong host memory")
 	}
-	if h, _ := hostOf(fb, gb); h != unsafe.Pointer(&memB[0]) {
+	if h, _ := hostOf(fb, gb); h != uintptr(unsafe.Pointer(&memB[0])) {
 		t.Error("a guest page maps the wrong host memory")
 	}
 }

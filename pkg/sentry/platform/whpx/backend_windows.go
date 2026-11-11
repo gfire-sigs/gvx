@@ -156,6 +156,10 @@ func (b *winBackend) features() (hostFeatures, error) {
 		return f, err
 	}
 	f.arm64Support = feats&featArm64Support != 0
+	var paBits uint32
+	if err := getCapability(capCodePhysicalAddressWidth, unsafe.Pointer(&paBits), 4); err == nil {
+		f.physicalAddressBits = paBits
+	}
 	if runtime.GOARCH == "arm64" {
 		build, ubr, err := windowsVersion()
 		if err != nil {
@@ -207,6 +211,17 @@ func (b *winBackend) createPartition(cfg partitionConfig) (info partitionInfo, e
 		}
 	}
 	if runtime.GOARCH == "arm64" {
+		if cfg.physicalAddressBits > minGPABits {
+			paWidth := cfg.physicalAddressBits
+			if err := call(procSetPartitionProperty, "WHvSetPartitionProperty(PhysicalAddressWidth)",
+				h, uintptr(propCodePhysicalAddressWidth), uintptr(unsafe.Pointer(&paWidth)), 4); err == nil {
+				info.physicalAddressBits = paWidth
+			} else {
+				info.physicalAddressBits = minGPABits
+			}
+		} else {
+			info.physicalAddressBits = minGPABits
+		}
 		var lpiBits uint32
 		if err := getCapability(capCodeGicLpiIntIdBits, unsafe.Pointer(&lpiBits), 4); err != nil {
 			return info, err
@@ -223,6 +238,8 @@ func (b *winBackend) createPartition(cfg partitionConfig) (info partitionInfo, e
 			h, uintptr(propCodeArm64IcParameters), uintptr(unsafe.Pointer(&ic)), unsafe.Sizeof(ic)); err != nil {
 			return info, err
 		}
+	} else {
+		info.physicalAddressBits = cfg.physicalAddressBits
 	}
 	if err := call(procSetupPartition, "WHvSetupPartition", h); err != nil {
 		return info, err
@@ -288,9 +305,9 @@ func (b *winBackend) freeHost(mem []byte) error {
 	return nil
 }
 
-func (b *winBackend) mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint32) error {
+func (b *winBackend) mapGPA(host uintptr, gpa, size uint64, flags uint32) error {
 	return call(procMapGpaRange, "WHvMapGpaRange",
-		b.partition, uintptr(host), uintptr(gpa), uintptr(size), uintptr(flags))
+		b.partition, host, uintptr(gpa), uintptr(size), uintptr(flags))
 }
 
 func (b *winBackend) unmapGPA(gpa, size uint64) error {

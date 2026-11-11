@@ -84,7 +84,7 @@ func (a *PTAllocator) take() (*pagetables.PTEs, error) {
 	return ptes, nil
 }
 
-// Reserve ensures that at least n pages are ready in a.Ready for NewPTEs.
+// Reserve populates a.Ready until it holds at least n pages for NewPTEs.
 func (a *PTAllocator) Reserve(n int) error {
 	for len(a.Ready) < n {
 		ptes, err := a.take()
@@ -163,18 +163,23 @@ func ReserveForMap(n uint64) int {
 
 // GPARun is a contiguous range of guest physical memory.
 type GPARun struct {
-	GPA  uint64
-	Size uint64
+	GPA    uint64
+	Size   uint64
+	region *Region
 }
 
 // AppendGPARun appends a range to runs, coalescing it with the previous run
 // when the two are contiguous.
 func AppendGPARun(runs []GPARun, gpa, size uint64) []GPARun {
-	if n := len(runs); n > 0 && runs[n-1].GPA+runs[n-1].Size == gpa {
+	return appendRegionRun(runs, gpa, size, nil)
+}
+
+func appendRegionRun(runs []GPARun, gpa, size uint64, r *Region) []GPARun {
+	if n := len(runs); n > 0 && runs[n-1].GPA+runs[n-1].Size == gpa && runs[n-1].region == r {
 		runs[n-1].Size += size
 		return runs
 	}
-	return append(runs, GPARun{GPA: gpa, Size: size})
+	return append(runs, GPARun{GPA: gpa, Size: size, region: r})
 }
 
 // ReserveForRuns returns an upper bound on the number of page-table pages that

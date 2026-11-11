@@ -31,10 +31,11 @@
 //
 // Each address space owns its own guest page tables, built with
 // pkg/ring0/pagetables. All address spaces share the kernel region: stub
-// code, descriptor tables and the CommPages. Guest memory comes from the
-// host memory that MapFile receives. The partition maps that memory once, in
-// arenas of one guest physical window (gpa.go), and keeps it until Close.
-// An address space reaches only the pages that its own page tables name.
+// code, descriptor tables, and the CommPages. Guest memory comes from the
+// host ranges that MapFile receives. The partition maps persistent
+// pgalloc.MemoryFile chunks once in Stage-2 GPA space, and reference-counted
+// regions unmap transient files after their guest translations clear. An
+// address space reaches only the pages that its own page tables name.
 package whpx
 
 import (
@@ -96,10 +97,12 @@ type Platform struct {
 	// when another Context takes its processor.
 	fpSize int
 
-	gpa    *gpaAllocator
-	mem    *memoryMap
-	pool   *ptPool
-	kernel *kernelRegion
+	gpaBits uint32
+	gpaEnd  uint64
+	gpa     *gpaAllocator
+	mem     *memoryMap
+	pool    *ptPool
+	kernel  *kernelRegion
 
 	// nextASID numbers address spaces. A virtual processor compares the
 	// number, not a pointer, to find out whether the last address space it
@@ -204,7 +207,11 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 	if vpCount <= 0 {
 		vpCount = min(max(runtime.NumCPU(), 1), maxVPs)
 	}
-	cfg := partitionConfig{vpCount: uint32(vpCount)}
+	cpuPABits := hostCPUPABits()
+	cfg := partitionConfig{
+		vpCount:             uint32(vpCount),
+		physicalAddressBits: selectGPABits(arm64, feats.physicalAddressBits, cpuPABits),
+	}
 	fpSize := a64FPSize
 	var vec guestVector
 	if !arm64 {
@@ -220,6 +227,7 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("whpx: create partition: %w", err)
 	}
+	gpaBits := selectGPABits(arm64, info.physicalAddressBits, cpuPABits)
 	p = &Platform{
 		be:      be,
 		opts:    opts,
@@ -228,6 +236,8 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 		info:    info,
 		vec:     vec,
 		fpSize:  fpSize,
+		gpaBits: gpaBits,
+		gpaEnd:  uint64(1) << gpaBits,
 	}
 	p.cond = sync.NewCond(&p.mu)
 	defer func() {
@@ -245,7 +255,7 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 
 	archInit()
 	p.gpa = newGPAAllocator(gpaWindowBase, gpaTableEnd)
-	p.mem = newMemoryMap(be, gpaTableEnd, gpaWindowEnd)
+	p.mem = newMemoryMap(be, gpaTableEnd, p.gpaEnd)
 	p.pool = newPTPool(be, p.gpa)
 	p.kernel, err = buildKernelRegion(be, p.gpa, p.pool, arm64, p.vpCount)
 	if err != nil {

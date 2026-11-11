@@ -72,7 +72,7 @@ func (p *ptPool) grow() error {
 	if err != nil {
 		return errors.Join(err, p.be.freeHost(mem))
 	}
-	if err := p.be.mapGPA(unsafe.Pointer(&mem[0]), gpa, ptSlabSize, partitionFlags(true)&^mapFlagExecute); err != nil {
+	if err := p.be.mapGPA(uintptr(unsafe.Pointer(&mem[0])), gpa, ptSlabSize, partitionFlags(true)&^mapFlagExecute); err != nil {
 		return errors.Join(fmt.Errorf("whpx: map page-table slab at %#x: %w", gpa, err), p.be.freeHost(mem))
 	}
 	p.slabs = append(p.slabs, &ptSlab{mem: mem, gpa: gpa})

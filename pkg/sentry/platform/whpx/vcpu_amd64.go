@@ -57,6 +57,11 @@ func archInit() {
 	pagetables.DisableLA57()
 }
 
+func hostCPUPABits() uint32 {
+	cpuid.Initialize()
+	return cpuid.HostFeatureSet().PhysicalAddressBits()
+}
+
 // vpState is what the holder of a virtual processor knows about the guest
 // state of the processor.
 type vpState struct {
