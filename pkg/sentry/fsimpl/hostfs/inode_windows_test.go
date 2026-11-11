@@ -33,6 +33,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fd"
 )
@@ -123,25 +124,63 @@ func TestWindowsHostValidateName(t *testing.T) {
 	}
 }
 
+// winSymbolicLinkReparseHeader matches the Windows REPARSE_DATA_BUFFER header
+// for SymbolicLinkReparseBuffer in ntifs.h.
+type winSymbolicLinkReparseHeader struct {
+	ReparseTag           uint32
+	ReparseDataLength    uint16
+	Reserved             uint16
+	SubstituteNameOffset uint16
+	SubstituteNameLength uint16
+	PrintNameOffset      uint16
+	PrintNameLength      uint16
+	Flags                uint32
+}
+
 func winTestSymlinkBuffer(tag uint32, substitute string, flags uint32) []byte {
 	units := utf16.Encode([]rune(substitute))
 	pathBytes := len(units) * 2
-	buf := make([]byte, reparseSymlinkHeaderSize+2*pathBytes)
-	binary.LittleEndian.PutUint32(buf[0:], tag)
-	binary.LittleEndian.PutUint16(buf[4:], uint16(12+2*pathBytes))
-	binary.LittleEndian.PutUint16(buf[8:], 0)
-	binary.LittleEndian.PutUint16(buf[10:], uint16(pathBytes))
-	binary.LittleEndian.PutUint16(buf[12:], uint16(pathBytes))
-	binary.LittleEndian.PutUint16(buf[14:], uint16(pathBytes))
-	binary.LittleEndian.PutUint32(buf[16:], flags)
+	hdrSize := int(unsafe.Sizeof(winSymbolicLinkReparseHeader{}))
+	hdr := winSymbolicLinkReparseHeader{
+		ReparseTag:           tag,
+		ReparseDataLength:    uint16(12 + 2*pathBytes),
+		SubstituteNameOffset: 0,
+		SubstituteNameLength: uint16(pathBytes),
+		PrintNameOffset:      uint16(pathBytes),
+		PrintNameLength:      uint16(pathBytes),
+		Flags:                flags,
+	}
+	buf := make([]byte, hdrSize+2*pathBytes)
+	copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(&hdr)), hdrSize))
 	for i, u := range units {
-		binary.LittleEndian.PutUint16(buf[reparseSymlinkHeaderSize+2*i:], u)
-		binary.LittleEndian.PutUint16(buf[reparseSymlinkHeaderSize+pathBytes+2*i:], u)
+		binary.LittleEndian.PutUint16(buf[hdrSize+2*i:], u)
+		binary.LittleEndian.PutUint16(buf[hdrSize+pathBytes+2*i:], u)
 	}
 	return buf
 }
 
+// readKernelReparseBuffer opens path with FILE_OPEN_REPARSE_POINT and returns
+// the raw REPARSE_DATA_BUFFER produced by FSCTL_GET_REPARSE_POINT.
+func readKernelReparseBuffer(t *testing.T, h *hostRoot, rel string) []byte {
+	t.Helper()
+	handle, err := h.openAny("readlink", rel, windows.FILE_READ_ATTRIBUTES)
+	if err != nil {
+		t.Fatalf("openAny(%q) = %v", rel, err)
+	}
+	defer closeHandle(handle)
+	buf := make([]byte, windows.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+	var returned uint32
+	if err := windows.DeviceIoControl(handle, windows.FSCTL_GET_REPARSE_POINT, nil, 0,
+		&buf[0], uint32(len(buf)), &returned, nil); err != nil {
+		t.Fatalf("DeviceIoControl(FSCTL_GET_REPARSE_POINT, %q) = %v", rel, err)
+	}
+	return buf[:returned]
+}
+
 func TestWindowsHostParseSymlinkReparse(t *testing.T) {
+	if got, want := uintptr(reparseSymlinkHeaderSize), unsafe.Sizeof(winSymbolicLinkReparseHeader{}); got != want {
+		t.Fatalf("reparseSymlinkHeaderSize = %d, want %d", got, want)
+	}
 	tests := []struct {
 		name    string
 		data    []byte
@@ -168,27 +207,95 @@ func TestWindowsHostParseSymlinkReparse(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("real kernel reparse buffers", func(t *testing.T) {
+		h, dir := winTestHost(t)
+		if err := h.mkdir("real"); err != nil {
+			t.Fatalf("mkdir(real) = %v", err)
+		}
+		winTestWrite(t, h, "real/file.txt", "inside")
+		winTestJunction(t, filepath.Join(dir, "junc"), filepath.Join(dir, "real"))
+		if _, err := parseSymlinkReparse(readKernelReparseBuffer(t, h, "junc")); !errors.Is(err, windows.ERROR_NOT_A_REPARSE_POINT) {
+			t.Fatalf("parseSymlinkReparse(real junction) = %v, want ERROR_NOT_A_REPARSE_POINT", err)
+		}
+
+		winTestSymlink(t, `real\file.txt`, filepath.Join(dir, "rel_sym"))
+		gotRel, err := parseSymlinkReparse(readKernelReparseBuffer(t, h, "rel_sym"))
+		if err != nil || gotRel != "real/file.txt" {
+			t.Fatalf("parseSymlinkReparse(real relative symlink) = (%q, %v), want (%q, nil)", gotRel, err, "real/file.txt")
+		}
+
+		absTarget := filepath.Join(dir, "real", "file.txt")
+		winTestSymlink(t, absTarget, filepath.Join(dir, "abs_sym"))
+		gotAbs, err := parseSymlinkReparse(readKernelReparseBuffer(t, h, "abs_sym"))
+		wantAbs := "/" + strings.ReplaceAll(absTarget, `\`, "/")
+		if err != nil || gotAbs != wantAbs {
+			t.Fatalf("parseSymlinkReparse(real absolute symlink) = (%q, %v), want (%q, nil)", gotAbs, err, wantAbs)
+		}
+	})
+}
+
+// winFileIDBothDirInfoHeader matches FILE_ID_BOTH_DIR_INFO in winbase.h up to
+// FileName[0].
+type winFileIDBothDirInfoHeader struct {
+	NextEntryOffset uint32
+	FileIndex       uint32
+	CreationTime    int64
+	LastAccessTime  int64
+	LastWriteTime   int64
+	ChangeTime      int64
+	EndOfFile       int64
+	AllocationSize  int64
+	FileAttributes  uint32
+	FileNameLength  uint32
+	EaSize          uint32
+	ShortNameLength uint8
+	Reserved1       uint8
+	ShortName       [12]uint16
+	Reserved2       uint16
+	FileID          uint64
 }
 
 func winTestDirEntry(attrs, eaSize uint32, fileID uint64, name string, last bool) []byte {
 	units := utf16.Encode([]rune(name))
 	nameBytes := len(units) * 2
-	size := (idDirInfoNameOffset + nameBytes + 7) &^ 7
-	buf := make([]byte, size)
-	if !last {
-		binary.LittleEndian.PutUint32(buf[0:], uint32(size))
+	hdrSize := int(unsafe.Sizeof(winFileIDBothDirInfoHeader{}))
+	size := (hdrSize + nameBytes + 7) &^ 7
+	hdr := winFileIDBothDirInfoHeader{
+		FileAttributes: attrs,
+		FileNameLength: uint32(nameBytes),
+		EaSize:         eaSize,
+		FileID:         fileID,
 	}
-	binary.LittleEndian.PutUint32(buf[idDirInfoAttributesOffset:], attrs)
-	binary.LittleEndian.PutUint32(buf[idDirInfoNameLengthOffset:], uint32(nameBytes))
-	binary.LittleEndian.PutUint32(buf[idDirInfoEaSizeOffset:], eaSize)
-	binary.LittleEndian.PutUint64(buf[idDirInfoFileIDOffset:], fileID)
+	if !last {
+		hdr.NextEntryOffset = uint32(size)
+	}
+	buf := make([]byte, size)
+	copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(&hdr)), hdrSize))
 	for i, u := range units {
-		binary.LittleEndian.PutUint16(buf[idDirInfoNameOffset+2*i:], u)
+		binary.LittleEndian.PutUint16(buf[hdrSize+2*i:], u)
 	}
 	return buf
 }
 
 func TestWindowsHostParseDirBuffer(t *testing.T) {
+	var hdr winFileIDBothDirInfoHeader
+	if got, want := uintptr(idDirInfoAttributesOffset), unsafe.Offsetof(hdr.FileAttributes); got != want {
+		t.Fatalf("idDirInfoAttributesOffset = %d, want %d", got, want)
+	}
+	if got, want := uintptr(idDirInfoNameLengthOffset), unsafe.Offsetof(hdr.FileNameLength); got != want {
+		t.Fatalf("idDirInfoNameLengthOffset = %d, want %d", got, want)
+	}
+	if got, want := uintptr(idDirInfoEaSizeOffset), unsafe.Offsetof(hdr.EaSize); got != want {
+		t.Fatalf("idDirInfoEaSizeOffset = %d, want %d", got, want)
+	}
+	if got, want := uintptr(idDirInfoFileIDOffset), unsafe.Offsetof(hdr.FileID); got != want {
+		t.Fatalf("idDirInfoFileIDOffset = %d, want %d", got, want)
+	}
+	if got, want := uintptr(idDirInfoNameOffset), unsafe.Sizeof(hdr); got != want {
+		t.Fatalf("idDirInfoNameOffset = %d, want %d", got, want)
+	}
+
 	const (
 		reparse = windows.FILE_ATTRIBUTE_REPARSE_POINT
 		dirAttr = windows.FILE_ATTRIBUTE_DIRECTORY
@@ -227,6 +334,26 @@ func TestWindowsHostParseDirBuffer(t *testing.T) {
 			t.Errorf("parseDirBuffer(buf[:%d]) = %v, want errMalformedDirBuffer", cut, err)
 		}
 	}
+
+	t.Run("real kernel directory buffer", func(t *testing.T) {
+		h, dir := winTestHost(t)
+		if err := h.mkdir("sub"); err != nil {
+			t.Fatalf("mkdir(sub) = %v", err)
+		}
+		winTestWrite(t, h, "file.txt", "data")
+		winTestJunction(t, filepath.Join(dir, "junc"), filepath.Join(dir, "sub"))
+
+		backing := make([]uint64, dirBufferSize/8)
+		rawBuf := unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), dirBufferSize)
+		if err := windows.GetFileInformationByHandleEx(h.handle, windows.FileIdBothDirectoryRestartInfo, &rawBuf[0], uint32(len(rawBuf))); err != nil {
+			t.Fatalf("GetFileInformationByHandleEx: %v", err)
+		}
+		parsed, err := parseDirBuffer(rawBuf, nil)
+		if err != nil {
+			t.Fatalf("parseDirBuffer(real kernel buffer) = %v", err)
+		}
+		checkListedIDs(t, h, ".", parsed)
+	})
 }
 
 func TestWindowsHostNameInfoLayout(t *testing.T) {
@@ -947,5 +1074,81 @@ func TestWindowsHostFileSymlink(t *testing.T) {
 	}
 	if got := winTestRead(t, h, "real/file.txt"); got != "inside" {
 		t.Errorf("target = %q after unlink of the link, want %q", got, "inside")
+	}
+}
+
+func TestWindowsVFSReparsePointsAndSymlinkContainment(t *testing.T) {
+	e := newEnv(t)
+	e.mustMkdir("real")
+	e.writeFile("real/file.txt", []byte("inside"))
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile(outside): %v", err)
+	}
+
+	winTestJunction(t, filepath.Join(e.dir, "junc"), filepath.Join(e.dir, "real"))
+	winTestJunction(t, filepath.Join(e.dir, "junc_escape"), outsideDir)
+
+	for _, name := range []string{"junc", "junc_escape"} {
+		if slices.Contains(e.readdir("."), name) {
+			t.Errorf("readdir(.) includes directory junction %q", name)
+		}
+		if _, err := e.lstat(name); err == nil {
+			t.Errorf("lstat(%q) on directory junction succeeded", name)
+		}
+		if _, err := e.open(name, linux.O_RDONLY, 0); err == nil {
+			t.Errorf("open(%q) on directory junction succeeded", name)
+		}
+	}
+	if _, err := e.open("junc/file.txt", linux.O_RDONLY, 0); err == nil {
+		t.Errorf("open(junc/file.txt) through directory junction succeeded")
+	}
+	if _, err := e.open("junc_escape/secret.txt", linux.O_RDONLY, 0); err == nil {
+		t.Errorf("open(junc_escape/secret.txt) through escaping junction succeeded")
+	}
+
+	winTestSymlink(t, `real\file.txt`, filepath.Join(e.dir, "inlink"))
+	winTestSymlink(t, `..\secret.txt`, filepath.Join(e.dir, "rel_escape"))
+	winTestSymlink(t, outsideFile, filepath.Join(e.dir, "abs_escape"))
+
+	for _, esc := range []string{"rel_escape", "abs_escape"} {
+		if slices.Contains(e.readdir("."), esc) {
+			t.Errorf("readdir(.) includes escaping symlink %q", esc)
+		}
+		if _, err := e.lstat(esc); err == nil {
+			t.Errorf("lstat(%q) on escaping symlink succeeded", esc)
+		}
+		if _, err := e.readlink(esc); err == nil {
+			t.Errorf("readlink(%q) on escaping symlink succeeded", esc)
+		}
+		if _, err := e.open(esc, linux.O_RDONLY, 0); err == nil {
+			t.Errorf("open(%q) on escaping symlink succeeded", esc)
+		}
+	}
+
+	if !slices.Contains(e.readdir("."), "inlink") {
+		t.Errorf("readdir(.) lacks in-workspace symlink inlink")
+	}
+	st, err := e.lstat("inlink")
+	if err != nil {
+		t.Fatalf("lstat(inlink) = %v", err)
+	}
+	if st.Mode&linux.S_IFMT != linux.S_IFLNK {
+		t.Errorf("lstat(inlink).Mode = %#o, want S_IFLNK", st.Mode)
+	}
+	target, err := e.readlink("inlink")
+	if err != nil || target != "real/file.txt" {
+		t.Fatalf("readlink(inlink) = (%q, %v), want (%q, nil)", target, err, "real/file.txt")
+	}
+	if got := string(e.readFile("inlink")); got != "inside" {
+		t.Errorf("readFile(inlink) = %q, want %q", got, "inside")
+	}
+	if err := e.unlink("inlink"); err != nil {
+		t.Fatalf("unlink(inlink) = %v", err)
+	}
+	if got := string(e.readFile("real/file.txt")); got != "inside" {
+		t.Errorf("real/file.txt after unlink(inlink) = %q, want %q", got, "inside")
 	}
 }

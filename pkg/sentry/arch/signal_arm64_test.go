@@ -17,6 +17,7 @@ package arch
 import (
 	"encoding/binary"
 	"testing"
+	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
@@ -27,10 +28,11 @@ import (
 
 // signalFrameFixture holds the context and the signal frame of one delivery.
 type signalFrameFixture struct {
-	ctx    *Context64
-	st     *Stack
-	buf    []byte
-	ucAddr hostarch.Addr
+	ctx      *Context64
+	st       *Stack
+	buf      []byte
+	ucAddr   hostarch.Addr
+	infoAddr hostarch.Addr
 }
 
 func deliverSignalWithFPRegs(t *testing.T) *signalFrameFixture {
@@ -44,6 +46,7 @@ func deliverFaultWithFPRegs(t *testing.T, sig linux.Signal, at hostarch.AccessTy
 	ctx := New(ARM64)
 	ctx.SetFaultAccess(at)
 	var fp FpsimdContext
+	fp.Head = aarch64Ctx{Magic: fpsimdMagic, Size: fpsimdContextSize}
 	fp.Fpsr = 0x11
 	fp.Fpcr = 0x22
 	for i := range fp.Vregs {
@@ -53,33 +56,141 @@ func deliverFaultWithFPRegs(t *testing.T, sig linux.Signal, at hostarch.AccessTy
 
 	buf := make([]byte, 1<<14)
 	st := &Stack{Arch: ctx, IO: &usermem.BytesIO{Bytes: buf}, Bottom: hostarch.Addr(len(buf))}
-	act := &linux.SigAction{Handler: 0x1000}
+	act := &linux.SigAction{Handler: 0x1000, Restorer: 0x2000}
 	info := &linux.SignalInfo{Signo: int32(sig), Code: 1}
+	info.SetAddr(0x7fff00001234)
 	if err := ctx.SignalSetup(st, act, info, &linux.SignalStack{}, 0, cpuid.FeatureSet{}); err != nil {
 		t.Fatalf("SignalSetup: %v", err)
 	}
-	return &signalFrameFixture{ctx: ctx, st: st, buf: buf, ucAddr: st.Bottom}
-}
-
-// putFPState writes the registers of fp into state in the layout that the
-// platforms use: FPSR, FPCR, then V0 to V31, without the record header.
-func putFPState(state fpu.State, fp FpsimdContext) {
-	binary.LittleEndian.PutUint32(state[FPSIMDOffFPSR:], fp.Fpsr)
-	binary.LittleEndian.PutUint32(state[FPSIMDOffFPCR:], fp.Fpcr)
-	for i, v := range fp.Vregs {
-		binary.LittleEndian.PutUint64(state[FPSIMDOffV+8*i:], v)
+	return &signalFrameFixture{
+		ctx:      ctx,
+		st:       st,
+		buf:      buf,
+		ucAddr:   st.Bottom,
+		infoAddr: hostarch.Addr(ctx.Regs.Regs[1]),
 	}
 }
 
-// getFPState reads the registers from state. See putFPState.
+// putFPState serializes fp with the generated go_marshal encoder and copies
+// the body after the 8-byte aarch64_ctx header into state. Using MarshalBytes
+// instead of the FPSIMDOff constants detects any offset mismatch between the
+// ABI definition of FpsimdContext and fpStateToSignalFrame.
+func putFPState(state fpu.State, fp FpsimdContext) {
+	raw := make([]byte, fp.SizeBytes())
+	fp.MarshalBytes(raw)
+	hdrSize := (*aarch64Ctx)(nil).SizeBytes()
+	copy(state, raw[hdrSize:])
+}
+
+// getFPState decodes state through the generated go_marshal decoder for
+// FpsimdContext. See putFPState.
 func getFPState(state fpu.State) FpsimdContext {
 	var fp FpsimdContext
-	fp.Fpsr = binary.LittleEndian.Uint32(state[FPSIMDOffFPSR:])
-	fp.Fpcr = binary.LittleEndian.Uint32(state[FPSIMDOffFPCR:])
-	for i := range fp.Vregs {
-		fp.Vregs[i] = binary.LittleEndian.Uint64(state[FPSIMDOffV+8*i:])
-	}
+	hdrSize := (*aarch64Ctx)(nil).SizeBytes()
+	raw := make([]byte, fp.SizeBytes())
+	copy(raw[hdrSize:], state[:fp.SizeBytes()-hdrSize])
+	fp.UnmarshalBytes(raw)
 	return fp
+}
+
+// TestFPSIMDLayoutMatchesABI verifies that the shared fpu.State offset
+// constants match the generated ABI layout of FpsimdContext.
+func TestFPSIMDLayoutMatchesABI(t *testing.T) {
+	var fp FpsimdContext
+	hdrSize := unsafe.Sizeof(fp.Head)
+	if got, want := uintptr(FPSIMDOffFPSR), unsafe.Offsetof(fp.Fpsr)-hdrSize; got != want {
+		t.Fatalf("FPSIMDOffFPSR = %d, want %d", got, want)
+	}
+	if got, want := uintptr(FPSIMDOffFPCR), unsafe.Offsetof(fp.Fpcr)-hdrSize; got != want {
+		t.Fatalf("FPSIMDOffFPCR = %d, want %d", got, want)
+	}
+	if got, want := uintptr(FPSIMDOffV), unsafe.Offsetof(fp.Vregs)-hdrSize; got != want {
+		t.Fatalf("FPSIMDOffV = %d, want %d", got, want)
+	}
+	if got, want := FPSIMDBodySize, fp.SizeBytes()-(*aarch64Ctx)(nil).SizeBytes(); got != want {
+		t.Fatalf("FPSIMDBodySize = %d, want %d", got, want)
+	}
+	if got := len(fpu.NewState()); got < FPSIMDBodySize {
+		t.Fatalf("len(fpu.NewState()) = %d, want >= %d", got, FPSIMDBodySize)
+	}
+}
+
+// TestSignalSetupBuildsLinuxABIFrameAndRegisters verifies that SignalSetup
+// populates the handler registers, siginfo, and ucontext on the user stack and
+// that SignalRestore recovers the interrupted context.
+func TestSignalSetupBuildsLinuxABIFrameAndRegisters(t *testing.T) {
+	ctx := New(ARM64)
+	for i := range ctx.Regs.Regs {
+		ctx.Regs.Regs[i] = 0x1000_0000_0000_0000 | uint64(i+1)
+	}
+	ctx.Regs.Sp = 0x4000
+	ctx.Regs.Pc = 0x800400
+	ctx.Regs.Pstate = linux.PSR_MODE_EL0t | linux.PSR_N_BIT | linux.PSR_C_BIT
+	wantRegs := ctx.Regs
+
+	var fp FpsimdContext
+	fp.Head = aarch64Ctx{Magic: fpsimdMagic, Size: fpsimdContextSize}
+	fp.Fpsr = 0x15
+	fp.Fpcr = 0x01000000
+	for i := range fp.Vregs {
+		fp.Vregs[i] = 0xfeedface00000000 | uint64(i)
+	}
+	putFPState(ctx.fpState, fp)
+	ctx.SetFaultAccess(hostarch.Write)
+
+	buf := make([]byte, 1<<14)
+	st := &Stack{Arch: ctx, IO: &usermem.BytesIO{Bytes: buf}, Bottom: hostarch.Addr(len(buf))}
+	act := &linux.SigAction{Handler: 0x550000, Restorer: 0x660000}
+	info := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
+	const faultAddr = 0x7fff12345678
+	info.SetAddr(faultAddr)
+	alt := &linux.SignalStack{Addr: 0x1000, Size: 0x3000, Flags: linux.SS_ONSTACK}
+	const wantSigset = linux.SignalSet(0x1234)
+
+	if err := ctx.SignalSetup(st, act, info, alt, wantSigset, cpuid.FeatureSet{}); err != nil {
+		t.Fatalf("SignalSetup: %v", err)
+	}
+	if ctx.Regs.Sp != uint64(st.Bottom) || ctx.Regs.Sp%16 != 0 {
+		t.Fatalf("handler Sp = %#x (st.Bottom %#x), want 16-byte aligned frame bottom", ctx.Regs.Sp, st.Bottom)
+	}
+	if ctx.Regs.Pc != act.Handler {
+		t.Errorf("handler Pc = %#x, want %#x", ctx.Regs.Pc, act.Handler)
+	}
+	if ctx.Regs.Regs[0] != uint64(linux.SIGSEGV) {
+		t.Errorf("handler X0 (signo) = %d, want %d", ctx.Regs.Regs[0], linux.SIGSEGV)
+	}
+	if ctx.Regs.Regs[2] != uint64(st.Bottom) {
+		t.Errorf("handler X2 (ucontext) = %#x, want %#x", ctx.Regs.Regs[2], st.Bottom)
+	}
+	if ctx.Regs.Regs[30] != act.Restorer {
+		t.Errorf("handler X30 (restorer) = %#x, want %#x", ctx.Regs.Regs[30], act.Restorer)
+	}
+	for i, b := range ctx.fpState[:FPSIMDBodySize] {
+		if b != 0 {
+			t.Fatalf("handler fpState[%d] = %#x, want 0", i, b)
+		}
+	}
+
+	var gotInfo linux.SignalInfo
+	gotInfo.UnmarshalBytes(buf[ctx.Regs.Regs[1]:])
+	if gotInfo.Signo != int32(linux.SIGSEGV) || gotInfo.Code != segvAccerr || gotInfo.Addr() != faultAddr {
+		t.Errorf("siginfo = {signo:%d code:%d addr:%#x}, want {signo:%d code:%d addr:%#x}",
+			gotInfo.Signo, gotInfo.Code, gotInfo.Addr(), linux.SIGSEGV, segvAccerr, uint64(faultAddr))
+	}
+
+	gotSet, gotStack, err := ctx.SignalRestore(st, true, cpuid.FeatureSet{})
+	if err != nil {
+		t.Fatalf("SignalRestore: %v", err)
+	}
+	if gotSet != wantSigset {
+		t.Errorf("restored sigset = %#x, want %#x", gotSet, wantSigset)
+	}
+	if gotStack != *alt {
+		t.Errorf("restored stack = %+v, want %+v", gotStack, *alt)
+	}
+	if ctx.Regs != wantRegs {
+		t.Errorf("restored Regs = %+v, want %+v", ctx.Regs, wantRegs)
+	}
 }
 
 // A signal and its sigreturn leave every floating point register as it was.
@@ -106,6 +217,34 @@ func (f *signalFrameFixture) frame() UContext64 {
 	var uc UContext64
 	uc.UnmarshalBytes(f.buf[f.ucAddr:])
 	return uc
+}
+
+// walkReservedRecords walks the Linux arm64 __reserved context records in the
+// raw stack frame starting at the fpsimd_context offset inside ucontext up to
+// the siginfo boundary.
+func (f *signalFrameFixture) walkReservedRecords(t *testing.T) []aarch64Ctx {
+	t.Helper()
+	var uc UContext64
+	reservedOff := int(unsafe.Offsetof(uc.MContext) + unsafe.Offsetof(uc.MContext.Fpsimd64))
+	raw := f.buf[int(f.ucAddr)+reservedOff : f.infoAddr]
+	var records []aarch64Ctx
+	for off := 0; off+8 <= len(raw); {
+		var hdr aarch64Ctx
+		hdr.UnmarshalBytes(raw[off:])
+		if hdr.Magic == 0 {
+			if hdr.Size != 0 {
+				t.Fatalf("terminator record at offset %d has size %d, want 0", off, hdr.Size)
+			}
+			return records
+		}
+		if hdr.Size < 8 || hdr.Size%16 != 0 || off+int(hdr.Size) > len(raw) {
+			t.Fatalf("invalid record header {%#x, %d} at offset %d (len %d)", hdr.Magic, hdr.Size, off, len(raw))
+		}
+		records = append(records, hdr)
+		off += int(hdr.Size)
+	}
+	t.Fatalf("reserved area [%#x, %#x) lacks a zero terminator record", int(f.ucAddr)+reservedOff, f.infoAddr)
+	return nil
 }
 
 // Linux puts the floating point registers of the interrupted thread in the
@@ -177,6 +316,10 @@ func (f *signalFrameFixture) trailer() []byte {
 // makes a nested Sentry stub loop forever.
 func TestSignalFrameEndsTheRecordsWithoutAFault(t *testing.T) {
 	f := deliverSignalWithFPRegs(t)
+	records := f.walkReservedRecords(t)
+	if len(records) != 1 || records[0] != (aarch64Ctx{Magic: fpsimdMagic, Size: fpsimdContextSize}) {
+		t.Fatalf("reserved records = %+v, want only fpsimd_context", records)
+	}
 	if got := binary.LittleEndian.Uint32(f.trailer()); got != 0 {
 		t.Errorf("magic after the floating point record = %#x, want 0, the end marker", got)
 	}
@@ -198,10 +341,15 @@ func TestSignalFrameReportsTheFaultAccess(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := deliverFaultWithFPRegs(t, tc.sig, tc.at)
-			trailer := f.trailer()
-			if magic, size := binary.LittleEndian.Uint32(trailer), binary.LittleEndian.Uint32(trailer[4:]); magic != esrMagic || size != esrContextSize {
-				t.Fatalf("record head = {%#x, %d}, want {%#x, %d}", magic, size, esrMagic, esrContextSize)
+			records := f.walkReservedRecords(t)
+			wantRecords := []aarch64Ctx{
+				{Magic: fpsimdMagic, Size: fpsimdContextSize},
+				{Magic: esrMagic, Size: esrContextSize},
 			}
+			if len(records) != len(wantRecords) || records[0] != wantRecords[0] || records[1] != wantRecords[1] {
+				t.Fatalf("reserved records = %+v, want %+v", records, wantRecords)
+			}
+			trailer := f.trailer()
 			esr := binary.LittleEndian.Uint64(trailer[8:])
 			if got := hostarch.ESRAccessType(esr); got != tc.at {
 				t.Errorf("ESR %#x reports the access %v, want %v", esr, got, tc.at)
@@ -222,6 +370,10 @@ func TestSignalFrameForgetsTheFaultAccess(t *testing.T) {
 		t.Fatalf("SignalSetup: %v", err)
 	}
 	f.ucAddr = st.Bottom
+	f.infoAddr = hostarch.Addr(f.ctx.Regs.Regs[1])
+	if records := f.walkReservedRecords(t); len(records) != 1 {
+		t.Fatalf("reserved records on second signal = %+v, want only fpsimd_context", records)
+	}
 	if got := binary.LittleEndian.Uint32(f.trailer()); got != 0 {
 		t.Errorf("magic after the floating point record = %#x, want 0: the frame has a stale ESR", got)
 	}

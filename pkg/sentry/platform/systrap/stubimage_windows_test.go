@@ -17,6 +17,9 @@
 package systrap
 
 import (
+	"bytes"
+	"debug/pe"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -27,6 +30,109 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+// verifyLockedStubImageInvariants opens img.path with GENERIC_READ and FILE_SHARE_READ
+// while img.file holds the read-only lock, and verifies the on-disk PE header, section
+// alignment, entry/trap page RVA offsets, and file-handle identity invariants.
+func verifyLockedStubImageInvariants(t *testing.T, img *stubImage) {
+	t.Helper()
+	if img.file == 0 {
+		t.Fatal("img.file = 0, want valid locked handle")
+	}
+	path16, err := windows.UTF16PtrFromString(img.path)
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString(%q): %v", img.path, err)
+	}
+	reader, err := windows.CreateFile(
+		path16,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("concurrent GENERIC_READ open of locked stub image failed: %v", err)
+	}
+	defer windows.CloseHandle(reader)
+
+	var lockedInfo, readerInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(img.file, &lockedInfo); err != nil {
+		t.Fatalf("GetFileInformationByHandle(img.file): %v", err)
+	}
+	if err := windows.GetFileInformationByHandle(reader, &readerInfo); err != nil {
+		t.Fatalf("GetFileInformationByHandle(reader): %v", err)
+	}
+	if lockedInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		t.Fatalf("locked stub image has FILE_ATTRIBUTE_REPARSE_POINT: %#x", lockedInfo.FileAttributes)
+	}
+	if lockedInfo.NumberOfLinks != 1 {
+		t.Fatalf("lockedInfo.NumberOfLinks = %d, want 1", lockedInfo.NumberOfLinks)
+	}
+	if lockedInfo.VolumeSerialNumber != readerInfo.VolumeSerialNumber ||
+		lockedInfo.FileIndexHigh != readerInfo.FileIndexHigh ||
+		lockedInfo.FileIndexLow != readerInfo.FileIndexLow {
+		t.Fatalf("reader handle file identity (%#x:%#x:%#x) != locked handle (%#x:%#x:%#x)",
+			readerInfo.VolumeSerialNumber, readerInfo.FileIndexHigh, readerInfo.FileIndexLow,
+			lockedInfo.VolumeSerialNumber, lockedInfo.FileIndexHigh, lockedInfo.FileIndexLow)
+	}
+
+	wantBytes := buildStubImage(stubImageMachine())
+	diskBytes := make([]byte, len(wantBytes)+16)
+	n, err := windows.Read(reader, diskBytes)
+	if err != nil {
+		t.Fatalf("Read(reader): %v", err)
+	}
+	diskBytes = diskBytes[:n]
+	if n != stubImageSize || !bytes.Equal(diskBytes, wantBytes) {
+		t.Fatalf("on-disk stub image size = %d (want %d), bytes match = %v", n, stubImageSize, bytes.Equal(diskBytes, wantBytes))
+	}
+
+	peFile, err := pe.NewFile(bytes.NewReader(diskBytes))
+	if err != nil {
+		t.Fatalf("pe.NewFile(diskBytes): %v", err)
+	}
+	if peFile.Machine != stubImageMachine() {
+		t.Fatalf("PE Machine = %#x, want %#x", peFile.Machine, stubImageMachine())
+	}
+	oh, ok := peFile.OptionalHeader.(*pe.OptionalHeader64)
+	if !ok {
+		t.Fatalf("OptionalHeader = %T, want *pe.OptionalHeader64", peFile.OptionalHeader)
+	}
+	if oh.SectionAlignment != peSectionAlign || oh.FileAlignment != peFileAlign {
+		t.Fatalf("SectionAlignment=%#x FileAlignment=%#x, want %#x and %#x",
+			oh.SectionAlignment, oh.FileAlignment, uint32(peSectionAlign), uint32(peFileAlign))
+	}
+	if oh.ImageBase != peImageBase {
+		t.Fatalf("ImageBase = %#x, want %#x", oh.ImageBase, uint64(peImageBase))
+	}
+	if oh.AddressOfEntryPoint != peSectionAlign || oh.BaseOfCode != peSectionAlign {
+		t.Fatalf("AddressOfEntryPoint=%#x BaseOfCode=%#x, want %#x",
+			oh.AddressOfEntryPoint, oh.BaseOfCode, uint32(peSectionAlign))
+	}
+	if len(peFile.Sections) != 1 {
+		t.Fatalf("len(Sections) = %d, want 1", len(peFile.Sections))
+	}
+	sec := peFile.Sections[0]
+	if sec.VirtualAddress != peSectionAlign || sec.Offset != peFileAlign || sec.Size != peFileAlign {
+		t.Fatalf(".text section VA=%#x Offset=%#x Size=%#x, want VA=%#x Offset=%#x Size=%#x",
+			sec.VirtualAddress, sec.Offset, sec.Size, uint32(peSectionAlign), uint32(peFileAlign), uint32(peFileAlign))
+	}
+	relocDir := oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_BASERELOC]
+	if relocDir.VirtualAddress != peSectionAlign+stubImageRelocOff || relocDir.Size != 8 {
+		t.Fatalf("base reloc directory = %+v, want VA=%#x Size=8", relocDir, uint32(peSectionAlign+stubImageRelocOff))
+	}
+	loadDir := oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG]
+	if loadDir.VirtualAddress != peSectionAlign+stubImageLoadOff || loadDir.Size != stubImageLoadSize {
+		t.Fatalf("load config directory = %+v, want VA=%#x Size=%#x",
+			loadDir, uint32(peSectionAlign+stubImageLoadOff), uint32(stubImageLoadSize))
+	}
+	guardFlags := binary.LittleEndian.Uint32(diskBytes[peFileAlign+stubImageLoadOff+loadConfigGuardFlagsOff:])
+	if guardFlags&guardSecurityCookieUnused == 0 {
+		t.Fatalf("GuardFlags = %#x, want bit %#x set", guardFlags, uint32(guardSecurityCookieUnused))
+	}
+}
 
 // runImage starts path as a normal process and returns its exit code.
 func runImage(t *testing.T, path string) uint32 {
@@ -61,6 +167,7 @@ func TestStubImageRunsAsAProcess(t *testing.T) {
 		t.Fatalf("createStubImage: %v", err)
 	}
 	defer img.close()
+	verifyLockedStubImageInvariants(t, img)
 	if code := runImage(t, img.path); code != 0 {
 		t.Fatalf("the stub image exited with %#x, want 0. A code of 0xC000007B means that the loader rejected the header", code)
 	}
@@ -76,12 +183,20 @@ func TestStubImageLockRefusesWritersAndAllowsReaders(t *testing.T) {
 		t.Fatalf("createStubImage: %v", err)
 	}
 	defer img.close()
-	p, _ := windows.UTF16PtrFromString(img.path)
+	verifyLockedStubImageInvariants(t, img)
+	p, err := windows.UTF16PtrFromString(img.path)
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString(%q): %v", img.path, err)
+	}
 
 	for _, access := range []struct {
 		name string
 		bits uint32
-	}{{"write", windows.GENERIC_WRITE}, {"append", windows.FILE_APPEND_DATA}, {"delete", windows.DELETE}} {
+	}{
+		{"write", windows.GENERIC_WRITE},
+		{"append", windows.FILE_APPEND_DATA},
+		{"delete", windows.DELETE},
+	} {
 		h, err := windows.CreateFile(p, access.bits, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 			nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 		if err == nil {
@@ -89,6 +204,24 @@ func TestStubImageLockRefusesWritersAndAllowsReaders(t *testing.T) {
 			t.Errorf("open for %s succeeded while the host holds the image", access.name)
 		} else if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 			t.Errorf("open for %s failed with %v, want a sharing violation", access.name, err)
+		}
+	}
+	// Opening with write or delete sharing must also fail with ERROR_SHARING_VIOLATION
+	// because the host handle shares only FILE_SHARE_READ.
+	for _, share := range []struct {
+		name string
+		mode uint32
+	}{
+		{"share-write", windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE},
+		{"share-delete", windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE},
+	} {
+		h, err := windows.CreateFile(p, windows.GENERIC_READ, share.mode,
+			nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		if err == nil {
+			windows.CloseHandle(h)
+			t.Errorf("GENERIC_READ open with %s succeeded while the host holds the image", share.name)
+		} else if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			t.Errorf("GENERIC_READ open with %s failed with %v, want ERROR_SHARING_VIOLATION", share.name, err)
 		}
 	}
 	if err := os.Remove(img.path); err == nil {
@@ -100,18 +233,10 @@ func TestStubImageLockRefusesWritersAndAllowsReaders(t *testing.T) {
 	if err := os.WriteFile(img.path, []byte("x"), 0o755); err == nil {
 		t.Error("os.WriteFile replaced the locked image")
 	}
-	// Record whether the directory of a locked file can be renamed. The threat
-	// model in the document depends on the answer.
-	moved := dir + "-moved"
-	if err := os.Rename(dir, moved); err == nil {
-		t.Logf("DIRECTORY RENAME OF A LOCKED FILE SUCCEEDED")
-		_ = os.Rename(moved, dir)
-	} else {
-		t.Logf("directory rename of a locked file failed: %v", err)
-	}
 	if got := runImage(t, img.path); got != 0 {
 		t.Errorf("the loader could not run the locked image: exit %#x", got)
 	}
+	verifyLockedStubImageInvariants(t, img)
 }
 
 func TestStubImageCloseRemovesTheFile(t *testing.T) {
