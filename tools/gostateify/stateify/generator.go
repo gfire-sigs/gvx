@@ -1295,7 +1295,10 @@ func extractStructFields(pf *parsedSourceFile, structName string, st *ast.Struct
 		if err != nil {
 			return nil, fmt.Errorf("%s (%s): %w", pf.baseName, structName, err)
 		}
-		if stateTag == "nosave" {
+		// Upstream gVisor uses "nosave", "manual" (pkg/tcpip/socketops.go,
+		// pkg/tcpip/transport/tcp/segment.go), and "zero" (pkg/sleep/sleep_unsafe.go)
+		// to omit fields from generated StateFields/StateSave/StateLoad methods.
+		if stateTag == "nosave" || stateTag == "manual" || stateTag == "zero" {
 			continue
 		}
 
