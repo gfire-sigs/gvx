@@ -979,7 +979,7 @@ func (d *dynamicCacheEntry) beforeSave() {}
 func (d *dynamicCacheEntry) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
 	stateSinkObject.Save(0, &d.lru)
-	stateSinkObject.Save(1, &d.count)
+	stateSinkObject.SaveUint16(1, &d.count)
 }
 
 func (d *dynamicCacheEntry) afterLoad(context.Context) {}
@@ -987,7 +987,7 @@ func (d *dynamicCacheEntry) afterLoad(context.Context) {}
 // +checklocksignore
 func (d *dynamicCacheEntry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.lru)
-	stateSourceObject.Load(1, &d.count)
+	stateSourceObject.LoadUint16(1, &d.count)
 }
 
 func (n *neighborCacheMu) StateTypeName() string {

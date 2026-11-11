@@ -202,3 +202,80 @@ func TestForcedCollectionKeepsRecentStaleEntries(t *testing.T) {
 		t.Errorf("entries after the collection = %v, want the younger stale entry and the new entry", entries)
 	}
 }
+
+func TestDynamicNeighborCountsIsolateAcrossStacksAndNICDisable(t *testing.T) {
+	a, b := newNeighStack(t), newNeighStack(t)
+	a.addLink(t, 1)
+	b.addLink(t, 1)
+	if err := a.SetNeighborGCThresholds(ipv4.ProtocolNumber, stack.NeighborGCThresholds{Thresh1: 1, Thresh2: 2, Thresh3: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetNeighborGCThresholds(ipv4.ProtocolNumber, stack.NeighborGCThresholds{Thresh1: 1, Thresh2: 2, Thresh3: 2}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if err := a.resolve(1, peer4(1, i)); err != nil {
+			t.Fatalf("stack a entry %d: %v", i, err)
+		}
+	}
+	if err := a.resolve(1, peer4(1, 10)); !isNoBufferSpace(err) {
+		t.Fatalf("stack a third entry = %v, want ErrNoBufferSpace", err)
+	}
+	for i := range 2 {
+		if err := b.resolve(1, peer4(1, i)); err != nil {
+			t.Fatalf("stack b entry %d while stack a is full: %v", i, err)
+		}
+	}
+
+	if err := a.DisableNIC(1); err != nil {
+		t.Fatalf("DisableNIC: %v", err)
+	}
+	if err := a.EnableNIC(1); err != nil {
+		t.Fatalf("EnableNIC: %v", err)
+	}
+	for i := range 2 {
+		if err := a.resolve(1, peer4(1, 20+i)); err != nil {
+			t.Fatalf("stack a entry %d after NIC reset: %v", i, err)
+		}
+	}
+	if err := a.resolve(1, peer4(1, 30)); !isNoBufferSpace(err) {
+		t.Fatalf("stack a third entry after NIC reset = %v, want ErrNoBufferSpace", err)
+	}
+}
+
+func TestThresh3AboveUint16MaxEnforcesExactLimit(t *testing.T) {
+	s := newNeighStack(t)
+	s.addLink(t, 1)
+	const limit = 65540
+	if err := s.SetNeighborGCThresholds(ipv6.ProtocolNumber, stack.NeighborGCThresholds{
+		Thresh1: limit,
+		Thresh2: limit,
+		Thresh3: limit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range limit {
+		if err := s.resolve6(1, peer6(1, i)); err != nil {
+			t.Fatalf("dynamic entry %d: %v", i, err)
+		}
+	}
+	if err := s.resolve6(1, peer6(1, limit)); !isNoBufferSpace(err) {
+		t.Fatalf("entry %d = %v, want ErrNoBufferSpace", limit+1, err)
+	}
+
+	if err := s.RemoveNeighbor(1, ipv6.ProtocolNumber, peer6(1, 0)); err != nil {
+		t.Fatalf("RemoveNeighbor: %v", err)
+	}
+	if err := s.resolve6(1, peer6(1, limit)); err != nil {
+		t.Fatalf("insert after RemoveNeighbor above MaxUint16: %v", err)
+	}
+	if err := s.DisableNIC(1); err != nil {
+		t.Fatalf("DisableNIC: %v", err)
+	}
+	if err := s.EnableNIC(1); err != nil {
+		t.Fatalf("EnableNIC: %v", err)
+	}
+	if err := s.resolve6(1, peer6(1, limit+1)); err != nil {
+		t.Fatalf("insert after NIC reset above MaxUint16: %v", err)
+	}
+}

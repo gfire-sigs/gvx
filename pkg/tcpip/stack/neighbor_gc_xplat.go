@@ -15,6 +15,7 @@
 package stack
 
 import (
+	"math"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/sync"
@@ -22,12 +23,12 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
 
-// This file limits the dynamic entries of the neighbor tables as neigh_alloc and
-// neigh_forced_gc of net/core/neighbour.c do in Linux. Linux counts the entries
-// of one table (arp_tbl or nd_tbl) over all links, and the sysctls
-// net.ipv4.neigh.default.gc_thresh1 to gc_thresh3 and the IPv6 equivalents
-// set the thresholds. A static entry (NUD_PERMANENT) is not on the garbage
-// collection list, so it does not count and has no limit.
+// This file limits dynamic entries in neighbor tables as neigh_alloc and
+// neigh_forced_gc in Linux net/core/neighbour.c do. Linux counts entries of
+// one protocol table (arp_tbl or nd_tbl) across all links in the network
+// namespace. The sysctls net.ipv4.neigh.default.gc_thresh1 to gc_thresh3 and
+// their IPv6 equivalents configure those thresholds. Static entries
+// (NUD_PERMANENT) stay off the garbage-collection list and have no limit.
 
 // Defaults of gc_thresh1, gc_thresh2, and gc_thresh3 in arp_tbl and nd_tbl.
 const (
@@ -37,53 +38,68 @@ const (
 )
 
 const (
-	// neighborGCRecent is the age below which a stale entry survives a forced
+	// neighborGCRecent is the age below which a stale entry survives forced
 	// collection. Linux uses 5 * HZ.
 	neighborGCRecent = 5 * time.Second
-	// neighborGCBudget is the time that a forced collection may run before it
-	// stops. Linux stops after one millisecond.
+	// neighborGCBudget bounds the duration of one forced-collection pass.
+	// Linux stops after one millisecond.
 	neighborGCBudget = time.Millisecond
-	// neighborGCBudgetStep is the count of removal candidates between two clock
-	// reads of a forced collection.
+	// neighborGCBudgetStep is the number of candidates visited between clock
+	// reads during forced collection.
 	neighborGCBudgetStep = 16
 )
 
-// NeighborGCThresholds are gc_thresh1, gc_thresh2, and gc_thresh3 of a
-// neighbor table. Linux accepts every value from 0 to MaxInt32 and does not
-// compare the thresholds with each other.
+// NeighborGCThresholds holds gc_thresh1, gc_thresh2, and gc_thresh3 for one
+// neighbor table. Linux accepts values from 0 to MaxInt32 without ordering
+// constraints between thresholds.
 type NeighborGCThresholds struct {
 	Thresh1, Thresh2, Thresh3 int32
 }
 
-// DefaultNeighborGCThresholds returns the thresholds of a new neighbor table.
+// DefaultNeighborGCThresholds returns the default thresholds for a neighbor table.
 func DefaultNeighborGCThresholds() NeighborGCThresholds {
 	return NeighborGCThresholds{DefaultNeighborGCThresh1, DefaultNeighborGCThresh2, DefaultNeighborGCThresh3}
 }
 
-// neighborTable is the neighbor table of one network protocol in a stack. It
-// corresponds to struct neigh_table of Linux for the network namespace of the
-// stack. It owns the thresholds and the registry of the caches of the links.
+// neighborCacheSlot tracks one registered link cache inside a neighborTable.
+type neighborCacheSlot struct {
+	cache *neighborCache
+	// wideCount reports whether dynamic entries exceeded MaxUint16, where
+	// dynamicCacheEntry.count wraps modulo 65536. cache.mu protects wideCount.
+	wideCount bool
+}
+
+func (s *neighborCacheSlot) dynamicEntries() int64 {
+	c := s.cache
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !s.wideCount {
+		return int64(c.mu.dynamic.count)
+	}
+	return int64(c.mu.dynamic.lru.Len())
+}
+
+// neighborTable owns the thresholds and registered link caches for one network
+// protocol in a Stack.
 type neighborTable struct {
-	// allocMu orders the allocation of dynamic entries and the forced
-	// collection. It plays the role of tbl->lock for neigh_alloc. The code
-	// takes allocMu before the lock of a cache and never the reverse.
+	// allocMu serializes dynamic entry admission and forced collection.
+	// Callers acquire allocMu before any neighborCache lock.
 	allocMu sync.Mutex
-	// thresholds and lastFlush are protected by allocMu.
+	// allocMu protects thresholds and lastFlush.
 	thresholds *NeighborGCThresholds
 	lastFlush  tcpip.MonotonicTime
 
-	// regMu protects caches. It is a leaf lock.
+	// regMu protects caches as a leaf lock.
 	regMu  sync.Mutex
-	caches []*neighborCache
+	caches []*neighborCacheSlot
 }
 
-// neighborTables are the neighbor tables of the stack.
+// neighborTables holds the per-protocol neighbor tables of a Stack.
 type neighborTables struct {
 	ipv4, ipv6 neighborTable
 }
 
-// of returns the table of the network protocol, or nil when the protocol has
-// no neighbor table.
+// of returns the table for protocol, or nil when protocol uses no neighbor table.
 func (t *neighborTables) of(protocol tcpip.NetworkProtocolNumber) *neighborTable {
 	switch protocol {
 	case header.IPv4ProtocolNumber:
@@ -94,8 +110,7 @@ func (t *neighborTables) of(protocol tcpip.NetworkProtocolNumber) *neighborTable
 	return nil
 }
 
-// NeighborGCThresholds returns gc_thresh1, gc_thresh2, and gc_thresh3 of the
-// neighbor table of the protocol.
+// NeighborGCThresholds returns gc_thresh1, gc_thresh2, and gc_thresh3 for protocol.
 func (s *Stack) NeighborGCThresholds(protocol tcpip.NetworkProtocolNumber) (NeighborGCThresholds, tcpip.Error) {
 	t := s.neighborTables.of(protocol)
 	if t == nil {
@@ -106,9 +121,9 @@ func (s *Stack) NeighborGCThresholds(protocol tcpip.NetworkProtocolNumber) (Neig
 	return t.thresholdsLocked(), nil
 }
 
-// SetNeighborGCThresholds sets gc_thresh1, gc_thresh2, and gc_thresh3 of the
-// neighbor table of the protocol. A table that already holds more entries than
-// the new threshold keeps them. The next new dynamic entry starts a collection.
+// SetNeighborGCThresholds updates gc_thresh1, gc_thresh2, and gc_thresh3 for
+// protocol. Existing entries remain in the table; the next dynamic allocation
+// evaluates the new thresholds.
 func (s *Stack) SetNeighborGCThresholds(protocol tcpip.NetworkProtocolNumber, th NeighborGCThresholds) tcpip.Error {
 	t := s.neighborTables.of(protocol)
 	if t == nil {
@@ -127,80 +142,144 @@ func (t *neighborTable) thresholdsLocked() NeighborGCThresholds {
 	return *t.thresholds
 }
 
-// register adds the cache of a link to the table. It does nothing when the
-// cache is in the table.
-func (t *neighborTable) register(n *neighborCache) {
+// register adds n to the table when absent and returns its slot.
+func (t *neighborTable) register(n *neighborCache) *neighborCacheSlot {
 	t.regMu.Lock()
-	defer t.regMu.Unlock()
-	for _, c := range t.caches {
-		if c == n {
-			return
+	for _, s := range t.caches {
+		if s.cache == n {
+			t.regMu.Unlock()
+			return s
 		}
 	}
-	t.caches = append(t.caches, n)
+	t.regMu.Unlock()
+
+	n.mu.RLock()
+	wide := n.mu.dynamic.lru.Len() > math.MaxUint16
+	n.mu.RUnlock()
+
+	t.regMu.Lock()
+	defer t.regMu.Unlock()
+	for _, s := range t.caches {
+		if s.cache == n {
+			return s
+		}
+	}
+	s := &neighborCacheSlot{cache: n, wideCount: wide}
+	t.caches = append(t.caches, s)
+	return s
 }
 
-// unregister removes the cache of a link from the table. The entries of the
-// cache stop counting.
+// unregister removes n from the table so entries on a removed NIC stop counting.
 func (t *neighborTable) unregister(n *neighborCache) {
 	t.regMu.Lock()
 	defer t.regMu.Unlock()
-	for i, c := range t.caches {
-		if c == n {
+	for i, s := range t.caches {
+		if s.cache == n {
 			t.caches = append(t.caches[:i], t.caches[i+1:]...)
 			return
 		}
 	}
 }
 
-// snapshot returns the caches of the table.
-func (t *neighborTable) snapshot() []*neighborCache {
+// snapshot returns a copy of the registered cache slots.
+func (t *neighborTable) snapshot() []*neighborCacheSlot {
 	t.regMu.Lock()
 	defer t.regMu.Unlock()
-	return append([]*neighborCache(nil), t.caches...)
+	return append([]*neighborCacheSlot(nil), t.caches...)
 }
 
-// entries returns the count of dynamic entries of the table, which is
-// tbl->gc_entries in Linux.
-func (t *neighborTable) entries() int32 {
-	var total int32
-	for _, c := range t.snapshot() {
-		total += c.mu.dynamic.count.Load() // +checklocksforce: count is atomic, and the table reads it without the lock
+// entries returns the total count of dynamic entries across registered caches.
+func (t *neighborTable) entries() int64 {
+	var total int64
+	for _, s := range t.snapshot() {
+		total += s.dynamicEntries()
 	}
 	return total
 }
 
-// admitLocked decides whether the table accepts one more dynamic entry. It
-// follows neigh_alloc: a table with gc_thresh3 entries, or with gc_thresh2
-// entries and no forced collection for five seconds, runs a forced collection.
-// The table refuses the entry only when the collection frees nothing and the
-// table holds gc_thresh3 entries or more. Linux then logs "neighbor table
-// overflow!" and fails with ENOBUFS.
+// getOrCreateDynamicEntry returns the cached entry for remoteAddr or allocates
+// a new dynamic entry when the stack neighbor table admits one. It returns nil
+// when the table rejects allocation at gc_thresh3.
+func (n *neighborCache) getOrCreateDynamicEntry(remoteAddr tcpip.Address) *neighborEntry {
+	n.mu.Lock()
+	entry, ok := n.mu.cache[remoteAddr]
+	if ok {
+		n.bumpLocked(entry)
+	}
+	n.mu.Unlock()
+	if ok {
+		return entry
+	}
+
+	var slot *neighborCacheSlot
+	if table := n.nic.stack.neighborTables.of(n.linkRes.LinkAddressProtocol()); table != nil {
+		table.allocMu.Lock()
+		defer table.allocMu.Unlock()
+		slot = table.register(n)
+		if !table.admitLocked(n.nic.stack.clock) {
+			return nil
+		}
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if entry, ok := n.mu.cache[remoteAddr]; ok {
+		n.bumpLocked(entry)
+		return entry
+	}
+	if slot != nil && slot.wideCount && n.mu.dynamic.lru.Empty() {
+		slot.wideCount = false
+	}
+	entry = newNeighborEntry(n, remoteAddr, n.state)
+	n.mu.cache[remoteAddr] = entry
+	n.mu.dynamic.lru.PushFront(entry)
+	if slot != nil && n.mu.dynamic.count == math.MaxUint16 {
+		slot.wideCount = true
+	}
+	n.mu.dynamic.count++
+	return entry
+}
+
+// bumpLocked moves a dynamic entry to the front of the LRU list.
 //
-// The caller holds allocMu.
+// +checklocks:n.mu.neighborCacheRWMutex
+func (n *neighborCache) bumpLocked(entry *neighborEntry) {
+	entry.mu.RLock()
+	if entry.mu.neigh.State != Static {
+		n.mu.dynamic.lru.Remove(entry)
+		n.mu.dynamic.lru.PushFront(entry)
+	}
+	entry.mu.RUnlock()
+}
+
+// admitLocked reports whether the table admits one new dynamic entry. At
+// gc_thresh3, or at gc_thresh2 after five seconds since the last flush, it runs
+// forced collection first. It rejects allocation when collection frees no entry
+// at or above gc_thresh3. Caller holds allocMu.
 func (t *neighborTable) admitLocked(clock tcpip.Clock) bool {
 	th := t.thresholdsLocked()
 	entries := t.entries()
+	thresh2 := int64(th.Thresh2)
+	thresh3 := int64(th.Thresh3)
 	now := clock.NowMonotonic()
-	if entries < th.Thresh3 && (entries < th.Thresh2 || now.Sub(t.lastFlush) <= neighborGCRecent) {
+	if entries < thresh3 && (entries < thresh2 || now.Sub(t.lastFlush) <= neighborGCRecent) {
 		return true
 	}
-	// The collection counts the entry that the caller adds.
-	return t.forcedGCLocked(clock, int64(entries)+1-int64(th.Thresh2)) > 0 || entries < th.Thresh3
+	// Count the incoming entry when computing forced-collection target removals.
+	return t.forcedGCLocked(clock, entries+1-thresh2) > 0 || entries < thresh3
 }
 
-// forcedGCLocked removes the entries that neigh_forced_gc removes: failed
-// entries, entries for a multicast address, and entries that did not change
-// for five seconds. An entry with a running timer (incomplete, reachable,
-// delay, and probe) holds a reference in Linux, so it stays. It stops after
-// maxClean removals, or after neighborGCBudget. It returns the count of
-// removed entries.
+// forcedGCLocked evicts unreachable entries, multicast entries, and stale
+// entries older than five seconds, matching Linux neigh_forced_gc. Entries with
+// active timers remain in the cache. It stops after maxClean removals or
+// neighborGCBudget and returns the number of evicted entries.
 func (t *neighborTable) forcedGCLocked(clock tcpip.Clock, maxClean int64) int {
 	now := clock.NowMonotonic()
 	deadline := now.Add(neighborGCBudget)
 	tref := now.Add(-neighborGCRecent)
 	shrunk, loop := 0, 0
-	for _, c := range t.snapshot() {
+	for _, s := range t.snapshot() {
+		c := s.cache
 		c.mu.Lock()
 		for e := c.mu.dynamic.lru.Back(); e != nil; {
 			prev := e.Prev()
@@ -212,7 +291,7 @@ func (t *neighborTable) forcedGCLocked(clock tcpip.Clock, maxClean int64) int {
 					e.mu.neigh.UpdatedAt.Before(tref) || e.mu.neigh.UpdatedAt.After(now) {
 					c.mu.dynamic.lru.Remove(e)
 					delete(c.mu.cache, e.mu.neigh.Addr)
-					c.mu.dynamic.count.Add(-1)
+					c.mu.dynamic.count--
 					e.removeLocked()
 					shrunk++
 				}
