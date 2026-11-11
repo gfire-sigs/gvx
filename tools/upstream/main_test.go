@@ -36,8 +36,8 @@ func TestRunAuditPrintsPerTierNumbers(t *testing.T) {
 
 	repo := with(cleanRepo(),
 		"pkg/hostsyscall/sys.go", "//go:build linux\n\npackage hostsyscall\n",
-		"pkg/kernel/helper_xplat.go", "package kernel\n\nfunc Helper() {}\n",
-		"pkg/kernel/helper_xplat_test.go", "package kernel\n",
+		"pkg/memutil/helper_xplat.go", "package memutil\n\nfunc Helper() {}\n",
+		"pkg/memutil/helper_xplat_test.go", "package memutil\n",
 		"pkg/fd/fd_xplat.go", "package fd\n",
 	)
 	root, archive := writeMainRepo(t, repo)
@@ -156,7 +156,7 @@ func TestSyncModeFallsBackToArchiveOverlayOutsideGit(t *testing.T) {
 	t.Parallel()
 
 	// The PROTECTed Tier 2 shadow file is gvx-owned: sync leaves it alone and the audit expects it to exist.
-	root, archive := writeMainRepo(t, map[string]string{"pkg/shadow/shadow_darwin.go": "package shadow\n"})
+	root, archive := writeMainRepo(t, map[string]string{"pkg/rawfile/shadow_darwin.go": "package rawfile\n"})
 	writeTestFile(t, root, "go.mod", "module z.gfire.dev/gvx\n\ngo 1.27.4\n\nrequire golang.org/x/arch v0.32.0\n")
 	stdout, stderr, err := runTool(t, "-mode=sync", "-root", root, "-ref", testSHA, "-archive", archive, "-offline")
 	if err != nil {

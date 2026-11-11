@@ -197,8 +197,8 @@ func printReport(w io.Writer, r AuditReport, maxRatio float64) {
 		commit = commit[:12]
 	}
 	fmt.Fprintf(w, "upstream commit=%s baseline=%d go/asm files (mask-excluded=%d)\n", commit, r.UpstreamBaseline, r.MaskExcluded)
-	fmt.Fprintf(w, "tier1 (additive):  files=%d\n", r.Tier1Count)
-	fmt.Fprintf(w, "tier2 (siblings):  files=%d upstream-shadows=%d shadow-edits=%d\n", r.Tier2Count, r.Tier2Shadows, r.Shadow)
+	fmt.Fprintf(w, "tier1 (additive):  files=%d pkgs=%d\n", r.Tier1Count, r.Tier1PackageCount)
+	fmt.Fprintf(w, "tier2 (siblings):  files=%d pkgs=%d upstream-shadows=%d shadow-edits=%d\n", r.Tier2Count, r.Tier2PackageCount, r.Tier2Shadows, r.Shadow)
 	fmt.Fprintf(w, "tier2 (xplat):     files=%d loc=%d shared-pkgs=%d\n", r.Tier2XplatCount, r.Tier2XplatLOC, r.Tier2SharedPkgCount)
 	fmt.Fprintf(w, "tier3 (upstream):  files=%d pristine=%d format-only=%d build-expand=%d seams=%d added=%d tests-added=%d\n",
 		r.Tier3Count, r.Pristine, r.Format, r.Expand, r.Seam, r.Added, r.TestsAdded)

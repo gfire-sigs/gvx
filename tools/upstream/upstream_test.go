@@ -300,9 +300,10 @@ INCLUDE pkg/**
 	oldUpstream["pkg/seam/both.go"] = "package seam\n\nfunc Top() int {\n\treturn 1\n}\n\nfunc Bottom() int {\n\treturn 10\n}\n"
 	oldUpstream["pkg/seam/localonly.go"] = "package seam\n\nfunc Keep() string {\n\treturn \"upstream\"\n}\n"
 	oldUpstream["pkg/expanded/exp.go"] = "//go:build linux\n\npackage expanded\n\nfunc V() int { return 1 }\n"
+	oldUpstream["pkg/tcpip/stack/stack.go"] = "package stack\n"
 	oldUpstream["pkg/obsolete/gone.go"] = "package obsolete\n"
 	delete(oldUpstream, "runsc/main.go")
-	delete(oldUpstream, "pkg/shadow/shadow_darwin.go")
+	delete(oldUpstream, "pkg/rawfile/shadow_darwin.go")
 
 	newUpstream := with(oldUpstream,
 		"pkg/seam/both.go", "package seam\n\nfunc Top() int {\n\treturn 2\n}\n\nfunc Bottom() int {\n\treturn 10\n}\n",
@@ -445,7 +446,7 @@ func TestSyncUpstreamAuditFailurePreservesOldCommit(t *testing.T) {
 		newSHA = "6666666666666666666666666666666666666666"
 	)
 
-	mask, err := ParseFileMaskReader(strings.NewReader("EXCLUDE runsc/**\nPROTECT pkg/shadow/*_darwin*\nINCLUDE pkg/**\n"))
+	mask, err := ParseFileMaskReader(strings.NewReader("EXCLUDE runsc/**\nPROTECT pkg/rawfile/*_darwin*\nINCLUDE pkg/**\n"))
 	if err != nil {
 		t.Fatalf("ParseFileMaskReader: %v", err)
 	}
