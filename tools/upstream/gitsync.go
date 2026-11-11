@@ -32,11 +32,13 @@ type GitSyncConfig struct {
 	// Branch is the upstream branch to merge. Empty selects "go".
 	Branch string
 	// TargetRef optionally pins the commit to merge instead of the branch tip.
-	TargetRef string
-	MaxRatio  float64
-	Mask      *FileMask
-	Patches   *PatchSet
-	Source    ArchiveSource
+	TargetRef            string
+	MaxRatio             float64
+	Mask                 *FileMask
+	Patches              *PatchSet
+	RegenStateify        bool
+	StateifyPackagesFile string
+	Source               ArchiveSource
 	// Log receives one line per completed step. Nil discards them.
 	Log func(format string, args ...any)
 }
@@ -144,14 +146,19 @@ func GitSync(ctx context.Context, cfg GitSyncConfig) (SyncManifest, error) {
 		if listErr != nil {
 			return SyncManifest{}, errors.Join(err, listErr)
 		}
-		return SyncManifest{}, fmt.Errorf("%w: resolve these files, then run -mode=retag and -mode=audit -ref=%s:\n%s", errMergeConflicts, target, conflicts)
+		return SyncManifest{}, fmt.Errorf("%w: resolve these files, then run ./scripts/gostateify.sh, -mode=retag, and -mode=audit -ref=%s:\n%s", errMergeConflicts, target, conflicts)
 	}
 	cfg.logf("step 4: merged %s without committing", target)
 
+	if cfg.RegenStateify {
+		if _, err := RegenerateStateify(cfg.RootDir, cfg.RootDir, cfg.StateifyPackagesFile); err != nil {
+			return SyncManifest{}, fmt.Errorf("step 5: regenerate stateify: %w", err)
+		}
+	}
 	if _, err := RetagFiles(cfg.RootDir, cfg.Patches); err != nil {
 		return SyncManifest{}, fmt.Errorf("step 5: retag: %w", err)
 	}
-	cfg.logf("step 5: retagged allowlisted files")
+	cfg.logf("step 5: regenerated stateify and retagged allowlisted files")
 
 	if err := auditAgainst(ctx, cfg, target); err != nil {
 		return SyncManifest{}, fmt.Errorf("step 6: audit of merged tree: %w", err)

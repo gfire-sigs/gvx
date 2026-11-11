@@ -35,7 +35,7 @@ Execute these numbered steps at the start of every task before editing repositor
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `android`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
+| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Place alongside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip`, `pkg/sentry/platform/systrap/{usertrap,sysmsg}` (`amd64` files) | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below `5.0%`. Name every additive helper file in a shared package `*_xplat.go` or `*_darwin*.go`, so the audit counts it as a Tier 2 sibling. |
 
@@ -93,9 +93,10 @@ Keep `e2e/` black-box tests 100% OS-agnostic across Windows and macOS (`pkg/gvx`
 1. Format source files and run native unit and `e2e/` tests on `darwin/arm64` with `scripts/codesign-exec.sh`.
 2. Cross-compile all packages across the three non-Linux Priority-0 targets (`darwin/arm64`, `windows/amd64`, `windows/arm64`) and both Linux targets (`linux/amd64`, `linux/arm64`).
 3. Run the upstream diff audit tool to verify that modified upstream files remain below 5.0%.
-4. Run the gVisor analyzers (`checklocks`, `checkconst`, `checklinkname`) for the five targets. Read [`docs/gvisorlint.md`](docs/gvisorlint.md) to fix a finding.
-5. Execute the mechanical `ripgrep` checks from Section 9.2 of [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) against `README.md`, `AGENTS.md`, and `docs/`.
-6. Push the change and read the CI result. CI runs the tests that the local host cannot run.
+4. Run `./scripts/gostateify.sh -check` to verify that generated state files match their source declarations.
+5. Run the gVisor analyzers (`checklocks`, `checkconst`, `checklinkname`) for the five targets. Read [`docs/gvisorlint.md`](docs/gvisorlint.md) to fix a finding.
+6. Execute the mechanical `ripgrep` checks from Section 9.2 of [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) against `README.md`, `AGENTS.md`, and `docs/`.
+7. Push the change and read the CI result. CI runs the tests that the local host cannot run.
 
 ```bash
 # 1. Format and test natively on the active host (darwin/arm64 first; gojgp lint is disabled)
@@ -112,10 +113,13 @@ GOOS=linux   GOARCH=arm64 go build ./...
 # 3. Verify upstream diff budget (< 5.0% touched upstream files)
 go run ./tools/upstream -mode=audit -max-ratio=0.05
 
-# 4. Run checklocks, checkconst, and checklinkname for the five targets (must print nothing)
+# 4. Verify generated state files match source declarations
+./scripts/gostateify.sh -check
+
+# 5. Run checklocks, checkconst, and checklinkname for the five targets (must print nothing)
 scripts/gvisorlint.sh
 
-# 5. Verify zero em-dashes, spaced en-dashes, or prose arrows in documentation (must return 0 matches)
+# 6. Verify zero em-dashes, spaced en-dashes, or prose arrows in documentation (must return 0 matches)
 rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md docs/ 2>/dev/null
 ```
 

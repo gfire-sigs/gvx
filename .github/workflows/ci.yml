@@ -29,7 +29,7 @@ env:
   # Packages that gvx owns or extends. The upstream gVisor trees have their own
   # tests, which the project does not run.
   OWNED: >-
-    ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/...
+    ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
     ./pkg/gvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/...
     ./pkg/abi/linux/... ./pkg/cpuid/... ./pkg/erofs/... ./pkg/fd/... ./pkg/fdnotifier/... ./pkg/fsutil/... ./pkg/hostarch/...
     ./pkg/memutil/... ./pkg/rawfile/... ./pkg/ring0/... ./pkg/sync/... ./pkg/syserr/...
@@ -44,7 +44,7 @@ env:
   # Packages that gvx wrote. Upstream packages carry vet findings that the
   # project does not fix.
   VET: >-
-    ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/...
+    ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
     ./pkg/gvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/...
     ./pkg/sentry/blockdev/... ./pkg/sentry/socket/netlink/genetlink/...
     ./pkg/sentry/platform/hvcommon/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
@@ -67,7 +67,7 @@ jobs:
           go-version-file: go.mod
       - name: Check Go formatting
         run: |
-          unformatted=$(gofmt -l cmd e2e internal scripts tools/upstream tools/licenses tools/gvisorlint tools/androidprobe \
+          unformatted=$(gofmt -l cmd e2e internal scripts tools/upstream tools/licenses tools/gvisorlint tools/androidprobe tools/gostateify \
             pkg/gvx pkg/oci pkg/netbackend pkg/hostlockdown pkg/syserr pkg/ipset pkg/tcpip/link/vxlan \
             pkg/sentry/blockdev pkg/sentry/socket/netlink/genetlink pkg/sentry/platform/hvcommon \
             pkg/sentry/platform/hvf pkg/sentry/platform/whpx pkg/sentry/fsimpl/chunkcache \
@@ -75,6 +75,8 @@ jobs:
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
       - name: Verify coverage of test packages
         run: ./scripts/check-ci-owned.sh
+      - name: Check stateify generated files
+        run: ./scripts/gostateify.sh -check
       - name: Build all target platforms
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64; do

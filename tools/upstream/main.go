@@ -27,21 +27,23 @@ func main() {
 }
 
 type options struct {
-	mode        string
-	maxRatio    float64
-	countFences bool
-	rootDir     string
-	allowlist   string
-	mask        string
-	destSubdir  string
-	repoURL     string
-	targetRef   string
-	archivePath string
-	cacheDir    string
-	offline     bool
-	strategy    string
-	timeout     time.Duration
-	maxFindings int
+	mode                 string
+	maxRatio             float64
+	countFences          bool
+	rootDir              string
+	allowlist            string
+	mask                 string
+	destSubdir           string
+	repoURL              string
+	targetRef            string
+	archivePath          string
+	cacheDir             string
+	offline              bool
+	strategy             string
+	regenStateify        bool
+	stateifyPackagesFile string
+	timeout              time.Duration
+	maxFindings          int
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
@@ -61,6 +63,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&o.cacheDir, "cache-dir", "", "directory for <sha>.tar.gz archives (default: per-user cache)")
 	fs.BoolVar(&o.offline, "offline", false, "use cached archives only and fail when one is missing")
 	fs.StringVar(&o.strategy, "strategy", "auto", "sync strategy: auto, git (SPEC 2.3 merge), or archive (overlay fallback)")
+	fs.BoolVar(&o.regenStateify, "regen-stateify", true, "regenerate gostateify packages after sync")
+	fs.StringVar(&o.stateifyPackagesFile, "stateify-packages", DefaultStateifyPackagesFile, "path to the gostateify package list")
 	fs.DurationVar(&o.timeout, "timeout", 2*time.Minute, "network timeout for download, resolve, and sync modes")
 	fs.IntVar(&o.maxFindings, "max-findings", 60, "audit findings to print; 0 prints all (the exit status still counts all)")
 
@@ -260,14 +264,16 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 		case fork:
 			gitDir = o.rootDir
 			manifest, err := GitSync(ctx, GitSyncConfig{
-				RootDir:   o.rootDir,
-				RemoteURL: o.repoURL,
-				TargetRef: o.targetRef,
-				MaxRatio:  o.maxRatio,
-				Mask:      mask,
-				Patches:   patches,
-				Source:    o.archiveSource(""),
-				Log:       func(format string, args ...any) { fmt.Fprintf(stdout, format+"\n", args...) },
+				RootDir:              o.rootDir,
+				RemoteURL:            o.repoURL,
+				TargetRef:            o.targetRef,
+				MaxRatio:             o.maxRatio,
+				Mask:                 mask,
+				Patches:              patches,
+				RegenStateify:        o.regenStateify,
+				StateifyPackagesFile: o.stateifyPackagesFile,
+				Source:               o.archiveSource(""),
+				Log:                  func(format string, args ...any) { fmt.Fprintf(stdout, format+"\n", args...) },
 			})
 			if err == nil {
 				fmt.Fprintf(stdout, "sync complete (git merge, uncommitted): commit=%s\n", manifest.GoBranchSHA)
@@ -289,16 +295,18 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 	var rawAuditErr error
 	var auditRan bool
 	manifest, err := SyncUpstream(ctx, SyncConfig{
-		RootDir:     o.rootDir,
-		DestSubdir:  o.destSubdir,
-		RepoURL:     o.repoURL,
-		TargetRef:   o.targetRef,
-		MaxRatio:    o.maxRatio,
-		CountFences: o.countFences,
-		Audit:       inPlace,
-		Mask:        mask,
-		Patches:     patches,
-		Source:      o.archiveSource(gitDir),
+		RootDir:              o.rootDir,
+		DestSubdir:           o.destSubdir,
+		RepoURL:              o.repoURL,
+		TargetRef:            o.targetRef,
+		MaxRatio:             o.maxRatio,
+		CountFences:          o.countFences,
+		Audit:                inPlace,
+		Mask:                 mask,
+		Patches:              patches,
+		RegenStateify:        o.regenStateify,
+		StateifyPackagesFile: o.stateifyPackagesFile,
+		Source:               o.archiveSource(gitDir),
 		OnAudit: func(r AuditReport, auditErr error) {
 			auditReport = r
 			rawAuditErr = auditErr
