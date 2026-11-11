@@ -92,3 +92,37 @@ func lookupLinuxerr(n errno.Errno) (le *errors.Error) {
 	}
 	return err.(*errors.Error)
 }
+
+// maxLinuxABI bounds the errno range [1, maxLinuxABI) of the Linux ABI.
+const maxLinuxABI = 134
+
+// init registers every Linux errno absent from the host tables.
+// FromError and Error.ToError then resolve Linux-only values such as EBADFD,
+// EDEADLK, ENOMEDIUM, and ENOKEY without panicking on macOS or Windows.
+func init() {
+	for code := errno.Errno(1); code < maxLinuxABI; code++ {
+		le := lookupLinuxerr(code)
+		msg := fmt.Sprintf("linux errno %d", code)
+		if le != nil {
+			msg = le.Error()
+		}
+		e := &Error{message: msg, errno: code}
+		registerLinuxErrno(code, e)
+		if !linuxBackwardsTranslations[code].ok {
+			var be error
+			switch {
+			case code == errno.EINTR:
+				be = linuxerr.ErrInterrupted
+			case code == linuxerr.EWOULDBLOCK.Errno():
+				be = linuxerr.ErrWouldBlock
+			case (runtime.GOOS == "linux" || runtime.GOOS == "android") && getHostTranslation(unix.Errno(code)) != nil:
+				be = unix.Errno(code)
+			case le != nil:
+				be = le
+			default:
+				be = errors.New(code, msg)
+			}
+			linuxBackwardsTranslations[code] = linuxBackwardsTranslation{err: be, ok: true}
+		}
+	}
+}

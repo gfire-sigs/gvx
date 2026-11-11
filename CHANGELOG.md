@@ -2,6 +2,16 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Complete registration of Linux errnos on macOS and Windows (`pkg/syserr`)**: `host_darwin.go` and `host_windows.go` omitted 45 Linux-only error numbers. `Error.ToError` panicked on macOS and Windows for values such as `EBADFD`, `EDEADLK`, `ENOMEDIUM`, and `ENOKEY`. `linux_errno_xplat.go` now registers every Linux errno in `[1, 134)` at initialization. `rpfilter_xplat_test.go` matches `ENODEV` across Linux and non-Linux hosts with `linuxerr.Equals`.
+
+### Tests
+
+- **CI coverage for all owned test packages (`.github/workflows/ci.yml`, `scripts/check-ci-owned.sh`, `tools/gvisorlint/lint_test.go`)**: `ci.yml` adds 29 omitted test packages to `OWNED` and adds omitted Tier 1 packages to `VET`. `lint_test.go` appends `.exe` to the temporary `gvisorlint` binary on Windows, and `darwin-arm64` runs host-level `e2e` gates that require no hypervisor. `scripts/check-ci-owned.sh` fails the build job when a repository package with `*_test.go` files is absent from `OWNED`.
+
 ## [v0.13.10002026110200] - 2026-11-11
 
 This release raises default Go microarchitecture baselines per target OS and adds an ARMv8.2 LSE release archive for Linux (#138). It also prints the compiled architecture level in `rungv version` and eliminates timing-sensitive and varint-width flaky tests (#137, #138, #139).

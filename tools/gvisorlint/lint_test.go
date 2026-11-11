@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -36,7 +37,11 @@ func buildTool(t *testing.T) string {
 			buildErr = err
 			return
 		}
-		toolPath = filepath.Join(dir, "gvisorlint")
+		name := "gvisorlint"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		toolPath = filepath.Join(dir, name)
 		out, err := exec.Command("go", "build", "-o", toolPath, ".").CombinedOutput()
 		if err != nil {
 			buildErr = &buildError{err: err, out: string(out)}
