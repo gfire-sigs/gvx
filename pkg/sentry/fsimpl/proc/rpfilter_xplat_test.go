@@ -16,7 +16,6 @@ package proc
 
 import (
 	"bytes"
-	"errors"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/context"
@@ -84,11 +83,11 @@ func TestRPFilterFilesReadAndWriteIntegers(t *testing.T) {
 		}
 		before := readRPFilter(t, f)
 		for _, bad := range []string{"abc\n", "1.5\n", "99999999999\n"} {
-			if _, err := writeRPFilter(f, bad, 0); !errors.Is(err, linuxerr.EINVAL) {
+			if _, err := writeRPFilter(f, bad, 0); !linuxerr.Equals(linuxerr.EINVAL, err) {
 				t.Errorf("%s write %q = %v, want EINVAL", name, bad, err)
 			}
 		}
-		if _, err := writeRPFilter(f, "1\n", 3); !errors.Is(err, linuxerr.EINVAL) {
+		if _, err := writeRPFilter(f, "1\n", 3); !linuxerr.Equals(linuxerr.EINVAL, err) {
 			t.Errorf("%s write at offset 3 = %v, want EINVAL", name, err)
 		}
 		if got := readRPFilter(t, f); got != before {
@@ -137,10 +136,10 @@ func TestRPFilterLinkFileOfAMissingLink(t *testing.T) {
 	s := newRPFilterStack(t)
 	f := &linkRPFilter{stack: s, id: 42}
 	var buf bytes.Buffer
-	if err := f.Generate(context.Background(), &buf); !errors.Is(err, linuxerr.ENODEV) {
+	if err := f.Generate(context.Background(), &buf); !linuxerr.Equals(linuxerr.ENODEV, err) {
 		t.Errorf("Generate of a missing link = %v, want ENODEV", err)
 	}
-	if _, err := writeRPFilter(f, "1\n", 0); !errors.Is(err, linuxerr.ENODEV) {
+	if _, err := writeRPFilter(f, "1\n", 0); !linuxerr.Equals(linuxerr.ENODEV, err) {
 		t.Errorf("Write of a missing link = %v, want ENODEV", err)
 	}
 }

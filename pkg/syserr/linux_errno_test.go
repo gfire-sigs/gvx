@@ -140,31 +140,40 @@ func TestFromHostSocketErrors(t *testing.T) {
 	}
 }
 
-// TestToErrorRoundTripsEveryLinuxErrno checks that the error value of ToError
-// returns to the same Linux errno through FromError on every host. A Linux
-// number that FromError looks up in a host table made the sentry panic on macOS.
+// TestToErrorRoundTripsEveryLinuxErrno verifies that FromError maps every
+// Error.ToError result back to its Linux errno on every host. Linux-only values
+// such as EBADFD (77) and ENOKEY (126) lack Darwin and Windows host entries.
+// Package initialization registers every Linux errno in [1, maxLinuxABI).
 func TestToErrorRoundTripsEveryLinuxErrno(t *testing.T) {
-	checked := 0
-	for n := 1; n < len(linuxBackwardsTranslations); n++ {
+	for n := errno.Errno(1); n < maxLinuxABI; n++ {
 		if !linuxBackwardsTranslations[n].ok {
-			continue
+			t.Fatalf("linuxBackwardsTranslations[%d] is unregistered", n)
 		}
-		checked++
-		e := NewDynamic("test", errno.Errno(n))
+		e := NewDynamic("test", n)
 		got := func() (got *Error) {
 			defer func() {
 				if r := recover(); r != nil {
-					t.Errorf("FromError(errno %d).ToError()) panicked: %v", n, r)
+					t.Errorf("FromError((errno %d).ToError()) panicked: %v", n, r)
 				}
 			}()
 			return FromError(e.ToError())
 		}()
-		if got != nil && got.ToLinux() != errno.Errno(n) {
+		if got == nil {
+			t.Errorf("FromError((errno %d).ToError()) = nil", n)
+			continue
+		}
+		if got.ToLinux() != n {
 			t.Errorf("round trip of errno %d gave %d", n, got.ToLinux())
 		}
-	}
-	if checked < 80 {
-		t.Fatalf("checked only %d errnos", checked)
+		if le := linuxErrorFor(int(n)); le != nil {
+			fromLE := FromError(le)
+			if fromLE == nil || fromLE.ToLinux() != n {
+				t.Errorf("FromError(linuxerr %d) = %v, want %d", n, fromLE, n)
+			}
+			if rt := FromError(fromLE.ToError()); rt == nil || rt.ToLinux() != n {
+				t.Errorf("FromError(FromError(linuxerr %d).ToError()) = %v, want %d", n, rt, n)
+			}
+		}
 	}
 }
 
