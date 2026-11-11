@@ -107,6 +107,7 @@ func (n *Namespace) StateFields() []string {
 		"inode",
 		"stack",
 		"creator",
+		"root",
 		"isRoot",
 		"userNS",
 		"abstractSockets",
@@ -122,10 +123,11 @@ func (n *Namespace) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &n.inode)
 	stateSinkObject.Save(1, &n.stack)
 	stateSinkObject.Save(2, &n.creator)
-	stateSinkObject.SaveBool(3, &n.isRoot)
-	stateSinkObject.Save(4, &n.userNS)
-	stateSinkObject.Save(5, &n.abstractSockets)
-	stateSinkObject.Save(6, &n.netlinkMcastTable)
+	stateSinkObject.Save(3, &n.root)
+	stateSinkObject.SaveBool(4, &n.isRoot)
+	stateSinkObject.Save(5, &n.userNS)
+	stateSinkObject.Save(6, &n.abstractSockets)
+	stateSinkObject.Save(7, &n.netlinkMcastTable)
 }
 
 // +checklocksignore
@@ -133,10 +135,11 @@ func (n *Namespace) StateLoad(ctx context.Context, stateSourceObject state.Sourc
 	stateSourceObject.Load(0, &n.inode)
 	stateSourceObject.Load(1, &n.stack)
 	stateSourceObject.LoadWait(2, &n.creator)
-	stateSourceObject.LoadBool(3, &n.isRoot)
-	stateSourceObject.Load(4, &n.userNS)
-	stateSourceObject.Load(5, &n.abstractSockets)
-	stateSourceObject.Load(6, &n.netlinkMcastTable)
+	stateSourceObject.LoadWait(3, &n.root)
+	stateSourceObject.LoadBool(4, &n.isRoot)
+	stateSourceObject.Load(5, &n.userNS)
+	stateSourceObject.Load(6, &n.abstractSockets)
+	stateSourceObject.Load(7, &n.netlinkMcastTable)
 	stateSourceObject.AfterLoadTo(n)
 }
 

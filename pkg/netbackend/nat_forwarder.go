@@ -389,6 +389,65 @@ func registerNATTransportHandlers(s *stack.Stack, nf *NATForwarder) {
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 }
 
+func (nf *NATForwarder) rebindHostNIC(ep stack.LinkEndpoint) error {
+	_ = nf.stack.RemoveNIC(hostNICID)
+	if err := nf.stack.CreateNIC(hostNICID, ep); err != nil {
+		return fmt.Errorf("netbackend: create the NIC on the host stack: %s", err)
+	}
+	if err := nf.stack.SetPromiscuousMode(hostNICID, true); err != nil {
+		return fmt.Errorf("netbackend: set promiscuous mode on the host stack: %s", err)
+	}
+	if err := nf.stack.SetSpoofing(hostNICID, true); err != nil {
+		return fmt.Errorf("netbackend: set spoofing on the host stack: %s", err)
+	}
+	nf.stack.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: hostNICID},
+		{Destination: header.IPv6EmptySubnet, NIC: hostNICID},
+	})
+	return nil
+}
+
+// AttachRestoredStack rebinds a restored guest Netstack to nf without opening
+// new host sockets. It resets and reconfigures lo and eth0 on restored, wires
+// a fresh in-memory pipe to the host forwarder stack, and restores saved guest
+// transport endpoints.
+func (nf *NATForwarder) AttachRestoredStack(restored *stack.Stack) error {
+	if restored == nil {
+		return errors.New("netbackend: restored stack is nil")
+	}
+	nf.mu.Lock()
+	if nf.closed {
+		nf.mu.Unlock()
+		return errors.New("netbackend: NATForwarder is closed")
+	}
+	nf.mu.Unlock()
+
+	guestEP, hostEP := pipe.New("", "", uint32(nf.cfg.Tuning.Int(tuning.NATMTU)))
+	if err := nf.rebindHostNIC(checksumOffloadEndpoint{hostEP}); err != nil {
+		guestEP.Close()
+		hostEP.Close()
+		return err
+	}
+	restored.ResetConfig()
+	if err := configureLoopbackNIC(restored, LoopbackNICID); err != nil {
+		guestEP.Close()
+		hostEP.Close()
+		return err
+	}
+	if err := configureNATNIC(restored, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, nf); err != nil {
+		guestEP.Close()
+		hostEP.Close()
+		return err
+	}
+	restored.Restore()
+	return nil
+}
+
+// RebindRestore rebinds a restored guest Netstack to nf.
+func (nf *NATForwarder) RebindRestore(restored *stack.Stack) error {
+	return nf.AttachRestoredStack(restored)
+}
+
 // Close cancels active NAT relays and waits for goroutines to finish.
 func (nf *NATForwarder) Close() error {
 	nf.mu.Lock()

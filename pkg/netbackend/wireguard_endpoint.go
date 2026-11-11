@@ -38,6 +38,8 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
+	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
+	"z.gfire.dev/gvx/pkg/tcpip/transport/udp"
 )
 
 const (
@@ -123,6 +125,8 @@ type WireGuardEndpoint struct {
 	stack     *stack.Stack
 	channelEP *channel.Endpoint
 	dev       *device.Device
+	dnsStack  *stack.Stack
+	dnsLink   *wgDNSLinkEndpoint
 	dnsCancel context.CancelFunc
 	dnsUDP    *gonet.UDPConn
 	dnsTCP    *gonet.TCPListener
@@ -361,28 +365,55 @@ func (w *WireGuardEndpoint) Start() (*stack.Stack, error) {
 	return s, nil
 }
 
-// startDNSRelayLocked binds the virtual DNS relay at 10.0.2.3:53 on s when
-// 10.0.2.3 is not the guest NIC address itself.
-func (w *WireGuardEndpoint) startDNSRelayLocked(s *stack.Stack) error {
+// startDNSRelayLocked binds the virtual DNS relay at 10.0.2.3:53 on an
+// internal DNS stack connected to w.dnsLink when 10.0.2.3 is not the guest NIC
+// address itself. Keeping the gonet DNS listeners off the guest stack keeps s
+// checkpoint-savable by pkg/state.
+func (w *WireGuardEndpoint) startDNSRelayLocked(_ *stack.Stack) error {
 	dnsAddr := netip.MustParseAddr(HostDNSIPv4)
-	if w.cfg.GuestIPv4.Addr() == dnsAddr {
+	if w.cfg.GuestIPv4.Addr() == dnsAddr || w.dnsLink == nil {
 		return nil
 	}
+	dnsStack := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+	})
+	if err := dnsStack.CreateNIC(Eth0NICID, w.dnsLink); err != nil {
+		dnsStack.Close()
+		return fmt.Errorf("netbackend: create WireGuard virtual DNS NIC: %s", err)
+	}
+	dnsProto := tcpip.ProtocolAddress{
+		Protocol: ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFrom4(dnsAddr.As4()),
+			PrefixLen: 32,
+		},
+	}
+	if err := dnsStack.AddProtocolAddress(Eth0NICID, dnsProto, stack.AddressProperties{}); err != nil {
+		dnsStack.Close()
+		return fmt.Errorf("netbackend: add WireGuard virtual DNS address: %s", err)
+	}
+	dnsStack.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: Eth0NICID},
+	})
 	fullAddr := tcpip.FullAddress{
 		NIC:  Eth0NICID,
 		Addr: tcpip.AddrFrom4(dnsAddr.As4()),
 		Port: DefaultDNSPort,
 	}
-	udpConn, err := gonet.DialUDP(s, &fullAddr, nil, ipv4.ProtocolNumber)
+	udpConn, err := gonet.DialUDP(dnsStack, &fullAddr, nil, ipv4.ProtocolNumber)
 	if err != nil {
+		dnsStack.Close()
 		return fmt.Errorf("netbackend: listen WireGuard virtual UDP DNS: %w", err)
 	}
-	tcpLn, err := gonet.ListenTCP(s, fullAddr, ipv4.ProtocolNumber)
+	tcpLn, err := gonet.ListenTCP(dnsStack, fullAddr, ipv4.ProtocolNumber)
 	if err != nil {
 		_ = udpConn.Close()
+		dnsStack.Close()
 		return fmt.Errorf("netbackend: listen WireGuard virtual TCP DNS: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	w.dnsStack = dnsStack
 	w.dnsCancel = cancel
 	w.dnsUDP = udpConn
 	w.dnsTCP = tcpLn
@@ -402,10 +433,76 @@ func (w *WireGuardEndpoint) startDNSRelayLocked(s *stack.Stack) error {
 	return nil
 }
 
+type wgDNSLinkEndpoint struct {
+	mu         sync.RWMutex
+	dispatcher stack.NetworkDispatcher
+	guestEP    *channel.Endpoint
+	mtu        uint32
+}
+
+func (e *wgDNSLinkEndpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mtu
+}
+
+func (e *wgDNSLinkEndpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	e.mtu = mtu
+	e.mu.Unlock()
+}
+
+func (*wgDNSLinkEndpoint) MaxHeaderLength() uint16                      { return 0 }
+func (*wgDNSLinkEndpoint) LinkAddress() tcpip.LinkAddress               { return "" }
+func (*wgDNSLinkEndpoint) SetLinkAddress(tcpip.LinkAddress)             {}
+func (*wgDNSLinkEndpoint) Capabilities() stack.LinkEndpointCapabilities { return stack.CapabilityNone }
+
+func (e *wgDNSLinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	e.dispatcher = dispatcher
+	e.mu.Unlock()
+}
+
+func (e *wgDNSLinkEndpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.dispatcher != nil
+}
+
+func (*wgDNSLinkEndpoint) Wait()                                   {}
+func (*wgDNSLinkEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
+func (*wgDNSLinkEndpoint) AddHeader(*stack.PacketBuffer)           {}
+func (*wgDNSLinkEndpoint) ParseHeader(*stack.PacketBuffer) bool    { return true }
+func (e *wgDNSLinkEndpoint) Close()                                { e.Attach(nil) }
+func (*wgDNSLinkEndpoint) SetOnCloseAction(func())                 {}
+
+func (e *wgDNSLinkEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	if d != nil {
+		d.DeliverNetworkPacket(protocol, pkt)
+	}
+}
+
+func (e *wgDNSLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	n := 0
+	for _, pkt := range pkts.AsSlice() {
+		newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: pkt.ToBuffer(),
+		})
+		e.guestEP.InjectInbound(pkt.NetworkProtocolNumber, newPkt)
+		newPkt.DecRef()
+		n++
+	}
+	return n, nil
+}
+
 // newStackLocked builds the Netstack with lo and the WireGuard eth0 NIC.
 type wgLinkEndpoint struct {
 	*channel.Endpoint
 	dnsAddr tcpip.Address
+	dnsLink *wgDNSLinkEndpoint
 	// tun is the device that reads the packets of the endpoint. SetMTU tells
 	// it about a new MTU.
 	tun *channelTUN
@@ -415,11 +512,14 @@ type wgLinkEndpoint struct {
 // new MTU, which sets the padding limit of the encrypted packets.
 func (e *wgLinkEndpoint) SetMTU(mtu uint32) {
 	e.Endpoint.SetMTU(mtu)
+	if e.dnsLink != nil {
+		e.dnsLink.SetMTU(mtu)
+	}
 	e.tun.NotifyMTU()
 }
 
 func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
-	if e.dnsAddr.Len() == 0 {
+	if e.dnsAddr.Len() == 0 || e.dnsLink == nil {
 		return e.Endpoint.WritePackets(pkts)
 	}
 	var forward stack.PacketBufferList
@@ -429,11 +529,11 @@ func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.E
 			netHdr := pkt.NetworkHeader().Slice()
 			if len(netHdr) >= header.IPv4MinimumSize {
 				ipHdr := header.IPv4(netHdr)
-				if ipHdr.DestinationAddress() == e.dnsAddr || ipHdr.SourceAddress() == e.dnsAddr {
+				if ipHdr.DestinationAddress() == e.dnsAddr {
 					newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 						Payload: pkt.ToBuffer(),
 					})
-					e.Endpoint.InjectInbound(pkt.NetworkProtocolNumber, newPkt)
+					e.dnsLink.InjectInbound(pkt.NetworkProtocolNumber, newPkt)
 					newPkt.DecRef()
 					looped++
 					continue
@@ -454,19 +554,30 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channelTUN, error) 
 	if err != nil {
 		return nil, nil, err
 	}
+	tn, err := w.configureEth0Locked(s)
+	if err != nil {
+		s.Close()
+		return nil, nil, err
+	}
+	return s, tn, nil
+}
 
+func (w *WireGuardEndpoint) configureEth0Locked(s *stack.Stack) (*channelTUN, error) {
 	chEP := channel.New(w.cfg.Tuning.Int(tuning.WGQueueLength), w.cfg.MTU, "")
 	tn := newChannelTUN(chEP)
-	fail := func(err error) (*stack.Stack, *channelTUN, error) {
-		s.Close()
+	fail := func(err error) (*channelTUN, error) {
 		chEP.Close()
 		_ = tn.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	dnsAddr := netip.MustParseAddr(HostDNSIPv4)
 	linkEP := &wgLinkEndpoint{Endpoint: chEP, tun: tn}
 	if w.cfg.GuestIPv4.Addr() != dnsAddr {
 		linkEP.dnsAddr = tcpip.AddrFrom4(dnsAddr.As4())
+		linkEP.dnsLink = &wgDNSLinkEndpoint{guestEP: chEP, mtu: w.cfg.MTU}
+		w.dnsLink = linkEP.dnsLink
+	} else {
+		w.dnsLink = nil
 	}
 	if err := createNamedNICWithMTURange(s, Eth0NICID, Eth0NICName, linkEP, header.IPv4MinimumMTU, device.MaxContentSize); err != nil {
 		return fail(err)
@@ -485,18 +596,6 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channelTUN, error) 
 		{Destination: header.IPv4LoopbackSubnet, NIC: LoopbackNICID},
 		{Destination: header.IPv4EmptySubnet, NIC: Eth0NICID},
 	}
-	if w.cfg.GuestIPv4.Addr() != dnsAddr {
-		dnsProto := tcpip.ProtocolAddress{
-			Protocol: ipv4.ProtocolNumber,
-			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.AddrFrom4(dnsAddr.As4()),
-				PrefixLen: 32,
-			},
-		}
-		if err := s.AddProtocolAddress(Eth0NICID, dnsProto, stack.AddressProperties{PEB: stack.NeverPrimaryEndpoint}); err != nil {
-			return fail(fmt.Errorf("netbackend: add WireGuard virtual DNS address: %s", err))
-		}
-	}
 	if w.cfg.GuestIPv6.IsValid() {
 		v6 := tcpip.ProtocolAddress{
 			Protocol: ipv6.ProtocolNumber,
@@ -511,7 +610,95 @@ func (w *WireGuardEndpoint) newStackLocked() (*stack.Stack, *channelTUN, error) 
 		routes = append(routes, tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: Eth0NICID})
 	}
 	s.SetRouteTable(routes)
-	return s, tn, nil
+	return tn, nil
+}
+
+// AttachRestoredStack rebinds a restored guest Netstack to w over the
+// pre-bound host UDP socket without opening new host sockets. It stops any
+// previous WireGuard device and DNS relay, configures lo and eth0 on restored,
+// restores saved guest transport endpoints, and restarts the WireGuard device
+// and virtual DNS relay on restored.
+func (w *WireGuardEndpoint) AttachRestoredStack(restored *stack.Stack) error {
+	if restored == nil {
+		return errors.New("netbackend: restored stack is nil")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.preBindLocked(); err != nil {
+		return err
+	}
+
+	dnsCancel, dnsUDP, dnsTCP, dnsStack := w.dnsCancel, w.dnsUDP, w.dnsTCP, w.dnsStack
+	oldDev, oldStack, oldChEP := w.dev, w.stack, w.channelEP
+	w.dnsCancel, w.dnsUDP, w.dnsTCP, w.dnsStack, w.dnsLink = nil, nil, nil, nil, nil
+	w.dev, w.stack, w.channelEP = nil, nil, nil
+
+	if dnsCancel != nil {
+		dnsCancel()
+	}
+	if dnsUDP != nil {
+		_ = dnsUDP.Close()
+	}
+	if dnsTCP != nil {
+		_ = dnsTCP.Close()
+	}
+	w.dnsWG.Wait()
+	if dnsStack != nil {
+		dnsStack.Close()
+	}
+	if oldDev != nil {
+		oldDev.Close()
+	}
+	if oldStack != nil && oldStack != restored {
+		oldStack.Close()
+	}
+	if oldChEP != nil {
+		oldChEP.Close()
+	}
+
+	restored.ResetConfig()
+	if err := configureLoopbackNIC(restored, LoopbackNICID); err != nil {
+		return err
+	}
+	tn, err := w.configureEth0Locked(restored)
+	if err != nil {
+		return err
+	}
+	chEP := tn.Endpoint()
+	restored.Restore()
+
+	bind, err := newPreboundBind(w.udpConn)
+	if err != nil {
+		chEP.Close()
+		_ = tn.Close()
+		return err
+	}
+	dev := device.NewDevice(tn, bind, newWireGuardLogger(w.cfg.Logger))
+	if err := dev.IpcSet(wireGuardIPCConfig(w.cfg, w.peerEndpoint)); err != nil {
+		dev.Close()
+		chEP.Close()
+		return fmt.Errorf("netbackend: configure WireGuard device: %w", err)
+	}
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		chEP.Close()
+		return fmt.Errorf("netbackend: bring up WireGuard device: %w", err)
+	}
+	if err := w.startDNSRelayLocked(restored); err != nil {
+		dev.Close()
+		chEP.Close()
+		return err
+	}
+
+	w.stack = restored
+	w.channelEP = chEP
+	w.dev = dev
+	return nil
+}
+
+// RebindRestore rebinds a restored guest Netstack to w.
+func (w *WireGuardEndpoint) RebindRestore(restored *stack.Stack) error {
+	return w.AttachRestoredStack(restored)
 }
 
 // wireGuardIPCConfig renders cfg in the wireguard-go UAPI "set" format.
@@ -569,8 +756,9 @@ func (w *WireGuardEndpoint) Close() error {
 		return nil
 	}
 	w.closed = true
-	dnsCancel, dnsUDP, dnsTCP := w.dnsCancel, w.dnsUDP, w.dnsTCP
+	dnsCancel, dnsUDP, dnsTCP, dnsStack := w.dnsCancel, w.dnsUDP, w.dnsTCP, w.dnsStack
 	dev, s, chEP, sock := w.dev, w.stack, w.channelEP, w.udpConn
+	w.dnsCancel, w.dnsUDP, w.dnsTCP, w.dnsStack, w.dnsLink = nil, nil, nil, nil, nil
 	w.mu.Unlock()
 
 	if dnsCancel != nil {
@@ -583,6 +771,9 @@ func (w *WireGuardEndpoint) Close() error {
 		_ = dnsTCP.Close()
 	}
 	w.dnsWG.Wait()
+	if dnsStack != nil {
+		dnsStack.Close()
+	}
 	if dev != nil {
 		dev.Close()
 	}

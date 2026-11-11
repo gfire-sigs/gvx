@@ -142,6 +142,16 @@ type fibState struct {
 	// the order of the source address choice. See route_xplat.go.
 	nicGen   atomicbitops.Uint64
 	nicOrder atomic.Pointer[nicOrderSnapshot] `state:"nosave"`
+
+	// protocolsStarted tracks whether protocol background workers are active.
+	protocolsStarted atomic.Bool `state:"nosave"`
+	// restoredNICs tracks preserved NICs already restored since load.
+	restoredNICs map[tcpip.NICID]*nic `state:"nosave"`
+	// childPause, childResume, and childRestore propagate lifecycle actions to
+	// child network namespace stacks.
+	childPause   func() `state:"nosave"`
+	childResume  func() `state:"nosave"`
+	childRestore func() `state:"nosave"`
 }
 
 var (

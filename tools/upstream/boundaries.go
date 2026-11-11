@@ -229,7 +229,7 @@ var boundaryRules = []importRule{
 		pkg:               "pkg/netbackend",
 		tier:              Tier1Additive,
 		subtree:           true,
-		allowed:           []string{"pkg/tcpip/*"},
+		allowed:           []string{"pkg/state", "pkg/tcpip/*"},
 		forbidden:         append([]string{pkgSentryAll, "pkg/gvx/*", "pkg/oci/*", "pkg/hostlockdown/*"}, runtimeOuterBans...),
 		forbiddenExcept:   []string{"pkg/gvx/tuning"},
 		forbiddenLiterals: []string{winHvDLL},
@@ -589,6 +589,12 @@ var boundaryRules = []importRule{
 		forbidden: lowLevelTier2Bans,
 	},
 	{
+		pkg:       "pkg/tcpip/link/veth",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/state", "pkg/sync", "pkg/tcpip/*"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
 		pkg:       "pkg/tcpip/network/ipv6",
 		tier:      Tier2Sibling,
 		allowed:   []string{"pkg/tcpip/*"},
@@ -668,6 +674,12 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/hostfd",
 		tier:      Tier2Sibling,
 		forbidden: append([]string{"pkg/sentry/kernel/*", "pkg/sentry/platform/*"}, tier2UpperBans...),
+	},
+	{
+		pkg:       "pkg/sentry/inet",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/rand", "pkg/refs", "pkg/sentry/fsimpl/nsfs", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/nlmsg", "pkg/sentry/socket/unix/transport", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
+		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
 		pkg:       "pkg/sentry/kernel",
@@ -762,7 +774,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/socket/netstack",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/abi/linux/errno", "pkg/atomicbitops", "pkg/context", "pkg/errors", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/sentry/inet", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/nlmsg", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
+		allowed:   []string{"pkg/abi/linux", "pkg/abi/linux/errno", "pkg/atomicbitops", "pkg/context", "pkg/errors", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/refs", "pkg/sentry/fsimpl/nsfs", "pkg/sentry/inet", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/nlmsg", "pkg/sentry/socket/unix/transport", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{

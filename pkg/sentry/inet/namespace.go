@@ -16,6 +16,7 @@ package inet
 
 import (
 	goContext "context"
+	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
@@ -39,6 +40,9 @@ type Namespace struct {
 	// needs to wait for this field to be loaded before calling afterLoad().
 	creator NetworkStackCreator `state:"wait"`
 
+	// root is the owning root network namespace for non-root namespaces.
+	root *Namespace `state:"wait"`
+
 	// isRoot indicates whether this is the root network namespace.
 	isRoot bool
 
@@ -49,6 +53,10 @@ type Namespace struct {
 
 	// netlinkMcastTable manages multicast group membership for netlink sockets.
 	netlinkMcastTable *McastTable
+
+	childMu  sync.Mutex   `state:"nosave"`
+	children []*Namespace `state:"nosave"`
+	restored bool         `state:"nosave"`
 }
 
 // NewRootNamespace creates the root network namespace, with creator
@@ -65,6 +73,7 @@ func NewRootNamespace(stack Stack, creator NetworkStackCreator, userNS *auth.Use
 	if eventPublishingStack, ok := stack.(InterfaceEventPublisher); ok {
 		eventPublishingStack.AddInterfaceEventSubscriber(n.netlinkMcastTable)
 	}
+	n.bindStackCallbacks()
 	n.abstractSockets.init()
 	return n
 }
@@ -86,17 +95,21 @@ func (n *Namespace) GetInode() *nsfs.Inode {
 
 // NewNamespace creates a new network namespace from the root.
 func NewNamespace(root *Namespace, userNS *auth.UserNamespace) *Namespace {
+	rootNS := root.rootNamespace()
 	n := &Namespace{
-		creator:           root.creator,
+		creator:           root.effectiveCreator(),
+		root:              rootNS,
 		userNS:            userNS,
 		netlinkMcastTable: NewNetlinkMcastTable(),
 	}
 	n.init()
+	rootNS.registerChild(n)
 	return n
 }
 
 // Destroy implements nsfs.Namespace.Destroy.
 func (n *Namespace) Destroy(ctx context.Context) {
+	n.root.unregisterChild(n)
 	if s := n.Stack(); s != nil {
 		s.Destroy()
 	}
@@ -128,16 +141,10 @@ func (n *Namespace) IsRoot() bool {
 	return n.isRoot
 }
 
-// RestoreRootStack restores the root network namespace with stack. This should
+// RestoreRootStack restores the network namespace with stack. This should
 // only be called when restoring kernel.
 func (n *Namespace) RestoreRootStack(stack Stack) {
-	if !n.isRoot {
-		panic("RestoreRootStack can only be called on root network namespace")
-	}
-	if n.stack != nil {
-		panic("RestoreRootStack called after a stack has already been set")
-	}
-	n.stack = stack
+	n.restoreRootStack(stack)
 }
 
 // ResetStack resets the stack in the network namespace to nil. This should
@@ -151,22 +158,20 @@ func (n *Namespace) init() {
 	if n.isRoot {
 		return
 	}
-	if n.creator != nil {
+	if n.stack == nil && n.creator != nil {
 		var err error
 		n.stack, err = n.creator.CreateStack()
 		if err != nil {
 			panic(err)
 		}
-		if eventPublishingStack, ok := n.stack.(InterfaceEventPublisher); ok {
-			eventPublishingStack.AddInterfaceEventSubscriber(n.netlinkMcastTable)
-		}
+		n.subscribeInterfaceEvents()
 	}
-	n.abstractSockets.init()
+	n.ensureInitialized()
 }
 
 // afterLoad is invoked by stateify.
 func (n *Namespace) afterLoad(goContext.Context) {
-	n.init()
+	n.restoreAfterLoad()
 }
 
 // AbstractSockets returns AbstractSocketNamespace.
