@@ -10,7 +10,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Tests
 
-- **CI coverage for all owned test packages (`.github/workflows/ci.yml`, `scripts/check-ci-owned.sh`)**: `ci.yml` adds 29 omitted test packages to `OWNED` and adds omitted Tier 1 packages to `VET`. The `darwin-arm64` job also runs the host-level `e2e` gates that require no hypervisor. `scripts/check-ci-owned.sh` fails the build job when a repository package with `*_test.go` files is absent from `OWNED`.
+- **CI coverage for all owned test packages (`.github/workflows/ci.yml`, `scripts/check-ci-owned.sh`, `tools/gvisorlint/lint_test.go`)**: `ci.yml` adds 29 omitted test packages to `OWNED` and adds omitted Tier 1 packages to `VET`. `lint_test.go` appends `.exe` to the temporary `gvisorlint` binary on Windows, and `darwin-arm64` runs host-level `e2e` gates that require no hypervisor. `scripts/check-ci-owned.sh` fails the build job when a repository package with `*_test.go` files is absent from `OWNED`.
 
 ## [v0.13.10002026110200] - 2026-11-11
 
