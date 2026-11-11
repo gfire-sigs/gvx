@@ -1629,7 +1629,10 @@ func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 		return mountSubfs(m.GuestPath, ext4lite.Name, &vfs.MountOptions{
 			ReadOnly: m.ReadOnly,
 			GetFilesystemOptions: vfs.GetFilesystemOptions{
-				InternalData: ext4lite.InternalFilesystemOptions{Volume: m.volume},
+				InternalData: ext4lite.InternalFilesystemOptions{
+					Volume:   m.volume,
+					UniqueID: m.GuestPath,
+				},
 			},
 		})
 	}

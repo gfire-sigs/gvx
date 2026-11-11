@@ -16,11 +16,15 @@ package ext4lite
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
+	gverrors "z.gfire.dev/gvx/pkg/errors"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 const (
@@ -42,14 +46,86 @@ type cacheChunk = chunkcache.Chunk
 // before they call into the cache. A memory-manager call that drops a mapping
 // takes MapsMu and DataMu without wmu, so the write-back checks the size under
 // n.mu for every page it writes.
+// +stateify savable
 type fileData struct {
-	chunkcache.Cache
-	ino *inode
+	chunkcache.Cache `state:"nosave"`
+	ino              *inode
+	mappings         struct{} `state:".(memmap.MappingSet)"`
+	writableMaps     struct{} `state:".(int)"`
+	wbErrErrno       struct{} `state:".(int32)"`
 }
 
 func (c *fileData) init(ino *inode) {
 	c.ino = ino
 	c.Init(c)
+}
+
+func (c *fileData) saveMappings() memmap.MappingSet {
+	return c.Mappings
+}
+
+func (c *fileData) loadMappings(_ context.Context, m memmap.MappingSet) {
+	c.Mappings = m
+}
+
+func (c *fileData) saveWritableMaps() int {
+	return c.WritableMaps
+}
+
+func (c *fileData) loadWritableMaps(_ context.Context, w int) {
+	c.WritableMaps = w
+}
+
+func (c *fileData) saveWbErrErrno() int32 {
+	if c.WBErr == nil {
+		return 0
+	}
+	var le *gverrors.Error
+	if errors.As(toLinuxErr(c.WBErr), &le) {
+		return int32(le.Errno())
+	}
+	return int32(linuxerr.EIO.Errno())
+}
+
+func (c *fileData) loadWbErrErrno(_ context.Context, errno int32) {
+	if errno != 0 {
+		c.WBErr = linuxerr.ErrorFromUnix(unix.Errno(errno))
+	}
+}
+
+func (c *fileData) afterLoad(context.Context) {
+	c.Init(c)
+	if !c.Mappings.IsEmpty() || c.WritableMaps > 0 {
+		c.Chunks = make(map[uint64]*cacheChunk)
+		c.Active.Store(true)
+	}
+}
+
+// dropForSave invalidates active translations and releases every cached chunk
+// after PrepareSave flushed dirty pages to the volume.
+func (c *fileData) dropForSave() {
+	c.MapsMu.Lock()
+	defer c.MapsMu.Unlock()
+	hadMappings := !c.Mappings.IsEmpty()
+	c.DataMu.Lock()
+	var dropped []*cacheChunk
+	for _, ch := range c.Chunks {
+		dropped = append(dropped, ch)
+	}
+	if hadMappings || c.WritableMaps > 0 {
+		c.Chunks = make(map[uint64]*cacheChunk)
+		c.Active.Store(true)
+	} else {
+		c.Chunks = nil
+		c.Active.Store(false)
+	}
+	c.DataMu.Unlock()
+	if hadMappings {
+		c.Mappings.InvalidateAll(memmap.InvalidateOpts{})
+	}
+	for _, ch := range dropped {
+		ch.Release()
+	}
 }
 
 func (c *fileData) ChunkMemory() chunkcache.ChunkMemory { return c.ino.fs.vol.chunkMemory() }

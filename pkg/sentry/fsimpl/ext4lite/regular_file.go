@@ -36,6 +36,8 @@ import (
 // fileDescription holds the members that every file description of this
 // filesystem shares. The nesting lets dirFD embed both default implementations
 // without ambiguity.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -67,11 +69,13 @@ func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
 }
 
 // regularFD implements vfs.FileDescriptionImpl for regular files.
+//
+// +stateify savable
 type regularFD struct {
 	fileDescription
 
 	// mu protects off.
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	off int64
 }
 

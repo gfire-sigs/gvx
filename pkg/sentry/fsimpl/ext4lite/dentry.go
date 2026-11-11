@@ -46,9 +46,11 @@ type attr struct {
 // inode is the identity of one engine node in the VFS. Hard links share one
 // inode, so they share locks, watches, and the page cache of mapped pages. The
 // inode owns one reference on the engine node.
+//
+// +stateify savable
 type inode struct {
 	fs   *filesystem
-	n    *node
+	n    *node `state:"nosave"`
 	ino  uint32
 	kind uint16 // node type bits, constant for the life of the inode
 
@@ -65,7 +67,7 @@ type inode struct {
 	writeCount vfs.WriteCount
 
 	// wmu serializes writes and truncation, so that O_APPEND is atomic.
-	wmu sync.Mutex
+	wmu sync.Mutex `state:"nosave"`
 
 	// data is the page cache of mapped pages. Only regular files use it.
 	data fileData
@@ -79,9 +81,9 @@ type inode struct {
 	ep transport.BoundEndpoint
 
 	// targetOnce guards target, the immutable content of a symlink.
-	targetOnce sync.Once
-	target     string
-	targetErr  error
+	targetOnce sync.Once `state:"nosave"`
+	target     string    `state:"nosave"`
+	targetErr  error     `state:"nosave"`
 }
 
 func (i *inode) isDir() bool     { return i.kind == modeDir }
@@ -150,16 +152,25 @@ func (i *inode) addLinks(delta int) {
 // destroy releases the inode after its last dentry died. The mapped-page cache
 // goes first, and the engine frees the storage when no name remains.
 func (i *inode) destroy(ctx context.Context) {
-	i.n.mu.RLock()
-	unlinked := i.n.links == 0
-	i.n.mu.RUnlock()
-	if err := i.data.release(!unlinked); err != nil {
+	if i.n == nil {
+		_ = i.data.release(false)
+		return
+	}
+	flush := !i.fs.saved
+	if flush {
+		i.n.mu.RLock()
+		flush = i.n.links > 0
+		i.n.mu.RUnlock()
+	}
+	if err := i.data.release(flush); err != nil {
 		ctx.Warningf("ext4lite: write back mapped data of inode %d: %v", i.ino, err)
 	}
 	i.fs.v.putNode(i.n)
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
@@ -170,7 +181,7 @@ type dentry struct {
 
 	// nameMu protects parent and name for readers that do not hold fs.mu.
 	// Writers hold both.
-	nameMu sync.RWMutex
+	nameMu sync.RWMutex `state:"nosave"`
 	parent *dentry
 	name   string
 

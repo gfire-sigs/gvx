@@ -283,7 +283,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/fsimpl/ext4lite",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/blockdev", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/fsutilx", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/blockdev", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/fsutilx", "pkg/state", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
 		forbidden: append([]string{"pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{

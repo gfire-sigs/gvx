@@ -34,6 +34,11 @@ type VolumeOptions struct {
 	// ReadOnly opens the image without any write. It fails when the last mount
 	// did not end cleanly.
 	ReadOnly bool
+
+	// DeferOrphanCleanup preserves the on-disk orphan inode list during
+	// OpenVolume so CompleteRestore can rebind open unlinked and O_TMPFILE
+	// inodes before sweeping unreferenced orphans.
+	DeferOrphanCleanup bool
 }
 
 // Volume is an open image in one host file. The sandbox opens the volume
@@ -75,7 +80,7 @@ func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 	if err != nil {
 		return nil, hostError(err)
 	}
-	if !opts.ReadOnly {
+	if !opts.ReadOnly && !opts.DeferOrphanCleanup {
 		fresh := size == 0
 		if !fresh {
 			var err error
@@ -89,7 +94,10 @@ func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 			}
 		}
 	}
-	return openVolume(hf, volumeOptions{readOnly: opts.ReadOnly})
+	return openVolume(hf, volumeOptions{
+		readOnly:           opts.ReadOnly,
+		deferOrphanCleanup: opts.DeferOrphanCleanup,
+	})
 }
 
 // Close performs the clean unmount: it compacts and trims the trailing groups,

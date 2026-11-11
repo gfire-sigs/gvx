@@ -133,3 +133,109 @@ func (v *volume) cleanOrphans() (bool, error) {
 	v.mu.Unlock()
 	return true, nil
 }
+
+// completeDeferredOrphans sweeps unreferenced inodes from the on-disk orphan
+// list after CompleteRestore rebinds active VFS inodes. It then rebuilds the
+// active orphan chain for surviving zero-link nodes.
+func (v *volume) completeDeferredOrphans() error {
+	v.flushMu.Lock()
+	defer v.flushMu.Unlock()
+
+	v.mu.Lock()
+	head := v.sbU32(sbLastOrphan)
+	v.mu.Unlock()
+
+	changed := false
+	if head != 0 {
+		inodes := v.numGroups() * inodesPerGroup
+		seen := make(map[uint32]bool)
+		for ino := head; ino != 0; {
+			if ino < firstIno || ino > inodes || seen[ino] {
+				break
+			}
+			seen[ino] = true
+			blk, off := inodeLocation(ino)
+			var buf [blockSize]byte
+			if _, err := v.hf.ReadAt(buf[:], int64(blk)*blockSize); err != nil {
+				return hostError(err)
+			}
+			raw := buf[off : off+inodeSize]
+			next := le.Uint32(raw[inDtime:])
+
+			v.nodeMu.Lock()
+			bound := v.nodes[ino]
+			v.nodeMu.Unlock()
+
+			if bound == nil && le.Uint16(raw[inLinks:]) == 0 {
+				var rawCopy [inodeSize]byte
+				copy(rawCopy[:], raw)
+				le.PutUint16(rawCopy[inLinks:], 1)
+				if n, err := v.parseInode(ino, rawCopy[:]); err == nil {
+					n.links = 0
+					v.gate.enterInner()
+					n.mu.Lock()
+					_ = n.destroyLocked()
+					n.mu.Unlock()
+					v.gate.exit()
+					changed = true
+				}
+			}
+			ino = next
+		}
+	}
+
+	// Rebuild v.orphans for all rebound open nodes that have zero links.
+	clear(v.orphans)
+	v.nodeMu.Lock()
+	for ino, n := range v.nodes {
+		if ino < firstIno {
+			continue
+		}
+		n.mu.RLock()
+		live := n.links == 0 && !n.deleted
+		n.mu.RUnlock()
+		if live {
+			v.orphans[ino] = n
+		}
+	}
+	v.nodeMu.Unlock()
+
+	inos := make([]uint32, 0, len(v.orphans))
+	for ino := range v.orphans {
+		inos = append(inos, ino)
+	}
+	slices.Sort(inos)
+	v.orphanHead = 0
+	if len(inos) > 0 {
+		v.orphanHead = inos[0]
+	}
+	for i, ino := range inos {
+		var next uint32
+		if i+1 < len(inos) {
+			next = inos[i+1]
+		}
+		n := v.orphans[ino]
+		n.mu.Lock()
+		n.orphan = true
+		if n.dtime != next {
+			n.dtime = next
+			n.markDirtyLocked()
+			changed = true
+		}
+		n.mu.Unlock()
+	}
+
+	v.mu.Lock()
+	if v.sbU32(sbLastOrphan) != v.orphanHead {
+		v.setSbU32(sbLastOrphan, v.orphanHead)
+		v.sbDirty = true
+		changed = true
+	}
+	v.mu.Unlock()
+	v.deferredOrphanCleanup = false
+
+	if changed && !v.readOnly {
+		return v.flushLocked()
+	}
+	return nil
+}

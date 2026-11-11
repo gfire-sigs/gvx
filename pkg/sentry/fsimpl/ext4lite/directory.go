@@ -31,11 +31,12 @@ import (
 // because unlinking another entry never moves it. So a read that interleaves
 // with unlinks neither repeats nor skips a surviving entry, as rm -rf needs.
 // A cookie that names no entry resumes at the next entry.
+// +stateify savable
 type dirFD struct {
 	fileDescription
 	vfs.DirectoryFileDescriptionDefaultImpl
 
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	pos int64
 }
 
