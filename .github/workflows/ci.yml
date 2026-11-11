@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run one job family: all, build, linux, darwin, or windows"
+        description: "Run one job family: all, build, repro, linux, darwin, or windows"
         type: choice
         default: all
-        options: [all, build, linux, darwin, windows]
+        options: [all, build, repro, linux, darwin, windows]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -308,3 +308,27 @@ jobs:
         env:
           GVX_E2E_OFFLINE: "1"
         run: go test -count=1 -timeout 25m ./pkg/gvx/ ./cmd/rungv/ ./e2e/
+
+  repro:
+    name: reproducible build in gvx
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'repro'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Cache Go image layers for gvx
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/gvx/repro-layers
+          key: gvx-repro-golang-${{ hashFiles('go.mod') }}-${{ runner.arch }}
+      - name: Build rungv in gvx Go image and compare SHA-256
+        env:
+          GVX_REPRO_PLATFORM: systrap
+        run: GVX_REPRO_CACHE_DIR="$HOME/.cache/gvx/repro-layers" ./scripts/verify-repro-gvx.sh
