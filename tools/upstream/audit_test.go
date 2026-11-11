@@ -8,7 +8,7 @@ import (
 )
 
 const auditMaskText = `
-PROTECT pkg/shadow/*_darwin*
+PROTECT pkg/rawfile/*_darwin*
 EXCLUDE runsc/**
 EXCLUDE **/BUILD
 INCLUDE pkg/**
@@ -32,7 +32,7 @@ func baseUpstream() map[string]string {
 		"pkg/hostsyscall/sys.go":           "package hostsyscall\n",
 		"pkg/memutil/mmap.go":              "package memutil\n",
 		"pkg/memutil/mmap_linux.go":        "package memutil\n",
-		"pkg/shadow/shadow_darwin.go":      "package shadow\n",
+		"pkg/rawfile/shadow_darwin.go":     "package rawfile\n",
 		"pkg/erofs/erofs.go":               "package erofs\n\nfunc F() {}\n",
 		"pkg/erofs/erofs_state_autogen.go": "package erofs\n\nfunc g() {\n}\n",
 		"runsc/main.go":                    "package main\n",
@@ -230,7 +230,7 @@ func TestAuditViolations(t *testing.T) {
 		{
 			name: "tier 2 file shadows upstream without PROTECT",
 			fixture: auditFixture{upstream: baseUpstream(),
-				repo: with(cleanRepo(), "pkg/shadow/shadow_darwin.go", "package shadow\n\nvar X = 1\n"),
+				repo: with(cleanRepo(), "pkg/rawfile/shadow_darwin.go", "package rawfile\n\nvar X = 1\n"),
 				mask: "EXCLUDE runsc/**\nINCLUDE pkg/**\n"},
 			want: errUnprotectedShadow,
 		},
@@ -310,7 +310,7 @@ func TestAuditAcceptedDeviations(t *testing.T) {
 		{
 			name: "protected tier 2 shadow edit counts against the budget",
 			fixture: auditFixture{upstream: baseUpstream(),
-				repo: with(cleanRepo(), "pkg/shadow/shadow_darwin.go", "package shadow\n\nvar X = 1\n")},
+				repo: with(cleanRepo(), "pkg/rawfile/shadow_darwin.go", "package rawfile\n\nvar X = 1\n")},
 			check: func(t *testing.T, r AuditReport) {
 				if r.Shadow != 1 || r.Budgeted != 1 {
 					t.Fatalf("report = %+v", r)

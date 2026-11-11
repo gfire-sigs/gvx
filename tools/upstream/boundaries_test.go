@@ -4,8 +4,10 @@ import (
 	"errors"
 	"go/token"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func importLines(imports ...string) string {
@@ -378,4 +380,267 @@ func TestBoundaryNormalizesTheEmbeddedXSysUnix(t *testing.T) {
 	if vs := boundaryCheck(t, "pkg/sentry/platform/whpx/whpx.go", importLines(embedded)); len(vs) != 1 {
 		t.Errorf("whpx imports the embedded unix package: %d violations, want 1", len(vs))
 	}
+}
+
+func TestVerifyBoundariesLiveRepository(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now()
+	report, err := VerifyBoundaries(BoundaryConfig{RootDir: "../.."})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("VerifyBoundaries(../..) failed: %v", err)
+	}
+	t.Logf("verified %d files (%d Tier 1 pkgs, %d Tier 2 pkgs) in %v",
+		report.VerifiedFiles, len(report.Tier1Packages), len(report.Tier2Packages), elapsed)
+
+	if len(report.Tier1Packages) < 60 {
+		t.Errorf("discovered %d Tier 1 packages, want at least 60", len(report.Tier1Packages))
+	}
+	if len(report.Tier2Packages) < 45 {
+		t.Errorf("discovered %d Tier 2 packages, want at least 45", len(report.Tier2Packages))
+	}
+	if report.VerifiedFiles < 3000 {
+		t.Errorf("verified %d Go files, want at least 3000", report.VerifiedFiles)
+	}
+	if slices.Contains(report.Tier1Packages, "tools/shiminterop") {
+		t.Errorf("isolated tools/shiminterop module appeared in root Tier 1 package list")
+	}
+	for _, pkg := range append(slices.Clone(report.Tier1Packages), report.Tier2Packages...) {
+		if strings.Contains(pkg, "testdata") {
+			t.Errorf("testdata directory %q appeared in discovered packages", pkg)
+		}
+	}
+	for _, rule := range boundaryRules {
+		if rule.tier == Tier2Sibling && !slices.Contains(report.Tier2Packages, rule.pkg) {
+			t.Errorf("stale Tier 2 rule %q matches no discovered Tier 2 package", rule.pkg)
+		}
+	}
+}
+
+func TestVerifyBoundariesFailsClosedOnUncoveredPackages(t *testing.T) {
+	t.Parallel()
+
+	upstream := &UpstreamTree{
+		SHA: testSHA,
+		Files: map[string][]byte{
+			"pkg/rand/rng.go":              []byte("package rand\n"),
+			"pkg/sentry/kernel/kernel.go":  []byte("package kernel\n"),
+			"pkg/sentry/kernel/futex/f.go": []byte("package futex\n"),
+			"pkg/sync/mutex.go":            []byte("package sync\n"),
+			"tools/checklocks/analyzer.go": []byte("package checklocks\n"),
+		},
+	}
+
+	cases := []struct {
+		name     string
+		files    map[string]string
+		wantPkg  string
+		wantTier IsolationTier
+	}{
+		{
+			name:     "unlisted Tier 1 package under internal",
+			files:    map[string]string{"internal/unlistedprobe/probe.go": "package unlistedprobe\n"},
+			wantPkg:  "internal/unlistedprobe",
+			wantTier: Tier1Additive,
+		},
+		{
+			name:     "unlisted Tier 1 command under cmd",
+			files:    map[string]string{"cmd/unlistedcli/main.go": "package main\n"},
+			wantPkg:  "cmd/unlistedcli",
+			wantTier: Tier1Additive,
+		},
+		{
+			name:     "unlisted Tier 1 subpackage under pkg/gvx",
+			files:    map[string]string{"pkg/gvx/unlistedsub/sub.go": "package unlistedsub\n"},
+			wantPkg:  "pkg/gvx/unlistedsub",
+			wantTier: Tier1Additive,
+		},
+		{
+			name:     "purely additive Tier 1 package outside tier1Prefixes and upstream",
+			files:    map[string]string{"pkg/unlistedadditive/add.go": "package unlistedadditive\n"},
+			wantPkg:  "pkg/unlistedadditive",
+			wantTier: Tier1Additive,
+		},
+		{
+			name: "unlisted Tier 2 xplat sibling in shared upstream package",
+			files: map[string]string{
+				"pkg/rand/rng.go":       "package rand\n",
+				"pkg/rand/rng_xplat.go": "package rand\n",
+			},
+			wantPkg:  "pkg/rand",
+			wantTier: Tier2Sibling,
+		},
+		{
+			name: "unlisted Tier 2 windows sibling under parent subtree rule",
+			files: map[string]string{
+				"pkg/sentry/kernel/futex/f.go":         "package futex\n",
+				"pkg/sentry/kernel/futex/f_windows.go": "package futex\n",
+			},
+			wantPkg:  "pkg/sentry/kernel/futex",
+			wantTier: Tier2Sibling,
+		},
+		{
+			name: "windows arm64 only Tier 1 package discovered across five targets",
+			files: map[string]string{
+				"internal/winarmonly/only.go": "//go:build windows && arm64\n\npackage winarmonly\n",
+			},
+			wantPkg:  "internal/winarmonly",
+			wantTier: Tier1Additive,
+		},
+		{
+			name: "darwin arm64 only Tier 2 sibling discovered across five targets",
+			files: map[string]string{
+				"pkg/rand/rng.go":        "package rand\n",
+				"pkg/rand/rng_darwin.go": "//go:build darwin && arm64\n\npackage rand\n",
+			},
+			wantPkg:  "pkg/rand",
+			wantTier: Tier2Sibling,
+		},
+		{
+			name: "linux cgo only Tier 1 package discovered across cgo states",
+			files: map[string]string{
+				"internal/cgonly/only.go": "//go:build linux && cgo\n\npackage cgonly\n",
+			},
+			wantPkg:  "internal/cgonly",
+			wantTier: Tier1Additive,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			for rel, body := range tc.files {
+				writeTestFile(t, root, rel, body)
+			}
+			_, err := VerifyBoundaries(BoundaryConfig{RootDir: root, Upstream: upstream})
+			if !errors.Is(err, errUncoveredPackage) {
+				t.Fatalf("VerifyBoundaries err = %v, want %v", err, errUncoveredPackage)
+			}
+			var uncov UncoveredPackageError
+			if !errors.As(err, &uncov) {
+				t.Fatalf("err %v does not unwrap to UncoveredPackageError", err)
+			}
+			if uncov.Package != tc.wantPkg || uncov.Tier != tc.wantTier {
+				t.Fatalf("got uncovered %+v, want Package=%q Tier=%v", uncov, tc.wantPkg, tc.wantTier)
+			}
+			if !strings.Contains(err.Error(), tc.wantPkg) {
+				t.Fatalf("error %q omits package path %q", err.Error(), tc.wantPkg)
+			}
+		})
+	}
+
+	t.Run("RunAudit fails closed on uncovered package", func(t *testing.T) {
+		t.Parallel()
+		_, err := auditFixture{
+			upstream: baseUpstream(),
+			repo:     with(cleanRepo(), "pkg/unlistedadditive/add.go", "package unlistedadditive\n"),
+		}.run(t)
+		if !errors.Is(err, errUncoveredPackage) || !strings.Contains(err.Error(), "pkg/unlistedadditive") {
+			t.Fatalf("RunAudit err = %v, want errUncoveredPackage naming pkg/unlistedadditive", err)
+		}
+	})
+
+	t.Run("ignored files testdata isolated modules and test-only siblings pass", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		for rel, body := range map[string]string{
+			"internal/unlistedignored/ig.go":          "//go:build ignore\n\npackage main\n",
+			"pkg/sync/testdata/unlisted/fixture.go":   "package unlisted\n",
+			"docs/probes/submod/go.mod":               "module submod\n\ngo 1.27.4\n",
+			"docs/probes/submod/main.go":              "package main\n",
+			"tools/shiminterop/go.mod":                "module z.gfire.dev/gvx/tools/shiminterop\n\ngo 1.27.4\n",
+			"tools/shiminterop/interop_linux_test.go": "package shiminterop\n",
+			"pkg/rand/rng.go":                         "package rand\n",
+			"pkg/rand/rng_xplat_test.go":              "package rand\n",
+			"tools/checklocks/analyzer.go":            "package checklocks\n",
+		} {
+			writeTestFile(t, root, rel, body)
+		}
+		report, err := VerifyBoundaries(BoundaryConfig{RootDir: root, Upstream: upstream})
+		if err != nil {
+			t.Fatalf("VerifyBoundaries returned unexpected error: %v", err)
+		}
+		if len(report.Tier1Packages) != 0 || len(report.Tier2Packages) != 0 {
+			t.Fatalf("unexpected discovered packages: tier1=%v tier2=%v", report.Tier1Packages, report.Tier2Packages)
+		}
+	})
+}
+
+func TestVerifyBoundariesEnforcesArchitecturalRules(t *testing.T) {
+	t.Parallel()
+
+	m := modulePrefix
+	forbiddenCases := []struct {
+		name string
+		file string
+		imp  string
+	}{
+		{"gvxshim importing pkg/gvx", "internal/gvxshim/service.go", m + "pkg/gvx"},
+		{"gvxshim importing pkg/sentry", "internal/gvxshim/service.go", m + "pkg/sentry/kernel"},
+		{"gvxshim importing pkg/hostlockdown", "internal/gvxshim/service.go", m + "pkg/hostlockdown"},
+		{"gvxshim importing upstream runsc", "internal/gvxshim/service.go", m + "runsc/boot"},
+		{"shim binary importing pkg/gvx", "cmd/containerd-shim-gvx-v2/main.go", m + "pkg/gvx"},
+		{"shim binary importing pkg/sentry", "cmd/containerd-shim-gvx-v2/main.go", m + "pkg/sentry/kernel"},
+		{"shim binary importing pkg/hostlockdown", "cmd/containerd-shim-gvx-v2/main.go", m + "pkg/hostlockdown"},
+		{"pkg/gvx importing internal/gvxshim", "pkg/gvx/sandbox.go", m + "internal/gvxshim"},
+		{"pkg/gvx importing cmd/rungv", "pkg/gvx/sandbox.go", m + "cmd/rungv"},
+		{"pkg/hostlockdown importing pkg/gvx", "pkg/hostlockdown/lockdown.go", m + "pkg/gvx"},
+		{"pkg/hostlockdown importing pkg/sentry", "pkg/hostlockdown/lockdown.go", m + "pkg/sentry/kernel"},
+		{"pkg/hostlockdown importing pkg/tcpip", "pkg/hostlockdown/lockdown.go", m + "pkg/tcpip"},
+		{"pkg/hostlockdown importing pkg/oci", "pkg/hostlockdown/lockdown.go", m + "pkg/oci"},
+		{"pkg/hostlockdown importing pkg/netbackend", "pkg/hostlockdown/lockdown.go", m + "pkg/netbackend"},
+		{"pkg/netbackend importing pkg/sentry/kernel", "pkg/netbackend/nat.go", m + "pkg/sentry/kernel"},
+		{"pkg/netbackend importing pkg/gvx", "pkg/netbackend/nat.go", m + "pkg/gvx"},
+		{"pkg/netbackend importing cmd/rungv", "pkg/netbackend/nat.go", m + "cmd/rungv"},
+		{"pkg/oci importing google.golang.org/grpc", "pkg/oci/pull.go", "google.golang.org/grpc"},
+		{"pkg/oci importing containerd", "pkg/oci/pull.go", "github.com/containerd/containerd/v2/client"},
+		{"pkg/oci importing pkg/sentry", "pkg/oci/pull.go", m + "pkg/sentry/kernel"},
+		{"pkg/oci importing pkg/gvx", "pkg/oci/pull.go", m + "pkg/gvx"},
+		{"pkg/ipset importing pkg/sentry", "pkg/ipset/ipset.go", m + "pkg/sentry/kernel"},
+		{"pkg/ipset importing pkg/gvx", "pkg/ipset/ipset.go", m + "pkg/gvx"},
+		{"pkg/tcpip/link/vxlan importing pkg/sentry", "pkg/tcpip/link/vxlan/vxlan.go", m + "pkg/sentry/kernel"},
+		{"pkg/tcpip/link/wgtun importing pkg/gvx", "pkg/tcpip/link/wgtun/wgtun.go", m + "pkg/gvx"},
+		{"hvcommon importing pkg/gvx", "pkg/sentry/platform/hvcommon/arm64.go", m + "pkg/gvx"},
+		{"hvf importing pkg/oci", "pkg/sentry/platform/hvf/hvf.go", m + "pkg/oci"},
+		{"whpx importing pkg/netbackend", "pkg/sentry/platform/whpx/whpx.go", m + "pkg/netbackend"},
+		{"runtime pkg importing tools", "pkg/sync/mutex.go", m + "tools/upstream"},
+		{"runtime pkg importing e2e", "pkg/sentry/vfs/vfs.go", m + "e2e"},
+		{"runtime pkg importing cmd", "pkg/sentry/vfs/vfs.go", m + "cmd/rungv"},
+		{"pkg/sync xplat sibling importing pkg/sentry/kernel", "pkg/sync/futex_xplat.go", m + "pkg/sentry/kernel"},
+		{"pkg/ring0 windows sibling importing pkg/sentry/arch", "pkg/ring0/bluepill_windows.go", m + "pkg/sentry/arch"},
+		{"Tier 2 sibling importing pkg/gvx", "pkg/sentry/mm/mm_xplat.go", m + "pkg/gvx"},
+		{"Tier 2 sibling importing pkg/oci", "pkg/sentry/mm/mm_xplat.go", m + "pkg/oci"},
+		{"Tier 2 sibling importing pkg/netbackend", "pkg/sentry/mm/mm_xplat.go", m + "pkg/netbackend"},
+		{"Tier 2 sibling importing pkg/hostlockdown", "pkg/sentry/mm/mm_xplat.go", m + "pkg/hostlockdown"},
+		{"Tier 2 sibling importing internal/gvxshim", "pkg/sentry/mm/mm_xplat.go", m + "internal/gvxshim"},
+		{"Tier 2 sibling importing cmd", "pkg/sentry/mm/mm_xplat.go", m + "cmd/rungv"},
+	}
+
+	for _, tc := range forbiddenCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			if ClassifyFile(tc.file) == Tier2Sibling {
+				writeTestFile(t, root, filepath.ToSlash(filepath.Join(filepath.Dir(tc.file), "upstream.go")), "package p\n")
+			}
+			writeTestFile(t, root, tc.file, importLines(tc.imp))
+			_, err := VerifyBoundaries(BoundaryConfig{RootDir: root})
+			if !errors.Is(err, errForbiddenImport) {
+				t.Fatalf("VerifyBoundaries(%s importing %s) err = %v, want %v", tc.file, tc.imp, err, errForbiddenImport)
+			}
+		})
+	}
+
+	t.Run("netbackend allows leaf pkg/gvx/tuning and Tier 3 ring0 allows pkg/sentry/arch", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeTestFile(t, root, "pkg/netbackend/nat.go", importLines(m+"pkg/gvx/tuning"))
+		writeTestFile(t, root, "pkg/ring0/defs.go", importLines(m+"pkg/sentry/arch"))
+		writeTestFile(t, root, "pkg/ring0/bluepill_windows.go", "package p\n")
+		if _, err := VerifyBoundaries(BoundaryConfig{RootDir: root}); err != nil {
+			t.Fatalf("VerifyBoundaries returned unexpected error: %v", err)
+		}
+	})
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/token"
 	"io/fs"
 	"os"
 	"path"
@@ -61,9 +60,11 @@ func (t IsolationTier) String() string {
 type AuditReport struct {
 	UpstreamCommit string
 
-	Tier1Count int
-	Tier2Count int
-	Tier3Count int
+	Tier1Count        int
+	Tier1PackageCount int
+	Tier2Count        int
+	Tier2PackageCount int
+	Tier3Count        int
 	// Tier2Shadows counts Tier 2 files that replace an upstream file of the same path.
 	Tier2Shadows int
 	// Tier2XplatCount counts non-test *_xplat*.go files inside shared upstream packages.
@@ -273,23 +274,27 @@ func RunAudit(cfg AuditConfig) (AuditReport, error) {
 		ruleUsed:  make(map[string]bool),
 		xplatPkgs: make(map[string]bool),
 	}
+
+	boundaryReport, boundaryErr := VerifyBoundaries(BoundaryConfig{
+		RootDir:  cfg.RootDir,
+		Upstream: cfg.Upstream,
+	})
+	st.report.Tier1PackageCount = len(boundaryReport.Tier1Packages)
+	st.report.Tier2PackageCount = len(boundaryReport.Tier2Packages)
+	if boundaryErr != nil {
+		if !errors.Is(boundaryErr, errForbiddenImport) && !errors.Is(boundaryErr, errUncoveredPackage) {
+			return st.report, boundaryErr
+		}
+		st.violations = append(st.violations, flattenErrors(boundaryErr)...)
+	}
+
 	seen := make(map[string]bool)
-	fset := token.NewFileSet()
 
 	walkErr := walkRepo(cfg.RootDir, func(abs, relSlash string, _ fs.DirEntry) error {
 		if !isGoSource(relSlash) {
 			return nil
 		}
 		tier := ClassifyFile(relSlash)
-		if strings.HasSuffix(relSlash, ".go") {
-			vs, err := auditFileImports(fset, abs, relSlash, tier)
-			if err != nil {
-				return err
-			}
-			for _, v := range vs {
-				st.violations = append(st.violations, v)
-			}
-		}
 		switch tier {
 		case Tier1Additive:
 			st.report.Tier1Count++
