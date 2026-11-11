@@ -16,6 +16,7 @@ package fsutil
 
 import (
 	"bytes"
+	"encoding/binary"
 	"unsafe"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -91,18 +92,39 @@ func RenameAt2(oldDirFD int, oldName string, newDirFD int, newName string, flags
 // ParseDirents parses dirents from buf. buf must have been populated by
 // getdents64(2) syscall. It calls the handleDirent callback for each dirent.
 func ParseDirents(buf []byte, handleDirent DirentHandler) {
-	for len(buf) > 0 {
-		// Interpret the buf populated by unix.Getdents as unix.Dirent.
-		dirent := *(*unix.Dirent)(unsafe.Pointer(&buf[0]))
+	const (
+		inoOff    = unsafe.Offsetof(unix.Dirent{}.Ino)
+		offOff    = unsafe.Offsetof(unix.Dirent{}.Off)
+		reclenOff = unsafe.Offsetof(unix.Dirent{}.Reclen)
+		typeOff   = unsafe.Offsetof(unix.Dirent{}.Type)
+		nameOff   = unsafe.Offsetof(unix.Dirent{}.Name)
 
-		// Extract the name from buf, since len(unix.Dirent.Name) == 256 is
-		// incorrect in general. The name is null-terminated.
-		nameBuf := buf[unsafe.Offsetof(dirent.Name):dirent.Reclen]
-		nameLen := bytes.IndexByte(nameBuf, 0)
-		name := string(nameBuf[:nameLen])
+		_ uint = uint(nameOff) - uint(inoOff+8)
+		_ uint = uint(nameOff) - uint(offOff+8)
+		_ uint = uint(nameOff) - uint(reclenOff+2)
+		_ uint = uint(nameOff) - uint(typeOff+1)
+	)
+	for uintptr(len(buf)) >= nameOff {
+		// Decode fixed header fields from buf[:nameOff] without dereferencing
+		// a full unix.Dirent struct past the end of buf.
+		hdr := buf[:nameOff]
+		reclen := binary.NativeEndian.Uint16(hdr[reclenOff:])
+		if reclen == 0 || uintptr(reclen) < nameOff || int(reclen) > len(buf) {
+			break
+		}
+		ino := binary.NativeEndian.Uint64(hdr[inoOff:])
+		off := int64(binary.NativeEndian.Uint64(hdr[offOff:]))
+		ftype := hdr[typeOff]
+
+		// Extract the null-terminated name within the record bounds.
+		nameBuf := buf[nameOff:reclen]
+		if nameLen := bytes.IndexByte(nameBuf, 0); nameLen >= 0 {
+			nameBuf = nameBuf[:nameLen]
+		}
+		name := string(nameBuf)
 
 		// Advance buf for the next dirent.
-		buf = buf[dirent.Reclen:]
+		buf = buf[reclen:]
 
 		// Skip `.` and `..` entries. It is anyways ignored by the client. We also
 		// don't want to leak information about `..`.
@@ -111,6 +133,6 @@ func ParseDirents(buf []byte, handleDirent DirentHandler) {
 		}
 
 		// Deliver results to caller.
-		handleDirent(dirent.Ino, dirent.Off, dirent.Type, name, dirent.Reclen)
+		handleDirent(ino, off, ftype, name, reclen)
 	}
 }

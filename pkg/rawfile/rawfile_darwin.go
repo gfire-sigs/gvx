@@ -16,14 +16,18 @@ const MaxIovs = 1024
 
 // IovecFromBytes returns a unix.Iovec representing bs.
 func IovecFromBytes(bs []byte) unix.Iovec {
-	iov := unix.Iovec{
-		Base: &bs[0],
+	var iov unix.Iovec
+	if len(bs) > 0 {
+		iov.Base = &bs[0]
+		iov.SetLen(len(bs))
 	}
-	iov.SetLen(len(bs))
 	return iov
 }
 
 func bytesFromIovec(iov unix.Iovec) []byte {
+	if iov.Len == 0 {
+		return nil
+	}
 	ptr := unsafe.Pointer(iov.Base)
 	return unsafe.Slice((*byte)(ptr), int(iov.Len))
 }
@@ -83,6 +87,9 @@ func NonBlockingWrite(fd int, buf []byte) unix.Errno {
 
 // NonBlockingWriteIovec writes iovec to fd in a single writev call.
 func NonBlockingWriteIovec(fd int, iovec []unix.Iovec) unix.Errno {
+	if len(iovec) == 0 {
+		return NonBlockingWrite(fd, nil)
+	}
 	_, _, e := unix.RawSyscall(unix.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovec[0])), uintptr(len(iovec)))
 	return e
 }
@@ -113,20 +120,26 @@ type PollEvent struct {
 
 // BlockingPoll polls the given PollEvent array using poll(2).
 func BlockingPoll(fds *PollEvent, nfds int, timeout *unix.Timespec) (int, unix.Errno) {
-	timeoutMillis := -1
-	if timeout != nil {
-		timeoutMillis = int(timeout.Sec*1000 + timeout.Nsec/1_000_000)
-	}
-	n, _, e := unix.Syscall(unix.SYS_POLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(timeoutMillis))
+	n, _, e := unix.Syscall6(unix.SYS_PPOLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(unsafe.Pointer(timeout)), 0, 0, 0)
 	return int(n), e
 }
 
 // BlockingRead reads from a non-blocking fd, polling until readable.
 func BlockingRead(fd int, b []byte) (int, unix.Errno) {
+	var ptr unsafe.Pointer
+	if len(b) > 0 {
+		ptr = unsafe.Pointer(&b[0])
+	}
 	for {
-		n, _, e := unix.RawSyscall(unix.SYS_READ, uintptr(fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
+		n, _, e := unix.RawSyscall(unix.SYS_READ, uintptr(fd), uintptr(ptr), uintptr(len(b)))
 		if e == 0 {
 			return int(n), 0
+		}
+		if e == unix.EINTR {
+			continue
+		}
+		if e != unix.EAGAIN && e != unix.EWOULDBLOCK {
+			return -1, e
 		}
 		event := PollEvent{
 			FD:     int32(fd),
@@ -134,7 +147,7 @@ func BlockingRead(fd int, b []byte) (int, unix.Errno) {
 		}
 		_, e = BlockingPoll(&event, 1, nil)
 		if e != 0 && e != unix.EINTR {
-			return 0, e
+			return -1, e
 		}
 	}
 }
@@ -163,10 +176,17 @@ func BlockingPollUntilStopped(efd int, fd int, events int16) (bool, unix.Errno) 
 
 // BlockingReadvUntilStopped reads into iovecs or unblocks when efd becomes readable.
 func BlockingReadvUntilStopped(efd int, fd int, iovecs []unix.Iovec) (int, unix.Errno) {
+	var empty [1]unix.Iovec
+	if len(iovecs) == 0 {
+		iovecs = empty[:]
+	}
 	for {
 		n, _, e := unix.RawSyscall(unix.SYS_READV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs)))
 		if e == 0 {
 			return int(n), 0
+		}
+		if e == unix.EINTR {
+			continue
 		}
 		if e != unix.EWOULDBLOCK && e != unix.EAGAIN {
 			return 0, e
@@ -183,11 +203,17 @@ func BlockingReadvUntilStopped(efd int, fd int, iovecs []unix.Iovec) (int, unix.
 
 // BlockingRecvMMsgUntilStopped receives messages into msgHdrs or unblocks when efd becomes readable.
 func BlockingRecvMMsgUntilStopped(efd int, fd int, msgHdrs []MMsgHdr) (int, unix.Errno) {
+	if len(msgHdrs) == 0 {
+		return 0, 0
+	}
 	for {
 		n, _, e := unix.RawSyscall(unix.SYS_RECVMSG, uintptr(fd), uintptr(unsafe.Pointer(&msgHdrs[0].Msg)), unix.MSG_DONTWAIT)
 		if e == 0 {
 			msgHdrs[0].Len = uint32(n)
 			return 1, 0
+		}
+		if e == unix.EINTR {
+			continue
 		}
 		if e != unix.EWOULDBLOCK && e != unix.EAGAIN {
 			return 0, e
