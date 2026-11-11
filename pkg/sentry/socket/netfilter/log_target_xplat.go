@@ -16,16 +16,15 @@ package netfilter
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
-	"runtime"
 	"slices"
 	"strings"
-	"weak"
 
+	"z.gfire.dev/gvx/internal/weakmap"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/log"
-	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -73,36 +72,22 @@ type LogFunc func(level int, line string)
 
 // stackLogs maps a network stack to its log function. The map holds the stacks
 // weakly, so a stack that a test drops frees its entry.
-var stackLogs = struct {
-	mu sync.Mutex
-	m  map[weak.Pointer[stack.Stack]]LogFunc
-}{m: make(map[weak.Pointer[stack.Stack]]LogFunc)}
+var stackLogs weakmap.Map[stack.Stack, LogFunc]
 
 // SetStackLog sets the function that the LOG rules of stk write their lines
 // to. A nil function removes it. The function applies to the rules that a later
 // SetEntries request creates.
 func SetStackLog(stk *stack.Stack, fn LogFunc) {
-	key := weak.Make(stk)
-	stackLogs.mu.Lock()
-	defer stackLogs.mu.Unlock()
 	if fn == nil {
-		delete(stackLogs.m, key)
+		stackLogs.Delete(stk)
 		return
 	}
-	if _, ok := stackLogs.m[key]; !ok {
-		runtime.AddCleanup(stk, func(key weak.Pointer[stack.Stack]) {
-			stackLogs.mu.Lock()
-			defer stackLogs.mu.Unlock()
-			delete(stackLogs.m, key)
-		}, key)
-	}
-	stackLogs.m[key] = fn
+	stackLogs.Store(stk, fn)
 }
 
 func stackLog(stk *stack.Stack) LogFunc {
-	stackLogs.mu.Lock()
-	defer stackLogs.mu.Unlock()
-	return stackLogs.m[weak.Make(stk)]
+	fn, _ := stackLogs.Load(stk)
+	return fn
 }
 
 func init() {
@@ -148,14 +133,17 @@ func (m *logTargetMaker) unmarshal(buf []byte, _ stack.IPHeaderFilter) (target, 
 
 // logTarget is the LOG target. Like Linux log_tg, it returns XT_CONTINUE
 // (RuleContinue), so traversal continues with the next rule.
+//
+// +stateify savable
 type logTarget struct {
 	networkProtocol tcpip.NetworkProtocolNumber
 	// raw is the whole user target as parsed. Marshal returns it unchanged.
 	raw []byte
+	stk *stack.Stack
 	// log writes the line to the kernel log. bindStack sets it before the rule
 	// is published, so Action reads it without a lock. It is nil for a rule of
 	// a stack without a log function.
-	log LogFunc
+	log LogFunc `state:"nosave"`
 }
 
 var (
@@ -163,12 +151,19 @@ var (
 	_ stack.InterfaceTarget = (*logTarget)(nil)
 )
 
+func (t *logTarget) afterLoad(context.Context) {
+	if t.stk != nil {
+		t.log = stackLog(t.stk)
+	}
+}
+
 func (t *logTarget) id() targetID {
 	return targetID{name: LogTargetName, networkProtocol: t.networkProtocol, revision: logTargetRevision}
 }
 
 // bindStack implements stackBinder.bindStack.
 func (t *logTarget) bindStack(stk *stack.Stack) *syserr.Error {
+	t.stk = stk
 	t.log = stackLog(stk)
 	return nil
 }
@@ -331,13 +326,17 @@ func (t *logTarget) ActionOnInterfaces(pkt *stack.PacketBuffer, _ stack.Hook, _ 
 	// Format the line only for a reader: the kernel log, or the debug log of
 	// the Sentry. A rule of a stack without a log function and without debug
 	// logging costs a packet nothing.
+	logFn := t.log
+	if logFn == nil && t.stk != nil {
+		logFn = stackLog(t.stk)
+	}
 	debug := log.IsLogging(log.Debug)
-	if t.log == nil && !debug {
+	if logFn == nil && !debug {
 		return stack.RuleContinue, 0
 	}
 	line := t.line(pkt, in, out)
-	if t.log != nil {
-		t.log(t.level(), line)
+	if logFn != nil {
+		logFn(t.level(), line)
 	}
 	if debug {
 		log.Debugf("netfilter LOG: %s", line)

@@ -108,6 +108,7 @@ func (e *linkEndpoint) applySet(attrs map[uint16]nlmsg.BytesView, canSetSocket b
 	if e.closed {
 		return syserr.ErrNoDevice
 	}
+	e.ensureDeviceLocked()
 	var flags uint32
 	if v, ok := attrs[deviceAttrFlags]; ok {
 		flags, _ = v.Uint32()

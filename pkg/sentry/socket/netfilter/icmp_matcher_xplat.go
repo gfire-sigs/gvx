@@ -113,6 +113,8 @@ func (m icmpMarshaler) unmarshal(_ IDMapper, buf []byte, filter stack.IPHeaderFi
 }
 
 // ICMPMatcher matches ICMP and ICMPv6 packets by type and code range.
+//
+// +stateify savable
 type ICMPMatcher struct {
 	ipv6     bool
 	icmpType uint8

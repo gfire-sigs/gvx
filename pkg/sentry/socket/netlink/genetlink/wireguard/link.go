@@ -15,8 +15,10 @@
 package wireguard
 
 import (
+	stdcontext "context"
 	"errors"
 	"sync"
+	"weak"
 
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
@@ -42,6 +44,9 @@ var birthplaces struct {
 
 // register records e as a link that its birthplace stack created.
 func (e *linkEndpoint) register() {
+	if e.bind == nil || e.bind.stack == nil {
+		return
+	}
 	birthplaces.Lock()
 	defer birthplaces.Unlock()
 	if birthplaces.links == nil {
@@ -57,6 +62,9 @@ func (e *linkEndpoint) register() {
 
 // unregister removes e from the links of its birthplace.
 func (e *linkEndpoint) unregister() {
+	if e.bind == nil || e.bind.stack == nil {
+		return
+	}
 	birthplaces.Lock()
 	defer birthplaces.Unlock()
 	set := birthplaces.links[e.bind.stack]
@@ -87,9 +95,12 @@ func stackEnded(stk *stack.Stack) {
 //
 // The link starts down and owns no socket. LinkUp opens the UDP endpoints on
 // the stored port, and LinkDown closes them, as wg_open and wg_stop do.
+//
+// +stateify savable
 type linkEndpoint struct {
 	*channel.Endpoint
-	tun *tunDevice
+	name string
+	tun  *tunDevice `state:"nosave"`
 
 	bind *netBind
 	// userNS is the user namespace of the network namespace that created the
@@ -99,7 +110,7 @@ type linkEndpoint struct {
 	// updateMu serializes the requests that change the device and the changes
 	// of the link state, as device_update_lock does in Linux. It protects the
 	// fields below.
-	updateMu sync.Mutex
+	updateMu sync.Mutex `state:"nosave"`
 	// up is true between LinkUp and LinkDown. It is netif_running.
 	up bool
 	// closed is true after Close. A request that finds it answers ENODEV,
@@ -112,40 +123,78 @@ type linkEndpoint struct {
 	public [keyLen]byte
 	// peers lists the peers of the device in the order of their creation.
 	peers peerSet
+	// savedConfig holds static device and peer configuration captured at
+	// beforeSave with ephemeral session keys wiped.
+	savedConfig *deviceInfo
 	// acct is the memory accounting of the kernel that created the link, and
 	// charged is the memory that the device and its peers hold against it.
-	acct    *usage.MemoryLocked
+	acct    *usage.MemoryLocked `state:"nosave"`
 	charged uint64
 
-	closeOnce sync.Once
+	closeOnce sync.Once `state:"nosave"`
+	suspended bool      `state:"nosave"`
+	hookID    uint64    `state:"nosave"`
 	// dev is set before the stack sees the endpoint.
-	dev *device.Device
+	dev *device.Device `state:"nosave"`
 }
 
 var (
 	_ stack.LinkEndpoint         = (*linkEndpoint)(nil)
+	_ stack.RestoredEndpoint     = (*linkEndpoint)(nil)
 	_ netstack.LinkStateListener = (*linkEndpoint)(nil)
 )
+
+// Capabilities implements stack.LinkEndpoint.Capabilities.
+func (e *linkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return e.Endpoint.Capabilities() | stack.CapabilitySaveRestore
+}
+
+// PreserveAcrossSaveRestore marks WireGuard NICs for virtual NIC preservation
+// on Stack checkpoint and restore.
+func (*linkEndpoint) PreserveAcrossSaveRestore() bool { return true }
 
 // SetMTU implements stack.LinkEndpoint.SetMTU. It tells wireguard-go about
 // the new MTU, which sets the padding limit of the encrypted packets.
 func (e *linkEndpoint) SetMTU(mtu uint32) {
 	e.Endpoint.SetMTU(mtu)
-	e.tun.notifyMTU()
+	e.updateMu.Lock()
+	tun := e.tun
+	e.updateMu.Unlock()
+	if tun != nil {
+		tun.notifyMTU()
+	}
 }
 
 // Close implements stack.LinkEndpoint.Close. It stops every goroutine of the
 // device and closes its UDP endpoints before it returns.
 func (e *linkEndpoint) Close() {
 	e.closeOnce.Do(func() {
+		if e.bind != nil && e.bind.stack != nil && e.hookID != 0 {
+			e.bind.stack.UnregisterLifecycleHooks(e.hookID)
+			e.hookID = 0
+		}
 		e.Endpoint.Close()
-		e.dev.Close()
-		e.unregister()
 		e.updateMu.Lock()
+		dev := e.dev
 		e.closed = true
 		e.releaseMemory()
 		e.updateMu.Unlock()
+		if dev != nil {
+			dev.Close()
+		}
+		e.unregister()
 	})
+}
+
+func (e *linkEndpoint) ensureDeviceLocked() {
+	if e.closed || e.dev != nil {
+		return
+	}
+	e.tun = newTUN(e.Endpoint, e.name)
+	e.dev = device.NewDevice(e.tun, e.bind, newLogger(e.name))
+	if e.savedConfig != nil {
+		_ = e.dev.IpcSet(formatIpcSet(e.savedConfig))
+	}
 }
 
 // LinkUp implements netstack.LinkStateListener. It opens the UDP endpoints of
@@ -161,6 +210,7 @@ func (e *linkEndpoint) LinkUp() tcpip.Error {
 	if e.up {
 		return nil
 	}
+	e.ensureDeviceLocked()
 	if err := e.dev.Up(); err != nil {
 		return bindTCPIPError(err)
 	}
@@ -177,8 +227,119 @@ func (e *linkEndpoint) LinkDown() {
 	if !e.up {
 		return
 	}
-	e.dev.Down()
+	if e.dev != nil {
+		e.dev.Down()
+	}
 	e.up = false
+}
+
+func (e *linkEndpoint) registerHooks() {
+	if e.bind == nil || e.bind.stack == nil || e.hookID != 0 {
+		return
+	}
+	we := weak.Make(e)
+	e.hookID = e.bind.stack.RegisterLifecycleHooks(
+		func() {
+			if ep := we.Value(); ep != nil {
+				ep.suspendForSave()
+			}
+		},
+		func() {
+			if ep := we.Value(); ep != nil {
+				ep.resumeAfterSave()
+			}
+		},
+	)
+}
+
+// suspendForSave captures static device and peer configuration and wipes all
+// ephemeral Noise session keys, handshake state, and open UDP sockets on e.dev.
+func (e *linkEndpoint) suspendForSave() {
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
+	if e.closed || e.suspended || e.dev == nil {
+		return
+	}
+	if text, err := e.dev.IpcGet(); err == nil {
+		if info, err := parseIpcGet(text); err == nil {
+			e.peers.sortPeers(info.peers)
+			for i := range info.peers {
+				info.peers[i].handshakeSec = 0
+				info.peers[i].handshakeNsec = 0
+				info.peers[i].rxBytes = 0
+				info.peers[i].txBytes = 0
+			}
+			info.listenPort = e.bind.incomingPort()
+			info.fwmark = e.fwmark
+			e.savedConfig = info
+		}
+	}
+	_ = e.dev.Down()
+	e.bind.closePending()
+	e.dev.RemoveAllPeers()
+	_ = e.dev.SetPrivateKey(device.NoisePrivateKey{})
+	e.suspended = true
+}
+
+func (e *linkEndpoint) resumeAfterSave() {
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
+	if e.closed || !e.suspended || e.dev == nil {
+		return
+	}
+	if e.savedConfig != nil {
+		_ = e.dev.IpcSet(formatIpcSet(e.savedConfig))
+	}
+	e.suspended = false
+	if e.up && !e.bind.gone {
+		_ = e.dev.Up()
+	}
+}
+
+func (e *linkEndpoint) beforeSave() {
+	e.suspendForSave()
+}
+
+func (e *linkEndpoint) afterLoad(ctx stdcontext.Context) {
+	if e.peers.seq == nil {
+		e.peers.init()
+	}
+	if e.closed {
+		return
+	}
+	if gctx, ok := ctx.(context.Context); ok {
+		e.acct = accountingOf(gctx)
+	} else {
+		e.acct = usage.MemoryAccounting
+	}
+	if e.charged > 0 {
+		if err := chargeMemory(e.acct, e.charged); err != nil {
+			e.charged = 0
+		}
+	}
+	e.register()
+	e.registerHooks()
+	if e.bind != nil && e.bind.stack != nil {
+		e.bind.stack.RegisterRestoredEndpoint(e)
+	}
+}
+
+func (e *linkEndpoint) bringUpRestored() {
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
+	if e.closed {
+		return
+	}
+	e.ensureDeviceLocked()
+	if !e.up || e.dev == nil || e.bind == nil || e.bind.gone {
+		return
+	}
+	_ = e.dev.Up()
+}
+
+// Restore implements stack.RestoredEndpoint.
+func (e *linkEndpoint) Restore(_ *stack.Stack) {
+	e.bringUpRestored()
 }
 
 // newLink creates the link endpoint and the wireguard-go device of a new
@@ -194,10 +355,19 @@ func newLink(ctx context.Context, req *netstack.NewLinkRequest) (stack.LinkEndpo
 	ch := channel.New(queueSize, defaultMTU, "")
 	tunDev := newTUN(ch, req.Name)
 	bind := newBind(req.Stack.Stack)
-	ep := &linkEndpoint{Endpoint: ch, tun: tunDev, bind: bind, userNS: req.UserNS, acct: acct, charged: charged}
+	ep := &linkEndpoint{
+		Endpoint: ch,
+		name:     req.Name,
+		tun:      tunDev,
+		bind:     bind,
+		userNS:   req.UserNS,
+		acct:     acct,
+		charged:  charged,
+	}
 	ep.peers.init()
 	ep.dev = device.NewDevice(tunDev, bind, newLogger(req.Name))
 	ep.register()
+	ep.registerHooks()
 	return ep, nil
 }
 

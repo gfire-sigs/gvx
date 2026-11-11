@@ -14,43 +14,34 @@
 
 package kernel
 
-import (
-	"runtime"
-	"weak"
+import "z.gfire.dev/gvx/internal/weakmap"
 
-	"z.gfire.dev/gvx/pkg/sync"
-)
-
-// shmRmidForced holds kernel.shm_rmid_forced of the IPC namespaces that set it.
-// The map holds the namespaces weakly, so a namespace that the guest drops
-// frees its entry. A struct field would need a change in ipc_namespace.go.
-var shmRmidForced struct {
-	mu     sync.Mutex
-	values map[weak.Pointer[IPCNamespace]]int32
-}
+// shmRmidForcedFallback backs zero-valued IPCNamespace structs in tests that
+// bypass NewIPCNamespace. Standard namespaces persist shm_rmid_forced directly
+// in i.shms across checkpoint and restore.
+var shmRmidForcedFallback weakmap.Map[IPCNamespace, int32]
 
 // ShmRmidForced returns kernel.shm_rmid_forced of the namespace: 0 or 1. The
 // value is stored only. The shm registry does not read it.
 func (i *IPCNamespace) ShmRmidForced() int32 {
-	shmRmidForced.mu.Lock()
-	defer shmRmidForced.mu.Unlock()
-	return shmRmidForced.values[weak.Make(i)]
+	if i == nil {
+		return 0
+	}
+	if i.shms != nil {
+		return i.shms.RmidForced()
+	}
+	v, _ := shmRmidForcedFallback.Load(i)
+	return v
 }
 
 // SetShmRmidForced stores kernel.shm_rmid_forced of the namespace.
 func (i *IPCNamespace) SetShmRmidForced(v int32) {
-	key := weak.Make(i)
-	shmRmidForced.mu.Lock()
-	defer shmRmidForced.mu.Unlock()
-	if _, ok := shmRmidForced.values[key]; !ok {
-		if shmRmidForced.values == nil {
-			shmRmidForced.values = make(map[weak.Pointer[IPCNamespace]]int32)
-		}
-		runtime.AddCleanup(i, func(key weak.Pointer[IPCNamespace]) {
-			shmRmidForced.mu.Lock()
-			defer shmRmidForced.mu.Unlock()
-			delete(shmRmidForced.values, key)
-		}, key)
+	if i == nil {
+		return
 	}
-	shmRmidForced.values[key] = v
+	if i.shms != nil {
+		i.shms.SetRmidForced(v)
+		return
+	}
+	shmRmidForcedFallback.Store(i, v)
 }

@@ -104,6 +104,8 @@ func (m *nflogTargetMaker) unmarshal(buf []byte, _ stack.IPHeaderFilter) (target
 
 // nflogTarget is the NFLOG target. Like Linux nflog_tg, it returns XT_CONTINUE
 // (RuleContinue), so traversal continues with the next rule.
+//
+// +stateify savable
 type nflogTarget struct {
 	networkProtocol tcpip.NetworkProtocolNumber
 	// raw is the whole user target as parsed. Marshal returns it unchanged.

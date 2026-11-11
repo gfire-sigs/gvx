@@ -84,6 +84,8 @@ func setMatchSize(rev uint8) int {
 
 // setInfo is struct xt_set_info: the set and the way a packet selects the
 // element of the set.
+//
+// +stateify savable
 type setInfo struct {
 	index ipset.ID
 	dim   uint8
@@ -141,6 +143,8 @@ func (m setMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) 
 }
 
 // SetMatcher is the "set" match: it tests the packet against an IP set.
+//
+// +stateify savable
 type SetMatcher struct {
 	rev uint8
 	// raw is the user struct as parsed. Marshal returns it unchanged.

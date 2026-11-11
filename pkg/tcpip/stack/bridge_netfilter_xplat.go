@@ -15,10 +15,7 @@
 package stack
 
 import (
-	"runtime"
-	"sync/atomic"
-	"weak"
-
+	"z.gfire.dev/gvx/internal/weakmap"
 	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -42,28 +39,18 @@ type bridgeNetfilterSwitches struct {
 	ipv6 bool
 }
 
-// bridgeNetfilterState holds the switches of the stacks that differ from the
-// default. The map holds the stacks weakly, so a stack that a test drops frees
-// its entry. A struct field of Stack would need a change in stack.go.
-var bridgeNetfilterState struct {
-	mu sync.Mutex
-	// switches maps a stack to its switches. A stack with both switches at the
-	// default has no entry.
-	switches map[weak.Pointer[Stack]]bridgeNetfilterSwitches
-	// overrides is the number of entries. It is 0 on a host that never changed a
-	// switch, so the packet path takes no lock.
-	overrides atomic.Int32
-}
+// bridgeNetfilterSwitchesMap holds the switches of stacks that differ from the
+// default. When Len is 0, BridgeNetfilter takes no lock on the packet path.
+// Checkpoint persistence lives on Stack.extState.
+var bridgeNetfilterSwitchesMap weakmap.Map[Stack, bridgeNetfilterSwitches]
 
 // BridgeNetfilter reports whether an IP frame of the protocol that a bridge of
 // the stack forwards between two ports passes the iptables hooks.
 func (s *Stack) BridgeNetfilter(protocol tcpip.NetworkProtocolNumber) bool {
-	if bridgeNetfilterState.overrides.Load() == 0 {
+	if bridgeNetfilterSwitchesMap.Len() == 0 {
 		return bridgeNetfilterDefault
 	}
-	bridgeNetfilterState.mu.Lock()
-	defer bridgeNetfilterState.mu.Unlock()
-	sw, ok := bridgeNetfilterState.switches[weak.Make(s)]
+	sw, ok := bridgeNetfilterSwitchesMap.Load(s)
 	if !ok {
 		return bridgeNetfilterDefault
 	}
@@ -76,40 +63,30 @@ func (s *Stack) BridgeNetfilter(protocol tcpip.NetworkProtocolNumber) bool {
 // SetBridgeNetfilter sets bridge-nf-call-iptables for IPv4 or
 // bridge-nf-call-ip6tables for IPv6 in the stack.
 func (s *Stack) SetBridgeNetfilter(protocol tcpip.NetworkProtocolNumber, enable bool) {
-	key := weak.Make(s)
-	bridgeNetfilterState.mu.Lock()
-	defer bridgeNetfilterState.mu.Unlock()
-	sw, ok := bridgeNetfilterState.switches[key]
-	if !ok {
-		sw = bridgeNetfilterSwitches{ipv4: bridgeNetfilterDefault, ipv6: bridgeNetfilterDefault}
-	}
-	if protocol == header.IPv6ProtocolNumber {
-		sw.ipv6 = enable
-	} else {
-		sw.ipv4 = enable
-	}
-	if sw.ipv4 == bridgeNetfilterDefault && sw.ipv6 == bridgeNetfilterDefault {
-		if ok {
-			delete(bridgeNetfilterState.switches, key)
-			bridgeNetfilterState.overrides.Add(-1)
-		}
+	if s == nil {
 		return
 	}
-	if !ok {
-		if bridgeNetfilterState.switches == nil {
-			bridgeNetfilterState.switches = make(map[weak.Pointer[Stack]]bridgeNetfilterSwitches)
+	e := s.ensureExtState()
+	var finalSw bridgeNetfilterSwitches
+	var keep bool
+	bridgeNetfilterSwitchesMap.Update(s, func(sw bridgeNetfilterSwitches, ok bool) (bridgeNetfilterSwitches, bool) {
+		if !ok {
+			sw = bridgeNetfilterSwitches{ipv4: bridgeNetfilterDefault, ipv6: bridgeNetfilterDefault}
 		}
-		runtime.AddCleanup(s, func(key weak.Pointer[Stack]) {
-			bridgeNetfilterState.mu.Lock()
-			defer bridgeNetfilterState.mu.Unlock()
-			if _, ok := bridgeNetfilterState.switches[key]; ok {
-				delete(bridgeNetfilterState.switches, key)
-				bridgeNetfilterState.overrides.Add(-1)
-			}
-		}, key)
-		bridgeNetfilterState.overrides.Add(1)
-	}
-	bridgeNetfilterState.switches[key] = sw
+		if protocol == header.IPv6ProtocolNumber {
+			sw.ipv6 = enable
+		} else {
+			sw.ipv4 = enable
+		}
+		finalSw = sw
+		keep = sw.ipv4 != bridgeNetfilterDefault || sw.ipv6 != bridgeNetfilterDefault
+		return sw, keep
+	})
+	e.mu.Lock()
+	e.hasBridgeNetfilter = keep
+	e.bridgeIPv4 = finalSw.ipv4
+	e.bridgeIPv6 = finalSw.ipv6
+	e.mu.Unlock()
 }
 
 // hasRules reports whether a write changed an iptables table. Until then the

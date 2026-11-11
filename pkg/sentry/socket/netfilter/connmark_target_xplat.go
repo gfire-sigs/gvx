@@ -136,6 +136,8 @@ func (m *connmarkTargetMaker) unmarshal(buf []byte, _ stack.IPHeaderFilter) (tar
 // connmarkTarget is the "CONNMARK" target. Like Linux connmark_tg, it returns
 // XT_CONTINUE (RuleContinue). A packet without a tracked connection stays
 // unchanged.
+//
+// +stateify savable
 type connmarkTarget struct {
 	rev             uint8
 	networkProtocol tcpip.NetworkProtocolNumber

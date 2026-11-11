@@ -66,6 +66,8 @@ func (rpfilterMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilte
 
 // RPFilterMatcher matches a packet whose source address passes the reverse
 // path check.
+//
+// +stateify savable
 type RPFilterMatcher struct {
 	flags uint8
 	stack *stack.Stack

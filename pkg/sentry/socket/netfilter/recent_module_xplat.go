@@ -16,13 +16,13 @@ package netfilter
 
 import (
 	"errors"
-	"runtime"
 	"sync"
-	"sync/atomic"
-	"weak"
 
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
+
+const stackRecentModuleKey = "nf_recent.module"
 
 // RecentModule holds the module parameters of xt_recent. Linux has one set for
 // the whole kernel, and the network namespaces of a kernel share it. The zero
@@ -32,16 +32,18 @@ import (
 // cannot change them (mode 0400 in /sys/module/xt_recent/parameters). gvx has no
 // module load, so it accepts a change while no recent list exists, as if the
 // module was unloaded and loaded again with new options.
+//
+// +stateify savable
 type RecentModule struct {
 	// listTot is ip_list_tot. The value 0 stands for the default.
-	listTot atomic.Uint32
+	listTot atomicbitops.Uint32
 	// pktListTot is ip_pkt_list_tot. The value 0 means "not set", as in Linux.
-	pktListTot atomic.Uint32
+	pktListTot atomicbitops.Uint32
 
 	// mu serializes the change of a parameter and the creation of a list.
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 	// lists is the count of lists of all network namespaces.
-	lists int
+	lists int `state:"nosave"`
 }
 
 const (
@@ -90,7 +92,7 @@ func (m *RecentModule) SetPktListTot(v uint32) error {
 	return m.set(&m.pktListTot, v)
 }
 
-func (m *RecentModule) set(p *atomic.Uint32, v uint32) error {
+func (m *RecentModule) set(p *atomicbitops.Uint32, v uint32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lists > 0 {
@@ -100,50 +102,23 @@ func (m *RecentModule) set(p *atomic.Uint32, v uint32) error {
 	return nil
 }
 
-// recentModules maps each network stack to the module parameters that it
-// shares with the other stacks of its kernel.
-var recentModules = struct {
-	mu      sync.Mutex
-	modules map[weak.Pointer[stack.Stack]]*RecentModule
-}{modules: make(map[weak.Pointer[stack.Stack]]*RecentModule)}
-
 // RecentModuleOf returns the module parameters of the kernel of stk. A stack
 // that no ShareRecentModule call linked has parameters of its own.
 func RecentModuleOf(stk *stack.Stack) *RecentModule {
-	recentModules.mu.Lock()
-	defer recentModules.mu.Unlock()
-	return recentModuleLocked(stk)
-}
-
-func recentModuleLocked(stk *stack.Stack) *RecentModule {
-	key := weak.Make(stk)
-	if m := recentModules.modules[key]; m != nil {
-		return m
+	if stk == nil {
+		return new(RecentModule)
 	}
-	m := new(RecentModule)
-	recentModules.modules[key] = m
-	runtime.AddCleanup(stk, func(key weak.Pointer[stack.Stack]) {
-		recentModules.mu.Lock()
-		defer recentModules.mu.Unlock()
-		delete(recentModules.modules, key)
-	}, key)
-	return m
+	return stk.LoadOrStoreExtensionState(stackRecentModuleKey, func() any {
+		return new(RecentModule)
+	}).(*RecentModule)
 }
 
 // ShareRecentModule makes child use the module parameters of parent. A new
 // network namespace calls it with the stack of the root network namespace.
 // Call it before the first rule of child names a list.
 func ShareRecentModule(child, parent *stack.Stack) {
-	recentModules.mu.Lock()
-	defer recentModules.mu.Unlock()
-	m := recentModuleLocked(parent)
-	key := weak.Make(child)
-	if _, ok := recentModules.modules[key]; !ok {
-		runtime.AddCleanup(child, func(key weak.Pointer[stack.Stack]) {
-			recentModules.mu.Lock()
-			defer recentModules.mu.Unlock()
-			delete(recentModules.modules, key)
-		}, key)
+	if child == nil || parent == nil {
+		return
 	}
-	recentModules.modules[key] = m
+	child.SetExtensionState(stackRecentModuleKey, RecentModuleOf(parent))
 }

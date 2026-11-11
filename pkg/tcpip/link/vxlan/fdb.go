@@ -15,6 +15,7 @@
 package vxlan
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"sync"
@@ -56,6 +57,8 @@ const zeroMAC tcpip.LinkAddress = "\x00\x00\x00\x00\x00\x00"
 
 // Remote is one destination of an FDB entry: the tunnel endpoint that gets the
 // encapsulated frame.
+//
+// +stateify savable
 type Remote struct {
 	// IP is the outer destination address. The unspecified address of the
 	// family of the link means "no remote", and the link drops the frame.
@@ -94,26 +97,56 @@ type UpdateMode struct {
 }
 
 // fdbEntry is the stored form of an entry.
+//
+// +stateify savable
 type fdbEntry struct {
 	mac     tcpip.LinkAddress
 	state   uint16
 	flags   uint8
 	remotes []Remote
-	updated time.Time
-	used    time.Time
+	updated time.Time `state:".(int64)"`
+	used    time.Time `state:".(int64)"`
 }
+
+func saveTimeNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func loadTimeNano(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+func (f *fdbEntry) saveUpdated() int64 { return saveTimeNano(f.updated) }
+
+func (f *fdbEntry) loadUpdated(_ context.Context, ns int64) { f.updated = loadTimeNano(ns) }
+
+func (f *fdbEntry) saveUsed() int64 { return saveTimeNano(f.used) }
+
+func (f *fdbEntry) loadUsed(_ context.Context, ns int64) { f.used = loadTimeNano(ns) }
 
 func (f *fdbEntry) static() bool { return f.state&(NUDPermanent|NUDNoARP) != 0 }
 
 // fdb is the forwarding table of a link. The zero value is an empty table.
+//
+// +stateify savable
 type fdb struct {
-	mu      sync.Mutex
+	mu      sync.Mutex `state:"nosave"`
 	entries map[tcpip.LinkAddress]*fdbEntry
 	// nextExpiry is a lower bound of the time at which a dynamic entry can end.
 	// The zero value means that no dynamic entry exists, so a lookup scans the
 	// table only when an entry can be due.
-	nextExpiry time.Time
+	nextExpiry time.Time `state:".(int64)"`
 }
+
+func (t *fdb) saveNextExpiry() int64 { return saveTimeNano(t.nextExpiry) }
+
+func (t *fdb) loadNextExpiry(_ context.Context, ns int64) { t.nextExpiry = loadTimeNano(ns) }
 
 // noteDynamicLocked records that f is a dynamic entry that ends ageing after
 // its last use.

@@ -62,6 +62,8 @@ func (connmarkMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilte
 }
 
 // ConnmarkMatcher matches the mark of the connection of a packet.
+//
+// +stateify savable
 type ConnmarkMatcher struct {
 	mark   uint32
 	mask   uint32

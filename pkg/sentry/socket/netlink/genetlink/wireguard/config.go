@@ -15,6 +15,7 @@
 package wireguard
 
 import (
+	stdcontext "context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -37,24 +38,97 @@ const (
 )
 
 // peerInfo is the state of one peer as wireguard-go reports it.
+//
+// +stateify savable
 type peerInfo struct {
 	publicKey     [keyLen]byte
 	presharedKey  [keyLen]byte
-	endpoint      netip.AddrPort
+	endpoint      netip.AddrPort `state:".(string)"`
 	keepalive     uint16
 	handshakeSec  int64
 	handshakeNsec int64
 	rxBytes       uint64
 	txBytes       uint64
-	allowedIPs    []netip.Prefix
+	allowedIPs    []netip.Prefix `state:".([]string)"`
+}
+
+func (p *peerInfo) saveEndpoint() string {
+	if !p.endpoint.IsValid() {
+		return ""
+	}
+	return p.endpoint.String()
+}
+
+func (p *peerInfo) loadEndpoint(_ stdcontext.Context, s string) {
+	if s == "" {
+		return
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		p.endpoint = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	}
+}
+
+func (p *peerInfo) saveAllowedIPs() []string {
+	if len(p.allowedIPs) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.allowedIPs))
+	for i, pfx := range p.allowedIPs {
+		out[i] = pfx.String()
+	}
+	return out
+}
+
+func (p *peerInfo) loadAllowedIPs(_ stdcontext.Context, ss []string) {
+	if len(ss) == 0 {
+		return
+	}
+	p.allowedIPs = make([]netip.Prefix, 0, len(ss))
+	for _, s := range ss {
+		if pfx, err := netip.ParsePrefix(s); err == nil {
+			p.allowedIPs = append(p.allowedIPs, pfx)
+		}
+	}
 }
 
 // deviceInfo is the state of one device as wireguard-go reports it.
+//
+// +stateify savable
 type deviceInfo struct {
 	privateKey [keyLen]byte
 	listenPort uint16
 	fwmark     uint32
 	peers      []peerInfo
+}
+
+// formatIpcSet encodes the static device and peer configuration in UAPI text
+// form so afterLoad and post-save resume can recreate peers without carrying
+// ephemeral Noise session keys across checkpoint.
+func formatIpcSet(info *deviceInfo) string {
+	if info == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "private_key=%x\n", info.privateKey)
+	b.WriteString("replace_peers=true\n")
+	for i := range info.peers {
+		p := &info.peers[i]
+		fmt.Fprintf(&b, "public_key=%x\n", p.publicKey)
+		if p.presharedKey != [keyLen]byte{} {
+			fmt.Fprintf(&b, "preshared_key=%x\n", p.presharedKey)
+		}
+		if p.endpoint.IsValid() {
+			fmt.Fprintf(&b, "endpoint=%s\n", p.endpoint)
+		}
+		b.WriteString("replace_allowed_ips=true\n")
+		for _, prefix := range p.allowedIPs {
+			fmt.Fprintf(&b, "allowed_ip=%s\n", prefix)
+		}
+		if p.keepalive != 0 {
+			fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", p.keepalive)
+		}
+	}
+	return b.String()
 }
 
 // parseIpcGet parses the text of Device.IpcGet. The peers come in the order of

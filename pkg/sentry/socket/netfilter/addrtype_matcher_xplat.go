@@ -15,6 +15,7 @@
 package netfilter
 
 import (
+	"context"
 	"fmt"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -252,6 +253,8 @@ func (m addrtypeMarshaler) unmarshal(_ IDMapper, buf []byte, filter stack.IPHead
 
 // AddrtypeMatcher matches the type (LOCAL, UNICAST, ...) of the source and
 // destination address of a packet.
+//
+// +stateify savable
 type AddrtypeMatcher struct {
 	rev uint8
 	// source and dest are bit masks of XT_ADDRTYPE_* values. A zero mask
@@ -263,9 +266,17 @@ type AddrtypeMatcher struct {
 	limitIfaceIn  bool
 	limitIfaceOut bool
 
+	stk *stack.Stack
+
 	// resolver is nil until bindStack runs. A nil resolver classifies every
 	// address as UNICAST.
-	resolver addrResolver
+	resolver addrResolver `state:"nosave"`
+}
+
+func (am *AddrtypeMatcher) afterLoad(context.Context) {
+	if am.stk != nil {
+		am.resolver = stackResolver{stk: am.stk}
+	}
 }
 
 // name implements matcher.name.
@@ -280,6 +291,7 @@ func (am *AddrtypeMatcher) revision() uint8 {
 
 // bindStack implements stackBinder.bindStack.
 func (am *AddrtypeMatcher) bindStack(stk *stack.Stack) *syserr.Error {
+	am.stk = stk
 	am.resolver = stackResolver{stk: stk}
 	return nil
 }

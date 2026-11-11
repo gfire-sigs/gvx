@@ -226,6 +226,11 @@ type Stack struct {
 	// neighborTables hold the gc_thresh values and the entry counts of the
 	// ARP and NDP tables. See neighbor_gc_xplat.go.
 	neighborTables neighborTables
+
+	// extStateMu guards lazy initialization of extState on zero-valued stacks.
+	extStateMu sync.Mutex `state:"nosave"`
+	// extState holds savable per-stack extension state.
+	extState *stackExtState
 }
 
 // NetworkProtocolFactory instantiates a network protocol.
@@ -486,6 +491,7 @@ func New(opts Options) *Stack {
 		tsOffsetSecret:        secureRNG.Uint32(),
 		allowLiveTCPMigration: opts.AllowLiveTCPMigration,
 	}
+	s.extState = newStackExtState(s)
 	s.SetNFTables(opts.NFTables)
 
 	// Add specified network protocols.
@@ -1053,7 +1059,7 @@ func (s *Stack) CreateNICWithOptions(id tcpip.NICID, ep LinkEndpoint, opts NICOp
 	}
 	s.nics[id] = n
 	s.nicsChanged()
-	if n.kind == "tun" {
+	if n.kind == "tun" || n.kind == "vxlan" || n.kind == "wireguard" || isPreservedEndpoint(ep) {
 		s.preservedNICs[id] = n
 	}
 	if n.IsLoopback() {
@@ -2351,6 +2357,7 @@ func (s *Stack) Resume() {
 	for _, e := range eps {
 		e.Resume()
 	}
+	s.runResumeHooks()
 	// Now resume any protocol level background workers.
 	for _, p := range s.transportProtocols {
 		p.proto.Resume()

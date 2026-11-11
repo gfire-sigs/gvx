@@ -15,17 +15,22 @@
 package ipset
 
 import (
+	"context"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"z.gfire.dev/gvx/pkg/atomicbitops"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
 // Module holds the module parameters of ip_set. The parameter max_sets sets
 // the initial size of the table of sets of each network namespace that is
 // created after the change. The table grows as in Linux, so the parameter is
 // no limit on the count of sets.
+//
+// +stateify savable
 type Module struct {
-	maxSets atomic.Int32
+	maxSets atomicbitops.Int32
 }
 
 // NewModule returns the parameters with the defaults of Linux.
@@ -47,13 +52,17 @@ func (m *Module) SetMaxSets(n int32) {
 
 // Registry holds the sets of one network namespace. Its methods are safe for
 // concurrent use.
+//
+// +stateify savable
 type Registry struct {
-	clock func() time.Duration
+	clock    func() time.Duration `state:"nosave"`
+	stk      *stack.Stack
+	savedNow time.Duration
 
 	// mu guards the table and the reference counts and names of the sets.
 	// A method never holds mu while it calls into a Set that takes the
 	// lock of the Set, except where a comment says so.
-	mu   sync.RWMutex
+	mu   sync.RWMutex `state:"nosave"`
 	sets []*Set
 }
 
@@ -64,7 +73,46 @@ func NewRegistry(maxSets int, clock func() time.Duration) *Registry {
 		maxSets = DefaultMaxSets
 	}
 	maxSets = min(maxSets, int(InvalidID)-1)
+	if clock == nil {
+		start := time.Now()
+		clock = func() time.Duration {
+			return time.Since(start) + time.Second
+		}
+	}
 	return &Registry{clock: clock, sets: make([]*Set, maxSets)}
+}
+
+func (r *Registry) now() time.Duration {
+	if r.clock != nil {
+		return r.clock()
+	}
+	if r.savedNow > 0 {
+		return r.savedNow
+	}
+	return time.Second
+}
+
+func (r *Registry) beforeSave() {
+	r.savedNow = r.now()
+}
+
+func (r *Registry) afterLoad(context.Context) {
+	baseOffset := r.savedNow
+	if baseOffset <= 0 {
+		baseOffset = time.Second
+	}
+	if r.stk != nil {
+		clock := r.stk.Clock()
+		epoch := clock.NowMonotonic()
+		r.clock = func() time.Duration {
+			return clock.NowMonotonic().Sub(epoch) + baseOffset
+		}
+		return
+	}
+	start := time.Now()
+	r.clock = func() time.Duration {
+		return time.Since(start) + baseOffset
+	}
 }
 
 // find returns the set with the name and its index.

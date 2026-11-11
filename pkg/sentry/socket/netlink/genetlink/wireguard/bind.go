@@ -70,15 +70,16 @@ var errBirthplaceEnded = &bindError{err: syserr.ErrNoNet, terr: &tcpip.ErrNoNet{
 // chooses the port. It asks the bind to open, and the bind opens the stored
 // port. The stored port survives a close, so a device that comes up again
 // listens on the port that it had before, as in wg_open.
+// +stateify savable
 type netBind struct {
 	stack *stack.Stack
 
-	mu      sync.Mutex
-	session *bindSession
+	mu      sync.Mutex   `state:"nosave"`
+	session *bindSession `state:"nosave"`
 	// pending holds sockets that the next Open takes. A change of the port
 	// opens them first, so that a busy port fails before the device closes
 	// its sockets.
-	pending *bindSession
+	pending *bindSession `state:"nosave"`
 	// incoming is the port that the next Open binds. It is 0 for a random
 	// port until the first Open. After an Open it is the port of that Open.
 	incoming uint16
@@ -86,6 +87,16 @@ type netBind struct {
 	mark uint32
 	// gone is true after the creating namespace ended. No socket opens then.
 	gone bool
+}
+
+func (b *netBind) closePending() {
+	b.mu.Lock()
+	p := b.pending
+	b.pending = nil
+	b.mu.Unlock()
+	if p != nil {
+		p.close()
+	}
 }
 
 // bindSession is one generation of UDP endpoints.

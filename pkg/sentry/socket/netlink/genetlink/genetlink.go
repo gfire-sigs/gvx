@@ -21,6 +21,7 @@
 package genetlink
 
 import (
+	stdcontext "context"
 	"fmt"
 	"sync"
 
@@ -174,9 +175,24 @@ type Dumper interface {
 }
 
 // dumpAdapter runs a Dumper of a family as a netlink.Dumper.
+//
+// +stateify savable
 type dumpAdapter struct {
-	family *Family
+	family *Family `state:".(string)"`
 	dumper Dumper
+}
+
+func (a *dumpAdapter) saveFamily() string {
+	if a.family == nil {
+		return ""
+	}
+	return a.family.Name
+}
+
+func (a *dumpAdapter) loadFamily(_ stdcontext.Context, name string) {
+	if name != "" {
+		a.family = lookupName(name)
+	}
 }
 
 var _ netlink.Dumper = (*dumpAdapter)(nil)
@@ -309,6 +325,8 @@ func families() []*Family {
 }
 
 // Protocol implements netlink.Protocol for NETLINK_GENERIC.
+//
+// +stateify savable
 type Protocol struct{}
 
 var _ netlink.Protocol = (*Protocol)(nil)

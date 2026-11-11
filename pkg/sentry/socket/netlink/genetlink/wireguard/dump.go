@@ -53,6 +53,7 @@ func (e *linkEndpoint) snapshot() (*deviceDump, *syserr.Error) {
 	if e.closed {
 		return nil, syserr.ErrNoDevice
 	}
+	e.ensureDeviceLocked()
 	text, err := e.dev.IpcGet()
 	if err != nil {
 		return nil, syserr.ErrIO
@@ -68,6 +69,8 @@ func (e *linkEndpoint) snapshot() (*deviceDump, *syserr.Error) {
 }
 
 // deviceDump sends the snapshot of a device, one message for each chunk.
+//
+// +stateify savable
 type deviceDump struct {
 	ifindex uint32
 	name    string

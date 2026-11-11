@@ -43,6 +43,8 @@ func protoWithPorts(proto uint8) bool {
 // hashKey is the identity of an element of a hash set or a bitmap set. A
 // component that a type does not use stays zero. cidr and cidr2 are the prefix
 // lengths of the components that are networks.
+//
+// +stateify savable
 type hashKey struct {
 	ip, ip2     Addr
 	port        uint16
@@ -51,6 +53,8 @@ type hashKey struct {
 }
 
 // entry is a stored element.
+//
+// +stateify savable
 type entry struct {
 	key     hashKey
 	live    bool
@@ -61,6 +65,8 @@ type entry struct {
 // prefixSet counts the elements of a set for each prefix length of a network
 // component. list holds the prefix lengths in use from the longest to the
 // shortest, as the arrays of nets of Linux do.
+//
+// +stateify savable
 type prefixSet struct {
 	counts [129]uint32
 	list   []uint8
@@ -89,12 +95,14 @@ func (p *prefixSet) del(cidr uint8) {
 // store keeps the elements of a hash set or a bitmap set in the order of their
 // insertion. A removed element leaves a dead slot, so that a listing in
 // progress keeps its position. The slots are compacted when no listing runs.
+//
+// +stateify savable
 type store struct {
 	index   map[hashKey]int
 	entries []entry
 	live    int
 	// listings counts the cursors that read the entries.
-	listings int
+	listings int `state:"nosave"`
 	prefix   [2]prefixSet
 	// purgeAt is the entry count at which the next add looks for expired
 	// elements.

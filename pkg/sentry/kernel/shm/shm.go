@@ -38,6 +38,7 @@ import (
 	"fmt"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -88,6 +89,9 @@ type Registry struct {
 	//
 	// +checklocks:mu
 	totalPages uint64
+
+	// rmidForced stores kernel.shm_rmid_forced for the owning IPC namespace.
+	rmidForced atomicbitops.Int32
 }
 
 // NewRegistry creates a new shm registry.
