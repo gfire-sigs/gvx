@@ -98,5 +98,6 @@ if [ "$host_sha" != "$guest_sha" ]; then
 fi
 
 if [ "$host_os/$host_arch" = "$target_os/$target_arch" ] && [ "$pkg" = "./cmd/rungv" ]; then
+	chmod +x "$guest_out"
 	"$guest_out" version
 fi

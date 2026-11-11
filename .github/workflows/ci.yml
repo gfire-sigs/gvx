@@ -330,6 +330,5 @@ jobs:
           key: gvx-repro-golang-${{ hashFiles('go.mod') }}-${{ runner.arch }}
       - name: Build rungv in gvx Go image and compare SHA-256
         env:
-          GVX_REPRO_CACHE_DIR: ~/.cache/gvx/repro-layers
           GVX_REPRO_PLATFORM: systrap
-        run: ./scripts/verify-repro-gvx.sh
+        run: GVX_REPRO_CACHE_DIR="$HOME/.cache/gvx/repro-layers" ./scripts/verify-repro-gvx.sh
