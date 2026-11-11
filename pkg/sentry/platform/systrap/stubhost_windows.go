@@ -17,12 +17,14 @@
 package systrap
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -74,6 +76,8 @@ const (
 	confineWin32k
 	// confineStrict adds strict handle checks and disables extension points.
 	confineStrict
+	// confineImageLoad blocks remote DLL loads and non-system fonts.
+	confineImageLoad
 )
 
 // stubHandles is the host reply for one stub.
@@ -177,6 +181,11 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 	if err != nil {
 		return 5
 	}
+	defer func() {
+		if h.token != 0 {
+			_ = h.token.Close()
+		}
+	}()
 	tImage := time.Now()
 	h.image, err = createStubImage(os.TempDir())
 	if err != nil && traceEvents {
@@ -287,6 +296,7 @@ var (
 
 	procInitializeProcThreadAttributeList = modKernel32.NewProc("InitializeProcThreadAttributeList")
 	procUpdateProcThreadAttribute         = modKernel32.NewProc("UpdateProcThreadAttribute")
+	procDeleteProcThreadAttributeList     = modKernel32.NewProc("DeleteProcThreadAttributeList")
 )
 
 const (
@@ -294,41 +304,68 @@ const (
 	lowIntegritySID     = "S-1-16-4096"
 
 	procThreadAttributeMitigationPolicy = 0x00020007
-	mitigationWin32kSystemCallDisable   = uint64(1) << 28
-	mitigationStrictHandleChecks        = uint64(1) << 24
-	mitigationExtensionPointDisable     = uint64(1) << 32
+
+	mitigationStrictHandleChecks      = uint64(1) << 24
+	mitigationWin32kSystemCallDisable = uint64(1) << 28
+	mitigationExtensionPointDisable   = uint64(1) << 32
+	mitigationFontDisable             = uint64(1) << 48
+	mitigationImageLoadNoRemote       = uint64(1) << 52
 )
 
-// stubRestrictingSIDs are the restricting SIDs of the stub token: Everyone,
-// BUILTIN\Users, and RESTRICTED. The system files that a process needs to start
-// grant at least one of them.
-var stubRestrictingSIDs = []string{stubPrivateSID, "S-1-1-0", "S-1-5-32-545", "S-1-5-12"}
+// stubBaseRestrictingSIDs are the shared restricting SIDs of a stub token:
+// Everyone, BUILTIN\Users, and RESTRICTED. System DLLs grant read and execute
+// to at least one of them. Each stub token prepends its own random private SID.
+var stubBaseRestrictingSIDs = []string{"S-1-1-0", "S-1-5-32-545", "S-1-5-12"}
 
-// stubPrivateSID is the Null SID. No token holds it, so no DACL grants it unless
-// gvx does. The stub token lists it as a restricting SID and its default DACL
-// grants it full access. The stub can then open the objects that it creates,
-// such as its own process and threads, and no other process can.
-const stubPrivateSID = "S-1-0-0"
-
-// buildStubToken returns the primary token of every stub: the token of the
-// host with restricting SIDs, without privileges, at Low integrity.
-//
-// WHY: a Low-integrity token cannot write to Medium objects or open most
-// processes. Dropping privileges removes SeDebugPrivilege and similar rights.
-// The restricting SIDs keep the token from reading the private files of the
-// user. The stub needs no handle at all, so the token is the only identity that
-// a guest escape would inherit.
-func buildStubToken() (windows.Token, confinement, error) {
-	return buildStubTokenWith(stubRestrictingSIDs)
+// randomStubPrivateSID generates a unique 128-bit resource-manager SID
+// (S-1-9-...) for a single stub token. No other process or sibling stub holds
+// this SID in its restricting SID list, so granting it alongside the host user
+// and SYSTEM in the stub Process/Thread DACL and TokenDefaultDacl lets the
+// stub open its own objects during loader initialization while isolating stubs
+// from one another and from external Low-integrity processes.
+func randomStubPrivateSID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate stub private SID: %w", err)
+	}
+	s0 := binary.LittleEndian.Uint32(raw[0:4])
+	s1 := binary.LittleEndian.Uint32(raw[4:8])
+	s2 := binary.LittleEndian.Uint32(raw[8:12])
+	s3 := binary.LittleEndian.Uint32(raw[12:16])
+	return fmt.Sprintf("S-1-9-%d-%d-%d-%d", s0, s1, s2, s3), nil
 }
 
-// buildStubTokenWith builds the stub token with the given restricting SIDs.
-func buildStubTokenWith(restrictingSIDs []string) (windows.Token, confinement, error) {
+// buildStubToken returns a confined primary token for a stub: the host token
+// with a unique private restricting SID, deny-only logon and extra group SIDs,
+// all privileges removed, and Low integrity.
+//
+// WHY: a Low-integrity token cannot write to Medium objects or open most
+// processes. Removing privileges drops SeDebugPrivilege and similar rights.
+// The restricting SIDs block reads of private user files in the second pass of
+// SeAccessCheck, while deny-only logon and extra group SIDs block logon-session
+// objects in both passes.
+func buildStubToken() (windows.Token, confinement, error) {
+	tok, _, level, err := newStubIdentity()
+	return tok, level, err
+}
+
+// newStubIdentity builds a confined primary token and matching protected
+// Process/Thread security descriptor for one stub process.
+func newStubIdentity() (windows.Token, *windows.SECURITY_DESCRIPTOR, confinement, error) {
+	privSID, err := randomStubPrivateSID()
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	restrictingSIDs := append([]string{privSID}, stubBaseRestrictingSIDs...)
+	return buildStubIdentityWith(privSID, restrictingSIDs)
+}
+
+func buildStubIdentityWith(privateSID string, restrictingSIDs []string) (windows.Token, *windows.SECURITY_DESCRIPTOR, confinement, error) {
 	var self windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(),
 		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ADJUST_DEFAULT|windows.TOKEN_ADJUST_SESSIONID|windows.TOKEN_ADJUST_PRIVILEGES, &self)
 	if err != nil {
-		return 0, 0, fmt.Errorf("OpenProcessToken: %w", err)
+		return 0, nil, 0, fmt.Errorf("OpenProcessToken: %w", err)
 	}
 	defer self.Close()
 	// The restricting SIDs make the kernel check each access a second time against
@@ -341,83 +378,148 @@ func buildStubTokenWith(restrictingSIDs []string) (windows.Token, confinement, e
 	for _, sddl := range restrictingSIDs {
 		sid, err := windows.StringToSid(sddl)
 		if err != nil {
-			return 0, 0, fmt.Errorf("restricting SID %s: %w", sddl, err)
+			return 0, nil, 0, fmt.Errorf("restricting SID %s: %w", sddl, err)
 		}
 		restrict = append(restrict, windows.SIDAndAttributes{Sid: sid})
 	}
+	userInfo, err := self.GetTokenUser()
+	if err != nil {
+		return 0, nil, 0, fmt.Errorf("GetTokenUser: %w", err)
+	}
+	groupInfo, err := self.GetTokenGroups()
+	if err != nil {
+		return 0, nil, 0, fmt.Errorf("GetTokenGroups: %w", err)
+	}
+	deny := stubDenyOnlySIDs(groupInfo.AllGroups())
 	var restricted windows.Token
-	var restrictPtr uintptr
+	var denyPtr, restrictPtr uintptr
+	if len(deny) > 0 {
+		denyPtr = uintptr(unsafe.Pointer(&deny[0]))
+	}
 	if len(restrict) > 0 {
 		restrictPtr = uintptr(unsafe.Pointer(&restrict[0]))
 	}
-	r, _, e := procCreateRestrictedToken.Call(uintptr(self), disableMaxPrivilege, 0, 0, 0, 0,
+	r, _, e := procCreateRestrictedToken.Call(uintptr(self), disableMaxPrivilege,
+		uintptr(len(deny)), denyPtr, 0, 0,
 		uintptr(len(restrict)), restrictPtr, uintptr(unsafe.Pointer(&restricted)))
+	runtime.KeepAlive(deny)
+	runtime.KeepAlive(restrict)
 	if r == 0 {
-		return 0, 0, fmt.Errorf("CreateRestrictedToken: %w", e)
+		return 0, nil, 0, fmt.Errorf("CreateRestrictedToken: %w", e)
 	}
-	if err := setStubDefaultDacl(restricted, self); err != nil {
+	sd, err := buildStubObjectSD(userInfo.User.Sid, privateSID)
+	if err != nil {
 		restricted.Close()
-		return 0, 0, err
+		return 0, nil, 0, err
+	}
+	if err := setStubDefaultDacl(restricted, sd); err != nil {
+		restricted.Close()
+		return 0, nil, 0, err
 	}
 	if err := removeAllStubPrivileges(restricted); err != nil {
 		restricted.Close()
-		return 0, 0, err
+		return 0, nil, 0, err
 	}
 	sid, err := windows.StringToSid(lowIntegritySID)
 	if err != nil {
 		restricted.Close()
-		return 0, 0, err
+		return 0, nil, 0, err
 	}
 	label := windows.Tokenmandatorylabel{Label: windows.SIDAndAttributes{Sid: sid, Attributes: windows.SE_GROUP_INTEGRITY}}
 	err = windows.SetTokenInformation(restricted, windows.TokenIntegrityLevel, (*byte)(unsafe.Pointer(&label)),
 		uint32(unsafe.Sizeof(label))+windows.GetLengthSid(sid))
 	if err != nil {
 		restricted.Close()
-		return 0, 0, fmt.Errorf("SetTokenInformation(TokenIntegrityLevel): %w", err)
+		return 0, nil, 0, fmt.Errorf("SetTokenInformation(TokenIntegrityLevel): %w", err)
 	}
-	return restricted, confineToken, nil
+	return restricted, sd, confineToken, nil
 }
 
-// setStubDefaultDacl sets the default DACL of the stub token. The DACL gives the
-// process and the thread objects of the stub to the user, to SYSTEM, and to the
-// private restricting SID. A restricted token passes an access check only when
-// a restricting SID is also granted, so without the last entry the stub could
-// not open its own process and the loader would fail with 0xC0000142.
-func setStubDefaultDacl(token, parent windows.Token) error {
-	user, err := parent.GetTokenUser()
+// buildStubObjectSD builds a protected security descriptor granting GENERIC_ALL
+// strictly to the host user SID, SYSTEM, and the per-stub private restricting
+// SID (never Everyone).
+func buildStubObjectSD(userSID *windows.SID, privateSID string) (*windows.SECURITY_DESCRIPTOR, error) {
+	sddl := "D:P(A;;GA;;;" + userSID.String() + ")(A;;GA;;;SY)(A;;GA;;;" + privateSID + ")"
+	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
-		return fmt.Errorf("read the user of the host token: %w", err)
+		return nil, fmt.Errorf("build the security descriptor of the stub: %w", err)
 	}
-	system, err := windows.StringToSid("S-1-5-18")
+	return sd, nil
+}
+
+// setStubDefaultDacl sets the default DACL of the stub token from sd. A
+// restricted token passes SeAccessCheck only when both the enabled normal SIDs
+// (host user) and the restricting SIDs (privateSID) grant access, so without
+// privateSID the stub loader fails with 0xC0000142, and excluding Everyone
+// keeps external users and sibling stubs out.
+func setStubDefaultDacl(token windows.Token, sd *windows.SECURITY_DESCRIPTOR) error {
+	acl, _, err := sd.DACL()
 	if err != nil {
-		return err
-	}
-	private, err := windows.StringToSid(stubPrivateSID)
-	if err != nil {
-		return err
-	}
-	var entries []windows.EXPLICIT_ACCESS
-	for _, sid := range []*windows.SID{user.User.Sid, system, private} {
-		entries = append(entries, windows.EXPLICIT_ACCESS{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_UNKNOWN,
-				TrusteeValue: windows.TrusteeValueFromSID(sid),
-			},
-		})
-	}
-	acl, err := windows.ACLFromEntries(entries, nil)
-	if err != nil {
-		return fmt.Errorf("build the default DACL of the stub token: %w", err)
+		return fmt.Errorf("read the default DACL of the stub token: %w", err)
 	}
 	info := struct{ acl *windows.ACL }{acl}
-	if err := windows.SetTokenInformation(token, windows.TokenDefaultDacl, (*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+	err = windows.SetTokenInformation(token, windows.TokenDefaultDacl, (*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)))
+	runtime.KeepAlive(sd)
+	if err != nil {
 		return fmt.Errorf("SetTokenInformation(TokenDefaultDacl): %w", err)
 	}
 	return nil
+}
+
+// stubDenyOnlySIDs marks every enabled non-baseline group SID on the host
+// token with SE_GROUP_USE_FOR_DENY_ONLY while keeping standard session and
+// system groups enabled for Pass 1 kernel directory checks (such as
+// \Sessions\<N>\BaseNamedObjects during ntdll initialization). Pass 2
+// enforces TokenRestrictedSids (privateSID, Everyone, Users, RESTRICTED), which
+// denies objects that grant only the user SID, logon SID, or custom groups.
+func stubDenyOnlySIDs(groups []windows.SIDAndAttributes) []windows.SIDAndAttributes {
+	var out []windows.SIDAndAttributes
+	for _, g := range groups {
+		switch {
+		case g.Attributes&windows.SE_GROUP_INTEGRITY != 0:
+		case g.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY != 0:
+		case g.Attributes&windows.SE_GROUP_LOGON_ID == windows.SE_GROUP_LOGON_ID:
+		case g.Attributes&windows.SE_GROUP_ENABLED == 0:
+		case isStubAllowedGroupSID(g.Sid):
+		default:
+			out = append(out, windows.SIDAndAttributes{Sid: g.Sid, Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY})
+		}
+	}
+	return out
+}
+
+func isStubAllowedGroupSID(sid *windows.SID) bool {
+	auth, subs, ok := stubSIDFields(sid)
+	if !ok {
+		return false
+	}
+	if auth == windows.SECURITY_WORLD_SID_AUTHORITY && len(subs) == 1 && subs[0] == 0 {
+		return true // Everyone (S-1-1-0)
+	}
+	if auth == windows.SECURITY_NT_AUTHORITY && len(subs) == 1 && subs[0] == 11 {
+		return true // Authenticated Users (S-1-5-11)
+	}
+	if auth == windows.SECURITY_NT_AUTHORITY && len(subs) == 2 && subs[0] == 32 && (subs[1] == 544 || subs[1] == 545) {
+		return true // BUILTIN\Administrators (S-1-5-32-544) and BUILTIN\Users (S-1-5-32-545)
+	}
+	return false
+}
+
+func stubSIDFields(sid *windows.SID) (windows.SidIdentifierAuthority, []uint32, bool) {
+	var auth windows.SidIdentifierAuthority
+	if sid == nil || !sid.IsValid() {
+		return auth, nil, false
+	}
+	b := unsafe.Slice((*byte)(unsafe.Pointer(sid)), sid.Len())
+	if len(b) < 8 || len(b) < 8+4*int(b[1]) {
+		return auth, nil, false
+	}
+	copy(auth.Value[:], b[2:8])
+	subs := make([]uint32, b[1])
+	for i := range subs {
+		subs[i] = binary.LittleEndian.Uint32(b[8+4*i:])
+	}
+	return auth, subs, true
 }
 
 // removeAllStubPrivileges deletes every privilege from token with
@@ -765,20 +867,29 @@ func (h *stubHostLoop) createProcessFor(path string) (*windows.ProcessInformatio
 	return h.createProcess(cmd)
 }
 
-// createProcess starts the suspended stub with the strongest mitigation set
-// that the host accepts.
+// createProcess starts the suspended stub with a fresh per-stub restricted
+// token and the strongest mitigation set that the host accepts.
 func (h *stubHostLoop) createProcess(cmd *uint16) (*windows.ProcessInformation, confinement, error) {
+	tok, sd, _, err := newStubIdentity()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tok.Close()
+
+	const baseStrict = mitigationWin32kSystemCallDisable | mitigationStrictHandleChecks | mitigationExtensionPointDisable
+	const imageHardening = mitigationFontDisable | mitigationImageLoadNoRemote
 	policies := []struct {
 		bits  uint64
 		level confinement
 	}{
-		{mitigationWin32kSystemCallDisable | mitigationStrictHandleChecks | mitigationExtensionPointDisable, confineToken | confineWin32k | confineStrict},
+		{baseStrict | imageHardening, confineToken | confineWin32k | confineStrict | confineImageLoad},
+		{baseStrict, confineToken | confineWin32k | confineStrict},
 		{mitigationWin32kSystemCallDisable, confineToken | confineWin32k},
 		{0, confineToken},
 	}
 	var lastErr error
 	for _, p := range policies {
-		pi, err := h.createWithPolicy(cmd, p.bits)
+		pi, err := h.createWithPolicy(cmd, tok, sd, p.bits)
 		if err == nil {
 			return pi, p.level, nil
 		}
@@ -790,7 +901,7 @@ func (h *stubHostLoop) createProcess(cmd *uint16) (*windows.ProcessInformation, 
 	return nil, 0, lastErr
 }
 
-func (h *stubHostLoop) createWithPolicy(cmd *uint16, policy uint64) (*windows.ProcessInformation, error) {
+func (h *stubHostLoop) createWithPolicy(cmd *uint16, tok windows.Token, sd *windows.SECURITY_DESCRIPTOR, policy uint64) (*windows.ProcessInformation, error) {
 	type startupInfoEx struct {
 		windows.StartupInfo
 		attrs uintptr
@@ -806,16 +917,29 @@ func (h *stubHostLoop) createWithPolicy(cmd *uint16, policy uint64) (*windows.Pr
 		if r, _, e := procInitializeProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&list[0])), 1, 0, uintptr(unsafe.Pointer(&size))); r == 0 {
 			return nil, fmt.Errorf("InitializeProcThreadAttributeList: %w", e)
 		}
+		defer procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&list[0])))
 		if r, _, e := procUpdateProcThreadAttribute.Call(uintptr(unsafe.Pointer(&list[0])), 0, procThreadAttributeMitigationPolicy,
-			uintptr(unsafe.Pointer(&policy)), 8, 0, 0); r == 0 {
+			uintptr(unsafe.Pointer(&policy)), unsafe.Sizeof(policy), 0, 0); r == 0 {
 			return nil, fmt.Errorf("UpdateProcThreadAttribute(mitigation policy): %w", e)
 		}
 		si.attrs = uintptr(unsafe.Pointer(&list[0]))
 		flags |= windows.EXTENDED_STARTUPINFO_PRESENT
 	}
 	var pi windows.ProcessInformation
-	r, _, e := procCreateProcessAsUserW.Call(uintptr(h.token), 0, uintptr(unsafe.Pointer(cmd)), 0, 0, 0, flags, 0, 0,
-		uintptr(unsafe.Pointer(&si)), uintptr(unsafe.Pointer(&pi)))
+	r, _, e := procCreateProcessAsUserW.Call(
+		uintptr(tok),
+		0,
+		uintptr(unsafe.Pointer(cmd)),
+		0,
+		0,
+		0,
+		flags,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&si)),
+		uintptr(unsafe.Pointer(&pi)),
+	)
+	runtime.KeepAlive(sd)
 	if r == 0 {
 		return nil, fmt.Errorf("CreateProcessAsUser: %w", e)
 	}

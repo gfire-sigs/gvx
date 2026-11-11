@@ -127,7 +127,7 @@ func (th *thread) setTLS(value uint64) error {
 func (th *thread) archStart(ac *arch.Context64) error {
 	want := ac.StateData().Regs.TPIDR_EL0
 	if f := th.fast.Load(); f != nil {
-		f.slot.sm.TLS = want
+		f.slot.sm.tls().Store(want)
 		want = f.slot.va
 	}
 	if th.tlsKnown && th.tls == want {
@@ -161,7 +161,7 @@ func archStatsLine() string { return "" }
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(ac *arch.Context64) {
 	if f := th.fast.Load(); f != nil {
-		ac.StateData().Regs.TPIDR_EL0 = f.slot.sm.TLS
+		ac.StateData().Regs.TPIDR_EL0 = f.slot.sm.tls().Load()
 		return
 	}
 	if th.tlsKnown {
@@ -221,7 +221,7 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		if f := th.fast.Load(); f != nil {
 			// The register of the thread keeps the address of the sysmsg. The
 			// guest thread pointer lives in the sysmsg.
-			f.slot.sm.TLS = v
+			f.slot.sm.tls().Store(v)
 			if err := th.continueEvent(ev); err != nil {
 				return fatal(err, unix.EFAULT), true
 			}
@@ -240,7 +240,7 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	case siteMRS:
 		// A read of the guest thread pointer that no slot serves.
 		if f := th.fast.Load(); f != nil && site.reg != 31 {
-			th.ctx.setReg(int(site.reg), f.slot.sm.TLS)
+			th.ctx.setReg(int(site.reg), f.slot.sm.tls().Load())
 		}
 	default:
 		return outcome{}, false
@@ -332,7 +332,7 @@ type siteInfo struct {
 // aligned word has no marker that tells code from data. A data word that
 // equals one of the 289 patched encodings changes in the copy that the guest
 // reads. A word matches with a probability of 289 in 2^32 for uniform data.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool, _ []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, error) {
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool, _ []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, []uint16, error) {
 	sites := make(map[uint16]siteInfo)
 	var slots []winSlotRef
 	for _, s := range scanARM64(page) {
@@ -379,7 +379,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 			binary.LittleEndian.PutUint32(page[off:], arm64NOP)
 		}
 	}
-	return sites, slots, nil, nil
+	return sites, slots, nil, nil, nil
 }
 
 // fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and
@@ -441,7 +441,7 @@ func (th *thread) archFastTrap(ac *arch.Context64) { th.pullArch(ac) }
 // forces a cold resume.
 func (th *thread) archFastHot(ac *arch.Context64) bool {
 	if f := th.fast.Load(); f != nil {
-		f.slot.sm.TLS = ac.StateData().Regs.TPIDR_EL0
+		f.slot.sm.tls().Store(ac.StateData().Regs.TPIDR_EL0)
 	}
 	return true
 }
@@ -450,7 +450,7 @@ func (th *thread) archFastHot(ac *arch.Context64) bool {
 // routine to enter the new guest context through a cold resume.
 func (th *thread) archFastRecycleStart(_ *fastThread, ac *arch.Context64) uint32 {
 	if f := th.fast.Load(); f != nil {
-		f.slot.sm.TLS = ac.StateData().Regs.TPIDR_EL0
+		f.slot.sm.tls().Store(ac.StateData().Regs.TPIDR_EL0)
 	}
 	return winStateRunCold
 }
@@ -477,3 +477,7 @@ func (th *thread) archFastGetFP(f *fastThread, ac *arch.Context64) error {
 	f.slot.sm.storeVector(ac)
 	return nil
 }
+
+func initIslandBytes([]byte) {}
+
+func slotSeamSafe([]byte, uint32, uint32) bool { return true }

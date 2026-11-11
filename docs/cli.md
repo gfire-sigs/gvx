@@ -70,7 +70,8 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | Flag | Meaning |
 | :--- | :--- |
 | `-image REF`, `-bin ELF` | Name the image or the binary without a positional argument. |
-| `-platform BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. The `systrap` backend runs on Windows and Linux. macOS has no `systrap` engine. A value with a slash is a Docker image platform. |
+| `-platform BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. On Windows, `auto` requires `whpx` unless `-allow-unconfined-systrap` is set, and `systrap` prints a stderr warning. macOS has no `systrap` engine. A value with a slash selects a Docker image platform. |
+| `-allow-unconfined-systrap` | Allow `-platform=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted workloads on Windows require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
@@ -256,7 +257,7 @@ An unmodified `docker:dind` image starts with the default `--iptables=true`. [`d
 
 ### 4.9 Failures and diagnostics
 
-`-platform=auto` prefers the hardware hypervisor and falls back to `systrap`. The fallback is slower. `rungv` then prints a warning that names the cause and the fix. On Windows the usual cause is a disabled "Windows Hypervisor Platform" feature. On macOS it is a binary without the hypervisor entitlement. Sign it with `codesign --sign - --entitlements entitlements.plist --force rungv`. The SDK gives the same text through `Sandbox.FallbackReason`.
+`-platform=auto` selects `hvf` on macOS, `systrap` on Linux, and `whpx` on Windows unless `-allow-unconfined-systrap` enables fallback to `systrap`. On Windows, a disabled "Windows Hypervisor Platform" feature makes `auto` fail closed without `-allow-unconfined-systrap`. When `-allow-unconfined-systrap` or `-platform=systrap` runs on Windows, `rungv` prints a stderr warning and the SDK records the reason in `Sandbox.FallbackReason`. macOS has no `systrap` engine, so `auto` fails when the binary lacks the hypervisor entitlement. Sign it with `codesign --sign - --entitlements entitlements.plist --force rungv`.
 
 The exit code 137 has two causes that `rungv` tells apart. A guest that passes `--memory` gets the message about the memory limit. When the engine fails under the guest, the kernel ends the guest with SIGKILL, and `rungv` prints `the execution engine stopped the guest` with the cause. The SDK returns `ErrEngineFault` in that case. A stub process that a virus scanner ended is one example of an engine fault.
 

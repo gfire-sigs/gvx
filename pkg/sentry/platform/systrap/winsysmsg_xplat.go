@@ -44,6 +44,12 @@ const (
 	// The first part of the code pages holds the routines of the arch files:
 	// the amd64 FS base trampolines and the arm64 TLS routine.
 	winSpillOffset = 0x4000
+	// winGuardCodeOffset is the offset of the per-thread amd64 guarded-site
+	// scratch slots in the executable part of the engine pages.
+	winGuardCodeOffset = 0x4800
+	// winSpillMaxSize bounds the spill routine so it never overlaps the
+	// guarded-site scratch slots that start at winGuardCodeOffset.
+	winSpillMaxSize = winGuardCodeOffset - winSpillOffset
 
 	// winThreadAreaSize is the distance between the areas of two threads. One
 	// area holds the winSysmsg page, then the page of the stub stack.
@@ -167,6 +173,9 @@ const (
 
 var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsgHeader{})-winOffRegs]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsgHeader{}.FPDirty)-winOffFPDirty]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsgHeader{}.Tail)%8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsgHeader{}.Target)%8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsgHeader{}.TLS)%8]
 
 func (h *winSysmsgHeader) state() *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Pointer(&h.State))
@@ -182,6 +191,18 @@ func (h *winSysmsgHeader) stubWaiter() *atomic.Uint32 {
 
 func (h *winSysmsgHeader) fpDirty() *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Pointer(&h.FPDirty))
+}
+
+func (h *winSysmsgHeader) tail() *atomic.Uint64 {
+	return (*atomic.Uint64)(unsafe.Pointer(&h.Tail))
+}
+
+func (h *winSysmsgHeader) target() *atomic.Uint64 {
+	return (*atomic.Uint64)(unsafe.Pointer(&h.Target))
+}
+
+func (h *winSysmsgHeader) tls() *atomic.Uint64 {
+	return (*atomic.Uint64)(unsafe.Pointer(&h.TLS))
 }
 
 func (m *winSysmsg) sleepHint() *atomic.Uint32 {

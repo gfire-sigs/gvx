@@ -34,8 +34,9 @@ type PlatformType string
 
 const (
 	// PlatformAuto selects the hardware hypervisor of the host OS (whpx on
-	// Windows, hvf on macOS) and falls back to systrap when the hypervisor
-	// cannot start. New returns an error when no backend starts.
+	// Windows, hvf on macOS). On Linux it selects the kernel-trapped systrap
+	// backend. On Windows it fails closed when whpx cannot start unless
+	// Config.AllowUnconfinedSystrap is true.
 	PlatformAuto PlatformType = "auto"
 	// PlatformWHPX selects the Windows Hypervisor Platform backend.
 	PlatformWHPX PlatformType = "whpx"
@@ -142,6 +143,11 @@ var ErrInvalidConfig = errors.New("gvx: invalid configuration")
 type Config struct {
 	// Platform selects the execution backend ("auto", "whpx", "hvf", or "systrap").
 	Platform PlatformType
+
+	// AllowUnconfinedSystrap permits PlatformAuto on Windows to fall back to
+	// PlatformSystrap when whpx is unavailable. Windows offers no kernel
+	// syscall trap for stub processes, so untrusted workloads require whpx.
+	AllowUnconfinedSystrap bool
 
 	// NetworkMode selects the network backend ("nat", "wg", or "none").
 	NetworkMode NetworkMode

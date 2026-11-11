@@ -597,30 +597,37 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	var sites map[uint16]siteInfo
 	var slots []winSlotRef
 	var spans []patchSpan
+	var prevTail []uint16
 	// The plan keeps every JMP away from the addresses where threads continue,
 	// and from the addresses where the tail of a slot of an earlier copy
 	// continues. The install below checks that no thread started to continue
 	// inside the plan since.
 	continuations := as.continuationsIn(base)
-	// A page that an earlier scan found clean needs no scan again. The cache
-	// holds the digest of the scanned bytes, and a hit needs the same digest.
-	// The address alone is no key: the memory file reuses a frame for other
-	// content, and the guest can write the frame through another mapping.
+	// A page that an earlier scan found clean needs no scan again when neither
+	// its own edges nor its neighbors' edges hold patchable opcode bytes. The
+	// cache holds the digest of the scanned bytes, and a hit needs the same
+	// digest. The address alone is no key: the memory file reuses a frame for
+	// other content, and the guest can write the frame through another mapping.
 	var digest [sha256.Size]byte
 	cleanHit := false
+	neighborsClean := false
 	if readOnly {
-		digest = sha256.Sum256(copyBuf)
-		if v, ok := as.p.cleanCode.Load(src); ok {
-			cleanHit = v.([sha256.Size]byte) == digest
+		neighborsClean = !edgeHasPatchByte(as.neighborBytes(base, true, cleanEdgeLen)) &&
+			!edgeHasPatchByte(as.neighborBytes(base, false, cleanEdgeLen))
+		if neighborsClean {
+			digest = sha256.Sum256(copyBuf)
+			if v, ok := as.p.cleanCode.Load(src); ok {
+				cleanHit = v.([sha256.Size]byte) == digest
+			}
 		}
 	}
 	if !cleanHit {
 		var err error
-		sites, slots, spans, err = as.patchPage(ctx, mm, base, copyBuf, writable, continuations)
+		sites, slots, spans, prevTail, err = as.patchPage(ctx, mm, base, copyBuf, writable, continuations)
 		if err != nil {
 			return err
 		}
-		if readOnly && len(sites) == 0 && len(slots) == 0 && cleanBoundarySafe(copyBuf) && bytes.Equal(copyBuf, orig) {
+		if readOnly && neighborsClean && len(sites) == 0 && len(slots) == 0 && len(prevTail) == 0 && cleanBoundarySafe(copyBuf) && bytes.Equal(copyBuf, orig) {
 			as.p.cleanCode.Store(src, digest)
 		}
 	}
@@ -677,6 +684,27 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 	blk.slots = slots
 	blk.entry, entry = entry, nil
 	as.patchedBlocks.Add(1)
+	if len(prevTail) > 0 && base >= blockSize {
+		if prev := as.blocks[base-blockSize]; prev != nil {
+			if prev.src != 0 {
+				as.p.cleanCode.Delete(prev.src)
+			}
+			if prev.state == blockExec && prev.stepSnap == nil {
+				missing := false
+				for _, off := range prevTail {
+					if _, ok := prev.sites[off]; !ok {
+						missing = true
+						break
+					}
+				}
+				if missing {
+					if err := as.returnToDataLocked(prev); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -785,22 +813,23 @@ func (blk *execBlock) frame() []byte {
 	return nil
 }
 
+const cleanEdgeLen = 15
+
+func edgeHasPatchByte(b []byte) bool {
+	for _, v := range b {
+		switch v {
+		case 0x05, 0x0F, 0xAE, 0x65, 0xCD, 0x2E, 0x34:
+			return true
+		}
+	}
+	return false
+}
+
 // cleanBoundarySafe reports whether the first and last 15 bytes of page have
 // no opcode bytes that could join a neighbor page to form a patched site.
 func cleanBoundarySafe(page []byte) bool {
-	const edge = 15
-	if len(page) < 2*edge {
+	if len(page) < 2*cleanEdgeLen {
 		return false
 	}
-	for _, b := range page[:edge] {
-		if b == 0x05 || b == 0x0F || b == 0xAE || b == 0x65 {
-			return false
-		}
-	}
-	for _, b := range page[len(page)-edge:] {
-		if b == 0x05 || b == 0x0F || b == 0xAE || b == 0x65 {
-			return false
-		}
-	}
-	return true
+	return !edgeHasPatchByte(page[:cleanEdgeLen]) && !edgeHasPatchByte(page[len(page)-cleanEdgeLen:])
 }

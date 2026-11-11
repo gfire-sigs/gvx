@@ -226,10 +226,13 @@ type codeScope struct {
 	// all is true when the memory manager cannot describe mappings, so the
 	// patcher treats the whole block as code.
 	all bool
-	// none is true for a block that holds no provable code: memory that the
-	// Sentry provides, anonymous memory, and a file that is not a usable ELF
-	// image.
+	// none is true for a block that holds no provable code section: memory that
+	// the Sentry provides, anonymous memory, a file that is not a usable ELF/PE
+	// image, or a file block outside SHF_EXECINSTR sections.
 	none bool
+	// unbacked is true only when the block is not backed by a loadable segment
+	// of a parsed ELF or PE image (such as anonymous JIT memory).
+	unbacked bool
 	// spans lists the code ranges when neither flag is set.
 	spans []span
 }
@@ -269,7 +272,7 @@ func (p *Platform) scopeOf(ctx context.Context, m interface{}, base uint64) code
 	}
 	info := im.ExecImageAt(ctx, hostarch.Addr(base))
 	if info.Kind != platform.MappingFile {
-		return codeScope{none: true}
+		return codeScope{none: true, unbacked: true}
 	}
 	key := imageKey{info.Device, info.Inode}
 	ci, cached := p.images.lookup(key)
@@ -283,11 +286,11 @@ func (p *Platform) scopeOf(ctx context.Context, m interface{}, base uint64) code
 	}
 	info.Release()
 	if ci == nil {
-		return codeScope{none: true}
+		return codeScope{none: true, unbacked: true}
 	}
 	bias, ok := ci.bias(base, info.Offset)
 	if !ok {
-		return codeScope{none: true}
+		return codeScope{none: true, unbacked: true}
 	}
 	spans := ci.codeInRange(base, blockSize, bias)
 	if len(spans) == 0 {

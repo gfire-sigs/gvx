@@ -8,7 +8,7 @@ A vulnerability is a defect that lets a guest, an image, or a volume file cross 
 
 | Boundary | Expected Behavior |
 | :--- | :--- |
-| Guest to host | Guest code cannot run host system calls, read or write host memory, or start a host process. |
+| Guest to host | On `whpx`, `hvf`, and Linux `systrap`, guest code cannot run host system calls, read or write host memory, or start a host process. Untrusted workloads on Windows require `whpx`. |
 | Host lockdown | After `hostlockdown.Apply()` returns, the host process cannot start a process, open an unbound host path, or create a blocked socket. |
 | Workspace and bind mounts | `hostfs` opens no host file outside the mounted directory or file. |
 | Untrusted input | A malformed image layer, EROFS image, `ext4lite` volume file, or registry response causes an error, not memory corruption or a host write outside the cache. |
@@ -18,6 +18,8 @@ A vulnerability is a defect that lets a guest, an image, or a volume file cross 
 
 These limits are documented behavior, not vulnerabilities:
 
+- On Windows, `PlatformAuto` refuses fallback to `systrap` when `whpx` is unavailable unless `Config.AllowUnconfinedSystrap` or `-allow-unconfined-systrap` enables it.
+- On Windows, `systrap` uses user-mode syscall patching with Low-integrity token and job containment; it provides no hardware or kernel syscall trap.
 - On Android, a host mount leaves `Status.UnboundFileOpenBlocked` false because the `untrusted_app` seccomp policy of Zygote blocks Landlock calls.
 - `-lockdown=false` disables the host lockdown.
 - A guest can use the host network that `-net=nat` and `-p` expose.

@@ -694,3 +694,329 @@ func TestScanAMD64KeepsSitesWhenEverySweepSkips(t *testing.T) {
 		t.Errorf("scanAMD64 = %+v, want %+v", got, want)
 	}
 }
+
+func TestHiddenExitsNeutralizeMajorityVoteBypass(t *testing.T) {
+	t.Run("nop_sled_movabs_imm64_0f05", func(t *testing.T) {
+		// 64 NOPs synchronize all 16 sweeps before `movabs rax, 0x909090909090050f`.
+		orig := catBytes(
+			nops(64),
+			[]byte{0x48, 0xb8, 0x0f, 0x05, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90},
+			[]byte{0xc3},
+		)
+		if primary := scanAMD64GS(nil, orig, nil, true); len(primary) != 0 {
+			t.Fatalf("primary scan unexpectedly matched imm64: %+v", primary)
+		}
+		patched := bytes.Clone(orig)
+		hidden := scanAMD64HiddenExits(nil, orig, nil, patched)
+		added, prevTail := applyAMD64HiddenExits(patched, orig, hidden)
+		if len(prevTail) != 0 {
+			t.Fatalf("unexpected prevTail = %v", prevTail)
+		}
+		wantAdded := []amd64Site{
+			{Offset: 64, Len: 10, Kind: amd64SiteGuardedInsn},
+			{Offset: 66, Len: 2, Kind: amd64SiteSyscall},
+		}
+		if !reflect.DeepEqual(added, wantAdded) {
+			t.Fatalf("added = %+v, want %+v", added, wantAdded)
+		}
+		if hasRemainingKernelExit(nil, patched, nil) {
+			t.Fatalf("patched page still contains raw kernel exit: % x", patched[64:])
+		}
+		// Single-byte INT3 at 66 leaves byte 67 (0x05) intact.
+		if patched[64] != 0xcc || patched[66] != 0xcc || patched[67] != 0x05 {
+			t.Fatalf("unexpected trap bytes at [64..68]: % x", patched[64:68])
+		}
+		// Normal execution from offset 64 emulates from orig and loads the uncorrupted imm64.
+		var regs [16]uint64
+		var eflags uint32
+		var nextPC uint64
+		noMem := func(uint64, []byte) bool { return false }
+		out := emulateGuardedX86Insn(orig[64:74], 0x1040, 0, 0, &regs, &eflags, &nextPC, noMem, noMem)
+		if !out.ok || out.fault || regs[0] != 0x909090909090050f || nextPC != 0x104a {
+			t.Fatalf("emulateGuardedX86Insn = %+v, RAX=%#x, nextPC=%#x", out, regs[0], nextPC)
+		}
+	})
+
+	t.Run("straddling_mov_al_0f_and_add_eax", func(t *testing.T) {
+		// `mov al, 0x0f` (b0 0f) followed by `add eax, 0x44332211` (05 11 22 33 44)
+		// forms 0F 05 across bytes [65..67). Single-byte INT3 at 65 must keep
+		// byte 66 (0x05, the opcode of ADD EAX) untouched so ADD runs natively.
+		orig := catBytes(
+			nops(64),
+			[]byte{0xb0, 0x0f, 0x05, 0x11, 0x22, 0x33, 0x44, 0xc3},
+		)
+		patched := bytes.Clone(orig)
+		hidden := scanAMD64HiddenExits(nil, orig, nil, patched)
+		added, _ := applyAMD64HiddenExits(patched, orig, hidden)
+		wantAdded := []amd64Site{
+			{Offset: 64, Len: 2, Kind: amd64SiteGuardedInsn},
+			{Offset: 65, Len: 2, Kind: amd64SiteSyscall},
+		}
+		if !reflect.DeepEqual(added, wantAdded) {
+			t.Fatalf("added = %+v, want %+v", added, wantAdded)
+		}
+		if patched[66] != 0x05 {
+			t.Fatalf("byte 66 (ADD EAX opcode) was modified: %#x", patched[66])
+		}
+		if hasRemainingKernelExit(nil, patched, nil) {
+			t.Fatalf("patched page still contains raw kernel exit")
+		}
+	})
+
+	t.Run("double_0f05_and_int2e_and_sysenter_in_immediates", func(t *testing.T) {
+		orig := catBytes(
+			nops(64),
+			[]byte{0x48, 0xb8, 0x0f, 0x05, 0x11, 0x22, 0x0f, 0x05, 0x33, 0x44}, // movabs rax, ...
+			[]byte{0xb9, 0xcd, 0x2e, 0x0f, 0x34},                               // mov ecx, 0x340f2ecd
+			[]byte{0xc3},
+		)
+		patched := bytes.Clone(orig)
+		hidden := scanAMD64HiddenExits(nil, orig, nil, patched)
+		added, _ := applyAMD64HiddenExits(patched, orig, hidden)
+		wantAdded := []amd64Site{
+			{Offset: 64, Len: 10, Kind: amd64SiteGuardedInsn},
+			{Offset: 66, Len: 2, Kind: amd64SiteSyscall},
+			{Offset: 70, Len: 2, Kind: amd64SiteSyscall},
+			{Offset: 74, Len: 5, Kind: amd64SiteGuardedInsn},
+			{Offset: 75, Len: 2, Kind: amd64SiteInt2E},
+			{Offset: 77, Len: 2, Kind: amd64SiteSysenter},
+		}
+		if !reflect.DeepEqual(added, wantAdded) {
+			t.Fatalf("added = %+v, want %+v", added, wantAdded)
+		}
+		if hasRemainingKernelExit(nil, patched, nil) {
+			t.Fatalf("patched page still contains raw kernel exit")
+		}
+	})
+
+	t.Run("cross_page_outer_movabs_into_next_page_0f05", func(t *testing.T) {
+		pageA := catBytes(nops(amd64PageSize-2), []byte{0x48, 0xb8})
+		pageB := catBytes([]byte{0x0f, 0x05, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xc3}, nops(amd64PageSize-9))
+
+		patchedA := bytes.Clone(pageA)
+		hiddenA := scanAMD64HiddenExits(nops(amd64ScanLead), pageA, pageB[:amd64MaxInsnLen], patchedA)
+		addedA, prevA := applyAMD64HiddenExits(patchedA, pageA, hiddenA)
+		wantA := []amd64Site{{Offset: amd64PageSize - 2, Len: 10, Kind: amd64SiteGuardedInsn}}
+		if !reflect.DeepEqual(addedA, wantA) || len(prevA) != 0 {
+			t.Fatalf("pageA added=%+v prev=%v, want %+v nil", addedA, prevA, wantA)
+		}
+
+		patchedB := bytes.Clone(pageB)
+		hiddenB := scanAMD64HiddenExits(pageA[amd64PageSize-amd64ScanLead:], pageB, nil, patchedB)
+		addedB, prevB := applyAMD64HiddenExits(patchedB, pageB, hiddenB)
+		wantB := []amd64Site{{Offset: 0, Len: 2, Kind: amd64SiteSyscall}}
+		wantPrevB := []uint16{uint16(amd64PageSize - 2)}
+		if !reflect.DeepEqual(addedB, wantB) || !reflect.DeepEqual(prevB, wantPrevB) {
+			t.Fatalf("pageB added=%+v prev=%v, want %+v %v", addedB, prevB, wantB, wantPrevB)
+		}
+		if hasRemainingKernelExit(patchedA[amd64PageSize-1:], patchedB, nil) {
+			t.Fatalf("cross-page seam still contains raw kernel exit")
+		}
+	})
+}
+
+func TestEmulateGuardedX86InsnCoversLegitimateCode(t *testing.T) {
+	var mem [256]byte
+	const memBase = 0x200000
+	readMem := func(addr uint64, buf []byte) bool {
+		if addr < memBase || addr+uint64(len(buf)) > memBase+uint64(len(mem)) {
+			return false
+		}
+		copy(buf, mem[addr-memBase:])
+		return true
+	}
+	writeMem := func(addr uint64, buf []byte) bool {
+		if addr < memBase || addr+uint64(len(buf)) > memBase+uint64(len(mem)) {
+			return false
+		}
+		copy(mem[addr-memBase:], buf)
+		return true
+	}
+
+	var regs [16]uint64
+	var eflags uint32
+	var nextPC uint64
+	regs[4] = memBase + 128 // RSP
+
+	// 1. lea rdi, [rip + 0x0000050f] (48 8d 3d 0f 05 00 00) at PC=0x4000
+	lea := []byte{0x48, 0x8d, 0x3d, 0x0f, 0x05, 0x00, 0x00}
+	if out := emulateGuardedX86Insn(lea, 0x4000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || regs[7] != 0x4007+0x050f || nextPC != 0x4007 {
+		t.Fatalf("LEA = %+v, RDI=%#x, nextPC=%#x", out, regs[7], nextPC)
+	}
+
+	// 2. add rax, 0x0000050f (48 05 0f 05 00 00)
+	regs[0] = 0x1000
+	addImm := []byte{0x48, 0x05, 0x0f, 0x05, 0x00, 0x00}
+	if out := emulateGuardedX86Insn(addImm, 0x4010, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || regs[0] != 0x150f || nextPC != 0x4016 {
+		t.Fatalf("ADD = %+v, RAX=%#x, nextPC=%#x", out, regs[0], nextPC)
+	}
+
+	// 3. call rel32 (e8 0f 05 00 00) at PC=0x5000 pushes 0x5005 and branches to 0x5514.
+	callRel := []byte{0xe8, 0x0f, 0x05, 0x00, 0x00}
+	if out := emulateGuardedX86Insn(callRel, 0x5000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || nextPC != 0x5514 || regs[4] != memBase+120 {
+		t.Fatalf("CALL = %+v, nextPC=%#x, RSP=%#x", out, nextPC, regs[4])
+	}
+
+	// 4. ret 0x050f (c2 0f 05) pops 0x5005 and adds 0x050f to RSP.
+	retImm := []byte{0xc2, 0x0f, 0x05}
+	if out := emulateGuardedX86Insn(retImm, 0x5514, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || nextPC != 0x5005 || regs[4] != memBase+128+0x050f {
+		t.Fatalf("RET imm16 = %+v, nextPC=%#x, RSP=%#x", out, nextPC, regs[4])
+	}
+
+	// 5. je rel32 (0f 84 0f 05 00 00) taken when ZF=1 and not taken when ZF=0.
+	jeRel := []byte{0x0f, 0x84, 0x0f, 0x05, 0x00, 0x00}
+	eflags = eflagZF
+	if out := emulateGuardedX86Insn(jeRel, 0x6000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || nextPC != 0x6515 {
+		t.Fatalf("JE (taken) = %+v, nextPC=%#x", out, nextPC)
+	}
+	eflags = 0
+	if out := emulateGuardedX86Insn(jeRel, 0x6000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || nextPC != 0x6006 {
+		t.Fatalf("JE (not taken) = %+v, nextPC=%#x", out, nextPC)
+	}
+
+	// 6. imul ecx, edx, 0x0000050f (69 ca 0f 05 00 00)
+	regs[2] = 3
+	imul := []byte{0x69, 0xca, 0x0f, 0x05, 0x00, 0x00}
+	if out := emulateGuardedX86Insn(imul, 0x7000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || regs[1] != 3*0x050f {
+		t.Fatalf("IMUL = %+v, RCX=%#x", out, regs[1])
+	}
+
+	// 7. 16-bit operand-size override on stack/branch ops (e.g. 66 68 0f 05 pushw 0x050f)
+	// must be rejected rather than mis-emulated with 64-bit stack width.
+	pushw := []byte{0x66, 0x68, 0x0f, 0x05}
+	if out := emulateGuardedX86Insn(pushw, 0x8000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); out.ok {
+		t.Fatalf("emulateGuardedX86Insn accepted 16-bit PUSHW % x: %+v", pushw, out)
+	}
+}
+
+func TestPlanGuardedScratchInsnSanitizesVectorAndAtomicOps(t *testing.T) {
+	var regs [16]uint64
+	regs[0] = 0x300000 // RAX
+	regs[3] = 0x400000 // RBX
+	regs[6] = 0x500000 // RSI
+	regs[7] = 0x600000 // RDI
+
+	cases := []struct {
+		name        string
+		code        []byte
+		pc          uint64
+		wantAddr    uint64
+		wantScratch bool
+	}{
+		{
+			name:        "movups_xmm0_rip_disp32_0f05",
+			code:        []byte{0x0f, 0x10, 0x05, 0x0f, 0x05, 0x00, 0x00},
+			pc:          0x10000,
+			wantAddr:    0x10007 + 0x050f,
+			wantScratch: true,
+		},
+		{
+			name:        "vmovdqu_ymm1_rax_disp32_0f05",
+			code:        []byte{0xc5, 0xfe, 0x6f, 0x88, 0x0f, 0x05, 0x00, 0x00},
+			pc:          0x20000,
+			wantAddr:    0x300000 + 0x050f,
+			wantScratch: true,
+		},
+		{
+			// x86asm omits Base=RIP on VEX RIP-relative operands (mod=0, rm=5).
+			// planGuardedScratchInsn must restore RIP-relative addressing so
+			// effAddr equals pc + 8 + 0x50f instead of 0x50f.
+			name:        "vmovss_xmm0_rip_disp32_0f05",
+			code:        []byte{0xc5, 0xfa, 0x10, 0x05, 0x0f, 0x05, 0x00, 0x00},
+			pc:          0x25000,
+			wantAddr:    0x25000 + 8 + 0x050f,
+			wantScratch: true,
+		},
+		{
+			name:        "lock_xadd_rbx_disp32_cd2e_ecx",
+			code:        []byte{0xf0, 0x0f, 0xc1, 0x8b, 0xcd, 0x2e, 0x00, 0x00},
+			pc:          0x30000,
+			wantAddr:    0x400000 + 0x2ecd,
+			wantScratch: true,
+		},
+		{
+			// Register-only non-GPR instruction at a cross-instruction seam:
+			// popcnt eax, ecx (f3 0f b8 c1) has no memory operand, so useScratch
+			// must be false and effAddr must not trigger a spurious 0x0 range check.
+			name:        "popcnt_eax_ecx_register_only",
+			code:        []byte{0xf3, 0x0f, 0xb8, 0xc1},
+			pc:          0x35000,
+			wantAddr:    0,
+			wantScratch: false,
+		},
+		{
+			// Non-RIP memory instruction without internal raw exit bytes
+			// (cmpps xmm0, [rbx], 0x0f -> 0f c2 03 0f) MUST still evaluate effAddr
+			// and set useScratch=true so inGuestRange validates [rbx].
+			name:        "cmpps_xmm0_rbx_imm0f",
+			code:        []byte{0x0f, 0xc2, 0x03, 0x0f},
+			pc:          0x38000,
+			wantAddr:    0x400000,
+			wantScratch: true,
+		},
+	}
+	noMem := func(uint64, []byte) bool { return false }
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var eflags uint32
+			var nextPC uint64
+			if em := emulateGuardedX86Insn(tc.code, tc.pc, 0, 0, &regs, &eflags, &nextPC, noMem, noMem); em.ok {
+				t.Fatalf("expected non-GPR/atomic op to delegate to scratch planner")
+			}
+			pl, ok := planGuardedScratchInsn(tc.code, tc.pc, 0, 0, &regs)
+			if !ok {
+				t.Fatalf("planGuardedScratchInsn failed on % x", tc.code)
+			}
+			if pl.useScratch != tc.wantScratch {
+				t.Fatalf("useScratch = %v, want %v", pl.useScratch, tc.wantScratch)
+			}
+			if pl.effAddr != tc.wantAddr {
+				t.Fatalf("effAddr = %#x, want %#x", pl.effAddr, tc.wantAddr)
+			}
+			if hasRawKernelExit(pl.insn) {
+				t.Fatalf("rewritten instruction still contains raw kernel exit: % x", pl.insn)
+			}
+		})
+	}
+
+	// LOCK CMPXCHG8B [rdi+0x50f] (f0 0f c7 8f 0f 05 00 00) implicitly reads
+	// RAX(0), RCX(1), RDX(2), and RBX(3), so scratchReg must NOT pick 0..3.
+	cmpxchg8b := []byte{0xf0, 0x0f, 0xc7, 0x8f, 0x0f, 0x05, 0x00, 0x00}
+	pl1, ok := planGuardedScratchInsn(cmpxchg8b, 0x40000, 0, 0, &regs)
+	if !ok || !pl1.useScratch {
+		t.Fatalf("planGuardedScratchInsn(CMPXCHG8B [rdi+0x50f]) = %+v, %v", pl1, ok)
+	}
+	if pl1.scratchReg <= 5 || pl1.scratchReg == 7 {
+		t.Fatalf("CMPXCHG8B picked reserved/used GPR %d, want RSI(6) or R8+", pl1.scratchReg)
+	}
+	if pl1.effAddr != regs[7]+0x050f || hasRawKernelExit(pl1.insn) {
+		t.Fatalf("CMPXCHG8B plan = %+v", pl1)
+	}
+
+	// LOCK CMPXCHG8B [rsi+rdi+0x50f] (f0 0f c7 8c 3e 0f 05 00 00) uses both RSI
+	// and RDI, so scratchReg must promote cleanly to R8 (8) with REX.B set.
+	cmpxchg8bSib := []byte{0xf0, 0x0f, 0xc7, 0x8c, 0x3e, 0x0f, 0x05, 0x00, 0x00}
+	pl2, ok := planGuardedScratchInsn(cmpxchg8bSib, 0x41000, 0, 0, &regs)
+	if !ok || !pl2.useScratch || pl2.scratchReg != 8 || pl2.effAddr != regs[6]+regs[7]+0x050f || hasRawKernelExit(pl2.insn) {
+		t.Fatalf("CMPXCHG8B [rsi+rdi+0x50f] plan = %+v, ok=%v", pl2, ok)
+	}
+
+	// FS-prefixed VEX RIP-relative load (64 c5 fa 10 05 0f 05 00 00) must add
+	// both fsBase and fallthrough RIP.
+	fsVexRip := []byte{0x64, 0xc5, 0xfa, 0x10, 0x05, 0x0f, 0x05, 0x00, 0x00}
+	plFS, ok := planGuardedScratchInsn(fsVexRip, 0x42000, 0x7f000000, 0, &regs)
+	if !ok || !plFS.useScratch || plFS.effAddr != 0x7f000000+0x42009+0x050f || hasRawKernelExit(plFS.insn) {
+		t.Fatalf("FS VEX RIP plan = %+v, ok=%v", plFS, ok)
+	}
+
+	// Implicit-memory MASKMOVDQU (66 0f f7 cd: maskmovdqu xmm1, xmm5) and
+	// 32-bit address-size override (67 0f 10 80 0f 05 00 00) must be rejected.
+	for _, rejectCode := range [][]byte{
+		{0x66, 0x0f, 0xf7, 0xcd},
+		{0x67, 0x0f, 0x10, 0x80, 0x0f, 0x05, 0x00, 0x00},
+	} {
+		if badPlan, badOK := planGuardedScratchInsn(rejectCode, 0x43000, 0, 0, &regs); badOK {
+			t.Fatalf("planGuardedScratchInsn accepted % x: %+v", rejectCode, badPlan)
+		}
+	}
+}

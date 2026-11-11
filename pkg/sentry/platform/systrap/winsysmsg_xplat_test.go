@@ -325,3 +325,41 @@ func TestHandoffPropagatesWaitFailure(t *testing.T) {
 		t.Fatalf("release error = %v, want %v", err, boom)
 	}
 }
+
+func TestWinSysmsgHeaderAtomicFieldsAndSnapshot(t *testing.T) {
+	var sm winSysmsg
+	sm.tail().Store(0x123456789abcdef0)
+	sm.target().Store(0xfeedface00001000)
+	sm.tls().Store(0x7fff00001234)
+	if got := sm.tail().Load(); got != 0x123456789abcdef0 {
+		t.Fatalf("tail().Load() = %#x", got)
+	}
+	if got := sm.target().Load(); got != 0xfeedface00001000 {
+		t.Fatalf("target().Load() = %#x", got)
+	}
+	if got := sm.tls().Load(); got != 0x7fff00001234 {
+		t.Fatalf("tls().Load() = %#x", got)
+	}
+
+	// Concurrent mutation of shared winRegs while snapshot() runs must never
+	// race or tear 64-bit register words under -race.
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p := (*uint64)(unsafe.Pointer(&sm.Regs))
+		for i := uint64(1); !stop.Load(); i++ {
+			atomic.StoreUint64(p, uint64(byte(i))*0x0101010101010101)
+		}
+	}()
+	for range 1000 {
+		snap := sm.Regs.snapshot()
+		first := *(*uint64)(unsafe.Pointer(&snap))
+		if b := byte(first); first != uint64(b)*0x0101010101010101 {
+			t.Fatalf("torn 64-bit register word in snapshot: %#x", first)
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+}

@@ -207,3 +207,26 @@ func TestRunFlagsHostCACertsIsOptIn(t *testing.T) {
 		})
 	}
 }
+
+func TestRunFlagsAllowUnconfinedSystrapIsOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"default", []string{"-image=x"}, false},
+		{"single dash", []string{"-allow-unconfined-systrap", "-image=x"}, true},
+		{"double dash", []string{"--allow-unconfined-systrap", "-image=x"}, true},
+		{"explicit false", []string{"--allow-unconfined-systrap=false", "-image=x"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, _, done, stderr := parse(t, tc.args...)
+			if done {
+				t.Fatalf("parseRunArgs ended the command: %s", stderr)
+			}
+			if rc.cfg.AllowUnconfinedSystrap != tc.want {
+				t.Errorf("AllowUnconfinedSystrap = %v, want %v", rc.cfg.AllowUnconfinedSystrap, tc.want)
+			}
+		})
+	}
+}

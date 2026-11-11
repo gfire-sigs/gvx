@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -140,17 +141,46 @@ func (r *winRegs) loadFrom(ac *arch.Context64) {
 	r.loadTLSFrom(ac)
 }
 
+// snapshot copies every word of r once with atomic loads into a stack-local
+// winRegs so a concurrent stub thread cannot race with validation or register
+// copying.
+func (r *winRegs) snapshot() winRegs {
+	return winRegs{
+		Rax:       atomic.LoadUint64(&r.Rax),
+		Rcx:       atomic.LoadUint64(&r.Rcx),
+		Rdx:       atomic.LoadUint64(&r.Rdx),
+		Rbx:       atomic.LoadUint64(&r.Rbx),
+		Rsp:       atomic.LoadUint64(&r.Rsp),
+		Rbp:       atomic.LoadUint64(&r.Rbp),
+		Rsi:       atomic.LoadUint64(&r.Rsi),
+		Rdi:       atomic.LoadUint64(&r.Rdi),
+		R8:        atomic.LoadUint64(&r.R8),
+		R9:        atomic.LoadUint64(&r.R9),
+		R10:       atomic.LoadUint64(&r.R10),
+		R11:       atomic.LoadUint64(&r.R11),
+		R12:       atomic.LoadUint64(&r.R12),
+		R13:       atomic.LoadUint64(&r.R13),
+		R14:       atomic.LoadUint64(&r.R14),
+		R15:       atomic.LoadUint64(&r.R15),
+		Rflags:    atomic.LoadUint64(&r.Rflags),
+		FsBase:    atomic.LoadUint64(&r.FsBase),
+		GsBase:    atomic.LoadUint64(&r.GsBase),
+		GsMemBase: atomic.LoadUint64(&r.GsMemBase),
+	}
+}
+
 // storeTo copies the block into ac the way a SYSCALL leaves the registers: RCX
 // holds the return address and R11 holds the flags.
 func (r *winRegs) storeTo(ac *arch.Context64, ret uint64) {
+	snap := r.snapshot()
 	g := &ac.StateData().Regs
-	g.Rax, g.Rdx, g.Rbx, g.Rsp, g.Rbp, g.Rsi, g.Rdi = r.Rax, r.Rdx, r.Rbx, r.Rsp, r.Rbp, r.Rsi, r.Rdi
-	g.R8, g.R9, g.R10, g.R12, g.R13, g.R14, g.R15 = r.R8, r.R9, r.R10, r.R12, r.R13, r.R14, r.R15
-	g.Eflags = r.Rflags
+	g.Rax, g.Rdx, g.Rbx, g.Rsp, g.Rbp, g.Rsi, g.Rdi = snap.Rax, snap.Rdx, snap.Rbx, snap.Rsp, snap.Rbp, snap.Rsi, snap.Rdi
+	g.R8, g.R9, g.R10, g.R12, g.R13, g.R14, g.R15 = snap.R8, snap.R9, snap.R10, snap.R12, snap.R13, snap.R14, snap.R15
+	g.Eflags = snap.Rflags
 	g.Rip = ret
 	g.Rcx = ret
-	g.R11 = r.Rflags
-	g.Orig_rax = r.Rax
+	g.R11 = snap.Rflags
+	g.Orig_rax = snap.Rax
 }
 
 // resumeState returns the state that the Sentry publishes for ac after a trap.
@@ -205,13 +235,19 @@ func (m *winSysmsg) storeVector(ac *arch.Context64) { m.storeXsave(*ac.FloatingP
 // XSTATE_BV bit becomes clear. The x87 and SSE bits are always set, as
 // markLegacyState explains.
 func (m *winSysmsg) storeXsave(fp []byte) {
-	copy(fp[:min(len(fp), xsaveHeaderOffset)], m.Xsave[:xsaveHeaderOffset])
+	var snap [winXsaveSize]byte
+	words := unsafe.Slice((*uint64)(unsafe.Pointer(&m.Xsave[0])), winXsaveSize/8)
+	dstWords := unsafe.Slice((*uint64)(unsafe.Pointer(&snap[0])), winXsaveSize/8)
+	for i := range words {
+		dstWords[i] = atomic.LoadUint64(&words[i])
+	}
+	copy(fp[:min(len(fp), xsaveHeaderOffset)], snap[:xsaveHeaderOffset])
 	if len(fp) < xsaveHeaderOffset+8 {
 		return
 	}
 	markLegacyState(fp)
-	have := binary.LittleEndian.Uint64(m.Xsave[xsaveHeaderOffset:])
+	have := binary.LittleEndian.Uint64(snap[xsaveHeaderOffset:])
 	storeXStateComponents(fp, ^uint64(0), have, func(comp xstateComponent) []byte {
-		return m.Xsave[comp.offset : comp.offset+comp.size]
+		return snap[comp.offset : comp.offset+comp.size]
 	})
 }

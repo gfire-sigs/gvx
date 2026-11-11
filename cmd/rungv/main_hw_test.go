@@ -157,8 +157,9 @@ func TestPullAndRunRegistryImage(t *testing.T) {
 		t.Fatalf("rungv pull -arch=s390x = (code %d, stderr %q), want 1", code, stderr)
 	}
 
-	// macOS runs guests on the hypervisor only. Windows falls back to systrap.
-	if runtime.GOOS == "darwin" {
+	// macOS runs guests on the hypervisor only. Windows requires whpx for
+	// PlatformAuto unless GVX_ALLOW_NO_HYPERVISOR=1 enables systrap.
+	if runtime.GOOS == "darwin" || (runtime.GOOS == "windows" && os.Getenv(hvtest.AllowNoHypervisorEnv) != "1") {
 		hvtest.Require(t)
 	}
 	code, stdout, stderr = runCLI(t, "run", "-lockdown=false", "-net=none",
@@ -190,5 +191,8 @@ func TestRunPlatformSystrap(t *testing.T) {
 	}
 	if strings.Contains(stderr, "platform=") {
 		t.Fatalf("explicit backend printed a selection line: %q", stderr)
+	}
+	if runtime.GOOS == "windows" && !strings.Contains(stderr, "Windows systrap lacks hardware or kernel syscall isolation") {
+		t.Fatalf("Windows systrap stderr = %q, want syscall isolation warning", stderr)
 	}
 }

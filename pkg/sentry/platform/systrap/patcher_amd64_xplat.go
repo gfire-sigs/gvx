@@ -54,6 +54,18 @@ const (
 	amd64SiteWRGSBASE
 	// amd64SiteGSMem is a memory instruction with a GS segment override prefix.
 	amd64SiteGSMem
+	// amd64SiteInt2E is INT 0x2E, bytes CD 2E, which enters the Windows NT
+	// kernel service gate on x64 hosts and raises SIGSEGV on Linux.
+	amd64SiteInt2E
+	// amd64SiteSysenter is SYSENTER, bytes 0F 34, which raises SIGILL on
+	// 64-bit Linux.
+	amd64SiteSysenter
+	// amd64SiteGuardedInsn marks the start of an outer instruction whose
+	// interior or trailing boundary holds a raw kernel-entry byte pair. Both
+	// the outer start and the interior exit offset carry INT3 so normal
+	// execution emulates the outer instruction while a mid-instruction branch
+	// traps in the Sentry.
+	amd64SiteGuardedInsn
 )
 
 const (
@@ -347,7 +359,7 @@ func patchAMD64(page []byte, sites []amd64Site) (spill int, err error) {
 			return 0, fmt.Errorf("site at %d with length %d lies outside a page of %d bytes", s.Offset, s.Len, len(page))
 		}
 		switch s.Kind {
-		case amd64SiteSyscall:
+		case amd64SiteSyscall, amd64SiteInt2E, amd64SiteSysenter:
 			if s.Len != 2 {
 				return 0, fmt.Errorf("syscall site at %d has length %d", s.Offset, s.Len)
 			}
@@ -355,6 +367,11 @@ func patchAMD64(page []byte, sites []amd64Site) (spill int, err error) {
 				return 0, fmt.Errorf("syscall site at %d starts too far before the page", s.Offset)
 			}
 			want := [2]byte{0x0F, 0x05}
+			if s.Kind == amd64SiteInt2E {
+				want = [2]byte{0xCD, 0x2E}
+			} else if s.Kind == amd64SiteSysenter {
+				want = [2]byte{0x0F, 0x34}
+			}
 			for j, w := range want {
 				if i := s.Offset + j; i >= 0 && i < len(page) && page[i] != w {
 					return 0, fmt.Errorf("syscall site at %d: byte %d is %#x, want %#x", s.Offset, j, page[i], w)
@@ -367,6 +384,10 @@ func patchAMD64(page []byte, sites []amd64Site) (spill int, err error) {
 		case amd64SiteGSMem:
 			if s.Len < 2 {
 				return 0, fmt.Errorf("gs memory site at %d has length %d", s.Offset, s.Len)
+			}
+		case amd64SiteGuardedInsn:
+			if s.Len < 2 {
+				return 0, fmt.Errorf("guarded instruction site at %d has length %d", s.Offset, s.Len)
 			}
 		default:
 			return 0, fmt.Errorf("site at %d has unknown kind %d", s.Offset, s.Kind)
@@ -383,8 +404,12 @@ func patchAMD64(page []byte, sites []amd64Site) (spill int, err error) {
 				continue
 			}
 			switch {
-			case s.Kind == amd64SiteSyscall:
+			case s.Kind == amd64SiteSyscall || s.Kind == amd64SiteInt2E || s.Kind == amd64SiteSysenter:
 				page[i] = amd64Trap[j]
+			case s.Kind == amd64SiteGuardedInsn:
+				if j == 0 {
+					page[i] = amd64INT3
+				}
 			case j == 0:
 				page[i] = amd64INT3
 			default:
@@ -393,4 +418,305 @@ func patchAMD64(page []byte, sites []amd64Site) (spill int, err error) {
 		}
 	}
 	return spill, nil
+}
+
+// isX86Prefix reports whether b is a legacy instruction prefix or a REX prefix.
+func isX86Prefix(b byte) bool {
+	if b >= 0x40 && b <= 0x4F {
+		return true
+	}
+	switch b {
+	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
+		return true
+	}
+	return false
+}
+
+// amd64KernelExitKind classifies a 2-byte sequence that can transition out of
+// 64-bit user mode on an x86-64 host: SYSCALL (0F 05), INT 0x2E (CD 2E), or
+// SYSENTER (0F 34).
+func amd64KernelExitKind(b0, b1 byte) (amd64SiteKind, bool) {
+	switch {
+	case b0 == 0x0F && b1 == 0x05:
+		return amd64SiteSyscall, true
+	case b0 == 0xCD && b1 == 0x2E:
+		return amd64SiteInt2E, true
+	case b0 == 0x0F && b1 == 0x34:
+		return amd64SiteSysenter, true
+	}
+	return 0, false
+}
+
+// isRawKernelExitPair reports whether (b0, b1) forms a raw kernel-entry opcode.
+func isRawKernelExitPair(b0, b1 byte) bool {
+	_, ok := amd64KernelExitKind(b0, b1)
+	return ok
+}
+
+// hasRawKernelExit reports whether b contains any raw kernel-entry byte pair.
+func hasRawKernelExit(b []byte) bool {
+	for i := 0; i+1 < len(b); i++ {
+		if isRawKernelExitPair(b[i], b[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRemainingKernelExit reports whether patchedPage, its single-byte seam with
+// before or after, or after itself still contains a raw kernel-entry byte pair.
+func hasRemainingKernelExit(before, patchedPage, after []byte) bool {
+	if len(patchedPage) == 0 {
+		return false
+	}
+	if len(before) > 0 && isRawKernelExitPair(before[len(before)-1], patchedPage[0]) {
+		return true
+	}
+	if hasRawKernelExit(patchedPage) {
+		return true
+	}
+	if len(after) > 0 && isRawKernelExitPair(patchedPage[len(patchedPage)-1], after[0]) {
+		return true
+	}
+	return hasRawKernelExit(after)
+}
+
+// amd64HiddenExit describes a raw kernel-entry byte pair (0F 05, CD 2E, or
+// 0F 34) that remains in patchedPage after primary majority-vote patching,
+// together with any synchronized outer instruction in origPage that covers its
+// first byte.
+type amd64HiddenExit struct {
+	// ExitOffset is the page-relative offset of the first byte of the 2-byte
+	// kernel-entry sequence (-1 <= ExitOffset < len(origPage)).
+	ExitOffset int
+	// ExitKind is amd64SiteSyscall, amd64SiteInt2E, or amd64SiteSysenter.
+	ExitKind amd64SiteKind
+	// HasOuter reports whether synchronized decode sweeps place ExitOffset
+	// inside an outer instruction [OuterOffset, OuterOffset+OuterLen) rather
+	// than as a standalone exit instruction at ExitOffset.
+	HasOuter    bool
+	OuterOffset int
+	OuterLen    int
+}
+
+// scanAMD64HiddenExits finds every raw kernel-entry byte pair overlapping
+// patchedPage that still holds its raw opcode bytes, and resolves any outer
+// instruction in (before, origPage, after) that covers it. When patchedPage is
+// nil, origPage is used for both roles.
+func scanAMD64HiddenExits(before, origPage, after, patchedPage []byte) []amd64HiddenExit {
+	if len(origPage) == 0 {
+		return nil
+	}
+	if patchedPage == nil {
+		patchedPage = origPage
+	}
+	if !hasRemainingKernelExit(before, patchedPage, after) {
+		return nil
+	}
+
+	pageStart := len(before)
+	pageEnd := pageStart + len(origPage)
+	origBuf := make([]byte, 0, pageEnd+len(after))
+	origBuf = append(origBuf, before...)
+	origBuf = append(origBuf, origPage...)
+	origBuf = append(origBuf, after...)
+
+	curByte := func(bufPos int) byte {
+		if bufPos >= pageStart && bufPos < pageEnd {
+			return patchedPage[bufPos-pageStart]
+		}
+		return origBuf[bufPos]
+	}
+
+	type rawHit struct {
+		pos  int
+		kind amd64SiteKind
+	}
+	var hits []rawHit
+	loPos := max(0, pageStart-1)
+	for pos := loPos; pos+1 < len(origBuf); pos++ {
+		if kind, ok := amd64KernelExitKind(curByte(pos), curByte(pos+1)); ok {
+			hits = append(hits, rawHit{pos: pos, kind: kind})
+		}
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+
+	type step struct {
+		pos int
+		len uint8
+	}
+	type sweepSteps struct {
+		skipped int
+		steps   []step
+	}
+
+	insnLens := make([]int8, pageEnd)
+	var runs []sweepSteps
+	fewest := -1
+	prevStart := -1
+	for k := 0; k < amd64SweepCount; k++ {
+		start := min(k, pageStart)
+		if start == prevStart {
+			continue
+		}
+		prevStart = start
+		var run sweepSteps
+		for pos := start; pos < pageEnd; {
+			l := insnLens[pos]
+			if l == 0 {
+				inst, err := decodeX86(origBuf[pos:])
+				if err != nil || inst.Op == 0 || inst.Len == 0 {
+					l = -1
+				} else {
+					l = int8(inst.Len)
+				}
+				insnLens[pos] = l
+			}
+			if l < 0 {
+				run.skipped++
+				pos++
+				continue
+			}
+			run.steps = append(run.steps, step{pos: pos, len: uint8(l)})
+			pos += int(l)
+		}
+		runs = append(runs, run)
+		if fewest < 0 || run.skipped < fewest {
+			fewest = run.skipped
+		}
+	}
+
+	isStandaloneExit := func(st step, hitPos int) bool {
+		if int(st.len) < 2 || st.pos+int(st.len) != hitPos+2 {
+			return false
+		}
+		for i := st.pos; i < hitPos; i++ {
+			if !isX86Prefix(origBuf[i]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	type outerKey struct {
+		off int
+		len int
+	}
+	out := make([]amd64HiddenExit, 0, len(hits))
+	for _, h := range hits {
+		sweeps := 0
+		standaloneVotes := 0
+		var outerOrder []outerKey
+		outerVotes := make(map[outerKey]int, 2)
+		for _, run := range runs {
+			if run.skipped != fewest {
+				continue
+			}
+			sweeps++
+			// Binary search for the unique decoded step with st.pos <= h.pos.
+			idx := sort.Search(len(run.steps), func(i int) bool {
+				return run.steps[i].pos > h.pos
+			}) - 1
+			if idx < 0 {
+				continue
+			}
+			st := run.steps[idx]
+			if h.pos >= st.pos+int(st.len) {
+				continue
+			}
+			if isStandaloneExit(st, h.pos) {
+				standaloneVotes++
+				continue
+			}
+			if st.pos < h.pos {
+				key := outerKey{off: st.pos - pageStart, len: int(st.len)}
+				if _, seen := outerVotes[key]; !seen {
+					outerOrder = append(outerOrder, key)
+				}
+				outerVotes[key]++
+			}
+		}
+		entry := amd64HiddenExit{
+			ExitOffset: h.pos - pageStart,
+			ExitKind:   h.kind,
+		}
+		if 2*standaloneVotes <= sweeps && len(outerOrder) > 0 {
+			best := outerOrder[0]
+			bestVotes := outerVotes[best]
+			for _, k := range outerOrder[1:] {
+				v := outerVotes[k]
+				if v > bestVotes || (v == bestVotes && k.off > best.off) {
+					best = k
+					bestVotes = v
+				}
+			}
+			entry.HasOuter = true
+			entry.OuterOffset = best.off
+			entry.OuterLen = best.len
+		}
+		touchesExit := entry.ExitOffset >= -1 && entry.ExitOffset < len(origPage)
+		touchesOuter := entry.HasOuter && entry.OuterOffset < len(origPage) && entry.OuterOffset+entry.OuterLen > 0
+		if touchesExit || touchesOuter {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// applyAMD64HiddenExits installs single-byte INT3 traps in page for every
+// hidden kernel-entry sequence in hidden (and at the start of any covering
+// outer instruction whose first byte still matches origPage). It returns the
+// added page-local sites sorted by Offset and any tail offsets in the preceding
+// block that must also hold a trap.
+func applyAMD64HiddenExits(page, origPage []byte, hidden []amd64HiddenExit) (added []amd64Site, prevTail []uint16) {
+	if len(hidden) == 0 {
+		return nil, nil
+	}
+	byOff := make(map[int]amd64Site, 2*len(hidden))
+	addPrev := func(negOff int) {
+		if len(page)+negOff < 0 {
+			return
+		}
+		want := uint16(len(page) + negOff)
+		for _, v := range prevTail {
+			if v == want {
+				return
+			}
+		}
+		prevTail = append(prevTail, want)
+	}
+	for _, h := range hidden {
+		if h.HasOuter {
+			if h.OuterOffset < 0 {
+				addPrev(h.OuterOffset)
+			} else if h.OuterOffset < len(page) {
+				if _, exists := byOff[h.OuterOffset]; !exists && page[h.OuterOffset] == origPage[h.OuterOffset] {
+					page[h.OuterOffset] = amd64INT3
+					byOff[h.OuterOffset] = amd64Site{
+						Offset: h.OuterOffset,
+						Len:    h.OuterLen,
+						Kind:   amd64SiteGuardedInsn,
+					}
+				}
+			}
+		}
+		if h.ExitOffset < 0 {
+			addPrev(h.ExitOffset)
+		} else if h.ExitOffset < len(page) {
+			page[h.ExitOffset] = amd64INT3
+			byOff[h.ExitOffset] = amd64Site{
+				Offset: h.ExitOffset,
+				Len:    2,
+				Kind:   h.ExitKind,
+			}
+		}
+	}
+	added = make([]amd64Site, 0, len(byOff))
+	for _, s := range byOff {
+		added = append(added, s)
+	}
+	sort.Slice(added, func(i, j int) bool { return added[i].Offset < added[j].Offset })
+	return added, prevTail
 }
