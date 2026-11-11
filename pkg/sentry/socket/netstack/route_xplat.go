@@ -16,6 +16,8 @@ package netstack
 
 import (
 	"errors"
+	"maps"
+	"slices"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
@@ -25,10 +27,15 @@ import (
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
-// Route request limits and attribute numbers of include/uapi/linux/rtnetlink.h.
+// useXplatRoutes enables policy-routing hooks while keeping upstream route
+// methods intact in stack.go.
+var useXplatRoutes = true
+
+// Route limits and attribute numbers from include/uapi/linux/rtnetlink.h.
 const (
 	// rtaxMTU is RTAX_MTU, the MTU entry of RTA_METRICS.
 	rtaxMTU = 2
@@ -56,8 +63,8 @@ type routeRequest struct {
 	v6       bool
 }
 
-// parseRouteRequest reads the route of a netlink message like
-// rtm_to_fib_config() of Linux. A delete request skips the type checks.
+// parseRouteRequest parses the route from a netlink message as
+// rtm_to_fib_config() does in Linux. A delete request skips type validation.
 func (s *Stack) parseRouteRequest(msg *nlmsg.Message) (routeRequest, *syserr.Error) {
 	var rtMsg linux.RouteMessage
 	attrs, ok := msg.GetData(&rtMsg)
@@ -220,12 +227,11 @@ func routeMTU(metrics []byte) (uint32, *syserr.Error) {
 	return mtu, nil
 }
 
-// validateNewRoute applies the type checks of fib_create_info() to a new
-// route and sets the type of a route that names none.
+// validateNewRoute validates route types as fib_create_info() does and sets the
+// default type when omitted.
 //
-// An IPv6 route of a type without a device belongs to the loopback link, as in
-// Linux, whatever device the request names. loopback is the index of that
-// link.
+// Linux assigns device-less IPv6 route types to the loopback link regardless of
+// the requested device. loopback is the index of that link.
 func (req *routeRequest) validateNewRoute(loopback tcpip.NICID) *syserr.Error {
 	rt := &req.route
 	switch t := req.msgType; t {
@@ -255,8 +261,8 @@ func (req *routeRequest) validateNewRoute(loopback tcpip.NICID) *syserr.Error {
 	return nil
 }
 
-// loopbackID returns the index of the loopback link with the lowest index, or 0
-// when the stack has none.
+// loopbackID returns the lowest loopback NIC index, or 0 when the stack has
+// none.
 func (s *Stack) loopbackID() tcpip.NICID {
 	var id tcpip.NICID
 	for i, nic := range s.Interfaces() {
@@ -267,21 +273,9 @@ func (s *Stack) loopbackID() tcpip.NICID {
 	return id
 }
 
-// RouteTable implements inet.Stack.RouteTable.
-func (s *Stack) RouteTable() []inet.Route {
-	var routeTable []inet.Route
-
-	for _, rt := range s.Stack.GetRouteTable() {
-		if r, ok := makeInetRoute(rt); ok {
-			routeTable = append(routeTable, r)
-		}
-	}
-
-	return routeTable
-}
-
-// makeInetRoute converts a netstack route to the form reported by RTM_GETROUTE.
-func makeInetRoute(rt tcpip.Route) (inet.Route, bool) {
+// makeInetRouteXplat converts a netstack route into the inet.Route format that
+// RTM_GETROUTE reports.
+func makeInetRouteXplat(rt tcpip.Route) (inet.Route, bool) {
 	var family uint8
 	switch rt.Destination.ID().BitLen() {
 	case header.IPv4AddressSizeBits:
@@ -315,9 +309,9 @@ func makeInetRoute(rt tcpip.Route) (inet.Route, bool) {
 	return out, true
 }
 
-// RemoveRoute implements inet.Stack.RemoveRoute. It removes the first route
-// that matches every attribute of the request, as fib_table_delete() does.
-func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+// removeRouteXplat removes the first route that matches every attribute of the
+// request, as fib_table_delete() does.
+func (s *Stack) removeRouteXplat(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	req, err := s.parseRouteRequest(msg)
 	if err != nil {
 		return err
@@ -343,8 +337,8 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 	return nil
 }
 
-// NewRoute implements inet.Stack.NewRoute.
-func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+// newRouteXplat validates and inserts a route from an RTM_NEWROUTE message.
+func (s *Stack) newRouteXplat(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	req, err := s.parseRouteRequest(msg)
 	if err != nil {
 		return err
@@ -383,8 +377,96 @@ func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error 
 	return nil
 }
 
-// RouteFlow is the input of LookupRoute: the fields of an RTM_GETROUTE
-// request that select a route.
+// checkGatewayXplat validates the gateway of route against the target table
+// first and all tables second, as fib_check_nh() does.
+func (s *Stack) checkGatewayXplat(msg *nlmsg.Message, route *tcpip.Route) *syserr.Error {
+	var rtMsg linux.RouteMessage
+	if _, ok := msg.GetData(&rtMsg); !ok {
+		return syserr.ErrInvalidArgument
+	}
+	gw := route.Gateway
+	if gw.Unspecified() || header.IsV6LinkLocalUnicastAddress(gw) || rtMsg.Flags&linux.RTNH_F_ONLINK != 0 {
+		return nil
+	}
+	// fib_check_nh() searches the table of the route first and every table
+	// second. A non-unicast route such as a blackhole rejects the gateway.
+	routes := s.Stack.GetRouteTable()
+	for _, ownTable := range []bool{true, false} {
+		for _, rt := range routes {
+			if ownTable && rt.TableID() != route.TableID() {
+				continue
+			}
+			if !rt.Gateway.Unspecified() || !rt.Destination.Contains(gw) {
+				continue
+			}
+			if rt.RouteType() != tcpip.RouteTypeUnicast {
+				return syserr.ErrInvalidArgument
+			}
+			if route.NIC == 0 || rt.NIC == route.NIC {
+				route.NIC = rt.NIC
+				return nil
+			}
+		}
+	}
+	nics := s.Stack.NICInfo()
+	for _, id := range slices.Sorted(maps.Keys(nics)) {
+		if route.NIC != 0 && id != route.NIC {
+			continue
+		}
+		for _, a := range nics[id].ProtocolAddresses {
+			if subnet := a.AddressWithPrefix.Subnet(); subnet.Contains(gw) {
+				route.NIC = id
+				return nil
+			}
+		}
+	}
+	if rtMsg.Family == linux.AF_INET6 {
+		return syserr.ErrHostUnreachable
+	}
+	return syserr.ErrNetworkUnreachable
+}
+
+// addPrefixRoute inserts the main-table subnet route for a new interface
+// address and emits a kernel route event.
+func (s *Stack) addPrefixRoute(ctx context.Context, protocolAddress tcpip.ProtocolAddress, nicID tcpip.NICID) {
+	localRoute := prefixRoute(protocolAddress.AddressWithPrefix.Subnet(), nicID)
+
+	sameDst := false
+	for _, rt := range s.Stack.GetRouteTable() {
+		if isPrefixRoute(rt, localRoute) {
+			return
+		}
+		if rt.Destination.Equal(localRoute.Destination) {
+			sameDst = true
+		}
+	}
+
+	s.Stack.AddRoute(localRoute)
+	var reqFlags uint16
+	if protocolAddress.Protocol == ipv4.ProtocolNumber {
+		reqFlags = linux.NLM_F_APPEND
+	}
+	s.sendRouteEvent(inet.WithNetlinkOrigin(ctx, inet.NetlinkOrigin{}), localRoute, true /* added */, newRouteFlags(localRoute, sameDst, reqFlags))
+}
+
+// removePrefixRoute removes the main-table subnet route for a deleted interface
+// address and emits kernel route events.
+func (s *Stack) removePrefixRoute(ctx context.Context, protocolAddress tcpip.ProtocolAddress, nicID tcpip.NICID) {
+	localRoute := prefixRoute(protocolAddress.AddressWithPrefix.Subnet(), nicID)
+	var removed []tcpip.Route
+	s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
+		if !isPrefixRoute(rt, localRoute) {
+			return false
+		}
+		removed = append(removed, rt)
+		return true
+	})
+	for _, rt := range removed {
+		s.sendRouteEvent(inet.WithNetlinkOrigin(ctx, inet.NetlinkOrigin{}), rt, false /* added */, 0)
+	}
+}
+
+// RouteFlow holds the RTM_GETROUTE fields that select a route in LookupRoute.
 type RouteFlow struct {
 	Family      uint8
 	Dst, Src    []byte
@@ -393,9 +475,8 @@ type RouteFlow struct {
 	Mark        uint32
 }
 
-// LookupRoute resolves the route for a destination like an RTM_GETROUTE
-// request without the dump flag. It applies the routing rules, the mark, and
-// the interfaces of the flow.
+// LookupRoute resolves a destination route for a non-dump RTM_GETROUTE request
+// using the routing rules, mark, and interfaces of f.
 func (s *Stack) LookupRoute(f RouteFlow) (inet.Route, *syserr.Error) {
 	proto := header.IPv4ProtocolNumber
 	if f.Family == linux.AF_INET6 {
@@ -417,8 +498,8 @@ func (s *Stack) LookupRoute(f RouteFlow) (inet.Route, *syserr.Error) {
 	return r, nil
 }
 
-// prefixRoute returns the route that the stack adds to the table main for an
-// address with a prefix, like fib_magic() and addrconf_prefix_route().
+// prefixRoute builds the main-table prefix route for an interface address, as
+// fib_magic() and addrconf_prefix_route() do.
 func prefixRoute(subnet tcpip.Subnet, nicID tcpip.NICID) tcpip.Route {
 	rt := tcpip.Route{
 		Destination: subnet,
@@ -436,8 +517,7 @@ func prefixRoute(subnet tcpip.Subnet, nicID tcpip.NICID) tcpip.Route {
 	return rt
 }
 
-// isPrefixRoute reports whether rt is the prefix route of the table main that
-// has the destination and the NIC of want.
+// isPrefixRoute reports whether rt is a main-table route equal to want.
 func isPrefixRoute(rt, want tcpip.Route) bool {
 	return rt.TableID() == tcpip.RouteTableMain && rt.Equal(want)
 }
