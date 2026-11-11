@@ -27,10 +27,12 @@ import (
 	"slices"
 
 	gvcontext "z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
+	"z.gfire.dev/gvx/pkg/oci"
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
@@ -155,6 +157,48 @@ func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
 	return nil
 }
 
+func (s *Sandbox) hasLayerSource() bool {
+	return len(s.cfg.OCILayerTars) > 0 || s.cfg.OCIImage != "" || len(s.cfg.ELFBytes) > 0 || s.cfg.BinaryPath != ""
+}
+
+func (s *Sandbox) openManifestLayers(digests []string) (err error) {
+	if len(digests) == 0 {
+		return nil
+	}
+	cache, err := NewLayerCacheWithTuning(s.cfg.OCICacheDir, s.cfg.Tuning)
+	if err != nil {
+		return err
+	}
+	layerFiles, err := cache.OpenLayerHandles(digests)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, oci.CloseLayerFiles(layerFiles))
+	}()
+	for i, f := range layerFiles {
+		layerPath, err := cache.LayerPath(digests[i])
+		if err != nil {
+			return err
+		}
+		hh, err := fd.OpenHostPath(layerPath, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("gvx: open EROFS HostHandle %q: %w", layerPath, err)
+		}
+		s.layerHandles = append(s.layerHandles, hh)
+		s.layerDigests = append(s.layerDigests, normalizeEROFSDigest(digests[i]))
+		if err := verifySameLayerFile(f, layerPath); err != nil {
+			return err
+		}
+		info, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("gvx: stat EROFS layer %q: %w", layerPath, err)
+		}
+		s.layerBytes += uint64(info.Size())
+	}
+	return nil
+}
+
 // Restore loads a checkpoint bundle from opts.Dir into a new Sandbox. Restore
 // opens all host handles, validates manifest.json, and applies hostlockdown
 // before loading untrusted checkpoint pages and kernel state.
@@ -163,15 +207,20 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
-	if err := cfg.normalize(); err != nil {
-		return nil, err
-	}
-	applyHostMemoryDefaults()
-
 	manifest, err := readAndParseManifest(opts.Dir)
 	if err != nil {
 		return nil, err
 	}
+	if cfg.NetworkMode == "" && manifest.NetMode != "" {
+		cfg.NetworkMode = manifest.NetMode
+	}
+	if cfg.Architecture == "" && manifest.Arch != "" {
+		cfg.Architecture = manifest.Arch
+	}
+	if err := cfg.normalize(); err != nil {
+		return nil, err
+	}
+	applyHostMemoryDefaults()
 
 	sb := &Sandbox{
 		cfg:            cfg,
@@ -236,8 +285,14 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 	sb.platName = opened.name
 	sb.fallbackFrom = opened.fallbackFrom
 
-	if err := sb.initOCILayers(ctx); err != nil {
-		return cleanup(err)
+	if sb.hasLayerSource() {
+		if err := sb.initOCILayers(ctx); err != nil {
+			return cleanup(err)
+		}
+	} else {
+		if err := sb.openManifestLayers(manifest.LayerDigests); err != nil {
+			return cleanup(err)
+		}
 	}
 
 	if err := sb.openMountsForRestore(); err != nil {

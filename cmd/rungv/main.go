@@ -37,6 +37,7 @@ type cliIO struct {
 // init function, so that adding a command changes no shared line.
 type command struct {
 	name    string
+	aliases []string
 	summary string
 	// usage lists the synopsis lines that the help text prints.
 	usage []string
@@ -50,6 +51,12 @@ func register(c command) {
 		panic("rungv: duplicate command " + c.name)
 	}
 	commands[c.name] = c
+	for _, alias := range c.aliases {
+		if _, dup := commands[alias]; dup {
+			panic("rungv: duplicate command " + alias)
+		}
+		commands[alias] = c
+	}
 }
 
 func main() {
@@ -93,8 +100,10 @@ func executeCLI(ctx context.Context, args []string, stdin io.Reader, stdout, std
 func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Usage:")
 	names := make([]string, 0, len(commands))
-	for name := range commands {
-		names = append(names, name)
+	for name, c := range commands {
+		if name == c.name {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	for _, name := range names {
