@@ -15,8 +15,6 @@
 package oci
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,16 +22,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-const (
-	// annotationRefName is the OCI annotation that names an image in index.json.
-	annotationRefName = "org.opencontainers.image.ref.name"
-	// annotationImageName is the containerd annotation with the full image name.
-	annotationImageName = "io.containerd.image.name"
-	// mediaTypeOCILayerTar is the media type of an uncompressed layer.
-	mediaTypeOCILayerTar = "application/vnd.oci.image.layer.v1.tar"
-)
+// annotationImageName is the containerd annotation with the full image name.
+const annotationImageName = "io.containerd.image.name"
 
 // LoadedImage is one image that LoadArchive registered in the cache.
 type LoadedImage struct {
@@ -45,11 +41,6 @@ type LoadedImage struct {
 	// Names lists the tags that the archive gave the image. It is empty for an
 	// image without a name.
 	Names []Reference
-}
-
-func blobDigest(b []byte) string {
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // LoadArchive compiles every image of an image archive for targetArch into the
@@ -102,7 +93,7 @@ func (a *archive) register(arch string) ([]LoadedImage, error) {
 	return nil, errors.New("oci: the archive is neither an OCI image layout nor a docker save archive")
 }
 
-func (a *archive) registerOCILayout(idx ImageIndex, arch string) ([]LoadedImage, error) {
+func (a *archive) registerOCILayout(idx ocispec.Index, arch string) ([]LoadedImage, error) {
 	configNames := a.dockerSaveNames()
 	var out []LoadedImage
 	byDigest := make(map[string]int)
@@ -122,7 +113,7 @@ func (a *archive) registerOCILayout(idx ImageIndex, arch string) ([]LoadedImage,
 		if err := verifyBody(desc, body); err != nil {
 			return nil, fmt.Errorf("oci: manifest %s: %w", desc.Digest, err)
 		}
-		res, err := resolveManifestChain(body, arch, func(d Descriptor) ([]byte, error) {
+		res, err := resolveManifestChain(body, arch, func(d ocispec.Descriptor) ([]byte, error) {
 			name, err := blobMemberName(d.Digest)
 			if err != nil {
 				return nil, err
@@ -153,20 +144,22 @@ func (a *archive) registerOCILayout(idx ImageIndex, arch string) ([]LoadedImage,
 			return nil, err
 		}
 
+		cfgDigestStr := res.Manifest.Config.Digest.String()
+		descDigestStr := desc.Digest.String()
 		raw := archiveNames(desc.Annotations)
-		raw = append(raw, configNames[res.Manifest.Config.Digest]...)
+		raw = append(raw, configNames[cfgDigestStr]...)
 		names := parseArchiveNames(raw)
 		if err := a.cache.registerLoaded(imageRecord{
-			Digest: desc.Digest, Architecture: arch, Manifests: res.Chain, Config: cfgBytes,
+			Digest: descDigestStr, Architecture: arch, Manifests: res.Chain, Config: cfgBytes,
 		}, names); err != nil {
 			return nil, err
 		}
-		if i, ok := byDigest[desc.Digest]; ok {
+		if i, ok := byDigest[descDigestStr]; ok {
 			out[i].Names = mergeNames(out[i].Names, names)
 			continue
 		}
-		byDigest[desc.Digest] = len(out)
-		out = append(out, LoadedImage{ID: res.Manifest.Config.Digest, Digest: desc.Digest, Names: names})
+		byDigest[descDigestStr] = len(out)
+		out = append(out, LoadedImage{ID: cfgDigestStr, Digest: descDigestStr, Names: names})
 	}
 	if len(out) == 0 {
 		if firstErr != nil {
@@ -200,25 +193,26 @@ func (a *archive) registerDockerSave(arch string) ([]LoadedImage, error) {
 
 		// The format has no manifest. The record holds a manifest that points at
 		// the layers by their diff IDs, which are the cache keys.
-		manifest := ImageManifest{
-			SchemaVersion: 2,
-			MediaType:     mediaTypeOCIManifest,
-			Config:        Descriptor{MediaType: mediaTypeOCIConfig, Digest: blobDigest(img.cfgBytes), Size: int64(len(img.cfgBytes))},
+		cfgDigest := digest.FromBytes(img.cfgBytes)
+		manifest := ocispec.Manifest{
+			Versioned: specs.Versioned{SchemaVersion: 2},
+			MediaType: ocispec.MediaTypeImageManifest,
+			Config:    ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: cfgDigest, Size: int64(len(img.cfgBytes))},
 		}
 		for i, diffID := range img.diffIDs {
-			manifest.Layers = append(manifest.Layers, Descriptor{MediaType: mediaTypeOCILayerTar, Digest: diffID, Size: img.layerSizes[i]})
+			manifest.Layers = append(manifest.Layers, ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: diffID, Size: img.layerSizes[i]})
 		}
 		body, err := json.Marshal(manifest)
 		if err != nil {
 			return nil, fmt.Errorf("oci: encode manifest of a docker save image: %w", err)
 		}
-		digest := blobDigest(body)
+		dgstStr := digest.FromBytes(body).String()
 		if err := a.cache.registerLoaded(imageRecord{
-			Digest: digest, Architecture: arch, Manifests: [][]byte{body}, Config: img.cfgBytes,
+			Digest: dgstStr, Architecture: arch, Manifests: [][]byte{body}, Config: img.cfgBytes,
 		}, names); err != nil {
 			return nil, err
 		}
-		out = append(out, LoadedImage{ID: manifest.Config.Digest, Digest: digest, Names: names})
+		out = append(out, LoadedImage{ID: cfgDigest.String(), Digest: dgstStr, Names: names})
 	}
 	if len(out) == 0 {
 		if firstErr != nil {
@@ -238,7 +232,7 @@ func cmpFirst(first, err error) error {
 
 func isManifestMediaType(mt string) bool {
 	switch mt {
-	case "", mediaTypeOCIManifest, mediaTypeDockerManifest, mediaTypeOCIIndex, mediaTypeDockerList:
+	case "", ocispec.MediaTypeImageManifest, mediaTypeDockerManifest, ocispec.MediaTypeImageIndex, mediaTypeDockerList:
 		return true
 	}
 	return false
@@ -250,7 +244,7 @@ func archiveNames(annotations map[string]string) []string {
 	if n := annotations[annotationImageName]; n != "" {
 		names = append(names, n)
 	}
-	if n := annotations[annotationRefName]; strings.ContainsAny(n, ":/@") {
+	if n := annotations[ocispec.AnnotationRefName]; strings.ContainsAny(n, ":/@") {
 		names = append(names, n)
 	}
 	return names
@@ -325,7 +319,7 @@ func (a *archive) dockerSaveNames() map[string][]string {
 		if err != nil {
 			continue
 		}
-		id := blobDigest(cfgBytes)
+		id := digest.FromBytes(cfgBytes).String()
 		names[id] = append(names[id], e.RepoTags...)
 	}
 	return names

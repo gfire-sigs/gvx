@@ -17,8 +17,6 @@ package oci
 import (
 	"archive/tar"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +24,10 @@ import (
 	"net/http"
 	"slices"
 	"time"
+
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // SaveTarget selects one image for SaveImages and gives it names.
@@ -47,8 +49,8 @@ type preparedSave struct {
 }
 
 // saveBlobPath returns the archive member of a blob.
-func saveBlobPath(digest string) string {
-	name, _ := blobMemberName(digest)
+func saveBlobPath(d digest.Digest) string {
+	name, _ := blobMemberName(d)
 	return name
 }
 
@@ -91,22 +93,26 @@ func (c *LayerCache) SaveImages(ctx context.Context, w io.Writer, client *http.C
 	}
 
 	tw := tar.NewWriter(w)
-	written := make(map[string]bool)
-	writeBlob := func(digest string, data []byte) error {
-		if written[digest] {
+	written := make(map[digest.Digest]bool)
+	writeBlob := func(d digest.Digest, data []byte) error {
+		if written[d] {
 			return nil
 		}
-		written[digest] = true
-		return writeTarFile(tw, saveBlobPath(digest), data)
+		written[d] = true
+		return writeTarFile(tw, saveBlobPath(d), data)
 	}
-	if err := writeTarFile(tw, "oci-layout", []byte(`{"imageLayoutVersion":"1.0.0"}`)); err != nil {
+	layoutRaw, err := json.Marshal(ocispec.ImageLayout{Version: ocispec.ImageLayoutVersion})
+	if err != nil {
+		return fmt.Errorf("oci: encode oci-layout: %w", err)
+	}
+	if err := writeTarFile(tw, ocispec.ImageLayoutFile, layoutRaw); err != nil {
 		return err
 	}
 
-	index := ImageIndex{SchemaVersion: 2, MediaType: mediaTypeOCIIndex}
+	index := ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageIndex}
 	var manifestJSON []dockerSaveEntry
 	for _, p := range prepared {
-		manifestDigest := blobDigest(p.dec.manifestBody)
+		manifestDigest := digest.FromBytes(p.dec.manifestBody)
 		if err := writeBlob(manifestDigest, p.dec.manifestBody); err != nil {
 			return err
 		}
@@ -130,18 +136,18 @@ func (c *LayerCache) SaveImages(ctx context.Context, w io.Writer, client *http.C
 
 		mediaType := p.dec.manifest.MediaType
 		if mediaType == "" {
-			mediaType = mediaTypeOCIManifest
+			mediaType = ocispec.MediaTypeImageManifest
 		}
-		desc := Descriptor{
+		desc := ocispec.Descriptor{
 			MediaType: mediaType, Digest: manifestDigest, Size: int64(len(p.dec.manifestBody)),
-			Platform: &PlatformSpec{OS: "linux", Architecture: p.img.Architecture},
+			Platform: &ocispec.Platform{OS: "linux", Architecture: p.img.Architecture},
 		}
 		if len(p.names) == 0 {
 			index.Manifests = append(index.Manifests, desc)
 		}
 		for _, n := range p.names {
 			named := desc
-			named.Annotations = map[string]string{annotationRefName: n.Familiar(), annotationImageName: n.String()}
+			named.Annotations = map[string]string{ocispec.AnnotationRefName: n.Familiar(), annotationImageName: n.String()}
 			index.Manifests = append(index.Manifests, named)
 			entry.RepoTags = append(entry.RepoTags, n.Familiar())
 		}
@@ -222,8 +228,11 @@ func writeTarFile(tw *tar.Writer, name string, data []byte) error {
 // copyRegistryBlob streams the layer blob l from the registry into the
 // archive. The descriptor gives the size. The call verifies size and digest
 // while it copies and returns ErrDigestMismatch on a difference.
-func copyRegistryBlob(ctx context.Context, tw *tar.Writer, rc *registryClient, l Descriptor) error {
-	body, err := rc.openBlob(ctx, l.Digest)
+func copyRegistryBlob(ctx context.Context, tw *tar.Writer, rc *registryClient, l ocispec.Descriptor) error {
+	if err := validateSHA256(l.Digest); err != nil {
+		return err
+	}
+	body, err := rc.openBlob(ctx, l.Digest.String())
 	if err != nil {
 		return err
 	}
@@ -233,8 +242,8 @@ func copyRegistryBlob(ctx context.Context, tw *tar.Writer, rc *registryClient, l
 	if err := tw.WriteHeader(hdr); err != nil {
 		return fmt.Errorf("oci: write archive member %s: %w", hdr.Name, err)
 	}
-	h := sha256.New()
-	if _, err := io.CopyN(io.MultiWriter(tw, h), body, l.Size); err != nil {
+	digester := digest.SHA256.Digester()
+	if _, err := io.CopyN(io.MultiWriter(tw, digester.Hash()), body, l.Size); err != nil {
 		if errors.Is(err, io.EOF) {
 			return fmt.Errorf("%w: blob %s is shorter than the %d bytes of its descriptor", ErrDigestMismatch, l.Digest, l.Size)
 		}
@@ -244,12 +253,8 @@ func copyRegistryBlob(ctx context.Context, tw *tar.Writer, rc *registryClient, l
 	if n, _ := body.Read(extra[:]); n > 0 {
 		return fmt.Errorf("%w: blob %s is longer than the %d bytes of its descriptor", ErrDigestMismatch, l.Digest, l.Size)
 	}
-	want, err := parseDigest(l.Digest)
-	if err != nil {
-		return err
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != want {
-		return fmt.Errorf("%w: blob sha256 is %s, want %s", ErrDigestMismatch, got, want)
+	if got := digester.Digest(); got != l.Digest {
+		return fmt.Errorf("%w: blob sha256 is %s, want %s", ErrDigestMismatch, got.Encoded(), l.Digest.Encoded())
 	}
 	return nil
 }

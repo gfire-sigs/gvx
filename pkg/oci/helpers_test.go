@@ -18,8 +18,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +27,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/opencontainers/go-digest"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/erofs"
@@ -112,8 +111,7 @@ func zstdBytes(t testing.TB, raw []byte) []byte {
 }
 
 func sha256Digest(b []byte) string {
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
+	return digest.FromBytes(b).String()
 }
 
 // compileTar compiles a layer into a fresh image file and returns its path.
@@ -284,8 +282,8 @@ func zstdBytesWithWindow(t testing.TB, raw []byte, window int) []byte {
 func treeSummary(tree map[string]*node) map[string]string {
 	out := make(map[string]string, len(tree))
 	for p, n := range tree {
-		out[p] = fmt.Sprintf("mode=%o uid=%d gid=%d nlink=%d size=%d content=%x target=%q dev=%d:%d xattrs=%v children=%v",
-			n.mode, n.uid, n.gid, n.nlink, n.size, sha256.Sum256(n.content), n.target, n.major, n.minor, n.xattrs, n.children)
+		out[p] = fmt.Sprintf("mode=%o uid=%d gid=%d nlink=%d size=%d content=%s target=%q dev=%d:%d xattrs=%v children=%v",
+			n.mode, n.uid, n.gid, n.nlink, n.size, digest.FromBytes(n.content).Encoded(), n.target, n.major, n.minor, n.xattrs, n.children)
 	}
 	return out
 }

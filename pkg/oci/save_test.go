@@ -23,6 +23,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // untar returns the members of a tar archive in order.
@@ -177,11 +179,11 @@ func TestSaveImagesWritesAnOCILayoutAndADockerManifest(t *testing.T) {
 		t.Errorf("RepoTags = %v and %v", manifest[0].RepoTags, manifest[1].RepoTags)
 	}
 
-	var index ImageIndex
+	var index ocispec.Index
 	if err := json.Unmarshal(files["index.json"], &index); err != nil {
 		t.Fatalf("index.json: %v", err)
 	}
-	if len(index.Manifests) != 2 || index.Manifests[0].Annotations[annotationRefName] != reg.ref("a") {
+	if len(index.Manifests) != 2 || index.Manifests[0].Annotations[ocispec.AnnotationRefName] != reg.ref("a") {
 		t.Errorf("index.json = %+v, want two named manifests", index)
 	}
 }

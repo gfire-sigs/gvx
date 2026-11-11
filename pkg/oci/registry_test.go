@@ -25,10 +25,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const testRepo = "app"
@@ -46,13 +51,13 @@ func newTestImage(t testing.TB, arch string, env string, rawLayers ...[]byte) *t
 	t.Helper()
 	img := &testImage{arch: arch, rawLayers: rawLayers}
 	var diffIDs []string
-	var layerDescs []Descriptor
+	var layerDescs []ocispec.Descriptor
 	for _, raw := range rawLayers {
 		blob := gzipBytes(t, raw)
 		img.blobs = append(img.blobs, blob)
 		diffIDs = append(diffIDs, sha256Digest(raw))
-		layerDescs = append(layerDescs, Descriptor{
-			MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Digest: sha256Digest(blob), Size: int64(len(blob)),
+		layerDescs = append(layerDescs, ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayerGzip, Digest: digest.FromBytes(blob), Size: int64(len(blob)),
 		})
 	}
 	cfg := map[string]any{
@@ -64,9 +69,9 @@ func newTestImage(t testing.TB, arch string, env string, rawLayers ...[]byte) *t
 	if img.config, err = json.Marshal(cfg); err != nil {
 		t.Fatal(err)
 	}
-	img.manifest, err = json.Marshal(ImageManifest{
-		SchemaVersion: 2, MediaType: mediaTypeOCIManifest,
-		Config: Descriptor{MediaType: mediaTypeOCIConfig, Digest: sha256Digest(img.config), Size: int64(len(img.config))},
+	img.manifest, err = json.Marshal(ocispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageManifest,
+		Config: ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: digest.FromBytes(img.config), Size: int64(len(img.config))},
 		Layers: layerDescs,
 	})
 	if err != nil {
@@ -214,7 +219,7 @@ func (r *fakeRegistry) serveManifest(w http.ResponseWriter, req *http.Request, r
 		http.NotFound(w, req)
 		return
 	}
-	w.Header().Set("Content-Type", mediaTypeOCIManifest)
+	w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
 	if !r.noDigestHeader || req.Method == http.MethodGet {
 		w.Header().Set("Docker-Content-Digest", digest)
 	}
@@ -276,11 +281,11 @@ func mustPull(t *testing.T, reg *fakeRegistry, cache *LayerCache, ref, arch stri
 func TestPullSelectsTheManifestForEachArchitecture(t *testing.T) {
 	reg := newFakeRegistry(t)
 	amd, arm := twoLayerImage(t, "amd64", "A=amd"), twoLayerImage(t, "arm64", "A=arm")
-	index, err := json.Marshal(ImageIndex{SchemaVersion: 2, MediaType: mediaTypeOCIIndex, Manifests: []Descriptor{
-		{MediaType: mediaTypeOCIManifest, Digest: sha256Digest([]byte("attestation")), Size: 11, Platform: &PlatformSpec{OS: "unknown", Architecture: "unknown"}},
-		{MediaType: mediaTypeOCIManifest, Digest: amd.digest(), Size: int64(len(amd.manifest)), Platform: &PlatformSpec{OS: "linux", Architecture: "amd64"}},
-		{MediaType: mediaTypeOCIManifest, Digest: arm.digest(), Size: int64(len(arm.manifest)), Platform: &PlatformSpec{OS: "linux", Architecture: "arm64", Variant: "v8"}},
-		{MediaType: mediaTypeOCIManifest, Digest: sha256Digest([]byte("windows")), Size: 7, Platform: &PlatformSpec{OS: "windows", Architecture: "amd64"}},
+	index, err := json.Marshal(ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageIndex, Manifests: []ocispec.Descriptor{
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.FromBytes([]byte("attestation")), Size: 11, Platform: &ocispec.Platform{OS: "unknown", Architecture: "unknown"}},
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest(amd.digest()), Size: int64(len(amd.manifest)), Platform: &ocispec.Platform{OS: "linux", Architecture: "amd64"}},
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest(arm.digest()), Size: int64(len(arm.manifest)), Platform: &ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}},
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.FromBytes([]byte("windows")), Size: 7, Platform: &ocispec.Platform{OS: "windows", Architecture: "amd64"}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -346,7 +351,7 @@ func TestPullVerifiesEveryDigest(t *testing.T) {
 			reg.manifests[good.digest()] = other.manifest
 		},
 		"layer size": func(reg *fakeRegistry) {
-			var m ImageManifest
+			var m ocispec.Manifest
 			if err := json.Unmarshal(good.manifest, &m); err != nil {
 				t.Fatal(err)
 			}
@@ -385,7 +390,7 @@ func TestPullRejectsATamperedLayerWithoutCachingIt(t *testing.T) {
 	if _, err := PullRegistryImage(context.Background(), nil, base, repo, "latest", "amd64", cache); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("err = %v, want ErrDigestMismatch", err)
 	}
-	hexStr, _ := parseDigest(sha256Digest(good.blobs[1]))
+	hexStr := digest.FromBytes(good.blobs[1]).Encoded()
 	if _, ok := cache.HasLayer(hexStr); ok {
 		t.Error("the tampered layer is in the cache")
 	}
@@ -685,7 +690,7 @@ func TestPullHandlesRegistryFailures(t *testing.T) {
 	})
 	t.Run("foreign layers are refused", func(t *testing.T) {
 		reg := newFakeRegistry(t)
-		var m ImageManifest
+		var m ocispec.Manifest
 		if err := json.Unmarshal(img.manifest, &m); err != nil {
 			t.Fatal(err)
 		}
@@ -1036,11 +1041,187 @@ func TestDockerConfigHostMatching(t *testing.T) {
 	}
 }
 
-func TestParseChallengeKeepsCommasInsideQuotes(t *testing.T) {
-	ch := parseChallenge(`Bearer realm="https://auth.example/token",service="registry.example",scope="repository:a/b:pull,push",error=invalid_token`)
-	if ch.scheme != "bearer" || ch.params["realm"] != "https://auth.example/token" ||
-		ch.params["service"] != "registry.example" || ch.params["scope"] != "repository:a/b:pull,push" || ch.params["error"] != "invalid_token" {
-		t.Errorf("challenge = %+v", ch)
+func TestParseChallengesRFC9110(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		headers    []string
+		want       []challenge
+		wantScheme string
+	}{
+		{
+			name:    "commas inside quoted scope and unquoted error",
+			headers: []string{`Bearer realm="https://auth.example/token",service="registry.example",scope="repository:a/b:pull,push",error=invalid_token`},
+			want: []challenge{{
+				scheme: "bearer",
+				params: map[string]string{
+					"realm":   "https://auth.example/token",
+					"service": "registry.example",
+					"scope":   "repository:a/b:pull,push",
+					"error":   "invalid_token",
+				},
+			}},
+			wantScheme: "bearer",
+		},
+		{
+			name:    "escaped quotes and backslashes inside quoted string",
+			headers: []string{`bEaReR REALM="https://auth.example/token", error_description="bad \"token\" \\ retry", Scope="repo:a,b:pull"`},
+			want: []challenge{{
+				scheme: "bearer",
+				params: map[string]string{
+					"realm":             "https://auth.example/token",
+					"error_description": `bad "token" \ retry`,
+					"scope":             "repo:a,b:pull",
+				},
+			}},
+			wantScheme: "bearer",
+		},
+		{
+			name:    "multiple headers with bare Negotiate and Bearer",
+			headers: []string{"Negotiate", `Bearer realm="https://auth.example/token",service="reg"`},
+			want: []challenge{
+				{scheme: "negotiate", params: map[string]string{}},
+				{scheme: "bearer", params: map[string]string{"realm": "https://auth.example/token", "service": "reg"}},
+			},
+			wantScheme: "bearer",
+		},
+		{
+			name:    "multiple headers with token68 Negotiate and Basic fallback",
+			headers: []string{"Negotiate YIIbcgYGKwYBBQUCoIIbZjCC==", `bAsIc Realm="corp"`},
+			want: []challenge{
+				{scheme: "negotiate", token68: "YIIbcgYGKwYBBQUCoIIbZjCC==", params: map[string]string{}},
+				{scheme: "basic", params: map[string]string{"realm": "corp"}},
+			},
+			wantScheme: "basic",
+		},
+		{
+			name:    "multiple headers with Basic first and Bearer second selects Bearer",
+			headers: []string{`Basic realm="reg"`, `Bearer realm="https://auth.example/token",service="reg"`},
+			want: []challenge{
+				{scheme: "basic", params: map[string]string{"realm": "reg"}},
+				{scheme: "bearer", params: map[string]string{"realm": "https://auth.example/token", "service": "reg"}},
+			},
+			wantScheme: "bearer",
+		},
+		{
+			name:    "single header comma-merged Negotiate token68, Basic, and Bearer",
+			headers: []string{`Negotiate YWJj=, Basic realm="reg, \"prod\"", charset="UTF-8", Bearer realm="https://auth.example/token", service="reg", scope="repository:a/b:pull,push"`},
+			want: []challenge{
+				{scheme: "negotiate", token68: "YWJj=", params: map[string]string{}},
+				{scheme: "basic", params: map[string]string{"realm": `reg, "prod"`, "charset": "UTF-8"}},
+				{scheme: "bearer", params: map[string]string{"realm": "https://auth.example/token", "service": "reg", "scope": "repository:a/b:pull,push"}},
+			},
+			wantScheme: "bearer",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseChallenges(tc.headers)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("parseChallenges(%q) = %#v, want %#v", tc.headers, got, tc.want)
+			}
+			sel, ok := selectChallenge(got)
+			if !ok || sel.scheme != tc.wantScheme {
+				t.Errorf("selectChallenge = (%#v, %v), want scheme %q", sel, ok, tc.wantScheme)
+			}
+		})
+	}
+}
+
+func TestPullAuthenticatesMultiChallengeWWWAuthenticate(t *testing.T) {
+	img := twoLayerImage(t, "amd64", "A=1")
+
+	for _, tc := range []struct {
+		name     string
+		wantAuth string
+		headers  func(realm string) []string
+	}{
+		{
+			name:     "multi-header Negotiate then Bearer",
+			wantAuth: "Bearer tok-1",
+			headers: func(realm string) []string {
+				return []string{
+					"Negotiate",
+					fmt.Sprintf(`Bearer realm=%q,service="reg",scope="repository:%s:pull,push"`, realm, testRepo),
+				}
+			},
+		},
+		{
+			name:     "multi-header Basic then Bearer selects Bearer",
+			wantAuth: "Bearer tok-1",
+			headers: func(realm string) []string {
+				return []string{
+					`Basic realm="reg", charset="UTF-8"`,
+					fmt.Sprintf(`BEARER Realm=%q,Service="reg",Scope="repository:%s:pull,push"`, realm, testRepo),
+				}
+			},
+		},
+		{
+			name:     "multi-header Negotiate token68 then Basic selects Basic",
+			wantAuth: "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret")),
+			headers: func(string) []string {
+				return []string{
+					"Negotiate YIIbcgYGKwYBBQUCoIIb==",
+					`bAsIc realm="reg"`,
+				}
+			},
+		},
+		{
+			name:     "single-header comma-merged Negotiate, Basic, and Bearer",
+			wantAuth: "Bearer tok-1",
+			headers: func(realm string) []string {
+				return []string{
+					fmt.Sprintf(`Negotiate YWJj=, Basic realm="reg, \"corp\"", charset="UTF-8", Bearer realm=%q, service="reg", scope="repository:%s:pull,push"`, realm, testRepo),
+				}
+			},
+		},
+		{
+			name:     "single-header comma-merged Negotiate and Basic",
+			wantAuth: "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret")),
+			headers: func(string) []string {
+				return []string{`Negotiate, Basic realm="reg, \"corp\"", charset="UTF-8"`}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := newFakeRegistry(t)
+			reg.tag("latest", reg.addImage(img))
+
+			var srvURL string
+			mux := http.NewServeMux()
+			mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+				user, pass, ok := r.BasicAuth()
+				if !ok || user != "alice" || pass != "s3cret" {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				_, _ = fmt.Fprint(w, `{"token":"tok-1"}`)
+			})
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != tc.wantAuth {
+					for _, h := range tc.headers(srvURL + "/token") {
+						w.Header().Add("WWW-Authenticate", h)
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				reg.serve(w, r)
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			srvURL = srv.URL
+			writeDockerConfig(t, srv.URL, "alice", "s3cret", "")
+
+			got, err := PullRegistryImage(context.Background(), nil, srv.URL, testRepo, "latest", "amd64", newCache(t))
+			if err != nil {
+				t.Fatalf("PullRegistryImage failed: %v", err)
+			}
+			defer got.Close()
+			if len(got.LayerFiles) != 2 {
+				t.Fatalf("LayerFiles = %d, want 2", len(got.LayerFiles))
+			}
+			if content := string(readImage(t, got.LayerPaths[0])["/etc/os-release"].content); content != "base-amd64" {
+				t.Errorf("layer 0 content = %q, want base-amd64", content)
+			}
+		})
 	}
 }
 

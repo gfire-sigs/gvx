@@ -22,27 +22,23 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 )
 
 // ErrInvalidReference reports an image reference that breaks the Docker
 // reference grammar. The error text names the broken part.
 var ErrInvalidReference = errors.New("oci: invalid image reference")
 
+var anchoredDomainRegexp = regexp.MustCompile("^" + reference.DomainRegexp.String() + "$")
+
 const (
 	// DockerHubRegistry is the canonical registry name of Docker Hub.
 	DockerHubRegistry = "docker.io"
-	defaultTag        = "latest"
-	maxRepositoryLen  = 255
 	// hubRepositoryRoot prefixes a Docker Hub repository of one component.
-	hubRepositoryRoot = "library/"
-)
-
-var (
-	tagPattern       = regexp.MustCompile(`^[0-9A-Za-z_][0-9A-Za-z_.-]{0,127}$`)
-	digestPattern    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	repoPartPattern  = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$`)
-	hostLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
-	dockerHubAliases = map[string]bool{"docker.io": true, "index.docker.io": true, "registry-1.docker.io": true}
+	hubRepositoryRoot   = "library/"
+	placeholderRegistry = "registry.invalid"
 )
 
 // Reference names an image in a registry. Registry is the canonical host
@@ -57,41 +53,44 @@ type Reference struct {
 	Digest     string
 }
 
-// rawReference is the result of the grammar step, before Docker Hub defaults.
-type rawReference struct {
-	// registry is the host as written, lowercase, or empty.
-	registry string
-	// path is the repository path as written.
-	path   string
-	tag    string
-	digest string
-}
-
 // ParseReference parses a Docker image reference such as "alpine:3.20",
 // "ghcr.io/org/img:v1", or "name@sha256:<64 hex digits>". The first path
 // component names a registry only if it contains "." or ":" or equals
 // "localhost". Other names live on Docker Hub.
 func ParseReference(s string) (Reference, error) {
-	raw, err := splitReference(s)
+	if s == "" {
+		return Reference{}, fmt.Errorf("%w: reference is empty", ErrInvalidReference)
+	}
+	input := s
+	if first, rest, ok := strings.Cut(s, "/"); ok {
+		host := strings.ToLower(first)
+		switch {
+		case dockerHubHosts[host]:
+			input = DockerHubRegistry + "/" + rest
+		case isRegistryComponent(first):
+			if err := validateRegistryHost(host); err != nil {
+				return Reference{}, invalidReference(s, "%v", err)
+			}
+			input = host + "/" + rest
+		default:
+			input = DockerHubRegistry + "/" + s
+		}
+	}
+	named, err := parseNamed(s, input)
 	if err != nil {
 		return Reference{}, err
 	}
-	registry := raw.registry
-	if registry == "" || dockerHubAliases[registry] {
-		registry = DockerHubRegistry
+	domain := strings.ToLower(reference.Domain(named))
+	if err := validateRegistryHost(domain); err != nil {
+		return Reference{}, invalidReference(s, "%v", err)
 	}
-	repo := raw.path
-	if registry == DockerHubRegistry && !strings.Contains(repo, "/") {
-		repo = hubRepositoryRoot + repo
-	}
-	if len(repo) > maxRepositoryLen {
-		return Reference{}, invalidReference(s, "repository name is longer than %d characters", maxRepositoryLen)
-	}
-	ref := Reference{Registry: registry, Repository: repo, Tag: raw.tag, Digest: raw.digest}
-	if ref.Tag == "" && ref.Digest == "" {
-		ref.Tag = defaultTag
-	}
-	return ref, nil
+	tag, dgst := extractTagAndDigest(named)
+	return Reference{
+		Registry:   domain,
+		Repository: reference.Path(named),
+		Tag:        tag,
+		Digest:     dgst,
+	}, nil
 }
 
 // ParseReferenceAt parses s for an explicit registry base URL, such as the
@@ -99,95 +98,67 @@ func ParseReference(s string) (Reference, error) {
 // registry. The repository path stays as written, except that a Docker Hub
 // base URL adds "library/" to a one-component name.
 func ParseReferenceAt(s, baseURL string) (Reference, error) {
-	raw, err := splitReference(s)
+	if s == "" {
+		return Reference{}, fmt.Errorf("%w: reference is empty", ErrInvalidReference)
+	}
+	pathSpec := s
+	if first, rest, ok := strings.Cut(s, "/"); ok && isRegistryComponent(first) {
+		if err := validateRegistryHost(strings.ToLower(first)); err != nil {
+			return Reference{}, invalidReference(s, "%v", err)
+		}
+		pathSpec = rest
+	}
+	named, err := parseNamed(s, placeholderRegistry+"/"+pathSpec)
 	if err != nil {
 		return Reference{}, err
 	}
+	tag, dgst := extractTagAndDigest(named)
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	ref := Reference{
+	return Reference{
 		Registry:   registryOfBaseURL(baseURL),
-		Repository: NormalizeRegistryRepo(baseURL, raw.path),
-		Tag:        raw.tag,
-		Digest:     raw.digest,
-	}
-	if ref.Tag == "" && ref.Digest == "" {
-		ref.Tag = defaultTag
-	}
-	return ref, nil
+		Repository: NormalizeRegistryRepo(baseURL, reference.Path(named)),
+		Tag:        tag,
+		Digest:     dgst,
+	}, nil
 }
 
 func invalidReference(s, format string, args ...any) error {
 	return fmt.Errorf("%w %q: %s", ErrInvalidReference, s, fmt.Sprintf(format, args...))
 }
 
-// outsideBrackets returns s without a leading "[...]" IPv6 host. An unclosed
-// bracket returns an empty string, and host validation reports it.
-func outsideBrackets(s string) string {
-	if !strings.HasPrefix(s, "[") {
-		return s
+func parseNamed(raw, input string) (reference.Named, error) {
+	if namePart, digestPart, hasAt := strings.Cut(raw, "@"); hasAt && namePart != "" {
+		d, err := digest.Parse(digestPart)
+		if err != nil {
+			return nil, invalidReference(raw, "invalid digest %q: %v", digestPart, err)
+		}
+		if d.Algorithm() != digest.SHA256 {
+			return nil, invalidReference(raw, "unsupported digest algorithm %q", d.Algorithm())
+		}
 	}
-	end := strings.IndexByte(s, ']')
-	if end < 0 {
-		return ""
+	named, err := reference.ParseNormalizedNamed(input)
+	if err != nil {
+		if errors.Is(err, reference.ErrNameContainsUppercase) || strings.Contains(err.Error(), "must be lowercase") {
+			return nil, invalidReference(raw, "%v (uppercase characters are not allowed)", err)
+		}
+		return nil, invalidReference(raw, "%v", err)
 	}
-	return s[end+1:]
+	return named, nil
 }
 
-// splitReference applies the reference grammar and leaves the defaults of
-// Docker Hub to the caller.
-func splitReference(s string) (rawReference, error) {
-	switch {
-	case s == "":
-		return rawReference{}, fmt.Errorf("%w: the reference is empty", ErrInvalidReference)
-	case strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r == 0x7f }):
-		return rawReference{}, invalidReference(s, "it contains a space or control character")
-	case strings.Contains(outsideBrackets(s), "::"):
-		return rawReference{}, invalidReference(s, "it contains a double colon")
-	case strings.HasSuffix(s, "/"):
-		return rawReference{}, invalidReference(s, "it ends with a slash")
-	case strings.HasPrefix(s, "/"):
-		return rawReference{}, invalidReference(s, "it starts with a slash")
+func extractTagAndDigest(named reference.Named) (tag, dgst string) {
+	if tagged, ok := named.(reference.NamedTagged); ok {
+		tag = tagged.Tag()
 	}
-
-	var raw rawReference
-	name := s
-	if at := strings.IndexByte(name, '@'); at >= 0 {
-		name, raw.digest = name[:at], name[at+1:]
-		if !digestPattern.MatchString(raw.digest) {
-			return rawReference{}, invalidReference(s, "digest %q must be sha256: followed by 64 lowercase hex digits", raw.digest)
+	if digested, ok := named.(reference.Digested); ok {
+		dgst = digested.Digest().String()
+	}
+	if tag == "" && dgst == "" {
+		if tagged, ok := reference.TagNameOnly(named).(reference.NamedTagged); ok {
+			tag = tagged.Tag()
 		}
 	}
-	if name == "" {
-		return rawReference{}, invalidReference(s, "the image name is empty")
-	}
-
-	slash := strings.LastIndexByte(name, '/')
-	if colon := strings.LastIndexByte(name[slash+1:], ':'); colon >= 0 {
-		colon += slash + 1
-		name, raw.tag = name[:colon], name[colon+1:]
-		if raw.tag == "" {
-			return rawReference{}, invalidReference(s, "the tag after the colon is empty")
-		}
-		if !tagPattern.MatchString(raw.tag) {
-			return rawReference{}, invalidReference(s, "tag %q must match [\\w][\\w.-]{0,127}", raw.tag)
-		}
-	}
-	if name == "" {
-		return rawReference{}, invalidReference(s, "the image name is empty")
-	}
-
-	raw.path = name
-	if first, rest, ok := strings.Cut(name, "/"); ok && isRegistryComponent(first) {
-		host := strings.ToLower(first)
-		if err := validateRegistryHost(host); err != nil {
-			return rawReference{}, invalidReference(s, "%v", err)
-		}
-		raw.registry, raw.path = host, rest
-	}
-	if err := validateRepositoryPath(raw.path); err != nil {
-		return rawReference{}, invalidReference(s, "%v", err)
-	}
-	return raw, nil
+	return tag, dgst
 }
 
 // isRegistryComponent applies the Docker rule for the first path component.
@@ -195,58 +166,23 @@ func isRegistryComponent(c string) bool {
 	return strings.ContainsAny(c, ".:") || c == "localhost"
 }
 
-func validateRepositoryPath(path string) error {
-	for part := range strings.SplitSeq(path, "/") {
-		switch {
-		case part == "":
-			return errors.New("the repository path has an empty component")
-		case part != strings.ToLower(part):
-			return fmt.Errorf("repository component %q has uppercase letters, which Docker rejects", part)
-		case !repoPartPattern.MatchString(part):
-			return fmt.Errorf("repository component %q must use lowercase letters, digits, and the separators . _ -", part)
-		}
-	}
-	return nil
-}
-
 func validateRegistryHost(host string) error {
+	if host == "" || host != strings.ToLower(host) || !anchoredDomainRegexp.MatchString(host) {
+		return fmt.Errorf("invalid reference format: invalid registry host %q", host)
+	}
 	hostname, port := host, ""
 	if strings.HasPrefix(host, "[") {
 		end := strings.IndexByte(host, ']')
-		if end < 0 {
-			return fmt.Errorf("registry host %q has an unclosed bracket", host)
-		}
-		hostname, port = host[1:end], host[end+1:]
+		hostname, port = host[1:end], strings.TrimPrefix(host[end+1:], ":")
 		if _, err := netip.ParseAddr(hostname); err != nil {
 			return fmt.Errorf("registry host %q has an invalid IPv6 address", host)
 		}
-		if port != "" {
-			if port[0] != ':' {
-				return fmt.Errorf("registry host %q has text after the bracket", host)
-			}
-			port = port[1:]
-			if port == "" {
-				return fmt.Errorf("registry host %q has an empty port", host)
-			}
-		}
 	} else if i := strings.IndexByte(host, ':'); i >= 0 {
-		hostname, port = host[:i], host[i+1:]
-		if port == "" {
-			return fmt.Errorf("registry host %q has an empty port", host)
-		}
-		hostname = strings.TrimSuffix(hostname, ".")
+		port = host[i+1:]
 	}
 	if port != "" {
 		if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
 			return fmt.Errorf("registry host %q has an invalid port", host)
-		}
-	}
-	if strings.HasPrefix(host, "[") {
-		return nil
-	}
-	for label := range strings.SplitSeq(hostname, ".") {
-		if !hostLabelPattern.MatchString(label) {
-			return fmt.Errorf("registry host %q has an invalid name", host)
 		}
 	}
 	return nil
@@ -334,6 +270,9 @@ func (r Reference) suffix() string {
 // drops the host and drops "library/", so "docker.io/library/alpine" becomes
 // "alpine" and "docker.io/me/app" becomes "me/app".
 func (r Reference) FamiliarName() string {
+	if named, err := reference.WithName(r.Name()); err == nil {
+		return reference.FamiliarName(named)
+	}
 	if r.Registry != DockerHubRegistry {
 		return r.Name()
 	}

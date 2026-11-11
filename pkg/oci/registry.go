@@ -16,9 +16,7 @@ package oci
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +27,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const (
@@ -43,9 +44,9 @@ const (
 )
 
 var manifestAccept = strings.Join([]string{
-	mediaTypeOCIIndex,
+	ocispec.MediaTypeImageIndex,
 	mediaTypeDockerList,
-	mediaTypeOCIManifest,
+	ocispec.MediaTypeImageManifest,
 	mediaTypeDockerManifest,
 }, ", ")
 
@@ -230,12 +231,12 @@ func (rc *registryClient) do(ctx context.Context, method, rawURL, accept string)
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
 		return resp, err
 	}
-	challenge := resp.Header.Get("Www-Authenticate")
+	headers := resp.Header.Values("WWW-Authenticate")
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if err := resp.Body.Close(); err != nil {
 		return nil, fmt.Errorf("oci: close response of %s: %w", rawURL, err)
 	}
-	if err := rc.authorize(ctx, challenge); err != nil {
+	if err := rc.authorize(ctx, headers); err != nil {
 		return nil, err
 	}
 	return rc.once(ctx, method, rawURL, accept)
@@ -258,8 +259,8 @@ func (rc *registryClient) manifestURL(ref string) string {
 	return fmt.Sprintf("%s/v2/%s/manifests/%s", strings.TrimRight(rc.baseURL.String(), "/"), rc.repo, ref)
 }
 
-func (rc *registryClient) blobURL(digest string) string {
-	return fmt.Sprintf("%s/v2/%s/blobs/%s", strings.TrimRight(rc.baseURL.String(), "/"), rc.repo, digest)
+func (rc *registryClient) blobURL(dgst string) string {
+	return fmt.Sprintf("%s/v2/%s/blobs/%s", strings.TrimRight(rc.baseURL.String(), "/"), rc.repo, dgst)
 }
 
 // getManifest returns the body of a manifest or index.
@@ -280,7 +281,7 @@ func (rc *registryClient) getManifest(ctx context.Context, ref string) ([]byte, 
 // resolveTag returns the manifest digest that tag names right now. When the
 // registry answers a HEAD request without a digest header, it fetches the
 // manifest and also returns the body.
-func (rc *registryClient) resolveTag(ctx context.Context, tag string) (digest string, body []byte, err error) {
+func (rc *registryClient) resolveTag(ctx context.Context, tag string) (dgst string, body []byte, err error) {
 	u := rc.manifestURL(tag)
 	resp, err := rc.do(ctx, http.MethodHead, u, manifestAccept)
 	if err != nil {
@@ -298,22 +299,21 @@ func (rc *registryClient) resolveTag(ctx context.Context, tag string) (digest st
 		if body, err = rc.getManifest(ctx, tag); err != nil {
 			return "", nil, err
 		}
-		sum := sha256.Sum256(body)
-		return "sha256:" + hex.EncodeToString(sum[:]), body, nil
+		return digest.FromBytes(body).String(), body, nil
 	default:
 		return "", nil, &StatusError{URL: u, StatusCode: status}
 	}
 }
 
 // getBlobBytes fetches a small blob such as an image config and verifies it.
-func (rc *registryClient) getBlobBytes(ctx context.Context, desc Descriptor) ([]byte, error) {
+func (rc *registryClient) getBlobBytes(ctx context.Context, desc ocispec.Descriptor) ([]byte, error) {
 	if desc.Size < 0 || desc.Size > rc.lim.MaxJSONBytes {
 		return nil, &LimitError{What: fmt.Sprintf("size of blob %s", desc.Digest), Limit: rc.lim.MaxJSONBytes}
 	}
-	if _, err := parseDigest(desc.Digest); err != nil {
+	if err := validateSHA256(desc.Digest); err != nil {
 		return nil, err
 	}
-	u := rc.blobURL(desc.Digest)
+	u := rc.blobURL(desc.Digest.String())
 	resp, err := rc.get(ctx, u, "")
 	if err != nil {
 		return nil, fmt.Errorf("oci: fetch blob %s: %w", u, err)
@@ -330,8 +330,8 @@ func (rc *registryClient) getBlobBytes(ctx context.Context, desc Descriptor) ([]
 }
 
 // openBlob streams a blob. The caller verifies the digest while it reads.
-func (rc *registryClient) openBlob(ctx context.Context, digest string) (io.ReadCloser, error) {
-	u := rc.blobURL(digest)
+func (rc *registryClient) openBlob(ctx context.Context, dgst string) (io.ReadCloser, error) {
+	u := rc.blobURL(dgst)
 	resp, err := rc.get(ctx, u, "")
 	if err != nil {
 		return nil, fmt.Errorf("oci: fetch blob %s: %w", u, err)
@@ -339,49 +339,151 @@ func (rc *registryClient) openBlob(ctx context.Context, digest string) (io.ReadC
 	return resp.Body, nil
 }
 
-// challenge is a parsed WWW-Authenticate header.
+// challenge is one parsed RFC 9110 WWW-Authenticate challenge.
 type challenge struct {
-	scheme string
-	params map[string]string
+	scheme  string
+	token68 string
+	params  map[string]string
 }
 
-// parseChallenge parses `Scheme key="value", key=value`. Quoted values can
-// contain commas, as Docker scopes do.
-func parseChallenge(h string) challenge {
-	h = strings.TrimSpace(h)
-	scheme, rest, _ := strings.Cut(h, " ")
-	c := challenge{scheme: strings.ToLower(scheme), params: make(map[string]string)}
-	for rest = strings.TrimSpace(rest); rest != ""; {
-		eq := strings.IndexByte(rest, '=')
-		if eq <= 0 {
-			break
-		}
-		key := strings.ToLower(strings.TrimSpace(rest[:eq]))
-		rest = strings.TrimSpace(rest[eq+1:])
-		var value string
-		if strings.HasPrefix(rest, `"`) {
-			var sb strings.Builder
-			i := 1
-			for ; i < len(rest) && rest[i] != '"'; i++ {
-				if rest[i] == '\\' && i+1 < len(rest) {
-					i++
-				}
-				sb.WriteByte(rest[i])
-			}
-			value = sb.String()
-			rest = rest[min(i+1, len(rest)):]
-		} else {
-			end := strings.IndexByte(rest, ',')
-			if end < 0 {
-				end = len(rest)
-			}
-			value = strings.TrimSpace(rest[:end])
-			rest = rest[end:]
-		}
-		c.params[key] = value
-		rest = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest), ","))
+// parseChallenges parses every RFC 9110 challenge across all WWW-Authenticate
+// header lines. One header line can carry comma-merged challenges, token68
+// values, and quoted parameter strings with commas or escaped quotes.
+func parseChallenges(headers []string) []challenge {
+	var out []challenge
+	for _, h := range headers {
+		out = append(out, parseHeaderChallenges(h)...)
 	}
-	return c
+	return out
+}
+
+func parseHeaderChallenges(s string) []challenge {
+	var out []challenge
+	skipRest := func(v string) string {
+		if i := strings.IndexByte(v, ','); i >= 0 {
+			return v[i:]
+		}
+		return ""
+	}
+	for s = strings.TrimLeft(s, " \t,"); s != ""; s = strings.TrimLeft(s, " \t,") {
+		scheme, rest := scanToken(s)
+		if scheme == "" {
+			s = s[1:]
+			continue
+		}
+		ch := challenge{scheme: strings.ToLower(scheme), params: make(map[string]string)}
+		if rest == "" || rest[0] == ',' {
+			out = append(out, ch)
+			s = rest
+			continue
+		}
+		if rest[0] != ' ' && rest[0] != '\t' {
+			s = skipRest(rest)
+			continue
+		}
+		s = strings.TrimLeft(rest, " \t")
+		if s == "" || s[0] == ',' {
+			out = append(out, ch)
+			continue
+		}
+		if !looksLikeAuthParam(s) {
+			if tok68, after, ok := scanToken68(s); ok {
+				ch.token68 = tok68
+				out = append(out, ch)
+				s = after
+				continue
+			}
+			s = skipRest(s)
+			continue
+		}
+		for s != "" && looksLikeAuthParam(s) {
+			key, rest := scanToken(s)
+			rest = strings.TrimLeft(strings.TrimLeft(rest, " \t")[1:], " \t")
+			var val string
+			if strings.HasPrefix(rest, `"`) {
+				val, rest = consumeQuotedString(rest)
+			} else {
+				i := strings.IndexAny(rest, ", \t")
+				if i < 0 {
+					i = len(rest)
+				}
+				val, rest = rest[:i], rest[i:]
+			}
+			ch.params[strings.ToLower(key)] = val
+			rest = strings.TrimLeft(rest, " \t")
+			if !strings.HasPrefix(rest, ",") {
+				s = skipRest(rest)
+				break
+			}
+			s = strings.TrimLeft(rest, " \t,")
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+func scanToken(s string) (string, string) {
+	i := 0
+	for i < len(s) && ((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9') || strings.IndexByte("!#$%&'*+-.^_`|~", s[i]) >= 0) {
+		i++
+	}
+	return s[:i], s[i:]
+}
+
+func scanToken68(s string) (string, string, bool) {
+	i := 0
+	for i < len(s) && ((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9') || strings.IndexByte("-._~+/", s[i]) >= 0) {
+		i++
+	}
+	if i == 0 {
+		return "", s, false
+	}
+	for i < len(s) && s[i] == '=' {
+		i++
+	}
+	after := strings.TrimLeft(s[i:], " \t")
+	if after != "" && after[0] != ',' {
+		return "", s, false
+	}
+	return s[:i], after, true
+}
+
+func consumeQuotedString(s string) (string, string) {
+	var sb strings.Builder
+	i := 1
+	for ; i < len(s) && s[i] != '"'; i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String(), s[min(i+1, len(s)):]
+}
+
+func looksLikeAuthParam(s string) bool {
+	tok, rest := scanToken(s)
+	rest = strings.TrimLeft(rest, " \t")
+	if tok == "" || !strings.HasPrefix(rest, "=") {
+		return false
+	}
+	rest = strings.TrimLeft(rest[1:], " \t")
+	return rest != "" && rest[0] != '=' && rest[0] != ','
+}
+
+// selectChallenge picks Bearer when present and falls back to Basic.
+func selectChallenge(challenges []challenge) (challenge, bool) {
+	var basic challenge
+	for _, ch := range challenges {
+		switch ch.scheme {
+		case "bearer":
+			return ch, true
+		case "basic":
+			if basic.scheme == "" {
+				basic = ch
+			}
+		}
+	}
+	return basic, basic.scheme != ""
 }
 
 // dockerHubHosts are the host names of Docker Hub's registry and its token
@@ -427,8 +529,11 @@ func (rc *registryClient) credentials(ctx context.Context) (Credentials, bool, e
 }
 
 // authorize answers a 401 challenge and stores the resulting credentials.
-func (rc *registryClient) authorize(ctx context.Context, header string) error {
-	ch := parseChallenge(header)
+func (rc *registryClient) authorize(ctx context.Context, headers []string) error {
+	ch, ok := selectChallenge(parseChallenges(headers))
+	if !ok {
+		return fmt.Errorf("oci: unsupported WWW-Authenticate challenge %q", strings.Join(headers, ", "))
+	}
 	cred, haveCred, err := rc.credentials(ctx)
 	if err != nil {
 		return err
@@ -448,7 +553,7 @@ func (rc *registryClient) authorize(ctx context.Context, header string) error {
 		rc.authz = "Bearer " + token
 		return nil
 	default:
-		return fmt.Errorf("oci: unsupported WWW-Authenticate challenge %q", header)
+		return fmt.Errorf("oci: unsupported WWW-Authenticate challenge %q", strings.Join(headers, ", "))
 	}
 }
 

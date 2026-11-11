@@ -25,6 +25,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 )
 
@@ -47,12 +50,12 @@ func writeArchive(t testing.TB, members []archiveMemberSpec) []byte {
 // given images, one manifest per architecture in index.json.
 func ociLayoutMembers(t testing.TB, imgs ...*testImage) []archiveMemberSpec {
 	t.Helper()
-	members := []archiveMemberSpec{{name: "oci-layout", data: []byte(`{"imageLayoutVersion":"1.0.0"}`)}}
-	index := ImageIndex{SchemaVersion: 2, MediaType: mediaTypeOCIIndex}
+	members := []archiveMemberSpec{{name: ocispec.ImageLayoutFile, data: []byte(`{"imageLayoutVersion":"1.0.0"}`)}}
+	index := ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageIndex}
 	for _, img := range imgs {
-		index.Manifests = append(index.Manifests, Descriptor{
-			MediaType: mediaTypeOCIManifest, Digest: img.digest(), Size: int64(len(img.manifest)),
-			Platform: &PlatformSpec{OS: "linux", Architecture: img.arch},
+		index.Manifests = append(index.Manifests, ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest(img.digest()), Size: int64(len(img.manifest)),
+			Platform: &ocispec.Platform{OS: "linux", Architecture: img.arch},
 		})
 		members = append(members, blobMember(img.manifest), blobMember(img.config))
 		for _, b := range img.blobs {

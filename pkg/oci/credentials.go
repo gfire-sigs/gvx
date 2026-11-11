@@ -520,7 +520,7 @@ func RegistryBaseURL(server string) (string, error) {
 	if err := validateRegistryHost(host); err != nil {
 		return "", fmt.Errorf("oci: %w", err)
 	}
-	if dockerHubAliases[host] || host == "registry.docker.io" {
+	if dockerHubHosts[host] {
 		return DefaultRegistryBaseURL, nil
 	}
 	return Reference{Registry: host}.BaseURL(), nil

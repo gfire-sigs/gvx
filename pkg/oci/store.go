@@ -267,15 +267,16 @@ func (c *LayerCache) ListImages(arch string) ([]Image, error) {
 func (c *LayerCache) newImage(rec imageRecord, dec *decodedRecord) Image {
 	img := Image{
 		BaseURL: rec.BaseURL, Repository: rec.Repository, Architecture: rec.Architecture,
-		Digest: rec.Digest, ID: dec.manifest.Config.Digest,
+		Digest: rec.Digest, ID: dec.manifest.Config.Digest.String(),
 		Config: dec.cfg, Source: rec.Source, record: rec,
 	}
-	var cfg imageConfigFile
-	if err := json.Unmarshal(dec.config, &cfg); err == nil {
+	if cfg, _, err := parseImageConfigFile(dec.config, "", -1); err == nil {
 		img.OS = cfg.OS
-		img.DiffIDs = cfg.RootFS.DiffIDs
-		if t, err := time.Parse(time.RFC3339Nano, cfg.Created); err == nil {
-			img.Created = t
+		for _, diffID := range cfg.RootFS.DiffIDs {
+			img.DiffIDs = append(img.DiffIDs, diffID.String())
+		}
+		if cfg.Created != nil {
+			img.Created = *cfg.Created
 		}
 	}
 	for _, hexStr := range dec.layerHex {
@@ -340,9 +341,19 @@ func (c *LayerCache) imageByReference(images []Image, ref Reference, arch string
 	return Image{}, false, nil
 }
 
+func isLowerHex(s string) bool {
+	for i := range len(s) {
+		ch := s[i]
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func selectByID(images []Image, query string) (Selection, error) {
 	q := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(query)), "sha256:")
-	if len(q) < minIDPrefix || len(q) > 64 || normalizeDigestHex(q) != q {
+	if len(q) < minIDPrefix || len(q) > 64 || !isLowerHex(q) {
 		return Selection{}, fmt.Errorf("%w: %s", ErrNotCached, query)
 	}
 	var matches []Image

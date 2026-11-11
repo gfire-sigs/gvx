@@ -207,10 +207,17 @@ var boundaryRules = []importRule{
 		pkg:     "pkg/oci",
 		tier:    Tier1Additive,
 		subtree: true,
-		allowed: []string{"pkg/abi/linux"},
+		allowed: []string{
+			"pkg/abi/linux",
+			"github.com/distribution/reference",
+			"github.com/opencontainers/go-digest",
+			"github.com/opencontainers/image-spec/*",
+		},
 		forbidden: append([]string{
 			"github.com/containerd/*",
 			"google.golang.org/grpc/*",
+			"go.opentelemetry.io/*",
+			"k8s.io/*",
 			pkgSentryAll,
 			"pkg/gvx/*",
 			"pkg/hostlockdown/*",
