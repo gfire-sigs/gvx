@@ -2,7 +2,7 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.13.10002026110200] - 2026-11-11
 
 This release raises default Go microarchitecture baselines per target OS and adds an ARMv8.2 LSE release archive for Linux (#138). It also prints the compiled architecture level in `rungv version` and eliminates timing-sensitive and varint-width flaky tests (#137, #138, #139).
 
