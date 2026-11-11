@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/internal/acceptprog"
+	"z.gfire.dev/gvx/internal/hvtest"
+	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/pkg/gvx"
 )
@@ -60,12 +62,12 @@ type benchLine struct {
 	NsPerOp float64 `json:"ns_per_op"`
 }
 
-func benchRepeat(t *testing.T) int {
-	t.Helper()
+func benchRepeat(tb testing.TB) int {
+	tb.Helper()
 	if v := os.Getenv("GVX_E2E_BENCH_REPEAT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
-			t.Fatalf("GVX_E2E_BENCH_REPEAT=%q is not a positive number", v)
+			tb.Fatalf("GVX_E2E_BENCH_REPEAT=%q is not a positive number", v)
 		}
 		return n
 	}
@@ -87,6 +89,27 @@ func median(v []float64) float64 {
 	return s[len(s)/2]
 }
 
+func requireBenchBackend(tb testing.TB, backend gateBackend) {
+	tb.Helper()
+	switch backend.plat {
+	case gvx.PlatformSystrap:
+		systraptest.Require(tb)
+	case gvx.PlatformHVF, gvx.PlatformWHPX:
+		hvtest.Require(tb)
+	}
+}
+
+func skipBenchWhenFixedAddressRefused(tb testing.TB, what string, err error) {
+	tb.Helper()
+	if err == nil {
+		return
+	}
+	if strings.Contains(err.Error(), "not position-independent") {
+		tb.Skipf("this engine cannot hold an executable that links at a fixed address: %v", err)
+	}
+	tb.Fatalf("%s: %v", what, err)
+}
+
 func TestE2EMicroBench(t *testing.T) {
 	if os.Getenv(microBenchEnv) != "1" {
 		t.Skipf("set %s=1 to run the micro-benchmarks", microBenchEnv)
@@ -104,6 +127,97 @@ func TestE2EMicroBench(t *testing.T) {
 			benchHostColdStart(t, b, exitELF, max(repeat, 5))
 			benchGuest(t, b, bin, repeat)
 		})
+	}
+}
+
+// BenchmarkE2EHostColdStart measures sandbox creation, guest execution, and
+// teardown for a minimal guest that exits with status 0.
+func BenchmarkE2EHostColdStart(b *testing.B) {
+	exitELF, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "")
+	if err != nil {
+		b.Fatalf("BuildGuestELF64: %v", err)
+	}
+	for _, backend := range fixedAddressBackends() {
+		b.Run(backend.name, func(b *testing.B) {
+			requireBenchBackend(b, backend)
+			cache := b.TempDir()
+			var newTotal, runTotal, closeTotal time.Duration
+			b.ResetTimer()
+			for range b.N {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				t0 := time.Now()
+				sb, err := gvx.New(ctx, gvx.Config{
+					Platform:            backend.plat,
+					NetworkMode:         gvx.NetModeNone,
+					OCICacheDir:         cache,
+					ELFBytes:            exitELF,
+					DisableHostLockdown: true,
+				})
+				t1 := time.Now()
+				if err != nil {
+					cancel()
+					skipBenchWhenFixedAddressRefused(b, "New", err)
+					return
+				}
+				code, err := sb.Run(ctx)
+				t2 := time.Now()
+				cerr := sb.Close()
+				t3 := time.Now()
+				cancel()
+				if err != nil || code != 0 || cerr != nil {
+					b.Fatalf("exit guest on %s: code %d, run error %v, close error %v", backend.name, code, err, cerr)
+				}
+				newTotal += t1.Sub(t0)
+				runTotal += t2.Sub(t1)
+				closeTotal += t3.Sub(t2)
+			}
+			b.StopTimer()
+			n := float64(b.N)
+			b.ReportMetric(float64(newTotal.Nanoseconds())/n, "host_new_ns/op")
+			b.ReportMetric(float64(runTotal.Nanoseconds())/n, "host_run_ns/op")
+			b.ReportMetric(float64(closeTotal.Nanoseconds())/n, "host_close_ns/op")
+		})
+	}
+}
+
+// BenchmarkE2EGuestMicroBench runs the guest micro-benchmarks across all
+// supported backends and reports per-operation latency and host CPU metrics.
+func BenchmarkE2EGuestMicroBench(b *testing.B) {
+	bin := acceptprog.BuildMicroBench(b, runtime.GOARCH)
+	names := benchNames
+	if only := benchOnly(); only != nil {
+		names = only
+	}
+	for _, backend := range fixedAddressBackends() {
+		for _, name := range names {
+			b.Run(backend.name+"/"+name, func(b *testing.B) {
+				requireBenchBackend(b, backend)
+				var nsPerOpSum, userMsSum, sysMsSum, cpuPctSum float64
+				b.ResetTimer()
+				for range b.N {
+					sample, detail, err := runBenchOnce(backend, bin, name)
+					if err != nil {
+						if strings.Contains(err.Error(), "not position-independent") {
+							b.Skipf("this engine cannot hold the guest: %v", err)
+						}
+						b.Fatalf("runBenchOnce(%s, %s): %v%s", backend.name, name, err, detail)
+					}
+					if sample.iters < 1 || sample.nsPerOp <= 0 {
+						b.Fatalf("runBenchOnce(%s, %s) produced non-positive sample: %+v", backend.name, name, sample)
+					}
+					nsPerOpSum += sample.nsPerOp
+					userMsSum += sample.userMs
+					sysMsSum += sample.sysMs
+					cpuPctSum += sample.cpuPct
+				}
+				b.StopTimer()
+				n := float64(b.N)
+				b.ReportMetric(nsPerOpSum/n, "guest_ns/op")
+				b.ReportMetric(userMsSum/n, "host_user_ms/op")
+				b.ReportMetric(sysMsSum/n, "host_sys_ms/op")
+				b.ReportMetric(cpuPctSum/n, "cpu_pct")
+			})
+		}
 	}
 }
 
@@ -144,7 +258,14 @@ func benchHostColdStart(t *testing.T, b gateBackend, elfData []byte, reps int) {
 		name string
 		v    []float64
 	}{{"host_new", newNs}, {"host_run_exit", runNs}, {"host_close", closeNs}} {
-		t.Logf("MBRESULT backend=%s name=%s median_ns=%.0f runs=%d", b.name, r.name, median(r.v), len(r.v))
+		if len(r.v) != reps {
+			t.Fatalf("backend %s stage %s collected %d samples, want %d", b.name, r.name, len(r.v), reps)
+		}
+		med := median(r.v)
+		if med <= 0 {
+			t.Fatalf("backend %s stage %s median_ns = %v, want > 0", b.name, r.name, med)
+		}
+		t.Logf("MBRESULT backend=%s name=%s median_ns=%.0f runs=%d", b.name, r.name, med, len(r.v))
 	}
 }
 
@@ -153,6 +274,8 @@ func benchHostColdStart(t *testing.T, b gateBackend, elfData []byte, reps int) {
 var benchNames = []string{"getpid", "open_close", "pipe_pingpong", "futex_pingpong", "fork_wait", "fork_exec_true", "shm_sparse_idle"}
 
 type benchSample struct {
+	iters   int
+	totalNs int64
 	nsPerOp float64
 	userMs  float64
 	sysMs   float64
@@ -191,8 +314,7 @@ func (w *benchOutputTap) Write(p []byte) (int, error) {
 }
 
 // benchGuest runs each benchmark of the microbench guest repeat times and
-// prints each result and the median of each benchmark. A run that fails is
-// printed as MBFAIL and does not stop the others.
+// prints each result and the median of each benchmark.
 func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 	t.Helper()
 	names := benchNames
@@ -210,7 +332,12 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 					t.Skipf("this engine cannot hold the guest: %v", err)
 				}
 				failures++
-				t.Logf("MBFAIL backend=%s name=%s rep=%d %v%s", b.name, name, rep, err, detail)
+				t.Errorf("MBFAIL backend=%s name=%s rep=%d %v%s", b.name, name, rep, err, detail)
+				continue
+			}
+			if sample.iters < 1 || sample.nsPerOp <= 0 {
+				failures++
+				t.Errorf("MBFAIL backend=%s name=%s rep=%d invalid sample %+v", b.name, name, rep, sample)
 				continue
 			}
 			samples = append(samples, sample.nsPerOp)
@@ -218,12 +345,21 @@ func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
 			t.Logf("MBRESULT backend=%s name=%s rep=%d ns_per_op=%.0f host_user_ms=%.2f host_sys_ms=%.2f cpu_pct=%.2f",
 				b.name, name, rep, sample.nsPerOp, sample.userMs, sample.sysMs, sample.cpuPct)
 		}
-		if len(samples) > 0 {
-			t.Logf("MBSUMMARY backend=%s name=%s median_ns_per_op=%.0f median_cpu_pct=%.2f runs=%d of %d",
-				b.name, name, median(samples), median(cpuSamples), len(samples), repeat)
+		if len(samples) == 0 {
+			t.Errorf("backend %s benchmark %s produced 0 valid samples out of %d runs", b.name, name, repeat)
+			continue
 		}
+		med := median(samples)
+		if med <= 0 {
+			t.Errorf("backend %s benchmark %s median_ns_per_op = %v, want > 0", b.name, name, med)
+		}
+		t.Logf("MBSUMMARY backend=%s name=%s median_ns_per_op=%.0f median_cpu_pct=%.2f runs=%d of %d",
+			b.name, name, med, median(cpuSamples), len(samples), repeat)
 	}
 	t.Logf("MBDONE backend=%s failures=%d", b.name, failures)
+	if failures != 0 {
+		t.Fatalf("backend %s had %d micro-benchmark failures", b.name, failures)
+	}
 }
 
 // runBenchOnce runs one benchmark of the guest in a new sandbox and returns its
@@ -315,7 +451,12 @@ func runBenchOnce(b gateBackend, bin, name string) (sample benchSample, detail s
 			if err := json.Unmarshal([]byte(rest), &r); err != nil {
 				return fail("parse %q: %v", line, err)
 			}
+			if r.Name != name || r.Iters < 1 || r.TotalNs <= 0 || r.NsPerOp <= 0 {
+				return fail("invalid benchmark record %+v for %q", r, name)
+			}
 			return benchSample{
+				iters:   r.Iters,
+				totalNs: r.TotalNs,
 				nsPerOp: r.NsPerOp,
 				userMs:  float64(userDur) / float64(time.Millisecond),
 				sysMs:   float64(sysDur) / float64(time.Millisecond),

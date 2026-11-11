@@ -37,13 +37,14 @@ func TestSharedPagesAliasAndDecommit(t *testing.T) {
 	if alias[0] != 0x5A || alias[len(alias)-1] != 0x5A {
 		t.Fatalf("alias bytes = %#x..%#x, want 0x5A", alias[0], alias[len(alias)-1])
 	}
-	// DiscardVirtualMemory can refuse section views. The zeroing must hold either way.
-	if err := DecommitSharedPages(pages); err != nil {
+	// DiscardVirtualMemory can return ERROR_INVALID_PARAMETER on mapped section views,
+	// while DecommitSharedPages must still zero the shared backing pages.
+	if err := DecommitSharedPages(pages); err != nil && !errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		var errno syscall.Errno
 		if !errors.As(err, &errno) {
-			t.Fatalf("DecommitSharedPages: %v", err)
+			t.Fatalf("DecommitSharedPages returned non-Errno error: %v", err)
 		}
-		t.Logf("DecommitSharedPages reported a missed reclaim: %v", err)
+		t.Fatalf("DecommitSharedPages = %v, want nil or ERROR_INVALID_PARAMETER", err)
 	}
 	for i, b := range pages {
 		if b != 0 {
@@ -55,6 +56,12 @@ func TestSharedPagesAliasAndDecommit(t *testing.T) {
 			t.Fatalf("alias[%d] = %#x after DecommitSharedPages, want 0", i, b)
 		}
 	}
+	// Verify that both views remain coherent after decommit.
+	alias[0] = 0xA5
+	alias[len(alias)-1] = 0x3C
+	if pages[0] != 0xA5 || pages[len(pages)-1] != 0x3C {
+		t.Fatalf("pages bytes after alias write = %#x..%#x, want 0xA5..0x3C", pages[0], pages[len(pages)-1])
+	}
 }
 
 func TestDecommitSharedPagesKeepsNeighbours(t *testing.T) {
@@ -63,12 +70,18 @@ func TestDecommitSharedPagesKeepsNeighbours(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocateSharedPages: %v", err)
 	}
-	defer ReleaseSharedPages(pages)
+	defer func() {
+		if err := ReleaseSharedPages(pages); err != nil {
+			t.Errorf("ReleaseSharedPages: %v", err)
+		}
+	}()
 	for i := range pages {
 		pages[i] = 0xC3
 	}
 	const page = 4096
-	_ = DecommitSharedPages(pages[page : 2*page])
+	if err := DecommitSharedPages(pages[page : 2*page]); err != nil && !errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		t.Fatalf("DecommitSharedPages: %v", err)
+	}
 	for i, b := range pages {
 		want := byte(0xC3)
 		if i >= page && i < 2*page {
@@ -95,13 +108,23 @@ func TestDefaultMemoryFileDecommitZeroesPages(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(uint64(hostarch.PageSize), AllocOpts{Kind: usage.Anonymous})
+	const allocSize = uint64(2 * hostarch.PageSize)
+	fr, err := mf.Allocate(allocSize, AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
+	}
+	if fr.Length() != allocSize {
+		t.Fatalf("fr.Length() = %d, want %d", fr.Length(), allocSize)
+	}
+	if !mf.HasUniqueRef(fr) {
+		t.Fatalf("HasUniqueRef(%v) = false, want true", fr)
 	}
 	bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatalf("MapInternal: %v", err)
+	}
+	if uint64(bs.NumBytes()) != allocSize {
+		t.Fatalf("MapInternal NumBytes = %d, want %d", bs.NumBytes(), allocSize)
 	}
 	slice := bs.Head().ToSlice()
 	for i := range slice {
@@ -114,7 +137,68 @@ func TestDefaultMemoryFileDecommitZeroesPages(t *testing.T) {
 			t.Fatalf("slice[%d] = %#x after Decommit, want 0", i, b)
 		}
 	}
+	// Verify that the mapping remains writable and visible across a second MapInternal call.
+	slice[0] = 0x42
+	slice[len(slice)-1] = 0x99
+	bs2, err := mf.MapInternal(fr, hostarch.Read)
+	if err != nil {
+		t.Fatalf("second MapInternal: %v", err)
+	}
+	slice2 := bs2.Head().ToSlice()
+	if slice2[0] != 0x42 || slice2[len(slice2)-1] != 0x99 {
+		t.Fatalf("second MapInternal bytes = %#x..%#x, want 0x42..0x99", slice2[0], slice2[len(slice2)-1])
+	}
 	mf.DecRef(fr)
+}
+
+func BenchmarkAllocateAndDecommitSharedPages(b *testing.B) {
+	const regionSize = 16 * 4096
+	pages, err := AllocateSharedPages(regionSize)
+	if err != nil {
+		b.Fatalf("AllocateSharedPages: %v", err)
+	}
+	defer func() {
+		if err := ReleaseSharedPages(pages); err != nil {
+			b.Fatalf("ReleaseSharedPages: %v", err)
+		}
+	}()
+	b.SetBytes(regionSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pages[0] = byte(i)
+		pages[len(pages)-1] = byte(i)
+		if err := DecommitSharedPages(pages); err != nil && !errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			b.Fatalf("DecommitSharedPages: %v", err)
+		}
+	}
+}
+
+func BenchmarkMemoryFileAllocateMapDecommit(b *testing.B) {
+	mf, err := NewDefaultMemoryFile(MemoryFileOpts{DisableMemoryAccounting: true})
+	if err != nil {
+		b.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	const allocSize = uint64(4 * hostarch.PageSize)
+	b.SetBytes(int64(allocSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fr, err := mf.Allocate(allocSize, AllocOpts{Kind: usage.Anonymous})
+		if err != nil {
+			b.Fatalf("Allocate: %v", err)
+		}
+		bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			b.Fatalf("MapInternal: %v", err)
+		}
+		head := bs.Head().ToSlice()
+		head[0] = byte(i)
+		mf.Decommit(fr)
+		mf.DecRef(fr)
+	}
 }
 
 func TestWindowsMultiChunkLoadFromAndDestroyReleasesKernelViews(t *testing.T) {
