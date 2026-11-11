@@ -154,6 +154,7 @@ The table below lists the available `rungv` subcommands.
 | `tag` | `rungv tag SOURCE_IMAGE[:TAG] TARGET_IMAGE[:TAG]` | Create a new tag for a cached image. |
 | `rmi` | `rungv rmi [-f] IMAGE [IMAGE...]` | Remove an image tag and clean up unused layer files. |
 | `save` / `load` | `rungv save -o FILE IMAGE...` / `rungv load -i FILE` | Export images to a `.tar` archive or import them on another machine. |
+| `checkpoint` / `restore` | `rungv checkpoint -socket PATH` / `rungv restore -dir DIR` | Checkpoint a running sandbox over its control socket (`snapshot`) or restore a checkpoint bundle (`resume`). |
 | `login` / `logout` | `rungv login [SERVER]` / `rungv logout [SERVER]` | Save or remove registry credentials in the Docker config store. |
 | `stub` | `rungv stub` | Check whether the `systrap` engine is ready on the current host. |
 | `tune` | `rungv tune list` | List the host-side tunables that `--tune` and `--tune-file` set. |
@@ -171,6 +172,7 @@ Use the `pkg/gvx` package to run isolated Linux workloads directly inside your o
 | `Argv` / `Envv` / `WorkDir` | `[]string` / `string` | Command arguments, `KEY=VALUE` environment variables, and working directory inside the container. |
 | `WorkspacePath` / `Mounts` | `string` / `[]gvx.Mount` | Host directory mounted at `/workspace`, plus additional bind, volume, or `tmpfs` mounts. |
 | `NetworkMode` / `PortForwards` | `gvx.NetworkMode` / `[]gvx.PortForward` | `NetModeNAT` (with optional TCP/UDP port forwards), `NetModeWireGuard`, or `NetModeNone`. |
+| `CheckpointDir` / `CheckpointListener` | `string` / `net.Listener` | Host directory and control listener pre-opened before lockdown for `Sandbox.Checkpoint` and `gvx.Restore`. |
 | `Resources` | `gvx.Resources` | Optional `MemoryBytes` limit and `CPUMillis` CPU quota. |
 
 > [!CAUTION]

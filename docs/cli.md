@@ -24,6 +24,8 @@ Run `rungv help` to print this list.
 | `rmi` | Remove a name of an image, or the image. |
 | `save` | Write images to a tar archive. |
 | `load` | Read images from a tar archive. |
+| `checkpoint` | Write a checkpoint bundle for a running sandbox over its control socket (alias: `snapshot`). |
+| `restore` | Restore and run a sandbox from a checkpoint bundle directory (alias: `resume`). |
 | `login` | Store the credentials of a registry. |
 | `logout` | Remove the credentials of a registry. |
 | `stub` | Probe the `systrap` engine of this host. |
@@ -83,6 +85,8 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `-registry-url URL` | Override the registry of the image reference. |
 | `--host-dns IP[:PORT]` | Name a DNS server of the host. The flag repeats. The servers replace the discovery of the host resolver for the DNS relay of the guest and for the registry requests. `pull` and `save` take it too. Section 5.2 gives the reason. |
 | `-cache-dir DIR` | Select the layer cache directory. |
+| `-checkpoint-dir DIR` | Pre-open a host directory before the lockdown for checkpoint bundle files. |
+| `-checkpoint-socket PATH` | Bind a Unix domain socket or loopback TCP listener before the lockdown for `rungv checkpoint`. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
 | `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, and `tag` take it. |
 | `--tune-file FILE` | Read host-side tunables from a JSON object. A `--tune` flag wins over the file. The same eight commands take it. |
@@ -299,6 +303,31 @@ Add a root that the system store lacks. The variable works on every host OS:
 
 ```sh
 SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO- https://registry.corp.example/
+```
+
+### 4.11 Checkpoint and restore
+
+`rungv` can save a running sandbox to a host directory and resume it in a new process. The host lockdown blocks new file opens and socket binds after the guest starts. The sandbox therefore opens the checkpoint files at `-checkpoint-dir` and binds the control listener at `-checkpoint-socket` before the lockdown applies.
+
+The bundle directory holds four files: `manifest.json`, `state.img`, `pages.meta`, and `pages.img`. `manifest.json` records the host OS, the CPU architecture, the active platform, the address holes, the EROFS layer digests, the mounts, and the network mode. `rungv restore` (or its alias `rungv resume`) validates `manifest.json` against the host and reopens the cached layers and mounts before it applies the lockdown.
+
+| Command or flag | Meaning |
+| :--- | :--- |
+| `rungv run -checkpoint-dir DIR -checkpoint-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before the lockdown. |
+| `rungv checkpoint -socket PATH [-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` is an alias). Without `-leave-running`, the sandbox stops and exits `0` after the save finishes. When `-dir` is set, the server verifies that it matches `-checkpoint-dir`. |
+| `rungv restore -dir DIR [flags]` | Restore a sandbox from `DIR` (`rungv resume` is an alias). Pass `-w` or `-workspace`, `-v`, `--mount`, `-p`, `-net`, `-wg-config`, `-checkpoint-dir`, and `-checkpoint-socket` to reattach mounts, network backends, or a new checkpoint listener. |
+
+> [!IMPORTANT]
+> Pass the same workspace and volume mounts to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the layer digests, the platform, or the network mode do not match `manifest.json`.
+
+1. Start a workload with `-checkpoint-dir` and `-checkpoint-socket`.
+2. Run `rungv checkpoint` in another terminal to write the bundle and stop the sandbox.
+3. Run `rungv restore` with `-dir` and the same mounts to resume the workload.
+
+```sh
+rungv run -checkpoint-dir=./ckpt -checkpoint-socket=./ckpt.sock -workspace=./work alpine:3.20 sh -c "sleep 30"
+rungv checkpoint -socket=./ckpt.sock -dir=./ckpt
+rungv restore -dir=./ckpt -w=./work
 ```
 
 ## 5. Images and registries

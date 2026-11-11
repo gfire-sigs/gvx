@@ -75,6 +75,8 @@ type runConfig struct {
 	cfg gvx.Config
 	// autoPlatform reports that the user left the backend selection to gvx.
 	autoPlatform bool
+	// checkpointSocket is the host path or loopback address for the checkpoint control listener.
+	checkpointSocket string
 }
 
 // shortBoolFlags are the one-letter flags that Docker lets a user cluster, as in -it.
@@ -206,6 +208,8 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	alias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
+	checkpointDirFlag := fs.String("checkpoint-dir", "", "Host directory pre-opened before lockdown for checkpoint output")
+	checkpointSocketFlag := fs.String("checkpoint-socket", "", "Host path or loopback address for the checkpoint control listener")
 
 	if err := fs.Parse(expandShortClusters(args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -378,6 +382,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		Stderr:                 stderr,
 		TTY:                    *ttyFlag || *itFlag,
 		DisableHostLockdown:    !*lockdownFlag,
+		CheckpointDir:          strings.TrimSpace(*checkpointDirFlag),
 	}
 	if len(guestArgs) > 0 {
 		if binPath != "" {
@@ -396,7 +401,11 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 			}
 		}
 	})
-	return runConfig{autoPlatform: backend == gvx.PlatformAuto, cfg: cfg}, 0, false
+	return runConfig{
+		autoPlatform:     backend == gvx.PlatformAuto,
+		cfg:              cfg,
+		checkpointSocket: strings.TrimSpace(*checkpointSocketFlag),
+	}, 0, false
 }
 
 // readEnvFile reads and parses one env file against the host environment.
@@ -415,8 +424,26 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return exitCode
 	}
 
+	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
+	var cleanupSocket func()
+	if rc.checkpointSocket != "" {
+		ln, sockCleanup, err := listenCheckpointSocket(rc.checkpointSocket)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "rungv run: listen checkpoint socket: %v\n", err)
+			return 1
+		}
+		rc.cfg.CheckpointListener = ln
+		cleanupSocket = sockCleanup
+	}
+	if cleanupSocket != nil {
+		defer cleanupSocket()
+	}
+
 	sb, err := gvx.New(ctx, rc.cfg)
 	if err != nil {
+		if rc.cfg.CheckpointListener != nil {
+			_ = rc.cfg.CheckpointListener.Close()
+		}
 		_, _ = fmt.Fprintf(stderr, "rungv run: init sandbox: %v\n", err)
 		if errors.Is(err, gvx.ErrInvalidConfig) {
 			return 2
@@ -426,6 +453,9 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	defer func() {
 		_ = sb.Close()
 	}()
+	stopControl := startCheckpointControl(ctx, sb, rc.cfg.CheckpointListener, cleanCkptDir, absCkptDir)
+	defer stopControl()
+
 	if rc.autoPlatform {
 		_, _ = fmt.Fprintf(stderr, "rungv: platform=%s\n", sb.PlatformName())
 		if reason := sb.FallbackReason(); reason != "" {
@@ -444,6 +474,7 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	}
 
 	exitCode, err = sb.Run(ctx)
+	stopControl()
 	if errors.Is(err, gvx.ErrMemoryLimit) {
 		_, _ = fmt.Fprintf(stderr, "rungv: the guest was killed: it passed the memory limit of %d bytes\n", rc.cfg.Resources.MemoryBytes)
 		return exitCode
