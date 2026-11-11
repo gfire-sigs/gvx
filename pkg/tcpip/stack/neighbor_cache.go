@@ -17,9 +17,12 @@ package stack
 import (
 	"fmt"
 
-	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/tcpip"
 )
+
+// NeighborCacheSize is the size of the neighborCache. Exceeding this size will
+// result in the least recently used entry being evicted.
+const NeighborCacheSize = 512 // max entries per interface
 
 // NeighborStats holds metrics for the neighbor table.
 type NeighborStats struct {
@@ -32,11 +35,10 @@ type NeighborStats struct {
 type dynamicCacheEntry struct {
 	lru neighborEntryList
 
-	// count tracks the amount of dynamic entries in the cache. Static
-	// entries do not count. The neighbor table of the stack adds the counts
-	// of its caches to apply gc_thresh1 to gc_thresh3. Writers hold the lock
-	// of the cache. The table reads count without the lock.
-	count atomicbitops.Int32
+	// count tracks the amount of dynamic entries in the cache. This is
+	// needed since static entries do not count towards the LRU cache
+	// eviction strategy.
+	count uint16
 }
 
 // +stateify savable
@@ -49,10 +51,10 @@ type neighborCacheMu struct {
 	dynamic dynamicCacheEntry
 }
 
-// neighborCache maps IP addresses to link addresses. The neighbor table of the
-// stack bounds the dynamic entries of all its caches with gc_thresh2 and
-// gc_thresh3 (see neighbor_gc_xplat.go). It contains the state machine and
-// configuration for running Neighbor Unreachability Detection (NUD).
+// neighborCache maps IP addresses to link addresses. It uses the Least
+// Recently Used (LRU) eviction strategy to implement a bounded cache for
+// dynamically acquired entries. It contains the state machine and configuration
+// for running Neighbor Unreachability Detection (NUD).
 //
 // There are two types of entries in the neighbor cache:
 //  1. Dynamic entries are discovered automatically by neighbor discovery
@@ -60,7 +62,7 @@ type neighborCacheMu struct {
 //     reachability with the device once the entry's state becomes Stale.
 //  2. Static entries are explicitly added by a user and have no expiration.
 //     Their state is always Static. The amount of static entries stored in the
-//     cache is unbounded, as the amount of NUD_PERMANENT entries in Linux.
+//     cache is unbounded.
 //
 // +stateify savable
 type neighborCache struct {
@@ -74,54 +76,13 @@ type neighborCache struct {
 // returned entry is always refreshed in the cache (it is reachable via the
 // map, and its place is bumped in LRU).
 //
-// If a matching entry exists in the cache, it is returned. Otherwise a new
-// entry with state incomplete is allocated and returned, unless the neighbor
-// table of the stack refuses it (see neighborTable.admitLocked). In that case
-// the function returns nil, as neigh_alloc fails in Linux.
+// If a matching entry exists in the cache, it is returned. If no matching
+// entry exists and the cache is full, an existing entry is evicted via LRU,
+// reset to state incomplete, and returned. If no matching entry exists and the
+// cache is not full, a new entry with state incomplete is allocated and
+// returned.
 func (n *neighborCache) getOrCreateEntry(remoteAddr tcpip.Address) *neighborEntry {
-	n.mu.Lock()
-	entry, ok := n.mu.cache[remoteAddr]
-	if ok {
-		n.bumpLocked(entry)
-	}
-	n.mu.Unlock()
-	if ok {
-		return entry
-	}
-
-	table := n.nic.stack.neighborTables.of(n.linkRes.LinkAddressProtocol())
-	table.allocMu.Lock()
-	defer table.allocMu.Unlock()
-	table.register(n)
-	if !table.admitLocked(n.nic.stack.clock) {
-		return nil
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if entry, ok := n.mu.cache[remoteAddr]; ok {
-		// A static entry for the address appeared in the meantime.
-		n.bumpLocked(entry)
-		return entry
-	}
-	// The entry that needs to be created must be dynamic since all static
-	// entries are directly added to the cache via addStaticEntry.
-	entry = newNeighborEntry(n, remoteAddr, n.state)
-	n.mu.cache[remoteAddr] = entry
-	n.mu.dynamic.lru.PushFront(entry)
-	n.mu.dynamic.count.Add(1)
-	return entry
-}
-
-// bumpLocked moves a dynamic entry to the front of the LRU list.
-//
-// +checklocks:n.mu.neighborCacheRWMutex
-func (n *neighborCache) bumpLocked(entry *neighborEntry) {
-	entry.mu.RLock()
-	if entry.mu.neigh.State != Static {
-		n.mu.dynamic.lru.Remove(entry)
-		n.mu.dynamic.lru.PushFront(entry)
-	}
-	entry.mu.RUnlock()
+	return n.getOrCreateDynamicEntry(remoteAddr)
 }
 
 // entry looks up neighbor information matching the remote address, and returns
@@ -207,7 +168,7 @@ func (n *neighborCache) addStaticEntry(addr tcpip.Address, linkAddr tcpip.LinkAd
 		if entry.mu.neigh.State != Static {
 			// Dynamic entry found with the same address.
 			n.mu.dynamic.lru.Remove(entry)
-			n.mu.dynamic.count.Add(-1)
+			n.mu.dynamic.count--
 		} else if entry.mu.neigh.LinkAddr == linkAddr {
 			// Static entry found with the same address and link address.
 			entry.mu.Unlock()
@@ -248,7 +209,7 @@ func (n *neighborCache) removeEntry(addr tcpip.Address) bool {
 
 	if entry.mu.neigh.State != Static {
 		n.mu.dynamic.lru.Remove(entry)
-		n.mu.dynamic.count.Add(-1)
+		n.mu.dynamic.count--
 	}
 
 	entry.removeLocked()
@@ -269,7 +230,7 @@ func (n *neighborCache) clear() {
 
 	n.mu.dynamic.lru = neighborEntryList{}
 	clear(n.mu.cache)
-	n.mu.dynamic.count.Store(0)
+	n.mu.dynamic.count = 0
 }
 
 // config returns the NUD configuration.
@@ -326,7 +287,8 @@ func (n *neighborCache) init(nic *nic, r LinkAddressResolver) {
 		linkRes: r,
 	}
 	n.mu.Lock()
-	// Don't presize the map: most caches only ever hold a few entries.
+	// Don't presize the map: most caches only ever hold a few entries, and
+	// NeighborCacheSize is enforced as an upper bound by getOrCreateEntry.
 	n.mu.cache = make(map[tcpip.Address]*neighborEntry)
 	n.mu.Unlock()
 }

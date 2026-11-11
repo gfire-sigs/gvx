@@ -241,13 +241,11 @@ seam pkg/sentry/socket/netlink/netfilter/protocol.go
 # IPSET does (pkg/sentry/socket/netlink/netfilter/ipset_xplat.go).
 seam pkg/sentry/socket/netlink/socket.go
 
-# Content seams: the neighbor tables obey gc_thresh1 to gc_thresh3 as Linux does
-# (pkg/tcpip/stack/neighbor_gc_xplat.go). The neighbor cache asks the table of the stack before it
-# adds a dynamic entry, a NIC that goes away leaves the table (one call in remove, nic.go, under the
-# seam above), and the dynamic count of a cache is atomic. The stack_state_autogen.go change follows
-# that count type.
+# Content seam: neighbor tables obey gc_thresh1 to gc_thresh3 as Linux does
+# (pkg/tcpip/stack/neighbor_gc_xplat.go). getOrCreateEntry delegates dynamic
+# allocation to getOrCreateDynamicEntry, entry and handleProbe guard nil
+# allocations, and nic.remove unregisters removed links under the nic.go seam.
 seam pkg/tcpip/stack/neighbor_cache.go
-seam pkg/tcpip/stack/stack_state_autogen.go
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
