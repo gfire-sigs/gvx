@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"sync/atomic"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -443,55 +442,6 @@ func (i *inode) statTo(stat *linux.Statx) {
 	stat.DevMajor = linux.UNNAMED_MAJOR
 	stat.DevMinor = i.fs.devMinor
 	stat.RdevMajor, stat.RdevMinor = i.Rdev()
-}
-
-// listXattr returns the xattr names visible to creds.
-func (i *inode) listXattr(creds *auth.Credentials, size uint64) ([]string, error) {
-	all, err := i.ListXattrs()
-	if err != nil {
-		return nil, err
-	}
-	// Hide the trusted namespace from unprivileged users, as Linux's
-	// fs/xattr.c:simple_xattr_list() does.
-	haveCap := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
-	names := all[:0]
-	listSize := 0
-	for _, n := range all {
-		if !haveCap && strings.HasPrefix(n, linux.XATTR_TRUSTED_PREFIX) {
-			continue
-		}
-		names = append(names, n)
-		listSize += len(n) + 1
-	}
-	if size != 0 && uint64(listSize) > size {
-		return nil, linuxerr.ERANGE
-	}
-	return names, nil
-}
-
-// getXattr returns the value of the xattr opts.Name.
-func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
-	// Linux applies the file permission test before any namespace specific
-	// test; see fs/xattr.c:xattr_permission().
-	if vfs.XattrReadNeedsFilePermission(opts.Name) {
-		if err := i.checkPermissions(creds, vfs.MayRead); err != nil {
-			return "", err
-		}
-	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayRead, linux.FileMode(i.Mode()), auth.KUID(i.UID()), opts.Name); err != nil {
-		return "", err
-	}
-	value, err := i.GetXattr(opts.Name)
-	if err != nil {
-		return "", err
-	}
-	if opts.Size != 0 && uint64(len(value)) > opts.Size {
-		return "", linuxerr.ERANGE
-	}
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
-		return auth.FixupVfsCapDataOnGet(creds, string(value))
-	}
-	return string(value), nil
 }
 
 func (i *inode) fileType() uint16 {
