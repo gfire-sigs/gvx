@@ -393,17 +393,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 		sysmsgThreads:     make(map[uint32]*sysmsgThread),
 	}
 	sp.subprocessRefs.InitRefs()
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	// Initialize the syscall thread.
-	ptraceThread, err := create()
-	if err != nil {
-		return nil, err
-	}
-	sp.sysmsgInitRegs = ptraceThread.initRegs
-
-	if err := sp.initSyscallThread(ptraceThread, seccompNotify); err != nil {
+	if err := sp.initPtraceSyscallThread(create, seccompNotify); err != nil {
 		return nil, err
 	}
 
@@ -415,7 +405,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 				close(stop.done)
 				return
 			}
-			sp.handlePtraceSyscallRequest(req)
+			sp.runPtraceSyscallRequest(req)
 		}
 
 		// Requests should never be closed.
@@ -1185,7 +1175,15 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 			s.sysmsgStackPool.Put(p.sysmsgStackID)
 		}
 	}()
+	if err := s.runSysmsgThreadInit(p); err != nil {
+		return err
+	}
+	success = true
+	return nil
+}
 
+func (s *subprocess) initSysmsgThread(p *thread) error {
+	success := false
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if err := p.attach(); err != nil {

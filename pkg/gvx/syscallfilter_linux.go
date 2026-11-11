@@ -36,6 +36,13 @@ import (
 // its image file is open already.
 func (s *Sandbox) syscallFilter() func() error {
 	return func() error {
+		// Landlock is active when InstallSyscallFilter runs; refresh the source
+		// stub before seccomp blocks clone so PTRACE_SEIZE shares the domain.
+		if refresher, ok := s.plat.(interface{ RefreshSourceForLockdown() error }); ok {
+			if err := refresher.RefreshSourceForLockdown(); err != nil {
+				return err
+			}
+		}
 		opt := config.Options{
 			Platform:       s.plat.SeccompInfo(),
 			HostNetwork:    s.cfg.NetworkMode == NetModeNAT,
@@ -160,6 +167,14 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
+		})
+		// hostfs opens entries beneath pinned directory descriptors with
+		// openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS).
+		rules.Add(unix.SYS_OPENAT2, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.SizeofOpenHow),
 		})
 	}
 	if volumes {

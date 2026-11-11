@@ -362,7 +362,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "internal/lockdownprobe/cmd/lockdownprobe",
 		tier:      Tier1Additive,
-		allowed:   []string{"internal/lockdownprobe", "pkg/gvx", "pkg/hostlockdown", "pkg/netbackend", "pkg/tcpip/*"},
+		allowed:   []string{"internal/lockdownprobe", "pkg/gvx", "pkg/hostlockdown", "pkg/netbackend", "pkg/tcpip/*", xSysUnix},
 		forbidden: append([]string{pkgSentryAll, "pkg/oci/*"}, runtimeOuterBans...),
 	},
 	{

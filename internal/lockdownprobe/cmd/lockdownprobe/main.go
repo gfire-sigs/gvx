@@ -114,6 +114,8 @@ func run() int {
 	var guestOut bytes.Buffer
 	cfg.Stdout = &guestOut
 	cfg.Stderr = os.Stderr
+	dirProbe := openDirfdProbe(*workspace, *outsideFile)
+	defer dirProbe.close()
 	sb, err := gvx.New(context.Background(), cfg)
 	if err != nil {
 		rep.NewErr = err.Error()
@@ -135,6 +137,7 @@ func run() int {
 	if err := os.WriteFile(filepath.Join(*outsideDir, "escape.txt"), []byte("escaped"), 0o600); err != nil {
 		rep.WriteOutsideErr = err.Error()
 	}
+	dirProbe.run(&rep)
 	spawn := exec.Command(os.Args[0])
 	spawn.Env = append(os.Environ(), childEnv+"=1")
 	if err := spawn.Run(); err != nil {

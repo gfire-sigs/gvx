@@ -107,7 +107,7 @@ func openatRetry(dirfd int, name string, flags int, perm uint32) (int, error) {
 	var fd int
 	err := retryEINTR(func() error {
 		var oerr error
-		fd, oerr = unix.Openat(dirfd, name, flags, perm)
+		fd, oerr = hostOpenat(dirfd, name, flags, perm)
 		return oerr
 	})
 	return fd, err

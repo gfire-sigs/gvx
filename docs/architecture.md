@@ -553,15 +553,15 @@ The sandbox applies the image settings with Docker rules. The `Entrypoint` and `
 
 ### 3.7 Secure Host File System Driver: `pkg/sentry/fsimpl/hostfs`
 
-`fsimpl/hostfs` replaces `pkg/sentry/fsimpl/gofer` (`lisafs`) to mount the host `/workspace` directory on Windows and macOS without spawning an external file-server process. It also runs on Linux, where it uses `os.Root` and `openat` in the same way. A run can mount many host directories. The mount at `/workspace` is one of them, and the `-v` bind mounts and the named volumes are the others. Each directory has its own `os.Root` handle and its own `.gvx_meta` writer. A host directory nested inside another mounted host directory keeps its own table. When a non-aligned layout lets the guest reach one file through both mounts, the two views can show different metadata for that file. An aligned layout has no overlap, because the inner mount covers the outer copy. A bind mount can also name one host file. See "Single-File Mount" below.
+`fsimpl/hostfs` replaces `pkg/sentry/fsimpl/gofer` (`lisafs`) to mount the host `/workspace` directory on Windows and macOS without spawning an external file-server process. It also runs on Linux, where it uses `os.Root` and `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` (falling back to `O_NOFOLLOW` `openat` on `ENOSYS` or Android). A run can mount many host directories. The mount at `/workspace` is one of them, and the `-v` bind mounts and the named volumes are the others. Each directory has its own `os.Root` handle and its own `.gvx_meta` writer. A host directory nested inside another mounted host directory keeps its own table. When a non-aligned layout lets the guest reach one file through both mounts, the two views can show different metadata for that file. An aligned layout has no overlap, because the inner mount covers the outer copy. A bind mount can also name one host file. See "Single-File Mount" below.
 
 #### Handle-Scoped Traversal and POSIX Adaptation (Descriptive Module)
 
-`hostfs` anchors the workspace mount using `os.OpenRoot(hostWorkspacePath)` before sandbox lockdown. On Windows (`inode_windows.go`), every file open invokes `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` pinned to the `os.Root` handle and enforces `FILE_OPEN_REPARSE_POINT`. On macOS (`inode_darwin.go`), `os.OpenRoot` uses `openat(dirfd, ..., O_NOFOLLOW | O_SYMLINK)` so the XNU kernel never traverses symbolic links or firmlinks pointing outside `/workspace`.
+`hostfs` anchors the workspace mount using `os.OpenRoot(hostWorkspacePath)` before sandbox lockdown. On Windows (`inode_windows.go`), every file open invokes `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` pinned to the `os.Root` handle and enforces `FILE_OPEN_REPARSE_POINT`. On macOS (`inode_darwin.go`), `os.OpenRoot` uses `openat(dirfd, ..., O_NOFOLLOW | O_SYMLINK)` so the XNU kernel never traverses symbolic links or firmlinks pointing outside `/workspace`. On Linux (`openat_linux.go`), `hostfs` calls `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` and falls back to single-component `O_NOFOLLOW` `openat` on `ENOSYS` or Android.
 
 On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` on open files via `NtSetInformationFile(FileRenameInformationEx)` with `FILE_RENAME_POSIX_SEMANTICS`, and `unlink(2)` via `FileDispositionInfoEx`. NTFS refuses to rename a directory that has an open descendant, so `hostfs` closes and reopens the descendant handles around the rename. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table to `.gvx_meta` as an append-only journal. See "Extended Operations and Durability" below.
 
-`hostfs` opens a child through a pinned handle of its parent directory, with `NtCreateFile` and `RootDirectory` on Windows and `openat` on Unix. A lookup of one name then makes one host call, and a path of depth `D` no longer walks from the root at each level. A `Workspace` owns the pinned handles, caps them at 256, and closes idle handles after 5 seconds. It closes the handles in a subtree before a directory rename or a directory removal. Windows refuses to rename or remove a directory with an open handle.
+`hostfs` opens a child through a pinned handle of its parent directory, with `NtCreateFile` and `RootDirectory` on Windows, `openat2` on Linux, and `openat` elsewhere. A lookup of one name then makes one host call, and a path of depth `D` no longer walks from the root at each level. A `Workspace` owns the pinned handles, caps them at 256, and closes idle handles after 5 seconds. It closes the handles in a subtree before a directory rename or a directory removal. Windows refuses to rename or remove a directory with an open handle.
 
 Every lookup, mutation, and listing of an entry uses the pinned handle of the directory that holds it. The host backend takes the handle and one name for `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`, `utimensat`, and the listing, and it refuses a name with a separator. These calls make one host call for the name at any depth. A handle follows its directory when a host process moves it, so each pinned handle gets one `lstat` of its name in the parent directory after the cache lifetime. A handle whose name now holds another object retires with its subtree, and the next call opens the new directory. A host swap of a directory therefore reaches every call after 1 second at the latest. A descriptor that the guest opened below the directory before the swap keeps the old directory, as `openat` on an open directory does on POSIX.
 
@@ -595,13 +595,13 @@ On APFS, a lookup that misses the exact name falls back to the NFC form of the n
 
 #### Single-File Mount (Descriptive Module)
 
-`OpenWorkspace` accepts the path of a regular file. It resolves links in the path, pins the parent directory with `os.OpenRoot`, and stores the exact file name. The root of the mounted filesystem is that file, so the guest sees no sibling entry. Seatbelt grants a `literal` rule for that file on macOS. On Windows, the sealed file broker authorizes opens for that stored name only and modifies no host ACL or label.
+`OpenWorkspace` accepts the path of a regular file. It resolves links in the path, pins the parent directory with `os.OpenRoot`, and stores the exact file name. The root of the mounted filesystem is that file, so the guest sees no sibling entry. The lockdown grants the one file only: a Seatbelt `literal` rule on macOS, and a Landlock rule on the file descriptor on Linux. On Windows, the sealed file broker authorizes opens for that stored name only and modifies no host ACL or label.
 
 The mode writes no `.gvx_meta`, because the parent directory belongs to the user. The mode, the owner, and the extended attributes that the guest sets stay in memory and reset at the next start. A change of the times reaches the host file. The guest mount point is an empty regular file. A `unlink` or a `rename` of the mount point returns `EBUSY`, because the mount point lies in the outer filesystem. A `link` to the file returns `EXDEV`.
 
 On Windows, single-file mode never calls `GetFinalPathNameByHandle` on the bound file after the lockdown. `OpenWorkspace` resolves the stored name before the lockdown instead. `NtQueryVolumeInformationFile` reads the volume numbers from the pinned parent handle without a path query.
 
-A host editor can replace the file with an atomic rename. Each fresh open resolves the stored name again and reaches the new file. A file description that is open keeps its handle and so keeps the old file. The host watcher polls the one file by name in this mode.
+On macOS or with `-lockdown=false`, a host editor can replace the file with an atomic rename, and fresh opens reach the new file. On Linux and Windows under lockdown, Landlock and file ACLs bind the original file, so atomic replacement requires a directory mount or `-lockdown=false`. An open file description keeps its handle and so keeps the old file. The host watcher polls the one file by name in this mode.
 
 #### Host Event Bridge (Descriptive Module)
 
@@ -696,7 +696,7 @@ The meta store holds at most 4 KiB of names and values for one inode, and it fai
 
 ### 3.8 Volume File System: `pkg/sentry/fsimpl/ext4lite`
 
-`fsimpl/ext4lite` stores a named volume in one host file. The sandbox opens that file before the host lockdown. After the lockdown, the volume needs no host path and no new host handle. A sandbox that has only ext4lite volumes therefore reports `UnboundFileOpenBlocked`, also on Linux.
+`fsimpl/ext4lite` stores a named volume in one host file. The sandbox opens that file before the host lockdown. After the lockdown, the volume needs no host path and no new host handle. A sandbox that has only ext4lite volumes therefore reports `UnboundFileOpenBlocked`, also on Android.
 
 #### Image Layout (Descriptive Module)
 
@@ -800,7 +800,7 @@ A volume file is untrusted input. `isValidDataBlock` rejects every block that ov
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `fsimpl/ext4lite`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go. Scopes all `/workspace` opens to the `os.Root` handle. Keeps each volume inside one pre-opened host file. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. The host directories of the mounts are the only bound files. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, Linux Landlock and seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. The host directories and files of the mounts are the only bound paths. |
 
 ```mermaid
 stateDiagram-v2
@@ -808,7 +808,7 @@ stateDiagram-v2
     PreInit --> HandlesOpen: Open Hypervisor (WHPX/HVF) or Pre-Spawn systrap Stub, .erofs Layers, Sockets, and /workspace os.Root
     HandlesOpen --> WinLockdown: Windows: Pinned Broker + SE_PRIVILEGE_REMOVED + NULL_SID Token + JobObject + NoWin32k
     HandlesOpen --> MacLockdown: macOS: sandbox_init Seatbelt Profile (deny process-fork/exec/file-*) + RLIMIT_NPROC=0
-    HandlesOpen --> LinuxLockdown: Linux: PR_SET_NO_NEW_PRIVS + seccomp allowlist of the runsc Sentry on every thread (other calls kill the process)
+    HandlesOpen --> LinuxLockdown: Linux: Landlock FS ruleset + PR_SET_NO_NEW_PRIVS + seccomp allowlist on every thread
     WinLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
     MacLockdown --> GuestRunning: Enter Guest ELF Entrypoint (arm64 or amd64)
     LinuxLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
@@ -846,19 +846,21 @@ Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framew
 
 `rungv` and `pkg/gvx` enable the lockdown by default. The option `-lockdown=false` opts out and prints a warning.
 
-#### Linux Lockdown Sequence (`lockdown_linux.go` and `syscallfilter_linux.go`) (Procedural Module)
+#### Linux Lockdown Sequence (`landlock_linux.go`, `lockdown_linux.go`, and `syscallfilter_linux.go`) (Procedural Module)
 
-Execute these steps after the `systrap` platform, the cached `.erofs` layer descriptors, the network sockets, and the `/workspace` directory exist. The lockdown reuses the seccomp allowlist of the gVisor Sentry in `runsc/boot/filter`. `pkg/hostlockdown` must not import the Sentry. Therefore `pkg/gvx` builds the program and passes it in `Options.InstallSyscallFilter`.
+Execute these steps after the `systrap` platform, the cached `.erofs` layer descriptors, the network sockets, and the `/workspace` directory exist. The lockdown applies Landlock LSM path rules first and then installs the seccomp allowlist of `runsc/boot/filter`. `pkg/hostlockdown` must not import the Sentry, so `pkg/gvx` builds the seccomp program and passes it in `Options.InstallSyscallFilter`.
 
-1. Build the rules with `config.Rules`. Pass the `SeccompInfo` of the `systrap` platform. Enable the host network rules for `-net=nat`. Enable the host filesystem rules when a workspace, a bind mount, or a hostfs volume exists.
-2. Merge the embedder rules of `gvx`. They allow `fcntl` with close-on-exec, `renameat`, and `sched_getaffinity`. An `ext4lite` volume adds `flock` with `LOCK_UN`. NAT adds sockets with protocol 0. WireGuard adds `sendto` and `recvfrom`. A cgo build sets `CgoEnabled` and adds the thread start of the C library: `clone` with the `pthread_create` flags, `prctl(PR_PAC_RESET_KEYS)`, and private `FUTEX_WAIT_BITSET`. It returns `ENOSYS` for `clone3`, so the C library falls back to `clone`.
-3. Add a last rule set that returns `EPERM` for `execve`, `execveat`, `clone`, `openat`, and `socket`. It applies only when no allow rule matched. Every other call outside the allowlist kills the process.
-4. Install the program on every thread with `seccomp(SECCOMP_FILTER_FLAG_TSYNC)`. The call sets `PR_SET_NO_NEW_PRIVS` first.
-5. Probe the result. `execve` and `clone` must fail with `EPERM`. An `openat` relative to the working directory must fail with `EPERM`. A TCP `socket` must fail unless the options allow outbound traffic.
+1. Create a Landlock filesystem ruleset for `Options.Mounts` masked to the kernel Landlock ABI.
+2. Restrict all process threads with that Landlock ruleset before seccomp blocks the Landlock calls.
+3. Build the seccomp rules with `config.Rules` for the `systrap` platform, network mode, and host mounts.
+4. Merge the embedder rules (`fcntl`, `sched_getaffinity`, `renameat`, `openat2`, `flock`, sockets, and cgo thread calls).
+5. Append the `EPERM` fallback rule set for `execve`, `execveat`, `clone`, `openat`, and `socket`.
+6. Install the seccomp program on every thread with `seccomp(SECCOMP_FILTER_FLAG_TSYNC)`.
+7. Probe `execve`, `clone`, `openat` (working directory and root descriptor), and `socket` to verify containment.
 
 #### Linux Lockdown Limits (Descriptive Module)
 
-Seccomp reads no path. A workspace or a hostfs mount needs `openat` relative to a directory descriptor, and that call can open an absolute path. gVisor closes this gap with a mount namespace and `chroot`. A library cannot create them without privilege, because the Go runtime runs many threads. `Status.UnboundFileOpenBlocked` is therefore false on Linux when a bind mount, a workspace, or a hostfs volume exists. It is true when the guest has only `ext4lite` volumes and tmpfs mounts. The filter then has no rule for `openat`.
+Landlock confines `openat` and `openat2` calls to `Options.Mounts`, and `hostfs` opens entries on Linux with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`. `Status.UnboundFileOpenBlocked` is therefore true on Linux with or without host mounts. On Android, the `untrusted_app` seccomp policy of Zygote sends `SIGSYS` on Landlock calls. `pkg/hostlockdown` skips Landlock on Android and relies on SELinux and per-app mount namespaces. `Status.UnboundFileOpenBlocked` stays false on Android when a host mount exists.
 
 Seccomp cannot read a socket address. The filter cannot pin the WireGuard peer port the way the Seatbelt profile does. The `EPERM` rule set keeps the process alive where `runsc` kills it. Code in the embedding process then sees an error from `os/exec`, `os.Open`, or `net.Dial`. The Go runtime also opens cgroup files once a second to adjust `GOMAXPROCS`, and it accepts a failure.
 

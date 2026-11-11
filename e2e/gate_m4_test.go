@@ -710,9 +710,9 @@ func TestE2EGateM4LockdownDefaultBlocksSubprocess(t *testing.T) {
 			if !rep.Lockdown.Applied || !rep.LockedAPI {
 				t.Errorf("default run: Lockdown.Applied=%v IsLockedDown=%v, want both true", rep.Lockdown.Applied, rep.LockedAPI)
 			}
-			// The Linux seccomp filter cannot read paths, so a workspace keeps
-			// opens relative to a directory descriptor, and the status says so.
-			wantUnbound := runtime.GOOS != "linux" && runtime.GOOS != "android"
+			// Android skips Landlock under the Zygote seccomp policy, so a workspace
+			// leaves descriptor-relative opens unblocked only on Android.
+			wantUnbound := runtime.GOOS != "android"
 			if !rep.Lockdown.SubprocessBlocked || rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
 				t.Errorf("default run: lockdown status %+v, want a subprocess block and UnboundFileOpenBlocked=%v", rep.Lockdown, wantUnbound)
 			}

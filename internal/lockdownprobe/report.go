@@ -45,6 +45,17 @@ type Report struct {
 	// OutsideReadBytes is the content that the outside read returned.
 	OutsideReadBytes string
 
+	// DirfdProbed reports that the probe pre-opened directory descriptors
+	// before gvx.New and ran descriptor-relative probes after lockdown.
+	DirfdProbed bool
+	// RootDirfdReadErr and WorkspaceEscapeErr hold the OS error text from
+	// opening -outside-file through "/" and "../" from -workspace.
+	RootDirfdReadErr   string
+	WorkspaceEscapeErr string
+	// WorkspaceRWProbeErr holds any error from creating, writing, reading,
+	// and unlinking a probe file inside the mounted -workspace directory.
+	WorkspaceRWProbeErr string
+
 	// DialAttempted reports that the probe dialed -dial-target after the
 	// lockdown. DialErr is the OS error text, empty when the dial worked.
 	DialAttempted bool
