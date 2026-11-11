@@ -38,11 +38,25 @@ import (
 // /sys/block. Here each entry is a directory with the same files.
 
 // blockDirKey names a disk in one of the three directories.
-type blockDirKey func(*blockdev.Device) string
+//
+// +stateify savable
+type blockDirKey int
 
-func byDiskName(d *blockdev.Device) string { return d.Name }
+const (
+	byDiskName blockDirKey = iota
+	byDiskNumber
+)
 
-func byDiskNumber(d *blockdev.Device) string { return fmt.Sprintf("%d:%d", d.Major, d.Minor) }
+func (k blockDirKey) format(d *blockdev.Device) string {
+	switch k {
+	case byDiskName:
+		return d.Name
+	case byDiskNumber:
+		return fmt.Sprintf("%d:%d", d.Major, d.Minor)
+	default:
+		return ""
+	}
+}
 
 // blockDisks returns the disks of the kernel of the reader.
 func blockDisks(ctx context.Context) *blockdev.Registry {
@@ -50,6 +64,8 @@ func blockDisks(ctx context.Context) *blockdev.Registry {
 }
 
 // blockListDir is a directory with one subdirectory for each disk.
+//
+// +stateify savable
 type blockListDir struct {
 	dir
 
@@ -72,7 +88,7 @@ func (fs *filesystem) newBlockListDir(ctx context.Context, creds *auth.Credentia
 func (d *blockListDir) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
 	registry := blockDisks(ctx)
 	for _, disk := range registry.Devices() {
-		if d.key(disk) == name {
+		if d.key.format(disk) == name {
 			return d.fs.newDiskDir(ctx, d.creds, registry, disk), nil
 		}
 	}
@@ -85,7 +101,7 @@ func (d *blockListDir) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.I
 	base := offset - relOffset
 	for i := int(relOffset); i < len(disks); i++ {
 		dirent := vfs.Dirent{
-			Name:    d.key(disks[i]),
+			Name:    d.key.format(disks[i]),
 			Type:    linux.DT_DIR,
 			Ino:     d.fs.NextIno(),
 			NextOff: base + int64(i) + 1,
@@ -99,44 +115,88 @@ func (d *blockListDir) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.I
 
 // diskDir is the directory of one disk. The dentry stays valid while the disk
 // exists.
+//
+// +stateify savable
 type diskDir struct {
 	dir
 
-	registry *blockdev.Registry
-	disk     *blockdev.Device
+	diskName string
+	major    uint32
+	minor    uint32
+	registry *blockdev.Registry `state:"nosave"`
+	disk     *blockdev.Device   `state:"nosave"`
 }
 
 var _ kernfs.Inode = (*diskDir)(nil)
 
 // Valid implements kernfs.Inode.Valid.
 func (d *diskDir) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
-	return d.registry.Find(d.disk.Name) == d.disk
+	if d.registry != nil && d.disk != nil {
+		return d.registry.Find(d.disk.Name) == d.disk
+	}
+	got := blockDisks(ctx).Find(d.diskName)
+	return got != nil && got.Major == d.major && got.Minor == d.minor
 }
 
-// diskFile is a file of a disk directory. gen writes the content.
+// diskFileKind selects how diskFile generates its line.
+//
+// +stateify savable
+type diskFileKind int
+
+const (
+	diskFileConstant diskFileKind = iota
+	diskFileSize
+	diskFileStat
+)
+
+// diskFile is a file of a disk directory.
+//
+// +stateify savable
 type diskFile struct {
 	kernfs.DynamicBytesFile
 
-	gen func(buf *bytes.Buffer)
+	kind     diskFileKind
+	diskName string
+	constant string
 }
 
 var _ vfs.DynamicBytesSource = (*diskFile)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *diskFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	f.gen(buf)
-	return nil
+	switch f.kind {
+	case diskFileConstant:
+		buf.WriteString(f.constant)
+		buf.WriteByte('\n')
+		return nil
+	case diskFileSize:
+		disk := blockDisks(ctx).Find(f.diskName)
+		if disk == nil {
+			return linuxerr.ENOENT
+		}
+		fmt.Fprintf(buf, "%d\n", disk.Sectors())
+		return nil
+	case diskFileStat:
+		disk := blockDisks(ctx).Find(f.diskName)
+		if disk == nil {
+			return linuxerr.ENOENT
+		}
+		writeDiskStat(buf, disk.Stats.Snapshot())
+		return nil
+	default:
+		return linuxerr.EINVAL
+	}
 }
 
-func (fs *filesystem) newDiskFile(ctx context.Context, creds *auth.Credentials, gen func(buf *bytes.Buffer)) kernfs.Inode {
-	f := &diskFile{gen: gen}
+func (fs *filesystem) newDiskFile(ctx context.Context, creds *auth.Credentials, kind diskFileKind, diskName, constant string) kernfs.Inode {
+	f := &diskFile{kind: kind, diskName: diskName, constant: constant}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), f, 0444)
 	return f
 }
 
 // constantDiskFile returns a file that always holds the line value.
 func (fs *filesystem) constantDiskFile(ctx context.Context, creds *auth.Credentials, value string) kernfs.Inode {
-	return fs.newDiskFile(ctx, creds, func(buf *bytes.Buffer) { buf.WriteString(value + "\n") })
+	return fs.newDiskFile(ctx, creds, diskFileConstant, "", value)
 }
 
 // writeDiskStat writes the 17 fields of /sys/block/<disk>/stat, each padded to
@@ -158,14 +218,10 @@ func (fs *filesystem) newDiskDir(ctx context.Context, creds *auth.Credentials, r
 	}
 	sectorSize := strconv.Itoa(blockdev.SectorSize)
 	contents := map[string]kernfs.Inode{
-		"dev": fs.constantDiskFile(ctx, creds, fmt.Sprintf("%d:%d", disk.Major, disk.Minor)),
-		"size": fs.newDiskFile(ctx, creds, func(buf *bytes.Buffer) {
-			fmt.Fprintf(buf, "%d\n", disk.Sectors())
-		}),
+		"dev":  fs.constantDiskFile(ctx, creds, fmt.Sprintf("%d:%d", disk.Major, disk.Minor)),
+		"size": fs.newDiskFile(ctx, creds, diskFileSize, disk.Name, ""),
 		// The line has the 17 fields of Linux 5.5 and later, each padded to 8 characters.
-		"stat": fs.newDiskFile(ctx, creds, func(buf *bytes.Buffer) {
-			writeDiskStat(buf, disk.Stats.Snapshot())
-		}),
+		"stat":             fs.newDiskFile(ctx, creds, diskFileStat, disk.Name, ""),
 		"ro":               fs.constantDiskFile(ctx, creds, readOnly),
 		"removable":        fs.constantDiskFile(ctx, creds, "0"),
 		"hidden":           fs.constantDiskFile(ctx, creds, "0"),
@@ -178,7 +234,13 @@ func (fs *filesystem) newDiskDir(ctx context.Context, creds *auth.Credentials, r
 			"hw_sector_size":      fs.constantDiskFile(ctx, creds, sectorSize),
 		}),
 	}
-	d := &diskDir{registry: registry, disk: disk}
+	d := &diskDir{
+		diskName: disk.Name,
+		major:    disk.Major,
+		minor:    disk.Minor,
+		registry: registry,
+		disk:     disk,
+	}
 	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
 	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	d.InitRefs()

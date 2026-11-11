@@ -35,6 +35,8 @@ import (
 // read these values.
 
 // kmsgSysctlKind selects the file that a kmsgSysctl serves.
+//
+// +stateify savable
 type kmsgSysctlKind int
 
 const (
@@ -49,6 +51,8 @@ const (
 
 // kmsgSysctl implements vfs.WritableDynamicBytesSource for the sysctl files of
 // the kernel log.
+//
+// +stateify savable
 type kmsgSysctl struct {
 	kernfs.DynamicBytesFile
 
@@ -115,7 +119,12 @@ func (f *kmsgSysctl) Write(ctx context.Context, _ *vfs.FileDescription, src user
 	defer sysctlWriteMu.Unlock()
 	switch f.kind {
 	case kmsgDmesgRestrict:
-		if !auth.CredentialsFromContext(ctx).HasCapabilityIn(linux.CAP_SYS_ADMIN, k.RootUserNamespace()) {
+		creds := auth.CredentialsFromContext(ctx)
+		rootNS := k.RootUserNamespace()
+		if rootNS == nil {
+			rootNS = creds.UserNamespace
+		}
+		if !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, rootNS) {
 			return 0, linuxerr.EPERM
 		}
 		cur := "0"

@@ -16,6 +16,7 @@ package proc
 
 import (
 	"bytes"
+	goContext "context"
 	"fmt"
 	"math"
 	"runtime"
@@ -64,8 +65,58 @@ type sysctlStore interface {
 	SetSysctlValue(key, value string)
 }
 
+// sysctlID identifies a stored sysctl entry in sysctlTable across save and
+// restore without serializing parse or apply closures.
+//
+// +stateify savable
+type sysctlID int
+
+const (
+	sysctlVMOvercommitMemory sysctlID = iota + 1
+	sysctlVMPanicOnOOM
+	sysctlKernelPanic
+	sysctlKernelPanicOnOops
+	sysctlKernelShmRmidForced
+	sysctlKernelKeysRootMaxKeys
+	sysctlKernelKeysRootMaxBytes
+	sysctlIPv4UnprivilegedPortStart
+	sysctlIPv4TCPSynCookies
+	sysctlIPv4PingGroupRange
+	sysctlIPv4LocalReservedPorts
+	sysctlIPv4TCPKeepaliveTime
+	sysctlIPv4TCPKeepaliveIntvl
+	sysctlIPv4TCPKeepaliveProbes
+	sysctlIPv4TCPFinTimeout
+	sysctlIPv4NeighGCThresh1
+	sysctlIPv4NeighGCThresh2
+	sysctlIPv4NeighGCThresh3
+	sysctlIPv6NeighGCThresh1
+	sysctlIPv6NeighGCThresh2
+	sysctlIPv6NeighGCThresh3
+
+	sysctlConntrackTimeoutBase   sysctlID = 100
+	sysctlConntrackTCPMaxRetrans sysctlID = 150
+	sysctlIPv4ConfAllBase        sysctlID = 300
+	sysctlIPv4ConfDefaultBase    sysctlID = 400
+	sysctlIPv4NeighDefaultBase   sysctlID = 500
+)
+
+var sysctlTable = make(map[sysctlID]*sysctlSpec)
+
+func registerSysctlSpec(spec *sysctlSpec) *sysctlSpec {
+	if spec.id <= 0 {
+		panic(fmt.Sprintf("sysctl %q missing deterministic sysctlID", spec.key))
+	}
+	if prev, dup := sysctlTable[spec.id]; dup {
+		panic(fmt.Sprintf("duplicate sysctlID %d for %q and %q", spec.id, prev.key, spec.key))
+	}
+	sysctlTable[spec.id] = spec
+	return spec
+}
+
 // sysctlSpec describes one stored sysctl file.
 type sysctlSpec struct {
+	id    sysctlID
 	scope sysctlScope
 	// name is the name of the file in its directory.
 	name string
@@ -86,9 +137,21 @@ type sysctlSpec struct {
 var sysctlWriteMu sync.Mutex
 
 // valueStore is the sysctlStore of a scope that has no namespace object.
+//
+// +stateify savable
 type valueStore struct {
-	mu     sync.Mutex
+	mu     sync.Mutex `state:"nosave"`
 	values map[string]string
+}
+
+// afterLoad is invoked by stateify.
+func (s *valueStore) afterLoad(ctx goContext.Context) {
+	if ctx == nil {
+		return
+	}
+	if k, ok := ctx.Value(kernel.CtxKernel).(*kernel.Kernel); ok && k != nil {
+		attachNodeStore(k, s)
+	}
 }
 
 // SysctlValue implements sysctlStore.SysctlValue.
@@ -137,6 +200,23 @@ func nodeStore(k *kernel.Kernel) *valueStore {
 	return s
 }
 
+func attachNodeStore(k *kernel.Kernel, s *valueStore) {
+	key := weak.Make(k)
+	nodeStores.mu.Lock()
+	defer nodeStores.mu.Unlock()
+	if nodeStores.stores == nil {
+		nodeStores.stores = make(map[weak.Pointer[kernel.Kernel]]*valueStore)
+	}
+	if _, exists := nodeStores.stores[key]; !exists {
+		runtime.AddCleanup(k, func(key weak.Pointer[kernel.Kernel]) {
+			nodeStores.mu.Lock()
+			defer nodeStores.mu.Unlock()
+			delete(nodeStores.stores, key)
+		}, key)
+	}
+	nodeStores.stores[key] = s
+}
+
 // ipcStore adapts the IPC namespace to sysctlStore. The namespace has the
 // single value kernel.shm_rmid_forced.
 type ipcStore struct {
@@ -175,18 +255,22 @@ func sysctlNamespace(ctx context.Context) *inet.Namespace {
 }
 
 // sysctlStack returns the network stack of the network namespace of the
-// caller. It returns fallback when the context names no namespace with a stack.
+// caller. It returns fallback or the context stack when the context names no
+// namespace with a stack.
 func sysctlStack(ctx context.Context, fallback inet.Stack) inet.Stack {
 	if ns := sysctlNamespace(ctx); ns != nil && ns.Stack() != nil {
 		return ns.Stack()
 	}
-	return fallback
+	if fallback != nil {
+		return fallback
+	}
+	return inet.StackFromContext(ctx)
 }
 
 // withStore runs f with the store that holds the value of the spec for the
 // caller. The network stack is nil for the other scopes. The store of a network
 // sysctl is the network stack of the network namespace of the caller.
-func (s *sysctlSpec) withStore(ctx context.Context, f func(st sysctlStore, stack inet.Stack) error) error {
+func (s *sysctlSpec) withStore(ctx context.Context, nodeValues *valueStore, f func(st sysctlStore, stack inet.Stack) error) error {
 	switch s.scope {
 	case scopeNet:
 		stack := sysctlStack(ctx, nil)
@@ -203,29 +287,45 @@ func (s *sysctlSpec) withStore(ctx context.Context, f func(st sysctlStore, stack
 		defer ns.DecRef(ctx)
 		return f(ipcStore{ns}, nil)
 	default:
-		k := kernel.KernelFromContext(ctx)
-		if k == nil {
-			return linuxerr.ENOENT
+		if k := kernel.KernelFromContext(ctx); k != nil {
+			if nodeValues != nil {
+				return f(nodeValues, nil)
+			}
+			return f(nodeStore(k), nil)
 		}
-		return f(nodeStore(k), nil)
+		if nodeValues != nil {
+			return f(nodeValues, nil)
+		}
+		return linuxerr.ENOENT
 	}
 }
 
 // sysctlFile implements vfs.WritableDynamicBytesSource for a stored sysctl.
+//
+// +stateify savable
 type sysctlFile struct {
 	kernfs.DynamicBytesFile
 
-	spec *sysctlSpec
+	id         sysctlID
+	nodeValues *valueStore
 }
 
 var _ vfs.WritableDynamicBytesSource = (*sysctlFile)(nil)
 
+func (f *sysctlFile) spec() *sysctlSpec {
+	return sysctlTable[f.id]
+}
+
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *sysctlFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	return f.spec.withStore(ctx, func(st sysctlStore, _ inet.Stack) error {
-		v, ok := st.SysctlValue(f.spec.key)
+	spec := f.spec()
+	if spec == nil {
+		return linuxerr.ENOENT
+	}
+	return spec.withStore(ctx, f.nodeValues, func(st sysctlStore, _ inet.Stack) error {
+		v, ok := st.SysctlValue(spec.key)
 		if !ok {
-			v = f.spec.def
+			v = spec.def
 		}
 		buf.WriteString(v)
 		buf.WriteByte('\n')
@@ -238,28 +338,32 @@ func (f *sysctlFile) Write(ctx context.Context, _ *vfs.FileDescription, src user
 	if offset != 0 {
 		return 0, linuxerr.EINVAL
 	}
+	spec := f.spec()
+	if spec == nil {
+		return 0, linuxerr.ENOENT
+	}
 	text, n, err := readSysctlText(ctx, src)
 	if err != nil || n == 0 {
 		return 0, err
 	}
 	sysctlWriteMu.Lock()
 	defer sysctlWriteMu.Unlock()
-	err = f.spec.withStore(ctx, func(st sysctlStore, stack inet.Stack) error {
-		old, had := st.SysctlValue(f.spec.key)
+	err = spec.withStore(ctx, f.nodeValues, func(st sysctlStore, stack inet.Stack) error {
+		old, had := st.SysctlValue(spec.key)
 		cur := old
 		if !had {
-			cur = f.spec.def
+			cur = spec.def
 		}
-		val, err := f.spec.parse(text, cur)
+		val, err := spec.parse(text, cur)
 		if err != nil {
 			return err
 		}
-		st.SetSysctlValue(f.spec.key, val)
-		if f.spec.apply == nil || stack == nil {
+		st.SetSysctlValue(spec.key, val)
+		if spec.apply == nil || stack == nil {
 			return nil
 		}
-		if err := f.spec.apply(stack, st); err != nil {
-			st.SetSysctlValue(f.spec.key, cur)
+		if err := spec.apply(stack, st); err != nil {
+			st.SetSysctlValue(spec.key, cur)
 			return err
 		}
 		return nil
@@ -376,27 +480,27 @@ const (
 // /proc/sys that holds them.
 var nodeSysctlSpecs = map[string][]*sysctlSpec{
 	"vm": {
-		{scope: scopeNode, name: "overcommit_memory", key: "vm/overcommit_memory", def: "0", parse: intVecParser(1, 0, 2, nil)},
-		{scope: scopeNode, name: "panic_on_oom", key: "vm/panic_on_oom", def: "0", parse: intVecParser(1, 0, 2, nil)},
+		registerSysctlSpec(&sysctlSpec{id: sysctlVMOvercommitMemory, scope: scopeNode, name: "overcommit_memory", key: "vm/overcommit_memory", def: "0", parse: intVecParser(1, 0, 2, nil)}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlVMPanicOnOOM, scope: scopeNode, name: "panic_on_oom", key: "vm/panic_on_oom", def: "0", parse: intVecParser(1, 0, 2, nil)}),
 	},
 	"kernel": {
-		{scope: scopeNode, name: "panic", key: "kernel/panic", def: "0", parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil)},
-		{scope: scopeNode, name: "panic_on_oops", key: "kernel/panic_on_oops", def: "0", parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil)},
-		{scope: scopeIPC, name: "shm_rmid_forced", key: shmRmidForcedKey, def: "0", parse: intVecParser(1, 0, 1, nil)},
+		registerSysctlSpec(&sysctlSpec{id: sysctlKernelPanic, scope: scopeNode, name: "panic", key: "kernel/panic", def: "0", parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil)}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlKernelPanicOnOops, scope: scopeNode, name: "panic_on_oops", key: "kernel/panic_on_oops", def: "0", parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil)}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlKernelShmRmidForced, scope: scopeIPC, name: "shm_rmid_forced", key: shmRmidForcedKey, def: "0", parse: intVecParser(1, 0, 1, nil)}),
 	},
 	"kernel/keys": {
-		{scope: scopeNode, name: "root_maxkeys", key: "kernel/keys/root_maxkeys", def: "1000000", parse: intVecParser(1, 1, math.MaxInt32, nil)},
-		{scope: scopeNode, name: "root_maxbytes", key: "kernel/keys/root_maxbytes", def: "25000000", parse: intVecParser(1, 1, math.MaxInt32, nil)},
+		registerSysctlSpec(&sysctlSpec{id: sysctlKernelKeysRootMaxKeys, scope: scopeNode, name: "root_maxkeys", key: "kernel/keys/root_maxkeys", def: "1000000", parse: intVecParser(1, 1, math.MaxInt32, nil)}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlKernelKeysRootMaxBytes, scope: scopeNode, name: "root_maxbytes", key: "kernel/keys/root_maxbytes", def: "25000000", parse: intVecParser(1, 1, math.MaxInt32, nil)}),
 	},
 	"net/ipv4": {
-		{scope: scopeNet, name: "ip_unprivileged_port_start", key: netstack.UnprivilegedPortStartKey, def: strconv.Itoa(netstack.DefaultUnprivilegedPortStart), parse: intVecParser(1, 0, math.MaxUint16, nil)},
-		{scope: scopeNet, name: "tcp_syncookies", key: "ipv4/tcp_syncookies", def: "1", parse: intVecParser(1, 0, 2, nil), apply: applySynCookies},
-		{scope: scopeNet, name: "ping_group_range", key: "ipv4/ping_group_range", def: "1\t0", parse: intVecParser(2, 0, maxGroupID, fixPingGroupRange)},
-		{scope: scopeNet, name: "ip_local_reserved_ports", key: "ipv4/ip_local_reserved_ports", def: "", parse: parseReservedPorts},
-		{scope: scopeNet, name: "tcp_keepalive_time", key: keepaliveTimeKey, def: "7200", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyKeepalive},
-		{scope: scopeNet, name: "tcp_keepalive_intvl", key: keepaliveIntvlKey, def: "75", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyKeepalive},
-		{scope: scopeNet, name: "tcp_keepalive_probes", key: keepaliveProbesKey, def: "9", parse: intVecParser(1, 1, math.MaxInt32, nil), apply: applyKeepalive},
-		{scope: scopeNet, name: "tcp_fin_timeout", key: "ipv4/tcp_fin_timeout", def: "60", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyFinTimeout},
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4UnprivilegedPortStart, scope: scopeNet, name: "ip_unprivileged_port_start", key: netstack.UnprivilegedPortStartKey, def: strconv.Itoa(netstack.DefaultUnprivilegedPortStart), parse: intVecParser(1, 0, math.MaxUint16, nil)}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4TCPSynCookies, scope: scopeNet, name: "tcp_syncookies", key: "ipv4/tcp_syncookies", def: "1", parse: intVecParser(1, 0, 2, nil), apply: applySynCookies}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4PingGroupRange, scope: scopeNet, name: "ping_group_range", key: "ipv4/ping_group_range", def: "1\t0", parse: intVecParser(2, 0, maxGroupID, fixPingGroupRange)}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4LocalReservedPorts, scope: scopeNet, name: "ip_local_reserved_ports", key: "ipv4/ip_local_reserved_ports", def: "", parse: parseReservedPorts}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4TCPKeepaliveTime, scope: scopeNet, name: "tcp_keepalive_time", key: keepaliveTimeKey, def: "7200", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyKeepalive}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4TCPKeepaliveIntvl, scope: scopeNet, name: "tcp_keepalive_intvl", key: keepaliveIntvlKey, def: "75", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyKeepalive}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4TCPKeepaliveProbes, scope: scopeNet, name: "tcp_keepalive_probes", key: keepaliveProbesKey, def: "9", parse: intVecParser(1, 1, math.MaxInt32, nil), apply: applyKeepalive}),
+		registerSysctlSpec(&sysctlSpec{id: sysctlIPv4TCPFinTimeout, scope: scopeNet, name: "tcp_fin_timeout", key: "ipv4/tcp_fin_timeout", def: "60", parse: intVecParser(1, 0, maxSysctlSeconds, nil), apply: applyFinTimeout}),
 	},
 	"net/netfilter": conntrackNetfilterSysctls,
 }
@@ -469,7 +573,11 @@ func applyFinTimeout(stack inet.Stack, st sysctlStore) error {
 // conf/default/forwarding has a value of its own.
 func (fs *filesystem) addNodeSysctlFiles(ctx context.Context, root *auth.Credentials, k *kernel.Kernel, stack inet.Stack, path string, files map[string]kernfs.Inode) {
 	for _, spec := range nodeSysctlSpecs[path] {
-		files[spec.name] = fs.newInode(ctx, root, 0644, &sysctlFile{spec: spec})
+		var nv *valueStore
+		if spec.scope == scopeNode && k != nil {
+			nv = nodeStore(k)
+		}
+		files[spec.name] = fs.newInode(ctx, root, 0644, &sysctlFile{id: spec.id, nodeValues: nv})
 	}
 	fs.addConntrackFiles(ctx, root, stack, path, files)
 	switch path {
@@ -505,6 +613,8 @@ type forwardingStack interface {
 // conf/all/forwarding are one switch. A write to it sets conf/default/forwarding
 // and every link, as on Linux. A write to conf/default/forwarding changes only
 // the links that the guest creates later.
+//
+// +stateify savable
 type nsForwarding struct {
 	kernfs.DynamicBytesFile
 

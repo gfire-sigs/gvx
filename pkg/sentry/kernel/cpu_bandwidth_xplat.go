@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"context"
 	"math"
 	"math/bits"
 	"sync/atomic"
@@ -80,29 +81,42 @@ func newHostBandwidthClock() bandwidthClock {
 // hostBandwidthClock is the shared clock of the nodes that the Sentry creates.
 var hostBandwidthClock = newHostBandwidthClock()
 
+// BandwidthNow returns the current monotonic timestamp in nanoseconds on the
+// host CPU bandwidth clock.
+func BandwidthNow() int64 {
+	return hostBandwidthClock.now()
+}
+
 // CPUBandwidth is the CPU budget of one cgroup. Each cgroup that has the cpu
 // controller owns one node, and the node of a child points to the node of the
 // nearest ancestor with the controller.
+//
+// +stateify savable
 type CPUBandwidth struct {
 	// parent is the node of the nearest ancestor. It is nil at the root.
 	parent *CPUBandwidth
 
-	clock bandwidthClock
+	clock bandwidthClock `state:"nosave"`
 
 	// quotaNS is the CPU time for each period in nanoseconds. A negative
 	// value means no limit. Writers hold mu. Readers use the atomic.
-	quotaNS atomic.Int64
+	quotaNS atomic.Int64 `state:".(int64)"`
 
 	// throttled is true while the node holds its tasks back. Writers hold mu.
-	throttled atomic.Bool
+	throttled atomic.Bool `state:".(bool)"`
 
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
+
+	// restoredPending is true between state.Load and ActivateRestored so that
+	// state.Load never mutates process-wide counters or arms host timers.
+	restoredPending bool `state:"nosave"`
 
 	// periodNS is the length of one period.
 	periodNS int64
 
-	// periodEnd is the time at which the next period starts.
-	periodEnd int64
+	// periodEnd is the time at which the next period starts, saved relative to
+	// clock.now() so restore rebases onto the new host monotonic clock.
+	periodEnd int64 `state:".(int64)"`
 
 	// remainingNS is the CPU time left in the current period. It goes
 	// negative when tasks run past the quota. The next period repays that debt.
@@ -111,21 +125,102 @@ type CPUBandwidth struct {
 	// charged is true when the node took a charge since the last refill.
 	charged bool
 
-	// throttleStart is the time at which the current throttle began.
-	throttleStart int64
+	// throttleStart is the time at which the current throttle began, saved
+	// relative to clock.now() while throttled.
+	throttleStart int64 `state:".(int64)"`
 
 	// stopRefill cancels the refill timer of the current throttle.
-	stopRefill func()
+	stopRefill func() `state:"nosave"`
 
 	// wake closes when a throttle ends, and then a new channel replaces it.
-	wake chan struct{}
+	wake chan struct{} `state:"nosave"`
 
 	nrPeriods   uint64
 	nrThrottled uint64
 	throttledNS int64
 }
 
+// saveQuotaNS is invoked by stateify.
+func (b *CPUBandwidth) saveQuotaNS() int64 {
+	return b.quotaNS.Load()
+}
+
+// loadQuotaNS is invoked by stateify.
+func (b *CPUBandwidth) loadQuotaNS(_ context.Context, v int64) {
+	b.quotaNS.Store(v)
+}
+
+// saveThrottled is invoked by stateify.
+func (b *CPUBandwidth) saveThrottled() bool {
+	return b.throttled.Load()
+}
+
+// loadThrottled is invoked by stateify.
+func (b *CPUBandwidth) loadThrottled(_ context.Context, v bool) {
+	b.throttled.Store(v)
+}
+
+// savePeriodEnd is invoked by stateify.
+func (b *CPUBandwidth) savePeriodEnd() int64 {
+	if !b.restoredPending && b.clock.now != nil && b.periodNS > 0 {
+		return b.periodEnd - b.clock.now()
+	}
+	return b.periodEnd
+}
+
+// loadPeriodEnd is invoked by stateify.
+func (b *CPUBandwidth) loadPeriodEnd(_ context.Context, delta int64) {
+	b.periodEnd = delta
+}
+
+// saveThrottleStart is invoked by stateify.
+func (b *CPUBandwidth) saveThrottleStart() int64 {
+	if !b.restoredPending && b.clock.now != nil && b.throttled.Load() {
+		return b.throttleStart - b.clock.now()
+	}
+	return b.throttleStart
+}
+
+// loadThrottleStart is invoked by stateify.
+func (b *CPUBandwidth) loadThrottleStart(_ context.Context, delta int64) {
+	b.throttleStart = delta
+}
+
+// afterLoad is invoked by stateify.
+func (b *CPUBandwidth) afterLoad(_ context.Context) {
+	b.clock = hostBandwidthClock
+	b.wake = make(chan struct{})
+	b.restoredPending = true
+}
+
+// ActivateRestored rebases saved deadlines onto now, updates active bandwidth
+// counters, and arms the refill timer when throttled. It is a no-op when b was
+// not loaded from state or was already activated.
+func (b *CPUBandwidth) ActivateRestored(now int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.restoredPending {
+		return
+	}
+	b.restoredPending = false
+	if b.periodNS > 0 {
+		b.periodEnd += now
+	}
+	if b.quotaNS.Load() >= 0 {
+		if cpuBandwidthLimited.Add(1) == 1 {
+			cpuBillingGeneration.Add(1)
+		}
+	}
+	if b.throttled.Load() {
+		b.throttleStart += now
+		cpuBandwidthThrottled.Add(1)
+		b.armRefillLocked(now)
+	}
+}
+
 // CPUBandwidthStats are the counters that cpu.stat reports.
+//
+// +stateify savable
 type CPUBandwidthStats struct {
 	// Periods counts the periods that ended while the node was active, as
 	// nr_periods does in Linux. A node is active from its first charge until
@@ -163,7 +258,9 @@ func (b *CPUBandwidth) SetLimits(quota, period time.Duration) {
 	defer b.mu.Unlock()
 	now := b.clock.now()
 	quotaNS := quota.Nanoseconds()
-	wasLimited := b.quotaNS.Load() >= 0
+	wasPending := b.restoredPending
+	b.restoredPending = false
+	wasLimited := !wasPending && b.quotaNS.Load() >= 0
 	if quotaNS < 0 {
 		quotaNS = -1
 	}
@@ -181,7 +278,14 @@ func (b *CPUBandwidth) SetLimits(quota, period time.Duration) {
 		cpuBandwidthLimited.Add(-1)
 	}
 	if b.throttled.Load() {
-		b.endThrottleLocked(now)
+		if wasPending {
+			b.throttled.Store(false)
+			b.throttledNS += -b.throttleStart
+			close(b.wake)
+			b.wake = make(chan struct{})
+		} else {
+			b.endThrottleLocked(now)
+		}
 	}
 }
 
@@ -204,7 +308,11 @@ func (b *CPUBandwidth) Stats() CPUBandwidthStats {
 	defer b.mu.Unlock()
 	throttledNS := b.throttledNS
 	if b.throttled.Load() {
-		throttledNS += b.clock.now() - b.throttleStart
+		if b.restoredPending {
+			throttledNS += -b.throttleStart
+		} else {
+			throttledNS += b.clock.now() - b.throttleStart
+		}
 	}
 	return CPUBandwidthStats{
 		Periods:       b.nrPeriods,

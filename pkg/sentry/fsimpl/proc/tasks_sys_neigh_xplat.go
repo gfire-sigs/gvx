@@ -37,11 +37,12 @@ type neighFamily struct {
 	// dir is the directory of the table below /proc/sys.
 	dir      string
 	protocol tcpip.NetworkProtocolNumber
+	ids      [3]sysctlID
 }
 
 var neighFamilies = []neighFamily{
-	{"net/ipv4/neigh/default", ipv4.ProtocolNumber},
-	{"net/ipv6/neigh/default", ipv6.ProtocolNumber},
+	{"net/ipv4/neigh/default", ipv4.ProtocolNumber, [3]sysctlID{sysctlIPv4NeighGCThresh1, sysctlIPv4NeighGCThresh2, sysctlIPv4NeighGCThresh3}},
+	{"net/ipv6/neigh/default", ipv6.ProtocolNumber, [3]sysctlID{sysctlIPv6NeighGCThresh1, sysctlIPv6NeighGCThresh2, sysctlIPv6NeighGCThresh3}},
 }
 
 func init() {
@@ -65,14 +66,15 @@ func (f neighFamily) specs() []*sysctlSpec {
 	}
 	specs := make([]*sysctlSpec, len(files))
 	for i, file := range files {
-		specs[i] = &sysctlSpec{
+		specs[i] = registerSysctlSpec(&sysctlSpec{
+			id:    f.ids[i],
 			scope: scopeNet,
 			name:  file.name,
 			key:   f.key(file.name),
 			def:   strconv.Itoa(file.def),
 			parse: intVecParser(1, 0, math.MaxInt32, nil),
 			apply: f.apply,
-		}
+		})
 	}
 	return specs
 }

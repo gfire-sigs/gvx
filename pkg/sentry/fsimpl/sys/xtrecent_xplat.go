@@ -27,6 +27,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/kernfs"
+	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
@@ -45,29 +46,62 @@ import (
 // network namespace of the kernel has a recent list fails with EINVAL, as the
 // write to a loaded module does.
 
+// xtRecentParamKind selects one parameter of /sys/module/xt_recent/parameters.
+//
+// +stateify savable
+type xtRecentParamKind int
+
+const (
+	xtRecentListTot xtRecentParamKind = iota
+	xtRecentPktListTot
+)
+
 // xtRecentParam is one of the files in /sys/module/xt_recent/parameters.
+//
+// +stateify savable
 type xtRecentParam struct {
 	kernfs.DynamicBytesFile
 
-	// get reads the value from the module. set validates and stores it.
-	get func(*netfilter.RecentModule) uint32
-	set func(*netfilter.RecentModule, uint32) error
+	kind xtRecentParamKind
 }
 
 var _ vfs.WritableDynamicBytesSource = (*xtRecentParam)(nil)
 
+func (f *xtRecentParam) get(mod *netfilter.RecentModule) uint32 {
+	switch f.kind {
+	case xtRecentListTot:
+		return mod.ListTot()
+	case xtRecentPktListTot:
+		return mod.PktListTot()
+	default:
+		return 0
+	}
+}
+
+func (f *xtRecentParam) set(mod *netfilter.RecentModule, v uint32) error {
+	switch f.kind {
+	case xtRecentListTot:
+		return mod.SetListTot(v)
+	case xtRecentPktListTot:
+		return mod.SetPktListTot(v)
+	default:
+		return linuxerr.EINVAL
+	}
+}
+
 // recentModule returns the module parameters of the kernel of the caller. It
 // returns nil when the kernel has no network stack.
 func recentModule(ctx context.Context) *netfilter.RecentModule {
-	k := kernel.KernelFromContext(ctx)
-	if k == nil {
-		return nil
+	var inetSt inet.Stack
+	if k := kernel.KernelFromContext(ctx); k != nil {
+		if ns := k.RootNetworkNamespace(); ns != nil {
+			inetSt = ns.Stack()
+		}
 	}
-	ns := k.RootNetworkNamespace()
-	if ns == nil {
-		return nil
+	if inetSt == nil {
+		inetSt = inet.StackFromContext(ctx)
 	}
-	st, ok := ns.Stack().(*netstack.Stack)
+	st, ok := inetSt.(*netstack.Stack)
 	if !ok || st.Stack == nil {
 		return nil
 	}
@@ -144,15 +178,15 @@ func parseModuleUint(text string) (uint32, error) {
 
 // newXtRecentDir returns /sys/module/xt_recent.
 func (fs *filesystem) newXtRecentDir(ctx context.Context, creds *auth.Credentials) kernfs.Inode {
-	param := func(get func(*netfilter.RecentModule) uint32, set func(*netfilter.RecentModule, uint32) error) kernfs.Inode {
-		f := &xtRecentParam{get: get, set: set}
+	param := func(kind xtRecentParamKind) kernfs.Inode {
+		f := &xtRecentParam{kind: kind}
 		f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), f, 0400)
 		return f
 	}
 	return fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"parameters": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"ip_list_tot":     param((*netfilter.RecentModule).ListTot, (*netfilter.RecentModule).SetListTot),
-			"ip_pkt_list_tot": param((*netfilter.RecentModule).PktListTot, (*netfilter.RecentModule).SetPktListTot),
+			"ip_list_tot":     param(xtRecentListTot),
+			"ip_pkt_list_tot": param(xtRecentPktListTot),
 		}),
 	})
 }

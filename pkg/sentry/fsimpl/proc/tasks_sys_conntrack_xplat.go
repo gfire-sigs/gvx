@@ -65,10 +65,11 @@ var conntrackTimeoutFiles = []struct {
 // The stack applies each value after a write.
 func conntrackNetfilterSpecs() []*sysctlSpec {
 	var specs []*sysctlSpec
-	for _, f := range conntrackTimeoutFiles {
+	for i, f := range conntrackTimeoutFiles {
 		key := "netfilter/" + f.name
 		def := int(stack.DefaultConntrackTimeout(f.timeout) / time.Second)
-		specs = append(specs, &sysctlSpec{
+		specs = append(specs, registerSysctlSpec(&sysctlSpec{
+			id:    sysctlConntrackTimeoutBase + sysctlID(i),
 			scope: scopeNet,
 			name:  f.name,
 			key:   key,
@@ -84,11 +85,12 @@ func conntrackNetfilterSpecs() []*sysctlSpec {
 				cs.SetConntrackTimeout(f.timeout, time.Duration(storedInt(st, key, def))*time.Second)
 				return nil
 			},
-		})
+		}))
 	}
 	// nf_conntrack_tcp_max_retrans is a u8 without a range in Linux.
 	const maxRetransKey = "netfilter/nf_conntrack_tcp_max_retrans"
-	specs = append(specs, &sysctlSpec{
+	specs = append(specs, registerSysctlSpec(&sysctlSpec{
+		id:    sysctlConntrackTCPMaxRetrans,
 		scope: scopeNet,
 		name:  "nf_conntrack_tcp_max_retrans",
 		key:   maxRetransKey,
@@ -102,7 +104,7 @@ func conntrackNetfilterSpecs() []*sysctlSpec {
 			cs.SetConntrackTCPMaxRetrans(uint8(storedInt(st, maxRetransKey, 3)))
 			return nil
 		},
-	})
+	}))
 	return specs
 }
 
@@ -133,6 +135,8 @@ func conntrackStackOf(ctx context.Context, fallback inet.Stack) (conntrackStack,
 // in every network namespace, and lets only the root network namespace write it.
 // A write takes a signed 32-bit integer. The limit is the unsigned value of
 // the integer, and 0 means no limit.
+//
+// +stateify savable
 type conntrackMaxFile struct {
 	kernfs.DynamicBytesFile
 
@@ -188,6 +192,8 @@ func (f *conntrackMaxFile) Write(ctx context.Context, _ *vfs.FileDescription, sr
 
 // conntrackCountFile is nf_conntrack_count or nf_conntrack_buckets. Both files
 // are read-only.
+//
+// +stateify savable
 type conntrackCountFile struct {
 	kernfs.DynamicBytesFile
 

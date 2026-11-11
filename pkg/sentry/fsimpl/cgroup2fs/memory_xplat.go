@@ -16,11 +16,15 @@ package cgroup2fs
 
 import (
 	"bytes"
+	goContext "context"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
@@ -87,9 +91,156 @@ func (f memoryStatFields) writeTo(buf *bytes.Buffer) {
 	}
 }
 
+// cgroupRootXplatState holds filesystem-wide Tier 2 state saved on the root
+// memoryStat node so Tier 3 autogen files stay untouched.
+//
+// +stateify savable
+type cgroupRootXplatState struct {
+	klog           *kernel.KernelLog
+	klogBufLen     int
+	reportedMemory uint64
+	enforcerOpts   MemoryEnforcerOptions
+	cpuBandwidths  map[*cpu]*kernel.CPUBandwidth
+	taskCPUMeters  map[*kernel.Task]int64
+}
+
 // memoryStat implements vfs.DynamicBytesSource for memory.stat.
+//
+// +stateify savable
 type memoryStat struct {
-	m *memory
+	m    *memory
+	oom  oomState
+	root *cgroupRootXplatState
+}
+
+func copyOOMState(dst, src *oomState) {
+	dst.hitMax.Store(src.hitMax.Load())
+	dst.oom.Store(src.oom.Load())
+	dst.oomKill.Store(src.oomKill.Load())
+	dst.oomGroupKill.Store(src.oomGroupKill.Load())
+	dst.eventsFile = src.eventsFile
+	dst.pending = maps.Clone(src.pending)
+	dst.gate = src.gate
+}
+
+func applyRestoredKernelProps(k *kernel.Kernel, st *cgroupRootXplatState) {
+	if k == nil || st == nil {
+		return
+	}
+	if st.reportedMemory > 0 {
+		k.SetReportedMemory(st.reportedMemory)
+	}
+	if st.klog != nil {
+		k.AttachKernelLog(st.klog)
+	} else if st.klogBufLen > 0 {
+		k.SetKernelLogBufLen(st.klogBufLen)
+	}
+}
+
+// beforeSave is invoked by stateify.
+func (ms *memoryStat) beforeSave() {
+	if ms.m == nil {
+		return
+	}
+	copyOOMState(&ms.oom, &ms.m.oom)
+	if ms.m.parent != nil {
+		ms.root = nil
+		return
+	}
+	fs := ms.m.c.fs
+	bwMap := make(map[*cpu]*kernel.CPUBandwidth)
+	var taskMeters map[*kernel.Task]int64
+	k := fs.memEnforcer.saveKernel.Value()
+	fs.treeMu.RLock()
+	fs.tasksMu.RLock()
+	visit := func(c *cgroup) {
+		if cc, ok := c.ctrls[kernel.Cgroup2CPU].(*cpu); ok { // +checklocksforce: fs.treeMu is held
+			if node := cc.bandwidth.node.Load(); node != nil {
+				bwMap[cc] = node
+			}
+		}
+		for t := range c.tasks { // +checklocksforce: fs.tasksMu is held
+			if k == nil {
+				k = t.Kernel()
+			}
+			if ns := t.CPUTimeMeasured().Nanoseconds(); ns > 0 {
+				if taskMeters == nil {
+					taskMeters = make(map[*kernel.Task]int64)
+				}
+				taskMeters[t] = ns
+			}
+		}
+	}
+	visit(ms.m.c)
+	ms.m.c.walkSubtreeLocked(func(c *cgroup) bool { // +checklocksforce: ms.m.c.fs is fs
+		visit(c)
+		return true
+	})
+	fs.tasksMu.RUnlock()
+	fs.treeMu.RUnlock()
+
+	var (
+		klog        *kernel.KernelLog
+		klogBufLen  int
+		reportedMem uint64
+	)
+	if k != nil {
+		klog = k.LookupKernelLog()
+		klogBufLen = k.KernelLogBufLen()
+		if total, ok := k.ReportedMemory(); ok {
+			reportedMem = total
+		}
+		for t, ns := range k.SaveTaskCPUMeters() {
+			if taskMeters == nil {
+				taskMeters = make(map[*kernel.Task]int64)
+			}
+			taskMeters[t] = ns
+		}
+	}
+	ms.root = &cgroupRootXplatState{
+		klog:           klog,
+		klogBufLen:     klogBufLen,
+		reportedMemory: reportedMem,
+		enforcerOpts:   fs.memEnforcer.opts,
+		cpuBandwidths:  bwMap,
+		taskCPUMeters:  taskMeters,
+	}
+}
+
+// afterLoad is invoked by stateify.
+func (ms *memoryStat) afterLoad(ctx goContext.Context) {
+	if ms.m == nil {
+		return
+	}
+	copyOOMState(&ms.m.oom, &ms.oom)
+	if ms.root == nil {
+		return
+	}
+	fs := ms.m.c.fs
+	fs.memEnforcer.opts = ms.root.enforcerOpts
+	fs.memEnforcer.pendingRestore = ms.root
+	for cc, node := range ms.root.cpuBandwidths {
+		cc.bandwidth.node.Store(node)
+	}
+	var nilKernel *kernel.Kernel
+	nilKernel.LoadTaskCPUMeters(ms.root.taskCPUMeters)
+
+	var k *kernel.Kernel
+	if ctx != nil {
+		k, _ = ctx.Value(kernel.CtxKernel).(*kernel.Kernel)
+	}
+	if k == nil {
+		for t := range ms.root.taskCPUMeters {
+			if t != nil && t.Kernel() != nil {
+				k = t.Kernel()
+				break
+			}
+		}
+	}
+	if k != nil {
+		fs.memEnforcer.saveKernel = weak.Make(k)
+		applyRestoredKernelProps(k, ms.root)
+	}
 }
 
 // Generate implements vfs.DynamicBytesSource.Generate.
@@ -100,12 +251,15 @@ func (ms *memoryStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	collectMemCgIDs(ms.m.c, memCgIDs)
 	ms.m.c.fs.treeMu.RUnlock()
 
-	stats := getUsageStats(k, memCgIDs)
-	if ms.m.c.parent == nil {
-		// The root cgroup accounts all memory of the sandbox, also the memory of
-		// tasks that no memory cgroup owns. Linux has memory.stat at the root for
-		// this, and the cAdvisor of the kubelet reads it for the memory of the node.
-		stats, _ = k.MemoryFile().Accounting().CopyPerCg(0)
+	var stats usage.MemoryStats
+	if k != nil && k.MemoryFile() != nil {
+		stats = getUsageStats(k, memCgIDs)
+		if ms.m.c.parent == nil {
+			// The root cgroup accounts all memory of the sandbox, also the memory of
+			// tasks that no memory cgroup owns. Linux has memory.stat at the root for
+			// this, and the cAdvisor of the kubelet reads it for the memory of the node.
+			stats, _ = k.MemoryFile().Accounting().CopyPerCg(0)
+		}
 	}
 	memoryStatFor(stats).writeTo(buf)
 	return nil
@@ -135,6 +289,8 @@ func sumUsageStats(k *kernel.Kernel, memCgIDs map[uint32]struct{}) usage.MemoryS
 }
 
 // oomState is the OOM bookkeeping of one memory controller.
+//
+// +stateify savable
 type oomState struct {
 	// The counters of memory.events. As in Linux, a cgroup counts the events
 	// of its own subtree.
@@ -160,6 +316,8 @@ type oomState struct {
 // until a check sees the usage at or below the limit. If the usage stays above
 // the limit because the cgroup still holds tmpfs data, the gate lets the next
 // kill pass after two more checks above the limit.
+//
+// +stateify savable
 type oomGate struct {
 	disarmed   bool
 	overChecks int
@@ -186,9 +344,25 @@ func (g *oomGate) shouldKill(over bool, pending int) bool {
 }
 
 // memoryEnforcer is the state of the goroutine that enforces memory.max.
+//
+// +stateify savable
 type memoryEnforcer struct {
 	// running is true while the goroutine runs or starts.
-	running atomic.Bool
+	running atomic.Bool `state:"nosave"`
+
+	// saveKernel weakly tracks the owning Kernel so root memoryStat can
+	// snapshot KernelLog even when no task is attached to a cgroup.
+	saveKernel weak.Pointer[kernel.Kernel] `state:"nosave"`
+
+	// pendingRestore holds restored root state until CompleteRestore
+	// activates bandwidth nodes and applies restored kernel properties.
+	pendingRestore *cgroupRootXplatState `state:"nosave"`
+
+	mu      sync.Mutex     `state:"nosave"`
+	paused  bool           `state:"nosave"`
+	stopped bool           `state:"nosave"`
+	stopCh  chan struct{}  `state:"nosave"`
+	wg      sync.WaitGroup `state:"nosave"`
 
 	// opts holds the time limits of the checks. A zero field selects the
 	// default.
@@ -197,6 +371,8 @@ type memoryEnforcer struct {
 
 // MemoryEnforcerOptions sets the time limits of the checks of memory.max. A
 // zero field selects the default.
+//
+// +stateify savable
 type MemoryEnforcerOptions struct {
 	// PollInterval is the shortest time between two checks while a cgroup uses
 	// at least half of its limit. The default is 5 ms.
@@ -234,8 +410,159 @@ func NewFilesystemWithMemoryOptions(opts MemoryEnforcerOptions) func(context.Con
 		if err != nil {
 			return nil, err
 		}
-		vfsfs.Impl().(*filesystem).memEnforcer.opts = opts
+		fs := vfsfs.Impl().(*filesystem)
+		fs.memEnforcer.opts = opts
+		if k != nil {
+			fs.memEnforcer.saveKernel = weak.Make(k)
+		}
 		return vfsfs, nil
+	}
+}
+
+var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
+
+// PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
+func (fs *filesystem) PrepareSave(ctx context.Context, _ vfs.PrepareSaveOptions) error {
+	if k := kernel.KernelFromContext(ctx); k != nil {
+		fs.memEnforcer.saveKernel = weak.Make(k)
+	}
+	fs.pauseMemoryEnforcer()
+	return nil
+}
+
+// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
+func (fs *filesystem) BeforeResume(ctx context.Context) {
+	fs.memEnforcer.mu.Lock()
+	fs.memEnforcer.paused = false
+	fs.memEnforcer.mu.Unlock()
+	if k := fs.resolveKernel(ctx); k != nil && len(fs.limitedMemory()) > 0 {
+		fs.armMemoryEnforcer(k)
+	}
+}
+
+func (fs *filesystem) resolveKernel(ctx context.Context) *kernel.Kernel {
+	if ctx != nil {
+		if k := kernel.KernelFromContext(ctx); k != nil {
+			return k
+		}
+	}
+	if k := fs.memEnforcer.saveKernel.Value(); k != nil {
+		return k
+	}
+	if fs.root != nil {
+		var found *kernel.Kernel
+		fs.treeMu.RLock()
+		fs.tasksMu.RLock()
+		visit := func(c *cgroup) bool {
+			for t := range c.tasks { // +checklocksforce: fs.tasksMu is held
+				if t != nil && t.Kernel() != nil {
+					found = t.Kernel()
+					return false
+				}
+			}
+			return true
+		}
+		root := fs.root.Inode().(*cgroup)
+		if visit(root) {
+			root.walkSubtreeLocked(visit) // +checklocksforce: root.fs is fs
+		}
+		fs.tasksMu.RUnlock()
+		fs.treeMu.RUnlock()
+		if found != nil {
+			return found
+		}
+	}
+	if pr := fs.memEnforcer.pendingRestore; pr != nil {
+		for t := range pr.taskCPUMeters {
+			if t != nil && t.Kernel() != nil {
+				return t.Kernel()
+			}
+		}
+	}
+	return nil
+}
+
+// CompleteRestore implements vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
+func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestoreOptions) error {
+	k := fs.resolveKernel(ctx)
+	pr := fs.memEnforcer.pendingRestore
+	fs.memEnforcer.pendingRestore = nil
+	now := kernel.BandwidthNow()
+	if pr != nil {
+		k.LoadTaskCPUMeters(pr.taskCPUMeters)
+		applyRestoredKernelProps(k, pr)
+		for _, node := range pr.cpuBandwidths {
+			if node != nil {
+				node.ActivateRestored(now)
+			}
+		}
+	}
+	if fs.root != nil {
+		var limitedCPU []*cpu
+		fs.treeMu.RLock()
+		visit := func(c *cgroup) {
+			if cc, ok := c.ctrls[kernel.Cgroup2CPU].(*cpu); ok && cc.isActive() && cc.maxUSec.Load() != cpuMaxUnlimited { // +checklocksforce: fs.treeMu is held
+				limitedCPU = append(limitedCPU, cc)
+			}
+		}
+		root := fs.root.Inode().(*cgroup)
+		visit(root)
+		root.walkSubtreeLocked(func(c *cgroup) bool { // +checklocksforce: root.fs is fs
+			visit(c)
+			return true
+		})
+		fs.treeMu.RUnlock()
+		for _, cc := range limitedCPU {
+			cc.bandwidthNode().ActivateRestored(now)
+		}
+	}
+	if k != nil {
+		fs.memEnforcer.saveKernel = weak.Make(k)
+		if len(fs.limitedMemory()) > 0 {
+			fs.armMemoryEnforcer(k)
+		}
+	}
+	return nil
+}
+
+// releaseXplat stops the memory enforcer goroutine and removes active CPU
+// bandwidth limits when the filesystem releases its root tree.
+func (fs *filesystem) releaseXplat() {
+	fs.stopMemoryEnforcer()
+	var ctrls []*cpu
+	seen := make(map[*cpu]struct{})
+	add := func(cc *cpu) {
+		if cc == nil {
+			return
+		}
+		if _, ok := seen[cc]; !ok {
+			seen[cc] = struct{}{}
+			ctrls = append(ctrls, cc)
+		}
+	}
+	if pr := fs.memEnforcer.pendingRestore; pr != nil {
+		fs.memEnforcer.pendingRestore = nil
+		for cc := range pr.cpuBandwidths {
+			add(cc)
+		}
+	}
+	if fs.root != nil {
+		fs.treeMu.RLock()
+		visit := func(c *cgroup) {
+			if cc, ok := c.ctrls[kernel.Cgroup2CPU].(*cpu); ok { // +checklocksforce: fs.treeMu is held
+				add(cc)
+			}
+		}
+		root := fs.root.Inode().(*cgroup)
+		visit(root)
+		root.walkSubtreeLocked(func(c *cgroup) bool { // +checklocksforce: root.fs is fs
+			visit(c)
+			return true
+		})
+		fs.treeMu.RUnlock()
+	}
+	for _, cc := range ctrls {
+		cc.releaseBandwidth()
 	}
 }
 
@@ -272,28 +599,75 @@ func enforcerSupported(p any) bool {
 }
 
 // armMemoryEnforcer starts the goroutine that enforces memory.max if it does
-// not run. The goroutine ends when no cgroup has a limit or the guest has no
-// task. A later write of a limit starts it again.
+// not run. The goroutine ends when no cgroup has a limit, the filesystem stops,
+// or the guest has no task. A later write of a limit starts it again.
 func (fs *filesystem) armMemoryEnforcer(k *kernel.Kernel) {
+	if k == nil {
+		return
+	}
+	fs.memEnforcer.saveKernel = weak.Make(k)
 	if !enforcerSupported(k.Platform) {
 		return
 	}
-	if fs.memEnforcer.running.CompareAndSwap(false, true) {
-		go fs.enforceMemoryLimits(k, &fs.memEnforcer)
+	fs.memEnforcer.mu.Lock()
+	if fs.memEnforcer.stopped || fs.memEnforcer.paused || !fs.memEnforcer.running.CompareAndSwap(false, true) {
+		fs.memEnforcer.mu.Unlock()
+		return
 	}
+	stopCh := make(chan struct{})
+	fs.memEnforcer.stopCh = stopCh
+	fs.memEnforcer.wg.Add(1)
+	fs.memEnforcer.mu.Unlock()
+	go func() {
+		defer fs.memEnforcer.wg.Done()
+		fs.enforceMemoryLimits(k, &fs.memEnforcer, stopCh)
+	}()
+}
+
+// pauseMemoryEnforcer quiesces the memory.max goroutine before state.Save reads
+// oomState fields owned by the goroutine. BeforeResume restarts it.
+func (fs *filesystem) pauseMemoryEnforcer() {
+	fs.memEnforcer.mu.Lock()
+	fs.memEnforcer.paused = true
+	if fs.memEnforcer.stopCh != nil {
+		close(fs.memEnforcer.stopCh)
+		fs.memEnforcer.stopCh = nil
+	}
+	fs.memEnforcer.mu.Unlock()
+	fs.memEnforcer.wg.Wait()
+}
+
+// stopMemoryEnforcer stops the memory.max goroutine and waits for any active
+// scan to finish before the caller releases backing memory files.
+func (fs *filesystem) stopMemoryEnforcer() {
+	fs.memEnforcer.mu.Lock()
+	fs.memEnforcer.stopped = true
+	if fs.memEnforcer.stopCh != nil {
+		close(fs.memEnforcer.stopCh)
+		fs.memEnforcer.stopCh = nil
+	}
+	fs.memEnforcer.mu.Unlock()
+	fs.memEnforcer.wg.Wait()
 }
 
 // enforceMemoryLimits checks the limits at intervals. Linux checks at each
 // charge of a page. The Sentry sees a committed page only when it scans the
 // memory file, so a task can pass its limit by what it allocates between two
 // checks.
-func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
+func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer, stopCh <-chan struct{}) {
 	ctx := k.SupervisorContext()
 	opts := e.opts.withDefaults()
 	delay := opts.IdlePollInterval
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
-		time.Sleep(delay)
-		if k.RootPIDNamespace().NumTasks() == 0 {
+		select {
+		case <-stopCh:
+			e.running.Store(false)
+			return
+		case <-timer.C:
+		}
+		if k.TaskSet() == nil || k.RootPIDNamespace() == nil || k.RootPIDNamespace().NumTasks() == 0 {
 			e.running.Store(false)
 			return
 		}
@@ -302,9 +676,13 @@ func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 			e.running.Store(false)
 			// A write of a limit can see running == true just before the store
 			// above and then not start a goroutine.
-			if len(fs.limitedMemory()) == 0 || !e.running.CompareAndSwap(false, true) {
+			e.mu.Lock()
+			inactive := e.stopped || e.paused
+			e.mu.Unlock()
+			if inactive || len(fs.limitedMemory()) == 0 || !e.running.CompareAndSwap(false, true) {
 				return
 			}
+			timer.Reset(delay)
 			continue
 		}
 		start := time.Now()
@@ -317,6 +695,7 @@ func (fs *filesystem) enforceMemoryLimits(k *kernel.Kernel, e *memoryEnforcer) {
 			delay = opts.PollInterval
 		}
 		delay = max(delay, time.Duration(opts.ScanRatio)*time.Since(start))
+		timer.Reset(delay)
 	}
 }
 
