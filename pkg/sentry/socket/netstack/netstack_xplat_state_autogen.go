@@ -137,12 +137,16 @@ func (l *vethLink) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &l.mtu)
 }
 
-func (l *vethLink) afterLoad(context.Context) {}
-
 // +checklocksignore
 func (l *vethLink) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &l.Endpoint)
 	stateSourceObject.Load(1, &l.mtu)
+	stateSourceObject.AfterLoadTo(l)
+}
+
+// +checklocksignore
+func (l *vethLink) StateAfterLoad(ctx context.Context) {
+	l.afterLoad(ctx)
 }
 
 func (r *rpFilterState) StateTypeName() string {
@@ -206,7 +210,7 @@ func init() {
 	state.RegisterNoHooks((*ethtoolState)(nil))
 	state.RegisterNoHooks((*hostFilterEndpoint)(nil))
 	state.RegisterNoHooks((*linkConfState)(nil))
-	state.RegisterNoHooks((*vethLink)(nil))
+	state.RegisterStruct((*vethLink)(nil))
 	state.RegisterNoHooks((*rpFilterState)(nil))
 	state.RegisterNoHooks((*sysctlValues)(nil))
 }

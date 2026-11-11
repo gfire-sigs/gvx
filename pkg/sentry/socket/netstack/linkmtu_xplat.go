@@ -15,6 +15,8 @@
 package netstack
 
 import (
+	goContext "context"
+
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/context"
@@ -73,6 +75,12 @@ func (l *vethLink) MTU() uint32 {
 // Ethernet header.
 func (l *vethLink) SetMTU(mtu uint32) {
 	l.mtu.Store(mtu + header.EthernetMinimumSize)
+}
+
+func (l *vethLink) afterLoad(goContext.Context) {
+	if l.Endpoint != nil {
+		l.Endpoint.Restore()
+	}
 }
 
 // newVethNICEndpoint returns the link endpoint that a NIC for one end of a

@@ -513,6 +513,7 @@ func New(opts Options) *Stack {
 
 	// Create the global transport demuxer.
 	s.demux = newTransportDemuxer(s)
+	s.initRestoreState()
 
 	return s
 }
@@ -1059,9 +1060,7 @@ func (s *Stack) CreateNICWithOptions(id tcpip.NICID, ep LinkEndpoint, opts NICOp
 	}
 	s.nics[id] = n
 	s.nicsChanged()
-	if n.kind == "tun" || n.kind == "vxlan" || n.kind == "wireguard" || isPreservedEndpoint(ep) {
-		s.preservedNICs[id] = n
-	}
+	s.maybePreserveNICLocked(id, n)
 	if n.IsLoopback() {
 		s.loopbackNIC = n
 	}
@@ -2215,6 +2214,7 @@ func (s *Stack) Pause() {
 	for _, p := range s.transportProtocols {
 		p.proto.Pause()
 	}
+	s.pauseChildStacks()
 }
 
 func (s *Stack) getNICs() map[tcpip.NICID]*nic {
@@ -2233,6 +2233,7 @@ func (s *Stack) ResetConfig() {
 	s.nics = nics
 	s.loopbackNIC = nil
 	s.nicIDGen.Store(0)
+	s.resetPreservedConfigLocked()
 }
 
 // ReplaceConfig replaces config in the loaded stack.
@@ -2248,6 +2249,7 @@ func (s *Stack) ReplaceConfig(st *Stack) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.resetPreservedConfigLocked()
 
 	// Update iptables and nftables.
 	s.tables = st.IPTables()
@@ -2271,7 +2273,11 @@ func (s *Stack) Restore() {
 	// RestoredEndpoint.Restore() may call other methods on s, so we can't hold
 	// s.mu while restoring the endpoints.
 	s.mu.Lock()
+	s.prepareRestoreLocked()
 	for id, nic := range s.preservedNICs {
+		if !s.restorePreservedNICLocked(id, nic) {
+			continue
+		}
 		nic.stack = s
 		s.nics[id] = nic
 		s.nicsChanged()
@@ -2332,9 +2338,12 @@ func (s *Stack) Restore() {
 	tcpip.AsyncLoading.Wait()
 
 	// Now restore any protocol level background workers.
-	for _, p := range s.transportProtocols {
-		p.proto.Restore()
+	if s.shouldRestoreProtocols() {
+		for _, p := range s.transportProtocols {
+			p.proto.Restore()
+		}
 	}
+	s.restoreChildStacks()
 }
 
 // Resume resumes the stack after a save.
@@ -2362,6 +2371,7 @@ func (s *Stack) Resume() {
 	for _, p := range s.transportProtocols {
 		p.proto.Resume()
 	}
+	s.resumeChildStacks()
 }
 
 // RegisterPacketEndpoint registers ep with the stack, causing it to receive
@@ -2805,6 +2815,9 @@ func (s *Stack) SetRemoveConf(removeConf bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeConf = removeConf
+	if removeConf {
+		s.resetPreservedConfigLocked()
+	}
 }
 
 // GetRemoveConf gets the removeConf from stack.

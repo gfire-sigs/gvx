@@ -320,6 +320,7 @@ type udpForwardSession struct {
 // hostlockdown.Apply() and forwards inbound traffic into Netstack via gonet.
 type PortForwarder struct {
 	mu      sync.Mutex
+	stack   *stack.Stack
 	tcpList []*boundTCPForward
 	udpList []*boundUDPForward
 	started bool
@@ -479,15 +480,73 @@ func (pf *PortForwarder) Start(s *stack.Stack) {
 	if pf.closed || pf.started {
 		return
 	}
+	pf.stack = s
 	pf.started = true
 	for _, b := range pf.tcpList {
 		pf.wg.Add(1)
-		go pf.serveTCP(s, b)
+		go pf.serveTCP(b)
 	}
 	for _, b := range pf.udpList {
 		pf.wg.Add(1)
-		go pf.serveUDP(s, b)
+		go pf.serveUDP(b)
 	}
+}
+
+// AttachRestoredStack rebinds all pre-bound TCP, Unix, and UDP port forwarders
+// to target the restored guest Netstack s without opening new host sockets. If
+// Start has not run yet, AttachRestoredStack starts the relay workers on s.
+func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
+	if s == nil {
+		return errors.New("netbackend: restored stack is nil")
+	}
+	pf.mu.Lock()
+	if pf.closed {
+		pf.mu.Unlock()
+		return errors.New("netbackend: PortForwarder is closed")
+	}
+	if !pf.started {
+		pf.stack = s
+		pf.started = true
+		for _, b := range pf.tcpList {
+			pf.wg.Add(1)
+			go pf.serveTCP(b)
+		}
+		for _, b := range pf.udpList {
+			pf.wg.Add(1)
+			go pf.serveUDP(b)
+		}
+		pf.mu.Unlock()
+		return nil
+	}
+	pf.stack = s
+	var staleGuests []*gonet.UDPConn
+	for _, b := range pf.udpList {
+		for client, sess := range b.sessions {
+			staleGuests = append(staleGuests, sess.guest)
+			delete(b.sessions, client)
+		}
+	}
+	pf.mu.Unlock()
+	for _, g := range staleGuests {
+		_ = g.Close()
+	}
+	return nil
+}
+
+// RebindRestore rebinds all pre-bound port forwarders to target s.
+func (pf *PortForwarder) RebindRestore(s *stack.Stack) error {
+	return pf.AttachRestoredStack(s)
+}
+
+// RebindStack updates the target Netstack for all pre-bound port forwarders.
+func (pf *PortForwarder) RebindStack(s *stack.Stack) {
+	_ = pf.AttachRestoredStack(s)
+}
+
+func (pf *PortForwarder) targetStack() *stack.Stack {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	return pf.stack
 }
 
 // spawn runs fn on a tracked goroutine. It returns false after Close, so that
@@ -496,7 +555,7 @@ func (pf *PortForwarder) spawn(fn func()) bool {
 	return spawnTracked(&pf.mu, &pf.closed, &pf.wg, fn)
 }
 
-func (pf *PortForwarder) serveTCP(s *stack.Stack, b *boundTCPForward) {
+func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 	defer pf.wg.Done()
 	pf.mu.Lock()
 	acceptFn := pf.accept
@@ -523,7 +582,7 @@ func (pf *PortForwarder) serveTCP(s *stack.Stack, b *boundTCPForward) {
 			continue
 		}
 		backoff = 0
-		if !pf.spawn(func() { pf.relayTCPClient(s, guestAddr, hostConn) }) {
+		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, hostConn) }) {
 			_ = hostConn.Close()
 			return
 		}
@@ -533,7 +592,7 @@ func (pf *PortForwarder) serveTCP(s *stack.Stack, b *boundTCPForward) {
 // relayTCPClient connects hostConn to the guest endpoint and relays both
 // streams. The guest may start listening after the host client connects, so
 // the dial retries during the guest dial window.
-func (pf *PortForwarder) relayTCPClient(s *stack.Stack, guestAddr tcpip.FullAddress, hostConn net.Conn) {
+func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn net.Conn) {
 	defer func() { _ = hostConn.Close() }()
 
 	ctx, cancel := context.WithTimeout(pf.ctx, pf.guestDialWindow)
@@ -541,9 +600,13 @@ func (pf *PortForwarder) relayTCPClient(s *stack.Stack, guestAddr tcpip.FullAddr
 	var guestConn *gonet.TCPConn
 	for {
 		var err error
-		guestConn, err = gonet.DialContextTCP(ctx, s, guestAddr, ipv4.ProtocolNumber)
-		if err == nil {
-			break
+		if s := pf.targetStack(); s != nil {
+			guestConn, err = gonet.DialContextTCP(ctx, s, guestAddr, ipv4.ProtocolNumber)
+			if err == nil {
+				break
+			}
+		} else {
+			err = errors.New("target stack is nil")
 		}
 		select {
 		case <-ctx.Done():
@@ -556,7 +619,7 @@ func (pf *PortForwarder) relayTCPClient(s *stack.Stack, guestAddr tcpip.FullAddr
 	relayBidirectional(pf.ctx, hostConn, guestConn)
 }
 
-func (pf *PortForwarder) serveUDP(s *stack.Stack, b *boundUDPForward) {
+func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 	defer pf.wg.Done()
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
 	buf := make([]byte, maxUDPDatagram)
@@ -577,7 +640,7 @@ func (pf *PortForwarder) serveUDP(s *stack.Stack, b *boundUDPForward) {
 			continue
 		}
 		backoff = 0
-		sess := pf.udpSession(s, b, guestAddr, client)
+		sess := pf.udpSession(b, guestAddr, client)
 		if sess == nil {
 			continue
 		}
@@ -591,9 +654,9 @@ func (pf *PortForwarder) serveUDP(s *stack.Stack, b *boundUDPForward) {
 // udpSession returns the session of client. It creates the session and its
 // reply goroutine on the first datagram. It returns nil when the forwarder is
 // closed, the rule is at its session limit, or the guest endpoint fails.
-func (pf *PortForwarder) udpSession(s *stack.Stack, b *boundUDPForward, guestAddr tcpip.FullAddress, client netip.AddrPort) *udpForwardSession {
+func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, client netip.AddrPort) *udpForwardSession {
 	pf.mu.Lock()
-	if pf.closed {
+	if pf.closed || pf.stack == nil {
 		pf.mu.Unlock()
 		return nil
 	}
@@ -606,6 +669,7 @@ func (pf *PortForwarder) udpSession(s *stack.Stack, b *boundUDPForward, guestAdd
 		pf.log.Warn("netbackend: UDP forward session limit reached", "port", b.rule.HostPort, "client", client)
 		return nil
 	}
+	s := pf.stack
 	pf.mu.Unlock()
 
 	guest, err := gonet.DialUDP(s, nil, &guestAddr, ipv4.ProtocolNumber)
@@ -618,7 +682,7 @@ func (pf *PortForwarder) udpSession(s *stack.Stack, b *boundUDPForward, guestAdd
 	// Only this rule's serveUDP goroutine inserts sessions, so the earlier
 	// lookup cannot race with another insert for the same key.
 	pf.mu.Lock()
-	if pf.closed {
+	if pf.closed || pf.stack != s {
 		pf.mu.Unlock()
 		_ = guest.Close()
 		return nil

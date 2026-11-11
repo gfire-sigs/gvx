@@ -335,8 +335,12 @@ linux-only pkg/sentry/fsimpl/gofer/
 # (pkg/tcpip/stack/fib_xplat.go, pkg/tcpip/route_xplat.go). RouteAttrs joins tcpip.Route,
 # a lookup carries the mark of the socket, and a reject route has its own errors with
 # the errno of Linux. inet.Route gets the metric, the preferred source, and the MTU.
-# hostinet keeps its table of the host through the wider type.
+# hostinet keeps its table of the host through the wider type. RestoreRootStack and
+# afterLoad preserve saved child network namespaces and abstract sockets on restore
+# (pkg/sentry/inet/namespace_restore_xplat.go).
 seam pkg/sentry/inet/inet.go
+seam pkg/sentry/inet/inet_state_autogen.go
+seam pkg/sentry/inet/namespace.go
 seam pkg/sentry/socket/hostinet/netlink.go
 seam pkg/syserr/netstack.go
 seam pkg/tcpip/transport/internal/network/endpoint.go
