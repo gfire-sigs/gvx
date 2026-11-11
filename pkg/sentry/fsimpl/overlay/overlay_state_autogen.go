@@ -75,6 +75,8 @@ func (f *FilesystemOptions) StateFields() []string {
 	return []string{
 		"UpperRoot",
 		"LowerRoots",
+		"DirDevMajor",
+		"DirDevMinor",
 	}
 }
 
@@ -85,6 +87,8 @@ func (f *FilesystemOptions) StateSave(stateSinkObject state.Sink) {
 	f.beforeSave()
 	stateSinkObject.Save(0, &f.UpperRoot)
 	stateSinkObject.Save(1, &f.LowerRoots)
+	stateSinkObject.SaveUint32(2, &f.DirDevMajor)
+	stateSinkObject.SaveUint32(3, &f.DirDevMinor)
 }
 
 func (f *FilesystemOptions) afterLoad(context.Context) {}
@@ -93,6 +97,8 @@ func (f *FilesystemOptions) afterLoad(context.Context) {}
 func (f *FilesystemOptions) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.UpperRoot)
 	stateSourceObject.Load(1, &f.LowerRoots)
+	stateSourceObject.LoadUint32(2, &f.DirDevMajor)
+	stateSourceObject.LoadUint32(3, &f.DirDevMinor)
 }
 
 func (fs *filesystem) StateTypeName() string {
@@ -108,6 +114,7 @@ func (fs *filesystem) StateFields() []string {
 		"xattrOpaque",
 		"createCreds",
 		"dirDevMinor",
+		"dirDevMajor",
 		"lowerDevMinors",
 		"dirInoCache",
 		"lastDirIno",
@@ -127,10 +134,11 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveString(4, &fs.xattrOpaque)
 	stateSinkObject.Save(5, &fs.createCreds)
 	stateSinkObject.SaveUint32(6, &fs.dirDevMinor)
-	stateSinkObject.Save(7, &fs.lowerDevMinors)
-	stateSinkObject.Save(8, &fs.dirInoCache)
-	stateSinkObject.SaveUint64(9, &fs.lastDirIno)
-	stateSinkObject.SaveUint64(10, &fs.maxFilenameLen)
+	stateSinkObject.SaveUint32(7, &fs.dirDevMajor)
+	stateSinkObject.Save(8, &fs.lowerDevMinors)
+	stateSinkObject.Save(9, &fs.dirInoCache)
+	stateSinkObject.SaveUint64(10, &fs.lastDirIno)
+	stateSinkObject.SaveUint64(11, &fs.maxFilenameLen)
 }
 
 func (fs *filesystem) afterLoad(context.Context) {}
@@ -144,10 +152,11 @@ func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.LoadString(4, &fs.xattrOpaque)
 	stateSourceObject.Load(5, &fs.createCreds)
 	stateSourceObject.LoadUint32(6, &fs.dirDevMinor)
-	stateSourceObject.Load(7, &fs.lowerDevMinors)
-	stateSourceObject.Load(8, &fs.dirInoCache)
-	stateSourceObject.LoadUint64(9, &fs.lastDirIno)
-	stateSourceObject.LoadUint64(10, &fs.maxFilenameLen)
+	stateSourceObject.LoadUint32(7, &fs.dirDevMajor)
+	stateSourceObject.Load(8, &fs.lowerDevMinors)
+	stateSourceObject.Load(9, &fs.dirInoCache)
+	stateSourceObject.LoadUint64(10, &fs.lastDirIno)
+	stateSourceObject.LoadUint64(11, &fs.maxFilenameLen)
 }
 
 func (l *layerDevNumber) StateTypeName() string {

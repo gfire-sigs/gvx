@@ -21,6 +21,8 @@ import "time"
 // endpoints of a stack start with. It models net.ipv4.tcp_keepalive_time,
 // tcp_keepalive_intvl, and tcp_keepalive_probes. A socket option on an
 // endpoint overrides these values for that endpoint.
+//
+// +stateify savable
 type TCPKeepaliveDefaultsOption struct {
 	// Idle is the idle time before the first probe.
 	Idle time.Duration

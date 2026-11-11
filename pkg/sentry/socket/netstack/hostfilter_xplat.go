@@ -15,8 +15,7 @@
 package netstack
 
 import (
-	"sync/atomic"
-
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/link/nested"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -32,9 +31,11 @@ import (
 // Packet sockets sit below this endpoint and still see every frame. The drop
 // does not apply to a veth end that is a bridge port, because the bridge must
 // forward frames for other hosts.
+//
+// +stateify savable
 type hostFilterEndpoint struct {
 	nested.Endpoint
-	bridged atomic.Bool
+	bridged atomicbitops.Bool
 }
 
 // newHostFilterEndpoint wraps child, the endpoint that parses Ethernet headers.

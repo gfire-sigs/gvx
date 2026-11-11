@@ -697,7 +697,9 @@ func (it *IPTables) check(table Table, hook Hook, pkt *PacketBuffer, r *Route, a
 // beforeSave is invoked by stateify.
 func (it *IPTables) beforeSave() {
 	// Ensure the reaper exits cleanly.
-	it.reaper.Stop()
+	if it.reaper != nil {
+		it.reaper.Stop()
+	}
 	// Prevent others from modifying the connection table.
 	it.connections.mu.Lock()
 }

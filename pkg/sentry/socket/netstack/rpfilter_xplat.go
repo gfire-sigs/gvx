@@ -37,8 +37,10 @@ import (
 // default of the Linux kernel.
 
 // rpFilterState holds the rp_filter values of one network stack.
+//
+// +stateify savable
 type rpFilterState struct {
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// all and def are conf/all/rp_filter and conf/default/rp_filter.
 	all, def int32
 	// links holds the value of each link that the guest wrote.

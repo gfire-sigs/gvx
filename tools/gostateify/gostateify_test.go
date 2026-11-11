@@ -34,6 +34,7 @@ func TestGoldenUpstreamPackages(t *testing.T) {
 		"pkg/refs",
 		"pkg/sentry/checkpoint",
 		"pkg/sentry/fsimpl/kernfs",
+		"pkg/sentry/fsimpl/overlay",
 		"pkg/sentry/fsimpl/tmpfs",
 		"pkg/sentry/inet",
 		"pkg/sentry/kernel/auth",
@@ -42,9 +43,13 @@ func TestGoldenUpstreamPackages(t *testing.T) {
 		"pkg/sentry/limits",
 		"pkg/sentry/pgalloc",
 		"pkg/sentry/socket/control",
+		"pkg/sentry/socket/netstack",
 		"pkg/sentry/uniqueid",
 		"pkg/sentry/vfs",
+		"pkg/tcpip",
+		"pkg/tcpip/network/ipv4",
 		"pkg/tcpip/stack",
+		"pkg/tcpip/transport/tcp",
 		"pkg/tcpip/transport/udp",
 		"pkg/waiter",
 	}
@@ -530,6 +535,19 @@ func TestStructTagValidationAndAuxAutogenScoping(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "unsupported state struct tag") {
 			t.Fatalf("expected unsupported state struct tag error for %q, got: %v", badTag, err)
 		}
+	}
+
+	manualDir := filepath.Join(tmpRoot, "pkg", "manual_ok")
+	if err := os.MkdirAll(manualDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(manualDir, "manual.go"), "package manual\n\n// +stateify savable\ntype S struct {\n\tSaved int\n\tSkipped func() `state:\"manual\"`\n}\n")
+	if _, err := stateify.Run(stateify.Options{
+		RootDir:         tmpRoot,
+		Packages:        []string{"pkg/manual_ok"},
+		PartitionByTier: true,
+	}); err != nil {
+		t.Fatalf("expected state:\"manual\" to skip field cleanly, got: %v", err)
 	}
 
 	// 2. Verify auxiliary Tier 3 arch_x86_impl_state_autogen.go (amd64) does not suppress arm64 State.

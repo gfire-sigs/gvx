@@ -15,9 +15,8 @@
 package netstack
 
 import (
-	"sync/atomic"
-
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
@@ -50,9 +49,11 @@ const (
 // them, as Linux does for the MTU of a link. A change of the MTU through
 // netlink or ioctl must add the header again, or the link would read 14 bytes
 // less than the value that the guest set.
+//
+// +stateify savable
 type vethLink struct {
 	*veth.Endpoint
-	mtu atomic.Uint32
+	mtu atomicbitops.Uint32
 }
 
 // newVethLink returns the link of one end of a veth pair. The link starts with

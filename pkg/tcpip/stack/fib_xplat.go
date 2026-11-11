@@ -20,6 +20,7 @@ import (
 	"slices"
 	"sync/atomic"
 
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
@@ -54,6 +55,8 @@ const (
 
 // PolicyRule is one routing rule of an IP family. The fields hold the values that
 // "ip rule" prints. An unset match field matches every lookup.
+//
+// +stateify savable
 type PolicyRule struct {
 	// Priority orders the rules. The rule with the lowest value applies first.
 	Priority uint32
@@ -108,33 +111,37 @@ var (
 // fibRules holds the routing rules of a stack. A nil slice stands for the
 // default rules, so a stack needs no setup code. Both slices are sorted by
 // priority, and Stack.routeMu guards them.
+//
+// +stateify savable
 type fibRules struct {
 	rules4, rules6 []PolicyRule
 }
 
 // fibState holds the policies, the counters, and the snapshots of a stack that
 // a reader uses without routeMu. Every field is atomic.
+//
+// +stateify savable
 type fibState struct {
 	// proxyARP is the policy for proxy ARP. See proxyarp_xplat.go.
-	proxyARP atomic.Pointer[ProxyARPPolicy]
+	proxyARP atomic.Pointer[ProxyARPPolicy] `state:"nosave"`
 	// rpFilter is the policy for the reverse path check of received IPv4
 	// packets. See rpfilter_xplat.go.
-	rpFilter atomic.Pointer[RPFilterPolicy]
+	rpFilter atomic.Pointer[RPFilterPolicy] `state:"nosave"`
 
 	// hostAddrGen and hostAddrs hold the snapshot of the IPv4 addresses of the
 	// NICs. See hostaddr_xplat.go.
-	hostAddrGen atomic.Uint64
-	hostAddrs   atomic.Pointer[hostAddrSnapshot]
+	hostAddrGen atomicbitops.Uint64
+	hostAddrs   atomic.Pointer[hostAddrSnapshot] `state:"nosave"`
 
 	// routeGen counts the changes of the route list, and routeTables holds the
 	// count of routes in each table at one generation. See tablehas_xplat.go.
-	routeGen    atomic.Uint64
-	routeTables atomic.Pointer[routeTableCounts]
+	routeGen    atomicbitops.Uint64
+	routeTables atomic.Pointer[routeTableCounts] `state:"nosave"`
 
 	// nicGen counts the NICs that join or leave, and nicOrder holds the NICs in
 	// the order of the source address choice. See route_xplat.go.
-	nicGen   atomic.Uint64
-	nicOrder atomic.Pointer[nicOrderSnapshot]
+	nicGen   atomicbitops.Uint64
+	nicOrder atomic.Pointer[nicOrderSnapshot] `state:"nosave"`
 }
 
 var (

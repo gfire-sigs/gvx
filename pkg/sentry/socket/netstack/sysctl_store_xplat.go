@@ -37,8 +37,10 @@ const (
 
 // sysctlValues stores the text of the sysctl files of one Stack. A key that no
 // write stored has no entry, and the reader uses the default of the file.
+//
+// +stateify savable
 type sysctlValues struct {
-	mu     sync.Mutex
+	mu     sync.Mutex `state:"nosave"`
 	values map[string]string
 }
 

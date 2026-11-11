@@ -85,6 +85,10 @@ func (s *Stack) StateFields() []string {
 		"Stack",
 		"eventSubscriber",
 		"id",
+		"sysctls",
+		"offloads",
+		"rpFilter",
+		"linkConf",
 	}
 }
 
@@ -97,16 +101,23 @@ func (s *Stack) StateSave(stateSinkObject state.Sink) {
 	_ = (*stack.Stack)(StackValue)
 	stateSinkObject.Save(1, &s.eventSubscriber)
 	stateSinkObject.SaveUint64(2, &s.id)
+	stateSinkObject.Save(3, &s.sysctls)
+	stateSinkObject.Save(4, &s.offloads)
+	stateSinkObject.Save(5, &s.rpFilter)
+	stateSinkObject.Save(6, &s.linkConf)
 	stateSinkObject.SaveValue(0, StackValue)
 }
-
-func (s *Stack) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &s.eventSubscriber)
 	stateSourceObject.LoadUint64(2, &s.id)
+	stateSourceObject.Load(3, &s.sysctls)
+	stateSourceObject.Load(4, &s.offloads)
+	stateSourceObject.Load(5, &s.rpFilter)
+	stateSourceObject.Load(6, &s.linkConf)
 	stateSourceObject.LoadValueTo(0, (**stack.Stack)(nil), s)
+	stateSourceObject.AfterLoadTo(s)
 }
 
 // +checklocksignore
@@ -117,7 +128,12 @@ func (s *Stack) StateLoadValue(ctx context.Context, stateSlot int, stateValue an
 	}
 }
 
+// +checklocksignore
+func (s *Stack) StateAfterLoad(ctx context.Context) {
+	s.afterLoad(ctx)
+}
+
 func init() {
 	state.RegisterNoHooks((*sock)(nil))
-	state.RegisterNoHooks((*Stack)(nil))
+	state.RegisterStruct((*Stack)(nil))
 }

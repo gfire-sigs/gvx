@@ -714,6 +714,7 @@ func (p *protocol) StateFields() []string {
 		"maxRTO",
 		"maxRetries",
 		"synRetries",
+		"keepaliveDefaults",
 		"dispatcher",
 	}
 }
@@ -740,7 +741,8 @@ func (p *protocol) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(14, &p.maxRTO)
 	stateSinkObject.SaveUint32(15, &p.maxRetries)
 	stateSinkObject.SaveUint8(16, &p.synRetries)
-	stateSinkObject.Save(17, &p.dispatcher)
+	stateSinkObject.Save(17, &p.keepaliveDefaults)
+	stateSinkObject.Save(18, &p.dispatcher)
 }
 
 // +checklocksignore
@@ -762,7 +764,8 @@ func (p *protocol) StateLoad(ctx context.Context, stateSourceObject state.Source
 	stateSourceObject.Load(14, &p.maxRTO)
 	stateSourceObject.LoadUint32(15, &p.maxRetries)
 	stateSourceObject.LoadUint8(16, &p.synRetries)
-	stateSourceObject.Load(17, &p.dispatcher)
+	stateSourceObject.Load(17, &p.keepaliveDefaults)
+	stateSourceObject.Load(18, &p.dispatcher)
 	stateSourceObject.AfterLoadTo(p)
 }
 

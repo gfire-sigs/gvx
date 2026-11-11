@@ -136,6 +136,8 @@ func startsTCPConn(flags header.TCPFlags) bool {
 }
 
 // tcpSeen is what the tracker knows of one direction of a TCP connection.
+//
+// +stateify savable
 type tcpSeen struct {
 	// end is the highest sequence number after the data that the sender sent.
 	end uint32
@@ -153,6 +155,8 @@ type tcpSeen struct {
 // tcpTrack is the Linux view of the state of a TCP connection. The stack
 // still keeps the window state of the connection in tcpconntrack.TCB. That
 // state decides whether a RST ends the connection.
+//
+// +stateify savable
 type tcpTrack struct {
 	// state is a ConntrackTCP* value.
 	state uint8
@@ -173,6 +177,8 @@ type tcpTrack struct {
 }
 
 // connProto is the state that the timeout of a connection needs.
+//
+// +stateify savable
 type connProto struct {
 	tcp tcpTrack
 	// assured tells that traffic in both directions made the connection

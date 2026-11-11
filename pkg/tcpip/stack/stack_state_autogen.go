@@ -302,6 +302,8 @@ func (cn *conn) StateFields() []string {
 		"tcb",
 		"lastUsed",
 		"replySeen",
+		"extState",
+		"connAtomics",
 	}
 }
 
@@ -319,6 +321,8 @@ func (cn *conn) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(6, &cn.tcb)
 	stateSinkObject.Save(7, &cn.lastUsed)
 	stateSinkObject.SaveBool(8, &cn.replySeen)
+	stateSinkObject.Save(9, &cn.extState)
+	stateSinkObject.Save(10, &cn.connAtomics)
 }
 
 func (cn *conn) afterLoad(context.Context) {}
@@ -334,6 +338,8 @@ func (cn *conn) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(6, &cn.tcb)
 	stateSourceObject.Load(7, &cn.lastUsed)
 	stateSourceObject.LoadBool(8, &cn.replySeen)
+	stateSourceObject.Load(9, &cn.extState)
+	stateSourceObject.Load(10, &cn.connAtomics)
 }
 
 func (ct *ConnTrack) StateTypeName() string {
@@ -346,6 +352,7 @@ func (ct *ConnTrack) StateFields() []string {
 		"nftIDSeed",
 		"clock",
 		"buckets",
+		"connTrackLimits",
 	}
 }
 
@@ -358,9 +365,8 @@ func (ct *ConnTrack) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveUint32(1, &ct.nftIDSeed)
 	stateSinkObject.Save(2, &ct.clock)
 	stateSinkObject.Save(3, &ct.buckets)
+	stateSinkObject.Save(4, &ct.connTrackLimits)
 }
-
-func (ct *ConnTrack) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (ct *ConnTrack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
@@ -368,6 +374,13 @@ func (ct *ConnTrack) StateLoad(ctx context.Context, stateSourceObject state.Sour
 	stateSourceObject.LoadUint32(1, &ct.nftIDSeed)
 	stateSourceObject.Load(2, &ct.clock)
 	stateSourceObject.Load(3, &ct.buckets)
+	stateSourceObject.Load(4, &ct.connTrackLimits)
+	stateSourceObject.AfterLoadTo(ct)
+}
+
+// +checklocksignore
+func (ct *ConnTrack) StateAfterLoad(ctx context.Context) {
+	ct.afterLoad(ctx)
 }
 
 func (bkt *bucket) StateTypeName() string {
@@ -2257,6 +2270,8 @@ func (s *Stack) StateFields() []string {
 		"packetEndpointWriteSupported",
 		"demux",
 		"stats",
+		"fibRules",
+		"fib",
 		"defaultForwardingEnabled",
 		"preservedNICs",
 		"preservedRoutes",
@@ -2278,6 +2293,7 @@ func (s *Stack) StateFields() []string {
 		"tsOffsetSecret",
 		"externalNetworkingDisabled",
 		"allowConnectedOnSave",
+		"neighborTables",
 	}
 }
 
@@ -2290,27 +2306,30 @@ func (s *Stack) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(3, &s.packetEndpointWriteSupported)
 	stateSinkObject.Save(4, &s.demux)
 	stateSinkObject.Save(5, &s.stats)
-	stateSinkObject.Save(6, &s.defaultForwardingEnabled)
-	stateSinkObject.Save(7, &s.preservedNICs)
-	stateSinkObject.Save(8, &s.preservedRoutes)
-	stateSinkObject.Save(9, &s.cleanupEndpoints)
-	stateSinkObject.Save(10, &s.PortManager)
-	stateSinkObject.Save(11, &s.clock)
-	stateSinkObject.Save(12, &s.clockResolution)
-	stateSinkObject.SaveBool(13, &s.handleLocal)
-	stateSinkObject.Save(14, &s.nftablesConfigured)
-	stateSinkObject.Save(15, &s.restoredEndpoints)
-	stateSinkObject.Save(16, &s.resumableEndpoints)
-	stateSinkObject.Save(17, &s.icmpRateLimiter)
-	stateSinkObject.SaveUint32(18, &s.seed)
-	stateSinkObject.Save(19, &s.nudConfigs)
-	stateSinkObject.Save(20, &s.nudDisp)
-	stateSinkObject.Save(21, &s.sendBufferSize)
-	stateSinkObject.Save(22, &s.receiveBufferSize)
-	stateSinkObject.Save(23, &s.tcpInvalidRateLimit)
-	stateSinkObject.SaveUint32(24, &s.tsOffsetSecret)
-	stateSinkObject.SaveBool(25, &s.externalNetworkingDisabled)
-	stateSinkObject.SaveBool(26, &s.allowConnectedOnSave)
+	stateSinkObject.Save(6, &s.fibRules)
+	stateSinkObject.Save(7, &s.fib)
+	stateSinkObject.Save(8, &s.defaultForwardingEnabled)
+	stateSinkObject.Save(9, &s.preservedNICs)
+	stateSinkObject.Save(10, &s.preservedRoutes)
+	stateSinkObject.Save(11, &s.cleanupEndpoints)
+	stateSinkObject.Save(12, &s.PortManager)
+	stateSinkObject.Save(13, &s.clock)
+	stateSinkObject.Save(14, &s.clockResolution)
+	stateSinkObject.SaveBool(15, &s.handleLocal)
+	stateSinkObject.Save(16, &s.nftablesConfigured)
+	stateSinkObject.Save(17, &s.restoredEndpoints)
+	stateSinkObject.Save(18, &s.resumableEndpoints)
+	stateSinkObject.Save(19, &s.icmpRateLimiter)
+	stateSinkObject.SaveUint32(20, &s.seed)
+	stateSinkObject.Save(21, &s.nudConfigs)
+	stateSinkObject.Save(22, &s.nudDisp)
+	stateSinkObject.Save(23, &s.sendBufferSize)
+	stateSinkObject.Save(24, &s.receiveBufferSize)
+	stateSinkObject.Save(25, &s.tcpInvalidRateLimit)
+	stateSinkObject.SaveUint32(26, &s.tsOffsetSecret)
+	stateSinkObject.SaveBool(27, &s.externalNetworkingDisabled)
+	stateSinkObject.SaveBool(28, &s.allowConnectedOnSave)
+	stateSinkObject.Save(29, &s.neighborTables)
 }
 
 // +checklocksignore
@@ -2321,27 +2340,30 @@ func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadBool(3, &s.packetEndpointWriteSupported)
 	stateSourceObject.Load(4, &s.demux)
 	stateSourceObject.Load(5, &s.stats)
-	stateSourceObject.Load(6, &s.defaultForwardingEnabled)
-	stateSourceObject.Load(7, &s.preservedNICs)
-	stateSourceObject.Load(8, &s.preservedRoutes)
-	stateSourceObject.Load(9, &s.cleanupEndpoints)
-	stateSourceObject.Load(10, &s.PortManager)
-	stateSourceObject.Load(11, &s.clock)
-	stateSourceObject.Load(12, &s.clockResolution)
-	stateSourceObject.LoadBool(13, &s.handleLocal)
-	stateSourceObject.Load(14, &s.nftablesConfigured)
-	stateSourceObject.Load(15, &s.restoredEndpoints)
-	stateSourceObject.Load(16, &s.resumableEndpoints)
-	stateSourceObject.Load(17, &s.icmpRateLimiter)
-	stateSourceObject.LoadUint32(18, &s.seed)
-	stateSourceObject.Load(19, &s.nudConfigs)
-	stateSourceObject.Load(20, &s.nudDisp)
-	stateSourceObject.Load(21, &s.sendBufferSize)
-	stateSourceObject.Load(22, &s.receiveBufferSize)
-	stateSourceObject.Load(23, &s.tcpInvalidRateLimit)
-	stateSourceObject.LoadUint32(24, &s.tsOffsetSecret)
-	stateSourceObject.LoadBool(25, &s.externalNetworkingDisabled)
-	stateSourceObject.LoadBool(26, &s.allowConnectedOnSave)
+	stateSourceObject.Load(6, &s.fibRules)
+	stateSourceObject.Load(7, &s.fib)
+	stateSourceObject.Load(8, &s.defaultForwardingEnabled)
+	stateSourceObject.Load(9, &s.preservedNICs)
+	stateSourceObject.Load(10, &s.preservedRoutes)
+	stateSourceObject.Load(11, &s.cleanupEndpoints)
+	stateSourceObject.Load(12, &s.PortManager)
+	stateSourceObject.Load(13, &s.clock)
+	stateSourceObject.Load(14, &s.clockResolution)
+	stateSourceObject.LoadBool(15, &s.handleLocal)
+	stateSourceObject.Load(16, &s.nftablesConfigured)
+	stateSourceObject.Load(17, &s.restoredEndpoints)
+	stateSourceObject.Load(18, &s.resumableEndpoints)
+	stateSourceObject.Load(19, &s.icmpRateLimiter)
+	stateSourceObject.LoadUint32(20, &s.seed)
+	stateSourceObject.Load(21, &s.nudConfigs)
+	stateSourceObject.Load(22, &s.nudDisp)
+	stateSourceObject.Load(23, &s.sendBufferSize)
+	stateSourceObject.Load(24, &s.receiveBufferSize)
+	stateSourceObject.Load(25, &s.tcpInvalidRateLimit)
+	stateSourceObject.LoadUint32(26, &s.tsOffsetSecret)
+	stateSourceObject.LoadBool(27, &s.externalNetworkingDisabled)
+	stateSourceObject.LoadBool(28, &s.allowConnectedOnSave)
+	stateSourceObject.Load(29, &s.neighborTables)
 	stateSourceObject.AfterLoadTo(s)
 }
 
@@ -2608,7 +2630,7 @@ func init() {
 	state.RegisterNoHooks((*tuple)(nil))
 	state.RegisterNoHooks((*tupleID)(nil))
 	state.RegisterNoHooks((*conn)(nil))
-	state.RegisterNoHooks((*ConnTrack)(nil))
+	state.RegisterStruct((*ConnTrack)(nil))
 	state.RegisterNoHooks((*bucket)(nil))
 	state.RegisterStruct((*ICMPRateLimiter)(nil))
 	state.RegisterNoHooks((*AcceptTarget)(nil))

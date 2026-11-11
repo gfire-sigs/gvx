@@ -91,7 +91,7 @@ type FilesystemOptions struct {
 	// numbers that the directories of the overlay report as st_dev. The
 	// default is an anonymous number. The root file system of a sandbox sets
 	// them to the number of its disk (see dirdev_xplat.go).
-	DirDevMajor, DirDevMinor uint32 `state:"nosave"`
+	DirDevMajor, DirDevMinor uint32
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -123,8 +123,8 @@ type filesystem struct {
 	dirDevMinor uint32
 
 	// dirDevMajor is the device major number used for directories. It is
-	// immutable. A restored filesystem has the anonymous major number 0.
-	dirDevMajor uint32 `state:"nosave"`
+	// immutable.
+	dirDevMajor uint32
 
 	// lowerDevMinors maps device numbers from lower layer filesystems to
 	// device minor numbers assigned to non-directory files originating from
@@ -795,6 +795,7 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 	// deleted. Note that overlayfs never calls VFS.InvalidateDentry(), so
 	// d.vfsd.IsDead() indicates that d was deleted.
 	if !d.vfsd.IsDead() && d.watches.Size() > 0 {
+		d.fs.unused.remove(d)
 		return
 	}
 

@@ -297,6 +297,7 @@ func (e *endpoint) StateTypeName() string {
 
 func (e *endpoint) StateFields() []string {
 	return []string{
+		"allowMartianLoopback",
 		"nic",
 		"dispatcher",
 		"protocol",
@@ -314,30 +315,32 @@ func (e *endpoint) beforeSave() {}
 // +checklocksignore
 func (e *endpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
-	stateSinkObject.Save(0, &e.nic)
-	stateSinkObject.Save(1, &e.dispatcher)
-	stateSinkObject.Save(2, &e.protocol)
-	stateSinkObject.Save(3, &e.stats)
-	stateSinkObject.Save(4, &e.enabled)
-	stateSinkObject.Save(5, &e.forwarding)
-	stateSinkObject.Save(6, &e.multicastForwarding)
-	stateSinkObject.Save(7, &e.addressableEndpointState)
-	stateSinkObject.Save(8, &e.igmp)
+	stateSinkObject.Save(0, &e.allowMartianLoopback)
+	stateSinkObject.Save(1, &e.nic)
+	stateSinkObject.Save(2, &e.dispatcher)
+	stateSinkObject.Save(3, &e.protocol)
+	stateSinkObject.Save(4, &e.stats)
+	stateSinkObject.Save(5, &e.enabled)
+	stateSinkObject.Save(6, &e.forwarding)
+	stateSinkObject.Save(7, &e.multicastForwarding)
+	stateSinkObject.Save(8, &e.addressableEndpointState)
+	stateSinkObject.Save(9, &e.igmp)
 }
 
 func (e *endpoint) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (e *endpoint) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &e.nic)
-	stateSourceObject.Load(1, &e.dispatcher)
-	stateSourceObject.Load(2, &e.protocol)
-	stateSourceObject.Load(3, &e.stats)
-	stateSourceObject.Load(4, &e.enabled)
-	stateSourceObject.Load(5, &e.forwarding)
-	stateSourceObject.Load(6, &e.multicastForwarding)
-	stateSourceObject.Load(7, &e.addressableEndpointState)
-	stateSourceObject.Load(8, &e.igmp)
+	stateSourceObject.Load(0, &e.allowMartianLoopback)
+	stateSourceObject.Load(1, &e.nic)
+	stateSourceObject.Load(2, &e.dispatcher)
+	stateSourceObject.Load(3, &e.protocol)
+	stateSourceObject.Load(4, &e.stats)
+	stateSourceObject.Load(5, &e.enabled)
+	stateSourceObject.Load(6, &e.forwarding)
+	stateSourceObject.Load(7, &e.multicastForwarding)
+	stateSourceObject.Load(8, &e.addressableEndpointState)
+	stateSourceObject.Load(9, &e.igmp)
 }
 
 func (p *protocol) StateTypeName() string {

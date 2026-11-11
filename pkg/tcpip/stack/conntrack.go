@@ -192,8 +192,8 @@ type conn struct {
 	replySeen bool
 
 	// +checklocks:stateMu
-	extState    `state:"nosave"`
-	connAtomics `state:"nosave"`
+	extState
+	connAtomics
 }
 
 // timedOut returns whether the connection timed out based on its state.
@@ -262,7 +262,7 @@ type ConnTrack struct {
 	// +checklocks:mu
 	buckets []bucket
 
-	connTrackLimits `state:"nosave"`
+	connTrackLimits
 }
 
 // +stateify savable
@@ -743,7 +743,9 @@ func (cn *conn) getFinalizeResult() finalizeResult {
 // goroutines will block until the finalizing goroutine finishes finalizing.
 func (cn *conn) finalize() bool {
 	cn.finalizeOnce.Do(func() {
-		cn.finalizeResult.Store(uint32(cn.ct.finalize(cn)))
+		if cn.getFinalizeResult() == 0 {
+			cn.finalizeResult.Store(uint32(cn.ct.finalize(cn)))
+		}
 	})
 
 	switch res := cn.getFinalizeResult(); res {

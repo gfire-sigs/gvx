@@ -573,7 +573,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/tcpip/network/ipv4",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/tcpip/*"},
+		allowed:   []string{"pkg/state", "pkg/tcpip/*"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
@@ -585,13 +585,13 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/tcpip/stack",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/tcpip/*", "pkg/atomicbitops", "pkg/log", "pkg/sync"},
+		allowed:   []string{"pkg/tcpip/*", "pkg/atomicbitops", "pkg/log", "pkg/state", "pkg/sync"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
 		pkg:       "pkg/tcpip/transport/tcp",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/tcpip/*", "pkg/waiter"},
+		allowed:   []string{"pkg/state", "pkg/tcpip/*", "pkg/waiter"},
 		forbidden: lowLevelTier2Bans,
 	},
 
@@ -631,7 +631,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/fsimpl/overlay",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/sentry/vfs"},
+		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/sentry/uniqueid", "pkg/sentry/vfs", "pkg/state"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -744,7 +744,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/socket/netstack",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/abi/linux/errno", "pkg/context", "pkg/errors", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/sentry/inet", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/nlmsg", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
+		allowed:   []string{"pkg/abi/linux", "pkg/abi/linux/errno", "pkg/atomicbitops", "pkg/context", "pkg/errors", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/sentry/inet", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/nlmsg", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -892,8 +892,8 @@ var boundaryTestExceptions = []importException{
 	{[]string{"e2e"}, "golang.org/x/sys/unix/*", "Unix e2e tests configure non-blocking host descriptors and signals"},
 	{[]string{"e2e"}, "golang.zx2c4.com/wireguard/*", "WireGuard e2e tests pair sandboxes with an in-memory peer"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/hvcommon"}, "golang.org/x/arch/*", "unit tests disassemble generated guest stubs"},
-	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/socket/netlink/genetlink/wireguard"}, "pkg/sentry/pgalloc", "unit tests back mapped file chunks or kernel memory with pgalloc.MemoryFile"},
-	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/socket/netlink/genetlink/wireguard"}, "pkg/memutil", "unit tests allocate backing memory for pgalloc.MemoryFile"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/overlay", "pkg/sentry/socket/netlink/genetlink/wireguard"}, "pkg/sentry/pgalloc", "unit tests back mapped file chunks or kernel memory with pgalloc.MemoryFile"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/overlay", "pkg/sentry/socket/netlink/genetlink/wireguard"}, "pkg/memutil", "unit tests allocate backing memory for pgalloc.MemoryFile"},
 	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/chunkcache"}, "pkg/sentry/usage", "pgalloc.AllocOpts requires usage.MemoryKind"},
 	{[]string{"pkg/sentry/devices/memdev", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/proc", "pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite", "pkg/sentry/fsimpl/sys"}, "pkg/sentry/uniqueid", "vfs.Init in unit tests requires uniqueid.Provider on context"},
 	{[]string{"pkg/sentry/fsimpl/cgroup2fs"}, "pkg/sentry/kernel/auth", "cgroup2fs VFS unit tests pass auth.Credentials to OpenAt and MkdirAt"},
@@ -911,16 +911,17 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/waiter", "FIFO unit test blocks inside VFS via waiter.Queue"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "vDSO test verifies that the mapped image omits x18"},
 	{[]string{"pkg/sentry/arch", "pkg/sentry/socket/netlink"}, "pkg/usermem", "unit tests read and write guest structures through usermem"},
-	{[]string{"pkg/sentry/devices/memdev", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/proc", "pkg/sentry/fsimpl/sys"}, "pkg/sentry/ktime", "unit tests supply a synthetic clock to filesystem contexts"},
+	{[]string{"pkg/sentry/devices/memdev", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/overlay", "pkg/sentry/fsimpl/proc", "pkg/sentry/fsimpl/sys"}, "pkg/sentry/ktime", "unit tests supply a synthetic clock to filesystem contexts"},
 	{[]string{"pkg/sentry/fsimpl/erofs", "pkg/sentry/fsimpl/cgroup2fs"}, "pkg/hostarch", "unit tests align pages and user address ranges with hostarch constants"},
 	{[]string{"pkg/sentry/fsimpl/erofs", "pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs"}, "pkg/sentry/memmap", "unit tests construct or exercise memmap mappable implementations"},
-	{[]string{"pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/proc", "pkg/sentry/fsimpl/sys"}, "pkg/fspath", "VFS unit tests parse virtual paths with fspath.Parse"},
+	{[]string{"pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/overlay", "pkg/sentry/fsimpl/proc", "pkg/sentry/fsimpl/sys"}, "pkg/fspath", "VFS unit tests parse virtual paths with fspath.Parse"},
+	{[]string{"pkg/sentry/fsimpl/overlay"}, "pkg/sentry/fsimpl/tmpfs", "overlay save and restore tests mount tmpfs layers"},
 	{[]string{"pkg/sentry/devices/memdev", "pkg/sentry/fsimpl/cgroup2fs", "pkg/sentry/fsimpl/proc", "pkg/sentry/fsimpl/sys", "pkg/sentry/mm", "pkg/sentry/loader"}, "pkg/sentry/limits", "unit tests attach a limits.LimitSet to test contexts"},
 	{[]string{"pkg/sentry/fsimpl/sys"}, "pkg/syserr", "sysfs unit tests compare syserr error codes"},
 	{[]string{"pkg/sentry/mm", "pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs"}, "pkg/sentry/arch", "unit tests construct arch.Context64 address spaces or syscall tables"},
 	{[]string{"pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs"}, "pkg/abi", "unit tests pass abi.Linux to arch or syscall table registration"},
 	{[]string{"pkg/sentry/loader"}, "pkg/abi/linux", "loader tests construct ELF program headers with Linux ABI constants"},
-	{[]string{"pkg/sentry/loader"}, "pkg/sentry/kernel/auth", "loader tests supply auth.NewRootCredentials to VFS"},
+	{[]string{"pkg/sentry/fsimpl/overlay", "pkg/sentry/loader"}, "pkg/sentry/kernel/auth", "unit tests supply auth.NewRootCredentials to VFS"},
 	{[]string{"pkg/sentry/loader", "pkg/sentry/fsimpl/cgroup2fs"}, "pkg/sentry/platform", "unit tests provide a minimal platform.Platform stub"},
 	{[]string{"pkg/sentry/loader"}, "pkg/sentry/vfs", "loader tests map synthetic ELF segments from an anonymous VFS file"},
 	{[]string{"pkg/sentry/socket/netfilter", "pkg/sentry/socket/netstack", "pkg/tcpip/network/ipv4", "pkg/tcpip/network/ipv6", "pkg/tcpip/stack"}, "pkg/buffer", "packet unit tests construct payloads with pkg/buffer"},

@@ -86,7 +86,7 @@ var _ IGMPEndpoint = (*endpoint)(nil)
 type endpoint struct {
 	// allowMartianLoopback is the route_localnet setting of this endpoint. See
 	// martian_xplat.go.
-	allowMartianLoopback atomicbitops.Bool `state:"nosave"`
+	allowMartianLoopback atomicbitops.Bool
 
 	nic        stack.NetworkInterface
 	dispatcher stack.TransportDispatcher

@@ -30,7 +30,8 @@ func (s *Stack) beforeSave() {
 	s.routeMu.RLock()
 	s.preservedRoutes = nil
 	for r := s.routeTable.Front(); r != nil; r = r.Next() {
-		if _, ok := s.preservedNICs[r.NIC]; ok {
+		_, preservedNIC := s.preservedNICs[r.NIC]
+		if preservedNIC || r.TableID() != tcpip.RouteTableMain || r.RouteType() != tcpip.RouteTypeUnicast {
 			rCopy := *r
 			rCopy.RouteEntry = tcpip.RouteEntry{}
 			s.preservedRoutes = append(s.preservedRoutes, rCopy)
@@ -100,7 +101,21 @@ func (s *Stack) afterLoad(context.Context) {
 	s.ensureRNG()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.nics == nil {
+		s.nics = make(map[tcpip.NICID]*nic)
+	}
 	if s.preservedNICs == nil {
 		s.preservedNICs = make(map[tcpip.NICID]*nic)
+	}
+}
+
+// afterLoad reseeds ct.rng after restore.
+func (ct *ConnTrack) afterLoad(context.Context) {
+	if ct.rng == nil {
+		var v int64
+		if err := binary.Read(cryptorand.Reader, binary.LittleEndian, &v); err != nil {
+			panic(err)
+		}
+		ct.rng = rand.New(&lockedRandomSource{src: rand.NewSource(v)})
 	}
 }
