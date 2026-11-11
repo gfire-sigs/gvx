@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -32,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/pipe"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
@@ -262,38 +262,7 @@ func ReadAtToBlocks(dsts safemem.BlockSeq, off int64, readAt func(p []byte, off 
 
 // SeekRegular computes the new file offset for a regular file description.
 func SeekRegular(curOff, offset int64, whence int32, fileSize func() (int64, error)) (int64, error) {
-	var newOff int64
-	switch whence {
-	case linux.SEEK_SET:
-		newOff = offset
-	case linux.SEEK_CUR:
-		newOff = curOff + offset
-	case linux.SEEK_END, linux.SEEK_DATA, linux.SEEK_HOLE:
-		size, err := fileSize()
-		if err != nil {
-			return 0, err
-		}
-		switch whence {
-		case linux.SEEK_END:
-			newOff = size + offset
-		case linux.SEEK_DATA:
-			if offset < 0 || offset >= size {
-				return 0, linuxerr.ENXIO
-			}
-			newOff = offset
-		default:
-			if offset < 0 || offset >= size {
-				return 0, linuxerr.ENXIO
-			}
-			newOff = size
-		}
-	default:
-		return 0, linuxerr.EINVAL
-	}
-	if newOff < 0 {
-		return 0, linuxerr.EINVAL
-	}
-	return newOff, nil
+	return fsutilx.SeekRegular(curOff, offset, whence, fileSize)
 }
 
 // DirCursor tracks the snapshot and offset of an open directory description.
@@ -367,34 +336,13 @@ func TryIncRef(refs *atomicbitops.Int64) bool {
 // CheckXattrPrefix accepts the user, trusted, and security extended attribute
 // namespaces and rejects all other prefixes with EOPNOTSUPP.
 func CheckXattrPrefix(name string) error {
-	for _, prefix := range []string{linux.XATTR_USER_PREFIX, linux.XATTR_TRUSTED_PREFIX, linux.XATTR_SECURITY_PREFIX} {
-		if strings.HasPrefix(name, prefix) {
-			return nil
-		}
-	}
-	return linuxerr.EOPNOTSUPP
+	return fsutilx.CheckXattrPrefix(name)
 }
 
 // FilterXattrList filters extended attribute names for a caller with creds and
 // validates that the null-terminated list fits within size when size is non-zero.
 func FilterXattrList(all []string, creds *auth.Credentials, size uint64) ([]string, error) {
-	haveCap := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
-	names := make([]string, 0, len(all))
-	listSize := 0
-	for _, name := range all {
-		if CheckXattrPrefix(name) != nil {
-			continue
-		}
-		if !haveCap && strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
-			continue
-		}
-		names = append(names, name)
-		listSize += len(name) + 1
-	}
-	if size != 0 && uint64(listSize) > size {
-		return nil, linuxerr.ERANGE
-	}
-	return names, nil
+	return fsutilx.FilterXattrList(all, creds, size)
 }
 
 // OpenSpecial opens a FIFO, character device, or block device node and returns

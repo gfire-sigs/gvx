@@ -1574,11 +1574,8 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 	}
 	stat := &opts.Stat
 	if stat.Mask&linux.STATX_SIZE != 0 {
-		if d.inode.isDir() {
-			return linuxerr.EISDIR
-		}
-		if !d.inode.isRegular() {
-			return linuxerr.EINVAL
+		if err := checkTruncateFileType(uint32(e.attr.Mode)); err != nil {
+			return err
 		}
 		if opts.NeedWritePerm {
 			// truncate(2), unlike ftruncate(2), needs write access to the
@@ -1639,24 +1636,6 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 	}
 	d.inode.invalidateMeta()
 	return d.refresh()
-}
-
-// clearSUIDAndSGID clears the set-user-ID and set-group-ID bits of a
-// non-directory mode. Upstream vfs.ClearSUIDAndSGID tests ModeDirectory without
-// masking the file type, which misclassifies S_IFBLK (0x6000) and S_IFSOCK
-// (0xc000) as directories.
-func clearSUIDAndSGID(mode uint32) uint32 {
-	if mode&linux.S_IFMT == linux.S_IFDIR {
-		return mode
-	}
-	return vfs.ClearSUIDAndSGID(mode&^uint32(linux.S_IFMT)) | (mode & linux.S_IFMT)
-}
-
-func statxTime(ts linux.StatxTimestamp, now time.Time) time.Time {
-	if ts.Nsec == linux.UTIME_NOW {
-		return now
-	}
-	return time.Unix(ts.Sec, int64(ts.Nsec))
 }
 
 func (d *dentry) isDead() bool {
@@ -1740,10 +1719,6 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	return stat, nil
 }
 
-func statxTimestamp(t time.Time) linux.StatxTimestamp {
-	return linux.StatxTimestamp{Sec: t.Unix(), Nsec: uint32(t.Nanosecond())}
-}
-
 // statxFor builds the stat result for entry e of this inode.
 func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 	info := e.info
@@ -1773,25 +1748,25 @@ func (i *inode) statxFor(e entry, devMinor uint32) linux.Statx {
 	if blocks == 0 && info.size > 0 {
 		blocks = (uint64(info.size) + 511) / 512
 	}
-	st := linux.Statx{
-		Mask:     linux.STATX_BASIC_STATS | linux.STATX_BTIME,
-		Blksize:  4096,
-		Nlink:    nlink,
-		UID:      e.attr.UID,
-		GID:      e.attr.GID,
-		Mode:     uint16(e.attr.Mode),
-		Ino:      i.ino,
-		Size:     uint64(info.size),
-		Blocks:   blocks,
-		Atime:    statxTimestamp(info.atime),
-		Mtime:    statxTimestamp(mtime),
-		Ctime:    statxTimestamp(ctime),
-		Btime:    statxTimestamp(btime),
-		DevMajor: 0,
-		DevMinor: devMinor,
-	}
-	st.RdevMajor, st.RdevMinor = unpackRdev(e.attr.Rdev)
-	return st
+	rdevMajor, rdevMinor := unpackRdev(e.attr.Rdev)
+	return newHostfsStatx(hostfsStatxAttr{
+		Blksize:   4096,
+		Nlink:     nlink,
+		UID:       e.attr.UID,
+		GID:       e.attr.GID,
+		Mode:      uint16(e.attr.Mode),
+		Ino:       i.ino,
+		Size:      uint64(info.size),
+		Blocks:    blocks,
+		Atime:     statxTimestamp(info.atime),
+		Mtime:     statxTimestamp(mtime),
+		Ctime:     statxTimestamp(ctime),
+		Btime:     statxTimestamp(btime),
+		DevMajor:  0,
+		DevMinor:  devMinor,
+		RdevMajor: rdevMajor,
+		RdevMinor: rdevMinor,
+	})
 }
 
 // StatFSAt implements vfs.FilesystemImpl.StatFSAt. It reports the capacity of

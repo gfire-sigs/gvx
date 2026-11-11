@@ -18,6 +18,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -45,27 +46,28 @@ func timeFromStatx(ts linux.StatxTimestamp, now tstamp) tstamp {
 // statx builds the stat result of the inode.
 func (i *inode) statx() linux.Statx {
 	a := i.attr()
-	st := linux.Statx{
-		Mask:     linux.STATX_BASIC_STATS | linux.STATX_BTIME,
-		Blksize:  blockSize,
-		Nlink:    a.links,
-		UID:      a.uid,
-		GID:      a.gid,
-		Mode:     a.mode,
-		Ino:      uint64(i.ino),
-		Size:     a.size,
-		Blocks:   a.nblocks * (blockSize / 512),
-		Atime:    statxTimestamp(a.atime),
-		Mtime:    statxTimestamp(a.mtime),
-		Ctime:    statxTimestamp(a.ctime),
-		Btime:    statxTimestamp(a.crtime),
-		DevMajor: i.fs.dev.Major,
-		DevMinor: i.fs.dev.Minor,
-	}
+	var rdevMajor, rdevMinor uint32
 	if i.kind == modeChar || i.kind == modeBlock {
-		st.RdevMajor, st.RdevMinor = decodeRdev(a.rdev)
+		rdevMajor, rdevMinor = decodeRdev(a.rdev)
 	}
-	return st
+	return fsutilx.NewStatx(fsutilx.StatxAttr{
+		Blksize:   blockSize,
+		Nlink:     a.links,
+		UID:       a.uid,
+		GID:       a.gid,
+		Mode:      a.mode,
+		Ino:       uint64(i.ino),
+		Size:      a.size,
+		Blocks:    a.nblocks * (blockSize / 512),
+		Atime:     statxTimestamp(a.atime),
+		Mtime:     statxTimestamp(a.mtime),
+		Ctime:     statxTimestamp(a.ctime),
+		Btime:     statxTimestamp(a.crtime),
+		DevMajor:  i.fs.dev.Major,
+		DevMinor:  i.fs.dev.Minor,
+		RdevMajor: rdevMajor,
+		RdevMinor: rdevMinor,
+	})
 }
 
 // atimeOff reports that the mount keeps the old access time: the volume is
@@ -125,11 +127,8 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.M
 	if mask == 0 {
 		return nil
 	}
-	if mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID|linux.STATX_ATIME|linux.STATX_MTIME|linux.STATX_CTIME|linux.STATX_SIZE) != 0 {
-		return linuxerr.EPERM
-	}
 	mode, uid, gid := i.owner()
-	if err := vfs.CheckSetStat(ctx, creds, opts, mode, nil, uid, gid); err != nil {
+	if err := fsutilx.CheckSetStat(ctx, creds, opts, mode, uid, gid); err != nil {
 		return err
 	}
 	if opts.NeedWritePerm {
@@ -142,11 +141,8 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.M
 	return i.fs.writeOp(mnt, func() error {
 		bumpC := false
 		if mask&linux.STATX_SIZE != 0 {
-			switch {
-			case i.isDir():
-				return linuxerr.EISDIR
-			case !i.isRegular():
-				return linuxerr.EINVAL
+			if err := fsutilx.CheckTruncateFileType(uint32(i.kind)); err != nil {
+				return err
 			}
 			if err := i.truncate(stat.Size); err != nil {
 				return err

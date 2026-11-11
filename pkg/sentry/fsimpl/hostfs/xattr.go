@@ -24,7 +24,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
@@ -61,54 +61,17 @@ const (
 	maxXattrBytes = 4096
 )
 
-func checkXattrPrefix(name string) error {
-	return chunkcache.CheckXattrPrefix(name)
-}
-
-// xattrBytes returns the size that the meta store charges for m.
-func xattrBytes(m map[string][]byte) int {
-	total := 0
-	for name, value := range m {
-		total += len(name) + len(value)
-	}
-	return total
-}
-
 // setXattrMap returns a copy of cur with name set to value. It applies the
 // create and replace flags and the size limit of the meta store, and it
 // returns a Linux errno on failure.
 func setXattrMap(cur map[string][]byte, name string, value []byte, flags uint32) (map[string][]byte, error) {
-	if len(value) > linux.XATTR_SIZE_MAX {
-		return nil, linuxerr.E2BIG
-	}
-	_, exists := cur[name]
-	if flags&linux.XATTR_CREATE != 0 && exists {
-		return nil, linuxerr.EEXIST
-	}
-	if flags&linux.XATTR_REPLACE != 0 && !exists {
-		return nil, linuxerr.ENODATA
-	}
-	next := make(map[string][]byte, len(cur)+1)
-	maps.Copy(next, cur)
-	next[name] = slices.Clone(value)
-	if xattrBytes(next) > maxXattrBytes {
-		return nil, linuxerr.ENOSPC
-	}
-	return next, nil
+	return fsutilx.SetXattrMap(cur, name, value, flags, maxXattrBytes)
 }
 
 // removeXattrMap returns a copy of cur without name. It returns ENODATA when
 // cur has no such name. An empty result is nil.
 func removeXattrMap(cur map[string][]byte, name string) (map[string][]byte, error) {
-	if _, ok := cur[name]; !ok {
-		return nil, linuxerr.ENODATA
-	}
-	if len(cur) == 1 {
-		return nil, nil
-	}
-	next := maps.Clone(cur)
-	delete(next, name)
-	return next, nil
+	return fsutilx.RemoveXattrMap(cur, name)
 }
 
 // xattrTarget names the object that an extended attribute call reaches.
@@ -359,63 +322,35 @@ func (d *dentry) listXattr(creds *auth.Credentials, size uint64, h *hostHandle) 
 	if err != nil {
 		return nil, err
 	}
-	return chunkcache.FilterXattrList(all, creds, size)
+	return fsutilx.FilterXattrList(all, creds, size)
 }
 
 func (d *dentry) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions, h *hostHandle) (string, error) {
 	e := d.inode.snapshot()
 	mode, uid, gid := linux.FileMode(e.attr.Mode), auth.KUID(e.attr.UID), auth.KGID(e.attr.GID)
-	// Linux requires read permission for the namespaces that are not security,
-	// system, or trusted, and it checks before any handler rejects the name.
-	if vfs.XattrReadNeedsFilePermission(opts.Name) {
-		if err := vfs.GenericCheckPermissions(creds, vfs.MayRead, mode, nil, uid, gid); err != nil {
-			return "", err
-		}
-	}
-	if err := checkXattrPrefix(opts.Name); err != nil {
-		return "", err
-	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayRead, mode, uid, opts.Name); err != nil {
+	if err := fsutilx.CheckGetXattr(creds, mode, uid, gid, opts.Name); err != nil {
 		return "", err
 	}
 	raw, err := d.fs.ws.xattrGet(d.xattrTarget(h), opts.Name)
 	if err != nil {
 		return "", err
 	}
-	value := string(raw)
-	// The size is a hint of the caller. A larger value gets ERANGE.
-	if opts.Size != 0 && uint64(len(value)) > opts.Size {
-		return "", linuxerr.ERANGE
-	}
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
-		return auth.FixupVfsCapDataOnGet(creds, value)
-	}
-	return value, nil
+	return fsutilx.FinishGetXattr(creds, opts, raw)
 }
 
 func (d *dentry) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.SetXattrOptions, h *hostHandle) error {
-	if err := checkXattrPrefix(opts.Name); err != nil {
-		return err
-	}
 	e := d.inode.snapshot()
 	mode, uid, gid := linux.FileMode(e.attr.Mode), auth.KUID(e.attr.UID), auth.KGID(e.attr.GID)
-	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, nil, uid, gid); err != nil {
-		return err
-	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, uid, opts.Name); err != nil {
+	if err := fsutilx.CheckSetXattr(creds, mode, uid, gid, opts.Name); err != nil {
 		return err
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return err
 	}
 	defer mnt.EndWrite()
-	value := opts.Value
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
-		var err error
-		value, err = auth.FixupVfsCapDataOnSet(creds, value, uid, gid)
-		if err != nil {
-			return err
-		}
+	value, err := fsutilx.PrepareSetXattrValue(creds, uid, gid, opts)
+	if err != nil {
+		return err
 	}
 	return d.mutateXattr(opts.Name, h, func(t xattrTarget) error {
 		return d.fs.ws.xattrSet(t, opts.Name, []byte(value), opts.Flags)
@@ -423,15 +358,9 @@ func (d *dentry) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.Set
 }
 
 func (d *dentry) removeXattr(creds *auth.Credentials, mnt *vfs.Mount, name string, h *hostHandle) error {
-	if err := checkXattrPrefix(name); err != nil {
-		return err
-	}
 	e := d.inode.snapshot()
 	mode, uid, gid := linux.FileMode(e.attr.Mode), auth.KUID(e.attr.UID), auth.KGID(e.attr.GID)
-	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, nil, uid, gid); err != nil {
-		return err
-	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, uid, name); err != nil {
+	if err := fsutilx.CheckRemoveXattr(creds, mode, uid, gid, name); err != nil {
 		return err
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {

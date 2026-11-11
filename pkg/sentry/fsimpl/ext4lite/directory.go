@@ -20,6 +20,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -109,23 +110,11 @@ func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) er
 func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	var newOff int64
-	switch whence {
-	case linux.SEEK_SET:
-		newOff = offset
-	case linux.SEEK_CUR:
-		newOff = fd.pos + offset
-	case linux.SEEK_END:
-		n := fd.dentry.inode.n
-		n.mu.RLock()
-		size := n.size
-		n.mu.RUnlock()
-		newOff = int64(size) + offset
-	default:
-		return 0, linuxerr.EINVAL
-	}
-	if newOff < 0 {
-		return 0, linuxerr.EINVAL
+	newOff, err := fsutilx.SeekBasic(fd.pos, offset, whence, func() (int64, error) {
+		return int64(fd.dentry.inode.size()), nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	fd.pos = newOff
 	return newOff, nil

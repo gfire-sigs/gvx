@@ -300,7 +300,7 @@ func (fd *regularFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs
 func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	newOff, err := chunkcache.SeekRegular(fd.off, offset, whence, func() (int64, error) {
+	newOff, err := seekRegular(fd.off, offset, whence, func() (int64, error) {
 		info, err := fd.h.fstat(fd.dentry.fs.ws.host)
 		if err != nil {
 			return 0, translateHostError(err)

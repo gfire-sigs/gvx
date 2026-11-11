@@ -17,15 +17,10 @@ package ext4lite
 import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
-	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
-
-func checkXattrPrefix(name string) error {
-	return chunkcache.CheckXattrPrefix(name)
-}
 
 // listXattr returns the names of the attributes that the caller may see. The
 // trusted namespace stays hidden from a caller without CAP_SYS_ADMIN, as in
@@ -35,57 +30,29 @@ func (i *inode) listXattr(creds *auth.Credentials, size uint64) ([]string, error
 	if err != nil {
 		return nil, toLinuxErr(err)
 	}
-	return chunkcache.FilterXattrList(all, creds, size)
+	return fsutilx.FilterXattrList(all, creds, size)
 }
 
 func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
 	mode, uid, gid := i.owner()
-	// Linux requires read permission for the namespaces that are not security,
-	// system, or trusted, and it checks before any handler rejects the name.
-	if vfs.XattrReadNeedsFilePermission(opts.Name) {
-		if err := vfs.GenericCheckPermissions(creds, vfs.MayRead, mode, nil, uid, gid); err != nil {
-			return "", err
-		}
-	}
-	if err := checkXattrPrefix(opts.Name); err != nil {
-		return "", err
-	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayRead, mode, uid, opts.Name); err != nil {
+	if err := fsutilx.CheckGetXattr(creds, mode, uid, gid, opts.Name); err != nil {
 		return "", err
 	}
 	raw, err := i.n.getXattr(opts.Name)
 	if err != nil {
 		return "", toLinuxErr(err)
 	}
-	value := string(raw)
-	// The size is a hint of the caller. A larger value gets ERANGE.
-	if opts.Size != 0 && uint64(len(value)) > opts.Size {
-		return "", linuxerr.ERANGE
-	}
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
-		return auth.FixupVfsCapDataOnGet(creds, value)
-	}
-	return value, nil
+	return fsutilx.FinishGetXattr(creds, opts, raw)
 }
 
 func (i *inode) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.SetXattrOptions) error {
-	if err := checkXattrPrefix(opts.Name); err != nil {
-		return err
-	}
 	mode, uid, gid := i.owner()
-	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, nil, uid, gid); err != nil {
+	if err := fsutilx.CheckSetXattr(creds, mode, uid, gid, opts.Name); err != nil {
 		return err
 	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, uid, opts.Name); err != nil {
+	value, err := fsutilx.PrepareSetXattrValue(creds, uid, gid, opts)
+	if err != nil {
 		return err
-	}
-	value := opts.Value
-	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
-		var err error
-		value, err = auth.FixupVfsCapDataOnSet(creds, value, uid, gid)
-		if err != nil {
-			return err
-		}
 	}
 	create := opts.Flags&linux.XATTR_CREATE != 0
 	replace := opts.Flags&linux.XATTR_REPLACE != 0
@@ -99,14 +66,8 @@ func (i *inode) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.SetX
 }
 
 func (i *inode) removeXattr(creds *auth.Credentials, mnt *vfs.Mount, name string) error {
-	if err := checkXattrPrefix(name); err != nil {
-		return err
-	}
 	mode, uid, gid := i.owner()
-	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, nil, uid, gid); err != nil {
-		return err
-	}
-	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, uid, name); err != nil {
+	if err := fsutilx.CheckRemoveXattr(creds, mode, uid, gid, name); err != nil {
 		return err
 	}
 	return i.fs.writeOp(mnt, func() error {
