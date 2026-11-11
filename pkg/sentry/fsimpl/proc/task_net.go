@@ -736,13 +736,7 @@ func (d *netRouteData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		}
 
 		// /proc/net/route does not include broadcast or multicast routes.
-		if rt.Type == linux.RTN_BROADCAST || rt.Type == linux.RTN_MULTICAST {
-			continue
-		}
-
-		// /proc/net/route lists the table main only, as fib_route_seq_start
-		// does. A route with table 0 belongs to the table main.
-		if rt.Table != 0 && rt.Table != linux.RT_TABLE_MAIN {
+		if rt.Type == linux.RTN_BROADCAST || rt.Type == linux.RTN_MULTICAST || !isMainTableRoute(rt) {
 			continue
 		}
 

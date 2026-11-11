@@ -809,27 +809,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 	// No suitable waste pages or we can't use them.
 retryFree:
 	// Try to allocate free pages from existing chunks.
-	var ufgap unfreeGapIterator
-	if alloc.opts.Dir == BottomUp {
-		ufgap = unfree.FirstLargeEnoughGap(alloc.length)
-	} else {
-		ufgap = unfree.LastLargeEnoughGap(alloc.length)
-	}
-	if ufgap.Ok() && !alloc.huge {
-		if alignedFR, ok := alignSmallAllocRange(ufgap.Range(), alloc.length, alloc.opts.Dir); ok {
-			fr = alignedFR
-		} else {
-			need := alloc.length + uint64(unix.Getpagesize()) - uint64(hostarch.PageSize)
-			if alloc.opts.Dir == BottomUp {
-				ufgap = unfree.FirstLargeEnoughGap(need)
-			} else {
-				ufgap = unfree.LastLargeEnoughGap(need)
-			}
-			if ufgap.Ok() {
-				fr, _ = alignSmallAllocRange(ufgap.Range(), alloc.length, alloc.opts.Dir)
-			}
-		}
-	}
+	ufgap := findUnfreeAllocGap(unfree, alloc, &fr)
 	if !ufgap.Ok() {
 		// Extend the file to create more chunks.
 		err = f.extendChunksLocked(alloc)
@@ -838,19 +818,6 @@ retryFree:
 		}
 		// Retry the allocation using new chunks.
 		goto retryFree
-	}
-	if fr.Length() == 0 {
-		if alloc.opts.Dir == BottomUp {
-			fr = memmap.FileRange{
-				Start: ufgap.Start(),
-				End:   ufgap.Start() + alloc.length,
-			}
-		} else {
-			fr = memmap.FileRange{
-				Start: ufgap.End() - alloc.length,
-				End:   ufgap.End(),
-			}
-		}
 	}
 	unfree.Insert(ufgap, fr, unfreeInfo{refs: 1})
 	// These pages should all be known-decommitted; mark them

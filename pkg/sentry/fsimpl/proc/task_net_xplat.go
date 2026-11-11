@@ -15,6 +15,7 @@
 package proc
 
 import (
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/kernfs"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
@@ -35,4 +36,11 @@ func (fs *filesystem) addNetfilterNameFiles(ctx context.Context, root *auth.Cred
 	if stack.SupportsIPv6() {
 		contents["ip6_tables_names"] = fs.newInode(ctx, root, 0440, newStaticFile(netfilterTableNames))
 	}
+}
+
+// isMainTableRoute reports whether rt belongs to the main routing table.
+// Linux fib_route_seq_start lists only the main table in /proc/net/route, and
+// table 0 aliases RT_TABLE_MAIN.
+func isMainTableRoute(rt inet.Route) bool {
+	return rt.Table == 0 || rt.Table == linux.RT_TABLE_MAIN
 }

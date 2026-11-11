@@ -742,7 +742,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/syscalls/linux",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/errors/linuxerr", "pkg/sentry/vfs"},
+		allowed:   []string{"pkg/abi/linux", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/sentry/arch", "pkg/sentry/kernel", "pkg/sentry/limits", "pkg/sentry/syscalls", "pkg/sentry/usage", "pkg/sentry/vfs", "pkg/waiter"},
 		forbidden: append([]string{xSysWindows}, tier2UpperBans...),
 	},
 	{

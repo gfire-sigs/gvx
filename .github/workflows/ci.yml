@@ -40,6 +40,7 @@ env:
     ./pkg/sentry/hostcpu/... ./pkg/sentry/kernel/... ./pkg/sentry/loader/... ./pkg/sentry/mm/... ./pkg/sentry/pgalloc/... ./pkg/sentry/time/...
     ./pkg/sentry/platform ./pkg/sentry/platform/hvcommon/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
     ./pkg/sentry/socket/netfilter/... ./pkg/sentry/socket/netlink/... ./pkg/sentry/socket/netstack/...
+    ./pkg/sentry/syscalls/linux/...
     ./pkg/tcpip/network/ipv4/... ./pkg/tcpip/network/ipv6/... ./pkg/tcpip/stack/... ./pkg/tcpip/transport/tcp/...
   # Packages that gvx wrote. Upstream packages carry vet findings that the
   # project does not fix.
@@ -117,7 +118,7 @@ jobs:
           path: ~/.cache/gvx/upstream
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
       - name: Audit upstream diff
-        run: go run ./tools/upstream -mode=audit -max-ratio=0.05
+        run: go run ./tools/upstream -mode=audit -max-ratio=0.042
       - name: Build a module that imports pkg/gvx
         run: ./scripts/check-consumer.sh
       - name: Check license notices

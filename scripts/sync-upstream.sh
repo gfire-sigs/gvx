@@ -18,7 +18,7 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 cd -- "$repo_root"
-go run ./tools/upstream -mode=sync -root=. -max-ratio=0.05 -regen-stateify "$@"
+go run ./tools/upstream -mode=sync -root=. -max-ratio=0.042 -regen-stateify "$@"
 
 # Step 7: verify stateify drift, all five host targets, Android arm64, and gVisor analyzers.
 "$script_dir/gostateify.sh" -check

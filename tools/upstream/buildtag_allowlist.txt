@@ -55,16 +55,10 @@ seam pkg/sentry/fsimpl/overlay/filesystem.go
 # SetEntries also gives each matcher the set of hooks that reach its rule, as the physdev match needs
 # (pkg/sentry/socket/netfilter/physdev_matcher_xplat.go).
 seam pkg/sentry/socket/netfilter/netfilter.go
-# Content seam: marshalMatcher writes the revision of the match into the entry, so that iptables
-# reads the revision of the matches mark and multiport back.
-seam pkg/sentry/socket/netfilter/extensions.go
 
 # Content seam: getEntries4 and getEntries6 report the inverted input interface flag ("! -i").
 seam pkg/sentry/socket/netfilter/ipv4.go
 seam pkg/sentry/socket/netfilter/ipv6.go
-
-# Content seam: the DNAT revision 2 target reports its real size (80 bytes).
-seam pkg/sentry/socket/netfilter/dnat.go
 
 # Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno_xplat.go).
 seam pkg/syserr/syserr.go
@@ -142,15 +136,6 @@ seam pkg/tcpip/network/ipv4/ipv4.go
 # written pages (pkg/sentry/mm/hostwrite_windows.go and hostwrite_xplat.go).
 seam pkg/sentry/mm/io.go
 
-# Content seam: inotify_add_watch(2) asks a dentry to admit the watch before it adds one
-# (pkg/sentry/syscalls/linux/sys_inotify.go). hostfs returns ENOSPC above 8192 watched objects.
-seam pkg/sentry/syscalls/linux/sys_inotify.go
-
-# Content seam: fallocate(2) forwards a mode other than 0 to a file description that serves it
-# (pkg/sentry/syscalls/linux/sys_file.go and sys_file_xplat.go). ext4lite and hostfs serve the
-# modes KEEP_SIZE, PUNCH_HOLE, and, on ext4lite, ZERO_RANGE, COLLAPSE_RANGE, and INSERT_RANGE.
-seam pkg/sentry/syscalls/linux/sys_file.go
-
 # Content seams: New TCP endpoints start with the keepalive defaults of the stack, which
 # net.ipv4.tcp_keepalive_time, tcp_keepalive_intvl, and tcp_keepalive_probes set
 # (pkg/tcpip/transport/tcp/keepalive_xplat.go and pkg/tcpip/keepalive_xplat.go).
@@ -183,15 +168,11 @@ seam pkg/sentry/fsimpl/proc/tasks.go
 # /proc/mounts and mountinfo show the device of a file system on a disk as the mount source
 # (pkg/sentry/vfs/mount_source_xplat.go).
 seam pkg/sentry/vfs/mount.go
-# /proc/meminfo and sysinfo(2) ask the kernel for the total memory, which a sandbox with a memory
+# /proc/meminfo asks the kernel for the total memory, which a sandbox with a memory
 # limit sets for its own kernel (pkg/sentry/kernel/total_memory_xplat.go).
 seam pkg/sentry/fsimpl/proc/tasks_files.go
-seam pkg/sentry/syscalls/linux/sys_sysinfo.go
 
-# Content seams: the kernel log (GVXIP-005, P1). syslog(2) reads the per-kernel ring buffer
-# in pkg/sentry/kernel/syslog_xplat.go.
-seam pkg/sentry/syscalls/linux/sys_syslog.go
-seam pkg/sentry/syscalls/linux/linux64.go
+# Content seams: the kernel log and conntrack limits (GVXIP-005, P1).
 # A target that logs the interfaces of a packet runs through InterfaceTarget
 # (pkg/tcpip/stack/iptables_target_xplat.go). The seam is one call in checkRule.
 # The OUTPUT and PREROUTING hooks drop a packet that needs a new connection when the table is

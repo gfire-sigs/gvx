@@ -17,9 +17,54 @@ package pgalloc
 import (
 	"fmt"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
+
+// findUnfreeAllocGap selects a free gap and target range in unfree for alloc,
+// aligning small allocations to host pages when possible.
+func findUnfreeAllocGap(unfree *unfreeSet, alloc *allocState, out *memmap.FileRange) unfreeGapIterator {
+	*out = memmap.FileRange{}
+	var ufgap unfreeGapIterator
+	if alloc.opts.Dir == BottomUp {
+		ufgap = unfree.FirstLargeEnoughGap(alloc.length)
+	} else {
+		ufgap = unfree.LastLargeEnoughGap(alloc.length)
+	}
+	if ufgap.Ok() && !alloc.huge {
+		if alignedFR, ok := alignSmallAllocRange(ufgap.Range(), alloc.length, alloc.opts.Dir); ok {
+			*out = alignedFR
+			return ufgap
+		}
+		need := alloc.length + uint64(unix.Getpagesize()) - uint64(hostarch.PageSize)
+		if alloc.opts.Dir == BottomUp {
+			ufgap = unfree.FirstLargeEnoughGap(need)
+		} else {
+			ufgap = unfree.LastLargeEnoughGap(need)
+		}
+		if ufgap.Ok() {
+			*out, _ = alignSmallAllocRange(ufgap.Range(), alloc.length, alloc.opts.Dir)
+		}
+	}
+	if !ufgap.Ok() {
+		return ufgap
+	}
+	if out.Length() == 0 {
+		if alloc.opts.Dir == BottomUp {
+			*out = memmap.FileRange{
+				Start: ufgap.Start(),
+				End:   ufgap.Start() + alloc.length,
+			}
+		} else {
+			*out = memmap.FileRange{
+				Start: ufgap.End() - alloc.length,
+				End:   ufgap.End(),
+			}
+		}
+	}
+	return ufgap
+}
 
 // AllocateAligned is Allocate for a range that starts at a multiple of align.
 // Allocate aligns a range to guest pages only, so a misaligned result is
