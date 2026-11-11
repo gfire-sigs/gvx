@@ -31,7 +31,7 @@ testbuild -o "$work/root/systrap.test" ./pkg/sentry/platform/systrap
 testbuild -o "$work/root/hostfs.test" ./pkg/sentry/fsimpl/hostfs
 testbuild -o "$work/root/ext4lite.test" ./pkg/sentry/fsimpl/ext4lite
 testbuild -o "$work/root/e2e.test" ./e2e
-for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow; do
+for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow checkpointprobe; do
 	build -ldflags=-linkmode=internal -o "$work/root/guests/$g" "./internal/acceptprog/$g"
 done
 build -ldflags="-linkmode=internal -T 0x1001000" -o "$work/root/guests/brkgrow-0x1001000" ./internal/acceptprog/brkgrow

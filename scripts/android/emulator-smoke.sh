@@ -38,7 +38,7 @@ env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/hos
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/ext4lite.test" ./pkg/sentry/fsimpl/ext4lite
 env "${android_env[@]}" go test -c -trimpath -ldflags="-s -w" -o "$work/bins/e2e.test" ./e2e
 GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$work/bins/rungv-static" ./cmd/rungv
-for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow; do
+for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe membarrierprobe eintrprobe fsfeatures voltree compatprobe microbench parityprobe nodeprobe cpumaxprobe ptracegs brkgrow checkpointprobe; do
 	GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags=-linkmode=internal -o "$work/bins/$g" "./internal/acceptprog/$g"
 done
 GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-linkmode=internal -T 0x1001000" -o "$work/bins/brkgrow-0x1001000" ./internal/acceptprog/brkgrow
