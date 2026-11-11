@@ -573,6 +573,18 @@ func newWorkspaceKey(hostPath string, file, readOnly bool) workspaceKey {
 // directory gets its own workspace and its own table. openMounts must run
 // before the host lockdown.
 func (s *Sandbox) openMounts() error {
+	return s.openMountsWithMode(false)
+}
+
+// openMountsForRestore opens every mount before the host lockdown in restore
+// mode: hostfs workspaces keep unlinked .gvx_tmp_* backing files until
+// CompleteRestore claims them, and ext4lite volumes defer orphan cleanup until
+// CompleteRestore rebinds open orphan inodes.
+func (s *Sandbox) openMountsForRestore() error {
+	return s.openMountsWithMode(true)
+}
+
+func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	volumes := make(map[string]bool)
 	for _, m := range s.cfg.mountList() {
@@ -595,7 +607,7 @@ func (s *Sandbox) openMounts() error {
 				return fmt.Errorf("gvx: volume %s is mounted twice: %w", m.volumeLabel(), ErrInvalidConfig)
 			}
 			volumes[image] = true
-			vol, err := s.openVolumeImage(m, image)
+			vol, err := s.openVolumeImageWithMode(m, image, forRestore)
 			if err != nil {
 				return err
 			}
@@ -614,7 +626,12 @@ func (s *Sandbox) openMounts() error {
 			key := newWorkspaceKey(hostPath, isFile, m.ReadOnly)
 			ws, ok := shared[key]
 			if !ok {
-				if ws, err = hostfs.OpenWorkspace(hostPath, m.ReadOnly); err != nil {
+				if forRestore {
+					ws, err = hostfs.OpenWorkspaceForRestore(hostPath, m.ReadOnly)
+				} else {
+					ws, err = hostfs.OpenWorkspace(hostPath, m.ReadOnly)
+				}
+				if err != nil {
 					return fmt.Errorf("gvx: open mount %s from %q: %w", m.GuestPath, hostPath, err)
 				}
 				shared[key] = ws
@@ -691,12 +708,18 @@ func (c Config) resolveVolumeDriver(m Mount) (MountDriver, error) {
 // read-only and never creates it. For a named volume, it also creates the
 // volume directory. For an ImagePath, the directory must exist.
 func (s *Sandbox) openVolumeImage(m Mount, image string) (*ext4lite.Volume, error) {
+	return s.openVolumeImageWithMode(m, image, false)
+}
+
+func (s *Sandbox) openVolumeImageWithMode(m Mount, image string, forRestore bool) (*ext4lite.Volume, error) {
 	if info, err := os.Stat(image); err == nil && !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("gvx: volume %s: %q is not a regular file (mode %s)", m.volumeLabel(), image, info.Mode().Type())
 	}
 	flags := os.O_RDWR | os.O_CREATE
 	if m.ReadOnly {
 		flags = os.O_RDONLY
+	} else if forRestore {
+		flags = os.O_RDWR
 	} else if m.ImagePath == "" {
 		if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
 			return nil, fmt.Errorf("gvx: create the volume directory: %w", err)
@@ -706,7 +729,10 @@ func (s *Sandbox) openVolumeImage(m Mount, image string) (*ext4lite.Volume, erro
 	if err != nil {
 		return nil, fmt.Errorf("gvx: open volume %s: %w", m.volumeLabel(), err)
 	}
-	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{ReadOnly: m.ReadOnly})
+	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{
+		ReadOnly:           m.ReadOnly,
+		DeferOrphanCleanup: forRestore,
+	})
 	if errors.Is(err, ext4lite.ErrVolumeInUse) {
 		return nil, fmt.Errorf("gvx: volume %s is in use by another sandbox: %w", m.volumeLabel(), err)
 	}

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"regexp"
@@ -50,6 +51,9 @@ const (
 
 // NetworkMode selects the Netstack egress backend.
 type NetworkMode string
+
+// NetMode is an alias for NetworkMode.
+type NetMode = NetworkMode
 
 const (
 	// NetModeNAT selects Track A: L4 Go net NAT and inbound port forwarding.
@@ -333,6 +337,16 @@ type Config struct {
 	// defaults to runtime.GOARCH. The hardware backends run only the host
 	// architecture.
 	Architecture string
+
+	// CheckpointDir is an optional host directory where New or Restore
+	// pre-opens the checkpoint bundle files (manifest.json, state.img,
+	// pages.meta, and pages.img) before the host lockdown.
+	CheckpointDir string
+
+	// CheckpointListener is an optional pre-bound listener for external
+	// checkpoint control requests. When set, New and Restore count it as a
+	// pre-bound listener in the host lockdown profile and Close closes it.
+	CheckpointListener net.Listener
 
 	// DisableHostLockdown skips pkg/hostlockdown. New applies the lockdown
 	// (Windows RestrictedToken and JobObject, or macOS Seatbelt) by default,

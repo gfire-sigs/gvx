@@ -24,7 +24,7 @@ type preservedEndpoint interface {
 	PreserveAcrossSaveRestore() bool
 }
 
-func isPreservedEndpoint(ep LinkEndpoint) bool {
+func isPreservedEndpoint(ep NetworkLinkEndpoint) bool {
 	p, ok := ep.(preservedEndpoint)
 	return ok && p.PreserveAcrossSaveRestore()
 }
