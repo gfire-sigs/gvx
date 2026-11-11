@@ -569,7 +569,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/tcpip/stack",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/tcpip/*", "pkg/log", "pkg/sync"},
+		allowed:   []string{"pkg/tcpip/*", "pkg/atomicbitops", "pkg/log", "pkg/sync"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
@@ -694,10 +694,11 @@ var boundaryRules = []importRule{
 		forbidden: append([]string{"pkg/sentry/kernel/*", "pkg/sentry/vfs/*", "pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf"}, tier2UpperBans...),
 	},
 	{
-		pkg:       "pkg/sentry/platform/systrap/usertrap",
-		tier:      Tier3Upstream,
-		subtree:   true,
-		forbidden: append([]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf"}, tier2UpperBans...),
+		pkg:            "pkg/sentry/platform/systrap/usertrap",
+		tier:           Tier2Sibling,
+		subtree:        true,
+		forbidden:      append([]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf"}, tier2UpperBans...),
+		forbiddenTier2: []string{"pkg/sentry/kernel/*"},
 	},
 	{
 		pkg:       "pkg/sentry/socket/netfilter",
@@ -773,6 +774,7 @@ var sentryAPIUsers = []string{
 	"pkg/sentry/platform/hvf",
 	"pkg/sentry/platform/hvcommon",
 	"pkg/sentry/platform/systrap",
+	"pkg/sentry/platform/systrap/usertrap",
 }
 
 var platformBackends = []string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/systrap"}

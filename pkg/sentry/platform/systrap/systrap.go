@@ -157,14 +157,7 @@ type platformContext struct {
 	// faultAccess infers the access of a fault when the host reports none.
 	faultAccess faultAccessInferrer
 
-	// subBlockSeq is the number of stores that the sub-block layer ran when
-	// the thread resumed last (subblock_xplat.go).
-	subBlockSeq uint64
-	// subBlockChanges is the number of stub mapping changes of the sub-block
-	// layer when the thread resumed last. subBlockRetries counts the SIGILLs
-	// in a row that the layer made the thread run again.
-	subBlockChanges uint64
-	subBlockRetries int
+	subBlockContext
 }
 
 // PullFullState implements platform.Context.PullFullState.
@@ -198,10 +191,7 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 	}
 
 restart:
-	if s.subBlocks != nil {
-		c.subBlockSeq = s.subBlocks.beforeSwitch(ctx, mm)
-		c.subBlockChanges = s.subBlocks.changes.Load()
-	}
+	s.beforeSubBlockSwitch(ctx, c, mm)
 	isSyscall, needPatch, at, err := s.switchToApp(c, ac)
 	if err != nil {
 		return nil, hostarch.NoAccess, err
@@ -225,25 +215,8 @@ restart:
 	}
 
 	si := c.signalInfo
-
-	// A store into a composite page of the sub-block layer faults. The layer
-	// runs it, or reports it as a signal when it cannot (subblock_xplat.go).
-	if s.subBlocks != nil && !isSyscall && at.Write && linux.Signal(si.Signo) == linux.SIGSEGV {
-		switch s.subBlocks.emulateStore(c, ac) {
-		case storeFaultEmulated:
-			goto restart
-		case storeFaultRefused:
-			at = hostarch.NoAccess
-		}
-	}
-	if s.subBlocks != nil {
-		// A bounded number of retries keeps a guest that runs an invalid
-		// instruction from looping while other threads change mappings.
-		if s.subBlocks.fixMissingPageFault(&si, &at, ac, c.subBlockChanges) && c.subBlockRetries < 16 {
-			c.subBlockRetries++
-			goto restart
-		}
-		c.subBlockRetries = 0
+	if s.resolveSubBlockFault(c, ac, &si, &at) {
+		goto restart
 	}
 
 	// See if this can be handled as a CPUID exception.
