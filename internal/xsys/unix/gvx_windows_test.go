@@ -3,6 +3,7 @@
 package unix_test
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"testing"
@@ -205,5 +206,63 @@ func TestGvxMincoreReportsWorkingSetResidency(t *testing.T) {
 	}
 	if vec[3]&1 != 0 {
 		t.Fatalf("vec[3] = %#x, want non-resident for an untouched committed page", vec[3])
+	}
+}
+
+func TestGvxSeekRejectsDataAndHoleAndPreadv2Works(t *testing.T) {
+	f := gvxTempFile(t, 4096)
+	fd := int(f.Fd())
+
+	if _, err := unix.Seek(fd, 0, unix.SEEK_DATA); !errors.Is(err, unix.EINVAL) {
+		t.Fatalf("Seek(SEEK_DATA) = %v, want EINVAL", err)
+	}
+	if _, err := unix.Seek(fd, 0, unix.SEEK_HOLE); !errors.Is(err, unix.EINVAL) {
+		t.Fatalf("Seek(SEEK_HOLE) = %v, want EINVAL", err)
+	}
+	if pos, err := unix.Seek(fd, 128, unix.SEEK_SET); err != nil || pos != 128 {
+		t.Fatalf("Seek(SEEK_SET, 128) = (%d, %v), want (128, nil)", pos, err)
+	}
+
+	seg0 := []byte("win-")
+	seg1 := []byte("scatter-")
+	seg2 := []byte("gather")
+	txIovs := [3]unix.Iovec{
+		{Base: &seg0[0]},
+		{Base: &seg1[0]},
+		{Base: &seg2[0]},
+	}
+	txIovs[0].SetLen(len(seg0))
+	txIovs[1].SetLen(len(seg1))
+	txIovs[2].SetLen(len(seg2))
+	wantTotal := len(seg0) + len(seg1) + len(seg2)
+
+	nw, _, errno := unix.Syscall6(unix.SYS_PWRITEV2, uintptr(fd), uintptr(unsafe.Pointer(&txIovs[0])), uintptr(len(txIovs)), 256, 0, 0)
+	if errno != 0 || int(nw) != wantTotal {
+		t.Fatalf("SYS_PWRITEV2 = (%d, %v), want (%d, 0)", int(nw), errno, wantTotal)
+	}
+
+	out0 := make([]byte, 6)
+	out1 := make([]byte, 5)
+	out2 := make([]byte, wantTotal-11)
+	rxIovs := [3]unix.Iovec{
+		{Base: &out0[0]},
+		{Base: &out1[0]},
+		{Base: &out2[0]},
+	}
+	rxIovs[0].SetLen(len(out0))
+	rxIovs[1].SetLen(len(out1))
+	rxIovs[2].SetLen(len(out2))
+
+	nr, _, errno := unix.Syscall6(unix.SYS_PREADV2, uintptr(fd), uintptr(unsafe.Pointer(&rxIovs[0])), uintptr(len(rxIovs)), 256, 0, 0)
+	if errno != 0 || int(nr) != wantTotal {
+		t.Fatalf("SYS_PREADV2 = (%d, %v), want (%d, 0)", int(nr), errno, wantTotal)
+	}
+	if got, want := string(bytes.Join([][]byte{out0, out1, out2}, nil)), "win-scatter-gather"; got != want {
+		t.Fatalf("SYS_PREADV2 joined = %q, want %q", got, want)
+	}
+
+	var eofBuf [16]byte
+	if n, err := unix.Pread(fd, eofBuf[:], 8192); err != nil || n != 0 {
+		t.Fatalf("Pread past EOF = (%d, %v), want (0, nil)", n, err)
 	}
 }

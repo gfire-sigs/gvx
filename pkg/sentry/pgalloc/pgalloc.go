@@ -59,7 +59,8 @@ type MemoryFile struct {
 	// hostWrites tells a platform that runs guest code from copies of
 	// memory-file pages about writes of the Sentry. It is empty on hosts whose
 	// platforms map the pages themselves.
-	hostWrites hostWriteHooks
+	hostWrites  hostWriteHooks
+	saveRestore saveRestoreXplat
 
 	// MemoryFile owns a single backing file. Each page in the backing file is
 	// considered "committed" or "uncommitted". A page is committed if the host
@@ -517,9 +518,7 @@ func (f *MemoryFile) releaserDestroyLocked() {
 
 	if f.opts.DecommitOnDestroy {
 		if chunks := f.chunksLoad(); len(chunks) != 0 {
-			if err := f.decommitFile(memmap.FileRange{0, uint64(len(chunks)) * chunkSize}); err != nil {
-				panic(fmt.Sprintf("failed to decommit entire memory file during destruction: %v", err))
-			}
+			f.decommitRange(memmap.FileRange{0, uint64(len(chunks)) * chunkSize})
 		}
 	}
 
@@ -527,15 +526,7 @@ func (f *MemoryFile) releaserDestroyLocked() {
 	// Ensure that any attempts to use f.file.Fd() fail instead of getting a fd
 	// that has possibly been reassigned.
 	f.file = nil
-	chunks := f.chunksLoad()
-	for i := range chunks {
-		chunk := &chunks[i]
-		_, _, errno := unix.Syscall(unix.SYS_MUNMAP, chunk.mapping, chunkSize, 0)
-		if errno != 0 {
-			log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)
-		}
-		chunk.mapping = 0
-	}
+	f.unmapChunksLocked(f.chunksLoad())
 }
 
 // AllocOpts are options used in MemoryFile.Allocate.
@@ -921,7 +912,6 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 		}
 	}
 	incNrChunks := (alloc.length + chunkMask - tail) / chunkSize
-	incFileSize := incNrChunks * chunkSize
 	newNrChunks := oldNrChunks + incNrChunks
 	if newNrChunks > maxChunks || newNrChunks < oldNrChunks /* overflow */ {
 		return linuxerr.ENOMEM
@@ -934,35 +924,20 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	// mm/shmem.c:shmem_get_unmapped_area().
 	//
 	// In tests, f.file may be nil.
-	var mapStart uintptr
+	newChunks := make([]chunkInfo, newNrChunks)
+	copy(newChunks, oldChunks)
+	for i := oldNrChunks; i < newNrChunks; i++ {
+		newChunks[i].huge = alloc.huge
+	}
 	if f.file != nil {
 		if err := f.file.Truncate(int64(newFileSize)); err != nil {
 			return err
 		}
-		m, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			uintptr(incFileSize),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			f.file.Fd(),
-			uintptr(oldFileSize))
-		if errno != 0 {
-			return errno
+		if err := mapMemoryFileChunks(f.file.Fd(), oldFileSize, newChunks[oldNrChunks:]); err != nil {
+			return err
 		}
-		mapStart = m
-		f.madviseChunkMapping(mapStart, uintptr(incFileSize), alloc.huge)
-	}
-
-	// Update chunk state.
-	newChunks := make([]chunkInfo, newNrChunks)
-	copy(newChunks, oldChunks)
-	m := mapStart
-	for i := oldNrChunks; i < newNrChunks; i++ {
-		newChunks[i].huge = alloc.huge
-		if f.file != nil {
-			newChunks[i].mapping = m
-			m += chunkSize
+		for i := oldNrChunks; i < newNrChunks; i++ {
+			f.madviseChunkMapping(newChunks[i].mapping, chunkSize, alloc.huge)
 		}
 	}
 	f.chunks.Store(&newChunks)

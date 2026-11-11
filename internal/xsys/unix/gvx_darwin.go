@@ -459,6 +459,22 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall
 		return syscall_syscall6(libc_pread_trampoline_addr, a1, a2, a3, a4, 0, 0)
 	case SYS_PWRITE64:
 		return syscall_syscall6(libc_pwrite_trampoline_addr, a1, a2, a3, a4, 0, 0)
+	case SYS_PREADV2:
+		if a6 != 0 {
+			return 0, 0, ENOTSUP
+		}
+		if int64(a4) == -1 {
+			return syscall_syscall(libc_readv_trampoline_addr, a1, a2, a3)
+		}
+		return syscall_syscall6(libc_preadv_trampoline_addr, a1, a2, a3, a4, 0, 0)
+	case SYS_PWRITEV2:
+		if a6 != 0 {
+			return 0, 0, ENOTSUP
+		}
+		if int64(a4) == -1 {
+			return syscall_syscall(libc_writev_trampoline_addr, a1, a2, a3)
+		}
+		return syscall_syscall6(libc_pwritev_trampoline_addr, a1, a2, a3, a4, 0, 0)
 	case SYS_LSEEK:
 		return syscall_syscall(libc_lseek_trampoline_addr, a1, a2, a3)
 	case SYS_FTRUNCATE:

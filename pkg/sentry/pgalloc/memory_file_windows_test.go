@@ -3,13 +3,17 @@
 package pgalloc
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"syscall"
 	"testing"
+	"unsafe"
 
+	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
-	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func TestSharedPagesAliasAndDecommit(t *testing.T) {
@@ -111,4 +115,47 @@ func TestDefaultMemoryFileDecommitZeroesPages(t *testing.T) {
 		}
 	}
 	mf.DecRef(fr)
+}
+
+func TestWindowsMultiChunkLoadFromAndDestroyReleasesKernelViews(t *testing.T) {
+	ctx := context.Background()
+	fx := buildMultiChunkFixture(t)
+
+	var buf bytes.Buffer
+	if err := fx.mf.SaveTo(ctx, &buf, &SaveOpts{ExcludeCommittedZeroPages: true}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	restored := newTestMemoryFile(t, MemoryFileOpts{ExpectHugepages: true})
+	if err := restored.LoadFrom(ctx, &buf, &LoadOpts{}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	chunks := append([]chunkInfo(nil), restored.chunksLoad()...)
+	if len(chunks) < 2 {
+		t.Fatalf("len(chunks) = %d, want >= 2", len(chunks))
+	}
+	for i, c := range chunks {
+		var info windows.MemoryBasicInformation
+		if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
+			t.Fatalf("VirtualQuery(chunk %d at %#x): %v", i, c.mapping, err)
+		}
+		if info.State != windows.MEM_COMMIT {
+			t.Fatalf("chunk %d State = %#x before Destroy, want MEM_COMMIT", i, info.State)
+		}
+	}
+
+	fx.verifyMemoryFile(t, restored)
+	fx.releaseAndDestroy(t, restored)
+	fx.releaseAndDestroy(t, fx.mf)
+
+	const winMemFree = 0x10000 // MEM_FREE from winnt.h
+	for i, c := range chunks {
+		var info windows.MemoryBasicInformation
+		if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
+			t.Fatalf("VirtualQuery(chunk %d at %#x after Destroy): %v", i, c.mapping, err)
+		}
+		if info.State != winMemFree {
+			t.Fatalf("chunk %d State = %#x after Destroy, want %#x (MEM_FREE)", i, info.State, winMemFree)
+		}
+	}
 }

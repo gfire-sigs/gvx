@@ -904,6 +904,8 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/errors/linuxerr", "netlink unit tests compare linuxerr return values"},
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/sentry/socket/unix", "netlink unit tests pair endpoints with unix sockets"},
 	{[]string{"pkg/sentry/socket/netfilter", "pkg/tcpip/transport/tcp", "tools/gostateify"}, "pkg/state", "stateify round-trip unit tests serialize and restore structs with pkg/state"},
+	{[]string{"pkg/sentry/pgalloc"}, "pkg/sentry/state/stateio", "save and restore unit tests construct stateio async page streams"},
+	{[]string{"pkg/sentry/pgalloc"}, "pkg/compressio", "save and restore unit tests round-trip streams through compressio"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {

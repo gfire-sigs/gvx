@@ -25,8 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"z.gfire.dev/gvx/internal/xsys/unix"
 	"google.golang.org/protobuf/proto"
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/bitmap"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -271,20 +271,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// usage during scanning. Batch decommitment of transiently-committed pages
 	// to reduce host syscalls.
 	var (
-		decommitWarnOnce  sync.Once
 		decommitPendingFR memmap.FileRange
 		decommitCount     uint64
 	)
 	decommitNow := func(fr memmap.FileRange) {
 		decommitCount++
-		if err := f.decommitFile(fr); err != nil {
-			// This doesn't impact the correctness of saved memory, it just
-			// means that we're incrementally more likely to OOM. Complain, but
-			// don't abort saving.
-			decommitWarnOnce.Do(func() {
-				log.Warningf("Decommitting MemoryFile offsets %v while saving failed: %v", fr, err)
-			})
-		}
+		f.decommitRange(fr)
 	}
 	decommitAddPage := func(off uint64) {
 		// Invariants:
@@ -449,6 +441,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		for fr.Length() != 0 {
 			data, err := dataSeeker.dataAtOrAfter(fr.Start)
 			if err != nil {
+				if isSeekDataUnsupported(err) {
+					dataSeeker = nil
+					decommitZeroPages = true
+					scanRange(fr, false /* wasCommitted */)
+					return nil
+				}
 				return err
 			}
 			hole := memmap.FileRange{fr.Start, min(data.Start, fr.End)}
@@ -583,6 +581,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 // hostFileDataSeeker iterates over the data ranges of a MemoryFile's backing
 // file.
 type hostFileDataSeeker struct {
+	f    *MemoryFile
 	fd   int
 	size uint64
 	cur  memmap.FileRange
@@ -595,7 +594,7 @@ func (f *MemoryFile) newHostFileDataSeeker() *hostFileDataSeeker {
 	if f.opts.DiskBackedFile {
 		return nil
 	}
-	return &hostFileDataSeeker{fd: f.FD(), size: f.TotalSize()}
+	return &hostFileDataSeeker{f: f, fd: f.FD(), size: f.TotalSize()}
 }
 
 // dataAtOrAfter returns the first page-aligned data range at or after off, or
@@ -604,7 +603,7 @@ func (f *MemoryFile) newHostFileDataSeeker() *hostFileDataSeeker {
 // Preconditions: off must be >= the off passed to any previous call.
 func (d *hostFileDataSeeker) dataAtOrAfter(off uint64) (memmap.FileRange, error) {
 	if d.cur.End <= off {
-		data, err := unix.Seek(d.fd, int64(off), unix.SEEK_DATA)
+		data, err := d.f.seekFileData(d.fd, int64(off), unix.SEEK_DATA)
 		if err == unix.ENXIO {
 			d.cur = memmap.FileRange{d.size, d.size}
 			return d.cur, nil
@@ -612,7 +611,7 @@ func (d *hostFileDataSeeker) dataAtOrAfter(off uint64) (memmap.FileRange, error)
 		if err != nil {
 			return memmap.FileRange{}, fmt.Errorf("SEEK_DATA from %#x: %w", off, err)
 		}
-		hole, err := unix.Seek(d.fd, data, unix.SEEK_HOLE)
+		hole, err := d.f.seekFileData(d.fd, data, unix.SEEK_HOLE)
 		if err != nil {
 			return memmap.FileRange{}, fmt.Errorf("SEEK_HOLE from %#x: %w", data, err)
 		}
@@ -1161,23 +1160,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		madviseWG   sync.WaitGroup
 	)
 	if len(chunks) != 0 {
-		m, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			uintptr(fileSize),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			f.file.Fd(),
-			0)
-		if errno != 0 {
-			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
+		if err := mapMemoryFileChunks(f.file.Fd(), 0, chunks); err != nil {
+			return fmt.Errorf("failed to mmap MemoryFile: %w", err)
 		}
 		mfTimeline.Reached("mmaped chunks")
-		for i := range chunks {
-			chunk := &chunks[i]
-			chunk.mapping = m
-			m += chunkSize
-		}
 		madviseWG.Add(1)
 		go func() {
 			defer madviseWG.Done()

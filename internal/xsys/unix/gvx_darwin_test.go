@@ -518,3 +518,50 @@ func TestGvxSyscallPpollVsPollAndReadvWritev(t *testing.T) {
 		t.Fatalf("SYS_READV joined = %q, want %q", gotJoined, want)
 	}
 }
+
+func TestGvxPreadv2AndPwritev2Syscalls(t *testing.T) {
+	f := gvxTempFile(t, 4096)
+	fd := uintptr(f.Fd())
+
+	seg0 := []byte("alpha-")
+	seg1 := []byte("bravo-")
+	seg2 := []byte("charlie")
+	txIovs := [3]unix.Iovec{
+		{Base: &seg0[0]},
+		{Base: &seg1[0]},
+		{Base: &seg2[0]},
+	}
+	txIovs[0].SetLen(len(seg0))
+	txIovs[1].SetLen(len(seg1))
+	txIovs[2].SetLen(len(seg2))
+	wantTotal := len(seg0) + len(seg1) + len(seg2)
+
+	nw, _, errno := unix.Syscall6(unix.SYS_PWRITEV2, fd, uintptr(unsafe.Pointer(&txIovs[0])), uintptr(len(txIovs)), 512, 0, 0)
+	if errno != 0 || int(nw) != wantTotal {
+		t.Fatalf("SYS_PWRITEV2 = (%d, %v), want (%d, 0)", int(nw), errno, wantTotal)
+	}
+
+	if _, _, errno := unix.Syscall6(unix.SYS_PWRITEV2, fd, uintptr(unsafe.Pointer(&txIovs[0])), uintptr(len(txIovs)), 512, 0, 1); errno != unix.ENOTSUP {
+		t.Fatalf("SYS_PWRITEV2(flags=1) = %v, want ENOTSUP", errno)
+	}
+
+	out0 := make([]byte, 4)
+	out1 := make([]byte, 8)
+	out2 := make([]byte, wantTotal-12)
+	rxIovs := [3]unix.Iovec{
+		{Base: &out0[0]},
+		{Base: &out1[0]},
+		{Base: &out2[0]},
+	}
+	rxIovs[0].SetLen(len(out0))
+	rxIovs[1].SetLen(len(out1))
+	rxIovs[2].SetLen(len(out2))
+
+	nr, _, errno := unix.Syscall6(unix.SYS_PREADV2, fd, uintptr(unsafe.Pointer(&rxIovs[0])), uintptr(len(rxIovs)), 512, 0, 0)
+	if errno != 0 || int(nr) != wantTotal {
+		t.Fatalf("SYS_PREADV2 = (%d, %v), want (%d, 0)", int(nr), errno, wantTotal)
+	}
+	if got, want := string(bytes.Join([][]byte{out0, out1, out2}, nil)), "alpha-bravo-charlie"; got != want {
+		t.Fatalf("SYS_PREADV2 joined = %q, want %q", got, want)
+	}
+}

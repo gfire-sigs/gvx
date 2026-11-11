@@ -88,7 +88,8 @@ seam pkg/sentry/loader/elf.go
 # accounting does not sum the memory of every sandbox (MemoryFile.Accounting in
 # pkg/sentry/pgalloc/usage_scan_xplat.go). MapInternal also reports a write request to
 # the observers of the Windows systrap engine (pkg/sentry/pgalloc/hostwrite_windows.go
-# and memory_file_xplat.go).
+# and memory_file_xplat.go). Chunk mapping and destruction route through
+# save_restore_xplat.go so Windows maps one view per 1 GiB chunk.
 seam pkg/sentry/pgalloc/pgalloc.go
 
 # Content seams: Docker with --userland-proxy=false, docker stats, and iptables-legacy-save.
@@ -111,6 +112,8 @@ seam pkg/sentry/socket/netlink/route/protocol.go
 seam pkg/sentry/fsimpl/cgroup2fs/memory.go
 # Content seams: the readers of memory.current and of the memory usage of a kernel read the
 # accounting of its own memory file (MemoryFile.Accounting in pkg/sentry/pgalloc/usage_scan_xplat.go).
+# SaveTo scans pages directly when SEEK_DATA returns an unsupported error, decommits zero pages through
+# decommitRange, and LoadFrom maps chunks through save_restore_xplat.go.
 seam pkg/sentry/pgalloc/save_restore.go
 seam pkg/sentry/fsimpl/cgroupfs/memory.go
 seam pkg/sentry/kernel/memevent/memory_events.go
