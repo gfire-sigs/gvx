@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -131,13 +132,29 @@ func matchMaskPattern(pattern, relPath string) bool {
 	if pattern == relPath {
 		return true
 	}
-	if strings.HasSuffix(pattern, "/**") {
-		prefix := strings.TrimSuffix(pattern, "/**")
-		return relPath == prefix || strings.HasPrefix(relPath, prefix+"/")
+	if suffix, ok := strings.CutPrefix(pattern, "**/"); ok {
+		if !strings.Contains(suffix, "/") {
+			matched, err := path.Match(suffix, path.Base(relPath))
+			return err == nil && matched
+		}
+		for tail := relPath; ; {
+			if matchMaskPattern(suffix, tail) {
+				return true
+			}
+			var rest string
+			_, rest, ok = strings.Cut(tail, "/")
+			if !ok {
+				return false
+			}
+			tail = rest
+		}
 	}
-	if strings.HasPrefix(pattern, "**/") {
-		suffix := strings.TrimPrefix(pattern, "**/")
-		return path.Base(relPath) == suffix || strings.HasSuffix(relPath, "/"+suffix)
+	if before, after, ok := strings.Cut(pattern, "/**/"); ok {
+		rest, hasPrefix := strings.CutPrefix(relPath, before+"/")
+		return hasPrefix && matchMaskPattern("**/"+after, rest)
+	}
+	if prefix, ok := strings.CutSuffix(pattern, "/**"); ok {
+		return relPath == prefix || strings.HasPrefix(relPath, prefix+"/")
 	}
 	if !strings.Contains(pattern, "/") {
 		matched, err := path.Match(pattern, path.Base(relPath))
@@ -211,28 +228,36 @@ func parseLsRemoteOutput(raw string) (UpstreamRefInfo, error) {
 	return info, nil
 }
 
-// SyncConfig configures an upstream snapshot download and masked extraction.
+// SyncConfig configures an upstream snapshot download and three-way masked merge.
 type SyncConfig struct {
-	RootDir    string
-	DestSubdir string
-	RepoURL    string
-	TargetRef  string
-	Mask       *FileMask
+	RootDir     string
+	DestSubdir  string
+	RepoURL     string
+	TargetRef   string
+	MaxRatio    float64
+	CountFences bool
+	Audit       bool
+	Mask        *FileMask
 	// Patches, when set, runs RetagFiles on the destination after extraction.
 	Patches *PatchSet
 	Source  ArchiveSource
+	// OnAudit receives the audit report when an in-place sync runs RunAudit.
+	OnAudit func(AuditReport, error)
 }
 
 // SyncManifest records the result of an upstream sync.
 type SyncManifest struct {
-	GoBranchSHA    string `json:"go_branch_sha"`
-	ReleaseTag     string `json:"release_tag"`
-	ReleaseTagSHA  string `json:"release_tag_sha"`
-	ExtractedFiles int    `json:"extracted_files"`
-	ProtectedSkips int    `json:"protected_skips"`
-	ExcludedSkips  int    `json:"excluded_skips"`
-	DestDir        string `json:"dest_dir"`
-	Strategy       string `json:"strategy,omitempty"`
+	GoBranchSHA    string   `json:"go_branch_sha"`
+	ReleaseTag     string   `json:"release_tag"`
+	ReleaseTagSHA  string   `json:"release_tag_sha"`
+	ExtractedFiles int      `json:"extracted_files"`
+	MergedFiles    int      `json:"merged_files,omitempty"`
+	DeletedFiles   int      `json:"deleted_files,omitempty"`
+	ProtectedSkips int      `json:"protected_skips"`
+	ExcludedSkips  int      `json:"excluded_skips"`
+	Conflicts      []string `json:"conflicts,omitempty"`
+	DestDir        string   `json:"dest_dir"`
+	Strategy       string   `json:"strategy,omitempty"`
 }
 
 // Sync strategy names recorded in the manifest.
@@ -241,12 +266,12 @@ const (
 	StrategyGit     = "git"
 )
 
-// SyncUpstream resolves the upstream commit, loads its archive, and extracts masked files into DestSubdir.
-//
-// This is the archive-overlay fallback for repositories that share no git history with upstream.
+// SyncUpstream resolves the upstream commit, merges masked files into DestSubdir,
+// audits in-place changes against the target tree, and records UPSTREAM_COMMIT.
 func SyncUpstream(ctx context.Context, cfg SyncConfig) (SyncManifest, error) {
 	cfg.RootDir = cmp.Or(cfg.RootDir, ".")
 	cfg.DestSubdir = cmp.Or(cfg.DestSubdir, ".")
+	inPlace := filepath.Clean(cfg.DestSubdir) == "."
 
 	var refs UpstreamRefInfo
 	if cfg.TargetRef != "" {
@@ -268,11 +293,31 @@ func SyncUpstream(ctx context.Context, cfg SyncConfig) (SyncManifest, error) {
 		return SyncManifest{}, err
 	}
 
+	var oldTree *UpstreamTree
+	if inPlace {
+		oldSHA, commitErr := ReadUpstreamCommit(cfg.RootDir)
+		if commitErr != nil && !errors.Is(commitErr, os.ErrNotExist) {
+			return SyncManifest{}, commitErr
+		}
+		if commitErr == nil {
+			if oldSHA == refs.GoBranchSHA {
+				oldTree = tree
+			} else {
+				baseSource := cfg.Source
+				baseSource.ArchivePath = ""
+				oldTree, err = baseSource.Load(ctx, oldSHA)
+				if err != nil {
+					return SyncManifest{}, fmt.Errorf("load base upstream commit %s: %w", oldSHA, err)
+				}
+			}
+		}
+	}
+
 	destRoot := filepath.Clean(filepath.Join(cfg.RootDir, cfg.DestSubdir))
 	if err := os.MkdirAll(destRoot, 0o755); err != nil {
 		return SyncManifest{}, fmt.Errorf("mkdir %s: %w", destRoot, err)
 	}
-	manifest, err := ExtractMasked(tree, destRoot, cfg.Mask)
+	manifest, err := mergeMaskedTree(ctx, oldTree, tree, destRoot, cfg.Mask, cfg.Patches)
 	if err != nil {
 		return SyncManifest{}, err
 	}
@@ -282,13 +327,38 @@ func SyncUpstream(ctx context.Context, cfg SyncConfig) (SyncManifest, error) {
 	manifest.DestDir = destRoot
 	manifest.Strategy = StrategyArchive
 
+	if len(manifest.Conflicts) > 0 {
+		return manifest, fmt.Errorf(
+			"%w: resolve these files, then run -mode=retag and -mode=audit -ref=%s:\n%s",
+			errMergeConflicts, refs.GoBranchSHA, strings.Join(manifest.Conflicts, "\n"),
+		)
+	}
+
 	if cfg.Patches != nil {
 		if _, err := RetagFiles(destRoot, cfg.Patches); err != nil {
 			return manifest, fmt.Errorf("retag after extraction: %w", err)
 		}
 	}
-	if err := WriteSyncRecord(cfg.RootDir, manifest); err != nil {
-		return manifest, err
+	if inPlace && (cfg.Audit || cfg.MaxRatio > 0) {
+		report, auditErr := RunAudit(AuditConfig{
+			RootDir:     cfg.RootDir,
+			Patches:     cfg.Patches,
+			Mask:        cfg.Mask,
+			Upstream:    tree,
+			MaxRatio:    cfg.MaxRatio,
+			CountFences: cfg.CountFences,
+		})
+		if cfg.OnAudit != nil {
+			cfg.OnAudit(report, auditErr)
+		}
+		if auditErr != nil {
+			return manifest, fmt.Errorf("audit merged tree: %w", auditErr)
+		}
+	}
+	if inPlace {
+		if err := WriteSyncRecord(cfg.RootDir, manifest); err != nil {
+			return manifest, err
+		}
 	}
 	return manifest, nil
 }
@@ -318,9 +388,31 @@ func WriteSyncRecord(rootDir string, manifest SyncManifest) error {
 // Go and assembly files get the gvx module path. go.mod and go.sum merge with the existing
 // files so that gvx-only requirements and replace directives survive.
 func ExtractMasked(tree *UpstreamTree, destRoot string, mask *FileMask) (SyncManifest, error) {
+	return mergeMaskedTree(context.Background(), nil, tree, destRoot, mask, nil)
+}
+
+func mergeMaskedTree(ctx context.Context, oldTree, newTree *UpstreamTree, destRoot string, mask *FileMask, patches *PatchSet) (_ SyncManifest, err error) {
 	var manifest SyncManifest
-	paths := make([]string, 0, len(tree.Files))
-	for rel := range tree.Files {
+	var tmpDir string
+	defer func() {
+		if tmpDir != "" {
+			err = errors.Join(err, os.RemoveAll(tmpDir))
+		}
+	}()
+	getTmpDir := func() (string, error) {
+		if tmpDir != "" {
+			return tmpDir, nil
+		}
+		d, mkErr := os.MkdirTemp("", "gvx-upstream-merge-*")
+		if mkErr != nil {
+			return "", fmt.Errorf("create merge temp directory: %w", mkErr)
+		}
+		tmpDir = d
+		return tmpDir, nil
+	}
+
+	paths := make([]string, 0, len(newTree.Files))
+	for rel := range newTree.Files {
 		paths = append(paths, rel)
 	}
 	slices.Sort(paths)
@@ -339,11 +431,34 @@ func ExtractMasked(tree *UpstreamTree, destRoot string, mask *FileMask) (SyncMan
 			continue
 		case MaskInclude:
 		}
-		if err := extractSingleFile(tree.Files[rel], destRoot, rel); err != nil {
+		if err := mergeSingleFile(ctx, getTmpDir, oldTree, newTree.Files[rel], destRoot, rel, patches, &manifest); err != nil {
 			return SyncManifest{}, err
 		}
-		manifest.ExtractedFiles++
 	}
+
+	if oldTree != nil {
+		oldPaths := make([]string, 0, len(oldTree.Files))
+		for rel := range oldTree.Files {
+			oldPaths = append(oldPaths, rel)
+		}
+		slices.Sort(oldPaths)
+		for _, rel := range oldPaths {
+			if _, inNew := newTree.Files[rel]; inNew {
+				continue
+			}
+			decision := MaskInclude
+			if mask != nil {
+				decision = mask.Decide(rel)
+			}
+			if decision != MaskInclude || ClassifyFile(rel) != Tier3Upstream {
+				continue
+			}
+			if err := removeDeletedUpstreamFile(oldTree.Files[rel], destRoot, rel, patches, &manifest); err != nil {
+				return SyncManifest{}, err
+			}
+		}
+	}
+	slices.Sort(manifest.Conflicts)
 	return manifest, nil
 }
 
@@ -360,33 +475,16 @@ func stripArchiveRootPrefix(entryName string) (string, error) {
 	return cleaned, nil
 }
 
-func extractSingleFile(data []byte, destRoot, relSlash string) error {
+func resolveDestTarget(destRoot, relSlash string) (string, error) {
 	targetPath := filepath.Join(destRoot, filepath.FromSlash(relSlash))
 	relCheck, err := filepath.Rel(destRoot, targetPath)
 	if err != nil || strings.HasPrefix(filepath.ToSlash(relCheck), "../") {
-		return fmt.Errorf("%w: %s escapes %s", errUnsafeArchivePath, relSlash, destRoot)
+		return "", fmt.Errorf("%w: %s escapes %s", errUnsafeArchivePath, relSlash, destRoot)
 	}
+	return targetPath, nil
+}
 
-	switch {
-	case relSlash == "go.mod":
-		existing, err := os.ReadFile(targetPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("read existing go.mod: %w", err)
-		}
-		data, err = MergeGoMod(data, existing)
-		if err != nil {
-			return err
-		}
-	case relSlash == "go.sum":
-		existing, err := os.ReadFile(targetPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("read existing go.sum: %w", err)
-		}
-		data = MergeGoSum(data, existing)
-	case isGoSource(relSlash):
-		data = rewriteModulePath(data)
-	}
-
+func writeTargetFile(targetPath, relSlash string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir for %s: %w", relSlash, err)
 	}
@@ -394,4 +492,226 @@ func extractSingleFile(data []byte, destRoot, relSlash string) error {
 		return fmt.Errorf("write %s: %w", relSlash, err)
 	}
 	return nil
+}
+
+func rewriteIfGo(relSlash string, raw []byte) []byte {
+	if isGoSource(relSlash) {
+		return rewriteModulePath(raw)
+	}
+	return raw
+}
+
+func mergeSingleFile(ctx context.Context, getTmpDir func() (string, error), oldTree *UpstreamTree, newRaw []byte, destRoot, relSlash string, patches *PatchSet, manifest *SyncManifest) error {
+	targetPath, err := resolveDestTarget(destRoot, relSlash)
+	if err != nil {
+		return err
+	}
+
+	switch relSlash {
+	case "go.mod":
+		existing, readErr := os.ReadFile(targetPath)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return fmt.Errorf("read existing go.mod: %w", readErr)
+		}
+		merged, mergeErr := MergeGoMod(newRaw, existing)
+		if mergeErr != nil {
+			return mergeErr
+		}
+		if err := writeTargetFile(targetPath, relSlash, merged); err != nil {
+			return err
+		}
+		manifest.ExtractedFiles++
+		return nil
+	case "go.sum":
+		existing, readErr := os.ReadFile(targetPath)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return fmt.Errorf("read existing go.sum: %w", readErr)
+		}
+		merged := MergeGoSum(newRaw, existing)
+		if err := writeTargetFile(targetPath, relSlash, merged); err != nil {
+			return err
+		}
+		manifest.ExtractedFiles++
+		return nil
+	}
+
+	if oldTree == nil {
+		if err := writeTargetFile(targetPath, relSlash, rewriteIfGo(relSlash, newRaw)); err != nil {
+			return err
+		}
+		manifest.ExtractedFiles++
+		return nil
+	}
+
+	theirs, _, _, _, err := retagSourceBytes(relSlash, newRaw, patches)
+	if err != nil {
+		return err
+	}
+	ours, readErr := os.ReadFile(targetPath)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read local %s: %w", relSlash, readErr)
+	}
+	if errors.Is(readErr, os.ErrNotExist) {
+		if err := writeTargetFile(targetPath, relSlash, theirs); err != nil {
+			return err
+		}
+		manifest.ExtractedFiles++
+		return nil
+	}
+
+	oldRaw, inOld := oldTree.Files[relSlash]
+	if !inOld {
+		if bytes.Equal(ours, theirs) {
+			manifest.ExtractedFiles++
+			return nil
+		}
+		merged, conflicted, mergeErr := mergeThreeWay(ctx, getTmpDir, ours, nil, theirs)
+		if mergeErr != nil {
+			return fmt.Errorf("merge %s: %w", relSlash, mergeErr)
+		}
+		if err := writeTargetFile(targetPath, relSlash, merged); err != nil {
+			return err
+		}
+		if conflicted {
+			manifest.Conflicts = append(manifest.Conflicts, relSlash)
+			return nil
+		}
+		manifest.MergedFiles++
+		manifest.ExtractedFiles++
+		return nil
+	}
+
+	base, _, _, _, err := retagSourceBytes(relSlash, oldRaw, patches)
+	if err != nil {
+		return err
+	}
+	rawBase := rewriteIfGo(relSlash, oldRaw)
+	if bytes.Equal(ours, base) || bytes.Equal(ours, rawBase) {
+		if err := writeTargetFile(targetPath, relSlash, theirs); err != nil {
+			return err
+		}
+		manifest.ExtractedFiles++
+		return nil
+	}
+	if bytes.Equal(base, theirs) {
+		return nil
+	}
+
+	merged, conflicted, err := mergeThreeWay(ctx, getTmpDir, ours, base, theirs)
+	if err != nil {
+		return fmt.Errorf("merge %s: %w", relSlash, err)
+	}
+	if err := writeTargetFile(targetPath, relSlash, merged); err != nil {
+		return err
+	}
+	if conflicted {
+		manifest.Conflicts = append(manifest.Conflicts, relSlash)
+		return nil
+	}
+	manifest.MergedFiles++
+	manifest.ExtractedFiles++
+	return nil
+}
+
+func removeDeletedUpstreamFile(oldRaw []byte, destRoot, relSlash string, patches *PatchSet, manifest *SyncManifest) error {
+	targetPath, err := resolveDestTarget(destRoot, relSlash)
+	if err != nil {
+		return err
+	}
+	ours, readErr := os.ReadFile(targetPath)
+	if errors.Is(readErr, os.ErrNotExist) {
+		return nil
+	}
+	if readErr != nil {
+		return fmt.Errorf("read local %s: %w", relSlash, readErr)
+	}
+	base, _, _, _, err := retagSourceBytes(relSlash, oldRaw, patches)
+	if err != nil {
+		return err
+	}
+	rawBase := rewriteIfGo(relSlash, oldRaw)
+	if !bytes.Equal(ours, base) && !bytes.Equal(ours, rawBase) {
+		manifest.Conflicts = append(manifest.Conflicts, relSlash)
+		return nil
+	}
+	if err := os.Remove(targetPath); err != nil {
+		return fmt.Errorf("remove deleted upstream file %s: %w", relSlash, err)
+	}
+	pruneEmptyParents(destRoot, filepath.Dir(targetPath))
+	manifest.DeletedFiles++
+	return nil
+}
+
+func pruneEmptyParents(destRoot, dir string) {
+	rootClean := filepath.Clean(destRoot)
+	for cur := filepath.Clean(dir); cur != rootClean && cur != "." && cur != string(filepath.Separator); cur = filepath.Dir(cur) {
+		if err := os.Remove(cur); err != nil {
+			return
+		}
+	}
+}
+
+func mergeThreeWay(ctx context.Context, getTmpDir func() (string, error), ours, base, theirs []byte) ([]byte, bool, error) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return formatFallbackConflict(ours, base, theirs), true, nil
+	}
+	dir, err := getTmpDir()
+	if err != nil {
+		return nil, false, err
+	}
+	oursPath := filepath.Join(dir, "ours")
+	basePath := filepath.Join(dir, "base")
+	theirsPath := filepath.Join(dir, "theirs")
+	for _, input := range []struct {
+		path string
+		data []byte
+	}{
+		{oursPath, ours},
+		{basePath, base},
+		{theirsPath, theirs},
+	} {
+		if err := os.WriteFile(input.path, input.data, 0o600); err != nil {
+			return nil, false, fmt.Errorf("write merge input %s: %w", filepath.Base(input.path), err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "git", "merge-file", "-p", "-L", "ours", "-L", "base", "-L", "theirs", oursPath, basePath, theirsPath)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	if err == nil {
+		return stdout.Bytes(), false, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitCode()
+		if code >= 1 && code <= 127 {
+			return stdout.Bytes(), true, nil
+		}
+	}
+	return nil, false, fmt.Errorf("git merge-file: %w: %s", err, strings.TrimSpace(stderr.String()))
+}
+
+func formatFallbackConflict(ours, base, theirs []byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("<<<<<<< ours\n")
+	buf.Write(ours)
+	if len(ours) > 0 && ours[len(ours)-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	if len(base) > 0 {
+		buf.WriteString("||||||| base\n")
+		buf.Write(base)
+		if base[len(base)-1] != '\n' {
+			buf.WriteByte('\n')
+		}
+	}
+	buf.WriteString("=======\n")
+	buf.Write(theirs)
+	if len(theirs) > 0 && theirs[len(theirs)-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	buf.WriteString(">>>>>>> theirs\n")
+	return buf.Bytes()
 }

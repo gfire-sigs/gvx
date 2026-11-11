@@ -7,16 +7,22 @@
 
 PROTECT AGENTS.md
 PROTECT README.md
+PROTECT CHANGELOG.md
+PROTECT SECURITY.md
 PROTECT LICENSE
 PROTECT UPSTREAM_COMMIT
 PROTECT entitlements.plist
 PROTECT .gitignore
 PROTECT skills-lock.json
 PROTECT .agents/**
+PROTECT android/**
 PROTECT docs/**
 PROTECT tools/upstream/**
 PROTECT tools/shiminterop/**
 PROTECT tools/gvisorlint/**
+PROTECT tools/licenses/**
+PROTECT tools/androidprobe/**
+PROTECT tools/gostateify/**
 PROTECT internal/xsys/**
 PROTECT scripts/**
 PROTECT cmd/rungv/**
@@ -25,6 +31,7 @@ PROTECT pkg/gvx/**
 PROTECT pkg/oci/**
 PROTECT pkg/netbackend/**
 PROTECT pkg/hostlockdown/**
+PROTECT pkg/sentry/blockdev/**
 PROTECT pkg/sentry/platform/whpx/**
 PROTECT pkg/sentry/platform/hvf/**
 PROTECT pkg/sentry/platform/hvcommon/**
@@ -35,6 +42,7 @@ PROTECT pkg/sentry/fsimpl/chunkcache/**
 PROTECT pkg/sentry/socket/netlink/genetlink/**
 PROTECT pkg/ipset/**
 PROTECT pkg/tcpip/link/vxlan/**
+PROTECT pkg/tcpip/link/wgtun/**
 PROTECT pkg/sentry/fsimpl/hostfs/**
 PROTECT pkg/sentry/fsimpl/ext4lite/**
 PROTECT e2e/**
@@ -90,6 +98,9 @@ PROTECT pkg/sentry/platform/*_xplat*
 PROTECT pkg/sentry/syscalls/linux/*_xplat*
 PROTECT pkg/sync/*_xplat*
 PROTECT pkg/syserr/*_xplat*
+PROTECT **/*_windows*
+PROTECT **/*_darwin*
+PROTECT **/*_xplat*
 
 EXCLUDE .github/**
 EXCLUDE .buildkite/**

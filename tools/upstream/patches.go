@@ -428,6 +428,45 @@ type RetagReport struct {
 	Formatted  int
 }
 
+// retagSourceBytes rewrites upstream module imports, formats generated Go files,
+// and applies build-constraint rules from ps in memory.
+func retagSourceBytes(relSlash string, data []byte, ps *PatchSet) (updated []byte, modRewritten, formatted, patched bool, err error) {
+	if !isGoSource(relSlash) {
+		return data, false, false, false, nil
+	}
+	updated = data
+	if bytes.Contains(updated, []byte(upstreamModulePath)) || bytes.Contains(updated, []byte(upstreamXSysUnix)) {
+		updated = rewriteModulePath(updated)
+		modRewritten = true
+	}
+	if ClassifyFile(relSlash) == Tier1Additive {
+		return updated, modRewritten, false, false, nil
+	}
+	if isGeneratedUpstreamFile(relSlash) && strings.HasSuffix(relSlash, ".go") {
+		fmtBytes, fmtErr := format.Source(updated)
+		if fmtErr != nil {
+			return nil, false, false, false, fmt.Errorf("format %s: %w", relSlash, fmtErr)
+		}
+		if !bytes.Equal(fmtBytes, updated) {
+			updated = fmtBytes
+			formatted = true
+		}
+	}
+	if ps != nil {
+		if rule, ok := ps.Lookup(relSlash); ok && ClassifyFile(relSlash) == Tier3Upstream && !isTestFile(relSlash) {
+			next, changed, patchErr := applyPatch(relSlash, updated, rule)
+			if patchErr != nil {
+				return nil, false, false, false, patchErr
+			}
+			if changed {
+				updated = next
+				patched = true
+			}
+		}
+	}
+	return updated, modRewritten, formatted, patched, nil
+}
+
 // RetagFiles applies the allowlist to every matching file under rootDir.
 //
 // It performs three idempotent steps: rewrite the upstream module path in Go and assembly
@@ -443,30 +482,18 @@ func RetagFiles(rootDir string, ps *PatchSet) (RetagReport, error) {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", relSlash, err)
 		}
-		updated := data
-		if bytes.Contains(updated, []byte(upstreamModulePath)) || bytes.Contains(updated, []byte(upstreamXSysUnix)) {
-			updated = rewriteModulePath(updated)
+		updated, modRewritten, formatted, patched, err := retagSourceBytes(relSlash, data, ps)
+		if err != nil {
+			return err
+		}
+		if modRewritten {
 			report.ModulePath++
 		}
-		if isGeneratedUpstreamFile(relSlash) && strings.HasSuffix(relSlash, ".go") {
-			formatted, err := format.Source(updated)
-			if err != nil {
-				return fmt.Errorf("format %s: %w", relSlash, err)
-			}
-			if !bytes.Equal(formatted, updated) {
-				updated = formatted
-				report.Formatted++
-			}
+		if formatted {
+			report.Formatted++
 		}
-		if rule, ok := ps.Lookup(relSlash); ok && ClassifyFile(relSlash) == Tier3Upstream && !isTestFile(relSlash) {
-			patched, changed, err := applyPatch(relSlash, updated, rule)
-			if err != nil {
-				return err
-			}
-			if changed {
-				updated = patched
-				report.Patched++
-			}
+		if patched {
+			report.Patched++
 		}
 		if bytes.Equal(updated, data) {
 			return nil

@@ -34,7 +34,12 @@ func runTool(t *testing.T, args ...string) (stdout, stderr string, err error) {
 func TestRunAuditPrintsPerTierNumbers(t *testing.T) {
 	t.Parallel()
 
-	repo := with(cleanRepo(), "pkg/hostsyscall/sys.go", "//go:build linux\n\npackage hostsyscall\n")
+	repo := with(cleanRepo(),
+		"pkg/hostsyscall/sys.go", "//go:build linux\n\npackage hostsyscall\n",
+		"pkg/kernel/helper_xplat.go", "package kernel\n\nfunc Helper() {}\n",
+		"pkg/kernel/helper_xplat_test.go", "package kernel\n",
+		"pkg/fd/fd_xplat.go", "package fd\n",
+	)
 	root, archive := writeMainRepo(t, repo)
 
 	stdout, stderr, err := runTool(t, "-mode=audit", "-root", root, "-archive", archive, "-offline")
@@ -45,6 +50,7 @@ func TestRunAuditPrintsPerTierNumbers(t *testing.T) {
 		"baseline=48",
 		"tier1 (additive):",
 		"tier2 (siblings):",
+		"tier2 (xplat):     files=2 loc=4 shared-pkgs=2",
 		"tier3 (upstream):",
 		"linux fences=1",
 		"budget: touched=0/48",
@@ -201,5 +207,57 @@ func TestSyncModeFallsBackWhenForkSharesNoHistory(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "shares no git history") || !strings.Contains(stderr, "falling back to the archive overlay") {
 		t.Fatalf("stderr lacks the fallback notice (err=%v):\n%s", err, stderr)
+	}
+}
+
+func TestSyncModeFallbackPreservesSeamsAndRemovesDeletedFiles(t *testing.T) {
+	isolateGit(t)
+	upFiles := gitUpstreamFiles()
+	upFiles["pkg/obsolete/old.go"] = "package obsolete\n"
+	upFiles["pkg/seam/seam.go"] = "package seam\n\nfunc Top() int {\n\treturn 1\n}\n\nfunc Bottom() int {\n\treturn 10\n}\n"
+	upstream := newGitRepo(t, upFiles)
+	sha1 := gitCommitAll(t, upstream, "upstream 1")
+	runGit(t, upstream, "branch", "-m", defaultUpstreamBranch)
+
+	// Build an archive-imported fork with no shared git history, local Tier 3 seam edit, and pinned sha1.
+	fork := newGitRepo(t, upFiles)
+	writeTestFile(t, fork, "tools/upstream/buildtag_allowlist.txt", "linux-only pkg/hostsyscall/\nseam pkg/seam/seam.go\n")
+	writeTestFile(t, fork, "tools/upstream/file_mask.txt", "PROTECT tools/upstream/**\nINCLUDE pkg/**\n")
+	if _, err := RetagFiles(fork, mustPatchSet(t, "linux-only pkg/hostsyscall/\nseam pkg/seam/seam.go\n")); err != nil {
+		t.Fatalf("RetagFiles: %v", err)
+	}
+	writeTestFile(t, fork, "pkg/seam/seam.go", "package seam\n\nfunc Top() int {\n\treturn 1\n}\n\nfunc Bottom() int {\n\treturn 99\n}\n")
+	writeTestFile(t, fork, "UPSTREAM_COMMIT", sha1+"\n")
+	writeTestFile(t, fork, "tools/upstream/sync_manifest.json", `{"go_branch_sha": "`+sha1+`"}`+"\n")
+	gitCommitAll(t, fork, "imported fork with seam")
+
+	// Advance upstream: edit Top() in seam.go and delete pkg/obsolete/old.go.
+	writeTestFile(t, upstream, "pkg/seam/seam.go", "package seam\n\nfunc Top() int {\n\treturn 2\n}\n\nfunc Bottom() int {\n\treturn 10\n}\n")
+	if err := os.Remove(filepath.Join(upstream, "pkg/obsolete/old.go")); err != nil {
+		t.Fatalf("remove old.go: %v", err)
+	}
+	sha2 := gitCommitAll(t, upstream, "upstream 2")
+
+	cache := t.TempDir()
+	if _, err := (ArchiveSource{CacheDir: cache, GitDir: upstream, Offline: true}).Load(t.Context(), sha1); err != nil {
+		t.Fatalf("prime sha1 cache: %v", err)
+	}
+
+	stdout, stderr, err := runTool(t, "-mode=sync", "-root", fork, "-repo", upstream, "-ref", sha2, "-cache-dir", cache, "-offline", "-max-ratio=0.10")
+	if err != nil {
+		t.Fatalf("sync fallback failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "audit passed") {
+		t.Fatalf("stdout lacks audit confirmation:\n%s", stdout)
+	}
+	if got := strings.TrimSpace(readTestFile(t, fork, "UPSTREAM_COMMIT")); got != sha2 {
+		t.Fatalf("UPSTREAM_COMMIT = %q, want %q", got, sha2)
+	}
+	seam := readTestFile(t, fork, "pkg/seam/seam.go")
+	if !strings.Contains(seam, "return 2") || !strings.Contains(seam, "return 99") {
+		t.Fatalf("seam file did not preserve both edits:\n%s", seam)
+	}
+	if _, err := os.Stat(filepath.Join(fork, "pkg/obsolete/old.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted upstream file remained in fork: %v", err)
 	}
 }

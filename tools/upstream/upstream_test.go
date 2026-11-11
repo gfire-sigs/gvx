@@ -45,6 +45,10 @@ func TestClassifyFilePartitionsThreeIsolationTiers(t *testing.T) {
 		{name: "tier2 xplat helper in a shared package", path: "pkg/syserr/linux_errno_xplat.go", want: Tier2Sibling},
 		{name: "tier2 darwin page size file", path: "pkg/hostarch/hostarch_darwin_arm64_16k.go", want: Tier2Sibling},
 		{name: "tier3 helper without a marker", path: "pkg/syserr/linux_errno.go", want: Tier3Upstream},
+		{name: "tier1 scripts tree", path: "scripts/linux16k/init.go", want: Tier1Additive},
+		{name: "tier1 sentry blockdev", path: "pkg/sentry/blockdev/registry_xplat.go", want: Tier1Additive},
+		{name: "tier1 gostateify tool", path: "tools/gostateify/main.go", want: Tier1Additive},
+		{name: "tier1 wgtun link", path: "pkg/tcpip/link/wgtun/wgtun.go", want: Tier1Additive},
 	}
 
 	for _, tc := range cases {
@@ -81,24 +85,27 @@ func TestFileMaskPrecedenceAndPatterns(t *testing.T) {
 PROTECT README.md
 PROTECT pkg/gvx/**
 PROTECT *_darwin.go
+PROTECT **/*_xplat*
+PROTECT pkg/deep/**/*_windows*
 EXCLUDE runsc/**
 EXCLUDE **/BUILD
-INCLUDE pkg/sentry/kernel/**
-INCLUDE pkg/sync/**
+INCLUDE pkg/**
 `
 	mask, err := ParseFileMaskReader(strings.NewReader(maskText))
 	if err != nil {
 		t.Fatalf("ParseFileMaskReader: %v", err)
 	}
 	cases := map[string]MaskDecision{
-		"README.md":                     MaskProtect,
-		"pkg/sync/futex_darwin.go":      MaskProtect,
-		"runsc/main.go":                 MaskExclude,
-		"pkg/sentry/kernel/BUILD":       MaskExclude,
-		"pkg/sentry/kernel/kernel.go":   MaskInclude,
-		"unlisted/file.go":              MaskExclude,
-		"pkg/gvx/sandbox.go":            MaskProtect,
-		"pkg/sentry/kernel/x_darwin.go": MaskProtect,
+		"README.md":                           MaskProtect,
+		"pkg/sync/futex_darwin.go":            MaskProtect,
+		"pkg/tcpip/stack/conntrack_xplat.go":  MaskProtect,
+		"pkg/deep/nested/sub/file_windows.go": MaskProtect,
+		"runsc/main.go":                       MaskExclude,
+		"pkg/sentry/kernel/BUILD":             MaskExclude,
+		"pkg/sentry/kernel/kernel.go":         MaskInclude,
+		"unlisted/file.go":                    MaskExclude,
+		"pkg/gvx/sandbox.go":                  MaskProtect,
+		"pkg/sentry/kernel/x_darwin.go":       MaskProtect,
 	}
 	for rel, want := range cases {
 		if got := mask.Decide(rel); got != want {
@@ -133,7 +140,29 @@ func TestRepositoryMaskKeepsUpstreamTreesIncluded(t *testing.T) {
 			t.Errorf("Decide(%q) = %v, want MaskInclude", rel, got)
 		}
 	}
-	for _, rel := range []string{"pkg/gvx/sandbox.go", "pkg/sentry/platform/platforms/platforms_darwin.go", "pkg/sentry/fsimpl/ext4lite/ext4lite.go", "pkg/sentry/platform/hvcommon/arm64.go", "internal/testelf/elf.go", "cmd/containerd-shim-gvx-v2/main.go", "internal/gvxshim/lifecycle.go", "tools/shiminterop/shim_manager_linux_test.go", "tools/shiminterop/go.mod"} {
+	for _, rel := range []string{
+		"pkg/gvx/sandbox.go",
+		"pkg/sentry/platform/platforms/platforms_darwin.go",
+		"pkg/sentry/fsimpl/ext4lite/ext4lite.go",
+		"pkg/sentry/platform/hvcommon/arm64.go",
+		"internal/testelf/elf.go",
+		"cmd/containerd-shim-gvx-v2/main.go",
+		"internal/gvxshim/lifecycle.go",
+		"tools/shiminterop/shim_manager_linux_test.go",
+		"tools/shiminterop/go.mod",
+		"CHANGELOG.md",
+		"SECURITY.md",
+		"tools/licenses/main.go",
+		"tools/androidprobe/main.go",
+		"tools/gostateify/main.go",
+		"android/sdk.go",
+		"pkg/sentry/blockdev/registry_xplat.go",
+		"pkg/tcpip/link/wgtun/wgtun.go",
+		"pkg/tcpip/stack/conntrack_xplat.go",
+		"pkg/sentry/fsimpl/proc/rpfilter_xplat.go",
+		"pkg/tcpip/stdclock_windows.go",
+		"pkg/cpuid/hwcap_darwin_arm64.go",
+	} {
 		if got := mask.Decide(rel); got != MaskProtect {
 			t.Errorf("Decide(%q) = %v, want MaskProtect", rel, got)
 		}
@@ -241,6 +270,232 @@ INCLUDE pkg/**
 			t.Errorf("masked path %s exists after sync (stat err %v)", rel, err)
 		}
 	}
+}
+
+func TestSyncUpstreamThreeWayMergesSeamsAndRemovesUpstreamDeletions(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldSHA = "1111111111111111111111111111111111111111"
+		newSHA = "2222222222222222222222222222222222222222"
+	)
+
+	mask, err := ParseFileMaskReader(strings.NewReader(`
+PROTECT **/*_xplat*
+INCLUDE pkg/**
+`))
+	if err != nil {
+		t.Fatalf("ParseFileMaskReader: %v", err)
+	}
+	patches, err := ParsePatchSet(strings.NewReader(strings.Join([]string{
+		"seam pkg/seam/both.go",
+		"seam pkg/seam/localonly.go",
+		"pkg/expanded/exp.go",
+	}, "\n") + "\n"))
+	if err != nil {
+		t.Fatalf("ParsePatchSet: %v", err)
+	}
+
+	oldUpstream := baseUpstream()
+	oldUpstream["pkg/seam/both.go"] = "package seam\n\nfunc Top() int {\n\treturn 1\n}\n\nfunc Bottom() int {\n\treturn 10\n}\n"
+	oldUpstream["pkg/seam/localonly.go"] = "package seam\n\nfunc Keep() string {\n\treturn \"upstream\"\n}\n"
+	oldUpstream["pkg/expanded/exp.go"] = "//go:build linux\n\npackage expanded\n\nfunc V() int { return 1 }\n"
+	oldUpstream["pkg/obsolete/gone.go"] = "package obsolete\n"
+	delete(oldUpstream, "runsc/main.go")
+	delete(oldUpstream, "pkg/shadow/shadow_darwin.go")
+
+	newUpstream := with(oldUpstream,
+		"pkg/seam/both.go", "package seam\n\nfunc Top() int {\n\treturn 2\n}\n\nfunc Bottom() int {\n\treturn 10\n}\n",
+		"pkg/expanded/exp.go", "//go:build linux && (amd64 || arm64)\n\npackage expanded\n\nfunc V() int { return 2 }\n",
+		"pkg/obsolete/gone.go", "\x00",
+	)
+
+	cacheDir := t.TempDir()
+	writeCachedArchiveSHA(t, cacheDir, oldSHA, oldUpstream)
+	writeCachedArchiveSHA(t, cacheDir, newSHA, newUpstream)
+
+	root := t.TempDir()
+	for rel, body := range oldUpstream {
+		writeTestFile(t, root, rel, body)
+	}
+	if _, err := RetagFiles(root, patches); err != nil {
+		t.Fatalf("initial RetagFiles: %v", err)
+	}
+	// Apply local Tier 3 seam edits and add a Tier 2 _xplat sibling in a shared package.
+	writeTestFile(t, root, "pkg/seam/both.go", "package seam\n\nfunc Top() int {\n\treturn 1\n}\n\nfunc Bottom() int {\n\treturn 99\n}\n")
+	writeTestFile(t, root, "pkg/seam/localonly.go", "package seam\n\nfunc Keep() string {\n\treturn \"gvx-seam\"\n}\n")
+	writeTestFile(t, root, "pkg/tcpip/stack/conntrack_xplat.go", "package stack\n\nfunc Track() {}\n")
+	writeTestFile(t, root, "UPSTREAM_COMMIT", oldSHA+"\n")
+	writeTestFile(t, root, "tools/upstream/sync_manifest.json", `{"go_branch_sha": "`+oldSHA+`"}`+"\n")
+
+	manifest, err := SyncUpstream(context.Background(), SyncConfig{
+		RootDir:   root,
+		TargetRef: newSHA,
+		MaxRatio:  0.10,
+		Audit:     true,
+		Mask:      mask,
+		Patches:   patches,
+		Source:    ArchiveSource{CacheDir: cacheDir, Offline: true},
+	})
+	if err != nil {
+		t.Fatalf("SyncUpstream: %v", err)
+	}
+	if manifest.MergedFiles != 1 || manifest.DeletedFiles != 1 || len(manifest.Conflicts) != 0 {
+		t.Fatalf("unexpected merge manifest: %+v", manifest)
+	}
+	if got := strings.TrimSpace(readTestFile(t, root, "UPSTREAM_COMMIT")); got != newSHA {
+		t.Fatalf("UPSTREAM_COMMIT = %q, want %q", got, newSHA)
+	}
+
+	both := readTestFile(t, root, "pkg/seam/both.go")
+	if !strings.Contains(both, "return 2") || !strings.Contains(both, "return 99") {
+		t.Fatalf("3-way merged pkg/seam/both.go lost an edit:\n%s", both)
+	}
+	localOnly := readTestFile(t, root, "pkg/seam/localonly.go")
+	if !strings.Contains(localOnly, `"gvx-seam"`) {
+		t.Fatalf("unchanged upstream clobbered local seam:\n%s", localOnly)
+	}
+	expanded := readTestFile(t, root, "pkg/expanded/exp.go")
+	if !strings.HasPrefix(expanded, ExpandedBuildTag+"\n") || !strings.Contains(expanded, "return 2") {
+		t.Fatalf("expanded file did not merge and retag cleanly:\n%s", expanded)
+	}
+	if _, err := os.Stat(filepath.Join(root, "pkg/obsolete/gone.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted upstream file still exists: stat err = %v", err)
+	}
+	if got := readTestFile(t, root, "pkg/tcpip/stack/conntrack_xplat.go"); !strings.Contains(got, "func Track()") {
+		t.Fatalf("protected _xplat file modified: %q", got)
+	}
+}
+
+func TestSyncUpstreamConflictPreservesOldCommit(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldSHA = "3333333333333333333333333333333333333333"
+		newSHA = "4444444444444444444444444444444444444444"
+	)
+
+	mask, err := ParseFileMaskReader(strings.NewReader("INCLUDE pkg/**\n"))
+	if err != nil {
+		t.Fatalf("ParseFileMaskReader: %v", err)
+	}
+	patches, err := ParsePatchSet(strings.NewReader("seam pkg/seam/conflict.go\nseam pkg/seam/delmod.go\n"))
+	if err != nil {
+		t.Fatalf("ParsePatchSet: %v", err)
+	}
+
+	oldUpstream := map[string]string{
+		"pkg/seam/conflict.go": "package seam\n\nvar Value = 1\n",
+		"pkg/seam/delmod.go":   "package seam\n\nvar Deleted = 1\n",
+	}
+	newUpstream := map[string]string{
+		"pkg/seam/conflict.go": "package seam\n\nvar Value = 2\n",
+	}
+
+	cacheDir := t.TempDir()
+	writeCachedArchiveSHA(t, cacheDir, oldSHA, oldUpstream)
+	writeCachedArchiveSHA(t, cacheDir, newSHA, newUpstream)
+
+	root := t.TempDir()
+	writeTestFile(t, root, "pkg/seam/conflict.go", "package seam\n\nvar Value = 99\n")
+	writeTestFile(t, root, "pkg/seam/delmod.go", "package seam\n\nvar Deleted = 88\n")
+	writeTestFile(t, root, "UPSTREAM_COMMIT", oldSHA+"\n")
+	writeTestFile(t, root, "tools/upstream/sync_manifest.json", `{"go_branch_sha": "`+oldSHA+`"}`+"\n")
+
+	manifest, err := SyncUpstream(context.Background(), SyncConfig{
+		RootDir:   root,
+		TargetRef: newSHA,
+		MaxRatio:  0.50,
+		Audit:     true,
+		Mask:      mask,
+		Patches:   patches,
+		Source:    ArchiveSource{CacheDir: cacheDir, Offline: true},
+	})
+	if !errors.Is(err, errMergeConflicts) {
+		t.Fatalf("SyncUpstream err = %v, want %v", err, errMergeConflicts)
+	}
+	wantConflicts := []string{"pkg/seam/conflict.go", "pkg/seam/delmod.go"}
+	if !slices.Equal(manifest.Conflicts, wantConflicts) {
+		t.Fatalf("manifest.Conflicts = %v, want %v", manifest.Conflicts, wantConflicts)
+	}
+	for _, rel := range wantConflicts {
+		if !strings.Contains(err.Error(), rel) {
+			t.Errorf("conflict error lacks %q: %v", rel, err)
+		}
+	}
+	if got := strings.TrimSpace(readTestFile(t, root, "UPSTREAM_COMMIT")); got != oldSHA {
+		t.Fatalf("UPSTREAM_COMMIT = %q, want preserved %q", got, oldSHA)
+	}
+	if err := ValidateManifest(root, oldSHA); err != nil {
+		t.Fatalf("sync_manifest.json was clobbered on conflict: %v", err)
+	}
+	if conflictBody := readTestFile(t, root, "pkg/seam/conflict.go"); !strings.Contains(conflictBody, "<<<<<<< ours") {
+		t.Fatalf("conflicted file lacks conflict markers:\n%s", conflictBody)
+	}
+	if delModBody := readTestFile(t, root, "pkg/seam/delmod.go"); !strings.Contains(delModBody, "Deleted = 88") {
+		t.Fatalf("delete/modify conflict erased local edit:\n%s", delModBody)
+	}
+}
+
+func TestSyncUpstreamAuditFailurePreservesOldCommit(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldSHA = "5555555555555555555555555555555555555555"
+		newSHA = "6666666666666666666666666666666666666666"
+	)
+
+	mask, err := ParseFileMaskReader(strings.NewReader("EXCLUDE runsc/**\nPROTECT pkg/shadow/*_darwin*\nINCLUDE pkg/**\n"))
+	if err != nil {
+		t.Fatalf("ParseFileMaskReader: %v", err)
+	}
+	// Register a stale allowlist rule so post-merge RunAudit fails after clean extraction.
+	patches, err := ParsePatchSet(strings.NewReader("pkg/nonexistent/stale.go\n"))
+	if err != nil {
+		t.Fatalf("ParsePatchSet: %v", err)
+	}
+
+	oldUpstream := baseUpstream()
+	newUpstream := with(oldUpstream, "pkg/fd/fd.go", "package fd\n\nfunc Updated() {}\n")
+
+	cacheDir := t.TempDir()
+	writeCachedArchiveSHA(t, cacheDir, oldSHA, oldUpstream)
+	writeCachedArchiveSHA(t, cacheDir, newSHA, newUpstream)
+
+	root := t.TempDir()
+	for rel, body := range cleanRepo() {
+		writeTestFile(t, root, rel, body)
+	}
+	writeTestFile(t, root, "UPSTREAM_COMMIT", oldSHA+"\n")
+	writeTestFile(t, root, "tools/upstream/sync_manifest.json", `{"go_branch_sha": "`+oldSHA+`"}`+"\n")
+
+	_, err = SyncUpstream(context.Background(), SyncConfig{
+		RootDir:   root,
+		TargetRef: newSHA,
+		MaxRatio:  0.05,
+		Audit:     true,
+		Mask:      mask,
+		Patches:   patches,
+		Source:    ArchiveSource{CacheDir: cacheDir, Offline: true},
+	})
+	if !errors.Is(err, errStaleRule) {
+		t.Fatalf("SyncUpstream err = %v, want %v", err, errStaleRule)
+	}
+	if got := strings.TrimSpace(readTestFile(t, root, "UPSTREAM_COMMIT")); got != oldSHA {
+		t.Fatalf("UPSTREAM_COMMIT = %q, want preserved %q after audit failure", got, oldSHA)
+	}
+	if err := ValidateManifest(root, oldSHA); err != nil {
+		t.Fatalf("sync_manifest.json was clobbered after audit failure: %v", err)
+	}
+}
+
+func writeCachedArchiveSHA(tb testing.TB, cacheDir, sha string, files map[string]string) string {
+	tb.Helper()
+	p := filepath.Join(cacheDir, sha+".tar.gz")
+	if err := os.WriteFile(p, buildTestTarGzSHA(tb, sha, files), 0o644); err != nil {
+		tb.Fatalf("write cached archive %s: %v", sha, err)
+	}
+	return p
 }
 
 func TestSyncUpstreamRejectsMalformedTargetRef(t *testing.T) {
