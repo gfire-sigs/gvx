@@ -18,12 +18,12 @@ import (
 	"errors"
 	"math"
 	"os"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/sentry/limits"
-	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 )
 
 // This file implements fallocate(2) for regular files. hostfs supports three
@@ -46,37 +46,50 @@ import (
 // zeroChunk is the write size of the zero-fill emulation.
 const zeroChunk = 64 << 10
 
+func clearSUIDAndSGID(mode uint32) uint32 {
+	return fsutilx.ClearSUIDAndSGID(mode)
+}
+
+func statxTime(ts linux.StatxTimestamp, now time.Time) time.Time {
+	return fsutilx.ResolveStatxTime(ts, now)
+}
+
+func statxTimestamp(t time.Time) linux.StatxTimestamp {
+	return fsutilx.StatxTimestampFromTime(t)
+}
+
+func checkTruncateFileType(mode uint32) error {
+	return fsutilx.CheckTruncateFileType(mode)
+}
+
+func newHostfsStatx(a fsutilx.StatxAttr) linux.Statx {
+	return fsutilx.NewStatx(a)
+}
+
+func seekRegular(cur, offset int64, whence int32, sizeFn func() (int64, error)) (int64, error) {
+	return fsutilx.SeekRegular(cur, offset, whence, sizeFn)
+}
+
+type hostfsStatxAttr = fsutilx.StatxAttr
+
 // ServesFallocateModes marks the description for the fallocate system call. The
 // call forwards a mode other than 0 only to a description with this method.
 func (fd *regularFD) ServesFallocateModes() {}
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
-	const supported = linux.FALLOC_FL_KEEP_SIZE | linux.FALLOC_FL_PUNCH_HOLE
-	if mode&^uint64(supported) != 0 {
-		return linuxerr.EOPNOTSUPP
+	op, keepSize, err := fsutilx.ParseFallocateMode(mode, fsutilx.HostfsFallocateModes)
+	if err != nil {
+		return err
 	}
-	punch := mode&linux.FALLOC_FL_PUNCH_HOLE != 0
-	keepSize := mode&linux.FALLOC_FL_KEEP_SIZE != 0
-	if punch && !keepSize {
-		return linuxerr.EOPNOTSUPP
+	end, err := fsutilx.CheckFallocateRange(offset, length, math.MaxInt64)
+	if err != nil {
+		return err
 	}
-	if length == 0 || offset > math.MaxInt64 || length > math.MaxInt64 {
-		return linuxerr.EINVAL
+	if err := fsutilx.CheckFallocateLimit(ctx, offset, length, !keepSize); err != nil {
+		return err
 	}
-	end := offset + length
-	if end < offset || end > math.MaxInt64 {
-		return linuxerr.EFBIG
-	}
-	if !keepSize && limits.FromContext(ctx) != nil {
-		limit, err := vfs.CheckLimit(ctx, int64(offset), int64(length))
-		if err != nil {
-			return err
-		}
-		if limit < int64(length) {
-			return linuxerr.ErrExceedsFileSizeLimit
-		}
-	}
+	punch := op == fsutilx.FallocatePunchHole
 	d := fd.dentry
 	ino := d.inode
 	mnt := fd.vfsfd.Mount()

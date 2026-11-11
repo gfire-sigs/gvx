@@ -17,8 +17,8 @@ package ext4lite
 import (
 	"errors"
 
-	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 )
 
 // The fallocate modes that change the mapping of a file. A zero range, a
@@ -27,50 +27,21 @@ import (
 // of a partial edge block change in place, as with a punch.
 
 // allocOp is the operation that a fallocate mode selects.
-type allocOp uint8
+type allocOp = fsutilx.FallocateOp
 
 const (
-	allocReserve allocOp = iota
-	allocPunch
-	allocZero
-	allocCollapse
-	allocInsert
+	allocReserve  = fsutilx.FallocateReserve
+	allocPunch    = fsutilx.FallocatePunchHole
+	allocZero     = fsutilx.FallocateZeroRange
+	allocCollapse = fsutilx.FallocateCollapseRange
+	allocInsert   = fsutilx.FallocateInsertRange
 )
 
 // parseAllocMode validates a fallocate mode as the Linux function
 // vfs_fallocate and the function ext4_fallocate do. The mode names one
 // operation and the optional flag FALLOC_FL_KEEP_SIZE.
 func parseAllocMode(mode uint64) (op allocOp, keepSize bool, err error) {
-	const modeMask = linux.FALLOC_FL_PUNCH_HOLE | linux.FALLOC_FL_COLLAPSE_RANGE |
-		linux.FALLOC_FL_ZERO_RANGE | linux.FALLOC_FL_INSERT_RANGE | linux.FALLOC_FL_UNSHARE_RANGE
-	if mode&^uint64(modeMask|linux.FALLOC_FL_KEEP_SIZE) != 0 {
-		return 0, false, linuxerr.EOPNOTSUPP
-	}
-	keepSize = mode&linux.FALLOC_FL_KEEP_SIZE != 0
-	switch mode & modeMask {
-	case 0:
-		return allocReserve, keepSize, nil
-	case linux.FALLOC_FL_ZERO_RANGE:
-		return allocZero, keepSize, nil
-	case linux.FALLOC_FL_PUNCH_HOLE:
-		if !keepSize {
-			return 0, false, linuxerr.EOPNOTSUPP
-		}
-		return allocPunch, true, nil
-	case linux.FALLOC_FL_COLLAPSE_RANGE:
-		if keepSize {
-			return 0, false, linuxerr.EOPNOTSUPP
-		}
-		return allocCollapse, false, nil
-	case linux.FALLOC_FL_INSERT_RANGE:
-		if keepSize {
-			return 0, false, linuxerr.EOPNOTSUPP
-		}
-		return allocInsert, false, nil
-	}
-	// A combination of operations, and FALLOC_FL_UNSHARE_RANGE, which ext4 does
-	// not serve.
-	return 0, false, linuxerr.EOPNOTSUPP
+	return fsutilx.ParseFallocateMode(mode, fsutilx.Ext4FallocateModes)
 }
 
 // zeroRange makes the bytes of [off, off+length) read as zeros. A whole block

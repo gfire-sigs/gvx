@@ -58,6 +58,7 @@ var tier1Prefixes = []string{
 	"pkg/sentry/fsimpl/hostfs/",
 	"pkg/sentry/fsimpl/ext4lite/",
 	"pkg/sentry/fsimpl/chunkcache/",
+	"pkg/sentry/fsimpl/fsutilx/",
 	"pkg/sentry/socket/netlink/genetlink/",
 	"pkg/ipset/",
 	"pkg/tcpip/link/vxlan/",

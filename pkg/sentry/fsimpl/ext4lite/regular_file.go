@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/limits"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
@@ -334,19 +335,10 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	ino := fd.dentry.inode
-	var newOff int64
-	switch whence {
-	case linux.SEEK_SET:
-		newOff = offset
-	case linux.SEEK_CUR:
-		newOff = fd.off + offset
-	case linux.SEEK_END:
-		ino.n.mu.RLock()
-		size := int64(ino.n.size)
-		ino.n.mu.RUnlock()
-		newOff = size + offset
-	case linux.SEEK_DATA, linux.SEEK_HOLE:
-		if offset < 0 {
+	newOff, err := fsutilx.SeekOffset(fd.off, offset, whence, func() (int64, error) {
+		return int64(ino.size()), nil
+	}, func(off int64, seekData bool) (int64, error) {
+		if off < 0 {
 			return 0, linuxerr.ENXIO
 		}
 		// A dirty mapped page over a hole counts as data only after the
@@ -354,26 +346,20 @@ func (fd *regularFD) Seek(ctx context.Context, offset int64, whence int32) (int6
 		if err := ino.flushMapped(0, math.MaxUint64); err != nil {
 			return 0, toLinuxErr(err)
 		}
-		ino.n.mu.RLock()
-		size := int64(ino.n.size)
-		ino.n.mu.RUnlock()
-		if offset >= size {
+		if off >= int64(ino.size()) {
 			return 0, linuxerr.ENXIO
 		}
-		if whence == linux.SEEK_DATA {
-			pos, ok := ino.n.seekData(uint64(offset))
+		if seekData {
+			pos, ok := ino.n.seekData(uint64(off))
 			if !ok {
 				return 0, linuxerr.ENXIO
 			}
-			newOff = int64(pos)
-		} else {
-			newOff = int64(ino.n.seekHole(uint64(offset)))
+			return int64(pos), nil
 		}
-	default:
-		return 0, linuxerr.EINVAL
-	}
-	if newOff < 0 {
-		return 0, linuxerr.EINVAL
+		return int64(ino.n.seekHole(uint64(off))), nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	fd.off = newOff
 	return newOff, nil
@@ -392,28 +378,18 @@ func (fd *regularFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 // FALLOC_FL_KEEP_SIZE, FALLOC_FL_COLLAPSE_RANGE, and FALLOC_FL_INSERT_RANGE.
 // The checks and their order follow vfs_fallocate and ext4_fallocate.
 func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
-	if length == 0 || offset > math.MaxInt64 || length > math.MaxInt64 {
-		return linuxerr.EINVAL
-	}
 	op, keepSize, err := parseAllocMode(mode)
 	if err != nil {
 		return err
 	}
-	if offset+length < offset || offset+length > maxFileSize {
-		return linuxerr.EFBIG
+	if _, err := fsutilx.CheckFallocateRange(offset, length, maxFileSize); err != nil {
+		return err
 	}
 	d := fd.dentry
 	ino := d.inode
-	if !keepSize && limits.FromContext(ctx) != nil && (op == allocReserve || op == allocZero && offset+length > ino.size()) {
-		// Like Linux, a call that grows the file past RLIMIT_FSIZE fails whole.
-		// The system call turns the error into SIGXFSZ and EFBIG.
-		limit, err := vfs.CheckLimit(ctx, int64(offset), int64(length))
-		if err != nil {
-			return err
-		}
-		if limit < int64(length) {
-			return linuxerr.ErrExceedsFileSizeLimit
-		}
+	checkLimit := !keepSize && (op == allocReserve || op == allocZero && offset+length > ino.size())
+	if err := fsutilx.CheckFallocateLimit(ctx, offset, length, checkLimit); err != nil {
+		return err
 	}
 	return d.fs.writeOp(fd.vfsfd.Mount(), func() error { return fd.allocateLocked(ino, op, offset, length, keepSize) })
 }
