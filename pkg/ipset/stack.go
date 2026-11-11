@@ -23,52 +23,58 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
-// registries maps each network stack to its sets. A network namespace owns
-// one network stack, so its sets live and die with the stack.
-var registries = struct {
-	mu sync.Mutex
-	m  map[weak.Pointer[stack.Stack]]*Registry
-}{m: make(map[weak.Pointer[stack.Stack]]*Registry)}
+const (
+	stackRegistryKey = "ipset.registry"
+	kernelModuleKey  = "ipset.module"
+)
+
+type extensionOwner interface {
+	LoadOrStoreExtensionState(key string, init func() any) any
+}
 
 // ForStack returns the sets of the network stack. It makes an empty registry
 // at the first call. mod gives the initial size of the table of sets.
 func ForStack(stk *stack.Stack, mod *Module) *Registry {
-	registries.mu.Lock()
-	defer registries.mu.Unlock()
-	key := weak.Make(stk)
-	if r := registries.m[key]; r != nil {
+	if stk == nil {
+		maxSets := DefaultMaxSets
+		if mod != nil {
+			maxSets = mod.MaxSets()
+		}
+		return NewRegistry(maxSets, nil)
+	}
+	return stk.LoadOrStoreExtensionState(stackRegistryKey, func() any {
+		maxSets := DefaultMaxSets
+		if mod != nil {
+			maxSets = mod.MaxSets()
+		}
+		clock := stk.Clock()
+		epoch := clock.NowMonotonic()
+		r := NewRegistry(maxSets, func() time.Duration {
+			// The offset keeps the time after zero, because zero marks an
+			// element with no timeout.
+			return clock.NowMonotonic().Sub(epoch) + time.Second
+		})
+		r.stk = stk
 		return r
-	}
-	maxSets := DefaultMaxSets
-	if mod != nil {
-		maxSets = mod.MaxSets()
-	}
-	clock := stk.Clock()
-	epoch := clock.NowMonotonic()
-	r := NewRegistry(maxSets, func() time.Duration {
-		// The offset keeps the time after zero, because zero marks an
-		// element with no timeout.
-		return clock.NowMonotonic().Sub(epoch) + time.Second
-	})
-	registries.m[key] = r
-	runtime.AddCleanup(stk, func(key weak.Pointer[stack.Stack]) {
-		registries.mu.Lock()
-		delete(registries.m, key)
-		registries.mu.Unlock()
-	}, key)
-	return r
+	}).(*Registry)
 }
 
 // ExistingForStack returns the sets of the network stack, or nil when the
 // stack never had a set. A rule that names a set needs the sets to exist.
 func ExistingForStack(stk *stack.Stack) *Registry {
-	registries.mu.Lock()
-	defer registries.mu.Unlock()
-	return registries.m[weak.Make(stk)]
+	if stk == nil {
+		return nil
+	}
+	v, ok := stk.ExtensionState(stackRegistryKey)
+	if !ok {
+		return nil
+	}
+	return v.(*Registry)
 }
 
-// modules maps each owner of the module parameters to its Module.
-var modules = struct {
+// fallbackModules maps arbitrary non-Kernel owners in unit tests weakly to
+// their Module parameters.
+var fallbackModules = struct {
 	mu sync.Mutex
 	m  map[any]*Module
 }{m: make(map[any]*Module)}
@@ -76,18 +82,26 @@ var modules = struct {
 // ModuleFor returns the module parameters that belong to owner, which is the
 // kernel of one sandbox. It makes the parameters at the first call.
 func ModuleFor[T any](owner *T) *Module {
-	modules.mu.Lock()
-	defer modules.mu.Unlock()
+	if owner == nil {
+		return NewModule()
+	}
+	if ext, ok := any(owner).(extensionOwner); ok {
+		return ext.LoadOrStoreExtensionState(kernelModuleKey, func() any {
+			return NewModule()
+		}).(*Module)
+	}
+	fallbackModules.mu.Lock()
+	defer fallbackModules.mu.Unlock()
 	key := weak.Make(owner)
-	if m := modules.m[key]; m != nil {
+	if m := fallbackModules.m[key]; m != nil {
 		return m
 	}
 	m := NewModule()
-	modules.m[key] = m
+	fallbackModules.m[key] = m
 	runtime.AddCleanup(owner, func(key weak.Pointer[T]) {
-		modules.mu.Lock()
-		delete(modules.m, key)
-		modules.mu.Unlock()
+		fallbackModules.mu.Lock()
+		delete(fallbackModules.m, key)
+		fallbackModules.mu.Unlock()
 	}, key)
 	return m
 }

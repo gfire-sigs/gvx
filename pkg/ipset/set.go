@@ -15,6 +15,7 @@
 package ipset
 
 import (
+	"context"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -79,16 +80,18 @@ const (
 func (p *CreateParams) given(g CreateGiven) bool { return p.Given&g != 0 }
 
 // Set is one IP set. The type of the set decides how it stores its elements.
+//
+// +stateify savable
 type Set struct {
 	reg *Registry
 
 	// name, ref, and refNetlink belong to the registry, which guards them
 	// with its own lock.
 	name       string
-	ref        int
-	refNetlink int
+	ref        int `state:"nosave"`
+	refNetlink int `state:"nosave"`
 
-	spec     *typeSpec
+	spec     *typeSpec `state:".(string)"`
 	family   uint8
 	revision uint8
 
@@ -111,12 +114,34 @@ type Set struct {
 	listSize    uint32
 
 	// rangeYieldHook runs in tests while hashUadt releases mu between chunks.
-	rangeYieldHook func()
+	rangeYieldHook func() `state:"nosave"`
 
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 	// The fields below are guarded by mu.
 	store store
 	list  []member
+}
+
+func (s *Set) saveSpec() string {
+	if s.spec == nil {
+		return ""
+	}
+	return s.spec.name
+}
+
+func (s *Set) loadSpec(_ context.Context, name string) {
+	if spec, ok := findType(name); ok {
+		s.spec = spec
+	}
+}
+
+func (s *Set) afterLoad(context.Context) {
+	if s.reg == nil {
+		return
+	}
+	for _, m := range s.list {
+		s.reg.GetRef(m.id)
+	}
 }
 
 // newSet builds a set from the create request. It returns a negative error
@@ -170,7 +195,7 @@ func newSet(reg *Registry, p *CreateParams) (*Set, int) {
 func (s *Set) Name() string { return s.name }
 
 // now returns the time of the registry clock.
-func (s *Set) now() time.Duration { return s.reg.clock() }
+func (s *Set) now() time.Duration { return s.reg.now() }
 
 // expiredAt reports whether an expiry time has passed. The value zero marks
 // an element with no timeout.
@@ -233,6 +258,8 @@ func (s *Set) getExtensions(e *Element) (ext, int) {
 }
 
 // extensionData is the extension part of a stored element.
+//
+// +stateify savable
 type extensionData struct {
 	// expires is the expiry time. Zero means that the element never expires.
 	expires        time.Duration

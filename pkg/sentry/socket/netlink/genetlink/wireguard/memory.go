@@ -119,6 +119,8 @@ func (e *linkEndpoint) releaseMemory() {
 
 // peerSet lists the public keys of the peers of a device in the order of their
 // creation, as the peer list of Linux does. A dump follows that order.
+//
+// +stateify savable
 type peerSet struct {
 	next uint64
 	seq  map[[keyLen]byte]uint64

@@ -15,6 +15,7 @@
 package netfilter
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sync"
@@ -133,6 +134,8 @@ func limitUserToCredits(user uint32) uint32 {
 
 // LimitMatcher is a token bucket. Each rule has its own bucket, which a
 // replacement of the table resets, as in Linux.
+//
+// +stateify savable
 type LimitMatcher struct {
 	// raw is the struct xt_rateinfo as parsed. Marshal returns it unchanged.
 	raw []byte
@@ -142,14 +145,37 @@ type LimitMatcher struct {
 	creditCap uint32
 	cost      uint32
 
+	stk      *stack.Stack
+	savedNow time.Duration
+
 	// clock returns the time since the bucket started. bindStack sets it
 	// before the rule is published, so Match reads it without a lock.
-	clock func() time.Duration
+	clock func() time.Duration `state:"nosave"`
 
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 	// prev is the tick of the last packet. credit is the current credit.
 	prev   int64
 	credit uint32
+}
+
+func (m *LimitMatcher) beforeSave() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.clock != nil {
+		m.savedNow = m.clock()
+	}
+}
+
+func (m *LimitMatcher) afterLoad(context.Context) {
+	baseOffset := m.savedNow
+	if m.stk != nil {
+		clock := m.stk.Clock()
+		epoch := clock.NowMonotonic()
+		m.clock = func() time.Duration { return clock.NowMonotonic().Sub(epoch) + baseOffset }
+		return
+	}
+	start := time.Now()
+	m.clock = func() time.Duration { return time.Since(start) + baseOffset }
 }
 
 // name implements matcher.name.
@@ -162,6 +188,7 @@ func (*LimitMatcher) revision() uint8 { return 0 }
 // monotonic clock of the stack, from the moment of the bind. It is the
 // initialization of prev in limit_mt_check.
 func (m *LimitMatcher) bindStack(stk *stack.Stack) *syserr.Error {
+	m.stk = stk
 	clock := stk.Clock()
 	epoch := clock.NowMonotonic()
 	m.clock = func() time.Duration { return clock.NowMonotonic().Sub(epoch) }

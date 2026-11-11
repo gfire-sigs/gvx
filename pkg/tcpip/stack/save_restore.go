@@ -25,6 +25,7 @@ import (
 
 // beforeSave is invoked by stateify.
 func (s *Stack) beforeSave() {
+	s.runPreSaveHooks()
 	// removeConf will be set only in case of save/restore.
 	s.mu.Lock()
 	s.routeMu.RLock()
@@ -100,13 +101,14 @@ func (s *Stack) ensureRNG() {
 func (s *Stack) afterLoad(context.Context) {
 	s.ensureRNG()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.nics == nil {
 		s.nics = make(map[tcpip.NICID]*nic)
 	}
 	if s.preservedNICs == nil {
 		s.preservedNICs = make(map[tcpip.NICID]*nic)
 	}
+	s.mu.Unlock()
+	s.finishExtLoad()
 }
 
 // afterLoad reseeds ct.rng after restore.

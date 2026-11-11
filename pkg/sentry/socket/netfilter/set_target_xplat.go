@@ -15,10 +15,11 @@
 package netfilter
 
 import (
+	"context"
 	"math"
-	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/ipset"
 	"z.gfire.dev/gvx/pkg/syserr"
@@ -72,11 +73,22 @@ func init() {
 // setRefs holds the references of a rule to the sets that it names. It is the
 // state that the check function of a Linux extension takes and the destroy
 // function gives back.
+//
+// +stateify savable
 type setRefs struct {
 	reg *ipset.Registry
 	ids []ipset.ID
 	// released is true after release ran, so that a second call does nothing.
-	released atomic.Bool
+	released atomicbitops.Bool
+}
+
+func (r *setRefs) afterLoad(context.Context) {
+	if r.reg == nil || r.released.Load() {
+		return
+	}
+	for _, id := range r.ids {
+		r.reg.GetRef(id)
+	}
 }
 
 // acquire takes a reference to the set of each info. With optional true, an
@@ -182,6 +194,8 @@ func (m *setTargetMaker) unmarshal(buf []byte, _ stack.IPHeaderFilter) (target, 
 
 // setTarget is the "SET" target. Like Linux set_target_v1 to set_target_v3,
 // it returns XT_CONTINUE (RuleContinue).
+//
+// +stateify savable
 type setTarget struct {
 	rev             uint8
 	networkProtocol tcpip.NetworkProtocolNumber

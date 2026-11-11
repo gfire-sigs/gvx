@@ -3,6 +3,7 @@
 pkg/bitmap
 pkg/bpf
 pkg/ilist
+pkg/ipset
 pkg/refs
 pkg/sentry/checkpoint
 pkg/sentry/devices/memdev tier2
@@ -17,15 +18,20 @@ pkg/sentry/kernel tier2
 pkg/sentry/kernel/auth
 pkg/sentry/kernel/futex
 pkg/sentry/kernel/pipe
+pkg/sentry/kernel/shm
 pkg/sentry/limits
 pkg/sentry/mm tier2
 pkg/sentry/pgalloc tier2
 pkg/sentry/socket/control
 pkg/sentry/socket/netfilter
+pkg/sentry/socket/netfilter tier2
+pkg/sentry/socket/netlink/genetlink
+pkg/sentry/socket/netlink/genetlink/wireguard
 pkg/sentry/socket/netstack
 pkg/sentry/uniqueid
 pkg/sentry/vfs tier2
 pkg/tcpip
+pkg/tcpip/link/vxlan
 pkg/tcpip/network/ipv4
 pkg/tcpip/stack
 pkg/tcpip/transport/tcp

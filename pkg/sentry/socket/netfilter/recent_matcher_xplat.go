@@ -17,14 +17,14 @@ package netfilter
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"fmt"
 	"math/bits"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
-	"weak"
 
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	bitsutil "z.gfire.dev/gvx/pkg/bits"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/syserr"
@@ -183,6 +183,8 @@ func (m *RecentMatcher) stampCount(pktListTot uint32) int {
 
 // RecentMatcher matches packets by the history of their address in a named
 // list. The lists belong to the network stack of the rule.
+//
+// +stateify savable
 type RecentMatcher struct {
 	rev uint8
 	// raw is the user struct as parsed. Marshal returns it unchanged, as
@@ -198,9 +200,36 @@ type RecentMatcher struct {
 
 	// table is the named list. bindStack sets it before the rule is
 	// published, so Match reads it without a lock.
-	table *recentTable
-	// released is set when the rule gives up its reference to table.
-	released atomic.Bool
+	table   *recentTable
+	release *recentRelease
+}
+
+func (m *RecentMatcher) afterLoad(context.Context) {
+	if m.table == nil || (m.release != nil && m.release.released.Load()) {
+		return
+	}
+	t := m.table
+	if r := t.owner; r != nil {
+		r.mu.Lock()
+		if r.tables == nil {
+			r.tables = make(map[string]*recentTable)
+		}
+		if t.refs == 0 {
+			r.tables[t.name] = t
+			if r.module != nil {
+				r.module.mu.Lock()
+				r.module.lists++
+				r.module.mu.Unlock()
+			}
+		}
+		t.refs++
+		r.mu.Unlock()
+	} else {
+		t.refs++
+	}
+	if m.release != nil && m.release.table != nil {
+		runtime.AddCleanup(m, (*recentRelease).run, m.release)
+	}
 }
 
 func (*RecentMatcher) name() string { return matcherNameRecent }
@@ -210,23 +239,28 @@ func (m *RecentMatcher) revision() uint8 { return m.rev }
 // bindStack implements stackBinder.bindStack. Rules of one stack that name the
 // same list share it.
 func (m *RecentMatcher) bindStack(stk *stack.Stack) *syserr.Error {
-	t := recentTables.registry(stk).acquire(m.listName, m.mask, m.stampCount)
+	t := recentRegistryForStack(stk).acquire(m.listName, m.mask, m.stampCount)
 	m.table = t
+	m.release = &recentRelease{table: t}
 	// The cleanup releases the list if the rule is lost without a
 	// replacement of its table, for example with its network stack.
-	runtime.AddCleanup(m, func(r *recentRelease) { r.run() }, &recentRelease{table: t, released: &m.released})
+	runtime.AddCleanup(m, (*recentRelease).run, m.release)
 	return nil
 }
 
 // releaseStack implements stackReleaser.releaseStack.
 func (m *RecentMatcher) releaseStack() {
-	(&recentRelease{table: m.table, released: &m.released}).run()
+	if m.release != nil {
+		m.release.run()
+	}
 }
 
 // recentRelease drops the reference of one rule to its list once.
+//
+// +stateify savable
 type recentRelease struct {
 	table    *recentTable
-	released *atomic.Bool
+	released atomicbitops.Bool
 }
 
 func (r *recentRelease) run() {
@@ -269,11 +303,13 @@ func packetTTL(pkt *stack.PacketBuffer) uint8 {
 	return 0
 }
 
+// +stateify savable
 type recentKey struct {
 	proto tcpip.NetworkProtocolNumber
 	addr  [16]byte
 }
 
+// +stateify savable
 type recentEntry struct {
 	key    recentKey
 	ttl    uint8
@@ -282,7 +318,7 @@ type recentEntry struct {
 	// stamp.
 	nstamps int
 	index   int
-	lru     *list.Element
+	lru     *list.Element `state:"nosave"`
 }
 
 // last returns the newest stamp.
@@ -292,21 +328,47 @@ func (e *recentEntry) last() time.Duration {
 
 // recentTable is one named list. The LRU list holds the entries from the
 // oldest update to the newest.
+//
+// +stateify savable
 type recentTable struct {
 	owner *recentRegistry
 	name  string
-	clock func() time.Duration
+	clock func() time.Duration `state:"nosave"`
 	// mask comes from the first rule that names the list, as in Linux.
 	mask [16]byte
 
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 	// refs is the count of rules that name the list. The registry lock
 	// guards it.
-	refs int
+	refs int `state:"nosave"`
 	// stamps is the count of time stamps of each entry.
-	stamps  int
-	entries map[recentKey]*recentEntry
-	lru     list.List
+	stamps     int
+	entries    map[recentKey]*recentEntry
+	lru        list.List `state:"nosave"`
+	savedOrder []*recentEntry
+}
+
+func (t *recentTable) beforeSave() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.savedOrder = make([]*recentEntry, 0, len(t.entries))
+	for elem := t.lru.Front(); elem != nil; elem = elem.Next() {
+		t.savedOrder = append(t.savedOrder, elem.Value.(*recentEntry))
+	}
+}
+
+func (t *recentTable) afterLoad(context.Context) {
+	t.lru.Init()
+	for _, e := range t.savedOrder {
+		e.lru = t.lru.PushBack(e)
+	}
+	t.savedOrder = nil
+	if t.owner != nil {
+		t.clock = t.owner.readClock
+		return
+	}
+	start := time.Now()
+	t.clock = func() time.Duration { return time.Since(start) }
 }
 
 // match runs recent_mt for one packet.
@@ -415,13 +477,47 @@ func (t *recentTable) reap(limit time.Duration, working *recentEntry, update boo
 }
 
 // recentRegistry holds the named lists of one network stack.
+//
+// +stateify savable
 type recentRegistry struct {
-	mu     sync.Mutex
-	tables map[string]*recentTable
-	clock  func() time.Duration
+	mu       sync.Mutex `state:"nosave"`
+	stk      *stack.Stack
+	savedNow time.Duration
+	tables   map[string]*recentTable `state:"nosave"`
+	clock    func() time.Duration    `state:"nosave"`
 	// module holds the module parameters that all registries of a kernel
 	// share.
 	module *RecentModule
+}
+
+func (r *recentRegistry) readClock() time.Duration {
+	if r.clock != nil {
+		return r.clock()
+	}
+	return r.savedNow
+}
+
+func (r *recentRegistry) beforeSave() {
+	if r.clock != nil {
+		r.savedNow = r.clock()
+	}
+}
+
+func (r *recentRegistry) afterLoad(context.Context) {
+	r.mu.Lock()
+	if r.tables == nil {
+		r.tables = make(map[string]*recentTable)
+	}
+	r.mu.Unlock()
+	baseOffset := r.savedNow
+	if r.stk != nil {
+		clock := r.stk.Clock()
+		epoch := clock.NowMonotonic()
+		r.clock = func() time.Duration { return clock.NowMonotonic().Sub(epoch) + baseOffset }
+		return
+	}
+	start := time.Now()
+	r.clock = func() time.Duration { return time.Since(start) + baseOffset }
 }
 
 // acquire returns the list name and counts one more rule that uses it. A new
@@ -436,7 +532,7 @@ func (r *recentRegistry) acquire(name string, mask [16]byte, stampsFor func(pktL
 	stamps := stampsFor(r.module.PktListTot())
 	t := r.tables[name]
 	if t == nil {
-		t = &recentTable{owner: r, name: name, clock: r.clock, mask: mask, stamps: stamps, entries: make(map[recentKey]*recentEntry)}
+		t = &recentTable{owner: r, name: name, clock: r.readClock, mask: mask, stamps: stamps, entries: make(map[recentKey]*recentEntry)}
 		r.tables[name] = t
 		r.module.lists++
 	}
@@ -465,34 +561,29 @@ func (r *recentRegistry) release(t *recentTable) {
 	}
 }
 
-// recentStacks maps each network stack to its lists.
-type recentStacks struct {
-	mu     sync.Mutex
-	stacks map[weak.Pointer[stack.Stack]]*recentRegistry
-}
+const stackRecentRegistryKey = "nf_recent.registry"
 
-var recentTables = recentStacks{stacks: make(map[weak.Pointer[stack.Stack]]*recentRegistry)}
-
-// registry returns the lists of stk.
-func (s *recentStacks) registry(stk *stack.Stack) *recentRegistry {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := weak.Make(stk)
-	if r := s.stacks[key]; r != nil {
-		return r
+func recentRegistryForStack(stk *stack.Stack) *recentRegistry {
+	if stk == nil {
+		start := time.Now()
+		return &recentRegistry{
+			tables: make(map[string]*recentTable),
+			clock:  func() time.Duration { return time.Since(start) },
+			module: new(RecentModule),
+		}
 	}
-	clock := stk.Clock()
-	epoch := clock.NowMonotonic()
-	r := &recentRegistry{
-		tables: make(map[string]*recentTable),
-		clock:  func() time.Duration { return clock.NowMonotonic().Sub(epoch) },
-		module: RecentModuleOf(stk),
+	if v, ok := stk.ExtensionState(stackRecentRegistryKey); ok {
+		return v.(*recentRegistry)
 	}
-	s.stacks[key] = r
-	runtime.AddCleanup(stk, func(key weak.Pointer[stack.Stack]) {
-		s.mu.Lock()
-		delete(s.stacks, key)
-		s.mu.Unlock()
-	}, key)
-	return r
+	mod := RecentModuleOf(stk)
+	return stk.LoadOrStoreExtensionState(stackRecentRegistryKey, func() any {
+		clock := stk.Clock()
+		epoch := clock.NowMonotonic()
+		return &recentRegistry{
+			stk:    stk,
+			tables: make(map[string]*recentTable),
+			clock:  func() time.Duration { return clock.NowMonotonic().Sub(epoch) },
+			module: mod,
+		}
+	}).(*recentRegistry)
 }

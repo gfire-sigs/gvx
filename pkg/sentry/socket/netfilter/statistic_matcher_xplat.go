@@ -133,6 +133,8 @@ func (statisticMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilt
 
 // StatisticMatcher matches a random share of the packets or every Nth packet
 // of a rule.
+//
+// +stateify savable
 type StatisticMatcher struct {
 	mode  uint16
 	flags uint16

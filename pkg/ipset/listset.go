@@ -21,6 +21,8 @@ import (
 
 // member is one set that a list:set set holds. It holds a reference on the
 // member set, by index, as the set_elem of Linux does.
+//
+// +stateify savable
 type member struct {
 	id  ID
 	ext extensionData

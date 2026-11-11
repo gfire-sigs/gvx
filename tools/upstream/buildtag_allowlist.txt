@@ -402,3 +402,9 @@ seam pkg/sentry/platform/systrap/metrics.go
 # Content seam: ParseDirents decodes the fixed header fields within the record bounds instead of
 # dereferencing a full unix.Dirent struct past the end of the caller buffer.
 seam pkg/fsutil/fsutil_unsafe.go
+
+# Content seams: Stack owns per-sandbox extension state and pre-save hooks across
+# checkpoint and restore, and shm.Registry owns per-namespace shm_rmid_forced
+# (pkg/tcpip/stack/ext_state_xplat.go, pkg/sentry/kernel/shm/rmid_xplat.go).
+seam pkg/sentry/kernel/shm/shm.go
+seam pkg/sentry/kernel/shm/shm_state_autogen.go

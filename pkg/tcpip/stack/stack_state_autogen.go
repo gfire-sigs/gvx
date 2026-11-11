@@ -2294,6 +2294,7 @@ func (s *Stack) StateFields() []string {
 		"externalNetworkingDisabled",
 		"allowConnectedOnSave",
 		"neighborTables",
+		"extState",
 	}
 }
 
@@ -2330,6 +2331,7 @@ func (s *Stack) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(27, &s.externalNetworkingDisabled)
 	stateSinkObject.SaveBool(28, &s.allowConnectedOnSave)
 	stateSinkObject.Save(29, &s.neighborTables)
+	stateSinkObject.Save(30, &s.extState)
 }
 
 // +checklocksignore
@@ -2364,6 +2366,7 @@ func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadBool(27, &s.externalNetworkingDisabled)
 	stateSourceObject.LoadBool(28, &s.allowConnectedOnSave)
 	stateSourceObject.Load(29, &s.neighborTables)
+	stateSourceObject.Load(30, &s.extState)
 	stateSourceObject.AfterLoadTo(s)
 }
 

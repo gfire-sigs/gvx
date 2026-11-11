@@ -78,6 +78,8 @@ type Element struct {
 func (e *Element) has(p Present) bool { return e.Has&p != 0 }
 
 // SkbInfo is the packet information that an element stores.
+//
+// +stateify savable
 type SkbInfo struct {
 	Mark     uint32
 	MarkMask uint32

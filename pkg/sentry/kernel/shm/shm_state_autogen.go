@@ -17,6 +17,7 @@ func (r *Registry) StateFields() []string {
 		"userNS",
 		"reg",
 		"totalPages",
+		"rmidForced",
 	}
 }
 
@@ -28,6 +29,7 @@ func (r *Registry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.userNS)
 	stateSinkObject.Save(1, &r.reg)
 	stateSinkObject.SaveUint64(2, &r.totalPages)
+	stateSinkObject.Save(3, &r.rmidForced)
 }
 
 func (r *Registry) afterLoad(context.Context) {}
@@ -37,6 +39,7 @@ func (r *Registry) StateLoad(ctx context.Context, stateSourceObject state.Source
 	stateSourceObject.Load(0, &r.userNS)
 	stateSourceObject.Load(1, &r.reg)
 	stateSourceObject.LoadUint64(2, &r.totalPages)
+	stateSourceObject.Load(3, &r.rmidForced)
 }
 
 func (s *Shm) StateTypeName() string {

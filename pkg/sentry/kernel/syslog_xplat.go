@@ -17,14 +17,14 @@ package kernel
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"weak"
 
+	"z.gfire.dev/gvx/internal/weakmap"
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sync"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -176,8 +176,8 @@ type KernelLog struct {
 	maxRecords int
 
 	// devkmsg and dmesgRestrict store the corresponding sysctl settings.
-	devkmsg       atomic.Int32 `state:".(int32)"`
-	dmesgRestrict atomic.Bool  `state:".(bool)"`
+	devkmsg       atomicbitops.Int32
+	dmesgRestrict atomicbitops.Bool
 
 	// queue wakes /dev/kmsg and syslog(2) readers when Emit appends records.
 	queue waiter.Queue
@@ -202,26 +202,6 @@ type KernelLog struct {
 	levels [4]int
 	// +checklocks:mu
 	savedConsole int
-}
-
-// saveDevkmsg is invoked by stateify.
-func (l *KernelLog) saveDevkmsg() int32 {
-	return l.devkmsg.Load()
-}
-
-// loadDevkmsg is invoked by stateify.
-func (l *KernelLog) loadDevkmsg(_ context.Context, v int32) {
-	l.devkmsg.Store(v)
-}
-
-// saveDmesgRestrict is invoked by stateify.
-func (l *KernelLog) saveDmesgRestrict() bool {
-	return l.dmesgRestrict.Load()
-}
-
-// loadDmesgRestrict is invoked by stateify.
-func (l *KernelLog) loadDmesgRestrict(_ context.Context, v bool) {
-	l.dmesgRestrict.Store(v)
 }
 
 // afterLoad is invoked by stateify.
@@ -557,41 +537,33 @@ func CanReadKernelLog(creds *auth.Credentials, k *Kernel) bool {
 }
 
 // kernelLogEntry stores the configured ring size and lazy ring for one Kernel.
+//
+// +stateify savable
 type kernelLogEntry struct {
+	mu     sync.Mutex `state:"nosave"`
 	bufLen int
 	log    *KernelLog
 }
 
-// kernelLogRegistry maps each live Kernel to its KernelLog by weak pointer.
-// Unreferenced Kernel instances drop their ring buffers without adding fields
-// to Kernel or syslog.
-type kernelLogRegistry struct {
-	mu sync.Mutex
-	// +checklocks:mu
-	entries map[weak.Pointer[Kernel]]*kernelLogEntry
-}
+// kernelLogs maps each live Kernel to its kernelLogEntry by weak pointer so
+// unreferenced Kernels drop their ring buffers. Checkpoint persistence lives on
+// kernelExtState inside Kernel.additionalCheckpointState.
+var kernelLogs weakmap.Map[Kernel, *kernelLogEntry]
 
-var kernelLogs kernelLogRegistry
-
-func cleanupKernelLog(key weak.Pointer[Kernel]) {
-	kernelLogs.mu.Lock()
-	defer kernelLogs.mu.Unlock()
-	delete(kernelLogs.entries, key)
-}
-
-// +checklocks:kernelLogs.mu
-func kernelLogEntryFor(k *Kernel) (*kernelLogEntry, weak.Pointer[Kernel]) {
-	key := weak.Make(k)
-	if entry, ok := kernelLogs.entries[key]; ok {
-		return entry, key
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
+func kernelLogEntryFor(k *Kernel) *kernelLogEntry {
+	if entry, ok := kernelLogs.Load(k); ok {
+		return entry
 	}
-	if kernelLogs.entries == nil {
-		kernelLogs.entries = make(map[weak.Pointer[Kernel]]*kernelLogEntry)
-	}
-	entry := &kernelLogEntry{}
-	kernelLogs.entries[key] = entry
-	runtime.AddCleanup(k, cleanupKernelLog, key)
-	return entry, key
+	ext := k.ensureExtState()
+	entry, _ := kernelLogs.LoadOrStore(k, func() *kernelLogEntry {
+		return &kernelLogEntry{}
+	})
+	ext.mu.Lock()
+	ext.logEntry = entry
+	ext.mu.Unlock()
+	return entry
 }
 
 // kernelUptimeFunc binds only the weak Kernel pointer so the stored KernelLog
@@ -608,10 +580,13 @@ func kernelUptimeFunc(key weak.Pointer[Kernel]) func() time.Duration {
 
 // SetKernelLogBufLen sets the byte capacity of the kernel log ring for k before
 // its first KernelLog call. It returns false once the ring exists.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) SetKernelLogBufLen(bufLen int) bool {
-	kernelLogs.mu.Lock()
-	defer kernelLogs.mu.Unlock()
-	entry, _ := kernelLogEntryFor(k)
+	entry := kernelLogEntryFor(k)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 	if entry.log != nil {
 		return false
 	}
@@ -625,9 +600,9 @@ func (k *Kernel) KernelLogBufLen() int {
 	if k == nil {
 		return 0
 	}
-	kernelLogs.mu.Lock()
-	defer kernelLogs.mu.Unlock()
-	if entry, ok := kernelLogs.entries[weak.Make(k)]; ok {
+	if entry, ok := kernelLogs.Load(k); ok {
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
 		if entry.log != nil {
 			return entry.log.bufLen
 		}
@@ -639,40 +614,49 @@ func (k *Kernel) KernelLogBufLen() int {
 // LookupKernelLog returns the allocated kernel log ring of k, or nil before
 // first access.
 func (k *Kernel) LookupKernelLog() *KernelLog {
-	kernelLogs.mu.Lock()
-	defer kernelLogs.mu.Unlock()
-	if entry, ok := kernelLogs.entries[weak.Make(k)]; ok {
+	if k == nil {
+		return nil
+	}
+	if entry, ok := kernelLogs.Load(k); ok {
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
 		return entry.log
 	}
 	return nil
 }
 
 // AttachKernelLog binds l as the kernel log ring of k after restore.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) AttachKernelLog(l *KernelLog) {
-	if l == nil {
+	if k == nil || l == nil {
 		return
 	}
-	kernelLogs.mu.Lock()
-	entry, key := kernelLogEntryFor(k)
+	entry := kernelLogEntryFor(k)
+	entry.mu.Lock()
 	entry.bufLen = l.bufLen
 	entry.log = l
-	kernelLogs.mu.Unlock()
+	entry.mu.Unlock()
 	l.mu.Lock()
-	l.now = kernelUptimeFunc(key)
+	l.now = kernelUptimeFunc(weak.Make(k))
 	l.mu.Unlock()
 }
 
 // KernelLog returns the kernel log ring of k, allocating it on first access.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) KernelLog() *KernelLog {
-	kernelLogs.mu.Lock()
-	defer kernelLogs.mu.Unlock()
-	entry, key := kernelLogEntryFor(k)
+	entry := kernelLogEntryFor(k)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 	if entry.log == nil {
 		bufLen := entry.bufLen
 		if bufLen == 0 {
 			bufLen = KernelLogDefaultBufLen
 		}
-		entry.log = NewKernelLog(bufLen, kernelUptimeFunc(key))
+		entry.log = NewKernelLog(bufLen, kernelUptimeFunc(weak.Make(k)))
 	}
 	return entry.log
 }

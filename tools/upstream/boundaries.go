@@ -247,14 +247,14 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/ipset",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/state", "pkg/tcpip/*"},
+		allowed:   []string{"pkg/atomicbitops", "pkg/state", "pkg/tcpip/*"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
 		pkg:       "pkg/tcpip/link/vxlan",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/tcpip/*", "pkg/buffer", "pkg/waiter"},
+		allowed:   []string{"pkg/atomicbitops", "pkg/buffer", "pkg/state", "pkg/sync", "pkg/tcpip/*", "pkg/waiter"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
@@ -317,13 +317,13 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/socket/netlink/genetlink",
 		tier:      Tier1Additive,
-		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/sentry/socket/netlink", "pkg/sentry/socket/netlink/nlmsg", "pkg/syserr"},
+		allowed:   []string{"pkg/abi/linux", "pkg/context", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/sentry/socket/netlink", "pkg/sentry/socket/netlink/nlmsg", "pkg/state", "pkg/sync", "pkg/syserr"},
 		forbidden: append([]string{xSysWindows, xSysUnix, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
 		pkg:       "pkg/sentry/socket/netlink/genetlink/wireguard",
 		tier:      Tier1Additive,
-		allowed:   []string{"golang.zx2c4.com/wireguard/*", "pkg/abi/linux", "pkg/buffer", "pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/genetlink", "pkg/sentry/socket/netlink/nlmsg", "pkg/sentry/socket/netstack", "pkg/sentry/usage", "pkg/syserr", "pkg/tcpip/*", "pkg/waiter"},
+		allowed:   []string{"golang.zx2c4.com/wireguard/*", "pkg/abi/linux", "pkg/atomicbitops", "pkg/buffer", "pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/genetlink", "pkg/sentry/socket/netlink/nlmsg", "pkg/sentry/socket/netstack", "pkg/sentry/usage", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*", "pkg/waiter"},
 		forbidden: append([]string{xSysWindows, xSysUnix, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 
@@ -333,6 +333,11 @@ var boundaryRules = []importRule{
 		tier:      Tier1Additive,
 		allowed:   []string{xSysWindows},
 		forbidden: []string{"cmd/*", "internal/gvxshim/*", "tools/*", "scripts/*", "runsc/*", "shim/*", "pkg/sentry/kernel/*", "pkg/sentry/platform/*", "pkg/hostlockdown/*"},
+	},
+	{
+		pkg:       "internal/weakmap",
+		tier:      Tier1Additive,
+		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{
 		pkg:       "internal/xsys",
@@ -585,7 +590,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/tcpip/stack",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/tcpip/*", "pkg/atomicbitops", "pkg/log", "pkg/state", "pkg/sync"},
+		allowed:   []string{"internal/weakmap", "pkg/atomicbitops", "pkg/log", "pkg/state", "pkg/sync", "pkg/tcpip/*"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
@@ -637,7 +642,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/fsimpl/proc",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/sentry/blockdev", "pkg/sentry/fsimpl/kernfs", "pkg/sentry/inet", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netstack", "pkg/sentry/vfs", "pkg/sync", "pkg/tcpip/*", "pkg/usermem"},
+		allowed:   []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/sentry/blockdev", "pkg/sentry/fsimpl/kernfs", "pkg/sentry/inet", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netstack", "pkg/sentry/vfs", "pkg/state", "pkg/sync", "pkg/tcpip/*", "pkg/usermem"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -661,7 +666,13 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/kernel",
 		tier:      Tier2Sibling,
 		subtree:   true,
-		allowed:   []string{"pkg/abi/linux", "pkg/sentry/platform", "pkg/sentry/vfs", "pkg/state", "pkg/sync"},
+		allowed:   []string{"internal/weakmap", "pkg/abi/linux", "pkg/atomicbitops", "pkg/sentry/platform", "pkg/sentry/vfs", "pkg/state", "pkg/sync"},
+		forbidden: append([]string{xSysWindows}, tier2UpperBans...),
+	},
+	{
+		pkg:       "pkg/sentry/kernel/shm",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/atomicbitops"},
 		forbidden: append([]string{xSysWindows}, tier2UpperBans...),
 	},
 	{
@@ -720,7 +731,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/socket/netfilter",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/atomicbitops", "pkg/bits", "pkg/hostarch", "pkg/ipset", "pkg/log", "pkg/marshal", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
+		allowed:   []string{"internal/weakmap", "pkg/abi/linux", "pkg/atomicbitops", "pkg/bits", "pkg/hostarch", "pkg/ipset", "pkg/log", "pkg/marshal", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{

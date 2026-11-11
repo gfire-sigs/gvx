@@ -14,17 +14,27 @@
 
 package ipset
 
+import "context"
+
 // Cursor reads the elements of one set in order. A set that has a Cursor
 // cannot be destroyed or swapped, because the Dump that made the Cursor pins
 // the set. Elements that an add creates after the Cursor started do not
 // appear. An element that exists for the whole life of the Cursor appears
 // once.
+//
+// +stateify savable
 type Cursor struct {
 	set  *Set
 	pos  int
 	end  int
 	next int
 	open bool
+}
+
+func (c *Cursor) afterLoad(context.Context) {
+	if c.open && c.set != nil && c.set.listSize == 0 {
+		c.set.store.listings++
+	}
 }
 
 // newCursor starts a listing of the elements of the set.
@@ -96,6 +106,8 @@ func (c *Cursor) Close() {
 
 // Dump lists the sets of a registry in the order of Linux: every set in the
 // order of its index, with the list:set sets last.
+//
+// +stateify savable
 type Dump struct {
 	reg *Registry
 	// one is true when the dump lists the set at oneID only.
@@ -110,6 +122,12 @@ type Dump struct {
 	cur    *Set
 	curID  ID
 	cursor *Cursor
+}
+
+func (d *Dump) afterLoad(context.Context) {
+	if d.cur != nil {
+		d.cur.refNetlink++
+	}
 }
 
 // NewDump starts a listing. With one, it lists the set with the name, or fails

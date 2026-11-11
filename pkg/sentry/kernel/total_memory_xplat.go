@@ -14,51 +14,41 @@
 
 package kernel
 
-import (
-	"runtime"
-	"weak"
+import "z.gfire.dev/gvx/internal/weakmap"
 
-	"z.gfire.dev/gvx/pkg/sync"
-)
-
-// reportedTotals holds the total memory that a kernel reports. The map holds
-// the kernels weakly, so a kernel that a test drops frees its entry. A struct
-// field would need a change in kernel.go.
-var reportedTotals struct {
-	mu     sync.Mutex
-	totals map[weak.Pointer[Kernel]]uint64
-}
+// reportedTotals caches the total memory that each Kernel reports without
+// retaining dropped Kernels strongly. Checkpoint persistence lives on
+// kernelExtState inside Kernel.additionalCheckpointState.
+var reportedTotals weakmap.Map[Kernel, uint64]
 
 // SetReportedMemory sets the total memory that /proc/meminfo and sysinfo(2) of
 // the kernel report. A value of 0 removes the setting. Call it before the
 // kernel starts a task.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
 func (k *Kernel) SetReportedMemory(total uint64) {
-	key := weak.Make(k)
-	reportedTotals.mu.Lock()
-	defer reportedTotals.mu.Unlock()
-	if total == 0 {
-		delete(reportedTotals.totals, key)
+	if k == nil {
 		return
 	}
-	if reportedTotals.totals == nil {
-		reportedTotals.totals = make(map[weak.Pointer[Kernel]]uint64)
+	e := k.ensureExtState()
+	e.mu.Lock()
+	if total == 0 {
+		e.hasReportedMemory = false
+		e.reportedMemory = 0
+		e.mu.Unlock()
+		reportedTotals.Delete(k)
+		return
 	}
-	if _, ok := reportedTotals.totals[key]; !ok {
-		runtime.AddCleanup(k, func(key weak.Pointer[Kernel]) {
-			reportedTotals.mu.Lock()
-			defer reportedTotals.mu.Unlock()
-			delete(reportedTotals.totals, key)
-		}, key)
-	}
-	reportedTotals.totals[key] = total
+	e.hasReportedMemory = true
+	e.reportedMemory = total
+	e.mu.Unlock()
+	reportedTotals.Store(k, total)
 }
 
 // ReportedMemory returns the total memory that SetReportedMemory set for the
 // kernel. It reports false when no value is set, and the caller then uses
 // usage.TotalMemory.
 func (k *Kernel) ReportedMemory() (uint64, bool) {
-	reportedTotals.mu.Lock()
-	defer reportedTotals.mu.Unlock()
-	total, ok := reportedTotals.totals[weak.Make(k)]
-	return total, ok
+	return reportedTotals.Load(k)
 }

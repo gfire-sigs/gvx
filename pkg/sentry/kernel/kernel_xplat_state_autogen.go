@@ -155,6 +155,47 @@ func (m *cpuMeter) StateLoadValue(ctx context.Context, stateSlot int, stateValue
 	}
 }
 
+func (e *kernelExtState) StateTypeName() string {
+	return "pkg/sentry/kernel.kernelExtState"
+}
+
+func (e *kernelExtState) StateFields() []string {
+	return []string{
+		"kernel",
+		"hasReportedMemory",
+		"reportedMemory",
+		"logEntry",
+		"values",
+	}
+}
+
+func (e *kernelExtState) beforeSave() {}
+
+// +checklocksignore
+func (e *kernelExtState) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.kernel)
+	stateSinkObject.SaveBool(1, &e.hasReportedMemory)
+	stateSinkObject.SaveUint64(2, &e.reportedMemory)
+	stateSinkObject.Save(3, &e.logEntry)
+	stateSinkObject.Save(4, &e.values)
+}
+
+// +checklocksignore
+func (e *kernelExtState) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.kernel)
+	stateSourceObject.LoadBool(1, &e.hasReportedMemory)
+	stateSourceObject.LoadUint64(2, &e.reportedMemory)
+	stateSourceObject.Load(3, &e.logEntry)
+	stateSourceObject.Load(4, &e.values)
+	stateSourceObject.AfterLoadTo(e)
+}
+
+// +checklocksignore
+func (e *kernelExtState) StateAfterLoad(ctx context.Context) {
+	e.afterLoad(ctx)
+}
+
 func (m *DevkmsgMode) StateTypeName() string {
 	return "pkg/sentry/kernel.DevkmsgMode"
 }
@@ -262,12 +303,10 @@ func (l *KernelLog) beforeSave() {}
 // +checklocksignore
 func (l *KernelLog) StateSave(stateSinkObject state.Sink) {
 	l.beforeSave()
-	devkmsgValue := l.saveDevkmsg()
-	_ = (int32)(devkmsgValue)
-	dmesgRestrictValue := l.saveDmesgRestrict()
-	_ = (bool)(dmesgRestrictValue)
 	stateSinkObject.SaveInt(0, &l.bufLen)
 	stateSinkObject.SaveInt(1, &l.maxRecords)
+	stateSinkObject.Save(2, &l.devkmsg)
+	stateSinkObject.Save(3, &l.dmesgRestrict)
 	stateSinkObject.Save(4, &l.queue)
 	stateSinkObject.Save(5, &l.records)
 	stateSinkObject.SaveInt(6, &l.first)
@@ -278,14 +317,14 @@ func (l *KernelLog) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveInt(11, &l.syslogPartial)
 	stateSinkObject.Save(12, &l.levels)
 	stateSinkObject.SaveInt(13, &l.savedConsole)
-	stateSinkObject.SaveValue(2, devkmsgValue)
-	stateSinkObject.SaveValue(3, dmesgRestrictValue)
 }
 
 // +checklocksignore
 func (l *KernelLog) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadInt(0, &l.bufLen)
 	stateSourceObject.LoadInt(1, &l.maxRecords)
+	stateSourceObject.Load(2, &l.devkmsg)
+	stateSourceObject.Load(3, &l.dmesgRestrict)
 	stateSourceObject.Load(4, &l.queue)
 	stateSourceObject.Load(5, &l.records)
 	stateSourceObject.LoadInt(6, &l.first)
@@ -296,19 +335,7 @@ func (l *KernelLog) StateLoad(ctx context.Context, stateSourceObject state.Sourc
 	stateSourceObject.LoadInt(11, &l.syslogPartial)
 	stateSourceObject.Load(12, &l.levels)
 	stateSourceObject.LoadInt(13, &l.savedConsole)
-	stateSourceObject.LoadValueTo(2, (*int32)(nil), l)
-	stateSourceObject.LoadValueTo(3, (*bool)(nil), l)
 	stateSourceObject.AfterLoadTo(l)
-}
-
-// +checklocksignore
-func (l *KernelLog) StateLoadValue(ctx context.Context, stateSlot int, stateValue any) {
-	switch stateSlot {
-	case 2:
-		l.loadDevkmsg(ctx, stateValue.(int32))
-	case 3:
-		l.loadDmesgRestrict(ctx, stateValue.(bool))
-	}
 }
 
 // +checklocksignore
@@ -316,12 +343,42 @@ func (l *KernelLog) StateAfterLoad(ctx context.Context) {
 	l.afterLoad(ctx)
 }
 
+func (k *kernelLogEntry) StateTypeName() string {
+	return "pkg/sentry/kernel.kernelLogEntry"
+}
+
+func (k *kernelLogEntry) StateFields() []string {
+	return []string{
+		"bufLen",
+		"log",
+	}
+}
+
+func (k *kernelLogEntry) beforeSave() {}
+
+// +checklocksignore
+func (k *kernelLogEntry) StateSave(stateSinkObject state.Sink) {
+	k.beforeSave()
+	stateSinkObject.SaveInt(0, &k.bufLen)
+	stateSinkObject.Save(1, &k.log)
+}
+
+func (k *kernelLogEntry) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (k *kernelLogEntry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.LoadInt(0, &k.bufLen)
+	stateSourceObject.Load(1, &k.log)
+}
+
 func init() {
 	state.RegisterStruct((*CPUBandwidth)(nil))
 	state.RegisterNoHooks((*CPUBandwidthStats)(nil))
 	state.RegisterNoHooks((*cpuMeter)(nil))
+	state.RegisterStruct((*kernelExtState)(nil))
 	state.Register((*DevkmsgMode)(nil))
 	state.RegisterNoHooks((*LogRateLimit)(nil))
 	state.RegisterNoHooks((*KernelLogRecord)(nil))
 	state.RegisterStruct((*KernelLog)(nil))
+	state.RegisterNoHooks((*kernelLogEntry)(nil))
 }

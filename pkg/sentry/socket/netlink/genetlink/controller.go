@@ -15,6 +15,8 @@
 package genetlink
 
 import (
+	stdcontext "context"
+
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
@@ -119,8 +121,35 @@ func ctrlDumpFamilies(context.Context, *Request) (Dumper, *syserr.Error) {
 }
 
 // familyDump sends the registered families, as many as each chunk holds.
+//
+// +stateify savable
 type familyDump struct {
-	families []*Family
+	families []*Family `state:".([]string)"`
+}
+
+func (d *familyDump) saveFamilies() []string {
+	if len(d.families) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(d.families))
+	for _, f := range d.families {
+		if f != nil {
+			names = append(names, f.Name)
+		}
+	}
+	return names
+}
+
+func (d *familyDump) loadFamilies(_ stdcontext.Context, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	d.families = make([]*Family, 0, len(names))
+	for _, name := range names {
+		if f := lookupName(name); f != nil {
+			d.families = append(d.families, f)
+		}
+	}
 }
 
 // DumpChunk implements Dumper.DumpChunk.

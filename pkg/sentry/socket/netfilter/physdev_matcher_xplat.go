@@ -134,6 +134,8 @@ func checkPhysdevName(option string, name [physdevNameLen]byte) error {
 }
 
 // PhysdevMatcher matches the bridge ports of a bridged IP packet.
+//
+// +stateify savable
 type PhysdevMatcher struct {
 	// The fields hold struct xt_physdev_info as parsed. Marshal writes them
 	// back unchanged.

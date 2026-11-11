@@ -285,6 +285,47 @@ func (c *connTrackLimits) StateLoadValue(ctx context.Context, stateSlot int, sta
 	}
 }
 
+func (e *stackExtState) StateTypeName() string {
+	return "pkg/tcpip/stack.stackExtState"
+}
+
+func (e *stackExtState) StateFields() []string {
+	return []string{
+		"stack",
+		"hasBridgeNetfilter",
+		"bridgeIPv4",
+		"bridgeIPv6",
+		"values",
+	}
+}
+
+func (e *stackExtState) beforeSave() {}
+
+// +checklocksignore
+func (e *stackExtState) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.stack)
+	stateSinkObject.SaveBool(1, &e.hasBridgeNetfilter)
+	stateSinkObject.SaveBool(2, &e.bridgeIPv4)
+	stateSinkObject.SaveBool(3, &e.bridgeIPv6)
+	stateSinkObject.Save(4, &e.values)
+}
+
+// +checklocksignore
+func (e *stackExtState) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.stack)
+	stateSourceObject.LoadBool(1, &e.hasBridgeNetfilter)
+	stateSourceObject.LoadBool(2, &e.bridgeIPv4)
+	stateSourceObject.LoadBool(3, &e.bridgeIPv6)
+	stateSourceObject.Load(4, &e.values)
+	stateSourceObject.AfterLoadTo(e)
+}
+
+// +checklocksignore
+func (e *stackExtState) StateAfterLoad(ctx context.Context) {
+	e.afterLoad(ctx)
+}
+
 func (r *PolicyRule) StateTypeName() string {
 	return "pkg/tcpip/stack.PolicyRule"
 }
@@ -519,6 +560,7 @@ func init() {
 	state.RegisterNoHooks((*extState)(nil))
 	state.RegisterNoHooks((*connAtomics)(nil))
 	state.RegisterNoHooks((*connTrackLimits)(nil))
+	state.RegisterStruct((*stackExtState)(nil))
 	state.RegisterNoHooks((*PolicyRule)(nil))
 	state.RegisterNoHooks((*fibRules)(nil))
 	state.RegisterNoHooks((*fibState)(nil))

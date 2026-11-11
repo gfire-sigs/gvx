@@ -25,14 +25,15 @@
 package vxlan
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 	"weak"
 
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/checksum"
@@ -82,6 +83,8 @@ const (
 
 // Config is the configuration of a link. The fields follow the IFLA_VXLAN
 // attributes of include/uapi/linux/if_link.h. The endpoint stores every field.
+//
+// +stateify savable
 type Config struct {
 	// ID is the interface index of the link in the stack. A packet whose route
 	// leaves through this index loops, so the endpoint drops it.
@@ -215,24 +218,31 @@ func deleteVxlanNIC(key nicKey) {
 }
 
 // Endpoint is a VXLAN link endpoint.
+//
+// +stateify savable
 type Endpoint struct {
-	stack   weak.Pointer[stack.Stack]
-	cfg     Config
-	proto   tcpip.NetworkProtocolNumber
-	table   fdb
-	sock    *udpSocket
-	cleanup runtime.Cleanup
+	stack         weak.Pointer[stack.Stack] `state:".(*stack.Stack)"`
+	cfg           Config
+	proto         tcpip.NetworkProtocolNumber
+	table         fdb
+	sock          *udpSocket      `state:"nosave"`
+	cleanup       runtime.Cleanup `state:"nosave"`
+	nicRegistered bool            `state:"nosave"`
+	hookID        uint64          `state:"nosave"`
 
-	mtu    atomic.Uint32
-	closed atomic.Bool
+	mtu    atomicbitops.Uint32
+	closed atomicbitops.Bool
 
-	mu         sync.RWMutex
+	mu         sync.RWMutex `state:"nosave"`
 	dispatcher stack.NetworkDispatcher
 	linkAddr   tcpip.LinkAddress
-	onClose    func()
+	onClose    func() `state:"nosave"`
 }
 
-var _ stack.LinkEndpoint = (*Endpoint)(nil)
+var (
+	_ stack.LinkEndpoint     = (*Endpoint)(nil)
+	_ stack.RestoredEndpoint = (*Endpoint)(nil)
+)
 
 // New returns a link endpoint. It binds the UDP endpoint of the link, or joins
 // the one of another link with the same address and port and another VNI.
@@ -283,11 +293,111 @@ func New(s *stack.Stack, cfg Config) (*Endpoint, error) {
 		return nil, err
 	}
 	e.sock = sock
-	key := nicKey{stack: ws, id: cfg.ID}
-	vxlanNICs.Store(key, struct{}{})
-	e.cleanup = runtime.AddCleanup(s, deleteVxlanNIC, key)
+	e.registerRuntime(s)
 	return e, nil
 }
+
+func (e *Endpoint) registerRuntime(s *stack.Stack) {
+	if s == nil || e.nicRegistered {
+		return
+	}
+	ws := weak.Make(s)
+	e.stack = ws
+	key := nicKey{stack: ws, id: e.cfg.ID}
+	vxlanNICs.Store(key, struct{}{})
+	e.cleanup = runtime.AddCleanup(s, deleteVxlanNIC, key)
+	we := weak.Make(e)
+	e.hookID = s.RegisterLifecycleHooks(
+		func() {
+			if ep := we.Value(); ep != nil {
+				ep.suspendSocket()
+			}
+		},
+		func() {
+			if ep := we.Value(); ep != nil {
+				ep.resumeSocket()
+			}
+		},
+	)
+	e.nicRegistered = true
+}
+
+func (e *Endpoint) suspendSocket() {
+	e.mu.Lock()
+	sock := e.sock
+	e.sock = nil
+	e.mu.Unlock()
+	if sock != nil {
+		sock.release(e)
+	}
+}
+
+func (e *Endpoint) resumeSocket() {
+	if e.closed.Load() {
+		return
+	}
+	s := e.stack.Value()
+	if s == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.sock != nil {
+		e.mu.Unlock()
+		return
+	}
+	e.mu.Unlock()
+
+	sock, err := acquireSocket(s, e)
+	if err != nil {
+		return
+	}
+	e.mu.Lock()
+	if e.closed.Load() || e.sock != nil {
+		e.mu.Unlock()
+		sock.release(e)
+		return
+	}
+	e.sock = sock
+	e.mu.Unlock()
+}
+
+func (e *Endpoint) saveStack() *stack.Stack {
+	return e.stack.Value()
+}
+
+func (e *Endpoint) loadStack(_ context.Context, s *stack.Stack) {
+	if s != nil {
+		e.stack = weak.Make(s)
+	}
+}
+
+func (e *Endpoint) beforeSave() {
+	e.suspendSocket()
+}
+
+func (e *Endpoint) afterLoad(context.Context) {
+	if e.closed.Load() {
+		return
+	}
+	s := e.stack.Value()
+	if s == nil {
+		return
+	}
+	e.registerRuntime(s)
+	s.RegisterRestoredEndpoint(e)
+}
+
+// Restore implements stack.RestoredEndpoint.
+func (e *Endpoint) Restore(s *stack.Stack) {
+	if s != nil {
+		e.registerRuntime(s)
+	}
+	e.resumeSocket()
+}
+
+// PreserveAcrossSaveRestore marks VXLAN NICs for virtual NIC preservation on
+// Stack checkpoint and restore.
+func (*Endpoint) PreserveAcrossSaveRestore() bool { return true }
 
 // initialMTU returns the MTU of a new link: the one in the configuration, or
 // the MTU of the underlay link minus the overhead.
@@ -581,10 +691,10 @@ func (e *Endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
 }
 
 // Capabilities implements stack.LinkEndpoint. The link needs address
-// resolution, and it computes no checksum, so the stack must fill in the
-// checksums of the inner packets.
+// resolution, supports save and restore, and computes no checksum, so the
+// stack must fill in the checksums of the inner packets.
 func (*Endpoint) Capabilities() stack.LinkEndpointCapabilities {
-	return stack.CapabilityResolutionRequired
+	return stack.CapabilityResolutionRequired | stack.CapabilitySaveRestore
 }
 
 // Attach implements stack.LinkEndpoint.
@@ -652,16 +762,23 @@ func (e *Endpoint) Close() {
 	if !e.closed.CompareAndSwap(false, true) {
 		return
 	}
+	if s := e.stack.Value(); s != nil && e.hookID != 0 {
+		s.UnregisterLifecycleHooks(e.hookID)
+		e.hookID = 0
+	}
 	e.cleanup.Stop()
+	e.nicRegistered = false
+	vxlanNICs.Delete(nicKey{stack: e.stack, id: e.cfg.ID})
 	e.mu.Lock()
 	action := e.onClose
 	e.onClose = nil
+	sock := e.sock
+	e.sock = nil
 	e.mu.Unlock()
 	if action != nil {
 		action()
 	}
-	if e.sock != nil {
-		vxlanNICs.Delete(nicKey{stack: e.stack, id: e.cfg.ID})
-		e.sock.release(e)
+	if sock != nil {
+		sock.release(e)
 	}
 }
