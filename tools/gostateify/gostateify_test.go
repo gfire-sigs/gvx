@@ -515,8 +515,8 @@ func TestStructTagValidationAndAuxAutogenScoping(t *testing.T) {
 	tmpRoot := t.TempDir()
 	writeTestFile(t, filepath.Join(tmpRoot, "go.mod"), "module z.gfire.dev/gvx\n\ngo 1.27\n")
 
-	// 1. Verify undocumented state:"zero" and state:"manual" fail fast.
-	for _, badTag := range []string{"zero", "manual"} {
+	// 1. Verify unknown state struct tags fail fast while upstream "manual" and "zero" are accepted.
+	for _, badTag := range []string{"unknown", "ignore"} {
 		badDir := filepath.Join(tmpRoot, "pkg", "bad_"+badTag)
 		if err := os.MkdirAll(badDir, 0o755); err != nil {
 			t.Fatal(err)

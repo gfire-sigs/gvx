@@ -48,6 +48,8 @@ const (
 // RouteAttrs holds the attributes of a route that a netlink client sets. The
 // zero value describes a unicast route in the table main, as the boot
 // configuration of a stack adds it.
+//
+// +stateify savable
 type RouteAttrs struct {
 	// Table is the routing table. 0 means the table main.
 	Table uint32

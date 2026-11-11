@@ -429,6 +429,7 @@ func (jt *JumpTarget) StateFields() []string {
 		"Offset",
 		"RuleNum",
 		"NetworkProtocol",
+		"Goto",
 	}
 }
 
@@ -440,6 +441,7 @@ func (jt *JumpTarget) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveUint32(0, &jt.Offset)
 	stateSinkObject.SaveInt(1, &jt.RuleNum)
 	stateSinkObject.Save(2, &jt.NetworkProtocol)
+	stateSinkObject.SaveBool(3, &jt.Goto)
 }
 
 func (jt *JumpTarget) afterLoad(context.Context) {}
@@ -449,6 +451,7 @@ func (jt *JumpTarget) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.LoadUint32(0, &jt.Offset)
 	stateSourceObject.LoadInt(1, &jt.RuleNum)
 	stateSourceObject.Load(2, &jt.NetworkProtocol)
+	stateSourceObject.LoadBool(3, &jt.Goto)
 }
 
 func (rt *rejectIPv4Target) StateTypeName() string {

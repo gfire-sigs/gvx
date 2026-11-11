@@ -16,9 +16,12 @@ pkg/sentry/limits
 pkg/sentry/mm tier2
 pkg/sentry/pgalloc tier2
 pkg/sentry/socket/control
+pkg/sentry/socket/netfilter
 pkg/sentry/uniqueid
 pkg/sentry/vfs tier2
+pkg/tcpip
 pkg/tcpip/stack
+pkg/tcpip/transport/tcp
 pkg/tcpip/transport/udp
 pkg/waiter
 tools/gostateify/internal/testfixture

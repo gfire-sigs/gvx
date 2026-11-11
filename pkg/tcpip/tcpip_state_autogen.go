@@ -1867,6 +1867,7 @@ func (r *Route) StateTypeName() string {
 func (r *Route) StateFields() []string {
 	return []string{
 		"RouteEntry",
+		"RouteAttrs",
 		"Destination",
 		"Gateway",
 		"NIC",
@@ -1881,11 +1882,12 @@ func (r *Route) beforeSave() {}
 func (r *Route) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.RouteEntry)
-	stateSinkObject.Save(1, &r.Destination)
-	stateSinkObject.Save(2, &r.Gateway)
-	stateSinkObject.SaveInt32(3, (*int32)(&r.NIC))
-	stateSinkObject.Save(4, &r.SourceHint)
-	stateSinkObject.SaveUint32(5, &r.MTU)
+	stateSinkObject.Save(1, &r.RouteAttrs)
+	stateSinkObject.Save(2, &r.Destination)
+	stateSinkObject.Save(3, &r.Gateway)
+	stateSinkObject.SaveInt32(4, (*int32)(&r.NIC))
+	stateSinkObject.Save(5, &r.SourceHint)
+	stateSinkObject.SaveUint32(6, &r.MTU)
 }
 
 func (r *Route) afterLoad(context.Context) {}
@@ -1893,11 +1895,12 @@ func (r *Route) afterLoad(context.Context) {}
 // +checklocksignore
 func (r *Route) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.RouteEntry)
-	stateSourceObject.Load(1, &r.Destination)
-	stateSourceObject.Load(2, &r.Gateway)
-	stateSourceObject.LoadInt32(3, (*int32)(&r.NIC))
-	stateSourceObject.Load(4, &r.SourceHint)
-	stateSourceObject.LoadUint32(5, &r.MTU)
+	stateSourceObject.Load(1, &r.RouteAttrs)
+	stateSourceObject.Load(2, &r.Destination)
+	stateSourceObject.Load(3, &r.Gateway)
+	stateSourceObject.LoadInt32(4, (*int32)(&r.NIC))
+	stateSourceObject.Load(5, &r.SourceHint)
+	stateSourceObject.LoadUint32(6, &r.MTU)
 }
 
 func (s *StatCounter) StateTypeName() string {

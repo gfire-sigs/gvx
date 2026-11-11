@@ -240,7 +240,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/ipset",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/tcpip/*"},
+		allowed:   []string{"pkg/state", "pkg/tcpip/*"},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
@@ -560,7 +560,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/tcpip",
 		tier:      Tier2Sibling,
-		allowed:   []string{xSysWindows},
+		allowed:   []string{"pkg/state", xSysWindows},
 		forbidden: lowLevelTier2Bans,
 	},
 	{
@@ -903,7 +903,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/abi/linux/errno", "netlink unit tests assert Linux errno constants"},
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/errors/linuxerr", "netlink unit tests compare linuxerr return values"},
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/sentry/socket/unix", "netlink unit tests pair endpoints with unix sockets"},
-	{[]string{"tools/gostateify"}, "pkg/state", "round-trip tests verify generated Save and Load methods"},
+	{[]string{"pkg/sentry/socket/netfilter", "pkg/tcpip/transport/tcp", "tools/gostateify"}, "pkg/state", "stateify round-trip unit tests serialize and restore structs with pkg/state"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {
