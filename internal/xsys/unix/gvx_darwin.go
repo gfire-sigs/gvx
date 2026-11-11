@@ -3,6 +3,8 @@
 package unix
 
 import (
+	"math"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -72,7 +74,7 @@ const (
 	SYS_IO_URING_ENTER    = 426
 	SYS_IO_URING_REGISTER = 427
 	SYS_EVENTFD2          = 290
-	SYS_PPOLL             = SYS_POLL
+	SYS_PPOLL             = 0x10001
 	SYS_MEMBARRIER        = 324
 	SYS_MREMAP            = 25
 	SYS_CLOCK_GETTIME     = 228
@@ -201,10 +203,120 @@ func Getdents(fd int, buf []byte) (int, error) {
 	return Getdirentries(fd, buf, nil)
 }
 
+// darwinMsghdr matches the 48-byte struct msghdr of the 64-bit XNU ABI.
+// Msghdr widens Iovlen and Controllen to uint64 for Linux callers, so Darwin
+// sendmsg and recvmsg wrappers marshal between the two layouts.
+type darwinMsghdr struct {
+	Name       *byte
+	Namelen    uint32
+	_          [4]byte
+	Iov        *Iovec
+	Iovlen     int32
+	_          [4]byte
+	Control    *byte
+	Controllen uint32
+	Flags      int32
+}
+
+const (
+	_ uint = 48 - uint(unsafe.Sizeof(darwinMsghdr{}))
+	_ uint = uint(unsafe.Sizeof(darwinMsghdr{})) - 48
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Name))
+	_ uint = 8 - uint(unsafe.Offsetof(darwinMsghdr{}.Namelen))
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Namelen)) - 8
+	_ uint = 16 - uint(unsafe.Offsetof(darwinMsghdr{}.Iov))
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Iov)) - 16
+	_ uint = 24 - uint(unsafe.Offsetof(darwinMsghdr{}.Iovlen))
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Iovlen)) - 24
+	_ uint = 32 - uint(unsafe.Offsetof(darwinMsghdr{}.Control))
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Control)) - 32
+	_ uint = 40 - uint(unsafe.Offsetof(darwinMsghdr{}.Controllen))
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Controllen)) - 40
+	_ uint = 44 - uint(unsafe.Offsetof(darwinMsghdr{}.Flags))
+	_ uint = uint(unsafe.Offsetof(darwinMsghdr{}.Flags)) - 44
+)
+
+func darwinRecvmsgErrno(s int, msg *Msghdr, flags int) (int, Errno) {
+	if msg == nil || msg.Iovlen > math.MaxInt32 || msg.Controllen > math.MaxUint32 {
+		return -1, EINVAL
+	}
+	raw := darwinMsghdr{
+		Name:       msg.Name,
+		Namelen:    msg.Namelen,
+		Iov:        msg.Iov,
+		Iovlen:     int32(msg.Iovlen),
+		Control:    msg.Control,
+		Controllen: uint32(msg.Controllen),
+		Flags:      msg.Flags,
+	}
+	r0, _, e1 := syscall_syscall(libc_recvmsg_trampoline_addr, uintptr(s), uintptr(unsafe.Pointer(&raw)), uintptr(flags))
+	runtime.KeepAlive(&raw)
+	runtime.KeepAlive(msg)
+	if e1 != 0 {
+		return -1, e1
+	}
+	msg.Namelen = raw.Namelen
+	msg.Controllen = uint64(raw.Controllen)
+	msg.Flags = raw.Flags
+	return int(r0), 0
+}
+
+func darwinRecvmsg(s int, msg *Msghdr, flags int) (n int, err error) {
+	n, e1 := darwinRecvmsgErrno(s, msg, flags)
+	if e1 != 0 {
+		return n, errnoErr(e1)
+	}
+	return n, nil
+}
+
+func darwinSendmsgErrno(s int, msg *Msghdr, flags int) (int, Errno) {
+	if msg == nil || msg.Iovlen > math.MaxInt32 || msg.Controllen > math.MaxUint32 {
+		return -1, EINVAL
+	}
+	raw := darwinMsghdr{
+		Name:       msg.Name,
+		Namelen:    msg.Namelen,
+		Iov:        msg.Iov,
+		Iovlen:     int32(msg.Iovlen),
+		Control:    msg.Control,
+		Controllen: uint32(msg.Controllen),
+		Flags:      msg.Flags,
+	}
+	r0, _, e1 := syscall_syscall(libc_sendmsg_trampoline_addr, uintptr(s), uintptr(unsafe.Pointer(&raw)), uintptr(flags))
+	runtime.KeepAlive(&raw)
+	runtime.KeepAlive(msg)
+	if e1 != 0 {
+		return -1, e1
+	}
+	return int(r0), 0
+}
+
+func darwinSendmsg(s int, msg *Msghdr, flags int) (n int, err error) {
+	n, e1 := darwinSendmsgErrno(s, msg, flags)
+	if e1 != 0 {
+		return n, errnoErr(e1)
+	}
+	return n, nil
+}
+
+func darwinPpollTimeout(timeout *Timespec) (int, Errno) {
+	if timeout == nil {
+		return -1, 0
+	}
+	if timeout.Sec < 0 || timeout.Nsec < 0 || timeout.Nsec >= 1_000_000_000 {
+		return 0, EINVAL
+	}
+	const maxSec = (math.MaxInt32 - 1000) / 1000
+	if timeout.Sec > maxSec {
+		return math.MaxInt32, 0
+	}
+	return int(timeout.Sec*1000 + (timeout.Nsec+999_999)/1_000_000), 0
+}
+
 func Ppoll(fds []PollFd, timeout *Timespec, _ *Sigset_t) (int, error) {
-	timeoutMillis := -1
-	if timeout != nil {
-		timeoutMillis = int(timeout.Sec*1000 + timeout.Nsec/1_000_000)
+	timeoutMillis, errno := darwinPpollTimeout(timeout)
+	if errno != 0 {
+		return 0, errno
 	}
 	return Poll(fds, timeoutMillis)
 }
@@ -313,6 +425,36 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall
 		return syscall_syscall(libc_read_trampoline_addr, a1, a2, a3)
 	case SYS_WRITE:
 		return syscall_syscall(libc_write_trampoline_addr, a1, a2, a3)
+	case SYS_READV:
+		return syscall_syscall(libc_readv_trampoline_addr, a1, a2, a3)
+	case SYS_WRITEV:
+		return syscall_syscall(libc_writev_trampoline_addr, a1, a2, a3)
+	case SYS_RECVMSG:
+		var msg *Msghdr
+		if a2 != 0 {
+			msg = *(**Msghdr)(unsafe.Pointer(&a2))
+		}
+		n, errno := darwinRecvmsgErrno(int(a1), msg, int(a3))
+		return uintptr(n), 0, errno
+	case SYS_SENDMSG:
+		var msg *Msghdr
+		if a2 != 0 {
+			msg = *(**Msghdr)(unsafe.Pointer(&a2))
+		}
+		n, errno := darwinSendmsgErrno(int(a1), msg, int(a3))
+		return uintptr(n), 0, errno
+	case SYS_POLL:
+		return syscall_syscall(libc_poll_trampoline_addr, a1, a2, uintptr(int(int32(a3))))
+	case SYS_PPOLL:
+		var ts *Timespec
+		if a3 != 0 {
+			ts = *(**Timespec)(unsafe.Pointer(&a3))
+		}
+		timeoutMillis, errno := darwinPpollTimeout(ts)
+		if errno != 0 {
+			return ^uintptr(0), 0, errno
+		}
+		return syscall_syscall(libc_poll_trampoline_addr, a1, a2, uintptr(timeoutMillis))
 	case SYS_PREAD64:
 		return syscall_syscall6(libc_pread_trampoline_addr, a1, a2, a3, a4, 0, 0)
 	case SYS_PWRITE64:

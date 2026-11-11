@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
+- **Darwin `Msghdr` ABI marshalling, BSD syscall dispatch, and `ParseDirents` bounds (`internal/xsys/unix`, `pkg/rawfile`, `pkg/fsutil`)**: `recvmsg` and `sendmsg` now marshal 56-byte `unix.Msghdr` values through the 48-byte XNU `darwinMsghdr` layout so `msg_flags` never corrupts `Controllen`. `Syscall6` separates `SYS_PPOLL` from `SYS_POLL` and dispatches `SYS_READV`, `SYS_WRITEV`, `SYS_RECVMSG`, and `SYS_SENDMSG`. `rawfile` guards empty slices and Windows errno wrapping, and `fsutil.ParseDirents` decodes fixed header fields within record bounds.
 - **Complete registration of Linux errnos on macOS and Windows (`pkg/syserr`)**: `host_darwin.go` and `host_windows.go` omitted 45 Linux-only error numbers. `Error.ToError` panicked on macOS and Windows for values such as `EBADFD`, `EDEADLK`, `ENOMEDIUM`, and `ENOKEY`. `linux_errno_xplat.go` now registers every Linux errno in `[1, 134)` at initialization. `rpfilter_xplat_test.go` matches `ENODEV` across Linux and non-Linux hosts with `linuxerr.Equals`.
 
 ### Tests

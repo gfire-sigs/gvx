@@ -16,9 +16,10 @@ The other packages of `golang.org/x/sys`, such as `windows` and `cpu`, come from
 | :--- | :--- | :--- |
 | Windows | `gvx_windows.go`, `gvx_memory_windows.go`, `gvx_z*_windows*.go` | Adds the Linux errors, types, system call numbers, and functions such as `Mmap`. The functions call the Windows API. |
 | Darwin types | `ztypes_darwin_{amd64,arm64}.go` | Gives `Stat_t`, `Dirent`, and `Msghdr` the Linux field sizes and names. |
-| Darwin calls | `zsyscall_darwin_{amd64,arm64}.go`, `gvx_darwin.go` | `Stat`, `Lstat`, `Fstat`, and `Fstatat` read the native structure and convert it. |
+| Darwin calls | `zsyscall_darwin_{amd64,arm64}.go`, `gvx_darwin.go` | Converts `Stat_t` in `Stat`, `Lstat`, `Fstat`, and `Fstatat`; marshals `Msghdr` through the 48-byte XNU `darwinMsghdr` in `recvmsg` and `sendmsg`; imports `readdir_r$INODE64` on `darwin/amd64`. |
+| Darwin dispatch | `gvx_darwin.go` | Separates synthetic `SYS_PPOLL` (nullable `*Timespec`) from `SYS_POLL` (millisecond integer) and dispatches `SYS_READV`, `SYS_WRITEV`, `SYS_RECVMSG`, `SYS_SENDMSG`, `SYS_POLL`, and `SYS_PPOLL`. |
 | Darwin `mincore` | `gvx_mincore_*` | Implements the Linux `mincore` contract on top of the 16KB host page. |
-| Build tags | `asm_bsd_*.s`, `syscall_unix_gc.go`, `syscall_darwin_*.go` | Drops `darwin` from the tags of three files and widens two fields of `Msghdr` in the setters. |
+| Build tags | `syscall_unix_gc.go`, `syscall_darwin_*.go` | Drops `darwin` from `syscall_unix_gc.go` and widens two fields of `Msghdr` in the setters. |
 
 The copy keeps only the files for Darwin, Linux on `amd64` and `arm64`, Windows, and the shared code. It has no generator scripts and no upstream tests. The tests of the gvx changes are in the files `gvx_*_test.go`.
 
