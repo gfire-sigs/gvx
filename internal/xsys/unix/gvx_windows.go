@@ -3,6 +3,7 @@
 package unix
 
 import (
+	"errors"
 	"os"
 	"syscall"
 	"unsafe"
@@ -245,9 +246,269 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall
 		return 0, 0, winMadvise(a1, a2, int(a3))
 	case SYS_MINCORE:
 		return 0, 0, winMincore(a1, a2, a3)
+	case SYS_READ:
+		buf, errno := winSyscallBytes(a2, a3)
+		if errno != 0 {
+			return 0, 0, errno
+		}
+		n, errno := winRead(windows.Handle(a1), buf)
+		return uintptr(n), 0, errno
+	case SYS_WRITE:
+		buf, errno := winSyscallBytes(a2, a3)
+		if errno != 0 {
+			return 0, 0, errno
+		}
+		n, errno := winWrite(windows.Handle(a1), buf)
+		return uintptr(n), 0, errno
+	case SYS_PREAD64:
+		buf, errno := winSyscallBytes(a2, a3)
+		if errno != 0 {
+			return 0, 0, errno
+		}
+		n, errno := winPread(windows.Handle(a1), buf, int64(a4))
+		return uintptr(n), 0, errno
+	case SYS_PWRITE64:
+		buf, errno := winSyscallBytes(a2, a3)
+		if errno != 0 {
+			return 0, 0, errno
+		}
+		n, errno := winPwrite(windows.Handle(a1), buf, int64(a4))
+		return uintptr(n), 0, errno
+	case SYS_READV:
+		n, errno := winPreadv2(windows.Handle(a1), a2, a3, -1, 0)
+		return n, 0, errno
+	case SYS_WRITEV:
+		n, errno := winPwritev2(windows.Handle(a1), a2, a3, -1, 0)
+		return n, 0, errno
+	case SYS_PREADV:
+		n, errno := winPreadv2(windows.Handle(a1), a2, a3, int64(a4), 0)
+		return n, 0, errno
+	case SYS_PWRITEV:
+		n, errno := winPwritev2(windows.Handle(a1), a2, a3, int64(a4), 0)
+		return n, 0, errno
+	case SYS_PREADV2:
+		n, errno := winPreadv2(windows.Handle(a1), a2, a3, int64(a4), a6)
+		return n, 0, errno
+	case SYS_PWRITEV2:
+		n, errno := winPwritev2(windows.Handle(a1), a2, a3, int64(a4), a6)
+		return n, 0, errno
+	case SYS_CLOSE:
+		return 0, 0, winErrno(Close(int(a1)))
+	case SYS_FTRUNCATE:
+		return 0, 0, winErrno(windows.Ftruncate(windows.Handle(a1), int64(a2)))
+	case SYS_FSYNC, SYS_FDATASYNC:
+		return 0, 0, winErrno(syscall.FlushFileBuffers(syscall.Handle(a1)))
+	case SYS_LSEEK:
+		pos, seekErr := Seek(int(a1), int64(a2), int(a3))
+		if seekErr != nil {
+			return 0, 0, winErrno(seekErr)
+		}
+		return uintptr(pos), 0, 0
 	default:
 		return 0, 0, ENOSYS
 	}
+}
+
+const (
+	winMaxRWChunk = 1 << 30
+	winMaxRWTotal = 0x7ffff000
+)
+
+func winSyscallBytes(addr, count uintptr) ([]byte, Errno) {
+	if int(count) < 0 {
+		return nil, EINVAL
+	}
+	if count == 0 {
+		return nil, 0
+	}
+	if addr == 0 {
+		return nil, EFAULT
+	}
+	return unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&addr))), int(count)), 0
+}
+
+func winRead(handle windows.Handle, p []byte) (int, Errno) {
+	if len(p) == 0 {
+		return 0, 0
+	}
+	if len(p) > winMaxRWChunk {
+		p = p[:winMaxRWChunk]
+	}
+	var done uint32
+	err := windows.ReadFile(handle, p, &done, nil)
+	if errors.Is(err, windows.ERROR_HANDLE_EOF) || errors.Is(err, windows.ERROR_BROKEN_PIPE) {
+		return int(done), 0
+	}
+	if err != nil {
+		return int(done), winErrno(err)
+	}
+	return int(done), 0
+}
+
+func winWrite(handle windows.Handle, p []byte) (int, Errno) {
+	if len(p) == 0 {
+		return 0, 0
+	}
+	if len(p) > winMaxRWChunk {
+		p = p[:winMaxRWChunk]
+	}
+	var done uint32
+	if err := windows.WriteFile(handle, p, &done, nil); err != nil {
+		return int(done), winErrno(err)
+	}
+	return int(done), 0
+}
+
+func winPread(handle windows.Handle, p []byte, offset int64) (int, Errno) {
+	if offset < 0 {
+		return 0, EINVAL
+	}
+	if len(p) == 0 {
+		return 0, 0
+	}
+	if len(p) > winMaxRWChunk {
+		p = p[:winMaxRWChunk]
+	}
+	var o windows.Overlapped
+	o.Offset = uint32(offset)
+	o.OffsetHigh = uint32(uint64(offset) >> 32)
+	var done uint32
+	err := windows.ReadFile(handle, p, &done, &o)
+	if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+		return int(done), 0
+	}
+	if err != nil {
+		return int(done), winErrno(err)
+	}
+	return int(done), 0
+}
+
+func winPwrite(handle windows.Handle, p []byte, offset int64) (int, Errno) {
+	if offset < 0 {
+		return 0, EINVAL
+	}
+	if len(p) == 0 {
+		return 0, 0
+	}
+	if len(p) > winMaxRWChunk {
+		p = p[:winMaxRWChunk]
+	}
+	var o windows.Overlapped
+	o.Offset = uint32(offset)
+	o.OffsetHigh = uint32(uint64(offset) >> 32)
+	var done uint32
+	if err := windows.WriteFile(handle, p, &done, &o); err != nil {
+		return int(done), winErrno(err)
+	}
+	return int(done), 0
+}
+
+func winPreadv2(handle windows.Handle, iovAddr, iovCnt uintptr, offset int64, flags uintptr) (uintptr, Errno) {
+	if flags != 0 {
+		return 0, ENOTSUP
+	}
+	if int(iovCnt) < 0 || offset < -1 {
+		return 0, EINVAL
+	}
+	if iovCnt == 0 {
+		return 0, 0
+	}
+	if iovAddr == 0 {
+		return 0, EFAULT
+	}
+	iovs := unsafe.Slice((*Iovec)(*(*unsafe.Pointer)(unsafe.Pointer(&iovAddr))), int(iovCnt))
+	var total uintptr
+	for _, iov := range iovs {
+		if iov.Len == 0 {
+			continue
+		}
+		rem := uint64(winMaxRWTotal) - uint64(total)
+		if rem == 0 {
+			break
+		}
+		chunk := min(iov.Len, rem)
+		if iov.Base == nil {
+			if total > 0 {
+				return total, 0
+			}
+			return 0, EFAULT
+		}
+		buf := unsafe.Slice(iov.Base, int(chunk))
+		var (
+			n     int
+			errno Errno
+		)
+		if offset == -1 {
+			n, errno = winRead(handle, buf)
+		} else {
+			n, errno = winPread(handle, buf, offset+int64(total))
+		}
+		total += uintptr(n)
+		if errno != 0 {
+			if total > 0 {
+				return total, 0
+			}
+			return 0, errno
+		}
+		if n < len(buf) {
+			break
+		}
+	}
+	return total, 0
+}
+
+func winPwritev2(handle windows.Handle, iovAddr, iovCnt uintptr, offset int64, flags uintptr) (uintptr, Errno) {
+	if flags != 0 {
+		return 0, ENOTSUP
+	}
+	if int(iovCnt) < 0 || offset < -1 {
+		return 0, EINVAL
+	}
+	if iovCnt == 0 {
+		return 0, 0
+	}
+	if iovAddr == 0 {
+		return 0, EFAULT
+	}
+	iovs := unsafe.Slice((*Iovec)(*(*unsafe.Pointer)(unsafe.Pointer(&iovAddr))), int(iovCnt))
+	var total uintptr
+	for _, iov := range iovs {
+		if iov.Len == 0 {
+			continue
+		}
+		rem := uint64(winMaxRWTotal) - uint64(total)
+		if rem == 0 {
+			break
+		}
+		chunk := min(iov.Len, rem)
+		if iov.Base == nil {
+			if total > 0 {
+				return total, 0
+			}
+			return 0, EFAULT
+		}
+		buf := unsafe.Slice(iov.Base, int(chunk))
+		var (
+			n     int
+			errno Errno
+		)
+		if offset == -1 {
+			n, errno = winWrite(handle, buf)
+		} else {
+			n, errno = winPwrite(handle, buf, offset+int64(total))
+		}
+		total += uintptr(n)
+		if errno != 0 {
+			if total > 0 {
+				return total, 0
+			}
+			return 0, errno
+		}
+		if n < len(buf) {
+			break
+		}
+	}
+	return total, 0
 }
 
 func ErrnoName(e syscall.Errno) string {
@@ -292,25 +553,29 @@ func Write(fd int, p []byte) (int, error) {
 }
 
 func Pread(fd int, p []byte, offset int64) (int, error) {
-	var o syscall.Overlapped
-	o.Offset = uint32(offset)
-	o.OffsetHigh = uint32(uint64(offset) >> 32)
-	var done uint32
-	err := syscall.ReadFile(syscall.Handle(uintptr(fd)), p, &done, &o)
-	return int(done), err
+	n, errno := winPread(windows.Handle(uintptr(fd)), p, offset)
+	if errno != 0 {
+		return n, errno
+	}
+	return n, nil
 }
 
 func Pwrite(fd int, p []byte, offset int64) (int, error) {
-	var o syscall.Overlapped
-	o.Offset = uint32(offset)
-	o.OffsetHigh = uint32(uint64(offset) >> 32)
-	var done uint32
-	err := syscall.WriteFile(syscall.Handle(uintptr(fd)), p, &done, &o)
-	return int(done), err
+	n, errno := winPwrite(windows.Handle(uintptr(fd)), p, offset)
+	if errno != 0 {
+		return n, errno
+	}
+	return n, nil
 }
 
 func Seek(fd int, offset int64, whence int) (int64, error) {
-	return syscall.Seek(syscall.Handle(uintptr(fd)), offset, whence)
+	switch whence {
+	case SEEK_SET, SEEK_CUR, SEEK_END:
+		pos, err := syscall.Seek(syscall.Handle(uintptr(fd)), offset, whence)
+		return pos, winError(err)
+	default:
+		return 0, EINVAL
+	}
 }
 
 func Dup(fd int) (int, error) {

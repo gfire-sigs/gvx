@@ -42,7 +42,7 @@ func winErrno(err error) Errno {
 	switch errno {
 	case windows.ERROR_NOT_ENOUGH_MEMORY, windows.ERROR_OUTOFMEMORY, windows.ERROR_COMMITMENT_LIMIT, windows.ERROR_WORKING_SET_QUOTA:
 		return ENOMEM
-	case windows.ERROR_INVALID_PARAMETER, windows.ERROR_INVALID_ADDRESS:
+	case windows.ERROR_INVALID_PARAMETER, windows.ERROR_INVALID_ADDRESS, windows.ERROR_NEGATIVE_SEEK:
 		return EINVAL
 	case windows.ERROR_ACCESS_DENIED:
 		return EACCES
