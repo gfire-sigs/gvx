@@ -357,32 +357,41 @@ func TestCompileDecompressesGzipAndZstd(t *testing.T) {
 
 func TestCompileEnforcesBudgetsOnDecompressionBombs(t *testing.T) {
 	const bombSize = 48 << 20
-	bomb := buildTar(t, fileEntry("zeros", string(make([]byte, bombSize))))
+	// The archive appends a 256 KiB random tail so the compressed stream exceeds
+	// decompressor read-ahead buffers while staying below 1 MiB. A streaming
+	// compiler rejects the zero run early without reading the tail.
+	bomb := buildTar(t,
+		fileEntry("zeros", string(make([]byte, bombSize))),
+		fileEntry("tail", string(patternBytes(256<<10, 1))),
+	)
 	gz, zst := gzipBytes(t, bomb), zstdBytes(t, bomb)
 	if len(gz) > 1<<20 || len(zst) > 1<<20 {
 		t.Fatalf("test input is not a bomb: gzip %d, zstd %d bytes", len(gz), len(zst))
 	}
 	lim := DefaultLimits()
 	lim.MaxLayerBytes = 4 << 20
-	lim.MaxEntryBytes = 2 << 20
+	lim.MaxEntryBytes = 64 << 20
 
 	for name, input := range map[string][]byte{"gzip": gz, "zstd": zst} {
 		t.Run(name, func(t *testing.T) {
-			var before, after runtimeMemStats
-			before.read()
-			_, err := CompileTarToEROFSWithLimits(bytes.NewReader(input), newMemImage(), lim)
-			after.read()
+			reader := bytes.NewReader(input)
+			img := newMemImage()
+			_, err := CompileTarToEROFSWithLimits(reader, img, lim)
 			if !errors.Is(err, ErrLimitExceeded) {
 				t.Fatalf("err = %v, want ErrLimitExceeded", err)
 			}
-			if grown := after.totalAlloc - before.totalAlloc; grown > 64<<20 {
-				t.Errorf("rejecting the bomb allocated %d MiB", grown>>20)
+			if len(img.buf) > int(lim.MaxLayerBytes)+1<<20 {
+				t.Errorf("rejecting the bomb wrote %d MiB to image", len(img.buf)>>20)
+			}
+			if reader.Len() == 0 {
+				t.Errorf("compiler drained all %d compressed bytes before rejecting the bomb", len(input))
 			}
 		})
 	}
 
 	// A layer within the layer budget but with a file over the entry budget.
 	lim.MaxLayerBytes = 1 << 30
+	lim.MaxEntryBytes = 2 << 20
 	small := buildTar(t, fileEntry("big", string(make([]byte, 3<<20))))
 	if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(small), newMemImage(), lim); !errors.Is(err, ErrLimitExceeded) {
 		t.Errorf("entry budget: err = %v, want ErrLimitExceeded", err)

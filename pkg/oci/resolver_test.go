@@ -82,23 +82,18 @@ func TestSaveImagesResolvesTheRegistryNameThroughTheConfiguredDNSServers(t *test
 }
 
 func TestResolverTriesTheNextServerWhenTheFirstIsDown(t *testing.T) {
+	failing := startFailingTestDNS(t)
 	dns := startTestDNS(t, map[string]netip.Addr{registryName: netip.MustParseAddr("127.0.0.1")})
-	// A closed UDP port answers with ICMP unreachable on loopback, so the read fails.
-	dead, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadAddr := dead.LocalAddr().(*net.UDPAddr).AddrPort()
-	if err := dead.Close(); err != nil {
-		t.Fatal(err)
-	}
 
-	resolver := newServerResolver([]netip.AddrPort{deadAddr, dns.AddrPort()})
+	resolver := newServerResolver([]netip.AddrPort{failing.AddrPort(), dns.AddrPort()})
 	addrs, err := resolver.LookupNetIP(context.Background(), "ip4", registryName)
 	if err != nil {
-		t.Fatalf("lookup with the servers %s and %s: %v", deadAddr, dns.AddrPort(), err)
+		t.Fatalf("lookup with the servers %s and %s: %v", failing.AddrPort(), dns.AddrPort(), err)
 	}
 	if len(addrs) != 1 || addrs[0] != netip.MustParseAddr("127.0.0.1") {
 		t.Errorf("addresses = %v, want [127.0.0.1]", addrs)
+	}
+	if failing.Queries() == 0 {
+		t.Errorf("the resolver never queried the first server %s", failing.AddrPort())
 	}
 }

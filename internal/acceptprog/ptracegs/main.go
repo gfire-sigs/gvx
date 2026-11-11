@@ -25,22 +25,18 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 const (
-	// childRuntime is the time that the child runs the syscall loop.
-	childRuntime = 2 * time.Second
-	// patchWait is the time that the child gets to run before the tracer
-	// attaches. The Sentry patches the syscall instruction in this time.
-	patchWait = 500 * time.Millisecond
 	// junkGSBase is a canonical address that no mapping covers.
 	junkGSBase = 0x123456000
 	ntPrstatus = 1
@@ -100,24 +96,63 @@ func main() {
 	fmt.Println("DONE")
 }
 
-// child runs the syscall loop and exits with 0.
+// child runs the syscall loop to trigger fast-path patching, signals readiness
+// on stdout, keeps spinning until stdin closes, and spins once more under the
+// mutated GS base before exiting with 0.
 func child() {
-	start := time.Now()
-	for time.Since(start) < childRuntime {
-		spin(1000)
+	spin(5000)
+	if _, err := os.Stdout.Write([]byte{'R'}); err != nil {
+		os.Exit(2)
 	}
+	if err := unix.SetNonblock(0, true); err != nil {
+		os.Exit(2)
+	}
+	var buf [1]byte
+	for {
+		spin(1000)
+		n, err := unix.Read(0, buf[:])
+		if n == 0 && err == nil {
+			break
+		}
+		if err != nil && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR) {
+			os.Exit(2)
+		}
+	}
+	spin(5000)
 }
 
-// check runs a child, attaches to it after the Sentry patched its syscall
-// instruction, changes its GS base with m, detaches, and waits for the exit.
+// check runs a child, waits until the child executes its syscall loop, attaches
+// to it, changes its GS base with m, detaches, closes stdin, and waits for exit.
 func check(m method) error {
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+	defer stdinW.Close()
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		stdinR.Close()
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	defer stdoutR.Close()
+
 	cmd := exec.Command(os.Args[0], "child")
+	cmd.Stdin = stdinR
+	cmd.Stdout = stdoutW
 	if err := cmd.Start(); err != nil {
+		stdinR.Close()
+		stdoutW.Close()
 		return fmt.Errorf("start the child: %w", err)
 	}
+	stdinR.Close()
+	stdoutW.Close()
 	pid := cmd.Process.Pid
 	defer unix.Kill(pid, unix.SIGKILL)
-	time.Sleep(patchWait)
+
+	var ready [1]byte
+	if _, err := io.ReadFull(stdoutR, ready[:]); err != nil {
+		return fmt.Errorf("wait for child readiness: %w", err)
+	}
 
 	if err := unix.PtraceAttach(pid); err != nil {
 		return fmt.Errorf("PTRACE_ATTACH: %w", err)
@@ -148,6 +183,9 @@ func check(m method) error {
 	}
 	if err := unix.PtraceDetach(pid); err != nil {
 		return fmt.Errorf("PTRACE_DETACH: %w", err)
+	}
+	if err := stdinW.Close(); err != nil {
+		return fmt.Errorf("close child stdin: %w", err)
 	}
 
 	var ws unix.WaitStatus

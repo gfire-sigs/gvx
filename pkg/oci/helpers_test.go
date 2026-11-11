@@ -25,7 +25,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -260,14 +259,6 @@ func (m *memImage) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
-}
-
-type runtimeMemStats struct{ totalAlloc uint64 }
-
-func (s *runtimeMemStats) read() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	s.totalAlloc = m.TotalAlloc
 }
 
 // zstdBytesWithWindow encodes raw as a stream whose frame header declares a

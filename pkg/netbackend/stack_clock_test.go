@@ -59,13 +59,24 @@ func TestStdClockMonotonicStepIsFine(t *testing.T) {
 }
 
 // TestStdClockMonotonicRate checks that NowMonotonic advances at the rate of
-// the time package. A wrong scale of the host tick counter fails it.
+// the time package. Each NowMonotonic reading sits between two time.Now calls
+// so preemption widens the expected interval instead of failing the test.
 func TestStdClockMonotonicRate(t *testing.T) {
+	const goClockStep = 20 * time.Millisecond
 	clock := tcpip.NewStdClock()
-	startClock, startTime := clock.NowMonotonic(), time.Now()
+	tStart0 := time.Now()
+	cStart := clock.NowMonotonic()
+	tStart1 := time.Now()
 	time.Sleep(100 * time.Millisecond)
-	gotClock, gotTime := clock.NowMonotonic().Sub(startClock), time.Since(startTime)
-	if gotClock < gotTime-20*time.Millisecond || gotClock > gotTime+20*time.Millisecond {
-		t.Fatalf("NowMonotonic advanced %v while the time package advanced %v", gotClock, gotTime)
+	tEnd0 := time.Now()
+	cEnd := clock.NowMonotonic()
+	tEnd1 := time.Now()
+
+	gotClock := cEnd.Sub(cStart)
+	minTime := tEnd0.Sub(tStart1)
+	maxTime := tEnd1.Sub(tStart0)
+	if gotClock < minTime-goClockStep || gotClock > maxTime+goClockStep {
+		t.Fatalf("NowMonotonic advanced %v outside runtime interval [%v, %v] with step %v",
+			gotClock, minTime, maxTime, goClockStep)
 	}
 }

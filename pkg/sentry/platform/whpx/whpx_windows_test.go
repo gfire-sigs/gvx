@@ -143,7 +143,8 @@ func TestRealInterruptStopsALoop(t *testing.T) {
 		_, _, err := c.Switch(nil, mm, ac, -1)
 		done <- err
 	}()
-	for {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
 		select {
 		case err := <-done:
 			if !errors.Is(err, platform.ErrContextInterrupt) {
@@ -155,4 +156,5 @@ func TestRealInterruptStopsALoop(t *testing.T) {
 			runtime.Gosched()
 		}
 	}
+	t.Fatal("Interrupt did not stop a spinning WHPX guest within 10s")
 }

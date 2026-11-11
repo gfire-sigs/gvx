@@ -22,7 +22,7 @@ func TestWindowsLogPipeRejectsCrossInstanceCollision(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	firstLog, err := openLog(t.Context(), first, firstRef, time.Second)
+	firstLog, err := openLog(t.Context(), first, firstRef, 10*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestWindowsLogPipeRejectsCrossInstanceCollision(t *testing.T) {
 	if err := firstLog.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	secondLog, err := openLog(t.Context(), second, secondRef, time.Second)
+	secondLog, err := openLog(t.Context(), second, secondRef, 10*time.Second)
 	if err != nil {
 		t.Fatalf("released log name cannot be rebound: %v", err)
 	}

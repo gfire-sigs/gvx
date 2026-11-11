@@ -21,6 +21,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -243,31 +244,37 @@ func TestStubOutlivesAddressSpaceUntilTheLastContextReleases(t *testing.T) {
 	}
 }
 
-// memfdMappings returns the number of lines of /proc/self/maps that map the
-// file with inode ino, the sum of their lengths, and the number of all lines.
-func memfdMappings(t testing.TB, ino uint64) (lines int, bytes uint64, all int) {
+// memfdMappings parses /proc/self/maps and returns VMA counts and mapped byte totals.
+// It reports totals for inode ino, totals across all memfds, and total VMA lines.
+func memfdMappings(t testing.TB, ino uint64) (lines int, bytes uint64, allMemfdLines int, allMemfdBytes uint64, all int) {
 	t.Helper()
 	b, err := os.ReadFile("/proc/self/maps")
 	if err != nil {
 		t.Fatalf("read /proc/self/maps: %v", err)
 	}
+	wantIno := strconv.FormatUint(ino, 10)
 	for line := range strings.Lines(string(b)) {
 		fields := strings.Fields(line)
 		if len(fields) < 5 {
 			continue
 		}
 		all++
-		if fields[4] != strconv.FormatUint(ino, 10) || !strings.Contains(line, "memfd:") {
+		if !strings.Contains(line, "memfd:") {
 			continue
 		}
 		var start, end uint64
 		if _, err := fmt.Sscanf(fields[0], "%x-%x", &start, &end); err != nil {
 			t.Fatalf("parse maps line %q: %v", line, err)
 		}
-		lines++
-		bytes += end - start
+		span := end - start
+		allMemfdLines++
+		allMemfdBytes += span
+		if fields[4] == wantIno {
+			lines++
+			bytes += span
+		}
 	}
-	return lines, bytes, all
+	return lines, bytes, allMemfdLines, allMemfdBytes, all
 }
 
 func openFDs(t testing.TB) int {
@@ -309,25 +316,27 @@ func settledUsage(t testing.TB, mf *pgalloc.MemoryFile, atMost uint64) uint64 {
 }
 
 type hostCounts struct {
-	fds, children, memfdLines, allLines int
-	memfdBytes, usage                   uint64
+	fds, children, memfdLines, totalMemfdLines, allLines int
+	memfdBytes, totalMemfdBytes, usage                   uint64
 }
 
 func (c hostCounts) String() string {
-	return fmt.Sprintf("fds=%d children=%d memfd mapping lines=%d memfd mapped bytes=%d all mapping lines=%d memory file usage=%d",
-		c.fds, c.children, c.memfdLines, c.memfdBytes, c.allLines, c.usage)
+	return fmt.Sprintf("fds=%d children=%d memfd mapping lines=%d memfd mapped bytes=%d all memfd lines=%d all memfd bytes=%d all mapping lines=%d memory file usage=%d",
+		c.fds, c.children, c.memfdLines, c.memfdBytes, c.totalMemfdLines, c.totalMemfdBytes, c.allLines, c.usage)
 }
 
 func measureHost(t testing.TB, mf *pgalloc.MemoryFile, ino uint64, usageAtMost uint64) hostCounts {
 	t.Helper()
-	lines, bytes, all := memfdMappings(t, ino)
+	lines, bytes, allMemfdLines, allMemfdBytes, all := memfdMappings(t, ino)
 	return hostCounts{
-		fds:        openFDs(t),
-		children:   countChildren(t),
-		memfdLines: lines,
-		memfdBytes: bytes,
-		allLines:   all,
-		usage:      settledUsage(t, mf, usageAtMost),
+		fds:             openFDs(t),
+		children:        countChildren(t),
+		memfdLines:      lines,
+		memfdBytes:      bytes,
+		totalMemfdLines: allMemfdLines,
+		totalMemfdBytes: allMemfdBytes,
+		allLines:        all,
+		usage:           settledUsage(t, mf, usageAtMost),
 	}
 }
 
@@ -352,25 +361,33 @@ func TestDestroyingEveryReleasedStubLeaksNothing(t *testing.T) {
 		sp.Release()
 	}
 
-	// The first round is a warm-up: it makes the Go runtime open its own
-	// descriptors and mappings before the first measurement.
-	oneRound()
+	// Run several warm-up rounds and a GC cycle so the Go runtime opens its
+	// background threads, descriptors, and heap arenas before baseline capture.
+	const warmupRounds = 16
+	for range warmupRounds {
+		oneRound()
+	}
+	runtime.GC()
 	first := measureHost(t, p.memoryFile, ino, math.MaxUint64)
-	t.Logf("after the warm-up round: %v", first)
+	t.Logf("after %d warm-up rounds: %v", warmupRounds, first)
 	const rounds = 500
 	for range rounds {
 		oneRound()
 	}
+	runtime.GC()
 	last := measureHost(t, p.memoryFile, ino, first.usage)
 	t.Logf("after %d rounds: %v", rounds, last)
 
-	// The Go runtime maps and unmaps its own memory, so the total of mapping
-	// lines may move a little. The lines of the memory file may not move.
-	const runtimeSlack = 16
+	// Every systrap shared mapping backs a memfd, so totalMemfdLines and
+	// totalMemfdBytes require exact equality. Go GC madvise calls can split
+	// anonymous heap and stack VMAs, while a per-round anonymous VMA leak across
+	// 500 rounds adds at least 500 lines.
+	const runtimeSlack = 128
 	if last.fds != first.fds || last.children != first.children ||
 		last.memfdLines != first.memfdLines || last.memfdBytes != first.memfdBytes ||
+		last.totalMemfdLines != first.totalMemfdLines || last.totalMemfdBytes != first.totalMemfdBytes ||
 		last.usage > first.usage || last.allLines > first.allLines+runtimeSlack {
-		t.Fatalf("after %d create and release rounds with bound 0, the host counts differ from the first round\nfirst: %v\nlast:  %v",
+		t.Fatalf("after %d create and release rounds with bound 0, the host counts differ from the baseline\nfirst: %v\nlast:  %v",
 			rounds, first, last)
 	}
 }
@@ -399,7 +416,7 @@ func TestIdleBoundHoldsUnderConcurrentReleaseAndMapFile(t *testing.T) {
 	}
 	stop := make(chan struct{})
 
-	// Steady address spaces call MapFile while other stubs are destroyed.
+	// Steady address spaces call MapFile while churners destroy other stubs.
 	var steadyWG sync.WaitGroup
 	for i, sp := range steadySet.spaces {
 		steadyWG.Add(1)

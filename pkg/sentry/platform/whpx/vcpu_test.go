@@ -18,6 +18,7 @@ import (
 	"errors"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // limitVPs shrinks the processor pool of a fresh platform to n processors.
@@ -56,12 +57,16 @@ func TestAcquireCreatesProcessorsLazilyUpToTheLimit(t *testing.T) {
 		}
 		got <- v
 	}()
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		p.mu.Lock()
 		n := p.waiters
 		p.mu.Unlock()
 		if n > 0 {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("third acquire did not queue a waiter within 10s")
 		}
 		runtime.Gosched()
 	}

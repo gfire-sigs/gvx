@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -263,7 +264,11 @@ func TestHandoffAwaitWakesOnPendingSignal(t *testing.T) {
 	}()
 	// A source of a pending reason sets the condition after the Sentry sleeps,
 	// then wakes the sleeper when it reads a non-zero flag.
+	deadline := time.Now().Add(10 * time.Second)
 	for h.sentryWaiter().Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("await did not set sentryWaiter within 10s")
+		}
 		runtime.Gosched()
 	}
 	pend.Store(true)
@@ -287,7 +292,11 @@ func TestHandoffAwaitIgnoresStaleSignal(t *testing.T) {
 		res, _ := h.await(winSpin{}, sentry, func() bool { return false })
 		done <- res
 	}()
+	deadline := time.Now().Add(10 * time.Second)
 	for h.loadState() == winStateTrapped || h.sentryWaiter().Load() == 0 || len(sig.guest) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("await did not drain stale signal and park within 10s")
+		}
 		runtime.Gosched()
 	}
 	h.state().Store(winStateTrapped)

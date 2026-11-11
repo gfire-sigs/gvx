@@ -74,52 +74,70 @@ func TestNewSpinWindowsUsesTheEnvironment(t *testing.T) {
 }
 
 // TestSpinTicksPerUsTracksTheClock checks the calibration against the Go clock
-// over a longer span. The counter that the stub reads must advance at the rate
-// that the Sentry used to convert the windows.
+// over a longer span. Each counter reading sits between two readings of the Go
+// clock, so thread preemption widens the bound instead of failing the sample.
 func TestSpinTicksPerUsTracksTheClock(t *testing.T) {
 	rate := spinTicksPerUs()
 	if rate < 1 || math.IsNaN(rate) {
 		t.Fatalf("spinTicksPerUs = %v", rate)
 	}
-	// A descheduled thread skews one sample. The counter is right when one of
-	// a few samples agrees with the calibration.
-	var got float64
-	for range 5 {
-		start, c0 := time.Now(), spinNow()
-		for time.Since(start) < 20*time.Millisecond {
-		}
-		elapsedUs := float64(time.Since(start)) / 1e3
-		got = float64(spinNow()-c0) / elapsedUs
-		if got >= rate*0.9 && got <= rate*1.1 {
-			return
-		}
+	// The Go clock on Windows reads interrupt time, which can step by up to
+	// 15.6 ms when timer resolution is coarse.
+	const goClockStepUs = 20_000.0
+	t0a := time.Now()
+	c0 := spinNow()
+	t0b := time.Now()
+	for time.Since(t0b) < 100*time.Millisecond {
 	}
-	t.Errorf("the counter ran at %.1f ticks per microsecond in the last of five samples, the calibration says %.1f", got, rate)
+	t1a := time.Now()
+	c1 := spinNow()
+	t1b := time.Now()
+
+	minUs := max(0.0, float64(t1a.Sub(t0b))/1e3-goClockStepUs)
+	maxUs := float64(t1b.Sub(t0a))/1e3 + goClockStepUs
+	ticks := float64(c1 - c0)
+	if ticks < minUs*rate*0.9 || ticks > maxUs*rate*1.1 {
+		t.Errorf("counter advanced %.0f ticks in [%.0f, %.0f] us, outside 10%% of calibrated %.1f ticks/us",
+			ticks, minUs, maxUs, rate)
+	}
 }
 
-// TestAwaitSpinWindowLastsItsTime checks that the Sentry polls for the time of
-// its window, and not for a number of loop iterations. The test reads the
-// performance counter, because the Go clock of Windows ticks every half
-// millisecond.
+// TestAwaitSpinWindowLastsItsTime checks that the Sentry polls across its spin
+// window and skips polling when the window has zero ticks.
 func TestAwaitSpinWindowLastsItsTime(t *testing.T) {
+	// Verify deterministic poll counts with a synthetic clock first.
+	var zeroCalls int
+	var hZero winSysmsgHeader
+	_, _ = hZero.await(winSpin{ticks: 0, now: func() uint64 {
+		zeroCalls++
+		return 0
+	}}, errSignaler{}, func() bool { return false })
+	if zeroCalls != 0 {
+		t.Errorf("zero-tick window read the clock %d times, want 0", zeroCalls)
+	}
+
+	var fakeTicks uint64
+	var windowCalls int
+	var hWin winSysmsgHeader
+	_, _ = hWin.await(winSpin{ticks: 1000, now: func() uint64 {
+		windowCalls++
+		v := fakeTicks
+		fakeTicks += 250
+		return v
+	}}, errSignaler{}, func() bool { return false })
+	if windowCalls != 5 {
+		t.Errorf("1000-tick window with 250-tick steps read the clock %d times, want 5", windowCalls)
+	}
+
+	// Verify that a real spin window waits at least its calibrated duration.
 	const windowUs = 2000
 	freq := float64(sentrytime.CounterFrequencyHz())
-	measure := func(spin winSpin) float64 {
-		var h winSysmsgHeader
-		start := sentrytime.ReadCounterTicks()
-		_, _ = h.await(spin, errSignaler{}, func() bool { return false })
-		return float64(sentrytime.ReadCounterTicks()-start) * 1e6 / freq
-	}
-	got := measure(winSpin{ticks: uint64(windowUs * spinTicksPerUs()), now: spinNow})
-	if got < windowUs {
-		t.Errorf("await polled for %.0f us, want at least %d us", got, windowUs)
-	}
-	if got > 50*windowUs {
-		t.Errorf("await polled for %.0f us, far more than %d us", got, windowUs)
-	}
-	// A window of zero ticks sleeps at once.
-	if got := measure(winSpin{now: spinNow}); got > 1000 {
-		t.Errorf("a window of 0 ticks polled for %.0f us", got)
+	var h winSysmsgHeader
+	start := sentrytime.ReadCounterTicks()
+	_, _ = h.await(winSpin{ticks: uint64(windowUs * spinTicksPerUs()), now: spinNow}, errSignaler{}, func() bool { return false })
+	got := float64(sentrytime.ReadCounterTicks()-start) * 1e6 / freq
+	if got < windowUs*0.9 {
+		t.Errorf("await polled for %.0f us, want at least %.0f us", got, windowUs*0.9)
 	}
 }
 

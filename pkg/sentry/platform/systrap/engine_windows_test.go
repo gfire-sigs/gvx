@@ -23,8 +23,10 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -468,7 +470,19 @@ func TestThreadsShareAddressSpace(t *testing.T) {
 
 func TestInterruptStopsRunningGuest(t *testing.T) {
 	r := newRig(t, newPlatform(t))
-	r.program(gCountSpin())
+	r.program(gCountSpinAt(dataVA))
+	counter := r.mapPage(dataVA, hostarch.ReadWrite)
+	counterWord := (*uint64)(unsafe.Pointer(&counter[0]))
+	waitCountAbove := func(min uint64, phase string) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for atomic.LoadUint64(counterWord) <= min {
+			if time.Now().After(deadline) {
+				t.Fatalf("spinning guest did not advance past %d %s", min, phase)
+			}
+			runtime.Gosched()
+		}
+	}
 	type result struct {
 		si  *linux.SignalInfo
 		err error
@@ -478,7 +492,7 @@ func TestInterruptStopsRunningGuest(t *testing.T) {
 		si, _, err := r.run()
 		done <- result{si, err}
 	}()
-	time.Sleep(200 * time.Millisecond)
+	waitCountAbove(1, "before first interrupt")
 	r.ctx.Interrupt()
 	select {
 	case res := <-done:
@@ -492,16 +506,21 @@ func TestInterruptStopsRunningGuest(t *testing.T) {
 	if first == 0 {
 		t.Errorf("the guest counted nothing before the interrupt")
 	}
-	// The thread resumes from the captured state.
+	// Clear the memory witness and wait until the resumed loop writes a value past first.
+	atomic.StoreUint64(counterWord, 0)
 	go func() {
 		si, _, err := r.run()
 		done <- result{si, err}
 	}()
-	time.Sleep(100 * time.Millisecond)
+	waitCountAbove(first, "after resume")
 	r.ctx.Interrupt()
-	res := <-done
-	if !errors.Is(res.err, platform.ErrContextInterrupt) {
-		t.Fatalf("second Switch = (%s, %v), want an interrupt", describe(res.si), res.err)
+	select {
+	case res := <-done:
+		if !errors.Is(res.err, platform.ErrContextInterrupt) {
+			t.Fatalf("second Switch = (%s, %v), want an interrupt", describe(res.si), res.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second interrupt did not stop the resumed guest")
 	}
 	if got := regAcc(r.ac); got <= first {
 		t.Errorf("the counter did not advance after the resume: %d then %d", first, got)

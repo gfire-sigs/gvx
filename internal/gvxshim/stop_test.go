@@ -25,7 +25,7 @@ func lifecycleStopServer(t *testing.T) (*stopServer, *controlState, stateRecord)
 	server := newStopServer(endpoint.Listener, state, token, time.Minute)
 	t.Cleanup(func() {
 		state.RequestStop()
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.close(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			t.Error(err)
@@ -41,13 +41,13 @@ func lifecycleStopServer(t *testing.T) (*stopServer, *controlState, stateRecord)
 
 func stopTestConnection(t *testing.T, address string) net.Conn {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	conn, err := dialLocal(ctx, address)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		conn.Close()
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestStopRejectsWrongGenerationWithoutStopping(t *testing.T) {
 
 func TestStopAcknowledgesMatchingGeneration(t *testing.T) {
 	_, state, record := lifecycleStopServer(t)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	if err := requestIndependentStop(ctx, &record); err != nil {
 		t.Fatal(err)

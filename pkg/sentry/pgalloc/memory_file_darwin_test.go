@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
-	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 func TestSharedPagesAliasAndDecommit(t *testing.T) {
@@ -477,13 +477,16 @@ func TestReleaseSubPagesCoalescesIntoWholeHostPageHolePunch(t *testing.T) {
 	}
 	for _, idx := range order {
 		mf.DecRef(subRanges[idx])
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
+		deadline := time.Now().Add(20 * time.Second)
+		for {
 			mf.mu.Lock()
 			busy := mf.haveWaste
 			mf.mu.Unlock()
 			if !busy {
 				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("releaser did not drain waste within 20s at step %d", idx)
 			}
 			time.Sleep(time.Millisecond)
 		}

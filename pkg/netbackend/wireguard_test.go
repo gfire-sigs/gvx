@@ -619,11 +619,11 @@ func TestWireGuardEndpointCloseReleasesSocketAndGoroutines(t *testing.T) {
 	p := newWGPair(t, wgPairOptions{})
 	checkTraffic(ctx, t, p, guestPrefixV4.Addr(), peerPrefixV4.Addr())
 
-	port := p.guest.LocalUDPAddr().(*net.UDPAddr).Port
-	// While the endpoint is open, the port is taken.
-	if busy, err := net.ListenPacket("udp", ":"+strconv.Itoa(port)); err == nil {
-		busy.Close()
-		t.Fatalf("port %d is free while the endpoint is open", port)
+	p.guest.mu.Lock()
+	sock := p.guest.udpConn
+	p.guest.mu.Unlock()
+	if sock == nil {
+		t.Fatal("endpoint has no UDP socket while started")
 	}
 
 	p.peer.close()
@@ -633,11 +633,9 @@ func TestWireGuardEndpointCloseReleasesSocketAndGoroutines(t *testing.T) {
 	if err := p.guest.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	reuse, err := net.ListenPacket("udp", ":"+strconv.Itoa(port))
-	if err != nil {
-		t.Fatalf("UDP port %d is still bound after Close: %v", port, err)
+	if _, err := sock.WriteTo([]byte{0}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("WriteTo on closed endpoint socket = %v, want net.ErrClosed", err)
 	}
-	reuse.Close()
 
 	if err := waitNoGoroutines(ctx, "golang.zx2c4.com/wireguard/", "(*channelTUN)", "(*preboundBind)"); err != nil {
 		t.Fatalf("goroutines remain after Close: %v", err)
@@ -695,15 +693,15 @@ func TestWireGuardEndpointLifecycle(t *testing.T) {
 	if err := w2.PreBindUDP(); err != nil {
 		t.Fatal(err)
 	}
-	port := w2.LocalUDPAddr().(*net.UDPAddr).Port
+	w2.mu.Lock()
+	sock2 := w2.udpConn
+	w2.mu.Unlock()
 	if err := w2.Close(); err != nil {
 		t.Fatalf("Close before Start: %v", err)
 	}
-	reuse, err := net.ListenPacket("udp", ":"+strconv.Itoa(port))
-	if err != nil {
-		t.Fatalf("socket still bound after Close before Start: %v", err)
+	if _, err := sock2.WriteTo([]byte{0}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("WriteTo after Close before Start = %v, want net.ErrClosed", err)
 	}
-	reuse.Close()
 }
 
 func TestWireGuardEndpointUsesRequestedListenAddress(t *testing.T) {
