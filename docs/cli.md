@@ -418,7 +418,7 @@ The command exits with 0 on success and with 2 when an argument is unexpected. T
 | :--- | :--- |
 | `rungv VERSION` | The module version. A build of a clean tag checkout prints the tag, such as `v0.1.0-rc.1`. Another build prints a pseudo-version or `(devel)`. |
 | `commit SHA (TIME)` | The Git commit and its commit time. The word `modified` follows when the checkout had uncommitted changes. A build without Git metadata omits this line. |
-| `go VERSION OS/ARCH` | The Go toolchain and the target of the binary. |
+| `go VERSION OS/ARCH LEVEL` | The Go toolchain, target OS and architecture, and compiled architecture level (such as `GOAMD64=v2` or `GOARM64=v8.4`). |
 
 The command exits with 0 on success and with 2 when an argument is unexpected.
 

@@ -150,7 +150,7 @@ Each release tag has the form `vMAJOR.MINOR.PATCH`. The workflow `release.yml` r
 | Field | Current value | Rule |
 | :--- | :--- | :--- |
 | `MAJOR` | `0` | Keep `0`. |
-| `MINOR` | `12` | Increase by 1 when a release adds a feature or changes behavior. An upstream sync alone does not increase `MINOR`. |
+| `MINOR` | `13` | Increase by 1 when a release adds a feature or changes behavior. An upstream sync alone does not increase `MINOR`. |
 | `PATCH` | `10002026110200` | Join the four parts of the next table as decimal digits, in table order. |
 
 | PATCH part | Digits | Value in `v0.6.10002026110200` | Rule |
