@@ -17,7 +17,7 @@
 # Pure-Go Sentry and Netstack core. SPEC 3.1 requires these files to build on all four
 # Priority-0 targets. Upstream gives them no //go:build line, so retag edits nothing today.
 # The audit still fails if any of them stops building on a target.
-seam pkg/sentry/kernel/kernel.go
+pkg/sentry/kernel/kernel.go
 pkg/sentry/arch/arch.go
 pkg/ring0/ring0.go
 pkg/sentry/vfs/vfs.go
@@ -188,11 +188,8 @@ seam pkg/sentry/vfs/mount.go
 seam pkg/sentry/fsimpl/proc/tasks_files.go
 seam pkg/sentry/syscalls/linux/sys_sysinfo.go
 
-# Content seams: the kernel log (GVXIP-005, P1). The kernel keeps a ring of records in place of
-# the fixed boot messages of gVisor (pkg/sentry/kernel/kmsg_xplat.go). The kernel field and the
-# state code follow the new type syslog, and syslog(2) reads the ring.
-seam pkg/sentry/kernel/kernel_state_autogen.go
-seam pkg/sentry/kernel/syslog.go
+# Content seams: the kernel log (GVXIP-005, P1). syslog(2) reads the per-kernel ring buffer
+# in pkg/sentry/kernel/syslog_xplat.go.
 seam pkg/sentry/syscalls/linux/sys_syslog.go
 seam pkg/sentry/syscalls/linux/linux64.go
 # A target that logs the interfaces of a packet runs through InterfaceTarget
