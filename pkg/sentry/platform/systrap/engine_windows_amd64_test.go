@@ -19,6 +19,7 @@ package systrap
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -480,7 +481,7 @@ func TestStopThreadReturnsWhenTheThreadFaultsInASlot(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the relocated MOV raised no event")
 		}
-		time.Sleep(time.Millisecond)
+		runtime.Gosched()
 	}
 
 	r.ctx.kicked.Store(true)

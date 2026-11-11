@@ -792,25 +792,24 @@ func TestCloseTerminatesStubs(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for alive(pid) {
-		if time.Now().After(deadline) {
-			t.Fatalf("stub %d is still alive after Close", pid)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitProcessExit(t, pid)
 }
 
 // waitPool waits until the pool of p holds poolDepth stubs and returns their
 // process IDs.
 func waitPool(t *testing.T, p *Platform) []uint32 {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for len(p.pool.ready) < poolDepth {
-		if time.Now().After(deadline) {
-			t.Fatalf("the pool holds %d stubs after 30 s, want %d", len(p.pool.ready), poolDepth)
+	held := make([]*stubProc, 0, poolDepth)
+	for len(held) < poolDepth {
+		select {
+		case sp := <-p.pool.ready:
+			held = append(held, sp)
+		case <-time.After(30 * time.Second):
+			t.Fatalf("the pool holds %d stubs after 30 s, want %d", len(held), poolDepth)
 		}
-		time.Sleep(20 * time.Millisecond)
+	}
+	for _, sp := range held {
+		p.pool.ready <- sp
 	}
 	p.dbg.mu.Lock()
 	defer p.dbg.mu.Unlock()
@@ -902,14 +901,22 @@ func TestCloseTerminatesPooledStubs(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
 	for _, pid := range pooled {
-		for alive(pid) {
-			if time.Now().After(deadline) {
-				t.Fatalf("pooled stub %d is still alive after Close", pid)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
+		waitProcessExit(t, pid)
+	}
+}
+
+// waitProcessExit blocks until the process pid exits or fails the test after 10 seconds.
+func waitProcessExit(t *testing.T, pid uint32) {
+	t.Helper()
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(h)
+	ev, err := windows.WaitForSingleObject(h, 10000)
+	if err != nil || ev == uint32(windows.WAIT_TIMEOUT) {
+		t.Fatalf("stub %d is still alive after Close", pid)
 	}
 }
 

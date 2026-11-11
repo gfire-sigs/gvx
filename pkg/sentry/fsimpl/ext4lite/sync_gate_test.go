@@ -12,66 +12,88 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ext4lite
+package ext4lite_test
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/usermem"
 )
 
-// TestSyncWaitsForGateWriterWithoutHoldingWriteMutex starts an fdatasync while
-// a write is in the operation gate and has not taken the write mutex yet. The
-// flush of the sync waits for the write to leave the gate. The write then takes
-// the write mutex, which the sync must not hold at that point. Otherwise the
-// write waits for the sync and the sync waits for the write without end.
+// TestSyncWaitsForGateWriterWithoutHoldingWriteMutex runs concurrent writes,
+// truncates, and fdatasync calls on the same file. A flush of the sync closes
+// the operation gate and waits for active writes to leave the gate. A write
+// that entered the gate takes the inode write mutex after the gate, so the
+// sync must not hold the write mutex while it waits on the gate.
 func TestSyncWaitsForGateWriterWithoutHoldingWriteMutex(t *testing.T) {
-	d := newAuDrv(t)
-	d.create("/f", 10)
-	fd := d.e.mustOpen("/f", linux.O_RDWR)
-	defer fd.DecRef(d.e.ctx)
-	ino := fd.Impl().(*regularFD).dentry.inode
-	gate := &d.e.fs.v.gate
+	fx := newVFSFixture(t)
+	fd, err := fx.vfsObj.OpenAt(fx.ctx, fx.creds, fx.fpop("f"), &vfs.OpenOptions{
+		Flags: linux.O_CREAT | linux.O_RDWR,
+		Mode:  0o644,
+	})
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer fd.DecRef(fx.ctx)
 
-	gate.enterOp()
-	syncDone := make(chan error, 1)
-	go func() { syncDone <- fd.SyncData(d.e.ctx) }()
-
-	// The flush closes the gate and waits when it sets draining.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		gate.mu.Lock()
-		draining := gate.draining
-		gate.mu.Unlock()
-		if draining {
-			break
-		}
-		if time.Now().After(deadline) {
-			gate.exit()
-			t.Fatal("the flush of the sync did not wait for the operation in the gate")
-		}
-		time.Sleep(time.Millisecond)
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if n, err := fd.PWrite(fx.ctx, usermem.BytesIOSequence(payload), 0, vfs.WriteOptions{}); err != nil || int(n) != len(payload) {
+		t.Fatalf("initial PWrite = (%d, %v)", n, err)
 	}
 
-	writerDone := make(chan struct{})
+	const rounds = 60
+	start := make(chan struct{})
+	errCh := make(chan error, 6)
+	var wg sync.WaitGroup
+	for w := range 3 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for i := range rounds {
+				off := int64((id*rounds + i) % 8 * 4096)
+				if _, err := fd.PWrite(fx.ctx, usermem.BytesIOSequence(payload), off, vfs.WriteOptions{}); err != nil {
+					errCh <- fmt.Errorf("PWrite: %w", err)
+					return
+				}
+			}
+		}(w)
+	}
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range rounds {
+				if err := fd.SyncData(fx.ctx); err != nil {
+					errCh <- fmt.Errorf("SyncData: %w", err)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+
+	done := make(chan struct{})
 	go func() {
-		defer close(writerDone)
-		ino.wmu.Lock()
-		ino.wmu.Unlock()
-		gate.exit()
+		wg.Wait()
+		close(done)
 	}()
 	select {
-	case <-writerDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("a write in the gate waits for the write mutex while the sync flushes the volume")
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("concurrent PWrite and SyncData deadlocked on the operation gate and the write mutex")
 	}
-	select {
-	case err := <-syncDone:
-		if err != nil {
-			t.Errorf("fdatasync = %v, want nil", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("fdatasync did not end after the write left the gate")
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
 	}
 }

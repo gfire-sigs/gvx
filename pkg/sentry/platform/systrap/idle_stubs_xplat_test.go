@@ -311,7 +311,7 @@ func settledUsage(t testing.TB, mf *pgalloc.MemoryFile, atMost uint64) uint64 {
 		if (stable >= stableReads && got <= atMost) || time.Now().After(deadline) {
 			return got
 		}
-		time.Sleep(10 * time.Millisecond)
+		runtime.Gosched()
 	}
 }
 

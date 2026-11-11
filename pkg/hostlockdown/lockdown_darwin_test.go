@@ -14,7 +14,7 @@
 
 //go:build darwin
 
-package hostlockdown
+package hostlockdown_test
 
 import (
 	"bufio"
@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
+	. "z.gfire.dev/gvx/pkg/hostlockdown"
 )
 
 // The tests re-execute the test binary as a locked child. Seatbelt and
@@ -315,6 +316,17 @@ func TestLockdownDarwinRejectsRootWorkspace(t *testing.T) {
 
 func TestLockdownDarwinRejectsMissingWorkspace(t *testing.T) {
 	runChildToCompletion(t, "missing-workspace", childWSEnv+"="+filepath.Join(realTempDir(t), "absent"))
+}
+
+func TestLockdownDarwinConfinesParameterizedMountPath(t *testing.T) {
+	base, outside, env := workspaceEnv(t)
+	injected := filepath.Join(base, `evil") (allow default) ("`)
+	if err := os.Mkdir(injected, 0o700); err != nil {
+		t.Fatalf("Mkdir injected: %v", err)
+	}
+	_ = outside
+	env = append(env, childWSEnv+"="+injected)
+	runChildToCompletion(t, "files", env...)
 }
 
 // childChecks collects every failed expectation so that one run reports all

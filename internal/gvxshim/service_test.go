@@ -295,14 +295,15 @@ func drainThenCloseConnections(f *rpcFixture) error {
 	return errors.Join(err, f.transport.CloseConnections())
 }
 
-// lagConn models a client whose call goroutine is not scheduled for lag after
-// the ttRPC receive loop reads the response. The ttRPC client returns ErrClosed
-// when the shim closes the connection in that interval.
+// lagConn models a client whose call goroutine is not scheduled until the shim
+// begins draining the server after the ttRPC receive loop reads the response.
+// The ttRPC client returns ErrClosed when the shim closes the connection in
+// that interval.
 type lagConn struct {
 	net.Conn
-	lag     time.Duration
-	mu      sync.Mutex
-	pending chan struct{}
+	mu       sync.Mutex
+	pending  chan struct{}
+	draining chan struct{}
 }
 
 func (c *lagConn) armed() chan struct{} {
@@ -336,7 +337,8 @@ func (c *lagConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if pending != nil && err == nil {
 		<-pending
-		time.Sleep(c.lag)
+		<-c.draining
+		runtime.Gosched()
 	}
 	return n, err
 }
@@ -344,18 +346,21 @@ func (c *lagConn) Write(p []byte) (int, error) {
 func TestShutdownReplySurvivesClientCallLag(t *testing.T) {
 	for i := range 20 {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			draining := make(chan struct{})
 			var lagged *lagConn
 			f := newRPCFixtureConn(t, func(conn net.Conn) net.Conn {
-				lagged = &lagConn{Conn: conn, lag: 20 * time.Millisecond}
+				lagged = &lagConn{Conn: conn, draining: draining}
 				return lagged
 			})
 			drained := make(chan error, 1)
 			go func() {
 				<-f.state.StopRequested()
 				if err := f.transport.Close(); err != nil {
+					close(draining)
 					drained <- err
 					return
 				}
+				close(draining)
 				drained <- drainThenCloseConnections(f)
 			}()
 			lagged.arm()

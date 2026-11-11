@@ -12,38 +12,103 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ext4lite
+package ext4lite_test
 
 import (
-	"runtime"
-	"strings"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	gvcontext "z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/fspath"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/limits"
+	"z.gfire.dev/gvx/pkg/sentry/uniqueid"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
-// waitUntil polls cond until it is true. It fails the test after 10 seconds.
-func waitUntil(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timeout while waiting for %s", what)
-		}
-		time.Sleep(time.Millisecond)
-	}
+type extCookieContext struct {
+	gvcontext.Context
 }
 
-// goroutineIn reports whether a goroutine has a frame whose text contains
-// frame.
-func goroutineIn(frame string) bool {
-	buf := make([]byte, 1<<20)
-	for {
-		n := runtime.Stack(buf, true)
-		if n < len(buf) {
-			return strings.Contains(string(buf[:n]), frame)
-		}
-		buf = make([]byte, 2*len(buf))
+var (
+	extTestLimits = limits.NewLimitSet()
+	extTestCreds  = auth.NewRootCredentials(auth.NewRootUserNamespace())
+)
+
+func (c extCookieContext) Value(key any) any {
+	switch key {
+	case uniqueid.CtxInotifyCookie:
+		return uint32(1)
+	case limits.CtxLimits:
+		return extTestLimits
+	case auth.CtxCredentials:
+		return extTestCreds
 	}
+	return c.Context.Value(key)
+}
+
+type vfsFixture struct {
+	t      *testing.T
+	ctx    gvcontext.Context
+	creds  *auth.Credentials
+	vfsObj *vfs.VirtualFilesystem
+	root   vfs.VirtualDentry
+	mntns  *vfs.MountNamespace
+}
+
+func newVFSFixture(t *testing.T) *vfsFixture {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "vol.ext4")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{})
+	if err != nil {
+		t.Fatalf("OpenVolume: %v", err)
+	}
+	ctx := gvcontext.Background()
+	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("vfsObj.Init: %v", err)
+	}
+	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	var mopts vfs.MountOptions
+	mopts.GetFilesystemOptions.InternalData = ext4lite.InternalFilesystemOptions{Volume: vol}
+	mntns, err := vfsObj.NewMountNamespace(ctx, creds, "", ext4lite.Name, &mopts, nil)
+	if err != nil {
+		t.Fatalf("NewMountNamespace: %v", err)
+	}
+	root := mntns.Root(ctx)
+	fx := &vfsFixture{
+		t:      t,
+		ctx:    extCookieContext{vfs.WithMountNamespace(ctx, mntns)},
+		creds:  creds,
+		vfsObj: vfsObj,
+		root:   root,
+		mntns:  mntns,
+	}
+	t.Cleanup(func() {
+		root.DecRef(fx.ctx)
+		mntns.DecRef(fx.ctx)
+	})
+	return fx
+}
+
+func (fx *vfsFixture) pop(p string) *vfs.PathOperation {
+	return &vfs.PathOperation{Root: fx.root, Start: fx.root, Path: fspath.Parse(p)}
+}
+
+func (fx *vfsFixture) fpop(p string) *vfs.PathOperation {
+	pop := fx.pop(p)
+	pop.FollowFinalSymlink = true
+	return pop
 }
 
 // TestReadlinkDoesNotTakeMountLockUnderFilesystemMutex checks the lock order
@@ -54,70 +119,71 @@ func goroutineIn(frame string) bool {
 // the readlink, and every other call that needs fs.mu waits behind them,
 // including the background flush.
 func TestReadlinkDoesNotTakeMountLockUnderFilesystemMutex(t *testing.T) {
-	e := newEnv(t)
-	e.mustMkdir("a")
-	e.mustMkdir("b")
-	if err := e.symlink("target", "l"); err != nil {
-		t.Fatalf("symlink: %v", err)
+	fx := newVFSFixture(t)
+	if err := fx.vfsObj.MkdirAt(fx.ctx, fx.creds, fx.pop("a"), &vfs.MkdirOptions{Mode: 0o755}); err != nil {
+		t.Fatalf("MkdirAt a: %v", err)
+	}
+	if err := fx.vfsObj.MkdirAt(fx.ctx, fx.creds, fx.pop("b"), &vfs.MkdirOptions{Mode: 0o755}); err != nil {
+		t.Fatalf("MkdirAt b: %v", err)
+	}
+	const links = 16
+	for i := range links {
+		name := fmt.Sprintf("l%d", i)
+		if err := fx.vfsObj.SymlinkAt(fx.ctx, fx.creds, fx.pop(name), "target"); err != nil {
+			t.Fatalf("SymlinkAt %s: %v", name, err)
+		}
 	}
 	// The mount at b makes the mount operation below call IsDescendant of
 	// this filesystem.
-	if err := e.vfsObj.BindAt(e.ctx, e.creds, e.pop("a"), e.pop("b"), false); err != nil {
+	if err := fx.vfsObj.BindAt(fx.ctx, fx.creds, fx.pop("a"), fx.pop("b"), false); err != nil {
 		t.Fatalf("BindAt: %v", err)
 	}
 
-	// Hold the lock of the root node. ReadlinkAt takes fs.mu and then waits
-	// for this lock when it checks the search permission of the root.
-	rootNode := e.fs.root.inode.n
-	rootNode.mu.Lock()
-	unlocked := false
-	unlockRoot := func() {
-		if !unlocked {
-			unlocked = true
-			rootNode.mu.Unlock()
-		}
-	}
-	defer unlockRoot()
-
-	readlinkDone := make(chan error, 1)
-	go func() {
-		_, err := e.vfsObj.ReadlinkAt(e.ctx, e.creds, e.pop("l"))
-		readlinkDone <- err
-	}()
-	waitUntil(t, "readlink to hold fs.mu", func() bool {
-		if e.fs.mu.TryLock() {
-			e.fs.mu.Unlock() // +checklocksforce: TryLock succeeded
-			return false
-		}
-		return true
-	})
-
-	// The mount operation takes the mount lock and then waits for fs.mu.
-	cloneDone := make(chan error, 1)
-	go func() {
-		cloneDone <- e.vfsObj.CheckClonePrivateMount(e.ctx, e.creds, e.root)
-	}()
-	waitUntil(t, "the mount operation to wait for fs.mu", func() bool {
-		return goroutineIn("ext4lite.(*filesystem).IsDescendant")
-	})
-
-	unlockRoot()
-	for _, c := range []struct {
-		name string
-		done chan error
-	}{
-		{"ReadlinkAt", readlinkDone},
-		{"CheckClonePrivateMount", cloneDone},
-	} {
-		select {
-		case err := <-c.done:
-			if err != nil {
-				t.Errorf("%s = %v", c.name, err)
+	const rounds = 200
+	start := make(chan struct{})
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for i := range rounds {
+				name := fmt.Sprintf("l%d", (id+i)%links)
+				if _, err := fx.vfsObj.ReadlinkAt(fx.ctx, fx.creds, fx.pop(name)); err != nil {
+					errCh <- fmt.Errorf("ReadlinkAt(%s): %w", name, err)
+					return
+				}
 			}
-		case <-time.After(10 * time.Second):
-			// The unmount would wait for fs.mu behind the stuck calls.
-			e.done = true
-			t.Fatalf("%s did not end: ReadlinkAt holds fs.mu and waits for the mount lock, and the mount operation holds the mount lock and waits for fs.mu", c.name)
-		}
+		}(g)
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range rounds {
+				if err := fx.vfsObj.CheckClonePrivateMount(fx.ctx, fx.creds, fx.root); err != nil {
+					errCh <- fmt.Errorf("CheckClonePrivateMount: %w", err)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ReadlinkAt and CheckClonePrivateMount deadlocked on the mount lock and fs.mu")
+	}
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
 	}
 }

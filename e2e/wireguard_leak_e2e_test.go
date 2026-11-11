@@ -75,7 +75,8 @@ echo LINK-UP
 					if time.Now().After(deadline) {
 						t.Fatalf("%d wireguard-go goroutines before the guest and %d after Close, want no more than before", before, after)
 					}
-					time.Sleep(100 * time.Millisecond)
+					runtime.GC()
+					runtime.Gosched()
 				}
 			})
 		}

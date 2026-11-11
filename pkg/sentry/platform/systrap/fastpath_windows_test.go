@@ -162,7 +162,10 @@ func TestInterruptAfterHotResumeStopsTheGuest(t *testing.T) {
 			_, _, err := r.run()
 			done <- err
 		}()
-		time.Sleep(time.Duration(i%25) * 4 * time.Microsecond)
+		delayTicks := uint64(i%25) * 4 * sentrytime.CounterFrequencyHz() / 1_000_000
+		for start := sentrytime.ReadCounterTicks(); sentrytime.ReadCounterTicks()-start < delayTicks; {
+			runtime.Gosched()
+		}
 		r.ctx.Interrupt()
 		select {
 		case err := <-done:
@@ -613,7 +616,7 @@ func TestStopThreadReturnsWhenTheThreadWaitsAtAnEvent(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the cold resume raised no event")
 		}
-		time.Sleep(time.Millisecond)
+		runtime.Gosched()
 	}
 
 	r.ctx.kicked.Store(true)

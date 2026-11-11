@@ -18,9 +18,10 @@ package systrap
 
 import (
 	"bytes"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
@@ -112,7 +113,14 @@ func TestConcurrentBeforeSwitchWaitsForPopulatePartial(t *testing.T) {
 			enteredOnce.Do(func() {
 				close(enteredPopulate)
 				<-bStarted
-				time.Sleep(15 * time.Millisecond)
+				buf := make([]byte, 1<<18)
+				for {
+					n := runtime.Stack(buf, true)
+					if strings.Count(string(buf[:n]), "subBlockLayer).beforeSwitch(") >= 2 {
+						break
+					}
+					runtime.Gosched()
+				}
 				sub01FR := memmap.FileRange{Start: baseOff, End: baseOff + 2*hostarch.PageSize}
 				if err := layer.mapFile(blockAddr, mf, sub01FR, hostarch.Read, false); err != nil {
 					t.Errorf("mapFile sub-pages 0..1: %v", err)
