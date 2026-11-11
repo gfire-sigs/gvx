@@ -161,7 +161,7 @@ func (e *linkEndpoint) SetMTU(mtu uint32) {
 	tun := e.tun
 	e.updateMu.Unlock()
 	if tun != nil {
-		tun.notifyMTU()
+		tun.NotifyMTU()
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/link/wgtun"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -301,7 +302,7 @@ func receive(s *bindSession, c *gonet.UDPConn) conn.ReceiveFunc {
 		if !ok {
 			return 0, fmt.Errorf("wireguard: invalid sender address %v", ua.IP)
 		}
-		eps[0] = &conn.StdNetEndpoint{AddrPort: netip.AddrPortFrom(ip.Unmap(), uint16(ua.Port))}
+		eps[0] = wgtun.NewEndpoint(netip.AddrPortFrom(ip, uint16(ua.Port)))
 		return 1, nil
 	}
 }
@@ -359,11 +360,7 @@ func (b *netBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 // ParseEndpoint parses "ip:port" or "[ipv6]:port".
 func (b *netBind) ParseEndpoint(s string) (conn.Endpoint, error) {
-	ap, err := netip.ParseAddrPort(s)
-	if err != nil {
-		return nil, fmt.Errorf("wireguard: parse endpoint %q: %w", s, err)
-	}
-	return &conn.StdNetEndpoint{AddrPort: netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())}, nil
+	return wgtun.ParseEndpoint(s)
 }
 
 // BatchSize returns 1, because a UDP endpoint of the stack reads one datagram

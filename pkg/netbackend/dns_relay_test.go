@@ -28,10 +28,25 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+)
+
+const (
+	dnsHeaderSize = 12
+	dnsTypeA      = uint16(dnsmessage.TypeA)
+	dnsTypeAAAA   = uint16(dnsmessage.TypeAAAA)
+	dnsClassIN    = uint16(dnsmessage.ClassINET)
+	dnsFlagQR     = 1 << 15
+	dnsFlagTC     = 1 << 9
+	dnsRCodeNoErr = dnsmessage.RCodeSuccess
+	dnsRCodeFmt   = dnsmessage.RCodeFormatError
+	dnsRCodeSrv   = dnsmessage.RCodeServerFailure
+	dnsRCodeNX    = dnsmessage.RCodeNameError
+	dnsRCodeRefus = dnsmessage.RCodeRefused
 )
 
 // buildDNSQuery returns a standard query with recursion desired.
@@ -41,34 +56,55 @@ func buildDNSQuery(id uint16, name string, qtype uint16) []byte {
 		q = append(q, byte(len(label)))
 		q = append(q, label...)
 	}
-	return append(q, 0x00, byte(qtype>>8), byte(qtype), 0x00, dnsClassIN)
+	return append(q, 0x00, byte(qtype>>8), byte(qtype), 0x00, byte(dnsClassIN))
 }
 
-func dnsRCode(resp []byte) uint16 { return binary.BigEndian.Uint16(resp[2:4]) & dnsRCodeMask }
+func dnsRCode(resp []byte) dnsmessage.RCode {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(resp)
+	if err != nil {
+		return 0
+	}
+	return hdr.RCode
+}
 
-// answerIPs returns the A and AAAA addresses in the answer section of a
-// response that uses name compression only for the owner name.
+// answerIPs returns the A and AAAA addresses in the answer section of a response.
 func answerIPs(t *testing.T, resp []byte) []netip.Addr {
 	t.Helper()
-	if len(resp) < dnsHeaderSize {
-		t.Fatalf("short DNS response: %x", resp)
+	var p dnsmessage.Parser
+	if _, err := p.Start(resp); err != nil {
+		t.Fatalf("parse response header: %v", err)
 	}
-	q, err := parseDNSQuestion(resp, dnsHeaderSize)
-	if err != nil {
-		t.Fatalf("parse response question: %v", err)
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("skip response questions: %v", err)
 	}
-	off := q.endOff
 	var out []netip.Addr
-	for range binary.BigEndian.Uint16(resp[6:8]) {
-		off += 2 + 2 + 2 + 4 // name pointer, type, class, TTL
-		rdLen := int(binary.BigEndian.Uint16(resp[off : off+2]))
-		off += 2
-		addr, ok := netip.AddrFromSlice(resp[off : off+rdLen])
-		if !ok {
-			t.Fatalf("bad RDATA length %d", rdLen)
+	for {
+		hdr, err := p.AnswerHeader()
+		if errors.Is(err, dnsmessage.ErrSectionDone) {
+			break
 		}
-		out = append(out, addr)
-		off += rdLen
+		if err != nil {
+			t.Fatalf("parse answer header: %v", err)
+		}
+		switch hdr.Type {
+		case dnsmessage.TypeA:
+			r, err := p.AResource()
+			if err != nil {
+				t.Fatalf("parse A resource: %v", err)
+			}
+			out = append(out, netip.AddrFrom4(r.A))
+		case dnsmessage.TypeAAAA:
+			r, err := p.AAAAResource()
+			if err != nil {
+				t.Fatalf("parse AAAA resource: %v", err)
+			}
+			out = append(out, netip.AddrFrom16(r.AAAA))
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				t.Fatalf("skip answer: %v", err)
+			}
+		}
 	}
 	return out
 }
@@ -178,23 +214,22 @@ func startFakeDNSServer(t *testing.T, handler dnsHandler) *fakeDNSServer {
 // answerWith returns a handler that answers every A query with ip.
 func answerWith(ip string) dnsHandler {
 	return func(req []byte, _ bool) []byte {
-		q, err := parseDNSQuestion(req, dnsHeaderSize)
+		reqHdr, q, _, err := parseDNSQuery(req)
 		if err != nil {
 			return nil
 		}
-		return buildDNSAddressResponse(binary.BigEndian.Uint16(req[0:2]), binary.BigEndian.Uint16(req[2:4]),
-			req[dnsHeaderSize:q.endOff], q.qtype, []netip.Addr{netip.MustParseAddr(ip)})
+		return buildDNSAddressResponse(reqHdr, q, []netip.Addr{netip.MustParseAddr(ip)})
 	}
 }
 
 // rcodeResponse returns a handler that answers every query with rcode.
-func rcodeResponse(rcode uint16) dnsHandler {
+func rcodeResponse(rcode dnsmessage.RCode) dnsHandler {
 	return func(req []byte, _ bool) []byte {
-		q, err := parseDNSQuestion(req, dnsHeaderSize)
+		reqHdr, q, _, err := parseDNSQuery(req)
 		if err != nil {
 			return nil
 		}
-		return buildDNSErrorResponse(binary.BigEndian.Uint16(req[0:2]), binary.BigEndian.Uint16(req[2:4]), req[dnsHeaderSize:q.endOff], rcode)
+		return buildDNSErrorResponse(reqHdr, &q, rcode)
 	}
 }
 
@@ -671,18 +706,17 @@ func TestDNSRelayRandomizesUpstreamTXIDAndRejectsQuestionMismatch(t *testing.T) 
 		}
 		req := buf[:n]
 		upID := binary.BigEndian.Uint16(req[0:2])
-		flags := binary.BigEndian.Uint16(req[2:4])
 
-		wrongName := buildDNSQuery(upID, "evil.example.test", dnsTypeA)
-		spoofName := buildDNSAddressResponse(upID, flags, wrongName[dnsHeaderSize:], dnsTypeA, []netip.Addr{netip.MustParseAddr("6.6.6.1")})
+		wrongNameHdr, wrongNameQ, _, _ := parseDNSQuery(buildDNSQuery(upID, "evil.example.test", dnsTypeA))
+		spoofName := buildDNSAddressResponse(wrongNameHdr, wrongNameQ, []netip.Addr{netip.MustParseAddr("6.6.6.1")})
 		_, _ = pc.WriteTo(spoofName, from)
 
-		wrongType := buildDNSQuery(upID, "target.example.test", dnsTypeAAAA)
-		spoofType := buildDNSAddressResponse(upID, flags, wrongType[dnsHeaderSize:], dnsTypeAAAA, []netip.Addr{netip.MustParseAddr("2001:db8::6")})
+		wrongTypeHdr, wrongTypeQ, _, _ := parseDNSQuery(buildDNSQuery(upID, "target.example.test", dnsTypeAAAA))
+		spoofType := buildDNSAddressResponse(wrongTypeHdr, wrongTypeQ, []netip.Addr{netip.MustParseAddr("2001:db8::6")})
 		_, _ = pc.WriteTo(spoofType, from)
 
-		upperCase := buildDNSQuery(upID, "TARGET.EXAMPLE.TEST", dnsTypeA)
-		valid := buildDNSAddressResponse(upID, flags, upperCase[dnsHeaderSize:], dnsTypeA, []netip.Addr{netip.MustParseAddr("198.51.100.99")})
+		upperHdr, upperQ, _, _ := parseDNSQuery(buildDNSQuery(upID, "TARGET.EXAMPLE.TEST", dnsTypeA))
+		valid := buildDNSAddressResponse(upperHdr, upperQ, []netip.Addr{netip.MustParseAddr("198.51.100.99")})
 		_, _ = pc.WriteTo(valid, from)
 	}()
 
@@ -1019,5 +1053,83 @@ func TestDNSRelaySemaphoreCancellationSkipsUpstream(t *testing.T) {
 	}
 	if srv.queries.Load() != 0 {
 		t.Fatalf("upstream saw %d queries after saturated TCP DNS cancellation, want 0", srv.queries.Load())
+	}
+}
+
+func TestDNSRelayForwardsCNAMEAndPTRAnswersFromUpstream(t *testing.T) {
+	srv := startFakeDNSServer(t, func(req []byte, _ bool) []byte {
+		reqHdr, q, _, err := parseDNSQuery(req)
+		if err != nil {
+			return nil
+		}
+		b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+			ID:                 reqHdr.ID,
+			Response:           true,
+			RecursionDesired:   reqHdr.RecursionDesired,
+			RecursionAvailable: true,
+			RCode:              dnsmessage.RCodeSuccess,
+		})
+		b.EnableCompression()
+		if err := b.StartQuestions(); err != nil {
+			return nil
+		}
+		if err := b.Question(q); err != nil {
+			return nil
+		}
+		if err := b.StartAnswers(); err != nil {
+			return nil
+		}
+		switch q.Type {
+		case dnsmessage.TypeA:
+			target := dnsmessage.MustNewName("target.example.test.")
+			_ = b.CNAMEResource(dnsmessage.ResourceHeader{
+				Name:  q.Name,
+				Type:  dnsmessage.TypeCNAME,
+				Class: dnsmessage.ClassINET,
+				TTL:   60,
+			}, dnsmessage.CNAMEResource{CNAME: target})
+			_ = b.AResource(dnsmessage.ResourceHeader{
+				Name:  target,
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+				TTL:   60,
+			}, dnsmessage.AResource{A: [4]byte{198, 51, 100, 88}})
+		case dnsmessage.TypePTR:
+			_ = b.PTRResource(dnsmessage.ResourceHeader{
+				Name:  q.Name,
+				Type:  dnsmessage.TypePTR,
+				Class: dnsmessage.ClassINET,
+				TTL:   60,
+			}, dnsmessage.PTRResource{PTR: dnsmessage.MustNewName("ptr.example.test.")})
+		}
+		out, err := b.Finish()
+		if err != nil {
+			return nil
+		}
+		return out
+	})
+	nf := newTestForwarder(t, NATConfig{}, srv.addr)
+
+	respA := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x2222, "alias.example.test", dnsTypeA))
+	if got := answerIPs(t, respA); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.88")}) {
+		t.Fatalf("CNAME+A answerIPs = %v, want [198.51.100.88]", got)
+	}
+
+	respPTR := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x3333, "88.100.51.198.in-addr.arpa", uint16(dnsmessage.TypePTR)))
+	var p dnsmessage.Parser
+	hdr, err := p.Start(respPTR)
+	if err != nil || hdr.ID != 0x3333 || hdr.RCode != dnsmessage.RCodeSuccess {
+		t.Fatalf("PTR response header = %+v, err = %v", hdr, err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("SkipAllQuestions: %v", err)
+	}
+	ansHdr, err := p.AnswerHeader()
+	if err != nil || ansHdr.Type != dnsmessage.TypePTR {
+		t.Fatalf("AnswerHeader = %+v, err = %v", ansHdr, err)
+	}
+	ptrRes, err := p.PTRResource()
+	if err != nil || ptrRes.PTR.String() != "ptr.example.test." {
+		t.Fatalf("PTRResource = %+v, err = %v", ptrRes, err)
 	}
 }

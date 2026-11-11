@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
@@ -40,31 +41,10 @@ const (
 	// DefaultDNSPort is the standard UDP and TCP port for the virtual DNS relay.
 	DefaultDNSPort = 53
 
-	dnsHeaderSize = 12
-	dnsTypeA      = 1
-	dnsTypeAAAA   = 28
-	dnsClassIN    = 1
-
-	dnsFlagQR     = 1 << 15
-	dnsFlagAA     = 1 << 10
-	dnsFlagTC     = 1 << 9
-	dnsFlagRD     = 1 << 8
-	dnsFlagRA     = 1 << 7
-	dnsRCodeMask  = 0xf
-	dnsRCodeNoErr = 0
-	dnsRCodeFmt   = 1
-	dnsRCodeSrv   = 2
-	dnsRCodeNX    = 3
-	dnsRCodeRefus = 5
-
 	defaultDNSTTL = 60
 
 	// maxDNSMessage is the largest DNS message that a UDP or TCP exchange carries.
 	maxDNSMessage = 65535
-
-	// maxDNSNameWireLen is the RFC 1035 maximum wire length of a domain name,
-	// including label length octets and the terminating root octet.
-	maxDNSNameWireLen = 255
 
 	// maxConcurrentDNS bounds concurrent in-flight DNS queries per endpoint.
 	maxConcurrentDNS = 64
@@ -77,13 +57,6 @@ var (
 	dnsGatewayAddr = netip.MustParseAddr(HostGatewayIPv4)
 	dnsGuestAddr   = netip.MustParseAddr(DefaultGuestIPv4)
 )
-
-type dnsQuestion struct {
-	name   string
-	qtype  uint16
-	qclass uint16
-	endOff int
-}
 
 func (nf *NATForwarder) dnsSemaphore() chan struct{} {
 	nf.mu.Lock()
@@ -269,41 +242,34 @@ func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) (
 }
 
 func (r dnsRelay) answerQuery(ctx context.Context, req []byte) []byte {
-	if len(req) < dnsHeaderSize {
+	reqHdr, q, hdrOK, err := parseDNSQuery(req)
+	if !hdrOK {
 		return nil
 	}
-	txID := binary.BigEndian.Uint16(req[0:2])
-	reqFlags := binary.BigEndian.Uint16(req[2:4])
-	qdCount := binary.BigEndian.Uint16(req[4:6])
-	if qdCount == 0 {
-		return buildDNSErrorResponse(txID, reqFlags, nil, dnsRCodeFmt)
-	}
-
-	q, err := parseDNSQuestion(req, dnsHeaderSize)
 	if err != nil {
-		return buildDNSErrorResponse(txID, reqFlags, nil, dnsRCodeFmt)
+		return buildDNSErrorResponse(reqHdr, nil, dnsmessage.RCodeFormatError)
 	}
-	rawQuestion := req[dnsHeaderSize:q.endOff]
+	name := q.Name.String()
 
-	if q.qclass == dnsClassIN && (q.qtype == dnsTypeA || q.qtype == dnsTypeAAAA) {
-		addrs, found, handled, lookupErr := r.lookupLocalAddrs(ctx, q.name)
+	if q.Class == dnsmessage.ClassINET && (q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA) {
+		addrs, found, handled, lookupErr := r.lookupLocalAddrs(ctx, name)
 		if lookupErr != nil && r.log != nil {
-			r.log.Debug("netbackend: DNS lookup hook failed", "name", q.name, "error", lookupErr)
+			r.log.Debug("netbackend: DNS lookup hook failed", "name", name, "error", lookupErr)
 		}
 		if handled {
 			if !found {
-				return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeNX)
+				return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
 			}
-			return buildDNSAddressResponse(txID, reqFlags, rawQuestion, q.qtype, addrs)
+			return buildDNSAddressResponse(reqHdr, q, addrs)
 		}
 	}
 
 	resp, err := r.forwardRawUpstream(ctx, req)
 	if err != nil {
 		if r.log != nil {
-			r.log.Debug("netbackend: forward DNS query", "name", q.name, "error", err)
+			r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
 		}
-		return buildDNSErrorResponse(txID, reqFlags, rawQuestion, dnsRCodeSrv)
+		return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure)
 	}
 	return resp
 }
@@ -386,12 +352,9 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 	if len(r.servers) == 0 {
 		return nil, errNoDNSServers
 	}
-	if len(req) < dnsHeaderSize || binary.BigEndian.Uint16(req[4:6]) == 0 {
-		return nil, errors.New("netbackend: invalid DNS query header")
-	}
-	wantQ, err := parseDNSQuestion(req, dnsHeaderSize)
+	reqHdr, wantQ, _, err := parseDNSQuery(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("netbackend: invalid DNS query: %w", err)
 	}
 	var errs []error
 	for _, server := range r.servers {
@@ -399,17 +362,17 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			resp, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
-			if err == nil && binary.BigEndian.Uint16(resp[2:4])&dnsFlagTC != 0 {
-				resp, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+			resp, respHdr, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+			if err == nil && respHdr.Truncated {
+				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
 			}
 			if err != nil {
 				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
 				continue
 			}
-			switch binary.BigEndian.Uint16(resp[2:4]) & dnsRCodeMask {
-			case dnsRCodeSrv, dnsRCodeRefus:
-				errs = append(errs, fmt.Errorf("server %s: rcode %d", server, binary.BigEndian.Uint16(resp[2:4])&dnsRCodeMask))
+			switch respHdr.RCode {
+			case dnsmessage.RCodeServerFailure, dnsmessage.RCodeRefused:
+				errs = append(errs, fmt.Errorf("server %s: rcode %v", server, respHdr.RCode))
 				continue
 			}
 			return resp, nil
@@ -418,11 +381,10 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
-func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, wantQ dnsQuestion, timeout time.Duration) ([]byte, error) {
-	guestTxID := binary.BigEndian.Uint16(req[0:2])
+func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, guestTxID uint16, wantQ dnsmessage.Question, timeout time.Duration) ([]byte, dnsmessage.Header, error) {
 	upstreamTxID, err := randomDNSTxID()
 	if err != nil {
-		return nil, err
+		return nil, dnsmessage.Header{}, err
 	}
 	upstreamReq := append([]byte(nil), req...)
 	binary.BigEndian.PutUint16(upstreamReq[0:2], upstreamTxID)
@@ -431,13 +393,13 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 	defer cancel()
 	conn, err := dial(ctx, network, server)
 	if err != nil {
-		return nil, err
+		return nil, dnsmessage.Header{}, err
 	}
 	defer conn.Close()
 	// The deadline also bounds the read and write calls below.
 	deadline, _ := ctx.Deadline()
 	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, err
+		return nil, dnsmessage.Header{}, err
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
@@ -447,38 +409,39 @@ func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, net
 		binary.BigEndian.PutUint16(framed[0:2], uint16(len(upstreamReq)))
 		copy(framed[2:], upstreamReq)
 		if _, err := conn.Write(framed); err != nil {
-			return nil, err
+			return nil, dnsmessage.Header{}, err
 		}
 		var lenBuf [2]byte
 		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			return nil, err
+			return nil, dnsmessage.Header{}, err
 		}
 		resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
 		if _, err := io.ReadFull(conn, resp); err != nil {
-			return nil, err
+			return nil, dnsmessage.Header{}, err
 		}
-		if !validDNSResponse(resp, upstreamTxID, wantQ) {
-			return nil, errors.New("invalid DNS response")
+		respHdr, ok := parseDNSResponse(resp, upstreamTxID, wantQ)
+		if !ok {
+			return nil, dnsmessage.Header{}, errors.New("invalid DNS response")
 		}
 		binary.BigEndian.PutUint16(resp[0:2], guestTxID)
-		return resp, nil
+		return resp, respHdr, nil
 	}
 
 	if _, err := conn.Write(upstreamReq); err != nil {
-		return nil, err
+		return nil, dnsmessage.Header{}, err
 	}
 	buf := make([]byte, maxDNSMessage)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			return nil, err
+			return nil, dnsmessage.Header{}, err
 		}
 		// A connected UDP socket accepts datagrams from the server only. The
 		// ID and question checks drop late or mismatched answers on a reused port.
-		if validDNSResponse(buf[:n], upstreamTxID, wantQ) {
+		if respHdr, ok := parseDNSResponse(buf[:n], upstreamTxID, wantQ); ok {
 			resp := append([]byte(nil), buf[:n]...)
 			binary.BigEndian.PutUint16(resp[0:2], guestTxID)
-			return resp, nil
+			return resp, respHdr, nil
 		}
 	}
 }
@@ -642,105 +605,105 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 	}
 }
 
-func validDNSResponse(msg []byte, txID uint16, wantQ dnsQuestion) bool {
-	if len(msg) < dnsHeaderSize ||
-		binary.BigEndian.Uint16(msg[0:2]) != txID ||
-		binary.BigEndian.Uint16(msg[2:4])&dnsFlagQR == 0 ||
-		binary.BigEndian.Uint16(msg[4:6]) != 1 {
-		return false
-	}
-	gotQ, err := parseDNSQuestion(msg, dnsHeaderSize)
+func parseDNSQuery(msg []byte) (dnsmessage.Header, dnsmessage.Question, bool, error) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(msg)
 	if err != nil {
-		return false
+		return dnsmessage.Header{}, dnsmessage.Question{}, false, err
 	}
-	return strings.EqualFold(gotQ.name, wantQ.name) &&
-		gotQ.qtype == wantQ.qtype &&
-		gotQ.qclass == wantQ.qclass
+	q, err := p.Question()
+	if err != nil {
+		return hdr, dnsmessage.Question{}, true, err
+	}
+	return hdr, q, true, nil
 }
 
-func parseDNSQuestion(msg []byte, offset int) (dnsQuestion, error) {
-	var labels []string
-	cur := offset
-	for {
-		if cur >= len(msg) {
-			return dnsQuestion{}, errors.New("truncated DNS label")
-		}
-		length := int(msg[cur])
-		cur++
-		if cur-offset > maxDNSNameWireLen {
-			return dnsQuestion{}, errors.New("DNS name exceeds 255 bytes")
-		}
-		if length == 0 {
-			break
-		}
-		if (length & 0xc0) != 0 {
-			return dnsQuestion{}, errors.New("compressed label in question not supported")
-		}
-		if cur+length > len(msg) {
-			return dnsQuestion{}, errors.New("DNS label exceeds packet")
-		}
-		if cur+length-offset > maxDNSNameWireLen {
-			return dnsQuestion{}, errors.New("DNS name exceeds 255 bytes")
-		}
-		labels = append(labels, string(msg[cur:cur+length]))
-		cur += length
+func parseDNSResponse(msg []byte, wantID uint16, wantQ dnsmessage.Question) (dnsmessage.Header, bool) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(msg)
+	if err != nil || !hdr.Response || hdr.ID != wantID {
+		return dnsmessage.Header{}, false
 	}
-	if cur+4 > len(msg) {
-		return dnsQuestion{}, errors.New("truncated DNS question fields")
+	gotQ, err := p.Question()
+	if err != nil {
+		return dnsmessage.Header{}, false
 	}
-	qtype := binary.BigEndian.Uint16(msg[cur : cur+2])
-	qclass := binary.BigEndian.Uint16(msg[cur+2 : cur+4])
-	cur += 4
-	return dnsQuestion{
-		name:   strings.Join(labels, "."),
-		qtype:  qtype,
-		qclass: qclass,
-		endOff: cur,
-	}, nil
+	if _, err := p.Question(); !errors.Is(err, dnsmessage.ErrSectionDone) {
+		return dnsmessage.Header{}, false
+	}
+	if !strings.EqualFold(gotQ.Name.String(), wantQ.Name.String()) ||
+		gotQ.Type != wantQ.Type ||
+		gotQ.Class != wantQ.Class {
+		return dnsmessage.Header{}, false
+	}
+	return hdr, true
 }
 
-func buildDNSErrorResponse(txID, reqFlags uint16, rawQuestion []byte, rcode uint16) []byte {
-	resp := make([]byte, dnsHeaderSize+len(rawQuestion))
-	binary.BigEndian.PutUint16(resp[0:2], txID)
-	flags := uint16(dnsFlagQR | dnsFlagRA | (reqFlags & dnsFlagRD) | (rcode & 0xf))
-	binary.BigEndian.PutUint16(resp[2:4], flags)
-	if len(rawQuestion) > 0 {
-		binary.BigEndian.PutUint16(resp[4:6], 1)
-		copy(resp[dnsHeaderSize:], rawQuestion)
+func buildDNSErrorResponse(reqHdr dnsmessage.Header, q *dnsmessage.Question, rcode dnsmessage.RCode) []byte {
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 reqHdr.ID,
+		Response:           true,
+		RecursionDesired:   reqHdr.RecursionDesired,
+		RecursionAvailable: true,
+		RCode:              rcode,
+	})
+	b.EnableCompression()
+	if q != nil {
+		if err := b.StartQuestions(); err != nil {
+			return nil
+		}
+		if err := b.Question(*q); err != nil {
+			return nil
+		}
 	}
-	return resp
+	out, err := b.Finish()
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
-func buildDNSAddressResponse(txID, reqFlags uint16, rawQuestion []byte, qtype uint16, addrs []netip.Addr) []byte {
-	var matched []netip.Addr
+func buildDNSAddressResponse(reqHdr dnsmessage.Header, q dnsmessage.Question, addrs []netip.Addr) []byte {
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 reqHdr.ID,
+		Response:           true,
+		Authoritative:      true,
+		RecursionDesired:   reqHdr.RecursionDesired,
+		RecursionAvailable: true,
+		RCode:              dnsmessage.RCodeSuccess,
+	})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		return nil
+	}
+	if err := b.Question(q); err != nil {
+		return nil
+	}
+	if err := b.StartAnswers(); err != nil {
+		return nil
+	}
+	hdr := dnsmessage.ResourceHeader{
+		Name:  q.Name,
+		Type:  q.Type,
+		Class: dnsmessage.ClassINET,
+		TTL:   defaultDNSTTL,
+	}
 	for _, a := range addrs {
 		unmapped := a.Unmap()
-		if qtype == dnsTypeA && unmapped.Is4() {
-			matched = append(matched, unmapped)
-		} else if qtype == dnsTypeAAAA && unmapped.Is6() {
-			matched = append(matched, unmapped)
+		switch {
+		case q.Type == dnsmessage.TypeA && unmapped.Is4():
+			if err := b.AResource(hdr, dnsmessage.AResource{A: unmapped.As4()}); err != nil {
+				return nil
+			}
+		case q.Type == dnsmessage.TypeAAAA && unmapped.Is6():
+			if err := b.AAAAResource(hdr, dnsmessage.AAAAResource{AAAA: unmapped.As16()}); err != nil {
+				return nil
+			}
 		}
 	}
-
-	out := make([]byte, dnsHeaderSize, dnsHeaderSize+len(rawQuestion)+len(matched)*28)
-	binary.BigEndian.PutUint16(out[0:2], txID)
-	flags := uint16(dnsFlagQR | dnsFlagAA | dnsFlagRA | (reqFlags & dnsFlagRD) | dnsRCodeNoErr)
-	binary.BigEndian.PutUint16(out[2:4], flags)
-	binary.BigEndian.PutUint16(out[4:6], 1) // QDCOUNT
-	binary.BigEndian.PutUint16(out[6:8], uint16(len(matched)))
-	out = append(out, rawQuestion...)
-
-	for _, addr := range matched {
-		// Pointer to QNAME at offset 12 (0xc00c).
-		var rrHdr [12]byte
-		binary.BigEndian.PutUint16(rrHdr[0:2], 0xc00c)
-		binary.BigEndian.PutUint16(rrHdr[2:4], qtype)
-		binary.BigEndian.PutUint16(rrHdr[4:6], dnsClassIN)
-		binary.BigEndian.PutUint32(rrHdr[6:10], defaultDNSTTL)
-		rawIP := addr.AsSlice()
-		binary.BigEndian.PutUint16(rrHdr[10:12], uint16(len(rawIP)))
-		out = append(out, rrHdr[:]...)
-		out = append(out, rawIP...)
+	out, err := b.Finish()
+	if err != nil {
+		return nil
 	}
 	return out
 }
