@@ -14,9 +14,9 @@
 
 // Package hostlockdown applies irreversible host OS self-containment to the
 // current process after all required host handles are open. Windows uses a
-// restricted token, Low integrity, a job object and no win32k. macOS uses a
-// Seatbelt profile and RLIMIT_NPROC=0. A host mount is a directory or one
-// regular file.
+// restricted thread token, an Untrusted primary token, a job object, and no
+// win32k. macOS uses a Seatbelt profile and RLIMIT_NPROC=0. A host mount is a
+// directory or one regular file.
 package hostlockdown
 
 import (
@@ -42,8 +42,8 @@ var ErrNotLockedDown = errors.New("hostlockdown: Apply has not succeeded")
 // sibling files of a file mount stay closed by path.
 type HostMount struct {
 	// Path is the host directory, or the host file when File is true. It must
-	// exist when Apply runs. The root of a file system, such as "/" or "C:\",
-	// is refused.
+	// exist when Apply runs. Apply refuses the root of a file system, such as
+	// "/" or "C:\".
 	Path string
 
 	// ReadOnly limits the locked process to read access to Path and, for a
@@ -51,7 +51,7 @@ type HostMount struct {
 	ReadOnly bool
 
 	// File marks Path as one regular file. Apply refuses the mount when Path
-	// is not a regular file. A symbolic link to a regular file is allowed.
+	// is not a regular file. Apply accepts a symbolic link to a regular file.
 	// The lockdown does not allow access to the parent directory by path.
 	File bool
 }
@@ -59,8 +59,8 @@ type HostMount struct {
 // Options configures the host OS lockdown boundary.
 type Options struct {
 	// Mounts lists the host directories and files that the locked process
-	// may open. Duplicate and nested entries are allowed. A file mount below
-	// a directory mount is allowed. The lockdown only adds allow rules, so a
+	// may open. Apply accepts duplicate and nested entries, including a file
+	// mount below a directory mount. The lockdown only adds allow rules, so a
 	// path is writable when any entry that covers it is writable.
 	Mounts []HostMount
 
@@ -70,10 +70,16 @@ type Options struct {
 	// OutboundUDPPorts is empty.
 	AllowOutboundNet bool
 
+	// PreboundListeners counts pre-bound stream listeners that call
+	// AcceptListener while AllowOutboundNet is true. Windows pre-warms at
+	// least this many locked accept-broker threads before closing the broker
+	// token handle.
+	PreboundListeners int
+
 	// OutboundUDPPorts lists remote UDP ports that pre-bound UDP sockets may
 	// send to and receive from. The -net=wg backend sets the WireGuard peer
 	// port here. Seatbelt can match remote ports but not remote addresses.
-	// Ignored when AllowOutboundNet is true.
+	// Apply ignores OutboundUDPPorts when AllowOutboundNet is true.
 	OutboundUDPPorts []uint16
 
 	// CPUQuotaMillis caps the CPU time of the process, in thousandths of a CPU.
@@ -108,8 +114,9 @@ type Status struct {
 
 	// UnboundFileOpenBlocked reports that opens outside every mount fail.
 	// macOS: probe opens failed in the whole process. Windows: probe opens
-	// failed on a thread that holds the restricted token, so only threads
-	// that call BindThread have this property. Linux: the seccomp filter
+	// failed under the NULL_SID restricted token attached to process threads
+	// and maintained by BindThread and the background thread sweeper; mounted
+	// files open only through the sealed pinned-root file broker. Linux: the seccomp filter
 	// rejects every open when no mount exists. With a mount, the filter
 	// rejects opens relative to the working directory but must allow opens
 	// relative to a directory descriptor, and seccomp cannot read the path. An
@@ -122,10 +129,10 @@ type Status struct {
 	// OS that has no such cap. Windows reads the cap back from the job.
 	CPUQuotaEnforced bool
 
-	// IntegrityDowngraded reports a Low integrity primary token. Windows only.
+	// IntegrityDowngraded reports an Untrusted integrity primary token. Windows only.
 	IntegrityDowngraded bool
 
-	// Win32kBlocked reports that win32k system calls are disabled. Windows only.
+	// Win32kBlocked reports that the process mitigation policy blocks win32k system calls. Windows only.
 	Win32kBlocked bool
 
 	// NetworkOutboundBlocked reports that a self-probe observed a rejected

@@ -595,11 +595,11 @@ On APFS, a lookup that misses the exact name falls back to the NFC form of the n
 
 #### Single-File Mount (Descriptive Module)
 
-`OpenWorkspace` accepts the path of a regular file. It resolves links in the path, pins the parent directory with `os.OpenRoot`, and remembers the stored name of the file. The root of the mounted filesystem is that file. The guest sees no other name of the parent directory. The lockdown grants the one file only: a Seatbelt `literal` rule on macOS. On Windows it puts a Low-integrity label and an ACL entry on the file. It also adds one non-inherited `FILE_TRAVERSE` entry for the logon SID to the parent directory. The restricted token lacks `SeChangeNotifyPrivilege`, so a relative open through the pinned parent needs that right. The entry gives no listing and no creation, and no sibling gains access, because each sibling keeps its own ACL.
+`OpenWorkspace` accepts the path of a regular file. It resolves links in the path, pins the parent directory with `os.OpenRoot`, and stores the exact file name. The root of the mounted filesystem is that file, so the guest sees no sibling entry. Seatbelt grants a `literal` rule for that file on macOS. On Windows, the sealed file broker authorizes opens for that stored name only and modifies no host ACL or label.
 
 The mode writes no `.gvx_meta`, because the parent directory belongs to the user. The mode, the owner, and the extended attributes that the guest sets stay in memory and reset at the next start. A change of the times reaches the host file. The guest mount point is an empty regular file. A `unlink` or a `rename` of the mount point returns `EBUSY`, because the mount point lies in the outer filesystem. A `link` to the file returns `EXDEV`.
 
-On Windows, the mode does not call `GetFinalPathNameByHandle` for the bound file. That call reads the parent directory, which needs a list right that the mode does not grant. `OpenWorkspace` finds the stored name of the file before the lockdown instead. The volume numbers come from `NtQueryVolumeInformationFile` on the pinned parent handle, which needs no path. Only a failure of that call falls back to a path query.
+On Windows, single-file mode never calls `GetFinalPathNameByHandle` on the bound file after the lockdown. `OpenWorkspace` resolves the stored name before the lockdown instead. `NtQueryVolumeInformationFile` reads the volume numbers from the pinned parent handle without a path query.
 
 A host editor can replace the file with an atomic rename. Each fresh open resolves the stored name again and reaches the new file. A file description that is open keeps its handle and so keeps the old file. The host watcher polls the one file by name in this mode.
 
@@ -806,7 +806,7 @@ A volume file is untrusted input. `isValidDataBlock` rejects every block that ov
 stateDiagram-v2
     [*] --> PreInit: Launch rungv or pkg/gvx (Unprivileged User Account)
     PreInit --> HandlesOpen: Open Hypervisor (WHPX/HVF) or Pre-Spawn systrap Stub, .erofs Layers, Sockets, and /workspace os.Root
-    HandlesOpen --> WinLockdown: Windows: In-Place SE_PRIVILEGE_REMOVED + Low Integrity + Deny-Only SID + JobObject + NoWin32k
+    HandlesOpen --> WinLockdown: Windows: Pinned Broker + SE_PRIVILEGE_REMOVED + NULL_SID Token + JobObject + NoWin32k
     HandlesOpen --> MacLockdown: macOS: sandbox_init Seatbelt Profile (deny process-fork/exec/file-*) + RLIMIT_NPROC=0
     HandlesOpen --> LinuxLockdown: Linux: PR_SET_NO_NEW_PRIVS + seccomp allowlist of the runsc Sentry on every thread (other calls kill the process)
     WinLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
@@ -821,14 +821,20 @@ Execute these steps in `lockdown_windows.go` before starting virtual processor o
 > [!IMPORTANT]
 > Open the WHPX partition handle (or pre-spawn the `systrap` stub subprocess and `sysmsg` mapping), cached `.erofs` layer handles, `-p` host listeners, the `-net=wg` UDP socket, and `/workspace` `os.Root` before calling `hostlockdown.Apply()`. Once `hostlockdown.Apply()` locks down the process token and sets `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, the Windows kernel rejects new host file opens and child processes.
 
-1. Apply an inheritable Low-Integrity ACE (`S-1-16-4096`) to bound `/workspace` paths and a non-inherited `FILE_TRAVERSE` entry to single-file mount parents.
-2. Restrict the default DACL on the live primary process token (`restrictPrimaryTokenDACL`) to deny unbound host file creation.
-3. Open the live primary process token (`OpenProcessToken`) and call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete privileges in-place.
-4. Create a `DISABLE_MAX_PRIVILEGE` restricted impersonation token at `Low` integrity (`S-1-16-4096`) with `SE_GROUP_USE_FOR_DENY_ONLY` and bind it to runtime threads via `SetThreadToken`.
-5. Install the Winsock outbound hook when `-net=none` or `-net=wg` blocks direct host socket connections and listeners.
-6. Create an anonymous Job Object with `CreateJobObjectW` and assign the current process via `AssignProcessToJobObject`.
-7. Set `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, and `JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_READCLIPBOARD | JOB_OBJECT_UILIMIT_WRITECLIPBOARD` on the Job Object.
-8. Call `SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy, ...)` with `DisallowWin32kSystemCalls = 1` to block `win32kfull.sys` system calls.
+1. Update `TokenDefaultDacl` on the live primary token so unnamed kernel objects admit `NULL_SID`.
+2. Pin directory and single-file mount handles in memory without modifying any NTFS security descriptor.
+3. Call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete all privileges from the primary token.
+4. Start the locked file-broker and thread-sweeper OS threads before lowering the primary token.
+5. Start the locked Low-integrity socket-broker worker pool when `-net=nat` enables outbound host connections.
+6. Create an Untrusted restricted token with `NULL_SID` to verify that unlisted opens and raw sockets fail.
+7. Assign the current process to a Job Object with `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and UI restrictions.
+8. Call `SetProcessMitigationPolicy` with `DisallowWin32kSystemCalls = 1` to block `win32kfull.sys` system calls.
+9. Lower the primary token to Untrusted integrity after binding pre-warmed Go runtime threads to the restricted token.
+10. Activate the background thread sweeper so later Go runtime OS threads receive the restricted token.
+
+#### Windows Lockdown Limits (Descriptive Module)
+
+Windows applies `RestrictedSids` on thread impersonation tokens because `CreateProcessAsUser` cannot replace a live process token. Host code inside the Sentry process could call `SetThreadToken(nil, 0)` to drop its thread token and revert to the primary token. Lowering the primary token to Untrusted integrity (`S-1-16-0`) blocks raw Winsock endpoints, `NO_READ_UP` reads, and Low or Medium writes after revert. Hardware page tables in `platform/whpx` and separate stub processes in `platform/systrap` prevent guest code from invoking host APIs.
 
 #### macOS Lockdown Sequence (`lockdown_darwin.go`) (Procedural Module)
 
@@ -1041,7 +1047,7 @@ A guest must never see or change the state of another sandbox. State of the host
 | `seccheck.Global`, `nftables.enableNFTables`, `afsSyscallPanic`, `gofer.globalDentryCache`, `netfilter.chainCounter`, the plugin network stack, and the RDMA snapshot | Sentry packages | The `runsc` boot code sets them, and `gvx` never does. Do not set them in a process that runs more than one sandbox. |
 | `tcpip.AsyncLoading`, `hostinet.restoredListeners`, `state.previousMetadata` | `tcpip`, `socket/hostinet`, `state` | Only save and restore use them, and `gvx` has no save or restore. |
 | `hostfs` budget of watched objects (`processWatches`) | `fsimpl/hostfs` | The descriptors belong to the host process. All workspaces draw from one budget (section 3.7). |
-| `seccompNotifyBusy`, `hostlockdown` state, `tuning` registry, the log target | `platform/systrap`, `pkg/hostlockdown`, `pkg/gvx` | They describe a host fact, a one-way lockdown of the process, or a table that never changes. |
+| `seccompNotifyBusy`, `hostlockdown` state, `fd.installedBroker` and `fd.installedBinder`, `tuning` registry, the log target | `platform/systrap`, `pkg/hostlockdown`, `pkg/fd`, `pkg/gvx` | They describe a host fact, a one-way lockdown of the process, or a table that never changes. |
 
 Each row of the next table is state that a guest can read or limit. Each kernel owns it, through one of three keys.
 

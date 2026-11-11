@@ -53,8 +53,8 @@ func probeRestrictedOpenBlocked(token windows.Token, mountsReal []string) error 
 }
 
 // unlistedProbeTargets returns host locations outside every mount. The parent
-// of each mount, the profile directory, and the hosts file are candidates. A
-// candidate that lies inside a mount is dropped.
+// of each mount, the profile directory, and the hosts file are candidates. The
+// helper omits candidates that lie inside a mount.
 func unlistedProbeTargets(mountsReal []string) []string {
 	var candidates []string
 	for _, real := range mountsReal {

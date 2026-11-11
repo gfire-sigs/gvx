@@ -203,14 +203,18 @@ type dnsRelay struct {
 }
 
 func (nf *NATForwarder) dnsRelay() dnsRelay {
-	var d net.Dialer
+	dialFn := nf.cfg.DialContext
+	if dialFn == nil {
+		var d net.Dialer
+		dialFn = d.DialContext
+	}
 	return dnsRelay{
 		gvxAddrs:   []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)},
 		hasGateway: true,
 		isolateLAN: nf.cfg.IsolateLAN,
 		lookupHost: nf.cfg.LookupHost,
 		servers:    nf.upstreamDNS,
-		dials:      []func(context.Context, string, string) (net.Conn, error){d.DialContext},
+		dials:      []func(context.Context, string, string) (net.Conn, error){dialFn},
 		log:        nf.log,
 		tune:       nf.cfg.Tuning,
 	}

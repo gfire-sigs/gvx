@@ -17,14 +17,18 @@
 package hostlockdown
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -35,13 +39,15 @@ const (
 	childWSEnv     = "GVX_HOSTLOCKDOWN_WORKSPACE"
 	childOutEnv    = "GVX_HOSTLOCKDOWN_OUTSIDE"
 	childROEnv     = "GVX_HOSTLOCKDOWN_READONLY"
+	childFileEnv   = "GVX_HOSTLOCKDOWN_FILE"
+	childDialEnv   = "GVX_HOSTLOCKDOWN_DIAL"
 	childResultEnv = "GVX_HOSTLOCKDOWN_RESULT"
 )
 
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(childModeEnv); mode != "" {
-		// The child opens the result file before the lockdown, because the
-		// lockdown can refuse a write to the pipes of the parent.
+		// Open the result file before the lockdown, because the lockdown can
+		// refuse a write to the pipes of the parent.
 		var result *os.File
 		if path := os.Getenv(childResultEnv); path != "" {
 			result, _ = os.Create(path)
@@ -114,6 +120,17 @@ func TestDenyOnlySIDs(t *testing.T) {
 			t.Errorf("entry %d attributes = %#x, want SE_GROUP_USE_FOR_DENY_ONLY", i, got[i].Attributes)
 		}
 	}
+
+	netBrokerDeny := buildDenyOnlySIDs(user, groups, true)
+	wantNet := []*windows.SID{user, admins}
+	if len(netBrokerDeny) != len(wantNet) {
+		t.Fatalf("buildDenyOnlySIDs(keepEveryone=true) returned %d entries, want %d", len(netBrokerDeny), len(wantNet))
+	}
+	for i, sid := range wantNet {
+		if !netBrokerDeny[i].Sid.Equals(sid) {
+			t.Errorf("netBrokerDeny[%d] = %v, want %v", i, netBrokerDeny[i].Sid, sid)
+		}
+	}
 }
 
 func TestIsLowIntegritySID(t *testing.T) {
@@ -137,176 +154,138 @@ func TestIsLowIntegritySID(t *testing.T) {
 	}
 }
 
-func TestIsLogonSessionSID(t *testing.T) {
+func TestIsUntrustedIntegritySID(t *testing.T) {
 	tests := []struct {
 		sid  string
 		want bool
 	}{
-		{"S-1-5-5-0-123456", true},
-		{"S-1-5-5-1-2", true},
-		{"S-1-5-5-0", false},
+		{"S-1-16-0", true},
+		{"S-1-16-4096", false},
+		{"S-1-16-8192", false},
 		{"S-1-5-32-544", false},
-		{"S-1-5-21-1-2-3", false},
-		{"S-1-1-0", false},
+		{"S-1-5-5-0-0", false},
 	}
 	for _, tt := range tests {
-		if got := isLogonSessionSID(mustSID(t, tt.sid)); got != tt.want {
-			t.Errorf("isLogonSessionSID(%s) = %v, want %v", tt.sid, got, tt.want)
+		if got := isUntrustedIntegritySID(mustSID(t, tt.sid)); got != tt.want {
+			t.Errorf("isUntrustedIntegritySID(%s) = %v, want %v", tt.sid, got, tt.want)
+		}
+	}
+	if isUntrustedIntegritySID(nil) {
+		t.Error("isUntrustedIntegritySID(nil) = true")
+	}
+}
+
+func TestBrokerParameterAllowlists(t *testing.T) {
+	const (
+		fileOpenByFileID  = 0x2000
+		fileDeleteOnClose = 0x1000
+	)
+	for _, tc := range []struct {
+		name        string
+		access      uint32
+		fileAttrs   uint32
+		disposition uint32
+		options     uint32
+		wantErr     bool
+	}{
+		{"valid regular read", windows.FILE_GENERIC_READ, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, windows.FILE_NON_DIRECTORY_FILE, false},
+		{"valid dir open", windows.FILE_LIST_DIRECTORY, 0, windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE, false},
+		{"valid create readonly", windows.FILE_GENERIC_WRITE, windows.FILE_ATTRIBUTE_READONLY, windows.FILE_CREATE, windows.FILE_NON_DIRECTORY_FILE, false},
+		{"reject FILE_OPEN_BY_FILE_ID", windows.FILE_GENERIC_READ, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, fileOpenByFileID, true},
+		{"reject FILE_DELETE_ON_CLOSE", windows.FILE_GENERIC_READ, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, fileDeleteOnClose, true},
+		{"reject conflicting dir and nondir", windows.FILE_GENERIC_READ, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE | windows.FILE_NON_DIRECTORY_FILE, true},
+		{"reject system attribute", windows.FILE_GENERIC_WRITE, windows.FILE_ATTRIBUTE_SYSTEM, windows.FILE_OPEN_IF, windows.FILE_NON_DIRECTORY_FILE, true},
+		{"reject FILE_SUPERSEDE", windows.FILE_GENERIC_WRITE, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_SUPERSEDE, windows.FILE_NON_DIRECTORY_FILE, true},
+		{"reject WRITE_DAC", windows.WRITE_DAC, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateBrokerOpenParams(tc.access, tc.fileAttrs, tc.disposition, tc.options)
+			if tc.wantErr && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+				t.Fatalf("validateBrokerOpenParams = %v, want ERROR_ACCESS_DENIED", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateBrokerOpenParams = %v, want nil", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name      string
+		access    uint32
+		flags     uint32
+		infoClass uint32
+		wantErr   bool
+	}{
+		{"valid posix rename", windows.DELETE | windows.FILE_READ_ATTRIBUTES, windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS, fileRenameInformationExClass, false},
+		{"valid hard link", windows.FILE_WRITE_ATTRIBUTES, 0, fileLinkInformationClass, false},
+		{"reject zero access", 0, 0, fileLinkInformationClass, true},
+		{"reject data write access", windows.FILE_WRITE_DATA, 0, fileLinkInformationClass, true},
+		{"reject nonzero link flags", windows.FILE_WRITE_ATTRIBUTES, windows.FILE_RENAME_REPLACE_IF_EXISTS, fileLinkInformationClass, true},
+		{"reject unknown rename flag", windows.DELETE | windows.FILE_READ_ATTRIBUTES, 0x80, fileRenameInformationExClass, true},
+		{"reject unknown info class", windows.DELETE, 0, 99, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBrokerTargetParams(tc.access, tc.flags, tc.infoClass)
+			if tc.wantErr && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+				t.Fatalf("validateBrokerTargetParams = %v, want ERROR_ACCESS_DENIED", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateBrokerTargetParams = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestValidateBrokerName(t *testing.T) {
+	valid := []string{"file.txt", ".gvx_meta", "~gvx~tmp.1", "COM10", "normal-dir_2"}
+	for _, name := range valid {
+		if err := validateBrokerName(name); err != nil {
+			t.Errorf("validateBrokerName(%q) = %v, want nil", name, err)
+		}
+	}
+	invalid := []string{
+		"",
+		".",
+		"..",
+		`sub\file`,
+		"sub/file",
+		"file:ads",
+		"bad\x00name",
+		"bad\x1fname",
+		"trailing.",
+		"trailing ",
+		"CON",
+		"nul.txt",
+		"Aux .log",
+		"COM1",
+		"LPT\u00b9",
+		"CONIN$",
+	}
+	for _, name := range invalid {
+		if err := validateBrokerName(name); err == nil {
+			t.Errorf("validateBrokerName(%q) = nil, want error", name)
 		}
 	}
 }
 
-func TestStaleLogonSIDs(t *testing.T) {
-	current := mustSID(t, "S-1-5-5-0-111")
-	sd, err := windows.SecurityDescriptorFromString(
-		"D:(A;;FA;;;S-1-5-5-0-111)(A;;FA;;;S-1-5-5-0-222)(A;;FA;;;S-1-5-5-0-222)(A;;FA;;;S-1-5-32-544)(A;;FA;;;S-1-5-5-0-333)")
-	if err != nil {
-		t.Fatalf("SecurityDescriptorFromString: %v", err)
-	}
-	dacl, _, err := sd.DACL()
-	if err != nil {
-		t.Fatalf("DACL: %v", err)
-	}
-	got := staleLogonSIDs(dacl, current)
-	if len(got) != 2 || got[0].String() != "S-1-5-5-0-222" || got[1].String() != "S-1-5-5-0-333" {
-		t.Fatalf("staleLogonSIDs = %v, want S-1-5-5-0-222 and S-1-5-5-0-333 once each", got)
-	}
-	if staleLogonSIDs(nil, current) != nil {
-		t.Fatal("staleLogonSIDs(nil) is not nil")
-	}
-}
-
-func TestWorkspaceAccessMask(t *testing.T) {
-	rw := workspaceAccessMask(false)
-	ro := workspaceAccessMask(true)
-	writeBits := windows.ACCESS_MASK(windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.DELETE | fileDeleteChild)
-	if rw&writeBits != writeBits {
-		t.Errorf("read-write mask %#x lacks write bits %#x", rw, writeBits)
-	}
-	if ro&writeBits != 0 {
-		t.Errorf("read-only mask %#x contains write bits %#x", ro, ro&writeBits)
-	}
-	if ro&windows.FILE_GENERIC_READ != windows.FILE_GENERIC_READ || rw&ro != ro {
-		t.Errorf("masks ro=%#x rw=%#x: read-only must be a subset that includes generic read", ro, rw)
-	}
-}
-
-// TestPrepareWorkspaceFileLabelsOnlyTheFile proves that a file mount puts the
-// Low label and the logon SID entry on that file and on nothing around it.
-func TestPrepareWorkspaceFileLabelsOnlyTheFile(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target.txt")
-	sibling := filepath.Join(dir, "sibling.txt")
-	for _, p := range []string{target, sibling} {
-		if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
-			t.Fatalf("WriteFile %q: %v", p, err)
-		}
-	}
-	primary, err := openPrimaryToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer primary.Close()
-	id, err := readTokenIdentity(primary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := prepareWorkspace(target, id.logon, false, true); err != nil {
-		t.Fatalf("prepareWorkspace(file) = %v", err)
-	}
-	grant := workspaceGrant{logon: id.logon, mask: workspaceAccessMask(false)}
-	state, err := grant.read(target, false)
-	if err != nil || !state.complete() {
-		t.Errorf("target state = %+v, %v; want the Low label and the logon entry", state, err)
-	}
-	for _, other := range []struct {
-		path  string
-		isDir bool
-	}{{sibling, false}, {dir, true}} {
-		state, err := grant.read(other.path, other.isDir)
-		if err != nil {
-			t.Fatalf("read %q: %v", other.path, err)
-		}
-		if state.labeled {
-			t.Errorf("%q carries a Low label after a file mount of its neighbor", other.path)
-		}
-	}
-}
-
-func TestGrantsAccess(t *testing.T) {
-	logon := mustSID(t, "S-1-5-5-0-123456")
-	rw := workspaceAccessMask(false)
-	tests := []struct {
-		name string
-		sddl string
-		mask windows.ACCESS_MASK
+func TestNTPathAtOrBelow(t *testing.T) {
+	root := `\Device\HarddiskVolume3\Users\alice\ws`
+	cases := []struct {
+		path string
 		want bool
 	}{
-		{"full access", "D:(A;;FA;;;S-1-5-5-0-123456)", rw, true},
-		{"read only entry for write mask", "D:(A;;FRFX;;;S-1-5-5-0-123456)", rw, false},
-		{"read only entry for read mask", "D:(A;;FRFX;;;S-1-5-5-0-123456)", workspaceAccessMask(true), true},
-		{"other sid", "D:(A;;FA;;;S-1-5-5-0-999999)", rw, false},
-		{"inherit only entry", "D:(A;OICIIO;FA;;;S-1-5-5-0-123456)", rw, false},
-		{"deny entry", "D:(D;;FA;;;S-1-5-5-0-123456)", rw, false},
-		{"split entries", "D:(A;;FRFX;;;S-1-5-5-0-123456)(A;;FW;;;S-1-5-5-0-123456)(A;;SD;;;S-1-5-5-0-123456)(A;;0x40;;;S-1-5-5-0-123456)", rw, true},
+		{`\Device\HarddiskVolume3\Users\alice\ws`, true},
+		{`\Device\HarddiskVolume3\Users\alice\ws\`, true},
+		{`\Device\HarddiskVolume3\Users\alice\ws\sub\file.txt`, true},
+		{`\device\harddiskvolume3\users\ALICE\WS\sub`, true},
+		{`\Device\HarddiskVolume3\Users\alice\ws2`, false},
+		{`\Device\HarddiskVolume3\Users\alice`, false},
+		{"", false},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sd, err := windows.SecurityDescriptorFromString(tt.sddl)
-			if err != nil {
-				t.Fatalf("SecurityDescriptorFromString: %v", err)
-			}
-			dacl, _, err := sd.DACL()
-			if err != nil {
-				t.Fatalf("DACL: %v", err)
-			}
-			if got := grantsAccess(dacl, logon, tt.mask); got != tt.want {
-				var entries []string
-				for i := uint32(0); i < uint32(dacl.AceCount); i++ {
-					var ace *windows.ACCESS_ALLOWED_ACE
-					if err := windows.GetAce(dacl, i, &ace); err != nil {
-						entries = append(entries, fmt.Sprintf("GetAce(%d): %v", i, err))
-						continue
-					}
-					entries = append(entries, fmt.Sprintf("type %d flags %#x mask %#x", ace.Header.AceType, ace.Header.AceFlags, uint32(ace.Mask)))
-				}
-				t.Fatalf("grantsAccess = %v, want %v for mask %#x and %d entries: %q",
-					got, tt.want, uint32(tt.mask), dacl.AceCount, entries)
-			}
-		})
-	}
-}
-
-func TestHasLowLabel(t *testing.T) {
-	tests := []struct {
-		name  string
-		sddl  string
-		isDir bool
-		want  bool
-	}{
-		{"inheritable label on directory", lowLabelDirSDDL, true, true},
-		{"inheritable label on file", lowLabelDirSDDL, false, true},
-		{"file label on file", lowLabelFileSDDL, false, true},
-		{"file label on directory", lowLabelFileSDDL, true, false},
-		{"medium label", "S:(ML;OICI;NW;;;ME)", true, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sd, err := windows.SecurityDescriptorFromString(tt.sddl)
-			if err != nil {
-				t.Fatalf("SecurityDescriptorFromString: %v", err)
-			}
-			sacl, _, err := sd.SACL()
-			if err != nil {
-				t.Fatalf("SACL: %v", err)
-			}
-			if got := hasLowLabel(sacl, tt.isDir); got != tt.want {
-				t.Fatalf("hasLowLabel = %v, want %v", got, tt.want)
-			}
-		})
-	}
-	if hasLowLabel(nil, true) {
-		t.Fatal("hasLowLabel(nil) = true")
+	for _, tc := range cases {
+		if got := ntPathAtOrBelow(tc.path, root); got != tc.want {
+			t.Errorf("ntPathAtOrBelow(%q, %q) = %v, want %v", tc.path, root, got, tc.want)
+		}
 	}
 }
 
@@ -329,6 +308,79 @@ func TestBindThreadBeforeApply(t *testing.T) {
 	}
 }
 
+func readPathSDDL(t *testing.T, path string) string {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.LABEL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		t.Fatalf("GetNamedSecurityInfo(%q): %v", path, err)
+	}
+	return sd.String()
+}
+
+func openPreLockdownDir(path string) (windows.Handle, func(), error) {
+	utf16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	h, err := windows.CreateFile(
+		utf16,
+		windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES,
+		brokerShareAll,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+	if err != nil {
+		return 0, nil, err
+	}
+	return h, func() { _ = windows.CloseHandle(h) }, nil
+}
+
+func brokerWriteFile(b WindowsFileBroker, dir windows.Handle, name, data string) error {
+	h, err := b.OpenAt(
+		dir,
+		name,
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_OPEN_IF,
+		windows.FILE_NON_DIRECTORY_FILE,
+	)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(h), name)
+	_, werr := f.WriteString(data)
+	cerr := f.Close()
+	return errors.Join(werr, cerr)
+}
+
+func brokerReadFile(b WindowsFileBroker, dir windows.Handle, name string) (string, error) {
+	h, err := b.OpenAt(
+		dir,
+		name,
+		windows.FILE_GENERIC_READ,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_OPEN,
+		windows.FILE_NON_DIRECTORY_FILE,
+	)
+	if err != nil {
+		return "", err
+	}
+	f := os.NewFile(uintptr(h), name)
+	buf := make([]byte, 256)
+	n, rerr := f.Read(buf)
+	_ = f.Close()
+	if rerr != nil {
+		return "", rerr
+	}
+	return string(buf[:n]), nil
+}
+
 func TestApplyLockdownWindows(t *testing.T) {
 	ws, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -341,10 +393,157 @@ func TestApplyLockdownWindows(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("host-secret"), 0o600); err != nil {
 		t.Fatalf("WriteFile secret: %v", err)
 	}
+	result := filepath.Join(t.TempDir(), "result.txt")
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), childModeEnv+"=files", childWSEnv+"="+ws, childOutEnv+"="+outside)
+	cmd.Env = append(os.Environ(), childModeEnv+"=files", childWSEnv+"="+ws, childOutEnv+"="+outside, childResultEnv+"="+result)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+		reported, _ := os.ReadFile(result)
+		t.Fatalf("lockdown child failed: %v\n%s\nreported: %s", err, out, reported)
+	}
+}
+
+// TestApplyPreservesHostSecurityDescriptors proves that Apply mutates neither
+// the DACL nor the mandatory integrity label on workspace directories, nested
+// subdirectories, read-only mounts, single-file mounts, siblings, or parents.
+func TestApplyPreservesHostSecurityDescriptors(t *testing.T) {
+	evalTemp := func() string {
+		p, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("EvalSymlinks: %v", err)
+		}
+		return p
+	}
+	ws, ro, fileDir := evalTemp(), evalTemp(), evalTemp()
+	subDir := filepath.Join(ws, "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	subFile := filepath.Join(subDir, "item.txt")
+	roFile := filepath.Join(ro, "existing.txt")
+	targetFile := filepath.Join(fileDir, "target.txt")
+	siblingFile := filepath.Join(fileDir, "sibling.txt")
+	for path, body := range map[string]string{
+		subFile:     "sub-item",
+		roFile:      "ro-item",
+		targetFile:  "target-item",
+		siblingFile: "sibling-item",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	watchedPaths := []string{ws, subDir, subFile, ro, roFile, fileDir, targetFile, siblingFile}
+	before := make(map[string]string, len(watchedPaths))
+	for _, p := range watchedPaths {
+		before[p] = readPathSDDL(t, p)
+	}
+
+	result := filepath.Join(t.TempDir(), "result.txt")
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(
+		os.Environ(),
+		childModeEnv+"=preserve-acl",
+		childWSEnv+"="+ws,
+		childROEnv+"="+ro,
+		childFileEnv+"="+targetFile,
+		childResultEnv+"="+result,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		reported, _ := os.ReadFile(result)
+		t.Fatalf("preserve-acl child failed: %v\n%s\nreported: %s", err, out, reported)
+	}
+
+	for _, p := range watchedPaths {
+		after := readPathSDDL(t, p)
+		if after != before[p] {
+			t.Errorf("security descriptor mutated on %q:\nbefore: %s\nafter:  %s", p, before[p], after)
+		}
+	}
+}
+
+// TestCrossSandboxLogonIsolationAndManyThreads proves:
+//  1. A sandbox with AllowOutboundNet=true still blocks Everyone-readable host
+//     files on both pre-warmed and newly spawned Go runtime OS threads (#129+),
+//     while outbound dials through DialContext succeed.
+//  2. A second locked-down sandbox in the same Windows logon session cannot open
+//     or modify files inside the first sandbox's workspace.
+func TestCrossSandboxLogonIsolationAndManyThreads(t *testing.T) {
+	evalTemp := func() string {
+		p, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("EvalSymlinks: %v", err)
+		}
+		return p
+	}
+	wsA, outside := evalTemp(), evalTemp()
+	everyoneFile := filepath.Join(outside, "everyone.txt")
+	if err := os.WriteFile(everyoneFile, []byte("world-readable-secret"), 0o644); err != nil {
+		t.Fatalf("WriteFile everyone: %v", err)
+	}
+	// Grant Everyone (WD) explicit read access so any token with Everyone
+	// enabled in RestrictedSids would read the file.
+	sd, err := windows.SecurityDescriptorFromString("D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;WD)")
+	if err != nil {
+		t.Fatalf("SecurityDescriptorFromString: %v", err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("sd.DACL: %v", err)
+	}
+	if err := windows.SetNamedSecurityInfo(
+		everyoneFile,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		dacl,
+		nil,
+	); err != nil {
+		t.Fatalf("SetNamedSecurityInfo(everyoneFile): %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen loopback: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	resA := filepath.Join(t.TempDir(), "resA.txt")
+	cmdA := exec.Command(os.Args[0], "-test.run=^$")
+	cmdA.Env = append(
+		os.Environ(),
+		childModeEnv+"=sandbox-a",
+		childWSEnv+"="+wsA,
+		childOutEnv+"="+everyoneFile,
+		childDialEnv+"="+ln.Addr().String(),
+		childResultEnv+"="+resA,
+	)
+	if out, err := cmdA.CombinedOutput(); err != nil {
+		reported, _ := os.ReadFile(resA)
+		t.Fatalf("sandbox-a child failed: %v\n%s\nreported: %s", err, out, reported)
+	}
+
+	resB := filepath.Join(t.TempDir(), "resB.txt")
+	cmdB := exec.Command(os.Args[0], "-test.run=^$")
+	cmdB.Env = append(
+		os.Environ(),
+		childModeEnv+"=sandbox-b",
+		childWSEnv+"="+wsA,
+		childResultEnv+"="+resB,
+	)
+	if out, err := cmdB.CombinedOutput(); err != nil {
+		reported, _ := os.ReadFile(resB)
+		t.Fatalf("sandbox-b child failed: %v\n%s\nreported: %s", err, out, reported)
 	}
 }
 
@@ -357,24 +556,43 @@ func runLockedChild(mode string) error {
 		return runMountsChild()
 	case "file-mount":
 		return runFileMountChild()
+	case "preserve-acl":
+		return runPreserveACLChild()
+	case "sandbox-a":
+		return runSandboxAChild()
+	case "sandbox-b":
+		return runSandboxBChild()
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
 	ws, outside := os.Getenv(childWSEnv), os.Getenv(childOutEnv)
 	secret := filepath.Join(outside, "secret.txt")
 
+	wsDir, closeWSDir, err := openPreLockdownDir(ws)
+	if err != nil {
+		return err
+	}
+	defer closeWSDir()
 	root, err := os.OpenRoot(ws)
 	if err != nil {
 		return err
 	}
+	defer root.Close()
 	pre, err := os.OpenFile(filepath.Join(ws, "pre.txt"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
+	defer pre.Close()
 	secretHandle, err := os.Open(secret)
 	if err != nil {
 		return err
 	}
+	defer secretHandle.Close()
+	var queryTok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &queryTok); err != nil {
+		return fmt.Errorf("pre-open query token: %w", err)
+	}
+	defer queryTok.Close()
 
 	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}})
 	if err != nil {
@@ -386,7 +604,7 @@ func runLockedChild(mode string) error {
 			errs = append(errs, fmt.Errorf(format, args...))
 		}
 	}
-	expect(st.Applied && st.SubprocessBlocked && st.UnboundFileOpenBlocked && st.IntegrityDowngraded && st.Win32kBlocked, "status = %+v", st)
+	expect(st.Applied && st.SubprocessBlocked && st.UnboundFileOpenBlocked && st.IntegrityDowngraded && st.Win32kBlocked && st.NetworkOutboundBlocked, "status = %+v", st)
 	expect(IsLockedDown(), "IsLockedDown = false after Apply")
 
 	_, err = pre.WriteString("pre-opened")
@@ -395,8 +613,36 @@ func runLockedChild(mode string) error {
 	n, err := secretHandle.Read(buf)
 	expect(err == nil && string(buf[:n]) == "host-secret", "read pre-opened outside handle = %q, %v", buf[:n], err)
 
-	// The restricted token on a locked thread still serves the workspace
-	// through the pinned root handle and rejects every other path.
+	broker := ActiveWindowsFileBroker()
+	if broker == nil {
+		return errors.New("ActiveWindowsFileBroker() = nil after Apply")
+	}
+
+	var procTok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &procTok); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		if err == nil {
+			_ = procTok.Close()
+		}
+		errs = append(errs, fmt.Errorf("OpenProcessToken after Apply = %v, want ERROR_ACCESS_DENIED", err))
+	}
+	if tmlBuf, tmlErr := tokenInformation(queryTok, windows.TokenIntegrityLevel); tmlErr != nil {
+		errs = append(errs, fmt.Errorf("query primary TokenIntegrityLevel: %w", tmlErr))
+	} else {
+		tml := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&tmlBuf[0]))
+		expect(isUntrustedIntegritySID(tml.Label.Sid), "primary token integrity = %v, want Untrusted (%s)", tml.Label.Sid, untrustedIntegritySID)
+	}
+
+	for _, badOpt := range []uint32{0x2000, 0x1000} {
+		if h, openErr := broker.OpenAt(wsDir, "bound.txt", windows.FILE_GENERIC_READ, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, badOpt); !errors.Is(openErr, windows.ERROR_ACCESS_DENIED) {
+			if openErr == nil {
+				_ = windows.CloseHandle(h)
+			}
+			errs = append(errs, fmt.Errorf("OpenAt with disallowed option %#x = %v, want ERROR_ACCESS_DENIED", badOpt, openErr))
+		}
+	}
+
+	// A restricted thread opens workspace files exclusively through the sealed
+	// file broker and fails direct unbrokered opens.
 	done := make(chan []error, 1)
 	go func() {
 		runtime.LockOSThread()
@@ -405,15 +651,14 @@ func runLockedChild(mode string) error {
 			done <- []error{fmt.Errorf("BindThread: %w", err)}
 			return
 		}
-		f, err := root.OpenFile("bound.txt", os.O_CREATE|os.O_RDWR, 0o600)
-		if err != nil {
-			threadErrs = append(threadErrs, fmt.Errorf("create through root on bound thread: %w", err))
-		} else {
-			_, werr := f.WriteString("bound")
-			if werr != nil {
-				threadErrs = append(threadErrs, fmt.Errorf("write on bound thread: %w", werr))
-			}
+		if err := brokerWriteFile(broker, wsDir, "bound.txt", "bound"); err != nil {
+			threadErrs = append(threadErrs, fmt.Errorf("broker write in workspace: %w", err))
+		}
+		if f, err := root.OpenFile("direct.txt", os.O_CREATE|os.O_RDWR, 0o600); err == nil {
 			_ = f.Close()
+			threadErrs = append(threadErrs, errors.New("direct unbrokered root.OpenFile succeeded on restricted thread"))
+		} else if !errors.Is(err, fs.ErrPermission) {
+			threadErrs = append(threadErrs, fmt.Errorf("direct unbrokered root.OpenFile = %v, want permission error", err))
 		}
 		if _, err := os.ReadFile(secret); !errors.Is(err, fs.ErrPermission) {
 			threadErrs = append(threadErrs, fmt.Errorf("read outside path on bound thread = %v, want permission error", err))
@@ -462,6 +707,168 @@ func runLockedChild(mode string) error {
 	return errors.Join(errs...)
 }
 
+func runPreserveACLChild() error {
+	ws, ro, target := os.Getenv(childWSEnv), os.Getenv(childROEnv), os.Getenv(childFileEnv)
+	fileDir, leaf := filepath.Split(target)
+	fileDir = filepath.Clean(fileDir)
+
+	wsDir, closeWS, err := openPreLockdownDir(ws)
+	if err != nil {
+		return err
+	}
+	defer closeWS()
+	roDir, closeRO, err := openPreLockdownDir(ro)
+	if err != nil {
+		return err
+	}
+	defer closeRO()
+	parentDir, closeParent, err := openPreLockdownDir(fileDir)
+	if err != nil {
+		return err
+	}
+	defer closeParent()
+
+	if _, err := Apply(Options{
+		Mounts: []HostMount{
+			{Path: ws},
+			{Path: ro, ReadOnly: true},
+			{Path: target, File: true},
+		},
+	}); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	b := ActiveWindowsFileBroker()
+	if b == nil {
+		return errors.New("broker is nil")
+	}
+	if err := brokerWriteFile(b, wsDir, "created.txt", "created"); err != nil {
+		return fmt.Errorf("broker write ws: %w", err)
+	}
+	if got, err := brokerReadFile(b, roDir, "existing.txt"); err != nil || got != "ro-item" {
+		return fmt.Errorf("broker read ro = %q, %v", got, err)
+	}
+	h, err := b.OpenAt(parentDir, leaf, windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, windows.FILE_NON_DIRECTORY_FILE)
+	if err != nil {
+		return fmt.Errorf("broker open file mount: %w", err)
+	}
+	_ = windows.CloseHandle(h)
+	return nil
+}
+
+func runSandboxAChild() error {
+	wsA := os.Getenv(childWSEnv)
+	everyoneFile := os.Getenv(childOutEnv)
+	dialAddr := os.Getenv(childDialEnv)
+
+	wsDir, closeWS, err := openPreLockdownDir(wsA)
+	if err != nil {
+		return err
+	}
+	defer closeWS()
+
+	st, err := Apply(Options{
+		Mounts:           []HostMount{{Path: wsA}},
+		AllowOutboundNet: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Apply(sandbox-a): %w", err)
+	}
+	if !st.Applied || st.NetworkOutboundBlocked {
+		return fmt.Errorf("unexpected sandbox-a status: %+v", st)
+	}
+	b := ActiveWindowsFileBroker()
+	if b == nil {
+		return errors.New("broker is nil")
+	}
+	insidePath := filepath.Join(wsA, "inside.txt")
+	if err := brokerWriteFile(b, wsDir, "inside.txt", "sandbox-a-secret"); err != nil {
+		return fmt.Errorf("brokerWriteFile: %w", err)
+	}
+
+	// Outbound TCP through DialContext must succeed when AllowOutboundNet=true.
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	conn, err := DialContext(dialCtx, "tcp", dialAddr)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("DialContext(%q) under AllowOutboundNet=true: %w", dialAddr, err)
+	}
+	_ = conn.Close()
+
+	// Park 160 OS threads concurrently (exceeding minPrewarmedThreads=128)
+	// without calling BindThread() directly. After the background sweeper runs,
+	// every OS thread must hold an impersonation token and fail reads of both
+	// Everyone-readable host files and unbrokered workspace paths.
+	const totalThreads = 160
+	var parked sync.WaitGroup
+	var finished sync.WaitGroup
+	parked.Add(totalThreads)
+	finished.Add(totalThreads)
+	checkNow := make(chan struct{})
+	errCh := make(chan error, totalThreads)
+
+	for i := range totalThreads {
+		go func(idx int) {
+			runtime.LockOSThread()
+			defer finished.Done()
+			parked.Done()
+			<-checkNow
+
+			var tok windows.Token
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				tokErr := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &tok)
+				if tokErr == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					errCh <- fmt.Errorf("thread %d has no impersonation token before deadline: %w", idx, tokErr)
+					return
+				}
+				runtime.Gosched()
+			}
+			_ = tok.Close()
+			if _, rerr := os.ReadFile(everyoneFile); !errors.Is(rerr, fs.ErrPermission) {
+				errCh <- fmt.Errorf("thread %d read Everyone file = %v, want permission error", idx, rerr)
+				return
+			}
+			if _, rerr := os.ReadFile(insidePath); !errors.Is(rerr, fs.ErrPermission) {
+				errCh <- fmt.Errorf("thread %d direct read workspace file = %v, want permission error", idx, rerr)
+				return
+			}
+		}(i)
+	}
+	parked.Wait()
+	close(checkNow)
+	finished.Wait()
+	close(errCh)
+
+	var errs []error
+	for e := range errCh {
+		errs = append(errs, e)
+	}
+	return errors.Join(errs...)
+}
+
+func runSandboxBChild() error {
+	wsA := os.Getenv(childWSEnv)
+	insidePath := filepath.Join(wsA, "inside.txt")
+
+	if _, err := Apply(Options{}); err != nil {
+		return fmt.Errorf("Apply(sandbox-b): %w", err)
+	}
+	var errs []error
+	if _, err := os.ReadFile(insidePath); !errors.Is(err, fs.ErrPermission) {
+		errs = append(errs, fmt.Errorf("sandbox-b read sandbox-a file = %v, want permission error", err))
+	}
+	if err := os.WriteFile(filepath.Join(wsA, "intrude.txt"), []byte("bad"), 0o600); !errors.Is(err, fs.ErrPermission) {
+		errs = append(errs, fmt.Errorf("sandbox-b write in sandbox-a workspace = %v, want permission error", err))
+	}
+	if _, err := os.ReadDir(wsA); !errors.Is(err, fs.ErrPermission) {
+		errs = append(errs, fmt.Errorf("sandbox-b list sandbox-a workspace = %v, want permission error", err))
+	}
+	return errors.Join(errs...)
+}
+
 // TestApplyCapsTheCPUTimeOfTheJob proves that the lockdown puts the hard CPU cap
 // on the job of the process, by reading the cap back in the locked child.
 func TestApplyCapsTheCPUTimeOfTheJob(t *testing.T) {
@@ -493,9 +900,9 @@ func runCPUChild() error {
 	return nil
 }
 
-// TestApplyLockdownWithTwoMounts proves that a writable mount and a read-only
-// mount both serve a bound thread, that the read-only mount refuses a write,
-// and that a path outside every mount stays closed.
+// TestApplyLockdownWithTwoMounts proves that the file broker serves a writable
+// mount and a read-only mount, refuses writes to the read-only mount, and keeps
+// paths outside every mount closed.
 func TestApplyLockdownWithTwoMounts(t *testing.T) {
 	dir := func() string {
 		p, err := filepath.EvalSymlinks(t.TempDir())
@@ -511,29 +918,43 @@ func TestApplyLockdownWithTwoMounts(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("host-secret"), 0o600); err != nil {
 		t.Fatalf("WriteFile secret: %v", err)
 	}
+	result := filepath.Join(t.TempDir(), "result.txt")
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), childModeEnv+"=mounts", childWSEnv+"="+rw, childROEnv+"="+ro, childOutEnv+"="+outside)
+	cmd.Env = append(os.Environ(), childModeEnv+"=mounts", childWSEnv+"="+rw, childROEnv+"="+ro, childOutEnv+"="+outside, childResultEnv+"="+result)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+		reported, _ := os.ReadFile(result)
+		t.Fatalf("lockdown child failed: %v\n%s\nreported: %s", err, out, reported)
 	}
 }
 
 func runMountsChild() error {
 	rw, ro, outside := os.Getenv(childWSEnv), os.Getenv(childROEnv), os.Getenv(childOutEnv)
-	rwRoot, err := os.OpenRoot(rw)
+	rwDir, closeRW, err := openPreLockdownDir(rw)
 	if err != nil {
 		return err
 	}
-	roRoot, err := os.OpenRoot(ro)
+	defer closeRW()
+	roDir, closeRO, err := openPreLockdownDir(ro)
 	if err != nil {
 		return err
 	}
+	defer closeRO()
+	outDir, closeOut, err := openPreLockdownDir(outside)
+	if err != nil {
+		return err
+	}
+	defer closeOut()
+
 	st, err := Apply(Options{Mounts: []HostMount{{Path: rw}, {Path: ro, ReadOnly: true}}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}
 	if !st.Applied || !st.UnboundFileOpenBlocked {
 		return fmt.Errorf("status = %+v, want an applied lockdown that blocks unbound opens", st)
+	}
+	b := ActiveWindowsFileBroker()
+	if b == nil {
+		return errors.New("broker is nil")
 	}
 
 	done := make(chan []error, 1)
@@ -544,19 +965,17 @@ func runMountsChild() error {
 			done <- []error{fmt.Errorf("BindThread: %w", err)}
 			return
 		}
-		if f, err := rwRoot.OpenFile("new.txt", os.O_CREATE|os.O_RDWR, 0o600); err != nil {
+		if err := brokerWriteFile(b, rwDir, "new.txt", "created"); err != nil {
 			errs = append(errs, fmt.Errorf("create in the writable mount: %w", err))
-		} else {
-			_ = f.Close()
 		}
-		if data, err := roRoot.ReadFile("existing.txt"); err != nil || string(data) != "read-only-content" {
+		if data, err := brokerReadFile(b, roDir, "existing.txt"); err != nil || data != "read-only-content" {
 			errs = append(errs, fmt.Errorf("read in the read-only mount = %q, %v", data, err))
 		}
-		if f, err := roRoot.OpenFile("new.txt", os.O_CREATE|os.O_RDWR, 0o600); err == nil {
-			_ = f.Close()
-			errs = append(errs, errors.New("create in the read-only mount succeeded"))
-		} else if !errors.Is(err, fs.ErrPermission) {
-			errs = append(errs, fmt.Errorf("create in the read-only mount = %v, want a permission error", err))
+		if err := brokerWriteFile(b, roDir, "new.txt", "forbidden"); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			errs = append(errs, fmt.Errorf("create in the read-only mount = %v, want ERROR_ACCESS_DENIED", err))
+		}
+		if _, err := brokerReadFile(b, outDir, "secret.txt"); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			errs = append(errs, fmt.Errorf("broker read in unmounted dir = %v, want ERROR_ACCESS_DENIED", err))
 		}
 		if _, err := os.ReadFile(filepath.Join(outside, "secret.txt")); !errors.Is(err, fs.ErrPermission) {
 			errs = append(errs, fmt.Errorf("read outside every mount = %v, want a permission error", err))
@@ -566,9 +985,8 @@ func runMountsChild() error {
 	return errors.Join(<-done...)
 }
 
-// TestApplyLockdownWithFileMount proves that a file mount serves a bound
-// thread for that file only. The sibling file and the parent directory stay
-// closed.
+// TestApplyLockdownWithFileMount proves that a file mount serves the broker for
+// that file only while keeping the sibling file and the parent directory closed.
 func TestApplyLockdownWithFileMount(t *testing.T) {
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -592,14 +1010,17 @@ func TestApplyLockdownWithFileMount(t *testing.T) {
 func runFileMountChild() error {
 	dir := os.Getenv(childWSEnv)
 	target := filepath.Join(dir, "target.txt")
-	root, err := os.OpenRoot(dir)
+	parentDir, closeParent, err := openPreLockdownDir(dir)
 	if err != nil {
 		return err
 	}
+	defer closeParent()
 	held, err := os.OpenFile(target, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
+	defer held.Close()
+
 	st, err := Apply(Options{Mounts: []HostMount{{Path: target, File: true}}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
@@ -607,6 +1028,11 @@ func runFileMountChild() error {
 	if !st.Applied || !st.UnboundFileOpenBlocked {
 		return fmt.Errorf("status = %+v, want an applied lockdown that blocks unbound opens", st)
 	}
+	b := ActiveWindowsFileBroker()
+	if b == nil {
+		return errors.New("broker is nil")
+	}
+
 	var errs []error
 	if _, err := held.WriteString("held"); err != nil {
 		errs = append(errs, fmt.Errorf("write through the pre-opened handle: %w", err))
@@ -620,29 +1046,34 @@ func runFileMountChild() error {
 			done <- []error{fmt.Errorf("BindThread: %w", err)}
 			return
 		}
-		f, err := root.OpenFile("target.txt", os.O_RDWR, 0)
+		h, err := b.OpenAt(
+			parentDir,
+			"target.txt",
+			windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE,
+			windows.FILE_ATTRIBUTE_NORMAL,
+			windows.FILE_OPEN,
+			windows.FILE_NON_DIRECTORY_FILE,
+		)
 		if err != nil {
-			threadErrs = append(threadErrs, fmt.Errorf("open the file mount through the root on a bound thread: %w", err))
+			threadErrs = append(threadErrs, fmt.Errorf("broker open file mount: %w", err))
 		} else {
-			if _, err := f.WriteString("bound"); err != nil {
-				threadErrs = append(threadErrs, fmt.Errorf("write the file mount on a bound thread: %w", err))
+			f := os.NewFile(uintptr(h), "target.txt")
+			if _, werr := f.WriteString("bound"); werr != nil {
+				threadErrs = append(threadErrs, fmt.Errorf("write file mount handle: %w", werr))
 			}
 			_ = f.Close()
 		}
-		if f, err := root.Open("sibling.txt"); err == nil {
-			_ = f.Close()
-			threadErrs = append(threadErrs, errors.New("open of the sibling file through the root succeeded"))
-		} else if !errors.Is(err, fs.ErrPermission) {
-			threadErrs = append(threadErrs, fmt.Errorf("open sibling through the root = %v, want a permission error", err))
+		if _, err := brokerReadFile(b, parentDir, "sibling.txt"); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			threadErrs = append(threadErrs, fmt.Errorf("broker open sibling = %v, want ERROR_ACCESS_DENIED", err))
+		}
+		if err := brokerWriteFile(b, parentDir, "created.txt", "x"); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			threadErrs = append(threadErrs, fmt.Errorf("broker create next to file mount = %v, want ERROR_ACCESS_DENIED", err))
 		}
 		if _, err := os.ReadFile(filepath.Join(dir, "sibling.txt")); !errors.Is(err, fs.ErrPermission) {
 			threadErrs = append(threadErrs, fmt.Errorf("read sibling by path = %v, want a permission error", err))
 		}
 		if _, err := os.ReadDir(dir); !errors.Is(err, fs.ErrPermission) {
 			threadErrs = append(threadErrs, fmt.Errorf("list the parent of the file mount = %v, want a permission error", err))
-		}
-		if _, err := root.OpenFile("created.txt", os.O_CREATE|os.O_RDWR, 0o600); !errors.Is(err, fs.ErrPermission) {
-			threadErrs = append(threadErrs, fmt.Errorf("create next to the file mount = %v, want a permission error", err))
 		}
 		done <- threadErrs
 	}()

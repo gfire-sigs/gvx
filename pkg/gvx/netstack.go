@@ -15,6 +15,7 @@
 package gvx
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -22,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
 )
@@ -52,13 +55,22 @@ func (s *Sandbox) initNetstack() error {
 		return nil
 
 	case NetModeNAT:
-		st, fwd, err := netbackend.NewNATStack(netbackend.NATConfig{
+		natCfg := netbackend.NATConfig{
 			IsolateLAN:        s.cfg.IsolateLAN,
 			DNSServers:        s.cfg.HostDNSServers,
 			StreamInterceptor: s.cfg.StreamInterceptor,
 			Stack:             s.stackOptions(),
 			Tuning:            s.cfg.Tuning,
-		})
+		}
+		if !s.cfg.DisableHostLockdown {
+			dialTimeout := s.cfg.Tuning.Duration(tuning.NATDialTimeout)
+			natCfg.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dctx, cancel := context.WithTimeout(ctx, dialTimeout)
+				defer cancel()
+				return hostlockdown.DialContext(dctx, network, addr)
+			}
+		}
+		st, fwd, err := netbackend.NewNATStack(natCfg)
 		if err != nil {
 			return err
 		}
@@ -68,6 +80,9 @@ func (s *Sandbox) initNetstack() error {
 		s.forwards = s.effectivePortForwards()
 		if len(s.forwards) > 0 {
 			pf := netbackend.NewPortForwarder(s.cfg.Tuning)
+			if !s.cfg.DisableHostLockdown {
+				pf.SetAccept(hostlockdown.AcceptListener)
+			}
 			rules := make([]netbackend.PortForwardRule, 0, len(s.forwards))
 			for _, pfSpec := range s.forwards {
 				hostIP := pfSpec.BindAddress

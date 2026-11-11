@@ -27,6 +27,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/pkg/fd"
 )
 
 // extendedFileIDType is ExtendedFileIdType of FILE_ID_TYPE. It selects the
@@ -84,6 +85,9 @@ func (h *hostRoot) existsByID(key fileKey) (bool, error) {
 	desc := fileIDDescriptor{size: uint32(unsafe.Sizeof(fileIDDescriptor{})), typ: extendedFileIDType}
 	binary.LittleEndian.PutUint64(desc.id[0:8], key.ino)
 	binary.LittleEndian.PutUint64(desc.id[8:16], key.ino2)
+	if b := fd.ActiveWindowsFileBroker(); b != nil {
+		return b.ExistsByID(h.handle, desc.id)
+	}
 	r1, _, callErr := procOpenFileByID.Call(
 		uintptr(h.handle),
 		uintptr(unsafe.Pointer(&desc)),

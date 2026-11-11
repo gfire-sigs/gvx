@@ -31,6 +31,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"z.gfire.dev/gvx/pkg/fd"
 )
 
 // hostRoot performs every host file operation relative to a directory handle
@@ -190,6 +191,9 @@ func validateWindowsName(name string) error {
 // OBJ_CASE_INSENSITIVE so that case-sensitive directories match exactly.
 // Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwcreatefile
 func openAt(dir windows.Handle, name string, access, fileAttrs, disposition, options uint32) (windows.Handle, error) {
+	if b := fd.ActiveWindowsFileBroker(); b != nil {
+		return b.OpenAt(dir, name, access, fileAttrs, disposition, options)
+	}
 	if name == "." {
 		name = ""
 	}
@@ -668,6 +672,17 @@ const fileFullDirectoryInformation = 2
 
 var procNtQueryDirectoryFile = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryDirectoryFile")
 
+func fallbackPathLeaf(dir, handle windows.Handle) (string, error) {
+	leaf, err := finalPathLeaf(handle)
+	if err == nil {
+		return leaf, nil
+	}
+	if b := fd.ActiveWindowsFileBroker(); b != nil && errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return b.FinalPathLeaf(dir, handle)
+	}
+	return "", err
+}
+
 // storedNameIn queries the directory dir for the single entry matching name and
 // returns its stored name. The stored name carries the on-disk case and the
 // long form of the name. Unlike GetFinalPathNameByHandle, it reads only dir and
@@ -678,7 +693,7 @@ func storedNameIn(dir, handle windows.Handle, name string) (string, error) {
 	listHandle, err := openAt(dir, "", windows.FILE_LIST_DIRECTORY, windows.FILE_ATTRIBUTE_NORMAL,
 		windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE)
 	if err != nil {
-		return finalPathLeaf(handle)
+		return fallbackPathLeaf(dir, handle)
 	}
 	defer closeHandle(listHandle)
 	filter, err := windows.NewNTUnicodeString(name)
@@ -703,7 +718,7 @@ func storedNameIn(dir, handle windows.Handle, name string) (string, error) {
 	)
 	runtime.KeepAlive(filter)
 	if r1 != 0 {
-		return finalPathLeaf(handle)
+		return fallbackPathLeaf(dir, handle)
 	}
 	nameLen := int(binary.LittleEndian.Uint32(buf[dirInfoNameLengthOffset:]))
 	if nameLen%2 != 0 || dirInfoNameOffset+nameLen > len(buf) {
