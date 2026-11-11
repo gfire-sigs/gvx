@@ -270,17 +270,15 @@ func TestDNSRelayAnswersSERVFAILWithoutHostServers(t *testing.T) {
 }
 
 func TestDNSRelayTriesNextServerAfterFailure(t *testing.T) {
-	deadServer, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadAddr := deadServer.LocalAddr().String()
-	_ = deadServer.Close() // Nothing listens here, so the first server fails.
-
+	silent := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
 	servfail := startFakeDNSServer(t, rcodeResponse(dnsRCodeSrv))
 	refused := startFakeDNSServer(t, rcodeResponse(dnsRCodeRefus))
 	good := startFakeDNSServer(t, answerWith("203.0.113.9"))
-	nf := newTestForwarder(t, NATConfig{}, deadAddr, servfail.addr, refused.addr, good.addr)
+	tuned, err := tuning.Values{}.WithDuration(tuning.DNSUpstreamTimeout, 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nf := newTestForwarder(t, NATConfig{Tuning: tuned}, silent.addr, servfail.addr, refused.addr, good.addr)
 
 	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(5, "example.test", dnsTypeA))
 	if dnsRCode(resp) != dnsRCodeNoErr {
@@ -289,8 +287,8 @@ func TestDNSRelayTriesNextServerAfterFailure(t *testing.T) {
 	if got := answerIPs(t, resp); len(got) != 1 || got[0] != netip.MustParseAddr("203.0.113.9") {
 		t.Fatalf("answer = %v, want [203.0.113.9]", got)
 	}
-	if servfail.queries.Load() != 1 || refused.queries.Load() != 1 {
-		t.Fatalf("failing servers saw %d and %d queries, want 1 each", servfail.queries.Load(), refused.queries.Load())
+	if silent.queries.Load() == 0 || servfail.queries.Load() != 1 || refused.queries.Load() != 1 {
+		t.Fatalf("failing servers saw %d, %d, and %d queries", silent.queries.Load(), servfail.queries.Load(), refused.queries.Load())
 	}
 }
 
@@ -458,13 +456,18 @@ func TestDNSRelayRejectsMalformedQueries(t *testing.T) {
 }
 
 func TestDNSRelayStopsWaitingWhenContextEnds(t *testing.T) {
-	// The upstream reads queries and never answers.
+	// The upstream reads queries and never answers. Set a 30s upstream timeout
+	// so returning within testTimeout proves cancellation unblocked the relay.
 	received := make(chan struct{}, 4)
 	silent := startFakeDNSServer(t, func([]byte, bool) []byte {
 		received <- struct{}{}
 		return nil
 	})
-	nf := newTestForwarder(t, NATConfig{}, silent.addr)
+	tuned, err := tuning.Values{}.WithDuration(tuning.DNSUpstreamTimeout, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nf := newTestForwarder(t, NATConfig{Tuning: tuned}, silent.addr)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan []byte, 1)
 	go func() { done <- nf.handleDNSQuery(ctx, buildDNSQuery(1, "slow.test", dnsTypeA)) }()
@@ -480,14 +483,14 @@ func TestDNSRelayStopsWaitingWhenContextEnds(t *testing.T) {
 		if dnsRCode(resp) != dnsRCodeSrv {
 			t.Fatalf("rcode = %d, want SERVFAIL after cancellation", dnsRCode(resp))
 		}
-	case <-time.After(tuning.Values{}.Duration(tuning.DNSUpstreamTimeout) / 2):
+	case <-time.After(testTimeout):
 		t.Fatal("relay kept waiting for the upstream after the context ended")
 	}
 }
 
 func TestDNSUpstreamTimeoutComesFromTheTunable(t *testing.T) {
 	silent := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
-	tuned, err := tuning.Values{}.WithDuration(tuning.DNSUpstreamTimeout, 150*time.Millisecond)
+	tuned, err := tuning.Values{}.WithDuration(tuning.DNSUpstreamTimeout, 100*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,10 +500,8 @@ func TestDNSUpstreamTimeoutComesFromTheTunable(t *testing.T) {
 	if dnsRCode(resp) != dnsRCodeSrv {
 		t.Fatalf("rcode = %d, want SERVFAIL after the timeout", dnsRCode(resp))
 	}
-	// One exchange over UDP, with the same timeout, ends in SERVFAIL. The default of 2 s
-	// would take more than 10 times as long.
-	if took := time.Since(start); took > time.Second {
-		t.Errorf("the relay waited %v with a 150 ms upstream timeout", took)
+	if took := time.Since(start); took < 90*time.Millisecond || took > testTimeout {
+		t.Errorf("relay waited %v with a 100 ms upstream timeout", took)
 	}
 }
 

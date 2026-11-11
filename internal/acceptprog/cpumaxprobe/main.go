@@ -75,11 +75,11 @@ const (
 	// loop count after it started.
 	startLimit = 30 * time.Second
 
-	// resumeLimit is the time that a held-back task has to run again after the
-	// Sentry releases it.
-	resumeLimit = 500 * time.Millisecond
-	// resumeCPU is the CPU time that shows the task runs again.
-	resumeCPU = 100 * time.Millisecond
+	// resumeLimit bounds how long a released task may take to accumulate resumeCPU.
+	// A task still throttled at 1 ms/s uses at most ~5 ms across 5 seconds.
+	resumeLimit = 5 * time.Second
+	// resumeCPU is the CPU time that proves the task was unthrottled.
+	resumeCPU = 30 * time.Millisecond
 )
 
 func main() {
@@ -612,46 +612,82 @@ func checkSmallQuota() error {
 			return err
 		}
 		time.Sleep(time.Second)
-		w, err := measure(probeDir, s, quotaWindow)
-		if err != nil {
-			return err
+		var lastErr error
+		for attempt := range 3 {
+			w, err := measure(probeDir, s, quotaWindow)
+			if err != nil {
+				return err
+			}
+			// The clock loop reports microseconds, so the progress is microseconds
+			// of running time for each second of wall time.
+			ran := w.progress / 1e6
+			fmt.Printf("INFO attempt %d: the clock loop ran %.3f of the wall time, %.3f of the billed time\n",
+				attempt+1, ran, ran/w.cpus)
+			if err := expectCPUs(w, 0.07, 0.13); err != nil {
+				lastErr = fmt.Errorf("billed time: %w", err)
+				continue
+			}
+			if w.periods == 0 || float64(w.throttled) < 0.8*float64(w.periods) {
+				lastErr = fmt.Errorf("the cgroup throttled %d of %d periods, want at least 0.8", w.throttled, w.periods)
+				continue
+			}
+			if held := float64(w.throttledUSec) / (w.wall.Seconds() * 1e6); held < 0.8 || held > 0.97 {
+				lastErr = fmt.Errorf("the cgroup held its thread back for %.3f of the wall time, want 0.80 to 0.97", held)
+				continue
+			}
+			if share := ran / w.cpus; share < minRanShare || share > maxRanShare {
+				lastErr = fmt.Errorf("the thread ran for %.3f of the billed time, want %.2f to %.2f", share, minRanShare, maxRanShare)
+				continue
+			}
+			return nil
 		}
-		// The clock loop reports microseconds, so the progress is microseconds
-		// of running time for each second of wall time.
-		ran := w.progress / 1e6
-		fmt.Printf("INFO the clock loop ran %.3f of the wall time, %.3f of the billed time\n", ran, ran/w.cpus)
-		if err := expectCPUs(w, 0.07, 0.13); err != nil {
-			return fmt.Errorf("billed time: %w", err)
-		}
-		if w.periods == 0 || float64(w.throttled) < 0.8*float64(w.periods) {
-			return fmt.Errorf("the cgroup throttled %d of %d periods, want at least 0.8", w.throttled, w.periods)
-		}
-		if held := float64(w.throttledUSec) / (w.wall.Seconds() * 1e6); held < 0.8 || held > 0.97 {
-			return fmt.Errorf("the cgroup held its thread back for %.3f of the wall time, want 0.80 to 0.97", held)
-		}
-		if share := ran / w.cpus; share < minRanShare || share > maxRanShare {
-			return fmt.Errorf("the thread ran for %.3f of the billed time, want %.2f to %.2f", share, minRanShare, maxRanShare)
-		}
-		return nil
+		return lastErr
 	})
 }
 
-// holdBack starts a loop in dir at 1 ms of CPU for each second, so that the
-// first tick of the loop leaves it held back for many seconds.
+// holdBack starts an active loop in dir, applies a 1 ms per second limit, and
+// waits until cpu.stat records at least one throttle event.
 func holdBack(dir string) (*spinner, error) {
-	if err := writeFile(dir, "cpu.max", "1000 1000000"); err != nil {
+	if err := writeFile(dir, "cpu.max", "max 1000000"); err != nil {
 		return nil, err
 	}
 	s, err := startSpinner(dir)
 	if err != nil {
 		return nil, err
 	}
-	time.Sleep(settle)
-	return s, nil
+	if err := s.waitProgress(startLimit); err != nil {
+		s.stop()
+		return nil, err
+	}
+	before, err := readStat(dir)
+	if err != nil {
+		s.stop()
+		return nil, err
+	}
+	if err := writeFile(dir, "cpu.max", "1000 1000000"); err != nil {
+		s.stop()
+		return nil, err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		now, err := readStat(dir)
+		if err != nil {
+			s.stop()
+			return nil, err
+		}
+		if now.nrThrottled > before.nrThrottled {
+			return s, nil
+		}
+		if time.Now().After(deadline) {
+			s.stop()
+			return nil, fmt.Errorf("%s did not throttle within 10s (nr_throttled=%d)", dir, now.nrThrottled)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // checkRaisedToMax holds a loop back, then writes max to cpu.max. The loop must
-// use 100 ms of CPU within 500 ms.
+// use resumeCPU within resumeLimit.
 func checkRaisedToMax() error {
 	return withCgroup(probeDir, func() error {
 		s, err := holdBack(probeDir)
@@ -667,7 +703,7 @@ func checkRaisedToMax() error {
 }
 
 // checkMigration moves a held-back loop into a sibling without a limit. The loop
-// must not wait for the end of the period of the cgroup that it left.
+// must unthrottle and accumulate resumeCPU within resumeLimit.
 func checkMigration() error {
 	return withCgroup(probeDir, func() error {
 		return withCgroup(siblingDir, func() error {

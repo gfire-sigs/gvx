@@ -23,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -122,47 +123,94 @@ func TestRelayDatagramsForwardsBothDirections(t *testing.T) {
 }
 
 func TestRelayDatagramsKeepsSessionWhileOneDirectionIsActive(t *testing.T) {
-	const idle = 1500 * time.Millisecond
-	guestPeer, hostPeer, guestSide, hostSide, done := startRelay(t, t.Context(), idle)
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 1500 * time.Millisecond
+		guestPeer, guestConn := net.Pipe()
+		hostPeer, hostConn := net.Pipe()
+		defer guestPeer.Close()
+		defer hostPeer.Close()
 
-	// The guest sends once and then stays quiet. Its direction goes idle,
-	// but the host keeps sending for longer than the idle timeout. The session
-	// must survive because the two directions share one activity clock.
-	guestPeer.send("request", guestSide)
-	if got, _ := hostPeer.recv(); got != "request" {
-		t.Fatalf("host received %q", got)
-	}
-	start := time.Now()
-	tick := time.NewTicker(idle / 4)
-	defer tick.Stop()
-	for i := 0; time.Since(start) < idle+idle/2; i++ {
-		<-tick.C
-		hostPeer.send("reply", hostSide)
-		if got, _ := guestPeer.recv(); got != "reply" {
-			t.Fatalf("guest received %q, want reply", got)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagrams(t.Context(), guestConn, hostConn, idle)
+		}()
+
+		exchange := func(src, dst net.Conn, msg string) {
+			t.Helper()
+			errCh := make(chan error, 1)
+			go func() {
+				_, err := src.Write([]byte(msg))
+				errCh <- err
+			}()
+			buf := make([]byte, 64)
+			n, err := dst.Read(buf)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if err := <-errCh; err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if got := string(buf[:n]); got != msg {
+				t.Fatalf("received %q, want %q", got, msg)
+			}
 		}
+
+		// The guest sends once and stays quiet while the host keeps sending past
+		// the idle timeout. Both directions share one activity clock.
+		exchange(guestPeer, hostPeer, "request")
+		for range 6 {
+			time.Sleep(idle / 4)
+			synctest.Wait()
+			select {
+			case <-done:
+				t.Fatal("relay ended while the host direction remained active")
+			default:
+			}
+			exchange(hostPeer, guestPeer, "reply")
+		}
+
+		// Advance virtual time to the full idle window with both sides quiet.
+		time.Sleep(idle)
+		synctest.Wait()
 		select {
 		case <-done:
-			t.Fatalf("relay ended after %s although the host was active", time.Since(start))
 		default:
+			t.Fatal("relay stayed open after both directions went idle")
 		}
-	}
-
-	// With both directions quiet, the session expires and the relay returns.
-	select {
-	case <-done:
-	case <-time.After(testTimeout):
-		t.Fatal("relay stayed open after both directions went idle")
-	}
+	})
 }
 
 func TestRelayDatagramsExpiresWhenIdle(t *testing.T) {
-	_, _, _, _, done := startRelay(t, t.Context(), 200*time.Millisecond)
-	select {
-	case <-done:
-	case <-time.After(testTimeout):
-		t.Fatal("relay stayed open with no traffic")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		const idle = 200 * time.Millisecond
+		guestPeer, guestConn := net.Pipe()
+		hostPeer, hostConn := net.Pipe()
+		defer guestPeer.Close()
+		defer hostPeer.Close()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			relayDatagrams(t.Context(), guestConn, hostConn, idle)
+		}()
+
+		time.Sleep(idle / 2)
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("relay expired before its idle timeout")
+		default:
+		}
+
+		time.Sleep(idle / 2)
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("relay stayed open with no traffic")
+		}
+	})
 }
 
 func TestRelayDatagramsStopsOnContextAndClosesConnections(t *testing.T) {

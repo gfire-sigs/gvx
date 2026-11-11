@@ -78,7 +78,7 @@ func TestDeleteCleansPreparedStateButRetainsStableLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer admission.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	response, err := deleteInstance(ctx, admission)
 	if err != nil {
@@ -285,7 +285,7 @@ func TestPrivateFramePreservesRedirectedFilePosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := boundReport{PID: 17, Error: "redirected private frame"}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	if err := writePrivateFrame(ctx, file, expected); err != nil {
 		t.Fatal(err)

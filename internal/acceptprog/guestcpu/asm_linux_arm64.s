@@ -174,9 +174,11 @@ TEXT ·runSpin(SB), NOSPLIT|NOFRAME, $0-16
 	LOAD_X
 	LOAD_X30
 	LOAD_X9
+	MOVD  $·spinWaiting(SB), R0
+	STLRW ZR, (R0)
 spin:
 	MOVD  $·spinFlag(SB), R0
-	MOVWU (R0), R0
+	LDARW (R0), R0
 	CBZW  R0, spin
 	STORE_STATE
 	LEAVE
@@ -340,6 +342,9 @@ fixpage:
 	MOVD  $226, R8 // mprotect
 	SVC   $0
 trash:
+	MOVD  $·handlerDone(SB), R3
+	MOVD  $1, R4
+	STLRW R4, (R3)
 	MOVD $·trashState(SB), R9
 	LOAD_CTL_VEC
 	LOAD_X

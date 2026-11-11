@@ -55,20 +55,24 @@ func runtimeClockTolerance() stdtime.Duration {
 }
 
 // TestMonotonicNanosecondsTracksRuntimeClock compares deltas with the Go runtime
-// monotonic clock. A wrong unit or a wrong clock source shows up as a large
-// mismatch.
+// monotonic clock. Each host reading sits between two Go clock readings so
+// thread preemption widens the valid interval instead of causing false failure.
 func TestMonotonicNanosecondsTracksRuntimeClock(t *testing.T) {
 	tol := runtimeClockTolerance()
+	goStart0 := stdtime.Now()
 	hostStart := MonotonicNanoseconds()
-	goStart := stdtime.Now()
+	goStart1 := stdtime.Now()
 	spinFor(20 * stdtime.Millisecond)
-	hostElapsed := stdtime.Duration(MonotonicNanoseconds() - hostStart)
-	goElapsed := stdtime.Since(goStart)
-	if hostElapsed < 20*stdtime.Millisecond-tol {
-		t.Fatalf("host clock advanced %v while the runtime clock advanced %v", hostElapsed, goElapsed)
-	}
-	if diff := hostElapsed - goElapsed; diff < -tol || diff > tol {
-		t.Fatalf("host clock advanced %v, runtime clock advanced %v, want a difference below %v", hostElapsed, goElapsed, tol)
+	goEnd0 := stdtime.Now()
+	hostEnd := MonotonicNanoseconds()
+	goEnd1 := stdtime.Now()
+
+	hostElapsed := stdtime.Duration(hostEnd - hostStart)
+	minGo := goEnd0.Sub(goStart1)
+	maxGo := goEnd1.Sub(goStart0)
+	if hostElapsed < minGo-tol || hostElapsed > maxGo+tol {
+		t.Fatalf("host clock advanced %v, runtime clock interval [%v, %v] with tolerance %v",
+			hostElapsed, minGo, maxGo, tol)
 	}
 }
 
@@ -78,16 +82,22 @@ func TestCounterTicksMatchFrequency(t *testing.T) {
 	if freq == 0 {
 		t.Fatal("CounterFrequencyHz returned 0")
 	}
-	ticksStart, nsStart := ReadCounterTicks(), MonotonicNanoseconds()
+	nsStart0 := MonotonicNanoseconds()
+	ticksStart := ReadCounterTicks()
+	nsStart1 := MonotonicNanoseconds()
 	spinFor(20 * stdtime.Millisecond)
-	ticksEnd, nsEnd := ReadCounterTicks(), MonotonicNanoseconds()
+	nsEnd0 := MonotonicNanoseconds()
+	ticksEnd := ReadCounterTicks()
+	nsEnd1 := MonotonicNanoseconds()
 	if ticksEnd <= ticksStart {
 		t.Fatalf("counter ticks did not advance: %d -> %d", ticksStart, ticksEnd)
 	}
 	fromTicks := float64(ticksEnd-ticksStart) / float64(freq) * 1e9
-	fromClock := float64(nsEnd - nsStart)
-	if ratio := fromTicks / fromClock; ratio < 0.95 || ratio > 1.05 {
-		t.Fatalf("counter delta is %.0fns at %dHz, clock delta is %.0fns, ratio %.3f outside 0.95..1.05", fromTicks, freq, fromClock, ratio)
+	minClock := float64(nsEnd0 - nsStart1)
+	maxClock := float64(nsEnd1 - nsStart0)
+	if (minClock > 0 && fromTicks < minClock*0.95) || fromTicks > maxClock*1.05 {
+		t.Fatalf("counter delta is %.0fns at %dHz, clock interval is [%.0fns, %.0fns]",
+			fromTicks, freq, minClock, maxClock)
 	}
 }
 

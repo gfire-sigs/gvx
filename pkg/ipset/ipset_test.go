@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -930,46 +931,59 @@ func TestListSetGivesTheSkbInfoOfTheMatchingMember(t *testing.T) {
 	}
 }
 
-// TestHugeRangeDoesNotBlockPackets deletes a range of 16 million addresses. The
-// operation once held the lock of the set until it ended, so a packet test of
-// the same set waited for seconds.
+// TestHugeRangeDoesNotBlockPackets deletes a multi-chunk address range alongside a packet lookup.
+// It verifies that the lookup acquires the set lock at a chunk boundary.
 func TestHugeRangeDoesNotBlockPackets(t *testing.T) {
-	if testing.Short() {
-		t.Skip("the range walk takes seconds")
-	}
 	r, _ := newTestRegistry(t)
 	create(t, r, "s", "hash:ip", FamilyIPv4, nil)
 	uadt(r, "s", AdtAdd, hostElem("10.0.0.1"), 0)
 	id, _, _ := r.Lookup("s")
 
-	done := make(chan int)
+	r.mu.RLock()
+	_, s := r.find("s")
+	r.mu.RUnlock()
+
+	yielded := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	s.rangeYieldHook = func() {
+		once.Do(func() {
+			close(yielded)
+			<-resume
+		})
+	}
+
+	done := make(chan int, 1)
 	go func() {
-		e := Element{Has: HasIP | HasCIDR, IP: ip4("11.0.0.0"), CIDR: 8}
+		e := Element{Has: HasIP | HasCIDR, IP: ip4("11.0.0.0"), CIDR: 16}
 		done <- uadt(r, "s", AdtDel, e, FlagExist)
 	}()
-	time.Sleep(50 * time.Millisecond)
-	pkt := &Packet{Family: FamilyIPv4, Src: ip4("10.0.0.1")}
-	opt := &KOpt{Dim: 1, Flags: KDimOneSrc, Timeout: NoTimeout}
-	var worst time.Duration
-	running := true
-	for i := 0; i < 20 && running; i++ {
-		start := time.Now()
-		if r.Test(id, pkt, opt) <= 0 {
-			t.Fatal("the member does not match")
-		}
-		worst = max(worst, time.Since(start))
-		select {
-		case <-done:
-			running = false
-		case <-time.After(20 * time.Millisecond):
-		}
+
+	select {
+	case <-yielded:
+	case <-time.After(10 * time.Second):
+		t.Fatal("range delete did not yield at rangeChunk")
 	}
-	if running {
-		if got := <-done; got != 0 {
-			t.Errorf("range delete = %d, want 0", got)
+
+	// While the range delete is paused at the chunk yield point, a packet lookup
+	// must acquire s.mu and succeed without blocking on the range delete.
+	lookupDone := make(chan int, 1)
+	go func() {
+		pkt := &Packet{Family: FamilyIPv4, Src: ip4("10.0.0.1")}
+		opt := &KOpt{Dim: 1, Flags: KDimOneSrc, Timeout: NoTimeout}
+		lookupDone <- r.Test(id, pkt, opt)
+	}()
+	select {
+	case got := <-lookupDone:
+		if got <= 0 {
+			t.Fatal("the member does not match during range yield")
 		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("packet lookup blocked while range delete paused at yield point")
 	}
-	if worst > 100*time.Millisecond {
-		t.Errorf("a packet test waited %v for a range operation", worst)
+
+	close(resume)
+	if got := <-done; got != 0 {
+		t.Errorf("range delete = %d, want 0", got)
 	}
 }

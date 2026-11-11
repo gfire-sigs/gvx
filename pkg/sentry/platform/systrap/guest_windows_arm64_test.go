@@ -102,6 +102,16 @@ func gSpin() []byte { return wordBytes(0x14000000) } // b .
 // gCountSpin increments the return register forever.
 func gCountSpin() []byte { return wordBytes(0x91000400, 0x17ffffff) } // add x0, x0, #1; b -4
 
+// gCountSpinAt increments the return register and writes it to addr forever.
+func gCountSpinAt(addr uint64) []byte {
+	c := gConst(1, addr)
+	return append(c, wordBytes(
+		0x91000400, // loop: add x0, x0, #1
+		0xf9000020, // str x0, [x1]
+		0x17fffffe, // b loop
+	)...)
+}
+
 // gCountInMemory increments the word at addr forever. The Sentry reads the
 // word to see that the guest runs.
 func gCountInMemory(addr uint64) []byte {

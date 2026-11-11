@@ -1343,6 +1343,17 @@ func TestReadOnlyWorkspaceRejectsMutationsThroughTheVFS(t *testing.T) {
 	wantErrno(t, "chmod on read-only workspace", e.setStat("f", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}), linuxerr.EROFS)
 }
 
+func waitWallClockPast(t *testing.T, ns int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().UnixNano() <= ns {
+		if time.Now().After(deadline) {
+			t.Fatalf("wall clock %d did not advance past %d", time.Now().UnixNano(), ns)
+		}
+		runtime.Gosched()
+	}
+}
+
 func TestVirtualMetadataUpdatesCtimeAndClearsBlockSocketPrivileges(t *testing.T) {
 	e := newEnv(t)
 	e.writeFile("f", []byte("data"))
@@ -1350,7 +1361,7 @@ func TestVirtualMetadataUpdatesCtimeAndClearsBlockSocketPrivileges(t *testing.T)
 		t.Fatalf("link: %v", err)
 	}
 	before := e.mustStat("f")
-	time.Sleep(2 * time.Millisecond)
+	waitWallClockPast(t, before.Ctime.ToNsec())
 
 	if err := e.setStat("f", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}); err != nil {
 		t.Fatalf("chmod f: %v", err)
@@ -1394,7 +1405,7 @@ func TestVirtualSymlinkUpdatesParentDirMtimeAndCtime(t *testing.T) {
 	e := newEnv(t)
 	e.mustMkdir("dir")
 	t0 := e.mustStat("dir")
-	time.Sleep(2 * time.Millisecond)
+	waitWallClockPast(t, max(t0.Mtime.ToNsec(), t0.Ctime.ToNsec()))
 
 	if err := e.vfsObj.SymlinkAt(e.ctx, e.creds, e.pop("dir/sym"), "target"); err != nil {
 		t.Fatalf("symlink: %v", err)
@@ -1405,7 +1416,7 @@ func TestVirtualSymlinkUpdatesParentDirMtimeAndCtime(t *testing.T) {
 			t0.Mtime.ToNsec(), t0.Ctime.ToNsec(), t1.Mtime.ToNsec(), t1.Ctime.ToNsec())
 	}
 
-	time.Sleep(2 * time.Millisecond)
+	waitWallClockPast(t, max(t1.Mtime.ToNsec(), t1.Ctime.ToNsec()))
 	if err := e.unlink("dir/sym"); err != nil {
 		t.Fatalf("unlink sym: %v", err)
 	}

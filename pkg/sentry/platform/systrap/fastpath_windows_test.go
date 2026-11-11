@@ -19,9 +19,12 @@ package systrap
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -106,7 +109,9 @@ func TestFastPathChangedProgramCounterTakesColdResume(t *testing.T) {
 
 func TestFastPathInterruptStopsGuestAfterSystemCall(t *testing.T) {
 	r := newRig(t, newFastPlatform(t))
-	r.program(gSyscall(1), gCountSpin())
+	r.program(gSyscall(1), gCountSpinAt(dataVA))
+	counter := r.mapPage(dataVA, hostarch.ReadWrite)
+	counterWord := (*uint64)(unsafe.Pointer(&counter[0]))
 	si, _, err := r.run()
 	mustSyscall(t, si, err, 1, r.ac)
 	type result struct {
@@ -118,7 +123,13 @@ func TestFastPathInterruptStopsGuestAfterSystemCall(t *testing.T) {
 		si, _, err := r.run()
 		done <- result{si, err}
 	}()
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(20 * time.Second)
+	for atomic.LoadUint64(counterWord) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("guest did not reach the spin loop after the fast system call")
+		}
+		runtime.Gosched()
+	}
 	r.ctx.Interrupt()
 	select {
 	case res := <-done:
@@ -664,9 +675,10 @@ func TestKickDuringColdResumeInterruptsTheGuest(t *testing.T) {
 		}
 		done <- err
 	}()
-	// Kick many times while the resume and the loop run, so some kicks land
-	// while the thread waits at the trap of the cold resume.
-	for range 200 {
+	// Kick repeatedly while the resume and the loop run, so kicks land while
+	// the thread waits at the trap of the cold resume.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
 		r.ctx.Interrupt()
 		select {
 		case err := <-done:
@@ -674,10 +686,10 @@ func TestKickDuringColdResumeInterruptsTheGuest(t *testing.T) {
 				t.Fatalf("Switch returned %v, want ErrContextInterrupt", err)
 			}
 			return
-		case <-time.After(time.Millisecond):
+		case <-time.After(2 * time.Millisecond):
 		}
 	}
-	t.Fatal("the guest did not stop after 200 kicks")
+	t.Fatal("the guest did not stop within 10s of repeated kicks")
 }
 
 // TestFastPathLeavesGuestFaultsAsSegv runs a fast system call and then a load

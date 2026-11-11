@@ -171,6 +171,7 @@ TEXT ·runSyscall(SB), NOSPLIT, $const_frameSize-16
 TEXT ·runSpin(SB), NOSPLIT, $const_frameSize-16
 	ENTER
 	LOAD_STATE
+	MOVL $0, ·spinWaiting(SB)
 spin:
 	PAUSE
 	CMPL ·spinFlag(SB), $0
@@ -359,6 +360,7 @@ fixpage:
 	MOVL $10, AX // mprotect
 	SYSCALL
 trash:
+	MOVL $1, ·handlerDone(SB)
 	MOVQ $·trashState(SB), R15
 	LOAD_STATE
 	RET

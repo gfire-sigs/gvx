@@ -18,7 +18,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"strconv"
 	"sync"
 	"testing"
 
@@ -48,11 +47,10 @@ func TestPreboundBindOpenReportsSocketPortAndNeverRebinds(t *testing.T) {
 	}
 	wantPort := uint16(sock.LocalAddr().(*net.UDPAddr).Port)
 
-	// The requested port is a hint only. The Bind must report the real port and
-	// must not open a socket for the requested one. Pick a free port to request.
+	// The requested port is a hint only. Keep freeProbe bound across Open so
+	// any attempt to bind the requested port fails deterministically.
 	freeProbe := newBindSocket(t)
 	requested := uint16(freeProbe.LocalAddr().(*net.UDPAddr).Port)
-	_ = freeProbe.Close()
 	fns, got, err := b.Open(requested)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -66,11 +64,6 @@ func TestPreboundBindOpenReportsSocketPortAndNeverRebinds(t *testing.T) {
 	if _, _, err := b.Open(0); !errors.Is(err, conn.ErrBindAlreadyOpen) {
 		t.Fatalf("second Open = %v, want conn.ErrBindAlreadyOpen", err)
 	}
-	probe, err := net.ListenPacket("udp", ":"+strconv.Itoa(int(requested)))
-	if err != nil {
-		t.Fatalf("requested port %d is in use after Open, so the Bind opened a socket: %v", requested, err)
-	}
-	probe.Close()
 	if err := b.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

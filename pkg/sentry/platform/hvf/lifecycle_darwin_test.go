@@ -439,12 +439,16 @@ func TestInterruptEndsAWaitForAVCPU(t *testing.T) {
 
 	waitRes := waiter.switchAsync()
 	// The waiter blocks: the only vCPU runs the hog. Wait until it queued.
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		plat.vm.pool.mu.Lock()
 		queued := len(plat.vm.pool.waiters)
 		plat.vm.pool.mu.Unlock()
 		if queued == 1 {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter did not queue on the vCPU pool within 10s")
 		}
 		runtime.Gosched()
 	}

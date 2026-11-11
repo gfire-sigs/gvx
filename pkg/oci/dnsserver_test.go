@@ -33,6 +33,7 @@ const (
 	dnsClassIN    = 1
 	// dnsFlagsResponse is a response with the RD and RA bits set.
 	dnsFlagsResponse = 0x8180
+	dnsRCodeServFail = 2
 	dnsRCodeNXDomain = 3
 	// dnsAnswerTTL is the lifetime of an answer in seconds.
 	dnsAnswerTTL = 60
@@ -42,6 +43,7 @@ const (
 type testDNS struct {
 	addr    netip.AddrPort
 	hosts   map[string]netip.Addr
+	rcode   uint16
 	queries atomic.Int64
 }
 
@@ -51,11 +53,23 @@ type testDNS struct {
 // gets an empty NOERROR answer.
 func startTestDNS(t testing.TB, hosts map[string]netip.Addr) *testDNS {
 	t.Helper()
+	return startTestDNSWithRCode(t, hosts, 0)
+}
+
+// startFailingTestDNS listens on a free UDP port of 127.0.0.1 and answers
+// every query with SERVFAIL until the test ends.
+func startFailingTestDNS(t testing.TB) *testDNS {
+	t.Helper()
+	return startTestDNSWithRCode(t, nil, dnsRCodeServFail)
+}
+
+func startTestDNSWithRCode(t testing.TB, hosts map[string]netip.Addr, rcode uint16) *testDNS {
+	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("test DNS server: listen: %v", err)
 	}
-	s := &testDNS{addr: pc.LocalAddr().(*net.UDPAddr).AddrPort(), hosts: hosts}
+	s := &testDNS{addr: pc.LocalAddr().(*net.UDPAddr).AddrPort(), hosts: hosts, rcode: rcode}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -115,7 +129,9 @@ func (s *testDNS) answer(req []byte) []byte {
 
 	flags := uint16(dnsFlagsResponse)
 	var rdata []byte
-	if qtype == dnsTypeA {
+	if s.rcode != 0 {
+		flags |= s.rcode
+	} else if qtype == dnsTypeA {
 		if ip, ok := s.hosts[name]; ok && ip.Is4() {
 			a := ip.As4()
 			rdata = a[:]

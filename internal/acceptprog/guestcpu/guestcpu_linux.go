@@ -53,16 +53,20 @@ const (
 // arm64 the Go handler of a signal reads the g register, and in holds a test
 // value there. On every architecture, a signal that the Go runtime sends to a
 // thread that is busy in Run has no use.
+//
+//go:nosplit
 func Run(ev Event, in, out *State) {
 	switch ev {
 	case EventSyscall:
+		atomic.StoreUint32(&syscallEntered, 1)
 		runSyscall(in, out)
+		atomic.StoreUint32(&syscallEntered, 0)
 	case EventSpin:
 		runSpin(in, out)
 	case EventFault:
 		runFault(in, out)
 	default:
-		panic(fmt.Sprintf("guestcpu: unknown event %d", ev))
+		panic("guestcpu: unknown event")
 	}
 }
 
@@ -83,8 +87,15 @@ func handlerPC() uintptr
 var (
 	// spinFlag ends EventSpin when it is not zero.
 	spinFlag uint32
+	// spinWaiting clears to zero once runSpin loads state and enters its loop.
+	spinWaiting uint32
+	// syscallEntered is non-zero while Run executes runSyscall.
+	syscallEntered uint32
 	// sigCount is the number of signals that evilHandler received.
 	sigCount uint32
+	// handlerDone becomes non-zero after evilHandler records flagSeen, copies
+	// the frame, and applies any frame edits.
+	handlerDone uint32
 	// flagSeen is the value of spinFlag that evilHandler saw at its last call.
 	flagSeen uint32
 	// pageMask and pageSize describe the page that evilHandler makes writable
@@ -198,8 +209,11 @@ func ResetHandler() {
 	handlerMode = 0
 	captured = capture{}
 	atomic.StoreUint32(&sigCount, 0)
+	atomic.StoreUint32(&handlerDone, 0)
 	atomic.StoreUint32(&flagSeen, 0)
 	atomic.StoreUint32(&spinFlag, 0)
+	atomic.StoreUint32(&spinWaiting, 1)
+	atomic.StoreUint32(&syscallEntered, 0)
 }
 
 // HandlerCalls returns the number of signals that evilHandler received since
@@ -244,26 +258,51 @@ func Compare(want, got *State, skip ...int) error {
 	return errors.New(strings.Join(d, "; ") + more)
 }
 
-// SignalDelay is the time that SignalLater waits before it sends the signal,
-// and then before it calls release. It gives the thread time to enter its
-// blocking call or its loop.
-const SignalDelay = 30 * time.Millisecond
+// taskSleeping reports whether tid is in interruptible sleep ('S').
+func taskSleeping(tid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/self/task/%d/stat", tid))
+	if err != nil {
+		return false
+	}
+	idx := strings.LastIndexByte(string(data), ')')
+	return idx >= 0 && idx+2 < len(data) && data[idx+2] == 'S'
+}
 
-// SignalLater sends sig to the calling thread after SignalDelay. When release is
-// not nil, it calls release after a second delay. The returned function waits
-// for both actions. The caller must lock its OS thread. The process needs two
-// or more Ps, so that the goroutine runs while the thread is busy in Run.
+// SignalLater waits until the calling thread enters EventSpin or blocks inside
+// EventSyscall, then sends sig to the thread. When release is non-nil, it waits
+// for evilHandler to finish recording state (and for any restarted syscall to
+// block again) before calling release. The caller must lock its OS thread.
 func SignalLater(sig syscall.Signal, release func()) (wait func()) {
 	tid := syscall.Gettid()
+	atomic.StoreUint32(&spinWaiting, 1)
+	atomic.StoreUint32(&handlerDone, 0)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		time.Sleep(SignalDelay)
+		enterDeadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(enterDeadline) {
+			if atomic.LoadUint32(&spinWaiting) == 0 {
+				break
+			}
+			if atomic.LoadUint32(&syscallEntered) != 0 && taskSleeping(tid) {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
 		if err := syscall.Tgkill(os.Getpid(), tid, sig); err != nil {
 			fmt.Println("tgkill:", err)
 		}
 		if release != nil {
-			time.Sleep(SignalDelay)
+			handleDeadline := time.Now().Add(2 * time.Second)
+			for atomic.LoadUint32(&handlerDone) == 0 && time.Now().Before(handleDeadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if atomic.LoadUint32(&syscallEntered) != 0 {
+				restartDeadline := time.Now().Add(2 * time.Second)
+				for atomic.LoadUint32(&syscallEntered) != 0 && !taskSleeping(tid) && time.Now().Before(restartDeadline) {
+					time.Sleep(time.Millisecond)
+				}
+			}
 			release()
 		}
 	}()

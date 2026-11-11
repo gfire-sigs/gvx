@@ -34,6 +34,8 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -43,9 +45,8 @@ import (
 
 const (
 	defaultSignals = 100
-	// enterWait is the time that the receiver thread gets to block in its call
-	// before the first signal.
-	enterWait = 50 * time.Millisecond
+	// enterWait bounds how long startCall waits for the thread to enter sleep.
+	enterWait = 5 * time.Second
 	// signalGap is the time between two signals.
 	signalGap = time.Millisecond
 	// releaseWait is the time that a released call gets to return.
@@ -155,18 +156,44 @@ func runChecks(count int) bool {
 	return ok
 }
 
-// startCall runs the call on a locked thread and returns the thread ID and the
-// channel of the result.
-func startCall(block func() (int, error)) (int, <-chan outcome) {
+// startCall runs block on a locked OS thread, waits until the thread enters
+// interruptible sleep inside block, and returns the thread ID, result channel,
+// and a cleanup function that releases the locked OS thread.
+func startCall(block func() (int, error)) (int, <-chan outcome, func(), error) {
 	tidCh := make(chan int, 1)
 	done := make(chan outcome, 1)
+	releaseThread := make(chan struct{})
+	var entered atomic.Bool
 	go func() {
 		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 		tidCh <- unix.Gettid()
+		entered.Store(true)
 		n, err := block()
 		done <- outcome{n, err}
+		<-releaseThread
 	}()
-	return <-tidCh, done
+	tid := <-tidCh
+	statPath := fmt.Sprintf("/proc/self/task/%d/stat", tid)
+	deadline := time.Now().Add(enterWait)
+	for time.Now().Before(deadline) {
+		select {
+		case r := <-done:
+			close(releaseThread)
+			return 0, nil, func() {}, fmt.Errorf("call returned before blocking: n=%d, %w", r.n, orNone(r.err))
+		default:
+		}
+		if entered.Load() {
+			if data, err := os.ReadFile(statPath); err == nil {
+				if idx := strings.LastIndexByte(string(data), ')'); idx >= 0 && idx+2 < len(data) && data[idx+2] == 'S' {
+					return tid, done, func() { close(releaseThread) }, nil
+				}
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseThread)
+	return 0, nil, func() {}, fmt.Errorf("thread %d did not enter interruptible sleep within %v", tid, enterWait)
 }
 
 // checkRestarts blocks a thread in the call and sends it count signals. The call
@@ -177,18 +204,15 @@ func checkRestarts(c call, sig syscall.Signal, count int) error {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer closeAll()
-	tid, done := startCall(block)
-	time.Sleep(enterWait)
+	tid, done, stopThread, err := startCall(block)
+	if err != nil {
+		return err
+	}
+	defer stopThread()
 	pid := os.Getpid()
 	for i := range count {
 		if err := unix.Tgkill(pid, tid, sig); err != nil {
-			if errors.Is(err, unix.ESRCH) {
-				// The thread ended, so the call returned before the release.
-				r := <-done
-				return fmt.Errorf("the call returned before signal %d of %d, before the release: n=%d, %w",
-					i+1, count, r.n, orNone(r.err))
-			}
-			return fmt.Errorf("tgkill: %w", err)
+			return fmt.Errorf("tgkill at signal %d of %d: %w", i+1, count, err)
 		}
 		time.Sleep(signalGap)
 		select {
@@ -223,8 +247,11 @@ func checkInterrupts(c call, sig syscall.Signal) error {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer closeAll()
-	tid, done := startCall(block)
-	time.Sleep(enterWait)
+	tid, done, stopThread, err := startCall(block)
+	if err != nil {
+		return err
+	}
+	defer stopThread()
 	pid := os.Getpid()
 	deadline := time.After(eintrWait)
 	result := func(r outcome) error {
@@ -235,12 +262,6 @@ func checkInterrupts(c call, sig syscall.Signal) error {
 	}
 	for {
 		if err := unix.Tgkill(pid, tid, sig); err != nil {
-			// The thread ends when its goroutine returns, because the goroutine
-			// keeps the thread locked. A signal that arrives after the call
-			// returned finds no thread, so the result is already in done.
-			if errors.Is(err, unix.ESRCH) {
-				return result(<-done)
-			}
 			return fmt.Errorf("tgkill: %w", err)
 		}
 		select {
