@@ -18,7 +18,6 @@ package whpx
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
@@ -238,8 +237,8 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	if reloadRoot {
 		cflags |= flagReloadRoot
 	}
-	atomic.StoreUint32(&comm.Flags, cflags)
-	atomic.StoreUint32(&comm.ExitReason, uint32(ExitNone))
+	comm.Flags.Store(cflags)
+	comm.ExitReason.Store(uint32(ExitNone))
 
 	full := !st.valid || !st.parked || c.parkDirty ||
 		st.fsBase != r.Fs_base || st.gsBase != r.Gs_base ||
@@ -285,7 +284,7 @@ func (c *Context) onStubExit(v *vcpu, _ exitInfo, ac *arch.Context64) (runResult
 	comm := v.comm
 	state := ac.StateData()
 	r := &state.Regs
-	reason := ExitReason(atomic.LoadUint32(&comm.ExitReason))
+	reason := ExitReason(comm.ExitReason.Load())
 	switch reason {
 	case ExitSyscall, ExitException:
 		r.Rax, r.Rcx, r.Rdx, r.Rbx = comm.Regs[0], comm.Regs[1], comm.Regs[2], comm.Regs[3]

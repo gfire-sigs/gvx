@@ -253,7 +253,10 @@ func checkInterrupts(c call, sig syscall.Signal) error {
 	}
 	defer stopThread()
 	pid := os.Getpid()
-	deadline := time.After(eintrWait)
+	deadline := time.NewTimer(eintrWait)
+	defer deadline.Stop()
+	gapTimer := time.NewTimer(signalGap)
+	defer gapTimer.Stop()
 	result := func(r outcome) error {
 		if !errors.Is(r.err, syscall.EINTR) {
 			return fmt.Errorf("the call returned n=%d, %w, want EINTR", r.n, orNone(r.err))
@@ -264,13 +267,14 @@ func checkInterrupts(c call, sig syscall.Signal) error {
 		if err := unix.Tgkill(pid, tid, sig); err != nil {
 			return fmt.Errorf("tgkill: %w", err)
 		}
+		gapTimer.Reset(signalGap)
 		select {
 		case r := <-done:
 			return result(r)
-		case <-deadline:
+		case <-deadline.C:
 			_ = release()
 			return errors.New("the call did not return EINTR for a handler without SA_RESTART")
-		case <-time.After(signalGap):
+		case <-gapTimer.C:
 		}
 	}
 }

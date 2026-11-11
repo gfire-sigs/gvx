@@ -333,6 +333,12 @@ func (p *Platform) startPool() {
 func (p *Platform) fillPool() {
 	pool := p.pool
 	defer pool.wg.Done()
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-pool.stop:
@@ -343,10 +349,16 @@ func (p *Platform) fillPool() {
 		if err != nil {
 			// The next call of NewAddressSpace reports the failure. Wait
 			// before the next try, so that a failing host does not make a busy loop.
+			const retryDelay = 250 * time.Millisecond
+			if timer == nil {
+				timer = time.NewTimer(retryDelay)
+			} else {
+				timer.Reset(retryDelay)
+			}
 			select {
 			case <-pool.stop:
 				return
-			case <-time.After(250 * time.Millisecond):
+			case <-timer.C:
 			}
 			continue
 		}

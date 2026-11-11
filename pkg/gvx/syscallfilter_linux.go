@@ -205,6 +205,7 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 		// pin the peer port the way the Seatbelt profile does.
 		rules.Add(unix.SYS_SENDTO, seccomp.MatchAll{})
 		rules.Add(unix.SYS_RECVFROM, seccomp.MatchAll{})
+	case NetModeNone:
 	}
 	return rules
 }

@@ -15,6 +15,7 @@
 package whpx
 
 import (
+	"sync/atomic"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
@@ -120,8 +121,8 @@ type CommPage struct {
 	CS         uint64
 	SS         uint64
 	Root       uint64
-	ExitReason uint32
-	Flags      uint32
+	ExitReason atomic.Uint32
+	Flags      atomic.Uint32
 	_          [commTSSOff - commEnd]byte
 	TSS        [commTSSSize]byte
 	_          [pageSize - commTSSOff - commTSSSize]byte

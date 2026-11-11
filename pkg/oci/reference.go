@@ -69,7 +69,7 @@ func ParseReference(s string) (Reference, error) {
 			input = DockerHubRegistry + "/" + rest
 		case isRegistryComponent(first):
 			if err := validateRegistryHost(host); err != nil {
-				return Reference{}, invalidReference(s, "%v", err)
+				return Reference{}, fmt.Errorf("%w %q: %w", ErrInvalidReference, s, err)
 			}
 			input = host + "/" + rest
 		default:
@@ -82,7 +82,7 @@ func ParseReference(s string) (Reference, error) {
 	}
 	domain := strings.ToLower(reference.Domain(named))
 	if err := validateRegistryHost(domain); err != nil {
-		return Reference{}, invalidReference(s, "%v", err)
+		return Reference{}, fmt.Errorf("%w %q: %w", ErrInvalidReference, s, err)
 	}
 	tag, dgst := extractTagAndDigest(named)
 	return Reference{
@@ -104,7 +104,7 @@ func ParseReferenceAt(s, baseURL string) (Reference, error) {
 	pathSpec := s
 	if first, rest, ok := strings.Cut(s, "/"); ok && isRegistryComponent(first) {
 		if err := validateRegistryHost(strings.ToLower(first)); err != nil {
-			return Reference{}, invalidReference(s, "%v", err)
+			return Reference{}, fmt.Errorf("%w %q: %w", ErrInvalidReference, s, err)
 		}
 		pathSpec = rest
 	}
@@ -122,26 +122,22 @@ func ParseReferenceAt(s, baseURL string) (Reference, error) {
 	}, nil
 }
 
-func invalidReference(s, format string, args ...any) error {
-	return fmt.Errorf("%w %q: %s", ErrInvalidReference, s, fmt.Sprintf(format, args...))
-}
-
 func parseNamed(raw, input string) (reference.Named, error) {
 	if namePart, digestPart, hasAt := strings.Cut(raw, "@"); hasAt && namePart != "" {
 		d, err := digest.Parse(digestPart)
 		if err != nil {
-			return nil, invalidReference(raw, "invalid digest %q: %v", digestPart, err)
+			return nil, fmt.Errorf("%w %q: invalid digest %q: %w", ErrInvalidReference, raw, digestPart, err)
 		}
 		if d.Algorithm() != digest.SHA256 {
-			return nil, invalidReference(raw, "unsupported digest algorithm %q", d.Algorithm())
+			return nil, fmt.Errorf("%w %q: unsupported digest algorithm %q", ErrInvalidReference, raw, d.Algorithm())
 		}
 	}
 	named, err := reference.ParseNormalizedNamed(input)
 	if err != nil {
 		if errors.Is(err, reference.ErrNameContainsUppercase) || strings.Contains(err.Error(), "must be lowercase") {
-			return nil, invalidReference(raw, "%v (uppercase characters are not allowed)", err)
+			return nil, fmt.Errorf("%w %q: %w (uppercase characters are not allowed)", ErrInvalidReference, raw, err)
 		}
-		return nil, invalidReference(raw, "%v", err)
+		return nil, fmt.Errorf("%w %q: %w", ErrInvalidReference, raw, err)
 	}
 	return named, nil
 }

@@ -271,7 +271,7 @@ func (s *Sandbox) applyImageDefaults(img oci.RuntimeConfig) error {
 	}
 	env, err := mergeEnv(img.Env, s.cfg.Envv)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	s.cfg.Argv, s.cfg.Envv = argv, env
 	return nil

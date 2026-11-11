@@ -14,7 +14,7 @@ var errClosedHostHandle = errors.New("host handle is closed")
 
 // HostHandle wraps a POSIX file descriptor with explicit single-owner Close and Release semantics.
 type HostHandle struct {
-	raw    int64
+	raw    atomic.Int64
 	closed atomic.Bool
 }
 
@@ -23,7 +23,9 @@ func NewHostHandle(fd int) (*HostHandle, error) {
 	if fd < 0 {
 		return nil, fmt.Errorf("%w: fd=%d", errClosedHostHandle, fd)
 	}
-	return &HostHandle{raw: int64(fd)}, nil
+	h := &HostHandle{}
+	h.raw.Store(int64(fd))
+	return h, nil
 }
 
 // OpenHostPath opens a host path with O_CLOEXEC and returns an owned HostHandle.
@@ -40,7 +42,7 @@ func (h *HostHandle) RawHandle() (uintptr, error) {
 	if h == nil || h.closed.Load() {
 		return 0, errClosedHostHandle
 	}
-	return uintptr(atomic.LoadInt64(&h.raw)), nil
+	return uintptr(h.raw.Load()), nil
 }
 
 // ReadAt reads from the descriptor at offset without mutating file seek state.
@@ -66,7 +68,7 @@ func (h *HostHandle) Release() (uintptr, error) {
 	if h == nil || h.closed.Swap(true) {
 		return 0, errClosedHostHandle
 	}
-	raw := atomic.SwapInt64(&h.raw, -1)
+	raw := h.raw.Swap(-1)
 	return uintptr(raw), nil
 }
 
@@ -89,7 +91,7 @@ func (h *HostHandle) Close() error {
 	if h == nil || h.closed.Swap(true) {
 		return nil
 	}
-	raw := atomic.SwapInt64(&h.raw, -1)
+	raw := h.raw.Swap(-1)
 	if raw < 0 {
 		return nil
 	}

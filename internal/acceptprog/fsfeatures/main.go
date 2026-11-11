@@ -368,13 +368,16 @@ func sizeLimit(dir string) error {
 		{"ZERO_RANGE from below the limit", unix.FALLOC_FL_ZERO_RANGE, 0, 8 * block},
 		{"ZERO_RANGE from above the limit", unix.FALLOC_FL_ZERO_RANGE, 6 * block, block},
 	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
 	for _, c := range calls {
 		if err := wantErrno("fallocate "+c.name+" past RLIMIT_FSIZE", unix.Fallocate(fd, c.mode, c.offset, c.size), unix.EFBIG); err != nil {
 			return err
 		}
+		timer.Reset(5 * time.Second)
 		select {
 		case <-sigs:
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
 			return fmt.Errorf("fallocate %s past RLIMIT_FSIZE sent no SIGXFSZ", c.name)
 		}
 	}

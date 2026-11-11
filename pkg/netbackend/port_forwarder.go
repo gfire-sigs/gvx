@@ -565,6 +565,12 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 	}
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
 	var backoff time.Duration
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		hostConn, err := acceptFn(b.listener)
 		if err != nil {
@@ -574,10 +580,15 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 			// A transient error such as EMFILE must not end the listener.
 			backoff = min(max(2*backoff, acceptBackoffMin), acceptBackoffMax)
 			pf.log.Warn("netbackend: accept on forwarded port failed", "port", b.rule.HostPort, "retry_in", backoff, "error", err)
+			if timer == nil {
+				timer = time.NewTimer(backoff)
+			} else {
+				timer.Reset(backoff)
+			}
 			select {
 			case <-pf.ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-timer.C:
 			}
 			continue
 		}
@@ -598,6 +609,12 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 	ctx, cancel := context.WithTimeout(pf.ctx, pf.guestDialWindow)
 	defer cancel()
 	var guestConn *gonet.TCPConn
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		var err error
 		if s := pf.targetStack(); s != nil {
@@ -608,11 +625,16 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 		} else {
 			err = errors.New("target stack is nil")
 		}
+		if timer == nil {
+			timer = time.NewTimer(pf.guestDialInterval)
+		} else {
+			timer.Reset(pf.guestDialInterval)
+		}
 		select {
 		case <-ctx.Done():
 			pf.log.Debug("netbackend: dial guest for forwarded connection", "guest", guestAddr.Addr, "port", guestAddr.Port, "error", err)
 			return
-		case <-time.After(pf.guestDialInterval):
+		case <-timer.C:
 		}
 	}
 	defer func() { _ = guestConn.Close() }()
@@ -624,6 +646,12 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
 	buf := make([]byte, maxUDPDatagram)
 	var backoff time.Duration
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		n, client, err := b.packetConn.ReadFromUDPAddrPort(buf)
 		if err != nil {
@@ -632,10 +660,15 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 			}
 			backoff = min(max(2*backoff, acceptBackoffMin), acceptBackoffMax)
 			pf.log.Warn("netbackend: read on forwarded UDP port failed", "port", b.rule.HostPort, "retry_in", backoff, "error", err)
+			if timer == nil {
+				timer = time.NewTimer(backoff)
+			} else {
+				timer.Reset(backoff)
+			}
 			select {
 			case <-pf.ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-timer.C:
 			}
 			continue
 		}

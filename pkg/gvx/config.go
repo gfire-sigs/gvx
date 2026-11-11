@@ -358,7 +358,7 @@ var (
 func ParseHostDNSServers(raw []string) ([]netip.AddrPort, error) {
 	servers, err := netbackend.ParseDNSServers(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%w: host DNS servers: %v", ErrInvalidConfig, err)
+		return nil, fmt.Errorf("%w: host DNS servers: %w", ErrInvalidConfig, err)
 	}
 	return servers, nil
 }
@@ -424,7 +424,7 @@ func (c *Config) normalize() error {
 	}
 
 	if _, _, _, err := splitUserSpec(c.User); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	if c.Name != "" && !containerNamePattern.MatchString(c.Name) {
 		return fmt.Errorf("%w: invalid container name %q (want [a-zA-Z0-9][a-zA-Z0-9_.-]+)", ErrInvalidConfig, c.Name)

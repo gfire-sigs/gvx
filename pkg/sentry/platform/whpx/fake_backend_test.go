@@ -33,6 +33,7 @@ type fakeMapping struct {
 
 // fakeVP is one virtual processor of the fake partition.
 type fakeVP struct {
+	mu    sync.Mutex
 	index uint32
 	regs  map[uint32][2]uint64
 
@@ -374,12 +375,14 @@ func (fb *fakeBackend) getRegs(index uint32, b *regBatch) error {
 		return fmt.Errorf("virtual processor %d does not exist", index)
 	}
 	names, vals := b.view()
+	vp.mu.Lock()
 	vp.getCalls = append(vp.getCalls, append([]uint32(nil), names...))
 	for i, name := range names {
 		v := vp.regs[name]
 		binary.LittleEndian.PutUint64(vals[i*regValueSize:], v[0])
 		binary.LittleEndian.PutUint64(vals[i*regValueSize+8:], v[1])
 	}
+	vp.mu.Unlock()
 	return nil
 }
 
@@ -396,6 +399,7 @@ func (fb *fakeBackend) setRegs(index uint32, b *regBatch) error {
 		return fmt.Errorf("virtual processor %d does not exist", index)
 	}
 	names, vals := b.view()
+	vp.mu.Lock()
 	vp.setCalls = append(vp.setCalls, append([]uint32(nil), names...))
 	for i, name := range names {
 		vp.regs[name] = [2]uint64{
@@ -403,6 +407,7 @@ func (fb *fakeBackend) setRegs(index uint32, b *regBatch) error {
 			binary.LittleEndian.Uint64(vals[i*regValueSize+8:]),
 		}
 	}
+	vp.mu.Unlock()
 	return nil
 }
 
@@ -495,12 +500,19 @@ func (fb *fakeBackend) waitRunning(index uint32) *fakeVP {
 // setReg stores a register value that a later read returns.
 func (fb *fakeBackend) setReg(index uint32, name uint32, lo uint64) {
 	fb.mu.Lock()
-	fb.vps[index].regs[name] = [2]uint64{lo, 0}
+	vp := fb.vps[index]
 	fb.mu.Unlock()
+	vp.mu.Lock()
+	vp.regs[name] = [2]uint64{lo, 0}
+	vp.mu.Unlock()
 }
 
 // reg returns the low 64 bits of a register that the Sentry wrote.
-func (vp *fakeVP) reg(name uint32) uint64 { return vp.regs[name][0] }
+func (vp *fakeVP) reg(name uint32) uint64 {
+	vp.mu.Lock()
+	defer vp.mu.Unlock()
+	return vp.regs[name][0]
+}
 
 // canceledReason is the exit reason of a cancel on the test architecture.
 func canceledReason() uint32 {

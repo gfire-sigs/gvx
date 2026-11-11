@@ -598,6 +598,12 @@ func (h *stubHostLoop) fillPool() {
 	defer h.poolWG.Done()
 	const minBackoff, maxBackoff = 10 * time.Millisecond, 2 * time.Second
 	backoff := minBackoff
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-h.stopPool:
@@ -606,10 +612,15 @@ func (h *stubHostLoop) fillPool() {
 		}
 		prep, err := h.prepareStub()
 		if err != nil {
+			if timer == nil {
+				timer = time.NewTimer(backoff)
+			} else {
+				timer.Reset(backoff)
+			}
 			select {
 			case <-h.stopPool:
 				return
-			case <-time.After(backoff):
+			case <-timer.C:
 			}
 			backoff = min(2*backoff, maxBackoff)
 			continue

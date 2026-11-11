@@ -18,7 +18,6 @@ package whpx
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
@@ -144,8 +143,8 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	if !st.valid || st.asID != as.id || st.execGen != execGen {
 		cflags |= flagICacheSync
 	}
-	atomic.StoreUint32(&comm.Flags, cflags)
-	atomic.StoreUint32(&comm.ExitReason, uint32(ExitNone))
+	comm.Flags.Store(cflags)
+	comm.ExitReason.Store(uint32(ExitNone))
 
 	b := v.regs
 	b.reset()
@@ -186,7 +185,7 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 // onStubExit reads the CommPage after the stub completed its register spill.
 func (c *Context) onStubExit(v *vcpu, ex exitInfo, ac *arch.Context64) (runResult, bool) {
 	comm := v.comm
-	if reason := ExitReason(atomic.LoadUint32(&comm.ExitReason)); reason != ExitException {
+	if reason := ExitReason(comm.ExitReason.Load()); reason != ExitException {
 		v.st.invalidate()
 		return runResult{err: fmt.Errorf("whpx: virtual processor %d stopped with stub exit reason %d", v.index, reason)}, false
 	}
@@ -207,8 +206,8 @@ func (c *Context) onStubExit(v *vcpu, ex exitInfo, ac *arch.Context64) (runResul
 	if t.kind == trapSkip {
 		// Resume after the instruction, as the KVM platform does for WFI.
 		comm.PC += 4
-		atomic.StoreUint32(&comm.Flags, 0)
-		atomic.StoreUint32(&comm.ExitReason, uint32(ExitNone))
+		comm.Flags.Store(0)
+		comm.ExitReason.Store(uint32(ExitNone))
 		if ex.pc != v.reloadVA() {
 			b := v.regs
 			b.reset()

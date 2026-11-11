@@ -19,7 +19,6 @@ package whpx
 import (
 	"encoding/binary"
 	"errors"
-	"sync/atomic"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -75,6 +74,13 @@ func (e *x64Env) newContext() (*Context, *arch.Context64) {
 
 func (e *x64Env) comm(vp *fakeVP) *CommPage { return e.p.kernel.commPage(int(vp.index)) }
 
+func (e *x64Env) commCopy(vp *fakeVP) *CommPage {
+	var buf [pageSize]byte
+	slot := int(vp.index)
+	copy(buf[:], e.p.kernel.commMem[slot*pageSize:(slot+1)*pageSize])
+	return overlayCommPage(buf[:])
+}
+
 func (e *x64Env) reload() uint64 {
 	return e.p.kernel.layout.code() + uint64(e.p.kernel.x64.Reload)
 }
@@ -91,7 +97,7 @@ func (e *x64Env) syscall(vp *fakeVP, exit []byte, rip, rflags uint64, mutate fun
 	if mutate != nil {
 		mutate(c)
 	}
-	atomic.StoreUint32(&c.ExitReason, uint32(ExitSyscall))
+	c.ExitReason.Store(uint32(ExitSyscall))
 	writeStubExit(exit, e.p.kernel.layout.code()+uint64(e.p.kernel.x64.HltSyscall)+1)
 }
 
@@ -100,7 +106,7 @@ func (e *x64Env) exception(vp *fakeVP, exit []byte, vector, errCode, cr2, rip ui
 	c := e.comm(vp)
 	c.Vector, c.ESR, c.FaultAddr, c.PC = vector, errCode, cr2, rip
 	c.Pstate, c.CS, c.SS = 0x246, x64SelUserCS, x64SelUserSS
-	atomic.StoreUint32(&c.ExitReason, uint32(ExitException))
+	c.ExitReason.Store(uint32(ExitException))
 	writeStubExit(exit, e.p.kernel.layout.code()+uint64(e.p.kernel.x64.HltException)+1)
 }
 
@@ -114,9 +120,9 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	r.Rcx, r.R11 = r.Rip, r.Eflags // Hardware state after a system call.
 	r.Fs_base, r.Gs_base = 0x7F0000001000, 0x7F0000002000
 
-	var saw []CommPage
+	var saw []*CommPage
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		saw = append(saw, *e.comm(vp))
+		saw = append(saw, e.commCopy(vp))
 		e.syscall(vp, exit, 0x400002, 0x246, func(c *CommPage) {
 			c.Regs[0] = 0xAA
 			c.Regs[15] = 0xFF
@@ -137,8 +143,8 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if first.SP != 0x7FFF0000 || first.PC != 0x400000 || first.Pstate != 0x246 {
 		t.Errorf("SP %#x PC %#x RFLAGS %#x", first.SP, first.PC, first.Pstate)
 	}
-	if first.Flags != flagReloadRoot {
-		t.Errorf("flags are %#x: SYSRET is correct and the first entry flushes", first.Flags)
+	if first.Flags.Load() != flagReloadRoot {
+		t.Errorf("flags are %#x: SYSRET is correct and the first entry flushes", first.Flags.Load())
 	}
 	if first.Root != e.as.rootValue() {
 		t.Errorf("CR3 value is %#x, want %#x", first.Root, e.as.rootValue())
@@ -157,10 +163,10 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if vp.reg(x64RegRip) != e.reload() || vp.reg(x64RegKernelGsBase) != 0x7F0000002000 || vp.reg(x64RegInternalActivity) != 0 {
 		t.Errorf("park state: rip=%#x kernelGsBase=%#x", vp.reg(x64RegRip), vp.reg(x64RegKernelGsBase))
 	}
-	if got := vp.regs[x64RegFs][0]; got != 0x7F0000001000 {
+	if got := vp.reg(x64RegFs); got != 0x7F0000001000 {
 		t.Errorf("FS base is %#x", got)
 	}
-	if got := vp.regs[x64RegGs][0]; got != e.p.kernel.layout.comm(0) {
+	if got := vp.reg(x64RegGs); got != e.p.kernel.layout.comm(0) {
 		t.Errorf("kernel GS base is %#x, want the CommPage address", got)
 	}
 	if vp.reg(x64RegRsp) != e.p.kernel.layout.comm(0)+commStackTop || vp.reg(x64RegRflags) != 2 {
@@ -169,7 +175,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 
 	// The next system call resumes with two register writes.
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		saw = append(saw, *e.comm(vp))
+		saw = append(saw, e.commCopy(vp))
 		e.syscall(vp, exit, 0x400004, 0x246, nil)
 		return nil
 	}
@@ -182,8 +188,8 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if resume := vp.setCalls[2]; len(resume) != 2 || resume[0] != x64RegRip || resume[1] != x64RegInternalActivity {
 		t.Errorf("resume writes %#x, want RIP and the activity state", resume)
 	}
-	if saw[1].Flags != 0 {
-		t.Errorf("second entry flags are %#x", saw[1].Flags)
+	if saw[1].Flags.Load() != 0 {
+		t.Errorf("second entry flags are %#x", saw[1].Flags.Load())
 	}
 	if saw[1].Regs[1] != 0x400002 || saw[1].Regs[11] != 0x246 {
 		t.Errorf("SYSRET registers RCX=%#x R11=%#x", saw[1].Regs[1], saw[1].Regs[11])
@@ -194,7 +200,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if len(vp.setCalls[3]) < 8 || vp.reg(x64RegKernelGsBase) != 0x7F0000002000 || vp.regs[x64RegFs][0] != 0x7F0000009000 {
+	if len(vp.setCalls[3]) < 8 || vp.reg(x64RegKernelGsBase) != 0x7F0000002000 || vp.reg(x64RegFs) != 0x7F0000009000 {
 		t.Errorf("FS base change gave writes %#x", vp.setCalls[3])
 	}
 }
@@ -205,17 +211,17 @@ func TestSwitchUsesIRETWhenRCXOrR11AreNotTheSyscallValues(t *testing.T) {
 	r := &ac.StateData().Regs
 	r.Rip, r.Rsp, r.Eflags = 0x400000, 0x7FFF0000, 0x246
 	r.Rcx, r.R11 = 0x1111, 0x2222 // For example after a page fault.
-	var saw CommPage
+	var saw *CommPage
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		saw = *e.comm(vp)
+		saw = e.commCopy(vp)
 		e.syscall(vp, exit, 0x400002, 0x246, nil)
 		return nil
 	}
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if saw.Flags != flagReloadRoot|flagFullRestore {
-		t.Errorf("flags are %#x, want a full restore", saw.Flags)
+	if saw.Flags.Load() != flagReloadRoot|flagFullRestore {
+		t.Errorf("flags are %#x, want a full restore", saw.Flags.Load())
 	}
 	if saw.Regs[1] != 0x1111 || saw.Regs[11] != 0x2222 {
 		t.Errorf("RCX=%#x R11=%#x, want the application values", saw.Regs[1], saw.Regs[11])
@@ -232,17 +238,17 @@ func TestSwitchSanitizesFlagsAndRefusesBadState(t *testing.T) {
 	r.Rip, r.Rsp = 0x400000, 0x7FFF0000
 	r.Rcx, r.R11 = r.Rip, 0x3246 // IOPL set.
 	r.Eflags = 0x3246
-	var saw CommPage
+	var saw *CommPage
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		saw = *e.comm(vp)
+		saw = e.commCopy(vp)
 		e.syscall(vp, exit, 0x400002, 0x246, nil)
 		return nil
 	}
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if saw.Pstate != 0x246 || saw.Flags&flagFullRestore == 0 {
-		t.Errorf("RFLAGS %#x flags %#x: IOPL must not reach user mode, and SYSRET would carry it", saw.Pstate, saw.Flags)
+	if saw.Pstate != 0x246 || saw.Flags.Load()&flagFullRestore == 0 {
+		t.Errorf("RFLAGS %#x flags %#x: IOPL must not reach user mode, and SYSRET would carry it", saw.Pstate, saw.Flags.Load())
 	}
 
 	runs := e.fb.vps[0].runs
@@ -295,17 +301,17 @@ func TestSwitchPageFaultBecomesSignalAndResumesWithIRET(t *testing.T) {
 		t.Errorf("state after the fault: rip=%#x rsp=%#x rcx=%#x r11=%#x", r.Rip, r.Rsp, r.Rcx, r.R11)
 	}
 	// RCX and R11 survived the fault, so the restart must use IRET.
-	var saw CommPage
+	var saw *CommPage
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		saw = *e.comm(vp)
+		saw = e.commCopy(vp)
 		e.syscall(vp, exit, 0x400042, 0x246, nil)
 		return nil
 	}
 	if _, _, err := e.switchTo(c, ac); err != nil {
 		t.Fatal(err)
 	}
-	if saw.Flags&flagFullRestore == 0 || saw.Regs[1] != 0x1234 || saw.Regs[11] != 0x5678 || saw.PC != 0x400040 {
-		t.Errorf("restart flags %#x rcx %#x r11 %#x pc %#x", saw.Flags, saw.Regs[1], saw.Regs[11], saw.PC)
+	if saw.Flags.Load()&flagFullRestore == 0 || saw.Regs[1] != 0x1234 || saw.Regs[11] != 0x5678 || saw.PC != 0x400040 {
+		t.Errorf("restart flags %#x rcx %#x r11 %#x pc %#x", saw.Flags.Load(), saw.Regs[1], saw.Regs[11], saw.PC)
 	}
 }
 
@@ -319,7 +325,7 @@ func TestSwitchRejectsUnexpectedExits(t *testing.T) {
 		}},
 		{"kernel fault", func(e *x64Env, vp *fakeVP, exit []byte) {
 			cp := e.comm(vp)
-			atomic.StoreUint32(&cp.ExitReason, uint32(ExitKernelFault))
+			cp.ExitReason.Store(uint32(ExitKernelFault))
 			writeStubExit(exit, 0x1000)
 		}},
 		{"double fault", func(e *x64Env, vp *fakeVP, exit []byte) {
@@ -615,7 +621,7 @@ func TestSwitchFlushesWhenTheTranslationStateChanges(t *testing.T) {
 	r.Rip, r.Rcx, r.Eflags, r.R11 = 0x400000, 0x400000, 0x202, 0x202
 	var flags []uint32
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		flags = append(flags, e.comm(vp).Flags)
+		flags = append(flags, e.comm(vp).Flags.Load())
 		e.syscall(vp, exit, 0x400000, 0x202, nil)
 		return nil
 	}

@@ -934,24 +934,35 @@ func TestListSetGivesTheSkbInfoOfTheMatchingMember(t *testing.T) {
 // TestHugeRangeDoesNotBlockPackets deletes a multi-chunk address range alongside a packet lookup.
 // It verifies that the lookup acquires the set lock at a chunk boundary.
 func TestHugeRangeDoesNotBlockPackets(t *testing.T) {
-	r, _ := newTestRegistry(t)
+	yielded := make(chan struct{})
+	resume := make(chan struct{})
+	var armYield sync.Mutex
+	var armed bool
+	var rangeCalls int
+	r := NewRegistry(DefaultMaxSets, func() time.Duration {
+		armYield.Lock()
+		active := armed
+		if active {
+			rangeCalls++
+		}
+		call := rangeCalls
+		armYield.Unlock()
+		// Call 1 happens before the range operation takes the set lock. Call 2
+		// refreshes the timestamp at the first rangeChunk boundary while hashUadt
+		// releases the set lock.
+		if active && call == 2 {
+			close(yielded)
+			<-resume
+		}
+		return time.Second
+	})
 	create(t, r, "s", "hash:ip", FamilyIPv4, nil)
 	uadt(r, "s", AdtAdd, hostElem("10.0.0.1"), 0)
 	id, _, _ := r.Lookup("s")
 
-	r.mu.RLock()
-	_, s := r.find("s")
-	r.mu.RUnlock()
-
-	yielded := make(chan struct{})
-	resume := make(chan struct{})
-	var once sync.Once
-	s.rangeYieldHook = func() {
-		once.Do(func() {
-			close(yielded)
-			<-resume
-		})
-	}
+	armYield.Lock()
+	armed = true
+	armYield.Unlock()
 
 	done := make(chan int, 1)
 	go func() {

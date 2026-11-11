@@ -754,6 +754,7 @@ func (s *Sandbox) prepareHostPath(m Mount) (string, bool, error) {
 				return "", false, fmt.Errorf("gvx: create bind source %q: %w", abs, err)
 			}
 		}
+	case hostPathDir:
 	}
 	return abs, false, nil
 }

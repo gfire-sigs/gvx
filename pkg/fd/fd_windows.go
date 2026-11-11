@@ -16,7 +16,7 @@ var errClosedHostHandle = errors.New("host handle is closed")
 
 // HostHandle wraps a Windows syscall.Handle with explicit single-owner Close and Release semantics.
 type HostHandle struct {
-	raw    uintptr
+	raw    atomic.Uintptr
 	closed atomic.Bool
 }
 
@@ -25,7 +25,9 @@ func NewHostHandle(handle uintptr) (*HostHandle, error) {
 	if handle == 0 || windows.Handle(handle) == windows.InvalidHandle {
 		return nil, errClosedHostHandle
 	}
-	return &HostHandle{raw: handle}, nil
+	h := &HostHandle{}
+	h.raw.Store(handle)
+	return h, nil
 }
 
 // OpenHostPath opens a host path on Windows with CreateFileW and returns an owned HostHandle.
@@ -79,7 +81,7 @@ func (h *HostHandle) RawHandle() (uintptr, error) {
 	if h == nil || h.closed.Load() {
 		return 0, errClosedHostHandle
 	}
-	return atomic.LoadUintptr(&h.raw), nil
+	return h.raw.Load(), nil
 }
 
 // ReadAt reads from the handle at off using an Overlapped structure.
@@ -123,7 +125,7 @@ func (h *HostHandle) Release() (uintptr, error) {
 	if h == nil || h.closed.Swap(true) {
 		return 0, errClosedHostHandle
 	}
-	raw := atomic.SwapUintptr(&h.raw, uintptr(windows.InvalidHandle))
+	raw := h.raw.Swap(uintptr(windows.InvalidHandle))
 	return raw, nil
 }
 
@@ -146,7 +148,7 @@ func (h *HostHandle) Close() error {
 	if h == nil || h.closed.Swap(true) {
 		return nil
 	}
-	raw := atomic.SwapUintptr(&h.raw, uintptr(windows.InvalidHandle))
+	raw := h.raw.Swap(uintptr(windows.InvalidHandle))
 	if raw == 0 || windows.Handle(raw) == windows.InvalidHandle {
 		return nil
 	}
