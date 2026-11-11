@@ -15,7 +15,8 @@
 // Package hostlockdown applies irreversible host OS self-containment to the
 // current process after all required host handles are open. Windows uses a
 // restricted thread token, an Untrusted primary token, a job object, and no
-// win32k. macOS uses a Seatbelt profile and RLIMIT_NPROC=0. A host mount is a
+// win32k. macOS uses a Seatbelt profile and RLIMIT_NPROC=0. Linux uses Landlock
+// LSM path rules and a seccomp system-call allowlist. A host mount is a
 // directory or one regular file.
 package hostlockdown
 
@@ -116,12 +117,10 @@ type Status struct {
 	// macOS: probe opens failed in the whole process. Windows: probe opens
 	// failed under the NULL_SID restricted token attached to process threads
 	// and maintained by BindThread and the background thread sweeper; mounted
-	// files open only through the sealed pinned-root file broker. Linux: the seccomp filter
-	// rejects every open when no mount exists. With a mount, the filter
-	// rejects opens relative to the working directory but must allow opens
-	// relative to a directory descriptor, and seccomp cannot read the path. An
-	// absolute path opened through such a descriptor still reaches the host
-	// root, so the field stays false.
+	// files open only through the sealed pinned-root file broker. Linux:
+	// Landlock confines descriptor-relative opens to Options.Mounts and seccomp
+	// blocks other opens. Android skips Landlock under the Zygote seccomp
+	// policy, so the field stays false on Android when a mount exists.
 	UnboundFileOpenBlocked bool
 
 	// CPUQuotaEnforced reports that the OS caps the CPU time of the process at

@@ -48,3 +48,14 @@ func TestHostFilesystemRulesAllowTheXattrCalls(t *testing.T) {
 		t.Errorf("the base rules allow fsetxattr without a host directory")
 	}
 }
+
+func TestEmbedderRulesAllowOpenat2ForHostDirsOnly(t *testing.T) {
+	withDirs := embedderRules(Config{}, true, false)
+	if !withDirs.Has(unix.SYS_OPENAT2) {
+		t.Error("embedderRules with hostDirs=true lacks openat2")
+	}
+	withoutDirs := embedderRules(Config{}, false, false)
+	if withoutDirs.Has(unix.SYS_OPENAT2) {
+		t.Error("embedderRules with hostDirs=false allows openat2")
+	}
+}

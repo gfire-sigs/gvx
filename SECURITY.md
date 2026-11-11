@@ -18,7 +18,7 @@ A vulnerability is a defect that lets a guest, an image, or a volume file cross 
 
 These limits are documented behavior, not vulnerabilities:
 
-- On Linux, a workspace, a bind mount, or a `hostfs` volume leaves `Status.UnboundFileOpenBlocked` false.
+- On Android, a host mount leaves `Status.UnboundFileOpenBlocked` false because the `untrusted_app` seccomp policy of Zygote blocks Landlock calls.
 - `-lockdown=false` disables the host lockdown.
 - A guest can use the host network that `-net=nat` and `-p` expose.
 

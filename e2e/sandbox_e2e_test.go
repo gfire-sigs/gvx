@@ -563,14 +563,25 @@ func TestE2EHostLockdownEnforcedByDefault(t *testing.T) {
 		if !rep.Lockdown.Applied || !rep.LockedAPI {
 			t.Errorf("Lockdown.Applied=%v IsLockedDown=%v, want both true by default", rep.Lockdown.Applied, rep.LockedAPI)
 		}
-		// The Linux seccomp filter cannot read paths, so a workspace keeps
-		// opens relative to a directory descriptor, and the status says so.
-		wantUnbound := runtime.GOOS != "linux" && runtime.GOOS != "android"
+		// Android skips Landlock under the Zygote seccomp policy, so a workspace
+		// leaves descriptor-relative opens unblocked only on Android.
+		wantUnbound := runtime.GOOS != "android"
 		if !rep.Lockdown.SubprocessBlocked || rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
 			t.Errorf("Lockdown status = %+v, want SubprocessBlocked and UnboundFileOpenBlocked=%v", rep.Lockdown, wantUnbound)
 		}
 		if rep.ReadOutsideErr == "" {
 			t.Errorf("host read of a file outside the workspace succeeded after lockdown: %q", rep.OutsideReadBytes)
+		}
+		if rep.DirfdProbed {
+			if wantUnbound && rep.RootDirfdReadErr == "" {
+				t.Errorf("descriptor-relative open through / succeeded after lockdown")
+			}
+			if wantUnbound && rep.WorkspaceEscapeErr == "" {
+				t.Errorf("descriptor-relative traversal out of workspace succeeded after lockdown")
+			}
+			if rep.WorkspaceRWProbeErr != "" {
+				t.Errorf("workspace read/write probe after lockdown failed: %s", rep.WorkspaceRWProbeErr)
+			}
 		}
 		if rep.WriteOutsideErr == "" {
 			t.Errorf("host write outside the workspace succeeded after lockdown")
@@ -599,6 +610,9 @@ func TestE2EHostLockdownEnforcedByDefault(t *testing.T) {
 		}
 		if rep.ReadOutsideErr != "" || rep.OutsideReadBytes != "secret" {
 			t.Errorf("control read = (%q, err %q), want the secret", rep.OutsideReadBytes, rep.ReadOutsideErr)
+		}
+		if rep.DirfdProbed && (rep.RootDirfdReadErr != "" || rep.WorkspaceEscapeErr != "" || rep.WorkspaceRWProbeErr != "") {
+			t.Errorf("control dirfd probes = (root=%q, escape=%q, rw=%q), want no errors", rep.RootDirfdReadErr, rep.WorkspaceEscapeErr, rep.WorkspaceRWProbeErr)
 		}
 		if rep.WriteOutsideErr != "" {
 			t.Errorf("control write failed: %s", rep.WriteOutsideErr)

@@ -19,6 +19,7 @@ package hostlockdown
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -29,22 +30,29 @@ import (
 // the call returns ENOENT and starts nothing.
 const probeExecPath = "/gvx-lockdown-probe/does-not-exist"
 
-// applyOSLockdown installs the seccomp filter of the embedder and observes
-// that the filter holds. The filter follows the model of the gVisor Sentry:
-// an allowlist of system calls, with every other call killing the process.
-// The caller adds EPERM rules for the calls that this function probes, so that
-// the probes do not kill the process.
+// applyOSLockdown applies Landlock path containment, installs the seccomp
+// filter of the embedder, and observes that both boundaries hold. Landlock
+// runs before Options.InstallSyscallFilter so the Landlock system calls remain
+// outside the post-lockdown seccomp allowlist.
 func applyOSLockdown(opts Options) (Status, error) {
 	if opts.InstallSyscallFilter == nil {
 		return Status{}, errors.New("hostlockdown: the Linux lockdown needs Options.InstallSyscallFilter")
 	}
-	// The root descriptor lets the open probe walk an absolute path through a
-	// directory descriptor. It must exist before the filter rejects opens.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// The root descriptor lets the open probe walk paths below "/" through a
+	// directory descriptor. Open it before Landlock and seccomp restrict opens.
 	root, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return Status{}, fmt.Errorf("hostlockdown: open the root directory for the probes: %w", err)
 	}
 	defer unix.Close(root)
+
+	mountsReal, err := applyLandlock(opts.Mounts)
+	if err != nil {
+		return Status{}, err
+	}
 
 	if err := opts.InstallSyscallFilter(); err != nil {
 		return Status{}, fmt.Errorf("hostlockdown: install the syscall filter: %w", err)
@@ -59,19 +67,19 @@ func applyOSLockdown(opts Options) (Status, error) {
 	}
 	st.SubprocessBlocked = true
 
-	cwdBlocked, err := probeOpen(unix.AT_FDCWD, "/etc/passwd")
+	cwdBlocked, err := probeOpen(unix.AT_FDCWD, "/")
 	if err != nil {
 		return st, err
 	}
 	if !cwdBlocked {
 		return st, errors.New("hostlockdown: the filter allows an open relative to the working directory")
 	}
-	dirfdBlocked, err := probeOpen(root, "etc/passwd")
+	dirfdBlocked, err := probeRootOpenBlocked(root, mountsReal)
 	if err != nil {
 		return st, err
 	}
-	if !dirfdBlocked && len(opts.Mounts) == 0 {
-		return st, errors.New("hostlockdown: the filter allows an open through a directory descriptor, and no mount needs it")
+	if !dirfdBlocked && (runtime.GOOS != "android" || len(opts.Mounts) == 0) {
+		return st, errors.New("hostlockdown: descriptor-relative open outside Options.Mounts succeeded after lockdown")
 	}
 	st.UnboundFileOpenBlocked = dirfdBlocked
 
@@ -115,19 +123,44 @@ func probeForkBlocked() error {
 	return nil
 }
 
-// probeOpen reports whether the filter rejects opening path below dirfd. An
-// EPERM result means rejected. Any other failure means that the call reached
-// the kernel path lookup. A success closes the descriptor at once.
+// probeRootOpenBlocked verifies that descriptor-relative opens outside
+// mountsReal fail with EPERM or EACCES. Probing "." on root works even in an
+// initramfs that lacks /etc/passwd, and validateMounts forbids mounting "/".
+func probeRootOpenBlocked(root int, mountsReal []string) (bool, error) {
+	rootBlocked, err := probeOpenFlags(root, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC)
+	if err != nil || !rootBlocked {
+		return false, err
+	}
+	if outsideAll("/etc/passwd", mountsReal) {
+		fd, openErr := unix.Openat(root, "etc/passwd", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		switch {
+		case openErr == nil:
+			_ = unix.Close(fd)
+			return false, nil
+		case errors.Is(openErr, unix.EPERM), errors.Is(openErr, unix.EACCES), errors.Is(openErr, unix.ENOENT):
+		default:
+			return false, fmt.Errorf("hostlockdown: root openat probe for etc/passwd returned %w, want EPERM or EACCES", openErr)
+		}
+	}
+	return true, nil
+}
+
+// probeOpen reports whether the kernel rejects opening path below dirfd with
+// EPERM (seccomp) or EACCES (Landlock). A success closes the descriptor at once.
 func probeOpen(dirfd int, path string) (blocked bool, err error) {
-	fd, err := unix.Openat(dirfd, path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	return probeOpenFlags(dirfd, path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC)
+}
+
+func probeOpenFlags(dirfd int, path string, flags int) (blocked bool, err error) {
+	fd, err := unix.Openat(dirfd, path, flags, 0)
 	switch {
 	case err == nil:
 		_ = unix.Close(fd)
 		return false, nil
-	case errors.Is(err, unix.EPERM):
+	case errors.Is(err, unix.EPERM), errors.Is(err, unix.EACCES):
 		return true, nil
 	default:
-		return false, nil
+		return false, fmt.Errorf("hostlockdown: openat probe for %q returned %w, want EPERM or EACCES", path, err)
 	}
 }
 

@@ -93,8 +93,15 @@ func TestE2EFileBindMountExposesOnlyTheFile(t *testing.T) {
 			if !rep.Lockdown.Applied || !rep.LockedAPI {
 				t.Errorf("Lockdown.Applied=%v IsLockedDown=%v, want both true", rep.Lockdown.Applied, rep.LockedAPI)
 			}
+			wantUnbound := runtime.GOOS != "android"
+			if rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
+				t.Errorf("UnboundFileOpenBlocked = %v, want %v", rep.Lockdown.UnboundFileOpenBlocked, wantUnbound)
+			}
 			if rep.ReadOutsideErr == "" {
 				t.Errorf("host read of the sibling file succeeded after the lockdown: %q", rep.OutsideReadBytes)
+			}
+			if rep.DirfdProbed && wantUnbound && rep.RootDirfdReadErr == "" {
+				t.Errorf("descriptor-relative host read of the sibling file succeeded after the lockdown")
 			}
 			if rep.WriteOutsideErr == "" {
 				t.Errorf("host write outside the mounts succeeded after the lockdown")

@@ -197,7 +197,9 @@ A source with no path separator that is not an absolute path names a volume. A W
 
 A bind source can be one regular file, as in `-v /host/app.conf:/etc/app.conf:ro`. A socket, a device, or a pipe is not valid. The guest sees only that file. The parent directory and the sibling files of the host file are not exposed, and the guest cannot reach them by a path. The sandbox creates the guest path as an empty regular file with the mode 0644, and it creates the missing parent directories. The option `:ro` makes the file read-only. The option `-workspace` takes a directory only.
 
-A file mount writes no `.gvx_meta` file. The mode, the owner, and the extended attributes that the guest sets stay in memory and reset at the next start. A change of the times reaches the host file. An `unlink` or a `rename` of the mounted file in the guest returns `EBUSY`, as for a file that Docker bind-mounts. A `link` to the file returns `EXDEV`. When a host editor replaces the file with an atomic rename, the next open of the guest path reaches the new file. A descriptor that was already open keeps the old file.
+A file mount writes no `.gvx_meta` file. The mode, the owner, and the extended attributes that the guest sets stay in memory and reset at the next start. A change of the times reaches the host file. An `unlink` or a `rename` of the mounted file in the guest returns `EBUSY`, as for a file that Docker bind-mounts. A `link` to the file returns `EXDEV`.
+
+On macOS or with `-lockdown=false`, an atomic host rename replaces the mounted file for later opens. On Linux and Windows under lockdown, Landlock and file ACLs bind the original file, so atomic host replacement requires a directory mount or `-lockdown=false`. A descriptor that was already open keeps the old file.
 
 On Windows, the sandbox puts the Low integrity label and an access entry for the logon session on the mounted file only. It also gives the logon session the traverse right (`FILE_TRAVERSE`) on the parent directory, with no inheritance. The restricted token has no `SeChangeNotifyPrivilege`, so the system needs that right to open the file through the parent. The right gives no listing and no creation of files. The sibling files keep their own security descriptors and stay closed. The entry stays on the parent directory after the run.
 
@@ -213,7 +215,7 @@ A volume with the `ext4lite` driver needs no lockdown rule for a host path. The 
 | :--- | :--- |
 | macOS | The Seatbelt profile gets a read rule, and a write rule for a writable mount, for the path and for its resolved path. |
 | Windows | The lockdown writes a Low integrity label on each object of a writable mount. It grants the logon session read and execute access, and write access for a writable mount. |
-| Linux | The seccomp filter allows opens through a directory descriptor when a bind mount or a `hostfs` volume exists. |
+| Linux | Landlock confines path opens to the mounted directories and files before seccomp restricts system calls to directory descriptors. |
 
 > [!WARNING]
 > On Windows, a bind mount changes the security descriptors of the host directory, or of the host file for a file mount. Mount only a path that the guest may change.
