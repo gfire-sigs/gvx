@@ -143,6 +143,8 @@ Components that use this text:
       Copyright 2009 The Go Authors.
       Copyright 2016 The Go Authors. All rights reserved.
       Copyright 2017 The Go Authors. All rights reserved.
+      Copyright 2009 The Go Authors. All rights reserved.
+      Copyright 2025 The Go Authors. All rights reserved.
       Copyright 2013 The Go Authors. All rights reserved.
       Copyright 2020 The Go Authors. All rights reserved.
       Copyright 2021 The Go Authors. All rights reserved.

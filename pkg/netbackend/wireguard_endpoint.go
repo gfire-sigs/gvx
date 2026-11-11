@@ -327,7 +327,7 @@ func (w *WireGuardEndpoint) Start() (*stack.Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	chEP := tn.ep
+	chEP := tn.Endpoint()
 	bind, err := newPreboundBind(w.udpConn)
 	if err != nil {
 		s.Close()
@@ -415,7 +415,7 @@ type wgLinkEndpoint struct {
 // new MTU, which sets the padding limit of the encrypted packets.
 func (e *wgLinkEndpoint) SetMTU(mtu uint32) {
 	e.Endpoint.SetMTU(mtu)
-	e.tun.notifyMTU()
+	e.tun.NotifyMTU()
 }
 
 func (e *wgLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {

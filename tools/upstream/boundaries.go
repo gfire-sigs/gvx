@@ -875,6 +875,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/netbackend"}, "pkg/buffer", "pkg/tcpip packets use pkg/buffer.Buffer values"},
 	{[]string{"pkg/netbackend"}, "pkg/waiter", "pkg/tcpip endpoints signal readiness via pkg/waiter queues"},
 	{[]string{"pkg/netbackend"}, "golang.zx2c4.com/wireguard/*", "Track B embeds wireguard-go for L3 tunnels"},
+	{[]string{"pkg/netbackend"}, "golang.org/x/net/dns/dnsmessage", "DNS relay parses and builds RFC 1035 wire messages with dnsmessage"},
 	{[]string{"pkg/netbackend"}, "golang.org/x/sys/*", "host DNS discovery reads Windows adapter addresses and macOS resolver state"},
 
 	// pkg/gvx: Linux lockdown reuses the seccomp allowlist of the gVisor Sentry.

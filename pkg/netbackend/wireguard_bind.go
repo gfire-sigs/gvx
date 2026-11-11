@@ -18,12 +18,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"z.gfire.dev/gvx/pkg/tcpip/link/wgtun"
 )
 
 // errMarkUnsupported reports a non-zero socket mark request. Only Linux
@@ -110,7 +110,7 @@ func (b *preboundBind) receive(s *bindSession, bufs [][]byte, sizes []int, eps [
 	}
 	// A dual-stack socket reports IPv4 peers as IPv4-mapped IPv6 addresses.
 	// Unmap them so that the endpoint equals the configured peer address.
-	eps[0] = &conn.StdNetEndpoint{AddrPort: netip.AddrPortFrom(from.Addr().Unmap(), from.Port())}
+	eps[0] = wgtun.NewEndpoint(from)
 	return 1, nil
 }
 
@@ -162,11 +162,7 @@ func (b *preboundBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 // ParseEndpoint parses "ip:port" or "[ipv6]:port". Host names are invalid
 // because DNS lookups run before lockdown, in NewWireGuardEndpoint.
 func (b *preboundBind) ParseEndpoint(s string) (conn.Endpoint, error) {
-	ap, err := netip.ParseAddrPort(s)
-	if err != nil {
-		return nil, fmt.Errorf("netbackend: parse WireGuard endpoint %q: %w", s, err)
-	}
-	return &conn.StdNetEndpoint{AddrPort: netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())}, nil
+	return wgtun.ParseEndpoint(s)
 }
 
 // BatchSize returns 1. Windows and macOS have no batched UDP receive call.
