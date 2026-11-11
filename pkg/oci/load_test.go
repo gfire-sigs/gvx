@@ -19,6 +19,10 @@ import (
 	"encoding/json"
 	"slices"
 	"testing"
+
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // annotatedLayout returns the members of an OCI layout for img whose index
@@ -26,9 +30,9 @@ import (
 func annotatedLayout(t *testing.T, img *testImage, annotations map[string]string) []archiveMemberSpec {
 	t.Helper()
 	members := ociLayoutMembers(t, img)
-	index := ImageIndex{SchemaVersion: 2, MediaType: mediaTypeOCIIndex, Manifests: []Descriptor{{
-		MediaType: mediaTypeOCIManifest, Digest: img.digest(), Size: int64(len(img.manifest)),
-		Platform: &PlatformSpec{OS: "linux", Architecture: img.arch}, Annotations: annotations,
+	index := ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageIndex, Manifests: []ocispec.Descriptor{{
+		MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest(img.digest()), Size: int64(len(img.manifest)),
+		Platform: &ocispec.Platform{OS: "linux", Architecture: img.arch}, Annotations: annotations,
 	}}}
 	raw, err := json.Marshal(index)
 	if err != nil {
@@ -50,8 +54,8 @@ func TestLoadArchiveRegistersTheNamesOfAnOCILayout(t *testing.T) {
 	img := twoLayerImage(t, storeArch, "A=1")
 	cache := newCache(t)
 	members := annotatedLayout(t, img, map[string]string{
-		annotationImageName: "docker.io/library/myapp:v2",
-		annotationRefName:   "ghcr.io/org/myapp:v2",
+		annotationImageName:       "docker.io/library/myapp:v2",
+		ocispec.AnnotationRefName: "ghcr.io/org/myapp:v2",
 	})
 
 	loaded, err := LoadArchive(bytes.NewReader(writeArchive(t, members)), cache, storeArch)
@@ -81,7 +85,7 @@ func TestLoadArchiveRegistersTheNamesOfAnOCILayout(t *testing.T) {
 func TestLoadArchiveGivesNoNameToABareTagAnnotation(t *testing.T) {
 	img := twoLayerImage(t, storeArch, "A=1")
 	cache := newCache(t)
-	members := annotatedLayout(t, img, map[string]string{annotationRefName: "latest"})
+	members := annotatedLayout(t, img, map[string]string{ocispec.AnnotationRefName: "latest"})
 
 	loaded, err := LoadArchive(bytes.NewReader(writeArchive(t, members)), cache, storeArch)
 	if err != nil {

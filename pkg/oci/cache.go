@@ -15,8 +15,6 @@
 package oci
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +29,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // compilerVersion names the EROFS output format. A cached layer is valid only
@@ -175,10 +176,10 @@ func (c *LayerCache) Dir() string {
 }
 
 // LayerPath returns the absolute host path for a cached <digestHex>.erofs file.
-func (c *LayerCache) LayerPath(digest string) (string, error) {
-	hexStr := normalizeDigestHex(digest)
+func (c *LayerCache) LayerPath(dgst string) (string, error) {
+	hexStr := normalizeDigestHex(dgst)
 	if hexStr == "" {
-		return "", fmt.Errorf("oci: invalid layer digest %q", digest)
+		return "", fmt.Errorf("oci: invalid layer digest %q", dgst)
 	}
 	return filepath.Join(c.dir, hexStr+c.layerSuffix()), nil
 }
@@ -190,12 +191,12 @@ func (c *LayerCache) sumPath(hexStr string) string {
 // HasLayer reports whether the compiled <digestHex>.erofs layer exists in the
 // cache directory and matches its integrity record. The first verification of a
 // layer in each process hashes the whole file.
-func (c *LayerCache) HasLayer(digest string) (string, bool) {
-	p, err := c.LayerPath(digest)
+func (c *LayerCache) HasLayer(dgst string) (string, bool) {
+	p, err := c.LayerPath(dgst)
 	if err != nil {
 		return "", false
 	}
-	f, err := c.openVerifiedLayer(normalizeDigestHex(digest))
+	f, err := c.openVerifiedLayer(normalizeDigestHex(dgst))
 	if err != nil {
 		return "", false
 	}
@@ -244,12 +245,12 @@ func (c *LayerCache) openVerifiedLayer(hexStr string) (*os.File, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: %q has %d bytes, want %d", ErrCacheCorrupt, p, info.Size(), wantSize)
 	}
-	h := sha256.New()
-	if _, err := io.Copy(h, io.NewSectionReader(f, 0, info.Size())); err != nil {
+	digester := digest.SHA256.Digester()
+	if _, err := io.Copy(digester.Hash(), io.NewSectionReader(f, 0, info.Size())); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("oci: hash cached EROFS layer %q: %w", p, err)
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != wantSum {
+	if got := digester.Digest().Encoded(); got != wantSum {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: %q has sha256 %s, want %s", ErrCacheCorrupt, p, got, wantSum)
 	}
@@ -272,7 +273,7 @@ func (c *LayerCache) parseSumRecord(raw []byte) (size int64, sum string, err err
 	if err != nil || size < 0 {
 		return 0, "", errors.New("integrity record has an invalid size")
 	}
-	if len(fields[2]) != sha256.Size*2 || normalizeDigestHex(fields[2]) != fields[2] {
+	if digest.SHA256.Validate(fields[2]) != nil {
 		return 0, "", errors.New("integrity record has an invalid digest")
 	}
 	return size, fields[2], nil
@@ -283,11 +284,11 @@ func (c *LayerCache) parseSumRecord(raw []byte) (size int64, sum string, err err
 // raw, gzip, or zstd compressed tar. A non-empty digest is the sha256 of the
 // stream bytes. A mismatch fails the call and stores nothing. An empty digest
 // names the image by the sha256 of the compiled image.
-func (c *LayerCache) CompileAndStore(digest string, tarStream io.Reader) (string, CompileStats, error) {
+func (c *LayerCache) CompileAndStore(dgst string, tarStream io.Reader) (string, CompileStats, error) {
 	var hexKey string
-	if strings.TrimSpace(digest) != "" {
-		if hexKey = normalizeDigestHex(digest); len(hexKey) != sha256.Size*2 {
-			return "", CompileStats{}, fmt.Errorf("oci: invalid layer digest %q", digest)
+	if strings.TrimSpace(dgst) != "" {
+		if hexKey = normalizeDigestHex(dgst); hexKey == "" {
+			return "", CompileStats{}, fmt.Errorf("oci: invalid layer digest %q", dgst)
 		}
 	}
 	return c.compileAndStore(layerSpec{key: hexKey, blobHex: hexKey, blobSize: -1}, tarStream)
@@ -341,7 +342,8 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 
 	// The hash covers every byte that the compiler and the final drain read,
 	// so it equals the hash of the whole stream.
-	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", c.limits.MaxBlobBytes, nil), h: sha256.New()}
+	digester := digest.SHA256.Digester()
+	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", c.limits.MaxBlobBytes, nil), h: digester.Hash()}
 	var diff *diffVerifier
 	if spec.diffID != "" {
 		diff = newDiffVerifier(spec.diffID)
@@ -356,7 +358,7 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	if spec.blobSize >= 0 && in.n != spec.blobSize {
 		return "", CompileStats{}, fmt.Errorf("%w: layer has %d bytes, descriptor says %d", ErrDigestMismatch, in.n, spec.blobSize)
 	}
-	if got := hex.EncodeToString(in.h.Sum(nil)); spec.blobHex != "" && got != spec.blobHex {
+	if got := digester.Digest().Encoded(); spec.blobHex != "" && got != spec.blobHex {
 		return "", CompileStats{}, fmt.Errorf("%w: layer sha256 is %s, want %s", ErrDigestMismatch, got, spec.blobHex)
 	}
 	if hexKey == "" {
@@ -439,20 +441,12 @@ func (c *LayerCache) OpenLayerHandles(digests []string) ([]*os.File, error) {
 	return files, nil
 }
 
-func normalizeDigestHex(digest string) string {
-	digest = strings.TrimSpace(digest)
-	digest = strings.TrimPrefix(digest, "sha256:")
-	if len(digest) == 0 {
+func normalizeDigestHex(s string) string {
+	s = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(s), "sha256:"))
+	if digest.SHA256.Validate(s) != nil {
 		return ""
 	}
-	for i := range len(digest) {
-		ch := digest[i]
-		isHex := (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
-		if !isHex {
-			return ""
-		}
-	}
-	return strings.ToLower(digest)
+	return s
 }
 
 // CloseLayerFiles closes a slice of pre-opened *os.File handles.
@@ -498,16 +492,17 @@ const (
 
 func cacheKey(format string, parts ...string) string {
 	parts = append([]string{format}, parts...)
-	h := sha256.New()
+	digester := digest.SHA256.Digester()
+	h := digester.Hash()
 	for _, p := range parts {
 		h.Write([]byte(p))
 		h.Write([]byte{0})
 	}
-	return hex.EncodeToString(h.Sum(nil)[:16])
+	return digester.Digest().Encoded()[:32]
 }
 
-func (c *LayerCache) imageRecordPath(baseURL, repository, digest, arch string) string {
-	return filepath.Join(c.dir, imagePrefix+cacheKey(c.format(), strings.ToLower(baseURL), repository, digest, arch)+cacheJSONSuffix)
+func (c *LayerCache) imageRecordPath(baseURL, repository, dgst, arch string) string {
+	return filepath.Join(c.dir, imagePrefix+cacheKey(c.format(), strings.ToLower(baseURL), repository, dgst, arch)+cacheJSONSuffix)
 }
 
 func (c *LayerCache) tagRecordPath(baseURL, repository, tag, arch string) string {
@@ -549,9 +544,9 @@ func (c *LayerCache) storeImage(rec imageRecord) error {
 
 // storeTag records the manifest digest that a tag pointed to. A digest
 // reference passes the digest as tag.
-func (c *LayerCache) storeTag(baseURL, repository, tag, arch, digest string) error {
+func (c *LayerCache) storeTag(baseURL, repository, tag, arch, dgst string) error {
 	raw, err := json.Marshal(tagRecord{
-		Digest: digest, Version: tagRecordVersion,
+		Digest: dgst, Version: tagRecordVersion,
 		BaseURL: baseURL, Repository: repository, Tag: tag, Architecture: arch,
 	})
 	if err != nil {
@@ -585,16 +580,16 @@ func (c *LayerCache) resolveTagDigest(baseURL, repository, reference, arch strin
 // It returns ErrNotCached if the image or any of its layers is missing.
 func (c *LayerCache) LoadCachedImage(baseURL, repository, reference, targetArch string) (*ResolvedImage, error) {
 	baseURL, repository, reference, targetArch = normalizePullArgs(baseURL, repository, reference, targetArch)
-	digest, err := c.resolveTagDigest(baseURL, repository, reference, targetArch)
+	dgst, err := c.resolveTagDigest(baseURL, repository, reference, targetArch)
 	if err != nil {
 		return nil, err
 	}
-	return c.loadImageByDigest(baseURL, repository, digest, targetArch)
+	return c.loadImageByDigest(baseURL, repository, dgst, targetArch)
 }
 
 // decodedRecord is the verified content of an image record.
 type decodedRecord struct {
-	manifest ImageManifest
+	manifest ocispec.Manifest
 	// manifestBody is the verbatim body of the image manifest.
 	manifestBody []byte
 	config       []byte
@@ -607,10 +602,10 @@ type decodedRecord struct {
 // verbatim blobs. A non-empty digest or arch must equal the one in the
 // record. It returns ErrNotCached for a record that is stale, belongs to
 // another format, or fails verification.
-func (c *LayerCache) decodeRecord(raw []byte, digest, arch string) (imageRecord, *decodedRecord, error) {
+func (c *LayerCache) decodeRecord(raw []byte, dgst, arch string) (imageRecord, *decodedRecord, error) {
 	var rec imageRecord
 	if err := json.Unmarshal(raw, &rec); err != nil || rec.Version != imageRecordVersion || len(rec.Manifests) == 0 ||
-		(digest != "" && rec.Digest != digest) || (arch != "" && rec.Architecture != arch) || rec.Format != c.format() {
+		(dgst != "" && rec.Digest != dgst) || (arch != "" && rec.Architecture != arch) || rec.Format != c.format() {
 		return imageRecord{}, nil, ErrNotCached
 	}
 	dec, err := c.verifyRecord(rec)
@@ -624,16 +619,16 @@ func (c *LayerCache) decodeRecord(raw []byte, digest, arch string) (imageRecord,
 // that was edited after it was written no longer matches the digest that
 // names it.
 func (c *LayerCache) verifyRecord(rec imageRecord) (*decodedRecord, error) {
-	digest, arch := rec.Digest, rec.Architecture
-	byDigest := make(map[string][]byte, len(rec.Manifests))
+	dgst, arch := digest.Digest(rec.Digest), rec.Architecture
+	byDigest := make(map[digest.Digest][]byte, len(rec.Manifests))
 	for _, m := range rec.Manifests {
-		byDigest[blobDigest(m)] = m
+		byDigest[digest.FromBytes(m)] = m
 	}
-	top, ok := byDigest[digest]
+	top, ok := byDigest[dgst]
 	if !ok {
 		return nil, ErrNotCached
 	}
-	res, err := resolveManifestChain(top, arch, func(d Descriptor) ([]byte, error) {
+	res, err := resolveManifestChain(top, arch, func(d ocispec.Descriptor) ([]byte, error) {
 		b, ok := byDigest[d.Digest]
 		if !ok {
 			return nil, ErrNotCached
@@ -655,11 +650,10 @@ func (c *LayerCache) verifyRecord(rec imageRecord) (*decodedRecord, error) {
 	}
 	layerHex := make([]string, 0, len(res.Manifest.Layers))
 	for _, l := range res.Manifest.Layers {
-		hexStr, err := parseDigest(l.Digest)
-		if err != nil {
+		if err := validateSHA256(l.Digest); err != nil {
 			return nil, fmt.Errorf("oci: cached image record is invalid: %w", err)
 		}
-		layerHex = append(layerHex, hexStr)
+		layerHex = append(layerHex, l.Digest.Encoded())
 	}
 	return &decodedRecord{
 		manifest: res.Manifest, manifestBody: res.Chain[len(res.Chain)-1],
@@ -668,15 +662,15 @@ func (c *LayerCache) verifyRecord(rec imageRecord) (*decodedRecord, error) {
 }
 
 // loadImageByDigest loads and re-verifies the record of a manifest digest.
-func (c *LayerCache) loadImageByDigest(baseURL, repository, digest, arch string) (*ResolvedImage, error) {
-	raw, err := readFileShared(c.imageRecordPath(baseURL, repository, digest, arch))
+func (c *LayerCache) loadImageByDigest(baseURL, repository, dgst, arch string) (*ResolvedImage, error) {
+	raw, err := readFileShared(c.imageRecordPath(baseURL, repository, dgst, arch))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrNotCached
 		}
 		return nil, fmt.Errorf("oci: read image record: %w", err)
 	}
-	_, dec, err := c.decodeRecord(raw, digest, arch)
+	_, dec, err := c.decodeRecord(raw, dgst, arch)
 	if err != nil {
 		return nil, err
 	}
@@ -696,7 +690,7 @@ func (c *LayerCache) loadImageByDigest(baseURL, repository, digest, arch string)
 	return &ResolvedImage{
 		Architecture:   arch,
 		Config:         dec.cfg,
-		ManifestDigest: digest,
+		ManifestDigest: dgst,
 		LayerDigests:   dec.layerHex,
 		LayerPaths:     paths,
 		LayerFiles:     handles,
@@ -768,11 +762,11 @@ func (c *LayerCache) importLayer(src *LayerCache, hexStr string) error {
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(tmp, h), io.NewSectionReader(in, 0, size)); err != nil {
+	digester := digest.SHA256.Digester()
+	if _, err := io.Copy(io.MultiWriter(tmp, digester.Hash()), io.NewSectionReader(in, 0, size)); err != nil {
 		return fmt.Errorf("oci: copy layer %s: %w", hexStr, err)
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != sum {
+	if got := digester.Digest().Encoded(); got != sum {
 		return fmt.Errorf("%w: layer %s changed while it was copied", ErrCacheCorrupt, hexStr)
 	}
 	if err := tmp.Sync(); err != nil {

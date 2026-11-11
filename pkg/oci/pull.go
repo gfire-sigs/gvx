@@ -16,8 +16,7 @@ package oci
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	_ "crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,19 +26,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // DefaultRegistryBaseURL is the default OCI v2 registry endpoint (Docker Hub).
 const DefaultRegistryBaseURL = "https://registry-1.docker.io"
 
-// Media types of the manifest formats that the runner understands.
+// Docker manifest and config media types accepted alongside OCI image-spec types.
 const (
-	mediaTypeOCIIndex       = "application/vnd.oci.image.index.v1+json"
 	mediaTypeDockerList     = "application/vnd.docker.distribution.manifest.list.v2+json"
-	mediaTypeOCIManifest    = "application/vnd.oci.image.manifest.v1+json"
 	mediaTypeDockerManifest = "application/vnd.docker.distribution.manifest.v2+json"
 	mediaTypeDockerV1Prefix = "application/vnd.docker.distribution.manifest.v1"
-	mediaTypeOCIConfig      = "application/vnd.oci.image.config.v1+json"
 	mediaTypeDockerConfig   = "application/vnd.docker.container.image.v1+json"
 
 	// maxIndexDepth bounds nested image indexes.
@@ -75,38 +74,6 @@ func rejectSchema1(body []byte) error {
 // isSchema1 reports whether a manifest header names Docker schema 1.
 func isSchema1(schemaVersion int, mediaType string) bool {
 	return schemaVersion == 1 || strings.HasPrefix(mediaType, mediaTypeDockerV1Prefix)
-}
-
-// PlatformSpec identifies the OS and CPU architecture of an OCI manifest.
-type PlatformSpec struct {
-	OS           string `json:"os"`
-	Architecture string `json:"architecture"`
-	Variant      string `json:"variant,omitempty"`
-}
-
-// Descriptor describes a content-addressable blob in an OCI Image Index or Manifest.
-type Descriptor struct {
-	MediaType   string            `json:"mediaType"`
-	Digest      string            `json:"digest"`
-	Size        int64             `json:"size"`
-	URLs        []string          `json:"urls,omitempty"`
-	Platform    *PlatformSpec     `json:"platform,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
-}
-
-// ImageIndex represents an OCI Image Index or Docker Manifest List.
-type ImageIndex struct {
-	SchemaVersion int          `json:"schemaVersion"`
-	MediaType     string       `json:"mediaType,omitempty"`
-	Manifests     []Descriptor `json:"manifests"`
-}
-
-// ImageManifest represents a single-architecture OCI Image Manifest.
-type ImageManifest struct {
-	SchemaVersion int          `json:"schemaVersion"`
-	MediaType     string       `json:"mediaType,omitempty"`
-	Config        Descriptor   `json:"config"`
-	Layers        []Descriptor `json:"layers"`
 }
 
 // RuntimeConfig holds the container execution metadata parsed from an OCI
@@ -153,17 +120,6 @@ func (c RuntimeConfig) ExposedPortList() []ExposedPort {
 	return ports
 }
 
-type imageConfigFile struct {
-	Architecture string        `json:"architecture"`
-	OS           string        `json:"os"`
-	Created      string        `json:"created"`
-	Config       RuntimeConfig `json:"config"`
-	RootFS       struct {
-		Type    string   `json:"type"`
-		DiffIDs []string `json:"diff_ids"`
-	} `json:"rootfs"`
-}
-
 // ResolvedImage holds the resolved runtime metadata, cached .erofs layer paths,
 // and pre-opened read-only *os.File handles ready for VFS2 overlay mounting.
 type ResolvedImage struct {
@@ -201,8 +157,8 @@ func (c RuntimeConfig) CommandVector(userArgs []string) []string {
 }
 
 // SelectManifestForArch selects the linux/<targetArch> manifest descriptor from
-// an OCI ImageIndex. When targetArch is empty, runtime.GOARCH is used.
-func SelectManifestForArch(index ImageIndex, targetArch string) (Descriptor, error) {
+// an OCI Image Index. An empty targetArch selects runtime.GOARCH.
+func SelectManifestForArch(index ocispec.Index, targetArch string) (ocispec.Descriptor, error) {
 	if targetArch == "" {
 		targetArch = runtime.GOARCH
 	}
@@ -216,7 +172,7 @@ func SelectManifestForArch(index ImageIndex, targetArch string) (Descriptor, err
 			return m, nil
 		}
 	}
-	return Descriptor{}, fmt.Errorf("oci: no linux/%s manifest found in image index", targetArch)
+	return ocispec.Descriptor{}, fmt.Errorf("oci: no linux/%s manifest found in image index", targetArch)
 }
 
 func normalizeArch(arch string) string {
@@ -233,76 +189,88 @@ func normalizeArch(arch string) string {
 // ParseRuntimeConfig parses Entrypoint, Cmd, Env, WorkingDir, and User from an
 // OCI Image Configuration JSON payload.
 func ParseRuntimeConfig(configJSON []byte) (RuntimeConfig, error) {
-	parsed, err := parseImageConfigFile(configJSON, "", -1)
+	_, cfg, err := parseImageConfigFile(configJSON, "", -1)
 	if err != nil {
 		return RuntimeConfig{}, err
 	}
-	return parsed.Config, nil
+	return cfg, nil
 }
 
 // parseImageConfig parses an image config and rejects an image for another OS
 // or architecture, or a config that disagrees with the manifest layer count.
 func parseImageConfig(raw []byte, arch string, layers int) (RuntimeConfig, error) {
-	parsed, err := parseImageConfigFile(raw, arch, layers)
+	_, cfg, err := parseImageConfigFile(raw, arch, layers)
 	if err != nil {
 		return RuntimeConfig{}, err
 	}
-	return parsed.Config, nil
+	return cfg, nil
 }
 
-func parseImageConfigFile(raw []byte, arch string, layers int) (imageConfigFile, error) {
-	var parsed imageConfigFile
+func parseImageConfigFile(raw []byte, arch string, layers int) (ocispec.Image, RuntimeConfig, error) {
+	var parsed ocispec.Image
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return imageConfigFile{}, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
+		// Accept legacy image configs whose created string is empty or non-RFC3339.
+		type lenientImage struct {
+			ocispec.Image
+			Created json.RawMessage `json:"created,omitempty"`
+		}
+		var fallback lenientImage
+		if json.Unmarshal(raw, &fallback) != nil {
+			return ocispec.Image{}, RuntimeConfig{}, fmt.Errorf("oci: unmarshal image config JSON: %w", err)
+		}
+		parsed = fallback.Image
 	}
 	if arch != "" {
 		if parsed.OS != "" && !strings.EqualFold(parsed.OS, "linux") {
-			return imageConfigFile{}, fmt.Errorf("oci: image targets OS %q, want linux", parsed.OS)
+			return ocispec.Image{}, RuntimeConfig{}, fmt.Errorf("oci: image targets OS %q, want linux", parsed.OS)
 		}
 		if parsed.Architecture != "" && normalizeArch(parsed.Architecture) != arch {
-			return imageConfigFile{}, fmt.Errorf("oci: image targets architecture %q, want %s", parsed.Architecture, arch)
+			return ocispec.Image{}, RuntimeConfig{}, fmt.Errorf("oci: image targets architecture %q, want %s", parsed.Architecture, arch)
 		}
 	}
 	if layers >= 0 {
 		if n := len(parsed.RootFS.DiffIDs); n != 0 && n != layers {
-			return imageConfigFile{}, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", n, layers)
+			return ocispec.Image{}, RuntimeConfig{}, fmt.Errorf("oci: image config lists %d diff IDs for %d layers", n, layers)
 		}
 	}
-	if parsed.Config.WorkingDir == "" {
-		parsed.Config.WorkingDir = "/"
+	cfg := RuntimeConfig{
+		Entrypoint:   parsed.Config.Entrypoint,
+		Cmd:          parsed.Config.Cmd,
+		Env:          parsed.Config.Env,
+		WorkingDir:   parsed.Config.WorkingDir,
+		User:         parsed.Config.User,
+		ExposedPorts: parsed.Config.ExposedPorts,
 	}
-	return parsed, nil
+	if cfg.WorkingDir == "" {
+		cfg.WorkingDir = "/"
+	}
+	return parsed, cfg, nil
 }
 
-// parseDigest returns the lowercase hex of a "sha256:<hex>" digest.
-func parseDigest(digest string) (string, error) {
-	hexStr, ok := strings.CutPrefix(digest, "sha256:")
-	if !ok || len(hexStr) != sha256.Size*2 || normalizeDigestHex(hexStr) != hexStr {
-		return "", fmt.Errorf("oci: unsupported or malformed digest %q", digest)
+func validateSHA256(d digest.Digest) error {
+	if d.Validate() != nil || d.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("oci: unsupported or malformed digest %q", d)
 	}
-	return hexStr, nil
+	return nil
 }
 
 func isDigestRef(ref string) bool {
-	_, err := parseDigest(ref)
-	return err == nil
+	return validateSHA256(digest.Digest(ref)) == nil
 }
 
-// verifyDigest compares body against a sha256 digest string.
-func verifyDigest(digest string, body []byte) error {
-	want, err := parseDigest(digest)
-	if err != nil {
+// verifyDigest compares body against a SHA-256 digest.
+func verifyDigest(d digest.Digest, body []byte) error {
+	if err := validateSHA256(d); err != nil {
 		return err
 	}
-	sum := sha256.Sum256(body)
-	if got := hex.EncodeToString(sum[:]); got != want {
-		return fmt.Errorf("%w: sha256 is %s, want %s", ErrDigestMismatch, got, want)
+	if got := digest.FromBytes(body); got != d {
+		return fmt.Errorf("%w: sha256 is %s, want %s", ErrDigestMismatch, got.Encoded(), d.Encoded())
 	}
 	return nil
 }
 
 // verifyBody compares body against the digest and size of its descriptor.
-func verifyBody(desc Descriptor, body []byte) error {
+func verifyBody(desc ocispec.Descriptor, body []byte) error {
 	if int64(len(body)) != desc.Size {
 		return fmt.Errorf("%w: %s has %d bytes, descriptor says %d", ErrDigestMismatch, desc.Digest, len(body), desc.Size)
 	}
@@ -314,23 +282,23 @@ type resolvedManifest struct {
 	// Chain holds the verbatim bodies from the top-level index or manifest
 	// down to the image manifest.
 	Chain    [][]byte
-	Manifest ImageManifest
+	Manifest ocispec.Manifest
 }
 
 // resolveManifestChain walks from a verified top-level body to the image
 // manifest for arch. fetch returns the body of a descriptor. Every body that
 // fetch returns is verified against its descriptor.
-func resolveManifestChain(top []byte, arch string, fetch func(Descriptor) ([]byte, error)) (*resolvedManifest, error) {
+func resolveManifestChain(top []byte, arch string, fetch func(ocispec.Descriptor) ([]byte, error)) (*resolvedManifest, error) {
 	res := &resolvedManifest{}
 	body := top
 	for range maxIndexDepth {
 		res.Chain = append(res.Chain, body)
 		var probe struct {
-			SchemaVersion int          `json:"schemaVersion"`
-			MediaType     string       `json:"mediaType"`
-			Manifests     []Descriptor `json:"manifests"`
-			Layers        []Descriptor `json:"layers"`
-			Config        *Descriptor  `json:"config"`
+			SchemaVersion int                  `json:"schemaVersion"`
+			MediaType     string               `json:"mediaType"`
+			Manifests     []ocispec.Descriptor `json:"manifests"`
+			Layers        []ocispec.Descriptor `json:"layers"`
+			Config        *ocispec.Descriptor  `json:"config"`
 		}
 		if err := json.Unmarshal(body, &probe); err != nil {
 			return nil, fmt.Errorf("oci: decode manifest: %w", err)
@@ -338,7 +306,7 @@ func resolveManifestChain(top []byte, arch string, fetch func(Descriptor) ([]byt
 		if isSchema1(probe.SchemaVersion, probe.MediaType) {
 			return nil, ErrSchema1Unsupported
 		}
-		isIndex := probe.MediaType == mediaTypeOCIIndex || probe.MediaType == mediaTypeDockerList ||
+		isIndex := probe.MediaType == ocispec.MediaTypeImageIndex || probe.MediaType == mediaTypeDockerList ||
 			(probe.MediaType == "" && probe.Config == nil && len(probe.Manifests) > 0)
 		if !isIndex {
 			if err := json.Unmarshal(body, &res.Manifest); err != nil {
@@ -347,13 +315,13 @@ func resolveManifestChain(top []byte, arch string, fetch func(Descriptor) ([]byt
 			if res.Manifest.Config.Digest == "" {
 				return nil, errors.New("oci: image manifest has no config descriptor")
 			}
-			if mt := res.Manifest.Config.MediaType; mt != "" && mt != mediaTypeOCIConfig && mt != mediaTypeDockerConfig {
+			if mt := res.Manifest.Config.MediaType; mt != "" && mt != ocispec.MediaTypeImageConfig && mt != mediaTypeDockerConfig {
 				return nil, fmt.Errorf("oci: config media type %q is not a container image", mt)
 			}
 			return res, nil
 		}
 
-		desc, err := SelectManifestForArch(ImageIndex{Manifests: probe.Manifests}, arch)
+		desc, err := SelectManifestForArch(ocispec.Index{Manifests: probe.Manifests}, arch)
 		if err != nil {
 			if len(probe.Manifests) != 1 || probe.Manifests[0].Platform != nil {
 				return nil, err
@@ -371,8 +339,8 @@ func resolveManifestChain(top []byte, arch string, fetch func(Descriptor) ([]byt
 }
 
 // checkLayerDescriptor rejects layers that the runner cannot compile.
-func checkLayerDescriptor(l Descriptor, lim Limits) error {
-	if len(l.URLs) > 0 || strings.Contains(l.MediaType, "foreign") {
+func checkLayerDescriptor(l ocispec.Descriptor, lim Limits) error {
+	if len(l.URLs) > 0 || strings.Contains(l.MediaType, "foreign") || strings.Contains(l.MediaType, "nondistributable") {
 		return fmt.Errorf("oci: layer %s is a foreign layer, which is not supported", l.Digest)
 	}
 	if mt := l.MediaType; mt != "" &&
@@ -454,16 +422,16 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 	}
 	defer rc.close()
 
-	digest := reference
+	dgstStr := reference
 	var topBody []byte
 	if !isDigestRef(reference) {
-		if digest, topBody, err = rc.resolveTag(ctx, reference); err != nil {
+		if dgstStr, topBody, err = rc.resolveTag(ctx, reference); err != nil {
 			return nil, fmt.Errorf("oci: resolve tag %q: %w", reference, err)
 		}
-		img, err := cache.loadImageByDigest(baseURL, repository, digest, targetArch)
+		img, err := cache.loadImageByDigest(baseURL, repository, dgstStr, targetArch)
 		switch {
 		case err == nil:
-			if err := cache.storeTag(baseURL, repository, reference, targetArch, digest); err != nil {
+			if err := cache.storeTag(baseURL, repository, reference, targetArch, dgstStr); err != nil {
 				_ = img.Close()
 				return nil, err
 			}
@@ -473,19 +441,19 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		}
 	}
 	if topBody == nil {
-		if topBody, err = rc.getManifest(ctx, digest); err != nil {
+		if topBody, err = rc.getManifest(ctx, dgstStr); err != nil {
 			return nil, err
 		}
 	}
 	if err := rejectSchema1(topBody); err != nil {
 		return nil, err
 	}
-	if err := verifyDigest(digest, topBody); err != nil {
-		return nil, fmt.Errorf("oci: manifest %s: %w", digest, err)
+	if err := verifyDigest(digest.Digest(dgstStr), topBody); err != nil {
+		return nil, fmt.Errorf("oci: manifest %s: %w", dgstStr, err)
 	}
 
-	res, err := resolveManifestChain(topBody, targetArch, func(d Descriptor) ([]byte, error) {
-		return rc.getManifest(ctx, d.Digest)
+	res, err := resolveManifestChain(topBody, targetArch, func(d ocispec.Descriptor) ([]byte, error) {
+		return rc.getManifest(ctx, d.Digest.String())
 	})
 	if err != nil {
 		return nil, err
@@ -502,15 +470,15 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 	image := newByteBudget("decompressed image size", cache.limits.MaxImageBytes)
 	digests := make([]string, 0, len(res.Manifest.Layers))
 	for _, l := range res.Manifest.Layers {
-		hexStr, err := parseDigest(l.Digest)
-		if err != nil {
+		if err := validateSHA256(l.Digest); err != nil {
 			return nil, err
 		}
+		hexStr := l.Digest.Encoded()
 		if err := checkLayerDescriptor(l, cache.limits); err != nil {
 			return nil, err
 		}
 		if _, ok := cache.HasLayer(hexStr); !ok {
-			body, err := rc.openBlob(ctx, l.Digest)
+			body, err := rc.openBlob(ctx, l.Digest.String())
 			if err != nil {
 				return nil, err
 			}
@@ -529,17 +497,17 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 	if err := cache.storeImage(imageRecord{
 		BaseURL:      baseURL,
 		Repository:   repository,
-		Digest:       digest,
+		Digest:       dgstStr,
 		Architecture: targetArch,
 		Manifests:    res.Chain,
 		Config:       cfgBytes,
 	}); err != nil {
 		return nil, err
 	}
-	if err := cache.storeTag(baseURL, repository, reference, targetArch, digest); err != nil {
+	if err := cache.storeTag(baseURL, repository, reference, targetArch, dgstStr); err != nil {
 		return nil, err
 	}
-	return cache.finishImage(targetArch, cfg, digest, digests)
+	return cache.finishImage(targetArch, cfg, dgstStr, digests)
 }
 
 // finishImage opens the verified layer handles of a finished image.

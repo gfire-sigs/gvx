@@ -69,8 +69,8 @@ func TestBoundaryAllowListsFollowSpecTable(t *testing.T) {
 		},
 		{
 			name: "pkg/oci stays independent of the sentry", file: "pkg/oci/pull.go",
-			imports: []string{m + "pkg/abi/linux", m + "pkg/erofs", "github.com/klauspost/compress/zstd", "github.com/cespare/xxhash/v2", "archive/tar"},
-			bad:     []string{m + "pkg/sentry/kernel", m + "pkg/sentry/vfs", m + "pkg/hostlockdown", m + "pkg/tcpip", m + "pkg/log"},
+			imports: []string{m + "pkg/abi/linux", m + "pkg/erofs", "github.com/distribution/reference", "github.com/opencontainers/go-digest", "github.com/opencontainers/image-spec/specs-go/v1", "github.com/klauspost/compress/zstd", "github.com/cespare/xxhash/v2", "archive/tar"},
+			bad:     []string{m + "pkg/sentry/kernel", m + "pkg/sentry/vfs", m + "pkg/hostlockdown", m + "pkg/tcpip", m + "pkg/log", "github.com/containerd/containerd/v2/client", "google.golang.org/grpc", "go.opentelemetry.io/otel", "k8s.io/apimachinery/pkg/apis/meta/v1"},
 		},
 		{
 			name: "pkg/netbackend bridges tcpip", file: "pkg/netbackend/nat.go",
@@ -605,6 +605,8 @@ func TestVerifyBoundariesEnforcesArchitecturalRules(t *testing.T) {
 		{"pkg/netbackend importing cmd/rungv", "pkg/netbackend/nat.go", m + "cmd/rungv"},
 		{"pkg/oci importing google.golang.org/grpc", "pkg/oci/pull.go", "google.golang.org/grpc"},
 		{"pkg/oci importing containerd", "pkg/oci/pull.go", "github.com/containerd/containerd/v2/client"},
+		{"pkg/oci importing go.opentelemetry.io", "pkg/oci/pull.go", "go.opentelemetry.io/otel"},
+		{"pkg/oci importing k8s.io", "pkg/oci/pull.go", "k8s.io/apimachinery/pkg/apis/meta/v1"},
 		{"pkg/oci importing pkg/sentry", "pkg/oci/pull.go", m + "pkg/sentry/kernel"},
 		{"pkg/oci importing pkg/gvx", "pkg/oci/pull.go", m + "pkg/gvx"},
 		{"pkg/ipset importing pkg/sentry", "pkg/ipset/ipset.go", m + "pkg/sentry/kernel"},

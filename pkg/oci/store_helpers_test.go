@@ -20,6 +20,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // storeArch is the architecture of every image in the store tests.
@@ -38,11 +41,11 @@ func newImageWithCreated(t testing.TB, env, created string, rawLayers ...[]byte)
 	if img.config, err = json.Marshal(cfg); err != nil {
 		t.Fatal(err)
 	}
-	var manifest ImageManifest
+	var manifest ocispec.Manifest
 	if err := json.Unmarshal(img.manifest, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	manifest.Config = Descriptor{MediaType: mediaTypeOCIConfig, Digest: sha256Digest(img.config), Size: int64(len(img.config))}
+	manifest.Config = ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: digest.FromBytes(img.config), Size: int64(len(img.config))}
 	if img.manifest, err = json.Marshal(manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -81,12 +84,13 @@ func listImages(t *testing.T, cache *LayerCache) []Image {
 }
 
 // layerFiles returns the names of the layer image and integrity files of a layer.
-func layerFiles(t *testing.T, cache *LayerCache, digest string) []string {
+func layerFiles(t *testing.T, cache *LayerCache, rawDigest string) []string {
 	t.Helper()
-	hexStr, err := parseDigest(digest)
+	d, err := digest.Parse(rawDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
+	hexStr := d.Encoded()
 	var found []string
 	for _, name := range []string{hexStr + cache.layerSuffix(), hexStr + cache.sumSuffix()} {
 		if _, err := os.Stat(filepath.Join(cache.Dir(), name)); err == nil {

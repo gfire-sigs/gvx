@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // archiveMember locates a regular file inside an uncompressed tar archive.
@@ -176,12 +179,11 @@ func (a *archive) readJSON(name string) ([]byte, error) {
 	return readAllBounded(sr, "size of "+name, a.cache.limits.MaxJSONBytes)
 }
 
-func blobMemberName(digest string) (string, error) {
-	hexStr, err := parseDigest(digest)
-	if err != nil {
+func blobMemberName(d digest.Digest) (string, error) {
+	if err := validateSHA256(d); err != nil {
 		return "", err
 	}
-	return "blobs/sha256/" + hexStr, nil
+	return "blobs/sha256/" + d.Encoded(), nil
 }
 
 // LoadArchiveTar compiles a multi-arch or single-arch image archive into
@@ -213,22 +215,22 @@ func LoadArchiveTar(r io.Reader, cache *LayerCache, targetArch string) (*Resolve
 	return img, loadErr
 }
 
-func (a *archive) readIndexManifests() ([]byte, ImageIndex, bool, error) {
+func (a *archive) readIndexManifests() ([]byte, ocispec.Index, bool, error) {
 	if _, ok := a.members["index.json"]; !ok {
-		return nil, ImageIndex{}, false, nil
+		return nil, ocispec.Index{}, false, nil
 	}
 	raw, err := a.readJSON("index.json")
 	if err != nil {
-		return nil, ImageIndex{}, false, err
+		return nil, ocispec.Index{}, false, err
 	}
-	var idx ImageIndex
+	var idx ocispec.Index
 	if err := json.Unmarshal(raw, &idx); err == nil && len(idx.Manifests) > 0 {
 		return raw, idx, true, nil
 	}
-	if _, ok := a.members["oci-layout"]; ok {
-		return nil, ImageIndex{}, false, errors.New("oci: archive has an oci-layout marker but index.json lists no manifests")
+	if _, ok := a.members[ocispec.ImageLayoutFile]; ok {
+		return nil, ocispec.Index{}, false, errors.New("oci: archive has an oci-layout marker but index.json lists no manifests")
 	}
-	return nil, ImageIndex{}, false, nil
+	return nil, ocispec.Index{}, false, nil
 }
 
 func (a *archive) load(targetArch string) (*ResolvedImage, error) {
@@ -251,7 +253,7 @@ func (a *archive) load(targetArch string) (*ResolvedImage, error) {
 
 // loadOCILayout resolves an OCI image layout, whose index.json is the entry point.
 func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedImage, error) {
-	res, err := resolveManifestChain(indexJSON, targetArch, func(d Descriptor) ([]byte, error) {
+	res, err := resolveManifestChain(indexJSON, targetArch, func(d ocispec.Descriptor) ([]byte, error) {
 		name, err := blobMemberName(d.Digest)
 		if err != nil {
 			return nil, err
@@ -287,7 +289,7 @@ func (a *archive) loadOCILayout(indexJSON []byte, targetArch string) (*ResolvedI
 // compileOCILayers compiles the layer blobs of an OCI manifest from the archive
 // into the cache and returns their cache keys. It skips a layer that the cache
 // already holds.
-func (a *archive) compileOCILayers(layers []Descriptor) ([]string, error) {
+func (a *archive) compileOCILayers(layers []ocispec.Descriptor) ([]string, error) {
 	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
 	digests := make([]string, 0, len(layers))
 	for _, l := range layers {
@@ -298,7 +300,7 @@ func (a *archive) compileOCILayers(layers []Descriptor) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		hexStr, _ := parseDigest(l.Digest)
+		hexStr := l.Digest.Encoded()
 		if _, ok := a.cache.HasLayer(hexStr); !ok {
 			sr, ok := a.reader(name)
 			if !ok {
@@ -367,7 +369,7 @@ type dockerSaveImage struct {
 	cfgBytes []byte
 	cfg      RuntimeConfig
 	// diffIDs are the diff IDs of the config, one per layer.
-	diffIDs []string
+	diffIDs []digest.Digest
 	// digests are the cache keys of the layers, which are the diff ID hex.
 	digests []string
 	// layerSizes are the sizes of the layer members in the archive.
@@ -385,7 +387,7 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 	if err != nil {
 		return nil, false, err
 	}
-	parsed, err := parseImageConfigFile(cfgBytes, targetArch, len(e.Layers))
+	parsed, cfg, err := parseImageConfigFile(cfgBytes, targetArch, len(e.Layers))
 	if err != nil {
 		return nil, true, err
 	}
@@ -394,12 +396,13 @@ func (a *archive) compileDockerSaveEntry(e dockerSaveEntry, targetArch string) (
 	}
 
 	image := newByteBudget("decompressed image size", a.cache.limits.MaxImageBytes)
-	out := &dockerSaveImage{cfgBytes: cfgBytes, cfg: parsed.Config, diffIDs: parsed.RootFS.DiffIDs}
+	out := &dockerSaveImage{cfgBytes: cfgBytes, cfg: cfg, diffIDs: parsed.RootFS.DiffIDs}
 	for i, layer := range e.Layers {
-		diffHex, err := parseDigest(parsed.RootFS.DiffIDs[i])
-		if err != nil {
+		diffID := parsed.RootFS.DiffIDs[i]
+		if err := validateSHA256(diffID); err != nil {
 			return nil, false, err
 		}
+		diffHex := diffID.Encoded()
 		name, err := cleanTarPath(layer)
 		if err != nil {
 			return nil, false, err
