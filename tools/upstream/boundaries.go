@@ -268,7 +268,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/blockdev",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/sentry/vfs", "pkg/sync"},
+		allowed:   []string{"pkg/context", "pkg/errors/linuxerr", "pkg/sentry/vfs", "pkg/state", "pkg/sync"},
 		forbidden: append([]string{"pkg/sentry/platform/*", "pkg/sentry/kernel/*"}, tier2UpperBans...),
 	},
 	{
@@ -290,7 +290,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/fsimpl/chunkcache",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/fsimpl/fsutilx", "pkg/abi/linux", "golang.org/x/sys/*"},
+		allowed:   []string{"pkg/sentry/vfs", "pkg/sentry/fsimpl/fsutilx", "pkg/state", "pkg/abi/linux", "golang.org/x/sys/*"},
 		forbidden: append([]string{"pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -951,6 +951,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/socket/netfilter", "pkg/tcpip/transport/tcp", "tools/gostateify"}, "pkg/state", "stateify round-trip unit tests serialize and restore structs with pkg/state"},
 	{[]string{"pkg/sentry/pgalloc"}, "pkg/sentry/state/stateio", "save and restore unit tests construct stateio async page streams"},
 	{[]string{"pkg/sentry/pgalloc"}, "pkg/compressio", "save and restore unit tests round-trip streams through compressio"},
+	{[]string{"pkg/gvx"}, "pkg/state", "EROFS restore tests round-trip VFS mounts and open file descriptions"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {

@@ -5,9 +5,12 @@ pkg/bpf
 pkg/ilist
 pkg/ipset
 pkg/refs
+pkg/sentry/blockdev tier1
 pkg/sentry/checkpoint
 pkg/sentry/devices/memdev tier2
 pkg/sentry/fsimpl/cgroup2fs tier2
+pkg/sentry/fsimpl/chunkcache tier1
+pkg/sentry/fsimpl/erofs
 pkg/sentry/fsimpl/kernfs
 pkg/sentry/fsimpl/overlay
 pkg/sentry/fsimpl/proc tier2

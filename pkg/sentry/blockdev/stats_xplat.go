@@ -23,6 +23,7 @@
 package blockdev
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -58,36 +59,67 @@ var processStart = time.Now()
 func monotonicClock() int64 { return int64(time.Since(processStart)) }
 
 // opCounters is the count of one kind of request.
+//
+// +stateify savable
 type opCounters struct {
-	completed atomic.Uint64
-	sectors   atomic.Uint64
+	completed atomic.Uint64 `state:".(uint64)"`
+	sectors   atomic.Uint64 `state:".(uint64)"`
 	// ticks is the total time of the requests, in nanoseconds, from Begin to
 	// End. Requests that overlap each add their own time.
-	ticks atomic.Uint64
+	ticks atomic.Uint64 `state:".(uint64)"`
 }
+
+func (c *opCounters) saveCompleted() uint64                     { return c.completed.Load() }
+func (c *opCounters) loadCompleted(_ context.Context, v uint64) { c.completed.Store(v) }
+func (c *opCounters) saveSectors() uint64                       { return c.sectors.Load() }
+func (c *opCounters) loadSectors(_ context.Context, v uint64)   { c.sectors.Store(v) }
+func (c *opCounters) saveTicks() uint64                         { return c.ticks.Load() }
+func (c *opCounters) loadTicks(_ context.Context, v uint64)     { c.ticks.Store(v) }
 
 // Stats holds the counters of one disk. The zero value does not work: use
 // NewStats. All methods are safe for concurrent use. No method takes a lock:
 // each counter is an atomic word, so the CPUs of a guest that read one disk at
 // once do not wait for each other.
+//
+// +stateify savable
 type Stats struct {
-	clock Clock
+	clock Clock `state:"nosave"`
 
 	// ops holds the counters of each kind of request.
 	ops [numOps]opCounters
 	// inFlight is the number of requests between Begin and End.
-	inFlight atomic.Int64
+	inFlight atomic.Int64 `state:".(int64)"`
 	// ioTicks is the time, in nanoseconds, in which at least one request was
 	// in flight.
-	ioTicks atomic.Uint64
+	ioTicks atomic.Uint64 `state:".(uint64)"`
 	// weighted is the sum, over all time, of the requests in flight, in
 	// nanoseconds.
-	weighted atomic.Uint64
+	weighted atomic.Uint64 `state:".(uint64)"`
 	// last is the time of the latest update of ioTicks and weighted, in
 	// milliseconds of the clock. Only the
 	// goroutine that moves it forward adds the interval, so no interval counts
 	// twice.
-	last atomic.Int64
+	last atomic.Int64 `state:"nosave"`
+}
+
+func (s *Stats) saveInFlight() int64                      { return s.inFlight.Load() }
+func (s *Stats) loadInFlight(_ context.Context, v int64)  { s.inFlight.Store(v) }
+func (s *Stats) saveIoTicks() uint64                      { return s.ioTicks.Load() }
+func (s *Stats) loadIoTicks(_ context.Context, v uint64)  { s.ioTicks.Store(v) }
+func (s *Stats) saveWeighted() uint64                     { return s.weighted.Load() }
+func (s *Stats) loadWeighted(_ context.Context, v uint64) { s.weighted.Store(v) }
+
+func (s *Stats) beforeSave() {
+	if s.clock != nil {
+		s.update(s.clock())
+	}
+}
+
+func (s *Stats) afterLoad(context.Context) {
+	if s.clock == nil {
+		s.clock = monotonicClock
+	}
+	s.last.Store(s.clock() / int64(nsPerMilli))
 }
 
 // NewStats returns counters that read time from clock. A nil clock selects the
@@ -99,7 +131,19 @@ func NewStats(clock Clock) *Stats {
 	return &Stats{clock: clock}
 }
 
+// SetClock binds clock as the time source of s and rebases its tick stamp. A
+// nil clock selects the monotonic clock of the process.
+func (s *Stats) SetClock(clock Clock) {
+	if clock == nil {
+		clock = monotonicClock
+	}
+	s.clock = clock
+	s.last.Store(clock() / int64(nsPerMilli))
+}
+
 // Request is a request between Begin and End.
+//
+// +stateify savable
 type Request struct {
 	start int64
 }
@@ -171,6 +215,8 @@ func (s *Stats) Add(op Op, n int64) {
 // Snapshot holds the counters of a disk at one time, in the units of
 // /proc/diskstats. The comments give the field number of the Linux document
 // Documentation/admin-guide/iostats.rst.
+//
+// +stateify savable
 type Snapshot struct {
 	// ReadsCompleted, ReadsMerged, SectorsRead, and ReadMillis are the fields 1
 	// to 4.

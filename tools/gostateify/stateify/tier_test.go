@@ -2,6 +2,8 @@ package stateify
 
 import (
 	"go/build/constraint"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -162,5 +164,41 @@ func TestClassifyPackageAndPartition(t *testing.T) {
 	}
 	if got := ClassifyFilePartition(PackageTier1, "inode_linux.go", true); got != PartitionLinux {
 		t.Fatalf("Tier 1 inode_linux.go partition = %v, want PartitionLinux", got)
+	}
+	if got := classifyFilePartition(PackageTier1, "registry_xplat.go", true, true); got != PartitionDefault {
+		t.Fatalf("Tier 1 merged registry_xplat.go partition = %v, want PartitionDefault", got)
+	}
+}
+
+func TestReadPackagesFileTierOptions(t *testing.T) {
+	dir := t.TempDir()
+	validPath := filepath.Join(dir, "packages.txt")
+	content := "# registered packages\npkg/sentry/blockdev tier1\npkg/sentry/kernel tier2\npkg/bitmap\n"
+	if err := os.WriteFile(validPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := readPackagesFile(validPath)
+	if err != nil {
+		t.Fatalf("readPackagesFile: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("len(entries) = %d, want 3", len(entries))
+	}
+	if !entries[0].tier1 || entries[0].tier2Only {
+		t.Fatalf("entries[0] = %+v, want tier1=true tier2Only=false", entries[0])
+	}
+	if entries[1].tier1 || !entries[1].tier2Only {
+		t.Fatalf("entries[1] = %+v, want tier1=false tier2Only=true", entries[1])
+	}
+	if entries[2].tier1 || entries[2].tier2Only {
+		t.Fatalf("entries[2] = %+v, want tier1=false tier2Only=false", entries[2])
+	}
+
+	conflictPath := filepath.Join(dir, "conflict.txt")
+	if err := os.WriteFile(conflictPath, []byte("pkg/sentry/blockdev tier1 tier2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPackagesFile(conflictPath); err == nil {
+		t.Fatal("expected error for conflicting tier1 and tier2 options")
 	}
 }

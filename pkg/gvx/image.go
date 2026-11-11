@@ -148,6 +148,7 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		err = errors.Join(err, oci.CloseLayerFiles(layerFiles))
 	}()
 	var layerPaths []string
+	var layerDigests []string
 
 	if len(s.cfg.OCILayerTars) > 0 {
 		var digests []string
@@ -158,6 +159,7 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 			}
 			digests = append(digests, stats.SHA256Hex)
 			layerPaths = append(layerPaths, p)
+			layerDigests = append(layerDigests, stats.SHA256Hex)
 		}
 		files, err := cache.OpenLayerHandles(digests)
 		if err != nil {
@@ -173,6 +175,13 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		layerFiles = append(layerFiles, img.LayerFiles...)
 		img.LayerFiles = nil
 		layerPaths = append(layerPaths, img.LayerPaths...)
+		for i, p := range img.LayerPaths {
+			if i < len(img.LayerDigests) && img.LayerDigests[i] != "" {
+				layerDigests = append(layerDigests, img.LayerDigests[i])
+			} else {
+				layerDigests = append(layerDigests, digestFromLayerPath(p))
+			}
+		}
 		if err := s.applyImageDefaults(img.Config); err != nil {
 			return err
 		}
@@ -203,6 +212,7 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 			return err
 		}
 		layerPaths = append(layerPaths, p)
+		layerDigests = append(layerDigests, stats.SHA256Hex)
 		layerFiles = append(layerFiles, files...)
 		if len(s.cfg.Argv) == 0 {
 			s.cfg.Argv = []string{"/bin/app"}
@@ -227,6 +237,13 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 			return fmt.Errorf("gvx: open EROFS HostHandle %q: %w", layerPaths[i], err)
 		}
 		s.layerHandles = append(s.layerHandles, hh)
+		var digest string
+		if i < len(layerDigests) {
+			digest = normalizeEROFSDigest(layerDigests[i])
+		} else {
+			digest = digestFromLayerPath(layerPaths[i])
+		}
+		s.layerDigests = append(s.layerDigests, digest)
 		if err := verifySameLayerFile(f, layerPaths[i]); err != nil {
 			return err
 		}

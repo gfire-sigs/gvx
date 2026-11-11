@@ -89,7 +89,7 @@ type filesystem struct {
 
 	// touched holds the pages of the image that a read or a mapping took, or
 	// nil when the mount has no block counters. touched is immutable.
-	touched *blockdev.FirstTouch `state:"nosave"`
+	touched *blockdev.FirstTouch
 
 	// memoryFile is the application memory file. memoryFile is immutable.
 	memoryFile *pgalloc.MemoryFile `state:"nosave"`
@@ -132,9 +132,8 @@ type InternalFilesystemOptions struct {
 	UniqueID checkpoint.ResourceID
 
 	// BlockStats, when non-nil, counts the file data that the file system
-	// reads from the image as the read requests of a disk. A restored
-	// filesystem has no counters.
-	BlockStats *blockdev.Stats `state:"nosave"`
+	// reads from the image as the read requests of a disk.
+	BlockStats *blockdev.Stats
 }
 
 // Name implements vfs.FilesystemType.Name.

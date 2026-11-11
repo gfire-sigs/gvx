@@ -67,6 +67,7 @@ type packageTarget struct {
 	relDir    string
 	pkgPath   string
 	modPath   string
+	tier1     bool
 	tier2Only bool
 }
 
@@ -180,6 +181,7 @@ func parseModulePath(goMod []byte) string {
 func resolvePackageTargets(rootDir, modPath string, opts Options) ([]packageTarget, error) {
 	type rawSpec struct {
 		pattern   string
+		tier1     bool
 		tier2Only bool
 	}
 	var specs []rawSpec
@@ -196,6 +198,7 @@ func resolvePackageTargets(rootDir, modPath string, opts Options) ([]packageTarg
 		for _, e := range entries {
 			specs = append(specs, rawSpec{
 				pattern:   e.pkg,
+				tier1:     e.tier1,
 				tier2Only: opts.Tier2Only || e.tier2Only,
 			})
 		}
@@ -222,7 +225,9 @@ func resolvePackageTargets(rootDir, modPath string, opts Options) ([]packageTarg
 			return nil, err
 		}
 		for _, tgt := range expanded {
+			tgt.tier1 = spec.tier1
 			if idx, exists := seen[tgt.absDir]; exists {
+				out[idx].tier1 = out[idx].tier1 || tgt.tier1
 				out[idx].tier2Only = out[idx].tier2Only && tgt.tier2Only
 				continue
 			}
@@ -235,6 +240,7 @@ func resolvePackageTargets(rootDir, modPath string, opts Options) ([]packageTarg
 
 type pkgFileEntry struct {
 	pkg       string
+	tier1     bool
 	tier2Only bool
 }
 
@@ -259,11 +265,16 @@ func readPackagesFile(filePath string) ([]pkgFileEntry, error) {
 		entry := pkgFileEntry{pkg: fields[0]}
 		for _, opt := range fields[1:] {
 			switch opt {
+			case "tier1":
+				entry.tier1 = true
 			case "tier2":
 				entry.tier2Only = true
 			default:
 				return nil, fmt.Errorf("%s:%d: unsupported option %q", filePath, lineNum, opt)
 			}
+		}
+		if entry.tier1 && entry.tier2Only {
+			return nil, fmt.Errorf("%s:%d: conflicting options \"tier1\" and \"tier2\"", filePath, lineNum)
 		}
 		entries = append(entries, entry)
 	}
@@ -448,7 +459,7 @@ type GeneratedFile struct {
 }
 
 func inspectTarget(rootDir string, target packageTarget, opts Options, report *Report) error {
-	outputs, err := GeneratePackage(target.absDir, target.relDir, target.pkgPath, target.modPath, opts.PartitionByTier, target.tier2Only)
+	outputs, err := generatePackageWithTier(target.absDir, target.relDir, target.pkgPath, target.modPath, opts.PartitionByTier, target.tier1, target.tier2Only)
 	if err != nil {
 		return fmt.Errorf("generate %s: %w", target.relDir, err)
 	}
@@ -636,12 +647,19 @@ type subPartitionGroup struct {
 // GeneratePackage parses all non-test, non-autogen Go files in absDir and returns the
 // formatted autogen outputs for each partition and build-constraint sub-partition.
 func GeneratePackage(absDir, relDir, pkgPath, modPath string, partitionByTier, tier2Only bool) ([]GeneratedFile, error) {
+	return generatePackageWithTier(absDir, relDir, pkgPath, modPath, partitionByTier, false, tier2Only)
+}
+
+func generatePackageWithTier(absDir, relDir, pkgPath, modPath string, partitionByTier, forceTier1, tier2Only bool) ([]GeneratedFile, error) {
 	entries, err := os.ReadDir(absDir)
 	if err != nil {
 		return nil, fmt.Errorf("read dir %s: %w", absDir, err)
 	}
 
 	pkgTier := ClassifyPackage(relDir)
+	if forceTier1 {
+		pkgTier = PackageTier1
+	}
 	fset := token.NewFileSet()
 
 	var sourceNames []string
@@ -689,7 +707,7 @@ func GeneratePackage(absDir, relDir, pkgPath, modPath string, partitionByTier, t
 
 		pf := &parsedSourceFile{
 			baseName:   name,
-			partition:  ClassifyFilePartition(pkgTier, name, partitionByTier),
+			partition:  classifyFilePartition(pkgTier, name, partitionByTier, forceTier1),
 			constraint: fileConstraint,
 			astFile:    astFile,
 			imports:    collectFileImports(astFile),
