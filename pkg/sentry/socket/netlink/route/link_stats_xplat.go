@@ -15,12 +15,14 @@
 package route
 
 import (
+	"bytes"
 	"encoding/binary"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/marshal/primitive"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 )
 
 // rtnlLinkStats64Fields is the number of 64-bit counters in struct
@@ -28,6 +30,59 @@ import (
 // libraries cast the attribute to a struct of this size, so a shorter attribute
 // would make them read past it.
 const rtnlLinkStats64Fields = 25
+
+func linkOperState(i inet.Interface, fallback uint8) uint8 {
+	if kindState, ok := netstack.LinkOperState(i.Kind, i.Flags); ok {
+		return kindState
+	}
+	return fallback
+}
+
+// hasLinkLayerAddr reports whether RTM_NEWLINK and RTM_DELLINK carry
+// IFLA_ADDRESS and IFLA_BROADCAST for i. A link of type ARPHRD_NONE without an
+// address omits both so "ip link" prints "link/none".
+func hasLinkLayerAddr(i inet.Interface) bool {
+	return !netstack.LinkHasNoLinkLayer(i.Kind) || len(i.Addr) > 0
+}
+
+func writeLinkInfoWithStack(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Stack) {
+	m.Put(&linux.InterfaceInfoMessage{
+		Family: linux.AF_UNSPEC,
+		Type:   i.DeviceType,
+		Index:  idx,
+		Flags:  i.Flags,
+	})
+
+	m.PutAttrString(linux.IFLA_IFNAME, i.Name)
+	m.PutAttr(linux.IFLA_MTU, primitive.AllocateUint32(i.MTU))
+
+	operState := uint8(linux.IF_OPER_DOWN)
+	if i.Flags&linux.IFF_UP != 0 {
+		operState = linux.IF_OPER_UP
+	}
+	m.PutAttr(linux.IFLA_OPERSTATE, primitive.AllocateUint8(linkOperState(i, operState)))
+
+	if hasLinkLayerAddr(i) {
+		mac := make([]byte, 6)
+		brd := mac
+		if len(i.Addr) > 0 {
+			mac = i.Addr
+			brd = bytes.Repeat([]byte{0xff}, len(i.Addr))
+		}
+		m.PutAttr(linux.IFLA_ADDRESS, primitive.AsByteSlice(mac))
+		m.PutAttr(linux.IFLA_BROADCAST, primitive.AsByteSlice(brd))
+	}
+	if i.Master != 0 {
+		m.PutAttr(linux.IFLA_MASTER, primitive.AllocateUint32(i.Master))
+	}
+
+	if i.Kind != "" {
+		var nestedAttrs nlmsg.NestedAttr
+		nestedAttrs.PutAttrString(linux.IFLA_INFO_KIND, i.Kind)
+		putLinkInfoData(&nestedAttrs, stack, idx, i)
+		m.PutNestedAttr(linux.IFLA_LINKINFO, nestedAttrs)
+	}
+}
 
 // addNewLinkMessageWithStats is AddNewLinkMessage plus the IFLA_STATS64
 // attribute for the counters of the link. docker stats asks every container
@@ -37,7 +92,7 @@ func (p *Protocol) addNewLinkMessageWithStats(ms *nlmsg.MessageSet, stack inet.S
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.RTM_NEWLINK,
 	})
-	writeLinkInfo(m, idx, i, stack)
+	writeLinkInfoWithStack(m, idx, i, stack)
 
 	var dev inet.StatDev
 	if err := stack.Statistics(&dev, i.Name); err != nil {

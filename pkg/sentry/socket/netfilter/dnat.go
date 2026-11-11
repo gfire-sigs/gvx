@@ -232,7 +232,7 @@ func (*dnatTargetMakerR2) marshal(target target) []byte {
 	dt := target.(*dnatTarget)
 	nt := linux.XTNATTargetV2{
 		Target: linux.XTEntryTarget{
-			TargetSize: linux.SizeOfXTNATTargetV2,
+			TargetSize: linux.SizeOfXTNATTargetV1,
 			Revision:   2,
 		},
 	}

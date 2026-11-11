@@ -101,6 +101,42 @@ func isRuleMessage(typ uint16) bool {
 	return typ == linux.RTM_NEWRULE || typ == linux.RTM_DELRULE || typ == linux.RTM_GETRULE
 }
 
+// putRouteAttrs appends the route attributes beyond RTA_DST and RTA_SRC to m.
+func putRouteAttrs(m *nlmsg.Message, rt inet.Route, prefSrc []byte) {
+	m.PutAttr(linux.RTA_TABLE, primitive.AllocateUint32(tableOrMain(rt.Table)))
+	if rt.OutputInterface != 0 {
+		m.PutAttr(linux.RTA_OIF, primitive.AllocateInt32(rt.OutputInterface))
+	}
+	if len(rt.PrefSrc) > 0 {
+		prefSrc = rt.PrefSrc
+	}
+	if len(prefSrc) > 0 && (rt.OutputInterface != 0 || len(rt.PrefSrc) > 0) {
+		m.PutAttr(linux.RTA_PREFSRC, primitive.AsByteSlice(prefSrc))
+	}
+	if len(rt.GatewayAddr) > 0 {
+		m.PutAttr(linux.RTA_GATEWAY, primitive.AsByteSlice(rt.GatewayAddr))
+	}
+	if rt.Priority != 0 || rt.Family == linux.AF_INET6 {
+		m.PutAttr(linux.RTA_PRIORITY, primitive.AllocateUint32(rt.Priority))
+	}
+	if rt.MTU != 0 {
+		var metrics nlmsg.NestedAttr
+		metrics.PutAttr(rtaxMTU, primitive.AllocateUint32(rt.MTU))
+		m.PutNestedAttr(linux.RTA_METRICS, metrics)
+	}
+}
+
+// processXplatMessage dispatches neighbor and FIB rule messages.
+func (p *Protocol) processXplatMessage(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet, typ uint16) (bool, *syserr.Error) {
+	if isNeighMessage(typ) {
+		return true, p.processNeigh(ctx, s, msg, ms)
+	}
+	if isRuleMessage(typ) {
+		return true, p.processRule(ctx, s, msg, ms)
+	}
+	return false, nil
+}
+
 // fibRuleHdr is struct fib_rule_hdr.
 type fibRuleHdr struct {
 	family, dstLen, srcLen, tos, table uint8

@@ -32,7 +32,7 @@ import (
 func linkAttrs(t *testing.T, i inet.Interface) map[uint16]nlmsg.BytesView {
 	t.Helper()
 	m := nlmsg.NewMessage(linux.NetlinkMessageHeader{})
-	writeLinkInfo(m, 3, i, nil)
+	writeLinkInfo(m, 3, i)
 	var ifi linux.InterfaceInfoMessage
 	view, ok := m.GetData(&ifi)
 	if !ok {

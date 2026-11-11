@@ -15,16 +15,19 @@
 package linux
 
 import (
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/limits"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
-// fallocateModeServer is implemented by a file description that serves the
-// fallocate modes beyond mode 0, such as FALLOC_FL_PUNCH_HOLE. A file
-// description that does not implement it treats every call as mode 0, so the
-// system call must not forward a mode to it. The implementation validates the
-// mode as vfs_fallocate does and returns EOPNOTSUPP for a mode that its file
-// system cannot serve.
+// fallocateModeServer marks a file description that serves fallocate modes
+// beyond mode 0, such as FALLOC_FL_PUNCH_HOLE. A file description without this
+// method treats every call as mode 0, so the system call must not forward a
+// mode to it. The implementation validates the mode as vfs_fallocate does and
+// returns EOPNOTSUPP for a mode that its file system cannot serve.
 type fallocateModeServer interface {
 	ServesFallocateModes()
 }
@@ -43,4 +46,45 @@ func checkFallocateMode(file *vfs.FileDescription, mode uint64, offset, length i
 		return linuxerr.EINVAL
 	}
 	return nil
+}
+
+// fallocateXplat implements fallocate(2) and forwards non-zero modes to file
+// descriptions that implement fallocateModeServer.
+func fallocateXplat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	fd := args[0].Int()
+	mode := args[1].Uint64()
+	offset := args[2].Int64()
+	length := args[3].Int64()
+
+	file := t.GetFile(fd)
+	if file == nil {
+		return 0, nil, linuxerr.EBADF
+	}
+	defer file.DecRef(t)
+
+	if !file.IsWritable() {
+		return 0, nil, linuxerr.EBADF
+	}
+	if err := checkFallocateMode(file, mode, offset, length); err != nil {
+		return 0, nil, err
+	}
+	if offset < 0 || length <= 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+
+	size := offset + length
+	if size < 0 {
+		return 0, nil, linuxerr.EFBIG
+	}
+	limit := limits.FromContext(t).Get(limits.FileSize).Cur
+	// Non-zero modes verify RLIMIT_FSIZE themselves when a call grows the file.
+	if mode == 0 && uint64(size) >= limit {
+		t.SendSignal(&linux.SignalInfo{
+			Signo: int32(linux.SIGXFSZ),
+			Code:  linux.SI_USER,
+		})
+		return 0, nil, linuxerr.EFBIG
+	}
+
+	return 0, nil, handleSetSizeError(t, file.Allocate(t, mode, uint64(offset), uint64(length)))
 }

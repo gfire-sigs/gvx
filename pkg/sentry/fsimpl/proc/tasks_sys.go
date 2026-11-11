@@ -149,17 +149,18 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 //
 // The returned slice must not be modified.
 func sysSubdirs(path string) []string {
+	if subdirs, ok := sysSubdirsXplat(path); ok {
+		return subdirs
+	}
 	switch path {
 	case "":
 		return []string{"kernel", "fs", "vm", "user", "net"}
 	case "kernel":
 		return []string{"random", "yama", "keys"}
 	case "net":
-		return []string{"ipv4", "core", "ipv6", "bridge", "netfilter"}
+		return []string{"ipv4", "core", "ipv6"}
 	case "net/ipv4", "net/ipv6":
-		return []string{"conf", "neigh"}
-	case "net/ipv4/neigh", "net/ipv6/neigh":
-		return []string{"default"}
+		return []string{"conf"}
 	case "net/ipv4/conf", "net/ipv6/conf":
 		return []string{"all", "default"}
 	default:
@@ -251,8 +252,9 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "vm":
 		return map[string]kernfs.Inode{
-			"max_map_count": fs.newInode(ctx, root, 0444, newStaticFile("2147483647\n")),
-			"mmap_min_addr": fs.newInode(ctx, root, 0444, &mmapMinAddrData{k: k}),
+			"max_map_count":     fs.newInode(ctx, root, 0444, newStaticFile("2147483647\n")),
+			"mmap_min_addr":     fs.newInode(ctx, root, 0444, &mmapMinAddrData{k: k}),
+			"overcommit_memory": fs.newInode(ctx, root, 0444, newStaticFile("0\n")),
 		}
 	case "user":
 		return map[string]kernfs.Inode{
@@ -260,7 +262,7 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "net/ipv4":
 		return map[string]kernfs.Inode{
-			"ip_forward":          fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv4.ProtocolNumber}),
+			"ip_forward":          fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv4.ProtocolNumber}),
 			"ip_local_port_range": fs.newInode(ctx, root, 0644, &portRange{stack: stack}),
 			"tcp_recovery":        fs.newInode(ctx, root, 0644, &tcpRecoveryData{stack: stack}),
 			"tcp_rmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpRMem}),
@@ -271,9 +273,10 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 			// netstack, most of these files are configuration related. We use the
 			// value closest to the actual netstack behavior or any empty file, all
 			// of these files will have mode 0444 (read-only for all users).
-			"ipfrag_time":      fs.newInode(ctx, root, 0444, newStaticFile("30")),
-			"ip_nonlocal_bind": fs.newInode(ctx, root, 0444, newStaticFile("0")),
-			"ip_no_pmtu_disc":  fs.newInode(ctx, root, 0444, newStaticFile("1")),
+			"ip_local_reserved_ports": fs.newInode(ctx, root, 0444, newStaticFile("")),
+			"ipfrag_time":             fs.newInode(ctx, root, 0444, newStaticFile("30")),
+			"ip_nonlocal_bind":        fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"ip_no_pmtu_disc":         fs.newInode(ctx, root, 0444, newStaticFile("1")),
 
 			// tcp_allowed_congestion_control tell the user what they are able to
 			// do as an unprivledged process so we leave it empty.
@@ -291,6 +294,9 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 			"tcp_fastopen":              fs.newInode(ctx, root, 0444, newStaticFile("0")),
 			"tcp_fastopen_key":          fs.newInode(ctx, root, 0444, newStaticFile("")),
 			"tcp_invalid_ratelimit":     fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_keepalive_intvl":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_keepalive_probes":      fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_keepalive_time":        fs.newInode(ctx, root, 0444, newStaticFile("7200")),
 			"tcp_mtu_probing":           fs.newInode(ctx, root, 0444, newStaticFile("0")),
 			"tcp_no_metrics_save":       fs.newInode(ctx, root, 0444, newStaticFile("1")),
 			"tcp_probe_interval":        fs.newInode(ctx, root, 0444, newStaticFile("0")),
@@ -331,12 +337,12 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "net/ipv6/conf/all":
 		return map[string]kernfs.Inode{
-			"forwarding": fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv6.ProtocolNumber}),
+			"forwarding": fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv6.ProtocolNumber}),
 		}
 	case "net/ipv6/conf/default":
 		// Stub for conf/default/forwarding.
 		return map[string]kernfs.Inode{
-			"forwarding": fs.newInode(ctx, root, 0644, &nsForwarding{stack: stack, protocol: ipv6.ProtocolNumber, isDefault: true}),
+			"forwarding": fs.newInode(ctx, root, 0644, &atomicInt32File{val: new(atomicbitops.Int32), min: 0, max: 1}),
 		}
 	}
 	if files, ok := fs.sysNetXplatFiles(ctx, root, stack, path); ok {

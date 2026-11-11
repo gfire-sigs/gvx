@@ -26,7 +26,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
-	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
@@ -243,7 +242,7 @@ func (p *Protocol) delLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 	return syserr.FromError(stack.RemoveInterface(ctx, ifinfomsg.Index))
 }
 
-func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Stack) {
+func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface) {
 	m.Put(&linux.InterfaceInfoMessage{
 		Family: linux.AF_UNSPEC,
 		Type:   i.DeviceType,
@@ -260,14 +259,9 @@ func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Sta
 	if i.Flags&linux.IFF_UP != 0 {
 		operState = linux.IF_OPER_UP
 	}
-	if kindState, ok := netstack.LinkOperState(i.Kind, i.Flags); ok {
-		operState = kindState
-	}
-	m.PutAttr(linux.IFLA_OPERSTATE, primitive.AllocateUint8(operState))
+	m.PutAttr(linux.IFLA_OPERSTATE, primitive.AllocateUint8(linkOperState(i, operState)))
 
-	// A link of type ARPHRD_NONE has no link-layer address, so Linux sends
-	// neither IFLA_ADDRESS nor IFLA_BROADCAST, and "ip link" prints "link/none".
-	if !netstack.LinkHasNoLinkLayer(i.Kind) || len(i.Addr) > 0 {
+	if hasLinkLayerAddr(i) {
 		mac := make([]byte, 6)
 		brd := mac
 		if len(i.Addr) > 0 {
@@ -284,7 +278,7 @@ func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface, stack inet.Sta
 	if i.Kind != "" {
 		var nestedAttrs nlmsg.NestedAttr
 		nestedAttrs.PutAttrString(linux.IFLA_INFO_KIND, i.Kind)
-		putLinkInfoData(&nestedAttrs, stack, idx, i)
+		putLinkInfoData(&nestedAttrs, nil, idx, i)
 		m.PutNestedAttr(linux.IFLA_LINKINFO, nestedAttrs)
 	}
 
@@ -298,7 +292,7 @@ func (p *Protocol) AddNewLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Int
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.RTM_NEWLINK,
 	})
-	writeLinkInfo(m, idx, i, nil)
+	writeLinkInfo(m, idx, i)
 }
 
 // AddDelLinkMessage appends an RTM_DELLINK message for the given interface into
@@ -308,7 +302,7 @@ func (p *Protocol) AddDelLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Int
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: linux.RTM_DELLINK,
 	})
-	writeLinkInfo(m, idx, i, nil)
+	writeLinkInfo(m, idx, i)
 }
 
 // dumpAddrs handles RTM_GETADDR dump requests.
@@ -582,27 +576,7 @@ func (p *Protocol) AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uin
 	if rt.SrcLen > 0 {
 		m.PutAttr(linux.RTA_SRC, primitive.AsByteSlice(rt.SrcAddr))
 	}
-	m.PutAttr(linux.RTA_TABLE, primitive.AllocateUint32(tableOrMain(rt.Table)))
-	if rt.OutputInterface != 0 {
-		m.PutAttr(linux.RTA_OIF, primitive.AllocateInt32(rt.OutputInterface))
-	}
-	if len(rt.PrefSrc) > 0 {
-		prefSrc = rt.PrefSrc
-	}
-	if len(prefSrc) > 0 && (rt.OutputInterface != 0 || len(rt.PrefSrc) > 0) {
-		m.PutAttr(linux.RTA_PREFSRC, primitive.AsByteSlice(prefSrc))
-	}
-	if len(rt.GatewayAddr) > 0 {
-		m.PutAttr(linux.RTA_GATEWAY, primitive.AsByteSlice(rt.GatewayAddr))
-	}
-	if rt.Priority != 0 || rt.Family == linux.AF_INET6 {
-		m.PutAttr(linux.RTA_PRIORITY, primitive.AllocateUint32(rt.Priority))
-	}
-	if rt.MTU != 0 {
-		var metrics nlmsg.NestedAttr
-		metrics.PutAttr(rtaxMTU, primitive.AllocateUint32(rt.MTU))
-		m.PutNestedAttr(linux.RTA_METRICS, metrics)
-	}
+	putRouteAttrs(m, rt, prefSrc)
 
 	// TODO(gvisor.dev/issue/578): There are many more attributes.
 }
@@ -734,12 +708,8 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 		}
 	}
 
-	if isNeighMessage(hdr.Type) {
-		return p.processNeigh(ctx, s, msg, ms)
-	}
-
-	if isRuleMessage(hdr.Type) {
-		return p.processRule(ctx, s, msg, ms)
+	if ok, err := p.processXplatMessage(ctx, s, msg, ms, hdr.Type); ok {
+		return err
 	}
 
 	if typeKind(hdr.Type) == kindGet && hdr.Flags&(linux.NLM_F_DUMP|linux.NLM_F_ROOT) != 0 {

@@ -380,6 +380,21 @@ func (fs *filesystem) sysBridgeNetfilterFiles(ctx context.Context, root *auth.Cr
 	return files
 }
 
+// sysSubdirsXplat returns the subdirectory list for /proc/sys paths that add
+// bridge, netfilter, or neighbor directories beyond upstream procfs.
+func sysSubdirsXplat(path string) ([]string, bool) {
+	switch path {
+	case "net":
+		return []string{"ipv4", "core", "ipv6", "bridge", "netfilter"}, true
+	case "net/ipv4", "net/ipv6":
+		return []string{"conf", "neigh"}, true
+	case "net/ipv4/neigh", "net/ipv6/neigh":
+		return []string{"default"}, true
+	default:
+		return nil, false
+	}
+}
+
 // sysNetXplatFiles returns the files of the directories that this file adds to
 // /proc/sys/net: net/bridge, net/netfilter, and net/*/neigh. It reports false for
 // any other path. The files of net/netfilter and net/*/neigh/default come from
