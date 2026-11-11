@@ -13,32 +13,28 @@
 // limitations under the License.
 
 //go:build darwin
+// +build darwin
 
 package sighandling
 
 import (
-	"os"
+	"errors"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
-// IgnoreChildStop is a no-op on macOS where child process stop notifications
-// are not used by the Sentry.
+// IgnoreChildStop sets the SA_NOCLDSTOP flag, causing child processes to not
+// generate SIGCHLD when they stop.
 func IgnoreChildStop() error {
-	return nil
+	return errors.New("IgnoreChildStop not supported on Darwin")
 }
 
-// ReplaceSignalHandler records the requested handler on macOS while preserving
-// the Go runtime's Mach/BSD signal forwarding chain.
-func ReplaceSignalHandler(_ unix.Signal, handler uintptr, previous *uintptr) error {
-	if previous != nil {
-		*previous = handler
-	}
-	return nil
-}
-
-// KillItself terminates the current process immediately.
-func KillItself() error {
-	os.Exit(137)
-	return nil
+// ReplaceSignalHandler replaces the existing signal handler for the provided
+// signal with the function pointer at `handler`. This bypasses the Go runtime
+// signal handlers, and should only be used for low-level signal handlers where
+// use of signal.Notify is not appropriate.
+//
+// It stores the value of the previously set handler in previous.
+func ReplaceSignalHandler(sig unix.Signal, handler uintptr, previous *uintptr) error {
+	return errors.New("ReplaceSignalHandler not supported on Darwin")
 }

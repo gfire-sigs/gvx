@@ -259,7 +259,11 @@ linux-only pkg/sentry/time/vdso.go
 linux-only pkg/sentry/time/vdso_asm_impl_amd64.s
 linux-only pkg/sentry/time/vdso_asm_impl_arm64.s
 # Android denies apps the read of vm.mmap_min_addr, so mmap_min_addr_android_xplat.go measures it.
-expr pkg/sentry/platform/mmap_min_addr.go linux && !android
+linux-only pkg/sentry/platform/mmap_min_addr.go !android
+# Signal handlers in pkg/safecopy target Linux; safecopy_xplat.go serves Windows and macOS.
+linux-only pkg/safecopy/safecopy.go
+linux-only pkg/safecopy/sighandler_amd64.s
+linux-only pkg/safecopy/sighandler_arm64.s
 linux-only pkg/rawfile/blockingpoll_amd64.s
 linux-only pkg/rawfile/blockingpoll_arm64.s
 linux-only pkg/ring0/pagetables/pcids_aarch64.go

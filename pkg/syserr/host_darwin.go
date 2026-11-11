@@ -23,7 +23,7 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
-const maxErrno = 256
+const maxErrno = 107
 
 var darwinHostTranslations [maxErrno]*Error
 
