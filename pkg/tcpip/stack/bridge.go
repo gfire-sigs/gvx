@@ -57,34 +57,14 @@ func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, 
 	}
 	bridge := p.bridge
 	eth := header.Ethernet(pkt.LinkHeader().Slice())
-	bridge.mu.RLock()
-	// Add an entry at the bridge FDB, it maps a MAC address
-	// to a bridge port where the traffic is received when
-	// the MAC address is not multicast.
-	// Network packets that are sent to the learned MAC address
-	// will be forwarded to the bridge port that is stored in
-	// the FDB table.
-	sourceAddress := eth.SourceAddress()
-	updateFDB := bridge.needsLearningLocked(sourceAddress, p)
 	destAddress := eth.DestinationAddress()
 	isMulticast := header.IsMulticastEthernetAddress(destAddress)
-	for _, port := range bridge.forwardTargetsLocked(p, destAddress) {
-		newPkt := NewPacketBuffer(PacketBufferOptions{
-			ReserveHeaderBytes: int(port.nic.MaxHeaderLength()),
-			Payload:            pkt.ToBuffer(),
-		})
-		port.nic.writeRawPacket(newPkt)
-		newPkt.DecRef()
-	}
+	bridge.forwardFrame(p, pkt)
 
+	bridge.mu.RLock()
 	d := bridge.dispatcher
 	bridgeAddr := bridge.addr
 	bridge.mu.RUnlock()
-	if updateFDB {
-		bridge.mu.Lock()
-		bridge.addFDBEntryLocked(eth.SourceAddress(), p, 0)
-		bridge.mu.Unlock()
-	}
 	// As in Linux, only group frames and frames addressed to the bridge or to
 	// the receiving port reach the IP layer. Passing up transit unicast lets
 	// IP forwarding inject a duplicate back onto the bridge.
