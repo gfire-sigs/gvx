@@ -40,6 +40,8 @@ const (
 )
 
 // BPFFilesystemType implements vfs.FilesystemType for bpffs.
+//
+// +stateify savable
 type BPFFilesystemType struct{}
 
 // Name implements vfs.FilesystemType.Name.
@@ -70,6 +72,8 @@ func (t BPFFilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virtua
 }
 
 // bpfFilesystem is a bpffs instance. It shares the kernfs plumbing of sysfs.
+//
+// +stateify savable
 type bpfFilesystem struct {
 	filesystem
 }
@@ -81,6 +85,8 @@ func (*bpfFilesystem) MountOptions() string {
 }
 
 // bpfDir is a directory of bpffs. Users create and remove directories in it.
+//
+// +stateify savable
 type bpfDir struct {
 	dir
 
@@ -145,6 +151,8 @@ func (*bpfDir) Unlink(context.Context, string, kernfs.Inode) error {
 
 // bpfMountDir is the empty /sys/fs/bpf directory of sysfs. A mount of bpffs
 // covers it.
+//
+// +stateify savable
 type bpfMountDir struct {
 	dir
 }

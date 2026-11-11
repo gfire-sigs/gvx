@@ -35,6 +35,8 @@ func disks(ctx context.Context) []*blockdev.Device {
 }
 
 // diskstatsData implements vfs.DynamicBytesSource for /proc/diskstats.
+//
+// +stateify savable
 type diskstatsData struct {
 	dynamicBytesFileSetAttr
 }
@@ -61,6 +63,8 @@ func writeDiskstats(buf *bytes.Buffer, disks []*blockdev.Device) {
 }
 
 // partitionsData implements vfs.DynamicBytesSource for /proc/partitions.
+//
+// +stateify savable
 type partitionsData struct {
 	dynamicBytesFileSetAttr
 }

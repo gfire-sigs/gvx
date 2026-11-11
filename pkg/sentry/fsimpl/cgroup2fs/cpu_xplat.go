@@ -15,6 +15,7 @@
 package cgroup2fs
 
 import (
+	"context"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -65,12 +66,24 @@ func bandwidthLimits(quotaUSec, periodUSec int64) (quota, period time.Duration) 
 }
 
 // cpuBandwidth is the CPU budget state of one cpu controller.
+//
+// +stateify savable
 type cpuBandwidth struct {
 	// node is the budget. The first use creates it. Reads need no lock.
-	node atomic.Pointer[kernel.CPUBandwidth]
+	node atomic.Pointer[kernel.CPUBandwidth] `state:".(*kernel.CPUBandwidth)"`
 
 	// mu protects the creation of node and the writes of cpu.max.
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
+}
+
+// saveNode is invoked by stateify.
+func (b *cpuBandwidth) saveNode() *kernel.CPUBandwidth {
+	return b.node.Load()
+}
+
+// loadNode is invoked by stateify.
+func (b *cpuBandwidth) loadNode(_ context.Context, n *kernel.CPUBandwidth) {
+	b.node.Store(n)
 }
 
 // bandwidthNode returns the budget of cc.

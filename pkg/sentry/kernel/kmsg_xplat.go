@@ -30,6 +30,8 @@ const (
 )
 
 // DevkmsgMode represents /proc/sys/kernel/printk_devkmsg.
+//
+// +stateify savable
 type DevkmsgMode int32
 
 // Supported modes for kernel.printk_devkmsg.
@@ -70,8 +72,10 @@ func ParseDevkmsgMode(text string) (DevkmsgMode, bool) {
 
 // LogRateLimit enforces a burst of 10 writes per 5-second window for one
 // /dev/kmsg file description, matching Linux ___ratelimit.
+//
+// +stateify savable
 type LogRateLimit struct {
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 	// +checklocks:mu
 	begin time.Duration
 	// +checklocks:mu

@@ -58,6 +58,8 @@ func parseRPFilter(ctx context.Context, src usermem.IOSequence, offset int64) (v
 }
 
 // nsRPFilter is conf/all/rp_filter or conf/default/rp_filter.
+//
+// +stateify savable
 type nsRPFilter struct {
 	kernfs.DynamicBytesFile
 
@@ -111,6 +113,8 @@ func (f *nsRPFilter) Write(ctx context.Context, _ *vfs.FileDescription, src user
 }
 
 // linkRPFilter is conf/<link>/rp_filter.
+//
+// +stateify savable
 type linkRPFilter struct {
 	kernfs.DynamicBytesFile
 

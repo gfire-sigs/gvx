@@ -48,6 +48,8 @@ const (
 // netConfDir is a conf directory whose link subdirectories follow the links of
 // the network stack. A lookup or an open of the directory first adds the
 // subdirectories of new links and removes those of deleted links.
+//
+// +stateify savable
 type netConfDir struct {
 	*lazySysDir
 
@@ -73,6 +75,8 @@ func (fs *filesystem) newSysSubdir(ctx context.Context, root *auth.Credentials, 
 // netLinkDir is the conf directory of one network link. A path walk drops its
 // cached dentry when the link no longer exists, or when a new link took the
 // name of the old one.
+//
+// +stateify savable
 type netLinkDir struct {
 	*lazySysDir
 
@@ -209,6 +213,8 @@ type linkRouteLocalnet interface {
 // routeLocalnetLinkData implements vfs.WritableDynamicBytesSource for
 // /proc/sys/net/ipv4/conf/<link>/route_localnet. The value belongs to one link,
 // so a write does not change the martian filter of any other link.
+//
+// +stateify savable
 type routeLocalnetLinkData struct {
 	kernfs.DynamicBytesFile
 
@@ -258,6 +264,8 @@ func (r *routeLocalnetLinkData) Write(ctx context.Context, _ *vfs.FileDescriptio
 
 // boolSysctlFile is a sysctl file whose value is 0 or 1. A write of any other
 // non-zero number stores 1, as Linux does for the bridge-nf-call files.
+//
+// +stateify savable
 type boolSysctlFile struct {
 	kernfs.DynamicBytesFile
 
@@ -304,6 +312,8 @@ type bridgeNetfilterStack interface {
 // value belongs to the network namespace of the caller. At 1, a bridge of that
 // namespace passes the IP frames that it forwards between two ports through
 // the iptables hooks. Any non-zero write stores 1, as on Linux.
+//
+// +stateify savable
 type nsBridgeNetfilter struct {
 	kernfs.DynamicBytesFile
 

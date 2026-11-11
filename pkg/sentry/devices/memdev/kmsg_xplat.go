@@ -40,6 +40,8 @@ func RegisterKmsg(vfsObj *vfs.VirtualFilesystem) error {
 }
 
 // kmsgDevice implements vfs.Device for /dev/kmsg.
+//
+// +stateify savable
 type kmsgDevice struct{}
 
 // Open implements vfs.Device.Open. Like devkmsg_open, it fails with EPERM for
@@ -73,6 +75,8 @@ func (kmsgDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, op
 // kmsgFD implements vfs.FileDescriptionImpl for /dev/kmsg. Each descriptor has
 // its own position in the log, the sequence number of the next record that a
 // read returns.
+//
+// +stateify savable
 type kmsgFD struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -84,7 +88,7 @@ type kmsgFD struct {
 	// limit is the rate limit of the writes through this descriptor.
 	limit kernel.LogRateLimit
 
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 	// seq is the position.
 	seq uint64
 }

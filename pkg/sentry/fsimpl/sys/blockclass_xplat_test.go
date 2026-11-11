@@ -43,10 +43,10 @@ func TestDiskStatHasSeventeenFieldsPaddedToEight(t *testing.T) {
 
 func TestDiskDirectoriesAreKeyedByNameAndNumber(t *testing.T) {
 	d := &blockdev.Device{Name: "vdb", Major: 254, Minor: 16}
-	if got := byDiskName(d); got != "vdb" {
+	if got := byDiskName.format(d); got != "vdb" {
 		t.Errorf("byDiskName = %q, want vdb", got)
 	}
-	if got := byDiskNumber(d); got != "254:16" {
+	if got := byDiskNumber.format(d); got != "254:16" {
 		t.Errorf("byDiskNumber = %q, want 254:16", got)
 	}
 }

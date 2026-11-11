@@ -44,6 +44,8 @@ import (
 // namespaces share one sysfs.
 
 // netClassDir is /sys/class/net.
+//
+// +stateify savable
 type netClassDir struct {
 	dir
 
@@ -75,11 +77,17 @@ func readerNetNamespace(ctx context.Context) *inet.Namespace {
 // readerLinks returns the links of the network namespace of the reader by
 // index. A namespace without a stack has no links.
 func readerLinks(ctx context.Context) (inet.Stack, map[int32]inet.Interface) {
-	ns := readerNetNamespace(ctx)
-	if ns == nil || ns.Stack() == nil {
+	var st inet.Stack
+	if ns := readerNetNamespace(ctx); ns != nil {
+		st = ns.Stack()
+	}
+	if st == nil {
+		st = inet.StackFromContext(ctx)
+	}
+	if st == nil {
 		return nil, nil
 	}
-	return ns.Stack(), ns.Stack().Interfaces()
+	return st, st.Interfaces()
 }
 
 // findLink returns the index and the description of the link with name in the
@@ -127,6 +135,8 @@ func (d *netClassDir) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.It
 
 // netLinkDir is /sys/class/net/<link>. The dentry stays valid for the readers
 // whose network namespace has a link with the same name.
+//
+// +stateify savable
 type netLinkDir struct {
 	dir
 
@@ -141,13 +151,29 @@ func (d *netLinkDir) Valid(ctx context.Context, parent *kernfs.Dentry, name stri
 	return ok
 }
 
-// netLinkFile is a file of a link directory. gen writes the content for the
+// netLinkFileKind selects how netLinkFile formats a link attribute.
+//
+// +stateify savable
+type netLinkFileKind int
+
+const (
+	netLinkAddress netLinkFileKind = iota
+	netLinkMTU
+	netLinkOperstate
+	netLinkIfindex
+	netLinkStatistic
+)
+
+// netLinkFile is a file of a link directory. It writes the content for the
 // link of the reader that has the name of the file's directory.
+//
+// +stateify savable
 type netLinkFile struct {
 	kernfs.DynamicBytesFile
 
-	link string
-	gen  func(buf *bytes.Buffer, id int32, nic inet.Interface, dev inet.StatDev)
+	link      string
+	kind      netLinkFileKind
+	statIndex int
 }
 
 var _ vfs.DynamicBytesSource = (*netLinkFile)(nil)
@@ -158,15 +184,37 @@ func (f *netLinkFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	if !ok {
 		return linuxerr.ENOENT
 	}
-	var dev inet.StatDev
-	// A link without counters reads as zero.
-	_ = st.Statistics(&dev, nic.Name)
-	f.gen(buf, id, nic, dev)
+	switch f.kind {
+	case netLinkAddress:
+		addr := net.HardwareAddr(nic.Addr)
+		if len(addr) == 0 {
+			if netstack.LinkHasNoLinkLayer(nic.Kind) {
+				// A link without a link layer has an empty address.
+				fmt.Fprintf(buf, "\n")
+				return nil
+			}
+			addr = make(net.HardwareAddr, 6)
+		}
+		fmt.Fprintf(buf, "%s\n", addr)
+	case netLinkMTU:
+		fmt.Fprintf(buf, "%d\n", nic.MTU)
+	case netLinkOperstate:
+		fmt.Fprintf(buf, "%s\n", linkOperState(nic))
+	case netLinkIfindex:
+		fmt.Fprintf(buf, "%d\n", id)
+	case netLinkStatistic:
+		var dev inet.StatDev
+		// A link without counters reads as zero.
+		_ = st.Statistics(&dev, nic.Name)
+		fmt.Fprintf(buf, "%d\n", dev[f.statIndex])
+	default:
+		return linuxerr.EINVAL
+	}
 	return nil
 }
 
-func (fs *filesystem) newNetLinkFile(ctx context.Context, creds *auth.Credentials, link string, gen func(buf *bytes.Buffer, id int32, nic inet.Interface, dev inet.StatDev)) kernfs.Inode {
-	f := &netLinkFile{link: link, gen: gen}
+func (fs *filesystem) newNetLinkFile(ctx context.Context, creds *auth.Credentials, link string, kind netLinkFileKind, statIndex int) kernfs.Inode {
+	f := &netLinkFile{link: link, kind: kind, statIndex: statIndex}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), f, 0444)
 	return f
 }
@@ -208,33 +256,13 @@ func linkOperState(nic inet.Interface) string {
 func (fs *filesystem) newNetLinkDir(ctx context.Context, creds *auth.Credentials, link string) kernfs.Inode {
 	stats := make(map[string]kernfs.Inode, len(linkStatistics))
 	for _, c := range linkStatistics {
-		index := c.index
-		stats[c.name] = fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, _ int32, _ inet.Interface, dev inet.StatDev) {
-			fmt.Fprintf(buf, "%d\n", dev[index])
-		})
+		stats[c.name] = fs.newNetLinkFile(ctx, creds, link, netLinkStatistic, c.index)
 	}
 	contents := map[string]kernfs.Inode{
-		"address": fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, _ int32, nic inet.Interface, _ inet.StatDev) {
-			addr := net.HardwareAddr(nic.Addr)
-			if len(addr) == 0 {
-				if netstack.LinkHasNoLinkLayer(nic.Kind) {
-					// A link without a link layer has an empty address.
-					fmt.Fprintf(buf, "\n")
-					return
-				}
-				addr = make(net.HardwareAddr, 6)
-			}
-			fmt.Fprintf(buf, "%s\n", addr)
-		}),
-		"mtu": fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, _ int32, nic inet.Interface, _ inet.StatDev) {
-			fmt.Fprintf(buf, "%d\n", nic.MTU)
-		}),
-		"operstate": fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, _ int32, nic inet.Interface, _ inet.StatDev) {
-			fmt.Fprintf(buf, "%s\n", linkOperState(nic))
-		}),
-		"ifindex": fs.newNetLinkFile(ctx, creds, link, func(buf *bytes.Buffer, id int32, _ inet.Interface, _ inet.StatDev) {
-			fmt.Fprintf(buf, "%d\n", id)
-		}),
+		"address":    fs.newNetLinkFile(ctx, creds, link, netLinkAddress, 0),
+		"mtu":        fs.newNetLinkFile(ctx, creds, link, netLinkMTU, 0),
+		"operstate":  fs.newNetLinkFile(ctx, creds, link, netLinkOperstate, 0),
+		"ifindex":    fs.newNetLinkFile(ctx, creds, link, netLinkIfindex, 0),
 		"statistics": fs.newDir(ctx, creds, defaultSysDirMode, stats),
 	}
 	d := &netLinkDir{link: link}
@@ -248,6 +276,8 @@ func (fs *filesystem) newNetLinkDir(ctx context.Context, creds *auth.Credentials
 // hashsizeFile is /sys/module/nf_conntrack/parameters/hashsize. The file stores
 // the size of the table of the connection tracker. The tracker of the network
 // stack does not read it.
+//
+// +stateify savable
 type hashsizeFile struct {
 	kernfs.DynamicBytesFile
 

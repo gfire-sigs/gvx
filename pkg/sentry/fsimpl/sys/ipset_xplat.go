@@ -35,6 +35,8 @@ import (
 // maxSetsFile is /sys/module/ip_set/parameters/max_sets. A network namespace
 // that starts after a write gets a table of this many sets, and the table grows
 // when it fills up, as on Linux.
+//
+// +stateify savable
 type maxSetsFile struct {
 	kernfs.DynamicBytesFile
 }

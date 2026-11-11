@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -85,6 +86,8 @@ const (
 )
 
 // KernelLogRecord holds one entry in the kernel log ring.
+//
+// +stateify savable
 type KernelLogRecord struct {
 	// Seq is the monotonic sequence number starting at 0.
 	Seq uint64
@@ -161,9 +164,11 @@ func (r KernelLogRecord) syslogLen() int {
 
 // KernelLog owns the kernel log ring of one Kernel instance. All exported
 // methods are safe for concurrent callers.
+//
+// +stateify savable
 type KernelLog struct {
-	// now returns elapsed time since boot. Immutable after construction.
-	now func() time.Duration
+	// now returns elapsed time since boot. Rebound on restore via AttachKernelLog.
+	now func() time.Duration `state:"nosave"`
 
 	// bufLen is the data ring capacity in bytes (power of two). Immutable.
 	bufLen int
@@ -171,13 +176,13 @@ type KernelLog struct {
 	maxRecords int
 
 	// devkmsg and dmesgRestrict store the corresponding sysctl settings.
-	devkmsg       atomic.Int32
-	dmesgRestrict atomic.Bool
+	devkmsg       atomic.Int32 `state:".(int32)"`
+	dmesgRestrict atomic.Bool  `state:".(bool)"`
 
 	// queue wakes /dev/kmsg and syslog(2) readers when Emit appends records.
 	queue waiter.Queue
 
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 
 	// +checklocks:mu
 	records []KernelLogRecord
@@ -197,6 +202,36 @@ type KernelLog struct {
 	levels [4]int
 	// +checklocks:mu
 	savedConsole int
+}
+
+// saveDevkmsg is invoked by stateify.
+func (l *KernelLog) saveDevkmsg() int32 {
+	return l.devkmsg.Load()
+}
+
+// loadDevkmsg is invoked by stateify.
+func (l *KernelLog) loadDevkmsg(_ context.Context, v int32) {
+	l.devkmsg.Store(v)
+}
+
+// saveDmesgRestrict is invoked by stateify.
+func (l *KernelLog) saveDmesgRestrict() bool {
+	return l.dmesgRestrict.Load()
+}
+
+// loadDmesgRestrict is invoked by stateify.
+func (l *KernelLog) loadDmesgRestrict(_ context.Context, v bool) {
+	l.dmesgRestrict.Store(v)
+}
+
+// afterLoad is invoked by stateify.
+func (l *KernelLog) afterLoad(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if k, ok := ctx.Value(CtxKernel).(*Kernel); ok && k != nil {
+		k.AttachKernelLog(l)
+	}
 }
 
 // noSavedConsole marks an empty savedConsole slot, matching Linux LOGLEVEL_DEFAULT.
@@ -582,6 +617,49 @@ func (k *Kernel) SetKernelLogBufLen(bufLen int) bool {
 	}
 	entry.bufLen = bufLen
 	return true
+}
+
+// KernelLogBufLen returns the configured ring byte capacity for k, or 0 before
+// SetKernelLogBufLen or KernelLog runs on k.
+func (k *Kernel) KernelLogBufLen() int {
+	if k == nil {
+		return 0
+	}
+	kernelLogs.mu.Lock()
+	defer kernelLogs.mu.Unlock()
+	if entry, ok := kernelLogs.entries[weak.Make(k)]; ok {
+		if entry.log != nil {
+			return entry.log.bufLen
+		}
+		return entry.bufLen
+	}
+	return 0
+}
+
+// LookupKernelLog returns the allocated kernel log ring of k, or nil before
+// first access.
+func (k *Kernel) LookupKernelLog() *KernelLog {
+	kernelLogs.mu.Lock()
+	defer kernelLogs.mu.Unlock()
+	if entry, ok := kernelLogs.entries[weak.Make(k)]; ok {
+		return entry.log
+	}
+	return nil
+}
+
+// AttachKernelLog binds l as the kernel log ring of k after restore.
+func (k *Kernel) AttachKernelLog(l *KernelLog) {
+	if l == nil {
+		return
+	}
+	kernelLogs.mu.Lock()
+	entry, key := kernelLogEntryFor(k)
+	entry.bufLen = l.bufLen
+	entry.log = l
+	kernelLogs.mu.Unlock()
+	l.mu.Lock()
+	l.now = kernelUptimeFunc(key)
+	l.mu.Unlock()
 }
 
 // KernelLog returns the kernel log ring of k, allocating it on first access.

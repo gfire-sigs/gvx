@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -24,30 +25,42 @@ import (
 // whole tick to each, so its numbers are exact only on average. The meter reads
 // the clock when the task blocks and when it resumes, so a system call that does
 // not block costs nothing.
+//
+// +stateify savable
 type cpuMeter struct {
 	// total is the time of the finished runs in nanoseconds.
-	total atomic.Int64
+	total atomic.Int64 `state:".(int64)"`
 
 	// runStart is the start of the current run. It is 0 while the task is
 	// blocked, and before the first reading of a task that never blocked.
-	runStart atomic.Int64
+	runStart atomic.Int64 `state:"nosave"`
 
 	// billed is the measured time that the budget already took. Only the CPU
 	// clock ticker uses it.
-	billed int64
+	billed int64 `state:"nosave"`
 
 	// billedAt is the time of the last reading of the ticker. The next charge
 	// spreads the unbilled time over the interval since then. Only the CPU
 	// clock ticker uses it.
-	billedAt int64
+	billedAt int64 `state:"nosave"`
 
 	// skipToApp is true after a throttled task woke. The time up to its next
 	// entry into application code is the cost of the wake, and it is not billed.
 	// Only the task goroutine uses it.
-	skipToApp bool
+	skipToApp bool `state:"nosave"`
 
 	// billedGen is the value of cpuBillingGeneration when billed was set.
-	billedGen int32
+	billedGen int32 `state:"nosave"`
+}
+
+// saveTotal is invoked by stateify.
+func (m *cpuMeter) saveTotal() int64 {
+	return m.total.Load()
+}
+
+// loadTotal is invoked by stateify.
+func (m *cpuMeter) loadTotal(_ context.Context, v int64) {
+	m.total.Store(v)
 }
 
 // meterNow returns the monotonic time in nanoseconds. It is never 0.
@@ -93,6 +106,52 @@ func (m *cpuMeter) measured(now int64, running bool) int64 {
 // CPUClock, which count whole ticks of sampled tasks.
 func (t *Task) CPUTimeMeasured() time.Duration {
 	return time.Duration(t.cpuMeter.measured(meterNow(), t.running()))
+}
+
+// SetCPUTimeMeasured sets the finished run time of t to d and resets any active
+// run start or unbilled delta.
+func (t *Task) SetCPUTimeMeasured(d time.Duration) {
+	ns := max(d.Nanoseconds(), 0)
+	t.cpuMeter.runStart.Store(0)
+	t.cpuMeter.total.Store(ns)
+	t.cpuMeter.billed = ns
+}
+
+// SaveTaskCPUMeters returns the non-zero measured CPU time in nanoseconds for
+// every task in k.
+//
+// +checklocksexclude:k.tasks.mu
+func (k *Kernel) SaveTaskCPUMeters() map[*Task]int64 {
+	if k == nil || k.tasks == nil || k.tasks.Root == nil {
+		return nil
+	}
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+	now := meterNow()
+	var out map[*Task]int64
+	for t := range k.tasks.Root.tids {
+		if ns := t.cpuMeter.measured(now, t.running()); ns > 0 {
+			if out == nil {
+				out = make(map[*Task]int64)
+			}
+			out[t] = ns
+		}
+	}
+	return out
+}
+
+// LoadTaskCPUMeters restores the saved CPU time in nanoseconds onto each task
+// in meters without re-billing pre-checkpoint time to CPU bandwidth budgets.
+func (k *Kernel) LoadTaskCPUMeters(meters map[*Task]int64) {
+	_ = k
+	for t, ns := range meters {
+		if t == nil || ns <= 0 {
+			continue
+		}
+		t.cpuMeter.runStart.Store(0)
+		t.cpuMeter.total.Store(ns)
+		t.cpuMeter.billed = ns
+	}
 }
 
 // running returns true if the task goroutine runs application or Sentry code.

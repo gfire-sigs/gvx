@@ -266,6 +266,7 @@ func (fs *filesystem) EverMounted() bool {
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.releaseXplat()
 	if fs.root != nil {
 		fs.root.DecRef(ctx)
 		fs.root = nil

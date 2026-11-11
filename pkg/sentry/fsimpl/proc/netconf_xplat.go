@@ -37,6 +37,8 @@ import (
 // answers to ARP requests, and the other values change nothing yet.
 
 // confInt is an integer file with its default.
+//
+// +stateify savable
 type confInt struct {
 	name string
 	def  int32
@@ -69,21 +71,27 @@ var ipv4NeighDefaultOnly = []confInt{
 }
 
 func init() {
-	spec := func(dir, sub string, c confInt) *sysctlSpec {
-		return &sysctlSpec{
-			scope: scopeNet, name: c.name, key: dir + "/" + sub + "/" + c.name,
+	spec := func(id sysctlID, dir, sub string, c confInt) *sysctlSpec {
+		return registerSysctlSpec(&sysctlSpec{
+			id: id, scope: scopeNet, name: c.name, key: dir + "/" + sub + "/" + c.name,
 			def: strconv.Itoa(int(c.def)), parse: intVecParser(1, math.MinInt32, math.MaxInt32, nil),
+		})
+	}
+	for _, entry := range []struct {
+		sub  string
+		base sysctlID
+	}{
+		{"all", sysctlIPv4ConfAllBase},
+		{"default", sysctlIPv4ConfDefaultBase},
+	} {
+		path := "net/" + netstack.ConfDirIPv4 + "/" + entry.sub
+		for i, c := range ipv4ConfInts {
+			nodeSysctlSpecs[path] = append(nodeSysctlSpecs[path], spec(entry.base+sysctlID(i), netstack.ConfDirIPv4, entry.sub, c))
 		}
 	}
-	for _, sub := range []string{"all", "default"} {
-		path := "net/" + netstack.ConfDirIPv4 + "/" + sub
-		for _, c := range ipv4ConfInts {
-			nodeSysctlSpecs[path] = append(nodeSysctlSpecs[path], spec(netstack.ConfDirIPv4, sub, c))
-		}
-	}
-	for _, c := range append(append([]confInt(nil), ipv4NeighInts...), ipv4NeighDefaultOnly...) {
+	for i, c := range append(append([]confInt(nil), ipv4NeighInts...), ipv4NeighDefaultOnly...) {
 		path := "net/" + netstack.NeighDirIPv4 + "/default"
-		nodeSysctlSpecs[path] = append(nodeSysctlSpecs[path], spec(netstack.NeighDirIPv4, "default", c))
+		nodeSysctlSpecs[path] = append(nodeSysctlSpecs[path], spec(sysctlIPv4NeighDefaultBase+sysctlID(i), netstack.NeighDirIPv4, "default", c))
 	}
 }
 
@@ -95,6 +103,8 @@ type linkConfStack interface {
 }
 
 // linkConfFile is one integer file of conf/<link> or neigh/<link>.
+//
+// +stateify savable
 type linkConfFile struct {
 	kernfs.DynamicBytesFile
 
@@ -159,6 +169,8 @@ type linkForwardingStack interface {
 }
 
 // linkForwarding is conf/<link>/forwarding.
+//
+// +stateify savable
 type linkForwarding struct {
 	kernfs.DynamicBytesFile
 
