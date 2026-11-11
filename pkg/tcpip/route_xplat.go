@@ -120,6 +120,8 @@ func (t RouteType) IsReject() bool {
 
 // ErrRouteBlackhole indicates that a blackhole route matched the destination.
 // It maps to EINVAL, as in Linux.
+//
+// +stateify savable
 type ErrRouteBlackhole struct{}
 
 func (*ErrRouteBlackhole) isError() {}
@@ -132,6 +134,8 @@ func (*ErrRouteBlackhole) String() string { return "invalid argument" }
 
 // ErrRouteProhibited indicates that a prohibit route matched the destination.
 // It maps to EACCES, as in Linux.
+//
+// +stateify savable
 type ErrRouteProhibited struct{}
 
 func (*ErrRouteProhibited) isError() {}

@@ -33,8 +33,10 @@ import (
 // takes the value of conf/all or the value of the link.
 
 // linkConfState holds the values that the guest wrote to the files of links.
+//
+// +stateify savable
 type linkConfState struct {
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// values maps a link to the values of its files by "dir/name".
 	values map[tcpip.NICID]map[string]int32
 }

@@ -14,7 +14,17 @@
 
 package netstack
 
-import "z.gfire.dev/gvx/pkg/tcpip"
+import (
+	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
+)
+
+func bridgeNetfilterKey(protocol tcpip.NetworkProtocolNumber) string {
+	if protocol == header.IPv6ProtocolNumber {
+		return "bridge/bridge-nf-call-ip6tables"
+	}
+	return "bridge/bridge-nf-call-iptables"
+}
 
 // BridgeNetfilter reports whether the bridges of the network namespace pass the
 // IP frames that they forward through the iptables hooks. It is
@@ -25,5 +35,21 @@ func (s *Stack) BridgeNetfilter(protocol tcpip.NetworkProtocolNumber) bool {
 
 // SetBridgeNetfilter sets what BridgeNetfilter reports.
 func (s *Stack) SetBridgeNetfilter(protocol tcpip.NetworkProtocolNumber, enable bool) {
+	value := "0"
+	if enable {
+		value = "1"
+	}
+	s.SetSysctlValue(bridgeNetfilterKey(protocol), value)
 	s.Stack.SetBridgeNetfilter(protocol, enable)
+}
+
+func (s *Stack) restoreBridgeNetfilter() {
+	if s.Stack == nil {
+		return
+	}
+	for _, proto := range []tcpip.NetworkProtocolNumber{header.IPv4ProtocolNumber, header.IPv6ProtocolNumber} {
+		if v, ok := s.SysctlValue(bridgeNetfilterKey(proto)); ok {
+			s.Stack.SetBridgeNetfilter(proto, v == "1")
+		}
+	}
 }

@@ -399,6 +399,8 @@ func ethtoolProfileOf(kind string, loopback bool) ethtoolProfile {
 }
 
 // linkFeatures is the feature state of one link.
+//
+// +stateify savable
 type linkFeatures struct {
 	hw, wanted, active uint64
 }
@@ -456,8 +458,10 @@ func (l *linkFeatures) flags() uint32 {
 
 // ethtoolState keeps the feature state of the links of one network stack. The
 // stack drops the state of a link when the link leaves the stack.
+//
+// +stateify savable
 type ethtoolState struct {
-	mu    sync.Mutex
+	mu    sync.Mutex `state:"nosave"`
 	links map[tcpip.NICID]*linkFeatures
 }
 

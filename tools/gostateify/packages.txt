@@ -8,6 +8,7 @@ pkg/sentry/checkpoint
 pkg/sentry/devices/memdev tier2
 pkg/sentry/fsimpl/cgroup2fs tier2
 pkg/sentry/fsimpl/kernfs
+pkg/sentry/fsimpl/overlay
 pkg/sentry/fsimpl/proc tier2
 pkg/sentry/fsimpl/sys tier2
 pkg/sentry/fsimpl/tmpfs
@@ -21,9 +22,11 @@ pkg/sentry/mm tier2
 pkg/sentry/pgalloc tier2
 pkg/sentry/socket/control
 pkg/sentry/socket/netfilter
+pkg/sentry/socket/netstack
 pkg/sentry/uniqueid
 pkg/sentry/vfs tier2
 pkg/tcpip
+pkg/tcpip/network/ipv4
 pkg/tcpip/stack
 pkg/tcpip/transport/tcp
 pkg/tcpip/transport/udp

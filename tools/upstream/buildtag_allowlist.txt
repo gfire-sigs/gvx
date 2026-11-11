@@ -47,6 +47,7 @@ seam pkg/sentry/fsimpl/overlay/overlay.go
 # The directories of an overlay can report the numbers of a disk
 # (pkg/sentry/fsimpl/overlay/dirdev_xplat.go).
 seam pkg/sentry/fsimpl/overlay/filesystem.go
+seam pkg/sentry/fsimpl/overlay/overlay_state_autogen.go
 
 # Content seam: SetEntries gives the Stack to the matchers that need it
 # (pkg/sentry/socket/netfilter/addrtype_matcher_xplat.go). stack.Matcher.Match gets only the packet.
@@ -104,7 +105,10 @@ seam pkg/sentry/fsimpl/proc/task_net.go
 # newVeth wraps each veth end with newHostFilterEndpoint (pkg/sentry/socket/netstack/hostfilter_xplat.go).
 # newVeth and newBridge set the Linux MTU range of the link, and newVeth counts the Ethernet header
 # in the MTU of the pair (pkg/sentry/socket/netstack/linkmtu_xplat.go).
+# netstack_state.go rebinds the proxy ARP and reverse-path policies after load.
 seam pkg/sentry/socket/netstack/stack.go
+seam pkg/sentry/socket/netstack/netstack_state.go
+seam pkg/sentry/socket/netstack/netstack_state_autogen.go
 # Content seam: RTM_GETLINK reports IFLA_STATS64 (pkg/sentry/socket/netlink/route/link_stats_xplat.go).
 seam pkg/sentry/socket/netlink/route/protocol.go
 # Content seam: cgroup2 memory.stat, memory.events counters, and the enforcement of memory.max
@@ -135,6 +139,7 @@ seam pkg/sentry/kernel/task_sched.go
 # Content seam: route_localnet of one IPv4 endpoint (pkg/tcpip/network/ipv4/martian_xplat.go).
 # conf/<link>/route_localnet must not change the martian filter of other links.
 seam pkg/tcpip/network/ipv4/ipv4.go
+seam pkg/tcpip/network/ipv4/ipv4_state_autogen.go
 
 # Content seam: the memory manager reports each Sentry write into guest memory to the memory
 # file after it completes, so that the Windows systrap engine drops the patched copies of the
@@ -205,7 +210,10 @@ seam pkg/tcpip/stack/conntrack.go
 # (pkg/tcpip/stack/route_xplat.go). The seam is one call in FindRoute. The delivery of a forwarded
 # packet to a local address of another NIC lives in pkg/tcpip/network/ipv4/local_delivery_xplat.go
 # (the seam in pkg/tcpip/network/ipv4/ipv4.go).
+# save_restore.go preserves policy routes and reseeds the connection-tracking generator after load.
 seam pkg/tcpip/stack/stack.go
+seam pkg/tcpip/stack/save_restore.go
+seam pkg/tcpip/stack/stack_state_autogen.go
 # Content seam: a weak host reply route may leave through another NIC than the NIC of its local
 # address without forwarding, as in Linux. The seam is the field Route.weakHost and one condition
 # in isValidForOutgoingRLocked; route_xplat.go sets the field.

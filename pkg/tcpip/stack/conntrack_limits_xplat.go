@@ -15,9 +15,9 @@
 package stack
 
 import (
-	"sync/atomic"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -117,6 +117,8 @@ func DefaultConntrackTimeout(t ConntrackTimeout) time.Duration {
 
 // conntrackConfig is an immutable set of timeouts. A change builds a new set,
 // so a packet reads one consistent set without a lock.
+//
+// +stateify savable
 type conntrackConfig struct {
 	timeouts      [numConntrackTimeouts]time.Duration
 	tcpMaxRetrans uint8
@@ -153,8 +155,10 @@ func (ct *ConnTrack) updateConfig(change func(*conntrackConfig)) {
 
 // ConntrackLimit is the limit nf_conntrack_max. Linux keeps one limit for all
 // network namespaces, so the stacks of one kernel share one ConntrackLimit.
+//
+// +stateify savable
 type ConntrackLimit struct {
-	max atomic.Uint32
+	max atomicbitops.Uint32
 }
 
 // NewConntrackLimit returns a limit with the value max. The value 0 means no
@@ -381,6 +385,9 @@ func (ct *ConnTrack) dropUnconfirmed(pkt *PacketBuffer) bool {
 // connection fails to finalize it, as it does after a tuple conflict.
 func (ct *ConnTrack) discardUnconfirmed(cn *conn) {
 	cn.finalizeOnce.Do(func() {
+		if cn.getFinalizeResult() != 0 {
+			return
+		}
 		cn.finalizeResult.Store(uint32(finalizeResultConflict))
 		buckets := ct.tableBuckets()
 		bkt := &buckets[ct.bucketWithTableLength(cn.original.tupleID, len(buckets))]

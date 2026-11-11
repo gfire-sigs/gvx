@@ -14,7 +14,12 @@
 
 package overlay
 
-import "z.gfire.dev/gvx/pkg/context"
+import (
+	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
+)
+
+var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
 
 // maxUnusedDentries is the number of dentries without references that a
 // filesystem keeps for later lookups.
@@ -85,6 +90,10 @@ func (c *dentryCache) remove(d *dentry) {
 //   - fs.renameMu must be locked for writing.
 //   - d.refs == 0.
 func (fs *filesystem) cacheOrDestroyLocked(ctx context.Context, d *dentry) {
+	if !d.vfsd.IsDead() && d.watches.Size() > 0 {
+		fs.unused.remove(d)
+		return
+	}
 	if d.vfsd.IsDead() || d.parent.Load() == nil || fs.unused.closed {
 		d.destroyLocked(ctx)
 		return
@@ -96,7 +105,7 @@ func (fs *filesystem) cacheOrDestroyLocked(ctx context.Context, d *dentry) {
 		fs.unused.remove(victim)
 		// A lookup can take a reference on a dentry in the list. Such a
 		// dentry returns to the list when it loses that reference.
-		if victim.refs.Load() == 0 {
+		if victim.refs.Load() == 0 && (victim.vfsd.IsDead() || victim.watches.Size() == 0) {
 			victim.destroyLocked(ctx)
 		}
 	}
@@ -106,14 +115,36 @@ func (fs *filesystem) cacheOrDestroyLocked(ctx context.Context, d *dentry) {
 // further caching. The list holds references on the parents of its dentries,
 // and through them on the layers, so the filesystem must empty it at release.
 func (fs *filesystem) evictUnusedDentries(ctx context.Context) {
+	fs.drainUnusedDentries(ctx, true)
+}
+
+func (fs *filesystem) drainUnusedDentries(ctx context.Context, closeCache bool) {
 	fs.renameMu.Lock()
 	defer fs.renameMu.Unlock()
+	wasClosed := fs.unused.closed
 	fs.unused.closed = true
 	for fs.unused.tail != nil {
 		victim := fs.unused.tail
 		fs.unused.remove(victim)
-		if victim.refs.Load() == 0 {
+		if victim.refs.Load() == 0 && (closeCache || victim.vfsd.IsDead() || victim.watches.Size() == 0) {
 			victim.destroyLocked(ctx)
 		}
 	}
+	if !closeCache {
+		fs.unused.closed = wasClosed
+	}
+}
+
+// PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
+func (fs *filesystem) PrepareSave(ctx context.Context, _ vfs.PrepareSaveOptions) error {
+	fs.drainUnusedDentries(ctx, false)
+	return nil
+}
+
+// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
+func (fs *filesystem) BeforeResume(context.Context) {}
+
+// CompleteRestore implements vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
+func (fs *filesystem) CompleteRestore(context.Context, vfs.CompleteRestoreOptions) error {
+	return nil
 }

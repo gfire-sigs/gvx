@@ -8,6 +8,37 @@ import (
 	"z.gfire.dev/gvx/pkg/state"
 )
 
+func (t *TCPKeepaliveDefaultsOption) StateTypeName() string {
+	return "pkg/tcpip.TCPKeepaliveDefaultsOption"
+}
+
+func (t *TCPKeepaliveDefaultsOption) StateFields() []string {
+	return []string{
+		"Idle",
+		"Interval",
+		"Count",
+	}
+}
+
+func (t *TCPKeepaliveDefaultsOption) beforeSave() {}
+
+// +checklocksignore
+func (t *TCPKeepaliveDefaultsOption) StateSave(stateSinkObject state.Sink) {
+	t.beforeSave()
+	stateSinkObject.Save(0, &t.Idle)
+	stateSinkObject.Save(1, &t.Interval)
+	stateSinkObject.SaveInt(2, &t.Count)
+}
+
+func (t *TCPKeepaliveDefaultsOption) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (t *TCPKeepaliveDefaultsOption) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &t.Idle)
+	stateSourceObject.Load(1, &t.Interval)
+	stateSourceObject.LoadInt(2, &t.Count)
+}
+
 func (a *RouteAttrs) StateTypeName() string {
 	return "pkg/tcpip.RouteAttrs"
 }
@@ -54,6 +85,51 @@ func (a *RouteAttrs) StateLoad(ctx context.Context, stateSourceObject state.Sour
 	stateSourceObject.LoadUint32(7, &a.Flags)
 }
 
+func (e *ErrRouteBlackhole) StateTypeName() string {
+	return "pkg/tcpip.ErrRouteBlackhole"
+}
+
+func (e *ErrRouteBlackhole) StateFields() []string {
+	return []string{}
+}
+
+func (e *ErrRouteBlackhole) beforeSave() {}
+
+// +checklocksignore
+func (e *ErrRouteBlackhole) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+}
+
+func (e *ErrRouteBlackhole) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (e *ErrRouteBlackhole) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+}
+
+func (e *ErrRouteProhibited) StateTypeName() string {
+	return "pkg/tcpip.ErrRouteProhibited"
+}
+
+func (e *ErrRouteProhibited) StateFields() []string {
+	return []string{}
+}
+
+func (e *ErrRouteProhibited) beforeSave() {}
+
+// +checklocksignore
+func (e *ErrRouteProhibited) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+}
+
+func (e *ErrRouteProhibited) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (e *ErrRouteProhibited) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+}
+
 func init() {
+	state.RegisterNoHooks((*TCPKeepaliveDefaultsOption)(nil))
 	state.RegisterNoHooks((*RouteAttrs)(nil))
+	state.RegisterNoHooks((*ErrRouteBlackhole)(nil))
+	state.RegisterNoHooks((*ErrRouteProhibited)(nil))
 }

@@ -55,17 +55,17 @@ type Stack struct {
 
 	// sysctls stores the /proc/sys/net values that the stack does not own. See
 	// sysctl_store_xplat.go.
-	sysctls sysctlValues `state:"nosave"`
+	sysctls sysctlValues
 
 	// offloads keeps the ethtool features of the links. See ethtool_xplat.go.
-	offloads ethtoolState `state:"nosave"`
+	offloads ethtoolState
 
 	// rpFilter keeps the rp_filter values. See rpfilter_xplat.go.
-	rpFilter rpFilterState `state:"nosave"`
+	rpFilter rpFilterState
 
 	// linkConf keeps the conf and neigh values of the links. See
 	// linkconf_values_xplat.go.
-	linkConf linkConfState `state:"nosave"`
+	linkConf linkConfState
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.

@@ -94,10 +94,10 @@ type Stack struct {
 	routeTable tcpip.RouteList `state:"nosave"`
 	// fibRules holds the routing rules.
 	// +checklocks:routeMu
-	fibRules fibRules `state:"nosave"`
+	fibRules fibRules
 	// fib holds the atomic policies and snapshots that a reader uses without
 	// routeMu.
-	fib fibState `state:"nosave"`
+	fib fibState
 
 	mu stackRWMutex `state:"nosave"`
 	// +checklocks:mu
@@ -225,7 +225,7 @@ type Stack struct {
 
 	// neighborTables hold the gc_thresh values and the entry counts of the
 	// ARP and NDP tables. See neighbor_gc_xplat.go.
-	neighborTables neighborTables `state:"nosave"`
+	neighborTables neighborTables
 }
 
 // NetworkProtocolFactory instantiates a network protocol.
@@ -2309,6 +2309,7 @@ func (s *Stack) Restore() {
 			resolver.neigh.mu.Unlock()
 		}
 		nic.linkResQueue.mu.Unlock()
+		nic.registerRestoredNeighborCaches()
 	}
 	eps := s.restoredEndpoints
 	s.restoredEndpoints = nil

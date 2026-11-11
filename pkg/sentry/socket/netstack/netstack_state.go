@@ -26,4 +26,17 @@ func (s *Stack) saveStack() *stack.Stack {
 
 func (s *Stack) loadStack(_ context.Context, st *stack.Stack) {
 	s.Stack = st
+	s.bindStackPolicies()
+}
+
+func (s *Stack) afterLoad(context.Context) {
+	s.bindStackPolicies()
+}
+
+func (s *Stack) bindStackPolicies() {
+	if s.Stack != nil {
+		s.Stack.SetProxyARPPolicy(s.proxyARPEnabled)
+		s.Stack.SetRPFilterPolicy(s.rpFilterPolicy)
+		s.restoreBridgeNetfilter()
+	}
 }

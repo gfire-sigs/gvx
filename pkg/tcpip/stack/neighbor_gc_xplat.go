@@ -52,6 +52,8 @@ const (
 // NeighborGCThresholds holds gc_thresh1, gc_thresh2, and gc_thresh3 for one
 // neighbor table. Linux accepts values from 0 to MaxInt32 without ordering
 // constraints between thresholds.
+//
+// +stateify savable
 type NeighborGCThresholds struct {
 	Thresh1, Thresh2, Thresh3 int32
 }
@@ -81,20 +83,24 @@ func (s *neighborCacheSlot) dynamicEntries() int64 {
 
 // neighborTable owns the thresholds and registered link caches for one network
 // protocol in a Stack.
+//
+// +stateify savable
 type neighborTable struct {
 	// allocMu serializes dynamic entry admission and forced collection.
 	// Callers acquire allocMu before any neighborCache lock.
-	allocMu sync.Mutex
+	allocMu sync.Mutex `state:"nosave"`
 	// allocMu protects thresholds and lastFlush.
 	thresholds *NeighborGCThresholds
 	lastFlush  tcpip.MonotonicTime
 
 	// regMu protects caches as a leaf lock.
-	regMu  sync.Mutex
-	caches []*neighborCacheSlot
+	regMu  sync.Mutex           `state:"nosave"`
+	caches []*neighborCacheSlot `state:"nosave"`
 }
 
 // neighborTables holds the per-protocol neighbor tables of a Stack.
+//
+// +stateify savable
 type neighborTables struct {
 	ipv4, ipv6 neighborTable
 }
@@ -326,4 +332,20 @@ func isMulticastNeighbor(addr tcpip.Address) bool {
 		return header.IsV4MulticastAddress(addr)
 	}
 	return header.IsV6MulticastAddress(addr)
+}
+
+// registerRestoredNeighborCaches registers link caches that carry restored
+// dynamic entries so forced collection counts them after restore.
+func (n *nic) registerRestoredNeighborCaches() {
+	for protocol, l := range n.linkAddrResolvers {
+		l.neigh.mu.RLock()
+		hasDynamic := !l.neigh.mu.dynamic.lru.Empty()
+		l.neigh.mu.RUnlock()
+		if !hasDynamic {
+			continue
+		}
+		if t := n.stack.neighborTables.of(protocol); t != nil {
+			t.register(&l.neigh)
+		}
+	}
 }

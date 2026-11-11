@@ -15,6 +15,7 @@
 package stack
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +33,8 @@ import (
 
 // extState holds the timeout and protocol state of a connection.
 // conn.stateMu guards every field of extState.
+//
+// +stateify savable
 type extState struct {
 	// timeout is the duration after lastUsed when the connection expires.
 	timeout time.Duration
@@ -42,6 +45,8 @@ type extState struct {
 }
 
 // connAtomics holds the lock-free fields of a tracked connection.
+//
+// +stateify savable
 type connAtomics struct {
 	// released becomes 1 when the table removes the connection and decrements count.
 	released atomicbitops.Uint32
@@ -50,13 +55,31 @@ type connAtomics struct {
 }
 
 // connTrackLimits holds the atomic timeouts, entry limit, and entry count of a table.
+//
+// +stateify savable
 type connTrackLimits struct {
 	// cfg stores the timeout configuration; nil selects the Linux defaults.
-	cfg atomic.Pointer[conntrackConfig]
+	cfg atomic.Pointer[conntrackConfig] `state:".(*conntrackConfig)"`
 	// limit stores nf_conntrack_max; nil disables the entry limit.
-	limit atomic.Pointer[ConntrackLimit]
+	limit atomic.Pointer[ConntrackLimit] `state:".(*ConntrackLimit)"`
 	// count tracks active entries that the reaper or eviction has not removed.
 	count atomicbitops.Int32
+}
+
+func (c *connTrackLimits) saveCfg() *conntrackConfig {
+	return c.cfg.Load()
+}
+
+func (c *connTrackLimits) loadCfg(_ context.Context, cfg *conntrackConfig) {
+	c.cfg.Store(cfg)
+}
+
+func (c *connTrackLimits) saveLimit() *ConntrackLimit {
+	return c.limit.Load()
+}
+
+func (c *connTrackLimits) loadLimit(_ context.Context, limit *ConntrackLimit) {
+	c.limit.Store(limit)
 }
 
 // newConnState initializes the timeout and protocol state for a new connection.
