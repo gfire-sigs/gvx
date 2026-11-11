@@ -24,6 +24,10 @@ tmp_dir=${TMPDIR:-/tmp}
 goproxy=${GVX_GOPROXY:-https://proxy.golang.org/}
 gosumdb=${GVX_GOSUMDB:-sum.golang.org}
 buildvcs=${GVX_BUILDVCS:-true}
+buildmode=exe
+if [ "$goos" = "android" ]; then
+	buildmode=pie
+fi
 
 mkdir -p -- "$(dirname -- "$out")"
 out_abs="$(CDPATH= cd -- "$(dirname -- "$out")" && pwd)/$(basename -- "$out")"
@@ -69,7 +73,7 @@ exec env -i "$@" "$go_bin" build \
 	-mod=readonly \
 	-pgo=off \
 	-trimpath \
-	-buildmode=exe \
+	"-buildmode=$buildmode" \
 	-compiler=gc \
 	"-buildvcs=$buildvcs" \
 	-ldflags="-s -w -buildid=" \

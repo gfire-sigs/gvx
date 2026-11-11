@@ -36,6 +36,11 @@ sha256_file() {
 	fi
 }
 
+if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
+	printf 'working tree has uncommitted changes; commit or stash before running verify-repro-gvx.sh\n' >&2
+	exit 1
+fi
+
 go -C "$repo_root" mod download
 
 host_out="$work/host/rungv"
@@ -69,8 +74,12 @@ mkdir -p -- "$work/guest"
 	"$image" \
 	sh -ceu '
 		git config --global --add safe.directory /src
+		head_sha=$(git -C /src rev-parse HEAD)
+		git clone --local --no-hardlinks --no-checkout --quiet /src /tmp/src
+		git -C /tmp/src fetch --tags --quiet /src
+		git -C /tmp/src checkout --detach --quiet "$head_sha"
 		GOOS="$1" GOARCH="$2" GOMODCACHE=/gomodcache GOCACHE=/tmp/gocache \
-			/src/scripts/repro-build.sh /out/rungv "$3"
+			/tmp/src/scripts/repro-build.sh /out/rungv "$3"
 	' sh "$target_os" "$target_arch" "$pkg"
 
 guest_out="$work/guest/rungv"
