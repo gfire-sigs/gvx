@@ -55,6 +55,8 @@ func newTmpLeaf() string {
 }
 
 // tmpFile is the host state of an unnamed file.
+//
+// +stateify savable
 type tmpFile struct {
 	// parent is the directory dentry that holds the host name of the file.
 	// The tmpFile holds one reference on it, so the cached path of the
@@ -245,7 +247,9 @@ func (i *inode) releaseTmp() {
 	}
 	i.tmp = nil
 	if t.named() {
-		i.fs.ws.removeTmp(t)
+		if !i.fs.preserveSavedTmp && i.fs.ws != nil {
+			i.fs.ws.removeTmp(t)
+		}
 		t.parent.decRefLocked()
 	}
 }
@@ -346,6 +350,7 @@ func (fs *filesystem) linkTmpLocked(creds *auth.Credentials, src, parent *dentry
 		return translateHostError(err)
 	}
 	ino.tmp = nil
+	ino.savedTmpRel = ""
 	t.parent.decRefLocked()
 	ino.unlinked.Store(false)
 	ino.invalidateMeta()

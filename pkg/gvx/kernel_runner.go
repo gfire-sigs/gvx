@@ -44,6 +44,7 @@ import (
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/blockdev"
+	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/devices/memdev"
 	"z.gfire.dev/gvx/pkg/sentry/devices/ttydev"
 	"z.gfire.dev/gvx/pkg/sentry/devices/tundev"
@@ -194,29 +195,6 @@ func guestFeatureSet(plat platform.Platform) cpuid.FeatureSet {
 // MemoryFile, and the host lockdown denies the creation of a new one.
 var errRunConsumed = errors.New("gvx: Sandbox.Run already ran and consumed the kernel memory file")
 
-type ttyState struct {
-	mu         sync.Mutex
-	termios    linux.KernelTermios
-	winsize    linux.Winsize
-	fgPgrp     int32
-	session    int32
-	rawHost    bool
-	lineBuf    []byte
-	readBuf    []byte
-	pendingEOF bool
-	hostEOF    bool
-	hostErr    error
-	stopped    bool
-
-	in    io.Reader
-	out   io.Writer
-	outMu *sync.Mutex
-	ktty  *kernel.TTY
-	wq    waiter.Queue
-}
-
-var _ kernel.TTYOperations = (*ttyState)(nil)
-
 func newDefaultTTYState() *ttyState {
 	return newTTYState(nil, nil, false, 24, 80)
 }
@@ -249,9 +227,14 @@ func (t *ttyState) IncRef()                  {}
 func (t *ttyState) DecRef(gvcontext.Context) {}
 
 func (t *ttyState) OpenTTY(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	t.mu.Lock()
+	in := t.in
+	out := t.out
+	t.mu.Unlock()
 	fd := &stdioFD{
-		reader: t.in,
-		writer: t.out,
+		stream: stdioStreamCTTY,
+		reader: in,
+		writer: out,
 		tty:    t,
 		mu:     t.outMu,
 	}
@@ -268,15 +251,32 @@ func (t *ttyState) OpenTTY(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dent
 	return &fd.vfsfd, nil
 }
 
+func (t *ttyState) ensurePumpStarted() {
+	t.mu.Lock()
+	canStart := !t.pumpStarted && !t.stopped && !t.hostEOF && t.in != nil
+	t.mu.Unlock()
+	if canStart {
+		t.startPump()
+	}
+}
+
 func (t *ttyState) startPump() {
-	if t.in == nil {
+	t.mu.Lock()
+	if t.pumpStarted || t.stopped {
+		t.mu.Unlock()
+		return
+	}
+	t.pumpStarted = true
+	in := t.in
+	t.mu.Unlock()
+	if in == nil {
 		t.finishInput(io.EOF)
 		return
 	}
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			n, err := t.in.Read(buf)
+			n, err := in.Read(buf)
 			if n > 0 {
 				if !t.consumeInput(buf[:n]) {
 					return
@@ -294,8 +294,9 @@ func (t *ttyState) stop() {
 	t.mu.Lock()
 	t.stopped = true
 	t.hostEOF = true
+	in := t.in
 	t.mu.Unlock()
-	if d, ok := t.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+	if d, ok := in.(interface{ SetReadDeadline(time.Time) error }); ok {
 		_ = d.SetReadDeadline(time.Now())
 	}
 	t.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
@@ -535,11 +536,12 @@ func (t *ttyState) consumeInput(chunk []byte) bool {
 			notifyRead = true
 		}
 	}
+	out := t.out
 	t.mu.Unlock()
 
-	if len(echo) > 0 && t.out != nil {
+	if len(echo) > 0 && out != nil {
 		t.outMu.Lock()
-		_, _ = t.out.Write(echo)
+		_, _ = out.Write(echo)
 		t.outMu.Unlock()
 	}
 	for _, sig := range sigs {
@@ -585,6 +587,7 @@ func (t *ttyState) read(ctx gvcontext.Context, dst usermem.IOSequence) (int64, e
 		return 0, io.EOF
 	}
 	t.mu.Unlock()
+	t.ensurePumpStarted()
 	return 0, linuxerr.ErrWouldBlock
 }
 
@@ -657,27 +660,12 @@ func isHostTerminalReader(r io.Reader) bool {
 	return isHostTerminal(r)
 }
 
-type stdioFD struct {
-	vfsfd vfs.FileDescription
-	vfs.FileDescriptionDefaultImpl
-	vfs.NoLockFD
-
-	reader io.Reader
-	writer io.Writer
-	tty    *ttyState
-	// pump serves reads of a stream without a terminal. It is nil for a
-	// terminal and for a stream without a reader.
-	pump *stdinPump
-	// mu serializes the host reader or writer that every file description of
-	// the stream shares.
-	mu *sync.Mutex
-}
-
 func (f *stdioFD) Release(gvcontext.Context) {}
 
 func (f *stdioFD) EventRegister(e *waiter.Entry) error {
 	if f.tty != nil {
 		f.tty.wq.EventRegister(e)
+		f.tty.ensurePumpStarted()
 	}
 	if f.pump != nil {
 		f.pump.register(e)
@@ -705,7 +693,7 @@ func (f *stdioFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 	if f.writer != nil {
 		ready |= waiter.WritableEvents
 	}
-	if f.reader != nil {
+	if f.reader != nil || f.vfsfd.IsReadable() {
 		ready |= f.tty.readReadiness()
 	}
 	return ready & mask
@@ -742,14 +730,14 @@ func (f *stdioFD) SetStat(gvcontext.Context, vfs.SetStatOptions) error {
 }
 
 func (f *stdioFD) Read(ctx gvcontext.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
-	if f.reader == nil {
-		return 0, io.EOF
-	}
 	if f.tty != nil {
 		return f.tty.read(ctx, dst)
 	}
 	if f.pump != nil {
 		return f.pump.read(ctx, dst)
+	}
+	if f.reader == nil {
+		return 0, io.EOF
 	}
 	if dst.NumBytes() == 0 {
 		return 0, nil
@@ -1051,7 +1039,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		netfilter.SetStackLog(inetStack.Stack, kernelLogFunc(k))
 		defer netfilter.SetStackLog(inetStack.Stack, nil)
 		inetStack.InitConntrackLimit(nil)
-		rootNetNS = inet.NewRootNamespace(inetStack, &guestNetnsCreator{k: k, opts: s.stackOptions()}, creds.UserNamespace)
+		rootNetNS = inet.NewRootNamespace(inetStack, newGuestNetnsCreator(k, s.stackOptions()), creds.UserNamespace)
 	}
 
 	maxCPUs := runtime.NumCPU()
@@ -1327,39 +1315,6 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		return 128 + int(ws.TerminationSignal()), nil
 	}
 	return int(ws.ExitStatus()), nil
-}
-
-// guestNetnsCreator creates the network stack of a new guest network
-// namespace, such as the namespace of unshare -n or of a runc container. The
-// stack has only lo, as a new namespace on Linux has.
-type guestNetnsCreator struct {
-	k    *kernel.Kernel
-	opts netbackend.StackOptions
-}
-
-// CreateStack implements inet.NetworkStackCreator.CreateStack.
-func (c *guestNetnsCreator) CreateStack() (inet.Stack, error) {
-	st, err := netbackend.NewLoopbackStack(c.opts)
-	if err != nil {
-		return nil, err
-	}
-	stack := netstack.NewStack(st, c.k.UniqueID())
-	// Linux gives a new network namespace the IPv4 forwarding switches of the
-	// root namespace and the defaults for IPv6.
-	root, ok := c.k.RootNetworkNamespace().Stack().(*netstack.Stack)
-	if ok {
-		if err := stack.InheritForwarding(root); err != nil {
-			return nil, fmt.Errorf("gvx: copy the forwarding switches to a new network namespace: %w", err)
-		}
-		// The module parameters of xt_recent belong to the kernel, so all
-		// network namespaces share them.
-		netfilter.ShareRecentModule(st, root.Stack)
-		// IPv4 also copies rp_filter of conf/all and conf/default.
-		stack.InheritRPFilter(root)
-	}
-	// nf_conntrack_max is one value for the kernel, as on Linux.
-	stack.InitConntrackLimit(root)
-	return stack, nil
 }
 
 // buildKernelRootMountNamespace creates the mount namespace of the guest. As
@@ -1639,7 +1594,13 @@ func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	return mountSubfs(m.GuestPath, hostfs.Name, &vfs.MountOptions{
 		ReadOnly: m.workspace.ReadOnly(),
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
-			InternalData: hostfs.InternalFilesystemOptions{Workspace: m.workspace},
+			InternalData: hostfs.InternalFilesystemOptions{
+				Workspace: m.workspace,
+				UniqueID: checkpoint.ResourceID{
+					ContainerName: cmp.Or(s.cfg.Name, "gvx-default"),
+					Path:          m.GuestPath,
+				},
+			},
 		},
 	})
 }

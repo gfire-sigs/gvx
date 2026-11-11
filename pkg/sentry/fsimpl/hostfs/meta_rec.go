@@ -46,6 +46,8 @@ const (
 
 // recKey is the key of one .gvx_meta record. It is comparable, so it keys the
 // in-memory table directly. Only the fields of its kind are set.
+//
+// +stateify savable
 type recKey struct {
 	kind recKind
 	// id is the file for kindInode and the parent directory for kindName.

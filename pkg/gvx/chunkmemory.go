@@ -28,12 +28,8 @@ import (
 // guest pages by host pointer.
 const sharedChunkMemory = runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "windows"
 
-// memoryFileChunks lets hostfs and ext4lite keep the chunks of mapped files in
-// the kernel memory file.
-type memoryFileChunks struct{ *pgalloc.MemoryFile }
-
 // AllocateChunk implements hostfs.ChunkMemory.
-func (m memoryFileChunks) AllocateChunk(length uint64) (memmap.FileRange, error) {
+func (m *memoryFileChunks) AllocateChunk(length uint64) (memmap.FileRange, error) {
 	return m.Allocate(length, pgalloc.AllocOpts{Kind: usage.Anonymous})
 }
 
@@ -44,10 +40,11 @@ func (s *Sandbox) attachChunkMemory() {
 	if !sharedChunkMemory || s.memFile == nil {
 		return
 	}
+	chunks := &memoryFileChunks{MemoryFile: s.memFile}
 	for _, ws := range s.workspaces {
-		ws.SetChunkMemory(memoryFileChunks{s.memFile})
+		ws.SetChunkMemory(chunks)
 	}
 	for _, vol := range s.volumes {
-		vol.SetChunkMemory(memoryFileChunks{s.memFile})
+		vol.SetChunkMemory(chunks)
 	}
 }

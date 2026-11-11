@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/fspath"
+	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -43,11 +44,17 @@ const (
 
 // InternalFilesystemOptions may be passed as vfs.GetFilesystemOptions.InternalData
 // to mount an already-opened *Workspace prior to hostlockdown.Apply().
+//
+// +stateify savable
 type InternalFilesystemOptions struct {
-	Workspace *Workspace
+	Workspace   *Workspace `state:"nosave"`
+	UniqueID    checkpoint.ResourceID
+	RestoreMode bool
 }
 
 // FilesystemType implements vfs.FilesystemType for hostfs.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // Name implements vfs.FilesystemType.Name.
@@ -60,19 +67,31 @@ func (FilesystemType) Release(ctx context.Context) {}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	var ws *Workspace
+	var (
+		ws          *Workspace
+		uniqueID    checkpoint.ResourceID
+		restoreMode bool
+	)
 	ownsWS := false
-	if internalOpts, ok := opts.InternalData.(InternalFilesystemOptions); ok && internalOpts.Workspace != nil {
+	if internalOpts, ok := opts.InternalData.(InternalFilesystemOptions); ok {
+		uniqueID = internalOpts.UniqueID
+		restoreMode = internalOpts.RestoreMode
 		ws = internalOpts.Workspace
-	} else if source != "" {
+	}
+	if ws == nil {
+		if source == "" {
+			return nil, nil, linuxerr.EINVAL
+		}
 		var err error
-		ws, err = OpenWorkspace(source, false)
+		if restoreMode {
+			ws, err = OpenWorkspaceForRestore(source, false)
+		} else {
+			ws, err = OpenWorkspace(source, false)
+		}
 		if err != nil {
 			return nil, nil, translateHostError(err)
 		}
 		ownsWS = true
-	} else {
-		return nil, nil, linuxerr.EINVAL
 	}
 	fail := func(err error) (*vfs.Filesystem, *vfs.Dentry, error) {
 		if ownsWS {
@@ -90,11 +109,15 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return fail(err)
 	}
 	hfs := &filesystem{
-		ws:       ws,
-		ownsWS:   ownsWS,
-		devMinor: devMinor,
-		inodes:   make(map[hostID]*inode),
-		pruneAt:  pruneThreshold,
+		ws:         ws,
+		ownsWS:     ownsWS,
+		devMinor:   devMinor,
+		uniqueID:   uniqueID,
+		singleFile: ws.SingleFile(),
+		inodes:     make(map[hostID]*inode),
+		liveInodes: make(map[*inode]struct{}),
+		pruneAt:    pruneThreshold,
+		openFDs:    make(map[*regularFD]struct{}),
 	}
 	hfs.vfsfs.Init(vfsObj, fsType, hfs)
 	hfs.mu.Lock()
@@ -110,23 +133,32 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 // expired or a mutation dropped it. The dentry tree also keeps object identity
 // stable for open files, mounts, and watches. The consistency contract is in
 // lookupChildLocked.
+// +stateify savable
 type filesystem struct {
-	vfsfs    vfs.Filesystem
-	ws       *Workspace
-	ownsWS   bool
-	devMinor uint32
+	vfsfs            vfs.Filesystem
+	ws               *Workspace `state:"nosave"`
+	ownsWS           bool
+	devMinor         uint32
+	uniqueID         checkpoint.ResourceID
+	singleFile       bool
+	preserveSavedTmp bool `state:"nosave"`
 
 	// mu protects the dentry tree, dentry names and paths, the inode map, and
 	// pending. Lock order: filesystem.mu, then Workspace.mu, then inode locks.
-	mu     sync.Mutex
-	root   *dentry
-	inodes map[hostID]*inode
+	mu         sync.Mutex `state:"nosave"`
+	root       *dentry
+	inodes     map[hostID]*inode
+	liveInodes map[*inode]struct{}
 	// pending holds references returned by the VFS that must be dropped after
 	// mu is released, because dropping them can release this filesystem.
-	pending []decRefer
+	pending []decRefer `state:"nosave"`
 
 	dentryCount int
 	pruneAt     int
+
+	// openFDsMu is a leaf lock protecting openFDs.
+	openFDsMu sync.Mutex `state:"nosave"`
+	openFDs   map[*regularFD]struct{}
 }
 
 // decRefer is the part of refs.RefCounter that hostfs needs. The VFS returns
@@ -164,27 +196,39 @@ func (fs *filesystem) unlock(ctx context.Context) {
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
-	fs.mu.Lock()
-	inodes := make([]*inode, 0, len(fs.inodes))
-	for _, ino := range fs.inodes {
-		inodes = append(inodes, ino)
-	}
-	fs.mu.Unlock()
-	for _, ino := range inodes {
-		// Release has no error result, so a failure is logged. An earlier
-		// Sync call already reported the failures that it saw.
-		if err := ino.syncData(); err != nil {
-			ctx.Warningf("hostfs: write back mapped data at unmount: %v", err)
+	if fs.ws != nil {
+		fs.mu.Lock()
+		inodes := make([]*inode, 0, max(len(fs.inodes), len(fs.liveInodes)))
+		seen := make(map[*inode]struct{}, max(len(fs.inodes), len(fs.liveInodes)))
+		for _, ino := range fs.inodes {
+			seen[ino] = struct{}{}
+			inodes = append(inodes, ino)
+		}
+		for ino := range fs.liveInodes {
+			if _, ok := seen[ino]; !ok {
+				seen[ino] = struct{}{}
+				inodes = append(inodes, ino)
+			}
+		}
+		fs.mu.Unlock()
+		for _, ino := range inodes {
+			// Release has no error result, so a failure is logged. An earlier
+			// Sync call already reported the failures that it saw.
+			if err := ino.syncData(); err != nil {
+				ctx.Warningf("hostfs: write back mapped data at unmount: %v", err)
+			}
+		}
+		if err := fs.ws.Sync(); err != nil {
+			ctx.Warningf("hostfs: flush metadata at unmount: %v", err)
 		}
 	}
-	if err := fs.ws.Sync(); err != nil {
-		ctx.Warningf("hostfs: flush metadata at unmount: %v", err)
-	}
 	fs.mu.Lock()
-	fs.root.decRefLocked()
+	if fs.root != nil {
+		fs.root.decRefLocked()
+	}
 	fs.mu.Unlock()
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
-	if fs.ownsWS {
+	if fs.ownsWS && fs.ws != nil {
 		_ = fs.ws.Close()
 	}
 }
@@ -193,9 +237,17 @@ func (fs *filesystem) Release(ctx context.Context) {
 // flushes the metadata table, and it reports every failure.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	fs.mu.Lock()
-	inodes := make([]*inode, 0, len(fs.inodes))
+	inodes := make([]*inode, 0, max(len(fs.inodes), len(fs.liveInodes)))
+	seen := make(map[*inode]struct{}, max(len(fs.inodes), len(fs.liveInodes)))
 	for _, ino := range fs.inodes {
+		seen[ino] = struct{}{}
 		inodes = append(inodes, ino)
+	}
+	for ino := range fs.liveInodes {
+		if _, ok := seen[ino]; !ok {
+			seen[ino] = struct{}{}
+			inodes = append(inodes, ino)
+		}
 	}
 	fs.mu.Unlock()
 	var errs []error
@@ -213,6 +265,7 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 // inode is the identity of a host file. Hard links share one inode through the
 // filesystem inode map, so they share locks, watches, and the mapped-page
 // cache. A virtual symlink has an inode of its own.
+// +stateify savable
 type inode struct {
 	fs      *filesystem
 	id      hostID
@@ -242,22 +295,22 @@ type inode struct {
 	// valid, but a stat of the path reads the host again. An open file
 	// description reads size and times from its handle, so its stat needs no
 	// host call for the path.
-	attrMu     sync.Mutex
+	attrMu     sync.Mutex `state:"nosave"`
 	cur        entry
-	metaValid  bool
-	timesStale bool
-	metaUntil  int64
-	metaSeq    uint64
+	metaValid  bool   `state:"nosave"`
+	timesStale bool   `state:"nosave"`
+	metaUntil  int64  `state:"nosave"`
+	metaSeq    uint64 `state:"nosave"`
 
 	// negChildren holds the names that a lookup in this directory did not
 	// find, so a repeated lookup makes no host call. negUntil ends the life of
 	// the whole set. Protected by fs.mu. See lookupChildLocked for the
 	// consistency contract.
-	negChildren map[string]struct{}
-	negUntil    int64
+	negChildren map[string]struct{} `state:"nosave"`
+	negUntil    int64               `state:"nosave"`
 
 	// wmu serialises writes so that O_APPEND is atomic.
-	wmu sync.Mutex
+	wmu sync.Mutex `state:"nosave"`
 
 	data fileData
 
@@ -275,6 +328,9 @@ type inode struct {
 	// O_TMPFILE, or nil. Protected by fs.mu. See tmpfile.go.
 	tmp *tmpFile
 
+	savedRel    string
+	savedTmpRel string
+
 	// special holds the in-memory state of a socket, a FIFO, or a device
 	// node. See special_node.go.
 	special specialState
@@ -282,11 +338,11 @@ type inode struct {
 	// guest records the host state that the last guest write produced. The
 	// host watcher uses it to tell a guest write from a host write. See
 	// watcher.go.
-	guest guestState
+	guest guestState `state:"nosave"`
 
 	// dirLinks caches the counted link count of a directory on a host that
 	// does not count directory links. See dirlinks.go.
-	dirLinks dirLinkCache
+	dirLinks dirLinkCache `state:"nosave"`
 }
 
 func (i *inode) snapshot() entry {
@@ -443,7 +499,12 @@ func (i *inode) syncData() error {
 
 // destroy releases the resources of an inode with no dentries left.
 func (i *inode) destroy() {
-	i.fs.ws.watchForget(i)
+	if i.fs.ws != nil {
+		i.fs.ws.watchForget(i)
+		if !i.fs.preserveSavedTmp && i.savedTmpRel != "" && (i.tmp == nil || !i.tmp.named()) {
+			i.fs.ws.removeEphemeral(i.savedTmpRel)
+		}
+	}
 	i.data.release()
 	i.releaseTmp()
 }
@@ -479,12 +540,18 @@ func (fs *filesystem) inodeForLocked(e entry, rel string) *inode {
 	} else {
 		fs.inodes[e.info.id] = ino
 	}
+	if fs.liveInodes == nil {
+		fs.liveInodes = make(map[*inode]struct{})
+	}
+	fs.liveInodes[ino] = struct{}{}
 	ino.data.init(ino)
 	ino.initSpecial(e)
 	return ino
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 	// refs counts the VFS and file description references, plus one for the
@@ -494,7 +561,7 @@ type dentry struct {
 
 	// nameMu protects parent, name, and relPath for readers that do not hold
 	// fs.mu. Writers hold both.
-	nameMu  sync.RWMutex
+	nameMu  sync.RWMutex `state:"nosave"`
 	parent  *dentry
 	name    string
 	relPath string
@@ -570,6 +637,7 @@ func (fs *filesystem) destroyLocked(d *dentry) {
 	ino := d.inode
 	ino.refs--
 	if ino.refs == 0 {
+		delete(fs.liveInodes, ino)
 		if !ino.virtual && fs.inodes[ino.id] == ino {
 			delete(fs.inodes, ino.id)
 		}

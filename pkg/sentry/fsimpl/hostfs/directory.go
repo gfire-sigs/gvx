@@ -15,6 +15,7 @@
 package hostfs
 
 import (
+	goContext "context"
 	"errors"
 	"slices"
 	"strings"
@@ -28,13 +29,15 @@ import (
 
 // fileDescription holds the members shared by the file description types. The
 // nesting lets dirFD embed both default implementations without ambiguity.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.LockFD
 
 	dentry *dentry
-	h      *hostHandle
+	h      *hostHandle `state:"nosave"`
 }
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
@@ -61,10 +64,23 @@ func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
 // the visibility of entries that change during iteration unspecified. The
 // snapshot keeps offsets stable while the guest deletes entries it already
 // read, as rm -rf does.
+// +stateify savable
 type dirFD struct {
 	fileDescription
 	vfs.DirectoryFileDescriptionDefaultImpl
-	cursor chunkcache.DirCursor
+	cursor         chunkcache.DirCursor `state:"nosave"`
+	savedCursorOff int64
+}
+
+func (fd *dirFD) beforeSave() {
+	off, _ := fd.cursor.SeekDir(0, linux.SEEK_CUR)
+	fd.savedCursorOff = off
+}
+
+func (fd *dirFD) afterLoad(goContext.Context) {
+	if fd.savedCursorOff > 0 {
+		_, _ = fd.cursor.SeekDir(fd.savedCursorOff, linux.SEEK_SET)
+	}
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.

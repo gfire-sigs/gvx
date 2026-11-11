@@ -25,9 +25,19 @@ import (
 
 // setSource records the dentry that AddMapping can open a handle through.
 func (c *fileData) setSource(d *dentry) {
+	c.MapsMu.Lock()
 	c.DataMu.Lock()
-	c.src = d
+	if c.src == nil || c.Mappings.IsEmpty() {
+		c.src = d
+	}
 	c.DataMu.Unlock()
+	c.MapsMu.Unlock()
+}
+
+func (c *fileData) source() *dentry {
+	c.DataMu.Lock()
+	defer c.DataMu.Unlock()
+	return c.src
 }
 
 // AddMapping implements memmap.Mappable.AddMapping. It shadows the method of
@@ -44,7 +54,30 @@ func (c *fileData) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar ho
 	if err := c.ensureHandle(writable); err != nil {
 		return err
 	}
-	return c.Cache.AddMapping(ctx, ms, ar, offset, writable)
+	src := c.source()
+	if src != nil {
+		src.IncRef()
+	}
+	if err := c.Cache.AddMapping(ctx, ms, ar, offset, writable); err != nil {
+		if src != nil {
+			src.DecRef(ctx)
+		}
+		return err
+	}
+	return nil
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (c *fileData) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return c.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (c *fileData) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	c.Cache.RemoveMapping(ctx, ms, ar, offset, writable)
+	if src := c.source(); src != nil {
+		src.DecRef(ctx)
+	}
 }
 
 // ensureHandle reserves a handle for the AddMapping call when the file data

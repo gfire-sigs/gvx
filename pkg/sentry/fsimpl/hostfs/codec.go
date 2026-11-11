@@ -29,11 +29,11 @@ const (
 	// without the prefix stands for itself.
 	codecPrefix = "~gvx~"
 
-	// ephemeralTmpPrefix and ephemeralSwapPrefix start the names of the
-	// internal host files of hostfs. NameCodec never produces these prefixes
-	// for a guest name, and every guest listing hides them.
+	// ephemeralTmpPrefix, ephemeralSwapPrefix, and unlinkedTmpPrefix start the
+	// names of internal host files of hostfs. Every guest listing hides them.
 	ephemeralTmpPrefix  = codecPrefix + "tmp."
 	ephemeralSwapPrefix = codecPrefix + "swap."
+	unlinkedTmpPrefix   = ".gvx_tmp_"
 
 	// winForbiddenBytes lists the bytes that Windows refuses in a file name,
 	// besides the control bytes. The backslash is a path separator.
@@ -434,7 +434,9 @@ func isReservedDeviceName(name string) bool {
 }
 
 // isEphemeralName reports whether name belongs to the internal namespace of
-// hostfs: unnamed temporary files and swap files.
+// hostfs: unnamed temporary files, swap files, and checkpointed unlinked files.
 func isEphemeralName(name string) bool {
-	return strings.HasPrefix(name, ephemeralTmpPrefix) || strings.HasPrefix(name, ephemeralSwapPrefix)
+	return strings.HasPrefix(name, ephemeralTmpPrefix) ||
+		strings.HasPrefix(name, ephemeralSwapPrefix) ||
+		strings.HasPrefix(name, unlinkedTmpPrefix)
 }

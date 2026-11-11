@@ -124,6 +124,8 @@ const (
 
 // hostID identifies a host file independent of the path used to reach it.
 // Hard links share one hostID.
+//
+// +stateify savable
 type hostID struct {
 	dev uint64
 	ino uint64
@@ -145,6 +147,7 @@ type hostID struct {
 // A backend stores the raw device number in dev. The Workspace replaces the
 // device of the workspace root with zero before it stores a key, so a volume
 // that gets another device number after a reboot keeps its records.
+// +stateify savable
 type fileKey struct {
 	dev  uint64
 	ino  uint64
@@ -161,6 +164,8 @@ func (k fileKey) isZero() bool {
 
 // hostInfo is the host metadata of one entry, obtained without following
 // symbolic links.
+//
+// +stateify savable
 type hostInfo struct {
 	kind hostKind
 	id   hostID
