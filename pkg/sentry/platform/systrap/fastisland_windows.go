@@ -278,28 +278,49 @@ func (as *addressSpace) guestPageOK(va uint64) bool {
 // so a failure frees the slot at once.
 func (as *addressSpace) installSlot(ctx context.Context, mm platform.MemoryManager, rec islandSlot, encode func(buf []byte, slotVA uint64) error) (uint64, winSlotRef, error) {
 	site, size := rec.site, rec.size
-	isl, off, err := as.allocSlot(ctx, mm, site, size)
-	if err != nil {
-		return 0, winSlotRef{}, err
-	}
-	ref := winSlotRef{isl: isl, off: off, size: size}
-	slotVA := isl.base + uint64(off)
-	if err := encode(isl.page.bytes()[off:off+size], slotVA); err != nil {
+	var rejected []winSlotRef
+	defer func() {
+		if len(rejected) == 0 {
+			return
+		}
 		as.mu.Lock()
-		isl.discard(off, size)
+		for _, r := range rejected {
+			r.isl.discard(r.off, r.size)
+		}
 		as.mu.Unlock()
-		return 0, winSlotRef{}, err
-	}
-	as.mu.Lock()
-	isl.record(off, rec)
-	as.mu.Unlock()
-	if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), uintptr(size)); err != nil {
+	}()
+	var lastErr error
+	for range 12 {
+		isl, off, err := as.allocSlot(ctx, mm, site, size)
+		if err != nil {
+			return 0, winSlotRef{}, err
+		}
+		ref := winSlotRef{isl: isl, off: off, size: size}
+		slotVA := isl.base + uint64(off)
+		slotBuf := isl.page.bytes()[off : off+size]
+		if err := encode(slotBuf, slotVA); err != nil {
+			initIslandBytes(slotBuf)
+			rejected = append(rejected, ref)
+			lastErr = err
+			continue
+		}
+		if !slotSeamSafe(isl.page.bytes(), off, size) {
+			rejected = append(rejected, ref)
+			lastErr = errors.New("island slot forms a raw kernel opcode")
+			continue
+		}
 		as.mu.Lock()
-		isl.discard(off, size)
+		isl.record(off, rec)
 		as.mu.Unlock()
-		return 0, winSlotRef{}, err
+		if err := flushInstructionCache(as.sp.proc, uintptr(slotVA), uintptr(size)); err != nil {
+			as.mu.Lock()
+			isl.discard(off, size)
+			as.mu.Unlock()
+			return 0, winSlotRef{}, err
+		}
+		return slotVA, ref, nil
 	}
-	return slotVA, ref, nil
+	return 0, winSlotRef{}, lastErr
 }
 
 // allocSlot returns space for a slot of size bytes within reach of site. It
@@ -356,6 +377,7 @@ func (as *addressSpace) installIsland(base uint64) error {
 		as.dropReservation(base)
 		return err
 	}
+	initIslandBytes(pg.bytes())
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	delete(as.reserved, base)

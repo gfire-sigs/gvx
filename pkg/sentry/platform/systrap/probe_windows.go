@@ -65,7 +65,7 @@ func (as *addressSpace) installCode(ctx context.Context, mm platform.MemoryManag
 		return err
 	}
 	copy(pg.bytes(), code)
-	sites, slots, _, err := as.patchPage(ctx, mm, base, pg.bytes(), false, nil)
+	sites, slots, _, _, err := as.patchPage(ctx, mm, base, pg.bytes(), false, nil)
 	if err != nil {
 		as.p.priv.release(pg)
 		return err

@@ -341,6 +341,9 @@ func (p *Platform) Confinement() string {
 	if level&confineStrict != 0 {
 		s += ", strict handle checks, extension points disabled"
 	}
+	if level&confineImageLoad != 0 {
+		s += ", fonts and remote images disabled"
+	}
 	return s
 }
 

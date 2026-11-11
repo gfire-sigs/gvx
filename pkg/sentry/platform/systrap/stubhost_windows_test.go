@@ -162,3 +162,106 @@ func TestStubTokenCannotReadAFileThatOnlyTheUserCanRead(t *testing.T) {
 		f.Close()
 	}
 }
+
+func TestStubTokenMarksExtraGroupsDenyOnlyAndRestrictsLogonSID(t *testing.T) {
+	primary, _, err := buildStubToken()
+	if err != nil {
+		t.Fatalf("buildStubToken: %v", err)
+	}
+	defer primary.Close()
+
+	groups, err := primary.GetTokenGroups()
+	if err != nil {
+		t.Fatalf("GetTokenGroups: %v", err)
+	}
+	var logonSID *windows.SID
+	for _, g := range groups.AllGroups() {
+		if g.Attributes&windows.SE_GROUP_INTEGRITY != 0 {
+			continue
+		}
+		if g.Attributes&windows.SE_GROUP_LOGON_ID == windows.SE_GROUP_LOGON_ID {
+			logonSID = g.Sid
+			continue
+		}
+		if g.Attributes&windows.SE_GROUP_ENABLED != 0 && !isStubAllowedGroupSID(g.Sid) {
+			t.Errorf("unexpected enabled group SID %s in stub token (attrs=%#x)", g.Sid, g.Attributes)
+		}
+	}
+
+	var needed uint32
+	_ = windows.GetTokenInformation(primary, windows.TokenRestrictedSids, nil, 0, &needed)
+	if needed == 0 {
+		t.Fatal("TokenRestrictedSids returned zero size")
+	}
+	buf := make([]byte, needed)
+	if err := windows.GetTokenInformation(primary, windows.TokenRestrictedSids, &buf[0], needed, &needed); err != nil {
+		t.Fatalf("GetTokenInformation(TokenRestrictedSids): %v", err)
+	}
+	restricted := (*windows.Tokengroups)(unsafe.Pointer(&buf[0]))
+	for _, r := range restricted.AllGroups() {
+		if logonSID != nil && windows.EqualSid(r.Sid, logonSID) {
+			t.Errorf("TokenRestrictedSids unexpectedly includes logon SID %s", r.Sid)
+		}
+	}
+}
+
+func TestStubTokenDefaultDACLExcludesEveryoneAndIsolatesStubs(t *testing.T) {
+	tokA, sdA, _, err := newStubIdentity()
+	if err != nil {
+		t.Fatalf("newStubIdentity A: %v", err)
+	}
+	defer tokA.Close()
+	tokB, sdB, _, err := newStubIdentity()
+	if err != nil {
+		t.Fatalf("newStubIdentity B: %v", err)
+	}
+	defer tokB.Close()
+
+	if sdA.String() == sdB.String() {
+		t.Fatalf("two stub identities shared the same private SID in SDDL: %s", sdA.String())
+	}
+
+	everyone, err := windows.StringToSid("S-1-1-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var needed uint32
+	_ = windows.GetTokenInformation(tokA, windows.TokenDefaultDacl, nil, 0, &needed)
+	if needed == 0 {
+		t.Fatal("TokenDefaultDacl returned zero size")
+	}
+	buf := make([]byte, needed)
+	if err := windows.GetTokenInformation(tokA, windows.TokenDefaultDacl, &buf[0], needed, &needed); err != nil {
+		t.Fatalf("GetTokenInformation(TokenDefaultDacl): %v", err)
+	}
+	dacl := *(**windows.ACL)(unsafe.Pointer(&buf[0]))
+	if dacl == nil {
+		t.Fatal("TokenDefaultDacl has nil ACL")
+	}
+	type aceHeader struct {
+		AceType  uint8
+		AceFlags uint8
+		AceSize  uint16
+	}
+	type accessAllowedAce struct {
+		Header   aceHeader
+		Mask     uint32
+		SidStart uint32
+	}
+	aclHdr := (*struct {
+		AclRevision uint8
+		Sbz1        uint8
+		AclSize     uint16
+		AceCount    uint16
+		Sbz2        uint16
+	})(unsafe.Pointer(dacl))
+	offset := uintptr(8)
+	for i := uint16(0); i < aclHdr.AceCount; i++ {
+		ace := (*accessAllowedAce)(unsafe.Pointer(uintptr(unsafe.Pointer(dacl)) + offset))
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if windows.EqualSid(sid, everyone) {
+			t.Fatalf("TokenDefaultDacl grants access to Everyone (S-1-1-0)")
+		}
+		offset += uintptr(ace.Header.AceSize)
+	}
+}

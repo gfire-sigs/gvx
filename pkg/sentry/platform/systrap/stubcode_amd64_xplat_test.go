@@ -32,8 +32,8 @@ func TestBuildSpillDecodesEveryInstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sc.code) > winCodeSize-winSpillOffset {
-		t.Fatalf("spill routine has %d bytes, the code pages leave %d", len(sc.code), winCodeSize-winSpillOffset)
+	if len(sc.code) > winSpillMaxSize {
+		t.Fatalf("spill routine has %d bytes, the spill region leaves %d", len(sc.code), winSpillMaxSize)
 	}
 	for off := 0; off < len(sc.code); {
 		inst, err := x86asm.Decode(sc.code[off:], 64)
@@ -1873,5 +1873,98 @@ func TestPlanSiteKeepsTheBytesWhereAThreadContinues(t *testing.T) {
 				t.Errorf("plan = %s, want a post window: %v", got.kind, c.want)
 			}
 		})
+	}
+}
+
+func TestFastPathPlannerRejectsEmbeddedKernelExitsInRelocAndJmp(t *testing.T) {
+	// patchJmpSite must reject a rel32 displacement whose bytes form 0F 05.
+	page := nops(128)
+	const siteVA = 0x100000
+	if err := patchJmpSite(page, 0, winJmpLen, siteVA, siteVA+winJmpLen+0x050f); err == nil {
+		t.Fatalf("patchJmpSite accepted a JMP rel32 displacement containing 0F 05")
+	}
+
+	// newJmpPlanner must refuse to relocate an instruction containing 0F 05
+	// unpatched into a fast-path slot.
+	code := catBytes(
+		nops(32),
+		[]byte{0x0f, 0x05},
+		[]byte{0xb8, 0x0f, 0x05, 0x00, 0x00, 0xc3},
+	)
+	pl := newJmpPlanner(nil, pageWith(corpusDefaultAt, code...), nil).planSite(corpusDefaultAt+32, 0)
+	if pl.kind == planPost {
+		t.Fatalf("planner relocated mov eax, 0x050f into an unpatched fast-path slot: %+v", pl)
+	}
+
+	// encodeWinGSMovSlot must reject gs:[0x50f] (disp32 contains 0F 05).
+	gsMovCode := []byte{0x65, 0x48, 0x8b, 0x04, 0x25, 0x0f, 0x05, 0x00, 0x00}
+	gsPlan, ok := planGSMov(gsMovCode)
+	if !ok {
+		t.Fatalf("planGSMov failed on mov rax, gs:[0x50f]")
+	}
+	var gsSlot [winGSMovSlotSize]byte
+	if err := encodeWinGSMovSlot(gsSlot[:], 0x200000, 0x201000, len(gsMovCode), gsPlan); err == nil {
+		t.Fatalf("encodeWinGSMovSlot accepted gs:[0x50f] displacement containing 0F 05")
+	}
+
+	// encodeWinSlot must reject a return E9 displacement or spill literal containing 0F 05.
+	var slotBuf [winSlotSize]byte
+	if err := encodeWinSlot(slotBuf[:], 0x200000, 0x200000+winSlotLiteralOffset+8+3+5+0x050f-winSiteLen-3, 0x300000, []byte{0x90, 0x90, 0x90}); err == nil {
+		t.Fatalf("encodeWinSlot accepted return E9 displacement containing 0F 05")
+	}
+	if err := encodeWinSlot(slotBuf[:], 0x200000, 0x201000, 0x0000050f00000000, []byte{0x90, 0x90, 0x90}); err == nil {
+		t.Fatalf("encodeWinSlot accepted spill literal containing 0F 05")
+	}
+
+	// Relocated RIP-relative post-window (`syscall; mov rax, [rip+0x50f]`):
+	// patchJmpSite with spanLen = max(winJmpLen, winSiteLen+len(reloc)) must fill
+	// trailing relocated bytes with 0xCC so scanAMD64HiddenExits sees no leftover
+	// 0F 05 and never clobbers the 5-byte E9 jump!
+	ripRelCode := catBytes(
+		nops(16),
+		[]byte{0x0f, 0x05}, // syscall at +16
+		[]byte{0x48, 0x8b, 0x05, 0x0f, 0x05, 0x00, 0x00}, // mov rax, [rip+0x50f] at +18..+25
+		[]byte{0xc3},
+	)
+	origPage := pageWith(0, ripRelCode...)
+	patchedPage := append([]byte(nil), origPage...)
+	sites := scanAMD64(nil, patchedPage, nil)
+	if _, err := patchAMD64(patchedPage, sites); err != nil {
+		t.Fatalf("patchAMD64: %v", err)
+	}
+	relocPlan := newJmpPlanner(nil, origPage, nil).planSite(16, 0)
+	if relocPlan.kind != planPost {
+		t.Fatalf("expected planPost for syscall + mov rax, [rip+0x50f], got %+v", relocPlan)
+	}
+	spanLen := max(winJmpLen, winSiteLen+len(relocPlan.reloc))
+	if err := patchJmpSite(patchedPage, 16, spanLen, 0x100010, 0x102000); err != nil {
+		t.Fatalf("patchJmpSite: %v", err)
+	}
+	wantJmp := append([]byte(nil), patchedPage[16:16+winJmpLen]...)
+	for i := 16 + winJmpLen; i < 16+spanLen; i++ {
+		if patchedPage[i] != 0xCC {
+			t.Fatalf("trailing relocated byte at %d = %#x, want 0xCC", i, patchedPage[i])
+		}
+	}
+	hidden := scanAMD64HiddenExits(nil, origPage, nil, patchedPage)
+	if len(hidden) != 0 {
+		t.Fatalf("scanAMD64HiddenExits found %+v after filling relocated span with 0xCC, want none", hidden)
+	}
+	if !bytes.Equal(patchedPage[16:16+winJmpLen], wantJmp) {
+		t.Fatalf("E9 jump bytes changed: got % x, want % x", patchedPage[16:16+winJmpLen], wantJmp)
+	}
+
+	// Pre-window jump at offset 72 (0x48, next IP 0x5555_0000_004D) to an island
+	// 4015 pages below (0x5555_0000_0000 - 4015*0x1000) produces rel = 0xFF05_0FB3
+	// (E9 B3 0F 05 FF) at slot offset 0, which encodeJmpSite must reject while
+	// accepting slot offset 128 (rel = 0xFF05_1033).
+	prePage := pageWith(72, 0x48, 0x89, 0x1c, 0x24, 0x90, 0x0f, 0x05)
+	const preBase = uint64(0x5555_0000_0000)
+	const islBase = preBase - 4015*0x1000
+	if _, err := encodeJmpSite(prePage, 72, 5, preBase+72, islBase); err == nil {
+		t.Fatalf("encodeJmpSite accepted E9 displacement containing 0F 05 at slot offset 0")
+	}
+	if _, err := encodeJmpSite(prePage, 72, 5, preBase+72, islBase+2*winSlotSize); err != nil {
+		t.Fatalf("encodeJmpSite rejected collision-free slot offset 128: %v", err)
 	}
 }

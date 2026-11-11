@@ -35,11 +35,11 @@ import (
 )
 
 // requireGuestBackend skips a test that runs a guest when the host has no
-// engine for it. macOS runs guests on the hypervisor only. Windows falls back
-// to the systrap engine, which needs no hypervisor.
+// engine for it. macOS runs guests on the hypervisor only. Windows requires
+// whpx for PlatformAuto unless GVX_ALLOW_NO_HYPERVISOR=1 enables systrap.
 func requireGuestBackend(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || (runtime.GOOS == "windows" && os.Getenv(hvtest.AllowNoHypervisorEnv) != "1") {
 		hvtest.Require(t)
 	}
 }

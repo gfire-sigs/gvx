@@ -144,6 +144,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	}
 
 	platformFlag := fs.String("platform", string(gvx.PlatformAuto), "Execution backend (auto, whpx, hvf, or systrap) or image platform (linux/amd64 or linux/arm64)")
+	allowUnconfinedSystrapFlag := fs.Bool("allow-unconfined-systrap", false, "Allow -platform=auto on Windows to fall back to systrap when whpx is unavailable")
 	archFlag := fs.String("arch", runtime.GOARCH, "Guest Linux architecture: amd64 or arm64")
 	var netFlag string
 	alias([]string{"net", "network"}, func(n string) {
@@ -343,6 +344,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 
 	cfg := gvx.Config{
 		Platform:               backend,
+		AllowUnconfinedSystrap: *allowUnconfinedSystrapFlag,
 		Architecture:           arch,
 		NetworkMode:            netMode,
 		IsolateLAN:             *isolateLANFlag,
@@ -429,6 +431,9 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		if reason := sb.FallbackReason(); reason != "" {
 			_, _ = fmt.Fprintf(stderr, "rungv: warning: the hardware hypervisor is not available, so the guest runs on %s, which is slower: %s\n", sb.PlatformName(), reason)
 		}
+	}
+	if !sb.SecurityPosture().HardwareOrKernelSyscallIsolation {
+		_, _ = fmt.Fprintln(stderr, "rungv: warning: Windows systrap lacks hardware or kernel syscall isolation; use whpx for untrusted workloads")
 	}
 	if rc.cfg.DisableHostLockdown {
 		_, _ = fmt.Fprintln(stderr, "rungv: warning: host lockdown disabled")

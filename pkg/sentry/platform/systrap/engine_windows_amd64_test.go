@@ -578,3 +578,112 @@ func TestPatchKeepsTheAddressWhereAThreadContinues(t *testing.T) {
 		t.Errorf("the SYSCALL before %#x stayed a trap after the thread stopped: site %+v", ret, s)
 	}
 }
+
+func TestHiddenSyscallInImmediateTrapsInteriorJumpAndPreservesFallthrough(t *testing.T) {
+	p := newFastPlatform(t)
+
+	t.Run("fallthrough_preserves_imm64", func(t *testing.T) {
+		r := newRig(t, p)
+		const wantImm = uint64(0x8877_6655_4433_050F)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, imm64([]byte{0x48, 0xB8}, wantImm)...) // movabs rax, 0x887766554433050f
+		prog = append(prog, 0x48, 0x89, 0xC3)                      // mov rbx, rax
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+		if got := r.ac.StateData().Regs.Rbx; got != wantImm {
+			t.Fatalf("movabs rax with embedded 0F 05 loaded %#x, want %#x", got, wantImm)
+		}
+	})
+
+	t.Run("direct_interior_jump_traps_to_sentry", func(t *testing.T) {
+		r := newRig(t, p)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, 0xB8, 39, 0, 0, 0) // mov eax, 39
+		prog = append(prog, 0xEB, 0x02)        // jmp +2 into the 0F 05 inside movabs rcx, imm64
+		exitVA := codeVA + uint64(len(prog)) + 2
+		prog = append(prog, 0x48, 0xB9, 0x0F, 0x05, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
+		prog = append(prog, 0x0F, 0x0B) // ud2 if host NT syscall ran instead of Sentry trap
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 39, r.ac)
+		if got := regPC(r.ac); got != exitVA+2 {
+			t.Fatalf("interior jump trapped with Rip=%#x, want %#x", got, exitVA+2)
+		}
+	})
+
+	t.Run("indirect_interior_jump_traps_to_sentry", func(t *testing.T) {
+		r := newRig(t, p)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		movIdx := 64 + 10 + 5 + 2
+		exitVA := codeVA + uint64(movIdx) + 2
+		prog = append(prog, imm64([]byte{0x48, 0xB9}, exitVA)...) // movabs rcx, exitVA
+		prog = append(prog, 0xB8, 39, 0, 0, 0)                    // mov eax, 39
+		prog = append(prog, 0xFF, 0xE1)                           // jmp rcx
+		prog = append(prog, 0x48, 0xBA, 0x0F, 0x05, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
+		prog = append(prog, 0x0F, 0x0B) // ud2
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 39, r.ac)
+		if got := regPC(r.ac); got != exitVA+2 {
+			t.Fatalf("indirect interior jump trapped with Rip=%#x, want %#x", got, exitVA+2)
+		}
+	})
+
+	t.Run("vector_load_with_0f05_disp_runs_in_guard_slot", func(t *testing.T) {
+		r := newRig(t, p)
+		const vecPageVA = codeVA + 0x10000
+		vecPage := r.mapPage(vecPageVA, hostarch.ReadWrite)
+		const targetOff = 0x50F
+		store64(vecPage[targetOff:], 0x1122_3344_5566_7788)
+		store64(vecPage[targetOff+8:], 0x99AA_BBCC_DDEE_FF00)
+
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, imm64([]byte{0x48, 0xB9}, vecPageVA)...)        // movabs rcx, vecPageVA
+		prog = append(prog, imm64([]byte{0x48, 0xBB}, 0xCAFE_BABE_1234)...) // sentinel in rbx
+		// movups xmm0, [rcx + 0x0000050f] (0f 10 81 0f 05 00 00)
+		prog = append(prog, 0x0F, 0x10, 0x81, 0x0F, 0x05, 0x00, 0x00)
+		// movups [rcx + 0x100], xmm0 (0f 11 81 00 01 00 00)
+		prog = append(prog, 0x0F, 0x11, 0x81, 0x00, 0x01, 0x00, 0x00)
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+		if got := load64(vecPage[0x100:]); got != 0x1122_3344_5566_7788 {
+			t.Fatalf("low qword of stored xmm0 = %#x, want 0x1122334455667788", got)
+		}
+		if got := load64(vecPage[0x108:]); got != 0x99AA_BBCC_DDEE_FF00 {
+			t.Fatalf("high qword of stored xmm0 = %#x, want 0x99aabbccddeeff00", got)
+		}
+		if got := r.ac.StateData().Regs.Rbx; got != 0xCAFE_BABE_1234 {
+			t.Fatalf("scratch execution clobbered RBX = %#x, want 0xcafebabe1234", got)
+		}
+	})
+
+	t.Run("int2e_traps_with_sigsegv", func(t *testing.T) {
+		r := newRig(t, p)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		intVA := codeVA + uint64(len(prog))
+		prog = append(prog, 0xCD, 0x2E) // int 0x2e
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		if si == nil || err == nil || si.Signo != int32(linux.SIGSEGV) {
+			t.Fatalf("int 0x2e produced si=%+v err=%v, want SIGSEGV", si, err)
+		}
+		if got := regPC(r.ac); got != intVA {
+			t.Fatalf("int 0x2e Rip = %#x, want %#x", got, intVA)
+		}
+	})
+}

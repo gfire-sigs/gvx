@@ -142,8 +142,8 @@ func (p *Platform) prepareFast() error {
 	if err != nil {
 		return fmt.Errorf("generate the spill routine: %w", err)
 	}
-	if len(sc.code) > winCodeSize-winSpillOffset {
-		return fmt.Errorf("the spill routine has %d bytes and the engine pages leave %d", len(sc.code), winCodeSize-winSpillOffset)
+	if len(sc.code) > winSpillMaxSize {
+		return fmt.Errorf("the spill routine has %d bytes and the spill region leaves %d", len(sc.code), winSpillMaxSize)
 	}
 	for _, proc := range []*windows.LazyProc{procNtSetEvent, procNtWaitForSingleObject} {
 		if err := proc.Find(); err != nil {
@@ -252,6 +252,9 @@ type fastThread struct {
 	recycled bool
 	// trap describes the trap that put the thread in the spill routine.
 	trap winTrap
+	// coldTarget holds the Sentry-computed target PC of a cold resume so
+	// fastExit never reads Target back from untrusted shared memory.
+	coldTarget uint64
 	// resume is the state that the next run publishes.
 	resume uint32
 	// traps counts the system calls that the thread served through the fast
@@ -497,15 +500,17 @@ func (th *thread) waitNext() (ev debugEvent, trapped bool, err error) {
 // fastTrapLocked reads the registers of a trap into ac. Callers hold mu.
 func (th *thread) fastTrapLocked(as *addressSpace, f *fastThread, ac *arch.Context64) error {
 	sm := f.slot.sm
-	site, ok := as.slotAtTail(sm.Tail)
+	tail := sm.tail().Load()
+	site, ok := as.slotAtTail(tail)
 	if !ok {
-		return fmt.Errorf("the stub trapped from unknown slot %#x", sm.Tail)
+		return fmt.Errorf("the stub trapped from unknown slot %#x", tail)
 	}
+	regs := sm.Regs.snapshot()
 	// The thread waits in the spill routine and can leave only through the tail
 	// of this slot or through the Sentry. The pin keeps the slot until then.
-	f.slot.reader.goOffline(sm.Tail - winSlotTailOffset)
-	f.trap = newWinTrap(site, &sm.Regs)
-	sm.Regs.storeTo(ac, f.trap.ret)
+	f.slot.reader.goOffline(tail - winSlotTailOffset)
+	f.trap = newWinTrap(site, &regs)
+	regs.storeTo(ac, f.trap.ret)
 	th.archFastTrap(ac)
 	f.inSpill = true
 	f.traps.Add(1)
@@ -532,7 +537,9 @@ func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) erro
 		}
 	}
 	sm.Regs.loadFrom(ac)
-	sm.Target = archPC(ac)
+	target := archPC(ac)
+	f.coldTarget = target
+	sm.target().Store(target)
 	th.stepping = false
 	th.lastExecPC, th.execRepeats = 0, 0
 	return nil
@@ -566,7 +573,7 @@ func (th *thread) fastExit(ac *arch.Context64, ev debugEvent) outcome {
 	} else {
 		f.colds.Add(1)
 	}
-	th.ctx.setPC(f.slot.sm.Target)
+	th.ctx.setPC(f.coldTarget)
 	if err := th.park(ev); err != nil {
 		return fatal(err, unix.EFAULT)
 	}

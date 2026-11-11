@@ -69,13 +69,22 @@ const (
 	// code pages.
 	slotBase   = codeSize
 	slotStride = 16
+
+	// guardCodeBase and guardDataBase locate the per-thread scratch slots that
+	// execute sanitized non-GPR instructions covered by amd64SiteGuardedInsn.
+	guardCodeBase   = winGuardCodeOffset
+	guardCodeStride = 28
+	guardDataBase   = slotBase + maxSlots*slotStride
+	guardDataStride = 16
 )
 
-// The trampolines end where the spill routine starts, and the data slots fit in
-// the data pages of the engine.
+// The trampolines end where the spill routine starts, the guarded-site code
+// slots fit behind the spill region, and the data slots fit in the data pages
+// of the engine.
 var (
 	_ = [winSpillOffset - maxSlots*trampStride]struct{}{}
-	_ = [winEnginePagesSize - slotBase - maxSlots*slotStride]struct{}{}
+	_ = [winCodeSize - guardCodeBase - maxSlots*guardCodeStride]struct{}{}
+	_ = [winEnginePagesSize - guardDataBase - maxSlots*guardDataStride]struct{}{}
 )
 
 // fetchWindow is the longest instruction in bytes. A fetch of one instruction
@@ -114,6 +123,14 @@ type archThread struct {
 	// this address with a JMP. It is zero when the thread continued in a slot,
 	// and after the thread stops. continueAt writes it under as.mu.
 	restartPC atomic.Uint64
+	// guardSite records the active amd64SiteGuardedInsn address while the thread
+	// runs a sanitized instruction in its per-thread scratch slot.
+	guardSite        uint64
+	guardResume      uint64
+	guardSavedVal    uint64
+	guardInsnLen     uint8
+	guardScratchReg  uint8
+	guardScratchUsed bool
 }
 
 func configureArch() {}
@@ -126,6 +143,12 @@ func (th *thread) resetArch() {
 		sum uint64
 		n   int
 	}{}
+	th.guardSite = 0
+	th.guardResume = 0
+	th.guardSavedVal = 0
+	th.guardInsnLen = 0
+	th.guardScratchReg = 0
+	th.guardScratchUsed = false
 }
 
 func (th *thread) releaseArch() {
@@ -155,6 +178,14 @@ func (th *thread) ensureSlot() (int, error) {
 }
 
 func trampAddr(slot int) uint64 { return internalBase + uint64(slot)*trampStride }
+
+func guardCodeAddr(slot int) uint64 {
+	return internalBase + guardCodeBase + uint64(slot)*guardCodeStride
+}
+
+func inGuardCode(pc uint64) bool {
+	return pc >= internalBase+guardCodeBase && pc < internalBase+guardCodeBase+maxSlots*guardCodeStride
+}
 
 // writeInternalCode fills the code pages of the window with one trampoline for
 // each slot. The rest holds INT3, so a stray jump traps.
@@ -340,6 +371,15 @@ func (as *addressSpace) relocatedEntryLocked(pc uint64, syscall bool, reader *ep
 // cancellation check must see the address that the instruction has in the
 // original code.
 func (th *thread) guestPC(pc uint64) uint64 {
+	if inGuardCode(pc) && th.guardSite != 0 && th.slot != 0 {
+		slotAddr := guardCodeAddr(th.slot - 1)
+		if pc == slotAddr {
+			return th.guardSite
+		}
+		if pc > slotAddr && pc < slotAddr+guardCodeStride {
+			return th.guardResume
+		}
+	}
 	as := th.sp.owner.Load()
 	if as == nil {
 		return pc
@@ -375,7 +415,57 @@ func (as *addressSpace) jumpTailLocked(pc uint64, reader *epochReader) (uint64, 
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(ac *arch.Context64) {
 	r := &ac.StateData().Regs
-	r.Rip = th.guestPC(r.Rip)
+	rawPC := r.Rip
+	if inGuardCode(rawPC) && th.guardSite != 0 && th.slot != 0 {
+		slotAddr := guardCodeAddr(th.slot - 1)
+		if rawPC >= slotAddr && rawPC < slotAddr+guardCodeStride {
+			if th.guardScratchUsed && rawPC <= slotAddr+uint64(th.guardInsnLen) {
+				putArchGPR(&r.PtraceRegs, th.guardScratchReg, th.guardSavedVal)
+			}
+			r.Rip = th.guestPC(rawPC)
+			th.guardSite = 0
+			th.guardScratchUsed = false
+			return
+		}
+	}
+	r.Rip = th.guestPC(rawPC)
+}
+
+func putArchGPR(r *linux.PtraceRegs, reg uint8, val uint64) {
+	switch reg {
+	case 0:
+		r.Rax = val
+	case 1:
+		r.Rcx = val
+	case 2:
+		r.Rdx = val
+	case 3:
+		r.Rbx = val
+	case 4:
+		r.Rsp = val
+	case 5:
+		r.Rbp = val
+	case 6:
+		r.Rsi = val
+	case 7:
+		r.Rdi = val
+	case 8:
+		r.R8 = val
+	case 9:
+		r.R9 = val
+	case 10:
+		r.R10 = val
+	case 11:
+		r.R11 = val
+	case 12:
+		r.R12 = val
+	case 13:
+		r.R13 = val
+	case 14:
+		r.R14 = val
+	case 15:
+		r.R15 = val
+	}
 }
 
 // inEngineCode reports whether pc lies in the engine pages or in a trampoline
@@ -465,8 +555,203 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		return running, true
 	case amd64SiteGSMem:
 		return th.emulateGSMemSite(as, ac, ev, site)
+	case amd64SiteInt2E:
+		th.ctx.setPC(ev.Addr)
+		if err := th.stopAndPull(ac, ev); err != nil {
+			return fatal(err, unix.EFAULT), true
+		}
+		si := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: linux.SI_KERNEL}
+		return outcome{done: true, si: si, err: platform.ErrContextSignal}, true
+	case amd64SiteSysenter:
+		th.ctx.setPC(ev.Addr)
+		if err := th.stopAndPull(ac, ev); err != nil {
+			return fatal(err, unix.EFAULT), true
+		}
+		si := &linux.SignalInfo{Signo: int32(linux.SIGILL), Code: illIllOpc}
+		si.SetAddr(ev.Addr)
+		return outcome{done: true, si: si, err: platform.ErrContextSignal}, true
+	case amd64SiteGuardedInsn:
+		return th.emulateGuardedSite(as, ac, ev, site)
 	}
 	return outcome{}, false
+}
+
+// emulateGuardedSite executes the unmodified outer instruction at ev.Addr that
+// covers an embedded raw kernel-entry byte pair without exposing the raw bytes
+// to direct branches.
+func (th *thread) emulateGuardedSite(as *addressSpace, ac *arch.Context64, ev debugEvent, site siteInfo) (outcome, bool) {
+	code := as.codeBytes(ev.Addr, int(site.length))
+	if len(code) < int(site.length) {
+		return outcome{}, false
+	}
+	var regs [16]uint64
+	for i := range regs {
+		regs[i] = th.ctx.u64(ctxOffRax + 8*i)
+	}
+	eflags := th.ctx.u32(ctxOffEFlags)
+	var preciseFaultAddr uint64
+	readMem := func(addr uint64, buf []byte) bool {
+		if as.readGuest(addr, buf) {
+			return true
+		}
+		preciseFaultAddr = addr
+		if len(buf) > 1 && as.inGuestRange(addr, len(buf)) {
+			nextPage := blockRound(addr) + blockSize
+			if nextPage > addr && nextPage < addr+uint64(len(buf)) {
+				var probe [8]byte
+				firstLen := int(nextPage - addr)
+				if as.readGuest(addr, probe[:firstLen]) {
+					preciseFaultAddr = nextPage
+				}
+			}
+		}
+		return false
+	}
+	writeMem := func(addr uint64, buf []byte) bool {
+		if !as.inGuestRange(addr, len(buf)) {
+			preciseFaultAddr = addr
+			return false
+		}
+		end := addr + uint64(len(buf))
+		for pg := blockRound(addr); pg <= blockRound(end-1); pg += blockSize {
+			if pg != blockRound(ev.Addr) {
+				_, _ = as.aliasWriteFault(max(addr, pg))
+				_, _ = as.restoreData(pg)
+			}
+		}
+		ok, badAddr := as.writeGuestSpanWritable(addr, buf)
+		if !ok {
+			preciseFaultAddr = badAddr
+		}
+		return ok
+	}
+	fsBase := ac.StateData().Regs.Fs_base
+	gsBase := ac.StateData().Regs.Gs_base
+	var nextPC uint64
+	res := emulateGuardedX86Insn(code, ev.Addr, fsBase, gsBase, &regs, &eflags, &nextPC, readMem, writeMem)
+	if res.fault {
+		fAddr := res.faultAddr
+		if preciseFaultAddr != 0 {
+			fAddr = preciseFaultAddr
+		}
+		return th.guardedFaultStop(as, ac, ev, fAddr, res.faultWrite), true
+	}
+	if res.ok {
+		for i := range regs {
+			th.ctx.put64(ctxOffRax+8*i, regs[i])
+		}
+		th.ctx.put32(ctxOffEFlags, eflags)
+		th.ctx.setPC(th.resumePC(nextPC))
+		if err := th.continueEvent(ev); err != nil {
+			return fatal(err, unix.EFAULT), true
+		}
+		return running, true
+	}
+	return th.runGuardedScratch(as, ac, ev, site, code, fsBase, gsBase, &regs)
+}
+
+func (th *thread) guardedFaultStop(as *addressSpace, ac *arch.Context64, ev debugEvent, faultAddr uint64, write bool) outcome {
+	th.ctx.setPC(ev.Addr)
+	if err := th.stopAndPull(ac, ev); err != nil {
+		return fatal(err, unix.EFAULT)
+	}
+	at := hostarch.Read
+	if write {
+		at = hostarch.Write
+	}
+	sigCode := int32(segvMapErr)
+	if as.mapped(faultAddr) {
+		sigCode = segvAccErr
+	}
+	si := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: sigCode}
+	si.SetAddr(faultAddr)
+	return outcome{done: true, si: si, at: at, err: platform.ErrContextSignal}
+}
+
+// runGuardedScratch executes a sanitized instruction (such as an SSE, AVX, FPU,
+// or LOCK instruction whose displacement or immediate held raw kernel-entry
+// bytes, or a non-memory non-GPR instruction on a cross-instruction seam)
+// inside the thread's engine-page scratch slot.
+func (th *thread) runGuardedScratch(as *addressSpace, ac *arch.Context64, ev debugEvent, site siteInfo, code []byte, fsBase, gsBase uint64, regs *[16]uint64) (outcome, bool) {
+	plan, ok := planGuardedScratchInsn(code, ev.Addr, fsBase, gsBase, regs)
+	if !ok || len(plan.insn) == 0 || len(plan.insn) > amd64MaxInsnLen {
+		return outcome{}, false
+	}
+	var savedVal uint64
+	if plan.useScratch {
+		accessLen := 1
+		if inst, err := decodeX86(code); err == nil && inst.MemBytes > 0 {
+			accessLen = inst.MemBytes
+		}
+		if !as.inGuestRange(plan.effAddr, accessLen) {
+			return th.guardedFaultStop(as, ac, ev, plan.effAddr, false), true
+		}
+		savedVal = regs[plan.scratchReg]
+	}
+	slot, err := th.ensureSlot()
+	if err != nil {
+		return fatal(err, unix.EFAULT), true
+	}
+	resumeAddr := th.resumePC(ev.Addr + uint64(site.length))
+
+	codeOff := guardCodeBase + slot*guardCodeStride
+	dataOff := guardDataBase + slot*guardDataStride
+	dataBuf := th.sp.internal.local[dataOff : dataOff+guardDataStride]
+	binary.LittleEndian.PutUint64(dataBuf[0:], savedVal)
+	binary.LittleEndian.PutUint64(dataBuf[8:], resumeAddr)
+
+	codeBuf := th.sp.internal.local[codeOff : codeOff+guardCodeStride]
+	L := copy(codeBuf, plan.insn)
+	pos := L
+	if plan.useScratch {
+		// mov <scratchReg64>, [rip + disp1]
+		rex := byte(0x48)
+		if plan.scratchReg >= 8 {
+			rex = 0x4C
+		}
+		codeBuf[pos] = rex
+		codeBuf[pos+1] = 0x8B
+		codeBuf[pos+2] = ((plan.scratchReg & 7) << 3) | 0x05
+		disp1 := int32(dataOff - (codeOff + pos + 7))
+		binary.LittleEndian.PutUint32(codeBuf[pos+3:], uint32(disp1))
+		pos += 7
+	}
+	// jmp qword ptr [rip + disp2]
+	codeBuf[pos] = 0xFF
+	codeBuf[pos+1] = 0x25
+	disp2 := int32((dataOff + 8) - (codeOff + pos + 6))
+	binary.LittleEndian.PutUint32(codeBuf[pos+2:], uint32(disp2))
+	pos += 6
+	for i := pos; i < guardCodeStride; i++ {
+		codeBuf[i] = amd64INT3
+	}
+	if hasRawKernelExit(codeBuf[:guardCodeStride]) {
+		for i := 0; i < guardCodeStride; i++ {
+			codeBuf[i] = amd64INT3
+		}
+		return outcome{}, false
+	}
+	slotAddr := guardCodeAddr(slot)
+	if err := flushInstructionCache(th.sp.proc, uintptr(slotAddr), guardCodeStride); err != nil {
+		return fatal(err, unix.EFAULT), true
+	}
+
+	th.guardSite = ev.Addr
+	th.guardResume = resumeAddr
+	th.guardSavedVal = savedVal
+	th.guardInsnLen = uint8(L)
+	th.guardScratchReg = plan.scratchReg
+	th.guardScratchUsed = plan.useScratch
+	if plan.useScratch {
+		th.ctx.put64(ctxOffRax+8*int(plan.scratchReg), plan.effAddr)
+	}
+	th.ctx.setPC(slotAddr)
+	if err := th.continueEvent(ev); err != nil {
+		th.guardSite = 0
+		th.guardScratchUsed = false
+		return fatal(err, unix.EFAULT), true
+	}
+	return running, true
 }
 
 // emulateGSMemSite emulates a trapped GS-segment memory instruction in the stub
@@ -568,6 +853,42 @@ func (as *addressSpace) writeGuestWritable(addr uint64, buf []byte) bool {
 	var n uintptr
 	err := windows.WriteProcessMemory(as.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
 	return err == nil && n == uintptr(len(buf))
+}
+
+// writeGuestSpanWritable writes buf to guest memory at addr when every region
+// covering [addr, addr+len(buf)) is committed and writable in the stub view.
+// When a region is unmapped or read-only, it returns false and the first
+// faulting address without modifying memory.
+func (as *addressSpace) writeGuestSpanWritable(addr uint64, buf []byte) (bool, uint64) {
+	if !as.inGuestRange(addr, len(buf)) {
+		return false, addr
+	}
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released {
+		return false, addr
+	}
+	end := addr + uint64(len(buf))
+	for cur := addr; cur < end; {
+		var mbi windows.MemoryBasicInformation
+		if err := windows.VirtualQueryEx(as.sp.proc, uintptr(cur), &mbi, unsafe.Sizeof(mbi)); err != nil {
+			return false, cur
+		}
+		if mbi.State != windows.MEM_COMMIT || (mbi.Protect != windows.PAGE_READWRITE && mbi.Protect != windows.PAGE_EXECUTE_READWRITE) {
+			return false, cur
+		}
+		regionEnd := uint64(mbi.BaseAddress) + uint64(mbi.RegionSize)
+		if regionEnd <= cur {
+			return false, cur
+		}
+		cur = regionEnd
+	}
+	var n uintptr
+	err := windows.WriteProcessMemory(as.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
+	if err != nil || n != uintptr(len(buf)) {
+		return false, addr + uint64(n)
+	}
+	return true, 0
 }
 
 // emulateFSAccess runs the memory instruction at pc, which addresses memory
@@ -737,25 +1058,27 @@ func archStatsLine() string {
 // compiler keeps beside its code. The guest reads the bytes of the copy that
 // runs, and the scan finds false sites in that data, so a patch would change
 // the data.
-func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, writable bool, continuations []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, error) {
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, writable bool, continuations []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, []uint16, error) {
 	before := as.neighborBytes(base, true, amd64ScanLead)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
 	found := scanAMD64GS(before, page, after, true)
-	if len(found) == 0 {
-		return nil, nil, nil, nil
+	hasRaw := hasRemainingKernelExit(before, page, after)
+	if len(found) == 0 && !hasRaw {
+		return nil, nil, nil, nil, nil
 	}
 	scope := as.p.scopeOf(ctx, mm, base)
-	if writable && scope.none {
-		return nil, nil, nil, nil
+	if writable && scope.unbacked {
+		return nil, nil, nil, nil, nil
 	}
+	origPage := append([]byte(nil), page...)
 	var plan *jmpPlanner
-	if as.p.fast {
+	if as.p.fast && len(found) > 0 {
 		// The plan reads the original bytes, because an earlier patch changes
 		// the page. A wider neighbor window catches branches that start more
 		// than one instruction before or after the page boundary.
 		jmpBefore := as.neighborBytes(base, true, winJmpNeighborLen)
 		jmpAfter := as.neighborBytes(base, false, winJmpNeighborLen)
-		plan = newJmpPlanner(jmpBefore, append([]byte(nil), page...), jmpAfter)
+		plan = newJmpPlanner(jmpBefore, origPage, jmpAfter)
 		for _, pc := range continuations {
 			plan.restartAt(int(pc - base))
 		}
@@ -763,6 +1086,16 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	var keep []amd64Site
 	var slots []winSlotRef
 	var spans []patchSpan
+	var prevTail []uint16
+	addPrevTail := func(negOff int) {
+		if blockSize+negOff < 0 {
+			return
+		}
+		want := uint16(blockSize + negOff)
+		if !slices.Contains(prevTail, want) {
+			prevTail = append(prevTail, want)
+		}
+	}
 	sites := make(map[uint16]siteInfo, len(found))
 	// jumpEnd is the end of the bytes that the last JMP patch owns. prevEnd is
 	// the end of every site that the loop met. A pre-window patch must not
@@ -837,15 +1170,59 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		keep = append(keep, s)
 		if s.Offset >= 0 {
 			sites[uint16(s.Offset)] = siteInfo{kind: s.Kind, reg: s.Reg, wide: s.Wide, length: uint8(s.Len)}
+		} else {
+			addPrevTail(s.Offset)
 		}
 	}
 	if _, err := patchAMD64(page, keep); err != nil {
 		as.mu.Lock()
 		discardSlotRefsLocked(slots)
 		as.mu.Unlock()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return sites, slots, spans, nil
+	if hidden := scanAMD64HiddenExits(before, origPage, after, page); len(hidden) > 0 {
+		// Neutralize remaining raw kernel-exit byte pairs across the entire
+		// executable page without trusting optional ELF SHF_EXECINSTR section
+		// headers, while preserving fast-path E9 jump spans written above.
+		inJumpSpan := func(off int) bool {
+			for _, sp := range spans {
+				if off >= sp.lo-1 && off < sp.hi {
+					return true
+				}
+			}
+			return false
+		}
+		var filtered []amd64HiddenExit
+		for _, h := range hidden {
+			if h.ExitOffset < 0 && base < blockSize {
+				continue
+			}
+			if h.ExitOffset >= 0 && h.ExitOffset < len(page) && inJumpSpan(h.ExitOffset) {
+				continue
+			}
+			if h.HasOuter {
+				if h.OuterOffset < 0 && base < blockSize {
+					h.HasOuter = false
+				} else if h.OuterOffset >= 0 && h.OuterOffset < len(page) && inJumpSpan(h.OuterOffset) {
+					h.HasOuter = false
+				}
+			}
+			if h.ExitOffset >= len(page) && (!h.HasOuter || h.OuterOffset >= len(page)) {
+				continue
+			}
+			filtered = append(filtered, h)
+		}
+		added, hiddenPrev := applyAMD64HiddenExits(page, origPage, filtered)
+		for _, s := range added {
+			sites[uint16(s.Offset)] = siteInfo{kind: s.Kind, length: uint8(s.Len)}
+		}
+		for _, off := range hiddenPrev {
+			if !slices.Contains(prevTail, off) {
+				prevTail = append(prevTail, off)
+			}
+		}
+	}
+	return sites, slots, spans, prevTail, nil
 }
 
 // patchJump replaces the SYSCALL at offset off of page and the bytes behind it
@@ -854,13 +1231,17 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 // when the site keeps its trap.
 func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, off int, reloc []byte) (int, uint64, winSlotRef, bool) {
 	site := base + uint64(off)
+	spanLen := max(winJmpLen, winSiteLen+len(reloc))
 	rec := plainSlot(site, winSlotSize)
 	rec.resume = site + winSiteLen + uint64(len(reloc))
 	slotVA, ref, err := as.installSlot(ctx, mm, rec, func(buf []byte, slotVA uint64) error {
+		if _, err := encodeJmpSite(page, off, spanLen, site, slotVA); err != nil {
+			return err
+		}
 		return encodeWinSlot(buf, slotVA, site, as.p.spillVA(), reloc)
 	})
 	if err == nil {
-		if err = patchJmp(page, off, site, slotVA); err != nil {
+		if err = patchJmpSite(page, off, spanLen, site, slotVA); err != nil {
 			as.mu.Lock()
 			ref.isl.discard(ref.off, ref.size)
 			as.mu.Unlock()
@@ -875,6 +1256,27 @@ func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager
 	}
 	siteStats.post.Add(1)
 	return off + winSiteLen + len(reloc), slotVA + winSlotTailOffset, ref, true
+}
+
+func initIslandBytes(b []byte) {
+	for i := range b {
+		b[i] = amd64INT3
+	}
+}
+
+func slotSeamSafe(page []byte, off, size uint32) bool {
+	lo := int(off)
+	if lo > 0 {
+		lo--
+	}
+	hi := min(len(page), int(off+size)+1)
+	if hasRawKernelExit(page[lo:hi]) {
+		for i := off; i < off+size && int(i) < len(page); i++ {
+			page[i] = amd64INT3
+		}
+		return false
+	}
+	return true
 }
 
 // preWindowPatch describes a pre-window patch that patchJumpBefore installed.
@@ -898,6 +1300,9 @@ func (as *addressSpace) patchJumpBefore(ctx context.Context, mm platform.MemoryM
 	site, jmpVA := base+uint64(off), base+uint64(pl.start)
 	rec := islandSlot{site: site, size: winSlotSize, jmpVA: jmpVA, resume: site + winSiteLen, insn: insn}
 	slotVA, ref, err := as.installSlot(ctx, mm, rec, func(buf []byte, slotVA uint64) error {
+		if _, err := encodeJmpSite(page, pl.start, off-pl.start, jmpVA, slotVA); err != nil {
+			return err
+		}
 		return encodeWinPreSlot(buf, slotVA, site, as.p.spillVA(), pl.reloc)
 	})
 	if err == nil {
@@ -928,6 +1333,9 @@ func (as *addressSpace) patchTLSBaseJump(ctx context.Context, mm platform.Memory
 	site := base + uint64(s.Offset)
 	isGS := s.Kind == amd64SiteRDGSBASE
 	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winTLSSlotSize), func(buf []byte, slotVA uint64) error {
+		if _, err := encodeJmpSite(page, s.Offset, s.Len, site, slotVA); err != nil {
+			return err
+		}
 		return encodeWinTLSBaseSlot(buf, slotVA, site, s.Len, s.Reg, s.Wide, isGS)
 	})
 	if err == nil {
@@ -956,6 +1364,9 @@ func (as *addressSpace) patchGSMovJump(ctx context.Context, mm platform.MemoryMa
 	}
 	site := base + uint64(s.Offset)
 	slotVA, ref, err := as.installSlot(ctx, mm, plainSlot(site, winGSMovSlotSize), func(buf []byte, slotVA uint64) error {
+		if _, err := encodeJmpSite(page, s.Offset, s.Len, site, slotVA); err != nil {
+			return err
+		}
 		return encodeWinGSMovSlot(buf, slotVA, site, s.Len, gp)
 	})
 	if err == nil {
@@ -978,6 +1389,18 @@ func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *d
 		return false, nil
 	}
 	pc := th.ctx.pc()
+	if inGuardCode(pc) && th.guardSite != 0 && th.slot != 0 {
+		slotAddr := guardCodeAddr(th.slot - 1)
+		if pc == slotAddr {
+			if th.guardScratchUsed {
+				th.ctx.put64(ctxOffRax+8*int(th.guardScratchReg), th.guardSavedVal)
+			}
+			th.ctx.setPC(th.guardSite)
+			th.guardSite = 0
+			th.guardScratchUsed = false
+			return true, nil
+		}
+	}
 	slot, slotVA, ok := as.slotContaining(pc)
 	if !ok {
 		return false, nil
@@ -1027,7 +1450,7 @@ func (th *thread) archFastHot(*arch.Context64) bool { return true }
 // routine to jump directly to the entry address of the new guest context
 // through the hot resume path without raising a debug trap.
 func (th *thread) archFastRecycleStart(f *fastThread, ac *arch.Context64) uint32 {
-	f.slot.sm.Tail = th.startPC(archPC(ac))
+	f.slot.sm.tail().Store(th.startPC(archPC(ac)))
 	return winStateRunHot
 }
 

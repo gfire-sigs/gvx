@@ -179,6 +179,55 @@ func TestOpenAuto(t *testing.T) {
 			t.Fatalf("openAuto error = %v, want it to wrap both backend errors", err)
 		}
 	})
+	t.Run("windows fails closed without opt-in", func(t *testing.T) {
+		var fbCalls int
+		whpxErr := fmt.Errorf("gvx: open whpx backend: %w", whpx.ErrUnsupported)
+		failWHPX := func() (platform.Platform, string, error) { return nil, "", whpxErr }
+		_, err := openAutoForOS("windows", failWHPX, named("systrap", &fbCalls), false)
+		if err == nil {
+			t.Fatal("openAutoForOS(windows, allowUnconfined=false) succeeded without whpx")
+		}
+		if fbCalls != 0 {
+			t.Fatalf("fallback calls = %d, want 0 when allowUnconfinedSystrap is false", fbCalls)
+		}
+		if !errors.Is(err, ErrPlatformUnavailable) || !errors.Is(err, whpx.ErrUnsupported) {
+			t.Fatalf("error = %v, want ErrPlatformUnavailable and whpx.ErrUnsupported", err)
+		}
+		if !strings.Contains(err.Error(), "AllowUnconfinedSystrap") || !strings.Contains(err.Error(), "-allow-unconfined-systrap") {
+			t.Fatalf("error = %q, want AllowUnconfinedSystrap and -allow-unconfined-systrap guidance", err)
+		}
+	})
+	t.Run("windows falls back with explicit opt-in", func(t *testing.T) {
+		var fbCalls int
+		got, err := openAutoForOS("windows", failHW, named("systrap", &fbCalls), true)
+		if err != nil || got.name != "systrap" || fbCalls != 1 || !errors.Is(got.fallbackFrom, hwErr) {
+			t.Fatalf("openAutoForOS(windows, allowUnconfined=true) = (%q, fallback=%v, err=%v) calls=%d", got.name, got.fallbackFrom, err, fbCalls)
+		}
+	})
+}
+
+func TestSecurityPostureClassifiesBackends(t *testing.T) {
+	lockdown := hostlockdown.Status{Applied: true}
+	for _, tc := range []struct {
+		name     string
+		goos     string
+		plat     string
+		wantMode SyscallIsolationMode
+		wantHard bool
+	}{
+		{"windows whpx", "windows", "whpx", SyscallIsolationHardware, true},
+		{"darwin hvf", "darwin", "hvf", SyscallIsolationHardware, true},
+		{"linux systrap", "linux", "systrap", SyscallIsolationKernel, true},
+		{"windows systrap unconfined", "windows", "systrap", SyscallIsolationUserModePatch, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &Sandbox{platName: tc.plat, lockdown: lockdown}
+			got := securityPostureFor(tc.goos, sb.platName, sb.lockdown)
+			if got.Platform != tc.plat || got.SyscallIsolation != tc.wantMode || got.HardwareOrKernelSyscallIsolation != tc.wantHard || !got.Lockdown.Applied {
+				t.Fatalf("securityPostureFor(%s, %s) = %+v, want (%s, %v, Applied=true)", tc.goos, tc.plat, got, tc.wantMode, tc.wantHard)
+			}
+		})
+	}
 }
 
 func TestNewRejectsInvalidConfigBeforeOpeningHandles(t *testing.T) {

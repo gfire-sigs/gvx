@@ -82,7 +82,7 @@ sequenceDiagram
 
 | Component | How `gvx` Works | Why It Matters to Users |
 | :--- | :--- | :--- |
-| **Execution Engines (`whpx`, `hvf`, `systrap`)** | Uses lightweight hardware virtualization (`WinHvPlatform.dll` on Windows, `Hypervisor.framework` on macOS) to run guest code and provide 4KB memory pages. When a hypervisor is unavailable on Windows or Linux (such as in a cloud VM), `systrap` runs the container inside an isolated helper process and traps syscalls in user space. | Runs standard Linux binaries, dynamic linkers (`glibc`, `musl`), and JIT runtimes (Node.js V8, Python, Go) at native CPU speed. |
+| **Execution Engines (`whpx`, `hvf`, `systrap`)** | Uses hardware virtualization (`WinHvPlatform.dll` on Windows, `Hypervisor.framework` on macOS) for 4KB guest pages. Linux `systrap` traps syscalls via `seccomp`; Windows `systrap` uses user-mode patching under token containment and requires `-platform=systrap` or `-allow-unconfined-systrap`. | Runs standard Linux binaries, dynamic linkers (`glibc`, `musl`), and JIT runtimes at native CPU speed. Untrusted workloads on Windows require `whpx`. |
 | **In-Memory Image Compilation (`pkg/oci`)** | Streams `.tar.gz` and `.tar.zst` image layers in memory and compiles them into read-only `.erofs` image files in the local cache. | Avoids extracting Linux files onto Windows NTFS or case-insensitive macOS APFS, which preserves case-sensitive filenames, permissions, and reserved names like `CON` or `AUX`. |
 | **Container Storage (`ext4lite` & `hostfs`)** | Keeps container rootfs changes in memory (`tmpfs`), stores named volumes (`-v data:/var/lib/data`) inside a single journaled `<name>.ext4` file on the host, and mounts host project directories (`-workspace`) through pinned directory handles. | Gives databases and stateful apps full POSIX filesystem behavior inside one portable `.ext4` host file while letting you edit code live from your host IDE. |
 | **Driverless Networking (`nat` & `wg`)** | Runs a complete TCP/IP stack in memory. Standard NAT mode (`-net=nat`) forwards ports with `-p` and maps `host.docker.internal` to the host. WireGuard mode (`-net=wg`) encrypts all container traffic over a single UDP socket. | Works without kernel TAP/TUN drivers (`WinTun.dll` or `/dev/tun`) and can isolate untrusted workloads from your local network. |
@@ -99,7 +99,7 @@ You can run Linux containers from the terminal with the `rungv` CLI or embed a s
 Build the standalone `rungv` binary with Go 1.27.4 or newer, or download a prebuilt archive from the releases page.
 
 > [!IMPORTANT]
-> On macOS, sign the binary with `entitlements.plist` so it can access `Hypervisor.framework`. On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`, or pass `-platform=systrap` to run without a hypervisor. On Linux, build with `CGO_ENABLED=0`.
+> On macOS, sign the binary with `entitlements.plist` so it can access `Hypervisor.framework`. On Windows, enable "Windows Hypervisor Platform" for `whpx`; untrusted workloads require `whpx`, and fallback to `systrap` requires `-allow-unconfined-systrap` or `-platform=systrap`. On Linux, build with `CGO_ENABLED=0`.
 
 1. Run `scripts/repro-build.sh` to build a deterministic `rungv` binary for your operating system.
 2. Apply the hypervisor entitlement signature when building on macOS.
@@ -123,7 +123,7 @@ codesign --sign - --entitlements entitlements.plist --force ./rungv
 1. Run a quick command inside an Alpine Linux container.
 2. Start a web server with port forwarding (`-p`), a persistent volume (`-v`), and a shared host workspace (`-workspace`).
 3. Run a workload over an encrypted WireGuard tunnel (`-net=wg`) to block local LAN access.
-4. Run a container without a hypervisor on Windows or Linux using `-platform=systrap`.
+4. Run a trusted container without a hypervisor on Windows or Linux using `-platform=systrap`.
 
 ```bash
 # 1. Run a command in an OCI image
@@ -136,7 +136,7 @@ codesign --sign - --entitlements entitlements.plist --force ./rungv
 ./rungv run -net=wg -wg-conf=./sandbox-wg.conf python:3.12-alpine \
   python3 -c "import urllib.request; print(urllib.request.urlopen('https://example.com').status)"
 
-# 4. Run on Windows or Linux without a hypervisor
+# 4. Run a trusted workload on Windows or Linux without a hypervisor (prints a stderr warning on Windows)
 ./rungv run -platform=systrap alpine:3.20 sh -c "echo hello from systrap"
 ```
 
@@ -165,7 +165,8 @@ Use the `pkg/gvx` package to run isolated Linux workloads directly inside your o
 
 | `gvx.Config` Field | Type | Purpose |
 | :--- | :--- | :--- |
-| `Platform` | `gvx.PlatformType` | `PlatformAuto` (tries `whpx`/`hvf`, then `systrap` on Windows and Linux), `PlatformWHPX`, `PlatformHVF`, or `PlatformSystrap`. |
+| `Platform` | `gvx.PlatformType` | `PlatformAuto` (selects `whpx` on Windows, `hvf` on macOS, or `systrap` on Linux; Windows fallback requires `AllowUnconfinedSystrap`), `PlatformWHPX`, `PlatformHVF`, or `PlatformSystrap`. |
+| `AllowUnconfinedSystrap` | `bool` | Permits `PlatformAuto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted Windows workloads require `whpx`. |
 | `OCIImage` / `BinaryPath` / `ELFBytes` | `string` / `string` / `[]byte` | Container image reference (`alpine:3.20`), path to a local Linux ELF64 binary, or raw ELF bytes. |
 | `Argv` / `Envv` / `WorkDir` | `[]string` / `string` | Command arguments, `KEY=VALUE` environment variables, and working directory inside the container. |
 | `WorkspacePath` / `Mounts` | `string` / `[]gvx.Mount` | Host directory mounted at `/workspace`, plus additional bind, volume, or `tmpfs` mounts. |

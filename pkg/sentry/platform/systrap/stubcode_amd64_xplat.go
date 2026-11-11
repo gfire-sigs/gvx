@@ -500,6 +500,9 @@ func encodeWinSlot(buf []byte, slotVA, site, spill uint64, reloc []byte) error {
 	for len(a.b) < winSlotSize {
 		a.emit(0xCC)
 	}
+	if hasRawKernelExit(a.b) {
+		return fmt.Errorf("slot at %#x contains a raw kernel opcode", slotVA)
+	}
 	copy(buf, a.b)
 	return nil
 }
@@ -575,6 +578,9 @@ func encodeWinPreSlot(buf []byte, slotVA, site, spill uint64, reloc []byte) erro
 	for len(a.b) < winSlotSize {
 		a.emit(0xCC)
 	}
+	if hasRawKernelExit(a.b) {
+		return fmt.Errorf("slot at %#x contains a raw kernel opcode", slotVA)
+	}
 	copy(buf, a.b)
 	return nil
 }
@@ -610,18 +616,41 @@ func patchJmp(page []byte, off int, siteVA, slotVA uint64) error {
 	return patchJmpSite(page, off, winJmpLen, siteVA, slotVA)
 }
 
-// patchJmpSite writes `jmp rel32` to slotVA over the siteLen-byte instruction
-// at page[off] and fills any trailing bytes of the instruction with INT3.
-func patchJmpSite(page []byte, off, siteLen int, siteVA, slotVA uint64) error {
+// encodeJmpSite encodes and validates `jmp rel32` to slotVA over the
+// siteLen-byte instruction at page[off] without modifying page.
+func encodeJmpSite(page []byte, off, siteLen int, siteVA, slotVA uint64) ([winJmpLen]byte, error) {
+	var jmp [winJmpLen]byte
 	if siteLen < winJmpLen || off < 0 || off+siteLen > len(page) {
-		return fmt.Errorf("jump at %d (len %d) does not fit in a page of %d bytes", off, siteLen, len(page))
+		return jmp, fmt.Errorf("jump at %d (len %d) does not fit in a page of %d bytes", off, siteLen, len(page))
 	}
 	rel, err := rel32(siteVA+winJmpLen, slotVA)
 	if err != nil {
+		return jmp, err
+	}
+	jmp[0] = 0xE9
+	binary.LittleEndian.PutUint32(jmp[1:], rel)
+	if hasRawKernelExit(jmp[:]) {
+		return jmp, fmt.Errorf("jump displacement at %#x forms a raw kernel opcode", siteVA)
+	}
+	if siteLen == winJmpLen {
+		if off+winJmpLen < len(page) && isRawKernelExitPair(jmp[winJmpLen-1], page[off+winJmpLen]) {
+			return jmp, fmt.Errorf("jump boundary at %#x forms a raw kernel opcode", siteVA)
+		}
+		if off+winJmpLen == len(page) && (jmp[winJmpLen-1] == 0x0F || jmp[winJmpLen-1] == 0xCD) {
+			return jmp, fmt.Errorf("page-end jump at %#x ends with a kernel-exit lead byte", siteVA)
+		}
+	}
+	return jmp, nil
+}
+
+// patchJmpSite writes `jmp rel32` to slotVA over the siteLen-byte instruction
+// at page[off] and fills any trailing bytes of the instruction with INT3.
+func patchJmpSite(page []byte, off, siteLen int, siteVA, slotVA uint64) error {
+	jmp, err := encodeJmpSite(page, off, siteLen, siteVA, slotVA)
+	if err != nil {
 		return err
 	}
-	page[off] = 0xE9
-	binary.LittleEndian.PutUint32(page[off+1:], rel)
+	copy(page[off:off+winJmpLen], jmp[:])
 	for i := winJmpLen; i < siteLen; i++ {
 		page[off+i] = 0xCC
 	}
@@ -656,6 +685,9 @@ func encodeWinTLSBaseSlot(buf []byte, slotVA, site uint64, siteLen int, reg uint
 	a.imm32(rel)
 	for len(a.b) < winTLSSlotSize {
 		a.emit(0xCC)
+	}
+	if hasRawKernelExit(a.b) {
+		return fmt.Errorf("TLS slot at %#x contains a raw kernel opcode", slotVA)
 	}
 	copy(buf[:winTLSSlotSize], a.b)
 	return nil
@@ -765,6 +797,9 @@ func encodeWinGSMovSlot(buf []byte, slotVA, site uint64, siteLen int, p gsMovPla
 	for len(a.b) < winGSMovSlotSize {
 		a.emit(0xCC)
 	}
+	if hasRawKernelExit(a.b) {
+		return fmt.Errorf("GS MOV slot at %#x contains a raw kernel opcode", slotVA)
+	}
 	copy(buf[:winGSMovSlotSize], a.b)
 	return nil
 }
@@ -846,6 +881,9 @@ func classifyReloc(inst x86asm.Inst, code []byte) relocClass {
 				return relocNone
 			}
 		}
+	}
+	if class == relocCopy && hasRawKernelExit(code) {
+		return relocNone
 	}
 	return class
 }
@@ -945,19 +983,10 @@ func relocateInstructions(code []byte, origVA, newVA uint64, branches bool) ([]b
 		}
 		pos += inst.Len
 	}
+	if hasRawKernelExit(out) {
+		return nil, fmt.Errorf("relocated instructions at %#x form a raw kernel opcode", origVA)
+	}
 	return out, nil
-}
-
-// isX86Prefix reports whether b is a legacy instruction prefix or a REX prefix.
-func isX86Prefix(b byte) bool {
-	if b >= 0x40 && b <= 0x4F {
-		return true
-	}
-	switch b {
-	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
-		return true
-	}
-	return false
 }
 
 // hasPrefixBefore reports whether the byte in front of page[off] is an

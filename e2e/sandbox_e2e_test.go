@@ -72,10 +72,10 @@ func autoPlatform() gvx.PlatformType {
 }
 
 // resolvedAutoPlatform returns the backend that -platform=auto picks on this
-// host. Windows falls back to systrap when the Windows Hypervisor Platform is
-// absent, as on the windows-11-arm runner.
+// host. On Windows without a hypervisor, fallback to systrap occurs only when
+// GVX_ALLOW_NO_HYPERVISOR=1 or -allow-unconfined-systrap is active.
 func resolvedAutoPlatform() gvx.PlatformType {
-	if runtime.GOOS == "windows" && !hvtest.Available() {
+	if runtime.GOOS == "windows" && !hvtest.Available() && os.Getenv(hvtest.AllowNoHypervisorEnv) == "1" {
 		return gvx.PlatformSystrap
 	}
 	return autoPlatform()
@@ -170,9 +170,32 @@ func toolPath(t *testing.T, pkg string) string {
 // runTool runs bin and returns stdout, stderr, and the exit code.
 func runTool(t *testing.T, bin string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
+	return runToolWithEnv(t, nil, bin, args...)
+}
+
+// runToolWithEnv runs bin with extra environment overrides replacing matching keys in os.Environ().
+func runToolWithEnv(t *testing.T, extraEnv []string, bin string, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(extraEnv) > 0 {
+		override := make(map[string]bool, len(extraEnv))
+		for _, kv := range extraEnv {
+			if k, _, ok := strings.Cut(kv, "="); ok {
+				override[strings.ToUpper(k)] = true
+			}
+		}
+		base := os.Environ()
+		env := make([]string, 0, len(base)+len(extraEnv))
+		for _, kv := range base {
+			k, _, _ := strings.Cut(kv, "=")
+			if !override[strings.ToUpper(k)] {
+				env = append(env, kv)
+			}
+		}
+		cmd.Env = append(env, extraEnv...)
+	}
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
@@ -971,6 +994,9 @@ func TestE2ENetstackDualTrackNATAndWireGuard(t *testing.T) {
 	if natRes := <-natRunCh; natRes.err != nil || natRes.code != 0 {
 		t.Fatalf("sbNAT.Run = (%d, %v)", natRes.code, natRes.err)
 	}
+	if err := sbNAT.Close(); err != nil {
+		t.Fatalf("sbNAT.Close failed: %v", err)
+	}
 
 	// 2. and 3. need the python and alpine images from the public registry.
 	// Part 2 is the positive control for part 3: the same gateway URL works
@@ -999,6 +1025,9 @@ func TestE2ENetstackDualTrackNATAndWireGuard(t *testing.T) {
 
 		if code, err := sbFetch.Run(ctx); err != nil || code != 0 {
 			t.Fatalf("sbFetch.Run = (%d, %v) stderr=%q", code, err, stderr.String())
+		}
+		if err := sbFetch.Close(); err != nil {
+			t.Fatalf("sbFetch.Close failed: %v", err)
 		}
 		if stdout.String() != "host-gateway-200-ok" {
 			t.Fatalf("outbound gateway fetch = %q, want %q", stdout.String(), "host-gateway-200-ok")
@@ -1300,8 +1329,29 @@ func TestE2ERungvSystrapDefaultLockdown(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("rungv run -platform=systrap exit code = %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(stderr, "Windows systrap lacks hardware or kernel syscall isolation") {
+			t.Fatalf("Windows systrap stderr = %q, want syscall isolation warning", stderr)
+		}
+	} else if strings.Contains(stderr, "Windows systrap lacks") {
+		t.Fatalf("non-Windows systrap stderr = %q, printed Windows warning", stderr)
+	}
 	if got, err := os.ReadFile(filepath.Join(workspace, "cli.txt")); err != nil || string(got) != "cli-systrap\n" {
 		t.Fatalf("workspace cli.txt = (%q, %v), want the guest write", got, err)
+	}
+
+	if runtime.GOOS == "windows" && !hvtest.Available() {
+		noHV := []string{hvtest.AllowNoHypervisorEnv + "=0"}
+		_, failStderr, failCode := runToolWithEnv(t, noHV, rungv, "run", "-platform=auto", "-net=none",
+			"-cache-dir="+t.TempDir(), "-workspace="+workspace, elfPath)
+		if failCode != 1 || !strings.Contains(failStderr, "-allow-unconfined-systrap") {
+			t.Fatalf("Windows -platform=auto without whpx or opt-in = (code %d, stderr %q), want code 1 and -allow-unconfined-systrap", failCode, failStderr)
+		}
+		_, okStderr, okCode := runToolWithEnv(t, noHV, rungv, "run", "-platform=auto", "-allow-unconfined-systrap", "-net=none",
+			"-cache-dir="+t.TempDir(), "-workspace="+workspace, elfPath)
+		if okCode != 0 || !strings.Contains(okStderr, "rungv: platform=systrap") || !strings.Contains(okStderr, "Windows systrap lacks hardware or kernel syscall isolation") {
+			t.Fatalf("Windows -platform=auto -allow-unconfined-systrap = (code %d, stderr %q), want code 0, platform=systrap, and warning", okCode, okStderr)
+		}
 	}
 
 	stdout, stderr, code = runTool(t, rungv, "stub")

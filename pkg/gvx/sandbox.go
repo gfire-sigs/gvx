@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -99,7 +100,8 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
 
-	opened, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
+	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
+	opened, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown, allowUnconfined)
 	if err != nil {
 		return cleanup(err)
 	}
@@ -158,12 +160,12 @@ type openedPlatform struct {
 }
 
 // openPlatform opens the requested backend. PlatformAuto prefers the hardware
-// hypervisor of the host OS and falls back to systrap (SPEC section 1) when
-// the hypervisor cannot initialize. The result then carries the error of the
-// hypervisor. An explicit PlatformSystrap returns the engine error. The
-// lockdown argument tells the backend to bind vCPU threads to the lockdown
+// hypervisor of the host OS. On Windows, PlatformAuto falls back to systrap
+// only when allowUnconfinedSystrap is true; otherwise it returns an error
+// wrapping ErrPlatformUnavailable. An explicit PlatformSystrap opens the
+// engine directly. The lockdown argument binds vCPU threads to the restricted
 // token.
-func openPlatform(requested PlatformType, lockdown bool) (openedPlatform, error) {
+func openPlatform(requested PlatformType, lockdown, allowUnconfinedSystrap bool) (openedPlatform, error) {
 	hardware := func() (platform.Platform, string, error) {
 		return nil, "", fmt.Errorf("%w: no hypervisor backend for %s", ErrPlatformUnavailable, runtime.GOOS)
 	}
@@ -185,19 +187,32 @@ func openPlatform(requested PlatformType, lockdown bool) (openedPlatform, error)
 	case PlatformSystrap:
 		return single(openSystrap)
 	case PlatformAuto:
-		return openAuto(hardware, openSystrap)
+		return openAutoForOS(runtime.GOOS, hardware, openSystrap, allowUnconfinedSystrap)
 	default:
 		return openedPlatform{}, fmt.Errorf("%w: unknown platform %q", ErrInvalidConfig, requested)
 	}
 }
 
 // openAuto starts the hardware backend and falls back to the fallback backend
-// when the hardware backend fails. The result then carries the error of the
-// hardware backend. When both fail, the error reports both.
+// when the hardware backend fails on a host whose fallback confines syscalls.
 func openAuto(hardware, fallback opener) (openedPlatform, error) {
+	return openAutoForOS("linux", hardware, fallback, true)
+}
+
+// openAutoForOS implements PlatformAuto for goos. On Windows, fallback to
+// systrap requires allowUnconfinedSystrap because Windows offers no kernel
+// syscall trap for stub processes.
+func openAutoForOS(goos string, hardware, fallback opener, allowUnconfinedSystrap bool) (openedPlatform, error) {
 	p, name, hwErr := hardware()
 	if hwErr == nil {
 		return openedPlatform{plat: p, name: name}, nil
+	}
+	if goos == "windows" && !allowUnconfinedSystrap {
+		msg := "gvx: Windows Hypervisor Platform (whpx) is unavailable and Windows systrap lacks hardware or kernel syscall isolation; enable whpx or set Config.AllowUnconfinedSystrap (-allow-unconfined-systrap)"
+		if hint := platformFailureHint(goos, hwErr); hint != "" {
+			msg += " (" + hint + ")"
+		}
+		return openedPlatform{}, fmt.Errorf("%s: %w", msg, errors.Join(ErrPlatformUnavailable, hwErr))
 	}
 	p, name, fbErr := fallback()
 	if fbErr == nil {
@@ -285,7 +300,7 @@ func platformFailureHint(goos string, err error) string {
 	switch goos {
 	case "windows":
 		if errors.Is(err, whpx.ErrUnsupported) {
-			return "enable the Windows feature \"Windows Hypervisor Platform\" and restart, or pass -platform=systrap"
+			return "enable the Windows feature \"Windows Hypervisor Platform\" and restart, or pass -allow-unconfined-systrap or -platform=systrap"
 		}
 	case "darwin":
 		switch {
@@ -296,6 +311,65 @@ func platformFailureHint(goos string, err error) string {
 		}
 	}
 	return ""
+}
+
+// SyscallIsolationMode classifies how the active backend intercepts guest
+// system calls.
+type SyscallIsolationMode string
+
+const (
+	// SyscallIsolationHardware intercepts guest execution in a hardware
+	// hypervisor partition (whpx or hvf).
+	SyscallIsolationHardware SyscallIsolationMode = "hardware"
+	// SyscallIsolationKernel intercepts every unpatched guest syscall in the
+	// host kernel via seccomp user notification (Linux systrap).
+	SyscallIsolationKernel SyscallIsolationMode = "kernel"
+	// SyscallIsolationUserModePatch rewrites syscall sites in user mode under a
+	// restricted token and job object without a host kernel syscall trap
+	// (Windows systrap).
+	SyscallIsolationUserModePatch SyscallIsolationMode = "usermode-patch"
+)
+
+// SecurityPosture summarizes the guest syscall isolation boundary and host
+// process containment of a Sandbox.
+type SecurityPosture struct {
+	// Platform is the active backend name ("whpx", "hvf", or "systrap").
+	Platform string
+	// SyscallIsolation classifies the syscall interception boundary.
+	SyscallIsolation SyscallIsolationMode
+	// HardwareOrKernelSyscallIsolation is true when a hardware hypervisor or
+	// host kernel filter intercepts unpatched guest system calls. It is false
+	// on Windows systrap.
+	HardwareOrKernelSyscallIsolation bool
+	// Lockdown reports the host process containment that New enforced.
+	Lockdown hostlockdown.Status
+}
+
+// SecurityPosture reports the syscall isolation boundary and host containment
+// of the Sandbox.
+func (s *Sandbox) SecurityPosture() SecurityPosture {
+	return securityPostureFor(runtime.GOOS, s.platName, s.lockdown)
+}
+
+func securityPostureFor(goos, platName string, lockdown hostlockdown.Status) SecurityPosture {
+	posture := SecurityPosture{
+		Platform: platName,
+		Lockdown: lockdown,
+	}
+	switch platName {
+	case "whpx", "hvf":
+		posture.SyscallIsolation = SyscallIsolationHardware
+		posture.HardwareOrKernelSyscallIsolation = true
+	case "systrap":
+		if goos == "windows" {
+			posture.SyscallIsolation = SyscallIsolationUserModePatch
+			posture.HardwareOrKernelSyscallIsolation = false
+		} else {
+			posture.SyscallIsolation = SyscallIsolationKernel
+			posture.HardwareOrKernelSyscallIsolation = true
+		}
+	}
+	return posture
 }
 
 // LockdownStatus reports the host containment that New enforced. The zero

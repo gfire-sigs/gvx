@@ -40,6 +40,9 @@ func TestParseRunArgsDefaults(t *testing.T) {
 	if cfg.DisableHostLockdown {
 		t.Errorf("DisableHostLockdown = true by default, want the lockdown on")
 	}
+	if cfg.AllowUnconfinedSystrap {
+		t.Errorf("AllowUnconfinedSystrap = true by default, want false")
+	}
 	if cfg.Platform != gvx.PlatformAuto || !rc.autoPlatform {
 		t.Errorf("Platform = %q autoPlatform = %v, want auto", cfg.Platform, rc.autoPlatform)
 	}
@@ -75,7 +78,7 @@ func TestParseRunArgsLockdownOptOut(t *testing.T) {
 
 func TestParseRunArgsExplicitSettings(t *testing.T) {
 	rc, _, done, stderr := parse(t,
-		"-platform=HVF", "-arch=ARM64", "-net=None", "-workspace=/w", "-ro",
+		"-platform=HVF", "-allow-unconfined-systrap", "-arch=ARM64", "-net=None", "-workspace=/w", "-ro",
 		"-cache-dir=/c", "-registry-url=http://r", "-wg-config=wg.conf", "-isolate-lan", "-image=x")
 	if done {
 		t.Fatalf("parseRunArgs ended the command: %s", stderr)
@@ -83,6 +86,9 @@ func TestParseRunArgsExplicitSettings(t *testing.T) {
 	cfg := rc.cfg
 	if cfg.Platform != gvx.PlatformHVF || rc.autoPlatform {
 		t.Errorf("Platform = %q autoPlatform = %v, want hvf and false", cfg.Platform, rc.autoPlatform)
+	}
+	if !cfg.AllowUnconfinedSystrap {
+		t.Errorf("AllowUnconfinedSystrap = false, want true")
 	}
 	if cfg.Architecture != "arm64" || cfg.NetworkMode != gvx.NetModeNone {
 		t.Errorf("Architecture = %q NetworkMode = %q, want arm64 and none", cfg.Architecture, cfg.NetworkMode)

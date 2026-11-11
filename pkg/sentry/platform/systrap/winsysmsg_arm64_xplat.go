@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"sync/atomic"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -111,21 +112,43 @@ func (r *winRegs) loadFrom(ac *arch.Context64) {
 	r.NZCV = regs.Pstate & pstateNZCV
 }
 
+// snapshot copies every word of r once with atomic loads into a stack-local
+// winRegs so a concurrent stub thread cannot race with validation or register
+// copying.
+func (r *winRegs) snapshot() winRegs {
+	var snap winRegs
+	for i := range r.X {
+		snap.X[i] = atomic.LoadUint64(&r.X[i])
+	}
+	snap.SP = atomic.LoadUint64(&r.SP)
+	snap.NZCV = atomic.LoadUint64(&r.NZCV)
+	return snap
+}
+
 // storeTo copies the block into ac. The guest continues at ret.
 func (r *winRegs) storeTo(ac *arch.Context64, ret uint64) {
+	snap := r.snapshot()
 	st := ac.StateData()
 	regs := &st.Regs
-	regs.Regs = r.X
-	regs.Sp = r.SP
+	regs.Regs = snap.X
+	regs.Sp = snap.SP
 	regs.Pc = ret
-	regs.Pstate = regs.Pstate&^pstateNZCV | r.NZCV&pstateNZCV
-	st.OrigR0 = r.X[0]
+	regs.Pstate = regs.Pstate&^pstateNZCV | snap.NZCV&pstateNZCV
+	st.OrigR0 = snap.X[0]
 }
 
 // storeVector copies V0 to V31, FPSR, and FPCR from the sysmsg into the
 // floating-point state of ac.
 func (m *winSysmsg) storeVector(ac *arch.Context64) {
-	copyFPToArch(ac, m.Vec[:], uint32(m.Fpsr), uint32(m.Fpcr))
+	var vec [32 * 16]byte
+	srcWords := unsafe.Slice((*uint64)(unsafe.Pointer(&m.Vec[0])), len(vec)/8)
+	dstWords := unsafe.Slice((*uint64)(unsafe.Pointer(&vec[0])), len(vec)/8)
+	for i := range srcWords {
+		dstWords[i] = atomic.LoadUint64(&srcWords[i])
+	}
+	fpsr := uint32(atomic.LoadUint64(&m.Fpsr))
+	fpcr := uint32(atomic.LoadUint64(&m.Fpcr))
+	copyFPToArch(ac, vec[:], fpsr, fpcr)
 }
 
 // loadVector copies the floating-point state of ac into the vector block of
