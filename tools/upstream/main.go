@@ -4,6 +4,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -198,6 +199,7 @@ func printReport(w io.Writer, r AuditReport, maxRatio float64) {
 	fmt.Fprintf(w, "upstream commit=%s baseline=%d go/asm files (mask-excluded=%d)\n", commit, r.UpstreamBaseline, r.MaskExcluded)
 	fmt.Fprintf(w, "tier1 (additive):  files=%d\n", r.Tier1Count)
 	fmt.Fprintf(w, "tier2 (siblings):  files=%d upstream-shadows=%d shadow-edits=%d\n", r.Tier2Count, r.Tier2Shadows, r.Shadow)
+	fmt.Fprintf(w, "tier2 (xplat):     files=%d loc=%d shared-pkgs=%d\n", r.Tier2XplatCount, r.Tier2XplatLOC, r.Tier2SharedPkgCount)
 	fmt.Fprintf(w, "tier3 (upstream):  files=%d pristine=%d format-only=%d build-expand=%d seams=%d added=%d tests-added=%d\n",
 		r.Tier3Count, r.Pristine, r.Format, r.Expand, r.Seam, r.Added, r.TestsAdded)
 	fmt.Fprintf(w, "tier3 linux fences=%d (machine-derived, SPEC 2.3 retag)\n", r.Fence)
@@ -248,6 +250,7 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 		return fmt.Errorf("%w: %q", errUnknownStrategy, o.strategy)
 	}
 
+	gitDir := ""
 	if o.strategy != "archive" {
 		fork, err := IsGitFork(ctx, o.rootDir)
 		if err != nil {
@@ -255,6 +258,7 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 		}
 		switch {
 		case fork:
+			gitDir = o.rootDir
 			manifest, err := GitSync(ctx, GitSyncConfig{
 				RootDir:   o.rootDir,
 				RemoteURL: o.repoURL,
@@ -280,30 +284,49 @@ func syncMode(ctx context.Context, o options, patches *PatchSet, mask *FileMask,
 		}
 	}
 
+	inPlace := filepath.Clean(cmp.Or(o.destSubdir, ".")) == "."
+	var auditReport AuditReport
+	var rawAuditErr error
+	var auditRan bool
 	manifest, err := SyncUpstream(ctx, SyncConfig{
-		RootDir:    o.rootDir,
-		DestSubdir: o.destSubdir,
-		RepoURL:    o.repoURL,
-		TargetRef:  o.targetRef,
-		Mask:       mask,
-		Patches:    patches,
-		Source:     o.archiveSource(""),
+		RootDir:     o.rootDir,
+		DestSubdir:  o.destSubdir,
+		RepoURL:     o.repoURL,
+		TargetRef:   o.targetRef,
+		MaxRatio:    o.maxRatio,
+		CountFences: o.countFences,
+		Audit:       inPlace,
+		Mask:        mask,
+		Patches:     patches,
+		Source:      o.archiveSource(gitDir),
+		OnAudit: func(r AuditReport, auditErr error) {
+			auditReport = r
+			rawAuditErr = auditErr
+			auditRan = true
+		},
 	})
+	if rawAuditErr != nil {
+		printReport(stdout, auditReport, o.maxRatio)
+		printViolations(stderr, rawAuditErr, o.maxFindings)
+		return fmt.Errorf("audit failed with %d finding(s): %w", countErrors(rawAuditErr), rawAuditErr)
+	}
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout,
-		"sync complete (archive overlay): commit=%s release=%s extracted=%d protected_skipped=%d excluded_skipped=%d dest=%s\n",
-		manifest.GoBranchSHA[:12], manifest.ReleaseTag, manifest.ExtractedFiles, manifest.ProtectedSkips, manifest.ExcludedSkips, manifest.DestDir,
+		"sync complete (archive overlay): commit=%s release=%s extracted=%d merged=%d deleted=%d protected_skipped=%d excluded_skipped=%d dest=%s\n",
+		manifest.GoBranchSHA[:12], manifest.ReleaseTag, manifest.ExtractedFiles, manifest.MergedFiles, manifest.DeletedFiles, manifest.ProtectedSkips, manifest.ExcludedSkips, manifest.DestDir,
 	)
-	fmt.Fprintln(stdout, "run `go mod tidy`, then -mode=audit, then the four-target builds")
-	if o.destSubdir != "." && o.destSubdir != "" {
+	if !inPlace {
+		fmt.Fprintln(stdout, "run `go mod tidy`, then -mode=audit, then the five-target builds")
 		return nil
 	}
-	return auditMode(ctx, options{
-		rootDir: o.rootDir, maxRatio: o.maxRatio, countFences: o.countFences,
-		targetRef: manifest.GoBranchSHA, archivePath: o.archivePath, cacheDir: o.cacheDir, offline: o.offline,
-	}, patches, mask, stdout, stderr)
+	if auditRan {
+		printReport(stdout, auditReport, o.maxRatio)
+		fmt.Fprintln(stdout, "audit passed")
+	}
+	fmt.Fprintln(stdout, "run `go mod tidy`, then the five-target builds")
+	return nil
 }
 
 func resolvePath(rootDir, relOrAbs string) string {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +66,12 @@ type AuditReport struct {
 	Tier3Count int
 	// Tier2Shadows counts Tier 2 files that replace an upstream file of the same path.
 	Tier2Shadows int
+	// Tier2XplatCount counts non-test *_xplat*.go files inside shared upstream packages.
+	Tier2XplatCount int
+	// Tier2XplatLOC sums lines across non-test *_xplat*.go files inside shared upstream packages.
+	Tier2XplatLOC int
+	// Tier2SharedPkgCount counts shared upstream packages that contain non-test *_xplat*.go files.
+	Tier2SharedPkgCount int
 	// TestsAdded counts gvx-written _test.go files in Tier 3 directories. They stay outside the budget.
 	TestsAdded int
 
@@ -115,6 +122,7 @@ var tier1Prefixes = []string{
 	"pkg/oci/",
 	"pkg/netbackend/",
 	"pkg/hostlockdown/",
+	"pkg/sentry/blockdev/",
 	"pkg/sentry/platform/whpx/",
 	"pkg/sentry/platform/hvf/",
 	"pkg/sentry/fsimpl/hostfs/",
@@ -123,13 +131,16 @@ var tier1Prefixes = []string{
 	"pkg/sentry/socket/netlink/genetlink/",
 	"pkg/ipset/",
 	"pkg/tcpip/link/vxlan/",
+	"pkg/tcpip/link/wgtun/",
 	"pkg/sentry/platform/hvcommon/",
 	"e2e/",
+	"scripts/",
 	"tools/upstream/",
 	"tools/shiminterop/",
 	"tools/licenses/",
 	"tools/gvisorlint/",
 	"tools/androidprobe/",
+	"tools/gostateify/",
 	"android/",
 	"docs/",
 	"internal/",
@@ -152,14 +163,32 @@ func ClassifyFile(relPath string) IsolationTier {
 // isSiblingOSFile reports whether the file name carries a gvx sibling marker token.
 // Tokens are separated by underscores: name_windows.go, name_darwin_arm64.go, name_xplat_test.go.
 func isSiblingOSFile(base string) bool {
+	return hasSiblingToken(base, "windows") || hasSiblingToken(base, "darwin") || hasSiblingToken(base, "xplat")
+}
+
+func hasSiblingToken(base, target string) bool {
 	name := strings.TrimSuffix(base, path.Ext(base))
 	for tok := range strings.SplitSeq(name, "_") {
-		switch tok {
-		case "windows", "darwin", "xplat":
+		if tok == target {
 			return true
 		}
 	}
 	return false
+}
+
+func isXplatGoFile(relSlash string) bool {
+	return strings.HasSuffix(relSlash, ".go") && !isTestFile(relSlash) && hasSiblingToken(path.Base(relSlash), "xplat")
+}
+
+func countLines(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	lines := bytes.Count(data, []byte{'\n'})
+	if data[len(data)-1] != '\n' {
+		lines++
+	}
+	return lines
 }
 
 // ValidateCommitSHA verifies that raw contains a 40-character lowercase or uppercase hex SHA.
@@ -218,7 +247,7 @@ func RunAudit(cfg AuditConfig) (AuditReport, error) {
 		return AuditReport{}, fmt.Errorf("%w: %v", errInvalidMaxRatio, cfg.MaxRatio)
 	}
 	commit, err := ReadUpstreamCommit(cfg.RootDir)
-	if err != nil {
+	if err != nil && (cfg.Upstream == nil || !errors.Is(err, os.ErrNotExist)) {
 		return AuditReport{}, err
 	}
 	report := AuditReport{UpstreamCommit: commit}
@@ -238,7 +267,12 @@ func RunAudit(cfg AuditConfig) (AuditReport, error) {
 		return report, errNoBaseline
 	}
 
-	st := &auditState{cfg: cfg, report: report, ruleUsed: make(map[string]bool)}
+	st := &auditState{
+		cfg:       cfg,
+		report:    report,
+		ruleUsed:  make(map[string]bool),
+		xplatPkgs: make(map[string]bool),
+	}
 	seen := make(map[string]bool)
 	fset := token.NewFileSet()
 
@@ -271,6 +305,7 @@ func RunAudit(cfg AuditConfig) (AuditReport, error) {
 	if walkErr != nil {
 		return st.report, walkErr
 	}
+	st.report.Tier2SharedPkgCount = len(st.xplatPkgs)
 
 	for _, rel := range included {
 		if ClassifyFile(rel) == Tier1Additive || seen[rel] {
@@ -299,6 +334,8 @@ type auditState struct {
 	violations []error
 	// ruleUsed marks the allowlist paths that edited at least one file.
 	ruleUsed map[string]bool
+	// xplatPkgs records shared package directories that hold non-test *_xplat*.go files.
+	xplatPkgs map[string]bool
 }
 
 // checkStaleRules reports allowlist rules that no file needs. A stale rule hides a SPEC
@@ -318,6 +355,11 @@ func (st *auditState) auditAgainstUpstream(abs, relSlash string, tier IsolationT
 	repoBytes, err := os.ReadFile(abs)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", relSlash, err)
+	}
+	if tier == Tier2Sibling && isXplatGoFile(relSlash) {
+		st.report.Tier2XplatCount++
+		st.report.Tier2XplatLOC += countLines(repoBytes)
+		st.xplatPkgs[path.Dir(relSlash)] = true
 	}
 	upBytes, inUpstream := st.cfg.Upstream.pristine(relSlash)
 

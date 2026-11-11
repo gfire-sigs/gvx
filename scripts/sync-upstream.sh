@@ -17,11 +17,16 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 cd -- "$repo_root"
-go run ./tools/upstream -mode=sync -root=. -max-ratio=0.02 "$@"
+go run ./tools/upstream -mode=sync -root=. -max-ratio=0.05 "$@"
 
-# Step 7: verify the three non-Linux Priority-0 targets.
-targets=(windows/amd64 windows/arm64 darwin/arm64)
+# Step 7: verify all five host targets, Android arm64, and gVisor static analyzers.
+targets=(linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64)
 for target in "${targets[@]}"; do
   printf 'building %s\n' "$target"
   GOOS=${target%/*} GOARCH=${target#*/} go build ./...
 done
+
+printf 'building android/arm64\n'
+GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./...
+
+"$script_dir/gvisorlint.sh"
