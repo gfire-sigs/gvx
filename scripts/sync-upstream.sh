@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Synchronize the fork with google/gvisor (docs/architecture.md section 2.3).
 #
-# `tools/upstream -mode=sync` runs steps 1 to 7. It uses `git merge --no-commit upstream/go`
-# when the repository is a git fork that shares history with upstream. Otherwise it prints a
-# notice and overlays the pinned upstream archive. Extra arguments go to the tool, for example
-# `-ref=<sha>`, `-strategy=archive`, `-offline`, or `-dest=<dir>`.
+# `tools/upstream -mode=sync` runs steps 1 to 7 and regenerates packages listed in
+# `tools/gostateify/packages.txt`. It uses `git merge --no-commit upstream/go` when the
+# repository is a git fork that shares history with upstream. Otherwise it prints a notice and
+# overlays the pinned upstream archive. Extra arguments go to the tool, for example
+# `-ref=<sha>`, `-strategy=archive`, `-offline`, `-regen-stateify=false`, or `-dest=<dir>`.
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -17,9 +18,10 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 cd -- "$repo_root"
-go run ./tools/upstream -mode=sync -root=. -max-ratio=0.05 "$@"
+go run ./tools/upstream -mode=sync -root=. -max-ratio=0.05 -regen-stateify "$@"
 
-# Step 7: verify all five host targets, Android arm64, and gVisor static analyzers.
+# Step 7: verify stateify drift, all five host targets, Android arm64, and gVisor analyzers.
+"$script_dir/gostateify.sh" -check
 targets=(linux/amd64 linux/arm64 darwin/arm64 windows/amd64 windows/arm64)
 for target in "${targets[@]}"; do
   printf 'building %s\n' "$target"

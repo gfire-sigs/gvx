@@ -402,7 +402,7 @@ var boundaryRules = []importRule{
 		pkg:       "tools/upstream",
 		tier:      Tier1Additive,
 		subtree:   true,
-		allowed:   []string{"golang.org/x/mod/*"},
+		allowed:   []string{"golang.org/x/mod/*", "tools/gostateify/stateify"},
 		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{
@@ -426,11 +426,20 @@ var boundaryRules = []importRule{
 		forbidden: lowLevelTier2Bans,
 	},
 	{
-		pkg:       "tools/gostateify",
+		pkg:             "tools/gostateify",
+		tier:            Tier1Additive,
+		subtree:         true,
+		allowed:         []string{"golang.org/x/tools/*"},
+		forbidden:       []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
+		forbiddenExcept: []string{"pkg/state"},
+		forbiddenProd:   []string{"pkg/state"},
+		skipTrees:       []string{"tools/gostateify/internal/testfixture"},
+	},
+	{
+		pkg:       "tools/gostateify/internal/testfixture",
 		tier:      Tier1Additive,
-		subtree:   true,
-		allowed:   []string{"golang.org/x/tools/*"},
-		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
+		allowed:   []string{"pkg/state"},
+		forbidden: lowLevelTier2Bans,
 	},
 
 	// Low-level foundation Tier 2 packages (must never import pkg/sentry/* or upper layers).
@@ -515,6 +524,12 @@ var boundaryRules = []importRule{
 		forbidden: lowLevelTier2Bans,
 	},
 	{
+		pkg:       "pkg/safecopy",
+		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/errors", "pkg/errors/linuxerr"},
+		forbidden: lowLevelTier2Bans,
+	},
+	{
 		pkg:       "pkg/sighandling",
 		tier:      Tier2Sibling,
 		allowed:   []string{xSysUnix},
@@ -532,18 +547,12 @@ var boundaryRules = []importRule{
 		allowed:   []string{xSysUnix, "pkg/abi/linux/errno", "pkg/errors", "pkg/errors/linuxerr"},
 		forbidden: lowLevelTier2Bans,
 	},
-	// Low-level Tier 3 safeguards keeping fsutil and safecopy free of Sentry imports.
+	// Low-level Tier 3 safeguard keeping fsutil free of Sentry imports.
 	{
 		pkg:       "pkg/fsutil",
 		tier:      Tier3Upstream,
 		subtree:   true,
 		allowed:   []string{xSysUnix},
-		forbidden: lowLevelTier2Bans,
-	},
-	{
-		pkg:       "pkg/safecopy",
-		tier:      Tier3Upstream,
-		subtree:   true,
 		forbidden: lowLevelTier2Bans,
 	},
 
@@ -644,7 +653,7 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/kernel",
 		tier:      Tier2Sibling,
 		subtree:   true,
-		allowed:   []string{"pkg/abi/linux", "pkg/sentry/platform", "pkg/sentry/vfs", "pkg/sync"},
+		allowed:   []string{"pkg/abi/linux", "pkg/sentry/platform", "pkg/sentry/vfs", "pkg/state", "pkg/sync"},
 		forbidden: append([]string{xSysWindows}, tier2UpperBans...),
 	},
 	{
@@ -657,13 +666,13 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/mm",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/safemem", "pkg/sentry/memmap", "pkg/sentry/pgalloc", "pkg/sentry/platform", "pkg/sentry/usage", "pkg/sentry/vfs", "pkg/usermem"},
+		allowed:   []string{"pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/safemem", "pkg/sentry/memmap", "pkg/sentry/pgalloc", "pkg/sentry/platform", "pkg/sentry/usage", "pkg/sentry/vfs", "pkg/state", "pkg/usermem"},
 		forbidden: append([]string{xSysWindows}, tier2UpperBans...),
 	},
 	{
 		pkg:       "pkg/sentry/pgalloc",
 		tier:      Tier2Sibling,
-		allowed:   []string{xSysWindows, xSysUnix, "pkg/abi/linux", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/memutil", "pkg/safemem", "pkg/sentry/memmap", "pkg/sentry/usage", "pkg/sync"},
+		allowed:   []string{xSysWindows, xSysUnix, "pkg/abi/linux", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/memutil", "pkg/safemem", "pkg/sentry/memmap", "pkg/sentry/usage", "pkg/state", "pkg/sync"},
 		forbidden: append([]string{"pkg/sentry/kernel/*", "pkg/sentry/vfs/*", "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
@@ -750,6 +759,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/vfs",
 		tier:      Tier2Sibling,
+		allowed:   []string{"pkg/state"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 }
@@ -893,6 +903,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/abi/linux/errno", "netlink unit tests assert Linux errno constants"},
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/errors/linuxerr", "netlink unit tests compare linuxerr return values"},
 	{[]string{"pkg/sentry/socket/netlink"}, "pkg/sentry/socket/unix", "netlink unit tests pair endpoints with unix sockets"},
+	{[]string{"tools/gostateify"}, "pkg/state", "round-trip tests verify generated Save and Load methods"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"z.gfire.dev/gvx/tools/gostateify/stateify"
 )
 
 const (
@@ -116,36 +118,7 @@ type AuditConfig struct {
 	CountFences bool
 }
 
-var tier1Prefixes = []string{
-	"cmd/rungv/",
-	"cmd/containerd-shim-gvx-v2/",
-	"pkg/gvx/",
-	"pkg/oci/",
-	"pkg/netbackend/",
-	"pkg/hostlockdown/",
-	"pkg/sentry/blockdev/",
-	"pkg/sentry/platform/whpx/",
-	"pkg/sentry/platform/hvf/",
-	"pkg/sentry/fsimpl/hostfs/",
-	"pkg/sentry/fsimpl/ext4lite/",
-	"pkg/sentry/fsimpl/chunkcache/",
-	"pkg/sentry/socket/netlink/genetlink/",
-	"pkg/ipset/",
-	"pkg/tcpip/link/vxlan/",
-	"pkg/tcpip/link/wgtun/",
-	"pkg/sentry/platform/hvcommon/",
-	"e2e/",
-	"scripts/",
-	"tools/upstream/",
-	"tools/shiminterop/",
-	"tools/licenses/",
-	"tools/gvisorlint/",
-	"tools/androidprobe/",
-	"tools/gostateify/",
-	"android/",
-	"docs/",
-	"internal/",
-}
+var tier1Prefixes = stateify.Tier1Prefixes()
 
 // ClassifyFile returns the IsolationTier for a slash-normalized repository path.
 func ClassifyFile(relPath string) IsolationTier {

@@ -68,6 +68,7 @@ gvx/ (Fork of google/gvisor@go)
  │   └── architecture.md                    # [NEW] Authoritative architecture and milestone plan
  ├── scripts/                               # [NEW] codesign-exec.sh (signs test binaries) and sync-upstream.sh
  ├── tools/
+ │   ├── gostateify/                        # [NEW] Native Go pkg/state generator and drift verifier
  │   ├── shiminterop/                       # [NEW] Isolated SDK smoke tests
  │   └── upstream/                          # [NEW] Upstream sync, diff audit, import boundaries, and build-tag rewriter
  │       ├── main.go
@@ -195,6 +196,7 @@ Each package owns one architectural boundary. Enforce top-down import directiona
 | `cmd/containerd-shim-gvx-v2` | Dispatches the optional shim command. | `internal/gvxshim` | `pkg/*`, `runsc/*`, `shim/*` |
 | `internal/gvxshim` | Owns bootstrap, local RPC controls, process lifetime, and safe cleanup. | None; public containerd types, ttRPC, protobuf, and host APIs are external dependencies. | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
 | `tools/shiminterop` | Exercises real ShimManager `2.1.5` against the compiled shim in an isolated module. | None | Root runtime, command, and internal packages |
+| `tools/gostateify` | Generates reflection-free `pkg/state` methods and verifies zero autogen drift. | `golang.org/x/tools/*` | `pkg/*` (production), `cmd/*`, `internal/*` |
 | `cmd/rungv` | Parses the Docker-style commands of [`cli.md`](cli.md) (`run`, `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, `logout`, `stub`) and starts a sandbox instance. | `pkg/gvx` | `pkg/sentry/*`, `WinHvPlatform.dll` |
 | `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, and Sentry boot. | `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip` | `cmd/*`, `internal/gvxshim` |
 | `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests and compiles `.tar` layers into `.erofs` files. | `pkg/abi/linux` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
@@ -216,7 +218,7 @@ To prevent merge conflicts during continuous upstream pulls, `gvx` partitions al
 
 | Isolation Tier | File Paths | Upstream Conflict Rate | Maintenance Mechanism |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/platform/hvcommon/`, `pkg/sentry/fsimpl/chunkcache/`, `pkg/sentry/fsimpl/hostfs/`, `pkg/sentry/fsimpl/ext4lite/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `tools/licenses/`, `tools/gvisorlint/`, `tools/androidprobe/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
+| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/platform/hvcommon/`, `pkg/sentry/fsimpl/chunkcache/`, `pkg/sentry/fsimpl/hostfs/`, `pkg/sentry/fsimpl/ext4lite/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `tools/licenses/`, `tools/gvisorlint/`, `tools/androidprobe/`, `tools/gostateify/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 5.0%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
 
@@ -241,17 +243,20 @@ Run this procedure to audit the current upstream diff or merge new commits from 
 2. Fetch the latest `go` branch from `upstream`.
 3. Inspect the modified upstream file count and verify the `< 5.0%` budget against `UPSTREAM_COMMIT`.
 4. Merge `upstream/go` without committing.
-5. Run `tools/upstream` in `retag` mode to apply `//go:build linux || windows || darwin` to allowlisted files.
-6. Run `tools/upstream` in `audit` mode to assert zero unauthorized edits in `*_linux.go` files.
-7. Record the merged `upstream/go` SHA in `UPSTREAM_COMMIT` and verify all three non-Linux Priority-0 targets and both Linux targets.
+5. Run `./scripts/gostateify.sh` to regenerate registered state files before retagging.
+6. Run `tools/upstream` in `retag` mode to apply `//go:build linux || windows || darwin` to allowlisted files.
+7. Run `./scripts/gostateify.sh -check` and `tools/upstream` in `audit` mode to verify zero drift or unauthorized edits.
+8. Record the merged `upstream/go` SHA in `UPSTREAM_COMMIT` and verify all three non-Linux Priority-0 targets and both Linux targets.
 
 ```bash
 git remote add upstream https://github.com/google/gvisor.git 2>/dev/null || true
 git fetch upstream go
 
-# Merge new upstream commits and re-apply build tags
+# Merge new upstream commits, regenerate state files, and re-apply build tags
 git merge --no-commit upstream/go
+./scripts/gostateify.sh
 go run ./tools/upstream -mode=retag
+./scripts/gostateify.sh -check
 go run ./tools/upstream -mode=audit -max-ratio=0.05   # add -offline to reuse the cached upstream archive
 git rev-parse upstream/go > UPSTREAM_COMMIT
 
