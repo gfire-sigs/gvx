@@ -206,6 +206,13 @@ func (v *volume) putNode(n *node) {
 	}
 	// The last reference can drop after the unlink call returned, so the free
 	// of the blocks and the inode enters the gate on its own.
+	v.mu.Lock()
+	saved := v.savedForCheckpoint
+	v.mu.Unlock()
+	if saved {
+		v.evict(n)
+		return
+	}
 	v.gate.enterInner()
 	defer v.gate.exit()
 	n.mu.Lock()
@@ -225,6 +232,17 @@ func (v *volume) evict(n *node) {
 	v.nodeMu.Lock()
 	defer v.nodeMu.Unlock()
 	if n.refs == 0 && v.nodes[n.ino] == n {
+		delete(v.nodes, n.ino)
+	}
+}
+
+// unrebindNode drops a reference that rebindNode added without destroying an
+// unlinked node when CompleteRestore rolls back.
+func (v *volume) unrebindNode(n *node) {
+	v.nodeMu.Lock()
+	defer v.nodeMu.Unlock()
+	n.refs--
+	if n.refs <= 0 && v.nodes[n.ino] == n {
 		delete(v.nodes, n.ino)
 	}
 }
@@ -317,6 +335,66 @@ func (v *volume) loadNode(ino uint32) (*node, error) {
 		return nil, hostError(err)
 	}
 	return v.parseInode(ino, buf[off:off+inodeSize])
+}
+
+// rebindNode loads or returns the active node for ino during checkpoint
+// restore. Unlike getNode, it accepts an allocated non-root inode whose link
+// count is zero on disk, which backs an open unlinked file or O_TMPFILE.
+func (v *volume) rebindNode(ino uint32) (*node, error) {
+	v.nodeMu.Lock()
+	if n, ok := v.nodes[ino]; ok {
+		n.refs++
+		v.nodeMu.Unlock()
+		return n, nil
+	}
+	v.nodeMu.Unlock()
+
+	v.mu.Lock()
+	groups := uint32(len(v.groups))
+	if ino < 1 || ino > groups*inodesPerGroup || (ino < firstIno && ino != rootIno) {
+		v.mu.Unlock()
+		return nil, corrupt("inode number %d is not valid", ino)
+	}
+	g := v.groups[(ino-1)/inodesPerGroup]
+	allocated := g.inodes.test((ino - 1) % inodesPerGroup)
+	v.mu.Unlock()
+	if !allocated {
+		return nil, corrupt("inode %d is not allocated", ino)
+	}
+
+	blk, off := inodeLocation(ino)
+	var buf [blockSize]byte
+	if _, err := v.hf.ReadAt(buf[:], int64(blk)*blockSize); err != nil {
+		return nil, hostError(err)
+	}
+	raw := buf[off : off+inodeSize]
+	zeroLinks := le.Uint16(raw[inLinks:]) == 0
+	if zeroLinks {
+		if ino == rootIno {
+			return nil, corrupt("root inode %d has no link", ino)
+		}
+		var rawCopy [inodeSize]byte
+		copy(rawCopy[:], raw)
+		le.PutUint16(rawCopy[inLinks:], 1)
+		raw = rawCopy[:]
+	}
+	n, err := v.parseInode(ino, raw)
+	if err != nil {
+		return nil, err
+	}
+	if zeroLinks {
+		n.links = 0
+	}
+
+	v.nodeMu.Lock()
+	defer v.nodeMu.Unlock()
+	if existing, ok := v.nodes[ino]; ok {
+		existing.refs++
+		return existing, nil
+	}
+	n.refs = 1
+	v.nodes[ino] = n
+	return n, nil
 }
 
 // parseInode decodes and validates the raw inode.

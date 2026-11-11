@@ -69,9 +69,14 @@ func (vol *Volume) chunkMemory() ChunkMemory {
 // decides whether the volume accepts writes.
 type InternalFilesystemOptions struct {
 	Volume *Volume
+	// UniqueID identifies this filesystem in CtxRestoreVolumeMap across save
+	// and restore.
+	UniqueID string
 }
 
 // FilesystemType implements vfs.FilesystemType for ext4lite.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // Name implements vfs.FilesystemType.Name.
@@ -91,6 +96,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, linuxerr.EINVAL
 	}
 	vol := iopts.Volume
+	if vol.v.deferredOrphanCleanup {
+		return nil, nil, linuxerr.EINVAL
+	}
 	if !vol.mounted.CompareAndSwap(false, true) {
 		return nil, nil, linuxerr.EBUSY
 	}
@@ -103,16 +111,28 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		vol.mounted.Store(false)
 		return nil, nil, err
 	}
+	if !vol.v.readOnly {
+		if err := vol.v.ensureSessionStarted(); err != nil {
+			return fail(toLinuxErr(err))
+		}
+	}
 	rootNode, err := vol.v.getNode(rootIno)
 	if err != nil {
 		return fail(toLinuxErr(err))
 	}
+	sectors := vol.v.statfs().blocks * (blockSize / blockdev.SectorSize)
+	uniqueID := iopts.UniqueID
+	if uniqueID == "" {
+		uniqueID = source
+	}
 	fs := &filesystem{
-		vol:      vol,
-		v:        vol.v,
-		readOnly: vol.v.readOnly,
-		inodes:   make(map[uint32]*inode),
-		pruneAt:  pruneThreshold,
+		vol:        vol,
+		v:          vol.v,
+		uniqueID:   uniqueID,
+		readOnly:   vol.v.readOnly,
+		devSectors: sectors,
+		inodes:     make(map[uint32]*inode),
+		pruneAt:    pruneThreshold,
 	}
 	// The volume is a disk of the sandbox. The files of the file system report
 	// the number of the disk as st_dev, as the files of a file system on a
@@ -123,7 +143,6 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// file system can use now plus the room that the host volume gives it to
 	// grow, as statfs reports it, and that room changes with the free space of
 	// the host. The disk therefore keeps the size of the mount.
-	sectors := vol.v.statfs().blocks * (blockSize / blockdev.SectorSize)
 	registry := blockdev.Of(vfsObj)
 	fs.dev, err = registry.Add(blockdev.Options{
 		Stats:    vol.v.stats,
@@ -149,29 +168,35 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 // filesystem implements vfs.FilesystemImpl. The engine is the only writer of
 // the volume, so the dentry tree is a cache that is always current. A change
 // of the namespace goes through filesystem.mu.
+//
+// +stateify savable
 type filesystem struct {
-	vfsfs    vfs.Filesystem
-	vol      *Volume
-	v        *volume
-	readOnly bool
+	vfsfs         vfs.Filesystem
+	vol           *Volume `state:"nosave"`
+	v             *volume `state:"nosave"`
+	uniqueID      string
+	readOnly      bool
+	devSectors    uint64
+	savedIdentity volumeIdentity
+	saved         bool `state:"nosave"`
 	// dev is the disk of the volume. It is immutable.
 	dev *blockdev.Device
 
 	// mu protects the dentry tree, the names of dentries, the inode map, and
 	// pending. Lock order: mu, then the locks of the engine nodes, then the
 	// lock of the volume.
-	mu     sync.Mutex
+	mu     sync.Mutex `state:"nosave"`
 	root   *dentry
 	inodes map[uint32]*inode
 	// pending holds references that the VFS returned and that must drop after
 	// mu is released, because dropping them can release this filesystem.
-	pending []refs.RefCounter
+	pending []refs.RefCounter `state:"nosave"`
 
 	dentryCount int
 	pruneAt     int
 
 	// flusher is the background flush of a writable filesystem.
-	flusher *flusher
+	flusher *flusher `state:"nosave"`
 }
 
 // lock takes fs.mu and prunes the dentries.
@@ -272,13 +297,17 @@ func (fs *filesystem) Release(ctx context.Context) {
 		ino.destroy(ctx)
 	}
 	fs.mu.Unlock()
-	fs.vol.dataSync.Store(nil)
-	// Release has no error result, so a failure is logged. An earlier Sync
-	// call already reported the failures that it saw.
-	if err := fs.vol.Close(); err != nil {
-		ctx.Warningf("ext4lite: unmount the volume: %v", err)
+	if fs.vol != nil {
+		fs.vol.dataSync.Store(nil)
+		// Release has no error result, so a failure is logged. An earlier Sync
+		// call already reported the failures that it saw.
+		if err := fs.vol.Close(); err != nil {
+			ctx.Warningf("ext4lite: unmount the volume: %v", err)
+		}
 	}
-	blockdev.Of(fs.vfsfs.VirtualFilesystem()).Remove(fs.dev)
+	if fs.dev != nil {
+		blockdev.Of(fs.vfsfs.VirtualFilesystem()).Remove(fs.dev)
+	}
 }
 
 // MountSource implements vfs.MountSourceProvider.MountSource.

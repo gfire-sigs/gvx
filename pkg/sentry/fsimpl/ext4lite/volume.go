@@ -30,6 +30,9 @@ type volumeOptions struct {
 	// readOnly opens the volume without any write to the host file. A volume
 	// that was not unmounted cleanly fails to open read-only.
 	readOnly bool
+	// deferOrphanCleanup skips orphan cleanup and writable session startup during
+	// openVolume until CompleteRestore validates the superblock identity.
+	deferOrphanCleanup bool
 	// now returns the current time. The default is time.Now.
 	now func() time.Time
 }
@@ -73,9 +76,13 @@ type volume struct {
 	// it. orphanHead is the first inode of the chain that the next snapshot
 	// writes into the superblock, and orphanChanged tells the snapshot to write
 	// it.
-	orphans       map[uint32]*node
-	orphanHead    uint32
-	orphanChanged bool
+	orphans               map[uint32]*node
+	orphanHead            uint32
+	orphanChanged         bool
+	deferredOrphanCleanup bool
+	sessionStarted        bool
+	savedForCheckpoint    bool
+	openedIdentity        volumeIdentity
 
 	// assertGate makes the allocator panic when a caller changes it outside the
 	// operation gate. The VFS tests turn it on to find an operation that
@@ -134,6 +141,20 @@ func (v *volume) numGroups() uint32 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return uint32(len(v.groups))
+}
+
+// setStats binds stats as the block device counter sink of v and its underlying
+// countedFile wrapper.
+func (v *volume) setStats(stats *blockdev.Stats) {
+	if stats == nil {
+		return
+	}
+	v.stats = stats
+	if tf, ok := v.hf.(*trackedFile); ok {
+		if cf, ok := tf.hostFile.(*countedFile); ok {
+			cf.stats = stats
+		}
+	}
 }
 
 func (v *volume) sbU32(off int) uint32       { return le.Uint32(v.sb[off:]) }
@@ -234,6 +255,7 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	if v.j, err = v.loadJournal(); err != nil {
 		return nil, err
 	}
+	onDiskClean := v.state&stateValid != 0 && v.state&stateError == 0 && (v.j == nil || !v.j.needsReplay(v.sb[:]))
 	recovered := false
 	if v.j != nil {
 		v.j.seq = v.j.super.sequence
@@ -292,31 +314,16 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	if err := v.runFixups(); err != nil {
 		return nil, err
 	}
+	v.openedIdentity = v.captureIdentity(onDiskClean)
 	if v.readOnly {
 		return v, nil
 	}
-	if v.j == nil && !disableJournalUpgrade.Load() {
-		// An old volume gets a journal when group 0 has room for it.
-		if ok, err := v.createJournal(true); err != nil {
-			return nil, err
-		} else if ok {
-			if err := v.flushDirectLocked(); err != nil {
-				return nil, err
-			}
-		}
+	if opts.deferOrphanCleanup {
+		v.deferredOrphanCleanup = true
+		return v, nil
 	}
-	if v.j != nil {
-		if err := v.startSession(); err != nil {
-			return nil, err
-		}
-	} else {
-		// Clear the valid bit first. The next mount runs fsckLite when this
-		// mount ends abnormally.
-		v.state &^= stateValid
-		v.sbDirty = true
-		if err := v.writeSuperblockNow(); err != nil {
-			return nil, err
-		}
+	if err := v.ensureSessionStartedLocked(); err != nil {
+		return nil, err
 	}
 	// A crash can leave inodes that a guest unlinked and still held open.
 	cleaned, err := v.cleanOrphans()
@@ -329,6 +336,53 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 		}
 	}
 	return v, nil
+}
+
+// ensureSessionStarted starts the writable superblock or journal session if it
+// is not yet active.
+func (v *volume) ensureSessionStarted() error {
+	v.flushMu.Lock()
+	defer v.flushMu.Unlock()
+	return v.ensureSessionStartedLocked()
+}
+
+// ensureSessionStartedLocked starts the writable superblock or journal session.
+// The caller holds flushMu or owns the volume before publication.
+func (v *volume) ensureSessionStartedLocked() error {
+	if v.readOnly || v.sessionStarted {
+		return nil
+	}
+	if v.j == nil && !disableJournalUpgrade.Load() && !v.deferredOrphanCleanup {
+		// An old volume gets a journal when group 0 has room for it.
+		if ok, err := v.createJournal(true); err != nil {
+			return err
+		} else if ok {
+			if err := v.flushDirectLocked(); err != nil {
+				return err
+			}
+		}
+	}
+	v.mu.Lock()
+	v.setSbU16(sbMntCount, v.sbU16(sbMntCount)+1)
+	v.mu.Unlock()
+	if v.j != nil {
+		if err := v.startSession(); err != nil {
+			return err
+		}
+	} else {
+		// Clear the valid bit first. The next mount runs fsckLite when this
+		// mount ends abnormally.
+		v.mu.Lock()
+		v.state &^= stateValid
+		v.sbDirty = true
+		v.mu.Unlock()
+		if err := v.writeSuperblockNow(); err != nil {
+			return err
+		}
+	}
+	v.sessionStarted = true
+	v.savedForCheckpoint = false
+	return nil
 }
 
 // loadGroups reads the group descriptors and the bitmaps.
@@ -407,7 +461,7 @@ func (v *volume) close() error {
 	v.assertGate.Store(false)
 
 	var errs []error
-	if !v.readOnly {
+	if !v.readOnly && v.sessionStarted && !v.savedForCheckpoint {
 		if err := v.shutdownLocked(); err != nil {
 			errs = append(errs, err)
 		}
