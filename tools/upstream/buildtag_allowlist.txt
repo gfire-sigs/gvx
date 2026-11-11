@@ -30,6 +30,7 @@ seam pkg/tcpip/tcpip_state_autogen.go
 seam pkg/erofs/erofs.go
 seam pkg/erofs/erofs_state_autogen.go
 seam pkg/sentry/fsimpl/erofs/erofs.go
+seam pkg/sentry/fsimpl/erofs/erofs_state_autogen.go
 seam pkg/sentry/fsimpl/erofs/filesystem.go
 # An image can count its file reads as the reads of a disk
 # (pkg/sentry/fsimpl/erofs/blockstats_xplat.go).

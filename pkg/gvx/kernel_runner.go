@@ -1416,9 +1416,9 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	disks := blockdev.Of(vfsObj)
 	rootBytes := s.layerBytes
 	rootDisk, err := disks.Add(blockdev.Options{
-		Stats:    rootStats,
-		Sectors:  func() uint64 { return rootBytes / blockdev.SectorSize },
-		ReadOnly: true,
+		Stats:        rootStats,
+		SectorsCount: rootBytes / blockdev.SectorSize,
+		ReadOnly:     true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gvx: add the root disk: %w", err)
@@ -1450,9 +1450,16 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 			cleanupLowers()
 			return nil, fmt.Errorf("gvx: release dup EROFS layer handle: %w", err)
 		}
+		var digest string
+		if i < len(s.layerDigests) {
+			digest = s.layerDigests[i]
+		}
 		fs, rootDentry, err := erofs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
-			Data:         fmt.Sprintf("ifd=%d", int(dupFD)),
-			InternalData: erofs.InternalFilesystemOptions{BlockStats: rootStats},
+			Data: fmt.Sprintf("ifd=%d", int(dupFD)),
+			InternalData: erofs.InternalFilesystemOptions{
+				UniqueID:   EROFSUniqueID("/", i, digest),
+				BlockStats: rootStats,
+			},
 		})
 		if err != nil {
 			cleanupLowers()

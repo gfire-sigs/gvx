@@ -17,6 +17,7 @@
 package chunkcache
 
 import (
+	stdcontext "context"
 	"errors"
 	"fmt"
 	"io"
@@ -69,8 +70,10 @@ type chunkMemoryBox struct {
 }
 
 // ChunkMemoryHolder stores a ChunkMemory reference atomically.
+//
+// +stateify savable
 type ChunkMemoryHolder struct {
-	ptr atomic.Pointer[chunkMemoryBox]
+	ptr atomic.Pointer[chunkMemoryBox] `state:"nosave"`
 }
 
 // Set stores mem as the active ChunkMemory.
@@ -266,8 +269,10 @@ func SeekRegular(curOff, offset int64, whence int32, fileSize func() (int64, err
 }
 
 // DirCursor tracks the snapshot and offset of an open directory description.
+//
+// +stateify savable
 type DirCursor struct {
-	mu       sync.Mutex
+	mu       sync.Mutex `state:"nosave"`
 	snapshot []vfs.Dirent
 	loaded   bool
 	off      int64
@@ -375,22 +380,34 @@ type CacheBackend interface {
 }
 
 // Cache holds the mapped-page chunks and mapping state of a regular file.
+//
+// +stateify savable
 type Cache struct {
-	backend CacheBackend
+	backend CacheBackend `state:"nosave"`
 
-	Active atomic.Bool
+	Active atomic.Bool `state:"nosave"`
 
 	// MapsMu protects Mappings. Lock order: MapsMu, then DataMu.
-	MapsMu   sync.Mutex
+	MapsMu   sync.Mutex `state:"nosave"`
 	Mappings memmap.MappingSet
 
 	// DataMu protects the fields below.
-	DataMu       sync.Mutex
-	Chunks       map[uint64]*Chunk
+	DataMu       sync.Mutex        `state:"nosave"`
+	Chunks       map[uint64]*Chunk `state:"nosave"`
 	WritableMaps int
-	WBErr        error
+	WBErr        error `state:"nosave"`
 
 	mf dataMemmapFile
+}
+
+func (c *Cache) beforeSave() {
+	if len(c.Chunks) != 0 {
+		panic("chunkcache: Cache saved with live chunks; call FlushAndDropLocked in PrepareSave")
+	}
+}
+
+func (c *Cache) afterLoad(stdcontext.Context) {
+	c.mf.cache = c
 }
 
 // Init binds the cache to b.
@@ -407,6 +424,65 @@ func (c *Cache) DropLocked() {
 	c.Chunks = nil
 	c.Active.Store(false)
 	c.backend.DropBackendLocked()
+}
+
+// FlushAndDropLocked writes back dirty chunks, invalidates active MMU
+// mappings, and releases every chunk allocation from the backing MemoryFile.
+// Call it during PrepareSave with MapsMu and DataMu held.
+//
+// +checklocks:c.MapsMu
+// +checklocks:c.DataMu
+func (c *Cache) FlushAndDropLocked() error {
+	if c.backend != nil && (c.Active.Load() || len(c.Chunks) > 0) {
+		flushErr := c.backend.FlushLocked(0, math.MaxUint64)
+		if err := errors.Join(c.WBErr, flushErr); err != nil {
+			c.WBErr = err
+			return err
+		}
+	} else if c.WBErr != nil {
+		return c.WBErr
+	}
+	c.WBErr = nil
+	if !c.Mappings.IsEmpty() {
+		c.DataMu.Unlock()
+		c.Mappings.InvalidateAll(memmap.InvalidateOpts{})
+		c.DataMu.Lock()
+	}
+	if c.backend != nil {
+		c.DropLocked()
+	} else {
+		for _, ch := range c.Chunks {
+			ch.Release()
+		}
+		c.Chunks = nil
+		c.Active.Store(false)
+	}
+	return nil
+}
+
+// RearmMappedLocked binds b to the restored cache and activates chunk storage
+// when active mappings exist. Call it during CompleteRestore with MapsMu and
+// DataMu held after restoring the backing MemoryFile and file handle.
+//
+// +checklocks:c.MapsMu
+// +checklocks:c.DataMu
+func (c *Cache) RearmMappedLocked(b CacheBackend) error {
+	c.Init(b)
+	if c.Mappings.IsEmpty() {
+		return nil
+	}
+	if err := c.backend.PrepareAddMappingLocked(); err != nil {
+		return err
+	}
+	if c.Chunks == nil {
+		c.Chunks = make(map[uint64]*Chunk)
+	}
+	c.Active.Store(true)
+	if err := c.backend.CanTranslateLocked(c.WritableMaps > 0); err != nil {
+		c.DropLocked()
+		return err
+	}
+	return nil
 }
 
 // TakeWritebackErr returns and clears any deferred write-back failure.
@@ -683,6 +759,8 @@ func (c *Cache) Translate(ctx context.Context, required, optional memmap.Mappabl
 }
 
 // dataMemmapFile exposes the chunks of a Cache as a memmap.File.
+//
+// +stateify savable
 type dataMemmapFile struct {
 	memmap.DefaultMemoryType
 	memmap.NoBufferedIOFallback

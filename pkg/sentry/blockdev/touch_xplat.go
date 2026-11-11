@@ -15,6 +15,7 @@
 package blockdev
 
 import (
+	"context"
 	"math/bits"
 	"sync/atomic"
 )
@@ -30,9 +31,26 @@ const PageSize = 4096
 // read and not at each mapping or read of it.
 //
 // The set uses one bit for each page and takes no lock.
+//
+// +stateify savable
 type FirstTouch struct {
 	size  uint64
-	words []atomic.Uint64
+	words []atomic.Uint64 `state:".([]uint64)"`
+}
+
+func (t *FirstTouch) saveWords() []uint64 {
+	out := make([]uint64, len(t.words))
+	for i := range t.words {
+		out[i] = t.words[i].Load()
+	}
+	return out
+}
+
+func (t *FirstTouch) loadWords(_ context.Context, src []uint64) {
+	t.words = make([]atomic.Uint64, len(src))
+	for i, v := range src {
+		t.words[i].Store(v)
+	}
 }
 
 // NewFirstTouch returns an empty set for an image of size bytes.

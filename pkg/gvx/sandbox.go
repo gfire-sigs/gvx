@@ -51,6 +51,7 @@ type Sandbox struct {
 	memFile       *pgalloc.MemoryFile
 	resolvedImg   *oci.ResolvedImage
 	layerHandles  []*fd.HostHandle
+	layerDigests  []string
 	layerBytes    uint64
 	workspace     *hostfs.Workspace
 	workspaces    []*hostfs.Workspace
@@ -545,6 +546,7 @@ func (s *Sandbox) Close() error {
 		}
 	}
 	s.layerHandles = nil
+	s.layerDigests = nil
 
 	if s.resolvedImg != nil {
 		if err := s.resolvedImg.Close(); err != nil {

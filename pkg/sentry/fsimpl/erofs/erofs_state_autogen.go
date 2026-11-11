@@ -129,6 +129,7 @@ func (fs *filesystem) StateFields() []string {
 		"root",
 		"image",
 		"mf",
+		"touched",
 		"zeroPage",
 		"useReadForIO",
 		"inodeBuckets",
@@ -151,13 +152,14 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(4, &fs.root)
 	stateSinkObject.Save(5, &fs.image)
 	stateSinkObject.Save(6, &fs.mf)
-	stateSinkObject.Save(7, &fs.zeroPage)
-	stateSinkObject.SaveBool(8, &fs.useReadForIO)
-	stateSinkObject.Save(9, &fs.inodeBuckets)
-	stateSinkObject.Save(10, &fs.cachedDentries)
-	stateSinkObject.SaveUint64(11, &fs.cachedDentriesLen)
-	stateSinkObject.SaveUint64(12, &fs.maxCachedDentries)
-	stateSinkObject.Save(13, &fs.released)
+	stateSinkObject.Save(7, &fs.touched)
+	stateSinkObject.Save(8, &fs.zeroPage)
+	stateSinkObject.SaveBool(9, &fs.useReadForIO)
+	stateSinkObject.Save(10, &fs.inodeBuckets)
+	stateSinkObject.Save(11, &fs.cachedDentries)
+	stateSinkObject.SaveUint64(12, &fs.cachedDentriesLen)
+	stateSinkObject.SaveUint64(13, &fs.maxCachedDentries)
+	stateSinkObject.Save(14, &fs.released)
 }
 
 // +checklocksignore
@@ -169,13 +171,14 @@ func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(4, &fs.root)
 	stateSourceObject.Load(5, &fs.image)
 	stateSourceObject.Load(6, &fs.mf)
-	stateSourceObject.Load(7, &fs.zeroPage)
-	stateSourceObject.LoadBool(8, &fs.useReadForIO)
-	stateSourceObject.Load(9, &fs.inodeBuckets)
-	stateSourceObject.Load(10, &fs.cachedDentries)
-	stateSourceObject.LoadUint64(11, &fs.cachedDentriesLen)
-	stateSourceObject.LoadUint64(12, &fs.maxCachedDentries)
-	stateSourceObject.Load(13, &fs.released)
+	stateSourceObject.Load(7, &fs.touched)
+	stateSourceObject.Load(8, &fs.zeroPage)
+	stateSourceObject.LoadBool(9, &fs.useReadForIO)
+	stateSourceObject.Load(10, &fs.inodeBuckets)
+	stateSourceObject.Load(11, &fs.cachedDentries)
+	stateSourceObject.LoadUint64(12, &fs.cachedDentriesLen)
+	stateSourceObject.LoadUint64(13, &fs.maxCachedDentries)
+	stateSourceObject.Load(14, &fs.released)
 	stateSourceObject.AfterLoadTo(fs)
 }
 
@@ -191,6 +194,7 @@ func (i *InternalFilesystemOptions) StateTypeName() string {
 func (i *InternalFilesystemOptions) StateFields() []string {
 	return []string{
 		"UniqueID",
+		"BlockStats",
 	}
 }
 
@@ -200,6 +204,7 @@ func (i *InternalFilesystemOptions) beforeSave() {}
 func (i *InternalFilesystemOptions) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.UniqueID)
+	stateSinkObject.Save(1, &i.BlockStats)
 }
 
 func (i *InternalFilesystemOptions) afterLoad(context.Context) {}
@@ -207,6 +212,7 @@ func (i *InternalFilesystemOptions) afterLoad(context.Context) {}
 // +checklocksignore
 func (i *InternalFilesystemOptions) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.UniqueID)
+	stateSourceObject.Load(1, &i.BlockStats)
 }
 
 func (ib *inodeBucket) StateTypeName() string {

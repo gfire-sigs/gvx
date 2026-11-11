@@ -98,6 +98,10 @@ func ClassifyPackage(relPkgDir string) PackageTier {
 
 // ClassifyFilePartition assigns a non-autogen, non-test Go file to an output partition.
 func ClassifyFilePartition(pkgTier PackageTier, baseName string, partitionByTier bool) PartitionKind {
+	return classifyFilePartition(pkgTier, baseName, partitionByTier, false)
+}
+
+func classifyFilePartition(pkgTier PackageTier, baseName string, partitionByTier, tier1MergeXplat bool) PartitionKind {
 	if !partitionByTier {
 		return PartitionDefault
 	}
@@ -106,7 +110,7 @@ func ClassifyFilePartition(pkgTier PackageTier, baseName string, partitionByTier
 		return PartitionDarwin
 	case hasUnderscoreToken(baseName, "windows"):
 		return PartitionWindows
-	case hasUnderscoreToken(baseName, "xplat"):
+	case !tier1MergeXplat && hasUnderscoreToken(baseName, "xplat"):
 		return PartitionXplat
 	case pkgTier == PackageTier1 && hasUnderscoreToken(baseName, "linux"):
 		return PartitionLinux
