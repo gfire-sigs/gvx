@@ -113,9 +113,6 @@ type Set struct {
 	portTo      uint16
 	listSize    uint32
 
-	// rangeYieldHook runs in tests while hashUadt releases mu between chunks.
-	rangeYieldHook func() `state:"nosave"`
-
 	mu sync.Mutex `state:"nosave"`
 	// The fields below are guarded by mu.
 	store store

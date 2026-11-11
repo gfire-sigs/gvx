@@ -60,6 +60,13 @@ func (e *a64Env) newContext() (*Context, *arch.Context64) {
 
 func (e *a64Env) comm(vp *fakeVP) *CommPage { return e.p.kernel.commPage(int(vp.index)) }
 
+func (e *a64Env) commCopy(vp *fakeVP) *CommPage {
+	var buf [pageSize]byte
+	slot := int(vp.index)
+	copy(buf[:], e.p.kernel.commMem[slot*pageSize:(slot+1)*pageSize])
+	return overlayCommPage(buf[:])
+}
+
 func (e *a64Env) reload() uint64 {
 	return e.p.kernel.layout.code() + uint64(e.p.kernel.a64.Reload)
 }
@@ -76,7 +83,7 @@ func (e *a64Env) trap(vp *fakeVP, exit []byte, slot, esrVal, far, elr uint64, mu
 	if mutate != nil {
 		mutate(c)
 	}
-	atomic.StoreUint32(&c.ExitReason, uint32(ExitException))
+	c.ExitReason.Store(uint32(ExitException))
 	writeStubExit(exit, e.exit())
 }
 
@@ -101,8 +108,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 
 	var saw []*CommPage
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		cp := *e.comm(vp)
-		saw = append(saw, &cp)
+		saw = append(saw, e.commCopy(vp))
 		e.svc(vp, exit, 0x400004, func(c *CommPage) {
 			c.Regs[0] = 0xAA
 			c.TLS = 0x5678
@@ -129,11 +135,11 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if first.Root != e.as.rootValue() {
 		t.Errorf("root is %#x, want %#x", first.Root, e.as.rootValue())
 	}
-	if first.Flags != flagReloadRoot|flagICacheSync {
-		t.Errorf("first entry flags are %#x, want a TLB flush and an icache sync", first.Flags)
+	if first.Flags.Load() != flagReloadRoot|flagICacheSync {
+		t.Errorf("first entry flags are %#x, want a TLB flush and an icache sync", first.Flags.Load())
 	}
-	if first.ExitReason != uint32(ExitNone) {
-		t.Errorf("exit reason is %d before the run", first.ExitReason)
+	if first.ExitReason.Load() != uint32(ExitNone) {
+		t.Errorf("exit reason is %d before the run", first.ExitReason.Load())
 	}
 	if r.Regs[0] != 0xAA || r.Regs[1] != 0x1001 || r.Pc != 0x400004 || r.Sp != 0x7FFF0000 ||
 		r.TPIDR_EL0 != 0x5678 || r.Pstate != 0x20000000 || ac.StateData().OrigR0 != 0xAA {
@@ -152,7 +158,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if vp.reg(a64RegTtbr0) != e.as.rootValue() {
 		t.Errorf("TTBR0_EL1 is %#x, want %#x", vp.reg(a64RegTtbr0), e.as.rootValue())
 	}
-	if vp.reg(a64RegSpEl1) != vp.regs[a64RegSpEl1][0] || vp.reg(a64RegSpEl1) != e.p.kernel.layout.comm(0) {
+	if vp.reg(a64RegSpEl1) != e.p.kernel.layout.comm(0) {
 		t.Errorf("SP_EL1 is %#x, want the CommPage address %#x", vp.reg(a64RegSpEl1), e.p.kernel.layout.comm(0))
 	}
 	if vp.reg(a64RegPstate) != a64PstateKernel || vp.reg(a64RegPc) != e.reload() {
@@ -161,8 +167,7 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 
 	// Second syscall of the same thread: one PC write, no flush.
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		cp := *e.comm(vp)
-		saw = append(saw, &cp)
+		saw = append(saw, e.commCopy(vp))
 		e.svc(vp, exit, 0x400008, nil)
 		return nil
 	}
@@ -175,8 +180,8 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	if vp.reg(a64RegPc) != e.reload() {
 		t.Errorf("resume PC is %#x, want the reload path %#x", vp.reg(a64RegPc), e.reload())
 	}
-	if saw[1].Flags != 0 {
-		t.Errorf("second entry flags are %#x, want none", saw[1].Flags)
+	if saw[1].Flags.Load() != 0 {
+		t.Errorf("second entry flags are %#x, want none", saw[1].Flags.Load())
 	}
 	if saw[1].PC != 0x400004 {
 		t.Errorf("second entry resumes at %#x, want the previous ELR", saw[1].PC)
@@ -456,7 +461,7 @@ func TestSwitchMemoryFaultAtEL0IsSIGBUS(t *testing.T) {
 	c, ac := e.newContext()
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
 		for i := range 31 {
-			e.fb.vps[0].regs[a64RegX0+uint32(i)] = [2]uint64{uint64(i), 0}
+			e.fb.setReg(0, a64RegX0+uint32(i), uint64(i))
 		}
 		clear(exit)
 		binary.LittleEndian.PutUint32(exit[a64ExitOffReason:], a64ExitUnmappedGpa)
@@ -493,7 +498,7 @@ func TestSwitchFlushesWhenTheTranslationStateChanges(t *testing.T) {
 	c, ac := e.newContext()
 	var flags []uint32
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
-		flags = append(flags, e.comm(vp).Flags)
+		flags = append(flags, e.comm(vp).Flags.Load())
 		e.svc(vp, exit, 4, nil)
 		return nil
 	}
@@ -708,7 +713,7 @@ func TestThreadInitRunsOnEverySwitch(t *testing.T) {
 	fb.onRun = func(vp *fakeVP, exit []byte) error {
 		cp := p.kernel.commPage(int(vp.index))
 		cp.Vector, cp.ESR = a64SlotLowA64Sync, esr(hvcommon.ECSVC64, 0)
-		atomic.StoreUint32(&cp.ExitReason, uint32(ExitException))
+		cp.ExitReason.Store(uint32(ExitException))
 		writeStubExit(exit, p.kernel.layout.code()+uint64(p.kernel.a64.Exit))
 		return nil
 	}

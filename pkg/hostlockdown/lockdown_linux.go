@@ -101,12 +101,12 @@ func probeExecBlocked() error {
 	}
 	_, _, errno := unix.Syscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(path)), 0, 0)
 	if errno != unix.EPERM {
-		return fmt.Errorf("hostlockdown: the execve probe returned %v, want EPERM", errnoOrNone(errno))
+		return fmt.Errorf("hostlockdown: the execve probe returned %w, want EPERM", errnoOrNone(errno))
 	}
 	atFDCWD := unix.AT_FDCWD
 	_, _, errno = unix.Syscall6(unix.SYS_EXECVEAT, uintptr(atFDCWD), uintptr(unsafe.Pointer(path)), 0, 0, 0, 0)
 	if errno != unix.EPERM {
-		return fmt.Errorf("hostlockdown: the execveat probe returned %v, want EPERM", errnoOrNone(errno))
+		return fmt.Errorf("hostlockdown: the execveat probe returned %w, want EPERM", errnoOrNone(errno))
 	}
 	return nil
 }
@@ -118,7 +118,7 @@ func probeExecBlocked() error {
 func probeForkBlocked() error {
 	_, _, errno := unix.RawSyscall6(unix.SYS_CLONE, unix.CLONE_THREAD, 0, 0, 0, 0, 0)
 	if errno != unix.EPERM {
-		return fmt.Errorf("hostlockdown: the clone probe returned %v, want EPERM", errnoOrNone(errno))
+		return fmt.Errorf("hostlockdown: the clone probe returned %w, want EPERM", errnoOrNone(errno))
 	}
 	return nil
 }
@@ -172,7 +172,7 @@ func probeSocketBlocked() error {
 		return errors.New("hostlockdown: the socket probe created a TCP socket")
 	}
 	if !errors.Is(err, unix.EPERM) {
-		return fmt.Errorf("hostlockdown: the socket probe returned %v, want EPERM", err)
+		return fmt.Errorf("hostlockdown: the socket probe returned %w, want EPERM", err)
 	}
 	return nil
 }

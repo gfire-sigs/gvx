@@ -239,7 +239,7 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 			}
 			return r
 		case exitCanceled:
-			if ExitReason(atomic.LoadUint32(&v.comm.ExitReason)) != ExitNone {
+			if ExitReason(v.comm.ExitReason.Load()) != ExitNone {
 				// The stub finished spilling guest state into the CommPage
 				// right as WHvCancelRunVirtualProcessor stopped the vCPU at
 				// its exit instruction. Serve the completed stub exit instead
@@ -274,7 +274,7 @@ func (v *vcpu) decodeExit() (exitInfo, error) {
 		ex, err := decodeExitA64(v.exit)
 		if err == nil && ex.kind == exitMemory && ex.gpa == 0 && ex.inKernel(true) &&
 			ex.pc == v.p.kernel.layout.code()+uint64(v.p.kernel.a64.Exit) &&
-			ExitReason(atomic.LoadUint32(&v.comm.ExitReason)) == ExitException {
+			ExitReason(v.comm.ExitReason.Load()) == ExitException {
 			ex.kind = exitStub
 		}
 		return ex, err

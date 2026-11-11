@@ -427,36 +427,37 @@ type dimension struct {
 	// set with the create option netmask, which has one element for each
 	// network of the netmask.
 	step uint32
+	done bool
 }
 
-// each calls yield for every component of the dimension until yield returns
-// false. It reports whether the walk reached the end.
-func (d *dimension) each(yield func(component) bool) bool {
+// next returns the next component of the dimension and reports whether one
+// existed. A copy of a newly built dimension starts at the beginning.
+func (d *dimension) next() (component, bool) {
+	if d.done {
+		return component{}, false
+	}
 	if !d.ranged {
-		return yield(d.one)
+		d.done = true
+		return d.one, true
 	}
 	if d.blocks {
-		from := d.from
-		for {
-			last, c := rangeToCIDR(from, d.to)
-			if !yield(component{addr4(from), c}) {
-				return false
-			}
-			if last >= d.to || last == ^uint32(0) {
-				return true
-			}
-			from = last + 1
+		last, c := rangeToCIDR(d.from, d.to)
+		out := component{addr4(d.from), c}
+		if last >= d.to || last == ^uint32(0) {
+			d.done = true
+		} else {
+			d.from = last + 1
 		}
+		return out, true
 	}
 	step := max(d.step, 1)
-	for a := d.from; ; a += step {
-		if !yield(component{addr4(a), 0}) {
-			return false
-		}
-		if d.to-a < step {
-			return true
-		}
+	out := component{addr4(d.from), 0}
+	if d.to-d.from < step {
+		d.done = true
+	} else {
+		d.from += step
 	}
+	return out, true
 }
 
 // newDimension validates an address attribute with its range or prefix.
@@ -591,19 +592,7 @@ func (s *Set) hashUadt(adt Adt, e *Element, flags uint32) int {
 	}
 	bitmask := spec.bitmask && spec.ipNet
 
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	changed := 0
-	apply := func(a, b component, p uint16) int {
-		if changed++; changed%rangeChunk == 0 {
-			s.mu.Unlock() // +checklocksforce: the closure runs with s.mu held
-			if s.rangeYieldHook != nil {
-				s.rangeYieldHook()
-			}
-			s.mu.Lock()
-			now = s.now()
-		}
+	makeKey := func(a, b component, p uint16) hashKey {
 		k := hashKey{ip: a.addr, ip2: b.addr, port: p, proto: proto}
 		if bitmask {
 			k.ip, k.ip2 = k.ip.and(s.bitmask), k.ip2.and(s.bitmask)
@@ -614,28 +603,31 @@ func (s *Set) hashUadt(adt Adt, e *Element, flags uint32) int {
 		if spec.ip2Net {
 			k.cidr2 = b.cidr
 		}
-		return s.hashApply(adt, k, nomatch, &x, flags, now)
+		return k
 	}
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if adt == AdtTest {
-		return s.testResult(apply(first.one, second.one, port), nomatch)
+		return s.testResult(s.hashApply(adt, makeKey(first.one, second.one, port), nomatch, &x, flags, now), nomatch)
 	}
-	ret = 0
-	first.each(func(a component) bool {
+	changed := 0
+	for a, ok := first.next(); ok; a, ok = first.next() {
 		for p := uint32(port); p <= uint32(portTo); p++ {
-			ok := second.each(func(b component) bool {
-				if r := apply(a, b, uint16(p)); r != 0 && !(r == -ErrExist && flags&FlagExist != 0) {
-					ret = r
-					return false
+			bDim := second
+			for b, ok := bDim.next(); ok; b, ok = bDim.next() {
+				if changed++; changed%rangeChunk == 0 {
+					s.mu.Unlock()
+					now = s.now()
+					s.mu.Lock()
 				}
-				return true
-			})
-			if !ok {
-				return false
+				if r := s.hashApply(adt, makeKey(a, b, uint16(p)), nomatch, &x, flags, now); r != 0 && !(r == -ErrExist && flags&FlagExist != 0) {
+					return r
+				}
 			}
 		}
-		return true
-	})
-	return ret
+	}
+	return 0
 }
 
 // testResult converts the result of a lookup for a TEST command to the code

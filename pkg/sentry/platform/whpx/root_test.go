@@ -61,7 +61,7 @@ func (e *rootEnv) install() {
 	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
 		e.entries = append(e.entries, rootEntry{
 			root:  vp.reg(rootReg),
-			flags: e.p.kernel.commPage(int(vp.index)).Flags,
+			flags: e.p.kernel.commPage(int(vp.index)).Flags.Load(),
 		})
 		if e.block {
 			e.block = false

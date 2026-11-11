@@ -115,7 +115,11 @@ func startInstance(ctx context.Context, identity instanceIdentity, timeout time.
 	}
 	defer reportRead.Close()
 	defer reportWrite.Close()
-	child = exec.Command(executable, "-namespace", identity.Namespace, "-id", identity.ID, "-address", identity.ContainerdAddress, "-bundle", identity.Bundle, "-timeout", timeout.String(), "serve")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// context.WithoutCancel keeps the serve daemon alive after startInstance returns.
+	child = exec.CommandContext(context.WithoutCancel(ctx), executable, "-namespace", identity.Namespace, "-id", identity.ID, "-address", identity.ContainerdAddress, "-bundle", identity.Bundle, "-timeout", timeout.String(), "serve")
 	child.Stdin = configRead
 	child.Stdout = reportWrite
 	child.Stderr = diagnostics

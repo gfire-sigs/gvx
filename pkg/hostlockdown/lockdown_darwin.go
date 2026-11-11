@@ -226,7 +226,7 @@ func sandboxInit(profile string, kv []string) error {
 		darwinSyscall6(addrOfSandboxFreeError(), uintptr(unsafe.Pointer(errBuf)), 0, 0, 0, 0, 0)
 		sandboxErrBuf = nil
 	}
-	return fmt.Errorf("hostlockdown: sandbox_init_with_parameters rc=%d errno=%v: %s", int32(r1), errno, detail)
+	return fmt.Errorf("hostlockdown: sandbox_init_with_parameters rc=%d errno=%w: %s", int32(r1), errno, detail)
 }
 
 //go:cgo_import_dynamic libc_sandbox_init_with_parameters sandbox_init_with_parameters "/usr/lib/libSystem.B.dylib"

@@ -93,6 +93,7 @@ func resolveRegistryImage(ctx context.Context, cache *oci.LayerCache, req regist
 		if !errors.Is(err, oci.ErrNotCached) {
 			return img, err
 		}
+	case PullAlways:
 	}
 
 	img, pullErr := pull(ctx, nil, req.baseURL, req.repo, req.tag, req.arch, cache)
