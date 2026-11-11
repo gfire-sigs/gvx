@@ -490,11 +490,11 @@ func (w *Workspace) listName(dirRel, leaf string) string {
 // codec never writes it: a malformed escape, or a name that no form of the
 // decoded guest name matches.
 func (w *Workspace) hiddenByName(leaf string) bool {
-	if !strings.HasPrefix(leaf, codecPrefix) {
-		return false
-	}
 	if isEphemeralName(leaf) {
 		return true
+	}
+	if !strings.HasPrefix(leaf, codecPrefix) {
+		return false
 	}
 	if !w.codec.active {
 		return false

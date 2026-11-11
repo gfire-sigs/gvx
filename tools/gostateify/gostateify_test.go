@@ -30,9 +30,11 @@ func TestGoldenUpstreamPackages(t *testing.T) {
 	goldenPackages := []string{
 		"pkg/bitmap",
 		"pkg/bpf",
+		"pkg/gvx",
 		"pkg/ilist",
 		"pkg/refs",
 		"pkg/sentry/checkpoint",
+		"pkg/sentry/fsimpl/hostfs",
 		"pkg/sentry/fsimpl/kernfs",
 		"pkg/sentry/fsimpl/overlay",
 		"pkg/sentry/fsimpl/tmpfs",

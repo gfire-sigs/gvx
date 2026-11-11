@@ -15,6 +15,7 @@
 package hostfs
 
 import (
+	goContext "context"
 	"errors"
 	"io"
 	"math"
@@ -34,15 +35,39 @@ import (
 )
 
 // regularFD implements vfs.FileDescriptionImpl for regular files.
+//
+// +stateify savable
 type regularFD struct {
 	fileDescription
 
+	hostFlags int
+	savedRel  string
+
 	// mu protects off.
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	off int64
 	// dirSynced is set once a write through a synchronous description made
 	// the directory entry durable. See durability.go.
-	dirSynced atomic.Bool
+	dirSynced atomic.Bool `state:".(bool)"`
+}
+
+func (fd *regularFD) saveDirSynced() bool {
+	return fd.dirSynced.Load()
+}
+
+func (fd *regularFD) loadDirSynced(_ goContext.Context, v bool) {
+	fd.dirSynced.Store(v)
+}
+
+func linuxAccessToHostFlags(flags uint32) int {
+	switch flags & linux.O_ACCMODE {
+	case linux.O_WRONLY:
+		return os.O_WRONLY
+	case linux.O_RDWR:
+		return os.O_RDWR
+	default:
+		return os.O_RDONLY
+	}
 }
 
 // openHost opens the host file of d. It passes the entry that the lookup
@@ -60,6 +85,9 @@ func (d *dentry) openHost(flags int) (*hostHandle, error) {
 		if t := d.tmpOf(); t != nil {
 			return d.fs.ws.openTmp(t, flags)
 		}
+		if d.inode.savedTmpRel != "" {
+			return d.fs.ws.openEphemeralHandle(d.inode.savedTmpRel, flags)
+		}
 	}
 	rel := d.path()
 	h, err := d.fs.ws.openHandleWithAttr(rel, d.inode.snapshot(), flags)
@@ -75,27 +103,25 @@ func (d *dentry) openHost(flags int) (*hostHandle, error) {
 func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *hostHandle) (*vfs.FileDescription, error) {
 	h := created
 	writable := vfs.MayWriteFileWithOpenFlags(opts.Flags)
+	hostFlags := linuxAccessToHostFlags(opts.Flags)
 	if h == nil {
-		hostFlags := os.O_RDONLY
-		switch opts.Flags & linux.O_ACCMODE {
-		case linux.O_WRONLY:
-			hostFlags = os.O_WRONLY
-		case linux.O_RDWR:
-			hostFlags = os.O_RDWR
-		}
 		var err error
 		h, err = d.openHost(hostFlags)
 		if err != nil {
 			return nil, translateHostError(err)
 		}
 	}
-	fd := &regularFD{fileDescription: fileDescription{dentry: d, h: h}}
+	fd := &regularFD{
+		fileDescription: fileDescription{dentry: d, h: h},
+		hostFlags:       hostFlags,
+	}
 	fd.LockFD.Init(&d.inode.locks)
 	mnt := rp.Mount()
 	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Credentials(), mnt, &d.vfsd, &vfs.FileDescriptionOptions{AllowDirectIO: true}); err != nil {
 		_ = h.decRef()
 		return nil, err
 	}
+	d.fs.trackRegularFD(fd)
 	if created == nil && opts.Flags&linux.O_TRUNC != 0 {
 		if err := mnt.CheckBeginWrite(); err != nil {
 			fd.vfsfd.DecRef(ctx)
@@ -117,9 +143,12 @@ func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *v
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *regularFD) Release(ctx context.Context) {
+	fd.dentry.fs.untrackRegularFD(fd)
 	// A close error at the last reference has no caller to report to. fsync
 	// and close(2) through OnClose report write-back failures.
-	_ = fd.h.decRef()
+	if fd.h != nil {
+		_ = fd.h.decRef()
+	}
 }
 
 // OnClose implements vfs.FileDescriptionImpl.OnClose. It reports the write-back
@@ -397,15 +426,18 @@ type cacheChunk = chunkcache.Chunk
 // reads and writes them without the host file. A chunk that the guest changed
 // stays dirty until a write-back writes it. A write-back goes through the
 // handle, which waits for the reopen. See handle_registry.go.
+// +stateify savable
 type fileData struct {
-	chunkcache.Cache
-	ino *inode
+	chunkcache.Cache `state:"nosave"`
+	ino              *inode
 
-	size            int64
-	mh              *hostHandle
-	mhWritable      bool
-	pending         *hostHandle
-	pendingWritable bool
+	size              int64
+	mh                *hostHandle `state:"nosave"`
+	mhWritable        bool        `state:"nosave"`
+	pending           *hostHandle `state:"nosave"`
+	pendingWritable   bool        `state:"nosave"`
+	savedMappings     memmap.MappingSet
+	savedWritableMaps int
 
 	// src is the dentry of the last ConfigureMMap call. AddMapping opens a
 	// handle through it when no handle exists. Protected by DataMu. See

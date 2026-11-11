@@ -109,6 +109,7 @@ var (
 // socket, a FIFO, or a device stands for an empty placeholder file on the
 // host. Rdev holds the device number of a device record: the major number in
 // the high 32 bits and the minor number in the low 32 bits.
+// +stateify savable
 type POSIXAttr struct {
 	Mode    uint32            `json:"mode"`
 	UID     uint32            `json:"uid"`
@@ -123,6 +124,8 @@ type POSIXAttr struct {
 
 // entry is the effective state of one workspace path: the virtual attributes
 // layered over the host metadata.
+//
+// +stateify savable
 type entry struct {
 	attr POSIXAttr
 	info hostInfo
@@ -299,6 +302,9 @@ type workspaceOptions struct {
 	// countDirLinks makes hostfs count directory links on every host, as it
 	// does on NTFS.
 	countDirLinks bool
+	// restoreMode skips ephemeral file sweeping during OpenWorkspaceForRestore
+	// so CompleteRestore can reattach unlinked backing files first.
+	restoreMode bool
 }
 
 // ChunkMemory supplies the memory for the chunks of mapped files.
@@ -429,7 +435,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		_ = root.Close()
 		return nil, err
 	}
-	if !readOnly {
+	if !readOnly && !opts.restoreMode {
 		w.sweepEphemeral()
 	}
 	if !readOnly && w.coalesce > 0 {

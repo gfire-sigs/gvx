@@ -188,7 +188,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/gvx",
 		tier:      Tier1Additive,
-		allowed:   []string{"pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/tcpip/*"},
+		allowed:   []string{"pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/state", "pkg/tcpip/*"},
 		forbidden: []string{"cmd/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "shim/*"},
 	},
 	{
@@ -275,7 +275,7 @@ var boundaryRules = []importRule{
 		pkg:           "pkg/sentry/fsimpl/hostfs",
 		tier:          Tier1Additive,
 		subtree:       true,
-		allowed:       []string{"pkg/sentry/vfs", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/fsutilx", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		allowed:       []string{"pkg/sentry/vfs", "pkg/sentry/checkpoint", "pkg/sentry/fsimpl/chunkcache", "pkg/sentry/fsimpl/fsutilx", "pkg/abi/linux", "pkg/fd", "pkg/state", "golang.org/x/sys/*"},
 		forbidden:     append([]string{"pkg/sentry/platform/*"}, without(tier2UpperBans, "pkg/hostlockdown/*")...),
 		forbiddenProd: []string{"pkg/hostlockdown/*"},
 	},

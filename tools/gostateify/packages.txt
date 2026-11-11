@@ -2,6 +2,7 @@
 # Append each newly onboarded package on its own sorted line.
 pkg/bitmap
 pkg/bpf
+pkg/gvx tier1
 pkg/ilist
 pkg/ipset
 pkg/refs
@@ -12,6 +13,7 @@ pkg/sentry/fsimpl/cgroup2fs tier2
 pkg/sentry/fsimpl/chunkcache tier1
 pkg/sentry/fsimpl/erofs
 pkg/sentry/fsimpl/ext4lite
+pkg/sentry/fsimpl/hostfs tier1
 pkg/sentry/fsimpl/kernfs
 pkg/sentry/fsimpl/overlay
 pkg/sentry/fsimpl/proc tier2
