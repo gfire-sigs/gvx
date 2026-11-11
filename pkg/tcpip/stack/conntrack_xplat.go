@@ -15,18 +15,147 @@
 package stack
 
 import (
+	"sync/atomic"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 )
 
-// This file gives ctnetlink access to the connection table. A caller reads a
-// snapshot of each tracked connection and deletes connections. It never holds
-// a reference to the table internals.
+// This file holds the gvx extension state, timeout hooks, admission hooks, and
+// ctnetlink inspection methods for ConnTrack. Callers read entry snapshots and
+// expire entries without holding references to table internals.
 //
 // Ref: include/uapi/linux/netfilter/nf_conntrack_common.h (IPS_*) and
 // include/uapi/linux/netfilter/nf_conntrack_tcp.h (TCP_CONNTRACK_*).
+
+// extState holds the timeout and protocol state of a connection.
+// conn.stateMu guards every field of extState.
+type extState struct {
+	// timeout is the duration after lastUsed when the connection expires.
+	timeout time.Duration
+	// dying marks an explicitly expired connection; lookups skip it and packets do not renew it.
+	dying bool
+	// proto holds the protocol state that selects the timeout.
+	proto connProto
+}
+
+// connAtomics holds the lock-free fields of a tracked connection.
+type connAtomics struct {
+	// released becomes 1 when the table removes the connection and decrements count.
+	released atomicbitops.Uint32
+	// mark stores the connection mark for the CONNMARK target and connmark match.
+	mark atomicbitops.Uint32
+}
+
+// connTrackLimits holds the atomic timeouts, entry limit, and entry count of a table.
+type connTrackLimits struct {
+	// cfg stores the timeout configuration; nil selects the Linux defaults.
+	cfg atomic.Pointer[conntrackConfig]
+	// limit stores nf_conntrack_max; nil disables the entry limit.
+	limit atomic.Pointer[ConntrackLimit]
+	// count tracks active entries that the reaper or eviction has not removed.
+	count atomicbitops.Int32
+}
+
+// newConnState initializes the timeout and protocol state for a new connection.
+func (ct *ConnTrack) newConnState(transProto tcpip.TransportProtocolNumber, now tcpip.MonotonicTime) extState {
+	return extState{
+		timeout: initialTimeout(ct.config(), transProto),
+		proto:   connProto{streamAt: now.Add(udpStreamDelay)},
+	}
+}
+
+// timedOutAt reports whether the connection has expired at now.
+func (cn *conn) timedOutAt(now tcpip.MonotonicTime) bool {
+	cn.stateMu.RLock()
+	defer cn.stateMu.RUnlock()
+	return cn.dying || !now.Before(cn.lastUsed.Add(cn.timeout))
+}
+
+// remainingTime returns the duration until the connection expires, or 0 after expiry.
+func (cn *conn) remainingTime() time.Duration {
+	cn.stateMu.RLock()
+	expires := cn.lastUsed.Add(cn.timeout)
+	dying := cn.dying
+	cn.stateMu.RUnlock()
+	left := expires.Sub(cn.ct.clock.NowMonotonic())
+	if dying || left < 0 {
+		return 0
+	}
+	return left
+}
+
+// updateState advances the TCB and the timeout state for pkt.
+func (cn *conn) updateState(pkt *PacketBuffer, reply bool) {
+	cn.stateMu.Lock()
+	defer cn.stateMu.Unlock()
+	if cn.dying {
+		return
+	}
+	if pkt.TransportProtocolNumber != cn.original.tupleID.transProto {
+		// An ICMP error matches the connection tuple without renewing its timeout.
+		return
+	}
+
+	now := cn.ct.clock.NowMonotonic()
+
+	if pkt.TransportProtocolNumber == header.TCPProtocolNumber {
+		tcpHeader := header.TCP(pkt.TransportHeader().Slice())
+
+		// Advance tcb so trackLocked can verify whether a RST lies inside the window.
+		switch {
+		case cn.tcb.IsEmpty():
+			cn.tcb.Init(tcpHeader, pkt.Data().Size())
+		case reply:
+			cn.tcb.UpdateStateReply(tcpHeader, pkt.Data().Size())
+		default:
+			cn.tcb.UpdateStateOriginal(tcpHeader, pkt.Data().Size())
+		}
+	}
+
+	if cn.trackLocked(pkt, reply, now) && reply {
+		// Linux sets IPS_SEEN_REPLY after tracking, so the first reply still uses the unassured path.
+		cn.replySeen = true
+	}
+}
+
+// trackPacket looks up or creates a connection for pkt and updates its state.
+// It reports full when pkt requires a new entry and the full table cannot evict one.
+func (ct *ConnTrack) trackPacket(pkt *PacketBuffer, skipChecksumValidation bool) (*tuple, bool) {
+	var full bool
+	return ct.getConnAndUpdateFull(pkt, skipChecksumValidation, &full), full
+}
+
+// bucketIndex returns the bucket index for tid under ct.mu.
+func (ct *ConnTrack) bucketIndex(tid tupleID) int {
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+	return ct.bucket(tid)
+}
+
+// admitNewConn validates the initial packet and reserves a slot in the table.
+// It sets *full when nf_conntrack_max blocks allocation and early drop evicts nothing.
+func (ct *ConnTrack) admitNewConn(pkt *PacketBuffer, tid tupleID, now tcpip.MonotonicTime, full *bool) bool {
+	// Linux creates a TCP entry only for a SYN or a mid-stream pickup ACK.
+	if pkt.TransportProtocolNumber == header.TCPProtocolNumber &&
+		!startsTCPConn(header.TCP(pkt.TransportHeader().Slice()).Flags()) {
+		return false
+	}
+	if !ct.reserve(ct.bucketIndex(tid), now) {
+		if full != nil {
+			*full = true
+		}
+		return false
+	}
+	return true
+}
+
+// cancelReserve releases a reserved slot when a concurrent lookup inserted the tuple first.
+func (ct *ConnTrack) cancelReserve() {
+	ct.count.Add(-1)
+}
 
 // Bits of ConntrackEntry.Status. The values are the IPS_* bits of Linux.
 const (

@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/atomicbitops"
@@ -39,6 +38,11 @@ import (
 
 // Our hash table has 16K buckets.
 const numBuckets = 1 << 14
+
+const (
+	establishedTimeout   time.Duration = 5 * 24 * time.Hour
+	unestablishedTimeout time.Duration = 120 * time.Second
+)
 
 // ConnTrackState represents the state of a connection.
 type ConnTrackState int
@@ -187,89 +191,24 @@ type conn struct {
 	// +checklocks:stateMu
 	replySeen bool
 
-	// timeout is the time after lastUsed at which the connection expires. The
-	// packet that set lastUsed chose it from the timeouts of the table. See
-	// conntrack_proto_xplat.go.
-	//
 	// +checklocks:stateMu
-	timeout time.Duration `state:"nosave"`
-	// dying is true after the connection was deleted. The connection then
-	// counts as timed out and no packet renews it.
-	//
-	// +checklocks:stateMu
-	dying bool `state:"nosave"`
-	// proto holds the state that sets the timeout.
-	//
-	// +checklocks:stateMu
-	proto connProto `state:"nosave"`
-	// released is 1 after the table removed the connection and gave back its
-	// place in the count of the table.
-	released atomicbitops.Uint32 `state:"nosave"`
-	// mark is the connection mark that the CONNMARK target and the connmark
-	// match use. The netstack does not save it.
-	mark atomicbitops.Uint32 `state:"nosave"`
+	extState    `state:"nosave"`
+	connAtomics `state:"nosave"`
 }
 
-// timedOut returns whether the connection timed out. A connection times out
-// when its timeout passed since its last packet, as Linux does with the
-// timeout of each state.
+// timedOut returns whether the connection timed out based on its state.
 func (cn *conn) timedOut(now tcpip.MonotonicTime) bool {
-	cn.stateMu.RLock()
-	defer cn.stateMu.RUnlock()
-	return cn.dying || !now.Before(cn.lastUsed.Add(cn.timeout))
+	return cn.timedOutAt(now)
 }
 
 // expiresIn returns the duration from now until the connection times out.
 func (cn *conn) expiresIn() time.Duration {
-	cn.stateMu.RLock()
-	expires := cn.lastUsed.Add(cn.timeout)
-	dying := cn.dying
-	cn.stateMu.RUnlock()
-	left := expires.Sub(cn.ct.clock.NowMonotonic())
-	if dying || left < 0 {
-		return 0
-	}
-	return left
+	return cn.remainingTime()
 }
 
 // update the connection tracking state.
 func (cn *conn) update(pkt *PacketBuffer, reply bool) {
-	cn.stateMu.Lock()
-	defer cn.stateMu.Unlock()
-	if cn.dying {
-		return
-	}
-	if pkt.TransportProtocolNumber != cn.original.tupleID.transProto {
-		// An ICMP error about the connection finds it by its tuple. As on
-		// Linux, the error does not renew the connection.
-		return
-	}
-
-	now := cn.ct.clock.NowMonotonic()
-
-	if pkt.TransportProtocolNumber == header.TCPProtocolNumber {
-		tcpHeader := header.TCP(pkt.TransportHeader().Slice())
-
-		// Update the state of tcb. tcb assumes it's always initialized on the
-		// client. The state of the Linux timeouts comes from trackLocked.
-		// The tcb tells it whether a RST is inside the window.
-		switch {
-		case cn.tcb.IsEmpty():
-			cn.tcb.Init(tcpHeader, pkt.Data().Size())
-		case reply:
-			cn.tcb.UpdateStateReply(tcpHeader, pkt.Data().Size())
-		default:
-			cn.tcb.UpdateStateOriginal(tcpHeader, pkt.Data().Size())
-		}
-	}
-
-	// Mark the connection as having been used recently so it isn't reaped, and
-	// give it the timeout of its new state.
-	if cn.trackLocked(pkt, reply, now) && reply {
-		// Linux sets IPS_SEEN_REPLY after it handled the packet, so the first
-		// reply is still tracked as the packet of a connection without reply.
-		cn.replySeen = true
-	}
+	cn.updateState(pkt, reply)
 }
 
 type connTrackRNG interface {
@@ -323,15 +262,7 @@ type ConnTrack struct {
 	// +checklocks:mu
 	buckets []bucket
 
-	// cfg holds the timeouts of the table. A nil value stands for the
-	// defaults of Linux. See conntrack_limits_xplat.go.
-	cfg atomic.Pointer[conntrackConfig] `state:"nosave"`
-	// limit is the limit on the number of connections. A nil value stands for
-	// no limit.
-	limit atomic.Pointer[ConntrackLimit] `state:"nosave"`
-	// count is the number of connections in the table, which the reaper has
-	// not removed.
-	count atomicbitops.Int32 `state:"nosave"`
+	connTrackLimits `state:"nosave"`
 }
 
 // +stateify savable
@@ -514,16 +445,10 @@ func (ct *ConnTrack) init() {
 // If the packet's protocol is trackable, the connection's state is updated to
 // match the contents of the packet.
 func (ct *ConnTrack) getConnAndUpdate(pkt *PacketBuffer, skipChecksumValidation bool) *tuple {
-	t, _ := ct.trackPacket(pkt, skipChecksumValidation)
-	return t
+	return ct.getConnAndUpdateFull(pkt, skipChecksumValidation, nil)
 }
 
-// trackPacket does what getConnAndUpdate does. It also reports whether the
-// table is full: the packet needs a new connection, the table holds the
-// maximum number of connections, and no connection can leave. As on Linux, the
-// caller must drop such a packet.
-func (ct *ConnTrack) trackPacket(pkt *PacketBuffer, skipChecksumValidation bool) (*tuple, bool) {
-	full := false
+func (ct *ConnTrack) getConnAndUpdateFull(pkt *PacketBuffer, skipChecksumValidation bool, full *bool) *tuple {
 	// Get or (maybe) create a connection.
 	t := func() *tuple {
 		var allowNewConn bool
@@ -568,8 +493,7 @@ func (ct *ConnTrack) trackPacket(pkt *PacketBuffer, skipChecksumValidation bool)
 		}
 
 		ct.mu.RLock()
-		bktIdx := ct.bucket(tid)
-		bkt := &ct.buckets[bktIdx]
+		bkt := &ct.buckets[ct.bucket(tid)]
 		ct.mu.RUnlock()
 
 		now := ct.clock.NowMonotonic()
@@ -578,22 +502,7 @@ func (ct *ConnTrack) trackPacket(pkt *PacketBuffer, skipChecksumValidation bool)
 			return t
 		}
 
-		if !allowNewConn {
-			return nil
-		}
-
-		// Linux creates a TCP connection for a SYN, or for an ACK that picks up
-		// a connection in mid-stream. Another first packet is invalid.
-		if pkt.TransportProtocolNumber == header.TCPProtocolNumber &&
-			!startsTCPConn(header.TCP(pkt.TransportHeader().Slice()).Flags()) {
-			return nil
-		}
-
-		// Count the new connection against nf_conntrack_max before it takes a
-		// place in the table. A full table drops an old connection that is not
-		// assured, or it drops this packet.
-		if !ct.reserve(bktIdx, now) {
-			full = true
+		if !allowNewConn || !ct.admitNewConn(pkt, tid, now, full) {
 			return nil
 		}
 
@@ -603,20 +512,18 @@ func (ct *ConnTrack) trackPacket(pkt *PacketBuffer, skipChecksumValidation bool)
 		// Make sure a connection wasn't added between when we last checked the
 		// bucket and acquired the bucket's write lock.
 		if t := bkt.connForTIDRLocked(tid, now); t != nil {
-			ct.count.Add(-1)
+			ct.cancelReserve()
 			return t
 		}
 
 		// This is the first packet we're seeing for the connection. Create an entry
 		// for this new connection.
-		cfg := ct.config()
 		conn := &conn{
 			ct:       ct,
 			original: tuple{tupleID: tid},
 			reply:    tuple{tupleID: tid.reply(), reply: true},
 			lastUsed: now,
-			timeout:  initialTimeout(cfg, tid.transProto),
-			proto:    connProto{streamAt: now.Add(udpStreamDelay)},
+			extState: ct.newConnState(tid.transProto, now),
 		}
 		conn.original.conn = conn
 		conn.reply.conn = conn
@@ -637,7 +544,7 @@ func (ct *ConnTrack) trackPacket(pkt *PacketBuffer, skipChecksumValidation bool)
 	if t != nil {
 		t.conn.update(pkt, t.reply)
 	}
-	return t, full
+	return t
 }
 
 // GetConnAndUpdatePkt gets the connection for the packet and also sets the packet's tuple.
