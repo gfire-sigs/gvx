@@ -718,8 +718,25 @@ func TestGuestCallsNeverScanTheTable(t *testing.T) {
 	}
 }
 
+func journalOps(t testing.TB, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := parseMeta(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return img.ops
+}
+
 func TestDirectoryRenameCostDoesNotGrowWithItsSubtree(t *testing.T) {
-	cost := func(children int) (calls int, journalGrowth int64) {
+	// File keys and timestamps use varints, so two separate host directories
+	// can differ by a few bytes for one appended record.
+	const maxSingleRecordBytes = 200
+	const maxVarintDiff = 16
+	cost := func(children int) (calls int, opsAdded int, journalGrowth int64) {
 		dir := resolvedTempDir(t)
 		ch := &countingHost{}
 		ws := plainWS(t, dir, workspaceOptions{wrapHost: func(b hostBackend) hostBackend {
@@ -735,22 +752,33 @@ func TestDirectoryRenameCostDoesNotGrowWithItsSubtree(t *testing.T) {
 		}
 		mustSync(t, ws)
 		path := filepath.Join(dir, MetaFileName)
-		before := fileSize(t, path)
+		beforeBytes := fileSize(t, path)
+		beforeOps := journalOps(t, path)
 		ch.reset()
 		if err := ws.Rename("d", "e"); err != nil {
 			t.Fatal(err)
 		}
 		calls = ch.total()
 		mustSync(t, ws)
-		return calls, fileSize(t, path) - before
+		return calls, journalOps(t, path) - beforeOps, fileSize(t, path) - beforeBytes
 	}
-	smallCalls, smallGrowth := cost(3)
-	largeCalls, largeGrowth := cost(300)
+	smallCalls, smallOps, smallGrowth := cost(3)
+	largeCalls, largeOps, largeGrowth := cost(300)
 	if largeCalls != smallCalls {
 		t.Errorf("renaming a directory with 300 children made %d host calls, and with 3 children %d, want equal", largeCalls, smallCalls)
 	}
-	if largeGrowth != smallGrowth {
-		t.Errorf("renaming a directory with 300 children grew .gvx_meta by %d bytes, and with 3 children by %d, want equal", largeGrowth, smallGrowth)
+	if smallOps != 1 || largeOps != 1 {
+		t.Errorf("renaming a directory appended %d ops (3 children) and %d ops (300 children), want 1 each", smallOps, largeOps)
+	}
+	if smallGrowth <= 0 || smallGrowth > maxSingleRecordBytes || largeGrowth <= 0 || largeGrowth > maxSingleRecordBytes {
+		t.Errorf("renaming a directory grew .gvx_meta by %d bytes (3 children) and %d bytes (300 children), want 1..%d each", smallGrowth, largeGrowth, maxSingleRecordBytes)
+	}
+	diff := largeGrowth - smallGrowth
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > maxVarintDiff {
+		t.Errorf("renaming a directory with 300 children grew .gvx_meta by %d bytes, and with 3 children by %d, diff %d exceeds varint bound %d", largeGrowth, smallGrowth, diff, maxVarintDiff)
 	}
 }
 

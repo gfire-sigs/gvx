@@ -4,7 +4,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-This release raises default Go microarchitecture baselines per target OS and adds an ARMv8.2 LSE release archive for Linux (#138). It also prints the compiled architecture level in `rungv version` and eliminates timing-sensitive flaky tests (#137, #138).
+This release raises default Go microarchitecture baselines per target OS and adds an ARMv8.2 LSE release archive for Linux (#138). It also prints the compiled architecture level in `rungv version` and eliminates timing-sensitive and varint-width flaky tests (#137, #138, #139).
 
 ### Build
 
@@ -12,7 +12,7 @@ This release raises default Go microarchitecture baselines per target OS and add
 
 ### Tests
 
-- **Flaky timing, port-reuse, and VMA assertions** (#137): unit tests and `e2e` probes now use deterministic clocks, bound UDP sockets, and explicit barriers. `idle_stubs_xplat_test.go` also verifies exact `memfd:` VMA line and byte counts.
+- **Flaky timing, port-reuse, varint, and VMA assertions** (#137, #139): tests now use deterministic clocks, bound UDP sockets, exact journal op counts, and barriers. `idle_stubs_xplat_test.go` also verifies exact `memfd:` VMA line and byte counts.
 
 ## [v0.12.10032026110200] - 2026-11-11
 
