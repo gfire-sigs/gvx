@@ -126,6 +126,7 @@ type NATForwarder struct {
 	cfg         NATConfig
 	log         *slog.Logger
 	upstreamDNS []string
+	dnsSem      chan struct{}
 	udpIdle     time.Duration
 	udpSessions *udpSessionTable
 	ctx         context.Context
@@ -372,6 +373,7 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		cfg:         cfg,
 		log:         log,
 		upstreamDNS: upstream,
+		dnsSem:      make(chan struct{}, maxConcurrentDNS),
 		udpIdle:     cfg.Tuning.Duration(tuning.UDPIdleTimeout),
 		udpSessions: newUDPSessionTable(cfg.Tuning.Int(tuning.NATUDPSessions)),
 		ctx:         ctx,
@@ -542,7 +544,6 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 		}
 		guestConn := gonet.NewUDPConn(&wq, ep)
 		if !nf.spawn(func() {
-			defer func() { _ = guestConn.Close() }()
 			nf.serveUDPDNS(nf.ctx, guestConn)
 		}) {
 			_ = guestConn.Close()

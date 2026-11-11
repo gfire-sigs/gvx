@@ -116,6 +116,7 @@ type WireGuardEndpoint struct {
 	cfg          WireGuardConfig
 	peerEndpoint netip.AddrPort
 	upstreamDNS  []string
+	dnsSem       chan struct{}
 
 	mu        sync.Mutex
 	udpConn   net.PacketConn
@@ -175,7 +176,12 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WireGuardEndpoint{cfg: cfg, peerEndpoint: peerEndpoint, upstreamDNS: upstreamDNS}, nil
+	return &WireGuardEndpoint{
+		cfg:          cfg,
+		peerEndpoint: peerEndpoint,
+		upstreamDNS:  upstreamDNS,
+		dnsSem:       make(chan struct{}, maxConcurrentDNS),
+	}, nil
 }
 
 // validateWireGuardConfig rejects unusable keys, addresses, and sizes. It

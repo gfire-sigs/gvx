@@ -69,7 +69,12 @@ const (
 const vxlanDFInherit = 2
 
 func init() {
-	RegisterLinkKind("vxlan", LinkKind{NamePrefix: "vxlan", New: newVxlanLink, MTURange: vxlanMTURange})
+	RegisterLinkKind("vxlan", LinkKind{
+		NamePrefix: "vxlan",
+		New:        newVxlanLink,
+		MTURange:   vxlanMTURange,
+		StackEnded: vxlan.CloseStack,
+	})
 }
 
 // vxlanAttrs reads the attributes of IFLA_INFO_DATA.

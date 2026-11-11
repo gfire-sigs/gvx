@@ -210,6 +210,10 @@ type Config struct {
 	// image after a registry denies access. A nil value discards them.
 	Warnings io.Writer
 
+	// DebugLog receives Sentry kernel log lines while the sandbox is open. A
+	// nil value leaves Sentry logging to the GVX_DEBUG_LOG environment variable.
+	DebugLog io.Writer
+
 	// BinaryPath specifies a host path to a Linux ELF64 binary to execute.
 	BinaryPath string
 

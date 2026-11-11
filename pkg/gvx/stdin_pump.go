@@ -17,6 +17,7 @@ package gvx
 import (
 	"io"
 	"sync"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -27,6 +28,10 @@ import (
 // maxStdinChunk is the largest host read that one pending guest read starts.
 const maxStdinChunk = 64 * 1024
 
+type readDeadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
+
 // stdinPump lets a guest read a host io.Reader without blocking the task
 // goroutine. A host read cannot be interrupted, so a task that called it
 // directly ignored SIGKILL until the host reader returned. The pump runs the
@@ -36,7 +41,8 @@ const maxStdinChunk = 64 * 1024
 //
 // At most one host read runs at a time. The pump reads only when a guest read
 // or a poll waits for input, so the guest never loses data to a read-ahead
-// beyond one chunk. The helper goroutine ends when the host reader returns.
+// beyond one chunk. The helper goroutine ends when the host reader returns or
+// when stop interrupts a deadline-capable reader.
 type stdinPump struct {
 	r  io.Reader
 	wq waiter.Queue
@@ -50,6 +56,10 @@ type stdinPump struct {
 	err error
 	// pending is set while a helper goroutine reads the host reader.
 	pending bool
+	// stopped is set when the sandbox run finishes.
+	stopped bool
+	// readDone closes when the active helper goroutine returns.
+	readDone chan struct{}
 }
 
 func newStdinPump(r io.Reader) *stdinPump { return &stdinPump{r: r} }
@@ -85,30 +95,84 @@ func (p *stdinPump) read(ctx context.Context, dst usermem.IOSequence) (int64, er
 	return 0, linuxerr.ErrWouldBlock
 }
 
-// startReadLocked starts a helper goroutine unless one runs already.
+// startReadLocked starts a helper goroutine unless one runs already or the pump stopped.
 func (p *stdinPump) startReadLocked(size int) {
-	if p.pending {
+	if p.pending || p.stopped {
 		return
 	}
+	done := make(chan struct{})
 	p.pending = true
+	p.readDone = done
 	go func() {
+		defer close(done)
 		buf := make([]byte, size)
 		n, err := p.r.Read(buf)
 		p.mu.Lock()
-		p.buf = append(p.buf, buf[:n]...)
-		if err != nil {
-			p.err = err
+		stopped := p.stopped
+		if !stopped {
+			p.buf = append(p.buf, buf[:n]...)
+			if err != nil {
+				p.err = err
+			}
 		}
 		p.pending = false
+		p.readDone = nil
+		if stopped {
+			if d, ok := p.r.(readDeadlineSetter); ok {
+				_ = d.SetReadDeadline(time.Time{})
+			}
+		}
 		p.mu.Unlock()
+		if stopped {
+			p.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
+			return
+		}
 		p.wq.Notify(waiter.ReadableEvents)
 	}()
+}
+
+// stop ends the pump when a sandbox run finishes. For a reader that supports
+// read deadlines, it expires the read deadline to unblock an in-flight Read and
+// resets the deadline once the helper goroutine returns.
+func (p *stdinPump) stop() {
+	p.mu.Lock()
+	alreadyStopped := p.stopped
+	p.stopped = true
+	if p.err == nil {
+		p.err = io.EOF
+	}
+	done := p.readDone
+	p.mu.Unlock()
+
+	if !alreadyStopped {
+		p.wq.Notify(waiter.ReadableEvents | waiter.EventHUp)
+	}
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	default:
+	}
+	if d, ok := p.r.(readDeadlineSetter); ok {
+		if err := d.SetReadDeadline(time.Now()); err == nil {
+			select {
+			case <-done:
+				_ = d.SetReadDeadline(time.Time{})
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
 }
 
 // readiness reports whether a read returns without blocking.
 func (p *stdinPump) readiness() waiter.EventMask {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.stopped {
+		return waiter.ReadableEvents | waiter.EventHUp
+	}
 	if len(p.buf) > 0 || p.err != nil {
 		return waiter.ReadableEvents
 	}
@@ -120,7 +184,7 @@ func (p *stdinPump) readiness() waiter.EventMask {
 func (p *stdinPump) register(e *waiter.Entry) {
 	p.wq.EventRegister(e)
 	p.mu.Lock()
-	if len(p.buf) == 0 && p.err == nil {
+	if !p.stopped && len(p.buf) == 0 && p.err == nil {
 		p.startReadLocked(4096)
 	}
 	p.mu.Unlock()

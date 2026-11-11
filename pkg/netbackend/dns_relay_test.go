@@ -245,8 +245,12 @@ func TestDNSRelayForwardsNonAddressQueriesUnchanged(t *testing.T) {
 	if dnsRCode(resp) != dnsRCodeNoErr {
 		t.Fatalf("response rcode = %d, want NOERROR", dnsRCode(resp))
 	}
-	if forwarded, _ := got.Load().([]byte); string(forwarded) != string(req) {
-		t.Fatalf("upstream received %x, want the guest query %x", forwarded, req)
+	if binary.BigEndian.Uint16(resp[0:2]) != 7 {
+		t.Fatalf("response transaction ID = %d, want 7", binary.BigEndian.Uint16(resp[0:2]))
+	}
+	forwarded, _ := got.Load().([]byte)
+	if len(forwarded) != len(req) || string(forwarded[2:]) != string(req[2:]) {
+		t.Fatalf("upstream received body %x, want %x", forwarded, req)
 	}
 }
 
@@ -626,5 +630,394 @@ func TestParseDNSServersAcceptsBareIPsAndRejectsNames(t *testing.T) {
 	}
 	if _, err := ParseDNSServers([]string{"dns.example.test"}); err == nil {
 		t.Error("ParseDNSServers accepted a host name")
+	}
+}
+
+func TestDNSRelayRandomizesUpstreamTXIDAndRejectsQuestionMismatch(t *testing.T) {
+	seenIDs := make(map[uint16]struct{})
+	var mu sync.Mutex
+	srv := startFakeDNSServer(t, func(req []byte, _ bool) []byte {
+		mu.Lock()
+		seenIDs[binary.BigEndian.Uint16(req[0:2])] = struct{}{}
+		mu.Unlock()
+		return answerWith("198.51.100.12")(req, false)
+	})
+	nf := newTestForwarder(t, NATConfig{}, srv.addr)
+	for range 16 {
+		resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x1234, "rand.example.test", dnsTypeA))
+		if binary.BigEndian.Uint16(resp[0:2]) != 0x1234 || dnsRCode(resp) != dnsRCodeNoErr {
+			t.Fatalf("response = %x, want ID 0x1234 and NOERROR", resp[:dnsHeaderSize])
+		}
+	}
+	mu.Lock()
+	uniqueCount := len(seenIDs)
+	mu.Unlock()
+	if uniqueCount < 2 {
+		t.Fatalf("upstream saw %d distinct TXIDs across 16 queries, want randomized TXIDs", uniqueCount)
+	}
+
+	// Verify UDP rejects spoofed responses that match the upstream TXID yet
+	// carry a mismatched QNAME or QTYPE, while accepting case-folded QNAMEs.
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 512)
+		n, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		req := buf[:n]
+		upID := binary.BigEndian.Uint16(req[0:2])
+		flags := binary.BigEndian.Uint16(req[2:4])
+
+		wrongName := buildDNSQuery(upID, "evil.example.test", dnsTypeA)
+		spoofName := buildDNSAddressResponse(upID, flags, wrongName[dnsHeaderSize:], dnsTypeA, []netip.Addr{netip.MustParseAddr("6.6.6.1")})
+		_, _ = pc.WriteTo(spoofName, from)
+
+		wrongType := buildDNSQuery(upID, "target.example.test", dnsTypeAAAA)
+		spoofType := buildDNSAddressResponse(upID, flags, wrongType[dnsHeaderSize:], dnsTypeAAAA, []netip.Addr{netip.MustParseAddr("2001:db8::6")})
+		_, _ = pc.WriteTo(spoofType, from)
+
+		upperCase := buildDNSQuery(upID, "TARGET.EXAMPLE.TEST", dnsTypeA)
+		valid := buildDNSAddressResponse(upID, flags, upperCase[dnsHeaderSize:], dnsTypeA, []netip.Addr{netip.MustParseAddr("198.51.100.99")})
+		_, _ = pc.WriteTo(valid, from)
+	}()
+
+	nfMismatch := newTestForwarder(t, NATConfig{}, pc.LocalAddr().String())
+	resp := nfMismatch.handleDNSQuery(t.Context(), buildDNSQuery(0xbeef, "target.example.test", dnsTypeA))
+	if binary.BigEndian.Uint16(resp[0:2]) != 0xbeef {
+		t.Fatalf("guest TXID = %#x, want 0xbeef", binary.BigEndian.Uint16(resp[0:2]))
+	}
+	if got := answerIPs(t, resp); len(got) != 1 || got[0] != netip.MustParseAddr("198.51.100.99") {
+		t.Fatalf("answer = %v, want [198.51.100.99]", got)
+	}
+}
+
+func TestDNSRelayEnforcesRFC1035QNAMELength(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.50"))
+	nf := newTestForwarder(t, NATConfig{}, srv.addr)
+
+	// 3 labels of 63 bytes + 1 label of 61 bytes: (1+63)*3 + (1+61) + 1 = 255 wire bytes.
+	maxValid := strings.Join([]string{
+		strings.Repeat("a", 63),
+		strings.Repeat("b", 63),
+		strings.Repeat("c", 63),
+		strings.Repeat("d", 61),
+	}, ".")
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(1, maxValid, dnsTypeA))
+	if dnsRCode(resp) != dnsRCodeNoErr {
+		t.Fatalf("255-byte wire QNAME rcode = %d, want NOERROR", dnsRCode(resp))
+	}
+
+	// 1 byte longer (256 wire bytes) must be rejected with FORMERR.
+	tooLong := strings.Join([]string{
+		strings.Repeat("a", 63),
+		strings.Repeat("b", 63),
+		strings.Repeat("c", 63),
+		strings.Repeat("d", 62),
+	}, ".")
+	resp = nf.handleDNSQuery(t.Context(), buildDNSQuery(2, tooLong, dnsTypeA))
+	if dnsRCode(resp) != dnsRCodeFmt {
+		t.Fatalf("256-byte wire QNAME rcode = %d, want FORMERR", dnsRCode(resp))
+	}
+}
+
+func TestDNSRelayLookupHookIsolateLANBlocksRebinding(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.250"))
+	nf := newTestForwarder(t, NATConfig{
+		IsolateLAN: true,
+		LookupHost: func(_ context.Context, host string) ([]netip.Addr, error) {
+			switch host {
+			case "mixed.test":
+				return []netip.Addr{
+					netip.MustParseAddr("127.0.0.1"),
+					netip.MustParseAddr("192.168.1.10"),
+					netip.MustParseAddr("10.0.2.2"),
+					netip.MustParseAddr("10.0.2.15"),
+					netip.MustParseAddr("169.254.169.254"),
+					netip.MustParseAddr("::ffff:127.0.0.1"),
+					netip.MustParseAddr("198.51.100.88"),
+				}, nil
+			case "rebind.test":
+				return []netip.Addr{
+					netip.MustParseAddr("127.0.0.1"),
+					netip.MustParseAddr("10.0.0.9"),
+				}, nil
+			}
+			return nil, errors.New("unexpected name")
+		},
+	}, srv.addr)
+
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(10, "mixed.test", dnsTypeA))
+	if dnsRCode(resp) != dnsRCodeNoErr {
+		t.Fatalf("mixed.test rcode = %d, want NOERROR", dnsRCode(resp))
+	}
+	if got := answerIPs(t, resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.88")}) {
+		t.Fatalf("mixed.test answers = %v, want [198.51.100.88]", got)
+	}
+
+	resp = nf.handleDNSQuery(t.Context(), buildDNSQuery(11, "rebind.test", dnsTypeA))
+	if dnsRCode(resp) != dnsRCodeNoErr {
+		t.Fatalf("rebind.test rcode = %d, want NOERROR", dnsRCode(resp))
+	}
+	if got := answerIPs(t, resp); len(got) != 0 {
+		t.Fatalf("rebind.test answers = %v, want empty", got)
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream queries = %d, want 0", srv.queries.Load())
+	}
+}
+
+type closeTrackingConn struct {
+	net.Conn
+	closed atomic.Int32
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Add(1)
+	return c.Conn.Close()
+}
+
+func TestNATForwarderServeUDPDNSClosesConnOnIdleTimeout(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.33"))
+	tuned, err := tuning.Values{}.WithDuration(tuning.DNSTimeout, 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nf := newTestForwarder(t, NATConfig{Tuning: tuned}, srv.addr)
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	tracked := &closeTrackingConn{Conn: serverConn}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nf.serveUDPDNS(nf.ctx, tracked)
+	}()
+
+	req := buildDNSQuery(0x3131, "idle.example.test", dnsTypeA)
+	if _, err := clientConn.Write(req); err != nil {
+		t.Fatalf("write DNS query: %v", err)
+	}
+	buf := make([]byte, 512)
+	_ = clientConn.SetReadDeadline(time.Now().Add(testTimeout))
+	n, err := clientConn.Read(buf)
+	if err != nil {
+		t.Fatalf("read DNS reply: %v", err)
+	}
+	if got := answerIPs(t, buf[:n]); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.33")}) {
+		t.Fatalf("answer = %v, want [198.51.100.33]", got)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("serveUDPDNS did not exit after idle timeout")
+	}
+	if tracked.closed.Load() == 0 {
+		t.Fatal("serveUDPDNS returned on idle timeout without closing conn")
+	}
+}
+
+func TestDNSRelayConcurrentUDPFlood(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	var (
+		inFlight       atomic.Int32
+		peakInFlight   atomic.Int32
+		releaseGate    = make(chan struct{})
+		saturationOnce sync.Once
+		srvWG          sync.WaitGroup
+	)
+	srvWG.Add(1)
+	go func() {
+		defer srvWG.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pkt := append([]byte(nil), buf[:n]...)
+			srvWG.Add(1)
+			go func(req []byte, peer net.Addr) {
+				defer srvWG.Done()
+				cur := inFlight.Add(1)
+				for {
+					prev := peakInFlight.Load()
+					if cur <= prev || peakInFlight.CompareAndSwap(prev, cur) {
+						break
+					}
+				}
+				if cur >= maxConcurrentDNS {
+					saturationOnce.Do(func() { close(releaseGate) })
+				}
+				select {
+				case <-releaseGate:
+				case <-t.Context().Done():
+				}
+				inFlight.Add(-1)
+				if resp := answerWith("198.51.100.77")(req, false); resp != nil {
+					_, _ = pc.WriteTo(resp, peer)
+				}
+			}(pkt, from)
+		}
+	}()
+	t.Cleanup(func() {
+		saturationOnce.Do(func() { close(releaseGate) })
+		_ = pc.Close()
+		srvWG.Wait()
+	})
+
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	w, err := NewWireGuardEndpoint(WireGuardConfig{
+		PrivateKey:     guestKey.private,
+		PeerPublicKey:  peerKey.public,
+		HostDNSServers: []string{pc.LocalAddr().String()},
+	})
+	if err != nil {
+		t.Fatalf("NewWireGuardEndpoint: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	s, err := w.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	const floodCount = 200
+	dnsAddr := tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}), Port: 53}
+
+	var (
+		clientWG sync.WaitGroup
+		errCh    = make(chan error, floodCount)
+	)
+	for i := range floodCount {
+		clientWG.Add(1)
+		go func(idx int) {
+			defer clientWG.Done()
+			u, err := gonet.DialUDP(s, nil, &dnsAddr, ipv4.ProtocolNumber)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer u.Close()
+
+			txID := uint16(0x1000 + idx)
+			if _, err := u.Write(buildDNSQuery(txID, "flood.example.test", dnsTypeA)); err != nil {
+				errCh <- err
+				return
+			}
+			if err := u.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+				errCh <- err
+				return
+			}
+			buf := make([]byte, 512)
+			n, err := u.Read(buf)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if gotID := binary.BigEndian.Uint16(buf[0:2]); gotID != txID {
+				errCh <- errors.New("mismatched guest transaction ID in flood reply")
+				return
+			}
+			if got := answerIPs(t, buf[:n]); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.77")}) {
+				errCh <- errors.New("unexpected DNS flood answer IP")
+			}
+		}(i)
+	}
+	clientWG.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("UDP DNS flood query failed: %v", err)
+	}
+	if peak := peakInFlight.Load(); peak != maxConcurrentDNS {
+		t.Fatalf("peak concurrent upstream DNS queries = %d, want %d", peak, maxConcurrentDNS)
+	}
+}
+
+func TestDNSRelaySemaphoreCancellationSkipsUpstream(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.11"))
+	nf := newTestForwarder(t, NATConfig{}, srv.addr)
+
+	sem := nf.dnsSemaphore()
+	for range maxConcurrentDNS {
+		sem <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for len(sem) > 0 {
+			<-sem
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if resp := nf.handleDNSQuery(ctx, buildDNSQuery(1, "blocked.example.test", dnsTypeA)); resp != nil {
+		t.Fatalf("cancelled handleDNSQuery while semaphore full returned %x, want nil", resp)
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream saw %d queries despite saturated semaphore cancellation, want 0", srv.queries.Load())
+	}
+
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	w, err := NewWireGuardEndpoint(WireGuardConfig{
+		PrivateKey:     guestKey.private,
+		PeerPublicKey:  peerKey.public,
+		HostDNSServers: []string{srv.addr},
+	})
+	if err != nil {
+		t.Fatalf("NewWireGuardEndpoint: %v", err)
+	}
+	s, err := w.Start()
+	if err != nil {
+		_ = w.Close()
+		t.Fatalf("Start: %v", err)
+	}
+
+	wgSem := w.dnsSemaphore()
+	for range maxConcurrentDNS {
+		wgSem <- struct{}{}
+	}
+
+	dnsAddr := tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}), Port: 53}
+	tcpConn, err := gonet.DialTCP(s, dnsAddr, ipv4.ProtocolNumber)
+	if err != nil {
+		_ = w.Close()
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer tcpConn.Close()
+
+	req := buildDNSQuery(2, "wg-blocked.example.test", dnsTypeA)
+	framed := binary.BigEndian.AppendUint16(nil, uint16(len(req)))
+	if _, err := tcpConn.Write(append(framed, req...)); err != nil {
+		_ = w.Close()
+		t.Fatalf("write TCP DNS query: %v", err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- w.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("w.Close(): %v", err)
+		}
+	case <-time.After(testTimeout):
+		for len(wgSem) > 0 {
+			<-wgSem
+		}
+		t.Fatal("WireGuardEndpoint.Close hung waiting for TCP DNS listener with saturated semaphore")
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream saw %d queries after saturated TCP DNS cancellation, want 0", srv.queries.Load())
 	}
 }

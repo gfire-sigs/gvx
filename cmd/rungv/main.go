@@ -53,11 +53,14 @@ func register(c command) {
 }
 
 func main() {
+	os.Exit(mainExit())
+}
+
+func mainExit() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	code := executeCLI(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
-	os.Exit(code)
+	return executeCLI(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 }
 
 func executeCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {

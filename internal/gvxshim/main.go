@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -29,12 +28,15 @@ type commandOptions struct {
 	version       bool
 }
 
+// retainedExitLease keeps the serving lease reachable across os.Exit until the
+// operating system closes all process handles.
+var retainedExitLease any
+
 func Main() {
 	// Broken bootstrap and readiness pipes must run rollback instead of terminating the process.
 	signal.Ignore(syscall.SIGPIPE)
 	exit := dispatch(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
-	// Keep the serving lease rooted until the operating system closes all process handles.
-	defer runtime.KeepAlive(exit.RetainLease)
+	retainedExitLease = exit.RetainLease
 	os.Exit(exit.Code)
 }
 
