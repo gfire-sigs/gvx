@@ -82,6 +82,8 @@ func placeholderType(info hostInfo, m POSIXAttr) uint32 {
 }
 
 // specialState is the in-memory state of a socket, a FIFO, or a device node.
+//
+// +stateify savable
 type specialState struct {
 	// pipe is the pipe of a FIFO. It is set when the inode is created and
 	// never changes.

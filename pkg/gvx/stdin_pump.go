@@ -16,7 +16,6 @@ package gvx
 
 import (
 	"io"
-	"sync"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/context"
@@ -32,37 +31,13 @@ type readDeadlineSetter interface {
 	SetReadDeadline(time.Time) error
 }
 
-// stdinPump lets a guest read a host io.Reader without blocking the task
-// goroutine. A host read cannot be interrupted, so a task that called it
-// directly ignored SIGKILL until the host reader returned. The pump runs the
-// host read in a helper goroutine. A guest read that finds no data returns
-// ErrWouldBlock, and the read system call waits on the queue of the pump. The
-// wait ends on a signal, as on Linux.
-//
-// At most one host read runs at a time. The pump reads only when a guest read
-// or a poll waits for input, so the guest never loses data to a read-ahead
-// beyond one chunk. The helper goroutine ends when the host reader returns or
-// when stop interrupts a deadline-capable reader.
-type stdinPump struct {
-	r  io.Reader
-	wq waiter.Queue
-
-	mu sync.Mutex
-	// buf holds the bytes that the host read returned and the guest did not
-	// read yet.
-	buf []byte
-	// err is the error that ended the host reader. It stays set, so every
-	// later read returns it after the buffer is empty.
-	err error
-	// pending is set while a helper goroutine reads the host reader.
-	pending bool
-	// stopped is set when the sandbox run finishes.
-	stopped bool
-	// readDone closes when the active helper goroutine returns.
-	readDone chan struct{}
+func newStdinPump(r io.Reader) *stdinPump {
+	p := &stdinPump{r: r}
+	if r == nil {
+		p.err = io.EOF
+	}
+	return p
 }
-
-func newStdinPump(r io.Reader) *stdinPump { return &stdinPump{r: r} }
 
 // read implements the non-blocking read of the guest. It returns ErrWouldBlock
 // while no data and no error is available.
@@ -100,13 +75,18 @@ func (p *stdinPump) startReadLocked(size int) {
 	if p.pending || p.stopped {
 		return
 	}
+	if p.r == nil {
+		p.err = io.EOF
+		return
+	}
+	r := p.r
 	done := make(chan struct{})
 	p.pending = true
 	p.readDone = done
 	go func() {
 		defer close(done)
 		buf := make([]byte, size)
-		n, err := p.r.Read(buf)
+		n, err := r.Read(buf)
 		p.mu.Lock()
 		stopped := p.stopped
 		if !stopped {
@@ -118,7 +98,7 @@ func (p *stdinPump) startReadLocked(size int) {
 		p.pending = false
 		p.readDone = nil
 		if stopped {
-			if d, ok := p.r.(readDeadlineSetter); ok {
+			if d, ok := r.(readDeadlineSetter); ok {
 				_ = d.SetReadDeadline(time.Time{})
 			}
 		}
@@ -142,6 +122,7 @@ func (p *stdinPump) stop() {
 		p.err = io.EOF
 	}
 	done := p.readDone
+	r := p.r
 	p.mu.Unlock()
 
 	if !alreadyStopped {
@@ -155,7 +136,7 @@ func (p *stdinPump) stop() {
 		return
 	default:
 	}
-	if d, ok := p.r.(readDeadlineSetter); ok {
+	if d, ok := r.(readDeadlineSetter); ok {
 		if err := d.SetReadDeadline(time.Now()); err == nil {
 			select {
 			case <-done:

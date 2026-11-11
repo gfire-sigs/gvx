@@ -32,27 +32,18 @@ import (
 // the minor numbers 0, 1, and 2.
 const stdioDeviceMajor = 240
 
-// stdioDevice implements vfs.Device for one guest stdio stream.
-//
-// WHY: a guest reopens its standard streams through /dev/stdout and
-// /proc/self/fd/N, and nginx does so for its log files. The magic link jumps
-// to the dentry of the file description and opens it again. An anonymous
-// dentry cannot be opened, so each stream lives behind a real character device
-// node. A second open then creates a new file description on the same host
-// reader or writer.
-type stdioDevice struct {
-	reader io.Reader
-	writer io.Writer
-	tty    *ttyState
-	// pump serves the reads of a stream without a terminal.
-	pump *stdinPump
-	// mu serializes host I/O of every file description of the stream.
-	mu *sync.Mutex
-}
-
 // Open implements vfs.Device.Open.
-func (d stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd := &stdioFD{reader: d.reader, writer: d.writer, tty: d.tty, pump: d.pump, mu: d.mu}
+func (d *stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd := &stdioFD{
+		stream:       d.stream,
+		sharedOutErr: d.sharedOutErr,
+		dev:          d,
+		reader:       d.reader,
+		writer:       d.writer,
+		tty:          d.tty,
+		pump:         d.pump,
+		mu:           d.mu,
+	}
 	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
 		SpecialFile: d.tty != nil,
 	}); err != nil {
@@ -66,30 +57,31 @@ func (d stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentr
 // private tmpfs that no mount namespace contains, so the guest sees the
 // streams only through its descriptor table.
 func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, err error) {
-	devs := [3]stdioDevice{
-		{reader: in, pump: pump},
-		{writer: out},
-		{writer: errw},
+	devs := [3]*stdioDevice{
+		{stream: stdioStreamStdin, reader: in, pump: pump},
+		{stream: stdioStreamStdout, writer: out},
+		{stream: stdioStreamStderr, writer: errw},
 	}
 	names := [3]string{"stdin", "stdout", "stderr"}
 	flags := [3]uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_WRONLY}
 	if tty != nil {
+		sharedOutErr := errw == out
 		errMu := tty.outMu
-		if errw != out {
+		if !sharedOutErr {
 			errMu = new(sync.Mutex)
 		}
-		devs = [3]stdioDevice{
-			{reader: in, writer: out, tty: tty, mu: tty.outMu},
-			{reader: in, writer: out, tty: tty, mu: tty.outMu},
-			{reader: in, writer: errw, tty: tty, mu: errMu},
+		devs = [3]*stdioDevice{
+			{stream: stdioStreamStdin, reader: in, writer: out, tty: tty, mu: tty.outMu},
+			{stream: stdioStreamStdout, reader: in, writer: out, tty: tty, mu: tty.outMu},
+			{stream: stdioStreamStderr, sharedOutErr: sharedOutErr, reader: in, writer: errw, tty: tty, mu: errMu},
 		}
 		flags = [3]uint32{linux.O_RDWR, linux.O_RDWR, linux.O_RDWR}
 	}
-	for i := range devs {
-		if devs[i].mu == nil {
-			devs[i].mu = new(sync.Mutex)
+	for i, dev := range devs {
+		if dev.mu == nil {
+			dev.mu = new(sync.Mutex)
 		}
-		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, uint32(i), devs[i], &vfs.RegisterDeviceOptions{}); err != nil {
+		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, uint32(i), dev, &vfs.RegisterDeviceOptions{}); err != nil {
 			return fds, fmt.Errorf("gvx: register the %s device: %w", names[i], err)
 		}
 	}

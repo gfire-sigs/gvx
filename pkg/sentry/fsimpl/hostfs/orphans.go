@@ -508,9 +508,31 @@ func (w *Workspace) entryGoneLocked(rel string) bool {
 // an internal name holds guest data, so it stays. OpenWorkspace calls it before
 // the guest runs, so it takes no lock.
 func (w *Workspace) sweepEphemeral() {
+	w.sweepEphemeralExcept(nil)
+}
+
+func (w *Workspace) sweepUnclaimedEphemeral(claimed map[string]struct{}) {
+	if w.readOnly || w.single != "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	w.sweepEphemeralExcept(claimed)
+}
+
+func (w *Workspace) sweepEphemeralExcept(claimed map[string]struct{}) {
 	seen := map[string]struct{}{}
 	for _, p := range w.meta.paths() {
 		parent, _ := splitParent(p)
+		if parent != "." {
+			seen[parent] = struct{}{}
+		}
+	}
+	for rel := range claimed {
+		parent, _ := splitParent(rel)
 		if parent != "." {
 			seen[parent] = struct{}{}
 		}
@@ -532,6 +554,9 @@ func (w *Workspace) sweepEphemeral() {
 		}
 		for _, e := range entries {
 			if e.kind == hostKindRegular && isEphemeralName(e.name) {
+				if _, keep := claimed[joinRelPath(dir, e.name)]; keep {
+					continue
+				}
 				_ = w.host.unlink(hostChild(hostDir, e.name))
 			}
 		}
