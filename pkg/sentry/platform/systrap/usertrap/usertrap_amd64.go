@@ -81,46 +81,6 @@ type memoryManager interface {
 	WithPinnedMappings(ctx context.Context, addr hostarch.Addr, length int, f func(safemem.BlockSeq) error) error
 }
 
-// siteWrite is one write of a patch or an unpatch. off is the offset of data
-// in the jmpInstLen bytes of the patch site.
-type siteWrite struct {
-	off  int
-	data []byte
-}
-
-// rewriteSite makes the writes, in order, into the jmpInstLen bytes at addr.
-// All writes reach the frames that back addr when the call starts. Another
-// thread that unmaps or replaces the mapping of addr waits until the call
-// returns. Writes that look up the frames again for each step would put the
-// first step into the old frame and the last steps into the new frame. That
-// leaves the old frame with the invalid instruction and no jump, and the new
-// frame with a jump instruction that has no operand.
-//
-// If old is not nil, rewriteSite compares the bytes at addr with old first. It
-// returns false and writes nothing if they differ.
-func rewriteSite(ctx context.Context, mm memoryManager, addr hostarch.Addr, old *[jmpInstLen]uint8, writes ...siteWrite) (bool, error) {
-	matched := true
-	err := mm.WithPinnedMappings(ctx, addr, jmpInstLen, func(ims safemem.BlockSeq) error {
-		if old != nil {
-			var current [jmpInstLen]uint8
-			if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(current[:])), ims); err != nil {
-				return err
-			}
-			if current != *old {
-				matched = false
-				return nil
-			}
-		}
-		for _, w := range writes {
-			if _, err := safemem.CopySeq(ims.DropFirst(w.off), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(w.data))); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	return matched, err
-}
-
 // State represents the current state of the trap table.
 //
 // +stateify savable
@@ -322,10 +282,9 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		return err
 	}
 
-	// Check that another thread has not patched this syscall yet, and that
-	// the bytes are the "mov sysno, %eax; syscall" that trapped.
-	prev := origSyscallCode(uint32(sysno))
-	if prevCode == prev {
+	// Check that another thread has not patched this syscall yet.
+	// 0xb8 is the first byte of "mov sysno, %eax".
+	if prevCode == origSyscallCode(uint32(sysno)) {
 		ctx.Debugf("Found the pattern at ip %x:sysno %d", patchAddr, sysno)
 
 		trapAddr, err := s.addTrapLocked(ctx, ac, mm, uint32(sysno))
@@ -365,35 +324,8 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		// patched code the mov reading a garbage immediate operand
 		// doesn’t impact correctness.
 
-		// The patch is applied in three steps, all in one call of
-		// rewriteSite, so that all steps reach the same frames:
-		//
-		// The first step is to replace the first byte of the syscall
-		// instruction by one-byte invalid instruction (0x06), so that
-		// other threads which have passed the mov instruction fault on
-		// the invalid instruction and restart a patched code.
-		//
-		// The second step is to replace all bytes except the first one
-		// which is the opcode of the mov instruction, so that the first
-		// five bytes remain "mov XXX, %rax".
-		//
-		// The final step is to replace the first byte of the patch.
-		// After this point, all threads will read the valid jmp
-		// instruction.
-		//
-		// Another thread can replace the mapping of the site between the
-		// read above and the call. rewriteSite reads the site again and
-		// applies the patch only if it still holds prev.
-		applied, err := rewriteSite(ctx, mm, hostarch.Addr(patchAddr), &prev,
-			siteWrite{off: int(faultInstOffset), data: faultInst[:]},
-			siteWrite{off: 1, data: newCode[1:]},
-			siteWrite{off: 0, data: newCode[0:1]})
-		if err != nil {
+		if applied, err := patchSyscallSite(ctx, mm, patchAddr, sysno, newCode); err != nil || !applied {
 			return err
-		}
-		if !applied {
-			ctx.Debugf("The code at %x changed before the patch, skip it", patchAddr)
-			return nil
 		}
 
 		// s.patches is initialized in New(), but check it just in case.
@@ -586,30 +518,7 @@ func (s *State) UnpatchSyscalls(ctx context.Context, mm memoryManager) error {
 		// guarantee that in each moment other threads will read a
 		// valid set of instructions, detect any inconsistent states
 		// and restart the unpatched code via HandleFault.
-		//
-		// The unpatch is applied in three steps, all in one call of
-		// rewriteSite, so that all steps reach the same frames:
-		//
-		// The first step is to replace the first byte of the jmp
-		// instruction with a one-byte invalid instruction (0x06), so that
-		// other threads which attempt to execute at patchAddr fault on
-		// the invalid instruction and restart the unpatched code via HandleFault.
-		//
-		// The second step is to replace all bytes except the first one
-		// with the remainder of the original code, so that bytes 1..4
-		// become the sysno and bytes 5..6 become the syscall opcode (0x0f05).
-		// During this write, the first byte remains 0x06, ensuring any
-		// racing threads fault on the invalid instruction.
-		//
-		// The final step is to restore the first byte of the original
-		// instruction (0xb8, the opcode of "mov sysno, %eax").
-		// After this point, all threads will read the valid
-		// "mov sysno, %eax; syscall" instruction sequence.
-		if _, err := rewriteSite(ctx, mm, patchAddr, nil,
-			siteWrite{off: 0, data: faultInst[:]},
-			siteWrite{off: 1, data: origCode[1:]},
-			siteWrite{off: 0, data: origCode[0:1]}); err != nil {
-			ctx.Warningf("Failed to unpatch syscall at %x (sysno %d): %v", patchAddr, sysno, err)
+		if err := unpatchSyscallSite(ctx, mm, patchAddr, sysno, origCode); err != nil {
 			return err
 		}
 	}

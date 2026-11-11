@@ -163,8 +163,6 @@ type subprocess struct {
 	// trampolines.
 	usertrap *usertrap.State
 
-	// subBlocks maps guest pages of 4 KB on a host with larger pages. It is
-	// nil on a host with 4 KB pages (subblock_xplat.go).
 	subBlocks *subBlockLayer
 
 	syscallThreadMu sync.Mutex
@@ -1125,8 +1123,7 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
-	if s.subBlocks != nil {
-		s.subBlocks.unmap(addr, length)
+	if s.unmapSubBlocks(addr, length) {
 		return
 	}
 	_, err := s.syscall(
@@ -1271,12 +1268,8 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 	}
 
 	// Map the stack into the BPF process.
-	// On a host with pages larger than the guard page, the private stack
-	// takes the whole host page around it (hostpage_xplat.go).
 	privateStackAddr := sysThread.sysmsgPerThreadMemAddr() + sysmsg.PerThreadPrivateStackOffset
-	privateStackEnd := hostPageRoundUp(privateStackAddr + sysmsg.PerThreadPrivateStackSize)
-	privateStackAddr = hostPageRoundDown(privateStackAddr)
-	err = sysThread.mapPrivateStack(privateStackAddr, privateStackEnd-privateStackAddr)
+	err = sysThread.mapHostPrivateStack(privateStackAddr, sysmsg.PerThreadPrivateStackSize)
 	if err != nil {
 		return fmt.Errorf("mmap failed: %w", err)
 	}

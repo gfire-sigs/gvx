@@ -1219,3 +1219,70 @@ func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlo
 		}
 	}
 }
+
+// maxSubBlockFaultRetries bounds consecutive SIGILL restarts while concurrent
+// threads modify stub mappings.
+const maxSubBlockFaultRetries = 16
+
+// subBlockContext tracks per-thread sub-block state across guest switches.
+type subBlockContext struct {
+	subBlockSeq     uint64
+	subBlockChanges uint64
+	subBlockRetries int
+}
+
+// beforeSubBlockSwitch refreshes pending blocks and records the store and
+// mapping counters for c.
+func (s *subprocess) beforeSubBlockSwitch(ctx context.Context, c *platformContext, mm platform.MemoryManager) {
+	if s.subBlocks == nil {
+		return
+	}
+	c.subBlockSeq = s.subBlocks.beforeSwitch(ctx, mm)
+	c.subBlockChanges = s.subBlocks.changes.Load()
+}
+
+// resolveSubBlockFault emulates composite stores and rewrites missing-page
+// faults. It returns true when the caller must restart the guest switch.
+func (s *subprocess) resolveSubBlockFault(c *platformContext, ac *arch.Context64, si *linux.SignalInfo, at *hostarch.AccessType) bool {
+	if s.subBlocks == nil {
+		return false
+	}
+	if at.Write && linux.Signal(si.Signo) == linux.SIGSEGV {
+		switch s.subBlocks.emulateStore(c, ac) {
+		case storeFaultEmulated:
+			return true
+		case storeFaultRefused:
+			*at = hostarch.NoAccess
+		}
+	}
+	if s.subBlocks.fixMissingPageFault(si, at, ac, c.subBlockChanges) && c.subBlockRetries < maxSubBlockFaultRetries {
+		c.subBlockRetries++
+		return true
+	}
+	c.subBlockRetries = 0
+	return false
+}
+
+// unmapSubBlocks unmaps [addr, addr+length) through s.subBlocks and reports
+// whether s owns a sub-block layer.
+func (s *subprocess) unmapSubBlocks(addr hostarch.Addr, length uint64) bool {
+	if s.subBlocks == nil {
+		return false
+	}
+	s.subBlocks.unmap(addr, length)
+	return true
+}
+
+// alignToPageSpan expands [addr, addr+size) to whole multiples of pageSize.
+func alignToPageSpan(addr, size, pageSize uintptr) (uintptr, uintptr) {
+	start := addr &^ (pageSize - 1)
+	end := (addr + size + pageSize - 1) &^ (pageSize - 1)
+	return start, end - start
+}
+
+// mapHostPrivateStack aligns [addr, addr+size) to host pages and maps the
+// private stack into p.
+func (p *sysmsgThread) mapHostPrivateStack(addr, size uintptr) error {
+	alignedAddr, alignedSize := alignToPageSpan(addr, size, hostPageSize)
+	return p.mapPrivateStack(alignedAddr, alignedSize)
+}

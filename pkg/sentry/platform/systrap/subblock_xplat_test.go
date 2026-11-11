@@ -22,8 +22,10 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -222,5 +224,166 @@ func TestPopulatePartialRepopulatesAfterConcurrentRelease(t *testing.T) {
 	layer.mu.Unlock()
 	if !bytes.Equal(got, []byte{0xa5, 0xa5, 0xa5, 0xa5}) {
 		t.Fatalf("composite sub-page 0 prefix = %x, want a5a5a5a5", got)
+	}
+}
+
+func TestAlignToPageSpan(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		addr, size, ps uintptr
+		wantAddr       uintptr
+		wantSize       uintptr
+	}{
+		{"4 KB aligned stack on 4 KB host", 0x601000, 0x1000, 0x1000, 0x601000, 0x1000},
+		{"4 KB sub-page stack on 16 KB host", 0x601000, 0x1000, 0x4000, 0x600000, 0x4000},
+		{"cross-boundary span on 16 KB host", 0x603000, 0x2000, 0x4000, 0x600000, 0x8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotAddr, gotSize := alignToPageSpan(tc.addr, tc.size, tc.ps)
+			if gotAddr != tc.wantAddr || gotSize != tc.wantSize {
+				t.Fatalf("alignToPageSpan(%#x, %#x, %#x) = (%#x, %#x), want (%#x, %#x)",
+					tc.addr, tc.size, tc.ps, gotAddr, gotSize, tc.wantAddr, tc.wantSize)
+			}
+		})
+	}
+}
+
+func TestSubprocessSubBlockSwitchAndUnmapHooks(t *testing.T) {
+	var nilSubproc subprocess
+	var ctx platformContext
+	ctx.subBlockSeq = 7
+	ctx.subBlockChanges = 9
+	nilSubproc.beforeSubBlockSwitch(nil, &ctx, noopSubBlockPopulator{})
+	if ctx.subBlockSeq != 7 || ctx.subBlockChanges != 9 {
+		t.Fatalf("nil subBlocks modified counters to (%d, %d), want (7, 9)", ctx.subBlockSeq, ctx.subBlockChanges)
+	}
+	if nilSubproc.unmapSubBlocks(0x200000, subBlockSize) {
+		t.Fatal("nil subBlocks unmapSubBlocks = true, want false")
+	}
+
+	mf, err := createMemoryFile()
+	if err != nil {
+		t.Fatalf("createMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	layer := newSubBlockLayer(fakeCompBlockHost{})
+	defer layer.reset()
+	layer.storeSeq.Store(41)
+
+	const blockAddr = hostarch.Addr(0x200000)
+	pageFR := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+	if err := layer.mapFile(blockAddr, mf, pageFR, hostarch.Read, false); err != nil {
+		t.Fatalf("mapFile: %v", err)
+	}
+
+	subproc := subprocess{subBlocks: layer}
+	subproc.beforeSubBlockSwitch(nil, &ctx, noopSubBlockPopulator{})
+	if ctx.subBlockSeq != 41 {
+		t.Fatalf("subBlockSeq = %d, want 41", ctx.subBlockSeq)
+	}
+	if ctx.subBlockChanges == 0 {
+		t.Fatal("subBlockChanges = 0 after mapping deferred composite block, want > 0")
+	}
+	if !subproc.unmapSubBlocks(blockAddr, subBlockSize) {
+		t.Fatal("active subBlocks unmapSubBlocks = false, want true")
+	}
+	layer.mu.Lock()
+	_, exists := layer.blocks[uintptr(blockAddr)]
+	layer.mu.Unlock()
+	if exists {
+		t.Fatalf("block %#x remained present after unmapSubBlocks", blockAddr)
+	}
+}
+
+func TestResolveSubBlockFault(t *testing.T) {
+	ac := arch.New(arch.Host)
+	ac.SetIP(0x500000)
+
+	var nilSubproc subprocess
+	var ctx platformContext
+	ctx.subBlockRetries = 3
+	si := linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
+	at := hostarch.Write
+	if nilSubproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatal("nil subBlocks resolveSubBlockFault = true, want false")
+	}
+	if ctx.subBlockRetries != 3 || at != hostarch.Write {
+		t.Fatalf("nil subBlocks mutated state: retries=%d at=%v", ctx.subBlockRetries, at)
+	}
+
+	mf, err := createMemoryFile()
+	if err != nil {
+		t.Fatalf("createMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	layer := newSubBlockLayer(fakeCompBlockHost{})
+	defer layer.reset()
+
+	const blockAddr = hostarch.Addr(0x400000)
+	pageFR := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+	if err := layer.mapFile(blockAddr, mf, pageFR, hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("mapFile: %v", err)
+	}
+	subproc := subprocess{subBlocks: layer}
+	subproc.beforeSubBlockSwitch(nil, &ctx, noopSubBlockPopulator{})
+
+	// A write fault on a writable composite sub-page with an unreadable PC is
+	// refused: access clears to NoAccess and retries reset to zero.
+	ctx.signalInfo = linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
+	ctx.signalInfo.SetAddr(uint64(blockAddr))
+	si = ctx.signalInfo
+	at = hostarch.Write
+	ctx.subBlockRetries = 5
+	if subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatal("refused store returned restart = true, want false")
+	}
+	if at != hostarch.NoAccess || ctx.subBlockRetries != 0 {
+		t.Fatalf("after refused store: at=%v retries=%d, want NoAccess and 0", at, ctx.subBlockRetries)
+	}
+
+	// A SEGV_ACCERR on an unmapped sub-page of a mapped block becomes SEGV_MAPERR.
+	missingAddr := uint64(blockAddr + hostarch.PageSize)
+	ctx.signalInfo = linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
+	ctx.signalInfo.SetAddr(missingAddr)
+	si = ctx.signalInfo
+	at = hostarch.Read
+	if subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatal("missing-page SEGV returned restart = true, want false")
+	}
+	if si.Code != segvMaperr {
+		t.Fatalf("missing-page si.Code = %d, want segvMaperr (%d)", si.Code, segvMaperr)
+	}
+
+	// SIGILL while changes advanced restarts at most maxSubBlockFaultRetries times.
+	layer.changes.Add(1)
+	si = linux.SignalInfo{Signo: int32(linux.SIGILL)}
+	at = hostarch.Execute
+	for i := 1; i <= maxSubBlockFaultRetries; i++ {
+		if !subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+			t.Fatalf("retry %d: resolveSubBlockFault = false, want true", i)
+		}
+		if ctx.subBlockRetries != i {
+			t.Fatalf("retry %d: subBlockRetries = %d, want %d", i, ctx.subBlockRetries, i)
+		}
+	}
+	if subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatal("17th consecutive SIGILL returned restart = true, want false")
+	}
+	if ctx.subBlockRetries != 0 {
+		t.Fatalf("subBlockRetries after cap = %d, want 0", ctx.subBlockRetries)
 	}
 }

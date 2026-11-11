@@ -193,6 +193,15 @@ func TestBoundaryUsertrapMayImportTheKernelButNotAHardwareBackend(t *testing.T) 
 	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go", importLines(m+"pkg/sentry/platform/whpx", m+"pkg/sentry/platform/hvf")); len(vs) != 2 {
 		t.Errorf("usertrap importing a hardware backend: %d violations, want 2", len(vs))
 	}
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/rewrite_xplat_amd64.go", importLines(m+"pkg/context", m+"pkg/hostarch", m+"pkg/safemem")); len(vs) != 0 {
+		t.Errorf("usertrap xplat sibling importing foundation packages flagged: %v", vs)
+	}
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/rewrite_xplat_amd64.go", importLines(m+"pkg/sentry/platform/whpx")); len(vs) != 1 {
+		t.Errorf("usertrap xplat sibling importing whpx: %d violations, want 1", len(vs))
+	}
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/rewrite_xplat_amd64.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 1 {
+		t.Errorf("usertrap xplat sibling importing kernel: %d violations, want 1", len(vs))
+	}
 	// The rest of systrap keeps the kernel ban.
 	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/context_queue.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 1 {
 		t.Errorf("systrap importing the kernel: %d violations, want 1", len(vs))
