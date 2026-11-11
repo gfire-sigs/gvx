@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/inet"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
@@ -36,7 +37,29 @@ type restoreContextKey int
 const (
 	ctxRestoreStdio restoreContextKey = iota
 	ctxRestoreNetnsHook
+	ctxRestoreCollector
 )
+
+type restoreStdioCollector struct {
+	mu    sync.Mutex
+	ttys  []*ttyState
+	pumps []*stdinPump
+}
+
+func withRestoreCollector(ctx context.Context, c *restoreStdioCollector) context.Context {
+	if gctx, ok := ctx.(gvcontext.Context); ok {
+		return gvcontext.WithValue(gctx, ctxRestoreCollector, c)
+	}
+	return context.WithValue(ctx, ctxRestoreCollector, c)
+}
+
+func restoreCollectorFromContext(ctx context.Context) *restoreStdioCollector {
+	if ctx == nil {
+		return nil
+	}
+	c, _ := ctx.Value(ctxRestoreCollector).(*restoreStdioCollector)
+	return c
+}
 
 // RestoreStdio carries the host standard streams attached during checkpoint restore.
 type RestoreStdio struct {
@@ -48,6 +71,9 @@ type RestoreStdio struct {
 
 // WithRestoreStdio binds host stdio streams to ctx for state.Load rebinding.
 func WithRestoreStdio(ctx context.Context, stdio RestoreStdio) context.Context {
+	if gctx, ok := ctx.(gvcontext.Context); ok {
+		return gvcontext.WithValue(gctx, ctxRestoreStdio, stdio)
+	}
 	return context.WithValue(ctx, ctxRestoreStdio, stdio)
 }
 
@@ -65,6 +91,9 @@ type NetnsStackHook func(k *kernel.Kernel, opts netbackend.StackOptions) (inet.S
 
 // WithRestoreNetnsHook binds a guest network-namespace stack hook to ctx for state.Load.
 func WithRestoreNetnsHook(ctx context.Context, hook NetnsStackHook) context.Context {
+	if gctx, ok := ctx.(gvcontext.Context); ok {
+		return gvcontext.WithValue(gctx, ctxRestoreNetnsHook, hook)
+	}
 	return context.WithValue(ctx, ctxRestoreNetnsHook, hook)
 }
 
@@ -155,6 +184,11 @@ func (t *ttyState) afterLoad(ctx context.Context) {
 	} else {
 		t.hostEOF = false
 	}
+	if c := restoreCollectorFromContext(ctx); c != nil {
+		c.mu.Lock()
+		c.ttys = append(c.ttys, t)
+		c.mu.Unlock()
+	}
 }
 
 // ActivateRestoredTTY starts the background host terminal reader pump when a
@@ -195,6 +229,11 @@ func (p *stdinPump) afterLoad(ctx context.Context) {
 	}
 	if p.r == nil {
 		p.err = io.EOF
+	}
+	if c := restoreCollectorFromContext(ctx); c != nil {
+		c.mu.Lock()
+		c.pumps = append(c.pumps, p)
+		c.mu.Unlock()
 	}
 }
 

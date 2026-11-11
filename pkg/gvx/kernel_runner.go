@@ -981,7 +981,79 @@ func createSandboxLimitSet() (*limits.LimitSet, error) {
 	return ls, nil
 }
 
+func registerKernelVFS(vfsObj *vfs.VirtualFilesystem, rootNetNS *inet.Namespace) error {
+	vfsObj.MustRegisterFilesystemType("erofs", erofs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	vfsObj.MustRegisterFilesystemType("overlay", overlay.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	vfsObj.MustRegisterFilesystemType("tmpfs", tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType("proc", proc.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType("sysfs", sys.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(sys.BPFName, sys.BPFFilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType("devtmpfs", dev.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType("devpts", &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(mqfs.Name, &mqfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(fuse.Name, &fuse.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	if ext4lite.Name != "ext4lite" {
+		vfsObj.MustRegisterFilesystemType("ext4lite", ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	}
+
+	if err := memdev.Register(vfsObj); err != nil {
+		return fmt.Errorf("gvx: register memdev: %w", err)
+	}
+	if err := memdev.RegisterKmsg(vfsObj); err != nil {
+		return fmt.Errorf("gvx: register /dev/kmsg: %w", err)
+	}
+	if err := ttydev.Register(vfsObj); err != nil {
+		return fmt.Errorf("gvx: register ttydev: %w", err)
+	}
+	if err := fuse.Register(vfsObj); err != nil {
+		return fmt.Errorf("gvx: register fuse device: %w", err)
+	}
+	if rootNetNS == nil || tundev.IsNetTunSupported(rootNetNS.Stack()) {
+		if err := tundev.Register(vfsObj); err != nil {
+			return fmt.Errorf("gvx: register tun device: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Sandbox) setActiveKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
+	s.mu.Lock()
+	s.activeKernel = k
+	s.activeWatchdog = dog
+	s.mu.Unlock()
+	if s.kernelReady != nil {
+		s.kernelReadyOnce.Do(func() {
+			close(s.kernelReady)
+		})
+	}
+}
+
+func (s *Sandbox) clearActiveKernel() {
+	s.mu.Lock()
+	s.activeKernel = nil
+	s.activeWatchdog = nil
+	s.mu.Unlock()
+}
+
+func (s *Sandbox) closeRunDone() {
+	if s.runDone != nil {
+		s.runDoneOnce.Do(func() {
+			close(s.runDone)
+		})
+	}
+}
+
+func (s *Sandbox) hasRestoredKernel() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restoredKernel != nil
+}
+
 func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error) {
+	defer s.closeRunDone()
 	initRuntimeGlobals()
 	if s.detachDebugLog == nil && s.cfg.DebugLog != nil {
 		detach := attachDebugLogSink(s.cfg.DebugLog)
@@ -1073,39 +1145,8 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	k.KernelLog().WriteBootMessages()
 
 	vfsObj := k.VFS()
-	vfsObj.MustRegisterFilesystemType("erofs", erofs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
-	vfsObj.MustRegisterFilesystemType("overlay", overlay.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
-	vfsObj.MustRegisterFilesystemType("tmpfs", tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType("proc", proc.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType("sysfs", sys.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType(sys.BPFName, sys.BPFFilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType("devtmpfs", dev.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType("devpts", &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType(mqfs.Name, &mqfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType(fuse.Name, &fuse.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	if ext4lite.Name != "ext4lite" {
-		vfsObj.MustRegisterFilesystemType("ext4lite", ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
-	}
-
-	if err := memdev.Register(vfsObj); err != nil {
-		return 1, fmt.Errorf("gvx: register memdev: %w", err)
-	}
-	if err := memdev.RegisterKmsg(vfsObj); err != nil {
-		return 1, fmt.Errorf("gvx: register /dev/kmsg: %w", err)
-	}
-	if err := ttydev.Register(vfsObj); err != nil {
-		return 1, fmt.Errorf("gvx: register ttydev: %w", err)
-	}
-	if err := fuse.Register(vfsObj); err != nil {
-		return 1, fmt.Errorf("gvx: register fuse device: %w", err)
-	}
-	if rootNetNS != nil && tundev.IsNetTunSupported(rootNetNS.Stack()) {
-		if err := tundev.Register(vfsObj); err != nil {
-			return 1, fmt.Errorf("gvx: register tun device: %w", err)
-		}
+	if err := registerKernelVFS(vfsObj, rootNetNS); err != nil {
+		return 1, err
 	}
 
 	sctx := k.SupervisorContext()
@@ -1114,10 +1155,20 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err != nil {
 		return 1, err
 	}
-	defer mntns.DecRef(sctx)
+	mntnsOwned := true
+	defer func() {
+		if mntnsOwned {
+			mntns.DecRef(sctx)
+		}
+	}()
 
 	root := mntns.Root(sctx)
-	defer root.DecRef(sctx)
+	rootOwned := true
+	defer func() {
+		if rootOwned {
+			root.DecRef(sctx)
+		}
+	}()
 	sctxWithRoot := vfs.WithRoot(sctx, root)
 
 	if err := s.setupKernelSubmountsAndFiles(sctxWithRoot, vfsObj, creds, root); err != nil {
@@ -1239,6 +1290,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		}
 		return 1, fmt.Errorf("gvx: create guest process %q: %w", execPath, err)
 	}
+	// Drop the setup references on root and mntns so only the guest tasks own
+	// the mount namespace while the sandbox runs.
+	root.DecRef(sctx)
+	rootOwned = false
+	mntns.DecRef(sctx)
+	mntnsOwned = false
 
 	if tty != nil {
 		tty.startPump()
@@ -1252,6 +1309,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	dog := watchdog.New(k, watchdog.DefaultOpts)
 	dog.Start()
 	defer dog.Stop()
+
+	s.setActiveKernel(k, dog)
+	defer s.clearActiveKernel()
 
 	doneCh := make(chan struct{})
 	go func() {
@@ -1298,6 +1358,160 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	close(doneCh)
 	k.Pause()
 
+	if s.checkpointStopped.Load() {
+		return 0, nil
+	}
+	if ctx.Err() != nil {
+		return 1, ctx.Err()
+	}
+	if memoryExceeded.Load() {
+		return 137, ErrMemoryLimit
+	}
+
+	ws := tg.ExitStatus()
+	if ws.Signaled() && ws.TerminationSignal() == linux.SIGKILL {
+		if cause := k.TakeEngineFault(); cause != "" {
+			return 128 + int(linux.SIGKILL), engineFaultError(cause)
+		}
+	}
+	if ws.Signaled() {
+		return 128 + int(ws.TerminationSignal()), nil
+	}
+	return int(ws.ExitStatus()), nil
+}
+
+func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
+	defer s.closeRunDone()
+	initRuntimeGlobals()
+	if s.detachDebugLog == nil && s.cfg.DebugLog != nil {
+		detach := attachDebugLogSink(s.cfg.DebugLog)
+		if detach != nil {
+			defer detach()
+		}
+	}
+
+	s.mu.Lock()
+	k := s.restoredKernel
+	s.restoredKernel = nil
+	collector := s.restoredStdio
+	s.restoredStdio = nil
+	mf := s.memFile
+	s.memFile = nil
+	s.mu.Unlock()
+	if k == nil || mf == nil {
+		return 1, errRunConsumed
+	}
+	defer mf.Destroy()
+	if tk := k.Timekeeper(); tk != nil {
+		defer tk.Destroy()
+	}
+	if s.netStack != nil {
+		netfilter.SetStackLog(s.netStack, kernelLogFunc(k))
+		defer netfilter.SetStackLog(s.netStack, nil)
+	}
+
+	tg := k.GlobalInit()
+	if tg == nil {
+		return 1, errors.New("gvx: restored kernel has no global init process")
+	}
+
+	var restoredTTYs []*ttyState
+	var restoredPumps []*stdinPump
+	if collector != nil {
+		collector.mu.Lock()
+		restoredTTYs = append(restoredTTYs, collector.ttys...)
+		restoredPumps = append(restoredPumps, collector.pumps...)
+		collector.mu.Unlock()
+	}
+	if ktty := tg.TTY(); ktty != nil {
+		if ts, ok := ktty.TTYOperations.(*ttyState); ok && ts != nil {
+			found := false
+			for _, existing := range restoredTTYs {
+				if existing == ts {
+					found = true
+					break
+				}
+			}
+			if !found {
+				restoredTTYs = append(restoredTTYs, ts)
+			}
+		}
+	}
+	if s.cfg.TTY || isHostTerminalReader(s.cfg.Stdin) {
+		restoreTerm, _ := enterHostRawMode(s.cfg.Stdin, s.cfg.Stdout)
+		defer restoreTerm()
+		if len(restoredTTYs) > 0 {
+			stopWinch := watchHostWinch(ctx, s.cfg.Stdin, s.cfg.Stdout, func(r, c uint16) {
+				for _, ts := range restoredTTYs {
+					ts.setWinsize(linux.Winsize{Row: r, Col: c})
+				}
+			})
+			defer stopWinch()
+		}
+	}
+	for _, ts := range restoredTTYs {
+		ts.ActivateRestoredTTY()
+		defer ts.stop()
+	}
+	for _, p := range restoredPumps {
+		defer p.stop()
+	}
+
+	if err := k.Start(); err != nil {
+		return 1, fmt.Errorf("gvx: start restored Sentry kernel: %w", err)
+	}
+	dog := watchdog.New(k, watchdog.DefaultOpts)
+	dog.Start()
+	defer dog.Stop()
+
+	s.setActiveKernel(k, dog)
+	defer s.clearActiveKernel()
+
+	doneCh := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+		case <-doneCh:
+		}
+	}()
+
+	hostRAM, _ := hostMemory()
+	var memoryExceeded atomic.Bool
+	if limit, interval := effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM, s.cfg.Tuning); limit > 0 {
+		guard := memoryGuard{
+			limit: limit,
+			used: func() uint64 {
+				_ = mf.UpdateUsage(nil)
+				return mf.Accounting().Total()
+			},
+			flushScan:    mf.FlushCommitScan,
+			idleActivity: k.IdleTaskActivityChan,
+			interval:     interval,
+			kill: func() {
+				memoryExceeded.Store(true)
+				_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+			},
+		}
+		guardCtx, stopGuard := context.WithCancel(ctx)
+		guardDone := make(chan struct{})
+		go func() {
+			defer close(guardDone)
+			guard.run(guardCtx)
+		}()
+		defer func() {
+			stopGuard()
+			<-guardDone
+		}()
+	}
+
+	k.WaitExited()
+	close(doneCh)
+	k.Pause()
+
+	if s.checkpointStopped.Load() {
+		return 0, nil
+	}
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
 	}

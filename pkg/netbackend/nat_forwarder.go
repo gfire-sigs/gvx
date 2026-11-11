@@ -215,6 +215,27 @@ func NewLoopbackStack(opts StackOptions) (*stack.Stack, error) {
 	return s, nil
 }
 
+// AttachRestoredLoopbackStack reconfigures lo (127.0.0.1/8) and the loopback
+// route table on a restored guest Netstack and restores saved guest transport
+// endpoints.
+func AttachRestoredLoopbackStack(restored *stack.Stack) error {
+	if restored == nil {
+		return errors.New("netbackend: restored stack is nil")
+	}
+	restored.ResetConfig()
+	if err := configureLoopbackNIC(restored, LoopbackNICID); err != nil {
+		return err
+	}
+	restored.SetRouteTable([]tcpip.Route{
+		{
+			Destination: header.IPv4LoopbackSubnet,
+			NIC:         LoopbackNICID,
+		},
+	})
+	restored.Restore()
+	return nil
+}
+
 // NewNATStack creates a pure-Go Netstack configured with lo (127.0.0.1/8) and
 // eth0 (10.0.2.15/24) and attaches a Track A L4 NATForwarder.
 //

@@ -701,6 +701,33 @@ func (w *WireGuardEndpoint) RebindRestore(restored *stack.Stack) error {
 	return w.AttachRestoredStack(restored)
 }
 
+// QuiesceForSave brings the in-memory WireGuard device down before a
+// checkpoint save so no background tunnel goroutine mutates the guest stack
+// while it is serialized.
+func (w *WireGuardEndpoint) QuiesceForSave() {
+	w.mu.Lock()
+	dev := w.dev
+	w.mu.Unlock()
+	if dev != nil {
+		_ = dev.Down()
+	}
+}
+
+// ResumeAfterSave brings the in-memory WireGuard device back up when a
+// sandbox resumes execution after a checkpoint save.
+func (w *WireGuardEndpoint) ResumeAfterSave() error {
+	w.mu.Lock()
+	dev := w.dev
+	w.mu.Unlock()
+	if dev == nil {
+		return nil
+	}
+	if err := dev.Up(); err != nil {
+		return fmt.Errorf("netbackend: resume WireGuard device after save: %w", err)
+	}
+	return nil
+}
+
 // wireGuardIPCConfig renders cfg in the wireguard-go UAPI "set" format.
 func wireGuardIPCConfig(cfg WireGuardConfig, peerEndpoint netip.AddrPort) string {
 	var b strings.Builder

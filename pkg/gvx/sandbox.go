@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
@@ -31,11 +32,13 @@ import (
 	"z.gfire.dev/gvx/pkg/oci"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvf"
 	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
+	"z.gfire.dev/gvx/pkg/sentry/watchdog"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
@@ -68,9 +71,20 @@ type Sandbox struct {
 	hostCARoots [][]byte
 	// forwards holds the port forwards that initNetstack bound, in rule order:
 	// the caller list, then the ports that PublishAll added.
-	forwards       []PortForward
-	detachDebugLog func()
-	closed         bool
+	forwards          []PortForward
+	ckptFiles         *checkpointBundleFiles
+	ckptMu            sync.Mutex
+	kernelReady       chan struct{}
+	kernelReadyOnce   sync.Once
+	runDone           chan struct{}
+	runDoneOnce       sync.Once
+	activeKernel      *kernel.Kernel
+	activeWatchdog    *watchdog.Watchdog
+	checkpointStopped atomic.Bool
+	restoredKernel    *kernel.Kernel
+	restoredStdio     *restoreStdioCollector
+	detachDebugLog    func()
+	closed            bool
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
@@ -87,6 +101,8 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 
 	sb := &Sandbox{
 		cfg:            cfg,
+		kernelReady:    make(chan struct{}),
+		runDone:        make(chan struct{}),
 		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
 	}
 	if cfg.HostCACerts {
@@ -128,6 +144,14 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 	}
 	sb.memFile = mf
 	sb.attachChunkMemory()
+
+	if cfg.CheckpointDir != "" {
+		cf, err := openCheckpointBundleFiles(cfg.CheckpointDir)
+		if err != nil {
+			return cleanup(err)
+		}
+		sb.ckptFiles = cf
+	}
 
 	if !cfg.DisableHostLockdown {
 		st, err := hostlockdown.Apply(sb.lockdownOptions())
@@ -266,6 +290,9 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 				opts.PreboundListeners++
 			}
 		}
+	}
+	if s.cfg.CheckpointListener != nil {
+		opts.PreboundListeners++
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {
 		opts.OutboundUDPPorts = []uint16{s.wgPeerPort}
@@ -487,6 +514,9 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 	if s.portForwarder != nil && s.netStack != nil {
 		s.portForwarder.Start(s.netStack)
 	}
+	if s.hasRestoredKernel() {
+		return s.runRestoredKernel(ctx)
+	}
 	return s.runWithKernel(ctx, s.cfg.Argv)
 }
 
@@ -501,6 +531,13 @@ func (s *Sandbox) Close() error {
 	}
 	s.closed = true
 
+	if s.restoredKernel != nil {
+		if tk := s.restoredKernel.Timekeeper(); tk != nil {
+			tk.Destroy()
+		}
+		s.restoredKernel = nil
+	}
+
 	if s.netStack != nil {
 		// Stack.Close leaves the link endpoints open. Close the links that
 		// the guest created, such as wireguard devices, in every network
@@ -509,6 +546,20 @@ func (s *Sandbox) Close() error {
 	}
 
 	var errs []error
+	if s.ckptFiles != nil {
+		if err := s.ckptFiles.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.ckptFiles = nil
+	}
+
+	if s.cfg.CheckpointListener != nil {
+		if err := s.cfg.CheckpointListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			errs = append(errs, err)
+		}
+		s.cfg.CheckpointListener = nil
+	}
+
 	if s.portForwarder != nil {
 		if err := s.portForwarder.Close(); err != nil {
 			errs = append(errs, err)

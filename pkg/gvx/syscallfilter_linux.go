@@ -186,6 +186,13 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.EqualTo(unix.LOCK_UN),
 		})
 	}
+	if cfg.CheckpointListener != nil {
+		// AcceptCheckpointConn accepts a connection on the pre-bound
+		// CheckpointListener socket.
+		rules.Add(unix.SYS_ACCEPT4, seccomp.MatchAll{})
+		rules.Add(unix.SYS_GETSOCKNAME, seccomp.MatchAll{})
+		rules.Add(unix.SYS_GETPEERNAME, seccomp.MatchAll{})
+	}
 	switch cfg.NetworkMode {
 	case NetModeNAT:
 		// The net package opens sockets with protocol 0, but hostinet allows
