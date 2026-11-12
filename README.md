@@ -7,11 +7,11 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 | Target | Backend | Commit | `host_new` | `getpid` | `open_close` | `pipe_pingpong` | `futex_pingpong` | `fork_wait` | `fork_exec_true` | `shm_sparse_idle` |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `darwin/arm64` | `hvf` | `ce792c97` | 11.39 ms | 1.3 us (206%) | 5.2 us (257%) | 15.1 us (401%) | 25.9 us (566%) | 940.2 us (293%) | 232.0 us (323%) | 0.3% CPU |
-| `linux/amd64` | `systrap` | `f3846fba` | 1.68 ms | 4.2 us (105%) | 14.8 us (115%) | 28.1 us (119%) | 9.8 us (112%) | 3.06 ms (183%) | 599.9 us (128%) | 0.4% CPU |
-| `linux/arm64` | `systrap` | `f3846fba` | 1.74 ms | 3.2 us (102%) | 10.6 us (110%) | 17.8 us (111%) | 6.4 us (104%) | 2.00 ms (182%) | 671.0 us (115%) | 0.2% CPU |
-| `windows/amd64` | `systrap` | `f3846fba` | 50.73 ms | 558 ns (98%) | 5.4 us (111%) | 79.8 us (110%) | 69.7 us (115%) | 10.14 ms (101%) | 7.32 ms (62%) | 1.5% CPU |
-| `windows/amd64` | `whpx` | `f3846fba` | 10.29 ms | 16.5 us (104%) | 44.9 us (149%) | 155.2 us (178%) | 147.2 us (185%) | 784.1 us (250%) | 1.65 ms (143%) | 0.0% CPU |
-| `windows/arm64` | `systrap` | `f3846fba` | 87.08 ms | 956 ns (80%) | 5.4 us (114%) | 32.6 us (114%) | 26.8 us (122%) | 17.62 ms (22%) | 20.44 ms (18%) | 0.8% CPU |
+| `linux/amd64` | `systrap` | `7a1d1bd1` | 2.41 ms | 4.1 us (103%) | 13.0 us (111%) | 23.0 us (114%) | 8.9 us (108%) | 2.21 ms (189%) | 463.2 us (126%) | 0.3% CPU |
+| `linux/arm64` | `systrap` | `7a1d1bd1` | 2.23 ms | 3.2 us (102%) | 11.0 us (110%) | 18.2 us (111%) | 6.9 us (107%) | 2.15 ms (177%) | 754.9 us (117%) | 0.3% CPU |
+| `windows/amd64` | `systrap` | `7a1d1bd1` | 50.45 ms | 510 ns (94%) | 6.3 us (77%) | 46.1 us (112%) | 43.0 us (116%) | 30.36 ms (29%) | 6.09 ms (59%) | 0.8% CPU |
+| `windows/amd64` | `whpx` | `7a1d1bd1` | 9.36 ms | 11.9 us (101%) | 29.0 us (128%) | 88.9 us (180%) | 82.9 us (168%) | 653.0 us (235%) | 1.19 ms (142%) | 0.8% CPU |
+| `windows/arm64` | `systrap` | `7a1d1bd1` | 97.75 ms | 1.0 us (94%) | 5.8 us (100%) | 32.0 us (111%) | 26.3 us (112%) | 18.52 ms (22%) | 18.54 ms (19%) | 1.6% CPU |
 
 ## Historical Trend (Last 10 Runs per Target)
 
@@ -25,6 +25,7 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 
 | Timestamp (UTC) | Commit | `getpid` | `pipe_pingpong` | `futex_pingpong` | `fork_wait` | `fork_exec_true` | `shm_sparse_idle` | Failures |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `2026-11-12T19:12:52Z` | `7a1d1bd1` | 4.1 us (103%) | 23.0 us (114%) | 8.9 us (108%) | 2.21 ms (189%) | 463.2 us (126%) | 0.3% CPU | 0 |
 | `2026-11-12T17:30:52Z` | `f3846fba` | 4.2 us (105%) | 28.1 us (119%) | 9.8 us (112%) | 3.06 ms (183%) | 599.9 us (128%) | 0.4% CPU | 0 |
 | `2026-11-12T14:43:33Z` | `89d4d166` | 3.8 us (103%) | 21.6 us (115%) | 6.6 us (106%) | 1.63 ms (188%) | 449.4 us (128%) | 0.2% CPU | 0 |
 | `2026-11-12T05:22:29Z` | `e1abbbeb` | 4.2 us (103%) | 23.1 us (115%) | 8.7 us (109%) | 2.25 ms (187%) | 443.3 us (123%) | 0.3% CPU | 0 |
@@ -34,12 +35,12 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 | `2026-11-12T00:21:47Z` | `944eb0f9` | 4.1 us (105%) | 28.1 us (119%) | 10.1 us (113%) | 2.91 ms (191%) | 590.5 us (126%) | 0.4% CPU | 0 |
 | `2026-11-11T22:46:44Z` | `dfe0d2ae` | 4.2 us (105%) | 29.0 us (119%) | 9.9 us (113%) | 3.00 ms (191%) | 615.8 us (127%) | 0.4% CPU | 0 |
 | `2026-11-11T22:18:44Z` | `56c8a5ca` | 4.1 us (105%) | 26.4 us (108%) | 9.2 us (111%) | 3.62 ms (189%) | 602.7 us (127%) | 0.4% CPU | 0 |
-| `2026-11-11T22:04:57Z` | `f33ca9f8` | 4.2 us (105%) | 27.6 us (119%) | 9.6 us (112%) | 2.94 ms (192%) | 601.2 us (127%) | 0.5% CPU | 0 |
 
 ### `linux/arm64` (`systrap`)
 
 | Timestamp (UTC) | Commit | `getpid` | `pipe_pingpong` | `futex_pingpong` | `fork_wait` | `fork_exec_true` | `shm_sparse_idle` | Failures |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `2026-11-12T19:12:52Z` | `7a1d1bd1` | 3.2 us (102%) | 18.2 us (111%) | 6.9 us (107%) | 2.15 ms (177%) | 754.9 us (117%) | 0.3% CPU | 0 |
 | `2026-11-12T17:30:52Z` | `f3846fba` | 3.2 us (102%) | 17.8 us (111%) | 6.4 us (104%) | 2.00 ms (182%) | 671.0 us (115%) | 0.2% CPU | 0 |
 | `2026-11-12T14:43:33Z` | `89d4d166` | 3.1 us (102%) | 17.4 us (111%) | 6.5 us (107%) | 2.03 ms (179%) | 726.1 us (116%) | 0.3% CPU | 0 |
 | `2026-11-12T05:22:29Z` | `e1abbbeb` | 3.1 us (102%) | 17.3 us (111%) | 6.7 us (106%) | 1.88 ms (180%) | 689.8 us (114%) | 0.3% CPU | 0 |
@@ -49,12 +50,12 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 | `2026-11-12T00:21:47Z` | `944eb0f9` | 3.2 us (102%) | 17.9 us (111%) | 6.6 us (106%) | 2.04 ms (179%) | 744.7 us (116%) | 0.3% CPU | 0 |
 | `2026-11-11T22:46:44Z` | `dfe0d2ae` | 3.2 us (102%) | 17.2 us (111%) | 7.0 us (106%) | 1.91 ms (182%) | 685.6 us (116%) | 0.3% CPU | 0 |
 | `2026-11-11T22:18:44Z` | `56c8a5ca` | 3.1 us (102%) | 17.0 us (110%) | 6.8 us (106%) | 2.42 ms (181%) | 618.0 us (115%) | 0.2% CPU | 0 |
-| `2026-11-11T22:04:57Z` | `f33ca9f8` | 3.1 us (102%) | 17.9 us (111%) | 6.7 us (107%) | 2.05 ms (179%) | 704.3 us (117%) | 0.3% CPU | 0 |
 
 ### `windows/amd64` (`systrap`)
 
 | Timestamp (UTC) | Commit | `getpid` | `pipe_pingpong` | `futex_pingpong` | `fork_wait` | `fork_exec_true` | `shm_sparse_idle` | Failures |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `2026-11-12T19:12:52Z` | `7a1d1bd1` | 510 ns (94%) | 46.1 us (112%) | 43.0 us (116%) | 30.36 ms (29%) | 6.09 ms (59%) | 0.8% CPU | 0 |
 | `2026-11-12T17:30:52Z` | `f3846fba` | 558 ns (98%) | 79.8 us (110%) | 69.7 us (115%) | 10.14 ms (101%) | 7.32 ms (62%) | 1.5% CPU | 0 |
 | `2026-11-12T14:43:33Z` | `89d4d166` | 580 ns (100%) | 81.3 us (106%) | 72.0 us (117%) | 10.18 ms (102%) | 7.10 ms (67%) | 3.1% CPU | 0 |
 | `2026-11-12T05:22:29Z` | `e1abbbeb` | 447 ns (98%) | 36.9 us (122%) | 33.7 us (117%) | 5.99 ms (102%) | 4.30 ms (64%) | 0.0% CPU | 0 |
@@ -64,12 +65,12 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 | `2026-11-12T00:21:47Z` | `944eb0f9` | 508 ns (97%) | 47.2 us (114%) | 43.7 us (110%) | 7.42 ms (96%) | 5.15 ms (62%) | 1.6% CPU | 0 |
 | `2026-11-11T22:46:44Z` | `dfe0d2ae` | 530 ns (100%) | 49.0 us (110%) | 43.0 us (117%) | 7.59 ms (100%) | 5.36 ms (59%) | 3.1% CPU | 0 |
 | `2026-11-11T22:18:44Z` | `56c8a5ca` | 548 ns (90%) | 79.2 us (116%) | 68.3 us (127%) | 10.13 ms (104%) | 7.00 ms (62%) | 1.6% CPU | 0 |
-| `2026-11-11T22:04:57Z` | `f33ca9f8` | 590 ns (94%) | 83.8 us (98%) | 69.7 us (107%) | 10.71 ms (100%) | 7.62 ms (67%) | 2.3% CPU | 0 |
 
 ### `windows/amd64` (`whpx`)
 
 | Timestamp (UTC) | Commit | `getpid` | `pipe_pingpong` | `futex_pingpong` | `fork_wait` | `fork_exec_true` | `shm_sparse_idle` | Failures |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `2026-11-12T19:12:52Z` | `7a1d1bd1` | 11.9 us (101%) | 88.9 us (180%) | 82.9 us (168%) | 653.0 us (235%) | 1.19 ms (142%) | 0.8% CPU | 0 |
 | `2026-11-12T17:30:52Z` | `f3846fba` | 16.5 us (104%) | 155.2 us (178%) | 147.2 us (185%) | 784.1 us (250%) | 1.65 ms (143%) | 0.0% CPU | 0 |
 | `2026-11-12T14:43:33Z` | `89d4d166` | 16.7 us (102%) | 156.1 us (185%) | 147.1 us (197%) | 836.6 us (229%) | 1.68 ms (142%) | 0.0% CPU | 0 |
 | `2026-11-12T05:22:29Z` | `e1abbbeb` | 12.2 us (100%) | 72.9 us (174%) | 67.9 us (189%) | 481.5 us (209%) | 1.12 ms (129%) | 0.0% CPU | 0 |
@@ -79,12 +80,12 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 | `2026-11-12T00:21:47Z` | `944eb0f9` | 12.3 us (105%) | 92.0 us (170%) | 84.7 us (182%) | 643.6 us (215%) | 1.21 ms (135%) | 0.0% CPU | 0 |
 | `2026-11-11T22:46:44Z` | `dfe0d2ae` | 12.3 us (99%) | 92.8 us (166%) | 84.5 us (165%) | 655.2 us (243%) | 1.23 ms (126%) | 0.8% CPU | 0 |
 | `2026-11-11T22:18:44Z` | `56c8a5ca` | 16.8 us (101%) | 153.7 us (180%) | 145.2 us (190%) | 829.4 us (219%) | 1.67 ms (144%) | 0.0% CPU | 0 |
-| `2026-11-11T22:04:57Z` | `f33ca9f8` | 16.7 us (109%) | 163.0 us (178%) | 148.0 us (187%) | 859.3 us (217%) | 1.71 ms (141%) | 0.8% CPU | 0 |
 
 ### `windows/arm64` (`systrap`)
 
 | Timestamp (UTC) | Commit | `getpid` | `pipe_pingpong` | `futex_pingpong` | `fork_wait` | `fork_exec_true` | `shm_sparse_idle` | Failures |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `2026-11-12T19:12:52Z` | `7a1d1bd1` | 1.0 us (94%) | 32.0 us (111%) | 26.3 us (112%) | 18.52 ms (22%) | 18.54 ms (19%) | 1.6% CPU | 0 |
 | `2026-11-12T17:30:52Z` | `f3846fba` | 956 ns (80%) | 32.6 us (114%) | 26.8 us (122%) | 17.62 ms (22%) | 20.44 ms (18%) | 0.8% CPU | 0 |
 | `2026-11-12T14:43:33Z` | `89d4d166` | 974 ns (90%) | 31.1 us (111%) | 29.8 us (100%) | 17.27 ms (20%) | 12.35 ms (20%) | 1.6% CPU | 0 |
 | `2026-11-12T05:22:29Z` | `e1abbbeb` | 1.0 us (90%) | 33.8 us (114%) | 30.3 us (98%) | 18.28 ms (20%) | 15.11 ms (18%) | 0.8% CPU | 0 |
@@ -94,5 +95,4 @@ This branch records automated cross-platform `TestE2EMicroBench` latency and hos
 | `2026-11-12T00:21:47Z` | `944eb0f9` | 1.0 us (80%) | 34.7 us (104%) | 29.2 us (118%) | 13.39 ms (36%) | 19.35 ms (15%) | 1.6% CPU | 0 |
 | `2026-11-11T22:46:44Z` | `dfe0d2ae` | 978 ns (96%) | 30.9 us (121%) | 28.9 us (99%) | 17.79 ms (23%) | 13.28 ms (23%) | 0.8% CPU | 0 |
 | `2026-11-11T22:18:44Z` | `56c8a5ca` | 961 ns (85%) | 31.0 us (114%) | 29.4 us (98%) | 17.89 ms (25%) | 16.65 ms (17%) | 0.8% CPU | 0 |
-| `2026-11-11T22:04:57Z` | `f33ca9f8` | 928 ns (90%) | 31.7 us (102%) | 29.2 us (92%) | 15.55 ms (23%) | 17.46 ms (15%) | 0.8% CPU | 0 |
 
