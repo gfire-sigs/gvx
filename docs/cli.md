@@ -507,9 +507,9 @@ The stub processes of an inner Sentry keep the sealed syscall patching table of 
 
 ## 12. Android
 
-`rungv` runs on `android/arm64` with the `systrap` engine. An Android app cannot start a hardware hypervisor, so `-platform=auto` selects `systrap`. [`gvxip/gvxip-006-android-host-support.md`](gvxip/gvxip-006-android-host-support.md) records the design and the measured limits.
+`rungv` runs on `android/arm64` with the `systrap` engine. An Android app cannot start a hardware hypervisor, so `-platform=auto` selects `systrap`.
 
-### 12.1 Process Model (Descriptive Module)
+### 12.1 Process Model
 
 The app starts `librungv.so` from its native library directory. The Android library `dev.gfire.gvx.Gvx` does this and passes the DNS servers of the active network with `--host-dns`, because Android has no `/etc/resolv.conf`. The Sentry then runs in that child process with its host lockdown. Android SELinux denies `linkat` hard links on app and shell data files with `EACCES`, so hard links in the guest work on `ext4lite` volumes and the root file system, not on a `hostfs` workspace.
 
@@ -521,7 +521,7 @@ Each live guest address space has one stub process and at most 2 sysmsg processe
 | 12L and 13 | `adb shell settings put global settings_enable_monitor_phantom_procs false` | The same switch |
 | 14 and later | Developer options, "Disable child process restrictions" | The same switch |
 
-### 12.2 Keep a Long Guest Running (Procedural Module)
+### 12.2 Keep a Long Guest Running
 
 Use this procedure for a guest that runs longer than a few seconds, such as a build.
 

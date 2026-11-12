@@ -94,7 +94,7 @@ Keep `e2e/` black-box tests 100% OS-agnostic across Windows and macOS (`pkg/gvx`
 2. Cross-compile all packages across the three non-Linux Priority-0 targets (`darwin/arm64`, `windows/amd64`, `windows/arm64`) and both Linux targets (`linux/amd64`, `linux/arm64`).
 3. Run the upstream diff audit tool to verify that modified upstream files remain below 5.0%.
 4. Run `./scripts/gostateify.sh -check` to verify that generated state files match their source declarations.
-5. Run the gVisor analyzers (`checklocks`, `checkconst`, `checklinkname`) for the five targets. Read [`docs/gvisorlint.md`](docs/gvisorlint.md) to fix a finding.
+5. Run the gVisor analyzers (`checklocks`, `checkconst`, `checklinkname`) for the five targets. Read [`docs/architecture.md`](docs/architecture.md) Section 4.5 to fix a finding.
 6. Execute the mechanical `ripgrep` checks from Section 9.2 of [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) against `README.md`, `AGENTS.md`, and `docs/`.
 7. Push the change and read the CI result. CI runs the tests that the local host cannot run.
 

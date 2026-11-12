@@ -1,8 +1,8 @@
 # Run a Kubernetes Node with `gvx`
 
-This guide shows how to run an unmodified `k3s` node in a `gvx` sandbox: as a single-node cluster, or as a node of a cluster with several nodes. The sandbox provides the Linux kernel behavior that `k3s`, the `kubelet`, `containerd`, `runc`, and `flannel` use. `gvx` has no Kubernetes-specific option. [`gvxip/gvxip-005-kubernetes-node-compatibility.md`](gvxip/gvxip-005-kubernetes-node-compatibility.md) defines the behavior and its tests.
+This guide shows how to run an unmodified `k3s` node in a `gvx` sandbox: as a single-node cluster, or as a node of a cluster with several nodes. The sandbox provides the Linux kernel behavior that `k3s`, the `kubelet`, `containerd`, `runc`, `flannel`, and Calico CNI use. `gvx` has no Kubernetes-specific option.
 
-## 1. How It Works (Descriptive Module)
+## 1. How It Works
 
 `rungv` runs the official `rancher/k3s` image. The guest kernel gives the node agent what it needs. The table lists the parts of a node and the settings that each part uses.
 
@@ -17,7 +17,7 @@ This guide shows how to run an unmodified `k3s` node in a `gvx` sandbox: as a si
 
 The sandbox locks itself down before the guest starts. Publish every host port that the cluster needs, such as NodePorts and the WireGuard port, when you start the node.
 
-## 2. Start a Single-Node Cluster (Procedural Module)
+## 2. Start a Single-Node Cluster
 
 These steps start a `k3s` server and connect `kubectl` on the host to it. You need `rungv` and a `kubectl` command on the host. The steps work on macOS, Windows, and Linux.
 
@@ -63,7 +63,7 @@ These steps start a `k3s` server and connect `kubectl` on the host to it. You ne
 
 A Service of the type `NodePort` with a port from 30000 to 30019 is then reachable at `127.0.0.1:<port>` on the host.
 
-## 3. Start a Cluster with Two Nodes (Procedural Module)
+## 3. Start a Cluster with Two Nodes
 
 These steps start a server and an agent in two sandboxes on one host. The agent reaches the server through the published port on the host, which a guest sees at `10.0.2.2`. `flannel` carries the pod traffic between the nodes in WireGuard over the published UDP port 51820.
 
@@ -130,7 +130,7 @@ These steps start a server and an agent in two sandboxes on one host. The agent 
 
 The agent publishes no port. It starts the WireGuard handshake, so the server learns the endpoint of the agent. The agent needs `--node-external-ip` because `k3s agent` refuses `--flannel-external-ip`, and the address `192.0.2.1` is a placeholder. Both nodes show the internal address `10.0.2.15`. `kubectl logs` and `kubectl exec` reach the agent through the tunnel of `k3s`.
 
-## 4. Run Calico Instead of flannel (Procedural Module)
+## 4. Run Calico Instead of flannel
 
 Calico replaces `flannel` as the CNI and enforces NetworkPolicy. The VXLAN mode with the legacy iptables back end runs in a `gvx` sandbox. The guest provides the routing rules, the route types, proxy ARP, the reverse path match `rpfilter`, and the ipsets that Felix uses.
 
@@ -217,7 +217,7 @@ The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and 
 
 ### 5.3 Known Limits
 
-These limits come from the guest kernel. GVXIP-005, section 3.5, gives the reasons.
+These limits come from the user-space guest kernel.
 
 | Limit | Effect |
 | :--- | :--- |
