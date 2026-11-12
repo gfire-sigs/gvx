@@ -126,6 +126,23 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 				`(allow file-ioctl (literal (param "TTY_0")))`,
 			},
 		},
+		{
+			name: "prebound listener without outbound net",
+			opts: Options{PreboundListeners: 1},
+			wantAllow: []string{
+				"(allow signal (target children))",
+				"(allow network-inbound)",
+			},
+		},
+		{
+			name: "udp peer with prebound listener",
+			opts: Options{OutboundUDPPorts: []uint16{51820}, PreboundListeners: 1},
+			wantAllow: []string{
+				"(allow signal (target children))",
+				`(allow network-outbound (remote udp "*:51820"))`,
+				"(allow network-inbound)",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -203,6 +220,7 @@ func TestSeatbeltProfileDeniesBindAfterInboundAllow(t *testing.T) {
 	for _, opts := range []Options{
 		{AllowOutboundNet: true},
 		{OutboundUDPPorts: []uint16{51820}},
+		{PreboundListeners: 1},
 	} {
 		lines := profileLines(BuildSeatbeltProfile(opts))
 		inbound := slices.IndexFunc(lines, func(l string) bool { return strings.HasPrefix(l, "(allow network-inbound") })

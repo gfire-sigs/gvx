@@ -108,6 +108,31 @@ func shortCheckpointSocketDir(t *testing.T) string {
 	return dir
 }
 
+func freeLoopbackControlSocketAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate loopback TCP port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func canBindUnixControlSocket(dir string) bool {
+	if runtime.GOOS == "android" {
+		return false
+	}
+	probe := filepath.Join(dir, "probe.sock")
+	ln, err := net.Listen("unix", probe)
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	_ = os.Remove(probe)
+	return true
+}
+
 func verifyCheckpointBundleFiles(t *testing.T, dir string) {
 	t.Helper()
 	for _, name := range []string{"manifest.json", "state.img", "pages.meta", "pages.img"} {
@@ -830,7 +855,8 @@ func TestE2ECheckpointRestoreHostLockdownInvariants(t *testing.T) {
 }
 
 // TestE2ECheckpointRestoreRungvCLIRoundTrip verifies end-to-end execution of
-// rungv run, rungv checkpoint, and rungv restore under default host lockdown.
+// rungv run, rungv checkpoint, and rungv restore under default host lockdown
+// over both Unix and loopback TCP control sockets.
 func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 	rungvBin := toolPath(t, rungvPkg)
 	for _, b := range fixedAddressBackends() {
@@ -838,96 +864,120 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 			requireFixedAddressBackend(t, b)
 			probePath := acceptprog.BuildCheckpointProbe(t, hostArch())
 
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
+			for _, mode := range []string{"tcp", "unix"} {
+				t.Run(mode, func(t *testing.T) {
+					var controlAddr string
+					switch mode {
+					case "tcp":
+						controlAddr = freeLoopbackControlSocketAddr(t)
+					case "unix":
+						sockDir := shortCheckpointSocketDir(t)
+						if !canBindUnixControlSocket(sockDir) {
+							t.Skipf("unix socket bind not permitted in %s on %s", sockDir, runtime.GOOS)
+						}
+						controlAddr = filepath.Join(sockDir, "ctrl.sock")
+					}
 
-			cacheDir := t.TempDir()
-			wsDir := t.TempDir()
-			ckptDir := filepath.Join(t.TempDir(), "bundle")
-			sockDir := shortCheckpointSocketDir(t)
-			sockPath := filepath.Join(sockDir, "ctrl.sock")
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					defer cancel()
 
-			stdinR1, stdinW1 := io.Pipe()
-			defer stdinW1.Close()
+					cacheDir := t.TempDir()
+					wsDir := t.TempDir()
+					ckptDir := filepath.Join(t.TempDir(), "bundle")
 
-			stdout1 := newCheckpointNotifyBuffer()
-			stderr1 := newCheckpointNotifyBuffer()
+					stdinR1, stdinW1 := io.Pipe()
+					defer stdinW1.Close()
 
-			runCmd := exec.CommandContext(ctx, rungvBin,
-				"run",
-				"-platform="+string(b.plat),
-				"-net=none",
-				"-cache-dir="+cacheDir,
-				"-workspace="+wsDir,
-				"-checkpoint-dir="+ckptDir,
-				"-control-socket="+sockPath,
-				"-bin="+probePath,
-				"--",
-				"-mode=hostfs",
-				"-workspace=/workspace",
-			)
-			runCmd.Stdin = stdinR1
-			runCmd.Stdout = stdout1
-			runCmd.Stderr = stderr1
+					stdout1 := newCheckpointNotifyBuffer()
+					stderr1 := newCheckpointNotifyBuffer()
 
-			if err := runCmd.Start(); err != nil {
-				t.Fatalf("start rungv run: %v", err)
+					runCmd := exec.CommandContext(ctx, rungvBin,
+						"run",
+						"-platform="+string(b.plat),
+						"-net=none",
+						"-cache-dir="+cacheDir,
+						"-workspace="+wsDir,
+						"-checkpoint-dir="+ckptDir,
+						"-control-socket="+controlAddr,
+						"-bin="+probePath,
+						"--",
+						"-mode=hostfs",
+						"-workspace=/workspace",
+					)
+					runCmd.Stdin = stdinR1
+					runCmd.Stdout = stdout1
+					runCmd.Stderr = stderr1
+
+					if err := runCmd.Start(); err != nil {
+						t.Fatalf("start rungv run: %v", err)
+					}
+
+					runWaitCh := make(chan error, 1)
+					go func() {
+						runWaitCh <- runCmd.Wait()
+					}()
+					defer func() {
+						_ = stdinW1.Close()
+						if runCmd.Process != nil {
+							_ = runCmd.Process.Kill()
+						}
+					}()
+
+					// Wait until the guest signals readiness or rungv exits on an unsupported ET_EXEC backend.
+					readyTimer := time.NewTimer(30 * time.Second)
+					defer readyTimer.Stop()
+					for !strings.Contains(stdout1.String(), "READY:hostfs\n") {
+						select {
+						case wErr := <-runWaitCh:
+							skipWhenFixedAddressRefused(t, "rungv run", fmt.Errorf("%w: %s", wErr, stderr1.String()))
+							t.Fatalf("rungv run exited before READY: %v (stdout=%q stderr=%q)", wErr, stdout1.String(), stderr1.String())
+						case <-stdout1.ch:
+						case <-stderr1.ch:
+							if strings.Contains(stderr1.String(), "rungv run:") {
+								_ = stdinW1.Close()
+							}
+						case <-readyTimer.C:
+							t.Fatalf("timed out waiting for READY:hostfs from rungv run (stdout=%q stderr=%q)", stdout1.String(), stderr1.String())
+						}
+					}
+
+					ckptOut, ckptStderr, ckptCode := runTool(t, rungvBin,
+						"checkpoint",
+						"-control-socket="+controlAddr,
+						"-checkpoint-dir="+ckptDir,
+					)
+					if ckptCode != 0 {
+						t.Fatalf("rungv checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptStderr)
+					}
+					_ = stdinW1.Close()
+
+					if wErr := <-runWaitCh; wErr != nil {
+						t.Fatalf("rungv run exit after checkpoint: %v (stderr=%q)", wErr, stderr1.String())
+					}
+					verifyCheckpointBundleFiles(t, ckptDir)
+
+					var restoreStdout, restoreStderr bytes.Buffer
+					restoreCmd := exec.CommandContext(ctx, rungvBin,
+						"restore",
+						"-platform="+string(b.plat),
+						"-net=none",
+						"-cache-dir="+cacheDir,
+						"-workspace="+wsDir,
+						"-checkpoint-dir="+ckptDir,
+					)
+					restoreCmd.Stdin = strings.NewReader("RESUME\n")
+					restoreCmd.Stdout = &restoreStdout
+					restoreCmd.Stderr = &restoreStderr
+
+					if err := restoreCmd.Run(); err != nil {
+						t.Fatalf("rungv restore failed: %v (stdout=%q stderr=%q)", err, restoreStdout.String(), restoreStderr.String())
+					}
+					if !strings.Contains(restoreStdout.String(), "VERIFIED:hostfs\n") {
+						t.Fatalf("rungv restore stdout = %q, want VERIFIED:hostfs (stderr=%q)", restoreStdout.String(), restoreStderr.String())
+					}
+					verifyHostfsWorkspaceArtifacts(t, wsDir)
+				})
 			}
-
-			runWaitCh := make(chan error, 1)
-			go func() {
-				runWaitCh <- runCmd.Wait()
-			}()
-
-			// Wait until the guest signals readiness or rungv exits on an unsupported ET_EXEC backend.
-			readyTimer := time.NewTimer(30 * time.Second)
-			defer readyTimer.Stop()
-			for !strings.Contains(stdout1.String(), "READY:hostfs\n") {
-				select {
-				case wErr := <-runWaitCh:
-					skipWhenFixedAddressRefused(t, "rungv run", fmt.Errorf("%w: %s", wErr, stderr1.String()))
-					t.Fatalf("rungv run exited before READY: %v (stdout=%q stderr=%q)", wErr, stdout1.String(), stderr1.String())
-				case <-stdout1.ch:
-				case <-readyTimer.C:
-					t.Fatalf("timed out waiting for READY:hostfs from rungv run (stdout=%q stderr=%q)", stdout1.String(), stderr1.String())
-				}
-			}
-
-			ckptOut, ckptStderr, ckptCode := runTool(t, rungvBin,
-				"checkpoint",
-				"-control-socket="+sockPath,
-				"-checkpoint-dir="+ckptDir,
-			)
-			if ckptCode != 0 {
-				t.Fatalf("rungv checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptStderr)
-			}
-			_ = stdinW1.Close()
-
-			if wErr := <-runWaitCh; wErr != nil {
-				t.Fatalf("rungv run exit after checkpoint: %v (stderr=%q)", wErr, stderr1.String())
-			}
-			verifyCheckpointBundleFiles(t, ckptDir)
-
-			var restoreStdout, restoreStderr bytes.Buffer
-			restoreCmd := exec.CommandContext(ctx, rungvBin,
-				"restore",
-				"-platform="+string(b.plat),
-				"-net=none",
-				"-cache-dir="+cacheDir,
-				"-workspace="+wsDir,
-				"-checkpoint-dir="+ckptDir,
-			)
-			restoreCmd.Stdin = strings.NewReader("RESUME\n")
-			restoreCmd.Stdout = &restoreStdout
-			restoreCmd.Stderr = &restoreStderr
-
-			if err := restoreCmd.Run(); err != nil {
-				t.Fatalf("rungv restore failed: %v (stdout=%q stderr=%q)", err, restoreStdout.String(), restoreStderr.String())
-			}
-			if !strings.Contains(restoreStdout.String(), "VERIFIED:hostfs\n") {
-				t.Fatalf("rungv restore stdout = %q, want VERIFIED:hostfs (stderr=%q)", restoreStdout.String(), restoreStderr.String())
-			}
-			verifyHostfsWorkspaceArtifacts(t, wsDir)
 		})
 	}
 }

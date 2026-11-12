@@ -90,7 +90,14 @@ func BuildSeatbeltProfile(opts Options) string {
 		for _, port := range opts.OutboundUDPPorts {
 			fmt.Fprintf(&b, "(allow network-outbound (remote udp \"*:%d\"))\n", port)
 		}
-		b.WriteString("(allow network-inbound (local udp \"*:*\"))\n")
+		if opts.PreboundListeners > 0 {
+			b.WriteString("(allow network-inbound)\n")
+		} else {
+			b.WriteString("(allow network-inbound (local udp \"*:*\"))\n")
+		}
+		b.WriteString(denyNewBind)
+	case opts.PreboundListeners > 0:
+		b.WriteString("(allow network-inbound)\n")
 		b.WriteString(denyNewBind)
 	}
 	b.WriteString("(deny process-fork)\n")
