@@ -215,7 +215,7 @@ jobs:
             found { print }
             END { if (!found) exit 1 }
           ' CHANGELOG.md > notes.md || { echo "CHANGELOG.md has no section $heading" >&2; exit 1; }
-          sed -i -E "s#\]\(([^):]+)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/\1)#g" notes.md
+          sed -i -E "s#\]\(([^#):][^):]*)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/\1)#g" notes.md
           test -s notes.md
           cat notes.md
       - name: Publish release

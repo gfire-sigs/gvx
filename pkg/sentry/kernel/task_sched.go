@@ -337,7 +337,7 @@ func (k *Kernel) runCPUClockTicker() {
 				userSysTickInc++
 			}
 		}
-		if cpuBandwidthLimited.Load() != 0 {
+		if k.cpuBandwidthLimited() {
 			k.accountCPUBandwidth(allTasks)
 		}
 		if userTickInc != 0 {

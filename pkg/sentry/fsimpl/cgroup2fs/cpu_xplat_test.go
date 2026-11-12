@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"runtime"
 	"testing"
 	"time"
+	"weak"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -93,7 +95,7 @@ func TestSetMaxLimitsOnlyTheWrittenController(t *testing.T) {
 	parent := newTestCPU(t, nil)
 	child := newTestCPU(t, parent)
 
-	if err := child.setMax(50000, 100000); err != nil {
+	if err := child.setMax(nil, 50000, 100000); err != nil {
 		t.Fatalf("setMax: %v", err)
 	}
 	requireLimit(t, child, 50*time.Millisecond, 100*time.Millisecond, true)
@@ -102,10 +104,10 @@ func TestSetMaxLimitsOnlyTheWrittenController(t *testing.T) {
 
 func TestSetMaxRejectsABadValueAndKeepsTheOldLimit(t *testing.T) {
 	cc := newTestCPU(t, nil)
-	if err := cc.setMax(50000, 100000); err != nil {
+	if err := cc.setMax(nil, 50000, 100000); err != nil {
 		t.Fatalf("setMax: %v", err)
 	}
-	if err := cc.setMax(500, 100000); !errors.Is(err, linuxerr.EINVAL) {
+	if err := cc.setMax(nil, 500, 100000); !errors.Is(err, linuxerr.EINVAL) {
 		t.Fatalf("setMax(500, 100000) = %v, want EINVAL", err)
 	}
 	requireLimit(t, cc, 50*time.Millisecond, 100*time.Millisecond, true)
@@ -117,10 +119,10 @@ func TestSetMaxRejectsABadValueAndKeepsTheOldLimit(t *testing.T) {
 
 func TestSetMaxMaxRemovesTheLimit(t *testing.T) {
 	cc := newTestCPU(t, nil)
-	if err := cc.setMax(50000, 100000); err != nil {
+	if err := cc.setMax(nil, 50000, 100000); err != nil {
 		t.Fatalf("setMax: %v", err)
 	}
-	if err := cc.setMax(math.MaxInt64, 100000); err != nil {
+	if err := cc.setMax(nil, math.MaxInt64, 100000); err != nil {
 		t.Fatalf("setMax(max): %v", err)
 	}
 	requireLimit(t, cc, 0, 0, false)
@@ -136,7 +138,7 @@ func TestBandwidthNodeLinksToTheNodeOfTheParentController(t *testing.T) {
 	if leaf.bandwidthNode() != leafNode {
 		t.Error("bandwidthNode returned two nodes for one controller")
 	}
-	if err := parent.setMax(30000, 100000); err != nil {
+	if err := parent.setMax(nil, 30000, 100000); err != nil {
 		t.Fatalf("setMax: %v", err)
 	}
 	// A charge on the leaf reaches the limit of the ancestor.
@@ -166,12 +168,12 @@ func TestSetMaxBeforeFirstUseAppliesTheStoredLimit(t *testing.T) {
 
 func TestDetachRemovesTheLimitAndLaterWritesOnlyStore(t *testing.T) {
 	cc := newTestCPU(t, nil)
-	if err := cc.setMax(50000, 100000); err != nil {
+	if err := cc.setMax(nil, 50000, 100000); err != nil {
 		t.Fatalf("setMax: %v", err)
 	}
 	cc.detach()
 	requireLimit(t, cc, 0, 0, false)
-	if err := cc.setMax(40000, 100000); err != nil {
+	if err := cc.setMax(nil, 40000, 100000); err != nil {
 		t.Fatalf("setMax after detach: %v", err)
 	}
 	requireLimit(t, cc, 0, 0, false)
@@ -183,7 +185,7 @@ func TestDetachRemovesTheLimitAndLaterWritesOnlyStore(t *testing.T) {
 // +checklocksignore: the test owns the cgroup and no other goroutine reads it.
 func TestRemovedCgroupReleasesItsLimit(t *testing.T) {
 	cc := newTestCPU(t, nil)
-	if err := cc.setMax(50000, 100000); err != nil {
+	if err := cc.setMax(nil, 50000, 100000); err != nil {
 		t.Fatalf("setMax: %v", err)
 	}
 	cc.c.ctrls[kernel.Cgroup2CPU] = cc
@@ -239,4 +241,26 @@ func TestRemovedCgroupAddsItsUsageToTheNearestParentController(t *testing.T) {
 	if child.usage != (usage.CPUStats{}) {
 		t.Errorf("the removed cgroup keeps usage %+v", child.usage)
 	}
+}
+
+// TestBandwidthKernelPrefersTheContextKernel checks which Kernel owns the
+// bandwidth counters of a controller. Two sandboxes share one host process, so
+// a controller must never take the Kernel of another filesystem.
+func TestBandwidthKernelPrefersTheContextKernel(t *testing.T) {
+	saved, other := &kernel.Kernel{}, &kernel.Kernel{}
+	cc := newTestCPU(t, nil)
+	if got := cc.bandwidthKernel(nil); got != nil {
+		t.Errorf("bandwidthKernel without a filesystem = %p, want nil", got)
+	}
+
+	cc.c.fs = &filesystem{}
+	cc.c.fs.memEnforcer.saveKernel = weak.Make(saved)
+	if got := cc.bandwidthKernel(nil); got != saved {
+		t.Errorf("bandwidthKernel without a context = %p, want the saved Kernel %p", got, saved)
+	}
+	ctx := context.WithValue(context.Background(), kernel.CtxKernel, other)
+	if got := cc.bandwidthKernel(ctx); got != other {
+		t.Errorf("bandwidthKernel with a context Kernel = %p, want %p", got, other)
+	}
+	runtime.KeepAlive(saved)
 }

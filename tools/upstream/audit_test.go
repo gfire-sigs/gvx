@@ -447,3 +447,71 @@ func TestRestoreUnrequiredEditsKeepsContentEditsAndRequiredFences(t *testing.T) 
 		t.Errorf("required fence was discarded: %q", got)
 	}
 }
+
+func TestAuditNonGoSourcesMustMatchUpstream(t *testing.T) {
+	t.Parallel()
+
+	upstream := with(baseUpstream(),
+		"pkg/rawfile/ring.c", "int ring;\n",
+		"pkg/rawfile/ring.h", "extern int ring;\n",
+		"pkg/rawfile/vdso.S", "nop\n",
+		"pkg/rawfile/ring.proto", "syntax = \"proto3\";\n",
+	)
+	repo := with(cleanRepo(),
+		"pkg/rawfile/ring.c", "int ring;\n",
+		"pkg/rawfile/ring.h", "extern int ring;\n",
+		"pkg/rawfile/vdso.S", "nop\n",
+		"pkg/rawfile/ring.proto", "syntax = \"proto3\";\n",
+		"pkg/rawfile/extra.c", "int extra;\n",
+	)
+
+	t.Run("pristine and added files pass", func(t *testing.T) {
+		t.Parallel()
+		report, err := auditFixture{upstream: upstream, repo: repo}.run(t)
+		if err != nil {
+			t.Fatalf("RunAudit: %v", err)
+		}
+		if report.NonGoPristine != 4 || report.NonGoAdded != 1 || report.NonGoMissing != 0 {
+			t.Fatalf("non-Go counts pristine=%d added=%d missing=%d, want 4, 1, 0", report.NonGoPristine, report.NonGoAdded, report.NonGoMissing)
+		}
+		if report.Budgeted != 0 {
+			t.Errorf("non-Go files changed the Go budget: %d", report.Budgeted)
+		}
+	})
+
+	for _, rel := range []string{"pkg/rawfile/ring.c", "pkg/rawfile/ring.h", "pkg/rawfile/vdso.S", "pkg/rawfile/ring.proto"} {
+		t.Run("edit of "+rel+" fails", func(t *testing.T) {
+			t.Parallel()
+			_, err := auditFixture{upstream: upstream, repo: with(repo, rel, "tampered\n")}.run(t)
+			if !errors.Is(err, errNonGoModified) || !strings.Contains(err.Error(), rel) {
+				t.Fatalf("RunAudit = %v, want errNonGoModified naming %s", err, rel)
+			}
+		})
+	}
+
+	t.Run("protected edit passes", func(t *testing.T) {
+		t.Parallel()
+		report, err := auditFixture{
+			upstream: upstream,
+			repo:     with(repo, "pkg/rawfile/ring.c", "int mine;\n"),
+			mask:     auditMaskText + "PROTECT pkg/rawfile/ring.c\n",
+		}.run(t)
+		if err != nil {
+			t.Fatalf("RunAudit: %v", err)
+		}
+		if report.NonGoProtected != 1 {
+			t.Errorf("NonGoProtected = %d, want 1", report.NonGoProtected)
+		}
+	})
+
+	t.Run("missing file is counted", func(t *testing.T) {
+		t.Parallel()
+		report, err := auditFixture{upstream: upstream, repo: with(repo, "pkg/rawfile/ring.h", "\x00")}.run(t)
+		if err != nil {
+			t.Fatalf("RunAudit: %v", err)
+		}
+		if report.NonGoMissing != 1 {
+			t.Errorf("NonGoMissing = %d, want 1", report.NonGoMissing)
+		}
+	})
+}

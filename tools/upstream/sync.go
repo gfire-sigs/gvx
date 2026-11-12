@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"z.gfire.dev/gvx/tools/gostateify/stateify"
@@ -192,6 +193,8 @@ func parseLsRemoteOutput(raw string) (UpstreamRefInfo, error) {
 	type tagEntry struct {
 		name string
 		sha  string
+		// peeled marks the line of a dereferenced annotated tag, which names the commit.
+		peeled bool
 	}
 	var tags []tagEntry
 
@@ -212,14 +215,17 @@ func parseLsRemoteOutput(raw string) (UpstreamRefInfo, error) {
 		}
 		if strings.HasPrefix(ref, "refs/tags/release-") {
 			tagName := strings.TrimPrefix(ref, "refs/tags/")
-			tagName = strings.TrimSuffix(tagName, "^{}")
-			tags = append(tags, tagEntry{name: tagName, sha: sha})
+			tagName, peeled := strings.CutSuffix(tagName, "^{}")
+			tags = append(tags, tagEntry{name: tagName, sha: sha, peeled: peeled})
 		}
 	}
 
 	if len(tags) > 0 {
 		slices.SortFunc(tags, func(a, b tagEntry) int {
-			return strings.Compare(a.name, b.name)
+			if c := compareReleaseTags(a.name, b.name); c != 0 {
+				return c
+			}
+			return cmp.Compare(boolToInt(a.peeled), boolToInt(b.peeled))
 		})
 		latest := tags[len(tags)-1]
 		info.ReleaseTag = latest.name
@@ -231,6 +237,46 @@ func parseLsRemoteOutput(raw string) (UpstreamRefInfo, error) {
 	}
 	info.GoBranchSHA = cmp.Or(info.GoBranchSHA, info.ReleaseTagSHA)
 	return info, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// releaseTagKey parses a name of the form release-YYYYMMDD.N into its date and
+// its counter.
+func releaseTagKey(name string) (date, n int, ok bool) {
+	rest, found := strings.CutPrefix(name, "release-")
+	if !found {
+		return 0, 0, false
+	}
+	dateText, nText, found := strings.Cut(rest, ".")
+	if !found {
+		return 0, 0, false
+	}
+	date, errDate := strconv.Atoi(dateText)
+	n, errN := strconv.Atoi(nText)
+	return date, n, errDate == nil && errN == nil && date >= 0 && n >= 0
+}
+
+// compareReleaseTags orders release tags by date and then by counter, as a
+// number. A text order would put release-20260101.10 before release-20260101.2.
+// A name that does not parse sorts below every parsed name.
+func compareReleaseTags(a, b string) int {
+	ad, an, aok := releaseTagKey(a)
+	bd, bn, bok := releaseTagKey(b)
+	switch {
+	case aok && bok:
+		return cmp.Or(cmp.Compare(ad, bd), cmp.Compare(an, bn), strings.Compare(a, b))
+	case aok:
+		return 1
+	case bok:
+		return -1
+	}
+	return strings.Compare(a, b)
 }
 
 // SyncConfig configures an upstream snapshot download and three-way masked merge.

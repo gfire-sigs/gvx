@@ -529,6 +529,11 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 		if err != nil {
 			return vfs.ErrCorruption{Err: fmt.Errorf("hostfs: lookup %q during restore: %w", rel, err)}
 		}
+		if e.info.kind != ino.kind || e.virtual != ino.virtual {
+			// The host replaced the entry while the sandbox was down. A refresh
+			// would join the saved kind to the new host identity and mode.
+			return vfs.ErrCorruption{Err: fmt.Errorf("hostfs: %q changed from kind %v (virtual %t) to kind %v (virtual %t) during restore", rel, ino.kind, ino.virtual, e.info.kind, e.virtual)}
+		}
 		if ws.SingleFile() {
 			// Single-file mode keeps guest mode, uid, gid, and xattrs in memory;
 			// preserve the saved POSIXAttr while refreshing host size and times.

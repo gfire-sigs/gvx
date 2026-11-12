@@ -40,6 +40,7 @@ var shippedTargets = []struct{ goos, goarch string }{
 	{"windows", "arm64"},
 	{"linux", "amd64"},
 	{"linux", "arm64"},
+	{"android", "arm64"},
 }
 
 // group orders the components of the document: the standard library, then

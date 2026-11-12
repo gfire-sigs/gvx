@@ -301,7 +301,7 @@ func (cm *cpuMax) Write(ctx context.Context, _ *vfs.FileDescription, src usermem
 		period = cm.cc.periodUSec.Load()
 	}
 
-	if err := cm.cc.setMax(quota, period); err != nil {
+	if err := cm.cc.setMax(ctx, quota, period); err != nil {
 		return 0, err
 	}
 	return int64(len(buf)), nil

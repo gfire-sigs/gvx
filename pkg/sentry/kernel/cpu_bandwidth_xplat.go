@@ -20,7 +20,9 @@ import (
 	"math/bits"
 	"sync/atomic"
 	"time"
+	"weak"
 
+	"z.gfire.dev/gvx/internal/weakmap"
 	"z.gfire.dev/gvx/pkg/sync"
 )
 
@@ -34,22 +36,44 @@ import (
 // A node reads time and arms timers only through a bandwidthClock, so the
 // budget logic runs in tests without a Kernel and without real time.
 
-var (
-	// cpuBandwidthLimited counts the nodes with a finite quota. While it is
-	// zero, the CPU clock ticker skips the accounting of CPU bandwidth.
-	cpuBandwidthLimited atomic.Int32
+// cpuBandwidthCounters are the counters of the CPU bandwidth control of one
+// Kernel. A host process can run many sandboxes, so each Kernel owns one set
+// and a limit in one sandbox never changes the accounting of another.
+type cpuBandwidthCounters struct {
+	// limited counts the nodes with a finite quota. While it is zero, the CPU
+	// clock ticker skips the accounting of CPU bandwidth.
+	limited atomic.Int32
 
-	// cpuBandwidthThrottled counts the nodes that throttle their tasks now.
-	// While it is zero, the task run loop skips the throttle check, so a
-	// Sentry without a spent quota pays one load for each return to the
-	// application.
-	cpuBandwidthThrottled atomic.Int32
+	// throttled counts the nodes that throttle their tasks now. While it is
+	// zero, the task run loop skips the throttle check, so a Sentry without a
+	// spent quota pays one load for each return to the application.
+	throttled atomic.Int32
 
-	// cpuBillingGeneration changes each time the first finite quota appears.
-	// A task that last ran under an older generation starts a new account, so
-	// the time before the first quota is never charged.
-	cpuBillingGeneration atomic.Int32
-)
+	// generation changes each time the first finite quota appears. A task that
+	// last ran under an older generation starts a new account, so the time
+	// before the first quota is never charged.
+	generation atomic.Int32
+}
+
+// kernelBandwidth maps each Kernel to its counters. The map does not keep the
+// Kernel alive, and an entry ends with its Kernel.
+var kernelBandwidth weakmap.Map[Kernel, *cpuBandwidthCounters]
+
+// bandwidthCountersOf returns the counters of k. A nil k gets a fresh set that
+// no Kernel reads.
+func bandwidthCountersOf(k *Kernel) *cpuBandwidthCounters {
+	c, _ := kernelBandwidth.LoadOrStore(k, func() *cpuBandwidthCounters {
+		return &cpuBandwidthCounters{}
+	})
+	return c
+}
+
+// addLimited counts one more node with a finite quota.
+func (c *cpuBandwidthCounters) addLimited() {
+	if c.limited.Add(1) == 1 {
+		c.generation.Add(1)
+	}
+}
 
 // bandwidthSlackNS is the debt that a node tolerates before it throttles. The
 // CPU clock ticker charges each task once for each tick, and the threads of a
@@ -97,6 +121,11 @@ type CPUBandwidth struct {
 	parent *CPUBandwidth
 
 	clock bandwidthClock `state:"nosave"`
+
+	// counters are the counters of the Kernel that owns the node. A node gets
+	// them when it first takes a finite quota or when ActivateRestored runs.
+	// Writers hold mu.
+	counters *cpuBandwidthCounters `state:"nosave"`
 
 	// quotaNS is the CPU time for each period in nanoseconds. A negative
 	// value means no limit. Writers hold mu. Readers use the atomic.
@@ -193,10 +222,20 @@ func (b *CPUBandwidth) afterLoad(_ context.Context) {
 	b.restoredPending = true
 }
 
-// ActivateRestored rebases saved deadlines onto now, updates active bandwidth
-// counters, and arms the refill timer when throttled. It is a no-op when b was
-// not loaded from state or was already activated.
-func (b *CPUBandwidth) ActivateRestored(now int64) {
+// attachLocked binds the node to the counters of k when it has none. A nil k
+// gives the node a private set, which is right for a node without a Kernel.
+//
+// Preconditions: b.mu is locked.
+func (b *CPUBandwidth) attachLocked(k *Kernel) {
+	if b.counters == nil {
+		b.counters = bandwidthCountersOf(k)
+	}
+}
+
+// ActivateRestored rebases saved deadlines onto now, updates the bandwidth
+// counters of k, and arms the refill timer when throttled. It is a no-op when b
+// was not loaded from state or was already activated.
+func (b *CPUBandwidth) ActivateRestored(k *Kernel, now int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.restoredPending {
@@ -206,14 +245,15 @@ func (b *CPUBandwidth) ActivateRestored(now int64) {
 	if b.periodNS > 0 {
 		b.periodEnd += now
 	}
+	if b.quotaNS.Load() >= 0 || b.throttled.Load() {
+		b.attachLocked(k)
+	}
 	if b.quotaNS.Load() >= 0 {
-		if cpuBandwidthLimited.Add(1) == 1 {
-			cpuBillingGeneration.Add(1)
-		}
+		b.counters.addLimited()
 	}
 	if b.throttled.Load() {
 		b.throttleStart += now
-		cpuBandwidthThrottled.Add(1)
+		b.counters.throttled.Add(1)
 		b.armRefillLocked(now)
 	}
 }
@@ -252,8 +292,9 @@ func newCPUBandwidth(parent *CPUBandwidth, clock bandwidthClock) *CPUBandwidth {
 
 // SetLimits sets the quota and the period of the node. A negative quota
 // removes the limit. As in Linux, a new limit starts a fresh period with a
-// full quota and ends a throttle at once.
-func (b *CPUBandwidth) SetLimits(quota, period time.Duration) {
+// full quota and ends a throttle at once. The Kernel k owns the counters that
+// a finite quota changes. It can be nil only when the quota is negative.
+func (b *CPUBandwidth) SetLimits(k *Kernel, quota, period time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.clock.now()
@@ -271,11 +312,10 @@ func (b *CPUBandwidth) SetLimits(quota, period time.Duration) {
 	b.charged = false
 	switch isLimited := quotaNS >= 0; {
 	case isLimited && !wasLimited:
-		if cpuBandwidthLimited.Add(1) == 1 {
-			cpuBillingGeneration.Add(1)
-		}
+		b.attachLocked(k)
+		b.counters.addLimited()
 	case !isLimited && wasLimited:
-		cpuBandwidthLimited.Add(-1)
+		b.counters.limited.Add(-1)
 	}
 	if b.throttled.Load() {
 		if wasPending {
@@ -467,7 +507,7 @@ func (b *CPUBandwidth) chargeRuns(end int64, spans []bandwidthSpan) {
 	if b.remainingNS < -bandwidthSlackNS && !b.throttled.Load() {
 		b.throttled.Store(true)
 		b.throttleStart = now
-		cpuBandwidthThrottled.Add(1)
+		b.counters.throttled.Add(1)
 		b.armRefillLocked(b.clock.now())
 	}
 }
@@ -519,11 +559,18 @@ func (b *CPUBandwidth) throttleWake() chan struct{} {
 
 // armRefillLocked starts the timer that begins the next period. The timer
 // runs while the node throttles, so a node whose tasks all sleep or exited
-// still leaves the throttle.
+// still leaves the throttle. The timer holds the node weakly, so a node that
+// its Kernel dropped, for example after a failed restore, ends the timer chain
+// at the next expiry.
 //
 // Preconditions: b.mu is locked and b throttles.
 func (b *CPUBandwidth) armRefillLocked(now int64) {
-	b.stopRefill = b.clock.after(time.Duration(max(b.periodEnd-now, 0)), b.refillTimer)
+	node := weak.Make(b)
+	b.stopRefill = b.clock.after(time.Duration(max(b.periodEnd-now, 0)), func() {
+		if b := node.Value(); b != nil {
+			b.refillTimer()
+		}
+	})
 }
 
 // refillTimer is the callback of the refill timer.
@@ -586,7 +633,7 @@ func (b *CPUBandwidth) advancePeriodsLocked(n, now int64) {
 func (b *CPUBandwidth) endThrottleLocked(now int64) {
 	b.throttled.Store(false)
 	b.throttledNS += now - b.throttleStart
-	cpuBandwidthThrottled.Add(-1)
+	b.counters.throttled.Add(-1)
 	if b.stopRefill != nil {
 		b.stopRefill()
 		b.stopRefill = nil

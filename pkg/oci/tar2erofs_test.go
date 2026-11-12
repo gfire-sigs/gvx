@@ -28,6 +28,7 @@ import (
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/erofs"
 )
 
 func patternBytes(n int, seed int64) []byte {
@@ -308,11 +309,12 @@ func TestCompileRejectsUnsafeNames(t *testing.T) {
 
 func TestCompileRejectsUnencodableInput(t *testing.T) {
 	for name, entry := range map[string]tarEntry{
-		"device major too large": deviceEntry("d", tar.TypeChar, 4096, 0),
-		"device minor too large": deviceEntry("d", tar.TypeChar, 1, 1<<20),
-		"empty symlink target":   symlinkEntry("l", ""),
-		"huge symlink target":    symlinkEntry("l", strings.Repeat("t", testBlockSize)),
-		"negative uid":           {hdr: tar.Header{Name: "f", Typeflag: tar.TypeReg, Uid: -1, Mode: 0o644}},
+		"device major too large":               deviceEntry("d", tar.TypeChar, 4096, 0),
+		"device minor too large":               deviceEntry("d", tar.TypeChar, 1, 1<<20),
+		"empty symlink target":                 symlinkEntry("l", ""),
+		"huge symlink target":                  symlinkEntry("l", strings.Repeat("t", testBlockSize)),
+		"negative uid":                         {hdr: tar.Header{Name: "f", Typeflag: tar.TypeReg, Uid: -1, Mode: 0o644}},
+		"inline xattrs above the icount limit": {hdr: tar.Header{Name: "f", Typeflag: tar.TypeReg, Mode: 0o644, PAXRecords: bigXattrRecords(5, 60000)}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			raw := buildTar(t, entry)
@@ -565,4 +567,36 @@ func ustarHeader(name string, typeflag byte, size int64) []byte {
 	}
 	copy(h[148:156], fmt.Sprintf("%06o\x00 ", sum))
 	return h
+}
+
+// bigXattrRecords returns the PAX records of n xattrs with values of size bytes.
+func bigXattrRecords(n, size int) map[string]string {
+	records := make(map[string]string, n)
+	for i := range n {
+		records[fmt.Sprintf("%suser.big%d", paxXattrPrefix, i)] = strings.Repeat("v", size)
+	}
+	return records
+}
+
+func TestEncodeXattrIbodyBoundsInlineSize(t *testing.T) {
+	// Each entry below has a suffix of one byte, so it takes 4+1+len(value)
+	// bytes. Three values of 65535 bytes take 196632 bytes with the header. A
+	// fourth value of 65511 bytes ends the area at the limit of the icount field.
+	big := func(name string, n int) xattrKV { return xattrKV{name: name, value: make([]byte, n)} }
+	atLimit := []xattrKV{big("user.a", 65535), big("user.b", 65535), big("user.c", 65535), big("user.d", 65511)}
+	ibody, err := encodeXattrIbody(atLimit)
+	if err != nil {
+		t.Fatalf("encodeXattrIbody at the limit = %v, want success", err)
+	}
+	if len(ibody) != erofs.MaxXattrIbodySize {
+		t.Fatalf("area at the limit has %d bytes, want %d", len(ibody), erofs.MaxXattrIbodySize)
+	}
+	if got := xattrIcount(ibody); got != 1<<16-1 {
+		t.Errorf("icount at the limit = %d, want %d", got, 1<<16-1)
+	}
+
+	over := append(slices.Clone(atLimit), big("user.e", 1))
+	if _, err := encodeXattrIbody(over); err == nil || !strings.Contains(err.Error(), "inline space") {
+		t.Errorf("encodeXattrIbody above the limit = %v, want an inline space error", err)
+	}
 }

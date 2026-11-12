@@ -5,7 +5,7 @@
 # change adds a host call and the normal build kills the process.
 #
 # Usage: scripts/seccomp-audit.sh <package patterns> [go test -run value]
-set -u
+set -eo pipefail
 
 pkgs=${1:?usage: seccomp-audit.sh <package patterns> [run pattern]}
 run=${2:-}
@@ -13,14 +13,17 @@ run=${2:-}
 export CGO_ENABLED=0
 export GOFLAGS="${GOFLAGS:-} -tags=gvx_seccomp_log"
 
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+
 sudo dmesg -C >/dev/null 2>&1 || true
 args=(-count=1 -v)
-[ -n "$run" ] && args+=(-run "$run")
-go test "${args[@]}" $pkgs
-rc=$?
+if [ -n "$run" ]; then args+=(-run "$run"); fi
+rc=0
+# shellcheck disable=SC2086 # the patterns split on spaces on purpose
+go test "${args[@]}" $pkgs || rc=$?
 
-log=$(mktemp)
-{ sudo dmesg 2>/dev/null || sudo journalctl -k --no-pager 2>/dev/null; } | grep -E 'type=1326|SECCOMP' >"$log"
+{ sudo dmesg 2>/dev/null || sudo journalctl -k --no-pager 2>/dev/null; } | grep -E 'type=1326|SECCOMP' >"$log" || true
 echo
 echo "== system calls outside the allowlist ($(wc -l <"$log") log lines, test exit code $rc)"
 sysdir=$(go list -m -f '{{.Dir}}' golang.org/x/sys)

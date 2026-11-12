@@ -543,6 +543,17 @@ func isGoSource(relSlash string) bool {
 	return strings.HasSuffix(relSlash, ".go") || strings.HasSuffix(relSlash, ".s")
 }
 
+// isNonGoSource reports whether relSlash is a C source, a C header, a preprocessed
+// assembly file, or a protocol buffer file. The sync copies these files without
+// a rewrite, so a pristine copy equals the upstream bytes.
+func isNonGoSource(relSlash string) bool {
+	switch path.Ext(relSlash) {
+	case ".c", ".h", ".S", ".proto":
+		return true
+	}
+	return false
+}
+
 func isTestFile(relSlash string) bool {
 	return strings.HasSuffix(relSlash, "_test.go")
 }

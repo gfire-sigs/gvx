@@ -38,6 +38,7 @@ var (
 	errUnprotectedShadow = errors.New("Tier 2 file replaces an upstream file but file_mask.txt does not PROTECT it")
 	errStaleRule         = errors.New("allowlist rule matches no edited file")
 	errUnmaskedRemoval   = errors.New("upstream file is missing but file_mask.txt does not EXCLUDE it")
+	errNonGoModified     = errors.New("upstream C, header, assembly, or proto file differs from upstream and file_mask.txt does not PROTECT it")
 	errNonGeneratedFmt   = errors.New("formatting differs from upstream in a hand-written file")
 )
 

@@ -493,7 +493,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 		applyRestoredKernelProps(k, pr)
 		for _, node := range pr.cpuBandwidths {
 			if node != nil {
-				node.ActivateRestored(now)
+				node.ActivateRestored(k, now)
 			}
 		}
 	}
@@ -513,7 +513,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, _ vfs.CompleteRestore
 		})
 		fs.treeMu.RUnlock()
 		for _, cc := range limitedCPU {
-			cc.bandwidthNode().ActivateRestored(now)
+			cc.bandwidthNode().ActivateRestored(k, now)
 		}
 	}
 	if k != nil {

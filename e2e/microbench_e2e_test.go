@@ -313,6 +313,37 @@ func (w *benchOutputTap) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// benchTapState is a copy of the state of a benchOutputTap.
+type benchTapState struct {
+	output    string
+	hasStart  bool
+	hasEnd    bool
+	startWall time.Time
+	startUser time.Duration
+	startSys  time.Duration
+	endWall   time.Time
+	endUser   time.Duration
+	endSys    time.Duration
+}
+
+// snapshot returns the state of the tap. It holds the lock, so a guest write
+// that still runs cannot race with the reader.
+func (w *benchOutputTap) snapshot() benchTapState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return benchTapState{
+		output:    w.buf.String(),
+		hasStart:  w.hasStart,
+		hasEnd:    w.hasEnd,
+		startWall: w.startWall,
+		startUser: w.startUser,
+		startSys:  w.startSys,
+		endWall:   w.endWall,
+		endUser:   w.endUser,
+		endSys:    w.endSys,
+	}
+}
+
 // benchGuest runs each benchmark of the microbench guest repeat times and
 // prints each result and the median of each benchmark.
 func benchGuest(t *testing.T, b gateBackend, bin string, repeat int) {
@@ -411,11 +442,12 @@ func runBenchOnce(b gateBackend, bin, name string) (sample benchSample, detail s
 	}
 	endWall := time.Now()
 	endUser, endSys, _ := hostProcessCPUTime()
-	if outTap.hasStart {
-		startWall, startUser, startSys = outTap.startWall, outTap.startUser, outTap.startSys
+	tap := outTap.snapshot()
+	if tap.hasStart {
+		startWall, startUser, startSys = tap.startWall, tap.startUser, tap.startSys
 	}
-	if outTap.hasEnd {
-		endWall, endUser, endSys = outTap.endWall, outTap.endUser, outTap.endSys
+	if tap.hasEnd {
+		endWall, endUser, endSys = tap.endWall, tap.endUser, tap.endSys
 	}
 	wallDur := endWall.Sub(startWall)
 	userDur := max(endUser-startUser, 0)
@@ -441,7 +473,7 @@ func runBenchOnce(b gateBackend, bin, name string) (sample benchSample, detail s
 	if closeErr != nil {
 		return fail("close: %v", closeErr)
 	}
-	for _, line := range strings.Split(outTap.buf.String(), "\n") {
+	for _, line := range strings.Split(tap.output, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "MICROBENCH_ERR ") {
 			return fail("%s", line)
@@ -464,5 +496,5 @@ func runBenchOnce(b gateBackend, bin, name string) (sample benchSample, detail s
 			}, "", nil
 		}
 	}
-	return fail("no result in the output %q", outTap.buf.String())
+	return fail("no result in the output %q", tap.output)
 }

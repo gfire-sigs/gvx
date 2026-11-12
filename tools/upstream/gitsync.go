@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -170,11 +172,37 @@ func GitSync(ctx context.Context, cfg GitSyncConfig) (SyncManifest, error) {
 		DestDir:     cfg.RootDir,
 		Strategy:    StrategyGit,
 	}
+	manifest.ReleaseTag, manifest.ReleaseTagSHA = releaseTagFor(ctx, cfg)
 	if err := WriteSyncRecord(cfg.RootDir, manifest); err != nil {
 		return SyncManifest{}, fmt.Errorf("step 7: %w", err)
 	}
 	cfg.logf("step 7: recorded %s in UPSTREAM_COMMIT", target)
 	return manifest, nil
+}
+
+// releaseTagFor returns the release tag and its commit for the sync manifest.
+// AGENTS.md derives the PATCH field of the release version from the tag, so the
+// manifest must never lose it. A sync of the branch tip asks the upstream remote
+// for the newest release-* tag, as the archive sync does. A pinned TargetRef, or
+// a remote that does not answer, keeps the values that the manifest holds now.
+func releaseTagFor(ctx context.Context, cfg GitSyncConfig) (tag, sha string) {
+	if cfg.TargetRef == "" {
+		out, err := git(ctx, cfg.RootDir, "ls-remote", upstreamRemoteName, "refs/tags/release-*")
+		if err == nil {
+			if refs, parseErr := parseLsRemoteOutput(out); parseErr == nil && refs.ReleaseTag != "" {
+				return refs.ReleaseTag, refs.ReleaseTagSHA
+			}
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(cfg.RootDir, "tools", "upstream", "sync_manifest.json"))
+	if err != nil {
+		return "", ""
+	}
+	var previous SyncManifest
+	if json.Unmarshal(raw, &previous) != nil {
+		return "", ""
+	}
+	return previous.ReleaseTag, previous.ReleaseTagSHA
 }
 
 // resolveMergeTarget returns the full commit SHA to merge.

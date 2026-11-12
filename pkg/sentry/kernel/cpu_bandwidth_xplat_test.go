@@ -15,9 +15,12 @@
 package kernel
 
 import (
+	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"time"
+	"weak"
 )
 
 const (
@@ -71,14 +74,26 @@ func (c *fakeBandwidthClock) advance(d time.Duration) {
 	c.timers = slices.DeleteFunc(c.timers, func(t *fakeTimer) bool { return t.stopped })
 }
 
+var testKernels sync.Map
+
+// testKernel returns the Kernel of a test. Each test owns one Kernel, so the
+// bandwidth counters of two tests never meet. The Kernel has no tasks.
+func testKernel(t *testing.T) *Kernel {
+	t.Helper()
+	k, _ := testKernels.LoadOrStore(t, &Kernel{})
+	t.Cleanup(func() { testKernels.Delete(t) })
+	return k.(*Kernel)
+}
+
 // newTestBandwidth returns a node with a quota of 50 ms for each period of
 // 100 ms, and it removes the limit at the end of the test so that the global
 // counters return to their old values.
 func newTestBandwidth(t *testing.T, c *fakeBandwidthClock, parent *CPUBandwidth, quota time.Duration) *CPUBandwidth {
 	t.Helper()
 	b := newCPUBandwidth(parent, c.clock())
-	b.SetLimits(quota, period)
-	t.Cleanup(func() { b.SetLimits(-1, period) })
+	k := testKernel(t)
+	b.SetLimits(k, quota, period)
+	t.Cleanup(func() { b.SetLimits(k, -1, period) })
 	return b
 }
 
@@ -418,9 +433,10 @@ func TestCPUBandwidthSetLimitsReleasesThrottle(t *testing.T) {
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
 	ran(&clock, b, 61*ms)
 	wake := b.throttleWake()
-	before := cpuBandwidthThrottled.Load()
+	counters := bandwidthCountersOf(testKernel(t))
+	before := counters.throttled.Load()
 
-	b.SetLimits(-1, period)
+	b.SetLimits(nil, -1, period)
 	if b.Throttled() {
 		t.Error("still throttled after the limit was removed")
 	}
@@ -429,7 +445,7 @@ func TestCPUBandwidthSetLimitsReleasesThrottle(t *testing.T) {
 	default:
 		t.Error("waiters did not wake when the limit was removed")
 	}
-	if got := cpuBandwidthThrottled.Load(); got != before-1 {
+	if got := counters.throttled.Load(); got != before-1 {
 		t.Errorf("throttled node count = %d, want %d", got, before-1)
 	}
 }
@@ -439,7 +455,7 @@ func TestCPUBandwidthRaisedQuotaStartsFullPeriod(t *testing.T) {
 	b := newTestBandwidth(t, &clock, nil, 50*time.Millisecond)
 	ran(&clock, b, 61*ms)
 
-	b.SetLimits(80*time.Millisecond, period)
+	b.SetLimits(testKernel(t), 80*time.Millisecond, period)
 	if b.Throttled() {
 		t.Fatal("still throttled after the quota grew")
 	}
@@ -455,16 +471,18 @@ func TestCPUBandwidthRaisedQuotaStartsFullPeriod(t *testing.T) {
 
 func TestCPUBandwidthLimitCountTracksFiniteQuotas(t *testing.T) {
 	var clock fakeBandwidthClock
-	before := cpuBandwidthLimited.Load()
+	k := testKernel(t)
+	counters := bandwidthCountersOf(k)
+	before := counters.limited.Load()
 	b := newCPUBandwidth(nil, clock.clock())
 
-	b.SetLimits(50*time.Millisecond, period)
-	b.SetLimits(60*time.Millisecond, period)
-	if got := cpuBandwidthLimited.Load(); got != before+1 {
+	b.SetLimits(k, 50*time.Millisecond, period)
+	b.SetLimits(k, 60*time.Millisecond, period)
+	if got := counters.limited.Load(); got != before+1 {
 		t.Errorf("limited node count = %d with one finite node, want %d", got, before+1)
 	}
-	b.SetLimits(-1, period)
-	if got := cpuBandwidthLimited.Load(); got != before {
+	b.SetLimits(k, -1, period)
+	if got := counters.limited.Load(); got != before {
 		t.Errorf("limited node count = %d after the limit was removed, want %d", got, before)
 	}
 }
@@ -521,8 +539,9 @@ func TestCPUBandwidthLimitReportsQuotaAndPeriod(t *testing.T) {
 	if _, _, limited := b.Limit(); limited {
 		t.Error("a new node reports a limit")
 	}
-	b.SetLimits(20*time.Millisecond, 200*time.Millisecond)
-	t.Cleanup(func() { b.SetLimits(-1, period) })
+	k := testKernel(t)
+	b.SetLimits(k, 20*time.Millisecond, 200*time.Millisecond)
+	t.Cleanup(func() { b.SetLimits(k, -1, period) })
 	quota, per, limited := b.Limit()
 	if !limited || quota != 20*time.Millisecond || per != 200*time.Millisecond {
 		t.Errorf("Limit = (%v, %v, %v), want (20ms, 200ms, true)", quota, per, limited)
@@ -553,5 +572,91 @@ func TestCPUMeterStartsAtTheFirstReadingOfAnUnstampedTask(t *testing.T) {
 	}
 	if got := m.measured(1400, true); got != 400 {
 		t.Errorf("second reading = %d, want 400", got)
+	}
+}
+
+// TestCPUBandwidthCountersAreIsolatedBetweenKernels runs two Kernels in one
+// process. A limit and a throttle in one Kernel must not change the counters
+// that the CPU clock ticker and the run loop of the other Kernel read.
+func TestCPUBandwidthCountersAreIsolatedBetweenKernels(t *testing.T) {
+	var clock fakeBandwidthClock
+	kA, kB := &Kernel{}, &Kernel{}
+	cA, cB := bandwidthCountersOf(kA), bandwidthCountersOf(kB)
+	if cA == cB {
+		t.Fatal("two Kernels share one set of bandwidth counters")
+	}
+	taskA, taskB := &Task{k: kA}, &Task{k: kB}
+	if taskA.bandwidthCounters() != cA || taskB.bandwidthCounters() != cB {
+		t.Fatal("a task does not read the counters of its own Kernel")
+	}
+
+	genB := cB.generation.Load()
+	a := newCPUBandwidth(nil, clock.clock())
+	a.SetLimits(kA, 50*time.Millisecond, period)
+	t.Cleanup(func() { a.SetLimits(kA, -1, period) })
+
+	if !kA.cpuBandwidthLimited() {
+		t.Error("Kernel A has a finite quota, but cpuBandwidthLimited is false")
+	}
+	if kB.cpuBandwidthLimited() {
+		t.Error("a limit in Kernel A makes Kernel B account CPU bandwidth")
+	}
+	if got := cB.generation.Load(); got != genB {
+		t.Errorf("billing generation of Kernel B = %d after a limit in Kernel A, want %d", got, genB)
+	}
+
+	ran(&clock, a, 61*ms)
+	if !a.Throttled() {
+		t.Fatal("node A is not throttled after it spent its quota")
+	}
+	if !taskA.cpuBandwidthThrottled() {
+		t.Error("a task of Kernel A does not see the throttle of its Kernel")
+	}
+	if taskB.cpuBandwidthThrottled() {
+		t.Error("a throttle in Kernel A makes a task of Kernel B look for a throttle")
+	}
+
+	b := newCPUBandwidth(nil, clock.clock())
+	b.SetLimits(kB, 50*time.Millisecond, period)
+	t.Cleanup(func() { b.SetLimits(kB, -1, period) })
+	a.SetLimits(kA, -1, period)
+	if kA.cpuBandwidthLimited() {
+		t.Error("Kernel A still counts a limit after it removed its only limit")
+	}
+	if !kB.cpuBandwidthLimited() {
+		t.Error("removing the limit of Kernel A removed the limit count of Kernel B")
+	}
+}
+
+// TestCPUBandwidthRefillTimerDoesNotKeepNodeAlive checks the leak of a node
+// that a failed restore drops while it throttles. The refill timer must not
+// keep the node reachable.
+func TestCPUBandwidthRefillTimerDoesNotKeepNodeAlive(t *testing.T) {
+	var clock fakeBandwidthClock
+	k := &Kernel{}
+	node := newCPUBandwidth(nil, clock.clock())
+	node.SetLimits(k, 50*time.Millisecond, period)
+	ran(&clock, node, 61*ms)
+	if !node.Throttled() || len(clock.timers) != 1 {
+		t.Fatalf("throttled = %t, timers = %d, want a throttled node with one timer", node.Throttled(), len(clock.timers))
+	}
+	// Keep the timer callback, as the host timer does, and drop the node.
+	refill := clock.timers[0].f
+	clock.timers = nil
+	ref := weak.Make(node)
+	node = nil
+	for range 5 {
+		runtime.GC()
+		if ref.Value() == nil {
+			break
+		}
+	}
+	if ref.Value() != nil {
+		t.Fatal("the refill timer keeps a dropped node alive")
+	}
+	clock.advance(period)
+	refill()
+	if len(clock.timers) != 0 {
+		t.Errorf("the refill timer of a dropped node armed %d new timers, want 0", len(clock.timers))
 	}
 }

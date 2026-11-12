@@ -95,13 +95,17 @@ switch_adb_uid() {
 	return 1
 }
 
+# run_shell runs cmd in the adb shell, and it passes only when the exit status
+# equals want_rc (default 0), the output holds want, and no line says FAIL. The
+# pipefail option makes the status the one of adb, which returns the status of
+# the remote command.
 run_shell() {
-	local label=$1 want=$2 cmd=$3 out
-	out=$(adb shell "umask 022 && cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache $cmd 2>&1" | tr -d '\r') || true
-	if grep -qF "$want" <<<"$out" && ! grep -qE '(^| )FAIL ' <<<"$out"; then
+	local label=$1 want=$2 cmd=$3 want_rc=${4:-0} out rc=0
+	out=$(adb shell "umask 022 && cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache $cmd 2>&1" | tr -d '\r') || rc=$?
+	if [ "$rc" -eq "$want_rc" ] && grep -qF "$want" <<<"$out" && ! grep -qE '(^| )FAIL ' <<<"$out"; then
 		echo "PASS $label"
 	else
-		echo "FAIL $label"
+		echo "FAIL $label (exit $rc, want $want_rc)"
 		echo "$out" | head -n 40
 		failed=1
 	fi

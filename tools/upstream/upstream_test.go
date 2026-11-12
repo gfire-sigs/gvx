@@ -597,3 +597,24 @@ func readTestFile(tb testing.TB, root, rel string) string {
 	}
 	return string(raw)
 }
+
+func TestParseLsRemoteOutputOrdersReleaseCountersNumerically(t *testing.T) {
+	t.Parallel()
+
+	raw := strings.Join([]string{
+		"aaaa000000000000000000000000000000000001\trefs/tags/release-20260201.2",
+		"bbbb000000000000000000000000000000000002\trefs/tags/release-20260201.10",
+		"cccc000000000000000000000000000000000003\trefs/tags/release-20260131.99",
+		"dddd000000000000000000000000000000000004\trefs/tags/release-20260201.10^{}",
+	}, "\n")
+	info, err := parseLsRemoteOutput(raw)
+	if err != nil {
+		t.Fatalf("parseLsRemoteOutput: %v", err)
+	}
+	if info.ReleaseTag != "release-20260201.10" {
+		t.Fatalf("ReleaseTag = %q, want release-20260201.10", info.ReleaseTag)
+	}
+	if want := "dddd000000000000000000000000000000000004"; info.ReleaseTagSHA != want {
+		t.Errorf("ReleaseTagSHA = %q, want the peeled commit %q", info.ReleaseTagSHA, want)
+	}
+}

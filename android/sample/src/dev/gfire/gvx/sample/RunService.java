@@ -30,6 +30,9 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Runs one rungv command in a foreground service.
@@ -42,10 +45,18 @@ import java.util.List;
  * dev.gfire.gvx.sample/.RunService --esa args run,alpine:3,uname,-a}. The
  * output goes to logcat (tag {@code gvx}) and to {@code files/run.log}; the
  * last line is {@code exit N}.
+ *
+ * <p>Commands run one after another on one thread. A second start waits for the
+ * first command, so two commands never write {@code files/run.log} together, and
+ * the service leaves the foreground state only after the last command ends.
  */
 public final class RunService extends Service {
     private static final String TAG = "gvx";
     private static final String CHANNEL = "gvx";
+
+    private final ExecutorService runner =
+            Executors.newSingleThreadExecutor(r -> new Thread(r, "gvx-run"));
+    private final AtomicInteger pending = new AtomicInteger();
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -65,12 +76,24 @@ public final class RunService extends Service {
 
         String[] raw = intent == null ? null : intent.getStringArrayExtra("args");
         List<String> args = Arrays.asList(raw == null ? new String[] {"version"} : raw);
-        new Thread(() -> {
-            run(args);
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf(startId);
-        }, "gvx-run").start();
+        pending.incrementAndGet();
+        runner.execute(() -> {
+            try {
+                run(args);
+            } finally {
+                if (pending.decrementAndGet() == 0) {
+                    stopForeground(STOP_FOREGROUND_REMOVE);
+                }
+                stopSelf(startId);
+            }
+        });
         return START_NOT_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        runner.shutdown();
+        super.onDestroy();
     }
 
     private void run(List<String> args) {
