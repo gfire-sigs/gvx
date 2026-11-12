@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -242,9 +243,13 @@ func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
 func (s *Sandbox) AcceptCheckpointConn() (net.Conn, error) {
 	s.mu.Lock()
 	ln := s.cfg.CheckpointListener
+	locked := s.lockdown.Applied
 	s.mu.Unlock()
 	if ln == nil {
 		return nil, fmt.Errorf("%w: Config.CheckpointListener is nil", ErrInvalidConfig)
+	}
+	if locked {
+		return hostlockdown.AcceptListener(ln)
 	}
 	return ln.Accept()
 }

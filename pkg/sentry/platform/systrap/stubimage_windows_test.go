@@ -206,14 +206,15 @@ func TestStubImageLockRefusesWritersAndAllowsReaders(t *testing.T) {
 			t.Errorf("open for %s failed with %v, want a sharing violation", access.name, err)
 		}
 	}
-	// Opening with write or delete sharing must also fail with ERROR_SHARING_VIOLATION
-	// because the host handle shares only FILE_SHARE_READ.
+	// Opening without FILE_SHARE_READ must also fail with ERROR_SHARING_VIOLATION
+	// because the host handle holds GENERIC_READ.
 	for _, share := range []struct {
 		name string
 		mode uint32
 	}{
-		{"share-write", windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE},
-		{"share-delete", windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE},
+		{"share-none", 0},
+		{"share-write-only", windows.FILE_SHARE_WRITE},
+		{"share-delete-only", windows.FILE_SHARE_DELETE},
 	} {
 		h, err := windows.CreateFile(p, windows.GENERIC_READ, share.mode,
 			nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
