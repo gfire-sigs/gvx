@@ -57,6 +57,17 @@ func (s *Stack) resumeChildStacks() {
 }
 
 func (s *Stack) restoreChildStacks() {
+	ext := s.ensureExtState()
+	ext.mu.Lock()
+	eps := ext.restoredEndpoints
+	ext.restoredEndpoints = nil
+	ext.mu.Unlock()
+	for _, ep := range eps {
+		if p, ok := ep.(postRestoreTransportEndpoint); ok {
+			p.FinishRestore()
+		}
+	}
+
 	s.mu.RLock()
 	fn := s.fib.childRestore
 	s.mu.RUnlock()
@@ -123,6 +134,10 @@ func (s *Stack) prepareRestoreLocked() {
 	if s.tables == nil {
 		s.tables = DefaultTables(s.clock, s.insecureRNG)
 	}
+	ext := s.ensureExtState()
+	ext.mu.Lock()
+	ext.restoredEndpoints = append(ext.restoredEndpoints[:0], s.restoredEndpoints...)
+	ext.mu.Unlock()
 }
 
 func restoreLinkEndpoint(ep NetworkLinkEndpoint) {
