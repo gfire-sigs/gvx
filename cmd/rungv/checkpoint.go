@@ -252,14 +252,19 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 		}
 	}
 
+	// Every path writes the token file only after the bind succeeds. A second
+	// rungv that fails to bind a live sandbox's address must not replace or
+	// remove the token of that sandbox.
 	if network == "tcp" {
-		if err := writeControlToken(tokenPath, token); err != nil {
-			return nil, err
-		}
 		ln, err := net.Listen("tcp", address)
 		if err != nil {
-			removeToken()
 			return nil, err
+		}
+		if tokenPath != "" {
+			if err := writeControlToken(tokenPath, token); err != nil {
+				_ = ln.Close()
+				return nil, err
+			}
 		}
 		return &controlEndpoint{Listener: ln, Token: token, Cleanup: removeToken}, nil
 	}
@@ -278,15 +283,16 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 			return nil, fmt.Errorf("remove stale checkpoint socket %q: %w", address, err)
 		}
 	}
-	if tokenPath != "" {
-		if err := writeControlToken(tokenPath, token); err != nil {
-			return nil, err
-		}
-	}
 	ln, err := net.Listen("unix", address)
 	if err != nil {
-		removeToken()
 		return nil, err
+	}
+	if tokenPath != "" {
+		if err := writeControlToken(tokenPath, token); err != nil {
+			_ = ln.Close()
+			_ = os.Remove(address)
+			return nil, err
+		}
 	}
 	if ul, ok := ln.(*net.UnixListener); ok {
 		ul.SetUnlinkOnClose(false)

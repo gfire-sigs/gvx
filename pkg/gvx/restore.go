@@ -358,7 +358,8 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 
 	hostRAM, _ := hostMemory()
-	mf, err := createKernelMemoryFile(restoreFileLimit(sb.cfg.Resources.MemoryBytes, hostRAM, sb.cfg.Tuning))
+	restoreLimit, _ := effectiveMemoryLimit(sb.cfg.Resources.MemoryBytes, hostRAM, sb.cfg.Tuning)
+	mf, err := createKernelMemoryFile(restoreFileLimit(restoreLimit, manifest.MemoryLimitBytes))
 	if err != nil {
 		return cleanup(err)
 	}

@@ -81,8 +81,14 @@ type CheckpointManifest struct {
 	// Eth0 records the addresses, MTU, and routes that the guest set on eth0
 	// in NAT mode. A restore applies them again. The field is absent in other
 	// network modes and in bundles of older runtimes.
-	Eth0      *netbackend.Eth0Config `json:"eth0,omitempty"`
-	CreatedAt time.Time              `json:"created_at"`
+	Eth0 *netbackend.Eth0Config `json:"eth0,omitempty"`
+	// MemoryLimitBytes is the memory limit that the guard of the saving
+	// sandbox enforced: the configured limit, or the RAM of the host without
+	// one. A restore sizes the cap of the memory file from the larger of this
+	// value and its own limit. The field is absent in bundles of older
+	// runtimes.
+	MemoryLimitBytes uint64    `json:"memory_limit_bytes,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type checkpointBundleFiles struct {
@@ -287,6 +293,17 @@ func (s *Sandbox) saveQuiescersLocked() []saveQuiescer {
 	return out
 }
 
+// guestNICCount returns the number of NICs of the guest root Netstack.
+func (s *Sandbox) guestNICCount() int {
+	s.mu.Lock()
+	st := s.netStack
+	s.mu.Unlock()
+	if st == nil {
+		return 0
+	}
+	return len(st.NICInfo())
+}
+
 // snapshotEth0 returns the eth0 settings of the guest in NAT mode, or nil in
 // every other mode. The guest must be paused: a running guest can change them.
 func (s *Sandbox) snapshotEth0() *netbackend.Eth0Config {
@@ -360,11 +377,21 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	// paused, because Run and Close would then block forever.
 	paused := true
 	kCtx := k.SupervisorContext()
+	nicsBefore := s.guestNICCount()
 	defer func() {
 		if !paused {
 			return
 		}
 		k.BeforeResume(kCtx)
+		// Kernel.SaveTo with resume=false removes the NICs of the guest
+		// Netstack and ends its connections, because the saved guest is not
+		// meant to continue. A failure after that point leaves a guest
+		// without a network, so the guest stops instead of resuming. A
+		// failure before it leaves the guest intact, and it resumes.
+		if retErr != nil && !opts.LeaveRunning && s.guestNICCount() < nicsBefore {
+			retErr = errors.Join(retErr, errors.New("gvx: the failed checkpoint removed the guest network configuration, so the guest was stopped"))
+			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		}
 		for _, q := range quiescers {
 			if err := q.ResumeAfterSave(); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("gvx: resume network backend after checkpoint: %w", err))
@@ -408,6 +435,8 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	}
 	manifest := s.buildCheckpointManifest()
 	manifest.Eth0 = eth0
+	hostRAM, _ := hostMemory()
+	manifest.MemoryLimitBytes, _ = effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM, s.cfg.Tuning)
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("gvx: marshal checkpoint manifest: %w", err)

@@ -239,3 +239,28 @@ func TestControlStopKeepsInFlightResponse(t *testing.T) {
 	}
 	<-stopped
 }
+
+func TestControlFailedBindKeepsTheTokenOfTheLiveListener(t *testing.T) {
+	isolateControlTokenDir(t)
+	addr := freeLoopbackAddr(t)
+	first, err := listenCheckpointSocket("tcp://" + addr)
+	if err != nil {
+		t.Fatalf("first listenCheckpointSocket: %v", err)
+	}
+	defer first.Cleanup()
+	defer first.Listener.Close()
+
+	if second, err := listenCheckpointSocket("tcp://" + addr); err == nil {
+		second.Cleanup()
+		_ = second.Listener.Close()
+		t.Fatal("a second listener bound the address of a live listener")
+	}
+
+	got, err := readControlToken("tcp", addr)
+	if err != nil {
+		t.Fatalf("readControlToken: %v", err)
+	}
+	if got != first.Token {
+		t.Fatalf("token file holds %q after a failed second bind, want the token %q of the live listener", got, first.Token)
+	}
+}

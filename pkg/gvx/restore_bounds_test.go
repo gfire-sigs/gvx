@@ -16,13 +16,12 @@ package gvx
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
 func TestReadAndParseManifestRejectsOversizedFile(t *testing.T) {
@@ -60,19 +59,26 @@ func TestReadAndParseManifestRejectsDirectory(t *testing.T) {
 
 func TestRestoreFileLimit(t *testing.T) {
 	const gib = 1 << 30
-	var tun tuning.Values
 	for _, tc := range []struct {
-		name       string
-		configured int64
-		hostRAM    uint64
-		want       uint64
+		name                string
+		restoreLimit, saved uint64
+		want                uint64
 	}{
-		{"configured limit wins", 4 * gib, 64 * gib, 9 * gib},
-		{"host RAM without a limit", 0, 16 * gib, 33 * gib},
+		{"restore limit only", 4 * gib, 0, 9 * gib},
+		{"saved limit only, an old bundle has none", 0, 16 * gib, 33 * gib},
+		{"the larger saved limit wins over a smaller restore host", 4 * gib, 64 * gib, 129 * gib},
+		{"the larger restore limit wins", 64 * gib, 4 * gib, 129 * gib},
 		{"nothing known", 0, 0, 0},
 	} {
-		if got := restoreFileLimit(tc.configured, tc.hostRAM, tun); got != tc.want {
-			t.Errorf("%s: restoreFileLimit(%d, %d) = %d, want %d", tc.name, tc.configured, tc.hostRAM, got, tc.want)
+		if got := restoreFileLimit(tc.restoreLimit, tc.saved); got != tc.want {
+			t.Errorf("%s: restoreFileLimit(%d, %d) = %d, want %d", tc.name, tc.restoreLimit, tc.saved, got, tc.want)
 		}
+	}
+}
+
+func TestManifestWithoutMemoryLimitMeansUnknown(t *testing.T) {
+	var old CheckpointManifest
+	if err := json.Unmarshal([]byte(`{"version":1}`), &old); err != nil || old.MemoryLimitBytes != 0 {
+		t.Fatalf("a manifest without memory_limit_bytes = (%+v, %v), want a zero limit", old, err)
 	}
 }

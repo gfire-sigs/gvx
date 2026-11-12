@@ -222,6 +222,10 @@ func TestCheckpointAndRestoreStopAndResume(t *testing.T) {
 	if manifest.Version != CheckpointManifestVersion {
 		t.Fatalf("manifest.Version = %d, want %d", manifest.Version, CheckpointManifestVersion)
 	}
+	// The sandbox has no configured limit, so the guard used the host RAM.
+	if hostRAM, _ := hostMemory(); manifest.MemoryLimitBytes != hostRAM {
+		t.Fatalf("manifest.MemoryLimitBytes = %d, want the host RAM %d", manifest.MemoryLimitBytes, hostRAM)
+	}
 	if len(manifest.LayerDigests) != 1 {
 		t.Fatalf("manifest.LayerDigests = %v, want 1 digest", manifest.LayerDigests)
 	}
@@ -604,7 +608,17 @@ func TestRestoreManifestValidationRejectsMismatch(t *testing.T) {
 	})
 }
 
-func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
+// failedCheckpointCase describes one Checkpoint call that fails after
+// Kernel.SaveTo succeeded.
+type failedCheckpointCase struct {
+	mode         NetMode
+	leaveRunning bool
+	// wantStopped is true when the failed checkpoint removed the guest
+	// network configuration, so the guest must stop instead of resume.
+	wantStopped bool
+}
+
+func runFailedCheckpoint(t *testing.T, tc failedCheckpointCase) {
 	cacheDir := t.TempDir()
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
@@ -622,6 +636,7 @@ func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
 	var stderr syncBuffer
 
 	cfg := newCheckpointTestConfig(t, cacheDir)
+	cfg.NetworkMode = tc.mode
 	cfg.OCILayerTars = [][]byte{layer}
 	cfg.CheckpointDir = filepath.Join(t.TempDir(), "bundle-fail")
 	cfg.Argv = []string{"/bin/cat", "/proc/self/fd/0"}
@@ -635,13 +650,14 @@ func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
 	}
 	defer sb.Close()
 
-	runCh := make(chan error, 1)
+	type runResult struct {
+		code int
+		err  error
+	}
+	runCh := make(chan runResult, 1)
 	go func() {
 		code, rErr := sb.Run(context.Background())
-		if rErr == nil && code != 0 {
-			rErr = fmt.Errorf("exit code %d", code)
-		}
-		runCh <- rErr
+		runCh <- runResult{code, rErr}
 	}()
 
 	go func() {
@@ -651,8 +667,24 @@ func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
 
 	injected := errors.New("injected post-save failure")
 	sb.ckptFiles.afterSave = func() error { return injected }
-	if err := sb.Checkpoint(context.Background(), CheckpointOptions{LeaveRunning: true}); !errors.Is(err, injected) {
+	err = sb.Checkpoint(context.Background(), CheckpointOptions{LeaveRunning: tc.leaveRunning})
+	if !errors.Is(err, injected) {
 		t.Fatalf("Checkpoint error = %v, want %v", err, injected)
+	}
+	if got := err != nil && strings.Contains(err.Error(), "so the guest was stopped"); got != tc.wantStopped {
+		t.Fatalf("Checkpoint error = %v, stopped = %v, want stopped = %v", err, got, tc.wantStopped)
+	}
+
+	if tc.wantStopped {
+		select {
+		case res := <-runCh:
+			if res.code != 128+9 {
+				t.Fatalf("Run after the stop = (%d, %v), want exit code 137", res.code, res.err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("the guest neither resumed nor stopped after a failed checkpoint")
+		}
+		return
 	}
 
 	// The guest must run again after the failed checkpoint.
@@ -661,9 +693,9 @@ func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
 		_ = stdinW.Close()
 	}()
 	select {
-	case rErr := <-runCh:
-		if rErr != nil {
-			t.Fatalf("Run after failed checkpoint: %v; stderr=%q", rErr, stderr.String())
+	case res := <-runCh:
+		if res.err != nil || res.code != 0 {
+			t.Fatalf("Run after failed checkpoint = (%d, %v); stderr=%q", res.code, res.err, stderr.String())
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatalf("guest stayed paused after a failed checkpoint; stdout=%q", stdout.String())
@@ -671,9 +703,23 @@ func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
 	if got, want := stdout.String(), "line-one\nline-two\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+}
 
-	// A later checkpoint attempt must not deadlock on a stale pause.
-	if err := sb.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
+	runFailedCheckpoint(t, failedCheckpointCase{mode: NetModeNone, leaveRunning: true})
+}
+
+// Kernel.SaveTo with resume=false removes every non-preserved NIC, even in the
+// none mode, so a failure after it leaves a guest that cannot resume.
+func TestCheckpointStopKillsGuestWhenSaveRemovedTheNICs(t *testing.T) {
+	runFailedCheckpoint(t, failedCheckpointCase{mode: NetModeNone, leaveRunning: false, wantStopped: true})
+}
+
+// Kernel.SaveTo with resume=false removes eth0, so the guest cannot resume.
+func TestCheckpointStopKillsNATGuestWhenSaveRemovedTheNetwork(t *testing.T) {
+	runFailedCheckpoint(t, failedCheckpointCase{mode: NetModeNAT, leaveRunning: false, wantStopped: true})
+}
+
+func TestCheckpointLeaveRunningKeepsNetworkedGuestAfterPostSaveFailure(t *testing.T) {
+	runFailedCheckpoint(t, failedCheckpointCase{mode: NetModeNAT, leaveRunning: true})
 }
