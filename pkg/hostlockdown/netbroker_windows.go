@@ -53,7 +53,7 @@ func isAllowedNetBrokerNetwork(network string) bool {
 // attaches its own duplicated impersonation token and closes that token handle
 // immediately, and startNetBroker closes netTok before returning so zero
 // broker token handles remain in the process handle table.
-func startNetBroker(primary windows.Token, id *tokenIdentity, preboundListeners int) (*winNetBroker, error) {
+func startNetBroker(primary windows.Token, id *tokenIdentity, allowOutbound bool, preboundListeners int) (*winNetBroker, error) {
 	netTok, err := createNetBrokerImpersonationToken(primary, id)
 	if err != nil {
 		return nil, err
@@ -61,15 +61,17 @@ func startNetBroker(primary windows.Token, id *tokenIdentity, preboundListeners 
 	defer netTok.Close()
 
 	b := &winNetBroker{
-		dialCh:   make(chan func()),
 		acceptCh: make(chan func()),
 		stopCh:   make(chan struct{}),
 	}
-	acceptWorkers := max(preboundListeners, minNetAcceptWorkers)
-	if err := startNetWorkerPool(netTok, defaultNetDialWorkers, b.dialCh, b.stopCh); err != nil {
-		close(b.stopCh)
-		return nil, err
+	if allowOutbound {
+		b.dialCh = make(chan func())
+		if err := startNetWorkerPool(netTok, defaultNetDialWorkers, b.dialCh, b.stopCh); err != nil {
+			close(b.stopCh)
+			return nil, err
+		}
 	}
+	acceptWorkers := max(preboundListeners, minNetAcceptWorkers)
 	if err := startNetWorkerPool(netTok, acceptWorkers, b.acceptCh, b.stopCh); err != nil {
 		close(b.stopCh)
 		return nil, err
@@ -142,7 +144,7 @@ func (b *winNetBroker) runAccept(fn func()) {
 }
 
 func dialHostContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if b := activeNetBroker.Load(); b != nil && isAllowedNetBrokerNetwork(network) {
+	if b := activeNetBroker.Load(); b != nil && b.dialCh != nil && isAllowedNetBrokerNetwork(network) {
 		type dialResult struct {
 			conn net.Conn
 			err  error
