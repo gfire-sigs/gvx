@@ -177,7 +177,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 	}
 
 	// Hold the task back while its cgroup has no CPU quota left (cpu.max).
-	if cpuBandwidthThrottled.Load() != 0 && t.throttleCPUBandwidth() {
+	if t.cpuBandwidthThrottled() && t.throttleCPUBandwidth() {
 		return (*runApp)(nil)
 	}
 

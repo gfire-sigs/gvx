@@ -6,7 +6,7 @@ The generator "go run ./tools/licenses" writes this file. Do not edit it by hand
 "rungv license" prints this file. "rungv license -list" prints the component index.
 
 Go version: go1.27.4
-Targets: darwin/arm64, windows/amd64, windows/arm64, linux/amd64, linux/arm64. Each target builds with CGO_ENABLED=0.
+Targets: darwin/arm64, windows/amd64, windows/arm64, linux/amd64, linux/arm64, android/arm64. Each target builds with CGO_ENABLED=0.
 
 Components (name version SPDX-id):
 std go1.27.4 BSD-3-Clause

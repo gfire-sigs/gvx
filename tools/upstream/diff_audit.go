@@ -89,6 +89,19 @@ type AuditReport struct {
 	Shadow   int
 	Added    int
 
+	// NonGoPristine counts C, header, preassembled assembly, and proto files
+	// that equal their upstream bytes. NonGoProtected counts those that differ
+	// and that file_mask.txt PROTECTs. NonGoAdded counts those that upstream
+	// does not have. These files stay outside the budget, because it counts Go
+	// and assembly files. Any other difference fails the audit.
+	NonGoPristine  int
+	NonGoProtected int
+	NonGoAdded     int
+	// NonGoMissing counts upstream files of these kinds that the tree lacks and
+	// that file_mask.txt does not EXCLUDE. The sync prunes them, so this count
+	// informs and does not fail the audit.
+	NonGoMissing int
+
 	// Budgeted counts the files charged against the ceiling.
 	Budgeted      int
 	BudgetedRatio float64
@@ -263,8 +276,13 @@ func RunAudit(cfg AuditConfig) (AuditReport, error) {
 
 	seen := make(map[string]bool)
 
+	nonGoSeen := make(map[string]bool)
 	walkErr := walkRepo(cfg.RootDir, func(abs, relSlash string, _ fs.DirEntry) error {
 		if !isGoSource(relSlash) {
+			if isNonGoSource(relSlash) && ClassifyFile(relSlash) != Tier1Additive {
+				nonGoSeen[relSlash] = true
+				return st.auditNonGoFile(abs, relSlash)
+			}
 			return nil
 		}
 		tier := ClassifyFile(relSlash)
@@ -284,6 +302,7 @@ func RunAudit(cfg AuditConfig) (AuditReport, error) {
 		return st.report, walkErr
 	}
 	st.report.Tier2SharedPkgCount = len(st.xplatPkgs)
+	st.countMissingNonGo(nonGoSeen)
 
 	for _, rel := range included {
 		if ClassifyFile(rel) == Tier1Additive || seen[rel] {
@@ -314,6 +333,42 @@ type auditState struct {
 	ruleUsed map[string]bool
 	// xplatPkgs records shared package directories that hold non-test *_xplat*.go files.
 	xplatPkgs map[string]bool
+}
+
+// auditNonGoFile compares one C, header, assembly, or proto file with upstream.
+// The sync copies such a file without a rewrite, so an edit is a deviation that
+// the Go retag cannot reproduce. Only file_mask.txt PROTECT can keep one.
+func (st *auditState) auditNonGoFile(abs, relSlash string) error {
+	repoBytes, err := os.ReadFile(abs)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", relSlash, err)
+	}
+	upBytes, inUpstream := st.cfg.Upstream.pristine(relSlash)
+	switch {
+	case !inUpstream:
+		st.report.NonGoAdded++
+	case bytes.Equal(repoBytes, upBytes):
+		st.report.NonGoPristine++
+	case st.cfg.Mask != nil && st.cfg.Mask.Decide(relSlash) == MaskProtect:
+		st.report.NonGoProtected++
+	default:
+		st.violations = append(st.violations, fmt.Errorf("%w: %s", errNonGoModified, relSlash))
+	}
+	return nil
+}
+
+// countMissingNonGo counts the upstream C, header, assembly, and proto files
+// that the tree lacks.
+func (st *auditState) countMissingNonGo(seen map[string]bool) {
+	for rel := range st.cfg.Upstream.Files {
+		if !isNonGoSource(rel) || seen[rel] || ClassifyFile(rel) == Tier1Additive {
+			continue
+		}
+		if st.cfg.Mask != nil && st.cfg.Mask.Decide(rel) == MaskExclude {
+			continue
+		}
+		st.report.NonGoMissing++
+	}
 }
 
 // checkStaleRules reports allowlist rules that no file needs. A stale rule hides a SPEC

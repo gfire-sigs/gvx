@@ -73,6 +73,9 @@ func encodeXattrIbody(xs []xattrKV) ([]byte, error) {
 		for len(out)%erofs.XattrAlign != 0 {
 			out = append(out, 0)
 		}
+		if len(out) > erofs.MaxXattrIbodySize {
+			return nil, fmt.Errorf("oci: xattrs of one inode need %d bytes of inline space after %q, above the limit of %d bytes", len(out), x.name, erofs.MaxXattrIbodySize)
+		}
 	}
 	return out, nil
 }

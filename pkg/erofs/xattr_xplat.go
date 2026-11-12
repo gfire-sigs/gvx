@@ -36,6 +36,10 @@ const (
 	// XattrLongPrefixFlag marks a name index that refers to the long prefix
 	// table. This implementation does not support long prefixes.
 	XattrLongPrefixFlag = 0x80
+
+	// MaxXattrIbodySize is the largest inline xattr area that the 16-bit
+	// i_xattr_icount field can encode. The header counts as one 4-byte unit.
+	MaxXattrIbodySize = XattrIbodyHeaderSize + XattrAlign*(1<<16-2)
 )
 
 // Name indexes of the predefined xattr name prefixes.

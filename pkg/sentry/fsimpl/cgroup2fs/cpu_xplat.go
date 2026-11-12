@@ -93,14 +93,29 @@ func (cc *cpu) bandwidthNode() *kernel.CPUBandwidth {
 	}
 	cc.bandwidth.mu.Lock()
 	defer cc.bandwidth.mu.Unlock()
-	return cc.bandwidthNodeLocked()
+	return cc.bandwidthNodeLocked(nil)
+}
+
+// bandwidthKernel returns the Kernel that owns cc, or nil if it is unknown.
+// The filesystem learns its Kernel when it is created, saved, or restored. The
+// Kernel in the context of a caller takes precedence.
+func (cc *cpu) bandwidthKernel(ctx context.Context) *kernel.Kernel {
+	if ctx != nil {
+		if k, _ := ctx.Value(kernel.CtxKernel).(*kernel.Kernel); k != nil {
+			return k
+		}
+	}
+	if fs := cc.c.fs; fs != nil {
+		return fs.memEnforcer.saveKernel.Value()
+	}
+	return nil
 }
 
 // bandwidthNodeLocked creates the budget on first use. The new budget takes
-// the limits that cc already stores.
+// the limits that cc already stores. The context ctx can be nil.
 //
 // Preconditions: cc.bandwidth.mu is locked.
-func (cc *cpu) bandwidthNodeLocked() *kernel.CPUBandwidth {
+func (cc *cpu) bandwidthNodeLocked(ctx context.Context) *kernel.CPUBandwidth {
 	if node := cc.bandwidth.node.Load(); node != nil {
 		return node
 	}
@@ -110,7 +125,8 @@ func (cc *cpu) bandwidthNodeLocked() *kernel.CPUBandwidth {
 	}
 	node := kernel.NewCPUBandwidth(parent)
 	if quotaUSec := cc.maxUSec.Load(); quotaUSec != cpuMaxUnlimited && cc.isActive() {
-		node.SetLimits(bandwidthLimits(quotaUSec, cc.periodUSec.Load()))
+		quota, period := bandwidthLimits(quotaUSec, cc.periodUSec.Load())
+		node.SetLimits(cc.bandwidthKernel(ctx), quota, period)
 	}
 	cc.bandwidth.node.Store(node)
 	return node
@@ -118,7 +134,7 @@ func (cc *cpu) bandwidthNodeLocked() *kernel.CPUBandwidth {
 
 // setMax stores a new value of cpu.max and applies it to the budget. Both
 // values are in microseconds, and a quota of cpuMaxUnlimited removes the limit.
-func (cc *cpu) setMax(quotaUSec, periodUSec int64) error {
+func (cc *cpu) setMax(ctx context.Context, quotaUSec, periodUSec int64) error {
 	if err := validateCPUMax(quotaUSec, periodUSec); err != nil {
 		return err
 	}
@@ -131,7 +147,8 @@ func (cc *cpu) setMax(quotaUSec, periodUSec int64) error {
 		// Sentry account CPU time for a budget that nothing reads.
 		return nil
 	}
-	cc.bandwidthNodeLocked().SetLimits(bandwidthLimits(quotaUSec, periodUSec))
+	quota, period := bandwidthLimits(quotaUSec, periodUSec)
+	cc.bandwidthNodeLocked(ctx).SetLimits(cc.bandwidthKernel(ctx), quota, period)
 	return nil
 }
 
@@ -141,7 +158,8 @@ func (cc *cpu) releaseBandwidth() {
 	cc.bandwidth.mu.Lock()
 	defer cc.bandwidth.mu.Unlock()
 	if node := cc.bandwidth.node.Load(); node != nil {
-		node.SetLimits(bandwidthLimits(cpuMaxUnlimited, cc.periodUSec.Load()))
+		quota, period := bandwidthLimits(cpuMaxUnlimited, cc.periodUSec.Load())
+		node.SetLimits(nil, quota, period)
 	}
 }
 

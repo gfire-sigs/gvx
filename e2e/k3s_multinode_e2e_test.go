@@ -48,7 +48,8 @@ const (
 
 	// flannelWireGuardPort is the UDP port of the flannel wireguard back end.
 	// k3s fixes it, and the peers of a node dial it at the external address
-	// of that node. The server of C1 publishes it on the same host port.
+	// of that node. The server of C1 publishes it on the same host port, so a
+	// host process that holds the port makes the test skip.
 	flannelWireGuardPort = 51820
 
 	// agnhostImage serves HTTP on the pods of the checks.
@@ -358,6 +359,21 @@ log "AGENT-STARTED"
 serve
 `
 
+// requireFreeUDPPort skips the test when another process holds the UDP port on
+// the loopback address. Flannel fixes its WireGuard port, so the test cannot
+// publish another port. A held port is a property of the host, not a defect of
+// the sandbox, and a skip names it.
+func requireFreeUDPPort(t *testing.T, port int) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Skipf("host UDP port %d is in use, and flannel cannot use another port: %v", port, err)
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatalf("close the probe socket of UDP port %d: %v", port, err)
+	}
+}
+
 // TestE2EK3sMultiNodeT1Join runs C1 of GVXIP-005. A server sandbox and an agent
 // sandbox form one k3s cluster with the flannel wireguard-native back end. The
 // server publishes its API port and the WireGuard port. The agent publishes
@@ -366,6 +382,7 @@ func TestE2EK3sMultiNodeT1Join(t *testing.T) {
 	for _, b := range gateBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			requireMultiSandbox(t, b)
+			requireFreeUDPPort(t, flannelWireGuardPort)
 			ctx, cancel := context.WithTimeout(context.Background(), 28*time.Minute)
 			t.Cleanup(cancel)
 

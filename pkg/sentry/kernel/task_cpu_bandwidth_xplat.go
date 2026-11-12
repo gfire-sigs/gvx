@@ -34,6 +34,27 @@ func (t *Task) cpuBandwidth() *CPUBandwidth {
 	return p.CPUBandwidth()
 }
 
+// bandwidthCounters returns the CPU bandwidth counters of the Kernel of t.
+func (t *Task) bandwidthCounters() *cpuBandwidthCounters {
+	if c := t.cpuMeter.counters.Load(); c != nil {
+		return c
+	}
+	c := bandwidthCountersOf(t.k)
+	t.cpuMeter.counters.Store(c)
+	return c
+}
+
+// cpuBandwidthLimited returns true while a cgroup of k has a finite quota.
+func (k *Kernel) cpuBandwidthLimited() bool {
+	return bandwidthCountersOf(k).limited.Load() != 0
+}
+
+// cpuBandwidthThrottled returns true while a cgroup of the Kernel of t holds
+// its tasks back.
+func (t *Task) cpuBandwidthThrottled() bool {
+	return t.bandwidthCounters().throttled.Load() != 0
+}
+
 // accountCPUBandwidth runs once for each CPU clock tick while a cgroup has a
 // quota. It charges the time that each task ran since its last charge to the
 // budget of the cgroup of the task, and to the budget of every ancestor with a
@@ -52,7 +73,8 @@ func (t *Task) cpuBandwidth() *CPUBandwidth {
 // Preconditions: The caller must be the CPU clock ticker.
 func (k *Kernel) accountCPUBandwidth(all []*Task) {
 	now := meterNow()
-	gen := cpuBillingGeneration.Load()
+	counters := bandwidthCountersOf(k)
+	gen := counters.generation.Load()
 	var stack [32]bandwidthRun
 	runs := stack[:0]
 	for _, t := range all {
@@ -77,7 +99,7 @@ func (k *Kernel) accountCPUBandwidth(all []*Task) {
 		m.billed, m.billedAt = cur, now
 	}
 	chargeBandwidthRuns(now, runs)
-	if cpuBandwidthThrottled.Load() == 0 {
+	if counters.throttled.Load() == 0 {
 		return
 	}
 	for _, t := range all {

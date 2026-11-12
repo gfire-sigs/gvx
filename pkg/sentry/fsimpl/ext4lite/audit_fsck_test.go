@@ -16,6 +16,7 @@ package ext4lite
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -187,5 +188,31 @@ func TestAuditFsckKeepsADirectoryThatTwoEntriesName(t *testing.T) {
 	}
 	if got.Tree["/two"] != nil {
 		t.Errorf("the second name of the directory is still there")
+	}
+}
+
+// TestAuditFsckRecountsASharedXattrBlock mimics a crash after an inode that
+// shared an xattr block went away without a write of the count. Two inodes name
+// the block, and its header counts three, then one. The mount must set the
+// count to two. A count that stays too high leaks the block after the last
+// name goes, and a count that is too low frees a block that an inode names.
+func TestAuditFsckRecountsASharedXattrBlock(t *testing.T) {
+	for _, stale := range []uint32{1, 3} {
+		t.Run(fmt.Sprintf("header counts %d", stale), func(t *testing.T) {
+			base, acl := auSharedXattrImage(t)
+			legacy := auDowngrade(t, base)
+			var sb [2]byte
+			legacy.readAt(sb[:], 1024+0x3A)
+			auLE.PutUint16(sb[:], auLE.Uint16(sb[:])&^1)
+			legacy.writeAt(sb[:], 1024+0x3A)
+			var count [4]byte
+			auLE.PutUint32(count[:], stale)
+			legacy.writeAt(count[:], int64(acl)*auBlock+4)
+
+			_, notes := auMountLegacy(t, legacy)
+			if len(notes) == 0 {
+				t.Error("the mount did not report the repair of the reference count")
+			}
+		})
 	}
 }

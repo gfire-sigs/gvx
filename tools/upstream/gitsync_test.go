@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -271,5 +272,56 @@ func TestArchiveSourceBuildsArchiveFromLocalGit(t *testing.T) {
 	_, err = ArchiveSource{CacheDir: t.TempDir(), GitDir: repo, Offline: true}.Load(context.Background(), missing)
 	if !errors.Is(err, errArchiveMissing) {
 		t.Fatalf("Load of an absent commit err = %v, want %v", err, errArchiveMissing)
+	}
+}
+
+// readManifestFile parses tools/upstream/sync_manifest.json of the fork.
+func readManifestFile(t *testing.T, fork string) SyncManifest {
+	t.Helper()
+	var m SyncManifest
+	if err := json.Unmarshal([]byte(readTestFile(t, fork, "tools/upstream/sync_manifest.json")), &m); err != nil {
+		t.Fatalf("parse sync_manifest.json: %v", err)
+	}
+	return m
+}
+
+func TestGitSyncRecordsNewestReleaseTagOfUpstream(t *testing.T) {
+	isolateGit(t)
+	upstream, fork, _ := newFork(t)
+	writeTestFile(t, upstream, "pkg/log/log.go", "package log\n\nfunc Warn() {}\n")
+	gitCommitAll(t, upstream, "upstream 2")
+	runGit(t, upstream, "tag", "release-20260101.2")
+	tagSHA := runGit(t, upstream, "rev-parse", "HEAD")
+	runGit(t, upstream, "tag", "release-20260101.10")
+
+	var log []string
+	manifest, err := GitSync(context.Background(), gitSyncConfig(t, upstream, fork, &log))
+	if err != nil {
+		t.Fatalf("GitSync: %v (log: %v)", err, log)
+	}
+	if manifest.ReleaseTag != "release-20260101.10" || manifest.ReleaseTagSHA != tagSHA {
+		t.Errorf("manifest release = %q %q, want release-20260101.10 %s", manifest.ReleaseTag, manifest.ReleaseTagSHA, tagSHA)
+	}
+	if got := readManifestFile(t, fork); got.ReleaseTag != "release-20260101.10" {
+		t.Errorf("sync_manifest.json release_tag = %q, want release-20260101.10", got.ReleaseTag)
+	}
+}
+
+func TestGitSyncPreservesReleaseTagWhenUpstreamHasNone(t *testing.T) {
+	isolateGit(t)
+	upstream, fork, sha1 := newFork(t)
+	writeTestFile(t, fork, "tools/upstream/sync_manifest.json",
+		`{"go_branch_sha": "`+sha1+`", "release_tag": "release-20250101.3", "release_tag_sha": "`+sha1+`"}`+"\n")
+	gitCommitAll(t, fork, "record release tag")
+	writeTestFile(t, upstream, "pkg/log/log.go", "package log\n\nfunc Warn() {}\n")
+	gitCommitAll(t, upstream, "upstream 2")
+
+	var log []string
+	if _, err := GitSync(context.Background(), gitSyncConfig(t, upstream, fork, &log)); err != nil {
+		t.Fatalf("GitSync: %v (log: %v)", err, log)
+	}
+	got := readManifestFile(t, fork)
+	if got.ReleaseTag != "release-20250101.3" || got.ReleaseTagSHA != sha1 {
+		t.Errorf("sync_manifest.json release = %q %q, want the previous tag release-20250101.3 %s", got.ReleaseTag, got.ReleaseTagSHA, sha1)
 	}
 }

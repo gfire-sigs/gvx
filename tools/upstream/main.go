@@ -207,6 +207,8 @@ func printReport(w io.Writer, r AuditReport, maxRatio float64) {
 	fmt.Fprintf(w, "tier3 (upstream):  files=%d pristine=%d format-only=%d build-expand=%d seams=%d added=%d tests-added=%d\n",
 		r.Tier3Count, r.Pristine, r.Format, r.Expand, r.Seam, r.Added, r.TestsAdded)
 	fmt.Fprintf(w, "tier3 linux fences=%d (machine-derived, SPEC 2.3 retag)\n", r.Fence)
+	fmt.Fprintf(w, "non-go (c/h/S/proto): pristine=%d protected=%d added=%d missing=%d (outside the budget)\n",
+		r.NonGoPristine, r.NonGoProtected, r.NonGoAdded, r.NonGoMissing)
 	fmt.Fprintf(w, "budget: touched=%d/%d (%.2f%% of limit %.2f%%); strict with fences=%.2f%%\n",
 		r.Budgeted, r.UpstreamBaseline, r.BudgetedRatio*100, maxRatio*100, r.StrictRatio*100)
 	for i, f := range r.AddedFiles {

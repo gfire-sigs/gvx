@@ -20,7 +20,10 @@ rm -rf "$base"
 cp -r /workspace "$base"
 chmod +x "$base/pjdfstest"
 for suite in "$@"; do
-	[ -d "$base/tests/$suite" ] || continue
+	if [ ! -d "$base/tests/$suite" ]; then
+		printf 'guest-run.sh: suite directory %s does not exist\n' "$base/tests/$suite" >&2
+		exit 2
+	fi
 	mkdir -p "/mnt/vol/work/$suite"
 	cd "/mnt/vol/work/$suite"
 	for t in "$base/tests/$suite"/*.t; do

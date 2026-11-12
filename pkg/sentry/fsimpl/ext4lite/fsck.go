@@ -16,6 +16,7 @@ package ext4lite
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -190,6 +191,8 @@ func (v *volume) fsckLite() error {
 		return n, nil
 	}
 	xattrOwned := make(map[uint64]bool)
+	// xattrRefs counts the live inodes that name each xattr block.
+	xattrRefs := make(map[uint64]uint32)
 	take := func(n *node, parent uint32) error {
 		var runs []run
 		for _, e := range n.exts {
@@ -215,6 +218,7 @@ func (v *volume) fsckLite() error {
 		}
 		if n.fileACL != 0 {
 			xattrOwned[n.fileACL] = true
+			xattrRefs[n.fileACL]++
 		}
 		info := &fsckInode{mode: n.mode, links: n.links, parent: parent}
 		if zeroOnDisk[n.ino] {
@@ -295,6 +299,9 @@ func (v *volume) fsckLite() error {
 	// The rebuild runs first. A removal of an entry can free the last block of
 	// a directory, and it checks the bitmap that the rebuild writes.
 	if err := v.rebuildFromWalk(seen, claimed); err != nil {
+		return err
+	}
+	if err := v.repairXattrRefcounts(xattrRefs); err != nil {
 		return err
 	}
 	for _, dr := range drops {
@@ -424,6 +431,36 @@ func (v *volume) rebuildFromWalk(seen map[uint32]*fsckInode, claimed []bitmap) e
 				return n.setParent(parent)
 			})
 		}
+	}
+	return nil
+}
+
+// repairXattrRefcounts sets the reference count in the header of each xattr
+// block to the number of live inodes that name the block. A crash can free an
+// inode that shared a block without a write of the count. A count that stays
+// too high keeps the block allocated after its last name went. A count that
+// is too low frees it while an inode still names it. The mount has loaded no
+// inode yet, so the write of the header cannot meet a cached share. A block
+// with a bad header is left for the lazy check of the inode.
+func (v *volume) repairXattrRefcounts(refs map[uint64]uint32) error {
+	var hdr [8]byte
+	for _, blk := range slices.Sorted(maps.Keys(refs)) {
+		off := int64(blk) * blockSize
+		if _, err := v.hf.ReadAt(hdr[:], off); err != nil {
+			return hostError(err)
+		}
+		if le.Uint32(hdr[0:]) != xattrMagic {
+			continue
+		}
+		have, want := le.Uint32(hdr[4:]), refs[blk]
+		if have == want {
+			continue
+		}
+		le.PutUint32(hdr[4:], want)
+		if _, err := v.hf.WriteAt(hdr[4:], off+4); err != nil {
+			return hostError(err)
+		}
+		v.repairNotes = append(v.repairNotes, fmt.Sprintf("set the reference count of xattr block %d from %d to %d", blk, have, want))
 	}
 	return nil
 }

@@ -49,8 +49,13 @@ type cpuMeter struct {
 	// Only the task goroutine uses it.
 	skipToApp bool `state:"nosave"`
 
-	// billedGen is the value of cpuBillingGeneration when billed was set.
+	// billedGen is the value of cpuBandwidthCounters.generation when billed was
+	// set.
 	billedGen int32 `state:"nosave"`
+
+	// counters caches the bandwidth counters of the Kernel of the task. The
+	// first use sets them.
+	counters atomic.Pointer[cpuBandwidthCounters] `state:"nosave"`
 }
 
 // saveTotal is invoked by stateify.

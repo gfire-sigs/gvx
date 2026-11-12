@@ -181,25 +181,27 @@ func TestCPUBandwidthSaveLoadRoundTrip(t *testing.T) {
 	savedBytes := saveBuf.Bytes()
 
 	// Loading without ActivateRestored must not increment global counters or leak timers.
-	baseLim := cpuBandwidthLimited.Load()
-	baseThr := cpuBandwidthThrottled.Load()
+	restoredKernel := testKernel(t)
+	counters := bandwidthCountersOf(restoredKernel)
+	baseLim := counters.limited.Load()
+	baseThr := counters.throttled.Load()
 	var unactivated [2]*CPUBandwidth
 	if _, err := state.Load(context.Background(), bytes.NewReader(savedBytes), &unactivated); err != nil {
 		t.Fatalf("state.Load(unactivated): %v", err)
 	}
-	if got := cpuBandwidthLimited.Load(); got != baseLim {
+	if got := counters.limited.Load(); got != baseLim {
 		t.Fatalf("cpuBandwidthLimited after state.Load = %d, want %d before ActivateRestored", got, baseLim)
 	}
-	if got := cpuBandwidthThrottled.Load(); got != baseThr {
+	if got := counters.throttled.Load(); got != baseThr {
 		t.Fatalf("cpuBandwidthThrottled after state.Load = %d, want %d before ActivateRestored", got, baseThr)
 	}
 	// Releasing unactivated nodes must keep global counters unchanged.
-	unactivated[1].SetLimits(-1, period)
-	unactivated[0].SetLimits(-1, period)
-	if got := cpuBandwidthLimited.Load(); got != baseLim {
+	unactivated[1].SetLimits(restoredKernel, -1, period)
+	unactivated[0].SetLimits(restoredKernel, -1, period)
+	if got := counters.limited.Load(); got != baseLim {
 		t.Fatalf("cpuBandwidthLimited after unactivated release = %d, want %d", got, baseLim)
 	}
-	if got := cpuBandwidthThrottled.Load(); got != baseThr {
+	if got := counters.throttled.Load(); got != baseThr {
 		t.Fatalf("cpuBandwidthThrottled after unactivated release = %d, want %d", got, baseThr)
 	}
 
@@ -209,16 +211,16 @@ func TestCPUBandwidthSaveLoadRoundTrip(t *testing.T) {
 	}
 	loadedParent, loadedChild := loaded[0], loaded[1]
 	t.Cleanup(func() {
-		loadedChild.SetLimits(-1, period)
-		loadedParent.SetLimits(-1, period)
+		loadedChild.SetLimits(restoredKernel, -1, period)
+		loadedParent.SetLimits(restoredKernel, -1, period)
 	})
 	now := BandwidthNow()
-	loadedParent.ActivateRestored(now)
-	loadedChild.ActivateRestored(now)
-	if got, want := cpuBandwidthLimited.Load(), baseLim+2; got != want {
+	loadedParent.ActivateRestored(restoredKernel, now)
+	loadedChild.ActivateRestored(restoredKernel, now)
+	if got, want := counters.limited.Load(), baseLim+2; got != want {
 		t.Errorf("cpuBandwidthLimited after ActivateRestored = %d, want %d", got, want)
 	}
-	if got, want := cpuBandwidthThrottled.Load(), baseThr+1; got != want {
+	if got, want := counters.throttled.Load(), baseThr+1; got != want {
 		t.Errorf("cpuBandwidthThrottled after ActivateRestored = %d, want %d", got, want)
 	}
 
@@ -236,7 +238,7 @@ func TestCPUBandwidthSaveLoadRoundTrip(t *testing.T) {
 	}
 
 	// Raise quota to unthrottle and verify throttled period accounting survives.
-	loadedChild.SetLimits(200*time.Millisecond, period)
+	loadedChild.SetLimits(restoredKernel, 200*time.Millisecond, period)
 	if loadedChild.Throttled() {
 		t.Error("loadedChild remained throttled after quota increase")
 	}
