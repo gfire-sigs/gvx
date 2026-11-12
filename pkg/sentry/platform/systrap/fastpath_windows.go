@@ -611,6 +611,21 @@ func (th *thread) inIslandPC(pc uint64) bool {
 	return as != nil && as.inIsland(pc)
 }
 
+// stopPin returns the address of the slot that holds the program counter of
+// the stopped thread, or 0 when the program counter lies outside every slot.
+// Callers hold th.mu.
+func (th *thread) stopPin() uint64 {
+	as := th.sp.owner.Load()
+	if as == nil {
+		return 0
+	}
+	_, slotVA, ok := as.slotContaining(th.ctx.pc())
+	if !ok {
+		return 0
+	}
+	return slotVA
+}
+
 // rewindToSite moves a thread that stopped at the first instruction of a slot
 // back to the instruction that jumps to the slot. The slot has not run, so the
 // registers are the guest registers, and the jump enters the slot again. For a

@@ -14,8 +14,8 @@ var errClosedHostHandle = errors.New("host handle is closed")
 
 // HostHandle wraps a macOS file descriptor with explicit single-owner Close and Release semantics.
 type HostHandle struct {
-	raw    atomic.Int64
-	closed atomic.Bool
+	raw   atomic.Int64
+	guard handleGuard
 }
 
 // NewHostHandle wraps an open macOS file descriptor.
@@ -38,8 +38,10 @@ func OpenHostPath(path string, flags int, mode uint32) (*HostHandle, error) {
 }
 
 // RawHandle returns the underlying file descriptor as uintptr.
+// The caller must not use the value after it closes or releases h. ReadAt, WriteAt, and Dup
+// hold the handle open for the length of the call, and RawHandle does not.
 func (h *HostHandle) RawHandle() (uintptr, error) {
-	if h == nil || h.closed.Load() {
+	if h == nil || h.guard.isClosed() {
 		return 0, errClosedHostHandle
 	}
 	return uintptr(h.raw.Load()), nil
@@ -47,25 +49,27 @@ func (h *HostHandle) RawHandle() (uintptr, error) {
 
 // ReadAt reads from the descriptor at offset without mutating file seek state.
 func (h *HostHandle) ReadAt(p []byte, off int64) (int, error) {
-	raw, err := h.RawHandle()
-	if err != nil {
-		return 0, err
+	if h == nil || !h.guard.enter() {
+		return 0, errClosedHostHandle
 	}
+	defer h.guard.exit()
+	raw := h.raw.Load()
 	return unix.Pread(int(raw), p, off)
 }
 
 // WriteAt writes to the descriptor at offset without mutating file seek state.
 func (h *HostHandle) WriteAt(p []byte, off int64) (int, error) {
-	raw, err := h.RawHandle()
-	if err != nil {
-		return 0, err
+	if h == nil || !h.guard.enter() {
+		return 0, errClosedHostHandle
 	}
+	defer h.guard.exit()
+	raw := h.raw.Load()
 	return unix.Pwrite(int(raw), p, off)
 }
 
 // Release transfers ownership of the underlying descriptor to the caller without closing it.
 func (h *HostHandle) Release() (uintptr, error) {
-	if h == nil || h.closed.Swap(true) {
+	if h == nil || !h.guard.shut() {
 		return 0, errClosedHostHandle
 	}
 	raw := h.raw.Swap(-1)
@@ -74,13 +78,14 @@ func (h *HostHandle) Release() (uintptr, error) {
 
 // Dup duplicates the underlying macOS file descriptor with F_DUPFD_CLOEXEC and returns a new owned HostHandle.
 func (h *HostHandle) Dup() (*HostHandle, error) {
-	raw, err := h.RawHandle()
-	if err != nil {
-		return nil, err
+	if h == nil || !h.guard.enter() {
+		return nil, errClosedHostHandle
 	}
+	defer h.guard.exit()
+	raw := h.raw.Load()
 	// F_DUPFD_CLOEXEC sets close-on-exec atomically, so a concurrent fork and
 	// exec never inherits the new descriptor.
-	dupFD, err := unix.FcntlInt(raw, unix.F_DUPFD_CLOEXEC, 0)
+	dupFD, err := unix.FcntlInt(uintptr(raw), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("fcntl(F_DUPFD_CLOEXEC) fd %d: %w", raw, err)
 	}
@@ -89,7 +94,7 @@ func (h *HostHandle) Dup() (*HostHandle, error) {
 
 // Close closes the underlying macOS file descriptor idempotently.
 func (h *HostHandle) Close() error {
-	if h == nil || h.closed.Swap(true) {
+	if h == nil || !h.guard.shut() {
 		return nil
 	}
 	raw := h.raw.Swap(-1)

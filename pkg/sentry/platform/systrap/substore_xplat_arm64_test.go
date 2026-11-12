@@ -18,12 +18,15 @@ package systrap
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
+	"z.gfire.dev/gvx/pkg/sentry/platform/systrap/sysmsg"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
@@ -278,5 +281,96 @@ func TestCrossLayerSharedCompositeRefresh(t *testing.T) {
 	reader.beforeSwitch(nil, pop)
 	if got := hb.comp.buf[:len(wantEmulated)]; !bytes.Equal(got, wantEmulated) {
 		t.Fatalf("composite page0 after emulated store = %v, want %v", got, wantEmulated)
+	}
+}
+
+// TestStoreCrossingIntoAnotherPageReportsThatPage runs a 16-byte store that
+// starts in a writable guest page of a composite block and ends in the next
+// page. The next page is read-only, as a page that waits for copy on write is,
+// or it is unmapped. The layer must report a write fault at the start of the
+// next page. A fault at the start of the store would let the memory manager
+// resolve the writable page, and the thread would fault again for ever. A
+// SIGSEGV without a fault report would stop a guest that Linux serves.
+func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
+	const (
+		dataAddr = hostarch.Addr(0x400000)
+		codeAddr = hostarch.Addr(0x500000)
+		stpX1X2  = 0xa9000801 // stp x1, x2, [x0]
+	)
+	for _, tc := range []struct {
+		name     string
+		nextPage *hostarch.AccessType
+		wantCode int32
+	}{
+		{"read-only next page", &hostarch.Read, segvAccerr},
+		{"unmapped next page", nil, segvMaperr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mf, err := createMemoryFile()
+			if err != nil {
+				t.Fatalf("createMemoryFile: %v", err)
+			}
+			defer mf.Destroy()
+			fr, err := mf.Allocate(3*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+			if err != nil {
+				t.Fatalf("Allocate: %v", err)
+			}
+			defer mf.DecRef(fr)
+			page := func(i uint64) memmap.FileRange {
+				return memmap.FileRange{Start: fr.Start + i*hostarch.PageSize, End: fr.Start + (i+1)*hostarch.PageSize}
+			}
+			bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+			if err != nil {
+				t.Fatalf("MapInternal: %v", err)
+			}
+			mem := bs.Head().ToSlice()
+			binary.LittleEndian.PutUint32(mem[2*hostarch.PageSize:], stpX1X2)
+
+			layer := newSubBlockLayer(fakeCompBlockHost{})
+			defer layer.reset()
+			if err := layer.mapFile(dataAddr, mf, page(0), hostarch.ReadWrite, false); err != nil {
+				t.Fatalf("mapFile of the writable page: %v", err)
+			}
+			if tc.nextPage != nil {
+				if err := layer.mapFile(dataAddr+hostarch.PageSize, mf, page(1), *tc.nextPage, false); err != nil {
+					t.Fatalf("mapFile of the next page: %v", err)
+				}
+			}
+			if err := layer.mapFile(codeAddr, mf, page(2), hostarch.AccessType{Read: true, Execute: true}, false); err != nil {
+				t.Fatalf("mapFile of the code page: %v", err)
+			}
+			layer.beforeSwitch(nil, noopSubBlockPopulator{})
+
+			ac := arch.New(arch.Host)
+			ac.SetIP(uintptr(codeAddr))
+			storeAddr := uint64(dataAddr) + hostarch.PageSize - 8
+			regs := &ac.StateData().Regs
+			regs.Regs[0], regs.Regs[1], regs.Regs[2] = storeAddr, 0x1111111111111111, 0x2222222222222222
+
+			var ctx platformContext
+			ctx.sharedContext.Store(&sharedContext{shared: &sysmsg.ThreadContext{}})
+			ctx.signalInfo = linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
+			ctx.signalInfo.SetAddr(storeAddr)
+			si, at := ctx.signalInfo, hostarch.Write
+			subproc := subprocess{subBlocks: layer}
+			if subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+				t.Fatal("resolveSubBlockFault = true, want a report to the memory manager")
+			}
+			if !at.Write {
+				t.Errorf("access = %v, want a write fault, so that the memory manager runs", at)
+			}
+			if got, want := si.Addr(), uint64(dataAddr)+hostarch.PageSize; got != want {
+				t.Errorf("fault address = %#x, want %#x: the start of the page that blocks the store", got, want)
+			}
+			if si.Code != tc.wantCode {
+				t.Errorf("si_code = %d, want %d", si.Code, tc.wantCode)
+			}
+			if got := ac.IP(); got != uintptr(codeAddr) {
+				t.Errorf("IP = %#x, want %#x: the store did not run", got, uintptr(codeAddr))
+			}
+			if !bytes.Equal(mem[hostarch.PageSize-8:hostarch.PageSize], make([]byte, 8)) {
+				t.Errorf("a refused store changed the writable page")
+			}
+		})
 	}
 }

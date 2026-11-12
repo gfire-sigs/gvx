@@ -167,7 +167,11 @@ func TestRemapOfTheSameRangeMakesNoStage2Call(t *testing.T) {
 	}
 }
 
-func TestReplacementKeepsBothRegionsUntilRelease(t *testing.T) {
+// A replacement of the only mapping of a region leaves nothing that names the
+// old memory, so the region of the old file leaves Stage-2 with the call. A
+// stale translation cannot reach the old memory, because MapFile stops the
+// vCPUs first.
+func TestReplacementReleasesTheOldRegion(t *testing.T) {
 	vm, be := newFakeVM(t)
 	as, err := newAddressSpace(vm)
 	if err != nil {
@@ -187,13 +191,15 @@ func TestReplacementKeepsBothRegionsUntilRelease(t *testing.T) {
 	if !ok || ipaB == ipaA {
 		t.Fatalf("the replacement maps %#x (mapped=%v), want a new address, not %#x", ipaB, ok, ipaA)
 	}
-	if _, unmaps := be.counts(); unmaps != 0 {
-		t.Errorf("the replacement made %d hv_vm_unmap calls, want 0", unmaps)
+	if _, unmaps := be.counts(); unmaps != 1 {
+		t.Errorf("the replacement made %d hv_vm_unmap calls, want 1: the region of the old file", unmaps)
 	}
-	// Nothing maps the old memory after Release, so its region goes with the address space.
+	if got := vm.regions.regionCount(); got != 1 {
+		t.Errorf("regions after the replacement = %d, want only the region of the new file", got)
+	}
 	as.Release()
 	if _, unmaps := be.counts(); unmaps != 2 {
-		t.Errorf("Release made %d hv_vm_unmap calls, want 2: one per file", unmaps)
+		t.Errorf("Release made %d hv_vm_unmap calls in total, want 2: one per file", unmaps)
 	}
 	if got := vm.regions.regionCount(); got != 0 {
 		t.Errorf("regions after Release = %d, want 0", got)
@@ -260,8 +266,13 @@ func TestUnmapOfAWideRangeClearsDistantMappings(t *testing.T) {
 			t.Errorf("the page at %#x survived an Unmap of the whole user range", uint64(va))
 		}
 	}
-	if _, unmaps := be.counts(); unmaps != baseUnmaps {
-		t.Errorf("Unmap made %d hv_vm_unmap calls, want 0", unmaps-baseUnmaps)
+	// Four mappings share one region. The region leaves Stage-2 with the last
+	// mapping, and not before.
+	if _, unmaps := be.counts(); unmaps != baseUnmaps+1 {
+		t.Errorf("Unmap made %d hv_vm_unmap calls, want 1: the region of the file", unmaps-baseUnmaps)
+	}
+	if got := vm.regions.regionCount(); got != 0 {
+		t.Errorf("regions after the unmap = %d, want 0", got)
 	}
 	// An empty address space handles the same call at once.
 	as.Unmap(0, ^uint64(0))
@@ -286,5 +297,46 @@ func TestMapFileRejectsRangesOutsideTheUserAddressSpace(t *testing.T) {
 	}
 	if err := as.MapFile(0x400000, file, memmap.FileRange{Start: 0, End: pageSize4K}, hostarch.NoAccess, false); !errors.As(err, &segv) {
 		t.Errorf("a mapping without access: MapFile = %v, want SegmentationFault", err)
+	}
+}
+
+// An Unmap of a part of a mapping keeps the region while another page names it.
+// The last page that names it frees it.
+func TestUnmapKeepsARegionWhileAPageNamesIt(t *testing.T) {
+	vm, be := newFakeVM(t)
+	as := newFakeAddressSpace(t, vm)
+	file := &plainFile{mem: alignedMem(1 << 20)}
+	fr := memmap.FileRange{Start: 0, End: 16 * pageSize4K}
+	if err := as.MapFile(bigVA, file, fr, hostarch.ReadWrite, false); err != nil {
+		t.Fatal(err)
+	}
+	_, base := be.counts()
+	as.Unmap(bigVA, 8*pageSize4K)
+	if _, unmaps := be.counts(); unmaps != base {
+		t.Fatalf("a partial Unmap made %d hv_vm_unmap calls, want 0: eight pages still name the region", unmaps-base)
+	}
+	as.Unmap(bigVA+8*pageSize4K, 8*pageSize4K)
+	if _, unmaps := be.counts(); unmaps != base+1 {
+		t.Errorf("the last Unmap made %d hv_vm_unmap calls, want 1", unmaps-base)
+	}
+	if got := vm.regions.regionCount(); got != 0 {
+		t.Errorf("regions after the last Unmap = %d, want 0", got)
+	}
+}
+
+// A mapping of a memory file range never releases the region of the file,
+// because the file outlives its mappings. This keeps a fault of 4 MiB free of
+// hypervisor calls.
+func TestUnmapKeepsTheRegionOfAMemoryFile(t *testing.T) {
+	vm, _ := newFakeVM(t)
+	as := newFakeAddressSpace(t, vm)
+	file := newTestChunkFile(1, 16<<20)
+	if err := as.MapFile(bigVA, file, memmap.FileRange{Start: 0, End: fourMiB}, hostarch.ReadWrite, false); err != nil {
+		t.Fatal(err)
+	}
+	want := vm.regions.regionCount()
+	as.Unmap(bigVA, fourMiB)
+	if got := vm.regions.regionCount(); got != want {
+		t.Errorf("regions after Unmap of a memory file = %d, want %d", got, want)
 	}
 }

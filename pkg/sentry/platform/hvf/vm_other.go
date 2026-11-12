@@ -27,6 +27,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // Hypervisor.framework exists only on macOS. Every entry point of this file
@@ -61,6 +62,14 @@ func (*vmState) FreePage([]byte, uint64) {}
 func (*vmState) resolveMemory(*regionUser, memmap.File, safemem.BlockSeq, bool) ([]segment, error) {
 	return nil, errUnsupportedOS
 }
+
+func (*vmState) resolveMemoryPinned(*regionUser, memmap.File, safemem.BlockSeq, bool) ([]segment, error) {
+	return nil, errUnsupportedOS
+}
+
+func (*vmState) finishPin([]segment, []*hvcommon.Region, []*hvcommon.Region) {}
+
+func (*vmState) releaseRegions([]*hvcommon.Region) {}
 
 func (*vmState) releaseMemory(*regionUser) {}
 

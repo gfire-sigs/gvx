@@ -190,8 +190,12 @@ func (th *thread) park(ev debugEvent) error {
 	th.parked = true
 	if f := th.fast.Load(); f != nil {
 		// The thread is suspended, and resumeParked replaces its registers, so
-		// it cannot be inside a slot until it runs again.
-		f.slot.reader.goOffline(0)
+		// it cannot be inside a slot until it runs again. A thread that stops
+		// inside a slot, such as a fault in a relocated instruction of a
+		// post-window slot, reports the slot address, and the Sentry can
+		// start the thread there again. The pin keeps the slot until the
+		// thread stops somewhere else.
+		f.slot.reader.goOffline(th.stopPin())
 	}
 	if err := th.sp.p.dbg.reply(ev); err != nil {
 		return th.ctxErr("NtDebugContinue", err)

@@ -22,13 +22,17 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 var errNoAddressSpace = errors.New("hvf: the memory manager has no hvf address space")
 
 // AddressSpace implements platform.AddressSpace. Stage-1 maps 4KB pages with
-// exact permissions over whole contiguous host ranges. Stage-2 regions stay
-// mapped after Unmap, so MapFile and Unmap change only Stage-1 tables.
+// exact permissions over whole contiguous host ranges. Stage-2 regions of a
+// memory file stay mapped after Unmap, so MapFile and Unmap of such memory
+// change only Stage-1 tables. Unmap releases the region of any other file when
+// no mapping of the address space names it, which also frees its private copy
+// of read-only memory.
 //
 // The guest reaches only the memory that a Stage-1 descriptor names. Unmap and
 // each replacement of a mapping stop every vCPU that can hold the old
@@ -40,8 +44,9 @@ type AddressSpace struct {
 	pt *stage1Tables
 
 	mu sync.Mutex
-	// regions are the Stage-2 regions that this address space may map. Release
-	// drops them after no vCPU can run the page tables.
+	// regions are the Stage-2 regions that this address space uses. Unmap drops
+	// the regions of unmapped ranges, and Release drops the rest after no vCPU
+	// can run the page tables.
 	regions  regionUser
 	released bool
 }
@@ -88,28 +93,38 @@ func (as *AddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	if as.released {
 		return platform.SegmentationFault{Addr: addr}
 	}
-	segs, err := as.vm.resolveMemory(&as.regions, f, bs, at.Write)
+	segs, err := as.vm.resolveMemoryPinned(&as.regions, f, bs, at.Write)
 	if err != nil {
 		return err
 	}
+	var acquired, dropped []*hvcommon.Region
 	invalidated := false
 	// A replaced mapping can leave a stale translation in a running vCPU. The
 	// caller can reuse the old memory when MapFile returns, so MapFile waits
-	// for those vCPUs even when it fails after a partial change.
+	// for those vCPUs even when it fails after a partial change. Only then
+	// can finishPin free the regions that no mapping names any more.
 	defer func() {
 		if invalidated {
 			as.settle()
 		}
+		as.vm.finishPin(segs, acquired, dropped)
 	}()
 	va := uint64(addr)
 	for _, s := range segs {
 		inv, err := as.pt.mapRange(va, s.GPA, s.Size, at)
 		invalidated = invalidated || inv
 		if err != nil {
+			// The tables can name a part of the range. Remove it, so that no
+			// entry names a region that finishPin frees.
+			if as.pt.unmapRange(uint64(addr), length) {
+				invalidated = true
+			}
+			dropped = as.regions.ClearRange(uint64(addr), end)
 			return err
 		}
 		va += s.Size
 	}
+	acquired, dropped = as.regions.RecordRuns(uint64(addr), segs)
 	return nil
 }
 
@@ -129,6 +144,10 @@ func (as *AddressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if as.pt.unmapRange(start, end-start) {
 		as.settle()
 	}
+	// No vCPU translates the range now, so a region that only this range
+	// named can leave Stage-2. A region of a memory file stays, because the
+	// file outlives its mappings.
+	as.vm.releaseRegions(as.regions.ClearRange(start, end))
 }
 
 // Release implements platform.AddressSpace.Release. It frees the page tables

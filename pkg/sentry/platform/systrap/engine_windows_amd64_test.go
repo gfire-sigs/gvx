@@ -25,6 +25,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
@@ -687,4 +688,133 @@ func TestHiddenSyscallInImmediateTrapsInteriorJumpAndPreservesFallthrough(t *tes
 			t.Fatalf("int 0x2e Rip = %#x, want %#x", got, intVA)
 		}
 	})
+}
+
+// TestGSStoreIntoReadOnlyViewFaults runs a trapped store through %gs into a
+// page that the stub maps read-only. The store must raise a write fault at the
+// address, so that the memory manager can copy the page on write, and must
+// leave the shared frame unchanged. A direct WriteProcessMemory call writes the
+// frame without any fault. This test is verified by the Windows CI job.
+func TestGSStoreIntoReadOnlyViewFaults(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	page := r.mapPage(dataVA, hostarch.Read)
+	store64(page[0x30:], 0x1111_2222_3333_4444)
+
+	var prog []byte
+	prog = append(prog, imm64([]byte{0x48, 0xB8}, dataVA)...)                // mov rax, dataVA
+	prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD8)                        // wrgsbase rax
+	prog = append(prog, imm64([]byte{0x49, 0xBD}, 0xDEAD_BEEF_CAFE_0001)...) // mov r13, value
+	storeSite := codeVA + uint64(len(prog))
+	prog = append(prog, 0x65, 0x4C, 0x89, 0x2C, 0x25, 0x30, 0, 0, 0) // mov gs:[0x30], r13
+	prog = append(prog, gSyscall(93)...)
+	r.program(prog)
+
+	si, at, err := r.run()
+	wantSignal(t, si, err, linux.SIGSEGV)
+	if !at.Write {
+		t.Errorf("fault access = %v, want a write", at)
+	}
+	if got, want := si.Addr(), uint64(dataVA)+0x30; got != want {
+		t.Errorf("fault address = %#x, want %#x", got, want)
+	}
+	if got := regPC(r.ac); got != storeSite {
+		t.Errorf("fault pc = %#x, want %#x", got, storeSite)
+	}
+	if got := load64(page[0x30:]); got != 0x1111_2222_3333_4444 {
+		t.Errorf("a store through a read-only view changed the frame to %#x", got)
+	}
+}
+
+// TestGSStoreReportsFirstReadOnlyPage runs a trapped store through %gs that
+// starts in a writable page and ends in a read-only one. The fault address
+// must lie in the read-only page, or the memory manager resolves the writable
+// page and the thread repeats the store forever. No byte may change.
+func TestGSStoreReportsFirstReadOnlyPage(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	fr, mem := r.allocFrames(2)
+	r.mapRange(dataVA, memmap.FileRange{Start: fr.Start, End: fr.Start + blockSize}, hostarch.ReadWrite)
+	r.mapRange(dataVA+blockSize, memmap.FileRange{Start: fr.Start + blockSize, End: fr.End}, hostarch.Read)
+
+	disp := uint16(blockSize - 4)
+	var prog []byte
+	prog = append(prog, imm64([]byte{0x48, 0xB8}, dataVA)...)                          // mov rax, dataVA
+	prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD8)                                  // wrgsbase rax
+	prog = append(prog, imm64([]byte{0x49, 0xBD}, 0xDEAD_BEEF_CAFE_0001)...)           // mov r13, value
+	prog = append(prog, 0x65, 0x4C, 0x89, 0x2C, 0x25, byte(disp), byte(disp>>8), 0, 0) // mov gs:[disp], r13
+	prog = append(prog, gSyscall(93)...)
+	r.program(prog)
+
+	si, at, err := r.run()
+	wantSignal(t, si, err, linux.SIGSEGV)
+	if !at.Write {
+		t.Errorf("fault access = %v, want a write", at)
+	}
+	if got, want := si.Addr(), uint64(dataVA)+blockSize; got != want {
+		t.Errorf("fault address = %#x, want %#x", got, want)
+	}
+	if got := load64(mem[disp:]); got != 0 {
+		t.Errorf("a partial store changed the writable page to %#x", got)
+	}
+}
+
+// TestWRFSBASEZeroClearsTheHardwareBase sets a non-zero FS base with WRFSBASE
+// and then writes zero. A read through %fs afterwards must fault at the low
+// address. A stale hardware base would let the read succeed.
+func TestWRFSBASEZeroClearsTheHardwareBase(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	page := r.mapPage(dataVA, hostarch.ReadWrite)
+	store64(page, 0x1234)
+
+	var prog []byte
+	prog = append(prog, imm64([]byte{0x48, 0xB8}, dataVA)...)     // mov rax, dataVA
+	prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD0)             // wrfsbase rax
+	prog = append(prog, 0x31, 0xC0)                               // xor eax, eax
+	prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD0)             // wrfsbase rax
+	prog = append(prog, 0x64, 0x48, 0x8B, 0x1C, 0x25, 0, 0, 0, 0) // mov rbx, fs:[0]
+	prog = append(prog, gSyscall(93)...)
+	r.program(prog)
+
+	si, _, err := r.run()
+	wantSignal(t, si, err, linux.SIGSEGV)
+	if got := si.Addr(); got != 0 {
+		t.Errorf("fault address = %#x, want 0", got)
+	}
+	if got := regAcc(r.ac); got == 0x1234 {
+		t.Errorf("the read through a zero FS base returned the old data")
+	}
+}
+
+// TestFaultInARelocatedInstructionKeepsTheSlotPinned makes a thread fault in
+// an instruction that the patch moved into the tail of a post-window slot. The
+// stop reports an address in the slot, and the Sentry can start the thread
+// there again. The thread must keep the slot as its pin while it is parked, or
+// the allocator can reuse the slot bytes before the thread continues. This
+// test is verified by the Windows CI job.
+func TestFaultInARelocatedInstructionKeepsTheSlotPinned(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	first := gSyscall(1)
+	ret := codeVA + uint64(len(first))
+	r.program(first, []byte{0x48, 0x8B, 0x16}, gSyscall(93)) // mov rdx, [rsi]
+	r.ac.StateData().Regs.Rsi = 0
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+
+	r.as.mu.Lock()
+	tail, ok := r.as.jumpTailLocked(ret, nil)
+	r.as.mu.Unlock()
+	if !ok {
+		t.Fatalf("the SYSCALL before %#x did not become a JMP with a slot tail", ret)
+	}
+
+	// The thread continues in the tail, runs the load, and faults at address 0.
+	si, _, err = r.run()
+	wantSignal(t, si, err, linux.SIGSEGV)
+	th := r.ctx.th.Load()
+	f := th.fast.Load()
+	if f == nil {
+		t.Fatal("the thread has no fast slot")
+	}
+	if got, want := f.slot.reader.pin.Load(), tail-winSlotTailOffset; got != want {
+		t.Errorf("pin of the parked thread = %#x, want the slot at %#x", got, want)
+	}
 }

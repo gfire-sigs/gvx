@@ -1248,11 +1248,15 @@ func (s *subprocess) resolveSubBlockFault(c *platformContext, ac *arch.Context64
 		return false
 	}
 	if at.Write && linux.Signal(si.Signo) == linux.SIGSEGV {
-		switch s.subBlocks.emulateStore(c, ac) {
+		switch res, addr := s.subBlocks.emulateStore(c, ac); res {
 		case storeFaultEmulated:
 			return true
 		case storeFaultRefused:
 			*at = hostarch.NoAccess
+		case storeFaultNeedsPage:
+			// The memory manager resolves the fault at the page that blocks
+			// the store, and the thread repeats the store.
+			si.SetAddr(addr)
 		}
 	}
 	if s.subBlocks.fixMissingPageFault(si, at, ac, c.subBlockChanges) && c.subBlockRetries < maxSubBlockFaultRetries {

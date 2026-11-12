@@ -105,6 +105,24 @@ func (m *regionMap) resolve(u *regionUser, f memmap.File, bs safemem.BlockSeq, w
 	return m.inner.Resolve(u, f, bs, write)
 }
 
+// resolvePinned is resolve for regions that the address space tracks by guest
+// address range. A region of a file that outlives its mappings attaches to u
+// at once. Any other region stays pinned in the runs until finishPin.
+func (m *regionMap) resolvePinned(u *regionUser, f memmap.File, bs safemem.BlockSeq, write bool) ([]segment, error) {
+	return m.inner.ResolvePinned(u, f, bs, write)
+}
+
+// finishPin applies the extent changes that RecordRuns reported and drops the
+// pins of resolvePinned.
+func (m *regionMap) finishPin(runs []segment, acquired, dropped []*hvcommon.Region) {
+	m.inner.FinishPin(runs, acquired, dropped)
+}
+
+// releaseRegions drops the references of regions that ClearRange reported.
+func (m *regionMap) releaseRegions(dropped []*hvcommon.Region) {
+	m.inner.ReleaseRegions(dropped)
+}
+
 func (m *regionMap) release(u *regionUser) {
 	m.inner.Release(u)
 }

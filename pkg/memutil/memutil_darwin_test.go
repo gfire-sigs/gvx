@@ -276,3 +276,23 @@ func TestMapSliceSharesFileContents(t *testing.T) {
 		t.Fatal("mapping is still mapped after UnmapSlice")
 	}
 }
+
+// TestTaskPortCacheRunsTheTrapOnce checks that RemapAnonymousView does not call
+// task_self_trap for each alias. Every call adds a user reference to the port
+// of the task and no code returns it.
+func TestTaskPortCacheRunsTheTrapOnce(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	c := taskPortCache{trap: func() uintptr { calls++; return 7 }}
+	for range 10 {
+		if got := c.get(); got != 7 {
+			t.Fatalf("get = %d, want 7", got)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("the trap ran %d times, want 1", calls)
+	}
+	if port := selfTaskPort.get(); port == 0 || port != selfTaskPort.get() {
+		t.Errorf("selfTaskPort.get = %d, want a stable non-zero port name", port)
+	}
+}

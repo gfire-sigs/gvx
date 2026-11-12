@@ -17,6 +17,7 @@ package hvf
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -261,13 +262,16 @@ func (w *vcpuWorker) runLoop(c *Context, pt *stage1Tables, ac *arch.Context64) (
 			return nil, hostarch.NoAccess, fmt.Errorf("hvf: a cancellation of the vCPU failed: %w", *e)
 		}
 		done, info, at, err := w.dispatchExit(c, pt, ac)
-		if done {
+		if done || err != nil {
+			// An exit that fails while it leaves the guest live, such as a
+			// failed PC advance, must not enter the guest again: the next
+			// prepareEntry would reload stale registers from the CommPage.
 			return info, at, err
 		}
 		if c.interrupted.Load() {
 			// The exit left the guest live. onCancel records the state for the
 			// interrupt and consumes the flag, or it resumes the guest.
-			if done, info, at, err = w.onCancel(c, pt); done {
+			if done, info, at, err = w.onCancel(c, pt); done || err != nil {
 				return info, at, err
 			}
 		}
@@ -443,6 +447,13 @@ func (w *vcpuWorker) onStubExit(ac *arch.Context64) (bool, *linux.SignalInfo, ho
 		return true, nil, hostarch.NoAccess, nil
 	case exitSignal:
 		return true, act.info, act.at, platform.ErrContextSignal
+	case exitWFx:
+		// A trapped WFI or WFE returns at once, which the architecture allows
+		// as a spurious wake-up. The guest resumes behind the instruction. The
+		// yield lets another goroutine run while the guest spins on WFE.
+		comm.PC += 4
+		runtime.Gosched()
+		return false, nil, hostarch.NoAccess, nil
 	case exitSysReg:
 		iss := hvcommon.DecodeSysRegISS(comm.ESR)
 		val, ok := w.ids.EmulateSysRegRead(iss)
