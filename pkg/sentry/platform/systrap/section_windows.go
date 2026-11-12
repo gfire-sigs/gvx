@@ -54,6 +54,26 @@ type sectionRef struct {
 	readOnly bool
 }
 
+// sectionFileID identifies an open host file independently of its numeric handle
+// value, which Windows can reassign after the handle closes.
+type sectionFileID struct {
+	vol       uint32
+	idxHigh   uint32
+	idxLow    uint32
+	ctimeHigh uint32
+	ctimeLow  uint32
+}
+
+func fileIdentityFromInfo(info windows.ByHandleFileInformation) sectionFileID {
+	return sectionFileID{
+		vol:       info.VolumeSerialNumber,
+		idxHigh:   info.FileIndexHigh,
+		idxLow:    info.FileIndexLow,
+		ctimeHigh: info.CreationTime.HighDateTime,
+		ctimeLow:  info.CreationTime.LowDateTime,
+	}
+}
+
 // sectionCache holds one section for each memory file. The memory file grows
 // in steps, and a section covers only the file size at its creation, so the
 // cache creates a new section when a mapping reaches past the old one.
@@ -62,27 +82,33 @@ type sectionRef struct {
 // window map keeps the section handle to map a piece of a split view again.
 // So the cache closes no handle before the platform closes.
 type sectionCache struct {
-	mu    sync.Mutex
-	files map[windows.Handle]*sectionRef
-	all   []*sectionRef
+	mu     sync.Mutex
+	files  map[sectionFileID]*sectionRef
+	nextID uintptr
+	all    []*sectionRef
 }
 
 // get returns a section of the file that covers [0, end). A caller that needs
 // write access gets an error for a file that has none.
 func (c *sectionCache) get(file windows.Handle, end uint64, write bool) (*sectionRef, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ref := c.files[file]; ref != nil && ref.size >= end {
-		if write && ref.readOnly {
-			return nil, errReadOnlyFile
-		}
-		return ref, nil
-	}
 	var info windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(file, &info); err != nil {
 		return nil, fmt.Errorf("GetFileInformationByHandle: %w", err)
 	}
+	key := fileIdentityFromInfo(info)
 	size := uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var fileID uintptr
+	var prevRO bool
+	if ref := c.files[key]; ref != nil {
+		fileID = ref.file
+		prevRO = ref.readOnly
+		if ref.size >= end && (!write || !ref.readOnly) {
+			return ref, nil
+		}
+	}
 	if size < end {
 		return nil, fmt.Errorf("the file has %d bytes and the mapping needs %d", size, end)
 	}
@@ -92,6 +118,9 @@ func (c *sectionCache) get(file windows.Handle, end uint64, write bool) (*sectio
 	h, err := windows.CreateFileMapping(file, nil, windows.PAGE_READWRITE, 0, 0, nil)
 	if err != nil {
 		if write {
+			if prevRO {
+				return nil, fmt.Errorf("%w: %w", errReadOnlyFile, err)
+			}
 			return nil, fmt.Errorf("CreateFileMapping of the file: %w", err)
 		}
 		// The handle has no write access. A read-only section serves every
@@ -101,11 +130,15 @@ func (c *sectionCache) get(file windows.Handle, end uint64, write bool) (*sectio
 			return nil, fmt.Errorf("CreateFileMapping of the file: %w", err)
 		}
 	}
-	ref := &sectionRef{h: h, file: uintptr(file), size: size, readOnly: readOnly}
-	if c.files == nil {
-		c.files = make(map[windows.Handle]*sectionRef)
+	if fileID == 0 {
+		c.nextID++
+		fileID = c.nextID
 	}
-	c.files[file] = ref
+	ref := &sectionRef{h: h, file: fileID, size: size, readOnly: readOnly}
+	if c.files == nil {
+		c.files = make(map[sectionFileID]*sectionRef)
+	}
+	c.files[key] = ref
 	c.all = append(c.all, ref)
 	return ref, nil
 }

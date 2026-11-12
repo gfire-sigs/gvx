@@ -218,28 +218,37 @@ func TestWindowsMultiChunkLoadFromAndDestroyReleasesKernelViews(t *testing.T) {
 	if len(chunks) < 2 {
 		t.Fatalf("len(chunks) = %d, want >= 2", len(chunks))
 	}
+	const (
+		winMemFree   = 0x10000 // MEM_FREE from winnt.h
+		winMemMapped = 0x40000 // MEM_MAPPED from winnt.h
+	)
 	for i, c := range chunks {
 		var info windows.MemoryBasicInformation
 		if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
 			t.Fatalf("VirtualQuery(chunk %d at %#x): %v", i, c.mapping, err)
 		}
-		if info.State != windows.MEM_COMMIT {
-			t.Fatalf("chunk %d State = %#x before Destroy, want MEM_COMMIT", i, info.State)
+		if info.State != windows.MEM_COMMIT || info.Type != winMemMapped || info.AllocationBase != c.mapping {
+			t.Fatalf("chunk %d before Destroy: State=%#x Type=%#x AllocationBase=%#x, want MEM_COMMIT (%#x) MEM_MAPPED (%#x) at %#x",
+				i, info.State, info.Type, info.AllocationBase, windows.MEM_COMMIT, winMemMapped, c.mapping)
 		}
 	}
 
 	fx.verifyMemoryFile(t, restored)
 	fx.releaseAndDestroy(t, restored)
-	fx.releaseAndDestroy(t, fx.mf)
 
-	const winMemFree = 0x10000 // MEM_FREE from winnt.h
 	for i, c := range chunks {
 		var info windows.MemoryBasicInformation
 		if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
 			t.Fatalf("VirtualQuery(chunk %d at %#x after Destroy): %v", i, c.mapping, err)
 		}
-		if info.State != winMemFree {
-			t.Fatalf("chunk %d State = %#x after Destroy, want %#x (MEM_FREE)", i, info.State, winMemFree)
+		// Another runtime VirtualAlloc call can claim the lowest freed VA hole
+		// before VirtualQuery runs. Only a surviving MEM_MAPPED region at the
+		// chunk base means UnmapViewOfFile leaked the section view.
+		if info.State != winMemFree && info.Type == winMemMapped && info.AllocationBase == c.mapping {
+			t.Fatalf("chunk %d still mapped after Destroy: State=%#x Type=%#x AllocationBase=%#x RegionSize=%#x",
+				i, info.State, info.Type, info.AllocationBase, info.RegionSize)
 		}
 	}
+
+	fx.releaseAndDestroy(t, fx.mf)
 }
