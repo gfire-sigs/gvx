@@ -75,22 +75,22 @@ classes: {
   }
 }
 
-hostapp: "1. Host Caller (cmd/rungv or pkg/gvx)" {
+hostapp: "1. Host Caller (cmd/rungv, pkg/gvx, or android/library)\nRun, Checkpoint, and Restore Lifecycle + Per-Sandbox Tuning" {
   class: stage
   style.fill: "#1E293B"
   style.font-color: "#F8FAFC"
   style.stroke: "#0F172A"
 }
 
-oci: "2. pkg/oci (Multi-Arch OCI Pull & In-Memory Tar-to-EROFS Cache)" {
+oci: "2. pkg/oci & pkg/gvx/hostcerts\nMulti-Arch OCI Pull, In-Memory Tar-to-EROFS Cache, and Host CA Bundle" {
   class: stage
 }
 
-lockdown: "3. pkg/hostlockdown (Windows RestrictedToken/JobObject, macOS Seatbelt, Linux Landlock+seccomp)" {
+lockdown: "3. pkg/hostlockdown\nWindows RestrictedToken/JobObject, macOS Seatbelt, Linux Landlock+seccomp" {
   class: stage
 }
 
-sentry: "4. pkg/sentry/kernel (Pure-Go Linux Syscall & Task Engine: amd64 & arm64)" {
+sentry: "4. pkg/sentry/kernel (Pure-Go Linux Syscall, Task, Cgroup v2, & State Engine: amd64 & arm64)" {
   class: sentry
 }
 
@@ -124,14 +124,14 @@ vfs: "pkg/sentry/vfs (VFS2 Layer)" {
   }
 }
 
-net: "pkg/tcpip (Pure-Go Netstack TCP/IP)" {
+net: "pkg/tcpip, pkg/netbackend, & pkg/ipset (Pure-Go Netstack)" {
   class: group_net
   grid-columns: 1
-  nat: "Track A (-net=nat)\nL4 Go net NAT & -p Port Forwarder" {
+  nat: "Track A (-net=nat)\nL4 Go net NAT, -p Port Forwarder, & DNS Relay" {
     class: item
     style.stroke: "#0284C7"
   }
-  wg: "Track B (-net=wg)\nL3 channel.Endpoint + wireguard-go" {
+  wg: "Track B (-net=wg) & Overlay Links\nL3 wgtun + wireguard-go, VXLAN, Bridge, Conntrack, & IPSet" {
     class: item
     style.stroke: "#0284C7"
   }
@@ -140,15 +140,15 @@ net: "pkg/tcpip (Pure-Go Netstack TCP/IP)" {
 platform: "pkg/sentry/platform (Execution Backend)" {
   class: group_plat
   grid-columns: 1
-  whpx: "platform/whpx\nWindows WinHvPlatform.dll (amd64 & arm64)" {
+  whpx: "platform/whpx\nWindows WinHvPlatform.dll 4KB EPT/Stage-2 (amd64 & arm64)" {
     class: item
     style.stroke: "#7C3AED"
   }
-  hvf: "platform/hvf\nmacOS Hypervisor.framework (arm64)" {
+  hvf: "platform/hvf\nmacOS Hypervisor.framework 4KB Stage-1 / 16KB Stage-2 (arm64)" {
     class: item
     style.stroke: "#7C3AED"
   }
-  systrap: "platform/systrap\nIn-Place Syscall Patcher & Stub Subprocess" {
+  systrap: "platform/systrap\nLinux upstream (4KB & 16KB sub-blocks) + Windows winsystrap" {
     class: item
     style.stroke: "#7C3AED"
   }

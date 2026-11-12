@@ -1,230 +1,201 @@
 # `gvx` Architecture and Implementation Plan
 
-`gvx` is an upstream-trackable fork of `google/gvisor` that ports the Sentry kernel to Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`) as Priority-0 targets. Without booting a virtual machine, `gvx` runs Linux ELF64 binaries and OCI images inside an unprivileged sandbox via `cmd/rungv` or `pkg/gvx`. The runtime intercepts Linux system calls in Go and translates them into native Windows NT, macOS XNU, Go `net`, and user-mode hypervisor or `systrap` calls.
+`gvx` is an upstream-trackable fork of `google/gvisor` that ports the Sentry kernel to Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`) as Priority-0 targets. It also supports Linux (`linux/amd64`, `linux/arm64`, with 4KB and 16KB host pages) officially and packages an Android library (`android/arm64`). Without booting a virtual machine, `gvx` runs Linux ELF64 binaries and OCI images inside an unprivileged sandbox via `cmd/rungv` or `pkg/gvx`. The runtime intercepts Linux system calls in Go and dispatches host NT, XNU, Linux, Go `net`, hypervisor, or `systrap` calls.
 
 ---
 
 ## 1. Executive Summary and Architectural Scope
 
-This section defines the Priority-0 target matrix, execution backends, networking modes, OCI image pipeline, and upstream isolation rules for `gvx`. Every subsystem implementation must satisfy these baseline contracts before merging.
+This section defines the Priority-0 target matrix, execution backends, networking modes, OCI image pipeline, checkpoint model, and upstream isolation rules for `gvx`. Every subsystem implementation must satisfy these baseline contracts before merging.
 
 | Design Objective | Engineering Contract | Verification Boundary |
 | :--- | :--- | :--- |
-| **Priority-0 Dual-OS & Dual-Arch** | Targets `windows/amd64`, `windows/arm64`, and `darwin/arm64` from one codebase. | Compiles and runs native `linux/amd64` and `linux/arm64` ELF64 workloads on Windows and macOS. |
+| **Priority-0 Multi-OS & Multi-Arch** | Targets `windows/amd64`, `windows/arm64`, and `darwin/arm64` as Priority-0 hosts alongside `linux/amd64`, `linux/arm64`, and `android/arm64`. | Compiles and runs native `linux/amd64` and `linux/arm64` ELF64 workloads across desktop, server, and mobile hosts. |
 | **Zero Runtime Elevation** | Runs under a standard user account and locks down the host process before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
 | **Hardware 4KB Paging (`whpx` & `hvf`)** | Uses `WinHvPlatform.dll` (Windows) and `Hypervisor.framework` (macOS) with 4KB EPT and Stage-1/Stage-2 tables. | Bypasses the Windows 64KB `VirtualAlloc` limit and the Apple Silicon 16KB host page limit. |
-| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream). Windows (`winsystrap`) runs stub processes under explicit opt-in (`AllowUnconfinedSystrap` or `PlatformSystrap`), because Windows provides no kernel syscall trap. macOS has no `systrap` engine. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
-| **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
-| **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
-| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 5.0% under Section 2.2 audit rules and Go 1.27+ builds without Bazel. |
+| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (4KB and 16KB host pages). Windows (`winsystrap`) runs stub processes under explicit opt-in (`AllowUnconfinedSystrap` or `PlatformSystrap`), because Windows provides no kernel syscall trap. macOS has no `systrap` engine. | Executes ELF64 binaries and JIT runtimes (V8, OpenJDK) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
+| **Dual-Track Netstack & Overlay Networking** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`), with guest `vxlan`, `wireguard`, `bridge`, `conntrack`, and `ipset`. | Supports inbound/outbound port forwarding (`-p`), `host.docker.internal`, cryptographic L3 isolation, Docker Engine, and multi-node Kubernetes (`k3s`, Flannel, Calico). |
+| **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.gvx-erofs-v3-b4096.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
+| **Pre-Lockdown Checkpoint & Restore** | Pre-opens checkpoint bundle descriptors and optional Unix or loopback TCP control listeners before `hostlockdown.Apply()`, and locks down `gvx.Restore` before decoding untrusted state. | Saves and restores running tasks, sparse `pgalloc` memory, `hostfs` mounts, `ext4lite` volumes, and Netstack state without weakening containment. |
+| **Clean Upstream Boundary** | Isolates host logic behind Tier 1 additive packages and Tier 2 `_windows.go`, `_darwin.go`, and `_xplat.go` files. | Enforces a `< 4.2%` CI audit gate inside the `< 5.0%` upstream diff ceiling and builds with Go 1.27+ without Bazel. |
 
 ![gvx Subsystem Architecture Overview](assets/arch-overview.svg)
 
 ### 1.1 Compatibility Matrix and Cross-Architecture Execution (Descriptive Module)
 
-`gvx` uses hardware virtualization (`whpx` and `hvf`) as the default Tier-1 engine. On Windows, `PlatformAuto` fails closed when `whpx` is unavailable unless `Config.AllowUnconfinedSystrap` (`-allow-unconfined-systrap`) opts into `systrap`. Untrusted Windows workloads require `whpx`. Linux uses the upstream gVisor platforms.
+`gvx` uses hardware virtualization (`whpx` and `hvf`) as the default Tier-1 engine on Windows and macOS. On Windows, `PlatformAuto` fails closed when `whpx` is unavailable unless `Config.AllowUnconfinedSystrap` (`-allow-unconfined-systrap`) opts into `systrap`. Untrusted Windows workloads require `whpx`. Linux and Android use the upstream gVisor platforms (`systrap` by default under `PlatformAuto`).
 
-The `systrap` fallback runs on Windows `amd64` and `arm64` with 4KB guest pages. The Windows engine starts its stubs from a generated 1 KB image, so it needs no C toolchain. The project removed the macOS engine (`darwinsystrap`) because it could not run executables with 4KB-aligned segments and non-PIE executables. Section 3.3 gives the reason. macOS runs on `hvf`. The project also dropped the Rosetta 2 engine and the whole `darwin/amd64` target. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without that filter would let a guest issue host system calls. The guest architecture must equal the host architecture on every backend.
+The `systrap` fallback runs on Windows (`amd64` and `arm64`) and on Linux and Android over 4KB and 16KB host kernels. The Windows engine starts its stubs from a generated 1 KB image, so it needs no C toolchain. The project removed the macOS engine (`darwinsystrap`) because it could not run executables with 4KB-aligned segments and non-PIE executables. Section 3.3 gives the reason. The project also dropped the Rosetta 2 engine and the `darwin/amd64` target because a syscall-number Seatbelt filter on a translated process panicked the host kernel. The guest architecture must equal the host architecture on every backend.
 
-| Host Target | Primary Engine (`whpx` / `hvf`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
+| Host Target | Primary Engine (`whpx` / `hvf` / `kvm`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | `platform/systrap` (`winsystrap`: `winSysmsg` fast path and debug-object stops, `jmp rel32`, `CC 90`, or dual-`INT3` guarded sites). Requires explicit opt-in; untrusted workloads require `whpx`. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
 | **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | `platform/systrap` (`winsystrap`: `winSysmsg` fast path and debug-object stops, `B` or `brk` patch). Runs on hosts without WHP under explicit opt-in; untrusted workloads require `whpx`. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
 | **`darwin/arm64`** (Apple Silicon M1-M5) | `platform/hvf` (`Hypervisor.framework` Stage-1 4KB + Stage-2 16KB) | None. The `darwinsystrap` engine was removed. `platform/systrap` builds a stub that returns `ErrUnavailable`. | 16KB Host Page / 16KB Map Granularity | Entitlement `com.apple.security.hypervisor` for `hvf`. Runs `linux/arm64` images. |
 | **`darwin/amd64`** (Intel Mac) | None. | None. | None. | Not supported. The project dropped this target, because no Intel Mac ran the engine. |
-| **`linux/amd64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap`. | 4KB Page | CI builds and tests the packages that `gvx` owns. |
-| **`linux/arm64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap`. | 4KB Page (host dependent) | CI builds and tests the packages that `gvx` owns. |
+| **`linux/amd64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap` (default under `PlatformAuto`). | 4KB Page | Official target; CI builds, vets, and runs the full `e2e` and conformance suites. |
+| **`linux/arm64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap` (4KB direct or 16KB `subblock_xplat.go` layer). | 4KB or 16KB Host Page | Official target; CI tests 4KB hosts natively and boots a 16KB Debian ARM64 kernel in QEMU. |
+| **`android/arm64`** (`android/amd64` CI) | None (`untrusted_app` cannot open `/dev/kvm`). | Upstream `systrap` with `MFD_EXEC`, `idleStubLimit = 2`, and 16KB sub-block support. | 4KB or 16KB Host Page | Packaged as `librungv.so` inside `gvx-android.aar` (`minSdkVersion 31`); CI tests on an Android 16 emulator. |
 
 ---
 
 ## 2. Repository Layout and Upstream Synchronization Architecture
 
-`gvx` tracks the pre-generated `go` branch of `https://github.com/google/gvisor.git` (`upstream/go`). Upstream publishes `go_stateify` and `go_marshal` output for both `amd64` and `arm64` directly to `upstream/go`, so `gvx` compiles with `go build` without Bazel.
+`gvx` tracks the pre-generated `go` branch of `https://github.com/google/gvisor.git` (`upstream/go`). Upstream publishes `go_stateify` and `go_marshal` output for both `amd64` and `arm64` to `upstream/go`, so `gvx` compiles with `go build` without Bazel. `tools/gostateify` regenerates `*_state_autogen.go` for `gvx`-owned and modified packages without Bazel.
 
 ```text
 gvx/ (Fork of google/gvisor@go)
- ├── AGENTS.md                              # [NEW] Mandatory agent instructions and ASD-STE100 gates
+ ├── AGENTS.md                              # [NEW] Mandatory operating manual and ASD-STE100 gates
  ├── README.md                              # [NEW] Project overview, quickstart, and build guide
  ├── UPSTREAM_COMMIT                        # [NEW] Pinned commit SHA from google/gvisor (go branch)
  ├── entitlements.plist                     # [NEW] com.apple.security.hypervisor entitlement for hvf
- ├── .github/workflows/                     # [NEW] ci.yml (every push) and e2e-images.yml (weekly registry gates)
+ ├── .github/workflows/                     # [NEW] ci, e2e-images, pjdfstest, android, linux16k, benchmark, release
+ ├── android/                               # [NEW] Android AAR library (dev.gfire.gvx.Gvx) and sample service
  ├── docs/
- │   └── architecture.md                    # [NEW] Authoritative architecture and milestone plan
- ├── scripts/                               # [NEW] codesign-exec.sh (signs test binaries) and sync-upstream.sh
+ │   ├── architecture.md                    # [NEW] Authoritative architecture and subsystem specifications
+ │   ├── cli.md                             # [NEW] rungv CLI reference
+ │   ├── systrap-windows.md                 # [NEW] Windows systrap engine design
+ │   ├── moonshots.md                       # [NEW] Completed feature milestones
+ │   ├── assets/                            # [NEW] D2 diagram sources and compiled SVGs
+ │   └── recipes/                           # [NEW] Docker Engine and Kubernetes integration guides
+ ├── scripts/                               # [NEW] codesign-exec, sync-upstream, gostateify, gvisorlint, repro-build
  ├── tools/
+ │   ├── androidprobe/                      # [NEW] Android kernel and seccomp capability probe
  │   ├── gostateify/                        # [NEW] Native Go pkg/state generator and drift verifier
- │   ├── shiminterop/                       # [NEW] Isolated SDK smoke tests
- │   └── upstream/                          # [NEW] Upstream sync, diff audit, import boundaries, and build-tag rewriter
+ │   ├── gvisorlint/                        # [NEW] checklocks, checkconst, and checklinkname runner
+ │   ├── licenses/                          # [NEW] Shipped third-party license collector and verifier
+ │   ├── shiminterop/                       # [NEW] Isolated containerd 2.1.5 SDK interoperability tests
+ │   └── upstream/                          # [NEW] Upstream sync, diff audit, import boundaries, and retagger
  │       ├── main.go
+ │       ├── gitsync.go
  │       ├── patches.go
  │       ├── buildtag_allowlist.txt
+ │       ├── file_mask.txt
+ │       ├── sync_manifest.json
  │       ├── boundaries.go
- │       ├── compare.go
- │       ├── sync.go
  │       └── diff_audit.go
  ├── cmd/
- │   ├── containerd-shim-gvx-v2/             # [NEW] Optional containerd control command
+ │   ├── containerd-shim-gvx-v2/            # [NEW] Optional containerd control shim command
  │   │   └── main.go
- │   └── rungv/                             # [NEW] Standalone CLI runner (run, pull, stub)
+ │   └── rungv/                             # [NEW] Standalone CLI (run, pull, checkpoint, restore, tune, stub)
  │       └── main.go
- ├── internal/                              # [NEW] gvxshim control adapter and test fixtures
- │   └── xsys/unix/                         # [NEW] Embedded copy of golang.org/x/sys/unix with Darwin and Windows changes (Section 4.4)
+ ├── internal/                              # [NEW] gvxshim control adapter, acceptprog probes, weakmap, xsys/unix
+ │   ├── acceptprog/                        # [NEW] Zero-dependency guest syscall acceptance binaries
+ │   ├── gvxshim/                           # [NEW] Isolated containerd control adapter
+ │   ├── weakmap/                           # [NEW] Per-instance weak-pointer side table
+ │   └── xsys/unix/                         # [NEW] Embedded golang.org/x/sys/unix with Darwin and Windows extensions
  ├── pkg/
- │   ├── gvx/                               # [NEW] Embeddable Go library API for host tools
+ │   ├── gvx/                               # [NEW] Embeddable Go SDK for sandbox boot, checkpoint, and restore
  │   │   ├── sandbox.go
  │   │   ├── config.go
- │   │   ├── image.go
+ │   │   ├── checkpoint.go
+ │   │   ├── restore.go
+ │   │   ├── erofs_restore.go
  │   │   ├── kernel_runner.go
- │   │   ├── stdio_device.go
- │   │   └── platform_systrap_{native,other}.go
- │   ├── oci/                               # [NEW] Multi-arch OCI puller and Tar-to-EROFS compiler
+ │   │   ├── syscallfilter_linux.go
+ │   │   ├── hostcerts/                     # [NEW] Host root CA bundle collector and guest injector
+ │   │   └── tuning/                        # [NEW] Typed runtime tuning registry
+ │   ├── oci/                               # [NEW] Multi-arch OCI puller, cache, and Tar-to-EROFS compiler
  │   │   ├── pull.go
  │   │   ├── tar2erofs.go
  │   │   ├── erofs_layout.go
  │   │   └── cache.go
- │   ├── netbackend/                        # [NEW] Dual-track Netstack egress & port forwarder
- │   │   ├── nat_forwarder.go
- │   │   ├── port_forwarder.go
- │   │   ├── dns_relay.go
- │   │   ├── wireguard_endpoint.go
- │   │   ├── wireguard_tun.go
- │   │   └── wireguard_bind.go
+ │   ├── netbackend/                        # [NEW] Dual-track Netstack NAT forwarder and WireGuard endpoint
+ │   ├── ipset/                             # [NEW] IPv4/IPv6 hash:*, bitmap:port, and list:set kernel sets
+ │   ├── tcpip/link/
+ │   │   ├── vxlan/                         # [NEW] Guest VXLAN UDP encapsulation link endpoint
+ │   │   └── wgtun/                         # [NEW] Shared netstack-to-wireguard-go channel adapter
  │   ├── hostarch/
  │   │   └── hostarch_darwin_arm64_4k.go    # [NEW] 4KB guest page constants for darwin/arm64
- │   ├── sync/
- │   │   ├── futex_linux_xplat.go           # [NEW] Linux SYS_FUTEX implementation
- │   │   ├── futex_windows.go               # [NEW] WaitOnAddress / WakeByAddressSingle bindings
- │   │   └── futex_darwin.go                # [NEW] XNU __ulock_wait / __ulock_wake bindings
- │   ├── memutil/
- │   │   ├── memfd_linux_unsafe.go          # Unmodified upstream memfd_create / mmap wrappers
- │   │   ├── memutil_windows.go             # [NEW] CreateFileMappingW + MapViewOfFile3 wrappers
- │   │   └── memutil_darwin.go              # [NEW] mmap(MAP_ANON) + mach_vm_remap wrappers
- │   ├── fd/
- │   │   ├── fd_windows.go                  # [NEW] Unified HostHandle wrapping Win32 HANDLE
- │   │   └── fd_darwin.go                   # [NEW] Unified HostHandle wrapping Darwin FD
+ │   ├── sync/                              # Host futex bindings (Linux, Windows WaitOnAddress, Darwin ulock)
+ │   ├── memutil/                           # Shared memory views (memfd, CreateFileMappingW, mach_vm_remap)
+ │   ├── fd/                                # Unified HostHandle for Win32 HANDLE and POSIX file descriptors
  │   ├── hostlockdown/
- │   │   ├── lockdown_windows.go            # [NEW] RestrictedToken, Low Integrity, JobObject, Win32k block
- │   │   ├── lockdown_darwin.go             # [NEW] Seatbelt sandbox_init SBPL profile & RLIMIT_NPROC=0
- │   │   └── lockdown_other.go              # [NEW] Returns ErrUnsupported on other hosts
+ │   │   ├── lockdown.go
+ │   │   ├── lockdown_windows.go            # [NEW] Untrusted token, JobObject, Win32k block, mount/net brokers
+ │   │   ├── lockdown_darwin.go             # [NEW] Seatbelt SBPL profile, RLIMIT_NPROC=0, GOMAXPROCS pin
+ │   │   └── lockdown_linux.go              # [NEW] PR_SET_NO_NEW_PRIVS and Landlock ABI v1-v5 rulesets
  │   └── sentry/
- │       ├── hostcpu/
- │       │   ├── hostcpu_windows.go         # [NEW] GetCurrentProcessorNumber binding
- │       │   └── hostcpu_darwin.go          # [NEW] Darwin CPU number binding
- │       ├── time/
- │       │   ├── calibrated_clock_windows.go # [NEW] QueryPerformanceCounter clock calibration
- │       │   └── calibrated_clock_darwin.go  # [NEW] mach_continuous_time clock calibration
- │       ├── pgalloc/
- │       │   ├── memory_file_windows.go     # [NEW] DiscardVirtualMemory / MEM_RESET page reclaim
- │       │   └── memory_file_darwin.go      # [NEW] madvise(MADV_FREE) page reclaim
+ │       ├── hostcpu/                       # Host CPU number bindings on Windows and macOS
+ │       ├── time/                          # Monotonic clock calibration (QPC and mach_continuous_time)
+ │       ├── pgalloc/                       # Backing shared memory, 16KB sub-page decommit, sparse C/R page I/O
+ │       ├── socket/netlink/genetlink/      # [NEW] Generic Netlink router and in-guest WireGuard family
  │       ├── platform/
- │       │   ├── whpx/                      # [NEW] Windows Hypervisor Platform backend (amd64 & arm64)
- │       │   │   ├── whpx.go
- │       │   │   ├── address_space.go
- │       │   │   ├── vcpu_amd64.go
- │       │   │   ├── vcpu_arm64.go
- │       │   │   ├── vector.go              # Guest XSAVE features, XCR0, and the compacted layout
- │       │   │   ├── stubgen_x86.go         # Go generator for the in-partition amd64 stub
- │       │   │   └── stubgen_a64.go         # Go generator for the in-partition arm64 stub
- │       │   ├── hvf/                       # [NEW] macOS Hypervisor.framework backend (arm64)
- │       │   │   ├── hvf.go
- │       │   │   ├── address_space.go
- │       │   │   ├── vcpu_darwin_arm64.go
- │       │   │   └── bluepill_arm64.go      # Go generator for the in-guest EL1 stub
- │       │   ├── hvcommon/                  # [NEW] Stage-2 mapper, page-table allocator, and arch primitives for whpx and hvf
- │       │   │   ├── regions.go             # Reference-counted Stage-2 GPA/IPA mapper keyed by memmap.File
- │       │   │   ├── pagetables.go          # Shared Stage-1 page-table allocator and GPA run coalescing
- │       │   │   ├── a64.go                 # AArch64 encoders and EL1 constants
- │       │   │   └── x86.go                 # x86-64 selectors, GDT, TSS, IDT gate, and GS opcode emitters
- │       │   └── systrap/                   # Unified systrap backend (Linux upstream + Windows siblings)
-│       │       ├── systrap.go             # Unmodified upstream Linux systrap implementation
-│       │       ├── systrap_xplat.go       # [NEW] Shared types: ProbeInfo, ErrUnavailable
-│       │       ├── platform_darwin.go     # [NEW] macOS stub: New returns ErrUnavailable, because macOS runs on hvf
-│       │       ├── patcher_amd64_xplat.go # [NEW] Page scan and patcher for amd64 (x86asm sweeps, island slots)
-│       │       ├── patcher_arm64_xplat.go # [NEW] Lazy page-trap patcher for arm64 (B island slots)
-│       │       ├── stubcode_*_xplat.go    # [NEW] Generated spill routines and trampolines
-│       │       ├── stubimage_xplat.go     # [NEW] The 1 KB executable that every Windows stub runs
-│       │       ├── platform_windows.go    # [NEW] Windows platform, stub host client, debug object
-│       │       ├── stubhost_windows.go    # [NEW] Stub host process, confined token, one job for each stub
-│       │       ├── stubimage_windows.go   # [NEW] Writes the image once and holds it open with read-only sharing
-│       │       ├── address_space_windows.go # [NEW] 4KB placeholder window, lazy patching, private code pages
-│       │       ├── context_windows.go     # [NEW] Context.Switch over debug-object stops
-│       │       ├── fastpath_windows.go    # [NEW] winSysmsg fast path and spin windows
-│       └── fsimpl/
- │           ├── hostfs/                    # [NEW] Secure os.Root + .gvx_meta host mount (Windows, macOS, and Linux)
- │           │   ├── hostfs.go
- │           │   ├── inode_windows.go
- │           │   ├── inode_darwin.go
- │           │   └── posix_rename_windows.go
- │           └── ext4lite/                  # [NEW] Volume file system: one host file in the ext4 format
- │               ├── ondisk.go              # Geometry and codecs
- │               ├── alloc.go               # Block and inode allocator
- │               ├── flush.go               # Snapshot of the dirty state and the write of a flush
- │               ├── gate.go                # Operation gate that makes the snapshot a cut between operations
- │               ├── jbd2.go                # JBD2 journal codecs
- │               ├── journal.go             # Journal commit, replay, and creation
- │               ├── orphan.go              # Orphan list of unlinked open files
- │               ├── fsck.go                # fsckLite for volumes without a journal
- │               ├── compact.go             # Unmount compaction
- │               └── storage_*.go           # Storage tiers A, B, and C
- └── e2e/                                   # [NEW] Unified OS-agnostic end-to-end test suite
-     ├── sandbox_e2e_test.go
-     └── gate_*_test.go                     # Milestone gates M2, M3, and M4
+ │       │   ├── whpx/                      # [NEW] Windows Hypervisor Platform engine (amd64 and arm64)
+ │       │   ├── hvf/                       # [NEW] macOS Hypervisor.framework engine (arm64)
+ │       │   ├── hvcommon/                  # [NEW] Shared Stage-2 GPA mapper, CommHeader, and Stage-1 pool
+ │       │   └── systrap/                   # Unified systrap engine (Linux 4KB/16KB sub-blocks + Windows stubs)
+ │       │       ├── systrap.go             # Unmodified upstream Linux systrap implementation
+ │       │       ├── subblock_xplat.go      # [NEW] 4KB guest sub-block mapper for 16KB Linux/Android hosts
+ │       │       ├── substore_xplat_arm64.go # [NEW] Composite-block ARM64 store and atomic emulator
+ │       │       ├── platform_darwin.go     # [NEW] macOS stub returning ErrUnavailable (macOS runs hvf)
+ │       │       ├── patcher_*_xplat.go     # [NEW] Lazy syscall and svc binary patchers for amd64 and arm64
+ │       │       ├── platform_windows.go    # [NEW] Windows platform, pre-lockdown stub host, debug object
+ │       │       ├── address_space_windows.go # [NEW] 4KB placeholder views, lazy patching, private code pages
+ │       │       └── fastpath_windows.go    # [NEW] winSysmsg shared-memory fast path
+ │       └── fsimpl/
+ │           ├── chunkcache/                # [NEW] Shared 64 KiB page-chunk cache for hostfs and ext4lite
+ │           ├── fsutilx/                   # [NEW] Shared VFS2 inode and dirent helpers
+ │           ├── hostfs/                    # [NEW] Symlink-safe os.Root + .gvx_meta mount driver
+ │           └── ext4lite/                  # [NEW] Single-file ext4 volume driver with JBD2 journal
+ └── e2e/                                   # [NEW] OS-agnostic black-box end-to-end test suite
 ```
 
 ### 2.1 Layered Subsystem Map and Import Directionality
 
-Each package owns one architectural boundary. Enforce top-down import directionality to keep Windows and macOS host APIs out of the pure-Go Sentry kernel.
+Each package owns one architectural boundary. Top-down import directionality keeps host OS APIs out of the pure-Go Sentry kernel.
 
 | Package | Single Responsibility | Allowed Internal Imports | Forbidden Imports |
 | :--- | :--- | :--- | :--- |
-| `cmd/containerd-shim-gvx-v2` | Dispatches the optional shim command. | `internal/gvxshim` | `pkg/*`, `runsc/*`, `shim/*` |
-| `internal/gvxshim` | Owns bootstrap, local RPC controls, process lifetime, and safe cleanup. | None; public containerd types, ttRPC, protobuf, and host APIs are external dependencies. | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
-| `tools/shiminterop` | Exercises real ShimManager `2.1.5` against the compiled shim in an isolated module. | None | Root runtime, command, and internal packages |
+| `cmd/containerd-shim-gvx-v2` | Dispatches the optional containerd shim binary. | `internal/gvxshim` | `pkg/*`, `runsc/*`, `shim/*` |
+| `internal/gvxshim` | Owns shim bootstrap, local ttRPC control, state locking, and teardown. | Public containerd types, ttRPC, protobuf, and host OS APIs | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
+| `tools/shiminterop` | Exercises real containerd `2.1.5` ShimManager calls in an isolated Go module. | None | Root runtime, command, and internal packages |
 | `tools/gostateify` | Generates reflection-free `pkg/state` methods and verifies zero autogen drift. | `golang.org/x/tools/*` | `pkg/*` (production), `cmd/*`, `internal/*` |
-| `cmd/rungv` | Parses the Docker-style commands of [`cli.md`](cli.md) (`run`, `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, `logout`, `stub`) and starts a sandbox instance. | `pkg/gvx` | `pkg/sentry/*`, `WinHvPlatform.dll` |
-| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, and Sentry boot. | `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip` | `cmd/*`, `internal/gvxshim` |
-| `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests and compiles `.tar` layers into `.erofs` files. | `pkg/abi/linux` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
-| `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
-| `pkg/hostlockdown` | Locks down the host process via Windows Tokens/JobObjects or macOS Seatbelt. | `golang.org/x/sys/windows`, `golang.org/x/sys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
-| `pkg/sentry/kernel` | Dispatches the OS-agnostic Linux task, signal, and syscall table (`amd64` & `arm64`). | `pkg/abi/linux`, `pkg/sentry/platform`, `pkg/sentry/vfs`, `pkg/sync` | `golang.org/x/sys/windows`, `pkg/hostlockdown` |
-| `pkg/sentry/platform/whpx` | Executes guest Ring-3/EL0 code on Windows via `WinHvPlatform.dll` and 4KB EPT/Stage-2. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/sys/windows` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
-| `pkg/sentry/platform/hvf` | Executes guest EL0/Ring-3 code on macOS via `Hypervisor.framework` and 4KB Stage-1/Stage-2. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/sys/unix` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
-| `pkg/sentry/platform/systrap` | Executes guest code via in-place syscall patching, `sysmsg` shared memory, and isolated stub subprocesses across Linux, macOS, and Windows. | `pkg/sentry/platform`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/arch/*` | `pkg/sentry/kernel`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf` |
-| `pkg/sentry/fsimpl/hostfs` | Mounts host `/workspace` via `os.Root`, `NtCreateFile`/`openat`, and `.gvx_meta`. | `pkg/sentry/vfs`, `pkg/abi/linux`, `pkg/fd`, `golang.org/x/sys/*` | `pkg/sentry/platform/*` |
-| `pkg/sentry/fsimpl/ext4lite` | Stores one named volume in one pre-opened host file in the ext4 format. | `pkg/sentry/vfs`, `pkg/sentry/blockdev`, `pkg/abi/linux`, `pkg/fd`, `golang.org/x/sys/*` | `pkg/sentry/platform/*`, `cmd/*` |
-| `pkg/sync`, `pkg/memutil`, `pkg/fd` | Provide host futexes, shared memory views, and host handles on Windows and macOS. | `golang.org/x/sys/windows`, `golang.org/x/sys/unix` | `pkg/sentry/*` |
+| `cmd/rungv` | Parses CLI subcommands in [`cli.md`](cli.md) (`run`, `pull`, `images`, `inspect`, `rmi`, `save`, `load`, `login`, `checkpoint`, `restore`, `tune`, `version`, `license`, `stub`) and runs a sandbox. | `pkg/gvx`, `pkg/gvx/tuning`, `pkg/oci`, `pkg/netbackend` | `pkg/sentry/*`, `WinHvPlatform.dll` |
+| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, Sentry boot, checkpoint, and restore. | `pkg/gvx/{hostcerts,tuning}`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip`, `pkg/seccomp`, `runsc/boot/filter/config` | `cmd/*`, `internal/gvxshim` |
+| `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests, caches layers, and compiles `.tar` streams into `.erofs` images. | `pkg/abi/linux`, `pkg/erofs`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
+| `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip`, `pkg/tcpip/link/wgtun`, `pkg/hostlockdown`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
+| `pkg/hostlockdown` | Confines the host process via Windows Tokens/JobObjects/brokers, macOS Seatbelt, or Linux Landlock. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
+| `pkg/sentry/kernel` | Dispatches the OS-agnostic Linux task, signal, and syscall table (`amd64` and `arm64`). | `pkg/abi/linux`, `pkg/sentry/platform`, `pkg/sentry/vfs`, `pkg/sync`, `internal/weakmap` | `golang.org/x/sys/windows`, `pkg/hostlockdown` |
+| `pkg/sentry/platform/hvcommon` | Provides the shared Stage-2 GPA mapper, `CommHeader` layout, Stage-1 pool, and arch encoders. | `pkg/hostarch`, `pkg/sentry/memmap` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
+| `pkg/sentry/platform/whpx` | Executes guest Ring-3/EL0 code on Windows via `WinHvPlatform.dll` and 4KB Stage-2 mappings. | `pkg/sentry/platform`, `pkg/sentry/platform/hvcommon`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/sys/windows` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
+| `pkg/sentry/platform/hvf` | Executes guest EL0 code on macOS via `Hypervisor.framework` and 4KB Stage-1/Stage-2 tables. | `pkg/sentry/platform`, `pkg/sentry/platform/hvcommon`, `pkg/memutil`, `pkg/abi/linux`, `internal/xsys/unix` | `pkg/sentry/kernel`, `pkg/sentry/vfs` |
+| `pkg/sentry/platform/systrap` | Executes guest code via syscall patching, `sysmsg` shared memory, and isolated stubs on Linux and Windows. | `pkg/sentry/platform`, `pkg/sentry/platform/hvcommon`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/arch/*` | `pkg/sentry/kernel`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf` |
+| `pkg/sentry/fsimpl/hostfs` | Mounts host workspaces via `os.Root`, `NtCreateFile`/`openat`, `chunkcache`, and `.gvx_meta`. | `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{chunkcache,fsutilx}`, `pkg/abi/linux`, `pkg/fd`, `pkg/hostlockdown`, `internal/xsys/unix` | `pkg/sentry/platform/*` |
+| `pkg/sentry/fsimpl/ext4lite` | Stores one named volume or writable rootfs upper layer in one pre-opened ext4 image file. | `pkg/sentry/vfs`, `pkg/sentry/blockdev`, `pkg/sentry/fsimpl/{chunkcache,fsutilx}`, `pkg/abi/linux`, `pkg/fd`, `internal/xsys/unix` | `pkg/sentry/platform/*`, `cmd/*` |
+| `pkg/sync`, `pkg/memutil`, `pkg/fd` | Provide host futexes, shared memory views, and host handles across Linux, Windows, and macOS. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*` |
 
-`tools/upstream` enforces this table with `boundaries.go`. Sentry foundation packages such as `pkg/context`, `pkg/hostarch`, `pkg/usermem`, and `pkg/sentry/memmap` appear in every platform and VFS interface, so those packages import them. Each other import needs a reason-annotated exception in `boundaries.go`.
+`tools/upstream` enforces this table in `boundaries.go` (`VerifyBoundaries`). Sentry foundation packages such as `pkg/context`, `pkg/hostarch`, `pkg/usermem`, and `pkg/sentry/memmap` appear in every platform and VFS interface, so platform and VFS packages import them directly. Every other cross-boundary import requires an explicit reason-annotated exception in `boundaries.go`.
 
 ### 2.2 Three-Tier Upstream Isolation Model (Descriptive Module)
 
-To prevent merge conflicts during continuous upstream pulls, `gvx` partitions all repository files into three strict isolation tiers.
+`gvx` partitions all repository files into three isolation tiers to prevent merge conflicts during upstream synchronization.
 
 | Isolation Tier | File Paths | Upstream Conflict Rate | Maintenance Mechanism |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/platform/hvcommon/`, `pkg/sentry/fsimpl/chunkcache/`, `pkg/sentry/fsimpl/hostfs/`, `pkg/sentry/fsimpl/ext4lite/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `tools/licenses/`, `tools/gvisorlint/`, `tools/androidprobe/`, `tools/gostateify/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
-| **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
-| **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 5.0%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
+| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths (`file_mask.txt` omits unshipped upstream directories). |
+| **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr,safecopy}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{arch,kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin,xplat}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*`, `pkg/tcpip/**_{windows,darwin,xplat}*`, `pkg/sentry/{inet,socket,fsimpl,devices}/**_*xplat*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
+| **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and narrow cross-platform seams | `< 5.0%` (`< 4.2%` CI gate) | Re-applied by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after each upstream sync and recorded in `sync_manifest.json`. |
 
-The audit charges a file against the 5.0% ceiling only when its content differs from upstream. A file that `gvx` adds inside an upstream directory is free when its name carries the token `windows`, `darwin`, or `xplat`. The audit then counts it as a Tier 2 sibling. It reports build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) as a third number. A strict count that includes the fences is larger than the charged share, and the audit prints both.
+The audit charges a file against the upstream diff ceiling only when its body differs from `upstream/go`. An additive file inside an upstream package costs zero budget when its name carries `windows`, `darwin`, or `xplat`. The audit classifies that file as a Tier 2 sibling. Build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) appear as a separate uncharged count, and the audit prints both ratios.
 
 ![Upstream Synchronization Pipeline](assets/upstream-sync.svg)
 
 ### 2.3 Upstream Diff and Synchronization Procedure (Procedural Module)
 
-Run this procedure to audit the current upstream diff or merge new commits from `google/gvisor`.
+Run this procedure or `scripts/sync-upstream.sh` to audit the upstream diff or merge new commits from `google/gvisor`.
 
 > [!WARNING]
-> Do not hand-edit `*_linux.go` files or scatter ad-hoc changes across pure-Go Sentry files. Unrecorded edits in Tier 3 files cause merge conflicts during upstream synchronization and violate the 5.0% diff ceiling. Register every build-tag change in `tools/upstream/buildtag_allowlist.txt`.
+> Do not hand-edit `*_linux.go` files or scatter ad-hoc changes across pure-Go Sentry files. Unrecorded edits in Tier 3 files cause merge conflicts during upstream synchronization and violate the 4.2% CI diff gate (`5.0%` architectural ceiling). Register every build-tag change in `tools/upstream/buildtag_allowlist.txt`.
 
 1. Register the upstream gVisor repository as the `upstream` Git remote.
 2. Fetch the latest `go` branch from `upstream`.
-3. Inspect the modified upstream file count and verify the `< 5.0%` budget against `UPSTREAM_COMMIT`.
-4. Merge `upstream/go` without committing.
-5. Run `./scripts/gostateify.sh` to regenerate registered state files before retagging.
-6. Run `tools/upstream` in `retag` mode to apply `//go:build linux || windows || darwin` to allowlisted files.
-7. Run `./scripts/gostateify.sh -check` and `tools/upstream` in `audit` mode to verify zero drift or unauthorized edits.
-8. Record the merged `upstream/go` SHA in `UPSTREAM_COMMIT` and verify all three non-Linux Priority-0 targets and both Linux targets.
+3. Run `tools/upstream` in `gitsync` mode or merge `upstream/go` without committing.
+4. Run `./scripts/gostateify.sh` to regenerate registered state files before retagging.
+5. Run `tools/upstream` in `retag` mode to apply `//go:build linux || windows || darwin` to allowlisted files.
+6. Run `./scripts/gostateify.sh -check` and `tools/upstream` in `audit` mode to verify zero drift or boundary violations.
+7. Record the synced commit metadata in `UPSTREAM_COMMIT` and `tools/upstream/sync_manifest.json`.
+8. Compile all five Priority-0 and Linux host targets to verify clean builds.
 
 ```bash
 git remote add upstream https://github.com/google/gvisor.git 2>/dev/null || true
@@ -235,7 +206,7 @@ git merge --no-commit upstream/go
 ./scripts/gostateify.sh
 go run ./tools/upstream -mode=retag
 ./scripts/gostateify.sh -check
-go run ./tools/upstream -mode=audit -max-ratio=0.05   # add -offline to reuse the cached upstream archive
+go run ./tools/upstream -mode=audit -max-ratio=0.042   # add -offline to reuse the cached upstream archive
 git rev-parse upstream/go > UPSTREAM_COMMIT
 
 # Verify the three non-Linux Priority-0 host targets and both Linux targets compile cleanly
@@ -258,14 +229,17 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 
 | gVisor Package | Current Linux Dependency | Windows Implementation (`_windows.go`) | macOS Implementation (`_darwin.go`) |
 | :--- | :--- | :--- | :--- |
-| **`pkg/sync`** | `SYS_FUTEX` (`FUTEX_WAIT`, `FUTEX_WAKE`) | `WaitOnAddress`, `WakeByAddressSingle`, `WakeByAddressAll` (`api-ms-win-core-synch-l1-2-0.dll`). | `__ulock_wait` and `__ulock_wake` (`UL_COMPARE_AND_WAIT` in `libSystem.B.dylib`). |
-| **`pkg/memutil` & `pgalloc`** | `memfd_create`, `SYS_MMAP`, `MADV_DONTNEED`, `FALLOC_FL_PUNCH_HOLE` | `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)`, `MapViewOfFile3` (`kernelbase.dll`, with `MapViewOfFile` fallback), and `DiscardVirtualMemory` (`MEM_RESET`). | `mmap(MAP_ANON)`, `mach_vm_remap` (multi-view shared aliasing), and `madvise(MADV_FREE)`. |
-| **`pkg/sentry/time` & `hostcpu`** | `clock_gettime(CLOCK_MONOTONIC)`, `getcpu` VDSO | `QueryPerformanceCounter` / `QueryPerformanceFrequency` and `GetCurrentProcessorNumber`. | `mach_continuous_time` / `clock_gettime_nsec_np` and `pthread_cpu_number_np`. |
+| **`pkg/sync`** | `SYS_FUTEX` (`FUTEX_WAIT`, `FUTEX_WAKE`) | 64-shard waiter/wake-token table over `WaitOnAddress`, `WakeByAddressSingle`, and `WakeByAddressAll` (`api-ms-win-core-synch-l1-2-0.dll`). | `__ulock_wait` and `__ulock_wake` (`UL_COMPARE_AND_WAIT` in `libSystem.B.dylib` via `syscall6` assembly trampolines). |
+| **`pkg/memutil` & `pgalloc`** | `memfd_create`, `SYS_MMAP`, `MADV_DONTNEED`, `FALLOC_FL_PUNCH_HOLE`, `mincore` | `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)`, 1 GiB `MapViewOfFile` chunk views, `DiscardVirtualMemory` (`MEM_RESET`), and `K32QueryWorkingSetEx`. | `mmap(MAP_ANON)`, `mach_vm_remap` multi-view aliasing, whole-16KB `F_PUNCHHOLE` / sub-page zeroing, and 4KB `darwinMincore`. |
+| **`pkg/sentry/time` & `hostcpu`** | `clock_gettime(CLOCK_MONOTONIC)`, `getcpu` VDSO | `QueryPerformanceCounter` / `QueryPerformanceFrequency` and multi-group `GetCurrentProcessorNumberEx`. | `mach_continuous_time` / `clock_gettime_nsec_np` and `pthread_cpu_number_np`. |
 | **`pkg/fd`** | Raw `int` FDs, `dup3`, `SCM_RIGHTS` | `HostHandle` wrapping `syscall.Handle` with explicit `Close()` ownership. | `HostHandle` wrapping Darwin file descriptors with `fcntl(F_DUPFD_CLOEXEC)`. |
-| **`pkg/fdnotifier`** | `epoll` in edge-triggered mode (`fdnotifier.go`, Linux only). | One table of observed descriptors in `fdnotifier_portable.go`, with no goroutine and no event. `NonBlockingPoll` reports every requested event as ready. | The same table in `fdnotifier_portable.go`. `NonBlockingPoll` calls `poll` once without blocking. |
-| **`pkg/tcpip`** | `af_packet` / `tun` host links | Pure-Go Netstack routed via `pkg/netbackend` (`-net=nat` or `-net=wg`). | Pure-Go Netstack routed via `pkg/netbackend` (`-net=nat` or `-net=wg`). |
+| **`pkg/fdnotifier`** | `epoll` in edge-triggered mode (`fdnotifier.go`, Linux only). | Passive descriptor table in `fdnotifier_portable_xplat.go` with no background poller; `NonBlockingPoll` reports requested events as ready. | Passive descriptor table in `fdnotifier_portable_xplat.go`; `NonBlockingPoll` invokes `SYS_POLL` once without blocking. |
+| **`internal/xsys/unix`** | Direct Linux `syscall.Syscall6` numbers and struct layouts | Translates `SYS_MMAP`, `SYS_MUNMAP`, `SYS_MPROTECT`, `SYS_MADVISE`, `SYS_MINCORE`, and `SYS_PREAD64`/`SYS_PWRITE64` onto Win32 APIs. | Bridges 48-byte XNU `darwinMsghdr`, `Stat_t`, `Dirent`, `Fallocate`, and `darwinMincore` without `cgo` or `go.mod` `replace` rules. |
+| **`pkg/tcpip`** | `af_packet` / `tun` host links | Pure-Go Netstack routed via `pkg/netbackend` (`-net=nat` or `-net=wg`) with a `QueryPerformanceCounter` network clock. | Pure-Go Netstack routed via `pkg/netbackend` (`-net=nat` or `-net=wg`). |
 | **`pkg/abi/linux` & `sentry/arch`** | Pure Go (`amd64` & `arm64`) | Retain 100% unchanged; supports Linux `x86_64` and `aarch64` ABIs natively. | Retain 100% unchanged; supports Linux `aarch64` and `x86_64` ABIs natively. |
 | **`pkg/sentry/syscalls`** | `io_uring` host passthrough | Return `-ENOSYS` on `io_uring_setup` and `io_uring_enter` to select Sentry `epoll`. | Return `-ENOSYS` on `io_uring_setup` and `io_uring_enter` to select Sentry `epoll`. |
+
+On 16 KiB hosts (macOS, Android 16, and Debian `arm64-16k`), `pgalloc` aligns allocations of 16 KiB or more to 16 KiB boundaries. During 4 KiB sub-page reclaim, `decommitFile` punches holes only across whole reclaimed 16 KiB host pages. It zeroes partial sub-pages in memory so live 4 KiB neighbors keep their bytes. On 16 KiB Linux hosts, `mincoreExpandHostPages` expands each host `mincore(2)` byte into four 4 KiB guest-page entries. Each `MemoryFile` binds its own per-sandbox `usage.Memory` ledger (`MemoryFileOpts.Accounting`) and notifies registered platform observers (`ObserveHostWrites`, `NoteHostWrite`) on Sentry writes.
 
 ### 3.2 Primary Hardware Hypervisor Engines: `platform/whpx` (Windows) and `platform/hvf` (macOS)
 
@@ -281,7 +255,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | **`amd64` Syscall Trap (`stubgen_x86.go`)** | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT`. | Not applicable (`darwin/amd64` dropped). |
 | **`arm64` Syscall Trap (`bluepill_arm64.go`, `stubgen_a64.go`)** | EL0 `SVC #0` enters EL1 vectors and spills registers to `CommPage`. An EL1 load from unbacked GPA zero returns to the host. | EL0 `SVC #0` enters EL1 `VBAR_EL1`, spills `X0..X8, SP_EL0, ELR_EL1, PSTATE` to `CommPage`, executes `HVC #0`. |
 | **`amd64` Vector State** | Sets `ProcessorXsaveFeatures` before `WHvSetupPartition`. XCR0 enables x87, SSE, AVX, and AVX-512 when the hypervisor and the Sentry image hold them. `WHvGetVirtualProcessorState` moves the compacted XSAVE state on the cold path. | Not applicable (`darwin/amd64` dropped). |
-| **Read-only File Mappings** | Maps read-only host views directly into the partition. | `hv_vm_map` rejects the read-only descriptor of an EROFS image. `hvf` copies those pages into immutable slab pages, and pgalloc memory files map directly. |
+| **Read-only File Mappings** | Maps read-only host views directly into the partition via `ResolvePinned`. | `hv_vm_map` rejects the read-only descriptor of an EROFS image. `hvf` copies read-only blocks into 64 KiB `MAP_ANON` buffers (`CopyReadOnly`), while `pgalloc` memory files map directly. |
 | **`membarrier` Global and Private Expedited** | `GlobalMemoryBarrier` cancels each virtual processor that runs guest code and waits until its `Switch` call returns. A processor outside the guest needs no cancel. `FlushProcessWriteBuffers` orders the Sentry threads, which access guest memory for system calls in progress. | `GlobalMemoryBarrier` cancels each vCPU that runs guest code and waits for one exit of `hv_vcpu_run`. A cancel that finds no guest to stop resumes the guest, so the guest task keeps running. macOS has no call that forces a barrier on every thread of a process, so the barrier orders guest code only. It does not order a Sentry thread that accesses guest memory for a system call in progress. |
 | **Unknown Exit Reason** | Not applicable. | `HV_EXIT_REASON_UNKNOWN` carries no information. The worker resumes the vCPU as it does after a cancellation, and `Switch` fails after 4096 consecutive unknown exits. |
 
@@ -295,7 +269,7 @@ On Apple Silicon macOS (`darwin/arm64`), the host XNU kernel and `hv_vm_map()` o
 
 Both hardware backends register guest memory with the hypervisor once, and never on a page fault. `MapFile` and `Unmap` change only the guest page tables. A 4 MiB fault therefore makes one call into the page-table code and no call into the hypervisor. `Platform.MapUnit` returns 2 MiB on both backends. `SupportsAddressSpaceIO` returns false, so the Sentry reads and writes guest memory through its own mapping of the memory file. A write that the Sentry makes to a page that the guest already runs as code does not flush the guest instruction cache on `arm64`. A mapping with execute permission flushes it, so the ELF loader, `mprotect`, and copy-on-write stay correct.
 
-`pkg/sentry/platform/hvcommon` holds the shared Stage-2 region mapper and the architecture primitives that both backends share. Those primitives cover AArch64 instruction encoders, EL1 system registers, x86-64 descriptors, the TSS template, IDT gates, and GS-relative opcodes. Each backend keeps its own `CommPage` layout and its own stub generator. Hyper-V and Hypervisor.framework exchange different state at a stop.
+`pkg/sentry/platform/hvcommon` holds the shared Stage-2 region mapper (`RegionTable`), Stage-1 page-table pool (`PageTablePool`), 304-byte `CommHeader` layout, and architecture primitives that both backends share. Those primitives cover AArch64 instruction encoders, deterministic `IDRegisters`, EL1 exception syndrome decoders, x86-64 descriptors, the TSS template, IDT gates, and GS-relative opcodes. On Windows, `MemoryManager.PinRange` (`mm/pinned_xplat.go`) pins backing frame references while `whpx` holds faulted Stage-2 mappings. On macOS, a 256-page (`4 MiB`) VM slab allocates Stage-1 page tables, the EL1 vector page, and per-worker communication pages.
 
 ARM64 WHPX configures GICv3 before partition setup and assigns a separate redistributor to every vCPU.
 It clears startup suspension because Sentry schedules guest threads without a Linux kernel.
@@ -409,7 +383,7 @@ Every execution backend (`whpx`, `hvf`, and `systrap`) must preserve these archi
 Follow these synchronization rules in `platform/whpx`, `platform/hvf`, and `platform/systrap`:
 
 > [!CAUTION]
-> Always call `runtime.LockOSThread()` at the start of `Context.Switch()` before invoking `hv_vcpu_run`, `WHvRunVirtualProcessor`, or entering a `systrap` trampoline. Calling `hv_vcpu_run` from a migrated OS thread returns `HV_ERROR` immediately, and entering Go with guest `FSBase`, `GSBase`, `X18`, or `MXCSR` crashes the Go runtime.
+> Bind vCPU execution to a locked OS thread before entering a hypervisor run loop or `systrap` trampoline. `whpx` locks the caller thread in `vCPU.Switch()`, whereas `hvf` dispatches `Switch()` to locked `vcpuWorker` threads. Calling `hv_vcpu_run` from another thread returns `HV_ERROR`, and entering Go with guest `FSBase`, `GSBase`, `X18`, or `MXCSR` corrupts the Go runtime.
 
 1. In `platform/whpx` and `platform/hvf` Fast-Path transitions (standard system calls), read and write only the syscall argument/return GPRs, `PC`, `SP`, and `PSTATE`/`RFLAGS` in `CommPage` while leaving `XSAVE`/`V0..V31`, `FSBase`/`GSBase`, and `DR0..DR7` inside the hardware vCPU.
 2. In `platform/whpx` and `platform/hvf` Medium/Cold-Path transitions (`PullFullState` and `FullStateChanged` on `clone`, signal delivery, page faults, `arch_prctl`, and `ptrace` / Wine context queries), synchronize all GPRs (`RCX`, `R11`, `X18`), dual TLS bases, segment selectors, full 512-byte `V0..V31` / `XSAVE` state (`ac.FloatingPointData()`), `FPCR`/`FPSR`/`MXCSR`/`FCW`, and debug registers.
@@ -421,15 +395,15 @@ On `amd64`, `whpx` keeps `YMM0..15` and the AVX-512 state inside the vCPU on the
 
 ### 3.5 Dual-Track Netstack Backend and Port Forwarding: `pkg/netbackend`
 
-Guest applications (`nginx`, `postgres`, `git`, `curl`, `omp`, `herdr`) invoke `socket()`, `connect()`, `bind()`, and `epoll_wait()` against gVisor's pure-Go `pkg/tcpip` (Netstack). Netstack implements the virtual Linux network interface (`eth0`), loopback (`lo`), TCP 3-way handshakes, sliding windows, and packet retransmission in memory. `pkg/netbackend` is 100% OS-agnostic Go code and runs identically on Windows and macOS.
+Guest applications (`nginx`, `postgres`, `git`, `curl`, `dockerd`, `k3s`) invoke `socket()`, `connect()`, `bind()`, and `epoll_wait()` against gVisor's pure-Go `pkg/tcpip` (Netstack). Netstack implements the virtual Linux network interface (`eth0`), loopback (`lo`), TCP 3-way handshakes, sliding windows, and packet retransmission in memory. `pkg/netbackend` is OS-agnostic Go code and runs identically across Windows, macOS, Linux, and Android.
 
 | Egress Attribute | Track A: Go `net` NAT & Port Forwarder (`-net=nat`, Default) | Track B: In-Memory WireGuard (`-net=wg`) |
 | :--- | :--- | :--- |
-| **Interception Layer** | L4 Transport Layer (`tcp.NewForwarder`, `udp.NewForwarder`, `gonet.DialTCP`) | L3 Network Layer (`channel.Endpoint` to `wireguard-go`) |
-| **Packet / Stream Path** | Dials outbound via host `net.DialContext` and forwards inbound `-p host:guest` listeners via `gonet.DialTCP`. | Encrypts raw IP packets in memory and transmits via one pre-bound host UDP socket. |
-| **Admin / Driver Needed** | None (Standard unprivileged host sockets on Windows IOCP and macOS `kqueue`) | None (Pure in-memory link; no `WinTun.dll` or `/dev/tun`) |
+| **Interception Layer** | L2 `pipe` link to a peer stack running `tcp.NewForwarder`, `udp.NewForwarder`, and `gonet.DialTCP` | L3 Network Layer (`pkg/tcpip/link/wgtun` `Endpoint` to `wireguard-go`) |
+| **Packet / Stream Path** | Dials outbound via host `net.DialContext` (`hostlockdown.DialContext` on Windows) and forwards inbound `-p` TCP/UDP/Unix listeners via `gonet`. | Encrypts raw IP packets in memory and transmits via one pre-bound host UDP socket. |
+| **Admin / Driver Needed** | None (unprivileged host sockets over Windows IOCP, macOS `kqueue`, and Linux `epoll`) | None (pure in-memory link; no `WinTun.dll` or `/dev/tun`) |
 | **Local / LAN Access** | Permitted by default (maps `10.0.2.2` / `host.docker.internal` to host `127.0.0.1`; optional `-isolate-lan` flag). | Enforced cryptographically; packets exit only through the WireGuard tunnel. |
-| **Primary Workload** | Unmodified OCI containers (`-p 8080:80`), local dev tools (`git`, `omp`), and L4/L7 API key proxies. | Enterprise LAN isolation, multi-sandbox mesh, and remote `herdr` cluster links. |
+| **Primary Workload** | Unmodified OCI containers (`-p 8080:80`, `-p unix:/tmp/app.sock:80`), local dev tools, and L4/L7 API proxies. | Enterprise LAN isolation, multi-sandbox mesh, and multi-node Kubernetes overlay links. |
 
 ![Dual-Track Netstack Backend](assets/netbackend.svg)
 
@@ -449,35 +423,37 @@ The NAT relay keeps at most 512 UDP sessions by default. The tunable `net.nat.ud
 
 The values of this track that Linux has no knob for are tunables: the MTU of `eth0`, the UDP session limit and idle time, the dial time, the SYN backlog, the DNS time limits, and the limits of published ports. [`cli.md`](cli.md), section 3.3, lists them with their defaults and ranges. The registry in `pkg/gvx/tuning` holds them, and `gvx.Config.Tuning` passes them to `netbackend` through `NATConfig.Tuning`, `WireGuardConfig.Tuning`, and `NewPortForwarder`. No package keeps a global setting: each sandbox holds its own `Values`.
 
-For inbound port forwarding (`-p hostPort:guestPort`), `port_forwarder.go` binds host `net.Listener` and `net.PacketConn` sockets before `hostlockdown.Apply()` executes. When a host client connects to a published port (`127.0.0.1:8080`), `port_forwarder.go` calls `gonet.DialTCP` into Netstack (`10.0.2.15:80`) and relays both streams. Go's `internal/poll` runtime multiplexes host sockets over Windows IOCP and macOS `kqueue` without custom C socket loops. Optional L4/L7 stream interceptors attach at the outbound forwarder boundary to inject host-held LLM API keys without exposing secrets inside the guest environment.
+For inbound port forwarding (`-p hostPort:guestPort`, port ranges up to 1,024 ports, and `-p unix:hostPath:guestPort`), `port_forwarder.go` binds host `net.Listener` and `net.PacketConn` sockets before `hostlockdown.Apply()` executes. When a host client connects to a published TCP or Unix endpoint, `port_forwarder.go` calls `gonet.DialTCP` into Netstack (`10.0.2.15:guestPort`) and relays both streams. Go's `internal/poll` runtime multiplexes host sockets over Windows IOCP, macOS `kqueue`, and Linux `epoll` without custom C socket loops. Optional L4/L7 stream interceptors attach at the outbound forwarder boundary to inject host-held API keys without exposing secrets inside the guest.
 
-A DNS relay (`dns_relay.go`) answers guest queries to `10.0.2.3` through the host resolvers in both `-net=nat` and `-net=wg` modes. The relay reads the resolver addresses before `hostlockdown.Apply()` executes, because the macOS profile denies `getaddrinfo` and reads of `/etc/resolv.conf` afterwards. The relay has no fixed public resolver address. `Config.HostDNSServers` replaces the discovery for a host without `/etc/resolv.conf`, such as an Android app. The registry client of `pkg/oci` takes the same servers through `LayerCache.SetDNSServers`. Its resolver belongs to the cache, so no process-wide resolver changes.
+A DNS relay (`dns_relay.go`) answers guest UDP and TCP queries to `10.0.2.3:53` through the host resolvers in both `-net=nat` and `-net=wg` modes. The relay reads resolver addresses before `hostlockdown.Apply()` executes and randomizes upstream transaction IDs with `crypto/rand`. It bounds concurrent upstream exchanges to 64 slots and retries truncated UDP answers over TCP. The relay defines no fixed public resolver address. `Config.HostDNSServers` (`--host-dns`) supplies explicit resolvers on hosts without `/etc/resolv.conf`, such as Android apps. `LayerCache.SetDNSServers` passes those same resolvers to `pkg/oci` without mutating process-wide DNS state.
 
-#### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go`) (Descriptive Module)
+#### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go` and `pkg/tcpip/link/wgtun`) (Descriptive Module)
 
-In `-net=wg` mode, `wireguard_endpoint.go` attaches a Netstack `channel.Endpoint` (MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wireguard_tun.go` adapts the endpoint to a `tun.Device`, and `wireguard_bind.go` adapts the pre-bound socket to a `conn.Bind`. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to the WireGuard bind interface. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption. Encrypted packets exit exclusively through that pre-bound UDP socket to the configured WireGuard or Tailscale peer. Guest DNS queries to `10.0.2.3:53` resolve through the virtual DNS relay (`dns_relay.go`).
+In `-net=wg` mode, `wireguard_endpoint.go` attaches a shared `wgtun.Endpoint` (`pkg/tcpip/link/wgtun`, default MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wgtun.Endpoint` implements both `stack.LinkEndpoint` and `wireguard-go`'s `tun.Device` with 16-packet batch reads and `Suspend`/`Resume` lifecycle hooks, serving both host `-net=wg` tunnels and in-guest `genetlink/wireguard` interfaces. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to `wireguard_bind.go`. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption and exit exclusively through that pre-bound UDP socket. Guest DNS queries to `10.0.2.3:53` resolve through `dns_relay.go`.
 
-### 3.6 Unmodified Multi-Arch OCI Image Runner: `pkg/oci`
+### 3.6 Unmodified Multi-Arch OCI Image Runner and Host CA Injection: `pkg/oci` and `pkg/gvx/hostcerts`
 
-Extracting Linux container layers (`.tar.gz`) directly onto Windows NTFS or case-insensitive macOS APFS breaks case-sensitive filenames (`xt_CONNMARK.h` vs. `xt_connmark.h`), fails on reserved Windows names (`CON`, `AUX`, `NUL`, `:`), discards POSIX `uid/gid` ownership, and requires elevated privileges for device nodes or symbolic links. `pkg/oci` runs unmodified OCI and Docker images on both Windows and macOS by compiling layer tarballs in memory into cached EROFS images.
+Extracting Linux container layers (`.tar.gz` or `.tar.zst`) onto Windows NTFS or case-insensitive macOS APFS breaks case-sensitive filenames (`xt_CONNMARK.h` vs. `xt_connmark.h`), fails on reserved Windows names (`CON`, `AUX`, `NUL`, `:`), discards POSIX `uid/gid` ownership, and requires elevated privileges for device nodes or symbolic links. `pkg/oci` runs unmodified OCI and Docker images across Windows, macOS, Linux, and Android by compiling layer tarballs into cached EROFS images.
 
 ![OCI Tar-to-EROFS Layer Compilation Pipeline](assets/oci-erofs.svg)
 
 #### Tar-to-EROFS Layer Compilation and Overlay Mount (Procedural Module)
 
-Execute these steps in `pkg/oci` before calling `hostlockdown.Apply()`:
+Execute these steps in `pkg/oci` and `pkg/gvx` before calling `hostlockdown.Apply()`:
 
-1. Resolve the OCI Image Index and select the manifest matching `linux/amd64` or `linux/arm64` for the target guest architecture. Verify the manifest digest and every layer digest.
-2. Parse `Entrypoint`, `Cmd`, `Env`, `WorkingDir`, and `User` from the OCI image configuration JSON.
-3. Stream each `.tar.gz` or `.tar.zst` layer in memory through `tar2erofs.go` without extracting files onto NTFS or APFS. Decode zstd with `github.com/klauspost/compress/zstd` under bounded window and output limits.
-4. Convert OverlayFS whiteout markers (`.wh.<name>` and `.wh..wh..opq`) into native EROFS whiteout nodes and the `trusted.overlay.opaque` attribute on opaque directories.
-5. Write each compiled layer to the non-TCC cache directory (`%LOCALAPPDATA%\gvx\cache\layers\` on Windows; `~/Library/Caches/gvx/layers/` on macOS). Name the file `<sha256>.gvx-erofs-v3-b<block>.erofs`. The block size equals `hostarch.PageSize`, which is 4096. A `.sum` record next to the file proves its integrity.
-6. Open read-only `os.File` handles for all cached `.erofs` layers before calling `hostlockdown.Apply()`.
-7. Mount the `.erofs` handles as ordered read-only lower layers under Sentry's `fsimpl/overlay` with `fsimpl/tmpfs` as the writable upper layer.
+1. Resolve the OCI Image Index and select the manifest matching `linux/amd64` or `linux/arm64` for the guest architecture.
+2. Verify the manifest SHA-256 digest and every compressed layer SHA-256 digest against the registry descriptors.
+3. Parse `Entrypoint`, `Cmd`, `Env`, `WorkingDir`, `User`, and `ExposedPorts` from the OCI image configuration JSON.
+4. Stream each `.tar.gz` or `.tar.zst` layer through `tar2erofs.go` without extracting files onto the host filesystem.
+5. Deduplicate 4 KiB blocks and holes with `InodeDataLayoutChunkBased`, and inline short symlinks and directory tails with `InodeDataLayoutFlatInline`.
+6. Convert OverlayFS whiteouts (`.wh.<name>` and `.wh..wh..opq`) into character device `0:0` nodes and `trusted.overlay.opaque` xattrs.
+7. Write each compiled `.erofs` image and `.sum` sidecar into the platform layer cache (`%LOCALAPPDATA%`, `~/Library/Caches`, or `$XDG_CACHE_HOME`).
+8. Open read-only `HostHandle` descriptors for all lower `.erofs` layers before calling `hostlockdown.Apply()`.
+9. Mount the `.erofs` descriptors under `fsimpl/overlay` using `fsimpl/tmpfs` or persistent `fsimpl/ext4lite` (`-rootfs-upper`) as the upper layer.
 
-An image reference follows the Docker grammar. `oci.ParseReference` splits it into a registry, a repository, a tag, and a digest. The credentials come from `credHelpers`, `credsStore`, or `auths` of the Docker configuration file. The layer cache doubles as the image store: one record for each image and one record for each name. `images`, `tag`, `rmi`, `inspect`, `save`, and `load` work on those records. [`cli.md`](cli.md) states the rules.
+An image reference obeys the Docker reference grammar. `oci.ParseReference` splits a reference into registry, repository, tag, and digest components, and `pkg/oci` reads credentials from `credHelpers`, `credsStore`, or `auths` in `~/.docker/config.json`. The layer cache stores image manifests and tags for `images`, `inspect`, `rmi`, `save`, and `load` ([`cli.md`](cli.md)) under `pkg/gvx/tuning` limits.
 
-The sandbox applies the image settings with Docker rules. The `Entrypoint` and `Cmd` of the image compose the command. The caller environment merges over the `Env` of the image. The `User` resolves against the guest `/etc/passwd` and `/etc/group`. The `ExposedPorts` feed `-P`. The sandbox sets the mode of the guest root to 0755, because the tmpfs upper layer has the mode 01777.
+When `Config.HostCACerts` (`--host-ca-certs`) is set, `pkg/gvx/hostcerts` collects X.509 root certificates from the host trust store before `hostlockdown.Apply()` executes. It queries `CertOpenSystemStore` on Windows, Keychain on macOS, and `/etc/ssl/certs` or `$SSL_CERT_FILE` on Linux and Android. During rootfs setup, the runtime merges those roots with any existing guest CA bundle. It writes PEM bundles into the writable upper layer (`/etc/ssl/certs/ca-certificates.crt` and distribution paths) so guest TLS clients trust host CAs.
 
 ### 3.7 Secure Host File System Driver: `pkg/sentry/fsimpl/hostfs`
 
@@ -529,7 +505,7 @@ The mode writes no `.gvx_meta`, because the parent directory belongs to the user
 
 On Windows, single-file mode never calls `GetFinalPathNameByHandle` on the bound file after the lockdown. `OpenWorkspace` resolves the stored name before the lockdown instead. `NtQueryVolumeInformationFile` reads the volume numbers from the pinned parent handle without a path query.
 
-On macOS or with `-lockdown=false`, a host editor can replace the file with an atomic rename, and fresh opens reach the new file. On Linux and Windows under lockdown, Landlock and file ACLs bind the original file, so atomic replacement requires a directory mount or `-lockdown=false`. An open file description keeps its handle and so keeps the old file. The host watcher polls the one file by name in this mode.
+On macOS, on Windows, or with `-lockdown=false`, a host editor can replace the file by atomic rename, and fresh opens reach it. On Windows, `winMountBroker` authorizes opens by pinned parent identity and leaf filename without altering NTFS ACLs. On Linux under Landlock, the ruleset binds the original inode descriptor, so atomic replacement requires a directory mount or `-lockdown=false`. An open file description keeps its handle and so keeps the old file. The host watcher polls the one file by name in this mode.
 
 #### Host Event Bridge (Descriptive Module)
 
@@ -758,9 +734,10 @@ Windows applies `RestrictedSids` on thread impersonation tokens because `CreateP
 
 Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framework` VM, cached `.erofs` layer descriptors, network sockets, and `/workspace` `os.Root` descriptor:
 
-1. Call `setrlimit(RLIMIT_NPROC, &rlimit{Cur: 0, Max: 0})` to block `fork()` at the XNU kernel boundary.
-2. Call `sandbox_init_with_parameters` with the Seatbelt `deny default` profile to block `process-fork`, `process-exec*`, and new host file opens.
-3. Probe that each denial holds. `Apply` returns an error when a probe succeeds.
+1. Pin `GOMAXPROCS` (`runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))`) so Seatbelt denials on CPU `sysctl` queries do not shrink worker parallelism.
+2. Call `setrlimit(RLIMIT_NPROC, &rlimit{Cur: 0, Max: 0})` to block `fork()` at the XNU kernel boundary.
+3. Call `sandbox_init_with_parameters` with the Seatbelt `deny default` profile to block `process-fork`, `process-exec*`, and unbound file or port binds.
+4. Probe descriptor I/O and verify file, directory, and unbound socket denials; return an error if any denial probe succeeds.
 
 `rungv` and `pkg/gvx` enable the lockdown by default. The option `-lockdown=false` opts out and prints a warning.
 
@@ -825,9 +802,9 @@ The isolated `tools/shiminterop` module compiles real SDK lifecycle code with co
 The installed containerd `2.2.4` smoke verifies native creation rejection and cleanup only. It does not demonstrate a successfully created sandbox.
 Containerd `2.3` binary bootstrap, CRI, guest workloads, and successful native sandbox creation remain outside this adapter.
 
-### 3.11 Guest Kernel Interfaces for the Docker Engine (Descriptive Module)
+### 3.11 Guest Kernel Interfaces for Docker Engine and Kubernetes (Descriptive Module)
 
-`dockerd`, `containerd`, and `runc` read and write kernel files that upstream gVisor does not provide. The `kubelet` and `k3s` need more files (GVXIP-005, phase P1): the rows from `/dev/kmsg` to `/proc/diskstats` belong to that phase. Phase P3 adds the last four rows, which link a node to other nodes. Each addition lives in an `_xplat.go` file next to the upstream file that calls it. The table lists the additions and their owners.
+`dockerd`, `containerd`, `runc`, `kubelet`, and `k3s` read and write Linux kernel interfaces that upstream gVisor omits. Each addition lives in a Tier 1 package or a Tier 2 `*_xplat.go` sibling file alongside the upstream caller. See [`recipes/docker-engine.md`](recipes/docker-engine.md) and [`recipes/kubernetes.md`](recipes/kubernetes.md) for workload deployment guides. The table below lists each interface and its owning package.
 
 | Interface | Owner | Behavior |
 | :--- | :--- | :--- |
@@ -882,7 +859,7 @@ A dump runs as a `genetlink.Dumper`. The socket asks it for one chunk each time 
 
 The registry of link kinds in `socket/netstack/linkkind_xplat.go` does the same for `RTM_NEWLINK`. A package registers a kind from an init function. The one seam in `stack.go` calls the registry for each kind that the stack does not create itself.
 
-The `wireguard` link runs a `wireguard-go` device. Its TUN side is a `channel.Endpoint`, and that endpoint is the link endpoint of the stack. Its UDP side is one IPv4 and one IPv6 UDP endpoint of the network stack where the guest created the link. The encrypted packets leave through the routes of that stack, for example through `eth0` and the NAT of `-net=nat`. The replies arrive through a published UDP port or through the NAT.
+The `wireguard` link runs a `wireguard-go` device over a shared `wgtun.Endpoint` (`pkg/tcpip/link/wgtun`). Its UDP side binds one IPv4 and one IPv6 UDP endpoint on the network stack where the guest created the link. Encrypted packets leave through the routes of that stack, such as `eth0` and the NAT of `-net=nat`. Replies arrive through a published UDP port or through the NAT session table.
 
 The link has an administrative state, as the Linux driver has. `LinkKind.AdminState` makes a link start down, and `netstack.LinkStateListener` gives the endpoint two calls. `ip link set wg0 up` calls `LinkUp`, which opens the two UDP endpoints on the stored listen port, starts the peers, and sends the keepalives. A port that is busy fails the request with `EADDRINUSE` and leaves the link down. `ip link set wg0 down` calls `LinkDown`, which closes the endpoints and stops the peers. The configuration stays. The stored port also stays. Port 0 selects a free port at the first up, and a later up binds that port again, as `wg_open` does. A change of the listen port on a link that is down only stores the port. On a link that is up, it binds the new endpoints before it closes the old ones. A busy port then leaves the device as it was. The link reports `IFF_POINTOPOINT` and `IFF_NOARP`, and `IFF_UP` and `IFF_LOWER_UP` while it is up. Its `IFLA_OPERSTATE` is `IF_OPER_UNKNOWN` while it is up, as on Linux. The stack calls both methods without a stack lock, because the device waits for goroutines that use the stack. A request applies its flags after the other changes. A new route through a link that is down fails with `ENETDOWN`. `/sys/class/net/NAME/operstate` follows the same rule as `IFLA_OPERSTATE`.
 
@@ -969,13 +946,13 @@ A guest must never see or change the state of another sandbox. State of the host
 | `hostfs` budget of watched objects (`processWatches`) | `fsimpl/hostfs` | The descriptors belong to the host process. All workspaces draw from one budget (section 3.7). |
 | `seccompNotifyBusy`, `hostlockdown` state, `fd.installedBroker` and `fd.installedBinder`, `tuning` registry, the log target | `platform/systrap`, `pkg/hostlockdown`, `pkg/fd`, `pkg/gvx` | They describe a host fact, a one-way lockdown of the process, or a table that never changes. |
 
-Each row of the next table is state that a guest can read or limit. Each kernel owns it, through one of three keys.
+Each row of the next table is state that a guest can read or limit. Each kernel owns that state through one of three keys. To attach per-sandbox fields to upstream structs without Tier 3 struct conflicts, `internal/weakmap.Map` provides a 16-shard `weak.Pointer` side table with `runtime.AddCleanup` eviction. `stackExtState` (`pkg/tcpip/stack/ext_state_xplat.go`) and `kernelExtState` (`pkg/sentry/kernel/ext_state_xplat.go`) store per-stack FIB rules, `rp_filter`, conntrack limits, `/dev/kmsg` rings, and checkpoint snapshots, serialized through `saveExt` and `loadExt` hooks.
 
 | State owned by one kernel | Key |
 | :--- | :--- |
 | Usage accounting for `/proc/meminfo`, `sysinfo`, `memory.current`, `memory.stat`, the `memory.max` enforcer, and the WireGuard memory charge | The memory file of the kernel (`MemoryFile.Accounting`) |
-| Cause of an engine fault (`kernel.TakeEngineFault`), reported total memory, node sysctls, `shm_rmid_forced`, cgroup registry and cgroup IDs | The kernel or its namespace |
-| Bridge netfilter switches, netfilter logs, `xt_recent` tables, ipset registries, `vxlan` sockets and links, WireGuard links of a stack, disk registry | The network stack or the VFS |
+| Cause of an engine fault (`kernel.TakeEngineFault`), reported total memory, `/dev/kmsg` ring (`kernelExtState`), node sysctls (`proc.nodeStores`), `shm_rmid_forced`, cgroup registry and cgroup IDs | The kernel or its namespace |
+| Policy-routing FIB, `rp_filter`, proxy ARP, bridge netfilter switches, netfilter logs, `xt_recent` tables, ipset registries, `vxlan` sockets and links, WireGuard links, preserved C/R topology (`stackExtState`), disk registry | The network stack or the VFS |
 
 > [!IMPORTANT]
 > Add a package variable only for host state. Add a test that runs two sandboxes in one process for every guest-visible value that a new variable would hold.
@@ -984,9 +961,36 @@ The tests `TestE2EMemoryAccountingIsPerSandbox`, `TestE2EMemoryLimitCountsOnlyIt
 
 ### 3.13 Pre-Lockdown Checkpoint and Restore (Descriptive Module)
 
-`Sandbox.Checkpoint` (`pkg/gvx/checkpoint.go`) and `gvx.Restore` (`pkg/gvx/restore.go`) save and restore a sandbox without weakening `hostlockdown`. When `Config.CheckpointDir` is set, `gvx.New` and `gvx.Restore` open `manifest.json`, `state.img`, `pages.meta`, and `pages.img` before `hostlockdown.Apply()` runs. When `Config.CheckpointListener` is set, the caller binds the control socket before the lockdown and accepts requests with `Sandbox.AcceptCheckpointConn`.
+`Sandbox.Checkpoint` (`pkg/gvx/checkpoint.go`) and `gvx.Restore` (`pkg/gvx/restore.go`) save and restore a running sandbox on the same host OS, CPU architecture, and execution engine without weakening `hostlockdown`. Both paths open every host file, layer, workspace, volume, and socket handle before `hostlockdown.Apply()` executes.
 
-`Sandbox.Checkpoint` pauses the kernel and writes the device and kernel state to the pre-opened files. It then resumes the guest (`LeaveRunning: true`) or stops the kernel (`LeaveRunning: false`). `gvx.Restore` reads `manifest.json` and opens the bundle descriptors, platform engine, EROFS layers, workspace roots, `ext4lite` images, and network endpoints. It then calls `hostlockdown.Apply()` before `Kernel.LoadFrom` decodes the untrusted checkpoint state.
+![Pre-Lockdown Checkpoint and Restore Pipeline](assets/checkpoint-restore.svg)
+
+#### Bundle Layout and Binary Formats (Reference Module)
+
+A checkpoint directory (`0700`) holds four `0600` files pre-opened before lockdown. Repeated live checkpoints (`LeaveRunning: true`) rewind and truncate those four descriptors in place, then sync `pages.img`, `pages.meta`, `state.img`, and `manifest.json` in order.
+
+| Bundle File | Producer / Consumer | Format Specification |
+| :--- | :--- | :--- |
+| `manifest.json` | `pkg/gvx` (`CheckpointManifest` v1) | JSON object recording `version` (`1`), `goos`, `goarch`, `platform`, `arch`, `user_address_holes`, ordered `layer_digests`, ordered `mounts` (`type`, `guest_path`, `read_only`, `kind`), `net_mode`, and `created_at`. |
+| `state.img` | `pkg/state/statefile` & `pkg/sentry/state` | 8-byte `"gVisorSF"` magic, big-endian `uint64` JSON metadata length, 1 MiB chunked `compressio` stream holding `cpuid.FeatureSet` and the serialized `kernel.Kernel` object graph. |
+| `pages.meta` | `pkg/sentry/pgalloc` | Little-endian `uint64` length plus `MemoryFileMetadataProto` for the primary `MemoryFile`, followed by a `pkg/state` table of private `MemoryFile` metadata keyed by `checkpoint.ResourceID`. |
+| `pages.img` | `pkg/sentry/pgalloc` & `stateio` | Concatenated 4 KiB non-zero committed page ranges scanned with `SEEK_DATA`/`SEEK_HOLE` where supported and loaded asynchronously via `kernel.AsyncMFLoader`. |
+
+#### Control Socket, Save Sequence, and Restore Rebinding (Descriptive Module)
+
+When `-control-socket` (`Config.CheckpointListener`) is set, `cmd/rungv` binds a `0600` Unix domain socket or loopback TCP listener (`tcp://127.0.0.1:<port>`) before `hostlockdown.Apply()` runs. Post-lockdown, `Sandbox.AcceptCheckpointConn` accepts control streams (`winNetBroker` on Windows; pre-bound inbound rules on macOS and Linux). `rungv checkpoint` sends one JSON request (`{"dir":"...","leave_running":true|false}`) and reads one JSON status reply (`{"ok":true}` or `{"ok":false,"error":"..."}`).
+
+During `Sandbox.Checkpoint`, the runtime stops the task watchdog, pauses all guest tasks (`Kernel.Pause`), and quiesces host WireGuard workers (`QuiesceForSave`). Inside `Kernel.SaveTo`, `inet.Namespace.FreezeSave` suspends in-guest `wireguard` and `vxlan` UDP endpoints. `tcp.endpoint.PrepareSave` aborts non-FD forwarder endpoints and drains segment queues. `savePreservedConfigLocked` snapshots guest NICs, routes, `veth` pairs, bridges, VXLAN links, and WireGuard peers into `stackExtState`. `hostfs` stages open unlinked files as `.gvx_tmp_*` entries and flushes `.gvx_meta`. `ext4lite` flushes dirty pages and commits a JBD2 transaction preserving `s_last_orphan`.
+
+During `gvx.Restore`, the runtime parses `manifest.json` and enforces exact equality on `Version`, `GOOS`, `GOARCH`, `Arch`, `Platform`, `UserAddressHoles`, `LayerDigests`, `Mounts`, and `NetMode`. Before calling `hostlockdown.Apply()`, `gvx.Restore` opens the bundle files, platform engine, EROFS layers, `hostfs` workspaces, `ext4lite` volumes (`DeferOrphanCleanup: true`), and network sockets. After `hostlockdown.Apply()` seals the host process, `Kernel.LoadFrom` rebinds EROFS descriptors by `EROFSUniqueID` and `hostfs` workspaces by `checkpoint.ResourceID` (`CompleteRestore` unlinks `.gvx_tmp_*`). It also rebinds `ext4lite` volumes by guest path, stdio via `WithRestoreStdio`, root Netstack via `AttachRestoredStack`, and child namespaces via `inet.Namespace.afterLoad`.
+
+### 3.14 Android Host Runtime and Packaging (`android/`, `tools/androidprobe`) (Descriptive Module)
+
+Android 10 and newer enforce SELinux W^X rules on writable `app_data_file` directories (`Context.getFilesDir()` and `getCacheDir()`), blocking direct `execve` of downloaded binaries. `scripts/android/build-sdk.sh` cross-compiles `cmd/rungv` with Android NDK `clang` (`GOOS=android`, `CGO_ENABLED=1`) into `jniLibs/<abi>/librungv.so` inside `gvx-android.aar` (`minSdkVersion 31`). App manifests set `android:extractNativeLibs="true"` and align APKs with `zipalign -P 16` so PackageManager extracts `librungv.so` under the executable `apk_data_file` SELinux label in `ApplicationInfo.nativeLibraryDir`.
+
+The Java entry point `dev.gfire.gvx.Gvx` (`android/library`) configures `ProcessBuilder` for `librungv.so`. It sets `HOME` and `TMPDIR` to app-private directories, reads active resolvers from `ConnectivityManager.getLinkProperties()`, injects `--host-dns=<ip>` for `run` commands, and launches the sandbox process. `android/sample` wraps `Gvx.start` inside an Android 14+ `specialUse` foreground service (`RunService`) so background execution limits do not freeze guest tasks.
+
+Inside the Android sandbox process, `platform/systrap` allocates executable stub mappings with `memfd_create(MFD_EXEC)` and probes `vm.mmap_min_addr` (`0x8000`) with `MAP_FIXED_NOREPLACE`. It caps `idleStubLimit` and `maxSysmsgThreads` to `2` under Android 12's 32-process ceiling and activates `subblock_xplat.go` on 16 KiB ARM64 kernels. `pkg/hostlockdown` detects Zygote's `untrusted_app` seccomp filter (`PR_GET_SECCOMP == 2`), skips Landlock syscalls that Zygote traps with `SIGSYS`, and relies on Android's per-UID SELinux domain and mount namespace. `tools/androidprobe` reports kernel page size, `memfd`, seccomp, and `systrap` capabilities on target devices and CI emulators.
 
 ---
 
@@ -1006,28 +1010,32 @@ Implementation proceeds across five sequential milestones (`M1` through `M5`) ta
 
 Within each milestone (`M1` through `M5`), engineers implement and verify `darwin/arm64` code paths (`*_darwin.go`, `*_arm64.s`, `platform/hvf`) first on the Apple Silicon development host. Running `go test -race -exec "$PWD/scripts/codesign-exec.sh" ./...` natively on `darwin/arm64` validates the Sentry integration, VFS semantics, and OCI/Netstack pipelines immediately. Once `darwin/arm64` passes all tests, engineers implement the sibling `windows/{amd64,arm64}` bindings (`*_windows.go`, `platform/whpx`, and the Windows `platform/systrap` engine) and verify cross-compilation across all five targets.
 
-`gvx` enforces the Barbell Testing Model across two test layers:
+`gvx` structures verification across three complementary test layers:
 
 | Test Layer | Package Scope | Build Constraints | Behavioral Contract Verified |
 | :--- | :--- | :--- | :--- |
-| **Bottom of Barbell: Host Primitive Unit Tests** | `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/hostlockdown`, `platform/{whpx,hvf,systrap}` | OS-specific (`*_darwin_test.go`, `*_windows_test.go`) | Verifies low-level OS syscalls (`__ulock_wait`, `WaitOnAddress`, `mach_vm_remap`, `MapViewOfFile3`, Seatbelt, JobObjects, in-place syscall patching, and 4KB Trampoline Islands) in isolation. |
-| **Top of Barbell: Unified Black-Box E2E Suite** | `e2e/` (`sandbox_e2e_test.go`) | 100% OS-agnostic (`//go:build darwin \|\| windows \|\| linux`) | Invokes `pkg/gvx` and `cmd/rungv` with identical assertions across Windows, macOS, and Linux (`amd64` & `arm64`) and all backends (`hvf`, `whpx`, `systrap`). `-platform=auto` selects `systrap` on Linux. |
+| **Host Primitive & Contract Unit Tests** | `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/hostlockdown`, `platform/{whpx,hvf,systrap}`, `fsimpl/{hostfs,ext4lite}`, `pkg/oci`, `pkg/ipset` | OS-specific (`*_{darwin,windows,linux}_test.go`) and pure-Go | Verifies host syscalls (`__ulock_wait`, `WaitOnAddress`, `mach_vm_remap`, `MapViewOfFile3`, Seatbelt, JobObjects, Landlock), binary patchers, crash recovery, and data structures. |
+| **Zero-Dependency Guest Probes** | `internal/acceptprog` (`acceptprog`, `lockdownprobe`, `checkpointprobe`, `cpumaxprobe`, `nodeprobe`) | Cross-compiled `GOOS=linux` (`amd64` & `arm64`, `CGO_ENABLED=0`) | Exercises guest syscalls, signal frames, vector state, namespaces, cgroup limits, and C/R transitions offline without registry pulls. |
+| **Unified Black-Box E2E & POSIX Suites** | `e2e/` and `scripts/pjdfstest` | 100% OS-agnostic (`//go:build darwin \|\| windows \|\| linux`) | Invokes `pkg/gvx` and `cmd/rungv` with identical assertions across Windows, macOS, Linux (4KB & 16KB), and Android, plus `pjdfstest` POSIX conformance on `hostfs` and `ext4lite`. |
 
 ### 4.2 Continuous Integration and Verification Status (Procedural Module)
 
-GitHub Actions runs the verification that the local host cannot run. The workflows live in `.github/workflows/`. Keep CI usage small: a new push cancels the older run, documentation-only changes skip it, and tests that pull images run once a week.
+GitHub Actions executes cross-platform verification in `.github/workflows/`. Workflows cancel superseded runs on new pushes, skip doc-only pushes where configured, and isolate registry pulls to weekly schedules.
 
 | Workflow and Job | Runner | What It Verifies |
 | :--- | :--- | :--- |
-| `ci.yml` (`build, vet, and audit`) | `ubuntu-24.04` | Formatting of the packages that `gvx` owns, a build of every package for five targets, `go vet` of the packages that `gvx` wrote, the gVisor analyzers `checklocks`, `checkconst`, and `checklinkname` on every package for five targets (Section 4.5), and the upstream audit. |
-| `ci.yml` (`test linux/amd64`, `test linux/arm64`) | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages. Without cgo: `pkg/hostlockdown`, `pkg/gvx`, and the whole `e2e` suite with the seccomp lockdown on. Guest runs on the upstream `systrap` platform with and without the lockdown. |
-| `ci.yml` (`test darwin/arm64`) | `macos-15` | The owned packages and `pkg/sentry/platform/systrap` through `scripts/codesign-exec.sh`. The runner has no hypervisor, so `GVX_ALLOW_NO_HYPERVISOR=1` skips the tests that run a guest. |
-| `ci.yml` (`test windows/amd64`) | `windows-latest` | The owned packages, the `systrap` engine, the host lockdown tests, a report of the hypervisor state, and a guest boot on `whpx`. |
-| `ci.yml` (`test windows/arm64`) | `windows-11-arm` | The containerd shim control plane, the `systrap` engine, and the `systrap` end-to-end and host lockdown suites. |
-| `e2e-images.yml` (`test linux/*`, `test windows/*`) | `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The registry gates, once a week. The Linux and Windows jobs run the same registry scope with host lockdown enabled: every gate on `systrap`, plus `whpx` on `windows-latest`. Only `TestE2EK3sMultiNodeMixedKernels` and `TestE2EK3sConformance*` run on Linux alone. `TestE2EK3sMultiNodeControlPlaneFailover` does not run on `windows-11-arm`. |
-| `pjdfstest.yml` (`select pjdfstest drivers`, `build pjdfstest bundle linux/*`, `test pjdfstest <fs> <target>`) | `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The POSIX conformance suite `pjdfstest` inside `systrap` guests. A change below `pkg/sentry/fsimpl/ext4lite` runs it on `ext4lite` volumes. A change below `pkg/sentry/fsimpl/hostfs` runs it on `hostfs` volumes. A change of the harness runs both. |
-| `diagnose.yml` (`test (<runner>)`) | A chosen runner | A chosen test selection or script, started by hand. |
-| `release.yml` (`build <target>`, `publish`) | `ubuntu-24.04`, `macos-15` | The five archives of a `v*` tag, the signature of the macOS binary, the SLSA build provenance attestation, and the GitHub release. A pull request that changes the workflow runs every step except the publication. |
+| `ci.yml` (`build, vet, and audit`) | `ubuntu-24.04` | Formatting of owned packages, five-target builds, `go vet`, `gostateify -check`, `tools/licenses -check`, `gvisorlint` (`checklocks`, `checkconst`, `checklinkname`), and `tools/upstream` (`-max-ratio=0.042`). |
+| `ci.yml` (`test linux/amd64`, `test linux/arm64`) | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of owned packages, 16KB sub-block emulation (`GVX_SYSTRAP_SUBBLOCKS=1`), seccomp lockdown, and the offline `e2e` suite on `systrap`. |
+| `ci.yml` (`repro`) | `ubuntu-24.04` | `scripts/verify-repro-gvx.sh`: builds `rungv` inside a Go container running on `gvx` and verifies bit-for-bit SHA-256 reproducibility against the host build. |
+| `ci.yml` (`test darwin/arm64`) | `macos-15` | Owned packages and `systrap` stub tests signed via `scripts/codesign-exec.sh` (`GVX_ALLOW_NO_HYPERVISOR=1` skips VM boot on nested macOS runners). |
+| `ci.yml` (`test windows/amd64`) | `windows-latest` | Owned packages, `winsystrap`, `hostlockdown`, hypervisor state report, and guest boot on `whpx`. |
+| `ci.yml` (`test windows/arm64`) | `windows-11-arm` | Containerd shim control plane, `winsystrap`, offline `e2e` suite, and `hostlockdown`. |
+| `android.yml` (`emulator smoke`) | `ubuntu-24.04` (KVM) | `scripts/android/emulator-smoke.sh` on an x86_64 Android 16 emulator: `androidprobe`, `systrap`/`hostfs`/`ext4lite` tests, offline `e2e`, and `gvx-android.aar` sample APK smoke. |
+| `linux16k.yml` (`arm64-16k`) | `ubuntu-24.04-arm` (QEMU) | Boots Debian trixie `arm64-16k` in QEMU and runs `scripts/linux16k/run.sh` across `systrap` sub-blocks, `hostfs`, `ext4lite`, and offline `e2e`. |
+| `pjdfstest.yml` (`test pjdfstest <fs> <target>`) | `ubuntu-24.04*`, `windows-*` | Runs the POSIX conformance suite `pjdfstest` against `ext4lite` and `hostfs` and compares output with `scripts/pjdfstest/known-failures.txt`. |
+| `e2e-images.yml` (`test linux/*`, `test windows/*`) | `ubuntu-24.04*`, `windows-*` | Weekly real-registry OCI, Docker Engine, and multi-node K3s gates under host lockdown. |
+| `benchmark.yml` & `diagnose.yml` | Chosen runners | On-demand microbenchmarks (`microbench_e2e_test.go`) and targeted runner diagnostics. |
+| `release.yml` (`build <target>`, `publish`) | `ubuntu-24.04`, `macos-15` | Publishes seven archives (`linux-{amd64,arm64}`, `darwin-arm64`, `windows-{amd64,arm64}`, `android-arm64`, `gvx-android.aar`), `SHA256SUMS`, and SLSA provenance attestations. |
 
 The `pjdfstest` harness lives in `scripts/pjdfstest`. The command `internal/pjdfsreport` compares the guest output with `scripts/pjdfstest/known-failures.txt`. That file lists only failures that a host file system cannot avoid, by driver, host OS, and test number. A failure that the file does not list fails the job. A listed failure that does not occur also fails the job, so the list cannot go stale. CI has no macOS guest, so run the suite on a Mac with `hvf` by hand. Set `PJDFS_PLATFORM=auto`, then run `build-bundle.sh`, `run.sh`, and `go run ./internal/pjdfsreport -os darwin`.
 
@@ -1041,7 +1049,8 @@ The gate `TestE2EGateETExec` decides whether a backend runs an executable that l
 | `darwin/arm64` `systrap` | Not applicable. The engine was removed. `platform_darwin.go` returns `ErrUnavailable`, and CI builds and vets it. |
 | `windows/amd64` and `windows/arm64` | CI builds and tests both. `whpx` runs on `windows/amd64` where the runner exposes the Windows Hypervisor Platform, and `systrap` runs on both `windows/amd64` and `windows/arm64`. |
 | `darwin/amd64` | Not supported. The project dropped this target. |
-| `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both. |
+| `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both (4KB host pages natively and 16KB ARM64 pages in QEMU). |
+| `android/arm64` (`android/amd64` CI) | CI builds `gvx-android.aar` and runs `emulator-smoke.sh` on an Android 16 KVM emulator. |
 
 ### 4.3 Containerd Shim Verification (Reference Module)
 
@@ -1060,7 +1069,7 @@ The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2
 | Native Darwin `arm64` | Focused race tests passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290740802)) | Focused diagnose run, not the full CI workflow |
 | Native Windows `amd64` | Focused packages and fallocate cases passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290744995)) | Focused diagnose run, not the full CI workflow |
 | Native Windows `arm64` | Focused packages and fallocate cases passed ([run](https://github.com/gfire-sigs/gvx/actions/runs/41290749213)) | Focused diagnose run, not the full CI workflow |
-| Upstream isolation | The audit charged 18/2507 files (0.72%), below the 1.0% ceiling | Charged share excludes Linux fences |
+| Upstream isolation | Historical snapshot at `f3b7ef4` charged 18/2507 files (0.72%); current `main` audits against the 4.2% CI gate (`< 5.0%` ceiling) | Charged share excludes Linux fences |
 
 Workload creation and native sandbox creation remain unsupported; these results make no CRI or guest-execution claim.
 The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-module) reproduces the SDK and external-daemon boundaries without registry or rootfs dependencies.
@@ -1072,4 +1081,16 @@ The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-
 ### 4.5 The gVisor Static Analyzers (`tools/gvisorlint`)
 
 `scripts/gvisorlint.sh` builds `tools/gvisorlint` and runs `checklocks`, `checkconst`, and `checklinkname` via `go vet` across all five target platforms (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`). Fix lock order or field protection defects in code first; use `// +checklocksforce:` or `// +checklocksignore:` only with a documented reason when the SSA analyzer cannot follow a valid lock path. `tools/gvisorlint/baseline.txt` holds accepted upstream findings only.
+
+### 4.6 Native State Code Generator (`tools/gostateify`)
+
+`tools/gostateify` generates reflection-free `pkg/state` `StateSave`, `StateLoad`, and `init` registration methods from `// +stateify savable` struct annotations without Bazel. `tools/gostateify/packages.txt` lists every registered package. Entries marked `tier2` restrict code generation to Tier 2 `*_xplat.go`, `*_windows.go`, and `*_darwin.go` files and emit `*_xplat_state_autogen.go` siblings so upstream `*_state_autogen.go` files remain untouched. Run `./scripts/gostateify.sh` after editing savable structs, and run `./scripts/gostateify.sh -check` in CI to reject stale generated files.
+
+### 4.7 Third-Party License Collector (`tools/licenses`)
+
+`tools/licenses` resolves the transitive Go module graph of shipped binaries, collects upstream license notices, and verifies `THIRD_PARTY_LICENSES.txt` (`go run ./tools/licenses -check`). `cmd/rungv` embeds the resulting notice bundle for `rungv license`, and `release.yml` packages `LICENSE` and `THIRD_PARTY_LICENSES.txt` in every release archive.
+
+### 4.8 Reproducible Builds (`scripts/repro-build.sh` and `scripts/verify-repro-gvx.sh`)
+
+`scripts/repro-build.sh` compiles `cmd/rungv` and `cmd/containerd-shim-gvx-v2` with deterministic flags (`-trimpath`, `-buildvcs=false`, stripped build IDs, and pinned `CGO_ENABLED=0` toolchains). `scripts/verify-repro-gvx.sh` builds `rungv` on the host and inside a `golang` OCI container running on `gvx`, then asserts that both binaries produce identical SHA-256 digests.
 
