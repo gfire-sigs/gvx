@@ -18,6 +18,7 @@ package whpx
 
 import (
 	"fmt"
+	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cpuid"
@@ -50,10 +51,16 @@ const (
 	x64EferNXE = 1 << 11
 )
 
+var archInitOnce sync.Once
+
+func init() {
+	archInit()
+}
+
 // archInit sets global state of the page table package. The
 // guest uses 4-level paging, so it must not use 5 levels on hosts with LA57.
 func archInit() {
-	pagetables.DisableLA57()
+	archInitOnce.Do(pagetables.DisableLA57)
 }
 
 func hostCPUPABits() uint32 {

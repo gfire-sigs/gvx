@@ -739,6 +739,7 @@ func TestSaveRestoreSweepsUnreferencedDeferredOrphans(t *testing.T) {
 	if err := e.vfsObj.PrepareSave(e.ctx, vfs.PrepareSaveOptions{}); err != nil {
 		t.Fatalf("PrepareSave: %v", err)
 	}
+	staleFD.DecRef(e.ctx)
 	e.fs.mu.Lock()
 	delete(e.fs.inodes, staleIno)
 	e.fs.mu.Unlock()
@@ -755,7 +756,6 @@ func TestSaveRestoreSweepsUnreferencedDeferredOrphans(t *testing.T) {
 		t.Fatalf("state.Save: %v", err)
 	}
 	keptFD.DecRef(e.ctx)
-	staleFD.DecRef(e.ctx)
 	e.unmount()
 
 	rf, err := os.OpenFile(imgPath, os.O_RDWR, 0)

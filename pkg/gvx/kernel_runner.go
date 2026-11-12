@@ -544,7 +544,11 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	stopGuard := s.startKernelMemoryGuard(ctx, k, tg, mf, hostRAM, &memoryExceeded)
 	defer stopGuard()
 
+	tg.WaitExited()
+	s.ckptMu.Lock()
+	s.clearActiveKernel()
 	k.WaitExited()
+	s.ckptMu.Unlock()
 	close(doneCh)
 	k.Pause()
 

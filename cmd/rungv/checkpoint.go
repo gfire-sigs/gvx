@@ -228,6 +228,9 @@ func listenCheckpointSocket(raw string) (net.Listener, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 	if err := os.Chmod(address, 0o600); err != nil && runtime.GOOS != "windows" {
 		_ = ln.Close()
 		_ = os.Remove(address)

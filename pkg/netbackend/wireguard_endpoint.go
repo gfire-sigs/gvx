@@ -413,6 +413,9 @@ func (w *WireGuardEndpoint) startDNSRelayLocked(_ *stack.Stack) error {
 		return fmt.Errorf("netbackend: listen WireGuard virtual TCP DNS: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	if w.dnsSem == nil {
+		w.dnsSem = make(chan struct{}, maxConcurrentDNS)
+	}
 	w.dnsStack = dnsStack
 	w.dnsCancel = cancel
 	w.dnsUDP = udpConn
@@ -623,8 +626,8 @@ func (w *WireGuardEndpoint) AttachRestoredStack(restored *stack.Stack) error {
 		return errors.New("netbackend: restored stack is nil")
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if err := w.preBindLocked(); err != nil {
+		w.mu.Unlock()
 		return err
 	}
 
@@ -632,6 +635,7 @@ func (w *WireGuardEndpoint) AttachRestoredStack(restored *stack.Stack) error {
 	oldDev, oldStack, oldChEP := w.dev, w.stack, w.channelEP
 	w.dnsCancel, w.dnsUDP, w.dnsTCP, w.dnsStack, w.dnsLink = nil, nil, nil, nil, nil
 	w.dev, w.stack, w.channelEP = nil, nil, nil
+	w.mu.Unlock()
 
 	if dnsCancel != nil {
 		dnsCancel()
@@ -654,6 +658,12 @@ func (w *WireGuardEndpoint) AttachRestoredStack(restored *stack.Stack) error {
 	}
 	if oldChEP != nil {
 		oldChEP.Close()
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return errors.New("netbackend: WireGuard endpoint is closed")
 	}
 
 	restored.ResetConfig()

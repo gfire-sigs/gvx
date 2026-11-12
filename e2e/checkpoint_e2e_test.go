@@ -647,6 +647,7 @@ func runRestoreLockdownHelperSubprocess(t *testing.T) {
 	plat := gvx.PlatformType(os.Getenv(restoreLockdownPlatEnv))
 	outsideFile := os.Getenv(restoreLockdownProbeFile)
 	outsideDir := os.Getenv(restoreLockdownProbeDir)
+	selfExe, exeErr := os.Executable()
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	restoredSB, err := gvx.Restore(ctx, gvx.Config{
@@ -676,7 +677,6 @@ func runRestoreLockdownHelperSubprocess(t *testing.T) {
 	if wErr := os.WriteFile(filepath.Join(outsideDir, "escape.txt"), []byte("nope"), 0o600); wErr != nil {
 		rep.OutsideWriteBlocked = true
 	}
-	selfExe, exeErr := os.Executable()
 	if exeErr == nil {
 		if cErr := exec.Command(selfExe, "-test.list=^$").Run(); cErr != nil {
 			rep.SubprocessBlockedByOS = true

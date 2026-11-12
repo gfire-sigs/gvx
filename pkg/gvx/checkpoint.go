@@ -255,7 +255,12 @@ func (s *Sandbox) AcceptCheckpointConn() (net.Conn, error) {
 // false, Checkpoint stops the guest kernel so Run returns cleanly.
 func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error {
 	s.ckptMu.Lock()
-	defer s.ckptMu.Unlock()
+	ckptLocked := true
+	defer func() {
+		if ckptLocked {
+			s.ckptMu.Unlock()
+		}
+	}()
 
 	s.mu.Lock()
 	files := s.ckptFiles
@@ -366,6 +371,9 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error 
 	}
 	k.Unpause()
 	k.OnCheckpointAttempt(nil)
+	s.clearActiveKernel()
+	ckptLocked = false
+	s.ckptMu.Unlock()
 	select {
 	case <-doneCh:
 		return nil

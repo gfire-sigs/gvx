@@ -368,6 +368,7 @@ func TestCheckpointLeaveRunningAndRestore(t *testing.T) {
 }
 
 func TestCheckpointAndRestoreTwoSandboxesConcurrent(t *testing.T) {
+	requireCheckpointGuestBackend(t)
 	cacheDir := t.TempDir()
 	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
