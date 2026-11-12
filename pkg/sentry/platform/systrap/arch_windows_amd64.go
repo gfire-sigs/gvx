@@ -1388,6 +1388,9 @@ func (as *addressSpace) patchGSMovJump(ctx context.Context, mm platform.MemoryMa
 	return gp, ref, true
 }
 
+// gsMovMaxAccess is the most bytes that a patched GS-segment MOV accesses.
+const gsMovMaxAccess = 8
+
 // recoverIslandFault restores the guest registers and program counter when a
 // GS-segment MOV trampoline slot faults on the guest memory access.
 func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *debugEvent) (bool, error) {
@@ -1425,7 +1428,15 @@ func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *d
 		th.ctx.put64(ctxOffRax+8*int(info.scratch), saved)
 	}
 	th.ctx.setPC(site)
-	ev.Info[1] = ac.StateData().Regs.Gs_base + uint64(int64(info.disp))
+	// The slot ran the access with the stub GS base, so the hardware address
+	// is not the guest address. The guest address is the start of the access.
+	// An access that crosses a page boundary faults at the first byte of the
+	// next page, and that byte lies inside the access. The memory manager must
+	// resolve that page, so the hardware address stays.
+	start := ac.StateData().Regs.Gs_base + uint64(int64(info.disp))
+	if hw := ev.Info[1]; hw <= start || hw-start >= gsMovMaxAccess || hw&(blockSize-1) != 0 {
+		ev.Info[1] = start
+	}
 	if info.store {
 		ev.Info[0] = avWrite
 	} else {
