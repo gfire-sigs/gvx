@@ -200,14 +200,14 @@ func TestControlRequestReadDeadlineFreesTheServer(t *testing.T) {
 
 	sockPath := filepath.Join(shortSocketDir(t), "slow.sock")
 	cp := &fakeCheckpointer{}
-	startFakeControl(t, sockPath, cp)
+	ep, _ := startFakeControl(t, sockPath, cp)
 
 	slow := dialRaw(t, "unix", sockPath)
 	if _, err := slow.Write([]byte(`{"dir":`)); err != nil {
 		t.Fatal(err)
 	}
 
-	resp := exchange(t, dialRaw(t, "unix", sockPath), checkpointControlRequest{Dir: "ckpt"})
+	resp := exchange(t, dialRaw(t, "unix", sockPath), checkpointControlRequest{Dir: "ckpt", Token: ep.Token})
 	if !resp.OK || cp.calls.Load() != 1 {
 		t.Fatalf("second client = %+v, Checkpoint calls = %d, want ok and 1", resp, cp.calls.Load())
 	}
@@ -216,12 +216,18 @@ func TestControlRequestReadDeadlineFreesTheServer(t *testing.T) {
 func TestControlStopKeepsInFlightResponse(t *testing.T) {
 	sockPath := filepath.Join(shortSocketDir(t), "busy.sock")
 	cp := &fakeCheckpointer{started: make(chan struct{}, 1), gate: make(chan struct{})}
-	_, stop := startFakeControl(t, sockPath, cp)
+	ep, stop := startFakeControl(t, sockPath, cp)
 
 	conn := dialRaw(t, "unix", sockPath)
 	respCh := make(chan checkpointControlResponse, 1)
-	go func() { respCh <- exchange(t, conn, checkpointControlRequest{Dir: "ckpt"}) }()
-	<-cp.started
+	go func() { respCh <- exchange(t, conn, checkpointControlRequest{Dir: "ckpt", Token: ep.Token}) }()
+	select {
+	case <-cp.started:
+	case resp := <-respCh:
+		t.Fatalf("the request ended before Checkpoint started: %+v", resp)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Checkpoint did not start")
+	}
 
 	stopped := make(chan struct{})
 	go func() {
