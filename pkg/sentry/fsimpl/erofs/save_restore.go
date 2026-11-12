@@ -33,11 +33,19 @@ func (fs *filesystem) afterLoad(ctx context.Context) {
 	if !ok {
 		panic(fmt.Sprintf("no image FD available for filesystem with unique ID %q, map: %#v", fs.iopts.UniqueID, fdmap))
 	}
-	newImage, err := erofs.OpenImage(os.NewFile(uintptr(fd), "EROFS image file"))
+	// The image file owns the descriptor from here on. Delete the entry so
+	// that the caller does not close it again, and so that a second
+	// filesystem with the same unique ID fails instead of sharing one
+	// descriptor between two os.File values.
+	delete(fdmap, fs.iopts.UniqueID)
+	imageFile := os.NewFile(uintptr(fd), "EROFS image file")
+	newImage, err := erofs.OpenImage(imageFile)
 	if err != nil {
+		_ = imageFile.Close()
 		panic(fmt.Sprintf("erofs.OpenImage failed: %v", err))
 	}
 	if got, want := newImage.SuperBlock(), fs.image.SuperBlock(); got != want {
+		_ = imageFile.Close()
 		panic(fmt.Sprintf("superblock mismatch detected on restore, got %+v, expected %+v", got, want))
 	}
 	// We need to update the image in place, as there are other pointers

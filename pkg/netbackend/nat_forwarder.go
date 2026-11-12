@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,18 @@ const (
 	// UDP session. A connected host socket reports an ICMP error once per
 	// refused datagram, and that error does not end the session.
 	maxTransientUDPErrors = 8
+
+	// maxNATTCPRelays bounds the guest TCP connections that the NAT relays at
+	// once, including the ones that still dial. Each relay holds one host
+	// socket and two goroutines. The forwarder resets a connection beyond the
+	// limit.
+	maxNATTCPRelays = 4096
+
+	// maxNATDNSFlows bounds the guest flows that the virtual resolver serves at
+	// once: one for each UDP source port and one for each TCP connection. Each
+	// flow holds a guest endpoint, a goroutine, and a read buffer until it
+	// idles out. The forwarder drops a flow beyond the limit.
+	maxNATDNSFlows = 256
 )
 
 // StreamInterceptor inspects or transforms an outbound L4 stream between the
@@ -127,6 +140,13 @@ type NATForwarder struct {
 	log         *slog.Logger
 	upstreamDNS []string
 	dnsSem      chan struct{}
+	// paused is true between QuiesceForSave and ResumeAfterSave. While it is
+	// true, both ends of the eth0 link drop every packet.
+	paused *atomic.Bool
+	// tcpRelaySem and dnsFlowSem count the running TCP relays and DNS flows.
+	// A nil channel means no limit.
+	tcpRelaySem chan struct{}
+	dnsFlowSem  chan struct{}
 	udpIdle     time.Duration
 	udpSessions *udpSessionTable
 	ctx         context.Context
@@ -165,6 +185,9 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 	if e.nf == nil {
 		return e.LinkEndpoint.WritePackets(pkts)
 	}
+	if e.nf.paused != nil && e.nf.paused.Load() {
+		return pkts.Len(), nil
+	}
 	var filtered stack.PacketBufferList
 	dropped := 0
 	dnsIP := netip.MustParseAddr(HostDNSIPv4)
@@ -192,6 +215,39 @@ func (e *natLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 	}
 	n, err := e.LinkEndpoint.WritePackets(filtered)
 	return n + dropped, err
+}
+
+// pausableLink drops every packet that the stack writes to it while paused is
+// true, as if an unplugged cable carried them. TCP retransmits after the
+// link comes back, so a pause shows to the guest as packet loss only.
+type pausableLink struct {
+	stack.LinkEndpoint
+	paused *atomic.Bool
+}
+
+// WritePackets implements stack.LinkEndpoint.WritePackets.
+func (e pausableLink) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	if e.paused.Load() {
+		return pkts.Len(), nil
+	}
+	return e.LinkEndpoint.WritePackets(pkts)
+}
+
+// QuiesceForSave stops the packet flow between the guest and the host relays.
+// The guest Netstack then holds no new packet from a relay while the kernel
+// saves its state. ResumeAfterSave restores the flow.
+func (nf *NATForwarder) QuiesceForSave() {
+	if nf.paused != nil {
+		nf.paused.Store(true)
+	}
+}
+
+// ResumeAfterSave restores the packet flow that QuiesceForSave stopped.
+func (nf *NATForwarder) ResumeAfterSave() error {
+	if nf.paused != nil {
+		nf.paused.Store(false)
+	}
+	return nil
 }
 
 // NewLoopbackStack creates a pure-Go Netstack configured with lo (127.0.0.1/8)
@@ -254,12 +310,14 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	// tunnels from it: flannel uses the MTU of eth0 minus 50 for vxlan and
 	// minus 80 for WireGuard. The loopback device keeps the MTU of 65536.
 	guestEP, hostEP := pipe.New("", "", uint32(cfg.Tuning.Int(tuning.NATMTU)))
-	hostStack, err := newNATHostStack(checksumOffloadEndpoint{hostEP})
+	paused := new(atomic.Bool)
+	hostStack, err := newNATHostStack(pausableLink{checksumOffloadEndpoint{hostEP}, paused})
 	if err != nil {
 		s.Close()
 		return nil, nil, err
 	}
 	fwd := newNATForwarder(hostStack, cfg)
+	fwd.paused = paused
 	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, fwd); err != nil {
 		_ = fwd.Close()
 		s.Close()
@@ -395,6 +453,9 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		log:         log,
 		upstreamDNS: upstream,
 		dnsSem:      make(chan struct{}, maxConcurrentDNS),
+		paused:      new(atomic.Bool),
+		tcpRelaySem: make(chan struct{}, maxNATTCPRelays),
+		dnsFlowSem:  make(chan struct{}, maxNATDNSFlows),
 		udpIdle:     cfg.Tuning.Duration(tuning.UDPIdleTimeout),
 		udpSessions: newUDPSessionTable(cfg.Tuning.Int(tuning.NATUDPSessions)),
 		ctx:         ctx,
@@ -428,11 +489,165 @@ func (nf *NATForwarder) rebindHostNIC(ep stack.LinkEndpoint) error {
 	return nil
 }
 
+// Limits for Eth0Config. A checkpoint of a normal guest holds a few entries.
+// The limits stop a corrupt manifest from forcing thousands of Netstack calls.
+const (
+	maxEth0Addresses = 64
+	maxEth0Routes    = 1024
+)
+
+// Eth0Config holds the settings of eth0 that a guest changes at run time:
+// its addresses, its MTU, and its routes. NewNATStack gives eth0 fixed
+// values, and the state of a saved guest Netstack does not hold NIC settings,
+// so a checkpoint records them with SnapshotEth0Config and a restore applies
+// them again with AttachRestoredStackWithConfig.
+type Eth0Config struct {
+	// Addresses lists the addresses of eth0 in CIDR form.
+	Addresses []string `json:"addresses,omitempty"`
+	// MTU is the MTU of eth0 in bytes.
+	MTU uint32 `json:"mtu,omitempty"`
+	// Routes lists the main-table unicast routes that leave through eth0.
+	Routes []Eth0Route `json:"routes,omitempty"`
+}
+
+// Eth0Route is one route of eth0.
+type Eth0Route struct {
+	// Destination is the prefix of the route in CIDR form.
+	Destination string `json:"destination"`
+	// Gateway is the next hop, or empty for an on-link route.
+	Gateway string `json:"gateway,omitempty"`
+	// MTU is the MTU of the route, or zero for the MTU of eth0.
+	MTU uint32 `json:"mtu,omitempty"`
+}
+
+// SnapshotEth0Config reads the settings of eth0 from the guest stack s. It
+// returns false when s has no eth0 with an IPv4 address.
+func SnapshotEth0Config(s *stack.Stack) (Eth0Config, bool) {
+	if s == nil {
+		return Eth0Config{}, false
+	}
+	info, ok := s.NICInfo()[Eth0NICID]
+	if !ok {
+		return Eth0Config{}, false
+	}
+	var cfg Eth0Config
+	hasIPv4 := false
+	for _, pa := range info.ProtocolAddresses {
+		addr := pa.AddressWithPrefix.Address
+		if pa.Protocol == ipv4.ProtocolNumber {
+			hasIPv4 = true
+		} else if header.IsV6LinkLocalUnicastAddress(addr) {
+			// Netstack derives the link-local address of eth0 itself.
+			continue
+		}
+		ip, ok := netip.AddrFromSlice(addr.AsSlice())
+		if !ok || len(cfg.Addresses) >= maxEth0Addresses {
+			continue
+		}
+		cfg.Addresses = append(cfg.Addresses, netip.PrefixFrom(ip, pa.AddressWithPrefix.PrefixLen).String())
+	}
+	if !hasIPv4 {
+		return Eth0Config{}, false
+	}
+	cfg.MTU = info.MTU
+	for _, r := range s.GetRouteTable() {
+		if r.NIC != Eth0NICID || r.TableID() != tcpip.RouteTableMain || r.RouteType() != tcpip.RouteTypeUnicast || len(cfg.Routes) >= maxEth0Routes {
+			continue
+		}
+		er := Eth0Route{Destination: r.Destination.String(), MTU: r.MTU}
+		if gw, ok := netip.AddrFromSlice(r.Gateway.AsSlice()); ok {
+			er.Gateway = gw.String()
+		}
+		if _, err := netip.ParsePrefix(er.Destination); err != nil {
+			continue
+		}
+		cfg.Routes = append(cfg.Routes, er)
+	}
+	return cfg, true
+}
+
+// apply sets cfg on s after configureNATNIC gave eth0 its defaults. Its error
+// joins each setting that is invalid or that Netstack rejected. A setting
+// that fails does not stop the others.
+func (cfg Eth0Config) apply(s *stack.Stack) error {
+	if len(cfg.Addresses) > maxEth0Addresses || len(cfg.Routes) > maxEth0Routes {
+		return fmt.Errorf("netbackend: eth0 config has %d addresses and %d routes, above the limits %d and %d", len(cfg.Addresses), len(cfg.Routes), maxEth0Addresses, maxEth0Routes)
+	}
+	var errs []error
+	defaultAddr := tcpip.AddrFrom4([4]byte{10, 0, 2, 15})
+	haveDefault := false
+	for _, text := range cfg.Addresses {
+		prefix, err := netip.ParsePrefix(text)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("eth0 address %q: %w", text, err))
+			continue
+		}
+		pa := tcpip.ProtocolAddress{
+			Protocol:          ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(prefix.Addr().AsSlice()), PrefixLen: prefix.Bits()},
+		}
+		if prefix.Addr().Is6() {
+			pa.Protocol = ipv6.ProtocolNumber
+		}
+		if pa.AddressWithPrefix.Address == defaultAddr {
+			haveDefault = true
+			continue
+		}
+		if err := s.AddProtocolAddress(Eth0NICID, pa, stack.AddressProperties{}); err != nil {
+			errs = append(errs, fmt.Errorf("add %s to eth0: %s", prefix, err))
+		}
+	}
+	if len(cfg.Addresses) > 0 && !haveDefault {
+		if err := s.RemoveAddress(Eth0NICID, defaultAddr); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s from eth0: %s", defaultAddr, err))
+		}
+	}
+	if cfg.MTU != 0 {
+		if err := s.SetNICMTU(Eth0NICID, cfg.MTU); err != nil {
+			errs = append(errs, fmt.Errorf("set the MTU of eth0 to %d: %s", cfg.MTU, err))
+		}
+	}
+	if len(cfg.Routes) > 0 {
+		table := slices.DeleteFunc(s.GetRouteTable(), func(r tcpip.Route) bool { return r.NIC == Eth0NICID })
+		for _, er := range cfg.Routes {
+			prefix, err := netip.ParsePrefix(er.Destination)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("eth0 route %q: %w", er.Destination, err))
+				continue
+			}
+			route := tcpip.Route{
+				Destination: tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(prefix.Masked().Addr().AsSlice()), PrefixLen: prefix.Bits()}.Subnet(),
+				NIC:         Eth0NICID,
+				MTU:         er.MTU,
+			}
+			if er.Gateway != "" {
+				gw, err := netip.ParseAddr(er.Gateway)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("eth0 route gateway %q: %w", er.Gateway, err))
+					continue
+				}
+				route.Gateway = tcpip.AddrFromSlice(gw.AsSlice())
+			}
+			table = append(table, route)
+		}
+		s.SetRouteTable(table)
+	}
+	return errors.Join(errs...)
+}
+
 // AttachRestoredStack rebinds a restored guest Netstack to nf without opening
 // new host sockets. It resets and reconfigures lo and eth0 on restored, wires
 // a fresh in-memory pipe to the host forwarder stack, and restores saved guest
 // transport endpoints.
 func (nf *NATForwarder) AttachRestoredStack(restored *stack.Stack) error {
+	return nf.AttachRestoredStackWithConfig(restored, nil)
+}
+
+// AttachRestoredStackWithConfig is AttachRestoredStack followed by the
+// settings of eth0 in eth0 that the guest had set before the checkpoint. A nil
+// eth0 keeps the defaults of NewNATStack. A setting that Netstack rejects is
+// logged and skipped, so one bad entry never fails the restore.
+func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth0 *Eth0Config) error {
 	if restored == nil {
 		return errors.New("netbackend: restored stack is nil")
 	}
@@ -444,7 +659,11 @@ func (nf *NATForwarder) AttachRestoredStack(restored *stack.Stack) error {
 	nf.mu.Unlock()
 
 	guestEP, hostEP := pipe.New("", "", uint32(nf.cfg.Tuning.Int(tuning.NATMTU)))
-	if err := nf.rebindHostNIC(checksumOffloadEndpoint{hostEP}); err != nil {
+	hostLink := stack.LinkEndpoint(checksumOffloadEndpoint{hostEP})
+	if nf.paused != nil {
+		hostLink = pausableLink{hostLink, nf.paused}
+	}
+	if err := nf.rebindHostNIC(hostLink); err != nil {
 		guestEP.Close()
 		hostEP.Close()
 		return err
@@ -459,6 +678,11 @@ func (nf *NATForwarder) AttachRestoredStack(restored *stack.Stack) error {
 		guestEP.Close()
 		hostEP.Close()
 		return err
+	}
+	if eth0 != nil {
+		if err := eth0.apply(restored); err != nil {
+			nf.log.Warn("netbackend: reapply the saved eth0 settings", "error", err)
+		}
 	}
 	restored.Restore()
 	return nil
@@ -481,6 +705,27 @@ func (nf *NATForwarder) Close() error {
 		nf.stack.Close()
 	}
 	return nil
+}
+
+// tryAcquire takes one slot of sem without waiting. It reports false when sem
+// is full. A nil sem has no limit.
+func tryAcquire(sem chan struct{}) bool {
+	if sem == nil {
+		return true
+	}
+	select {
+	case sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseSlot returns the slot that tryAcquire took from sem.
+func releaseSlot(sem chan struct{}) {
+	if sem != nil {
+		<-sem
+	}
 }
 
 // spawnTracked runs fn on a tracked goroutine unless *closed is true.
@@ -545,14 +790,24 @@ func (nf *NATForwarder) handleTCP(r *tcp.ForwarderRequest) {
 
 	// Intercept TCP DNS queries to the virtual DNS relay (10.0.2.3:53).
 	if dstIP == netip.MustParseAddr(HostDNSIPv4) && id.LocalPort == 53 {
+		if !tryAcquire(nf.dnsFlowSem) {
+			nf.log.Debug("netbackend: reject guest DNS connection: too many DNS flows")
+			r.Complete(true)
+			return
+		}
 		var wq waiter.Queue
 		ep, tcpErr := r.CreateEndpoint(&wq)
 		if tcpErr != nil {
+			releaseSlot(nf.dnsFlowSem)
 			r.Complete(true)
 			return
 		}
 		guestConn := gonet.NewTCPConn(&wq, ep)
-		if !nf.spawn(func() { nf.serveTCPDNS(nf.ctx, guestConn) }) {
+		if !nf.spawn(func() {
+			defer releaseSlot(nf.dnsFlowSem)
+			nf.serveTCPDNS(nf.ctx, guestConn)
+		}) {
+			releaseSlot(nf.dnsFlowSem)
 			_ = guestConn.Close()
 			r.Complete(true)
 			return
@@ -568,9 +823,18 @@ func (nf *NATForwarder) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 
+	if !tryAcquire(nf.tcpRelaySem) {
+		nf.log.Debug("netbackend: reject guest TCP connection: too many relays", "target", targetAddr)
+		r.Complete(true)
+		return
+	}
 	// Dial the outbound host target on a dedicated goroutine so that slow or
 	// unreachable remote hosts never block the Netstack packet demuxer.
-	if !nf.spawn(func() { nf.relayTCP(r, targetAddr) }) {
+	if !nf.spawn(func() {
+		defer releaseSlot(nf.tcpRelaySem)
+		nf.relayTCP(r, targetAddr)
+	}) {
+		releaseSlot(nf.tcpRelaySem)
 		r.Complete(true)
 	}
 }
@@ -617,15 +881,22 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 
 	// Intercept UDP DNS queries to the virtual DNS relay (10.0.2.3:53).
 	if dstIP == netip.MustParseAddr(HostDNSIPv4) && id.LocalPort == 53 {
+		if !tryAcquire(nf.dnsFlowSem) {
+			nf.log.Debug("netbackend: drop guest DNS flow: too many DNS flows")
+			return false
+		}
 		var wq waiter.Queue
 		ep, tcpErr := r.CreateEndpoint(&wq)
 		if tcpErr != nil {
+			releaseSlot(nf.dnsFlowSem)
 			return false
 		}
 		guestConn := gonet.NewUDPConn(&wq, ep)
 		if !nf.spawn(func() {
+			defer releaseSlot(nf.dnsFlowSem)
 			nf.serveUDPDNS(nf.ctx, guestConn)
 		}) {
+			releaseSlot(nf.dnsFlowSem)
 			_ = guestConn.Close()
 			return false
 		}

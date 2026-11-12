@@ -96,15 +96,15 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 
 	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
-	cleanupSocket, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv restore", stderr)
+	control, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv restore", stderr)
 	if !ok {
 		return 1
 	}
 	var sb *gvx.Sandbox
-	if cleanupSocket != nil {
+	if control != nil {
 		defer func() {
 			if sb == nil || !sb.LockdownStatus().Applied {
-				cleanupSocket()
+				control.Cleanup()
 			}
 		}()
 	}
@@ -124,5 +124,5 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	defer func() {
 		_ = sb.Close()
 	}()
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", stderr)
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", stderr)
 }

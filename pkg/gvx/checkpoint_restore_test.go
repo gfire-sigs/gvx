@@ -603,3 +603,77 @@ func TestRestoreManifestValidationRejectsMismatch(t *testing.T) {
 		}
 	})
 }
+
+func TestCheckpointLeaveRunningResumesGuestAfterPostSaveFailure(t *testing.T) {
+	cacheDir := t.TempDir()
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	layer, err := testimage.Tar(testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755})
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+
+	stdinR, stdinW := net.Pipe()
+	defer stdinR.Close()
+	defer stdinW.Close()
+	stdout := newNotifyBuffer()
+	var stderr syncBuffer
+
+	cfg := newCheckpointTestConfig(t, cacheDir)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.CheckpointDir = filepath.Join(t.TempDir(), "bundle-fail")
+	cfg.Argv = []string{"/bin/cat", "/proc/self/fd/0"}
+	cfg.Stdin = stdinR
+	cfg.Stdout = stdout
+	cfg.Stderr = &stderr
+
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer sb.Close()
+
+	runCh := make(chan error, 1)
+	go func() {
+		code, rErr := sb.Run(context.Background())
+		if rErr == nil && code != 0 {
+			rErr = fmt.Errorf("exit code %d", code)
+		}
+		runCh <- rErr
+	}()
+
+	go func() {
+		_, _ = io.WriteString(stdinW, "line-one\n")
+	}()
+	stdout.waitForSubstring(t, "line-one\n", 15*time.Second)
+
+	injected := errors.New("injected post-save failure")
+	sb.ckptFiles.afterSave = func() error { return injected }
+	if err := sb.Checkpoint(context.Background(), CheckpointOptions{LeaveRunning: true}); !errors.Is(err, injected) {
+		t.Fatalf("Checkpoint error = %v, want %v", err, injected)
+	}
+
+	// The guest must run again after the failed checkpoint.
+	go func() {
+		_, _ = io.WriteString(stdinW, "line-two\n")
+		_ = stdinW.Close()
+	}()
+	select {
+	case rErr := <-runCh:
+		if rErr != nil {
+			t.Fatalf("Run after failed checkpoint: %v; stderr=%q", rErr, stderr.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("guest stayed paused after a failed checkpoint; stdout=%q", stdout.String())
+	}
+	if got, want := stdout.String(), "line-one\nline-two\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	// A later checkpoint attempt must not deadlock on a stale pause.
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

@@ -28,6 +28,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
+	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -77,7 +78,11 @@ type CheckpointManifest struct {
 	LayerDigests     []string        `json:"layer_digests,omitempty"`
 	Mounts           []ManifestMount `json:"mounts,omitempty"`
 	NetMode          NetMode         `json:"net_mode"`
-	CreatedAt        time.Time       `json:"created_at"`
+	// Eth0 records the addresses, MTU, and routes that the guest set on eth0
+	// in NAT mode. A restore applies them again. The field is absent in other
+	// network modes and in bundles of older runtimes.
+	Eth0      *netbackend.Eth0Config `json:"eth0,omitempty"`
+	CreatedAt time.Time              `json:"created_at"`
 }
 
 type checkpointBundleFiles struct {
@@ -86,6 +91,11 @@ type checkpointBundleFiles struct {
 	state     *os.File
 	pagesMeta *os.File
 	pages     *os.File
+
+	// afterSave runs after Kernel.SaveTo succeeds and before the manifest is
+	// written. Tests set it to inject a post-save failure. Production code
+	// leaves it nil.
+	afterSave func() error
 }
 
 func openCheckpointBundleFiles(dir string) (*checkpointBundleFiles, error) {
@@ -254,11 +264,50 @@ func (s *Sandbox) AcceptCheckpointConn() (net.Conn, error) {
 	return ln.Accept()
 }
 
+// saveQuiescer is a host network component that stops its traffic into the
+// guest Netstack while the kernel saves its state.
+type saveQuiescer interface {
+	QuiesceForSave()
+	ResumeAfterSave() error
+}
+
+// saveQuiescersLocked returns the network components of s that must stop
+// during a checkpoint. s.mu must be held: Close clears these fields under it.
+func (s *Sandbox) saveQuiescersLocked() []saveQuiescer {
+	var out []saveQuiescer
+	if s.wgEndpoint != nil {
+		out = append(out, s.wgEndpoint)
+	}
+	if s.natForwarder != nil {
+		out = append(out, s.natForwarder)
+	}
+	if s.portForwarder != nil {
+		out = append(out, s.portForwarder)
+	}
+	return out
+}
+
+// snapshotEth0 returns the eth0 settings of the guest in NAT mode, or nil in
+// every other mode. The guest must be paused: a running guest can change them.
+func (s *Sandbox) snapshotEth0() *netbackend.Eth0Config {
+	if s.cfg.NetworkMode != NetModeNAT {
+		return nil
+	}
+	s.mu.Lock()
+	st := s.netStack
+	s.mu.Unlock()
+	cfg, ok := netbackend.SnapshotEth0Config(st)
+	if !ok {
+		return nil
+	}
+	return &cfg
+}
+
 // Checkpoint saves the running sandbox state into the pre-opened bundle files
 // under Config.CheckpointDir. When opts.LeaveRunning is true, Checkpoint
 // resumes the sandbox after writing the bundle. When opts.LeaveRunning is
 // false, Checkpoint stops the guest kernel so Run returns cleanly.
-func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error {
+func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retErr error) {
 	s.ckptMu.Lock()
 	ckptLocked := true
 	defer func() {
@@ -291,6 +340,7 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error 
 	s.mu.Lock()
 	k := s.activeKernel
 	dog := s.activeWatchdog
+	quiescers := s.saveQuiescersLocked()
 	s.mu.Unlock()
 	if k == nil {
 		return errors.New("gvx: sandbox is not running")
@@ -304,18 +354,40 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error 
 		dog.Stop()
 	}
 	k.Pause()
+	// Invariant: from here until the guest is resumed or killed, every
+	// return path undoes the pause, the watchdog stop, and the WireGuard
+	// quiesce. A bundle write or sync failure must not leave the kernel
+	// paused, because Run and Close would then block forever.
+	paused := true
+	kCtx := k.SupervisorContext()
+	defer func() {
+		if !paused {
+			return
+		}
+		k.BeforeResume(kCtx)
+		for _, q := range quiescers {
+			if err := q.ResumeAfterSave(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("gvx: resume network backend after checkpoint: %w", err))
+			}
+		}
+		if dog != nil {
+			dog.Start()
+		}
+		k.Unpause()
+		k.OnCheckpointAttempt(retErr)
+	}()
 	k.ReceiveTaskStates()
 
-	if s.wgEndpoint != nil {
-		s.wgEndpoint.QuiesceForSave()
+	for _, q := range quiescers {
+		q.QuiesceForSave()
 	}
+	eth0 := s.snapshotEth0()
 
-	kCtx := k.SupervisorContext()
 	stateWriter := stateio.NewBufioWriteCloser(nopCloseWriter{files.state})
 	pagesMetaWriter := stateio.NewBufioWriteCloser(nopCloseWriter{files.pagesMeta})
 	pagesWriter := stateio.NewIOWriter(nopCloseWriter{files.pages}, 256<<10, 64, 4)
 
-	saveErr := k.SaveTo(
+	if saveErr := k.SaveTo(
 		kCtx,
 		stateWriter,
 		pagesMetaWriter,
@@ -325,21 +397,17 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error 
 		nil,
 		vfs.PrepareSaveOptions{ValidateMetadata: true},
 		nil,
-	)
-	if saveErr != nil {
-		k.BeforeResume(kCtx)
-		if s.wgEndpoint != nil {
-			_ = s.wgEndpoint.ResumeAfterSave()
-		}
-		if dog != nil {
-			dog.Start()
-		}
-		k.Unpause()
-		k.OnCheckpointAttempt(saveErr)
+	); saveErr != nil {
 		return fmt.Errorf("gvx: save kernel state: %w", saveErr)
 	}
 
+	if files.afterSave != nil {
+		if err := files.afterSave(); err != nil {
+			return fmt.Errorf("gvx: after checkpoint save: %w", err)
+		}
+	}
 	manifest := s.buildCheckpointManifest()
+	manifest.Eth0 = eth0
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("gvx: marshal checkpoint manifest: %w", err)
@@ -354,20 +422,11 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) error 
 
 	if opts.LeaveRunning {
 		k.SetSaveSuccess(false)
-		k.BeforeResume(kCtx)
-		if s.wgEndpoint != nil {
-			if err := s.wgEndpoint.ResumeAfterSave(); err != nil {
-				return fmt.Errorf("gvx: resume WireGuard after checkpoint: %w", err)
-			}
-		}
-		if dog != nil {
-			dog.Start()
-		}
-		k.Unpause()
-		k.OnCheckpointAttempt(nil)
+		// The deferred rollback resumes the guest and reports success.
 		return nil
 	}
 
+	paused = false
 	s.checkpointStopped.Store(true)
 	k.SetSaveSuccess(false)
 	k.Kill(linux.WaitStatusExit(0))

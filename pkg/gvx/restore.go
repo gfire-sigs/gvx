@@ -65,6 +65,9 @@ func (nopCloseReaderAt) Close() error {
 
 type restoreNetworkArgs struct {
 	sb *Sandbox
+	// eth0 holds the eth0 settings that the checkpoint recorded in NAT mode.
+	// It is nil when the manifest has none.
+	eth0 *netbackend.Eth0Config
 }
 
 func (r restoreNetworkArgs) ConfigureNetwork(st inet.Stack) error {
@@ -78,13 +81,18 @@ func (r restoreNetworkArgs) ConfigureNetwork(st inet.Stack) error {
 		if r.sb.natForwarder == nil {
 			return errors.New("gvx: NAT forwarder is nil during restore")
 		}
-		if err := r.sb.natForwarder.AttachRestoredStack(restored); err != nil {
+		if err := r.sb.natForwarder.AttachRestoredStackWithConfig(restored, r.eth0); err != nil {
 			return fmt.Errorf("gvx: attach restored NAT stack: %w", err)
 		}
 		if r.sb.portForwarder != nil {
 			if err := r.sb.portForwarder.RebindRestore(restored); err != nil {
 				return fmt.Errorf("gvx: rebind port forwarder to restored stack: %w", err)
 			}
+		}
+		// The guest stack of New is dead now: the forwarder moved to the
+		// restored stack. Close it, or its timers and goroutines leak.
+		if r.sb.netStack != nil && r.sb.netStack != restored {
+			r.sb.netStack.Close()
 		}
 	case NetModeWireGuard:
 		if r.sb.wgEndpoint == nil {
@@ -107,9 +115,38 @@ func (r restoreNetworkArgs) ConfigureNetwork(st inet.Stack) error {
 	return nil
 }
 
+// maxManifestBytes bounds the size of manifest.json. A manifest of 1 MiB
+// holds thousands of mounts, so a larger file is corrupt.
+const maxManifestBytes = 1 << 20
+
+// readManifestBytes reads manifest.json from path and fails when the file is
+// larger than maxManifestBytes, before the whole file reaches memory.
+func readManifestBytes(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file (mode %v)", st.Mode())
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxManifestBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxManifestBytes {
+		return nil, fmt.Errorf("file exceeds %d bytes", maxManifestBytes)
+	}
+	return data, nil
+}
+
 func readAndParseManifest(dir string) (CheckpointManifest, error) {
 	manifestPath := filepath.Join(dir, checkpointManifestFileName)
-	data, err := os.ReadFile(manifestPath)
+	data, err := readManifestBytes(manifestPath)
 	if err != nil {
 		return CheckpointManifest{}, fmt.Errorf("%w: read %q: %w", ErrCheckpointManifest, manifestPath, err)
 	}
@@ -202,8 +239,18 @@ func (s *Sandbox) openManifestLayers(digests []string) (err error) {
 // Restore loads a checkpoint bundle from opts.Dir into a new Sandbox. Restore
 // opens all host handles, validates manifest.json, and applies hostlockdown
 // before loading untrusted checkpoint pages and kernel state.
-func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, error) {
+//
+// Restore takes ownership of Config.CheckpointListener on every call. When
+// Restore fails, it closes the listener.
+func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
+	if ln := cfg.CheckpointListener; ln != nil {
+		defer func() {
+			if retErr != nil {
+				_ = ln.Close()
+			}
+		}()
+	}
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
@@ -234,7 +281,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 	if cfg.HostCACerts {
 		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
 		if err != nil {
-			return nil, fmt.Errorf("gvx: read the host root certificates: %w", err)
+			return nil, errors.Join(fmt.Errorf("gvx: read the host root certificates: %w", err), sb.Close())
 		}
 		sb.hostCARoots = roots
 	}
@@ -310,7 +357,8 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 		return cleanup(err)
 	}
 
-	mf, err := createKernelMemoryFile()
+	hostRAM, _ := hostMemory()
+	mf, err := createKernelMemoryFile(restoreFileLimit(sb.cfg.Resources.MemoryBytes, hostRAM, sb.cfg.Tuning))
 	if err != nil {
 		return cleanup(err)
 	}
@@ -337,7 +385,6 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 		}
 	}
 
-	hostRAM, _ := hostMemory()
 	k := &kernel.Kernel{
 		Platform:  sb.plat,
 		AllowSUID: sb.cfg.AllowSUID,
@@ -354,6 +401,10 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 		return cleanup(err)
 	}
 	loadCtx = erofsCtx.(gvcontext.Context)
+	// Close the descriptors that no restored filesystem claims, whether
+	// LoadFrom succeeds, fails, or panics.
+	restoreFDMap := vfs.RestoreFilesystemFDMapFromContext(loadCtx)
+	defer func() { _ = closeRestoreFDMap(restoreFDMap) }()
 
 	mfMap := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
 	loadCtx = gvcontext.WithValue(loadCtx, pgalloc.CtxMemoryFileMap, mfMap)
@@ -410,7 +461,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 		stateReader,
 		asyncMFLoader,
 		nil,
-		restoreNetworkArgs{sb: sb},
+		restoreNetworkArgs{sb: sb, eth0: manifest.Eth0},
 		clocks,
 		vfsOpts,
 		nil,

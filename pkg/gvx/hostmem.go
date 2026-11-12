@@ -73,3 +73,17 @@ func effectiveMemoryLimit(configured int64, hostRAM uint64, t tuning.Values) (ui
 	}
 	return 0, 0
 }
+
+// restoreFileLimit returns the largest backing file size in bytes that a
+// restore accepts for the kernel memory file, or zero for no limit. The
+// guard of a running sandbox keeps committed memory below the effective
+// memory limit, and the file can hold uncommitted address space beyond it, so
+// the bound is twice the limit plus one 1 GiB chunk.
+func restoreFileLimit(configured int64, hostRAM uint64, t tuning.Values) uint64 {
+	limit, _ := effectiveMemoryLimit(configured, hostRAM, t)
+	if limit == 0 {
+		return 0
+	}
+	const chunk = 1 << 30
+	return 2*limit + chunk
+}

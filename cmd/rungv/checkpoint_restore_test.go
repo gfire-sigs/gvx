@@ -216,12 +216,12 @@ func TestParseRestoreArgs(t *testing.T) {
 func TestListenCheckpointSocketPermissionsAndValidation(t *testing.T) {
 	sockDir := shortSocketDir(t)
 	sockPath := filepath.Join(sockDir, "sub", "ctrl.sock")
-	ln, cleanup, err := listenCheckpointSocket(sockPath)
+	ep, err := listenCheckpointSocket(sockPath)
 	if err != nil {
 		t.Fatalf("listenCheckpointSocket(%q): %v", sockPath, err)
 	}
-	defer cleanup()
-	defer ln.Close()
+	defer ep.Cleanup()
+	defer ep.Listener.Close()
 
 	if runtime.GOOS != "windows" {
 		fi, statErr := os.Lstat(sockPath)
@@ -238,12 +238,12 @@ func TestListenCheckpointSocketPermissionsAndValidation(t *testing.T) {
 	if err := os.WriteFile(regFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := listenCheckpointSocket(regFile); err == nil {
+	if _, err := listenCheckpointSocket(regFile); err == nil {
 		t.Fatal("listenCheckpointSocket succeeded on regular file, want error")
 	}
 
 	// Rejects non-loopback TCP addresses.
-	if _, _, err := listenCheckpointSocket("tcp://8.8.8.8:9999"); err == nil {
+	if _, err := listenCheckpointSocket("tcp://8.8.8.8:9999"); err == nil {
 		t.Fatal("listenCheckpointSocket accepted non-loopback TCP address, want error")
 	}
 }

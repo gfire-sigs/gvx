@@ -35,6 +35,10 @@ seam pkg/sentry/fsimpl/erofs/filesystem.go
 # An image can count its file reads as the reads of a disk
 # (pkg/sentry/fsimpl/erofs/blockstats_xplat.go).
 seam pkg/sentry/fsimpl/erofs/regular_file.go
+# afterLoad deletes the restore-map entry of the descriptor that the image file
+# takes, so gvx.Restore closes only unclaimed descriptors
+# (pkg/sentry/fsimpl/erofs/save_restore.go).
+seam pkg/sentry/fsimpl/erofs/save_restore.go
 
 # pkg/hostarch: darwin/arm64 has its own 4KB constants in hostarch_darwin_arm64_4k.go.
 # The upstream 4KB file excludes darwin so that exactly one of the page-size files applies.
