@@ -84,7 +84,7 @@ gvx/ (Fork of google/gvisor@go)
  │   └── rungv/                             # [NEW] Standalone CLI runner (run, pull, stub)
  │       └── main.go
  ├── internal/                              # [NEW] gvxshim control adapter and test fixtures
- │   └── xsys/unix/                         # [NEW] Embedded copy of golang.org/x/sys/unix with Darwin and Windows changes (docs/x-sys-unix.md)
+ │   └── xsys/unix/                         # [NEW] Embedded copy of golang.org/x/sys/unix with Darwin and Windows changes (Section 4.4)
  ├── pkg/
  │   ├── gvx/                               # [NEW] Embeddable Go library API for host tools
  │   │   ├── sandbox.go
@@ -665,7 +665,7 @@ A guest symbolic link lives only in `.gvx_meta`. The host never receives a link,
 
 `fallocate` supports mode 0, `FALLOC_FL_KEEP_SIZE`, and `FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`. A volume or a range that the host call cannot serve takes a zero-fill emulation. The system call forwards a mode other than 0 only to a file description that implements `ServesFallocateModes`. The seam is in `pkg/sentry/syscalls/linux/sys_file.go`. Other file systems keep the answer `ENOTSUP` for such a mode.
 
-On Windows, a punch marks the file sparse and calls `FSCTL_SET_ZERO_DATA`. NTFS then frees the whole clusters of the range, and the allocation size of the host file drops. The file stays sparse. The bytes of a partial cluster at an edge read as zeros and stay allocated. A volume without sparse files, such as FAT or exFAT, takes the zero-fill emulation. A file whose `$ATTRIBUTE_LIST` is full takes it too. Many holes in one file fragment that list, and NTFS stops at about 256 KiB of it with `ERROR_FILE_SYSTEM_LIMITATION` (see `docs/gvxip/gvxip-002-ext4lite-volume-engine.md`, section 2). Such a file keeps its holes, and its later punches write zeros. The `st_blocks` of the guest still shows the logical size on Windows.
+On Windows, a punch marks the file sparse and calls `FSCTL_SET_ZERO_DATA`. NTFS then frees the whole clusters of the range, and the allocation size of the host file drops. The file stays sparse. The bytes of a partial cluster at an edge read as zeros and stay allocated. A volume without sparse files, such as FAT or exFAT, takes the zero-fill emulation. A file whose `$ATTRIBUTE_LIST` is full takes it too. Many holes in one file fragment that list, and NTFS stops at about 256 KiB of it with `ERROR_FILE_SYSTEM_LIMITATION`. Such a file keeps its holes, and its later punches write zeros. The `st_blocks` of the guest still shows the logical size on Windows.
 
 A linkable `O_TMPFILE` file keeps a hidden `~gvx~tmp` host file until the last reference ends. The host seccomp rule refuses `linkat` with `AT_EMPTY_PATH`. An `O_TMPFILE|O_EXCL` file uses native `O_TMPFILE` on Linux. A file with no name reports a link count of zero. A running program makes every write open, `truncate`, and writable shared mapping fail with `ETXTBSY`. `statfs` reports the host volume.
 
@@ -1103,7 +1103,7 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 
 | Workflow and Job | Runner | What It Verifies |
 | :--- | :--- | :--- |
-| `ci.yml` (`build, vet, and audit`) | `ubuntu-24.04` | Formatting of the packages that `gvx` owns, a build of every package for five targets, `go vet` of the packages that `gvx` wrote, the gVisor analyzers `checklocks`, `checkconst`, and `checklinkname` on every package for five targets ([`gvisorlint.md`](gvisorlint.md)), and the upstream audit. |
+| `ci.yml` (`build, vet, and audit`) | `ubuntu-24.04` | Formatting of the packages that `gvx` owns, a build of every package for five targets, `go vet` of the packages that `gvx` wrote, the gVisor analyzers `checklocks`, `checkconst`, and `checklinkname` on every package for five targets (Section 4.5), and the upstream audit. |
 | `ci.yml` (`test linux/amd64`, `test linux/arm64`) | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages. Without cgo: `pkg/hostlockdown`, `pkg/gvx`, and the whole `e2e` suite with the seccomp lockdown on. Guest runs on the upstream `systrap` platform with and without the lockdown. |
 | `ci.yml` (`test darwin/arm64`) | `macos-15` | The owned packages and `pkg/sentry/platform/systrap` through `scripts/codesign-exec.sh`. The runner has no hypervisor, so `GVX_ALLOW_NO_HYPERVISOR=1` skips the tests that run a guest. |
 | `ci.yml` (`test windows/amd64`) | `windows-latest` | The owned packages, the `systrap` engine, the host lockdown tests, a report of the hypervisor state, and a guest boot on `whpx`. |
@@ -1148,4 +1148,12 @@ The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2
 
 Workload creation and native sandbox creation remain unsupported; these results make no CRI or guest-execution claim.
 The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-module) reproduces the SDK and external-daemon boundaries without registry or rootfs dependencies.
+
+### 4.4 Embedded `internal/xsys/unix` Package
+
+`gvx` embeds a modified copy of `golang.org/x/sys/unix` in `internal/xsys/unix` so that pure-Go Sentry packages can import Linux types and constants on Windows and macOS without a `replace` directive in `go.mod` (verified by `scripts/check-consumer.sh`). When updating `golang.org/x/sys`, preserve every `gvx_*` file and the Darwin `Stat_t`, `Dirent`, `Msghdr` (`darwinMsghdr` marshalling), and `SYS_PPOLL` / `SYS_POLL` dispatch adaptations, then run `go test ./internal/xsys/unix/` and `scripts/check-consumer.sh`.
+
+### 4.5 The gVisor Static Analyzers (`tools/gvisorlint`)
+
+`scripts/gvisorlint.sh` builds `tools/gvisorlint` and runs `checklocks`, `checkconst`, and `checklinkname` via `go vet` across all five target platforms (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`). Fix lock order or field protection defects in code first; use `// +checklocksforce:` or `// +checklocksignore:` only with a documented reason when the SSA analyzer cannot follow a valid lock path. `tools/gvisorlint/baseline.txt` holds accepted upstream findings only.
 

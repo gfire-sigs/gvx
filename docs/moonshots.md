@@ -1,15 +1,14 @@
-# GVXIP-004: GPU Acceleration for Browser and GUI Guests
+# Moonshot: GPU Acceleration for Browser and GUI Guests
 
-This proposal defines how `gvx` can give Linux browser and GUI guests access to the host GPU on macOS and Windows. The design has three layers: the Mesa driver in the guest, a virtual DRM device in the Sentry, and a renderer process on the host. The document assesses an earlier draft, states the constraints of `gvx`, and defines the security model and a phased plan with exit criteria. The repository implements no part of this design.
+This document outlines a future moonshot architecture for giving Linux browser and GUI guests access to the host GPU on macOS and Windows. The design has three layers: the Mesa driver in the guest, a virtual DRM device in the Sentry, and a renderer process on the host. The document assesses an earlier draft, states the constraints of `gvx`, and defines the security model and a phased plan with exit criteria. The repository implements no part of this design today.
 
 | Field | Value |
 | :--- | :--- |
-| **Document ID** | `GVXIP-004` |
 | **Title** | GPU Acceleration for Browser and GUI Guests |
-| **Status** | Proposed. Phase 0 is the next step. |
+| **Status** | Moonshot (Proposed, Phase 0 not started) |
 | **Isolation Tier** | Tier 1 after registration of `pkg/sentry/devices/virtgpu`, the renderer command, and its IPC package. Register each path in `tier1Prefixes` (`tools/upstream/diff_audit.go`) and in `tools/upstream/file_mask.txt`. Add each path to the Tier 1 tables of `AGENTS.md` and `docs/architecture.md`. Tier 3: a `seam` entry for `pkg/sentry/fsimpl/sys/sys.go`. |
 | **Target Platforms** | `darwin/arm64`, `windows/amd64`, `windows/arm64`. `linux/amd64` and `linux/arm64` are optional. |
-| **Companion Specs** | [`gvxip-003-backend-perf-and-compat.md`](gvxip-003-backend-perf-and-compat.md), [`../systrap-windows.md`](../systrap-windows.md), [`../architecture.md`](../architecture.md) |
+| **Companion Docs** | [`systrap-windows.md`](systrap-windows.md), [`architecture.md`](architecture.md) |
 
 The phases below have a fixed order. A phase starts only when the phase before it meets its exit criterion.
 
@@ -82,7 +81,7 @@ No project runs `virglrenderer` with ANGLE on Direct3D 11 as a supported Windows
 
 ## 4. Constraints of `gvx` (Descriptive Module)
 
-The design must satisfy the rules of [`AGENTS.md`](../../AGENTS.md) and of the backends. These constraints change the design of the earlier draft. Each row names the rule and its effect on this proposal.
+The design must satisfy the rules of [`AGENTS.md`](../AGENTS.md) and of the backends. These constraints change the design of the earlier draft. Each row names the rule and its effect on this proposal.
 
 | Constraint | Source | Effect on the design |
 | :--- | :--- | :--- |

@@ -20,7 +20,7 @@ The package `pkg/sentry/platform/systrap` holds the code. The files with the suf
 
 ## 2. Measurement Method
 
-The probes are Go programs in [`windows-systrap-probes/`](windows-systrap-probes/). They use only the `syscall` package and raw machine code that the probe generates at run time. They need no C toolchain.
+The probes were standalone Go programs using only the `syscall` package and raw machine code generated at run time, requiring no C toolchain.
 
 Each probe ran on a throwaway orphan branch. A workflow with `on: push` built the probe and ran it on two GitHub-hosted runners. `windows-latest` is `amd64`. `windows-11-arm` is `arm64`. The engine tests ran on the same runners through the workflow that section 10 describes.
 
@@ -151,7 +151,7 @@ Measured on the hosted runners, the median of eight runs, with the copy of the S
 
 ### 3.7 Instruction Scan of Real Binaries
 
-The scan in [`windows-systrap-probes/x86scan/`](windows-systrap-probes/x86scan/) read the Alpine 3.20.10 root filesystems. It covered 17 `x86-64` ELF files and 17 `aarch64` ELF files.
+An instruction scan read the Alpine 3.20.10 root filesystems. It covered 17 `x86-64` ELF files and 17 `aarch64` ELF files.
 
 | Measure | `x86-64` | `aarch64` |
 | :--- | :--- | :--- |
@@ -774,7 +774,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | `41751794179`, `41751797551` | `amd64`, `arm64` | `TestProbeStubLayout` with 200 stubs and `TestProbeBringUp` with 1200 requests on the current layout. |
 | `41749759297`, `41750370342` | both, before and after | A throwaway guest probe before and after the HotSpot windows: 8, then 38 of the 38 HotSpot places map; AddressSanitizer fails at start in both. |
 
-The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
+The scan of section 3.7 ran on a development host against the Alpine 3.20.10 root filesystems.
 
 ## 11. Reproduction Procedure
 
