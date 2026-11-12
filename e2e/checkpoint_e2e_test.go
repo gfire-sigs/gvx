@@ -860,7 +860,7 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 				"-cache-dir="+cacheDir,
 				"-workspace="+wsDir,
 				"-checkpoint-dir="+ckptDir,
-				"-checkpoint-socket="+sockPath,
+				"-control-socket="+sockPath,
 				"-bin="+probePath,
 				"--",
 				"-mode=hostfs",
@@ -895,8 +895,8 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 
 			ckptOut, ckptStderr, ckptCode := runTool(t, rungvBin,
 				"checkpoint",
-				"-socket="+sockPath,
-				"-dir="+ckptDir,
+				"-control-socket="+sockPath,
+				"-checkpoint-dir="+ckptDir,
 			)
 			if ckptCode != 0 {
 				t.Fatalf("rungv checkpoint = (code %d, stdout %q, stderr %q), want 0", ckptCode, ckptOut, ckptStderr)
@@ -915,7 +915,7 @@ func TestE2ECheckpointRestoreRungvCLIRoundTrip(t *testing.T) {
 				"-net=none",
 				"-cache-dir="+cacheDir,
 				"-workspace="+wsDir,
-				"-dir="+ckptDir,
+				"-checkpoint-dir="+ckptDir,
 			)
 			restoreCmd.Stdin = strings.NewReader("RESUME\n")
 			restoreCmd.Stdout = &restoreStdout

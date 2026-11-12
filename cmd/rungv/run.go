@@ -48,8 +48,8 @@ type runConfig struct {
 	cfg gvx.Config
 	// autoPlatform reports that the user left the backend selection to gvx.
 	autoPlatform bool
-	// checkpointSocket is the host path or loopback address for the checkpoint control listener.
-	checkpointSocket string
+	// controlSocket is the host path or loopback address for the control listener.
+	controlSocket string
 }
 
 // parseRunArgs converts `rungv run` arguments into a gvx.Config. It returns
@@ -91,9 +91,9 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	applyGuestCommand(&cfg, fs, flags.entrypoint, binPath, guestArgs)
 
 	return runConfig{
-		autoPlatform:     autoPlatform,
-		cfg:              cfg,
-		checkpointSocket: strings.TrimSpace(flags.checkpointSocket),
+		autoPlatform:  autoPlatform,
+		cfg:           cfg,
+		controlSocket: strings.TrimSpace(flags.controlSocket),
 	}, 0, false
 }
 
@@ -156,7 +156,7 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	}
 
 	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
-	cleanupSocket, ok := bindCheckpointSocket(&rc.cfg, rc.checkpointSocket, "rungv run", stderr)
+	cleanupSocket, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv run", stderr)
 	if !ok {
 		return 1
 	}
@@ -187,14 +187,14 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv run", stderr)
 }
 
-// bindCheckpointSocket opens the checkpoint control listener before host lockdown when requested.
-func bindCheckpointSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.Writer) (func(), bool) {
+// bindControlSocket opens the control listener before host lockdown when requested.
+func bindControlSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.Writer) (func(), bool) {
 	if socketSpec == "" {
 		return nil, true
 	}
 	ln, sockCleanup, err := listenCheckpointSocket(socketSpec)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "%s: listen checkpoint socket: %v\n", cmdPrefix, err)
+		_, _ = fmt.Fprintf(stderr, "%s: listen control socket: %v\n", cmdPrefix, err)
 		return nil, false
 	}
 	cfg.CheckpointListener = ln
