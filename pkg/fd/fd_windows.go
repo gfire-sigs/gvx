@@ -16,8 +16,8 @@ var errClosedHostHandle = errors.New("host handle is closed")
 
 // HostHandle wraps a Windows syscall.Handle with explicit single-owner Close and Release semantics.
 type HostHandle struct {
-	raw    atomic.Uintptr
-	closed atomic.Bool
+	raw   atomic.Uintptr
+	guard handleGuard
 }
 
 // NewHostHandle wraps an open Windows handle.
@@ -77,8 +77,10 @@ func OpenHostPath(path string, flags int, _ uint32) (*HostHandle, error) {
 }
 
 // RawHandle returns the underlying Windows handle as uintptr.
+// The caller must not use the value after it closes or releases h. ReadAt, WriteAt, and Dup
+// hold the handle open for the length of the call, and RawHandle does not.
 func (h *HostHandle) RawHandle() (uintptr, error) {
-	if h == nil || h.closed.Load() {
+	if h == nil || h.guard.isClosed() {
 		return 0, errClosedHostHandle
 	}
 	return h.raw.Load(), nil
@@ -87,10 +89,11 @@ func (h *HostHandle) RawHandle() (uintptr, error) {
 // ReadAt reads from the handle at off using an Overlapped structure.
 // Like pread(2), it returns a short count and a nil error at end of file.
 func (h *HostHandle) ReadAt(p []byte, off int64) (int, error) {
-	raw, err := h.RawHandle()
-	if err != nil {
-		return 0, err
+	if h == nil || !h.guard.enter() {
+		return 0, errClosedHostHandle
 	}
+	defer h.guard.exit()
+	raw := h.raw.Load()
 	var overlapped windows.Overlapped
 	overlapped.Offset = uint32(uint64(off) & 0xffffffff)
 	overlapped.OffsetHigh = uint32(uint64(off) >> 32)
@@ -106,10 +109,11 @@ func (h *HostHandle) ReadAt(p []byte, off int64) (int, error) {
 
 // WriteAt writes to the handle at off using an Overlapped structure.
 func (h *HostHandle) WriteAt(p []byte, off int64) (int, error) {
-	raw, err := h.RawHandle()
-	if err != nil {
-		return 0, err
+	if h == nil || !h.guard.enter() {
+		return 0, errClosedHostHandle
 	}
+	defer h.guard.exit()
+	raw := h.raw.Load()
 	var overlapped windows.Overlapped
 	overlapped.Offset = uint32(uint64(off) & 0xffffffff)
 	overlapped.OffsetHigh = uint32(uint64(off) >> 32)
@@ -122,19 +126,21 @@ func (h *HostHandle) WriteAt(p []byte, off int64) (int, error) {
 
 // Release transfers ownership of the underlying Windows handle to the caller without closing it.
 func (h *HostHandle) Release() (uintptr, error) {
-	if h == nil || h.closed.Swap(true) {
+	if h == nil || !h.guard.shut() {
 		return 0, errClosedHostHandle
 	}
+	defer h.guard.finish()
 	raw := h.raw.Swap(uintptr(windows.InvalidHandle))
 	return raw, nil
 }
 
 // Dup duplicates the underlying Windows handle and returns a new owned HostHandle.
 func (h *HostHandle) Dup() (*HostHandle, error) {
-	raw, err := h.RawHandle()
-	if err != nil {
-		return nil, err
+	if h == nil || !h.guard.enter() {
+		return nil, errClosedHostHandle
 	}
+	defer h.guard.exit()
+	raw := h.raw.Load()
 	proc := windows.CurrentProcess()
 	var dup windows.Handle
 	if err := windows.DuplicateHandle(proc, windows.Handle(raw), proc, &dup, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
@@ -145,9 +151,10 @@ func (h *HostHandle) Dup() (*HostHandle, error) {
 
 // Close closes the underlying Windows handle idempotently.
 func (h *HostHandle) Close() error {
-	if h == nil || h.closed.Swap(true) {
+	if h == nil || !h.guard.shut() {
 		return nil
 	}
+	defer h.guard.finish()
 	raw := h.raw.Swap(uintptr(windows.InvalidHandle))
 	if raw == 0 || windows.Handle(raw) == windows.InvalidHandle {
 		return nil

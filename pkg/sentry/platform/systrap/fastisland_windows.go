@@ -90,7 +90,9 @@ import (
 // or it continues in place without a park. One case has no conversion. A fault
 // in a relocated instruction of a post-window slot reports the address of the
 // slot. A signal handler of the guest can then resume inside the slot. That
-// case is outside the contract.
+// case is outside the contract. The park of such a thread keeps the slot as the
+// pin of the thread (stopPin), and a start at an island address pins the slot
+// again (continueAt). The slot stays valid until the thread stops elsewhere.
 
 // winIslandReach is the largest distance between a patched instruction and the
 // island that holds its slot. A B instruction reaches 128MiB on arm64. The

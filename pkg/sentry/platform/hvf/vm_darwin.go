@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 const (
@@ -303,6 +304,22 @@ func (v *vmState) slabStats() slabStats {
 // records the regions in u. See regionMap.resolve.
 func (v *vmState) resolveMemory(u *regionUser, f memmap.File, bs safemem.BlockSeq, write bool) ([]segment, error) {
 	return v.regions.resolve(u, f, bs, write)
+}
+
+// resolveMemoryPinned is resolveMemory for an address space that releases the
+// regions of unmapped ranges. See regionMap.resolvePinned.
+func (v *vmState) resolveMemoryPinned(u *regionUser, f memmap.File, bs safemem.BlockSeq, write bool) ([]segment, error) {
+	return v.regions.resolvePinned(u, f, bs, write)
+}
+
+// finishPin completes resolveMemoryPinned. See regionMap.finishPin.
+func (v *vmState) finishPin(runs []segment, acquired, dropped []*hvcommon.Region) {
+	v.regions.finishPin(runs, acquired, dropped)
+}
+
+// releaseRegions drops the references of regions that left an address space.
+func (v *vmState) releaseRegions(dropped []*hvcommon.Region) {
+	v.regions.releaseRegions(dropped)
 }
 
 // releaseMemory drops the region references of an address space after no vCPU

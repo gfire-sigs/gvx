@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -27,6 +28,28 @@ func addrOfMachVMRemapWrapper() uintptr
 
 //go:cgo_import_dynamic libc_task_self_trap task_self_trap "/usr/lib/libSystem.B.dylib"
 //go:cgo_import_dynamic libc_mach_vm_remap mach_vm_remap "/usr/lib/libSystem.B.dylib"
+
+// taskPortCache runs a task_self_trap function once and keeps the port name.
+// Each call of the trap adds one user reference to the send right of the task,
+// and nothing returns it. mach_task_self() in libSystem avoids the growth with
+// the same cache.
+type taskPortCache struct {
+	once sync.Once
+	port uintptr
+	trap func() uintptr
+}
+
+// get returns the port name of the current task, or 0 when the trap failed.
+func (c *taskPortCache) get() uintptr {
+	c.once.Do(func() { c.port = c.trap() })
+	return c.port
+}
+
+// selfTaskPort is the port of the current Mach task.
+var selfTaskPort = taskPortCache{trap: func() uintptr {
+	port, _, _ := darwinSyscall6(addrOfTaskSelfTrap(), 0, 0, 0, 0, 0, 0)
+	return port
+}}
 
 // hostPageSize returns the macOS VM page size, which is 16KB on Apple silicon.
 func hostPageSize() int {
@@ -102,7 +125,7 @@ func RemapAnonymousView(arena []byte, offset, size int) ([]byte, error) {
 	subPageOffset := start - srcAddr
 	remapSize := (subPageOffset + uintptr(size) + hostPage - 1) &^ (hostPage - 1)
 
-	taskPort, _, _ := darwinSyscall6(addrOfTaskSelfTrap(), 0, 0, 0, 0, 0, 0)
+	taskPort := selfTaskPort.get()
 	if taskPort == 0 {
 		return nil, errors.New("task_self_trap returned MACH_PORT_NULL")
 	}

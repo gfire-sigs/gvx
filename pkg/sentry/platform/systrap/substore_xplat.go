@@ -61,6 +61,12 @@ const (
 	// storeFaultRefused means that the layer owns the fault but cannot run
 	// the store. The caller reports the SIGSEGV to the guest.
 	storeFaultRefused
+	// storeFaultNeedsPage means that the store reaches a guest page that the
+	// guest cannot write yet: a page that is unmapped, or mapped without write
+	// access, such as a page that waits for copy on write. The caller reports
+	// a write fault at that page, so that the memory manager can map or copy
+	// the page. The thread then runs the store again.
+	storeFaultNeedsPage
 )
 
 // storeEnv gives the store emulator access to a stopped thread and to the
@@ -94,19 +100,28 @@ func (l *subBlockLayer) pageLocked(addr uintptr) (*hostBlock, int, bool) {
 	return hb, i, hb.subs[i].f != nil
 }
 
-// writableLocked reports whether the guest has mapped [addr, addr+n) with
-// write access.
-func (l *subBlockLayer) writableLocked(addr uint64, n int) bool {
+// firstUnwritableLocked returns the lowest address in [addr, addr+n) that the
+// guest has not mapped with write access. The address is addr itself, or the
+// start of a later guest page. It reports false when every page is writable.
+// An empty or wrapping range reports addr.
+func (l *subBlockLayer) firstUnwritableLocked(addr uint64, n int) (uint64, bool) {
 	if n <= 0 || addr+uint64(n) < addr {
-		return false
+		return addr, true
 	}
 	for p := uintptr(addr) &^ (hostarch.PageSize - 1); p < uintptr(addr)+uintptr(n); p += hostarch.PageSize {
 		hb, i, ok := l.pageLocked(p)
 		if !ok || !hb.subs[i].at.Write {
-			return false
+			return max(addr, uint64(p)), true
 		}
 	}
-	return true
+	return 0, false
+}
+
+// writableLocked reports whether the guest has mapped [addr, addr+n) with
+// write access.
+func (l *subBlockLayer) writableLocked(addr uint64, n int) bool {
+	_, blocked := l.firstUnwritableLocked(addr, n)
+	return !blocked
 }
 
 // readLocked reads n bytes at addr from the file pages of the guest. The
@@ -191,35 +206,45 @@ func (l *subBlockLayer) staleLocked(addr uint64, n int, since uint64) bool {
 	return false
 }
 
-// emulateStore runs the store that faulted in a composite page.
-func (l *subBlockLayer) emulateStore(c *platformContext, ac *arch.Context64) storeFaultResult {
+// emulateStore runs the store that faulted in a composite page. With
+// storeFaultNeedsPage, it also returns the address of the first page that the
+// store cannot write.
+func (l *subBlockLayer) emulateStore(c *platformContext, ac *arch.Context64) (storeFaultResult, uint64) {
 	si := &c.signalInfo
 	if si.Signo != int32(linux.SIGSEGV) || si.Code != segvAccerr {
-		return storeFaultIgnored
+		return storeFaultIgnored, 0
 	}
 	faultAddr := uintptr(si.Addr())
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	hb, i, ok := l.pageLocked(faultAddr)
 	if !ok || hb.cur.kind != stubMapComp || !hb.subs[i].at.Write {
-		return storeFaultIgnored
+		return storeFaultIgnored, 0
 	}
 	pc := uint64(ac.IP())
 	raw, ok := l.readLocked(pc&^3, 4)
 	if !ok || pc&3 != 0 {
 		l.logRefusedLocked(pc, 0, "the guest cannot read the instruction")
-		return storeFaultRefused
+		return storeFaultRefused, 0
 	}
 	insn := binary.LittleEndian.Uint32(raw)
 	sc := c.sharedContext.Load()
 	if sc == nil {
-		return storeFaultRefused
+		return storeFaultRefused, 0
 	}
+	// blockedAt is the first page that a check rejected. A store that starts in
+	// a writable page can end in a page that the memory manager has to map or
+	// copy first.
+	var blockedAt uint64
+	var blocked bool
 	env := storeEnv{
 		ac:      ac,
 		fpState: sc.shared.FPState[:],
 		check: func(addr uint64, n int) bool {
-			if !l.writableLocked(addr, n) {
+			if at, bad := l.firstUnwritableLocked(addr, n); bad {
+				if !blocked {
+					blockedAt, blocked = at, true
+				}
 				return false
 			}
 			// Load the Sentry mappings first, so that a write cannot fail.
@@ -241,11 +266,14 @@ func (l *subBlockLayer) emulateStore(c *platformContext, ac *arch.Context64) sto
 		},
 	}
 	if !emulateGuestStore(insn, env) {
-		l.logRefusedLocked(pc, insn, "the emulator does not run the instruction or the store is not writable")
-		return storeFaultRefused
+		if blocked {
+			return storeFaultNeedsPage, blockedAt
+		}
+		l.logRefusedLocked(pc, insn, "the emulator does not run the instruction")
+		return storeFaultRefused, 0
 	}
 	ac.SetIP(uintptr(pc + 4))
-	return storeFaultEmulated
+	return storeFaultEmulated, 0
 }
 
 // logRefusedLocked reports a store that the layer cannot run. It logs the

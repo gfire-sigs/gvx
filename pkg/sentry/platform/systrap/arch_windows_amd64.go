@@ -287,6 +287,10 @@ func (th *thread) continueAt(pc uint64, syscall bool) uint64 {
 		th.restartPC.Store(0)
 		return tail
 	}
+	// A thread that continues at an address inside a slot holds the slot until
+	// it stops again. The Sentry sends a thread there after a fault in a
+	// relocated instruction of a post-window slot.
+	as.pinSlotLocked(reader, pc)
 	th.restartPC.Store(pc)
 	return pc
 }
@@ -538,7 +542,10 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		th.ctx.setPC(ev.Addr + uint64(site.length))
 		if site.kind == amd64SiteWRFSBASE {
 			ac.StateData().Regs.Fs_base = v
-			if v != 0 {
+			// A zero base must still reach the hardware when the thread
+			// loaded a non-zero base before, or the old base stays live.
+			if v != 0 || th.fsNonZero {
+				th.fsNonZero = v != 0
 				if err := th.goThroughTrampoline(v); err != nil {
 					return fatal(err, unix.EFAULT), true
 				}
@@ -755,7 +762,9 @@ func (th *thread) runGuardedScratch(as *addressSpace, ac *arch.Context64, ev deb
 }
 
 // emulateGSMemSite emulates a trapped GS-segment memory instruction in the stub
-// process.
+// process. A store goes through writeGuestSpanWritable, so a read-only or
+// copy-on-write view faults and the memory manager resolves it. A direct
+// WriteProcessMemory would write the shared frame without that fault.
 func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debugEvent, site siteInfo) (outcome, bool) {
 	code := as.codeBytes(ev.Addr, int(site.length))
 	if len(code) < int(site.length) {
@@ -766,35 +775,32 @@ func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debu
 		regs[i] = th.ctx.u64(ctxOffRax + 8*i)
 	}
 	eflags := th.ctx.u32(ctxOffEFlags)
+	var preciseFaultAddr uint64
 	writeMem := func(addr uint64, buf []byte) bool {
 		if !as.inGuestRange(addr, len(buf)) {
+			preciseFaultAddr = addr
 			return false
 		}
-		base := blockRound(addr)
-		if blockRound(ev.Addr) != base {
-			_, _ = as.restoreData(base)
+		end := addr + uint64(len(buf))
+		for pg := blockRound(addr); pg <= blockRound(end-1); pg += blockSize {
+			if pg != blockRound(ev.Addr) {
+				_, _ = as.aliasWriteFault(max(addr, pg))
+				_, _ = as.restoreData(pg)
+			}
 		}
-		var n uintptr
-		err := windows.WriteProcessMemory(th.sp.proc, uintptr(addr), &buf[0], uintptr(len(buf)), &n)
-		return err == nil && n == uintptr(len(buf))
+		ok, badAddr := as.writeGuestSpanWritable(addr, buf)
+		if !ok {
+			preciseFaultAddr = badAddr
+		}
+		return ok
 	}
 	res := emulateSegMemInsn(code, x86asm.GS, ac.StateData().Regs.Gs_base, &regs, &eflags, as.readGuest, writeMem)
 	if res.fault {
-		th.ctx.setPC(ev.Addr)
-		if err := th.stopAndPull(ac, ev); err != nil {
-			return fatal(err, unix.EFAULT), true
+		fAddr := res.faultAddr
+		if res.faultWrite && preciseFaultAddr != 0 {
+			fAddr = preciseFaultAddr
 		}
-		at := hostarch.Read
-		if res.faultWrite {
-			at = hostarch.Write
-		}
-		sigCode := int32(segvMapErr)
-		if as.mapped(res.faultAddr) {
-			sigCode = segvAccErr
-		}
-		si := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: sigCode}
-		si.SetAddr(res.faultAddr)
-		return outcome{done: true, si: si, at: at, err: platform.ErrContextSignal}, true
+		return th.guardedFaultStop(as, ac, ev, fAddr, res.faultWrite), true
 	}
 	if !res.ok {
 		return outcome{}, false
@@ -1419,7 +1425,12 @@ func (th *thread) recoverIslandFault(as *addressSpace, ac *arch.Context64, ev *d
 		th.ctx.put64(ctxOffRax+8*int(info.scratch), saved)
 	}
 	th.ctx.setPC(site)
-	ev.Info[1] = ac.StateData().Regs.Gs_base + uint64(int64(info.disp))
+	// The slot ran the access through the thread sysmsg, so the guest address
+	// is the guest GS base plus the displacement, and the hardware address
+	// can differ. gsFaultAddr keeps the hardware address only for an access
+	// that crosses into the next page, which the memory manager must resolve.
+	start := ac.StateData().Regs.Gs_base + uint64(int64(info.disp))
+	ev.Info[1] = gsFaultAddr(ev.Info[1], start, info.gsAccessSize())
 	if info.store {
 		ev.Info[0] = avWrite
 	} else {

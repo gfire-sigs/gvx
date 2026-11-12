@@ -155,13 +155,19 @@ func TestRegionsAreSharedAndOutliveUnmap(t *testing.T) {
 	if got := regions.regionCount(); got != base+1 {
 		t.Fatalf("a second mapping of the same file maps %d regions, want 1", got-base)
 	}
-	a.as.Unmap(guestCodeAddr, 2*pageSize4K)
+	// The code page goes, and the data page of a still names the region.
+	a.as.Unmap(guestCodeAddr, pageSize4K)
 	if got := regions.regionCount(); got != base+1 {
 		t.Fatalf("Unmap changed the region count to %d", got-base)
 	}
 	b.Release()
 	if got := regions.regionCount(); got != base+1 {
 		t.Fatalf("the region went away while the first address space uses it (%d)", got-base)
+	}
+	// The last page that names the region goes: the region leaves Stage-2.
+	a.as.Unmap(guestDataAddr, pageSize4K)
+	if got := regions.regionCount(); got != base {
+		t.Fatalf("%d regions stay mapped after the last mapping went", got-base)
 	}
 	a.as.Release()
 	if got := regions.regionCount(); got != base {
@@ -312,13 +318,25 @@ func TestReadOnlyFileDescriptorMappingUsesACopy(t *testing.T) {
 	if !errors.Is(err, errHostBlockRejected) {
 		t.Errorf("writable MapFile of read-only memory = %v, want errHostBlockRejected", err)
 	}
-	// Unmap changes only Stage-1: the copy stays for the next mapping.
+	// The last page that names the copy goes, so the copy goes with it. A
+	// later mapping then reads the new content of the file, and not a stale
+	// snapshot.
 	g.as.Unmap(guestDataAddr+0x10000, pageSize4K)
-	if got := regions.copyCount(); got != baseCopies+1 {
-		t.Errorf("private copies = %d after the unmap, want %d: Unmap changed Stage-2", got, baseCopies+1)
+	if got := regions.copyCount(); got != baseCopies {
+		t.Errorf("private copies = %d after the unmap, want %d: the snapshot leaked", got, baseCopies)
 	}
 	if _, sig, err := g.read64(guestDataAddr + 0x10000); sig == nil && err == nil {
 		t.Error("the guest read an unmapped page")
+	}
+	binary.LittleEndian.PutUint64(content[0:], 0xc0ffee)
+	if err := os.WriteFile(f.Name(), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.as.MapFile(guestDataAddr+0x10000, file, fr, hostarch.Read, false); err != nil {
+		t.Fatalf("second read-only MapFile: %v", err)
+	}
+	if got, sig, err := g.read64(guestDataAddr + 0x10000); sig != nil || err != nil || got != 0xc0ffee {
+		t.Errorf("the guest read (%#x, %v, %v) after the remap, want the new content 0xc0ffee", got, sig, err)
 	}
 	g.as.Release()
 	if got := regions.copyCount(); got != baseCopies {

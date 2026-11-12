@@ -34,6 +34,31 @@ type siteInfo struct {
 	entry uint64
 }
 
+// gsAccessSize returns the width in bytes of a patched GS-segment MOV. The
+// patcher accepts only 32-bit and 64-bit general-purpose registers (planGSMov).
+func (s siteInfo) gsAccessSize() uint64 {
+	if s.wide {
+		return 8
+	}
+	return 4
+}
+
+// gsFaultPage is the page size of the guest.
+const gsFaultPage = 0x1000
+
+// gsFaultAddr returns the fault address that the Sentry reports for an access
+// of size bytes at start, which faulted in hardware at hw. The address is
+// start, unless the access crosses a page boundary and the hardware reported
+// the first byte of the next page. Then the next page is the page that the
+// memory manager must resolve, and hw stays.
+func gsFaultAddr(hw, start, size uint64) uint64 {
+	next := (start | (gsFaultPage - 1)) + 1
+	if start&(gsFaultPage-1)+size > gsFaultPage && hw == next {
+		return hw
+	}
+	return start
+}
+
 const (
 	// winSiteJump marks the SYSCALL that became a JMP to a slot. The debugger
 	// never sees a trap there, so the kind only serves resumePC.
