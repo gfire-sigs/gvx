@@ -12,8 +12,8 @@ It is built on Google's [gVisor](https://github.com/google/gvisor) user-space ap
 ./rungv run -p 8080:80 -v appdata:/var/lib/nginx -workspace=./my-site nginx:alpine
 
 # Checkpoint a running sandbox to disk and restore it later
-./rungv checkpoint -socket ./ctrl.sock -dir ./snap
-./rungv restore -dir ./snap
+./rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
+./rungv restore -checkpoint-dir ./snap
 ```
 
 ---
@@ -28,7 +28,7 @@ Upstream gVisor (`runsc`) is an OCI runtime for Linux hosts. On Windows and macO
 | :--- | :--- | :--- | :--- |
 | **Host OS** | Windows (`amd64`, `arm64`), macOS (`arm64`) | Linux (`amd64`, `arm64`), Windows (`amd64`, `arm64`) | Windows, macOS |
 | **Background VM / Daemon** | None (single process per sandbox) | None (single process per sandbox) | Persistent Linux VM + daemon |
-| **Admin / `root` Required** | No (once hypervisor feature is enabled on Windows) | No | Yes (initial VM/driver setup) |
+| **Admin / `root` Required** | No | No | Yes (initial VM/driver setup) |
 | **Typical Cold Start** | `~20 ms` (cached EROFS layer) | `~25 to 65 ms` (cached EROFS layer) | `800 to 2500 ms` (if VM is cold) |
 | **Base Memory Overhead** | `~16 MiB` per sandbox process | `~16 MiB` per sandbox process | `512 MiB+` reserved for the utility VM |
 | **Workload Coverage** | CLI tools, databases, `dockerd`, full `k3s` + Calico CNI | CLI tools, databases, `dockerd`, full `k3s` + Calico CNI | Full Linux kernel inside the VM |
@@ -140,9 +140,9 @@ See [`docs/cli.md`](docs/cli.md) for the complete command and flag reference, [`
 ./rungv run -p 8080:80 -v appdata:/var/lib/nginx -workspace=./my-site nginx:alpine
 
 # 3. Checkpoint a running container and restore it from disk
-./rungv run -checkpoint-socket ./ctrl.sock -checkpoint-dir ./snap alpine:3.20 sh -c "sleep 300" &
-./rungv checkpoint -socket ./ctrl.sock -dir ./snap
-./rungv restore -dir ./snap
+./rungv run -control-socket ./ctrl.sock -checkpoint-dir ./snap alpine:3.20 sh -c "sleep 300" &
+./rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
+./rungv restore -checkpoint-dir ./snap
 
 # 4. Run Python over a user-space WireGuard tunnel (blocks local LAN access)
 ./rungv run -net=wg -wg-conf=./sandbox-wg.conf python:3.12-alpine \
@@ -152,7 +152,7 @@ See [`docs/cli.md`](docs/cli.md) for the complete command and flag reference, [`
 | Command | Synopsis | Description |
 | :--- | :--- | :--- |
 | `run` | `rungv run [flags] IMAGE [COMMAND [ARG...]]` | Run a command inside an OCI image or a local Linux ELF64 binary (`-bin`). |
-| `checkpoint` / `restore` | `rungv checkpoint -socket PATH` / `rungv restore -dir DIR` | Save a running sandbox (`snapshot`) or resume a saved bundle (`resume`). |
+| `checkpoint` / `restore` | `rungv checkpoint -control-socket PATH` / `rungv restore -checkpoint-dir DIR` | Save a running sandbox (`snapshot`) or resume a saved bundle (`resume`). |
 | `pull` / `images` / `rmi` | `rungv pull IMAGE` / `rungv images` / `rungv rmi IMAGE` | Pull, list, or remove cached OCI images and compiled `.erofs` layers. |
 | `inspect` / `tag` | `rungv inspect IMAGE` / `rungv tag SRC DST` | Inspect image configuration JSON or retag a cached image. |
 | `save` / `load` | `rungv save -o FILE IMAGE...` / `rungv load -i FILE` | Export images to an OCI `.tar` archive or import them offline. |
@@ -251,3 +251,11 @@ func main() {
 - **Tier 3 (Minimal Upstream Seams, `< 5.0%`)**: Fewer than `5.0%` of upstream gVisor files (`104 / 2,526` files, **`4.12%`**) contain build-tag expansions or hook seams, and `tools/upstream -mode=sync` performs automated 3-way merges (`git merge-file`) across upstream releases.
 
 Run `rungv license` to print the full license texts of `gvx`, upstream gVisor, the Go standard library, and all linked third-party Go modules, or `rungv license -list` for the SPDX summary table.
+
+| SPDX identifier | Third-party modules |
+| :--- | :--- |
+| `Apache-2.0` | `github.com/distribution/reference` v0.6.0, `github.com/google/btree` v1.1.2, `github.com/opencontainers/image-spec` v1.1.1 |
+| `Apache-2.0 AND BSD-3-Clause AND MIT` | `github.com/klauspost/compress` v1.18.0 |
+| `BSD-3-Clause` | `golang.org/x/arch` v0.32.0, `golang.org/x/crypto` v0.57.0, `golang.org/x/exp` v0.0.0-20250711185948-6ae5c78190dc, `golang.org/x/mod` v0.41.0, `golang.org/x/net` v0.60.0, `golang.org/x/sync` v0.23.0, `golang.org/x/sys` v0.48.0, `golang.org/x/text` v0.42.0, `golang.org/x/time` v0.15.0, `google.golang.org/protobuf` v1.36.11 |
+| `MIT` | `golang.zx2c4.com/wintun` v0.0.0-20230126152724-0fa3db229ce2, `golang.zx2c4.com/wireguard` v0.0.0-20261006164505-2631ce99a06f |
+| `NOASSERTION` | `github.com/opencontainers/go-digest` v1.0.0 |

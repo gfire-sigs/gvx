@@ -90,7 +90,7 @@ func (b *syncNotifyBuffer) waitForSubstring(t *testing.T, sub string, timeout ti
 func TestParseRunArgsCheckpointFlags(t *testing.T) {
 	rc, code, done, stderr := parse(t,
 		"-checkpoint-dir=/tmp/ckpt-bundle",
-		"-checkpoint-socket=/tmp/ckpt.sock",
+		"-control-socket=/tmp/ckpt.sock",
 		"-image=alpine:3.20",
 	)
 	if done || code != 0 {
@@ -99,22 +99,22 @@ func TestParseRunArgsCheckpointFlags(t *testing.T) {
 	if rc.cfg.CheckpointDir != "/tmp/ckpt-bundle" {
 		t.Errorf("CheckpointDir = %q, want /tmp/ckpt-bundle", rc.cfg.CheckpointDir)
 	}
-	if rc.checkpointSocket != "/tmp/ckpt.sock" {
-		t.Errorf("checkpointSocket = %q, want /tmp/ckpt.sock", rc.checkpointSocket)
+	if rc.controlSocket != "/tmp/ckpt.sock" {
+		t.Errorf("controlSocket = %q, want /tmp/ckpt.sock", rc.controlSocket)
 	}
 }
 
 func TestParseCheckpointArgs(t *testing.T) {
 	var stderr bytes.Buffer
 	ca, code, done := parseCheckpointArgs([]string{
-		"-socket=/tmp/ctrl.sock",
-		"-dir=/tmp/ckpt-out",
+		"-control-socket=/tmp/ctrl.sock",
+		"-checkpoint-dir=/tmp/ckpt-out",
 		"-leave-running",
 	}, &stderr)
 	if done || code != 0 {
 		t.Fatalf("parseCheckpointArgs failed: code=%d done=%v stderr=%q", code, done, stderr.String())
 	}
-	if ca.socket != "/tmp/ctrl.sock" || ca.dir != "/tmp/ckpt-out" || !ca.leaveRunning {
+	if ca.controlSocket != "/tmp/ctrl.sock" || ca.checkpointDir != "/tmp/ckpt-out" || !ca.leaveRunning {
 		t.Errorf("checkpointArgs = %+v", ca)
 	}
 
@@ -125,9 +125,9 @@ func TestParseCheckpointArgs(t *testing.T) {
 		wantCode   int
 		wantStderr string
 	}{
-		{"missing socket", "checkpoint", nil, 2, "specify -socket"},
-		{"missing socket on snapshot alias", "snapshot", []string{"-dir=/tmp/x"}, 2, "specify -socket"},
-		{"unexpected positional arg", "checkpoint", []string{"-socket=/tmp/s", "extra"}, 2, "unexpected positional"},
+		{"missing socket", "checkpoint", nil, 2, "specify -control-socket"},
+		{"missing socket on snapshot alias", "snapshot", []string{"-checkpoint-dir=/tmp/x"}, 2, "specify -control-socket"},
+		{"unexpected positional arg", "checkpoint", []string{"-control-socket=/tmp/s", "extra"}, 2, "unexpected positional"},
 		{"help", "checkpoint", []string{"--help"}, 0, "Usage"},
 		{"snapshot help", "snapshot", []string{"-h"}, 0, "Usage"},
 	} {
@@ -148,15 +148,14 @@ func TestParseRestoreArgs(t *testing.T) {
 
 	var stderr bytes.Buffer
 	rc, code, done := parseRestoreArgs([]string{
-		"-dir=/tmp/bundle",
+		"-checkpoint-dir=/tmp/bundle",
 		"-w=" + wsDir,
 		"-ro",
 		"-v=" + bindDir + ":/mnt/data:ro",
 		"-p=127.0.0.1:18080:80",
 		"-net=wg",
 		"-wg-config=/tmp/wg.conf",
-		"-checkpoint-dir=/tmp/next-bundle",
-		"-checkpoint-socket=/tmp/next.sock",
+		"-control-socket=/tmp/next.sock",
 	}, nil, &bytes.Buffer{}, &stderr)
 	if done || code != 0 {
 		t.Fatalf("parseRestoreArgs failed: code=%d done=%v stderr=%q", code, done, stderr.String())
@@ -176,13 +175,13 @@ func TestParseRestoreArgs(t *testing.T) {
 	if rc.cfg.NetworkMode != gvx.NetModeWireGuard || rc.cfg.WireGuardConfigPath != "/tmp/wg.conf" {
 		t.Errorf("NetworkMode = %q WireGuardConfigPath = %q", rc.cfg.NetworkMode, rc.cfg.WireGuardConfigPath)
 	}
-	if rc.cfg.CheckpointDir != "/tmp/next-bundle" || rc.checkpointSocket != "/tmp/next.sock" {
-		t.Errorf("CheckpointDir = %q checkpointSocket = %q", rc.cfg.CheckpointDir, rc.checkpointSocket)
+	if rc.cfg.CheckpointDir != "/tmp/bundle" || rc.controlSocket != "/tmp/next.sock" {
+		t.Errorf("CheckpointDir = %q controlSocket = %q", rc.cfg.CheckpointDir, rc.controlSocket)
 	}
 
 	// Verify -workspace alias as well.
 	rc2, code2, done2 := parseRestoreArgs([]string{
-		"-dir=/tmp/bundle",
+		"-checkpoint-dir=/tmp/bundle",
 		"-workspace=" + wsDir,
 	}, nil, &bytes.Buffer{}, &stderr)
 	if done2 || code2 != 0 || rc2.cfg.WorkspacePath != wsDir {
@@ -196,10 +195,10 @@ func TestParseRestoreArgs(t *testing.T) {
 		wantCode   int
 		wantStderr string
 	}{
-		{"missing dir", "restore", nil, 2, "specify -dir"},
-		{"missing dir on resume alias", "resume", []string{"-net=none"}, 2, "specify -dir"},
-		{"detach unsupported", "restore", []string{"-dir=/tmp/b", "-d"}, 2, "-d is not supported"},
-		{"unexpected positional arg", "restore", []string{"-dir=/tmp/b", "extra"}, 2, "unexpected positional"},
+		{"missing dir", "restore", nil, 2, "specify -checkpoint-dir"},
+		{"missing dir on resume alias", "resume", []string{"-net=none"}, 2, "specify -checkpoint-dir"},
+		{"detach unsupported", "restore", []string{"-checkpoint-dir=/tmp/b", "-d"}, 2, "-d is not supported"},
+		{"unexpected positional arg", "restore", []string{"-checkpoint-dir=/tmp/b", "extra"}, 2, "unexpected positional"},
 		{"help", "restore", []string{"--help"}, 0, "Usage"},
 		{"resume help", "resume", []string{"--help"}, 0, "Usage"},
 	} {
@@ -290,8 +289,7 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ckptDir1 := filepath.Join(t.TempDir(), "bundle1")
-	ckptDir2 := filepath.Join(t.TempDir(), "bundle2")
+	ckptDir := filepath.Join(t.TempDir(), "bundle")
 	sockDir := shortSocketDir(t)
 	sockPath1 := filepath.Join(sockDir, "c1.sock")
 	sockPath2 := filepath.Join(sockDir, "c2.sock")
@@ -314,8 +312,8 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 				"-net=none",
 				"-cache-dir=" + cacheDir,
 				"-workspace=" + wsDir,
-				"-checkpoint-dir=" + ckptDir1,
-				"-checkpoint-socket=" + sockPath1,
+				"-checkpoint-dir=" + ckptDir,
+				"-control-socket=" + sockPath1,
 				"-bin=" + elfPath,
 				"--",
 				"/workspace/before.txt",
@@ -332,13 +330,13 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 	// Wait until the guest has printed /workspace/before.txt and blocked on /proc/self/fd/0.
 	stdout1.waitForSubstring(t, "cli-before-ckpt\n", 15*time.Second)
 
-	// 1. A mismatched -dir is rejected over the control socket without stopping the sandbox.
+	// 1. A mismatched -checkpoint-dir is rejected over the control socket without stopping the sandbox.
 	var ckptOut, ckptErr bytes.Buffer
 	wrongDir := filepath.Join(t.TempDir(), "wrong-dir")
 	code := executeCLI(context.Background(), []string{
 		"checkpoint",
-		"-socket=" + sockPath1,
-		"-dir=" + wrongDir,
+		"-control-socket=" + sockPath1,
+		"-checkpoint-dir=" + wrongDir,
 	}, nil, &ckptOut, &ckptErr)
 	if code != 1 || !strings.Contains(ckptErr.String(), "does not match pre-opened -checkpoint-dir") {
 		t.Fatalf("mismatched dir checkpoint = (code %d, stderr %q), want (1, mismatch error)", code, ckptErr.String())
@@ -349,8 +347,8 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 	ckptErr.Reset()
 	code = executeCLI(context.Background(), []string{
 		"snapshot",
-		"-socket=" + sockPath1,
-		"-dir=" + ckptDir1,
+		"-control-socket=" + sockPath1,
+		"-checkpoint-dir=" + ckptDir,
 		"-leave-running",
 	}, nil, &ckptOut, &ckptErr)
 	if code != 0 {
@@ -367,8 +365,8 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 	ckptErr.Reset()
 	code = executeCLI(context.Background(), []string{
 		"checkpoint",
-		"-socket=" + sockPath1,
-		"-dir=" + ckptDir1,
+		"-control-socket=" + sockPath1,
+		"-checkpoint-dir=" + ckptDir,
 	}, nil, &ckptOut, &ckptErr)
 	if code != 0 {
 		t.Fatalf("rungv checkpoint = (code %d, stderr %q), want 0", code, ckptErr.String())
@@ -379,7 +377,7 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 		t.Fatalf("rungv run exit code = %d, want 0 (stderr=%q)", runExit, stderr1.String())
 	}
 
-	// 4. Restore from ckptDir1 with `rungv restore` and re-checkpoint into ckptDir2 over sockPath2.
+	// 4. Restore from ckptDir with `rungv restore` and re-checkpoint into ckptDir over sockPath2.
 	stdinR2, stdinW2 := net.Pipe()
 	defer stdinR2.Close()
 	defer stdinW2.Close()
@@ -396,9 +394,8 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 				"-platform=" + platform,
 				"-cache-dir=" + cacheDir,
 				"-w=" + wsDir,
-				"-dir=" + ckptDir1,
-				"-checkpoint-dir=" + ckptDir2,
-				"-checkpoint-socket=" + sockPath2,
+				"-checkpoint-dir=" + ckptDir,
+				"-control-socket=" + sockPath2,
 			},
 			stdinR2,
 			stdout2,
@@ -417,7 +414,7 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 	ckptErr.Reset()
 	code = executeCLI(context.Background(), []string{
 		"checkpoint",
-		"-socket=" + sockPath2,
+		"-control-socket=" + sockPath2,
 	}, nil, &ckptOut, &ckptErr)
 	if code != 0 {
 		t.Fatalf("second rungv checkpoint = (code %d, stderr %q), want 0", code, ckptErr.String())
@@ -426,7 +423,7 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 		t.Fatalf("first rungv restore exit code = %d, want 0 (stderr=%q)", rExit, stderr2.String())
 	}
 
-	// 5. Resume from ckptDir2 using the `rungv resume` alias and let the guest finish.
+	// 5. Resume from ckptDir using the `rungv resume` alias and let the guest finish.
 	var stdout3, stderr3 bytes.Buffer
 	resumeCode := executeCLI(
 		context.Background(),
@@ -436,7 +433,7 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 			"-platform=" + platform,
 			"-cache-dir=" + cacheDir,
 			"-workspace=" + wsDir,
-			"-dir=" + ckptDir2,
+			"-checkpoint-dir=" + ckptDir,
 		},
 		strings.NewReader("final-stdin\n"),
 		&stdout3,

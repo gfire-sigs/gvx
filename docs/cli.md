@@ -86,7 +86,7 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `--host-dns IP[:PORT]` | Name a DNS server of the host. The flag repeats. The servers replace the discovery of the host resolver for the DNS relay of the guest and for the registry requests. `pull` and `save` take it too. Section 5.2 gives the reason. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-checkpoint-dir DIR` | Pre-open a host directory before the lockdown for checkpoint bundle files. |
-| `-checkpoint-socket PATH` | Bind a Unix domain socket or loopback TCP listener before the lockdown for `rungv checkpoint`. |
+| `-control-socket PATH` | Bind a Unix domain socket or loopback TCP listener before the lockdown for `rungv checkpoint`. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
 | `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, and `tag` take it. |
 | `--tune-file FILE` | Read host-side tunables from a JSON object. A `--tune` flag wins over the file. The same eight commands take it. |

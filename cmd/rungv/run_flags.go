@@ -153,7 +153,7 @@ type sandboxFlagValues struct {
 	tune                   *tuneFlags
 	portSpecs              multiStringFlag
 	checkpointDir          string
-	checkpointSocket       string
+	controlSocket          string
 }
 
 // registerAlias binds a registration callback to each flag name in names.
@@ -251,7 +251,7 @@ func (f *sandboxFlagValues) registerResourceAndCheckpointFlags(fs *flag.FlagSet)
 	fs.StringVar(&f.cpus, "cpus", "", "CPU quota, such as 1.5")
 	f.tune = addTuneFlags(fs)
 	fs.StringVar(&f.checkpointDir, "checkpoint-dir", "", "Host directory pre-opened before lockdown for checkpoint output")
-	fs.StringVar(&f.checkpointSocket, "checkpoint-socket", "", "Host path or loopback address for the checkpoint control listener")
+	fs.StringVar(&f.controlSocket, "control-socket", "", "Host path or loopback address for the control listener")
 }
 
 // buildPortForwards parses repeatable -p / --publish flags with tuning applied.

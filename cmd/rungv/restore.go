@@ -31,7 +31,7 @@ func init() {
 		aliases: []string{"resume"},
 		summary: "Restore and run a sandbox from a checkpoint bundle directory (alias: resume).",
 		usage: []string{
-			"rungv restore -dir=<dir> [flags]",
+			"rungv restore -checkpoint-dir=<dir> [flags]",
 		},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return restoreSubcommand(ctx, args, streams.stdin, streams.stdout, streams.stderr)
@@ -41,10 +41,10 @@ func init() {
 
 // restoreConfig holds the parsed flags of `rungv restore`.
 type restoreConfig struct {
-	dir              string
-	cfg              gvx.Config
-	autoPlatform     bool
-	checkpointSocket string
+	dir           string
+	cfg           gvx.Config
+	autoPlatform  bool
+	controlSocket string
 }
 
 // parseRestoreArgs converts `rungv restore` arguments into a restoreConfig.
@@ -56,7 +56,6 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return restoreConfig{}, 2, true
 	}
 
-	dirFlag := fs.String("dir", "", "Checkpoint bundle directory")
 	flags := registerSandboxFlags(fs, flagDefaults{
 		shortWForWorkspace: true,
 	})
@@ -73,9 +72,9 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return usageError("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
 	}
 
-	dir := strings.TrimSpace(*dirFlag)
+	dir := strings.TrimSpace(flags.checkpointDir)
 	if dir == "" {
-		return usageError("specify -dir=<path>")
+		return usageError("specify -checkpoint-dir=<path>")
 	}
 
 	cfg, autoPlatform, err := flags.buildBaseConfig(fs, stdin, stdout, stderr, true)
@@ -83,10 +82,10 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return usageError("%v", err)
 	}
 	return restoreConfig{
-		dir:              dir,
-		cfg:              cfg,
-		autoPlatform:     autoPlatform,
-		checkpointSocket: strings.TrimSpace(flags.checkpointSocket),
+		dir:           dir,
+		cfg:           cfg,
+		autoPlatform:  autoPlatform,
+		controlSocket: strings.TrimSpace(flags.controlSocket),
 	}, 0, false
 }
 
@@ -97,7 +96,7 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 
 	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
-	cleanupSocket, ok := bindCheckpointSocket(&rc.cfg, rc.checkpointSocket, "rungv restore", stderr)
+	cleanupSocket, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv restore", stderr)
 	if !ok {
 		return 1
 	}

@@ -37,7 +37,7 @@ func init() {
 		aliases: []string{"snapshot"},
 		summary: "Checkpoint a running sandbox over its control socket (alias: snapshot).",
 		usage: []string{
-			"rungv checkpoint -socket=<path> [-dir=<dir>] [-leave-running]",
+			"rungv checkpoint -control-socket=<path> [-checkpoint-dir=<dir>] [-leave-running]",
 		},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return checkpointSubcommand(ctx, args, streams.stdout, streams.stderr)
@@ -59,9 +59,9 @@ type checkpointControlResponse struct {
 
 // checkpointArgs holds the parsed flags of `rungv checkpoint`.
 type checkpointArgs struct {
-	socket       string
-	dir          string
-	leaveRunning bool
+	controlSocket string
+	checkpointDir string
+	leaveRunning  bool
 }
 
 func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, bool) {
@@ -72,8 +72,9 @@ func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, 
 		return checkpointArgs{}, 2, true
 	}
 
-	socketFlag := fs.String("socket", "", "Control socket path or loopback address")
-	dirFlag := fs.String("dir", "", "Checkpoint bundle directory (validated against pre-opened -checkpoint-dir)")
+	var controlSocket, checkpointDir string
+	fs.StringVar(&controlSocket, "control-socket", "", "Control socket path or loopback address")
+	fs.StringVar(&checkpointDir, "checkpoint-dir", "", "Checkpoint bundle directory (validated against pre-opened -checkpoint-dir)")
 	leaveRunningFlag := fs.Bool("leave-running", false, "Keep the sandbox running after the checkpoint completes")
 
 	if err := fs.Parse(args); err != nil {
@@ -85,14 +86,14 @@ func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, 
 	if fs.NArg() > 0 {
 		return usageError("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	sock := strings.TrimSpace(*socketFlag)
+	sock := strings.TrimSpace(controlSocket)
 	if sock == "" {
-		return usageError("specify -socket=<path>")
+		return usageError("specify -control-socket=<path>")
 	}
 	return checkpointArgs{
-		socket:       sock,
-		dir:          strings.TrimSpace(*dirFlag),
-		leaveRunning: *leaveRunningFlag,
+		controlSocket: sock,
+		checkpointDir: strings.TrimSpace(checkpointDir),
+		leaveRunning:  *leaveRunningFlag,
 	}, 0, false
 }
 
@@ -102,14 +103,14 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		return exitCode
 	}
 
-	reqDir := ca.dir
+	reqDir := ca.checkpointDir
 	if reqDir != "" {
 		if abs, err := filepath.Abs(reqDir); err == nil {
 			reqDir = abs
 		}
 	}
 
-	conn, err := dialCheckpointSocket(ctx, ca.socket)
+	conn, err := dialCheckpointSocket(ctx, ca.controlSocket)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: connect control socket: %v\n", err)
 		return 1
