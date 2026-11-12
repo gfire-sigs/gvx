@@ -795,21 +795,16 @@ func TestCloseTerminatesStubs(t *testing.T) {
 	waitProcessExit(t, pid)
 }
 
-// waitPool waits until the pool of p holds poolDepth stubs and returns their
-// process IDs.
+// waitPool waits until the pool of p holds poolDepth stubs and returns the
+// process IDs of the tracked stubs.
 func waitPool(t *testing.T, p *Platform) []uint32 {
 	t.Helper()
-	held := make([]*stubProc, 0, poolDepth)
-	for len(held) < poolDepth {
-		select {
-		case sp := <-p.pool.ready:
-			held = append(held, sp)
-		case <-time.After(30 * time.Second):
-			t.Fatalf("the pool holds %d stubs after 30 s, want %d", len(held), poolDepth)
+	deadline := time.Now().Add(30 * time.Second)
+	for len(p.pool.ready) < poolDepth {
+		if time.Now().After(deadline) {
+			t.Fatalf("the pool holds %d stubs after 30 s, want %d", len(p.pool.ready), poolDepth)
 		}
-	}
-	for _, sp := range held {
-		p.pool.ready <- sp
+		time.Sleep(5 * time.Millisecond)
 	}
 	p.dbg.mu.Lock()
 	defer p.dbg.mu.Unlock()
