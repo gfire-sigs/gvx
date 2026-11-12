@@ -341,6 +341,10 @@ type PortForwarder struct {
 	guestDialInterval time.Duration
 	accept            func(net.Listener) (net.Conn, error)
 	log               *slog.Logger
+
+	// resumed is non-nil between QuiesceForSave and ResumeAfterSave. It
+	// closes when the pause ends. PortForwarder.mu guards it.
+	resumed chan struct{}
 }
 
 // NewPortForwarder constructs an empty PortForwarder ready for PreBind. The
@@ -549,6 +553,57 @@ func (pf *PortForwarder) targetStack() *stack.Stack {
 	return pf.stack
 }
 
+// QuiesceForSave holds back new host clients and the writes of running relays
+// into the guest Netstack until ResumeAfterSave runs. A client that connects
+// during the pause waits in the listener backlog, and a datagram waits in the
+// socket buffer.
+func (pf *PortForwarder) QuiesceForSave() {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	if pf.resumed == nil {
+		pf.resumed = make(chan struct{})
+	}
+}
+
+// ResumeAfterSave ends the pause that QuiesceForSave started.
+func (pf *PortForwarder) ResumeAfterSave() error {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	if pf.resumed != nil {
+		close(pf.resumed)
+		pf.resumed = nil
+	}
+	return nil
+}
+
+// waitResumed blocks while the forwarder is quiesced. It returns when the
+// pause ends or the forwarder closes.
+func (pf *PortForwarder) waitResumed() {
+	pf.mu.Lock()
+	ch := pf.resumed
+	pf.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-pf.ctx.Done():
+	}
+}
+
+// quiescedGuestConn gates the writes of a relay into the guest Netstack on
+// the pause of PortForwarder.QuiesceForSave.
+type quiescedGuestConn struct {
+	*gonet.TCPConn
+	wait func()
+}
+
+// Write implements net.Conn.Write.
+func (c quiescedGuestConn) Write(p []byte) (int, error) {
+	c.wait()
+	return c.TCPConn.Write(p)
+}
+
 // spawn runs fn on a tracked goroutine. It returns false after Close, so that
 // no goroutine starts while Close waits.
 func (pf *PortForwarder) spawn(fn func()) bool {
@@ -593,6 +648,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 			continue
 		}
 		backoff = 0
+		pf.waitResumed()
 		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, hostConn) }) {
 			_ = hostConn.Close()
 			return
@@ -638,7 +694,7 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 		}
 	}
 	defer func() { _ = guestConn.Close() }()
-	relayBidirectional(pf.ctx, hostConn, guestConn)
+	relayBidirectional(pf.ctx, hostConn, quiescedGuestConn{TCPConn: guestConn, wait: pf.waitResumed})
 }
 
 func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
@@ -673,6 +729,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 			continue
 		}
 		backoff = 0
+		pf.waitResumed()
 		sess := pf.udpSession(b, guestAddr, client)
 		if sess == nil {
 			continue

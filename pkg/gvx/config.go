@@ -346,6 +346,8 @@ type Config struct {
 	// CheckpointListener is an optional pre-bound listener for external
 	// checkpoint control requests. When set, New and Restore count it as a
 	// pre-bound listener in the host lockdown profile and Close closes it.
+	// New and Restore also close it when they fail, so the caller never closes
+	// a listener after it passed it to them.
 	CheckpointListener net.Listener
 
 	// DisableHostLockdown skips pkg/hostlockdown. New applies the lockdown

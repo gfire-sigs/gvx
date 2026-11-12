@@ -67,9 +67,13 @@ func EROFSUniqueID(mountTarget string, layerIndex int, digest string) checkpoint
 	}
 }
 
+// closeRestoreFDMap closes every descriptor that remains in fdMap and removes
+// the entries. A restored EROFS filesystem deletes its entry when it takes
+// ownership of the descriptor, so only unclaimed descriptors remain.
 func closeRestoreFDMap(fdMap map[checkpoint.ResourceID]int) error {
 	var errs []error
-	for _, rawFD := range fdMap {
+	for id, rawFD := range fdMap {
+		delete(fdMap, id)
 		if f := os.NewFile(uintptr(rawFD), "erofs-restore-cleanup"); f != nil {
 			errs = append(errs, f.Close())
 		}

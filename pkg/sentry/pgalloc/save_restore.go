@@ -1134,13 +1134,19 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		return fmt.Errorf("failed to read metadata length: %w", err)
 	}
 	length := binary.LittleEndian.Uint64(lengthBuf[:])
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
+	if length > maxLoadMetadataBytes {
+		return fmt.Errorf("metadata length %d exceeds the limit of %d bytes", length, uint64(maxLoadMetadataBytes))
+	}
+	data, err := readBoundedBytes(r, length)
+	if err != nil {
 		return fmt.Errorf("failed to read metadata: %w", err)
 	}
 	var pb pgallocpb.MemoryFileMetadataProto
 	if err := proto.Unmarshal(data, &pb); err != nil {
 		return fmt.Errorf("failed to unmarshal metadata: %w", err)
+	}
+	if err := f.validateMetadataProto(&pb); err != nil {
+		return fmt.Errorf("invalid metadata: %w", err)
 	}
 	if err := f.importMetadataProto(&pb); err != nil {
 		return fmt.Errorf("failed to import metadata: %w", err)

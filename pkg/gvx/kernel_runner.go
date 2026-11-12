@@ -169,7 +169,7 @@ var errRunConsumed = errors.New("gvx: Sandbox.Run already ran and consumed the k
 // createKernelMemoryFile creates the Sentry MemoryFile on an anonymous host
 // backing file. New calls it before the host lockdown because the lockdown
 // denies new host file creation.
-func createKernelMemoryFile() (*pgalloc.MemoryFile, error) {
+func createKernelMemoryFile(maxLoadBytes uint64) (*pgalloc.MemoryFile, error) {
 	const memFileName = "gvx-kernel-memory"
 	memFD, err := memutil.CreateMemFD(memFileName, 0)
 	if err != nil {
@@ -182,7 +182,7 @@ func createKernelMemoryFile() (*pgalloc.MemoryFile, error) {
 	// A sandbox counts its own memory. The global usage.MemoryAccounting sums
 	// every kernel of the process, and the memory cgroup IDs of two kernels
 	// overlap.
-	mf, err := pgalloc.NewMemoryFile(memFile, pgalloc.MemoryFileOpts{Accounting: usage.NewMemoryLocked()})
+	mf, err := pgalloc.NewMemoryFile(memFile, pgalloc.MemoryFileOpts{Accounting: usage.NewMemoryLocked(), MaxLoadBytes: maxLoadBytes})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("gvx: init pgalloc.MemoryFile: %w", err), memFile.Close())
 	}

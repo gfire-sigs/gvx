@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx"
 )
@@ -49,6 +50,9 @@ func init() {
 type checkpointControlRequest struct {
 	Dir          string `json:"dir,omitempty"`
 	LeaveRunning bool   `json:"leave_running,omitempty"`
+	// Token is the per-run secret of the listener. A loopback TCP listener and
+	// a Windows AF_UNIX listener reject a request without it.
+	Token string `json:"token,omitempty"`
 }
 
 // checkpointControlResponse is the JSON reply sent from the control socket.
@@ -123,6 +127,13 @@ func checkpointSubcommand(ctx context.Context, args []string, stdout, stderr io.
 		Dir:          reqDir,
 		LeaveRunning: ca.leaveRunning,
 	}
+	if network, address, perr := parseCheckpointEndpoint(ca.controlSocket); perr == nil {
+		token, tErr := readControlToken(network, address)
+		if tErr != nil {
+			_, _ = fmt.Fprintf(stderr, "rungv checkpoint: warning: %v\n", tErr)
+		}
+		req.Token = token
+	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv checkpoint: send request: %v\n", err)
 		return 1
@@ -196,38 +207,92 @@ func validateLoopbackTCPAddr(addr string) error {
 	return nil
 }
 
+// controlEndpoint is a bound control listener with its request token and
+// cleanup.
+type controlEndpoint struct {
+	// Listener accepts control connections.
+	Listener net.Listener
+	// Token is the per-run secret that each request must carry, or empty when
+	// the listener relies on the 0600 mode of a POSIX Unix socket.
+	Token string
+	// Cleanup removes the socket file and the token file. Call it only before
+	// host lockdown, because lockdown forbids file removal.
+	Cleanup func()
+}
+
+// token returns the request token of ep, or empty when ep is nil.
+func (ep *controlEndpoint) token() string {
+	if ep == nil {
+		return ""
+	}
+	return ep.Token
+}
+
 // listenCheckpointSocket binds an owner-only control listener before host
-// lockdown applies.
-func listenCheckpointSocket(raw string) (net.Listener, func(), error) {
+// lockdown applies. A loopback TCP listener and a Windows AF_UNIX listener
+// also get a per-run request token, published in a 0600 token file.
+func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 	network, address, err := parseCheckpointEndpoint(raw)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+
+	var token, tokenPath string
+	if controlTokenRequired(network) {
+		if token, err = newControlToken(); err != nil {
+			return nil, err
+		}
+		if tokenPath, err = controlTokenPath(network, address); err != nil {
+			return nil, err
+		}
+	}
+	removeToken := func() {
+		if tokenPath != "" {
+			_ = os.Remove(tokenPath)
+		}
+	}
+
+	// Every path writes the token file only after the bind succeeds. A second
+	// rungv that fails to bind a live sandbox's address must not replace or
+	// remove the token of that sandbox.
 	if network == "tcp" {
 		ln, err := net.Listen("tcp", address)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return ln, func() {}, nil
+		if tokenPath != "" {
+			if err := writeControlToken(tokenPath, token); err != nil {
+				_ = ln.Close()
+				return nil, err
+			}
+		}
+		return &controlEndpoint{Listener: ln, Token: token, Cleanup: removeToken}, nil
 	}
 
 	parent := filepath.Dir(address)
 	if parent != "" && parent != "." {
 		if err := os.MkdirAll(parent, 0o700); err != nil {
-			return nil, nil, fmt.Errorf("create checkpoint socket directory %q: %w", parent, err)
+			return nil, fmt.Errorf("create checkpoint socket directory %q: %w", parent, err)
 		}
 	}
 	if fi, err := os.Lstat(address); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
-			return nil, nil, fmt.Errorf("checkpoint socket path %q already exists and is not a socket", address)
+			return nil, fmt.Errorf("checkpoint socket path %q already exists and is not a socket", address)
 		}
 		if err := os.Remove(address); err != nil {
-			return nil, nil, fmt.Errorf("remove stale checkpoint socket %q: %w", address, err)
+			return nil, fmt.Errorf("remove stale checkpoint socket %q: %w", address, err)
 		}
 	}
 	ln, err := net.Listen("unix", address)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	if tokenPath != "" {
+		if err := writeControlToken(tokenPath, token); err != nil {
+			_ = ln.Close()
+			_ = os.Remove(address)
+			return nil, err
+		}
 	}
 	if ul, ok := ln.(*net.UnixListener); ok {
 		ul.SetUnlinkOnClose(false)
@@ -235,12 +300,14 @@ func listenCheckpointSocket(raw string) (net.Listener, func(), error) {
 	if err := os.Chmod(address, 0o600); err != nil && runtime.GOOS != "windows" {
 		_ = ln.Close()
 		_ = os.Remove(address)
-		return nil, nil, fmt.Errorf("chmod checkpoint socket %q: %w", address, err)
+		removeToken()
+		return nil, fmt.Errorf("chmod checkpoint socket %q: %w", address, err)
 	}
 	cleanup := func() {
 		_ = os.Remove(address)
+		removeToken()
 	}
-	return ln, cleanup, nil
+	return &controlEndpoint{Listener: ln, Token: token, Cleanup: cleanup}, nil
 }
 
 func dialCheckpointSocket(ctx context.Context, raw string) (net.Conn, error) {
@@ -281,56 +348,142 @@ func validateRequestedCheckpointDir(reqDir, cleanConfDir, absConfDir string) err
 	return fmt.Errorf("checkpoint directory %q does not match pre-opened -checkpoint-dir %q", trimmed, cleanConfDir)
 }
 
+// Control connection time limits. A client has controlRequestTimeout to send
+// one request, and the server has controlResponseTimeout to write the reply.
+// Neither covers the checkpoint itself.
+//
+// Tests shorten both limits.
+var (
+	controlRequestTimeout  = 10 * time.Second
+	controlResponseTimeout = 10 * time.Second
+)
+
+// checkpointer is the part of gvx.Sandbox that the control server calls.
+type checkpointer interface {
+	Checkpoint(ctx context.Context, opts gvx.CheckpointOptions) error
+}
+
+// controlServer serves one control connection at a time and tracks the
+// connections that still wait for a request, so stop can close them.
+type controlServer struct {
+	cp       checkpointer
+	token    string
+	cleanDir string
+	absDir   string
+
+	mu      sync.Mutex
+	closing bool
+	reading map[net.Conn]struct{}
+}
+
 // startCheckpointControl serves checkpoint control requests from sb in a
 // background goroutine until the listener closes. The returned stop function
-// closes the listener and waits for any in-flight request to finish writing its
-// response.
-func startCheckpointControl(ctx context.Context, sb *gvx.Sandbox, ln net.Listener, cleanDir, absDir string) func() {
+// closes the listener and every connection that has not sent a request, and
+// waits for an in-flight request to finish writing its response.
+func startCheckpointControl(ctx context.Context, sb *gvx.Sandbox, ln net.Listener, token, cleanDir, absDir string) func() {
 	if ln == nil {
 		return func() {}
+	}
+	return serveCheckpointControl(ctx, sb, sb.AcceptCheckpointConn, ln, token, cleanDir, absDir)
+}
+
+func serveCheckpointControl(ctx context.Context, cp checkpointer, accept func() (net.Conn, error), ln net.Listener, token, cleanDir, absDir string) func() {
+	srv := &controlServer{
+		cp:       cp,
+		token:    token,
+		cleanDir: cleanDir,
+		absDir:   absDir,
+		reading:  make(map[net.Conn]struct{}),
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
-			conn, err := sb.AcceptCheckpointConn()
+			conn, err := accept()
 			if err != nil {
 				return
 			}
-			handleCheckpointConn(ctx, sb, conn, cleanDir, absDir)
+			srv.serve(ctx, conn)
 		}
 	}()
 	return sync.OnceFunc(func() {
 		_ = ln.Close()
+		srv.closeReading()
 		<-done
 	})
 }
 
-func handleCheckpointConn(ctx context.Context, sb *gvx.Sandbox, conn net.Conn, cleanDir, absDir string) {
+// beginRead registers conn as waiting for a request. It reports false when the
+// server is stopping.
+func (s *controlServer) beginRead(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.reading[conn] = struct{}{}
+	return true
+}
+
+func (s *controlServer) endRead(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.reading, conn)
+	s.mu.Unlock()
+}
+
+// closeReading stops the server from accepting new requests and closes the
+// connections that wait for one.
+func (s *controlServer) closeReading() {
+	s.mu.Lock()
+	s.closing = true
+	conns := make([]net.Conn, 0, len(s.reading))
+	for c := range s.reading {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+func (s *controlServer) reply(conn net.Conn, resp checkpointControlResponse) {
+	_ = conn.SetWriteDeadline(time.Now().Add(controlResponseTimeout))
+	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+func (s *controlServer) serve(ctx context.Context, conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 	}()
+	if !s.beginRead(conn) {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(controlRequestTimeout))
 	var req checkpointControlRequest
-	if err := json.NewDecoder(io.LimitReader(conn, 64<<10)).Decode(&req); err != nil {
-		_ = json.NewEncoder(conn).Encode(checkpointControlResponse{
+	decodeErr := json.NewDecoder(io.LimitReader(conn, 64<<10)).Decode(&req)
+	s.endRead(conn)
+	_ = conn.SetReadDeadline(time.Time{})
+	if decodeErr != nil {
+		s.reply(conn, checkpointControlResponse{
 			OK:    false,
-			Error: fmt.Sprintf("decode checkpoint request: %v", err),
+			Error: fmt.Sprintf("decode checkpoint request: %v", decodeErr),
 		})
 		return
 	}
-	if err := validateRequestedCheckpointDir(req.Dir, cleanDir, absDir); err != nil {
-		_ = json.NewEncoder(conn).Encode(checkpointControlResponse{
+	if !controlTokenMatches(s.token, req.Token) {
+		s.reply(conn, checkpointControlResponse{
 			OK:    false,
-			Error: err.Error(),
+			Error: "unauthorized: the request lacks the control token of this sandbox",
 		})
 		return
 	}
-	if err := sb.Checkpoint(ctx, gvx.CheckpointOptions{LeaveRunning: req.LeaveRunning}); err != nil {
-		_ = json.NewEncoder(conn).Encode(checkpointControlResponse{
-			OK:    false,
-			Error: err.Error(),
-		})
+	if err := validateRequestedCheckpointDir(req.Dir, s.cleanDir, s.absDir); err != nil {
+		s.reply(conn, checkpointControlResponse{OK: false, Error: err.Error()})
 		return
 	}
-	_ = json.NewEncoder(conn).Encode(checkpointControlResponse{OK: true})
+	if err := s.cp.Checkpoint(ctx, gvx.CheckpointOptions{LeaveRunning: req.LeaveRunning}); err != nil {
+		s.reply(conn, checkpointControlResponse{OK: false, Error: err.Error()})
+		return
+	}
+	s.reply(conn, checkpointControlResponse{OK: true})
 }

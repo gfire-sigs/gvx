@@ -156,15 +156,15 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	}
 
 	cleanCkptDir, absCkptDir := resolveCheckpointDirs(rc.cfg.CheckpointDir)
-	cleanupSocket, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv run", stderr)
+	control, ok := bindControlSocket(&rc.cfg, rc.controlSocket, "rungv run", stderr)
 	if !ok {
 		return 1
 	}
 	var sb *gvx.Sandbox
-	if cleanupSocket != nil {
+	if control != nil {
 		defer func() {
 			if sb == nil || !sb.LockdownStatus().Applied {
-				cleanupSocket()
+				control.Cleanup()
 			}
 		}()
 	}
@@ -184,26 +184,26 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	defer func() {
 		_ = sb.Close()
 	}()
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv run", stderr)
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv run", stderr)
 }
 
 // bindControlSocket opens the control listener before host lockdown when requested.
-func bindControlSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.Writer) (func(), bool) {
+func bindControlSocket(cfg *gvx.Config, socketSpec, cmdPrefix string, stderr io.Writer) (*controlEndpoint, bool) {
 	if socketSpec == "" {
 		return nil, true
 	}
-	ln, sockCleanup, err := listenCheckpointSocket(socketSpec)
+	ep, err := listenCheckpointSocket(socketSpec)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: listen control socket: %v\n", cmdPrefix, err)
 		return nil, false
 	}
-	cfg.CheckpointListener = ln
-	return sockCleanup, true
+	cfg.CheckpointListener = ep.Listener
+	return ep, true
 }
 
 // executeSandboxWithControl emits startup warnings, starts checkpoint control, and runs the sandbox.
-func executeSandboxWithControl(ctx context.Context, sb *gvx.Sandbox, cfg *gvx.Config, autoPlatform bool, cleanCkptDir, absCkptDir, cmdPrefix string, stderr io.Writer) int {
-	stopControl := startCheckpointControl(ctx, sb, cfg.CheckpointListener, cleanCkptDir, absCkptDir)
+func executeSandboxWithControl(ctx context.Context, sb *gvx.Sandbox, cfg *gvx.Config, controlToken string, autoPlatform bool, cleanCkptDir, absCkptDir, cmdPrefix string, stderr io.Writer) int {
+	stopControl := startCheckpointControl(ctx, sb, cfg.CheckpointListener, controlToken, cleanCkptDir, absCkptDir)
 	defer stopControl()
 
 	reportSandboxStartup(stderr, sb, cfg, autoPlatform)

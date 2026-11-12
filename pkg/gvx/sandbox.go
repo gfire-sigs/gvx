@@ -92,8 +92,18 @@ type Sandbox struct {
 // MemoryFile, then locks down the host process unless
 // Config.DisableHostLockdown is set. Every host handle exists before the
 // lockdown call because the lockdown denies new host file opens.
-func New(ctx context.Context, cfg Config) (*Sandbox, error) {
+//
+// New takes ownership of Config.CheckpointListener on every call. When New
+// fails, it closes the listener.
+func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
+	if ln := cfg.CheckpointListener; ln != nil {
+		defer func() {
+			if retErr != nil {
+				_ = ln.Close()
+			}
+		}()
+	}
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
@@ -105,16 +115,15 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		runDone:        make(chan struct{}),
 		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
 	}
+	cleanup := func(cause error) (*Sandbox, error) {
+		return nil, errors.Join(cause, sb.Close())
+	}
 	if cfg.HostCACerts {
 		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
 		if err != nil {
-			return nil, fmt.Errorf("gvx: read the host root certificates: %w", err)
+			return cleanup(fmt.Errorf("gvx: read the host root certificates: %w", err))
 		}
 		sb.hostCARoots = roots
-	}
-
-	cleanup := func(cause error) (*Sandbox, error) {
-		return nil, errors.Join(cause, sb.Close())
 	}
 
 	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
@@ -138,7 +147,7 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return cleanup(err)
 	}
 
-	mf, err := createKernelMemoryFile()
+	mf, err := createKernelMemoryFile(0)
 	if err != nil {
 		return cleanup(err)
 	}

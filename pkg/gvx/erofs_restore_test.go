@@ -377,6 +377,9 @@ func TestEROFSVFSMountSaveRestorePreservesOpenFileDescriptors(t *testing.T) {
 		if _, err := state.Load(restoreSctx, bytes.NewReader(stateStream.Bytes()), &restored); err != nil {
 			t.Fatalf("attempt %d: state.Load VFS: %v", attempt, err)
 		}
+		if len(fdMap) != 0 {
+			t.Fatalf("attempt %d: restore left %d unclaimed FDs in RestoreFilesystemFDMap, want 0 (%v)", attempt, len(fdMap), fdMap)
+		}
 		if err := restored.VFS.CompleteRestore(restoreSctx, &vfs.CompleteRestoreOptions{}); err != nil {
 			t.Fatalf("attempt %d: CompleteRestore: %v", attempt, err)
 		}
@@ -448,5 +451,39 @@ func TestEROFSVFSMountSaveRestorePreservesOpenFileDescriptors(t *testing.T) {
 	}()
 	if _, err := sb.WithRestoreEROFSFDMap(ctx1); err == nil {
 		t.Fatal("duplicate sb.WithRestoreEROFSFDMap on same context succeeded, want collision error")
+	}
+}
+
+func TestCloseRestoreFDMapClosesAndClearsUnclaimedDescriptors(t *testing.T) {
+	cache, err := NewLayerCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLayerCache: %v", err)
+	}
+	path, stats, err := cache.CompileAndStore("", bytes.NewReader(buildTestTarLayer(t, map[string]string{"a.txt": "a"})))
+	if err != nil {
+		t.Fatalf("CompileAndStore: %v", err)
+	}
+	hh, err := fd.OpenHostPath(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenHostPath: %v", err)
+	}
+	t.Cleanup(func() { _ = hh.Close() })
+
+	fdMap, err := BuildRestoreEROFSFDMap([]EROFSLayerMount{{MountTarget: "/", Digest: stats.SHA256Hex, Handle: hh}})
+	if err != nil {
+		t.Fatalf("BuildRestoreEROFSFDMap: %v", err)
+	}
+	if err := closeRestoreFDMap(fdMap); err != nil {
+		t.Fatalf("closeRestoreFDMap: %v", err)
+	}
+	if len(fdMap) != 0 {
+		t.Fatalf("closeRestoreFDMap left %d entries, want 0", len(fdMap))
+	}
+	// A second call must not close the (possibly reused) descriptor number again.
+	if err := closeRestoreFDMap(fdMap); err != nil {
+		t.Fatalf("second closeRestoreFDMap: %v", err)
+	}
+	if _, err := hh.Dup(); err != nil {
+		t.Fatalf("original handle is unusable after cleanup: %v", err)
 	}
 }

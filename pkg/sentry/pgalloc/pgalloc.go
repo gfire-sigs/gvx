@@ -403,6 +403,12 @@ type MemoryFileOpts struct {
 	// MemoryFile instead of usage.MemoryAccounting. A process that runs more
 	// than one Sentry kernel gives each MemoryFile its own Accounting.
 	Accounting *usage.MemoryLocked
+
+	// MaxLoadBytes, if not zero, is the largest backing file size in bytes
+	// that LoadFrom accepts from saved metadata. A sandbox with a memory
+	// limit sets it so that a corrupt checkpoint cannot map more address
+	// space than the sandbox may use.
+	MaxLoadBytes uint64
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
