@@ -160,11 +160,17 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	if !ok {
 		return 1
 	}
+	var sb *gvx.Sandbox
 	if cleanupSocket != nil {
-		defer cleanupSocket()
+		defer func() {
+			if sb == nil || !sb.LockdownStatus().Applied {
+				cleanupSocket()
+			}
+		}()
 	}
 
-	sb, err := gvx.New(ctx, rc.cfg)
+	var err error
+	sb, err = gvx.New(ctx, rc.cfg)
 	if err != nil {
 		if rc.cfg.CheckpointListener != nil {
 			_ = rc.cfg.CheckpointListener.Close()

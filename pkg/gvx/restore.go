@@ -211,6 +211,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (*Sandbox, er
 	if err != nil {
 		return nil, err
 	}
+	if (cfg.Platform == "" || cfg.Platform == PlatformAuto) && manifest.Platform != "" {
+		cfg.Platform = PlatformType(manifest.Platform)
+	}
 	if cfg.NetworkMode == "" && manifest.NetMode != "" {
 		cfg.NetworkMode = manifest.NetMode
 	}
