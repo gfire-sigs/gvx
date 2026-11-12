@@ -24,6 +24,15 @@ type preservedEndpoint interface {
 	PreserveAcrossSaveRestore() bool
 }
 
+type preSaveTransportEndpoint interface {
+	FreezeSave()
+	PrepareSave()
+}
+
+type postRestoreTransportEndpoint interface {
+	FinishRestore()
+}
+
 func isPreservedEndpoint(ep NetworkLinkEndpoint) bool {
 	p, ok := ep.(preservedEndpoint)
 	return ok && p.PreserveAcrossSaveRestore()
@@ -44,6 +53,7 @@ type stackExtState struct {
 	hooks              map[uint64]stackLifecycleHook `state:"nosave"`
 	nextHookID         uint64                        `state:"nosave"`
 	postLoadHooks      []func()                      `state:"nosave"`
+	restoredEndpoints  []RestoredEndpoint            `state:"nosave"`
 	loaded             bool                          `state:"nosave"`
 	stack              *Stack
 	hasBridgeNetfilter bool
@@ -137,6 +147,17 @@ func (s *Stack) runPreSaveHooks() {
 	e.mu.RUnlock()
 	for _, fn := range fns {
 		fn()
+	}
+	eps := s.RegisteredEndpoints()
+	for _, ep := range eps {
+		if p, ok := ep.(preSaveTransportEndpoint); ok {
+			p.FreezeSave()
+		}
+	}
+	for _, ep := range eps {
+		if p, ok := ep.(preSaveTransportEndpoint); ok {
+			p.PrepareSave()
+		}
 	}
 }
 

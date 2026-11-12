@@ -188,10 +188,38 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 	}
 	if cfg.CheckpointListener != nil {
 		// AcceptCheckpointConn accepts a connection on the pre-bound
-		// CheckpointListener socket.
+		// CheckpointListener socket. A TCP listener configures keepalive
+		// and TCP_NODELAY on the accepted connection.
 		rules.Add(unix.SYS_ACCEPT4, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETSOCKNAME, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETPEERNAME, seccomp.MatchAll{})
+		rules.Add(unix.SYS_SETSOCKOPT, seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_KEEPALIVE),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_NODELAY),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_KEEPIDLE),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_KEEPINTVL),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_KEEPCNT),
+			},
+		})
 	}
 	switch cfg.NetworkMode {
 	case NetModeNAT:

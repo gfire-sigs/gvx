@@ -219,3 +219,133 @@ func TestEndpointBoundWildcardStateRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+type nonSavableLinkEndpoint struct {
+	stack.LinkEndpoint
+}
+
+func (nonSavableLinkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return stack.CapabilityNone
+}
+
+func newNonSavableStack(t *testing.T, addr tcpip.Address) *stack.Stack {
+	t.Helper()
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{NewProtocol},
+		HandleLocal:        true,
+	})
+	if err := s.CreateNIC(1, nonSavableLinkEndpoint{LinkEndpoint: loopback.New()}); err != nil {
+		s.Destroy()
+		t.Fatalf("CreateNIC: %s", err)
+	}
+	pa := tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: addr, PrefixLen: 24},
+	}
+	if err := s.AddProtocolAddress(1, pa, stack.AddressProperties{}); err != nil {
+		s.Destroy()
+		t.Fatalf("AddProtocolAddress: %s", err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	return s
+}
+
+func TestTerminatedConnectedEndpointRemovedFromDemuxerBeforeSave(t *testing.T) {
+	const (
+		clientPort = 41021
+		serverPort = 8080
+	)
+	addr := tcpip.AddrFrom4([4]byte{10, 0, 2, 15})
+
+	s := newNonSavableStack(t, addr)
+	defer s.Destroy()
+
+	var listenWQ waiter.Queue
+	listener, tcpErr := s.NewEndpoint(ProtocolNumber, ipv4.ProtocolNumber, &listenWQ)
+	if tcpErr != nil {
+		t.Fatalf("NewEndpoint listener: %s", tcpErr)
+	}
+	defer listener.Close()
+	if err := listener.Bind(tcpip.FullAddress{Port: serverPort}); err != nil {
+		t.Fatalf("Bind listener: %s", err)
+	}
+	if err := listener.Listen(4); err != nil {
+		t.Fatalf("Listen: %s", err)
+	}
+
+	acceptWE, acceptCh := waiter.NewChannelEntry(waiter.ReadableEvents)
+	listenWQ.EventRegister(&acceptWE)
+
+	var clientWQ waiter.Queue
+	client, tcpErr := s.NewEndpoint(ProtocolNumber, ipv4.ProtocolNumber, &clientWQ)
+	if tcpErr != nil {
+		t.Fatalf("NewEndpoint client: %s", tcpErr)
+	}
+	defer client.Close()
+	if err := client.Bind(tcpip.FullAddress{Addr: addr, Port: clientPort}); err != nil {
+		t.Fatalf("Bind client: %s", err)
+	}
+
+	connWE, connCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	clientWQ.EventRegister(&connWE)
+	connectErr := client.Connect(tcpip.FullAddress{NIC: 1, Addr: addr, Port: serverPort})
+	if connectErr != nil {
+		if _, ok := connectErr.(*tcpip.ErrConnectStarted); !ok {
+			clientWQ.EventUnregister(&connWE)
+			t.Fatalf("Connect: %s", connectErr)
+		}
+		select {
+		case <-connCh:
+		case <-time.After(5 * time.Second):
+			clientWQ.EventUnregister(&connWE)
+			t.Fatal("Connect timed out")
+		}
+	}
+	clientWQ.EventUnregister(&connWE)
+
+	accepted, _, tcpErr := listener.Accept(nil)
+	for tcpErr != nil {
+		if _, ok := tcpErr.(*tcpip.ErrWouldBlock); !ok {
+			t.Fatalf("Accept: %s", tcpErr)
+		}
+		select {
+		case <-acceptCh:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Accept timed out")
+		}
+		accepted, _, tcpErr = listener.Accept(nil)
+	}
+	listenWQ.EventUnregister(&acceptWE)
+
+	// Close the accepted endpoint so it enters FIN-WAIT and is referenced only
+	// through the stack demuxer while client remains ESTABLISHED/CLOSE-WAIT.
+	accepted.Close()
+
+	s.SetRemoveConf(true)
+	s.Pause()
+	var buf bytes.Buffer
+	ctx := context.Background()
+	_, saveErr := state.Save(ctx, &buf, &s)
+	s.Resume()
+	if saveErr != nil {
+		t.Fatalf("state.Save: %v", saveErr)
+	}
+
+	var restored *stack.Stack
+	if _, err := state.Load(ctx, bytes.NewReader(buf.Bytes()), &restored); err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	cfgStack := newNonSavableStack(t, addr)
+	restored.ReplaceConfig(cfgStack)
+	cfgStack.ResetConfig()
+	cfgStack.Destroy()
+	restored.Restore()
+
+	for _, ep := range restored.RegisteredEndpoints() {
+		if tcpEP, ok := ep.(*Endpoint); ok && tcpEP.EndpointState().closed() {
+			t.Fatalf("restored demuxer retained closed endpoint %+v in state %v", tcpEP.TransportEndpointInfo.ID, tcpEP.EndpointState())
+		}
+	}
+	restored.Destroy()
+}
