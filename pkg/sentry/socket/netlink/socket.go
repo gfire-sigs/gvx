@@ -16,6 +16,7 @@
 package netlink
 
 import (
+	goContext "context"
 	"fmt"
 	"io"
 	"math"
@@ -108,6 +109,9 @@ type Socket struct {
 	// datagram that a reader consumes (dump_xplat.go).
 	dump dumpState `state:"nosave"`
 
+	// dumpResume records a dump that a checkpoint cut short (dump_xplat.go).
+	dumpResume dumpResume
+
 	// netns is the network namespace associated with the socket.
 	// A netlink socket is immutably bound to a network namespace.
 	netns *inet.Namespace
@@ -186,6 +190,16 @@ func (s *Socket) Stack() inet.Stack {
 // NetworkNamespace returns the network namespace associated with the socket.
 func (s *Socket) NetworkNamespace() *inet.Namespace {
 	return s.netns
+}
+
+// beforeSave is invoked by stateify.
+func (s *Socket) beforeSave() {
+	s.dumpBeforeSave()
+}
+
+// afterLoad is invoked by stateify.
+func (s *Socket) afterLoad(goContext.Context) {
+	s.dumpAfterLoad()
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.

@@ -34,7 +34,7 @@ func (s *Set) createListSet(p *CreateParams) int {
 	if p.given(GivenSize) {
 		s.listSize = p.Size
 	}
-	s.listSize = max(s.listSize, listMinSize)
+	s.listSize = min(max(s.listSize, listMinSize), listMaxSize)
 	return 0
 }
 
@@ -162,10 +162,34 @@ func (s *Set) listTest(op *listSetOp, now time.Duration) int {
 
 // nextLive returns the first member after position i that has not timed out.
 func (s *Set) nextLive(i int, now time.Duration) *member {
-	if i+1 < len(s.list) {
-		return &s.list[i+1]
+	for j := i + 1; j < len(s.list); j++ {
+		if !s.expired(&s.list[j].ext, now) {
+			return &s.list[j]
+		}
 	}
 	return nil
+}
+
+// lastLive returns the position of the last member that has not timed out, or
+// -1 when the list has none.
+func (s *Set) lastLive(now time.Duration) int {
+	for i := len(s.list) - 1; i >= 0; i-- {
+		if !s.expired(&s.list[i].ext, now) {
+			return i
+		}
+	}
+	return -1
+}
+
+// liveCount returns the number of members that have not timed out.
+func (s *Set) liveCount(now time.Duration) int {
+	n := 0
+	for i := range s.list {
+		if !s.expired(&s.list[i].ext, now) {
+			n++
+		}
+	}
+	return n
 }
 
 // listAdd is list_set_uadd.
@@ -196,6 +220,17 @@ func (s *Set) listAdd(op *listSetOp, x *ext, flags uint32, now time.Duration) in
 		// The set is already in the list: drop the extra reference.
 		s.reg.put(op.id)
 		return 0
+	}
+	if s.liveCount(now) >= int(s.listSize) {
+		// The list is full. Without forceadd the add fails. With forceadd the
+		// last member leaves the list, as the push-out of Linux does. The
+		// reference member stays, because the new member needs its position.
+		victim := s.lastLive(now)
+		if !s.forceadd || victim < 0 || victim == nextPos || victim == prevPos {
+			return -ErrListFull
+		}
+		s.reg.put(s.list[victim].id)
+		s.list = slices.Delete(s.list, victim, victim+1)
 	}
 	m := member{id: op.id}
 	s.initExtensions(&m.ext, x, now)
