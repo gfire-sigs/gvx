@@ -2,7 +2,7 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.14.10002026110200] - 2026-11-12
 
 This release adds lockdown-safe sandbox checkpoint and restore across the Go SDK and the CLI (#157, #158, #160, #162, #163, #164, #167, #168, #170, #171, #174, #176, #178, #180, #181, #184, #186, #187). It also hardens host lockdown on Linux, macOS, and Windows, unifies Stage-2 hypervisor mappings, and trims Tier 3 upstream seams (#140-#156, #159, #161, #165, #166, #172, #173, #175, #177, #179, #182, #183, #185).
 
