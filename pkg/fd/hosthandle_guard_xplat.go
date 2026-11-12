@@ -29,12 +29,23 @@ import (
 // close of the OS handle never overlaps a call that uses it. After shut starts,
 // no new call enters.
 //
+// The wait is bounded by one system call. Every HostHandle wraps a regular
+// file that OpenHostPath opened (an EROFS layer image), and ReadAt, WriteAt,
+// and Dup never block on such a file. No call closes its own handle. A handle
+// of a pipe, a socket, or a console must not use HostHandle, because its calls
+// can block for ever and Close would wait for them.
+//
+// The first shut owns the close or the release of the OS handle and ends it
+// with finish. A later shut waits for finish, so a second Close never returns
+// before the OS handle is closed.
+//
 // The zero value is ready to use.
 type handleGuard struct {
-	mu     sync.Mutex
-	idle   sync.Cond
-	active int
-	closed atomic.Bool
+	mu       sync.Mutex
+	idle     sync.Cond
+	active   int
+	finished bool
+	closed   atomic.Bool
 }
 
 // isClosed reports whether shut started.
@@ -64,18 +75,30 @@ func (g *handleGuard) exit() {
 
 // shut stops the admission of new calls and waits for the admitted calls to
 // exit. It returns true for the first call, which owns the close or the
-// release of the OS handle. Any later call returns false at once.
+// release of the OS handle and must call finish when it is done. Any later
+// call waits for finish and returns false.
 func (g *handleGuard) shut() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.closed.Swap(true) {
-		return false
-	}
 	if g.idle.L == nil {
 		g.idle.L = &g.mu
+	}
+	if g.closed.Swap(true) {
+		for !g.finished {
+			g.idle.Wait()
+		}
+		return false
 	}
 	for g.active > 0 {
 		g.idle.Wait()
 	}
 	return true
+}
+
+// finish ends the close or the release that the first shut owns.
+func (g *handleGuard) finish() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.finished = true
+	g.idle.Broadcast()
 }

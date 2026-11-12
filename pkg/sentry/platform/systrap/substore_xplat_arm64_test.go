@@ -156,6 +156,35 @@ func TestStoreEmulationRefusesARangeThatTheCheckRejects(t *testing.T) {
 	}
 }
 
+// TestStoreChecksTheWholeRangeBeforeTheFirstWrite runs a pair store whose
+// second half crosses into a page that the check refuses. The emulator must ask
+// for the full 16 bytes once and write nothing, because the first half alone
+// would be a partial store that the thread repeats after the fault.
+func TestStoreChecksTheWholeRangeBeforeTheFirstWrite(t *testing.T) {
+	st, ok := decodeStore(0xa9000801) // stp x1, x2, [x0]
+	if !ok {
+		t.Fatal("decodeStore refused stp")
+	}
+	var ss arch.Registers
+	ss.Regs[0] = 0x1000 - 8
+	fp := make([]byte, arch.FPSIMDBodySize)
+	var checks [][2]uint64
+	wrote := false
+	_, ok = st.execute(storeRegs{regs: &ss, fp: fp},
+		func(addr uint64, n int) bool {
+			checks = append(checks, [2]uint64{addr, uint64(n)})
+			return addr+uint64(n) <= 0x1000
+		},
+		func(uint64, int) bool { return false },
+		func(uint64, []byte) { wrote = true })
+	if ok || wrote {
+		t.Errorf("execute = %v and wrote = %v, want a refusal with no write", ok, wrote)
+	}
+	if len(checks) != 1 || checks[0] != [2]uint64{0x1000 - 8, 16} {
+		t.Errorf("checks = %v, want one check of 16 bytes at %#x", checks, 0x1000-8)
+	}
+}
+
 func TestEmulateAtomicOrCacheOp(t *testing.T) {
 	mem := make([]byte, 128)
 	for i := range mem {

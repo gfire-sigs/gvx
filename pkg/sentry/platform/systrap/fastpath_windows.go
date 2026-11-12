@@ -613,7 +613,10 @@ func (th *thread) inIslandPC(pc uint64) bool {
 
 // stopPin returns the address of the slot that holds the program counter of
 // the stopped thread, or 0 when the program counter lies outside every slot.
-// Callers hold th.mu.
+// Callers hold th.mu. The call takes as.mu, which follows th.mu in the lock
+// order of guestPC, continueAt, and windowCodeChanged. No path takes th.mu or
+// calls park while it holds as.mu: Release unlocks as.mu before it destroys the
+// threads.
 func (th *thread) stopPin() uint64 {
 	as := th.sp.owner.Load()
 	if as == nil {

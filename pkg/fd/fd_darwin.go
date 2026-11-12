@@ -72,6 +72,7 @@ func (h *HostHandle) Release() (uintptr, error) {
 	if h == nil || !h.guard.shut() {
 		return 0, errClosedHostHandle
 	}
+	defer h.guard.finish()
 	raw := h.raw.Swap(-1)
 	return uintptr(raw), nil
 }
@@ -97,6 +98,7 @@ func (h *HostHandle) Close() error {
 	if h == nil || !h.guard.shut() {
 		return nil
 	}
+	defer h.guard.finish()
 	raw := h.raw.Swap(-1)
 	if raw < 0 {
 		return nil

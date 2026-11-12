@@ -55,27 +55,42 @@ func TestGuardShutWaitsForAdmittedCalls(t *testing.T) {
 		if !owner {
 			t.Error("the first shut did not own the close")
 		}
+		g.finish()
 		if g.shut() {
 			t.Error("the second shut owned the close again")
 		}
 	})
 }
 
-// TestGuardSecondShutDoesNotWait checks that a repeated Close or Release does
-// not block behind a call in flight. Only the first shut owns the close.
-func TestGuardSecondShutDoesNotWait(t *testing.T) {
+// TestGuardSecondShutWaitsForFinish checks that a repeated Close or Release
+// does not return before the first one closed the OS handle. Only the first
+// shut owns the close.
+func TestGuardSecondShutWaitsForFinish(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var g handleGuard
-		g.enter()
-		first := make(chan bool)
-		go func() { first <- g.shut() }()
-		synctest.Wait()
-		if g.shut() {
-			t.Error("the second shut returned true, want false")
+		if !g.shut() {
+			t.Fatal("the first shut did not own the close")
 		}
-		g.exit()
-		if !<-first {
-			t.Error("the first shut did not own the close")
+		second, owner := make(chan struct{}), true
+		go func() {
+			owner = g.shut()
+			close(second)
+		}()
+		synctest.Wait()
+		select {
+		case <-second:
+			t.Fatal("the second shut returned before the OS handle closed")
+		default:
+		}
+		g.finish()
+		synctest.Wait()
+		select {
+		case <-second:
+		default:
+			t.Fatal("the second shut did not return after finish")
+		}
+		if owner {
+			t.Error("the second shut owned the close")
 		}
 	})
 }

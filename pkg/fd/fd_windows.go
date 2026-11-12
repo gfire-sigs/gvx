@@ -129,6 +129,7 @@ func (h *HostHandle) Release() (uintptr, error) {
 	if h == nil || !h.guard.shut() {
 		return 0, errClosedHostHandle
 	}
+	defer h.guard.finish()
 	raw := h.raw.Swap(uintptr(windows.InvalidHandle))
 	return raw, nil
 }
@@ -153,6 +154,7 @@ func (h *HostHandle) Close() error {
 	if h == nil || !h.guard.shut() {
 		return nil
 	}
+	defer h.guard.finish()
 	raw := h.raw.Swap(uintptr(windows.InvalidHandle))
 	if raw == 0 || windows.Handle(raw) == windows.InvalidHandle {
 		return nil
