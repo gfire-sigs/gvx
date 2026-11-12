@@ -1,0 +1,158 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 24
+  }
+}
+
+direction: down
+
+classes: {
+  caller: {
+    style: {
+      fill: "#1E293B"
+      stroke: "#0F172A"
+      stroke-width: 2
+      font-color: "#F8FAFC"
+      border-radius: 8
+      font-size: 15
+      bold: true
+    }
+  }
+  core: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+  sentry: {
+    style: {
+      fill: "#DBEAFE"
+      stroke: "#1D4ED8"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 15
+      bold: true
+    }
+  }
+  subsystem: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+  leaf_vfs: {
+    style: {
+      fill: "#FFFFFF"
+      stroke: "#16A34A"
+      stroke-width: 1
+      font-color: "#1E293B"
+      border-radius: 6
+      font-size: 13
+    }
+  }
+  leaf_net: {
+    style: {
+      fill: "#FFFFFF"
+      stroke: "#0284C7"
+      stroke-width: 1
+      font-color: "#1E293B"
+      border-radius: 6
+      font-size: 13
+    }
+  }
+}
+
+caller: "Caller (rungv CLI or pkg/gvx Go SDK)" {
+  class: caller
+}
+
+sandbox: "Unprivileged Host Process (Restricted Token + Job Object / Seatbelt / Landlock + seccomp)" {
+  style: {
+    fill: "#F8FAFC"
+    stroke: "#64748B"
+    stroke-width: 2
+    stroke-dash: 4
+    border-radius: 12
+    font-color: "#334155"
+    font-size: 14
+    bold: true
+  }
+
+  guest: "Linux ELF64 Workload (Docker / k3s / App)" {
+    class: core
+  }
+
+  engine: "Execution Engine (WHPX / HVF / systrap)" {
+    class: core
+  }
+
+  sentry: "gVisor Sentry Kernel (Pure Go)" {
+    class: sentry
+  }
+
+  vfs: "VFS2 Filesystem Layer" {
+    class: subsystem
+    erofs: "OCI Rootfs\n(Cached .erofs + tmpfs Overlay)" {
+      class: leaf_vfs
+    }
+    ext4: "Named Volumes\n(ext4lite Single-File .ext4 + jbd2)" {
+      class: leaf_vfs
+    }
+    hostfs: "Host Bind Mounts\n(-workspace & -v via Pinned os.Root)" {
+      class: leaf_vfs
+    }
+  }
+
+  net: "User-Space Netstack (TCP/IP)" {
+    class: subsystem
+    style.fill: "#F0F9FF"
+    style.stroke: "#0284C7"
+    style.font-color: "#0C4A6E"
+
+    nat: "L4 NAT & Port Forwarder\n(-net=nat, -p, host.docker.internal)" {
+      class: leaf_net
+    }
+    wg: "L3 WireGuard Tunnel\n(-net=wg, User-Space UDP)" {
+      class: leaf_net
+    }
+  }
+
+  guest -> engine: "Syscalls & 4 KB Page Faults" {
+    style.stroke: "#2563EB"
+    style.stroke-width: 2
+    style.font-size: 13
+  }
+  engine -> sentry: "Fast-Path CommPage / sysmsg" {
+    style.stroke: "#2563EB"
+    style.stroke-width: 2
+    style.font-size: 13
+  }
+  sentry -> vfs: "File & Mount Operations" {
+    style.stroke: "#16A34A"
+    style.stroke-width: 2
+    style.font-size: 13
+  }
+  sentry -> net: "Socket & Packet Operations" {
+    style.stroke: "#0284C7"
+    style.stroke-width: 2
+    style.font-size: 13
+  }
+}
+
+caller -> sandbox.guest: "Pre-open handles, lock down host process, enter guest" {
+  style.stroke: "#0F172A"
+  style.stroke-width: 2
+  style.font-size: 13
+}

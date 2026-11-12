@@ -1,0 +1,168 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 24
+  }
+}
+
+direction: down
+
+classes: {
+  stage: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+  sentry: {
+    style: {
+      fill: "#DBEAFE"
+      stroke: "#1D4ED8"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 15
+      bold: true
+    }
+  }
+  group_vfs: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 10
+      font-size: 14
+      bold: true
+    }
+  }
+  group_net: {
+    style: {
+      fill: "#F0F9FF"
+      stroke: "#0284C7"
+      stroke-width: 2
+      font-color: "#0C4A6E"
+      border-radius: 10
+      font-size: 14
+      bold: true
+    }
+  }
+  group_plat: {
+    style: {
+      fill: "#FAF5FF"
+      stroke: "#7C3AED"
+      stroke-width: 2
+      font-color: "#4C1D95"
+      border-radius: 10
+      font-size: 14
+      bold: true
+    }
+  }
+  item: {
+    style: {
+      fill: "#FFFFFF"
+      stroke: "#94A3B8"
+      stroke-width: 1
+      font-color: "#1E293B"
+      border-radius: 6
+      font-size: 13
+    }
+  }
+}
+
+hostapp: "1. Host Caller (cmd/rungv or pkg/gvx)" {
+  class: stage
+  style.fill: "#1E293B"
+  style.font-color: "#F8FAFC"
+  style.stroke: "#0F172A"
+}
+
+oci: "2. pkg/oci (Multi-Arch OCI Pull & In-Memory Tar-to-EROFS Cache)" {
+  class: stage
+}
+
+lockdown: "3. pkg/hostlockdown (Windows RestrictedToken/JobObject, macOS Seatbelt, Linux Landlock+seccomp)" {
+  class: stage
+}
+
+sentry: "4. pkg/sentry/kernel (Pure-Go Linux Syscall & Task Engine: amd64 & arm64)" {
+  class: sentry
+}
+
+hostapp -> oci: "Pull & compile layers" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+oci -> lockdown: "Pre-open handles & lock down" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+lockdown -> sentry: "Enter guest execution" {
+  style.stroke: "#1D4ED8"
+  style.stroke-width: 2
+}
+
+vfs: "pkg/sentry/vfs (VFS2 Layer)" {
+  class: group_vfs
+  grid-columns: 1
+  overlay: "fsimpl/overlay\ntmpfs Upper + Multi-Layer EROFS Lower" {
+    class: item
+    style.stroke: "#16A34A"
+  }
+  ext4lite: "fsimpl/ext4lite\nSingle host .ext4 file with jbd2 journal" {
+    class: item
+    style.stroke: "#16A34A"
+  }
+  hostfs: "fsimpl/hostfs\nos.Root + NtCreateFile / openat + .gvx_meta" {
+    class: item
+    style.stroke: "#16A34A"
+  }
+}
+
+net: "pkg/tcpip (Pure-Go Netstack TCP/IP)" {
+  class: group_net
+  grid-columns: 1
+  nat: "Track A (-net=nat)\nL4 Go net NAT & -p Port Forwarder" {
+    class: item
+    style.stroke: "#0284C7"
+  }
+  wg: "Track B (-net=wg)\nL3 channel.Endpoint + wireguard-go" {
+    class: item
+    style.stroke: "#0284C7"
+  }
+}
+
+platform: "pkg/sentry/platform (Execution Backend)" {
+  class: group_plat
+  grid-columns: 1
+  whpx: "platform/whpx\nWindows WinHvPlatform.dll (amd64 & arm64)" {
+    class: item
+    style.stroke: "#7C3AED"
+  }
+  hvf: "platform/hvf\nmacOS Hypervisor.framework (arm64)" {
+    class: item
+    style.stroke: "#7C3AED"
+  }
+  systrap: "platform/systrap\nIn-Place Syscall Patcher & Stub Subprocess" {
+    class: item
+    style.stroke: "#7C3AED"
+  }
+}
+
+sentry -> vfs: "VFS2 Calls" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
+sentry -> net: "Socket I/O" {
+  style.stroke: "#0284C7"
+  style.stroke-width: 2
+}
+sentry -> platform: "Context.Switch & Memory Map" {
+  style.stroke: "#7C3AED"
+  style.stroke-width: 2
+}

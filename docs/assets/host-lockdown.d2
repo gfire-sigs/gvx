@@ -1,0 +1,111 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 24
+  }
+}
+
+direction: down
+
+classes: {
+  phase: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+  os_box: {
+    style: {
+      fill: "#FFF1F2"
+      stroke: "#E11D48"
+      stroke-width: 2
+      font-color: "#881337"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+  guest_box: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+}
+
+pre_init: "1. Pre-Initialization\nLaunch rungv or pkg/gvx under unprivileged user account" {
+  class: phase
+  style.fill: "#1E293B"
+  style.font-color: "#F8FAFC"
+  style.stroke: "#0F172A"
+}
+
+handles_open: "2. Pre-Open All Host Resources\nOpen WHPX/HVF partition (or pre-spawn systrap stub host),\ncached .erofs layers, .ext4 volumes, -p listeners, and pinned os.Root handles" {
+  class: phase
+}
+
+lockdown: "3. Apply Irreversible Host OS Containment (hostlockdown.Apply)" {
+  style: {
+    fill: "#F8FAFC"
+    stroke: "#E11D48"
+    stroke-width: 2
+    stroke-dash: 4
+    border-radius: 10
+    font-color: "#881337"
+    font-size: 14
+    bold: true
+  }
+
+  win: "Windows Lockdown\nPinned Handle Broker + SE_PRIVILEGE_REMOVED +\nNULL_SID Restricted Token + JobObject (ActiveProcess=1) + NoWin32k" {
+    class: os_box
+  }
+  mac: "macOS Lockdown\nsandbox_init Seatbelt Profile\n(deny process-fork, process-exec, unbound file-*) + RLIMIT_NPROC=0" {
+    class: os_box
+  }
+  linux: "Linux Lockdown\nLandlock FS Ruleset (mounted paths only) +\nPR_SET_NO_NEW_PRIVS + seccomp-bpf Allowlist on all threads" {
+    class: os_box
+  }
+}
+
+guest_running: "4. Guest Execution Loop\nEnter Linux ELF64 Entrypoint (amd64 or arm64) inside Locked-Down Process" {
+  class: guest_box
+}
+
+pre_init -> handles_open: "Resolve image & mounts" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+handles_open -> lockdown.win: "Windows" {
+  style.stroke: "#E11D48"
+  style.stroke-width: 2
+}
+handles_open -> lockdown.mac: "macOS" {
+  style.stroke: "#E11D48"
+  style.stroke-width: 2
+}
+handles_open -> lockdown.linux: "Linux" {
+  style.stroke: "#E11D48"
+  style.stroke-width: 2
+}
+lockdown.win -> guest_running: "Locked" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
+lockdown.mac -> guest_running: "Locked" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
+lockdown.linux -> guest_running: "Locked" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}

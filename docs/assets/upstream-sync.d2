@@ -1,0 +1,73 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 20
+  }
+}
+
+direction: right
+
+classes: {
+  step: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+  gate: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+}
+
+upstream: "1. google/gvisor\n(upstream/go branch)" {
+  class: step
+  style.fill: "#1E293B"
+  style.font-color: "#F8FAFC"
+  style.stroke: "#0F172A"
+}
+
+merge: "2. git merge --no-commit\nupstream/go + gostateify" {
+  class: step
+}
+
+retag: "3. tools/upstream -mode=retag\nRewrite //go:build linux || windows || darwin" {
+  class: step
+}
+
+audit: "4. tools/upstream -mode=audit\nVerify touched upstream files < 5.0%" {
+  class: gate
+}
+
+verify: "5. Update UPSTREAM_COMMIT\nBuild & test all 5 OS/Arch targets" {
+  class: gate
+}
+
+upstream -> merge: "git fetch" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+merge -> retag: "retag" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+retag -> audit: "audit" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
+audit -> verify: "< 5.0%" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}

@@ -1,0 +1,133 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 24
+  }
+}
+
+direction: right
+
+classes: {
+  box: {
+    style: {
+      fill: "#FFFFFF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E293B"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+}
+
+guest: "Guest (Linux ELF)" {
+  style: {
+    fill: "#EFF6FF"
+    stroke: "#2563EB"
+    stroke-width: 2
+    border-radius: 10
+    font-color: "#1E3A8A"
+    font-size: 14
+    bold: true
+  }
+
+  app: "Chromium / Electron\n(Unmodified Guest Binary)" {
+    class: box
+  }
+  mesa: "Mesa virtio_gpu Driver\n(virgl or venus stream)" {
+    class: box
+  }
+  app -> mesa: "GLES / Vulkan" {
+    style.stroke: "#2563EB"
+    style.stroke-width: 2
+  }
+}
+
+sentry: "Sentry (Pure Go)" {
+  style: {
+    fill: "#F0FDF4"
+    stroke: "#16A34A"
+    stroke-width: 2
+    border-radius: 10
+    font-color: "#14532D"
+    font-size: 14
+    bold: true
+  }
+
+  node: "/dev/dri/renderD128\n(pkg/sentry/devices/virtgpu)" {
+    class: box
+    style.stroke: "#16A34A"
+  }
+  mem: "Blob Memory\n(memmap.File per backend)" {
+    class: box
+    style.stroke: "#16A34A"
+  }
+}
+
+renderer: "Confined Host Renderer Process (C)" {
+  style: {
+    fill: "#FAF5FF"
+    stroke: "#7C3AED"
+    stroke-width: 2
+    border-radius: 10
+    font-color: "#4C1D95"
+    font-size: 14
+    bold: true
+  }
+
+  virgl: "virglrenderer\n(Stream Decoder)" {
+    class: box
+    style.stroke: "#7C3AED"
+  }
+  angle: "ANGLE" {
+    class: box
+    style.stroke: "#7C3AED"
+  }
+  vk: "MoltenVK or\nHost Vulkan" {
+    class: box
+    style.stroke: "#7C3AED"
+  }
+  virgl -> angle: "GLES" {
+    style.stroke: "#7C3AED"
+    style.stroke-width: 2
+  }
+  virgl -> vk: "Vulkan" {
+    style.stroke: "#7C3AED"
+    style.stroke-width: 2
+  }
+}
+
+api: "Host GPU API\nMetal (macOS) /\nDirect3D 11 & Vulkan (Windows)" {
+  style: {
+    fill: "#1E293B"
+    stroke: "#0F172A"
+    stroke-width: 2
+    font-color: "#F8FAFC"
+    border-radius: 8
+    font-size: 13
+    bold: true
+  }
+}
+
+guest.mesa -> sentry.node: "DRM ioctl" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+sentry.node -> renderer.virgl: "IPC ring" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
+sentry.mem <-> renderer.virgl: "Shared section" {
+  style.stroke: "#CA8A04"
+  style.stroke-width: 2
+  style.stroke-dash: 4
+}
+renderer.angle -> api: "Native GPU" {
+  style.stroke: "#7C3AED"
+  style.stroke-width: 2
+}
+renderer.vk -> api: "Native GPU" {
+  style.stroke: "#7C3AED"
+  style.stroke-width: 2
+}
