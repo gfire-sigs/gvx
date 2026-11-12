@@ -1,0 +1,143 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 24
+  }
+}
+
+direction: right
+
+classes: {
+  input: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+  core: {
+    style: {
+      fill: "#DBEAFE"
+      stroke: "#1D4ED8"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+  track_a: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+  track_b: {
+    style: {
+      fill: "#FAF5FF"
+      stroke: "#7C3AED"
+      stroke-width: 2
+      font-color: "#4C1D95"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+}
+
+inputs: "Traffic Sources" {
+  style: {
+    fill: "#F8FAFC"
+    stroke: "#CBD5E1"
+    stroke-width: 2
+    border-radius: 10
+    font-color: "#334155"
+    font-size: 14
+    bold: true
+  }
+
+  host_port: "Host Listener\n(-p 8080:80 / unix:PATH:PORT)" {
+    class: input
+  }
+  guest_app: "Guest Workload\n(nginx, dockerd, k3s, git)" {
+    class: input
+  }
+}
+
+netstack: "pkg/tcpip\nPure-Go Netstack\n(eth0, lo, bridge, veth, iptables)" {
+  class: core
+}
+
+track_a: "Track A: Driverless L4 NAT (-net=nat)" {
+  style: {
+    fill: "#F0FDF4"
+    stroke: "#86EFAC"
+    stroke-width: 2
+    border-radius: 10
+    font-color: "#14532D"
+    font-size: 14
+    bold: true
+  }
+
+  nat: "nat_forwarder.go\nL4 TCP/UDP Forwarder &\n10.0.2.2 Host Gateway" {
+    class: track_a
+  }
+  gonet: "Go Runtime Poller\nUnprivileged Host Sockets\n(IOCP / kqueue / epoll)" {
+    class: track_a
+    style.fill: "#FFFFFF"
+  }
+  nat -> gonet: "net.DialContext" {
+    style.stroke: "#16A34A"
+    style.stroke-width: 2
+  }
+}
+
+track_b: "Track B: Driverless L3 WireGuard (-net=wg)" {
+  style: {
+    fill: "#FAF5FF"
+    stroke: "#D8B4FE"
+    stroke-width: 2
+    border-radius: 10
+    font-color: "#4C1D95"
+    font-size: 14
+    bold: true
+  }
+
+  wg: "wireguard-go\nIn-Memory ChaCha20-Poly1305\n(channel.Endpoint)" {
+    class: track_b
+  }
+  udp: "Encrypted WireGuard Peer\n(Pre-Opened Host UDP Socket)" {
+    class: track_b
+    style.fill: "#FFFFFF"
+  }
+  wg -> udp: "UDP Datagrams" {
+    style.stroke: "#7C3AED"
+    style.stroke-width: 2
+  }
+}
+
+inputs.host_port -> netstack: "gonet.DialTCP" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+inputs.guest_app -> netstack: "socket / connect" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+netstack -> track_a.nat: "L4 Forwarder" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
+netstack -> track_b.wg: "L3 IP Packets" {
+  style.stroke: "#7C3AED"
+  style.stroke-width: 2
+}

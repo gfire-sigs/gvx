@@ -1,0 +1,65 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 20
+  }
+}
+
+direction: right
+
+classes: {
+  step: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+  storage: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+}
+
+source: "1. OCI Registry or Archive\n(linux/amd64 or linux/arm64\n.tar.gz / .tar.zst layers)" {
+  class: step
+  style.fill: "#1E293B"
+  style.font-color: "#F8FAFC"
+  style.stroke: "#0F172A"
+}
+
+compiler: "2. pkg/oci/tar2erofs.go\nIn-Memory Stream Compiler\n(Case, uid/gid, xattrs, whiteouts)" {
+  class: step
+}
+
+cache: "3. Host Layer Cache\n<sha256>.gvx-erofs-v3-b4096.erofs\n(Immutable binary file per layer)" {
+  class: storage
+}
+
+overlay: "4. Sentry VFS2 fsimpl/overlay\ntmpfs Writable Upper +\nOrdered EROFS Lower Layers" {
+  class: storage
+}
+
+source -> compiler: "Host GOARCH" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+compiler -> cache: "Write .erofs" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+cache -> overlay: "Pre-open FD" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}

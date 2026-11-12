@@ -1,0 +1,50 @@
+vars: {
+  d2-config: {
+    pad: 24
+  }
+}
+
+shape: sequence_diagram
+
+guest: "Guest Ring-3 / EL0 ELF\n(amd64 or arm64)" {
+  style.fill: "#EFF6FF"
+  style.stroke: "#2563EB"
+  style.font-color: "#1E3A8A"
+  style.bold: true
+}
+stub: "In-Partition Ring-0 / EL1 Stub\n(bluepill & stubgen)" {
+  style.fill: "#FAF5FF"
+  style.stroke: "#7C3AED"
+  style.font-color: "#4C1D95"
+  style.bold: true
+}
+comm: "Shared 4 KB CommPage\n(Host & Guest Mapped)" {
+  style.fill: "#FEFCE8"
+  style.stroke: "#CA8A04"
+  style.font-color: "#713F12"
+  style.bold: true
+}
+hv: "WHPX (WinHvPlatform.dll)\nor HVF (Hypervisor.framework)" {
+  style.fill: "#F1F5F9"
+  style.stroke: "#475569"
+  style.font-color: "#0F172A"
+  style.bold: true
+}
+sentry: "Go Sentry Kernel\n(Task Goroutine)" {
+  style.fill: "#F0FDF4"
+  style.stroke: "#16A34A"
+  style.font-color: "#14532D"
+  style.bold: true
+}
+
+guest -> stub: "1. SYSCALL / SVC #0 or Page Fault"
+stub -> comm: "2. Spill GPRs, PC, and SP"
+stub -> hv: "3. HLT / GPA-0 load / HVC #0"
+hv -> sentry: "4. Return from vCPU run"
+sentry -> comm: "5. Read spilled registers"
+sentry -> sentry: "6. Dispatch syscall or VMA fault"
+sentry -> comm: "7. Write return regs and PC/SP"
+sentry -> hv: "8. Resume vCPU"
+hv -> stub: "9. Resume reload routine"
+stub -> comm: "10. Reload registers"
+stub -> guest: "11. Return via SYSRETQ / ERET"

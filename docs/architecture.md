@@ -18,23 +18,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
 | **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 5.0% under Section 2.2 audit rules and Go 1.27+ builds without Bazel. |
 
-```mermaid
-flowchart TD
-    HostApp["Host Caller (cmd/rungv or pkg/gvx)"] --> OCI["pkg/oci (Multi-Arch OCI Pull & In-Memory Tar-to-EROFS Cache)"]
-    OCI --> Lockdown["pkg/hostlockdown (Windows RestrictedToken/JobObject or macOS Seatbelt)"]
-    Lockdown --> Sentry["pkg/sentry/kernel (Pure-Go Linux Syscall & Task Engine: amd64 & arm64)"]
-    Sentry --> VFS["pkg/sentry/vfs (VFS2 Layer)"]
-    Sentry --> Net["pkg/tcpip (Pure-Go Netstack TCP/IP)"]
-    Sentry --> Platform["pkg/sentry/platform (Execution Backend Interface)"]
-    VFS --> Overlay["fsimpl/overlay (tmpfs Upper + Multi-Layer EROFS Lower)"]
-    VFS --> HostFS["fsimpl/hostfs (os.Root + NtCreateFile / openat + .gvx_meta)"]
-    VFS --> Ext4lite["fsimpl/ext4lite (one host file in the ext4 format)"]
-    Net --> NetNAT["pkg/netbackend: Track A (-net=nat L4 Go net NAT & -p Port Forwarder)"]
-    Net --> NetWG["pkg/netbackend: Track B (-net=wg L3 channel.Endpoint + wireguard-go)"]
-    Platform --> WHPX["platform/whpx (Windows WinHvPlatform.dll: amd64 & arm64)"]
-    Platform --> HVF["platform/hvf (macOS Hypervisor.framework: arm64)"]
-    Platform --> Systrap["platform/systrap (Unified In-Place Syscall Patcher & Stub Subprocess: Linux, macOS, Windows)"]
-```
+![gvx Subsystem Architecture Overview](assets/arch-overview.svg)
 
 ### 1.1 Compatibility Matrix and Cross-Architecture Execution (Descriptive Module)
 
@@ -224,13 +208,7 @@ To prevent merge conflicts during continuous upstream pulls, `gvx` partitions al
 
 The audit charges a file against the 5.0% ceiling only when its content differs from upstream. A file that `gvx` adds inside an upstream directory is free when its name carries the token `windows`, `darwin`, or `xplat`. The audit then counts it as a Tier 2 sibling. It reports build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) as a third number. A strict count that includes the fences is larger than the charged share, and the audit prints both.
 
-```mermaid
-flowchart LR
-    Upstream["google/gvisor (go branch)"] -->|"1. git fetch upstream go"| Merge["2. git merge --no-commit upstream/go"]
-    Merge -->|"3. go run ./tools/upstream -mode=retag"| Retag["Rewrite //go:build linux || windows || darwin"]
-    Retag -->|"4. go run ./tools/upstream -mode=audit"| Audit["Assert touched upstream files < 5.0%"]
-    Audit -->|"5. Update UPSTREAM_COMMIT"| Verify["Build & test on Windows and macOS (amd64 & arm64)"]
-```
+![Upstream Synchronization Pipeline](assets/upstream-sync.svg)
 
 ### 2.3 Upstream Diff and Synchronization Procedure (Procedural Module)
 
@@ -307,26 +285,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | **`membarrier` Global and Private Expedited** | `GlobalMemoryBarrier` cancels each virtual processor that runs guest code and waits until its `Switch` call returns. A processor outside the guest needs no cancel. `FlushProcessWriteBuffers` orders the Sentry threads, which access guest memory for system calls in progress. | `GlobalMemoryBarrier` cancels each vCPU that runs guest code and waits for one exit of `hv_vcpu_run`. A cancel that finds no guest to stop resumes the guest, so the guest task keeps running. macOS has no call that forces a barrier on every thread of a process, so the barrier orders guest code only. It does not order a Sentry thread that accesses guest memory for a system call in progress. |
 | **Unknown Exit Reason** | Not applicable. | `HV_EXIT_REASON_UNKNOWN` carries no information. The worker resumes the vCPU as it does after a cancellation, and `Switch` fails after 4096 consecutive unknown exits. |
 
-```mermaid
-sequenceDiagram
-    participant Guest as Guest Ring-3 / EL0 ELF (amd64 or arm64)
-    participant Stub as In-Partition Ring-0 LSTAR / EL1 VBAR Stub (bluepill_*.go, stubgen_*.go)
-    participant Comm as Shared 4KB Comm Page (Host/Guest Mapped)
-    participant HV as WinHvPlatform.dll (whpx) or Hypervisor.framework (hvf)
-    participant Sentry as Go Sentry Kernel
-
-    Guest->>Stub: Execute SYSCALL (amd64) / SVC #0 (arm64) or trigger Page Fault
-    Stub->>Comm: Spill Fast-Path syscall GPRs (or full state on fault), RIP/ELR_EL1, RSP/SP_EL0
-    Stub->>HV: Execute HLT (amd64), notification load (WHPX arm64), or HVC #0 (HVF)
-    HV-->>Sentry: Return from WHvRunVirtualProcessor / hv_vcpu_run
-    Sentry->>Comm: Read spilled registers directly from shared page slice
-    Sentry->>Sentry: Dispatch Linux syscall or resolve VMA page fault (PullFullState on clone/signal)
-    Sentry->>Comm: Write updated return registers and PC/SP to Comm Page
-    Sentry->>HV: Resume virtual processor
-    HV->>Stub: Resume the reload routine
-    Stub->>Comm: Reload registers (and FSBase/GSBase/TPIDR_EL0/VRegs when FullStateChanged)
-    Stub->>Guest: Return to user mode via SYSRETQ / IRETQ (amd64) or ERET (arm64)
-```
+![Hypervisor Fast-Path Syscall and Fault Sequence](assets/hypervisor-trap.svg)
 
 #### Two-Stage 4KB Paging on Apple Silicon (`platform/hvf`) and 64KB-to-4KB Slicing on Windows (`platform/whpx`) (Descriptive Module)
 
@@ -424,27 +383,7 @@ By default, a patched syscall jumps through an island slot into the spill routin
 
 The diagram shows the Windows engine.
 
-```mermaid
-sequenceDiagram
-    participant Guest as Guest Thread (Stub Process)
-    participant Island as Trampoline Island & Spill Routine
-    participant WinSysmsg as Shared winSysmsg Page & Events
-    participant Debug as Debug Object
-    participant Sentry as Go Sentry Kernel Process
-
-    Note over Guest,Sentry: First Execution of a Code Page (Lazy Page-Trap)
-    Guest->>Debug: Execute access violation on a non-executable view
-    Debug->>Sentry: Exception event
-    Sentry->>Guest: Patch a private copy, map it as PAGE_EXECUTE_READ, and continue the thread
-
-    Note over Guest,Sentry: Fast-Path Syscall (Default)
-    Guest->>Island: B <slot> (arm64) or jmp rel32 <slot> (amd64)
-    Island->>WinSysmsg: Spill GPRs, flags, and vector state; set Trapped
-    Island->>Sentry: Spin or signal guest event and wait
-    Sentry->>WinSysmsg: Read arguments, dispatch Linux syscall, write return state
-    Sentry->>Island: Set RunHot or RunCold and signal host event
-    Island->>Guest: Reload registers and return through slot tail
-```
+![Windows systrap Lazy Page-Trap and Fast-Path Syscall Sequence](assets/winsystrap-flow.svg)
 
 ### 3.4 Register Preservation and Two-Tier Synchronization Contract (Linux ELF & Wine / WoW64 / ARM64EC) (Descriptive Module)
 
@@ -492,15 +431,7 @@ Guest applications (`nginx`, `postgres`, `git`, `curl`, `omp`, `herdr`) invoke `
 | **Local / LAN Access** | Permitted by default (maps `10.0.2.2` / `host.docker.internal` to host `127.0.0.1`; optional `-isolate-lan` flag). | Enforced cryptographically; packets exit only through the WireGuard tunnel. |
 | **Primary Workload** | Unmodified OCI containers (`-p 8080:80`), local dev tools (`git`, `omp`), and L4/L7 API key proxies. | Enterprise LAN isolation, multi-sandbox mesh, and remote `herdr` cluster links. |
 
-```mermaid
-flowchart LR
-    HostPort["Host Listener (-p 8080:80)"] -->|"gonet.DialTCP (Inbound)"| Netstack["pkg/tcpip (Pure-Go Netstack eth0 & lo)"]
-    Guest["Guest App (nginx, git, omp, herdr)"] -->|"socket / bind / connect"| Netstack
-    Netstack -->|"Track A (-net=nat): L4 tcp.NewForwarder"| NAT["nat_forwarder.go (Outbound Dial + 10.0.2.2 Host Gateway)"]
-    NAT -->|"net.DialContext"| GoNet["Go Runtime Poller (Windows IOCP / macOS kqueue)"]
-    Netstack -->|"Track B (-net=wg): L3 channel.Endpoint"| WG["wireguard-go (In-Memory ChaCha20-Poly1305)"]
-    WG -->|"Single Pre-Opened UDP Socket"| UDP["Encrypted WireGuard / Tailscale Peer"]
-```
+![Dual-Track Netstack Backend](assets/netbackend.svg)
 
 #### Track A: L4 Go `net` Forwarder and Bidirectional Port Forwarding (`nat_forwarder.go`, `port_forwarder.go`) (Descriptive Module)
 
@@ -530,12 +461,7 @@ In `-net=wg` mode, `wireguard_endpoint.go` attaches a Netstack `channel.Endpoint
 
 Extracting Linux container layers (`.tar.gz`) directly onto Windows NTFS or case-insensitive macOS APFS breaks case-sensitive filenames (`xt_CONNMARK.h` vs. `xt_connmark.h`), fails on reserved Windows names (`CON`, `AUX`, `NUL`, `:`), discards POSIX `uid/gid` ownership, and requires elevated privileges for device nodes or symbolic links. `pkg/oci` runs unmodified OCI and Docker images on both Windows and macOS by compiling layer tarballs in memory into cached EROFS images.
 
-```mermaid
-flowchart LR
-    Source["OCI Registry (linux/amd64 or linux/arm64) or .tar"] -->|"1. Select Host GOARCH Manifest"| Tar2Erofs["pkg/oci/tar2erofs.go (In-Memory Stream Compiler)"]
-    Tar2Erofs -->|"2. Write Single Binary File"| Cache["Host Cache Dir (<sha256>.gvx-erofs-v3-b<block>.erofs)"]
-    Cache -->|"3. Pre-Lockdown os.Open"| Overlay["Sentry VFS2 fsimpl/overlay (tmpfs Upper + EROFS Lower Layers)"]
-```
+![OCI Tar-to-EROFS Layer Compilation Pipeline](assets/oci-erofs.svg)
 
 #### Tar-to-EROFS Layer Compilation and Overlay Mount (Procedural Module)
 
@@ -804,17 +730,7 @@ A volume file is untrusted input. `isValidDataBlock` rejects every block that ov
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `fsimpl/ext4lite`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go. Scopes all `/workspace` opens to the `os.Root` handle. Keeps each volume inside one pre-opened host file. |
 | **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, Linux Landlock and seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. The host directories and files of the mounts are the only bound paths. |
 
-```mermaid
-stateDiagram-v2
-    [*] --> PreInit: Launch rungv or pkg/gvx (Unprivileged User Account)
-    PreInit --> HandlesOpen: Open Hypervisor (WHPX/HVF) or Pre-Spawn systrap Stub, .erofs Layers, Sockets, and /workspace os.Root
-    HandlesOpen --> WinLockdown: Windows: Pinned Broker + SE_PRIVILEGE_REMOVED + NULL_SID Token + JobObject + NoWin32k
-    HandlesOpen --> MacLockdown: macOS: sandbox_init Seatbelt Profile (deny process-fork/exec/file-*) + RLIMIT_NPROC=0
-    HandlesOpen --> LinuxLockdown: Linux: Landlock FS ruleset + PR_SET_NO_NEW_PRIVS + seccomp allowlist on every thread
-    WinLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
-    MacLockdown --> GuestRunning: Enter Guest ELF Entrypoint (arm64 or amd64)
-    LinuxLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
-```
+![Host Self-Lockdown State Transition](assets/host-lockdown.svg)
 
 #### Windows Lockdown Sequence (`lockdown_windows.go`) (Procedural Module)
 

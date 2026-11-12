@@ -1,0 +1,53 @@
+vars: {
+  d2-config: {
+    pad: 24
+  }
+}
+
+shape: sequence_diagram
+
+guest: "Guest Thread\n(Stub Process)" {
+  style.fill: "#EFF6FF"
+  style.stroke: "#2563EB"
+  style.font-color: "#1E3A8A"
+  style.bold: true
+}
+island: "Trampoline Island &\nSpill Routine" {
+  style.fill: "#FAF5FF"
+  style.stroke: "#7C3AED"
+  style.font-color: "#4C1D95"
+  style.bold: true
+}
+sysmsg: "Shared winSysmsg Page\n& Event Pair" {
+  style.fill: "#FEFCE8"
+  style.stroke: "#CA8A04"
+  style.font-color: "#713F12"
+  style.bold: true
+}
+debug: "NT Debug Object\n(Faults & Signals)" {
+  style.fill: "#FFF1F2"
+  style.stroke: "#E11D48"
+  style.font-color: "#881337"
+  style.bold: true
+}
+sentry: "Go Sentry Kernel\nProcess" {
+  style.fill: "#F0FDF4"
+  style.stroke: "#16A34A"
+  style.font-color: "#14532D"
+  style.bold: true
+}
+
+lazy_trap: "First Execution of a Code Page (Lazy Page-Trap)" {
+  guest -> debug: "1. Execute fault on non-RX view"
+  debug -> sentry: "2. Exception event"
+  sentry -> guest: "3. Patch private copy, map RX, resume"
+}
+
+fast_path: "Fast-Path Syscall (Default)" {
+  guest -> island: "4. Branch to island slot"
+  island -> sysmsg: "5. Spill state; set Trapped"
+  island -> sentry: "6. Spin (64 us) or signal event"
+  sentry -> sysmsg: "7. Run syscall, write return state"
+  sentry -> island: "8. Set RunHot / RunCold"
+  island -> guest: "9. Reload state & return"
+}

@@ -53,26 +53,7 @@ Upstream gVisor (`runsc`) is an OCI runtime for Linux hosts. On Windows and macO
 
 When you start a container with `rungv` or `pkg/gvx`, the host process compiles OCI image layers into cached `.erofs` files, opens all host file handles and sockets up front, locks down its own OS process privileges, and enters the guest execution loop.
 
-```mermaid
-flowchart TD
-    Caller["Caller (rungv CLI or pkg/gvx Go SDK)"] --> Sandbox["gvx Sandbox Process"]
-
-    subgraph HostProcess["Unprivileged Host Process (Restricted Token + Job Object / Seatbelt / Landlock + seccomp)"]
-        Sandbox --> Guest["Linux ELF64 Workload"]
-        Guest -->|"Syscalls & Page Faults"| Engine["Execution Engine (WHPX / HVF / systrap)"]
-        Engine --> Sentry["gVisor Sentry Kernel (Pure Go)"]
-
-        Sentry --> VFS["VFS2 Filesystem Layer"]
-        Sentry --> Net["User-Space Netstack (TCP/IP)"]
-
-        VFS --> EROFS["OCI Rootfs (Cached Read-Only .erofs + Memory Overlay)"]
-        VFS --> Ext4["Named Volumes (ext4lite Single-File .ext4 with Journal)"]
-        VFS --> HostFS["Host Bind Mounts (-workspace & -v via Pinned os.Root)"]
-
-        Net --> NAT["L4 NAT & Port Forwarder (-net=nat, -p)"]
-        Net --> WG["L3 WireGuard Tunnel (-net=wg, User-Space UDP)"]
-    end
-```
+![gvx Sandbox Architecture](docs/assets/overview.svg)
 
 ### How the Host OS Gaps Are Bridged
 
@@ -125,7 +106,7 @@ codesign --sign - --entitlements entitlements.plist --force ./rungv
 
 ### 3.2 Common `rungv` Commands
 
-See [`docs/cli.md`](docs/cli.md) for the complete command and flag reference, [`docs/docker-engine.md`](docs/docker-engine.md) to run `dockerd` inside `gvx`, and [`docs/kubernetes.md`](docs/kubernetes.md) to run a single-node or multi-node `k3s` Kubernetes cluster.
+See [`docs/cli.md`](docs/cli.md) for the complete command and flag reference, [`docs/recipes/docker-engine.md`](docs/recipes/docker-engine.md) to run `dockerd` inside `gvx`, and [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) to run a single-node or multi-node `k3s` Kubernetes cluster.
 
 1. Run a command in an OCI image.
 2. Run a service with port forwarding (`-p`), a persistent `.ext4` volume (`-v`), and a shared workspace (`-workspace`).
@@ -228,8 +209,8 @@ func main() {
 | Document | Contents |
 | :--- | :--- |
 | [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, flags, mounts, checkpoint/restore, containerd shim, and Android usage. |
-| [`docs/docker-engine.md`](docs/docker-engine.md) | Recipe: Run `dockerd` inside a `gvx` sandbox with an `ext4lite` volume and connect your host `docker` CLI. |
-| [`docs/kubernetes.md`](docs/kubernetes.md) | Recipe: Run single-node or multi-node `k3s` Kubernetes clusters (with flannel or Calico CNI) inside `gvx`. |
+| [`docs/recipes/docker-engine.md`](docs/recipes/docker-engine.md) | Recipe: Run `dockerd` inside a `gvx` sandbox with an `ext4lite` volume and connect your host `docker` CLI. |
+| [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) | Recipe: Run single-node or multi-node `k3s` Kubernetes clusters (with flannel or Calico CNI) inside `gvx`. |
 | [`docs/architecture.md`](docs/architecture.md) | Internal architecture, Tier 1/2/3 upstream isolation model, memory/handle ownership, and contributor guide. |
 | [`docs/systrap-windows.md`](docs/systrap-windows.md) | Engineering deep dive and measurements for the Windows user-mode `systrap` engine. |
 | [`docs/moonshots.md`](docs/moonshots.md) | Future architecture proposals (`virtgpu` and confined host GPU renderer for browser and GUI guests). |

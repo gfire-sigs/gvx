@@ -99,25 +99,7 @@ The design must satisfy the rules of [`AGENTS.md`](../AGENTS.md) and of the back
 
 The architecture keeps the guest unmodified and moves every host API call into one confined process. The Sentry implements the Linux DRM interface of a `virtio-gpu` render node and forwards command streams to the renderer. The renderer runs `virglrenderer` and passes the decoded calls to ANGLE or to a Vulkan driver.
 
-```mermaid
-flowchart LR
-  subgraph guest["Guest (Linux ELF)"]
-    app["Chromium / Electron"] --> mesa["Mesa virtio_gpu driver<br/>(virgl or venus)"]
-  end
-  subgraph sentry["Sentry (pure Go)"]
-    node["/dev/dri/renderD128<br/>(pkg/sentry/devices/virtgpu)"]
-    mem["Blob memory<br/>(memmap.File per backend)"]
-  end
-  subgraph renderer["Renderer process (C, confined)"]
-    virgl["virglrenderer"] --> angle["ANGLE"]
-    virgl --> vk["MoltenVK or host Vulkan"]
-  end
-  mesa -- "ioctl" --> node
-  node -- "IPC ring" --> virgl
-  angle --> api["Metal / Direct3D 11"]
-  vk --> api
-  mem <-. "shared section" .-> virgl
-```
+![Moonshot GPU Acceleration Architecture](assets/moonshot-gpu.svg)
 
 ### 5.1 Components
 

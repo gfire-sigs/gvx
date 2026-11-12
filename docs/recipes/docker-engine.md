@@ -1,6 +1,6 @@
 # Use `gvx` as a Docker Engine
 
-This guide shows how to run a Docker Engine inside a `gvx` sandbox and control it with the `docker` command of the host. The engine keeps its images and containers in an `ext4lite` volume, so they stay after a restart. The `docker` command reaches the engine through a Docker context. The flag reference is in [`cli.md`](cli.md).
+This guide shows how to run a Docker Engine inside a `gvx` sandbox and control it with the `docker` command of the host. The engine keeps its images and containers in an `ext4lite` volume, so they stay after a restart. The `docker` command reaches the engine through a Docker context. The flag reference is in [`../cli.md`](../cli.md).
 
 ## 1. How It Works
 
@@ -20,7 +20,7 @@ The sandbox locks itself down before the guest starts. The guest therefore canno
 
 ## 2. Start the Engine
 
-These steps start the engine and connect the `docker` command of the host to it. You need `rungv` (see the [README](../README.md#3-quickstart)) and a `docker` command on the host. The `docker` command needs no local engine. The steps work on macOS and Windows. On Windows, use PowerShell, create the directory with `mkdir $HOME\.gvx -Force`, and create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. A `unix://` host on Windows needs Docker CLI 29 or later. With an older CLI, publish `-p 127.0.0.1:2375:2375` and use `host=tcp://127.0.0.1:2375`.
+These steps start the engine and connect the `docker` command of the host to it. You need `rungv` (see the [README](../../README.md#3-quickstart)) and a `docker` command on the host. The `docker` command needs no local engine. The steps work on macOS and Windows. On Windows, use PowerShell, create the directory with `mkdir $HOME\.gvx -Force`, and create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. A `unix://` host on Windows needs Docker CLI 29 or later. With an older CLI, publish `-p 127.0.0.1:2375:2375` and use `host=tcp://127.0.0.1:2375`.
 
 > [!IMPORTANT]
 > Use host ports that no other program uses. `rungv` stops with `address already in use` when one port of a range is busy.
@@ -131,7 +131,7 @@ A path in `docker run -v` names a path in the sandbox, not on the host. Mount a 
 
 ## 6. Trust a TLS-Inspecting Proxy
 
-A host behind a proxy that inspects TLS, or a host with a private registry, trusts a root certificate that the images do not hold. Add `--host-ca-certs` to the `rungv run` command of section 2. `dockerd` then trusts the roots of the host, and `docker pull` and `docker build` can reach the registries through the proxy. [`cli.md`](cli.md#410-host-root-certificates) lists the sources of the roots.
+A host behind a proxy that inspects TLS, or a host with a private registry, trusts a root certificate that the images do not hold. Add `--host-ca-certs` to the `rungv run` command of section 2. `dockerd` then trusts the roots of the host, and `docker pull` and `docker build` can reach the registries through the proxy. [`../cli.md`](../cli.md#410-host-root-certificates) lists the sources of the roots.
 
 > [!IMPORTANT]
 > Only the `dockerd` process and the other sandbox processes trust the roots. A container that `dockerd` starts has its own file system and does not trust them.

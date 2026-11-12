@@ -109,7 +109,7 @@ func TestE2EMemoryCgroupLimits(t *testing.T) {
 				// The systrap engine runs guest code in stub processes. The
 				// Sentry finds committed pages with QueryWorkingSetEx, which sees
 				// only the working set of the Sentry process, so pages that a stub
-				// writes can stay uncounted. docs/docker-engine.md, section 6.4.
+				// writes can stay uncounted. docs/recipes/docker-engine.md, section 7.4.
 				t.Skip("memory cgroup accounting is incomplete under the Windows systrap engine")
 			}
 			code, out := runParityProbe(t, b, bin, false, "memcg")
