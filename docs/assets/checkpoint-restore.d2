@@ -1,0 +1,135 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    pad: 24
+  }
+}
+
+direction: down
+
+classes: {
+  phase: {
+    style: {
+      fill: "#EFF6FF"
+      stroke: "#2563EB"
+      stroke-width: 2
+      font-color: "#1E3A8A"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+  lock_box: {
+    style: {
+      fill: "#FFF1F2"
+      stroke: "#E11D48"
+      stroke-width: 2
+      font-color: "#881337"
+      border-radius: 8
+      font-size: 13
+      bold: true
+    }
+  }
+  bundle_box: {
+    style: {
+      fill: "#F8FAFC"
+      stroke: "#475569"
+      stroke-width: 2
+      font-color: "#0F172A"
+      border-radius: 10
+      font-size: 14
+      bold: true
+    }
+  }
+  item: {
+    style: {
+      fill: "#FFFFFF"
+      stroke: "#94A3B8"
+      stroke-width: 1
+      font-color: "#1E293B"
+      border-radius: 6
+      font-size: 13
+    }
+  }
+  guest_box: {
+    style: {
+      fill: "#F0FDF4"
+      stroke: "#16A34A"
+      stroke-width: 2
+      font-color: "#14532D"
+      border-radius: 8
+      font-size: 14
+      bold: true
+    }
+  }
+}
+
+save_init: "1. Pre-Lockdown Sandbox Boot (gvx.New / rungv run)\nPre-open CheckpointDir descriptors and bind -control-socket (Unix 0600 or loopback TCP)" {
+  class: phase
+  style.fill: "#1E293B"
+  style.font-color: "#F8FAFC"
+  style.stroke: "#0F172A"
+}
+
+save_lock: "2. Host Self-Lockdown Applied (hostlockdown.Apply)\nNo new host path opens or child processes permitted during save" {
+  class: lock_box
+}
+
+save_exec: "3. Sandbox.Checkpoint(ctx, opts)\nPause kernel, freeze TCP queues, flush hostfs/ext4lite chunks, quiesce WireGuard, stream state & pages" {
+  class: phase
+}
+
+bundle: "4. Checkpoint Bundle Directory (-checkpoint-dir)" {
+  class: bundle_box
+  grid-columns: 2
+
+  manifest: "manifest.json\nGOOS, GOARCH, Platform, Arch,\nAddressHoles, LayerDigests, Mounts, NetMode" {
+    class: item
+  }
+  state: "state.img\ngostateify object graph\n(tasks, VFS2, Netstack, cgroups, ipset)" {
+    class: item
+  }
+  pmeta: "pages.meta\nSparse MemoryFile metadata\n& multi-chunk offsets" {
+    class: item
+  }
+  pimg: "pages.img\nCommitted guest 4KB pages\n(256 KiB async writer / 4 MiB async reader)" {
+    class: item
+  }
+}
+
+restore_open: "5. Pre-Lockdown Restore Setup (gvx.Restore / rungv restore)\nValidate manifest.json, pre-open bundle FDs, engine, verified EROFS layers, os.Root, ext4lite, and sockets" {
+  class: phase
+}
+
+restore_lock: "6. Host Self-Lockdown Before Untrusted Decode (hostlockdown.Apply)\nLock down restore process before Kernel.LoadFrom parses state.img or pages.img" {
+  class: lock_box
+}
+
+restore_run: "7. Kernel.LoadFrom & AsyncMFLoader\nRebind EROFS FDs, hostfs inodes, ext4lite deferred orphans, Netstack NAT/WG/ports, and resume tasks" {
+  class: guest_box
+}
+
+save_init -> save_lock: "Pin descriptors" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+save_lock -> save_exec: "Control RPC or SDK call" {
+  style.stroke: "#E11D48"
+  style.stroke-width: 2
+}
+save_exec -> bundle: "Write & fsync" {
+  style.stroke: "#2563EB"
+  style.stroke-width: 2
+}
+bundle -> restore_open: "Read manifest.json" {
+  style.stroke: "#475569"
+  style.stroke-width: 2
+}
+restore_open -> restore_lock: "All handles pinned" {
+  style.stroke: "#E11D48"
+  style.stroke-width: 2
+}
+restore_lock -> restore_run: "Decode under lockdown" {
+  style.stroke: "#16A34A"
+  style.stroke-width: 2
+}
