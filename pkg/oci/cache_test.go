@@ -205,8 +205,39 @@ func TestLayerCacheToleratesConcurrentCompiles(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, err := cache.CompileAndStore(digest, bytes.NewReader(blob))
-			errs <- err
+			c, err := newCacheAt(cache.Dir())
+			if err != nil {
+				errs <- err
+				return
+			}
+			p, _, err := c.CompileAndStore(digest, bytes.NewReader(blob))
+			if err != nil {
+				errs <- err
+				return
+			}
+			files, err := c.OpenLayerHandles([]string{digest})
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer func() {
+				_ = CloseLayerFiles(files)
+			}()
+			openedInfo, err := files[0].Stat()
+			if err != nil {
+				errs <- err
+				return
+			}
+			pathInfo, err := os.Stat(p)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !os.SameFile(openedInfo, pathInfo) {
+				errs <- errors.New("layer file identity changed between OpenLayerHandles and Stat")
+				return
+			}
+			errs <- nil
 		}()
 	}
 	wg.Wait()

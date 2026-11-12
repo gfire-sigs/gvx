@@ -376,19 +376,84 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 		return "", CompileStats{}, fmt.Errorf("oci: close layer file: %w", err)
 	}
 
-	// Write the integrity record first, so that a published image always has one.
-	if err := writeFileAtomic(c.dir, hexKey+c.sumSuffix(), c.formatSumRecord(stats.TotalBytes, stats.SHA256Hex)); err != nil {
+	// Publish the compiled image without replacing a valid layer file that a
+	// concurrent writer already published at target.
+	target, err := c.publishCompiledLayer(tmpPath, hexKey, info, stats, &committed)
+	if err != nil {
 		return "", CompileStats{}, err
 	}
+	return target, stats, nil
+}
+
+// publishCompiledLayer publishes tmpPath at the cache path for hexKey while
+// preserving the file identity of an already-valid cached layer so concurrent
+// openers never observe an inode swap between verification and HostHandle open.
+func (c *LayerCache) publishCompiledLayer(tmpPath, hexKey string, tmpInfo os.FileInfo, stats CompileStats, committed *bool) (string, error) {
 	target := filepath.Join(c.dir, hexKey+c.layerSuffix())
-	if err := replaceFile(tmpPath, target); err != nil {
-		return "", CompileStats{}, fmt.Errorf("oci: rename cached layer %q: %w", target, err)
+	if info, ok := c.verifyLayerOnDisk(hexKey, stats.TotalBytes, stats.SHA256Hex); ok {
+		c.recordVerified(hexKey, info)
+		return target, nil
 	}
-	committed = true
+
+	// Write the integrity record first, so that a published image always has one.
+	if err := writeFileAtomic(c.dir, hexKey+c.sumSuffix(), c.formatSumRecord(stats.TotalBytes, stats.SHA256Hex)); err != nil {
+		return "", err
+	}
+
+	if err := os.Link(tmpPath, target); err == nil {
+		c.recordVerified(hexKey, tmpInfo)
+		return target, nil
+	}
+	if info, ok := c.verifyLayerOnDisk(hexKey, stats.TotalBytes, stats.SHA256Hex); ok {
+		c.recordVerified(hexKey, info)
+		return target, nil
+	}
+
+	if err := replaceFile(tmpPath, target); err != nil {
+		return "", fmt.Errorf("oci: rename cached layer %q: %w", target, err)
+	}
+	*committed = true
+	c.recordVerified(hexKey, tmpInfo)
+	return target, nil
+}
+
+func (c *LayerCache) recordVerified(hexKey string, info os.FileInfo) {
 	c.mu.Lock()
 	c.verified[hexKey] = verifiedLayer{size: info.Size(), modTime: info.ModTime()}
 	c.mu.Unlock()
-	return target, stats, nil
+}
+
+// verifyLayerOnDisk checks whether the on-disk layer and integrity record for
+// hexKey already exist and match wantSize and wantSum.
+func (c *LayerCache) verifyLayerOnDisk(hexKey string, wantSize int64, wantSum string) (os.FileInfo, bool) {
+	record, err := readFileShared(c.sumPath(hexKey))
+	if err != nil {
+		return nil, false
+	}
+	recSize, recSum, err := c.parseSumRecord(record)
+	if err != nil || recSize != wantSize || recSum != wantSum {
+		return nil, false
+	}
+	p := filepath.Join(c.dir, hexKey+c.layerSuffix())
+	f, err := openShared(p)
+	if err != nil {
+		return nil, false
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != wantSize {
+		return nil, false
+	}
+	digester := digest.SHA256.Digester()
+	if _, err := io.Copy(digester.Hash(), io.NewSectionReader(f, 0, info.Size())); err != nil {
+		return nil, false
+	}
+	if digester.Digest().Encoded() != wantSum {
+		return nil, false
+	}
+	return info, true
 }
 
 // writeFileAtomic writes data to dir/name through a synced temporary file.
