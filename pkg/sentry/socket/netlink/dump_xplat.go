@@ -229,16 +229,22 @@ func (s *Socket) produceChunkLocked(ctx context.Context, first bool) *syserr.Err
 // doneMessage returns the NLMSG_DONE message that ends a dump. Its payload
 // is dump_done_errno: zero, or the negative errno of the failure.
 func doneMessage(portID int32, seq uint32, err *syserr.Error) []byte {
-	m := nlmsg.NewMessage(linux.NetlinkMessageHeader{
-		Type:   linux.NLMSG_DONE,
-		Flags:  linux.NLM_F_MULTI,
-		Seq:    seq,
-		PortID: uint32(portID),
-	})
 	errno := int32(0)
 	if err != nil {
 		errno = -int32(err.ToLinux())
 	}
+	return newDoneMessage(portID, seq, linux.NLM_F_MULTI, errno)
+}
+
+// newDoneMessage returns an NLMSG_DONE message with the given header flags and
+// dump_done_errno payload.
+func newDoneMessage(portID int32, seq uint32, flags uint16, errno int32) []byte {
+	m := nlmsg.NewMessage(linux.NetlinkMessageHeader{
+		Type:   linux.NLMSG_DONE,
+		Flags:  flags,
+		Seq:    seq,
+		PortID: uint32(portID),
+	})
 	m.Put(primitive.AllocateInt32(errno))
 	return m.Finalize()
 }
@@ -275,4 +281,54 @@ func (s *Socket) queueDatagram(ctx context.Context, bufs [][]byte) bool {
 		s.connection.NotifyDataReady()
 	}
 	return true
+}
+
+// dumpResume is the part of a dump that a checkpoint keeps. A Dumper holds
+// protocol state that no checkpoint can save, so a restored socket cannot
+// continue the dump. The restored socket ends it with NLMSG_DONE and
+// NLM_F_DUMP_INTR. The flag tells the reader that the answer is incomplete.
+// Linux sets the same flag on a dump that a change of the data interrupts.
+//
+// +stateify savable
+type dumpResume struct {
+	// interrupted is true when the dump had more messages to send at save
+	// time.
+	interrupted bool
+
+	// seq is the sequence number of the request that started the dump.
+	seq uint32
+}
+
+// dumpBeforeSave records a running dump in s.dumpResume. It does not stop the
+// dump, so a checkpoint that leaves the sandbox running changes nothing.
+// Socket.beforeSave calls it.
+func (s *Socket) dumpBeforeSave() {
+	d := &s.dump
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s.dumpResume = dumpResume{
+		interrupted: d.active != nil || len(d.queue) > 0,
+		seq:         d.seq,
+	}
+}
+
+// dumpAfterLoad ends a dump that a checkpoint cut short. It puts one NLMSG_DONE
+// message with NLM_F_DUMP_INTR into the receive queue, after the datagrams
+// that the checkpoint kept. A reader that waits for the end of the dump then
+// wakes. Socket.afterLoad calls it.
+func (s *Socket) dumpAfterLoad() {
+	resume := s.dumpResume
+	s.dumpResume = dumpResume{}
+	if !resume.interrupted {
+		return
+	}
+	done := [][]byte{newDoneMessage(s.GetPortID(), resume.seq, linux.NLM_F_MULTI|linux.NLM_F_DUMP_INTR, 0)}
+	d := &s.dump
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !s.queueDatagram(context.Background(), done) {
+		// The receive queue is full. The next read that consumes a datagram
+		// sends the message.
+		d.queue = append(d.queue, done)
+	}
 }

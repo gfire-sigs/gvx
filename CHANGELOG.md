@@ -2,6 +2,14 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **State registration of the standard `iptables` matchers and the `DNAT` and `SNAT` targets (`pkg/sentry/socket/netfilter`, `tools/gostateify`)**: The matchers `tcp`, `udp`, `conntrack`, `mark`, `comment`, `owner` (revisions 0 and 1), and `multiport` (revisions 0 and 1), and the targets `DNAT` and `SNAT`, had no `pkg/state` registration. `state.Save` of a `stack.IPTables` object that held them failed with a nil pointer fault. `savable_xplat.go` registers them without a change to the upstream files, and a test keeps its field lists equal to the structs. The stack still does not save its tables (`Stack.tables` is `nosave` upstream), so a restored stack takes the tables of its new configuration.
+- **Netlink dump in progress at checkpoint (`pkg/sentry/socket/netlink`, `tools/gostateify`)**: A restored socket lost the `Dumper` of a dump that was in progress, so a reader that waited for the next chunk never woke. The socket now records the dump before save. After restore it queues `NLMSG_DONE` with `NLM_F_DUMP_INTR`, as Linux does for an interrupted dump. `tools/gostateify/packages.txt` lists the package.
+- **`list:set` limits and timeout handling (`pkg/ipset`)**: An add to a full `list:set` set now fails with `IPSET_ERR_LIST_FULL`, and `forceadd` pushes out the last member. The create size stays in the range 4 to 65536. A position test (`before` or `after`) now skips members that timed out.
+
 ## [v0.14.10002026110200] - 2026-11-12
 
 This release adds lockdown-safe sandbox checkpoint and restore across the Go SDK and the CLI (#157, #158, #160, #162, #163, #164, #167, #168, #170, #171, #174, #176, #178, #180, #181, #184, #186, #187). It also hardens host lockdown on Linux, macOS, and Windows, unifies Stage-2 hypervisor mappings, and trims Tier 3 upstream seams (#140-#156, #159, #161, #165, #166, #172, #173, #175, #177, #179, #182, #183, #185).

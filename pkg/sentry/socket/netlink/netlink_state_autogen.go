@@ -24,6 +24,7 @@ func (s *Socket) StateFields() []string {
 		"skType",
 		"ep",
 		"connection",
+		"dumpResume",
 		"netns",
 		"groups",
 		"bound",
@@ -32,8 +33,6 @@ func (s *Socket) StateFields() []string {
 		"filter",
 	}
 }
-
-func (s *Socket) beforeSave() {}
 
 // +checklocksignore
 func (s *Socket) StateSave(stateSinkObject state.Sink) {
@@ -48,15 +47,14 @@ func (s *Socket) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(7, &s.skType)
 	stateSinkObject.Save(8, &s.ep)
 	stateSinkObject.Save(9, &s.connection)
-	stateSinkObject.Save(10, &s.netns)
-	stateSinkObject.Save(11, &s.groups)
-	stateSinkObject.SaveBool(12, &s.bound)
-	stateSinkObject.SaveInt32(13, &s.portID)
-	stateSinkObject.SaveUint32(14, &s.sendBufferSize)
-	stateSinkObject.SaveBool(15, &s.filter)
+	stateSinkObject.Save(10, &s.dumpResume)
+	stateSinkObject.Save(11, &s.netns)
+	stateSinkObject.Save(12, &s.groups)
+	stateSinkObject.SaveBool(13, &s.bound)
+	stateSinkObject.SaveInt32(14, &s.portID)
+	stateSinkObject.SaveUint32(15, &s.sendBufferSize)
+	stateSinkObject.SaveBool(16, &s.filter)
 }
-
-func (s *Socket) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (s *Socket) StateLoad(ctx context.Context, stateSourceObject state.Source) {
@@ -70,12 +68,19 @@ func (s *Socket) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(7, &s.skType)
 	stateSourceObject.Load(8, &s.ep)
 	stateSourceObject.Load(9, &s.connection)
-	stateSourceObject.Load(10, &s.netns)
-	stateSourceObject.Load(11, &s.groups)
-	stateSourceObject.LoadBool(12, &s.bound)
-	stateSourceObject.LoadInt32(13, &s.portID)
-	stateSourceObject.LoadUint32(14, &s.sendBufferSize)
-	stateSourceObject.LoadBool(15, &s.filter)
+	stateSourceObject.Load(10, &s.dumpResume)
+	stateSourceObject.Load(11, &s.netns)
+	stateSourceObject.Load(12, &s.groups)
+	stateSourceObject.LoadBool(13, &s.bound)
+	stateSourceObject.LoadInt32(14, &s.portID)
+	stateSourceObject.LoadUint32(15, &s.sendBufferSize)
+	stateSourceObject.LoadBool(16, &s.filter)
+	stateSourceObject.AfterLoadTo(s)
+}
+
+// +checklocksignore
+func (s *Socket) StateAfterLoad(ctx context.Context) {
+	s.afterLoad(ctx)
 }
 
 func (k *kernelSCM) StateTypeName() string {
@@ -100,6 +105,6 @@ func (k *kernelSCM) StateLoad(ctx context.Context, stateSourceObject state.Sourc
 }
 
 func init() {
-	state.RegisterNoHooks((*Socket)(nil))
+	state.RegisterStruct((*Socket)(nil))
 	state.RegisterNoHooks((*kernelSCM)(nil))
 }

@@ -234,8 +234,12 @@ seam pkg/sentry/socket/netlink/netfilter/protocol.go
 # (pkg/sentry/socket/netlink/dump_xplat.go). The seams are the dump field of the socket, one call
 # each in Release, Read, and RecvMsg, and the start of a dump in ProcessMessages. ProcessMessages
 # sends no acknowledgement after an error message that a handler wrote itself, as the subsystem
-# IPSET does (pkg/sentry/socket/netlink/netfilter/ipset_xplat.go).
+# IPSET does (pkg/sentry/socket/netlink/netfilter/ipset_xplat.go). A checkpoint records a dump in
+# progress in the dumpResume field, and the restored socket ends it with NLMSG_DONE and
+# NLM_F_DUMP_INTR. The socket.go seams add the field and the beforeSave and afterLoad hooks that
+# call dump_xplat.go. The generator emits the hooks and the field into netlink_state_autogen.go.
 seam pkg/sentry/socket/netlink/socket.go
+seam pkg/sentry/socket/netlink/netlink_state_autogen.go
 
 # Content seam: neighbor tables obey gc_thresh1 to gc_thresh3 as Linux does
 # (pkg/tcpip/stack/neighbor_gc_xplat.go). getOrCreateEntry delegates dynamic
