@@ -91,7 +91,7 @@ func (physdevMarshaler) marshal(mr matcher) []byte {
 
 // unmarshal implements matchMaker.unmarshal. It applies the checks of
 // physdev_mt_check.
-func (physdevMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (physdevMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	// WHY: Linux requires the exact aligned size.
 	if want := bits.AlignUp(physdevInfoSize, 8); len(buf) != want {
 		return nil, fmt.Errorf("physdev: buf has size %d, want %d", len(buf), want)

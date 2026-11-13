@@ -104,7 +104,7 @@ func (statisticMarshaler) marshal(mr matcher) []byte {
 }
 
 // unmarshal implements matchMaker.unmarshal.
-func (statisticMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (statisticMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	// WHY: Linux requires the exact aligned size.
 	if want := bits.AlignUp(statisticInfoSize, 8); len(buf) != want {
 		return nil, fmt.Errorf("statistic: buf has size %d, want %d", len(buf), want)

@@ -1,8 +1,9 @@
 {
-  "go_branch_sha": "1cea747efe8d81d69ec1fb06199d7f166b82912e",
-  "release_tag": "release-20261102.0",
-  "release_tag_sha": "7a675ac66a1e2357abdaa6cccedabcd3cce9aa5c",
-  "extracted_files": 2539,
+  "upstream_repo": "https://github.com/google/gvisor.git",
+  "go_branch_sha": "10548a45b7ba46057de337e2eced510700f47574",
+  "release_tag": "release-20261109.0",
+  "release_tag_sha": "a0e6be6fb5e03d8ebea13592f36a097c7e9a41b9",
+  "extracted_files": 2564,
   "protected_skips": 5,
   "excluded_skips": 1,
   "dest_dir": "."

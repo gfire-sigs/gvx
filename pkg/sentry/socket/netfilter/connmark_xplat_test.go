@@ -267,7 +267,7 @@ func TestConnmarkMatcherRoundTripAndRevision(t *testing.T) {
 	}
 	short := connmarkMatchEntry(1, 1, false)
 	short = short[:len(short)-8]
-	if _, err := parseMatchers(nil, stack.EmptyFilter4(), short); err == nil {
+	if _, err := parseMatchers(nil, nil, stack.EmptyFilter4(), short); err == nil {
 		t.Error("parseMatchers accepted a short connmark match")
 	}
 }

@@ -61,7 +61,7 @@ func standardRules(t *testing.T) []stack.Rule {
 		marshalMatcher(&MarkMatcher{mark: 0x10, mask: 0xff, invert: true}),
 		marshalMatcher(&commentMatcher{comment: "kube-proxy: service"}),
 	)
-	tcpMatchers, err := parseMatchers(nil, tcpFilter, tcpEntries)
+	tcpMatchers, err := parseMatchers(nil, nil, tcpFilter, tcpEntries)
 	if err != nil {
 		t.Fatalf("parseMatchers(tcp): %v", err)
 	}
@@ -86,7 +86,7 @@ func standardRules(t *testing.T) []stack.Rule {
 		marshalMatcher(&UDPMatcher{destinationPortStart: 53, destinationPortEnd: 53, sourcePortEnd: 0xffff}),
 		marshalMatcher(&multiportMatcherV1{flags: linux.XT_MULTIPORT_SOURCE, count: 1, ports: []uint16{5353}, pflags: []uint8{0}}),
 	)
-	udpMatchers, err := parseMatchers(nil, udpFilter, udpEntries)
+	udpMatchers, err := parseMatchers(nil, nil, udpFilter, udpEntries)
 	if err != nil {
 		t.Fatalf("parseMatchers(udp): %v", err)
 	}

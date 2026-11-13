@@ -51,7 +51,12 @@ const (
 
 func init() {
 	registerMatchMaker(addrtypeMarshaler{rev: addrtypeRevision0})
-	registerMatchMaker(addrtypeMarshaler{rev: addrtypeRevision1})
+	// Overwrite the partial revision 1 matcher from addrtype_matcher.go so
+	// interface limits and stateify save/restore work.
+	matchMakers[matchKey{
+		name:     matcherNameAddrtype,
+		revision: addrtypeRevision1,
+	}] = addrtypeMarshaler{rev: addrtypeRevision1}
 }
 
 // addrResolver answers the questions that the classification of an address
@@ -209,9 +214,12 @@ func (m addrtypeMarshaler) marshal(mr matcher) []byte {
 }
 
 // unmarshal implements matchMaker.unmarshal.
-func (m addrtypeMarshaler) unmarshal(_ IDMapper, buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error) {
+func (m addrtypeMarshaler) unmarshal(_ IDMapper, stk *stack.Stack, buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error) {
 	ipv6 := filter.NetworkProtocol() == header.IPv6ProtocolNumber
-	am := &AddrtypeMatcher{rev: m.rev}
+	am := &AddrtypeMatcher{rev: m.rev, stk: stk}
+	if stk != nil {
+		am.resolver = stackResolver{stk: stk}
+	}
 	switch m.rev {
 	case addrtypeRevision0:
 		var info linux.XTAddrtypeInfo

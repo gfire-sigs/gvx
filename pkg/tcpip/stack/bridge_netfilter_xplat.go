@@ -126,9 +126,9 @@ func (p *bridgePort) netfilterForward(protocol tcpip.NetworkProtocolNumber, pkt 
 	}
 	b := p.bridge
 	b.mu.RLock()
-	bridgeAddr, dispatcher := b.addr, b.dispatcher
+	isLocal, dispatcher := b.isLocalAddressLocked(dstMAC), b.dispatcher
 	b.mu.RUnlock()
-	if dstMAC == bridgeAddr || dstMAC == p.nic.LinkAddress() {
+	if isLocal {
 		return false
 	}
 	bridgeNIC, ok := dispatcher.(*nic)
@@ -344,21 +344,34 @@ func (p *bridgePort) netfilterDeliverUp(d NetworkDispatcher, protocol tcpip.Netw
 
 // forwardFrame learns the source address of the frame and sends the frame to
 // the port of its destination address. An unknown destination goes to every port
-// except the port of arrival. The bridge keeps no lock while it writes.
-func (b *BridgeEndpoint) forwardFrame(from *bridgePort, frame *PacketBuffer) {
+// except the port of arrival. The bridge keeps no lock while it writes. It
+// returns whether the frame is addressed to the bridge or one of its ports.
+func (b *BridgeEndpoint) forwardFrame(from *bridgePort, frame *PacketBuffer) bool {
 	eth := header.Ethernet(frame.LinkHeader().Slice())
 	src, dst := eth.SourceAddress(), eth.DestinationAddress()
+	isMulticast := header.IsMulticastEthernetAddress(dst)
 
 	b.mu.RLock()
+	isLocal := !isMulticast && b.isLocalAddressLocked(dst)
+	switch {
+	case dst == header.EthernetBroadcastAddress:
+		frame.PktType = tcpip.PacketBroadcast
+	case isMulticast:
+		frame.PktType = tcpip.PacketMulticast
+	case isLocal:
+		frame.PktType = tcpip.PacketHost
+	default:
+		frame.PktType = tcpip.PacketOtherHost
+	}
 	learn := b.needsLearningLocked(src, from)
 	targets := b.forwardTargetsLocked(from, dst)
 	b.mu.RUnlock()
 
 	if learn {
 		b.mu.Lock()
-		// The port may have left the bridge while the frame waited for the
-		// neighbor cache.
-		if b.ports[from.nic.id] == from {
+		// The port or the bridge's addresses may have changed while the frame
+		// waited for the neighbor cache or while the lock was released.
+		if b.needsLearningLocked(src, from) {
 			b.addFDBEntryLocked(src, from, 0)
 		}
 		b.mu.Unlock()
@@ -371,4 +384,5 @@ func (b *BridgeEndpoint) forwardFrame(from *bridgePort, frame *PacketBuffer) {
 		port.nic.writeRawPacket(out)
 		out.DecRef()
 	}
+	return isLocal
 }

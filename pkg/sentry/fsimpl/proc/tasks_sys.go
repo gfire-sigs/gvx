@@ -17,7 +17,6 @@ package proc
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"math"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -231,7 +230,7 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "kernel/random":
 		return map[string]kernfs.Inode{
-			"boot_id": fs.newInode(ctx, root, 0444, newStaticFile(randUUID())),
+			"boot_id": fs.newInode(ctx, root, 0444, newStaticFile(k.BootID()+"\n")),
 			"uuid":    fs.newInode(ctx, root, 0444, &uuidData{}),
 		}
 	case "kernel/yama":
@@ -244,6 +243,10 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "fs":
 		return map[string]kernfs.Inode{
+			// AIO contexts are not limited or counted system-wide, so report
+			// Linux's default limit and no contexts in use.
+			"aio-max-nr":    fs.newInode(ctx, root, 0444, newStaticFile("65536\n")),
+			"aio-nr":        fs.newInode(ctx, root, 0444, newStaticFile("0\n")),
 			"file-max":      fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", int64(math.MaxInt64)))),
 			"file-nr":       fs.newInode(ctx, root, 0444, &fileNrData{vfs: k.VFS()}),
 			"mount-max":     fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.VFS().MountMax, min: 1, max: math.MaxInt32}),
@@ -337,7 +340,8 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "net/ipv6/conf/all":
 		return map[string]kernfs.Inode{
-			"forwarding": fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv6.ProtocolNumber}),
+			"forwarding":        fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv6.ProtocolNumber}),
+			"keep_addr_on_down": fs.newInode(ctx, root, 0644, &ipv6KeepAddrOnDown{stack: stack}),
 		}
 	case "net/ipv6/conf/default":
 		// Stub for conf/default/forwarding.
@@ -421,7 +425,8 @@ var _ dynamicInode = (*uuidData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*uuidData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	buf.WriteString(randUUID())
+	buf.WriteString(rand.UUID())
+	buf.WriteByte('\n')
 	return nil
 }
 
@@ -474,6 +479,45 @@ func (*maxUserNamespacesData) Write(ctx context.Context, _ *vfs.FileDescription,
 		return 0, linuxerr.EINVAL
 	}
 	auth.CredentialsFromContext(ctx).UserNamespace.SetMaxUserNamespaces(buf[0])
+	return n, nil
+}
+
+// ipv6KeepAddrOnDown implements vfs.WritableDynamicBytesSource for
+// /proc/sys/net/ipv6/conf/all/keep_addr_on_down.
+//
+// +stateify savable
+type ipv6KeepAddrOnDown struct {
+	kernfs.DynamicBytesFile
+
+	stack inet.Stack `state:"wait"`
+}
+
+var _ vfs.WritableDynamicBytesSource = (*ipv6KeepAddrOnDown)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *ipv6KeepAddrOnDown) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	val := "0\n"
+	if d.stack.IPv6KeepAddrOnDown() {
+		val = "1\n"
+	}
+	_, err := buf.WriteString(val)
+	return err
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *ipv6KeepAddrOnDown) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		// No need to handle partial writes thus far.
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, buf)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	if err := d.stack.SetIPv6KeepAddrOnDown(buf[0] > 0); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -855,18 +899,6 @@ var _ dynamicInode = (*fileNrData)(nil)
 func (f *fileNrData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	_, err := fmt.Fprintf(buf, "%d\t0\t%d\n", f.vfs.NumFiles(), int64(math.MaxInt64))
 	return err
-}
-
-// randUUID returns a string containing a randomly-generated UUID followed by a
-// newline.
-func randUUID() string {
-	var uuid [16]byte
-	if _, err := io.ReadFull(rand.Reader, uuid[:]); err != nil {
-		panic(fmt.Sprintf("failed to read random bytes for UUID: %v", err))
-	}
-	uuid[8] = (uuid[8] & 0x3f) | 0x80 // RFC 4122 UUID
-	uuid[6] = (uuid[6] & 0x0f) | 0x40 // Version 4 (random)
-	return fmt.Sprintf("%x-%x-%x-%x-%x\n", uuid[:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])
 }
 
 // ParseInt32Vec interprets src as string encoding slice of int32, and

@@ -154,8 +154,6 @@ seam pkg/sentry/mm/io.go
 # Content seams: New TCP endpoints start with the keepalive defaults of the stack, which
 # net.ipv4.tcp_keepalive_time, tcp_keepalive_intvl, and tcp_keepalive_probes set
 # (pkg/tcpip/transport/tcp/keepalive_xplat.go and pkg/tcpip/keepalive_xplat.go).
-# An endpoint that bound the wildcard address releases its port under that address after connect
-# (pkg/tcpip/transport/tcp/bindaddr_xplat.go).
 seam pkg/tcpip/transport/tcp/protocol.go
 seam pkg/tcpip/transport/tcp/endpoint.go
 seam pkg/tcpip/transport/tcp/tcp_state_autogen.go

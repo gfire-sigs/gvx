@@ -118,7 +118,7 @@ func (m setMarshaler) marshal(mr matcher) []byte {
 	return buf
 }
 
-func (m setMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (m setMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	if want := bitsutil.AlignUp(setMatchSize(m.rev), 8); len(buf) != want {
 		return nil, fmt.Errorf("set rev%d: buf has size %d, want %d", m.rev, len(buf), want)
 	}

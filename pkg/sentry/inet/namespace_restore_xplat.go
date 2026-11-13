@@ -221,7 +221,15 @@ func (n *Namespace) restoreAfterLoad() {
 		return
 	}
 	if n.creator != nil {
-		st, err := n.creator.CreateStack()
+		var (
+			st  Stack
+			err error
+		)
+		if rc, ok := n.creator.(RestoreNetworkStackCreator); ok {
+			st, err = rc.CreateStackForRestore()
+		} else {
+			st, err = n.creator.CreateStack()
+		}
 		if err != nil {
 			panic(err)
 		}
@@ -284,7 +292,15 @@ func (n *Namespace) restoreChildFromRoot(rootStack Stack) {
 		n.creator = c
 	}
 	if n.stack == nil && n.creator != nil {
-		st, err := n.creator.CreateStack()
+		var (
+			st  Stack
+			err error
+		)
+		if rc, ok := n.creator.(RestoreNetworkStackCreator); ok {
+			st, err = rc.CreateStackForRestore()
+		} else {
+			st, err = n.creator.CreateStack()
+		}
 		if err != nil {
 			panic(err)
 		}

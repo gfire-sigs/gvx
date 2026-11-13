@@ -53,7 +53,7 @@ func (rpfilterMarshaler) marshal(m matcher) []byte {
 	return marshalEntryMatch(matcherNameRPFilter, []byte{m.(*RPFilterMatcher).flags})
 }
 
-func (rpfilterMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (rpfilterMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	// struct xt_rpfilter_info holds one byte, which the entry pads to 8.
 	if want := bits.AlignUp(1, 8); len(buf) != want {
 		return nil, fmt.Errorf("rpfilter: buf has size %d, want %d", len(buf), want)

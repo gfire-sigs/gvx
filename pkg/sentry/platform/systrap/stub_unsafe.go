@@ -247,7 +247,7 @@ func stubInit() {
 	for i := 0; i < 32; i++ {
 		if i == 0 { // fast path
 			// Randomize stubStart address.
-			randomOffset := uintptr(rand.Uint64() * hostarch.PageSize)
+			randomOffset := uintptr(rand.Uint64()) * hostarch.PageSize
 			maxRandomOffset := maxRandomOffsetOfStubAddress - mapLen
 			stubStart = hostPageRoundDown(maxStubUserAddress + randomOffset%maxRandomOffset)
 		} else {

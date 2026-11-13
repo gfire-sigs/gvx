@@ -34,16 +34,16 @@ type fdInfo struct {
 	// membership and queued event masks.
 	queue *waiter.Queue
 
-	// waiting is protected by the owning notifier's mu. fdInfo does not retain
-	// a pointer to that owner for a checklocks annotation.
-	waiting bool
+	// id identifies the current epoll registration, or is zero if there is
+	// none. It is protected by the owning notifier's mu.
+	id uint64
 }
 
 // notifier holds all the state necessary to issue notifications when IO events
 // occur in the observed FDs.
 type notifier struct {
 	// epFD is the epoll file descriptor used to register for io
-	// notifications.
+	// notifications. The first AddFD sets it before starting waitAndNotify.
 	epFD int
 
 	// pauseMu synchronizes notifications with save/restore.
@@ -57,53 +57,55 @@ type notifier struct {
 	//
 	// +checklocks:mu
 	fdMap map[int32]*fdInfo
-}
 
-// newNotifier creates a new notifier object.
-func newNotifier() (*notifier, error) {
-	epfd, err := unix.EpollCreate1(0)
-	if err != nil {
-		return nil, err
-	}
+	// queues maps live epoll registrations to their waiters. The host FD may
+	// already have been reused when we dispatch a batch from epollWait.
+	//
+	// +checklocks:mu
+	queues map[uint64]*waiter.Queue
 
-	w := &notifier{
-		epFD:  epfd,
-		fdMap: make(map[int32]*fdInfo),
-	}
-
-	go w.waitAndNotify() // S/R-SAFE: no waiter exists during save / load.
-
-	return w, nil
+	// lastID is the last ID assigned by EPOLL_CTL_ADD.
+	//
+	// +checklocks:mu
+	lastID uint64
 }
 
 // waitFD waits on mask for fd.
 //
 // +checklocks:n.mu
 func (n *notifier) waitFD(fd int32, fi *fdInfo, mask waiter.EventMask) error {
-	if !fi.waiting && mask == 0 {
+	if mask == 0 {
+		if fi.id != 0 {
+			unix.EpollCtl(n.epFD, unix.EPOLL_CTL_DEL, int(fd), nil)
+			delete(n.queues, fi.id)
+			fi.id = 0
+		}
 		return nil
 	}
 
+	op := unix.EPOLL_CTL_MOD
+	id := fi.id
+	if id == 0 {
+		op = unix.EPOLL_CTL_ADD
+		id = n.lastID + 1
+		if id == 0 {
+			return unix.EOVERFLOW
+		}
+	}
+	// Fd and Pad hold the two words of epoll_event.data.
 	e := unix.EpollEvent{
 		Events: mask.ToLinux() | unix.EPOLLET,
-		Fd:     fd,
+		Fd:     int32(id),
+		Pad:    int32(id >> 32),
 	}
-
-	switch {
-	case !fi.waiting && mask != 0:
-		if err := unix.EpollCtl(n.epFD, unix.EPOLL_CTL_ADD, int(fd), &e); err != nil {
-			return err
-		}
-		fi.waiting = true
-	case fi.waiting && mask == 0:
-		unix.EpollCtl(n.epFD, unix.EPOLL_CTL_DEL, int(fd), nil)
-		fi.waiting = false
-	case fi.waiting && mask != 0:
-		if err := unix.EpollCtl(n.epFD, unix.EPOLL_CTL_MOD, int(fd), &e); err != nil {
-			return err
-		}
+	if err := unix.EpollCtl(n.epFD, op, int(fd), &e); err != nil {
+		return err
 	}
-
+	if op == unix.EPOLL_CTL_ADD {
+		n.lastID = id
+		fi.id = id
+		n.queues[id] = fi.queue
+	}
 	return nil
 }
 
@@ -114,6 +116,17 @@ func (n *notifier) waitFD(fd int32, fi *fdInfo, mask waiter.EventMask) error {
 func (n *notifier) addFD(fd int32, queue *waiter.Queue) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	if n.fdMap == nil {
+		epfd, err := unix.EpollCreate1(0)
+		if err != nil {
+			return err
+		}
+		n.epFD = epfd
+		n.fdMap = make(map[int32]*fdInfo)
+		n.queues = make(map[uint64]*waiter.Queue)
+		go n.waitAndNotify() // S/R-SAFE: pauseMu excludes callbacks during save/restore.
+	}
 
 	// Panic if we're already notifying on this FD.
 	if _, ok := n.fdMap[fd]; ok {
@@ -185,18 +198,7 @@ func (n *notifier) waitAndNotify() error {
 			return err
 		}
 
-		notified := false
-		n.pauseMu.Lock()
-		n.mu.Lock()
-		for i := 0; i < v; i++ {
-			if fi, ok := n.fdMap[e[i].Fd]; ok {
-				fi.queue.Notify(waiter.EventMaskFromLinux(e[i].Events))
-				notified = true
-			}
-		}
-		n.mu.Unlock()
-		n.pauseMu.Unlock()
-		if notified {
+		if n.notify(e[:v]) {
 			// Let goroutines woken by Notify get a chance to run before we
 			// epoll_wait again.
 			sync.Goyield()
@@ -204,71 +206,61 @@ func (n *notifier) waitAndNotify() error {
 	}
 }
 
-// pause suspends notifications until resume is called.
-func (n *notifier) pause() {
+// notify dispatches a batch already returned by epollWait.
+func (n *notifier) notify(events []unix.EpollEvent) bool {
 	n.pauseMu.Lock()
+	defer n.pauseMu.Unlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	notified := false
+	for _, event := range events {
+		id := uint64(uint32(event.Pad))<<32 | uint64(uint32(event.Fd))
+		if queue := n.queues[id]; queue != nil {
+			queue.Notify(waiter.EventMaskFromLinux(event.Events))
+			notified = true
+		}
+	}
+	return notified
 }
 
-// resume ends the effect of a previous call to pause.
-func (n *notifier) resume() {
-	n.pauseMu.Unlock()
-}
-
-// once publishes notifier and initErr; checklocks does not model sync.Once
-// publication. Public FD helpers acquire notifier.mu themselves, but their
+// Public FD helpers acquire the shared notifier's mu themselves, but their
 // exclusions cannot be exported reliably through this private package global.
 // Pause/Resume have the same private-global limitation for their lock effects.
 //
 // Notifications call waiter callbacks with pauseMu and mu held. Callbacks must
 // not reenter the FD helpers or Pause/Resume on the same notifier.
-var shared struct {
-	notifier *notifier
-	once     sync.Once
-	initErr  error
-}
-
-func ensureSharedNotifier() {
-	shared.once.Do(func() {
-		shared.notifier, shared.initErr = newNotifier()
-	})
-}
+var shared notifier
 
 // AddFD adds an FD to the list of observed FDs.
 //
 // +checklocksexclude:queue.mu
 func AddFD(fd int32, queue *waiter.Queue) error {
-	ensureSharedNotifier()
-	if shared.initErr != nil {
-		return shared.initErr
-	}
-
-	return shared.notifier.addFD(fd, queue)
+	return shared.addFD(fd, queue)
 }
 
 // UpdateFD updates the set of events the fd needs to be notified on.
 func UpdateFD(fd int32) error {
-	return shared.notifier.updateFD(fd)
+	return shared.updateFD(fd)
 }
 
 // RemoveFD removes an FD from the list of observed FDs.
 func RemoveFD(fd int32) {
-	shared.notifier.removeFD(fd)
+	shared.removeFD(fd)
 }
 
 // HasFD returns true if the FD is in the list of observed FDs.
 //
 // This should only be used by tests to assert that FDs are correctly registered.
 func HasFD(fd int32) bool {
-	return shared.notifier.hasFD(fd)
+	return shared.hasFD(fd)
 }
 
 // Pause suspends notifications until Resume is called.
 func Pause() {
-	ensureSharedNotifier()
-	shared.notifier.pause()
+	shared.pauseMu.Lock()
 }
 
 // Resume ends the effect of a previous call to Pause.
 func Resume() {
-	shared.notifier.resume()
+	shared.pauseMu.Unlock()
 }

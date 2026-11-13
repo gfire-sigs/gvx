@@ -119,8 +119,9 @@ func (fs *filesystem) evictUnusedDentries(ctx context.Context) {
 }
 
 func (fs *filesystem) drainUnusedDentries(ctx context.Context, closeCache bool) {
-	fs.renameMu.Lock()
-	defer fs.renameMu.Unlock()
+	renameIdx := fs.renameLockIndex()
+	fs.renameMu.NestedLock(renameIdx)
+	defer fs.renameMu.NestedUnlock(renameIdx)
 	wasClosed := fs.unused.closed
 	fs.unused.closed = true
 	for fs.unused.tail != nil {

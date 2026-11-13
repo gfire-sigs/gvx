@@ -129,7 +129,7 @@ func dropRule(filter stack.IPHeaderFilter, matchers ...stack.Matcher) stack.Rule
 // parseOneMatcher parses the entries that userspace sends for one rule.
 func parseOneMatcher(t *testing.T, filter stack.IPHeaderFilter, entry []byte) stack.Matcher {
 	t.Helper()
-	parsed, err := parseMatchers(nil, filter, entry)
+	parsed, err := parseMatchers(nil, nil, filter, entry)
 	if err != nil {
 		t.Fatalf("parseMatchers: %v", err)
 	}

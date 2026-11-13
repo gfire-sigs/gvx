@@ -51,7 +51,7 @@ func (connmarkMarshaler) marshal(mr matcher) []byte {
 	return marshalEntryMatch(matcherNameConnmark, marshal.Marshal(&info))
 }
 
-func (connmarkMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (connmarkMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	// Linux requires the exact aligned size.
 	if want := bits.AlignUp(linux.SizeOfXTMarkMtinfo1, 8); len(buf) != want {
 		return nil, fmt.Errorf("connmark: buf has size %d, want %d", len(buf), want)

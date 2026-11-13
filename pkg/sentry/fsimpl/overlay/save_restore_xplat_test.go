@@ -48,10 +48,10 @@ func newSavableOverlayContext(t *testing.T, mf *pgalloc.MemoryFile, creds *auth.
 	clock.Store(ktime.FromNanoseconds(1_700_000_000_000_000_000))
 	uidProvider := &testUniqueIDProvider{}
 	values := map[any]any{
-		pgalloc.CtxMemoryFile:          mf,
-		ktime.CtxRealtimeClock:         clock,
-		auth.CtxCredentials:            creds,
-		uniqueid.CtxGlobalUniqueID:     uint64(1),
+		pgalloc.CtxMemoryFile:              mf,
+		ktime.CtxRealtimeClock:             clock,
+		auth.CtxCredentials:                creds,
+		uniqueid.CtxGlobalUniqueID:         uint64(1),
 		uniqueid.CtxGlobalUniqueIDProvider: uidProvider,
 	}
 	gvCtx := gvcontext.WithValues(gvcontext.Background(), values)

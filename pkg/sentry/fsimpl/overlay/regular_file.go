@@ -48,20 +48,32 @@ func (d *dentry) readlink(ctx context.Context) (string, error) {
 type regularFileFD struct {
 	fileDescription
 
+	mu regularFileFDMutex `state:"nosave"`
+
+	// +checklocks:mu
+	copiedUp bool
+
 	// If copiedUp is false, cachedFD represents
 	// fileDescription.dentry().lowerVDs[0]; otherwise, cachedFD represents
-	// fileDescription.dentry().upperVD. cachedFlags is the last known value of
-	// cachedFD.StatusFlags(). copiedUp, cachedFD, and cachedFlags are
-	// protected by mu.
-	mu          regularFileFDMutex `state:"nosave"`
-	copiedUp    bool
-	cachedFD    *vfs.FileDescription
+	// fileDescription.dentry().upperVD.
+	//
+	// +checklocks:mu
+	cachedFD *vfs.FileDescription
+
+	// cachedFlags is the last known value of cachedFD.StatusFlags().
+	//
+	// +checklocks:mu
 	cachedFlags uint32
 }
 
+func (fd *regularFileFD) lockIndex() regularFileFDlockNameIndex {
+	return regularFileFDlockNameIndex(fd.filesystem().depthIndex())
+}
+
 func (fd *regularFileFD) getCurrentFD(ctx context.Context) (*vfs.FileDescription, error) {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(ctx)
 	if err != nil {
 		return nil, err
@@ -108,8 +120,9 @@ func (fd *regularFileFD) currentFDLocked(ctx context.Context) (*vfs.FileDescript
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *regularFileFD) Release(ctx context.Context) {
-	fd.cachedFD.DecRef(ctx)
-	fd.cachedFD = nil
+	// Release owns the cache after the last reference to fd is dropped.
+	fd.cachedFD.DecRef(ctx) // +checklocksignore
+	fd.cachedFD = nil       // +checklocksignore
 }
 
 // OnClose implements vfs.FileDescriptionImpl.OnClose.
@@ -120,16 +133,17 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 	// copied-up, since OnClose is mostly used to define post-close writeback,
 	// and if fd.cachedFD hasn't been updated then it can't have been used to
 	// mutate fd.dentry() anyway.
-	fd.mu.Lock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
 	if statusFlags := fd.vfsfd.StatusFlags(); fd.cachedFlags != statusFlags {
 		if err := fd.cachedFD.SetStatusFlags(ctx, fd.filesystem().creds, statusFlags); err != nil {
-			fd.mu.Unlock()
+			fd.mu.NestedUnlock(fdIdx)
 			return err
 		}
 		fd.cachedFlags = statusFlags
 	}
 	wrappedFD := fd.cachedFD
-	fd.mu.Unlock()
+	fd.mu.NestedUnlock(fdIdx)
 	return wrappedFD.OnClose(ctx)
 }
 
@@ -186,9 +200,10 @@ func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) e
 		if d.isNoopChown(&opts) {
 			return nil
 		}
-		d.fs.renameMu.RLock()
+		renameIdx := d.fs.renameLockIndex()
+		d.fs.renameMu.NestedRLock(renameIdx)
 		err := d.copyUpForWriteLocked(ctx)
-		d.fs.renameMu.RUnlock()
+		d.fs.renameMu.NestedRUnlock(renameIdx)
 		if err != nil {
 			return err
 		}
@@ -236,10 +251,11 @@ func (fd *regularFileFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 		// an error. This is obviously wrong, but at least consistent with
 		// VFS1.
 		log.Warningf("overlay.regularFileFD.Readiness: currentFDLocked failed: %v", err)
-		fd.mu.Lock()
+		fdIdx := fd.lockIndex()
+		fd.mu.NestedLock(fdIdx)
 		wrappedFD = fd.cachedFD
 		wrappedFD.IncRef()
-		fd.mu.Unlock()
+		fd.mu.NestedUnlock(fdIdx)
 	}
 	defer wrappedFD.DecRef(ctx)
 	return wrappedFD.Readiness(mask)
@@ -247,8 +263,9 @@ func (fd *regularFileFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // EventRegister implements waiter.Waitable.EventRegister.
 func (fd *regularFileFD) EventRegister(e *waiter.Entry) error {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(context.Background())
 	if err != nil {
 		// TODO(b/171089913): Just use fd.cachedFD for backward compatibility
@@ -261,15 +278,17 @@ func (fd *regularFileFD) EventRegister(e *waiter.Entry) error {
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (fd *regularFileFD) EventUnregister(e *waiter.Entry) {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	fd.cachedFD.EventUnregister(e)
 }
 
 // Epollable implements FileDescriptionImpl.Epollable.
 func (fd *regularFileFD) Epollable() bool {
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(context.Background())
 	if err != nil {
 		// TODO(b/171089913): Just use fd.cachedFD since EventRegister can't
@@ -294,8 +313,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 // Read implements vfs.FileDescriptionImpl.Read.
 func (fd *regularFileFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	// Hold fd.mu during the read to serialize the file offset.
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(ctx)
 	if err != nil {
 		return 0, err
@@ -320,8 +340,9 @@ func (fd *regularFileFD) PWrite(ctx context.Context, src usermem.IOSequence, off
 // Write implements vfs.FileDescriptionImpl.Write.
 func (fd *regularFileFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	// Hold fd.mu during the write to serialize the file offset.
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(ctx)
 	if err != nil {
 		return 0, err
@@ -353,8 +374,9 @@ func (fd *regularFileFD) updateSetUserGroupIDs(ctx context.Context, wrappedFD *v
 // Seek implements vfs.FileDescriptionImpl.Seek.
 func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	// Hold fd.mu during the seek to serialize the file offset.
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	wrappedFD, err := fd.currentFDLocked(ctx)
 	if err != nil {
 		return 0, err
@@ -364,19 +386,20 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (fd *regularFileFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
-	fd.mu.Lock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
 	if !fd.dentry().isCopiedUp() {
-		fd.mu.Unlock()
+		fd.mu.NestedUnlock(fdIdx)
 		return nil
 	}
 	wrappedFD, err := fd.currentFDLocked(ctx)
 	if err != nil {
-		fd.mu.Unlock()
+		fd.mu.NestedUnlock(fdIdx)
 		return err
 	}
 	wrappedFD.IncRef()
 	defer wrappedFD.DecRef(ctx)
-	fd.mu.Unlock()
+	fd.mu.NestedUnlock(fdIdx)
 	if opts.DataOnly {
 		return wrappedFD.SyncData(ctx)
 	}
@@ -417,8 +440,9 @@ func (fd *regularFileFD) ensureMappable(ctx context.Context, opts *memmap.MMapOp
 	}
 
 	// Get a Mappable for the current top layer.
-	fd.mu.Lock()
-	defer fd.mu.Unlock()
+	fdIdx := fd.lockIndex()
+	fd.mu.NestedLock(fdIdx)
+	defer fd.mu.NestedUnlock(fdIdx)
 	d.copyMu.RLock()
 	defer d.copyMu.RUnlock()
 	if d.isMappable.Load() != 0 {
@@ -437,10 +461,12 @@ func (fd *regularFileFD) ensureMappable(ctx context.Context, opts *memmap.MMapOp
 	}
 	// Use this Mappable for all mappings of this layer (unless we raced with
 	// another call to ensureMappable).
-	d.mapsMu.Lock()
-	defer d.mapsMu.Unlock()
-	d.dataMu.Lock()
-	defer d.dataMu.Unlock()
+	mapsIdx := d.mapsLockIndex()
+	d.mapsMu.NestedLock(mapsIdx)
+	defer d.mapsMu.NestedUnlock(mapsIdx)
+	dataIdx := d.dataLockIndex()
+	d.dataMu.NestedLock(dataIdx)
+	defer d.dataMu.NestedUnlock(dataIdx)
 	if d.wrappedMappable == nil {
 		d.wrappedMappable = opts.Mappable
 		d.isMappable.Store(1)
@@ -450,8 +476,9 @@ func (fd *regularFileFD) ensureMappable(ctx context.Context, opts *memmap.MMapOp
 
 // AddMapping implements memmap.Mappable.AddMapping.
 func (d *dentry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
-	d.mapsMu.Lock()
-	defer d.mapsMu.Unlock()
+	mapsIdx := d.mapsLockIndex()
+	d.mapsMu.NestedLock(mapsIdx)
+	defer d.mapsMu.NestedUnlock(mapsIdx)
 	if err := d.wrappedMappable.AddMapping(ctx, ms, ar, offset, writable); err != nil {
 		return err
 	}
@@ -463,8 +490,9 @@ func (d *dentry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar host
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
 func (d *dentry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
-	d.mapsMu.Lock()
-	defer d.mapsMu.Unlock()
+	mapsIdx := d.mapsLockIndex()
+	d.mapsMu.NestedLock(mapsIdx)
+	defer d.mapsMu.NestedUnlock(mapsIdx)
 	d.wrappedMappable.RemoveMapping(ctx, ms, ar, offset, writable)
 	if !d.isCopiedUp() {
 		d.lowerMappings.RemoveMapping(ms, ar, offset, writable)
@@ -473,8 +501,9 @@ func (d *dentry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar h
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
 func (d *dentry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
-	d.mapsMu.Lock()
-	defer d.mapsMu.Unlock()
+	mapsIdx := d.mapsLockIndex()
+	d.mapsMu.NestedLock(mapsIdx)
+	defer d.mapsMu.NestedUnlock(mapsIdx)
 	if err := d.wrappedMappable.CopyMapping(ctx, ms, srcAR, dstAR, offset, writable); err != nil {
 		return err
 	}
@@ -486,14 +515,16 @@ func (d *dentry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR,
 
 // Translate implements memmap.Mappable.Translate.
 func (d *dentry) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
-	d.dataMu.RLock()
-	defer d.dataMu.RUnlock()
+	dataIdx := d.dataLockIndex()
+	d.dataMu.NestedRLock(dataIdx)
+	defer d.dataMu.NestedRUnlock(dataIdx)
 	return d.wrappedMappable.Translate(ctx, required, optional, at)
 }
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
-	d.mapsMu.Lock()
-	defer d.mapsMu.Unlock()
+	mapsIdx := d.mapsLockIndex()
+	d.mapsMu.NestedLock(mapsIdx)
+	defer d.mapsMu.NestedUnlock(mapsIdx)
 	return d.wrappedMappable.InvalidateUnsavable(ctx)
 }

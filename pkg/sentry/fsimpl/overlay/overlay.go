@@ -32,6 +32,9 @@
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
 // stabilize this relationship.
+//
+// Locks on an outer stacked overlay filesystem (higher stackDepth) precede
+// locks on an inner overlay filesystem (lower stackDepth).
 package overlay
 
 import (
@@ -161,6 +164,64 @@ type filesystem struct {
 	// unused holds the dentries without references. It is protected by
 	// renameMu. See dentry_cache_xplat.go.
 	unused dentryCache `state:"nosave"`
+
+	// stackDepth is the 1-based overlay stacking depth of this filesystem,
+	// analogous to Linux's super_block.s_stack_depth. stackDepth is immutable.
+	stackDepth int
+}
+
+func layerStackDepth(vd vfs.VirtualDentry) int {
+	if !vd.Ok() {
+		return 0
+	}
+	if ovlFS, ok := vd.Mount().Filesystem().Impl().(*filesystem); ok {
+		return ovlFS.stackDepth
+	}
+	return 0
+}
+
+func computeStackDepth(opts FilesystemOptions) int {
+	depth := layerStackDepth(opts.UpperRoot)
+	for _, lowerRoot := range opts.LowerRoots {
+		if d := layerStackDepth(lowerRoot); d > depth {
+			depth = d
+		}
+	}
+	return depth + 1
+}
+
+// maxLockdepStackDepth is the number of per-depth lockdep subclasses declared
+// for overlay locks, matching Linux's FILESYSTEM_MAX_STACK_DEPTH.
+const maxLockdepStackDepth = 2
+
+func (fs *filesystem) depthIndex() int {
+	// GetFilesystem does not restrict stackDepth; clamping keeps the slice
+	// index in bounds when stackDepth > maxLockdepStackDepth (with lockdep
+	// enabled, traversing from depth >= 3 into depth 2 will still trigger a
+	// nested-locking panic on subclass "d2"; without lockdep, this index is
+	// ignored).
+	if fs.stackDepth >= maxLockdepStackDepth {
+		return maxLockdepStackDepth - 1
+	}
+	return fs.stackDepth - 1
+}
+
+func (fs *filesystem) renameLockIndex() renamelockNameIndex {
+	return renamelockNameIndex(fs.depthIndex())
+}
+
+const dirLocksPerDepth = dirLockD2 - dirLockD1
+
+func (d *dentry) dirLockIndex(offset dirlockNameIndex) dirlockNameIndex {
+	return dirlockNameIndex(d.fs.depthIndex())*dirLocksPerDepth + offset
+}
+
+func (d *dentry) mapsLockIndex() mapslockNameIndex {
+	return mapslockNameIndex(d.fs.depthIndex())
+}
+
+func (d *dentry) dataLockIndex() datalockNameIndex {
+	return datalockNameIndex(d.fs.depthIndex())
 }
 
 // +stateify savable
@@ -195,6 +256,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		defer vfsroot.DecRef(ctx)
 	}
 
+	// Used to resolve relative pathnames in the options below; see resolveStart.
+	vfscwd := vfs.WorkingDirectoryFromContext(ctx)
+	if vfscwd.Ok() {
+		defer vfscwd.DecRef(ctx)
+	}
+
 	userXattrVal, userXattr := mopts["userxattr"]
 	if userXattr && userXattrVal != "" {
 		ctx.Infof("overlay.FilesystemType.GetFilesystem: userxattr option does not take a value but got %q", userXattrVal)
@@ -211,17 +278,22 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		// Linux overlayfs also requires a workdir when upperdir is
 		// specified; we don't, so silently ignore this option.
 		if workdir, ok := mopts["workdir"]; ok {
+			if len(workdir) == 0 {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir must not be empty")
+				return nil, nil, linuxerr.EINVAL
+			}
 			// Linux creates the "work" directory in `workdir`.
 			// Docker calls chown on it and fails if it doesn't
 			// exist.
 			workdirPath := fspath.Parse(workdir + "/work")
-			if !workdirPath.Absolute {
-				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir %q must be absolute", workdir)
-				return nil, nil, linuxerr.EINVAL
+			workdirStart, err := resolveStart(vfsroot, vfscwd, workdirPath)
+			if err != nil {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir %q is relative, but the mount has no working directory", workdir)
+				return nil, nil, err
 			}
 			pop := vfs.PathOperation{
 				Root:               vfsroot,
-				Start:              vfsroot,
+				Start:              workdirStart,
 				Path:               workdirPath,
 				FollowFinalSymlink: false,
 			}
@@ -233,14 +305,19 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			delete(mopts, "workdir")
 		}
-		upperPath := fspath.Parse(upperPathname)
-		if !upperPath.Absolute {
-			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
+		if len(upperPathname) == 0 {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir must not be empty")
 			return nil, nil, linuxerr.EINVAL
+		}
+		upperPath := fspath.Parse(upperPathname)
+		upperStart, err := resolveStart(vfsroot, vfscwd, upperPath)
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q is relative, but the mount has no working directory", upperPathname)
+			return nil, nil, err
 		}
 		upperRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
 			Root:               vfsroot,
-			Start:              vfsroot,
+			Start:              upperStart,
 			Path:               upperPath,
 			FollowFinalSymlink: true,
 		}, &vfs.GetDentryOptions{
@@ -287,14 +364,19 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		delete(mopts, "lowerdir")
 		lowerPathnames := strings.Split(lowerPathnamesStr, ":")
 		for _, lowerPathname := range lowerPathnames {
-			lowerPath := fspath.Parse(lowerPathname)
-			if !lowerPath.Absolute {
-				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir %q must be absolute", lowerPathname)
+			if len(lowerPathname) == 0 {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir must not contain an empty pathname")
 				return nil, nil, linuxerr.EINVAL
+			}
+			lowerPath := fspath.Parse(lowerPathname)
+			lowerStart, err := resolveStart(vfsroot, vfscwd, lowerPath)
+			if err != nil {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir %q is relative, but the mount has no working directory", lowerPathname)
+				return nil, nil, err
 			}
 			lowerRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
 				Root:               vfsroot,
-				Start:              vfsroot,
+				Start:              lowerStart,
 				Path:               lowerPath,
 				FollowFinalSymlink: true,
 			}, &vfs.GetDentryOptions{
@@ -366,6 +448,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
 		maxFilenameLen: linux.NAME_MAX,
+		stackDepth:     computeStackDepth(fsopts),
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -464,6 +547,24 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	rootCleanup.Release()
 	return &fs.vfsfs, &root.vfsd, nil
+}
+
+// resolveStart returns the VirtualDentry that path should be resolved from.
+// Linux resolves relative pathnames in overlayfs mount options against the
+// working directory of the mounting process. Mounts that do not originate from
+// a task have no working directory, in which case relative pathnames are
+// rejected rather than silently resolved against the root.
+//
+// Preconditions: No reference is taken on the returned VirtualDentry, so the
+// caller must keep vfsroot and vfscwd alive for as long as it uses the result.
+func resolveStart(vfsroot, vfscwd vfs.VirtualDentry, path fspath.Path) (vfs.VirtualDentry, error) {
+	if path.Absolute {
+		return vfsroot, nil
+	}
+	if !vfscwd.Ok() {
+		return vfs.VirtualDentry{}, linuxerr.EINVAL
+	}
+	return vfscwd, nil
 }
 
 // clonePrivateMount creates a non-recursive bind mount rooted at vd, not
@@ -757,9 +858,10 @@ func (d *dentry) DecRef(ctx context.Context) {
 		refs.LogDecRef(d, r)
 	}
 	if r == 0 {
-		d.fs.renameMu.Lock()
+		idx := d.fs.renameLockIndex()
+		d.fs.renameMu.NestedLock(idx)
 		d.checkDropLocked(ctx)
-		d.fs.renameMu.Unlock()
+		d.fs.renameMu.NestedUnlock(idx)
 	} else if r < 0 {
 		panic("overlay.dentry.DecRef() called without holding a reference")
 	}
@@ -830,11 +932,12 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.watches.HandleDeletion(ctx)
 
 	if parent := d.parent.Load(); parent != nil {
-		parent.dirMu.Lock()
+		dirIdx := parent.dirLockIndex(dirLockD1)
+		parent.dirMu.NestedLock(dirIdx)
 		if !d.vfsd.IsDead() {
 			delete(parent.children, d.name)
 		}
-		parent.dirMu.Unlock()
+		parent.dirMu.NestedUnlock(dirIdx)
 		// Drop the reference held by d on its parent without recursively
 		// locking d.fs.renameMu.
 		parent.decRefLocked(ctx)
@@ -911,9 +1014,10 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 		*ds = appendDentry(*ds, d)
 		return
 	}
-	d.fs.renameMu.Lock()
+	idx := d.fs.renameLockIndex()
+	d.fs.renameMu.NestedLock(idx)
 	d.checkDropLocked(ctx)
-	d.fs.renameMu.Unlock()
+	d.fs.renameMu.NestedUnlock(idx)
 }
 
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
@@ -1093,32 +1197,36 @@ func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOption
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.setXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.removeXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
 }
 
 // GetPosixACL implements vfs.FileDescriptionImpl.GetPosixACL.
 func (fd *fileDescription) GetPosixACL(ctx context.Context, t vfs.ACLType) (*vfs.PosixACL, error) {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.getPosixACLLocked(ctx, fd.dentry(), t)
 }
 
 // SetPosixACL implements vfs.FileDescriptionImpl.SetPosixACL.
 func (fd *fileDescription) SetPosixACL(ctx context.Context, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.setPosixACLLocked(ctx, fd.dentry(), auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), t, acl, clearSGID)
 }
 

@@ -94,7 +94,7 @@ func (limitMarshaler) marshal(mr matcher) []byte {
 
 // unmarshal implements matchMaker.unmarshal. It applies the checks of
 // limit_mt_check.
-func (limitMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (limitMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	// WHY: Linux requires the exact aligned size.
 	if len(buf) != limitInfoSize {
 		return nil, fmt.Errorf("limit: buf has size %d, want %d", len(buf), limitInfoSize)

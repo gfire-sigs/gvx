@@ -129,8 +129,10 @@ type Pipe struct {
 	// The number of active writers for this pipe.
 	writers atomicbitops.Int32
 
-	// The total number of writers for this pipe.
-	totalWriters atomicbitops.Int32
+	// writerGeneration advances on each writer open, like Linux's
+	// pipe_inode_info.w_counter in fs/pipe.c. wOpen holds mu so that FIFO
+	// readers in rOpen and rReadinessLocked see both writer counters together.
+	writerGeneration atomicbitops.Int32
 
 	// mu protects all pipe internal state below.
 	mu pipeMutex `state:"nosave"`
@@ -141,46 +143,48 @@ type Pipe struct {
 	// avoids needing to heap-allocate a new safemem.Block slice when buf is
 	// resized. bufBlockSeq is a safemem.BlockSeq representing bufBlocks.
 	//
-	// These fields are protected by mu.
-	buf         []byte
-	bufBlocks   [2]safemem.Block `state:"nosave"`
+	// +checklocks:mu
+	buf []byte
+	// +checklocks:mu
+	bufBlocks [2]safemem.Block `state:"nosave"`
+	// +checklocks:mu
 	bufBlockSeq safemem.BlockSeq `state:"nosave"`
-	off         int64
-	size        int64
+	// +checklocks:mu
+	off int64
+	// +checklocks:mu
+	size int64
 
 	// max is the maximum size of the pipe in bytes. When this max has been
 	// reached, writers will get EWOULDBLOCK.
 	//
-	// This is protected by mu.
+	// +checklocks:mu
 	max int64
-
-	// hadWriter indicates if this pipe ever had a writer. Note that this
-	// does not necessarily indicate there is *currently* a writer, just
-	// that there has been a writer at some point since the pipe was
-	// created.
-	//
-	// This is protected by mu.
-	hadWriter bool
 }
 
 // NewPipe initializes and returns a pipe.
 //
 // N.B. The size will be bounded.
 func NewPipe(isNamed bool, sizeBytes int64) *Pipe {
-	var p Pipe
-	initPipe(&p, isNamed, sizeBytes)
+	p := newPipe(isNamed, sizeBytes)
 	return &p
 }
 
-func initPipe(pipe *Pipe, isNamed bool, sizeBytes int64) {
-	if sizeBytes < MinimumPipeSize {
-		sizeBytes = MinimumPipeSize
+func newPipe(isNamed bool, sizeBytes int64) Pipe {
+	return Pipe{
+		isNamed:          isNamed,
+		writerGeneration: atomicbitops.FromInt32(initialWriterGeneration(isNamed)),
+		max:              min(max(sizeBytes, MinimumPipeSize), MaximumPipeSize),
 	}
-	if sizeBytes > MaximumPipeSize {
-		sizeBytes = MaximumPipeSize
+}
+
+// Linux starts a FIFO at generation 1, distinct from the zero stored by
+// readers that do not suppress hangups. An anonymous pipe reaches generation
+// 1 when ReaderWriterPair opens its initial writer.
+func initialWriterGeneration(isNamed bool) int32 {
+	if isNamed {
+		return 1
 	}
-	pipe.isNamed = isNamed
-	pipe.max = sizeBytes
+	return 0
 }
 
 // peekLocked passes the first count bytes in the pipe, starting at offset off,
@@ -193,22 +197,38 @@ func initPipe(pipe *Pipe, isNamed bool, sizeBytes int64) {
 // unlocked.)
 //
 // Preconditions:
-//   - p.mu must be locked.
 //   - This pipe must have readers.
 //   - off <= p.size.
+//
+// +checklocks:p.mu
 func (p *Pipe) peekLocked(off, count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
+	srcs, err := p.readableBlocksLocked(off, count)
+	if srcs.IsEmpty() {
+		return 0, err
+	}
+	n, err := f(srcs)
+	return int64(n), err
+}
+
+// readableBlocksLocked returns a view of up to count bytes starting at off.
+// The view is valid only while p.mu is held.
+//
+// Preconditions: as for peekLocked.
+//
+// +checklocks:p.mu
+func (p *Pipe) readableBlocksLocked(off, count int64) (safemem.BlockSeq, error) {
 	// Don't block for a zero-length read even if the pipe is empty.
 	if count == 0 {
-		return 0, nil
+		return safemem.BlockSeq{}, nil
 	}
 
 	// Limit the amount of data read to the amount of data in the pipe.
 	if rem := p.size - off; count > rem {
 		if rem == 0 {
 			if !p.HasWriters() {
-				return 0, io.EOF
+				return safemem.BlockSeq{}, io.EOF
 			}
-			return 0, linuxerr.ErrWouldBlock
+			return safemem.BlockSeq{}, linuxerr.ErrWouldBlock
 		}
 		count = rem
 	}
@@ -218,19 +238,16 @@ func (p *Pipe) peekLocked(off, count int64, f func(safemem.BlockSeq) (uint64, er
 	if max := int64(len(p.buf)); pipeOff >= max {
 		pipeOff -= max
 	}
-	bs := p.bufBlockSeq.DropFirst64(uint64(pipeOff)).TakeFirst64(uint64(count))
-
-	// Perform the read.
-	done, err := f(bs)
-	return int64(done), err
+	return p.bufBlockSeq.DropFirst64(uint64(pipeOff)).TakeFirst64(uint64(count)), nil
 }
 
 // consumeLocked consumes the first n bytes in the pipe, such that they will no
 // longer be visible to future reads.
 //
 // Preconditions:
-//   - p.mu must be locked.
 //   - The pipe must contain at least n bytes.
+//
+// +checklocks:p.mu
 func (p *Pipe) consumeLocked(n int64) {
 	p.off += n
 	if max := int64(len(p.buf)); p.off >= max {
@@ -251,8 +268,7 @@ func (p *Pipe) consumeLocked(n int64) {
 // accordingly. Callers are still responsible for calling
 // p.queue.Notify(waiter.ReadableEvents) with p.mu unlocked.
 //
-// Preconditions:
-//   - p.mu must be locked.
+// +checklocks:p.mu
 func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Can't write to a pipe with no readers.
 	if !p.HasReaders() {
@@ -295,9 +311,7 @@ func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)
 			p.bufBlockSeq.DropFirst64(uint64(p.off)).TakeFirst64(uint64(p.size)))
 		// Switch to the new buffer.
 		p.buf = newBuf
-		p.bufBlocks[0] = safemem.BlockFromSafeSlice(newBuf)
-		p.bufBlocks[1] = p.bufBlocks[0]
-		p.bufBlockSeq = safemem.BlockSeqFromSlice(p.bufBlocks[:])
+		p.rebuildBufferViews()
 		p.off = 0
 	}
 
@@ -324,21 +338,35 @@ func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)
 	return done, nil
 }
 
-// rOpen signals a new reader of the pipe.
-func (p *Pipe) rOpen() {
+// rebuildBufferViews reconnects the safemem views to the current buffer
+// after growth or checkpoint restore.
+//
+// +checklocks:p.mu
+func (p *Pipe) rebuildBufferViews() {
+	p.bufBlocks[0] = safemem.BlockFromSafeSlice(p.buf)
+	p.bufBlocks[1] = p.bufBlocks[0]
+	p.bufBlockSeq = safemem.BlockSeqFromSlice(p.bufBlocks[:])
+}
+
+// rOpen registers a reader and reports the writer generation and whether a
+// writer was present. A FIFO reader uses that snapshot to distinguish a
+// writer that closed before registration from one that closed afterward.
+func (p *Pipe) rOpen() (generation int32, hasWriter bool) {
+	defer p.queue.Notify(waiter.EventInternal)
+	if p.isNamed {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+	}
 	p.readers.Add(1)
 	p.totalReaders.Add(1)
-
-	// Notify for blocking openers.
-	p.queue.Notify(waiter.EventInternal)
+	return p.writerGeneration.Load(), p.HasWriters()
 }
 
 // wOpen signals a new writer of the pipe.
 func (p *Pipe) wOpen() {
 	p.mu.Lock()
-	p.hadWriter = true
 	p.writers.Add(1)
-	p.totalWriters.Add(1)
+	p.writerGeneration.Add(1)
 	p.mu.Unlock()
 
 	// Notify for blocking openers.
@@ -371,17 +399,13 @@ func (p *Pipe) HasWriters() bool {
 
 // rReadinessLocked calculates the read readiness.
 //
-// Precondition: mu must be held.
-func (p *Pipe) rReadinessLocked() waiter.EventMask {
+// +checklocks:p.mu
+func (p *Pipe) rReadinessLocked(initialWriters int32) waiter.EventMask {
 	ready := waiter.EventMask(0)
 	if p.HasReaders() && p.size != 0 {
 		ready |= waiter.ReadableEvents
 	}
-	if !p.HasWriters() && p.hadWriter {
-		// POLLHUP must be suppressed until the pipe has had at least one writer
-		// at some point. Otherwise a reader thread may poll and immediately get
-		// a POLLHUP before the writer ever opens the pipe, which the reader may
-		// interpret as the writer opening then closing the pipe.
+	if !p.HasWriters() && p.writerGeneration.Load() != initialWriters {
 		ready |= waiter.EventHUp
 	}
 	return ready
@@ -389,15 +413,15 @@ func (p *Pipe) rReadinessLocked() waiter.EventMask {
 
 // rReadiness returns a mask that states whether the read end of the pipe is
 // ready for reading.
-func (p *Pipe) rReadiness() waiter.EventMask {
+func (p *Pipe) rReadiness(initialWriters int32) waiter.EventMask {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.rReadinessLocked()
+	return p.rReadinessLocked(initialWriters)
 }
 
 // wReadinessLocked calculates the write readiness.
 //
-// Precondition: mu must be held.
+// +checklocks:p.mu
 func (p *Pipe) wReadinessLocked() waiter.EventMask {
 	ready := waiter.EventMask(0)
 	if p.HasWriters() && p.size < p.max {
@@ -422,7 +446,7 @@ func (p *Pipe) wReadiness() waiter.EventMask {
 func (p *Pipe) rwReadiness() waiter.EventMask {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.rReadinessLocked() | p.wReadinessLocked()
+	return p.rReadinessLocked(initialWriterGeneration(p.isNamed)) | p.wReadinessLocked()
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -443,6 +467,7 @@ func (p *Pipe) queued() int64 {
 	return p.queuedLocked()
 }
 
+// +checklocks:p.mu
 func (p *Pipe) queuedLocked() int64 {
 	return p.size
 }

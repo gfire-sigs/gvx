@@ -280,7 +280,7 @@ func TestAddrtypeMarshalRoundTrip(t *testing.T) {
 				filter = stack.EmptyFilter6()
 			}
 			// parseMatchers is the production path that tries the highest revision first.
-			parsed, err := parseMatchers(nil, filter, marshalMatcher(&m))
+			parsed, err := parseMatchers(nil, nil, filter, marshalMatcher(&m))
 			if err != nil {
 				t.Fatalf("parseMatchers: %v", err)
 			}
@@ -305,7 +305,7 @@ func TestAddrtypeUnmarshalKernelLayout(t *testing.T) {
 		0x01, 0x00, 0x00, 0x00, // invert_dest
 		0x00, 0x00, 0x00, 0x00, // alignment padding
 	}
-	m, err := addrtypeMarshaler{rev: 0}.unmarshal(nil, rev0, stack.EmptyFilter4())
+	m, err := addrtypeMarshaler{rev: 0}.unmarshal(nil, nil, rev0, stack.EmptyFilter4())
 	if err != nil {
 		t.Fatalf("rev0 unmarshal: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestAddrtypeUnmarshalKernelLayout(t *testing.T) {
 		0x04, 0x00, // dest = LOCAL
 		0x06, 0x00, 0x00, 0x00, // flags = INVERT_DEST | LIMIT_IFACE_IN
 	}
-	m, err = addrtypeMarshaler{rev: 1}.unmarshal(nil, rev1, stack.EmptyFilter4())
+	m, err = addrtypeMarshaler{rev: 1}.unmarshal(nil, nil, rev1, stack.EmptyFilter4())
 	if err != nil {
 		t.Fatalf("rev1 unmarshal: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestAddrtypeUnmarshalRejects(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := (addrtypeMarshaler{rev: tc.rev}).unmarshal(nil, tc.buf, tc.filter); err == nil {
+			if _, err := (addrtypeMarshaler{rev: tc.rev}).unmarshal(nil, nil, tc.buf, tc.filter); err == nil {
 				t.Errorf("unmarshal succeeded, want an error")
 			}
 		})

@@ -1274,13 +1274,20 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 		}
 
 		info := linux.TCPInfo{
-			State:       uint8(v.State),
-			RTO:         uint32(v.RTO / time.Microsecond),
-			RTT:         uint32(v.RTT / time.Microsecond),
-			RTTVar:      uint32(v.RTTVar / time.Microsecond),
-			SndSsthresh: v.SndSsthresh,
-			SndCwnd:     v.SndCwnd,
-			SndMss:      v.SndMss,
+			State:        uint8(v.State),
+			RTO:          uint32(v.RTO / time.Microsecond),
+			RTT:          uint32(v.RTT / time.Microsecond),
+			RTTVar:       uint32(v.RTTVar / time.Microsecond),
+			SndSsthresh:  v.SndSsthresh,
+			SndCwnd:      v.SndCwnd,
+			SndMss:       v.SndMss,
+			TotalRetrans: v.TotalRetrans,
+		}
+		if v.Timestamps {
+			info.Options |= linux.TCPI_OPT_TIMESTAMPS
+		}
+		if v.SACKPermitted {
+			info.Options |= linux.TCPI_OPT_SACK
 		}
 		switch v.CcState {
 		case tcpip.RTORecovery:
@@ -3804,6 +3811,9 @@ func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	}
 	if f.Loopback {
 		rv |= linux.IFF_LOOPBACK
+	}
+	if f.Multicast {
+		rv |= linux.IFF_MULTICAST
 	}
 	return rv
 }

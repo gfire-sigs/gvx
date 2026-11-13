@@ -107,7 +107,7 @@ func (rm recentMarshaler) marshal(mr matcher) []byte {
 	return buf
 }
 
-func (rm recentMarshaler) unmarshal(_ IDMapper, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
+func (rm recentMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, _ stack.IPHeaderFilter) (stack.Matcher, error) {
 	size := recentInfoSize(rm.rev)
 	if want := bitsutil.AlignUp(size, 8); len(buf) != want {
 		return nil, fmt.Errorf("recent: buf has size %d, want %d", len(buf), want)

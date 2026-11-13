@@ -27,7 +27,6 @@ import (
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
-	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
@@ -428,8 +427,8 @@ func (s *Stack) checkGatewayXplat(msg *nlmsg.Message, route *tcpip.Route) *syser
 
 // addPrefixRoute inserts the main-table subnet route for a new interface
 // address and emits a kernel route event.
-func (s *Stack) addPrefixRoute(ctx context.Context, protocolAddress tcpip.ProtocolAddress, nicID tcpip.NICID) {
-	localRoute := prefixRoute(protocolAddress.AddressWithPrefix.Subnet(), nicID)
+func (s *Stack) addPrefixRoute(ctx context.Context, addr tcpip.AddressWithPrefix, nicID tcpip.NICID) {
+	localRoute := prefixRoute(addr.Subnet(), nicID)
 
 	sameDst := false
 	for _, rt := range s.Stack.GetRouteTable() {
@@ -443,7 +442,7 @@ func (s *Stack) addPrefixRoute(ctx context.Context, protocolAddress tcpip.Protoc
 
 	s.Stack.AddRoute(localRoute)
 	var reqFlags uint16
-	if protocolAddress.Protocol == ipv4.ProtocolNumber {
+	if addr.Address.Len() == header.IPv4AddressSize {
 		reqFlags = linux.NLM_F_APPEND
 	}
 	s.sendRouteEvent(inet.WithNetlinkOrigin(ctx, inet.NetlinkOrigin{}), localRoute, true /* added */, newRouteFlags(localRoute, sameDst, reqFlags))

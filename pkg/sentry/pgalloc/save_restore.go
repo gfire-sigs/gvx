@@ -27,6 +27,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	"z.gfire.dev/gvx/internal/xsys/unix"
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/bitmap"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -587,14 +588,31 @@ type hostFileDataSeeker struct {
 	cur  memmap.FileRange
 }
 
-// newHostFileDataSeeker returns nil for disk-backed files, since filesystems
-// such as FUSE may answer SEEK_DATA without accounting for dirty page cache
-// pages.
+// newHostFileDataSeeker returns nil if f's backing file may be on a filesystem
+// whose SEEK_DATA does not report dirty page cache pages.
 func (f *MemoryFile) newHostFileDataSeeker() *hostFileDataSeeker {
-	if f.opts.DiskBackedFile {
+	if f.opts.DiskBackedFile && !f.seekDataReportsDirtyPages() {
 		return nil
 	}
 	return &hostFileDataSeeker{f: f, fd: f.FD(), size: f.TotalSize()}
+}
+
+// seekDataReportsDirtyPages reports whether SEEK_DATA on f's backing file
+// reports dirty page cache pages. This is an allowlist: FUSE forwards SEEK_DATA
+// to its server, which has not seen pages that are not written back, and
+// fstatfs on overlayfs does not identify the filesystem that answers SEEK_DATA.
+func (f *MemoryFile) seekDataReportsDirtyPages() bool {
+	var statfs unix.Statfs_t
+	if err := unix.Fstatfs(f.FD(), &statfs); err != nil {
+		log.Warningf("MemoryFile(%p): fstatfs failed, scanning all possibly committed pages: %v", f, err)
+		return false
+	}
+	switch statfs.Type {
+	case linux.TMPFS_MAGIC, linux.EXT_SUPER_MAGIC, linux.XFS_SUPER_MAGIC, linux.BTRFS_SUPER_MAGIC:
+		return true
+	default:
+		return false
+	}
 }
 
 // dataAtOrAfter returns the first page-aligned data range at or after off, or
@@ -1801,6 +1819,31 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 }
 
 func (apfl *AsyncPagesFileLoad) main() {
+	maxParallel := apfl.ar.MaxParallel()
+	// Storage reused between main loop iterations:
+	var completions []stateio.Completion
+	var wakeups []*aplWaiter
+	var decRefs []aplFileRange
+
+	// DecRef can enter cancelWasteLoad and take mu. Drop these references
+	// only after releasing both loader locks.
+	collectRefs := func(op *aplOp) {
+		if op.tempRef {
+			for _, fr := range op.frs {
+				decRefs = append(decRefs, aplFileRange{op.amfl, fr})
+			}
+		}
+	}
+	finishCompletions := func() {
+		for _, w := range wakeups {
+			w.wakeup.Notify(1)
+		}
+		wakeups = wakeups[:0]
+		for _, fr := range decRefs {
+			fr.amfl.f.DecRef(fr.FileRange)
+		}
+		decRefs = decRefs[:0]
+	}
 	defer func() {
 		// Close ar first since this synchronously stops inflight I/O.
 		if err := apfl.ar.Close(); err != nil {
@@ -1835,26 +1878,21 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
+		// Once Close has stopped the reads and their ranges are no longer
+		// marked started, references held by unfinished reads can be dropped.
+		if apfl.err() != nil {
+			apfl.opsBusy.ForEach(0, uint32(len(apfl.ops)), func(id uint32) bool {
+				collectRefs(&apfl.ops[id])
+				return true
+			})
+		}
+		// A failed batch can also contain earlier successful reads whose
+		// waiters have already been removed from unloaded.
+		finishCompletions()
 		if apfl.doneCallback != nil {
 			apfl.doneCallback(apfl.err())
 		}
 	}()
-
-	maxParallel := apfl.ar.MaxParallel()
-	// Storage reused between main loop iterations:
-	var completions []stateio.Completion
-	var wakeups []*aplWaiter
-	var decRefs []aplFileRange
-
-	dropDelayedDecRefs := func() {
-		if len(decRefs) != 0 {
-			for _, fr := range decRefs {
-				fr.amfl.f.DecRef(fr.FileRange)
-			}
-			decRefs = decRefs[:0]
-		}
-	}
-	defer dropDelayedDecRefs()
 
 	// Don't start timing until we have pages to load.
 	apfl.lfStatus.Wait()
@@ -2055,15 +2093,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			op := &apfl.ops[c.ID]
 			apfl.opsBusy.Remove(uint32(c.ID))
 			apfl.qavail++
-			if op.tempRef {
-				// Delay f.DecRef(fr) until after dropping locks. This is
-				// required to avoid lock recursion via dropping the last
-				// reference => asyncMemoryFileLoad.cancelWasteLoad() =>
-				// apfl.mu.Lock().
-				for _, fr := range op.frs {
-					decRefs = append(decRefs, aplFileRange{op.amfl, fr})
-				}
-			}
+			collectRefs(op)
 			if c.N != op.total {
 				log.Warningf("Async page loading failed: read for MemoryFile(%p) pages %v (total %d bytes) returned %d bytes, error: %v", op.amfl.f, op.frs, op.total, c.N, c.Err)
 				apfl.errVal.Store(linuxerr.EIO)
@@ -2130,11 +2160,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
-		for _, w := range wakeups {
-			w.wakeup.Notify(1)
-		}
-		wakeups = wakeups[:0]
-		dropDelayedDecRefs()
+		finishCompletions()
 	}
 }
 
