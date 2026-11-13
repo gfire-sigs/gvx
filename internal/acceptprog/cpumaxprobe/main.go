@@ -220,11 +220,24 @@ type stat struct {
 }
 
 func readStat(dir string) (stat, error) {
-	data, err := os.ReadFile(dir + "/cpu.stat")
-	if err != nil {
-		return stat{}, err
+	var (
+		data []byte
+		err  error
+		at   time.Time
+	)
+	for attempt := range 5 {
+		t0 := time.Now()
+		data, err = os.ReadFile(dir + "/cpu.stat")
+		t1 := time.Now()
+		if err != nil {
+			return stat{}, err
+		}
+		at = t0.Add(t1.Sub(t0) / 2)
+		if t1.Sub(t0) <= 20*time.Millisecond || attempt == 4 {
+			break
+		}
 	}
-	s := stat{at: time.Now()}
+	s := stat{at: at}
 	fields := map[string]*uint64{
 		"usage_usec": &s.usageUSec, "nr_periods": &s.nrPeriods,
 		"nr_throttled": &s.nrThrottled, "throttled_usec": &s.throttledUSec,
