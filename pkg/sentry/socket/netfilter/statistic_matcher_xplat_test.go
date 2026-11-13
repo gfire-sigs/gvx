@@ -67,7 +67,7 @@ func nthInfo(every, packet uint32, flags uint16) statisticInfo {
 // parseStatistic runs the production parse path over info.
 func parseStatistic(t *testing.T, info statisticInfo) stack.Matcher {
 	t.Helper()
-	parsed, err := parseMatchers(nil, stack.EmptyFilter4(), statisticEntry(info))
+	parsed, err := parseMatchers(nil, nil, stack.EmptyFilter4(), statisticEntry(info))
 	if err != nil {
 		t.Fatalf("parseMatchers: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestStatisticUnmarshalKernelLayout(t *testing.T) {
 		0x01, 0x00, 0x00, 0x00, // count
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // master
 	}
-	m, err := statisticMarshaler{}.unmarshal(nil, data, stack.EmptyFilter4())
+	m, err := statisticMarshaler{}.unmarshal(nil, nil, data, stack.EmptyFilter4())
 	if err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestStatisticUnmarshalKernelLayout(t *testing.T) {
 }
 
 func TestStatisticAppliesToIPv6Rules(t *testing.T) {
-	parsed, err := parseMatchers(nil, stack.EmptyFilter6(), statisticEntry(nthInfo(2, 0, 0)))
+	parsed, err := parseMatchers(nil, nil, stack.EmptyFilter6(), statisticEntry(nthInfo(2, 0, 0)))
 	if err != nil {
 		t.Fatalf("parseMatchers for IPv6: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestStatisticUnmarshalRejects(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := (statisticMarshaler{}).unmarshal(nil, tc.buf, stack.EmptyFilter4()); err == nil {
+			if _, err := (statisticMarshaler{}).unmarshal(nil, nil, tc.buf, stack.EmptyFilter4()); err == nil {
 				t.Errorf("unmarshal succeeded, want an error")
 			}
 		})

@@ -31,7 +31,7 @@ import (
 //
 // +checklocksread:b.mu
 func (b *BridgeEndpoint) needsLearningLocked(src tcpip.LinkAddress, from *bridgePort) bool {
-	if header.IsMulticastEthernetAddress(src) {
+	if header.IsMulticastEthernetAddress(src) || b.isLocalAddressLocked(src) || b.ports[from.nic.id] != from {
 		return false
 	}
 	entry, ok := b.fdbTable[BridgeFDBKey(src)]
@@ -40,13 +40,13 @@ func (b *BridgeEndpoint) needsLearningLocked(src tcpip.LinkAddress, from *bridge
 
 // forwardTargetsLocked returns the ports that receive a frame with destination
 // address dst from port from. A frame for the bridge address or for the address
-// of the receiving port goes up to the IP layer only. A known unicast address
+// of any port goes up to the IP layer only. A known unicast address
 // has the port of its FDB entry, unless that port is from. Any other frame goes
 // to every port except from.
 //
 // +checklocksread:b.mu
 func (b *BridgeEndpoint) forwardTargetsLocked(from *bridgePort, dst tcpip.LinkAddress) []*bridgePort {
-	if dst == b.addr || dst == from.nic.LinkAddress() {
+	if b.isLocalAddressLocked(dst) {
 		return nil
 	}
 	if entry, ok := b.fdbTable[BridgeFDBKey(dst)]; ok && !header.IsMulticastEthernetAddress(dst) {

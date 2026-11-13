@@ -219,7 +219,7 @@ func TestLimitUnmarshalRejects(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseMatchers(nil, stack.EmptyFilter4(), tc.entry); err == nil {
+			if _, err := parseMatchers(nil, nil, stack.EmptyFilter4(), tc.entry); err == nil {
 				t.Errorf("parseMatchers accepted the match")
 			}
 		})

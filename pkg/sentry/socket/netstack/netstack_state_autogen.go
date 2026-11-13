@@ -89,6 +89,7 @@ func (s *Stack) StateFields() []string {
 		"offloads",
 		"rpFilter",
 		"linkConf",
+		"ipv6KeepAddrOnDown",
 	}
 }
 
@@ -105,6 +106,7 @@ func (s *Stack) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(4, &s.offloads)
 	stateSinkObject.Save(5, &s.rpFilter)
 	stateSinkObject.Save(6, &s.linkConf)
+	stateSinkObject.Save(7, &s.ipv6KeepAddrOnDown)
 	stateSinkObject.SaveValue(0, StackValue)
 }
 
@@ -116,6 +118,7 @@ func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &s.offloads)
 	stateSourceObject.Load(5, &s.rpFilter)
 	stateSourceObject.Load(6, &s.linkConf)
+	stateSourceObject.Load(7, &s.ipv6KeepAddrOnDown)
 	stateSourceObject.LoadValueTo(0, (**stack.Stack)(nil), s)
 	stateSourceObject.AfterLoadTo(s)
 }

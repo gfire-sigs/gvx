@@ -471,8 +471,8 @@ func (e *Endpoint) StateFields() []string {
 		"boundBindToDevice",
 		"boundPortFlags",
 		"boundDest",
-		"boundWildcard",
-		"boundNetworks",
+		"boundAddr",
+		"boundNetProtos",
 		"effectiveNetProtos",
 		"recentTSTime",
 		"shutdownFlags",
@@ -505,7 +505,6 @@ func (e *Endpoint) StateFields() []string {
 		"ops",
 		"lastOutOfWindowAckTime",
 		"pmtud",
-		"alsoBindToV4",
 		"terminateAtRestore",
 	}
 }
@@ -539,8 +538,8 @@ func (e *Endpoint) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(22, &e.boundBindToDevice)
 	stateSinkObject.Save(23, &e.boundPortFlags)
 	stateSinkObject.Save(24, &e.boundDest)
-	stateSinkObject.SaveBool(25, &e.boundWildcard)
-	stateSinkObject.Save(26, &e.boundNetworks)
+	stateSinkObject.Save(25, &e.boundAddr)
+	stateSinkObject.Save(26, &e.boundNetProtos)
 	stateSinkObject.Save(27, &e.effectiveNetProtos)
 	stateSinkObject.Save(28, &e.recentTSTime)
 	stateSinkObject.Save(29, &e.shutdownFlags)
@@ -573,8 +572,7 @@ func (e *Endpoint) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(56, &e.ops)
 	stateSinkObject.Save(57, &e.lastOutOfWindowAckTime)
 	stateSinkObject.Save(58, &e.pmtud)
-	stateSinkObject.SaveBool(59, &e.alsoBindToV4)
-	stateSinkObject.SaveBool(60, &e.terminateAtRestore)
+	stateSinkObject.SaveBool(59, &e.terminateAtRestore)
 	stateSinkObject.SaveValue(12, stateValue)
 }
 
@@ -604,8 +602,8 @@ func (e *Endpoint) StateLoad(ctx context.Context, stateSourceObject state.Source
 	stateSourceObject.Load(22, &e.boundBindToDevice)
 	stateSourceObject.Load(23, &e.boundPortFlags)
 	stateSourceObject.Load(24, &e.boundDest)
-	stateSourceObject.LoadBool(25, &e.boundWildcard)
-	stateSourceObject.Load(26, &e.boundNetworks)
+	stateSourceObject.Load(25, &e.boundAddr)
+	stateSourceObject.Load(26, &e.boundNetProtos)
 	stateSourceObject.Load(27, &e.effectiveNetProtos)
 	stateSourceObject.Load(28, &e.recentTSTime)
 	stateSourceObject.Load(29, &e.shutdownFlags)
@@ -638,8 +636,7 @@ func (e *Endpoint) StateLoad(ctx context.Context, stateSourceObject state.Source
 	stateSourceObject.Load(56, &e.ops)
 	stateSourceObject.Load(57, &e.lastOutOfWindowAckTime)
 	stateSourceObject.Load(58, &e.pmtud)
-	stateSourceObject.LoadBool(59, &e.alsoBindToV4)
-	stateSourceObject.LoadBool(60, &e.terminateAtRestore)
+	stateSourceObject.LoadBool(59, &e.terminateAtRestore)
 	stateSourceObject.LoadValueTo(12, (*EndpointState)(nil), e)
 	stateSourceObject.AfterLoadTo(e)
 }

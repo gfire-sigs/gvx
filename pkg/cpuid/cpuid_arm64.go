@@ -107,7 +107,14 @@ func (fs FeatureSet) CPUFreqMHz() float64 {
 func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, freqMHz float64, w io.Writer) {
 	fmt.Fprintf(w, "processor\t: %d\n", cpu)
 	fmt.Fprintf(w, "BogoMIPS\t: %.02f\n", freqMHz) // It's bogus anyway.
-	fmt.Fprintf(w, "Features\t\t: %s\n", fs.FlagString())
+	// List only the features that apps are given in AT_HWCAP and AT_HWCAP2,
+	// as Linux derives both from the same elf_hwcap.
+	allowed := fs
+	allowed.hwCap = hwCap{
+		hwCap1: fs.AllowedHWCap1(),
+		hwCap2: fs.AllowedHWCap2(),
+	}
+	fmt.Fprintf(w, "Features\t\t: %s\n", allowed.FlagString())
 	fmt.Fprintf(w, "CPU implementer\t: 0x%x\n", fs.cpuImplHex)
 	fmt.Fprintf(w, "CPU architecture\t: %d\n", fs.cpuArchDec)
 	fmt.Fprintf(w, "CPU variant\t: 0x%x\n", fs.cpuVarHex)
@@ -115,6 +122,8 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, freqMHz float64, w io.Writ
 	fmt.Fprintf(w, "CPU revision\t: %d\n", fs.cpuRevDec)
 	fmt.Fprintf(w, "\n") // The /proc/cpuinfo file ends with an extra newline.
 }
+
+var archIgnoredFeatures []Feature
 
 // archCheckHostCompatible is a noop on arm64.
 func (FeatureSet) archCheckHostCompatible(FeatureSet) error {
@@ -158,10 +167,16 @@ func (fs FeatureSet) AllowedHWCap1() uint64 {
 // AllowedHWCap2 returns the HWCAP2 bits that the guest is allowed to depend
 // on.
 func (fs FeatureSet) AllowedHWCap2() uint64 {
-	// We don't expose anything here yet, but this could be expanded to
-	// include features do not rely on cpu state that is not restored after
-	// a context switch.
-	allowed := 0
+	// Pick a set of safe HWCAP2s to expose. Their instructions keep no state
+	// outside the general-purpose and FP/SIMD registers and the flags, which
+	// gvisor restores after a context switch. SVE and MTE are not safe: they
+	// have registers or tags of their own.
+	allowed := HWCAP2_BF16 |
+		HWCAP2_DCPODP |
+		HWCAP2_DGH |
+		HWCAP2_FLAGM2 |
+		HWCAP2_FRINT |
+		HWCAP2_I8MM
 	return fs.hwCap.hwCap2 & uint64(allowed)
 }
 

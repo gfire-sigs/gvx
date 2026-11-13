@@ -410,6 +410,8 @@ func (e *Endpoint) reserveTupleLocked() bool {
 
 	e.isPortReserved = true
 	e.boundDest = dest
+	e.boundAddr = e.TransportEndpointInfo.ID.LocalAddress
+	e.boundNetProtos = e.effectiveNetProtos
 	return true
 }
 
@@ -520,11 +522,14 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			e.acceptMu.Lock()
 			defer e.acceptMu.Unlock()
 
-			// The capacity of the accepted queue would always be one greater than the
-			// listen backlog. But, the SYNRCVD connections count is always checked
-			// against the listen backlog value for Linux parity reason.
+			// The syscall layer adds one to the listen backlog for the accept queue.
+			// Use the listen backlog (capacity-1) as the pending handshake limit to
+			// match Linux.
 			// https://github.com/torvalds/linux/blob/7acac4b3196/include/net/inet_connection_sock.h#L280
-			if len(e.acceptQueue.pendingEndpoints) == e.acceptQueue.capacity-1 {
+			//
+			// Listen may shrink the capacity without removing pending handshakes,
+			// so use SYN cookies when the pending count is at or above the limit.
+			if len(e.acceptQueue.pendingEndpoints) >= e.acceptQueue.capacity-1 {
 				return true, nil
 			}
 
@@ -589,11 +594,10 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			df:        e.pmtud == tcpip.PMTUDiscoveryWant || e.pmtud == tcpip.PMTUDiscoveryDo || e.pmtud == tcpip.PMTUDiscoveryProbe,
 			expOptVal: e.getExperimentOptionValue(route),
 		}
-		if err := e.sendSynTCP(route, fields, synOpts); err != nil {
-			return err
-		}
+		// Linux counts a SYN cookie when it is generated, even if output fails.
+		// https://github.com/torvalds/linux/blob/adc218676/include/net/tcp.h#L2308-L2316
 		e.stack.Stats().TCP.ListenOverflowSynCookieSent.Increment()
-		return nil
+		return e.sendSynTCP(route, fields, synOpts)
 
 	case s.flags.Contains(header.TCPFlagAck):
 		iss := s.ackNumber - 1

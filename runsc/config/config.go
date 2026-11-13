@@ -107,6 +107,10 @@ type Config struct {
 	// DO NOT call it directly, use GetOverlay2() instead.
 	Overlay2 Overlay2 `flag:"overlay2"`
 
+	// TarTimestampResolution is the resolution of modification times in tar
+	// archives of overlay upper layers and filesystem checkpoints.
+	TarTimestampResolution TarTimestampResolution `flag:"tar-timestamp-resolution"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
@@ -181,6 +185,11 @@ type Config struct {
 
 	// PCAP is a file to which network packets should be logged in PCAP format.
 	PCAP string `flag:"pcap-log"`
+
+	// Netgofer controls whether and how netgofer is used for networking via UDS.
+	// Note: It is experimental and currently only proxies outbound TCP and UDP
+	// traffic. Active connections cannot be preserved across save/restore.
+	Netgofer NetgoferMode `flag:"netgofer"`
 
 	// NetworkProxyPath, if set, is the path of an external UDS that the
 	// sentry attaches its primary network interface to instead of creating
@@ -529,7 +538,7 @@ type Config struct {
 // UseNetworkProxy reports whether the primary sandbox network interface should
 // be attached to a unix domain socket instead of AF_PACKET socket.
 func (c *Config) UseNetworkProxy() bool {
-	return c.NetworkProxyPath != ""
+	return c.Netgofer.Enabled() || c.NetworkProxyPath != ""
 }
 
 // platformDevicePaths is the parsed value of --platform_device_path.
@@ -580,8 +589,8 @@ func (c *Config) PlatformDeviceFor(platform string) string {
 
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
-// Config.Override does not validate, so callers must call Validate once they
-// are done overriding.
+// Config.Override and Config.ApplyBundles do not validate, so callers must call
+// Validate once they are done overriding.
 func (c *Config) Validate() error {
 	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
 	if err != nil {
@@ -604,7 +613,7 @@ func (c *Config) Validate() error {
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
-	if c.UseNetworkProxy() {
+	if c.NetworkProxyPath != "" {
 		if !filepath.IsAbs(c.NetworkProxyPath) {
 			return fmt.Errorf("network-proxy-path must be an absolute path, got %q", c.NetworkProxyPath)
 		}
@@ -613,6 +622,17 @@ func (c *Config) Validate() error {
 		}
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("network-proxy-path flag is incompatible with XDP")
+		}
+	}
+	if c.Netgofer.Enabled() {
+		if c.NetworkProxyPath != "" {
+			return fmt.Errorf("netgofer and network-proxy-path flags cannot both be set")
+		}
+		if c.Network != NetworkSandbox {
+			return fmt.Errorf("netgofer flag is only supported with sandbox networking")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("netgofer flag is incompatible with XDP")
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -1288,6 +1308,52 @@ func (n InodeNumbers) String() string {
 	default:
 		panic(fmt.Sprintf("Invalid inode numbers mode %d", n))
 	}
+}
+
+// TarTimestampResolution is the resolution of modification times in tar
+// archives of sandbox filesystems.
+type TarTimestampResolution int
+
+const (
+	// TarTimestampSeconds rounds modification times to whole seconds.
+	TarTimestampSeconds TarTimestampResolution = iota
+
+	// TarTimestampNanoseconds keeps nanosecond modification times. Each tar
+	// entry gets a PAX extended header, which adds about 1 KiB per entry.
+	TarTimestampNanoseconds
+)
+
+func tarTimestampResolutionPtr(v TarTimestampResolution) *TarTimestampResolution {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (r *TarTimestampResolution) Set(v string) error {
+	switch v {
+	case "seconds":
+		*r = TarTimestampSeconds
+	case "nanoseconds":
+		*r = TarTimestampNanoseconds
+	default:
+		return fmt.Errorf("invalid tar timestamp resolution %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (r *TarTimestampResolution) Get() any {
+	return *r
+}
+
+// String implements flag.Value.
+func (r TarTimestampResolution) String() string {
+	switch r {
+	case TarTimestampSeconds:
+		return "seconds"
+	case TarTimestampNanoseconds:
+		return "nanoseconds"
+	}
+	panic(fmt.Sprintf("Invalid tar timestamp resolution %d", r))
 }
 
 // OverlayMedium describes how overlay medium is configured.
@@ -1982,4 +2048,69 @@ func (p StateEnginePolicy) String() string {
 	default:
 		panic(fmt.Sprintf("invalid state engine policy %d", p))
 	}
+}
+
+// NetgoferMode specifies whether and how the netgofer UDS proxy is used.
+type NetgoferMode int
+
+const (
+	// NetgoferModeOff disables the netgofer UDS proxy.
+	NetgoferModeOff NetgoferMode = iota
+
+	// NetgoferModeProxy runs netgofer in user-space Netstack TCP/UDP proxy mode.
+	NetgoferModeProxy
+
+	// NetgoferModeProxyLoopback runs netgofer in user-space Netstack TCP/UDP proxy
+	// mode and allows loopback traffic (e.g. Docker Compose embedded DNS at
+	// 127.0.0.11:53 or local host resolvers) over the UDS proxy link.
+	NetgoferModeProxyLoopback
+)
+
+// Enabled reports whether UDS proxy networking is enabled.
+func (n NetgoferMode) Enabled() bool {
+	return n != NetgoferModeOff
+}
+
+// Ptr returns a pointer to n.
+func (n NetgoferMode) Ptr() *NetgoferMode {
+	return &n
+}
+
+// AllowLoopback reports whether loopback traffic is allowed over the UDS proxy.
+func (n NetgoferMode) AllowLoopback() bool {
+	return n == NetgoferModeProxyLoopback
+}
+
+// Get implements flag.Getter.
+func (n *NetgoferMode) Get() any {
+	return *n
+}
+
+// String implements flag.Getter.
+func (n NetgoferMode) String() string {
+	switch n {
+	case NetgoferModeOff:
+		return "off"
+	case NetgoferModeProxy:
+		return "proxy"
+	case NetgoferModeProxyLoopback:
+		return "proxy-loopback"
+	default:
+		panic(fmt.Sprintf("invalid netgofer mode %d", n))
+	}
+}
+
+// Set implements flag.Getter. Set(String()) should be idempotent.
+func (n *NetgoferMode) Set(v string) error {
+	switch v {
+	case "", "off":
+		*n = NetgoferModeOff
+	case "proxy":
+		*n = NetgoferModeProxy
+	case "proxy-loopback":
+		*n = NetgoferModeProxyLoopback
+	default:
+		return fmt.Errorf("invalid netgofer mode %q (must be one of: off, proxy, proxy-loopback)", v)
+	}
+	return nil
 }

@@ -330,16 +330,16 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 	payloadPos := respMetaSize
 	if err := c.server.withRenameReadLock(func() error {
 		curDir := startDir
+		// newFDs holds the IDs of the FDs created by this walk.
+		newFDs := make([]FDID, 0, len(req.Path))
 		cu := cleanup.Make(func() {
-			// Destroy all newly created FDs until now. Read the new FDIDs from the
-			// payload buffer.
-			buf := comm.PayloadBuf(uint32(maxPayloadSize))[respMetaSize:]
-			var curIno Inode
-			for i := 0; i < int(numInodes); i++ {
-				buf = curIno.UnmarshalBytes(buf)
+			// Destroy all newly created FDs until now. Do not read their IDs back
+			// from the payload buffer, because the client can modify it at any
+			// time.
+			for _, id := range newFDs {
 				// Cleanup runs before withRenameReadLock releases the mutex;
 				// checklocks cannot propagate it into these passed callbacks.
-				c.removeControlFDLocked(curIno.ControlFD) // +checklocksignore
+				c.removeControlFDLocked(id) // +checklocksignore
 			}
 		})
 		defer cu.Clean()
@@ -371,6 +371,7 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 			if err != nil {
 				return err
 			}
+			newFDs = append(newFDs, child.id)
 			// Write inode into payload buffer.
 			i := Inode{ControlFD: child.id, Stat: childStat}
 			i.MarshalUnsafe(payloadBuf[payloadPos:])
@@ -1362,8 +1363,12 @@ func UnlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 
 		fd.node.childrenMu.Lock()
 		childNode := fd.node.LookupChildLocked(name)
+		if childNode != nil {
+			childNode.IncRef()
+		}
 		fd.node.childrenMu.Unlock()
 		if childNode != nil {
+			defer childNode.DecRef(nil)
 			// Before we do the unlink itself, we need to ensure that there
 			// are no operations in flight on associated path node.
 			//
@@ -1375,14 +1380,16 @@ func UnlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		if err := fd.impl.Unlink(name, uint32(req.Flags)); err != nil {
 			return err
 		}
-		// Since fd.node.opMu is locked for writing, there will not be a concurrent
-		// creation of a node at that position if childNode == nil. So only remove
-		// node if one existed.
+		fd.node.childrenMu.Lock()
+		removed := fd.node.removeChildLocked(name)
+		fd.node.childrenMu.Unlock()
 		if childNode != nil {
-			fd.node.childrenMu.Lock()
-			fd.node.removeChildLocked(name)
-			fd.node.childrenMu.Unlock()
 			childNode.markDeletedRecursive()
+		}
+		if removed != nil && removed != childNode {
+			removed.opMu.Lock()
+			removed.markDeletedRecursive()
+			removed.opMu.Unlock()
 		}
 		return nil
 	})

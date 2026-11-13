@@ -129,6 +129,7 @@ func (s *Stack) StateFields() []string {
 		"tcpSACKEnabled",
 		"portRange",
 		"allowRawSockets",
+		"ipv6KeepAddrOnDown",
 	}
 }
 
@@ -144,6 +145,7 @@ func (s *Stack) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveBool(4, &s.tcpSACKEnabled)
 	stateSinkObject.Save(5, &s.portRange)
 	stateSinkObject.SaveBool(6, &s.allowRawSockets)
+	stateSinkObject.SaveBool(7, &s.ipv6KeepAddrOnDown)
 }
 
 func (s *Stack) afterLoad(context.Context) {}
@@ -157,6 +159,7 @@ func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.LoadBool(4, &s.tcpSACKEnabled)
 	stateSourceObject.Load(5, &s.portRange)
 	stateSourceObject.LoadBool(6, &s.allowRawSockets)
+	stateSourceObject.LoadBool(7, &s.ipv6KeepAddrOnDown)
 }
 
 func init() {

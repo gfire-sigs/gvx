@@ -73,6 +73,7 @@ type FDBasedLink struct {
 	Name              string
 	InterfaceIndex    int
 	MTU               int
+	Multicast         bool
 	Addresses         []IPWithPrefix
 	Routes            []Route
 	GSOMaxSize        uint32
@@ -125,6 +126,7 @@ type XDPLink struct {
 	Name              string
 	InterfaceIndex    int
 	MTU               int
+	Multicast         bool
 	Addresses         []IPWithPrefix
 	Routes            []Route
 	TXChecksumOffload bool
@@ -145,6 +147,7 @@ type XDPLink struct {
 // LoopbackLink configures a loopback link.
 type LoopbackLink struct {
 	Name      string
+	Multicast bool
 	Addresses []IPWithPrefix
 	Routes    []Route
 	GVisorGRO bool
@@ -184,6 +187,11 @@ type CreateLinksAndRoutesArgs struct {
 	// AllowConnectedOnSave indicates whether connections should be allowed to
 	// remain connected during save.
 	AllowConnectedOnSave bool
+
+	// AllowExternalLoopbackTraffic indicates whether IPv4 loopback packets
+	// (e.g. replies from 127.0.0.11 over a UDS proxy link) should be accepted on
+	// the UDS proxy link.
+	AllowExternalLoopbackTraffic bool
 
 	// IsRestore indicates whether this is part of a restore flow.
 	IsRestore bool

@@ -81,7 +81,7 @@ func (m icmpMarshaler) marshal(mr matcher) []byte {
 
 // unmarshal implements matchMaker.unmarshal. It applies the checks of
 // xt_check_match and of icmp_checkentry.
-func (m icmpMarshaler) unmarshal(_ IDMapper, buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error) {
+func (m icmpMarshaler) unmarshal(_ IDMapper, _ *stack.Stack, buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error) {
 	// WHY: Linux requires the exact aligned size.
 	if want := bits.AlignUp(icmpInfoSize, 8); len(buf) != want {
 		return nil, fmt.Errorf("%s: buf has size %d, want %d", m.name(), len(buf), want)

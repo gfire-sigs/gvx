@@ -20,6 +20,7 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/seccomp"
+	"z.gfire.dev/gvx/pkg/seccomp/precompiledseccomp"
 	"z.gfire.dev/gvx/pkg/tcpip/link/fdbased"
 )
 
@@ -42,13 +43,26 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.EqualTo(0),
 	},
-	unix.SYS_EVENTFD2: seccomp.PerArg{
-		seccomp.EqualTo(0),
+	// eventfd2(2) must create an empty counter, with one of these flag values:
+	// 0 or EFD_NONBLOCK from gVisor code, or EFD_CLOEXEC|EFD_NONBLOCK from the
+	// Go runtime network poller.
+	unix.SYS_EVENTFD2: seccomp.Or{
+		seccomp.PerArg{
+			seccomp.EqualTo(0), /* initval */
+			seccomp.EqualTo(0), /* flags */
+		},
+		seccomp.PerArg{
+			seccomp.EqualTo(0),                 /* initval */
+			seccomp.EqualTo(unix.EFD_NONBLOCK), /* flags */
+		},
+		seccomp.PerArg{
+			seccomp.EqualTo(0), /* initval */
+			seccomp.EqualTo(unix.EFD_CLOEXEC | unix.EFD_NONBLOCK), /* flags */
+		},
 	},
 	unix.SYS_EXIT:       seccomp.MatchAll{},
 	unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
 	unix.SYS_FALLOCATE:  seccomp.MatchAll{},
-	unix.SYS_FCHMOD:     seccomp.MatchAll{},
 	unix.SYS_FCNTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.AnyValue{},
@@ -178,11 +192,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(linux.TIOCGWINSZ),
 			seccomp.AnyValue{}, /* winsize struct */
 		},
-		seccomp.PerArg{
-			seccomp.NonNegativeFD{}, /* fd */
-			seccomp.EqualTo(linux.SIOCGIFTXQLEN),
-			seccomp.AnyValue{}, /* ifreq struct */
-		},
 	},
 	unix.SYS_IO_SETUP:     seccomp.MatchAll{},
 	unix.SYS_IO_DESTROY:   seccomp.MatchAll{},
@@ -263,10 +272,8 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 	},
 	unix.SYS_PREAD64:  seccomp.MatchAll{},
-	unix.SYS_PREADV:   seccomp.MatchAll{},
 	unix.SYS_PREADV2:  seccomp.MatchAll{},
 	unix.SYS_PWRITE64: seccomp.MatchAll{},
-	unix.SYS_PWRITEV:  seccomp.MatchAll{},
 	unix.SYS_PWRITEV2: seccomp.MatchAll{},
 	unix.SYS_READ:     seccomp.MatchAll{},
 	unix.SYS_READV:    seccomp.MatchAll{}, // Used by TAP/TUN fdbased links.
@@ -319,7 +326,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.MaskedEqual(unix.AT_EMPTY_PATH, unix.AT_EMPTY_PATH),
 	},
-	unix.SYS_SYNC_FILE_RANGE: seccomp.MatchAll{},
 	unix.SYS_TEE: seccomp.PerArg{
 		seccomp.AnyValue{},
 		seccomp.AnyValue{},
@@ -380,7 +386,10 @@ func selfPIDFilters(pid uint64) seccomp.SyscallRules {
 }
 
 // hostFilesystemFilters contains syscalls that are needed by directfs.
-func hostFilesystemFilters() seccomp.SyscallRules {
+func hostFilesystemFilters(vars precompiledseccomp.Values) seccomp.SyscallRules {
+	// procSelfFD is the directory FD through which directfs reopens host FDs
+	// by following their magic links (see gofer.SetProcSelfFD).
+	procSelfFD := vars[procSelfFDVarName]
 	// Directfs allows FD-based filesystem syscalls. We deny these syscalls with
 	// negative FD values (like AT_FDCWD or invalid FD numbers). We try to be as
 	// restrictive as possible because any restriction here improves security. We
@@ -392,6 +401,10 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW),
+		},
+		unix.SYS_FCHMOD: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
 		},
 		unix.SYS_FCHMODAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
@@ -408,29 +421,49 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
-		unix.SYS_OPENAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-			seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
-			seccomp.AnyValue{},
+		unix.SYS_OPENAT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
+				seccomp.AnyValue{},
+			},
+			// Magic links must be followed to reopen host FDs; nothing is
+			// created through them.
+			seccomp.PerArg{
+				seccomp.EqualTo(procSelfFD),
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.O_CREAT|(unix.O_TMPFILE&^unix.O_DIRECTORY), 0),
+				seccomp.AnyValue{},
+			},
 		},
 		unix.SYS_LINKAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(procSelfFD),
 			seccomp.AnyValue{},
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
-			seccomp.EqualTo(0),
+			seccomp.EqualTo(unix.AT_SYMLINK_FOLLOW),
 		},
 		unix.SYS_MKDIRAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
-		unix.SYS_MKNODAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-			seccomp.AnyValue{},
-			seccomp.AnyValue{},
+		// Allow creating only regular files and (0, 0) character device
+		// whiteouts.
+		unix.SYS_MKNODAT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.S_IFMT, unix.S_IFREG),
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.MaskedEqual(unix.S_IFMT, unix.S_IFCHR),
+				seccomp.EqualTo(0),
+			},
 		},
 		unix.SYS_SYMLINKAT: seccomp.PerArg{
 			seccomp.AnyValue{},

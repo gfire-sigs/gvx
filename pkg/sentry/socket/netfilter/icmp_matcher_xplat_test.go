@@ -224,7 +224,7 @@ func TestICMPUnmarshalRejects(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseMatchers(nil, tc.filter, tc.entry); err == nil {
+			if _, err := parseMatchers(nil, nil, tc.filter, tc.entry); err == nil {
 				t.Errorf("parseMatchers accepted the match")
 			}
 		})

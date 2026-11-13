@@ -745,6 +745,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		// If a mount is being overlaid, it should not be limited by the default
 		// tmpfs size limit.
 		DisableDefaultSizeLimit: true,
+		TarNanosecondTimestamps: conf.TarTimestampResolution == config.TarTimestampNanoseconds,
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
@@ -1060,9 +1061,12 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 	// Find filesystem name and FS specific data field.
 	switch m.mount.Type {
 	case devpts.Name:
-		// /dev/ptmx is a symlink to pts/ptmx, so make ptmx usable by everyone, as
-		// container runtimes do. Linux and devpts default ptmxmode to 0000.
-		data = []string{"ptmxmode=0666"}
+		// Each container gets its own devpts instance, as with container
+		// runtimes, so that ptys and consoles of one container are not
+		// visible in other containers. /dev/ptmx is a symlink to pts/ptmx,
+		// so make ptmx usable by everyone, as container runtimes do. Linux
+		// and devpts default ptmxmode to 0000.
+		data = []string{"newinstance", "ptmxmode=0666"}
 
 	case dev.Name, devtmpfs.Name, cgroup2fs.Name:
 		// Nothing to do.
@@ -1100,6 +1104,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 				// If a mount is being overlaid with tmpfs, it should not be limited by
 				// the default tmpfs size limit.
 				DisableDefaultSizeLimit: true,
+				TarNanosecondTimestamps: conf.TarTimestampResolution == config.TarTimestampNanoseconds,
 			}
 			sourceTar, err := fsr.tmpfsSourceTar(resourceID, containerID)
 			if err != nil {
@@ -1222,8 +1227,7 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 	}
 	loaded := pagesMetadataReader != nil
 	mfOpts := pgalloc.MemoryFileOpts{
-		// Private memory files are usually backed by files on disk. Ideally we
-		// would confirm with fstatfs(2) but that is prohibited by seccomp.
+		// Private memory files are usually backed by files on disk.
 		DiskBackedFile: true,
 		// Disk backed files need to be decommited on destroy to release disk space.
 		DecommitOnDestroy: true,
@@ -1276,9 +1280,10 @@ func (c *containerMounter) mountTmp(ctx context.Context, spec *specs.Spec, conf 
 	root := mns.Root(ctx)
 	defer root.DecRef(ctx)
 	pop := vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("/tmp"),
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse("/tmp"),
+		FollowFinalSymlink: true,
 	}
 	fd, err := c.l.k.VFS().OpenAt(ctx, creds, &pop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
 	switch {

@@ -73,7 +73,7 @@ func (c *fakeClock) read() time.Duration { return c.now }
 // parseRecent parses info and binds it to the lists of reg.
 func parseRecent(t *testing.T, reg *recentRegistry, info recentInfo) *RecentMatcher {
 	t.Helper()
-	parsed, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(info))
+	parsed, err := parseMatchers(nil, nil, stack.EmptyFilter4(), recentEntryBuf(info))
 	if err != nil {
 		t.Fatalf("parseMatchers(%+v): %v", info, err)
 	}
@@ -244,7 +244,7 @@ func TestRecentListGoesAwayWhenItsRulesAreReplaced(t *testing.T) {
 	stk := stack.New(stack.Options{})
 	t.Cleanup(stk.Destroy)
 	parse := func(info recentInfo) *RecentMatcher {
-		parsed, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(info))
+		parsed, err := parseMatchers(nil, nil, stack.EmptyFilter4(), recentEntryBuf(info))
 		if err != nil {
 			t.Fatalf("parseMatchers: %v", err)
 		}
@@ -276,7 +276,7 @@ func TestRecentListGoesAwayWhenItsRulesAreReplaced(t *testing.T) {
 
 	other := stack.New(stack.Options{})
 	t.Cleanup(other.Destroy)
-	parsed, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(recentInfo{rev: 1, checkSet: recentCheck, name: "life"}))
+	parsed, err := parseMatchers(nil, nil, stack.EmptyFilter4(), recentEntryBuf(recentInfo{rev: 1, checkSet: recentCheck, name: "life"}))
 	if err != nil {
 		t.Fatalf("parseMatchers: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestRecentRejectsInvalidRules(t *testing.T) {
 		{"unknown flag", recentInfo{rev: 1, checkSet: recentSet | 0x40, name: "x"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(tc.info)); err == nil {
+			if _, err := parseMatchers(nil, nil, stack.EmptyFilter4(), recentEntryBuf(tc.info)); err == nil {
 				t.Errorf("parseMatchers(%+v) succeeded, want an error", tc.info)
 			}
 		})
@@ -311,7 +311,7 @@ func TestRecentRejectsInvalidRules(t *testing.T) {
 func TestRecentMarshalReturnsTheRule(t *testing.T) {
 	for _, rev := range []uint8{recentRevision0, recentRevision1} {
 		info := recentInfo{rev: rev, checkSet: recentCheck | recentReap, seconds: 10800, name: "KUBE-SEP-ABC"}
-		parsed, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(info))
+		parsed, err := parseMatchers(nil, nil, stack.EmptyFilter4(), recentEntryBuf(info))
 		if err != nil {
 			t.Fatalf("revision %d: parseMatchers: %v", rev, err)
 		}
@@ -521,7 +521,7 @@ func TestRecentModuleIsSharedByTheStacksOfAKernel(t *testing.T) {
 	if err := RecentModuleOf(parent).SetListTot(2); err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := parseMatchers(nil, stack.EmptyFilter4(), recentEntryBuf(recentInfo{rev: 1, checkSet: recentSet, name: "shared"}))
+	parsed, err := parseMatchers(nil, nil, stack.EmptyFilter4(), recentEntryBuf(recentInfo{rev: 1, checkSet: recentSet, name: "shared"}))
 	if err != nil {
 		t.Fatal(err)
 	}

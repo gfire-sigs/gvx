@@ -136,7 +136,7 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 		nicids[link.Name] = nicID
 
 		var linkEP stack.LinkEndpoint
-		linkEP = ethernet.New(loopback.New())
+		linkEP = ethernet.NewWithNetworkMTU(loopback.New())
 		if args.LogPackets {
 			linkEP = sniffer.New(linkEP)
 		}
@@ -144,6 +144,7 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 		log.Infof("Enabling loopback interface %q with id %d on addresses %+v", link.Name, nicID, link.Addresses)
 		opts := stack.NICOptions{
 			Name:               link.Name,
+			Multicast:          link.Multicast,
 			DeliverLinkPackets: true,
 		}
 		if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
@@ -244,9 +245,11 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 
 			log.Infof("Enabling interface %q with id %d on addresses %+v (%v) w/ %d channels", link.Name, nicID, link.Addresses, mac, link.NumChannels)
 			opts := stack.NICOptions{
-				Name:               link.Name,
-				QDisc:              qDisc,
-				DeliverLinkPackets: true,
+				Name:                             link.Name,
+				Multicast:                        link.Multicast,
+				QDisc:                            qDisc,
+				DeliverLinkPackets:               true,
+				AllowExternalIPv4LoopbackTraffic: link.IsProxy && args.AllowExternalLoopbackTraffic,
 			}
 			if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
 				return err
@@ -346,6 +349,7 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 		log.Infof("Enabling interface %q with id %d on addresses %+v (%v) w/ %d channels", link.Name, nicID, link.Addresses, mac, link.NumChannels)
 		opts := stack.NICOptions{
 			Name:               link.Name,
+			Multicast:          link.Multicast,
 			QDisc:              qDisc,
 			DeliverLinkPackets: true,
 		}

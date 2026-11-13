@@ -760,6 +760,7 @@ func Ppoll(fds []PollFd, timeout *Timespec, sigmask *Sigset_t) (int, error) { re
 func EpollCreate1(flag int) (int, error)                             { return -1, ENOSYS }
 func EpollCtl(epfd int, op int, fd int, event *EpollEvent) error     { return ENOSYS }
 func EpollWait(epfd int, events []EpollEvent, msec int) (int, error) { return 0, ENOSYS }
+func Eventfd(initval uint, flags int) (int, error)                   { return -1, ENOSYS }
 
 func Getrlimit(resource int, rlim *Rlimit) error                                     { return ENOSYS }
 func Setrlimit(resource int, rlim *Rlimit) error                                     { return ENOSYS }

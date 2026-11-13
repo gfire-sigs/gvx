@@ -17,6 +17,8 @@ package netstack
 import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/sentry/inet"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netlink/nlmsg"
 	"z.gfire.dev/gvx/pkg/syserr"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -46,6 +48,41 @@ func adminKind(kind string) (LinkKind, bool) {
 	return k, ok && k.AdminState
 }
 
+// setAdminKindUp brings the registered link id up or down without emitting a
+// netlink notification. The first result is false when the link does not use a
+// registered kind with AdminState.
+func (s *Stack) setAdminKindUp(id tcpip.NICID, up bool) (bool, *syserr.Error) {
+	info, ok := s.Stack.SingleNICInfo(id)
+	if !ok {
+		return true, syserr.ErrUnknownNICID
+	}
+	if _, ok := adminKind(info.Kind); !ok {
+		return false, nil
+	}
+	l, ok := s.Stack.GetLinkEndpointByName(info.Name).(LinkStateListener)
+	if !ok {
+		return true, syserr.ErrNotSupported
+	}
+	if info.Flags.Running == up {
+		return true, nil
+	}
+	if up {
+		if err := l.LinkUp(); err != nil {
+			return true, syserr.TranslateNetstackError(err)
+		}
+		if err := s.Stack.EnableNIC(id); err != nil {
+			l.LinkDown()
+			return true, syserr.TranslateNetstackError(err)
+		}
+	} else {
+		if err := s.Stack.DisableNIC(id); err != nil {
+			return true, syserr.TranslateNetstackError(err)
+		}
+		l.LinkDown()
+	}
+	return true, nil
+}
+
 // setLinkAdminState brings the registered link id up or down, as the flag
 // IFF_UP of "ip link set" does. It does nothing for a link without an
 // administrative state, which is always up. The caller holds the link mutex of
@@ -55,32 +92,28 @@ func (s *Stack) setLinkAdminState(ctx context.Context, id tcpip.NICID, up bool) 
 	if !ok {
 		return syserr.ErrUnknownNICID
 	}
-	if _, ok := adminKind(info.Kind); !ok {
-		return nil
+	wasRunning := info.Flags.Running
+	handled, err := s.setAdminKindUp(id, up)
+	if err != nil {
+		return err
 	}
-	l, ok := s.Stack.GetLinkEndpointByName(info.Name).(LinkStateListener)
-	if !ok {
-		return syserr.ErrNotSupported
+	if handled && wasRunning != up {
+		s.sendChangeEvent(ctx, id)
 	}
-	if info.Flags.Running == up {
-		return nil
-	}
-	if up {
-		if err := l.LinkUp(); err != nil {
-			return syserr.TranslateNetstackError(err)
-		}
-		if err := s.Stack.EnableNIC(id); err != nil {
-			l.LinkDown()
-			return syserr.TranslateNetstackError(err)
-		}
-	} else {
-		if err := s.Stack.DisableNIC(id); err != nil {
-			return syserr.TranslateNetstackError(err)
-		}
-		l.LinkDown()
-	}
-	s.sendChangeEvent(ctx, id)
 	return nil
+}
+
+// setLinkLockedState is setLinkLocked with an administrative state that it
+// applies after every other change, as do_setlink does.
+func (s *Stack) setLinkLockedState(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView, dstNs *inet.Namespace, state linkState) *syserr.Error {
+	var flags, change uint32
+	if state.change {
+		change = linux.IFF_UP
+		if state.up {
+			flags = linux.IFF_UP
+		}
+	}
+	return s.setLinkLocked(ctx, id, linkAttrs, flags, change, dstNs)
 }
 
 // disableMovedLink disables the NIC that SetNICStack created for a link that

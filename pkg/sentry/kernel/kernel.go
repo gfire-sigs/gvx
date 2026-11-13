@@ -54,6 +54,7 @@ import (
 	"z.gfire.dev/gvx/pkg/fdnotifier"
 	"z.gfire.dev/gvx/pkg/fspath"
 	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/rand"
 	"z.gfire.dev/gvx/pkg/refs"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/checkpoint"
@@ -306,6 +307,12 @@ type Kernel struct {
 	//
 	// +checkatomic
 	uniqueID atomicbitops.Uint64
+
+	bootIDMu sync.Mutex `state:"nosave"`
+	// bootID is generated on first use and saved across checkpoints.
+	//
+	// +checklocks:bootIDMu
+	bootID string
 
 	// nextInotifyCookie is a monotonically increasing counter used for
 	// generating unique inotify event cookies.
@@ -1260,6 +1267,16 @@ func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, async
 	}
 
 	return nil
+}
+
+// BootID returns the UUID shared by this kernel's proc mounts.
+func (k *Kernel) BootID() string {
+	k.bootIDMu.Lock()
+	defer k.bootIDMu.Unlock()
+	if k.bootID == "" {
+		k.bootID = rand.UUID()
+	}
+	return k.bootID
 }
 
 // UniqueID returns a unique identifier.

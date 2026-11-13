@@ -180,7 +180,7 @@ func (s *Stack) newRegisteredLink(ctx context.Context, kind string, up bool, lin
 			return err
 		}
 	}
-	if err := s.setLinkLocked(ctx, id, linkAttrs, dstNs); err != nil {
+	if err := s.setLinkLocked(ctx, id, linkAttrs, 0 /* flags */, 0 /* change */, dstNs); err != nil {
 		s.Stack.RemoveNIC(id)
 		return err
 	}

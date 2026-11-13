@@ -325,6 +325,10 @@ func Fdatasync(fd int) error {
 	return Fsync(fd)
 }
 
+func Eventfd(initval uint, flags int) (fd int, err error) {
+	return -1, ENOSYS
+}
+
 // fpunchhole mirrors struct fpunchhole from <sys/fcntl.h>.
 type fpunchhole struct {
 	Flags    uint32

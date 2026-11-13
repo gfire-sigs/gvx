@@ -23,7 +23,6 @@ import (
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/link/stopfd"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
-	"z.gfire.dev/gvx/pkg/tcpip/stack/gro"
 )
 
 // BufConfig defines the shape of the buffer used to read packets from the NIC.
@@ -236,9 +235,6 @@ type recvMMsgDispatcher struct {
 	// pkts is reused to avoid allocations.
 	pkts stack.PacketBufferList
 
-	// gro coalesces incoming packets to increase throughput.
-	gro gro.GRO
-
 	// mgr is the processor goroutine manager.
 	mgr *processorManager
 }
@@ -265,7 +261,6 @@ func newRecvMMsgDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, 
 	for i := range d.bufs {
 		d.bufs[i] = newIovecBuffer(BufConfig, skipsVnetHdr)
 	}
-	d.gro.Init(opts.GRO)
 	d.mgr = newProcessorManager(opts, e)
 	d.mgr.start()
 
@@ -310,10 +305,8 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 
 	d.e.mu.RLock()
 	addr := d.e.addr
-	dsp := d.e.dispatcher
 	d.e.mu.RUnlock()
 
-	d.gro.Dispatcher = dsp
 	defer d.pkts.Reset()
 
 	for k := 0; k < nMsgs; k++ {

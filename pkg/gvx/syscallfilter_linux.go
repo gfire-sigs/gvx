@@ -47,8 +47,10 @@ func (s *Sandbox) syscallFilter() func() error {
 			Platform:       s.plat.SeccompInfo(),
 			HostNetwork:    s.cfg.NetworkMode == NetModeNAT,
 			HostFilesystem: s.usesHostDirs(),
-			// gvx has no control server. No descriptor has this number.
+			// gvx has no control server and opens no /proc/self/fd directory. No
+			// descriptor has this number.
 			ControllerFD: math.MaxUint32,
+			ProcSelfFD:   math.MaxUint32,
 			// The C library of a cgo build creates threads with clone3 or with
 			// its own clone flags.
 			CgoEnabled: cgoBuild,
@@ -175,6 +177,15 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.SizeofOpenHow),
+		})
+		// hostfs creates hard links relative to pinned directory descriptors
+		// with flags=0; runsc's filter allows linkat only for procSelfFD.
+		rules.Add(unix.SYS_LINKAT, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(0),
 		})
 	}
 	if volumes {

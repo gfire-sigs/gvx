@@ -142,7 +142,7 @@ func (s setMatchSpec) entry() []byte {
 
 func parseSetMatch(t *testing.T, filter stack.IPHeaderFilter, spec setMatchSpec) *SetMatcher {
 	t.Helper()
-	parsed, err := parseMatchers(nil, filter, spec.entry())
+	parsed, err := parseMatchers(nil, nil, filter, spec.entry())
 	if err != nil {
 		t.Fatalf("parseMatchers(%+v): %v", spec, err)
 	}
@@ -301,11 +301,11 @@ func TestSetMatchRejectsWrongSize(t *testing.T) {
 		data := make([]byte, size)
 		bad := marshalEntryMatch(matcherNameSet, data)
 		bad[revisionOffset] = 4
-		if _, err := parseMatchers(nil, stack.EmptyFilter4(), bad); err == nil {
+		if _, err := parseMatchers(nil, nil, stack.EmptyFilter4(), bad); err == nil {
 			t.Errorf("parseMatchers accepted match data of %d bytes", size)
 		}
 	}
-	if _, err := parseMatchers(nil, stack.EmptyFilter4(), buf); err != nil {
+	if _, err := parseMatchers(nil, nil, stack.EmptyFilter4(), buf); err != nil {
 		t.Errorf("parseMatchers rejected a valid revision 4 match: %v", err)
 	}
 }

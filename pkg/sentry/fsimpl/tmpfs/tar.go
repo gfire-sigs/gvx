@@ -34,13 +34,24 @@ import (
 
 // tarRead creates the corresponding dentry and its children from the given
 // snapshot tar file.
+//
+// On success, tarRead also reads the rest of src, so that a pipe writer
+// doesn't get EPIPE when src is closed.
 func (fs *filesystem) tarRead(ctx context.Context, src io.Reader, cb tarReaderCallbacks) error {
 	tr := tar.NewReader(src)
 
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	err := fs.readFromTar(ctx, tr, cb)
+	fs.mu.Unlock()
+	if err != nil {
+		return err
+	}
 
-	return fs.readFromTar(ctx, tr, cb)
+	// Discard record padding or other data after the end-of-archive marker.
+	if _, err := io.Copy(io.Discard, src); err != nil {
+		return fmt.Errorf("failed to read past the end of the tar archive: %w", err)
+	}
+	return nil
 }
 
 // readFromTar creates the corresponding dentry and its children from the given
@@ -367,6 +378,16 @@ func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string,
 	if d.name != "" {
 		path = path + "/" + d.name
 	}
+	// A regular file's header records its size before its contents are
+	// copied. Hold inode.mu across both so that concurrent writes and
+	// truncates cannot change the size in between. A hard link entry has no
+	// size and no contents, so it does not need inode.mu.
+	if rf, ok := d.inode.impl.(*regularFile); ok {
+		if _, isLink := inoToPath[d.inode.ino]; !isLink {
+			rf.inode.mu.Lock()
+			defer rf.inode.mu.Unlock()
+		}
+	}
 	header, err := d.createTarHeader(path, inoToPath, cb)
 	if err != nil {
 		return fmt.Errorf("failed to create tar header for %q: %w", path, err)
@@ -400,6 +421,12 @@ func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string,
 	return nil
 }
 
+// tarOctalFieldLimit bounds the mode and device numbers that a PAX header can
+// hold. Tar stores them in seven octal digits, and PAX has no extended records
+// for them. Headers with larger values (e.g. from imported GNU archives) use
+// automatic format selection, which rounds timestamps to seconds.
+const tarOctalFieldLimit = 1 << 21
+
 // createTarHeader creates a tar header for the given dentry.
 func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb tarWriterCallbacks) (*tar.Header, error) {
 	if d.isSelfFilestoreWhiteout() {
@@ -413,6 +440,9 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 		Uid:     int(d.inode.uid.Load()),
 		Gid:     int(d.inode.gid.Load()),
 		ModTime: time.Unix(0, d.inode.mtime.Load()),
+	}
+	if d.inode.fs.tarNanosecondTimestamps && header.Mode < tarOctalFieldLimit {
+		header.Format = tar.FormatPAX
 	}
 	// Hard link: Check if the inode has already been written to the tar archive.
 	if existingPath, ok := inoToPath[d.inode.ino]; ok {
@@ -441,6 +471,9 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 		}
 		header.Devmajor = int64(impl.major)
 		header.Devminor = int64(impl.minor)
+		if header.Devmajor >= tarOctalFieldLimit || header.Devminor >= tarOctalFieldLimit {
+			header.Format = tar.FormatUnknown
+		}
 	case *socketFile:
 		// This is consistent with the behavior of tar(1).
 		log.Warningf("Skipping socket file %q while generating tar archive", path)
@@ -482,6 +515,8 @@ func (d *dentry) createTarHeader(path string, inoToPath map[uint64]string, cb ta
 	return header, nil
 }
 
+// tarWriterCallbacks customizes how regular files are written to the tar
+// archive. Callers hold rf.inode.mu across both calls for a given file.
 type tarWriterCallbacks interface {
 	// regularFileSize returns the size of the given regular file as written to
 	// the tar archive.
@@ -495,15 +530,15 @@ type tarWriterCallbacks interface {
 // file contents to the tar archive.
 type tarDefaultWriterCallbacks struct{}
 
+// +checklocks:rf.inode.mu
 func (tarDefaultWriterCallbacks) regularFileSize(rf *regularFile) int64 {
 	return int64(rf.size.Load())
 }
 
+// +checklocks:rf.inode.mu
 func (tarDefaultWriterCallbacks) regularFileWrite(ctx context.Context, rf *regularFile, tw *tar.Writer) error {
-	// Note that regularFileReadWriter.ReadToBlocks() does not lock inode.mu. So
-	// it is safe to lock here to ensure no concurrent writes occur.
-	rf.inode.mu.Lock()
-	defer rf.inode.mu.Unlock()
+	// regularFileReadWriter.ReadToBlocks() does not lock inode.mu, so it can
+	// run while inode.mu is held.
 	rw := getRegularFileReadWriter(rf, 0, 0)
 	defer putRegularFileReadWriter(rw)
 	if _, err := io.Copy(tw, safemem.ToIOReader{Reader: rw}); err != nil {

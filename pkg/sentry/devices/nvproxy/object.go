@@ -159,13 +159,6 @@ func (nvp *nvproxy) objDup(ctx context.Context, clientDst, clientSrc *rootClient
 	}
 	oDst := &miscObject{}
 	nvp.objAdd(ctx, clientDst, dstH, oSrc.class, oDst, parentDstH)
-	parentSrc := clientSrc.getObject(ctx, oSrc.parent)
-	// Copy all non-parent dependencies.
-	for dep := range oSrc.deps {
-		if dep != parentSrc {
-			objDep(oDst.Object(), dep)
-		}
-	}
 }
 
 // getClientWithLock returns the rootClient with the given handle.
@@ -410,6 +403,9 @@ func (c *rootClient) getObject(ctx context.Context, h nvgpu.Handle) *object {
 type osDescMem struct {
 	object
 	appMirror
+
+	// pinnedWritable records whether the backing pages were pinned for writing.
+	pinnedWritable bool
 }
 
 // Release implements objectImpl.Release.

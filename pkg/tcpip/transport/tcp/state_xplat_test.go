@@ -72,9 +72,12 @@ func TestEndpointBoundWildcardStateRoundTrip(t *testing.T) {
 		}
 
 		orig := rawEP.(*Endpoint)
-		wantNetworks := slices.Clone(orig.reservedNetworks())
-		if !orig.boundWildcard || len(wantNetworks) != 2 {
-			t.Fatalf("before save: boundWildcard=%v reservedNetworks=%v, want true and 2 networks", orig.boundWildcard, wantNetworks)
+		orig.mu.Lock()
+		gotOrigAddr := orig.boundAddr
+		wantNetworks := slices.Clone(orig.boundNetProtos)
+		orig.mu.Unlock()
+		if gotOrigAddr != (tcpip.Address{}) || len(wantNetworks) != 2 {
+			t.Fatalf("before save: boundAddr=%s boundNetProtos=%v, want empty address and 2 networks", gotOrigAddr, wantNetworks)
 		}
 
 		s.Pause()
@@ -99,17 +102,17 @@ func TestEndpointBoundWildcardStateRoundTrip(t *testing.T) {
 		cfgStack.Destroy()
 		restored.stack.Restore()
 
-		if !restored.boundWildcard {
+		restored.mu.Lock()
+		gotRestoredAddr := restored.boundAddr
+		gotRestoredNetworks := slices.Clone(restored.boundNetProtos)
+		restored.mu.Unlock()
+		if gotRestoredAddr != (tcpip.Address{}) {
 			restored.Close()
-			t.Fatalf("restored.boundWildcard = false, want true")
+			t.Fatalf("restored.boundAddr = %s, want wildcard empty address", gotRestoredAddr)
 		}
-		if got := restored.reservedAddr(); got != (tcpip.Address{}) {
+		if !slices.Equal(gotRestoredNetworks, wantNetworks) {
 			restored.Close()
-			t.Fatalf("restored.reservedAddr() = %s, want wildcard empty address", got)
-		}
-		if got := restored.reservedNetworks(); !slices.Equal(got, wantNetworks) {
-			restored.Close()
-			t.Fatalf("restored.reservedNetworks() = %v, want %v", got, wantNetworks)
+			t.Fatalf("restored.boundNetProtos = %v, want %v", gotRestoredNetworks, wantNetworks)
 		}
 
 		restored.Close()
@@ -178,11 +181,15 @@ func TestEndpointBoundWildcardStateRoundTrip(t *testing.T) {
 		clientWQ.EventUnregister(&we)
 
 		orig := rawClient.(*Endpoint)
-		if !orig.boundWildcard {
-			t.Fatal("orig.boundWildcard = false after Connect, want true")
+		orig.mu.Lock()
+		gotOrigAddr := orig.boundAddr
+		gotOrigNetworks := slices.Clone(orig.boundNetProtos)
+		orig.mu.Unlock()
+		if gotOrigAddr != (tcpip.Address{}) {
+			t.Fatalf("orig.boundAddr = %s after Connect, want wildcard empty address", gotOrigAddr)
 		}
-		if !slices.Equal(orig.reservedNetworks(), []tcpip.NetworkProtocolNumber{ipv6.ProtocolNumber}) {
-			t.Fatalf("orig.reservedNetworks() = %v, want [%d]", orig.reservedNetworks(), ipv6.ProtocolNumber)
+		if !slices.Equal(gotOrigNetworks, []tcpip.NetworkProtocolNumber{ipv6.ProtocolNumber}) {
+			t.Fatalf("orig.boundNetProtos = %v, want [%d]", gotOrigNetworks, ipv6.ProtocolNumber)
 		}
 
 		s.Pause()
@@ -208,14 +215,15 @@ func TestEndpointBoundWildcardStateRoundTrip(t *testing.T) {
 		restored.stack.Restore()
 		defer restored.Close()
 
-		if !restored.boundWildcard {
-			t.Fatalf("restored.boundWildcard = false, want true")
+		restored.mu.Lock()
+		gotRestoredAddr := restored.boundAddr
+		gotRestoredNetworks := slices.Clone(restored.boundNetProtos)
+		restored.mu.Unlock()
+		if gotRestoredAddr != (tcpip.Address{}) {
+			t.Fatalf("restored.boundAddr = %s, want wildcard empty address", gotRestoredAddr)
 		}
-		if got := restored.reservedAddr(); got != (tcpip.Address{}) {
-			t.Fatalf("restored.reservedAddr() = %s, want wildcard empty address", got)
-		}
-		if got := restored.reservedNetworks(); !slices.Equal(got, []tcpip.NetworkProtocolNumber{ipv6.ProtocolNumber}) {
-			t.Fatalf("restored.reservedNetworks() = %v, want [%d]", got, ipv6.ProtocolNumber)
+		if !slices.Equal(gotRestoredNetworks, []tcpip.NetworkProtocolNumber{ipv6.ProtocolNumber}) {
+			t.Fatalf("restored.boundNetProtos = %v, want [%d]", gotRestoredNetworks, ipv6.ProtocolNumber)
 		}
 	})
 }
