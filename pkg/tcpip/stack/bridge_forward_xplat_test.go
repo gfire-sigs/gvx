@@ -272,3 +272,67 @@ func TestBridgeIPOutputFollowsFDB(t *testing.T) {
 		}
 	})
 }
+
+func TestBridgeDeliversIPv4ToOtherPortMAC(t *testing.T) {
+	b := newTestBridge(t)
+	var wq waiter.Queue
+	ep, tcpErr := b.stack.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	if tcpErr != nil {
+		t.Fatalf("NewEndpoint: %s", tcpErr)
+	}
+	defer ep.Close()
+	if err := ep.Bind(tcpip.FullAddress{Port: 9009}); err != nil {
+		t.Fatalf("Bind: %s", err)
+	}
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	wq.EventRegister(&we)
+	defer wq.EventUnregister(&we)
+
+	// Send an IPv4/UDP packet into port 0 addressed Ethernet-wise to port 1's MAC.
+	port1MAC := b.stack.NICInfo()[tcpip.NICID(11)].LinkAddress
+	payload := []byte("to-other-port-mac")
+	udpLen := header.UDPMinimumSize + len(payload)
+	frame := make([]byte, header.EthernetMinimumSize+header.IPv4MinimumSize+udpLen)
+	header.Ethernet(frame).Encode(&header.EthernetFields{
+		SrcAddr: macs[0],
+		DstAddr: port1MAC,
+		Type:    header.IPv4ProtocolNumber,
+	})
+	ip := header.IPv4(frame[header.EthernetMinimumSize:])
+	ip.Encode(&header.IPv4Fields{
+		TotalLength: uint16(header.IPv4MinimumSize + udpLen),
+		Protocol:    uint8(header.UDPProtocolNumber),
+		TTL:         64,
+		SrcAddr:     tcpip.AddrFrom4([4]byte{10, 0, 0, 2}),
+		DstAddr:     bridgeIP,
+	})
+	ip.SetChecksum(^ip.CalculateChecksum())
+	u := header.UDP(frame[header.EthernetMinimumSize+header.IPv4MinimumSize:])
+	u.Encode(&header.UDPFields{SrcPort: 41000, DstPort: 9009, Length: uint16(udpLen)})
+	copy(frame[len(frame)-len(payload):], payload)
+
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
+	defer pkt.DecRef()
+	var list stack.PacketBufferList
+	list.PushBack(pkt)
+	b.hosts[0].end.WritePackets(list)
+
+	var got bytes.Buffer
+	for {
+		_, err := ep.Read(&got, tcpip.ReadOptions{})
+		if _, wouldBlock := err.(*tcpip.ErrWouldBlock); !wouldBlock {
+			if err != nil {
+				t.Fatalf("Read: %s", err)
+			}
+			break
+		}
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for datagram addressed to sibling bridge port MAC")
+		}
+	}
+	if got.String() != string(payload) {
+		t.Fatalf("payload = %q, want %q", got.String(), string(payload))
+	}
+}

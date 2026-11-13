@@ -358,7 +358,7 @@ func (b *BridgeEndpoint) forwardFrame(from *bridgePort, frame *PacketBuffer) boo
 		frame.PktType = tcpip.PacketBroadcast
 	case isMulticast:
 		frame.PktType = tcpip.PacketMulticast
-	case dst == b.addr || dst == from.nic.LinkAddress():
+	case isLocal:
 		frame.PktType = tcpip.PacketHost
 	default:
 		frame.PktType = tcpip.PacketOtherHost
