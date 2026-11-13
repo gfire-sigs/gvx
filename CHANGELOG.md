@@ -2,6 +2,23 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.14.10022026110900] - 2026-11-13
+
+This release updates the bundled gVisor core to upstream commit `10548a45b7ba` (`release-20261109.0`, #194). It also stabilizes loaded test deadlines on `windows/arm64` (#195).
+
+### Upstream Sync
+
+- **Upstream gVisor `release-20261109.0` (`10548a45b7ba`)** (#194): Advances `UPSTREAM_COMMIT` and `tools/upstream/sync_manifest.json` from `1cea747efe8d` (`release-20261102.0`) to `10548a45b7ba` across 325 upstream files. Adopts upstream `boundAddr` and `boundNetProtos` on `tcp.Endpoint`, and removes the superseded `bindaddr_xplat.go` file. Locks `Endpoint.mu` in `pkg/tcpip/transport/tcp/state_xplat_test.go` and updates `netfilter` xplat matchers for the new `Stack` parameter. Adds `Eventfd` `ENOSYS` stubs in `internal/xsys/unix`, and regenerates stateify files and third-party license notices.
+- **Linux seccomp filter parameters (`pkg/gvx/syscallfilter_linux.go`)** (#194): Sets `ProcSelfFD` to `math.MaxUint32` in `config.Options` so seccomp never treats descriptor 0 as `/proc/self/fd`. Allows `SYS_LINKAT` with `flags = 0` beneath pinned directory descriptors for `hostfs`.
+
+### Bug Fixes
+
+- **Bridge port MAC packet typing and overlay cache locking (`pkg/tcpip/stack`, `pkg/sentry/fsimpl/overlay`)** (#194): Updates `forwardFrame` in `bridge_netfilter_xplat.go` to mark frames addressed to any local port MAC as `PacketHost`. This prevents IPv4, IPv6, and ARP handlers from dropping intra-bridge traffic as `PacketOtherHost`. Updates `drainUnusedDentries` in `dentry_cache_xplat.go` to lock `fs.renameMu` through `NestedLock` and `NestedUnlock` with `fs.renameLockIndex()`.
+
+### Tests
+
+- **Sibling bridge port MAC regression test and loaded `windows/arm64` timeouts (`pkg/tcpip/stack`, `internal/gvxshim`, `internal/acceptprog/cpumaxprobe`)** (#194, #195): Adds `TestBridgeDeliversIPv4ToOtherPortMAC` to verify delivery across sibling bridge ports. Widens the blocked bootstrap and exit wait deadlines in `process_test.go` to 10 s and 25 s. Brackets `cpu.stat` reads in `cpumaxprobe` with `time.Now()` to reject host preemption skew above 20 ms.
+
 ## [v0.14.10012026110200] - 2026-11-12
 
 ### Bug Fixes
