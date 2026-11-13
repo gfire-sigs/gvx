@@ -251,7 +251,7 @@ func holdCommandLock(t *testing.T, record stateRecord) {
 
 func awaitProcessExit(t *testing.T, lease *ownedLock, record stateRecord) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
 	defer cancel()
 	if err := lock(ctx, lease); err != nil {
 		t.Fatalf("child %d retained its lifetime lease: %v", record.ShimPID, err)
@@ -511,11 +511,12 @@ func testBlockedProcessBootstrap(t *testing.T, killLauncher bool) {
 	f := newProcessFixture(t)
 	// The child must publish a ready record before the lifecycle deadline
 	// rolls the start back, and the launcher-death case must also reach the
-	// kill before that deadline. A loaded windows/arm64 runner needed more
-	// than 2 seconds for the child. The child still exits long before the
-	// 15 second wait of awaitProcessExit.
-	f.timeout = 6 * time.Second
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	// kill before that deadline. A loaded windows/arm64 runner under full
+	// OWNED parallel execution can take over 6 seconds to spawn both processes
+	// and probe the named pipe. The child still exits when its 10 second
+	// handoff deadline expires, well before the 25 second wait of awaitProcessExit.
+	f.timeout = 10 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
 	defer cancel()
 	writer := fullProcessBootstrapPipe(t)
 	cmd := f.cmd(ctx, "start")
