@@ -2,6 +2,23 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.15.10002026110900] - 2026-11-14
+
+This release adds Docker-style CLI flag parsing, Go template output, shell completion, and image, volume, and system commands to `rungv` (#196). It also adds OCI cache pruning, local `ext4lite` volume operations, host capability probes, and Go 1.27.4 documentation updates (#196).
+
+### Features
+
+- **Docker-style CLI flag parsing, Go template output, and shell completion (`cmd/rungv`, `docs/cli.md`)** (#196): `rungv` normalizes `--flag`, `-it`, and post-positional flags across commands while keeping single-dash Go flags working. `rungv run` unifies `-w` and `--workdir`, and separates `--backend` (`auto|whpx|hvf|kvm|systrap`) from `--platform` (`linux/amd64|linux/arm64`). List and inspect commands support `--format` (`json` or Go `text/template`), `--no-trunc`, and `-q` or `--quiet`. `rungv completion` writes `bash`, `zsh`, `fish`, and `powershell` completion scripts.
+- **Image, volume, and system commands (`cmd/rungv`, `pkg/oci`, `pkg/gvx`)** (#196): `rungv image` adds `ls`, `pull`, `inspect`, `rm` (`rungv rmi`), and `prune` subcommands backed by `LayerCache.Prune` and `LayerCache.DiskUsage` in `pkg/oci`. `rungv volume` adds `create`, `ls`, `inspect`, `rm`, and `prune` subcommands backed by `CreateVolume`, `ListVolumes`, `InspectVolume`, `RemoveVolume`, and `PruneVolumes` in `pkg/gvx`. `rungv info` (`rungv system info`), `rungv system df`, and `rungv system prune` report host capabilities from `ProbeSystemInfo` and reclaim unused storage.
+
+### Bug Fixes
+
+- **Shared volume lock probes and locked volume removal (`pkg/sentry/fsimpl/ext4lite`, `pkg/gvx`)** (#196): `ext4lite.ProbeVolumeInUse` acquires a non-blocking shared file lock (`LOCK_SH|LOCK_NB` on Unix; shared `LockFileEx` on Windows) so concurrent readers do not block exclusive `Open` calls. `ext4lite` `Open` retries shared-lock contention up to five times, and `RemoveVolumeFile` holds an exclusive lock while deleting the volume file.
+
+### Build
+
+- **Go 1.27.4 toolchain baseline (`README.md`, `docs/architecture.md`)** (#196): `README.md` and `docs/architecture.md` now specify the Go 1.27.4+ toolchain baseline pinned in `go.mod` and CI workflows.
+
 ## [v0.14.10022026110900] - 2026-11-13
 
 This release updates the bundled gVisor core to upstream commit `10548a45b7ba` (`release-20261109.0`, #194). It also stabilizes loaded test deadlines on `windows/arm64` (#195).
