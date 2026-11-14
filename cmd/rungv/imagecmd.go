@@ -90,15 +90,38 @@ func newImageFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
-// parseImageFlags parses args. stop is true when the command must return code.
+// parseImageFlags parses args after expanding short clusters and lifting
+// trailing flags ahead of positional arguments. stop is true when the command
+// must return code.
 func parseImageFlags(fs *flag.FlagSet, args []string) (code int, stop bool) {
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0, true
 		}
 		return 2, true
 	}
 	return 0, false
+}
+
+// applyPlatformFlag validates an optional --platform value against -arch and
+// updates *archFlag when --platform is set. It reports whether the caller
+// explicitly set either -arch or --platform.
+func applyPlatformFlag(fs *flag.FlagSet, platformVal string, archFlag *string) (bool, error) {
+	archExplicit := flagVisited(fs, "arch")
+	p := strings.TrimSpace(platformVal)
+	if p == "" {
+		return archExplicit, nil
+	}
+	platArch, err := parseImagePlatformArch(p)
+	if err != nil {
+		return false, fmt.Errorf("--platform: %w", err)
+	}
+	curArch := strings.ToLower(strings.TrimSpace(*archFlag))
+	if archExplicit && curArch != "" && curArch != platArch {
+		return false, fmt.Errorf("-arch=%s conflicts with --platform=%s", curArch, p)
+	}
+	*archFlag = platArch
+	return true, nil
 }
 
 // imageFail prints a command error and returns the exit code 1.

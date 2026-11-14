@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -30,7 +29,7 @@ func init() {
 	register(command{
 		name:    "images",
 		summary: "List the images in the layer cache.\nColumns are REPOSITORY, TAG, IMAGE ID, CREATED, and SIZE.",
-		usage:   []string{"rungv images [-a] [-q] [--no-trunc] [--digests] [--format json] [-cache-dir DIR] [-arch ARCH] [NAME[:TAG]]"},
+		usage:   []string{"rungv images [-a] [-q] [--no-trunc] [--digests] [--format table|json|TEMPLATE] [-cache-dir DIR] [-arch ARCH] [NAME[:TAG]]"},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return imagesSubcommand(ctx, args, streams.stdout, streams.stderr)
 		},
@@ -105,8 +104,22 @@ func imageRows(images []oci.Image, all bool, filter *imageFilter) []imageRow {
 	return rows
 }
 
+type imageFormatRow struct {
+	CreatedAt    string `json:"CreatedAt"`
+	CreatedSince string `json:"CreatedSince"`
+	Digest       string `json:"Digest"`
+	ID           string `json:"ID"`
+	Repository   string `json:"Repository"`
+	Size         string `json:"Size"`
+	Tag          string `json:"Tag"`
+}
+
 func imagesSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := newImageFlagSet("images", stderr)
+	return runImagesCommand(ctx, "images", args, stdout, stderr)
+}
+
+func runImagesCommand(_ context.Context, cmdName string, args []string, stdout, stderr io.Writer) int {
+	fs := newImageFlagSet(cmdName, stderr)
 	cacheFlags := addImageCacheFlags(fs)
 	var all, quiet, noTrunc, digests bool
 	fs.BoolVar(&all, "a", false, "Show dangling images, which no tag or digest names")
@@ -115,32 +128,34 @@ func imagesSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	fs.BoolVar(&quiet, "quiet", false, "Print only image IDs")
 	fs.BoolVar(&noTrunc, "no-trunc", false, "Print full image IDs")
 	fs.BoolVar(&digests, "digests", false, "Show manifest digests")
-	format := fs.String("format", "", "Output format: table (default) or json (one object per line)")
+	format := fs.String("format", "", "Output format: table (default), json, or a Go template")
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
 	if fs.NArg() > 1 {
-		return imageUsageError(stderr, "images", "at most one NAME argument, got %d", fs.NArg())
+		return imageUsageError(stderr, cmdName, "at most one NAME argument, got %d", fs.NArg())
 	}
-	if *format != "" && *format != "table" && *format != "json" {
-		return imageUsageError(stderr, "images", "unsupported --format %q: use table or json", *format)
+	if spec := strings.TrimSpace(*format); spec != "" && spec != "table" && spec != "json" {
+		if _, _, err := compileFormatTemplate(spec); err != nil {
+			return imageUsageError(stderr, cmdName, "invalid --format %q: %v", *format, err)
+		}
 	}
 	var filter *imageFilter
 	if fs.NArg() == 1 {
 		f, err := parseImageFilter(fs.Arg(0))
 		if err != nil {
-			return imageUsageError(stderr, "images", "%v", err)
+			return imageUsageError(stderr, cmdName, "%v", err)
 		}
 		filter = &f
 	}
 
 	cache, arch, err := cacheFlags.open()
 	if err != nil {
-		return imageFail(stderr, "images", err)
+		return imageFail(stderr, cmdName, err)
 	}
 	images, err := cache.ListImages(arch)
 	if err != nil {
-		return imageFail(stderr, "images", err)
+		return imageFail(stderr, cmdName, err)
 	}
 	rows := imageRows(images, all, filter)
 
@@ -150,24 +165,28 @@ func imagesSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 		}
 		return shortImageID(id)
 	}
-	switch {
-	case quiet:
+	if quiet {
 		for _, r := range rows {
 			_, _ = fmt.Fprintln(stdout, displayID(r.ID))
 		}
-	case *format == "json":
-		enc := json.NewEncoder(stdout)
-		for _, r := range rows {
-			if err := enc.Encode(map[string]string{
-				"ID": displayID(r.ID), "Repository": r.Repository, "Tag": r.Tag, "Digest": r.Digest,
-				"CreatedAt": formatCreatedAt(r.Created), "CreatedSince": createdSince(r.Created, time.Now()),
-				"Size": humanSize(r.Size),
-			}); err != nil {
-				return imageFail(stderr, "images", err)
-			}
-		}
-	default:
-		tw := tabwriter.NewWriter(stdout, 10, 1, 3, ' ', 0)
+		return 0
+	}
+
+	now := time.Now()
+	items := make([]imageFormatRow, 0, len(rows))
+	for _, r := range rows {
+		items = append(items, imageFormatRow{
+			ID:           displayID(r.ID),
+			Repository:   r.Repository,
+			Tag:          r.Tag,
+			Digest:       r.Digest,
+			CreatedAt:    formatCreatedAt(r.Created),
+			CreatedSince: createdSince(r.Created, now),
+			Size:         humanSize(r.Size),
+		})
+	}
+	usageErr, writeErr := renderListFormat(stdout, *format, items, func(w io.Writer) error {
+		tw := tabwriter.NewWriter(w, 10, 1, 3, ' ', 0)
 		header := "REPOSITORY\tTAG\t"
 		if digests {
 			header += "DIGEST\t"
@@ -178,11 +197,15 @@ func imagesSubcommand(ctx context.Context, args []string, stdout, stderr io.Writ
 			if digests {
 				line += r.Digest + "\t"
 			}
-			_, _ = fmt.Fprintln(tw, line+displayID(r.ID)+"\t"+createdSince(r.Created, time.Now())+"\t"+humanSize(r.Size))
+			_, _ = fmt.Fprintln(tw, line+displayID(r.ID)+"\t"+createdSince(r.Created, now)+"\t"+humanSize(r.Size))
 		}
-		if err := tw.Flush(); err != nil {
-			return imageFail(stderr, "images", err)
-		}
+		return tw.Flush()
+	})
+	if usageErr != nil {
+		return imageUsageError(stderr, cmdName, "%v", usageErr)
+	}
+	if writeErr != nil {
+		return imageFail(stderr, cmdName, writeErr)
 	}
 	return 0
 }

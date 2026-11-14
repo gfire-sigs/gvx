@@ -91,6 +91,12 @@ func (r testRegistry) ref(tag string) string { return r.Host + "/gvx/app:" + tag
 // startRegistry serves one image of the host architecture with the given layers.
 func startRegistry(t *testing.T, layers ...testimage.File) testRegistry {
 	t.Helper()
+	return startRegistryForArch(t, runtime.GOARCH, layers...)
+}
+
+// startRegistryForArch serves one image of arch with the given layers.
+func startRegistryForArch(t *testing.T, arch string, layers ...testimage.File) testRegistry {
+	t.Helper()
 	var tars [][]byte
 	for _, l := range layers {
 		raw, err := testimage.Tar(l)
@@ -100,7 +106,7 @@ func startRegistry(t *testing.T, layers ...testimage.File) testRegistry {
 		tars = append(tars, raw)
 	}
 	reg := testimage.NewRegistryServer(t, "gvx/app", "v1", testimage.Image{
-		Arch: runtime.GOARCH, Layers: tars, Cmd: []string{"/bin/true"}, Env: []string{"A=1"}, WorkingDir: "/w",
+		Arch: arch, Layers: tars, Cmd: []string{"/bin/true"}, Env: []string{"A=1"}, WorkingDir: "/w",
 	})
 	return testRegistry{Registry: reg, Host: strings.TrimPrefix(reg.URL, "http://")}
 }

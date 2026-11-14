@@ -149,7 +149,8 @@ func TestParseRestoreArgs(t *testing.T) {
 	var stderr bytes.Buffer
 	rc, code, done := parseRestoreArgs([]string{
 		"-checkpoint-dir=/tmp/bundle",
-		"-w=" + wsDir,
+		"-workspace=" + wsDir,
+		"-w=/srv",
 		"-ro",
 		"-v=" + bindDir + ":/mnt/data:ro",
 		"-p=127.0.0.1:18080:80",
@@ -166,6 +167,9 @@ func TestParseRestoreArgs(t *testing.T) {
 	if rc.cfg.WorkspacePath != wsDir || !rc.cfg.WorkspaceReadOnly {
 		t.Errorf("WorkspacePath = %q WorkspaceReadOnly = %v, want %q and true", rc.cfg.WorkspacePath, rc.cfg.WorkspaceReadOnly, wsDir)
 	}
+	if rc.cfg.WorkDir != "/srv" {
+		t.Errorf("WorkDir = %q, want /srv", rc.cfg.WorkDir)
+	}
 	if len(rc.cfg.Mounts) != 1 || rc.cfg.Mounts[0].GuestPath != "/mnt/data" || !rc.cfg.Mounts[0].ReadOnly {
 		t.Errorf("Mounts = %+v", rc.cfg.Mounts)
 	}
@@ -179,13 +183,14 @@ func TestParseRestoreArgs(t *testing.T) {
 		t.Errorf("CheckpointDir = %q controlSocket = %q", rc.cfg.CheckpointDir, rc.controlSocket)
 	}
 
-	// Verify -workspace alias as well.
 	rc2, code2, done2 := parseRestoreArgs([]string{
 		"-checkpoint-dir=/tmp/bundle",
-		"-workspace=" + wsDir,
+		"--platform", "linux/arm64",
+		"--backend", "systrap",
 	}, nil, &bytes.Buffer{}, &stderr)
-	if done2 || code2 != 0 || rc2.cfg.WorkspacePath != wsDir {
-		t.Fatalf("-workspace failed: code=%d done=%v WorkspacePath=%q", code2, done2, rc2.cfg.WorkspacePath)
+	if done2 || code2 != 0 || rc2.cfg.Architecture != "arm64" || rc2.cfg.Platform != gvx.PlatformSystrap || rc2.autoPlatform {
+		t.Fatalf("restore --platform/--backend failed: code=%d done=%v arch=%q plat=%q auto=%v stderr=%q",
+			code2, done2, rc2.cfg.Architecture, rc2.cfg.Platform, rc2.autoPlatform, stderr.String())
 	}
 
 	for _, tc := range []struct {
@@ -393,7 +398,7 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 				"-lockdown=false",
 				"-platform=" + platform,
 				"-cache-dir=" + cacheDir,
-				"-w=" + wsDir,
+				"-workspace=" + wsDir,
 				"-checkpoint-dir=" + ckptDir,
 				"-control-socket=" + sockPath2,
 			},

@@ -127,8 +127,12 @@ func TestImagesQuietNoTruncAndFormat(t *testing.T) {
 	if row["Repository"] != reg.Host+"/gvx/app" || row["Tag"] != "v1" || row["ID"] != short {
 		t.Errorf("json row = %v", row)
 	}
-	if res := env.run("images", "--format", "{{.ID}}"); res.code != 2 {
-		t.Errorf("images with a template = exit %d, want 2", res.code)
+	tmplOut := strings.TrimSpace(env.run("images", "--format", "{{.ID}}").mustSucceed(t, "images --format {{.ID}}").stdout)
+	if tmplOut != short {
+		t.Errorf("images --format {{.ID}} = %q, want %q", tmplOut, short)
+	}
+	if res := env.run("images", "--format", "{{.Bad"); res.code != 2 {
+		t.Errorf("images with malformed template = exit %d, want 2", res.code)
 	}
 }
 

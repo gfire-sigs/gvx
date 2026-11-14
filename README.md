@@ -84,7 +84,7 @@ When you start a container with `rungv` or `pkg/gvx`, the host process compiles 
 
 ### 3.1 Install or Build `rungv`
 
-Download a prebuilt archive from [Releases](https://github.com/gfire-sigs/gvx/releases) or build from source with Go 1.27+.
+Download a prebuilt archive from [Releases](https://github.com/gfire-sigs/gvx/releases) or build from source with Go 1.27.4+.
 
 > [!IMPORTANT]
 > On macOS, sign the binary with `entitlements.plist` so it can call `Hypervisor.framework`. On Windows, enable the "Windows Hypervisor Platform" optional feature for `whpx` execution. On Linux, build with `CGO_ENABLED=0`.

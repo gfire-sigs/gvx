@@ -56,10 +56,8 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return restoreConfig{}, 2, true
 	}
 
-	flags := registerSandboxFlags(fs, flagDefaults{
-		shortWForWorkspace: true,
-	})
-	if err := fs.Parse(expandShortClusters(args)); err != nil {
+	flags := registerSandboxFlags(fs, flagDefaults{})
+	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return restoreConfig{}, 0, true
 		}

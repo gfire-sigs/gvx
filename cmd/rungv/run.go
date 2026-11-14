@@ -67,7 +67,7 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		netDefault:        string(gvx.NetModeNAT),
 		includeEntrypoint: true,
 	})
-	if err := fs.Parse(expandShortClusters(args)); err != nil {
+	if err := fs.Parse(normalizeRunArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return runConfig{}, 0, true
 		}
