@@ -74,6 +74,26 @@ func OpenVolume(f *os.File, opts VolumeOptions) (*Volume, error) {
 	return &Volume{v: v}, nil
 }
 
+// ProbeVolumeInUse reports whether another open file description currently
+// holds the exclusive volume lock on path without mutating the image.
+func ProbeVolumeInUse(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	if err := lockFile(f); err != nil {
+		if errors.Is(err, errVolumeInUse) {
+			return true, nil
+		}
+		return false, err
+	}
+	_ = unlockFile(f)
+	return false, nil
+}
+
 func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 	hf = &countedFile{hostFile: hf, stats: blockdev.NewStats(nil)}
 	size, err := hf.Size()

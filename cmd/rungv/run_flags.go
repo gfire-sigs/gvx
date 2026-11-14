@@ -53,27 +53,30 @@ func (l *listFlag) Set(val string) error {
 	return nil
 }
 
-// shortBoolFlags are the one-letter flags that Docker lets a user cluster, as in -it.
-const shortBoolFlags = "itdP"
-
-// expandShortClusters splits a cluster of one-letter boolean flags such as
-// "-itd" into "-i", "-t", and "-d". It stops at "--" and at the first
-// argument that does not start with a hyphen.
+// expandShortClusters splits short-flag clusters and attached values before
+// "--" or the first positional target.
 func expandShortClusters(args []string) []string {
-	out := make([]string, 0, len(args))
-	for i, a := range args {
-		if a == "--" || !strings.HasPrefix(a, "-") {
-			return append(out, args[i:]...)
-		}
-		if len(a) > 2 && a[1] != '-' && strings.Trim(a[1:], shortBoolFlags) == "" {
-			for _, c := range a[1:] {
-				out = append(out, "-"+string(c))
-			}
-			continue
-		}
-		out = append(out, a)
+	fs := flag.NewFlagSet("rungv", flag.ContinueOnError)
+	registerSandboxFlags(fs, flagDefaults{includeEntrypoint: true})
+	return normalizeRunArgs(fs, args)
+}
+
+func parseBackend(v string) (gvx.PlatformType, error) {
+	switch b := gvx.PlatformType(strings.ToLower(strings.TrimSpace(v))); b {
+	case gvx.PlatformAuto, gvx.PlatformWHPX, gvx.PlatformHVF, gvx.PlatformSystrap:
+		return b, nil
+	default:
+		return "", fmt.Errorf("unsupported execution backend %q (want auto, whpx, hvf, or systrap)", v)
 	}
-	return out
+}
+
+func parseImagePlatformArch(v string) (string, error) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	parts := strings.Split(v, "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] != "linux" || (parts[1] != "amd64" && parts[1] != "arm64") {
+		return "", fmt.Errorf("unsupported image platform %q (want linux/amd64 or linux/arm64)", v)
+	}
+	return parts[1], nil
 }
 
 // splitPlatform separates a Docker image platform ("linux/arm64") from a gvx
@@ -81,13 +84,17 @@ func expandShortClusters(args []string) []string {
 func splitPlatform(v string) (backend gvx.PlatformType, arch string, err error) {
 	v = strings.ToLower(strings.TrimSpace(v))
 	if !strings.Contains(v, "/") {
-		return gvx.PlatformType(v), "", nil
+		b, err := parseBackend(v)
+		if err != nil {
+			return "", "", err
+		}
+		return b, "", nil
 	}
-	parts := strings.Split(v, "/")
-	if len(parts) < 2 || len(parts) > 3 || parts[0] != "linux" || (parts[1] != "amd64" && parts[1] != "arm64") {
-		return "", "", fmt.Errorf("unsupported image platform %q (want linux/amd64 or linux/arm64)", v)
+	arch, err = parseImagePlatformArch(v)
+	if err != nil {
+		return "", "", err
 	}
-	return gvx.PlatformAuto, parts[1], nil
+	return gvx.PlatformAuto, arch, nil
 }
 
 // networkFor maps a Docker network name to a gvx network mode.
@@ -104,15 +111,15 @@ func networkFor(v string) (gvx.NetworkMode, error) {
 // flagDefaults configures the subcommand-specific flag defaults and aliases
 // shared between `rungv run` and `rungv restore`.
 type flagDefaults struct {
-	archDefault        string
-	netDefault         string
-	shortWForWorkspace bool
-	includeEntrypoint  bool
+	archDefault       string
+	netDefault        string
+	includeEntrypoint bool
 }
 
 // sandboxFlagValues holds raw flag values bound to a FlagSet before validation.
 type sandboxFlagValues struct {
 	platform               string
+	backend                string
 	allowUnconfinedSystrap bool
 	arch                   string
 	net                    string
@@ -167,7 +174,7 @@ func registerAlias(names []string, define func(name string)) {
 func registerSandboxFlags(fs *flag.FlagSet, defs flagDefaults) *sandboxFlagValues {
 	f := &sandboxFlagValues{}
 	f.registerPlatformAndNetFlags(fs, defs)
-	f.registerTargetAndMountFlags(fs, defs)
+	f.registerTargetAndMountFlags(fs)
 	f.registerIdentityAndEnvFlags(fs, defs)
 	f.registerResourceAndCheckpointFlags(fs)
 	return f
@@ -175,6 +182,7 @@ func registerSandboxFlags(fs *flag.FlagSet, defs flagDefaults) *sandboxFlagValue
 
 func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs flagDefaults) {
 	fs.StringVar(&f.platform, "platform", string(gvx.PlatformAuto), "Execution backend (auto, whpx, hvf, or systrap) or image platform (linux/amd64 or linux/arm64)")
+	fs.StringVar(&f.backend, "backend", "", "Execution backend: auto, whpx, hvf, or systrap")
 	fs.BoolVar(&f.allowUnconfinedSystrap, "allow-unconfined-systrap", false, "Allow -platform=auto on Windows to fall back to systrap when whpx is unavailable")
 	fs.StringVar(&f.arch, "arch", defs.archDefault, "Guest Linux architecture: amd64 or arm64")
 	registerAlias([]string{"net", "network"}, func(n string) {
@@ -194,20 +202,13 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	})
 }
 
-func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet, defs flagDefaults) {
+func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
 	fs.StringVar(&f.image, "image", "", "OCI image reference or archive path")
 	fs.StringVar(&f.bin, "bin", "", "Host path to a Linux ELF64 executable")
-	if defs.shortWForWorkspace {
-		registerAlias([]string{"workspace", "w"}, func(n string) {
-			fs.StringVar(&f.workspace, n, "", "Host directory mounted at /workspace")
-		})
-		fs.StringVar(&f.workDir, "workdir", "", "Guest working directory")
-	} else {
-		fs.StringVar(&f.workspace, "workspace", "", "Host directory mounted at /workspace")
-		registerAlias([]string{"workdir", "w"}, func(n string) {
-			fs.StringVar(&f.workDir, n, "", "Initial guest working directory")
-		})
-	}
+	fs.StringVar(&f.workspace, "workspace", "", "Host directory mounted at /workspace")
+	registerAlias([]string{"workdir", "w"}, func(n string) {
+		fs.StringVar(&f.workDir, n, "", "Initial guest working directory")
+	})
 	fs.BoolVar(&f.readOnly, "ro", false, "Mount /workspace read-only")
 	fs.StringVar(&f.cacheDir, "cache-dir", "", "EROFS layer cache directory")
 	fs.StringVar(&f.registryURL, "registry-url", "", "OCI registry base URL")
@@ -336,11 +337,21 @@ func (f *sandboxFlagValues) buildResources() (gvx.Resources, error) {
 	return resources, nil
 }
 
-// resolveBackendAndNetwork validates platform, architecture, network mode, and pull policy.
-func (f *sandboxFlagValues) resolveBackendAndNetwork(allowEmptyNet bool) (gvx.PlatformType, string, gvx.NetworkMode, gvx.PullPolicy, error) {
+// resolveBackendAndNetwork validates backend, platform, architecture, network mode, and pull policy.
+func (f *sandboxFlagValues) resolveBackendAndNetwork(fs *flag.FlagSet, allowEmptyNet bool) (gvx.PlatformType, string, gvx.NetworkMode, gvx.PullPolicy, error) {
 	backend, imageArch, err := splitPlatform(f.platform)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("--platform: %w", err)
+	}
+	if flagVisited(fs, "backend") || strings.TrimSpace(f.backend) != "" {
+		explicitBackend, err := parseBackend(f.backend)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("--backend: %w", err)
+		}
+		if flagVisited(fs, "platform") && imageArch == "" && backend != explicitBackend {
+			return "", "", "", "", fmt.Errorf("--backend=%s conflicts with --platform=%s; pass --platform=linux/<arch> with --backend=<engine>", explicitBackend, backend)
+		}
+		backend = explicitBackend
 	}
 	arch := strings.ToLower(strings.TrimSpace(f.arch))
 	if imageArch != "" {
@@ -393,7 +404,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
-	backend, arch, netMode, pullPolicy, err := f.resolveBackendAndNetwork(allowEmptyNet)
+	backend, arch, netMode, pullPolicy, err := f.resolveBackendAndNetwork(fs, allowEmptyNet)
 	if err != nil {
 		return gvx.Config{}, false, err
 	}

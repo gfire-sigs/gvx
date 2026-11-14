@@ -17,29 +17,36 @@ Run `rungv help` to print this list.
 | Command | Purpose |
 | :--- | :--- |
 | `run` | Run a command in an image or in an ELF binary. |
-| `pull` | Download an image into the layer cache. |
+| `pull` | Download an image into the layer cache (`--platform linux/ARCH` selects the architecture). |
 | `images` | List the images of the cache. |
-| `inspect` | Print the configuration of images as JSON. |
+| `inspect` | Print the metadata of images as JSON or through a Go template. |
 | `tag` | Give an image a second name. |
 | `rmi` | Remove a name of an image, or the image. |
 | `save` | Write images to a tar archive. |
 | `load` | Read images from a tar archive. |
+| `image` | Group command for `ls`, `pull`, `rm`, `inspect`, `tag`, `save`, `load`, and `prune`. |
+| `volume` | Group command for `create`, `ls`, `inspect`, `rm`, and `prune` on local volumes. |
+| `system` | Group command for `info`, `df`, and `prune` on host backends and local storage. |
+| `info` | Print the host OS, available execution backends, lockdown profile, and storage paths. |
 | `checkpoint` | Write a checkpoint bundle for a running sandbox over its control socket (alias: `snapshot`). |
 | `restore` | Restore and run a sandbox from a checkpoint bundle directory (alias: `resume`). |
 | `login` | Store the credentials of a registry. |
 | `logout` | Remove the credentials of a registry. |
+| `completion` | Print shell completion scripts for `bash`, `zsh`, `fish`, or `powershell`. |
 | `stub` | Probe the `systrap` engine of this host. |
 | `tune` | List the host-side tunables. Section 3.3 describes them. |
 | `license` | Print the license texts of `gvx`, of its upstream code, and of the libraries in the binary. Section 9 describes it. |
 | `version` | Print the version, the source commit, and the Go toolchain of the binary. Section 10 describes it. |
 
-Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Flags go before the arguments. Every flag has a single-dash form, such as `-e`, and a double-dash form, such as `--env`. A cluster of one-letter flags, such as `-it`, works for `-i`, `-t`, `-d`, and `-P`.
+Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Every flag accepts both single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags either before or after positional arguments.
 
 ## 3. `rungv run`
 
 The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument that is not a flag names the image. The arguments after it replace the `Cmd` of the image and keep its `Entrypoint`. The synopsis `rungv run [flags] -bin=ELF [ARG...]` runs a host ELF binary with the arguments as the whole command vector.
 
 ### 3.1 Docker flags
+
+The table below lists the `rungv run` flags that match the Docker command line.
 
 | Flag | Meaning |
 | :--- | :--- |
@@ -48,7 +55,7 @@ The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument
 | `--entrypoint PROGRAM` | Replace the image entrypoint. An empty value clears it. The image `Cmd` is dropped. |
 | `-u`, `--user USER[:GROUP]` | Run as a user, by name or by number. |
 | `-h`, `--hostname NAME` | Set the hostname. The default is `gvx`. |
-| `-w`, `--workdir DIR` | Set the working directory. |
+| `-w`, `--workdir DIR` | Set the working directory inside the guest (applies to `restore` as well). |
 | `--name NAME` | Set the container name. It becomes the container ID of the kernel and has no other effect. |
 | `--rm` | Accepted. Every run removes its container. |
 | `-i` | Accepted. The guest always reads the standard input of `rungv`. |
@@ -69,11 +76,14 @@ The flag `-d` is refused with a message, because a run has no daemon.
 
 ### 3.2 gvx flags
 
+The table below lists the sandbox flags specific to `gvx`.
+
 | Flag | Meaning |
 | :--- | :--- |
 | `-image REF`, `-bin ELF` | Name the image or the binary without a positional argument. |
-| `-platform BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. On Windows, `auto` requires `whpx` unless `-allow-unconfined-systrap` is set, and `systrap` prints a stderr warning. macOS has no `systrap` engine. A value with a slash selects a Docker image platform. |
-| `-allow-unconfined-systrap` | Allow `-platform=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted workloads on Windows require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
+| `-backend`, `--backend BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. Combine it with `--platform linux/ARCH` when selecting both the image architecture and the backend. |
+| `-platform BACKEND` | Legacy alias for `-backend` (`auto`, `whpx`, `hvf`, or `systrap`) when the value has no slash. A value with a slash (`linux/amd64` or `linux/arm64`) selects the image platform. Setting both `-backend` and `-platform BACKEND` to different engines is an error. |
+| `-allow-unconfined-systrap` | Allow `-backend=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted workloads on Windows require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
@@ -88,8 +98,8 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `-checkpoint-dir DIR` | Pre-open a host directory before the lockdown for checkpoint bundle files. |
 | `-control-socket PATH` | Bind a Unix domain socket or loopback TCP listener before the lockdown for `rungv checkpoint`. A TCP listener and a Windows Unix socket need the per-run token that the server writes to a `0600` token file. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
-| `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, and `tag` take it. |
-| `--tune-file FILE` | Read host-side tunables from a JSON object. A `--tune` flag wins over the file. The same eight commands take it. |
+| `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info` take it. |
+| `--tune-file FILE` | Read host-side tunables from a JSON object. A `--tune` flag wins over the file. The same commands take it. |
 
 ### 3.3 Tunables
 
@@ -307,27 +317,27 @@ SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO-
 
 ### 4.11 Checkpoint and restore
 
-`rungv` can save a running sandbox to a host directory and resume it in a new process. The host lockdown blocks new file opens and socket binds after the guest starts. The sandbox therefore opens the checkpoint files at `-checkpoint-dir` and binds the control listener at `-checkpoint-socket` before the lockdown applies.
+`rungv` can save a running sandbox to a host directory and resume it in a new process. The host lockdown blocks new file opens and socket binds after the guest starts. The sandbox therefore opens the checkpoint files at `-checkpoint-dir` and binds the control listener at `-control-socket` before the lockdown applies.
 
 The bundle directory holds four files: `manifest.json`, `state.img`, `pages.meta`, and `pages.img`. `manifest.json` records the host OS, the CPU architecture, the active platform, the address holes, the EROFS layer digests, the mounts, and the network mode. `rungv restore` (or its alias `rungv resume`) validates `manifest.json` against the host and reopens the cached layers and mounts before it applies the lockdown.
 
 | Command or flag | Meaning |
 | :--- | :--- |
-| `rungv run -checkpoint-dir DIR -checkpoint-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before the lockdown. |
-| `rungv checkpoint -socket PATH [-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` is an alias). Without `-leave-running`, the sandbox stops and exits `0` after the save finishes. When `-dir` is set, the server verifies that it matches `-checkpoint-dir`. |
-| `rungv restore -dir DIR [flags]` | Restore a sandbox from `DIR` (`rungv resume` is an alias). Pass `-w` or `-workspace`, `-v`, `--mount`, `-p`, `-net`, `-wg-config`, `-checkpoint-dir`, and `-checkpoint-socket` to reattach mounts, network backends, or a new checkpoint listener. |
+| `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before the lockdown. |
+| `rungv checkpoint -control-socket PATH [-checkpoint-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` is an alias). Without `-leave-running`, the sandbox stops and exits `0` after the save finishes. When `-checkpoint-dir` is set, the server verifies that it matches the pre-opened directory. |
+| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (`rungv resume` is an alias). Pass `-workspace`, `-v`, `--mount`, `-p`, `-net`, `-wg-conf`, `-backend`, `--platform`, `-checkpoint-dir`, and `-control-socket` to reattach mounts, network backends, or a new control listener. `-w` and `--workdir` set the guest working directory. |
 
 > [!IMPORTANT]
 > Pass the same workspace and volume mounts to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the layer digests, the platform, or the network mode do not match `manifest.json`.
 
-1. Start a workload with `-checkpoint-dir` and `-checkpoint-socket`.
+1. Start a workload with `-checkpoint-dir` and `-control-socket`.
 2. Run `rungv checkpoint` in another terminal to write the bundle and stop the sandbox.
-3. Run `rungv restore` with `-dir` and the same mounts to resume the workload.
+3. Run `rungv restore` with `-checkpoint-dir` and the same mounts to resume the workload.
 
 ```sh
-rungv run -checkpoint-dir=./ckpt -checkpoint-socket=./ckpt.sock -workspace=./work alpine:3.20 sh -c "sleep 30"
-rungv checkpoint -socket=./ckpt.sock -dir=./ckpt
-rungv restore -dir=./ckpt -w=./work
+rungv run -checkpoint-dir=./ckpt -control-socket=./ckpt.sock -workspace=./work alpine:3.20 sh -c "sleep 30"
+rungv checkpoint -control-socket=./ckpt.sock -checkpoint-dir=./ckpt
+rungv restore -checkpoint-dir=./ckpt -workspace=./work
 ```
 
 ## 5. Images and registries
@@ -369,24 +379,66 @@ rungv run --host-dns 10.0.2.3 alpine:3.20 nslookup example.com
 rungv pull --host-dns 10.0.2.3 alpine:3.20
 ```
 
-## 6. The image store
+## 6. Storage, system, and completion commands
 
-The layer cache is the image store. It holds the compiled EROFS layers, one record for each image, and one record for each name. The default directory is `%LOCALAPPDATA%\gvx\cache\layers` on Windows and `~/Library/Caches/gvx/layers` on macOS.
+`rungv` provides Docker-style noun-verb groups for local images, named volumes, host diagnostics, and shell completion. Top-level commands (`images`, `pull`, `rmi`, `inspect`, `tag`, `save`, `load`, `info`) remain aliases of the corresponding group subcommands.
 
-`rungv images` lists names and tags. The IMAGE ID is the first 12 digits of the config digest, as in Docker. The SIZE column is the size of the EROFS layer files on disk. The flags are `-a`, `-q`, `--no-trunc`, `--digests`, and `--format json`.
+### 6.1 Image store and `rungv image`
 
-`rungv rmi` removes a name. When no name or digest keeps the image, it removes the image record and the layer files that no other image uses. An ID that has several names needs `-f`.
+The layer cache holds compiled EROFS layers, one record per image, and one record per tag or digest. The default directory is `%LOCALAPPDATA%\gvx\cache\layers` on Windows, `~/Library/Caches/gvx/layers` on macOS, and `~/.cache/gvx/layers` on Linux.
 
-`rungv save` writes a tar archive that is an OCI image layout and also has the Docker file `manifest.json` with `RepoTags`. The cache holds compiled layers and not the original blobs. The command therefore fetches each original layer from the registry and verifies its digest. It fails for an image that came from an archive. It writes a temporary file first, so a failure leaves no partial archive.
+| Command | Behavior |
+| :--- | :--- |
+| `rungv image ls` (`rungv images`) | Lists cached images. `IMAGE ID` shows the first 12 hex digits of the config digest, and `SIZE` sums the EROFS layer files. Accepts `-a`, `-q`, `--no-trunc`, `--digests`, and `--format`. |
+| `rungv image pull` (`rungv pull`) | Downloads an image or archive into the layer cache. Accepts `--platform linux/ARCH`, `-arch`, `-registry-url`, and `--host-dns`. |
+| `rungv image inspect` (`rungv inspect`) | Prints a JSON array of image metadata, or evaluates `-f` / `--format` per image. |
+| `rungv image rm` (`rungv rmi`) | Removes a tag or an image record and deletes unreferenced EROFS layers. An image ID with multiple tags requires `-f`. |
+| `rungv image tag` (`rungv tag`) | Creates a second repository or tag reference for a cached image. |
+| `rungv image save` (`rungv save`) | Writes an OCI layout and `docker save` tar archive by fetching verified layer blobs from the origin registry. |
+| `rungv image load` (`rungv load`) | Loads images for the selected architecture from an OCI layout or `docker save` tar archive. |
+| `rungv image prune [-a] [-f]` | Deletes dangling images (or all images for the architecture with `-a`), sweeps orphaned layer files, and prints reclaimed bytes. |
 
-`rungv load` reads such an archive, an OCI layout, or the output of `docker save`. It registers the names of the archive. It skips the images of other architectures.
+### 6.2 Named volumes and `rungv volume`
+
+`rungv volume` creates, inspects, and deletes named volumes in the local `volumes` directory without starting a sandbox. Each `ext4lite` volume probes its host file lock through `ext4lite.ProbeVolumeInUse` so `rungv` refuses deletion while a sandbox mounts the volume.
+
+| Command | Behavior |
+| :--- | :--- |
+| `rungv volume create [-d ext4lite\|hostfs] [NAME]` | Formats an `ext4lite` image file (`<name>.ext4`, default) or creates a `hostfs` directory. Generates a 64-digit hex name when `NAME` is omitted. |
+| `rungv volume ls [-q] [--format SPEC]` | Lists local volumes sorted by name, or prints only names with `-q`. |
+| `rungv volume inspect [-f SPEC] NAME...` | Prints JSON metadata (`Name`, `Driver`, `Mountpoint`, `CreatedAt`, `SizeBytes`, `InUse`) or evaluates a Go template. |
+| `rungv volume rm [-f] NAME...` | Deletes unlocked volumes. `-f` ignores missing names, and locked volumes always fail with `in use`. |
+| `rungv volume prune [-f]` | Deletes all unlocked local volumes after confirmation (or immediately with `-f`) and prints reclaimed bytes. |
+
+### 6.3 System diagnostics, disk usage, and Go templates
+
+`rungv system` and `rungv info` inspect the host environment and local storage without applying host lockdown. List and inspect commands share a Go `text/template` formatter through `--format` (and `-f` on `inspect`, `volume inspect`, and `info`).
+
+| Command or format | Behavior |
+| :--- | :--- |
+| `rungv system info` (`rungv info`) | Probes `whpx`, `hvf`, and `systrap`, reports the host lockdown profile, and prints cache and volume counts. |
+| `rungv system df [-v] [--format SPEC]` | Prints total, active, and reclaimable bytes for `Images` and `Local Volumes`. `-v` appends per-image and per-volume tables. |
+| `rungv system prune [-a] [--volumes] [-f]` | Prunes dangling images (or all images with `-a`) and prunes unlocked volumes when `--volumes` is set. |
+| `--format json` | Prints newline-delimited JSON objects on list commands, or an indented JSON value on `inspect` and `info`. |
+| `--format '{{.Field}}'` / `'table {{.A}}\t{{.B}}'` | Evaluates a Go `text/template` with the functions `json`, `lower`, `upper`, `join`, `split`, and `truncate`. |
+
+### 6.4 Shell completion
+
+`rungv completion <bash|zsh|fish|powershell>` writes a completion script for subcommands, group verbs, and common `run` flags to standard output.
+
+1. Run `source <(rungv completion bash)` to enable completion in the current Bash shell.
+2. Run `source <(rungv completion zsh)` in Zsh after `compinit`.
+3. Run `rungv completion fish | source` in Fish.
+4. Run `rungv completion powershell | Out-String | Invoke-Expression` in PowerShell.
 
 ## 7. Differences from Docker
 
+The table below lists Docker CLI features that differ or do not exist in `rungv`.
+
 | Docker | `rungv` |
 | :--- | :--- |
-| `-d`, `ps`, `exec`, `logs`, `stop`, `rm`, `restart` | Not available. A run is in the foreground and has no state. |
-| `docker build`, `compose`, `network`, `volume` | Not available. Remove a named volume by deleting its image file, `<name>.ext4`. |
+| `-d`, `ps`, `exec`, `logs`, `stop`, `rm`, `restart` | Not available. A run executes in the foreground and keeps no container daemon state. |
+| `docker build`, `compose`, `network` | Not available. Use `rungv volume` to create, inspect, remove, or prune named volumes. |
 | Image `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, labels | Ignored. |
 | `--network host` | Refused. The guest has its own network stack. |
 | `-p HOST-RANGE:PORT` | Refused. Publish ranges of the same length. |
@@ -397,7 +449,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. In the guest, `memory.max` of a nested cgroup ends processes with a delay. The Windows `systrap` engine does not enforce it. `cpu.max` of a nested cgroup holds on every engine. `memory.high` and `cpu.weight` of a nested cgroup are not enforced. |
 | Linux host with a seccomp listener in the filter chain of the process | The kernel allows one listener in a chain. The `systrap` engine then uses the futex loop for its stub threads. It writes one warning. This loop is slower than the listener. |
 | Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
-| Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
+| Guest architecture | Must equal the host architecture, except with `-backend=systrap` (`-platform=systrap`). |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
 | A store into the page of the storing instruction | The Windows `systrap` engine completes the store with a single step, and the page runs the new bytes. Each such store costs three debug stops. On `arm64`, a store exclusive (`stxr`, `stlxr`, `stxp`, `stlxp`) into its own page ends with SIGSEGV. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
@@ -416,10 +468,12 @@ Publish the exposed port of an image to a free host port:
 rungv run -P nginx:alpine
 ```
 
-Limit the memory and keep the data in a named volume:
+Create an `ext4lite` volume, mount it in a memory-limited guest, and inspect disk usage:
 
 ```sh
-rungv run -m 512m -v data:/var/lib/app myimage:1.0
+rungv volume create appdata
+rungv run -m512m -v appdata:/var/lib/app myimage:1.0
+rungv system df -v
 ```
 
 Move an image to another host:

@@ -41,6 +41,7 @@ func init() {
 func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := newImageFlagSet("pull", stderr)
 	cacheFlags := addImageCacheFlags(fs)
+	platformFlag := fs.String("platform", "", "Target image platform (linux/amd64 or linux/arm64)")
 	registryURLFlag := fs.String("registry-url", "", "OCI registry base URL that replaces the registry of the reference")
 	hostDNS := addHostDNSFlag(fs)
 
@@ -54,6 +55,13 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	target := remaining[0]
 	registryURL := strings.TrimSpace(*registryURLFlag)
+	if p := strings.TrimSpace(*platformFlag); p != "" {
+		platArch, err := parseImagePlatformArch(p)
+		if err != nil {
+			return imageUsageError(stderr, "pull", "--platform: %v", err)
+		}
+		*cacheFlags.arch = platArch
+	}
 
 	cache, arch, err := cacheFlags.openPullCache(*hostDNS)
 	if err != nil {

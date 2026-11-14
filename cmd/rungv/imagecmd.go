@@ -90,9 +90,11 @@ func newImageFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
-// parseImageFlags parses args. stop is true when the command must return code.
+// parseImageFlags parses args after expanding short clusters and lifting
+// trailing flags ahead of positional arguments. stop is true when the command
+// must return code.
 func parseImageFlags(fs *flag.FlagSet, args []string) (code int, stop bool) {
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0, true
 		}

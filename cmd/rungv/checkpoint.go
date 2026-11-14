@@ -81,7 +81,7 @@ func parseCheckpointArgs(args []string, stderr io.Writer) (checkpointArgs, int, 
 	fs.StringVar(&checkpointDir, "checkpoint-dir", "", "Checkpoint bundle directory (validated against pre-opened -checkpoint-dir)")
 	leaveRunningFlag := fs.Bool("leave-running", false, "Keep the sandbox running after the checkpoint completes")
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeCommandArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return checkpointArgs{}, 0, true
 		}

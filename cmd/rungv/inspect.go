@@ -16,10 +16,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/oci"
@@ -28,8 +27,8 @@ import (
 func init() {
 	register(command{
 		name:    "inspect",
-		summary: "Print the details of cached images as a JSON array.\nThe fields follow docker image inspect.",
-		usage:   []string{"rungv inspect [-cache-dir DIR] [-arch ARCH] IMAGE..."},
+		summary: "Print the details of cached images as a JSON array or Go template.\nThe fields follow docker image inspect.",
+		usage:   []string{"rungv inspect [-f|--format TEMPLATE] [-cache-dir DIR] [-arch ARCH] IMAGE..."},
 		run: func(ctx context.Context, args []string, streams cliIO) int {
 			return inspectSubcommand(ctx, args, streams.stdout, streams.stderr)
 		},
@@ -105,22 +104,35 @@ func nonNil[T any](s []T) []T {
 	return s
 }
 
-func inspectSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := newImageFlagSet("inspect", stderr)
+func inspectSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runInspectCommand(ctx, "inspect", args, stdout, stderr)
+}
+
+func runInspectCommand(_ context.Context, cmdName string, args []string, stdout, stderr io.Writer) int {
+	fs := newImageFlagSet(cmdName, stderr)
 	cacheFlags := addImageCacheFlags(fs)
+	var format string
+	registerAlias([]string{"f", "format"}, func(n string) {
+		fs.StringVar(&format, n, "", "Format output using json (default) or a Go template")
+	})
 	if code, stop := parseImageFlags(fs, args); stop {
 		return code
 	}
 	if fs.NArg() == 0 {
-		return imageUsageError(stderr, "inspect", "missing IMAGE argument")
+		return imageUsageError(stderr, cmdName, "missing IMAGE argument")
+	}
+	if spec := strings.TrimSpace(format); spec != "" && spec != "json" {
+		if _, _, err := compileFormatTemplate(spec); err != nil {
+			return imageUsageError(stderr, cmdName, "invalid --format %q: %v", format, err)
+		}
 	}
 	cache, arch, err := cacheFlags.open()
 	if err != nil {
-		return imageFail(stderr, "inspect", err)
+		return imageFail(stderr, cmdName, err)
 	}
 	all, err := cache.ListImages(arch)
 	if err != nil {
-		return imageFail(stderr, "inspect", err)
+		return imageFail(stderr, cmdName, err)
 	}
 
 	code := 0
@@ -128,17 +140,22 @@ func inspectSubcommand(_ context.Context, args []string, stdout, stderr io.Write
 	for _, query := range fs.Args() {
 		sel, err := cache.Select(query, arch)
 		if err != nil {
-			code = imageFail(stderr, "inspect", imageNotFound(query, err))
+			code = imageFail(stderr, cmdName, imageNotFound(query, err))
 			continue
 		}
 		img := sel.Images[0]
 		same := slices.DeleteFunc(slices.Clone(all), func(other oci.Image) bool { return other.ID != img.ID })
 		outputs = append(outputs, newInspectOutput(img, same))
 	}
-	raw, err := json.MarshalIndent(outputs, "", "    ")
-	if err != nil {
-		return imageFail(stderr, "inspect", err)
+	if len(outputs) == 0 && code != 0 && strings.TrimSpace(format) != "" && strings.TrimSpace(format) != "json" {
+		return code
 	}
-	_, _ = fmt.Fprintf(stdout, "%s\n", raw)
+	usageErr, writeErr := renderInspectFormat(stdout, format, outputs)
+	if usageErr != nil {
+		return imageUsageError(stderr, cmdName, "%v", usageErr)
+	}
+	if writeErr != nil {
+		return imageFail(stderr, cmdName, writeErr)
+	}
 	return code
 }
