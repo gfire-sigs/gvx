@@ -132,7 +132,7 @@ func TestProbeSystemInfoReportsHostAndStoreCounts(t *testing.T) {
 	if _, err := gvx.CreateVolume(cacheDir, "v1", gvx.DriverExt4lite); err != nil {
 		t.Fatal(err)
 	}
-	info, err := gvx.ProbeSystemInfo(cacheDir, tuning.Defaults())
+	info, err := gvx.ProbeSystemInfo(cacheDir, tuning.Values{})
 	if err != nil {
 		t.Fatalf("ProbeSystemInfo: %v", err)
 	}
