@@ -29,8 +29,14 @@ const platformTier = tierFallback
 // available, so two sandboxes that mount the same file are not detected.
 func lockFile(*os.File) error { return nil }
 
+// lockFileShared does nothing on this operating system.
+func lockFileShared(*os.File) error { return nil }
+
 // unlockFile does nothing, as lockFile does nothing.
 func unlockFile(*os.File) error { return nil }
+
+// removeVolumeFile removes path directly when no host lock call exists.
+func removeVolumeFile(path string) error { return os.Remove(path) }
 
 // availBytes reports that this operating system has no free-space call that
 // works on a handle.

@@ -81,6 +81,8 @@ func TestRunFlagsBackendAndPlatformOrthogonality(t *testing.T) {
 		{"unknown backend", []string{"--backend=kvm", "-image=x"}, "--backend"},
 		{"unknown platform backend", []string{"--platform=kvm", "-image=x"}, "--platform"},
 		{"conflicting backend and platform", []string{"--platform=whpx", "--backend=systrap", "-image=x"}, "conflicts"},
+		{"conflicting arch and platform", []string{"-arch=amd64", "--platform=linux/arm64", "-image=x"}, "conflicts"},
+		{"dangling value flag before double dash", []string{"-p", "--", "alpine:3.20"}, "flag needs an argument"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, code, stop, errOut := parse(t, tc.args...)
@@ -111,4 +113,22 @@ func TestManagementCommandsAcceptTrailingFlagsAndShortClusters(t *testing.T) {
 	// Trailing -f on rmi after tagging a second name.
 	env.run("tag", reg.ref("v1"), "copy:v1").mustSucceed(t, "tag copy:v1")
 	env.run("rmi", ids, "-f").mustSucceed(t, "rmi ID -f")
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"trailing -o missing value", []string{"save", "alpine:3.20", "-o"}, "flag needs an argument"},
+		{"trailing --format missing value", []string{"inspect", "alpine:3.20", "--format"}, "flag needs an argument"},
+		{"value flag before -- separator", []string{"save", "-o", "--", "alpine:3.20"}, "flag needs an argument"},
+		{"conflicting pull -arch and --platform", []string{"pull", "-arch=amd64", "--platform=linux/arm64", "alpine:3.20"}, "conflicts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runCLIArgs(t, nil, tc.args...)
+			if res.code != 2 || !strings.Contains(res.stderr, tc.want) {
+				t.Fatalf("runCLIArgs(%v) = (code %d, stderr %q), want exit 2 containing %q", tc.args, res.code, res.stderr, tc.want)
+			}
+		})
+	}
 }

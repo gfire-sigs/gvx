@@ -122,8 +122,12 @@ func runInspectCommand(_ context.Context, cmdName string, args []string, stdout,
 		return imageUsageError(stderr, cmdName, "missing IMAGE argument")
 	}
 	if spec := strings.TrimSpace(format); spec != "" && spec != "json" {
-		if _, _, err := compileFormatTemplate(spec); err != nil {
+		tmpl, _, err := compileFormatTemplate(spec)
+		if err != nil {
 			return imageUsageError(stderr, cmdName, "invalid --format %q: %v", format, err)
+		}
+		if tmpl == nil {
+			return imageUsageError(stderr, cmdName, "invalid --format %q: table requires a Go template expression", format)
 		}
 	}
 	cache, arch, err := cacheFlags.open()

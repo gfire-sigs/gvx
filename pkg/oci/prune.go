@@ -47,8 +47,8 @@ type CacheDiskUsage struct {
 }
 
 // PruneImages deletes dangling images (or all images when opts.All is true)
-// for opts.Arch, sweeps orphaned tag, layer, sum, and temporary files, and
-// reports the bytes reclaimed on disk.
+// for opts.Arch, sweeps orphaned tag, layer, and sum files, and reports the
+// bytes reclaimed on disk.
 func (c *LayerCache) PruneImages(opts PruneOptions) (PruneReport, error) {
 	beforeBytes, err := c.cacheFileBytes()
 	if err != nil {

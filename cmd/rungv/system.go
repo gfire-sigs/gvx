@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -288,6 +289,7 @@ func systemPruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 	const cmdName = "system prune"
 	fs := newImageFlagSet(cmdName, streams.stderr)
 	cacheFlags := addImageCacheFlags(fs)
+	platformFlag := fs.String("platform", "", "Target image platform (linux/amd64 or linux/arm64)")
 	var all, pruneVolumes, force bool
 	fs.BoolVar(&all, "a", false, "Remove all cached images, not only dangling images")
 	fs.BoolVar(&all, "all", false, "Remove all cached images, not only dangling images")
@@ -301,10 +303,18 @@ func systemPruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 	if fs.NArg() != 0 {
 		return imageUsageError(streams.stderr, cmdName, "unexpected argument %q", fs.Arg(0))
 	}
+	archExplicit, err := applyPlatformFlag(fs, *platformFlag, cacheFlags.arch)
+	if err != nil {
+		return imageUsageError(streams.stderr, cmdName, "%v", err)
+	}
 
 	targets := []string{"dangling images"}
 	if all {
-		targets = []string{"all cached images for the selected architecture"}
+		if archExplicit {
+			targets = []string{"all cached images for the selected architecture"}
+		} else {
+			targets = []string{"all cached images"}
+		}
 	}
 	if pruneVolumes {
 		targets = append(targets, "all unlocked local volumes")
@@ -333,12 +343,30 @@ func systemPruneSubcommand(_ context.Context, args []string, streams cliIO) int 
 		if openErr != nil {
 			code = imageFail(streams.stderr, cmdName, openErr)
 		} else {
-			imgReport, pruneErr := cache.PruneImages(oci.PruneOptions{Arch: arch, All: all})
-			writeImagePruneReport(streams.stdout, imgReport)
-			totalReclaimed += imgReport.SpaceReclaimed
-			if pruneErr != nil {
-				code = imageFail(streams.stderr, cmdName, pruneErr)
+			arches := []string{"amd64", "arm64"}
+			if archExplicit {
+				arches = []string{arch}
 			}
+			var combined oci.PruneReport
+			for _, a := range arches {
+				imgReport, pruneErr := cache.PruneImages(oci.PruneOptions{Arch: a, All: all})
+				for _, u := range imgReport.Untagged {
+					if !slices.Contains(combined.Untagged, u) {
+						combined.Untagged = append(combined.Untagged, u)
+					}
+				}
+				for _, d := range imgReport.Deleted {
+					if !slices.Contains(combined.Deleted, d) {
+						combined.Deleted = append(combined.Deleted, d)
+					}
+				}
+				combined.SpaceReclaimed += imgReport.SpaceReclaimed
+				if pruneErr != nil {
+					code = imageFail(streams.stderr, cmdName, pruneErr)
+				}
+			}
+			writeImagePruneReport(streams.stdout, combined)
+			totalReclaimed += combined.SpaceReclaimed
 		}
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		code = imageFail(streams.stderr, cmdName, statErr)

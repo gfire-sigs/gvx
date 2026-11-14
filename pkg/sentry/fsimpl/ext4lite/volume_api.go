@@ -75,7 +75,7 @@ func OpenVolume(f *os.File, opts VolumeOptions) (*Volume, error) {
 }
 
 // ProbeVolumeInUse reports whether another open file description currently
-// holds the exclusive volume lock on path without mutating the image.
+// holds the exclusive volume lock on path without taking an exclusive lock.
 func ProbeVolumeInUse(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -84,7 +84,7 @@ func ProbeVolumeInUse(path string) (bool, error) {
 	defer func() {
 		_ = f.Close()
 	}()
-	if err := lockFile(f); err != nil {
+	if err := lockFileShared(f); err != nil {
 		if errors.Is(err, errVolumeInUse) {
 			return true, nil
 		}
@@ -92,6 +92,12 @@ func ProbeVolumeInUse(path string) (bool, error) {
 	}
 	_ = unlockFile(f)
 	return false, nil
+}
+
+// RemoveVolumeFile deletes path while preventing concurrent exclusive mounts.
+// It returns ErrVolumeInUse when an active volume holds the lock.
+func RemoveVolumeFile(path string) error {
+	return removeVolumeFile(path)
 }
 
 func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {

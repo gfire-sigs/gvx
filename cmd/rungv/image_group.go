@@ -99,12 +99,8 @@ func imagePruneSubcommand(_ context.Context, args []string, streams cliIO) int {
 	if fs.NArg() != 0 {
 		return imageUsageError(streams.stderr, cmdName, "unexpected argument %q", fs.Arg(0))
 	}
-	if p := strings.TrimSpace(*platformFlag); p != "" {
-		platArch, err := parseImagePlatformArch(p)
-		if err != nil {
-			return imageUsageError(streams.stderr, cmdName, "--platform: %v", err)
-		}
-		*cacheFlags.arch = platArch
+	if _, err := applyPlatformFlag(fs, *platformFlag, cacheFlags.arch); err != nil {
+		return imageUsageError(streams.stderr, cmdName, "%v", err)
 	}
 
 	warning := "This will remove all dangling images."

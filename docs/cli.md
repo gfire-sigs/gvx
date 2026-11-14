@@ -325,7 +325,7 @@ The bundle directory holds four files: `manifest.json`, `state.img`, `pages.meta
 | :--- | :--- |
 | `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before the lockdown. |
 | `rungv checkpoint -control-socket PATH [-checkpoint-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` is an alias). Without `-leave-running`, the sandbox stops and exits `0` after the save finishes. When `-checkpoint-dir` is set, the server verifies that it matches the pre-opened directory. |
-| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (`rungv resume` is an alias). Pass `-workspace`, `-v`, `--mount`, `-p`, `-net`, `-wg-conf`, `-backend`, `--platform`, `-checkpoint-dir`, and `-control-socket` to reattach mounts, network backends, or a new control listener. `-w` and `--workdir` set the guest working directory. |
+| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Reattach mounts, network flags, and control sockets; `-w` sets the working directory. |
 
 > [!IMPORTANT]
 > Pass the same workspace and volume mounts to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the layer digests, the platform, or the network mode do not match `manifest.json`.
@@ -418,7 +418,7 @@ The layer cache holds compiled EROFS layers, one record per image, and one recor
 | :--- | :--- |
 | `rungv system info` (`rungv info`) | Probes `whpx`, `hvf`, and `systrap`, reports the host lockdown profile, and prints cache and volume counts. |
 | `rungv system df [-v] [--format SPEC]` | Prints total, active, and reclaimable bytes for `Images` and `Local Volumes`. `-v` appends per-image and per-volume tables. |
-| `rungv system prune [-a] [--volumes] [-f]` | Prunes dangling images (or all images with `-a`) and prunes unlocked volumes when `--volumes` is set. |
+| `rungv system prune [-a] [--volumes] [-f]` | Prunes unused images across cached architectures (or one `--platform`) and prunes unlocked volumes when `--volumes` is set. |
 | `--format json` | Prints newline-delimited JSON objects on list commands, or an indented JSON value on `inspect` and `info`. |
 | `--format '{{.Field}}'` / `'table {{.A}}\t{{.B}}'` | Evaluates a Go `text/template` with the functions `json`, `lower`, `upper`, `join`, `split`, and `truncate`. |
 
@@ -426,10 +426,12 @@ The layer cache holds compiled EROFS layers, one record per image, and one recor
 
 `rungv completion <bash|zsh|fish|powershell>` writes a completion script for subcommands, group verbs, and common `run` flags to standard output.
 
-1. Run `source <(rungv completion bash)` to enable completion in the current Bash shell.
-2. Run `source <(rungv completion zsh)` in Zsh after `compinit`.
-3. Run `rungv completion fish | source` in Fish.
-4. Run `rungv completion powershell | Out-String | Invoke-Expression` in PowerShell.
+| Shell | Activation command |
+| :--- | :--- |
+| Bash | `source <(rungv completion bash)` |
+| Zsh | `source <(rungv completion zsh)` (after `compinit`) |
+| Fish | `rungv completion fish \| source` |
+| PowerShell | `rungv completion powershell \| Out-String \| Invoke-Expression` |
 
 ## 7. Differences from Docker
 

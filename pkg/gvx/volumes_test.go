@@ -143,3 +143,32 @@ func TestProbeSystemInfoReportsHostAndStoreCounts(t *testing.T) {
 		t.Fatalf("ProbeSystemInfo.Volumes = %d, want 1", info.Volumes)
 	}
 }
+
+func TestConcurrentInspectVolumeNeverReportsFalseInUse(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	if _, err := gvx.CreateVolume(cacheDir, "shared-probe", gvx.DriverExt4lite); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	errs := make(chan error, 8)
+	for range 8 {
+		go func() {
+			for range 16 {
+				vi, err := gvx.InspectVolume(cacheDir, "shared-probe")
+				if err != nil {
+					errs <- err
+					return
+				}
+				if vi.InUse {
+					errs <- errors.New("concurrent read-only InspectVolume reported InUse = true")
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}

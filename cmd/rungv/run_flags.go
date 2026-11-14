@@ -355,6 +355,9 @@ func (f *sandboxFlagValues) resolveBackendAndNetwork(fs *flag.FlagSet, allowEmpt
 	}
 	arch := strings.ToLower(strings.TrimSpace(f.arch))
 	if imageArch != "" {
+		if flagVisited(fs, "arch") && arch != "" && arch != imageArch {
+			return "", "", "", "", fmt.Errorf("--arch=%s conflicts with --platform=linux/%s", arch, imageArch)
+		}
 		arch = imageArch
 	}
 	var netMode gvx.NetworkMode

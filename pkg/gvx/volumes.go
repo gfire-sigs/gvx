@@ -122,6 +122,9 @@ func CreateVolume(cacheDir, name string, driver MountDriver) (VolumeInfo, error)
 		}
 		f, err := os.OpenFile(imgPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return InspectVolume(cacheDir, name)
+			}
 			return VolumeInfo{}, fmt.Errorf("gvx: create volume %q: %w", name, err)
 		}
 		vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{})
@@ -234,7 +237,10 @@ func RemoveVolume(cacheDir, name string) error {
 	}
 	switch vi.Driver {
 	case DriverExt4lite:
-		if err := os.Remove(vi.Mountpoint); err != nil {
+		if err := ext4lite.RemoveVolumeFile(vi.Mountpoint); err != nil {
+			if errors.Is(err, ErrVolumeInUse) {
+				return fmt.Errorf("gvx: volume %q is in use: %w", vi.Name, ErrVolumeInUse)
+			}
 			if errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("%w: %s", ErrVolumeNotFound, vi.Name)
 			}

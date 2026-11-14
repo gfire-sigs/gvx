@@ -55,12 +55,8 @@ func pullSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	target := remaining[0]
 	registryURL := strings.TrimSpace(*registryURLFlag)
-	if p := strings.TrimSpace(*platformFlag); p != "" {
-		platArch, err := parseImagePlatformArch(p)
-		if err != nil {
-			return imageUsageError(stderr, "pull", "--platform: %v", err)
-		}
-		*cacheFlags.arch = platArch
+	if _, err := applyPlatformFlag(fs, *platformFlag, cacheFlags.arch); err != nil {
+		return imageUsageError(stderr, "pull", "%v", err)
 	}
 
 	cache, arch, err := cacheFlags.openPullCache(*hostDNS)

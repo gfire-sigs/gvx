@@ -45,7 +45,8 @@ type SystemInfo struct {
 }
 
 // ProbeSystemInfo inspects available execution backends, lockdown profile, and
-// local image and volume store statistics without applying host lockdown.
+// local image and volume store statistics without applying host lockdown. On
+// hosts that probe systrap, it initializes the reusable stub host process.
 func ProbeSystemInfo(cacheDir string, tuned tuning.Values) (SystemInfo, error) {
 	cacheDir = strings.TrimSpace(cacheDir)
 	resolvedCacheDir := cacheDir
@@ -94,8 +95,10 @@ func hostLockdownProfileName(goos string) string {
 		return "restricted-token+job-object+file-broker"
 	case "darwin":
 		return "seatbelt"
-	case "linux", "android":
+	case "linux":
 		return "landlock+seccomp"
+	case "android":
+		return "selinux+seccomp"
 	default:
 		return "none"
 	}

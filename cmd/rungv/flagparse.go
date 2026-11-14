@@ -59,10 +59,14 @@ func normalizeCommandArgs(fs *flag.FlagSet, args []string) []string {
 func normalizeArgs(fs *flag.FlagSet, args []string, stopAtPositional bool) []string {
 	flagArgs := make([]string, 0, len(args))
 	var posArgs []string
+	missingValue := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
+			if missingValue {
+				return flagArgs
+			}
 			if stopAtPositional {
 				return append(flagArgs, args[i:]...)
 			}
@@ -80,9 +84,13 @@ func normalizeArgs(fs *flag.FlagSet, args []string, stopAtPositional bool) []str
 			name, _, hasEq := strings.Cut(arg[2:], "=")
 			flagArgs = append(flagArgs, arg)
 			if !hasEq {
-				if f := fs.Lookup(name); f != nil && !isBoolFlag(f) && i+1 < len(args) {
-					i++
-					flagArgs = append(flagArgs, args[i])
+				if f := fs.Lookup(name); f != nil && !isBoolFlag(f) {
+					if i+1 < len(args) && args[i+1] != "--" {
+						i++
+						flagArgs = append(flagArgs, args[i])
+					} else {
+						missingValue = true
+					}
 				}
 			}
 			continue
@@ -92,9 +100,13 @@ func normalizeArgs(fs *flag.FlagSet, args []string, stopAtPositional bool) []str
 		name, _, hasEq := strings.Cut(body, "=")
 		if f := fs.Lookup(name); f != nil {
 			flagArgs = append(flagArgs, arg)
-			if !hasEq && !isBoolFlag(f) && i+1 < len(args) {
-				i++
-				flagArgs = append(flagArgs, args[i])
+			if !hasEq && !isBoolFlag(f) {
+				if i+1 < len(args) && args[i+1] != "--" {
+					i++
+					flagArgs = append(flagArgs, args[i])
+				} else {
+					missingValue = true
+				}
 			}
 			continue
 		}
@@ -105,9 +117,13 @@ func normalizeArgs(fs *flag.FlagSet, args []string, stopAtPositional bool) []str
 		if len(body) > 1 {
 			if expanded, needNext, ok := expandShortToken(fs, body); ok {
 				flagArgs = append(flagArgs, expanded...)
-				if needNext && i+1 < len(args) {
-					i++
-					flagArgs = append(flagArgs, args[i])
+				if needNext {
+					if i+1 < len(args) && args[i+1] != "--" {
+						i++
+						flagArgs = append(flagArgs, args[i])
+					} else {
+						missingValue = true
+					}
 				}
 				continue
 			}
@@ -115,7 +131,7 @@ func normalizeArgs(fs *flag.FlagSet, args []string, stopAtPositional bool) []str
 		flagArgs = append(flagArgs, arg)
 	}
 
-	if stopAtPositional || len(posArgs) == 0 {
+	if stopAtPositional || len(posArgs) == 0 || missingValue {
 		return flagArgs
 	}
 	out := make([]string, 0, len(flagArgs)+1+len(posArgs))

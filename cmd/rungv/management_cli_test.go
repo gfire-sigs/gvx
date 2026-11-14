@@ -175,8 +175,23 @@ func TestSystemInfoDFPruneAndCompletionCommands(t *testing.T) {
 		t.Fatalf("info Volumes = %d, want 1", si.Volumes)
 	}
 
+	infoTable := runCLIArgs(t, nil, "info", "--format", `table {{.OS}}\t{{.Volumes}}`, "-cache-dir", env.cacheDir).mustSucceed(t, "rungv info table template")
+	if strings.Contains(infoTable.stdout, `\t`) || !strings.Contains(infoTable.stdout, runtime.GOOS) {
+		t.Fatalf("info table template output = %q", infoTable.stdout)
+	}
+	if badInspect := runCLIArgs(t, nil, "volume", "inspect", "--format", "table", "sysvol", "-cache-dir", env.cacheDir); badInspect.code != 2 {
+		t.Fatalf("volume inspect --format table exited %d, want 2 (stderr: %s)", badInspect.code, badInspect.stderr)
+	}
+
+	otherArch := "arm64"
+	if runtime.GOARCH == "arm64" {
+		otherArch = "amd64"
+	}
+	reg := startRegistryForArch(t, otherArch, twoFiles()...)
+	runCLIArgs(t, nil, "pull", "--platform", "linux/"+otherArch, "-cache-dir", env.cacheDir, reg.ref("v1")).mustSucceed(t, "pull foreign arch")
+
 	dfOut := runCLIArgs(t, nil, "system", "df", "-v", "-cache-dir", env.cacheDir).mustSucceed(t, "system df -v").stdout
-	for _, want := range []string{"TYPE", "Images", "Local Volumes", "sysvol"} {
+	for _, want := range []string{"TYPE", "Images", "Local Volumes", "sysvol", otherArch} {
 		if !strings.Contains(dfOut, want) {
 			t.Errorf("system df -v lacks %q:\n%s", want, dfOut)
 		}
@@ -185,6 +200,9 @@ func TestSystemInfoDFPruneAndCompletionCommands(t *testing.T) {
 	runCLIArgs(t, nil, "system", "prune", "-af", "--volumes", "-cache-dir", env.cacheDir).mustSucceed(t, "system prune -af --volumes")
 	if rem := strings.Fields(runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir).stdout); len(rem) != 0 {
 		t.Fatalf("volumes after system prune --volumes = %v, want empty", rem)
+	}
+	if remImgs := strings.Fields(runCLIArgs(t, nil, "images", "-aq", "-arch", otherArch, "-cache-dir", env.cacheDir).stdout); len(remImgs) != 0 {
+		t.Fatalf("foreign-arch images after multi-arch system prune = %v, want empty", remImgs)
 	}
 
 	for _, sh := range []string{"bash", "zsh", "fish", "powershell"} {

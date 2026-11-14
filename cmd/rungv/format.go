@@ -173,12 +173,7 @@ func renderInspectFormat[T any](w io.Writer, formatSpec string, items []T) (usag
 		return fmt.Errorf("invalid --format template: %w", err), nil
 	}
 	if tmpl == nil {
-		raw, err := json.MarshalIndent(items, "", "    ")
-		if err != nil {
-			return nil, err
-		}
-		_, err = fmt.Fprintf(w, "%s\n", raw)
-		return nil, err
+		return fmt.Errorf("invalid --format %q: table requires a Go template expression", formatSpec), nil
 	}
 	out := w
 	var tw *tabwriter.Writer
@@ -218,13 +213,23 @@ func renderSingleFormat[T any](w io.Writer, formatSpec string, item T, writeDefa
 		_, err = fmt.Fprintf(w, "%s\n", raw)
 		return nil, err
 	}
-	tmpl, _, err := compileFormatTemplate(spec)
+	tmpl, isTable, err := compileFormatTemplate(spec)
 	if err != nil {
 		return fmt.Errorf("invalid --format template: %w", err), nil
+	}
+	if tmpl == nil {
+		return nil, writeDefault(w)
 	}
 	var line bytes.Buffer
 	if err := tmpl.Execute(&line, item); err != nil {
 		return fmt.Errorf("evaluate --format template: %w", err), nil
+	}
+	if isTable {
+		tw := tabwriter.NewWriter(w, 10, 1, 3, ' ', 0)
+		if _, err := fmt.Fprintln(tw, line.String()); err != nil {
+			return nil, err
+		}
+		return nil, tw.Flush()
 	}
 	_, err = fmt.Fprintln(w, line.String())
 	return nil, err

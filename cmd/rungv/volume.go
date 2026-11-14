@@ -185,8 +185,12 @@ func volumeInspectSubcommand(_ context.Context, args []string, stdout, stderr io
 		return imageUsageError(stderr, cmdName, "missing VOLUME argument")
 	}
 	if spec := strings.TrimSpace(format); spec != "" && spec != "json" {
-		if _, _, err := compileFormatTemplate(spec); err != nil {
+		tmpl, _, err := compileFormatTemplate(spec)
+		if err != nil {
 			return imageUsageError(stderr, cmdName, "invalid --format %q: %v", format, err)
+		}
+		if tmpl == nil {
+			return imageUsageError(stderr, cmdName, "invalid --format %q: table requires a Go template expression", format)
 		}
 	}
 
