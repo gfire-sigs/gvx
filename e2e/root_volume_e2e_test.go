@@ -20,11 +20,18 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -159,9 +166,36 @@ func buildCheckpointProbeOCIArchive(t *testing.T) string {
 	return archivePath
 }
 
+func writeE2ETestHostCAPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test CA key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               pkix.Name{CommonName: "gvx-e2e-rootvol-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create test CA cert: %v", err)
+	}
+	caPath := filepath.Join(t.TempDir(), "e2e-ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write test CA PEM: %v", err)
+	}
+	return caPath
+}
+
 func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 	rungvBin := toolPath(t, rungvPkg)
 	archive := buildCheckpointProbeOCIArchive(t)
+	t.Setenv("SSL_CERT_FILE", writeE2ETestHostCAPEM(t))
 
 	for _, b := range fixedAddressBackends() {
 		for _, layout := range []struct {
@@ -196,6 +230,7 @@ func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 						"-platform="+string(b.plat),
 						"-net=none",
 						"-cache-dir="+cacheDir,
+						"--host-ca-certs",
 						"-rootfs-volume="+rootSpec,
 						archive,
 						"-mode="+mode,
@@ -233,6 +268,8 @@ func TestE2ERootfsVolumePersistenceAndCLI(t *testing.T) {
 
 				runStep("rootfs-verify", "VERIFIED:rootfs")
 				requireCleanImage(t, imgPath, "rootfs-verify")
+				runStep("rootfs-verify", "VERIFIED:rootfs")
+				requireCleanImage(t, imgPath, "rootfs-verify-boot3")
 				if fsck, err := exec.LookPath("e2fsck"); err == nil {
 					if out, err := exec.Command(fsck, "-fn", imgPath).CombinedOutput(); err != nil {
 						t.Errorf("e2fsck -fn %s: %v\n%s", imgPath, err, out)

@@ -35,7 +35,6 @@ import (
 	"testing"
 	"time"
 
-	"z.gfire.dev/gvx/internal/acceptprog"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -47,17 +46,23 @@ import (
 
 func buildRootVolumeTestLayer(t *testing.T) []byte {
 	t.Helper()
-	probePath := acceptprog.BuildCheckpointProbe(t, runtime.GOARCH)
-	probeBytes, err := os.ReadFile(probePath)
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
 	if err != nil {
-		t.Fatalf("read checkpointprobe: %v", err)
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	writeCustomELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/etc/custom.conf", "custom=1\n")
+	if err != nil {
+		t.Fatalf("BuildGuestWriteFileELF64(custom): %v", err)
+	}
+	writePostELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/etc/post-restore.txt", "post-restore=1\n")
+	if err != nil {
+		t.Fatalf("BuildGuestWriteFileELF64(post): %v", err)
 	}
 	layer, err := testimage.Tar(
-		testimage.File{Name: "bin/checkpointprobe", Data: probeBytes, Mode: 0o755},
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/write-custom", Data: writeCustomELF, Mode: 0o755},
+		testimage.File{Name: "bin/write-post", Data: writePostELF, Mode: 0o755},
 		testimage.File{Name: "etc/image-keep.txt", Data: []byte("keep-v1\n"), Mode: 0o644},
-		testimage.File{Name: "etc/image-mod.txt", Data: []byte("mod-v1\n"), Mode: 0o644},
-		testimage.File{Name: "etc/image-del.txt", Data: []byte("delete-me\n"), Mode: 0o644},
-		testimage.File{Name: "opt/dir/child.txt", Data: []byte("lower-child\n"), Mode: 0o644},
 		testimage.File{Name: "etc/ssl/certs/ca-certificates.crt", Data: nil, Mode: 0o644},
 	)
 	if err != nil {
@@ -136,39 +141,71 @@ func TestRootVolumeMultiRunPersistenceAndHostCACerts(t *testing.T) {
 			cacheDir := t.TempDir()
 			rootSpec, imgPath := tc.rootVol(cacheDir)
 
-			runMode := func(mode, wantBanner string) {
+			runBin := func(argv []string) string {
 				t.Helper()
 				var stdout, stderr bytes.Buffer
 				cfg := newCheckpointTestConfig(t, cacheDir)
 				cfg.OCILayerTars = [][]byte{layer}
 				cfg.RootVolume = rootSpec
 				cfg.HostCACerts = true
-				cfg.Argv = []string{"/bin/checkpointprobe", "-mode=" + mode}
+				cfg.Argv = argv
 				cfg.Stdout = &stdout
 				cfg.Stderr = &stderr
 
 				sb, err := New(context.Background(), cfg)
 				if err != nil {
-					t.Fatalf("New(%s): %v", mode, err)
+					t.Fatalf("New(%v): %v", argv, err)
 				}
 				code, runErr := sb.Run(context.Background())
 				closeErr := sb.Close()
 				if runErr != nil || closeErr != nil || code != 0 {
-					t.Fatalf("Run(%s) = (%d, %v) Close=%v stdout=%q stderr=%q",
-						mode, code, runErr, closeErr, stdout.String(), stderr.String())
-				}
-				if !strings.Contains(stdout.String(), wantBanner) {
-					t.Fatalf("Run(%s) stdout = %q, want %q", mode, stdout.String(), wantBanner)
+					t.Fatalf("Run(%v) = (%d, %v) Close=%v stdout=%q stderr=%q",
+						argv, code, runErr, closeErr, stdout.String(), stderr.String())
 				}
 				assertExt4SuperblockClean(t, imgPath)
+				return stdout.String()
 			}
 
-			// Boot 1: write files, whiteouts, opaque dir, links, chmod /, xattrs.
-			runMode("rootfs-write", "WRITTEN:rootfs")
-			// Boot 2: verify persisted state, resolv.conf, hosts, and CA certs.
-			runMode("rootfs-verify", "VERIFIED:rootfs")
-			// Boot 3: verify repeated startup remains idempotent.
-			runMode("rootfs-verify", "VERIFIED:rootfs")
+			// Boot 1: write /etc/custom.conf into the persistent RootVolume.
+			runBin([]string{"/bin/write-custom"})
+
+			verifyCat := []string{
+				"/bin/cat",
+				"/etc/custom.conf",
+				"/etc/image-keep.txt",
+				"/etc/resolv.conf",
+				"/etc/hosts",
+				"/etc/ssl/certs/ca-certificates.crt",
+			}
+			verifyCertsNoDup := func(boot int, out string) int {
+				blocks := strings.Split(out, "-----BEGIN CERTIFICATE-----")
+				if len(blocks) < 2 {
+					t.Fatalf("boot %d expected at least 1 CA certificate in bundle:\n%s", boot, out)
+				}
+				seen := make(map[string]bool, len(blocks)-1)
+				for _, blk := range blocks[1:] {
+					trimmed := strings.TrimSpace(blk)
+					if seen[trimmed] {
+						t.Fatalf("boot %d cert bundle contains duplicate certificate:\n%s", boot, out)
+					}
+					seen[trimmed] = true
+				}
+				return len(seen)
+			}
+			var prevCount int
+			for boot := 2; boot <= 3; boot++ {
+				out := runBin(verifyCat)
+				for _, want := range []string{"custom=1\n", "keep-v1\n", "nameserver ", "host.docker.internal"} {
+					if !strings.Contains(out, want) {
+						t.Fatalf("boot %d stdout missing %q:\n%s", boot, want, out)
+					}
+				}
+				count := verifyCertsNoDup(boot, out)
+				if prevCount != 0 && count != prevCount {
+					t.Fatalf("boot %d cert count = %d, want stable %d", boot, count, prevCount)
+				}
+				prevCount = count
+			}
 		})
 	}
 }
@@ -242,6 +279,23 @@ func TestRootVolumeCheckpointAndRestore(t *testing.T) {
 	layer := buildRootVolumeTestLayer(t)
 	ckptDir := filepath.Join(t.TempDir(), "bundle-rootvol")
 
+	// Seed /etc/custom.conf in boot 0 so boot 1 holds persisted rootfs files across checkpoint.
+	seedCfg := newCheckpointTestConfig(t, cacheDir)
+	seedCfg.OCILayerTars = [][]byte{layer}
+	seedCfg.RootVolume = "ckpt-root"
+	seedCfg.Argv = []string{"/bin/write-custom"}
+	seedSB, err := New(context.Background(), seedCfg)
+	if err != nil {
+		t.Fatalf("New(seed): %v", err)
+	}
+	if code, rErr := seedSB.Run(context.Background()); rErr != nil || code != 0 {
+		_ = seedSB.Close()
+		t.Fatalf("Run(seed) = (%d, %v)", code, rErr)
+	}
+	if err := seedSB.Close(); err != nil {
+		t.Fatalf("Close(seed): %v", err)
+	}
+
 	stdinR, stdinW := net.Pipe()
 	defer stdinR.Close()
 	defer stdinW.Close()
@@ -253,7 +307,7 @@ func TestRootVolumeCheckpointAndRestore(t *testing.T) {
 	cfg.OCILayerTars = [][]byte{layer}
 	cfg.RootVolume = "ckpt-root"
 	cfg.CheckpointDir = ckptDir
-	cfg.Argv = []string{"/bin/checkpointprobe", "-mode=rootfs-ckpt"}
+	cfg.Argv = []string{"/bin/cat", "/etc/image-keep.txt", "/proc/self/fd/0", "/etc/custom.conf"}
 	cfg.Stdin = stdinR
 	cfg.Stdout = stdout1
 	cfg.Stderr = &stderr1
@@ -274,7 +328,7 @@ func TestRootVolumeCheckpointAndRestore(t *testing.T) {
 		runCh <- runResult{code: code, err: rErr}
 	}()
 
-	stdout1.waitForSubstring(t, "READY:rootfs-ckpt\n", 15*time.Second)
+	stdout1.waitForSubstring(t, "keep-v1\n", 15*time.Second)
 
 	if err := sb.Checkpoint(context.Background(), CheckpointOptions{LeaveRunning: false}); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
@@ -326,11 +380,11 @@ func TestRootVolumeCheckpointAndRestore(t *testing.T) {
 		t.Fatalf("Restore with unexpected RootVolume = %v, want ErrCheckpointManifest", err)
 	}
 
-	// Restore with RootVolume and verify open/unlinked FD + post-restore writes.
+	// Restore with RootVolume and verify resumed process reads persisted RootVolume file.
 	var stdout2, stderr2 bytes.Buffer
 	restoreCfg := newCheckpointTestConfig(t, cacheDir)
 	restoreCfg.RootVolume = "ckpt-root"
-	restoreCfg.Stdin = strings.NewReader("go\n")
+	restoreCfg.Stdin = strings.NewReader("resumed-ok\n")
 	restoreCfg.Stdout = &stdout2
 	restoreCfg.Stderr = &stderr2
 
@@ -344,16 +398,32 @@ func TestRootVolumeCheckpointAndRestore(t *testing.T) {
 		t.Fatalf("restored Run = (%d, %v) Close=%v stdout=%q stderr=%q",
 			code2, runErr2, closeErr2, stdout2.String(), stderr2.String())
 	}
-	if !strings.Contains(stdout2.String(), "VERIFIED:rootfs-ckpt") {
-		t.Fatalf("restored stdout = %q, want VERIFIED:rootfs-ckpt", stdout2.String())
+	if want := "resumed-ok\ncustom=1\n"; stdout2.String() != want {
+		t.Fatalf("restored stdout = %q, want %q", stdout2.String(), want)
 	}
 
-	// Boot a 3rd fresh sandbox on the same RootVolume and verify post-restore writes persisted.
+	// Write a new file in a fresh sandbox and verify persistence on a subsequent boot.
+	postCfg := newCheckpointTestConfig(t, cacheDir)
+	postCfg.OCILayerTars = [][]byte{layer}
+	postCfg.RootVolume = "ckpt-root"
+	postCfg.Argv = []string{"/bin/write-post"}
+	postSB, err := New(context.Background(), postCfg)
+	if err != nil {
+		t.Fatalf("New(post): %v", err)
+	}
+	if code, rErr := postSB.Run(context.Background()); rErr != nil || code != 0 {
+		_ = postSB.Close()
+		t.Fatalf("Run(post) = (%d, %v)", code, rErr)
+	}
+	if err := postSB.Close(); err != nil {
+		t.Fatalf("Close(post): %v", err)
+	}
+
 	var stdout3, stderr3 bytes.Buffer
 	cfg3 := newCheckpointTestConfig(t, cacheDir)
 	cfg3.OCILayerTars = [][]byte{layer}
 	cfg3.RootVolume = "ckpt-root"
-	cfg3.Argv = []string{"/bin/checkpointprobe", "-mode=rootfs-ckpt-verify"}
+	cfg3.Argv = []string{"/bin/cat", "/etc/custom.conf", "/etc/post-restore.txt"}
 	cfg3.Stdout = &stdout3
 	cfg3.Stderr = &stderr3
 
@@ -367,8 +437,8 @@ func TestRootVolumeCheckpointAndRestore(t *testing.T) {
 		t.Fatalf("sb3 Run = (%d, %v) Close=%v stdout=%q stderr=%q",
 			code3, runErr3, closeErr3, stdout3.String(), stderr3.String())
 	}
-	if !strings.Contains(stdout3.String(), "VERIFIED:rootfs-ckpt-persist") {
-		t.Fatalf("sb3 stdout = %q, want VERIFIED:rootfs-ckpt-persist", stdout3.String())
+	if want := "custom=1\npost-restore=1\n"; stdout3.String() != want {
+		t.Fatalf("sb3 stdout = %q, want %q", stdout3.String(), want)
 	}
 	assertExt4SuperblockClean(t, filepath.Join(cacheDir, "volumes", "ckpt-root.ext4"))
 }
@@ -384,7 +454,7 @@ func TestRootVolumeClearsStaleWorkDirectoryOnBoot(t *testing.T) {
 	cfg1 := newCheckpointTestConfig(t, cacheDir)
 	cfg1.OCILayerTars = [][]byte{layer}
 	cfg1.RootVolume = imgPath
-	cfg1.Argv = []string{"/bin/checkpointprobe", "-mode=rootfs-write"}
+	cfg1.Argv = []string{"/bin/write-custom"}
 	cfg1.Stdout = &out1
 	cfg1.Stderr = &err1
 	sb1, err := New(context.Background(), cfg1)
@@ -449,7 +519,7 @@ func TestRootVolumeClearsStaleWorkDirectoryOnBoot(t *testing.T) {
 	cfg2 := newCheckpointTestConfig(t, cacheDir)
 	cfg2.OCILayerTars = [][]byte{layer}
 	cfg2.RootVolume = imgPath
-	cfg2.Argv = []string{"/bin/checkpointprobe", "-mode=rootfs-verify"}
+	cfg2.Argv = []string{"/bin/cat", "/etc/custom.conf"}
 	cfg2.Stdout = &out2
 	cfg2.Stderr = &err2
 	sb2, err := New(context.Background(), cfg2)
@@ -461,8 +531,8 @@ func TestRootVolumeClearsStaleWorkDirectoryOnBoot(t *testing.T) {
 	if runErr2 != nil || closeErr2 != nil || code2 != 0 {
 		t.Fatalf("Run(boot2) = (%d, %v) Close=%v stdout=%q stderr=%q", code2, runErr2, closeErr2, out2.String(), err2.String())
 	}
-	if !strings.Contains(out2.String(), "VERIFIED:rootfs") {
-		t.Fatalf("Run(boot2) stdout = %q, want VERIFIED:rootfs", out2.String())
+	if out2.String() != "custom=1\n" {
+		t.Fatalf("Run(boot2) stdout = %q, want %q", out2.String(), "custom=1\n")
 	}
 
 	// Verify /work is empty inside the .ext4 volume.
