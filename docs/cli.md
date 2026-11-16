@@ -6,7 +6,7 @@
 
 `rungv` has no daemon. A run starts a sandbox, runs the guest command, and removes everything when the guest exits. Every run therefore behaves like `docker run --rm`.
 
-The writes of the guest go to a memory-backed layer on top of the read-only image layers. The only writes that outlive the run go to a bind mount, a named volume, or the image store of the host.
+By default, writes from the guest go to a memory-backed layer on top of the read-only image layers. Data outlives the run only when it goes to a bind mount, a named volume, a `-rootfs-volume` image, or the image store of the host.
 
 The host process locks itself down before the guest starts. After that point it cannot open a new host file, start a process, or create a socket. Every host resource of a run exists before the lockdown. This rule is the reason that `rungv` has no `exec`, no `logs`, and no `-d` in this stage.
 
@@ -65,7 +65,7 @@ The table below lists the `rungv run` flags that match the Docker command line.
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, one host file, or a named volume. |
 | `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. A `type=volume` source with a path separator names an image file. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
-| `--read-only` | Mount the root file system of the guest read-only. |
+| `--read-only` | Mount the root file system of the guest read-only. This option cannot combine with `-rootfs-volume`. |
 | `-m`, `--memory SIZE` | Limit the guest memory. The units are `b`, `k`, `m`, `g`, and `t`. The minimum is 6m. |
 | `--cpus N` | Limit the CPU quota. The value is a decimal number, such as `1.5`. |
 | `--network NAME` | `bridge` and `nat` select the NAT mode. `none` and `wg` are the other modes. `host` is refused. |
@@ -86,6 +86,7 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-allow-unconfined-systrap` | Allow `-backend=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted workloads on Windows require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
+| `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
 | `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
 | `--privileged` | On by default. Turns on `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` turns them off. A flag of the three that you set wins over `--privileged`. Section 4.8 describes the boundary. |
 | `--net-raw` | Let the guest open raw sockets and use `iptables`. `dockerd` needs it. The default comes from `--privileged`. |
@@ -224,7 +225,7 @@ The guest path of a mount is absolute and clean. It is not `/`. It is not `/proc
 
 The tmpfs options are `size`, `ro`, and `rw`. The option `size` takes a number with a binary unit. Any other tmpfs option stops the run with an error that names it.
 
-A volume with the `ext4lite` driver needs no lockdown rule for a host path. The sandbox opens the image file before the lockdown, and the guest reaches it only through that open file.
+A volume with the `ext4lite` driver needs no lockdown rule for a host path. The sandbox opens the image file before the lockdown, and the guest reaches it only through that open file. Pass `-rootfs-volume NAME` or `-rootfs-volume PATH` to persist writes on the root file system inside a managed or external `.ext4` image instead of `tmpfs`. The runtime opens the root volume before host lockdown, rejects `--read-only`, rejects raw `-bin` runs without image layers, and rejects the same `.ext4` file passed to both `-rootfs-volume` and `-v`.
 
 | Host OS | What the lockdown does with a mount |
 | :--- | :--- |
@@ -325,10 +326,10 @@ The bundle directory holds four files: `manifest.json`, `state.img`, `pages.meta
 | :--- | :--- |
 | `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before the lockdown. |
 | `rungv checkpoint -control-socket PATH [-checkpoint-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` is an alias). Without `-leave-running`, the sandbox stops and exits `0` after the save finishes. When `-checkpoint-dir` is set, the server verifies that it matches the pre-opened directory. |
-| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Reattach mounts, network flags, and control sockets; `-w` sets the working directory. |
+| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w` or `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `-net`, `-wg-config`, `-checkpoint-dir`, and `-control-socket` to reattach mounts, network backends, or a new checkpoint listener. |
 
 > [!IMPORTANT]
-> Pass the same workspace and volume mounts to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the layer digests, the platform, or the network mode do not match `manifest.json`.
+> Pass the same workspace, volume mounts, and `-rootfs-volume` flag to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the `root_volume` setting, the layer digests, the platform, or the network mode do not match `manifest.json`.
 
 1. Start a workload with `-checkpoint-dir` and `-control-socket`.
 2. Run `rungv checkpoint` in another terminal to write the bundle and stop the sandbox.
@@ -454,7 +455,7 @@ The table below lists Docker CLI features that differ or do not exist in `rungv`
 | Guest architecture | Must equal the host architecture, except with `-backend=systrap` (`-platform=systrap`). |
 | Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
 | A store into the page of the storing instruction | The Windows `systrap` engine completes the store with a single step, and the page runs the new bytes. Each such store costs three debug stops. On `arm64`, a store exclusive (`stxr`, `stlxr`, `stxp`, `stlxp`) into its own page ends with SIGSEGV. |
-| Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
+| Writes to the root file system | Lost at exit unless `-rootfs-volume` is active. Use `-rootfs-volume` or a mount for data that must stay. |
 
 ## 8. Examples
 
@@ -470,11 +471,12 @@ Publish the exposed port of an image to a free host port:
 rungv run -P nginx:alpine
 ```
 
-Create an `ext4lite` volume, mount it in a memory-limited guest, and inspect disk usage:
+Create an `ext4lite` volume, mount it as a data volume or persistent root overlay in a memory-limited guest, and inspect disk usage:
 
 ```sh
 rungv volume create appdata
 rungv run -m512m -v appdata:/var/lib/app myimage:1.0
+rungv run -rootfs-volume rootstate alpine:latest sh -c "echo saved >/etc/custom"
 rungv system df -v
 ```
 

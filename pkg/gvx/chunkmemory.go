@@ -47,4 +47,7 @@ func (s *Sandbox) attachChunkMemory() {
 	for _, vol := range s.volumes {
 		vol.SetChunkMemory(chunks)
 	}
+	if s.rootVolume != nil {
+		s.rootVolume.SetChunkMemory(chunks)
+	}
 }

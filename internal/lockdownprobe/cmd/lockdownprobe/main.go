@@ -87,6 +87,7 @@ func run() int {
 		return err
 	})
 	readOnlyRoot := flag.Bool("read-only-root", false, "mount the guest root file system read-only")
+	rootVolume := flag.String("rootfs-volume", "", "persistent ext4lite rootfs volume name or image path")
 	flag.Parse()
 
 	cfg := gvx.Config{
@@ -98,6 +99,7 @@ func run() int {
 		WorkspacePath:       *workspace,
 		Mounts:              mounts,
 		ReadOnlyRoot:        *readOnlyRoot,
+		RootVolume:          *rootVolume,
 		OCICacheDir:         *cacheDir,
 		DisableHostLockdown: !*lockdown,
 	}

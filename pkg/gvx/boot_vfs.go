@@ -97,16 +97,17 @@ func registerKernelVFS(vfsObj *vfs.VirtualFilesystem, rootNetNS *inet.Namespace)
 // "namespace NEWNS is not supported".
 func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, k *kernel.Kernel, creds *auth.Credentials) (*vfs.MountNamespace, error) {
 	vfsObj := k.VFS()
-	rootMnt, err := s.mountGuestRoot(sctx, vfsObj, creds)
-	if err != nil {
-		return nil, err
-	}
-	defer rootMnt.DecRef(sctx)
-
 	mntns, err := vfsObj.NewMountNamespace(sctx, creds, "rootfs", "tmpfs", &vfs.MountOptions{ReadOnly: true, Locked: true}, k)
 	if err != nil {
 		return nil, fmt.Errorf("gvx: create guest mount namespace: %w", err)
 	}
+	rootMnt, err := s.mountGuestRoot(vfs.WithMountNamespace(sctx, mntns), vfsObj, creds)
+	if err != nil {
+		mntns.DecRef(sctx)
+		return nil, err
+	}
+	defer rootMnt.DecRef(sctx)
+
 	nsRoot := mntns.Root(sctx)
 	defer nsRoot.DecRef(sctx)
 	if err := vfsObj.ConnectMountAt(sctx, creds, rootMnt, &vfs.PathOperation{Root: nsRoot, Start: nsRoot}); err != nil {
@@ -122,9 +123,13 @@ func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, k *kerne
 var rootUpperOptions = vfs.GetFilesystemOptions{InternalData: tmpfs.FilesystemOpts{DisableDefaultSizeLimit: true}}
 
 // mountGuestRoot creates the disconnected root mount of the guest: an overlay
-// of a tmpfs on the EROFS layers, or a plain tmpfs when the guest has no image.
+// of a tmpfs or ext4lite upper layer on the EROFS layers, or a plain tmpfs
+// when the guest has no image.
 func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.Mount, error) {
 	if len(s.layerHandles) == 0 {
+		if s.rootVolume != nil {
+			return nil, fmt.Errorf("%w: RootVolume requires OCI image layers", ErrInvalidConfig)
+		}
 		mnt, err := vfsObj.MountDisconnected(sctx, creds, "", "tmpfs", &vfs.MountOptions{GetFilesystemOptions: rootUpperOptions})
 		if err != nil {
 			return nil, fmt.Errorf("gvx: create tmpfs root: %w", err)
@@ -134,8 +139,9 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 
 	// The EROFS layers are the root disk of the guest, as the image of a
 	// virtual machine is. Its reads show in /proc/diskstats as vda, and the
-	// directories of the root overlay report its device numbers. The writes of
-	// the guest go to the tmpfs upper layer, which is memory and not a disk.
+	// directories of the root overlay report its device numbers. When
+	// RootVolume is set, writes persist in an ext4lite volume; otherwise they
+	// go to the tmpfs upper layer in memory.
 	rootStats := blockdev.NewStats(nil)
 	disks := blockdev.Of(vfsObj)
 	rootDisk, err := disks.Add(blockdev.Options{
@@ -159,13 +165,23 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	}
 	defer releaseVirtualDentries(sctx, lowerRoots)
 
-	upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
-	if err != nil {
-		return nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
+	var upperRoot vfs.VirtualDentry
+	if s.rootVolume != nil {
+		var upperExisting bool
+		upperRoot, upperExisting, err = s.prepareRootUpperOverlay(sctx, vfsObj, creds)
+		if err != nil {
+			return nil, err
+		}
+		s.rootUpperExisting = upperExisting
+	} else {
+		upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
+		if err != nil {
+			return nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
+		}
+		upperMnt := vfsObj.NewDisconnectedMount(upperFS, upperRootDentry, &vfs.MountOptions{})
+		upperFS.DecRef(sctx)
+		upperRoot = vfs.MakeVirtualDentry(upperMnt, upperRootDentry)
 	}
-	upperMnt := vfsObj.NewDisconnectedMount(upperFS, upperRootDentry, &vfs.MountOptions{})
-	upperFS.DecRef(sctx)
-	upperRoot := vfs.MakeVirtualDentry(upperMnt, upperRootDentry)
 	defer upperRoot.DecRef(sctx)
 
 	mnt, err := vfsObj.MountDisconnected(sctx, creds, "overlay", "overlay", &vfs.MountOptions{
@@ -183,6 +199,109 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	}
 	mounted = true
 	return mnt, nil
+}
+
+// prepareRootUpperOverlay mounts s.rootVolume via ext4lite, prepares the upper
+// and empty work directories inside it, and returns a disconnected mount
+// rooted at upper along with whether upper already existed.
+func (s *Sandbox) prepareRootUpperOverlay(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (vfs.VirtualDentry, bool, error) {
+	ext4FS, ext4RootDentry, err := ext4lite.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
+		InternalData: ext4lite.InternalFilesystemOptions{
+			Volume:   s.rootVolume,
+			UniqueID: rootVolumeUniqueID,
+		},
+	})
+	if err != nil {
+		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: mount root volume: %w", err)
+	}
+	ext4Mnt := vfsObj.NewDisconnectedMount(ext4FS, ext4RootDentry, &vfs.MountOptions{})
+	ext4FS.DecRef(sctx)
+	ext4Root := vfs.MakeVirtualDentry(ext4Mnt, ext4RootDentry)
+	defer ext4Root.DecRef(sctx)
+
+	upperPop := vfs.PathOperation{Root: ext4Root, Start: ext4Root, Path: makeFPath("/upper")}
+	upperVD, err := vfsObj.GetDentryAt(sctx, creds, &upperPop, &vfs.GetDentryOptions{CheckSearchable: true})
+	upperExisting := true
+	if linuxerr.Equals(linuxerr.ENOENT, err) {
+		upperExisting = false
+		if mkErr := vfsObj.MkdirAt(sctx, creds, &upperPop, &vfs.MkdirOptions{Mode: 0o755}); mkErr != nil {
+			return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: create root volume upper directory: %w", mkErr)
+		}
+		upperVD, err = vfsObj.GetDentryAt(sctx, creds, &upperPop, &vfs.GetDentryOptions{CheckSearchable: true})
+	}
+	if err != nil {
+		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: open root volume upper directory: %w", err)
+	}
+	defer upperVD.DecRef(sctx)
+
+	if err := ensureEmptyDir(sctx, vfsObj, creds, ext4Root, "/work"); err != nil {
+		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: prepare root volume work directory: %w", err)
+	}
+
+	upperDentry := upperVD.Dentry()
+	upperMnt := vfsObj.NewDisconnectedMount(ext4FS, upperDentry, &vfs.MountOptions{})
+	upperDentry.IncRef()
+	return vfs.MakeVirtualDentry(upperMnt, upperDentry), upperExisting, nil
+}
+
+// ensureEmptyDir creates dirPath under root or clears existing contents when it
+// already exists.
+func ensureEmptyDir(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, dirPath string) error {
+	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(dirPath)}
+	err := vfsObj.MkdirAt(sctx, creds, &pop, &vfs.MkdirOptions{Mode: 0o755})
+	if err == nil {
+		return nil
+	}
+	if !linuxerr.Equals(linuxerr.EEXIST, err) {
+		return err
+	}
+	return clearDirContents(sctx, vfsObj, creds, root, dirPath)
+}
+
+func clearDirContents(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, dirPath string) error {
+	pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(dirPath)}
+	fd, err := vfsObj.OpenAt(sctx, creds, &pop, &vfs.OpenOptions{
+		Flags: linux.O_RDONLY | linux.O_DIRECTORY,
+	})
+	if err != nil {
+		return err
+	}
+	type childEntry struct {
+		name  string
+		isDir bool
+	}
+	var children []childEntry
+	iterErr := fd.IterDirents(sctx, vfs.IterDirentsCallbackFunc(func(d vfs.Dirent) error {
+		if d.Name == "." || d.Name == ".." {
+			return nil
+		}
+		children = append(children, childEntry{
+			name:  d.Name,
+			isDir: d.Type == linux.DT_DIR,
+		})
+		return nil
+	}))
+	fd.DecRef(sctx)
+	if iterErr != nil {
+		return iterErr
+	}
+	for _, child := range children {
+		childPath := path.Join(dirPath, child.name)
+		cPop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(childPath)}
+		if child.isDir {
+			if err := clearDirContents(sctx, vfsObj, creds, root, childPath); err != nil {
+				return err
+			}
+			if err := vfsObj.RmdirAt(sctx, creds, &cPop); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := vfsObj.UnlinkAt(sctx, creds, &cPop); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mountEROFSLowerLayers mounts each EROFS layer from top to bottom and returns
@@ -230,7 +349,7 @@ func releaseVirtualDentries(sctx gvcontext.Context, dentries []vfs.VirtualDentry
 }
 
 func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
-	if err := createDefaultGuestDirs(sctx, vfsObj, creds, root); err != nil {
+	if err := createDefaultGuestDirs(sctx, vfsObj, creds, root, s.rootUpperExisting); err != nil {
 		return err
 	}
 	mountSubfs := func(target, fsName string, opts *vfs.MountOptions) error {
@@ -273,14 +392,17 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	return nil
 }
 
-func createDefaultGuestDirs(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
+func createDefaultGuestDirs(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, preserveRootMode bool) error {
 	// The tmpfs that holds the writes of the guest has the mode 01777, and the
 	// overlay shows it as the mode of "/". A guest user that is not root could
-	// then create files in "/". Images use the mode 0755 for "/".
-	if err := vfsObj.SetStatAt(sctx, creds, &vfs.PathOperation{Root: root, Start: root, Path: makeFPath("/")}, &vfs.SetStatOptions{
-		Stat: linux.Statx{Mask: linux.STATX_MODE, Mode: 0o755},
-	}); err != nil {
-		return fmt.Errorf("gvx: set the mode of the guest root: %w", err)
+	// then create files in "/". Images use the mode 0755 for "/". Preserve any
+	// persisted mode when reusing an existing RootVolume upper directory.
+	if !preserveRootMode {
+		if err := vfsObj.SetStatAt(sctx, creds, &vfs.PathOperation{Root: root, Start: root, Path: makeFPath("/")}, &vfs.SetStatOptions{
+			Stat: linux.Statx{Mask: linux.STATX_MODE, Mode: 0o755},
+		}); err != nil {
+			return fmt.Errorf("gvx: set the mode of the guest root: %w", err)
+		}
 	}
 	for _, dir := range []string{"/proc", "/sys", "/dev", "/etc", "/root", "/workspace", "/bin", "/usr/bin"} {
 		if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, dir, 0o755); err != nil {

@@ -110,6 +110,14 @@ func main() {
 		err = runExt4liteVerifyMode(*volDir)
 	case "net":
 		err = runNetMode()
+	case "rootfs-write":
+		err = runRootfsWriteMode()
+	case "rootfs-verify":
+		err = runRootfsVerifyMode()
+	case "rootfs-ckpt":
+		err = runRootfsCheckpointMode()
+	case "rootfs-ckpt-verify":
+		err = runRootfsCheckpointVerifyMode()
 	default:
 		err = fmt.Errorf("unknown mode %q", *mode)
 	}
@@ -1062,5 +1070,265 @@ func runNetMode() error {
 	}
 
 	fmt.Println("VERIFIED:net")
+	return nil
+}
+
+const (
+	rootfsPreCkptText    = "pre-ckpt\n"
+	rootfsRootPreText    = "root-pre\n"
+	rootfsPostText       = "post-restore\n"
+	rootfsRootPostText   = "root-post\n"
+	rootfsUnlinkPreText  = "unlinked-before-ckpt\n"
+	rootfsUnlinkPostText = "unlinked-after-restore\n"
+)
+
+func runRootfsWriteMode() error {
+	keep, err := os.ReadFile("/etc/image-keep.txt")
+	if err != nil || string(keep) != "keep-v1\n" {
+		return fmt.Errorf("read /etc/image-keep.txt = (%q, %v), want keep-v1", keep, err)
+	}
+	resolv, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil || !strings.Contains(string(resolv), "nameserver ") {
+		return fmt.Errorf("read /etc/resolv.conf = (%q, %v)", resolv, err)
+	}
+	hosts, err := os.ReadFile("/etc/hosts")
+	if err != nil || !strings.Contains(string(hosts), "host.docker.internal") {
+		return fmt.Errorf("read /etc/hosts = (%q, %v)", hosts, err)
+	}
+	if err := os.WriteFile("/etc/custom.conf", []byte("custom=1\n"), 0o640); err != nil {
+		return fmt.Errorf("write /etc/custom.conf: %w", err)
+	}
+	if err := os.Chmod("/etc/custom.conf", 0o640); err != nil {
+		return fmt.Errorf("chmod /etc/custom.conf: %w", err)
+	}
+	if err := os.MkdirAll("/root/secretdir", 0o700); err != nil {
+		return fmt.Errorf("mkdir /root/secretdir: %w", err)
+	}
+	if err := os.Chmod("/root/secretdir", 0o700); err != nil {
+		return fmt.Errorf("chmod /root/secretdir: %w", err)
+	}
+	if err := os.WriteFile("/root/note.txt", []byte("root-note\n"), 0o600); err != nil {
+		return fmt.Errorf("write /root/note.txt: %w", err)
+	}
+	if err := os.Chmod("/root/note.txt", 0o600); err != nil {
+		return fmt.Errorf("chmod /root/note.txt: %w", err)
+	}
+	if err := os.WriteFile("/etc/image-mod.txt", []byte("mod-v2\n"), 0o644); err != nil {
+		return fmt.Errorf("modify /etc/image-mod.txt: %w", err)
+	}
+	if err := os.Remove("/etc/image-del.txt"); err != nil {
+		return fmt.Errorf("delete /etc/image-del.txt: %w", err)
+	}
+	if err := os.RemoveAll("/opt/dir"); err != nil {
+		return fmt.Errorf("remove /opt/dir: %w", err)
+	}
+	if err := os.MkdirAll("/opt/dir", 0o755); err != nil {
+		return fmt.Errorf("recreate /opt/dir: %w", err)
+	}
+	if err := os.WriteFile("/opt/dir/new.txt", []byte("opaque-ok\n"), 0o644); err != nil {
+		return fmt.Errorf("write /opt/dir/new.txt: %w", err)
+	}
+	if err := os.Symlink("/root/note.txt", "/root/link-note"); err != nil {
+		return fmt.Errorf("symlink /root/link-note: %w", err)
+	}
+	if err := os.Link("/root/note.txt", "/root/hard-note"); err != nil {
+		return fmt.Errorf("hardlink /root/hard-note: %w", err)
+	}
+	if err := unix.Setxattr("/root/note.txt", "user.gvx", []byte("root-xattr"), 0); err != nil {
+		return fmt.Errorf("setxattr /root/note.txt: %w", err)
+	}
+	if err := os.Chmod("/", 0o750); err != nil {
+		return fmt.Errorf("chmod /: %w", err)
+	}
+	unix.Sync()
+	fmt.Println("WRITTEN:rootfs")
+	return nil
+}
+
+func runRootfsVerifyMode() error {
+	rootInfo, err := os.Stat("/")
+	if err != nil {
+		return fmt.Errorf("stat /: %w", err)
+	}
+	if perm := rootInfo.Mode().Perm(); perm != 0o750 {
+		return fmt.Errorf("root / perm = %#o, want 0750", perm)
+	}
+	dirInfo, err := os.Stat("/root/secretdir")
+	if err != nil {
+		return fmt.Errorf("stat /root/secretdir: %w", err)
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode().Perm() != 0o700 {
+		return fmt.Errorf("/root/secretdir mode = %v, want dir 0700", dirInfo.Mode())
+	}
+	for _, tc := range []struct {
+		path string
+		want string
+		perm os.FileMode
+	}{
+		{"/etc/custom.conf", "custom=1\n", 0o640},
+		{"/root/note.txt", "root-note\n", 0o600},
+		{"/etc/image-keep.txt", "keep-v1\n", 0},
+		{"/etc/image-mod.txt", "mod-v2\n", 0},
+		{"/opt/dir/new.txt", "opaque-ok\n", 0},
+	} {
+		got, err := os.ReadFile(tc.path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", tc.path, err)
+		}
+		if string(got) != tc.want {
+			return fmt.Errorf("%s content = %q, want %q", tc.path, got, tc.want)
+		}
+		if tc.perm != 0 {
+			fi, err := os.Stat(tc.path)
+			if err != nil {
+				return fmt.Errorf("stat %s: %w", tc.path, err)
+			}
+			if fi.Mode().Perm() != tc.perm {
+				return fmt.Errorf("%s perm = %#o, want %#o", tc.path, fi.Mode().Perm(), tc.perm)
+			}
+		}
+	}
+	for _, gone := range []string{"/etc/image-del.txt", "/opt/dir/child.txt"} {
+		if _, err := os.Stat(gone); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%s still exists (err=%v), want ENOENT whiteout", gone, err)
+		}
+	}
+	target, err := os.Readlink("/root/link-note")
+	if err != nil || target != "/root/note.txt" {
+		return fmt.Errorf("readlink /root/link-note = (%q, %v), want /root/note.txt", target, err)
+	}
+	linkBody, err := os.ReadFile("/root/link-note")
+	if err != nil || string(linkBody) != "root-note\n" {
+		return fmt.Errorf("read /root/link-note = (%q, %v)", linkBody, err)
+	}
+	var stNote, stHard unix.Stat_t
+	if err := unix.Stat("/root/note.txt", &stNote); err != nil {
+		return fmt.Errorf("stat /root/note.txt: %w", err)
+	}
+	if err := unix.Stat("/root/hard-note", &stHard); err != nil {
+		return fmt.Errorf("stat /root/hard-note: %w", err)
+	}
+	if stNote.Nlink != 2 || stHard.Nlink != 2 || stNote.Ino != stHard.Ino {
+		return fmt.Errorf("hardlink mismatch: note=(ino=%d nlink=%d) hard=(ino=%d nlink=%d)", stNote.Ino, stNote.Nlink, stHard.Ino, stHard.Nlink)
+	}
+	xbuf := make([]byte, 32)
+	xn, err := unix.Getxattr("/root/note.txt", "user.gvx", xbuf)
+	if err != nil || string(xbuf[:xn]) != "root-xattr" {
+		return fmt.Errorf("getxattr /root/note.txt = (%q, %v), want root-xattr", xbuf[:max(xn, 0)], err)
+	}
+	resolv, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil || !strings.Contains(string(resolv), "nameserver ") {
+		return fmt.Errorf("read /etc/resolv.conf = (%q, %v)", resolv, err)
+	}
+	hosts, err := os.ReadFile("/etc/hosts")
+	if err != nil || strings.Count(string(hosts), "host.docker.internal") != 1 {
+		return fmt.Errorf("/etc/hosts unexpected = (%q, %v)", hosts, err)
+	}
+	if certBundle, err := os.ReadFile("/etc/ssl/certs/ca-certificates.crt"); err == nil {
+		blocks := strings.Split(string(certBundle), "-----BEGIN CERTIFICATE-----")
+		seen := make(map[string]bool)
+		for _, blk := range blocks[1:] {
+			trimmed := strings.TrimSpace(blk)
+			if seen[trimmed] {
+				return fmt.Errorf("duplicate certificate found in /etc/ssl/certs/ca-certificates.crt")
+			}
+			seen[trimmed] = true
+		}
+	}
+	fmt.Println("VERIFIED:rootfs")
+	return nil
+}
+
+func runRootfsCheckpointMode() error {
+	if err := os.WriteFile("/etc/pre-ckpt.txt", []byte(rootfsPreCkptText), 0o644); err != nil {
+		return fmt.Errorf("write /etc/pre-ckpt.txt: %w", err)
+	}
+	if err := os.WriteFile("/root/pre-ckpt.txt", []byte(rootfsRootPreText), 0o600); err != nil {
+		return fmt.Errorf("write /root/pre-ckpt.txt: %w", err)
+	}
+	unlinkedPath := "/root/open-unlinked.dat"
+	unlinkedFD, err := unix.Open(unlinkedPath, unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", unlinkedPath, err)
+	}
+	defer func() { _ = unix.Close(unlinkedFD) }()
+	if err := writeAllFD(unlinkedFD, []byte(rootfsUnlinkPreText)); err != nil {
+		return fmt.Errorf("write %s: %w", unlinkedPath, err)
+	}
+	if _, err := unix.Seek(unlinkedFD, 0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek %s: %w", unlinkedPath, err)
+	}
+	if err := unix.Unlink(unlinkedPath); err != nil {
+		return fmt.Errorf("unlink %s: %w", unlinkedPath, err)
+	}
+
+	fmt.Println("READY:rootfs-ckpt")
+	if err := waitForResumeSignal(); err != nil {
+		return err
+	}
+
+	if got, err := os.ReadFile("/etc/pre-ckpt.txt"); err != nil || string(got) != rootfsPreCkptText {
+		return fmt.Errorf("read /etc/pre-ckpt.txt after restore = (%q, %v)", got, err)
+	}
+	if got, err := os.ReadFile("/root/pre-ckpt.txt"); err != nil || string(got) != rootfsRootPreText {
+		return fmt.Errorf("read /root/pre-ckpt.txt after restore = (%q, %v)", got, err)
+	}
+	preBuf := make([]byte, len(rootfsUnlinkPreText))
+	if err := readFullFD(unlinkedFD, preBuf); err != nil {
+		return fmt.Errorf("read unlinked fd after restore: %w", err)
+	}
+	if string(preBuf) != rootfsUnlinkPreText {
+		return fmt.Errorf("unlinked fd content = %q, want %q", preBuf, rootfsUnlinkPreText)
+	}
+	if err := pwriteAllFD(unlinkedFD, []byte(rootfsUnlinkPostText), 0); err != nil {
+		return fmt.Errorf("pwrite unlinked fd after restore: %w", err)
+	}
+	postBuf := make([]byte, len(rootfsUnlinkPostText))
+	if err := preadFullFD(unlinkedFD, postBuf, 0); err != nil {
+		return fmt.Errorf("pread unlinked fd after restore: %w", err)
+	}
+	if string(postBuf) != rootfsUnlinkPostText {
+		return fmt.Errorf("unlinked fd post-write = %q, want %q", postBuf, rootfsUnlinkPostText)
+	}
+	if err := unix.Access(unlinkedPath, unix.F_OK); !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("access unlinked path after restore = %v, want ENOENT", err)
+	}
+	if err := unix.Close(unlinkedFD); err != nil {
+		return fmt.Errorf("close unlinked fd: %w", err)
+	}
+
+	if err := os.WriteFile("/etc/post-restore.txt", []byte(rootfsPostText), 0o644); err != nil {
+		return fmt.Errorf("write /etc/post-restore.txt: %w", err)
+	}
+	if err := os.WriteFile("/root/post-restore.txt", []byte(rootfsRootPostText), 0o600); err != nil {
+		return fmt.Errorf("write /root/post-restore.txt: %w", err)
+	}
+	unix.Sync()
+	fmt.Println("VERIFIED:rootfs-ckpt")
+	return nil
+}
+
+func runRootfsCheckpointVerifyMode() error {
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/etc/pre-ckpt.txt", rootfsPreCkptText},
+		{"/root/pre-ckpt.txt", rootfsRootPreText},
+		{"/etc/post-restore.txt", rootfsPostText},
+		{"/root/post-restore.txt", rootfsRootPostText},
+	} {
+		got, err := os.ReadFile(tc.path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", tc.path, err)
+		}
+		if string(got) != tc.want {
+			return fmt.Errorf("%s = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+	if _, err := os.Stat("/root/open-unlinked.dat"); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("/root/open-unlinked.dat still exists (err=%v), want ENOENT", err)
+	}
+	fmt.Println("VERIFIED:rootfs-ckpt-persist")
 	return nil
 }

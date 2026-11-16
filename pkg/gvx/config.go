@@ -248,6 +248,15 @@ type Config struct {
 	// mount of WorkspacePath and Mounts keep their own access flags.
 	ReadOnlyRoot bool
 
+	// RootVolume names a persistent ext4lite volume or a host .ext4 image
+	// path for the writable upper layer of the container root filesystem. A
+	// value without a path separator names <cacheDir>/volumes/<name>.ext4; a
+	// value with a path separator names an image file at that host path. When
+	// empty, writes to the root filesystem stay in memory and end at exit.
+	// RootVolume requires OCI image layers and cannot be combined with
+	// ReadOnlyRoot.
+	RootVolume string
+
 	// Argv is the command vector passed to the guest process.
 	Argv []string
 
@@ -382,6 +391,10 @@ func ParseHostDNSServers(raw []string) ([]netip.AddrPort, error) {
 // normalize applies defaults and rejects contradictory settings before New
 // opens any host handle. Every rejection wraps ErrInvalidConfig.
 func (c *Config) normalize() error {
+	return c.normalizeWithMode(false)
+}
+
+func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	if c.Platform == "" {
 		c.Platform = PlatformAuto
 	}
@@ -464,6 +477,9 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("%w: publishing the exposed ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
 	}
 	if err := c.validateMounts(); err != nil {
+		return err
+	}
+	if err := c.validateRootVolume(hasManifestLayers); err != nil {
 		return err
 	}
 

@@ -8,8 +8,8 @@ It is built on Google's [gVisor](https://github.com/google/gvisor) user-space ap
 # Run an Alpine container directly on Windows, macOS, or Linux (no daemon, no sudo)
 ./rungv run alpine:3.20 uname -a
 
-# Run Nginx with port forwarding, a persistent .ext4 volume, and a live host directory
-./rungv run -p 8080:80 -v appdata:/var/lib/nginx -workspace=./my-site nginx:alpine
+# Run Nginx with port forwarding, a persistent .ext4 rootfs or data volume, and a live host directory
+./rungv run -p 8080:80 -rootfs-volume nginx-root -v appdata:/var/lib/nginx -workspace=./my-site nginx:alpine
 
 # Checkpoint a running sandbox to disk and restore it later
 ./rungv checkpoint -control-socket ./ctrl.sock -checkpoint-dir ./snap
@@ -63,7 +63,7 @@ When you start a container with `rungv` or `pkg/gvx`, the host process compiles 
    - On Linux (`amd64`, `arm64`) and Android (`arm64`, including 16 KB page kernels), `gvx` uses `systrap` (`seccomp` + shared-memory trampolines + 4 KB sub-block paging).
 2. **In-Memory OCI-to-EROFS Compilation (`pkg/oci`)**:
    - Extracting a Linux container `.tar` layer onto Windows NTFS or default macOS APFS breaks case-sensitive filenames (`Makefile` vs `makefile`), device nodes, and Windows reserved names (`CON`, `AUX`, `NUL`).
-   - `pkg/oci` never extracts container layers onto the host filesystem. It streams `.tar.gz` and `.tar.zst` layers in memory and compiles them directly into read-only `<sha256>.erofs` images cached on disk, mounted under an in-memory `tmpfs` upper layer.
+   - `pkg/oci` never extracts container layers onto the host filesystem. It streams `.tar.gz` and `.tar.zst` layers in memory and compiles them directly into read-only `<sha256>.erofs` images cached on disk. By default, `gvx` mounts them under an in-memory `tmpfs` upper layer; `-rootfs-volume` (`Config.RootVolume`) mounts an `ext4lite` image as the persistent overlay upper layer instead.
 3. **Single-File Journaled `ext4` Volumes (`pkg/sentry/fsimpl/ext4lite`)**:
    - Named volumes (`-v appdata:/var/lib/data`) are backed by `ext4lite`, a pure-Go VFS2 driver that formats and mounts a single `<name>.ext4` file on the host.
    - `ext4lite` organizes disk space into self-contained 16 MiB block groups with extent trees, inline data for small files, directory indexing, extended attributes (`security.*`, `trusted.overlay.*`), and an ordered metadata journal (`jbd2`). On filesystems where sparse hole punching (`FSCTL_SET_ZERO_DATA` or `F_PUNCHHOLE`) is unavailable or exhausted, `ext4lite` falls back cleanly to dense block allocation and compacts unused tail groups on unmount.

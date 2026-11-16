@@ -491,10 +491,10 @@ func TestOpenMountsRejectsBusyAndDuplicateVolumes(t *testing.T) {
 	cache := t.TempDir()
 	open := func(mounts ...gvx.Mount) (*gvx.Sandbox, error) {
 		cfg := gvx.Config{OCICacheDir: cache, Mounts: mounts}
-		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
-			t.Fatal(err)
-		}
 		sb := gvx.NewSandboxForMountTest(cfg)
+		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
+			return sb, err
+		}
 		return sb, gvx.OpenMountsForTest(sb)
 	}
 	first, err := open(gvx.Mount{Kind: gvx.MountVolume, VolumeName: "shared", GuestPath: "/a"})
@@ -541,10 +541,10 @@ func TestOpenMountsVolumeAtImagePath(t *testing.T) {
 	image := filepath.Join(dir, "data.ext4")
 	open := func(mounts ...gvx.Mount) (*gvx.Sandbox, error) {
 		cfg := gvx.Config{OCICacheDir: t.TempDir(), Mounts: mounts}
-		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
-			t.Fatal(err)
-		}
 		sb := gvx.NewSandboxForMountTest(cfg)
+		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
+			return sb, err
+		}
 		return sb, gvx.OpenMountsForTest(sb)
 	}
 
@@ -766,5 +766,141 @@ func TestParseMountDriver(t *testing.T) {
 		if m, err := gvx.ParseMount(spec); err == nil {
 			t.Errorf("ParseMount(%q) = %+v, want an error", spec, m)
 		}
+	}
+}
+
+func TestConfigNormalizeRootVolumeValidation(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		cfg  gvx.Config
+	}{
+		{"managed name with image", gvx.Config{OCIImage: "alpine:3.20", RootVolume: "my-root_1.0"}},
+		{"image path with layer tars", gvx.Config{OCILayerTars: [][]byte{{1}}, RootVolume: filepath.Join(dir, "root.ext4")}},
+		{"windows path with image", gvx.Config{OCIImage: "alpine:3.20", RootVolume: `C:\vols\root.ext4`}},
+	} {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			if err := gvx.NormalizeConfigForTest(&tc.cfg); err != nil {
+				t.Fatalf("normalize() failed: %v", err)
+			}
+			if gvx.HasHostDirsForTest(tc.cfg) {
+				t.Errorf("hasHostDirs() = true for RootVolume-only config, want false")
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		cfg     gvx.Config
+		wantMsg string
+	}{
+		{"whitespace name", gvx.Config{OCIImage: "alpine:3.20", RootVolume: "   "}, "empty"},
+		{"bad volume name", gvx.Config{OCIImage: "alpine:3.20", RootVolume: "bad name"}, "invalid root volume"},
+		{"dot name", gvx.Config{OCIImage: "alpine:3.20", RootVolume: "."}, "invalid root volume"},
+		{"dotdot name", gvx.Config{OCIImage: "alpine:3.20", RootVolume: ".."}, "invalid root volume"},
+		{"trailing slash", gvx.Config{OCIImage: "alpine:3.20", RootVolume: "/tmp/dir/"}, "not a directory"},
+		{"existing directory", gvx.Config{OCIImage: "alpine:3.20", RootVolume: dir}, "not a regular file"},
+		{"read-only root", gvx.Config{OCIImage: "alpine:3.20", RootVolume: "rootvol", ReadOnlyRoot: true}, "ReadOnlyRoot"},
+		{"no image layers", gvx.Config{RootVolume: "rootvol"}, "OCI image layers"},
+		{"binary path only", gvx.Config{BinaryPath: "/bin/sh", RootVolume: "rootvol"}, "OCI image layers"},
+		{"elf bytes only", gvx.Config{ELFBytes: []byte{0x7f, 'E', 'L', 'F'}, RootVolume: "rootvol"}, "OCI image layers"},
+	} {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			err := gvx.NormalizeConfigForTest(&tc.cfg)
+			if !errors.Is(err, gvx.ErrInvalidConfig) {
+				t.Fatalf("normalize() error = %v, want ErrInvalidConfig", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("normalize() error = %q, want substring %q", err, tc.wantMsg)
+			}
+		})
+	}
+}
+
+func TestOpenMountsRootVolumeLifecycleAndErrors(t *testing.T) {
+	cache := t.TempDir()
+	open := func(rootVol string, mounts ...gvx.Mount) (*gvx.Sandbox, error) {
+		cfg := gvx.Config{
+			OCICacheDir: cache,
+			OCIImage:    "alpine:3.20",
+			RootVolume:  rootVol,
+			Mounts:      mounts,
+		}
+		sb := gvx.NewSandboxForMountTest(cfg)
+		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
+			return sb, err
+		}
+		return sb, gvx.OpenMountsForTest(sb)
+	}
+
+	first, err := open("rootdata")
+	if err != nil {
+		t.Fatalf("open RootVolume: %v", err)
+	}
+	if !gvx.HasRootVolumeForTest(first) {
+		t.Error("HasRootVolumeForTest = false, want true")
+	}
+	if gvx.UsesHostDirsForTest(first) {
+		t.Error("usesHostDirs() = true for RootVolume, want false")
+	}
+	if got := gvx.HostMountsForTest(first); len(got) != 0 {
+		t.Errorf("hostMounts() = %+v, want empty", got)
+	}
+
+	// Concurrent open on the same RootVolume fails with ErrVolumeInUse.
+	busy, err := open("rootdata")
+	if err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Errorf("second open on RootVolume = %v, want in-use error", err)
+	}
+	if cerr := gvx.CloseMountsForTest(busy); cerr != nil {
+		t.Fatalf("closeMounts(busy): %v", cerr)
+	}
+	if cerr := gvx.CloseMountsForTest(first); cerr != nil {
+		t.Fatalf("closeMounts(first): %v", cerr)
+	}
+	if gvx.HasRootVolumeForTest(first) {
+		t.Error("HasRootVolumeForTest = true after closeMounts")
+	}
+
+	// Mounting the same volume in RootVolume and -v fails with ErrInvalidConfig.
+	dupNamed, err := open("rootdata", gvx.Mount{Kind: gvx.MountVolume, VolumeName: "rootdata", GuestPath: "/data"})
+	if !errors.Is(err, gvx.ErrInvalidConfig) || !strings.Contains(err.Error(), "mounted twice") {
+		t.Errorf("RootVolume + same named Mount = %v, want ErrInvalidConfig(mounted twice)", err)
+	}
+	if cerr := gvx.CloseMountsForTest(dupNamed); cerr != nil {
+		t.Fatalf("closeMounts(dupNamed): %v", cerr)
+	}
+
+	// Same managed volume as RootVolume and explicit ImagePath to <cache>/volumes/<name>.ext4.
+	namedImgPath := filepath.Join(cache, "volumes", "rootdata.ext4")
+	dupCross, err := open("rootdata", gvx.Mount{Kind: gvx.MountVolume, ImagePath: namedImgPath, GuestPath: "/data"})
+	if !errors.Is(err, gvx.ErrInvalidConfig) || !strings.Contains(err.Error(), "mounted twice") {
+		t.Errorf("RootVolume(name) + Mount(same path) = %v, want ErrInvalidConfig(mounted twice)", err)
+	}
+	if cerr := gvx.CloseMountsForTest(dupCross); cerr != nil {
+		t.Fatalf("closeMounts(dupCross): %v", cerr)
+	}
+
+	// Same host ImagePath in RootVolume and Mount.
+	customImg := filepath.Join(t.TempDir(), "custom-root.ext4")
+	dupImg, err := open(customImg, gvx.Mount{Kind: gvx.MountVolume, ImagePath: customImg, GuestPath: "/data"})
+	if !errors.Is(err, gvx.ErrInvalidConfig) || !strings.Contains(err.Error(), "mounted twice") {
+		t.Errorf("RootVolume(image) + Mount(same image) = %v, want ErrInvalidConfig(mounted twice)", err)
+	}
+	if cerr := gvx.CloseMountsForTest(dupImg); cerr != nil {
+		t.Fatalf("closeMounts(dupImg): %v", cerr)
+	}
+
+	// Legacy hostfs volume directory with same name is rejected.
+	legacyDir := filepath.Join(cache, "volumes", "legacy-hostfs")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacySB, err := open("legacy-hostfs")
+	if !errors.Is(err, gvx.ErrInvalidConfig) || !strings.Contains(err.Error(), "hostfs") {
+		t.Errorf("RootVolume matching legacy hostfs dir = %v, want ErrInvalidConfig mentioning hostfs", err)
+	}
+	if cerr := gvx.CloseMountsForTest(legacySB); cerr != nil {
+		t.Fatalf("closeMounts(legacySB): %v", cerr)
 	}
 }

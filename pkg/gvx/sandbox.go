@@ -46,26 +46,28 @@ import (
 // overlay layers, hostfs, volume and tmpfs mounts, Dual-Track Netstack, and host
 // process self-lockdown.
 type Sandbox struct {
-	mu            sync.Mutex
-	cfg           Config
-	plat          platform.Platform
-	platName      string
-	fallbackFrom  error
-	memFile       *pgalloc.MemoryFile
-	resolvedImg   *oci.ResolvedImage
-	layerHandles  []*fd.HostHandle
-	layerDigests  []string
-	layerBytes    uint64
-	workspace     *hostfs.Workspace
-	workspaces    []*hostfs.Workspace
-	volumes       []*ext4lite.Volume
-	mounts        []sandboxMount
-	netStack      *stack.Stack
-	natForwarder  *netbackend.NATForwarder
-	portForwarder *netbackend.PortForwarder
-	wgEndpoint    *netbackend.WireGuardEndpoint
-	wgPeerPort    uint16
-	lockdown      hostlockdown.Status
+	mu                sync.Mutex
+	cfg               Config
+	plat              platform.Platform
+	platName          string
+	fallbackFrom      error
+	memFile           *pgalloc.MemoryFile
+	resolvedImg       *oci.ResolvedImage
+	layerHandles      []*fd.HostHandle
+	layerDigests      []string
+	layerBytes        uint64
+	workspace         *hostfs.Workspace
+	workspaces        []*hostfs.Workspace
+	volumes           []*ext4lite.Volume
+	rootVolume        *ext4lite.Volume
+	rootUpperExisting bool
+	mounts            []sandboxMount
+	netStack          *stack.Stack
+	natForwarder      *netbackend.NATForwarder
+	portForwarder     *netbackend.PortForwarder
+	wgEndpoint        *netbackend.WireGuardEndpoint
+	wgPeerPort        uint16
+	lockdown          hostlockdown.Status
 	// hostCARoots holds the DER roots that Config.HostCACerts copies into the
 	// guest. New reads them before the lockdown.
 	hostCARoots [][]byte

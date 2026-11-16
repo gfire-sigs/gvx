@@ -113,6 +113,11 @@ type Mount struct {
 // workspaceGuestPath is the mount point of Config.WorkspacePath.
 const workspaceGuestPath = "/workspace"
 
+// rootVolumeUniqueID identifies the internal ext4lite upper layer of the
+// container root filesystem in CtxRestoreVolumeMap. User mounts cannot use "/",
+// so it never collides with Mount.GuestPath.
+const rootVolumeUniqueID = "/"
+
 // volumeNamePattern is the set of valid volume names.
 var volumeNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
@@ -374,6 +379,76 @@ func (c *Config) validateMounts() error {
 	return nil
 }
 
+// parseRootVolumeMount converts Config.RootVolume into an ext4lite volume
+// descriptor, accepting either a managed volume name or a host image path.
+func parseRootVolumeMount(spec string) (Mount, error) {
+	if strings.TrimSpace(spec) == "" {
+		return Mount{}, fmt.Errorf("%w: root volume must not be empty", ErrInvalidConfig)
+	}
+	m := Mount{Kind: MountVolume, Driver: DriverExt4lite}
+	if isHostPathSource(spec) {
+		if strings.HasSuffix(spec, "/") || strings.HasSuffix(spec, `\`) {
+			return Mount{}, fmt.Errorf("%w: root volume image path %q must name a file, not a directory", ErrInvalidConfig, spec)
+		}
+		m.ImagePath = spec
+		return m, nil
+	}
+	if !volumeNamePattern.MatchString(spec) {
+		return Mount{}, fmt.Errorf("%w: invalid root volume name %q", ErrInvalidConfig, spec)
+	}
+	m.VolumeName = spec
+	return m, nil
+}
+
+// validateRootVolume verifies Config.RootVolume syntax, image-layer presence,
+// and compatibility with ReadOnlyRoot.
+func (c *Config) validateRootVolume(hasManifestLayers bool) error {
+	if c.RootVolume == "" {
+		return nil
+	}
+	m, err := parseRootVolumeMount(c.RootVolume)
+	if err != nil {
+		return err
+	}
+	if m.ImagePath != "" {
+		if info, statErr := os.Stat(m.ImagePath); statErr == nil && !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: root volume %q is not a regular file (mode %s)", ErrInvalidConfig, m.ImagePath, info.Mode().Type())
+		}
+	}
+	if err := c.validateRootVolumeDup(m); err != nil {
+		return err
+	}
+	if c.ReadOnlyRoot {
+		return fmt.Errorf("%w: RootVolume cannot be combined with ReadOnlyRoot", ErrInvalidConfig)
+	}
+	if !hasManifestLayers && c.OCIImage == "" && len(c.OCILayerTars) == 0 {
+		return fmt.Errorf("%w: RootVolume requires OCI image layers (set OCIImage or OCILayerTars)", ErrInvalidConfig)
+	}
+	return nil
+}
+
+// validateRootVolumeDup rejects configurations that pass the same ext4lite
+// image as both Config.RootVolume and a volume entry in Config.Mounts.
+func (c *Config) validateRootVolumeDup(rootMount Mount) error {
+	rootImg, err := c.volumeImagePath(rootMount)
+	if err != nil {
+		return err
+	}
+	for _, m := range c.Mounts {
+		if m.Kind != MountVolume || m.Driver == DriverHostfs {
+			continue
+		}
+		img, err := c.volumeImagePath(m)
+		if err != nil {
+			continue
+		}
+		if img == rootImg {
+			return fmt.Errorf("%w: volume %s is mounted twice", ErrInvalidConfig, m.volumeLabel())
+		}
+	}
+	return nil
+}
+
 // validate checks one mount. The caller adds the context to the error.
 func (m Mount) validate() error {
 	if err := validateGuestPath(m.GuestPath); err != nil {
@@ -587,6 +662,30 @@ func (s *Sandbox) openMountsForRestore() error {
 func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
 	volumes := make(map[string]bool)
+	if s.cfg.RootVolume != "" {
+		m, err := parseRootVolumeMount(s.cfg.RootVolume)
+		if err != nil {
+			return err
+		}
+		image, err := s.cfg.volumeImagePath(m)
+		if err != nil {
+			return err
+		}
+		if m.ImagePath == "" {
+			if _, statErr := os.Stat(image); errors.Is(statErr, os.ErrNotExist) {
+				legacyDir := filepath.Join(filepath.Dir(image), m.VolumeName)
+				if info, dirErr := os.Stat(legacyDir); dirErr == nil && info.IsDir() {
+					return fmt.Errorf("%w: volume %q already exists with driver %q", ErrInvalidConfig, m.VolumeName, DriverHostfs)
+				}
+			}
+		}
+		volumes[image] = true
+		vol, err := s.openVolumeImageWithMode(m, image, forRestore)
+		if err != nil {
+			return err
+		}
+		s.rootVolume = vol
+	}
 	for _, m := range s.cfg.mountList() {
 		if m.Kind == MountVolume {
 			driver, err := s.cfg.resolveVolumeDriver(m)
@@ -657,16 +756,34 @@ func (c Config) volumeImagePath(m Mount) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("gvx: resolve volume image %q: %w", m.ImagePath, err)
 		}
-		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-			return resolved, nil
-		}
-		return abs, nil
+		return resolveSymlinkPrefix(abs), nil
 	}
 	root, err := c.volumeRoot()
 	if err != nil {
 		return "", fmt.Errorf("gvx: locate the volume directory: %w", err)
 	}
-	return filepath.Join(root, m.VolumeName+".ext4"), nil
+	return resolveSymlinkPrefix(filepath.Join(root, m.VolumeName+".ext4")), nil
+}
+
+// resolveSymlinkPrefix resolves symlinks along the longest existing prefix of
+// p so paths to uncreated and created files match on symlinked temp roots.
+func resolveSymlinkPrefix(p string) string {
+	var tail []string
+	cur := filepath.Clean(p)
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return resolved
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 // volumeLabel names a volume mount in messages: the quoted name, or the
@@ -713,7 +830,7 @@ func (s *Sandbox) openVolumeImage(m Mount, image string) (*ext4lite.Volume, erro
 
 func (s *Sandbox) openVolumeImageWithMode(m Mount, image string, forRestore bool) (*ext4lite.Volume, error) {
 	if info, err := os.Stat(image); err == nil && !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("gvx: volume %s: %q is not a regular file (mode %s)", m.volumeLabel(), image, info.Mode().Type())
+		return nil, fmt.Errorf("gvx: volume %s: %q is not a regular file (mode %s): %w", m.volumeLabel(), image, info.Mode().Type(), ErrInvalidConfig)
 	}
 	flags := os.O_RDWR | os.O_CREATE
 	if m.ReadOnly {
@@ -832,9 +949,16 @@ func (s *Sandbox) closeMounts() error {
 			errs = append(errs, fmt.Errorf("gvx: close volume: %w", err))
 		}
 	}
+	if s.rootVolume != nil {
+		if err := s.rootVolume.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("gvx: close root volume: %w", err))
+		}
+		s.rootVolume = nil
+	}
 	s.workspaces = nil
 	s.volumes = nil
 	s.mounts = nil
 	s.workspace = nil
+	s.rootUpperExisting = false
 	return errors.Join(errs...)
 }

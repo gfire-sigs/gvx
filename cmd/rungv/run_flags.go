@@ -154,6 +154,7 @@ type sandboxFlagValues struct {
 	cpus                   string
 	hostCACerts            bool
 	readOnlyRoot           bool
+	rootVolume             string
 	volumeFlags            listFlag
 	mountFlags             listFlag
 	tmpfsFlags             listFlag
@@ -215,6 +216,7 @@ func (f *sandboxFlagValues) registerTargetAndMountFlags(fs *flag.FlagSet) {
 	fs.StringVar(&f.pull, "pull", string(gvx.PullMissing), "Pull the image: missing (use the cache first, the default), always (ask the registry first), or never (cache only)")
 	fs.BoolVar(&f.hostCACerts, "host-ca-certs", false, "Make the guest trust the root certificates that the host trusts")
 	fs.BoolVar(&f.readOnlyRoot, "read-only", false, "Mount the root file system of the guest read-only")
+	fs.StringVar(&f.rootVolume, "rootfs-volume", "", "Persistent ext4lite volume name or .ext4 image path for the container rootfs")
 	registerAlias([]string{"v", "volume"}, func(n string) {
 		fs.Var(&f.volumeFlags, n, "Mount a host directory, one host file, or a named volume (an ext4 image file): src:dst[:ro|rw]")
 	})
@@ -412,6 +414,10 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		return gvx.Config{}, false, err
 	}
 	priv := resolvePrivileges(fs, f.privileged, f.netRaw, f.packetWrite, f.allowSUID)
+	rootVolume := strings.TrimSpace(f.rootVolume)
+	if flagVisited(fs, "rootfs-volume") && rootVolume == "" {
+		return gvx.Config{}, false, fmt.Errorf("--rootfs-volume must not be empty")
+	}
 
 	cfg := gvx.Config{
 		Platform:               backend,
@@ -436,6 +442,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		WorkspaceReadOnly:      f.readOnly,
 		Mounts:                 mounts,
 		ReadOnlyRoot:           f.readOnlyRoot,
+		RootVolume:             rootVolume,
 		HostCACerts:            f.hostCACerts,
 		WorkDir:                strings.TrimSpace(f.workDir),
 		Envv:                   envv,
