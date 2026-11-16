@@ -104,12 +104,10 @@ func (r storeRegs) vreg(n uint8) []byte {
 	return r.fp[off : off+16]
 }
 
-// decodeStore decodes the store forms that the Sentry runs. These are the
-// single register and register pair stores of general-purpose and vector
-// registers, in every immediate and register offset addressing mode. They also
-// include the store exclusive and store release forms and their pair forms.
-// It returns false for every other instruction, for example atomic operations,
-// compare and swap, and tagged stores.
+// decodeStore decodes general-purpose and vector single and pair stores,
+// store-exclusive instructions, and store-release instructions (including STLUR)
+// across immediate and register-offset modes. emulateAtomicOrCacheOp runs atomic
+// read-modify-write, compare-and-swap, SIMD structure stores, and cache ops.
 func decodeStore(insn uint32) (storeInsn, bool) {
 	s := storeInsn{base: uint8(insn >> 5 & 31), rt: uint8(insn & 31), rt2: uint8(insn >> 10 & 31)}
 	v := insn>>26&1 == 1
@@ -130,6 +128,10 @@ func decodeStore(insn uint32) (storeInsn, bool) {
 		default:
 			return s, false // Compare and swap, and the reserved encodings.
 		}
+		return s, true
+	case insn&0x3fe00c00 == 0x19000000: // Unscaled store release (STLURB, STLURH, STLUR).
+		s.size = 1 << (insn >> 30)
+		s.imm = int64(int32(insn>>12&0x1ff) << 23 >> 23)
 		return s, true
 	case insn&0x3a000000 == 0x28000000: // Store pair.
 		if insn>>22&1 != 0 {
