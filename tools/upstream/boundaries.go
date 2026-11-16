@@ -617,7 +617,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/sentry/arch",
 		tier:      Tier2Sibling,
-		allowed:   []string{"pkg/abi/linux", "pkg/hostarch"},
+		allowed:   []string{"internal/weakmap", "pkg/abi/linux", "pkg/hostarch"},
 		forbidden: append([]string{xSysWindows, "pkg/sentry/kernel/*", "pkg/sentry/vfs/*", "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
 	{
