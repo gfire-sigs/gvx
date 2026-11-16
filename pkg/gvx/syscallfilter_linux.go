@@ -56,7 +56,7 @@ func (s *Sandbox) syscallFilter() func() error {
 			CgoEnabled: cgoBuild,
 		}
 		rules, denyRules := config.Rules(opt)
-		rules.Merge(embedderRules(s.cfg, s.usesHostDirs(), len(s.volumes) > 0))
+		rules.Merge(embedderRules(s.cfg, s.usesHostDirs(), len(s.volumes) > 0 || s.rootVolume != nil))
 		if cgoBuild {
 			// The cgo rules of runsc allow clone3 for any flags, because runsc
 			// cannot return ENOSYS. Seccomp cannot read the flags of clone3,

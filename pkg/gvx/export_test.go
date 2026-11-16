@@ -95,6 +95,11 @@ func OpenVolumeCountForTest(sb *Sandbox) int {
 	return len(sb.volumes)
 }
 
+// HasRootVolumeForTest reports whether sb holds an open rootfs ext4lite volume.
+func HasRootVolumeForTest(sb *Sandbox) bool {
+	return sb.rootVolume != nil
+}
+
 // VolumeRootForTest returns the directory that stores named volume images for cfg.
 func VolumeRootForTest(cfg Config) (string, error) {
 	return cfg.volumeRoot()

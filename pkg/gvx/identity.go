@@ -64,8 +64,15 @@ func (s *Sandbox) guestUser(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 // before the root becomes read-only.
 func (s *Sandbox) writeGuestHostFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
 	hostname := s.hostname()
-	if err := vfsWriteFile(sctx, vfsObj, creds, root, "/etc/hostname", []byte(hostname+"\n"), 0o644); err != nil {
-		return fmt.Errorf("gvx: write /etc/hostname: %w", err)
+	wantHostname := []byte(hostname + "\n")
+	existingHostname, err := readGuestFile(sctx, vfsObj, creds, root, "/etc/hostname", maxGuestIdentityFile)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(existingHostname, wantHostname) {
+		if err := vfsWriteFile(sctx, vfsObj, creds, root, "/etc/hostname", wantHostname, 0o644); err != nil {
+			return fmt.Errorf("gvx: write /etc/hostname: %w", err)
+		}
 	}
 	hosts, err := readGuestFile(sctx, vfsObj, creds, root, "/etc/hosts", maxGuestIdentityFile)
 	if err != nil {

@@ -104,6 +104,38 @@ func TestParseRunArgsCheckpointFlags(t *testing.T) {
 	}
 }
 
+func TestParseRunAndRestoreRootfsVolumeFlags(t *testing.T) {
+	rc, code, done, stderr := parse(t, "-rootfs-volume=myroot", "alpine:3.20")
+	if done || code != 0 || rc.cfg.RootVolume != "myroot" {
+		t.Fatalf("parse(-rootfs-volume) = (code=%d done=%v rootVol=%q stderr=%q)", code, done, rc.cfg.RootVolume, stderr)
+	}
+	rcDouble, codeDouble, doneDouble, stderrDouble := parse(t, "--rootfs-volume", "/tmp/myroot.ext4", "alpine:3.20")
+	if doneDouble || codeDouble != 0 || rcDouble.cfg.RootVolume != "/tmp/myroot.ext4" {
+		t.Fatalf("parse(--rootfs-volume) = (code=%d done=%v rootVol=%q stderr=%q)", codeDouble, doneDouble, rcDouble.cfg.RootVolume, stderrDouble)
+	}
+	_, emptyCode, emptyDone, emptyStderr := parse(t, "--rootfs-volume=", "alpine:3.20")
+	if !emptyDone || emptyCode != 2 || !strings.Contains(emptyStderr, "--rootfs-volume") {
+		t.Fatalf("parse(--rootfs-volume=) = (code=%d done=%v stderr=%q), want exit 2", emptyCode, emptyDone, emptyStderr)
+	}
+
+	var restoreErr bytes.Buffer
+	resCfg, resCode, resDone := parseRestoreArgs([]string{
+		"-checkpoint-dir=/tmp/bundle",
+		"--rootfs-volume=myroot",
+	}, nil, &bytes.Buffer{}, &restoreErr)
+	if resDone || resCode != 0 || resCfg.cfg.RootVolume != "myroot" {
+		t.Fatalf("parseRestoreArgs(--rootfs-volume) = (code=%d done=%v rootVol=%q stderr=%q)", resCode, resDone, resCfg.cfg.RootVolume, restoreErr.String())
+	}
+	var restoreEmptyErr bytes.Buffer
+	_, resEmptyCode, resEmptyDone := parseRestoreArgs([]string{
+		"-checkpoint-dir=/tmp/bundle",
+		"-rootfs-volume", "   ",
+	}, nil, &bytes.Buffer{}, &restoreEmptyErr)
+	if !resEmptyDone || resEmptyCode != 2 || !strings.Contains(restoreEmptyErr.String(), "--rootfs-volume") {
+		t.Fatalf("parseRestoreArgs(empty -rootfs-volume) = (code=%d done=%v stderr=%q), want exit 2", resEmptyCode, resEmptyDone, restoreEmptyErr.String())
+	}
+}
+
 func TestParseCheckpointArgs(t *testing.T) {
 	var stderr bytes.Buffer
 	ca, code, done := parseCheckpointArgs([]string{

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/internal/testelf"
+	"z.gfire.dev/gvx/internal/testimage"
 	"z.gfire.dev/gvx/pkg/gvx"
 )
 
@@ -215,4 +217,91 @@ func TestSystemInfoDFPruneAndCompletionCommands(t *testing.T) {
 	if bad.code != 2 {
 		t.Errorf("completion csh exited %d, want 2", bad.code)
 	}
+}
+
+func TestRootfsVolumeWithVolumeAndSystemCLICommands(t *testing.T) {
+	platform := requireCheckpointCLIPlatform(t)
+
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "ready.txt", Data: []byte("rootfs-ready\n"), Mode: 0o644},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+	regURL := testimage.NewRegistry(t, "gvx/rootcat", "v1", testimage.Image{
+		Arch:   runtime.GOARCH,
+		Layers: [][]byte{layer},
+	})
+	parsedURL, err := url.Parse(regURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRef := parsedURL.Host + "/gvx/rootcat:v1"
+
+	env := newCLIEnv(t)
+	stdinR, stdinW := net.Pipe()
+	defer stdinR.Close()
+	defer stdinW.Close()
+	stdout := newSyncNotifyBuffer()
+	stderr := newSyncNotifyBuffer()
+	done := make(chan int, 1)
+
+	go func() {
+		done <- executeCLI(
+			context.Background(),
+			[]string{
+				"run",
+				"-lockdown=false",
+				"-backend=" + platform,
+				"-net=none",
+				"-cache-dir=" + env.cacheDir,
+				"-rootfs-volume=rootcli",
+				imageRef,
+				"/bin/cat",
+				"/ready.txt",
+				"/proc/self/fd/0",
+			},
+			stdinR,
+			stdout,
+			stderr,
+		)
+	}()
+
+	stdout.waitForSubstring(t, "rootfs-ready\n", 15*time.Second)
+
+	lsOut := runCLIArgs(t, nil, "volume", "ls", "-q", "-cache-dir", env.cacheDir).mustSucceed(t, "volume ls -q")
+	if strings.TrimSpace(lsOut.stdout) != "rootcli" {
+		t.Fatalf("volume ls -q = %q, want rootcli", lsOut.stdout)
+	}
+
+	inspOut := runCLIArgs(t, nil, "volume", "inspect", "rootcli", "-cache-dir", env.cacheDir, "-f", "{{.Driver}}:{{.InUse}}").mustSucceed(t, "volume inspect")
+	if strings.TrimSpace(inspOut.stdout) != "ext4lite:true" {
+		t.Fatalf("volume inspect = %q, want ext4lite:true", inspOut.stdout)
+	}
+
+	dfOut := runCLIArgs(t, nil, "system", "df", "-v", "-cache-dir", env.cacheDir).mustSucceed(t, "system df -v").stdout
+	if !strings.Contains(dfOut, "Local Volumes") || !strings.Contains(dfOut, "rootcli") {
+		t.Fatalf("system df -v missing rootcli:\n%s", dfOut)
+	}
+
+	rmLocked := runCLIArgs(t, nil, "volume", "rm", "-f", "rootcli", "-cache-dir", env.cacheDir)
+	if rmLocked.code != 1 || !strings.Contains(rmLocked.stderr, "in use") {
+		t.Fatalf("volume rm locked = (%d, %q), want exit 1 mentioning in use", rmLocked.code, rmLocked.stderr)
+	}
+
+	_ = stdinW.Close()
+	if code := <-done; code != 0 {
+		t.Fatalf("sandbox exited with %d: %s", code, stderr.String())
+	}
+
+	inspAfter := runCLIArgs(t, nil, "volume", "inspect", "rootcli", "-cache-dir", env.cacheDir, "-f", "{{.InUse}}").mustSucceed(t, "volume inspect after exit")
+	if strings.TrimSpace(inspAfter.stdout) != "false" {
+		t.Fatalf("volume inspect after exit = %q, want false", inspAfter.stdout)
+	}
+	runCLIArgs(t, nil, "volume", "rm", "rootcli", "-cache-dir", env.cacheDir).mustSucceed(t, "volume rm after exit")
 }

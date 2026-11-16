@@ -76,6 +76,7 @@ type CheckpointManifest struct {
 	Arch             string          `json:"arch"`
 	UserAddressHoles []AddrHoleEntry `json:"user_address_holes,omitempty"`
 	LayerDigests     []string        `json:"layer_digests,omitempty"`
+	RootVolume       bool            `json:"root_volume,omitempty"`
 	Mounts           []ManifestMount `json:"mounts,omitempty"`
 	NetMode          NetMode         `json:"net_mode"`
 	// Eth0 records the addresses, MTU, and routes that the guest set on eth0
@@ -249,6 +250,7 @@ func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
 		Arch:             arch,
 		UserAddressHoles: platformAddrHoles(s.plat),
 		LayerDigests:     append([]string(nil), s.layerDigests...),
+		RootVolume:       s.rootVolume != nil,
 		Mounts:           sandboxManifestMounts(s.mounts),
 		NetMode:          s.cfg.NetworkMode,
 		CreatedAt:        time.Now().UTC(),

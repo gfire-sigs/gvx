@@ -184,6 +184,10 @@ func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
 	if !slices.Equal(m.LayerDigests, s.layerDigests) {
 		return fmt.Errorf("%w: OCI layer digests mismatch: bundle has %v, config resolved %v", ErrCheckpointManifest, m.LayerDigests, s.layerDigests)
 	}
+	hasRootVol := s.rootVolume != nil
+	if m.RootVolume != hasRootVol {
+		return fmt.Errorf("%w: root volume mismatch: bundle has %v, config has %v", ErrCheckpointManifest, m.RootVolume, hasRootVol)
+	}
 	wantMounts := sandboxManifestMounts(s.mounts)
 	if !slices.Equal(m.Mounts, wantMounts) {
 		return fmt.Errorf("%w: mounts mismatch: bundle has %v, config has %v", ErrCheckpointManifest, m.Mounts, wantMounts)
@@ -267,8 +271,11 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if cfg.Architecture == "" && manifest.Arch != "" {
 		cfg.Architecture = manifest.Arch
 	}
-	if err := cfg.normalize(); err != nil {
+	if err := cfg.normalizeWithMode(len(manifest.LayerDigests) > 0); err != nil {
 		return nil, err
+	}
+	if manifest.RootVolume != (cfg.RootVolume != "") {
+		return nil, fmt.Errorf("%w: root volume mismatch: bundle has %v, config has %v", ErrCheckpointManifest, manifest.RootVolume, cfg.RootVolume != "")
 	}
 	applyHostMemoryDefaults()
 
@@ -413,6 +420,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	containerName := cmp.Or(sb.cfg.Name, "gvx-default")
 	wsMap := make(map[checkpoint.ResourceID]*hostfs.Workspace)
 	volMap := make(map[string]*ext4lite.Volume)
+	if sb.rootVolume != nil {
+		volMap[rootVolumeUniqueID] = sb.rootVolume
+	}
 	for _, sm := range sb.mounts {
 		if sm.workspace != nil {
 			id := checkpoint.ResourceID{

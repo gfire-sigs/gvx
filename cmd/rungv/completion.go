@@ -115,7 +115,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount -p -P -e --env-file -u --user -m --memory --cpus --net --backend --platform --pull --entrypoint --rm -cache-dir --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P -e --env-file -u --user -m --memory --cpus --net --backend --platform --pull --entrypoint --rm -cache-dir --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -182,6 +182,7 @@ _rungv() {
                 '-workspace[Host directory mounted at /workspace]:dir:_files -/' \
                 '*-v[Bind or named volume mount]:spec:' \
                 '*--mount[Structured mount specification]:spec:' \
+                '--rootfs-volume[Persistent ext4lite volume name or image path for container rootfs]:volume:' \
                 '*-p[Publish guest port to host]:port:' \
                 '-P[Publish all exposed image ports]' \
                 '*-e[Set guest environment variable]:env:' \
