@@ -491,10 +491,10 @@ func TestOpenMountsRejectsBusyAndDuplicateVolumes(t *testing.T) {
 	cache := t.TempDir()
 	open := func(mounts ...gvx.Mount) (*gvx.Sandbox, error) {
 		cfg := gvx.Config{OCICacheDir: cache, Mounts: mounts}
-		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
-			t.Fatal(err)
-		}
 		sb := gvx.NewSandboxForMountTest(cfg)
+		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
+			return sb, err
+		}
 		return sb, gvx.OpenMountsForTest(sb)
 	}
 	first, err := open(gvx.Mount{Kind: gvx.MountVolume, VolumeName: "shared", GuestPath: "/a"})
@@ -541,10 +541,10 @@ func TestOpenMountsVolumeAtImagePath(t *testing.T) {
 	image := filepath.Join(dir, "data.ext4")
 	open := func(mounts ...gvx.Mount) (*gvx.Sandbox, error) {
 		cfg := gvx.Config{OCICacheDir: t.TempDir(), Mounts: mounts}
-		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
-			t.Fatal(err)
-		}
 		sb := gvx.NewSandboxForMountTest(cfg)
+		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
+			return sb, err
+		}
 		return sb, gvx.OpenMountsForTest(sb)
 	}
 
@@ -826,10 +826,10 @@ func TestOpenMountsRootVolumeLifecycleAndErrors(t *testing.T) {
 			RootVolume:  rootVol,
 			Mounts:      mounts,
 		}
-		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
-			t.Fatal(err)
-		}
 		sb := gvx.NewSandboxForMountTest(cfg)
+		if err := gvx.NormalizeConfigForTest(&cfg); err != nil {
+			return sb, err
+		}
 		return sb, gvx.OpenMountsForTest(sb)
 	}
 

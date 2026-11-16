@@ -415,11 +415,36 @@ func (c *Config) validateRootVolume(hasManifestLayers bool) error {
 			return fmt.Errorf("%w: root volume %q is not a regular file (mode %s)", ErrInvalidConfig, m.ImagePath, info.Mode().Type())
 		}
 	}
+	if err := c.validateRootVolumeDup(m); err != nil {
+		return err
+	}
 	if c.ReadOnlyRoot {
 		return fmt.Errorf("%w: RootVolume cannot be combined with ReadOnlyRoot", ErrInvalidConfig)
 	}
 	if !hasManifestLayers && c.OCIImage == "" && len(c.OCILayerTars) == 0 {
 		return fmt.Errorf("%w: RootVolume requires OCI image layers (set OCIImage or OCILayerTars)", ErrInvalidConfig)
+	}
+	return nil
+}
+
+// validateRootVolumeDup rejects configurations that pass the same ext4lite
+// image as both Config.RootVolume and a volume entry in Config.Mounts.
+func (c *Config) validateRootVolumeDup(rootMount Mount) error {
+	rootImg, err := c.volumeImagePath(rootMount)
+	if err != nil {
+		return err
+	}
+	for _, m := range c.Mounts {
+		if m.Kind != MountVolume || m.Driver == DriverHostfs {
+			continue
+		}
+		img, err := c.volumeImagePath(m)
+		if err != nil {
+			continue
+		}
+		if img == rootImg {
+			return fmt.Errorf("%w: volume %s is mounted twice", ErrInvalidConfig, m.volumeLabel())
+		}
 	}
 	return nil
 }
