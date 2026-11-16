@@ -19,6 +19,7 @@ package arch
 import (
 	"encoding/binary"
 
+	"z.gfire.dev/gvx/internal/weakmap"
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch/fpu"
@@ -55,20 +56,27 @@ const (
 	esrDFSCPerm  = 0x0f // Permission fault, level 3.
 )
 
+// pendingFaultAccess stores the unhandled user fault access for each Context64
+// until signal frame setup consumes it.
+var pendingFaultAccess weakmap.Map[Context64, hostarch.AccessType]
+
 // SetFaultAccess records the access of a user fault that the Sentry could not
 // resolve and turns into a signal. The next signal frame of SIGSEGV or SIGBUS
 // reports it in the ESR record, as Linux does. A nested Sentry reads the
 // record to learn if the fault is a read, a write, or an instruction fetch.
 func (c *Context64) SetFaultAccess(at hostarch.AccessType) {
-	c.faultAccess = at
+	if !at.Any() {
+		pendingFaultAccess.Delete(c)
+		return
+	}
+	pendingFaultAccess.Store(c, at)
 }
 
 // faultESR returns the ESR_EL1 value for the recorded fault, or false when no
 // fault is recorded. The recorded access is cleared.
 func (c *Context64) faultESR(info *linux.SignalInfo) (uint64, bool) {
-	at := c.faultAccess
-	c.faultAccess = hostarch.AccessType{}
-	if !at.Any() || (info.Signo != int32(linux.SIGSEGV) && info.Signo != int32(linux.SIGBUS)) {
+	at, ok := pendingFaultAccess.Delete(c)
+	if !ok || !at.Any() || (info.Signo != int32(linux.SIGSEGV) && info.Signo != int32(linux.SIGBUS)) {
 		return 0, false
 	}
 	esr := uint64(esrIL)
