@@ -2,6 +2,15 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.16.10002026110900] - 2026-11-16
+
+This release adds `ext4lite`-backed persistent container root filesystems with `-rootfs-volume` and `Config.RootVolume` (#197).
+
+### Features
+
+- **Persistent root filesystem (`pkg/gvx`, `cmd/rungv`, `docs/`)** (#197): `gvx.Config` adds `RootVolume`, and `rungv run` and `rungv restore` add `-rootfs-volume` to store the root overlay upper layer in an `ext4lite` image. Callers pass either a managed volume name or a host `.ext4` path, and fresh boots preserve `upper` while clearing stale `work` entries. The runtime opens the root volume before host lockdown, rejects `ReadOnlyRoot`, rejects layerless runs, and rejects duplicate `-v` mounts.
+- **Checkpoint and restore support for `RootVolume` (`pkg/gvx`)** (#197): `CheckpointManifest` records `root_volume`, and `gvx.Restore` requires `-rootfs-volume` or `Config.RootVolume` to match the saved bundle. `Kernel.LoadFrom` rebinds the root volume under its internal `"/"` key and preserves open and unlinked files across restore.
+
 ## [v0.15.10002026110900] - 2026-11-14
 
 This release adds Docker-style CLI flag parsing, Go template output, shell completion, and image, volume, and system commands to `rungv` (#196). It also adds OCI cache pruning, local `ext4lite` volume operations, host capability probes, and Go 1.27.4 documentation updates (#196).
