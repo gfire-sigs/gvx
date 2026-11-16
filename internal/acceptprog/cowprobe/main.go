@@ -64,6 +64,12 @@ func main() {
 			continue
 		}
 		fmt.Printf("PASS cow-prefix:%s\n", dir)
+		if err := probeRelrSplit(dir); err != nil {
+			fmt.Printf("FAIL relr-split:%s: %v\n", dir, err)
+			failed = true
+			continue
+		}
+		fmt.Printf("PASS relr-split:%s\n", dir)
 	}
 	if failed {
 		os.Exit(1)
@@ -138,6 +144,171 @@ func probeBoundary(f *os.File, content []byte, boundary unsafe.Pointer, prot, i 
 	}
 	if !bytes.Equal(onDisk, content[fileOff:fileOff+length]) {
 		return fmt.Errorf("the write through a private mapping reached the file")
+	}
+	return nil
+}
+
+//go:noinline
+func applyRelr3(p *[3]uint64, base uint64) {
+	p[0] += base
+	p[1] += base
+	p[2] += base
+}
+
+//go:noinline
+func readVolatileByte(p *byte) byte {
+	return *p
+}
+
+// probeRelrSplit maps a file with PROT_READ|PROT_EXEC and MAP_PRIVATE, then
+// maps +0x3ef000 with PROT_READ|PROT_WRITE and MAP_FIXED from offset 0x3df000.
+// It zeroes the BSS tail and applies in-place RELR relocations at +0x3ef3e0.
+func probeRelrSplit(dir string) error {
+	const (
+		fileSize     = 0x452b98
+		totalMapLen  = 0x466000
+		rwVirtOff    = 0x3ef000
+		rwMapLen     = 0x77000
+		rwFileOff    = 0x3df000
+		anonVirtOff  = 0x463000
+		anonMapLen   = 0x3000
+		bssZeroStart = 0x462408
+		bssZeroLen   = 0xbf8
+		relrFileOff  = 0x3df3e0
+		relrVirtOff  = 0x3ef3e0
+		word0        = uint64(0x50c0c)
+		word1        = uint64(0x50880)
+		word2        = uint64(0x50bac)
+	)
+
+	path := filepath.Join(dir, "relrsplit.so")
+	content := make([]byte, fileSize)
+	for i := range content {
+		content[i] = byte((i/pageSize)*13 + (i % 251) + 1)
+	}
+	putU64 := func(off int, v uint64) {
+		for b := 0; b < 8; b++ {
+			content[off+b] = byte(v >> (8 * b))
+		}
+	}
+	putU64(relrFileOff+0, word0)
+	putU64(relrFileOff+8, word1)
+	putU64(relrFileOff+16, word2)
+
+	if err := os.WriteFile(path, content, 0o755); err != nil {
+		return fmt.Errorf("write relrsplit file: %w", err)
+	}
+	defer os.Remove(path)
+
+	runOne := func(label string, fixedPtr unsafe.Pointer, touchLoad0 bool) error {
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("%s: open: %w", label, err)
+		}
+		defer f.Close()
+
+		var basePtr unsafe.Pointer
+		if fixedPtr == nil {
+			mapped, err := syscall.Mmap(int(f.Fd()), 0, totalMapLen, syscall.PROT_READ|syscall.PROT_EXEC, syscall.MAP_PRIVATE)
+			if err != nil {
+				return fmt.Errorf("%s: mmap LOAD0: %w", label, err)
+			}
+			defer syscall.Munmap(mapped)
+			basePtr = unsafe.Pointer(&mapped[0])
+		} else {
+			if _, _, errno := syscall.Syscall6(
+				syscall.SYS_MMAP,
+				uintptr(fixedPtr),
+				totalMapLen,
+				syscall.PROT_READ|syscall.PROT_EXEC,
+				syscall.MAP_PRIVATE|syscall.MAP_FIXED,
+				f.Fd(),
+				0,
+			); errno != 0 {
+				return fmt.Errorf("%s: mmap LOAD0: %w", label, errno)
+			}
+			basePtr = fixedPtr
+		}
+		base := uintptr(basePtr)
+
+		if touchLoad0 {
+			_ = readVolatileByte((*byte)(basePtr))
+			_ = readVolatileByte((*byte)(unsafe.Add(basePtr, 0x3ec000)))
+		}
+
+		if _, _, errno := syscall.Syscall6(
+			syscall.SYS_MMAP,
+			uintptr(unsafe.Add(basePtr, rwVirtOff)),
+			rwMapLen,
+			syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_PRIVATE|syscall.MAP_FIXED,
+			f.Fd(),
+			rwFileOff,
+		); errno != 0 {
+			return fmt.Errorf("%s: mmap LOAD1: %w", label, errno)
+		}
+
+		if _, _, errno := syscall.Syscall6(
+			syscall.SYS_MMAP,
+			uintptr(unsafe.Add(basePtr, anonVirtOff)),
+			anonMapLen,
+			syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_PRIVATE|syscall.MAP_FIXED|syscall.MAP_ANON,
+			^uintptr(0),
+			0,
+		); errno != 0 {
+			return fmt.Errorf("%s: mmap BSS: %w", label, errno)
+		}
+
+		bssTail := unsafe.Slice((*byte)(unsafe.Add(basePtr, bssZeroStart)), bssZeroLen)
+		clear(bssTail)
+
+		relrPtr := (*[3]uint64)(unsafe.Add(basePtr, relrVirtOff))
+		applyRelr3(relrPtr, uint64(base))
+
+		got := *relrPtr
+		want := [3]uint64{uint64(base) + word0, uint64(base) + word1, uint64(base) + word2}
+		if got != want {
+			return fmt.Errorf(
+				"%s (base=%#x, base%%0x4000=%#x, base%%0x200000=%#x): relr words = [%#x, %#x, %#x] (deltas [%#x, %#x, %#x]), want [%#x, %#x, %#x]",
+				label, base, base%0x4000, base%0x200000,
+				got[0], got[1], got[2],
+				got[0]-uint64(base), got[1]-uint64(base), got[2]-uint64(base),
+				want[0], want[1], want[2],
+			)
+		}
+		return nil
+	}
+
+	// Test OS-assigned bases across 16 cold and 16 pre-touched rounds.
+	for round := 0; round < 16; round++ {
+		if err := runOne(fmt.Sprintf("aslr-%d-cold", round), nil, false); err != nil {
+			return err
+		}
+		if err := runOne(fmt.Sprintf("aslr-%d-touch0", round), nil, true); err != nil {
+			return err
+		}
+	}
+
+	// Test all four 16 KB sub-block alignments across three 2 MiB offsets.
+	reserve, err := syscall.Mmap(-1, 0, 8*hugeSize, syscall.PROT_NONE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		return fmt.Errorf("reserve arena: %w", err)
+	}
+	defer syscall.Munmap(reserve)
+	arenaStart := unsafe.Pointer(&reserve[0])
+	alignedHuge := unsafe.Add(arenaStart, (hugeSize-uintptr(arenaStart)%hugeSize)%hugeSize)
+
+	for _, hugeOff := range []uintptr{0, 0x1a0000, 0x1a4000} {
+		for sub := uintptr(0); sub < 0x4000; sub += pageSize {
+			fixed := unsafe.Add(alignedHuge, hugeOff+sub)
+			if err := runOne(fmt.Sprintf("fixed-h%#x-s%#x-cold", hugeOff, sub), fixed, false); err != nil {
+				return err
+			}
+			if err := runOne(fmt.Sprintf("fixed-h%#x-s%#x-touch0", hugeOff, sub), fixed, true); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

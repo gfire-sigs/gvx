@@ -436,8 +436,8 @@ type subBlockLayer struct {
 	// populating is 1 while populatePartial runs without mu, so pending
 	// stays positive until beforeSwitch finishes mapping deferred blocks.
 	populating int
-	// releaseGen counts release calls so populatePartial retries a block
-	// when a new guest mapping arrives during PopulateSubBlock.
+	// releaseGen counts release, unmap, and reset calls so populatePartial
+	// retries blocks modified while PopulateSubBlock runs without mu.
 	releaseGen uint64
 	// comps holds the blocks that map a composite page.
 	comps map[uintptr]*hostBlock
@@ -873,6 +873,7 @@ func (l *subBlockLayer) unmap(addr hostarch.Addr, length uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	defer l.updatePendingLocked()
+	l.releaseGen++
 	headEnd := min(end, (va+subBlockSize-1)&^(subBlockSize-1))
 	midEnd := max(headEnd, end&^(subBlockSize-1))
 	l.clearPagesLocked(va, headEnd)

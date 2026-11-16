@@ -70,6 +70,9 @@ func TestE2EWriteFaultInPrivateFileMapping(t *testing.T) {
 				if !strings.Contains(out.String(), "PASS cow-prefix:"+dir+"\n") {
 					t.Errorf("the write faults on %s did not pass on %s", dir, b.name)
 				}
+				if !strings.Contains(out.String(), "PASS relr-split:"+dir+"\n") {
+					t.Errorf("the split ELF RELR mappings on %s did not pass on %s", dir, b.name)
+				}
 			}
 			if err != nil || code != 0 || !strings.Contains(out.String(), "COWPROBE-OK") {
 				t.Fatalf("cowprobe on %s = (%d, %v)\nstderr:\n%s", b.name, code, err, errOut.String())
