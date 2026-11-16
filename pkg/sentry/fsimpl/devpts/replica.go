@@ -124,8 +124,8 @@ func (rfd *replicaFileDescription) Epollable() bool {
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
-func (rfd *replicaFileDescription) Read(ctx context.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
-	return rfd.inode.t.ld.inputQueueRead(ctx, dst)
+func (rfd *replicaFileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	return rfd.readReplica(ctx, dst, opts)
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
@@ -150,23 +150,23 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 	case linux.TCGETS2:
 		return rfd.inode.t.ld.getTermios2(t, args)
 	case linux.TCSETS:
-		return rfd.inode.t.ld.setTermios(t, args, false /* flushInput */)
+		return rfd.finishReplicaTermios(rfd.inode.t.ld.setTermios(t, args, false /* flushInput */))
 	case linux.TCSETSW:
 		// Draining output is a no-op for PTYs.
-		return rfd.inode.t.ld.setTermios(t, args, false /* flushInput */)
+		return rfd.finishReplicaTermios(rfd.inode.t.ld.setTermios(t, args, false /* flushInput */))
 	case linux.TCSETSF:
 		// Draining output is a no-op for PTYs, but pending input must be
 		// discarded.
-		return rfd.inode.t.ld.setTermios(t, args, true /* flushInput */)
+		return rfd.finishReplicaTermios(rfd.inode.t.ld.setTermios(t, args, true /* flushInput */))
 	case linux.TCSETS2:
-		return rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */)
+		return rfd.finishReplicaTermios(rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */))
 	case linux.TCSETSW2:
 		// Draining output is a no-op for PTYs.
-		return rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */)
+		return rfd.finishReplicaTermios(rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */))
 	case linux.TCSETSF2:
 		// Draining output is a no-op for PTYs, but pending input must be
 		// discarded.
-		return rfd.inode.t.ld.setTermios2(t, args, true /* flushInput */)
+		return rfd.finishReplicaTermios(rfd.inode.t.ld.setTermios2(t, args, true /* flushInput */))
 	case linux.TCSBRK:
 		// TCSBRK with arg != 0 is tcdrain, which waits for output to
 		// drain. For a pty with no real hardware, this is a no-op.

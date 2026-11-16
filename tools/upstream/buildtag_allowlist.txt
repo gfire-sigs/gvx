@@ -419,3 +419,7 @@ seam pkg/fsutil/fsutil_unsafe.go
 # (pkg/tcpip/stack/ext_state_xplat.go, pkg/sentry/kernel/shm/rmid_xplat.go).
 seam pkg/sentry/kernel/shm/shm.go
 seam pkg/sentry/kernel/shm/shm_state_autogen.go
+
+# Content seam: replicaFileDescription.Read delegates to readReplica so non-canonical
+# VMIN and VTIME reads obey POSIX termios rules (pkg/sentry/fsimpl/devpts/vmin_xplat.go).
+seam pkg/sentry/fsimpl/devpts/replica.go
