@@ -2,6 +2,19 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.16.10022026110900] - 2026-11-17
+
+This release fixes 16 KB `arm64` `systrap` composite sub-block store emulation (`TBI0` tags and `STLUR`) and per-sub-page VIPT I-cache cleaning (#203). It also fixes `devpts` master hangup notifications, `TCSETS` wakeups, and job-control routing (#205). In addition, it moves pending fault-access state into a weak-keyed side table (#204).
+
+### Bug Fixes
+
+- **16 KB `arm64` `systrap` composite stores and I-cache (`pkg/sentry/platform/systrap`)** (#203): `handleStoreFault` strips AArch64 `TBI0` tags before sub-block lookup and preserves register tags on writeback. `decodeStore` adds ARMv8.4 `STLURB`, `STLURH`, and `STLUR` unscaled store-release decoding. `hostBlock` tracks `compExec` and `compDirty` sub-page masks so `mapCompLocked` cleans the stub VIPT I-cache when a dirty sub-page gains `PROT_EXEC`.
+- **Master hangup wakeups and job-control routing (`pkg/sentry/fsimpl/devpts`)** (#205): `masterClose` wakes `replicaWaiter`, replica `Readiness` reports `EventHUp|EventIn|EventOut|EventErr` after hangup, and replica `Write` returns `EIO`. Master `TCSETS` ioctls wake blocked non-canonical replica readers when `VMIN` or line-discipline flags change. Master `TIOCSCTTY`, `TIOCNOTTY`, `TIOCGPGRP`, and `TIOCSPGRP` ioctls target `replicaKTTY` so master `TIOCSWINSZ` delivers `SIGWINCH` and master `TIOCGPGRP` queries the replica session.
+
+### Refactoring
+
+- **Weak-keyed pending `faultAccess` side table (`pkg/sentry/arch`)** (#204): `SetPendingFaultAccess` stores transient fault access in `weakmap.Map` inside `signal_arm64_fpsimd_xplat.go` and `signal_amd64_fault_xplat.go`. This restores `arch_aarch64.go` and `arch_x86_impl.go` to upstream bytes.
+
 ## [v0.16.10012026110900] - 2026-11-17
 
 This release fixes `devpts` non-canonical `VMIN` and `VTIME` reads (#198) and 16 KB `systrap` sub-block repopulation after `unmap` (#201). It also fixes backing-memory teardown order, Windows `arm64` WHPX floating-point layout, and checkpoint state-capture error handling (#202).
