@@ -2,6 +2,20 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.16.10012026110900] - 2026-11-17
+
+This release fixes `devpts` non-canonical `VMIN` and `VTIME` reads (#198) and 16 KB `systrap` sub-block repopulation after `unmap` (#201). It also fixes backing-memory teardown order, Windows `arm64` WHPX floating-point layout, and checkpoint state-capture error handling (#202).
+
+### Bug Fixes
+
+- **Non-canonical `devpts` reads (`pkg/sentry/fsimpl/devpts`)** (#198): `replicaFileDescription.Read` and replica `TCSETS` ioctls delegate to `vmin_xplat.go` for POSIX Cases A, B, C, and D. Polling reads (`VMIN == 0`, `VTIME == 0`) return `0, nil` on empty input so `btop` exits cleanly. Timed reads validate `preadv2` flags, check `RWF_NOWAIT` before `O_NONBLOCK`, wake on `TCSETS`, and preserve `ErrInterrupted` and `EFAULT`.
+- **16 KB `systrap` sub-block repopulation (`pkg/sentry/platform/systrap`, `e2e`)** (#201): `subBlockLayer.unmap` increments `releaseGen` under `mu` so `populatePartial` retries blocks cleared during `PopulateSubBlock`. This prevents zero-filled reads at split ELF `MAP_FIXED` `.relr.dyn` relocation boundaries when a sibling COW break unmaps a merged PMA.
+- **Memory lifetime, WHPX FP layout, and checkpoint capture (`pkg/gvx`)** (#202): `Sandbox.Run` retains `MemoryFile` instances, and `Sandbox.Close` closes `s.plat` before mounts, layers, and memory files. `whpx` aligns `arm64` floating-point marshaling with `arch.FPSIMDOffFPSR`, `arch.FPSIMDOffFPCR`, `arch.FPSIMDOffV`, and `arch.FPSIMDBodySize` (`520` bytes) and zero-extends `FPSR` and `FPCR`. `Sandbox.Checkpoint` calls `ReceiveTaskStatesChecked` before `QuiesceForSave`, and `whpx` wraps `PullFullState` and `evict` failures in `*platform.ContextError`.
+
+### Build
+
+- **CI coverage and `macos-26` runners (`.github/workflows`)** (#198, #201): `ci.yml` adds `./pkg/sentry/fsimpl/devpts/...` to `OWNED`, and `ci.yml` and `release.yml` move `darwin/arm64` jobs to `macos-26`.
+
 ## [v0.16.10002026110900] - 2026-11-16
 
 This release adds `ext4lite`-backed persistent container root filesystems with `-rootfs-volume` and `Config.RootVolume` (#197).
