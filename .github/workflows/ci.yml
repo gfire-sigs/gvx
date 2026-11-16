@@ -236,7 +236,7 @@ jobs:
   darwin-arm64:
     name: test darwin/arm64
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 40
     env:
       # A hosted runner is a virtual machine, so it cannot create a nested VM.
@@ -252,7 +252,7 @@ jobs:
           go-version-file: go.mod
       - name: Test owned packages
         run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED ./pkg/sentry/platform/systrap/...
-      # macOS has no systrap engine and macos-15 offers no Hypervisor.framework,
+      # macOS has no systrap engine and macos-26 offers no Hypervisor.framework,
       # so this step runs the host-level e2e gates that need no guest VM.
       - name: Test host-level end-to-end gates
         run: go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" -run '^TestE2E(OtherOSHypervisorFailsExplicitly|SystrapPrerequisiteError|RungvConfigurationErrors)$' ./e2e/

@@ -235,6 +235,121 @@ func TestPopulatePartialRepopulatesAfterConcurrentRelease(t *testing.T) {
 	}
 }
 
+// TestPopulatePartialRepopulatesAfterSiblingUnmap verifies that an unmap during
+// PopulateSubBlock (such as breaking COW on a merged PMA) causes populatePartial
+// to re-populate cleared sub-pages instead of zero-filling them.
+func TestPopulatePartialRepopulatesAfterSiblingUnmap(t *testing.T) {
+	mf, err := createMemoryFile()
+	if err != nil {
+		t.Fatalf("createMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	fr, err := mf.Allocate(9*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	raw := bs.Head().ToSlice()
+	for i := range raw {
+		raw[i] = 0xc5
+	}
+
+	layer := newSubBlockLayer(fakeCompBlockHost{})
+	defer layer.reset()
+
+	const (
+		headBlock = hostarch.Addr(0x400000)
+		tailBlock = hostarch.Addr(0x410000)
+	)
+	baseOff := fr.Start + hostarch.PageSize
+	pageAt := func(idx uint64) memmap.FileRange {
+		off := baseOff + idx*hostarch.PageSize
+		return memmap.FileRange{Start: off, End: off + hostarch.PageSize}
+	}
+
+	// Map headBlock sub-page 3 and tailBlock sub-pages 0..2 to match one 64 KiB COW PMA.
+	if err := layer.mapFile(headBlock+3*hostarch.PageSize, mf, pageAt(3), hostarch.Read, false); err != nil {
+		t.Fatalf("mapFile head sub-page 3: %v", err)
+	}
+	tailInitFR := memmap.FileRange{Start: baseOff + 4*hostarch.PageSize, End: baseOff + 7*hostarch.PageSize}
+	if err := layer.mapFile(tailBlock, mf, tailInitFR, hostarch.Read, false); err != nil {
+		t.Fatalf("mapFile tail sub-pages 0..2: %v", err)
+	}
+
+	cowBroken := false
+	pop := funcSubBlockPopulator{
+		fn: func(_ context.Context, addr hostarch.Addr) bool {
+			switch addr {
+			case headBlock, headBlock + hostarch.PageSize, headBlock + 2*hostarch.PageSize:
+				idx := uint64(addr-headBlock) / hostarch.PageSize
+				if err := layer.mapFile(addr, mf, pageAt(idx), hostarch.Read, false); err != nil {
+					t.Errorf("mapFile(%#x): %v", addr, err)
+				}
+				return true
+			case headBlock + 3*hostarch.PageSize:
+				if err := layer.mapFile(addr, mf, pageAt(3), hostarch.ReadWrite, false); err != nil {
+					t.Errorf("mapFile(%#x): %v", addr, err)
+				}
+				return true
+			case tailBlock, tailBlock + hostarch.PageSize, tailBlock + 2*hostarch.PageSize:
+				idx := 4 + uint64(addr-tailBlock)/hostarch.PageSize
+				if err := layer.mapFile(addr, mf, pageAt(idx), hostarch.ReadWrite, false); err != nil {
+					t.Errorf("mapFile(%#x): %v", addr, err)
+				}
+				return true
+			case tailBlock + 3*hostarch.PageSize:
+				if !cowBroken {
+					cowBroken = true
+					// Breaking COW on the merged PMA unmaps [headBlock+3*PageSize, tailBlock+3*PageSize)
+					// while PopulateSubBlock maps only the faulting page at tailBlock+3*PageSize.
+					layer.unmap(headBlock+3*hostarch.PageSize, uint64(tailBlock-headBlock))
+				}
+				if err := layer.mapFile(addr, mf, pageAt(7), hostarch.ReadWrite, false); err != nil {
+					t.Errorf("mapFile(%#x): %v", addr, err)
+				}
+				return true
+			default:
+				return false
+			}
+		},
+	}
+
+	layer.beforeSwitch(nil, pop)
+
+	layer.mu.Lock()
+	headHB := layer.blocks[uintptr(headBlock)]
+	tailHB := layer.blocks[uintptr(tailBlock)]
+	var headSub3, tailSub0 []byte
+	var headMapped, tailMapped uint8
+	if headHB != nil {
+		headMapped = headHB.mapped
+		if headHB.hasComp {
+			off := 3 * hostarch.PageSize
+			headSub3 = bytes.Clone(headHB.comp.buf[off : off+4])
+		}
+	}
+	if tailHB != nil {
+		tailMapped = tailHB.mapped
+		if tailHB.hasComp {
+			tailSub0 = bytes.Clone(tailHB.comp.buf[:4])
+		}
+	}
+	layer.mu.Unlock()
+
+	if headMapped != allSubPages || !bytes.Equal(headSub3, []byte{0xc5, 0xc5, 0xc5, 0xc5}) {
+		t.Fatalf("headBlock mapped=%#b sub-page 3 prefix=%x, want %#b and c5c5c5c5", headMapped, headSub3, uint8(allSubPages))
+	}
+	if tailMapped != allSubPages || !bytes.Equal(tailSub0, []byte{0xc5, 0xc5, 0xc5, 0xc5}) {
+		t.Fatalf("tailBlock mapped=%#b sub-page 0 prefix=%x, want %#b and c5c5c5c5", tailMapped, tailSub0, uint8(allSubPages))
+	}
+}
+
 func TestAlignToPageSpan(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
