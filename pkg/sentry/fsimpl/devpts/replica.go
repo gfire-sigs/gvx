@@ -115,7 +115,7 @@ func (rfd *replicaFileDescription) EventUnregister(e *waiter.Entry) {
 
 // Readiness implements waiter.Waitable.Readiness.
 func (rfd *replicaFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
-	return rfd.inode.t.ld.replicaReadiness()
+	return rfd.readinessReplica()
 }
 
 // Epollable implements FileDescriptionImpl.Epollable.
@@ -130,7 +130,7 @@ func (rfd *replicaFileDescription) Read(ctx context.Context, dst usermem.IOSeque
 
 // Write implements vfs.FileDescriptionImpl.Write.
 func (rfd *replicaFileDescription) Write(ctx context.Context, src usermem.IOSequence, _ vfs.WriteOptions) (int64, error) {
-	return rfd.inode.t.ld.outputQueueWrite(ctx, src)
+	return rfd.writeReplica(ctx, src)
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.

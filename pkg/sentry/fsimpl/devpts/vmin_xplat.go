@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/fsutilx"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -32,8 +33,69 @@ const vtimeUnit = 100 * time.Millisecond
 // replicaReadEvents lists the waiter events that wake a blocking replica read.
 const replicaReadEvents = waiter.ReadableEvents | waiter.EventHUp | waiter.EventErr
 
+// replicaHangupEvents matches Linux hung_up_tty_poll readiness after master close.
+const replicaHangupEvents = waiter.ReadableEvents | waiter.WritableEvents | waiter.EventErr | waiter.EventHUp
+
 // supportedReplicaReadFlags lists the preadv2 flags accepted by replica reads.
 const supportedReplicaReadFlags = uint32(linux.RWF_HIPRI | linux.RWF_DSYNC | linux.RWF_SYNC | fsutilx.RWFNoWait)
+
+// hungUp reports whether the master end of the terminal has closed.
+func (ri *replicaInode) hungUp() bool {
+	ri.root.mu.Lock()
+	_, ok := ri.root.replicas[ri.t.n]
+	ri.root.mu.Unlock()
+	return !ok
+}
+
+// readinessReplica returns replica poll readiness, reporting hangup events once the master closes.
+func (rfd *replicaFileDescription) readinessReplica() waiter.EventMask {
+	if rfd.inode.hungUp() {
+		return replicaHangupEvents
+	}
+	return rfd.inode.t.ld.replicaReadiness()
+}
+
+// writeReplica writes to the terminal output queue or returns EIO after master hangup.
+func (rfd *replicaFileDescription) writeReplica(ctx context.Context, src usermem.IOSequence) (int64, error) {
+	if rfd.inode.hungUp() {
+		return 0, linuxerr.EIO
+	}
+	return rfd.inode.t.ld.outputQueueWrite(ctx, src)
+}
+
+// releaseMaster closes the master terminal endpoint and wakes all waiting replica descriptors.
+func (mfd *masterFileDescription) releaseMaster(ctx context.Context) {
+	mfd.inode.root.masterClose(ctx, mfd.t)
+	mfd.t.ld.replicaWaiter.Notify(replicaHangupEvents)
+}
+
+// finishMasterTermios wakes blocked replica readers when a master TCSETS ioctl succeeds.
+func (mfd *masterFileDescription) finishMasterTermios(ret uintptr, err error) (uintptr, error) {
+	if err == nil {
+		mfd.t.ld.replicaWaiter.Notify(waiter.ReadableEvents)
+	}
+	return ret, err
+}
+
+// masterSetControllingTTY assigns the replica terminal as the controlling TTY of tg.
+func (mfd *masterFileDescription) masterSetControllingTTY(ctx context.Context, tg *kernel.ThreadGroup, steal bool) error {
+	return tg.SetControllingTTY(ctx, mfd.t.replicaKTTY, steal, mfd.vfsfd.IsReadable())
+}
+
+// masterForegroundProcessGroupID returns the foreground process group ID of the replica session.
+func (mfd *masterFileDescription) masterForegroundProcessGroupID(t *kernel.Task) kernel.ProcessGroupID {
+	if ttyTG := mfd.t.replicaKTTY.ThreadGroup(); ttyTG != nil {
+		if fg, err := ttyTG.ForegroundProcessGroup(mfd.t.replicaKTTY); err == nil && fg != nil {
+			return t.PIDNamespace().IDOfProcessGroup(fg)
+		}
+	}
+	return 0
+}
+
+// masterSetForegroundProcessGroupID sets the foreground process group ID on the replica terminal.
+func (mfd *masterFileDescription) masterSetForegroundProcessGroupID(ctx context.Context, tg *kernel.ThreadGroup, pgid kernel.ProcessGroupID) error {
+	return tg.SetForegroundProcessGroupID(ctx, mfd.t.replicaKTTY, pgid)
+}
 
 // finishReplicaTermios wakes blocked replica readers when a replica TCSETS ioctl succeeds.
 func (rfd *replicaFileDescription) finishReplicaTermios(ret uintptr, err error) (uintptr, error) {
