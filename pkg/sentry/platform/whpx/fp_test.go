@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
 
 // Compacted offsets of the test layout for testXcompBV. Component 5 and the
@@ -246,12 +248,12 @@ func TestXsaveConversionRoundTripsTheSentryImage(t *testing.T) {
 }
 
 func TestA64FPLayoutAndRoundTrip(t *testing.T) {
-	img := make([]byte, a64FPSize)
-	binary.LittleEndian.PutUint64(img[a64FPOffFPSR:], 0x0800_0010)
-	binary.LittleEndian.PutUint64(img[a64FPOffFPCR:], 0x0040_0000)
+	img := make([]byte, arch.FPSIMDBodySize)
+	binary.LittleEndian.PutUint32(img[arch.FPSIMDOffFPSR:], 0x0800_0010)
+	binary.LittleEndian.PutUint32(img[arch.FPSIMDOffFPCR:], 0x0040_0000)
 	for i := range 32 {
-		binary.LittleEndian.PutUint64(img[a64FPOffQ+i*16:], 0xAB00_0000_0000_0000|uint64(i))
-		binary.LittleEndian.PutUint64(img[a64FPOffQ+i*16+8:], 0xCD00_0000_0000_0000|uint64(i))
+		binary.LittleEndian.PutUint64(img[arch.FPSIMDOffV+i*16:], 0xAB00_0000_0000_0000|uint64(i))
+		binary.LittleEndian.PutUint64(img[arch.FPSIMDOffV+i*16+8:], 0xCD00_0000_0000_0000|uint64(i))
 	}
 	b := newRegBatch(a64FPRegCount)
 	if err := a64FPToRegs(b, img); err != nil {
@@ -272,7 +274,7 @@ func TestA64FPLayoutAndRoundTrip(t *testing.T) {
 	if names[32] != a64RegFpcr || names[33] != a64RegFpsr || b.u64(32) != 0x0040_0000 || b.u64(33) != 0x0800_0010 {
 		t.Errorf("FPCR and FPSR are %#x=%#x and %#x=%#x", names[32], b.u64(32), names[33], b.u64(33))
 	}
-	back := make([]byte, a64FPSize)
+	back := make([]byte, arch.FPSIMDBodySize)
 	if err := a64FPFromRegs(back, b, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +288,10 @@ func TestA64FPLayoutAndRoundTrip(t *testing.T) {
 	if len(wn) != a64FPRegCount || wn[0] != a64RegQ0 || wn[31] != a64RegQ0+31 || wn[32] != a64RegFpcr || wn[33] != a64RegFpsr {
 		t.Errorf("read list is %#x", wn)
 	}
-	if err := a64FPToRegs(newRegBatch(a64FPRegCount), make([]byte, a64FPSize-1)); err == nil {
+	if err := a64FPToRegs(newRegBatch(a64FPRegCount), make([]byte, arch.FPSIMDBodySize-1)); err == nil {
 		t.Error("short image accepted for a write")
+	}
+	if err := a64FPFromRegs(make([]byte, arch.FPSIMDBodySize-1), b, 0); err == nil {
+		t.Error("short image accepted for a read")
 	}
 }

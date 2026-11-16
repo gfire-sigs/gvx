@@ -405,7 +405,9 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		k.Unpause()
 		k.OnCheckpointAttempt(retErr)
 	}()
-	k.ReceiveTaskStates()
+	if err := k.ReceiveTaskStatesChecked(); err != nil {
+		return fmt.Errorf("gvx: capture task states for checkpoint: %w", err)
+	}
 
 	for _, q := range quiescers {
 		q.QuiesceForSave()

@@ -46,12 +46,14 @@ import (
 // overlay layers, hostfs, volume and tmpfs mounts, Dual-Track Netstack, and host
 // process self-lockdown.
 type Sandbox struct {
-	mu                sync.Mutex
-	cfg               Config
-	plat              platform.Platform
-	platName          string
-	fallbackFrom      error
-	memFile           *pgalloc.MemoryFile
+	mu           sync.Mutex
+	cfg          Config
+	plat         platform.Platform
+	platName     string
+	fallbackFrom error
+	memFile      *pgalloc.MemoryFile
+	// runMemFile retains consumed backing memory until the platform closes.
+	runMemFile        *pgalloc.MemoryFile
 	resolvedImg       *oci.ResolvedImage
 	layerHandles      []*fd.HostHandle
 	layerDigests      []string
@@ -87,6 +89,7 @@ type Sandbox struct {
 	restoredStdio     *restoreStdioCollector
 	detachDebugLog    func()
 	closed            bool
+	closeErr          error
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
@@ -538,7 +541,7 @@ func (s *Sandbox) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil
+		return s.closeErr
 	}
 	s.closed = true
 
@@ -598,6 +601,17 @@ func (s *Sandbox) Close() error {
 		s.netStack = nil
 	}
 
+	if s.plat != nil {
+		if closer, ok := s.plat.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				// Retain backing memory and mounts when platform teardown fails.
+				s.closeErr = errors.Join(append(errs, err)...)
+				return s.closeErr
+			}
+		}
+		s.plat = nil
+	}
+
 	if err := s.closeMounts(); err != nil {
 		errs = append(errs, err)
 	}
@@ -622,13 +636,9 @@ func (s *Sandbox) Close() error {
 		s.memFile = nil
 	}
 
-	if s.plat != nil {
-		if closer, ok := s.plat.(io.Closer); ok {
-			if err := closer.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		s.plat = nil
+	if s.runMemFile != nil {
+		s.runMemFile.Destroy()
+		s.runMemFile = nil
 	}
 
 	if s.detachDebugLog != nil {
@@ -636,5 +646,6 @@ func (s *Sandbox) Close() error {
 		s.detachDebugLog = nil
 	}
 
-	return errors.Join(errs...)
+	s.closeErr = errors.Join(errs...)
+	return s.closeErr
 }

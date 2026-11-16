@@ -549,8 +549,8 @@ func TestSwitchFlushesWhenTheTranslationStateChanges(t *testing.T) {
 
 func fillFP(ac *arch.Context64, q0 uint64) {
 	img := acImage(ac)
-	binary.LittleEndian.PutUint64(img[a64FPOffQ:], q0)
-	binary.LittleEndian.PutUint64(img[a64FPOffFPCR:], 0x400000)
+	binary.LittleEndian.PutUint64(img[arch.FPSIMDOffV:], q0)
+	binary.LittleEndian.PutUint32(img[arch.FPSIMDOffFPCR:], 0x400000)
 }
 
 func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
@@ -601,7 +601,7 @@ func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
 	if err := c.PullFullState(e.as, ac); err != nil {
 		t.Fatal(err)
 	}
-	if got := binary.LittleEndian.Uint64(acImage(ac)[a64FPOffQ:]); got != 0x2222 {
+	if got := binary.LittleEndian.Uint64(acImage(ac)[arch.FPSIMDOffV:]); got != 0x2222 {
 		t.Errorf("pulled Q0 is %#x, want the guest value", got)
 	}
 	reads := len(vp.getCalls)
@@ -612,7 +612,7 @@ func TestFloatingPointStaysInsideTheProcessor(t *testing.T) {
 	// FullStateChanged makes the Sentry image the truth and reloads it.
 	fillFP(ac, 0x3333)
 	c.FullStateChanged()
-	if err := c.PullFullState(e.as, ac); err != nil || binary.LittleEndian.Uint64(acImage(ac)[a64FPOffQ:]) != 0x3333 {
+	if err := c.PullFullState(e.as, ac); err != nil || binary.LittleEndian.Uint64(acImage(ac)[arch.FPSIMDOffV:]) != 0x3333 {
 		t.Errorf("PullFullState after FullStateChanged overwrote the image: %v", err)
 	}
 	if _, _, err := e.switchTo(c, ac); err != nil {
@@ -649,7 +649,7 @@ func TestFloatingPointSurvivesProcessorSharing(t *testing.T) {
 	if err := a.PullFullState(e.as, acA); err != nil {
 		t.Fatal(err)
 	}
-	if got := binary.LittleEndian.Uint64(acImage(acA)[a64FPOffQ:]); got != 0xA1A1 {
+	if got := binary.LittleEndian.Uint64(acImage(acA)[arch.FPSIMDOffV:]); got != 0xA1A1 {
 		t.Errorf("a pulled Q0=%#x, want its own value 0xa1a1", got)
 	}
 	if _, _, err := e.switchTo(a, acA); err != nil {
