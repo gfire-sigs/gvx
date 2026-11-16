@@ -32,6 +32,7 @@ import (
 	"z.gfire.dev/gvx/internal/testimage"
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
@@ -85,29 +86,40 @@ func testSandboxBackingLifetime(t *testing.T, consumed bool, closeErr error) {
 			plat: memoryLifetimePlatform{close: func() error {
 				closes++
 				synctest.Wait()
-				if _, err := backing.Stat(); err != nil {
+				if !mf.IsBackingOpen() {
+					t.Error("backing MemoryFile marked destroyed before platform teardown")
+				} else if _, err := backing.Stat(); err != nil {
 					t.Errorf("backing file closed before platform teardown: %v", err)
 				}
 				return closeErr
 			}},
 		}
 		if consumed {
-			// Exercise a sandbox whose Run path already claimed memFile.
-			_ = sb.claimRunMemFileForTest()
+			sb.memFile, sb.runMemFile = nil, mf
 		}
 		if closeErr != nil {
-			defer mf.Destroy()
+			defer func() {
+				mf.Destroy()
+				synctest.Wait()
+			}()
 		}
 		if err := sb.Close(); !errors.Is(err, closeErr) {
 			t.Fatalf("Close = %v, want %v", err, closeErr)
 		}
 		synctest.Wait()
-		_, statErr := backing.Stat()
-		if closeErr == nil && statErr == nil {
-			t.Error("backing file remains open after successful platform teardown")
-		}
-		if closeErr != nil && statErr != nil {
-			t.Errorf("backing file closed after failed platform teardown: %v", statErr)
+		if closeErr == nil {
+			if err := mf.WaitBackingClosed(t.Context()); err != nil {
+				t.Fatalf("WaitBackingClosed: %v", err)
+			}
+			if _, statErr := backing.Stat(); statErr == nil {
+				t.Error("backing file remains open after successful platform teardown")
+			}
+		} else {
+			if !mf.IsBackingOpen() {
+				t.Error("backing MemoryFile destroyed after failed platform teardown")
+			} else if _, statErr := backing.Stat(); statErr != nil {
+				t.Errorf("backing file closed after failed platform teardown: %v", statErr)
+			}
 		}
 		if err := sb.Close(); !errors.Is(err, closeErr) {
 			t.Fatalf("second Close = %v, want %v", err, closeErr)
@@ -118,25 +130,16 @@ func testSandboxBackingLifetime(t *testing.T, consumed bool, closeErr error) {
 	})
 }
 
-func (s *Sandbox) claimRunMemFileForTest() *os.File {
-	if s.memFile == nil {
-		return nil
-	}
-	f := s.memFile.File()
-	s.memFile, s.runMemFile = nil, s.memFile
-	return f
-}
-
-func waitForClosedFile(t *testing.T, what string, f *os.File) {
+func assertBackingClosedAfterTeardown(t *testing.T, what string, mf *pgalloc.MemoryFile, backing *os.File) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := f.Stat(); err != nil {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := mf.WaitBackingClosed(ctx); err != nil {
+		t.Fatalf("%s WaitBackingClosed: %v", what, err)
 	}
-	t.Fatalf("%s backing file remains open after Close", what)
+	if _, err := backing.Stat(); err == nil {
+		t.Fatalf("%s backing file remains open after Close", what)
+	}
 }
 
 func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
@@ -174,14 +177,17 @@ func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	freshBacking := sb.memFile.File()
+	freshMF := sb.memFile
+	freshBacking := freshMF.File()
 	innerFreshPlat := sb.plat
 	var freshCloseSawOpen atomic.Bool
 	sb.plat = memoryLifetimePlatform{
 		Platform: innerFreshPlat,
 		close: func() error {
 			runtime.Gosched()
-			if _, statErr := freshBacking.Stat(); statErr != nil {
+			if !freshMF.IsBackingOpen() {
+				t.Error("fresh MemoryFile marked destroyed before platform teardown")
+			} else if _, statErr := freshBacking.Stat(); statErr != nil {
 				t.Errorf("fresh backing file closed before platform teardown: %v", statErr)
 			} else {
 				freshCloseSawOpen.Store(true)
@@ -211,8 +217,9 @@ func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
 	if out1.err != nil || out1.code != 0 {
 		t.Fatalf("fresh Run = (%d, %v), stderr=%q", out1.code, out1.err, stderr1.String())
 	}
-	// Let any premature Destroy goroutine run before Close starts.
-	time.Sleep(15 * time.Millisecond)
+	if !freshMF.IsBackingOpen() {
+		t.Fatal("fresh MemoryFile destroyed when Run returned, before Close")
+	}
 	if _, err := freshBacking.Stat(); err != nil {
 		t.Fatalf("fresh backing file closed when Run returned, before Close: %v", err)
 	}
@@ -222,7 +229,7 @@ func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
 	if !freshCloseSawOpen.Load() {
 		t.Fatal("fresh platform Close did not observe an open backing file")
 	}
-	waitForClosedFile(t, "fresh", freshBacking)
+	assertBackingClosedAfterTeardown(t, "fresh", freshMF, freshBacking)
 
 	stdin2R, stdin2W := io.Pipe()
 	defer stdin2R.Close()
@@ -241,14 +248,17 @@ func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	restoredBacking := restoredSB.memFile.File()
+	restoredMF := restoredSB.memFile
+	restoredBacking := restoredMF.File()
 	innerRestoredPlat := restoredSB.plat
 	var restoredCloseSawOpen atomic.Bool
 	restoredSB.plat = memoryLifetimePlatform{
 		Platform: innerRestoredPlat,
 		close: func() error {
 			runtime.Gosched()
-			if _, statErr := restoredBacking.Stat(); statErr != nil {
+			if !restoredMF.IsBackingOpen() {
+				t.Error("restored MemoryFile marked destroyed before platform teardown")
+			} else if _, statErr := restoredBacking.Stat(); statErr != nil {
 				t.Errorf("restored backing file closed before platform teardown: %v", statErr)
 			} else {
 				restoredCloseSawOpen.Store(true)
@@ -265,7 +275,10 @@ func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
 		_ = restoredSB.Close()
 		t.Fatalf("restored Run = (%d, %v), stderr=%q", code2, err, stderr2.String())
 	}
-	time.Sleep(15 * time.Millisecond)
+	if !restoredMF.IsBackingOpen() {
+		_ = restoredSB.Close()
+		t.Fatal("restored MemoryFile destroyed when Run returned, before Close")
+	}
 	if _, err := restoredBacking.Stat(); err != nil {
 		_ = restoredSB.Close()
 		t.Fatalf("restored backing file closed when Run returned, before Close: %v", err)
@@ -276,7 +289,7 @@ func TestSandboxRunAndRestoreKeepBackingUntilClose(t *testing.T) {
 	if !restoredCloseSawOpen.Load() {
 		t.Fatal("restored platform Close did not observe an open backing file")
 	}
-	waitForClosedFile(t, "restored", restoredBacking)
+	assertBackingClosedAfterTeardown(t, "restored", restoredMF, restoredBacking)
 	if got := stdout2.String(); got != "resumed\n" {
 		t.Fatalf("restored stdout = %q, want %q", got, "resumed\n")
 	}

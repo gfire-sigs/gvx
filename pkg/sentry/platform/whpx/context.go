@@ -143,7 +143,7 @@ func (c *Context) evict(v *vcpu) {
 			c.fpSaved = make([]byte, c.p.fpSize)
 		}
 		if err := v.readFP(c.fpSaved); err != nil {
-			c.fpErr = fmt.Errorf("whpx: save floating-point state: %w", err)
+			c.fpErr = platform.NewIOContextError(fmt.Errorf("whpx: save floating-point state: %w", err))
 		} else {
 			c.fpWhere = fpSaved
 		}
@@ -321,7 +321,7 @@ func (c *Context) PullFullState(_ platform.AddressSpace, ac *arch.Context64) err
 	switch c.fpWhere {
 	case fpOnVP:
 		if err := c.fpVP.readFP(image); err != nil {
-			return fmt.Errorf("whpx: pull floating-point state: %w", err)
+			return platform.NewIOContextError(fmt.Errorf("whpx: pull floating-point state: %w", err))
 		}
 	case fpSaved:
 		copy(image, c.fpSaved)

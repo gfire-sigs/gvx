@@ -680,13 +680,21 @@ func TestFloatingPointSaveFailureFailsTheOwner(t *testing.T) {
 	}
 	boom := errors.New("get boom")
 	e.fb.getErr = func(uint32) error { return boom }
+	// Direct PullFullState while fpOnVP wraps the read failure in ContextError.
+	pullErr := a.PullFullState(e.as, acA)
+	var ctxErr *platform.ContextError
+	if !errors.Is(pullErr, boom) || !errors.As(pullErr, &ctxErr) {
+		t.Errorf("direct PullFullState returned %T (%v), want *platform.ContextError wrapping boom", pullErr, pullErr)
+	}
 	// b takes the processor. Saving the state of a fails.
 	if _, _, err := e.switchTo(b, acB); err != nil {
 		t.Fatalf("b returned %v", err)
 	}
 	e.fb.getErr = nil
-	if err := a.PullFullState(e.as, acA); !errors.Is(err, boom) {
-		t.Errorf("PullFullState returned %v, want the save error", err)
+	evictErr := a.PullFullState(e.as, acA)
+	ctxErr = nil
+	if !errors.Is(evictErr, boom) || !errors.As(evictErr, &ctxErr) {
+		t.Errorf("evicted PullFullState returned %T (%v), want *platform.ContextError wrapping boom", evictErr, evictErr)
 	}
 	if _, _, err := e.switchTo(a, acA); !errors.Is(err, boom) {
 		t.Errorf("Switch returned %v, want the save error", err)

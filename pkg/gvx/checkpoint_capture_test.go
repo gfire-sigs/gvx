@@ -75,8 +75,8 @@ type pullErrorContext struct {
 }
 
 func (c pullErrorContext) PullFullState(as platform.AddressSpace, ac *arch.Context64) error {
-	if errPtr := c.pullErr.Load(); errPtr != nil && *errPtr != nil {
-		return *errPtr
+	if errPtr := c.pullErr.Swap(nil); errPtr != nil && *errPtr != nil {
+		return platform.NewIOContextError(*errPtr)
 	}
 	return c.Context.PullFullState(as, ac)
 }
@@ -141,8 +141,9 @@ func TestCheckpointPropagatesTaskStateCaptureError(t *testing.T) {
 	pullErr.Store(&wantErr)
 
 	ckptErr := sb.Checkpoint(context.Background(), CheckpointOptions{})
-	if !errors.Is(ckptErr, wantErr) {
-		t.Fatalf("Checkpoint = %v, want error wrapping %v", ckptErr, wantErr)
+	var ctxErr *platform.ContextError
+	if !errors.Is(ckptErr, wantErr) || !errors.As(ckptErr, &ctxErr) {
+		t.Fatalf("Checkpoint = %v, want *platform.ContextError wrapping %v", ckptErr, wantErr)
 	}
 
 	restoreCfg := newCheckpointTestConfig(t, cacheDir)
@@ -154,8 +155,6 @@ func TestCheckpointPropagatesTaskStateCaptureError(t *testing.T) {
 		t.Fatalf("Restore from aborted checkpoint = %v, want %v", rErr, ErrCheckpointManifest)
 	}
 
-	// Disarm the injected error and verify the guest unpaused and completes cleanly.
-	pullErr.Store(nil)
 	if _, err := stdinW.Write([]byte("after-failed-ckpt\n")); err != nil {
 		t.Fatalf("write stdin after failed checkpoint: %v", err)
 	}
