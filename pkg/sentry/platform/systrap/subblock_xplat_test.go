@@ -510,3 +510,136 @@ func TestResolveSubBlockFault(t *testing.T) {
 		t.Fatalf("subBlockRetries after cap = %d, want 0", ctx.subBlockRetries)
 	}
 }
+
+type recordingCompBlockHost struct {
+	mf        *pgalloc.MemoryFile
+	mapCalls  int
+	lastProt  int
+	compRange memmap.FileRange
+}
+
+func (h *recordingCompBlockHost) mapRange(addr, length uintptr, prot int, populate bool, fd int, off uint64) error {
+	h.mapCalls++
+	h.lastProt = prot
+	return nil
+}
+
+func (h *recordingCompBlockHost) unmapRange(addr, length uintptr) error { return nil }
+
+func (h *recordingCompBlockHost) allocComp() (compPage, error) {
+	fr, err := h.mf.AllocateAligned(subBlockSize, subBlockSize, pgalloc.AllocOpts{Kind: usage.System})
+	if err != nil {
+		return compPage{}, err
+	}
+	bs, err := h.mf.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		h.mf.DecRef(fr)
+		return compPage{}, err
+	}
+	h.compRange = fr
+	return compPage{fr: fr, buf: bs.Head().ToSlice()}, nil
+}
+
+func (h *recordingCompBlockHost) freeComp(c compPage) {
+	h.mf.DecRef(c.fr)
+}
+
+func (h *recordingCompBlockHost) compFD() int {
+	return h.mf.FD()
+}
+
+// TestCompositeWXSiblingExecCleansStubICache verifies that mprotect cleans and
+// remaps a composite block after a guest store into a writable sub-page. A
+// sibling sub-page holds execute access throughout the test.
+func TestCompositeWXSiblingExecCleansStubICache(t *testing.T) {
+	mf, err := createMemoryFile()
+	if err != nil {
+		t.Fatalf("createMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	fr, err := mf.Allocate(5*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	host := &recordingCompBlockHost{mf: mf}
+	layer := newSubBlockLayer(host)
+	defer layer.reset()
+
+	const blockAddr = hostarch.Addr(0x600000)
+	baseOff := fr.Start + hostarch.PageSize
+	pageAt := func(idx uint64) memmap.FileRange {
+		off := baseOff + idx*hostarch.PageSize
+		return memmap.FileRange{Start: off, End: off + hostarch.PageSize}
+	}
+	rxPerms := hostarch.AccessType{Read: true, Execute: true}
+	rwxPerms := hostarch.AccessType{Read: true, Write: true, Execute: true}
+
+	for i := uint64(0); i < 3; i++ {
+		if err := layer.mapFile(blockAddr+hostarch.Addr(i*hostarch.PageSize), mf, pageAt(i), hostarch.ReadWrite, false); err != nil {
+			t.Fatalf("mapFile sub-page %d: %v", i, err)
+		}
+	}
+	if err := layer.mapFile(blockAddr+3*hostarch.PageSize, mf, pageAt(3), rxPerms, false); err != nil {
+		t.Fatalf("mapFile sub-page 3 RX: %v", err)
+	}
+	layer.beforeSwitch(nil, noopSubBlockPopulator{})
+	initMaps := host.mapCalls
+	if initMaps == 0 {
+		t.Fatal("initial composite mapping recorded zero mapRange calls")
+	}
+
+	// Emulated stores to a non-executable data sub-page must not remap the stub.
+	layer.mu.Lock()
+	layer.writeLocked(uint64(blockAddr), []byte{1, 2, 3, 4})
+	layer.mu.Unlock()
+	layer.beforeSwitch(nil, noopSubBlockPopulator{})
+	if host.mapCalls != initMaps {
+		t.Fatalf("data-only store remapped composite block (%d vs %d)", host.mapCalls, initMaps)
+	}
+
+	// Cycle 1: store machine code to RW sub-page 1, then mprotect sub-page 1 to RX.
+	p1Addr := blockAddr + hostarch.PageSize
+	codeV1 := []byte{0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6}
+	layer.mu.Lock()
+	layer.writeLocked(uint64(p1Addr), codeV1)
+	layer.mu.Unlock()
+	beforeWX1 := host.mapCalls
+	if err := layer.mapFile(p1Addr, mf, pageAt(1), rxPerms, false); err != nil {
+		t.Fatalf("mprotect sub-page 1 RX (cycle 1): %v", err)
+	}
+	if host.mapCalls <= beforeWX1 {
+		t.Fatalf("cycle 1 RW to RX transition did not remap stub (%d vs %d)", host.mapCalls, beforeWX1)
+	}
+
+	// Cycle 2: flip sub-page 1 back to RW, overwrite machine code, and flip to RX again.
+	if err := layer.mapFile(p1Addr, mf, pageAt(1), hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("mprotect sub-page 1 RW (cycle 2): %v", err)
+	}
+	codeV2 := []byte{0x60, 0x0c, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6}
+	layer.mu.Lock()
+	layer.writeLocked(uint64(p1Addr), codeV2)
+	layer.mu.Unlock()
+	beforeWX2 := host.mapCalls
+	if err := layer.mapFile(p1Addr, mf, pageAt(1), rxPerms, false); err != nil {
+		t.Fatalf("mprotect sub-page 1 RX (cycle 2): %v", err)
+	}
+	if host.mapCalls <= beforeWX2 {
+		t.Fatalf("cycle 2 RW to RX transition did not remap stub (%d vs %d)", host.mapCalls, beforeWX2)
+	}
+
+	// Self-modifying store on an RWX composite sub-page must remap on beforeSwitch.
+	if err := layer.mapFile(p1Addr, mf, pageAt(1), rwxPerms, false); err != nil {
+		t.Fatalf("mprotect sub-page 1 RWX: %v", err)
+	}
+	beforeRWX := host.mapCalls
+	layer.mu.Lock()
+	layer.writeLocked(uint64(p1Addr), codeV1)
+	layer.mu.Unlock()
+	layer.beforeSwitch(nil, noopSubBlockPopulator{})
+	if host.mapCalls <= beforeRWX {
+		t.Fatalf("RWX store did not remap stub on beforeSwitch (%d vs %d)", host.mapCalls, beforeRWX)
+	}
+}

@@ -100,11 +100,17 @@ func (l *subBlockLayer) pageLocked(addr uintptr) (*hostBlock, int, bool) {
 	return hb, i, hb.subs[i].f != nil
 }
 
+// untagGuestAddr clears any architectural top-byte pointer tag on addr.
+func untagGuestAddr(addr uint64) uint64 {
+	return uint64(hostarch.UntaggedUserAddr(hostarch.Addr(addr)))
+}
+
 // firstUnwritableLocked returns the lowest address in [addr, addr+n) that the
 // guest has not mapped with write access. The address is addr itself, or the
 // start of a later guest page. It reports false when every page is writable.
 // An empty or wrapping range reports addr.
 func (l *subBlockLayer) firstUnwritableLocked(addr uint64, n int) (uint64, bool) {
+	addr = untagGuestAddr(addr)
 	if n <= 0 || addr+uint64(n) < addr {
 		return addr, true
 	}
@@ -127,6 +133,7 @@ func (l *subBlockLayer) writableLocked(addr uint64, n int) bool {
 // readLocked reads n bytes at addr from the file pages of the guest. The
 // range is mapped.
 func (l *subBlockLayer) readLocked(addr uint64, n int) ([]byte, bool) {
+	addr = untagGuestAddr(addr)
 	out := make([]byte, 0, n)
 	for n > 0 {
 		hb, i, ok := l.pageLocked(uintptr(addr))
@@ -154,6 +161,7 @@ type hostWriteNoter interface {
 // writeLocked stores b at addr in the file pages of the guest and in the
 // composite pages that copy them. The range is writable.
 func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
+	addr = untagGuestAddr(addr)
 	for len(b) > 0 {
 		hb, i, _ := l.pageLocked(uintptr(addr))
 		src, err := hb.subs[i].bytes()
@@ -167,6 +175,7 @@ func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
 		hb.wseq[i] = l.storeSeq.Add(1)
 		if hb.hasComp {
 			copy(hb.comp.buf[i*hostarch.PageSize+off:], b[:chunk])
+			hb.compDirty |= 1 << i
 		}
 		// The guest makes its I-cache maintenance on the page that it maps.
 		// The source page can run later through a direct block, and the
@@ -198,6 +207,7 @@ func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
 // staleLocked reports whether the Sentry ran a store to a page of
 // [addr, addr+n) with a sequence number above since.
 func (l *subBlockLayer) staleLocked(addr uint64, n int, since uint64) bool {
+	addr = untagGuestAddr(addr)
 	for p := uintptr(addr) &^ (hostarch.PageSize - 1); p < uintptr(addr)+uintptr(n); p += hostarch.PageSize {
 		if hb, i, ok := l.pageLocked(p); ok && hb.wseq[i] > since {
 			return true
@@ -214,7 +224,7 @@ func (l *subBlockLayer) emulateStore(c *platformContext, ac *arch.Context64) (st
 	if si.Signo != int32(linux.SIGSEGV) || si.Code != segvAccerr {
 		return storeFaultIgnored, 0
 	}
-	faultAddr := uintptr(si.Addr())
+	faultAddr := uintptr(untagGuestAddr(si.Addr()))
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	hb, i, ok := l.pageLocked(faultAddr)
@@ -222,8 +232,9 @@ func (l *subBlockLayer) emulateStore(c *platformContext, ac *arch.Context64) (st
 		return storeFaultIgnored, 0
 	}
 	pc := uint64(ac.IP())
-	raw, ok := l.readLocked(pc&^3, 4)
-	if !ok || pc&3 != 0 {
+	uPC := untagGuestAddr(pc)
+	raw, ok := l.readLocked(uPC&^3, 4)
+	if !ok || uPC&3 != 0 {
 		l.logRefusedLocked(pc, 0, "the guest cannot read the instruction")
 		return storeFaultRefused, 0
 	}
@@ -241,6 +252,7 @@ func (l *subBlockLayer) emulateStore(c *platformContext, ac *arch.Context64) (st
 		ac:      ac,
 		fpState: sc.shared.FPState[:],
 		check: func(addr uint64, n int) bool {
+			addr = untagGuestAddr(addr)
 			if at, bad := l.firstUnwritableLocked(addr, n); bad {
 				if !blocked {
 					blockedAt, blocked = at, true

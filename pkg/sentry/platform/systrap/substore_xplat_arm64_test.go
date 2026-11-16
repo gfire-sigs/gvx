@@ -102,6 +102,10 @@ func TestStoreEmulationWritesTheBytesAndTheWriteback(t *testing.T) {
 		{"stlxp w5, x1, x3, [x4]", 0xc8258c81, map[uint64][]byte{0x2000: le(0x1122334455667788, 8), 0x2008: le(3, 8)}, map[int]uint64{5: 0}},
 		{"stlr x1, [x2]", 0xc89ffc41, map[uint64][]byte{0x1000: le(0x1122334455667788, 8)}, map[int]uint64{5: 0xdead}},
 		{"stlrb w1, [x2]", 0x089ffc41, map[uint64][]byte{0x1000: {0x88}}, map[int]uint64{5: 0xdead}},
+		{"stlurb w1, [x2, #-3]", 0x191fd041, map[uint64][]byte{0xffd: {0x88}}, nil},
+		{"stlurh w1, [x2, #4]", 0x59004041, map[uint64][]byte{0x1004: {0x88, 0x77}}, nil},
+		{"stlur w1, [x2, #-8]", 0x991f8041, map[uint64][]byte{0xff8: le(0x55667788, 4)}, nil},
+		{"stlur x1, [sp, #16]", 0xd90103e1, map[uint64][]byte{0x3010: le(0x1122334455667788, 8)}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writes, ss, _ := runStore(t, tc.insn)
@@ -401,5 +405,111 @@ func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
 				t.Errorf("a refused store changed the writable page")
 			}
 		})
+	}
+}
+
+// TestEmulateStoreTBI0TaggedAddresses verifies that composite store emulation
+// untags AArch64 TBI0 pointers for memory accesses while preserving register
+// tags across writeback and cross-page fault reports.
+func TestEmulateStoreTBI0TaggedAddresses(t *testing.T) {
+	mf, err := createMemoryFile()
+	if err != nil {
+		t.Fatalf("createMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	fr, err := mf.Allocate(3*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	defer mf.DecRef(fr)
+
+	page := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{Start: fr.Start + i*hostarch.PageSize, End: fr.Start + (i+1)*hostarch.PageSize}
+	}
+	bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	mem := bs.Head().ToSlice()
+	code := mem[2*hostarch.PageSize:]
+	// 0: str x1, [x2], #8      (0xf8008441)
+	// 4: ldaddal x1, x0, [x2]  (0xf8e10040)
+	// 8: stp x1, x2, [x0]      (0xa9000801)
+	binary.LittleEndian.PutUint32(code[0:], 0xf8008441)
+	binary.LittleEndian.PutUint32(code[4:], 0xf8e10040)
+	binary.LittleEndian.PutUint32(code[8:], 0xa9000801)
+
+	const (
+		dataAddr = hostarch.Addr(0x400000)
+		codeAddr = hostarch.Addr(0x500000)
+		scudoTag = uint64(0xb4) << 56
+		highTag  = uint64(0xff) << 56
+	)
+	layer := newSubBlockLayer(&recordingCompBlockHost{mf: mf})
+	defer layer.reset()
+	if err := layer.mapFile(dataAddr, mf, page(0), hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("mapFile writable page: %v", err)
+	}
+	if err := layer.mapFile(dataAddr+hostarch.PageSize, mf, page(1), hostarch.Read, false); err != nil {
+		t.Fatalf("mapFile read-only page: %v", err)
+	}
+	if err := layer.mapFile(codeAddr, mf, page(2), hostarch.AccessType{Read: true, Execute: true}, false); err != nil {
+		t.Fatalf("mapFile code page: %v", err)
+	}
+	layer.beforeSwitch(nil, noopSubBlockPopulator{})
+	subproc := subprocess{subBlocks: layer}
+
+	// 1. Post-indexed STR with 0xb4 TBI0 tag writes untagged memory and keeps the tag in X2.
+	ac := arch.New(arch.Host)
+	ac.SetIP(uintptr(codeAddr))
+	regs := &ac.StateData().Regs
+	regs.Regs[1] = 0xdeadbeefcafebabe
+	regs.Regs[2] = scudoTag | uint64(dataAddr)
+
+	var ctx platformContext
+	ctx.sharedContext.Store(&sharedContext{shared: &sysmsg.ThreadContext{}})
+	ctx.signalInfo = linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
+	ctx.signalInfo.SetAddr(uint64(dataAddr))
+	si, at := ctx.signalInfo, hostarch.Write
+	if !subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatalf("TBI0 post-indexed STR refused or requested page: at=%v addr=%#x", at, si.Addr())
+	}
+	if got := binary.LittleEndian.Uint64(mem[:8]); got != 0xdeadbeefcafebabe {
+		t.Fatalf("memory after TBI0 STR = %#x, want 0xdeadbeefcafebabe", got)
+	}
+	if wantX2 := scudoTag | uint64(dataAddr+8); regs.Regs[2] != wantX2 {
+		t.Fatalf("X2 writeback = %#x, want %#x with preserved TBI0 tag", regs.Regs[2], wantX2)
+	}
+
+	// 2. LDADDAL with 0xff top byte untags without unsigned wraparound failure.
+	ac.SetIP(uintptr(codeAddr + 4))
+	regs.Regs[1] = 2
+	regs.Regs[2] = highTag | uint64(dataAddr)
+	ctx.signalInfo.SetAddr(uint64(dataAddr))
+	si, at = ctx.signalInfo, hostarch.Write
+	if !subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatalf("TBI0 0xff LDADDAL failed: at=%v addr=%#x", at, si.Addr())
+	}
+	if regs.Regs[0] != 0xdeadbeefcafebabe {
+		t.Fatalf("X0 old value = %#x, want 0xdeadbeefcafebabe", regs.Regs[0])
+	}
+	if got := binary.LittleEndian.Uint64(mem[:8]); got != 0xdeadbeefcafebac0 {
+		t.Fatalf("memory after TBI0 LDADDAL = %#x, want 0xdeadbeefcafebac0", got)
+	}
+
+	// 3. Cross-page STP with 0xb4 tag into read-only COW page reports untagged fault address.
+	ac.SetIP(uintptr(codeAddr + 8))
+	storeAddr := uint64(dataAddr) + hostarch.PageSize - 8
+	regs.Regs[0] = scudoTag | storeAddr
+	regs.Regs[1] = 1
+	regs.Regs[2] = 2
+	ctx.signalInfo.SetAddr(storeAddr)
+	si, at = ctx.signalInfo, hostarch.Write
+	if subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
+		t.Fatal("cross-page TBI0 STP into read-only page returned restart = true, want fault report")
+	}
+	if want := uint64(dataAddr + hostarch.PageSize); si.Addr() != want {
+		t.Fatalf("cross-page TBI0 fault address = %#x, want untagged %#x", si.Addr(), want)
 	}
 }

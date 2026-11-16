@@ -219,9 +219,12 @@ type hostBlock struct {
 	// rebuildSourcesLocked sets it.
 	alwaysSync bool
 	// compMapped reports that the stub mapped the composite page at least
-	// once, and compExec that the last such mapping allowed execution
-	// (mapCompLocked).
-	compMapped, compExec bool
+	// once. compExec records the executable sub-page mask of the last clean
+	// stub mapping. compDirty records sub-pages written into the composite
+	// buffer since that mapping (mapCompLocked).
+	compMapped bool
+	compExec   uint8
+	compDirty  uint8
 }
 
 // dirtyRefreshes is the number of refreshes that a Sentry write asks for.
@@ -807,11 +810,12 @@ func (l *subBlockLayer) refreshLocked(base uintptr, hb *hostBlock, mapPartial bo
 // happens when the page changed or gained execute access since the stub mapped
 // it. The stub then maps it again.
 func (l *subBlockLayer) mapCompLocked(base uintptr, hb *hostBlock, changed bool) error {
-	clean := hb.exec != 0 && (changed || !hb.compExec || !hb.compMapped)
+	clean := hb.exec != 0 && (changed || hb.compDirty&hb.exec != 0 || hb.exec&^hb.compExec != 0 || !hb.compMapped)
 	if clean {
 		if _, err := unix.Pwrite(l.host.compFD(), hb.comp.buf, int64(hb.comp.fr.Start)); err != nil {
 			return fmt.Errorf("write the composite page for [%#x, %#x): %w", base, base+subBlockSize, err)
 		}
+		hb.compDirty = 0
 	}
 	want := stubMap{kind: stubMapComp, off: hb.comp.fr.Start, fd: l.host.compFD(), prot: hb.blockProt(false)}
 	if hb.cur != want || clean {
@@ -822,7 +826,7 @@ func (l *subBlockLayer) mapCompLocked(base uintptr, hb *hostBlock, changed bool)
 		hb.cur = want
 	}
 	hb.compMapped = true
-	hb.compExec = hb.exec != 0
+	hb.compExec = hb.exec
 	return nil
 }
 
@@ -834,7 +838,7 @@ func (l *subBlockLayer) freeCompLocked(base uintptr, hb *hostBlock) {
 	if hb.hasComp {
 		l.host.freeComp(hb.comp)
 		hb.comp, hb.hasComp = compPage{}, false
-		hb.compMapped, hb.compExec = false, false
+		hb.compMapped, hb.compExec, hb.compDirty = false, 0, 0
 	}
 }
 
@@ -1100,8 +1104,8 @@ func (l *subBlockLayer) beforeSwitch(ctx context.Context, mm platform.MemoryMana
 			log.Warningf("systrap: refresh the composite page at %#x: %v", base, err)
 			continue
 		}
-		if changed && hb.exec != 0 {
-			if err := l.mapCompLocked(base, hb, true); err != nil && !errors.Is(err, errDeadSubprocess) {
+		if (changed || hb.compDirty&hb.exec != 0) && hb.exec != 0 {
+			if err := l.mapCompLocked(base, hb, changed); err != nil && !errors.Is(err, errDeadSubprocess) {
 				log.Warningf("systrap: map the composite page at %#x: %v", base, err)
 			}
 		}
