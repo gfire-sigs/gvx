@@ -49,6 +49,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
+	"z.gfire.dev/gvx/pkg/waiter"
 )
 
 var initTestEnvOnce sync.Once
@@ -897,5 +898,194 @@ func TestReplicaCanonicalModeAndMasterCloseRemainIntact(t *testing.T) {
 	masterFD.DecRef(f.sctx)
 	if n, err := f.reader.readReplica(replicaFD, usermem.BytesIOSequence(buf), vfs.ReadOptions{}); err != nil || n != 0 {
 		t.Fatalf("replica read after master close = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func TestMasterCloseWakesReplicaWaitersAndReportsHangup(t *testing.T) {
+	f := newPTYFixture(t)
+
+	// Subcase 1: Registered replica waiter wakes on master close, reports POLLHUP/POLLIN, and rejects writes with EIO.
+	masterFD, replicaFD := f.openPair(t, 0)
+	defer replicaFD.DecRef(f.sctx)
+
+	const wantMask = waiter.ReadableEvents | waiter.WritableEvents | waiter.EventErr | waiter.EventHUp
+	const readHangupMask = waiter.ReadableEvents | waiter.EventErr | waiter.EventHUp
+	w, ch := waiter.NewChannelEntry(readHangupMask)
+	if err := replicaFD.EventRegister(&w); err != nil {
+		masterFD.DecRef(f.sctx)
+		t.Fatalf("EventRegister: %v", err)
+	}
+	defer replicaFD.EventUnregister(&w)
+
+	if got := replicaFD.Readiness(readHangupMask) & readHangupMask; got != 0 {
+		masterFD.DecRef(f.sctx)
+		t.Fatalf("initial replica Readiness = %#x, want 0", got)
+	}
+	masterFD.DecRef(f.sctx)
+	select {
+	case <-ch:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("master close did not wake registered replica waiter within 500ms")
+	}
+	if got := replicaFD.Readiness(wantMask); got != wantMask {
+		t.Fatalf("post-close replica Readiness = %#x, want %#x", got, wantMask)
+	}
+	var writeN int64
+	var writeErr error
+	f.peer.run(func(task *kernel.Task) {
+		writeN, writeErr = replicaFD.Write(task, usermem.BytesIOSequence([]byte("x")), vfs.WriteOptions{})
+	})
+	if !linuxerr.Equals(linuxerr.EIO, writeErr) || writeN != 0 {
+		t.Fatalf("post-close replica Write = (%d, %v), want (0, EIO)", writeN, writeErr)
+	}
+
+	// Subcase 2: Blocked non-canonical VMIN=4 reader with 2 buffered bytes wakes on master close and returns (2, nil).
+	master2, replica2 := f.openPair(t, 0)
+	defer replica2.DecRef(f.sctx)
+	f.setRawTermios(t, replica2, 4, 0)
+	if _, err := f.writeMaster(master2, []byte("ab")); err != nil {
+		master2.DecRef(f.sctx)
+		t.Fatalf("writeMaster 'ab': %v", err)
+	}
+	buf := make([]byte, 64)
+	var close2Once sync.Once
+	done2 := make(chan struct{})
+	var n2 int64
+	var err2 error
+	go func() {
+		n2, err2 = f.reader.readReplicaWithHook(replica2, usermem.BytesIOSequence(buf), vfs.ReadOptions{}, func(_ *kernel.Task, _ blockCall) {
+			close2Once.Do(func() {
+				go master2.DecRef(f.sctx)
+			})
+		})
+		close(done2)
+	}()
+	select {
+	case <-done2:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("master close left blocked VMIN=4 replica reader hung")
+	}
+	if err2 != nil || string(buf[:n2]) != "ab" {
+		t.Fatalf("woken VMIN=4 read on master close = (%d, %q, %v), want (2, \"ab\", nil)", n2, buf[:max(0, int(n2))], err2)
+	}
+
+	// Subcase 3: Blocked timed VMIN=0 VTIME=20 reader wakes immediately on master close instead of waiting 2s.
+	master3, replica3 := f.openPair(t, 0)
+	defer replica3.DecRef(f.sctx)
+	f.setRawTermios(t, replica3, 0, 20)
+	var close3Once sync.Once
+	start := time.Now()
+	n3, err3 := f.reader.readReplicaWithHook(replica3, usermem.BytesIOSequence(buf), vfs.ReadOptions{}, func(_ *kernel.Task, _ blockCall) {
+		close3Once.Do(func() {
+			go master3.DecRef(f.sctx)
+		})
+	})
+	if elapsed := time.Since(start); elapsed >= 1500*time.Millisecond {
+		t.Fatalf("master close during VTIME=20 read took %v, want immediate wakeup", elapsed)
+	}
+	if err3 != nil || n3 != 0 {
+		t.Fatalf("woken VTIME=20 read on master close = (%d, %v), want (0, nil)", n3, err3)
+	}
+}
+
+func TestMasterTCSETSWakesBlockedNonCanonicalReplicaReader(t *testing.T) {
+	f := newPTYFixture(t)
+	masterFD, replicaFD := f.openPair(t, 0)
+	defer masterFD.DecRef(f.sctx)
+	defer replicaFD.DecRef(f.sctx)
+
+	f.setRawTermios(t, replicaFD, 3, 0)
+	if _, err := f.writeMaster(masterFD, []byte("x")); err != nil {
+		t.Fatalf("writeMaster 'x': %v", err)
+	}
+	buf := make([]byte, 64)
+	var lowerOnce sync.Once
+	done := make(chan struct{})
+	var n int64
+	var err error
+	go func() {
+		n, err = f.reader.readReplicaWithHook(replicaFD, usermem.BytesIOSequence(buf), vfs.ReadOptions{}, func(_ *kernel.Task, _ blockCall) {
+			lowerOnce.Do(func() {
+				go func() {
+					_ = f.setRawTermiosOn(f.peer, masterFD, 1, 0, false)
+				}()
+			})
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		_ = f.setRawTermiosOn(f.peer, replicaFD, 0, 0, true)
+		<-done
+		t.Fatal("master TCSETS lowering VMIN did not wake blocked replica reader")
+	}
+	if err != nil || string(buf[:n]) != "x" {
+		t.Fatalf("master TCSETS wake read = (%d, %q, %v), want (1, \"x\", nil)", n, buf[:max(0, int(n))], err)
+	}
+}
+
+func TestMasterJobControlTargetsReplicaTTY(t *testing.T) {
+	f := newPTYFixture(t)
+	masterFD, replicaFD := f.openPair(t, 0)
+	defer masterFD.DecRef(f.sctx)
+	defer replicaFD.DecRef(f.sctx)
+
+	ioctlInt32 := func(w *taskWorker, fd *vfs.FileDescription, cmd uintptr, val *int32, copyIn bool) error {
+		var ioctlErr error
+		w.run(func(task *kernel.Task) {
+			if copyIn {
+				var raw [4]byte
+				binary.LittleEndian.PutUint32(raw[:], uint32(*val))
+				if _, err := task.MemoryManager().CopyOut(task, w.scratch, raw[:], usermem.IOOpts{}); err != nil {
+					ioctlErr = err
+					return
+				}
+			}
+			_, ioctlErr = fd.Ioctl(task, task.MemoryManager(), 0, arch.SyscallArguments{
+				{}, {Value: cmd}, {Value: uintptr(w.scratch)},
+			})
+			if ioctlErr == nil && !copyIn && val != nil {
+				var raw [4]byte
+				if _, err := task.MemoryManager().CopyIn(task, w.scratch, raw[:], usermem.IOOpts{}); err != nil {
+					ioctlErr = err
+					return
+				}
+				*val = int32(binary.LittleEndian.Uint32(raw[:]))
+			}
+		})
+		return ioctlErr
+	}
+
+	// 1. Before any session acquires the replica as controlling TTY, master TIOCGPGRP returns 0 without error.
+	gotPGID := int32(-1)
+	if err := ioctlInt32(f.peer, masterFD, linux.TIOCGPGRP, &gotPGID, false); err != nil || gotPGID != 0 {
+		t.Fatalf("uncontrolled master TIOCGPGRP = (%d, %v), want (0, nil)", gotPGID, err)
+	}
+
+	// 2. Acquire controlling TTY via master TIOCSCTTY on f.reader (a distinct session from f.peer).
+	if err := ioctlInt32(f.reader, masterFD, linux.TIOCSCTTY, nil, false); err != nil {
+		t.Fatalf("master TIOCSCTTY: %v", err)
+	}
+	wantPGID := int32(f.reader.task.ThreadID())
+	var repPGID int32
+	if err := ioctlInt32(f.reader, replicaFD, linux.TIOCGPGRP, &repPGID, false); err != nil || repPGID != wantPGID {
+		t.Fatalf("replica TIOCGPGRP after master TIOCSCTTY = (%d, %v), want (%d, nil)", repPGID, err, wantPGID)
+	}
+
+	// 3. Cross-session master TIOCGPGRP from f.peer returns f.reader's foreground PGID, while cross-session TIOCSPGRP returns ENOTTY.
+	if err := ioctlInt32(f.peer, masterFD, linux.TIOCGPGRP, &gotPGID, false); err != nil || gotPGID != wantPGID {
+		t.Fatalf("cross-session master TIOCGPGRP = (%d, %v), want (%d, nil)", gotPGID, err, wantPGID)
+	}
+	if err := ioctlInt32(f.peer, masterFD, linux.TIOCSPGRP, &wantPGID, true); !linuxerr.Equals(linuxerr.ENOTTY, err) {
+		t.Fatalf("cross-session master TIOCSPGRP = %v, want ENOTTY", err)
+	}
+
+	// 4. Same-session master TIOCSPGRP succeeds, and master TIOCNOTTY returns ENOTTY as on Linux.
+	if err := ioctlInt32(f.reader, masterFD, linux.TIOCSPGRP, &wantPGID, true); err != nil {
+		t.Fatalf("same-session master TIOCSPGRP: %v", err)
+	}
+	if err := ioctlInt32(f.reader, masterFD, linux.TIOCNOTTY, nil, false); !linuxerr.Equals(linuxerr.ENOTTY, err) {
+		t.Fatalf("master TIOCNOTTY = %v, want ENOTTY", err)
 	}
 }

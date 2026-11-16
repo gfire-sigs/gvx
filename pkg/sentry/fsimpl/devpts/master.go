@@ -109,7 +109,7 @@ var _ vfs.FileDescriptionImpl = (*masterFileDescription)(nil)
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (mfd *masterFileDescription) Release(ctx context.Context) {
-	mfd.inode.root.masterClose(ctx, mfd.t)
+	mfd.releaseMaster(ctx)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -167,22 +167,22 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 		// of the replica end.
 		//
 		// Draining output is a no-op for PTYs.
-		return mfd.t.ld.setTermios(t, args, false /* flushInput */)
+		return mfd.finishMasterTermios(mfd.t.ld.setTermios(t, args, false /* flushInput */))
 	case linux.TCSETSF:
 		// N.B. TCSETSF on the master actually affects the configuration
 		// of the replica end and flushes the replica input queue.
-		return mfd.t.ld.setTermios(t, args, true /* flushInput */)
+		return mfd.finishMasterTermios(mfd.t.ld.setTermios(t, args, true /* flushInput */))
 	case linux.TCSETS2,
 		linux.TCSETSW2:
 		// N.B. TCSETS2 on the master actually affects the configuration
 		// of the replica end.
 		//
 		// Draining output is a no-op for PTYs.
-		return mfd.t.ld.setTermios2(t, args, false /* flushInput */)
+		return mfd.finishMasterTermios(mfd.t.ld.setTermios2(t, args, false /* flushInput */))
 	case linux.TCSETSF2:
 		// N.B. TCSETSF2 on the master actually affects the configuration
 		// of the replica end and flushes the replica input queue.
-		return mfd.t.ld.setTermios2(t, args, true /* flushInput */)
+		return mfd.finishMasterTermios(mfd.t.ld.setTermios2(t, args, true /* flushInput */))
 	case linux.TCSBRK:
 		// TCSBRK with arg != 0 is tcdrain, which waits for output to
 		// drain. For a pty with no real hardware, this is a no-op.
@@ -202,29 +202,23 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 	case linux.TIOCSWINSZ:
 		return 0, mfd.t.ld.setWindowSize(t, args)
 	case linux.TIOCSCTTY:
-		// Make the given terminal the controlling terminal of the
-		// calling process.
+		// Make the replica terminal the controlling terminal of the calling process.
 		steal := args[2].Int() == 1
-		return 0, t.ThreadGroup().SetControllingTTY(ctx, mfd.t.masterKTTY, steal, mfd.vfsfd.IsReadable())
+		return 0, mfd.masterSetControllingTTY(ctx, t.ThreadGroup(), steal)
 	case linux.TIOCNOTTY:
-		// Release this process's controlling terminal.
-		return 0, t.ThreadGroup().ReleaseControllingTTY(ctx, mfd.t.masterKTTY)
+		// Linux compares the caller controlling TTY with the master TTY struct, so
+		// TIOCNOTTY on a master descriptor returns ENOTTY.
+		return 0, linuxerr.ENOTTY
 	case linux.TIOCGPGRP:
-		// Get the foreground process group id.
-		pgid, err := t.ThreadGroup().ForegroundProcessGroupID(mfd.t.masterKTTY)
-		if err != nil {
-			return 0, err
-		}
-		ret := primitive.Int32(pgid)
-		_, err = ret.CopyOut(t, args[2].Pointer())
+		ret := primitive.Int32(mfd.masterForegroundProcessGroupID(t))
+		_, err := ret.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TIOCSPGRP:
-		// Set the foreground process group id.
 		var pgid primitive.Int32
 		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
-		return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, mfd.t.masterKTTY, kernel.ProcessGroupID(pgid))
+		return 0, mfd.masterSetForegroundProcessGroupID(ctx, t.ThreadGroup(), kernel.ProcessGroupID(pgid))
 	case linux.TIOCGSID:
 		// Get the session id. N.B. TIOCGSID on the master returns the
 		// session of the replica end, and does not require the caller
