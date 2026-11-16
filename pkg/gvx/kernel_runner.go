@@ -250,11 +250,13 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	s.mu.Lock()
 	mf := s.memFile
 	s.memFile = nil
+	if mf != nil {
+		s.runMemFile = mf
+	}
 	s.mu.Unlock()
 	if mf == nil {
 		return 1, errRunConsumed
 	}
-	defer mf.Destroy()
 
 	hostRAM, _ := hostMemory()
 	k, tk, creds, cleanupNetLog, err := s.initFreshKernel(mf, hostRAM)
@@ -491,11 +493,13 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 	s.restoredStdio = nil
 	mf := s.memFile
 	s.memFile = nil
+	if mf != nil {
+		s.runMemFile = mf
+	}
 	s.mu.Unlock()
 	if k == nil || mf == nil {
 		return 1, errRunConsumed
 	}
-	defer mf.Destroy()
 	if tk := k.Timekeeper(); tk != nil {
 		defer tk.Destroy()
 	}

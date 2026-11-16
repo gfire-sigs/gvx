@@ -180,6 +180,7 @@ func TestE2ECheckpointRestoreMemoryState(t *testing.T) {
 				DisableHostLockdown: true,
 			})
 			skipWhenFixedAddressRefused(t, "create memory checkpoint sandbox", err)
+			t.Log("checkpoint: original sandbox opened")
 			defer func() { _ = sb.Close() }()
 
 			runErrCh := make(chan error, 1)
@@ -191,10 +192,12 @@ func TestE2ECheckpointRestoreMemoryState(t *testing.T) {
 			}()
 
 			stdout1.waitForSubstring(t, "READY:memory\n", 30*time.Second)
+			t.Log("checkpoint: original guest ready")
 
 			if err := sb.Checkpoint(ctx, gvx.CheckpointOptions{LeaveRunning: false}); err != nil {
 				t.Fatalf("Checkpoint(memory) failed: %v (stderr=%q)", err, stderr1.String())
 			}
+			t.Log("checkpoint: state saved")
 			if rErr := <-runErrCh; rErr != nil {
 				t.Fatalf("pre-checkpoint Run returned error: %v (stderr=%q)", rErr, stderr1.String())
 			}
@@ -204,6 +207,7 @@ func TestE2ECheckpointRestoreMemoryState(t *testing.T) {
 			if err := sb.Close(); err != nil {
 				t.Fatalf("Close pre-checkpoint sandbox: %v", err)
 			}
+			t.Log("checkpoint: original sandbox closed")
 			verifyCheckpointBundleFiles(t, ckptDir)
 
 			var stdout2, stderr2 bytes.Buffer
@@ -220,12 +224,14 @@ func TestE2ECheckpointRestoreMemoryState(t *testing.T) {
 				t.Fatalf("Restore(memory) failed: %v", err)
 			}
 			defer func() { _ = restoredSB.Close() }()
+			t.Log("checkpoint: restored sandbox opened")
 
 			code, err := restoredSB.Run(ctx)
 			if err != nil || code != 0 {
 				t.Fatalf("restored Run(memory) = (code %d, err %v), stdout=%q stderr=%q",
 					code, err, stdout2.String(), stderr2.String())
 			}
+			t.Log("checkpoint: restored guest exited")
 			if !strings.Contains(stdout2.String(), "VERIFIED:memory\n") {
 				t.Fatalf("restored stdout = %q, want VERIFIED:memory", stdout2.String())
 			}
@@ -408,6 +414,7 @@ func TestE2ECheckpointRestoreExt4liteState(t *testing.T) {
 				DisableHostLockdown: true,
 			})
 			skipWhenFixedAddressRefused(t, "create ext4lite checkpoint sandbox", err)
+			t.Log("checkpoint: original sandbox opened")
 			defer func() { _ = sb.Close() }()
 
 			runErrCh := make(chan error, 1)
@@ -419,10 +426,12 @@ func TestE2ECheckpointRestoreExt4liteState(t *testing.T) {
 			}()
 
 			stdout1.waitForSubstring(t, "READY:ext4lite\n", 30*time.Second)
+			t.Log("checkpoint: original guest ready")
 
 			if err := sb.Checkpoint(ctx, gvx.CheckpointOptions{LeaveRunning: false}); err != nil {
 				t.Fatalf("Checkpoint(ext4lite) failed: %v (stderr=%q)", err, stderr1.String())
 			}
+			t.Log("checkpoint: state saved")
 			if rErr := <-runErrCh; rErr != nil {
 				t.Fatalf("pre-checkpoint Run returned error: %v (stderr=%q)", rErr, stderr1.String())
 			}
@@ -448,6 +457,7 @@ func TestE2ECheckpointRestoreExt4liteState(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Restore(ext4lite) failed: %v", err)
 			}
+			t.Log("checkpoint: original sandbox closed; restored sandbox opened")
 			defer func() { _ = restoredSB.Close() }()
 
 			code, err := restoredSB.Run(ctx)
@@ -458,10 +468,12 @@ func TestE2ECheckpointRestoreExt4liteState(t *testing.T) {
 			if !strings.Contains(stdout2.String(), "VERIFIED:ext4lite\n") {
 				t.Fatalf("restored stdout = %q, want VERIFIED:ext4lite", stdout2.String())
 			}
+			t.Log("checkpoint: restored guest verified")
 			if err := restoredSB.Close(); err != nil {
 				t.Fatalf("Close restored ext4lite sandbox: %v", err)
 			}
 			requireCleanImage(t, volImg, "after-restore")
+			t.Log("checkpoint: restored sandbox closed")
 
 			// Mount the ext4lite volume read-only in a third sandbox to verify persisted disk state.
 			var stdout3, stderr3 bytes.Buffer
