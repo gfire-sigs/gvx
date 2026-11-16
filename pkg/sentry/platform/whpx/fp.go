@@ -17,6 +17,8 @@ package whpx
 import (
 	"encoding/binary"
 	"fmt"
+
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
 
 // This file converts between the Sentry floating-point image and the state
@@ -27,8 +29,8 @@ import (
 // reads and writes the XSAVE state of a processor in the compacted format of
 // XSAVES, which also holds supervisor components.
 //
-// On arm64 the image follows the layout of ring0.SaveFloatingPoint: FPSR at
-// byte 0, FPCR at byte 8 and Q0 to Q31 from byte 16.
+// On arm64 the image obeys the shared arch.FPSIMDOffFPSR layout: 32-bit FPSR
+// at byte 0, 32-bit FPCR at byte 4, and V0 to V31 from byte 8.
 
 // Offsets in the legacy region of an XSAVE area (the FXSAVE layout).
 const (
@@ -178,17 +180,9 @@ func x86CompactedFromStandard(dst, src []byte, xcr0 uint64, l *xsaveLayout) erro
 	return nil
 }
 
-// Layout of the arm64 floating-point image.
-const (
-	a64FPOffFPSR = 0
-	a64FPOffFPCR = 8
-	a64FPOffQ    = 16
-	a64FPSize    = 528
-
-	// a64FPRegCount is the number of registers in an FP read or write: Q0 to
-	// Q31, FPCR and FPSR.
-	a64FPRegCount = 34
-)
+// a64FPRegCount is the number of registers in an FP read or write: Q0 to Q31,
+// FPCR, and FPSR.
+const a64FPRegCount = 34
 
 // a64WantFP appends the vector registers and the FP control registers to a
 // read batch.
@@ -202,31 +196,31 @@ func a64WantFP(b *regBatch) {
 
 // a64FPFromRegs writes the registers that a64WantFP requested into image.
 func a64FPFromRegs(image []byte, b *regBatch, first int) error {
-	if len(image) < a64FPSize {
-		return fmt.Errorf("whpx: FP image is %d bytes, want at least %d", len(image), a64FPSize)
+	if len(image) < arch.FPSIMDBodySize {
+		return fmt.Errorf("whpx: FP image is %d bytes, want at least %d", len(image), arch.FPSIMDBodySize)
 	}
 	for i := range 32 {
 		lo, hi := b.u128(first + i)
-		binary.LittleEndian.PutUint64(image[a64FPOffQ+i*16:], lo)
-		binary.LittleEndian.PutUint64(image[a64FPOffQ+i*16+8:], hi)
+		binary.LittleEndian.PutUint64(image[arch.FPSIMDOffV+i*16:], lo)
+		binary.LittleEndian.PutUint64(image[arch.FPSIMDOffV+i*16+8:], hi)
 	}
-	binary.LittleEndian.PutUint64(image[a64FPOffFPCR:], b.u64(first+32))
-	binary.LittleEndian.PutUint64(image[a64FPOffFPSR:], b.u64(first+33))
+	binary.LittleEndian.PutUint32(image[arch.FPSIMDOffFPCR:], uint32(b.u64(first+32)))
+	binary.LittleEndian.PutUint32(image[arch.FPSIMDOffFPSR:], uint32(b.u64(first+33)))
 	return nil
 }
 
 // a64FPToRegs appends the register writes that load image into a virtual
 // processor.
 func a64FPToRegs(b *regBatch, image []byte) error {
-	if len(image) < a64FPSize {
-		return fmt.Errorf("whpx: FP image is %d bytes, want at least %d", len(image), a64FPSize)
+	if len(image) < arch.FPSIMDBodySize {
+		return fmt.Errorf("whpx: FP image is %d bytes, want at least %d", len(image), arch.FPSIMDBodySize)
 	}
 	for i := range 32 {
 		b.add128(a64RegQ0+uint32(i),
-			binary.LittleEndian.Uint64(image[a64FPOffQ+i*16:]),
-			binary.LittleEndian.Uint64(image[a64FPOffQ+i*16+8:]))
+			binary.LittleEndian.Uint64(image[arch.FPSIMDOffV+i*16:]),
+			binary.LittleEndian.Uint64(image[arch.FPSIMDOffV+i*16+8:]))
 	}
-	b.add64(a64RegFpcr, binary.LittleEndian.Uint64(image[a64FPOffFPCR:]))
-	b.add64(a64RegFpsr, binary.LittleEndian.Uint64(image[a64FPOffFPSR:]))
+	b.add64(a64RegFpcr, uint64(binary.LittleEndian.Uint32(image[arch.FPSIMDOffFPCR:])))
+	b.add64(a64RegFpsr, uint64(binary.LittleEndian.Uint32(image[arch.FPSIMDOffFPSR:])))
 	return nil
 }

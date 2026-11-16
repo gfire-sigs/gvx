@@ -49,6 +49,7 @@ import (
 	pkgcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/ring0/pagetables"
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
@@ -212,7 +213,7 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 		vpCount:             uint32(vpCount),
 		physicalAddressBits: selectGPABits(arm64, feats.physicalAddressBits, cpuPABits),
 	}
-	fpSize := a64FPSize
+	fpSize := arch.FPSIMDBodySize
 	var vec guestVector
 	if !arm64 {
 		layout, fpLimit := opts.xsaveLayout, opts.fpLimit
