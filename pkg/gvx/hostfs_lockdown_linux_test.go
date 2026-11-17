@@ -44,6 +44,7 @@ func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, er
 			// Under -race, extra_filters_race.go widens SYS_CLONE to MatchAll{},
 			// which bypasses rejectedRules() for hostlockdown's clone(CLONE_THREAD)
 			// probe. Restrict SYS_CLONE to thread creation so the probe gets EPERM.
+			rules.Remove(unix.SYS_CLONE)
 			rules.Set(unix.SYS_CLONE, seccomp.PerArg{
 				seccomp.EqualTo(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES |
 					unix.CLONE_SIGHAND | unix.CLONE_THREAD | unix.CLONE_SYSVSEM |
