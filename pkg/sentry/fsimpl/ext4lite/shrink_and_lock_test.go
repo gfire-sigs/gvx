@@ -27,7 +27,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -284,11 +283,16 @@ func TestHeldBlocksNeverPunchedBeforeJournalCommitAndCrashRecovers(t *testing.T)
 	}
 
 	// Copy the live host file bytes right now to simulate power loss / SIGKILL
-	// before JBD2 commit.
+	// before JBD2 commit. Read through e.fs.v.hf because Windows LockFileEx
+	// enforces mandatory locks against external os.ReadFile handles.
 	crashCopy := filepath.Join(t.TempDir(), "crash-copy.ext4")
-	rawCrash, err := os.ReadFile(path)
+	hfSize, err := e.fs.v.hf.Size()
 	if err != nil {
-		t.Fatalf("ReadFile(crash snapshot): %v", err)
+		t.Fatalf("hf.Size(crash snapshot): %v", err)
+	}
+	rawCrash := make([]byte, hfSize)
+	if _, err := e.fs.v.hf.ReadAt(rawCrash, 0); err != nil {
+		t.Fatalf("hf.ReadAt(crash snapshot): %v", err)
 	}
 	if err := os.WriteFile(crashCopy, rawCrash, 0o600); err != nil {
 		t.Fatalf("WriteFile(crashCopy): %v", err)
@@ -411,7 +415,7 @@ func TestReallocationOfPunchedBlocksEnforcesHostENOSPCWithoutCorruption(t *testi
 			oldAlloc := nativeAllocateRange
 			nativeAllocateRange = func(f *os.File, off, n int64) error {
 				if failAlloc.Load() {
-					return syscall.ENOSPC
+					return errHostDiskFull
 				}
 				return oldAlloc(f, off, n)
 			}
@@ -689,7 +693,7 @@ func TestCheckpointRestorePreservesPunchedVolumeAndGuardsReallocation(t *testing
 	oldAlloc := nativeAllocateRange
 	nativeAllocateRange = func(f *os.File, off, n int64) error {
 		if failAlloc.Load() {
-			return syscall.ENOSPC
+			return errHostDiskFull
 		}
 		return oldAlloc(f, off, n)
 	}
