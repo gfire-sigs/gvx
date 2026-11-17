@@ -43,13 +43,19 @@ func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, er
 			rules.Merge(embedderRules(Config{}, true, false))
 			// Under -race, extra_filters_race.go widens SYS_CLONE to MatchAll{},
 			// which bypasses rejectedRules() for hostlockdown's clone(CLONE_THREAD)
-			// probe. Restrict SYS_CLONE to thread creation so the probe gets EPERM.
+			// probe. Restrict SYS_CLONE to Go/cgo thread creation so the probe gets EPERM.
 			rules.Remove(unix.SYS_CLONE)
-			rules.Set(unix.SYS_CLONE, seccomp.PerArg{
-				seccomp.EqualTo(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES |
-					unix.CLONE_SIGHAND | unix.CLONE_THREAD | unix.CLONE_SYSVSEM |
-					unix.CLONE_SETTLS | unix.CLONE_PARENT_SETTID |
-					unix.CLONE_CHILD_CLEARTID),
+			rules.Set(unix.SYS_CLONE, seccomp.Or{
+				seccomp.PerArg{
+					seccomp.EqualTo(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES |
+						unix.CLONE_SIGHAND | unix.CLONE_SYSVSEM | unix.CLONE_THREAD),
+				},
+				seccomp.PerArg{
+					seccomp.EqualTo(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES |
+						unix.CLONE_SIGHAND | unix.CLONE_THREAD | unix.CLONE_SYSVSEM |
+						unix.CLONE_SETTLS | unix.CLONE_PARENT_SETTID |
+						unix.CLONE_CHILD_CLEARTID),
+				},
 			})
 			if cgoBuild {
 				rules.Remove(unix.SYS_CLONE3)
