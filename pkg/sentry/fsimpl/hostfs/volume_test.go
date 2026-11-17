@@ -446,7 +446,8 @@ func resolvedTempDir(t *testing.T) string {
 	return dir
 }
 
-// hostNames lists the stored names in a host directory, without .gvx_meta.
+// hostNames lists the stored names in a host directory, without .gvx_meta or
+// .gvx_meta.lock.
 func hostNames(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -455,7 +456,7 @@ func hostNames(t *testing.T, dir string) []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if e.Name() != MetaFileName {
+		if e.Name() != MetaFileName && e.Name() != MetaLockFileName {
 			out = append(out, e.Name())
 		}
 	}

@@ -95,7 +95,7 @@ func (e *env) hostEntries(p string) []string {
 	}
 	var names []string
 	for _, ent := range ents {
-		if ent.Name() == MetaFileName {
+		if ent.Name() == MetaFileName || (p == "." && ent.Name() == MetaLockFileName) {
 			continue
 		}
 		names = append(names, ent.Name())

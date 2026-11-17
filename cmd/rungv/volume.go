@@ -28,8 +28,8 @@ import (
 func init() {
 	register(command{
 		name:    "volume",
-		summary: "Manage named local volumes (create, ls, inspect, rm, prune).",
-		usage:   []string{"rungv volume <create|ls|inspect|rm|prune> [flags] [args...]"},
+		summary: "Manage named local volumes (create, ls, inspect, compact, rm, prune).",
+		usage:   []string{"rungv volume <create|ls|inspect|compact|rm|prune> [flags] [args...]"},
 		run:     volumeGroupSubcommand,
 	})
 }
@@ -51,6 +51,8 @@ func volumeGroupSubcommand(ctx context.Context, args []string, streams cliIO) in
 		return volumeListSubcommand(ctx, rest, streams.stdout, streams.stderr)
 	case "inspect":
 		return volumeInspectSubcommand(ctx, rest, streams.stdout, streams.stderr)
+	case "compact":
+		return volumeCompactSubcommand(ctx, rest, streams.stdout, streams.stderr)
 	case "rm", "remove":
 		return volumeRemoveSubcommand(ctx, rest, streams.stdout, streams.stderr)
 	case "prune":
@@ -69,6 +71,7 @@ func printVolumeGroupUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  create      Create a named volume (ext4lite or hostfs)")
 	_, _ = fmt.Fprintln(w, "  ls, list    List named volumes")
 	_, _ = fmt.Fprintln(w, "  inspect     Print detailed metadata for one or more volumes")
+	_, _ = fmt.Fprintln(w, "  compact     Replay journal, punch free blocks, and compact unlocked ext4lite volumes")
 	_, _ = fmt.Fprintln(w, "  rm, remove  Remove one or more unlocked volumes")
 	_, _ = fmt.Fprintln(w, "  prune       Remove all unlocked local volumes")
 }
@@ -103,12 +106,16 @@ func volumeCreateSubcommand(_ context.Context, args []string, stdout, stderr io.
 }
 
 type volumeFormatRow struct {
-	Driver     string `json:"Driver"`
-	Name       string `json:"Name"`
-	Mountpoint string `json:"Mountpoint"`
-	CreatedAt  string `json:"CreatedAt"`
-	Size       string `json:"Size"`
-	InUse      bool   `json:"InUse"`
+	Driver         string `json:"Driver"`
+	Name           string `json:"Name"`
+	Mountpoint     string `json:"Mountpoint"`
+	CreatedAt      string `json:"CreatedAt"`
+	Size           string `json:"Size"`
+	Allocated      string `json:"Allocated"`
+	SizeBytes      int64  `json:"SizeBytes"`
+	AllocatedBytes int64  `json:"AllocatedBytes"`
+	InUse          bool   `json:"InUse"`
+	LockMode       string `json:"LockMode,omitempty"`
 }
 
 func volumeListSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
@@ -145,19 +152,23 @@ func volumeListSubcommand(_ context.Context, args []string, stdout, stderr io.Wr
 	rows := make([]volumeFormatRow, 0, len(vols))
 	for _, v := range vols {
 		rows = append(rows, volumeFormatRow{
-			Driver:     string(v.Driver),
-			Name:       v.Name,
-			Mountpoint: v.Mountpoint,
-			CreatedAt:  formatCreatedAt(v.CreatedAt),
-			Size:       humanSize(v.SizeBytes),
-			InUse:      v.InUse,
+			Driver:         string(v.Driver),
+			Name:           v.Name,
+			Mountpoint:     v.Mountpoint,
+			CreatedAt:      formatCreatedAt(v.CreatedAt),
+			Size:           humanSize(v.SizeBytes),
+			Allocated:      humanSize(v.AllocatedBytes),
+			SizeBytes:      v.SizeBytes,
+			AllocatedBytes: v.AllocatedBytes,
+			InUse:          v.InUse,
+			LockMode:       v.LockMode,
 		})
 	}
 	usageErr, writeErr := renderListFormat(stdout, *format, rows, func(w io.Writer) error {
 		tw := tabwriter.NewWriter(w, 10, 1, 3, ' ', 0)
-		_, _ = fmt.Fprintln(tw, "DRIVER\tVOLUME NAME")
+		_, _ = fmt.Fprintln(tw, "DRIVER\tVOLUME NAME\tALLOCATED\tSIZE")
 		for _, r := range rows {
-			_, _ = fmt.Fprintf(tw, "%s\t%s\n", r.Driver, r.Name)
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.Driver, r.Name, r.Allocated, r.Size)
 		}
 		return tw.Flush()
 	})
@@ -217,6 +228,33 @@ func volumeInspectSubcommand(_ context.Context, args []string, stdout, stderr io
 	}
 	if writeErr != nil {
 		return imageFail(stderr, cmdName, writeErr)
+	}
+	return code
+}
+
+func volumeCompactSubcommand(_ context.Context, args []string, stdout, stderr io.Writer) int {
+	const cmdName = "volume compact"
+	fs := newImageFlagSet(cmdName, stderr)
+	cacheDir := fs.String("cache-dir", "", "EROFS cache parent directory")
+	if code, stop := parseImageFlags(fs, args); stop {
+		return code
+	}
+	if fs.NArg() == 0 {
+		return imageUsageError(stderr, cmdName, "missing VOLUME argument")
+	}
+
+	code := 0
+	for _, name := range fs.Args() {
+		vi, err := gvx.CompactVolume(*cacheDir, name)
+		if err == nil {
+			_, _ = fmt.Fprintln(stdout, vi.Name)
+			continue
+		}
+		if errors.Is(err, gvx.ErrVolumeNotFound) {
+			code = imageFail(stderr, cmdName, fmt.Errorf("no such volume: %s", name))
+			continue
+		}
+		code = imageFail(stderr, cmdName, err)
 	}
 	return code
 }

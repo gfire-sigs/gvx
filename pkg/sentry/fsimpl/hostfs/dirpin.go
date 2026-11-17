@@ -333,6 +333,7 @@ func (w *Workspace) closePins() error {
 // handle of that directory. It returns the same entry as lookup for the
 // joined path, with one host call when the pin of the directory exists.
 func (w *Workspace) lookupIn(parentRel, name string) (entry, error) {
+	w.maybeRefreshMeta(false)
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if w.closed {

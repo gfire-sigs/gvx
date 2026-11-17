@@ -433,6 +433,68 @@ func (t *metaTable) restore(keys []recKey) {
 	t.mu.Unlock()
 }
 
+// applyExternal merges journal operations committed by another Workspace into
+// the table without overwriting keys that have pending local mutations in dirty.
+// It reports whether any in-memory record changed.
+func (t *metaTable) applyExternal(ops []metaOp) bool {
+	if len(ops) == 0 {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	changed := false
+	for _, op := range ops {
+		if _, pending := t.dirty[op.key]; pending {
+			continue
+		}
+		delete(t.repaired, op.key)
+		if op.r == nil {
+			if t.recs[op.key] != nil {
+				t.delLocked(op.key)
+				changed = true
+			}
+			continue
+		}
+		t.putLocked(op.key, op.r)
+		changed = true
+	}
+	return changed
+}
+
+// replaceClean replaces all non-dirty records in the table with recs, which
+// came from a full on-disk .gvx_meta snapshot written by a peer Workspace.
+// Locally dirty puts and deletes in t.dirty are preserved on top of recs, while
+// clean keys missing from recs (deleted before the peer compacted) are removed.
+// It reports whether any in-memory record changed.
+func (t *metaTable) replaceClean(recs map[recKey]*rec) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	changed := false
+	var drop []recKey
+	for k := range t.scanLocked() {
+		if _, pending := t.dirty[k]; pending {
+			continue
+		}
+		if _, keep := recs[k]; !keep {
+			drop = append(drop, k)
+		}
+	}
+	for _, k := range drop {
+		delete(t.repaired, k)
+		t.delLocked(k)
+		changed = true
+	}
+	for k, r := range recs {
+		if _, pending := t.dirty[k]; pending {
+			continue
+		}
+		delete(t.repaired, k)
+		t.putLocked(k, r)
+		changed = true
+	}
+	return changed
+}
+
 // moveTree re-keys every path record below the directory oldRel to the same
 // place below newRel, and the virtual symbolic links that oldRel holds. The
 // record of oldRel itself stays. Only a table with path records calls it. The

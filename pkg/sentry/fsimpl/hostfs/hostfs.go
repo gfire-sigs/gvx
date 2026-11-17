@@ -37,6 +37,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -49,7 +50,11 @@ const (
 
 	// MetaFileName is the hidden metadata file persisted inside the workspace root.
 	MetaFileName = ".gvx_meta"
-	metaTempName = ".gvx_meta.tmp"
+	// MetaLockFileName is the hidden advisory lock and commit-sequence file
+	// persisted inside the workspace root for multi-sandbox synchronization.
+	MetaLockFileName = ".gvx_meta.lock"
+	metaTempName     = ".gvx_meta.tmp"
+	metaTempPrefix   = ".gvx_meta.tmp."
 
 	// defaultCoalesceWindow is the delay between the first unflushed
 	// metadata mutation and the background flush. Later mutations in the
@@ -164,16 +169,26 @@ type Workspace struct {
 	// mu protects closed and orders the guest calls. Lock order:
 	// Workspace.mu, then pinMu, then nameMu. filesystem.mu is always taken
 	// before Workspace.mu. The metaTable has its own lock, which is a leaf.
-	mu       sync.RWMutex
-	rootPath string
-	root     *os.Root
-	host     hostBackend
-	readOnly bool
-	closed   bool
-	closing  bool
+	mu            sync.RWMutex
+	rootPath      string
+	root          *os.Root
+	host          hostBackend
+	rawHost       hostBackend
+	readOnly      bool
+	closed        bool
+	closing       bool
+	closingAtomic atomic.Bool
 
 	// meta holds the records of .gvx_meta. See meta_table.go.
 	meta *metaTable
+	// metaLock holds the pre-opened .gvx_meta.lock file for directory
+	// workspaces, or nil in single-file mode and on read-only workspaces before
+	// any writer creates the lock file.
+	metaLock          atomic.Pointer[os.File]
+	metaEpoch         atomic.Uint64
+	lastLockCommit    atomic.Uint64
+	lastLockCompact   atomic.Uint64
+	lastMetaCheckNano atomic.Int64
 	// pathKeys selects the key kind of the records: guest paths on a volume
 	// without trustworthy file identities and in single-file mode, file
 	// identities everywhere else. It never changes after openWorkspace
@@ -386,6 +401,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		rootPath:         absPath,
 		root:             root,
 		host:             host,
+		rawHost:          backend,
 		readOnly:         readOnly,
 		meta:             newMetaTable(),
 		pathKeys:         opts.pathKeys || !caps.StableIDs || single != "",
@@ -403,7 +419,7 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		countsDirLinks:   !hostCountsDirLinks || opts.countDirLinks,
 		clutter:          clutterRulesFor(hostOS),
 		maxMetaBytes:     metaLimit(opts.maxMetaBytes),
-		journal:          metaJournal{slack: opts.journalSlack},
+		journal:          metaJournal{slack: opts.journalSlack, tempName: newMetaTempName()},
 		dirTimes:         make(map[recKey]int64),
 		single:           single,
 		orphans:          orphanCollector{dirsPerStep: opts.orphanDirsPerStep},
@@ -427,7 +443,13 @@ func openWorkspace(hostPath string, readOnly bool, opts workspaceOptions) (*Work
 		w.watch.factory = func(hw *hostWatcher) (watchBackend, error) { return newPollBackend(hw), nil }
 		return w, nil
 	}
+	if err := w.openMetaLock(); err != nil {
+		_ = host.close()
+		_ = root.Close()
+		return nil, err
+	}
 	if err := w.loadMeta(); err != nil {
+		_ = w.closeMetaLock()
 		_ = host.close()
 		_ = root.Close()
 		return nil, err
@@ -481,8 +503,10 @@ func (w *Workspace) Close() error {
 		<-w.done
 	}
 	flushErr := w.flushMeta()
+	w.closingAtomic.Store(true)
 	w.flushMu.Lock()
 	journalErr := w.closeJournal()
+	lockErr := w.closeMetaLock()
 	w.flushMu.Unlock()
 
 	w.mu.Lock()
@@ -491,7 +515,7 @@ func (w *Workspace) Close() error {
 	pinErr := w.closePins()
 	hostErr := w.host.close()
 	rootErr := w.root.Close()
-	return errors.Join(flushErr, journalErr, pinErr, hostErr, rootErr)
+	return errors.Join(flushErr, journalErr, lockErr, pinErr, hostErr, rootErr)
 }
 
 // Sync writes every pending metadata mutation to stable storage. After Sync
@@ -537,10 +561,25 @@ func joinRelPath(parentRel, comp string) string {
 	return parentRel + "/" + comp
 }
 
-// isReservedPath reports whether rel names a hidden metadata file. The match
-// ignores case because a case-insensitive host volume would alias such a name.
+// isMetaTempName reports whether rel names a root-level metadata snapshot
+// staging file, either ".gvx_meta.tmp" or ".gvx_meta.tmp.<suffix>".
+func isMetaTempName(rel string) bool {
+	if strings.ContainsRune(rel, '/') {
+		return false
+	}
+	if strings.EqualFold(rel, metaTempName) {
+		return true
+	}
+	return len(rel) >= len(metaTempPrefix) && strings.EqualFold(rel[:len(metaTempPrefix)], metaTempPrefix)
+}
+
+// isReservedPath reports whether rel names a hidden metadata or lock file. The
+// match ignores case because a case-insensitive host volume would alias such a
+// name.
 func isReservedPath(rel string) bool {
-	return strings.EqualFold(rel, MetaFileName) || strings.EqualFold(rel, metaTempName)
+	return strings.EqualFold(rel, MetaFileName) ||
+		strings.EqualFold(rel, MetaLockFileName) ||
+		isMetaTempName(rel)
 }
 
 // nowNano returns monotonic nanoseconds for cache expiry.

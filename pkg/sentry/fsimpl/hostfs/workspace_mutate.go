@@ -39,6 +39,7 @@ func (w *Workspace) Rename(oldRel, newRel string) error {
 
 // rename moves oldRel to newRel with POSIX semantics.
 func (w *Workspace) rename(oldRel, newRel string) error {
+	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.renameLocked(oldRel, newRel)
@@ -310,6 +311,7 @@ func (w *Workspace) unlink(rel string) error {
 // name of the file. A file with another hard link, and a virtual symbolic
 // link, report false.
 func (w *Workspace) unlinkLast(rel string) (last bool, err error) {
+	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkWritableLocked(rel); err != nil {

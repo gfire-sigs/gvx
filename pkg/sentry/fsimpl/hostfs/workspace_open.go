@@ -121,6 +121,7 @@ func (w *Workspace) OpenFile(relPath string, flags int, mode uint32) (*os.File, 
 	if _, err := hostOpenFlags(flags); err != nil {
 		return nil, err
 	}
+	w.maybeRefreshMeta(true)
 	if flags&os.O_CREATE != 0 {
 		f, _, err := w.createFile(cleanRel, mode&0o7777, 0, 0)
 		if err == nil || flags&os.O_EXCL != 0 || !errors.Is(err, fs.ErrExist) {
@@ -357,6 +358,7 @@ func (w *Workspace) Chown(relPath string, uid, gid uint32) error {
 // file identity, where setAttr copies the change to every other recorded path
 // of the same host file.
 func (w *Workspace) setAttr(rel string, mode, uid, gid *uint32) error {
+	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkWritableLocked(rel); err != nil {
@@ -449,6 +451,7 @@ func (w *Workspace) symlink(target, rel string, uid, gid uint32) error {
 	if err := validateGuestSymlinkTarget(target); err != nil {
 		return err
 	}
+	w.maybeRefreshMeta(false)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkWritableLocked(rel); err != nil {

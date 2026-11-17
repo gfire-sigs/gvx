@@ -904,3 +904,193 @@ func TestOpenMountsRootVolumeLifecycleAndErrors(t *testing.T) {
 		t.Fatalf("closeMounts(legacySB): %v", cerr)
 	}
 }
+
+func TestParseMountOverlay(t *testing.T) {
+	// Property: ParseMount accepts valid type=overlay specifications (named or image lower,
+	// optional named or image upper, or ephemeral tmpfs-size) and rejects reserved guest paths,
+	// self-overlays, readonly+upper, tmpfs-size+upper, and upper on non-overlay types.
+	for _, tc := range []struct {
+		spec string
+		want gvx.Mount
+	}{
+		{
+			"type=overlay,src=base-vol,dst=/mnt/data",
+			gvx.Mount{Kind: gvx.MountOverlay, VolumeName: "base-vol", GuestPath: "/mnt/data"},
+		},
+		{
+			"type=overlay,source=base-vol,upper=branch-a,target=/mnt/data",
+			gvx.Mount{Kind: gvx.MountOverlay, VolumeName: "base-vol", UpperVolumeName: "branch-a", GuestPath: "/mnt/data"},
+		},
+		{
+			"type=overlay,src=base-vol,destination=/mnt/scratch,tmpfs-size=32m",
+			gvx.Mount{Kind: gvx.MountOverlay, VolumeName: "base-vol", GuestPath: "/mnt/scratch", TmpfsSizeBytes: 32 << 20},
+		},
+		{
+			"type=overlay,src=/imgs/base.ext4,upper=/imgs/branch.ext4,dst=/mnt/img",
+			gvx.Mount{Kind: gvx.MountOverlay, ImagePath: "/imgs/base.ext4", UpperImagePath: "/imgs/branch.ext4", GuestPath: "/mnt/img"},
+		},
+		{
+			"type=overlay,src=base-vol,upper=./branch.ext4,dst=/mnt/mixed",
+			gvx.Mount{Kind: gvx.MountOverlay, VolumeName: "base-vol", UpperImagePath: "./branch.ext4", GuestPath: "/mnt/mixed"},
+		},
+		{
+			"type=overlay,src=base-vol,dst=/dev/shm/ovl",
+			gvx.Mount{Kind: gvx.MountOverlay, VolumeName: "base-vol", GuestPath: "/dev/shm/ovl"},
+		},
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			got, err := gvx.ParseMount(tc.spec)
+			if err != nil {
+				t.Fatalf("ParseMount(%q) failed: %v", tc.spec, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseMount(%q) = %+v, want %+v", tc.spec, got, tc.want)
+			}
+		})
+	}
+
+	for _, spec := range []string{
+		"type=overlay,dst=/mnt/data",
+		"type=overlay,src=base-vol",
+		"type=overlay,src=base-vol,dst=/",
+		"type=overlay,src=base-vol,dst=/proc",
+		"type=overlay,src=base-vol,dst=/proc/self",
+		"type=overlay,src=base-vol,dst=/sys",
+		"type=overlay,src=base-vol,dst=/dev",
+		"type=overlay,src=base-vol,dst=/dev/null",
+		"type=overlay,src=base-vol,dst=relative/path",
+		"type=overlay,src=base-vol,dst=/mnt/trailing/",
+		"type=overlay,src=base-vol,upper=base-vol,dst=/mnt/data",
+		"type=overlay,src=/imgs/a.ext4,upper=/imgs/../imgs/a.ext4,dst=/mnt/data",
+		"type=overlay,src=base-vol,upper=branch-a,dst=/mnt/data,readonly",
+		"type=overlay,src=base-vol,upper=branch-a,dst=/mnt/data,ro",
+		"type=overlay,src=base-vol,upper=branch-a,dst=/mnt/data,ro=true",
+		"type=overlay,src=base-vol,upper=branch-a,dst=/mnt/data,tmpfs-size=16m",
+		"type=overlay,src=base-vol,upper=,dst=/mnt/data",
+		"type=overlay,src=base-vol,upper=bad name,dst=/mnt/data",
+		"type=overlay,src=bad name,dst=/mnt/data",
+		"type=overlay,src=base-vol,dst=/mnt/data,driver=hostfs",
+		"type=volume,src=base-vol,upper=branch-a,dst=/mnt/data",
+		"type=bind,src=/h,upper=branch-a,dst=/mnt/data",
+		"type=tmpfs,upper=branch-a,dst=/mnt/data",
+	} {
+		if m, err := gvx.ParseMount(spec); err == nil {
+			t.Errorf("ParseMount(%q) = %+v, want an error", spec, m)
+		}
+	}
+}
+
+func TestConfigNormalizeAndOpenMountsOverlaySharingRules(t *testing.T) {
+	// Property: Within a single Sandbox, an ext4lite volume may be mounted >=1 times read-only
+	// (as `:ro` MountVolume or MountOverlay lower base) with a single deduplicated open Volume handle,
+	// whereas self-overlay, duplicate RW usage, or RW+RO conflict on the same image fails with ErrInvalidConfig.
+	cache := filepath.Join(t.TempDir(), "cache")
+	if _, err := gvx.CreateVolume(cache, "base", gvx.DriverExt4lite); err != nil {
+		t.Fatalf("CreateVolume(base): %v", err)
+	}
+	baseImgPath := filepath.Join(cache, "volumes", "base.ext4")
+
+	for _, tc := range []struct {
+		name   string
+		root   string
+		mounts []gvx.Mount
+	}{
+		{
+			name: "self_overlay_name_vs_path",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountOverlay, VolumeName: "base", UpperImagePath: baseImgPath, GuestPath: "/mnt/a"},
+			},
+		},
+		{
+			name: "duplicate_overlay_upper",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountOverlay, VolumeName: "base", UpperVolumeName: "u1", GuestPath: "/mnt/a"},
+				{Kind: gvx.MountOverlay, VolumeName: "base", UpperVolumeName: "u1", GuestPath: "/mnt/b"},
+			},
+		},
+		{
+			name: "rw_volume_conflicts_with_overlay_lower",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountVolume, VolumeName: "base", GuestPath: "/mnt/rw"},
+				{Kind: gvx.MountOverlay, VolumeName: "base", UpperVolumeName: "u1", GuestPath: "/mnt/ovl"},
+			},
+		},
+		{
+			name: "rw_volume_conflicts_with_ro_volume",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountVolume, VolumeName: "base", GuestPath: "/mnt/rw"},
+				{Kind: gvx.MountVolume, VolumeName: "base", GuestPath: "/mnt/ro", ReadOnly: true},
+			},
+		},
+		{
+			name: "overlay_upper_conflicts_with_peer_overlay_lower",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountOverlay, VolumeName: "base", UpperVolumeName: "u1", GuestPath: "/mnt/a"},
+				{Kind: gvx.MountOverlay, VolumeName: "u1", GuestPath: "/mnt/b"},
+			},
+		},
+		{
+			name: "root_volume_conflicts_with_overlay_lower",
+			root: "base",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountOverlay, VolumeName: "base", GuestPath: "/mnt/a"},
+			},
+		},
+		{
+			name: "root_volume_conflicts_with_overlay_upper",
+			root: "u1",
+			mounts: []gvx.Mount{
+				{Kind: gvx.MountOverlay, VolumeName: "base", UpperVolumeName: "u1", GuestPath: "/mnt/a"},
+			},
+		},
+	} {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			cfg := gvx.Config{
+				OCICacheDir: cache,
+				OCIImage:    "alpine:3.20",
+				RootVolume:  tc.root,
+				Mounts:      tc.mounts,
+			}
+			err := gvx.NormalizeConfigForTest(&cfg)
+			if !errors.Is(err, gvx.ErrInvalidConfig) {
+				t.Fatalf("NormalizeConfigForTest(%s) = %v, want ErrInvalidConfig", tc.name, err)
+			}
+		})
+	}
+
+	// Valid multi-reader sharing in the same sandbox: two overlays with persistent uppers,
+	// one overlay with ephemeral tmpfs upper, and two :ro volume mounts all sharing "base".
+	validCfg := gvx.Config{
+		OCICacheDir: cache,
+		OCIImage:    "alpine:3.20",
+		Mounts: []gvx.Mount{
+			{Kind: gvx.MountOverlay, VolumeName: "base", UpperVolumeName: "u1", GuestPath: "/mnt/ovl1"},
+			{Kind: gvx.MountOverlay, ImagePath: baseImgPath, UpperVolumeName: "u2", GuestPath: "/mnt/ovl2"},
+			{Kind: gvx.MountOverlay, VolumeName: "base", GuestPath: "/mnt/ovl3", TmpfsSizeBytes: 8 << 20},
+			{Kind: gvx.MountVolume, VolumeName: "base", GuestPath: "/mnt/ro1", ReadOnly: true},
+			{Kind: gvx.MountVolume, ImagePath: baseImgPath, GuestPath: "/mnt/ro2", ReadOnly: true},
+		},
+	}
+	if err := gvx.NormalizeConfigForTest(&validCfg); err != nil {
+		t.Fatalf("NormalizeConfigForTest(valid shared base): %v", err)
+	}
+	if gvx.HasHostDirsForTest(validCfg) {
+		t.Fatalf("HasHostDirsForTest = true for pure ext4lite/overlay config, want false")
+	}
+	sb := gvx.NewSandboxForMountTest(validCfg)
+	t.Cleanup(func() {
+		if err := gvx.CloseMountsForTest(sb); err != nil {
+			t.Errorf("closeMounts: %v", err)
+		}
+	})
+	if err := gvx.OpenMountsForTest(sb); err != nil {
+		t.Fatalf("OpenMountsForTest(valid shared base): %v", err)
+	}
+	if gvx.UsesHostDirsForTest(sb) || len(gvx.HostMountsForTest(sb)) != 0 {
+		t.Fatalf("UsesHostDirs=%v HostMounts=%+v, want false/empty", gvx.UsesHostDirsForTest(sb), gvx.HostMountsForTest(sb))
+	}
+	// Open ext4lite volumes must be exactly 3: deduplicated "base" + "u1" + "u2".
+	if got := gvx.OpenVolumeCountForTest(sb); got != 3 {
+		t.Fatalf("OpenVolumeCountForTest = %d, want 3 (deduplicated base + u1 + u2)", got)
+	}
+}

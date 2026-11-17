@@ -194,6 +194,7 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath) 
 
 // AccessAt implements vfs.FilesystemImpl.AccessAt.
 func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	fs.ws.maybeRefreshMeta(false)
 	fs.lock()
 	defer fs.unlock(ctx)
 	d, err := fs.resolveLocked(ctx, rp)
@@ -211,6 +212,7 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
 func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetDentryOptions) (*vfs.Dentry, error) {
+	fs.ws.maybeRefreshMeta(false)
 	fs.lock()
 	defer fs.unlock(ctx)
 	d, err := fs.resolveLocked(ctx, rp)
@@ -243,6 +245,7 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // ReadlinkAt implements vfs.FilesystemImpl.ReadlinkAt.
 func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (string, error) {
+	fs.ws.maybeRefreshMeta(false)
 	fs.lock()
 	defer fs.unlock(ctx)
 	d, err := fs.resolveLocked(ctx, rp)

@@ -26,6 +26,7 @@ import (
 
 // SetStatAt implements vfs.FilesystemImpl.SetStatAt.
 func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
+	fs.ws.maybeRefreshMeta(false)
 	fs.lock()
 	d, err := fs.resolveLocked(ctx, rp)
 	if err != nil {
@@ -187,6 +188,7 @@ func (d *dentry) refreshIdentity() error {
 }
 
 func (d *dentry) refreshAs(identityOnly bool) error {
+	d.fs.ws.maybeRefreshMeta(false)
 	if d.isDead() {
 		return nil
 	}
@@ -207,6 +209,7 @@ func (d *dentry) refreshAs(identityOnly bool) error {
 
 // StatAt implements vfs.FilesystemImpl.StatAt.
 func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
+	fs.ws.maybeRefreshMeta(false)
 	fs.lock()
 	d, err := fs.resolveLocked(ctx, rp)
 	if err != nil {

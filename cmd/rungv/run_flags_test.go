@@ -230,3 +230,26 @@ func TestRunFlagsAllowUnconfinedSystrapIsOptIn(t *testing.T) {
 		})
 	}
 }
+
+func TestRunFlagsOverlayMount(t *testing.T) {
+	rc, _, done, stderr := parse(t,
+		"--mount", "type=overlay,src=base-vol,upper=branch-a,dst=/mnt/persist",
+		"--mount", "type=overlay,src=base-vol,dst=/mnt/scratch,tmpfs-size=16m",
+		"-image=x",
+	)
+	if done {
+		t.Fatalf("parseRunArgs ended the command: %s", stderr)
+	}
+	want := []gvx.Mount{
+		{Kind: gvx.MountOverlay, VolumeName: "base-vol", UpperVolumeName: "branch-a", GuestPath: "/mnt/persist"},
+		{Kind: gvx.MountOverlay, VolumeName: "base-vol", GuestPath: "/mnt/scratch", TmpfsSizeBytes: 16 << 20},
+	}
+	if !reflect.DeepEqual(rc.cfg.Mounts, want) {
+		t.Fatalf("Mounts = %+v, want %+v", rc.cfg.Mounts, want)
+	}
+
+	_, code, badDone, badStderr := parse(t, "--mount", "type=overlay,src=same,upper=same,dst=/mnt/bad", "-image=x")
+	if !badDone || code != 2 || !strings.Contains(badStderr, "--mount") {
+		t.Fatalf("self-overlay = (code=%d, done=%v, stderr=%q), want usage error 2", code, badDone, badStderr)
+	}
+}

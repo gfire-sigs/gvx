@@ -431,7 +431,14 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 			}
 			wsMap[id] = sm.workspace
 		}
-		if sm.volume != nil {
+		if sm.Kind == MountOverlay {
+			if sm.volume != nil {
+				volMap[overlayLowerUniqueID(sm.GuestPath)] = sm.volume
+			}
+			if sm.upperVolume != nil {
+				volMap[overlayUpperUniqueID(sm.GuestPath)] = sm.upperVolume
+			}
+		} else if sm.volume != nil {
 			volMap[sm.GuestPath] = sm.volume
 		}
 	}

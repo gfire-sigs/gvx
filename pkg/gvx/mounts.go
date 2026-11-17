@@ -46,6 +46,10 @@ const (
 	MountVolume MountKind = "volume"
 	// MountTmpfs mounts a memory-backed tmpfs.
 	MountTmpfs MountKind = "tmpfs"
+	// MountOverlay mounts a copy-on-write overlay filesystem over an immutable
+	// read-only ext4lite base volume with either a persistent ext4lite upper
+	// volume or an ephemeral tmpfs upper layer.
+	MountOverlay MountKind = "overlay"
 )
 
 // MountDriver selects the filesystem of a volume mount.
@@ -85,6 +89,15 @@ type Mount struct {
 	// creates the file.
 	ImagePath string
 
+	// UpperVolumeName names the optional persistent writable ext4lite upper
+	// volume of a MountOverlay mount. When both UpperVolumeName and
+	// UpperImagePath are empty, MountOverlay uses an ephemeral tmpfs upper layer.
+	UpperVolumeName string
+
+	// UpperImagePath is the host path of the optional persistent writable
+	// ext4lite upper image file of a MountOverlay mount.
+	UpperImagePath string
+
 	// Driver selects the filesystem of a volume mount. The zero value selects
 	// ext4lite, except for a volume that exists only as a hostfs directory
 	// from an older release. That volume keeps using hostfs.
@@ -117,6 +130,27 @@ const workspaceGuestPath = "/workspace"
 // container root filesystem in CtxRestoreVolumeMap. User mounts cannot use "/",
 // so it never collides with Mount.GuestPath.
 const rootVolumeUniqueID = "/"
+
+func overlayLowerUniqueID(guestPath string) string {
+	return "overlay-lower:" + guestPath
+}
+
+func overlayUpperUniqueID(guestPath string) string {
+	return "overlay-upper:" + guestPath
+}
+
+func (m Mount) hasOverlayUpper() bool {
+	return m.UpperVolumeName != "" || m.UpperImagePath != ""
+}
+
+func (m Mount) overlayUpperMount() Mount {
+	return Mount{
+		Kind:       MountVolume,
+		Driver:     DriverExt4lite,
+		VolumeName: m.UpperVolumeName,
+		ImagePath:  m.UpperImagePath,
+	}
+}
 
 // volumeNamePattern is the set of valid volume names.
 var volumeNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
@@ -206,10 +240,10 @@ func isHostPathSource(src string) bool {
 }
 
 // ParseMount parses the value of a --mount flag. The keys are type (bind,
-// volume, or tmpfs; volume when absent), src or source, dst, destination, or
-// target, readonly or ro, tmpfs-size, and driver. A bind source must already
-// exist. A volume source with a path separator sets ImagePath; any other
-// volume source is a volume name.
+// volume, tmpfs, or overlay; volume when absent), src or source, dst,
+// destination, or target, upper, readonly or ro, tmpfs-size, and driver. A bind
+// source must already exist. A volume or overlay source with a path separator
+// sets ImagePath; any other volume or overlay source is a volume name.
 func ParseMount(spec string) (Mount, error) {
 	fields, err := csv.NewReader(strings.NewReader(spec)).Read()
 	if err != nil {
@@ -218,6 +252,8 @@ func ParseMount(spec string) (Mount, error) {
 	var (
 		kind     = MountVolume
 		src, dst string
+		upper    string
+		hasUpper bool
 		size     string
 		driver   string
 		readOnly bool
@@ -232,6 +268,9 @@ func ParseMount(spec string) (Mount, error) {
 			src = value
 		case "dst", "destination", "target":
 			dst = value
+		case "upper":
+			hasUpper = true
+			upper = value
 		case "readonly", "ro":
 			readOnly = true
 			if hasValue {
@@ -255,8 +294,11 @@ func ParseMount(spec string) (Mount, error) {
 	default:
 		return Mount{}, fmt.Errorf("gvx: invalid mount %q: unsupported driver %q (use ext4lite or hostfs)", spec, driver)
 	}
-	if driver != "" && kind != MountVolume {
-		return Mount{}, fmt.Errorf("gvx: invalid mount %q: driver needs type=volume", spec)
+	if driver != "" && kind != MountVolume && !(kind == MountOverlay && MountDriver(driver) == DriverExt4lite) {
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: driver=%s is unsupported for type=%s", spec, driver, kind)
+	}
+	if hasUpper && kind != MountOverlay {
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: upper needs type=overlay", spec)
 	}
 	m := Mount{Kind: kind, GuestPath: dst, ReadOnly: readOnly, Driver: MountDriver(driver)}
 	switch kind {
@@ -265,7 +307,7 @@ func ParseMount(spec string) (Mount, error) {
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: src is required for type=%s", spec, kind)
 		}
 		if size != "" {
-			return Mount{}, fmt.Errorf("gvx: invalid mount %q: tmpfs-size needs type=tmpfs", spec)
+			return Mount{}, fmt.Errorf("gvx: invalid mount %q: tmpfs-size needs type=tmpfs or type=overlay", spec)
 		}
 		if kind == MountBind {
 			m.HostPath = src
@@ -282,6 +324,54 @@ func ParseMount(spec string) (Mount, error) {
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: invalid volume name %q", spec, src)
 		}
 		m.VolumeName = src
+	case MountOverlay:
+		if err := validateGuestPath(dst); err != nil {
+			return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, err)
+		}
+		if src == "" {
+			return Mount{}, fmt.Errorf("gvx: invalid mount %q: src is required for type=overlay", spec)
+		}
+		if isHostPathSource(src) {
+			if strings.HasSuffix(src, "/") || strings.HasSuffix(src, `\`) {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: lower image path %q must name a file", spec, src)
+			}
+			m.ImagePath = src
+		} else {
+			if !volumeNamePattern.MatchString(src) {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: invalid volume name %q", spec, src)
+			}
+			m.VolumeName = src
+		}
+		if hasUpper {
+			if upper == "" {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: upper must not be empty", spec)
+			}
+			if readOnly {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: readonly cannot be combined with upper", spec)
+			}
+			if size != "" {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: tmpfs-size cannot be combined with upper", spec)
+			}
+			if isHostPathSource(upper) {
+				if strings.HasSuffix(upper, "/") || strings.HasSuffix(upper, `\`) {
+					return Mount{}, fmt.Errorf("gvx: invalid mount %q: upper image path %q must name a file", spec, upper)
+				}
+				m.UpperImagePath = upper
+			} else {
+				if !volumeNamePattern.MatchString(upper) {
+					return Mount{}, fmt.Errorf("gvx: invalid mount %q: invalid upper volume name %q", spec, upper)
+				}
+				m.UpperVolumeName = upper
+			}
+			if (m.VolumeName != "" && m.VolumeName == m.UpperVolumeName) ||
+				(m.ImagePath != "" && m.UpperImagePath != "" && filepath.Clean(m.ImagePath) == filepath.Clean(m.UpperImagePath)) {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: overlay lower and upper volumes must differ", spec)
+			}
+		} else if size != "" {
+			if m.TmpfsSizeBytes, err = parseTmpfsSize(size); err != nil {
+				return Mount{}, fmt.Errorf("gvx: invalid mount %q: %w", spec, err)
+			}
+		}
 	case MountTmpfs:
 		if src != "" {
 			return Mount{}, fmt.Errorf("gvx: invalid mount %q: type=tmpfs takes no src", spec)
@@ -292,7 +382,7 @@ func ParseMount(spec string) (Mount, error) {
 			}
 		}
 	default:
-		return Mount{}, fmt.Errorf("gvx: invalid mount %q: unsupported type %q (use bind, volume, or tmpfs)", spec, kind)
+		return Mount{}, fmt.Errorf("gvx: invalid mount %q: unsupported type %q (use bind, volume, tmpfs, or overlay)", spec, kind)
 	}
 	return m, nil
 }
@@ -376,7 +466,7 @@ func (c *Config) validateMounts() error {
 		}
 		guestPaths[m.GuestPath] = struct{}{}
 	}
-	return nil
+	return c.validateVolumeConflicts("")
 }
 
 // parseRootVolumeMount converts Config.RootVolume into an ext4lite volume
@@ -428,22 +518,77 @@ func (c *Config) validateRootVolume(hasManifestLayers bool) error {
 }
 
 // validateRootVolumeDup rejects configurations that pass the same ext4lite
-// image as both Config.RootVolume and a volume entry in Config.Mounts.
+// image as both Config.RootVolume and a volume or overlay entry in Config.Mounts.
 func (c *Config) validateRootVolumeDup(rootMount Mount) error {
 	rootImg, err := c.volumeImagePath(rootMount)
 	if err != nil {
 		return err
 	}
+	return c.validateVolumeConflicts(rootImg)
+}
+
+func (c *Config) validateVolumeConflicts(rootImg string) error {
+	rwImages := make(map[string]bool)
+	roImages := make(map[string]bool)
+	if rootImg != "" {
+		rwImages[rootImg] = true
+	}
+	checkRW := func(img, label string) error {
+		if rwImages[img] || roImages[img] {
+			return fmt.Errorf("%w: volume %s is mounted twice", ErrInvalidConfig, label)
+		}
+		rwImages[img] = true
+		return nil
+	}
+	checkRO := func(img, label string) error {
+		if rwImages[img] {
+			return fmt.Errorf("%w: volume %s is mounted twice", ErrInvalidConfig, label)
+		}
+		roImages[img] = true
+		return nil
+	}
+
 	for _, m := range c.Mounts {
-		if m.Kind != MountVolume || m.Driver == DriverHostfs {
-			continue
-		}
-		img, err := c.volumeImagePath(m)
-		if err != nil {
-			continue
-		}
-		if img == rootImg {
-			return fmt.Errorf("%w: volume %s is mounted twice", ErrInvalidConfig, m.volumeLabel())
+		switch m.Kind {
+		case MountVolume:
+			driver, err := c.resolveVolumeDriver(m)
+			if err != nil || driver != DriverExt4lite {
+				continue
+			}
+			img, err := c.volumeImagePath(m)
+			if err != nil {
+				continue
+			}
+			if m.ReadOnly {
+				if err := checkRO(img, m.volumeLabel()); err != nil {
+					return err
+				}
+			} else {
+				if err := checkRW(img, m.volumeLabel()); err != nil {
+					return err
+				}
+			}
+		case MountOverlay:
+			lowerImg, err := c.volumeImagePath(m)
+			if err != nil {
+				continue
+			}
+			if m.hasOverlayUpper() {
+				upperMount := m.overlayUpperMount()
+				upperImg, err := c.volumeImagePath(upperMount)
+				if err != nil {
+					continue
+				}
+				if lowerImg == upperImg {
+					return fmt.Errorf("%w: overlay volume %s is mounted twice as lower and upper", ErrInvalidConfig, upperMount.volumeLabel())
+				}
+				if err := checkRW(upperImg, upperMount.volumeLabel()); err != nil {
+					return err
+				}
+			}
+			if err := checkRO(lowerImg, m.volumeLabel()); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -454,13 +599,16 @@ func (m Mount) validate() error {
 	if err := validateGuestPath(m.GuestPath); err != nil {
 		return err
 	}
-	if m.TmpfsSizeBytes < 0 || m.TmpfsSizeBytes > 0 && m.Kind != MountTmpfs {
-		return errors.New("TmpfsSizeBytes must be zero or positive and applies to tmpfs mounts only")
+	if m.TmpfsSizeBytes < 0 || (m.TmpfsSizeBytes > 0 && m.Kind != MountTmpfs && (m.Kind != MountOverlay || m.hasOverlayUpper())) {
+		return errors.New("TmpfsSizeBytes must be zero or positive and applies to tmpfs or ephemeral overlay mounts only")
 	}
 	if m.CreateHostPathIfMissing && m.Kind != MountBind {
 		return errors.New("CreateHostPathIfMissing applies to bind mounts only")
 	}
-	if m.Driver != "" && m.Kind != MountVolume {
+	if m.hasOverlayUpper() && m.Kind != MountOverlay {
+		return errors.New("UpperVolumeName and UpperImagePath apply to overlay mounts only")
+	}
+	if m.Driver != "" && m.Kind != MountVolume && !(m.Kind == MountOverlay && m.Driver == DriverExt4lite) {
 		return errors.New("Driver applies to volume mounts only")
 	}
 	switch m.Kind {
@@ -489,6 +637,39 @@ func (m Mount) validate() error {
 		case "", DriverExt4lite, DriverHostfs:
 		default:
 			return fmt.Errorf("unsupported volume driver %q (use ext4lite or hostfs)", m.Driver)
+		}
+	case MountOverlay:
+		if m.HostPath != "" {
+			return errors.New("an overlay mount takes no HostPath")
+		}
+		if m.ImagePath != "" {
+			if m.VolumeName != "" {
+				return errors.New("an overlay mount takes VolumeName or ImagePath for lower base, not both")
+			}
+			if strings.HasSuffix(m.ImagePath, "/") || strings.HasSuffix(m.ImagePath, `\`) {
+				return fmt.Errorf("overlay lower image path %q must name a file", m.ImagePath)
+			}
+		} else if !volumeNamePattern.MatchString(m.VolumeName) {
+			return fmt.Errorf("invalid volume name %q", m.VolumeName)
+		}
+		if m.UpperImagePath != "" && m.UpperVolumeName != "" {
+			return errors.New("an overlay mount takes UpperVolumeName or UpperImagePath, not both")
+		}
+		if m.hasOverlayUpper() {
+			if m.ReadOnly {
+				return errors.New("a read-only overlay mount cannot set an upper volume")
+			}
+			if m.UpperImagePath != "" {
+				if strings.HasSuffix(m.UpperImagePath, "/") || strings.HasSuffix(m.UpperImagePath, `\`) {
+					return fmt.Errorf("overlay upper image path %q must name a file", m.UpperImagePath)
+				}
+			} else if !volumeNamePattern.MatchString(m.UpperVolumeName) {
+				return fmt.Errorf("invalid upper volume name %q", m.UpperVolumeName)
+			}
+			if (m.VolumeName != "" && m.VolumeName == m.UpperVolumeName) ||
+				(m.ImagePath != "" && m.UpperImagePath != "" && filepath.Clean(m.ImagePath) == filepath.Clean(m.UpperImagePath)) {
+				return errors.New("overlay lower and upper volumes must differ")
+			}
 		}
 	case MountTmpfs:
 		if m.HostPath != "" || m.VolumeName != "" || m.ImagePath != "" {
@@ -578,6 +759,7 @@ func (c Config) hasHostDirs() bool {
 	for _, m := range c.Mounts {
 		switch {
 		case m.Kind == MountTmpfs:
+		case m.Kind == MountOverlay:
 		case m.Kind == MountVolume && m.Driver != DriverHostfs:
 		default:
 			return true
@@ -606,10 +788,11 @@ func (c Config) volumeRoot() (string, error) {
 // otherwise. An ext4lite volume holds its open volume.
 type sandboxMount struct {
 	Mount
-	hostPath  string
-	hostFile  bool
-	workspace *hostfs.Workspace
-	volume    *ext4lite.Volume
+	hostPath    string
+	hostFile    bool
+	workspace   *hostfs.Workspace
+	volume      *ext4lite.Volume
+	upperVolume *ext4lite.Volume
 }
 
 // mountList returns every guest mount: the WorkspacePath mount first, then
@@ -659,9 +842,60 @@ func (s *Sandbox) openMountsForRestore() error {
 	return s.openMountsWithMode(true)
 }
 
+func checkNoLegacyHostfsVolume(m Mount, image string) error {
+	if m.ImagePath != "" {
+		return nil
+	}
+	if _, statErr := os.Stat(image); errors.Is(statErr, os.ErrNotExist) {
+		legacyDir := filepath.Join(filepath.Dir(image), m.VolumeName)
+		if info, dirErr := os.Stat(legacyDir); dirErr == nil && info.IsDir() {
+			return fmt.Errorf("%w: volume %q already exists with driver %q", ErrInvalidConfig, m.VolumeName, DriverHostfs)
+		}
+	}
+	return nil
+}
+
 func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	shared := make(map[workspaceKey]*hostfs.Workspace)
-	volumes := make(map[string]bool)
+	rwVolumes := make(map[string]bool)
+	roVolumes := make(map[string]*ext4lite.Volume)
+
+	openRW := func(m Mount) (*ext4lite.Volume, string, error) {
+		image, err := s.cfg.volumeImagePath(m)
+		if err != nil {
+			return nil, "", err
+		}
+		if rwVolumes[image] || roVolumes[image] != nil {
+			return nil, "", fmt.Errorf("gvx: volume %s is mounted twice: %w", m.volumeLabel(), ErrInvalidConfig)
+		}
+		rwVolumes[image] = true
+		vol, err := s.openVolumeImageWithMode(m, image, forRestore)
+		if err != nil {
+			return nil, "", err
+		}
+		return vol, image, nil
+	}
+	openRO := func(m Mount) (*ext4lite.Volume, error) {
+		m.ReadOnly = true
+		image, err := s.cfg.volumeImagePath(m)
+		if err != nil {
+			return nil, err
+		}
+		if rwVolumes[image] {
+			return nil, fmt.Errorf("gvx: volume %s is mounted twice: %w", m.volumeLabel(), ErrInvalidConfig)
+		}
+		if vol, ok := roVolumes[image]; ok {
+			return vol, nil
+		}
+		vol, err := s.openVolumeImageWithMode(m, image, false)
+		if err != nil {
+			return nil, err
+		}
+		roVolumes[image] = vol
+		s.volumes = append(s.volumes, vol)
+		return vol, nil
+	}
+
 	if s.cfg.RootVolume != "" {
 		m, err := parseRootVolumeMount(s.cfg.RootVolume)
 		if err != nil {
@@ -671,15 +905,10 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 		if err != nil {
 			return err
 		}
-		if m.ImagePath == "" {
-			if _, statErr := os.Stat(image); errors.Is(statErr, os.ErrNotExist) {
-				legacyDir := filepath.Join(filepath.Dir(image), m.VolumeName)
-				if info, dirErr := os.Stat(legacyDir); dirErr == nil && info.IsDir() {
-					return fmt.Errorf("%w: volume %q already exists with driver %q", ErrInvalidConfig, m.VolumeName, DriverHostfs)
-				}
-			}
+		if err := checkNoLegacyHostfsVolume(m, image); err != nil {
+			return err
 		}
-		volumes[image] = true
+		rwVolumes[image] = true
 		vol, err := s.openVolumeImageWithMode(m, image, forRestore)
 		if err != nil {
 			return err
@@ -697,21 +926,53 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 		sm := sandboxMount{Mount: m}
 		switch {
 		case m.Kind == MountTmpfs:
+		case m.Kind == MountOverlay:
+			lowerImg, err := s.cfg.volumeImagePath(m)
+			if err != nil {
+				return err
+			}
+			if err := checkNoLegacyHostfsVolume(m, lowerImg); err != nil {
+				return err
+			}
+			if m.hasOverlayUpper() {
+				upperMount := m.overlayUpperMount()
+				upperImg, err := s.cfg.volumeImagePath(upperMount)
+				if err != nil {
+					return err
+				}
+				if lowerImg == upperImg {
+					return fmt.Errorf("gvx: overlay volume %s is mounted twice: %w", upperMount.volumeLabel(), ErrInvalidConfig)
+				}
+				if err := checkNoLegacyHostfsVolume(upperMount, upperImg); err != nil {
+					return err
+				}
+				upperVol, _, err := openRW(upperMount)
+				if err != nil {
+					return err
+				}
+				s.volumes = append(s.volumes, upperVol)
+				sm.upperVolume = upperVol
+			}
+			lowerVol, err := openRO(m)
+			if err != nil {
+				return err
+			}
+			sm.volume = lowerVol
 		case m.Kind == MountVolume && m.Driver == DriverExt4lite:
-			image, err := s.cfg.volumeImagePath(m)
-			if err != nil {
-				return err
+			if m.ReadOnly {
+				vol, err := openRO(m)
+				if err != nil {
+					return err
+				}
+				sm.volume = vol
+			} else {
+				vol, _, err := openRW(m)
+				if err != nil {
+					return err
+				}
+				s.volumes = append(s.volumes, vol)
+				sm.volume = vol
 			}
-			if volumes[image] {
-				return fmt.Errorf("gvx: volume %s is mounted twice: %w", m.volumeLabel(), ErrInvalidConfig)
-			}
-			volumes[image] = true
-			vol, err := s.openVolumeImageWithMode(m, image, forRestore)
-			if err != nil {
-				return err
-			}
-			s.volumes = append(s.volumes, vol)
-			sm.volume = vol
 		default:
 			hostPath, isFile, err := s.prepareHostPath(m)
 			if err != nil {
@@ -917,7 +1178,7 @@ func sortMountsByDepth(mounts []sandboxMount) {
 func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 	var list []hostlockdown.HostMount
 	for _, m := range s.mounts {
-		if m.Kind != MountTmpfs && m.volume == nil {
+		if m.Kind != MountTmpfs && m.Kind != MountOverlay && m.volume == nil {
 			list = append(list, hostlockdown.HostMount{Path: m.hostPath, ReadOnly: m.ReadOnly, File: m.hostFile})
 		}
 	}
@@ -928,7 +1189,7 @@ func (s *Sandbox) hostMounts() []hostlockdown.HostMount {
 // then does the Linux seccomp filter need the host filesystem rules.
 func (s *Sandbox) usesHostDirs() bool {
 	for _, m := range s.mounts {
-		if m.Kind != MountTmpfs && m.volume == nil {
+		if m.Kind != MountTmpfs && m.Kind != MountOverlay && m.volume == nil {
 			return true
 		}
 	}

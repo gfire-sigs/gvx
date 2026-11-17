@@ -508,6 +508,12 @@ func (w *Workspace) entryGoneLocked(rel string) bool {
 // an internal name holds guest data, so it stays. OpenWorkspace calls it before
 // the guest runs, so it takes no lock.
 func (w *Workspace) sweepEphemeral() {
+	if lf := w.metaLock.Load(); lf != nil {
+		if locked, err := tryLockMetaExclusive(lf); err == nil && locked {
+			w.sweepStaleMetaTempsLocked()
+			_ = unlockMeta(lf)
+		}
+	}
 	w.sweepEphemeralExcept(nil)
 }
 

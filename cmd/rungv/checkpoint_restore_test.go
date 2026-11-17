@@ -484,3 +484,101 @@ func TestCLICheckpointAndRestoreEndToEnd(t *testing.T) {
 		t.Fatalf("rungv resume stdout = %q, want %q", stdout3.String(), wantOut3)
 	}
 }
+
+func TestCheckpointAndRestoreCLIOverlayMounts(t *testing.T) {
+	platform := requireCheckpointCLIPlatform(t)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	ckptDir := filepath.Join(t.TempDir(), "ckpt-ovl-cli")
+	sockPath := filepath.Join(shortSocketDir(t), "ovl.sock")
+
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	writeBaseELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/data/base.txt", "base-from-cli\n")
+	if err != nil {
+		t.Fatalf("BuildGuestWriteFileELF64(base): %v", err)
+	}
+	writeUpperELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/ovl/upper.txt", "upper-from-cli\n")
+	if err != nil {
+		t.Fatalf("BuildGuestWriteFileELF64(upper): %v", err)
+	}
+	catPath := filepath.Join(t.TempDir(), "cat.elf")
+	writeBasePath := filepath.Join(t.TempDir(), "write-base.elf")
+	writeUpperPath := filepath.Join(t.TempDir(), "write-upper.elf")
+	for p, b := range map[string][]byte{catPath: catELF, writeBasePath: writeBaseELF, writeUpperPath: writeUpperELF} {
+		if wErr := os.WriteFile(p, b, 0o755); wErr != nil {
+			t.Fatal(wErr)
+		}
+	}
+
+	// Seed base-cli volume, then seed branch-cli overlay upper via CLI!
+	runCLIArgs(t, nil, "run", "-lockdown=false", "-platform="+platform, "-net=none", "-cache-dir="+cacheDir, "-v=base-cli:/data", "-bin="+writeBasePath).mustSucceed(t, "seed base-cli")
+	runCLIArgs(t, nil, "run", "-lockdown=false", "-platform="+platform, "-net=none", "-cache-dir="+cacheDir, "--mount=type=overlay,src=base-cli,upper=branch-cli,dst=/ovl", "-bin="+writeUpperPath).mustSucceed(t, "seed branch-cli")
+
+	stdinR, stdinW := net.Pipe()
+	defer stdinR.Close()
+	defer stdinW.Close()
+	stdout1 := newSyncNotifyBuffer()
+	stderr1 := newSyncNotifyBuffer()
+	runDone := make(chan int, 1)
+	go func() {
+		runDone <- executeCLI(
+			context.Background(),
+			[]string{
+				"run",
+				"-lockdown=false",
+				"-platform=" + platform,
+				"-net=none",
+				"-cache-dir=" + cacheDir,
+				"--mount=type=overlay,src=base-cli,upper=branch-cli,dst=/ovl",
+				"--mount=type=overlay,src=base-cli,dst=/scratch,tmpfs-size=16m",
+				"-checkpoint-dir=" + ckptDir,
+				"-control-socket=" + sockPath,
+				"-bin=" + catPath,
+				"--",
+				"/ovl/upper.txt",
+				"/proc/self/fd/0",
+				"/ovl/base.txt",
+				"/scratch/base.txt",
+			},
+			stdinR,
+			stdout1,
+			stderr1,
+		)
+	}()
+
+	stdout1.waitForSubstring(t, "upper-from-cli\n", 15*time.Second)
+
+	var ckptOut, ckptErr bytes.Buffer
+	if code := executeCLI(context.Background(), []string{"checkpoint", "-control-socket=" + sockPath, "-checkpoint-dir=" + ckptDir}, nil, &ckptOut, &ckptErr); code != 0 {
+		t.Fatalf("rungv checkpoint = (%d, %q), want 0", code, ckptErr.String())
+	}
+	if exit := <-runDone; exit != 0 {
+		t.Fatalf("rungv run exit = %d, stderr = %q", exit, stderr1.String())
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	resCode := executeCLI(
+		context.Background(),
+		[]string{
+			"restore",
+			"-lockdown=false",
+			"-platform=" + platform,
+			"-net=none",
+			"-cache-dir=" + cacheDir,
+			"--mount=type=overlay,src=base-cli,upper=branch-cli,dst=/ovl",
+			"--mount=type=overlay,src=base-cli,dst=/scratch,tmpfs-size=16m",
+			"-checkpoint-dir=" + ckptDir,
+		},
+		strings.NewReader("cli-resumed\n"),
+		&stdout2,
+		&stderr2,
+	)
+	if resCode != 0 {
+		t.Fatalf("rungv restore = (%d, %q), want 0", resCode, stderr2.String())
+	}
+	if want := "cli-resumed\nbase-from-cli\nbase-from-cli\n"; stdout2.String() != want {
+		t.Fatalf("rungv restore stdout = %q, want %q", stdout2.String(), want)
+	}
+}
