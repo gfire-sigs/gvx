@@ -24,8 +24,12 @@ import (
 	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
+func platformPunchGranularity() int64 {
+	return blockSize
+}
+
 // osNativeGrow allocates the range [off, off+n) with fallocate in mode 0.
-// Mode 0 also moves the size of the file to off+n.
+// Mode 0 also moves the size of the file to off+n when off+n exceeds the size.
 func osNativeGrow(f *os.File, off, n int64) error {
 	fd := int(f.Fd())
 	defer runtime.KeepAlive(f)
@@ -37,10 +41,51 @@ func osNativeGrow(f *os.File, off, n int64) error {
 	}
 }
 
+// osNativeAllocateRange allocates physical blocks for [off, off+n) without
+// shrinking the file.
+func osNativeAllocateRange(f *os.File, off, n int64) error {
+	return osNativeGrow(f, off, n)
+}
+
+// osNativePunch releases physical backing in [off, off+n) while keeping the
+// file size unchanged.
+func osNativePunch(f *os.File, off, n int64) (int64, int64, error) {
+	fd := int(f.Fd())
+	defer runtime.KeepAlive(f)
+	var st unix.Stat_t
+	for {
+		err := unix.Fstat(fd, &st)
+		if !errors.Is(err, unix.EINTR) {
+			if err != nil {
+				return 0, 0, err
+			}
+			break
+		}
+	}
+	end := min(off+n, st.Size)
+	if off >= end {
+		return 0, 0, nil
+	}
+	length := end - off
+	for {
+		err := unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, length)
+		if !errors.Is(err, unix.EINTR) {
+			if err != nil {
+				return 0, 0, err
+			}
+			return off, length, nil
+		}
+	}
+}
+
 // nativeUnsupported reports whether err means that the host volume does not
 // support preallocation.
 func nativeUnsupported(err error) bool {
 	return errors.Is(err, unix.EOPNOTSUPP) ||
 		errors.Is(err, unix.EINVAL) ||
 		errors.Is(err, unix.ENOSYS)
+}
+
+func punchUnsupported(err error) bool {
+	return nativeUnsupported(err)
 }

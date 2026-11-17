@@ -333,6 +333,7 @@ func (v *volume) rebuildFromWalk(seen map[uint32]*fsckInode, claimed []bitmap) e
 	defer v.mu.Unlock()
 	v.freeBlocksTotal, v.freeInodesTotal = 0, 0
 	v.heldBlocksTotal, v.heldInodesTotal = 0, 0
+	v.punchingTotal = 0
 	usedDirs := make([]uint32, nGroups)
 	for ino, info := range seen {
 		if info.mode&modeTypeMask == modeDir {
@@ -343,6 +344,8 @@ func (v *volume) rebuildFromWalk(seen map[uint32]*fsckInode, claimed []bitmap) e
 		g.blocks, g.inodes = bitmap{}, bitmap{}
 		g.freshBlocks, g.freshInodes, g.heldBlocks, g.heldInodes = nil, nil, nil, nil
 		g.heldBlockCount, g.heldInodeCount = 0, 0
+		g.reclaimPending, g.punching = nil, nil
+		g.punchingCount = 0
 		for b := uint32(0); b < metaBlocksOf(uint32(gi)); b++ {
 			g.blocks.set(b)
 		}
@@ -350,6 +353,19 @@ func (v *volume) rebuildFromWalk(seen map[uint32]*fsckInode, claimed []bitmap) e
 			if claimed[gi].test(b) {
 				g.blocks.set(b)
 			}
+		}
+		if !v.readOnly {
+			var p bitmap
+			for w := range g.blocks {
+				p[w] = ^g.blocks[w]
+			}
+			if !p.isZero() {
+				g.punched = &p
+			} else {
+				g.punched = nil
+			}
+		} else {
+			g.punched = nil
 		}
 		if gi == 0 {
 			for i := uint32(0); i < firstIno-1; i++ {

@@ -83,6 +83,15 @@ type hostFile interface {
 	// and growing through Truncate can leave a sparse tail.
 	Truncate(size int64) error
 
+	// PunchHole releases the physical backing of [off, off+length) on the host
+	// volume without changing the file size. Punched bytes read back as zeros.
+	// Host volumes without hole-punch support leave the file unchanged.
+	PunchHole(off, length int64) error
+
+	// EnsureRange guarantees physical backing for [off, off+length) before a
+	// punched block range returns to the allocator.
+	EnsureRange(off, length int64) error
+
 	// AvailBytes returns the number of bytes that the host volume can still
 	// give to this file.
 	AvailBytes() (uint64, error)

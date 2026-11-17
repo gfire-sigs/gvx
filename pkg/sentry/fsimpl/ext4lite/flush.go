@@ -154,12 +154,21 @@ func (v *volume) flushLocked() error {
 		return err
 	}
 	if plan.empty() {
-		return v.syncData()
+		if err := v.syncData(); err != nil {
+			return err
+		}
+		v.reclaimAfterFlushLocked()
+		return nil
 	}
 	if v.j != nil {
-		return v.writePlanJournal(plan)
+		err = v.writePlanJournal(plan)
+	} else {
+		err = v.writePlanDirect(plan)
 	}
-	return v.writePlanDirect(plan)
+	if err == nil {
+		v.reclaimAfterFlushLocked()
+	}
+	return err
 }
 
 // flushDirectLocked flushes without the journal. The mount uses it to write a
@@ -614,6 +623,17 @@ func (v *volume) commitPlan(p *flushPlan) {
 		}
 		g := v.groups[s.gi]
 		if s.heldBlocks != nil && g.heldBlocks != nil {
+			var released bitmap
+			for w := range released {
+				released[w] = s.heldBlocks[w] & g.heldBlocks[w] &^ g.blocks[w]
+			}
+			if !released.isZero() {
+				if v.hf.Tier() == tierFallback {
+					lazyBitmap(&g.punched).or(&released)
+				} else {
+					lazyBitmap(&g.reclaimPending).or(&released)
+				}
+			}
 			g.heldBlocks.andNot(s.heldBlocks)
 			now := g.heldBlocks.count()
 			v.heldBlocksTotal -= uint64(g.heldBlockCount - now)

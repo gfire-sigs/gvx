@@ -97,3 +97,53 @@ func (b *bitmap) andNot(o *bitmap) {
 		b[i] &^= o[i]
 	}
 }
+
+// or sets in b every bit that is set in o.
+func (b *bitmap) or(o *bitmap) {
+	for i := range b {
+		b[i] |= o[i]
+	}
+}
+
+// isZero reports whether every bit in b is clear.
+func (b *bitmap) isZero() bool {
+	for _, w := range b {
+		if w != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// setRange sets n bits starting at off.
+func (b *bitmap) setRange(off, n uint32) {
+	for i := off; i < off+n; i++ {
+		b.set(i)
+	}
+}
+
+// clearRange clears n bits starting at off.
+func (b *bitmap) clearRange(off, n uint32) {
+	for i := off; i < off+n; i++ {
+		b.clear(i)
+	}
+}
+
+// anySet reports whether at least one bit in [off, off+n) is set.
+func (b *bitmap) anySet(off, n uint32) bool {
+	for i := off; i < off+n; i++ {
+		if b.test(i) {
+			return true
+		}
+	}
+	return false
+}
+
+// clearRun returns the length of the prefix of [off, off+limit) where b is clear.
+func (b *bitmap) clearRun(off, limit uint32) uint32 {
+	var k uint32
+	for k < limit && !b.test(off+k) {
+		k++
+	}
+	return k
+}

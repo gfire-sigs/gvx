@@ -49,6 +49,18 @@ type group struct {
 	heldBlockCount          uint32
 	heldInodeCount          uint32
 
+	// punched marks free blocks whose physical backing may be sparse on the
+	// host file. Reallocating a punched block verifies physical backing before
+	// marking the block allocated.
+	punched *bitmap
+	// reclaimPending marks blocks whose holds just cleared in commitPlan and
+	// that post-flush auto-shrink has not yet inspected.
+	reclaimPending *bitmap
+	// punching marks free unheld blocks undergoing an in-flight PunchHole call
+	// outside v.mu so concurrent allocations skip them.
+	punching      *bitmap
+	punchingCount uint32
+
 	// dirty is set when the bitmaps or the descriptor differ from the disk.
 	dirty bool
 	// needsBackup is set for a new group that holds a superblock copy. The
@@ -60,8 +72,35 @@ type group struct {
 	migDirty *bitmap
 }
 
-func (g *group) availBlocks() uint32 { return g.desc.freeBlocks - g.heldBlockCount }
+func (g *group) availBlocks() uint32 {
+	blocked := g.heldBlockCount + g.punchingCount
+	if blocked >= g.desc.freeBlocks {
+		return 0
+	}
+	return g.desc.freeBlocks - blocked
+}
+
 func (g *group) availInodes() uint32 { return g.desc.freeInodes - g.heldInodeCount }
+
+func (g *group) isBlocked(off uint32) bool {
+	return (g.heldBlocks != nil && g.heldBlocks.test(off)) ||
+		(g.punching != nil && g.punching.test(off))
+}
+
+func (g *group) allocMask() *bitmap {
+	switch {
+	case g.heldBlocks == nil:
+		return g.punching
+	case g.punching == nil:
+		return g.heldBlocks
+	default:
+		var combined bitmap
+		for i := range combined {
+			combined[i] = g.heldBlocks[i] | g.punching[i]
+		}
+		return &combined
+	}
+}
 
 func lazyBitmap(p **bitmap) *bitmap {
 	if *p == nil {
@@ -113,6 +152,7 @@ func (v *volume) allocBlocks(goal uint64, want uint32) (uint64, uint32, error) {
 	return v.allocBlocksLocked(goal, want)
 }
 
+// +checklocks:v.mu
 func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, error) {
 	if v.readOnly {
 		return 0, 0, linuxerr.EROFS
@@ -121,7 +161,7 @@ func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, er
 		if goal != 0 && goal < v.blocksCountLocked() && !isMetadataBlock(goal) {
 			gi, off := uint32(goal/blocksPerGroup), uint32(goal%blocksPerGroup)
 			g := v.groups[gi]
-			if g.availBlocks() > 0 && !g.blocks.test(off) && (g.heldBlocks == nil || !g.heldBlocks.test(off)) {
+			if g.availBlocks() > 0 && !g.blocks.test(off) && !g.isBlocked(off) {
 				return v.takeRunLocked(gi, off, want)
 			}
 		}
@@ -129,13 +169,13 @@ func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, er
 			if g.availBlocks() == 0 {
 				continue
 			}
-			off := g.blocks.firstFree(0, g.heldBlocks)
+			off := g.blocks.firstFree(0, g.allocMask())
 			if off >= blocksPerGroup {
 				continue
 			}
 			return v.takeRunLocked(uint32(gi), off, want)
 		}
-		if v.heldBlocksTotal > 0 {
+		if v.heldBlocksTotal > 0 || v.punchingTotal > 0 {
 			return 0, 0, errSpaceHeld
 		}
 		if err := v.appendGroupLocked(); err != nil {
@@ -145,23 +185,102 @@ func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, er
 }
 
 // takeRunLocked marks the free run that starts at off in group gi as used.
+//
+// +checklocks:v.mu
 func (v *volume) takeRunLocked(gi, off, want uint32) (uint64, uint32, error) {
 	g := v.groups[gi]
-	n := g.blocks.freeRun(off, want, g.heldBlocks)
+	n := g.blocks.freeRun(off, want, g.allocMask())
 	start := groupStart(gi) + uint64(off)
 	if err := v.ensureHostLocked(start + uint64(n)); err != nil {
 		return 0, 0, err
+	}
+	hadPunched := false
+	if g.punched != nil && g.punched.anySet(off, n) {
+		hadPunched = true
+		if err := v.ensurePunchedBackingLocked(gi, off, n); err != nil {
+			if n > 1 && linuxerr.Equals(linuxerr.ENOSPC, err) {
+				if !g.punched.test(off) {
+					n = g.punched.clearRun(off, n)
+					hadPunched = false
+				} else if err1 := v.ensurePunchedBackingLocked(gi, off, 1); err1 == nil {
+					n = 1
+				} else {
+					return 0, 0, err1
+				}
+			} else {
+				return 0, 0, err
+			}
+		}
 	}
 	fresh := lazyBitmap(&g.freshBlocks)
 	for i := off; i < off+n; i++ {
 		g.blocks.set(i)
 		fresh.set(i)
 	}
+	if g.punched != nil {
+		g.punched.clearRange(off, n)
+		if g.punched.isZero() {
+			g.punched = nil
+		}
+	}
+	if g.reclaimPending != nil {
+		g.reclaimPending.clearRange(off, n)
+		if g.reclaimPending.isZero() {
+			g.reclaimPending = nil
+		}
+	}
+	if hadPunched && v.migTracking {
+		v.markWrittenLocked(int64(start)*blockSize, int(n)*blockSize)
+	}
 	g.desc.freeBlocks -= n
 	v.freeBlocksTotal -= uint64(n)
 	g.dirty = true
 	v.allocSinceSnap = true
 	return start, n, nil
+}
+
+// ensurePunchedBackingLocked re-verifies physical host space for every punched
+// sub-run inside [off, off+n) of group gi before marking blocks allocated.
+func (v *volume) ensurePunchedBackingLocked(gi, off, n uint32) error {
+	g := v.groups[gi]
+	if g.punched == nil {
+		return nil
+	}
+	if v.hf.Tier() == tierFallback {
+		var punchedBlocks uint64
+		for i := off; i < off+n; i++ {
+			if g.punched.test(i) {
+				punchedBlocks++
+			}
+		}
+		if punchedBlocks > 0 {
+			if avail, err := v.hf.AvailBytes(); err == nil && avail < punchedBlocks*blockSize {
+				return linuxerr.ENOSPC
+			}
+		}
+		return nil
+	}
+	for i := off; i < off+n; {
+		if !g.punched.test(i) {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < off+n && g.punched.test(j) {
+			j++
+		}
+		byteOff := int64(groupStart(gi)+uint64(i)) * blockSize
+		byteLen := int64(j-i) * blockSize
+		if err := v.hf.EnsureRange(byteOff, byteLen); err != nil {
+			return hostError(err)
+		}
+		g.punched.clearRange(i, j-i)
+		i = j
+	}
+	if g.punched.isZero() {
+		g.punched = nil
+	}
+	return nil
 }
 
 // ensureHostLocked makes the host file cover every block below blockEnd on a
@@ -358,7 +477,7 @@ func (v *volume) groupIsEmpty(gi int) bool {
 	g := v.groups[gi]
 	return g.desc.freeBlocks == blocksPerGroup-metaBlocksOf(uint32(gi)) &&
 		g.desc.freeInodes == inodesOfGroup(uint32(gi)) &&
-		g.heldBlockCount == 0 && g.heldInodeCount == 0
+		g.heldBlockCount == 0 && g.heldInodeCount == 0 && g.punchingCount == 0
 }
 
 // trimGroupsLocked removes the empty groups at the end of the volume. It keeps

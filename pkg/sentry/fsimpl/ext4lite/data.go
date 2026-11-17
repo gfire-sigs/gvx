@@ -211,7 +211,7 @@ func (n *node) writeRange(p []byte, off int64, back bool) (int, error) {
 func (v *volume) hasHeld() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return v.heldBlocksTotal > 0 || v.heldInodesTotal > 0
+	return v.heldBlocksTotal > 0 || v.heldInodesTotal > 0 || v.punchingTotal > 0
 }
 
 // writeOnce writes as much of p at off as one mapping step allows. A back write

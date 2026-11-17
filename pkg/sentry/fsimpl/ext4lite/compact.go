@@ -70,11 +70,17 @@ func (v *volume) shutdownLocked() error {
 			if err := v.hf.Truncate(want); err != nil {
 				return errors.Join(append(errs, hostError(err))...)
 			}
+			v.mu.Lock()
+			v.hostBytes = want
+			v.mu.Unlock()
 		}
 	} else if v.hf.Tier() == tierFallback {
 		if err := v.hf.EnsureSize(want); err != nil {
 			errs = append(errs, hostError(err))
 		}
+	}
+	if compactErr == nil {
+		v.punchAllFreeBestEffortLocked(1)
 	}
 	if v.j != nil {
 		return errors.Join(errs...)

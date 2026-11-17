@@ -79,3 +79,29 @@ func (c *countedFile) Truncate(size int64) error {
 	c.stats.End(blockdev.Discard, r, released)
 	return err
 }
+
+// PunchHole implements hostFile. A non-empty punch counts as a discard request
+// when the underlying host file supports hole punching.
+func (c *countedFile) PunchHole(off, length int64) error {
+	if length <= 0 || isPunchDisabled(c.hostFile) {
+		return c.hostFile.PunchHole(off, length)
+	}
+	r := c.stats.Begin()
+	err := c.hostFile.PunchHole(off, length)
+	released := int64(0)
+	if err == nil && !isPunchDisabled(c.hostFile) {
+		released = length
+	}
+	c.stats.End(blockdev.Discard, r, released)
+	return err
+}
+
+// PunchGranularity forwards the host hole-punch alignment granularity.
+func (c *countedFile) PunchGranularity() int64 {
+	return punchGranularityOf(c.hostFile)
+}
+
+// PunchDisabled reports whether hole punching is disabled on the underlying file.
+func (c *countedFile) PunchDisabled() bool {
+	return isPunchDisabled(c.hostFile)
+}

@@ -25,14 +25,41 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/chunkcache"
 )
 
-// ErrVolumeInUse is the error of OpenVolume when another handle holds the host
-// file. Two sandboxes must never write one image.
+// ErrVolumeInUse is the error of OpenVolume when another handle holds a
+// conflicting lock on the host file.
 var ErrVolumeInUse = errVolumeInUse
+
+// VolumeLockMode describes the advisory OS lock state of a volume image file.
+type VolumeLockMode uint8
+
+const (
+	// VolumeLockNone reports that no open handle holds a shared or exclusive lock.
+	VolumeLockNone VolumeLockMode = iota
+	// VolumeLockShared reports that one or more read-only handles hold shared locks.
+	VolumeLockShared
+	// VolumeLockExclusive reports that a writable handle holds an exclusive lock.
+	VolumeLockExclusive
+)
+
+// String returns the canonical lock mode name.
+func (m VolumeLockMode) String() string {
+	switch m {
+	case VolumeLockNone:
+		return "none"
+	case VolumeLockShared:
+		return "shared"
+	case VolumeLockExclusive:
+		return "exclusive"
+	default:
+		return "unknown"
+	}
+}
 
 // VolumeOptions configures OpenVolume.
 type VolumeOptions struct {
-	// ReadOnly opens the image without any write. It fails when the last mount
-	// did not end cleanly.
+	// ReadOnly opens the image without any write and acquires a shared OS lock
+	// so concurrent read-only sandboxes can mount the image together. It fails
+	// when the last mount did not end cleanly or when a writer holds LOCK_EX.
 	ReadOnly bool
 
 	// DeferOrphanCleanup preserves the on-disk orphan inode list during
@@ -57,11 +84,11 @@ type Volume struct {
 }
 
 // OpenVolume takes ownership of f. It formats the file as a new volume when
-// the file is empty, and it mounts the existing image otherwise. It takes an
-// exclusive lock on f and returns ErrVolumeInUse when another handle holds it.
-// On an error, OpenVolume closes f.
+// the file is empty, and it mounts the existing image otherwise. Read-only
+// opens acquire a shared lock and writable opens acquire an exclusive lock,
+// returning ErrVolumeInUse on lock conflict. On an error, OpenVolume closes f.
 func OpenVolume(f *os.File, opts VolumeOptions) (*Volume, error) {
-	hf, err := newHostFile(f)
+	hf, err := newHostFileMode(f, opts.ReadOnly)
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -74,28 +101,23 @@ func OpenVolume(f *os.File, opts VolumeOptions) (*Volume, error) {
 	return &Volume{v: v}, nil
 }
 
-// ProbeVolumeInUse reports whether another open file description currently
-// holds the exclusive volume lock on path without taking an exclusive lock.
+// ProbeVolumeLock probes the current OS lock state of path without blocking.
+func ProbeVolumeLock(path string) (VolumeLockMode, error) {
+	return probeVolumeLock(path)
+}
+
+// ProbeVolumeInUse reports whether any shared reader or exclusive writer
+// currently holds a lock on path.
 func ProbeVolumeInUse(path string) (bool, error) {
-	f, err := os.Open(path)
+	mode, err := probeVolumeLock(path)
 	if err != nil {
 		return false, err
 	}
-	defer func() {
-		_ = f.Close()
-	}()
-	if err := lockFileShared(f); err != nil {
-		if errors.Is(err, errVolumeInUse) {
-			return true, nil
-		}
-		return false, err
-	}
-	_ = unlockFile(f)
-	return false, nil
+	return mode != VolumeLockNone, nil
 }
 
-// RemoveVolumeFile deletes path while preventing concurrent exclusive mounts.
-// It returns ErrVolumeInUse when an active volume holds the lock.
+// RemoveVolumeFile deletes path while preventing concurrent mounts. It returns
+// ErrVolumeInUse when any shared reader or exclusive writer holds the lock.
 func RemoveVolumeFile(path string) error {
 	return removeVolumeFile(path)
 }
@@ -106,6 +128,7 @@ func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 	if err != nil {
 		return nil, hostError(err)
 	}
+	freshFormatted := false
 	if !opts.ReadOnly && !opts.DeferOrphanCleanup {
 		fresh := size == 0
 		if !fresh {
@@ -118,17 +141,19 @@ func mountHostFile(hf hostFile, opts VolumeOptions) (*volume, error) {
 			if err := formatVolume(hf, time.Now()); err != nil {
 				return nil, err
 			}
+			freshFormatted = true
 		}
 	}
 	return openVolume(hf, volumeOptions{
 		readOnly:           opts.ReadOnly,
 		deferOrphanCleanup: opts.DeferOrphanCleanup,
+		freshFormatted:     freshFormatted,
 	})
 }
 
 // Close performs the clean unmount: it compacts and trims the trailing groups,
-// flushes the metadata, truncates the host file, marks the image clean, and
-// closes the host file. A second call returns nil.
+// flushes the metadata, truncates the host file, punches interior free space,
+// marks the image clean, and closes the host file. A second call returns nil.
 func (vol *Volume) Close() error {
 	return vol.v.close()
 }
@@ -230,6 +255,16 @@ type trackedFile struct {
 	// write yet. A read returns them, so that the engine never sees the stale
 	// block on the host file. The next flush writes them again.
 	pending map[uint64][]byte
+}
+
+// PunchGranularity forwards the host hole-punch alignment granularity.
+func (t *trackedFile) PunchGranularity() int64 {
+	return punchGranularityOf(t.hostFile)
+}
+
+// PunchDisabled reports whether hole punching is disabled on the underlying file.
+func (t *trackedFile) PunchDisabled() bool {
+	return isPunchDisabled(t.hostFile)
 }
 
 // WriteAt implements io.WriterAt. It counts as a write of file data.

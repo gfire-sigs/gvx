@@ -33,6 +33,9 @@ type volumeOptions struct {
 	// deferOrphanCleanup skips orphan cleanup and writable session startup during
 	// openVolume until CompleteRestore validates the superblock identity.
 	deferOrphanCleanup bool
+	// freshFormatted indicates that formatVolume just preallocated the volume
+	// densely before openVolume, so free blocks have not been hole-punched.
+	freshFormatted bool
 	// now returns the current time. The default is time.Now.
 	now func() time.Time
 }
@@ -97,6 +100,7 @@ type volume struct {
 	freeInodesTotal uint64
 	heldBlocksTotal uint64
 	heldInodesTotal uint64
+	punchingTotal   uint64
 	hostBytes       int64
 	sbDirty         bool
 	descDirty       bool
@@ -274,7 +278,7 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 		}
 	}
 
-	if err := v.loadGroups(groups); err != nil {
+	if err := v.loadGroups(groups, opts.freshFormatted); err != nil {
 		return nil, err
 	}
 	v.diskGroups = int(groups)
@@ -330,12 +334,54 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cleaned {
+	if !onDiskClean {
+		if err := v.recoverShrinkLocked(); err != nil {
+			return nil, err
+		}
+	} else if cleaned {
 		if err := v.flushLocked(); err != nil {
 			return nil, err
 		}
 	}
 	return v, nil
+}
+
+// recoverShrinkLocked flushes post-recovery metadata, compacts and truncates
+// empty trailing groups, and punches remaining free runs when mounting an
+// image whose previous session ended without a clean unmount.
+func (v *volume) recoverShrinkLocked() error {
+	if err := v.flushLocked(); err != nil {
+		return err
+	}
+	if err := v.compactLocked(); err != nil {
+		return err
+	}
+	v.mu.Lock()
+	removed := v.trimGroupsLocked()
+	v.mu.Unlock()
+	if removed > 0 {
+		if err := v.flushLocked(); err != nil {
+			return err
+		}
+		if v.j != nil {
+			if err := v.resetLog(); err != nil {
+				return err
+			}
+		}
+		v.mu.Lock()
+		want := int64(len(v.groups)) * groupBytes
+		v.mu.Unlock()
+		if size, err := v.hf.Size(); err == nil && size > want {
+			if err := v.hf.Truncate(want); err != nil {
+				return hostError(err)
+			}
+			v.mu.Lock()
+			v.hostBytes = want
+			v.mu.Unlock()
+		}
+	}
+	v.punchAllFreeBestEffortLocked(1)
+	return nil
 }
 
 // ensureSessionStarted starts the writable superblock or journal session if it
@@ -386,7 +432,7 @@ func (v *volume) ensureSessionStartedLocked() error {
 }
 
 // loadGroups reads the group descriptors and the bitmaps.
-func (v *volume) loadGroups(n uint32) error {
+func (v *volume) loadGroups(n uint32, freshFormatted bool) error {
 	v.groups = make([]*group, n)
 	var blk [blockSize]byte
 	for gi := uint32(0); gi < n; gi++ {
@@ -433,6 +479,15 @@ func (v *volume) loadGroups(n uint32) error {
 		for b := uint32(0); b < metaBlocksOf(gi); b++ {
 			if !g.blocks.test(b) {
 				return corrupt("group %d block bitmap frees metadata block %d", gi, b)
+			}
+		}
+		if !v.readOnly && !freshFormatted {
+			var p bitmap
+			for w := range g.blocks {
+				p[w] = ^g.blocks[w]
+			}
+			if !p.isZero() {
+				g.punched = &p
 			}
 		}
 		g.desc.freeBlocks = blocksPerGroup - g.blocks.count()

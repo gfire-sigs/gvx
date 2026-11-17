@@ -108,6 +108,18 @@ func (p *auPages) ensure(size int64) {
 	}
 }
 
+func (p *auPages) punchHole(off, length int64) {
+	end := min(off+length, p.size)
+	if off >= end {
+		return
+	}
+	first := (off + auPage - 1) / auPage
+	last := end / auPage
+	for idx := first; idx < last; idx++ {
+		delete(p.pages, idx)
+	}
+}
+
 // bytes returns the whole image.
 func (p *auPages) bytes() []byte {
 	b := make([]byte, p.size)
@@ -122,6 +134,7 @@ const (
 	auSync
 	auEnsure
 	auTrunc
+	auPunch
 )
 
 // auOp is one call that reached the host file.
@@ -141,6 +154,8 @@ func (op *auOp) apply(p *auPages) {
 		p.ensure(op.size)
 	case auTrunc:
 		p.truncate(op.size)
+	case auPunch:
+		p.punchHole(op.off, op.size)
 	}
 }
 
@@ -258,6 +273,47 @@ func (f *auFile) Truncate(size int64) error {
 	return nil
 }
 
+func (f *auFile) PunchHole(off, length int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if length <= 0 || off < 0 || f.tier == tierFallback {
+		return nil
+	}
+	if err := f.check(auPunch); err != nil {
+		return err
+	}
+	op := auOp{kind: auPunch, off: off, size: length}
+	op.apply(f.cur)
+	f.log = append(f.log, op)
+	return nil
+}
+
+func (f *auFile) EnsureRange(off, length int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if length <= 0 {
+		return nil
+	}
+	if f.avail >= 0 {
+		var need int64
+		first := off / auPage
+		last := (off + length + auPage - 1) / auPage
+		for idx := first; idx < last; idx++ {
+			if f.cur.pages[idx] == nil {
+				need += auPage
+			}
+		}
+		if int64(len(f.cur.pages))*auPage+need > f.avail {
+			return errHostDiskFull
+		}
+	}
+	if off+length > f.cur.size {
+		f.cur.ensure(off + length)
+		f.peak()
+	}
+	return nil
+}
+
 func (f *auFile) AvailBytes() (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -364,6 +420,10 @@ func (w auWindow) powerLoss(lo, hi int, rng *rand.Rand, keep float64, sectors bo
 		switch op.kind {
 		case auEnsure, auTrunc:
 			op.apply(p)
+		case auPunch:
+			if rng.Float64() < keep {
+				op.apply(p)
+			}
 		case auWrite:
 			if !sectors {
 				if rng.Float64() < keep {

@@ -22,6 +22,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // fallbackStep is the growth step of the fallback tier. The fallback tier
@@ -34,6 +35,18 @@ const fallbackStep = 4 << 20
 // inject a failure. The operating system files set the default value.
 var nativeGrow = osNativeGrow
 
+// nativeAllocateRange ensures physical backing for [off, off+n) inside an
+// already-sized host file. Tests replace it to inject host disk-full errors.
+var nativeAllocateRange = osNativeAllocateRange
+
+// nativePunch releases physical backing for [off, off+n) without changing the
+// file size. Tests replace it to observe or fault-inject punch calls.
+var nativePunch = osNativePunch
+
+// probeMu serializes in-process ProbeVolumeLock calls so concurrent goroutines
+// probing an idle volume never collide on the transient exclusive lock probe.
+var probeMu sync.Mutex
+
 // osHostFile is the hostFile implementation on top of an open *os.File. Every
 // method works on the open handle only.
 type osHostFile struct {
@@ -42,12 +55,15 @@ type osHostFile struct {
 	// mu makes the size check and the grow step in EnsureSize one step. A
 	// write that extends the file between the two steps would otherwise be
 	// lost when the grow step sets a smaller size. EnsureSize and Truncate
-	// hold mu for writing, and WriteAt holds it for reading.
+	// hold mu for writing, and WriteAt and PunchHole hold it for reading.
 	mu sync.RWMutex
 
 	// tier holds a storageTier. It changes at most once, from a native tier
 	// to tierFallback.
 	tier atomic.Int32
+
+	// punchDisabled becomes true when the host filesystem rejects hole punching.
+	punchDisabled atomic.Bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -64,7 +80,13 @@ var _ hostFile = (*osHostFile)(nil)
 // The hostFile owns f after a successful call. When newHostFile fails, the
 // caller keeps ownership of f and must close it.
 func newHostFile(f *os.File) (hostFile, error) {
-	return openHostFile(f, platformTier)
+	return openHostFile(f, platformTier, false)
+}
+
+// newHostFileMode opens f with a shared lock when readOnly is true and an
+// exclusive lock otherwise.
+func newHostFileMode(f *os.File, readOnly bool) (hostFile, error) {
+	return openHostFile(f, platformTier, readOnly)
 }
 
 // newHostFileForTier is like newHostFile, but it skips the probe and forces
@@ -74,16 +96,59 @@ func newHostFileForTier(f *os.File, t storageTier) (hostFile, error) {
 	if t != tierFallback && t != platformTier {
 		return nil, fmt.Errorf("ext4lite: the storage tier %q is not available on this operating system", t)
 	}
-	return openHostFile(f, t)
+	return openHostFile(f, t, false)
 }
 
-func openHostFile(f *os.File, t storageTier) (hostFile, error) {
-	if err := lockFile(f); err != nil {
+func openHostFile(f *os.File, t storageTier, readOnly bool) (hostFile, error) {
+	var err error
+	if readOnly {
+		err = lockFileShared(f)
+	} else {
+		err = lockFile(f)
+	}
+	if err != nil {
 		return nil, err
 	}
 	h := &osHostFile{f: f}
 	h.tier.Store(int32(t))
 	return h, nil
+}
+
+// probeVolumeLock inspects the advisory OS lock state on path without blocking.
+func probeVolumeLock(path string) (VolumeLockMode, error) {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+
+	f, err := os.Open(path)
+	if err != nil {
+		return VolumeLockNone, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	for attempt := range 5 {
+		err := tryLockExclusive(f)
+		if err == nil {
+			_ = unlockFile(f)
+			return VolumeLockNone, nil
+		}
+		if !errors.Is(err, errVolumeInUse) {
+			return VolumeLockNone, err
+		}
+		err = tryLockShared(f)
+		if err == nil {
+			_ = unlockFile(f)
+			return VolumeLockShared, nil
+		}
+		if !errors.Is(err, errVolumeInUse) {
+			return VolumeLockNone, err
+		}
+		if attempt < 4 {
+			time.Sleep(300 * time.Microsecond)
+		}
+	}
+	return VolumeLockExclusive, nil
 }
 
 // ReadAt reads len(p) bytes at off. It fills the bytes beyond the end of the
@@ -156,6 +221,96 @@ func (h *osHostFile) Truncate(size int64) error {
 	return h.f.Truncate(size)
 }
 
+// PunchHole releases physical space in [off, off+length) without changing the
+// logical size of the file. Host filesystems that reject hole punching disable
+// future punches on this handle and succeed as a no-op.
+func (h *osHostFile) PunchHole(off, length int64) error {
+	if length <= 0 || off < 0 || h.Tier() == tierFallback || h.punchDisabled.Load() {
+		return nil
+	}
+	h.mu.RLock()
+	_, _, err := nativePunch(h.f, off, length)
+	h.mu.RUnlock()
+	if err == nil {
+		return nil
+	}
+	if punchUnsupported(err) {
+		h.punchDisabled.Store(true)
+		return nil
+	}
+	return err
+}
+
+// EnsureRange guarantees physical backing for [off, off+length) before a
+// previously punched range returns to the allocator.
+func (h *osHostFile) EnsureRange(off, length int64) error {
+	if length <= 0 {
+		return nil
+	}
+	if off < 0 || length > math.MaxInt64-off {
+		return fmt.Errorf("ext4lite: invalid range [%d, +%d)", off, length)
+	}
+	if h.Tier() == tierFallback {
+		if err := h.EnsureSize(off + length); err != nil {
+			return err
+		}
+		if avail, err := h.AvailBytes(); err == nil && avail < uint64(length) {
+			return errHostDiskFull
+		}
+		return nil
+	}
+
+	h.mu.RLock()
+	cur, err := h.Size()
+	if err != nil {
+		h.mu.RUnlock()
+		return err
+	}
+	if off+length <= cur {
+		err = nativeAllocateRange(h.f, off, length)
+		h.mu.RUnlock()
+		if err == nil {
+			return nil
+		}
+		if !nativeUnsupported(err) {
+			return err
+		}
+		h.tier.Store(int32(tierFallback))
+		if avail, aerr := h.AvailBytes(); aerr == nil && avail < uint64(length) {
+			return errHostDiskFull
+		}
+		return nil
+	}
+	h.mu.RUnlock()
+
+	if err := h.EnsureSize(off + length); err != nil {
+		return err
+	}
+	if h.Tier() == tierFallback {
+		if avail, aerr := h.AvailBytes(); aerr == nil && avail < uint64(length) {
+			return errHostDiskFull
+		}
+		return nil
+	}
+	h.mu.RLock()
+	err = nativeAllocateRange(h.f, off, length)
+	h.mu.RUnlock()
+	if err != nil && !nativeUnsupported(err) {
+		return err
+	}
+	return nil
+}
+
+// PunchGranularity returns the alignment required by PunchHole on this OS.
+func (h *osHostFile) PunchGranularity() int64 {
+	return platformPunchGranularity()
+}
+
+// PunchDisabled reports whether hole punching is unsupported on this handle.
+func (h *osHostFile) PunchDisabled() bool {
+	return h.Tier() == tierFallback || h.punchDisabled.Load()
+}
+
 // AvailBytes returns the free space that the host volume gives to this file.
 func (h *osHostFile) AvailBytes() (uint64, error) {
 	return availBytes(h.f)
@@ -176,4 +331,18 @@ func (h *osHostFile) Close() error {
 		h.closeErr = h.f.Close()
 	})
 	return h.closeErr
+}
+
+func punchGranularityOf(hf hostFile) int64 {
+	if g, ok := hf.(interface{ PunchGranularity() int64 }); ok {
+		return g.PunchGranularity()
+	}
+	return blockSize
+}
+
+func isPunchDisabled(hf hostFile) bool {
+	if d, ok := hf.(interface{ PunchDisabled() bool }); ok {
+		return d.PunchDisabled()
+	}
+	return hf.Tier() == tierFallback
 }

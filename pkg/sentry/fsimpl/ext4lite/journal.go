@@ -472,13 +472,14 @@ func (v *volume) endSession(clean bool) error {
 // never grows the host file. The caller holds v.mu.
 func (v *volume) findJournalRunLocked() (uint64, bool) {
 	g := v.groups[0]
+	mask := g.allocMask()
 	off := uint32(0)
 	for off < blocksPerGroup {
-		off = g.blocks.firstFree(off, g.heldBlocks)
+		off = g.blocks.firstFree(off, mask)
 		if off >= blocksPerGroup {
 			return 0, false
 		}
-		if n := g.blocks.freeRun(off, journalBlocks, g.heldBlocks); n >= journalBlocks {
+		if n := g.blocks.freeRun(off, journalBlocks, mask); n >= journalBlocks {
 			return uint64(off), true
 		} else {
 			off += max(n, 1)
@@ -498,9 +499,19 @@ func (v *volume) createJournal(zero bool) (bool, error) {
 		v.mu.Unlock()
 		return false, nil
 	}
+	if err := v.ensurePunchedBackingLocked(0, uint32(start), journalBlocks); err != nil {
+		v.mu.Unlock()
+		return false, err
+	}
 	g := v.groups[0]
 	for i := uint32(0); i < journalBlocks; i++ {
 		g.blocks.set(uint32(start) + i)
+	}
+	if g.reclaimPending != nil {
+		g.reclaimPending.clearRange(uint32(start), journalBlocks)
+		if g.reclaimPending.isZero() {
+			g.reclaimPending = nil
+		}
 	}
 	g.desc.freeBlocks -= journalBlocks
 	v.freeBlocksTotal -= journalBlocks

@@ -19,11 +19,18 @@ package ext4lite
 import (
 	"errors"
 	"os"
+	"syscall"
 )
 
 // platformTier is the only tier that this operating system offers. No
 // preallocation call is available, so the file grows with ftruncate.
 const platformTier = tierFallback
+
+var errHostDiskFull error = syscall.ENOSPC
+
+func platformPunchGranularity() int64 {
+	return blockSize
+}
 
 // lockFile does nothing on this operating system. No portable lock call is
 // available, so two sandboxes that mount the same file are not detected.
@@ -31,6 +38,10 @@ func lockFile(*os.File) error { return nil }
 
 // lockFileShared does nothing on this operating system.
 func lockFileShared(*os.File) error { return nil }
+
+func tryLockExclusive(*os.File) error { return nil }
+
+func tryLockShared(*os.File) error { return nil }
 
 // unlockFile does nothing, as lockFile does nothing.
 func unlockFile(*os.File) error { return nil }
@@ -50,8 +61,20 @@ func osNativeGrow(*os.File, int64, int64) error {
 	return errors.ErrUnsupported
 }
 
+func osNativeAllocateRange(*os.File, int64, int64) error {
+	return errors.ErrUnsupported
+}
+
+func osNativePunch(*os.File, int64, int64) (int64, int64, error) {
+	return 0, 0, errors.ErrUnsupported
+}
+
 // nativeUnsupported reports whether err means that the host volume does not
 // support preallocation.
 func nativeUnsupported(err error) bool {
+	return errors.Is(err, errors.ErrUnsupported)
+}
+
+func punchUnsupported(err error) bool {
 	return errors.Is(err, errors.ErrUnsupported)
 }

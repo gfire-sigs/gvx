@@ -28,9 +28,11 @@ import (
 // platformTier is the tier that this operating system offers first.
 const platformTier = tierNative
 
+const errHostDiskFull = unix.ENOSPC
+
 // lockFile takes the exclusive advisory lock of f without blocking. It retries
-// briefly so a concurrent shared probe in ProbeVolumeInUse cannot abort
-// OpenVolume, and returns errVolumeInUse when another handle holds the lock.
+// briefly so a concurrent probe in ProbeVolumeLock cannot abort OpenVolume, and
+// returns errVolumeInUse when another handle holds a shared or exclusive lock.
 func lockFile(f *os.File) error {
 	fd := int(f.Fd())
 	defer runtime.KeepAlive(f)
@@ -50,7 +52,7 @@ func lockFile(f *os.File) error {
 			continue
 		case errors.Is(err, unix.EWOULDBLOCK):
 			attempt++
-			if attempt >= 5 {
+			if attempt >= 10 {
 				return errVolumeInUse
 			}
 			time.Sleep(time.Millisecond)
@@ -60,9 +62,57 @@ func lockFile(f *os.File) error {
 	}
 }
 
-// lockFileShared takes a shared advisory lock on f without blocking. It returns
-// errVolumeInUse when another open file description holds an exclusive lock.
+// lockFileShared takes a shared advisory lock on f without blocking. It retries
+// briefly so a concurrent exclusive probe in ProbeVolumeLock cannot abort
+// OpenVolume, and returns errVolumeInUse when a writer holds LOCK_EX.
 func lockFileShared(f *os.File) error {
+	fd := int(f.Fd())
+	defer runtime.KeepAlive(f)
+	for attempt := 0; ; {
+		err := unix.Flock(fd, unix.LOCK_SH|unix.LOCK_NB)
+		switch {
+		case err == nil:
+			if attempt > 0 {
+				var st unix.Stat_t
+				if statErr := unix.Fstat(fd, &st); statErr == nil && st.Nlink == 0 {
+					_ = unix.Flock(fd, unix.LOCK_UN)
+					return os.ErrNotExist
+				}
+			}
+			return nil
+		case errors.Is(err, unix.EINTR):
+			continue
+		case errors.Is(err, unix.EWOULDBLOCK):
+			attempt++
+			if attempt >= 10 {
+				return errVolumeInUse
+			}
+			time.Sleep(time.Millisecond)
+		default:
+			return err
+		}
+	}
+}
+
+func tryLockExclusive(f *os.File) error {
+	fd := int(f.Fd())
+	defer runtime.KeepAlive(f)
+	for {
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, unix.EINTR):
+			continue
+		case errors.Is(err, unix.EWOULDBLOCK):
+			return errVolumeInUse
+		default:
+			return err
+		}
+	}
+}
+
+func tryLockShared(f *os.File) error {
 	fd := int(f.Fd())
 	defer runtime.KeepAlive(f)
 	for {
@@ -90,7 +140,7 @@ func unlockFile(f *os.File) error {
 // removeVolumeFile acquires an exclusive lock on path, verifies that path still
 // resolves to the locked inode, and unlinks path while holding the lock.
 func removeVolumeFile(path string) error {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
