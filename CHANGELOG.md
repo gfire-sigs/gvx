@@ -2,6 +2,16 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.17.10002026110900] - 2026-11-17
+
+This release adds online `ext4lite` hole punching and `FITRIM` support, `LOCK_SH` shared read-only volume mounts, and `type=overlay` copy-on-write volume mounts. It also adds multi-sandbox `hostfs` `.gvx_meta.lock` synchronization under `hostlockdown`.
+
+### Features
+
+- **Online `ext4lite` hole punching, `FITRIM`, and `rungv volume compact` (`pkg/sentry/fsimpl/ext4lite`, `pkg/gvx`, `cmd/rungv`)**: `ext4lite` reclaims interior free runs after JBD2 commit and home-block flush while keeping `heldBlocks` untouched prior to commit. Reallocation of punched blocks verifies host physical backing and returns `ENOSPC` when full. Guest `FITRIM` ioctls call `Volume.Trim`, unclean mounts compact after replay, `VolumeInfo.AllocatedBytes` reports physical disk usage, and `rungv volume compact` trims unlocked volumes.
+- **Shared read-only volume locks and `type=overlay` copy-on-write mounts (`pkg/sentry/fsimpl/ext4lite`, `pkg/gvx`, `cmd/rungv`)**: `OpenVolume` with `ReadOnly: true` acquires `LOCK_SH` so concurrent sandboxes can share read-only and overlay lower volumes. `ProbeVolumeLock` and `VolumeInfo.LockMode` report `none`, `shared`, or `exclusive`. `--mount type=overlay,src=...,dst=...[,upper=...]` mounts persistent `ext4lite` or ephemeral `tmpfs` upper branches with full checkpoint and restore rebinding.
+- **Multi-sandbox `hostfs` `.gvx_meta.lock` synchronization (`pkg/sentry/fsimpl/hostfs`, `pkg/gvx`)**: `OpenWorkspace` pre-opens `.gvx_meta.lock` before `hostlockdown.Apply()`, hides `.gvx_meta.lock` and `.gvx_meta.tmp.*` from guests, and allows `flock` under `hostlockdown`. Flushes take an exclusive lock, merge peer appends or snapshots, and write via per-workspace `.gvx_meta.tmp.<hex>` files. Lookups and directory revalidation refresh external updates under a shared lock.
+
 ## [v0.16.10022026110900] - 2026-11-17
 
 This release fixes 16 KB `arm64` `systrap` composite sub-block store emulation (`TBI0` tags and `STLUR`) and per-sub-page VIPT I-cache cleaning (#203). It also fixes `devpts` master hangup notifications, `TCSETS` wakeups, and job-control routing (#205). In addition, it moves pending fault-access state into a weak-keyed side table (#204).
