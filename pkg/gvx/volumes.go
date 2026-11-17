@@ -288,11 +288,7 @@ func CompactVolume(cacheDir, name string) (VolumeInfo, error) {
 	syncErr := vol.Sync()
 	var trimErr error
 	if syncErr == nil {
-		if trimmer, ok := any(vol).(interface {
-			Trim(start, length, minlen uint64) (uint64, error)
-		}); ok {
-			_, trimErr = trimmer.Trim(0, math.MaxUint64, 0)
-		}
+		_, trimErr = vol.Trim(0, math.MaxUint64, 0)
 	}
 	closeErr := vol.Close()
 	if err := errors.Join(syncErr, trimErr, closeErr); err != nil {
@@ -351,10 +347,11 @@ func buildExt4VolumeInfo(name, imgPath string, info os.FileInfo) (VolumeInfo, er
 	if err == nil {
 		imgPath = abs
 	}
-	lockMode, err := probeVolumeLockMode(imgPath)
+	mode, err := ext4lite.ProbeVolumeLock(imgPath)
 	if err != nil {
 		return VolumeInfo{}, fmt.Errorf("gvx: probe volume %q lock: %w", name, err)
 	}
+	lockMode := mode.String()
 	return VolumeInfo{
 		Name:           name,
 		Driver:         DriverExt4lite,

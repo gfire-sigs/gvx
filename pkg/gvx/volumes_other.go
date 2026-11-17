@@ -16,23 +16,8 @@
 
 package gvx
 
-import (
-	"os"
-
-	"z.gfire.dev/gvx/pkg/sentry/fsimpl/ext4lite"
-)
+import "os"
 
 func fileAllocatedBytes(_ string, info os.FileInfo) int64 {
 	return info.Size()
-}
-
-func probeVolumeLockMode(path string) (string, error) {
-	inUse, err := ext4lite.ProbeVolumeInUse(path)
-	if err != nil {
-		return "", err
-	}
-	if inUse {
-		return "exclusive", nil
-	}
-	return "none", nil
 }

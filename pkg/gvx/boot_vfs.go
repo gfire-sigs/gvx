@@ -567,8 +567,8 @@ func (s *Sandbox) mountOverlayUserMount(sctx gvcontext.Context, vfsObj *vfs.Virt
 	defer lowerVD.DecRef(sctx)
 
 	var (
-		upperVD        vfs.VirtualDentry
-		initFromLower  bool
+		upperVD       vfs.VirtualDentry
+		initFromLower bool
 	)
 	if m.upperVolume != nil {
 		var upperExisting bool
