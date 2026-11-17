@@ -318,6 +318,8 @@ func (d *dentry) xattrTarget(h *hostHandle) xattrTarget {
 // trusted namespace stays hidden from a caller without CAP_SYS_ADMIN, as in
 // fs/xattr.c:simple_xattr_list().
 func (d *dentry) listXattr(creds *auth.Credentials, size uint64, h *hostHandle) ([]string, error) {
+	d.fs.ws.maybeRefreshMeta(false)
+	_ = d.refresh()
 	all, err := d.fs.ws.xattrList(d.xattrTarget(h))
 	if err != nil {
 		return nil, err
@@ -326,6 +328,8 @@ func (d *dentry) listXattr(creds *auth.Credentials, size uint64, h *hostHandle) 
 }
 
 func (d *dentry) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions, h *hostHandle) (string, error) {
+	d.fs.ws.maybeRefreshMeta(false)
+	_ = d.refresh()
 	e := d.inode.snapshot()
 	mode, uid, gid := linux.FileMode(e.attr.Mode), auth.KUID(e.attr.UID), auth.KGID(e.attr.GID)
 	if err := fsutilx.CheckGetXattr(creds, mode, uid, gid, opts.Name); err != nil {
@@ -413,6 +417,7 @@ func (d *dentry) mutateXattr(name string, h *hostHandle, change func(xattrTarget
 // resolveXattrDentry resolves rp and returns the dentry with one reference.
 // The caller drops it with DecRef.
 func (fs *filesystem) resolveXattrDentry(ctx context.Context, rp *vfs.ResolvingPath) (*dentry, error) {
+	fs.ws.maybeRefreshMeta(false)
 	fs.lock()
 	defer fs.unlock(ctx)
 	d, err := fs.resolveLocked(ctx, rp)

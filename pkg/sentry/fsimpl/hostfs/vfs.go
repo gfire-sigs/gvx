@@ -282,12 +282,14 @@ type inode struct {
 	timesStale bool   `state:"nosave"`
 	metaUntil  int64  `state:"nosave"`
 	metaSeq    uint64 `state:"nosave"`
+	metaEpoch  uint64 `state:"nosave"`
 
 	// negChildren holds the names that a lookup in this directory did not
 	// find, so a repeated lookup makes no host call. negUntil ends the life of
 	// the whole set. Protected by fs.mu.
 	negChildren map[string]struct{} `state:"nosave"`
 	negUntil    int64               `state:"nosave"`
+	negEpoch    uint64              `state:"nosave"`
 
 	// wmu serialises writes so that O_APPEND is atomic.
 	wmu sync.Mutex `state:"nosave"`
@@ -336,17 +338,19 @@ func (i *inode) update(e entry) {
 // metaFresh reports whether cur is valid at time now, with current size and
 // times.
 func (i *inode) metaFresh(now int64) bool {
+	epoch := i.fs.ws.metaEpoch.Load()
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
-	return i.metaValid && !i.timesStale && now < i.metaUntil
+	return i.metaValid && !i.timesStale && now < i.metaUntil && i.metaEpoch == epoch
 }
 
 // identityFresh reports whether cur names the right host object, with the
 // right mode and owner, at time now. The size and the times can be stale.
 func (i *inode) identityFresh(now int64) bool {
+	epoch := i.fs.ws.metaEpoch.Load()
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
-	return i.metaValid && now < i.metaUntil
+	return i.metaValid && now < i.metaUntil && i.metaEpoch == epoch
 }
 
 // markDataChanged records that a write changed the size and the times of the
@@ -376,21 +380,25 @@ func (i *inode) beginMeta() uint64 {
 // commitMeta stores e and marks it valid until the given time, unless a
 // mutation invalidated the inode after beginMeta returned seq.
 func (i *inode) commitMeta(e entry, seq uint64, until int64) {
+	epoch := i.fs.ws.metaEpoch.Load()
 	i.attrMu.Lock()
 	i.cur = e
 	if i.metaSeq == seq {
 		i.metaValid = true
 		i.timesStale = false
 		i.metaUntil = until
+		i.metaEpoch = epoch
 	}
 	i.attrMu.Unlock()
 }
 
 // markValid marks cur of a new inode as valid until the given time.
 func (i *inode) markValid(until int64) {
+	epoch := i.fs.ws.metaEpoch.Load()
 	i.attrMu.Lock()
 	i.metaValid = true
 	i.metaUntil = until
+	i.metaEpoch = epoch
 	i.attrMu.Unlock()
 }
 
@@ -403,7 +411,7 @@ func (i *inode) negHit(name string, now int64) bool {
 	if len(i.negChildren) == 0 {
 		return false
 	}
-	if now >= i.negUntil {
+	if now >= i.negUntil || i.negEpoch != i.fs.ws.metaEpoch.Load() {
 		i.negChildren = nil
 		return false
 	}
@@ -414,9 +422,11 @@ func (i *inode) negHit(name string, now int64) bool {
 // negAdd records that name does not exist in this directory. Callers hold
 // fs.mu.
 func (i *inode) negAdd(name string, now int64) {
-	if len(i.negChildren) == 0 || now >= i.negUntil {
+	epoch := i.fs.ws.metaEpoch.Load()
+	if len(i.negChildren) == 0 || now >= i.negUntil || i.negEpoch != epoch {
 		i.negChildren = make(map[string]struct{})
 		i.negUntil = now + int64(cacheTTL)
+		i.negEpoch = epoch
 	} else if len(i.negChildren) >= maxNegChildren {
 		clear(i.negChildren)
 	}

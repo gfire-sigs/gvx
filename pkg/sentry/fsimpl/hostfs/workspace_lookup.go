@@ -360,6 +360,7 @@ func virtualEntry(k recKey, r *rec) entry {
 }
 
 func (w *Workspace) lookup(rel string) (entry, error) {
+	w.maybeRefreshMeta(true)
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.lookupLocked(rel)
@@ -410,6 +411,7 @@ type dirListing struct {
 // listDir returns the visible children of the directory at rel, host entries
 // and virtual symlinks, sorted by name.
 func (w *Workspace) listDir(rel string) ([]dirListing, error) {
+	w.maybeRefreshMeta(false)
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	out, _, err := w.listDirLocked(rel)
@@ -514,6 +516,7 @@ func (w *Workspace) classifyDirEntryLocked(pin *dirPin, rel, hostDir string, dir
 // ListEntries returns the sorted workspace-relative paths of all files,
 // directories, and .gvx_meta symlinks inside the workspace (excluding .gvx_meta).
 func (w *Workspace) ListEntries() ([]string, error) {
+	w.maybeRefreshMeta(true)
 	var out []string
 	var walk func(rel string) error
 	walk = func(rel string) error {
@@ -548,6 +551,7 @@ type DirChild struct {
 
 // ReadDirChildren returns the sorted direct children of the directory at relPath.
 func (w *Workspace) ReadDirChildren(relPath string) ([]DirChild, error) {
+	w.maybeRefreshMeta(true)
 	cleanRel, err := CleanRelativePath(relPath)
 	if err != nil {
 		return nil, err

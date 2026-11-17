@@ -148,7 +148,13 @@ func TestListingReportsTypeAndInodeOfEveryEntry(t *testing.T) {
 	if err := unix.Mkfifo(e.host("pipe"), 0o600); err != nil {
 		t.Skipf("host cannot create a FIFO: %v", err)
 	}
-	want := map[string]hostKind{"sub": hostKindDir, "file": hostKindRegular, "hostlink": hostKindSymlink, "pipe": hostKindOther}
+	want := map[string]hostKind{
+		"sub":            hostKindDir,
+		"file":           hostKindRegular,
+		"hostlink":       hostKindSymlink,
+		"pipe":           hostKindOther,
+		MetaLockFileName: hostKindRegular,
+	}
 	for how, list := range map[string]func() ([]hostDirEntry, error){
 		"by path":   func() ([]hostDirEntry, error) { return e.ws.host.readDir(".") },
 		"by handle": func() ([]hostDirEntry, error) { return e.ws.host.readDirAt(e.ws.host.rootDir()) },

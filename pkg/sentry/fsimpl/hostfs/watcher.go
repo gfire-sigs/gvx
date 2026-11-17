@@ -760,6 +760,9 @@ func (e *watchEntry) scanHost() scanResult {
 		return res
 	}
 	dirRel := e.dirPath()
+	if dirRel == "." {
+		e.ws.maybeRefreshMeta(true)
+	}
 	dirInfo, names, infos, err := e.readEntries(dirRel)
 	if err != nil {
 		res.err = err

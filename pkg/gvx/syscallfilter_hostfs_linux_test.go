@@ -59,3 +59,59 @@ func TestEmbedderRulesAllowOpenat2ForHostDirsOnly(t *testing.T) {
 		t.Error("embedderRules with hostDirs=false allows openat2")
 	}
 }
+
+// TestEmbedderRulesAllowFlockOperationsForHostDirs verifies that hostDirs=true
+// allows flock(LOCK_SH, LOCK_EX, LOCK_SH|LOCK_NB, LOCK_EX|LOCK_NB, LOCK_UN) on
+// non-negative descriptors only, volumes-only allows LOCK_UN only, and neither
+// allows flock at all when both hostDirs and volumes are false.
+func TestEmbedderRulesAllowFlockOperationsForHostDirs(t *testing.T) {
+	none := embedderRules(Config{}, false, false)
+	if none.Has(unix.SYS_FLOCK) {
+		t.Fatal("embedderRules(hostDirs=false, volumes=false) must not allow flock")
+	}
+
+	volOnly := embedderRules(Config{}, false, true)
+	if !volOnly.Has(unix.SYS_FLOCK) {
+		t.Fatal("embedderRules(hostDirs=false, volumes=true) lacks flock(LOCK_UN)")
+	}
+	volOps := flockArgReprs(t, volOnly, 1)
+	if len(volOps) != 1 || !containsRepr(volOps, seccomp.EqualTo(unix.LOCK_UN)) {
+		t.Fatalf("volumes-only flock op matchers = %v, want only LOCK_UN", volOps)
+	}
+
+	for _, both := range []bool{false, true} {
+		rules := embedderRules(Config{}, true, both)
+		if !rules.Has(unix.SYS_FLOCK) {
+			t.Fatalf("embedderRules(hostDirs=true, volumes=%v) lacks flock", both)
+		}
+		for _, r := range flockArgReprs(t, rules, 0) {
+			if r != reprOf(seccomp.NonNegativeFD{}) {
+				t.Fatalf("flock fd matcher = %q, want NonNegativeFD", r)
+			}
+		}
+		gotOps := flockArgReprs(t, rules, 1)
+		for _, wantOp := range []uintptr{
+			unix.LOCK_SH,
+			unix.LOCK_EX,
+			unix.LOCK_SH | unix.LOCK_NB,
+			unix.LOCK_EX | unix.LOCK_NB,
+			unix.LOCK_UN,
+		} {
+			if !containsRepr(gotOps, seccomp.EqualTo(wantOp)) {
+				t.Errorf("embedderRules(hostDirs=true, volumes=%v) lacks flock op %#x; got %v", both, wantOp, gotOps)
+			}
+		}
+	}
+}
+
+func flockArgReprs(t *testing.T, rules seccomp.SyscallRules, arg int) []string {
+	t.Helper()
+	var out []string
+	if err := rules.ForSingleArgument(unix.SYS_FLOCK, arg, func(vm seccomp.ValueMatcher) error {
+		out = append(out, reprOf(vm))
+		return nil
+	}); err != nil {
+		t.Fatalf("ForSingleArgument(SYS_FLOCK, %d): %v", arg, err)
+	}
+	return out
+}

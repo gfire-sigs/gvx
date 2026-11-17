@@ -187,8 +187,23 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.EqualTo(0),
 		})
+		// hostfs coordinates concurrent .gvx_meta reads and writes across
+		// sandboxes with advisory flock locks on the pre-opened .gvx_meta.lock
+		// descriptor.
+		for _, op := range []uintptr{
+			unix.LOCK_SH,
+			unix.LOCK_EX,
+			unix.LOCK_SH | unix.LOCK_NB,
+			unix.LOCK_EX | unix.LOCK_NB,
+			unix.LOCK_UN,
+		} {
+			rules.Add(unix.SYS_FLOCK, seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(op),
+			})
+		}
 	}
-	if volumes {
+	if volumes && !hostDirs {
 		// An ext4lite volume holds an exclusive lock on its image file. The
 		// close of the volume releases the lock with flock(LOCK_UN) before it
 		// closes the descriptor. The rule allows no other operation.
