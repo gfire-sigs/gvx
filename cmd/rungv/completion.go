@@ -65,7 +65,7 @@ _rungv_completions() {
 
     local top_cmds="run pull images rmi inspect tag save load login logout image volume system info checkpoint restore version license completion help"
     local image_cmds="ls list pull rm remove rmi inspect tag save load prune"
-    local volume_cmds="create ls list inspect rm remove prune"
+    local volume_cmds="create ls list inspect compact rm remove prune"
     local system_cmds="info df prune"
     local shells="bash zsh fish powershell"
 
@@ -151,7 +151,7 @@ _rungv() {
         'help:Print command usage'
     )
     image_cmds=(ls list pull rm remove rmi inspect tag save load prune)
-    volume_cmds=(create ls list inspect rm remove prune)
+    volume_cmds=(create ls list inspect compact rm remove prune)
     system_cmds=(info df prune)
     shells=(bash zsh fish powershell)
 
@@ -227,7 +227,7 @@ complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a lice
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a completion -d "Generate shell completion script"
 
 complete -c rungv -n "__fish_seen_subcommand_from image; and not __fish_seen_subcommand_from ls list pull rm remove rmi inspect tag save load prune" -a "ls pull rm inspect tag save load prune"
-complete -c rungv -n "__fish_seen_subcommand_from volume; and not __fish_seen_subcommand_from create ls list inspect rm remove prune" -a "create ls inspect rm prune"
+complete -c rungv -n "__fish_seen_subcommand_from volume; and not __fish_seen_subcommand_from create ls list inspect compact rm remove prune" -a "create ls inspect compact rm prune"
 complete -c rungv -n "__fish_seen_subcommand_from system; and not __fish_seen_subcommand_from info df prune" -a "info df prune"
 complete -c rungv -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
 `
@@ -249,7 +249,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
     $sub = $tokens[1]
     $candidates = switch ($sub) {
         'image'      { @('ls','list','pull','rm','remove','rmi','inspect','tag','save','load','prune') }
-        'volume'     { @('create','ls','list','inspect','rm','remove','prune') }
+        'volume'     { @('create','ls','list','inspect','compact','rm','remove','prune') }
         'system'     { @('info','df','prune') }
         'completion' { @('bash','zsh','fish','powershell') }
         default      { @() }

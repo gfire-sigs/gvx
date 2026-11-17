@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,7 +34,7 @@ import (
 var (
 	// ErrVolumeNotFound reports that a named volume does not exist in the local store.
 	ErrVolumeNotFound = errors.New("gvx: volume not found")
-	// ErrVolumeInUse reports that another sandbox holds the exclusive lock on a volume.
+	// ErrVolumeInUse reports that another sandbox holds a shared or exclusive lock on a volume.
 	ErrVolumeInUse = ext4lite.ErrVolumeInUse
 )
 
@@ -41,12 +42,14 @@ const ext4VolumeSuffix = ".ext4"
 
 // VolumeInfo describes one named volume in the local gvx volume store.
 type VolumeInfo struct {
-	Name       string      `json:"Name"`
-	Driver     MountDriver `json:"Driver"`
-	Mountpoint string      `json:"Mountpoint"`
-	CreatedAt  time.Time   `json:"CreatedAt"`
-	SizeBytes  int64       `json:"SizeBytes"`
-	InUse      bool        `json:"InUse"`
+	Name           string      `json:"Name"`
+	Driver         MountDriver `json:"Driver"`
+	Mountpoint     string      `json:"Mountpoint"`
+	CreatedAt      time.Time   `json:"CreatedAt"`
+	SizeBytes      int64       `json:"SizeBytes"`
+	AllocatedBytes int64       `json:"AllocatedBytes"`
+	InUse          bool        `json:"InUse"`
+	LockMode       string      `json:"LockMode,omitempty"`
 }
 
 // VolumePruneReport summarizes volumes deleted by PruneVolumes.
@@ -254,6 +257,50 @@ func RemoveVolume(cacheDir, name string) error {
 	return nil
 }
 
+// CompactVolume opens an existing unlocked ext4lite volume exclusively, replays
+// any uncommitted journal state, punches interior free blocks when supported,
+// compacts and truncates trailing groups on Close, and returns updated metadata.
+func CompactVolume(cacheDir, name string) (VolumeInfo, error) {
+	vi, err := InspectVolume(cacheDir, name)
+	if err != nil {
+		return VolumeInfo{}, err
+	}
+	if vi.Driver != DriverExt4lite {
+		return VolumeInfo{}, fmt.Errorf("%w: volume %q uses driver %q (compact requires %q)", ErrInvalidConfig, vi.Name, vi.Driver, DriverExt4lite)
+	}
+	if vi.InUse {
+		return VolumeInfo{}, fmt.Errorf("gvx: volume %q is in use: %w", vi.Name, ErrVolumeInUse)
+	}
+	f, err := os.OpenFile(vi.Mountpoint, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return VolumeInfo{}, fmt.Errorf("%w: %s", ErrVolumeNotFound, vi.Name)
+		}
+		return VolumeInfo{}, fmt.Errorf("gvx: open volume %q for compact: %w", vi.Name, err)
+	}
+	vol, err := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{ReadOnly: false})
+	if err != nil {
+		if errors.Is(err, ErrVolumeInUse) {
+			return VolumeInfo{}, fmt.Errorf("gvx: volume %q is in use: %w", vi.Name, ErrVolumeInUse)
+		}
+		return VolumeInfo{}, fmt.Errorf("gvx: mount volume %q for compact: %w", vi.Name, err)
+	}
+	syncErr := vol.Sync()
+	var trimErr error
+	if syncErr == nil {
+		if trimmer, ok := any(vol).(interface {
+			Trim(start, length, minlen uint64) (uint64, error)
+		}); ok {
+			_, trimErr = trimmer.Trim(0, math.MaxUint64, 0)
+		}
+	}
+	closeErr := vol.Close()
+	if err := errors.Join(syncErr, trimErr, closeErr); err != nil {
+		return VolumeInfo{}, fmt.Errorf("gvx: compact volume %q: %w", vi.Name, err)
+	}
+	return InspectVolume(cacheDir, vi.Name)
+}
+
 // PruneVolumes removes all local volumes that are not currently locked by a
 // running sandbox.
 func PruneVolumes(cacheDir string) (VolumePruneReport, error) {
@@ -275,12 +322,12 @@ func PruneVolumes(cacheDir string) (VolumePruneReport, error) {
 			continue
 		}
 		report.Deleted = append(report.Deleted, v.Name)
-		report.SpaceReclaimed += v.SizeBytes
+		report.SpaceReclaimed += v.AllocatedBytes
 	}
 	return report, errors.Join(errs...)
 }
 
-// ComputeVolumeDiskUsage summarizes local volume counts and byte sizes.
+// ComputeVolumeDiskUsage summarizes local volume counts and physical allocated bytes.
 func ComputeVolumeDiskUsage(cacheDir string) (VolumeDiskUsage, error) {
 	vols, err := ListVolumes(cacheDir)
 	if err != nil {
@@ -289,11 +336,11 @@ func ComputeVolumeDiskUsage(cacheDir string) (VolumeDiskUsage, error) {
 	var du VolumeDiskUsage
 	du.Total = len(vols)
 	for _, v := range vols {
-		du.TotalBytes += v.SizeBytes
+		du.TotalBytes += v.AllocatedBytes
 		if v.InUse {
 			du.Active++
 		} else {
-			du.ReclaimableBytes += v.SizeBytes
+			du.ReclaimableBytes += v.AllocatedBytes
 		}
 	}
 	return du, nil
@@ -304,17 +351,19 @@ func buildExt4VolumeInfo(name, imgPath string, info os.FileInfo) (VolumeInfo, er
 	if err == nil {
 		imgPath = abs
 	}
-	inUse, err := ext4lite.ProbeVolumeInUse(imgPath)
+	lockMode, err := probeVolumeLockMode(imgPath)
 	if err != nil {
 		return VolumeInfo{}, fmt.Errorf("gvx: probe volume %q lock: %w", name, err)
 	}
 	return VolumeInfo{
-		Name:       name,
-		Driver:     DriverExt4lite,
-		Mountpoint: imgPath,
-		CreatedAt:  info.ModTime().UTC(),
-		SizeBytes:  info.Size(),
-		InUse:      inUse,
+		Name:           name,
+		Driver:         DriverExt4lite,
+		Mountpoint:     imgPath,
+		CreatedAt:      info.ModTime().UTC(),
+		SizeBytes:      info.Size(),
+		AllocatedBytes: fileAllocatedBytes(imgPath, info),
+		InUse:          lockMode != "none",
+		LockMode:       lockMode,
 	}, nil
 }
 
@@ -322,25 +371,29 @@ func buildHostfsVolumeInfo(name, dirPath string, info os.FileInfo) VolumeInfo {
 	if abs, err := filepath.Abs(dirPath); err == nil {
 		dirPath = abs
 	}
+	logical, allocated := directoryUsageBytes(dirPath)
 	return VolumeInfo{
-		Name:       name,
-		Driver:     DriverHostfs,
-		Mountpoint: dirPath,
-		CreatedAt:  info.ModTime().UTC(),
-		SizeBytes:  directorySizeBytes(dirPath),
+		Name:           name,
+		Driver:         DriverHostfs,
+		Mountpoint:     dirPath,
+		CreatedAt:      info.ModTime().UTC(),
+		SizeBytes:      logical,
+		AllocatedBytes: allocated,
+		InUse:          false,
+		LockMode:       "none",
 	}
 }
 
-func directorySizeBytes(root string) int64 {
-	var total int64
-	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+func directoryUsageBytes(root string) (logical, allocated int64) {
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		if fi, statErr := d.Info(); statErr == nil && fi.Mode().IsRegular() {
-			total += fi.Size()
+			logical += fi.Size()
+			allocated += fileAllocatedBytes(p, fi)
 		}
 		return nil
 	})
-	return total
+	return logical, allocated
 }

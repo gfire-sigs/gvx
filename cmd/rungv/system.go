@@ -278,9 +278,9 @@ func writeVerboseSystemDF(w io.Writer, cache *oci.LayerCache, cacheDir string) e
 	}
 	_, _ = fmt.Fprintln(w, "\nLocal Volumes space usage:")
 	vtw := tabwriter.NewWriter(w, 10, 1, 3, ' ', 0)
-	_, _ = fmt.Fprintln(vtw, "VOLUME NAME\tDRIVER\tIN USE\tSIZE")
+	_, _ = fmt.Fprintln(vtw, "VOLUME NAME\tDRIVER\tIN USE\tALLOCATED\tSIZE")
 	for _, v := range vols {
-		_, _ = fmt.Fprintf(vtw, "%s\t%s\t%t\t%s\n", v.Name, v.Driver, v.InUse, humanSize(v.SizeBytes))
+		_, _ = fmt.Fprintf(vtw, "%s\t%s\t%t\t%s\t%s\n", v.Name, v.Driver, v.InUse, humanSize(v.AllocatedBytes), humanSize(v.SizeBytes))
 	}
 	return vtw.Flush()
 }

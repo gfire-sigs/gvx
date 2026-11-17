@@ -305,3 +305,62 @@ func TestRootfsVolumeWithVolumeAndSystemCLICommands(t *testing.T) {
 	}
 	runCLIArgs(t, nil, "volume", "rm", "rootcli", "-cache-dir", env.cacheDir).mustSucceed(t, "volume rm after exit")
 }
+
+func TestVolumeCompactAndAllocatedBytesCLI(t *testing.T) {
+	// Property: `rungv volume ls --format json` and `rungv volume inspect` emit SizeBytes, AllocatedBytes,
+	// InUse, and LockMode without breaking `-q`, and `rungv volume compact` compacts unlocked ext4lite volumes
+	// while failing with exit 1 on missing/in-use volumes and exit 2 on missing arguments.
+	env := newCLIEnv(t)
+
+	runCLIArgs(t, nil, "volume", "create", "compactme", "-cache-dir", env.cacheDir).mustSucceed(t, "volume create compactme")
+	viBefore, err := gvx.InspectVolume(env.cacheDir, "compactme")
+	if err != nil {
+		t.Fatalf("InspectVolume(compactme): %v", err)
+	}
+	initialSize := viBefore.SizeBytes
+	if err := os.Truncate(viBefore.Mountpoint, initialSize+(48<<20)); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	lsJSON := runCLIArgs(t, nil, "volume", "ls", "--format", "json", "-cache-dir", env.cacheDir).mustSucceed(t, "volume ls --format json")
+	var row struct {
+		Name           string `json:"Name"`
+		Driver         string `json:"Driver"`
+		SizeBytes      int64  `json:"SizeBytes"`
+		AllocatedBytes int64  `json:"AllocatedBytes"`
+		InUse          bool   `json:"InUse"`
+		LockMode       string `json:"LockMode"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(lsJSON.stdout)), &row); err != nil {
+		t.Fatalf("unmarshal volume ls json %q: %v", lsJSON.stdout, err)
+	}
+	if row.Name != "compactme" || row.SizeBytes != initialSize+(48<<20) || row.AllocatedBytes <= 0 || row.AllocatedBytes >= row.SizeBytes/2 || row.InUse || row.LockMode != "none" {
+		t.Fatalf("volume ls json row = %+v", row)
+	}
+
+	lsTable := runCLIArgs(t, nil, "volume", "ls", "-cache-dir", env.cacheDir).mustSucceed(t, "volume ls table")
+	if !strings.Contains(lsTable.stdout, "ALLOCATED") || !strings.Contains(lsTable.stdout, "compactme") {
+		t.Fatalf("volume ls table = %q, want ALLOCATED column and compactme", lsTable.stdout)
+	}
+
+	if noArgs := runCLIArgs(t, nil, "volume", "compact", "-cache-dir", env.cacheDir); noArgs.code != 2 {
+		t.Fatalf("volume compact with no args exited %d, want 2", noArgs.code)
+	}
+	if missing := runCLIArgs(t, nil, "volume", "compact", "missingvol", "-cache-dir", env.cacheDir); missing.code != 1 || !strings.Contains(missing.stderr, "no such volume") {
+		t.Fatalf("volume compact missing = (%d, %q), want exit 1 mentioning no such volume", missing.code, missing.stderr)
+	}
+
+	compactedOut := runCLIArgs(t, nil, "volume", "compact", "compactme", "-cache-dir", env.cacheDir).mustSucceed(t, "volume compact compactme")
+	if strings.TrimSpace(compactedOut.stdout) != "compactme" {
+		t.Fatalf("volume compact stdout = %q, want compactme", compactedOut.stdout)
+	}
+
+	inspJSON := runCLIArgs(t, nil, "volume", "inspect", "compactme", "-cache-dir", env.cacheDir).mustSucceed(t, "volume inspect compactme")
+	var items []gvx.VolumeInfo
+	if err := json.Unmarshal([]byte(inspJSON.stdout), &items); err != nil || len(items) != 1 {
+		t.Fatalf("volume inspect json = %q, err = %v", inspJSON.stdout, err)
+	}
+	if items[0].SizeBytes != initialSize || items[0].LockMode != "none" || items[0].InUse {
+		t.Fatalf("inspected after compact = %+v, want SizeBytes=%d LockMode=none InUse=false", items[0], initialSize)
+	}
+}
