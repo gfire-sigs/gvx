@@ -58,8 +58,8 @@
     }
   },
   {
-    "timestamp": "2026-11-17T03:30:14Z",
-    "commit": "93f373219f018919a73fff5c3e542fffa76d514b",
+    "timestamp": "2026-11-17T03:39:54Z",
+    "commit": "a9067635ce21cda2a1e2f12e68ee7d127e563dc3",
     "branch": "main",
     "os": "linux",
     "arch": "amd64",
@@ -67,57 +67,57 @@
     "failures": 0,
     "metrics": {
       "fork_exec_true": {
-        "median_ns_per_op": 395412,
-        "median_cpu_pct": 125.06,
+        "median_ns_per_op": 428243,
+        "median_cpu_pct": 125.87,
         "runs": 3
       },
       "fork_wait": {
-        "median_ns_per_op": 1809837,
-        "median_cpu_pct": 185.15,
+        "median_ns_per_op": 2479459,
+        "median_cpu_pct": 175.17,
         "runs": 3
       },
       "futex_pingpong": {
-        "median_ns_per_op": 4877,
-        "median_cpu_pct": 108.09,
+        "median_ns_per_op": 5378,
+        "median_cpu_pct": 109.19,
         "runs": 3
       },
       "getpid": {
-        "median_ns_per_op": 2747,
-        "median_cpu_pct": 102.57,
+        "median_ns_per_op": 2926,
+        "median_cpu_pct": 102.75,
         "runs": 3
       },
       "host_close": {
-        "median_ns_per_op": 31547,
+        "median_ns_per_op": 26166,
         "runs": 5
       },
       "host_new": {
-        "median_ns_per_op": 1686685,
+        "median_ns_per_op": 1728178,
         "runs": 5
       },
       "host_run_exit": {
-        "median_ns_per_op": 828204,
+        "median_ns_per_op": 1460730,
         "runs": 5
       },
       "open_close": {
-        "median_ns_per_op": 8684,
-        "median_cpu_pct": 111.87,
+        "median_ns_per_op": 8818,
+        "median_cpu_pct": 111.59,
         "runs": 3
       },
       "pipe_pingpong": {
-        "median_ns_per_op": 14564,
-        "median_cpu_pct": 106.94,
+        "median_ns_per_op": 15426,
+        "median_cpu_pct": 116.99,
         "runs": 3
       },
       "shm_sparse_idle": {
-        "median_ns_per_op": 2000387411,
-        "median_cpu_pct": 0.2,
+        "median_ns_per_op": 2000520309,
+        "median_cpu_pct": 0.23,
         "runs": 3
       }
     }
   },
   {
-    "timestamp": "2026-11-17T03:30:14Z",
-    "commit": "93f373219f018919a73fff5c3e542fffa76d514b",
+    "timestamp": "2026-11-17T03:39:54Z",
+    "commit": "a9067635ce21cda2a1e2f12e68ee7d127e563dc3",
     "branch": "main",
     "os": "linux",
     "arch": "arm64",
@@ -125,57 +125,57 @@
     "failures": 0,
     "metrics": {
       "fork_exec_true": {
-        "median_ns_per_op": 676821,
-        "median_cpu_pct": 115.3,
+        "median_ns_per_op": 737057,
+        "median_cpu_pct": 116.6,
         "runs": 3
       },
       "fork_wait": {
-        "median_ns_per_op": 1930301,
-        "median_cpu_pct": 179.4,
+        "median_ns_per_op": 1963929,
+        "median_cpu_pct": 178.61,
         "runs": 3
       },
       "futex_pingpong": {
-        "median_ns_per_op": 6358,
-        "median_cpu_pct": 105.73,
+        "median_ns_per_op": 6887,
+        "median_cpu_pct": 106.91,
         "runs": 3
       },
       "getpid": {
-        "median_ns_per_op": 3187,
-        "median_cpu_pct": 101.68,
+        "median_ns_per_op": 3241,
+        "median_cpu_pct": 101.83,
         "runs": 3
       },
       "host_close": {
-        "median_ns_per_op": 20521,
+        "median_ns_per_op": 33465,
         "runs": 5
       },
       "host_new": {
-        "median_ns_per_op": 1849324,
+        "median_ns_per_op": 62275146,
         "runs": 5
       },
       "host_run_exit": {
-        "median_ns_per_op": 915782,
+        "median_ns_per_op": 1267744,
         "runs": 5
       },
       "open_close": {
-        "median_ns_per_op": 10870,
-        "median_cpu_pct": 109.64,
+        "median_ns_per_op": 11050,
+        "median_cpu_pct": 109.21,
         "runs": 3
       },
       "pipe_pingpong": {
-        "median_ns_per_op": 16967,
-        "median_cpu_pct": 110.19,
+        "median_ns_per_op": 18715,
+        "median_cpu_pct": 111.25,
         "runs": 3
       },
       "shm_sparse_idle": {
-        "median_ns_per_op": 2000683996,
-        "median_cpu_pct": 0.29,
+        "median_ns_per_op": 2000368414,
+        "median_cpu_pct": 0.3,
         "runs": 3
       }
     }
   },
   {
-    "timestamp": "2026-11-17T03:30:14Z",
-    "commit": "93f373219f018919a73fff5c3e542fffa76d514b",
+    "timestamp": "2026-11-17T03:39:54Z",
+    "commit": "a9067635ce21cda2a1e2f12e68ee7d127e563dc3",
     "branch": "main",
     "os": "windows",
     "arch": "amd64",
@@ -183,57 +183,57 @@
     "failures": 0,
     "metrics": {
       "fork_exec_true": {
-        "median_ns_per_op": 7120943,
-        "median_cpu_pct": 62.91,
+        "median_ns_per_op": 7244510,
+        "median_cpu_pct": 64.76,
         "runs": 3
       },
       "fork_wait": {
-        "median_ns_per_op": 40293535,
-        "median_cpu_pct": 31.07,
+        "median_ns_per_op": 10479660,
+        "median_cpu_pct": 112.43,
         "runs": 3
       },
       "futex_pingpong": {
-        "median_ns_per_op": 71527,
-        "median_cpu_pct": 125.93,
+        "median_ns_per_op": 70743,
+        "median_cpu_pct": 109.08,
         "runs": 3
       },
       "getpid": {
-        "median_ns_per_op": 572,
-        "median_cpu_pct": 99.8,
+        "median_ns_per_op": 567,
+        "median_cpu_pct": 93.25,
         "runs": 3
       },
       "host_close": {
-        "median_ns_per_op": 14930000,
+        "median_ns_per_op": 15853900,
         "runs": 5
       },
       "host_new": {
-        "median_ns_per_op": 52460400,
+        "median_ns_per_op": 52280400,
         "runs": 5
       },
       "host_run_exit": {
-        "median_ns_per_op": 11306700,
+        "median_ns_per_op": 13312300,
         "runs": 5
       },
       "open_close": {
-        "median_ns_per_op": 32473,
-        "median_cpu_pct": 25.91,
+        "median_ns_per_op": 24557,
+        "median_cpu_pct": 25.56,
         "runs": 3
       },
       "pipe_pingpong": {
-        "median_ns_per_op": 84593,
-        "median_cpu_pct": 110.73,
+        "median_ns_per_op": 80666,
+        "median_cpu_pct": 111.32,
         "runs": 3
       },
       "shm_sparse_idle": {
-        "median_ns_per_op": 2001887188,
-        "median_cpu_pct": 1.54,
+        "median_ns_per_op": 2002275336,
+        "median_cpu_pct": 3.85,
         "runs": 3
       }
     }
   },
   {
-    "timestamp": "2026-11-17T03:30:14Z",
-    "commit": "93f373219f018919a73fff5c3e542fffa76d514b",
+    "timestamp": "2026-11-17T03:39:54Z",
+    "commit": "a9067635ce21cda2a1e2f12e68ee7d127e563dc3",
     "branch": "main",
     "os": "windows",
     "arch": "amd64",
@@ -241,56 +241,56 @@
     "failures": 0,
     "metrics": {
       "fork_exec_true": {
-        "median_ns_per_op": 1696327,
-        "median_cpu_pct": 140.15,
+        "median_ns_per_op": 1722211,
+        "median_cpu_pct": 143.76,
         "runs": 3
       },
       "fork_wait": {
-        "median_ns_per_op": 923418,
-        "median_cpu_pct": 269.15,
+        "median_ns_per_op": 969360,
+        "median_cpu_pct": 244.78,
         "runs": 3
       },
       "futex_pingpong": {
-        "median_ns_per_op": 149082,
-        "median_cpu_pct": 210.88,
+        "median_ns_per_op": 145679,
+        "median_cpu_pct": 187.83,
         "runs": 3
       },
       "getpid": {
-        "median_ns_per_op": 16330,
-        "median_cpu_pct": 103.75,
+        "median_ns_per_op": 16504,
+        "median_cpu_pct": 111.44,
         "runs": 3
       },
       "host_close": {
-        "median_ns_per_op": 1025800,
+        "median_ns_per_op": 1158000,
         "runs": 5
       },
       "host_new": {
-        "median_ns_per_op": 8604800,
+        "median_ns_per_op": 8713900,
         "runs": 5
       },
       "host_run_exit": {
-        "median_ns_per_op": 2956800,
+        "median_ns_per_op": 2389900,
         "runs": 5
       },
       "open_close": {
-        "median_ns_per_op": 46199,
-        "median_cpu_pct": 124.58,
+        "median_ns_per_op": 45184,
+        "median_cpu_pct": 140.25,
         "runs": 3
       },
       "pipe_pingpong": {
-        "median_ns_per_op": 157455,
-        "median_cpu_pct": 165.55,
+        "median_ns_per_op": 154142,
+        "median_cpu_pct": 175.48,
         "runs": 3
       },
       "shm_sparse_idle": {
-        "median_ns_per_op": 2001321600,
+        "median_ns_per_op": 2001259498,
         "runs": 3
       }
     }
   },
   {
-    "timestamp": "2026-11-17T03:30:14Z",
-    "commit": "93f373219f018919a73fff5c3e542fffa76d514b",
+    "timestamp": "2026-11-17T03:39:54Z",
+    "commit": "a9067635ce21cda2a1e2f12e68ee7d127e563dc3",
     "branch": "main",
     "os": "windows",
     "arch": "arm64",
@@ -298,49 +298,49 @@
     "failures": 0,
     "metrics": {
       "fork_exec_true": {
-        "median_ns_per_op": 21011433,
-        "median_cpu_pct": 15.55,
+        "median_ns_per_op": 16346897,
+        "median_cpu_pct": 20.98,
         "runs": 3
       },
       "fork_wait": {
-        "median_ns_per_op": 13837925,
-        "median_cpu_pct": 35.96,
+        "median_ns_per_op": 13431406,
+        "median_cpu_pct": 33.7,
         "runs": 3
       },
       "futex_pingpong": {
-        "median_ns_per_op": 26706,
-        "median_cpu_pct": 121.32,
+        "median_ns_per_op": 28747,
+        "median_cpu_pct": 99.03,
         "runs": 3
       },
       "getpid": {
-        "median_ns_per_op": 934,
-        "median_cpu_pct": 85.84,
+        "median_ns_per_op": 966,
+        "median_cpu_pct": 79.92,
         "runs": 3
       },
       "host_close": {
-        "median_ns_per_op": 51797800,
+        "median_ns_per_op": 29980600,
         "runs": 5
       },
       "host_new": {
-        "median_ns_per_op": 98788600,
+        "median_ns_per_op": 83023400,
         "runs": 5
       },
       "host_run_exit": {
-        "median_ns_per_op": 30116400,
+        "median_ns_per_op": 24843800,
         "runs": 5
       },
       "open_close": {
-        "median_ns_per_op": 5969,
-        "median_cpu_pct": 100.4,
+        "median_ns_per_op": 5935,
+        "median_cpu_pct": 100.2,
         "runs": 3
       },
       "pipe_pingpong": {
-        "median_ns_per_op": 32194,
-        "median_cpu_pct": 106.09,
+        "median_ns_per_op": 36498,
+        "median_cpu_pct": 95.62,
         "runs": 3
       },
       "shm_sparse_idle": {
-        "median_ns_per_op": 2001154357,
+        "median_ns_per_op": 2001360495,
         "median_cpu_pct": 1.56,
         "runs": 3
       }
