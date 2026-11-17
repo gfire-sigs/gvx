@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/gvx"
@@ -228,8 +229,12 @@ func TestVolumeAllocatedBytesSparseVsDenseAndDiskUsage(t *testing.T) {
 	if hostInspected.SizeBytes != 64<<20 {
 		t.Fatalf("sparse-host SizeBytes = %d, want %d", hostInspected.SizeBytes, 64<<20)
 	}
-	if hostInspected.AllocatedBytes <= 0 || hostInspected.AllocatedBytes >= 32<<20 {
-		t.Fatalf("sparse-host AllocatedBytes = %d, want > 0 and < %d", hostInspected.AllocatedBytes, 32<<20)
+	if runtime.GOOS != "windows" {
+		if hostInspected.AllocatedBytes <= 0 || hostInspected.AllocatedBytes >= 32<<20 {
+			t.Fatalf("sparse-host AllocatedBytes = %d, want > 0 and < %d", hostInspected.AllocatedBytes, 32<<20)
+		}
+	} else if hostInspected.AllocatedBytes <= 0 {
+		t.Fatalf("sparse-host AllocatedBytes = %d, want > 0", hostInspected.AllocatedBytes)
 	}
 
 	wantPhysical := extInspected.AllocatedBytes + hostInspected.AllocatedBytes

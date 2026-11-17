@@ -14,11 +14,11 @@
 
 //go:build darwin
 
-package hostfs
+package gvx
 
 import "z.gfire.dev/gvx/pkg/hostlockdown"
 
-func applyTestHostLockdown(dir string, readOnly bool) (hostlockdown.Status, error) {
+func applyHostfsTestLockdown(dir string, readOnly bool) (hostlockdown.Status, error) {
 	return hostlockdown.Apply(hostlockdown.Options{
 		Mounts: []hostlockdown.HostMount{
 			{Path: dir, ReadOnly: readOnly},

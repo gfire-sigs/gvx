@@ -288,9 +288,19 @@ func (w *Workspace) openMetaLock() error {
 		w.metaLock.Store(f)
 		return nil
 	}
-	f, err := w.rawHost.openChildAt(rootDir, MetaLockFileName, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return fmt.Errorf("hostfs: open %s: %w", MetaLockFileName, err)
+	var (
+		f   *os.File
+		err error
+	)
+	for attempt := range 4 {
+		f, err = w.rawHost.openChildAt(rootDir, MetaLockFileName, os.O_RDWR|os.O_CREATE, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrNotExist) || attempt == 3 {
+			return fmt.Errorf("hostfs: open %s: %w", MetaLockFileName, err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	w.metaLock.Store(f)
 	return nil

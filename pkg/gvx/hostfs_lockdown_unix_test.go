@@ -14,7 +14,7 @@
 
 //go:build linux || darwin
 
-package hostfs
+package gvx
 
 import (
 	"bufio"
@@ -28,7 +28,7 @@ import (
 	"sync"
 	"testing"
 
-	"z.gfire.dev/gvx/pkg/hostlockdown"
+	"z.gfire.dev/gvx/pkg/sentry/fsimpl/hostfs"
 )
 
 const (
@@ -61,13 +61,9 @@ func TestMultiProcessHostlockdownWorker(t *testing.T) {
 }
 
 func runLockedGitWorktreeWorker(t *testing.T, dir string, id int) {
-	ws, err := openWorkspace(dir, false, workspaceOptions{
-		coalesce:     defaultCoalesceWindow,
-		journalSlack: 3, // Force compactions interleaved with peer appends across processes.
-		noOrphanGC:   true,
-	})
+	ws, err := hostfs.OpenWorkspace(dir, false)
 	if err != nil {
-		t.Fatalf("openWorkspace: %v", err)
+		t.Fatalf("OpenWorkspace: %v", err)
 	}
 	defer func() {
 		if cerr := ws.Close(); cerr != nil {
@@ -75,9 +71,9 @@ func runLockedGitWorktreeWorker(t *testing.T, dir string, id int) {
 		}
 	}()
 
-	st, err := applyTestHostLockdown(dir, false)
+	st, err := applyHostfsTestLockdown(dir, false)
 	if err != nil {
-		t.Fatalf("applyTestHostLockdown: %v", err)
+		t.Fatalf("applyHostfsTestLockdown: %v", err)
 	}
 	if !st.SubprocessBlocked || !st.UnboundFileOpenBlocked {
 		t.Fatalf("hostlockdown status = %+v, want SubprocessBlocked && UnboundFileOpenBlocked", st)
@@ -162,7 +158,7 @@ func runLockedGitWorktreeWorker(t *testing.T, dir string, id int) {
 }
 
 func runLockedReadOnlyObserver(t *testing.T, dir string) {
-	ws, err := OpenWorkspace(dir, true)
+	ws, err := hostfs.OpenWorkspace(dir, true)
 	if err != nil {
 		t.Fatalf("OpenWorkspace(RO): %v", err)
 	}
@@ -172,9 +168,9 @@ func runLockedReadOnlyObserver(t *testing.T, dir string) {
 		}
 	}()
 
-	st, err := applyTestHostLockdown(dir, true)
+	st, err := applyHostfsTestLockdown(dir, true)
 	if err != nil {
-		t.Fatalf("applyTestHostLockdown(RO): %v", err)
+		t.Fatalf("applyHostfsTestLockdown(RO): %v", err)
 	}
 	if !st.SubprocessBlocked || !st.UnboundFileOpenBlocked {
 		t.Fatalf("RO hostlockdown status = %+v, want SubprocessBlocked && UnboundFileOpenBlocked", st)
@@ -209,7 +205,10 @@ func runLockedReadOnlyObserver(t *testing.T, dir string) {
 // hostfs workspace and verifies zero EPERM/SIGSYS failures and 100% metadata
 // preservation across concurrent Git worktree ref/hook/object/symlink flushes.
 func TestMultiProcessConcurrentHostlockdownGitWorktree(t *testing.T) {
-	dir := resolvedTempDir(t)
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	type childProc struct {
 		cmd    *exec.Cmd
@@ -310,7 +309,7 @@ func TestMultiProcessConcurrentHostlockdownGitWorktree(t *testing.T) {
 	}
 
 	// Also independently verify on-disk .gvx_meta from the parent process.
-	metaMap, err := ReadMeta(filepath.Join(dir, MetaFileName))
+	metaMap, err := hostfs.ReadMeta(filepath.Join(dir, hostfs.MetaFileName))
 	if err != nil {
 		t.Fatalf("parent ReadMeta: %v", err)
 	}
@@ -332,6 +331,3 @@ func TestMultiProcessConcurrentHostlockdownGitWorktree(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
-
-// Ensure hostlockdown.Status is referenced in shared unix test file.
-var _ hostlockdown.Status

@@ -860,6 +860,7 @@ var boundaryExceptions = []importException{
 	{sentryAPIUsers, "pkg/atomicbitops", "dentry and option words use atomic upstream types"},
 	{sentryAPIUsers, "pkg/log", "upstream logging package"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/systrap"}, "pkg/sentry/arch", "platform.Context.Switch exchanges arch.Context64 values"},
+	{[]string{"pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/arch", "vfs.FileDescriptionImpl.Ioctl accepts arch.SyscallArguments"},
 	{platformBackends, "pkg/sentry/platform/interrupt", "platform.Context.Switch callers wake a running vCPU via interrupt.Forwarder"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/hvcommon"}, "pkg/ring0/pagetables", "hardware backends build guest stage-1 and stage-2 page tables with pagetables"},
 	{[]string{"pkg/sentry/platform/whpx"}, "pkg/cpuid", "amd64 whpx sizes the guest XSAVE layout from CPUID leaf 0xD"},
