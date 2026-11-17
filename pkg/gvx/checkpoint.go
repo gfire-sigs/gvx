@@ -226,6 +226,12 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 			} else {
 				kind = "hostfs"
 			}
+		case MountOverlay:
+			if sm.upperVolume != nil {
+				kind = "overlay:ext4lite"
+			} else {
+				kind = "overlay:tmpfs"
+			}
 		}
 		out[i] = ManifestMount{
 			Type:      sm.Kind,

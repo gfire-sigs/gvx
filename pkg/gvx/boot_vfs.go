@@ -205,14 +205,18 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 // and empty work directories inside it, and returns a disconnected mount
 // rooted at upper along with whether upper already existed.
 func (s *Sandbox) prepareRootUpperOverlay(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (vfs.VirtualDentry, bool, error) {
+	return prepareExt4UpperOverlay(sctx, vfsObj, creds, s.rootVolume, rootVolumeUniqueID)
+}
+
+func prepareExt4UpperOverlay(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, vol *ext4lite.Volume, uniqueID string) (vfs.VirtualDentry, bool, error) {
 	ext4FS, ext4RootDentry, err := ext4lite.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
 		InternalData: ext4lite.InternalFilesystemOptions{
-			Volume:   s.rootVolume,
-			UniqueID: rootVolumeUniqueID,
+			Volume:   vol,
+			UniqueID: uniqueID,
 		},
 	})
 	if err != nil {
-		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: mount root volume: %w", err)
+		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: mount overlay upper volume %q: %w", uniqueID, err)
 	}
 	ext4Mnt := vfsObj.NewDisconnectedMount(ext4FS, ext4RootDentry, &vfs.MountOptions{})
 	ext4FS.DecRef(sctx)
@@ -225,17 +229,17 @@ func (s *Sandbox) prepareRootUpperOverlay(sctx gvcontext.Context, vfsObj *vfs.Vi
 	if linuxerr.Equals(linuxerr.ENOENT, err) {
 		upperExisting = false
 		if mkErr := vfsObj.MkdirAt(sctx, creds, &upperPop, &vfs.MkdirOptions{Mode: 0o755}); mkErr != nil {
-			return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: create root volume upper directory: %w", mkErr)
+			return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: create overlay upper directory: %w", mkErr)
 		}
 		upperVD, err = vfsObj.GetDentryAt(sctx, creds, &upperPop, &vfs.GetDentryOptions{CheckSearchable: true})
 	}
 	if err != nil {
-		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: open root volume upper directory: %w", err)
+		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: open overlay upper directory: %w", err)
 	}
 	defer upperVD.DecRef(sctx)
 
 	if err := ensureEmptyDir(sctx, vfsObj, creds, ext4Root, "/work"); err != nil {
-		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: prepare root volume work directory: %w", err)
+		return vfs.VirtualDentry{}, false, fmt.Errorf("gvx: prepare overlay work directory: %w", err)
 	}
 
 	upperDentry := upperVD.Dentry()
@@ -348,6 +352,36 @@ func releaseVirtualDentries(sctx gvcontext.Context, dentries []vfs.VirtualDentry
 	}
 }
 
+type sharedExt4FS struct {
+	fs   *vfs.Filesystem
+	root *vfs.Dentry
+}
+
+func releaseSharedExt4FS(sctx gvcontext.Context, m map[*ext4lite.Volume]sharedExt4FS) {
+	for _, entry := range m {
+		entry.root.DecRef(sctx)
+		entry.fs.DecRef(sctx)
+	}
+}
+
+func ensureSharedExt4ReadOnly(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, vol *ext4lite.Volume, uniqueID string, shared map[*ext4lite.Volume]sharedExt4FS) (sharedExt4FS, error) {
+	if entry, ok := shared[vol]; ok {
+		return entry, nil
+	}
+	fs, rootDentry, err := ext4lite.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
+		InternalData: ext4lite.InternalFilesystemOptions{
+			Volume:   vol,
+			UniqueID: uniqueID,
+		},
+	})
+	if err != nil {
+		return sharedExt4FS{}, err
+	}
+	entry := sharedExt4FS{fs: fs, root: rootDentry}
+	shared[vol] = entry
+	return entry, nil
+}
+
 func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
 	if err := createDefaultGuestDirs(sctx, vfsObj, creds, root, s.rootUpperExisting); err != nil {
 		return err
@@ -376,10 +410,13 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		return err
 	}
 
+	sharedRO := make(map[*ext4lite.Volume]sharedExt4FS)
+	defer releaseSharedExt4FS(sctx, sharedRO)
+
 	// s.mounts is ordered by increasing path depth, so a mount point below
 	// another mount exists in that mount before the guest mounts there.
 	for _, m := range s.mounts {
-		if err := s.mountUserMount(sctx, vfsObj, creds, root, m, mountSubfs); err != nil {
+		if err := s.mountUserMount(sctx, vfsObj, creds, root, m, mountSubfs, sharedRO); err != nil {
 			return err
 		}
 	}
@@ -460,7 +497,7 @@ func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 // mount or a hostfs volume uses the VFS2 hostfs driver. An ext4lite volume uses
 // the ext4lite driver on its open image. A tmpfs mount uses the Sentry tmpfs
 // with a size limit and mode 1777.
-func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, m sandboxMount, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
+func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, m sandboxMount, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error, sharedRO map[*ext4lite.Volume]sharedExt4FS) error {
 	dirMode := linux.FileMode(0o755)
 	if m.Kind == MountTmpfs {
 		dirMode = 0o1777
@@ -478,9 +515,25 @@ func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 			GetFilesystemOptions: vfs.GetFilesystemOptions{Data: tmpfsMountData(m.TmpfsSizeBytes)},
 		})
 	}
+	if m.Kind == MountOverlay {
+		return s.mountOverlayUserMount(sctx, vfsObj, creds, m, mountSubfs, sharedRO)
+	}
 	if m.volume != nil {
+		if m.ReadOnly {
+			entry, err := ensureSharedExt4ReadOnly(sctx, vfsObj, creds, m.volume, m.GuestPath, sharedRO)
+			if err != nil {
+				return fmt.Errorf("gvx: mount read-only volume at %s: %w", m.GuestPath, err)
+			}
+			mnt := vfsObj.NewDisconnectedMount(entry.fs, entry.root, &vfs.MountOptions{ReadOnly: true})
+			defer mnt.DecRef(sctx)
+			pop := vfs.PathOperation{Root: root, Start: root, Path: makeFPath(m.GuestPath)}
+			if err := vfsObj.ConnectMountAt(sctx, creds, mnt, &pop); err != nil {
+				return fmt.Errorf("gvx: connect read-only volume at %s: %w", m.GuestPath, err)
+			}
+			return nil
+		}
 		return mountSubfs(m.GuestPath, ext4lite.Name, &vfs.MountOptions{
-			ReadOnly: m.ReadOnly,
+			ReadOnly: false,
 			GetFilesystemOptions: vfs.GetFilesystemOptions{
 				InternalData: ext4lite.InternalFilesystemOptions{
 					Volume:   m.volume,
@@ -498,6 +551,69 @@ func (s *Sandbox) mountUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 					ContainerName: cmp.Or(s.cfg.Name, "gvx-default"),
 					Path:          m.GuestPath,
 				},
+			},
+		},
+	})
+}
+
+func (s *Sandbox) mountOverlayUserMount(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, m sandboxMount, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error, sharedRO map[*ext4lite.Volume]sharedExt4FS) error {
+	lowerEntry, err := ensureSharedExt4ReadOnly(sctx, vfsObj, creds, m.volume, overlayLowerUniqueID(m.GuestPath), sharedRO)
+	if err != nil {
+		return fmt.Errorf("gvx: mount overlay lower volume for %s: %w", m.GuestPath, err)
+	}
+	lowerMnt := vfsObj.NewDisconnectedMount(lowerEntry.fs, lowerEntry.root, &vfs.MountOptions{ReadOnly: true})
+	lowerEntry.root.IncRef()
+	lowerVD := vfs.MakeVirtualDentry(lowerMnt, lowerEntry.root)
+	defer lowerVD.DecRef(sctx)
+
+	var (
+		upperVD        vfs.VirtualDentry
+		initFromLower  bool
+	)
+	if m.upperVolume != nil {
+		var upperExisting bool
+		upperVD, upperExisting, err = prepareExt4UpperOverlay(sctx, vfsObj, creds, m.upperVolume, overlayUpperUniqueID(m.GuestPath))
+		if err != nil {
+			return err
+		}
+		initFromLower = !upperExisting
+	} else {
+		upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
+			Data: tmpfsMountData(m.TmpfsSizeBytes),
+		})
+		if err != nil {
+			return fmt.Errorf("gvx: create overlay tmpfs upper for %s: %w", m.GuestPath, err)
+		}
+		upperMnt := vfsObj.NewDisconnectedMount(upperFS, upperRootDentry, &vfs.MountOptions{})
+		upperFS.DecRef(sctx)
+		upperVD = vfs.MakeVirtualDentry(upperMnt, upperRootDentry)
+		initFromLower = true
+	}
+	defer upperVD.DecRef(sctx)
+
+	if initFromLower {
+		lowerPop := vfs.PathOperation{Root: lowerVD, Start: lowerVD, Path: makeFPath("/")}
+		if st, statErr := vfsObj.StatAt(sctx, creds, &lowerPop, &vfs.StatOptions{
+			Mask: linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+		}); statErr == nil {
+			upperPop := vfs.PathOperation{Root: upperVD, Start: upperVD, Path: makeFPath("/")}
+			_ = vfsObj.SetStatAt(sctx, creds, &upperPop, &vfs.SetStatOptions{
+				Stat: linux.Statx{
+					Mask: linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+					Mode: st.Mode & 0o7777,
+					UID:  st.UID,
+					GID:  st.GID,
+				},
+			})
+		}
+	}
+
+	return mountSubfs(m.GuestPath, overlay.Name, &vfs.MountOptions{
+		ReadOnly: m.ReadOnly,
+		GetFilesystemOptions: vfs.GetFilesystemOptions{
+			InternalData: overlay.FilesystemOptions{
+				UpperRoot:  upperVD,
+				LowerRoots: []vfs.VirtualDentry{lowerVD},
 			},
 		},
 	})
