@@ -844,8 +844,7 @@ func (nf *NATForwarder) handleTCP(r *tcp.ForwarderRequest) {
 func (nf *NATForwarder) relayTCP(r *tcp.ForwarderRequest, targetAddr string) {
 	hostConn, err := nf.cfg.DialContext(nf.ctx, "tcp", targetAddr)
 	if err != nil {
-		nf.log.Debug("netbackend: dial host TCP target", "target", targetAddr, "error", err)
-		r.Complete(true)
+		nf.answerFailedDial(r, targetAddr, err)
 		return
 	}
 
