@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **NAT TCP answer to a failed host dial (`pkg/netbackend`)** (#206): `relayTCP` classifies the host dial error and no longer sends a RST for every failure. A refusal and an error of no known class still get a RST. A timeout gets no answer, and each retransmitted SYN dials again. The guest then gets `ETIMEDOUT` in place of `ECONNREFUSED`. A host or network unreachable error gets an ICMPv4 destination unreachable from `10.0.2.2`, so the guest gets `EHOSTUNREACH` or `ENETUNREACH`. A container behind the iptables NAT of the guest gets the same errno. `tcp_dial_answer_windows.go` matches the `WSAE` codes that Windows returns.
+
 ## [v0.17.10002026110900] - 2026-11-17
 
 This release adds online `ext4lite` hole punching and `FITRIM` support, `LOCK_SH` shared read-only volume mounts, and `type=overlay` copy-on-write volume mounts. It also adds multi-sandbox `hostfs` `.gvx_meta.lock` synchronization under `hostlockdown`.
