@@ -1,11 +1,11 @@
 name: release
 
 # A tag v* builds rungv for all supported targets and the linux/arm64v8.2 LSE
-# variant. It then publishes a GitHub release with notes from CHANGELOG.md. A
-# tag with a hyphen, such as v0.1.0-rc.1, publishes a pre-release. Each release
-# carries a SLSA v1 build provenance attestation for every archive. A pull
-# request that changes this file, and a manual run, execute every step except
-# the publication.
+# variant. It also builds the GPU renderer archive for darwin/arm64. It then
+# publishes a GitHub release with notes from CHANGELOG.md. A tag with a hyphen,
+# such as v0.1.0-rc.1, publishes a pre-release. Each release carries a SLSA v1
+# build provenance attestation for every archive. A pull request that changes
+# this file, and a manual run, execute every step except the publication.
 on:
   push:
     tags: ["v*"]
@@ -155,9 +155,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The GPU renderer archive holds gvx-gpu-renderer with the KosmicKrisp
+  # Vulkan driver, built from the pinned Mesa source tarball. The hosted
+  # runner has no hypervisor, and the renderer self-test runs only when the
+  # repository variable GVX_CI_METAL is 1 (see diagnose.yml).
+  gpu-renderer:
+    name: build gpu-renderer darwin/arm64
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install the driver build tools
+        run: brew install meson ninja cmake pkg-config llvm libclc spirv-llvm-translator spirv-tools
+      - name: Build the renderer bundle
+        run: scripts/gpu/build-renderer.sh --driver-source mesa-source --out "$RUNNER_TEMP/gpu"
+      - name: Run the renderer self-test
+        if: vars.GVX_CI_METAL == '1'
+        run: '"$RUNNER_TEMP/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" --selftest'
+      - name: Package the renderer
+        run: |
+          name="gvx-gpu-renderer-${GITHUB_REF_NAME}-darwin-arm64"
+          [ "$GITHUB_REF_TYPE" = tag ] || name="gvx-gpu-renderer-dryrun-darwin-arm64"
+          mkdir -p dist
+          scripts/gpu/package-renderer.sh "$RUNNER_TEMP/gpu/gvx-gpu-renderer" "dist/$name.tar.gz"
+          cat "$RUNNER_TEMP/gpu/gvx-gpu-renderer/BUILDINFO"
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: darwin-arm64-gpu-renderer
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: publish
-    needs: [build, android]
+    needs: [build, android, gpu-renderer]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -186,7 +221,9 @@ jobs:
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/attest@v4
         with:
-          subject-path: dist/rungv-*
+          subject-path: |
+            dist/rungv-*
+            dist/gvx-gpu-renderer-*
       - name: Verify provenance and add the bundle
         if: steps.attest.outcome == 'success'
         env:
@@ -195,7 +232,7 @@ jobs:
         run: |
           name=rungv-dryrun
           [ "$GITHUB_REF_TYPE" = tag ] && name="rungv-$GITHUB_REF_NAME"
-          for archive in dist/rungv-*; do
+          for archive in dist/rungv-* dist/gvx-gpu-renderer-*; do
             gh attestation verify "$archive" --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
               --source-ref "$GITHUB_REF" --deny-self-hosted-runners

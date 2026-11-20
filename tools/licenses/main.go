@@ -46,7 +46,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("licenses", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	out := fs.String("o", "", "write the notice text to `FILE`")
-	check := fs.Bool("check", false, "fail when the embedded file or the README table is stale")
+	check := fs.Bool("check", false, "fail when the embedded file, README table, or renderer license manifest is stale or invalid")
 	markdown := fs.Bool("markdown", false, "print the README table of the third-party modules")
 	embedded := fs.String("embedded", defaultEmbedded, "embedded text file that -check compares")
 	readme := fs.String("readme", defaultReadme, "README file that -check compares")
@@ -120,6 +120,10 @@ func checkDocument(doc document, embeddedPath, readmePath string, stdout, stderr
 	if table := doc.markdownTable(); !strings.Contains(lfOnly(string(readme)), table) {
 		stale = true
 		_, _ = fmt.Fprintf(stderr, "%s does not contain the current license table; paste the output of: go run ./tools/licenses -markdown\n", readmePath)
+	}
+	if err := checkRenderer("."); err != nil {
+		stale = true
+		_, _ = fmt.Fprintf(stderr, "licenses: %v\n", err)
 	}
 	if stale {
 		return 1

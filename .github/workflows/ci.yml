@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run one job family: all, build, repro, dind, linux, darwin, or windows"
+        description: "Run one job family: all, build, repro, dind, linux, darwin, windows, or gpu"
         type: choice
         default: all
-        options: [all, build, repro, dind, linux, darwin, windows]
+        options: [all, build, repro, dind, linux, darwin, windows, gpu]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -33,7 +33,7 @@ env:
     ./pkg/gvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
     ./pkg/abi/linux/... ./pkg/cpuid/... ./pkg/erofs/... ./pkg/fd/... ./pkg/fdnotifier/... ./pkg/fsutil/... ./pkg/hostarch/...
     ./pkg/memutil/... ./pkg/rawfile/... ./pkg/ring0/... ./pkg/sync/... ./pkg/syserr/...
-    ./pkg/sentry/arch/... ./pkg/sentry/blockdev/... ./pkg/sentry/devices/memdev/...
+    ./pkg/sentry/arch/... ./pkg/sentry/blockdev/... ./pkg/sentry/devices/memdev/... ./pkg/sentry/devices/virtgpu/...
     ./pkg/sentry/fsimpl/cgroup2fs/... ./pkg/sentry/fsimpl/chunkcache/... ./pkg/sentry/fsimpl/devpts/... ./pkg/sentry/fsimpl/erofs/...
     ./pkg/sentry/fsimpl/ext4lite/... ./pkg/sentry/fsimpl/fsutilx/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/sentry/fsimpl/iouringfs/...
     ./pkg/sentry/fsimpl/overlay/... ./pkg/sentry/fsimpl/proc/... ./pkg/sentry/fsimpl/sys/...
@@ -47,7 +47,7 @@ env:
   VET: >-
     ./cmd/... ./internal/... ./tools/upstream/... ./tools/licenses/... ./tools/gvisorlint/... ./tools/gostateify/...
     ./pkg/gvx/... ./pkg/oci/... ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/ipset/... ./pkg/tcpip/link/vxlan/... ./pkg/tcpip/link/wgtun/...
-    ./pkg/sentry/blockdev/... ./pkg/sentry/socket/netlink/genetlink/...
+    ./pkg/sentry/blockdev/... ./pkg/sentry/devices/virtgpu/... ./pkg/sentry/socket/netlink/genetlink/...
     ./pkg/sentry/platform/hvcommon/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
     ./pkg/sentry/fsimpl/chunkcache/... ./pkg/sentry/fsimpl/fsutilx/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/...
     ./pkg/sentry/fsimpl/ext4lite/...
@@ -72,7 +72,7 @@ jobs:
         run: |
           unformatted=$(gofmt -l cmd e2e internal scripts tools/upstream tools/licenses tools/gvisorlint tools/androidprobe tools/gostateify \
             pkg/gvx pkg/oci pkg/netbackend pkg/hostlockdown pkg/syserr pkg/ipset pkg/tcpip/link/vxlan pkg/tcpip/link/wgtun \
-            pkg/sentry/blockdev pkg/sentry/socket/netlink/genetlink pkg/sentry/platform/hvcommon \
+            pkg/sentry/blockdev pkg/sentry/devices/virtgpu pkg/sentry/socket/netlink/genetlink pkg/sentry/platform/hvcommon \
             pkg/sentry/platform/hvf pkg/sentry/platform/whpx pkg/sentry/fsimpl/chunkcache \
             pkg/sentry/fsimpl/fsutilx pkg/sentry/fsimpl/hostfs pkg/sentry/fsimpl/ext4lite)
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
@@ -256,6 +256,86 @@ jobs:
       # so this step runs the host-level e2e gates that need no guest VM.
       - name: Test host-level end-to-end gates
         run: go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" -run '^TestE2E(OtherOSHypervisorFailsExplicitly|SystrapPrerequisiteError|RungvConfigurationErrors)$' ./e2e/
+
+  # The renderer is C code with pinned inputs. Only a change to its code, to
+  # its Go client, to the device, or to this workflow can break it, so every
+  # other change skips the build on macOS.
+  gpu-changes:
+    name: select gpu-renderer
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'gpu'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.select.outputs.run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Select
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo run=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A pull request checks out its merge commit, whose first parent is the base.
+          base=HEAD^1
+          if [ "$EVENT" = push ]; then
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] || ! git fetch --depth=1 origin "$BEFORE"; then
+              echo run=true >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            base=$BEFORE
+          fi
+          if git diff --name-only "$base" HEAD | grep -qE '^(gpurenderer/|scripts/gpu/|pkg/sentry/devices/virtgpu/|internal/gpurender/|\.github/workflows/ci\.yml$)'; then
+            echo run=true >> "$GITHUB_OUTPUT"
+          else
+            echo run=false >> "$GITHUB_OUTPUT"
+          fi
+
+  gpu-renderer:
+    name: build gpu-renderer darwin/arm64
+    needs: gpu-changes
+    if: needs.gpu-changes.outputs.run == 'true'
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+      GVX_E2E_OFFLINE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install the build tools
+        run: brew install meson ninja
+      - name: Cache pinned renderer inputs
+        uses: actions/cache@v6
+        with:
+          path: build/gpu/cache
+          key: gpu-renderer-${{ runner.os }}-${{ hashFiles('gpurenderer/third_party.lock', 'scripts/gpu/stage_driver.py') }}
+      - name: Build the renderer bundle
+        run: scripts/gpu/build-renderer.sh
+      # The tests below need a Metal device that KosmicKrisp accepts. The
+      # repository variable GVX_CI_METAL is 1 only after diagnose.yml proved
+      # that on this runner (docs/architecture.md section 3.15).
+      - name: Run the renderer self-test
+        if: vars.GVX_CI_METAL == '1'
+        run: build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest
+      - name: Test the client and the device with the renderer
+        if: vars.GVX_CI_METAL == '1'
+        run: |
+          export GVX_GPU_RENDERER="$PWD/build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer"
+          go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" ./internal/gpurender/... ./pkg/sentry/devices/virtgpu/...
+      - name: Report the skipped renderer tests
+        if: vars.GVX_CI_METAL != '1'
+        run: echo "::notice::GVX_CI_METAL is not 1, so the renderer self-test and the renderer tests did not run (see diagnose.yml)."
 
   windows-amd64:
     name: test windows/amd64

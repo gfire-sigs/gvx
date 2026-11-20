@@ -88,7 +88,8 @@ func isSourceFile(name string) bool {
 
 // repoSourceFiles lists the source files under root. It skips the third_party
 // directory, which holds vendored modules, the embedded copy of the x/sys unix
-// package, whose license the module golang.org/x/sys already names, and the
+// package, whose license the module golang.org/x/sys already names, the
+// gitignored build output tree, the standalone gpurenderer C program, and the
 // hidden directories.
 func repoSourceFiles(root string) ([]sourceFile, error) {
 	var files []sourceFile
@@ -100,8 +101,11 @@ func repoSourceFiles(root string) ([]sourceFile, error) {
 			if p != root && (d.Name() == "third_party" || strings.HasPrefix(d.Name(), ".")) {
 				return filepath.SkipDir
 			}
-			if rel, err := filepath.Rel(root, p); err == nil && filepath.ToSlash(rel) == "internal/xsys" {
-				return filepath.SkipDir
+			if rel, err := filepath.Rel(root, p); err == nil {
+				switch filepath.ToSlash(rel) {
+				case "internal/xsys", "build", "gpurenderer":
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
