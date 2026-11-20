@@ -259,9 +259,13 @@ func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.
+//
+// The VFS lock order puts the locks of PrependPath last, because callers such
+// as FileDescription.MappedName hold other locks. So the walk takes
+// ancestryMu and not mu. See filesystem.ancestryMu.
 func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDentry, b *fspath.Builder) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
 	mnt := vd.Mount()
 	d := vd.Dentry().Impl().(*dentry)
 	for {
@@ -283,12 +287,15 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 }
 
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
+//
+// The VFS holds its mount lock during the call, for example when it propagates
+// a mount, so the walk takes ancestryMu and not mu. See filesystem.ancestryMu.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	if vfsroot.Mount() != vd.Mount() {
 		return false
 	}
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
 	return isAncestorLocked(vfsroot.Dentry().Impl().(*dentry), vd.Dentry().Impl().(*dentry))
 }
 
@@ -349,7 +356,9 @@ func (fs *filesystem) detachLocked(d *dentry) {
 	if d.dead {
 		return
 	}
+	fs.ancestryMu.Lock()
 	d.dead = true
+	fs.ancestryMu.Unlock()
 	if d.parent != nil && d.parent.children[d.name] == d {
 		delete(d.parent.children, d.name)
 	}

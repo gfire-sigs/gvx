@@ -354,10 +354,10 @@ func (fs *filesystem) linkTmpLocked(creds *auth.Credentials, src, parent *dentry
 	t.parent.decRefLocked()
 	ino.unlinked.Store(false)
 	ino.invalidateMeta()
-	src.nameMu.Lock()
+	fs.ancestryMu.Lock()
 	src.parent, src.name, src.relPath = parent, name, rel
-	src.nameMu.Unlock()
 	src.dead = false
+	fs.ancestryMu.Unlock()
 	if parent.children == nil {
 		parent.children = make(map[string]*dentry)
 	}
