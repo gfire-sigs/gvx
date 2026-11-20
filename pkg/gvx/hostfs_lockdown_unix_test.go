@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,26 @@ func runLockedGitWorktreeWorker(t *testing.T, dir string, id int) {
 	if !st.SubprocessBlocked || !st.UnboundFileOpenBlocked {
 		t.Fatalf("hostlockdown status = %+v, want SubprocessBlocked && UnboundFileOpenBlocked", st)
 	}
+
+	// Force fresh OS thread creation after lockdown so missing thread clone
+	// flags fail deterministically instead of depending on scheduler timing.
+	lockedThreads := min(runtime.GOMAXPROCS(0)+4, 16)
+	var threadReady, threadDone sync.WaitGroup
+	releaseThreads := make(chan struct{})
+	threadReady.Add(lockedThreads)
+	threadDone.Add(lockedThreads)
+	for range lockedThreads {
+		go func() {
+			defer threadDone.Done()
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			threadReady.Done()
+			<-releaseThreads
+		}()
+	}
+	threadReady.Wait()
+	close(releaseThreads)
+	threadDone.Wait()
 
 	// Signal readiness and wait for parent barrier so both locked child processes
 	// hammer .gvx_meta simultaneously.

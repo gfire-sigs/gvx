@@ -32,7 +32,10 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
 
 const (
@@ -218,7 +221,7 @@ func answerWith(ip string) dnsHandler {
 		if err != nil {
 			return nil
 		}
-		return buildDNSAddressResponse(reqHdr, q, []netip.Addr{netip.MustParseAddr(ip)})
+		return buildDNSAddressResponse(reqHdr, q, []netip.Addr{netip.MustParseAddr(ip)}, true)
 	}
 }
 
@@ -708,15 +711,15 @@ func TestDNSRelayRandomizesUpstreamTXIDAndRejectsQuestionMismatch(t *testing.T) 
 		upID := binary.BigEndian.Uint16(req[0:2])
 
 		wrongNameHdr, wrongNameQ, _, _ := parseDNSQuery(buildDNSQuery(upID, "evil.example.test", dnsTypeA))
-		spoofName := buildDNSAddressResponse(wrongNameHdr, wrongNameQ, []netip.Addr{netip.MustParseAddr("6.6.6.1")})
+		spoofName := buildDNSAddressResponse(wrongNameHdr, wrongNameQ, []netip.Addr{netip.MustParseAddr("6.6.6.1")}, true)
 		_, _ = pc.WriteTo(spoofName, from)
 
 		wrongTypeHdr, wrongTypeQ, _, _ := parseDNSQuery(buildDNSQuery(upID, "target.example.test", dnsTypeAAAA))
-		spoofType := buildDNSAddressResponse(wrongTypeHdr, wrongTypeQ, []netip.Addr{netip.MustParseAddr("2001:db8::6")})
+		spoofType := buildDNSAddressResponse(wrongTypeHdr, wrongTypeQ, []netip.Addr{netip.MustParseAddr("2001:db8::6")}, true)
 		_, _ = pc.WriteTo(spoofType, from)
 
 		upperHdr, upperQ, _, _ := parseDNSQuery(buildDNSQuery(upID, "TARGET.EXAMPLE.TEST", dnsTypeA))
-		valid := buildDNSAddressResponse(upperHdr, upperQ, []netip.Addr{netip.MustParseAddr("198.51.100.99")})
+		valid := buildDNSAddressResponse(upperHdr, upperQ, []netip.Addr{netip.MustParseAddr("198.51.100.99")}, true)
 		_, _ = pc.WriteTo(valid, from)
 	}()
 
@@ -1131,5 +1134,148 @@ func TestDNSRelayForwardsCNAMEAndPTRAnswersFromUpstream(t *testing.T) {
 	ptrRes, err := p.PTRResource()
 	if err != nil || ptrRes.PTR.String() != "ptr.example.test." {
 		t.Fatalf("PTRResource = %+v, err = %v", ptrRes, err)
+	}
+}
+
+func TestDNSRelayForwardsTCPQueriesDirectlyOverTCP(t *testing.T) {
+	var udpQueries, tcpQueries atomic.Int32
+	srv := startFakeDNSServer(t, func(req []byte, viaTCP bool) []byte {
+		if viaTCP {
+			tcpQueries.Add(1)
+			return answerWith("198.51.100.53")(req, true)
+		}
+		udpQueries.Add(1)
+		return answerWith("198.51.100.54")(req, false)
+	})
+	s, nf, err := NewNATStack(NATConfig{DNSServers: []string{srv.addr}})
+	if err != nil {
+		t.Fatalf("NewNATStack: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = nf.Close()
+		s.Close()
+	})
+
+	dnsAddr := tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}), Port: 53}
+	c, err := gonet.DialTCP(s, dnsAddr, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer c.Close()
+
+	query := buildDNSQuery(0x5353, "tcp-only.example.test", dnsTypeA)
+	framed := binary.BigEndian.AppendUint16(nil, uint16(len(query)))
+	if _, err := c.Write(append(framed, query...)); err != nil {
+		t.Fatalf("write TCP query: %v", err)
+	}
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+		t.Fatalf("read TCP length: %v", err)
+	}
+	resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
+	if _, err := io.ReadFull(c, resp); err != nil {
+		t.Fatalf("read TCP body: %v", err)
+	}
+	if got := answerIPs(t, resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.53")}) {
+		t.Fatalf("TCP answer = %v, want [198.51.100.53]", got)
+	}
+	if udpQueries.Load() != 0 || tcpQueries.Load() != 1 {
+		t.Fatalf("upstream counts = (udp %d, tcp %d), want (0, 1)", udpQueries.Load(), tcpQueries.Load())
+	}
+}
+
+func TestDNSRelayAnswersNonAddressQueriesForOwnNamesWithoutUpstream(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.99"))
+	nf := newTestForwarder(t, NATConfig{}, srv.addr)
+
+	const (
+		typeTXT   = uint16(dnsmessage.TypeTXT)
+		typeSRV   = uint16(dnsmessage.TypeSRV)
+		typeHTTPS = 65
+	)
+	for _, name := range []string{"host.docker.internal", "gateway.docker.internal", "localhost", "localhost.localdomain", "gvx"} {
+		for _, qtype := range []uint16{typeTXT, typeSRV, typeHTTPS} {
+			resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x21, name, qtype))
+			if dnsRCode(resp) != dnsRCodeNoErr {
+				t.Fatalf("%s type %d: rcode = %d, want NOERROR", name, qtype, dnsRCode(resp))
+			}
+			if got := answerIPs(t, resp); len(got) != 0 {
+				t.Fatalf("%s type %d: answers = %v, want empty", name, qtype, got)
+			}
+		}
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream saw %d queries for relay-owned names, want 0", srv.queries.Load())
+	}
+
+	isolated := newTestForwarder(t, NATConfig{IsolateLAN: true}, srv.addr)
+	resp := isolated.handleDNSQuery(t.Context(), buildDNSQuery(0x22, "host.docker.internal", typeTXT))
+	if dnsRCode(resp) != dnsRCodeNX {
+		t.Fatalf("isolated host.docker.internal TXT: rcode = %d, want NXDOMAIN", dnsRCode(resp))
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream saw %d queries under IsolateLAN, want 0", srv.queries.Load())
+	}
+}
+
+func TestDNSRelaySuppressesExternalAAAAWithoutGuestIPv6Route(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("2001:db8::99"))
+	s, nf, err := NewNATStack(NATConfig{DNSServers: []string{srv.addr}})
+	if err != nil {
+		t.Fatalf("NewNATStack: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = nf.Close()
+		s.Close()
+	})
+
+	// IPv4-only NAT suppresses external AAAA queries with empty NOERROR.
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x31, "archive.ubuntu.com", dnsTypeAAAA))
+	if dnsRCode(resp) != dnsRCodeNoErr {
+		t.Fatalf("external AAAA on IPv4-only NAT: rcode = %d, want NOERROR", dnsRCode(resp))
+	}
+	if got := answerIPs(t, resp); len(got) != 0 {
+		t.Fatalf("external AAAA on IPv4-only NAT: answers = %v, want empty", got)
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream saw %d AAAA queries on IPv4-only NAT, want 0", srv.queries.Load())
+	}
+
+	// localhost AAAA still resolves ::1.
+	loResp := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x32, "localhost", dnsTypeAAAA))
+	if got := answerIPs(t, loResp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("::1")}) {
+		t.Fatalf("localhost AAAA = %v, want [::1]", got)
+	}
+
+	// Adding an IPv6 route to eth0 enables upstream AAAA forwarding.
+	guestV6 := tcpip.AddrFrom16(netip.MustParseAddr("2001:db8::2").As16())
+	pa := tcpip.ProtocolAddress{
+		Protocol:          ipv6.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: guestV6, PrefixLen: 64},
+	}
+	if err := s.AddProtocolAddress(Eth0NICID, pa, stack.AddressProperties{}); err != nil {
+		t.Fatalf("add IPv6 address: %s", err)
+	}
+	s.SetRouteTable(append(s.GetRouteTable(), tcpip.Route{
+		Destination: header.IPv6EmptySubnet,
+		NIC:         Eth0NICID,
+	}))
+	v6Resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(0x33, "archive.ubuntu.com", dnsTypeAAAA))
+	if got := answerIPs(t, v6Resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("2001:db8::99")}) {
+		t.Fatalf("external AAAA with IPv6 route = %v, want [2001:db8::99]", got)
+	}
+	if srv.queries.Load() != 1 {
+		t.Fatalf("upstream saw %d queries after enabling IPv6 route, want 1", srv.queries.Load())
+	}
+}
+
+func TestFormatGuestResolvConf(t *testing.T) {
+	if got := formatGuestResolvConf(HostDNSIPv4, nil, nil); got != "nameserver 10.0.2.3\n" {
+		t.Fatalf("minimal resolv.conf = %q, want %q", got, "nameserver 10.0.2.3\n")
+	}
+	got := formatGuestResolvConf(HostDNSIPv4, []string{"corp.example", "svc.local"}, []string{"ndots:2", "edns0"})
+	want := "nameserver 10.0.2.3\nsearch corp.example svc.local\noptions ndots:2 edns0\n"
+	if got != want {
+		t.Fatalf("full resolv.conf = %q, want %q", got, want)
 	}
 }

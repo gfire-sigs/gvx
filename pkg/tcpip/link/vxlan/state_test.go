@@ -45,6 +45,18 @@ func TestStateRoundTripEndpointFDBAndOverlayTraffic(t *testing.T) {
 	a, b := newNodes(t, cfgA, cfgB)
 	connect(t, a, b)
 
+	// Add static underlay neighbors so before-save traffic does not spawn
+	// asynchronous ARP probe goroutines that can still update b's stats across
+	// the synchronous pipe when state.Save reads b.stack.
+	aUnderlayMAC := a.stack.NICInfo()[underlayNIC].LinkAddress
+	bUnderlayMAC := b.stack.NICInfo()[underlayNIC].LinkAddress
+	if err := a.stack.AddStaticNeighbor(underlayNIC, ipv4.ProtocolNumber, b.underlay, bUnderlayMAC); err != nil {
+		t.Fatalf("a.AddStaticNeighbor(underlay): %v", err)
+	}
+	if err := b.stack.AddStaticNeighbor(underlayNIC, ipv4.ProtocolNumber, a.underlay, aUnderlayMAC); err != nil {
+		t.Fatalf("b.AddStaticNeighbor(underlay): %v", err)
+	}
+
 	extraMAC := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x77")
 	extraRemote := Remote{IP: ip4(10, 0, 0, 99), Port: 4789, VNI: 42}
 	if err := b.vxlan.FDBUpdate(extraMAC, NUDPermanent, NTFSelf, extraRemote, UpdateMode{Create: true, Excl: true}); err != nil {
@@ -63,6 +75,13 @@ func TestStateRoundTripEndpointFDBAndOverlayTraffic(t *testing.T) {
 	bMAC := b.vxlan.LinkAddress()
 	wsOldB := weak.Make(b.stack)
 
+	// Shut down peer A before saving B so A detaches from the shared pipe and
+	// cannot deliver packets into B while state.Save traverses b.stack.
+	a.stack.Close()
+	a.stack.Wait()
+	CloseStack(a.stack)
+	a.vxlan.Close()
+
 	b.stack.Pause()
 	var buf bytes.Buffer
 	saved := []any{b.stack, b.vxlan}
@@ -70,12 +89,7 @@ func TestStateRoundTripEndpointFDBAndOverlayTraffic(t *testing.T) {
 		t.Fatalf("state.Save: %v", err)
 	}
 
-	// Shut down the pre-save nodes so their sockets release global entries.
-	a.stack.Close()
-	a.stack.Wait()
-	CloseStack(a.stack)
-	a.vxlan.Close()
-
+	// Shut down the pre-save node B so its socket releases global entries.
 	b.stack.Close()
 	b.stack.Wait()
 	CloseStack(b.stack)
