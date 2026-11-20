@@ -11,12 +11,13 @@ This guide shows how to run a Docker Engine inside a `gvx` sandbox and control i
 | `--privileged` | On by default. It turns on raw sockets, packet writes, and set-user-ID programs. These privileges stay inside the sandbox. |
 | `-v gvx-docker:/var/lib/docker` | Stores the data of `dockerd` in the `ext4lite` image `gvx-docker.ext4`. The overlay storage driver of `dockerd` works on it. |
 | `-p unix:~/.gvx/docker.sock:2375` | Binds a Unix socket on the host and forwards it to the API port 2375 of `dockerd`. Only your user can open the socket. |
-| `-p 127.0.0.1:9000-9019:9000-9019` | Publishes a range of host ports. A container that `docker run -p 9000:80` publishes in the guest is then reachable at `127.0.0.1:9000` on the host. |
+| `--auto-publish` | Publishes each `docker run -p` and `docker compose` port automatically on host `127.0.0.1:<port>`. Keeps port 2375 on the Unix socket only. |
+| `-p 127.0.0.1:9000-9019:9000-9019` | Optional static alternative to `--auto-publish` when you want strict lockdown with zero post-boot loopback binds. |
 | `-e DOCKER_TLS_CERTDIR=` | Makes the entrypoint listen on TCP port 2375 without TLS. The port is reachable only through the forwards above. |
 | `--tls=false` | Tells `dockerd` that the missing TLS is intended. Without it, `dockerd` waits 15 seconds before it starts. |
 | Docker context `gvx` | Points the `docker` command of the host at the Unix socket. |
 
-The sandbox locks itself down before the guest starts. The guest therefore cannot publish a new host port later. Publish every host port that your containers will use when you start the engine.
+By default, the sandbox locks itself down before the guest starts and rejects new host binds later. Pass `--auto-publish` to publish container ports dynamically on host `127.0.0.1` as containers start and stop. If you prefer strict lockdown without dynamic binds, omit `--auto-publish` and pre-bind a static `-p` port range instead.
 
 ## 2. Start the Engine
 
@@ -35,8 +36,8 @@ These steps start the engine and connect the `docker` command of the host to it.
 
    ```sh
    rungv run \
+     --auto-publish \
      -p unix:~/.gvx/docker.sock:2375 \
-     -p 127.0.0.1:9000-9019:9000-9019 \
      -v gvx-docker:/var/lib/docker \
      -e DOCKER_TLS_CERTDIR= \
      docker:dind --tls=false

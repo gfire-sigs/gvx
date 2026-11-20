@@ -4,6 +4,10 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
+### Features
+
+- **Dynamic loopback port auto-publishing (`--auto-publish`, `pkg/hostlockdown`, `pkg/netbackend`, `pkg/gvx`, `cmd/rungv`)** (#218): Opt-in `--auto-publish` (`Config.AutoPublishPorts`) reconciles guest TCP listeners and `iptables` NAT `DNAT` ports onto host `127.0.0.1` while host lockdown stays active. Host lockdown allows only loopback binds (`127.0.0.1` or `::1`), static `-p` rules keep precedence, and new tunables bound dynamic ports and polling.
+
 ### Bug Fixes
 
 - **Published port fallback to guest loopback (`pkg/netbackend`, `pkg/tcpip/stack`)** (#218): Inbound `-p` port forwarders now fall back to guest `127.0.0.1:<port>` on `lo` when a service binds only loopback. This lets host clients reach nested containers published with `docker run -p 127.0.0.1:...` and local development servers bound to `localhost`.

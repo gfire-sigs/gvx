@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -305,7 +306,9 @@ type boundUDPForward struct {
 	rule       PortForwardRule
 	packetConn *net.UDPConn
 
-	// sessions maps a client address to its session. PortForwarder.mu guards it.
+	// closed is set when this rule is unpublished or PortForwarder closes.
+	// PortForwarder.mu guards closed and sessions.
+	closed   bool
 	sessions map[netip.AddrPort]*udpForwardSession
 }
 
@@ -346,6 +349,16 @@ type PortForwarder struct {
 	// resumed is non-nil between QuiesceForSave and ResumeAfterSave. It
 	// closes when the pause ends. PortForwarder.mu guards it.
 	resumed chan struct{}
+
+	// Dynamic host loopback publishing state. dynMu serializes
+	// reconcileDynamicPorts calls (lock order: dynMu before mu); mu guards the
+	// fields below.
+	dynMu      sync.Mutex
+	dynEnabled bool
+	dynOpts    DynamicForwardOptions
+	dynTCP     map[dynPortKey]*boundTCPForward
+	dynUDP     map[dynPortKey]*boundUDPForward
+	dynFailed  map[dynPortKey]struct{}
 }
 
 // NewPortForwarder constructs an empty PortForwarder ready for PreBind. The
@@ -455,15 +468,36 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 }
 
 // BoundRules returns the active port forward rules with resolved host ports.
+// Static rules appear first in PreBind order, followed by active dynamic
+// loopback rules sorted by protocol and port.
 func (pf *PortForwarder) BoundRules() []PortForwardRule {
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
-	out := make([]PortForwardRule, 0, len(pf.tcpList)+len(pf.udpList))
+	out := make([]PortForwardRule, 0, len(pf.tcpList)+len(pf.udpList)+len(pf.dynTCP)+len(pf.dynUDP))
 	for _, b := range pf.tcpList {
 		out = append(out, b.rule)
 	}
 	for _, b := range pf.udpList {
 		out = append(out, b.rule)
+	}
+	if len(pf.dynTCP)+len(pf.dynUDP) > 0 {
+		keys := make([]dynPortKey, 0, len(pf.dynTCP)+len(pf.dynUDP))
+		for k := range pf.dynTCP {
+			keys = append(keys, k)
+		}
+		for k := range pf.dynUDP {
+			keys = append(keys, k)
+		}
+		slices.SortFunc(keys, compareDynPortKey)
+		for _, k := range keys {
+			if k.proto == "tcp" {
+				if b, ok := pf.dynTCP[k]; ok {
+					out = append(out, b.rule)
+				}
+			} else if b, ok := pf.dynUDP[k]; ok {
+				out = append(out, b.rule)
+			}
+		}
 	}
 	return out
 }
@@ -495,6 +529,10 @@ func (pf *PortForwarder) Start(s *stack.Stack) {
 		pf.wg.Add(1)
 		go pf.serveUDP(b)
 	}
+	if pf.dynEnabled {
+		pf.wg.Add(1)
+		go pf.runDynamicLoop()
+	}
 }
 
 // AttachRestoredStack rebinds all pre-bound TCP, Unix, and UDP port forwarders
@@ -520,12 +558,23 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 			pf.wg.Add(1)
 			go pf.serveUDP(b)
 		}
+		if pf.dynEnabled {
+			pf.wg.Add(1)
+			go pf.runDynamicLoop()
+		}
 		pf.mu.Unlock()
 		return nil
 	}
 	pf.stack = s
+	clear(pf.dynFailed)
 	var staleGuests []*gonet.UDPConn
 	for _, b := range pf.udpList {
+		for client, sess := range b.sessions {
+			staleGuests = append(staleGuests, sess.guest)
+			delete(b.sessions, client)
+		}
+	}
+	for _, b := range pf.dynUDP {
 		for client, sess := range b.sessions {
 			staleGuests = append(staleGuests, sess.guest)
 			delete(b.sessions, client)
@@ -762,7 +811,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 // closed, the rule is at its session limit, or the guest endpoint fails.
 func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, fallback bool, client netip.AddrPort) *udpForwardSession {
 	pf.mu.Lock()
-	if pf.closed || pf.stack == nil {
+	if pf.closed || b.closed || pf.stack == nil {
 		pf.mu.Unlock()
 		return nil
 	}
@@ -792,7 +841,7 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 	// Only this rule's serveUDP goroutine inserts sessions, so the earlier
 	// lookup cannot race with another insert for the same key.
 	pf.mu.Lock()
-	if pf.closed || pf.stack != s {
+	if pf.closed || b.closed || pf.stack != s {
 		pf.mu.Unlock()
 		_ = guest.Close()
 		return nil
@@ -886,8 +935,15 @@ func (pf *PortForwarder) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	for _, b := range pf.dynTCP {
+		if err := b.listener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	clear(pf.dynTCP)
 	var guests []*gonet.UDPConn
 	for _, b := range pf.udpList {
+		b.closed = true
 		if err := b.packetConn.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -895,6 +951,17 @@ func (pf *PortForwarder) Close() error {
 			guests = append(guests, sess.guest)
 		}
 	}
+	for _, b := range pf.dynUDP {
+		b.closed = true
+		if err := b.packetConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		for _, sess := range b.sessions {
+			guests = append(guests, sess.guest)
+		}
+	}
+	clear(pf.dynUDP)
+	clear(pf.dynFailed)
 	pf.mu.Unlock()
 	for _, g := range guests {
 		_ = g.Close()

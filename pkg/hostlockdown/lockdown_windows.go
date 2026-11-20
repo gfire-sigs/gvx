@@ -190,7 +190,7 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 
 	var netBroker *winNetBroker
 	if opts.AllowOutboundNet || opts.PreboundListeners > 0 {
-		netBroker, err = startNetBroker(primary, id, opts.AllowOutboundNet, opts.PreboundListeners)
+		netBroker, err = startNetBroker(primary, id, opts.AllowOutboundNet, opts.PreboundListeners, opts.AllowLoopbackBind, opts.DynamicListeners)
 		if err != nil {
 			return Status{}, err
 		}

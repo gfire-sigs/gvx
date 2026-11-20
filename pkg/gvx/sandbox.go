@@ -27,6 +27,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/netbackend"
 	"z.gfire.dev/gvx/pkg/oci"
@@ -308,6 +309,10 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 			}
 		}
 	}
+	if s.cfg.AutoPublishPorts && s.cfg.NetworkMode == NetModeNAT {
+		opts.AllowLoopbackBind = true
+		opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
+	}
 	if s.cfg.CheckpointListener != nil {
 		opts.PreboundListeners++
 	}
@@ -452,9 +457,10 @@ type PublishedPort struct {
 }
 
 // PublishedPorts lists the bound port forwards, in rule order: the forwards of
-// Config.PortForwards first, then the image ports that Config.PublishAll added.
-// A forward with host port zero shows the free port that the host chose. It is
-// empty before New binds the sockets, and for a mode other than nat.
+// Config.PortForwards first, then the image ports that Config.PublishAll added,
+// and then active dynamic ports from Config.AutoPublishPorts. A forward with
+// host port zero shows the free port that the host chose. It is empty before
+// New binds the sockets, and for a mode other than nat.
 func (s *Sandbox) PublishedPorts() []PublishedPort {
 	if s.portForwarder == nil {
 		return nil

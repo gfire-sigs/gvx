@@ -115,7 +115,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P -e --env-file -u --user -m --memory --cpus --net --backend --platform --pull --entrypoint --rm -cache-dir --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish -e --env-file -u --user -m --memory --cpus --net --backend --platform --pull --entrypoint --rm -cache-dir --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -185,6 +185,7 @@ _rungv() {
                 '--rootfs-volume[Persistent ext4lite volume name or image path for container rootfs]:volume:' \
                 '*-p[Publish guest port to host]:port:' \
                 '-P[Publish all exposed image ports]' \
+                '--auto-publish[Automatically publish guest listeners on host 127.0.0.1]' \
                 '*-e[Set guest environment variable]:env:' \
                 '*--env-file[Read environment variables from file]:file:_files' \
                 '-u[Guest user or UID:GID]:user:' \

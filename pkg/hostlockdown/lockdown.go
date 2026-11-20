@@ -77,6 +77,17 @@ type Options struct {
 	// token handle.
 	PreboundListeners int
 
+	// AllowLoopbackBind permits binding new TCP and UDP listeners on host
+	// loopback addresses (127.0.0.1 and ::1) after Apply while
+	// AllowOutboundNet is true. Non-loopback interfaces and Unix domain
+	// sockets remain blocked.
+	AllowLoopbackBind bool
+
+	// DynamicListeners bounds concurrent dynamic TCP listeners that call
+	// AcceptListener while AllowLoopbackBind is true. Windows pre-warms enough
+	// locked accept-broker threads for PreboundListeners plus DynamicListeners.
+	DynamicListeners int
+
 	// OutboundUDPPorts lists remote UDP ports that pre-bound UDP sockets may
 	// send to and receive from. The -net=wg backend sets the WireGuard peer
 	// port here. Seatbelt can match remote ports but not remote addresses.
@@ -143,9 +154,10 @@ type Status struct {
 }
 
 var (
-	lockdownMu     sync.Mutex
-	lockedDownFlag atomic.Bool
-	lastStatus     Status
+	lockdownMu          sync.Mutex
+	lockedDownFlag      atomic.Bool
+	loopbackBindAllowed atomic.Bool
+	lastStatus          Status
 )
 
 // Apply locks down the current host process using OS-native containment
@@ -179,6 +191,7 @@ func Apply(opts Options) (Status, error) {
 	}
 	st.Applied = true
 	lastStatus = st
+	loopbackBindAllowed.Store(opts.AllowOutboundNet && opts.AllowLoopbackBind)
 	lockedDownFlag.Store(true)
 	return st, nil
 }

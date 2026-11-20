@@ -122,5 +122,9 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	defer func() {
 		_ = sb.Close()
 	}()
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", stderr)
+	errOut := stderr
+	if rc.cfg.Stderr != nil {
+		errOut = rc.cfg.Stderr
+	}
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", errOut)
 }

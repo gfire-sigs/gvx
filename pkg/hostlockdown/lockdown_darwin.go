@@ -86,6 +86,9 @@ func BuildSeatbeltProfile(opts Options) string {
 		b.WriteString("(allow network-outbound)\n")
 		b.WriteString("(allow network-inbound)\n")
 		b.WriteString(denyNewBind)
+		if opts.AllowLoopbackBind {
+			b.WriteString(allowLoopbackBind)
+		}
 	case len(opts.OutboundUDPPorts) > 0:
 		for _, port := range opts.OutboundUDPPorts {
 			fmt.Fprintf(&b, "(allow network-outbound (remote udp \"*:%d\"))\n", port)
@@ -108,6 +111,11 @@ func BuildSeatbeltProfile(opts Options) string {
 // denyNewBind follows every network-inbound allow. network-inbound also
 // grants bind, and only pre-bound sockets may receive traffic.
 const denyNewBind = "(deny network-bind)\n"
+
+// allowLoopbackBind follows denyNewBind when AllowLoopbackBind is enabled.
+// It permits binding host IPv4/IPv6 loopback ports while keeping Unix socket
+// binds denied.
+const allowLoopbackBind = "(allow network-bind (local ip \"localhost:*\"))\n"
 
 // resolveMounts returns the absolute path of every mount and the path after
 // symlink resolution. The result has one entry per mount, in order.

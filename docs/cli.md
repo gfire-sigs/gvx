@@ -62,6 +62,7 @@ The table below lists the `rungv run` flags that match the Docker command line.
 | `-t` | Allocate a pseudo-terminal. |
 | `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. A range such as `8000-8009:8000-8009` publishes each port. `unix:PATH:GUEST` publishes a guest TCP port on a host Unix socket. Section 4.7 gives the rules. |
 | `-P` | Publish every port that the image declares with `EXPOSE` to a free port of `127.0.0.1`. |
+| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` while the sandbox runs. Static `-p` rules keep precedence. Section 4.7 gives the rules. |
 | `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, one host file, or a named volume. |
 | `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. A `type=volume` source with a path separator names an image file. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
@@ -134,6 +135,8 @@ To rewrite the table after a change of the registry, run `go test ./pkg/gvx/tuni
 | `net.forward.guest_dial_window` | duration | 3s | 10ms to 10m | time | Time that a published TCP port waits for the guest to listen before it closes the host client. |
 | `net.forward.guest_dial_interval` | duration | 15ms | 1ms to 10s | time | Pause between two attempts of a published TCP port to reach the guest listener. |
 | `net.forward.max_port_range` | int | 1024 | 1 to 65535 | ports | Largest number of ports in one range of a publish specification, such as 30000-32767. |
+| `net.forward.max_dynamic_ports` | int | 64 | 1 to 256 | ports | Largest number of host loopback ports that auto-publish opens at once. |
+| `net.forward.dynamic_poll_interval` | duration | 200ms | 20ms to 10s | time | Pause between two scans of guest listeners and iptables NAT rules when auto-publish is on. |
 | `net.wg.queue_length` | int | 512 | 1 to 1048576 | packets | Number of packets that the eth0 queue holds in the wg network mode. |
 | `net.wg.resolve_timeout` | duration | 10s | 100ms to 10m | time | Time that the sandbox waits to resolve the host name of the WireGuard peer endpoint. |
 | `memory.guard.poll_interval` | duration | 5ms | 1ms to 10s | time | Time between two readings of the guest memory use when the sandbox has a memory limit. |
@@ -254,7 +257,9 @@ The root file system is a mount on top of a hidden read-only root, as in runsc. 
 
 ### 4.7 Published ports
 
-`rungv` binds each published port before the lockdown. It prints one line for each port to the standard error before the guest starts, as in `rungv: publishing 127.0.0.1:49493 -> 8080/tcp`. The line shows the free port that the host chose. A published port needs the NAT network mode. The guest cannot add a published port after the start, so publish every port that a program in the guest will use, such as the ports of nested containers.
+`rungv` binds each static `-p` port before the lockdown. It prints one line for each port to standard error before the guest starts, as in `rungv: publishing 127.0.0.1:49493 -> 8080/tcp`. The line shows the free port that the host chose. Published ports need the NAT network mode. Without `--auto-publish`, the guest cannot add a published port after start, so publish every port that a program in the guest uses with `-p`.
+
+When `--auto-publish` (`Config.AutoPublishPorts`) is set, `rungv` relaxes host lockdown only for loopback binds (`127.0.0.1`). It scans guest TCP listeners and `iptables` NAT `DNAT` rules every `net.forward.dynamic_poll_interval` (default `200ms`). It opens matching `127.0.0.1` listeners up to `net.forward.max_dynamic_ports` (default `64`). When the guest closes a listener or removes a `DNAT` rule, `rungv` closes the host listener. Static `-p` rules always keep precedence, so `rungv` never exposes a guest port from `-p unix:...` on `127.0.0.1`. If a host port is busy, `rungv` prints one warning to standard error and leaves the host process untouched.
 
 A range publishes one port for each number. The host range and the guest range must have the same length, as in `-p 8000-8009:8000-8009`. A guest range alone, as in `-p 8000-8009`, gets free host ports. One range has at most 1024 ports. A host port range and a single guest port are refused.
 

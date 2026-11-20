@@ -100,6 +100,23 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 			},
 		},
 		{
+			name: "nat with loopback bind",
+			opts: Options{AllowOutboundNet: true, AllowLoopbackBind: true},
+			wantAllow: []string{
+				"(allow signal (target children))",
+				"(allow network-outbound)",
+				"(allow network-inbound)",
+				`(allow network-bind (local ip "localhost:*"))`,
+			},
+		},
+		{
+			name: "loopback bind without outbound net stays denied",
+			opts: Options{AllowLoopbackBind: true},
+			wantAllow: []string{
+				"(allow signal (target children))",
+			},
+		},
+		{
 			name: "udp peer",
 			opts: Options{OutboundUDPPorts: []uint16{51820, 51821}},
 			wantAllow: []string{
