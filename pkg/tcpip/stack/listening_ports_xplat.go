@@ -29,6 +29,8 @@ type BoundEndpoint struct {
 
 // ListeningEndpoints returns every registered TCP listening endpoint in s.
 // Listening TCP endpoints register with no remote address or remote port.
+// Dual-stack wildcard listeners yield one entry per network protocol (IPv4 and
+// IPv6). The returned slice order is unspecified.
 func (s *Stack) ListeningEndpoints() []BoundEndpoint {
 	if s == nil || s.demux == nil {
 		return nil
