@@ -25,6 +25,7 @@ import (
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sync"
@@ -42,12 +43,37 @@ const (
 // renderNodePath is the devtmpfs path of the node.
 const renderNodePath = "dri/renderD128"
 
+// modeMask is a set of renderer modes.
+type modeMask uint8
+
+const (
+	modeVenus modeMask = 1 << iota
+	modeVirgl
+	modeAll = modeVenus | modeVirgl
+)
+
+func maskOf(m gpuproto.Mode) modeMask {
+	switch m {
+	case gpuproto.ModeVenus:
+		return modeVenus
+	case gpuproto.ModeVirgl:
+		return modeVirgl
+	default:
+		return 0
+	}
+}
+
 var (
 	// ErrNoVenusCapset is returned by Register when the renderer did not report
 	// the venus capset in its handshake.
 	ErrNoVenusCapset = errors.New("virtgpu: renderer has no venus capset")
 
+	// Register returns ErrNoVirglCapset when a virgl renderer did not report
+	// the virgl capsets in its handshake.
+	ErrNoVirglCapset = errors.New("virtgpu: renderer has no virgl capsets")
+
 	errNilRenderer = errors.New("virtgpu: nil renderer")
+	errUnknownMode = errors.New("virtgpu: renderer reports an unknown mode")
 )
 
 // Device is the render node of one sandbox. It holds no process-wide state:
@@ -55,6 +81,11 @@ var (
 type Device struct {
 	vfs      *vfs.VirtualFilesystem
 	renderer Renderer
+
+	// mode, modes, and capsets never change after Register.
+	mode    gpuproto.Mode
+	modes   modeMask
+	capsets uint64 // bit n set: Device serves capset n (VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs)
 
 	// lastCtxID is the last context ID that allocCtxID returned.
 	lastCtxID atomicbitops.Uint32
@@ -88,6 +119,14 @@ type Device struct {
 
 var _ vfs.Device = (*Device)(nil)
 
+func (d *Device) hasCapset(id uint32) bool {
+	return id < 64 && d.capsets&(uint64(1)<<id) != 0
+}
+
+func isVirglCapset(id uint32) bool {
+	return id == gpuproto.CapsetVirgl || id == gpuproto.CapsetVirgl2
+}
+
 // Register creates the render node of one sandbox, registers it with vfsObj,
 // and installs the device as the event sink of r. Call it before the devtmpfs
 // mount, so that /dev/dri/renderD128 and /dev/char/226:128 exist.
@@ -95,13 +134,28 @@ func Register(vfsObj *vfs.VirtualFilesystem, r Renderer, lim Limits) (*Device, e
 	if r == nil {
 		return nil, errNilRenderer
 	}
-	if _, ok := r.Capset(virtgpuCapsetVenus, 0); !ok {
-		return nil, ErrNoVenusCapset
+	mode := r.Mode()
+	modes := maskOf(mode)
+	if modes == 0 {
+		return nil, errUnknownMode
+	}
+	var capsets uint64
+	for _, id := range mode.Capsets() {
+		if _, ok := r.Capset(id, 0); !ok {
+			if mode == gpuproto.ModeVenus {
+				return nil, ErrNoVenusCapset
+			}
+			return nil, ErrNoVirglCapset
+		}
+		capsets |= uint64(1) << id
 	}
 	lim = lim.withDefaults()
 	d := &Device{
 		vfs:      vfsObj,
 		renderer: r,
+		mode:     mode,
+		modes:    modes,
+		capsets:  capsets,
 		limits:   lim,
 		budget:   blobBudget{limit: lim.BlobBytes},
 		contexts: make(map[uint32]*fileContext),
@@ -149,10 +203,12 @@ type renderFD struct {
 	// events, so nothing notifies it with EventIn.
 	queue waiter.Queue
 
-	// initMu serializes CONTEXT_INIT. It is held across the CreateContext call.
+	// initMu serializes CONTEXT_INIT and the implicit context creation of
+	// ensureContext. Both hold it across the CreateContext call.
 	initMu sync.Mutex
 
-	// ctx is nil until CONTEXT_INIT succeeds, then constant.
+	// ctx stays nil until createContextLocked stores the context. It then
+	// never changes.
 	ctx atomic.Pointer[fileContext]
 
 	gemMu sync.Mutex

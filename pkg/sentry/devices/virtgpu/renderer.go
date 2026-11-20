@@ -42,6 +42,14 @@ type Renderer interface {
 	Submit(ctxID uint32, cmd []byte, fence *gpuproto.Fence) error
 	// SetEventSink installs the event receiver. Call it once, before the first CreateContext.
 	SetEventSink(sink gpuproto.EventSink)
+	// Mode returns the command stream that the renderer serves. It never changes.
+	Mode() gpuproto.Mode
+	// CreateResource creates a virgl resource with a shared-memory backing,
+	// attaches it to req.CtxID, and waits for the reply. On success the caller
+	// owns Blob.Shm.
+	CreateResource(ctx stdcontext.Context, req gpuproto.ResourceCreate) (gpuproto.Blob, error)
+	// Transfer runs one TRANSFER and waits until the copy is complete.
+	Transfer(ctx stdcontext.Context, req gpuproto.Transfer) error
 }
 
 // callRenderer runs call on a new goroutine and blocks the task until call

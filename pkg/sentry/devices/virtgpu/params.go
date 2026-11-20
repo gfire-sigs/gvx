@@ -34,16 +34,22 @@ func (fd *renderFD) getParam(ctx context.Context, uio usermem.IO, arg []byte) er
 	switch req.Param {
 	case virtgpuParam3DFeatures,
 		virtgpuParamCapsetQueryFix,
-		virtgpuParamResourceBlob,
-		virtgpuParamHostVisible,
 		virtgpuParamContextInit,
 		virtgpuParamExplicitDebugName:
 		val = 1
+	case virtgpuParamResourceBlob,
+		virtgpuParamHostVisible:
+		if fd.dev.modes&modeVenus != 0 {
+			val = 1
+		}
 	case virtgpuParamCrossDevice:
 		val = 0
 	case virtgpuParamSupportedCapsetIDs:
-		val = 1 << virtgpuCapsetVenus
+		val = uint32(fd.dev.capsets)
 	case virtgpuParamBlobAlignment:
+		if fd.dev.modes&modeVenus == 0 {
+			return linuxerr.EINVAL
+		}
 		val = blobAlignment
 	default:
 		return linuxerr.EINVAL

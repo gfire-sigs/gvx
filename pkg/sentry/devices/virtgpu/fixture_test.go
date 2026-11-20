@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
@@ -79,6 +80,21 @@ type isolatedContext struct {
 
 func (c *isolatedContext) Block(ch <-chan struct{}) error {
 	return c.nt.Block(ch)
+}
+
+func (c *isolatedContext) BlockWithTimeout(ch chan struct{}, haveTimeout bool, timeout time.Duration) (time.Duration, error) {
+	if !haveTimeout {
+		return timeout, c.nt.Block(ch)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	start := time.Now()
+	select {
+	case <-ch:
+		return max(0, timeout-time.Since(start)), nil
+	case <-timer.C:
+		return 0, linuxerr.ETIMEDOUT
+	}
 }
 
 func newTestNodeWithLimits(t *testing.T, r Renderer, lim Limits) *testNode {
@@ -180,6 +196,18 @@ func (n *testNode) openVenus(t *testing.T) *vfs.FileDescription {
 	return fd
 }
 
+func (n *testNode) openVirgl(t *testing.T) *vfs.FileDescription {
+	t.Helper()
+	fd := n.open(t)
+	mem := newGuestMem()
+	putContextInit(t, mem, 0x1000, 0x2000, mesaVirglParams())
+	if err := n.ioctl(fd, cmdVirtgpuContextInit, mem, 0x1000); err != nil {
+		fd.DecRef(n.ctx)
+		t.Fatalf("CONTEXT_INIT(virgl): %v", err)
+	}
+	return fd
+}
+
 func (n *testNode) ioctl(fd *vfs.FileDescription, cmd uint32, mem *guestMem, addr hostarch.Addr) error {
 	return n.ioctlWithCtx(n.ctx, fd, cmd, mem, addr)
 }
@@ -276,6 +304,23 @@ func (c *testTaskCtx) Block(ch <-chan struct{}) error {
 		return nil
 	case <-c.intr:
 		return linuxerr.ErrInterrupted
+	}
+}
+
+func (c *testTaskCtx) BlockWithTimeout(ch chan struct{}, haveTimeout bool, timeout time.Duration) (time.Duration, error) {
+	if !haveTimeout {
+		return timeout, c.Block(ch)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	start := time.Now()
+	select {
+	case <-ch:
+		return max(0, timeout-time.Since(start)), nil
+	case <-c.intr:
+		return max(0, timeout-time.Since(start)), linuxerr.ErrInterrupted
+	case <-timer.C:
+		return 0, linuxerr.ETIMEDOUT
 	}
 }
 

@@ -163,7 +163,11 @@ const (
 	virtgpuExecbufFenceFDOut = 0x02
 	virtgpuExecbufRingIdx    = 0x04
 
-	virtgpuCapsetVenus = gpuproto.CapsetVenus
+	virtgpuWaitNoWait = 1 // VIRTGPU_WAIT_NOWAIT
+
+	virtgpuCapsetVirgl  = gpuproto.CapsetVirgl  // VIRTGPU_DRM_CAPSET_VIRGL
+	virtgpuCapsetVirgl2 = gpuproto.CapsetVirgl2 // VIRTGPU_DRM_CAPSET_VIRGL2
+	virtgpuCapsetVenus  = gpuproto.CapsetVenus
 
 	virtgpuBlobMemGuest       = 0x0001
 	virtgpuBlobMemHost3D      = 0x0002
@@ -235,6 +239,51 @@ type virtgpuGetparam struct {
 	Value uint64
 }
 
+// virtgpuResourceCreate is struct drm_virtgpu_resource_create (56 bytes).
+type virtgpuResourceCreate struct {
+	Target    uint32
+	Format    uint32
+	Bind      uint32
+	Width     uint32
+	Height    uint32
+	Depth     uint32
+	ArraySize uint32
+	LastLevel uint32
+	NrSamples uint32
+	Flags     uint32
+	BoHandle  uint32
+	ResHandle uint32
+	Size      uint32
+	Stride    uint32
+}
+
+// virtgpu3DBox is struct drm_virtgpu_3d_box (24 bytes).
+type virtgpu3DBox struct {
+	X uint32
+	Y uint32
+	Z uint32
+	W uint32
+	H uint32
+	D uint32
+}
+
+// virtgpu3DTransfer is struct drm_virtgpu_3d_transfer_to_host and
+// struct drm_virtgpu_3d_transfer_from_host (44 bytes, one layout).
+type virtgpu3DTransfer struct {
+	BoHandle    uint32
+	Box         virtgpu3DBox
+	Level       uint32
+	Offset      uint32
+	Stride      uint32
+	LayerStride uint32
+}
+
+// virtgpu3DWait is struct drm_virtgpu_3d_wait (8 bytes).
+type virtgpu3DWait struct {
+	Handle uint32
+	Flags  uint32
+}
+
 // virtgpuResourceInfo is struct drm_virtgpu_resource_info.
 type virtgpuResourceInfo struct {
 	BoHandle  uint32
@@ -288,7 +337,11 @@ var (
 	cmdVirtgpuMap                = linux.IOWR(drmIoctlBase, nrVirtgpuMap, uint32(unsafe.Sizeof(virtgpuMap{})))
 	cmdVirtgpuExecbuffer         = linux.IOWR(drmIoctlBase, nrVirtgpuExecbuffer, uint32(unsafe.Sizeof(virtgpuExecbuffer{})))
 	cmdVirtgpuGetparam           = linux.IOWR(drmIoctlBase, nrVirtgpuGetparam, uint32(unsafe.Sizeof(virtgpuGetparam{})))
+	cmdVirtgpuResourceCreate     = linux.IOWR(drmIoctlBase, nrVirtgpuResourceCreate, uint32(unsafe.Sizeof(virtgpuResourceCreate{})))
 	cmdVirtgpuResourceInfo       = linux.IOWR(drmIoctlBase, nrVirtgpuResourceInfo, uint32(unsafe.Sizeof(virtgpuResourceInfo{})))
+	cmdVirtgpuTransferFromHost   = linux.IOWR(drmIoctlBase, nrVirtgpuTransferFromHost, uint32(unsafe.Sizeof(virtgpu3DTransfer{})))
+	cmdVirtgpuTransferToHost     = linux.IOWR(drmIoctlBase, nrVirtgpuTransferToHost, uint32(unsafe.Sizeof(virtgpu3DTransfer{})))
+	cmdVirtgpuWait               = linux.IOWR(drmIoctlBase, nrVirtgpuWait, uint32(unsafe.Sizeof(virtgpu3DWait{})))
 	cmdVirtgpuGetCaps            = linux.IOWR(drmIoctlBase, nrVirtgpuGetCaps, uint32(unsafe.Sizeof(virtgpuGetCaps{})))
 	cmdVirtgpuResourceCreateBlob = linux.IOWR(drmIoctlBase, nrVirtgpuResourceCreateBlob, uint32(unsafe.Sizeof(virtgpuResourceCreateBlob{})))
 	cmdVirtgpuContextInit        = linux.IOWR(drmIoctlBase, nrVirtgpuContextInit, uint32(unsafe.Sizeof(virtgpuContextInit{})))

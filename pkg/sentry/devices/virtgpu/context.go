@@ -63,6 +63,10 @@ type fileContext struct {
 	dead bool
 }
 
+func (c *fileContext) isVirgl() bool {
+	return isVirglCapset(c.capsetID)
+}
+
 // allocCtxID returns a context ID that is not 0 and that d never returned
 // before. It returns 0 once the 32-bit space is exhausted.
 func (d *Device) allocCtxID() uint32 {
@@ -99,6 +103,70 @@ func (d *Device) destroyContext(c *fileContext) {
 	d.sendDestroy(c)
 }
 
+// createContextLocked allocates an ID, enters c in d.contexts, and calls
+// CreateContext. The caller holds fd.initMu and saw fd.ctx == nil. It stores
+// c in fd.ctx on success. Errors: EIO (renderer lost or ID space empty),
+// ENOSPC (maxContexts), and the CreateContext errno.
+//
+// +checklocks:fd.initMu
+func (fd *renderFD) createContextLocked(ctx context.Context, capsetID, rings uint32, name string) (*fileContext, error) {
+	if fd.dev.lost.Load() {
+		return nil, linuxerr.EIO
+	}
+	id := fd.dev.allocCtxID()
+	if id == 0 {
+		return nil, linuxerr.EIO
+	}
+
+	c := &fileContext{
+		id:       id,
+		capsetID: capsetID,
+		numRings: rings,
+	}
+	fd.dev.mu.Lock()
+	if fd.dev.lost.Load() {
+		fd.dev.mu.Unlock()
+		return nil, linuxerr.EIO
+	}
+	if len(fd.dev.contexts) >= maxContexts {
+		fd.dev.mu.Unlock()
+		return nil, linuxerr.ENOSPC
+	}
+	fd.dev.contexts[id] = c
+	fd.dev.mu.Unlock()
+
+	err := callRenderer(ctx, func(cc stdcontext.Context) error {
+		return fd.dev.renderer.CreateContext(cc, id, capsetID, name)
+	})
+	if err != nil {
+		fd.dev.mu.Lock()
+		delete(fd.dev.contexts, id)
+		fd.dev.mu.Unlock()
+		return nil, err
+	}
+	fd.ctx.Store(c)
+	return c, nil
+}
+
+// ensureContext returns the context of fd. In virgl mode it first creates an
+// implicit context with gpuproto.CapsetVirgl2, no rings, and no name, as Linux
+// virtio_gpu_create_context does for RESOURCE_CREATE, TRANSFER_*, and
+// EXECBUFFER. In venus mode it returns EINVAL when fd has no context.
+func (fd *renderFD) ensureContext(ctx context.Context) (*fileContext, error) {
+	if c := fd.ctx.Load(); c != nil {
+		return c, nil
+	}
+	if fd.dev.modes&modeVirgl == 0 {
+		return nil, linuxerr.EINVAL
+	}
+	fd.initMu.Lock()
+	defer fd.initMu.Unlock()
+	if c := fd.ctx.Load(); c != nil {
+		return c, nil
+	}
+	return fd.createContextLocked(ctx, gpuproto.CapsetVirgl2, 0, "")
+}
+
 // contextInit serves DRM_IOCTL_VIRTGPU_CONTEXT_INIT.
 func (fd *renderFD) contextInit(ctx context.Context, uio usermem.IO, arg []byte) error {
 	var req virtgpuContextInit
@@ -132,16 +200,18 @@ func (fd *renderFD) contextInit(ctx context.Context, uio usermem.IO, arg []byte)
 		seenRings     bool
 		seenPollMask  bool
 		seenDebugName bool
+		capsetID      uint32
 		rings         uint32
 		name          string
 	)
 	for _, p := range params[:req.NumParams] {
 		switch p.Param {
 		case virtgpuContextParamCapsetID:
-			if seenCapset || p.Value > 63 || p.Value != virtgpuCapsetVenus {
+			if seenCapset || p.Value > 63 || !fd.dev.hasCapset(uint32(p.Value)) {
 				return linuxerr.EINVAL
 			}
 			seenCapset = true
+			capsetID = uint32(p.Value)
 		case virtgpuContextParamNumRings:
 			if seenRings || p.Value > gpuproto.MaxRings {
 				return linuxerr.EINVAL
@@ -170,40 +240,9 @@ func (fd *renderFD) contextInit(ctx context.Context, uio usermem.IO, arg []byte)
 	if !seenCapset {
 		return linuxerr.EINVAL
 	}
-	if fd.dev.lost.Load() {
-		return linuxerr.EIO
+	if isVirglCapset(capsetID) && rings > 1 {
+		return linuxerr.EINVAL
 	}
-	id := fd.dev.allocCtxID()
-	if id == 0 {
-		return linuxerr.EIO
-	}
-
-	c := &fileContext{
-		id:       id,
-		capsetID: virtgpuCapsetVenus,
-		numRings: rings,
-	}
-	fd.dev.mu.Lock()
-	if fd.dev.lost.Load() {
-		fd.dev.mu.Unlock()
-		return linuxerr.EIO
-	}
-	if len(fd.dev.contexts) >= maxContexts {
-		fd.dev.mu.Unlock()
-		return linuxerr.ENOSPC
-	}
-	fd.dev.contexts[id] = c
-	fd.dev.mu.Unlock()
-
-	err := callRenderer(ctx, func(cc stdcontext.Context) error {
-		return fd.dev.renderer.CreateContext(cc, id, virtgpuCapsetVenus, name)
-	})
-	if err != nil {
-		fd.dev.mu.Lock()
-		delete(fd.dev.contexts, id)
-		fd.dev.mu.Unlock()
-		return err
-	}
-	fd.ctx.Store(c)
-	return nil
+	_, err := fd.createContextLocked(ctx, capsetID, rings, name)
+	return err
 }

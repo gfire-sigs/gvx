@@ -374,3 +374,103 @@ func TestExecbufferFenceFDOutEMFILEClosesSyncFile(t *testing.T) {
 		t.Errorf("vfs.NumFiles() after EMFILE = %d, want %d", got, filesBefore)
 	}
 }
+
+func TestExecbufferVirglRecordsObjectFence(t *testing.T) {
+	requireBlobHost(t)
+
+	fake := newFakeVirglRenderer()
+	node := newTestNode(t, fake)
+	fd := node.openVirgl(t)
+	defer fd.DecRef(node.ctx)
+	ctxID := fake.createdCalls()[0].ctxID
+
+	res := mustCreateResource(t, node, fd, virtgpuResourceCreate{Size: 4096})
+
+	mem := newGuestMem()
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		boAddr     = hostarch.Addr(0x2000)
+	)
+	var boBuf [4]byte
+	binary.LittleEndian.PutUint32(boBuf[:], res.BoHandle)
+	mem.writeBytes(boAddr, boBuf[:])
+	mem.put(t, structAddr, virtgpuExecbuffer{
+		BoHandles:    uint64(boAddr),
+		NumBoHandles: 1,
+	})
+	if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); err != nil {
+		t.Fatalf("virgl EXECBUFFER with handle: %v", err)
+	}
+
+	calls := fake.submitCalls()
+	if len(calls) != 1 || calls[0].fence == nil {
+		t.Fatalf("submitCalls = %+v, want 1 call with fence", calls)
+	}
+	if calls[0].fence.RingIdx != 0 || calls[0].fence.ID == 0 {
+		t.Fatalf("submitted fence = %+v, want ring 0 and non-zero ID", *calls[0].fence)
+	}
+
+	mem.put(t, structAddr, virtgpu3DWait{Handle: res.BoHandle, Flags: virtgpuWaitNoWait})
+	if err := node.ioctl(fd, cmdVirtgpuWait, mem, structAddr); !linuxerr.Equals(linuxerr.EBUSY, err) {
+		t.Fatalf("WAIT(NOWAIT) before FenceDone: got %v, want EBUSY", err)
+	}
+
+	fake.emitFenceDone(ctxID, 0, calls[0].fence.ID)
+
+	mem.put(t, structAddr, virtgpu3DWait{Handle: res.BoHandle})
+	if err := node.ioctl(fd, cmdVirtgpuWait, mem, structAddr); err != nil {
+		t.Fatalf("WAIT after FenceDone: got %v, want nil", err)
+	}
+}
+
+func TestExecbufferVirglWithoutHandlesHasNoFence(t *testing.T) {
+	fake := newFakeVirglRenderer()
+	node := newTestNode(t, fake)
+	fd := node.openVirgl(t)
+	defer fd.DecRef(node.ctx)
+
+	mem := newGuestMem()
+	const structAddr = hostarch.Addr(0x1000)
+	mem.put(t, structAddr, virtgpuExecbuffer{})
+	if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); err != nil {
+		t.Fatalf("virgl EXECBUFFER without handles: %v", err)
+	}
+
+	calls := fake.submitCalls()
+	if len(calls) != 1 || calls[0].fence != nil {
+		t.Fatalf("submitCalls = %+v, want 1 call with nil fence", calls)
+	}
+}
+
+func TestExecbufferVenusKeepsNoObjectFence(t *testing.T) {
+	fake := newFakeRenderer()
+	node := newTestNode(t, fake)
+	fd := node.openVenus(t)
+	defer fd.DecRef(node.ctx)
+
+	bo := mustCreateBlob(t, node, fd, virtgpuResourceCreateBlob{
+		BlobMem: virtgpuBlobMemHost3D,
+		Size:    0x1000,
+	})
+
+	mem := newGuestMem()
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		boAddr     = hostarch.Addr(0x2000)
+	)
+	var boBuf [4]byte
+	binary.LittleEndian.PutUint32(boBuf[:], bo.BoHandle)
+	mem.writeBytes(boAddr, boBuf[:])
+	mem.put(t, structAddr, virtgpuExecbuffer{
+		BoHandles:    uint64(boAddr),
+		NumBoHandles: 1,
+	})
+	if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); err != nil {
+		t.Fatalf("venus EXECBUFFER with handle: %v", err)
+	}
+
+	calls := fake.submitCalls()
+	if len(calls) != 1 || calls[0].fence != nil {
+		t.Fatalf("submitCalls = %+v, want 1 call with nil fence", calls)
+	}
+}

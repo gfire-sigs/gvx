@@ -16,6 +16,7 @@ package virtgpu
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -269,4 +270,121 @@ func TestFenceTimeoutOnRealRenderer(t *testing.T) {
 	// The renderer stays alive and a new DRM file can create a context.
 	fd2 := node.openVenus(t)
 	fd2.DecRef(node.ctx)
+}
+
+func TestVirglResourceOnRealRenderer(t *testing.T) {
+	client := gpurendertest.NewVirgl(t)
+	node := newTestNode(t, client)
+	fd := node.openVirgl(t)
+	defer fd.DecRef(node.ctx)
+
+	const bufSize = 65536
+	res := mustCreateResource(t, node, fd, virtgpuResourceCreate{
+		Target:    0,      // PIPE_BUFFER
+		Format:    64,     // VIRGL_FORMAT_R8_UNORM
+		Bind:      1 << 4, // VIRGL_BIND_VERTEX_BUFFER
+		Width:     bufSize,
+		Height:    1,
+		Depth:     1,
+		ArraySize: 1,
+		Size:      bufSize,
+	})
+
+	off := mustMapOffset(t, node, fd, res.BoHandle)
+	opts := memmap.MMapOpts{Offset: off, Length: bufSize}
+	if err := fd.ConfigureMMap(node.ctx, &opts); err != nil {
+		t.Fatalf("ConfigureMMap: %v", err)
+	}
+	defer opts.MappingIdentity.DecRef(node.ctx)
+
+	req := memmap.MappableRange{Start: 0, End: bufSize}
+	ts, err := opts.Mappable.Translate(node.ctx, req, req, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	fr := memmap.FileRange{Start: 0, End: bufSize}
+	ts[0].File.IncRef(fr, 0)
+	defer ts[0].File.DecRef(fr)
+
+	bs, err := ts[0].File.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+
+	pattern := make([]byte, bufSize)
+	for i := range pattern {
+		pattern[i] = byte((i*31 + 17) & 0xff)
+	}
+	if _, err := safemem.CopySeq(bs, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(pattern))); err != nil {
+		t.Fatalf("CopySeq write pattern: %v", err)
+	}
+
+	mem := newGuestMem()
+	const addr = hostarch.Addr(0x1000)
+	xfer := virtgpu3DTransfer{
+		BoHandle: res.BoHandle,
+		Box:      virtgpu3DBox{W: bufSize, H: 1, D: 1},
+	}
+	mem.put(t, addr, xfer)
+	if err := node.ioctl(fd, cmdVirtgpuTransferToHost, mem, addr); err != nil {
+		t.Fatalf("TRANSFER_TO_HOST: %v", err)
+	}
+
+	zeros := make([]byte, bufSize)
+	if _, err := safemem.CopySeq(bs, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(zeros))); err != nil {
+		t.Fatalf("CopySeq zero view: %v", err)
+	}
+
+	mem.put(t, addr, xfer)
+	if err := node.ioctl(fd, cmdVirtgpuTransferFromHost, mem, addr); err != nil {
+		t.Fatalf("TRANSFER_FROM_HOST: %v", err)
+	}
+
+	got := make([]byte, bufSize)
+	if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), bs); err != nil {
+		t.Fatalf("CopySeq read back: %v", err)
+	}
+	if !bytes.Equal(got, pattern) {
+		t.Fatalf("read-back bytes differ from transferred pattern")
+	}
+}
+
+func TestVirglWaitOnRealRenderer(t *testing.T) {
+	client := gpurendertest.NewVirgl(t)
+	node := newTestNodeWithLimits(t, client, Limits{WaitTimeout: time.Second})
+	fd := node.openVirgl(t)
+	defer fd.DecRef(node.ctx)
+
+	res := mustCreateResource(t, node, fd, virtgpuResourceCreate{
+		Target:    0,      // PIPE_BUFFER
+		Format:    64,     // VIRGL_FORMAT_R8_UNORM
+		Bind:      1 << 4, // VIRGL_BIND_VERTEX_BUFFER
+		Width:     4096,
+		Height:    1,
+		Depth:     1,
+		ArraySize: 1,
+		Size:      4096,
+	})
+
+	mem := newGuestMem()
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		boAddr     = hostarch.Addr(0x2000)
+	)
+	var boBuf [4]byte
+	binary.LittleEndian.PutUint32(boBuf[:], res.BoHandle)
+	mem.writeBytes(boAddr, boBuf[:])
+	mem.put(t, structAddr, virtgpuExecbuffer{
+		BoHandles:    uint64(boAddr),
+		NumBoHandles: 1,
+	})
+	if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); err != nil {
+		t.Fatalf("virgl EXECBUFFER: %v", err)
+	}
+
+	tc := newTestTaskCtx(t, node.ctx)
+	mem.put(t, structAddr, virtgpu3DWait{Handle: res.BoHandle})
+	if err := node.ioctlWithCtx(tc, fd, cmdVirtgpuWait, mem, structAddr); err != nil {
+		t.Fatalf("virgl WAIT: got %v, want nil", err)
+	}
 }

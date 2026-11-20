@@ -18,9 +18,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
@@ -126,4 +130,76 @@ func TestBuildIoctlTablePanicsOnOverlap(t *testing.T) {
 		map[uint32]ioctlEntry{nrVersion: {name: "DRM_IOCTL_VERSION", cmd: cmdVersion, fn: (*renderFD).version}},
 		map[uint32]refusal{nrVersion: {name: "DRM_IOCTL_VERSION", err: linuxerr.EINVAL}},
 	)
+}
+
+type captureDebugCtx struct {
+	context.Context
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *captureDebugCtx) Debugf(format string, v ...any) {
+	c.mu.Lock()
+	c.lines = append(c.lines, fmt.Sprintf(format, v...))
+	c.mu.Unlock()
+}
+
+func (c *captureDebugCtx) takeLines() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.lines
+	c.lines = nil
+	return out
+}
+
+func TestModeGatedIoctls(t *testing.T) {
+	t.Run("venus refuses virgl ioctls with EINVAL and logs once each", func(t *testing.T) {
+		node := newTestNode(t, newFakeRenderer())
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+		dctx := &captureDebugCtx{Context: node.ctx}
+		mem := newGuestMem()
+
+		gated := []struct {
+			name string
+			cmd  uint32
+		}{
+			{"DRM_IOCTL_VIRTGPU_RESOURCE_CREATE", cmdVirtgpuResourceCreate},
+			{"DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST", cmdVirtgpuTransferFromHost},
+			{"DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST", cmdVirtgpuTransferToHost},
+			{"DRM_IOCTL_VIRTGPU_WAIT", cmdVirtgpuWait},
+		}
+		for _, tc := range gated {
+			for attempt := range 2 {
+				err := node.ioctlWithCtx(dctx, fd, tc.cmd, mem, badGuestAddr)
+				if !linuxerr.Equals(linuxerr.EINVAL, err) {
+					t.Errorf("%s attempt %d: got %v, want EINVAL", tc.name, attempt+1, err)
+				}
+			}
+			lines := dctx.takeLines()
+			if len(lines) != 1 || !strings.Contains(lines[0], "refused ioctl "+tc.name) {
+				t.Errorf("%s debug lines = %q, want 1 line naming %s", tc.name, lines, tc.name)
+			}
+		}
+	})
+
+	t.Run("virgl refuses RESOURCE_CREATE_BLOB with EINVAL and logs once", func(t *testing.T) {
+		node := newTestNode(t, newFakeVirglRenderer())
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+		dctx := &captureDebugCtx{Context: node.ctx}
+		mem := newGuestMem()
+
+		for attempt := range 2 {
+			err := node.ioctlWithCtx(dctx, fd, cmdVirtgpuResourceCreateBlob, mem, badGuestAddr)
+			if !linuxerr.Equals(linuxerr.EINVAL, err) {
+				t.Errorf("RESOURCE_CREATE_BLOB attempt %d: got %v, want EINVAL", attempt+1, err)
+			}
+		}
+		lines := dctx.takeLines()
+		const wantName = "DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB"
+		if len(lines) != 1 || !strings.Contains(lines[0], "refused ioctl "+wantName) {
+			t.Errorf("RESOURCE_CREATE_BLOB debug lines = %q, want 1 line naming %s", lines, wantName)
+		}
+	})
 }

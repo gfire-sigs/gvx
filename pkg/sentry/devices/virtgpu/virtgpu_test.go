@@ -21,6 +21,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -52,6 +53,7 @@ func TestRenderNodeInDevtmpfs(t *testing.T) {
 
 func TestRegisterRefusesRendererWithoutVenus(t *testing.T) {
 	fake := &fakeRenderer{
+		mode:     gpuproto.ModeVenus,
 		capsets:  map[capsetKey][]byte{},
 		contexts: make(map[uint32]createCall),
 	}
@@ -65,6 +67,70 @@ func TestRegisterRefusesRendererWithoutVenus(t *testing.T) {
 	}
 	if fake.hasSink() {
 		t.Errorf("SetEventSink was called despite Register failing")
+	}
+}
+
+func TestRegisterVirglNeedsCapsets(t *testing.T) {
+	cases := []struct {
+		name    string
+		fake    *fakeRenderer
+		wantErr error
+	}{
+		{
+			name: "missing capset 1",
+			fake: &fakeRenderer{
+				mode: gpuproto.ModeVirgl,
+				capsets: map[capsetKey][]byte{
+					{id: virtgpuCapsetVirgl2, version: 0}: make([]byte, 1408),
+				},
+				contexts: make(map[uint32]createCall),
+			},
+			wantErr: ErrNoVirglCapset,
+		},
+		{
+			name: "missing capset 2",
+			fake: &fakeRenderer{
+				mode: gpuproto.ModeVirgl,
+				capsets: map[capsetKey][]byte{
+					{id: virtgpuCapsetVirgl, version: 0}: make([]byte, 308),
+				},
+				contexts: make(map[uint32]createCall),
+			},
+			wantErr: ErrNoVirglCapset,
+		},
+		{
+			name: "unknown mode 0",
+			fake: &fakeRenderer{
+				mode:     0,
+				capsets:  map[capsetKey][]byte{},
+				contexts: make(map[uint32]createCall),
+			},
+			wantErr: errUnknownMode,
+		},
+		{
+			name: "unknown mode 99",
+			fake: &fakeRenderer{
+				mode:     99,
+				capsets:  map[capsetKey][]byte{},
+				contexts: make(map[uint32]createCall),
+			},
+			wantErr: errUnknownMode,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := &vfs.VirtualFilesystem{}
+			if err := v.Init(context.Background()); err != nil {
+				t.Fatalf("VirtualFilesystem.Init: %v", err)
+			}
+			if _, err := Register(v, tc.fake, Limits{}); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Register(%s): got %v, want %v", tc.name, err, tc.wantErr)
+			}
+			if tc.fake.hasSink() {
+				t.Errorf("SetEventSink was called despite Register failing")
+			}
+		})
 	}
 }
 

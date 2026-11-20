@@ -16,6 +16,7 @@ package virtgpu
 
 import (
 	stdcontext "context"
+	"encoding/binary"
 	"fmt"
 	"slices"
 	"sync"
@@ -55,6 +56,7 @@ type fakeOp struct {
 type fakeRenderer struct {
 	mu sync.Mutex
 
+	mode           gpuproto.Mode
 	capsets        map[capsetKey][]byte
 	contexts       map[uint32]createCall
 	created        []createCall
@@ -73,6 +75,15 @@ type fakeRenderer struct {
 	blobGate       chan struct{}
 	blobEntered    chan struct{}
 	blobCanceled   bool
+
+	resCreated  []gpuproto.ResourceCreate
+	transfers   []gpuproto.Transfer
+	resErr      error
+	transferErr error
+	resGate     chan struct{}
+	resEntered  chan struct{}
+	resCanceled bool
+	nilResShm   bool
 
 	unrefed   []unrefCall
 	submits   []submitCall
@@ -94,12 +105,42 @@ func newFakeRenderer() *fakeRenderer {
 		capData[i] = byte(i + 1)
 	}
 	return &fakeRenderer{
+		mode: gpuproto.ModeVenus,
 		capsets: map[capsetKey][]byte{
 			{id: virtgpuCapsetVenus, version: 0}: capData,
 		},
 		contexts:  make(map[uint32]createCall),
 		blobViews: make(map[uint32][]byte),
 	}
+}
+
+func newFakeVirglRenderer() *fakeRenderer {
+	makeCaps := func(size int, ver uint32, seed byte) []byte {
+		b := make([]byte, size)
+		binary.LittleEndian.PutUint32(b[:4], ver)
+		for i := 4; i < len(b); i++ {
+			b[i] = byte(i) ^ seed
+		}
+		return b
+	}
+	return &fakeRenderer{
+		mode: gpuproto.ModeVirgl,
+		capsets: map[capsetKey][]byte{
+			{id: virtgpuCapsetVirgl, version: 0}:  makeCaps(308, 1, 0x10),
+			{id: virtgpuCapsetVirgl, version: 1}:  makeCaps(308, 1, 0x11),
+			{id: virtgpuCapsetVirgl2, version: 0}: makeCaps(1408, 2, 0x20),
+			{id: virtgpuCapsetVirgl2, version: 1}: makeCaps(1408, 2, 0x21),
+			{id: virtgpuCapsetVirgl2, version: 2}: makeCaps(1408, 2, 0x22),
+		},
+		contexts:  make(map[uint32]createCall),
+		blobViews: make(map[uint32][]byte),
+	}
+}
+
+func (f *fakeRenderer) Mode() gpuproto.Mode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mode
 }
 
 func (f *fakeRenderer) cleanup() {
@@ -250,6 +291,90 @@ func (f *fakeRenderer) CreateBlob(ctx stdcontext.Context, req gpuproto.BlobCreat
 	f.blobViews[req.ResID] = view
 	f.mu.Unlock()
 	return gpuproto.Blob{Shm: h, HostSize: allocSize}, nil
+}
+
+func (f *fakeRenderer) CreateResource(ctx stdcontext.Context, req gpuproto.ResourceCreate) (gpuproto.Blob, error) {
+	f.mu.Lock()
+	gate := f.resGate
+	entered := f.resEntered
+	f.mu.Unlock()
+
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.resCanceled = true
+			f.mu.Unlock()
+			return gpuproto.Blob{}, ctx.Err()
+		}
+	}
+
+	f.mu.Lock()
+	if f.lost {
+		f.mu.Unlock()
+		return gpuproto.Blob{}, fmt.Errorf("fakeRenderer: %w", gpuproto.ErrRendererLost)
+	}
+	if f.resErr != nil {
+		err := f.resErr
+		f.mu.Unlock()
+		return gpuproto.Blob{}, err
+	}
+	f.resCreated = append(f.resCreated, req)
+	f.ops = append(f.ops, fakeOp{kind: "CreateResource", ctxID: req.CtxID, resID: req.ResID})
+	short := f.shortShm
+	nilShm := f.nilResShm
+	f.mu.Unlock()
+
+	if nilShm {
+		return gpuproto.Blob{}, nil
+	}
+
+	hostSize := roundUpBlobSize(req.Size)
+	allocSize := hostSize
+	if short {
+		allocSize = hostSize / 2
+	}
+	h, view, err := allocFakeShm(int64(allocSize))
+	if err != nil {
+		return gpuproto.Blob{}, err
+	}
+	f.mu.Lock()
+	if f.blobViews == nil {
+		f.blobViews = make(map[uint32][]byte)
+	}
+	f.blobViews[req.ResID] = view
+	f.mu.Unlock()
+	return gpuproto.Blob{Shm: h, HostSize: allocSize}, nil
+}
+
+func (f *fakeRenderer) Transfer(ctx stdcontext.Context, req gpuproto.Transfer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lost {
+		return fmt.Errorf("fakeRenderer: %w", gpuproto.ErrRendererLost)
+	}
+	if f.transferErr != nil {
+		return f.transferErr
+	}
+	f.transfers = append(f.transfers, req)
+	f.ops = append(f.ops, fakeOp{kind: "Transfer", ctxID: req.CtxID, resID: req.ResID})
+	if req.Direction == gpuproto.TransferFromHost {
+		if view := f.blobViews[req.ResID]; len(view) > 0 {
+			n := min(int(req.Box.W), len(view))
+			for i := range n {
+				view[i] = 0xA5
+			}
+		}
+	}
+	return nil
 }
 
 func (f *fakeRenderer) UnrefResource(ctxID, resID uint32) error {
@@ -423,4 +548,34 @@ func (f *fakeRenderer) hasSink() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.sinkSet
+}
+
+func (f *fakeRenderer) resCreateCalls() []gpuproto.ResourceCreate {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.resCreated)
+}
+
+func (f *fakeRenderer) transferCalls() []gpuproto.Transfer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.transfers)
+}
+
+func (f *fakeRenderer) setResErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resErr = err
+}
+
+func (f *fakeRenderer) setTransferErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transferErr = err
+}
+
+func (f *fakeRenderer) wasResCanceled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resCanceled
 }

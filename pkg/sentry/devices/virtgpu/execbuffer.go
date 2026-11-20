@@ -107,7 +107,17 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 	}
 	c := fd.ctx.Load()
 	if c == nil {
-		return linuxerr.EINVAL
+		if fd.dev.modes&modeVirgl == 0 {
+			return linuxerr.EINVAL
+		}
+		if req.Flags&virtgpuExecbufRingIdx != 0 {
+			return linuxerr.EINVAL
+		}
+		var err error
+		c, err = fd.ensureContext(ctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	var ring uint32
@@ -123,17 +133,26 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 	if req.NumBoHandles > maxBoHandles {
 		return linuxerr.EINVAL
 	}
+	var objs []*gemObject
 	if req.NumBoHandles > 0 {
 		raw := make([]byte, int(req.NumBoHandles)*4)
 		if _, err := uio.CopyIn(ctx, hostarch.Addr(req.BoHandles), raw, usermem.IOOpts{}); err != nil {
 			return linuxerr.EFAULT
 		}
+		collect := c.isVirgl()
+		if collect {
+			objs = make([]*gemObject, int(req.NumBoHandles))
+		}
 		fd.gemMu.Lock()
 		for i := range int(req.NumBoHandles) {
 			h := binary.LittleEndian.Uint32(raw[i*4:])
-			if _, ok := fd.gem.lookup(h); !ok {
+			o, ok := fd.gem.lookup(h)
+			if !ok {
 				fd.gemMu.Unlock()
 				return linuxerr.ENOENT
+			}
+			if collect {
+				objs[i] = o
 			}
 		}
 		fd.gemMu.Unlock()
@@ -147,20 +166,31 @@ func (fd *renderFD) execbuffer(ctx context.Context, uio usermem.IO, arg []byte) 
 		}
 	}
 
-	if req.Flags&virtgpuExecbufFenceFDOut == 0 {
-		_, err := fd.dev.submit(c, ring, cmd, false)
-		return err
+	wantFenceFD := req.Flags&virtgpuExecbufFenceFDOut != 0
+	var inst fdInstaller
+	if wantFenceFD {
+		var ok bool
+		inst, ok = ctx.(fdInstaller)
+		if !ok {
+			log.Warningf("virtgpu: EXECBUFFER FENCE_FD_OUT called without fdInstaller context")
+			return linuxerr.EINVAL
+		}
 	}
 
-	inst, ok := ctx.(fdInstaller)
-	if !ok {
-		log.Warningf("virtgpu: EXECBUFFER FENCE_FD_OUT called without fdInstaller context")
-		return linuxerr.EINVAL
-	}
-	f, err := fd.dev.submit(c, ring, cmd, true)
+	withFence := wantFenceFD || (c.isVirgl() && len(objs) > 0)
+	f, err := fd.dev.submit(c, ring, cmd, withFence)
 	if err != nil {
 		return err
 	}
+	if f != nil && len(objs) > 0 {
+		fd.gemMu.Lock()
+		fd.gem.recordFence(objs, f)
+		fd.gemMu.Unlock()
+	}
+	if !wantFenceFD {
+		return nil
+	}
+
 	file, err := newSyncFile(ctx, fd.dev.vfs, f)
 	if err != nil {
 		return err

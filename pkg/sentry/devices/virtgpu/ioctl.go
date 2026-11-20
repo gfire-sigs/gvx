@@ -32,10 +32,11 @@ type ioctlFunc func(fd *renderFD, ctx context.Context, uio usermem.IO, arg []byt
 
 // ioctlEntry describes one DRM request number.
 type ioctlEntry struct {
-	name string    // uAPI macro name, for the refusal log
-	cmd  uint32    // request as the uAPI header encodes it; 0 for a refused entry
-	fn   ioctlFunc // nil for a refused entry
-	err  error     // errno of a refused entry
+	name  string    // uAPI macro name, for the refusal log
+	cmd   uint32    // request as the uAPI header encodes it; 0 for a refused entry
+	fn    ioctlFunc // nil for a refused entry
+	err   error     // errno of a refused entry
+	modes modeMask  // served entries: modes that serve it; zero in the table literal means modeAll
 }
 
 // refusal describes one explicitly refused DRM request number.
@@ -75,10 +76,34 @@ var servedIoctls = map[uint32]ioctlEntry{
 		cmd:  cmdVirtgpuGetparam,
 		fn:   (*renderFD).getParam,
 	},
+	nrVirtgpuResourceCreate: {
+		name:  "DRM_IOCTL_VIRTGPU_RESOURCE_CREATE",
+		cmd:   cmdVirtgpuResourceCreate,
+		fn:    (*renderFD).resourceCreate,
+		modes: modeVirgl,
+	},
 	nrVirtgpuResourceInfo: {
 		name: "DRM_IOCTL_VIRTGPU_RESOURCE_INFO",
 		cmd:  cmdVirtgpuResourceInfo,
 		fn:   (*renderFD).resourceInfo,
+	},
+	nrVirtgpuTransferFromHost: {
+		name:  "DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST",
+		cmd:   cmdVirtgpuTransferFromHost,
+		fn:    (*renderFD).transferFromHost,
+		modes: modeVirgl,
+	},
+	nrVirtgpuTransferToHost: {
+		name:  "DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST",
+		cmd:   cmdVirtgpuTransferToHost,
+		fn:    (*renderFD).transferToHost,
+		modes: modeVirgl,
+	},
+	nrVirtgpuWait: {
+		name:  "DRM_IOCTL_VIRTGPU_WAIT",
+		cmd:   cmdVirtgpuWait,
+		fn:    (*renderFD).wait,
+		modes: modeVirgl,
 	},
 	nrVirtgpuGetCaps: {
 		name: "DRM_IOCTL_VIRTGPU_GET_CAPS",
@@ -86,9 +111,10 @@ var servedIoctls = map[uint32]ioctlEntry{
 		fn:   (*renderFD).getCaps,
 	},
 	nrVirtgpuResourceCreateBlob: {
-		name: "DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB",
-		cmd:  cmdVirtgpuResourceCreateBlob,
-		fn:   (*renderFD).createBlob,
+		name:  "DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB",
+		cmd:   cmdVirtgpuResourceCreateBlob,
+		fn:    (*renderFD).createBlob,
+		modes: modeVenus,
 	},
 	nrVirtgpuContextInit: {
 		name: "DRM_IOCTL_VIRTGPU_CONTEXT_INIT",
@@ -98,82 +124,78 @@ var servedIoctls = map[uint32]ioctlEntry{
 }
 
 var refusedIoctls = map[uint32]refusal{
-	nrGetUnique:               {name: "DRM_IOCTL_GET_UNIQUE", err: linuxerr.EACCES},
-	nrGetMagic:                {name: "DRM_IOCTL_GET_MAGIC", err: linuxerr.EACCES},
-	nrGetClient:               {name: "DRM_IOCTL_GET_CLIENT", err: linuxerr.EACCES},
-	nrGetStats:                {name: "DRM_IOCTL_GET_STATS", err: linuxerr.EACCES},
-	nrSetVersion:              {name: "DRM_IOCTL_SET_VERSION", err: linuxerr.EACCES},
-	nrGemFlink:                {name: "DRM_IOCTL_GEM_FLINK", err: linuxerr.EACCES},
-	nrGemOpen:                 {name: "DRM_IOCTL_GEM_OPEN", err: linuxerr.EACCES},
-	nrSetClientCap:            {name: "DRM_IOCTL_SET_CLIENT_CAP", err: linuxerr.EACCES},
-	nrSetUnique:               {name: "DRM_IOCTL_SET_UNIQUE", err: linuxerr.EACCES},
-	nrAuthMagic:               {name: "DRM_IOCTL_AUTH_MAGIC", err: linuxerr.EACCES},
-	nrBlock:                   {name: "DRM_IOCTL_BLOCK", err: linuxerr.EACCES},
-	nrUnblock:                 {name: "DRM_IOCTL_UNBLOCK", err: linuxerr.EACCES},
-	nrSetMaster:               {name: "DRM_IOCTL_SET_MASTER", err: linuxerr.EACCES},
-	nrDropMaster:              {name: "DRM_IOCTL_DROP_MASTER", err: linuxerr.EACCES},
-	nrAddDraw:                 {name: "DRM_IOCTL_ADD_DRAW", err: linuxerr.EACCES},
-	nrRmDraw:                  {name: "DRM_IOCTL_RM_DRAW", err: linuxerr.EACCES},
-	nrFinish:                  {name: "DRM_IOCTL_FINISH", err: linuxerr.EACCES},
-	nrPrimeHandleToFD:         {name: "DRM_IOCTL_PRIME_HANDLE_TO_FD", err: linuxerr.EOPNOTSUPP},
-	nrPrimeFDToHandle:         {name: "DRM_IOCTL_PRIME_FD_TO_HANDLE", err: linuxerr.EOPNOTSUPP},
-	nrWaitVblank:              {name: "DRM_IOCTL_WAIT_VBLANK", err: linuxerr.EACCES},
-	nrCrtcGetSequence:         {name: "DRM_IOCTL_CRTC_GET_SEQUENCE", err: linuxerr.EACCES},
-	nrCrtcQueueSequence:       {name: "DRM_IOCTL_CRTC_QUEUE_SEQUENCE", err: linuxerr.EACCES},
-	nrUpdateDraw:              {name: "DRM_IOCTL_UPDATE_DRAW", err: linuxerr.EACCES},
-	nrVirtgpuResourceCreate:   {name: "DRM_IOCTL_VIRTGPU_RESOURCE_CREATE", err: linuxerr.EINVAL},
-	nrVirtgpuTransferFromHost: {name: "DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST", err: linuxerr.EINVAL},
-	nrVirtgpuTransferToHost:   {name: "DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST", err: linuxerr.EINVAL},
-	nrVirtgpuWait:             {name: "DRM_IOCTL_VIRTGPU_WAIT", err: linuxerr.EINVAL},
-	nrModeGetresources:        {name: "DRM_IOCTL_MODE_GETRESOURCES", err: linuxerr.EACCES},
-	nrModeGetcrtc:             {name: "DRM_IOCTL_MODE_GETCRTC", err: linuxerr.EACCES},
-	nrModeSetcrtc:             {name: "DRM_IOCTL_MODE_SETCRTC", err: linuxerr.EACCES},
-	nrModeCursor:              {name: "DRM_IOCTL_MODE_CURSOR", err: linuxerr.EACCES},
-	nrModeGetgamma:            {name: "DRM_IOCTL_MODE_GETGAMMA", err: linuxerr.EACCES},
-	nrModeSetgamma:            {name: "DRM_IOCTL_MODE_SETGAMMA", err: linuxerr.EACCES},
-	nrModeGetencoder:          {name: "DRM_IOCTL_MODE_GETENCODER", err: linuxerr.EACCES},
-	nrModeGetconnector:        {name: "DRM_IOCTL_MODE_GETCONNECTOR", err: linuxerr.EACCES},
-	nrModeAttachmode:          {name: "DRM_IOCTL_MODE_ATTACHMODE", err: linuxerr.EACCES},
-	nrModeDetachmode:          {name: "DRM_IOCTL_MODE_DETACHMODE", err: linuxerr.EACCES},
-	nrModeGetproperty:         {name: "DRM_IOCTL_MODE_GETPROPERTY", err: linuxerr.EACCES},
-	nrModeSetproperty:         {name: "DRM_IOCTL_MODE_SETPROPERTY", err: linuxerr.EACCES},
-	nrModeGetpropblob:         {name: "DRM_IOCTL_MODE_GETPROPBLOB", err: linuxerr.EACCES},
-	nrModeGetfb:               {name: "DRM_IOCTL_MODE_GETFB", err: linuxerr.EACCES},
-	nrModeAddfb:               {name: "DRM_IOCTL_MODE_ADDFB", err: linuxerr.EACCES},
-	nrModeRmfb:                {name: "DRM_IOCTL_MODE_RMFB", err: linuxerr.EACCES},
-	nrModePageFlip:            {name: "DRM_IOCTL_MODE_PAGE_FLIP", err: linuxerr.EACCES},
-	nrModeDirtyfb:             {name: "DRM_IOCTL_MODE_DIRTYFB", err: linuxerr.EACCES},
-	nrModeCreateDumb:          {name: "DRM_IOCTL_MODE_CREATE_DUMB", err: linuxerr.EACCES},
-	nrModeMapDumb:             {name: "DRM_IOCTL_MODE_MAP_DUMB", err: linuxerr.EACCES},
-	nrModeDestroyDumb:         {name: "DRM_IOCTL_MODE_DESTROY_DUMB", err: linuxerr.EACCES},
-	nrModeGetplaneresources:   {name: "DRM_IOCTL_MODE_GETPLANERESOURCES", err: linuxerr.EACCES},
-	nrModeGetplane:            {name: "DRM_IOCTL_MODE_GETPLANE", err: linuxerr.EACCES},
-	nrModeSetplane:            {name: "DRM_IOCTL_MODE_SETPLANE", err: linuxerr.EACCES},
-	nrModeAddfb2:              {name: "DRM_IOCTL_MODE_ADDFB2", err: linuxerr.EACCES},
-	nrModeObjGetproperties:    {name: "DRM_IOCTL_MODE_OBJ_GETPROPERTIES", err: linuxerr.EACCES},
-	nrModeObjSetproperty:      {name: "DRM_IOCTL_MODE_OBJ_SETPROPERTY", err: linuxerr.EACCES},
-	nrModeCursor2:             {name: "DRM_IOCTL_MODE_CURSOR2", err: linuxerr.EACCES},
-	nrModeAtomic:              {name: "DRM_IOCTL_MODE_ATOMIC", err: linuxerr.EACCES},
-	nrModeCreatepropblob:      {name: "DRM_IOCTL_MODE_CREATEPROPBLOB", err: linuxerr.EACCES},
-	nrModeDestroypropblob:     {name: "DRM_IOCTL_MODE_DESTROYPROPBLOB", err: linuxerr.EACCES},
-	nrSyncobjCreate:           {name: "DRM_IOCTL_SYNCOBJ_CREATE", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjDestroy:          {name: "DRM_IOCTL_SYNCOBJ_DESTROY", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjHandleToFD:       {name: "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjFDToHandle:       {name: "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjWait:             {name: "DRM_IOCTL_SYNCOBJ_WAIT", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjReset:            {name: "DRM_IOCTL_SYNCOBJ_RESET", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjSignal:           {name: "DRM_IOCTL_SYNCOBJ_SIGNAL", err: linuxerr.EOPNOTSUPP},
-	nrModeCreateLease:         {name: "DRM_IOCTL_MODE_CREATE_LEASE", err: linuxerr.EACCES},
-	nrModeListLessees:         {name: "DRM_IOCTL_MODE_LIST_LESSEES", err: linuxerr.EACCES},
-	nrModeGetLease:            {name: "DRM_IOCTL_MODE_GET_LEASE", err: linuxerr.EACCES},
-	nrModeRevokeLease:         {name: "DRM_IOCTL_MODE_REVOKE_LEASE", err: linuxerr.EACCES},
-	nrSyncobjTimelineWait:     {name: "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjQuery:            {name: "DRM_IOCTL_SYNCOBJ_QUERY", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjTransfer:         {name: "DRM_IOCTL_SYNCOBJ_TRANSFER", err: linuxerr.EOPNOTSUPP},
-	nrSyncobjTimelineSignal:   {name: "DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL", err: linuxerr.EOPNOTSUPP},
-	nrModeGetfb2:              {name: "DRM_IOCTL_MODE_GETFB2", err: linuxerr.EACCES},
-	nrSyncobjEventFD:          {name: "DRM_IOCTL_SYNCOBJ_EVENTFD", err: linuxerr.EOPNOTSUPP},
-	nrModeClosefb:             {name: "DRM_IOCTL_MODE_CLOSEFB", err: linuxerr.EACCES},
+	nrGetUnique:             {name: "DRM_IOCTL_GET_UNIQUE", err: linuxerr.EACCES},
+	nrGetMagic:              {name: "DRM_IOCTL_GET_MAGIC", err: linuxerr.EACCES},
+	nrGetClient:             {name: "DRM_IOCTL_GET_CLIENT", err: linuxerr.EACCES},
+	nrGetStats:              {name: "DRM_IOCTL_GET_STATS", err: linuxerr.EACCES},
+	nrSetVersion:            {name: "DRM_IOCTL_SET_VERSION", err: linuxerr.EACCES},
+	nrGemFlink:              {name: "DRM_IOCTL_GEM_FLINK", err: linuxerr.EACCES},
+	nrGemOpen:               {name: "DRM_IOCTL_GEM_OPEN", err: linuxerr.EACCES},
+	nrSetClientCap:          {name: "DRM_IOCTL_SET_CLIENT_CAP", err: linuxerr.EACCES},
+	nrSetUnique:             {name: "DRM_IOCTL_SET_UNIQUE", err: linuxerr.EACCES},
+	nrAuthMagic:             {name: "DRM_IOCTL_AUTH_MAGIC", err: linuxerr.EACCES},
+	nrBlock:                 {name: "DRM_IOCTL_BLOCK", err: linuxerr.EACCES},
+	nrUnblock:               {name: "DRM_IOCTL_UNBLOCK", err: linuxerr.EACCES},
+	nrSetMaster:             {name: "DRM_IOCTL_SET_MASTER", err: linuxerr.EACCES},
+	nrDropMaster:            {name: "DRM_IOCTL_DROP_MASTER", err: linuxerr.EACCES},
+	nrAddDraw:               {name: "DRM_IOCTL_ADD_DRAW", err: linuxerr.EACCES},
+	nrRmDraw:                {name: "DRM_IOCTL_RM_DRAW", err: linuxerr.EACCES},
+	nrFinish:                {name: "DRM_IOCTL_FINISH", err: linuxerr.EACCES},
+	nrPrimeHandleToFD:       {name: "DRM_IOCTL_PRIME_HANDLE_TO_FD", err: linuxerr.EOPNOTSUPP},
+	nrPrimeFDToHandle:       {name: "DRM_IOCTL_PRIME_FD_TO_HANDLE", err: linuxerr.EOPNOTSUPP},
+	nrWaitVblank:            {name: "DRM_IOCTL_WAIT_VBLANK", err: linuxerr.EACCES},
+	nrCrtcGetSequence:       {name: "DRM_IOCTL_CRTC_GET_SEQUENCE", err: linuxerr.EACCES},
+	nrCrtcQueueSequence:     {name: "DRM_IOCTL_CRTC_QUEUE_SEQUENCE", err: linuxerr.EACCES},
+	nrUpdateDraw:            {name: "DRM_IOCTL_UPDATE_DRAW", err: linuxerr.EACCES},
+	nrModeGetresources:      {name: "DRM_IOCTL_MODE_GETRESOURCES", err: linuxerr.EACCES},
+	nrModeGetcrtc:           {name: "DRM_IOCTL_MODE_GETCRTC", err: linuxerr.EACCES},
+	nrModeSetcrtc:           {name: "DRM_IOCTL_MODE_SETCRTC", err: linuxerr.EACCES},
+	nrModeCursor:            {name: "DRM_IOCTL_MODE_CURSOR", err: linuxerr.EACCES},
+	nrModeGetgamma:          {name: "DRM_IOCTL_MODE_GETGAMMA", err: linuxerr.EACCES},
+	nrModeSetgamma:          {name: "DRM_IOCTL_MODE_SETGAMMA", err: linuxerr.EACCES},
+	nrModeGetencoder:        {name: "DRM_IOCTL_MODE_GETENCODER", err: linuxerr.EACCES},
+	nrModeGetconnector:      {name: "DRM_IOCTL_MODE_GETCONNECTOR", err: linuxerr.EACCES},
+	nrModeAttachmode:        {name: "DRM_IOCTL_MODE_ATTACHMODE", err: linuxerr.EACCES},
+	nrModeDetachmode:        {name: "DRM_IOCTL_MODE_DETACHMODE", err: linuxerr.EACCES},
+	nrModeGetproperty:       {name: "DRM_IOCTL_MODE_GETPROPERTY", err: linuxerr.EACCES},
+	nrModeSetproperty:       {name: "DRM_IOCTL_MODE_SETPROPERTY", err: linuxerr.EACCES},
+	nrModeGetpropblob:       {name: "DRM_IOCTL_MODE_GETPROPBLOB", err: linuxerr.EACCES},
+	nrModeGetfb:             {name: "DRM_IOCTL_MODE_GETFB", err: linuxerr.EACCES},
+	nrModeAddfb:             {name: "DRM_IOCTL_MODE_ADDFB", err: linuxerr.EACCES},
+	nrModeRmfb:              {name: "DRM_IOCTL_MODE_RMFB", err: linuxerr.EACCES},
+	nrModePageFlip:          {name: "DRM_IOCTL_MODE_PAGE_FLIP", err: linuxerr.EACCES},
+	nrModeDirtyfb:           {name: "DRM_IOCTL_MODE_DIRTYFB", err: linuxerr.EACCES},
+	nrModeCreateDumb:        {name: "DRM_IOCTL_MODE_CREATE_DUMB", err: linuxerr.EACCES},
+	nrModeMapDumb:           {name: "DRM_IOCTL_MODE_MAP_DUMB", err: linuxerr.EACCES},
+	nrModeDestroyDumb:       {name: "DRM_IOCTL_MODE_DESTROY_DUMB", err: linuxerr.EACCES},
+	nrModeGetplaneresources: {name: "DRM_IOCTL_MODE_GETPLANERESOURCES", err: linuxerr.EACCES},
+	nrModeGetplane:          {name: "DRM_IOCTL_MODE_GETPLANE", err: linuxerr.EACCES},
+	nrModeSetplane:          {name: "DRM_IOCTL_MODE_SETPLANE", err: linuxerr.EACCES},
+	nrModeAddfb2:            {name: "DRM_IOCTL_MODE_ADDFB2", err: linuxerr.EACCES},
+	nrModeObjGetproperties:  {name: "DRM_IOCTL_MODE_OBJ_GETPROPERTIES", err: linuxerr.EACCES},
+	nrModeObjSetproperty:    {name: "DRM_IOCTL_MODE_OBJ_SETPROPERTY", err: linuxerr.EACCES},
+	nrModeCursor2:           {name: "DRM_IOCTL_MODE_CURSOR2", err: linuxerr.EACCES},
+	nrModeAtomic:            {name: "DRM_IOCTL_MODE_ATOMIC", err: linuxerr.EACCES},
+	nrModeCreatepropblob:    {name: "DRM_IOCTL_MODE_CREATEPROPBLOB", err: linuxerr.EACCES},
+	nrModeDestroypropblob:   {name: "DRM_IOCTL_MODE_DESTROYPROPBLOB", err: linuxerr.EACCES},
+	nrSyncobjCreate:         {name: "DRM_IOCTL_SYNCOBJ_CREATE", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjDestroy:        {name: "DRM_IOCTL_SYNCOBJ_DESTROY", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjHandleToFD:     {name: "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjFDToHandle:     {name: "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjWait:           {name: "DRM_IOCTL_SYNCOBJ_WAIT", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjReset:          {name: "DRM_IOCTL_SYNCOBJ_RESET", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjSignal:         {name: "DRM_IOCTL_SYNCOBJ_SIGNAL", err: linuxerr.EOPNOTSUPP},
+	nrModeCreateLease:       {name: "DRM_IOCTL_MODE_CREATE_LEASE", err: linuxerr.EACCES},
+	nrModeListLessees:       {name: "DRM_IOCTL_MODE_LIST_LESSEES", err: linuxerr.EACCES},
+	nrModeGetLease:          {name: "DRM_IOCTL_MODE_GET_LEASE", err: linuxerr.EACCES},
+	nrModeRevokeLease:       {name: "DRM_IOCTL_MODE_REVOKE_LEASE", err: linuxerr.EACCES},
+	nrSyncobjTimelineWait:   {name: "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjQuery:          {name: "DRM_IOCTL_SYNCOBJ_QUERY", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjTransfer:       {name: "DRM_IOCTL_SYNCOBJ_TRANSFER", err: linuxerr.EOPNOTSUPP},
+	nrSyncobjTimelineSignal: {name: "DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL", err: linuxerr.EOPNOTSUPP},
+	nrModeGetfb2:            {name: "DRM_IOCTL_MODE_GETFB2", err: linuxerr.EACCES},
+	nrSyncobjEventFD:        {name: "DRM_IOCTL_SYNCOBJ_EVENTFD", err: linuxerr.EOPNOTSUPP},
+	nrModeClosefb:           {name: "DRM_IOCTL_MODE_CLOSEFB", err: linuxerr.EACCES},
 }
 
 // ioctls maps a DRM request number (_IOC_NR) to its entry. It is built once
@@ -187,6 +209,9 @@ func buildIoctlTable() map[uint32]ioctlEntry {
 func buildIoctlTableFrom(served map[uint32]ioctlEntry, refused map[uint32]refusal) map[uint32]ioctlEntry {
 	table := make(map[uint32]ioctlEntry, len(served)+len(refused))
 	for nr, e := range served {
+		if e.fn != nil && e.modes == 0 {
+			e.modes = modeAll
+		}
 		table[nr] = e
 	}
 	for nr, r := range refused {
@@ -223,6 +248,10 @@ func (fd *renderFD) ioctl(ctx context.Context, uio usermem.IO, cmd uint32, argAd
 	if e.fn == nil {
 		fd.logRefused(ctx, nr, e.name, cmd, e.err)
 		return 0, e.err
+	}
+	if e.modes&fd.dev.modes == 0 {
+		fd.logRefused(ctx, nr, e.name, cmd, linuxerr.EINVAL)
+		return 0, linuxerr.EINVAL
 	}
 
 	drvSize := linux.IOC_SIZE(e.cmd)

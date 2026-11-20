@@ -30,11 +30,15 @@ type Limits struct {
 	// FenceTimeout bounds how long a fence can stay pending before the device
 	// marks its context lost. Tests set a short value.
 	FenceTimeout time.Duration
+	// WaitTimeout bounds one blocking DRM_IOCTL_VIRTGPU_WAIT. Zero selects
+	// defaultWaitTimeout. Tests set a short value.
+	WaitTimeout time.Duration
 }
 
 const (
 	defaultBlobBytes    = 4 << 30
 	defaultFenceTimeout = 30 * time.Second
+	defaultWaitTimeout  = 15 * time.Second // Linux virtio_gpu_wait_ioctl: 15 * HZ
 	maxContexts         = 64
 	maxLiveBlobs        = 65536
 	maxHandlesPerFile   = 65536
@@ -47,6 +51,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.FenceTimeout <= 0 {
 		l.FenceTimeout = defaultFenceTimeout
+	}
+	if l.WaitTimeout <= 0 {
+		l.WaitTimeout = defaultWaitTimeout
 	}
 	return l
 }

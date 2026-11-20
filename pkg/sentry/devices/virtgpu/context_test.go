@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
@@ -42,6 +43,12 @@ func mesaVenusParams() []virtgpuContextSetParam {
 		{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVenus},
 		{Param: virtgpuContextParamNumRings, Value: gpuproto.MaxRings},
 		{Param: virtgpuContextParamPollRingsMask, Value: 0},
+	}
+}
+
+func mesaVirglParams() []virtgpuContextSetParam {
+	return []virtgpuContextSetParam{
+		{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVirgl2},
 	}
 }
 
@@ -531,4 +538,256 @@ func TestContextInitAfterRendererLost(t *testing.T) {
 			t.Fatalf("second CONTEXT_INIT after RendererLost: got %v, want EIO", err)
 		}
 	})
+}
+
+func TestContextInitVirgl(t *testing.T) {
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		paramsAddr = hostarch.Addr(0x2000)
+	)
+
+	t.Run("capset 1 accepted", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+
+		mem := newGuestMem()
+		putContextInit(t, mem, structAddr, paramsAddr, []virtgpuContextSetParam{
+			{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVirgl},
+		})
+		if err := node.ioctl(fd, cmdVirtgpuContextInit, mem, structAddr); err != nil {
+			t.Fatalf("CONTEXT_INIT(capset 1): %v", err)
+		}
+		calls := fake.createdCalls()
+		if len(calls) != 1 || calls[0].capsetID != virtgpuCapsetVirgl {
+			t.Fatalf("CreateContext calls = %+v, want capset 1", calls)
+		}
+	})
+
+	t.Run("capset 2 with rings 1 accepted and repeat returns EEXIST", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+
+		mem := newGuestMem()
+		putContextInit(t, mem, structAddr, paramsAddr, []virtgpuContextSetParam{
+			{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVirgl2},
+			{Param: virtgpuContextParamNumRings, Value: 1},
+		})
+		if err := node.ioctl(fd, cmdVirtgpuContextInit, mem, structAddr); err != nil {
+			t.Fatalf("CONTEXT_INIT(capset 2, rings 1): %v", err)
+		}
+		calls := fake.createdCalls()
+		if len(calls) != 1 || calls[0].capsetID != virtgpuCapsetVirgl2 {
+			t.Fatalf("CreateContext calls = %+v, want capset 2", calls)
+		}
+		if err := node.ioctl(fd, cmdVirtgpuContextInit, mem, structAddr); !linuxerr.Equals(linuxerr.EEXIST, err) {
+			t.Fatalf("repeat CONTEXT_INIT: got %v, want EEXIST", err)
+		}
+	})
+
+	badCases := []struct {
+		name   string
+		params []virtgpuContextSetParam
+	}{
+		{
+			name:   "capset 4 rejected",
+			params: []virtgpuContextSetParam{{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVenus}},
+		},
+		{
+			name: "NUM_RINGS 2 with capset 2",
+			params: []virtgpuContextSetParam{
+				{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVirgl2},
+				{Param: virtgpuContextParamNumRings, Value: 2},
+			},
+		},
+		{
+			name: "NUM_RINGS 2 with capset 1",
+			params: []virtgpuContextSetParam{
+				{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVirgl},
+				{Param: virtgpuContextParamNumRings, Value: 2},
+			},
+		},
+	}
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeVirglRenderer()
+			node := newTestNode(t, fake)
+			fd := node.open(t)
+			defer fd.DecRef(node.ctx)
+
+			mem := newGuestMem()
+			putContextInit(t, mem, structAddr, paramsAddr, tc.params)
+			if err := node.ioctl(fd, cmdVirtgpuContextInit, mem, structAddr); !linuxerr.Equals(linuxerr.EINVAL, err) {
+				t.Fatalf("CONTEXT_INIT(%s): got %v, want EINVAL", tc.name, err)
+			}
+			if got := len(fake.createdCalls()); got != 0 {
+				t.Errorf("CreateContext calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestContextInitVenusRefusesVirglCapsets(t *testing.T) {
+	fake := newFakeRenderer()
+	node := newTestNode(t, fake)
+	fd := node.open(t)
+	defer fd.DecRef(node.ctx)
+
+	mem := newGuestMem()
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		paramsAddr = hostarch.Addr(0x2000)
+	)
+	for _, capset := range []uint64{virtgpuCapsetVirgl, virtgpuCapsetVirgl2} {
+		putContextInit(t, mem, structAddr, paramsAddr, []virtgpuContextSetParam{
+			{Param: virtgpuContextParamCapsetID, Value: capset},
+		})
+		if err := node.ioctl(fd, cmdVirtgpuContextInit, mem, structAddr); !linuxerr.Equals(linuxerr.EINVAL, err) {
+			t.Errorf("venus CONTEXT_INIT(capset %d): got %v, want EINVAL", capset, err)
+		}
+	}
+	if got := len(fake.createdCalls()); got != 0 {
+		t.Errorf("CreateContext calls = %d, want 0", got)
+	}
+}
+
+func TestImplicitContext(t *testing.T) {
+	const (
+		structAddr = hostarch.Addr(0x1000)
+		paramsAddr = hostarch.Addr(0x2000)
+	)
+
+	t.Run("RESOURCE_CREATE creates implicit context and blocks later CONTEXT_INIT", func(t *testing.T) {
+		requireBlobHost(t)
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpuResourceCreate{Size: 4096})
+		if err := node.ioctl(fd, cmdVirtgpuResourceCreate, mem, structAddr); err != nil {
+			t.Fatalf("RESOURCE_CREATE on new file: %v", err)
+		}
+		calls := fake.createdCalls()
+		if len(calls) != 1 || calls[0].capsetID != virtgpuCapsetVirgl2 || calls[0].name != "" {
+			t.Fatalf("CreateContext calls = %+v, want 1 call (capset 2, empty name)", calls)
+		}
+
+		putContextInit(t, mem, structAddr, paramsAddr, mesaVirglParams())
+		if err := node.ioctl(fd, cmdVirtgpuContextInit, mem, structAddr); !linuxerr.Equals(linuxerr.EEXIST, err) {
+			t.Fatalf("CONTEXT_INIT after implicit context: got %v, want EEXIST", err)
+		}
+	})
+
+	t.Run("TRANSFER creates implicit context when handle exists", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+
+		// Unknown handle fails with ENOENT without creating a context.
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpu3DTransfer{BoHandle: 99})
+		if err := node.ioctl(fd, cmdVirtgpuTransferToHost, mem, structAddr); !linuxerr.Equals(linuxerr.ENOENT, err) {
+			t.Fatalf("TRANSFER unknown handle: got %v, want ENOENT", err)
+		}
+		if got := len(fake.createdCalls()); got != 0 {
+			t.Fatalf("CreateContext calls after ENOENT = %d, want 0", got)
+		}
+
+		// With a handle present on the file, TRANSFER creates the implicit context.
+		rfd := fd.Impl().(*renderFD)
+		rfd.gemMu.Lock()
+		h := rfd.gem.insert(&gemObject{resID: 7, size: 4096})
+		rfd.gemMu.Unlock()
+
+		mem.put(t, structAddr, virtgpu3DTransfer{BoHandle: h, Box: virtgpu3DBox{W: 64, H: 1, D: 1}})
+		if err := node.ioctl(fd, cmdVirtgpuTransferToHost, mem, structAddr); err != nil {
+			t.Fatalf("TRANSFER_TO_HOST on new file: %v", err)
+		}
+		calls := fake.createdCalls()
+		if len(calls) != 1 || calls[0].capsetID != virtgpuCapsetVirgl2 || calls[0].name != "" {
+			t.Fatalf("CreateContext calls = %+v, want 1 call (capset 2, empty name)", calls)
+		}
+	})
+
+	t.Run("EXECBUFFER creates implicit context", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpuExecbuffer{})
+		if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); err != nil {
+			t.Fatalf("EXECBUFFER on new file: %v", err)
+		}
+		calls := fake.createdCalls()
+		if len(calls) != 1 || calls[0].capsetID != virtgpuCapsetVirgl2 || calls[0].name != "" {
+			t.Fatalf("CreateContext calls = %+v, want 1 call (capset 2, empty name)", calls)
+		}
+	})
+
+	t.Run("EXECBUFFER with RING_IDX on new file fails EINVAL without creating context", func(t *testing.T) {
+		fake := newFakeVirglRenderer()
+		node := newTestNode(t, fake)
+		fd := node.open(t)
+		defer fd.DecRef(node.ctx)
+
+		mem := newGuestMem()
+		mem.put(t, structAddr, virtgpuExecbuffer{
+			Flags:   virtgpuExecbufRingIdx,
+			RingIdx: 0,
+		})
+		if err := node.ioctl(fd, cmdVirtgpuExecbuffer, mem, structAddr); !linuxerr.Equals(linuxerr.EINVAL, err) {
+			t.Fatalf("EXECBUFFER(RING_IDX) on new file: got %v, want EINVAL", err)
+		}
+		if got := len(fake.createdCalls()); got != 0 {
+			t.Errorf("CreateContext calls = %d, want 0", got)
+		}
+	})
+}
+
+func TestImplicitContextRace(t *testing.T) {
+	requireBlobHost(t)
+
+	fake := newFakeVirglRenderer()
+	node := newTestNode(t, fake)
+	fd := node.open(t)
+	defer fd.DecRef(node.ctx)
+
+	const workers = 8
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mem := newGuestMem()
+			mem.put(t, 0x1000, virtgpuResourceCreate{Size: 4096})
+			<-start
+			errCh <- node.ioctl(fd, cmdVirtgpuResourceCreate, mem, 0x1000)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent RESOURCE_CREATE: %v", err)
+		}
+	}
+	calls := fake.createdCalls()
+	if len(calls) != 1 || calls[0].capsetID != virtgpuCapsetVirgl2 || calls[0].name != "" {
+		t.Fatalf("CreateContext calls = %+v, want exactly 1 (capset 2, empty name)", calls)
+	}
+	if got := len(fake.resCreateCalls()); got != workers {
+		t.Errorf("CreateResource calls = %d, want %d", got, workers)
+	}
 }

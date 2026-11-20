@@ -31,17 +31,21 @@ import (
 const blobFlagsKnown = virtgpuBlobFlagUseMappable | virtgpuBlobFlagUseShareable | virtgpuBlobFlagUseCrossDevice
 
 // gemObject is one GEM handle of a DRM file. Its fields do not change after
-// insertion, except mapSlot.
+// insertion, except mapSlot and lastFence.
 type gemObject struct {
 	resID     uint32
-	blobMem   uint32 // VIRTGPU_BLOB_MEM_HOST3D
-	size      uint64 // RESOURCE_CREATE_BLOB size rounded up to hostarch.PageSize
+	blobMem   uint32 // VIRTGPU_BLOB_MEM_HOST3D for venus blobs, 0 for virgl resources
+	size      uint64 // requested size rounded up to hostarch.PageSize
 	blob      *blob  // nil when the resource is not mappable
 	accounted uint64 // reserved bytes for a non-mappable blob; 0 when blob != nil
 
 	// mapSlot is the fake mmap slot that MAP assigned, or 0.
 	// Protected by renderFD.gemMu.
 	mapSlot uint64
+
+	// lastFence is the newest fence of an EXECBUFFER that listed this object
+	// in bo_handles (virgl contexts only), or nil. Protected by renderFD.gemMu.
+	lastFence *fence
 }
 
 // handleHeap is a min-heap of freed GEM handle numbers.
@@ -103,6 +107,22 @@ func (t *gemTable) insert(o *gemObject) uint32 {
 func (t *gemTable) lookup(h uint32) (*gemObject, bool) {
 	o, ok := t.objects[h]
 	return o, ok
+}
+
+func (t *gemTable) lookupFence(h uint32) (*fence, bool) {
+	o, ok := t.objects[h]
+	if !ok {
+		return nil, false
+	}
+	return o.lastFence, true
+}
+
+func (t *gemTable) recordFence(objs []*gemObject, f *fence) {
+	for _, o := range objs {
+		if o.lastFence == nil || o.lastFence.id < f.id {
+			o.lastFence = f
+		}
+	}
 }
 
 func (t *gemTable) lookupSlot(slot uint64) *gemObject {
