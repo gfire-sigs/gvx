@@ -11,11 +11,6 @@ This release adds optional GPU paths for headless browsers on macOS (`rungv run 
 - **Virtual GPU render node (`pkg/sentry/devices/virtgpu`, `pkg/sentry/fsimpl/sys`)**: With `-gpu=venus` or `-gpu=virgl` on `darwin/arm64` and `hvf`, the guest gets `/dev/dri/renderD128` and the `sysfs` entries of a virtio GPU. `-gpu=venus` serves unmodified Mesa `venus` Vulkan drivers (tested with Mesa 25.0.7, 25.2.8, and 26.2.6) with blob, context, and fence requests. `-gpu=virgl` (`gvx.GPUVirgl`) serves unmodified Mesa `virgl` OpenGL 4.1 and OpenGL ES 3.0 drivers (tested with Mesa 25.0.7 and 25.2.8) with `RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`, `WAIT`, implicit capset-2 contexts, and per-object fences. Both modes refuse PRIME, DRM sync objects, and `FENCE_FD_IN`. Guest OpenGL ES stays at 3.0 without compute shaders or persistent and coherent buffer mapping.
 - **Confined renderer process (`gpurenderer`, `internal/gpurender`, `scripts/gpu/build-renderer.sh`)**: `gvx-gpu-renderer` is a C program that links `virglrenderer` and serves `--mode=venus` (KosmicKrisp on Metal) or `--mode=virgl` (`vrend` on Apple OpenGL 4.1 through CGL), with `--selftest` for each mode. `gvx.New` starts one renderer for each sandbox before the host lockdown. The bundle is a separate build; `rungv` stays pure Go. The release workflow builds KosmicKrisp from the pinned Mesa source and packages `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz` with a provenance attestation.
 - **`-gpu` and `-gpu-renderer` flags, `gvx.Config.GPU` (`cmd/rungv`, `pkg/gvx`)**: The option accepts `off` (default), `venus`, or `virgl`, and needs macOS 26 or later. `gvx.New` returns `ErrGPUUnavailable` when the renderer cannot start, and `ErrInvalidConfig` when the option meets a checkpoint option, another backend, or another host. `Config.GPU.MemoryLimit` caps shared GPU memory of the guest (default: the smaller of 4 GiB and 25% of host RAM).
-- **Dynamic loopback port auto-publishing (`--auto-publish`, `pkg/hostlockdown`, `pkg/netbackend`, `pkg/gvx`, `cmd/rungv`)** (#218): Opt-in `--auto-publish` (`Config.AutoPublishPorts`) reconciles guest TCP listeners and `iptables` NAT `DNAT` ports onto host `127.0.0.1` while host lockdown stays active. Host lockdown allows only loopback binds (`127.0.0.1` or `::1`), static `-p` rules keep precedence, and new tunables bound dynamic ports and polling.
-
-### Bug Fixes
-
-- **Published port fallback to guest loopback (`pkg/netbackend`, `pkg/tcpip/stack`)** (#218): Inbound `-p` port forwarders now fall back to guest `127.0.0.1:<port>` on `lo` when a service binds only loopback. This lets host clients reach nested containers published with `docker run -p 127.0.0.1:...` and local development servers bound to `localhost`.
 
 ### Changed
 
@@ -40,6 +35,18 @@ This release adds optional GPU paths for headless browsers on macOS (`rungv run 
 - No run has measured Metal or Apple OpenGL on a hosted `macos-26` runner. The repository variable `GVX_CI_METAL` is therefore not `1`, and CI skips both renderer self-tests and the renderer tests.
 - No run covers macOS 26, other Apple Silicon chips, or the WebGL conformance subset.
 - The device and client packages cross-compile for Windows and Linux, but `-gpu=venus` and `-gpu=virgl` return `ErrInvalidConfig` there.
+
+## [v0.18.10002026111600] - 2026-11-20
+
+This release adds opt-in `--auto-publish` (`Config.AutoPublishPorts`) to publish guest TCP listeners and `iptables` NAT `DNAT` ports onto host `127.0.0.1` under host lockdown (#218, #220). It also adds guest loopback fallback for inbound `-p` port forwarders (#219).
+
+### Features
+
+- **Dynamic loopback port auto-publishing (`--auto-publish`, `pkg/hostlockdown`, `pkg/netbackend`, `pkg/gvx`, `cmd/rungv`)** (#218): Opt-in `--auto-publish` (`Config.AutoPublishPorts`) reconciles guest TCP listeners and `iptables` NAT `DNAT` ports onto host `127.0.0.1` while host lockdown stays active. Host lockdown allows only loopback binds (`127.0.0.1` or `::1`), static `-p` rules keep precedence, and new tunables bound dynamic ports and polling.
+
+### Bug Fixes
+
+- **Published port fallback to guest loopback (`pkg/netbackend`, `pkg/tcpip/stack`)** (#218): Inbound `-p` port forwarders now fall back to guest `127.0.0.1:<port>` on `lo` when a service binds only loopback. This lets host clients reach nested containers published with `docker run -p 127.0.0.1:...` and local development servers bound to `localhost`.
 
 ## [v0.17.10032026111600] - 2026-11-20
 
