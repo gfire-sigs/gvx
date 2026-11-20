@@ -59,7 +59,10 @@ func (s *Sandbox) initKernelRootNetworkNamespace(k *kernel.Kernel, creds *auth.C
 
 // populateDefaultEtcFiles creates default /etc/passwd, /etc/group, /etc/hosts,
 // and /etc/resolv.conf files when the guest rootfs does not already provide them.
-func populateDefaultEtcFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
+func populateDefaultEtcFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, resolvConf string) error {
+	if resolvConf == "" {
+		resolvConf = "nameserver " + netbackend.HostDNSIPv4 + "\n"
+	}
 	for _, f := range []struct {
 		path string
 		data string
@@ -67,7 +70,7 @@ func populateDefaultEtcFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyst
 		{"/etc/passwd", "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n"},
 		{"/etc/group", "root:x:0:root\nnogroup:x:65534:\n"},
 		{"/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n" + netbackend.HostGatewayIPv4 + "\thost.docker.internal\n" + netbackend.DefaultGuestIPv4 + "\tgvx\n"},
-		{"/etc/resolv.conf", "nameserver " + netbackend.HostDNSIPv4 + "\n"},
+		{"/etc/resolv.conf", resolvConf},
 	} {
 		if err := ensureGuestFileIfAbsent(sctx, vfsObj, creds, root, f.path, []byte(f.data), 0o644); err != nil {
 			return fmt.Errorf("gvx: create guest file %s: %w", f.path, err)
@@ -100,6 +103,7 @@ func (s *Sandbox) initNATStack() error {
 	}
 	s.netStack = st
 	s.natForwarder = fwd
+	s.guestResolvConf = fwd.GuestResolvConf()
 	return s.initPortForwarder()
 }
 
@@ -204,6 +208,7 @@ func (s *Sandbox) initWireGuardStack() error {
 	s.wgEndpoint = wgEP
 	s.wgPeerPort = peerPort
 	s.netStack = st
+	s.guestResolvConf = wgEP.GuestResolvConf()
 	return nil
 }
 

@@ -400,7 +400,7 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	if err := mountStandardSubfilesystems(sctx, vfsObj, creds, root, mountSubfs); err != nil {
 		return err
 	}
-	if err := populateDefaultEtcFiles(sctx, vfsObj, creds, root); err != nil {
+	if err := populateDefaultEtcFiles(sctx, vfsObj, creds, root, s.guestResolvConf); err != nil {
 		return err
 	}
 	if err := s.writeGuestHostFiles(sctx, vfsObj, creds, root); err != nil {
