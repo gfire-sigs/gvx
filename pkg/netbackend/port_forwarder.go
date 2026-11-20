@@ -30,6 +30,7 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
@@ -619,6 +620,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 		acceptFn = net.Listener.Accept
 	}
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
+	fallback := allowsLoopbackFallback(b.rule.GuestIP)
 	var backoff time.Duration
 	var timer *time.Timer
 	defer func() {
@@ -649,7 +651,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
-		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, hostConn) }) {
+		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, fallback, hostConn) }) {
 			_ = hostConn.Close()
 			return
 		}
@@ -659,7 +661,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 // relayTCPClient connects hostConn to the guest endpoint and relays both
 // streams. The guest may start listening after the host client connects, so
 // the dial retries during the guest dial window.
-func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn net.Conn) {
+func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bool, hostConn net.Conn) {
 	defer func() { _ = hostConn.Close() }()
 
 	ctx, cancel := context.WithTimeout(pf.ctx, pf.guestDialWindow)
@@ -674,7 +676,7 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 	for {
 		var err error
 		if s := pf.targetStack(); s != nil {
-			guestConn, err = gonet.DialContextTCP(ctx, s, guestAddr, ipv4.ProtocolNumber)
+			guestConn, err = dialGuestTCP(ctx, s, guestAddr, fallback)
 			if err == nil {
 				break
 			}
@@ -697,9 +699,23 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 	relayBidirectional(pf.ctx, hostConn, quiescedGuestConn{TCPConn: guestConn, wait: pf.waitResumed})
 }
 
+func dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddress, fallback bool) (*gonet.TCPConn, error) {
+	primary := guestAddr
+	secondary := guestLoopbackAddr(guestAddr.Port)
+	if fallback && prefersGuestLoopback(s, header.TCPProtocolNumber, guestAddr) {
+		primary, secondary = secondary, primary
+	}
+	conn, err := gonet.DialContextTCP(ctx, s, primary, ipv4.ProtocolNumber)
+	if err == nil || !fallback || ctx.Err() != nil {
+		return conn, err
+	}
+	return gonet.DialContextTCP(ctx, s, secondary, ipv4.ProtocolNumber)
+}
+
 func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 	defer pf.wg.Done()
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
+	fallback := allowsLoopbackFallback(b.rule.GuestIP)
 	buf := make([]byte, maxUDPDatagram)
 	var backoff time.Duration
 	var timer *time.Timer
@@ -730,7 +746,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
-		sess := pf.udpSession(b, guestAddr, client)
+		sess := pf.udpSession(b, guestAddr, fallback, client)
 		if sess == nil {
 			continue
 		}
@@ -744,7 +760,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 // udpSession returns the session of client. It creates the session and its
 // reply goroutine on the first datagram. It returns nil when the forwarder is
 // closed, the rule is at its session limit, or the guest endpoint fails.
-func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, client netip.AddrPort) *udpForwardSession {
+func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, fallback bool, client netip.AddrPort) *udpForwardSession {
 	pf.mu.Lock()
 	if pf.closed || pf.stack == nil {
 		pf.mu.Unlock()
@@ -762,7 +778,11 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 	s := pf.stack
 	pf.mu.Unlock()
 
-	guest, err := gonet.DialUDP(s, nil, &guestAddr, ipv4.ProtocolNumber)
+	target := guestAddr
+	if fallback && prefersGuestLoopback(s, header.UDPProtocolNumber, guestAddr) {
+		target = guestLoopbackAddr(guestAddr.Port)
+	}
+	guest, err := gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
 	if err != nil {
 		pf.log.Debug("netbackend: open guest UDP endpoint", "client", client, "error", err)
 		return nil
@@ -805,6 +825,30 @@ func (pf *PortForwarder) runUDPSession(b *boundUDPForward, sess *udpForwardSessi
 	}, sess.clock, pf.udpIdle)
 }
 
+var guestLoopbackIPv4 = tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
+
+func guestLoopbackAddr(port uint16) tcpip.FullAddress {
+	return tcpip.FullAddress{
+		NIC:  LoopbackNICID,
+		Addr: guestLoopbackIPv4,
+		Port: port,
+	}
+}
+
+func allowsLoopbackFallback(guestIP string) bool {
+	return guestIP == "" || guestIP == DefaultGuestIPv4
+}
+
+func prefersGuestLoopback(s *stack.Stack, transProto tcpip.TransportProtocolNumber, guestAddr tcpip.FullAddress) bool {
+	if s.HasBoundEndpoint(header.IPv4ProtocolNumber, transProto, guestAddr.Addr, guestAddr.Port) {
+		return false
+	}
+	if s.HasBoundEndpoint(header.IPv4ProtocolNumber, transProto, tcpip.Address{}, guestAddr.Port) {
+		return false
+	}
+	return s.HasBoundEndpoint(header.IPv4ProtocolNumber, transProto, guestLoopbackIPv4, guestAddr.Port)
+}
+
 func parseGuestFullAddr(ipStr string, port uint16) tcpip.FullAddress {
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil || !addr.Is4() {
@@ -814,8 +858,12 @@ func parseGuestFullAddr(ipStr string, port uint16) tcpip.FullAddress {
 			Port: port,
 		}
 	}
+	nic := Eth0NICID
+	if addr.IsLoopback() {
+		nic = LoopbackNICID
+	}
 	return tcpip.FullAddress{
-		NIC:  Eth0NICID,
+		NIC:  nic,
 		Addr: tcpip.AddrFrom4(addr.As4()),
 		Port: port,
 	}
