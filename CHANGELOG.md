@@ -4,27 +4,37 @@ This file records the observable changes of each `gvx` release. The release work
 
 ## [Unreleased]
 
-This release adds an optional GPU path for headless browsers on macOS (`rungv run -gpu=venus`). It also adds the Phase 0 browser gates of the GPU moonshot, which run Chromium, Playwright, and Electron with software rendering.
+This release adds optional GPU paths for headless browsers on macOS (`rungv run -gpu=venus` and `rungv run -gpu=virgl`). It also adds the Phase 0 browser gates of the GPU moonshot, which run Chromium, Playwright, and Electron with software rendering.
 
 ### Features
 
-- **Virtual GPU render node (`pkg/sentry/devices/virtgpu`, `pkg/sentry/fsimpl/sys`)**: With `-gpu=venus` on `darwin/arm64` and `hvf`, the guest gets `/dev/dri/renderD128` and the `sysfs` entries of a virtio GPU. Unmodified Mesa `venus` drivers use it (tests ran with Mesa 25.0.7, 25.2.8, and 26.2.6). The device serves the blob, context, and fence requests of `venus`; it refuses PRIME, DRM sync objects, and the `virgl` requests.
-- **Confined renderer process (`gpurenderer`, `internal/gpurender`, `scripts/gpu/build-renderer.sh`)**: `gvx-gpu-renderer` is a C program that links `virglrenderer` and renders on Metal through KosmicKrisp. `gvx.New` starts one renderer for each sandbox before the host lockdown. The renderer confines itself with a Seatbelt profile that denies process creation, file writes, and network access. The bundle is a separate build; `rungv` stays pure Go. The release workflow builds KosmicKrisp from the pinned Mesa source and packages `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz` with a provenance attestation.
-- **`-gpu` and `-gpu-renderer` flags, `gvx.Config.GPU` (`cmd/rungv`, `pkg/gvx`)**: The option is off by default. It needs macOS 26 or later. `gvx.New` returns `ErrGPUUnavailable` when the renderer cannot start, and `ErrInvalidConfig` when the option meets a checkpoint option, another backend, or another host. `Config.GPU.MemoryLimit` caps the blob memory of the guest (default: the smaller of 4 GiB and 25% of host RAM).
+- **Virtual GPU render node (`pkg/sentry/devices/virtgpu`, `pkg/sentry/fsimpl/sys`)**: With `-gpu=venus` or `-gpu=virgl` on `darwin/arm64` and `hvf`, the guest gets `/dev/dri/renderD128` and the `sysfs` entries of a virtio GPU. `-gpu=venus` serves unmodified Mesa `venus` Vulkan drivers (tested with Mesa 25.0.7, 25.2.8, and 26.2.6) with blob, context, and fence requests. `-gpu=virgl` (`gvx.GPUVirgl`) serves unmodified Mesa `virgl` OpenGL 4.1 and OpenGL ES 3.0 drivers (tested with Mesa 25.0.7 and 25.2.8) with `RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`, `WAIT`, implicit capset-2 contexts, and per-object fences. Both modes refuse PRIME, DRM sync objects, and `FENCE_FD_IN`. Guest OpenGL ES stays at 3.0 without compute shaders or persistent and coherent buffer mapping.
+- **Confined renderer process (`gpurenderer`, `internal/gpurender`, `scripts/gpu/build-renderer.sh`)**: `gvx-gpu-renderer` is a C program that links `virglrenderer` and serves `--mode=venus` (KosmicKrisp on Metal) or `--mode=virgl` (`vrend` on Apple OpenGL 4.1 through CGL), with `--selftest` for each mode. `gvx.New` starts one renderer for each sandbox before the host lockdown. The bundle is a separate build; `rungv` stays pure Go. The release workflow builds KosmicKrisp from the pinned Mesa source and packages `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz` with a provenance attestation.
+- **`-gpu` and `-gpu-renderer` flags, `gvx.Config.GPU` (`cmd/rungv`, `pkg/gvx`)**: The option accepts `off` (default), `venus`, or `virgl`, and needs macOS 26 or later. `gvx.New` returns `ErrGPUUnavailable` when the renderer cannot start, and `ErrInvalidConfig` when the option meets a checkpoint option, another backend, or another host. `Config.GPU.MemoryLimit` caps shared GPU memory of the guest (default: the smaller of 4 GiB and 25% of host RAM).
+
+### Changed
+
+- **Renderer protocol v2 (`pkg/sentry/devices/virtgpu/gpuproto`, `internal/gpurender`, `gpurenderer`)**: Protocol version 2 carries the requested mode in `HELLO` and adds `RES_CREATE` and `TRANSFER`. A renderer bundle and `rungv` must come from the same release.
+- **Renderer bundle `libepoxy` dependency (`gpurenderer`, `scripts/gpu`, `tools/licenses`)**: `gvx-gpu-renderer` links `libepoxy` 1.5.10 (MIT) statically and ships `LICENSES/libepoxy.txt` in the bundle.
+- **Pinned `virglrenderer` patches for Apple OpenGL 4.1 (`gpurenderer/patches/virglrenderer/`, `scripts/gpu`)**: `build-renderer.sh` applies `0001-vrend-strip-core-desktop-extensions.patch` and `0002-vrend-multisample-without-storage.patch` to `virglrenderer` and records their SHA-256 digests in `BUILDINFO`.
+
+### Security
+
+- **OpenGL command stream confinement (`gpurenderer`)**: In `virgl` mode, the renderer parses OpenGL command streams with `vrend` on Apple OpenGL 4.1 through CGL. The same `deny default` Seatbelt profile confines it, adding only the `/gvx-r-` shared-memory name prefix.
 
 ### Tests
 
 - **Browser baseline gates and benchmark (`e2e`, `internal/acceptprog`)**: `e2e/gate_browser_test.go` runs Chromium 159, the Chromium sandbox, WebGL on SwiftShader, Playwright 1.65.1, and Electron 45.4.1. It pins `mcr.microsoft.com/playwright:v1.65.1-noble` by digest. The gates run only with `GVX_E2E_BROWSER=1`. `TestE2EBrowserBench` (`GVX_E2E_BROWSER_BENCH=1`) logs the start time, the tab time, and the SwiftShader share. `FetchPlaywrightCore` and `FetchElectron` download size-capped archives on the host, verify SHA-256 digests while streaming, and extract bounded entries through `os.Root`.
-- **GPU gates (`e2e`)**: `TestE2EGateGPUVulkan` runs a Vulkan compute probe on an unmodified `debian:trixie` Mesa. `TestE2EGateGPUChromium` runs Chromium 159 from the Playwright image and verifies WebGL 1, WebGL 2, the renderer string, and fixed pixels against a SwiftShader pass. `TestE2EGPURendererKill` kills the renderer during a run. The gates run only with `GVX_E2E_GPU=1` and `GVX_GPU_RENDERER`, on an Apple Silicon host. They write their records to `GVX_E2E_ARTIFACT_DIR`.
-- **Renderer build in CI (`.github/workflows`, `scripts/gpu`)**: The `gpu-renderer` job of `ci.yml` builds the renderer bundle on `macos-26` when a renderer path or `ci.yml` changes. It runs the renderer self-test and the renderer tests only when the repository variable `GVX_CI_METAL` is `1`. `scripts/gpu/ci-metal-probe.sh` measures Metal on a runner through `diagnose.yml`.
+- **GPU gates (`e2e`)**: `TestE2EGateGPUVulkan` (G1) runs a Vulkan compute probe on an unmodified `debian:trixie` Mesa. `TestE2EGateGPUOpenGL` (G3) runs a surfaceless EGL and OpenGL ES probe on `-gpu=virgl` against an `llvmpipe` control. `TestE2EGateGPUChromium` (G2) runs Chromium 159 from the Playwright image in `venus` and `virgl` passes against a SwiftShader pass. `TestE2EGPURendererKill` kills the renderer during a run in `venus` and `virgl` subtests. The gates run only with `GVX_E2E_GPU=1` and `GVX_GPU_RENDERER` on an Apple Silicon host; `GVX_E2E_GPU_MODES` selects modes and `GVX_E2E_ARTIFACT_DIR` receives the records.
+- **Renderer build in CI (`.github/workflows`, `scripts/gpu`)**: The `gpu-renderer` job of `ci.yml` installs `pkgconf` and builds the renderer bundle on `macos-26` when a renderer path or `ci.yml` changes. It runs both mode self-tests and the renderer tests only when `GVX_CI_METAL` is `1`. `scripts/gpu/ci-metal-probe.sh` measures Metal on a runner through `diagnose.yml`.
 
 ### Not verified
 
-- No CI job runs the GPU gates: hosted macOS runners have no hypervisor. The gates ran by hand on one host (Apple M1 Ultra, macOS 27.2.1).
-- No hosted runner has run the `gpu-renderer` jobs of `ci.yml` and `release.yml` yet. No host has built KosmicKrisp from the Mesa source with `--driver-source mesa-source`.
-- No run has measured Metal on a hosted `macos-26` runner. The repository variable `GVX_CI_METAL` is therefore not `1`, and CI skips the renderer self-test and the renderer tests.
+- No CI job runs the GPU gates: hosted macOS runners have no hypervisor. Gates G1, G2 (`venus` and `virgl`), G3, and the kill tests ran by hand on one host (Apple M1 Ultra, macOS 27.2.1).
+- No hosted runner has run the `gpu-renderer` jobs of `ci.yml` and `release.yml` yet (including `pkgconf`, `libepoxy`, and the `virgl` self-test). No host has built KosmicKrisp from the Mesa source with `--driver-source mesa-source`.
+- No run has measured Metal or Apple OpenGL on a hosted `macos-26` runner. The repository variable `GVX_CI_METAL` is therefore not `1`, and CI skips both renderer self-tests and the renderer tests.
 - No run covers macOS 26, other Apple Silicon chips, or the WebGL conformance subset.
-- The device and client packages cross-compile for Windows and Linux, but `-gpu=venus` returns `ErrInvalidConfig` there.
+- The device and client packages cross-compile for Windows and Linux, but `-gpu=venus` and `-gpu=virgl` return `ErrInvalidConfig` there.
 
 ## [v0.17.10022026111600] - 2026-11-20
 

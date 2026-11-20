@@ -189,48 +189,53 @@ func main() {
 }
 ```
 
-### 3.4 GPU Acceleration for Headless Browsers (`-gpu=venus`)
+### 3.4 GPU Acceleration for Headless Browsers (`-gpu=venus`, `-gpu=virgl`)
 
-On Apple Silicon, `rungv run -gpu=venus` lets a headless Chromium in the guest render WebGL on the host GPU. The guest sees a `virtio-gpu` render node (`/dev/dri/renderD128`). A separate host process, `gvx-gpu-renderer`, runs the Vulkan commands of the guest on Metal. The option is off by default.
+On Apple Silicon, `rungv run -gpu=venus` and `rungv run -gpu=virgl` let headless Linux guests render on the host GPU through `/dev/dri/renderD128`. `-gpu=venus` runs Vulkan commands on Metal through KosmicKrisp; `-gpu=virgl` runs OpenGL and OpenGL ES commands on Apple OpenGL 4.1 through CGL. Both modes run in a confined `gvx-gpu-renderer` process and stay off by default.
 
 | Requirement | Value |
 | :--- | :--- |
-| Host | Apple Silicon with macOS 26 or later, `hvf` backend. A locally built bundle needs the macOS version of its pinned driver binaries (27.2 for a build on macOS 27). |
+| Modes | `venus` (Vulkan; ANGLE on Vulkan) and `virgl` (OpenGL; ANGLE on OpenGL ES). |
+| Host | Apple Silicon with macOS 26 or later, `hvf` backend. For `venus`, a locally built bundle also needs the macOS version of its pinned driver binaries (27.2 for a build on macOS 27). |
 | Renderer bundle | `gvx-gpu-renderer`: `scripts/gpu/build-renderer.sh` builds it. The release workflow packages it as `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz`. |
-| Guest packages | `mesa-vulkan-drivers` and `libvulkan1`. Tests ran with Mesa 25.0.7, 25.2.8, and 26.2.6. The design floor is Mesa 24.0; no test covers a release before 25.0. |
-| Chromium flags | `--use-angle=vulkan --ignore-gpu-blocklist --disable-vulkan-surface` |
+| Guest packages | `venus`: `mesa-vulkan-drivers` and `libvulkan1` (tested with Mesa 25.0.7, 25.2.8, and 26.2.6; design floor 24.0). `virgl`: `libgl1-mesa-dri` and `libegl-mesa0` (tested with Mesa 25.0.7 and 25.2.8). |
+| Chromium flags | `venus`: `--use-angle=vulkan --ignore-gpu-blocklist --disable-vulkan-surface`. `virgl`: `--use-gl=angle --use-angle=gl-egl --ignore-gpu-blocklist`. |
 | Not supported | Checkpoint and restore, Windows and Linux hosts, windows on the host desktop |
 
 `gvx` adds no package and no flag to the guest; the guest image and the browser command supply both.
 
 > [!WARNING]
-> Use `-gpu=venus` only when the workload needs it. The option adds a host process that parses guest-controlled data in C and calls the GPU driver of the host. A Seatbelt profile confines that process, but it is a larger attack surface than a sandbox without the option.
+> Enable `-gpu=venus` or `-gpu=virgl` only when the workload needs it. The option adds a host process that parses guest-controlled data in C and calls the host GPU driver. A Seatbelt profile confines that process, but it is a larger attack surface than a sandbox without the option.
 
 1. Build the renderer bundle.
-2. Verify the bundle with its self-test.
-3. Run the guest with `-gpu=venus`.
-4. Read `UNMASKED_RENDERER_WEBGL` in the page to verify the GPU path.
+2. Run the `venus` self-test to verify Vulkan on Metal.
+3. Run the `virgl` self-test to verify OpenGL on CGL.
+4. Run the guest with `-gpu=venus` or `-gpu=virgl`.
+5. Read `UNMASKED_RENDERER_WEBGL` in the page to verify the GPU path.
 
 ```bash
-# 1. Build the bundle into build/gpu/gvx-gpu-renderer/ (needs meson >= 1.3, ninja, Python 3.10+, and Xcode command line tools)
+# 1. Build the bundle into build/gpu/gvx-gpu-renderer/ (needs meson >= 1.3, ninja, pkgconf, Python 3.10+, and Xcode command line tools)
 scripts/gpu/build-renderer.sh
 
-# 2. The self-test prints "selftest: PASS"
+# 2. Verify venus mode (prints "selftest: PASS")
 build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest
 
-# 3. Run a Playwright script with the GPU (the image needs mesa-vulkan-drivers)
+# 3. Verify virgl mode (prints "selftest: PASS")
+build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest --mode=virgl
+
+# 4. Run a Playwright script with the GPU (the image needs mesa-vulkan-drivers for venus, or libgl1-mesa-dri and libegl-mesa0 for virgl)
 ./rungv run -gpu=venus -gpu-renderer build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer \
   -workspace=./my-tests my-playwright-image:latest node /workspace/webgl-test.js
 ```
 
 ```js
-// Playwright launch options in the guest
+// Playwright launch options in the guest (venus mode)
 const browser = await chromium.launch({
   args: ['--use-angle=vulkan', '--ignore-gpu-blocklist', '--disable-vulkan-surface'],
 });
 ```
 
-With the GPU path, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU Venus`. With software rendering it contains `SwiftShader`. `rungv` finds the bundle without `-gpu-renderer` when the directory `gvx-gpu-renderer` is beside the `rungv` executable. When the renderer cannot start, `rungv` exits with an error; it does not fall back to software rendering. [`docs/architecture.md`](docs/architecture.md) section 3.15 describes the design, the limits, and the confinement.
+With `venus`, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU Venus`. With `virgl`, `UNMASKED_RENDERER_WEBGL` contains `virgl`. With software rendering it contains `SwiftShader`. `rungv` finds the bundle without `-gpu-renderer` when the directory `gvx-gpu-renderer` is beside the `rungv` executable. When the renderer cannot start, `rungv` exits with an error; it does not fall back to software rendering. [`docs/architecture.md`](docs/architecture.md) section 3.15 describes the design, the limits, and the confinement.
 
 ---
 
@@ -240,7 +245,7 @@ With the GPU path, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU V
 
 | Host OS & CPU | Primary Engine | Fallback Engine | Notes |
 | :--- | :--- | :--- | :--- |
-| **macOS `arm64`** (Apple Silicon M1 to M5) | `hvf` (`Hypervisor.framework`) | None | Requires `com.apple.security.hypervisor` code-signing entitlement. Optional GPU for headless browsers: `-gpu=venus` (macOS 26 or later, section 3.4). |
+| **macOS `arm64`** (Apple Silicon M1 to M5) | `hvf` (`Hypervisor.framework`) | None | Requires `com.apple.security.hypervisor` code-signing entitlement. Optional GPU for headless browsers: `-gpu=venus` or `-gpu=virgl` (macOS 26 or later, section 3.4). |
 | **Windows `amd64`** (Intel / AMD) | `whpx` (`WinHvPlatform.dll`) | `systrap` (opt-in) | `whpx` requires Windows Hypervisor Platform. `systrap` requires `-platform=systrap` or `-allow-unconfined-systrap`. |
 | **Windows `arm64`** (Snapdragon X) | `whpx` (`WinHvPlatform.dll`) | `systrap` (opt-in) | `whpx` on Windows 11 24H2+; `systrap` runs without a hypervisor for trusted workloads. |
 | **Linux `amd64` & `arm64`** | `systrap` / `kvm` | `systrap` | Supports both 4 KB and 16 KB host page kernels (including Android 15/16 `arm64`). |
@@ -256,7 +261,7 @@ With the GPU path, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU V
 | [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) | Recipe: Run single-node or multi-node `k3s` Kubernetes clusters (with flannel or Calico CNI) inside `gvx`. |
 | [`docs/architecture.md`](docs/architecture.md) | Internal architecture, Tier 1/2/3 upstream isolation model, memory/handle ownership, and contributor guide. |
 | [`docs/systrap-windows.md`](docs/systrap-windows.md) | Engineering deep dive and measurements for the Windows user-mode `systrap` engine. |
-| [`docs/moonshots.md`](docs/moonshots.md) | GPU acceleration for browser guests: the plan, the measured gates of the macOS path (`-gpu=venus`), and the proposals for Windows and for display output. |
+| [`docs/moonshots.md`](docs/moonshots.md) | GPU acceleration for browser guests: the plan, the measured gates of the macOS paths (`-gpu=venus`, `-gpu=virgl`), and the proposals for Windows and for display output. |
 | [`SECURITY.md`](SECURITY.md) | Threat model, security boundaries per platform, and vulnerability reporting policy. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes for each version. |
 

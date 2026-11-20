@@ -152,9 +152,11 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_E2E_BROWSER=1` | Runs the browser gates of `e2e/gate_browser_test.go`. They pull a Playwright image of about 1 GB, so CI leaves the variable unset. |
 | `GVX_E2E_BROWSER_BENCH=1` | Runs `TestE2EBrowserBench` with `GVX_E2E_BROWSER=1`. The test logs the browser start time, the tab time, and the SwiftShader share of each workload. |
 | `GVX_E2E_GPU=1` | Runs the GPU gates (`e2e/gate_gpu*_test.go`) on `darwin/arm64` with `hvf`. The gates need `GVX_GPU_RENDERER` and fail without it. |
-| `GVX_E2E_ARTIFACT_DIR` | Directory that receives the records of the GPU gates (`g1`, `g1-kill`, `g2`): results, logs, refused ioctls, and screenshots. |
-| `GVX_GPU_RENDERER` | Path of the `gvx-gpu-renderer` executable for `-gpu=venus`. `scripts/gpu/build-renderer.sh` writes it to `build/gpu/gvx-gpu-renderer/bin/`. |
-| `GVX_E2E_GPU_CHROMIUM_FLAGS` | Replaces the Chromium flags of the GPU pass of `TestE2EGateGPUChromium`, for the fallback steps of the GPU design. |
+| `GVX_E2E_ARTIFACT_DIR` | Directory that receives the records of the GPU gates (`g1`, `g1-kill`, `g2`, `g3`): results, logs, refused ioctls, and screenshots. |
+| `GVX_GPU_RENDERER` | Path of the `gvx-gpu-renderer` executable for `-gpu=venus` and `-gpu=virgl`. `scripts/gpu/build-renderer.sh` writes it to `build/gpu/gvx-gpu-renderer/bin/`. |
+| `GVX_E2E_GPU_MODES` | Comma-separated list of GPU modes (`venus`, `virgl`) that the GPU gates run. Unset selects both modes. |
+| `GVX_E2E_GPU_CHROMIUM_FLAGS` | Replaces the Chromium flags of the `venus` pass of `TestE2EGateGPUChromium`, for the fallback steps of the GPU design. |
+| `GVX_E2E_GPU_CHROMIUM_VIRGL_FLAGS` | Replaces the Chromium flags of the `virgl` pass of `TestE2EGateGPUChromium`, for the fallback steps of D13. |
 | `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. The value `2` also prints debug lines, such as each fault that the Sentry cannot resolve. |
 | `GVX_SYSTRAP_SUBBLOCKS=1` | Runs the sub-block layer of the Linux `systrap` engine on a host with 4 KB pages. The layer maps 4 KB guest pages on a host with 16 KB pages, such as an Android device. |
 | `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop and the state of each stub. The value `3` prints only the state, the count of each kind of stop, and the count of `amd64` `syscall` sites by patch outcome. The value `4` also samples the program counter and prints the hottest addresses. |

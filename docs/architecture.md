@@ -1044,30 +1044,57 @@ Inside the Android sandbox process, `platform/systrap` allocates executable stub
 
 ### 3.15 Virtual GPU Render Node and Renderer Process (`pkg/sentry/devices/virtgpu`, `internal/gpurender`, `gpurenderer`) (Descriptive Module)
 
-With `-gpu=venus`, a guest on `darwin/arm64` with the `hvf` backend renders on the host GPU. The Sentry emulates the Linux `virtio-gpu` render node. A separate host process, `gvx-gpu-renderer`, decodes the Vulkan command stream (`venus`) and calls Metal through KosmicKrisp. The option is off by default; a sandbox without it registers no device and starts no process. [`moonshots.md`](moonshots.md) holds the plan, the measurements, and the Windows proposal.
+On `darwin/arm64` with the `hvf` backend, `-gpu=venus` and `-gpu=virgl` render guest graphics on the host GPU. The Sentry emulates the Linux `virtio-gpu` render node, and one `gvx-gpu-renderer` process serves one mode per sandbox. `-gpu=venus` runs Vulkan through KosmicKrisp on Metal; `-gpu=virgl` runs OpenGL and OpenGL ES through `vrend` on Apple OpenGL 4.1 via CGL. The option is off by default; a sandbox without it registers no device and starts no process. [`moonshots.md`](moonshots.md) holds the plan, the measurements, and the Windows proposal.
 
 | Component | Location | Responsibility |
 | :--- | :--- | :--- |
-| Guest driver | Guest image (`mesa-vulkan-drivers`; tests ran with Mesa 25.0.7 to 26.2.6) | Encodes Vulkan calls. `gvx` adds no file to the guest. |
-| Render node | `pkg/sentry/devices/virtgpu` | Serves `/dev/dri/renderD128`: DRM ioctls, GEM handles, blob memory, fences, and resource caps. Pure Go. |
+| Guest driver | Guest image (`mesa-vulkan-drivers` for `venus`; `libgl1-mesa-dri` and `libegl-mesa0` for `virgl`; `venus` tested with Mesa 25.0.7 to 26.2.6; `virgl` tested with Mesa 25.0.7 and 25.2.8) | Encodes Vulkan (`venus`) or OpenGL (`virgl`) calls. `gvx` adds no file to the guest. |
+| Render node | `pkg/sentry/devices/virtgpu` | Serves `/dev/dri/renderD128`: DRM ioctls, GEM handles, shared memory, fences, and resource caps. Pure Go. |
 | Device enumeration | `pkg/sentry/fsimpl/sys/virtgpu_xplat.go` | Lists the node as a virtio GPU on a PCI device, because Mesa `venus` accepts only a PCI or platform bus. |
-| Protocol | `pkg/sentry/devices/virtgpu/gpuproto` | Defines the wire format. `go generate` writes `gpurenderer/gvx_gpu_protocol.h` from the Go constants. |
-| Client | `internal/gpurender` | Starts the renderer, runs requests and events, receives blob descriptors, and detects a lost renderer. |
-| Renderer | `gpurenderer` (C); `scripts/gpu/build-renderer.sh` builds the bundle | Links `virglrenderer` and serves the protocol. The bundle holds KosmicKrisp. `rungv` stays pure Go. |
+| Protocol | `pkg/sentry/devices/virtgpu/gpuproto` | Defines wire protocol version 2. `go generate` writes `gpurenderer/gvx_gpu_protocol.h` from the Go constants. |
+| Client | `internal/gpurender` | Starts the renderer, runs requests and events, receives shared-memory descriptors, and detects a lost renderer. |
+| Renderer | `gpurenderer` (C); `scripts/gpu/build-renderer.sh` builds the bundle | Links `virglrenderer` (`venus` and `vrend`, with pinned `vrend` patches) and `libepoxy` 1.5.10 statically. `venus` uses KosmicKrisp from the bundle; `virgl` uses the system OpenGL framework. `rungv` stays pure Go. |
 | Sandbox wiring | `pkg/gvx/gpu.go` | Validates the option, starts the renderer before the lockdown, registers the device, and closes both in order. |
+
+`scripts/gpu/build-renderer.sh` applies two pinned patches from `gpurenderer/patches/virglrenderer/` to `virglrenderer` for Apple OpenGL 4.1 core and records their SHA-256 digests in `BUILDINFO`. `0001-vrend-strip-core-desktop-extensions.patch` drops `#extension` lines for core ARB features that Apple OpenGL omits from its extension list, and raises `#version`. `0002-vrend-multisample-without-storage.patch` probes multisample formats with `glTexImage2DMultisample` when `glTexStorage2DMultisample` is absent, enabling `MaxSamples >= 4` and desktop OpenGL above 2.1.
+
+#### Modes (Reference Module)
+
+One `gvx-gpu-renderer` process serves one command stream per sandbox. Each mode advertises only its own capsets and refuses requests of the other mode.
+
+| Item | `venus` | `virgl` |
+| :--- | :--- | :--- |
+| Guest API | Vulkan | OpenGL 4.1 (Core and Compatibility, GLSL 4.10) and OpenGL ES 3.0 (GLSL ES 3.00); no OpenGL ES 3.1, compute shaders, or persistent and coherent buffer mapping |
+| Capsets | 4 | 1 (`v1`), 2 (`v2`) |
+| Host path | `virglrenderer` `venus`, KosmicKrisp, Metal | `virglrenderer` `vrend`, CGL, Apple OpenGL 4.1 on Metal |
+| Renderer argument | `--mode=venus` (default) | `--mode=virgl` |
+| Guest memory objects | `RESOURCE_CREATE_BLOB` (`HOST3D`, mappable) | `RESOURCE_CREATE` with a renderer shared-memory backing |
+| Minimum macOS | 26 and `MIN_MACOS` of the bundle driver | 26 |
 
 #### Guest Interface (Reference Module)
 
-The node serves the requests that Mesa `venus` and headless Chromium send. It refuses every other request with the error that a Linux render node without that feature returns. With `GVX_DEBUG_LOG=2`, the device logs each refused request one time for each open file.
+The node serves the requests that Mesa `venus`, Mesa `virgl`, and headless Chromium send. It refuses every other request with the error that a Linux render node without that feature returns. With `GVX_DEBUG_LOG=2`, the device logs each refused request one time for each open file.
 
-| Group | Served | Refused, with the error |
+| Group | Served in both modes | Mode-specific requests | Refused in both modes |
+| :--- | :--- | :--- | :--- |
+| DRM core | `DRM_IOCTL_VERSION` (driver name `virtio_gpu`), `DRM_IOCTL_GET_CAP` | None | Master, authentication, mode-setting, and dumb-buffer requests: `EACCES` |
+| GEM and PRIME | `DRM_IOCTL_GEM_CLOSE` | None | `GEM_FLINK`, `GEM_OPEN`: `EACCES`; PRIME export and import: `EOPNOTSUPP` |
+| Synchronization | `sync_file` descriptor from `EXECBUFFER` with `FENCE_FD_OUT`; `poll` on it | `virgl` only: `WAIT`, and per-object fences from `EXECBUFFER` when `num_bo_handles > 0` (`WAIT` returns `EINVAL` in `venus`) | `DRM_IOCTL_SYNCOBJ_*`: `EOPNOTSUPP`; `sync_file` ioctls: `ENOTTY`; `FENCE_FD_IN`: `EINVAL` |
+| `virtio-gpu` | `GETPARAM`, `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_INFO`, `MAP`, `EXECBUFFER` | `venus` only: `RESOURCE_CREATE_BLOB` (`EINVAL` in `virgl`). `virgl` only: `RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST` (`EINVAL` in `venus`) | None |
+
+`DRM_IOCTL_GET_CAP` reports no sync objects and no PRIME. Mesa then uses its simulated sync objects, which need only `sync_file` descriptors. In `virgl` mode, an open file that calls `RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`, or `EXECBUFFER` (without `RING_IDX`) before `CONTEXT_INIT` creates an implicit capset-2 context synchronously. In `venus` mode, those requests require an explicit `CONTEXT_INIT` first. On a `virgl` context, `EXECBUFFER` with `num_bo_handles > 0` attaches a fence even without `FENCE_FD_OUT` and records it on each listed object for `WAIT`.
+
+| `GETPARAM` parameter | `venus` | `virgl` |
 | :--- | :--- | :--- |
-| DRM core | `DRM_IOCTL_VERSION` (driver name `virtio_gpu`), `DRM_IOCTL_GET_CAP` | Master, authentication, and mode-setting requests: `EACCES` |
-| GEM and PRIME | `DRM_IOCTL_GEM_CLOSE` | PRIME export and import: `EOPNOTSUPP` |
-| Synchronization | A `sync_file` descriptor from `EXECBUFFER` with `FENCE_FD_OUT`; `poll` on it | `DRM_IOCTL_SYNCOBJ_*`: `EOPNOTSUPP`; `sync_file` ioctls: `ENOTTY`; `FENCE_FD_IN`: `EINVAL` |
-| `virtio-gpu` | `GETPARAM`, `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE_BLOB`, `RESOURCE_INFO`, `MAP`, `EXECBUFFER` | The `virgl` requests (`RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`, `WAIT`): `EINVAL` |
-
-`DRM_IOCTL_GET_CAP` reports no sync objects and no PRIME. Mesa then uses its simulated sync objects, which need only the `sync_file` descriptor. `GETPARAM` reports 3D features, blob resources, host-visible memory, context initialization, the `venus` capset, and a blob alignment of 16 KiB.
+| `3D_FEATURES` (1) | `1` | `1` |
+| `CAPSET_QUERY_FIX` (2) | `1` | `1` |
+| `RESOURCE_BLOB` (3) | `1` | `0` |
+| `HOST_VISIBLE` (4) | `1` | `0` |
+| `CROSS_DEVICE` (5) | `0` | `0` |
+| `CONTEXT_INIT` (6) | `1` | `1` |
+| `SUPPORTED_CAPSET_IDs` (7) | `1 << 4` | `1 << 1 \| 1 << 2` |
+| `EXPLICIT_DEBUG_NAME` (8) | `1` | `1` |
+| `BLOB_ALIGNMENT` (9) | `16384` | `EINVAL` |
 
 #### Data Path (Descriptive Module)
 
@@ -1075,21 +1102,23 @@ One open file of the node is one DRM file. It owns one GEM handle table and at m
 
 | Guest call | Sentry (`virtgpu`) | Renderer |
 | :--- | :--- | :--- |
-| `CONTEXT_INIT` | Allocates a context ID and sends `CTX_CREATE` | Creates a `virglrenderer` context for the `venus` capset |
-| `RESOURCE_CREATE_BLOB` | Reserves the bytes against the limit and sends `BLOB_CREATE` | Allocates a POSIX shared-memory object and returns its descriptor in the reply |
-| `MAP`, then `mmap` | Returns a fake offset; `ConfigureMMap` finds the blob and refuses a private mapping | None |
-| Vulkan commands | None: the guest writes them into the `venus` ring, which is a mapped blob | A ring thread reads the blob and runs the commands |
-| `EXECBUFFER` | Copies at most 16 MiB from the guest and sends `SUBMIT`; with `FENCE_FD_OUT` it also creates a fence and a `sync_file` descriptor | Runs the commands or wakes the ring thread; creates the fence |
-| `poll` on a `sync_file` | Waits for the `FENCE_DONE` event of that fence | Sends `FENCE_DONE` when the fence retires |
-| `GEM_CLOSE` | Drops the handle and sends `RES_UNREF` | Releases the resource |
+| `CONTEXT_INIT` | Allocates a context ID and sends `CTX_CREATE` | Creates a `virglrenderer` context for capset 4 (`venus`) or capset 1 or 2 (`virgl`) |
+| `RESOURCE_CREATE_BLOB` (`venus`) | Reserves the bytes against the limit and sends `BLOB_CREATE` | Allocates a POSIX shared-memory object and returns its descriptor in the reply |
+| `RESOURCE_CREATE` (`virgl`) | Reserves the bytes, ensures a context, and sends `RES_CREATE` | Creates a `vrend` resource with a POSIX shared-memory backing and returns its descriptor |
+| `TRANSFER_TO_HOST` / `TRANSFER_FROM_HOST` (`virgl`) | Validates the handle and sends `TRANSFER` | Copies synchronously between the attached backing and the `vrend` resource |
+| `MAP`, then `mmap` | Returns a fake offset; `ConfigureMMap` finds the object and refuses a private mapping | None |
+| Vulkan commands (`venus`) | None: the guest writes them into the `venus` ring, which is a mapped blob | A ring thread reads the blob and runs the commands |
+| `EXECBUFFER` | Copies at most 16 MiB from the guest and sends `SUBMIT`; creates a fence for `FENCE_FD_OUT` or `virgl` `bo_handles` | Runs the commands or wakes the ring thread; creates the fence |
+| `poll` on `sync_file`, or `WAIT` (`virgl`) | Waits for the `FENCE_DONE` event of that fence | Sends `FENCE_DONE` when the fence retires |
+| `GEM_CLOSE` | Drops the handle and sends `RES_UNREF` | Detaches and unmaps any `virgl` backing and releases the resource |
 
-Most Vulkan traffic never enters the Sentry, because the ring is shared memory between guest user space and the renderer. The host has no `eventfd`, so the renderer polls `virglrenderer` every 1 ms while a fence is pending.
+In `venus` mode, most Vulkan traffic never enters the Sentry because the ring is shared memory between guest user space and the renderer. In `virgl` mode, the renderer creates a POSIX shared-memory object for each resource, attaches it to the `vrend` resource as its backing, and sends the descriptor. The Sentry maps that descriptor like a blob. The guest mapping, the encoded transfers of the command stream, and the transfer ioctls all use the same pages, and the renderer never maps guest RAM.
 
 #### Memory Model (Descriptive Module)
 
-The device accepts only `VIRTGPU_BLOB_MEM_HOST3D`. The renderer allocates each shared buffer with `shm_open` and unlinks the name at once. The Sentry verifies the size with `fstat`, maps the object one time, and closes the descriptor. The blob implements `memmap.Mappable` and `memmap.File`. On `hvf`, `AddressSpace.MapFile` and `hvcommon.RegionMap` map the view with `hv_vm_map`; the platform package has no GPU code.
+In `venus` mode, the device accepts only `VIRTGPU_BLOB_MEM_HOST3D`. In `virgl` mode, `RESOURCE_CREATE` allocates a renderer shared-memory backing that uses the same mapping path. The renderer allocates each shared buffer with `shm_open` and unlinks the name at once. The Sentry verifies the size with `fstat`, maps the object one time, and closes the descriptor. The object implements `memmap.Mappable` and `memmap.File`; on `hvf`, `AddressSpace.MapFile` and `hvcommon.RegionMap` map the view with `hv_vm_map`, so the platform package needs no GPU code.
 
-The renderer never maps guest RAM. A guest blob size is a multiple of 4 KiB, and the host object is a multiple of 16 KiB. `MapInternal` refuses a range beyond the guest size.
+The renderer never maps guest RAM. A guest object size is a multiple of 4 KiB, and the host object is a multiple of 16 KiB. `MapInternal` refuses a range beyond the guest size.
 
 > [!IMPORTANT]
 > Unmap a blob view only after GEM handles, `blobMapping` VMA identities, and `MmapFileRefs` page references reach zero. An earlier `munmap` leaves a guest mapping that names freed host memory.
@@ -1098,31 +1127,32 @@ The renderer never maps guest RAM. A guest blob size is a multiple of 4 KiB, and
 
 #### Renderer Lifetime (Descriptive Module)
 
-`gvx.New` starts one renderer for each sandbox, after it creates the memory file and before `hostlockdown.Apply`. No package variable holds renderer state.
+`gvx.New` starts one renderer for each sandbox, after it creates the memory file and before `hostlockdown.Apply`. No package variable holds renderer state. In `virgl` mode, every `virglrenderer` and CGL call runs on the main request thread; the renderer retires fences across all `vrend` contexts with one `virgl_renderer_poll` call per 1 ms poll pass.
 
 | Event | Behavior |
 | :--- | :--- |
 | Search for the executable | `Config.GPU.RendererPath` (`-gpu-renderer`), then `GVX_GPU_RENDERER`, then `gvx-gpu-renderer/bin/gvx-gpu-renderer` beside `rungv`, then `../libexec/gvx-gpu-renderer/bin/gvx-gpu-renderer`. Setting `-gpu-renderer` or `GVX_GPU_RENDERER` stops the search. |
-| Start | The renderer inherits one socket end as descriptor 3. It loads the Vulkan driver, initializes `virglrenderer`, resolves the user cache directory, applies Seatbelt, probes Vulkan, and answers `HELLO`. The start limit is 20 s. |
+| Start (`venus`) | Inherits descriptor 3 with `--mode=venus`. Verifies KosmicKrisp `MIN_MACOS`, loads the Vulkan driver, initializes `virglrenderer`, caches capset metadata, applies Seatbelt, starts the watchdog, probes Vulkan, and answers `HELLO` v2. Start limit: 20 s. |
+| Start (`virgl`) | Inherits descriptor 3 with `--mode=virgl`. Locates the bundle without loading Vulkan, probes CGL for accelerated OpenGL 4.1 core, initializes `virglrenderer` with flags 0, caches filled capsets 1 and 2, applies Seatbelt, starts the watchdog, and answers `HELLO` v2. Start limit: 20 s. |
 | Start failure | `gvx.New` returns `ErrGPUUnavailable` with the searched paths or the last line of the renderer. The sandbox never falls back to software rendering. |
 | Host before macOS 26, or a backend other than `hvf` | `gvx.New` returns an error that names the requirement. |
-| Host older than the bundle requires | The renderer compares the host with the minimum macOS version of its staged driver and exits with a message that names that version. `gvx.New` returns `ErrGPUUnavailable`. |
+| Host older than KosmicKrisp requires (`venus`) | The renderer compares the host with the minimum macOS version of its staged driver and exits with a message naming that version. `gvx.New` returns `ErrGPUUnavailable`. |
 | Checkpoint or restore with GPU | `Config.validateGPU` and `gvx.Restore` return `ErrInvalidConfig` (section 3.13). |
-| Renderer exits or stops answering | The client marks it lost. Pending requests fail, pending fences signal with an error, and later GPU calls return `EIO`. Mapped blobs stay valid. The sandbox keeps running. No restart is possible after the lockdown. |
-| `Sandbox.Close` | Kills the guest kernel and waits for `Run` to return (limit 30 s). Closes the platform. Closes the client, which kills the renderer and reaps it. Unmaps the blob views that remain. |
+| Renderer exits or stops answering | The client marks it lost. Pending requests fail, pending fences signal with an error, and later GPU calls return `EIO`. Mapped views stay valid. The sandbox keeps running. No restart is possible after the lockdown. |
+| `Sandbox.Close` | Kills the guest kernel and waits for `Run` to return (limit 30 s). Closes the platform. Closes the client, which kills the renderer and reaps it. Unmaps the shared views that remain. |
 | `rungv` exits without `Close` | The renderer reads end-of-file on descriptor 3 and exits. |
 
 #### Renderer Confinement (Reference Module)
 
-The renderer parses guest-controlled data in C, so it confines itself with its own Seatbelt profile (`gpurenderer/src/confine_darwin.c`) before it reads a guest byte. The profile starts with `deny default`. The renderer also sets `RLIMIT_NPROC` and `RLIMIT_CORE` to 0. The Sentry profile has no GPU rule.
+The renderer parses guest-controlled data in C, so it confines itself with its own Seatbelt profile (`gpurenderer/src/confine_darwin.c`) before it reads a guest byte. The profile starts with `deny default`. The renderer also sets `RLIMIT_NPROC` and `RLIMIT_CORE` to 0. The Sentry profile has no GPU rule. CGL needs no rule beyond the Metal rules; the spike ran context creation, shader compile, draw, and readback under the unchanged profile.
 
 | Rule of the profile | Reason |
 | :--- | :--- |
 | `iokit-open` for `IOAccelerator` and `IOSurfaceRootUserClient` | Metal opens the GPU through these two user clients. |
 | `mach-lookup` of `com.apple.MTLCompilerService` | Metal compiles each shader in this service. Without the rule, pipeline creation fails. |
-| `file-read*` for `/System/Library`, `/Library/GPUBundles`, `/usr/lib`, `/private/var/db/dyld`, and the renderer bundle | The Metal driver bundles and the libraries of the bundle load from these paths. |
+| `file-read*` for `/System/Library`, `/Library/GPUBundles`, `/usr/lib`, `/private/var/db/dyld`, and the renderer bundle | The Metal driver bundles, system OpenGL libraries, and bundle libraries load from these paths. |
 | `file-read-metadata` | Metal reads metadata of paths outside the list above. A narrower rule made the driver fail at start. |
-| POSIX shared memory with the name prefixes `/vkr-` and `/proxy-` | `virglrenderer` creates blob objects and its fence table with these names. |
+| POSIX shared memory with prefixes `/vkr-`, `/proxy-` (`venus`), and `/gvx-r-` (`virgl`) | `virglrenderer` creates `venus` blobs and fence tables under `/vkr-` and `/proxy-`; the renderer creates `virgl` backings under `/gvx-r-`. |
 | `sysctl-read` | The system libraries read hardware values. |
 | No file write, no network, `deny process-fork`, `deny process-exec*` | The renderer needs none of them. It has no file right on the Metal shader cache; `com.apple.MTLCompilerService` owns that cache. |
 
@@ -1136,45 +1166,64 @@ The Sentry enforces the limits, because the renderer is the untrusted side. Each
 
 | Limit | Value | On violation |
 | :--- | ---: | :--- |
-| Open files with a context | 64 | `CONTEXT_INIT` returns `ENOSPC` |
-| Blob bytes (host sizes of live blobs) | The smaller of 4 GiB and 25% of host RAM; `Config.GPU.MemoryLimit` replaces it | `RESOURCE_CREATE_BLOB` returns `ENOMEM` |
-| One blob | 1 GiB | `EINVAL` |
+| Open files with a context | 64 | `CONTEXT_INIT` or implicit context creation returns `ENOSPC` |
+| Blob bytes (host sizes of live blobs and `virgl` backings) | The smaller of 4 GiB and 25% of host RAM; `Config.GPU.MemoryLimit` replaces it | `RESOURCE_CREATE_BLOB` and `RESOURCE_CREATE` return `ENOMEM` |
+| One blob or `virgl` resource | 1 GiB | `RESOURCE_CREATE_BLOB` returns `EINVAL`; `RESOURCE_CREATE` returns `ENOMEM` |
 | Live blobs; GEM handles of one file | 65536 each | `ENOMEM` |
 | One `EXECBUFFER` | 16 MiB | `EINVAL` |
 | Pending fences of one context | 4096 | `EXECBUFFER` with a fence returns `EBUSY` |
-| Reply of the renderer to a request | 10 s (`SUBMIT`: 30 s) | The client declares the renderer lost and kills it |
+| Blocking `WAIT` (`virgl`) | 15 s | `WAIT` returns `EBUSY` (Linux value) |
+| Reply of the renderer to a request | 10 s (`SUBMIT` and `TRANSFER`: 30 s) | The client declares the renderer lost and kills it |
 | Pending fence | 30 s | The fence signals with an error, and the device ends the context |
+| OpenGL contexts in the renderer (`virgl`) | 1024 (guest contexts and sub-contexts) | Above 1024, context creation fails; the renderer can fail, and the guest gets `EIO` |
 | Renderer memory footprint | Blob limit plus 512 MiB, sampled every 250 ms | The renderer exits |
 
-`venus` allocates device-local Vulkan memory through its ring, so the Sentry cannot count it. The footprint limit covers that memory, but the renderer enforces it on itself. A corrupted renderer can pass it. The host kernel sets no limit.
+`venus` allocates device-local Vulkan memory through its ring, and `vrend` allocates GL textures and buffers outside the blob count. The footprint limit covers both, but the renderer enforces it on itself. A corrupted renderer can pass it. The host kernel sets no limit.
+
+#### Deviations from Linux in `virgl` Mode (Reference Module)
+
+The `virgl` render node mirrors Linux `virtio-gpu` ioctls, with five synchronous and memory-model differences.
+
+| Area | `gvx` behavior | Linux behavior |
+| :--- | :--- | :--- |
+| Implicit context creation | Runs synchronously; its errno returns to the guest. | Runs asynchronously without reporting failure to the ioctl. |
+| `RESOURCE_CREATE` validation | Runs synchronously; an invalid GL field returns `EINVAL`. | Returns `0` and fails later on the host. |
+| `TRANSFER_TO_HOST` / `TRANSFER_FROM_HOST` | Run synchronously, return `EINVAL` or `EIO` on error, and attach no fence. | Queue transfers asynchronously and attach a fence. |
+| `RESOURCE_CREATE` size cap | Requests above 1 GiB return `ENOMEM`. | Enforces no 1 GiB ioctl cap. |
+| Resource backing memory | Uses renderer-owned POSIX shared memory shared between guest mappings and host transfers. | Uses guest RAM pages. |
 
 #### Known Defects (Reference Module)
+
+This table tracks open and fixed GPU defects verified by unit tests and hardware gates.
 
 | Defect | Symptom | State |
 | :--- | :--- | :--- |
 | KD-1 | The first blob request on a new context fails with an I/O status while other contexts start and stop at the same time. `sendmsg` with a descriptor returns `EINVAL` inside `virglrenderer`, and the device loses that context. | Open. It occurs only under a stress test of context churn. The GPU gates count the failure and report a count above 0. |
 | KD-2 | Metal compiled each shader slowly under the renderer profile, and the renderer start came close to its 10 s limit. | Fixed: the renderer resolves the cache directory of the user before confinement, and the start limit is 20 s. A start-time test fails when the delay returns. |
+| `virgl` on Apple OpenGL 4.1 | Apple OpenGL omits core ARB extensions from its list and lacks `glTexStorage2DMultisample`. | Fixed by pinned patches `0001-vrend-strip-core-desktop-extensions.patch` and `0002-vrend-multisample-without-storage.patch`. Gates G3, G2 `virgl`, and the kill test report zero open defects. Guest OpenGL ES stays at 3.0 without compute shaders, `ARB_buffer_storage`, or persistent and coherent buffer mapping. |
 
 #### Verification (Procedural Module)
 
-The GPU tests need the renderer bundle. The gates also need `hvf`, so they run by hand on an Apple Silicon host with macOS 26 or later. The `gpu-renderer` job of `ci.yml` builds the bundle on `macos-26` when a renderer path changes. It runs the self-test and the tests of the client and the device only when the repository variable `GVX_CI_METAL` is `1`. No CI job runs the gates.
+The GPU tests need the renderer bundle. The gates also need `hvf`, so they run by hand on an Apple Silicon host with macOS 26 or later. The `gpu-renderer` job of `ci.yml` builds the bundle on `macos-26` when a renderer path changes. It runs both self-tests and the tests of the client and the device only when `GVX_CI_METAL` is `1`. No CI job runs the gates.
 
 1. Run `scripts/gpu/build-renderer.sh` to build the bundle in `build/gpu/gvx-gpu-renderer/`.
-2. Run the self-test of the renderer and verify that it prints `selftest: PASS`.
-3. Set `GVX_GPU_RENDERER` to the path of the executable.
-4. Run the unit tests of the device, the client, and the sandbox wiring.
-5. Run the gates with `GVX_E2E_GPU=1`.
+2. Run the `venus` self-test and verify that it prints `selftest: PASS`.
+3. Run the `virgl` self-test and verify that it prints `selftest: PASS`.
+4. Set `GVX_GPU_RENDERER` to the path of the executable.
+5. Run the unit tests of the device, the client, and the sandbox wiring.
+6. Run gates G1, G2, G3 (`TestE2EGateGPUOpenGL`), and the kill tests with `GVX_E2E_GPU=1`.
 
 ```bash
 scripts/gpu/build-renderer.sh
 build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest
+build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest --mode=virgl
 export GVX_GPU_RENDERER="$PWD/build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer"
 go test -race -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/devices/virtgpu/... ./internal/gpurender/...
 go test -race -exec "$PWD/scripts/codesign-exec.sh" ./pkg/gvx -run 'GPU'
-GVX_E2E_GPU=1 go test -count=1 -timeout 30m -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2E(GateGPU|GPURendererKill)' -v
+GVX_E2E_GPU=1 go test -count=1 -timeout 60m -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2E(GateGPU|GPURendererKill)' -v
 ```
 
-A unit test that needs the renderer skips when `GVX_GPU_RENDERER` is empty and no bundle exists. It fails when the variable names an executable that does not work. The gates write their records to the directory in `GVX_E2E_ARTIFACT_DIR`.
+A unit test that needs the renderer skips when `GVX_GPU_RENDERER` is empty and no bundle exists. It fails when the variable names an executable that does not work. Set `GVX_E2E_GPU_MODES=venus` or `GVX_E2E_GPU_MODES=virgl` to run one mode of the gates. The gates write their records to the directory in `GVX_E2E_ARTIFACT_DIR`.
 
 ---
 
