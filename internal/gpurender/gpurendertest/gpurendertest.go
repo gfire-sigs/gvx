@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"z.gfire.dev/gvx/internal/gpurender"
+	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 )
 
 const skipBundleMsg = "no GPU renderer bundle: run scripts/gpu/build-renderer.sh or set GVX_GPU_RENDERER"
@@ -72,6 +73,12 @@ func Path(t testing.TB) string {
 func New(t testing.TB) *gpurender.Client {
 	t.Helper()
 	return NewWithOptions(t, gpurender.Options{})
+}
+
+// NewVirgl starts the renderer in virgl mode and closes it at cleanup.
+func NewVirgl(t testing.TB) *gpurender.Client {
+	t.Helper()
+	return NewWithOptions(t, gpurender.Options{Mode: gpuproto.ModeVirgl})
 }
 
 // NewWithOptions starts the renderer with opts and closes it at cleanup.

@@ -25,7 +25,7 @@ const (
 	Magic uint32 = 0x31555047
 	// Version is the protocol version that HELLO negotiates. Both sides
 	// require an exact match.
-	Version uint32 = 1
+	Version uint32 = 2
 	// HeaderSize is the encoded size of Header in bytes.
 	HeaderSize = 24
 	// SocketFD is the descriptor number of the socket in the renderer.
@@ -55,6 +55,10 @@ const (
 )
 
 const (
+	// CapsetVirgl is the virgl v1 capset ID (VIRTGPU_DRM_CAPSET_VIRGL).
+	CapsetVirgl = 1
+	// CapsetVirgl2 is the virgl v2 capset ID (VIRTGPU_DRM_CAPSET_VIRGL2).
+	CapsetVirgl2 = 2
 	// CapsetVenus is the venus capset ID (virtio-gpu uAPI VIRTGPU_CAPSET_VENUS).
 	CapsetVenus = 4
 	// BlobMemHost3D is VIRTGPU_BLOB_MEM_HOST3D, the only blob memory type that
@@ -64,12 +68,77 @@ const (
 	BlobFlagMappable    = 1
 	BlobFlagShareable   = 2
 	BlobFlagCrossDevice = 4
-	// FDTypeShm is VIRGL_RENDERER_BLOB_FD_TYPE_SHM, the only descriptor type
-	// that a BLOB_CREATE reply carries.
+	// FDTypeShm is VIRGL_RENDERER_BLOB_FD_TYPE_SHM, the descriptor type that
+	// BLOB_CREATE and RES_CREATE replies carry.
 	FDTypeShm = 3
 	// SubmitFlagFence marks a SUBMIT that carries a fence.
 	SubmitFlagFence = 1
+	// TransferToHost copies from the attached backing to the vrend resource.
+	TransferToHost = 1
+	// TransferFromHost copies from the vrend resource to the attached backing.
+	TransferFromHost = 2
 )
+
+// Mode is the command stream that one renderer process serves. The renderer
+// gets it on its command line (ArgMode) and confirms it in the HELLO reply.
+type Mode uint32
+
+const (
+	// ModeVenus serves Vulkan through venus (capset CapsetVenus).
+	ModeVenus Mode = 1
+	// ModeVirgl serves OpenGL through vrend (capsets CapsetVirgl and CapsetVirgl2).
+	ModeVirgl Mode = 2
+)
+
+// ModeNameVenus and ModeNameVirgl are the values of ArgMode.
+const (
+	ModeNameVenus = "venus"
+	ModeNameVirgl = "virgl"
+)
+
+// String returns ModeNameVenus, ModeNameVirgl, or "MODE(n)".
+func (m Mode) String() string {
+	switch m {
+	case ModeVenus:
+		return ModeNameVenus
+	case ModeVirgl:
+		return ModeNameVirgl
+	default:
+		return fmt.Sprintf("MODE(%d)", m)
+	}
+}
+
+// Valid reports whether m is ModeVenus or ModeVirgl.
+func (m Mode) Valid() bool {
+	return m == ModeVenus || m == ModeVirgl
+}
+
+// Capsets returns the capset IDs that mode m advertises, in increasing order:
+// [CapsetVenus] for ModeVenus, [CapsetVirgl, CapsetVirgl2] for ModeVirgl, or
+// nil otherwise.
+func (m Mode) Capsets() []uint32 {
+	switch m {
+	case ModeVenus:
+		return []uint32{CapsetVenus}
+	case ModeVirgl:
+		return []uint32{CapsetVirgl, CapsetVirgl2}
+	default:
+		return nil
+	}
+}
+
+// PrimaryCapset returns CapsetVenus for ModeVenus and CapsetVirgl2 for
+// ModeVirgl (the capset of an implicit context), or 0.
+func (m Mode) PrimaryCapset() uint32 {
+	switch m {
+	case ModeVenus:
+		return CapsetVenus
+	case ModeVirgl:
+		return CapsetVirgl2
+	default:
+		return 0
+	}
+}
 
 const (
 	// CtxLostSubmitFailed: virgl_renderer_submit_cmd failed for the context.
@@ -83,7 +152,7 @@ const (
 const (
 	ExitOK          = 0 // end of file on SocketFD, or --selftest passed
 	ExitUsage       = 2 // bad command line, or SocketFD is not a socket
-	ExitInit        = 3 // MoltenVK, the Vulkan self-test, or virgl_renderer_init failed
+	ExitInit        = 3 // KosmicKrisp, the Vulkan self-test, the OpenGL (CGL) probe, or virgl_renderer_init failed
 	ExitConfine     = 4 // the Seatbelt profile or a resource limit could not be applied
 	ExitProtocol    = 5 // the Sentry broke the protocol
 	ExitSelftest    = 6 // --selftest found a failed check
@@ -101,6 +170,10 @@ const (
 	// ArgTestWatchdogBytes sets the watchdog threshold directly, in bytes. The
 	// renderer accepts it only with EnvTestMode=1.
 	ArgTestWatchdogBytes = "--test-watchdog-bytes="
+	// ArgMode selects the command stream: ArgMode+ModeNameVenus or
+	// ArgMode+ModeNameVirgl. Without it the renderer serves ModeVenus. The
+	// renderer accepts it also with ArgSelftest.
+	ArgMode = "--mode="
 	// EnvTestMode must be "1" for the renderer to accept test arguments.
 	EnvTestMode = "GVX_GPU_RENDERER_TEST"
 	// WatchdogHeadroomBytes is the footprint that the renderer may use above
@@ -124,6 +197,8 @@ const (
 	OpFenceDone   Op = 8  // event
 	OpCtxLost     Op = 9  // event
 	OpTestConfine Op = 10 // request and reply; tests only (GVX_GPU_RENDERER_TEST=1)
+	OpResCreate   Op = 11 // request and reply (+1 descriptor)
+	OpTransfer    Op = 12 // request and reply
 )
 
 type opEntry struct {
@@ -142,6 +217,8 @@ var allOps = []opEntry{
 	{OpFenceDone, "FENCE_DONE"},
 	{OpCtxLost, "CTX_LOST"},
 	{OpTestConfine, "TEST_CONFINE"},
+	{OpResCreate, "RES_CREATE"},
+	{OpTransfer, "TRANSFER"},
 }
 
 // String returns the protocol name of o, such as "BLOB_CREATE", or "OP(n)".
@@ -154,9 +231,10 @@ func (o Op) String() string {
 	return fmt.Sprintf("OP(%d)", o)
 }
 
-// IsRequest reports whether o is a request operation (OpHello to OpSubmit, or OpTestConfine).
+// IsRequest reports whether o is a request operation: OpHello to OpSubmit,
+// OpTestConfine, OpResCreate, or OpTransfer.
 func (o Op) IsRequest() bool {
-	return (o >= OpHello && o <= OpSubmit) || o == OpTestConfine
+	return (o >= OpHello && o <= OpSubmit) || o == OpTestConfine || o == OpResCreate || o == OpTransfer
 }
 
 // IsEvent reports whether o is an event operation.
@@ -290,6 +368,10 @@ func MaxRequestPayload(op Op) uint32 {
 		return uint32(PayloadSize[ResUnrefRequest]())
 	case OpSubmit:
 		return uint32(PayloadSize[SubmitRequest]() + MaxSubmitBytes)
+	case OpResCreate:
+		return uint32(PayloadSize[ResCreateRequest]())
+	case OpTransfer:
+		return uint32(PayloadSize[TransferRequest]())
 	default:
 		return 0
 	}
@@ -405,7 +487,7 @@ func validateFromRenderer(h Header) (Header, error) {
 			return Header{}, fmt.Errorf("%w: error reply %s (%s) has FlagFD set", ErrMalformed, h.Op, h.Status)
 		}
 	}
-	if h.Flags&FlagFD != 0 && h.Op != OpBlobCreate {
+	if h.Flags&FlagFD != 0 && h.Op != OpBlobCreate && h.Op != OpResCreate {
 		return Header{}, fmt.Errorf("%w: reply %s has FlagFD set", ErrMalformed, h.Op)
 	}
 	return h, nil

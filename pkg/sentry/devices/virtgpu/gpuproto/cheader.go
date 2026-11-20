@@ -48,6 +48,9 @@ var cStructs = []cStruct{
 	{"fence_done_event", FenceDoneEvent{}},
 	{"ctx_lost_event", CtxLostEvent{}},
 	{"test_confine_reply", TestConfineReply{}},
+	{"res_create_request", ResCreateRequest{}},
+	{"res_create_reply", ResCreateReply{}},
+	{"transfer_request", TransferRequest{}},
 }
 
 func maxRequestPayloadAll() uint32 {
@@ -108,6 +111,8 @@ func buildCConstants() []cConst {
 	)
 
 	addGroup(
+		cConst{"GVX_GPU_CAPSET_VIRGL", fmt.Sprintf("%du", CapsetVirgl)},
+		cConst{"GVX_GPU_CAPSET_VIRGL2", fmt.Sprintf("%du", CapsetVirgl2)},
 		cConst{"GVX_GPU_CAPSET_VENUS", fmt.Sprintf("%du", CapsetVenus)},
 		cConst{"GVX_GPU_BLOB_MEM_HOST3D", fmt.Sprintf("%du", BlobMemHost3D)},
 		cConst{"GVX_GPU_BLOB_FLAG_MAPPABLE", fmt.Sprintf("%du", BlobFlagMappable)},
@@ -115,6 +120,13 @@ func buildCConstants() []cConst {
 		cConst{"GVX_GPU_BLOB_FLAG_CROSS_DEVICE", fmt.Sprintf("%du", BlobFlagCrossDevice)},
 		cConst{"GVX_GPU_FD_TYPE_SHM", fmt.Sprintf("%du", FDTypeShm)},
 		cConst{"GVX_GPU_SUBMIT_FLAG_FENCE", fmt.Sprintf("%du", SubmitFlagFence)},
+		cConst{"GVX_GPU_TRANSFER_TO_HOST", fmt.Sprintf("%du", TransferToHost)},
+		cConst{"GVX_GPU_TRANSFER_FROM_HOST", fmt.Sprintf("%du", TransferFromHost)},
+	)
+
+	addGroup(
+		cConst{"GVX_GPU_MODE_VENUS", fmt.Sprintf("%du", ModeVenus)},
+		cConst{"GVX_GPU_MODE_VIRGL", fmt.Sprintf("%du", ModeVirgl)},
 	)
 
 	addGroup(
@@ -150,6 +162,9 @@ func buildCConstants() []cConst {
 		cConst{"GVX_GPU_ARG_STALL_FENCES", fmt.Sprintf("%q", ArgStallFences)},
 		cConst{"GVX_GPU_ARG_MEMORY_LIMIT", fmt.Sprintf("%q", ArgMemoryLimit)},
 		cConst{"GVX_GPU_ARG_TEST_WATCHDOG_BYTES", fmt.Sprintf("%q", ArgTestWatchdogBytes)},
+		cConst{"GVX_GPU_ARG_MODE", fmt.Sprintf("%q", ArgMode)},
+		cConst{"GVX_GPU_MODE_NAME_VENUS", fmt.Sprintf("%q", ModeNameVenus)},
+		cConst{"GVX_GPU_MODE_NAME_VIRGL", fmt.Sprintf("%q", ModeNameVirgl)},
 		cConst{"GVX_GPU_ENV_TEST_MODE", fmt.Sprintf("%q", EnvTestMode)},
 		cConst{"GVX_GPU_WATCHDOG_HEADROOM_BYTES", fmt.Sprintf("%dull", WatchdogHeadroomBytes)},
 		cConst{"GVX_GPU_WATCHDOG_PERIOD_MILLIS", fmt.Sprintf("%du", WatchdogPeriodMillis)},

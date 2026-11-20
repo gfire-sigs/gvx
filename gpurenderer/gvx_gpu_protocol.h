@@ -14,7 +14,7 @@
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the protocol is little-endian");
 
 #define GVX_GPU_MAGIC 0x31555047u
-#define GVX_GPU_VERSION 1u
+#define GVX_GPU_VERSION 2u
 #define GVX_GPU_HEADER_SIZE 24u
 #define GVX_GPU_SOCKET_FD 3
 
@@ -32,6 +32,8 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the protocol is littl
 #define GVX_GPU_OP_FENCE_DONE 8u
 #define GVX_GPU_OP_CTX_LOST 9u
 #define GVX_GPU_OP_TEST_CONFINE 10u
+#define GVX_GPU_OP_RES_CREATE 11u
+#define GVX_GPU_OP_TRANSFER 12u
 
 #define GVX_GPU_STATUS_OK (0)
 #define GVX_GPU_STATUS_IO (-5)
@@ -52,6 +54,8 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the protocol is littl
 #define GVX_GPU_MAX_REPLY_PAYLOAD 65536u
 #define GVX_GPU_MAX_REQUEST_PAYLOAD 16777240u
 
+#define GVX_GPU_CAPSET_VIRGL 1u
+#define GVX_GPU_CAPSET_VIRGL2 2u
 #define GVX_GPU_CAPSET_VENUS 4u
 #define GVX_GPU_BLOB_MEM_HOST3D 2u
 #define GVX_GPU_BLOB_FLAG_MAPPABLE 1u
@@ -59,6 +63,11 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the protocol is littl
 #define GVX_GPU_BLOB_FLAG_CROSS_DEVICE 4u
 #define GVX_GPU_FD_TYPE_SHM 3u
 #define GVX_GPU_SUBMIT_FLAG_FENCE 1u
+#define GVX_GPU_TRANSFER_TO_HOST 1u
+#define GVX_GPU_TRANSFER_FROM_HOST 2u
+
+#define GVX_GPU_MODE_VENUS 1u
+#define GVX_GPU_MODE_VIRGL 2u
 
 #define GVX_GPU_CTX_LOST_SUBMIT_FAILED 1u
 #define GVX_GPU_CTX_LOST_FENCE_FAILED 2u
@@ -86,6 +95,9 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the protocol is littl
 #define GVX_GPU_ARG_STALL_FENCES "--test-stall-fences"
 #define GVX_GPU_ARG_MEMORY_LIMIT "--memory-limit="
 #define GVX_GPU_ARG_TEST_WATCHDOG_BYTES "--test-watchdog-bytes="
+#define GVX_GPU_ARG_MODE "--mode="
+#define GVX_GPU_MODE_NAME_VENUS "venus"
+#define GVX_GPU_MODE_NAME_VIRGL "virgl"
 #define GVX_GPU_ENV_TEST_MODE "GVX_GPU_RENDERER_TEST"
 #define GVX_GPU_WATCHDOG_HEADROOM_BYTES 536870912ull
 #define GVX_GPU_WATCHDOG_PERIOD_MILLIS 250u
@@ -111,22 +123,26 @@ _Static_assert(offsetof(struct gvx_gpu_header, status) == 20, "gvx_gpu_header.st
 #define GVX_GPU_HELLO_REQUEST_SIZE 8u
 struct gvx_gpu_hello_request {
 	uint32_t version;
-	uint32_t reserved;
+	uint32_t mode;
 };
 _Static_assert(sizeof(struct gvx_gpu_hello_request) == 8, "gvx_gpu_hello_request size");
 _Static_assert(offsetof(struct gvx_gpu_hello_request, version) == 0, "gvx_gpu_hello_request.version offset");
-_Static_assert(offsetof(struct gvx_gpu_hello_request, reserved) == 4, "gvx_gpu_hello_request.reserved offset");
+_Static_assert(offsetof(struct gvx_gpu_hello_request, mode) == 4, "gvx_gpu_hello_request.mode offset");
 
-#define GVX_GPU_HELLO_REPLY_SIZE 64u
+#define GVX_GPU_HELLO_REPLY_SIZE 72u
 struct gvx_gpu_hello_reply {
 	uint32_t version;
 	uint32_t num_capsets;
+	uint32_t mode;
+	uint32_t reserved;
 	uint8_t build[56];
 };
-_Static_assert(sizeof(struct gvx_gpu_hello_reply) == 64, "gvx_gpu_hello_reply size");
+_Static_assert(sizeof(struct gvx_gpu_hello_reply) == 72, "gvx_gpu_hello_reply size");
 _Static_assert(offsetof(struct gvx_gpu_hello_reply, version) == 0, "gvx_gpu_hello_reply.version offset");
 _Static_assert(offsetof(struct gvx_gpu_hello_reply, num_capsets) == 4, "gvx_gpu_hello_reply.num_capsets offset");
-_Static_assert(offsetof(struct gvx_gpu_hello_reply, build) == 8, "gvx_gpu_hello_reply.build offset");
+_Static_assert(offsetof(struct gvx_gpu_hello_reply, mode) == 8, "gvx_gpu_hello_reply.mode offset");
+_Static_assert(offsetof(struct gvx_gpu_hello_reply, reserved) == 12, "gvx_gpu_hello_reply.reserved offset");
+_Static_assert(offsetof(struct gvx_gpu_hello_reply, build) == 16, "gvx_gpu_hello_reply.build offset");
 
 #define GVX_GPU_CAPSET_INFO_SIZE 16u
 struct gvx_gpu_capset_info {
@@ -239,5 +255,78 @@ struct gvx_gpu_test_confine_reply {
 _Static_assert(sizeof(struct gvx_gpu_test_confine_reply) == 12, "gvx_gpu_test_confine_reply size");
 _Static_assert(offsetof(struct gvx_gpu_test_confine_reply, checks) == 0, "gvx_gpu_test_confine_reply.checks offset");
 _Static_assert(offsetof(struct gvx_gpu_test_confine_reply, results) == 4, "gvx_gpu_test_confine_reply.results offset");
+
+#define GVX_GPU_RES_CREATE_REQUEST_SIZE 56u
+struct gvx_gpu_res_create_request {
+	uint32_t res_id;
+	uint32_t target;
+	uint32_t format;
+	uint32_t bind;
+	uint32_t width;
+	uint32_t height;
+	uint32_t depth;
+	uint32_t array_size;
+	uint32_t last_level;
+	uint32_t nr_samples;
+	uint32_t flags;
+	uint32_t reserved;
+	uint64_t size;
+};
+_Static_assert(sizeof(struct gvx_gpu_res_create_request) == 56, "gvx_gpu_res_create_request size");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, res_id) == 0, "gvx_gpu_res_create_request.res_id offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, target) == 4, "gvx_gpu_res_create_request.target offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, format) == 8, "gvx_gpu_res_create_request.format offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, bind) == 12, "gvx_gpu_res_create_request.bind offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, width) == 16, "gvx_gpu_res_create_request.width offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, height) == 20, "gvx_gpu_res_create_request.height offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, depth) == 24, "gvx_gpu_res_create_request.depth offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, array_size) == 28, "gvx_gpu_res_create_request.array_size offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, last_level) == 32, "gvx_gpu_res_create_request.last_level offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, nr_samples) == 36, "gvx_gpu_res_create_request.nr_samples offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, flags) == 40, "gvx_gpu_res_create_request.flags offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, reserved) == 44, "gvx_gpu_res_create_request.reserved offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_request, size) == 48, "gvx_gpu_res_create_request.size offset");
+
+#define GVX_GPU_RES_CREATE_REPLY_SIZE 16u
+struct gvx_gpu_res_create_reply {
+	uint64_t host_size;
+	uint32_t fd_type;
+	uint32_t reserved;
+};
+_Static_assert(sizeof(struct gvx_gpu_res_create_reply) == 16, "gvx_gpu_res_create_reply size");
+_Static_assert(offsetof(struct gvx_gpu_res_create_reply, host_size) == 0, "gvx_gpu_res_create_reply.host_size offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_reply, fd_type) == 8, "gvx_gpu_res_create_reply.fd_type offset");
+_Static_assert(offsetof(struct gvx_gpu_res_create_reply, reserved) == 12, "gvx_gpu_res_create_reply.reserved offset");
+
+#define GVX_GPU_TRANSFER_REQUEST_SIZE 56u
+struct gvx_gpu_transfer_request {
+	uint32_t res_id;
+	uint32_t direction;
+	uint32_t level;
+	uint32_t stride;
+	uint32_t layer_stride;
+	uint32_t box_x;
+	uint32_t box_y;
+	uint32_t box_z;
+	uint32_t box_w;
+	uint32_t box_h;
+	uint32_t box_d;
+	uint32_t reserved;
+	uint64_t offset;
+};
+_Static_assert(sizeof(struct gvx_gpu_transfer_request) == 56, "gvx_gpu_transfer_request size");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, res_id) == 0, "gvx_gpu_transfer_request.res_id offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, direction) == 4, "gvx_gpu_transfer_request.direction offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, level) == 8, "gvx_gpu_transfer_request.level offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, stride) == 12, "gvx_gpu_transfer_request.stride offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, layer_stride) == 16, "gvx_gpu_transfer_request.layer_stride offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, box_x) == 20, "gvx_gpu_transfer_request.box_x offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, box_y) == 24, "gvx_gpu_transfer_request.box_y offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, box_z) == 28, "gvx_gpu_transfer_request.box_z offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, box_w) == 32, "gvx_gpu_transfer_request.box_w offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, box_h) == 36, "gvx_gpu_transfer_request.box_h offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, box_d) == 40, "gvx_gpu_transfer_request.box_d offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, reserved) == 44, "gvx_gpu_transfer_request.reserved offset");
+_Static_assert(offsetof(struct gvx_gpu_transfer_request, offset) == 48, "gvx_gpu_transfer_request.offset offset");
 
 #endif /* GVX_GPU_PROTOCOL_H */

@@ -23,8 +23,8 @@ import (
 
 // HelloRequest is the payload of a HELLO request.
 type HelloRequest struct {
-	Version  uint32 `c:"version"`
-	Reserved uint32 `c:"reserved"`
+	Version uint32 `c:"version"`
+	Mode    Mode   `c:"mode"` // the mode that the Sentry started the renderer with
 }
 
 // HelloReply is the fixed prefix of a HELLO reply, followed by NumCapsets
@@ -32,6 +32,8 @@ type HelloRequest struct {
 type HelloReply struct {
 	Version    uint32   `c:"version"`
 	NumCapsets uint32   `c:"num_capsets"`
+	Mode       Mode     `c:"mode"`     // the mode that the renderer serves
+	Reserved   uint32   `c:"reserved"` // 0
 	Build      [56]byte `c:"build"`
 }
 
@@ -130,11 +132,59 @@ type TestConfineReply struct {
 	Results [8]uint8 `c:"results"`
 }
 
+// ResCreateRequest is the payload of a RES_CREATE request (virgl mode). The
+// renderer creates a vrend resource, a shared-memory backing of at least Size
+// bytes, attaches the backing, and attaches the resource to the context of
+// the header.
+type ResCreateRequest struct {
+	ResID     uint32 `c:"res_id"`
+	Target    uint32 `c:"target"`
+	Format    uint32 `c:"format"`
+	Bind      uint32 `c:"bind"`
+	Width     uint32 `c:"width"`
+	Height    uint32 `c:"height"`
+	Depth     uint32 `c:"depth"`
+	ArraySize uint32 `c:"array_size"`
+	LastLevel uint32 `c:"last_level"`
+	NrSamples uint32 `c:"nr_samples"`
+	Flags     uint32 `c:"flags"`
+	Reserved  uint32 `c:"reserved"`
+	Size      uint64 `c:"size"` // backing bytes requested by the guest, 1..MaxBlobBytes
+}
+
+// ResCreateReply is the payload of a successful RES_CREATE reply. The reply
+// has FlagFD and carries the backing descriptor.
+type ResCreateReply struct {
+	HostSize uint64 `c:"host_size"` // fstat size of the backing, a multiple of HostBlobAlign
+	FDType   uint32 `c:"fd_type"`   // FDTypeShm
+	Reserved uint32 `c:"reserved"`
+}
+
+// TransferRequest is the payload of a TRANSFER request (virgl mode). The
+// renderer copies between the attached backing of ResID and the vrend
+// resource, in the context of the header, and replies after the copy ends.
+type TransferRequest struct {
+	ResID       uint32 `c:"res_id"`
+	Direction   uint32 `c:"direction"` // TransferToHost or TransferFromHost
+	Level       uint32 `c:"level"`
+	Stride      uint32 `c:"stride"`
+	LayerStride uint32 `c:"layer_stride"`
+	BoxX        uint32 `c:"box_x"`
+	BoxY        uint32 `c:"box_y"`
+	BoxZ        uint32 `c:"box_z"`
+	BoxW        uint32 `c:"box_w"`
+	BoxH        uint32 `c:"box_h"`
+	BoxD        uint32 `c:"box_d"`
+	Reserved    uint32 `c:"reserved"`
+	Offset      uint64 `c:"offset"` // byte offset into the backing
+}
+
 // fixedPayload lists the fixed-size payload structs.
 type fixedPayload interface {
 	HelloRequest | HelloReply | CapsetInfo | GetCapsetRequest | CtxCreateRequest |
 		BlobCreateRequest | BlobCreateReply | ResUnrefRequest | SubmitRequest |
-		FenceDoneEvent | CtxLostEvent | TestConfineReply
+		FenceDoneEvent | CtxLostEvent | TestConfineReply |
+		ResCreateRequest | ResCreateReply | TransferRequest
 }
 
 // PayloadSize returns the encoded size of T.
@@ -255,60 +305,79 @@ func DecodeSubmit(b []byte) (cmd []byte, fence *Fence, err error) {
 	return b[prefixLen:], fence, nil
 }
 
-// AppendHelloReply appends a HELLO reply payload with len(caps) capsets.
-func AppendHelloReply(dst []byte, build string, caps []CapsetInfo) ([]byte, error) {
-	if len(caps) > MaxCapsets {
-		return nil, fmt.Errorf("%w: HELLO reply has %d capsets, max %d", ErrMalformed, len(caps), MaxCapsets)
+// HelloInfo is the decoded HELLO reply.
+type HelloInfo struct {
+	Version uint32
+	Mode    Mode
+	Build   string
+	Caps    []CapsetInfo
+}
+
+// AppendHello appends a HELLO reply payload. len(info.Caps) must be at most
+// MaxCapsets. info.Version is ignored; the payload carries Version.
+func AppendHello(dst []byte, info HelloInfo) ([]byte, error) {
+	if len(info.Caps) > MaxCapsets {
+		return nil, fmt.Errorf("%w: HELLO reply has %d capsets, max %d", ErrMalformed, len(info.Caps), MaxCapsets)
 	}
 	rep := HelloReply{
 		Version:    Version,
-		NumCapsets: uint32(len(caps)),
+		NumCapsets: uint32(len(info.Caps)),
+		Mode:       info.Mode,
 	}
-	copy(rep.Build[:len(rep.Build)-1], build)
+	copy(rep.Build[:len(rep.Build)-1], info.Build)
 	dst = AppendPayload(dst, rep)
-	for _, capInfo := range caps {
+	for _, capInfo := range info.Caps {
 		dst = AppendPayload(dst, capInfo)
 	}
 	return dst, nil
 }
 
-// DecodeHelloReply decodes a HELLO reply payload. NumCapsets must be at most
-// MaxCapsets, len(b) must be exactly 64 + 16*NumCapsets, and every capset
-// must have MaxVersion <= MaxCapsetVersion and 0 < MaxSize <=
-// MaxCapsetBytes. build is the Build field up to the first NUL byte, with
-// every byte outside 0x20 to 0x7e replaced by '?'.
-func DecodeHelloReply(b []byte) (version uint32, build string, caps []CapsetInfo, err error) {
+// DecodeHello decodes a HELLO reply payload. NumCapsets must be at most
+// MaxCapsets, Reserved must be 0, len(b) must be exactly 72 + 16*NumCapsets,
+// and every capset must have MaxVersion <= MaxCapsetVersion and
+// 0 < MaxSize <= MaxCapsetBytes. Build is the Build field up to the first
+// NUL byte, with every byte outside 0x20 to 0x7e replaced by '?'. It does not
+// validate Mode; the client compares Mode with the requested mode.
+func DecodeHello(b []byte) (HelloInfo, error) {
 	prefixLen := PayloadSize[HelloReply]()
 	capLen := PayloadSize[CapsetInfo]()
 	if len(b) < prefixLen {
-		return 0, "", nil, fmt.Errorf("%w: HELLO reply length %d below %d", ErrMalformed, len(b), prefixLen)
+		return HelloInfo{}, fmt.Errorf("%w: HELLO reply length %d below %d", ErrMalformed, len(b), prefixLen)
 	}
 	rep, err := DecodePayload[HelloReply](b[:prefixLen])
 	if err != nil {
-		return 0, "", nil, err
+		return HelloInfo{}, err
+	}
+	if rep.Reserved != 0 {
+		return HelloInfo{}, fmt.Errorf("%w: HELLO reply reserved %#x, want 0", ErrMalformed, rep.Reserved)
 	}
 	if rep.NumCapsets > MaxCapsets {
-		return 0, "", nil, fmt.Errorf("%w: HELLO reply num_capsets %d exceeds max %d", ErrMalformed, rep.NumCapsets, MaxCapsets)
+		return HelloInfo{}, fmt.Errorf("%w: HELLO reply num_capsets %d exceeds max %d", ErrMalformed, rep.NumCapsets, MaxCapsets)
 	}
 	if want := prefixLen + int(rep.NumCapsets)*capLen; len(b) != want {
-		return 0, "", nil, fmt.Errorf("%w: HELLO reply length %d, want %d", ErrMalformed, len(b), want)
+		return HelloInfo{}, fmt.Errorf("%w: HELLO reply length %d, want %d", ErrMalformed, len(b), want)
 	}
-	caps = make([]CapsetInfo, rep.NumCapsets)
+	caps := make([]CapsetInfo, rep.NumCapsets)
 	for i := range caps {
 		off := prefixLen + i*capLen
 		info, err := DecodePayload[CapsetInfo](b[off : off+capLen])
 		if err != nil {
-			return 0, "", nil, err
+			return HelloInfo{}, err
 		}
 		if info.MaxVersion > MaxCapsetVersion {
-			return 0, "", nil, fmt.Errorf("%w: capset %d max_version %d exceeds max %d", ErrMalformed, info.ID, info.MaxVersion, MaxCapsetVersion)
+			return HelloInfo{}, fmt.Errorf("%w: capset %d max_version %d exceeds max %d", ErrMalformed, info.ID, info.MaxVersion, MaxCapsetVersion)
 		}
 		if info.MaxSize == 0 || info.MaxSize > MaxCapsetBytes {
-			return 0, "", nil, fmt.Errorf("%w: capset %d max_size %d out of range 1..%d", ErrMalformed, info.ID, info.MaxSize, MaxCapsetBytes)
+			return HelloInfo{}, fmt.Errorf("%w: capset %d max_size %d out of range 1..%d", ErrMalformed, info.ID, info.MaxSize, MaxCapsetBytes)
 		}
 		caps[i] = info
 	}
-	return rep.Version, sanitizeBuild(rep.Build[:]), caps, nil
+	return HelloInfo{
+		Version: rep.Version,
+		Mode:    rep.Mode,
+		Build:   sanitizeBuild(rep.Build[:]),
+		Caps:    caps,
+	}, nil
 }
 
 func sanitizeBuild(raw []byte) string {

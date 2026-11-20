@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,10 +64,24 @@ _Static_assert(GVX_GPU_SUBMIT_REQUEST_SIZE == sizeof(struct gvx_gpu_submit_reque
 _Static_assert(GVX_GPU_FENCE_DONE_EVENT_SIZE == sizeof(struct gvx_gpu_fence_done_event), "fence_done_event size macro");
 _Static_assert(GVX_GPU_CTX_LOST_EVENT_SIZE == sizeof(struct gvx_gpu_ctx_lost_event), "ctx_lost_event size macro");
 _Static_assert(GVX_GPU_TEST_CONFINE_REPLY_SIZE == sizeof(struct gvx_gpu_test_confine_reply), "test_confine_reply size macro");
+_Static_assert(GVX_GPU_RES_CREATE_REQUEST_SIZE == sizeof(struct gvx_gpu_res_create_request), "res_create_request size macro");
+_Static_assert(GVX_GPU_RES_CREATE_REPLY_SIZE == sizeof(struct gvx_gpu_res_create_reply), "res_create_reply size macro");
+_Static_assert(GVX_GPU_TRANSFER_REQUEST_SIZE == sizeof(struct gvx_gpu_transfer_request), "transfer_request size macro");
 int main(void) {
 	struct gvx_gpu_header h = { .magic = GVX_GPU_MAGIC, .status = GVX_GPU_STATUS_INVALID };
-	const char *arg = GVX_GPU_ARG_SELFTEST;
-	return (int)(h.magic != GVX_GPU_MAGIC) + (arg[0] != '-');
+	struct gvx_gpu_hello_request hreq = { .version = GVX_GPU_VERSION, .mode = GVX_GPU_MODE_VIRGL };
+	struct gvx_gpu_hello_reply hrep = { .version = GVX_GPU_VERSION, .mode = GVX_GPU_MODE_VENUS, .reserved = 0 };
+	struct gvx_gpu_res_create_request rreq = { .res_id = 1, .size = 4096 };
+	struct gvx_gpu_res_create_reply rrep = { .host_size = GVX_GPU_HOST_BLOB_ALIGN, .fd_type = GVX_GPU_FD_TYPE_SHM };
+	struct gvx_gpu_transfer_request treq = { .res_id = 1, .direction = GVX_GPU_TRANSFER_TO_HOST };
+	const char *arg = GVX_GPU_ARG_MODE;
+	return (int)(h.magic != GVX_GPU_MAGIC) +
+	       (int)(hreq.mode != GVX_GPU_MODE_VIRGL) +
+	       (int)(hrep.mode != GVX_GPU_MODE_VENUS) +
+	       (int)(rreq.res_id != 1) +
+	       (int)(rrep.fd_type != GVX_GPU_FD_TYPE_SHM) +
+	       (int)(treq.direction != GVX_GPU_TRANSFER_TO_HOST) +
+	       (arg[0] != '-');
 }
 `
 	mainPath := filepath.Join(dir, "main.c")
@@ -81,5 +96,31 @@ int main(void) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("cc failed: %v\n%s", err, out)
+	}
+}
+
+func TestCHeaderHasNewNames(t *testing.T) {
+	text := string(gpuproto.CHeader())
+	want := []string{
+		"#define GVX_GPU_VERSION 2u",
+		"#define GVX_GPU_OP_RES_CREATE 11u",
+		"#define GVX_GPU_OP_TRANSFER 12u",
+		"#define GVX_GPU_CAPSET_VIRGL 1u",
+		"#define GVX_GPU_CAPSET_VIRGL2 2u",
+		"#define GVX_GPU_TRANSFER_TO_HOST 1u",
+		"#define GVX_GPU_TRANSFER_FROM_HOST 2u",
+		"#define GVX_GPU_MODE_VENUS 1u",
+		"#define GVX_GPU_MODE_VIRGL 2u",
+		"#define GVX_GPU_ARG_MODE \"--mode=\"",
+		"#define GVX_GPU_MODE_NAME_VENUS \"venus\"",
+		"#define GVX_GPU_MODE_NAME_VIRGL \"virgl\"",
+		"struct gvx_gpu_res_create_request {",
+		"struct gvx_gpu_res_create_reply {",
+		"struct gvx_gpu_transfer_request {",
+	}
+	for _, needle := range want {
+		if !strings.Contains(text, needle) {
+			t.Errorf("CHeader() missing %q", needle)
+		}
 	}
 }

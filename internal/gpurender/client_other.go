@@ -30,6 +30,21 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	return nil, ErrUnsupported
 }
 
+// Mode returns 0 on non-darwin hosts.
+func (c *Client) Mode() gpuproto.Mode {
+	return 0
+}
+
+// CreateResource returns ErrUnsupported on non-darwin hosts.
+func (c *Client) CreateResource(ctx context.Context, req gpuproto.ResourceCreate) (gpuproto.Blob, error) {
+	return gpuproto.Blob{}, ErrUnsupported
+}
+
+// Transfer returns ErrUnsupported on non-darwin hosts.
+func (c *Client) Transfer(ctx context.Context, req gpuproto.Transfer) error {
+	return ErrUnsupported
+}
+
 // Capset returns nil and false on non-darwin hosts.
 func (c *Client) Capset(id, version uint32) ([]byte, bool) {
 	return nil, false

@@ -17,6 +17,7 @@ package gpuproto_test
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
@@ -32,6 +33,8 @@ func TestHeaderRoundTrip(t *testing.T) {
 		gpuproto.OpResUnref,
 		gpuproto.OpSubmit,
 		gpuproto.OpTestConfine,
+		gpuproto.OpResCreate,
+		gpuproto.OpTransfer,
 	}
 	wantMagicPrefix := []byte{0x47, 0x50, 0x55, 0x31}
 
@@ -125,6 +128,18 @@ func TestHeaderRoundTrip(t *testing.T) {
 			Seq:        7,
 			CtxID:      3,
 			PayloadLen: uint32(gpuproto.PayloadSize[gpuproto.BlobCreateReply]()),
+			Status:     gpuproto.StatusOK,
+		}
+		check(t, h, gpuproto.FromRenderer)
+	})
+	t.Run("reply_res_create_fd", func(t *testing.T) {
+		h := gpuproto.Header{
+			Magic:      gpuproto.Magic,
+			Op:         gpuproto.OpResCreate,
+			Flags:      gpuproto.FlagReply | gpuproto.FlagFD,
+			Seq:        7,
+			CtxID:      3,
+			PayloadLen: uint32(gpuproto.PayloadSize[gpuproto.ResCreateReply]()),
 			Status:     gpuproto.StatusOK,
 		}
 		check(t, h, gpuproto.FromRenderer)
@@ -366,10 +381,10 @@ func TestParseHeaderRejects(t *testing.T) {
 			dir: gpuproto.FromRenderer,
 		},
 		{
-			name: "reply_with_op_11",
+			name: "reply_with_op_13",
 			raw: func() []byte {
 				h := validReply()
-				h.Op = gpuproto.Op(11)
+				h.Op = gpuproto.Op(13)
 				return gpuproto.AppendHeader(nil, h)
 			}(),
 			dir: gpuproto.FromRenderer,
@@ -441,8 +456,8 @@ func TestOpAndStatusNames(t *testing.T) {
 	if !gpuproto.OpTestConfine.IsRequest() {
 		t.Errorf("OpTestConfine.IsRequest() = false, want true")
 	}
-	if got := gpuproto.Op(11).String(); got != "OP(11)" {
-		t.Errorf("Op(11).String() = %q, want %q", got, "OP(11)")
+	if got := gpuproto.Op(13).String(); got != "OP(13)" {
+		t.Errorf("Op(13).String() = %q, want %q", got, "OP(13)")
 	}
 	if got := gpuproto.StatusNotSupported.String(); got != "EOPNOTSUPP" {
 		t.Errorf("StatusNotSupported.String() = %q, want %q", got, "EOPNOTSUPP")
@@ -452,5 +467,218 @@ func TestOpAndStatusNames(t *testing.T) {
 	}
 	if gpuproto.Status(-35).Known() {
 		t.Errorf("Status(-35).Known() = true, want false")
+	}
+}
+
+func TestOpPredicates(t *testing.T) {
+	cases := []struct {
+		op        gpuproto.Op
+		wantName  string
+		wantReq   bool
+		wantEvent bool
+	}{
+		{gpuproto.Op(0), "OP(0)", false, false},
+		{gpuproto.OpHello, "HELLO", true, false},
+		{gpuproto.OpFenceDone, "FENCE_DONE", false, true},
+		{gpuproto.OpCtxLost, "CTX_LOST", false, true},
+		{gpuproto.OpTestConfine, "TEST_CONFINE", true, false},
+		{gpuproto.OpResCreate, "RES_CREATE", true, false},
+		{gpuproto.OpTransfer, "TRANSFER", true, false},
+		{gpuproto.Op(13), "OP(13)", false, false},
+	}
+	for _, tc := range cases {
+		if got := tc.op.String(); got != tc.wantName {
+			t.Errorf("Op(%d).String() = %q, want %q", tc.op, got, tc.wantName)
+		}
+		if got := tc.op.IsRequest(); got != tc.wantReq {
+			t.Errorf("Op(%d).IsRequest() = %v, want %v", tc.op, got, tc.wantReq)
+		}
+		if got := tc.op.IsEvent(); got != tc.wantEvent {
+			t.Errorf("Op(%d).IsEvent() = %v, want %v", tc.op, got, tc.wantEvent)
+		}
+	}
+}
+
+func TestParseHeaderNewOps(t *testing.T) {
+	if got := gpuproto.MaxRequestPayload(gpuproto.OpResCreate); got != 56 {
+		t.Fatalf("MaxRequestPayload(OpResCreate) = %d, want 56", got)
+	}
+	if got := gpuproto.MaxRequestPayload(gpuproto.OpTransfer); got != 56 {
+		t.Fatalf("MaxRequestPayload(OpTransfer) = %d, want 56", got)
+	}
+
+	okCases := []struct {
+		name string
+		hdr  gpuproto.Header
+		dir  gpuproto.Direction
+	}{
+		{
+			name: "res_create_request_ok",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpResCreate,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 56,
+			},
+			dir: gpuproto.ToRenderer,
+		},
+		{
+			name: "transfer_request_ok",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpTransfer,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 56,
+			},
+			dir: gpuproto.ToRenderer,
+		},
+		{
+			name: "res_create_reply_with_fd_ok",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpResCreate,
+				Flags:      gpuproto.FlagReply | gpuproto.FlagFD,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 16,
+				Status:     gpuproto.StatusOK,
+			},
+			dir: gpuproto.FromRenderer,
+		},
+	}
+	for _, tc := range okCases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := gpuproto.AppendHeader(nil, tc.hdr)
+			got, err := gpuproto.ParseHeader(raw, tc.dir)
+			if err != nil {
+				t.Fatalf("ParseHeader(%s): %v", tc.name, err)
+			}
+			if got != tc.hdr {
+				t.Fatalf("ParseHeader(%s) = %+v, want %+v", tc.name, got, tc.hdr)
+			}
+		})
+	}
+
+	rejectCases := []struct {
+		name string
+		hdr  gpuproto.Header
+		dir  gpuproto.Direction
+	}{
+		{
+			name: "res_create_request_ctx_0",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpResCreate,
+				Seq:        1,
+				CtxID:      0,
+				PayloadLen: 56,
+			},
+			dir: gpuproto.ToRenderer,
+		},
+		{
+			name: "transfer_request_ctx_0",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpTransfer,
+				Seq:        1,
+				CtxID:      0,
+				PayloadLen: 56,
+			},
+			dir: gpuproto.ToRenderer,
+		},
+		{
+			name: "res_create_request_payload_57",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpResCreate,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 57,
+			},
+			dir: gpuproto.ToRenderer,
+		},
+		{
+			name: "transfer_request_payload_57",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpTransfer,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 57,
+			},
+			dir: gpuproto.ToRenderer,
+		},
+		{
+			name: "transfer_reply_with_fd",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpTransfer,
+				Flags:      gpuproto.FlagReply | gpuproto.FlagFD,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 0,
+				Status:     gpuproto.StatusOK,
+			},
+			dir: gpuproto.FromRenderer,
+		},
+		{
+			name: "res_create_error_reply_with_fd",
+			hdr: gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpResCreate,
+				Flags:      gpuproto.FlagReply | gpuproto.FlagFD,
+				Seq:        1,
+				CtxID:      2,
+				PayloadLen: 0,
+				Status:     gpuproto.StatusInvalid,
+			},
+			dir: gpuproto.FromRenderer,
+		},
+	}
+	for _, tc := range rejectCases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := gpuproto.AppendHeader(nil, tc.hdr)
+			if _, err := gpuproto.ParseHeader(raw, tc.dir); !errors.Is(err, gpuproto.ErrMalformed) {
+				t.Fatalf("ParseHeader(%s) error = %v, want wrapping ErrMalformed", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestModeHelpers(t *testing.T) {
+	cases := []struct {
+		mode        gpuproto.Mode
+		wantString  string
+		wantValid   bool
+		wantCapsets []uint32
+		wantPrimary uint32
+	}{
+		{gpuproto.Mode(0), "MODE(0)", false, nil, 0},
+		{gpuproto.ModeVenus, "venus", true, []uint32{gpuproto.CapsetVenus}, gpuproto.CapsetVenus},
+		{gpuproto.ModeVirgl, "virgl", true, []uint32{gpuproto.CapsetVirgl, gpuproto.CapsetVirgl2}, gpuproto.CapsetVirgl2},
+		{gpuproto.Mode(3), "MODE(3)", false, nil, 0},
+	}
+	for _, tc := range cases {
+		if got := tc.mode.String(); got != tc.wantString {
+			t.Errorf("Mode(%d).String() = %q, want %q", tc.mode, got, tc.wantString)
+		}
+		if got := tc.mode.Valid(); got != tc.wantValid {
+			t.Errorf("Mode(%d).Valid() = %v, want %v", tc.mode, got, tc.wantValid)
+		}
+		gotCaps := tc.mode.Capsets()
+		if !slices.Equal(gotCaps, tc.wantCapsets) || (gotCaps == nil) != (tc.wantCapsets == nil) {
+			t.Errorf("Mode(%d).Capsets() = %v, want %v", tc.mode, gotCaps, tc.wantCapsets)
+		}
+		if len(gotCaps) > 0 {
+			gotCaps[0] = 99
+			if !slices.Equal(tc.mode.Capsets(), tc.wantCapsets) {
+				t.Errorf("Mode(%d).Capsets() aliased internal storage after caller mutation", tc.mode)
+			}
+		}
+		if got := tc.mode.PrimaryCapset(); got != tc.wantPrimary {
+			t.Errorf("Mode(%d).PrimaryCapset() = %d, want %d", tc.mode, got, tc.wantPrimary)
+		}
 	}
 }

@@ -19,10 +19,10 @@
 // inherits its end as descriptor SocketFD. Each message is a 24-byte
 // little-endian Header and then PayloadLen payload bytes. The Sentry sends
 // requests; the renderer sends one reply for each request, with the same
-// Seq, and events with Seq 0. A BLOB_CREATE reply for a mappable blob carries
-// one POSIX shared-memory descriptor in an SCM_RIGHTS control message. The
-// renderer attaches that control message to the sendmsg call with the first
-// byte of its header.
+// Seq, and events with Seq 0. A BLOB_CREATE reply for a mappable blob and
+// every successful RES_CREATE reply carry one POSIX shared-memory descriptor
+// in an SCM_RIGHTS control message. The renderer attaches that control message
+// to the sendmsg call with the first byte of its header.
 //
 // The renderer is untrusted. A receiver rejects a message that breaks any
 // rule of ParseHeader or of the payload decoders, and then stops using the

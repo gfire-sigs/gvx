@@ -71,8 +71,8 @@ func (b BlobCreate) Validate() error {
 	return nil
 }
 
-// Blob is the result of BLOB_CREATE. The caller owns Shm and must Close it.
-// Shm is nil and HostSize is 0 when the blob is not mappable.
+// Blob is the result of BLOB_CREATE or RES_CREATE. The caller owns Shm and
+// must Close it. Shm is nil and HostSize is 0 when the blob is not mappable.
 type Blob struct {
 	// Shm is the POSIX shared-memory descriptor received with SCM_RIGHTS,
 	// opened read-write, with close-on-exec set.
@@ -81,6 +81,88 @@ type Blob struct {
 	// HostBlobAlign and at least the requested size. The device verifies it
 	// with fstat.
 	HostSize uint64
+}
+
+// Box is the 3D region of struct drm_virtgpu_3d_box and struct virgl_box.
+type Box struct {
+	X, Y, Z, W, H, D uint32
+}
+
+// ResourceCreate is the input of RES_CREATE. The GL fields carry the guest
+// values of struct drm_virtgpu_resource_create unchanged; vrend validates them.
+type ResourceCreate struct {
+	CtxID, ResID         uint32
+	Target, Format, Bind uint32
+	Width, Height, Depth uint32
+	ArraySize, LastLevel uint32
+	NrSamples, Flags     uint32
+	// Size is the backing size in bytes, 1..MaxBlobBytes.
+	Size uint64
+}
+
+// Validate returns a *StatusError (OpResCreate, StatusInvalid) for a zero
+// CtxID or ResID, or a Size of 0 or above MaxBlobBytes.
+func (r ResourceCreate) Validate() error {
+	if r.CtxID == 0 || r.ResID == 0 || r.Size == 0 || r.Size > MaxBlobBytes {
+		return &StatusError{Op: OpResCreate, Status: StatusInvalid}
+	}
+	return nil
+}
+
+// Request returns the wire payload of r.
+func (r ResourceCreate) Request() ResCreateRequest {
+	return ResCreateRequest{
+		ResID:     r.ResID,
+		Target:    r.Target,
+		Format:    r.Format,
+		Bind:      r.Bind,
+		Width:     r.Width,
+		Height:    r.Height,
+		Depth:     r.Depth,
+		ArraySize: r.ArraySize,
+		LastLevel: r.LastLevel,
+		NrSamples: r.NrSamples,
+		Flags:     r.Flags,
+		Size:      r.Size,
+	}
+}
+
+// Transfer is the input of TRANSFER.
+type Transfer struct {
+	CtxID, ResID        uint32
+	Direction           uint32 // TransferToHost or TransferFromHost
+	Level               uint32
+	Stride, LayerStride uint32
+	Box                 Box
+	Offset              uint64
+}
+
+// Validate returns a *StatusError (OpTransfer, StatusInvalid) for a zero
+// CtxID or ResID, or a Direction other than TransferToHost and
+// TransferFromHost.
+func (t Transfer) Validate() error {
+	if t.CtxID == 0 || t.ResID == 0 || (t.Direction != TransferToHost && t.Direction != TransferFromHost) {
+		return &StatusError{Op: OpTransfer, Status: StatusInvalid}
+	}
+	return nil
+}
+
+// Request returns the wire payload of t.
+func (t Transfer) Request() TransferRequest {
+	return TransferRequest{
+		ResID:       t.ResID,
+		Direction:   t.Direction,
+		Level:       t.Level,
+		Stride:      t.Stride,
+		LayerStride: t.LayerStride,
+		BoxX:        t.Box.X,
+		BoxY:        t.Box.Y,
+		BoxZ:        t.Box.Z,
+		BoxW:        t.Box.W,
+		BoxH:        t.Box.H,
+		BoxD:        t.Box.D,
+		Offset:      t.Offset,
+	}
 }
 
 // Fence asks the renderer to signal FENCE_DONE after the commands of the

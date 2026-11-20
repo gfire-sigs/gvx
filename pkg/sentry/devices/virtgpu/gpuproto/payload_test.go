@@ -16,6 +16,7 @@ package gpuproto_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"strings"
@@ -28,7 +29,7 @@ func checkFixedPayload[T interface {
 	gpuproto.HelloRequest | gpuproto.HelloReply | gpuproto.CapsetInfo | gpuproto.GetCapsetRequest |
 		gpuproto.CtxCreateRequest | gpuproto.BlobCreateRequest | gpuproto.BlobCreateReply |
 		gpuproto.ResUnrefRequest | gpuproto.SubmitRequest | gpuproto.FenceDoneEvent | gpuproto.CtxLostEvent |
-		gpuproto.TestConfineReply
+		gpuproto.TestConfineReply | gpuproto.ResCreateRequest | gpuproto.ResCreateReply | gpuproto.TransferRequest
 	comparable
 }](t *testing.T, name string, wantSize int, v T) {
 	t.Helper()
@@ -62,8 +63,8 @@ func TestPayloadRoundTrip(t *testing.T) {
 		build[i] = byte(i + 1)
 	}
 
-	checkFixedPayload(t, "HelloRequest", 8, gpuproto.HelloRequest{Version: 1, Reserved: 2})
-	checkFixedPayload(t, "HelloReply", 64, gpuproto.HelloReply{Version: 1, NumCapsets: 2, Build: build})
+	checkFixedPayload(t, "HelloRequest", 8, gpuproto.HelloRequest{Version: 2, Mode: gpuproto.ModeVirgl})
+	checkFixedPayload(t, "HelloReply", 72, gpuproto.HelloReply{Version: 2, NumCapsets: 2, Mode: gpuproto.ModeVirgl, Build: build})
 	checkFixedPayload(t, "CapsetInfo", 16, gpuproto.CapsetInfo{ID: 4, MaxVersion: 1, MaxSize: 512, Reserved: 9})
 	checkFixedPayload(t, "GetCapsetRequest", 8, gpuproto.GetCapsetRequest{ID: 4, Version: 1})
 	checkFixedPayload(t, "CtxCreateRequest", 8, gpuproto.CtxCreateRequest{CapsetID: 4, NameLen: 12})
@@ -86,6 +87,17 @@ func TestPayloadRoundTrip(t *testing.T) {
 			uint8(gpuproto.ConfineDenied),
 			uint8(gpuproto.ConfineDenied),
 		},
+	})
+	checkFixedPayload(t, "ResCreateRequest", 56, gpuproto.ResCreateRequest{
+		ResID: 1, Target: 2, Format: 3, Bind: 4, Width: 5, Height: 6, Depth: 7,
+		ArraySize: 8, LastLevel: 9, NrSamples: 10, Flags: 11, Reserved: 12, Size: 0x10000,
+	})
+	checkFixedPayload(t, "ResCreateReply", 16, gpuproto.ResCreateReply{
+		HostSize: 0x10000, FDType: gpuproto.FDTypeShm, Reserved: 0,
+	})
+	checkFixedPayload(t, "TransferRequest", 56, gpuproto.TransferRequest{
+		ResID: 1, Direction: gpuproto.TransferToHost, Level: 2, Stride: 3, LayerStride: 4,
+		BoxX: 5, BoxY: 6, BoxZ: 7, BoxW: 8, BoxH: 9, BoxD: 10, Reserved: 11, Offset: 12,
 	})
 }
 
@@ -243,38 +255,69 @@ func TestSubmitRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHelloReplyRoundTrip(t *testing.T) {
+func TestHelloRoundTrip(t *testing.T) {
 	wantCaps := []gpuproto.CapsetInfo{
-		{ID: gpuproto.CapsetVenus, MaxVersion: 1, MaxSize: 1024},
+		{ID: gpuproto.CapsetVirgl, MaxVersion: 1, MaxSize: 308},
+		{ID: gpuproto.CapsetVirgl2, MaxVersion: 2, MaxSize: 1408},
 	}
-	raw, err := gpuproto.AppendHelloReply(nil, "gvx-gpu-renderer test", wantCaps)
+	raw, err := gpuproto.AppendHello(nil, gpuproto.HelloInfo{
+		Version: 99, // ignored by AppendHello
+		Mode:    gpuproto.ModeVirgl,
+		Build:   "gvx-gpu-renderer virgl",
+		Caps:    wantCaps,
+	})
 	if err != nil {
-		t.Fatalf("AppendHelloReply: %v", err)
+		t.Fatalf("AppendHello: %v", err)
 	}
-	ver, build, gotCaps, err := gpuproto.DecodeHelloReply(raw)
+	if wantLen := 72 + 16*len(wantCaps); len(raw) != wantLen {
+		t.Fatalf("AppendHello length = %d, want %d", len(raw), wantLen)
+	}
+
+	got, err := gpuproto.DecodeHello(raw)
 	if err != nil {
-		t.Fatalf("DecodeHelloReply: %v", err)
+		t.Fatalf("DecodeHello: %v", err)
 	}
-	if ver != gpuproto.Version {
-		t.Errorf("version = %d, want %d", ver, gpuproto.Version)
+	if got.Version != gpuproto.Version {
+		t.Errorf("Version = %d, want %d", got.Version, gpuproto.Version)
 	}
-	if build != "gvx-gpu-renderer test" {
-		t.Errorf("build = %q, want %q", build, "gvx-gpu-renderer test")
+	if got.Mode != gpuproto.ModeVirgl {
+		t.Errorf("Mode = %v, want %v", got.Mode, gpuproto.ModeVirgl)
 	}
-	if !slices.Equal(gotCaps, wantCaps) {
-		t.Errorf("caps = %+v, want %+v", gotCaps, wantCaps)
+	if got.Build != "gvx-gpu-renderer virgl" {
+		t.Errorf("Build = %q, want %q", got.Build, "gvx-gpu-renderer virgl")
+	}
+	if !slices.Equal(got.Caps, wantCaps) {
+		t.Errorf("Caps = %+v, want %+v", got.Caps, wantCaps)
+	}
+
+	// Non-zero Reserved must be rejected.
+	rawBadReserved := gpuproto.AppendPayload(nil, gpuproto.HelloReply{
+		Version:    gpuproto.Version,
+		NumCapsets: 0,
+		Mode:       gpuproto.ModeVirgl,
+		Reserved:   1,
+	})
+	if _, err := gpuproto.DecodeHello(rawBadReserved); !errors.Is(err, gpuproto.ErrMalformed) {
+		t.Fatalf("DecodeHello(reserved=1) error = %v, want wrapping ErrMalformed", err)
+	}
+
+	// Length 72 + 16*n enforced.
+	if _, err := gpuproto.DecodeHello(raw[:71]); !errors.Is(err, gpuproto.ErrMalformed) {
+		t.Fatalf("DecodeHello(71 bytes) error = %v, want wrapping ErrMalformed", err)
+	}
+	if _, err := gpuproto.DecodeHello(raw[:len(raw)-1]); !errors.Is(err, gpuproto.ErrMalformed) {
+		t.Fatalf("DecodeHello(short by 1) error = %v, want wrapping ErrMalformed", err)
+	}
+	if _, err := gpuproto.DecodeHello(append(slices.Clone(raw), 0)); !errors.Is(err, gpuproto.ErrMalformed) {
+		t.Fatalf("DecodeHello(long by 1) error = %v, want wrapping ErrMalformed", err)
 	}
 
 	rawBadCount := gpuproto.AppendPayload(nil, gpuproto.HelloReply{Version: gpuproto.Version, NumCapsets: gpuproto.MaxCapsets + 1})
 	for range gpuproto.MaxCapsets + 1 {
 		rawBadCount = gpuproto.AppendPayload(rawBadCount, wantCaps[0])
 	}
-	if _, _, _, err := gpuproto.DecodeHelloReply(rawBadCount); !errors.Is(err, gpuproto.ErrMalformed) {
-		t.Fatalf("DecodeHelloReply(num_capsets=9) error = %v, want wrapping ErrMalformed", err)
-	}
-
-	if _, _, _, err := gpuproto.DecodeHelloReply(raw[:len(raw)-1]); !errors.Is(err, gpuproto.ErrMalformed) {
-		t.Fatalf("DecodeHelloReply(length off by one) error = %v, want wrapping ErrMalformed", err)
+	if _, err := gpuproto.DecodeHello(rawBadCount); !errors.Is(err, gpuproto.ErrMalformed) {
+		t.Fatalf("DecodeHello(num_capsets=9) error = %v, want wrapping ErrMalformed", err)
 	}
 
 	badCapCases := []struct {
@@ -287,30 +330,136 @@ func TestHelloReplyRoundTrip(t *testing.T) {
 	}
 	for _, tc := range badCapCases {
 		t.Run("bad_capset/"+tc.name, func(t *testing.T) {
-			b, err := gpuproto.AppendHelloReply(nil, "ok", []gpuproto.CapsetInfo{tc.info})
+			b, err := gpuproto.AppendHello(nil, gpuproto.HelloInfo{Mode: gpuproto.ModeVenus, Build: "ok", Caps: []gpuproto.CapsetInfo{tc.info}})
 			if err != nil {
-				t.Fatalf("AppendHelloReply: %v", err)
+				t.Fatalf("AppendHello: %v", err)
 			}
-			if _, _, _, err := gpuproto.DecodeHelloReply(b); !errors.Is(err, gpuproto.ErrMalformed) {
-				t.Fatalf("DecodeHelloReply(%s) error = %v, want wrapping ErrMalformed", tc.name, err)
+			if _, err := gpuproto.DecodeHello(b); !errors.Is(err, gpuproto.ErrMalformed) {
+				t.Fatalf("DecodeHello(%s) error = %v, want wrapping ErrMalformed", tc.name, err)
 			}
 		})
 	}
 
-	rawControl, err := gpuproto.AppendHelloReply(nil, "a\x01b", nil)
+	rawControl, err := gpuproto.AppendHello(nil, gpuproto.HelloInfo{Mode: gpuproto.ModeVenus, Build: "a\x01b"})
 	if err != nil {
-		t.Fatalf("AppendHelloReply(control byte): %v", err)
+		t.Fatalf("AppendHello(control byte): %v", err)
 	}
-	_, build, _, err = gpuproto.DecodeHelloReply(rawControl)
+	gotControl, err := gpuproto.DecodeHello(rawControl)
 	if err != nil {
-		t.Fatalf("DecodeHelloReply(control byte): %v", err)
+		t.Fatalf("DecodeHello(control byte): %v", err)
 	}
-	if build != "a?b" {
-		t.Fatalf("sanitized build = %q, want %q", build, "a?b")
+	if gotControl.Build != "a?b" {
+		t.Fatalf("sanitized build = %q, want %q", gotControl.Build, "a?b")
 	}
 
 	tooManyCaps := make([]gpuproto.CapsetInfo, gpuproto.MaxCapsets+1)
-	if _, err := gpuproto.AppendHelloReply(nil, "ok", tooManyCaps); !errors.Is(err, gpuproto.ErrMalformed) {
-		t.Fatalf("AppendHelloReply(9 capsets) error = %v, want wrapping ErrMalformed", err)
+	if _, err := gpuproto.AppendHello(nil, gpuproto.HelloInfo{Mode: gpuproto.ModeVenus, Build: "ok", Caps: tooManyCaps}); !errors.Is(err, gpuproto.ErrMalformed) {
+		t.Fatalf("AppendHello(9 capsets) error = %v, want wrapping ErrMalformed", err)
+	}
+}
+
+func TestResCreateAndTransferLayout(t *testing.T) {
+	if got := gpuproto.PayloadSize[gpuproto.ResCreateRequest](); got != 56 {
+		t.Fatalf("PayloadSize[ResCreateRequest]() = %d, want 56", got)
+	}
+	if got := gpuproto.PayloadSize[gpuproto.ResCreateReply](); got != 16 {
+		t.Fatalf("PayloadSize[ResCreateReply]() = %d, want 16", got)
+	}
+	if got := gpuproto.PayloadSize[gpuproto.TransferRequest](); got != 56 {
+		t.Fatalf("PayloadSize[TransferRequest]() = %d, want 56", got)
+	}
+
+	resReq := gpuproto.ResCreateRequest{
+		ResID:     0x01020304,
+		Target:    0x05060708,
+		Format:    0x090a0b0c,
+		Bind:      0x0d0e0f10,
+		Width:     0x11121314,
+		Height:    0x15161718,
+		Depth:     0x191a1b1c,
+		ArraySize: 0x1d1e1f20,
+		LastLevel: 0x21222324,
+		NrSamples: 0x25262728,
+		Flags:     0x292a2b2c,
+		Reserved:  0x2d2e2f30,
+		Size:      0x3132333435363738,
+	}
+	wantResReq := []byte{
+		0x04, 0x03, 0x02, 0x01,
+		0x08, 0x07, 0x06, 0x05,
+		0x0c, 0x0b, 0x0a, 0x09,
+		0x10, 0x0f, 0x0e, 0x0d,
+		0x14, 0x13, 0x12, 0x11,
+		0x18, 0x17, 0x16, 0x15,
+		0x1c, 0x1b, 0x1a, 0x19,
+		0x20, 0x1f, 0x1e, 0x1d,
+		0x24, 0x23, 0x22, 0x21,
+		0x28, 0x27, 0x26, 0x25,
+		0x2c, 0x2b, 0x2a, 0x29,
+		0x30, 0x2f, 0x2e, 0x2d,
+		0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
+	}
+	buf := make([]byte, 56)
+	if _, err := binary.Encode(buf, binary.LittleEndian, resReq); err != nil {
+		t.Fatalf("binary.Encode(ResCreateRequest): %v", err)
+	}
+	if !bytes.Equal(buf, wantResReq) {
+		t.Fatalf("ResCreateRequest bytes = % x, want % x", buf, wantResReq)
+	}
+
+	resRep := gpuproto.ResCreateReply{
+		HostSize: 0x0102030405060708,
+		FDType:   gpuproto.FDTypeShm,
+		Reserved: 0x090a0b0c,
+	}
+	wantResRep := []byte{
+		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+		0x03, 0x00, 0x00, 0x00,
+		0x0c, 0x0b, 0x0a, 0x09,
+	}
+	repBuf := make([]byte, 16)
+	if _, err := binary.Encode(repBuf, binary.LittleEndian, resRep); err != nil {
+		t.Fatalf("binary.Encode(ResCreateReply): %v", err)
+	}
+	if !bytes.Equal(repBuf, wantResRep) {
+		t.Fatalf("ResCreateReply bytes = % x, want % x", repBuf, wantResRep)
+	}
+
+	trReq := gpuproto.TransferRequest{
+		ResID:       0x01020304,
+		Direction:   gpuproto.TransferFromHost,
+		Level:       0x05060708,
+		Stride:      0x090a0b0c,
+		LayerStride: 0x0d0e0f10,
+		BoxX:        0x11121314,
+		BoxY:        0x15161718,
+		BoxZ:        0x191a1b1c,
+		BoxW:        0x1d1e1f20,
+		BoxH:        0x21222324,
+		BoxD:        0x25262728,
+		Reserved:    0x292a2b2c,
+		Offset:      0x3132333435363738,
+	}
+	wantTrReq := []byte{
+		0x04, 0x03, 0x02, 0x01,
+		0x02, 0x00, 0x00, 0x00,
+		0x08, 0x07, 0x06, 0x05,
+		0x0c, 0x0b, 0x0a, 0x09,
+		0x10, 0x0f, 0x0e, 0x0d,
+		0x14, 0x13, 0x12, 0x11,
+		0x18, 0x17, 0x16, 0x15,
+		0x1c, 0x1b, 0x1a, 0x19,
+		0x20, 0x1f, 0x1e, 0x1d,
+		0x24, 0x23, 0x22, 0x21,
+		0x28, 0x27, 0x26, 0x25,
+		0x2c, 0x2b, 0x2a, 0x29,
+		0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
+	}
+	trBuf := make([]byte, 56)
+	if _, err := binary.Encode(trBuf, binary.LittleEndian, trReq); err != nil {
+		t.Fatalf("binary.Encode(TransferRequest): %v", err)
+	}
+	if !bytes.Equal(trBuf, wantTrReq) {
+		t.Fatalf("TransferRequest bytes = % x, want % x", trBuf, wantTrReq)
 	}
 }

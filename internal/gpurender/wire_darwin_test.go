@@ -17,12 +17,16 @@
 package gpurender
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -633,13 +637,14 @@ func TestReadRejectsProtocolErrorsWithoutDeadlock(t *testing.T) {
 
 func TestRendererEnvironment(t *testing.T) {
 	const exe = "/opt/gvx/bin/gvx-gpu-renderer"
+	const defaultModeArg = gpuproto.ArgMode + gpuproto.ModeNameVenus
 	wantDefault := append([]string(nil), defaultDriverEnv...)
 	wantWithTest := append(append([]string(nil), defaultDriverEnv...), gpuproto.EnvTestMode+"=1")
 
 	t.Run("default options", func(t *testing.T) {
 		args, env := rendererCommandLine(Options{Path: exe})
-		if !slices.Equal(args, []string{exe}) {
-			t.Fatalf("args = %v, want [%s]", args, exe)
+		if !slices.Equal(args, []string{exe, defaultModeArg}) {
+			t.Fatalf("args = %v, want [%s %s]", args, exe, defaultModeArg)
 		}
 		if env == nil {
 			t.Fatal("default env is nil; must stay non-nil to scrub host environment")
@@ -656,8 +661,8 @@ func TestRendererEnvironment(t *testing.T) {
 
 	t.Run("TestOps adds env without argv", func(t *testing.T) {
 		args, env := rendererCommandLine(Options{Path: exe, TestOps: true})
-		if !slices.Equal(args, []string{exe}) {
-			t.Fatalf("args = %v, want [%s]", args, exe)
+		if !slices.Equal(args, []string{exe, defaultModeArg}) {
+			t.Fatalf("args = %v, want [%s %s]", args, exe, defaultModeArg)
 		}
 		if !slices.Equal(env, wantWithTest) {
 			t.Fatalf("env = %v, want %v", env, wantWithTest)
@@ -666,8 +671,8 @@ func TestRendererEnvironment(t *testing.T) {
 
 	t.Run("StallFences adds arg and env", func(t *testing.T) {
 		args, env := rendererCommandLine(Options{Path: exe, StallFences: true})
-		if !slices.Equal(args, []string{exe, gpuproto.ArgStallFences}) {
-			t.Fatalf("args = %v, want [%s %s]", args, exe, gpuproto.ArgStallFences)
+		if !slices.Equal(args, []string{exe, defaultModeArg, gpuproto.ArgStallFences}) {
+			t.Fatalf("args = %v, want [%s %s %s]", args, exe, defaultModeArg, gpuproto.ArgStallFences)
 		}
 		if !slices.Equal(env, wantWithTest) {
 			t.Fatalf("env = %v, want %v", env, wantWithTest)
@@ -677,8 +682,8 @@ func TestRendererEnvironment(t *testing.T) {
 	t.Run("TestWatchdogBytes adds arg and env", func(t *testing.T) {
 		args, env := rendererCommandLine(Options{Path: exe, TestWatchdogBytes: 1048576})
 		wantArg := gpuproto.ArgTestWatchdogBytes + "1048576"
-		if !slices.Equal(args, []string{exe, wantArg}) {
-			t.Fatalf("args = %v, want [%s %s]", args, exe, wantArg)
+		if !slices.Equal(args, []string{exe, defaultModeArg, wantArg}) {
+			t.Fatalf("args = %v, want [%s %s %s]", args, exe, defaultModeArg, wantArg)
 		}
 		if !slices.Equal(env, wantWithTest) {
 			t.Fatalf("env = %v, want %v", env, wantWithTest)
@@ -688,13 +693,40 @@ func TestRendererEnvironment(t *testing.T) {
 	t.Run("MemoryLimit adds arg without test env", func(t *testing.T) {
 		args, env := rendererCommandLine(Options{Path: exe, MemoryLimit: 4 << 30})
 		wantArg := gpuproto.ArgMemoryLimit + "4294967296"
-		if !slices.Equal(args, []string{exe, wantArg}) {
-			t.Fatalf("args = %v, want [%s %s]", args, exe, wantArg)
+		if !slices.Equal(args, []string{exe, defaultModeArg, wantArg}) {
+			t.Fatalf("args = %v, want [%s %s %s]", args, exe, defaultModeArg, wantArg)
 		}
 		if !slices.Equal(env, wantDefault) {
 			t.Fatalf("env = %v, want %v", env, wantDefault)
 		}
 	})
+}
+
+func TestRendererCommandLineHasMode(t *testing.T) {
+	const exe = "/opt/gvx/bin/gvx-gpu-renderer"
+
+	args, _ := rendererCommandLine(Options{Path: exe})
+	wantVenus := []string{exe, gpuproto.ArgMode + gpuproto.ModeNameVenus}
+	if !slices.Equal(args, wantVenus) {
+		t.Fatalf("default args = %v, want %v", args, wantVenus)
+	}
+
+	args, _ = rendererCommandLine(Options{Path: exe, Mode: gpuproto.ModeVenus})
+	if !slices.Equal(args, wantVenus) {
+		t.Fatalf("venus args = %v, want %v", args, wantVenus)
+	}
+
+	args, _ = rendererCommandLine(Options{Path: exe, Mode: gpuproto.ModeVirgl})
+	wantVirgl := []string{exe, gpuproto.ArgMode + gpuproto.ModeNameVirgl}
+	if !slices.Equal(args, wantVirgl) {
+		t.Fatalf("virgl args = %v, want %v", args, wantVirgl)
+	}
+
+	args, _ = rendererCommandLine(Options{Path: exe, Mode: gpuproto.ModeVirgl, MemoryLimit: 1024})
+	wantVirglMem := []string{exe, gpuproto.ArgMode + gpuproto.ModeNameVirgl, gpuproto.ArgMemoryLimit + "1024"}
+	if !slices.Equal(args, wantVirglMem) {
+		t.Fatalf("virgl+memory args = %v, want %v", args, wantVirglMem)
+	}
 }
 
 func TestPeerClosePreservesExitError(t *testing.T) {
@@ -795,4 +827,543 @@ func TestPeerClosePreservesExitError(t *testing.T) {
 			t.Fatalf("Submit error = %v, want *ExitError{Code:%d}", err, gpuproto.ExitMemoryLimit)
 		}
 	})
+}
+
+const (
+	fakePeerScenarioEnv = "GVX_GPU_TEST_FAKE_PEER"
+	fakePeerPIDFileEnv  = "GVX_GPU_TEST_FAKE_PEER_PIDFILE"
+)
+
+// TestFakePeerHelper runs the fake peer child process when a scripted Start
+// handshake test sets GVX_GPU_TEST_FAKE_PEER.
+func TestFakePeerHelper(t *testing.T) {
+	scenario := os.Getenv(fakePeerScenarioEnv)
+	if scenario == "" {
+		return
+	}
+	if pidFile := os.Getenv(fakePeerPIDFileEnv); pidFile != "" {
+		_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	}
+
+	sock := os.NewFile(uintptr(gpuproto.SocketFD), "fake-peer-sock")
+	if sock == nil {
+		os.Exit(11)
+	}
+	defer sock.Close()
+
+	var hdrBuf [gpuproto.HeaderSize]byte
+	if _, err := io.ReadFull(sock, hdrBuf[:]); err != nil {
+		os.Exit(12)
+	}
+	hdr, err := gpuproto.ParseHeader(hdrBuf[:], gpuproto.ToRenderer)
+	if err != nil || hdr.Op != gpuproto.OpHello {
+		os.Exit(13)
+	}
+	reqPayload := make([]byte, hdr.PayloadLen)
+	if _, err := io.ReadFull(sock, reqPayload); err != nil {
+		os.Exit(14)
+	}
+
+	var hello gpuproto.HelloInfo
+	switch scenario {
+	case "mode_mismatch":
+		hello = gpuproto.HelloInfo{
+			Mode:  gpuproto.ModeVenus,
+			Build: "fake-peer",
+			Caps:  []gpuproto.CapsetInfo{{ID: gpuproto.CapsetVenus, MaxVersion: 0, MaxSize: 64}},
+		}
+	case "foreign_capset":
+		hello = gpuproto.HelloInfo{
+			Mode:  gpuproto.ModeVirgl,
+			Build: "fake-peer",
+			Caps: []gpuproto.CapsetInfo{
+				{ID: gpuproto.CapsetVirgl2, MaxVersion: 0, MaxSize: 64},
+				{ID: gpuproto.CapsetVenus, MaxVersion: 0, MaxSize: 64},
+			},
+		}
+	case "duplicate_capset":
+		hello = gpuproto.HelloInfo{
+			Mode:  gpuproto.ModeVirgl,
+			Build: "fake-peer",
+			Caps: []gpuproto.CapsetInfo{
+				{ID: gpuproto.CapsetVirgl2, MaxVersion: 0, MaxSize: 64},
+				{ID: gpuproto.CapsetVirgl2, MaxVersion: 0, MaxSize: 64},
+			},
+		}
+	case "missing_primary":
+		hello = gpuproto.HelloInfo{
+			Mode:  gpuproto.ModeVirgl,
+			Build: "fake-peer",
+			Caps:  []gpuproto.CapsetInfo{{ID: gpuproto.CapsetVirgl, MaxVersion: 1, MaxSize: 308}},
+		}
+	default:
+		os.Exit(15)
+	}
+
+	repPayload, err := gpuproto.AppendHello(nil, hello)
+	if err != nil {
+		os.Exit(16)
+	}
+	repHdr := gpuproto.AppendHeader(nil, gpuproto.Header{
+		Magic:      gpuproto.Magic,
+		Op:         gpuproto.OpHello,
+		Flags:      gpuproto.FlagReply,
+		Seq:        hdr.Seq,
+		PayloadLen: uint32(len(repPayload)),
+		Status:     gpuproto.StatusOK,
+	})
+	if _, err := sock.Write(append(repHdr, repPayload...)); err != nil {
+		os.Exit(17)
+	}
+	// Hold open until the client closes or kills the peer so Start proves reaping.
+	var drain [16]byte
+	_, _ = sock.Read(drain[:])
+	os.Exit(0)
+}
+
+func writeFakePeerScript(t *testing.T, scenario string) (scriptPath, pidFile string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	dir := t.TempDir()
+	pidFile = filepath.Join(dir, "peer.pid")
+	scriptPath = filepath.Join(dir, "fake-peer.sh")
+	script := fmt.Sprintf("#!/bin/sh\n%s=%q %s=%q exec %q -test.run=^TestFakePeerHelper$\n",
+		fakePeerScenarioEnv, scenario, fakePeerPIDFileEnv, pidFile, exe)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake peer script: %v", err)
+	}
+	return scriptPath, pidFile
+}
+
+func assertFakePeerReaped(t *testing.T, pidFile string) {
+	t.Helper()
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read fake peer pid file %s: %v", pidFile, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid fake peer pid %q: %v", string(raw), err)
+	}
+	if err := unix.Kill(pid, 0); !errors.Is(err, unix.ESRCH) {
+		t.Fatalf("Kill(%d, 0) after Start failure = %v, want ESRCH (process not reaped)", pid, err)
+	}
+}
+
+func readPeerFrame(t *testing.T, peerFD int) (gpuproto.Header, []byte) {
+	t.Helper()
+	readExact := func(buf []byte) {
+		t.Helper()
+		got := 0
+		for got < len(buf) {
+			n, err := unix.Read(peerFD, buf[got:])
+			if err == unix.EINTR {
+				continue
+			}
+			if err != nil {
+				t.Fatalf("peer Read: %v", err)
+			}
+			if n == 0 {
+				t.Fatalf("peer Read: unexpected EOF at %d/%d", got, len(buf))
+			}
+			got += n
+		}
+	}
+	var hdrBuf [gpuproto.HeaderSize]byte
+	readExact(hdrBuf[:])
+	hdr, err := gpuproto.ParseHeader(hdrBuf[:], gpuproto.ToRenderer)
+	if err != nil {
+		t.Fatalf("peer ParseHeader: %v", err)
+	}
+	var payload []byte
+	if hdr.PayloadLen > 0 {
+		payload = make([]byte, hdr.PayloadLen)
+		readExact(payload)
+	}
+	return hdr, payload
+}
+
+func TestStartRejectsModeMismatch(t *testing.T) {
+	t.Run("unknown mode starts no process", func(t *testing.T) {
+		c, err := Start(context.Background(), Options{Path: "/nonexistent/gvx-gpu-renderer", Mode: 99})
+		if c != nil {
+			_ = c.Close()
+			t.Fatal("Start accepted unknown mode 99")
+		}
+		var se *StartError
+		if !errors.As(err, &se) {
+			t.Fatalf("Start error = %v (%T), want *StartError", err, err)
+		}
+		if se.ExitCode != -1 {
+			t.Fatalf("StartError.ExitCode = %d, want -1", se.ExitCode)
+		}
+		if !strings.Contains(err.Error(), "unknown renderer mode 99") {
+			t.Fatalf("Start error = %q, want unknown renderer mode 99", err.Error())
+		}
+	})
+
+	t.Run("HELLO replies venus to virgl start", func(t *testing.T) {
+		script, pidFile := writeFakePeerScript(t, "mode_mismatch")
+		c, err := Start(context.Background(), Options{
+			Path:         script,
+			Mode:         gpuproto.ModeVirgl,
+			StartTimeout: 5 * time.Second,
+		})
+		if c != nil {
+			_ = c.Close()
+			t.Fatal("Start succeeded despite HELLO mode mismatch")
+		}
+		var se *StartError
+		if !errors.As(err, &se) {
+			t.Fatalf("Start error = %v (%T), want *StartError", err, err)
+		}
+		if !strings.Contains(err.Error(), gpuproto.ModeVenus.String()) || !strings.Contains(err.Error(), gpuproto.ModeVirgl.String()) {
+			t.Fatalf("Start error = %q, want both %q and %q", err.Error(), gpuproto.ModeVenus, gpuproto.ModeVirgl)
+		}
+		assertFakePeerReaped(t, pidFile)
+	})
+}
+
+func TestStartRejectsForeignCapset(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		scenario string
+		wantText string
+	}{
+		{name: "venus capset in virgl start", scenario: "foreign_capset", wantText: "capset 4"},
+		{name: "duplicate capset in virgl start", scenario: "duplicate_capset", wantText: "capset 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script, pidFile := writeFakePeerScript(t, tc.scenario)
+			c, err := Start(context.Background(), Options{
+				Path:         script,
+				Mode:         gpuproto.ModeVirgl,
+				StartTimeout: 5 * time.Second,
+			})
+			if c != nil {
+				_ = c.Close()
+				t.Fatalf("Start succeeded for %s", tc.name)
+			}
+			var se *StartError
+			if !errors.As(err, &se) {
+				t.Fatalf("Start error = %v (%T), want *StartError", err, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantText) || !strings.Contains(err.Error(), gpuproto.ModeVirgl.String()) {
+				t.Fatalf("Start error = %q, want %q and %q", err.Error(), tc.wantText, gpuproto.ModeVirgl)
+			}
+			assertFakePeerReaped(t, pidFile)
+		})
+	}
+}
+
+func TestStartRejectsMissingPrimaryCapset(t *testing.T) {
+	script, pidFile := writeFakePeerScript(t, "missing_primary")
+	c, err := Start(context.Background(), Options{
+		Path:         script,
+		Mode:         gpuproto.ModeVirgl,
+		StartTimeout: 5 * time.Second,
+	})
+	if c != nil {
+		_ = c.Close()
+		t.Fatal("Start succeeded without primary virgl capset")
+	}
+	var se *StartError
+	if !errors.As(err, &se) {
+		t.Fatalf("Start error = %v (%T), want *StartError", err, err)
+	}
+	if !strings.Contains(err.Error(), "no capset 2") || !strings.Contains(err.Error(), gpuproto.ModeVirgl.String()) {
+		t.Fatalf("Start error = %q, want missing capset 2 for mode virgl", err.Error())
+	}
+	assertFakePeerReaped(t, pidFile)
+}
+
+func TestResCreateReplyWithoutFDLosesRenderer(t *testing.T) {
+	const fdScanLimit = 4096
+	before := snapshotOpenFDs(fdScanLimit)
+	c, peerFD, sink, cleanup := newWireTestClient(t, 2*time.Second)
+
+	errCh := make(chan error, 1)
+	go func() {
+		blob, err := c.CreateResource(context.Background(), gpuproto.ResourceCreate{
+			CtxID: 1,
+			ResID: 10,
+			Size:  16384,
+		})
+		if blob.Shm != nil {
+			_ = blob.Shm.Close()
+		}
+		errCh <- err
+	}()
+
+	reqHdr, _ := readPeerFrame(t, peerFD)
+	if reqHdr.Op != gpuproto.OpResCreate {
+		cleanup()
+		t.Fatalf("peer got op %s, want RES_CREATE", reqHdr.Op)
+	}
+
+	repPayload := gpuproto.AppendPayload(nil, gpuproto.ResCreateReply{
+		HostSize: 16384,
+		FDType:   gpuproto.FDTypeShm,
+	})
+	repHdr := gpuproto.AppendHeader(nil, gpuproto.Header{
+		Magic:      gpuproto.Magic,
+		Op:         gpuproto.OpResCreate,
+		Flags:      gpuproto.FlagReply, // missing FlagFD and descriptor
+		Seq:        reqHdr.Seq,
+		CtxID:      reqHdr.CtxID,
+		PayloadLen: uint32(len(repPayload)),
+		Status:     gpuproto.StatusOK,
+	})
+	if _, err := unix.Write(peerFD, append(repHdr, repPayload...)); err != nil {
+		cleanup()
+		t.Fatalf("Write RES_CREATE reply without FD: %v", err)
+	}
+
+	callErr := <-errCh
+	if !errors.Is(callErr, gpuproto.ErrRendererLost) {
+		cleanup()
+		t.Fatalf("CreateResource error = %v, want ErrRendererLost", callErr)
+	}
+	lostErr := waitRendererLost(t, sink)
+	if !strings.Contains(lostErr.Error(), "FlagFD") {
+		cleanup()
+		t.Fatalf("RendererLost error = %v, want FlagFD protocol error", lostErr)
+	}
+	cleanup()
+	assertNoFDLeaks(t, before, fdScanLimit)
+}
+
+func TestResCreateReplyShortHostSizeLosesRenderer(t *testing.T) {
+	const fdScanLimit = 4096
+	cases := []struct {
+		name    string
+		reqSize uint64
+		rep     gpuproto.ResCreateReply
+	}{
+		{
+			name:    "host size below requested size",
+			reqSize: 32768,
+			rep:     gpuproto.ResCreateReply{HostSize: 16384, FDType: gpuproto.FDTypeShm},
+		},
+		{
+			name:    "unaligned host size",
+			reqSize: 4096,
+			rep:     gpuproto.ResCreateReply{HostSize: 20480, FDType: gpuproto.FDTypeShm},
+		},
+		{
+			name:    "host size above max",
+			reqSize: 16384,
+			rep:     gpuproto.ResCreateReply{HostSize: gpuproto.MaxBlobBytes + gpuproto.HostBlobAlign, FDType: gpuproto.FDTypeShm},
+		},
+		{
+			name:    "wrong fd type",
+			reqSize: 16384,
+			rep:     gpuproto.ResCreateReply{HostSize: 16384, FDType: 1},
+		},
+		{
+			name:    "non-zero reserved",
+			reqSize: 16384,
+			rep:     gpuproto.ResCreateReply{HostSize: 16384, FDType: gpuproto.FDTypeShm, Reserved: 1},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := snapshotOpenFDs(fdScanLimit)
+			c, peerFD, sink, cleanup := newWireTestClient(t, 2*time.Second)
+
+			errCh := make(chan error, 1)
+			go func() {
+				blob, err := c.CreateResource(context.Background(), gpuproto.ResourceCreate{
+					CtxID: 1,
+					ResID: 10,
+					Size:  tc.reqSize,
+				})
+				if blob.Shm != nil {
+					_ = blob.Shm.Close()
+				}
+				errCh <- err
+			}()
+
+			reqHdr, _ := readPeerFrame(t, peerFD)
+			repPayload := gpuproto.AppendPayload(nil, tc.rep)
+			repHdr := gpuproto.AppendHeader(nil, gpuproto.Header{
+				Magic:      gpuproto.Magic,
+				Op:         gpuproto.OpResCreate,
+				Flags:      gpuproto.FlagReply | gpuproto.FlagFD,
+				Seq:        reqHdr.Seq,
+				CtxID:      reqHdr.CtxID,
+				PayloadLen: uint32(len(repPayload)),
+				Status:     gpuproto.StatusOK,
+			})
+			sendFDs, closeSendFDs := openDevNullFDs(t, 1)
+			if err := unix.Sendmsg(peerFD, append(repHdr, repPayload...), unix.UnixRights(sendFDs...), nil, 0); err != nil {
+				closeSendFDs()
+				cleanup()
+				t.Fatalf("Sendmsg RES_CREATE reply: %v", err)
+			}
+			closeSendFDs()
+
+			callErr := <-errCh
+			if !errors.Is(callErr, gpuproto.ErrRendererLost) {
+				cleanup()
+				t.Fatalf("CreateResource error = %v, want ErrRendererLost", callErr)
+			}
+			lostErr := waitRendererLost(t, sink)
+			if !strings.Contains(lostErr.Error(), "protocol error") {
+				cleanup()
+				t.Fatalf("RendererLost error = %v, want protocol error", lostErr)
+			}
+			cleanup()
+			assertNoFDLeaks(t, before, fdScanLimit)
+		})
+	}
+}
+
+func TestTransferReplyWithPayloadLosesRenderer(t *testing.T) {
+	c, peerFD, sink, cleanup := newWireTestClient(t, 2*time.Second)
+	defer cleanup()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.Transfer(context.Background(), gpuproto.Transfer{
+			CtxID:     1,
+			ResID:     10,
+			Direction: gpuproto.TransferToHost,
+			Box:       gpuproto.Box{W: 64, H: 1, D: 1},
+		})
+	}()
+
+	reqHdr, _ := readPeerFrame(t, peerFD)
+	if reqHdr.Op != gpuproto.OpTransfer {
+		t.Fatalf("peer got op %s, want TRANSFER", reqHdr.Op)
+	}
+
+	repHdr := gpuproto.AppendHeader(nil, gpuproto.Header{
+		Magic:      gpuproto.Magic,
+		Op:         gpuproto.OpTransfer,
+		Flags:      gpuproto.FlagReply,
+		Seq:        reqHdr.Seq,
+		CtxID:      reqHdr.CtxID,
+		PayloadLen: 4,
+		Status:     gpuproto.StatusOK,
+	})
+	if _, err := unix.Write(peerFD, append(repHdr, 0, 0, 0, 0)); err != nil {
+		t.Fatalf("Write TRANSFER reply with payload: %v", err)
+	}
+
+	callErr := <-errCh
+	if !errors.Is(callErr, gpuproto.ErrRendererLost) {
+		t.Fatalf("Transfer error = %v, want ErrRendererLost", callErr)
+	}
+	lostErr := waitRendererLost(t, sink)
+	if !strings.Contains(lostErr.Error(), "payload length 4") {
+		t.Fatalf("RendererLost error = %v, want payload length protocol error", lostErr)
+	}
+}
+
+func TestCancelledCreateResourceIsUndone(t *testing.T) {
+	const fdScanLimit = 4096
+	before := snapshotOpenFDs(fdScanLimit)
+	c, peerFD, sink, cleanup := newWireTestClient(t, 2*time.Second)
+
+	const (
+		ctxID = uint32(7)
+		resID = uint32(42)
+	)
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		blob, err := c.CreateResource(cctx, gpuproto.ResourceCreate{
+			CtxID: ctxID,
+			ResID: resID,
+			Size:  16384,
+		})
+		if blob.Shm != nil {
+			_ = blob.Shm.Close()
+		}
+		errCh <- err
+	}()
+
+	reqHdr, _ := readPeerFrame(t, peerFD)
+	if reqHdr.Op != gpuproto.OpResCreate || reqHdr.CtxID != ctxID {
+		cleanup()
+		t.Fatalf("peer got (%s, ctx %d), want (RES_CREATE, ctx %d)", reqHdr.Op, reqHdr.CtxID, ctxID)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			cleanup()
+			t.Fatalf("cancelled CreateResource error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		cleanup()
+		t.Fatal("cancelled CreateResource did not return within 2s")
+	}
+
+	repPayload := gpuproto.AppendPayload(nil, gpuproto.ResCreateReply{
+		HostSize: 16384,
+		FDType:   gpuproto.FDTypeShm,
+	})
+	repHdr := gpuproto.AppendHeader(nil, gpuproto.Header{
+		Magic:      gpuproto.Magic,
+		Op:         gpuproto.OpResCreate,
+		Flags:      gpuproto.FlagReply | gpuproto.FlagFD,
+		Seq:        reqHdr.Seq,
+		CtxID:      ctxID,
+		PayloadLen: uint32(len(repPayload)),
+		Status:     gpuproto.StatusOK,
+	})
+	sendFDs, closeSendFDs := openDevNullFDs(t, 1)
+	if err := unix.Sendmsg(peerFD, append(repHdr, repPayload...), unix.UnixRights(sendFDs...), nil, 0); err != nil {
+		closeSendFDs()
+		cleanup()
+		t.Fatalf("Sendmsg delayed RES_CREATE OK reply: %v", err)
+	}
+	closeSendFDs()
+
+	undoHdr, undoPayload := readPeerFrame(t, peerFD)
+	if undoHdr.Op != gpuproto.OpResUnref || undoHdr.CtxID != ctxID {
+		cleanup()
+		t.Fatalf("undo frame = (%s, ctx %d), want (RES_UNREF, ctx %d)", undoHdr.Op, undoHdr.CtxID, ctxID)
+	}
+	unrefReq, err := gpuproto.DecodePayload[gpuproto.ResUnrefRequest](undoPayload)
+	if err != nil {
+		cleanup()
+		t.Fatalf("DecodePayload(ResUnrefRequest): %v", err)
+	}
+	if unrefReq.ResID != resID {
+		cleanup()
+		t.Fatalf("undo ResUnrefRequest.ResID = %d, want %d", unrefReq.ResID, resID)
+	}
+
+	unrefReply := gpuproto.AppendHeader(nil, gpuproto.Header{
+		Magic:  gpuproto.Magic,
+		Op:     gpuproto.OpResUnref,
+		Flags:  gpuproto.FlagReply,
+		Seq:    undoHdr.Seq,
+		CtxID:  ctxID,
+		Status: gpuproto.StatusOK,
+	})
+	if _, err := unix.Write(peerFD, unrefReply); err != nil {
+		cleanup()
+		t.Fatalf("Write RES_UNREF reply: %v", err)
+	}
+
+	select {
+	case lostErr := <-sink.rendererLost:
+		cleanup()
+		t.Fatalf("unexpected RendererLost during undo: %v", lostErr)
+	default:
+	}
+
+	cleanup()
+	assertNoFDLeaks(t, before, fdScanLimit)
 }

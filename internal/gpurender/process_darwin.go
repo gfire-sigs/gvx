@@ -42,7 +42,11 @@ var defaultDriverEnv []string
 // rendererCommandLine builds the argv and scrubbed environment of the renderer
 // child process from opts so no ambient host variable reaches the child.
 func rendererCommandLine(opts Options) (args, env []string) {
-	args = []string{opts.Path}
+	mode := opts.Mode
+	if mode == 0 {
+		mode = gpuproto.ModeVenus
+	}
+	args = []string{opts.Path, gpuproto.ArgMode + mode.String()}
 	if opts.MemoryLimit > 0 {
 		args = append(args, fmt.Sprintf("%s%d", gpuproto.ArgMemoryLimit, opts.MemoryLimit))
 	}

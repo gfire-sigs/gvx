@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -45,6 +46,7 @@ type Client struct {
 	proc      *process
 	capsets   map[capsetKey][]byte // immutable after Start
 	build     string               // immutable after Start
+	mode      gpuproto.Mode        // immutable after Start
 	writeSem  chan struct{}        // capacity 1; held while one frame is written
 	failed    chan struct{}        // closed by lose after every pending call got its lost result
 	done      chan struct{}        // closed by lose after failed
@@ -65,9 +67,10 @@ type capsetKey struct{ id, version uint32 }
 type call struct {
 	op               gpuproto.Op
 	ctxID            uint32
-	expectFD         bool                // BLOB_CREATE with BlobFlagMappable
-	expectCapsetSize uint32              // GET_CAPSET expected payload size
-	blob             gpuproto.BlobCreate // for BLOB_CREATE validation and undo
+	expectFD         bool                    // BLOB_CREATE with BlobFlagMappable, or RES_CREATE
+	expectCapsetSize uint32                  // GET_CAPSET expected payload size
+	blob             gpuproto.BlobCreate     // for BLOB_CREATE validation and undo
+	res              gpuproto.ResourceCreate // for RES_CREATE validation and undo
 	timeout          time.Duration
 	deadline         time.Time
 	done             chan result // nil for fire-and-forget; else capacity 1
@@ -79,6 +82,7 @@ type result struct {
 	payload          []byte
 	shm              *fd.HostHandle // owned by the receiver of the result
 	blobReply        gpuproto.BlobCreateReply
+	resReply         gpuproto.ResCreateReply
 	testConfineReply gpuproto.TestConfineReply
 	err              error
 }
@@ -90,6 +94,13 @@ type result struct {
 // opts.StartTimeout.
 func Start(ctx context.Context, opts Options) (*Client, error) {
 	opts = opts.withDefaults()
+	if !opts.Mode.Valid() {
+		return nil, &StartError{
+			Path:     opts.Path,
+			ExitCode: -1,
+			Err:      fmt.Errorf("unknown renderer mode %d", opts.Mode),
+		}
+	}
 	if !filepath.IsAbs(opts.Path) {
 		return nil, &StartError{
 			Path:     opts.Path,
@@ -164,7 +175,10 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	hctx, cancel := context.WithTimeout(ctx, opts.StartTimeout)
 	defer cancel()
 
-	helloPayload := gpuproto.AppendPayload(nil, gpuproto.HelloRequest{Version: gpuproto.Version})
+	helloPayload := gpuproto.AppendPayload(nil, gpuproto.HelloRequest{
+		Version: gpuproto.Version,
+		Mode:    opts.Mode,
+	})
 	helloCall := &call{
 		op:      gpuproto.OpHello,
 		timeout: opts.StartTimeout,
@@ -174,16 +188,31 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 	if err != nil {
 		return failStart(err)
 	}
-	ver, build, caps, err := gpuproto.DecodeHelloReply(res.payload)
+	info, err := gpuproto.DecodeHello(res.payload)
 	if err != nil {
 		return failStart(err)
 	}
-	if ver != gpuproto.Version {
-		return failStart(fmt.Errorf("HELLO version %d, want %d", ver, gpuproto.Version))
+	if info.Version != gpuproto.Version {
+		return failStart(fmt.Errorf("HELLO version %d, want %d", info.Version, gpuproto.Version))
 	}
-	c.build = build
+	if info.Mode != opts.Mode {
+		return failStart(fmt.Errorf("HELLO mode %s, want %s", info.Mode, opts.Mode))
+	}
+	allowedCapsets := opts.Mode.Capsets()
+	primaryCapset := opts.Mode.PrimaryCapset()
+	seenCapsets := make(map[uint32]bool, len(info.Caps))
+	for _, capInfo := range info.Caps {
+		if !slices.Contains(allowedCapsets, capInfo.ID) || seenCapsets[capInfo.ID] {
+			return failStart(fmt.Errorf("HELLO capset %d is not a capset of mode %s", capInfo.ID, opts.Mode))
+		}
+		seenCapsets[capInfo.ID] = true
+	}
+	if !seenCapsets[primaryCapset] {
+		return failStart(fmt.Errorf("HELLO has no capset %d for mode %s", primaryCapset, opts.Mode))
+	}
+	c.build = info.Build
 
-	for _, capInfo := range caps {
+	for _, capInfo := range info.Caps {
 		for version := uint32(0); version <= capInfo.MaxVersion; version++ {
 			reqPayload := gpuproto.AppendPayload(nil, gpuproto.GetCapsetRequest{
 				ID:      capInfo.ID,
@@ -205,6 +234,7 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 			c.capsets[capsetKey{id: capInfo.ID, version: version}] = bytes.Clone(capRes.payload)
 		}
 	}
+	c.mode = info.Mode
 
 	return c, nil
 }
@@ -215,6 +245,11 @@ func (c *Client) waitProcess() {
 	c.proc.state = c.proc.cmd.ProcessState
 	close(c.proc.exited)
 	c.lose(exitCause(c.proc.state), false)
+}
+
+// Mode returns the mode that the renderer confirmed in HELLO. It does no I/O.
+func (c *Client) Mode() gpuproto.Mode {
+	return c.mode
 }
 
 // Capset returns the capset data of id at version, as cached during the
@@ -305,6 +340,61 @@ func (c *Client) CreateBlob(ctx context.Context, req gpuproto.BlobCreate) (gpupr
 		Shm:      res.shm,
 		HostSize: res.blobReply.HostSize,
 	}, nil
+}
+
+// CreateResource creates a virgl resource with a shared-memory backing,
+// attaches it to req.CtxID, and waits for the reply. On success the caller
+// owns Blob.Shm (never nil) and Blob.HostSize is the backing size.
+func (c *Client) CreateResource(ctx context.Context, req gpuproto.ResourceCreate) (gpuproto.Blob, error) {
+	if err := c.lostErr(); err != nil {
+		return gpuproto.Blob{}, err
+	}
+	if err := req.Validate(); err != nil {
+		return gpuproto.Blob{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return gpuproto.Blob{}, fmt.Errorf("gpurender: %s: %w", gpuproto.OpResCreate, err)
+	}
+	payload := gpuproto.AppendPayload(nil, req.Request())
+	cl := &call{
+		op:       gpuproto.OpResCreate,
+		ctxID:    req.CtxID,
+		expectFD: true,
+		res:      req,
+		timeout:  c.opts.RequestTimeout,
+		done:     make(chan result, 1),
+	}
+	res, err := c.roundTrip(ctx, cl, payload, nil)
+	if err != nil {
+		return gpuproto.Blob{}, err
+	}
+	return gpuproto.Blob{
+		Shm:      res.shm,
+		HostSize: res.resReply.HostSize,
+	}, nil
+}
+
+// Transfer copies between the backing and the host resource and waits for
+// the reply. The copy is complete when Transfer returns nil.
+func (c *Client) Transfer(ctx context.Context, req gpuproto.Transfer) error {
+	if err := c.lostErr(); err != nil {
+		return err
+	}
+	if err := req.Validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("gpurender: %s: %w", gpuproto.OpTransfer, err)
+	}
+	payload := gpuproto.AppendPayload(nil, req.Request())
+	cl := &call{
+		op:      gpuproto.OpTransfer,
+		ctxID:   req.CtxID,
+		timeout: c.opts.SubmitTimeout,
+		done:    make(chan result, 1),
+	}
+	_, err := c.roundTrip(ctx, cl, payload, nil)
+	return err
 }
 
 // UnrefResource sends RES_UNREF (detach, then unref) and returns without
@@ -819,6 +909,9 @@ func (c *Client) dispatchReply(hdr gpuproto.Header, payload []byte, shm *fd.Host
 			case gpuproto.OpBlobCreate:
 				ctxID, resID := cl.ctxID, cl.blob.ResID
 				c.undo(func() { _ = c.UnrefResource(ctxID, resID) })
+			case gpuproto.OpResCreate:
+				ctxID, resID := cl.ctxID, cl.res.ResID
+				c.undo(func() { _ = c.UnrefResource(ctxID, resID) })
 			}
 		}
 		return true
@@ -838,6 +931,7 @@ func (c *Client) dispatchReply(hdr gpuproto.Header, payload []byte, shm *fd.Host
 		payload:          payload,
 		shm:              shm,
 		blobReply:        validated.blobReply,
+		resReply:         validated.resReply,
 		testConfineReply: validated.testConfineReply,
 	}
 	return true
@@ -845,6 +939,7 @@ func (c *Client) dispatchReply(hdr gpuproto.Header, payload []byte, shm *fd.Host
 
 type validatedReply struct {
 	blobReply        gpuproto.BlobCreateReply
+	resReply         gpuproto.ResCreateReply
 	testConfineReply gpuproto.TestConfineReply
 }
 
@@ -862,12 +957,12 @@ func validateReply(cl *call, hdr gpuproto.Header, payload []byte) (validatedRepl
 
 	switch hdr.Op {
 	case gpuproto.OpHello:
-		ver, _, _, err := gpuproto.DecodeHelloReply(payload)
+		info, err := gpuproto.DecodeHello(payload)
 		if err != nil {
 			return validatedReply{}, err
 		}
-		if ver != gpuproto.Version {
-			return validatedReply{}, fmt.Errorf("HELLO version %d, want %d", ver, gpuproto.Version)
+		if info.Version != gpuproto.Version {
+			return validatedReply{}, fmt.Errorf("HELLO version %d, want %d", info.Version, gpuproto.Version)
 		}
 		return validatedReply{}, nil
 	case gpuproto.OpGetCapset:
@@ -875,7 +970,7 @@ func validateReply(cl *call, hdr gpuproto.Header, payload []byte) (validatedRepl
 			return validatedReply{}, fmt.Errorf("GET_CAPSET payload length %d, want %d", len(payload), cl.expectCapsetSize)
 		}
 		return validatedReply{}, nil
-	case gpuproto.OpCtxCreate, gpuproto.OpCtxDestroy, gpuproto.OpResUnref, gpuproto.OpSubmit:
+	case gpuproto.OpCtxCreate, gpuproto.OpCtxDestroy, gpuproto.OpResUnref, gpuproto.OpSubmit, gpuproto.OpTransfer:
 		if len(payload) != 0 {
 			return validatedReply{}, fmt.Errorf("%s reply payload length %d, want 0", hdr.Op, len(payload))
 		}
@@ -904,6 +999,27 @@ func validateReply(cl *call, hdr gpuproto.Header, payload []byte) (validatedRepl
 			}
 		}
 		return validatedReply{blobReply: rep}, nil
+	case gpuproto.OpResCreate:
+		rep, err := gpuproto.DecodePayload[gpuproto.ResCreateReply](payload)
+		if err != nil {
+			return validatedReply{}, err
+		}
+		if rep.FDType != gpuproto.FDTypeShm {
+			return validatedReply{}, fmt.Errorf("RES_CREATE fd_type %d, want %d", rep.FDType, gpuproto.FDTypeShm)
+		}
+		if rep.Reserved != 0 {
+			return validatedReply{}, fmt.Errorf("RES_CREATE reserved %#x, want 0", rep.Reserved)
+		}
+		if rep.HostSize < cl.res.Size {
+			return validatedReply{}, fmt.Errorf("RES_CREATE host_size %d below requested %d", rep.HostSize, cl.res.Size)
+		}
+		if rep.HostSize%gpuproto.HostBlobAlign != 0 {
+			return validatedReply{}, fmt.Errorf("RES_CREATE host_size %d is not aligned to %d", rep.HostSize, gpuproto.HostBlobAlign)
+		}
+		if rep.HostSize > gpuproto.MaxBlobBytes {
+			return validatedReply{}, fmt.Errorf("RES_CREATE host_size %d exceeds max %d", rep.HostSize, gpuproto.MaxBlobBytes)
+		}
+		return validatedReply{resReply: rep}, nil
 	case gpuproto.OpTestConfine:
 		rep, err := gpuproto.DecodePayload[gpuproto.TestConfineReply](payload)
 		if err != nil {

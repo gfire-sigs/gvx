@@ -94,6 +94,9 @@ func assertStatusError(t *testing.T, err error, wantStatus gpuproto.Status) {
 
 func TestHandshakeCachesVenusCapset(t *testing.T) {
 	c := gpurendertest.New(t)
+	if got := c.Mode(); got != gpuproto.ModeVenus {
+		t.Fatalf("Mode() = %v, want %v", got, gpuproto.ModeVenus)
+	}
 
 	data, ok := c.Capset(gpuproto.CapsetVenus, 0)
 	if !ok {
@@ -1473,5 +1476,507 @@ func TestGPURendererTestOpsOffByDefault(t *testing.T) {
 	}
 	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVenus, ""); err != nil {
 		t.Fatalf("CreateContext(1) after refused TEST_CONFINE: %v", err)
+	}
+}
+
+func countOpenFDs(limit int) int {
+	n := 0
+	for fd := range limit {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+func TestVirglHandshakeCachesCapsets(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+
+	if got := c.Mode(); got != gpuproto.ModeVirgl {
+		t.Fatalf("Mode() = %v, want %v", got, gpuproto.ModeVirgl)
+	}
+
+	for v := uint32(0); v <= 1; v++ {
+		data, ok := c.Capset(gpuproto.CapsetVirgl, v)
+		if !ok {
+			t.Fatalf("Capset(CapsetVirgl, %d) ok = false, want true", v)
+		}
+		if len(data) == 0 || len(data)%4 != 0 {
+			t.Fatalf("len(Capset(CapsetVirgl, %d)) = %d, want positive multiple of 4", v, len(data))
+		}
+	}
+	if _, ok := c.Capset(gpuproto.CapsetVirgl, 2); ok {
+		t.Fatal("Capset(CapsetVirgl, 2) ok = true, want false")
+	}
+
+	for v := uint32(0); v <= 2; v++ {
+		data, ok := c.Capset(gpuproto.CapsetVirgl2, v)
+		if !ok {
+			t.Fatalf("Capset(CapsetVirgl2, %d) ok = false, want true", v)
+		}
+		if len(data) == 0 || len(data)%4 != 0 {
+			t.Fatalf("len(Capset(CapsetVirgl2, %d)) = %d, want positive multiple of 4", v, len(data))
+		}
+		if got := binary.LittleEndian.Uint32(data[0:4]); got != 2 {
+			t.Fatalf("Capset(CapsetVirgl2, %d) first word = %d, want 2", v, got)
+		}
+	}
+	if _, ok := c.Capset(gpuproto.CapsetVirgl2, 3); ok {
+		t.Fatal("Capset(CapsetVirgl2, 3) ok = true, want false")
+	}
+	if _, ok := c.Capset(gpuproto.CapsetVenus, 0); ok {
+		t.Fatal("Capset(CapsetVenus, 0) ok = true, want false")
+	}
+}
+
+func TestVirglContextCapsets(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+	ctx := context.Background()
+
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl, "virgl1"); err != nil {
+		t.Fatalf("CreateContext(1, CapsetVirgl): %v", err)
+	}
+	if err := c.CreateContext(ctx, 2, gpuproto.CapsetVirgl2, "virgl2"); err != nil {
+		t.Fatalf("CreateContext(2, CapsetVirgl2): %v", err)
+	}
+	err := c.CreateContext(ctx, 3, gpuproto.CapsetVenus, "venus")
+	assertStatusError(t, err, gpuproto.StatusInvalid)
+}
+
+func TestVirglResourceRoundTrip(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+	ctx := context.Background()
+
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, "rt"); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	const size = 65536
+	blob, err := c.CreateResource(ctx, gpuproto.ResourceCreate{
+		CtxID:     1,
+		ResID:     10,
+		Target:    0,      // PIPE_BUFFER
+		Format:    64,     // VIRGL_FORMAT_R8_UNORM
+		Bind:      1 << 4, // VIRGL_BIND_VERTEX_BUFFER
+		Width:     size,
+		Height:    1,
+		Depth:     1,
+		ArraySize: 1,
+		Size:      size,
+	})
+	if err != nil {
+		t.Fatalf("CreateResource(10): %v", err)
+	}
+	if blob.Shm == nil {
+		t.Fatal("CreateResource(10) returned nil Shm")
+	}
+	defer blob.Shm.Close()
+
+	if blob.HostSize != size {
+		t.Fatalf("HostSize = %d, want %d", blob.HostSize, size)
+	}
+
+	rawFD, err := blob.Shm.RawHandle()
+	if err != nil {
+		t.Fatalf("RawHandle: %v", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(int(rawFD), &st); err != nil {
+		t.Fatalf("Fstat: %v", err)
+	}
+	if st.Size != size {
+		t.Fatalf("fstat size = %d, want %d", st.Size, size)
+	}
+	fdFlags, err := unix.FcntlInt(rawFD, unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("F_GETFD: %v", err)
+	}
+	if fdFlags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("F_GETFD = %#x, want FD_CLOEXEC set", fdFlags)
+	}
+
+	mapped, err := unix.Mmap(int(rawFD), 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		t.Fatalf("Mmap: %v", err)
+	}
+	defer func() { _ = unix.Munmap(mapped) }()
+
+	pattern := make([]byte, size)
+	for i := range pattern {
+		pattern[i] = byte(i*7 + 3)
+	}
+	copy(mapped, pattern)
+
+	box := gpuproto.Box{W: size, H: 1, D: 1}
+	if err := c.Transfer(ctx, gpuproto.Transfer{
+		CtxID:     1,
+		ResID:     10,
+		Direction: gpuproto.TransferToHost,
+		Box:       box,
+	}); err != nil {
+		t.Fatalf("TransferToHost: %v", err)
+	}
+
+	clear(mapped)
+
+	if err := c.Transfer(ctx, gpuproto.Transfer{
+		CtxID:     1,
+		ResID:     10,
+		Direction: gpuproto.TransferFromHost,
+		Box:       box,
+	}); err != nil {
+		t.Fatalf("TransferFromHost: %v", err)
+	}
+
+	if !bytes.Equal(mapped, pattern) {
+		t.Fatal("TransferFromHost data did not match written pattern")
+	}
+
+	if err := c.UnrefResource(1, 10); err != nil {
+		t.Fatalf("UnrefResource(1, 10): %v", err)
+	}
+	if err := c.DestroyContext(1); err != nil {
+		t.Fatalf("DestroyContext(1): %v", err)
+	}
+}
+
+func TestVirglResourceBadArguments(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+	ctx := context.Background()
+
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	blob, err := c.CreateResource(ctx, gpuproto.ResourceCreate{
+		CtxID:     1,
+		ResID:     10,
+		Target:    99,
+		Format:    64,
+		Bind:      1 << 4,
+		Width:     4096,
+		Height:    1,
+		Depth:     1,
+		ArraySize: 1,
+		Size:      4096,
+	})
+	if blob.Shm != nil {
+		_ = blob.Shm.Close()
+	}
+	assertStatusError(t, err, gpuproto.StatusInvalid)
+
+	if err := c.CreateContext(ctx, 2, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(2) after bad CreateResource: %v", err)
+	}
+}
+
+func TestVirglBlobCreateNotSupported(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+	ctx := context.Background()
+
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	blob, err := c.CreateBlob(ctx, gpuproto.BlobCreate{
+		CtxID:     1,
+		ResID:     10,
+		BlobMem:   gpuproto.BlobMemHost3D,
+		BlobFlags: gpuproto.BlobFlagMappable,
+		Size:      4096,
+	})
+	if blob.Shm != nil {
+		_ = blob.Shm.Close()
+	}
+	assertStatusError(t, err, gpuproto.StatusNotSupported)
+
+	if err := c.CreateContext(ctx, 2, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(2) after refused CreateBlob: %v", err)
+	}
+}
+
+func TestVenusRefusesVirglRequests(t *testing.T) {
+	c := gpurendertest.New(t)
+	ctx := context.Background()
+
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVenus, ""); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	blob, err := c.CreateResource(ctx, gpuproto.ResourceCreate{
+		CtxID:     1,
+		ResID:     10,
+		Target:    0,
+		Format:    64,
+		Bind:      1 << 4,
+		Width:     4096,
+		Height:    1,
+		Depth:     1,
+		ArraySize: 1,
+		Size:      4096,
+	})
+	if blob.Shm != nil {
+		_ = blob.Shm.Close()
+	}
+	assertStatusError(t, err, gpuproto.StatusNotSupported)
+
+	err = c.Transfer(ctx, gpuproto.Transfer{
+		CtxID:     1,
+		ResID:     10,
+		Direction: gpuproto.TransferToHost,
+		Box:       gpuproto.Box{W: 4096, H: 1, D: 1},
+	})
+	assertStatusError(t, err, gpuproto.StatusNotSupported)
+
+	if err := c.CreateContext(ctx, 2, gpuproto.CapsetVenus, ""); err != nil {
+		t.Fatalf("CreateContext(2) after refused virgl requests: %v", err)
+	}
+}
+
+func TestVirglFenceRetires(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+	sink := newRecordingSink()
+	c.SetEventSink(sink)
+
+	ctx := context.Background()
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	if err := c.Submit(1, nil, &gpuproto.Fence{RingIdx: 0, ID: 1}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	submittedAt := time.Now()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case ev := <-sink.fenceDone:
+		if ev.ctxID != 1 || ev.ringIdx != 0 || ev.fenceID != 1 {
+			t.Fatalf("FenceDone = (%d, %d, %d), want (1, 0, 1)", ev.ctxID, ev.ringIdx, ev.fenceID)
+		}
+		if elapsed := ev.at.Sub(submittedAt); elapsed >= 100*time.Millisecond {
+			t.Fatalf("fence retired in %s, want < 100ms", elapsed)
+		}
+	case lostErr := <-sink.rendererLost:
+		t.Fatalf("unexpected RendererLost: %v", lostErr)
+	case <-timer.C:
+		t.Fatal("no FENCE_DONE")
+	}
+}
+
+func TestVirglBrokenStreamLosesContext(t *testing.T) {
+	c := gpurendertest.NewVirgl(t)
+	sink := newRecordingSink()
+	c.SetEventSink(sink)
+
+	ctx := context.Background()
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	// Single command header word: length 0, object type 0, unknown command 0xff.
+	bad := []byte{0xff, 0x00, 0x00, 0x00}
+	if err := c.Submit(1, bad, nil); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	select {
+	case lostCtx := <-sink.ctxLost:
+		if lostCtx != 1 {
+			t.Fatalf("ContextLost = %d, want 1", lostCtx)
+		}
+	case lostErr := <-sink.rendererLost:
+		t.Fatalf("unexpected RendererLost: %v", lostErr)
+	case <-deadline.C:
+		t.Fatal("timed out waiting for ContextLost(1)")
+	}
+
+	if err := c.CreateContext(ctx, 2, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(2) after context 1 lost: %v", err)
+	}
+}
+
+func TestVirglUnrefThenReuseID(t *testing.T) {
+	const fdScanLimit = 4096
+	c := gpurendertest.NewVirgl(t)
+	ctx := context.Background()
+
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, ""); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	before := countOpenFDs(fdScanLimit)
+	for i := range 200 {
+		resID := uint32(i + 1)
+		blob, err := c.CreateResource(ctx, gpuproto.ResourceCreate{
+			CtxID:     1,
+			ResID:     resID,
+			Target:    0,
+			Format:    64,
+			Bind:      1 << 4,
+			Width:     4096,
+			Height:    1,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      4096,
+		})
+		if err != nil {
+			t.Fatalf("round %d CreateResource(%d): %v", i, resID, err)
+		}
+		if err := blob.Shm.Close(); err != nil {
+			t.Fatalf("round %d Shm.Close(%d): %v", i, resID, err)
+		}
+		if err := c.UnrefResource(1, resID); err != nil {
+			t.Fatalf("round %d UnrefResource(%d): %v", i, resID, err)
+		}
+	}
+
+	after := countOpenFDs(fdScanLimit)
+	if after > before {
+		t.Fatalf("open descriptor count grew from %d to %d across 200 rounds", before, after)
+	}
+}
+
+func TestVirglConfinement(t *testing.T) {
+	c := gpurendertest.NewWithOptions(t, gpurender.Options{
+		Mode:    gpuproto.ModeVirgl,
+		TestOps: true,
+	})
+	sink := newRecordingSink()
+	c.SetEventSink(sink)
+
+	ctx := context.Background()
+	if data, ok := c.Capset(gpuproto.CapsetVirgl2, 0); !ok || len(data) == 0 {
+		t.Fatalf("Capset(CapsetVirgl2, 0) = (%d bytes, %v), want non-empty ok", len(data), ok)
+	}
+	if err := c.CreateContext(ctx, 1, gpuproto.CapsetVirgl2, "confine"); err != nil {
+		t.Fatalf("CreateContext(1): %v", err)
+	}
+
+	resReq := func(resID uint32) gpuproto.ResourceCreate {
+		return gpuproto.ResourceCreate{
+			CtxID:     1,
+			ResID:     resID,
+			Target:    0,
+			Format:    64,
+			Bind:      1 << 4,
+			Width:     16384,
+			Height:    1,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      16384,
+		}
+	}
+
+	blob1, err := c.CreateResource(ctx, resReq(1))
+	if err != nil {
+		t.Fatalf("first CreateResource(1): %v", err)
+	}
+	rawFD, err := blob1.Shm.RawHandle()
+	if err != nil {
+		_ = blob1.Shm.Close()
+		t.Fatalf("RawHandle: %v", err)
+	}
+	mapped, err := unix.Mmap(int(rawFD), 0, int(blob1.HostSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		_ = blob1.Shm.Close()
+		t.Fatalf("Mmap: %v", err)
+	}
+	binary.LittleEndian.PutUint32(mapped[0:4], 0x5a5a5a5a)
+	if got := binary.LittleEndian.Uint32(mapped[0:4]); got != 0x5a5a5a5a {
+		_ = unix.Munmap(mapped)
+		_ = blob1.Shm.Close()
+		t.Fatalf("mapped word = %#x, want 0x5a5a5a5a", got)
+	}
+	if err := unix.Munmap(mapped); err != nil {
+		_ = blob1.Shm.Close()
+		t.Fatalf("Munmap: %v", err)
+	}
+	if err := blob1.Shm.Close(); err != nil {
+		t.Fatalf("Shm.Close(1): %v", err)
+	}
+	if err := c.UnrefResource(1, 1); err != nil {
+		t.Fatalf("UnrefResource(1, 1): %v", err)
+	}
+
+	if err := c.Submit(1, nil, &gpuproto.Fence{RingIdx: 0, ID: 1}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	fenceTimer := time.NewTimer(2 * time.Second)
+	defer fenceTimer.Stop()
+	select {
+	case ev := <-sink.fenceDone:
+		if ev.ctxID != 1 || ev.fenceID != 1 {
+			t.Fatalf("FenceDone = %+v, want ctx=1 fence=1", ev)
+		}
+	case lostErr := <-sink.rendererLost:
+		t.Fatalf("unexpected RendererLost before TestConfinement: %v", lostErr)
+	case <-fenceTimer.C:
+		t.Fatal("timed out waiting for FenceDone")
+	}
+
+	rep, err := c.TestConfinement(ctx)
+	if err != nil {
+		if errors.Is(err, gpuproto.ErrRendererLost) {
+			t.Fatalf("exec allowed (renderer replaced): %v", err)
+		}
+		t.Fatalf("TestConfinement: %v", err)
+	}
+	if rep.Checks != gpuproto.ConfineChecks {
+		t.Fatalf("TestConfinement Checks = %d, want %d", rep.Checks, gpuproto.ConfineChecks)
+	}
+
+	checkNames := [gpuproto.ConfineChecks]string{
+		gpuproto.ConfineCheckFork:    "fork",
+		gpuproto.ConfineCheckExec:    "exec",
+		gpuproto.ConfineCheckRead:    "read",
+		gpuproto.ConfineCheckCreate:  "create",
+		gpuproto.ConfineCheckConnect: "connect",
+	}
+	for i, name := range checkNames {
+		res := gpuproto.ConfineResult(rep.Results[i])
+		switch res {
+		case gpuproto.ConfineDenied:
+		case gpuproto.ConfineAllowed:
+			t.Fatalf("%s allowed", name)
+		case gpuproto.ConfineUnexpected:
+			t.Fatalf("%s unexpected errno", name)
+		default:
+			t.Fatalf("%s invalid result %d", name, res)
+		}
+	}
+
+	blob2, err := c.CreateResource(ctx, resReq(2))
+	if err != nil {
+		t.Fatalf("second CreateResource(2) after TestConfinement: %v", err)
+	}
+	if err := blob2.Shm.Close(); err != nil {
+		t.Fatalf("Shm.Close(2): %v", err)
+	}
+	if err := c.UnrefResource(1, 2); err != nil {
+		t.Fatalf("UnrefResource(1, 2): %v", err)
+	}
+	if err := c.DestroyContext(1); err != nil {
+		t.Fatalf("DestroyContext(1): %v", err)
+	}
+
+	createPath := "/private/tmp/gvx-gpu-selftest-" + strconv.Itoa(c.PID())
+	if _, statErr := os.Lstat(createPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Lstat(%s) after TestConfinement = %v, want os.ErrNotExist", createPath, statErr)
+	}
+
+	pgrepOut, pgrepErr := exec.Command("pgrep", "-P", strconv.Itoa(c.PID())).CombinedOutput()
+	if pgrepErr == nil {
+		if len(bytes.TrimSpace(pgrepOut)) > 0 {
+			t.Fatalf("renderer PID %d has child processes: %s", c.PID(), strings.TrimSpace(string(pgrepOut)))
+		}
+	} else {
+		var exitErr *exec.ExitError
+		if !errors.As(pgrepErr, &exitErr) || exitErr.ExitCode() != 1 {
+			t.Fatalf("pgrep -P %d failed: %v (output: %s)", c.PID(), pgrepErr, strings.TrimSpace(string(pgrepOut)))
+		}
 	}
 }

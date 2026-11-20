@@ -34,10 +34,11 @@ const (
 	// GET_CAPSET. A new renderer binary with an empty Metal shader cache takes
 	// about 5 s on an M1 Ultra; later starts take about 2 s.
 	DefaultStartTimeout = 20 * time.Second
-	// DefaultRequestTimeout bounds the reply to every request except SUBMIT,
-	// and the write of every frame except SUBMIT.
+	// DefaultRequestTimeout bounds the reply to every request except SUBMIT
+	// and TRANSFER, and the write of every frame except SUBMIT and TRANSFER.
 	DefaultRequestTimeout = 10 * time.Second
-	// DefaultSubmitTimeout bounds the write of a SUBMIT frame and its reply.
+	// DefaultSubmitTimeout bounds the write of a SUBMIT or TRANSFER frame and
+	// its reply.
 	DefaultSubmitTimeout = 30 * time.Second
 	// KillGrace is how long Close waits for the renderer to exit after end of
 	// file on its socket before it sends SIGKILL.
@@ -71,6 +72,10 @@ type Options struct {
 	// adding a command-line flag, enabling test-only ops such as TEST_CONFINE.
 	// Tests only.
 	TestOps bool
+	// Mode selects the command stream of the renderer. Zero selects
+	// gpuproto.ModeVenus. Start passes it as gpuproto.ArgMode and verifies that
+	// the HELLO reply confirms it.
+	Mode gpuproto.Mode
 }
 
 func (o Options) withDefaults() Options {
@@ -82,6 +87,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.SubmitTimeout <= 0 {
 		o.SubmitTimeout = DefaultSubmitTimeout
+	}
+	if o.Mode == 0 {
+		o.Mode = gpuproto.ModeVenus
 	}
 	return o
 }
