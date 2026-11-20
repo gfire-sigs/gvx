@@ -16,6 +16,7 @@ package ext4lite
 
 import (
 	"crypto/rand"
+	"sync"
 	"time"
 )
 
@@ -76,6 +77,7 @@ func formatVolume(hf hostFile, now time.Time) error {
 		diskGroups: 1,
 	}
 	v.gate.init()
+	v.punchCond = sync.NewCond(&v.mu)
 	g := newGroup(0)
 	for i := uint32(0); i < firstIno-1; i++ {
 		g.inodes.set(i)

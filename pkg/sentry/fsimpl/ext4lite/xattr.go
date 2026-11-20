@@ -433,6 +433,10 @@ func (n *node) listXattr() ([]string, error) {
 // setXattr stores the attribute. With create, it fails with EEXIST when the
 // attribute exists. With replace, it fails with ENODATA when it does not.
 func (n *node) setXattr(full string, value []byte, create, replace bool) error {
+	return n.setXattrPolicy(full, value, create, replace, allocReuseHeld)
+}
+
+func (n *node) setXattrPolicy(full string, value []byte, create, replace bool, policy allocPolicy) error {
 	// Callers that run after an operation ended, such as the capability clear
 	// of an open, are outside the gate. The entry accepts a nested caller.
 	n.v.gate.enterInner()
@@ -472,11 +476,15 @@ func (n *node) setXattr(full string, value []byte, create, replace bool) error {
 	if xattrBlockSize(blockEntries(next)) > blockSize {
 		return linuxerr.ENOSPC
 	}
-	return n.installXattrsLocked(next)
+	return n.installXattrsLocked(next, policy)
 }
 
 // removeXattr deletes the attribute.
 func (n *node) removeXattr(full string) error {
+	return n.removeXattrPolicy(full, allocReuseHeld)
+}
+
+func (n *node) removeXattrPolicy(full string, policy allocPolicy) error {
 	n.v.gate.enterInner()
 	defer n.v.gate.exit()
 	idx, name, ok := splitXattrName(full)
@@ -492,7 +500,7 @@ func (n *node) removeXattr(full string) error {
 	for i, e := range xa.entries {
 		if e.index == idx && e.name == name {
 			next := append(append([]xattrEntry(nil), xa.entries[:i]...), xa.entries[i+1:]...)
-			return n.installXattrsLocked(next)
+			return n.installXattrsLocked(next, policy)
 		}
 	}
 	return linuxerr.ENODATA
@@ -502,13 +510,13 @@ func (n *node) removeXattr(full string) error {
 // shared block is never changed in place. The node takes a private block for
 // its block entries, and then it gives up its name of the shared block. The
 // private block is allocated first, so a failure leaves the node as it was.
-func (n *node) installXattrsLocked(next []xattrEntry) error {
+func (n *node) installXattrsLocked(next []xattrEntry, policy allocPolicy) error {
 	inBlock := len(blockEntries(next)) > 0
 	switch {
 	case n.xa.shared:
 		var blk uint64
 		if inBlock {
-			b, _, err := n.v.allocBlocks(0, 1)
+			b, _, err := n.v.allocBlocksPolicy(0, 1, policy)
 			if err != nil {
 				return err
 			}
@@ -526,7 +534,7 @@ func (n *node) installXattrsLocked(next []xattrEntry) error {
 		}
 		n.xa.shared = false
 	case inBlock && n.fileACL == 0:
-		blk, _, err := n.v.allocBlocks(0, 1)
+		blk, _, err := n.v.allocBlocksPolicy(0, 1, policy)
 		if err != nil {
 			return err
 		}

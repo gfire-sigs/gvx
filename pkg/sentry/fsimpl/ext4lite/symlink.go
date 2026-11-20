@@ -44,7 +44,7 @@ func (i *inode) symlinkTarget() (string, error) {
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name string) (*inode, error) {
+	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name string, policy allocPolicy) (*inode, error) {
 		if target == "" {
 			return nil, linuxerr.ENOENT
 		}
@@ -53,9 +53,9 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 		}
 		uid, gid, _ := parent.inode.newOwner(rp.Credentials())
 		return fs.newChildLocked(parent, name, modeSymlink|0o777, uid, gid, 0, func(n *node) error {
-			_, err := n.writeAt([]byte(target), 0)
+			_, err := n.writeAtPolicy([]byte(target), 0, policy)
 			return err
-		})
+		}, policy)
 	})
 }
 

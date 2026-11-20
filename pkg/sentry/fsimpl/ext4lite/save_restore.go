@@ -247,12 +247,9 @@ func (fs *filesystem) flushMappedForSave() error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, ino := range list {
-		err := ino.flushMapped(0, math.MaxUint64)
-		if errors.Is(err, errSpaceHeld) && fs.v.hasHeld() {
-			if serr := fs.v.sync(); serr == nil {
-				err = ino.flushMapped(0, math.MaxUint64)
-			}
-		}
+		err := fs.retryFlushHeld(func() error {
+			return ino.flushMapped(0, math.MaxUint64)
+		})
 		if err != nil {
 			errs = append(errs, err)
 		}
