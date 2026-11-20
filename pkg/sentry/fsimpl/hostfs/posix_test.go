@@ -946,21 +946,20 @@ func TestMappingSurvivesTheLastUnmapOfAnotherThread(t *testing.T) {
 		e.writeFile("loose", []byte("twenty-six bytes of data."))
 		fd := e.mustOpen("loose", linux.O_RDONLY)
 		defer fd.DecRef(e.ctx)
-		const length = hostarch.PageSize
+		length := hostarch.PageSize
+		first, msA, arA := e.mapFile(fd, uint64(length), false)
 
-		first, msA, arA := e.mapFile(fd, length, false)
-
-		optsB := &memmap.MMapOpts{Length: length, Perms: hostarch.Read, MaxPerms: hostarch.Read, Private: true}
+		optsB := &memmap.MMapOpts{Length: uint64(length), Perms: hostarch.Read, MaxPerms: hostarch.Read, Private: true}
 		if err := fd.ConfigureMMap(e.ctx, optsB); err != nil {
 			t.Fatalf("ConfigureMMap B: %v", err)
 		}
 		first.RemoveMapping(e.ctx, msA, arA, 0, false)
 		msB := &recordingSpace{}
-		arB := hostarch.AddrRange{Start: 0x30000, End: 0x30000 + length}
+		arB := hostarch.AddrRange{Start: 0x30000, End: 0x30000 + hostarch.Addr(length)}
 		if err := optsB.Mappable.AddMapping(e.ctx, msB, arB, 0, false); err != nil {
 			t.Fatalf("AddMapping B: %v", err)
 		}
-		required := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+		required := memmap.MappableRange{Start: 0, End: uint64(hostarch.PageSize)}
 		ts, err := optsB.Mappable.Translate(e.ctx, required, required, hostarch.Read)
 		if err != nil || len(ts) == 0 {
 			t.Fatalf("Translate after the other mapping ended = (%v, %v), want a translation", ts, err)
@@ -983,15 +982,16 @@ func TestMappedPagesWriteBackAndStayCoherent(t *testing.T) {
 }
 
 func testMappedPagesWriteBackAndStayCoherent(t *testing.T, e *env) {
-	content := bytes.Repeat([]byte("a"), 3*hostarch.PageSize+100)
+	page := uint64(hostarch.PageSize)
+	content := bytes.Repeat([]byte("a"), 3*int(page)+100)
 	e.writeFile("m", content)
 	fd := e.mustOpen("m", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
 	m, ms, ar := e.mapFile(fd, uint64(len(content)), true)
 
 	rw := hostarch.ReadWrite
-	required := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
-	optional := memmap.MappableRange{Start: 0, End: 4 * hostarch.PageSize}
+	required := memmap.MappableRange{Start: 0, End: page}
+	optional := memmap.MappableRange{Start: 0, End: 4 * page}
 	ts, err := m.Translate(e.ctx, required, optional, rw)
 	if err != nil || len(ts) == 0 {
 		t.Fatalf("Translate = (%v, %v)", ts, err)
@@ -1047,8 +1047,8 @@ func testMappedPagesWriteBackAndStayCoherent(t *testing.T, e *env) {
 	}
 
 	// Beyond the end of the file a translation is a bus error.
-	m2, ms2, ar2 := e.mapFile(fd, 8*hostarch.PageSize, false)
-	_, err = m2.Translate(e.ctx, memmap.MappableRange{Start: 6 * hostarch.PageSize, End: 7 * hostarch.PageSize}, memmap.MappableRange{Start: 0, End: 8 * hostarch.PageSize}, hostarch.Read)
+	m2, ms2, ar2 := e.mapFile(fd, 8*page, false)
+	_, err = m2.Translate(e.ctx, memmap.MappableRange{Start: 6 * page, End: 7 * page}, memmap.MappableRange{Start: 0, End: 8 * page}, hostarch.Read)
 	var bus *memmap.BusError
 	if !errors.As(err, &bus) {
 		t.Fatalf("Translate beyond EOF = %v, want BusError", err)
@@ -1061,23 +1061,24 @@ func TestTruncateInvalidatesMappings(t *testing.T) {
 }
 
 func testTruncateInvalidatesMappings(t *testing.T, e *env) {
-	e.writeFile("m", bytes.Repeat([]byte("z"), 4*hostarch.PageSize))
+	page := uint64(hostarch.PageSize)
+	e.writeFile("m", bytes.Repeat([]byte("z"), 4*int(page)))
 	fd := e.mustOpen("m", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
-	m, ms, ar := e.mapFile(fd, 4*hostarch.PageSize, true)
-	if _, err := m.Translate(e.ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize}, memmap.MappableRange{Start: 0, End: 4 * hostarch.PageSize}, hostarch.ReadWrite); err != nil {
+	m, ms, ar := e.mapFile(fd, 4*page, true)
+	if _, err := m.Translate(e.ctx, memmap.MappableRange{Start: 0, End: page}, memmap.MappableRange{Start: 0, End: 4 * page}, hostarch.ReadWrite); err != nil {
 		t.Fatal(err)
 	}
-	if err := fd.SetStat(e.ctx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: hostarch.PageSize + 10}}); err != nil {
+	if err := fd.SetStat(e.ctx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: page + 10}}); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	ms.mu.Lock()
 	got := append([]hostarch.AddrRange(nil), ms.invalidated...)
 	ms.mu.Unlock()
-	if len(got) == 0 || got[0].Start != ar.Start+2*hostarch.PageSize {
+	if len(got) == 0 || got[0].Start != ar.Start+2*hostarch.Addr(page) {
 		t.Fatalf("invalidated ranges = %v, want a range starting at the second page boundary", got)
 	}
-	_, err := m.Translate(e.ctx, memmap.MappableRange{Start: 3 * hostarch.PageSize, End: 4 * hostarch.PageSize}, memmap.MappableRange{Start: 0, End: 4 * hostarch.PageSize}, hostarch.Read)
+	_, err := m.Translate(e.ctx, memmap.MappableRange{Start: 3 * page, End: 4 * page}, memmap.MappableRange{Start: 0, End: 4 * page}, hostarch.Read)
 	var bus *memmap.BusError
 	if !errors.As(err, &bus) {
 		t.Fatalf("Translate after truncate = %v, want BusError", err)
@@ -1115,11 +1116,12 @@ func TestMappedWriteBackFailureSurfacesAtSyncAndClose(t *testing.T) {
 }
 
 func testMappedWriteBackFailureSurfacesAtSyncAndClose(t *testing.T, e *env) {
-	e.writeFile("w", bytes.Repeat([]byte("q"), hostarch.PageSize))
+	page := uint64(hostarch.PageSize)
+	e.writeFile("w", bytes.Repeat([]byte("q"), int(page)))
 	fd := e.mustOpen("w", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
-	m, ms, ar := e.mapFile(fd, hostarch.PageSize, true)
-	ts, err := m.Translate(e.ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize}, memmap.MappableRange{Start: 0, End: hostarch.PageSize}, hostarch.ReadWrite)
+	m, ms, ar := e.mapFile(fd, page, true)
+	ts, err := m.Translate(e.ctx, memmap.MappableRange{Start: 0, End: page}, memmap.MappableRange{Start: 0, End: page}, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}

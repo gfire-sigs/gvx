@@ -202,6 +202,12 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 				seccomp.EqualTo(op),
 			})
 		}
+		// hostfs serves FALLOC_FL_KEEP_SIZE via fallocate(2); runsc's base
+		// filter allows only mode 0 and FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE.
+		rules.Add(unix.SYS_FALLOCATE, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(unix.FALLOC_FL_KEEP_SIZE),
+		})
 	}
 	if volumes && !hostDirs {
 		// An ext4lite volume holds an exclusive lock on its image file. The

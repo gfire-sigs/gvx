@@ -153,9 +153,10 @@ func runErofsMappingsCountEachPageOnce(t *testing.T, bs int) {
 	// the same cached file, such as an exec of a program that ran before.
 	fault := func() {
 		t.Helper()
+		page := uint64(hostarch.PageSize)
 		opts, _ := mappableOf(t, s, "/plain", size)
-		for pg := uint64(0); pg < size; pg += hostarch.PageSize {
-			required := memmap.MappableRange{Start: pg, End: pg + hostarch.PageSize}
+		for pg := uint64(0); pg < size; pg += page {
+			required := memmap.MappableRange{Start: pg, End: pg + page}
 			if _, err := opts.Mappable.Translate(s.ctx, required, required, hostarch.Read); err != nil {
 				t.Fatalf("Translate(page at %d): %v", pg, err)
 			}

@@ -54,7 +54,7 @@ func TestPReadFlushesOnlyTheChunksItOverlaps(t *testing.T) {
 	rw := hostarch.ReadWrite
 	write := func(off uint64, s string) {
 		t.Helper()
-		required := memmap.MappableRange{Start: off, End: off + hostarch.PageSize}
+		required := memmap.MappableRange{Start: off, End: off + uint64(hostarch.PageSize)}
 		ts, err := m.Translate(e.ctx, required, required, rw)
 		if err != nil || len(ts) == 0 {
 			t.Fatalf("Translate(%v) = (%v, %v)", required, ts, err)

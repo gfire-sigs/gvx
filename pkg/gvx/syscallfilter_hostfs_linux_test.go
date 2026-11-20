@@ -115,3 +115,56 @@ func flockArgReprs(t *testing.T, rules seccomp.SyscallRules, arg int) []string {
 	}
 	return out
 }
+
+func fallocateArgReprs(t *testing.T, rules seccomp.SyscallRules, arg int) []string {
+	t.Helper()
+	var out []string
+	if err := rules.ForSingleArgument(unix.SYS_FALLOCATE, arg, func(vm seccomp.ValueMatcher) error {
+		out = append(out, reprOf(vm))
+		return nil
+	}); err != nil {
+		t.Fatalf("ForSingleArgument(SYS_FALLOCATE, %d): %v", arg, err)
+	}
+	return out
+}
+
+// TestEmbedderRulesAllowFallocateKeepSizeForHostDirsOnly verifies that
+// embedderRules permits fallocate(FALLOC_FL_KEEP_SIZE) on non-negative
+// descriptors only when hostDirs is true, and that merged with config.Rules it
+// covers all three hostfs fallocate modes.
+func TestEmbedderRulesAllowFallocateKeepSizeForHostDirsOnly(t *testing.T) {
+	if embedderRules(Config{}, false, false).Has(unix.SYS_FALLOCATE) {
+		t.Fatal("embedderRules(hostDirs=false, volumes=false) must not allow fallocate")
+	}
+	if embedderRules(Config{}, false, true).Has(unix.SYS_FALLOCATE) {
+		t.Fatal("embedderRules(hostDirs=false, volumes=true) must not allow fallocate")
+	}
+
+	rules := embedderRules(Config{}, true, false)
+	if !rules.Has(unix.SYS_FALLOCATE) {
+		t.Fatal("embedderRules(hostDirs=true, volumes=false) lacks fallocate")
+	}
+	for _, r := range fallocateArgReprs(t, rules, 0) {
+		if r != reprOf(seccomp.NonNegativeFD{}) {
+			t.Fatalf("fallocate fd matcher = %q, want NonNegativeFD", r)
+		}
+	}
+	modes := fallocateArgReprs(t, rules, 1)
+	if len(modes) != 1 || !containsRepr(modes, seccomp.EqualTo(unix.FALLOC_FL_KEEP_SIZE)) {
+		t.Fatalf("embedderRules fallocate mode matchers = %v, want only FALLOC_FL_KEEP_SIZE", modes)
+	}
+
+	plat := platform.StaticSeccompInfo{PlatformName: "test", Filters: seccomp.NewSyscallRules()}
+	merged, _ := config.Rules(config.Options{Platform: plat, HostFilesystem: true})
+	merged.Merge(rules)
+	mergedModes := fallocateArgReprs(t, merged, 1)
+	for _, wantMode := range []uintptr{
+		0,
+		unix.FALLOC_FL_KEEP_SIZE,
+		unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE,
+	} {
+		if !containsRepr(mergedModes, seccomp.EqualTo(wantMode)) {
+			t.Errorf("merged hostfs rules lack fallocate mode %#x; got %v", wantMode, mergedModes)
+		}
+	}
+}

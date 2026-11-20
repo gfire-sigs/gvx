@@ -311,12 +311,13 @@ func TestSaveRestoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenAt(mapped.txt): %v", err)
 	}
-	initialMapped := bytes.Repeat([]byte("A"), hostarch.PageSize)
+	page := uint64(hostarch.PageSize)
+	initialMapped := bytes.Repeat([]byte("A"), int(page))
 	if _, err := mappedFD.Write(ctx, usermem.BytesIOSequence(initialMapped), vfs.WriteOptions{}); err != nil {
 		t.Fatalf("Write(mapped.txt): %v", err)
 	}
 	mmapOpts := &memmap.MMapOpts{
-		Length:   hostarch.PageSize,
+		Length:   page,
 		Offset:   0,
 		Perms:    hostarch.ReadWrite,
 		MaxPerms: hostarch.ReadWrite,
@@ -325,7 +326,7 @@ func TestSaveRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("ConfigureMMap(mapped.txt): %v", err)
 	}
 	mapSpace := &savableMappingSpace{}
-	mapAR := hostarch.AddrRange{Start: 0x40000, End: 0x40000 + hostarch.PageSize}
+	mapAR := hostarch.AddrRange{Start: 0x40000, End: 0x40000 + hostarch.Addr(page)}
 	if err := mmapOpts.Mappable.AddMapping(ctx, mapSpace, mapAR, 0, true); err != nil {
 		t.Fatalf("AddMapping(mapped.txt): %v", err)
 	}
@@ -333,12 +334,12 @@ func TestSaveRestoreRoundTrip(t *testing.T) {
 	if mmapOpts.MappingIdentity != nil {
 		mmapOpts.MappingIdentity.DecRef(ctx)
 	}
-	reqRange := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+	reqRange := memmap.MappableRange{Start: 0, End: page}
 	ts, err := mmapOpts.Mappable.Translate(ctx, reqRange, reqRange, hostarch.ReadWrite)
 	if err != nil || len(ts) == 0 {
 		t.Fatalf("Translate(mapped.txt) before save = (%v, %v)", ts, err)
 	}
-	bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: ts[0].Offset, End: ts[0].Offset + hostarch.PageSize}, hostarch.ReadWrite)
+	bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: ts[0].Offset, End: ts[0].Offset + page}, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatalf("MapInternal(mapped.txt) before save: %v", err)
 	}
@@ -861,8 +862,9 @@ func TestSaveRestoreUnlinkedMappedWithoutFDAndLinkableTmpfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenAt(unlinked_map.txt): %v", err)
 	}
+	page := uint64(hostarch.PageSize)
 	mmapOpts := &memmap.MMapOpts{
-		Length:   hostarch.PageSize,
+		Length:   page,
 		Offset:   0,
 		Perms:    hostarch.ReadWrite,
 		MaxPerms: hostarch.ReadWrite,
@@ -871,8 +873,8 @@ func TestSaveRestoreUnlinkedMappedWithoutFDAndLinkableTmpfile(t *testing.T) {
 		t.Fatalf("ConfigureMMap: %v", err)
 	}
 	mapSpace := &savableMappingSpace{}
-	mapAR := hostarch.AddrRange{Start: 0x300000, End: 0x300000 + hostarch.PageSize}
-	reqRange := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+	mapAR := hostarch.AddrRange{Start: 0x300000, End: 0x300000 + hostarch.Addr(page)}
+	reqRange := memmap.MappableRange{Start: 0, End: page}
 	if err := mmapOpts.Mappable.AddMapping(ctx, mapSpace, mapAR, 0, true); err != nil {
 		t.Fatalf("AddMapping: %v", err)
 	}

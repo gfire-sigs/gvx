@@ -154,13 +154,14 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 			return nil, false
 		}
 		sub := seg.Range().Intersect(blockAR)
-		for p := sub.Start; p < sub.End; p += hostarch.PageSize {
-			i := uint64(p-blockAR.Start) / hostarch.PageSize
+		pageSize := uint64(hostarch.PageSize)
+		for p := sub.Start; p < sub.End; p += hostarch.Addr(pageSize) {
+			i := uint64(p-blockAR.Start) / pageSize
 			off := pma.off + uint64(p-seg.Start())
 			if present == 0 {
-				firstOff = off - i*hostarch.PageSize
-				alreadyAligned = off >= i*hostarch.PageSize && firstOff%hostBlockSize == 0
-			} else if off != firstOff+i*hostarch.PageSize {
+				firstOff = off - i*pageSize
+				alreadyAligned = off >= i*pageSize && firstOff%hostBlockSize == 0
+			} else if off != firstOff+i*pageSize {
 				alreadyAligned = false
 			}
 			present |= 1 << i
@@ -169,7 +170,7 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 			return nil, false
 		}
 	}
-	const allPages = 1<<(hostBlockSize/hostarch.PageSize) - 1
+	allPages := uint8(1<<(hostBlockSize/uint64(hostarch.PageSize)) - 1)
 	if present == 0 {
 		return nil, false
 	}
@@ -182,11 +183,11 @@ func (mm *MemoryManager) coalescePrivateBlockLocked(ctx context.Context, blockAR
 		if !canOwn {
 			return nil, false
 		}
-		for i := uint64(0); i < hostBlockSize/hostarch.PageSize; i++ {
+		for i := uint64(0); i < hostBlockSize/uint64(hostarch.PageSize); i++ {
 			if spare&(1<<i) == 0 {
 				continue
 			}
-			if vseg := mm.vmas.FindSegment(blockAR.Start + hostarch.Addr(i*hostarch.PageSize)); vseg.Ok() && vseg.ValuePtr().effectivePerms.Any() {
+			if vseg := mm.vmas.FindSegment(blockAR.Start + hostarch.Addr(i*uint64(hostarch.PageSize))); vseg.Ok() && vseg.ValuePtr().effectivePerms.Any() {
 				return nil, false
 			}
 		}

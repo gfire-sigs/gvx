@@ -40,10 +40,10 @@ seam pkg/sentry/fsimpl/erofs/regular_file.go
 # (pkg/sentry/fsimpl/erofs/save_restore.go).
 seam pkg/sentry/fsimpl/erofs/save_restore.go
 
-# pkg/hostarch: darwin/arm64 has its own 4KB constants in hostarch_darwin_arm64_4k.go.
-# The upstream 4KB file excludes darwin so that exactly one of the page-size files applies.
-expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !darwin && !pagesize_64k
-expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !darwin && !pagesize_64k
+# pkg/hostarch: 16 KB hosts (darwin/arm64, linux/arm64-16k, android/arm64-16k) keep
+# 4 KB guest pages (pkg/hostarch/hostarch_arm64_xplat.go), and darwin/arm64 avoids
+# emitting a stderr warning at init.
+seam pkg/hostarch/hostarch_arm64.go
 
 # Content seam: the overlay keeps unused dentries for later lookups
 # (pkg/sentry/fsimpl/overlay/dentry_cache_xplat.go). Upstream destroys a dentry at its

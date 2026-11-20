@@ -38,3 +38,12 @@ func toLinuxErr(err error) error {
 	}
 	return linuxerr.EIO
 }
+
+// toWriteOpErr keeps errSpaceHeld distinguishable for retryHeld across
+// concurrent flushes while translating all other engine errors to Linux errors.
+func toWriteOpErr(err error) error {
+	if errors.Is(err, errSpaceHeld) {
+		return err
+	}
+	return toLinuxErr(err)
+}

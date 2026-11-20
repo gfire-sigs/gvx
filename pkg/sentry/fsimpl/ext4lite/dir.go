@@ -263,13 +263,17 @@ func (b *dirBlock) image() []byte {
 // initDir gives a new directory its first block with the entries . and ..
 // The caller sets the link count.
 func (n *node) initDir(parent uint32) error {
+	return n.initDirPolicy(parent, allocReuseHeld)
+}
+
+func (n *node) initDirPolicy(parent uint32, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	blk, _, err := n.v.allocBlocks(0, 1)
+	blk, _, err := n.v.allocBlocksPolicy(0, 1, policy)
 	if err != nil {
 		return err
 	}
-	if err := n.setExtentsLocked([]extent{{lblk: 0, n: 1, pblk: blk}}); err != nil {
+	if err := n.setExtentsPolicyLocked([]extent{{lblk: 0, n: 1, pblk: blk}}, policy); err != nil {
 		_ = n.v.freeBlocks(blk, 1)
 		return err
 	}
@@ -361,6 +365,10 @@ func (b *dirBlock) emptyWithout(e *dirEntry) bool {
 
 // addEntry adds name for inode ino. It returns EEXIST when name exists.
 func (n *node) addEntry(name string, ino uint32, ft uint8) error {
+	return n.addEntryPolicy(name, ino, ft, allocReuseHeld)
+}
+
+func (n *node) addEntryPolicy(name string, ino uint32, ft uint8, policy allocPolicy) error {
 	if err := validName(name); err != nil {
 		return err
 	}
@@ -392,7 +400,7 @@ func (n *node) addEntry(name string, ino uint32, ft uint8) error {
 		}
 	}
 	if !placed {
-		b, err := n.appendDirBlockLocked()
+		b, err := n.appendDirBlockLocked(policy)
 		if err != nil {
 			return err
 		}
@@ -406,7 +414,7 @@ func (n *node) addEntry(name string, ino uint32, ft uint8) error {
 }
 
 // appendDirBlockLocked adds one empty block at the end of the directory.
-func (n *node) appendDirBlockLocked() (*dirBlock, error) {
+func (n *node) appendDirBlockLocked(policy allocPolicy) (*dirBlock, error) {
 	if uint64(len(n.dir.blocks)) >= maxDirBlocks {
 		return nil, linuxerr.ENOSPC
 	}
@@ -414,12 +422,12 @@ func (n *node) appendDirBlockLocked() (*dirBlock, error) {
 	if k := len(n.exts); k > 0 {
 		goal = n.exts[k-1].pend()
 	}
-	phys, _, err := n.v.allocBlocks(goal, 1)
+	phys, _, err := n.v.allocBlocksPolicy(goal, 1, policy)
 	if err != nil {
 		return nil, err
 	}
 	lb := uint32(n.size / blockSize)
-	if err := n.setExtentsLocked(insertMapping(n.exts, extent{lblk: lb, n: 1, pblk: phys})); err != nil {
+	if err := n.setExtentsPolicyLocked(insertMapping(n.exts, extent{lblk: lb, n: 1, pblk: phys}), policy); err != nil {
 		_ = n.v.freeBlocks(phys, 1)
 		return nil, err
 	}

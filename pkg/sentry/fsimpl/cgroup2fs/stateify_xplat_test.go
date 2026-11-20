@@ -68,7 +68,7 @@ type testSRPlatform struct{ platform.Platform }
 
 func (testSRPlatform) SupportsAddressSpaceIO() bool                { return false }
 func (testSRPlatform) CooperativelySchedulesAddressSpace() bool    { return false }
-func (testSRPlatform) MinUserAddress() hostarch.Addr               { return hostarch.PageSize }
+func (testSRPlatform) MinUserAddress() hostarch.Addr               { return hostarch.Addr(hostarch.PageSize) }
 func (testSRPlatform) MaxUserAddress() hostarch.Addr               { return 0x0000_7fff_ffff_f000 }
 func (testSRPlatform) MapUnit() uint64                             { return 0 }
 func (testSRPlatform) HasCPUNumbers() bool                         { return false }
@@ -161,7 +161,7 @@ func bootTestKernelWithInitTask(t *testing.T, opts MemoryEnforcerOptions) (*kern
 	}
 
 	tk := kernel.NewTimekeeper()
-	paramsRange, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.System})
+	paramsRange, err := mf.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		t.Fatalf("mf.Allocate: %v", err)
 	}

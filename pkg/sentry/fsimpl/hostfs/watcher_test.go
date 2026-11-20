@@ -406,12 +406,13 @@ func TestHostWatcherKeepsMappedPagesCoherent(t *testing.T) {
 // its bytes.
 func readMappedPage(t *testing.T, e *env, m memmap.Mappable) []byte {
 	t.Helper()
-	ts, err := m.Translate(e.ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize},
-		memmap.MappableRange{Start: 0, End: hostarch.PageSize}, hostarch.Read)
+	page := uint64(hostarch.PageSize)
+	ts, err := m.Translate(e.ctx, memmap.MappableRange{Start: 0, End: page},
+		memmap.MappableRange{Start: 0, End: page}, hostarch.Read)
 	if err != nil || len(ts) == 0 {
 		t.Fatalf("Translate = (%v, %v)", ts, err)
 	}
-	bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: ts[0].Offset, End: ts[0].Offset + hostarch.PageSize}, hostarch.Read)
+	bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: ts[0].Offset, End: ts[0].Offset + page}, hostarch.Read)
 	if err != nil {
 		t.Fatalf("MapInternal: %v", err)
 	}
@@ -420,11 +421,12 @@ func readMappedPage(t *testing.T, e *env, m memmap.Mappable) []byte {
 
 func testMappedPagesFollowHostWrites(t *testing.T, w *watchEnv, watchDir bool) {
 	w.mustMkdir("d")
-	old := bytes.Repeat([]byte("o"), hostarch.PageSize)
+	page := uint64(hostarch.PageSize)
+	old := bytes.Repeat([]byte("o"), int(page))
 	w.writeFile("d/m", old)
 	fd := w.mustOpen("d/m", linux.O_RDONLY)
 	defer fd.DecRef(w.env.ctx)
-	m, ms, ar := w.mapFile(fd, hostarch.PageSize, false)
+	m, ms, ar := w.mapFile(fd, page, false)
 	defer m.RemoveMapping(w.env.ctx, ms, ar, 0, false)
 
 	read := func() []byte {
@@ -444,7 +446,7 @@ func testMappedPagesFollowHostWrites(t *testing.T, w *watchEnv, watchDir bool) {
 
 	// The new bytes have the same length. A later modification time is the
 	// only sign of the change, as with an editor that saves in place.
-	fresh := bytes.Repeat([]byte("N"), hostarch.PageSize)
+	fresh := bytes.Repeat([]byte("N"), int(page))
 	hostWrite(t, w.host("d/m"), string(fresh))
 	later := time.Now().Add(3 * time.Second)
 	if err := os.Chtimes(w.host("d/m"), later, later); err != nil {
@@ -474,7 +476,7 @@ func testMappedPagesFollowHostWrites(t *testing.T, w *watchEnv, watchDir bool) {
 	if got := read(); !bytes.Equal(got, fresh) {
 		t.Fatalf("mapped read after the event = %q, want the new bytes", got[:8])
 	}
-	buf := make([]byte, hostarch.PageSize)
+	buf := make([]byte, page)
 	if n, err := fd.PRead(w.env.ctx, usermem.BytesIOSequence(buf), 0, vfs.ReadOptions{}); err != nil || int(n) != len(buf) || !bytes.Equal(buf, fresh) {
 		t.Fatalf("pread after the event = (%d, %v), want the new bytes", n, err)
 	}
@@ -482,12 +484,13 @@ func testMappedPagesFollowHostWrites(t *testing.T, w *watchEnv, watchDir bool) {
 
 func TestHostWatcherKeepsGuestModifiedChunks(t *testing.T) {
 	w := newWatchEnv(t)
-	w.writeFile("m", bytes.Repeat([]byte("a"), 2*hostarch.PageSize))
+	page := uint64(hostarch.PageSize)
+	w.writeFile("m", bytes.Repeat([]byte("a"), 2*int(page)))
 	fd := w.mustOpen("m", linux.O_RDWR)
 	defer fd.DecRef(w.env.ctx)
-	m, ms, ar := w.mapFile(fd, 2*hostarch.PageSize, true)
-	ts, err := m.Translate(w.env.ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize},
-		memmap.MappableRange{Start: 0, End: 2 * hostarch.PageSize}, hostarch.ReadWrite)
+	m, ms, ar := w.mapFile(fd, 2*page, true)
+	ts, err := m.Translate(w.env.ctx, memmap.MappableRange{Start: 0, End: page},
+		memmap.MappableRange{Start: 0, End: 2 * page}, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatalf("Translate: %v", err)
 	}
@@ -499,7 +502,7 @@ func TestHostWatcherKeepsGuestModifiedChunks(t *testing.T) {
 
 	w.add("m", hostEventMask)
 	w.settle()
-	hostWrite(t, w.host("m"), string(bytes.Repeat([]byte("h"), 2*hostarch.PageSize+1)))
+	hostWrite(t, w.host("m"), string(bytes.Repeat([]byte("h"), 2*int(page)+1)))
 	w.sync()
 	w.expect("after host write", "MODIFY ")
 
@@ -601,9 +604,10 @@ func TestHostWatcherSuppressesGuestEchoes(t *testing.T) {
 	step("mapped write and write-back", func() {
 		fd := w.mustOpen("d/over", linux.O_RDWR)
 		defer fd.DecRef(w.env.ctx)
-		m, ms, ar := w.mapFile(fd, hostarch.PageSize, true)
-		ts, err := m.Translate(w.env.ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize},
-			memmap.MappableRange{Start: 0, End: hostarch.PageSize}, hostarch.ReadWrite)
+		page := uint64(hostarch.PageSize)
+		m, ms, ar := w.mapFile(fd, page, true)
+		ts, err := m.Translate(w.env.ctx, memmap.MappableRange{Start: 0, End: page},
+			memmap.MappableRange{Start: 0, End: page}, hostarch.ReadWrite)
 		if err != nil {
 			t.Fatal(err)
 		}

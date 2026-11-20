@@ -28,10 +28,11 @@ import (
 
 func TestCanSkipUsageScan(t *testing.T) {
 	cgroups := map[uint32]struct{}{1: {}}
-	if !canSkipUsageScan(nil) {
-		t.Error("canSkipUsageScan(nil) = false, want true: a scan of all memory trusts the block count")
+	wantAll := runtime.GOOS != "windows"
+	if got := canSkipUsageScan(nil); got != wantAll {
+		t.Errorf("canSkipUsageScan(nil) on %s = %t, want %t", runtime.GOOS, got, wantAll)
 	}
-	want := (runtime.GOOS == "linux" || runtime.GOOS == "android") && unix.Getpagesize() <= hostarch.PageSize
+	want := (runtime.GOOS == "linux" || runtime.GOOS == "android") && unix.Getpagesize() <= int(hostarch.PageSize)
 	if got := canSkipUsageScan(cgroups); got != want {
 		t.Errorf("canSkipUsageScan(one cgroup) on %s = %t, want %t", runtime.GOOS, got, want)
 	}
@@ -39,7 +40,7 @@ func TestCanSkipUsageScan(t *testing.T) {
 
 func TestMincoreExpandHostPages(t *testing.T) {
 	const hostPage = 16 << 10
-	const guestPage = hostarch.PageSize
+	guestPage := hostarch.PageSize
 	raw := make([]byte, 3*hostPage)
 	rawAddr := uintptr(unsafe.Pointer(&raw[0]))
 	base := (rawAddr + hostPage - 1) &^ (hostPage - 1)

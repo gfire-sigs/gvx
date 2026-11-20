@@ -52,6 +52,10 @@ func parseAllocMode(mode uint64) (op allocOp, keepSize bool, err error) {
 // nothing when the call fails. The caller checked that the end of the range
 // lies within maxFileSize.
 func (n *node) zeroRange(off, length uint64, keepSize bool) error {
+	return n.zeroRangePolicy(off, length, keepSize, allocReuseHeld)
+}
+
+func (n *node) zeroRangePolicy(off, length uint64, keepSize bool, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	end := off + length
@@ -62,11 +66,11 @@ func (n *node) zeroRange(off, length uint64, keepSize bool) error {
 				n.markDirtyLocked()
 			}
 			if !keepSize && end > n.size {
-				return n.truncateLocked(end)
+				return n.truncatePolicyLocked(end, policy)
 			}
 			return nil
 		}
-		if err := n.convertInlineLocked(); err != nil {
+		if err := n.convertInlinePolicyLocked(policy); err != nil {
 			return err
 		}
 	}
@@ -84,11 +88,11 @@ func (n *node) zeroRange(off, length uint64, keepSize bool) error {
 	// space. A failed call then has changed no byte. The edge blocks lie outside
 	// the blocks that the mapping converts.
 	if first < last {
-		list, fresh, err := n.zeroMappingLocked(uint32(first), uint32(last))
+		list, fresh, err := n.zeroMappingLocked(uint32(first), uint32(last), policy)
 		if err != nil {
 			return err
 		}
-		if err := n.installMappingLocked(list, fresh, allBlocks); err != nil {
+		if err := n.installMappingPolicyLocked(list, fresh, allBlocks, policy); err != nil {
 			return err
 		}
 	}
@@ -127,12 +131,12 @@ func (n *node) clearEdgesLocked(edges [][2]uint64) error {
 // [lb0, lb1) turn into uninitialized blocks, and the new runs that the list
 // adds. A failure frees the new runs and returns no list. The caller installs
 // the list and owns the new runs from then on.
-func (n *node) zeroMappingLocked(lb0, lb1 uint32) (list, fresh []extent, err error) {
+func (n *node) zeroMappingLocked(lb0, lb1 uint32, policy allocPolicy) (list, fresh []extent, err error) {
 	out := make([]extent, 0, len(n.exts)+2)
 	pos := lb0
 	fill := func(until uint32) error {
 		for pos < until {
-			blk, got, err := n.v.allocBlocks(n.goalLocked(fresh, pos), min(until-pos, maxUninitExtentLen))
+			blk, got, err := n.v.allocBlocksPolicy(n.goalLocked(fresh, pos), min(until-pos, maxUninitExtentLen), policy)
 			if err != nil {
 				return err
 			}
@@ -195,6 +199,10 @@ func (n *node) zeroMappingLocked(lb0, lb1 uint32) (list, fresh []extent, err err
 // alignment and a range that ends below the end of the file, because a range
 // to the end is a truncate.
 func (n *node) collapseRange(off, length uint64) error {
+	return n.collapseRangePolicy(off, length, allocReuseHeld)
+}
+
+func (n *node) collapseRangePolicy(off, length uint64, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if (off|length)%blockSize != 0 || off+length >= n.size {
@@ -212,7 +220,7 @@ func (n *node) collapseRange(off, length uint64) error {
 		}
 		list = appendRun(list, e)
 	}
-	if err := n.setExtentsLocked(list); err != nil {
+	if err := n.setExtentsPolicyLocked(list, policy); err != nil {
 		return err
 	}
 	var errs []error
@@ -229,6 +237,10 @@ func (n *node) collapseRange(off, length uint64) error {
 // and the size grows by length. Linux demands block alignment and an offset
 // below the end of the file.
 func (n *node) insertRange(off, length uint64) error {
+	return n.insertRangePolicy(off, length, allocReuseHeld)
+}
+
+func (n *node) insertRangePolicy(off, length uint64, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if (off|length)%blockSize != 0 {
@@ -240,7 +252,7 @@ func (n *node) insertRange(off, length uint64) error {
 	if off >= n.size {
 		return linuxerr.EINVAL
 	}
-	if err := n.convertInlineLocked(); err != nil {
+	if err := n.convertInlinePolicyLocked(policy); err != nil {
 		return err
 	}
 	if n.flags&flagExtents == 0 || n.isDir() {
@@ -263,7 +275,7 @@ func (n *node) insertRange(off, length uint64) error {
 		e.lblk += shift
 		list = appendRun(list, e)
 	}
-	if err := n.setExtentsLocked(list); err != nil {
+	if err := n.setExtentsPolicyLocked(list, policy); err != nil {
 		return err
 	}
 	n.size += length

@@ -38,16 +38,21 @@ const (
 
 // canSkipUsageScan reports whether UpdateUsage may skip its scan because the
 // usage of the memory file equals the committed bytes that it already knows.
-// The usage is the block count of the file. Linux updates the count when a
-// page commits. macOS updates it late, by up to 15 seconds in a measurement.
-// A host with pages larger than 4 KB commits a whole host page when one guest
-// sub-page faults. The scan for memory cgroups therefore runs whenever the
-// host page exceeds 4 KB or the host is neither Linux nor Android.
+// On Unix, TotalUsage reads the block count of the backing file. Linux updates
+// that count when a page commits, while macOS updates it late by up to 15
+// seconds. On Windows, MemoryFile uses anonymous virtual memory and TotalUsage
+// returns knownCommittedBytes, so Windows must always run the QueryWorkingSetEx
+// scan. A host with pages larger than 4 KB commits a whole host page when one
+// guest sub-page faults, so per-cgroup scans also run whenever the host page
+// exceeds 4 KB or the host is neither Linux nor Android.
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
 	if memCgIDs == nil {
 		return true
 	}
-	if unix.Getpagesize() > hostarch.PageSize {
+	if unix.Getpagesize() > int(hostarch.PageSize) {
 		return false
 	}
 	return runtime.GOOS == "linux" || runtime.GOOS == "android"
@@ -60,11 +65,21 @@ func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 // enclosing host pages and copies each host-page result to its guest sub-pages.
 func mincoreGuestPages(s, buf []byte) error {
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		if hostPage := uintptr(unix.Getpagesize()); hostPage > hostarch.PageSize {
+		if hostPage := uintptr(unix.Getpagesize()); hostPage > uintptr(hostarch.PageSize) {
 			return mincoreExpandHostPages(s, buf, hostPage, rawMincore)
 		}
 	}
 	return mincore(s, buf)
+}
+
+// queryResidentPages populates buf with per-guest-page residency for fr and
+// invokes any host-specific external residency observers without holding f.mu.
+func (f *MemoryFile) queryResidentPages(fr memmap.FileRange, s, buf []byte) error {
+	if err := mincoreGuestPages(s, buf); err != nil {
+		return err
+	}
+	f.scanExternalResidency(fr, buf)
+	return nil
 }
 
 func rawMincore(base, span uintptr, vec []byte) error {
@@ -83,7 +98,7 @@ func mincoreExpandHostPages(s, buf []byte, hostPage uintptr, query func(base, sp
 		return nil
 	}
 	addr := uintptr(unsafe.Pointer(&s[0]))
-	if addr&(hostarch.PageSize-1) != 0 {
+	if addr&(uintptr(hostarch.PageSize)-1) != 0 {
 		return unix.EINVAL
 	}
 	length := uintptr(len(s))
@@ -93,9 +108,9 @@ func mincoreExpandHostPages(s, buf []byte, hostPage uintptr, query func(base, sp
 	if err := query(base, span, resident); err != nil {
 		return err
 	}
-	pages := int((length + hostarch.PageSize - 1) / hostarch.PageSize)
+	pages := int((length + uintptr(hostarch.PageSize) - 1) / uintptr(hostarch.PageSize))
 	for i := range pages {
-		buf[i] = resident[(addr-base+uintptr(i)*hostarch.PageSize)/hostPage]
+		buf[i] = resident[(addr-base+uintptr(i)*uintptr(hostarch.PageSize))/hostPage]
 	}
 	return nil
 }

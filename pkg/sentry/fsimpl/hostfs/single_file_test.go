@@ -271,16 +271,17 @@ func TestSingleFileReadOnly(t *testing.T) {
 }
 
 func TestSingleFileSyncAllocateAndMap(t *testing.T) {
-	s := newSingleEnv(t, string(bytes.Repeat([]byte("a"), 2*hostarch.PageSize)), false)
+	page := uint64(hostarch.PageSize)
+	s := newSingleEnv(t, string(bytes.Repeat([]byte("a"), 2*int(page))), false)
 	fd := s.mustOpen("mp", linux.O_RDWR)
 	defer fd.DecRef(s.ctx)
 	if err := fd.Sync(s.ctx); err != nil {
 		t.Fatalf("fsync: %v", err)
 	}
-	if err := fd.Allocate(s.ctx, 0, 0, 4*hostarch.PageSize); err != nil {
+	if err := fd.Allocate(s.ctx, 0, 0, 4*page); err != nil {
 		t.Fatalf("fallocate: %v", err)
 	}
-	if got := s.mustStat("mp").Size; got != 4*hostarch.PageSize {
+	if got := s.mustStat("mp").Size; got != 4*page {
 		t.Fatalf("size after fallocate = %d", got)
 	}
 	if err := fd.Allocate(s.ctx, linux.FALLOC_FL_PUNCH_HOLE|linux.FALLOC_FL_KEEP_SIZE, 0, 100); err != nil {
@@ -290,7 +291,7 @@ func TestSingleFileSyncAllocateAndMap(t *testing.T) {
 		t.Fatalf("punched range reads %v", got)
 	}
 
-	m, ms, ar := s.mapFile(fd, 4*hostarch.PageSize, true)
+	m, ms, ar := s.mapFile(fd, 4*page, true)
 	copy(mappedView(t, s.env, m, hostarch.ReadWrite, 200, 6), "MAPPED")
 	if err := fd.Sync(s.ctx); err != nil {
 		t.Fatalf("fsync with a mapping: %v", err)

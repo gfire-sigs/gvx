@@ -40,10 +40,13 @@ const (
 	holeStart  = 0x8000_0000
 	holeEnd    = 0x1_0000_0000
 	holeMax    = 0x2_0000_0000
-	holePage   = hostarch.Addr(hostarch.PageSize)
 	holeGiB    = uint64(1) << 30
-	holeSmall  = uint64(hostarch.PageSize)
 	topDownLow = 0x1_4000_0000 // The part of the range above the hole is 1 GiB.
+)
+
+var (
+	holePage  = hostarch.Addr(hostarch.PageSize)
+	holeSmall = uint64(hostarch.PageSize)
 )
 
 // findAvailable calls findAvailableLocked with mm.mappingMu held for reading.

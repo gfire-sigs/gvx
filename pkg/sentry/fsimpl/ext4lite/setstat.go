@@ -101,18 +101,22 @@ func (i *inode) setAtime(mnt *vfs.Mount) {
 
 // truncate sets the size of a regular file and trims the mapped-page cache.
 func (i *inode) truncate(size uint64) error {
-	i.wmu.Lock()
-	defer i.wmu.Unlock()
-	return i.truncateLocked(size)
+	return toLinuxErr(i.truncatePolicy(size, allocReuseHeld))
 }
 
-// truncateLocked is truncate for a caller that holds i.wmu.
-func (i *inode) truncateLocked(size uint64) error {
+func (i *inode) truncatePolicy(size uint64, policy allocPolicy) error {
+	i.wmu.Lock()
+	defer i.wmu.Unlock()
+	return i.truncatePolicyLocked(size, policy)
+}
+
+// truncatePolicyLocked is truncatePolicy for a caller that holds i.wmu.
+func (i *inode) truncatePolicyLocked(size uint64, policy allocPolicy) error {
 	i.n.mu.RLock()
 	old := i.n.size
 	i.n.mu.RUnlock()
-	if err := i.n.truncate(size); err != nil {
-		return toLinuxErr(err)
+	if err := i.n.truncatePolicy(size, policy); err != nil {
+		return toWriteOpErr(err)
 	}
 	i.data.truncated(old, size)
 	i.touchMCtime()
@@ -138,13 +142,13 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.M
 			return err
 		}
 	}
-	return i.fs.writeOp(mnt, func() error {
+	return i.fs.writeOp(mnt, func(policy allocPolicy) error {
 		bumpC := false
 		if mask&linux.STATX_SIZE != 0 {
 			if err := fsutilx.CheckTruncateFileType(uint32(i.kind)); err != nil {
 				return err
 			}
-			if err := i.truncate(stat.Size); err != nil {
+			if err := i.truncatePolicy(stat.Size, policy); err != nil {
 				return err
 			}
 		}
@@ -190,8 +194,8 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.M
 		})
 		if opts.ClearPrivs {
 			// A change of the content or the owner removes the file capabilities.
-			if err := i.n.removeXattr(linux.XATTR_SECURITY_CAPABILITY); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
-				return toLinuxErr(err)
+			if err := i.n.removeXattrPolicy(linux.XATTR_SECURITY_CAPABILITY, policy); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
+				return toWriteOpErr(err)
 			}
 		}
 		return nil

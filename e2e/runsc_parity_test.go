@@ -105,13 +105,6 @@ func TestE2EMemoryCgroupLimits(t *testing.T) {
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			requireFixedAddressBackend(t, b)
-			if runtime.GOOS == "windows" && b.plat == gvx.PlatformSystrap {
-				// The systrap engine runs guest code in stub processes. The
-				// Sentry finds committed pages with QueryWorkingSetEx, which sees
-				// only the working set of the Sentry process, so pages that a stub
-				// writes can stay uncounted. docs/recipes/docker-engine.md, section 7.4.
-				t.Skip("memory cgroup accounting is incomplete under the Windows systrap engine")
-			}
 			code, out := runParityProbe(t, b, bin, false, "memcg")
 			if code != 0 || !strings.Contains(out, "DONE") {
 				t.Fatalf("parityprobe memcg exited with %d\n%s", code, out)
@@ -136,9 +129,6 @@ func TestE2EMemoryCgroupIdleUsage(t *testing.T) {
 	for _, b := range fixedAddressBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			requireFixedAddressBackend(t, b)
-			if runtime.GOOS == "windows" && b.plat == gvx.PlatformSystrap {
-				t.Skip("memory cgroup accounting is incomplete under the Windows systrap engine")
-			}
 			code, out := runParityProbe(t, b, bin, false, "memcg-idle")
 			if code != 0 || !strings.Contains(out, "DONE") {
 				t.Fatalf("parityprobe memcg-idle exited with %d\n%s", code, out)

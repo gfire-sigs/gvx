@@ -323,7 +323,7 @@ func (blk *execBlock) frameID() (frameKey, bool) {
 	if blk.srcSec == nil || blk.srcSec.file == 0 {
 		return frameKey{}, false
 	}
-	return frameKey{blk.srcSec.file, blk.srcOff}, true
+	return frameKey{blk.srcSec.file, blk.srcSec.fileBase + blk.srcOff}, true
 }
 
 // lowerAliasLocked makes the view page at va read-only when it is a writable
@@ -335,10 +335,11 @@ func (as *addressSpace) lowerAliasLocked(va uint64, key frameKey) error {
 		return nil
 	}
 	vi, _, ok := as.win.Lookup(va)
-	if !ok || vi.prot != viewReadWrite || vi.off != key.off {
+	if !ok || vi.prot != viewReadWrite {
 		return nil
 	}
-	if sec, ok := vi.backing.(*sectionRef); !ok || sec.file != key.file {
+	sec, ok := vi.backing.(*sectionRef)
+	if !ok || sec.file != key.file || sec.fileBase+vi.off != key.off {
 		return nil
 	}
 	if err := as.win.Protect(va, blockSize, viewRead); err != nil {
@@ -554,11 +555,11 @@ func (as *addressSpace) lowersOwnFrame(addr, pc uint64) bool {
 // read-only view. Callers hold as.mu.
 func (as *addressSpace) aliasStillLoweredLocked(page uint64, key frameKey) bool {
 	vi, _, ok := as.win.Lookup(page)
-	if !ok || vi.prot != viewRead || vi.off != key.off {
+	if !ok || vi.prot != viewRead {
 		return false
 	}
 	sec, ok := vi.backing.(*sectionRef)
-	return ok && sec.file == key.file
+	return ok && sec.file == key.file && sec.fileBase+vi.off == key.off
 }
 
 // dropExecCopy returns the block of an installed copy to data state, as

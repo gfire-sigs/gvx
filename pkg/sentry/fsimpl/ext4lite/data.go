@@ -100,12 +100,16 @@ func (n *node) serializeInline(raw []byte) {
 // convertInlineLocked moves the inline content into extents. An empty file
 // gets no block. It changes nothing when it fails.
 func (n *node) convertInlineLocked() error {
+	return n.convertInlinePolicyLocked(allocReuseHeld)
+}
+
+func (n *node) convertInlinePolicyLocked(policy allocPolicy) error {
 	if n.flags&flagInlineData == 0 {
 		return nil
 	}
 	var list []extent
 	if len(n.inline) > 0 {
-		blk, _, err := n.v.allocBlocks(0, 1)
+		blk, _, err := n.v.allocBlocksPolicy(0, 1, policy)
 		if err != nil {
 			return err
 		}
@@ -119,7 +123,7 @@ func (n *node) convertInlineLocked() error {
 	flags, inline := n.flags, n.inline
 	n.flags = flags&^flagInlineData | flagExtents
 	n.inline = nil
-	if err := n.setExtentsLocked(list); err != nil {
+	if err := n.setExtentsPolicyLocked(list, policy); err != nil {
 		n.flags, n.inline = flags, inline
 		if len(list) > 0 {
 			return joinCleanup(err, n.v.freeBlocks(list[0].pblk, 1))
@@ -186,7 +190,11 @@ func (n *node) readAtLocked(p []byte, off int64) (int, error) {
 // data through to the host file. It extends the size of the file. It returns
 // the number of bytes that it wrote and an error that explains a short write.
 func (n *node) writeAt(p []byte, off int64) (int, error) {
-	return n.writeRange(p, off, false)
+	return n.writeRange(p, off, false, allocReuseHeld)
+}
+
+func (n *node) writeAtPolicy(p []byte, off int64, policy allocPolicy) (int, error) {
+	return n.writeRange(p, off, false, policy)
 }
 
 // writeBackAt writes the part of p that lies below the current size. A page
@@ -197,14 +205,14 @@ func (n *node) writeBackAt(p []byte, off int64) (int, error) {
 	// triggers it, so it enters the gate itself. The gate accepts a nested entry.
 	n.v.gate.enterInner()
 	defer n.v.gate.exit()
-	return n.writeRange(p, off, true)
+	return n.writeRange(p, off, true, allocGrowHeld)
 }
 
 // writeRange writes p at off. When the volume has freed space that waits for a
-// flush, it returns errSpaceHeld. The caller flushes with the operation gate open
-// and tries again, because a flush cannot run inside the gate.
-func (n *node) writeRange(p []byte, off int64, back bool) (int, error) {
-	return n.writeOnce(p, off, back)
+// flush, allocReuseHeld returns errSpaceHeld while allocGrowHeld appends a
+// group unless the host has no room.
+func (n *node) writeRange(p []byte, off int64, back bool, policy allocPolicy) (int, error) {
+	return n.writeOnce(p, off, back, policy)
 }
 
 // hasHeld reports whether freed blocks or inodes wait for a flush.
@@ -216,7 +224,7 @@ func (v *volume) hasHeld() bool {
 
 // writeOnce writes as much of p at off as one mapping step allows. A back write
 // stops at the current size.
-func (n *node) writeOnce(p []byte, off int64, back bool) (int, error) {
+func (n *node) writeOnce(p []byte, off int64, back bool, policy allocPolicy) (int, error) {
 	if off < 0 {
 		return 0, linuxerr.EINVAL
 	}
@@ -245,22 +253,22 @@ func (n *node) writeOnce(p []byte, off int64, back bool) (int, error) {
 			n.markDirtyLocked()
 			return len(p), nil
 		}
-		if err := n.convertInlineLocked(); err != nil {
+		if err := n.convertInlinePolicyLocked(policy); err != nil {
 			return 0, err
 		}
 	}
 	if n.flags&flagExtents == 0 || n.isDir() {
 		return 0, linuxerr.EINVAL
 	}
-	return n.writeExtentsLocked(p, uint64(off), end)
+	return n.writeExtentsLocked(p, uint64(off), end, policy)
 }
 
 // writeExtentsLocked writes p, which ends at end, through the mapping of an
 // extent node. It plans the mapping of the write, writes the data, and then
 // installs the blocks that the data fills. A failed host write keeps only the
 // blocks that it filled. The caller holds n.mu for writing.
-func (n *node) writeExtentsLocked(p []byte, off, end uint64) (int, error) {
-	plan := n.planLocked(off, end, false)
+func (n *node) writeExtentsLocked(p []byte, off, end uint64, policy allocPolicy) (int, error) {
+	plan := n.planPolicyLocked(off, end, false, policy)
 	var done uint64
 	var werr error
 	if plan.limit > off {
@@ -278,7 +286,7 @@ func (n *node) writeExtentsLocked(p []byte, off, end uint64) (int, error) {
 		final = spliceMapping(n.exts, plan.list, keep)
 	}
 	changed := !sameExtents(final, n.exts)
-	if err := n.installMappingLocked(final, plan.fresh, keep); err != nil {
+	if err := n.installMappingPolicyLocked(final, plan.fresh, keep, policy); err != nil {
 		if cause == nil {
 			return 0, err
 		}
@@ -334,10 +342,14 @@ func keptBlocks(runs []extent, keep uint64) uint64 {
 // below keep join the node and count as data blocks. Every other fresh run goes
 // back to the pool. The node changes nothing when the install fails.
 func (n *node) installMappingLocked(final, fresh []extent, keep uint64) error {
+	return n.installMappingPolicyLocked(final, fresh, keep, allocReuseHeld)
+}
+
+func (n *node) installMappingPolicyLocked(final, fresh []extent, keep uint64, policy allocPolicy) error {
 	if sameExtents(final, n.exts) {
 		return n.v.freeRunsFrom(fresh, 0)
 	}
-	if err := n.setExtentsLocked(final); err != nil {
+	if err := n.setExtentsPolicyLocked(final, policy); err != nil {
 		return joinCleanup(err, n.v.freeRunsFrom(fresh, 0))
 	}
 	n.nblocks += keptBlocks(fresh, keep)
@@ -368,6 +380,10 @@ type mapPlan struct {
 // nothing is zeroed or initialized. Without it, an uninitialized block in the
 // range becomes initialized. The caller holds n.mu for writing.
 func (n *node) planLocked(start, end uint64, zeroAll bool) mapPlan {
+	return n.planPolicyLocked(start, end, zeroAll, allocReuseHeld)
+}
+
+func (n *node) planPolicyLocked(start, end uint64, zeroAll bool, policy allocPolicy) mapPlan {
 	lb0, lb1 := uint32(start/blockSize), uint32((end+blockSize-1)/blockSize)
 	p := mapPlan{limit: end}
 	for cur := lb0; cur < lb1 && p.err == nil; {
@@ -380,7 +396,7 @@ func (n *node) planLocked(start, end uint64, zeroAll bool) mapPlan {
 			holeEnd = min(holeEnd, n.exts[i].lblk)
 		}
 		for cur < holeEnd && p.err == nil {
-			cur = n.fillLocked(&p, cur, holeEnd, start, end, zeroAll)
+			cur = n.fillLocked(&p, cur, holeEnd, start, end, zeroAll, policy)
 		}
 	}
 	p.limit = max(p.limit, start)
@@ -410,11 +426,11 @@ func (n *node) planLocked(start, end uint64, zeroAll bool) mapPlan {
 // fillLocked allocates a fresh run at file block cur, which lies in a hole that
 // ends at holeEnd. It records the run in p and returns the next file block. On
 // failure it records the error and the limit, and it returns cur.
-func (n *node) fillLocked(p *mapPlan, cur, holeEnd uint32, start, end uint64, zeroAll bool) uint32 {
+func (n *node) fillLocked(p *mapPlan, cur, holeEnd uint32, start, end uint64, zeroAll bool, policy allocPolicy) uint32 {
 	if zeroAll {
 		// A reservation maps uninitialized blocks, as Linux does. They read as
 		// zeros without a write, and e2fsck accepts them behind the end of file.
-		blk, got, err := n.v.allocBlocks(n.goalLocked(p.fresh, cur), min(holeEnd-cur, maxUninitExtentLen))
+		blk, got, err := n.v.allocBlocksPolicy(n.goalLocked(p.fresh, cur), min(holeEnd-cur, maxUninitExtentLen), policy)
 		if err != nil {
 			p.stop(cur, err)
 			return cur
@@ -422,7 +438,7 @@ func (n *node) fillLocked(p *mapPlan, cur, holeEnd uint32, start, end uint64, ze
 		p.fresh = append(p.fresh, extent{lblk: cur, n: got, pblk: blk, uninit: true})
 		return cur + got
 	}
-	blk, got, err := n.v.allocBlocks(n.goalLocked(p.fresh, cur), min(holeEnd-cur, maxExtentLen))
+	blk, got, err := n.v.allocBlocksPolicy(n.goalLocked(p.fresh, cur), min(holeEnd-cur, maxExtentLen), policy)
 	if err != nil {
 		p.stop(cur, err)
 		return cur
@@ -530,12 +546,20 @@ func (n *node) writeListLocked(list []extent, p []byte, off uint64) (int, error)
 // truncate sets the size of the file. Growing leaves a hole. Shrinking frees
 // the blocks behind the new end and clears the tail of the last block.
 func (n *node) truncate(size uint64) error {
+	return n.truncatePolicy(size, allocReuseHeld)
+}
+
+func (n *node) truncatePolicy(size uint64, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.truncateLocked(size)
+	return n.truncatePolicyLocked(size, policy)
 }
 
 func (n *node) truncateLocked(size uint64) error {
+	return n.truncatePolicyLocked(size, allocReuseHeld)
+}
+
+func (n *node) truncatePolicyLocked(size uint64, policy allocPolicy) error {
 	if size > maxFileSize {
 		return linuxerr.EFBIG
 	}
@@ -553,21 +577,21 @@ func (n *node) truncateLocked(size uint64) error {
 			n.markDirtyLocked()
 			return nil
 		}
-		if err := n.convertInlineLocked(); err != nil {
+		if err := n.convertInlinePolicyLocked(policy); err != nil {
 			return err
 		}
 	}
 	lb := uint32((size + blockSize - 1) / blockSize)
 	if size == n.size {
 		// Linux frees the blocks behind the end, which a keep-size fallocate maps.
-		return n.freeRangeLocked(lb, maxLogicalBlock)
+		return n.freeRangePolicyLocked(lb, maxLogicalBlock, policy)
 	}
 	if size > n.size {
 		n.size = size
 		n.markDirtyLocked()
 		return nil
 	}
-	if err := n.freeRangeLocked(lb, maxLogicalBlock); err != nil {
+	if err := n.freeRangePolicyLocked(lb, maxLogicalBlock, policy); err != nil {
 		return err
 	}
 	if rem := size % blockSize; rem != 0 {
@@ -586,11 +610,15 @@ func (n *node) truncateLocked(size uint64) error {
 // freeRangeLocked removes the file blocks [lb0, lb1) from the map and frees
 // their host blocks. lb1 can be maxLogicalBlock for the rest of the file.
 func (n *node) freeRangeLocked(lb0, lb1 uint32) error {
+	return n.freeRangePolicyLocked(lb0, lb1, allocReuseHeld)
+}
+
+func (n *node) freeRangePolicyLocked(lb0, lb1 uint32, policy allocPolicy) error {
 	list, freed := removeRange(n.exts, lb0, lb1)
 	if len(freed) == 0 {
 		return nil
 	}
-	if err := n.setExtentsLocked(list); err != nil {
+	if err := n.setExtentsPolicyLocked(list, policy); err != nil {
 		return err
 	}
 	var errs []error
@@ -604,6 +632,10 @@ func (n *node) freeRangeLocked(lb0, lb1 uint32) error {
 // punchHole frees the whole blocks inside [off, off+length) and clears the
 // partial blocks at the edges. The size does not change.
 func (n *node) punchHole(off, length uint64) error {
+	return n.punchHolePolicy(off, length, allocReuseHeld)
+}
+
+func (n *node) punchHolePolicy(off, length uint64, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.flags&flagInlineData != 0 {
@@ -620,7 +652,7 @@ func (n *node) punchHole(off, length uint64) error {
 	}
 	first, last := (off+blockSize-1)/blockSize, end/blockSize
 	if first < last {
-		if err := n.freeRangeLocked(uint32(first), uint32(last)); err != nil {
+		if err := n.freeRangePolicyLocked(uint32(first), uint32(last), policy); err != nil {
 			return err
 		}
 	}
@@ -646,6 +678,10 @@ func (n *node) punchHole(off, length uint64) error {
 // zeros. The size grows unless keepSize is set. A failed allocation keeps the
 // blocks that it mapped, as Linux does, and it leaves the size as it was.
 func (n *node) preallocate(off, length uint64, keepSize bool) error {
+	return n.preallocatePolicy(off, length, keepSize, allocReuseHeld)
+}
+
+func (n *node) preallocatePolicy(off, length uint64, keepSize bool, policy allocPolicy) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	end := off + length
@@ -655,16 +691,16 @@ func (n *node) preallocate(off, length uint64, keepSize bool) error {
 	if n.flags&flagInlineData != 0 {
 		if end <= maxInline {
 			if !keepSize && end > n.size {
-				return n.truncateLocked(end)
+				return n.truncatePolicyLocked(end, policy)
 			}
 			return nil
 		}
-		if err := n.convertInlineLocked(); err != nil {
+		if err := n.convertInlinePolicyLocked(policy); err != nil {
 			return err
 		}
 	}
-	plan := n.planLocked(off, end, true)
-	if err := n.installMappingLocked(plan.list, plan.fresh, allBlocks); err != nil {
+	plan := n.planPolicyLocked(off, end, true, policy)
+	if err := n.installMappingPolicyLocked(plan.list, plan.fresh, allBlocks, policy); err != nil {
 		return joinCleanup(plan.err, err)
 	}
 	if plan.err != nil {

@@ -111,7 +111,11 @@ type addressSpace struct {
 	// lowered to read-only because a copy of their frame exists. alias_windows.go
 	// explains both. They are guarded by mu.
 	wviews    []*writeView
+	memViews  []*memView
 	aliasProt map[uint64]frameKey
+
+	// residencyWG counts active scanResidency calls referencing this address space.
+	residencyWG sync.WaitGroup
 
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
@@ -249,6 +253,10 @@ func viewProtFor(at hostarch.AccessType) viewProt {
 	return viewNone
 }
 
+type chunkSectionFile interface {
+	ChunkSection(off uint64) (section windows.Handle, chunkStart, chunkLen uint64, fileID uintptr, ok bool)
+}
+
 // MapFile implements platform.AddressSpace.MapFile.
 func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) (err error) {
 	if traceEvents {
@@ -276,23 +284,43 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		// island like any other mapping. The island keeps its own private page.
 		return err
 	}
+	// A memory file backed by per-chunk pagefile sections maps directly from
+	// each chunk section without growing a temporary file on disk.
+	var sec *sectionRef
+	var copied *anonSection
+	secOff := fr.Start
+	if csf, ok := f.(chunkSectionFile); ok {
+		if secH, cStart, cLen, extFileID, hasChunk := csf.ChunkSection(fr.Start); hasChunk {
+			if fr.End > cStart+cLen {
+				split := cStart + cLen
+				first := memmap.FileRange{Start: fr.Start, End: split}
+				if err := as.MapFile(addr, f, first, at, precommit); err != nil {
+					return err
+				}
+				return as.MapFile(addr+hostarch.Addr(first.Length()), f, memmap.FileRange{Start: split, End: fr.End}, at, precommit)
+			}
+			sec = as.p.sections.forChunk(secH, extFileID, cStart, cLen)
+			secOff = fr.Start - cStart
+			as.p.watchHostWrites(f, sec.file)
+		}
+	}
 	// A file with a host handle maps through a section of that file. Any other
 	// file, such as a workspace file of hostfs, maps through a copy of its
 	// bytes, which serves a mapping without write permission.
-	var sec *sectionRef
-	var copied *anonSection
-	if fd := f.FD(); fd >= 0 {
-		var err error
-		if sec, err = as.p.sections.get(windows.Handle(fd), fr.End, at.Write); err != nil {
-			sec = nil
-			if at.Write {
-				return fmt.Errorf("map a writable range of the memory file: %w", err)
+	if sec == nil {
+		if fd := f.FD(); fd >= 0 {
+			var err error
+			if sec, err = as.p.sections.get(windows.Handle(fd), fr.End, at.Write); err != nil {
+				sec = nil
+				if at.Write {
+					return fmt.Errorf("map a writable range of the memory file: %w", err)
+				}
+			} else {
+				as.p.watchHostWrites(f, sec.file)
 			}
-		} else {
-			as.p.watchHostWrites(f, sec.file)
+		} else if at.Write {
+			return fmt.Errorf("the file has no host handle and cannot map writable: %w", unix.ENODEV)
 		}
-	} else if at.Write {
-		return fmt.Errorf("the file has no host handle and cannot map writable: %w", unix.ENODEV)
 	}
 	if sec == nil {
 		var err error
@@ -300,10 +328,9 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			return err
 		}
 		sec = &copied.ref
-	}
-	secOff := fr.Start
-	if copied != nil {
 		secOff = 0
+	} else {
+		as.p.watchResidency(f, sec.file)
 	}
 	var srcs []uint64
 	if at.Execute {
@@ -348,9 +375,10 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	if at.Execute && copied == nil {
 		for i := range keep {
 			old := as.blocks[guest+uint64(i)*blockSize]
-			keep[i] = old != nil && old.src == srcs[i] && old.srcOff == secOff+uint64(i)*blockSize && old.at == at
+			keep[i] = old != nil && old.src == srcs[i] && old.srcSec == sec && old.srcOff == secOff+uint64(i)*blockSize && old.at == at
 		}
 	}
+	resSrc, _ := f.(residencySource)
 	for i := 0; i < nblk; {
 		if keep[i] {
 			i++
@@ -361,11 +389,17 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			j++
 		}
 		start, length := guest+uint64(i)*blockSize, uint64(j-i)*blockSize
+		as.flushRangeResidencyLocked(start, start+length)
 		if err := as.win.Map(start, length, sec, secOff+uint64(i)*blockSize, viewProtFor(at)); err != nil {
 			if copied != nil {
 				copied.close()
 			}
 			return as.mapErr(fmt.Errorf("map [%#x, %#x): %w", start, start+length, err))
+		}
+		if copied == nil && resSrc != nil {
+			as.memViewsMappedLocked(start, length, resSrc, sec.file, sec.fileBase+secOff+uint64(i)*blockSize)
+		} else {
+			as.removeMemViewsLocked(start, start+length)
 		}
 		i = j
 	}
@@ -387,7 +421,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			as.blocks[base] = &execBlock{base: base, src: srcs[i], srcSec: sec, srcOff: secOff + uint64(i)*blockSize, at: at, state: blockData}
 		}
 	}
-	return as.aliasMappedLocked(guest, fr.Length(), sec, secOff, at, keep)
+	return as.aliasMappedLocked(guest, fr.Length(), sec, sec.fileBase+secOff, at, keep)
 }
 
 // mapErr reports a dead stub as such.
@@ -441,6 +475,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if as.released || as.sp.dead.Load() {
 		return
 	}
+	as.flushRangeResidencyLocked(start, end)
 	if err := as.win.Unmap(start, end-start); err != nil && !as.sp.dead.Load() {
 		// Windows rejects only a malformed range or a broken window here. Both
 		// are Sentry bugs, and a stale mapping would expose freed memory.
@@ -471,6 +506,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 		}
 	}
 	as.dropIslandsLocked(start, end)
+	as.removeMemViewsLocked(start, end)
 	as.aliasUnmappedLocked(start, end)
 }
 
@@ -483,7 +519,11 @@ func (as *addressSpace) Release() {
 		return
 	}
 	as.released = true
+	views := as.detachMemViewsLocked()
 	as.mu.Unlock()
+
+	as.flushViewsResidency(views)
+	as.residencyWG.Wait()
 
 	// Terminating the process stops every thread, so no stub thread touches
 	// the pages that go back to the pool below.

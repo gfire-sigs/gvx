@@ -46,7 +46,7 @@ func NewLayerCache(dir string) (*oci.LayerCache, error) {
 // NewLayerCacheWithTuning is NewLayerCache with the oci.* tunables of t. They
 // set the size budgets that a pull and a layer compilation obey.
 func NewLayerCacheWithTuning(dir string, t tuning.Values) (*oci.LayerCache, error) {
-	cache, err := oci.NewLayerCacheWithOptions(dir, oci.CacheOptions{BlockSize: hostarch.PageSize})
+	cache, err := oci.NewLayerCacheWithOptions(dir, oci.CacheOptions{BlockSize: int(hostarch.PageSize)})
 	if err != nil {
 		return nil, err
 	}

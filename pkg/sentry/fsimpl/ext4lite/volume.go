@@ -95,6 +95,7 @@ type volume struct {
 	// mu protects the allocator state and the fields up to the next blank
 	// line.
 	mu              sync.Mutex
+	punchCond       *sync.Cond
 	groups          []*group
 	freeBlocksTotal uint64
 	freeInodesTotal uint64
@@ -233,6 +234,7 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 	// Every write to the image goes through v.hf, so one wrapper sees them all.
 	v.hf = &trackedFile{hostFile: hf, v: v}
 	v.gate.init()
+	v.punchCond = sync.NewCond(&v.mu)
 	v.inflight = make(map[uint64]struct{})
 	v.orphans = make(map[uint32]*node)
 	if v.now == nil {
@@ -511,6 +513,9 @@ func (v *volume) close() error {
 		return nil
 	}
 	v.closed = true
+	if v.punchCond != nil {
+		v.punchCond.Broadcast()
+	}
 	v.mu.Unlock()
 	// The unmount frees blocks with no guest operation running.
 	v.assertGate.Store(false)

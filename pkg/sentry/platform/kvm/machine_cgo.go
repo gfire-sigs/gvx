@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build cgo && amd64
-// +build cgo,amd64
+//go:build linux && cgo && amd64
 
 package kvm
 

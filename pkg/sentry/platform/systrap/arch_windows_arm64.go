@@ -173,6 +173,10 @@ func (th *thread) pullArch(ac *arch.Context64) {
 // island.
 func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) || th.inIslandPC(pc) }
 
+// PrepareForPtrace implements platform.AddressSpace.PrepareForPtrace. The
+// Windows systrap engine does not run Linux ptrace on stubbed tasks.
+func (*addressSpace) PrepareForPtrace(context.Context, platform.MemoryManager) error { return nil }
+
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS. arm64 has no
 // GS register.
 func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error { return nil }

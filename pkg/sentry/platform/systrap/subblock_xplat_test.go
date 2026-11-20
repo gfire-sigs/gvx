@@ -79,7 +79,8 @@ func TestConcurrentBeforeSwitchWaitsForPopulatePartial(t *testing.T) {
 	// Allocate 5 guest pages and map starting at page 1 so the 4 sub-pages of
 	// the block are backed by non-block-aligned file offsets and use a
 	// composite page.
-	fr, err := mf.Allocate(5*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(5*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -98,9 +99,9 @@ func TestConcurrentBeforeSwitchWaitsForPopulatePartial(t *testing.T) {
 	defer layer.reset()
 
 	const blockAddr = hostarch.Addr(0x248000)
-	baseOff := fr.Start + hostarch.PageSize
-	sub23FR := memmap.FileRange{Start: baseOff + 2*hostarch.PageSize, End: baseOff + 4*hostarch.PageSize}
-	if err := layer.mapFile(blockAddr+2*hostarch.PageSize, mf, sub23FR, hostarch.Read, false); err != nil {
+	baseOff := fr.Start + page
+	sub23FR := memmap.FileRange{Start: baseOff + 2*page, End: baseOff + 4*page}
+	if err := layer.mapFile(blockAddr+2*hostarch.Addr(page), mf, sub23FR, hostarch.Read, false); err != nil {
 		t.Fatalf("mapFile sub-pages 2..3: %v", err)
 	}
 
@@ -121,7 +122,7 @@ func TestConcurrentBeforeSwitchWaitsForPopulatePartial(t *testing.T) {
 					}
 					runtime.Gosched()
 				}
-				sub01FR := memmap.FileRange{Start: baseOff, End: baseOff + 2*hostarch.PageSize}
+				sub01FR := memmap.FileRange{Start: baseOff, End: baseOff + 2*page}
 				if err := layer.mapFile(blockAddr, mf, sub01FR, hostarch.Read, false); err != nil {
 					t.Errorf("mapFile sub-pages 0..1: %v", err)
 				}
@@ -173,7 +174,8 @@ func TestPopulatePartialRepopulatesAfterConcurrentRelease(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(5*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(5*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -192,9 +194,9 @@ func TestPopulatePartialRepopulatesAfterConcurrentRelease(t *testing.T) {
 	defer layer.reset()
 
 	const blockAddr = hostarch.Addr(0x300000)
-	baseOff := fr.Start + hostarch.PageSize
-	sub23FR := memmap.FileRange{Start: baseOff + 2*hostarch.PageSize, End: baseOff + 4*hostarch.PageSize}
-	if err := layer.mapFile(blockAddr+2*hostarch.PageSize, mf, sub23FR, hostarch.Read, false); err != nil {
+	baseOff := fr.Start + page
+	sub23FR := memmap.FileRange{Start: baseOff + 2*page, End: baseOff + 4*page}
+	if err := layer.mapFile(blockAddr+2*hostarch.Addr(page), mf, sub23FR, hostarch.Read, false); err != nil {
 		t.Fatalf("mapFile sub-pages 2..3: %v", err)
 	}
 
@@ -211,7 +213,7 @@ func TestPopulatePartialRepopulatesAfterConcurrentRelease(t *testing.T) {
 				layer.release(hostarch.AddrRange{Start: blockAddr, End: blockAddr + subBlockSize})
 				return false
 			}
-			sub01FR := memmap.FileRange{Start: baseOff, End: baseOff + 2*hostarch.PageSize}
+			sub01FR := memmap.FileRange{Start: baseOff, End: baseOff + 2*page}
 			if err := layer.mapFile(blockAddr, mf, sub01FR, hostarch.Read, false); err != nil {
 				t.Errorf("mapFile sub-pages 0..1: %v", err)
 			}
@@ -245,7 +247,9 @@ func TestPopulatePartialRepopulatesAfterSiblingUnmap(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(9*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	pageAddr := hostarch.Addr(page)
+	fr, err := mf.Allocate(9*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -267,17 +271,17 @@ func TestPopulatePartialRepopulatesAfterSiblingUnmap(t *testing.T) {
 		headBlock = hostarch.Addr(0x400000)
 		tailBlock = hostarch.Addr(0x410000)
 	)
-	baseOff := fr.Start + hostarch.PageSize
+	baseOff := fr.Start + page
 	pageAt := func(idx uint64) memmap.FileRange {
-		off := baseOff + idx*hostarch.PageSize
-		return memmap.FileRange{Start: off, End: off + hostarch.PageSize}
+		off := baseOff + idx*page
+		return memmap.FileRange{Start: off, End: off + page}
 	}
 
 	// Map headBlock sub-page 3 and tailBlock sub-pages 0..2 to match one 64 KiB COW PMA.
-	if err := layer.mapFile(headBlock+3*hostarch.PageSize, mf, pageAt(3), hostarch.Read, false); err != nil {
+	if err := layer.mapFile(headBlock+3*pageAddr, mf, pageAt(3), hostarch.Read, false); err != nil {
 		t.Fatalf("mapFile head sub-page 3: %v", err)
 	}
-	tailInitFR := memmap.FileRange{Start: baseOff + 4*hostarch.PageSize, End: baseOff + 7*hostarch.PageSize}
+	tailInitFR := memmap.FileRange{Start: baseOff + 4*page, End: baseOff + 7*page}
 	if err := layer.mapFile(tailBlock, mf, tailInitFR, hostarch.Read, false); err != nil {
 		t.Fatalf("mapFile tail sub-pages 0..2: %v", err)
 	}
@@ -286,29 +290,29 @@ func TestPopulatePartialRepopulatesAfterSiblingUnmap(t *testing.T) {
 	pop := funcSubBlockPopulator{
 		fn: func(_ context.Context, addr hostarch.Addr) bool {
 			switch addr {
-			case headBlock, headBlock + hostarch.PageSize, headBlock + 2*hostarch.PageSize:
-				idx := uint64(addr-headBlock) / hostarch.PageSize
+			case headBlock, headBlock + pageAddr, headBlock + 2*pageAddr:
+				idx := uint64(addr-headBlock) / page
 				if err := layer.mapFile(addr, mf, pageAt(idx), hostarch.Read, false); err != nil {
 					t.Errorf("mapFile(%#x): %v", addr, err)
 				}
 				return true
-			case headBlock + 3*hostarch.PageSize:
+			case headBlock + 3*pageAddr:
 				if err := layer.mapFile(addr, mf, pageAt(3), hostarch.ReadWrite, false); err != nil {
 					t.Errorf("mapFile(%#x): %v", addr, err)
 				}
 				return true
-			case tailBlock, tailBlock + hostarch.PageSize, tailBlock + 2*hostarch.PageSize:
-				idx := 4 + uint64(addr-tailBlock)/hostarch.PageSize
+			case tailBlock, tailBlock + pageAddr, tailBlock + 2*pageAddr:
+				idx := 4 + uint64(addr-tailBlock)/page
 				if err := layer.mapFile(addr, mf, pageAt(idx), hostarch.ReadWrite, false); err != nil {
 					t.Errorf("mapFile(%#x): %v", addr, err)
 				}
 				return true
-			case tailBlock + 3*hostarch.PageSize:
+			case tailBlock + 3*pageAddr:
 				if !cowBroken {
 					cowBroken = true
 					// Breaking COW on the merged PMA unmaps [headBlock+3*PageSize, tailBlock+3*PageSize)
 					// while PopulateSubBlock maps only the faulting page at tailBlock+3*PageSize.
-					layer.unmap(headBlock+3*hostarch.PageSize, uint64(tailBlock-headBlock))
+					layer.unmap(headBlock+3*pageAddr, uint64(tailBlock-headBlock))
 				}
 				if err := layer.mapFile(addr, mf, pageAt(7), hostarch.ReadWrite, false); err != nil {
 					t.Errorf("mapFile(%#x): %v", addr, err)
@@ -330,7 +334,7 @@ func TestPopulatePartialRepopulatesAfterSiblingUnmap(t *testing.T) {
 	if headHB != nil {
 		headMapped = headHB.mapped
 		if headHB.hasComp {
-			off := 3 * hostarch.PageSize
+			off := 3 * int(page)
 			headSub3 = bytes.Clone(headHB.comp.buf[off : off+4])
 		}
 	}
@@ -390,7 +394,8 @@ func TestSubprocessSubBlockSwitchAndUnmapHooks(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(2*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -401,7 +406,7 @@ func TestSubprocessSubBlockSwitchAndUnmapHooks(t *testing.T) {
 	layer.storeSeq.Store(41)
 
 	const blockAddr = hostarch.Addr(0x200000)
-	pageFR := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+	pageFR := memmap.FileRange{Start: fr.Start + page, End: fr.End}
 	if err := layer.mapFile(blockAddr, mf, pageFR, hostarch.Read, false); err != nil {
 		t.Fatalf("mapFile: %v", err)
 	}
@@ -447,7 +452,8 @@ func TestResolveSubBlockFault(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(2*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -457,7 +463,7 @@ func TestResolveSubBlockFault(t *testing.T) {
 	defer layer.reset()
 
 	const blockAddr = hostarch.Addr(0x400000)
-	pageFR := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+	pageFR := memmap.FileRange{Start: fr.Start + page, End: fr.End}
 	if err := layer.mapFile(blockAddr, mf, pageFR, hostarch.ReadWrite, false); err != nil {
 		t.Fatalf("mapFile: %v", err)
 	}
@@ -479,7 +485,7 @@ func TestResolveSubBlockFault(t *testing.T) {
 	}
 
 	// A SEGV_ACCERR on an unmapped sub-page of a mapped block becomes SEGV_MAPERR.
-	missingAddr := uint64(blockAddr + hostarch.PageSize)
+	missingAddr := uint64(blockAddr) + page
 	ctx.signalInfo = linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvAccerr}
 	ctx.signalInfo.SetAddr(missingAddr)
 	si = ctx.signalInfo
@@ -558,7 +564,8 @@ func TestCompositeWXSiblingExecCleansStubICache(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(5*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(5*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -569,20 +576,20 @@ func TestCompositeWXSiblingExecCleansStubICache(t *testing.T) {
 	defer layer.reset()
 
 	const blockAddr = hostarch.Addr(0x600000)
-	baseOff := fr.Start + hostarch.PageSize
+	baseOff := fr.Start + page
 	pageAt := func(idx uint64) memmap.FileRange {
-		off := baseOff + idx*hostarch.PageSize
-		return memmap.FileRange{Start: off, End: off + hostarch.PageSize}
+		off := baseOff + idx*page
+		return memmap.FileRange{Start: off, End: off + page}
 	}
 	rxPerms := hostarch.AccessType{Read: true, Execute: true}
 	rwxPerms := hostarch.AccessType{Read: true, Write: true, Execute: true}
 
 	for i := uint64(0); i < 3; i++ {
-		if err := layer.mapFile(blockAddr+hostarch.Addr(i*hostarch.PageSize), mf, pageAt(i), hostarch.ReadWrite, false); err != nil {
+		if err := layer.mapFile(blockAddr+hostarch.Addr(i*page), mf, pageAt(i), hostarch.ReadWrite, false); err != nil {
 			t.Fatalf("mapFile sub-page %d: %v", i, err)
 		}
 	}
-	if err := layer.mapFile(blockAddr+3*hostarch.PageSize, mf, pageAt(3), rxPerms, false); err != nil {
+	if err := layer.mapFile(blockAddr+3*hostarch.Addr(page), mf, pageAt(3), rxPerms, false); err != nil {
 		t.Fatalf("mapFile sub-page 3 RX: %v", err)
 	}
 	layer.beforeSwitch(nil, noopSubBlockPopulator{})
@@ -601,7 +608,7 @@ func TestCompositeWXSiblingExecCleansStubICache(t *testing.T) {
 	}
 
 	// Cycle 1: store machine code to RW sub-page 1, then mprotect sub-page 1 to RX.
-	p1Addr := blockAddr + hostarch.PageSize
+	p1Addr := blockAddr + hostarch.Addr(page)
 	codeV1 := []byte{0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6}
 	layer.mu.Lock()
 	layer.writeLocked(uint64(p1Addr), codeV1)

@@ -444,7 +444,7 @@ func (st *auditState) auditAgainstUpstream(abs, relSlash string, tier IsolationT
 		}
 	}
 	if hasRule && rule.Kind == PatchLinuxOnly && (class == ClassPristine || class == ClassFormat) {
-		// An untouched file in a linux-only scope must already be Linux-only, including under -race, -msan, and -asan.
+		// An untouched file in a linux-only scope must already be Linux-only, including under -race, -msan, -asan, and cgo.
 		set, err := buildSet(path.Base(relSlash), repoBytes, nonLinuxTargets)
 		if err != nil {
 			return err

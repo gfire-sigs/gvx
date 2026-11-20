@@ -630,7 +630,7 @@ func TestPlatformRegistrationAndLimits(t *testing.T) {
 	}
 	plat := p.(*Platform)
 	defer plat.Close()
-	if got := plat.MapUnit(); got != 2<<20 || got%hostarch.PageSize != 0 || got&(got-1) != 0 {
+	if got := plat.MapUnit(); got != 2<<20 || got%uint64(hostarch.PageSize) != 0 || got&(got-1) != 0 {
 		t.Errorf("MapUnit() = %d, want 2 MiB, a power-of-two multiple of hostarch.PageSize %d", got, hostarch.PageSize)
 	}
 	if !FrameworkSymbolsLoaded() {

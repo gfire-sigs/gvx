@@ -19,10 +19,9 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"runtime"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
-	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	pgallocpb "z.gfire.dev/gvx/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 )
 
@@ -38,6 +37,9 @@ type saveRestoreXplat struct {
 	// destroyUnmapErr joins chunk unmap errors from releaserDestroyLocked.
 	// MemoryFile.mu protects destroyUnmapErr.
 	destroyUnmapErr error
+
+	// winBacking holds Windows-only chunk backing state.
+	winBacking windowsBacking
 }
 
 // isSeekDataUnsupported reports whether err indicates that the host kernel or
@@ -56,53 +58,14 @@ func (f *MemoryFile) seekFileData(fd int, offset int64, whence int) (int64, erro
 	return unix.Seek(fd, offset, whence)
 }
 
-// mapMemoryFileChunks maps len(chunks) contiguous 1 GiB chunks of fd starting
-// at startOffset and stores each base address in chunks[i].mapping.
-//
-// Linux and macOS split a single multi-chunk mmap during per-chunk munmap.
-// Windows UnmapViewOfFile releases a whole MapViewOfFile view at once and
-// rejects partial unmaps, so Windows maps one view per chunk.
-func mapMemoryFileChunks(fd uintptr, startOffset uint64, chunks []chunkInfo) error {
-	if len(chunks) == 0 {
-		return nil
-	}
-	if runtime.GOOS != "windows" {
-		size := uintptr(uint64(len(chunks)) * chunkSize)
-		m, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			size,
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			fd,
-			uintptr(startOffset))
-		if errno != 0 {
-			return errno
+// commitLoadedRanges commits every allocated memAcct range after LoadFrom maps
+// the backing chunks. Non-Windows hosts treat this as a no-op because mmap
+// commits pages on demand.
+func (f *MemoryFile) commitLoadedRanges() error {
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		if err := f.commitRange(maseg.Range()); err != nil {
+			return err
 		}
-		for i := range chunks {
-			chunks[i].mapping = m
-			m += chunkSize
-		}
-		return nil
-	}
-	for i := range chunks {
-		off := startOffset + uint64(i)*chunkSize
-		m, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			chunkSize,
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			fd,
-			uintptr(off))
-		if errno != 0 {
-			for j := range i {
-				_, _, _ = unix.Syscall(unix.SYS_MUNMAP, chunks[j].mapping, chunkSize, 0)
-				chunks[j].mapping = 0
-			}
-			return errno
-		}
-		chunks[i].mapping = m
 	}
 	return nil
 }
@@ -112,20 +75,7 @@ func mapMemoryFileChunks(fd uintptr, startOffset uint64, chunks []chunkInfo) err
 //
 // Preconditions: caller holds f.mu.
 func (f *MemoryFile) unmapChunksLocked(chunks []chunkInfo) {
-	var errs []error
-	for i := range chunks {
-		chunk := &chunks[i]
-		if chunk.mapping == 0 {
-			continue
-		}
-		_, _, errno := unix.Syscall(unix.SYS_MUNMAP, chunk.mapping, chunkSize, 0)
-		if errno != 0 {
-			log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)
-			errs = append(errs, fmt.Errorf("chunk %d (%#x): %w", i, chunk.mapping, errno))
-		}
-		chunk.mapping = 0
-	}
-	f.saveRestore.destroyUnmapErr = errors.Join(errs...)
+	f.saveRestore.destroyUnmapErr = f.unmapBackingChunks(chunks)
 	f.saveRestore.destroyDone = true
 	f.releaseCond.Broadcast()
 }
@@ -176,18 +126,21 @@ type rangeProto interface {
 	GetEnd() uint64
 }
 
-// validateRangeProtos verifies that segs are non-empty, ordered, and disjoint.
-// The segment sets of MemoryFile panic on other input. If limit is not
-// math.MaxUint64, it also verifies that every range ends at or below limit.
-// The free and waste sets that SaveTo writes end at math.MaxUint64, so only
-// the accounting ranges have a limit.
+// validateRangeProtos verifies that segs are non-empty, page-aligned, ordered,
+// and disjoint. The segment sets of MemoryFile panic on other input. If limit
+// is not math.MaxUint64, it also verifies that every range ends at or below
+// limit. The free and waste sets that SaveTo writes end at math.MaxUint64, so
+// only the accounting ranges have a limit.
 func validateRangeProtos[T rangeProto](name string, segs []T, limit uint64) error {
+	pageMask := uint64(hostarch.PageSize) - 1
 	var prevEnd uint64
 	for i, s := range segs {
 		start, end := s.GetStart(), s.GetEnd()
 		switch {
 		case start >= end:
 			return fmt.Errorf("%s[%d] has the empty or inverted range [%#x, %#x)", name, i, start, end)
+		case start&pageMask != 0 || (end != math.MaxUint64 && end&pageMask != 0):
+			return fmt.Errorf("%s[%d] range [%#x, %#x) is not page-aligned", name, i, start, end)
 		case end > limit:
 			return fmt.Errorf("%s[%d] range [%#x, %#x) exceeds the backing file size %#x", name, i, start, end, limit)
 		case start < prevEnd:

@@ -12,25 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build arm64 && pagesize_64k
+//go:build !windows
 
-package hostarch
+package pgalloc
 
-import "z.gfire.dev/gvx/internal/xsys/unix"
+import "z.gfire.dev/gvx/pkg/sentry/memmap"
 
-const (
-	// PageShift is the binary log of the system page size.
-	// 64K pages: 2^16 = 65536
-	PageShift = 16
-
-	// HugePageShift is the binary log of the system huge page size.
-	// For 64K pages: PageShift + (PageShift - 3) = 16 + 13 = 29
-	// This gives 512MB huge pages.
-	HugePageShift = 29
-)
-
-func init() {
-	if size := unix.Getpagesize(); size != PageSize {
-		println("WARNING: host page size mismatch - running on non-64K host")
-	}
-}
+func (f *MemoryFile) scanExternalResidency(memmap.FileRange, []byte) {}

@@ -782,6 +782,7 @@ func (rc *rackControl) StateFields() []string {
 		"minRTT",
 		"tlpRxtOut",
 		"tlpHighRxt",
+		"tlpAckSeq",
 		"snd",
 	}
 }
@@ -796,7 +797,8 @@ func (rc *rackControl) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &rc.minRTT)
 	stateSinkObject.SaveBool(3, &rc.tlpRxtOut)
 	stateSinkObject.Save(4, &rc.tlpHighRxt)
-	stateSinkObject.Save(5, &rc.snd)
+	stateSinkObject.Save(5, &rc.tlpAckSeq)
+	stateSinkObject.Save(6, &rc.snd)
 }
 
 func (rc *rackControl) afterLoad(context.Context) {}
@@ -808,7 +810,8 @@ func (rc *rackControl) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.Load(2, &rc.minRTT)
 	stateSourceObject.LoadBool(3, &rc.tlpRxtOut)
 	stateSourceObject.Load(4, &rc.tlpHighRxt)
-	stateSourceObject.Load(5, &rc.snd)
+	stateSourceObject.Load(5, &rc.tlpAckSeq)
+	stateSourceObject.Load(6, &rc.snd)
 }
 
 func (r *receiver) StateTypeName() string {

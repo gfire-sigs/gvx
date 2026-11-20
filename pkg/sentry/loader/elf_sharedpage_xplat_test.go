@@ -41,7 +41,7 @@ func init() {
 type testPlatform struct{ platform.Platform }
 
 func (testPlatform) SupportsAddressSpaceIO() bool  { return false }
-func (testPlatform) MinUserAddress() hostarch.Addr { return hostarch.PageSize }
+func (testPlatform) MinUserAddress() hostarch.Addr { return hostarch.Addr(hostarch.PageSize) }
 func (testPlatform) MaxUserAddress() hostarch.Addr { return 0x0000_7fff_ffff_f000 }
 func (testPlatform) MapUnit() uint64               { return 0 }
 func (testPlatform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
@@ -172,7 +172,7 @@ func readMappedRegions(ctx context.Context, m *mm.MemoryManager) []mappedRegion 
 }
 
 func TestLoadParsedELFMergesSharedBoundaryPagePerms(t *testing.T) {
-	const (
+	var (
 		page = uint64(hostarch.PageSize)
 		half = page / 2
 	)
@@ -244,7 +244,7 @@ func TestLoadParsedELFMergesSharedBoundaryPagePerms(t *testing.T) {
 }
 
 func TestMergeSharedPagePermsUnionSemantics(t *testing.T) {
-	const (
+	var (
 		page    = uint64(hostarch.PageSize)
 		half    = page / 2
 		quarter = page / 4
@@ -322,7 +322,7 @@ func TestMergeSharedPagePermsUnionSemantics(t *testing.T) {
 }
 
 func TestMergeSharedPagePermsPreservesDisjointAndNonLoadSegments(t *testing.T) {
-	const (
+	var (
 		page = uint64(hostarch.PageSize)
 		base = hostarch.Addr(0x20 * page)
 	)
