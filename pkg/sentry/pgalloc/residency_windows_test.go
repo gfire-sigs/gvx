@@ -99,3 +99,83 @@ func TestObserveResidencyUpdatesAccountingAndHonorsDecommit(t *testing.T) {
 		t.Fatalf("TotalPerCg after stop() = %d, want %d", got, 2*pageBytes)
 	}
 }
+
+func TestMarkCommittedPagesWithoutAccountingSink(t *testing.T) {
+	pageBytes := uint64(hostarch.PageSize)
+
+	t.Run("nil_global_accounting_is_noop", func(t *testing.T) {
+		if usage.MemoryAccounting != nil {
+			t.Skip("usage.MemoryAccounting is already initialized in this test binary")
+		}
+		mf, err := NewDefaultMemoryFile(MemoryFileOpts{SharedSection: true})
+		if err != nil {
+			t.Fatalf("NewDefaultMemoryFile: %v", err)
+		}
+		defer mf.Destroy()
+
+		fr, err := mf.Allocate(pageBytes, AllocOpts{Kind: usage.Anonymous})
+		if err != nil {
+			t.Fatalf("Allocate: %v", err)
+		}
+		defer mf.DecRef(fr)
+
+		if ranges, _ := mf.UncommittedRanges(fr); len(ranges) != 0 {
+			t.Fatalf("UncommittedRanges without accounting sink = %v, want empty", ranges)
+		}
+		mf.MarkCommittedPages(fr, []byte{1}, 0)
+		total, err := mf.TotalUsage()
+		if err != nil {
+			t.Fatalf("TotalUsage: %v", err)
+		}
+		if total != 0 {
+			t.Fatalf("TotalUsage after no-op MarkCommittedPages = %d, want 0", total)
+		}
+		mf.Decommit(fr)
+	})
+
+	t.Run("disabled_accounting_updates_total_usage", func(t *testing.T) {
+		mf, err := NewDefaultMemoryFile(MemoryFileOpts{
+			SharedSection:           true,
+			DisableMemoryAccounting: true,
+		})
+		if err != nil {
+			t.Fatalf("NewDefaultMemoryFile: %v", err)
+		}
+		defer mf.Destroy()
+
+		fr, err := mf.Allocate(pageBytes, AllocOpts{Kind: usage.Anonymous})
+		if err != nil {
+			t.Fatalf("Allocate: %v", err)
+		}
+		released := false
+		defer func() {
+			if !released {
+				mf.DecRef(fr)
+			}
+		}()
+
+		ranges, seq := mf.UncommittedRanges(fr)
+		if len(ranges) != 1 || ranges[0] != fr {
+			t.Fatalf("UncommittedRanges(%v) = %v, want [%v]", fr, ranges, fr)
+		}
+		mf.MarkCommittedPages(fr, []byte{1}, seq)
+		total, err := mf.TotalUsage()
+		if err != nil {
+			t.Fatalf("TotalUsage after MarkCommittedPages: %v", err)
+		}
+		if total != pageBytes {
+			t.Fatalf("TotalUsage after MarkCommittedPages = %d, want %d", total, pageBytes)
+		}
+
+		mf.Decommit(fr)
+		mf.DecRef(fr)
+		released = true
+		total, err = mf.TotalUsage()
+		if err != nil {
+			t.Fatalf("TotalUsage after Decommit+DecRef: %v", err)
+		}
+		if total != 0 {
+			t.Fatalf("TotalUsage after Decommit+DecRef = %d, want 0", total)
+		}
+	})
+}

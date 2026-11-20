@@ -107,7 +107,7 @@ func newPlatform(t testing.TB) *Platform {
 
 func newRig(t testing.TB, p *Platform) *rig {
 	t.Helper()
-	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true})
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true, DisableMemoryAccounting: true})
 	if err != nil {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
@@ -629,7 +629,7 @@ func TestManySystemCalls(t *testing.T) {
 
 func TestAddressSpacesAreIndependent(t *testing.T) {
 	p := newPlatform(t)
-	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true})
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true, DisableMemoryAccounting: true})
 	if err != nil {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
@@ -730,7 +730,7 @@ func TestForkStorm(t *testing.T) {
 	p := newPlatform(t)
 	// One memory file serves every task. A memory file takes a gigabyte of
 	// address space and disk space, and the hosted runners have little disk.
-	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true})
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true, DisableMemoryAccounting: true})
 	if err != nil {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
@@ -837,7 +837,7 @@ func TestPooledStubServesNewAddressSpace(t *testing.T) {
 // stub that served one guest process must not serve the next one.
 func TestReleasedStubNeverServesAnotherAddressSpace(t *testing.T) {
 	p := newPlatform(t)
-	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true})
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{SharedSection: true, DisableMemoryAccounting: true})
 	if err != nil {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}

@@ -21,6 +21,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
+	"z.gfire.dev/gvx/pkg/sentry/usage"
 )
 
 type residencyObserver struct {
@@ -89,7 +90,7 @@ func (f *MemoryFile) scanExternalResidency(fr memmap.FileRange, resident []byte)
 // UncommittedRanges returns the coalesced uncommitted sub-ranges of fr along
 // with the commit sequence number needed by MarkCommittedPages.
 func (f *MemoryFile) UncommittedRanges(fr memmap.FileRange) ([]memmap.FileRange, uint64) {
-	if !fr.WellFormed() || fr.Length() == 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || (!f.opts.DisableMemoryAccounting && f.Accounting() == nil) {
 		return nil, 0
 	}
 	f.mu.Lock()
@@ -123,6 +124,13 @@ func (f *MemoryFile) UncommittedRanges(fr memmap.FileRange) ([]memmap.FileRange,
 func (f *MemoryFile) MarkCommittedPages(fr memmap.FileRange, resident []byte, lastCommitSeq uint64) {
 	if !fr.WellFormed() || fr.Length() == 0 || len(resident) == 0 {
 		return
+	}
+	var acct *usage.MemoryLocked
+	if !f.opts.DisableMemoryAccounting {
+		acct = f.Accounting()
+		if acct == nil {
+			return
+		}
 	}
 	bufLen := min(len(resident), int(fr.Length()>>hostarch.PageShift))
 	if bufLen == 0 {
@@ -167,8 +175,8 @@ func (f *MemoryFile) MarkCommittedPages(fr memmap.FileRange, resident []byte, la
 				ma.knownCommitted = true
 				ma.commitSeq = 0
 				f.knownCommittedBytes += amount
-				if !f.opts.DisableMemoryAccounting {
-					f.Accounting().Inc(amount, ma.kind, ma.memCgID)
+				if acct != nil {
+					acct.Inc(amount, ma.kind, ma.memCgID)
 				}
 				changedAny = true
 			}
