@@ -121,6 +121,8 @@ type sandboxFlagValues struct {
 	platform               string
 	backend                string
 	allowUnconfinedSystrap bool
+	gpu                    string
+	gpuRenderer            string
 	arch                   string
 	net                    string
 	isolateLAN             bool
@@ -185,6 +187,8 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	fs.StringVar(&f.platform, "platform", string(gvx.PlatformAuto), "Execution backend (auto, whpx, hvf, or systrap) or image platform (linux/amd64 or linux/arm64)")
 	fs.StringVar(&f.backend, "backend", "", "Execution backend: auto, whpx, hvf, or systrap")
 	fs.BoolVar(&f.allowUnconfinedSystrap, "allow-unconfined-systrap", false, "Allow -platform=auto on Windows to fall back to systrap when whpx is unavailable")
+	fs.StringVar(&f.gpu, "gpu", "off", "Virtual GPU: off or venus (venus needs the hvf backend on Apple silicon and the gvx-gpu-renderer bundle)")
+	fs.StringVar(&f.gpuRenderer, "gpu-renderer", "", "Path of the gvx-gpu-renderer executable for -gpu=venus")
 	fs.StringVar(&f.arch, "arch", defs.archDefault, "Guest Linux architecture: amd64 or arm64")
 	registerAlias([]string{"net", "network"}, func(n string) {
 		fs.StringVar(&f.net, n, defs.netDefault, "Network backend: nat (or bridge), wg, or none")
@@ -413,6 +417,10 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
+	gpuMode, err := gvx.ParseGPUMode(f.gpu)
+	if err != nil {
+		return gvx.Config{}, false, fmt.Errorf("-gpu: %w", err)
+	}
 	priv := resolvePrivileges(fs, f.privileged, f.netRaw, f.packetWrite, f.allowSUID)
 	rootVolume := strings.TrimSpace(f.rootVolume)
 	if flagVisited(fs, "rootfs-volume") && rootVolume == "" {
@@ -457,6 +465,10 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		TTY:                    f.tty || f.it,
 		DisableHostLockdown:    !f.lockdown,
 		CheckpointDir:          strings.TrimSpace(f.checkpointDir),
+		GPU: gvx.GPUConfig{
+			Mode:         gpuMode,
+			RendererPath: strings.TrimSpace(f.gpuRenderer),
+		},
 	}
 	return cfg, backend == gvx.PlatformAuto, nil
 }

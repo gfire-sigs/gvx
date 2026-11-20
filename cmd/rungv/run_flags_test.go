@@ -253,3 +253,36 @@ func TestRunFlagsOverlayMount(t *testing.T) {
 		t.Fatalf("self-overlay = (code=%d, done=%v, stderr=%q), want usage error 2", code, badDone, badStderr)
 	}
 }
+
+func TestRunFlagsGPU(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		args         []string
+		wantMode     gvx.GPUMode
+		wantRenderer string
+		wantUsage    bool
+	}{
+		{"default", []string{"-image=x"}, gvx.GPUOff, "", false},
+		{"venus", []string{"-gpu=venus", "-image=x"}, gvx.GPUVenus, "", false},
+		{"venus with renderer", []string{"--gpu", "venus", "-gpu-renderer", "/opt/r/bin/gvx-gpu-renderer", "-image=x"}, gvx.GPUVenus, "/opt/r/bin/gvx-gpu-renderer", false},
+		{"explicit off", []string{"-gpu=off", "-image=x"}, gvx.GPUOff, "", false},
+		{"unknown mode", []string{"-gpu=bogus", "-image=x"}, "", "", true},
+		{"reserved virgl", []string{"-gpu=virgl", "-image=x"}, "", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, code, done, stderr := parse(t, tc.args...)
+			if tc.wantUsage {
+				if !done || code != 2 || !strings.Contains(stderr, "-gpu") {
+					t.Fatalf("parseRunArgs(%v) = (code %d, done %v, stderr %q), want usage error 2 that mentions -gpu", tc.args, code, done, stderr)
+				}
+				return
+			}
+			if done {
+				t.Fatalf("parseRunArgs(%v) ended the command: %s", tc.args, stderr)
+			}
+			if rc.cfg.GPU.Mode != tc.wantMode || rc.cfg.GPU.RendererPath != tc.wantRenderer {
+				t.Errorf("GPU = (%q, %q), want (%q, %q)", rc.cfg.GPU.Mode, rc.cfg.GPU.RendererPath, tc.wantMode, tc.wantRenderer)
+			}
+		})
+	}
+}

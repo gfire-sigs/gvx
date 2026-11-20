@@ -397,7 +397,7 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		}
 		return nil
 	}
-	if err := mountStandardSubfilesystems(sctx, vfsObj, creds, root, mountSubfs); err != nil {
+	if err := mountStandardSubfilesystems(sctx, vfsObj, creds, root, s.sysfsData(), mountSubfs); err != nil {
 		return err
 	}
 	if err := populateDefaultEtcFiles(sctx, vfsObj, creds, root, s.guestResolvConf); err != nil {
@@ -453,7 +453,7 @@ func createDefaultGuestDirs(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	return nil
 }
 
-func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
+func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, sysfsData *sys.InternalData, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
 	dataOpts := func(data string) *vfs.MountOptions {
 		return &vfs.MountOptions{GetFilesystemOptions: vfs.GetFilesystemOptions{Data: data}}
 	}
@@ -465,7 +465,11 @@ func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 		{"/sys", "sysfs"},
 		{"/dev", "devtmpfs"},
 	} {
-		if err := mountSubfs(sub.target, sub.fsName, dataOpts("")); err != nil {
+		opts := dataOpts("")
+		if sub.fsName == "sysfs" && sysfsData != nil {
+			opts.GetFilesystemOptions.InternalData = sysfsData
+		}
+		if err := mountSubfs(sub.target, sub.fsName, opts); err != nil {
 			return err
 		}
 	}

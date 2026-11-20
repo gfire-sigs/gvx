@@ -166,6 +166,10 @@ func guestFeatureSet(plat platform.Platform) cpuid.FeatureSet {
 // MemoryFile, and the host lockdown denies the creation of a new one.
 var errRunConsumed = errors.New("gvx: Sandbox.Run already ran and consumed the kernel memory file")
 
+// errSandboxClosing reports a Run call that reached kernel start after Close
+// began stopping the sandbox.
+var errSandboxClosing = errors.New("gvx: the sandbox is closing")
+
 // createKernelMemoryFile creates the Sentry MemoryFile on an anonymous host
 // backing file. New calls it before the host lockdown because the lockdown
 // denies new host file creation.
@@ -256,6 +260,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	s.memFile = nil
 	if mf != nil {
 		s.runMemFile = mf
+		s.runStarted = true
 	}
 	s.mu.Unlock()
 	if mf == nil {
@@ -346,6 +351,11 @@ func (s *Sandbox) initFreshKernel(mf *pgalloc.MemoryFile, hostRAM uint64) (*kern
 		return nil, nil, nil, nil, err
 	}
 	if err := registerKernelVFS(k.VFS(), rootNetNS); err != nil {
+		cleanupNetLog()
+		tk.Destroy()
+		return nil, nil, nil, nil, err
+	}
+	if err := s.registerGPU(k.VFS()); err != nil {
 		cleanupNetLog()
 		tk.Destroy()
 		return nil, nil, nil, nil, err
@@ -499,6 +509,7 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 	s.memFile = nil
 	if mf != nil {
 		s.runMemFile = mf
+		s.runStarted = true
 	}
 	s.mu.Unlock()
 	if k == nil || mf == nil {
@@ -527,7 +538,17 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 // executeActiveKernel starts k, attaches the watchdog and memory guard, waits
 // for guest exit or cancellation, and translates the exit status.
 func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, mf *pgalloc.MemoryFile, hostRAM uint64, startErrPrefix string) (int, error) {
+	s.mu.Lock()
+	if s.gpuClosing {
+		s.mu.Unlock()
+		return 1, errSandboxClosing
+	}
+	s.runningKernel = k
+	s.mu.Unlock()
 	if err := k.Start(); err != nil {
+		s.mu.Lock()
+		s.runningKernel = nil
+		s.mu.Unlock()
 		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
 	}
 	// The watchdog logs the stacks of a task that stays in the Sentry for a
@@ -559,6 +580,9 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	s.ckptMu.Unlock()
 	close(doneCh)
 	k.Pause()
+	s.mu.Lock()
+	s.runningKernel = nil
+	s.mu.Unlock()
 
 	return s.collectKernelExitStatus(ctx, k, tg, &memoryExceeded)
 }

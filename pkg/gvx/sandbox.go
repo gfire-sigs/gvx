@@ -78,21 +78,33 @@ type Sandbox struct {
 	hostCARoots [][]byte
 	// forwards holds the port forwards that initNetstack bound, in rule order:
 	// the caller list, then the ports that PublishAll added.
-	forwards          []PortForward
-	ckptFiles         *checkpointBundleFiles
-	ckptMu            sync.Mutex
-	kernelReady       chan struct{}
-	kernelReadyOnce   sync.Once
-	runDone           chan struct{}
-	runDoneOnce       sync.Once
+	forwards        []PortForward
+	ckptFiles       *checkpointBundleFiles
+	ckptMu          sync.Mutex
+	kernelReady     chan struct{}
+	kernelReadyOnce sync.Once
+	runDone         chan struct{}
+	runDoneOnce     sync.Once
+	// runStarted is set when Run consumes the memory file. After that,
+	// runDone closes when the run ends. Sandbox.mu guards it.
+	runStarted bool
+	// runningKernel is the kernel of the current run, from just before
+	// k.Start until k.WaitExited and k.Pause return. Sandbox.mu guards it.
+	// Unlike activeKernel, it covers every guest task, not only PID 1.
+	runningKernel *kernel.Kernel
+	// gpuClosing is set by stopKernelForGPU. A run that has not started its
+	// kernel yet then does not start it. Sandbox.mu guards it.
+	gpuClosing        bool
 	activeKernel      *kernel.Kernel
 	activeWatchdog    *watchdog.Watchdog
 	checkpointStopped atomic.Bool
 	restoredKernel    *kernel.Kernel
 	restoredStdio     *restoreStdioCollector
-	detachDebugLog    func()
-	closed            bool
-	closeErr          error
+	// gpu is the GPU renderer and render node, or nil when the GPU is off.
+	gpu            *gpuHost
+	detachDebugLog func()
+	closed         bool
+	closeErr       error
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
@@ -168,6 +180,10 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 			return cleanup(err)
 		}
 		sb.ckptFiles = cf
+	}
+
+	if err := sb.startGPU(ctx); err != nil {
+		return cleanup(err)
 	}
 
 	if !cfg.DisableHostLockdown {
@@ -541,12 +557,19 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 // WireGuard endpoint, Netstack, the os.Root of every mount, EROFS layer handles, and
 // the hypervisor platform.
 func (s *Sandbox) Close() error {
+	kernelStopped := s.stopKernelForGPU()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return s.closeErr
 	}
 	s.closed = true
+
+	if !kernelStopped {
+		s.closeGPU(false) // kills the renderer; guest GPU calls then get EIO
+		s.closeErr = fmt.Errorf("gvx: the guest kernel did not stop within %v; the sandbox keeps its platform, memory, and mounts", gpuKernelStopTimeout)
+		return s.closeErr
+	}
 
 	if s.restoredKernel != nil {
 		if tk := s.restoredKernel.Timekeeper(); tk != nil {
@@ -607,6 +630,7 @@ func (s *Sandbox) Close() error {
 	if s.plat != nil {
 		if closer, ok := s.plat.(io.Closer); ok {
 			if err := closer.Close(); err != nil {
+				s.closeGPU(false)
 				// Retain backing memory and mounts when platform teardown fails.
 				s.closeErr = errors.Join(append(errs, err)...)
 				return s.closeErr
@@ -614,6 +638,7 @@ func (s *Sandbox) Close() error {
 		}
 		s.plat = nil
 	}
+	s.closeGPU(true)
 
 	if err := s.closeMounts(); err != nil {
 		errs = append(errs, err)

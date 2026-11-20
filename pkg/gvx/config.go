@@ -25,6 +25,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/netbackend"
@@ -365,6 +366,11 @@ type Config struct {
 	// the host process, so embedders that keep using the process for other
 	// work must set this field.
 	DisableHostLockdown bool
+
+	// GPU turns on a virtual GPU for the guest. It is off by default. It
+	// needs the hvf backend on darwin/arm64. New rejects it with checkpoint
+	// options, and Restore rejects any GPU setting.
+	GPU GPUConfig
 }
 
 // defaultHostname is the guest hostname when Config.Hostname is empty.
@@ -415,6 +421,16 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	case PlatformAuto, PlatformWHPX, PlatformHVF, PlatformSystrap:
 	default:
 		return fmt.Errorf("%w: unsupported platform %q", ErrInvalidConfig, c.Platform)
+	}
+
+	gpuMode, err := ParseGPUMode(string(c.GPU.Mode))
+	if err != nil {
+		return err
+	}
+	c.GPU.Mode = gpuMode
+	c.GPU.RendererPath = strings.TrimSpace(c.GPU.RendererPath)
+	if err := c.validateGPU(runtime.GOOS, runtime.GOARCH, hostMacOSVersion()); err != nil {
+		return err
 	}
 
 	if c.Architecture == "" {

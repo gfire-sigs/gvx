@@ -258,6 +258,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
+	if err := refuseGPURestore(cfg.GPU); err != nil {
+		return nil, err
+	}
 	manifest, err := readAndParseManifest(opts.Dir)
 	if err != nil {
 		return nil, err
