@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.18.10002026111600] - 2026-11-20
+
+This release adds opt-in `--auto-publish` (`Config.AutoPublishPorts`) to publish guest TCP listeners and `iptables` NAT `DNAT` ports onto host `127.0.0.1` under host lockdown (#218, #220). It also adds guest loopback fallback for inbound `-p` port forwarders (#219).
 
 ### Features
 
