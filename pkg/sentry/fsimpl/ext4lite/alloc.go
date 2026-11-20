@@ -182,9 +182,11 @@ func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, er
 			return v.takeRunLocked(uint32(gi), off, want)
 		}
 		if err := v.appendGroupLocked(); err != nil {
-			// The host has no room for a group. A flush still releases the
-			// freed blocks.
-			if (v.heldBlocksTotal > 0 || v.punchingTotal > 0) && errors.Is(err, linuxerr.ENOSPC) {
+			// The volume cannot grow, for a full host or for another host
+			// error. A flush still releases the freed blocks. The caller
+			// flushes and tries again, and the second try reports the host
+			// error if the volume still cannot grow.
+			if v.heldBlocksTotal > 0 || v.punchingTotal > 0 {
 				return 0, 0, errSpaceHeld
 			}
 			return 0, 0, err

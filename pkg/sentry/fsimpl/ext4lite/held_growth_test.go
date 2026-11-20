@@ -159,3 +159,30 @@ func TestParallelChurnDoesNotFailWithENOSPC(t *testing.T) {
 		t.Errorf("an operation failed while the host has room: %v", err)
 	}
 }
+
+// TestHeldSpaceServesWriteWhenGrowthFailsOtherwise fills group 0 and frees one
+// block that the disk records. The host then rejects every growth with an error
+// that does not mean "disk full", as a quota or a file size limit does. A write
+// of one block must flush and use the freed block, because the flush releases
+// space without the host.
+func TestHeldSpaceServesWriteWhenGrowthFailsOtherwise(t *testing.T) {
+	d := fillGroupZeroAndHoldOneBlock(t, -1)
+	errQuota := errors.New("host: file size limit reached")
+	d.f.mu.Lock()
+	d.f.fail = func(kind auOpKind, _ int) error {
+		if kind == auEnsure {
+			return errQuota
+		}
+		return nil
+	}
+	d.f.mu.Unlock()
+
+	fd := d.e.mustOpen("/out", linux.O_WRONLY)
+	defer fd.DecRef(d.e.ctx)
+	if _, err := fd.PWrite(d.e.ctx, usermem.BytesIOSequence(auFill(9, 0, blockSize)), 0, vfsWriteOpts); err != nil {
+		t.Errorf("a write of the size of the held block fails with %v", err)
+	}
+	if n := d.e.fs.v.numGroups(); n != 1 {
+		t.Errorf("the volume has %d groups after the failed growth, want 1", n)
+	}
+}
