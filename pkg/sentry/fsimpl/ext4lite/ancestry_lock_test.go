@@ -65,6 +65,16 @@ func raceAncestry(t *testing.T, e *env, vd vfs.VirtualDentry, count int, write f
 		}
 		done <- nil
 	}()
+	probe := func() string {
+		if !e.fs.IsDescendant(e.root, vd) {
+			return "IsDescendant(/, moved directory) = false, want true"
+		}
+		path, err := e.vfsObj.PathnameWithDeleted(e.ctx, e.root, vd)
+		if err != nil || !slices.Contains(want, path) {
+			return fmt.Sprintf("PathnameWithDeleted(moved directory) = %q, %v, want one of %q", path, err, want)
+		}
+		return ""
+	}
 	for {
 		select {
 		case err := <-done:
@@ -74,12 +84,13 @@ func raceAncestry(t *testing.T, e *env, vd vfs.VirtualDentry, count int, write f
 			return
 		default:
 		}
-		if !e.fs.IsDescendant(e.root, vd) {
-			t.Fatalf("IsDescendant(/, moved directory) = false, want true")
-		}
-		path, err := e.vfsObj.PathnameWithDeleted(e.ctx, e.root, vd)
-		if err != nil || !slices.Contains(want, path) {
-			t.Fatalf("PathnameWithDeleted(moved directory) = %q, %v, want one of %q", path, err, want)
+		if msg := probe(); msg != "" {
+			// The writer still uses the environment that the cleanup of the
+			// test closes. Wait for it before the test stops.
+			if err := <-done; err != nil {
+				t.Errorf("writer: %v", err)
+			}
+			t.Fatal(msg)
 		}
 	}
 }
@@ -94,7 +105,7 @@ func (e *env) dentryAt(p string) vfs.VirtualDentry {
 	return vd
 }
 
-// TestAncestryReadersDoNotTakeFilesystemMu checks the lock order of
+// TestAncestryReadersDoNotTakeFilesystemMu verifies the lock order of
 // pkg/sentry/vfs/vfs.go for IsDescendant, PrependPath, and InotifyWithParent.
 // That order puts their locks last. For example, the VFS calls IsDescendant
 // with its mount lock held, and a rename or an unlink holds fs.mu while it
