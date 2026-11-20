@@ -34,6 +34,7 @@ const (
 var rendererBaseComponents = []string{
 	"virglrenderer",
 	"venus-protocol",
+	"libepoxy",
 	"mesa",
 }
 
@@ -45,9 +46,9 @@ var rendererBundleKinds = map[string]bool{
 
 // checkRenderer verifies the license inputs of the GPU renderer bundle:
 // every BOTTLE.<formula> of gpurenderer/third_party.lock and the components
-// virglrenderer, venus-protocol, and mesa have a line in
+// virglrenderer, venus-protocol, libepoxy, and mesa have a line in
 // gpurenderer/licenses/components.txt; every line names a formula of the lock
-// file or one of those three components; every SPDX field parses with the
+// file or one of those four components; every SPDX field parses with the
 // package's SPDX parser; and gpurenderer/licenses/venus-protocol.txt exists.
 func checkRenderer(root string) error {
 	expected, err := readRendererLockComponents(filepath.Join(root, filepath.FromSlash(rendererLockRelPath)))

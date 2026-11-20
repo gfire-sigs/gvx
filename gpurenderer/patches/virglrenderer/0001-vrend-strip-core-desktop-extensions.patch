@@ -1,0 +1,292 @@
+From 6d76edb6581da5c428e4fb7c77ef2bb60463b7ab Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sat, 21 Nov 2026 00:01:04 +0900
+Subject: [PATCH 1/2] vrend: strip core desktop GL extension lines on compile
+
+Desktop OpenGL core implementations such as Apple OpenGL 4.1 omit
+extension strings for features that became core in earlier GLSL
+versions (for example GL_ARB_fragment_coord_conventions and
+GL_ARB_uniform_buffer_object). When vrend emits #version 130/140/150
+followed by #extension GL_<name> : require, those drivers reject the
+shader.
+
+Before glShaderSource on desktop GL, drop #extension lines that the
+host does not advertise when the feature is core at a GLSL version
+within the host GLSL version, and raise the desktop #version line to
+the highest dropped version.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 253 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 253 insertions(+)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 5bd362e..7fd66c7 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -1385,12 +1385,265 @@ static inline int conv_shader_type(int type)
+    };
+ }
+ 
++struct vrend_core_ext_entry {
++   const char *name;
++   size_t name_len;
++   const char *gl_name;
++   int core_glsl_ver;
++};
++
++#define VREND_CORE_EXT(ext, ver) { #ext, sizeof(#ext) - 1, "GL_" #ext, (ver) }
++
++static const struct vrend_core_ext_entry vrend_desktop_core_exts[] = {
++   VREND_CORE_EXT(ARB_texture_rectangle, 140),
++   VREND_CORE_EXT(ARB_uniform_buffer_object, 140),
++   VREND_CORE_EXT(ARB_texture_buffer_object, 140),
++   VREND_CORE_EXT(ARB_draw_instanced, 140),
++   VREND_CORE_EXT(ARB_fragment_coord_conventions, 150),
++   VREND_CORE_EXT(ARB_texture_multisample, 150),
++   VREND_CORE_EXT(ARB_explicit_attrib_location, 330),
++   VREND_CORE_EXT(ARB_shader_bit_encoding, 330),
++   VREND_CORE_EXT(ARB_sample_shading, 400),
++   VREND_CORE_EXT(ARB_gpu_shader5, 400),
++   VREND_CORE_EXT(ARB_gpu_shader_fp64, 400),
++   VREND_CORE_EXT(ARB_texture_cube_map_array, 400),
++   VREND_CORE_EXT(ARB_texture_gather, 400),
++   VREND_CORE_EXT(ARB_texture_query_lod, 400),
++   VREND_CORE_EXT(ARB_tessellation_shader, 400),
++   VREND_CORE_EXT(ARB_separate_shader_objects, 410),
++   VREND_CORE_EXT(ARB_viewport_array, 410),
++   VREND_CORE_EXT(ARB_shading_language_420pack, 420),
++   VREND_CORE_EXT(ARB_shader_image_load_store, 420),
++   VREND_CORE_EXT(ARB_conservative_depth, 420),
++   VREND_CORE_EXT(ARB_arrays_of_arrays, 430),
++   VREND_CORE_EXT(ARB_fragment_layer_viewport, 430),
++   VREND_CORE_EXT(ARB_texture_query_levels, 430),
++   VREND_CORE_EXT(ARB_shader_image_size, 430),
++   VREND_CORE_EXT(ARB_explicit_uniform_location, 430),
++   VREND_CORE_EXT(ARB_shader_storage_buffer_object, 430),
++   VREND_CORE_EXT(ARB_compute_shader, 430),
++   VREND_CORE_EXT(ARB_enhanced_layouts, 440),
++   VREND_CORE_EXT(ARB_derivative_control, 450),
++   VREND_CORE_EXT(ARB_shader_texture_image_samples, 450),
++   VREND_CORE_EXT(ARB_cull_distance, 450),
++};
++#undef VREND_CORE_EXT
++
++static int vrend_host_desktop_glsl_version(void)
++{
++   int major = vrend_state.gl_major_ver;
++   int minor = vrend_state.gl_minor_ver;
++
++   if (major < 3)
++      return 0;
++   if (major == 3 && minor == 0)
++      return 130;
++   if (major == 3 && minor == 1)
++      return 140;
++   if (major == 3 && minor == 2)
++      return 150;
++   return major * 100 + minor * 10;
++}
++
++static bool vrend_parse_desktop_version_line(const char *line, size_t len,
++                                             int *ver_out,
++                                             const char **suffix_out,
++                                             size_t *suffix_len_out)
++{
++   while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
++      len--;
++
++   size_t pos = 0;
++   if (len < 9 || memcmp(line, "#version", 8) != 0)
++      return false;
++   pos = 8;
++   if (line[pos] != ' ' && line[pos] != '\t')
++      return false;
++   while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
++      pos++;
++   if (pos >= len || line[pos] < '0' || line[pos] > '9')
++      return false;
++
++   int ver = 0;
++   while (pos < len && line[pos] >= '0' && line[pos] <= '9') {
++      if (ver > 1000)
++         return false;
++      ver = ver * 10 + (line[pos] - '0');
++      pos++;
++   }
++
++   size_t suffix_start = pos;
++   while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
++      pos++;
++
++   size_t rem_len = len - pos;
++   while (rem_len > 0 && (line[pos + rem_len - 1] == ' ' || line[pos + rem_len - 1] == '\t'))
++      rem_len--;
++
++   if (rem_len >= 2 && memcmp(line + pos, "es", 2) == 0 &&
++       (rem_len == 2 || line[pos + 2] == ' ' || line[pos + 2] == '\t'))
++      return false;
++
++   *ver_out = ver;
++   *suffix_out = line + suffix_start;
++   *suffix_len_out = len - suffix_start;
++   return true;
++}
++
++static int vrend_match_dropped_core_ext(const char *line, size_t len,
++                                        const bool *drop_table)
++{
++   while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
++      len--;
++
++   size_t pos = 0;
++   if (len < 14 || memcmp(line, "#extension", 10) != 0)
++      return 0;
++   pos = 10;
++   if (line[pos] != ' ' && line[pos] != '\t')
++      return 0;
++   while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
++      pos++;
++   if (pos + 3 >= len || memcmp(line + pos, "GL_", 3) != 0)
++      return 0;
++   pos += 3;
++
++   size_t name_start = pos;
++   while (pos < len && line[pos] != ' ' && line[pos] != '\t' && line[pos] != ':')
++      pos++;
++   size_t name_len = pos - name_start;
++   if (name_len == 0)
++      return 0;
++
++   while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
++      pos++;
++   if (pos >= len || line[pos] != ':')
++      return 0;
++   pos++;
++   while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
++      pos++;
++
++   size_t verb_len = len - pos;
++   while (verb_len > 0 && (line[pos + verb_len - 1] == ' ' || line[pos + verb_len - 1] == '\t'))
++      verb_len--;
++
++   bool is_req_or_en =
++      (verb_len == 7 && memcmp(line + pos, "require", 7) == 0) ||
++      (verb_len == 6 && memcmp(line + pos, "enable", 6) == 0);
++   if (!is_req_or_en)
++      return 0;
++
++   for (size_t i = 0; i < ARRAY_SIZE(vrend_desktop_core_exts); i++) {
++      if (drop_table[i] &&
++          vrend_desktop_core_exts[i].name_len == name_len &&
++          memcmp(vrend_desktop_core_exts[i].name, line + name_start, name_len) == 0)
++         return vrend_desktop_core_exts[i].core_glsl_ver;
++   }
++   return 0;
++}
++
++static void vrend_rewrite_desktop_shader_header(struct vrend_strbuf *ver_ext)
++{
++   if (vrend_state.use_gles || !ver_ext || !ver_ext->buf || ver_ext->buf[0] == '\0')
++      return;
++
++   int host_glsl = vrend_host_desktop_glsl_version();
++   if (host_glsl <= 0)
++      return;
++
++   static int cached_host_glsl = -1;
++   static bool core_ext_drop[ARRAY_SIZE(vrend_desktop_core_exts)];
++   if (cached_host_glsl != host_glsl) {
++      for (size_t i = 0; i < ARRAY_SIZE(vrend_desktop_core_exts); i++) {
++         core_ext_drop[i] =
++            vrend_desktop_core_exts[i].core_glsl_ver <= host_glsl &&
++            !epoxy_has_gl_extension(vrend_desktop_core_exts[i].gl_name);
++      }
++      cached_host_glsl = host_glsl;
++   }
++
++   const char *src = ver_ext->buf;
++   int max_drop_ver = 0;
++   const char *p = src;
++   while (*p != '\0') {
++      const char *nl = strchr(p, '\n');
++      size_t line_len = nl ? (size_t)(nl - p + 1) : strlen(p);
++      int ext_ver = vrend_match_dropped_core_ext(p, line_len, core_ext_drop);
++      if (ext_ver > max_drop_ver)
++         max_drop_ver = ext_ver;
++      p += line_len;
++   }
++   if (max_drop_ver == 0)
++      return;
++
++   size_t src_len = (size_t)(p - src);
++   char stack_buf[4096];
++   char *dst_buf = stack_buf;
++   size_t dst_cap = sizeof(stack_buf);
++   bool heap_buf = false;
++   if (src_len + 16 > dst_cap) {
++      dst_cap = src_len + 16;
++      dst_buf = malloc(dst_cap);
++      if (!dst_buf)
++         return;
++      heap_buf = true;
++   }
++
++   size_t out_len = 0;
++   p = src;
++   while (*p != '\0') {
++      const char *nl = strchr(p, '\n');
++      size_t line_len = nl ? (size_t)(nl - p + 1) : strlen(p);
++      if (vrend_match_dropped_core_ext(p, line_len, core_ext_drop) > 0) {
++         p += line_len;
++         continue;
++      }
++
++      int cur_ver = 0;
++      const char *suffix = NULL;
++      size_t suffix_len = 0;
++      if (vrend_parse_desktop_version_line(p, line_len, &cur_ver, &suffix, &suffix_len) &&
++          max_drop_ver > cur_ver) {
++         int n = snprintf(dst_buf + out_len, dst_cap - out_len,
++                          "#version %d%.*s%s",
++                          max_drop_ver, (int)suffix_len, suffix,
++                          nl ? "\n" : "");
++         if (n < 0 || (size_t)n >= dst_cap - out_len) {
++            if (heap_buf)
++               free(dst_buf);
++            return;
++         }
++         out_len += (size_t)n;
++      } else {
++         if (line_len >= dst_cap - out_len) {
++            if (heap_buf)
++               free(dst_buf);
++            return;
++         }
++         memcpy(dst_buf + out_len, p, line_len);
++         out_len += line_len;
++      }
++      p += line_len;
++   }
++   dst_buf[out_len] = '\0';
++
++   if (out_len < ver_ext->alloc_size) {
++      memcpy(ver_ext->buf, dst_buf, out_len + 1);
++      ver_ext->size = out_len;
++   }
++   if (heap_buf)
++      free(dst_buf);
++}
++
+ static bool vrend_compile_shader(struct vrend_sub_context *sub_ctx,
+                                  struct vrend_shader *shader)
+ {
+    GLint param;
+    const char *shader_parts[SHADER_MAX_STRINGS];
+ 
++   if (!vrend_state.use_gles && shader->glsl_strings.num_strings > 0)
++      vrend_rewrite_desktop_shader_header(&shader->glsl_strings.strings[0]);
++
+    for (int i = 0; i < shader->glsl_strings.num_strings; i++)
+       shader_parts[i] = shader->glsl_strings.strings[i].buf;
+ 

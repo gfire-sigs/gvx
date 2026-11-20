@@ -42,7 +42,7 @@ static int check_bundle_file(const char *lib_dir, const char *name)
 	return 0;
 }
 
-int bundle_load(struct bundle *b)
+int bundle_locate(struct bundle *b)
 {
 	memset(b, 0, sizeof(*b));
 
@@ -102,6 +102,11 @@ int bundle_load(struct bundle *b)
 		return -1;
 	}
 
+	return 0;
+}
+
+int bundle_load_vulkan(struct bundle *b)
+{
 	if (check_bundle_file(b->lib_dir, "libvulkan_kosmickrisp.dylib") != 0 ||
 	    check_bundle_file(b->lib_dir, "libvulkan.dylib") != 0) {
 		return -1;
@@ -137,7 +142,7 @@ int bundle_load(struct bundle *b)
 	}
 
 	char lib_prefix[PATH_MAX];
-	n = snprintf(lib_prefix, sizeof(lib_prefix), "%s/", b->lib_dir);
+	int n = snprintf(lib_prefix, sizeof(lib_prefix), "%s/", b->lib_dir);
 	if (n < 0 || (size_t)n >= sizeof(lib_prefix)) {
 		fprintf(stderr, "gvx-gpu-renderer: bundle lib prefix exceeds PATH_MAX\n");
 		return -1;

@@ -5,6 +5,8 @@ VIRGLRENDERER_URL=https://gitlab.freedesktop.org/virgl/virglrenderer.git
 VIRGLRENDERER_COMMIT=211ca6e3ac98a2c18309b6d96ece75f76e0d049e
 VENUS_PROTOCOL_URL=https://gitlab.freedesktop.org/virgl/venus-protocol.git
 VENUS_PROTOCOL_COMMIT=ca19b6358d7cc491bc3e4de76f04c6700876a8fa
+LIBEPOXY_URL=https://github.com/anholt/libepoxy.git
+LIBEPOXY_COMMIT=c84bc9459357a40e46e2fec0408d04fbdde2c973
 PYTHON_REQUIREMENTS=Mako==1.4.3 MarkupSafe==3.0.4 PyYAML==6.0.3
 DRIVER_NAME=KosmicKrisp
 DRIVER_FORMULA=mesa

@@ -81,7 +81,7 @@ static void renderer_virgl_log(enum virgl_log_level_flags log_level,
 static int print_usage(void)
 {
 	fprintf(stderr,
-	        "gvx-gpu-renderer: usage: gvx-gpu-renderer [--selftest | --memory-limit=N]\n");
+	        "gvx-gpu-renderer: usage: gvx-gpu-renderer [--mode=venus|virgl] [--selftest | --memory-limit=N]\n");
 	return GVX_GPU_EXIT_USAGE;
 }
 
@@ -196,13 +196,16 @@ int main(int argc, char **argv)
 
 	bool selftest = false;
 	bool stall_fences = false;
+	bool seen_mode = false;
 	bool seen_memory_limit = false;
 	bool seen_test_watchdog = false;
+	uint32_t mode = GVX_GPU_MODE_VENUS;
 	uint64_t memory_limit = 0;
 	uint64_t test_watchdog_bytes = 0;
 
 	const char *test_mode = getenv(GVX_GPU_ENV_TEST_MODE);
 	const bool allow_test_args = (test_mode != NULL && strcmp(test_mode, "1") == 0);
+	const size_t mode_prefix_len = strlen(GVX_GPU_ARG_MODE);
 	const size_t mem_limit_prefix_len = strlen(GVX_GPU_ARG_MEMORY_LIMIT);
 	const size_t test_wd_prefix_len = strlen(GVX_GPU_ARG_TEST_WATCHDOG_BYTES);
 
@@ -213,6 +216,19 @@ int main(int argc, char **argv)
 				return print_usage();
 			}
 			selftest = true;
+		} else if (strncmp(arg, GVX_GPU_ARG_MODE, mode_prefix_len) == 0) {
+			if (seen_mode) {
+				return print_usage();
+			}
+			const char *val = arg + mode_prefix_len;
+			if (strcmp(val, GVX_GPU_MODE_NAME_VENUS) == 0) {
+				mode = GVX_GPU_MODE_VENUS;
+			} else if (strcmp(val, GVX_GPU_MODE_NAME_VIRGL) == 0) {
+				mode = GVX_GPU_MODE_VIRGL;
+			} else {
+				return print_usage();
+			}
+			seen_mode = true;
 		} else if (strcmp(arg, GVX_GPU_ARG_STALL_FENCES) == 0) {
 			if (!allow_test_args || stall_fences) {
 				return print_usage();
@@ -235,7 +251,7 @@ int main(int argc, char **argv)
 			return print_usage();
 		}
 	}
-	if (selftest && argc != 2) {
+	if (selftest && argc != (seen_mode ? 3 : 2)) {
 		return print_usage();
 	}
 
@@ -267,35 +283,40 @@ int main(int argc, char **argv)
 
 	virgl_set_log_callback(renderer_virgl_log, NULL, NULL);
 
-	if (check_macos_version() != 0) {
+	if (mode == GVX_GPU_MODE_VENUS && check_macos_version() != 0) {
 		return GVX_GPU_EXIT_INIT;
 	}
 
 	struct bundle b;
-	if (bundle_load(&b) != 0) {
+	if (bundle_locate(&b) != 0) {
+		return GVX_GPU_EXIT_INIT;
+	}
+	if (mode == GVX_GPU_MODE_VENUS && bundle_load_vulkan(&b) != 0) {
 		return GVX_GPU_EXIT_INIT;
 	}
 
+	char err[256];
+	if (mode == GVX_GPU_MODE_VIRGL) {
+		err[0] = '\0';
+		if (gl_cgl_init(err, sizeof(err)) != 0) {
+			fprintf(stderr, "gvx-gpu-renderer: OpenGL probe failed: %s\n", err);
+			return GVX_GPU_EXIT_INIT;
+		}
+	}
+
 	/* virgl_renderer_init must run before Seatbelt confinement. */
-	int ret = virgl_renderer_init(server_cookie(), renderer_virgl_flags, server_callbacks());
+	int ret = virgl_renderer_init(server_cookie(), renderer_virgl_flags(mode), server_callbacks());
 	if (ret != 0) {
 		fprintf(stderr, "gvx-gpu-renderer: virgl_renderer_init failed: %d\n", ret);
 		return GVX_GPU_EXIT_INIT;
 	}
 
-	uint32_t max_ver = 0;
-	uint32_t max_size = 0;
-	virgl_renderer_get_cap_set(GVX_GPU_CAPSET_VENUS, &max_ver, &max_size);
-	if (max_size == 0 ||
-	    max_size > GVX_GPU_MAX_CAPSET_BYTES ||
-	    max_ver > GVX_GPU_MAX_CAPSET_VERSION) {
-		fprintf(stderr, "gvx-gpu-renderer: invalid venus capset: max_ver=%u max_size=%u\n",
-		        max_ver, max_size);
+	err[0] = '\0';
+	if (server_init_capsets(mode, err, sizeof(err)) != 0) {
+		fprintf(stderr, "gvx-gpu-renderer: capset init failed: %s\n", err);
 		return GVX_GPU_EXIT_INIT;
 	}
-	server_set_venus_caps(max_ver, max_size);
 
-	char err[256];
 	err[0] = '\0';
 	if (confine_apply(b.lib_dir, err, sizeof(err)) != 0) {
 		fprintf(stderr, "gvx-gpu-renderer: confinement failed: %s\n", err);
@@ -303,7 +324,7 @@ int main(int argc, char **argv)
 	}
 
 	if (selftest) {
-		return selftest_run(&b);
+		return selftest_run(&b, mode);
 	}
 
 	uint64_t watchdog_limit = 0;
@@ -322,11 +343,13 @@ int main(int argc, char **argv)
 		return GVX_GPU_EXIT_CONFINE;
 	}
 
-	err[0] = '\0';
-	if (vk_probe_device(&b, err, sizeof(err)) != 0) {
-		fprintf(stderr, "gvx-gpu-renderer: Vulkan probe failed: %s\n", err);
-		return GVX_GPU_EXIT_INIT;
+	if (mode == GVX_GPU_MODE_VENUS) {
+		err[0] = '\0';
+		if (vk_probe_device(&b, err, sizeof(err)) != 0) {
+			fprintf(stderr, "gvx-gpu-renderer: Vulkan probe failed: %s\n", err);
+			return GVX_GPU_EXIT_INIT;
+		}
 	}
 
-	return server_run(GVX_GPU_SOCKET_FD, stall_fences, allow_test_args);
+	return server_run(GVX_GPU_SOCKET_FD, mode, stall_fences, allow_test_args);
 }

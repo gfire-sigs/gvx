@@ -24,8 +24,7 @@
 #include <vulkan/vulkan.h>
 
 #include "gvx_gpu_protocol.h"
-
-struct virgl_renderer_callbacks;
+#include "virglrenderer.h"
 
 /* Real paths of the bundle that holds this executable. */
 struct bundle {
@@ -36,11 +35,17 @@ struct bundle {
 };
 
 /*
- * Populates b from the executable path and verifies bundle libraries.
- * Loads libvulkan.dylib by leaf name and verifies it resolves inside lib_dir.
+ * Populates b->root and b->lib_dir from the executable real path.
  * Prints one diagnostic line on stderr and returns -1 on failure.
  */
-int bundle_load(struct bundle *b);
+int bundle_locate(struct bundle *b);
+
+/*
+ * Verifies bundle Vulkan libraries and loads libvulkan.dylib by leaf name.
+ * Requires b->lib_dir from bundle_locate. Prints one diagnostic line on
+ * stderr and returns -1 on failure.
+ */
+int bundle_load_vulkan(struct bundle *b);
 
 /*
  * Applies the renderer Seatbelt profile and resource limits.
@@ -101,17 +106,51 @@ int wire_send(int fd, const struct gvx_gpu_header *h, const void *payload, int s
 struct virgl_renderer_callbacks *server_callbacks(void);
 void *server_cookie(void);
 
-/* Records the validated venus capset bounds for HELLO and GET_CAPSET. */
-void server_set_venus_caps(uint32_t max_version, uint32_t max_size);
+/*
+ * Reads and validates the capsets of mode (venus: 4; virgl: 1 and 2) with
+ * virgl_renderer_get_cap_set. In virgl mode it also fills each capset at its
+ * max_version into the cache. Rejects max_size 0 or above
+ * GVX_GPU_MAX_CAPSET_BYTES and max_version above GVX_GPU_MAX_CAPSET_VERSION.
+ * Returns 0, or -1 with a message in err.
+ */
+int server_init_capsets(uint32_t mode, char *err, size_t err_len);
+
+/* Returns the number of initialized capsets. */
+uint32_t server_capset_count(void);
+
+/*
+ * Reads cached capset metadata and bytes at index into out parameters.
+ * Returns true when index is valid and cached.
+ */
+bool server_get_cached_capset(uint32_t index,
+                              uint32_t *id_out,
+                              uint32_t *max_version_out,
+                              const uint8_t **data_out,
+                              uint32_t *size_out);
+
+/*
+ * Maps a virglrenderer return value (negative or positive host errno) to a
+ * closed GVX_GPU_STATUS_* value.
+ */
+int32_t renderer_status_from_ret(int ret);
+
+/*
+ * Creates a virglrenderer context. In virgl mode it restores ctx0 after
+ * creation so vrend's context tracker matches the thread-local CGL context.
+ */
+int server_create_context(uint32_t ctx_id,
+                          uint32_t capset_id,
+                          uint32_t name_len,
+                          const char *name);
 
 /* Reports whether the last write_context_fence callback matched (ctx_id, fence_id). */
 bool server_fence_seen(uint32_t ctx_id, uint64_t fence_id);
 
 /* Serves protocol requests on sock until end of file. Returns a GVX_GPU_EXIT_* code. */
-int server_run(int sock, bool stall_fences, bool test_ops);
+int server_run(int sock, uint32_t mode, bool stall_fences, bool test_ops);
 
-/* Runs all self-test checks and prints one line per check to stdout. */
-int selftest_run(const struct bundle *b);
+/* Runs all self-test checks for mode and prints one line per check to stdout. */
+int selftest_run(const struct bundle *b, uint32_t mode);
 
 /*
  * Confinement checks shared by --selftest and TEST_CONFINE.
@@ -142,10 +181,57 @@ int watchdog_start(uint64_t limit_bytes);
 void watchdog_arm(void);
 
 /*
- * virglrenderer initialization flags for both modes.
+ * Returns virglrenderer initialization flags for mode.
  * VIRGL_RENDERER_ASYNC_FENCE_CB stays clear so write_context_fence runs on the
- * thread calling virgl_renderer_context_poll.
+ * thread calling poll.
  */
-extern const int renderer_virgl_flags;
+int renderer_virgl_flags(uint32_t mode);
+
+#define GL_CGL_MAX_CONTEXTS 1024u
+
+/*
+ * Chooses the CGL pixel format, creates one probe context, and verifies that
+ * it is an accelerated OpenGL 4.1 core context. Logs one line:
+ * "gvx-gpu-renderer: OpenGL: <GL_RENDERER>, <GL_VERSION>". Leaves no context
+ * current. Call once before virgl_renderer_init and before confinement.
+ * Returns 0, or -1 with a message in err.
+ */
+int gl_cgl_init(char *err, size_t err_len);
+
+/* Returns GL_RENDERER of the probe context, or "" before gl_cgl_init. */
+const char *gl_cgl_renderer(void);
+
+/* vrend GL callbacks (struct virgl_renderer_callbacks v4). */
+virgl_renderer_gl_context gl_cgl_create_context(void *cookie,
+                                                int scanout_idx,
+                                                struct virgl_renderer_gl_ctx_param *param);
+void gl_cgl_destroy_context(void *cookie, virgl_renderer_gl_context ctx);
+int gl_cgl_make_current(void *cookie, int scanout_idx, virgl_renderer_gl_context ctx);
+
+/* Returns the number of live contexts that gl_cgl_create_context returned. */
+uint32_t gl_cgl_live_contexts(void);
+
+/*
+ * Creates a vrend resource with a shared-memory backing and attaches both to
+ * ctx_id. Writes the descriptor to fd_out and the aligned size to
+ * host_size_out, and returns a GVX_GPU_STATUS_* code.
+ */
+int32_t virgl_res_create(uint32_t ctx_id,
+                         const struct gvx_gpu_res_create_request *req,
+                         int *fd_out,
+                         uint64_t *host_size_out);
+
+/*
+ * Copies synchronously between the attached backing of req->res_id and the
+ * vrend resource in ctx_id. Returns a GVX_GPU_STATUS_* code.
+ */
+int32_t virgl_res_transfer(uint32_t ctx_id,
+                           const struct gvx_gpu_transfer_request *req);
+
+/*
+ * Detaches the backing and context attachment (when ctx_live is true), unrefs
+ * res_id, and unmaps and frees the backing.
+ */
+void virgl_res_unref(uint32_t ctx_id, bool ctx_live, uint32_t res_id);
 
 #endif /* GVX_GPU_RENDERER_H */

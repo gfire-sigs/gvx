@@ -1,0 +1,73 @@
+From 8c5751c6ca134bc8a23883c7ed773b522de8b1f3 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sat, 21 Nov 2026 00:01:04 +0900
+Subject: [PATCH 2/2] vrend: fall back to glTexImage2DMultisample without
+ storage multisample
+
+On desktop OpenGL hosts that support GL_ARB_texture_storage but lack
+GL_ARB_texture_storage_multisample (such as Apple OpenGL 4.1 core),
+vrend_check_texture_multisample skipped every format with
+VIRGL_TEXTURE_CAN_TEXTURE_STORAGE instead of probing it with
+glTexImage2DMultisample. That left supported_multisample_formats
+empty and prevented guest Mesa from advertising desktop GL 3.0+.
+
+Use glTexStorage2DMultisample only when both the format storage flag
+and enable_storage hold, and use glTexImage2DMultisample on desktop
+GL otherwise. Apply the same feat_storage_multisample guard in
+vrend_resource_alloc_texture and skip mip level parameters on
+multisample targets.
+
+License: MIT
+---
+ src/vrend/vrend_formats.c  | 7 ++++---
+ src/vrend/vrend_renderer.c | 5 +++--
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index 670b3a4..9e95710 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -650,8 +650,9 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
+ {
+    bool is_desktop_gl = epoxy_is_desktop_gl();
+    for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
+-      bool function_available =
+-         (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) ? enable_storage : is_desktop_gl;
++      bool use_storage =
++         (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) && enable_storage;
++      bool function_available = use_storage || is_desktop_gl;
+ 
+       if (table[i].internalformat != 0 &&
+           !(table[i].flags & VIRGL_TEXTURE_CAN_MULTISAMPLE) &&
+@@ -659,7 +660,7 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
+          GLuint tex_id;
+          glGenTextures(1, &tex_id);
+          glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex_id);
+-         if (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) {
++         if (use_storage) {
+             glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 2,
+                                       table[i].internalformat, 32, 32, GL_TRUE);
+          } else {
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 7fd66c7..15440df 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8938,7 +8938,8 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+    struct pipe_resource *pr = &gr->base;
+ 
+    const bool format_can_texture_storage = has_feature(feat_texture_storage) &&
+-        (tex_conv_table[format].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE);
++        (tex_conv_table[format].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) &&
++        (pr->nr_samples <= 1 || has_feature(feat_storage_multisample));
+ 
+    if (format_can_texture_storage)
+       gr->storage_bits |= VREND_STORAGE_GL_IMMUTABLE;
+@@ -9094,7 +9095,7 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+       }
+    }
+ 
+-   if (!format_can_texture_storage) {
++   if (!format_can_texture_storage && pr->nr_samples <= 1) {
+       glTexParameteri(gr->target, GL_TEXTURE_BASE_LEVEL, 0);
+       glTexParameteri(gr->target, GL_TEXTURE_MAX_LEVEL, pr->last_level);
+    }

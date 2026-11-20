@@ -32,20 +32,34 @@ if min_macos == ''
 endif
 
 virgl = subproject('virglrenderer', default_options: [
-  'venus=true', 'vrend=false',
+  'venus=true', 'vrend=true', 'platforms=',
   'render-server-mode=thread', 'render-server-worker=thread',
   'tests=false', 'video=false', 'tracing=none',
   'default_library=static', 'werror=false',
 ])
 
+# Drop sources from libvirglrenderer_dep. virglrenderer's gallium_dep exports
+# u_format_table.c in sources, but libgallium.a already compiles that file,
+# and the parent target lacks virglrenderer's internal defines.
+virgl_dep = virgl.get_variable('libvirglrenderer_dep').partial_dependency(
+  compile_args: true,
+  link_args: true,
+  links: true,
+  includes: true,
+)
+
+opengl_dep = dependency('appleframeworks', modules: ['OpenGL'])
+
 executable('gvx-gpu-renderer',
   'src/main.c', 'src/bundle_darwin.c', 'src/confine_darwin.c', 'src/confine_checks.c',
   'src/vk_probe.c', 'src/wire.c', 'src/server.c', 'src/selftest.c', 'src/watchdog_darwin.c',
+  'src/gl_cgl_darwin.c', 'src/virgl_res.c',
   include_directories: include_directories('.', 'selftest', is_system: false),
   c_args: [
     '-mmacosx-version-min=26.0',
     '-D_DARWIN_C_SOURCE',
     '-DVK_NO_PROTOTYPES',
+    '-DGL_SILENCE_DEPRECATION',
     '-DGVX_RENDERER_VERSION="' + meson.project_version() + '"',
     '-DGVX_RENDERER_BUILD_INFO="' + build_info + '"',
     '-DGVX_RENDERER_MIN_MACOS="' + min_macos + '"',
@@ -53,7 +67,7 @@ executable('gvx-gpu-renderer',
     '-Wshadow', '-Wstrict-prototypes', '-Wmissing-prototypes', '-Wvla', '-Wformat=2',
   ],
   link_args: ['-mmacosx-version-min=26.0'],
-  dependencies: [virgl.get_variable('libvirglrenderer_dep'), dependency('threads')],
+  dependencies: [virgl_dep, dependency('threads'), opengl_dep],
   build_rpath: '@executable_path/../lib',
   install_rpath: '@executable_path/../lib',
   install: false)

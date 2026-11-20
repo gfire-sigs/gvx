@@ -34,9 +34,10 @@ void sandbox_free_error(char *errorbuf);
  * Seatbelt profile for the confined GPU renderer.
  *
  * Known residue: POSIX shm names exist in the global namespace between
- * shm_open(O_CREAT | O_EXCL, 0600) and shm_unlink. The names are random and
- * owner-only. Broad file-read-metadata stays enabled because narrowing it
- * crashed MoltenVK during host measurements.
+ * shm_open(O_CREAT | O_EXCL, 0600) and shm_unlink. The /gvx-r- names exist
+ * only between shm_open and shm_unlink of one RES_CREATE. The names are
+ * random and owner-only. Broad file-read-metadata stays enabled because
+ * narrowing it crashed MoltenVK during host measurements.
  */
 static const char renderer_seatbelt_profile[] =
     "(version 1)\n"
@@ -54,7 +55,8 @@ static const char renderer_seatbelt_profile[] =
     "(allow file-read-metadata)\n"
     "(allow ipc-posix-shm-read* ipc-posix-shm-write-create ipc-posix-shm-write-data ipc-posix-shm-write-unlink\n"
     "  (ipc-posix-name-prefix \"/vkr-\")\n"
-    "  (ipc-posix-name-prefix \"/proxy-\"))\n"
+    "  (ipc-posix-name-prefix \"/proxy-\")\n"
+    "  (ipc-posix-name-prefix \"/gvx-r-\"))\n"
     "(allow sysctl-read)\n"
     "(deny process-fork)\n"
     "(deny process-exec*)\n";

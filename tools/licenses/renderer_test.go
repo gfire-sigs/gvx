@@ -58,6 +58,25 @@ func TestCheckRenderer(t *testing.T) {
 			mutate: func(t *testing.T, root string) {},
 		},
 		{
+			name: "missing libepoxy line fails",
+			mutate: func(t *testing.T, root string) {
+				p := filepath.Join(root, filepath.FromSlash(rendererComponentsRelPath))
+				data, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatalf("read manifest: %v", err)
+				}
+				const target = "libepoxy|MIT|libepoxy.txt|pinned,mesa-source\n"
+				updated := strings.Replace(string(data), target, "", 1)
+				if updated == string(data) {
+					t.Fatal("failed to remove libepoxy line")
+				}
+				if err := os.WriteFile(p, []byte(updated), 0o644); err != nil {
+					t.Fatalf("write manifest: %v", err)
+				}
+			},
+			wantErr: `missing component "libepoxy"`,
+		},
+		{
 			name: "new bottle formula without manifest line fails",
 			mutate: func(t *testing.T, root string) {
 				p := filepath.Join(root, filepath.FromSlash(rendererLockRelPath))

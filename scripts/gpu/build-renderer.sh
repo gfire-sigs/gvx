@@ -27,6 +27,8 @@ VIRGLRENDERER_URL=""
 VIRGLRENDERER_COMMIT=""
 VENUS_PROTOCOL_URL=""
 VENUS_PROTOCOL_COMMIT=""
+LIBEPOXY_URL=""
+LIBEPOXY_COMMIT=""
 PYTHON_REQUIREMENTS=""
 MESA_VERSION=""
 MESA_BOTTLE_SHA256=""
@@ -41,6 +43,8 @@ VK_INCLUDE=""
 cache_dir=""
 work_dir=""
 meson_dir=""
+epoxy_build=""
+epoxy_prefix=""
 bundle_dir=""
 venv_python=""
 tmp_paths=()
@@ -161,13 +165,13 @@ step_args_and_host() {
 	fi
 
 	local cmd
-	for cmd in git curl shasum tar meson ninja cc install_name_tool codesign otool rsync; do
+	for cmd in git curl shasum tar meson ninja cc install_name_tool codesign otool rsync pkg-config; do
 		require_cmd "$cmd"
 	done
 	if [[ $driver_source == "homebrew" ]]; then
 		require_cmd brew
 	elif [[ $driver_source == "mesa-source" ]]; then
-		for cmd in cmake pkg-config brew; do
+		for cmd in cmake brew; do
 			require_cmd "$cmd"
 		done
 		local llvm_prefix
@@ -237,6 +241,14 @@ step_lock_file() {
 			[[ -z $VENUS_PROTOCOL_COMMIT ]] || die "duplicate key in $lock_file: $key"
 			VENUS_PROTOCOL_COMMIT=$val
 			;;
+		LIBEPOXY_URL)
+			[[ -z $LIBEPOXY_URL ]] || die "duplicate key in $lock_file: $key"
+			LIBEPOXY_URL=$val
+			;;
+		LIBEPOXY_COMMIT)
+			[[ -z $LIBEPOXY_COMMIT ]] || die "duplicate key in $lock_file: $key"
+			LIBEPOXY_COMMIT=$val
+			;;
 		PYTHON_REQUIREMENTS)
 			[[ -z $PYTHON_REQUIREMENTS ]] || die "duplicate key in $lock_file: $key"
 			PYTHON_REQUIREMENTS=$val
@@ -274,6 +286,8 @@ step_lock_file() {
 		VIRGLRENDERER_COMMIT
 		VENUS_PROTOCOL_URL
 		VENUS_PROTOCOL_COMMIT
+		LIBEPOXY_URL
+		LIBEPOXY_COMMIT
 		PYTHON_REQUIREMENTS
 	)
 	if [[ $driver_source == "pinned" ]]; then
@@ -320,6 +334,7 @@ fetch_git_source() {
 step_sources() {
 	fetch_git_source virglrenderer "$VIRGLRENDERER_URL" "$VIRGLRENDERER_COMMIT"
 	fetch_git_source venus-protocol "$VENUS_PROTOCOL_URL" "$VENUS_PROTOCOL_COMMIT"
+	fetch_git_source libepoxy "$LIBEPOXY_URL" "$LIBEPOXY_COMMIT"
 	VK_INCLUDE="$cache_dir/venus-protocol-${VENUS_PROTOCOL_COMMIT}/include"
 	if [[ ! -f "$VK_INCLUDE/vulkan/vulkan.h" ]]; then
 		die "missing Vulkan headers in $VK_INCLUDE"
@@ -390,6 +405,23 @@ step_python() {
 	export PYTHONNOUSERSITE=1
 	export PATH="$venv_dir/bin:$PATH"
 	venv_python="$venv_dir/bin/python"
+}
+
+step_epoxy() {
+	local src="$cache_dir/libepoxy-${LIBEPOXY_COMMIT}"
+	epoxy_build="$out_dir/epoxy-build"
+	epoxy_prefix="$out_dir/epoxy-prefix"
+	rm -rf -- "$epoxy_build" "$epoxy_prefix"
+	meson setup "$epoxy_build" "$src" --wrap-mode=nodownload \
+		--prefix="$epoxy_prefix" --libdir=lib --buildtype=release \
+		-Ddefault_library=static -Degl=no -Dglx=no -Dx11=false -Dtests=false -Ddocs=false \
+		-Dc_args=-mmacosx-version-min=26.0 -Dc_link_args=-mmacosx-version-min=26.0
+	ninja -C "$epoxy_build" install
+	[[ -f "$epoxy_prefix/lib/libepoxy.a" ]] || die "libepoxy.a missing in $epoxy_prefix/lib"
+	if compgen -G "$epoxy_prefix/lib/libepoxy*.dylib" >/dev/null; then
+		die "libepoxy must be static only"
+	fi
+	export PKG_CONFIG_PATH="$epoxy_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 }
 
 step_driver() {
@@ -488,6 +520,21 @@ step_work_tree() {
 	rsync -a --delete --exclude .git -- \
 		"$cache_dir/venus-protocol-${VENUS_PROTOCOL_COMMIT}/" \
 		"$work_dir/subprojects/virglrenderer/subprojects/$venus_dir/"
+
+	local patch_dir="$repo_root/gpurenderer/patches/virglrenderer"
+	if [[ -d $patch_dir ]]; then
+		local patch_file
+		shopt -s nullglob
+		for patch_file in "$patch_dir"/*.patch; do
+			GIT_CEILING_DIRECTORIES="$work_dir" git -C "$work_dir/subprojects/virglrenderer" \
+				apply --check "$patch_file" ||
+				die "virglrenderer patch failed check: $patch_file"
+			GIT_CEILING_DIRECTORIES="$work_dir" git -C "$work_dir/subprojects/virglrenderer" \
+				apply "$patch_file" ||
+				die "virglrenderer patch failed to apply: $patch_file"
+		done
+		shopt -u nullglob
+	fi
 }
 
 step_build() {
@@ -550,6 +597,7 @@ step_stage() {
 
 	cp -- "$cache_dir/virglrenderer-${VIRGLRENDERER_COMMIT}/COPYING" "$bundle_dir/LICENSES/virglrenderer.txt"
 	cp -- "$repo_root/gpurenderer/licenses/venus-protocol.txt" "$bundle_dir/LICENSES/venus-protocol.txt"
+	cp -- "$cache_dir/libepoxy-${LIBEPOXY_COMMIT}/COPYING" "$bundle_dir/LICENSES/libepoxy.txt"
 	for f in "$DRIVER_STAGE_DIR"/licenses/*.txt; do
 		cp -- "$f" "$bundle_dir/LICENSES/$(basename -- "$f")"
 	done
@@ -603,6 +651,9 @@ write_license_index() {
 		venus-protocol)
 			ver=${VENUS_PROTOCOL_COMMIT:0:12}
 			;;
+		libepoxy)
+			ver=${LIBEPOXY_COMMIT:0:12}
+			;;
 		mesa)
 			ver=$(awk '
 				/^MESA=/ { sub(/^MESA=/, "", $1); print $1; exit }
@@ -643,7 +694,18 @@ step_buildinfo() {
 	{
 		printf 'RENDERER_VERSION=0.1.0\n'
 		printf 'VIRGLRENDERER_COMMIT=%s\n' "$VIRGLRENDERER_COMMIT"
+		local patch_dir="$repo_root/gpurenderer/patches/virglrenderer"
+		if [[ -d $patch_dir ]]; then
+			local patch_file patch_sha
+			shopt -s nullglob
+			for patch_file in "$patch_dir"/*.patch; do
+				patch_sha=$(shasum -a 256 -- "$patch_file" | awk '{print $1}')
+				printf 'VIRGLRENDERER_PATCH=%s %s\n' "$(basename -- "$patch_file")" "$patch_sha"
+			done
+			shopt -u nullglob
+		fi
 		printf 'VENUS_PROTOCOL_COMMIT=%s\n' "$VENUS_PROTOCOL_COMMIT"
+		printf 'LIBEPOXY_COMMIT=%s\n' "$LIBEPOXY_COMMIT"
 		printf 'DRIVER=KosmicKrisp\n'
 		printf 'BOTTLE_TAG=%s\n' "$bottle_tag"
 		cat -- "$DRIVER_STAGE_DIR/driver.txt"
@@ -734,6 +796,7 @@ step_args_and_host "$@"
 step_lock_file
 step_sources
 step_python
+step_epoxy
 step_driver
 step_work_tree
 step_build

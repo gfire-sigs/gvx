@@ -38,13 +38,27 @@ _Static_assert(GVX_GPU_FD_TYPE_SHM == VIRGL_RENDERER_BLOB_FD_TYPE_SHM,
                "SHM fd type constant must match virglrenderer");
 
 #define SERVER_MAX_CONTEXTS 128
+#define SERVER_MAX_CAPSETS 2
 
-const int renderer_virgl_flags =
-    VIRGL_RENDERER_VENUS |
-    VIRGL_RENDERER_NO_VIRGL |
-    VIRGL_RENDERER_RENDER_SERVER |
-    VIRGL_RENDERER_THREAD_SYNC |
-    VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+int renderer_virgl_flags(uint32_t mode)
+{
+	if (mode == GVX_GPU_MODE_VIRGL) {
+		return 0;
+	}
+	return VIRGL_RENDERER_VENUS |
+	       VIRGL_RENDERER_NO_VIRGL |
+	       VIRGL_RENDERER_RENDER_SERVER |
+	       VIRGL_RENDERER_THREAD_SYNC |
+	       VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+}
+
+struct server_capset {
+	uint32_t id;
+	uint32_t max_version;
+	uint32_t size;
+	bool cached;
+	uint8_t data[GVX_GPU_MAX_CAPSET_BYTES];
+};
 
 struct server_context {
 	uint32_t id;
@@ -54,11 +68,12 @@ struct server_context {
 
 struct server {
 	int sock;
+	uint32_t mode;
 	bool stall_fences;
 	bool test_ops;
 	bool hello_done;
-	uint32_t venus_max_version;
-	uint32_t venus_max_size;
+	uint32_t num_capsets;
+	struct server_capset capsets[SERVER_MAX_CAPSETS];
 	struct server_context ctx[SERVER_MAX_CONTEXTS];
 	uint8_t *buf;
 	size_t buf_cap;
@@ -69,6 +84,16 @@ struct server {
 };
 
 static struct server g_server = { .sock = -1 };
+
+static const struct server_capset *find_capset(const struct server *s, uint32_t id)
+{
+	for (uint32_t i = 0; i < s->num_capsets; i++) {
+		if (s->capsets[i].id == id) {
+			return &s->capsets[i];
+		}
+	}
+	return NULL;
+}
 
 static struct server_context *find_context(struct server *s, uint32_t ctx_id)
 {
@@ -154,7 +179,11 @@ static void server_write_context_fence(void *cookie,
 static struct virgl_renderer_callbacks g_callbacks = {
 	.version = VIRGL_RENDERER_CALLBACKS_VERSION,
 	.write_fence = server_write_fence,
+	.create_gl_context = gl_cgl_create_context,
+	.destroy_gl_context = gl_cgl_destroy_context,
+	.make_current = gl_cgl_make_current,
 	.write_context_fence = server_write_context_fence,
+	/* get_egl_display stays NULL: virgl_renderer_init then uses these three callbacks. */
 };
 
 struct virgl_renderer_callbacks *server_callbacks(void)
@@ -167,10 +196,95 @@ void *server_cookie(void)
 	return &g_server;
 }
 
-void server_set_venus_caps(uint32_t max_version, uint32_t max_size)
+int server_init_capsets(uint32_t mode, char *err, size_t err_len)
 {
-	g_server.venus_max_version = max_version;
-	g_server.venus_max_size = max_size;
+	g_server.mode = mode;
+	g_server.num_capsets = 0;
+	memset(g_server.capsets, 0, sizeof(g_server.capsets));
+
+	uint32_t ids[SERVER_MAX_CAPSETS];
+	uint32_t count = 0;
+	bool cache_caps = false;
+
+	if (mode == GVX_GPU_MODE_VENUS) {
+		ids[0] = GVX_GPU_CAPSET_VENUS;
+		count = 1;
+	} else if (mode == GVX_GPU_MODE_VIRGL) {
+		ids[0] = GVX_GPU_CAPSET_VIRGL;
+		ids[1] = GVX_GPU_CAPSET_VIRGL2;
+		count = 2;
+		cache_caps = true;
+	} else {
+		snprintf(err, err_len, "unknown mode %u", mode);
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t max_ver = 0;
+		uint32_t max_size = 0;
+		virgl_renderer_get_cap_set(ids[i], &max_ver, &max_size);
+		if (max_size == 0 ||
+		    max_size > GVX_GPU_MAX_CAPSET_BYTES ||
+		    max_ver > GVX_GPU_MAX_CAPSET_VERSION) {
+			snprintf(err, err_len, "invalid capset %u: max_ver=%u max_size=%u",
+			         ids[i], max_ver, max_size);
+			return -1;
+		}
+
+		struct server_capset *cs = &g_server.capsets[i];
+		cs->id = ids[i];
+		cs->max_version = max_ver;
+		cs->size = max_size;
+		cs->cached = cache_caps;
+		if (cache_caps) {
+			memset(cs->data, 0, sizeof(cs->data));
+			virgl_renderer_fill_caps(cs->id, cs->max_version, cs->data);
+			fprintf(stderr, "gvx-gpu-renderer: virgl capset %u: max_version=%u max_size=%u\n",
+			        cs->id, cs->max_version, cs->size);
+		}
+	}
+
+	g_server.num_capsets = count;
+	return 0;
+}
+
+uint32_t server_capset_count(void)
+{
+	return g_server.num_capsets;
+}
+
+bool server_get_cached_capset(uint32_t index,
+                              uint32_t *id_out,
+                              uint32_t *max_version_out,
+                              const uint8_t **data_out,
+                              uint32_t *size_out)
+{
+	if (index >= g_server.num_capsets || !g_server.capsets[index].cached) {
+		return false;
+	}
+	const struct server_capset *cs = &g_server.capsets[index];
+	*id_out = cs->id;
+	*max_version_out = cs->max_version;
+	*data_out = cs->data;
+	*size_out = cs->size;
+	return true;
+}
+
+int server_create_context(uint32_t ctx_id,
+                          uint32_t capset_id,
+                          uint32_t name_len,
+                          const char *name)
+{
+	int ret = virgl_renderer_context_create_with_flags(ctx_id, capset_id, name_len, name);
+	if (ret == 0 && g_server.mode == GVX_GPU_MODE_VIRGL) {
+		/*
+		 * vrend_renderer_create_sub_ctx makes the new CGL context current
+		 * without updating vrend_state.current_ctx. Restore ctx0 so vrend's
+		 * tracker matches the thread-local CGL context.
+		 */
+		virgl_renderer_force_ctx_0();
+	}
+	return ret;
 }
 
 bool server_fence_seen(uint32_t ctx_id, uint64_t fence_id)
@@ -182,7 +296,7 @@ bool server_fence_seen(uint32_t ctx_id, uint64_t fence_id)
  * Maps a virglrenderer return value (negative or positive host errno, as its
  * functions mix both) to a closed GVX_GPU_STATUS_* value.
  */
-static int32_t status_from_ret(int ret)
+int32_t renderer_status_from_ret(int ret)
 {
 	if (ret == INT_MIN) {
 		return GVX_GPU_STATUS_IO;
@@ -281,7 +395,9 @@ static int validate_header(const struct server *s, const struct gvx_gpu_header *
 		return protocol_error("non-zero request status");
 	}
 	if ((h->op < GVX_GPU_OP_HELLO || h->op > GVX_GPU_OP_SUBMIT) &&
-	    h->op != GVX_GPU_OP_TEST_CONFINE) {
+	    h->op != GVX_GPU_OP_TEST_CONFINE &&
+	    h->op != GVX_GPU_OP_RES_CREATE &&
+	    h->op != GVX_GPU_OP_TRANSFER) {
 		return protocol_error("unknown request op");
 	}
 	if (h->seq == 0) {
@@ -320,13 +436,21 @@ static int handle_hello(struct server *s, const struct gvx_gpu_header *h)
 		send_reply(s, h, GVX_GPU_STATUS_NOT_SUPPORTED, NULL, 0, -1);
 		return 0;
 	}
+	if (req.mode != s->mode) {
+		fprintf(stderr, "gvx-gpu-renderer: HELLO mode %u, serving %u\n",
+		        req.mode, s->mode);
+		send_reply(s, h, GVX_GPU_STATUS_NOT_SUPPORTED, NULL, 0, -1);
+		return 0;
+	}
 
 	s->hello_done = true;
 
 	struct gvx_gpu_hello_reply hr;
 	memset(&hr, 0, sizeof(hr));
 	hr.version = GVX_GPU_VERSION;
-	hr.num_capsets = 1;
+	hr.num_capsets = s->num_capsets;
+	hr.mode = s->mode;
+	hr.reserved = 0;
 
 	static const char build_desc[] =
 	    "gvx-gpu-renderer " GVX_RENDERER_VERSION " " GVX_RENDERER_BUILD_INFO;
@@ -336,18 +460,21 @@ static int handle_hello(struct server *s, const struct gvx_gpu_header *h)
 	}
 	memcpy(hr.build, build_desc, copy_len);
 
-	struct gvx_gpu_capset_info ci = {
-		.id = GVX_GPU_CAPSET_VENUS,
-		.max_version = s->venus_max_version,
-		.max_size = s->venus_max_size,
-		.reserved = 0,
-	};
-
-	uint8_t out[GVX_GPU_HELLO_REPLY_SIZE + GVX_GPU_CAPSET_INFO_SIZE];
+	uint8_t out[GVX_GPU_HELLO_REPLY_SIZE + SERVER_MAX_CAPSETS * GVX_GPU_CAPSET_INFO_SIZE];
 	memcpy(out, &hr, GVX_GPU_HELLO_REPLY_SIZE);
-	memcpy(out + GVX_GPU_HELLO_REPLY_SIZE, &ci, GVX_GPU_CAPSET_INFO_SIZE);
+	for (uint32_t i = 0; i < s->num_capsets; i++) {
+		struct gvx_gpu_capset_info ci = {
+			.id = s->capsets[i].id,
+			.max_version = s->capsets[i].max_version,
+			.max_size = s->capsets[i].size,
+			.reserved = 0,
+		};
+		memcpy(out + GVX_GPU_HELLO_REPLY_SIZE + i * GVX_GPU_CAPSET_INFO_SIZE,
+		       &ci, GVX_GPU_CAPSET_INFO_SIZE);
+	}
 
-	send_reply(s, h, GVX_GPU_STATUS_OK, out, (uint32_t)sizeof(out), -1);
+	uint32_t out_len = GVX_GPU_HELLO_REPLY_SIZE + s->num_capsets * GVX_GPU_CAPSET_INFO_SIZE;
+	send_reply(s, h, GVX_GPU_STATUS_OK, out, out_len, -1);
 	return 0;
 }
 
@@ -359,16 +486,22 @@ static int handle_get_capset(struct server *s, const struct gvx_gpu_header *h)
 
 	struct gvx_gpu_get_capset_request req;
 	memcpy(&req, s->buf, sizeof(req));
-	if (req.id != GVX_GPU_CAPSET_VENUS || req.version > s->venus_max_version) {
+	const struct server_capset *cs = find_capset(s, req.id);
+	if (cs == NULL || req.version > cs->max_version) {
 		send_reply(s, h, GVX_GPU_STATUS_INVALID, NULL, 0, -1);
 		return 0;
 	}
 
+	if (cs->cached) {
+		send_reply(s, h, GVX_GPU_STATUS_OK, cs->data, cs->size, -1);
+		return 0;
+	}
+
 	uint8_t out[GVX_GPU_MAX_CAPSET_BYTES];
-	memset(out, 0, s->venus_max_size);
+	memset(out, 0, cs->size);
 	virgl_renderer_fill_caps(req.id, req.version, out);
 
-	send_reply(s, h, GVX_GPU_STATUS_OK, out, s->venus_max_size, -1);
+	send_reply(s, h, GVX_GPU_STATUS_OK, out, cs->size, -1);
 	return 0;
 }
 
@@ -385,7 +518,7 @@ static int handle_ctx_create(struct server *s, const struct gvx_gpu_header *h)
 		return protocol_error("bad CTX_CREATE name length");
 	}
 
-	if (req.capset_id != GVX_GPU_CAPSET_VENUS) {
+	if (find_capset(s, req.capset_id) == NULL) {
 		send_reply(s, h, GVX_GPU_STATUS_INVALID, NULL, 0, -1);
 		return 0;
 	}
@@ -406,10 +539,9 @@ static int handle_ctx_create(struct server *s, const struct gvx_gpu_header *h)
 	}
 	name[req.name_len] = '\0';
 
-	int ret = virgl_renderer_context_create_with_flags(
-	    h->ctx_id, req.capset_id, req.name_len, name);
+	int ret = server_create_context(h->ctx_id, req.capset_id, req.name_len, name);
 	if (ret != 0) {
-		send_reply(s, h, status_from_ret(ret), NULL, 0, -1);
+		send_reply(s, h, renderer_status_from_ret(ret), NULL, 0, -1);
 		return 0;
 	}
 
@@ -446,6 +578,10 @@ static int handle_blob_create(struct server *s, const struct gvx_gpu_header *h)
 {
 	if (h->payload_len != GVX_GPU_BLOB_CREATE_REQUEST_SIZE) {
 		return protocol_error("bad BLOB_CREATE payload size");
+	}
+	if (s->mode != GVX_GPU_MODE_VENUS) {
+		send_reply(s, h, GVX_GPU_STATUS_NOT_SUPPORTED, NULL, 0, -1);
+		return 0;
 	}
 
 	struct gvx_gpu_blob_create_request req;
@@ -484,7 +620,7 @@ static int handle_blob_create(struct server *s, const struct gvx_gpu_header *h)
 
 	int ret = virgl_renderer_resource_create_blob(&args);
 	if (ret != 0) {
-		send_reply(s, h, status_from_ret(ret), NULL, 0, -1);
+		send_reply(s, h, renderer_status_from_ret(ret), NULL, 0, -1);
 		return 0;
 	}
 
@@ -503,7 +639,7 @@ static int handle_blob_create(struct server *s, const struct gvx_gpu_header *h)
 			}
 			virgl_renderer_ctx_detach_resource((int)h->ctx_id, (int)req.res_id);
 			virgl_renderer_resource_unref(req.res_id);
-			send_reply(s, h, status_from_ret(ret), NULL, 0, -1);
+			send_reply(s, h, renderer_status_from_ret(ret), NULL, 0, -1);
 			return 0;
 		}
 		if (fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_SHM || blob_fd < 0) {
@@ -556,12 +692,88 @@ static int handle_res_unref(struct server *s, const struct gvx_gpu_header *h)
 	struct gvx_gpu_res_unref_request req;
 	memcpy(&req, s->buf, sizeof(req));
 
-	if (find_context(s, h->ctx_id) != NULL) {
-		virgl_renderer_ctx_detach_resource((int)h->ctx_id, (int)req.res_id);
+	const bool ctx_live = find_context(s, h->ctx_id) != NULL;
+	if (s->mode == GVX_GPU_MODE_VIRGL) {
+		virgl_res_unref(h->ctx_id, ctx_live, req.res_id);
+	} else {
+		if (ctx_live) {
+			virgl_renderer_ctx_detach_resource((int)h->ctx_id, (int)req.res_id);
+		}
+		virgl_renderer_resource_unref(req.res_id);
 	}
-	virgl_renderer_resource_unref(req.res_id);
 
 	send_reply(s, h, GVX_GPU_STATUS_OK, NULL, 0, -1);
+	return 0;
+}
+
+static int handle_res_create(struct server *s, const struct gvx_gpu_header *h)
+{
+	if (h->payload_len != GVX_GPU_RES_CREATE_REQUEST_SIZE) {
+		return protocol_error("bad RES_CREATE payload size");
+	}
+	if (s->mode != GVX_GPU_MODE_VIRGL) {
+		send_reply(s, h, GVX_GPU_STATUS_NOT_SUPPORTED, NULL, 0, -1);
+		return 0;
+	}
+
+	struct server_context *slot = find_context(s, h->ctx_id);
+	if (slot == NULL) {
+		send_reply(s, h, GVX_GPU_STATUS_INVALID, NULL, 0, -1);
+		return 0;
+	}
+	if (slot->lost) {
+		send_reply(s, h, GVX_GPU_STATUS_IO, NULL, 0, -1);
+		return 0;
+	}
+
+	struct gvx_gpu_res_create_request req;
+	memcpy(&req, s->buf, sizeof(req));
+
+	int res_fd = -1;
+	uint64_t host_size = 0;
+	int32_t st = virgl_res_create(h->ctx_id, &req, &res_fd, &host_size);
+	if (st != GVX_GPU_STATUS_OK) {
+		send_reply(s, h, st, NULL, 0, -1);
+		return 0;
+	}
+
+	struct gvx_gpu_res_create_reply rep = {
+		.host_size = host_size,
+		.fd_type = GVX_GPU_FD_TYPE_SHM,
+		.reserved = 0,
+	};
+	uint8_t out[GVX_GPU_RES_CREATE_REPLY_SIZE];
+	memcpy(out, &rep, sizeof(out));
+	send_reply(s, h, GVX_GPU_STATUS_OK, out, (uint32_t)sizeof(out), res_fd);
+	(void)close(res_fd);
+	return 0;
+}
+
+static int handle_transfer(struct server *s, const struct gvx_gpu_header *h)
+{
+	if (h->payload_len != GVX_GPU_TRANSFER_REQUEST_SIZE) {
+		return protocol_error("bad TRANSFER payload size");
+	}
+	if (s->mode != GVX_GPU_MODE_VIRGL) {
+		send_reply(s, h, GVX_GPU_STATUS_NOT_SUPPORTED, NULL, 0, -1);
+		return 0;
+	}
+
+	struct server_context *slot = find_context(s, h->ctx_id);
+	if (slot == NULL) {
+		send_reply(s, h, GVX_GPU_STATUS_INVALID, NULL, 0, -1);
+		return 0;
+	}
+	if (slot->lost) {
+		send_reply(s, h, GVX_GPU_STATUS_IO, NULL, 0, -1);
+		return 0;
+	}
+
+	struct gvx_gpu_transfer_request req;
+	memcpy(&req, s->buf, sizeof(req));
+
+	int32_t st = virgl_res_transfer(h->ctx_id, &req);
+	send_reply(s, h, st, NULL, 0, -1);
 	return 0;
 }
 
@@ -601,10 +813,18 @@ static int handle_submit(struct server *s, const struct gvx_gpu_header *h)
 		return 0;
 	}
 
-	if (req.cmd_len > 0) {
-		/* s->buf is malloc-aligned and GVX_GPU_SUBMIT_REQUEST_SIZE is 24, so cmd is 8-byte aligned. */
+	/*
+	 * In virgl mode, call submit_cmd even for 0 words so vrend switches the
+	 * active GL context before virgl_renderer_context_create_fence calls
+	 * glFenceSync.
+	 */
+	if (req.cmd_len > 0 || s->mode == GVX_GPU_MODE_VIRGL) {
+		uint64_t empty_cmd = 0;
+		void *cmd_buf = req.cmd_len > 0
+		                    ? (void *)(s->buf + GVX_GPU_SUBMIT_REQUEST_SIZE)
+		                    : (void *)&empty_cmd;
 		int ret = virgl_renderer_submit_cmd(
-		    s->buf + GVX_GPU_SUBMIT_REQUEST_SIZE, (int)h->ctx_id, (int)(req.cmd_len / 4u));
+		    cmd_buf, (int)h->ctx_id, (int)(req.cmd_len / 4u));
 		if (ret != 0) {
 			slot->lost = true;
 			send_ctx_lost(s, h->ctx_id, GVX_GPU_CTX_LOST_SUBMIT_FAILED);
@@ -698,15 +918,20 @@ static int dispatch_request(struct server *s, const struct gvx_gpu_header *h)
 		return handle_submit(s, h);
 	case GVX_GPU_OP_TEST_CONFINE:
 		return handle_test_confine(s, h);
+	case GVX_GPU_OP_RES_CREATE:
+		return handle_res_create(s, h);
+	case GVX_GPU_OP_TRANSFER:
+		return handle_transfer(s, h);
 	default:
 		return protocol_error("unknown request op");
 	}
 }
 
-int server_run(int sock, bool stall_fences, bool test_ops)
+int server_run(int sock, uint32_t mode, bool stall_fences, bool test_ops)
 {
 	struct server *s = &g_server;
 	s->sock = sock;
+	s->mode = mode;
 	s->stall_fences = stall_fences;
 	s->test_ops = test_ops;
 
@@ -773,12 +998,19 @@ int server_run(int sock, bool stall_fences, bool test_ops)
 			}
 		}
 
-		if (!s->stall_fences) {
-			for (size_t i = 0; i < SERVER_MAX_CONTEXTS; i++) {
-				if (s->ctx[i].id != 0 && s->ctx[i].pending_fences > 0) {
-					virgl_renderer_context_poll(s->ctx[i].id);
-					if (s->peer_gone) {
-						return GVX_GPU_EXIT_OK;
+		if (!s->stall_fences && has_pending_fences(s)) {
+			if (s->mode == GVX_GPU_MODE_VIRGL) {
+				virgl_renderer_poll();
+				if (s->peer_gone) {
+					return GVX_GPU_EXIT_OK;
+				}
+			} else {
+				for (size_t i = 0; i < SERVER_MAX_CONTEXTS; i++) {
+					if (s->ctx[i].id != 0 && s->ctx[i].pending_fences > 0) {
+						virgl_renderer_context_poll(s->ctx[i].id);
+						if (s->peer_gone) {
+							return GVX_GPU_EXIT_OK;
+						}
 					}
 				}
 			}
