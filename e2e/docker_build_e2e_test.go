@@ -17,14 +17,12 @@
 package e2e
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -47,10 +45,14 @@ func dindCacheDir(t *testing.T) string {
 	return sharedCacheDir(t)
 }
 
-// requireDindImage allows local-registry dind tests to run when CI provides
-// GVX_E2E_DIND_CACHE_DIR, and otherwise falls back to requireRegistry.
+// requireDindImage skips when GVX_E2E_OFFLINE=1 is set. When
+// GVX_E2E_DIND_CACHE_DIR is set without offline mode, it runs directly against
+// the cached layer directory; otherwise it calls requireRegistry.
 func requireDindImage(t *testing.T) {
 	t.Helper()
+	if os.Getenv("GVX_E2E_OFFLINE") == "1" {
+		t.Skip("registry tests are off (GVX_E2E_OFFLINE=1)")
+	}
 	if os.Getenv("GVX_E2E_DIND_CACHE_DIR") != "" {
 		return
 	}
@@ -184,12 +186,12 @@ echo REFUSED-OK
 
 timeout_out=$(docker run --rm %s /bin/svcprobe dial 192.0.2.1:80 2>&1 || true)
 echo "TIMEOUT: $timeout_out"
-echo "$timeout_out" | grep -qi 'i/o timeout' || fail "blackholed target did not time out: $timeout_out"
+echo "$timeout_out" | grep -qiE 'i/o timeout|no route to host|network is unreachable' || fail "blackholed target did not time out or report unreachable: $timeout_out"
 echo "$timeout_out" | grep -qi 'connection refused' && fail "blackholed target returned connection refused: $timeout_out"
 echo TIMEOUT-OK
 `, regHost, baseImage, bannerPort, baseImage, baseImage, closedPort, baseImage)
 
-			spec := guestSpec{
+			out := mustRunGuest(t, guestSpec{
 				plat:          b.plat,
 				image:         "docker:dind",
 				entrypoint:    []string{"sh", "-c"},
@@ -201,13 +203,13 @@ echo TIMEOUT-OK
 				packetWrite:   true,
 				allowSUID:     true,
 				mounts:        []gvx.Mount{{Kind: gvx.MountTmpfs, GuestPath: "/var/lib/docker", TmpfsSizeBytes: 2 << 30}},
+				cacheDir:      dindCacheDir(t),
 				timeout:       10 * time.Minute,
-			}
-
-			out := runGuestWithCache(t, spec, dindCacheDir(t))
+			})
 			requireContains(t, "dind local docker build", out,
 				"DOCKERD-READY\n",
 				"RESOLV-OK\n",
+				"REPLY host-build-ok",
 				"BUILD-OK\n",
 				"RUN-OK\n",
 				"REFUSED-OK\n",
@@ -272,31 +274,4 @@ echo RUN-OK
 			)
 		})
 	}
-}
-
-// runGuestWithCache runs g using cacheDir and fails the test unless the guest
-// exits with status 0.
-func runGuestWithCache(t *testing.T, g guestSpec, cacheDir string) string {
-	t.Helper()
-	timeout := g.timeout
-	if timeout == 0 {
-		timeout = 5 * time.Minute
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), timeout)
-	defer cancel()
-	var outBuf, errBuf strings.Builder
-	sb, err := gvx.New(ctx, g.config(cacheDir, &outBuf, &errBuf))
-	if err != nil {
-		t.Fatalf("gvx.New(%s, %s) failed: %v", g.plat, g.image, err)
-	}
-	defer func() {
-		if err := sb.Close(); err != nil {
-			t.Errorf("Close(%s, %s) failed: %v", g.plat, g.image, err)
-		}
-	}()
-	code, err := sb.Run(ctx)
-	if err != nil || code != 0 {
-		t.Fatalf("guest %s exit = (%d, %v)\nstdout:\n%s\nstderr:\n%s", g.image, code, err, outBuf.String(), errBuf.String())
-	}
-	return outBuf.String()
 }

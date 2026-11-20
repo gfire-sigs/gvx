@@ -205,6 +205,8 @@ type guestSpec struct {
 	// --privileged. dockerd needs all three.
 	packetWrite bool
 	allowSUID   bool
+	// cacheDir overrides sharedCacheDir when set.
+	cacheDir string
 }
 
 func (g guestSpec) config(cache string, stdout, stderr io.Writer) gvx.Config {
@@ -255,7 +257,11 @@ func runGuest(t *testing.T, g guestSpec) (code int, stdout, stderr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var outBuf, errBuf bytes.Buffer
-	sb, err := gvx.New(ctx, g.config(sharedCacheDir(t), &outBuf, &errBuf))
+	cache := g.cacheDir
+	if cache == "" {
+		cache = sharedCacheDir(t)
+	}
+	sb, err := gvx.New(ctx, g.config(cache, &outBuf, &errBuf))
 	if err != nil {
 		t.Fatalf("gvx.New(%s, %s) failed: %v", g.plat, g.image, err)
 	}

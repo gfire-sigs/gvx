@@ -669,7 +669,6 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 		nf.mu.Unlock()
 		return errors.New("netbackend: NATForwarder is closed")
 	}
-	nf.guestStack = restored
 	nf.mu.Unlock()
 
 	guestEP, hostEP := pipe.New("", "", uint32(nf.cfg.Tuning.Int(tuning.NATMTU)))
@@ -698,6 +697,15 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 			nf.log.Warn("netbackend: reapply the saved eth0 settings", "error", err)
 		}
 	}
+	nf.mu.Lock()
+	if nf.closed {
+		nf.mu.Unlock()
+		guestEP.Close()
+		hostEP.Close()
+		return errors.New("netbackend: NATForwarder is closed")
+	}
+	nf.guestStack = restored
+	nf.mu.Unlock()
 	restored.Restore()
 	return nil
 }

@@ -20,19 +20,12 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
-
-// discoverHostDNSServers returns the "host:port" address of each DNS server
-// that an operational Windows adapter reports. It runs before
-// hostlockdown.Apply. It returns nil when the call fails or no adapter lists a
-// server, so the relay then answers SERVFAIL.
-func discoverHostDNSServers() []string {
-	return discoverHostDNSConfig().servers
-}
 
 // discoverHostDNSConfig returns deduplicated DNS servers and adapter DNS search
 // suffixes from operational non-loopback Windows network adapters.
@@ -56,6 +49,9 @@ func adapterDNSConfig() (hostDNSConfig, error) {
 	size := uint32(15 * 1024)
 	var buf []byte
 	for range 8 {
+		if size == 0 {
+			return hostDNSConfig{}, windows.ERROR_BUFFER_OVERFLOW
+		}
 		buf = make([]byte, size)
 		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
 		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, first, &size)
@@ -67,7 +63,7 @@ func adapterDNSConfig() (hostDNSConfig, error) {
 		}
 		buf = nil
 	}
-	if buf == nil {
+	if len(buf) == 0 {
 		return hostDNSConfig{}, windows.ERROR_BUFFER_OVERFLOW
 	}
 
@@ -101,6 +97,7 @@ func adapterDNSConfig() (hostDNSConfig, error) {
 			cfg.servers = append(cfg.servers, net.JoinHostPort(addr.String(), "53"))
 		}
 	}
+	runtime.KeepAlive(buf)
 	cfg.servers = dedupeStrings(cfg.servers)
 	cfg.search = capSearchDomains(dedupeStrings(cfg.search))
 	return cfg, nil

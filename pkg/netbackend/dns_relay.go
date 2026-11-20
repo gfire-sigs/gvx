@@ -84,21 +84,27 @@ func dedupeStrings(in []string) []string {
 }
 
 // sanitizeSearchDomain validates one DNS search domain token from host config
-// so guest /etc/resolv.conf never receives whitespace or directive injection.
+// so guest /etc/resolv.conf never receives empty labels, whitespace, or
+// directive injection.
 func sanitizeSearchDomain(raw string) (string, bool) {
 	d := strings.TrimSuffix(strings.TrimSpace(raw), ".")
 	if d == "" || len(d) > 253 {
 		return "", false
 	}
-	if d[0] == '-' || d[0] == '.' || d[len(d)-1] == '-' {
-		return "", false
-	}
-	for i := range len(d) {
-		c := d[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' {
-			continue
+	for _, label := range strings.Split(d, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return "", false
 		}
-		return "", false
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for i := range len(label) {
+			c := label[i]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+				continue
+			}
+			return "", false
+		}
 	}
 	return d, true
 }

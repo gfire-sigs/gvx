@@ -53,7 +53,7 @@ func TestParseResolvConfWithoutNameserversReturnsNoServers(t *testing.T) {
 
 func TestParseResolvConfConfigExtractsSearchOptionsAndDeduplicates(t *testing.T) {
 	text := `domain old.example
-search corp.example. dev.example corp.example bad/domain ; comment
+search corp.example. dev.example corp.example a..b trailing.. -bad.example bad/domain ; comment
 nameserver 192.0.2.53
 nameserver 192.0.2.53
 nameserver 198.51.100.1
@@ -76,10 +76,13 @@ func TestMergeSystemdFallbackAppendsNonLoopbackUpstreams(t *testing.T) {
 	if !isOnlySystemdStub(primary.servers) {
 		t.Fatalf("isOnlySystemdStub(%v) = false, want true", primary.servers)
 	}
-	fallback := parseResolvConfConfig("search lan.example\nnameserver 127.0.0.1\nnameserver 192.0.2.10\nnameserver 198.51.100.20\noptions ndots:2\n")
+	fallback := parseResolvConfConfig("search lan.example\nnameserver 127.0.0.1\nnameserver 192.0.2.10\nnameserver fe80::1%eth0\nnameserver 198.51.100.20\noptions ndots:2\n")
 	merged := mergeSystemdFallback(primary, fallback)
-	if want := []string{"127.0.0.53:53", "192.0.2.10:53", "198.51.100.20:53"}; !slices.Equal(merged.servers, want) {
+	if want := []string{"127.0.0.53:53", "192.0.2.10:53", "[fe80::1%eth0]:53", "198.51.100.20:53"}; !slices.Equal(merged.servers, want) {
 		t.Fatalf("merged servers = %v, want %v", merged.servers, want)
+	}
+	if len(primary.servers) != 1 {
+		t.Fatalf("primary.servers was mutated: %v", primary.servers)
 	}
 	if want := []string{"lan.example"}; !slices.Equal(merged.search, want) {
 		t.Fatalf("merged search = %v, want %v", merged.search, want)

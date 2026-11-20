@@ -32,14 +32,6 @@ const (
 	systemdResolvConfPath = "/run/systemd/resolve/resolv.conf"
 )
 
-// discoverHostDNSServers returns the "host:port" address of each nameserver
-// in /etc/resolv.conf. It runs before hostlockdown.Apply, because lockdown
-// denies reads outside the workspace. It returns nil when the file is missing
-// or lists no valid nameserver, so the relay then answers SERVFAIL.
-func discoverHostDNSServers() []string {
-	return discoverHostDNSConfig().servers
-}
-
 // discoverHostDNSConfig reads nameservers, search domains, and resolver options
 // from /etc/resolv.conf before hostlockdown.Apply. When /etc/resolv.conf lists
 // only the systemd-resolved stub (127.0.0.53), it appends any non-loopback
@@ -64,10 +56,18 @@ func isOnlySystemdStub(servers []string) bool {
 }
 
 func mergeSystemdFallback(primary, fallback hostDNSConfig) hostDNSConfig {
-	merged := primary
+	merged := hostDNSConfig{
+		servers: append([]string(nil), primary.servers...),
+		search:  primary.search,
+		options: primary.options,
+	}
 	for _, s := range fallback.servers {
-		ap, err := netip.ParseAddrPort(s)
-		if err != nil || ap.Addr().IsLoopback() {
+		host, _, err := net.SplitHostPort(s)
+		if err != nil {
+			continue
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil || addr.IsLoopback() {
 			continue
 		}
 		merged.servers = append(merged.servers, s)
