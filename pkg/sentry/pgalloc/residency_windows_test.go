@@ -25,7 +25,7 @@ import (
 )
 
 func TestObserveResidencyUpdatesAccountingAndHonorsDecommit(t *testing.T) {
-	acct := new(usage.MemoryLocked)
+	acct := usage.NewMemoryLocked()
 	mf, err := NewDefaultMemoryFile(MemoryFileOpts{
 		SharedSection: true,
 		Accounting:    acct,

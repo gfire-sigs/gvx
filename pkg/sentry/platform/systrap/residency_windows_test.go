@@ -26,7 +26,7 @@ import (
 
 func newAccountedRig(t *testing.T) (*rig, *usage.MemoryLocked) {
 	t.Helper()
-	acct := new(usage.MemoryLocked)
+	acct := usage.NewMemoryLocked()
 	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{
 		SharedSection: true,
 		Accounting:    acct,
@@ -151,6 +151,32 @@ func TestStubResidencyAccounting(t *testing.T) {
 		r.mf.FlushCommitScan()
 		if got := acct.TotalPerCg(cgID); got != 0 {
 			t.Fatalf("TotalPerCg for untouched reallocation = %d, want 0", got)
+		}
+	})
+
+	t.Run("partial_unmap_splits_view", func(t *testing.T) {
+		r, acct := newAccountedRig(t)
+		const cgID = uint32(11)
+		fr, err := r.mf.Allocate(4*blockSize, pgalloc.AllocOpts{Kind: usage.Anonymous, MemCgID: cgID})
+		if err != nil {
+			t.Fatalf("Allocate: %v", err)
+		}
+		defer r.mf.DecRef(fr)
+
+		r.mapRange(dataVA, fr, hostarch.ReadWrite)
+		r.as.Unmap(dataVA+blockSize, 2*blockSize)
+
+		r.program(
+			gStoreTo(dataVA, 0x55),
+			gStoreTo(dataVA+3*blockSize, 0x66),
+			gSyscall(93),
+		)
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+
+		r.mf.FlushCommitScan()
+		if got := acct.TotalPerCg(cgID); got != 2*blockSize {
+			t.Fatalf("TotalPerCg after split view stores = %d, want %d", got, 2*blockSize)
 		}
 	})
 }

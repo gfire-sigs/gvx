@@ -187,9 +187,10 @@ func memFreeChecks(mib int) []check {
 		}
 
 		// /proc/meminfo calls MemoryFile.UpdateUsage rate-limited by ClockTick, so
-		// poll briefly until the scan observes the newly faulted pages.
+		// poll briefly until the scan observes the newly faulted pages (and
+		// allow up to 15 s for APFS st_blocks lag on macOS).
 		var freeDuring, anonDuring uint64
-		deadline := time.Now().Add(3 * time.Second)
+		deadline := time.Now().Add(15 * time.Second)
 		for {
 			freeDuring, err = meminfoValue("MemFree")
 			if err != nil {
