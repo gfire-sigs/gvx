@@ -64,6 +64,12 @@ var (
 	// ForwardMaxPortRange is the largest port range of one publish specification.
 	ForwardMaxPortRange = defineInt("net.forward.max_port_range", 1024, 1, 65535, "ports",
 		"Largest number of ports in one range of a publish specification, such as 30000-32767.")
+	// ForwardMaxDynamicPorts bounds how many loopback listeners --auto-publish opens at once.
+	ForwardMaxDynamicPorts = defineInt("net.forward.max_dynamic_ports", 64, 1, 256, "ports",
+		"Largest number of host loopback ports that auto-publish opens at once.")
+	// ForwardDynamicPollInterval sets how often --auto-publish inspects guest listeners and NAT rules.
+	ForwardDynamicPollInterval = defineDuration("net.forward.dynamic_poll_interval", 200*time.Millisecond, 20*time.Millisecond, 10*time.Second,
+		"Pause between two scans of guest listeners and iptables NAT rules when auto-publish is on.")
 	// WGQueueLength is the length of the packet queue of eth0 in the network mode "wg".
 	WGQueueLength = defineInt("net.wg.queue_length", 512, 1, 1<<20, "packets",
 		"Number of packets that the eth0 queue holds in the wg network mode.")

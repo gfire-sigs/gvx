@@ -325,6 +325,11 @@ type Config struct {
 	// free port of 127.0.0.1. It needs the nat network mode and an image.
 	PublishAll bool
 
+	// AutoPublishPorts publishes guest TCP listeners and iptables NAT DNAT
+	// ports on host 127.0.0.1 automatically while the sandbox runs. Static
+	// rules in PortForwards keep precedence. It needs the nat network mode.
+	AutoPublishPorts bool
+
 	// WorkDir is the initial guest working directory (defaults to "/workspace"
 	// when WorkspacePath is set, or "/").
 	WorkDir string
@@ -475,6 +480,9 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	}
 	if c.PublishAll && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: publishing the exposed ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if c.AutoPublishPorts && c.NetworkMode != NetModeNAT {
+		return fmt.Errorf("%w: auto-publishing guest ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
 	}
 	if err := c.validateMounts(); err != nil {
 		return err

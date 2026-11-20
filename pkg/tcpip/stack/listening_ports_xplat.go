@@ -76,3 +76,9 @@ func (s *Stack) HasBoundEndpoint(netProto tcpip.NetworkProtocolNumber, transProt
 	eps.mu.RUnlock()
 	return found
 }
+
+// IsDNATTarget reports that DNATTarget (and any wrapper type embedding it,
+// such as netfilter's dnatTarget) is an iptables DNAT rule target.
+func (*DNATTarget) IsDNATTarget() bool {
+	return true
+}

@@ -29,3 +29,11 @@ func dialHostContext(ctx context.Context, network, address string) (net.Conn, er
 func acceptHostListener(ln net.Listener) (net.Conn, error) {
 	return ln.Accept()
 }
+
+func listenHostLoopback(network, address string) (net.Listener, error) {
+	return net.Listen(network, address)
+}
+
+func listenHostPacketLoopback(network, address string) (net.PacketConn, error) {
+	return net.ListenPacket(network, address)
+}

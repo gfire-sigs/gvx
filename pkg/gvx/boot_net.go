@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"weak"
 
@@ -107,28 +108,55 @@ func (s *Sandbox) initNATStack() error {
 	return s.initPortForwarder()
 }
 
-// initPortForwarder pre-binds host listeners for all configured port forwards.
+// initPortForwarder pre-binds host listeners for all configured port forwards
+// and enables dynamic loopback publishing when Config.AutoPublishPorts is set.
 func (s *Sandbox) initPortForwarder() error {
 	s.forwards = s.effectivePortForwards()
-	if len(s.forwards) == 0 {
+	if len(s.forwards) == 0 && !s.cfg.AutoPublishPorts {
 		return nil
 	}
 	pf := netbackend.NewPortForwarder(s.cfg.Tuning)
 	if !s.cfg.DisableHostLockdown {
 		pf.SetAccept(hostlockdown.AcceptListener)
 	}
-	rules := make([]netbackend.PortForwardRule, 0, len(s.forwards))
-	for _, pfSpec := range s.forwards {
-		rule, err := buildPortForwardRule(pfSpec)
-		if err != nil {
+	if len(s.forwards) > 0 {
+		rules := make([]netbackend.PortForwardRule, 0, len(s.forwards))
+		for _, pfSpec := range s.forwards {
+			rule, err := buildPortForwardRule(pfSpec)
+			if err != nil {
+				_ = pf.Close()
+				return err
+			}
+			rules = append(rules, rule)
+		}
+		if err := pf.PreBind(rules); err != nil {
 			_ = pf.Close()
 			return err
 		}
-		rules = append(rules, rule)
 	}
-	if err := pf.PreBind(rules); err != nil {
-		_ = pf.Close()
-		return err
+	if s.cfg.AutoPublishPorts {
+		dynOpts := netbackend.DynamicForwardOptions{
+			MaxPorts:     s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts),
+			PollInterval: s.cfg.Tuning.Duration(tuning.ForwardDynamicPollInterval),
+		}
+		if !s.cfg.DisableHostLockdown {
+			dynOpts.ListenTCP = hostlockdown.ListenLoopback
+			dynOpts.ListenUDP = hostlockdown.ListenPacketLoopback
+		}
+		if w := s.cfg.Warnings; w != nil {
+			dynOpts.OnPublish = func(rule netbackend.PortForwardRule, added bool) {
+				host := net.JoinHostPort(rule.HostIP, strconv.Itoa(int(rule.HostPort)))
+				if added {
+					_, _ = fmt.Fprintf(w, "gvx: auto-published %s -> %d/%s\n", host, rule.GuestPort, rule.Proto)
+				} else {
+					_, _ = fmt.Fprintf(w, "gvx: unpublished %s -> %d/%s\n", host, rule.GuestPort, rule.Proto)
+				}
+			}
+			dynOpts.OnBindError = func(proto string, port uint16, err error) {
+				_, _ = fmt.Fprintf(w, "gvx: warning: could not auto-publish 127.0.0.1:%d/%s: %v\n", port, proto, err)
+			}
+		}
+		pf.EnableDynamicLoopback(dynOpts)
 	}
 	s.portForwarder = pf
 	return nil

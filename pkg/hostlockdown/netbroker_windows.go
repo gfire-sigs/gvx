@@ -18,6 +18,7 @@ package hostlockdown
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -32,9 +33,10 @@ const (
 )
 
 type winNetBroker struct {
-	dialCh   chan func()
-	acceptCh chan func()
-	stopCh   chan struct{}
+	dialCh            chan func()
+	acceptCh          chan func()
+	stopCh            chan struct{}
+	allowLoopbackBind bool
 }
 
 var activeNetBroker atomic.Pointer[winNetBroker]
@@ -53,7 +55,7 @@ func isAllowedNetBrokerNetwork(network string) bool {
 // attaches its own duplicated impersonation token and closes that token handle
 // immediately, and startNetBroker closes netTok before returning so zero
 // broker token handles remain in the process handle table.
-func startNetBroker(primary windows.Token, id *tokenIdentity, allowOutbound bool, preboundListeners int) (*winNetBroker, error) {
+func startNetBroker(primary windows.Token, id *tokenIdentity, allowOutbound bool, preboundListeners int, allowLoopbackBind bool, dynamicListeners int) (*winNetBroker, error) {
 	netTok, err := createNetBrokerImpersonationToken(primary, id)
 	if err != nil {
 		return nil, err
@@ -61,8 +63,9 @@ func startNetBroker(primary windows.Token, id *tokenIdentity, allowOutbound bool
 	defer netTok.Close()
 
 	b := &winNetBroker{
-		acceptCh: make(chan func()),
-		stopCh:   make(chan struct{}),
+		acceptCh:          make(chan func()),
+		stopCh:            make(chan struct{}),
+		allowLoopbackBind: allowOutbound && allowLoopbackBind,
 	}
 	if allowOutbound {
 		b.dialCh = make(chan func())
@@ -71,7 +74,11 @@ func startNetBroker(primary windows.Token, id *tokenIdentity, allowOutbound bool
 			return nil, err
 		}
 	}
-	acceptWorkers := max(preboundListeners, minNetAcceptWorkers)
+	totalListeners := preboundListeners
+	if b.allowLoopbackBind && dynamicListeners > 0 {
+		totalListeners += dynamicListeners
+	}
+	acceptWorkers := max(totalListeners, minNetAcceptWorkers)
 	if err := startNetWorkerPool(netTok, acceptWorkers, b.acceptCh, b.stopCh); err != nil {
 		close(b.stopCh)
 		return nil, err
@@ -185,4 +192,50 @@ func acceptHostListener(ln net.Listener) (net.Conn, error) {
 		_ = BindThread()
 	}
 	return ln.Accept()
+}
+
+func listenHostLoopback(network, address string) (net.Listener, error) {
+	if b := activeNetBroker.Load(); b != nil {
+		if !b.allowLoopbackBind || b.dialCh == nil {
+			return nil, errors.New("hostlockdown: loopback bind is disabled")
+		}
+		type listenResult struct {
+			ln  net.Listener
+			err error
+		}
+		done := make(chan listenResult, 1)
+		b.runDial(func() {
+			ln, err := net.Listen(network, address)
+			done <- listenResult{ln: ln, err: err}
+		})
+		res := <-done
+		return res.ln, res.err
+	}
+	if IsLockedDown() {
+		_ = BindThread()
+	}
+	return net.Listen(network, address)
+}
+
+func listenHostPacketLoopback(network, address string) (net.PacketConn, error) {
+	if b := activeNetBroker.Load(); b != nil {
+		if !b.allowLoopbackBind || b.dialCh == nil {
+			return nil, errors.New("hostlockdown: loopback bind is disabled")
+		}
+		type packetResult struct {
+			pc  net.PacketConn
+			err error
+		}
+		done := make(chan packetResult, 1)
+		b.runDial(func() {
+			pc, err := net.ListenPacket(network, address)
+			done <- packetResult{pc: pc, err: err}
+		})
+		res := <-done
+		return res.pc, res.err
+	}
+	if IsLockedDown() {
+		_ = BindThread()
+	}
+	return net.ListenPacket(network, address)
 }
