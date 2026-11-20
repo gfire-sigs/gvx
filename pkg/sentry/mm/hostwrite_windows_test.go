@@ -36,14 +36,15 @@ func newWatchedPMA(t *testing.T) (*MemoryManager, hostarch.AddrRange, memmap.Fil
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
 	t.Cleanup(mf.Destroy)
-	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	page := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(2*page, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 	got := new([]memmap.FileRange)
 	stop := mf.ObserveHostWrites(func(r memmap.FileRange) { *got = append(*got, r) })
 	t.Cleanup(stop)
-	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + 2*hostarch.PageSize}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + 2*hostarch.Addr(page)}
 	mm := &MemoryManager{}
 	mm.pmas.Insert(mm.pmas.FirstGap(), ar, pma{file: chunkLike{mf}, off: fr.Start})
 	return mm, ar, fr, got, mf
@@ -54,13 +55,14 @@ func newWatchedPMA(t *testing.T) (*MemoryManager, hostarch.AddrRange, memmap.Fil
 // the file range of that page.
 func TestHostWriteWrapReportsThroughAWrappedMemoryFile(t *testing.T) {
 	mm, ar, fr, got, _ := newWatchedPMA(t)
-	second := hostarch.AddrRange{Start: ar.Start + hostarch.PageSize, End: ar.End}
+	page := uint64(hostarch.PageSize)
+	second := hostarch.AddrRange{Start: ar.Start + hostarch.Addr(page), End: ar.End}
 	ran := false
 	f := mm.hostWriteWrap(second, func(safemem.BlockSeq) (uint64, error) { ran = true; return 0, nil })
 	if _, err := f(safemem.BlockSeq{}); err != nil || !ran {
 		t.Fatalf("the wrapped function ran = %v, err = %v", ran, err)
 	}
-	want := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+	want := memmap.FileRange{Start: fr.Start + page, End: fr.End}
 	if len(*got) != 1 || (*got)[0] != want {
 		t.Errorf("reported writes = %v, want [%v]", *got, want)
 	}
@@ -69,16 +71,17 @@ func TestHostWriteWrapReportsThroughAWrappedMemoryFile(t *testing.T) {
 // TestHostWriteWrapReportsEachRangeOfAVector covers a writev-style sequence.
 func TestHostWriteWrapReportsEachRangeOfAVector(t *testing.T) {
 	mm, ar, fr, got, _ := newWatchedPMA(t)
-	first := hostarch.AddrRange{Start: ar.Start, End: ar.Start + hostarch.PageSize}
-	second := hostarch.AddrRange{Start: ar.Start + hostarch.PageSize, End: ar.End}
+	page := uint64(hostarch.PageSize)
+	first := hostarch.AddrRange{Start: ar.Start, End: ar.Start + hostarch.Addr(page)}
+	second := hostarch.AddrRange{Start: ar.Start + hostarch.Addr(page), End: ar.End}
 	ars := hostarch.AddrRangeSeqFromSlice([]hostarch.AddrRange{second, first})
 	f := mm.hostWriteWrapVec(ars, func(safemem.BlockSeq) (uint64, error) { return 0, nil })
 	if _, err := f(safemem.BlockSeq{}); err != nil {
 		t.Fatal(err)
 	}
 	want := []memmap.FileRange{
-		{Start: fr.Start + hostarch.PageSize, End: fr.End},
-		{Start: fr.Start, End: fr.Start + hostarch.PageSize},
+		{Start: fr.Start + page, End: fr.End},
+		{Start: fr.Start, End: fr.Start + page},
 	}
 	if len(*got) != 2 || (*got)[0] != want[0] || (*got)[1] != want[1] {
 		t.Errorf("reported writes = %v, want %v", *got, want)

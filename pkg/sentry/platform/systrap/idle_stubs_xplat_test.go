@@ -157,7 +157,7 @@ func newTestAddressSpace(p *Systrap) (*subprocess, error) {
 // mapAndUnmapPage maps one page of the platform memory file into the address
 // space and unmaps it. The call goes through the syscall thread of the stub.
 func mapAndUnmapPage(p *Systrap, as platform.AddressSpace) error {
-	fr, err := p.memoryFile.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	fr, err := p.memoryFile.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		return fmt.Errorf("allocate: %w", err)
 	}
@@ -165,7 +165,7 @@ func mapAndUnmapPage(p *Systrap, as platform.AddressSpace) error {
 	if err := as.MapFile(mapAddr, p.memoryFile, fr, hostarch.ReadWrite, false); err != nil {
 		return fmt.Errorf("MapFile: %w", err)
 	}
-	as.Unmap(mapAddr, hostarch.PageSize)
+	as.Unmap(mapAddr, uint64(hostarch.PageSize))
 	return nil
 }
 

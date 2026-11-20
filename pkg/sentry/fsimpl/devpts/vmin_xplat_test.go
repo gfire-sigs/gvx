@@ -82,7 +82,7 @@ type ptyTestPlatform struct {
 func (*ptyTestPlatform) SupportsAddressSpaceIO() bool  { return false }
 func (*ptyTestPlatform) HaveGlobalMemoryBarrier() bool { return false }
 func (*ptyTestPlatform) GlobalMemoryBarrier() error    { return nil }
-func (*ptyTestPlatform) MinUserAddress() hostarch.Addr { return hostarch.PageSize }
+func (*ptyTestPlatform) MinUserAddress() hostarch.Addr { return hostarch.Addr(hostarch.PageSize) }
 func (*ptyTestPlatform) MaxUserAddress() hostarch.Addr { return 0x0000_7fff_ffff_f000 }
 func (*ptyTestPlatform) MapUnit() uint64               { return 0 }
 func (*ptyTestPlatform) ConcurrencyCount() int         { return math.MaxInt }
@@ -137,10 +137,13 @@ type ptyTestAddressSpace struct {
 	platform.NoAddressSpaceIO
 }
 
-func (ptyTestAddressSpace) Release()                                                     {}
-func (ptyTestAddressSpace) PreFork()                                                     {}
-func (ptyTestAddressSpace) PostFork()                                                    {}
-func (ptyTestAddressSpace) Unmap(hostarch.Addr, uint64)                                  {}
+func (ptyTestAddressSpace) Release()                    {}
+func (ptyTestAddressSpace) PreFork()                    {}
+func (ptyTestAddressSpace) PostFork()                   {}
+func (ptyTestAddressSpace) Unmap(hostarch.Addr, uint64) {}
+func (ptyTestAddressSpace) PrepareForPtrace(context.Context, platform.MemoryManager) error {
+	return nil
+}
 func (ptyTestAddressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error { return nil }
 func (ptyTestAddressSpace) MapFile(hostarch.Addr, memmap.File, memmap.FileRange, hostarch.AccessType, bool) error {
 	return nil
@@ -279,7 +282,7 @@ func (w *taskWorker) initMemory(t *testing.T) {
 	var mapErr error
 	w.run(func(task *kernel.Task) {
 		addr, err := task.MemoryManager().MMap(task, memmap.MMapOpts{
-			Length:   3 * hostarch.PageSize,
+			Length:   3 * uint64(hostarch.PageSize),
 			Private:  true,
 			Perms:    hostarch.ReadWrite,
 			MaxPerms: hostarch.AnyAccess,
@@ -289,7 +292,7 @@ func (w *taskWorker) initMemory(t *testing.T) {
 			return
 		}
 		w.scratch = addr
-		task.Arch().SetStack(uintptr(addr + 3*hostarch.PageSize))
+		task.Arch().SetStack(uintptr(addr + 3*hostarch.Addr(hostarch.PageSize)))
 	})
 	if mapErr != nil {
 		t.Fatalf("MMap scratch and stack: %v", mapErr)
@@ -322,7 +325,7 @@ func newPTYFixture(t *testing.T) *ptyFixture {
 	}
 
 	tk := kernel.NewTimekeeper()
-	paramsRange, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.System})
+	paramsRange, err := mf.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		t.Fatalf("mf.Allocate: %v", err)
 	}

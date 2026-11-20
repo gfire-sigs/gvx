@@ -109,7 +109,7 @@ func TestDefaultMemoryFileDecommitZeroesPages(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	const allocSize = uint64(2 * hostarch.PageSize)
+	allocSize := uint64(2 * hostarch.PageSize)
 	fr, err := mf.Allocate(allocSize, AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
@@ -182,7 +182,7 @@ func BenchmarkMemoryFileAllocateMapDecommit(b *testing.B) {
 	}
 	defer mf.Destroy()
 
-	const allocSize = uint64(4 * hostarch.PageSize)
+	allocSize := uint64(4 * hostarch.PageSize)
 	b.SetBytes(int64(allocSize))
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -378,7 +378,7 @@ func TestWindowsMemoryFileReclaimsWorkingSetAndUsesZeroDisk(t *testing.T) {
 				t.Fatalf("MapInternal: %v", err)
 			}
 			slice := bs.Head().ToSlice()
-			for i := 0; i < len(slice); i += hostarch.PageSize {
+			for i := 0; i < len(slice); i += int(hostarch.PageSize) {
 				slice[i] = 0x5A
 			}
 
@@ -437,7 +437,7 @@ func TestWindowsMemoryFileReclaimsWorkingSetAndUsesZeroDisk(t *testing.T) {
 				t.Fatalf("second MapInternal: %v", err)
 			}
 			slice2 := bs2.Head().ToSlice()
-			for i := 0; i < len(slice2); i += hostarch.PageSize {
+			for i := 0; i < len(slice2); i += int(hostarch.PageSize) {
 				if slice2[i] != 0 {
 					t.Fatalf("re-allocated page offset %#x = %#x, want 0", i, slice2[i])
 				}

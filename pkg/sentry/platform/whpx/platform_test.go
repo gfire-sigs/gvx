@@ -197,7 +197,7 @@ func TestCloseReportsBackendErrors(t *testing.T) {
 // larger entries, and NewWithOptions refuses the configuration.
 func requireGuestPageSize(t *testing.T) {
 	t.Helper()
-	if hostarch.PageSize != pageSize {
+	if int(hostarch.PageSize) != pageSize {
 		t.Skipf("the Sentry page size is %d bytes and whpx maps %d-byte pages", hostarch.PageSize, pageSize)
 	}
 }

@@ -62,7 +62,7 @@ func mergeSharedPagePerms(ctx context.Context, m *mm.MemoryManager, phdrs []elf.
 			return linuxerr.ENOEXEC
 		}
 		perms := progFlagsAsPerms(phdr.Flags)
-		first, last := start.RoundDown(), limit-hostarch.PageSize
+		first, last := start.RoundDown(), limit-hostarch.Addr(hostarch.PageSize)
 		touch(first, perms)
 		if last != first {
 			touch(last, perms)
@@ -72,7 +72,7 @@ func mergeSharedPagePerms(ctx context.Context, m *mm.MemoryManager, phdrs []elf.
 		if u.segs < 2 {
 			continue
 		}
-		if err := m.MProtect(page, hostarch.PageSize, u.perms, false); err != nil {
+		if err := m.MProtect(page, uint64(hostarch.PageSize), u.perms, false); err != nil {
 			ctx.Infof("Error merging permissions of the shared page at %#x: %v", page, err)
 			return err
 		}

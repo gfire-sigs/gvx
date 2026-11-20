@@ -21,6 +21,7 @@ package main
 
 import (
 	"z.gfire.dev/gvx/pkg/sentry/socket/plugin/cgo"
+	_ "z.gfire.dev/gvx/runsc/cgoextras"
 	"z.gfire.dev/gvx/runsc/cli/maincli"
 	"z.gfire.dev/gvx/runsc/sandbox"
 	"z.gfire.dev/gvx/runsc/version"

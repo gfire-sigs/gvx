@@ -330,7 +330,7 @@ func (s *Sandbox) initFreshKernel(mf *pgalloc.MemoryFile, hostRAM uint64) (*kern
 	}
 
 	tk := kernel.NewTimekeeper()
-	paramsRange, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.System})
+	paramsRange, err := mf.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("gvx: allocate VDSO param page: %w", err)
 	}

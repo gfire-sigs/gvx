@@ -71,7 +71,7 @@ func findUnfreeAllocGap(unfree *unfreeSet, alloc *allocState, out *memmap.FileRa
 // released, and a larger range gives up its head and its tail. align must be a
 // power of two that is a multiple of hostarch.PageSize.
 func (f *MemoryFile) AllocateAligned(length, align uint64, opts AllocOpts) (memmap.FileRange, error) {
-	if align < hostarch.PageSize || align&(align-1) != 0 {
+	if align < uint64(hostarch.PageSize) || align&(align-1) != 0 {
 		return memmap.FileRange{}, fmt.Errorf("alignment %#x is not a power of two of at least one page", align)
 	}
 	fr, err := f.Allocate(length, opts)
@@ -79,7 +79,7 @@ func (f *MemoryFile) AllocateAligned(length, align uint64, opts AllocOpts) (memm
 		return fr, err
 	}
 	f.DecRef(fr)
-	wide, err := f.Allocate(length+align-hostarch.PageSize, opts)
+	wide, err := f.Allocate(length+align-uint64(hostarch.PageSize), opts)
 	if err != nil {
 		return memmap.FileRange{}, err
 	}

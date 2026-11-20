@@ -77,7 +77,7 @@ const (
 	// subBlockSize is the size of a host block.
 	subBlockSize = 0x4000
 	// subPagesPerBlock is the number of guest pages in a host block.
-	subPagesPerBlock = subBlockSize / hostarch.PageSize
+	subPagesPerBlock = subBlockSize / hostarch.MinPageSize
 	// allSubPages is the mask of every guest page in a block.
 	allSubPages = 1<<subPagesPerBlock - 1
 )
@@ -153,7 +153,7 @@ func (sp *subPage) bytes() ([]byte, error) {
 	if sp.at.Write {
 		at = hostarch.Write
 	}
-	fr := memmap.FileRange{Start: sp.off, End: sp.off + hostarch.PageSize}
+	fr := memmap.FileRange{Start: sp.off, End: sp.off + uint64(hostarch.PageSize)}
 	var bs safemem.BlockSeq
 	var err error
 	// MapInternal would report a write on every composite refresh that maps a
@@ -169,7 +169,7 @@ func (sp *subPage) bytes() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("map the memory file page at %#x: %w", sp.off, err)
 	}
-	if bs.NumBlocks() != 1 || bs.Head().Len() != hostarch.PageSize {
+	if bs.NumBlocks() != 1 || bs.Head().Len() != int(hostarch.PageSize) {
 		return nil, fmt.Errorf("the memory file page at %#x has %d mappings", sp.off, bs.NumBlocks())
 	}
 	sp.src = bs.Head().ToSlice()
@@ -266,8 +266,8 @@ type ownedBlock struct {
 func (ob ownedBlock) release() {
 	for i := range subPagesPerBlock {
 		if ob.spare&(1<<i) != 0 {
-			start := ob.fr.Start + uint64(i)*hostarch.PageSize
-			ob.f.DecRef(memmap.FileRange{Start: start, End: start + hostarch.PageSize})
+			start := ob.fr.Start + uint64(i)*uint64(hostarch.PageSize)
+			ob.f.DecRef(memmap.FileRange{Start: start, End: start + uint64(hostarch.PageSize)})
 		}
 	}
 }
@@ -312,7 +312,7 @@ func (l *subBlockLayer) directLocked(base uintptr, hb *hostBlock) (uint64, int, 
 			}
 			continue
 		}
-		if sp.f != ob.f || sp.off != ob.fr.Start+uint64(i)*hostarch.PageSize {
+		if sp.f != ob.f || sp.off != ob.fr.Start+uint64(i)*uint64(hostarch.PageSize) {
 			return 0, 0, false
 		}
 		if fd < 0 {
@@ -345,7 +345,7 @@ func (hb *hostBlock) direct() (uint64, bool) {
 	}
 	for i := 1; i < subPagesPerBlock; i++ {
 		sp := &hb.subs[i]
-		if sp.f != first.f || sp.fd != first.fd || sp.off != first.off+uint64(i)*hostarch.PageSize {
+		if sp.f != first.f || sp.fd != first.fd || sp.off != first.off+uint64(i)*uint64(hostarch.PageSize) {
 			return 0, false
 		}
 	}
@@ -380,7 +380,7 @@ func (hb *hostBlock) syncCompPages(mask uint8) (bool, error) {
 		if mask&(1<<i) == 0 {
 			continue
 		}
-		dst := hb.comp.buf[i*hostarch.PageSize : (i+1)*hostarch.PageSize]
+		dst := hb.comp.buf[i*int(hostarch.PageSize) : (i+1)*int(hostarch.PageSize)]
 		sp := &hb.subs[i]
 		var src []byte
 		if sp.f != nil {
@@ -505,7 +505,7 @@ func (l *subBlockLayer) noteHostWrite(f memmap.File, fr memmap.FileRange) {
 	}
 	refs := (*p)[f]
 	i, _ := slices.BinarySearchFunc(refs, fr.Start, func(r srcRef, start uint64) int {
-		return cmp.Compare(r.off+hostarch.PageSize, start+1)
+		return cmp.Compare(r.off+uint64(hostarch.PageSize), start+1)
 	})
 	for ; i < len(refs) && refs[i].off < fr.End; i++ {
 		refs[i].hb.dirty.Store(dirtyRefreshes)
@@ -514,7 +514,7 @@ func (l *subBlockLayer) noteHostWrite(f memmap.File, fr memmap.FileRange) {
 		for _, hb := range *r {
 			for j := range hb.subs {
 				sp := &hb.subs[j]
-				if sp.f == f && sp.off < fr.End && fr.Start < sp.off+hostarch.PageSize {
+				if sp.f == f && sp.off < fr.End && fr.Start < sp.off+uint64(hostarch.PageSize) {
 					hb.dirty.Store(dirtyRefreshes)
 					break
 				}
@@ -537,7 +537,7 @@ func (l *subBlockLayer) observeLocked(f memmap.File) bool {
 	ro, ok := l.immutable[f]
 	if !ok {
 		// A file of an image refuses a writable mapping of any range.
-		_, err := f.MapInternal(memmap.FileRange{Start: 0, End: hostarch.PageSize}, hostarch.Write)
+		_, err := f.MapInternal(memmap.FileRange{Start: 0, End: uint64(hostarch.PageSize)}, hostarch.Write)
 		ro = err != nil
 		l.immutable[f] = ro
 	}
@@ -631,7 +631,7 @@ func (l *subBlockLayer) mapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	va := uintptr(addr)
 	end := va + uintptr(fr.Length())
 	off := fr.Start
-	if va%hostarch.PageSize != 0 || end%hostarch.PageSize != 0 || off%hostarch.PageSize != 0 || va >= end {
+	if va%uintptr(hostarch.PageSize) != 0 || end%uintptr(hostarch.PageSize) != 0 || off%uint64(hostarch.PageSize) != 0 || va >= end {
 		return fmt.Errorf("map [%#x, %#x) from offset %#x: the range is not aligned to guest pages", va, end, off)
 	}
 	l.mu.Lock()
@@ -667,10 +667,10 @@ func (l *subBlockLayer) setPagesLocked(va, end uintptr, off uint64, src subPage)
 		hb = &hostBlock{}
 		l.blocks[base] = hb
 	}
-	for p := va; p < end; p += hostarch.PageSize {
+	for p := va; p < end; p += uintptr(hostarch.PageSize) {
 		sp := src
 		sp.off = off + uint64(p-va)
-		hb.subs[(p-base)/hostarch.PageSize] = sp
+		hb.subs[(p-base)/uintptr(hostarch.PageSize)] = sp
 	}
 	return l.refreshLocked(base, hb, false)
 }
@@ -687,7 +687,7 @@ func (l *subBlockLayer) mapBlocksLocked(start, end uintptr, off uint64, src subP
 			}
 			for i := range hb.subs {
 				sp := src
-				sp.off = off + uint64(base-start) + uint64(i)*hostarch.PageSize
+				sp.off = off + uint64(base-start) + uint64(i)*uint64(hostarch.PageSize)
 				hb.subs[i] = sp
 			}
 			if err := l.refreshLocked(base, hb, false); err != nil {
@@ -700,7 +700,7 @@ func (l *subBlockLayer) mapBlocksLocked(start, end uintptr, off uint64, src subP
 	run := &hostBlock{}
 	for i := range run.subs {
 		run.subs[i] = src
-		run.subs[i].off = off + uint64(i)*hostarch.PageSize
+		run.subs[i].off = off + uint64(i)*uint64(hostarch.PageSize)
 	}
 	run.recompute()
 	prot := run.blockProt(true)
@@ -717,7 +717,7 @@ func (l *subBlockLayer) mapBlocksLocked(start, end uintptr, off uint64, src subP
 		blockOff := off + uint64(base-start)
 		for i := range hb.subs {
 			sp := src
-			sp.off = blockOff + uint64(i)*hostarch.PageSize
+			sp.off = blockOff + uint64(i)*uint64(hostarch.PageSize)
 			hb.subs[i] = sp
 		}
 		hb.recompute()
@@ -869,8 +869,9 @@ func (l *subBlockLayer) dropBlockLocked(base uintptr, hb *hostBlock) error {
 // unmap removes [addr, addr+length). A failure other than the death of the
 // stub is a bug.
 func (l *subBlockLayer) unmap(addr hostarch.Addr, length uint64) {
-	va := uintptr(addr) &^ (hostarch.PageSize - 1)
-	end := (uintptr(addr) + uintptr(length) + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1)
+	pageMask := uintptr(hostarch.PageSize) - 1
+	va := uintptr(addr) &^ pageMask
+	end := (uintptr(addr) + uintptr(length) + pageMask) &^ pageMask
 	if va >= end {
 		return
 	}
@@ -904,8 +905,8 @@ func (l *subBlockLayer) clearPagesLocked(va, end uintptr) {
 	}
 	// An unmapped page is not a spare page, so a block with spare pages
 	// stops its direct mapping here (directLocked).
-	for p := va; p < end; p += hostarch.PageSize {
-		hb.subs[(p-base)/hostarch.PageSize] = subPage{}
+	for p := va; p < end; p += uintptr(hostarch.PageSize) {
+		hb.subs[(p-base)/uintptr(hostarch.PageSize)] = subPage{}
 	}
 	if err := l.refreshLocked(base, hb, false); err != nil && !errors.Is(err, errDeadSubprocess) {
 		log.Warningf("systrap: update the block at %#x after an unmap: %v", base, err)
@@ -1193,7 +1194,7 @@ func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlo
 			first := -1
 			for i := range hb.subs {
 				if hb.subs[i].f == nil {
-					addrs = append(addrs, hostarch.Addr(base+uintptr(i)*hostarch.PageSize))
+					addrs = append(addrs, hostarch.Addr(base+uintptr(i)*uintptr(hostarch.PageSize)))
 				} else if first < 0 {
 					first = i
 				}
@@ -1201,7 +1202,7 @@ func (l *subBlockLayer) populatePartial(ctx context.Context, pop platform.SubBlo
 			// After the missing pages, a call for a mapped page lets the memory
 			// manager coalesce the block with spare pages.
 			if hb.canCoalesce() {
-				addrs = append(addrs, hostarch.Addr(base+uintptr(first)*hostarch.PageSize))
+				addrs = append(addrs, hostarch.Addr(base+uintptr(first)*uintptr(hostarch.PageSize)))
 			}
 		}
 		clear(l.partial)

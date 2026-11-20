@@ -377,6 +377,10 @@ type Cgroup interface {
 	Update(res *specs.LinuxResources) error
 	Uninstall() error
 	Join() (func(), error)
+	// AllowDevices lets processes in the cgroup access the devices matched by
+	// rules, besides those allowed by earlier calls from any process. Other
+	// devices are denied.
+	AllowDevices(rules []DeviceRule) error
 	CloneIntoCgroup() (*os.File, error)
 	CPUQuota() (int64, error)
 	CPUPeriod() (int64, error)
@@ -1021,7 +1025,22 @@ func (*blockIO) optional() bool {
 }
 
 func (*blockIO) skip(spec *specs.LinuxResources) error {
-	if spec != nil && spec.BlockIO != nil {
+	if spec == nil || spec.BlockIO == nil {
+		return nil
+	}
+
+	// Docker always populates BlockIO, even when no I/O limits are set
+	// (empty object, or Weight explicitly set to 0). Treat those as
+	// "no limits" so runsc still starts when the blkio controller is
+	// absent from the host.
+	b := spec.BlockIO
+	if (b.Weight != nil && *b.Weight != 0) ||
+		(b.LeafWeight != nil && *b.LeafWeight != 0) ||
+		len(b.WeightDevice) > 0 ||
+		len(b.ThrottleReadBpsDevice) > 0 ||
+		len(b.ThrottleWriteBpsDevice) > 0 ||
+		len(b.ThrottleReadIOPSDevice) > 0 ||
+		len(b.ThrottleWriteIOPSDevice) > 0 {
 		return fmt.Errorf("blkio controller is missing but limits are set in OCI spec")
 	}
 	return nil

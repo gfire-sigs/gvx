@@ -305,6 +305,11 @@ func (*AddressSpace) PreFork() {}
 // PostFork implements platform.AddressSpace.PostFork.
 func (*AddressSpace) PostFork() {}
 
+// PrepareForPtrace implements platform.AddressSpace.PrepareForPtrace.
+func (*AddressSpace) PrepareForPtrace(context.Context, platform.MemoryManager) error {
+	return nil
+}
+
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
 func (*AddressSpace) UserModifiedGS(context.Context, platform.MemoryManager) error {
 	return nil

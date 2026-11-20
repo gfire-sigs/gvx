@@ -26,7 +26,7 @@ import (
 // stay 4 KB (docs/gvxip/gvxip-006-android-host-support.md). The engine maps or
 // protects some regions for itself, such as the stub code, the seccomp rules,
 // and the shared queues. Every such region starts and ends on a host page.
-var hostPageSize = uintptr(max(unix.Getpagesize(), hostarch.PageSize))
+var hostPageSize = max(uintptr(unix.Getpagesize()), uintptr(hostarch.PageSize))
 
 // syscallStubMessageOff is the offset of the stub message of a syscall thread
 // from its sentry message. Each message has a host page, because one is read

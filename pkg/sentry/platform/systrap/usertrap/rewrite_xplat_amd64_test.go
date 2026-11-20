@@ -125,10 +125,11 @@ func TestPatchSyscallSiteSkipsModifiedSiteWithoutWriting(t *testing.T) {
 
 func TestUnpatchSyscallSiteRestoresOriginalCodeAndPropagatesPinError(t *testing.T) {
 	const (
-		sysno    = 1
-		siteAddr = hostarch.Addr(0x403ffc)
+		sysno     = 1
+		siteAddr  = hostarch.Addr(0x403ffc)
+		trapEntry = hostarch.Addr(0x600a0)
 	)
-	patched := jumpTargetCode(0x600a0)
+	patched := jumpTargetCode(uint32(trapEntry))
 	frameA := bytes.Clone(patched[:4])
 	frameB := bytes.Clone(patched[4:])
 	mm := &pinnedSiteMM{
@@ -139,7 +140,7 @@ func TestUnpatchSyscallSiteRestoresOriginalCodeAndPropagatesPinError(t *testing.
 	}
 	want := origSyscallCode(sysno)
 
-	if err := unpatchSyscallSite(context.Background(), mm, siteAddr, sysno, want); err != nil {
+	if err := unpatchSyscallSite(context.Background(), mm, siteAddr, trapEntry, want); err != nil {
 		t.Fatalf("unpatchSyscallSite: %v", err)
 	}
 	if mm.pins != 1 {
@@ -150,9 +151,21 @@ func TestUnpatchSyscallSiteRestoresOriginalCodeAndPropagatesPinError(t *testing.
 		t.Fatalf("unpatched bytes = % x, want % x", got, want)
 	}
 
+	reused := jumpTargetCode(0x60140)
+	reusedBacking := bytes.Clone(reused[:])
+	reusedMM := &pinnedSiteMM{
+		blocks: []safemem.Block{safemem.BlockFromSafeSlice(reusedBacking)},
+	}
+	if err := unpatchSyscallSite(context.Background(), reusedMM, siteAddr, trapEntry, want); err != nil {
+		t.Fatalf("unpatchSyscallSite on reused site: %v", err)
+	}
+	if !bytes.Equal(reusedBacking, reused[:]) {
+		t.Fatalf("reused site mutated to % x, want untouched % x", reusedBacking, reused)
+	}
+
 	errPin := errors.New("unmapped page")
 	failMM := &pinnedSiteMM{pinErr: errPin}
-	if err := unpatchSyscallSite(context.Background(), failMM, siteAddr, sysno, want); !errors.Is(err, errPin) {
+	if err := unpatchSyscallSite(context.Background(), failMM, siteAddr, trapEntry, want); !errors.Is(err, errPin) {
 		t.Fatalf("unpatchSyscallSite error = %v, want %v", err, errPin)
 	}
 }

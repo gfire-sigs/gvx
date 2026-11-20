@@ -31,18 +31,18 @@ type siteWrite struct {
 
 // rewriteSite writes each step in order to the frames that back addr.
 // WithPinnedMappings blocks concurrent unmap or remap calls until all steps
-// finish. That lock prevents split writes across old and new frames. When old
-// is non-nil, rewriteSite compares the bytes at addr with *old first. On
-// mismatch, it returns false without modifying memory.
-func rewriteSite(ctx context.Context, mm memoryManager, addr hostarch.Addr, old *[jmpInstLen]uint8, writes ...siteWrite) (bool, error) {
+// finish. That lock prevents split writes across old and new frames. When
+// allow is non-nil, rewriteSite validates the current bytes at addr with allow
+// first; if allow returns false, it returns false without modifying memory.
+func rewriteSite(ctx context.Context, mm memoryManager, addr hostarch.Addr, allow func([jmpInstLen]uint8) bool, writes ...siteWrite) (bool, error) {
 	matched := true
 	err := mm.WithPinnedMappings(ctx, addr, jmpInstLen, func(ims safemem.BlockSeq) error {
-		if old != nil {
+		if allow != nil {
 			var current [jmpInstLen]uint8
 			if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(current[:])), ims); err != nil {
 				return err
 			}
-			if current != *old {
+			if !allow(current) {
 				matched = false
 				return nil
 			}
@@ -62,7 +62,9 @@ func rewriteSite(ctx context.Context, mm memoryManager, addr hostarch.Addr, old 
 // last byte 0.
 func patchSyscallSite(ctx context.Context, mm memoryManager, patchAddr uintptr, sysno uintptr, newCode [jmpInstLen]uint8) (bool, error) {
 	prev := origSyscallCode(uint32(sysno))
-	applied, err := rewriteSite(ctx, mm, hostarch.Addr(patchAddr), &prev,
+	applied, err := rewriteSite(ctx, mm, hostarch.Addr(patchAddr), func(cur [jmpInstLen]uint8) bool {
+		return cur == prev
+	},
 		siteWrite{off: int(faultInstOffset), data: faultInst[:]},
 		siteWrite{off: 1, data: newCode[1:]},
 		siteWrite{off: 0, data: newCode[0:1]})
@@ -72,15 +74,15 @@ func patchSyscallSite(ctx context.Context, mm memoryManager, patchAddr uintptr, 
 	return applied, err
 }
 
-// unpatchSyscallSite restores origCode at patchAddr in one pinned pass. It
-// writes 0x06 at offset 0, then bytes 1..6, and last byte 0.
-func unpatchSyscallSite(ctx context.Context, mm memoryManager, patchAddr hostarch.Addr, sysno uint32, origCode [jmpInstLen]uint8) error {
-	if _, err := rewriteSite(ctx, mm, patchAddr, nil,
+// unpatchSyscallSite restores origCode at patchAddr in one pinned pass when the
+// pinned bytes still jump to trapAddr. It writes 0x06 at offset 0, then bytes
+// 1..6, and last byte 0.
+func unpatchSyscallSite(ctx context.Context, mm memoryManager, patchAddr, trapAddr hostarch.Addr, origCode [jmpInstLen]uint8) error {
+	_, err := rewriteSite(ctx, mm, patchAddr, func(cur [jmpInstLen]uint8) bool {
+		return isPatchedWith(cur[:], trapAddr)
+	},
 		siteWrite{off: 0, data: faultInst[:]},
 		siteWrite{off: 1, data: origCode[1:]},
-		siteWrite{off: 0, data: origCode[0:1]}); err != nil {
-		ctx.Warningf("Failed to unpatch syscall at %x (sysno %d): %v", patchAddr, sysno, err)
-		return err
-	}
-	return nil
+		siteWrite{off: 0, data: origCode[0:1]})
+	return err
 }

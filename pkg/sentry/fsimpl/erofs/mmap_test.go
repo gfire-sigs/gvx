@@ -48,7 +48,7 @@ func init() {
 type stubPlatform struct{ platform.Platform }
 
 func (stubPlatform) SupportsAddressSpaceIO() bool  { return false }
-func (stubPlatform) MinUserAddress() hostarch.Addr { return hostarch.PageSize }
+func (stubPlatform) MinUserAddress() hostarch.Addr { return hostarch.Addr(hostarch.PageSize) }
 func (stubPlatform) MaxUserAddress() hostarch.Addr { return 0x0000_7fff_ffff_f000 }
 func (stubPlatform) MapUnit() uint64               { return 0 }
 func (stubPlatform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
@@ -250,8 +250,9 @@ func verifyTranslate(t *testing.T, s *sentry, p string, want []byte) {
 	pgend, _ := hostarch.PageRoundUp(uint64(len(want)))
 	opts, _ := mappableOf(t, s, p, pgend)
 
-	for pg := uint64(0); pg < pgend; pg += hostarch.PageSize {
-		required := memmap.MappableRange{Start: pg, End: pg + hostarch.PageSize}
+	page := uint64(hostarch.PageSize)
+	for pg := uint64(0); pg < pgend; pg += page {
+		required := memmap.MappableRange{Start: pg, End: pg + page}
 		ts, err := opts.Mappable.Translate(s.ctx, required, required, hostarch.Read)
 		if err != nil {
 			t.Fatalf("Translate(page at %d): %v", pg, err)
@@ -281,12 +282,12 @@ func verifyTranslate(t *testing.T, s *sentry, p string, want []byte) {
 				t.Fatalf("page at %d (translation %v) holds wrong bytes", pg, tr.Source)
 			}
 		}
-		if covered != hostarch.PageSize {
+		if covered != page {
 			t.Fatalf("translations of page %d cover %d bytes, want a full page", pg, covered)
 		}
 	}
 	// A page wholly beyond the last file page is a bus error, not data.
-	beyond := memmap.MappableRange{Start: pgend, End: pgend + hostarch.PageSize}
+	beyond := memmap.MappableRange{Start: pgend, End: pgend + page}
 	if _, err := opts.Mappable.Translate(s.ctx, beyond, beyond, hostarch.Read); err == nil {
 		t.Errorf("Translate beyond EOF succeeded")
 	}

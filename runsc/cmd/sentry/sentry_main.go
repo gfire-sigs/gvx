@@ -18,6 +18,7 @@
 package main
 
 import (
+	_ "z.gfire.dev/gvx/runsc/cgoextras"
 	"z.gfire.dev/gvx/runsc/cli/sentrycli"
 	"z.gfire.dev/gvx/runsc/gvisorbinaries"
 )
