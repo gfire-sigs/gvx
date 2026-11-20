@@ -1,22 +1,24 @@
 # Moonshot: GPU Acceleration for Browser and GUI Guests
 
-This document outlines a future moonshot architecture for giving Linux browser and GUI guests access to the host GPU on macOS and Windows. The design has three layers: the Mesa driver in the guest, a virtual DRM device in the Sentry, and a renderer process on the host. The document assesses an earlier draft, states the constraints of `gvx`, and defines the security model and a phased plan with exit criteria. The repository implements no part of this design today.
+This document outlines a future moonshot architecture for giving Linux browser and GUI guests access to the host GPU on macOS and Windows. The design has three layers: the Mesa driver in the guest, a virtual DRM device in the Sentry, and a renderer process on the host. The document assesses an earlier draft, states the constraints of `gvx`, and defines the security model and a phased plan with exit criteria. The repository implements the Phase 0 baseline gates and the headless macOS path of Phase 2 (`rungv run -gpu=venus`). The Windows path and Phase 3 are proposals.
 
 | Field | Value |
 | :--- | :--- |
 | **Title** | GPU Acceleration for Browser and GUI Guests |
-| **Status** | Moonshot (Proposed, Phase 0 not started) |
-| **Isolation Tier** | Tier 1 after registration of `pkg/sentry/devices/virtgpu`, the renderer command, and its IPC package. Register each path in `tier1Prefixes` (`tools/upstream/diff_audit.go`) and in `tools/upstream/file_mask.txt`. Add each path to the Tier 1 tables of `AGENTS.md` and `docs/architecture.md`. Tier 3: a `seam` entry for `pkg/sentry/fsimpl/sys/sys.go`. |
+| **Status** | Moonshot. Phase 0: in progress. Phase 2 on macOS (headless): implemented behind `-gpu=venus`. Windows and Phase 3: proposed. |
+| **Isolation Tier** | Tier 1: `pkg/sentry/devices/virtgpu`, `internal/gpurender`, `gpurenderer`, and `scripts/gpu`. The list `tier1Prefixes` (`tools/gostateify/stateify/tier.go`) and `tools/upstream/file_mask.txt` register them. Tier 2: `pkg/sentry/fsimpl/sys/virtgpu_xplat.go`. Tier 3: the `seam` entry for `pkg/sentry/fsimpl/sys/sys.go`, which existed before this work. |
 | **Target Platforms** | `darwin/arm64`, `windows/amd64`, `windows/arm64`. `linux/amd64` and `linux/arm64` are optional. |
 | **Companion Docs** | [`systrap-windows.md`](systrap-windows.md), [`architecture.md`](architecture.md) |
 
-The phases below have a fixed order. A phase starts only when the phase before it meets its exit criterion.
+The phases below have a fixed order. A phase starts only when the phase before it meets its exit criterion. Section 9.2 records one deviation from this rule for macOS.
 
 | Phase | Content | State |
 | :--- | :--- | :--- |
-| Phase 0 | Baseline gates for Chromium, Playwright, and Electron with software rendering | Not started |
-| Phase 1 | Prototype over the `vtest` socket protocol, with no Sentry change | Not started |
-| Phase 2 | Virtual render node in the Sentry and a confined renderer process (headless) | Not started |
+| Phase 0 | Baseline gates for Chromium, Playwright, and Electron with software rendering | In progress: the gates pass on `hvf`; no run covers `whpx`, Windows `systrap`, or Linux `systrap` yet |
+| Phase 1 (macOS) | Renderer bring-up with no Sentry change | Done (section 9.2.2) |
+| Phase 1 (Windows) | Prototype over the `vtest` socket protocol, with no Sentry change | Not started |
+| Phase 2 (macOS) | Virtual render node for the `venus` stream and a confined renderer process (headless) | Implemented; gates G1 and G2 pass on `hvf` (section 9.3.1) |
+| Phase 2 (Windows) | Virtual render node and a confined renderer process (headless) | Not started |
 | Phase 3 | Display output to the host desktop | Not started |
 
 ---
@@ -50,14 +52,14 @@ The standard solution serializes the guest graphics calls into a command stream.
 
 ### 2.1 State of Browser Support in `gvx`
 
-The repository has no end-to-end test for Chromium, Playwright, Puppeteer, or Electron. The behavior of these programs on each backend is therefore unknown. A GPU path cannot show a gain before software rendering works.
+The `e2e` browser gates run Chromium, Playwright, and Electron with software rendering. They run only with `GVX_E2E_BROWSER=1`, because the image is about 1 GB. Section 9.1.1 records the results on `hvf`. A GPU path cannot show a gain before software rendering works.
 
 | Item | State in the current tree |
 | :--- | :--- |
-| Browser or Electron gate in `e2e/` | None |
+| Browser or Electron gate in `e2e/` | `e2e/gate_browser_test.go` (on request: `GVX_E2E_BROWSER=1`), with the benchmark `TestE2EBrowserBench` (`GVX_E2E_BROWSER_BENCH=1`) |
 | `/dev/shm` | A `tmpfs` mount without a size option (`pkg/gvx/kernel_runner.go`), so the `tmpfs` default of 50% of host RAM applies |
-| Guest devices | `pkg/gvx` registers `memdev`, `ttydev`, `/dev/fuse`, and `tundev` (when the stack supports TUN). `pkg/sentry/devices` also holds `nvproxy`, `rdmaproxy`, and `tpuproxy`, which `pkg/gvx` does not register. |
-| DRM device (`/dev/dri/*`) | None |
+| Guest devices | `pkg/gvx` registers `memdev`, `ttydev`, `/dev/fuse`, and `tundev` (when the stack supports TUN). With `-gpu=venus` it also registers `virtgpu`. `pkg/sentry/devices` also holds `nvproxy`, `rdmaproxy`, and `tpuproxy`, which `pkg/gvx` does not register. |
+| DRM device (`/dev/dri/*`) | `/dev/dri/renderD128` (character device 226:128) with `-gpu=venus` on `darwin/arm64`. None without the option. |
 | Cost of `fork` and `exec` on Windows `systrap` | 6.4 ms on `amd64` and 22 ms on `arm64` (hosted runners; `systrap-windows.md`, section 3.9) |
 
 Chromium starts a process for each renderer and for the GPU service. The `fork` and `exec` cost of Windows `systrap` therefore affects the start time of each tab [inference]. Phase 0 measures this cost.
@@ -90,8 +92,8 @@ The design must satisfy the rules of [`AGENTS.md`](../AGENTS.md) and of the back
 | Pure Go build | `release.yml` sets `CGO_ENABLED=0`, so the binary needs no C library on the host | `virglrenderer` and ANGLE live in the renderer binary. The Sentry talks to it through IPC. |
 | Sockets of `hostfs` live in Sentry memory | `docs/architecture.md`, "Special Files and Extended Attributes"; `pkg/sentry/fsimpl/hostfs/host.go` (`hostKindOther`) | A guest cannot connect to a host Unix socket through a bind mount. A display bridge needs a new socket bridge or TCP. |
 | Guest memory differs on each backend | `hvf` (`hv_vm_map`, 16 KiB blocks), `whpx` (`WHvMapGpaRange`), Windows `systrap` (section views), Linux `systrap` (memory file) | A shared buffer of the renderer needs a new `memmap.File` for each backend. |
-| Hosted CI runners have no GPU | GitHub-hosted runners | CI runs function tests on WARP for Windows only. The hosted macOS runner cannot run `hvf` (`docs/architecture.md`, section 4.2), so macOS tests run by hand on an Apple Silicon host. CI cannot detect a performance regression. |
-| Upstream diff budget below 2.0% | `tools/upstream -mode=audit` | Add each new package to `tier1Prefixes` first. Otherwise the audit charges each added file against the ceiling. The `sysfs` change needs a `seam` line in `buildtag_allowlist.txt`. |
+| Hosted CI runners have no GPU | GitHub-hosted runners | CI runs function tests on WARP for Windows only. The hosted macOS runner cannot run `hvf` (`docs/architecture.md`, section 4.2), so macOS gates run by hand on an Apple Silicon host. The renderer tests need Metal and no hypervisor. `ci.yml` builds the renderer on `macos-26` and runs those tests only when the repository variable `GVX_CI_METAL` is `1`. No run has measured Metal on a hosted macOS runner. CI cannot detect a performance regression. |
+| Upstream diff gate of 4.2% in CI | `tools/upstream -mode=audit -max-ratio=0.042` (`.github/workflows/ci.yml`) | The audit counts 106 of 2551 upstream files (4.16%). One more upstream file fits under the gate. The GPU path adds no file to the count: `sys.go` was a counted seam before, and every new path is Tier 1 or Tier 2. |
 
 ---
 
@@ -107,13 +109,13 @@ Each component has one owner and one boundary. The renderer is the only componen
 
 | Component | Location | Responsibility |
 | :--- | :--- | :--- |
-| Guest driver | Guest image (`libgl1-mesa-dri`, `mesa-vulkan-drivers`) | Encodes OpenGL or Vulkan calls into `virgl` or `venus` command streams. |
-| Virtual render node | `pkg/sentry/devices/virtgpu` (new) | Registers DRM character devices, serves the DRM and `virtio-gpu` ioctls, and owns GEM handles of each guest file. |
-| DRM file types | `pkg/sentry/devices/virtgpu` (new) | Implements dma-buf file descriptions for PRIME export and import, and `sync_file` descriptions for fences. |
-| Device enumeration | Sentry `sysfs` and `devtmpfs` | Exposes the nodes under `/sys/class/drm` and `/sys/dev/char/226:*`, which `libdrm` reads. `NewFilesystem` in `pkg/sentry/fsimpl/sys/sys.go` creates `dev/char` empty and has no extension point. |
-| Blob memory | Per-backend `memmap.File` (new) | Maps renderer buffers into guest address space without a copy, where the backend allows it. |
-| Renderer | New command, built with cgo or as a C program | Runs `virglrenderer` with ANGLE or Vulkan, owns the GPU context, and serves one sandbox. |
-| IPC | New package | Carries commands, fences, and resource events in a shared-memory ring with an event pair. |
+| Guest driver | Guest image (`mesa-vulkan-drivers` and `libvulkan1` for `venus`; `libgl1-mesa-dri` for `virgl`) | Encodes Vulkan calls into `venus` command streams, or OpenGL calls into `virgl` command streams. |
+| Virtual render node | `pkg/sentry/devices/virtgpu` | Registers the DRM render node 226:128, serves the DRM and `virtio-gpu` ioctls, and owns the GEM handles of each guest file. |
+| DRM file types | `pkg/sentry/devices/virtgpu` | Implements `sync_file` descriptions for fences. The dma-buf descriptions for PRIME are a later step. |
+| Device enumeration | `pkg/sentry/fsimpl/sys/virtgpu_xplat.go`, `devtmpfs` | Exposes a virtio GPU on a PCI device (`0x1af4:0x1050`) under `/sys/devices`, `/sys/class/drm`, and `/sys/dev/char/226:128`. `FilesystemType.GetFilesystem` in `sys.go` adds the entries when `pkg/gvx` passes `InternalData.VirtGPU`. |
+| Blob memory | `pkg/sentry/devices/virtgpu` (`blob.go`, `blob_darwin.go`) | Maps a shared-memory object of the renderer and exposes it as a `memmap.File`. On `hvf`, the existing region path maps it into the guest. Each other backend needs its own file. |
+| Renderer | `gpurenderer` (C program `gvx-gpu-renderer`) | Runs `virglrenderer` on KosmicKrisp and Metal, owns the GPU context, and serves one sandbox. |
+| IPC | `pkg/sentry/devices/virtgpu/gpuproto`, `internal/gpurender` | Carries requests, replies, and events on one stream socketpair. Blob memory passes as shared-memory descriptors. The `venus` command ring is inside a blob, so the IPC has no ring of its own. |
 
 ### 5.2 Guest Interface
 
@@ -129,18 +131,45 @@ The Linux kernel driver `virtio_gpu` defines the interface that Mesa expects. Th
 
 The earlier draft estimated about 10 ioctls. The table lists 28 ioctls (2 core, 3 GEM and PRIME, 12 `SYNCOBJ`, 11 `virtio-gpu`). The full surface also adds two new file types and `sysfs` enumeration.
 
+The first macOS step serves a subset of this table. Mesa `venus` and headless Chromium use only that subset. The device reports `DRM_CAP_SYNCOBJ` as 0, so Mesa uses its simulated sync objects, which need only `sync_file` descriptors and `poll`. With `GVX_DEBUG_LOG=2`, the device logs each refused request one time for each open file.
+
+| Group | Served in the first macOS step | Refused, with the error |
+| :--- | :--- | :--- |
+| DRM core | `DRM_IOCTL_VERSION`, `DRM_IOCTL_GET_CAP` | Master, authentication, and mode-setting requests: `EACCES` |
+| GEM and PRIME | `DRM_IOCTL_GEM_CLOSE` | `DRM_IOCTL_PRIME_HANDLE_TO_FD`, `DRM_IOCTL_PRIME_FD_TO_HANDLE`: `EOPNOTSUPP` |
+| Synchronization | A `sync_file` descriptor from `EXECBUFFER` with `VIRTGPU_EXECBUF_FENCE_FD_OUT`; `poll` on it | `DRM_IOCTL_SYNCOBJ_*`: `EOPNOTSUPP`. `SYNC_IOC_MERGE`, `SYNC_IOC_FILE_INFO`: `ENOTTY`. `VIRTGPU_EXECBUF_FENCE_FD_IN`: `EINVAL` |
+| `virtio-gpu` | `GETPARAM`, `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE_BLOB` (only `VIRTGPU_BLOB_MEM_HOST3D`), `RESOURCE_INFO`, `MAP`, `EXECBUFFER` | `RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`, `WAIT`: `EINVAL` |
+| File operations | `mmap` of a blob (shared mappings only), `poll` | The node has no DRM events, so `read` returns no data |
+
 ### 5.3 Command Stream Choice
 
-The renderer can serve two command streams. Each stream has a different translation depth and different prior art. Phase 1 measures `virgl`; Phase 2 measures `venus`.
+The renderer can serve two command streams. Each stream has a different translation depth and different prior art. The macOS path uses `venus` only. Windows keeps both candidates until its Phase 1 measures them.
 
 | Property | `virgl` (OpenGL) | `venus` (Vulkan) |
 | :--- | :--- | :--- |
 | Guest API | OpenGL and OpenGL ES | Vulkan |
-| Path of a Chromium WebGL call | Chromium ANGLE (GL back end), Mesa `virgl`, `virglrenderer`, host ANGLE, Metal or Direct3D 11 | Chromium ANGLE (Vulkan back end), Mesa `venus`, `virglrenderer`, MoltenVK or the host Vulkan driver |
-| Layers on the path | Chromium ANGLE, Mesa `virgl`, host ANGLE | Chromium ANGLE and MoltenVK (macOS only) |
-| macOS prior art | UTM | UTM, `krunkit` |
+| Path of a Chromium WebGL call | Chromium ANGLE (GL back end), Mesa `virgl`, `virglrenderer`, host ANGLE, Metal or Direct3D 11 | Chromium ANGLE (Vulkan back end), Mesa `venus`, `virglrenderer`, KosmicKrisp (macOS) or the host Vulkan driver |
+| Layers on the path | Chromium ANGLE, Mesa `virgl`, host ANGLE | Chromium ANGLE and a Vulkan driver on Metal (macOS only) |
+| macOS prior art | UTM | UTM, `krunkit` (both on MoltenVK) |
 | Windows prior art | None found | None found |
-| Known limit | Host ANGLE on Direct3D 11 offers OpenGL ES 3.0 and parts of 3.1 [inference] | `venus` needs host memory export that `virglrenderer` implements for Linux; the macOS port carries patches [inference] |
+| Known limit | Host ANGLE on Direct3D 11 offers OpenGL ES 3.0 and parts of 3.1 [inference]. On macOS, `virgl` needs an ANGLE build and a patched `libepoxy`. | Chromium needs an OpenGL ES 3.0 context from ANGLE. ANGLE gives it only when the Vulkan device has `VK_EXT_provoking_vertex`. MoltenVK 1.4.2 lacks that extension (section 5.3.1). |
+
+#### 5.3.1 Host Vulkan Driver on macOS (Reference Module)
+
+Two Vulkan drivers run on Metal: MoltenVK and KosmicKrisp, which is part of Mesa. The renderer uses KosmicKrisp. The table gives the measured reasons on an Apple M1 Ultra with macOS 27.2.1.
+
+| Property | MoltenVK 1.4.2 | KosmicKrisp (Mesa 26.3.0) |
+| :--- | :--- | :--- |
+| `VK_EXT_provoking_vertex` with `provokingVertexLast` | No | Yes |
+| `nullDescriptor` of `VK_EXT_robustness2` (Mesa Zink needs it) | No | Yes |
+| `SYNC_FD` descriptors for semaphores and fences | No | Yes |
+| `VK_EXT_external_memory_host` (`virglrenderer` needs it on macOS) | Yes | Yes |
+| Vulkan conformance | Portability subset | Conformant to Vulkan 1.4 |
+| Host requirement | Metal | Metal 4: macOS 26 or later |
+| Gate G2 with guest Mesa 25.2.8 | Fail: the guest device has no `VK_KHR_swapchain`, and ANGLE requires it | Pass |
+| Chromium with guest Mesa 26.2.6 | Fail: `VK_KHR_swapchain` is present, but ANGLE offers only OpenGL ES 2.0 | Pass (WebGL 1 and WebGL 2) |
+
+Mesa releases before 26.2 expose the `venus` swapchain extensions only when the host imports `SYNC_FD` semaphores. Mesa 26.2.0 removed that condition (merge request 42853). KosmicKrisp imports `SYNC_FD` semaphores, so both old and new guest Mesa releases work. The guest image therefore needs no patched driver.
 
 ### 5.4 Memory Model
 
@@ -148,24 +177,24 @@ A `virtio-gpu` resource has guest backing pages, host backing memory, or both. W
 
 | Backend | Mapping of a renderer buffer into the guest | Expected work |
 | :--- | :--- | :--- |
-| `hvf` | `hv_vm_map` of a host pointer, aligned to 16 KiB | Import a shared memory object of the renderer and expose it as a `memmap.File`. |
+| `hvf` | `hv_vm_map` of a host pointer, aligned to 16 KiB | Done in `pkg/sentry/devices/virtgpu`. The Sentry maps the shared-memory object of the renderer one time. `hvcommon.RegionMap` maps that view with `hv_vm_map`. The platform package did not change. |
 | `whpx` | `WHvMapGpaRange` of a host pointer | Import a section handle of the renderer. |
 | Windows `systrap` | Map a view of a section into the stub | Extend `sectionCache` (`section_windows.go`) to accept an imported section handle. `get` accepts only file handles today. |
 | Linux `systrap` | Map the descriptor of a memory file | Import a descriptor from the renderer (optional platform). |
 
-Phase 2 starts with `virgl` and transfers only. Mesa `venus` requires `VIRTGPU_PARAM_RESOURCE_BLOB` and `VIRTGPU_PARAM_HOST_VISIBLE`, so blob mapping must land before `venus` support.
+On macOS, Phase 2 starts with `venus` and blob resources. The device accepts only `VIRTGPU_BLOB_MEM_HOST3D`. The renderer allocates every shared buffer as a POSIX shared-memory object, so the renderer never maps guest RAM. The device reports `VIRTGPU_PARAM_BLOB_ALIGNMENT` as 16 KiB, the page size of the host. A `virgl` path would need guest backing pages in the renderer, or a copy for each transfer.
 
 ### 5.5 Renderer Process
 
-The Sentry starts one renderer for each sandbox before `hostlockdown.Apply`. The renderer receives its IPC endpoints and then confines itself. The Sentry keeps only the handles of the IPC ring and of the shared sections. It keeps no handle that can write the memory of the renderer.
+The Sentry starts one renderer for each sandbox before `hostlockdown.Apply`. The renderer receives its socket end and then confines itself, before it reads a guest byte. The Sentry keeps only its socket end and its views of the shared blob objects. It keeps no handle that can write other memory of the renderer.
 
 | Host | Confinement of the renderer | GPU access that it keeps |
 | :--- | :--- | :--- |
 | Windows | Restricted token at low integrity, a job object without child processes, no file system access except its own binary | Direct3D 11 through `dxgi.dll` and `d3d11.dll`, which need win32k system calls [inference] |
-| macOS | A Seatbelt profile that denies `process-fork`, file writes, and network access | `iokit-open` for the GPU user clients that Metal needs |
+| macOS | A Seatbelt profile with `deny default`. It denies `process-fork`, `process-exec`, file writes, and network access. It permits `file-read-metadata` and file reads only in system library paths and in the renderer bundle. | `iokit-open` for `IOAccelerator` and `IOSurfaceRootUserClient`; the Mach service `com.apple.MTLCompilerService`; POSIX shared memory with the name prefixes `/vkr-` and `/proxy-` |
 | Linux (optional) | seccomp and namespaces, as `crosvm` does | The render node of the host |
 
-The renderer runs C code that parses guest-controlled input. Section 6 describes the consequences.
+The renderer runs C code that parses guest-controlled input. Section 6 describes the consequences. The Sentry cannot start a process after the lockdown, so a renderer that exits does not restart. [`architecture.md`](architecture.md) section 3.15 gives the reason for each rule of the macOS profile.
 
 ### 5.6 Display Options
 
@@ -188,8 +217,10 @@ Phase 3 chooses one display path. The path decides the copy cost and the size of
 | :--- | :--- | :--- |
 | Memory corruption in `virglrenderer` | [CVE-2019-18389](https://access.redhat.com/security/cve/cve-2019-18389) is a heap overflow; Red Hat lists denial of service or a guest-to-host escape. [CVE-2022-0135](https://access.redhat.com/security/cve/cve-2022-0135) is an out-of-bounds write; Red Hat lists denial of service or code execution. | Run the renderer in its own confinement (section 5.5). Pin and update `virglrenderer` with each release. |
 | Defects in the host GPU driver | The driver runs in the host kernel or in a privileged host service | Keep the GPU path opt-in. State the risk in the documentation of the option. |
-| Resource exhaustion | A guest can allocate GPU memory and submit long command buffers | Cap the memory of the resources and the size of each submission in the Sentry. Time out a context that does not signal its fences. |
-| Data leaks between sandboxes | A shared renderer could mix contexts | Start one renderer for each sandbox. |
+| Resource exhaustion | A guest can allocate GPU memory and submit long command buffers | The Sentry caps contexts (64), one blob (1 GiB), one submission (16 MiB), and pending fences (4096 for each context). It caps blob bytes at the smaller of 4 GiB and 25% of host RAM by default. A fence that stays pending for 30 s ends its context. |
+| Data leaks between sandboxes | A shared renderer could mix contexts | Start one renderer for each sandbox. Give the renderer no write access to the Metal shader cache, which all processes of one user share. |
+| GPU memory that the Sentry cannot count | `venus` allocates device-local Vulkan memory through its ring, with no blob | A thread in the renderer samples the memory footprint every 250 ms. The renderer exits above the blob limit plus 512 MiB. The host kernel does not enforce this limit, so a corrupted renderer can pass it. |
+| Loss of the renderer during a run | The renderer is one process, and it cannot restart after the lockdown | Guest mappings stay valid, because the Sentry holds its own view of each blob. Later GPU calls return `EIO`. The sandbox keeps running, and Chromium uses its own fallback. |
 
 The option is off by default. A sandbox without the option registers no DRM device and starts no renderer. Its security model stays unchanged.
 
@@ -202,13 +233,14 @@ An earlier draft proposed the same three layers. This table compares its claims 
 | Claim of the draft | Finding | Basis |
 | :--- | :--- | :--- |
 | The Sentry intercepts about 10 ioctls | The surface also includes the DRM core, dma-buf and `sync_file` file types, and `sysfs` enumeration | Section 5.2 |
-| Chromium enables acceleration without changes | The Chromium GPU blocklist can disable features on a `virgl` device; a flag such as `--ignore-gpu-blocklist` can be necessary | [inference] Phase 1 measures it |
+| Chromium enables acceleration without changes | Headless Chromium needs `--use-angle=vulkan` and `--ignore-gpu-blocklist`. The guest image needs `mesa-vulkan-drivers`. `gvx` adds no flag and no package to the guest. | Gate G2 (section 9.3.1) |
 | WebGL becomes tens of times faster than SwiftShader | The gain applies to WebGL-heavy pages. Page rasterization, screenshots, and PDF output of automation depend on the CPU. Chromium deprecates the automatic WebGL fallback to SwiftShader, so WebGL on SwiftShader needs `--enable-unsafe-swiftshader` | Phase 0 measures the share of CPU rendering |
 | Guest sockets connect to the host X11 or Wayland socket | `hostfs` keeps sockets in Sentry memory. A guest reaches a host display server only through TCP today | Section 4 |
 | Shared memory gives zero-copy 4K at 60 Hz through the X11 bridge | X11 over TCP copies each frame. `virgl` transfers copy by default. Zero copy needs blob resources and a compositor bridge | Sections 5.4 and 5.6 |
 | `/dev/shm` must grow from 64 MB | The 64 MB limit is a Docker default. `gvx` mounts `/dev/shm` as `tmpfs` without a size option, so the `tmpfs` default of 50% of host RAM applies | `pkg/gvx/kernel_runner.go` |
 | The host renderer takes 15 MB to 20 MB | Plausible for ANGLE and `virglrenderer`. The ANGLE build needs `depot_tools` and `gn`, and `virglrenderer` has no supported `windows/arm64` build | [inference] Phase 1 measures it |
-| Two licenses fit the project | `virglrenderer` is MIT and ANGLE is BSD-3-Clause. MoltenVK is Apache-2.0 | Upstream license files |
+| Two licenses fit the project | `virglrenderer` is MIT and ANGLE is BSD-3-Clause. MoltenVK is Apache-2.0. Mesa, which holds KosmicKrisp, is MIT. | Upstream license files |
+| Phase 1 can prototype every stream over `vtest` (first version of this document) | On macOS the `vtest` server falls back to protocol version 0, because it needs `memfd_create`. Version 0 has no blob resource, and `venus` needs blob resources and descriptor passing. | `vtest/vtest_shm.c` and `vtest/vtest_renderer.c` of `virglrenderer` |
 
 ---
 
@@ -225,6 +257,8 @@ The risks below decide whether the project continues after each phase. The exit 
 | A renderer escape | Host compromise | Renderer confinement, opt-in, pinned versions | Phase 2 |
 | Build and release cost of C dependencies | CI time and release size | Build the renderer in a separate job and ship it as a separate archive | Phase 2 |
 | No GPU in CI | Regressions in performance stay unseen | Run function tests on WARP for Windows; run macOS and performance tests by hand on physical hosts | Phase 2 |
+| KosmicKrisp is a young driver (first release in 2025) | Rendering or stability defects on some pages | Pin the Mesa version in `gpurenderer/third_party.lock`. Run gates G1 and G2 after each change of the pin. | Phase 2 |
+| The renderer needs macOS 26 or later | No GPU option on older hosts | `gvx.New` returns an error that names the requirement. The sandbox does not fall back to software rendering silently. | Phase 2 |
 
 ---
 
@@ -248,42 +282,136 @@ Phase 0 needs no new device. It tells whether browsers run on each backend and h
 
 Exit criterion: the browsers pass on each backend, and SwiftShader takes at least the minimum share of run time.
 
-### 9.2 Phase 1: Prototype over `vtest`
+#### 9.1.1 Phase 0 Results on `hvf` (Reference Module)
 
-`virglrenderer` ships a test server (`vtest`) that speaks a Unix socket protocol. Mesa can use that protocol without a DRM device. The prototype therefore needs no Sentry change. Upstream Meson builds the server only for hosts other than Windows, and the clients receive buffers as file descriptors.
+The tables below record the first `hvf` results on an Apple M1 Ultra with 64 GB running macOS 27.2.1. Other workloads loaded the host (load average 24 to 133), so the latency values are upper bounds. Each row of the command table names the suite that produced the measurements below.
+
+| Suite | Command |
+| :--- | :--- |
+| Browser gates | `GVX_E2E_BROWSER=1 go test -count=1 -timeout 30m -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2EGateBrowser' -v` |
+| Browser benchmark (`hvf`) | `GVX_E2E_BROWSER=1 GVX_E2E_BROWSER_BENCH=1 go test -count=1 -timeout 60m -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2EBrowserBench$' -v` |
+| Native macOS Chromium 159 | `GVX_BENCH_PWCORE=<playwright-core-dir> GVX_BENCH_BASE="file://$PWD/e2e/testdata/browser/" GVX_BENCH_WEBGL="n=20000&size=0.05&iters=16;sync=1&n=20000&size=0.05&iters=16;sync=1&n=200&size=1.0&iters=64" node e2e/testdata/browser/browser-bench.js` (Playwright macOS Chromium 159 headless shell for SwiftShader; full Chromium for Metal) |
+| Microbenchmarks (`hvf`) | `GVX_E2E_BENCH=1 go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2EMicroBench$' -v` |
+
+| Gate | Result on `hvf` |
+| :--- | :--- |
+| Chromium 159 `--dump-dom` (`TestE2EGateBrowserChromiumDumpDOM`) | Pass |
+| Chromium sandbox as `pwuser` (`TestE2EGateBrowserChromiumSandbox`) | Pass: each renderer runs in seccomp mode 2 in its own user and PID namespaces |
+| WebGL on SwiftShader (`TestE2EGateBrowserWebGLSwiftShader`) | Pass with `--enable-unsafe-swiftshader` |
+| Playwright 1.65.1 screenshot and PDF (`TestE2EGateBrowserPlaywright`) | Pass |
+| Electron 45.4.1 (`TestE2EGateBrowserElectron`) | Pass with `--ozone-platform=headless` |
+
+| Measurement (`TestE2EBrowserBench`) | `hvf` | Native macOS, same Chromium |
+| :--- | ---: | ---: |
+| Browser start (median of 5) | 280 ms to 302 ms | 128 ms to 131 ms |
+| New tab (median of 10) | 190 ms to 202 ms | 46 ms to 47 ms |
+| WebGL draw-call bound, 60 frames (`webgl-load.html?frames=60&sync=1&n=20000&size=0.05&iters=16`) | 5263 ms (SwiftShader share 95 %) | 1277 ms (SwiftShader), 512 ms (Metal) |
+| WebGL fragment bound, 60 frames (`webgl-load.html?frames=60&sync=1&n=200&size=1.0&iters=64`) | 7577 ms (SwiftShader share 98 %) | 6948 ms (SwiftShader), 100 ms (Metal) |
+| Automation script: 10 screenshots and 10 PDFs (`automation-doc.html`) | 36.8 s (SwiftShader share 0 %) | 18.8 s |
+
+The first Phase 0 threshold is a SwiftShader share of at least 50 % of Chromium CPU time. The GPU path must run at least 3 times faster on the fragment-bound page. It must run at least 1.5 times faster on the draw-call-bound page. The automation script spends no time in SwiftShader, so a GPU path cannot shorten it. In `TestE2EMicroBench` on `hvf`, `futex_pingpong` takes 149 µs to 233 µs, and `getpid` takes 1.7 µs. This wake latency makes the draw-call page 4.1 times slower than native SwiftShader, and it also limits the GPU path.
+
+### 9.2 Phase 1: Prototype without a Sentry Change
+
+Phase 1 measures the rendering stack before the Sentry device exists. Windows uses the test server (`vtest`) of `virglrenderer`. macOS cannot use that server for `venus`, so macOS uses the checks of section 9.2.2.
+
+#### 9.2.1 Windows: Prototype over `vtest` (Procedural Module)
+
+`vtest` speaks a Unix socket protocol. Mesa can use that protocol without a DRM device, so the prototype needs no Sentry change. Upstream Meson builds the server only for hosts other than Windows, and the clients receive buffers as file descriptors.
 
 > [!CAUTION]
 > Run the prototype server only on a development host with test pages. The server parses guest commands in unconfined C code, so a malformed command can corrupt memory and run code on the host.
 
-1. Build `virglrenderer` and the `vtest` server with ANGLE on macOS.
-2. Port the `vtest` server to Windows.
+1. Port the `vtest` server to Windows.
+2. Build `virglrenderer` and the server with ANGLE on Direct3D 11.
 3. Relay the guest `vtest` Unix socket to the host over TCP on the NAT network.
 4. Run Chromium with Mesa in `vtest` mode for `virgl`.
-5. Defer `venus` to Phase 2, because Mesa `venus` over `vtest` needs host file descriptors.
-6. Run a WebGL conformance subset and the Phase 0 workloads.
-7. Compare frame times and correctness with SwiftShader.
+5. Run a WebGL conformance subset and the Phase 0 workloads.
+6. Compare frame times and correctness with SwiftShader.
 
-Exit criterion: `virgl` passes the conformance subset on macOS and on Windows and meets the minimum speedup of Phase 0. The relay copies every buffer because it cannot pass file descriptors. The criterion therefore compares the rendering work, not the transport.
+Exit criterion: `virgl` passes the conformance subset on Windows and meets the minimum speedup of Phase 0. The relay copies every buffer because it cannot pass file descriptors. The criterion therefore compares the rendering work, not the transport.
+
+#### 9.2.2 macOS: Renderer Bring-Up (Reference Module)
+
+On macOS, the `vtest` server negotiates protocol version 0, which has no blob resource. A TCP relay also cannot carry the shared memory of the `venus` ring. Phase 1 on macOS therefore proved each host mechanism alone, with no Sentry change. This is the deviation from the phase order: the browser measurement moved to gates G1 and G2 of Phase 2.
+
+The checks ran on an Apple M1 Ultra with macOS 27.2.1. Each check now has a test in the repository.
+
+| Check | Result | Test in the repository |
+| :--- | :--- | :--- |
+| `virglrenderer` with `venus` builds unpatched and serves a capset, a context, a blob as a shared-memory descriptor, and a fence through its public API | Pass | `internal/gpurender`: `TestHandshakeCachesVenusCapset`, `TestBlobDescriptorIsSharedMemory`, `TestFenceRetiresWithin100ms` |
+| `hv_vm_map` accepts a shared view of POSIX shared memory, and the view stays valid after the creator exits | Pass | `pkg/sentry/devices/virtgpu`: `TestBlobFromRendererOnHVF`, `TestBlobFromRendererSurvivesRendererExit` |
+| A process under the Sentry Seatbelt profile receives a shared-memory descriptor and maps it with no new rule | Pass | `pkg/gvx`: `TestGPUServesRenderNodeUnderLockdown` |
+| A Vulkan driver on Metal runs under a `deny default` Seatbelt profile, and the profile refuses `fork`, `exec`, file access, and network access | Pass | `gvx-gpu-renderer --selftest`; `internal/gpurender`: `TestGPURendererConfinement` |
+
+Exit criterion for macOS: all four checks pass on an Apple Silicon host. The four checks passed on 2026-11-20.
 
 ### 9.3 Phase 2: Virtual Render Node
 
-Phase 2 builds the production path for headless guests. It adds the device, the renderer process, the IPC ring, and the confinement of section 5.5.
+Phase 2 builds the production path for headless guests. It adds the device, the renderer process, the IPC, and the confinement of section 5.5. Steps 1 to 9 are the smallest path to a measurement on macOS.
 
-1. Add `pkg/sentry/devices/virtgpu` with the interface of section 5.2.
-2. Add the `sysfs` entries that `libdrm` reads.
-3. Add the renderer command and its IPC package.
-4. Start the renderer before `hostlockdown.Apply` when the sandbox enables the GPU option.
-5. Confine the renderer as section 5.5 describes.
-6. Add confinement tests that fail when the renderer starts a process, opens a file, or connects to a network.
-7. Add the resource caps and the fence timeout of section 6.
-8. Add blob resources and host-visible mapping before `venus` support.
-9. Measure `venus` with MoltenVK on macOS and with the host Vulkan driver on Windows.
-10. Run the WebGL conformance subset with the GPU option on.
-11. Build the renderer in a separate CI job and publish it as a separate archive.
-12. Add `e2e` gates that run on WARP in the Windows CI jobs.
-13. Run the gates by hand on a physical Mac and a physical Windows host.
+1. Add `pkg/sentry/devices/virtgpu` with the `venus` subset of section 5.2.
+2. Add blob resources and the host-visible mapping in the same step.
+3. Add the `sysfs` entries that `libdrm` reads.
+4. Add the renderer command and its IPC package.
+5. Start the renderer before `hostlockdown.Apply` when the sandbox enables the GPU option.
+6. Confine the renderer as section 5.5 describes.
+7. Add confinement tests that fail when the renderer starts a process, opens a file, or connects to a network.
+8. Run gate G1: an unmodified guest Mesa runs a Vulkan compute probe.
+9. Run gate G2: headless Chromium renders WebGL through `venus`.
+10. Add the resource caps and the fence timeout of section 6.
+11. Run the WebGL conformance subset with the GPU option on.
+12. Build the renderer in a separate CI job and publish it as a separate archive.
+13. Measure `venus` with the host Vulkan driver on Windows.
+14. Add `e2e` gates that run on WARP in the Windows CI jobs.
+15. Run the gates by hand on a physical Mac and a physical Windows host.
 
 Exit criterion: the Phase 0 gates and the confinement tests pass with the GPU option on. The speedup over SwiftShader meets the minimum of Phase 0.
+
+#### 9.3.1 Phase 2 Results on macOS (Reference Module)
+
+The macOS path completed steps 1 to 10. Step 11 is open: no run of the WebGL conformance subset exists. Step 12 has its jobs: `ci.yml` builds the renderer bundle, and `release.yml` builds and packages the renderer archive. No hosted runner has run either job yet. Steps 13 and 14 belong to Windows. The tables below record the gates on an Apple M1 Ultra with 64 GB running macOS 27.2.1, with the host lockdown on.
+
+Each gate writes its record to the directory in `GVX_E2E_ARTIFACT_DIR`: `result.json`, the Sentry log, the list of refused ioctls, and the screenshots.
+
+| Gate | Command |
+| :--- | :--- |
+| Renderer build and self-test | `scripts/gpu/build-renderer.sh`, then `build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest` |
+| G1, guest Vulkan (record `g1/result.json`) | `GVX_E2E_GPU=1 GVX_GPU_RENDERER="$PWD/build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2EGateGPUVulkan$' -v` |
+| Renderer kill (record `g1-kill/result.json`) | The same variables, with `-run '^TestE2EGPURendererKill$'` |
+| G2, Chromium WebGL (record `g2/result.json`) | The same variables, with `-timeout 30m -run '^TestE2EGateGPUChromium$'` |
+
+| Gate G1 (2026-11-20) | Result |
+| :--- | :--- |
+| Guest image and driver | `debian:trixie` with a digest pin, unmodified `mesa-vulkan-drivers`, Mesa 25.0.7-2+deb13u1 |
+| Device that the guest sees | `Virtio-GPU Venus (Apple M1 Ultra)`, driver `venus`; PCI ID `0x1af4:0x1050` in `sysfs` |
+| Compute probe | Pass: the GPU writes 1048576 words through a mapped blob, and the guest reads them with 0 mismatches |
+| First dispatch | 21.350 ms on `venus`; 55.203 ms on lavapipe in the same guest with `-gpu=off` |
+| Submit and wait, average of 50 rounds | 0.422 ms |
+| `SYNC_FD` fence through a `sync_file` descriptor | PASS |
+| Refused ioctls | None |
+| Renderer kill during the probe | Pass: the guest probe stops, `rungv` exits 4344 ms after the kill, and no renderer process stays |
+
+| Gate G2 (2026-11-20) | Headless shell | Full Chromium (new headless) |
+| :--- | :--- | :--- |
+| Guest image | `mcr.microsoft.com/playwright:v1.65.1-noble` with a digest pin, Chromium 159, plus `mesa-vulkan-drivers` 25.2.8 from Ubuntu 24.04 | The same image |
+| Chromium flags | `--use-angle=vulkan --ignore-gpu-blocklist --disable-vulkan-surface` | The same flags |
+| WebGL context | WebGL 1 and WebGL 2 | WebGL 1 and WebGL 2 |
+| `UNMASKED_RENDERER_WEBGL` | `ANGLE (Apple, Vulkan 1.4.307 (Virtio-GPU Venus (Apple M1 Ultra) (0x00000064)), venus)` | The same string |
+| Pixel checks of the scene page | 10 of 10 | 10 of 10 |
+| First page after browser start | 1655 ms | 5119 ms |
+| Load page (`webgl-load.html`, 60 frames), GPU | 177 ms | 235 ms |
+| Load page, SwiftShader in the same guest with `-gpu=off` | 7584 ms | 8788 ms |
+| Refused ioctls | None | None |
+
+The GPU pass of gate G2 takes 22.19 s for both browsers. The screenshots of the GPU pass and of the SwiftShader pass differ only in one pixel row on a texel boundary of the checker texture. The fragment-bound page meets the Phase 0 minimum of 3 times. No run has measured the draw-call-bound page or the WebGL conformance subset with the GPU option on.
+
+The first run of gate G2 used MoltenVK and failed. Section 5.3.1 gives the two causes and the change to KosmicKrisp.
+
+| Known defect | State |
+| :--- | :--- |
+| KD-1: the first blob request on a new context can fail while other contexts start and stop at the same time. `sendmsg` with a descriptor returns `EINVAL` in `virglrenderer`. | Open. In a stress test of context churn, up to 3 of 800 requests failed in about half of the runs. Gates G1 and G2 count the failure; both counts are 0. |
+| KD-2: Metal compiled each shader slowly under the renderer Seatbelt profile. The first page of full Chromium took about 55 s. | Fixed. The renderer resolves the cache directory of the user one time before it confines itself. A start-time test fails when the delay returns. |
 
 ### 9.4 Phase 3: Display Output
 
@@ -305,12 +433,17 @@ These questions have no answer in this proposal. Each answer changes the scope o
 
 | Question | Phase that answers it |
 | :--- | :--- |
-| Does Chromium run its multi-process sandbox in a `gvx` guest, or does it need `--no-sandbox`? | Phase 0 |
-| What share of automation time does SwiftShader take for the target users? | Phase 0 |
+| Does Chromium run its multi-process sandbox in a `gvx` guest, or does it need `--no-sandbox`? | Phase 0 (answered for `hvf`): the sandbox runs for a user that is not root. Chromium refuses to start as root without `--no-sandbox`. |
+| What share of automation time does SwiftShader take for the target users? | Phase 0 (answered for `hvf`): 0 % for screenshots and PDF output, and 83 % to 98 % for WebGL pages. |
 | Does `virglrenderer` with ANGLE on Direct3D 11 render the WebGL conformance subset? | Phase 1 |
 | Does `venus` run on Windows hosts with vendor Vulkan drivers on `amd64` and `arm64`? | Phase 2 |
 | Which renderer confinement on Windows keeps Direct3D 11 working? | Phase 2 |
 | Do the users need headed windows, or is headless rendering enough? | Before Phase 3 |
+| Does `venus` run on a macOS host? | Phase 2 (answered): yes, on KosmicKrisp with macOS 26 or later. On MoltenVK 1.4.2, Chromium gets no OpenGL ES 3.0 context. |
+| Does Chromium ANGLE on Vulkan render correct WebGL through `venus` on macOS? | Phase 2 (answered for the probe pages of gate G2): yes. The WebGL conformance subset is open. |
+| Does Chromium use PRIME or `sync_file` import with `--enable-features=Vulkan`? | Phase 2 (open). The device refuses both today and logs the refusal. |
+| Can the host kernel limit the memory of the renderer process? | Phase 2 (open). The limit is a watchdog inside the renderer today. |
+| Does Metal work on a hosted macOS CI runner, so that the renderer tests can run in CI? | Phase 2 (open). `scripts/gpu/ci-metal-probe.sh` measures it on a runner through `diagnose.yml`. The repository variable `GVX_CI_METAL=1` then turns on the renderer tests of `ci.yml`. |
 
 ---
 
@@ -328,3 +461,7 @@ The external facts of this proposal come from these sources. The facts about `gv
 | [WSLg](https://github.com/microsoft/wslg) | The Windows path through Mesa `d3d12` and RDP. |
 | [CVE-2019-18389](https://access.redhat.com/security/cve/cve-2019-18389), [CVE-2022-0135](https://access.redhat.com/security/cve/cve-2022-0135) | Guest-triggered memory corruption in `virglrenderer`: heap overflow and out-of-bounds write. |
 | [Chromium SwiftShader notes](https://chromium.googlesource.com/chromium/src/+/main/docs/gpu/swiftshader.md) | The deprecation of the automatic SwiftShader fallback for WebGL. |
+| [KosmicKrisp](https://docs.mesa3d.org/drivers/kosmickrisp.html) | The Vulkan driver on Metal in Mesa, its conformance, and the macOS 26 requirement. |
+| [Mesa merge request 42853](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42853) | The removal of the `SYNC_FD` condition on semaphore import for the `venus` swapchain extensions in Mesa 26.2.0. |
+| [ANGLE `vk_renderer.cpp`](https://chromium.googlesource.com/angle/angle/+/refs/heads/main/src/libANGLE/renderer/vulkan/vk_renderer.cpp) | The rule that limits ANGLE to OpenGL ES 2.0 without `VK_EXT_provoking_vertex`. |
+| [Using GPU Hardware in Headless Chrome](https://chromium.googlesource.com/chromium/src.git/+/main/docs/gpu/using-gpu-hardware-in-headless-chrome.md) | The `--use-angle=vulkan` flag for headless Chromium on Linux. |

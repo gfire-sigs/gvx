@@ -15,6 +15,7 @@ A vulnerability is a defect that lets a guest, an image, or a volume file cross 
 | Network isolation | `-net=wg` sends guest traffic only through the WireGuard tunnel. `-net=none` gives the guest no host network. |
 | Control shim | `containerd-shim-gvx-v2` never signals a stored PID and never deletes files that containerd owns. |
 | Release archives | Every archive of a release has a SLSA build provenance attestation from `.github/workflows/release.yml` for the tag of the release. An archive that fails `gh attestation verify` is not a `gvx` release. |
+| GPU renderer (`-gpu=venus`, off by default) | Guest data cannot make `gvx-gpu-renderer` start a process, write a host file, or open a network connection. The renderer reads file contents only in system library paths and in its bundle (`file-read-metadata` stays open for Metal). A renderer fault does not corrupt Sentry memory. |
 
 These limits are documented behavior, not vulnerabilities:
 
@@ -23,6 +24,9 @@ These limits are documented behavior, not vulnerabilities:
 - On Android, a host mount leaves `Status.UnboundFileOpenBlocked` false because the `untrusted_app` seccomp policy of Zygote blocks Landlock calls.
 - `-lockdown=false` disables the host lockdown.
 - A guest can use the host network that `-net=nat` and `-p` expose.
+- `-gpu=venus` adds a host process that parses guest-controlled command streams in C and calls the GPU driver of the host. A defect in `virglrenderer`, in the Vulkan driver, or in Metal is reachable from the guest inside the renderer confinement.
+- With `-gpu=venus`, the host kernel does not limit the memory of the renderer. A watchdog inside the renderer exits above the configured limit; a corrupted renderer can skip it.
+- With `-gpu=venus`, a guest can end its own GPU access: a malformed command stream stops the renderer, and the renderer does not restart.
 
 ## 2. Supported Versions (Reference Module)
 

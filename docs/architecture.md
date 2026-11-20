@@ -58,7 +58,7 @@ gvx/ (Fork of google/gvisor@go)
  │   ├── moonshots.md                       # [NEW] Completed feature milestones
  │   ├── assets/                            # [NEW] D2 diagram sources and compiled SVGs
  │   └── recipes/                           # [NEW] Docker Engine and Kubernetes integration guides
- ├── scripts/                               # [NEW] codesign-exec, sync-upstream, gostateify, gvisorlint, repro-build
+ ├── scripts/                               # [NEW] codesign-exec, sync-upstream, gostateify, gvisorlint, repro-build, gpu/build-renderer
  ├── tools/
  │   ├── androidprobe/                      # [NEW] Android kernel and seccomp capability probe
  │   ├── gostateify/                        # [NEW] Native Go pkg/state generator and drift verifier
@@ -74,6 +74,7 @@ gvx/ (Fork of google/gvisor@go)
  │       ├── sync_manifest.json
  │       ├── boundaries.go
  │       └── diff_audit.go
+ ├── gpurenderer/                           # [NEW] GPU renderer (C): virglrenderer venus, KosmicKrisp bundle, Seatbelt
  ├── cmd/
  │   ├── containerd-shim-gvx-v2/            # [NEW] Optional containerd control shim command
  │   │   └── main.go
@@ -82,6 +83,7 @@ gvx/ (Fork of google/gvisor@go)
  ├── internal/                              # [NEW] gvxshim control adapter, acceptprog probes, weakmap, xsys/unix
  │   ├── acceptprog/                        # [NEW] Zero-dependency guest syscall acceptance binaries
  │   ├── gvxshim/                           # [NEW] Isolated containerd control adapter
+ │   ├── gpurender/                         # [NEW] GPU renderer start, protocol client, and test helper
  │   ├── weakmap/                           # [NEW] Per-instance weak-pointer side table
  │   └── xsys/unix/                         # [NEW] Embedded golang.org/x/sys/unix with Darwin and Windows extensions
  ├── pkg/
@@ -119,6 +121,8 @@ gvx/ (Fork of google/gvisor@go)
  │       ├── hostcpu/                       # Host CPU number bindings on Windows and macOS
  │       ├── time/                          # Monotonic clock calibration (QPC and mach_continuous_time)
  │       ├── pgalloc/                       # Backing shared memory, 16KB sub-page decommit, sparse C/R page I/O
+ │       ├── devices/virtgpu/               # [NEW] virtio-gpu render node, GEM handles, blob memory, sync_file
+ │       ├── devices/virtgpu/gpuproto/      # [NEW] Sentry to GPU renderer protocol and C header generator
  │       ├── socket/netlink/genetlink/      # [NEW] Generic Netlink router and in-guest WireGuard family
  │       ├── platform/
  │       │   ├── whpx/                      # [NEW] Windows Hypervisor Platform engine (amd64 and arm64)
@@ -152,7 +156,7 @@ Each package owns one architectural boundary. Top-down import directionality kee
 | `tools/shiminterop` | Exercises real containerd `2.1.5` ShimManager calls in an isolated Go module. | None | Root runtime, command, and internal packages |
 | `tools/gostateify` | Generates reflection-free `pkg/state` methods and verifies zero autogen drift. | `golang.org/x/tools/*` | `pkg/*` (production), `cmd/*`, `internal/*` |
 | `cmd/rungv` | Parses CLI commands in [`cli.md`](cli.md) for sandboxes, images, volumes, system diagnostics, checkpoint, restore, tuning, and shell completion. | `pkg/gvx`, `pkg/gvx/tuning`, `pkg/oci`, `pkg/netbackend` | `pkg/sentry/*`, `WinHvPlatform.dll` |
-| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, Sentry boot, checkpoint, and restore. | `pkg/gvx/{hostcerts,tuning}`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip`, `pkg/seccomp`, `runsc/boot/filter/config` | `cmd/*`, `internal/gvxshim` |
+| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, Sentry boot, checkpoint, and restore. | `pkg/gvx/{hostcerts,tuning}`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip`, `pkg/seccomp`, `runsc/boot/filter/config`, `internal/gpurender` | `cmd/*`, `internal/gvxshim` |
 | `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests, caches layers, and compiles `.tar` streams into `.erofs` images. | `pkg/abi/linux`, `pkg/erofs`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
 | `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip`, `pkg/tcpip/link/wgtun`, `pkg/hostlockdown`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
 | `pkg/hostlockdown` | Confines the host process via Windows Tokens/JobObjects/brokers, macOS Seatbelt, or Linux Landlock. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
@@ -163,6 +167,9 @@ Each package owns one architectural boundary. Top-down import directionality kee
 | `pkg/sentry/platform/systrap` | Executes guest code via syscall patching, `sysmsg` shared memory, and isolated stubs on Linux and Windows. | `pkg/sentry/platform`, `pkg/sentry/platform/hvcommon`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/arch/*` | `pkg/sentry/kernel`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf` |
 | `pkg/sentry/fsimpl/hostfs` | Mounts host workspaces via `os.Root`, `NtCreateFile`/`openat`, `chunkcache`, and `.gvx_meta`. | `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{chunkcache,fsutilx}`, `pkg/abi/linux`, `pkg/fd`, `pkg/hostlockdown`, `internal/xsys/unix` | `pkg/sentry/platform/*` |
 | `pkg/sentry/fsimpl/ext4lite` | Stores one named volume or writable rootfs upper layer in one pre-opened ext4 image file. | `pkg/sentry/vfs`, `pkg/sentry/blockdev`, `pkg/sentry/fsimpl/{chunkcache,fsutilx}`, `pkg/abi/linux`, `pkg/fd`, `internal/xsys/unix` | `pkg/sentry/platform/*`, `cmd/*` |
+| `pkg/sentry/devices/virtgpu` | Exposes the virtio-gpu render node, GEM handles, blob memory, and `sync_file` descriptors to the guest. | `pkg/sentry/*`, `pkg/abi/linux`, `pkg/fd`, `pkg/marshal`, `pkg/waiter`, `internal/xsys/unix` | `pkg/sentry/platform/*` and `internal/*` (production code), `pkg/gvx` |
+| `pkg/sentry/devices/virtgpu/gpuproto` | Defines the wire format between the Sentry and the GPU renderer process and generates its C header. | `pkg/fd` | `pkg/sentry/*`, `internal/*` |
+| `internal/gpurender` | Starts the GPU renderer process, runs the protocol, and receives blob descriptors. | `pkg/sentry/devices/virtgpu/gpuproto`, `pkg/fd`, `internal/xsys/unix` | `pkg/sentry/*`, `pkg/gvx` |
 | `pkg/sync`, `pkg/memutil`, `pkg/fd` | Provide host futexes, shared memory views, and host handles across Linux, Windows, and macOS. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*` |
 
 `tools/upstream` enforces this table in `boundaries.go` (`VerifyBoundaries`). Sentry foundation packages such as `pkg/context`, `pkg/hostarch`, `pkg/usermem`, and `pkg/sentry/memmap` appear in every platform and VFS interface, so platform and VFS packages import them directly. Every other cross-boundary import requires an explicit reason-annotated exception in `boundaries.go`.
@@ -173,7 +180,7 @@ Each package owns one architectural boundary. Top-down import directionality kee
 
 | Isolation Tier | File Paths | Upstream Conflict Rate | Maintenance Mechanism |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths (`file_mask.txt` omits unshipped upstream directories). |
+| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/devices/virtgpu/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `gpurenderer/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths (`file_mask.txt` omits unshipped upstream directories). |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr,safecopy}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{arch,kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin,xplat}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*`, `pkg/tcpip/**_{windows,darwin,xplat}*`, `pkg/sentry/{inet,socket,fsimpl,devices}/**_*xplat*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and narrow cross-platform seams | `< 5.0%` (`< 4.2%` CI gate) | Re-applied by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after each upstream sync and recorded in `sync_manifest.json`. |
 
@@ -763,14 +770,18 @@ Windows applies `RestrictedSids` on thread impersonation tokens because `CreateP
 
 #### macOS Lockdown Sequence (`lockdown_darwin.go`) (Procedural Module)
 
-Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framework` VM, cached `.erofs` layer descriptors, network sockets, and `/workspace` `os.Root` descriptor:
+`gvx.New` opens the `Hypervisor.framework` VM, `.erofs` layers, sockets, and `/workspace` `os.Root`, and starts any `gvx-gpu-renderer` before lockdown. Execute these steps in `lockdown_darwin.go`:
 
 1. Pin `GOMAXPROCS` (`runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))`) so Seatbelt denials on CPU `sysctl` queries do not shrink worker parallelism.
 2. Call `setrlimit(RLIMIT_NPROC, &rlimit{Cur: 0, Max: 0})` to block `fork()` at the XNU kernel boundary.
 3. Call `sandbox_init_with_parameters` with the Seatbelt `deny default` profile to block `process-fork`, `process-exec*`, and unbound file or port binds.
 4. Probe descriptor I/O and verify file, directory, and unbound socket denials; return an error if any denial probe succeeds.
 
-`rungv` and `pkg/gvx` enable the lockdown by default. The option `-lockdown=false` opts out and prints a warning.
+#### macOS Lockdown Notes (Descriptive Module)
+
+`rungv` and `pkg/gvx` enable the macOS lockdown by default. The option `-lockdown=false` disables the lockdown and prints a warning.
+
+With `-gpu=venus`, `gvx.New` starts one `gvx-gpu-renderer` process before `hostlockdown.Apply`. The renderer receives one end of a socketpair as descriptor 3. It applies its own Seatbelt profile before it reads a guest byte. The Sentry profile needs no new rule: it already permits signals to child processes, and it permits the receipt and `mmap` of shared-memory descriptors. The renderer cannot restart after the lockdown.
 
 #### Linux Lockdown Sequence (`landlock_linux.go`, `lockdown_linux.go`, and `syscallfilter_linux.go`) (Procedural Module)
 
@@ -883,6 +894,7 @@ Containerd `2.3` binary bootstrap, CRI, guest workloads, and successful native s
 | `wireguard` link and the family `wireguard` | `socket/netlink/genetlink/wireguard` (Tier 1), `socket/netstack/linkkind_xplat.go`, `socket/netstack/linkstate_xplat.go` | `RTM_NEWLINK` with the kind `wireguard` creates a link with the MTU 1420 and no link-layer header. `WG_CMD_SET_DEVICE` and `WG_CMD_GET_DEVICE` follow `include/uapi/linux/wireguard.h`. A sandbox has no limit on the count of links, and a device has at most 1,048,576 peers, as in Linux. The link starts down and follows `IFF_UP`. See the paragraphs after this table. |
 | `vxlan` link | `pkg/tcpip/link/vxlan` (Tier 1), `socket/netstack/vxlan_xplat.go`, `socket/netstack/linkkind_xplat.go` | `RTM_NEWLINK` with the kind `vxlan` creates an Ethernet link with the MTU 1450, or the MTU of the underlay link minus 50. `RTM_GETLINK` reports the kind and `IFLA_INFO_DATA`. See the paragraphs after this table. |
 | Neighbor and FDB netlink | `socket/netlink/route/neigh_xplat.go`, one call in `route/protocol.go` | `RTM_NEWNEIGH`, `RTM_DELNEIGH`, and `RTM_GETNEIGH` map permanent IPv4 and IPv6 entries to the static neighbors of the stack. The family `AF_BRIDGE` reads and writes the FDB of a `vxlan` link. |
+| `/dev/dri/renderD128` (character device 226:128, mode 0666), `/sys/class/drm/renderD128`, `/sys/dev/char/226:128`, `/sys/devices/pci0000:00/0000:00:01.0` | `devices/virtgpu`, `fsimpl/sys/virtgpu_xplat.go`, `pkg/gvx/gpu.go` | The files exist only with `-gpu=venus`. The PCI device has the IDs `0x1af4:0x1050`. Section 3.15 describes the render node. |
 
 Generic netlink dispatches on the type of the netlink message, which is the family ID. The controller has the fixed ID 0x10. `genetlink.RegisterFamily` gives the other families the IDs from 0x11, in the order of registration. A family lists its commands. Each command answers a plain request, a dump, or both, and it can require `CAP_NET_ADMIN`.
 
@@ -984,6 +996,7 @@ Each row of the next table is state that a guest can read or limit. Each kernel 
 | Usage accounting for `/proc/meminfo`, `sysinfo`, `memory.current`, `memory.stat`, the `memory.max` enforcer, and the WireGuard memory charge | The memory file of the kernel (`MemoryFile.Accounting`) |
 | Cause of an engine fault (`kernel.TakeEngineFault`), reported total memory, `/dev/kmsg` ring (`kernelExtState`), node sysctls (`proc.nodeStores`), `shm_rmid_forced`, cgroup registry and cgroup IDs | The kernel or its namespace |
 | Policy-routing FIB, `rp_filter`, proxy ARP, bridge netfilter switches, netfilter logs, `xt_recent` tables, ipset registries, `vxlan` sockets and links, WireGuard links, preserved C/R topology (`stackExtState`), disk registry | The network stack or the VFS |
+| GPU renderer: one `gvx-gpu-renderer` process, one client, and one render node for each sandbox with `-gpu=venus`. No package-level variable holds renderer state. | The sandbox and its VFS (`pkg/gvx/gpu.go`, `pkg/sentry/devices/virtgpu`) |
 
 > [!IMPORTANT]
 > Add a package variable only for host state. Add a test that runs two sandboxes in one process for every guest-visible value that a new variable would hold.
@@ -992,7 +1005,7 @@ The tests `TestE2EMemoryAccountingIsPerSandbox`, `TestE2EMemoryLimitCountsOnlyIt
 
 ### 3.13 Pre-Lockdown Checkpoint and Restore (Descriptive Module)
 
-`Sandbox.Checkpoint` (`pkg/gvx/checkpoint.go`) and `gvx.Restore` (`pkg/gvx/restore.go`) save and restore a running sandbox on the same host OS, CPU architecture, and execution engine without weakening `hostlockdown`. Both paths open every host file, layer, workspace, volume, and socket handle before `hostlockdown.Apply()` executes.
+`Sandbox.Checkpoint` (`pkg/gvx/checkpoint.go`) and `gvx.Restore` (`pkg/gvx/restore.go`) save and restore a running sandbox on the same host OS, CPU architecture, and execution engine without weakening `hostlockdown`. Both paths open every host file, layer, workspace, volume, and socket handle before `hostlockdown.Apply()` executes. A sandbox with a GPU cannot checkpoint or restore. `gvx.New` (`Config.validateGPU`) and `gvx.Restore` refuse the combination, because a checkpoint does not hold Vulkan objects or GPU memory.
 
 ![Pre-Lockdown Checkpoint and Restore Pipeline](assets/checkpoint-restore.svg)
 
@@ -1028,6 +1041,140 @@ Android 10 and newer enforce SELinux W^X rules on writable `app_data_file` direc
 The Java entry point `dev.gfire.gvx.Gvx` (`android/library`) configures `ProcessBuilder` for `librungv.so`. It sets `HOME` and `TMPDIR` to app-private directories, reads active resolvers from `ConnectivityManager.getLinkProperties()`, injects `--host-dns=<ip>` for `run` commands, and launches the sandbox process. `android/sample` wraps `Gvx.start` inside an Android 14+ `specialUse` foreground service (`RunService`) so background execution limits do not freeze guest tasks.
 
 Inside the Android sandbox process, `platform/systrap` allocates executable stub mappings with `memfd_create(MFD_EXEC)` and probes `vm.mmap_min_addr` (`0x8000`) with `MAP_FIXED_NOREPLACE`. It caps `idleStubLimit` and `maxSysmsgThreads` to `2` under Android 12's 32-process ceiling and activates `subblock_xplat.go` on 16 KiB ARM64 kernels. `pkg/hostlockdown` detects Zygote's `untrusted_app` seccomp filter (`PR_GET_SECCOMP == 2`), skips Landlock syscalls that Zygote traps with `SIGSYS`, and relies on Android's per-UID SELinux domain and mount namespace. `tools/androidprobe` reports kernel page size, `memfd`, seccomp, and `systrap` capabilities on target devices and CI emulators.
+
+### 3.15 Virtual GPU Render Node and Renderer Process (`pkg/sentry/devices/virtgpu`, `internal/gpurender`, `gpurenderer`) (Descriptive Module)
+
+With `-gpu=venus`, a guest on `darwin/arm64` with the `hvf` backend renders on the host GPU. The Sentry emulates the Linux `virtio-gpu` render node. A separate host process, `gvx-gpu-renderer`, decodes the Vulkan command stream (`venus`) and calls Metal through KosmicKrisp. The option is off by default; a sandbox without it registers no device and starts no process. [`moonshots.md`](moonshots.md) holds the plan, the measurements, and the Windows proposal.
+
+| Component | Location | Responsibility |
+| :--- | :--- | :--- |
+| Guest driver | Guest image (`mesa-vulkan-drivers`; tests ran with Mesa 25.0.7 to 26.2.6) | Encodes Vulkan calls. `gvx` adds no file to the guest. |
+| Render node | `pkg/sentry/devices/virtgpu` | Serves `/dev/dri/renderD128`: DRM ioctls, GEM handles, blob memory, fences, and resource caps. Pure Go. |
+| Device enumeration | `pkg/sentry/fsimpl/sys/virtgpu_xplat.go` | Lists the node as a virtio GPU on a PCI device, because Mesa `venus` accepts only a PCI or platform bus. |
+| Protocol | `pkg/sentry/devices/virtgpu/gpuproto` | Defines the wire format. `go generate` writes `gpurenderer/gvx_gpu_protocol.h` from the Go constants. |
+| Client | `internal/gpurender` | Starts the renderer, runs requests and events, receives blob descriptors, and detects a lost renderer. |
+| Renderer | `gpurenderer` (C); `scripts/gpu/build-renderer.sh` builds the bundle | Links `virglrenderer` and serves the protocol. The bundle holds KosmicKrisp. `rungv` stays pure Go. |
+| Sandbox wiring | `pkg/gvx/gpu.go` | Validates the option, starts the renderer before the lockdown, registers the device, and closes both in order. |
+
+#### Guest Interface (Reference Module)
+
+The node serves the requests that Mesa `venus` and headless Chromium send. It refuses every other request with the error that a Linux render node without that feature returns. With `GVX_DEBUG_LOG=2`, the device logs each refused request one time for each open file.
+
+| Group | Served | Refused, with the error |
+| :--- | :--- | :--- |
+| DRM core | `DRM_IOCTL_VERSION` (driver name `virtio_gpu`), `DRM_IOCTL_GET_CAP` | Master, authentication, and mode-setting requests: `EACCES` |
+| GEM and PRIME | `DRM_IOCTL_GEM_CLOSE` | PRIME export and import: `EOPNOTSUPP` |
+| Synchronization | A `sync_file` descriptor from `EXECBUFFER` with `FENCE_FD_OUT`; `poll` on it | `DRM_IOCTL_SYNCOBJ_*`: `EOPNOTSUPP`; `sync_file` ioctls: `ENOTTY`; `FENCE_FD_IN`: `EINVAL` |
+| `virtio-gpu` | `GETPARAM`, `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE_BLOB`, `RESOURCE_INFO`, `MAP`, `EXECBUFFER` | The `virgl` requests (`RESOURCE_CREATE`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`, `WAIT`): `EINVAL` |
+
+`DRM_IOCTL_GET_CAP` reports no sync objects and no PRIME. Mesa then uses its simulated sync objects, which need only the `sync_file` descriptor. `GETPARAM` reports 3D features, blob resources, host-visible memory, context initialization, the `venus` capset, and a blob alignment of 16 KiB.
+
+#### Data Path (Descriptive Module)
+
+One open file of the node is one DRM file. It owns one GEM handle table and at most one renderer context. The Sentry and the renderer exchange frames on one `AF_UNIX` stream socketpair. Each frame has a 24-byte header with an operation code, a sequence number, a context ID, and a status.
+
+| Guest call | Sentry (`virtgpu`) | Renderer |
+| :--- | :--- | :--- |
+| `CONTEXT_INIT` | Allocates a context ID and sends `CTX_CREATE` | Creates a `virglrenderer` context for the `venus` capset |
+| `RESOURCE_CREATE_BLOB` | Reserves the bytes against the limit and sends `BLOB_CREATE` | Allocates a POSIX shared-memory object and returns its descriptor in the reply |
+| `MAP`, then `mmap` | Returns a fake offset; `ConfigureMMap` finds the blob and refuses a private mapping | None |
+| Vulkan commands | None: the guest writes them into the `venus` ring, which is a mapped blob | A ring thread reads the blob and runs the commands |
+| `EXECBUFFER` | Copies at most 16 MiB from the guest and sends `SUBMIT`; with `FENCE_FD_OUT` it also creates a fence and a `sync_file` descriptor | Runs the commands or wakes the ring thread; creates the fence |
+| `poll` on a `sync_file` | Waits for the `FENCE_DONE` event of that fence | Sends `FENCE_DONE` when the fence retires |
+| `GEM_CLOSE` | Drops the handle and sends `RES_UNREF` | Releases the resource |
+
+Most Vulkan traffic never enters the Sentry, because the ring is shared memory between guest user space and the renderer. The host has no `eventfd`, so the renderer polls `virglrenderer` every 1 ms while a fence is pending.
+
+#### Memory Model (Descriptive Module)
+
+The device accepts only `VIRTGPU_BLOB_MEM_HOST3D`. The renderer allocates each shared buffer with `shm_open` and unlinks the name at once. The Sentry verifies the size with `fstat`, maps the object one time, and closes the descriptor. The blob implements `memmap.Mappable` and `memmap.File`. On `hvf`, `AddressSpace.MapFile` and `hvcommon.RegionMap` map the view with `hv_vm_map`; the platform package has no GPU code.
+
+The renderer never maps guest RAM. A guest blob size is a multiple of 4 KiB, and the host object is a multiple of 16 KiB. `MapInternal` refuses a range beyond the guest size.
+
+> [!IMPORTANT]
+> Unmap a blob view only after GEM handles, `blobMapping` VMA identities, and `MmapFileRefs` page references reach zero. An earlier `munmap` leaves a guest mapping that names freed host memory.
+
+`mm` drops its references only after `AddressSpace.Unmap`, and `RegionMap` calls `hv_vm_unmap` when the last address space releases the region. The order is therefore: stage 1 unmap, `hv_vm_unmap`, `File.DecRef`, `munmap`. `GEM_CLOSE` alone does not unmap a view that the guest still maps.
+
+#### Renderer Lifetime (Descriptive Module)
+
+`gvx.New` starts one renderer for each sandbox, after it creates the memory file and before `hostlockdown.Apply`. No package variable holds renderer state.
+
+| Event | Behavior |
+| :--- | :--- |
+| Search for the executable | `Config.GPU.RendererPath` (`-gpu-renderer`), then `GVX_GPU_RENDERER`, then `gvx-gpu-renderer/bin/gvx-gpu-renderer` beside `rungv`, then `../libexec/gvx-gpu-renderer/bin/gvx-gpu-renderer`. Setting `-gpu-renderer` or `GVX_GPU_RENDERER` stops the search. |
+| Start | The renderer inherits one socket end as descriptor 3. It loads the Vulkan driver, initializes `virglrenderer`, resolves the user cache directory, applies Seatbelt, probes Vulkan, and answers `HELLO`. The start limit is 20 s. |
+| Start failure | `gvx.New` returns `ErrGPUUnavailable` with the searched paths or the last line of the renderer. The sandbox never falls back to software rendering. |
+| Host before macOS 26, or a backend other than `hvf` | `gvx.New` returns an error that names the requirement. |
+| Host older than the bundle requires | The renderer compares the host with the minimum macOS version of its staged driver and exits with a message that names that version. `gvx.New` returns `ErrGPUUnavailable`. |
+| Checkpoint or restore with GPU | `Config.validateGPU` and `gvx.Restore` return `ErrInvalidConfig` (section 3.13). |
+| Renderer exits or stops answering | The client marks it lost. Pending requests fail, pending fences signal with an error, and later GPU calls return `EIO`. Mapped blobs stay valid. The sandbox keeps running. No restart is possible after the lockdown. |
+| `Sandbox.Close` | Kills the guest kernel and waits for `Run` to return (limit 30 s). Closes the platform. Closes the client, which kills the renderer and reaps it. Unmaps the blob views that remain. |
+| `rungv` exits without `Close` | The renderer reads end-of-file on descriptor 3 and exits. |
+
+#### Renderer Confinement (Reference Module)
+
+The renderer parses guest-controlled data in C, so it confines itself with its own Seatbelt profile (`gpurenderer/src/confine_darwin.c`) before it reads a guest byte. The profile starts with `deny default`. The renderer also sets `RLIMIT_NPROC` and `RLIMIT_CORE` to 0. The Sentry profile has no GPU rule.
+
+| Rule of the profile | Reason |
+| :--- | :--- |
+| `iokit-open` for `IOAccelerator` and `IOSurfaceRootUserClient` | Metal opens the GPU through these two user clients. |
+| `mach-lookup` of `com.apple.MTLCompilerService` | Metal compiles each shader in this service. Without the rule, pipeline creation fails. |
+| `file-read*` for `/System/Library`, `/Library/GPUBundles`, `/usr/lib`, `/private/var/db/dyld`, and the renderer bundle | The Metal driver bundles and the libraries of the bundle load from these paths. |
+| `file-read-metadata` | Metal reads metadata of paths outside the list above. A narrower rule made the driver fail at start. |
+| POSIX shared memory with the name prefixes `/vkr-` and `/proxy-` | `virglrenderer` creates blob objects and its fence table with these names. |
+| `sysctl-read` | The system libraries read hardware values. |
+| No file write, no network, `deny process-fork`, `deny process-exec*` | The renderer needs none of them. It has no file right on the Metal shader cache; `com.apple.MTLCompilerService` owns that cache. |
+
+The shared-memory names exist in the global namespace between `shm_open` and `shm_unlink`. They are random, and their mode is 0600.
+
+Before it applies the profile, the renderer calls `confstr(_CS_DARWIN_USER_CACHE_DIR)` one time. Metal resolves its shader cache folder through that call at each shader compile, and the call needs Mach lookups that the profile denies. `libsystem` keeps the first answer, so a later call needs no lookup. Without the early call, each compile waits for a denied lookup. A renderer start then takes about 10 s in place of about 2 s. The first page of Chromium takes about 55 s.
+
+#### Limits (Reference Module)
+
+The Sentry enforces the limits, because the renderer is the untrusted side. Each count belongs to one sandbox.
+
+| Limit | Value | On violation |
+| :--- | ---: | :--- |
+| Open files with a context | 64 | `CONTEXT_INIT` returns `ENOSPC` |
+| Blob bytes (host sizes of live blobs) | The smaller of 4 GiB and 25% of host RAM; `Config.GPU.MemoryLimit` replaces it | `RESOURCE_CREATE_BLOB` returns `ENOMEM` |
+| One blob | 1 GiB | `EINVAL` |
+| Live blobs; GEM handles of one file | 65536 each | `ENOMEM` |
+| One `EXECBUFFER` | 16 MiB | `EINVAL` |
+| Pending fences of one context | 4096 | `EXECBUFFER` with a fence returns `EBUSY` |
+| Reply of the renderer to a request | 10 s (`SUBMIT`: 30 s) | The client declares the renderer lost and kills it |
+| Pending fence | 30 s | The fence signals with an error, and the device ends the context |
+| Renderer memory footprint | Blob limit plus 512 MiB, sampled every 250 ms | The renderer exits |
+
+`venus` allocates device-local Vulkan memory through its ring, so the Sentry cannot count it. The footprint limit covers that memory, but the renderer enforces it on itself. A corrupted renderer can pass it. The host kernel sets no limit.
+
+#### Known Defects (Reference Module)
+
+| Defect | Symptom | State |
+| :--- | :--- | :--- |
+| KD-1 | The first blob request on a new context fails with an I/O status while other contexts start and stop at the same time. `sendmsg` with a descriptor returns `EINVAL` inside `virglrenderer`, and the device loses that context. | Open. It occurs only under a stress test of context churn. The GPU gates count the failure and report a count above 0. |
+| KD-2 | Metal compiled each shader slowly under the renderer profile, and the renderer start came close to its 10 s limit. | Fixed: the renderer resolves the cache directory of the user before confinement, and the start limit is 20 s. A start-time test fails when the delay returns. |
+
+#### Verification (Procedural Module)
+
+The GPU tests need the renderer bundle. The gates also need `hvf`, so they run by hand on an Apple Silicon host with macOS 26 or later. The `gpu-renderer` job of `ci.yml` builds the bundle on `macos-26` when a renderer path changes. It runs the self-test and the tests of the client and the device only when the repository variable `GVX_CI_METAL` is `1`. No CI job runs the gates.
+
+1. Run `scripts/gpu/build-renderer.sh` to build the bundle in `build/gpu/gvx-gpu-renderer/`.
+2. Run the self-test of the renderer and verify that it prints `selftest: PASS`.
+3. Set `GVX_GPU_RENDERER` to the path of the executable.
+4. Run the unit tests of the device, the client, and the sandbox wiring.
+5. Run the gates with `GVX_E2E_GPU=1`.
+
+```bash
+scripts/gpu/build-renderer.sh
+build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest
+export GVX_GPU_RENDERER="$PWD/build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer"
+go test -race -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/devices/virtgpu/... ./internal/gpurender/...
+go test -race -exec "$PWD/scripts/codesign-exec.sh" ./pkg/gvx -run 'GPU'
+GVX_E2E_GPU=1 go test -count=1 -timeout 30m -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2E(GateGPU|GPURendererKill)' -v
+```
+
+A unit test that needs the renderer skips when `GVX_GPU_RENDERER` is empty and no bundle exists. It fails when the variable names an executable that does not work. The gates write their records to the directory in `GVX_E2E_ARTIFACT_DIR`.
 
 ---
 
@@ -1065,6 +1212,9 @@ GitHub Actions executes cross-platform verification in `.github/workflows/`. Wor
 | `ci.yml` (`test linux/amd64`, `test linux/arm64`) | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of owned packages, 16KB sub-block emulation (`GVX_SYSTRAP_SUBBLOCKS=1`), seccomp lockdown, and the offline `e2e` suite on `systrap`. |
 | `ci.yml` (`repro`) | `ubuntu-24.04` | `scripts/verify-repro-gvx.sh`: builds `rungv` inside a Go container running on `gvx` and verifies bit-for-bit SHA-256 reproducibility against the host build. |
 | `ci.yml` (`test darwin/arm64`) | `macos-15` | Owned packages and `systrap` stub tests signed via `scripts/codesign-exec.sh` (`GVX_ALLOW_NO_HYPERVISOR=1` skips VM boot on nested macOS runners). |
+| `ci.yml` (`build gpu-renderer darwin/arm64`) | `macos-26` | Runs only when a change touches `gpurenderer/`, `scripts/gpu/`, `pkg/sentry/devices/virtgpu/`, `internal/gpurender/`, or `ci.yml`. Builds the renderer bundle from the pinned inputs (`scripts/gpu/build-renderer.sh`). With the repository variable `GVX_CI_METAL=1`, it also runs the renderer self-test and the tests of `internal/gpurender` and `pkg/sentry/devices/virtgpu` with the renderer. |
+| `diagnose.yml` with `scripts/gpu/ci-metal-probe.sh` | Chosen runner (`macos-26`) | Prints the Metal device of the runner, builds the renderer bundle, and runs its self-test. Set `GVX_CI_METAL=1` only after this run passes. |
+| None (by hand) | Apple Silicon host with macOS 26 or later | The GPU gates `TestE2EGateGPUVulkan`, `TestE2EGateGPUChromium`, and `TestE2EGPURendererKill` (`GVX_E2E_GPU=1`). They need `hvf` and Metal. Section 3.15 gives the commands. |
 | `ci.yml` (`test windows/amd64`) | `windows-latest` | Owned packages, `winsystrap`, `hostlockdown`, hypervisor state report, and guest boot on `whpx`. |
 | `ci.yml` (`test windows/arm64`) | `windows-11-arm` | Containerd shim control plane, `winsystrap`, offline `e2e` suite, and `hostlockdown`. |
 | `android.yml` (`emulator smoke`) | `ubuntu-24.04` (KVM) | `scripts/android/emulator-smoke.sh` on an x86_64 Android 16 emulator: `androidprobe`, `systrap`/`hostfs`/`ext4lite` tests, offline `e2e`, and `gvx-android.aar` sample APK smoke. |
@@ -1072,7 +1222,7 @@ GitHub Actions executes cross-platform verification in `.github/workflows/`. Wor
 | `pjdfstest.yml` (`test pjdfstest <fs> <target>`) | `ubuntu-24.04*`, `windows-*` | Runs the POSIX conformance suite `pjdfstest` against `ext4lite` and `hostfs` and compares output with `scripts/pjdfstest/known-failures.txt`. |
 | `e2e-images.yml` (`test linux/*`, `test windows/*`) | `ubuntu-24.04*`, `windows-*` | Weekly real-registry OCI, Docker Engine, and multi-node K3s gates under host lockdown. |
 | `benchmark.yml` & `diagnose.yml` | Chosen runners | On-demand microbenchmarks (`microbench_e2e_test.go`) and targeted runner diagnostics. |
-| `release.yml` (`build <target>`, `publish`) | `ubuntu-24.04`, `macos-15` | Publishes seven archives (`linux-{amd64,arm64}`, `darwin-arm64`, `windows-{amd64,arm64}`, `android-arm64`, `gvx-android.aar`), `SHA256SUMS`, and SLSA provenance attestations. |
+| `release.yml` (`build <target>`, `build gpu-renderer darwin/arm64`, `publish`) | `ubuntu-24.04`, `macos-26` | Publishes seven archives (`linux-{amd64,arm64}`, `darwin-arm64`, `windows-{amd64,arm64}`, `android-arm64`, `gvx-android.aar`) and the renderer archive `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz`, with `SHA256SUMS` and SLSA provenance attestations. The renderer job builds KosmicKrisp from the pinned Mesa source (`scripts/gpu/build-renderer.sh --driver-source mesa-source`) and packages the bundle with `scripts/gpu/package-renderer.sh`. |
 
 The `pjdfstest` harness lives in `scripts/pjdfstest`. The command `internal/pjdfsreport` compares the guest output with `scripts/pjdfstest/known-failures.txt`. That file lists only failures that a host file system cannot avoid, by driver, host OS, and test number. A failure that the file does not list fails the job. A listed failure that does not occur also fails the job, so the list cannot go stale. CI has no macOS guest, so run the suite on a Mac with `hvf` by hand. Set `PJDFS_PLATFORM=auto`, then run `build-bundle.sh`, `run.sh`, and `go run ./internal/pjdfsreport -os darwin`.
 

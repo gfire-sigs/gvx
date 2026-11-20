@@ -35,7 +35,7 @@ Execute these numbered steps at the start of every task before editing repositor
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
+| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/devices/virtgpu`, `gpurenderer`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Place alongside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip`, `pkg/sentry/platform/systrap/{usertrap,sysmsg}` (`amd64` files) | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below `5.0%`. Name every additive helper file in a shared package `*_xplat.go` or `*_darwin*.go`, so the audit counts it as a Tier 2 sibling. |
 
@@ -92,7 +92,7 @@ Keep `e2e/` black-box tests 100% OS-agnostic across Windows and macOS (`pkg/gvx`
 
 1. Format source files and run native unit and `e2e/` tests on `darwin/arm64` with `scripts/codesign-exec.sh`.
 2. Cross-compile all packages across the three non-Linux Priority-0 targets (`darwin/arm64`, `windows/amd64`, `windows/arm64`) and both Linux targets (`linux/amd64`, `linux/arm64`).
-3. Run the upstream diff audit tool to verify that modified upstream files remain below 5.0%.
+3. Run the audit tool for the upstream diff with `-max-ratio=0.042` (`5.0%` policy ceiling).
 4. Run `./scripts/gostateify.sh -check` to verify that generated state files match their source declarations.
 5. Run the gVisor analyzers (`checklocks`, `checkconst`, `checklinkname`) for the five targets. Read [`docs/architecture.md`](docs/architecture.md) Section 4.5 to fix a finding.
 6. Execute the mechanical `ripgrep` checks from Section 9.2 of [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) against `README.md`, `AGENTS.md`, and `docs/`.
@@ -110,8 +110,8 @@ GOOS=windows GOARCH=arm64 go build ./...
 GOOS=linux   GOARCH=amd64 go build ./...
 GOOS=linux   GOARCH=arm64 go build ./...
 
-# 3. Verify upstream diff budget (< 5.0% touched upstream files)
-go run ./tools/upstream -mode=audit -max-ratio=0.05
+# 3. Verify upstream diff budget (CI gate: < 4.2% touched upstream files; policy ceiling: 5.0%)
+go run ./tools/upstream -mode=audit -max-ratio=0.042
 
 # 4. Verify generated state files match source declarations
 ./scripts/gostateify.sh -check
@@ -130,6 +130,9 @@ The workflow `.github/workflows/ci.yml` builds and vets all five targets, runs t
 The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand. On Linux, run `scripts/seccomp-audit.sh` when a change adds a host call, because a call outside the seccomp allowlist kills the process.
 The workflow `.github/workflows/pjdfstest.yml` runs the POSIX suite `pjdfstest` on `ext4lite` or `hostfs` volumes when that driver or the harness changes. Record a host limit in `scripts/pjdfstest/known-failures.txt`, and fix every other failure.
 The workflow `.github/workflows/release.yml` builds, attests, and publishes the archives of a `v*` tag. It runs on a pull request only when the workflow file changes.
+
+The `gpu-renderer` job of `ci.yml` builds the GPU renderer bundle on `macos-26` only when a change touches `gpurenderer/`, `scripts/gpu/`, `pkg/sentry/devices/virtgpu/`, `internal/gpurender/`, or `ci.yml`. The repository variable `GVX_CI_METAL=1` turns on its self-test and its renderer tests. Maintainers set `GVX_CI_METAL=1` only after `scripts/gpu/ci-metal-probe.sh` passes on that runner through `diagnose.yml`. The `gpu-renderer` job of `release.yml` builds the renderer archive from the pinned Mesa source.
+
 The workflow `.github/workflows/android.yml` runs `scripts/android/emulator-smoke.sh` on an x86_64 Android 16 emulator with KVM. It runs `androidprobe report`, the `systrap`, `hostfs`, and `ext4lite` unit tests, the offline `e2e` suite, and the APK smoke tests. The `arm64` emulator needs a hypervisor, which no hosted runner offers. Start it by hand.
 The workflow `.github/workflows/linux16k.yml` boots the `arm64-16k` kernel of Debian trixie in QEMU and runs `scripts/linux16k/run.sh`. That script runs the host facility report, the synthetic ELF probes, the `systrap`, `hostfs`, and `ext4lite` unit tests, and the offline `e2e` suite on 16 KB pages. Both workflows run on pull requests that change `systrap`, `mm`, `pgalloc`, `hostlockdown`, `chunkcache`, `hostfs`, `ext4lite`, `e2e`, or their harnesses.
 
@@ -146,6 +149,12 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_E2E_DIND_CACHE_DIR` | Layer cache directory for `TestE2EDockerBuildDindLocalRegistry` in the `dind-build` CI job. |
 | `GVX_PREBUILT_DIR` | Directory of prebuilt `rungv`, `lockdownprobe`, and `acceptprog` guest binaries for `e2e.test` when the target VM has no Go toolchain. |
 | `GVX_E2E_CPUMAX_CHECKS` | Comma-separated list of `cpumaxprobe` subtest names for `TestE2ECPUMaxEnforcement`. |
+| `GVX_E2E_BROWSER=1` | Runs the browser gates of `e2e/gate_browser_test.go`. They pull a Playwright image of about 1 GB, so CI leaves the variable unset. |
+| `GVX_E2E_BROWSER_BENCH=1` | Runs `TestE2EBrowserBench` with `GVX_E2E_BROWSER=1`. The test logs the browser start time, the tab time, and the SwiftShader share of each workload. |
+| `GVX_E2E_GPU=1` | Runs the GPU gates (`e2e/gate_gpu*_test.go`) on `darwin/arm64` with `hvf`. The gates need `GVX_GPU_RENDERER` and fail without it. |
+| `GVX_E2E_ARTIFACT_DIR` | Directory that receives the records of the GPU gates (`g1`, `g1-kill`, `g2`): results, logs, refused ioctls, and screenshots. |
+| `GVX_GPU_RENDERER` | Path of the `gvx-gpu-renderer` executable for `-gpu=venus`. `scripts/gpu/build-renderer.sh` writes it to `build/gpu/gvx-gpu-renderer/bin/`. |
+| `GVX_E2E_GPU_CHROMIUM_FLAGS` | Replaces the Chromium flags of the GPU pass of `TestE2EGateGPUChromium`, for the fallback steps of the GPU design. |
 | `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. The value `2` also prints debug lines, such as each fault that the Sentry cannot resolve. |
 | `GVX_SYSTRAP_SUBBLOCKS=1` | Runs the sub-block layer of the Linux `systrap` engine on a host with 4 KB pages. The layer maps 4 KB guest pages on a host with 16 KB pages, such as an Android device. |
 | `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop and the state of each stub. The value `3` prints only the state, the count of each kind of stop, and the count of `amd64` `syscall` sites by patch outcome. The value `4` also samples the program counter and prints the hottest addresses. |

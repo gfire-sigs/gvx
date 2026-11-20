@@ -84,6 +84,8 @@ The table below lists the sandbox flags specific to `gvx`.
 | `-backend`, `--backend BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. Combine it with `--platform linux/ARCH` when selecting both the image architecture and the backend. |
 | `-platform BACKEND` | Legacy alias for `-backend` (`auto`, `whpx`, `hvf`, or `systrap`) when the value has no slash. A value with a slash (`linux/amd64` or `linux/arm64`) selects the image platform. Setting both `-backend` and `-platform BACKEND` to different engines is an error. |
 | `-allow-unconfined-systrap` | Allow `-backend=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted workloads on Windows require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
+| `-gpu MODE` | Give the guest a virtual GPU: `off` (default) or `venus`. `venus` needs an Apple Silicon host with macOS 26 or later, the `hvf` backend, and the renderer bundle. Section 4.12 describes the rules. |
+| `-gpu-renderer PATH` | Name the `gvx-gpu-renderer` executable for `-gpu=venus`. Without the flag, `rungv` reads `GVX_GPU_RENDERER` and then searches beside its own executable. |
 | `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
@@ -340,6 +342,22 @@ rungv run -checkpoint-dir=./ckpt -control-socket=./ckpt.sock -workspace=./work a
 rungv checkpoint -control-socket=./ckpt.sock -checkpoint-dir=./ckpt
 rungv restore -checkpoint-dir=./ckpt -workspace=./work
 ```
+
+### 4.12 GPU
+
+`-gpu=venus` gives the guest the render node `/dev/dri/renderD128` of a `virtio-gpu` device. A host process, `gvx-gpu-renderer`, runs the Vulkan commands of the guest on Metal. `rungv` starts that process before the lockdown, one for each run, and stops it when the guest exits.
+
+| Rule | Behavior |
+| :--- | :--- |
+| Host | `darwin/arm64` with macOS 26 or later and the `hvf` backend. On another host or backend, `rungv` exits with a configuration error. |
+| Renderer search | `-gpu-renderer`, then `GVX_GPU_RENDERER`, then `gvx-gpu-renderer/bin/gvx-gpu-renderer` beside `rungv`, then `../libexec/gvx-gpu-renderer/bin/gvx-gpu-renderer`. |
+| Renderer missing or broken | `rungv` exits with an error that names the searched paths or the last stderr line of the renderer. It never falls back to software rendering. |
+| Guest software | The image needs `mesa-vulkan-drivers`. Tests ran with Mesa 25.0.7, 25.2.8, and 26.2.6. Chromium needs `--use-angle=vulkan --ignore-gpu-blocklist --disable-vulkan-surface`. `rungv` changes nothing in the guest. |
+| Checkpoint and restore | Not possible with `-gpu=venus`: `-checkpoint-dir`, `-control-socket`, and `rungv restore` refuse the combination. |
+| Renderer loss | When the renderer exits during a run, the guest gets I/O errors from the GPU, and the run continues. The renderer does not restart. |
+| Memory | The guest can hold blob memory up to the smaller of 4 GiB and 25% of host RAM. |
+
+The renderer parses guest data in C code. A Seatbelt profile confines it: no process creation, no file write, and no network. The option is still a larger attack surface than a run without it, so it is off by default. `GVX_DEBUG_LOG=2` prints each DRM request that the device refuses.
 
 ## 5. Images and registries
 
