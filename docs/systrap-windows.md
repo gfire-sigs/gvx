@@ -709,6 +709,7 @@ State this limit in every user-facing document for the engine. Do not describe t
 | `hostctx_xplat_*.go`, `hostctx_windows_amd64.go` | `CONTEXT` record layout and conversion, including the XSTATE area. |
 | `storestep_windows.go` | The windows of a store step and the single-step stop that closes them. |
 | `hostwrite_windows.go` | The observer that drops copies when the Sentry writes a frame of the memory file. |
+| `residency_windows.go` | Stub working-set observer and unmap flush that report stub-faulted pages to `MemoryFile`. |
 | `patcher_amd64_xplat.go` | The `x86asm` scanner and the in-page patch. |
 | `code_image_xplat.go` | ELF section headers that limit the scan to code. |
 | `winsysmsg_xplat.go`, `winsysmsg_*_xplat.go` | Layout of the arena and of the `winSysmsg` page, the handoff state machine, and the register blocks. |
@@ -738,6 +739,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `fastpat
 | Reads of the code of the guest | The stub runs a patched copy of each code page, and a load from a code page reads the copy. A guest that reads its own code sees the patched bytes at each site. A guest that loads a byte of its code and stores it back writes the patched byte into the original frame, and the next patch of the page scans the changed code. Linux returns the original bytes. The check `code-text-toggle` of the guest program `codewrite` therefore takes the stored bytes from the executable file. |
 | Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
 | Reuse of freed island slots | A thread that runs guest code and never traps blocks the reuse of slots that a block freed after the thread went online (section 6.9). When 4096 units are held, a patch leaves its sites on the debug path until that thread traps or stops. |
+| Guest memory accounting | Stub views register with the platform residency index. Scans, unmaps, remaps, and releases query `K32QueryWorkingSetEx` in each stub process and charge new pages to `MemoryFile`. The cgroup2 `memory.max` enforcer runs on Windows `systrap`. |
 
 ## 10. Evidence
 

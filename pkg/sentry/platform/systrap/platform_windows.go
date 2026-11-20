@@ -69,6 +69,11 @@ type Platform struct {
 	hostWrites     hostWriteWatch
 	hostWriteDrops atomic.Uint64
 
+	// residency tracks shared stub views so MemoryFile scans and unmaps count
+	// pages faulted only inside stub processes.
+	residency      residencyIndex
+	residencyWatch residencyWatch
+
 	// cleanCode maps the address of a read-only MemoryFile page to the SHA-256
 	// digest of the bytes that a scan found to need zero patches. A page is
 	// clean only while its bytes still have that digest.
@@ -284,6 +289,7 @@ func (p *Platform) Close() error {
 			}
 		}
 		t0 := time.Now()
+		p.stopResidencyWatches()
 		p.stopHostWrites()
 		p.stopPool()
 		p.stopReaper()
@@ -307,12 +313,10 @@ func (p *Platform) Close() error {
 // size, so the memory manager maps whole mappings at a time.
 func (*Platform) MapUnit() uint64 { return 0 }
 
-// MinUserAddress implements platform.Platform.MinUserAddress.
-// CountsCgroupMemory reports that the Sentry cannot count the pages of guest
-// memory for a memory cgroup. Guest code runs in stub processes, and the Sentry
-// finds committed pages through the working set of its own process. The cgroup2
-// filesystem then leaves memory.max unenforced.
-func (p *Platform) CountsCgroupMemory() bool { return false }
+// CountsCgroupMemory implements platform.Platform.CountsCgroupMemory and
+// reports that Windows systrap tracks committed pages across stub working sets
+// for memory cgroups.
+func (p *Platform) CountsCgroupMemory() bool { return true }
 
 func (p *Platform) MinUserAddress() hostarch.Addr { return hostarch.Addr(p.userMin) }
 

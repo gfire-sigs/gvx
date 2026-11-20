@@ -48,9 +48,11 @@ var (
 )
 
 type windowsBacking struct {
-	mu       sync.RWMutex
-	fileID   uintptr
-	sections []windows.Handle
+	mu           sync.RWMutex
+	fileID       uintptr
+	sections     []windows.Handle
+	residencyMu  sync.Mutex
+	residencyFns atomic.Pointer[[]*residencyObserver]
 }
 
 // NewDefaultMemoryFile creates a Windows MemoryFile backed by anonymous

@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Windows `systrap` stub memory accounting (`internal/xsys/unix`, `pkg/sentry/pgalloc`, `pkg/sentry/platform/systrap`)** (#213): Scans, unmaps, remaps, and address-space exits now query `K32QueryWorkingSetEx` in stub processes for guest pages. Both `/proc/meminfo` `MemFree` and `--memory` guards count stub-faulted pages, and Windows `systrap` enables `memory.max` enforcement.
+
 ## [v0.17.10012026111600] - 2026-11-20
 
 This release syncs upstream gVisor to `release-20261116.0` (`83282de1f21f`) and aligns the DNS relay with Docker Engine (#208, #215). It also reclaims freed Windows guest memory without disk backing (#211) and classifies failed host dials for NAT TCP (#206).

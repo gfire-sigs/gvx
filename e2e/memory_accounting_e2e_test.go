@@ -17,12 +17,16 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"io"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/acceptprog"
 	"z.gfire.dev/gvx/pkg/gvx"
 )
 
@@ -36,9 +40,6 @@ func TestE2EMemoryAccountingIsPerSandbox(t *testing.T) {
 	forEachNodeBackend(t, func(t *testing.T, b gateBackend, bin string) {
 		if b.plat == gvx.PlatformWHPX {
 			t.Skip("the whpx backend cannot hold two running sandboxes in one process")
-		}
-		if runtime.GOOS == "windows" && b.plat == gvx.PlatformSystrap {
-			t.Skip("the Windows systrap engine cannot count the pages of a memory cgroup")
 		}
 		holdIn, holdEnd := io.Pipe()
 		holding := make(chan struct{})
@@ -80,4 +81,50 @@ func TestE2EMemoryAccountingIsPerSandbox(t *testing.T) {
 			})
 		})
 	})
+}
+
+// TestE2EMemoryAccountingCountsGuestAnonymousMemory verifies that guest
+// anonymous memory moves /proc/meminfo counters and triggers the sandbox
+// memory guard under a 64 MiB limit on every backend.
+func TestE2EMemoryAccountingCountsGuestAnonymousMemory(t *testing.T) {
+	bin := acceptprog.BuildNodeProbe(t, runtime.GOARCH)
+	for _, b := range fixedAddressBackends() {
+		t.Run(b.name, func(t *testing.T) {
+			requireFixedAddressBackend(t, b)
+			code, out := runNodeProbe(t, b, bin, nil, "memfree", "48")
+			requireNodeChecks(t, code, out, "meminfo-tracks-guest-anonymous-commit")
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			inR, inW := io.Pipe()
+			defer inW.Close()
+			var stdout, stderr bytes.Buffer
+			sb, err := gvx.New(ctx, gvx.Config{
+				Platform:            b.plat,
+				NetworkMode:         gvx.NetModeNone,
+				OCICacheDir:         t.TempDir(),
+				BinaryPath:          bin,
+				Argv:                []string{"/bin/app", "hold", "128"},
+				Stdin:               inR,
+				Stdout:              &stdout,
+				Stderr:              &stderr,
+				Resources:           gvx.Resources{MemoryBytes: 64 << 20},
+				DisableHostLockdown: true,
+			})
+			skipWhenFixedAddressRefused(t, "New(nodeprobe hold)", err)
+			defer func() {
+				if err := sb.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			}()
+			code, err = sb.Run(ctx)
+			if err != nil && !errors.Is(err, gvx.ErrMemoryLimit) {
+				skipWhenFixedAddressRefused(t, "Run(nodeprobe hold)", err)
+			}
+			if !errors.Is(err, gvx.ErrMemoryLimit) || code != 137 {
+				t.Fatalf("hold 128 MiB under 64 MiB limit = (%d, %v), want (137, ErrMemoryLimit)\nstdout=%s\nstderr=%s",
+					code, err, stdout.String(), stderr.String())
+			}
+		})
+	}
 }

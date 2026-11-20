@@ -16,15 +16,15 @@ package systrap
 
 import "testing"
 
-// The cgroup2 filesystem finds this method by an interface assertion, so a
-// rename would turn the memory.max enforcer on for this engine again.
-func TestPlatformDeclaresThatItCannotCountCgroupMemory(t *testing.T) {
+// The cgroup2 filesystem finds this method by an interface assertion, so
+// keeping this contract guarantees memory.max enforcement stays enabled.
+func TestPlatformDeclaresThatItCountsCgroupMemory(t *testing.T) {
 	var p any = &Platform{}
 	counter, ok := p.(interface{ CountsCgroupMemory() bool })
 	if !ok {
 		t.Fatal("Platform lacks CountsCgroupMemory() bool")
 	}
-	if counter.CountsCgroupMemory() {
-		t.Error("CountsCgroupMemory() = true, want false")
+	if !counter.CountsCgroupMemory() {
+		t.Error("CountsCgroupMemory() = false, want true")
 	}
 }
