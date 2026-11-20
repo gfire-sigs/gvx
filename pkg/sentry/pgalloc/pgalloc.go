@@ -1114,16 +1114,6 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 	})
 }
 
-func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
-	// "The default operation (i.e., mode is zero) of fallocate() allocates the
-	// disk space within the range specified by offset and len." - fallocate(2)
-	return unix.Fallocate(
-		int(f.file.Fd()),
-		0, // mode
-		int64(fr.Start),
-		int64(fr.Length()))
-}
-
 func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
 	// "After a successful call, subsequent reads from this range will
 	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with

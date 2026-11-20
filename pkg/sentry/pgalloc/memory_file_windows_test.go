@@ -251,16 +251,25 @@ func TestWindowsMultiChunkLoadFromAndDestroyReleasesKernelViews(t *testing.T) {
 			fx.releaseAndDestroy(t, restored)
 
 			for i, c := range chunks {
-				var info windows.MemoryBasicInformation
-				if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
-					t.Fatalf("VirtualQuery(chunk %d at %#x after Destroy): %v", i, c.mapping, err)
-				}
 				// Another runtime VirtualAlloc call can claim the lowest freed VA hole
-				// before VirtualQuery runs. Only a surviving 1 GiB allocation at the
-				// chunk base means Destroy leaked the chunk mapping.
-				if info.State != winMemFree && info.Type == tc.wantType && info.AllocationBase == c.mapping && info.RegionSize >= chunkSize {
-					t.Fatalf("chunk %d still mapped after Destroy: State=%#x Type=%#x AllocationBase=%#x RegionSize=%#x",
-						i, info.State, info.Type, info.AllocationBase, info.RegionSize)
+				// before VirtualQuery runs. Sum contiguous sub-regions sharing the
+				// chunk AllocationBase so a leaked chunk split between MEM_COMMIT and
+				// MEM_RESERVE sub-regions is still caught.
+				var surviving uintptr
+				for cur := c.mapping; cur < c.mapping+chunkSize; {
+					var info windows.MemoryBasicInformation
+					if err := windows.VirtualQuery(cur, &info, unsafe.Sizeof(info)); err != nil {
+						t.Fatalf("VirtualQuery(chunk %d at %#x after Destroy): %v", i, cur, err)
+					}
+					if info.State == winMemFree || info.Type != tc.wantType || info.AllocationBase != c.mapping || info.RegionSize == 0 {
+						break
+					}
+					surviving += info.RegionSize
+					cur = info.BaseAddress + info.RegionSize
+				}
+				if surviving >= chunkSize {
+					t.Fatalf("chunk %d still mapped after Destroy: surviving=%#x Type=%#x AllocationBase=%#x",
+						i, surviving, tc.wantType, c.mapping)
 				}
 			}
 
@@ -377,6 +386,21 @@ func TestWindowsMemoryFileReclaimsWorkingSetAndUsesZeroDisk(t *testing.T) {
 			if finfo.EndOfFile != 0 || finfo.AllocationSize != 0 {
 				t.Fatalf("backing temp file grew on disk: EndOfFile=%d AllocationSize=%d, want (0, 0)",
 					finfo.EndOfFile, finfo.AllocationSize)
+			}
+
+			// AllocateAndCommit must also keep the placeholder file at zero bytes.
+			frCommit, err := mf.Allocate(uint64(hostarch.PageSize), AllocOpts{
+				Kind: usage.Anonymous,
+				Mode: AllocateAndCommit,
+			})
+			if err != nil {
+				t.Fatalf("Allocate(AllocateAndCommit): %v", err)
+			}
+			finfoCommit := queryFileStandardInfo(t, windows.Handle(mf.FD()))
+			mf.DecRef(frCommit)
+			if finfoCommit.EndOfFile != 0 || finfoCommit.AllocationSize != 0 {
+				t.Fatalf("backing temp file grew after AllocateAndCommit: EndOfFile=%d AllocationSize=%d, want (0, 0)",
+					finfoCommit.EndOfFile, finfoCommit.AllocationSize)
 			}
 
 			before := queryProcessMemory(t)

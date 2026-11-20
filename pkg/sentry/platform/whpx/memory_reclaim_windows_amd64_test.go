@@ -21,7 +21,9 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
+	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
@@ -100,16 +102,50 @@ func TestRealWHPXMemoryFileDecommitAndReuse(t *testing.T) {
 	}
 
 	// Pass 3: Unmap + DecRef (triggers VirtualFree(MEM_DECOMMIT) in releaser),
+	// wait deterministically for the backing VA to transition to MEM_RESERVE,
 	// then re-allocate and remap through the same persistent WHvMapGpaRange chunk.
+	baseVA := uintptr(unsafe.Pointer(&bs.Head().ToSlice()[0]))
+	var info windows.MemoryBasicInformation
+	if err := windows.VirtualQuery(baseVA, &info, unsafe.Sizeof(info)); err != nil {
+		mf.DecRef(fr)
+		t.Fatalf("VirtualQuery before DecRef: %v", err)
+	}
+	if info.State != windows.MEM_COMMIT {
+		mf.DecRef(fr)
+		t.Fatalf("VA %#x state before DecRef = %#x, want MEM_COMMIT (%#x)", baseVA, info.State, windows.MEM_COMMIT)
+	}
+
 	mm.as.Unmap(guestMemoryFileDataAddr, span)
 	mf.DecRef(fr)
-	time.Sleep(100 * time.Millisecond)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := windows.VirtualQuery(baseVA, &info, unsafe.Sizeof(info)); err != nil {
+			t.Fatalf("VirtualQuery after DecRef: %v", err)
+		}
+		if info.State == windows.MEM_RESERVE {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("VA %#x stayed in state %#x after DecRef, want MEM_RESERVE (%#x)", baseVA, info.State, windows.MEM_RESERVE)
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	fr2, err := mf.Allocate(span, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate pass 3: %v", err)
 	}
 	defer mf.DecRef(fr2)
+	if fr2 != fr {
+		t.Fatalf("re-allocated FileRange = %v, want %v (reuse of decommitted range)", fr2, fr)
+	}
+	if err := windows.VirtualQuery(baseVA, &info, unsafe.Sizeof(info)); err != nil {
+		t.Fatalf("VirtualQuery after re-Allocate: %v", err)
+	}
+	if info.State != windows.MEM_COMMIT {
+		t.Fatalf("VA %#x state after re-Allocate = %#x, want MEM_COMMIT (%#x)", baseVA, info.State, windows.MEM_COMMIT)
+	}
 	if err := mm.as.MapFile(guestMemoryFileDataAddr, mf, fr2, hostarch.ReadWrite, false); err != nil {
 		t.Fatalf("MapFile pass 3: %v", err)
 	}

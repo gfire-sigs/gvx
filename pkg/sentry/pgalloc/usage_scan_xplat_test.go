@@ -28,8 +28,9 @@ import (
 
 func TestCanSkipUsageScan(t *testing.T) {
 	cgroups := map[uint32]struct{}{1: {}}
-	if !canSkipUsageScan(nil) {
-		t.Error("canSkipUsageScan(nil) = false, want true: a scan of all memory trusts the block count")
+	wantAll := runtime.GOOS != "windows"
+	if got := canSkipUsageScan(nil); got != wantAll {
+		t.Errorf("canSkipUsageScan(nil) on %s = %t, want %t", runtime.GOOS, got, wantAll)
 	}
 	want := (runtime.GOOS == "linux" || runtime.GOOS == "android") && unix.Getpagesize() <= hostarch.PageSize
 	if got := canSkipUsageScan(cgroups); got != want {

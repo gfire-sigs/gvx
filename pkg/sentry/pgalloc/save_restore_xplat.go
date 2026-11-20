@@ -21,6 +21,7 @@ import (
 	"math"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	pgallocpb "z.gfire.dev/gvx/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 )
 
@@ -125,18 +126,21 @@ type rangeProto interface {
 	GetEnd() uint64
 }
 
-// validateRangeProtos verifies that segs are non-empty, ordered, and disjoint.
-// The segment sets of MemoryFile panic on other input. If limit is not
-// math.MaxUint64, it also verifies that every range ends at or below limit.
-// The free and waste sets that SaveTo writes end at math.MaxUint64, so only
-// the accounting ranges have a limit.
+// validateRangeProtos verifies that segs are non-empty, page-aligned, ordered,
+// and disjoint. The segment sets of MemoryFile panic on other input. If limit
+// is not math.MaxUint64, it also verifies that every range ends at or below
+// limit. The free and waste sets that SaveTo writes end at math.MaxUint64, so
+// only the accounting ranges have a limit.
 func validateRangeProtos[T rangeProto](name string, segs []T, limit uint64) error {
+	pageMask := uint64(hostarch.PageSize) - 1
 	var prevEnd uint64
 	for i, s := range segs {
 		start, end := s.GetStart(), s.GetEnd()
 		switch {
 		case start >= end:
 			return fmt.Errorf("%s[%d] has the empty or inverted range [%#x, %#x)", name, i, start, end)
+		case start&pageMask != 0 || (end != math.MaxUint64 && end&pageMask != 0):
+			return fmt.Errorf("%s[%d] range [%#x, %#x) is not page-aligned", name, i, start, end)
 		case end > limit:
 			return fmt.Errorf("%s[%d] range [%#x, %#x) exceeds the backing file size %#x", name, i, start, end, limit)
 		case start < prevEnd:

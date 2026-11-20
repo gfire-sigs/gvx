@@ -38,11 +38,13 @@ const (
 
 // canSkipUsageScan reports whether UpdateUsage may skip its scan because the
 // usage of the memory file equals the committed bytes that it already knows.
-// The usage is the block count of the file. Linux updates the count when a
-// page commits. macOS updates it late, by up to 15 seconds in a measurement.
-// A host with pages larger than 4 KB commits a whole host page when one guest
-// sub-page faults. The scan for memory cgroups therefore runs whenever the
-// host page exceeds 4 KB or the host is neither Linux nor Android.
+// On Unix, TotalUsage reads the block count of the backing file. Linux updates
+// that count when a page commits, while macOS updates it late by up to 15
+// seconds. On Windows, MemoryFile uses anonymous virtual memory and TotalUsage
+// returns knownCommittedBytes, so Windows must always run the QueryWorkingSetEx
+// scan. A host with pages larger than 4 KB commits a whole host page when one
+// guest sub-page faults, so per-cgroup scans also run whenever the host page
+// exceeds 4 KB or the host is neither Linux nor Android.
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	if runtime.GOOS == "windows" {
 		return false

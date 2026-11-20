@@ -136,6 +136,18 @@ func alignedHostPageSpan(region []byte) (uintptr, uintptr) {
 	return alignedStart, alignedEnd - alignedStart
 }
 
+func outwardHostPageSpan(region []byte) (uintptr, uintptr) {
+	if len(region) == 0 {
+		return 0, 0
+	}
+	page := uintptr(os.Getpagesize())
+	start := uintptr(unsafe.Pointer(&region[0]))
+	end := start + uintptr(len(region))
+	alignedStart := start &^ (page - 1)
+	alignedEnd := (end + page - 1) &^ (page - 1)
+	return alignedStart, alignedEnd - alignedStart
+}
+
 func (f *MemoryFile) truncateBackingFile(int64) error {
 	// Windows chunks live in anonymous virtual memory or pagefile sections,
 	// so the placeholder backing file never grows on disk.
@@ -273,17 +285,30 @@ func (f *MemoryFile) ChunkSection(off uint64) (section windows.Handle, chunkStar
 	return wb.sections[idx], uint64(idx) * chunkSize, chunkSize, wb.fileID, true
 }
 
+// commitFile is a no-op on Windows because commitRange already commits the
+// anonymous virtual memory range and the placeholder file stays at zero bytes.
+func (*MemoryFile) commitFile(memmap.FileRange) error {
+	return nil
+}
+
 func (f *MemoryFile) commitRange(fr memmap.FileRange) error {
 	if f.file == nil || fr.Length() == 0 {
 		return nil
 	}
-	var commitErr error
+	type committedSpan struct {
+		addr   uintptr
+		length uintptr
+	}
+	var (
+		committed []committedSpan
+		commitErr error
+	)
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 		if chunk.mapping == 0 {
 			return true
 		}
 		bs := chunk.sliceAt(chunkFR)
-		addr, length := alignedHostPageSpan(bs)
+		addr, length := outwardHostPageSpan(bs)
 		if length == 0 {
 			return true
 		}
@@ -291,8 +316,14 @@ func (f *MemoryFile) commitRange(fr memmap.FileRange) error {
 			commitErr = linuxerr.ENOMEM
 			return false
 		}
+		committed = append(committed, committedSpan{addr: addr, length: length})
 		return true
 	})
+	if commitErr != nil && !f.opts.SharedSection {
+		for _, span := range committed {
+			_ = windows.VirtualFree(span.addr, span.length, winMemDecommit)
+		}
+	}
 	return commitErr
 }
 
@@ -314,6 +345,28 @@ func (f *MemoryFile) decommitRange(fr memmap.FileRange) {
 // pagefile-backed sections without any disk backing file.
 func (*MemoryFile) decommitOnDestroyLocked(memmap.FileRange) {}
 
+// decommitCommittedSubregions resets only the sub-ranges inside [addr, addr+length)
+// that are currently in MEM_COMMIT state so fallback decommit cannot fault on
+// pages that an earlier sub-release already decommitted.
+func decommitCommittedSubregions(addr, length uintptr) {
+	end := addr + length
+	for cur := addr; cur < end; {
+		var info windows.MemoryBasicInformation
+		if err := windows.VirtualQuery(cur, &info, unsafe.Sizeof(info)); err != nil || info.RegionSize == 0 {
+			return
+		}
+		segEnd := min(info.BaseAddress+info.RegionSize, end)
+		if info.State == windows.MEM_COMMIT && segEnd > cur {
+			sub := unsafe.Slice((*byte)(unsafe.Pointer(cur)), int(segEnd-cur))
+			_ = DecommitSharedPages(sub)
+		}
+		if segEnd <= cur {
+			return
+		}
+		cur = segEnd
+	}
+}
+
 // decommitReleasedRange releases physical memory and, for private VirtualAlloc
 // chunks, commit charge for freed ranges returned to the allocator.
 func (f *MemoryFile) decommitReleasedRange(fr memmap.FileRange) {
@@ -329,7 +382,7 @@ func (f *MemoryFile) decommitReleasedRange(fr memmap.FileRange) {
 		}
 		if err := windows.VirtualFree(addr, length, winMemDecommit); err != nil {
 			log.Warningf("Failed to decommit MemoryFile range %#x+%#x: %v", addr, length, err)
-			_ = DecommitSharedPages(bs)
+			decommitCommittedSubregions(addr, length)
 		}
 	})
 }

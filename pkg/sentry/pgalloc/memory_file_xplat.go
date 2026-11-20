@@ -75,6 +75,16 @@ func (f *MemoryFile) unmapBackingChunks(chunks []chunkInfo) error {
 	return errors.Join(errs...)
 }
 
+func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
+	// "The default operation (i.e., mode is zero) of fallocate() allocates the
+	// disk space within the range specified by offset and len." - fallocate(2)
+	return unix.Fallocate(
+		int(f.file.Fd()),
+		0, // mode
+		int64(fr.Start),
+		int64(fr.Length()))
+}
+
 func (*MemoryFile) commitRange(memmap.FileRange) error {
 	return nil
 }
