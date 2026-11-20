@@ -1,0 +1,39 @@
+# Pinned inputs of gvx-gpu-renderer. scripts/gpu/build-renderer.sh and
+# scripts/gpu/stage_driver.py read this file.
+# Change a value only together with a build, a --selftest run, and gate G1 on darwin/arm64.
+VIRGLRENDERER_URL=https://gitlab.freedesktop.org/virgl/virglrenderer.git
+VIRGLRENDERER_COMMIT=211ca6e3ac98a2c18309b6d96ece75f76e0d049e
+VENUS_PROTOCOL_URL=https://gitlab.freedesktop.org/virgl/venus-protocol.git
+VENUS_PROTOCOL_COMMIT=ca19b6358d7cc491bc3e4de76f04c6700876a8fa
+PYTHON_REQUIREMENTS=Mako==1.4.3 MarkupSafe==3.0.4 PyYAML==6.0.3
+DRIVER_NAME=KosmicKrisp
+DRIVER_FORMULA=mesa
+DRIVER_LIBRARY=libvulkan_kosmickrisp.dylib
+DRIVER_SOURCE_VERSION=26.3.0
+DRIVER_SOURCE_URL=https://archive.mesa3d.org/mesa-26.3.0.tar.xz
+DRIVER_SOURCE_SHA256=91d729aa68bb89e4ec857841300bbe922bcb3e52b1f97566ca83930d3b28343a
+DRIVER_SOURCE_PYTHON_REQUIREMENTS=packaging==26.3
+BOTTLE.mesa.version=26.3.0
+BOTTLE.mesa.arm64_golden_gate=50f68aeab7a2cb37e07bac0ba1227d27bcd156d6c52966d7f8e16fc2933517ee
+BOTTLE.mesa.arm64_tahoe=f774ca38347701f9861c1a080e3002b46fc4bbc937d2df73c066f3b68f31c72c
+BOTTLE.spirv-tools.version=1.4.363.0
+BOTTLE.spirv-tools.arm64_golden_gate=be9c608d9d4062e661bf54c48df8eefcda66503655a68bcf251621eb4b4592d3
+BOTTLE.spirv-tools.arm64_tahoe=f1b075c2a107e314872144082b0ae49c18c15d7002e818fb60fe62f2d1c72e5a
+BOTTLE.xcb-util-keysyms.version=0.4.1
+BOTTLE.xcb-util-keysyms.arm64_golden_gate=5cb22b2679fb2355215fbcc6b68357796a9bda85c1a4863f48bf563c9a8f89c8
+BOTTLE.xcb-util-keysyms.arm64_tahoe=53daefbc9047587b5a2f2e41bd1ef7381593ee69e66193d4464041f45fe24429
+BOTTLE.zstd.version=1.5.7
+BOTTLE.zstd.arm64_golden_gate=7fb4af03304cc4897326168cdcd53290311c5543150f5502a61c3e84b6d62765
+BOTTLE.zstd.arm64_tahoe=628a4ef53428d0078e3d76d297171ce8d0294f5ec1de3f20305e08c4dd333565
+BOTTLE.libxcb.version=1.17.0
+BOTTLE.libxcb.arm64_golden_gate=36791e448c61f28491e742e9150ec78c13c8ef7f734a2a51b024cf189ed08d46
+BOTTLE.libxcb.arm64_tahoe=059edd054b17234abb0ce8a34dcbbd927e104445d09a3f5904ea82f7c5aa7ded
+BOTTLE.libx11.version=1.8.14
+BOTTLE.libx11.arm64_golden_gate=f16e804d426ea8b43df43c0a6207a106a342b35275e5c061ec8f89ad032140a1
+BOTTLE.libx11.arm64_tahoe=38fbafb4e0ff48cf924f110e1e11442df06091298dfce50b82866dcb7355cb1b
+BOTTLE.libxau.version=1.0.12
+BOTTLE.libxau.arm64_golden_gate=f880b5b3db6ef66ecebc49402c2ed48ffb00e288340f056f077f9f83c82ab3be
+BOTTLE.libxau.arm64_tahoe=503040606c5d29dd415f2c8dcba7e181d259e4cdff02d1d8bde4e9ea5244765a
+BOTTLE.libxdmcp.version=1.1.5
+BOTTLE.libxdmcp.arm64_golden_gate=fb949aa790c6d35e695e74ad7672ddc857538ab6256f83e3a327c78b7ca82027
+BOTTLE.libxdmcp.arm64_tahoe=34ca0da1c319eeea93ce31badfb5c29c8876cea644754279e93f6cf032ab5cb1

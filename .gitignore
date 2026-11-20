@@ -37,3 +37,7 @@ go.work.sum
 # .vscode/
 /rungv
 /rungv.exe
+
+# Renderer bundle and caches of scripts/gpu/build-renderer.sh
+/build/
+__pycache__/
