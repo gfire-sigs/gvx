@@ -155,7 +155,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 		return cleanup(err)
 	}
 
-	mf, err := createKernelMemoryFile(0)
+	mf, err := createKernelMemoryFile(0, sb.platName == "systrap")
 	if err != nil {
 		return cleanup(err)
 	}

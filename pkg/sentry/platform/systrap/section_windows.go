@@ -47,11 +47,17 @@ type sectionRef struct {
 	// file identifies the host file of the section, or is zero for an
 	// anonymous section. Two sections of one file map the same frames.
 	file uintptr
+	// fileBase is the byte offset within file where offset 0 of this section
+	// starts. It is zero for whole-file sections and chunkStart for per-chunk
+	// memory-file sections.
+	fileBase uint64
 	// size is the size of the section in bytes.
 	size uint64
 	// readOnly is true for a section of a file that the Sentry opened without
 	// write access, such as an erofs image.
 	readOnly bool
+	// owned reports whether sectionCache owns h and must close it in close().
+	owned bool
 }
 
 // sectionFileID identifies an open host file independently of its numeric handle
@@ -81,11 +87,50 @@ func fileIdentityFromInfo(info windows.ByHandleFileInformation) sectionFileID {
 // WHY: a view that the stub holds keeps its section object alive, but the
 // window map keeps the section handle to map a piece of a split view again.
 // So the cache closes no handle before the platform closes.
+type chunkSectionKey struct {
+	fileID   uintptr
+	fileBase uint64
+}
+
 type sectionCache struct {
 	mu     sync.Mutex
 	files  map[sectionFileID]*sectionRef
+	chunks map[chunkSectionKey]*sectionRef
+	chunkF map[uintptr]uintptr
 	nextID uintptr
 	all    []*sectionRef
+}
+
+// forChunk returns a cached sectionRef wrapping an externally owned per-chunk
+// pagefile section handle (such as pgalloc.MemoryFile with SharedSection).
+func (c *sectionCache) forChunk(h windows.Handle, externalFileID uintptr, fileBase, size uint64) *sectionRef {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.chunkF == nil {
+		c.chunkF = make(map[uintptr]uintptr)
+	}
+	fileID, ok := c.chunkF[externalFileID]
+	if !ok {
+		c.nextID++
+		fileID = c.nextID
+		c.chunkF[externalFileID] = fileID
+	}
+	key := chunkSectionKey{fileID: fileID, fileBase: fileBase}
+	if ref := c.chunks[key]; ref != nil && ref.h == h && ref.size == size {
+		return ref
+	}
+	ref := &sectionRef{
+		h:        h,
+		file:     fileID,
+		fileBase: fileBase,
+		size:     size,
+		owned:    false,
+	}
+	if c.chunks == nil {
+		c.chunks = make(map[chunkSectionKey]*sectionRef)
+	}
+	c.chunks[key] = ref
+	return ref
 }
 
 // get returns a section of the file that covers [0, end). A caller that needs
@@ -134,7 +179,7 @@ func (c *sectionCache) get(file windows.Handle, end uint64, write bool) (*sectio
 		c.nextID++
 		fileID = c.nextID
 	}
-	ref := &sectionRef{h: h, file: fileID, size: size, readOnly: readOnly}
+	ref := &sectionRef{h: h, file: fileID, size: size, readOnly: readOnly, owned: true}
 	if c.files == nil {
 		c.files = make(map[sectionFileID]*sectionRef)
 	}
@@ -149,9 +194,11 @@ func (c *sectionCache) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, ref := range c.all {
-		_ = windows.CloseHandle(ref.h)
+		if ref.owned {
+			_ = windows.CloseHandle(ref.h)
+		}
 	}
-	c.all, c.files = nil, nil
+	c.all, c.files, c.chunks, c.chunkF = nil, nil, nil, nil
 }
 
 // anonSection is a pagefile-backed section that the Sentry maps for writing
