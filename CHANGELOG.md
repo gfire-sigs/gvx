@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
+- **NAT TCP answer to a failed host dial (`pkg/netbackend`)** (#206): Outbound NAT TCP connections now classify host dial errors instead of sending a RST for every failure. Refusals and unknown errors still send a RST (`ECONNREFUSED`), while timeouts send no answer so retransmitted SYNs redial and end with `ETIMEDOUT`. Host or network unreachable and down errors (including Windows `WSAE` codes) send an ICMPv4 destination unreachable from `10.0.2.2`, returning `EHOSTUNREACH` or `ENETUNREACH`. Quoted 20-byte TCP headers let guest conntrack deliver the same errno to containers behind iptables NAT.
 - **Deadlock between mounts and renames on `ext4lite` and `hostfs` (`pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/hostfs`)**: `IsDescendant` and `PrependPath` took the file system lock `fs.mu`, but the VFS lock order puts their locks last. The VFS calls `IsDescendant` with its mount lock held, and a rename, an unlink, or an rmdir holds `fs.mu` while it waits for that lock. A mount with propagation during a rename stopped every file system call of the guest, for example in a `docker build` with parallel RUN steps. Both file systems now protect the parent and the name of each dentry with a file-system-wide `ancestryMu`. It is the last lock in the order, as in the upstream `fstree`.
 
 ## [v0.17.10002026110900] - 2026-11-17

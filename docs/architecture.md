@@ -411,7 +411,7 @@ Guest applications (`nginx`, `postgres`, `git`, `curl`, `dockerd`, `k3s`) invoke
 
 #### Track A: L4 Go `net` Forwarder and Bidirectional Port Forwarding (`nat_forwarder.go`, `port_forwarder.go`) (Descriptive Module)
 
-In `-net=nat` mode, the guest `eth0` is one end of an in-memory `pipe` link. The other end belongs to a second Netstack instance that stands for the host network. That host stack accepts packets to any address (promiscuous mode) and sends packets from any address (spoofing). `nat_forwarder.go` registers `tcp.NewForwarder` and `udp.NewForwarder` handlers on the host stack. The guest stack thus routes as a Linux host does, so a guest bridge, a network namespace, and iptables NAT work in the guest. When a guest process connects to an external address or local LAN host, Netstack completes the virtual TCP handshake and invokes the forwarder callback. Outbound connections to `10.0.2.2` (`host.docker.internal`) route to the host loopback (`127.0.0.1`). Guest `127.0.0.1` traffic remains isolated on the container's internal `lo` interface. Callers can pass the optional `-isolate-lan` flag when they wish to block RFC1918 and host loopback ranges.
+In `-net=nat` mode, the guest `eth0` is one end of an in-memory `pipe` link. The other end belongs to a second Netstack instance that stands for the host network. That host stack accepts packets to any address (promiscuous mode) and sends packets from any address (spoofing). `nat_forwarder.go` registers `tcp.NewForwarder` and `udp.NewForwarder` handlers on the host stack. The guest stack thus routes as a Linux host does, so a guest bridge, a network namespace, and iptables NAT work in the guest. A guest SYN to an external address or local LAN host goes to the forwarder callback, which dials the target on the host. Outbound connections to `10.0.2.2` (`host.docker.internal`) route to the host loopback (`127.0.0.1`). Guest `127.0.0.1` traffic remains isolated on the container's internal `lo` interface. Callers can pass the optional `-isolate-lan` flag when they wish to block RFC1918 and host loopback ranges.
 
 The guest `eth0` starts with the MTU 1500, as on a Linux node or in a Docker container. The tunable `net.nat.mtu` sets the first MTU. The loopback device keeps 65,536. Software in the guest derives the MTU of its tunnels from `eth0`: `flannel` uses 1450 for `vxlan` and 1420 for WireGuard.
 
@@ -424,6 +424,18 @@ macOS limits a datagram to the send buffer of a UDP socket, which starts at `net
 The NAT relay keeps at most 512 UDP sessions by default. The tunable `net.nat.udp_sessions` sets the limit. A new session beyond the limit ends the session with the oldest datagram. Each running direction of a session holds one pooled read buffer of 64 KiB, so a full table holds at most 64 MiB.
 
 The NAT relay bounds two more counts. It relays at most 4,096 guest TCP connections at once, and it resets each connection beyond that limit. It serves at most 256 guest DNS flows at once, one for each UDP source port and one for each TCP connection, and it drops each flow beyond that limit. A DNS flow frees its slot when it idles for the DNS timeout.
+
+The host stack completes the TCP handshake with the guest only after the host dial succeeds. A refusal, a timeout, or an unreachable target gets the answer that a Linux host gets from its network. The guest connect then fails with the errno of the host connect. Any other dial error gets a RST. The tunable `net.nat.dial_timeout` ends a dial to a host that does not answer.
+
+| Host dial result | Answer to the guest SYN | Result of the guest `connect()` |
+| :--- | :--- | :--- |
+| Refused (`ECONNREFUSED`, `WSAECONNREFUSED`) | RST | `ECONNREFUSED` at once. |
+| Timeout (`net.nat.dial_timeout`, `ETIMEDOUT`, `WSAETIMEDOUT`) | None. Each retransmitted SYN starts a new dial. | `ETIMEDOUT` when the SYN timer of the guest ends (about 127 s), or a connection when a later dial succeeds. |
+| Host unreachable (`EHOSTUNREACH`, `EHOSTDOWN`, `WSAEHOSTUNREACH`, `WSAEHOSTDOWN`) | ICMPv4 host unreachable from `10.0.2.2` | `EHOSTUNREACH` at once. |
+| Network unreachable (`ENETUNREACH`, `ENETDOWN`, `WSAENETUNREACH`, `WSAENETDOWN`) | ICMPv4 network unreachable from `10.0.2.2` | `ENETUNREACH` at once. |
+| Other error | RST | `ECONNREFUSED` at once. |
+
+The ICMP message quotes the full TCP header of the SYN. The connection tracker of the guest then translates the error back, so a container behind the iptables NAT of the guest gets the same errno. An IPv6 connection gets no ICMPv6 message, so a connect to an unreachable IPv6 target times out.
 
 The values of this track that Linux has no knob for are tunables: the MTU of `eth0`, the UDP session limit and idle time, the dial time, the SYN backlog, the DNS time limits, and the limits of published ports. [`cli.md`](cli.md), section 3.3, lists them with their defaults and ranges. The registry in `pkg/gvx/tuning` holds them, and `gvx.Config.Tuning` passes them to `netbackend` through `NATConfig.Tuning`, `WireGuardConfig.Tuning`, and `NewPortForwarder`. No package keeps a global setting: each sandbox holds its own `Values`.
 
