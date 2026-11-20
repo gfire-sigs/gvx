@@ -373,7 +373,7 @@ func runSteps(steps []renameStep) error {
 			for j := i - 1; j >= 0; j-- {
 				steps[j].undo()
 			}
-			return toLinuxErr(err)
+			return toWriteOpErr(err)
 		}
 	}
 	return nil

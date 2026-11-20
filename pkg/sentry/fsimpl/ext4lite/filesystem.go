@@ -21,6 +21,7 @@ package ext4lite
 
 import (
 	"errors"
+	"math"
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -277,6 +278,21 @@ func (fs *filesystem) retryHeld(op func(policy allocPolicy) error) error {
 	return toLinuxErr(op(allocGrowHeld))
 }
 
+// retryFlushHeld runs flush, syncs the volume if held space blocked the flush,
+// and retries once without discarding deferred write-back errors.
+func (fs *filesystem) retryFlushHeld(flush func() error) error {
+	err := flush()
+	if !errors.Is(err, errSpaceHeld) {
+		return err
+	}
+	if fs.v.hasHeld() {
+		if serr := fs.v.sync(); serr != nil {
+			return serr
+		}
+	}
+	return flush()
+}
+
 // writeOp runs op as one guest operation that changes the volume. op runs in the
 // gate, and the wrapper retries it once after a flush when the volume ran out of
 // space that a flush frees.
@@ -360,15 +376,13 @@ func (fs *filesystem) syncMapped() error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, ino := range list {
-		err := ino.data.SyncData()
-		if errors.Is(err, errSpaceHeld) && fs.v.hasHeld() {
-			// The write-back found no free block while freed blocks wait for a
-			// flush. The flush runs with the gate open.
-			if serr := fs.v.sync(); serr == nil {
-				err = ino.data.SyncData()
-			}
-		}
-		if err != nil {
+		flushErr := fs.retryFlushHeld(func() error {
+			return ino.flushMapped(0, math.MaxUint64)
+		})
+		ino.wmu.Lock()
+		wbErr := ino.data.TakeWritebackErr()
+		ino.wmu.Unlock()
+		if err := errors.Join(wbErr, flushErr); err != nil {
 			errs = append(errs, err)
 		}
 	}

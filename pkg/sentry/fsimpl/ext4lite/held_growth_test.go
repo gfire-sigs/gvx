@@ -17,12 +17,14 @@ package ext4lite
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
@@ -256,6 +258,7 @@ func TestAllocWaitsForInFlightHolePunchWithoutGrowth(t *testing.T) {
 			case <-punchStarted:
 			case <-time.After(10 * time.Second):
 				close(releasePunch)
+				<-syncErr
 				t.Fatal("reclaimAfterFlushLocked did not start PunchHole within 10s")
 			}
 
@@ -394,4 +397,142 @@ func TestHeldSpaceServesMappedFsyncOnFullHost(t *testing.T) {
 	}
 	wantBytes(t, "/out after mapped fsync", d.e.readAll(fd), want)
 	fd.DecRef(d.e.ctx)
+}
+
+// TestFsyncAfterFailedUnmapWriteBackReportsENOSPC verifies that fsync still
+// reports ENOSPC when an earlier RemoveMapping write-back failed and discarded
+// dirty chunks before fsync ran.
+func TestFsyncAfterFailedUnmapWriteBackReportsENOSPC(t *testing.T) {
+	d := fillGroupZeroAndHoldOneBlock(t, 16<<20)
+	const size = 4 * blockSize
+	d.truncate("/out", size)
+	fd := d.e.mustOpen("/out", linux.O_RDWR)
+	defer fd.DecRef(d.e.ctx)
+
+	mp := d.e.mapFile(fd, size, true)
+	mp.store(0, auFill(13, 0, size))
+	// Ending the only mapping flushes dirty chunks, fails with ENOSPC while
+	// holding 1 block vs 4 needed, drops chunks, and records errSpaceHeld in WBErr.
+	mp.remove()
+
+	if err := fd.Sync(d.e.ctx); !errors.Is(err, linuxerr.ENOSPC) {
+		t.Fatalf("fsync after failed unmap write-back = %v, want ENOSPC", err)
+	}
+}
+
+// TestPWriteClearsCapabilityUnderHeldSpace verifies that overwriting an existing
+// file whose security.capability shares an xattr block allocates a CoW xattr
+// block after flushing held space without failing or leaving capability intact.
+func TestPWriteClearsCapabilityUnderHeldSpace(t *testing.T) {
+	auNoFlusher(t)
+	d0 := newAuDrv(t)
+	d0.create("/out", blockSize)
+	d0.create("/g", 0)
+	capV2 := "\x01\x00\x00\x02" + "\x02\x00\x00\x00" + "\x00\x00\x00\x00" + "\x00\x00\x00\x00" + "\x00\x00\x00\x00"
+	if err := auSetXattr(d0.e, "/out", linux.XATTR_SECURITY_CAPABILITY, capV2); err != nil {
+		t.Fatalf("set security.capability: %v", err)
+	}
+	if err := auSetXattr(d0.e, "/out", "user.keep", "v"); err != nil {
+		t.Fatalf("set user.keep: %v", err)
+	}
+	d0.e.unmount()
+	base := d0.f.snapshot()
+	tree := auFsck(base, true).Tree
+	outRaw := auRawInode(base, tree["/out"].ino)
+	acl := uint64(auLE.Uint32(outRaw[0x68:])) | uint64(auLE.Uint16(outRaw[0x76:]))<<32
+	gRaw := auRawInode(base, tree["/g"].ino)
+	auLE.PutUint32(gRaw[0x68:], uint32(acl))
+	auLE.PutUint16(gRaw[0x76:], uint16(acl>>32))
+	auLE.PutUint32(gRaw[0x1C:], auLE.Uint32(gRaw[0x1C:])+8)
+	auWriteRawInode(base, tree["/g"].ino, gRaw)
+	base.writeAt([]byte{2, 0, 0, 0}, int64(acl)*auBlock+4)
+
+	e, fl := auMountImage(t, base)
+	fl.mu.Lock()
+	fl.avail = 16 << 20
+	fl.mu.Unlock()
+
+	e.writeFile("/held", auFill(1, 0, blockSize))
+	v := e.fs.v
+	v.mu.Lock()
+	free := int(v.groups[0].desc.freeBlocks)
+	v.mu.Unlock()
+	if free > 0 {
+		e.writeFile("/fill", auFill(2, 0, free*blockSize))
+	}
+	auFlush(t, e)
+	if got := v.numGroups(); got != 1 {
+		t.Fatalf("groups after fill = %d, want 1", got)
+	}
+	if err := e.unlink("/held"); err != nil {
+		t.Fatalf("unlink /held: %v", err)
+	}
+	if !v.hasHeld() {
+		t.Fatal("/held block is not held before PWrite")
+	}
+
+	fd := e.mustOpen("/out", linux.O_WRONLY)
+	defer fd.DecRef(e.ctx)
+	if _, err := fd.PWrite(e.ctx, usermem.BytesIOSequence(auFill(15, 0, blockSize)), 0, vfsWriteOpts); err != nil {
+		t.Fatalf("PWrite over existing block with shared xattr under held space: %v", err)
+	}
+	if _, err := auGetXattr(e, "/out", linux.XATTR_SECURITY_CAPABILITY); !errors.Is(err, linuxerr.ENODATA) {
+		t.Fatalf("security.capability after PWrite = %v, want ENODATA", err)
+	}
+	if got, err := auGetXattr(e, "/out", "user.keep"); err != nil || got != "v" {
+		t.Fatalf("user.keep after PWrite = (%q, %v), want (%q, nil)", got, err, "v")
+	}
+	if got := v.numGroups(); got != 1 {
+		t.Fatalf("groups after PWrite clearing capability = %d, want 1", got)
+	}
+}
+
+// TestRenameGrowsDirectoryUnderHeldSpace verifies that RenameAt allocating a
+// new directory block under held space preserves errSpaceHeld across runSteps,
+// retries cleanly, and succeeds while keeping consistency.
+func TestRenameGrowsDirectoryUnderHeldSpace(t *testing.T) {
+	auNoFlusher(t)
+	f := newAuFile(nil)
+	d := auMount(t, f, newAuModel())
+	e := d.e
+	d.mkdir("/src")
+	d.mkdir("/dst")
+
+	// Fill /dst's initial 4 KB directory block almost to capacity with long
+	// filenames so one more entry requires a new directory block.
+	prefix := strings.Repeat("d", 190)
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("/dst/%s_%02d", prefix, i)
+		d.create(name, 0)
+	}
+	srcName := "/src/" + strings.Repeat("s", 190)
+	d.create(srcName, 0)
+	d.create("/held", blockSize)
+
+	v := e.fs.v
+	v.mu.Lock()
+	free := int(v.groups[0].desc.freeBlocks)
+	v.mu.Unlock()
+	if free > 0 {
+		d.create("/fill", free*blockSize)
+	}
+	d.syncAll()
+	d.unlink("/held")
+	if !v.hasHeld() {
+		t.Fatal("/held block is not held before RenameAt")
+	}
+
+	dstName := "/dst/" + strings.Repeat("r", 190)
+	if err := e.rename(srcName, dstName); err != nil {
+		t.Fatalf("RenameAt needing new dir block under held space: %v", err)
+	}
+	if got := v.numGroups(); got != 1 {
+		t.Fatalf("groups after RenameAt reusing held block = %d, want 1", got)
+	}
+	d.syncAll()
+	d.e.unmount()
+	final := auFsck(d.f.snapshot(), true)
+	if !final.OK() {
+		t.Fatalf("fsck after RenameAt:\n%s", final)
+	}
 }

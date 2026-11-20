@@ -215,12 +215,13 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 	cur, pos := src, offset
 	var total int64
 	var werr error
+	retryKillCap := false
 	for retry := 0; ; retry++ {
 		policy := allocReuseHeld
 		if retry > 0 {
 			policy = allocGrowHeld
 		}
-		n, end, err := fd.pwriteGated(ctx, cur, pos, opts, policy)
+		n, end, killCapFailed, err := fd.pwriteGated(ctx, cur, pos, opts, policy, retryKillCap)
 		total += n
 		finalOff, werr = end, err
 		if !errors.Is(err, errSpaceHeld) || retry > 0 {
@@ -232,6 +233,7 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 			}
 		}
 		cur, pos = cur.DropFirst64(n), end
+		retryKillCap = killCapFailed
 	}
 	if werr != nil {
 		return total, finalOff, toLinuxErr(werr)
@@ -251,17 +253,23 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 // the offset behind them, and the raw error of the engine, so that pwrite can
 // recognize a request that waits for a flush. The gate comes before wmu, as in
 // every other operation.
-func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions, policy allocPolicy) (written, finalOff int64, err error) {
+func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions, policy allocPolicy, retryKillCap bool) (written, finalOff int64, killCapFailed bool, err error) {
 	d := fd.dentry
 	ino := d.inode
 	if err := d.fs.v.throttle(); err != nil {
-		return 0, offset, err
+		return 0, offset, false, err
 	}
 	d.fs.v.gate.enterOp()
 	defer d.fs.v.gate.exit()
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
 
+	if retryKillCap && src.NumBytes() == 0 {
+		if kerr := ino.killCapabilityPolicy(policy); kerr != nil {
+			return 0, offset, true, kerr
+		}
+		return 0, offset, false, nil
+	}
 	if appendsWrite(fd.vfsfd.StatusFlags(), opts.Flags) {
 		ino.n.mu.RLock()
 		offset = int64(ino.n.size)
@@ -270,12 +278,12 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 	if limits.FromContext(ctx) != nil {
 		limit, err := vfs.CheckLimit(ctx, offset, src.NumBytes())
 		if err != nil {
-			return 0, offset, err
+			return 0, offset, false, err
 		}
 		src = src.TakeFirst64(limit)
 	}
 	if src.NumBytes() == 0 {
-		return 0, offset, nil
+		return 0, offset, false, nil
 	}
 	w := &nodeWriter{ino: ino, off: offset, policy: policy}
 	n, err := src.CopyInTo(ctx, safemem.FromIOWriter{Writer: w})
@@ -287,11 +295,11 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 			nd.mtime, nd.ctime = now, now
 			nd.mode = writeClearPrivsMode(ctx, nd.mode, nd.uid, nd.gid)
 		})
-		if err := ino.killCapabilityPolicy(policy); err != nil {
-			return n, offset + n, err
+		if kerr := ino.killCapabilityPolicy(policy); kerr != nil {
+			return n, offset + n, true, kerr
 		}
 	}
-	return n, offset + n, err
+	return n, offset + n, false, err
 }
 
 // killCapability removes the file capabilities after a write. It reads the
@@ -309,7 +317,7 @@ func (i *inode) killCapabilityPolicy(policy allocPolicy) error {
 		return nil
 	}
 	if err := n.removeXattrPolicy(linux.XATTR_SECURITY_CAPABILITY, policy); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
-		return toLinuxErr(err)
+		return toWriteOpErr(err)
 	}
 	return nil
 }
@@ -324,17 +332,13 @@ func (i *inode) killCapabilityPolicy(policy allocPolicy) error {
 // would wait for that write without end.
 func (fs *filesystem) syncInode(ino *inode) error {
 	var errs []error
+	flushErr := fs.retryFlushHeld(func() error {
+		return ino.flushMapped(0, math.MaxUint64)
+	})
 	ino.wmu.Lock()
-	err := ino.data.SyncData()
+	wbErr := ino.data.TakeWritebackErr()
 	ino.wmu.Unlock()
-	if errors.Is(err, errSpaceHeld) && fs.v.hasHeld() {
-		if serr := fs.v.sync(); serr == nil {
-			ino.wmu.Lock()
-			err = ino.data.SyncData()
-			ino.wmu.Unlock()
-		}
-	}
-	if err != nil {
+	if err := errors.Join(wbErr, flushErr); err != nil {
 		errs = append(errs, err)
 	}
 	if err := fs.v.sync(); err != nil {

@@ -169,7 +169,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, err
 		}
 		if !afterCreate && opts.Flags&linux.O_TRUNC != 0 {
-			if err := d.clearPrivsAfterTruncate(rp.Credentials()); err != nil {
+			if err := d.clearPrivsAfterTruncate(rp.Mount(), rp.Credentials()); err != nil {
 				fd.DecRef(ctx)
 				return nil, err
 			}
@@ -205,9 +205,11 @@ func writeClearPrivsMode(ctx context.Context, mode uint16, uid, gid uint32) uint
 // clearPrivsAfterTruncate removes the set-user-ID and set-group-ID bits and the
 // file capabilities after O_TRUNC, as Linux does when a truncate changes a
 // file. It runs after the truncate, so the caller has the write permission.
-func (d *dentry) clearPrivsAfterTruncate(creds *auth.Credentials) error {
-	d.inode.mutate(func(n *node) {
-		n.mode = clearPrivsMode(creds, n.mode, n.uid, n.gid)
+func (d *dentry) clearPrivsAfterTruncate(mnt *vfs.Mount, creds *auth.Credentials) error {
+	return d.fs.writeOp(mnt, func(policy allocPolicy) error {
+		d.inode.mutate(func(n *node) {
+			n.mode = clearPrivsMode(creds, n.mode, n.uid, n.gid)
+		})
+		return d.inode.killCapabilityPolicy(policy)
 	})
-	return d.inode.killCapability()
 }
