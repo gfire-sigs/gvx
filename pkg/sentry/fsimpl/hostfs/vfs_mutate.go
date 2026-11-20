@@ -160,7 +160,8 @@ func mayDelete(creds *auth.Credentials, parent, child *inode) error {
 	return vfs.CheckDeleteSticky(creds, linux.FileMode(pe.attr.Mode), auth.KUID(pe.attr.UID), auth.KUID(ce.attr.UID), auth.KGID(ce.attr.GID))
 }
 
-// isAncestorLocked reports whether anc is d or an ancestor of d.
+// isAncestorLocked reports whether anc is d or an ancestor of d. The caller
+// holds fs.mu or fs.ancestryMu.
 func isAncestorLocked(anc, d *dentry) bool {
 	for ; d != nil; d = d.parent {
 		if d == anc {
@@ -351,18 +352,20 @@ func (fs *filesystem) moveLocked(d, newParent *dentry, newName, newRel string) {
 	}
 	newParent.children[newName] = d
 	newParent.refs.Add(1)
-	d.nameMu.Lock()
+	// One section changes the parent, the name, and the paths, so a reader
+	// under fs.ancestryMu never sees a new parent with an old path.
+	fs.ancestryMu.Lock()
 	d.parent = newParent
 	d.name = newName
-	d.nameMu.Unlock()
 	fs.rewritePathLocked(d, newRel)
+	fs.ancestryMu.Unlock()
 	oldParent.decRefLocked()
 }
 
+// rewritePathLocked sets the workspace path of d and of every cached
+// descendant. The caller holds fs.mu and fs.ancestryMu.
 func (fs *filesystem) rewritePathLocked(d *dentry, rel string) {
-	d.nameMu.Lock()
 	d.relPath = rel
-	d.nameMu.Unlock()
 	for name, c := range d.children {
 		fs.rewritePathLocked(c, joinRelPath(rel, name))
 	}

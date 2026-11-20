@@ -405,14 +405,12 @@ func (fs *filesystem) exchangeDentriesLocked(a, b *dentry, aRel, bRel string) {
 	// before the old ones drop, so no parent dies in between.
 	pa.refs.Add(1)
 	pb.refs.Add(1)
-	a.nameMu.Lock()
-	b.nameMu.Lock()
+	fs.ancestryMu.Lock()
 	a.parent, a.name = pb, nb
 	b.parent, b.name = pa, na
-	b.nameMu.Unlock()
-	a.nameMu.Unlock()
 	fs.rewritePathLocked(a, bRel)
 	fs.rewritePathLocked(b, aRel)
+	fs.ancestryMu.Unlock()
 	pa.decRefLocked()
 	pb.decRefLocked()
 }

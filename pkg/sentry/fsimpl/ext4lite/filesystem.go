@@ -185,8 +185,18 @@ type filesystem struct {
 
 	// mu protects the dentry tree, the names of dentries, the inode map, and
 	// pending. Lock order: mu, then the locks of the engine nodes, then the
-	// lock of the volume.
-	mu     sync.Mutex `state:"nosave"`
+	// lock of the volume. ancestryMu comes after all of them.
+	mu sync.Mutex `state:"nosave"`
+
+	// ancestryMu protects the parent and the name of each dentry for readers
+	// that do not hold mu: IsDescendant, PrependPath, and InotifyWithParent.
+	// A writer of a parent or a name holds mu and ancestryMu. The VFS lock
+	// order (pkg/sentry/vfs/vfs.go) puts the locks of these methods last. For
+	// example, the VFS calls IsDescendant with its mount lock held, and a
+	// rename or an unlink holds mu while it waits for that lock. So these
+	// methods do not take mu, and a holder of ancestryMu takes no other lock.
+	ancestryMu sync.RWMutex `state:"nosave"`
+
 	root   *dentry
 	inodes map[uint32]*inode
 	// pending holds references that the VFS returned and that must drop after
@@ -616,9 +626,13 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.
+//
+// The VFS lock order puts the locks of PrependPath last, because callers such
+// as FileDescription.MappedName hold other locks. So the walk takes
+// ancestryMu and not mu. See filesystem.ancestryMu.
 func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDentry, b *fspath.Builder) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
 	mnt := vd.Mount()
 	d := vd.Dentry().Impl().(*dentry)
 	for {
@@ -637,16 +651,20 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 }
 
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
+//
+// The VFS holds its mount lock during the call, for example when it propagates
+// a mount, so the walk takes ancestryMu and not mu. See filesystem.ancestryMu.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	if vfsroot.Mount() != vd.Mount() {
 		return false
 	}
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
 	return isAncestorLocked(vfsroot.Dentry().Impl().(*dentry), vd.Dentry().Impl().(*dentry))
 }
 
-// isAncestorLocked reports whether anc is d or an ancestor of d.
+// isAncestorLocked reports whether anc is d or an ancestor of d. The caller
+// holds fs.mu or fs.ancestryMu.
 func isAncestorLocked(anc, d *dentry) bool {
 	for ; d != nil; d = d.parent {
 		if d == anc {
