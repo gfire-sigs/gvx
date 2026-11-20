@@ -50,3 +50,44 @@ func TestParseResolvConfWithoutNameserversReturnsNoServers(t *testing.T) {
 		}
 	}
 }
+
+func TestParseResolvConfConfigExtractsSearchOptionsAndDeduplicates(t *testing.T) {
+	text := `domain old.example
+search corp.example. dev.example corp.example a..b trailing.. -bad.example bad/domain ; comment
+nameserver 192.0.2.53
+nameserver 192.0.2.53
+nameserver 198.51.100.1
+options ndots:2 timeout:3 attempts:2 edns0 ndots:2 inet6 badopt ndots:99
+`
+	got := parseResolvConfConfig(text)
+	if want := []string{"192.0.2.53:53", "198.51.100.1:53"}; !slices.Equal(got.servers, want) {
+		t.Fatalf("servers = %v, want %v", got.servers, want)
+	}
+	if want := []string{"corp.example", "dev.example"}; !slices.Equal(got.search, want) {
+		t.Fatalf("search = %v, want %v", got.search, want)
+	}
+	if want := []string{"ndots:2", "timeout:3", "attempts:2", "edns0"}; !slices.Equal(got.options, want) {
+		t.Fatalf("options = %v, want %v", got.options, want)
+	}
+}
+
+func TestMergeSystemdFallbackAppendsNonLoopbackUpstreams(t *testing.T) {
+	primary := parseResolvConfConfig("nameserver 127.0.0.53\noptions edns0\n")
+	if !isOnlySystemdStub(primary.servers) {
+		t.Fatalf("isOnlySystemdStub(%v) = false, want true", primary.servers)
+	}
+	fallback := parseResolvConfConfig("search lan.example\nnameserver 127.0.0.1\nnameserver 192.0.2.10\nnameserver fe80::1%eth0\nnameserver 198.51.100.20\noptions ndots:2\n")
+	merged := mergeSystemdFallback(primary, fallback)
+	if want := []string{"127.0.0.53:53", "192.0.2.10:53", "[fe80::1%eth0]:53", "198.51.100.20:53"}; !slices.Equal(merged.servers, want) {
+		t.Fatalf("merged servers = %v, want %v", merged.servers, want)
+	}
+	if len(primary.servers) != 1 {
+		t.Fatalf("primary.servers was mutated: %v", primary.servers)
+	}
+	if want := []string{"lan.example"}; !slices.Equal(merged.search, want) {
+		t.Fatalf("merged search = %v, want %v", merged.search, want)
+	}
+	if want := []string{"edns0"}; !slices.Equal(merged.options, want) {
+		t.Fatalf("merged options = %v, want %v", merged.options, want)
+	}
+}

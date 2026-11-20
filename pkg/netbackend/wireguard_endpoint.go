@@ -118,6 +118,8 @@ type WireGuardEndpoint struct {
 	cfg          WireGuardConfig
 	peerEndpoint netip.AddrPort
 	upstreamDNS  []string
+	dnsSearch    []string
+	dnsOptions   []string
 	dnsSem       chan struct{}
 
 	mu        sync.Mutex
@@ -167,11 +169,16 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 		return nil, fmt.Errorf("netbackend: host DNS servers: %w", err)
 	}
 	cfg.HostDNSServers = hostDNS
+	upstreamDNS = dedupeStrings(upstreamDNS)
+	var dnsSearch, dnsOptions []string
 	if len(upstreamDNS) == 0 {
-		upstreamDNS = hostDNS
+		upstreamDNS = dedupeStrings(hostDNS)
 	}
 	if len(upstreamDNS) == 0 {
-		upstreamDNS = discoverHostDNSServers()
+		hostCfg := discoverHostDNSConfig()
+		upstreamDNS = hostCfg.servers
+		dnsSearch = hostCfg.search
+		dnsOptions = hostCfg.options
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Tuning.Duration(tuning.WGResolveTimeout))
@@ -184,6 +191,8 @@ func NewWireGuardEndpoint(cfg WireGuardConfig) (*WireGuardEndpoint, error) {
 		cfg:          cfg,
 		peerEndpoint: peerEndpoint,
 		upstreamDNS:  upstreamDNS,
+		dnsSearch:    dnsSearch,
+		dnsOptions:   dnsOptions,
 		dnsSem:       make(chan struct{}, maxConcurrentDNS),
 	}, nil
 }

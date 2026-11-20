@@ -880,8 +880,10 @@ func TestVolumeSharedAndExclusiveLockMatrix(t *testing.T) {
 		"EXT4LITE_LOCK_HELPER_MODE=try-rw",
 		"EXT4LITE_LOCK_HELPER_PATH="+path,
 	)
-	if out, err := tryRWCmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "IN_USE" {
-		t.Fatalf("child try-rw while RO open = (%q, %v), want IN_USE", string(out), err)
+	var tryRWStderr bytes.Buffer
+	tryRWCmd.Stderr = &tryRWStderr
+	if out, err := tryRWCmd.Output(); err != nil || strings.TrimSpace(string(out)) != "IN_USE" {
+		t.Fatalf("child try-rw while RO open = (%q, %v; stderr=%q), want IN_USE", string(out), err, tryRWStderr.String())
 	}
 	if err := RemoveVolumeFile(path); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("RemoveVolumeFile while RO open = %v, want ErrVolumeInUse", err)
@@ -944,8 +946,10 @@ func TestVolumeSharedAndExclusiveLockMatrix(t *testing.T) {
 		"EXT4LITE_LOCK_HELPER_MODE=try-ro",
 		"EXT4LITE_LOCK_HELPER_PATH="+path,
 	)
-	if out, err := tryROCmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "IN_USE" {
-		t.Fatalf("child try-ro while RW open = (%q, %v), want IN_USE", string(out), err)
+	var tryROStderr bytes.Buffer
+	tryROCmd.Stderr = &tryROStderr
+	if out, err := tryROCmd.Output(); err != nil || strings.TrimSpace(string(out)) != "IN_USE" {
+		t.Fatalf("child try-ro while RW open = (%q, %v; stderr=%q), want IN_USE", string(out), err, tryROStderr.String())
 	}
 	if err := RemoveVolumeFile(path); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("RemoveVolumeFile while RW open = %v, want ErrVolumeInUse", err)
