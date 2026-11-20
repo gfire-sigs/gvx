@@ -139,6 +139,8 @@ type NATForwarder struct {
 	cfg         NATConfig
 	log         *slog.Logger
 	upstreamDNS []string
+	dnsSearch   []string
+	dnsOptions  []string
 	dnsSem      chan struct{}
 	// paused is true between QuiesceForSave and ResumeAfterSave. While it is
 	// true, both ends of the eth0 link drop every packet.
@@ -152,10 +154,11 @@ type NATForwarder struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
-	// mu guards closed, which stops spawn from calling wg.Add during wg.Wait.
-	mu     sync.Mutex
-	closed bool
-	wg     sync.WaitGroup
+	// mu guards closed and guestStack, stopping spawn from calling wg.Add during wg.Wait.
+	mu         sync.Mutex
+	guestStack *stack.Stack
+	closed     bool
+	wg         sync.WaitGroup
 }
 
 // discardLogger drops every record. Forwarders use it when the caller sets no Logger.
@@ -321,6 +324,7 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 	}
 	fwd := newNATForwarder(hostStack, cfg)
 	fwd.paused = paused
+	fwd.guestStack = s
 	if err := configureNATNIC(s, Eth0NICID, checksumOffloadEndpoint{guestEP}, checksumOffloadEndpoint{hostEP}, fwd); err != nil {
 		_ = fwd.Close()
 		s.Close()
@@ -441,9 +445,13 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		dialer := &net.Dialer{Timeout: cfg.Tuning.Duration(tuning.NATDialTimeout)}
 		cfg.DialContext = dialer.DialContext
 	}
-	upstream := cfg.DNSServers
+	upstream := dedupeStrings(cfg.DNSServers)
+	var dnsSearch, dnsOptions []string
 	if len(upstream) == 0 {
-		upstream = discoverHostDNSServers()
+		hostCfg := discoverHostDNSConfig()
+		upstream = hostCfg.servers
+		dnsSearch = hostCfg.search
+		dnsOptions = hostCfg.options
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -455,6 +463,8 @@ func newNATForwarder(s *stack.Stack, cfg NATConfig) *NATForwarder {
 		cfg:         cfg,
 		log:         log,
 		upstreamDNS: upstream,
+		dnsSearch:   dnsSearch,
+		dnsOptions:  dnsOptions,
 		dnsSem:      make(chan struct{}, maxConcurrentDNS),
 		paused:      new(atomic.Bool),
 		tcpRelaySem: make(chan struct{}, maxNATTCPRelays),
@@ -659,6 +669,7 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 		nf.mu.Unlock()
 		return errors.New("netbackend: NATForwarder is closed")
 	}
+	nf.guestStack = restored
 	nf.mu.Unlock()
 
 	guestEP, hostEP := pipe.New("", "", uint32(nf.cfg.Tuning.Int(tuning.NATMTU)))

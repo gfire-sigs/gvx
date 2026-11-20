@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
@@ -57,6 +59,152 @@ var (
 	dnsGatewayAddr = netip.MustParseAddr(HostGatewayIPv4)
 	dnsGuestAddr   = netip.MustParseAddr(DefaultGuestIPv4)
 )
+
+// hostDNSConfig holds host resolver settings captured before lockdown.
+type hostDNSConfig struct {
+	servers []string
+	search  []string
+	options []string
+}
+
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// sanitizeSearchDomain validates one DNS search domain token from host config
+// so guest /etc/resolv.conf never receives whitespace or directive injection.
+func sanitizeSearchDomain(raw string) (string, bool) {
+	d := strings.TrimSuffix(strings.TrimSpace(raw), ".")
+	if d == "" || len(d) > 253 {
+		return "", false
+	}
+	if d[0] == '-' || d[0] == '.' || d[len(d)-1] == '-' {
+		return "", false
+	}
+	for i := range len(d) {
+		c := d[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' {
+			continue
+		}
+		return "", false
+	}
+	return d, true
+}
+
+// capSearchDomains enforces glibc resolv.conf(5) bounds (6 domains, 256 bytes).
+func capSearchDomains(domains []string) []string {
+	if len(domains) == 0 {
+		return nil
+	}
+	var out []string
+	total := 0
+	for _, d := range domains {
+		if len(out) >= 6 {
+			break
+		}
+		add := len(d)
+		if len(out) > 0 {
+			add++
+		}
+		if total+add > 256 {
+			break
+		}
+		out = append(out, d)
+		total += add
+	}
+	return out
+}
+
+// sanitizeResolvOption filters host resolv.conf options down to the safe subset
+// that guest stub resolvers understand.
+func sanitizeResolvOption(raw string) (string, bool) {
+	opt := strings.TrimSpace(raw)
+	switch opt {
+	case "rotate", "edns0", "single-request", "single-request-reopen", "no-tld-query", "trust-ad", "use-vc":
+		return opt, true
+	}
+	key, val, ok := strings.Cut(opt, ":")
+	if !ok {
+		return "", false
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return "", false
+	}
+	switch key {
+	case "ndots":
+		if n >= 0 && n <= 15 {
+			return fmt.Sprintf("ndots:%d", n), true
+		}
+	case "timeout":
+		if n >= 1 && n <= 30 {
+			return fmt.Sprintf("timeout:%d", n), true
+		}
+	case "attempts":
+		if n >= 1 && n <= 5 {
+			return fmt.Sprintf("attempts:%d", n), true
+		}
+	}
+	return "", false
+}
+
+// formatGuestResolvConf builds a guest /etc/resolv.conf pointing at nameserver
+// while preserving sanitized host search domains and resolver options.
+func formatGuestResolvConf(nameserver string, search, options []string) string {
+	var b strings.Builder
+	b.WriteString("nameserver ")
+	b.WriteString(nameserver)
+	b.WriteByte('\n')
+	if len(search) > 0 {
+		b.WriteString("search ")
+		b.WriteString(strings.Join(search, " "))
+		b.WriteByte('\n')
+	}
+	if len(options) > 0 {
+		b.WriteString("options ")
+		b.WriteString(strings.Join(options, " "))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// GuestResolvConf returns the /etc/resolv.conf content for a guest attached to
+// nf. It points nameserver at HostDNSIPv4 and preserves sanitized host search
+// domains and resolver options captured before lockdown.
+func (nf *NATForwarder) GuestResolvConf() string {
+	return formatGuestResolvConf(HostDNSIPv4, nf.dnsSearch, nf.dnsOptions)
+}
+
+// GuestResolvConf returns the /etc/resolv.conf content for a guest attached to
+// w. It points nameserver at HostDNSIPv4 and preserves sanitized host search
+// domains and resolver options captured before lockdown.
+func (w *WireGuardEndpoint) GuestResolvConf() string {
+	return formatGuestResolvConf(HostDNSIPv4, w.dnsSearch, w.dnsOptions)
+}
+
+func hasEth0IPv6Route(s *stack.Stack) bool {
+	if s == nil {
+		return false
+	}
+	for _, r := range s.GetRouteTable() {
+		if r.NIC == Eth0NICID && r.Destination.ID().Len() == header.IPv6AddressSize {
+			return true
+		}
+	}
+	return false
+}
 
 func (nf *NATForwarder) dnsSemaphore() chan struct{} {
 	nf.mu.Lock()
@@ -109,7 +257,7 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 				<-sem
 				connWG.Done()
 			}()
-			resp := nf.dnsRelay().answerQuery(ctx, pkt)
+			resp := nf.dnsRelay().answerQuery(ctx, pkt, false)
 			if len(resp) == 0 {
 				return
 			}
@@ -125,7 +273,7 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 }
 
 func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
-	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), nf.handleDNSQuery)
+	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), nf.handleTCPDNSQuery)
 }
 
 func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, answer func(context.Context, []byte) []byte) {
@@ -165,14 +313,22 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, 
 }
 
 type dnsRelay struct {
-	gvxAddrs   []netip.Addr
-	hasGateway bool
-	isolateLAN bool
-	lookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
-	servers    []string
-	dials      []func(ctx context.Context, network, addr string) (net.Conn, error)
-	log        *slog.Logger
-	tune       tuning.Values
+	gvxAddrs    []netip.Addr
+	hasGateway  bool
+	ipv6Enabled bool
+	isolateLAN  bool
+	lookupHost  func(ctx context.Context, host string) ([]netip.Addr, error)
+	servers     []string
+	dials       []func(ctx context.Context, network, addr string) (net.Conn, error)
+	log         *slog.Logger
+	tune        tuning.Values
+}
+
+func (nf *NATForwarder) hasGuestIPv6() bool {
+	nf.mu.Lock()
+	s := nf.guestStack
+	nf.mu.Unlock()
+	return hasEth0IPv6Route(s)
 }
 
 func (nf *NATForwarder) dnsRelay() dnsRelay {
@@ -182,14 +338,15 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		dialFn = d.DialContext
 	}
 	return dnsRelay{
-		gvxAddrs:   []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)},
-		hasGateway: true,
-		isolateLAN: nf.cfg.IsolateLAN,
-		lookupHost: nf.cfg.LookupHost,
-		servers:    nf.upstreamDNS,
-		dials:      []func(context.Context, string, string) (net.Conn, error){dialFn},
-		log:        nf.log,
-		tune:       nf.cfg.Tuning,
+		gvxAddrs:    []netip.Addr{netip.MustParseAddr(DefaultGuestIPv4)},
+		hasGateway:  true,
+		ipv6Enabled: nf.hasGuestIPv6(),
+		isolateLAN:  nf.cfg.IsolateLAN,
+		lookupHost:  nf.cfg.LookupHost,
+		servers:     nf.upstreamDNS,
+		dials:       []func(context.Context, string, string) (net.Conn, error){dialFn},
+		log:         nf.log,
+		tune:        nf.cfg.Tuning,
 	}
 }
 
@@ -211,19 +368,30 @@ func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
 		dials[0], dials[1] = stackDial, hostDialer.DialContext
 	}
 	return dnsRelay{
-		gvxAddrs:   gvxAddrs,
-		lookupHost: w.cfg.LookupHost,
-		servers:    w.upstreamDNS,
-		dials:      dials,
-		log:        log,
-		tune:       w.cfg.Tuning,
+		gvxAddrs:    gvxAddrs,
+		ipv6Enabled: w.cfg.GuestIPv6.IsValid(),
+		lookupHost:  w.cfg.LookupHost,
+		servers:     w.upstreamDNS,
+		dials:       dials,
+		log:         log,
+		tune:        w.cfg.Tuning,
 	}
 }
 
-// handleDNSQuery answers one DNS message. The relay owns a few names and
-// resolves A and AAAA queries through the LookupHost hook. It forwards every
-// other query to the host DNS servers and answers SERVFAIL when none replies.
+// handleDNSQuery answers one UDP DNS message. The relay owns internal names
+// and resolves A and AAAA queries through the LookupHost hook. It forwards
+// other queries to the host DNS servers and answers SERVFAIL when none replies.
 func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
+	return nf.handleDNSQueryProto(ctx, req, false)
+}
+
+// handleTCPDNSQuery answers one TCP DNS message, forwarding upstream directly
+// over TCP rather than UDP.
+func (nf *NATForwarder) handleTCPDNSQuery(ctx context.Context, req []byte) []byte {
+	return nf.handleDNSQueryProto(ctx, req, true)
+}
+
+func (nf *NATForwarder) handleDNSQueryProto(ctx context.Context, req []byte, viaTCP bool) []byte {
 	sem := nf.dnsSemaphore()
 	select {
 	case sem <- struct{}{}:
@@ -231,17 +399,17 @@ func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
 	case <-ctx.Done():
 		return nil
 	}
-	return nf.dnsRelay().answerQuery(ctx, req)
+	return nf.dnsRelay().answerQuery(ctx, req, viaTCP)
 }
 
 // forwardRawDNSUpstream sends the wire query to each host DNS server in turn
 // and returns the first usable answer. A server that fails, answers SERVFAIL,
 // or answers REFUSED does not stop the search.
 func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
-	return nf.dnsRelay().forwardRawUpstream(ctx, req)
+	return nf.dnsRelay().forwardRawUpstream(ctx, req, false)
 }
 
-func (r dnsRelay) answerQuery(ctx context.Context, req []byte) []byte {
+func (r dnsRelay) answerQuery(ctx context.Context, req []byte, viaTCP bool) []byte {
 	reqHdr, q, hdrOK, err := parseDNSQuery(req)
 	if !hdrOK {
 		return nil
@@ -251,20 +419,37 @@ func (r dnsRelay) answerQuery(ctx context.Context, req []byte) []byte {
 	}
 	name := q.Name.String()
 
-	if q.Class == dnsmessage.ClassINET && (q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA) {
-		addrs, found, handled, lookupErr := r.lookupLocalAddrs(ctx, name)
-		if lookupErr != nil && r.log != nil {
-			r.log.Debug("netbackend: DNS lookup hook failed", "name", name, "error", lookupErr)
-		}
-		if handled {
+	if q.Class == dnsmessage.ClassINET {
+		if addrs, found, owned := r.lookupOwnName(name); owned {
 			if !found {
 				return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
 			}
-			return buildDNSAddressResponse(reqHdr, q, addrs)
+			if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA {
+				return buildDNSAddressResponse(reqHdr, q, addrs, true)
+			}
+			return buildDNSAddressResponse(reqHdr, q, nil, true)
+		}
+
+		if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA {
+			if !r.ipv6Enabled && q.Type == dnsmessage.TypeAAAA {
+				return buildDNSAddressResponse(reqHdr, q, nil, false)
+			}
+			if r.lookupHost != nil {
+				addrs, found, handled, lookupErr := r.lookupHookAddrs(ctx, name)
+				if lookupErr != nil && r.log != nil {
+					r.log.Debug("netbackend: DNS lookup hook failed", "name", name, "error", lookupErr)
+				}
+				if handled {
+					if !found {
+						return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
+					}
+					return buildDNSAddressResponse(reqHdr, q, addrs, true)
+				}
+			}
 		}
 	}
 
-	resp, err := r.forwardRawUpstream(ctx, req)
+	resp, err := r.forwardRawUpstream(ctx, req, viaTCP)
 	if err != nil {
 		if r.log != nil {
 			r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
@@ -274,31 +459,33 @@ func (r dnsRelay) answerQuery(ctx context.Context, req []byte) []byte {
 	return resp
 }
 
-// lookupLocalAddrs resolves the names that the relay answers without an
-// upstream server. handled is false when the relay must forward the query.
-// found is false for a name that does not exist.
-func (r dnsRelay) lookupLocalAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
+// lookupOwnName resolves the internal names that the relay owns authoritatively.
+// owned is false when the relay must delegate the query to the hook or upstream.
+// found is false when the owned name is blocked (for example under IsolateLAN).
+func (r dnsRelay) lookupOwnName(qname string) (addrs []netip.Addr, found, owned bool) {
 	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
 	switch clean {
 	case "localhost", "localhost.localdomain":
 		return []netip.Addr{
 			netip.MustParseAddr("127.0.0.1"),
 			netip.MustParseAddr("::1"),
-		}, true, true, nil
+		}, true, true
 	case "host.docker.internal", "gateway.docker.internal":
 		if r.hasGateway {
 			if r.isolateLAN {
-				return nil, false, true, nil
+				return nil, false, true
 			}
-			return []netip.Addr{netip.MustParseAddr(HostGatewayIPv4)}, true, true, nil
+			return []netip.Addr{netip.MustParseAddr(HostGatewayIPv4)}, true, true
 		}
 	case "gvx":
-		return r.gvxAddrs, true, true, nil
+		return r.gvxAddrs, true, true
 	}
+	return nil, false, false
+}
 
-	if r.lookupHost == nil {
-		return nil, false, false, nil
-	}
+// lookupHookAddrs resolves qname through the configured LookupHost hook.
+func (r dnsRelay) lookupHookAddrs(ctx context.Context, qname string) (addrs []netip.Addr, found, handled bool, err error) {
+	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
 	rctx, cancel := context.WithTimeout(ctx, r.tune.Duration(tuning.DNSTimeout))
 	defer cancel()
 
@@ -348,7 +535,7 @@ func randomDNSTxID() (uint16, error) {
 	return binary.BigEndian.Uint16(b[:]), nil
 }
 
-func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, error) {
+func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP bool) ([]byte, error) {
 	if len(r.servers) == 0 {
 		return nil, errNoDNSServers
 	}
@@ -362,9 +549,17 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			resp, respHdr, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
-			if err == nil && respHdr.Truncated {
+			var (
+				resp    []byte
+				respHdr dnsmessage.Header
+			)
+			if viaTCP {
 				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+			} else {
+				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+				if err == nil && respHdr.Truncated {
+					resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+				}
 			}
 			if err != nil {
 				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
@@ -564,7 +759,7 @@ func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn
 				<-sem
 				w.dnsWG.Done()
 			}()
-			resp := w.dnsRelay(log).answerQuery(ctx, pkt)
+			resp := w.dnsRelay(log).answerQuery(ctx, pkt, false)
 			if len(resp) > 0 {
 				writeMu.Lock()
 				_ = conn.SetWriteDeadline(time.Now().Add(w.cfg.Tuning.Duration(tuning.DNSTimeout)))
@@ -590,7 +785,7 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 		case <-qctx.Done():
 			return nil
 		}
-		return w.dnsRelay(log).answerQuery(qctx, req)
+		return w.dnsRelay(log).answerQuery(qctx, req, true)
 	}
 	for {
 		conn, err := ln.Accept()
@@ -663,11 +858,11 @@ func buildDNSErrorResponse(reqHdr dnsmessage.Header, q *dnsmessage.Question, rco
 	return out
 }
 
-func buildDNSAddressResponse(reqHdr dnsmessage.Header, q dnsmessage.Question, addrs []netip.Addr) []byte {
+func buildDNSAddressResponse(reqHdr dnsmessage.Header, q dnsmessage.Question, addrs []netip.Addr, authoritative bool) []byte {
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		ID:                 reqHdr.ID,
 		Response:           true,
-		Authoritative:      true,
+		Authoritative:      authoritative,
 		RecursionDesired:   reqHdr.RecursionDesired,
 		RecursionAvailable: true,
 		RCode:              dnsmessage.RCodeSuccess,

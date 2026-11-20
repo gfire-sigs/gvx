@@ -69,7 +69,10 @@ type Sandbox struct {
 	portForwarder     *netbackend.PortForwarder
 	wgEndpoint        *netbackend.WireGuardEndpoint
 	wgPeerPort        uint16
-	lockdown          hostlockdown.Status
+	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
+	// host resolver before hostlockdown.Apply runs.
+	guestResolvConf string
+	lockdown        hostlockdown.Status
 	// hostCARoots holds the DER roots that Config.HostCACerts copies into the
 	// guest. New reads them before the lockdown.
 	hostCARoots [][]byte
