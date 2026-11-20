@@ -17,11 +17,86 @@
 package pgalloc
 
 import (
+	"errors"
+	"fmt"
+
 	"z.gfire.dev/gvx/internal/xsys/unix"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
+
+type windowsBacking struct{}
+
+func (f *MemoryFile) truncateBackingFile(size int64) error {
+	return f.file.Truncate(size)
+}
+
+func (f *MemoryFile) extendBackingChunksLocked(oldFileSize, newFileSize uint64, newChunks []chunkInfo) error {
+	if err := f.file.Truncate(int64(newFileSize)); err != nil {
+		return err
+	}
+	if len(newChunks) == 0 {
+		return nil
+	}
+	size := uintptr(uint64(len(newChunks)) * chunkSize)
+	m, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
+		0,
+		size,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED,
+		f.file.Fd(),
+		uintptr(oldFileSize))
+	if errno != 0 {
+		return errno
+	}
+	for i := range newChunks {
+		newChunks[i].mapping = m
+		m += chunkSize
+	}
+	return nil
+}
+
+func (f *MemoryFile) unmapBackingChunks(chunks []chunkInfo) error {
+	var errs []error
+	for i := range chunks {
+		chunk := &chunks[i]
+		if chunk.mapping == 0 {
+			continue
+		}
+		_, _, errno := unix.Syscall(unix.SYS_MUNMAP, chunk.mapping, chunkSize, 0)
+		if errno != 0 {
+			log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)
+			errs = append(errs, fmt.Errorf("chunk %d (%#x): %w", i, chunk.mapping, errno))
+		}
+		chunk.mapping = 0
+	}
+	return errors.Join(errs...)
+}
+
+func (*MemoryFile) commitRange(memmap.FileRange) error {
+	return nil
+}
+
+func (f *MemoryFile) decommitReleasedRange(fr memmap.FileRange) {
+	f.decommitRange(fr)
+}
+
+func (f *MemoryFile) decommitOnDestroyLocked(fr memmap.FileRange) {
+	f.decommitRange(fr)
+}
+
+func (f *MemoryFile) totalUsage() (uint64, error) {
+	// Stat the underlying file to discover the underlying usage. stat(2)
+	// always reports the allocated block count in units of 512 bytes. This
+	// includes pages in the page cache and swapped pages.
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(f.file.Fd()), &stat); err != nil {
+		return 0, err
+	}
+	return uint64(stat.Blocks * 512), nil
+}
 
 // expandReleaseRangeLocked extends fr to cover the start and end host pages
 // when their remaining 4KB sub-pages are already free in f.unfreeSmall. It

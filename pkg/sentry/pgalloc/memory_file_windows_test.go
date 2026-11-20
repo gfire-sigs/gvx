@@ -8,6 +8,7 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -202,53 +203,221 @@ func BenchmarkMemoryFileAllocateMapDecommit(b *testing.B) {
 }
 
 func TestWindowsMultiChunkLoadFromAndDestroyReleasesKernelViews(t *testing.T) {
-	ctx := context.Background()
-	fx := buildMultiChunkFixture(t)
-
-	var buf bytes.Buffer
-	if err := fx.mf.SaveTo(ctx, &buf, &SaveOpts{ExcludeCommittedZeroPages: true}); err != nil {
-		t.Fatalf("SaveTo: %v", err)
-	}
-
-	restored := newTestMemoryFile(t, MemoryFileOpts{ExpectHugepages: true})
-	if err := restored.LoadFrom(ctx, &buf, &LoadOpts{}); err != nil {
-		t.Fatalf("LoadFrom: %v", err)
-	}
-	chunks := append([]chunkInfo(nil), restored.chunksLoad()...)
-	if len(chunks) < 2 {
-		t.Fatalf("len(chunks) = %d, want >= 2", len(chunks))
-	}
 	const (
-		winMemFree   = 0x10000 // MEM_FREE from winnt.h
-		winMemMapped = 0x40000 // MEM_MAPPED from winnt.h
+		winMemFree    = 0x10000 // MEM_FREE from winnt.h
+		winMemPrivate = 0x20000 // MEM_PRIVATE from winnt.h
+		winMemMapped  = 0x40000 // MEM_MAPPED from winnt.h
 	)
-	for i, c := range chunks {
-		var info windows.MemoryBasicInformation
-		if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
-			t.Fatalf("VirtualQuery(chunk %d at %#x): %v", i, c.mapping, err)
-		}
-		if info.State != windows.MEM_COMMIT || info.Type != winMemMapped || info.AllocationBase != c.mapping {
-			t.Fatalf("chunk %d before Destroy: State=%#x Type=%#x AllocationBase=%#x, want MEM_COMMIT (%#x) MEM_MAPPED (%#x) at %#x",
-				i, info.State, info.Type, info.AllocationBase, windows.MEM_COMMIT, winMemMapped, c.mapping)
-		}
+	for _, tc := range []struct {
+		name          string
+		sharedSection bool
+		wantType      uint32
+	}{
+		{name: "private", sharedSection: false, wantType: winMemPrivate},
+		{name: "shared_section", sharedSection: true, wantType: winMemMapped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fx := buildMultiChunkFixture(t)
+
+			var buf bytes.Buffer
+			if err := fx.mf.SaveTo(ctx, &buf, &SaveOpts{ExcludeCommittedZeroPages: true}); err != nil {
+				t.Fatalf("SaveTo: %v", err)
+			}
+
+			restored := newTestMemoryFile(t, MemoryFileOpts{
+				ExpectHugepages: true,
+				SharedSection:   tc.sharedSection,
+			})
+			if err := restored.LoadFrom(ctx, &buf, &LoadOpts{}); err != nil {
+				t.Fatalf("LoadFrom: %v", err)
+			}
+			chunks := append([]chunkInfo(nil), restored.chunksLoad()...)
+			if len(chunks) < 2 {
+				t.Fatalf("len(chunks) = %d, want >= 2", len(chunks))
+			}
+			for i, c := range chunks {
+				var info windows.MemoryBasicInformation
+				if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
+					t.Fatalf("VirtualQuery(chunk %d at %#x): %v", i, c.mapping, err)
+				}
+				if (info.State != windows.MEM_COMMIT && info.State != windows.MEM_RESERVE) || info.Type != tc.wantType || info.AllocationBase != c.mapping {
+					t.Fatalf("chunk %d before Destroy: State=%#x Type=%#x AllocationBase=%#x, want MEM_COMMIT/MEM_RESERVE Type=%#x at %#x",
+						i, info.State, info.Type, info.AllocationBase, tc.wantType, c.mapping)
+				}
+			}
+
+			fx.verifyMemoryFile(t, restored)
+			fx.releaseAndDestroy(t, restored)
+
+			for i, c := range chunks {
+				var info windows.MemoryBasicInformation
+				if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
+					t.Fatalf("VirtualQuery(chunk %d at %#x after Destroy): %v", i, c.mapping, err)
+				}
+				// Another runtime VirtualAlloc call can claim the lowest freed VA hole
+				// before VirtualQuery runs. Only a surviving 1 GiB allocation at the
+				// chunk base means Destroy leaked the chunk mapping.
+				if info.State != winMemFree && info.Type == tc.wantType && info.AllocationBase == c.mapping && info.RegionSize >= chunkSize {
+					t.Fatalf("chunk %d still mapped after Destroy: State=%#x Type=%#x AllocationBase=%#x RegionSize=%#x",
+						i, info.State, info.Type, info.AllocationBase, info.RegionSize)
+				}
+			}
+
+			fx.releaseAndDestroy(t, fx.mf)
+		})
 	}
+}
 
-	fx.verifyMemoryFile(t, restored)
-	fx.releaseAndDestroy(t, restored)
+type processMemoryCountersEx struct {
+	CB                         uint32
+	PageFaultCount             uint32
+	PeakWorkingSetSize         uintptr
+	WorkingSetSize             uintptr
+	QuotaPeakPagedPoolUsage    uintptr
+	QuotaPagedPoolUsage        uintptr
+	QuotaPeakNonPagedPoolUsage uintptr
+	QuotaNonPagedPoolUsage     uintptr
+	PagefileUsage              uintptr
+	PeakPagefileUsage          uintptr
+	PrivateUsage               uintptr
+}
 
-	for i, c := range chunks {
-		var info windows.MemoryBasicInformation
-		if err := windows.VirtualQuery(c.mapping, &info, unsafe.Sizeof(info)); err != nil {
-			t.Fatalf("VirtualQuery(chunk %d at %#x after Destroy): %v", i, c.mapping, err)
-		}
-		// Another runtime VirtualAlloc call can claim the lowest freed VA hole
-		// before VirtualQuery runs. Only a surviving MEM_MAPPED region at the
-		// chunk base means UnmapViewOfFile leaked the section view.
-		if info.State != winMemFree && info.Type == winMemMapped && info.AllocationBase == c.mapping {
-			t.Fatalf("chunk %d still mapped after Destroy: State=%#x Type=%#x AllocationBase=%#x RegionSize=%#x",
-				i, info.State, info.Type, info.AllocationBase, info.RegionSize)
-		}
+type fileStandardInfo struct {
+	AllocationSize int64
+	EndOfFile      int64
+	NumberOfLinks  uint32
+	DeletePending  byte
+	Directory      byte
+	_              [2]byte
+}
+
+var procGetProcessMemoryInfo = windows.NewLazySystemDLL("kernel32.dll").NewProc("K32GetProcessMemoryInfo")
+
+func queryProcessMemory(t *testing.T) processMemoryCountersEx {
+	t.Helper()
+	var pmc processMemoryCountersEx
+	pmc.CB = uint32(unsafe.Sizeof(pmc))
+	r1, _, err := procGetProcessMemoryInfo.Call(
+		uintptr(windows.CurrentProcess()),
+		uintptr(unsafe.Pointer(&pmc)),
+		uintptr(pmc.CB),
+	)
+	if r1 == 0 {
+		t.Fatalf("K32GetProcessMemoryInfo: %v", err)
 	}
+	return pmc
+}
 
-	fx.releaseAndDestroy(t, fx.mf)
+func queryFileStandardInfo(t *testing.T, h windows.Handle) fileStandardInfo {
+	t.Helper()
+	var info fileStandardInfo
+	if err := windows.GetFileInformationByHandleEx(
+		h,
+		windows.FileStandardInfo,
+		(*byte)(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		t.Fatalf("GetFileInformationByHandleEx(FileStandardInfo): %v", err)
+	}
+	return info
+}
+
+func waitReleaserIdle(t *testing.T, mf *MemoryFile) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		mf.mu.Lock()
+		busy := mf.haveWaste
+		mf.mu.Unlock()
+		if !busy {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("releaser did not drain waste within 20s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestWindowsMemoryFileReclaimsWorkingSetAndUsesZeroDisk(t *testing.T) {
+	const allocBytes = uint64(128 << 20)
+	for _, tc := range []struct {
+		name           string
+		sharedSection  bool
+		checkCommitDec bool
+	}{
+		{name: "private", sharedSection: false, checkCommitDec: true},
+		{name: "shared_section", sharedSection: true, checkCommitDec: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mf, err := NewDefaultMemoryFile(MemoryFileOpts{
+				DisableMemoryAccounting: true,
+				SharedSection:           tc.sharedSection,
+			})
+			if err != nil {
+				t.Fatalf("NewDefaultMemoryFile: %v", err)
+			}
+			defer mf.Destroy()
+
+			fr, err := mf.Allocate(allocBytes, AllocOpts{Kind: usage.Anonymous})
+			if err != nil {
+				t.Fatalf("Allocate(%d): %v", allocBytes, err)
+			}
+			bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+			if err != nil {
+				t.Fatalf("MapInternal: %v", err)
+			}
+			slice := bs.Head().ToSlice()
+			for i := 0; i < len(slice); i += hostarch.PageSize {
+				slice[i] = 0x5A
+			}
+
+			finfo := queryFileStandardInfo(t, windows.Handle(mf.FD()))
+			if finfo.EndOfFile != 0 || finfo.AllocationSize != 0 {
+				t.Fatalf("backing temp file grew on disk: EndOfFile=%d AllocationSize=%d, want (0, 0)",
+					finfo.EndOfFile, finfo.AllocationSize)
+			}
+
+			before := queryProcessMemory(t)
+			mf.DecRef(fr)
+			waitReleaserIdle(t, mf)
+			after := queryProcessMemory(t)
+
+			t.Logf("%s: WorkingSet %d MiB -> %d MiB, PrivateUsage %d MiB -> %d MiB",
+				tc.name,
+				before.WorkingSetSize>>20, after.WorkingSetSize>>20,
+				before.PrivateUsage>>20, after.PrivateUsage>>20,
+			)
+
+			const minDrop = uintptr(allocBytes / 2)
+			if before.WorkingSetSize <= after.WorkingSetSize || before.WorkingSetSize-after.WorkingSetSize < minDrop {
+				t.Fatalf("WorkingSetSize did not drop after DecRef: before=%d MiB after=%d MiB (want drop >= %d MiB)",
+					before.WorkingSetSize>>20, after.WorkingSetSize>>20, minDrop>>20)
+			}
+			if tc.checkCommitDec {
+				if before.PrivateUsage <= after.PrivateUsage || before.PrivateUsage-after.PrivateUsage < minDrop {
+					t.Fatalf("PrivateUsage (commit charge) did not drop after DecRef: before=%d MiB after=%d MiB (want drop >= %d MiB)",
+						before.PrivateUsage>>20, after.PrivateUsage>>20, minDrop>>20)
+				}
+			}
+
+			// Re-allocate and verify every returned page reads as zero.
+			fr2, err := mf.Allocate(allocBytes, AllocOpts{Kind: usage.Anonymous})
+			if err != nil {
+				t.Fatalf("second Allocate: %v", err)
+			}
+			defer mf.DecRef(fr2)
+			bs2, err := mf.MapInternal(fr2, hostarch.Read)
+			if err != nil {
+				t.Fatalf("second MapInternal: %v", err)
+			}
+			slice2 := bs2.Head().ToSlice()
+			for i := 0; i < len(slice2); i += hostarch.PageSize {
+				if slice2[i] != 0 {
+					t.Fatalf("re-allocated page offset %#x = %#x, want 0", i, slice2[i])
+				}
+			}
+		})
+	}
 }

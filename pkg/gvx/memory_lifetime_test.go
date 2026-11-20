@@ -75,7 +75,7 @@ func TestSandboxCloseKeepsBackingUntilPlatformCloses(t *testing.T) {
 func testSandboxBackingLifetime(t *testing.T, consumed bool, closeErr error) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
-		mf, err := createKernelMemoryFile(0)
+		mf, err := createKernelMemoryFile(0, false)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -410,6 +410,13 @@ type MemoryFileOpts struct {
 	// limit sets it so that a corrupt checkpoint cannot map more address
 	// space than the sandbox may use.
 	MaxLoadBytes uint64
+
+	// SharedSection, on Windows, backs each chunk with an anonymous
+	// pagefile-backed section so cross-process platforms such as Windows
+	// systrap can map views into stub processes with MapViewOfFile3. When
+	// false on Windows, each chunk uses anonymous VirtualAlloc memory so
+	// released ranges can be decommitted with VirtualFree(MEM_DECOMMIT).
+	SharedSection bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -525,7 +532,7 @@ func (f *MemoryFile) releaserDestroyLocked() {
 
 	if f.opts.DecommitOnDestroy {
 		if chunks := f.chunksLoad(); len(chunks) != 0 {
-			f.decommitRange(memmap.FileRange{0, uint64(len(chunks)) * chunkSize})
+			f.decommitOnDestroyLocked(memmap.FileRange{0, uint64(len(chunks)) * chunkSize})
 		}
 	}
 
@@ -824,6 +831,9 @@ retryFree:
 		// Retry the allocation using new chunks.
 		goto retryFree
 	}
+	if err := f.commitRange(fr); err != nil {
+		return memmap.FileRange{}, err
+	}
 	unfree.Insert(ufgap, fr, unfreeInfo{refs: 1})
 	// These pages should all be known-decommitted; mark them
 	// unknown-commitment, since they can be concurrently committed by the
@@ -944,10 +954,7 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 		newChunks[i].huge = alloc.huge
 	}
 	if f.file != nil {
-		if err := f.file.Truncate(int64(newFileSize)); err != nil {
-			return err
-		}
-		if err := mapMemoryFileChunks(f.file.Fd(), oldFileSize, newChunks[oldNrChunks:]); err != nil {
+		if err := f.extendBackingChunksLocked(oldFileSize, newFileSize, newChunks[oldNrChunks:]); err != nil {
 			return err
 		}
 		for i := oldNrChunks; i < newNrChunks; i++ {
@@ -1408,7 +1415,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 		// freed.
 		decommitFR := f.expandReleaseRangeLocked(fr)
 		f.mu.Unlock()
-		f.decommitOrManuallyZero(decommitFR)
+		f.decommitReleasedRange(decommitFR)
 		f.mu.Lock()
 		f.unfreeSmall.RemoveFullRange(decommitFR)
 		return
@@ -1445,13 +1452,13 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 			}
 			hugeFR := memmap.FileRange{firstHugeStart, firstHugeEnd}
 			f.mu.Unlock()
-			f.decommitOrManuallyZero(hugeFR)
+			f.decommitReleasedRange(hugeFR)
 			f.mu.Lock()
 			f.unfreeHuge.RemoveFullRange(hugeFR)
 		} else {
 			f.subreleased[firstHugeStart] = newSubrel
 			f.mu.Unlock()
-			f.decommitOrManuallyZero(fr)
+			f.decommitReleasedRange(fr)
 			f.mu.Lock()
 		}
 		return
@@ -1501,7 +1508,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 		}
 	}
 	f.mu.Unlock()
-	f.decommitOrManuallyZero(decommitFR)
+	f.decommitReleasedRange(decommitFR)
 	f.mu.Lock()
 	if freeFR.Length() != 0 {
 		f.unfreeHuge.RemoveFullRange(freeFR)
@@ -1858,14 +1865,7 @@ func (updateUsageDuringSaveErr) Error() string {
 // Mapped (which is external to MemoryFile). This is generally much cheaper
 // than UpdateUsage, but will not provide a fine-grained breakdown.
 func (f *MemoryFile) TotalUsage() (uint64, error) {
-	// Stat the underlying file to discover the underlying usage. stat(2)
-	// always reports the allocated block count in units of 512 bytes. This
-	// includes pages in the page cache and swapped pages.
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(f.file.Fd()), &stat); err != nil {
-		return 0, err
-	}
-	return uint64(stat.Blocks * 512), nil
+	return f.totalUsage()
 }
 
 // TotalSize returns the current size of the backing file in bytes, which is an

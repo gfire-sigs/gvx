@@ -44,6 +44,9 @@ const (
 // sub-page faults. The scan for memory cgroups therefore runs whenever the
 // host page exceeds 4 KB or the host is neither Linux nor Android.
 func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
 	if memCgIDs == nil {
 		return true
 	}

@@ -1174,18 +1174,22 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
 	fileSize := uint64(len(chunks)) * chunkSize
-	if err := f.file.Truncate(int64(fileSize)); err != nil {
-		return fmt.Errorf("failed to truncate MemoryFile: %w", err)
-	}
 	// Obtain chunk mappings, then madvise them concurrently with loading data.
 	var (
 		madviseEnd  atomicbitops.Uint64
 		madviseChan = make(chan struct{}, 1)
 		madviseWG   sync.WaitGroup
 	)
-	if len(chunks) != 0 {
-		if err := mapMemoryFileChunks(f.file.Fd(), 0, chunks); err != nil {
+	if len(chunks) == 0 {
+		if err := f.truncateBackingFile(0); err != nil {
+			return fmt.Errorf("failed to truncate MemoryFile: %w", err)
+		}
+	} else {
+		if err := f.extendBackingChunksLocked(0, fileSize, chunks); err != nil {
 			return fmt.Errorf("failed to mmap MemoryFile: %w", err)
+		}
+		if err := f.commitLoadedRanges(); err != nil {
+			return fmt.Errorf("failed to commit MemoryFile ranges: %w", err)
 		}
 		mfTimeline.Reached("mmaped chunks")
 		madviseWG.Add(1)
