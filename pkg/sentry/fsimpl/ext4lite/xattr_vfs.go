@@ -56,9 +56,9 @@ func (i *inode) setXattr(creds *auth.Credentials, mnt *vfs.Mount, opts *vfs.SetX
 	}
 	create := opts.Flags&linux.XATTR_CREATE != 0
 	replace := opts.Flags&linux.XATTR_REPLACE != 0
-	return i.fs.writeOp(mnt, func() error {
-		if err := i.n.setXattr(opts.Name, []byte(value), create, replace); err != nil {
-			return toLinuxErr(err)
+	return i.fs.writeOp(mnt, func(policy allocPolicy) error {
+		if err := i.n.setXattrPolicy(opts.Name, []byte(value), create, replace, policy); err != nil {
+			return toWriteOpErr(err)
 		}
 		i.touchCtime()
 		return nil
@@ -70,9 +70,9 @@ func (i *inode) removeXattr(creds *auth.Credentials, mnt *vfs.Mount, name string
 	if err := fsutilx.CheckRemoveXattr(creds, mode, uid, gid, name); err != nil {
 		return err
 	}
-	return i.fs.writeOp(mnt, func() error {
-		if err := i.n.removeXattr(name); err != nil {
-			return toLinuxErr(err)
+	return i.fs.writeOp(mnt, func(policy allocPolicy) error {
+		if err := i.n.removeXattrPolicy(name, policy); err != nil {
+			return toWriteOpErr(err)
 		}
 		i.touchCtime()
 		return nil

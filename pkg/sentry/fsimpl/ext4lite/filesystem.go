@@ -21,6 +21,7 @@ package ext4lite
 
 import (
 	"errors"
+	"math"
 	"sync"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -256,32 +257,52 @@ func (fs *filesystem) endWrite(mnt *vfs.Mount) {
 	mnt.EndWrite()
 }
 
-// retryHeld runs op. An operation that fails with ENOSPC while freed space waits
-// for a flush gets one more try after the flush. op must return with the gate
-// open and with no node lock. It can run under fs.mu, because a flush takes no
-// filesystem lock. The retry depends on the volume state and not on a flag that
-// the failed call set, because parallel operations would overwrite such a flag.
-func (fs *filesystem) retryHeld(op func() error) error {
-	err := op()
-	if err == nil || !linuxerr.Equals(linuxerr.ENOSPC, err) || !fs.v.hasHeld() {
+// retryHeld runs op with allocReuseHeld first. When op fails because freed
+// space waits for a flush, it flushes the volume and retries once with
+// allocGrowHeld so concurrent churn does not fail with ENOSPC if another writer
+// claims the released space first. op must return with the gate open and with no
+// node lock.
+func (fs *filesystem) retryHeld(op func(policy allocPolicy) error) error {
+	err := op(allocReuseHeld)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errSpaceHeld) && (!linuxerr.Equals(linuxerr.ENOSPC, err) || !fs.v.hasHeld()) {
+		return toLinuxErr(err)
+	}
+	if fs.v.hasHeld() {
+		if serr := fs.v.sync(); serr != nil {
+			return toLinuxErr(serr)
+		}
+	}
+	return toLinuxErr(op(allocGrowHeld))
+}
+
+// retryFlushHeld runs flush, syncs the volume if held space blocked the flush,
+// and retries once without discarding deferred write-back errors.
+func (fs *filesystem) retryFlushHeld(flush func() error) error {
+	err := flush()
+	if !errors.Is(err, errSpaceHeld) {
 		return err
 	}
-	if serr := fs.v.sync(); serr != nil {
-		return toLinuxErr(serr)
+	if fs.v.hasHeld() {
+		if serr := fs.v.sync(); serr != nil {
+			return serr
+		}
 	}
-	return op()
+	return flush()
 }
 
 // writeOp runs op as one guest operation that changes the volume. op runs in the
 // gate, and the wrapper retries it once after a flush when the volume ran out of
 // space that a flush frees.
-func (fs *filesystem) writeOp(mnt *vfs.Mount, op func() error) error {
-	return fs.retryHeld(func() error {
+func (fs *filesystem) writeOp(mnt *vfs.Mount, op func(policy allocPolicy) error) error {
+	return fs.retryHeld(func(policy allocPolicy) error {
 		if err := fs.beginWrite(mnt); err != nil {
 			return err
 		}
 		defer fs.endWrite(mnt)
-		return op()
+		return op(policy)
 	})
 }
 
@@ -355,15 +376,13 @@ func (fs *filesystem) syncMapped() error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, ino := range list {
-		err := ino.data.SyncData()
-		if errors.Is(err, errSpaceHeld) && fs.v.hasHeld() {
-			// The write-back found no free block while freed blocks wait for a
-			// flush. The flush runs with the gate open.
-			if serr := fs.v.sync(); serr == nil {
-				err = ino.data.SyncData()
-			}
-		}
-		if err != nil {
+		flushErr := fs.retryFlushHeld(func() error {
+			return ino.flushMapped(0, math.MaxUint64)
+		})
+		ino.wmu.Lock()
+		wbErr := ino.data.TakeWritebackErr()
+		ino.wmu.Unlock()
+		if err := errors.Join(wbErr, flushErr); err != nil {
 			errs = append(errs, err)
 		}
 	}

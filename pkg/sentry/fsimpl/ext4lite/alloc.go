@@ -22,9 +22,24 @@ import (
 )
 
 // errSpaceHeld reports that the volume has no allocatable block or inode,
-// but freed blocks or inodes wait for the next flush. The caller flushes and
-// tries again. Without a retry the error reads as ENOSPC.
+// but freed blocks or inodes wait for the next flush. Flush-capable callers
+// flush and retry once; callers that cannot flush grow the volume first under
+// allocGrowHeld and only receive errSpaceHeld when the host cannot grow.
+// Without a retry the error reads as ENOSPC.
 var errSpaceHeld = errors.New("ext4lite: free space waits for the next flush")
+
+// allocPolicy controls how the block allocator behaves when no group has a free
+// block while freed blocks wait for the next flush.
+type allocPolicy uint8
+
+const (
+	// allocReuseHeld returns errSpaceHeld while freed blocks wait for a flush,
+	// so flush-capable callers flush and reuse existing groups before growing.
+	allocReuseHeld allocPolicy = iota
+	// allocGrowHeld appends a new group even while freed blocks wait for a flush,
+	// returning errSpaceHeld only when the volume cannot grow.
+	allocGrowHeld
+)
 
 // corrupt wraps linuxerr.EUCLEAN with a description of the failed check.
 func corrupt(format string, args ...any) error {
@@ -143,17 +158,21 @@ func metaBlocksOf(idx uint32) uint32 { return uint32(groupOverhead(idx)) + 2 + i
 // dense and trailing groups empty out. It returns the start and the length of
 // the run, which is at least 1.
 func (v *volume) allocBlocks(goal uint64, want uint32) (uint64, uint32, error) {
+	return v.allocBlocksPolicy(goal, want, allocReuseHeld)
+}
+
+func (v *volume) allocBlocksPolicy(goal uint64, want uint32, policy allocPolicy) (uint64, uint32, error) {
 	if want == 0 {
 		return 0, 0, nil
 	}
 	v.checkGate()
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return v.allocBlocksLocked(goal, want)
+	return v.allocBlocksLocked(goal, want, policy)
 }
 
 // +checklocks:v.mu
-func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, error) {
+func (v *volume) allocBlocksLocked(goal uint64, want uint32, policy allocPolicy) (uint64, uint32, error) {
 	if v.readOnly {
 		return 0, 0, linuxerr.EROFS
 	}
@@ -175,10 +194,20 @@ func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, er
 			}
 			return v.takeRunLocked(uint32(gi), off, want)
 		}
-		if v.heldBlocksTotal > 0 || v.punchingTotal > 0 {
+		if v.punchingTotal > 0 {
+			if v.punchCond != nil && !v.closed {
+				v.punchCond.Wait()
+				continue
+			}
+			return 0, 0, errSpaceHeld
+		}
+		if policy == allocReuseHeld && v.heldBlocksTotal > 0 {
 			return 0, 0, errSpaceHeld
 		}
 		if err := v.appendGroupLocked(); err != nil {
+			if v.heldBlocksTotal > 0 {
+				return 0, 0, errSpaceHeld
+			}
 			return 0, 0, err
 		}
 	}
@@ -367,6 +396,10 @@ func (v *volume) revokeIfLoggedLocked(b uint64) {
 
 // allocInode takes the lowest free inode number.
 func (v *volume) allocInode(isDir bool) (uint32, error) {
+	return v.allocInodePolicy(isDir, allocReuseHeld)
+}
+
+func (v *volume) allocInodePolicy(isDir bool, policy allocPolicy) (uint32, error) {
 	v.checkGate()
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -392,13 +425,19 @@ func (v *volume) allocInode(isDir bool) (uint32, error) {
 			g.dirty = true
 			return uint32(gi)*inodesPerGroup + idx + 1, nil
 		}
-		if v.heldInodesTotal > 0 {
+		if policy == allocReuseHeld && v.heldInodesTotal > 0 {
 			return 0, errSpaceHeld
 		}
 		if uint32(len(v.groups)) >= maxInodeGroups {
+			if v.heldInodesTotal > 0 {
+				return 0, errSpaceHeld
+			}
 			return 0, linuxerr.ENOSPC
 		}
 		if err := v.appendGroupLocked(); err != nil {
+			if v.heldInodesTotal > 0 {
+				return 0, errSpaceHeld
+			}
 			return 0, err
 		}
 	}

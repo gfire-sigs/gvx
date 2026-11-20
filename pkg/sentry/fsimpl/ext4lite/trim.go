@@ -235,6 +235,9 @@ func (v *volume) execPunchRunLocked(gi, r0, r1 uint32, strict, skipIfAllPunched 
 	if punchedOK {
 		lazyBitmap(&g.punched).setRange(p0, pCount)
 	}
+	if v.punchCond != nil {
+		v.punchCond.Broadcast()
+	}
 	v.mu.Unlock()
 
 	if err != nil && strict {
