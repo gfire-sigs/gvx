@@ -23,7 +23,8 @@ import (
 
 // errSpaceHeld reports that the volume has no allocatable block or inode,
 // but freed blocks or inodes wait for the next flush. The caller flushes and
-// tries again. Without a retry the error reads as ENOSPC.
+// tries again. Without a retry the error reads as ENOSPC. The block allocator
+// returns it only when the volume cannot grow.
 var errSpaceHeld = errors.New("ext4lite: free space waits for the next flush")
 
 // corrupt wraps linuxerr.EUCLEAN with a description of the failed check.
@@ -142,6 +143,11 @@ func metaBlocksOf(idx uint32) uint32 { return uint32(groupOverhead(idx)) + 2 + i
 // starts at goal and otherwise takes the lowest free run, so that data stays
 // dense and trailing groups empty out. It returns the start and the length of
 // the run, which is at least 1.
+//
+// When no group has a free block, the volume grows by one group, also while
+// freed blocks wait for a flush. Some callers cannot flush, such as the
+// write-back at the end of a mapping. The other callers flush and try once
+// more, but parallel writers can take the released blocks first.
 func (v *volume) allocBlocks(goal uint64, want uint32) (uint64, uint32, error) {
 	if want == 0 {
 		return 0, 0, nil
@@ -175,10 +181,12 @@ func (v *volume) allocBlocksLocked(goal uint64, want uint32) (uint64, uint32, er
 			}
 			return v.takeRunLocked(uint32(gi), off, want)
 		}
-		if v.heldBlocksTotal > 0 || v.punchingTotal > 0 {
-			return 0, 0, errSpaceHeld
-		}
 		if err := v.appendGroupLocked(); err != nil {
+			// The host has no room for a group. A flush still releases the
+			// freed blocks.
+			if (v.heldBlocksTotal > 0 || v.punchingTotal > 0) && errors.Is(err, linuxerr.ENOSPC) {
+				return 0, 0, errSpaceHeld
+			}
 			return 0, 0, err
 		}
 	}
