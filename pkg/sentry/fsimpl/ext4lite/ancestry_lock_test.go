@@ -29,9 +29,9 @@ import (
 // ancestryWaitTimeout bounds the wait for a call that must not need fs.mu.
 const ancestryWaitTimeout = 10 * time.Second
 
-// heldMuCall runs call on a new goroutine while the test holds fs.mu, as a
-// rename or an unlink does while it waits for the mount lock of the VFS. It
-// fails the test when call does not return within ancestryWaitTimeout.
+// heldMuCall runs call on a new goroutine while the test holds fs.mu. Renames
+// and unlinks also hold fs.mu while waiting for the VFS mount lock. It fails
+// the test when call exceeds ancestryWaitTimeout.
 func heldMuCall(t *testing.T, fs *filesystem, what string, call func()) {
 	t.Helper()
 	fs.mu.Lock()
@@ -108,10 +108,10 @@ func (e *env) dentryAt(p string) vfs.VirtualDentry {
 // TestAncestryReadersDoNotTakeFilesystemMu verifies the lock order of
 // pkg/sentry/vfs/vfs.go for IsDescendant, PrependPath, and InotifyWithParent.
 // That order puts their locks last. For example, the VFS calls IsDescendant
-// with its mount lock held, and a rename or an unlink holds fs.mu while it
-// waits for that lock in Prepare*Dentry. So none of the methods may take
-// fs.mu. When IsDescendant took it, a docker build whose RUN steps mounted and
-// renamed at the same time stopped every file system call of the guest.
+// under its mount lock. A rename or unlink holds fs.mu while waiting for that
+// lock in Prepare*Dentry. So none of these methods may take fs.mu. When
+// IsDescendant took it, a docker build whose RUN steps mounted and renamed at
+// the same time stopped every file system call of the guest.
 func TestAncestryReadersDoNotTakeFilesystemMu(t *testing.T) {
 	e := newEnv(t)
 	e.mustMkdir("a")

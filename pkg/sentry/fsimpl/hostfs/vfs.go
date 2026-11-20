@@ -152,9 +152,9 @@ type filesystem struct {
 	// ancestryMu comes after all of them.
 	mu sync.Mutex `state:"nosave"`
 
-	// ancestryMu protects the parent, the name, the path, and the dead flag
-	// of each dentry for readers that do not hold mu: IsDescendant,
-	// PrependPath, InotifyWithParent, and the host operations of open files.
+	// ancestryMu protects the parent, name, path, and dead flag of each dentry
+	// for readers without mu. Those readers are IsDescendant, PrependPath,
+	// InotifyWithParent, and the host operations of open files.
 	// A writer of these fields holds mu and ancestryMu. The VFS lock order
 	// (pkg/sentry/vfs/vfs.go) puts the locks of IsDescendant, PrependPath,
 	// and InotifyWithParent last. For example, the VFS calls IsDescendant

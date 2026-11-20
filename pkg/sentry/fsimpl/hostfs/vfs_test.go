@@ -46,6 +46,7 @@ type env struct {
 	root   vfs.VirtualDentry
 	ws     *Workspace
 	dir    string
+	done   bool
 }
 
 func newEnv(t *testing.T) *env {
@@ -73,6 +74,9 @@ func newEnvOpts(t *testing.T, opts workspaceOptions) *env {
 	}
 	e := mountEnv(t, ws, dir)
 	t.Cleanup(func() {
+		if e.done {
+			return
+		}
 		e.root.DecRef(e.ctx)
 		if err := ws.Close(); err != nil {
 			t.Errorf("Workspace.Close: %v", err)
@@ -110,7 +114,12 @@ func mountEnv(t *testing.T, ws *Workspace, dir string) *env {
 	}
 	// The mount namespace outlives the test body; the cleanup of the caller
 	// drops the root reference, and this drops the namespace.
-	t.Cleanup(func() { mntns.DecRef(ctx) })
+	t.Cleanup(func() {
+		if e.done {
+			return
+		}
+		mntns.DecRef(ctx)
+	})
 	return e
 }
 

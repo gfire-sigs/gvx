@@ -33,9 +33,9 @@ func (e *env) filesystem() *filesystem {
 	return e.root.Mount().Filesystem().Impl().(*filesystem)
 }
 
-// heldMuCall runs call on a new goroutine while the test holds fs.mu, as a
-// rename or an unlink does while it waits for the mount lock of the VFS. It
-// fails the test when call does not return within ancestryWaitTimeout.
+// heldMuCall runs call on a new goroutine while the test holds fs.mu. Renames
+// and unlinks also hold fs.mu while waiting for the VFS mount lock. It fails
+// the test when call exceeds ancestryWaitTimeout.
 func heldMuCall(t *testing.T, fs *filesystem, what string, call func()) {
 	t.Helper()
 	fs.mu.Lock()
@@ -117,9 +117,8 @@ func (e *env) dentryAt(p string) vfs.VirtualDentry {
 // TestAncestryReadersDoNotTakeFilesystemMu verifies the lock order of
 // pkg/sentry/vfs/vfs.go for IsDescendant, PrependPath, and InotifyWithParent.
 // That order puts their locks last. For example, the VFS calls IsDescendant
-// with its mount lock held, and a rename or an unlink holds fs.mu while it
-// waits for that lock in Prepare*Dentry. So none of the methods may take
-// fs.mu.
+// under its mount lock. A rename or unlink holds fs.mu while waiting for that
+// lock in Prepare*Dentry. So none of these methods may take fs.mu.
 func TestAncestryReadersDoNotTakeFilesystemMu(t *testing.T) {
 	e := newEnv(t)
 	fs := e.filesystem()
@@ -154,13 +153,14 @@ func TestAncestryReadersDoNotTakeFilesystemMu(t *testing.T) {
 // readers that do not hold fs.mu walk its ancestry and read its workspace
 // path. Each reader must see one of the two places. Under the race detector
 // the test also fails when a writer of these fields does not hold
-// fs.ancestryMu. The subtests cover the writers moveLocked,
-// exchangeDentriesLocked, and the dead flag of detachLocked.
+// fs.ancestryMu. The subtests cover moveLocked, rewritePathLocked,
+// exchangeDentriesLocked, detachLocked, and linkTmpLocked.
 func TestAncestryReadersRaceWithRenames(t *testing.T) {
 	e := newEnv(t)
 	for _, d := range []string{"a", "c", "x", "y", "a/b", "x/m", "y/n"} {
 		e.mustMkdir(d)
 	}
+	e.writeFile("a/b/leaf", []byte("x"))
 	t.Run("move", func(t *testing.T) {
 		raceAncestry(t, e, e.dentryAt("a/b"), 100, func(i int) error {
 			if i%2 == 0 {
@@ -168,6 +168,14 @@ func TestAncestryReadersRaceWithRenames(t *testing.T) {
 			}
 			return e.rename("c/b", "a/b")
 		}, "/a/b", "/c/b")
+	})
+	t.Run("move_child", func(t *testing.T) {
+		raceAncestry(t, e, e.dentryAt("a/b/leaf"), 100, func(i int) error {
+			if i%2 == 0 {
+				return e.rename("a/b", "c/b")
+			}
+			return e.rename("c/b", "a/b")
+		}, "/a/b/leaf", "/c/b/leaf")
 	})
 	t.Run("exchange", func(t *testing.T) {
 		exchange := &vfs.RenameOptions{Flags: linux.RENAME_EXCHANGE}
@@ -198,11 +206,51 @@ func TestAncestryReadersRaceWithRenames(t *testing.T) {
 			}()
 			if err := e.unlink("f"); err != nil {
 				close(stop)
+				<-read
 				t.Fatalf("unlink: %v", err)
 			}
 			close(stop)
 			if err := <-read; err != nil {
 				t.Fatalf("PathnameWithDeleted(unlinked file): %v", err)
+			}
+		}
+	})
+	t.Run("link_tmpfile", func(t *testing.T) {
+		// linkTmpLocked updates parent, name, relPath, and dead together.
+		for i := range 20 {
+			fd := e.mustOpenTmp(".", linux.O_RDWR)
+			vd := fd.VirtualDentry()
+			d := vd.Dentry().Impl().(*dentry)
+			stop := make(chan struct{})
+			read := make(chan error, 1)
+			go func() {
+				for {
+					select {
+					case <-stop:
+						read <- nil
+						return
+					default:
+					}
+					_ = d.path()
+					if _, err := e.vfsObj.PathnameWithDeleted(e.ctx, e.root, vd); err != nil {
+						read <- err
+						return
+					}
+				}
+			}()
+			name := fmt.Sprintf("tmp-%d", i)
+			err := e.linkFD(fd, name)
+			close(stop)
+			rerr := <-read
+			fd.DecRef(e.ctx)
+			if err != nil {
+				t.Fatalf("linkFD(%s): %v", name, err)
+			}
+			if rerr != nil {
+				t.Fatalf("PathnameWithDeleted(linked tmpfile): %v", rerr)
+			}
+			if err := e.unlink(name); err != nil {
+				t.Fatalf("unlink(%s): %v", name, err)
 			}
 		}
 	})
@@ -223,9 +271,8 @@ func TestMountPropagationDoesNotDeadlockWithRename(t *testing.T) {
 	if err := e.vfsObj.BindAt(e.ctx, e.creds, e.pop("."), e.pop("peer"), false); err != nil {
 		t.Fatalf("BindAt(/, /peer): %v", err)
 	}
-	deadlocked := false
 	t.Cleanup(func() {
-		if !deadlocked {
+		if !e.done {
 			_ = e.vfsObj.UmountAt(e.ctx, e.creds, e.pop("peer"), &vfs.UmountOptions{Flags: linux.MNT_DETACH})
 		}
 	})
@@ -273,7 +320,7 @@ func TestMountPropagationDoesNotDeadlockWithRename(t *testing.T) {
 	select {
 	case <-finished:
 	case <-time.After(runFor + ancestryWaitTimeout):
-		deadlocked = true
+		e.done = true
 		t.Fatalf("bind mounts and renames deadlocked after %d mounts and %d renames", mounts.Load(), renames.Load())
 	}
 	close(errs)

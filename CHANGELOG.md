@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Deadlock between mounts and renames on `ext4lite` and `hostfs` (`pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/hostfs`)** (#209): `IsDescendant` and `PrependPath` took the file system lock `fs.mu`, but the VFS lock order puts their locks last. The VFS calls `IsDescendant` with its mount lock held, and a rename, an unlink, or an rmdir holds `fs.mu` while it waits for that lock. A mount with propagation during a rename stopped every file system call of the guest, for example in a `docker build` with parallel RUN steps. Both file systems now protect the parent and the name of each dentry with a file-system-wide `ancestryMu`. It is the last lock in the order, as in the upstream `fstree`.
+
 ## [v0.17.10022026111600] - 2026-11-20
 
 This release fixes memory accounting in Windows `systrap` for pages touched only by stub processes (#213, #217). It also separates held-space reuse and volume growth in `ext4lite` so mapped write-backs succeed without unnecessary sequential growth (#214, #216).
@@ -20,7 +26,6 @@ This release syncs upstream gVisor to `release-20261116.0` (`83282de1f21f`) and 
 - **Windows `pgalloc.MemoryFile` memory reclaim and zero-disk backing (`pkg/sentry/pgalloc`, `pkg/sentry/platform/systrap`, `pkg/gvx`)** (#211): Windows `MemoryFile` chunks no longer grow temporary files under `%TEMP%` on disk. WHPX sandboxes back each 1 GiB chunk with anonymous `VirtualAlloc(MEM_RESERVE)` memory and commit ranges on allocation and restore. Freed WHPX ranges release with `VirtualFree(MEM_DECOMMIT)` so working set and commit charge return to Windows, and `Decommit` resets live ranges with `DiscardVirtualMemory`. Windows `systrap` sandboxes back each chunk with a pagefile-backed `SEC_RESERVE` section mapped via `MapViewOfFile3` and reclaim freed ranges with `VirtualAlloc(MEM_RESET)` and `VirtualUnlock`.
 - **Docker-aligned DNS relay (`pkg/netbackend`, `pkg/gvx`)**: TCP DNS queries from the guest now forward directly over upstream TCP. Guest `/etc/resolv.conf` inherits sanitized host `search` domains and `options` captured before lockdown. The relay answers all `IN` query types for internal names (`localhost`, `host.docker.internal`, `gateway.docker.internal`, `gvx`) authoritatively without leaking them upstream. External `AAAA` queries return empty `NOERROR` when the guest has no IPv6 route, and Linux hosts using only `127.0.0.53` fall back to `/run/systemd/resolve/resolv.conf`.
 - **NAT TCP answer to a failed host dial (`pkg/netbackend`)** (#206): Outbound NAT TCP connections now classify host dial errors instead of sending a RST for every failure. Refusals and unknown errors still send a RST (`ECONNREFUSED`), while timeouts send no answer so retransmitted SYNs redial and end with `ETIMEDOUT`. Host or network unreachable and down errors (including Windows `WSAE` codes) send an ICMPv4 destination unreachable from `10.0.2.2`, returning `EHOSTUNREACH` or `ENETUNREACH`. Quoted 20-byte TCP headers let guest conntrack deliver the same errno to containers behind iptables NAT.
-- **Deadlock between mounts and renames on `ext4lite` and `hostfs` (`pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/hostfs`)**: `IsDescendant` and `PrependPath` took the file system lock `fs.mu`, but the VFS lock order puts their locks last. The VFS calls `IsDescendant` with its mount lock held, and a rename, an unlink, or an rmdir holds `fs.mu` while it waits for that lock. A mount with propagation during a rename stopped every file system call of the guest, for example in a `docker build` with parallel RUN steps. Both file systems now protect the parent and the name of each dentry with a file-system-wide `ancestryMu`. It is the last lock in the order, as in the upstream `fstree`.
 
 ### Upstream Sync
 
