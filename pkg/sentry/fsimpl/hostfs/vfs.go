@@ -149,7 +149,20 @@ type filesystem struct {
 
 	// mu protects the dentry tree, dentry names and paths, the inode map, and
 	// pending. Lock order: filesystem.mu, then Workspace.mu, then inode locks.
-	mu         sync.Mutex `state:"nosave"`
+	// ancestryMu comes after all of them.
+	mu sync.Mutex `state:"nosave"`
+
+	// ancestryMu protects the parent, name, path, and dead flag of each dentry
+	// for readers without mu. Those readers are IsDescendant, PrependPath,
+	// InotifyWithParent, and the host operations of open files.
+	// A writer of these fields holds mu and ancestryMu. The VFS lock order
+	// (pkg/sentry/vfs/vfs.go) puts the locks of IsDescendant, PrependPath,
+	// and InotifyWithParent last. For example, the VFS calls IsDescendant
+	// with its mount lock held, and a rename or an unlink holds mu while it
+	// waits for that lock. So these methods do not take mu, and a holder of
+	// ancestryMu takes no other lock.
+	ancestryMu sync.RWMutex `state:"nosave"`
+
 	root       *dentry
 	inodes     map[hostID]*inode
 	liveInodes map[*inode]struct{}
@@ -546,14 +559,16 @@ type dentry struct {
 	refs atomicbitops.Int64
 	fs   *filesystem
 
-	// nameMu protects parent, name, and relPath for readers that do not hold
-	// fs.mu. Writers hold both.
-	nameMu  sync.RWMutex `state:"nosave"`
+	// fs.mu protects parent, name, and relPath. A writer also holds
+	// fs.ancestryMu, so a reader that does not hold fs.mu holds
+	// fs.ancestryMu. See filesystem.ancestryMu.
 	parent  *dentry
 	name    string
 	relPath string
 
-	// inode, children, and dead are protected by fs.mu.
+	// fs.mu protects inode, children, and dead. A writer of dead on a dentry
+	// that other goroutines can reach also holds fs.ancestryMu, because
+	// PrependPath reads dead under fs.ancestryMu.
 	inode    *inode
 	children map[string]*dentry
 	dead     bool
@@ -581,15 +596,18 @@ func (fs *filesystem) newDentryLocked(parent *dentry, name, rel string, ino *ino
 	return d
 }
 
+// path returns the workspace path of d for a caller that does not hold fs.mu.
 func (d *dentry) path() string {
-	d.nameMu.RLock()
-	defer d.nameMu.RUnlock()
+	d.fs.ancestryMu.RLock()
+	defer d.fs.ancestryMu.RUnlock()
 	return d.relPath
 }
 
+// names returns the parent and the name of d for a caller that does not hold
+// fs.mu.
 func (d *dentry) names() (parent *dentry, name string) {
-	d.nameMu.RLock()
-	defer d.nameMu.RUnlock()
+	d.fs.ancestryMu.RLock()
+	defer d.fs.ancestryMu.RUnlock()
 	return d.parent, d.name
 }
 

@@ -21,6 +21,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 
 	"z.gfire.dev/gvx/pkg/gvx"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -146,6 +147,7 @@ type sandboxFlagValues struct {
 	it                     bool
 	detach                 bool
 	publishAll             bool
+	autoPublish            bool
 	envFlags               listFlag
 	envFileFlags           listFlag
 	entrypoint             string
@@ -202,6 +204,7 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	fs.StringVar(&f.wgConfigAlias, "wg-config", "", "Alias for -wg-conf")
 	f.hostDNS = addHostDNSFlag(fs)
 	fs.BoolVar(&f.publishAll, "P", false, "Publish every port that the image exposes to a free port of 127.0.0.1")
+	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1")
 	registerAlias([]string{"p", "publish"}, func(n string) {
 		fs.Var(&f.portSpecs, n, "Publish a container port: [ip:][hostPort:]guestPort[/proto]")
 	})
@@ -427,6 +430,14 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		return gvx.Config{}, false, fmt.Errorf("--rootfs-volume must not be empty")
 	}
 
+	warningsOut := stderr
+	stderrOut := stderr
+	if f.autoPublish && stderr != nil {
+		sw := &syncWriter{w: stderr}
+		warningsOut = sw
+		stderrOut = sw
+	}
+
 	cfg := gvx.Config{
 		Platform:               backend,
 		AllowUnconfinedSystrap: f.allowUnconfinedSystrap,
@@ -439,12 +450,13 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		AllowSUID:              priv.allowSUID,
 		PortForwards:           portForwards,
 		PublishAll:             f.publishAll,
+		AutoPublishPorts:       f.autoPublish,
 		WireGuardConfigPath:    f.wireGuardPath(),
 		OCIImage:               strings.TrimSpace(f.image),
 		OCICacheDir:            strings.TrimSpace(f.cacheDir),
 		RegistryBaseURL:        strings.TrimSpace(f.registryURL),
 		PullPolicy:             pullPolicy,
-		Warnings:               stderr,
+		Warnings:               warningsOut,
 		BinaryPath:             strings.TrimSpace(f.bin),
 		WorkspacePath:          strings.TrimSpace(f.workspace),
 		WorkspaceReadOnly:      f.readOnly,
@@ -461,7 +473,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		Tuning:                 tuned,
 		Stdin:                  stdin,
 		Stdout:                 stdout,
-		Stderr:                 stderr,
+		Stderr:                 stderrOut,
 		TTY:                    f.tty || f.it,
 		DisableHostLockdown:    !f.lockdown,
 		CheckpointDir:          strings.TrimSpace(f.checkpointDir),
@@ -471,4 +483,15 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		},
 	}
 	return cfg, backend == gvx.PlatformAuto, nil
+}
+
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }

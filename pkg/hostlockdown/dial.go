@@ -16,7 +16,10 @@ package hostlockdown
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
+	"net/netip"
 )
 
 // DialContext dials an outbound host network connection. On Windows after Apply
@@ -31,4 +34,52 @@ func DialContext(ctx context.Context, network, address string) (net.Conn, error)
 // sandboxes run the accept on the Low-integrity socket broker.
 func AcceptListener(ln net.Listener) (net.Conn, error) {
 	return acceptHostListener(ln)
+}
+
+// ListenLoopback binds a TCP listener on a host loopback address (127.0.0.1 or
+// ::1). After Apply, it requires Options.AllowOutboundNet and
+// Options.AllowLoopbackBind.
+func ListenLoopback(network, address string) (net.Listener, error) {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, fmt.Errorf("hostlockdown: ListenLoopback rejects network %q", network)
+	}
+	if err := validateLoopbackBind(address); err != nil {
+		return nil, err
+	}
+	if IsLockedDown() && !loopbackBindAllowed.Load() {
+		return nil, errors.New("hostlockdown: loopback bind is disabled")
+	}
+	return listenHostLoopback(network, address)
+}
+
+// ListenPacketLoopback binds a UDP packet socket on a host loopback address
+// (127.0.0.1 or ::1). After Apply, it requires Options.AllowOutboundNet and
+// Options.AllowLoopbackBind.
+func ListenPacketLoopback(network, address string) (net.PacketConn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+	default:
+		return nil, fmt.Errorf("hostlockdown: ListenPacketLoopback rejects network %q", network)
+	}
+	if err := validateLoopbackBind(address); err != nil {
+		return nil, err
+	}
+	if IsLockedDown() && !loopbackBindAllowed.Load() {
+		return nil, errors.New("hostlockdown: loopback bind is disabled")
+	}
+	return listenHostPacketLoopback(network, address)
+}
+
+func validateLoopbackBind(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: invalid loopback bind address %q: %w", address, err)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || !addr.IsLoopback() {
+		return fmt.Errorf("hostlockdown: bind address %q is not a loopback IP", address)
+	}
+	return nil
 }

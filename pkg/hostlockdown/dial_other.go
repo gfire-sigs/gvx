@@ -29,3 +29,16 @@ func dialHostContext(ctx context.Context, network, address string) (net.Conn, er
 func acceptHostListener(ln net.Listener) (net.Conn, error) {
 	return ln.Accept()
 }
+
+func listenHostLoopback(network, address string) (net.Listener, error) {
+	// Disable MPTCP probing before Listen. On Linux under seccomp, the MPTCP
+	// socket probe returns EPERM, which causes Go's net package to call
+	// uname(2) via KernelVersionGE and trigger SIGSYS.
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+	return lc.Listen(context.Background(), network, address)
+}
+
+func listenHostPacketLoopback(network, address string) (net.PacketConn, error) {
+	return net.ListenPacket(network, address)
+}

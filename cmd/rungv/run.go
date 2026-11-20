@@ -184,7 +184,11 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	defer func() {
 		_ = sb.Close()
 	}()
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv run", stderr)
+	errOut := stderr
+	if rc.cfg.Stderr != nil {
+		errOut = rc.cfg.Stderr
+	}
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv run", errOut)
 }
 
 // bindControlSocket opens the control listener before host lockdown when requested.
@@ -238,6 +242,9 @@ func reportSandboxStartup(stderr io.Writer, sb *gvx.Sandbox, cfg *gvx.Config, au
 		_, _ = fmt.Fprintln(stderr, "rungv: warning: host lockdown disabled")
 	}
 	reportPublishedPorts(stderr, sb)
+	if cfg.AutoPublishPorts {
+		_, _ = fmt.Fprintln(stderr, "rungv: auto-publish enabled for guest listeners on 127.0.0.1")
+	}
 	if cfg.Resources.CPUMillis > 0 && !sb.Limits().CPUTime {
 		_, _ = fmt.Fprintf(stderr, "rungv: warning: --cpus sets the number of CPUs that the guest sees; this host does not cap the CPU time\n")
 	}

@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
@@ -304,7 +306,9 @@ type boundUDPForward struct {
 	rule       PortForwardRule
 	packetConn *net.UDPConn
 
-	// sessions maps a client address to its session. PortForwarder.mu guards it.
+	// closed is set when this rule is unpublished or PortForwarder closes.
+	// PortForwarder.mu guards closed and sessions.
+	closed   bool
 	sessions map[netip.AddrPort]*udpForwardSession
 }
 
@@ -345,6 +349,16 @@ type PortForwarder struct {
 	// resumed is non-nil between QuiesceForSave and ResumeAfterSave. It
 	// closes when the pause ends. PortForwarder.mu guards it.
 	resumed chan struct{}
+
+	// Dynamic host loopback publishing state. dynMu serializes
+	// reconcileDynamicPorts calls (lock order: dynMu before mu); mu guards the
+	// fields below.
+	dynMu      sync.Mutex
+	dynEnabled bool
+	dynOpts    DynamicForwardOptions
+	dynTCP     map[dynPortKey]*boundTCPForward
+	dynUDP     map[dynPortKey]*boundUDPForward
+	dynFailed  map[dynPortKey]struct{}
 }
 
 // NewPortForwarder constructs an empty PortForwarder ready for PreBind. The
@@ -454,15 +468,36 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 }
 
 // BoundRules returns the active port forward rules with resolved host ports.
+// Static rules appear first in PreBind order, followed by active dynamic
+// loopback rules sorted by protocol and port.
 func (pf *PortForwarder) BoundRules() []PortForwardRule {
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
-	out := make([]PortForwardRule, 0, len(pf.tcpList)+len(pf.udpList))
+	out := make([]PortForwardRule, 0, len(pf.tcpList)+len(pf.udpList)+len(pf.dynTCP)+len(pf.dynUDP))
 	for _, b := range pf.tcpList {
 		out = append(out, b.rule)
 	}
 	for _, b := range pf.udpList {
 		out = append(out, b.rule)
+	}
+	if len(pf.dynTCP)+len(pf.dynUDP) > 0 {
+		keys := make([]dynPortKey, 0, len(pf.dynTCP)+len(pf.dynUDP))
+		for k := range pf.dynTCP {
+			keys = append(keys, k)
+		}
+		for k := range pf.dynUDP {
+			keys = append(keys, k)
+		}
+		slices.SortFunc(keys, compareDynPortKey)
+		for _, k := range keys {
+			if k.proto == "tcp" {
+				if b, ok := pf.dynTCP[k]; ok {
+					out = append(out, b.rule)
+				}
+			} else if b, ok := pf.dynUDP[k]; ok {
+				out = append(out, b.rule)
+			}
+		}
 	}
 	return out
 }
@@ -494,6 +529,10 @@ func (pf *PortForwarder) Start(s *stack.Stack) {
 		pf.wg.Add(1)
 		go pf.serveUDP(b)
 	}
+	if pf.dynEnabled {
+		pf.wg.Add(1)
+		go pf.runDynamicLoop()
+	}
 }
 
 // AttachRestoredStack rebinds all pre-bound TCP, Unix, and UDP port forwarders
@@ -519,12 +558,23 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 			pf.wg.Add(1)
 			go pf.serveUDP(b)
 		}
+		if pf.dynEnabled {
+			pf.wg.Add(1)
+			go pf.runDynamicLoop()
+		}
 		pf.mu.Unlock()
 		return nil
 	}
 	pf.stack = s
+	clear(pf.dynFailed)
 	var staleGuests []*gonet.UDPConn
 	for _, b := range pf.udpList {
+		for client, sess := range b.sessions {
+			staleGuests = append(staleGuests, sess.guest)
+			delete(b.sessions, client)
+		}
+	}
+	for _, b := range pf.dynUDP {
 		for client, sess := range b.sessions {
 			staleGuests = append(staleGuests, sess.guest)
 			delete(b.sessions, client)
@@ -619,6 +669,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 		acceptFn = net.Listener.Accept
 	}
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
+	fallback := allowsLoopbackFallback(b.rule.GuestIP)
 	var backoff time.Duration
 	var timer *time.Timer
 	defer func() {
@@ -649,7 +700,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
-		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, hostConn) }) {
+		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, fallback, hostConn) }) {
 			_ = hostConn.Close()
 			return
 		}
@@ -659,7 +710,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 // relayTCPClient connects hostConn to the guest endpoint and relays both
 // streams. The guest may start listening after the host client connects, so
 // the dial retries during the guest dial window.
-func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn net.Conn) {
+func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bool, hostConn net.Conn) {
 	defer func() { _ = hostConn.Close() }()
 
 	ctx, cancel := context.WithTimeout(pf.ctx, pf.guestDialWindow)
@@ -674,7 +725,7 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 	for {
 		var err error
 		if s := pf.targetStack(); s != nil {
-			guestConn, err = gonet.DialContextTCP(ctx, s, guestAddr, ipv4.ProtocolNumber)
+			guestConn, err = dialGuestTCP(ctx, s, guestAddr, fallback)
 			if err == nil {
 				break
 			}
@@ -697,9 +748,23 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, hostConn ne
 	relayBidirectional(pf.ctx, hostConn, quiescedGuestConn{TCPConn: guestConn, wait: pf.waitResumed})
 }
 
+func dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddress, fallback bool) (*gonet.TCPConn, error) {
+	primary := guestAddr
+	secondary := guestLoopbackAddr(guestAddr.Port)
+	if fallback && prefersGuestLoopback(s, header.TCPProtocolNumber, guestAddr) {
+		primary, secondary = secondary, primary
+	}
+	conn, err := gonet.DialContextTCP(ctx, s, primary, ipv4.ProtocolNumber)
+	if err == nil || !fallback || ctx.Err() != nil {
+		return conn, err
+	}
+	return gonet.DialContextTCP(ctx, s, secondary, ipv4.ProtocolNumber)
+}
+
 func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 	defer pf.wg.Done()
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
+	fallback := allowsLoopbackFallback(b.rule.GuestIP)
 	buf := make([]byte, maxUDPDatagram)
 	var backoff time.Duration
 	var timer *time.Timer
@@ -730,7 +795,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
-		sess := pf.udpSession(b, guestAddr, client)
+		sess := pf.udpSession(b, guestAddr, fallback, client)
 		if sess == nil {
 			continue
 		}
@@ -744,9 +809,9 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 // udpSession returns the session of client. It creates the session and its
 // reply goroutine on the first datagram. It returns nil when the forwarder is
 // closed, the rule is at its session limit, or the guest endpoint fails.
-func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, client netip.AddrPort) *udpForwardSession {
+func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, fallback bool, client netip.AddrPort) *udpForwardSession {
 	pf.mu.Lock()
-	if pf.closed || pf.stack == nil {
+	if pf.closed || b.closed || pf.stack == nil {
 		pf.mu.Unlock()
 		return nil
 	}
@@ -762,7 +827,11 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 	s := pf.stack
 	pf.mu.Unlock()
 
-	guest, err := gonet.DialUDP(s, nil, &guestAddr, ipv4.ProtocolNumber)
+	target := guestAddr
+	if fallback && prefersGuestLoopback(s, header.UDPProtocolNumber, guestAddr) {
+		target = guestLoopbackAddr(guestAddr.Port)
+	}
+	guest, err := gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
 	if err != nil {
 		pf.log.Debug("netbackend: open guest UDP endpoint", "client", client, "error", err)
 		return nil
@@ -772,7 +841,7 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 	// Only this rule's serveUDP goroutine inserts sessions, so the earlier
 	// lookup cannot race with another insert for the same key.
 	pf.mu.Lock()
-	if pf.closed || pf.stack != s {
+	if pf.closed || b.closed || pf.stack != s {
 		pf.mu.Unlock()
 		_ = guest.Close()
 		return nil
@@ -805,6 +874,30 @@ func (pf *PortForwarder) runUDPSession(b *boundUDPForward, sess *udpForwardSessi
 	}, sess.clock, pf.udpIdle)
 }
 
+var guestLoopbackIPv4 = tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
+
+func guestLoopbackAddr(port uint16) tcpip.FullAddress {
+	return tcpip.FullAddress{
+		NIC:  LoopbackNICID,
+		Addr: guestLoopbackIPv4,
+		Port: port,
+	}
+}
+
+func allowsLoopbackFallback(guestIP string) bool {
+	return guestIP == "" || guestIP == DefaultGuestIPv4
+}
+
+func prefersGuestLoopback(s *stack.Stack, transProto tcpip.TransportProtocolNumber, guestAddr tcpip.FullAddress) bool {
+	if s.HasBoundEndpoint(header.IPv4ProtocolNumber, transProto, guestAddr.Addr, guestAddr.Port) {
+		return false
+	}
+	if s.HasBoundEndpoint(header.IPv4ProtocolNumber, transProto, tcpip.Address{}, guestAddr.Port) {
+		return false
+	}
+	return s.HasBoundEndpoint(header.IPv4ProtocolNumber, transProto, guestLoopbackIPv4, guestAddr.Port)
+}
+
 func parseGuestFullAddr(ipStr string, port uint16) tcpip.FullAddress {
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil || !addr.Is4() {
@@ -814,8 +907,12 @@ func parseGuestFullAddr(ipStr string, port uint16) tcpip.FullAddress {
 			Port: port,
 		}
 	}
+	nic := Eth0NICID
+	if addr.IsLoopback() {
+		nic = LoopbackNICID
+	}
 	return tcpip.FullAddress{
-		NIC:  Eth0NICID,
+		NIC:  nic,
 		Addr: tcpip.AddrFrom4(addr.As4()),
 		Port: port,
 	}
@@ -838,8 +935,15 @@ func (pf *PortForwarder) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	for _, b := range pf.dynTCP {
+		if err := b.listener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	clear(pf.dynTCP)
 	var guests []*gonet.UDPConn
 	for _, b := range pf.udpList {
+		b.closed = true
 		if err := b.packetConn.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -847,6 +951,17 @@ func (pf *PortForwarder) Close() error {
 			guests = append(guests, sess.guest)
 		}
 	}
+	for _, b := range pf.dynUDP {
+		b.closed = true
+		if err := b.packetConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		for _, sess := range b.sessions {
+			guests = append(guests, sess.guest)
+		}
+	}
+	clear(pf.dynUDP)
+	clear(pf.dynFailed)
 	pf.mu.Unlock()
 	for _, g := range guests {
 		_ = g.Close()

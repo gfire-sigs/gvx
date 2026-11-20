@@ -111,13 +111,10 @@ func (fx *vfsFixture) fpop(p string) *vfs.PathOperation {
 	return pop
 }
 
-// TestReadlinkDoesNotTakeMountLockUnderFilesystemMutex checks the lock order
-// of the VFS mount lock and fs.mu. A mount operation holds the mount lock and
-// calls IsDescendant, which takes fs.mu. ReadlinkAt must therefore not take
-// the mount lock, which Mount.Options takes, while it holds fs.mu. Otherwise
-// the readlink waits for the mount operation, the mount operation waits for
-// the readlink, and every other call that needs fs.mu waits behind them,
-// including the background flush.
+// TestReadlinkDoesNotTakeMountLockUnderFilesystemMutex verifies the lock order
+// of the VFS mount lock and fs.mu. ReadlinkAt must not acquire the mount lock
+// via Mount.Options while holding fs.mu. Otherwise a readlink can invert the
+// lock order against mount operations and stall callers waiting on fs.mu.
 func TestReadlinkDoesNotTakeMountLockUnderFilesystemMutex(t *testing.T) {
 	fx := newVFSFixture(t)
 	if err := fx.vfsObj.MkdirAt(fx.ctx, fx.creds, fx.pop("a"), &vfs.MkdirOptions{Mode: 0o755}); err != nil {

@@ -513,3 +513,212 @@ func TestParsePortForwardRule(t *testing.T) {
 		}
 	}
 }
+
+func TestPortForwarderGuestLoopbackFallback(t *testing.T) {
+	t.Run("tcp_loopback_only", func(t *testing.T) {
+		s := newForwardStack(t)
+		guestLn, err := gonet.ListenTCP(s, guestLoopbackAddr(25433), ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("ListenTCP(127.0.0.1:25433): %v", err)
+		}
+		tcpEchoServer(t, guestLn)
+
+		pf := NewPortForwarder(tuning.Values{})
+		t.Cleanup(func() { _ = pf.Close() })
+		if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", HostIP: "127.0.0.1", GuestPort: 25433}}); err != nil {
+			t.Fatalf("PreBind: %v", err)
+		}
+		pf.Start(s)
+
+		client, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(pf.BoundRules()[0].HostPort))))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer client.Close()
+		roundTripTCP(t, client, []byte("loopback-tcp"))
+	})
+
+	t.Run("tcp_loopback_late_listener", func(t *testing.T) {
+		s := newForwardStack(t)
+		pf := NewPortForwarder(tuning.Values{})
+		t.Cleanup(func() { _ = pf.Close() })
+		if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", HostIP: "127.0.0.1", GuestPort: 25434}}); err != nil {
+			t.Fatalf("PreBind: %v", err)
+		}
+		pf.Start(s)
+
+		client, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(pf.BoundRules()[0].HostPort))))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer client.Close()
+
+		guestLn, err := gonet.ListenTCP(s, guestLoopbackAddr(25434), ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("ListenTCP(127.0.0.1:25434): %v", err)
+		}
+		tcpEchoServer(t, guestLn)
+		roundTripTCP(t, client, []byte("late-loopback"))
+	})
+
+	t.Run("udp_loopback_only", func(t *testing.T) {
+		s := newForwardStack(t)
+		loAddr := guestLoopbackAddr(25435)
+		guestConn, err := gonet.DialUDP(s, &loAddr, nil, ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("DialUDP(127.0.0.1:25435): %v", err)
+		}
+		done := make(chan struct{})
+		t.Cleanup(func() {
+			_ = guestConn.Close()
+			<-done
+		})
+		go func() {
+			defer close(done)
+			buf := make([]byte, 2048)
+			for {
+				n, from, err := guestConn.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				_, _ = guestConn.WriteTo(buf[:n], from)
+			}
+		}()
+
+		pf, target := preBoundUDPForward(t, 25435)
+		pf.Start(s)
+
+		client := newClientSocket(t)
+		if _, err := client.WriteToUDP([]byte("loopback-udp"), target); err != nil {
+			t.Fatalf("WriteToUDP: %v", err)
+		}
+		if got := recvFrom(t, client); got != "loopback-udp" {
+			t.Fatalf("UDP reply = %q, want %q", got, "loopback-udp")
+		}
+	})
+
+	t.Run("eth0_takes_precedence_over_loopback", func(t *testing.T) {
+		s := newForwardStack(t)
+		serveTag := func(addr tcpip.FullAddress, tag string) {
+			ln, err := gonet.ListenTCP(s, addr, ipv4.ProtocolNumber)
+			if err != nil {
+				t.Fatalf("ListenTCP(%v): %v", addr, err)
+			}
+			done := make(chan struct{})
+			t.Cleanup(func() {
+				_ = ln.Close()
+				<-done
+			})
+			go func() {
+				defer close(done)
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					_, _ = c.Write([]byte(tag))
+					_ = c.Close()
+				}
+			}()
+		}
+		serveTag(tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 15}), Port: 25437}, "eth0")
+		serveTag(guestLoopbackAddr(25437), "loopback")
+
+		pf := NewPortForwarder(tuning.Values{})
+		t.Cleanup(func() { _ = pf.Close() })
+		if err := pf.PreBind([]PortForwardRule{{Proto: "tcp", HostIP: "127.0.0.1", GuestPort: 25437}}); err != nil {
+			t.Fatalf("PreBind: %v", err)
+		}
+		pf.Start(s)
+
+		client, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(pf.BoundRules()[0].HostPort))))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer client.Close()
+		if err := client.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(client)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(got) != "eth0" {
+			t.Fatalf("reply = %q, want %q", string(got), "eth0")
+		}
+	})
+
+	t.Run("explicit_loopback_guest_ip", func(t *testing.T) {
+		s := newForwardStack(t)
+		guestLn, err := gonet.ListenTCP(s, guestLoopbackAddr(25438), ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("ListenTCP(127.0.0.1:25438): %v", err)
+		}
+		tcpEchoServer(t, guestLn)
+
+		pf := NewPortForwarder(tuning.Values{})
+		t.Cleanup(func() { _ = pf.Close() })
+		if err := pf.PreBind([]PortForwardRule{{
+			Proto:     "tcp",
+			HostIP:    "127.0.0.1",
+			GuestIP:   "127.0.0.1",
+			GuestPort: 25438,
+		}}); err != nil {
+			t.Fatalf("PreBind: %v", err)
+		}
+		pf.Start(s)
+
+		client, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(pf.BoundRules()[0].HostPort))))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer client.Close()
+		roundTripTCP(t, client, []byte("explicit-loopback"))
+	})
+
+	t.Run("explicit_non_default_guest_ip_skips_loopback_fallback", func(t *testing.T) {
+		s := newForwardStack(t)
+		guestLn, err := gonet.ListenTCP(s, guestLoopbackAddr(25436), ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatalf("ListenTCP(127.0.0.1:25436): %v", err)
+		}
+		tcpEchoServer(t, guestLn)
+
+		tv, err := (tuning.Values{}).Set("net.forward.guest_dial_window", "80ms")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pf := NewPortForwarder(tv)
+		t.Cleanup(func() { _ = pf.Close() })
+		if err := pf.PreBind([]PortForwardRule{{
+			Proto:     "tcp",
+			HostIP:    "127.0.0.1",
+			GuestIP:   "10.0.2.77",
+			GuestPort: 25436,
+		}}); err != nil {
+			t.Fatalf("PreBind: %v", err)
+		}
+		pf.Start(s)
+
+		client, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(pf.BoundRules()[0].HostPort))))
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer client.Close()
+		if err := client.SetDeadline(time.Now().Add(testTimeout)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Write([]byte("probe")); err != nil {
+			t.Fatalf("Write probe: %v", err)
+		}
+		buf := make([]byte, 16)
+		n, err := client.Read(buf)
+		if err == nil {
+			t.Fatalf("client read %q through explicit GuestIP 10.0.2.77, want no loopback fallback", string(buf[:n]))
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatalf("client read timed out instead of closing after guestDialWindow: %v", err)
+		}
+	})
+}

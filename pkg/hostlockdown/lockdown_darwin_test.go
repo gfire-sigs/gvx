@@ -208,6 +208,32 @@ func TestLockdownDarwinOutboundNATAndInbound(t *testing.T) {
 	child.wait(t)
 }
 
+func TestLockdownDarwinLoopbackBind(t *testing.T) {
+	// Use a short writable mount path under /tmp so filepath.Join(ws, "d.sock")
+	// stays within macOS's 104-byte sun_path limit and tests Seatbelt's
+	// network-bind denial inside a writable mount where file-write* is allowed.
+	ws, err := os.MkdirTemp("/tmp", "gvx-lb-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(ws) })
+	child := startChild(t, "net-loopback-bind", childWSEnv+"="+ws)
+	addr := child.readLine(t)
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial dynamic child listener %s: %v\nchild stderr:\n%s", addr, err, child.stderr.String())
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write to dynamic child listener: %v", err)
+	}
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || reply != "pong\n" {
+		t.Fatalf("dynamic child listener reply = %q, %v; want pong\\n\nchild stderr:\n%s", reply, err, child.stderr.String())
+	}
+	child.wait(t)
+}
+
 func TestLockdownDarwinWireGuardStyleUDP(t *testing.T) {
 	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -363,6 +389,8 @@ func runLockedChild(mode string) error {
 		return childNetNone()
 	case "net-nat":
 		return childNetNAT()
+	case "net-loopback-bind":
+		return childNetLoopbackBind()
 	case "net-udp":
 		return childNetUDP()
 	case "net-fresh":
@@ -760,6 +788,14 @@ func childNetNAT() error {
 	// A new listener needs bind, which no profile rule allows.
 	_, err = net.Listen("tcp4", "127.0.0.1:0")
 	c.expect(errors.Is(err, fs.ErrPermission), "new listener = %v, want permission error", err)
+	if ln, err := ListenLoopback("tcp4", "127.0.0.1:0"); err == nil {
+		_ = ln.Close()
+		c.expect(false, "ListenLoopback succeeded with AllowLoopbackBind=false")
+	}
+	if pc, err := ListenPacketLoopback("udp4", "127.0.0.1:0"); err == nil {
+		_ = pc.Close()
+		c.expect(false, "ListenPacketLoopback succeeded with AllowLoopbackBind=false")
+	}
 
 	if err := c.err(); err != nil {
 		return err
@@ -774,6 +810,65 @@ func childNetNAT() error {
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil || line != "ping\n" {
 		return fmt.Errorf("inbound read = %q, %v", line, err)
+	}
+	_, err = conn.Write([]byte("pong\n"))
+	return err
+}
+
+func childNetLoopbackBind() error {
+	ws := os.Getenv(childWSEnv)
+	st, err := Apply(Options{
+		Mounts:            []HostMount{{Path: ws}},
+		AllowOutboundNet:  true,
+		AllowLoopbackBind: true,
+		DynamicListeners:  4,
+	})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	c.expect(!st.NetworkOutboundBlocked, "NetworkOutboundBlocked = true with AllowOutboundNet")
+
+	// Unix socket binds must remain denied under Seatbelt even inside a
+	// writable mount where file-write* is allowed. ListenLoopback rejects
+	// wildcard 0.0.0.0 addresses in Go because XNU Seatbelt matches INADDR_ANY
+	// against (local ip "localhost:*").
+	if ln, err := ListenLoopback("tcp4", "0.0.0.0:0"); err == nil {
+		_ = ln.Close()
+		c.expect(false, "ListenLoopback accepted 0.0.0.0:0")
+	}
+	if ln, err := net.Listen("unix", filepath.Join(ws, "d.sock")); err == nil {
+		_ = ln.Close()
+		c.expect(false, "unix socket bind inside writable mount succeeded, want permission error")
+	} else {
+		c.expect(errors.Is(err, fs.ErrPermission), "unix socket bind inside writable mount = %v, want permission error", err)
+	}
+
+	// Loopback UDP bind succeeds.
+	if pc, err := ListenPacketLoopback("udp4", "127.0.0.1:0"); err != nil {
+		c.expect(false, "ListenPacketLoopback(udp4): %v", err)
+	} else {
+		_ = pc.Close()
+	}
+
+	// Loopback TCP bind succeeds and accepts a connection from the parent.
+	ln, err := ListenLoopback("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("ListenLoopback(tcp4): %w", err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := c.err(); err != nil {
+		return err
+	}
+	fmt.Println(ln.Addr().String())
+	conn, err := AcceptListener(ln)
+	if err != nil {
+		return fmt.Errorf("AcceptListener: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || line != "ping\n" {
+		return fmt.Errorf("dynamic inbound read = %q, %v", line, err)
 	}
 	_, err = conn.Write([]byte("pong\n"))
 	return err

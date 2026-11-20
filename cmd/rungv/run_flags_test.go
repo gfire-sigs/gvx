@@ -287,3 +287,26 @@ func TestRunFlagsGPU(t *testing.T) {
 		})
 	}
 }
+
+func TestRunFlagsAutoPublishIsOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"default", []string{"-image=x"}, false},
+		{"single dash", []string{"-auto-publish", "-image=x"}, true},
+		{"double dash", []string{"--auto-publish", "-image=x"}, true},
+		{"explicit false", []string{"--auto-publish=false", "-image=x"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, _, done, stderr := parse(t, tc.args...)
+			if done {
+				t.Fatalf("parseRunArgs ended the command: %s", stderr)
+			}
+			if rc.cfg.AutoPublishPorts != tc.want {
+				t.Errorf("AutoPublishPorts = %v, want %v", rc.cfg.AutoPublishPorts, tc.want)
+			}
+		})
+	}
+}
