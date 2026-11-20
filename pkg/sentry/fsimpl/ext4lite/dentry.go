@@ -179,9 +179,9 @@ type dentry struct {
 	refs atomicbitops.Int64
 	fs   *filesystem
 
-	// nameMu protects parent and name for readers that do not hold fs.mu.
-	// Writers hold both.
-	nameMu sync.RWMutex `state:"nosave"`
+	// fs.mu protects parent and name. A writer also holds fs.ancestryMu, so
+	// a reader that does not hold fs.mu holds fs.ancestryMu. See
+	// filesystem.ancestryMu.
 	parent *dentry
 	name   string
 
@@ -209,9 +209,11 @@ func (fs *filesystem) newDentryLocked(parent *dentry, name string, ino *inode) *
 	return d
 }
 
+// names returns the parent and the name of d for a caller that does not hold
+// fs.mu.
 func (d *dentry) names() (parent *dentry, name string) {
-	d.nameMu.RLock()
-	defer d.nameMu.RUnlock()
+	d.fs.ancestryMu.RLock()
+	defer d.fs.ancestryMu.RUnlock()
 	return d.parent, d.name
 }
 
@@ -327,10 +329,10 @@ func (fs *filesystem) moveLocked(ctx context.Context, d, newParent *dentry, newN
 	}
 	newParent.children[newName] = d
 	newParent.refs.Add(1)
-	d.nameMu.Lock()
+	fs.ancestryMu.Lock()
 	d.parent = newParent
 	d.name = newName
-	d.nameMu.Unlock()
+	fs.ancestryMu.Unlock()
 	oldParent.decRefLocked(ctx)
 }
 

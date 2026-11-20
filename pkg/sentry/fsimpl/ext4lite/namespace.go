@@ -679,12 +679,10 @@ func (fs *filesystem) exchangeDentriesLocked(ctx context.Context, a, b *dentry) 
 	// before the old ones drop.
 	pa.refs.Add(1)
 	pb.refs.Add(1)
-	a.nameMu.Lock()
-	b.nameMu.Lock()
+	fs.ancestryMu.Lock()
 	a.parent, a.name = pb, nb
 	b.parent, b.name = pa, na
-	b.nameMu.Unlock()
-	a.nameMu.Unlock()
+	fs.ancestryMu.Unlock()
 	pa.decRefLocked(ctx)
 	pb.decRefLocked(ctx)
 }
