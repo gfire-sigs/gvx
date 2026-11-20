@@ -37,15 +37,20 @@ import (
 	"time"
 )
 
-// The GPU gates G1 and G2 of the macOS GPU work prove the virtual render node
-// (-gpu=venus) with unmodified guest Mesa and Chromium. They run only on
-// request, on darwin/arm64 with hvf, with a built gvx-gpu-renderer bundle.
+// The GPU gates G1, G2, and G3 of the macOS GPU work prove the virtual render
+// node (-gpu=venus and -gpu=virgl) with unmodified guest Mesa and Chromium.
+// They run only on request, on darwin/arm64 with hvf, with a built
+// gvx-gpu-renderer bundle.
 const (
 	// gpuGateEnv turns the GPU gates on when it is "1".
 	gpuGateEnv = "GVX_E2E_GPU"
 
+	// gpuModesEnv lists the GPU modes that the gates run, separated by commas:
+	// venus, virgl. Unset means both.
+	gpuModesEnv = "GVX_E2E_GPU_MODES"
+
 	// gpuArtifactEnv names a host directory. Each gate writes its record to
-	// a subdirectory (g1, g2) for the review of a person or an agent. When
+	// a subdirectory (g1, g2, g3) for the review of a person or an agent. When
 	// it is unset, the record goes to a temporary directory of the test.
 	gpuArtifactEnv = "GVX_E2E_ARTIFACT_DIR"
 
@@ -117,9 +122,24 @@ func copyEmbedded(t *testing.T, fsys embed.FS, src, dst string) {
 	}
 }
 
+// gpuModeEnabled reports whether mode is in GVX_E2E_GPU_MODES (default: all).
+func gpuModeEnabled(mode string) bool {
+	raw := strings.TrimSpace(os.Getenv(gpuModesEnv))
+	if raw == "" {
+		return true
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), mode) {
+			return true
+		}
+	}
+	return false
+}
+
 // gpuRun describes one rungv run of a GPU gate.
 type gpuRun struct {
-	gpu       bool              // -gpu=venus when true, -gpu=off otherwise
+	gpu       bool              // -gpu=venus when true and mode is empty, -gpu=off otherwise (kept for G1)
+	mode      string            // -gpu value when not empty: "venus", "virgl", or "off"
 	image     string            // OCI image reference
 	net       string            // -net value
 	workspace string            // host directory at /workspace
@@ -186,9 +206,12 @@ func runGPUGuest(t *testing.T, runDir string, r gpuRun) gpuRunResult {
 // its default (on).
 func rungvArgs(t *testing.T, r gpuRun) []string {
 	t.Helper()
-	mode := "off"
-	if r.gpu {
-		mode = "venus"
+	mode := r.mode
+	if mode == "" {
+		mode = "off"
+		if r.gpu {
+			mode = "venus"
+		}
 	}
 	args := []string{"run", "-gpu=" + mode, "-net=" + r.net, "-cache-dir", sharedCacheDir(t),
 		"-workspace", r.workspace, "-v", r.out + ":" + gpuOutGuestPath}
@@ -554,6 +577,9 @@ func runG1(t *testing.T, art, name string, gpu bool, icd, device string) (g1, vk
 // run points at the GPU path and not at the probe or the packages.
 func TestE2EGateGPUVulkan(t *testing.T) {
 	requireGPUGate(t)
+	if !gpuModeEnabled("venus") {
+		t.Skipf("venus not in %s", gpuModesEnv)
+	}
 	art := gpuArtifactDir(t, "g1")
 	start := time.Now()
 	rec := g1Record{Gate: "G1", Image: g1Image, Snapshot: g1Snapshot, Host: newGPUHostRecord(start),
@@ -768,6 +794,32 @@ func TestScanGPULogKD1ZeroIsExplicit(t *testing.T) {
 	for _, key := range []string{"blob_create_status_io", "renderer_server_failed_to_send_message", "renderer_proxy_socket_disconnected", "context_lost"} {
 		if !strings.Contains(string(data), `"`+key+`":0`) {
 			t.Errorf("KD-1 JSON %s lacks an explicit %q: 0", data, key)
+		}
+	}
+}
+
+// TestGPUModeEnabled verifies GVX_E2E_GPU_MODES parsing with unset, single,
+// comma-separated, and padded values.
+func TestGPUModeEnabled(t *testing.T) {
+	cases := []struct {
+		env  string
+		mode string
+		want bool
+	}{
+		{"", "venus", true},
+		{"", "virgl", true},
+		{"venus", "venus", true},
+		{"venus", "virgl", false},
+		{"virgl", "venus", false},
+		{"virgl", "virgl", true},
+		{"venus, virgl", "virgl", true},
+		{" VIRGL ", "virgl", true},
+		{"none", "venus", false},
+	}
+	for _, c := range cases {
+		t.Setenv(gpuModesEnv, c.env)
+		if got := gpuModeEnabled(c.mode); got != c.want {
+			t.Errorf("gpuModeEnabled(%q) with %s=%q = %v, want %v", c.mode, gpuModesEnv, c.env, got, c.want)
 		}
 	}
 }

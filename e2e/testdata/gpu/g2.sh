@@ -5,7 +5,11 @@
 # Environment:
 #   GVX_G2_MODE  "gpu" installs the pinned Mesa Vulkan packages from
 #                /opt/gpu-debs, pins the venus driver, and checks it with
-#                vulkaninfo first. "swiftshader" runs the reference pass.
+#                vulkaninfo first. "virgl" uses the Mesa EGL and gallium
+#                packages already installed in the browser image
+#                (mesa-libgallium, libegl-mesa0, libegl1, libgl1-mesa-dri),
+#                installing any optional .deb files in /opt/gpu-debs if present.
+#                "swiftshader" runs the reference pass.
 #   GVX_G2_ARGS  Chromium flags (passed to gpu-webgl.js)
 #   GVX_G2_OUT   output directory (passed to gpu-webgl.js)
 #
@@ -33,6 +37,19 @@ if [ "$mode" = gpu ]; then
 	echo "GVX-G2 vulkaninfo_exit=$?"
 	grep -E '^\s*(deviceName|driverInfo|apiVersion)\s*=' "$out/vulkaninfo.txt" \
 		| sed -E 's/^\s*([a-zA-Z]+)\s*=\s*/GVX-G2 vulkaninfo_\1=/'
+elif [ "$mode" = virgl ]; then
+	# playwright:v1.65.1-noble already ships libegl1, libegl-mesa0,
+	# libgl1-mesa-dri, and mesa-libgallium (25.2.8-0ubuntu0.24.04.4), so no
+	# extra virgl .deb files are needed. Install any mounted files if present.
+	if compgen -G "/opt/gpu-debs/*.deb" >/dev/null; then
+		if ! dpkg -i /opt/gpu-debs/*.deb >"$out/dpkg.txt" 2>&1; then
+			echo "GVX-G2 error=dpkg failed"
+			tail -n 5 "$out/dpkg.txt"
+			exit 1
+		fi
+	fi
+	dpkg-query -W -f='GVX-G2 package_${Package}=${Version}\n' mesa-libgallium libegl-mesa0 libegl1 libgl1-mesa-dri
+	echo "GVX-G2 render_node=$(stat -c '%F %t:%T %a' /dev/dri/renderD128 2>&1)"
 fi
 
 exec node /workspace/gpu/gpu-webgl.js

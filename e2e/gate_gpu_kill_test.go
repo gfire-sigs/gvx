@@ -38,6 +38,10 @@ const (
 	// far longer than the test waits (about 0.6 ms each round on hvf).
 	killProbeRounds = "100000000"
 
+	// killVirglRounds keeps glesprobe in its alternating clear-and-readback
+	// loop far longer than the test waits.
+	killVirglRounds = "2000000"
+
 	// killExitTimeout bounds the time from the kill of the renderer to the
 	// exit of rungv. A longer time is a hang.
 	killExitTimeout = 2 * time.Minute
@@ -137,12 +141,13 @@ func orphanRendererPIDs(t *testing.T, since time.Time, ignore []int) (orphans, n
 // killRecord is the result.json of TestE2EGPURendererKill.
 type killRecord struct {
 	Gate               string            `json:"gate"`
+	Mode               string            `json:"mode"`
 	Pass               bool              `json:"pass"`
 	Host               gpuHostRecord     `json:"host"`
 	RendererPID        int               `json:"renderer_pid"`
 	ExitCode           int               `json:"rungv_exit_code"`
 	KillToExitMS       int64             `json:"kill_to_exit_ms"`
-	ProbeOutcome       string            `json:"probe_outcome"` // "vulkan-error" or "signal"
+	ProbeOutcome       string            `json:"probe_outcome"` // "vulkan-error", "gl-error", or "signal"
 	ProbeError         string            `json:"probe_error"`
 	Probe              map[string]string `json:"probe"`
 	RestartedRenderers []int             `json:"restarted_renderers"`
@@ -153,16 +158,34 @@ type killRecord struct {
 	Failures           []string          `json:"failures"`
 }
 
-// TestE2EGPURendererKill kills the renderer while the guest compute probe of
-// gate G1 runs its submit-and-wait loop. The guest must report a Vulkan error
-// or exit by signal. The sandbox must exit with that code within
-// killExitTimeout. The Sentry must log the lost renderer, and no renderer
-// process may remain. The renderer never restarts.
+// TestE2EGPURendererKill kills the renderer while the guest probe runs its
+// submit-and-wait loop in venus mode or its alternating clear-and-readback
+// loop in virgl mode. The guest must report a probe error or exit by signal.
+// The sandbox must exit with that code within killExitTimeout. The Sentry must
+// log the lost renderer, and no renderer process may remain. The renderer
+// never restarts.
 func TestE2EGPURendererKill(t *testing.T) {
 	requireGPUGate(t)
-	art := gpuArtifactDir(t, "g1-kill")
+	for _, mode := range []string{"venus", "virgl"} {
+		t.Run(mode, func(t *testing.T) {
+			if !gpuModeEnabled(mode) {
+				t.Skipf("%s not in %s", mode, gpuModesEnv)
+			}
+			runRendererKill(t, gpuArtifactDir(t, filepath.Join("g1-kill", mode)), mode)
+		})
+	}
+}
+
+// runRendererKill executes one renderer-kill scenario for mode ("venus" or
+// "virgl") and writes its record to art/result.json.
+func runRendererKill(t *testing.T, art, mode string) {
+	t.Helper()
 	start := time.Now()
-	rec := &killRecord{Gate: "G1-kill", Host: newGPUHostRecord(start)}
+	gateName := "G1-kill"
+	if mode == "virgl" {
+		gateName = "G3-kill"
+	}
+	rec := &killRecord{Gate: gateName, Mode: mode, Host: newGPUHostRecord(start)}
 	defer func() {
 		rec.Host.DurationSec = int(time.Since(start).Seconds())
 		rec.Pass = !t.Failed()
@@ -174,15 +197,53 @@ func TestE2EGPURendererKill(t *testing.T) {
 		rec.Failures = append(rec.Failures, fmt.Sprintf(format, args...))
 	}
 
+	var (
+		env          []string
+		argv         []string
+		readyLine    string
+		execProbeTag string
+		probePrefix  string
+		errorOutcome string
+	)
+	switch mode {
+	case "venus":
+		env = []string{
+			"GVX_G1_SNAPSHOT=" + g1Snapshot,
+			"GVX_G1_ICD=" + venusICD,
+			"GVX_G1_DEVICE=Venus",
+			"GVX_G1_EXEC_PROBE=1",
+			"GVX_VK_ROUNDS=" + killProbeRounds,
+		}
+		argv = []string{"bash", "/workspace/gpu/g1.sh"}
+		readyLine = "GVX-VK rounds_begin="
+		execProbeTag = "GVX-G1 exec_probe=1"
+		probePrefix = "GVX-VK "
+		errorOutcome = "vulkan-error"
+	case "virgl":
+		env = []string{
+			"GVX_G3_SNAPSHOT=" + g1Snapshot,
+			"GVX_G3_EXEC_PROBE=1",
+			"GVX_GL_ROUNDS=" + killVirglRounds,
+		}
+		argv = []string{"bash", "/workspace/gpu/g3.sh"}
+		readyLine = "GVX-GL rounds_begin="
+		execProbeTag = "GVX-G3 exec_probe=1"
+		probePrefix = "GVX-GL "
+		errorOutcome = "gl-error"
+	default:
+		t.Fatalf("unknown GPU kill mode %q", mode)
+	}
+
 	beforeOrphans, _ := orphanRendererPIDs(t, time.Time{}, nil)
-	runDir, out := newGPURunDir(t, art, "venus")
+	out := filepath.Join(art, "out")
+	if err := os.MkdirAll(out, 0o777); err != nil {
+		t.Fatalf("create %s: %v", out, err)
+	}
 	args := rungvArgs(t, gpuRun{
-		gpu: true, image: g1Image, net: "nat", workspace: g1Workspace(t), out: out,
-		env: []string{"GVX_G1_SNAPSHOT=" + g1Snapshot, "GVX_G1_ICD=" + venusICD, "GVX_G1_DEVICE=Venus",
-			"GVX_G1_EXEC_PROBE=1", "GVX_VK_ROUNDS=" + killProbeRounds},
-		argv: []string{"bash", "/workspace/gpu/g1.sh"},
+		mode: mode, image: g1Image, net: "nat", workspace: g1Workspace(t), out: out,
+		env: env, argv: argv,
 	})
-	logPath := filepath.Join(runDir, "sentry.log")
+	logPath := filepath.Join(art, "sentry.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create %s: %v", logPath, err)
@@ -209,14 +270,14 @@ func TestE2EGPURendererKill(t *testing.T) {
 			_ = cmd.Process.Kill()
 			<-done
 		}
-		if err := os.WriteFile(filepath.Join(runDir, "stdout.txt"), []byte(stdout.String()), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(art, "stdout.txt"), []byte(stdout.String()), 0o644); err != nil {
 			t.Errorf("write stdout.txt: %v", err)
 		}
 	}()
 
-	// The loop starts after apt, the build, vulkaninfo, the dispatch, and
-	// the check of the result.
-	stdout.waitFor(t, 0, "GVX-VK rounds_begin=", g1Timeout, done)
+	// The loop starts after apt, the build, the info tool, and the pre-kill
+	// probe checks.
+	stdout.waitFor(t, 0, readyLine, g1Timeout, done)
 	children := processPIDs(t, "-P", strconv.Itoa(cmd.Process.Pid), "-x", rendererComm)
 	if len(children) != 1 {
 		t.Fatalf("renderer children of rungv %d = %v, want exactly one", cmd.Process.Pid, children)
@@ -265,30 +326,41 @@ waitExit:
 	}
 
 	text := stdout.String()
-	rec.Probe = keyValues(text, "GVX-VK ")
+	rec.Probe = keyValues(text, probePrefix)
 	rec.ProbeError = rec.Probe["error"]
 	scan := scanGPULog(t, logPath)
 	rec.KD1, rec.RefusedIoctls = scan.KD1, scan.Refused
 
-	// The probe exits 1 when a Vulkan call fails (CHECK prints "GVX-VK error=...").
-	// It exits 128+signal when the guest driver aborts (SIGABRT gives 134).
-	// Because the probe replaced g1.sh via exec, the sandbox returns its exit code.
-	if !strings.Contains(text, "GVX-G1 exec_probe=1") {
-		fail("g1.sh did not exec the probe; stdout tail:\n%s", tail(text, 20))
+	// The probe exits 1 when a call or pixel check fails (printing
+	// "<probePrefix>error=..."). It exits 128+signal when the guest driver
+	// aborts (SIGABRT gives 134). Because the probe replaced the script via
+	// exec, the sandbox returns its exit code.
+	if !strings.Contains(text, execProbeTag) {
+		fail("guest script did not exec the probe (%s missing); stdout tail:\n%s", execProbeTag, tail(text, 20))
 	}
-	if want := g1ProbeWords + " mismatches=0 first_bad=-1"; rec.Probe["checked"] != want {
-		fail("pre-kill probe checked = %q, want %q", rec.Probe["checked"], want)
+	switch mode {
+	case "venus":
+		if want := g1ProbeWords + " mismatches=0 first_bad=-1"; rec.Probe["checked"] != want {
+			fail("pre-kill probe checked = %q, want %q", rec.Probe["checked"], want)
+		}
+		if rec.Probe["result"] == "PASS" {
+			fail("probe reported PASS after the renderer kill")
+		}
+	case "virgl":
+		if rec.Probe["result"] != "PASS" {
+			fail("pre-kill probe result = %q, want PASS", rec.Probe["result"])
+		}
+		if _, finished := rec.Probe["rounds_end"]; finished {
+			fail("probe reported rounds_end=%s after the renderer kill", rec.Probe["rounds_end"])
+		}
 	}
 	switch {
 	case rec.ProbeError != "" && rec.ExitCode == 1:
-		rec.ProbeOutcome = "vulkan-error"
+		rec.ProbeOutcome = errorOutcome
 	case rec.ProbeError == "" && rec.ExitCode > 128 && rec.ExitCode <= 192:
 		rec.ProbeOutcome = "signal"
 	default:
-		fail("rungv exit code %d with probe error %q: want 1 with a Vulkan error, or 129..192 without one", rec.ExitCode, rec.ProbeError)
-	}
-	if rec.Probe["result"] == "PASS" {
-		fail("probe reported PASS after the renderer kill")
+		fail("rungv exit code %d with probe error %q: want 1 with a probe error, or 129..192 without one", rec.ExitCode, rec.ProbeError)
 	}
 	if rec.KD1.RendererLost < 1 {
 		fail("the Sentry log has no \"virtgpu: renderer lost\" line for the kill (renderer_lost = 0)")

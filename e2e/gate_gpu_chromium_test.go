@@ -44,6 +44,12 @@ const (
 	gpuChromiumFlags    = "--use-angle=vulkan --ignore-gpu-blocklist --disable-vulkan-surface"
 	gpuChromiumFlagsEnv = "GVX_E2E_GPU_CHROMIUM_FLAGS"
 
+	// gpuChromiumVirglFlags are the Chromium flags of the virgl pass: ANGLE on
+	// the system OpenGL ES (Mesa virgl) through EGL, no GPU blocklist.
+	gpuChromiumVirglFlags    = "--use-gl=angle --use-angle=gl-egl --ignore-gpu-blocklist"
+	gpuChromiumVirglFlagsEnv = "GVX_E2E_GPU_CHROMIUM_VIRGL_FLAGS"
+	g2VirglBrowsers          = "headless-shell"
+
 	// referenceChromiumFlags select SwiftShader for the reference pass.
 	referenceChromiumFlags = "--use-angle=swiftshader --enable-unsafe-swiftshader"
 
@@ -147,6 +153,15 @@ type g2Browser struct {
 	Failures         []string          `json:"failures"`
 }
 
+// g2ModeRecord is the record of an additional GPU mode pass in g2Record.
+type g2ModeRecord struct {
+	ChromiumFlags string            `json:"chromium_flags"`
+	Guest         map[string]string `json:"guest"`
+	Browsers      []*g2Browser      `json:"browsers"`
+	RefusedIoctls []refusedIoctl    `json:"refused_ioctls"`
+	Failures      []string          `json:"failures"`
+}
+
 // g2Record is the result.json of gate G2.
 type g2Record struct {
 	Gate           string               `json:"gate"`
@@ -159,6 +174,7 @@ type g2Record struct {
 	ReferenceFlags string               `json:"reference_flags"`
 	Guest          map[string]string    `json:"guest"`
 	Browsers       []*g2Browser         `json:"browsers"`
+	Virgl          *g2ModeRecord        `json:"virgl,omitempty"`
 	RefusedIoctls  []refusedIoctl       `json:"refused_ioctls"`
 	KD1            map[string]kd1Counts `json:"kd1"`
 	KD1Report      bool                 `json:"kd1_report_required"`
@@ -183,10 +199,15 @@ func g2Workspace(t *testing.T) string {
 // of both pages, and match the reference scene.
 func TestE2EGateGPUChromium(t *testing.T) {
 	requireGPUGate(t)
+	runVenus := gpuModeEnabled("venus")
+	runVirgl := gpuModeEnabled("virgl")
+	if !runVenus && !runVirgl {
+		t.Skipf("neither venus nor virgl in %s", gpuModesEnv)
+	}
 	art := gpuArtifactDir(t, "g2")
 	pwcore := acceptprog.FetchPlaywrightCore(t)
-	debs := acceptprog.FetchGPUGuestDebs(t, hostArch())
 	flags := cmp.Or(os.Getenv(gpuChromiumFlagsEnv), gpuChromiumFlags)
+	virglFlags := cmp.Or(os.Getenv(gpuChromiumVirglFlagsEnv), gpuChromiumVirglFlags)
 	navEnv := []string{"GVX_G2_NAV_TIMEOUTS=" + g2NavTimeouts}
 	navOverride := os.Getenv(g2NavTimeoutOverrideEnv)
 	if navOverride != "" {
@@ -228,11 +249,15 @@ func TestE2EGateGPUChromium(t *testing.T) {
 	}
 	readOnly := map[string]string{pwcore: playwrightCoreGuestPath}
 
+	refBrowsers := g2Browsers
+	if !runVenus {
+		refBrowsers = g2VirglBrowsers
+	}
 	refDir, refOut := newGPURunDir(t, art, "swiftshader")
 	ref := runGPUGuest(t, refDir, gpuRun{
 		image: browserImage, net: "none", workspace: g2Workspace(t), out: refOut, readOnly: readOnly,
 		env: append([]string{"GVX_G2_MODE=swiftshader", "GVX_G2_ARGS=" + referenceChromiumFlags,
-			"GVX_G2_OUT=" + gpuOutGuestPath, "GVX_G2_CHANNELS=" + g2Browsers}, navEnv...),
+			"GVX_G2_OUT=" + gpuOutGuestPath, "GVX_G2_CHANNELS=" + refBrowsers}, navEnv...),
 		argv:    []string{"bash", "/workspace/gpu/g2.sh"},
 		timeout: g2Timeout,
 	})
@@ -244,60 +269,105 @@ func TestE2EGateGPUChromium(t *testing.T) {
 		t.FailNow()
 	}
 
-	gpuReadOnly := map[string]string{pwcore: playwrightCoreGuestPath, debs: gpuDebsGuestPath}
-	gpuDir, gpuOut := newGPURunDir(t, art, "gpu")
-	res := runGPUGuest(t, gpuDir, gpuRun{
-		gpu: true, image: browserImage, net: "none", workspace: g2Workspace(t), out: gpuOut, readOnly: gpuReadOnly,
-		env: append([]string{"GVX_G2_MODE=gpu", "GVX_G2_ARGS=" + flags,
-			"GVX_G2_OUT=" + gpuOutGuestPath, "GVX_G2_CHANNELS=" + g2Browsers}, navEnv...),
-		argv:    []string{"bash", "/workspace/gpu/g2.sh"},
-		timeout: g2Timeout,
-	})
-	scan := scanGPULog(t, res.log)
-	rec.RefusedIoctls = scan.Refused
-	rec.KD1["gpu"] = scan.KD1
-	writeJSON(t, filepath.Join(art, "refused-ioctls.json"), rec.RefusedIoctls)
-	for _, r := range rec.RefusedIoctls {
-		t.Logf("refused ioctl: %s nr %s cmd %s: %s (files %d)", r.Name, r.Nr, r.Cmd, r.Error, r.Files)
-	}
-	if !strings.Contains(res.stdout, "GVX-G2 mode=gpu") {
-		note(t, &rec.Failures, "GPU guest did not start (rungv exit %d): %s", res.code, rungvError(res.log))
-		t.FailNow()
-	}
-	rec.Guest = keyValues(res.stdout, "GVX-G2 ")
-
-	t.Run("vulkan", func(t *testing.T) {
-		g := rec.Guest
-		if g["vulkaninfo_exit"] != "0" {
-			note(t, &rec.Failures, "vulkaninfo exit = %q, want 0 (see gpu/out/vulkaninfo.txt)", g["vulkaninfo_exit"])
-		}
-		if name := g["vulkaninfo_deviceName"]; !strings.HasPrefix(name, venusDeviceName) {
-			note(t, &rec.Failures, "vulkaninfo deviceName = %q, want %q", name, venusDeviceName+" (...)")
-		}
-		mesa, gallium := g["package_mesa-vulkan-drivers"], g["package_mesa-libgallium"]
-		if mesa == "" || mesa != gallium {
-			note(t, &rec.Failures, "mesa-vulkan-drivers %q and mesa-libgallium %q differ: FetchGPUGuestDebs does not match the image", mesa, gallium)
-		}
-	})
-
-	for _, name := range strings.Fields(g2Browsers) {
-		b := &g2Browser{Name: name}
-		rec.Browsers = append(rec.Browsers, b)
-		t.Run(name, func(t *testing.T) {
-			evalG2Browser(t, art, refOut, gpuOut, res.stdout, b, func(format string, args ...any) {
-				t.Helper()
-				note(t, &b.Failures, format, args...)
-			})
-			b.Pass = !t.Failed()
+	if runVenus {
+		debs := acceptprog.FetchGPUGuestDebs(t, hostArch())
+		gpuReadOnly := map[string]string{pwcore: playwrightCoreGuestPath, debs: gpuDebsGuestPath}
+		gpuDir, gpuOut := newGPURunDir(t, art, "gpu")
+		res := runGPUGuest(t, gpuDir, gpuRun{
+			gpu: true, image: browserImage, net: "none", workspace: g2Workspace(t), out: gpuOut, readOnly: gpuReadOnly,
+			env: append([]string{"GVX_G2_MODE=gpu", "GVX_G2_ARGS=" + flags,
+				"GVX_G2_OUT=" + gpuOutGuestPath, "GVX_G2_CHANNELS=" + g2Browsers}, navEnv...),
+			argv:    []string{"bash", "/workspace/gpu/g2.sh"},
+			timeout: g2Timeout,
 		})
+		scan := scanGPULog(t, res.log)
+		rec.RefusedIoctls = scan.Refused
+		rec.KD1["gpu"] = scan.KD1
+		writeJSON(t, filepath.Join(art, "refused-ioctls.json"), rec.RefusedIoctls)
+		for _, r := range rec.RefusedIoctls {
+			t.Logf("refused ioctl: %s nr %s cmd %s: %s (files %d)", r.Name, r.Nr, r.Cmd, r.Error, r.Files)
+		}
+		if !strings.Contains(res.stdout, "GVX-G2 mode=gpu") {
+			note(t, &rec.Failures, "GPU guest did not start (rungv exit %d): %s", res.code, rungvError(res.log))
+		} else {
+			rec.Guest = keyValues(res.stdout, "GVX-G2 ")
+
+			t.Run("vulkan", func(t *testing.T) {
+				g := rec.Guest
+				if g["vulkaninfo_exit"] != "0" {
+					note(t, &rec.Failures, "vulkaninfo exit = %q, want 0 (see gpu/out/vulkaninfo.txt)", g["vulkaninfo_exit"])
+				}
+				if name := g["vulkaninfo_deviceName"]; !strings.HasPrefix(name, venusDeviceName) {
+					note(t, &rec.Failures, "vulkaninfo deviceName = %q, want %q", name, venusDeviceName+" (...)")
+				}
+				mesa, gallium := g["package_mesa-vulkan-drivers"], g["package_mesa-libgallium"]
+				if mesa == "" || mesa != gallium {
+					note(t, &rec.Failures, "mesa-vulkan-drivers %q and mesa-libgallium %q differ: FetchGPUGuestDebs does not match the image", mesa, gallium)
+				}
+			})
+
+			for _, name := range strings.Fields(g2Browsers) {
+				b := &g2Browser{Name: name}
+				rec.Browsers = append(rec.Browsers, b)
+				t.Run(name, func(t *testing.T) {
+					evalG2Browser(t, art, refOut, gpuOut, res.stdout, b, requireGPURenderer, "", func(format string, args ...any) {
+						t.Helper()
+						note(t, &b.Failures, format, args...)
+					})
+					b.Pass = !t.Failed()
+				})
+			}
+		}
+	}
+
+	if runVirgl {
+		rec.Files["virgl_run"] = "virgl/{stdout.txt,sentry.log,sentry-gpu.log,refused-ioctls.json,out/}"
+		rec.Files["virgl_browser"] = "virgl/<browser>/{scene-gpu.png,scene-swiftshader.png,scene-diff.png,probe-gpu.png,probe-swiftshader.png,scene-gpu.json,scene-swiftshader.json,gpu-info-gpu.json,gpu-info-swiftshader.json}"
+		rec.Virgl = &g2ModeRecord{ChromiumFlags: virglFlags}
+		virglDir, virglOut := newGPURunDir(t, art, "virgl")
+		virglRes := runGPUGuest(t, virglDir, gpuRun{
+			mode: "virgl", image: browserImage, net: "none", workspace: g2Workspace(t), out: virglOut, readOnly: readOnly,
+			env: append([]string{"GVX_G2_MODE=virgl", "GVX_G2_ARGS=" + virglFlags,
+				"GVX_G2_OUT=" + gpuOutGuestPath, "GVX_G2_CHANNELS=" + g2VirglBrowsers}, navEnv...),
+			argv:    []string{"bash", "/workspace/gpu/g2.sh"},
+			timeout: g2Timeout,
+		})
+		scan := scanGPULog(t, virglRes.log)
+		rec.Virgl.RefusedIoctls = scan.Refused
+		rec.KD1["virgl"] = scan.KD1
+		writeJSON(t, filepath.Join(virglDir, "refused-ioctls.json"), rec.Virgl.RefusedIoctls)
+		for _, r := range rec.Virgl.RefusedIoctls {
+			t.Logf("virgl refused ioctl: %s nr %s cmd %s: %s (files %d)", r.Name, r.Nr, r.Cmd, r.Error, r.Files)
+		}
+		if !strings.Contains(virglRes.stdout, "GVX-G2 mode=virgl") {
+			note(t, &rec.Virgl.Failures, "virgl guest did not start (rungv exit %d): %s", virglRes.code, rungvError(virglRes.log))
+			return
+		}
+		rec.Virgl.Guest = keyValues(virglRes.stdout, "GVX-G2 ")
+		if rec.Virgl.Guest["render_node"] != renderNodeStat {
+			note(t, &rec.Virgl.Failures, "virgl render_node = %q, want %q", rec.Virgl.Guest["render_node"], renderNodeStat)
+		}
+		for _, name := range strings.Fields(g2VirglBrowsers) {
+			b := &g2Browser{Name: name}
+			rec.Virgl.Browsers = append(rec.Virgl.Browsers, b)
+			t.Run("virgl/"+name, func(t *testing.T) {
+				evalG2Browser(t, art, refOut, virglOut, virglRes.stdout, b, requireGLRenderer, "virgl", func(format string, args ...any) {
+					t.Helper()
+					note(t, &b.Failures, format, args...)
+				})
+				b.Pass = !t.Failed()
+			})
+		}
 	}
 }
 
-// evalG2Browser checks the files of one browser and fills b. fail reports
+// evalG2Browser checks the files of one browser and fills b. check validates
+// the renderer string on the probe and scene pages. artSub names an optional
+// subdirectory under art (empty for venus, "virgl" for virgl). fail reports
 // one failed check.
-func evalG2Browser(t *testing.T, art, refOut, gpuOut, stdout string, b *g2Browser, fail func(format string, args ...any)) {
+func evalG2Browser(t *testing.T, art, refOut, gpuOut, stdout string, b *g2Browser, check func(renderer, page string, fail func(string, ...any)), artSub string, fail func(format string, args ...any)) {
 	t.Helper()
-	dir := filepath.Join(art, b.Name)
+	dir := filepath.Join(art, artSub, b.Name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("create %s: %v", dir, err)
 	}
@@ -331,7 +401,7 @@ func evalG2Browser(t *testing.T, art, refOut, gpuOut, stdout string, b *g2Browse
 		return
 	}
 	b.Probe = parseWebGLProbe(string(probeText))
-	requireGPURenderer(b.Probe["renderer"], "probe", fail)
+	check(b.Probe["renderer"], "probe", fail)
 	for key, want := range map[string]string{"context": "webgl", "left": "255,0,0,255", "right": "0,0,255,255", "error": "0"} {
 		if b.Probe[key] != want {
 			fail("probe %s = %q, want %q", key, b.Probe[key], want)
@@ -348,7 +418,7 @@ func evalG2Browser(t *testing.T, art, refOut, gpuOut, stdout string, b *g2Browse
 		fail("browser %s did not finish the scene page; driver line: %s", b.Name, g2ErrorLine(stdout, b.Name))
 		return
 	}
-	requireGPURenderer(b.Scene.UnmaskedRenderer, "scene", fail)
+	check(b.Scene.UnmaskedRenderer, "scene", fail)
 	if !b.Scene.Pass {
 		fail("scene pass = false: errors %v, pixel checks %+v", b.Scene.Errors, b.Scene.PixelChecks)
 	}
@@ -392,6 +462,14 @@ func readTimings(path string) map[string]int {
 func requireGPURenderer(renderer, page string, fail func(format string, args ...any)) {
 	if !vulkanRendererRE.MatchString(renderer) || !venusRendererRE.MatchString(renderer) || softwareRendererRE.MatchString(renderer) {
 		fail("%s renderer = %q, want a Vulkan renderer on venus or virtio, and no software renderer", page, renderer)
+	}
+}
+
+// requireGLRenderer reports a renderer string that is not ANGLE on Mesa virgl
+// or that names a software renderer.
+func requireGLRenderer(renderer, page string, fail func(format string, args ...any)) {
+	if !strings.Contains(strings.ToLower(renderer), "virgl") || softwareRendererRE.MatchString(renderer) {
+		fail("%s renderer = %q, want ANGLE on Mesa virgl, and no software renderer", page, renderer)
 	}
 }
 
@@ -534,8 +612,24 @@ func writeG2QA(t *testing.T, art string, rec *g2Record) {
 		}
 		sb.WriteString("\n")
 	}
+	if rec.Virgl != nil {
+		fmt.Fprintf(&sb, "## virgl pass\n\nChromium flags: `%s`.\n\n", rec.Virgl.ChromiumFlags)
+		for _, b := range rec.Virgl.Browsers {
+			renderer := ""
+			if b.Scene != nil {
+				renderer = b.Scene.UnmaskedRenderer
+			}
+			fmt.Fprintf(&sb, "### virgl/%s\n\nAutomatic checks: pass=%v. Renderer: `%s`. Mismatch fraction: %.4f.\n\n", b.Name, b.Pass, renderer, b.SceneMismatchFraction)
+			fmt.Fprintf(&sb, "First page on the GPU: %d ms with a navigation timeout of %d ms. Second page: %d ms.\n\n",
+				b.FirstPageMillis, b.NavTimeoutMillis, b.Timings["second_page_ms"])
+			for i, item := range rec.QAChecklist {
+				fmt.Fprintf(&sb, "%d. %s\n", i+1, item)
+			}
+			sb.WriteString("\n")
+		}
+	}
 	sb.WriteString("## Known defect KD-1\n\nCounts from the captured Sentry debug log (an explicit 0 means none). A non-zero BLOB_CREATE or renderer count, or complete=false, goes to the parent session.\n\n")
-	for _, name := range []string{"gpu", "swiftshader"} {
+	for _, name := range []string{"gpu", "virgl", "swiftshader"} {
 		if k, ok := rec.KD1[name]; ok {
 			fmt.Fprintf(&sb, "- %s: %s\n", name, k)
 		}
@@ -565,6 +659,26 @@ func TestRequireGPURendererRejectsSoftware(t *testing.T) {
 		requireGPURenderer(c.renderer, "probe", func(string, ...any) { failed = true })
 		if failed == c.pass {
 			t.Errorf("requireGPURenderer(%q) failed = %v, want pass %v", c.renderer, failed, c.pass)
+		}
+	}
+}
+
+// TestRequireGLRendererRejectsSoftware verifies that requireGLRenderer accepts
+// ANGLE on Mesa virgl and rejects llvmpipe, SwiftShader, and empty strings.
+func TestRequireGLRendererRejectsSoftware(t *testing.T) {
+	for _, c := range []struct {
+		renderer string
+		pass     bool
+	}{
+		{"ANGLE (Mesa, virgl (Apple M1 Ultra), OpenGL ES 3.2 Mesa 25.2.8)", true},
+		{"ANGLE (Mesa, llvmpipe (LLVM 20.1.2, 128 bits), OpenGL 4.5)", false},
+		{"ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)", false},
+		{"", false},
+	} {
+		var failed bool
+		requireGLRenderer(c.renderer, "probe", func(string, ...any) { failed = true })
+		if failed == c.pass {
+			t.Errorf("requireGLRenderer(%q) failed = %v, want pass %v", c.renderer, failed, c.pass)
 		}
 	}
 }
