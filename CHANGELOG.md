@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.17.10032026111600] - 2026-11-20
+
+This release fixes a lock-order deadlock between mount propagation and renames on `ext4lite` and `hostfs` (#209). Both file systems now protect dentry ancestry with a leaf `ancestryMu` lock instead of `fs.mu`.
 
 ### Bug Fixes
 
