@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Deadlock between mounts and renames on `ext4lite` and `hostfs` (`pkg/sentry/fsimpl/ext4lite`, `pkg/sentry/fsimpl/hostfs`)**: `IsDescendant` and `PrependPath` took the file system lock `fs.mu`, but the VFS lock order puts their locks last. The VFS calls `IsDescendant` with its mount lock held, and a rename, an unlink, or an rmdir holds `fs.mu` while it waits for that lock. A mount with propagation during a rename stopped every file system call of the guest, for example in a `docker build` with parallel RUN steps. Both file systems now protect the parent and the name of each dentry with a file-system-wide `ancestryMu`. It is the last lock in the order, as in the upstream `fstree`.
+
 ## [v0.17.10002026110900] - 2026-11-17
 
 This release adds online `ext4lite` hole punching and `FITRIM` support, `LOCK_SH` shared read-only volume mounts, and `type=overlay` copy-on-write volume mounts. It also adds multi-sandbox `hostfs` `.gvx_meta.lock` synchronization under `hostlockdown`.
