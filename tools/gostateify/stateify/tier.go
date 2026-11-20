@@ -64,6 +64,7 @@ var tier1Prefixes = []string{
 	"pkg/tcpip/link/vxlan/",
 	"pkg/tcpip/link/wgtun/",
 	"pkg/sentry/platform/hvcommon/",
+	"pkg/sentry/devices/virtgpu/",
 	"e2e/",
 	"scripts/",
 	"tools/upstream/",
@@ -73,6 +74,7 @@ var tier1Prefixes = []string{
 	"tools/androidprobe/",
 	"tools/gostateify/",
 	"android/",
+	"gpurenderer/",
 	"docs/",
 	"internal/",
 }

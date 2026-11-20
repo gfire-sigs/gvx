@@ -35,6 +35,8 @@ PROTECT pkg/sentry/blockdev/**
 PROTECT pkg/sentry/platform/whpx/**
 PROTECT pkg/sentry/platform/hvf/**
 PROTECT pkg/sentry/platform/hvcommon/**
+PROTECT pkg/sentry/devices/virtgpu/**
+PROTECT gpurenderer/**
 PROTECT pkg/sentry/platform/systrap/*_windows*
 PROTECT pkg/sentry/platform/systrap/*_darwin*
 PROTECT pkg/sentry/platform/systrap/*_xplat*

@@ -117,6 +117,21 @@ func TestBoundaryAllowListsFollowSpecTable(t *testing.T) {
 			imports: []string{"golang.org/x/sys/windows", "golang.org/x/sys/unix"},
 			bad:     []string{m + "pkg/sentry/vfs", m + "pkg/log"},
 		},
+		{
+			name: "virtgpu device uses sentry interfaces only", file: "pkg/sentry/devices/virtgpu/virtgpu.go",
+			imports: []string{m + "pkg/sentry/vfs", m + "pkg/sentry/kernel", m + "pkg/sentry/memmap", m + "pkg/abi/linux", m + "pkg/fd", m + "pkg/marshal/primitive", m + "pkg/waiter", m + "pkg/safemem", m + "pkg/context", m + "pkg/hostarch", m + "pkg/sentry/devices/virtgpu/gpuproto", "golang.org/x/sys/unix"},
+			bad:     []string{m + "internal/gpurender", m + "pkg/sentry/platform/hvf", m + "pkg/gvx", m + "pkg/hostlockdown"},
+		},
+		{
+			name: "gpuproto is a leaf contract", file: "pkg/sentry/devices/virtgpu/gpuproto/gen/main.go",
+			imports: []string{m + "pkg/sentry/devices/virtgpu/gpuproto", m + "pkg/fd", "encoding/binary"},
+			bad:     []string{m + "pkg/sentry/kernel", m + "pkg/sentry/devices/virtgpu", m + "internal/gpurender", m + "pkg/gvx"},
+		},
+		{
+			name: "gpurender client stays out of the sentry", file: "internal/gpurender/client.go",
+			imports: []string{m + "pkg/sentry/devices/virtgpu/gpuproto", m + "pkg/fd", m + "internal/xsys/unix", "net"},
+			bad:     []string{m + "pkg/sentry/devices/virtgpu", m + "pkg/sentry/kernel", m + "pkg/gvx", m + "pkg/hostlockdown"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

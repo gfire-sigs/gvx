@@ -188,7 +188,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:       "pkg/gvx",
 		tier:      Tier1Additive,
-		allowed:   []string{"pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/state", "pkg/tcpip/*"},
+		allowed:   []string{"pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/state", "pkg/tcpip/*", "internal/gpurender"},
 		forbidden: []string{"cmd/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "shim/*"},
 	},
 	{
@@ -333,6 +333,24 @@ var boundaryRules = []importRule{
 		allowed:   []string{"golang.zx2c4.com/wireguard/*", "pkg/abi/linux", "pkg/atomicbitops", "pkg/buffer", "pkg/context", "pkg/errors/linuxerr", "pkg/hostarch", "pkg/log", "pkg/marshal/primitive", "pkg/sentry/kernel", "pkg/sentry/kernel/auth", "pkg/sentry/socket/netlink/genetlink", "pkg/sentry/socket/netlink/nlmsg", "pkg/sentry/socket/netstack", "pkg/sentry/usage", "pkg/state", "pkg/sync", "pkg/syserr", "pkg/tcpip/*", "pkg/waiter"},
 		forbidden: append([]string{xSysWindows, xSysUnix, "pkg/sentry/platform/*"}, tier2UpperBans...),
 	},
+	{
+		pkg:  "pkg/sentry/devices/virtgpu",
+		tier: Tier1Additive,
+		allowed: []string{
+			pkgSentryAll, "pkg/abi/linux", "pkg/fd", "pkg/marshal/*", "pkg/waiter",
+			"pkg/sync", "pkg/safemem", "pkg/refs", xSysUnix,
+		},
+		forbidden:     tier2UpperBans,
+		forbiddenProd: []string{"pkg/sentry/platform/*", "internal/*"},
+	},
+	{
+		pkg:             "pkg/sentry/devices/virtgpu/gpuproto",
+		tier:            Tier1Additive,
+		subtree:         true,
+		allowed:         []string{"pkg/fd"},
+		forbidden:       append([]string{pkgSentryAll, "internal/*"}, runtimeOuterBans...),
+		forbiddenExcept: []string{"pkg/sentry/devices/virtgpu/gpuproto/*"},
+	},
 
 	// Tier 1 black-box test suite, internal probes/fixtures, scripts, and repository tools.
 	{
@@ -365,6 +383,14 @@ var boundaryRules = []importRule{
 		tier:      Tier1Additive,
 		allowed:   []string{"pkg/sentry/platform/hvf", "pkg/sentry/platform/whpx"},
 		forbidden: append([]string{"pkg/sentry/kernel/*"}, tier2UpperBans...),
+	},
+	{
+		pkg:             "internal/gpurender",
+		tier:            Tier1Additive,
+		subtree:         true,
+		allowed:         []string{"pkg/sentry/devices/virtgpu/gpuproto", "pkg/fd", xSysUnix},
+		forbidden:       append([]string{pkgSentryAll, "pkg/gvx/*"}, runtimeOuterBans...),
+		forbiddenExcept: []string{"pkg/sentry/devices/virtgpu/gpuproto"},
 	},
 	{
 		pkg:       "internal/systraptest",
@@ -832,6 +858,7 @@ func tier2AllPackages() []string {
 // sentryAPIUsers lists gvx-owned packages that implement or call Sentry interfaces.
 var sentryAPIUsers = []string{
 	"pkg/gvx",
+	"pkg/sentry/devices/virtgpu",
 	"pkg/sentry/fsimpl/hostfs",
 	"pkg/sentry/fsimpl/ext4lite",
 	"pkg/sentry/fsimpl/chunkcache",
@@ -974,6 +1001,10 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/pgalloc"}, "pkg/sentry/state/stateio", "save and restore unit tests construct stateio async page streams"},
 	{[]string{"pkg/sentry/pgalloc"}, "pkg/compressio", "save and restore unit tests round-trip streams through compressio"},
 	{[]string{"pkg/gvx"}, "pkg/state", "EROFS restore tests round-trip VFS mounts and open file descriptions"},
+	{[]string{"pkg/sentry/devices/virtgpu"}, "internal/*", "device tests drive the real renderer through internal/gpurender and need internal/hvtest"},
+	{[]string{"pkg/sentry/devices/virtgpu"}, "pkg/memutil", "device tests set up the hvf memory file for a real address space"},
+	{[]string{"pkg/sentry/devices/virtgpu"}, "pkg/cpuid", "device tests initialize CPUID feature sets before they build an hvf context"},
+	{[]string{"pkg/sentry/devices/virtgpu/gpuproto"}, "pkg/abi/linux/errno", "protocol tests compare status codes with the Linux errno numbers"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {
