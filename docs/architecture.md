@@ -106,7 +106,7 @@ gvx/ (Fork of google/gvisor@go)
  │   │   ├── vxlan/                         # [NEW] Guest VXLAN UDP encapsulation link endpoint
  │   │   └── wgtun/                         # [NEW] Shared netstack-to-wireguard-go channel adapter
  │   ├── hostarch/
- │   │   └── hostarch_darwin_arm64_4k.go    # [NEW] 4KB guest page constants for darwin/arm64
+ │   │   └── hostarch_arm64_xplat.go        # [NEW] 4KB guest page selection on darwin/arm64 and 16KB hosts
  │   ├── sync/                              # Host futex bindings (Linux, Windows WaitOnAddress, Darwin ulock)
  │   ├── memutil/                           # Shared memory views (memfd, CreateFileMappingW, mach_vm_remap)
  │   ├── fd/                                # Unified HostHandle for Win32 HANDLE and POSIX file descriptors
