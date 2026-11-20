@@ -7,6 +7,7 @@ This file records the observable changes of each `gvx` release. The release work
 ### Bug Fixes
 
 - **NAT TCP answer to a failed host dial (`pkg/netbackend`)** (#206): Outbound NAT TCP connections now classify host dial errors instead of sending a RST for every failure. Refusals and unknown errors still send a RST (`ECONNREFUSED`), while timeouts send no answer so retransmitted SYNs redial and end with `ETIMEDOUT`. Host or network unreachable and down errors (including Windows `WSAE` codes) send an ICMPv4 destination unreachable from `10.0.2.2`, returning `EHOSTUNREACH` or `ENETUNREACH`. Quoted 20-byte TCP headers let guest conntrack deliver the same errno to containers behind iptables NAT.
+- **`ENOSPC` while the volume can grow (`pkg/sentry/fsimpl/ext4lite`)**: The block allocator did not grow a full volume while freed blocks waited for the next flush. The write-back at the end of a memory mapping cannot flush, so `close` returned `ENOSPC` and the mapped bytes were lost. A `docker build` failed when `rust-lld` wrote its output. Parallel writers also got `ENOSPC`, because other writers took the released blocks before the one retry. The volume now grows in that state. An allocation flushes and tries again only when the host has no room for a group.
 
 ## [v0.17.10002026110900] - 2026-11-17
 
