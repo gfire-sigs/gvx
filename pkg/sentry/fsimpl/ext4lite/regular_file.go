@@ -264,11 +264,13 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
 
-	if retryKillCap && src.NumBytes() == 0 {
+	if retryKillCap {
 		if kerr := ino.killCapabilityPolicy(policy); kerr != nil {
 			return 0, offset, true, kerr
 		}
-		return 0, offset, false, nil
+		if src.NumBytes() == 0 {
+			return 0, offset, false, nil
+		}
 	}
 	if appendsWrite(fd.vfsfd.StatusFlags(), opts.Flags) {
 		ino.n.mu.RLock()

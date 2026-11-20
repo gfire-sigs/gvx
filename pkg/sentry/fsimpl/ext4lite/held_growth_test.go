@@ -420,10 +420,12 @@ func TestFsyncAfterFailedUnmapWriteBackReportsENOSPC(t *testing.T) {
 	}
 }
 
-// TestPWriteClearsCapabilityUnderHeldSpace verifies that overwriting an existing
-// file whose security.capability shares an xattr block allocates a CoW xattr
-// block after flushing held space without failing or leaving capability intact.
-func TestPWriteClearsCapabilityUnderHeldSpace(t *testing.T) {
+// fillGroupZeroWithSharedCapAndHoldOneBlock mounts a 16 MiB-capped volume
+// where /out has one data block plus security.capability and user.keep in an
+// xattr block shared with /g, and group 0 has zero unheld free blocks and one
+// held block.
+func fillGroupZeroWithSharedCapAndHoldOneBlock(t *testing.T) *env {
+	t.Helper()
 	auNoFlusher(t)
 	d0 := newAuDrv(t)
 	d0.create("/out", blockSize)
@@ -470,7 +472,14 @@ func TestPWriteClearsCapabilityUnderHeldSpace(t *testing.T) {
 	if !v.hasHeld() {
 		t.Fatal("/held block is not held before PWrite")
 	}
+	return e
+}
 
+// TestPWriteClearsCapabilityUnderHeldSpace verifies that overwriting an existing
+// file whose security.capability shares an xattr block allocates a CoW xattr
+// block after flushing held space without failing or leaving capability intact.
+func TestPWriteClearsCapabilityUnderHeldSpace(t *testing.T) {
+	e := fillGroupZeroWithSharedCapAndHoldOneBlock(t)
 	fd := e.mustOpen("/out", linux.O_WRONLY)
 	defer fd.DecRef(e.ctx)
 	if _, err := fd.PWrite(e.ctx, usermem.BytesIOSequence(auFill(15, 0, blockSize)), 0, vfsWriteOpts); err != nil {
@@ -482,8 +491,28 @@ func TestPWriteClearsCapabilityUnderHeldSpace(t *testing.T) {
 	if got, err := auGetXattr(e, "/out", "user.keep"); err != nil || got != "v" {
 		t.Fatalf("user.keep after PWrite = (%q, %v), want (%q, nil)", got, err, "v")
 	}
-	if got := v.numGroups(); got != 1 {
+	if got := e.fs.v.numGroups(); got != 1 {
 		t.Fatalf("groups after PWrite clearing capability = %d, want 1", got)
+	}
+}
+
+// TestPWritePartialWriteClearsCapabilityUnderHeldSpace verifies that when the
+// first pass of a multi-block PWrite overwrites an existing block and fails CoW
+// capability removal with errSpaceHeld, the retry removes security.capability
+// first even when writing the tail fails with ENOSPC.
+func TestPWritePartialWriteClearsCapabilityUnderHeldSpace(t *testing.T) {
+	e := fillGroupZeroWithSharedCapAndHoldOneBlock(t)
+	fd := e.mustOpen("/out", linux.O_WRONLY)
+	defer fd.DecRef(e.ctx)
+	n, err := fd.PWrite(e.ctx, usermem.BytesIOSequence(auFill(16, 0, 2*blockSize)), 0, vfsWriteOpts)
+	if n != blockSize || !errors.Is(err, linuxerr.ENOSPC) {
+		t.Fatalf("partial PWrite = (%d, %v), want (%d, ENOSPC)", n, err, blockSize)
+	}
+	if _, err := auGetXattr(e, "/out", linux.XATTR_SECURITY_CAPABILITY); !errors.Is(err, linuxerr.ENODATA) {
+		t.Fatalf("security.capability after partial PWrite = %v, want ENODATA", err)
+	}
+	if got, err := auGetXattr(e, "/out", "user.keep"); err != nil || got != "v" {
+		t.Fatalf("user.keep after partial PWrite = (%q, %v), want (%q, nil)", got, err, "v")
 	}
 }
 
