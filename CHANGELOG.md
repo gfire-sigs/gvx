@@ -2,12 +2,14 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.17.10022026111600] - 2026-11-20
+
+This release fixes memory accounting in Windows `systrap` for pages touched only by stub processes (#213, #217). It also separates held-space reuse and volume growth in `ext4lite` so mapped write-backs succeed without unnecessary sequential growth (#214, #216).
 
 ### Bug Fixes
 
-- **Windows `systrap` stub memory accounting (`internal/xsys/unix`, `pkg/sentry/pgalloc`, `pkg/sentry/platform/systrap`)** (#213): Scans, unmaps, remaps, and address-space exits now query `K32QueryWorkingSetEx` in stub processes for guest pages. Both `/proc/meminfo` `MemFree` and `--memory` guards count stub-faulted pages, and Windows `systrap` enables `memory.max` enforcement.
-- **`ext4lite` held-space allocation (`pkg/sentry/fsimpl/ext4lite`)** (#214): Mapped write-backs and post-flush retries grow the volume when held blocks wait for a flush. Initial allocations flush and reuse held space first. Allocations wait for active hole punches before appending groups.
+- **Windows `systrap` stub memory accounting (`internal/xsys/unix`, `pkg/sentry/pgalloc`, `pkg/sentry/platform/systrap`)** (#213, #217): Scans, unmaps, remaps, and address-space exits now query `K32QueryWorkingSetEx` in stub processes for guest pages. Both `/proc/meminfo` `MemFree` and `--memory` guards count stub-faulted pages, and Windows `systrap` enables `memory.max` enforcement.
+- **`ext4lite` held-space allocation (`pkg/sentry/fsimpl/ext4lite`)** (#214, #216): Mapped write-backs and post-flush retries grow the volume when held blocks wait for a flush. Initial allocations flush and reuse held space first. Allocations wait for active hole punches before appending groups.
 
 ## [v0.17.10012026111600] - 2026-11-20
 
