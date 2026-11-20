@@ -46,9 +46,10 @@ if ! xcrun swift "$probe_swift"; then
 	printf 'ci-metal-probe: xcrun swift Metal probe failed\n' >&2
 fi
 
-brew install meson ninja
+brew install meson ninja pkgconf
 
 out_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gpu"
 "$repo_root/scripts/gpu/build-renderer.sh" --out "$out_root"
 
 time "$out_root/gvx-gpu-renderer/bin/gvx-gpu-renderer" --selftest
+time "$out_root/gvx-gpu-renderer/bin/gvx-gpu-renderer" --selftest --mode=virgl

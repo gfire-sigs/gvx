@@ -169,12 +169,14 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install the driver build tools
-        run: brew install meson ninja cmake pkg-config llvm libclc spirv-llvm-translator spirv-tools
+        run: brew install meson ninja cmake pkgconf llvm libclc spirv-llvm-translator spirv-tools
       - name: Build the renderer bundle
         run: scripts/gpu/build-renderer.sh --driver-source mesa-source --out "$RUNNER_TEMP/gpu"
       - name: Run the renderer self-test
         if: vars.GVX_CI_METAL == '1'
-        run: '"$RUNNER_TEMP/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" --selftest'
+        run: |
+          "$RUNNER_TEMP/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" --selftest
+          "$RUNNER_TEMP/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" --selftest --mode=virgl
       - name: Package the renderer
         run: |
           name="gvx-gpu-renderer-${GITHUB_REF_NAME}-darwin-arm64"

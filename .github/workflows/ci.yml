@@ -314,7 +314,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install the build tools
-        run: brew install meson ninja
+        run: brew install meson ninja pkgconf
       - name: Cache pinned renderer inputs
         uses: actions/cache@v6
         with:
@@ -322,12 +322,14 @@ jobs:
           key: gpu-renderer-${{ runner.os }}-${{ hashFiles('gpurenderer/third_party.lock', 'scripts/gpu/stage_driver.py') }}
       - name: Build the renderer bundle
         run: scripts/gpu/build-renderer.sh
-      # The tests below need a Metal device that KosmicKrisp accepts. The
-      # repository variable GVX_CI_METAL is 1 only after diagnose.yml proved
+      # The tests below need a Metal device that KosmicKrisp and Apple OpenGL accept.
+      # The repository variable GVX_CI_METAL is 1 only after diagnose.yml proved
       # that on this runner (docs/architecture.md section 3.15).
       - name: Run the renderer self-test
         if: vars.GVX_CI_METAL == '1'
-        run: build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest
+        run: |
+          build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest
+          build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer --selftest --mode=virgl
       - name: Test the client and the device with the renderer
         if: vars.GVX_CI_METAL == '1'
         run: |
