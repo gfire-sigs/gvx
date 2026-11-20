@@ -27,5 +27,6 @@ var (
 	hostUnreachableErrno  = syscall.Errno(10065) // WSAEHOSTUNREACH
 	hostDownErrno         = syscall.Errno(10064) // WSAEHOSTDOWN
 	netUnreachableErrno   = syscall.Errno(10051) // WSAENETUNREACH
+	netDownErrno          = syscall.Errno(10050) // WSAENETDOWN
 	hostAccessDeniedErrno = syscall.Errno(10013) // WSAEACCES
 )

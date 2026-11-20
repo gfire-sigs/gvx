@@ -161,6 +161,9 @@ type NATForwarder struct {
 // discardLogger drops every record. Forwarders use it when the caller sets no Logger.
 var discardLogger = slog.New(slog.DiscardHandler)
 
+// hostGatewayAddr is the IPv4 address of the virtual NAT gateway (10.0.2.2).
+var hostGatewayAddr = tcpip.AddrFrom4([4]byte{10, 0, 2, 2})
+
 type natLinkEndpoint struct {
 	stack.LinkEndpoint
 	nf *NATForwarder
@@ -426,7 +429,7 @@ func configureNATNIC(s *stack.Stack, nicID tcpip.NICID, ep, peer stack.LinkEndpo
 		},
 		{
 			Destination: header.IPv4EmptySubnet,
-			Gateway:     tcpip.AddrFrom4([4]byte{10, 0, 2, 2}),
+			Gateway:     hostGatewayAddr,
 			NIC:         nicID,
 		},
 	})

@@ -19,7 +19,6 @@ import (
 	"syscall"
 
 	"z.gfire.dev/gvx/pkg/buffer"
-	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/checksum"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
@@ -126,7 +125,7 @@ func (nf *NATForwarder) sendDestinationUnreachable(id stack.TransportEndpointID,
 		TotalLength: totalLen,
 		TTL:         defaultTTL,
 		Protocol:    uint8(header.ICMPv4ProtocolNumber),
-		SrcAddr:     tcpip.AddrFrom4([4]byte{10, 0, 2, 2}),
+		SrcAddr:     hostGatewayAddr,
 		DstAddr:     id.RemoteAddress,
 	})
 	outer.SetChecksum(^outer.CalculateChecksum())

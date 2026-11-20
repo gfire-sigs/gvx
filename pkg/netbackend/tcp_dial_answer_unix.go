@@ -26,7 +26,7 @@ func dialErrnoAnswer(errno syscall.Errno) dialAnswer {
 		return answerNone
 	case syscall.EHOSTUNREACH, syscall.EHOSTDOWN:
 		return answerHostUnreachable
-	case syscall.ENETUNREACH:
+	case syscall.ENETUNREACH, syscall.ENETDOWN:
 		return answerNetUnreachable
 	default:
 		return answerReset

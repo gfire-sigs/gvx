@@ -432,7 +432,7 @@ The host stack completes the TCP handshake with the guest only after the host di
 | Refused (`ECONNREFUSED`, `WSAECONNREFUSED`) | RST | `ECONNREFUSED` at once. |
 | Timeout (`net.nat.dial_timeout`, `ETIMEDOUT`, `WSAETIMEDOUT`) | None. Each retransmitted SYN starts a new dial. | `ETIMEDOUT` when the SYN timer of the guest ends (about 127 s), or a connection when a later dial succeeds. |
 | Host unreachable (`EHOSTUNREACH`, `EHOSTDOWN`, `WSAEHOSTUNREACH`, `WSAEHOSTDOWN`) | ICMPv4 host unreachable from `10.0.2.2` | `EHOSTUNREACH` at once. |
-| Network unreachable (`ENETUNREACH`, `WSAENETUNREACH`) | ICMPv4 network unreachable from `10.0.2.2` | `ENETUNREACH` at once. |
+| Network unreachable (`ENETUNREACH`, `ENETDOWN`, `WSAENETUNREACH`, `WSAENETDOWN`) | ICMPv4 network unreachable from `10.0.2.2` | `ENETUNREACH` at once. |
 | Other error | RST | `ECONNREFUSED` at once. |
 
 The ICMP message quotes the full TCP header of the SYN. The connection tracker of the guest then translates the error back, so a container behind the iptables NAT of the guest gets the same errno. An IPv6 connection gets no ICMPv6 message, so a connect to an unreachable IPv6 target times out.

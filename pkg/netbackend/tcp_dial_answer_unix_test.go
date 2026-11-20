@@ -26,5 +26,6 @@ var (
 	hostUnreachableErrno  = syscall.EHOSTUNREACH
 	hostDownErrno         = syscall.EHOSTDOWN
 	netUnreachableErrno   = syscall.ENETUNREACH
+	netDownErrno          = syscall.ENETDOWN
 	hostAccessDeniedErrno = syscall.EACCES
 )

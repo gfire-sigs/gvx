@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"sync/atomic"
@@ -27,7 +29,10 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
+	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 	"z.gfire.dev/gvx/pkg/tcpip/transport/tcp"
 	"z.gfire.dev/gvx/pkg/waiter"
@@ -77,14 +82,19 @@ func newFailingDialNATStack(t *testing.T, fail func() error) *stack.Stack {
 	return s
 }
 
-// startGuestConnect starts a connect of a new guest TCP socket of s to dst.
-// The socket binds to local first when local is set. The returned channel
+// startGuestConnect starts a connect of a new guest IPv4 TCP socket of s to
+// dst. The socket binds to local first when local is set. The returned channel
 // gets a value when the connect ends. The returned function then gives the
 // error of the connect, or nil when it connected.
 func startGuestConnect(t *testing.T, s *stack.Stack, local tcpip.Address, dst tcpip.FullAddress) (<-chan struct{}, func() tcpip.Error) {
 	t.Helper()
+	return startGuestConnectProto(t, s, ipv4.ProtocolNumber, local, dst)
+}
+
+func startGuestConnectProto(t *testing.T, s *stack.Stack, proto tcpip.NetworkProtocolNumber, local tcpip.Address, dst tcpip.FullAddress) (<-chan struct{}, func() tcpip.Error) {
+	t.Helper()
 	var wq waiter.Queue
-	ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	ep, err := s.NewEndpoint(tcp.ProtocolNumber, proto, &wq)
 	if err != nil {
 		t.Fatalf("create a guest TCP endpoint: %s", err)
 	}
@@ -105,8 +115,8 @@ func startGuestConnect(t *testing.T, s *stack.Stack, local tcpip.Address, dst tc
 	return ended, ep.LastError
 }
 
-// TestNATAnswersFailedHostDialAsTheHost checks that a guest connect through the
-// NAT fails with the error class of the host dial (#206). A RST answers a
+// TestNATAnswersFailedHostDialAsTheHost verifies that a guest connect through
+// the NAT fails with the error class of the host dial (#206). A RST answers a
 // refusal and an error of no known class. An unreachable host or network gets
 // an ICMP error.
 func TestNATAnswersFailedHostDialAsTheHost(t *testing.T) {
@@ -119,6 +129,7 @@ func TestNATAnswersFailedHostDialAsTheHost(t *testing.T) {
 		{name: "host unreachable", dialErr: errnoDialError(hostUnreachableErrno), want: &tcpip.ErrHostUnreachable{}},
 		{name: "host down", dialErr: errnoDialError(hostDownErrno), want: &tcpip.ErrHostUnreachable{}},
 		{name: "network unreachable", dialErr: errnoDialError(netUnreachableErrno), want: &tcpip.ErrNetworkUnreachable{}},
+		{name: "network down", dialErr: errnoDialError(netDownErrno), want: &tcpip.ErrNetworkUnreachable{}},
 		{name: "unclassified errno", dialErr: errnoDialError(hostAccessDeniedErrno), want: &tcpip.ErrConnectionRefused{}},
 		{name: "canceled", dialErr: context.Canceled, want: &tcpip.ErrConnectionRefused{}},
 	} {
@@ -138,7 +149,7 @@ func TestNATAnswersFailedHostDialAsTheHost(t *testing.T) {
 	}
 }
 
-// TestNATLeavesTheSYNOfATimedOutDialUnanswered checks that a host dial that
+// TestNATLeavesTheSYNOfATimedOutDialUnanswered verifies that a host dial that
 // times out gives the guest no answer (#206). The guest connect stays open, and
 // each retransmitted SYN of the guest starts a new host dial. A third dial
 // shows that neither of the first two dials ended the connect. The guest fails
@@ -200,7 +211,7 @@ func addSourceNAT(t *testing.T, s *stack.Stack, from, to tcpip.Address) {
 	s.IPTables().ForceReplaceTable(stack.NATID, table, false)
 }
 
-// TestNATUnreachableAnswerReachesASocketBehindGuestNAT checks the ICMP answer
+// TestNATUnreachableAnswerReachesASocketBehindGuestNAT verifies the ICMP answer
 // through the connection tracker of the guest (#206). A container connects from
 // its own address, and the iptables NAT of the guest rewrites the source to
 // 10.0.2.15, as in a docker build. The tracker translates the ICMP error back
@@ -225,8 +236,8 @@ func TestNATUnreachableAnswerReachesASocketBehindGuestNAT(t *testing.T) {
 	}
 }
 
-// TestClassifyDialErrorOfRealRefusal checks the classifier with the error that
-// the Go runtime of the host returns for a refused connect. The test fails
+// TestClassifyDialErrorOfRealRefusal verifies the classifier with the error
+// that the Go runtime of the host returns for a refused connect. The test fails
 // when the error chain or the errno family of the host differs from the
 // values that the other tests give, such as a Win32 code in place of a WSAE
 // code on Windows.
@@ -250,5 +261,104 @@ func TestClassifyDialErrorOfRealRefusal(t *testing.T) {
 	}
 	if got := classifyDialError(err); got != answerReset {
 		t.Errorf("classifyDialError(%v) = %v, want %v", err, got, answerReset)
+	}
+}
+
+// TestNATConnectSucceedsOnRetransmittedSYNAfterTimeout verifies that a guest
+// connect recovers when a later retransmitted SYN succeeds after an earlier
+// host dial timed out (#206).
+func TestNATConnectSucceedsOnRetransmittedSYNAfterTimeout(t *testing.T) {
+	t.Parallel()
+	timeoutErr := expiredDialError(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = io.WriteString(conn, "recovered")
+		_ = conn.Close()
+	}()
+
+	var dials atomic.Int32
+	s, nf, err := NewNATStack(NATConfig{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			if dials.Add(1) == 1 {
+				return nil, timeoutErr
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewNATStack: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = nf.Close()
+		s.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, s, unansweredTarget, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("guest connect after initial timeout = %v, want success on retransmitted SYN", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(testTimeout))
+	body, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read from recovered connection: %v", err)
+	}
+	if string(body) != "recovered" {
+		t.Errorf("body = %q, want %q", string(body), "recovered")
+	}
+	if got := dials.Load(); got < 2 {
+		t.Errorf("host dial count = %d, want at least 2", got)
+	}
+}
+
+// TestNATUnreachableIPv6DialGetsNoReset verifies that an unreachable IPv6 host
+// dial gets no ICMPv6 message and no TCP RST, so retransmitted SYNs redial.
+func TestNATUnreachableIPv6DialGetsNoReset(t *testing.T) {
+	t.Parallel()
+	const wantDials = 2
+	var dials atomic.Int32
+	redialed := make(chan struct{})
+	s := newFailingDialNATStack(t, func() error {
+		if dials.Add(1) == wantDials {
+			close(redialed)
+		}
+		return errnoDialError(hostUnreachableErrno)
+	})
+
+	guestV6 := tcpip.AddrFrom16(netip.MustParseAddr("2001:db8::2").As16())
+	pa := tcpip.ProtocolAddress{
+		Protocol:          ipv6.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: guestV6, PrefixLen: 64},
+	}
+	if err := s.AddProtocolAddress(Eth0NICID, pa, stack.AddressProperties{}); err != nil {
+		t.Fatalf("add %v to eth0: %s", guestV6, err)
+	}
+	s.SetRouteTable(append(s.GetRouteTable(), tcpip.Route{
+		Destination: header.IPv6EmptySubnet,
+		NIC:         Eth0NICID,
+	}))
+
+	dstV6 := tcpip.FullAddress{
+		Addr: tcpip.AddrFrom16(netip.MustParseAddr("2001:db8:1::1").As16()),
+		Port: 80,
+	}
+	ended, result := startGuestConnectProto(t, s, ipv6.ProtocolNumber, guestV6, dstV6)
+	select {
+	case <-redialed:
+	case <-ended:
+		t.Fatalf("IPv6 connect ended with %v after %d dials, want no RST", result(), dials.Load())
+	case <-time.After(testTimeout):
+		t.Fatalf("%d IPv6 dials within %v, want %d", dials.Load(), testTimeout, wantDials)
 	}
 }

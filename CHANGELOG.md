@@ -6,7 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
-- **NAT TCP answer to a failed host dial (`pkg/netbackend`)** (#206): `relayTCP` classifies the host dial error and no longer sends a RST for every failure. A refusal and an error of no known class still get a RST. A timeout gets no answer, and each retransmitted SYN dials again. The guest then gets `ETIMEDOUT` in place of `ECONNREFUSED`. A host or network unreachable error gets an ICMPv4 destination unreachable from `10.0.2.2`, so the guest gets `EHOSTUNREACH` or `ENETUNREACH`. A container behind the iptables NAT of the guest gets the same errno. `tcp_dial_answer_windows.go` matches the `WSAE` codes that Windows returns.
+- **NAT TCP answer to a failed host dial (`pkg/netbackend`)** (#206): Outbound NAT TCP connections now classify host dial errors instead of sending a RST for every failure. Refusals and unknown errors still send a RST (`ECONNREFUSED`), while timeouts send no answer so retransmitted SYNs redial and end with `ETIMEDOUT`. Host or network unreachable and down errors (including Windows `WSAE` codes) send an ICMPv4 destination unreachable from `10.0.2.2`, returning `EHOSTUNREACH` or `ENETUNREACH`. Quoted 20-byte TCP headers let guest conntrack deliver the same errno to containers behind iptables NAT.
 
 ## [v0.17.10002026110900] - 2026-11-17
 

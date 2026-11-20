@@ -32,7 +32,7 @@ func dialErrnoAnswer(errno syscall.Errno) dialAnswer {
 		return answerNone
 	case windows.WSAEHOSTUNREACH, windows.WSAEHOSTDOWN:
 		return answerHostUnreachable
-	case windows.WSAENETUNREACH:
+	case windows.WSAENETUNREACH, windows.WSAENETDOWN:
 		return answerNetUnreachable
 	default:
 		return answerReset
