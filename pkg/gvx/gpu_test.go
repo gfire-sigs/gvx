@@ -23,6 +23,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 )
 
 func TestConfigGPUParseMode(t *testing.T) {
@@ -31,6 +33,9 @@ func TestConfigGPUParseMode(t *testing.T) {
 	}
 	if got := GPUVenus.String(); got != "venus" {
 		t.Errorf("GPUVenus.String() = %q, want %q", got, "venus")
+	}
+	if got := GPUVirgl.String(); got != "virgl" {
+		t.Errorf("GPUVirgl.String() = %q, want %q", got, "virgl")
 	}
 
 	for _, tc := range []struct {
@@ -44,7 +49,9 @@ func TestConfigGPUParseMode(t *testing.T) {
 		{"off with case and spaces", " Off ", GPUOff, ""},
 		{"venus", "venus", GPUVenus, ""},
 		{"venus uppercase", "VENUS", GPUVenus, ""},
-		{"reserved virgl", "virgl", "", "reserved"},
+		{"virgl", "virgl", GPUVirgl, ""},
+		{"virgl uppercase", "VIRGL", GPUVirgl, ""},
+		{"virgl with spaces", " virgl ", GPUVirgl, ""},
 		{"reserved auto", "auto", "", "reserved"},
 		{"unknown vulkan", "vulkan", "", "unsupported GPU mode"},
 	} {
@@ -195,6 +202,52 @@ func TestConfigGPUValidation(t *testing.T) {
 			macOS:   "27.2.1",
 			wantErr: "need a GPU mode",
 		},
+		{
+			name:   "virgl with auto on darwin arm64 macOS 26.0",
+			cfg:    Config{Platform: PlatformAuto, GPU: GPUConfig{Mode: GPUVirgl}},
+			goos:   "darwin",
+			goarch: "arm64",
+			macOS:  "26.0",
+		},
+		{
+			name:   "virgl with hvf on darwin arm64",
+			cfg:    Config{Platform: PlatformHVF, GPU: GPUConfig{Mode: GPUVirgl}},
+			goos:   "darwin",
+			goarch: "arm64",
+			macOS:  "27.2.1",
+		},
+		{
+			name:    "virgl on linux arm64",
+			cfg:     Config{Platform: PlatformAuto, GPU: GPUConfig{Mode: GPUVirgl}},
+			goos:    "linux",
+			goarch:  "arm64",
+			macOS:   "27.2.1",
+			wantErr: "darwin/arm64",
+		},
+		{
+			name:    "virgl on darwin arm64 macOS 25.4",
+			cfg:     Config{Platform: PlatformAuto, GPU: GPUConfig{Mode: GPUVirgl}},
+			goos:    "darwin",
+			goarch:  "arm64",
+			macOS:   "25.4",
+			wantErr: "built for macOS 26",
+		},
+		{
+			name:    "virgl with systrap",
+			cfg:     Config{Platform: PlatformSystrap, GPU: GPUConfig{Mode: GPUVirgl}},
+			goos:    "darwin",
+			goarch:  "arm64",
+			macOS:   "27.2.1",
+			wantErr: "hvf backend",
+		},
+		{
+			name:    "virgl with checkpoint dir",
+			cfg:     Config{Platform: PlatformAuto, GPU: GPUConfig{Mode: GPUVirgl}, CheckpointDir: ckptDir},
+			goos:    "darwin",
+			goarch:  "arm64",
+			macOS:   "27.2.1",
+			wantErr: "checkpoint",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.cfg.validateGPU(tc.goos, tc.goarch, tc.macOS)
@@ -272,6 +325,7 @@ func TestConfigGPURestoreRefused(t *testing.T) {
 		want string
 	}{
 		{"venus mode", GPUConfig{Mode: GPUVenus}, "cannot restore"},
+		{"virgl mode", GPUConfig{Mode: GPUVirgl}, "cannot restore"},
 		{"off with renderer path", GPUConfig{Mode: GPUOff, RendererPath: "/opt/r"}, "need a GPU mode"},
 		{"off with memory limit", GPUConfig{Mode: GPUOff, MemoryLimit: 1}, "need a GPU mode"},
 	} {
@@ -329,4 +383,19 @@ func TestGPUMemoryLimitDefault(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRendererMode(t *testing.T) {
+	if got := rendererMode(GPUVenus); got != gpuproto.ModeVenus {
+		t.Fatalf("rendererMode(GPUVenus) = %v, want %v", got, gpuproto.ModeVenus)
+	}
+	if got := rendererMode(GPUVirgl); got != gpuproto.ModeVirgl {
+		t.Fatalf("rendererMode(GPUVirgl) = %v, want %v", got, gpuproto.ModeVirgl)
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("rendererMode(GPUOff) did not panic")
+		}
+	}()
+	_ = rendererMode(GPUOff)
 }

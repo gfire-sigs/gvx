@@ -26,6 +26,7 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu"
+	"z.gfire.dev/gvx/pkg/sentry/devices/virtgpu/gpuproto"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/sys"
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvf"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
@@ -42,6 +43,12 @@ const (
 	// process, which runs them on the host GPU through KosmicKrisp and Metal. It
 	// needs the hvf backend on darwin/arm64 (macOS 26 or later).
 	GPUVenus GPUMode = "venus"
+	// GPUVirgl gives the guest a virtio-gpu render node at
+	// /dev/dri/renderD128. Mesa virgl in the guest sends OpenGL and OpenGL ES
+	// commands to a confined host renderer process. That process runs them on
+	// the host GPU through Apple OpenGL 4.1. It needs the hvf backend on
+	// darwin/arm64 (macOS 26 or later).
+	GPUVirgl GPUMode = "virgl"
 
 	gpuKernelStopTimeout  = 30 * time.Second
 	defaultGPUMemoryLimit = 4 << 30
@@ -58,7 +65,8 @@ func (m GPUMode) String() string {
 
 // GPUConfig turns on the virtual render node and its host renderer process.
 type GPUConfig struct {
-	// Mode selects the command stream. GPUOff (the zero value) turns the GPU off.
+	// Mode selects the command stream: GPUVenus (Vulkan) or GPUVirgl (OpenGL).
+	// GPUOff (the zero value) turns the GPU off.
 	Mode GPUMode
 
 	// RendererPath is the path of the gvx-gpu-renderer executable. When it is
@@ -101,20 +109,22 @@ func gpuMemoryLimit(cfg GPUConfig, hostRAM uint64) uint64 {
 	return min(defaultGPUMemoryLimit, hostRAM/4)
 }
 
-// ParseGPUMode parses a CLI or SDK GPU mode: "off" or "" (GPUOff) and
-// "venus" (GPUVenus), without regard to case and surrounding spaces. An
-// unknown or reserved name returns an error that wraps ErrInvalidConfig.
+// ParseGPUMode parses a CLI or SDK GPU mode: "off" or "" (GPUOff), "venus"
+// (GPUVenus), and "virgl" (GPUVirgl), without regard to case and surrounding
+// spaces. ParseGPUMode reserves "auto". An unknown or reserved name returns an error
+// that wraps ErrInvalidConfig.
 func ParseGPUMode(s string) (GPUMode, error) {
-	v := strings.ToLower(strings.TrimSpace(s))
-	switch v {
+	switch v := strings.ToLower(strings.TrimSpace(s)); v {
 	case "", "off":
 		return GPUOff, nil
 	case "venus":
 		return GPUVenus, nil
-	case "virgl", "auto":
-		return "", fmt.Errorf("%w: GPU mode %q is reserved and not supported (want off or venus)", ErrInvalidConfig, v)
+	case "virgl":
+		return GPUVirgl, nil
+	case "auto":
+		return "", fmt.Errorf("%w: GPU mode %q is reserved and not supported (want off, venus, or virgl)", ErrInvalidConfig, v)
 	default:
-		return "", fmt.Errorf("%w: unsupported GPU mode %q (want off or venus)", ErrInvalidConfig, v)
+		return "", fmt.Errorf("%w: unsupported GPU mode %q (want off, venus, or virgl)", ErrInvalidConfig, v)
 	}
 }
 
@@ -134,7 +144,11 @@ func (c *Config) validateGPU(goos, goarch, macOS string) error {
 	if macOS != "" {
 		majorStr, _, _ := strings.Cut(macOS, ".")
 		if major, err := strconv.Atoi(majorStr); err == nil && major < minGPUMacOSMajor {
-			return fmt.Errorf("%w: GPU mode %s needs macOS 26 or later (the KosmicKrisp driver needs Metal 4); this host runs macOS %s", ErrInvalidConfig, c.GPU.Mode, macOS)
+			reason := "the KosmicKrisp driver needs Metal 4"
+			if c.GPU.Mode == GPUVirgl {
+				reason = "the renderer is built for macOS 26"
+			}
+			return fmt.Errorf("%w: GPU mode %s needs macOS 26 or later (%s); this host runs macOS %s", ErrInvalidConfig, c.GPU.Mode, reason, macOS)
 		}
 	}
 	if c.Platform != PlatformAuto && c.Platform != PlatformHVF {
@@ -187,12 +201,25 @@ func (s *Sandbox) startGPU(ctx context.Context) error {
 		Path:        path,
 		Log:         logRendererLine,
 		MemoryLimit: limit,
+		Mode:        rendererMode(s.cfg.GPU.Mode),
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrGPUUnavailable, err)
 	}
 	s.gpu = &gpuHost{client: client, memoryLimit: limit}
 	return nil
+}
+
+// rendererMode returns the renderer mode of m. It panics on GPUOff, which
+// startGPU never passes.
+func rendererMode(m GPUMode) gpuproto.Mode {
+	switch m {
+	case GPUVenus:
+		return gpuproto.ModeVenus
+	case GPUVirgl:
+		return gpuproto.ModeVirgl
+	}
+	panic(fmt.Sprintf("gvx: no renderer mode for GPU mode %q", m))
 }
 
 // registerGPU registers the render node of the sandbox with vfsObj. Call it

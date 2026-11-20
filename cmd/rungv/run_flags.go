@@ -187,8 +187,8 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	fs.StringVar(&f.platform, "platform", string(gvx.PlatformAuto), "Execution backend (auto, whpx, hvf, or systrap) or image platform (linux/amd64 or linux/arm64)")
 	fs.StringVar(&f.backend, "backend", "", "Execution backend: auto, whpx, hvf, or systrap")
 	fs.BoolVar(&f.allowUnconfinedSystrap, "allow-unconfined-systrap", false, "Allow -platform=auto on Windows to fall back to systrap when whpx is unavailable")
-	fs.StringVar(&f.gpu, "gpu", "off", "Virtual GPU: off or venus (venus needs the hvf backend on Apple silicon and the gvx-gpu-renderer bundle)")
-	fs.StringVar(&f.gpuRenderer, "gpu-renderer", "", "Path of the gvx-gpu-renderer executable for -gpu=venus")
+	fs.StringVar(&f.gpu, "gpu", "off", "Virtual GPU: off, venus (Vulkan), or virgl (OpenGL); both need the hvf backend on Apple silicon and the gvx-gpu-renderer bundle")
+	fs.StringVar(&f.gpuRenderer, "gpu-renderer", "", "Path of the gvx-gpu-renderer executable for -gpu=venus and -gpu=virgl")
 	fs.StringVar(&f.arch, "arch", defs.archDefault, "Guest Linux architecture: amd64 or arm64")
 	registerAlias([]string{"net", "network"}, func(n string) {
 		fs.StringVar(&f.net, n, defs.netDefault, "Network backend: nat (or bridge), wg, or none")

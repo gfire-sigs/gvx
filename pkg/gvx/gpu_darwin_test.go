@@ -50,6 +50,7 @@ var _ virtgpu.Renderer = (*gpurender.Client)(nil)
 
 const (
 	gpuWorkerEnv         = "GVX_TEST_GPU_WORKER"
+	gpuWorkerModeEnv     = "GVX_TEST_GPU_MODE"
 	gpuWorkerRendererEnv = "GVX_TEST_GPU_RENDERER"
 	gpuWorkerProbeEnv    = "GVX_TEST_GPU_PROBE"
 	gpuWorkerCacheDirEnv = "GVX_TEST_GPU_CACHE_DIR"
@@ -115,15 +116,20 @@ func gpuProbeLayer(t *testing.T) []byte {
 	return gpuProbeLayerFromPath(t, acceptprog.BuildGPUProbe(t, runtime.GOARCH))
 }
 
-func gpuTestConfig(t *testing.T) Config {
+func gpuTestConfigForMode(t *testing.T, mode GPUMode) Config {
 	t.Helper()
 	cfg := hostTestConfig(t)
 	cfg.GPU = GPUConfig{
-		Mode:         GPUVenus,
+		Mode:         mode,
 		RendererPath: gpurendertest.Path(t),
 	}
 	cfg.OCILayerTars = [][]byte{gpuProbeLayer(t)}
 	return cfg
+}
+
+func gpuTestConfig(t *testing.T) Config {
+	t.Helper()
+	return gpuTestConfigForMode(t, GPUVenus)
 }
 
 type gpuRunResult struct {
@@ -652,6 +658,14 @@ func TestGPULockdownWorker(t *testing.T) {
 	if rendererPath == "" || probePath == "" || cacheDir == "" {
 		t.Fatalf("worker env incomplete: renderer=%q probe=%q cacheDir=%q", rendererPath, probePath, cacheDir)
 	}
+	mode := GPUVenus
+	probeMode := "full"
+	wantLines := []string{"alias=ok", "fence=ok", "gem_close=ok", "PASS"}
+	if os.Getenv(gpuWorkerModeEnv) == string(GPUVirgl) {
+		mode = GPUVirgl
+		probeMode = "virgl"
+		wantLines = []string{"create=ok bo=1", "transfer=ok", "wait=0", "VIRGL OK"}
+	}
 
 	var outBuf, errBuf bytes.Buffer
 	cfg := Config{
@@ -660,17 +674,17 @@ func TestGPULockdownWorker(t *testing.T) {
 		OCICacheDir:         cacheDir,
 		DisableHostLockdown: false,
 		GPU: GPUConfig{
-			Mode:         GPUVenus,
+			Mode:         mode,
 			RendererPath: rendererPath,
 		},
 		OCILayerTars: [][]byte{gpuProbeLayerFromPath(t, probePath)},
-		Argv:         []string{"/bin/gpuprobe", "full"},
+		Argv:         []string{"/bin/gpuprobe", probeMode},
 		Stdout:       &outBuf,
 		Stderr:       &errBuf,
 	}
 	sb, err := New(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("worker New(GPUVenus, lockdown): %v", err)
+		t.Fatalf("worker New(%s, lockdown): %v", mode, err)
 	}
 	st := sb.LockdownStatus()
 	if !st.Applied || !st.SubprocessBlocked || !st.UnboundFileOpenBlocked || !st.NetworkOutboundBlocked {
@@ -692,7 +706,7 @@ func TestGPULockdownWorker(t *testing.T) {
 		_ = sb.Close()
 		t.Fatalf("worker gpuprobe exit code = %d, want 0\nstdout:\n%s\nstderr:\n%s", code, stdout, errBuf.String())
 	}
-	for _, want := range []string{"alias=ok", "fence=ok", "gem_close=ok", "PASS"} {
+	for _, want := range wantLines {
 		if !hasExactLine(stdout, want) {
 			_ = sb.Close()
 			t.Fatalf("worker gpuprobe stdout missing line %q\nstdout:\n%s", want, stdout)
@@ -704,7 +718,8 @@ func TestGPULockdownWorker(t *testing.T) {
 	fmt.Printf("RENDERER_PID %d\nWORKER_OK\n", rpid)
 }
 
-func TestGPUServesRenderNodeUnderLockdown(t *testing.T) {
+func runGPULockdownWorkerTest(t *testing.T, mode GPUMode) {
+	t.Helper()
 	requireGuestBackend(t)
 	rendererPath := gpurendertest.Path(t)
 	probePath := acceptprog.BuildGPUProbe(t, runtime.GOARCH)
@@ -716,6 +731,7 @@ func TestGPUServesRenderNodeUnderLockdown(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"GORACE=atexit_sleep_ms=0",
 		gpuWorkerEnv+"=1",
+		gpuWorkerModeEnv+"="+string(mode),
 		gpuWorkerRendererEnv+"="+rendererPath,
 		gpuWorkerProbeEnv+"="+probePath,
 		gpuWorkerCacheDirEnv+"="+cacheDir,
@@ -746,6 +762,14 @@ func TestGPUServesRenderNodeUnderLockdown(t *testing.T) {
 	if kp, kerr := unix.SysctlKinfoProc("kern.proc.pid", rpid); kerr == nil && kinfoComm(kp) == "gvx-gpu-renderer" {
 		t.Fatalf("worker renderer pid %d is still running after worker exit", rpid)
 	}
+}
+
+func TestGPUServesRenderNodeUnderLockdown(t *testing.T) {
+	runGPULockdownWorkerTest(t, GPUVenus)
+}
+
+func TestGPUVirglUnderLockdown(t *testing.T) {
+	runGPULockdownWorkerTest(t, GPUVirgl)
 }
 
 func TestGPUMemoryLimitReachesDevice(t *testing.T) {
@@ -883,5 +907,234 @@ func TestGPUMemoryLimitForwardsToRenderer(t *testing.T) {
 				t.Fatalf("rendererChildren after failed New = %v, want empty", got)
 			}
 		})
+	}
+}
+
+func TestGPUVirglSandboxServesRenderNode(t *testing.T) {
+	cfg := gpuTestConfigForMode(t, GPUVirgl)
+	cfg.Argv = []string{"/bin/gpuprobe", "virgl"}
+	var outBuf, errBuf bytes.Buffer
+	cfg.Stdout = &outBuf
+	cfg.Stderr = &errBuf
+
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New(GPUVirgl): %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = sb.Close()
+		}
+	}()
+
+	if got := rendererChildren(t); len(got) != 1 {
+		t.Fatalf("rendererChildren after New = %v, want 1 child", got)
+	}
+
+	code, err := sb.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run(GPUVirgl): %v (stdout=%q stderr=%q)", err, outBuf.String(), errBuf.String())
+	}
+	stdout := outBuf.String()
+	if code != 0 {
+		t.Fatalf("gpuprobe virgl exit code = %d, want 0\nstdout:\n%s\nstderr:\n%s", code, stdout, errBuf.String())
+	}
+	wantLines := []string{
+		"version=virtio_gpu 0.1.0",
+		"params=1,1,0,0,0,1,6,1",
+		"blob_alignment=EINVAL",
+		"caps2_word0=2",
+		"caps4=EINVAL",
+		"create=ok bo=1",
+		"context_init=EEXIST",
+		"info=blob_mem:0 size:65536",
+		"transfer=ok",
+		"wait=0",
+		"wait_bad=ENOENT",
+		"blob=EINVAL",
+		"transfer_stride=EINVAL",
+		"VIRGL OK",
+	}
+	for _, want := range wantLines {
+		if !hasExactLine(stdout, want) {
+			t.Errorf("gpuprobe virgl stdout missing line %q\nstdout:\n%s", want, stdout)
+		}
+	}
+
+	closed = true
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close(GPUVirgl): %v", err)
+	}
+	if got := rendererChildren(t); len(got) != 0 {
+		t.Fatalf("rendererChildren after Close = %v, want empty", got)
+	}
+}
+
+func TestGPUVirglRendererKilledBeforeRun(t *testing.T) {
+	cfg := gpuTestConfigForMode(t, GPUVirgl)
+	cfg.Argv = []string{"/bin/gpuprobe", "virgl"}
+	var outBuf, errBuf bytes.Buffer
+	cfg.Stdout = &outBuf
+	cfg.Stderr = &errBuf
+
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New(GPUVirgl): %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = sb.Close()
+		}
+	}()
+
+	pids := rendererChildren(t)
+	if len(pids) != 1 {
+		t.Fatalf("rendererChildren after New = %v, want 1 child", pids)
+	}
+	pid := pids[0]
+
+	kq, err := unix.Kqueue()
+	if err != nil {
+		t.Fatalf("Kqueue: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(kq) })
+
+	watch := []unix.Kevent_t{{
+		Ident:  uint64(pid),
+		Filter: unix.EVFILT_PROC,
+		Flags:  unix.EV_ADD | unix.EV_ONESHOT,
+		Fflags: unix.NOTE_EXIT,
+	}}
+	if _, err := unix.Kevent(kq, watch, nil, nil); err != nil {
+		t.Fatalf("register NOTE_EXIT for pid %d: %v", pid, err)
+	}
+	if err := unix.Kill(pid, unix.SIGKILL); err != nil {
+		t.Fatalf("kill renderer pid %d: %v", pid, err)
+	}
+
+	events := make([]unix.Kevent_t, 1)
+	ts := unix.Timespec{Sec: 10}
+	for {
+		n, kerr := unix.Kevent(kq, nil, events, &ts)
+		if errors.Is(kerr, unix.EINTR) {
+			continue
+		}
+		if kerr != nil {
+			t.Fatalf("wait NOTE_EXIT for pid %d: %v", pid, kerr)
+		}
+		if n != 1 {
+			t.Fatalf("NOTE_EXIT for pid %d returned %d events, want 1", pid, n)
+		}
+		break
+	}
+
+	code, err := sb.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run after renderer SIGKILL: %v (stdout=%q stderr=%q)", err, outBuf.String(), errBuf.String())
+	}
+	stdout := outBuf.String()
+	if code != 1 {
+		t.Fatalf("gpuprobe virgl exit code after renderer SIGKILL = %d, want 1\nstdout:\n%s\nstderr:\n%s", code, stdout, errBuf.String())
+	}
+	if !strings.Contains(stdout, "FAIL create:") || !strings.Contains(stdout, "EIO") {
+		t.Fatalf("gpuprobe virgl stdout after renderer SIGKILL =\n%s\nwant FAIL create: with EIO", stdout)
+	}
+
+	closed = true
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close after renderer SIGKILL: %v", err)
+	}
+	if got := rendererChildren(t); len(got) != 0 {
+		t.Fatalf("rendererChildren after Close = %v, want empty", got)
+	}
+}
+
+func TestGPUVirglMemoryLimitReachesDevice(t *testing.T) {
+	requireGuestBackend(t)
+	rendererPath := gpurendertest.Path(t)
+	layer := gpuProbeLayer(t)
+
+	newFillSB := func(limit uint64, argv []string) (*Sandbox, *bytes.Buffer, *bytes.Buffer) {
+		var outBuf, errBuf bytes.Buffer
+		cfg := Config{
+			Platform:            PlatformAuto,
+			NetworkMode:         NetModeNone,
+			OCICacheDir:         t.TempDir(),
+			DisableHostLockdown: true,
+			GPU: GPUConfig{
+				Mode:         GPUVirgl,
+				RendererPath: rendererPath,
+				MemoryLimit:  limit,
+			},
+			OCILayerTars: [][]byte{layer},
+			Argv:         argv,
+			Stdout:       &outBuf,
+			Stderr:       &errBuf,
+		}
+		sb, err := New(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("New(GPUVirgl, limit=%d): %v", limit, err)
+		}
+		return sb, &outBuf, &errBuf
+	}
+
+	sbSmall, outSmall, errSmall := newFillSB(64<<10, []string{"/bin/gpuprobe", "virgl-fill"})
+	closedSmall := false
+	defer func() {
+		if !closedSmall {
+			_ = sbSmall.Close()
+		}
+	}()
+
+	sbDefault, outDefault, errDefault := newFillSB(0, []string{"/bin/gpuprobe", "virgl-fill", "8"})
+	closedDefault := false
+	defer func() {
+		if !closedDefault {
+			_ = sbDefault.Close()
+		}
+	}()
+
+	codeSmall, err := sbSmall.Run(context.Background())
+	if err != nil || codeSmall != 0 {
+		t.Fatalf("Run(small limit): code=%d err=%v\nstdout:\n%s\nstderr:\n%s", codeSmall, err, outSmall.String(), errSmall.String())
+	}
+	if !hasExactLine(outSmall.String(), "blobs=4 errno=ENOMEM") {
+		t.Fatalf("small-limit gpuprobe virgl-fill stdout = %q, want line %q", outSmall.String(), "blobs=4 errno=ENOMEM")
+	}
+
+	codeDefault, err := sbDefault.Run(context.Background())
+	if err != nil || codeDefault != 0 {
+		t.Fatalf("Run(default limit): code=%d err=%v\nstdout:\n%s\nstderr:\n%s", codeDefault, err, outDefault.String(), errDefault.String())
+	}
+	var gotDefaultBlobs int
+	for _, line := range strings.Split(outDefault.String(), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "blobs="); ok {
+			fields := strings.Fields(rest)
+			if len(fields) > 0 {
+				n, perr := strconv.Atoi(fields[0])
+				if perr != nil {
+					t.Fatalf("parse default-limit blobs count from %q: %v", line, perr)
+				}
+				gotDefaultBlobs = n
+				break
+			}
+		}
+	}
+	if gotDefaultBlobs <= 4 {
+		t.Fatalf("default-limit gpuprobe virgl-fill created %d blobs (stdout=%q), want > 4", gotDefaultBlobs, outDefault.String())
+	}
+
+	closedSmall = true
+	if err := sbSmall.Close(); err != nil {
+		t.Fatalf("Close(small): %v", err)
+	}
+	closedDefault = true
+	if err := sbDefault.Close(); err != nil {
+		t.Fatalf("Close(default): %v", err)
+	}
+	if got := rendererChildren(t); len(got) != 0 {
+		t.Fatalf("rendererChildren after Close = %v, want empty", got)
 	}
 }

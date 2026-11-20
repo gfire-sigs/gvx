@@ -267,7 +267,8 @@ func TestRunFlagsGPU(t *testing.T) {
 		{"venus with renderer", []string{"--gpu", "venus", "-gpu-renderer", "/opt/r/bin/gvx-gpu-renderer", "-image=x"}, gvx.GPUVenus, "/opt/r/bin/gvx-gpu-renderer", false},
 		{"explicit off", []string{"-gpu=off", "-image=x"}, gvx.GPUOff, "", false},
 		{"unknown mode", []string{"-gpu=bogus", "-image=x"}, "", "", true},
-		{"reserved virgl", []string{"-gpu=virgl", "-image=x"}, "", "", true},
+		{"virgl", []string{"-gpu=virgl", "-image=x"}, gvx.GPUVirgl, "", false},
+		{"reserved auto", []string{"-gpu=auto", "-image=x"}, "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rc, code, done, stderr := parse(t, tc.args...)

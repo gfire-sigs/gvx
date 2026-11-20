@@ -24,6 +24,8 @@
 //	gpuprobe fork-hold
 //	gpuprobe fill [max]
 //	gpuprobe full
+//	gpuprobe virgl
+//	gpuprobe virgl-fill [max]
 package main
 
 import (
@@ -52,18 +54,39 @@ const (
 	aliasPattern    = uint64(0x1122334455667788)
 	fencePollMs     = 2000
 	holdSleepPeriod = 600 * time.Second
+
+	// Gallium and virglrenderer resource constants for virgl buffer probes.
+	pipeBuffer            = 0     // PIPE_BUFFER (gallium enum pipe_texture_target)
+	virglFormatR8Unorm    = 64    // VIRGL_FORMAT_R8_UNORM (virgl_formats.h)
+	virglBindVertexBuffer = 0x10  // VIRGL_BIND_VERTEX_BUFFER (virglrenderer.h)
+	virglResSize          = 65536 // 64 KiB test buffer
 )
+
+const usageText = "usage: gpuprobe absent|hold|fork-hold|fill [max]|full|virgl|virgl-fill [max]"
+
+func parseFillMax(args []string) int {
+	if len(args) != 3 {
+		return 0
+	}
+	n, err := strconv.Atoi(args[2])
+	if err != nil || n < 1 {
+		fmt.Fprintf(os.Stderr, "gpuprobe: invalid fill max %q\n", args[2])
+		os.Exit(2)
+	}
+	return n
+}
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: gpuprobe absent|hold|fork-hold|fill [max]|full")
+		fmt.Fprintln(os.Stderr, usageText)
 		os.Exit(2)
 	}
-	if os.Args[1] != "fill" && len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: gpuprobe absent|hold|fork-hold|fill [max]|full")
+	mode := os.Args[1]
+	if mode != "fill" && mode != "virgl-fill" && len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, usageText)
 		os.Exit(2)
 	}
-	switch os.Args[1] {
+	switch mode {
 	case "absent":
 		runAbsent()
 	case "hold":
@@ -71,22 +94,26 @@ func main() {
 	case "fork-hold":
 		runForkHold()
 	case "fill":
-		var maxBlobs int
-		if len(os.Args) == 3 {
-			n, err := strconv.Atoi(os.Args[2])
-			if err != nil || n < 1 {
-				fmt.Fprintf(os.Stderr, "gpuprobe: invalid fill max %q\n", os.Args[2])
-				os.Exit(2)
-			}
-			maxBlobs = n
-		}
-		runFill(maxBlobs)
+		runFill(parseFillMax(os.Args))
 	case "full":
 		runFull()
+	case "virgl":
+		runVirgl()
+	case "virgl-fill":
+		runVirglFill(parseFillMax(os.Args))
 	default:
-		fmt.Fprintf(os.Stderr, "gpuprobe: unknown mode %q\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "gpuprobe: unknown mode %q\n", mode)
 		os.Exit(2)
 	}
+}
+
+func errnoString(err error) string {
+	if errno, ok := err.(unix.Errno); ok {
+		if name := unix.ErrnoName(errno); name != "" {
+			return name
+		}
+	}
+	return err.Error()
 }
 
 func fail(step string, err error) {
@@ -261,13 +288,7 @@ func runFill(maxBlobs int) {
 			Size:      blobSize,
 		}
 		if err := drmIoctl(fd, cmdVirtgpuResourceCreateBlob, unsafe.Pointer(&req)); err != nil {
-			errName := err.Error()
-			if errno, ok := err.(unix.Errno); ok {
-				if name := unix.ErrnoName(errno); name != "" {
-					errName = name
-				}
-			}
-			fmt.Printf("blobs=%d errno=%s\n", created, errName)
+			fmt.Printf("blobs=%d errno=%s\n", created, errnoString(err))
 			_ = unix.Close(fd)
 			return
 		}
@@ -275,6 +296,253 @@ func runFill(maxBlobs int) {
 	}
 	fmt.Printf("blobs=%d errno=OK\n", created)
 	_ = unix.Close(fd)
+}
+
+func runVirglFill(maxResources int) {
+	fd, _, _, _, _ := openAndVersion()
+	created := 0
+	for maxResources == 0 || created < maxResources {
+		req := virtgpuResourceCreate{
+			Target:    pipeBuffer,
+			Format:    virglFormatR8Unorm,
+			Bind:      virglBindVertexBuffer,
+			Width:     blobSize,
+			Height:    1,
+			Depth:     1,
+			ArraySize: 1,
+			Size:      blobSize,
+		}
+		if err := drmIoctl(fd, cmdVirtgpuResourceCreate, unsafe.Pointer(&req)); err != nil {
+			fmt.Printf("blobs=%d errno=%s\n", created, errnoString(err))
+			_ = unix.Close(fd)
+			return
+		}
+		created++
+	}
+	fmt.Printf("blobs=%d errno=OK\n", created)
+	_ = unix.Close(fd)
+}
+
+func runVirgl() {
+	// Step 1: open render node and query DRM_IOCTL_VERSION.
+	fd, name, major, minor, patch := openAndVersion()
+	fmt.Printf("version=%s %d.%d.%d\n", name, major, minor, patch)
+
+	// Step 2: GETPARAM 1..8 and 9.
+	paramIDs := [8]uint64{
+		virtgpuParam3DFeatures,
+		virtgpuParamCapsetQueryFix,
+		virtgpuParamResourceBlob,
+		virtgpuParamHostVisible,
+		virtgpuParamCrossDevice,
+		virtgpuParamContextInit,
+		virtgpuParamSupportedCapsetIDs,
+		virtgpuParamExplicitDebugName,
+	}
+	var vals [8]uint64
+	for i, id := range paramIDs {
+		var val uint64
+		req := virtgpuGetparam{
+			Param: id,
+			Value: uint64(uintptr(unsafe.Pointer(&val))),
+		}
+		if err := drmIoctl(fd, cmdVirtgpuGetparam, unsafe.Pointer(&req)); err != nil {
+			fail("params", err)
+		}
+		runtime.KeepAlive(&val)
+		vals[i] = val
+	}
+	fmt.Printf("params=%d,%d,%d,%d,%d,%d,%d,%d\n",
+		vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7])
+
+	var alignVal uint64
+	alignReq := virtgpuGetparam{
+		Param: virtgpuParamBlobAlignment,
+		Value: uint64(uintptr(unsafe.Pointer(&alignVal))),
+	}
+	err := drmIoctl(fd, cmdVirtgpuGetparam, unsafe.Pointer(&alignReq))
+	runtime.KeepAlive(&alignVal)
+	if !errors.Is(err, unix.EINVAL) {
+		fail("blob_alignment", fmt.Errorf("got %v, want EINVAL", err))
+	}
+	fmt.Printf("blob_alignment=%s\n", errnoString(err))
+
+	// Step 3: GET_CAPS(2, 0, size 4096).
+	capBuf := make([]byte, 4096)
+	capsReq := virtgpuGetCaps{
+		CapSetID:  virtgpuCapsetVirgl2,
+		CapSetVer: 0,
+		Addr:      uint64(uintptr(unsafe.Pointer(&capBuf[0]))),
+		Size:      uint32(len(capBuf)),
+	}
+	if err := drmIoctl(fd, cmdVirtgpuGetCaps, unsafe.Pointer(&capsReq)); err != nil {
+		fail("caps2", err)
+	}
+	runtime.KeepAlive(capBuf)
+	fmt.Printf("caps2_word0=%d\n", binary.LittleEndian.Uint32(capBuf[:4]))
+
+	// Step 4: GET_CAPS(4, 0) must return EINVAL.
+	caps4Req := virtgpuGetCaps{
+		CapSetID:  virtgpuCapsetVenus,
+		CapSetVer: 0,
+		Addr:      uint64(uintptr(unsafe.Pointer(&capBuf[0]))),
+		Size:      uint32(len(capBuf)),
+	}
+	err = drmIoctl(fd, cmdVirtgpuGetCaps, unsafe.Pointer(&caps4Req))
+	runtime.KeepAlive(capBuf)
+	if !errors.Is(err, unix.EINVAL) {
+		fail("caps4", fmt.Errorf("got %v, want EINVAL", err))
+	}
+	fmt.Printf("caps4=%s\n", errnoString(err))
+
+	// Step 5: RESOURCE_CREATE on the fresh file creates an implicit context.
+	createReq := virtgpuResourceCreate{
+		Target:    pipeBuffer,
+		Format:    virglFormatR8Unorm,
+		Bind:      virglBindVertexBuffer,
+		Width:     virglResSize,
+		Height:    1,
+		Depth:     1,
+		ArraySize: 1,
+		Size:      virglResSize,
+	}
+	if err := drmIoctl(fd, cmdVirtgpuResourceCreate, unsafe.Pointer(&createReq)); err != nil {
+		fail("create", err)
+	}
+	boHandle := createReq.BoHandle
+	fmt.Printf("create=ok bo=%d\n", boHandle)
+
+	// Step 6: CONTEXT_INIT(capset 2) must return EEXIST after implicit creation.
+	ctxParams := [1]virtgpuContextSetParam{
+		{Param: virtgpuContextParamCapsetID, Value: virtgpuCapsetVirgl2},
+	}
+	ctxReq := virtgpuContextInit{
+		NumParams:    uint32(len(ctxParams)),
+		CtxSetParams: uint64(uintptr(unsafe.Pointer(&ctxParams[0]))),
+	}
+	err = drmIoctl(fd, cmdVirtgpuContextInit, unsafe.Pointer(&ctxReq))
+	runtime.KeepAlive(&ctxParams)
+	if !errors.Is(err, unix.EEXIST) {
+		fail("context_init", fmt.Errorf("got %v, want EEXIST", err))
+	}
+	fmt.Printf("context_init=%s\n", errnoString(err))
+
+	// Step 7: RESOURCE_INFO.
+	infoReq := virtgpuResourceInfo{BoHandle: boHandle}
+	if err := drmIoctl(fd, cmdVirtgpuResourceInfo, unsafe.Pointer(&infoReq)); err != nil {
+		fail("info", err)
+	}
+	fmt.Printf("info=blob_mem:%d size:%d\n", infoReq.BlobMem, infoReq.Size)
+
+	// Step 8: MAP and mmap, then write the test pattern.
+	mapReq := virtgpuMap{Handle: boHandle}
+	if err := drmIoctl(fd, cmdVirtgpuMap, unsafe.Pointer(&mapReq)); err != nil {
+		fail("map", err)
+	}
+	mapped, err := unix.Mmap(fd, int64(mapReq.Offset), virglResSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		fail("mmap", err)
+	}
+	for i := range mapped {
+		mapped[i] = byte(i*7 + 3)
+	}
+
+	// Step 9: TRANSFER_TO_HOST, clear mapping, TRANSFER_FROM_HOST, compare.
+	xfer := virtgpu3DTransfer{
+		BoHandle: boHandle,
+		Box: virtgpu3DBox{
+			X: 0,
+			Y: 0,
+			Z: 0,
+			W: virglResSize,
+			H: 1,
+			D: 1,
+		},
+	}
+	if err := drmIoctl(fd, cmdVirtgpuTransferToHost, unsafe.Pointer(&xfer)); err != nil {
+		fail("transfer_to_host", err)
+	}
+	clear(mapped)
+	if err := drmIoctl(fd, cmdVirtgpuTransferFromHost, unsafe.Pointer(&xfer)); err != nil {
+		fail("transfer_from_host", err)
+	}
+	for i, got := range mapped {
+		want := byte(i*7 + 3)
+		if got != want {
+			fail("transfer", fmt.Errorf("byte %d = %#x, want %#x", i, got, want))
+		}
+	}
+	fmt.Println("transfer=ok")
+
+	// Step 10: EXECBUFFER with size 0 and bo_handles = [bo]; blocking WAIT.
+	handles := [1]uint32{boHandle}
+	execReq := virtgpuExecbuffer{
+		Size:         0,
+		BoHandles:    uint64(uintptr(unsafe.Pointer(&handles[0]))),
+		NumBoHandles: uint32(len(handles)),
+		FenceFD:      -1,
+	}
+	if err := drmIoctl(fd, cmdVirtgpuExecbuffer, unsafe.Pointer(&execReq)); err != nil {
+		fail("execbuffer", err)
+	}
+	runtime.KeepAlive(&handles)
+	waitReq := virtgpu3DWait{Handle: boHandle, Flags: 0}
+	if err := drmIoctl(fd, cmdVirtgpuWait, unsafe.Pointer(&waitReq)); err != nil {
+		fail("wait", err)
+	}
+	fmt.Println("wait=0")
+
+	// Step 11: WAIT with unknown handle 999 must return ENOENT.
+	badWaitReq := virtgpu3DWait{Handle: 999, Flags: 0}
+	if err := drmIoctl(fd, cmdVirtgpuWait, unsafe.Pointer(&badWaitReq)); !errors.Is(err, unix.ENOENT) {
+		fail("wait_bad", fmt.Errorf("got %v, want ENOENT", err))
+	} else {
+		fmt.Printf("wait_bad=%s\n", errnoString(err))
+	}
+
+	// Step 12: RESOURCE_CREATE_BLOB must return EINVAL in virgl mode.
+	blobReq := virtgpuResourceCreateBlob{
+		BlobMem:   virtgpuBlobMemHost3D,
+		BlobFlags: virtgpuBlobFlagUseMappable,
+		Size:      blobSize,
+	}
+	if err := drmIoctl(fd, cmdVirtgpuResourceCreateBlob, unsafe.Pointer(&blobReq)); !errors.Is(err, unix.EINVAL) {
+		fail("blob", fmt.Errorf("got %v, want EINVAL", err))
+	} else {
+		fmt.Printf("blob=%s\n", errnoString(err))
+	}
+
+	// Step 13: TRANSFER_TO_HOST with non-zero stride must return EINVAL.
+	badXfer := virtgpu3DTransfer{
+		BoHandle: boHandle,
+		Box: virtgpu3DBox{
+			X: 0,
+			Y: 0,
+			Z: 0,
+			W: 4,
+			H: 1,
+			D: 1,
+		},
+		Stride: 4,
+	}
+	if err := drmIoctl(fd, cmdVirtgpuTransferToHost, unsafe.Pointer(&badXfer)); !errors.Is(err, unix.EINVAL) {
+		fail("transfer_stride", fmt.Errorf("got %v, want EINVAL", err))
+	} else {
+		fmt.Printf("transfer_stride=%s\n", errnoString(err))
+	}
+
+	// Step 14: GEM_CLOSE, munmap, close.
+	closeReq := drmGemClose{Handle: boHandle}
+	if err := drmIoctl(fd, cmdGemClose, unsafe.Pointer(&closeReq)); err != nil {
+		fail("gem_close", err)
+	}
+	if err := unix.Munmap(mapped); err != nil {
+		fail("munmap", err)
+	}
+	if err := unix.Close(fd); err != nil {
+		fail("close", err)
+	}
+	fmt.Println("VIRGL OK")
 }
 
 func runFull() {
