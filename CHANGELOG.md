@@ -6,6 +6,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Bug Fixes
 
+- **Windows `systrap` stub memory accounting (`internal/xsys/unix`, `pkg/sentry/pgalloc`, `pkg/sentry/platform/systrap`)** (#213): Scans, unmaps, remaps, and address-space exits now query `K32QueryWorkingSetEx` in stub processes for guest pages. Both `/proc/meminfo` `MemFree` and `--memory` guards count stub-faulted pages, and Windows `systrap` enables `memory.max` enforcement.
 - **`ext4lite` held-space allocation (`pkg/sentry/fsimpl/ext4lite`)** (#214): Mapped write-backs and post-flush retries grow the volume when held blocks wait for a flush. Initial allocations flush and reuse held space first. Allocations wait for active hole punches before appending groups.
 
 ## [v0.17.10012026111600] - 2026-11-20

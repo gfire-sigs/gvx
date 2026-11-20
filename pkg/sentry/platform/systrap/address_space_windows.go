@@ -111,7 +111,11 @@ type addressSpace struct {
 	// lowered to read-only because a copy of their frame exists. alias_windows.go
 	// explains both. They are guarded by mu.
 	wviews    []*writeView
+	memViews  []*memView
 	aliasProt map[uint64]frameKey
+
+	// residencyWG counts active scanResidency calls referencing this address space.
+	residencyWG sync.WaitGroup
 
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
@@ -325,6 +329,8 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		}
 		sec = &copied.ref
 		secOff = 0
+	} else {
+		as.p.watchResidency(f, sec.file)
 	}
 	var srcs []uint64
 	if at.Execute {
@@ -372,6 +378,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			keep[i] = old != nil && old.src == srcs[i] && old.srcSec == sec && old.srcOff == secOff+uint64(i)*blockSize && old.at == at
 		}
 	}
+	resSrc, _ := f.(residencySource)
 	for i := 0; i < nblk; {
 		if keep[i] {
 			i++
@@ -382,11 +389,17 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 			j++
 		}
 		start, length := guest+uint64(i)*blockSize, uint64(j-i)*blockSize
+		as.flushRangeResidencyLocked(start, start+length)
 		if err := as.win.Map(start, length, sec, secOff+uint64(i)*blockSize, viewProtFor(at)); err != nil {
 			if copied != nil {
 				copied.close()
 			}
 			return as.mapErr(fmt.Errorf("map [%#x, %#x): %w", start, start+length, err))
+		}
+		if copied == nil && resSrc != nil {
+			as.memViewsMappedLocked(start, length, resSrc, sec.file, sec.fileBase+secOff+uint64(i)*blockSize)
+		} else {
+			as.removeMemViewsLocked(start, start+length)
 		}
 		i = j
 	}
@@ -462,6 +475,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if as.released || as.sp.dead.Load() {
 		return
 	}
+	as.flushRangeResidencyLocked(start, end)
 	if err := as.win.Unmap(start, end-start); err != nil && !as.sp.dead.Load() {
 		// Windows rejects only a malformed range or a broken window here. Both
 		// are Sentry bugs, and a stale mapping would expose freed memory.
@@ -492,6 +506,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 		}
 	}
 	as.dropIslandsLocked(start, end)
+	as.removeMemViewsLocked(start, end)
 	as.aliasUnmappedLocked(start, end)
 }
 
@@ -504,7 +519,11 @@ func (as *addressSpace) Release() {
 		return
 	}
 	as.released = true
+	views := as.detachMemViewsLocked()
 	as.mu.Unlock()
+
+	as.flushViewsResidency(views)
+	as.residencyWG.Wait()
 
 	// Terminating the process stops every thread, so no stub thread touches
 	// the pages that go back to the pool below.

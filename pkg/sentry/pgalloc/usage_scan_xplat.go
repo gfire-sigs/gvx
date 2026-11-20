@@ -72,6 +72,16 @@ func mincoreGuestPages(s, buf []byte) error {
 	return mincore(s, buf)
 }
 
+// queryResidentPages populates buf with per-guest-page residency for fr and
+// invokes any host-specific external residency observers without holding f.mu.
+func (f *MemoryFile) queryResidentPages(fr memmap.FileRange, s, buf []byte) error {
+	if err := mincoreGuestPages(s, buf); err != nil {
+		return err
+	}
+	f.scanExternalResidency(fr, buf)
+	return nil
+}
+
 func rawMincore(base, span uintptr, vec []byte) error {
 	if _, _, errno := unix.RawSyscall(
 		unix.SYS_MINCORE,

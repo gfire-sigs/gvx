@@ -321,11 +321,131 @@ const (
 	mincoreStackLimit = 256
 )
 
-var workingSetInfoPool = sync.Pool{
-	New: func() any {
-		buf := make([]workingSetExInfo, mincoreBatch)
-		return &buf
-	},
+var (
+	workingSetInfoPool = sync.Pool{
+		New: func() any {
+			buf := make([]workingSetExInfo, mincoreBatch)
+			return &buf
+		},
+	}
+	workingSetIdxPool = sync.Pool{
+		New: func() any {
+			buf := make([]int, mincoreBatch)
+			return &buf
+		},
+	}
+)
+
+// QueryProcessWorkingSetRange queries the working set of process for the pages
+// starting at addr and stores bit 0 (Valid) into vec, one byte per 4 KB page.
+func QueryProcessWorkingSetRange(process windows.Handle, addr uintptr, vec []byte) Errno {
+	if addr&(winPageSize-1) != 0 {
+		return EINVAL
+	}
+	if len(vec) == 0 {
+		return 0
+	}
+	if err := procQueryWorkingSetExUx.Find(); err != nil {
+		return ENOSYS
+	}
+	pages := len(vec)
+	var (
+		stackBuf [mincoreStackLimit]workingSetExInfo
+		infos    []workingSetExInfo
+	)
+	if pages <= mincoreStackLimit {
+		infos = stackBuf[:pages]
+	} else {
+		pooled := workingSetInfoPool.Get().(*[]workingSetExInfo)
+		defer workingSetInfoPool.Put(pooled)
+		infos = *pooled
+	}
+	for done := 0; done < pages; {
+		n := min(pages-done, len(infos))
+		for i := range n {
+			infos[i] = workingSetExInfo{virtualAddress: addr + uintptr(done+i)*winPageSize}
+		}
+		r1, _, callErr := procQueryWorkingSetExUx.Call(uintptr(process), uintptr(unsafe.Pointer(&infos[0])), uintptr(n)*unsafe.Sizeof(infos[0]))
+		if r1 == 0 {
+			return winErrno(callErr)
+		}
+		for i := range n {
+			vec[done+i] = byte(infos[i].virtualAttributes & 1)
+		}
+		done += n
+	}
+	return 0
+}
+
+// QueryProcessWorkingSetValid queries process for each page in vec whose bit 0
+// is clear and sets bit 0 in vec when the page is valid in that process.
+func QueryProcessWorkingSetValid(process windows.Handle, addr uintptr, vec []byte) Errno {
+	if addr&(winPageSize-1) != 0 {
+		return EINVAL
+	}
+	if len(vec) == 0 {
+		return 0
+	}
+	hasMissing := false
+	for _, v := range vec {
+		if v&1 == 0 {
+			hasMissing = true
+			break
+		}
+	}
+	if !hasMissing {
+		return 0
+	}
+	if err := procQueryWorkingSetExUx.Find(); err != nil {
+		return ENOSYS
+	}
+	pages := len(vec)
+	var (
+		stackBuf [mincoreStackLimit]workingSetExInfo
+		stackIdx [mincoreStackLimit]int
+		infos    []workingSetExInfo
+		idxs     []int
+	)
+	if pages <= mincoreStackLimit {
+		infos = stackBuf[:pages]
+		idxs = stackIdx[:pages]
+	} else {
+		pooledInfos := workingSetInfoPool.Get().(*[]workingSetExInfo)
+		defer workingSetInfoPool.Put(pooledInfos)
+		pooledIdxs := workingSetIdxPool.Get().(*[]int)
+		defer workingSetIdxPool.Put(pooledIdxs)
+		infos = *pooledInfos
+		idxs = *pooledIdxs
+	}
+	k := 0
+	flush := func() Errno {
+		if k == 0 {
+			return 0
+		}
+		r1, _, callErr := procQueryWorkingSetExUx.Call(uintptr(process), uintptr(unsafe.Pointer(&infos[0])), uintptr(k)*unsafe.Sizeof(infos[0]))
+		if r1 == 0 {
+			return winErrno(callErr)
+		}
+		for j := range k {
+			vec[idxs[j]] |= byte(infos[j].virtualAttributes & 1)
+		}
+		k = 0
+		return 0
+	}
+	for i, v := range vec {
+		if v&1 != 0 {
+			continue
+		}
+		infos[k] = workingSetExInfo{virtualAddress: addr + uintptr(i)*winPageSize}
+		idxs[k] = i
+		k++
+		if k == len(infos) {
+			if errno := flush(); errno != 0 {
+				return errno
+			}
+		}
+	}
+	return flush()
 }
 
 // winMincore implements mincore(2) with QueryWorkingSetEx. A page counts as
@@ -338,39 +458,9 @@ func winMincore(addr, length, vecAddr uintptr) Errno {
 	if length == 0 {
 		return 0
 	}
-	if err := procQueryWorkingSetExUx.Find(); err != nil {
-		return ENOSYS
-	}
 	pages := int(winRoundUp(length, winPageSize) / winPageSize)
 	vec := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&vecAddr))), pages)
-
-	var (
-		stackBuf [mincoreStackLimit]workingSetExInfo
-		infos    []workingSetExInfo
-	)
-	if pages <= mincoreStackLimit {
-		infos = stackBuf[:pages]
-	} else {
-		pooled := workingSetInfoPool.Get().(*[]workingSetExInfo)
-		defer workingSetInfoPool.Put(pooled)
-		infos = *pooled
-	}
-	process := uintptr(windows.CurrentProcess())
-	for done := 0; done < pages; {
-		n := min(pages-done, len(infos))
-		for i := 0; i < n; i++ {
-			infos[i] = workingSetExInfo{virtualAddress: addr + uintptr(done+i)*winPageSize}
-		}
-		r1, _, callErr := procQueryWorkingSetExUx.Call(process, uintptr(unsafe.Pointer(&infos[0])), uintptr(n)*unsafe.Sizeof(infos[0]))
-		if r1 == 0 {
-			return winErrno(callErr)
-		}
-		for i := 0; i < n; i++ {
-			vec[done+i] = byte(infos[i].virtualAttributes & 1)
-		}
-		done += n
-	}
-	return 0
+	return QueryProcessWorkingSetRange(windows.CurrentProcess(), addr, vec)
 }
 
 // Mmap maps a file or anonymous memory, as mmap(2) does.

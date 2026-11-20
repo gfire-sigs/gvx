@@ -50,6 +50,8 @@
 //	                                 check that it stays
 //	nodeprobe hold MIB               commit MIB MiB of anonymous memory, print
 //	                                 HOLDING, and keep it until the end of the input
+//	nodeprobe memfree MIB            verify MemFree and AnonPages in /proc/meminfo
+//	                                 change across mmap commit and munmap
 //	nodeprobe memcg HOLD_MIB [MAX_MIB]
 //	                                 start a child in a new memory cgroup, commit
 //	                                 HOLD_MIB MiB in it, print HOLDING, and after the
@@ -211,6 +213,16 @@ func main() {
 			os.Exit(2)
 		}
 		checks = holdChecks(mib)
+	case "memfree":
+		mib, err := 0, error(nil)
+		if len(os.Args) == 3 {
+			mib, err = strconv.Atoi(os.Args[2])
+		}
+		if len(os.Args) != 3 || err != nil || mib <= 0 {
+			fmt.Fprintln(os.Stderr, "usage: nodeprobe memfree MIB")
+			os.Exit(2)
+		}
+		checks = memFreeChecks(mib)
 	case "memcg":
 		hold, limit, err := 0, 0, error(nil)
 		if len(os.Args) == 3 || len(os.Args) == 4 {

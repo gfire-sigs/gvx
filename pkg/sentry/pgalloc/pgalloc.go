@@ -1770,7 +1770,7 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 			lastCommitSeq := f.commitSeq
 			f.commitSeq++
 			f.mu.Unlock() // +checklocksforce
-			err := mincoreGuestPages(s, buf)
+			err := f.queryResidentPages(chunkFR, s, buf[:bufLen])
 			f.mu.Lock()
 			if err != nil {
 				checkErr = err

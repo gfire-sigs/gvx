@@ -22,7 +22,6 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -335,12 +334,7 @@ func TestE2EK3sSingleNode(t *testing.T) {
 		t.Run(b.name, func(t *testing.T) {
 			requireBackend(t, b)
 			requireRegistry(t)
-			// The Windows systrap engine cannot count the pages of its stub
-			// processes, so the Sentry leaves memory.max unenforced there.
 			enforce := "1"
-			if runtime.GOOS == "windows" && b.plat == gvx.PlatformSystrap {
-				enforce = "0"
-			}
 			volume := filepath.Join(t.TempDir(), "k3s.ext4")
 			script := strings.ReplaceAll(k3sScript, "NODEPORT", strconv.Itoa(k3sNodePort))
 

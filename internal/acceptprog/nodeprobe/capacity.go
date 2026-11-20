@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -144,6 +145,99 @@ func holdChecks(mib int) []check {
 		fmt.Println("HOLDING")
 		_, err = io.Copy(io.Discard, os.Stdin)
 		return err
+	}}}
+}
+
+// memFreeChecks verifies that committing and unmapping mib MiB of anonymous
+// memory moves /proc/meminfo MemFree and AnonPages.
+func memFreeChecks(mib int) []check {
+	return []check{{"meminfo-tracks-guest-anonymous-commit", func() error {
+		freeBefore, err := meminfoValue("MemFree")
+		if err != nil {
+			return err
+		}
+		anonBefore, err := meminfoValue("AnonPages")
+		if err != nil {
+			return err
+		}
+
+		size := mib << 20
+		mem, err := unix.Mmap(-1, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+		if err != nil {
+			return err
+		}
+		unmapped := false
+		defer func() {
+			if !unmapped {
+				_ = unix.Munmap(mem)
+			}
+		}()
+
+		wantDelta := uint64(size) / 2
+		// Verify mapping alone without writing leaves AnonPages uncommitted.
+		anonMapped, err := meminfoValue("AnonPages")
+		if err != nil {
+			return err
+		}
+		if anonMapped >= anonBefore+wantDelta {
+			return fmt.Errorf("mmap alone raised AnonPages from %d to %d before touching pages", anonBefore, anonMapped)
+		}
+		for i := 0; i < len(mem); i += os.Getpagesize() {
+			mem[i] = 1
+		}
+
+		// /proc/meminfo calls MemoryFile.UpdateUsage rate-limited by ClockTick, so
+		// poll briefly until the scan observes the newly faulted pages (and
+		// allow up to 15 s for APFS st_blocks lag on macOS).
+		var freeDuring, anonDuring uint64
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			freeDuring, err = meminfoValue("MemFree")
+			if err != nil {
+				return err
+			}
+			anonDuring, err = meminfoValue("AnonPages")
+			if err != nil {
+				return err
+			}
+			if freeBefore >= freeDuring+wantDelta && anonDuring >= anonBefore+wantDelta {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf(
+					"anonymous commit %d MiB not reflected in /proc/meminfo: MemFree %d -> %d, AnonPages %d -> %d",
+					mib, freeBefore, freeDuring, anonBefore, anonDuring,
+				)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+
+		if err := unix.Munmap(mem); err != nil {
+			return err
+		}
+		unmapped = true
+
+		deadline = time.Now().Add(5 * time.Second)
+		for {
+			freeAfter, err := meminfoValue("MemFree")
+			if err != nil {
+				return err
+			}
+			anonAfter, err := meminfoValue("AnonPages")
+			if err != nil {
+				return err
+			}
+			if freeAfter >= freeDuring+wantDelta && anonDuring >= anonAfter+wantDelta {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf(
+					"/proc/meminfo did not recover after munmap: MemFree during=%d after=%d, AnonPages during=%d after=%d",
+					freeDuring, freeAfter, anonDuring, anonAfter,
+				)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
 	}}}
 }
 
