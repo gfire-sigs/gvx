@@ -2,7 +2,9 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
-## [Unreleased]
+## [v0.17.10012026111600] - 2026-11-20
+
+This release syncs upstream gVisor to `release-20261116.0` (`83282de1f21f`) and aligns the DNS relay with Docker Engine (#208, #215). It also reclaims freed Windows guest memory without disk backing (#211) and classifies failed host dials for NAT TCP (#206).
 
 ### Bug Fixes
 
@@ -12,7 +14,7 @@ This file records the observable changes of each `gvx` release. The release work
 
 ### Upstream Sync
 
-- **Upstream gVisor `release-20261116.0` (`83282de1f21f`)**: Advances `UPSTREAM_COMMIT` and `tools/upstream/sync_manifest.json` from `10548a45b7ba` (`release-20261109.0`) to `83282de1f21f` across 157 upstream files. Adopts runtime `hostarch.PageSize` on `arm64` via `hostarch_arm64_xplat.go` and keeps 4 KB guest pages on 16 KB `darwin`, `linux`, and `android` hosts. Adds `DrainDentryCache` on `hostfs` and `ext4lite`, and adds `PrepareForPtrace` on `hvf`, `whpx`, and address spaces for Windows `systrap`. Merges `usertrap` unpatch validation into `rewrite_xplat_amd64.go`, and permits `SYS_FALLOCATE` with `FALLOC_FL_KEEP_SIZE` for `hostfs` mounts. Evaluates `cgo` tags in `tools/upstream`, and regenerates stateify files and third-party license notices.
+- **Upstream gVisor `release-20261116.0` (`83282de1f21f`)** (#215): Advances `UPSTREAM_COMMIT` and `tools/upstream/sync_manifest.json` from `10548a45b7ba` (`release-20261109.0`) to `83282de1f21f` across 157 upstream files. Adopts runtime `hostarch.PageSize` on `arm64` via `hostarch_arm64_xplat.go` and keeps 4 KB guest pages on 16 KB `darwin`, `linux`, and `android` hosts. Adds `DrainDentryCache` on `hostfs` and `ext4lite`, and adds `PrepareForPtrace` on `hvf`, `whpx`, and address spaces for Windows `systrap`. Merges `usertrap` unpatch validation into `rewrite_xplat_amd64.go`, and permits `SYS_FALLOCATE` with `FALLOC_FL_KEEP_SIZE` for `hostfs` mounts. Evaluates `cgo` tags in `tools/upstream`, and regenerates stateify files and third-party license notices.
 
 ## [v0.17.10002026110900] - 2026-11-17
 
