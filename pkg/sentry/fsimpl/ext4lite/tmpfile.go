@@ -62,11 +62,11 @@ func (fs *filesystem) openTmpfile(ctx context.Context, rp *vfs.ResolvingPath, op
 		return nil, linuxerr.ENOENT
 	}
 	var ino *inode
-	if err := fs.writeOp(rp.Mount(), func() error {
+	if err := fs.writeOp(rp.Mount(), func(policy allocPolicy) error {
 		uid, gid, _ := parent.inode.newOwner(creds)
-		n, err := fs.v.newNode(modeRegular|uint16(opts.Mode&0o7777), uint32(uid), uint32(gid), 0, fs.now())
+		n, err := fs.v.newNodePolicy(modeRegular|uint16(opts.Mode&0o7777), uint32(uid), uint32(gid), 0, fs.now(), policy)
 		if err != nil {
-			return toLinuxErr(err)
+			return toWriteOpErr(err)
 		}
 		ino = fs.inodeForNodeLocked(n)
 		return nil

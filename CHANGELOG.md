@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **`ext4lite` held-space allocation (`pkg/sentry/fsimpl/ext4lite`)** (#214): Mapped write-backs and post-flush retries grow the volume when held blocks wait for a flush. Initial allocations flush and reuse held space first. Allocations wait for active hole punches before appending groups.
+
 ## [v0.17.10012026111600] - 2026-11-20
 
 This release syncs upstream gVisor to `release-20261116.0` (`83282de1f21f`) and aligns the DNS relay with Docker Engine (#208, #215). It also reclaims freed Windows guest memory without disk backing (#211) and classifies failed host dials for NAT TCP (#206).

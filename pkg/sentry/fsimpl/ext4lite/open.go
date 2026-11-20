@@ -100,10 +100,10 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		var ino *inode
-		if err := fs.writeOp(rp.Mount(), func() error {
+		if err := fs.writeOp(rp.Mount(), func(policy allocPolicy) error {
 			uid, gid, _ := parent.inode.newOwner(rp.Credentials())
 			var err error
-			ino, err = fs.newChildLocked(parent, name, modeRegular|uint16(opts.Mode&0o7777), uid, gid, 0, nil)
+			ino, err = fs.newChildLocked(parent, name, modeRegular|uint16(opts.Mode&0o7777), uid, gid, 0, nil, policy)
 			return err
 		}); err != nil {
 			return nil, err

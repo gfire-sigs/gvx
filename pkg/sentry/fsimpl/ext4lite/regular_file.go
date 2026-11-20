@@ -90,7 +90,7 @@ func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *v
 		return nil, err
 	}
 	if !afterCreate && opts.Flags&linux.O_TRUNC != 0 {
-		err := d.fs.writeOp(mnt, func() error { return d.inode.truncate(0) })
+		err := d.fs.writeOp(mnt, func(policy allocPolicy) error { return d.inode.truncatePolicy(0, policy) })
 		if err != nil {
 			fd.vfsfd.DecRef(ctx)
 			return nil, err
@@ -180,8 +180,9 @@ func (fd *regularFD) PWrite(ctx context.Context, src usermem.IOSequence, offset 
 // nodeWriter writes to a node and keeps the mapped-page cache coherent with
 // what it wrote.
 type nodeWriter struct {
-	ino *inode
-	off int64
+	ino    *inode
+	off    int64
+	policy allocPolicy
 }
 
 func (w *nodeWriter) Write(p []byte) (int, error) {
@@ -189,7 +190,7 @@ func (w *nodeWriter) Write(p []byte) (int, error) {
 	n.mu.RLock()
 	oldSize := n.size
 	n.mu.RUnlock()
-	done, err := n.writeAt(p, w.off)
+	done, err := n.writeAtPolicy(p, w.off, w.policy)
 	if done > 0 {
 		w.ino.data.writeThrough(oldSize, w.off, p[:done])
 		w.off += int64(done)
@@ -209,20 +210,26 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 	if d.fs.readOnly {
 		return 0, offset, linuxerr.EROFS
 	}
-	// A write that finds no free block while freed blocks wait for a flush
-	// flushes once with the gate open and writes the rest.
+	// Try to reuse free space first, flush any held blocks on errSpaceHeld, and
+	// retry once with allocGrowHeld so concurrent churn does not fail with ENOSPC.
 	cur, pos := src, offset
 	var total int64
 	var werr error
 	for retry := 0; ; retry++ {
-		n, end, err := fd.pwriteGated(ctx, cur, pos, opts)
+		policy := allocReuseHeld
+		if retry > 0 {
+			policy = allocGrowHeld
+		}
+		n, end, err := fd.pwriteGated(ctx, cur, pos, opts, policy)
 		total += n
 		finalOff, werr = end, err
-		if !errors.Is(err, errSpaceHeld) || retry > 0 || !d.fs.v.hasHeld() {
+		if !errors.Is(err, errSpaceHeld) || retry > 0 {
 			break
 		}
-		if serr := d.fs.v.sync(); serr != nil {
-			return total, finalOff, toLinuxErr(serr)
+		if d.fs.v.hasHeld() {
+			if serr := d.fs.v.sync(); serr != nil {
+				return total, finalOff, toLinuxErr(serr)
+			}
 		}
 		cur, pos = cur.DropFirst64(n), end
 	}
@@ -244,7 +251,7 @@ func (fd *regularFD) pwrite(ctx context.Context, src usermem.IOSequence, offset 
 // the offset behind them, and the raw error of the engine, so that pwrite can
 // recognize a request that waits for a flush. The gate comes before wmu, as in
 // every other operation.
-func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (written, finalOff int64, err error) {
+func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions, policy allocPolicy) (written, finalOff int64, err error) {
 	d := fd.dentry
 	ino := d.inode
 	if err := d.fs.v.throttle(); err != nil {
@@ -270,7 +277,7 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 	if src.NumBytes() == 0 {
 		return 0, offset, nil
 	}
-	w := &nodeWriter{ino: ino, off: offset}
+	w := &nodeWriter{ino: ino, off: offset, policy: policy}
 	n, err := src.CopyInTo(ctx, safemem.FromIOWriter{Writer: w})
 	if n > 0 {
 		// As with Linux, a write clears the set-user-ID and set-group-ID bits
@@ -280,7 +287,7 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 			nd.mtime, nd.ctime = now, now
 			nd.mode = writeClearPrivsMode(ctx, nd.mode, nd.uid, nd.gid)
 		})
-		if err := ino.killCapability(); err != nil {
+		if err := ino.killCapabilityPolicy(policy); err != nil {
 			return n, offset + n, err
 		}
 	}
@@ -290,6 +297,10 @@ func (fd *regularFD) pwriteGated(ctx context.Context, src usermem.IOSequence, of
 // killCapability removes the file capabilities after a write. It reads the
 // attributes only when the node has any.
 func (i *inode) killCapability() error {
+	return i.killCapabilityPolicy(allocReuseHeld)
+}
+
+func (i *inode) killCapabilityPolicy(policy allocPolicy) error {
 	n := i.n
 	n.mu.RLock()
 	has := n.fileACL != 0 || (n.xa != nil && len(n.xa.entries) > 0)
@@ -297,7 +308,7 @@ func (i *inode) killCapability() error {
 	if !has {
 		return nil
 	}
-	if err := n.removeXattr(linux.XATTR_SECURITY_CAPABILITY); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
+	if err := n.removeXattrPolicy(linux.XATTR_SECURITY_CAPABILITY, policy); err != nil && !linuxerr.Equals(linuxerr.ENODATA, err) {
 		return toLinuxErr(err)
 	}
 	return nil
@@ -316,6 +327,13 @@ func (fs *filesystem) syncInode(ino *inode) error {
 	ino.wmu.Lock()
 	err := ino.data.SyncData()
 	ino.wmu.Unlock()
+	if errors.Is(err, errSpaceHeld) && fs.v.hasHeld() {
+		if serr := fs.v.sync(); serr == nil {
+			ino.wmu.Lock()
+			err = ino.data.SyncData()
+			ino.wmu.Unlock()
+		}
+	}
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -395,7 +413,7 @@ func (fd *regularFD) Allocate(ctx context.Context, mode, offset, length uint64) 
 	if err := fsutilx.CheckFallocateLimit(ctx, offset, length, checkLimit); err != nil {
 		return err
 	}
-	return d.fs.writeOp(fd.vfsfd.Mount(), func() error { return fd.allocateLocked(ino, op, offset, length, keepSize) })
+	return d.fs.writeOp(fd.vfsfd.Mount(), func(policy allocPolicy) error { return fd.allocateLocked(ino, op, offset, length, keepSize, policy) })
 }
 
 // ServesFallocateModes marks the description for the fallocate system call. The
@@ -412,41 +430,41 @@ func (i *inode) size() uint64 {
 // allocateLocked runs a validated fallocate in the operation gate. The gate
 // comes before wmu, as in every operation. Dirty mapped pages in the range reach
 // the engine first, so the engine change covers them as well.
-func (fd *regularFD) allocateLocked(ino *inode, op allocOp, offset, length uint64, keepSize bool) error {
+func (fd *regularFD) allocateLocked(ino *inode, op allocOp, offset, length uint64, keepSize bool, policy allocPolicy) error {
 	ino.wmu.Lock()
 	defer ino.wmu.Unlock()
 	old := ino.size()
 	switch op {
 	case allocPunch:
 		if err := ino.data.FlushRange(offset, offset+length); err != nil {
-			return toLinuxErr(err)
+			return toWriteOpErr(err)
 		}
-		if err := ino.n.punchHole(offset, length); err != nil {
-			return toLinuxErr(err)
+		if err := ino.n.punchHolePolicy(offset, length, policy); err != nil {
+			return toWriteOpErr(err)
 		}
 		ino.data.Punched(offset, length)
 	case allocZero:
 		if err := ino.data.FlushRange(offset, offset+length); err != nil {
-			return toLinuxErr(err)
+			return toWriteOpErr(err)
 		}
-		if err := ino.n.zeroRange(offset, length, keepSize); err != nil {
-			return toLinuxErr(err)
+		if err := ino.n.zeroRangePolicy(offset, length, keepSize, policy); err != nil {
+			return toWriteOpErr(err)
 		}
 		ino.data.Punched(offset, length)
 		ino.data.truncated(old, ino.size())
 	case allocCollapse, allocInsert:
 		// Every byte from the offset on moves. The cache writes back, changes,
 		// and reloads under its own locks, so a mapped store never falls between.
-		change := ino.n.collapseRange
+		change := ino.n.collapseRangePolicy
 		if op == allocInsert {
-			change = ino.n.insertRange
+			change = ino.n.insertRangePolicy
 		}
-		if err := ino.data.ShiftFrom(offset, func() error { return change(offset, length) }); err != nil {
-			return toLinuxErr(err)
+		if err := ino.data.ShiftFrom(offset, func() error { return change(offset, length, policy) }); err != nil {
+			return toWriteOpErr(err)
 		}
 	default:
-		if err := ino.n.preallocate(offset, length, keepSize); err != nil {
-			return toLinuxErr(err)
+		if err := ino.n.preallocatePolicy(offset, length, keepSize, policy); err != nil {
+			return toWriteOpErr(err)
 		}
 		ino.data.truncated(old, ino.size())
 	}

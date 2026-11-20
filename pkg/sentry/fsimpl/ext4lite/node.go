@@ -263,8 +263,12 @@ func (v *volume) evictIdle(nodes []*node) {
 // A regular file or symlink starts empty inside the inode. The caller sets
 // the link count and links the node into a directory.
 func (v *volume) newNode(mode uint16, uid, gid, rdev uint32, now tstamp) (*node, error) {
+	return v.newNodePolicy(mode, uid, gid, rdev, now, allocReuseHeld)
+}
+
+func (v *volume) newNodePolicy(mode uint16, uid, gid, rdev uint32, now tstamp, policy allocPolicy) (*node, error) {
 	isDir := mode&modeTypeMask == modeDir
-	ino, err := v.allocInode(isDir)
+	ino, err := v.allocInodePolicy(isDir, policy)
 	if err != nil {
 		return nil, err
 	}

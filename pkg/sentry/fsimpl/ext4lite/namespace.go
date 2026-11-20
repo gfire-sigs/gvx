@@ -39,17 +39,17 @@ func (i *inode) newOwner(creds *auth.Credentials) (auth.KUID, auth.KGID, bool) {
 // newChildLocked creates a node and links it into parent. The init function
 // writes the content of the node before the node becomes visible. When any step
 // fails, the engine frees the node, because it has no link.
-func (fs *filesystem) newChildLocked(parent *dentry, name string, mode uint16, uid auth.KUID, gid auth.KGID, rdev uint32, init func(n *node) error) (*inode, error) {
-	n, err := fs.v.newNode(mode, uint32(uid), uint32(gid), rdev, fs.now())
+func (fs *filesystem) newChildLocked(parent *dentry, name string, mode uint16, uid auth.KUID, gid auth.KGID, rdev uint32, init func(n *node) error, policy allocPolicy) (*inode, error) {
+	n, err := fs.v.newNodePolicy(mode, uint32(uid), uint32(gid), rdev, fs.now(), policy)
 	if err != nil {
-		return nil, toLinuxErr(err)
+		return nil, toWriteOpErr(err)
 	}
 	fail := func(err error) (*inode, error) {
 		n.mu.Lock()
 		n.links = 0
 		n.mu.Unlock()
 		fs.v.putNode(n)
-		return nil, toLinuxErr(err)
+		return nil, toWriteOpErr(err)
 	}
 	if init != nil {
 		if err := init(n); err != nil {
@@ -64,7 +64,7 @@ func (fs *filesystem) newChildLocked(parent *dentry, name string, mode uint16, u
 	}
 	n.markDirtyLocked()
 	n.mu.Unlock()
-	if err := parent.inode.n.addEntry(name, n.ino, n.fileType()); err != nil {
+	if err := parent.inode.n.addEntryPolicy(name, n.ino, n.fileType(), policy); err != nil {
 		return fail(err)
 	}
 	now := fs.now()
@@ -82,7 +82,7 @@ func (fs *filesystem) newChildLocked(parent *dentry, name string, mode uint16, u
 //
 // Preconditions: !rp.Done() and rp.ShouldFollowSymlink() is false for the last
 // component.
-func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parent *dentry, name string) (*inode, error)) error {
+func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parent *dentry, name string, policy allocPolicy) (*inode, error)) error {
 	fs.lock(ctx)
 	defer fs.unlock(ctx)
 	parent, err := fs.walkParentDirLocked(ctx, rp, rp.Start().Impl().(*dentry))
@@ -111,12 +111,12 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return linuxerr.ENOENT
 	}
 	var ino *inode
-	if err := fs.writeOp(rp.Mount(), func() error {
+	if err := fs.writeOp(rp.Mount(), func(policy allocPolicy) error {
 		if err := parent.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 			return err
 		}
 		var err error
-		ino, err = create(parent, name)
+		ino, err = create(parent, name, policy)
 		return err
 	}); err != nil {
 		return err
@@ -132,7 +132,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name string) (*inode, error) {
+	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name string, policy allocPolicy) (*inode, error) {
 		if rp.Mount() != vd.Mount() {
 			return nil, linuxerr.EXDEV
 		}
@@ -154,8 +154,8 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if err := vfs.MayLink(rp.Credentials(), linux.FileMode(a.mode), nil, auth.KUID(a.uid), auth.KGID(a.gid)); err != nil {
 			return nil, err
 		}
-		if err := parent.inode.n.addEntry(name, si.ino, fileTypeOfMode(si.kind)); err != nil {
-			return nil, toLinuxErr(err)
+		if err := parent.inode.n.addEntryPolicy(name, si.ino, fileTypeOfMode(si.kind), policy); err != nil {
+			return nil, toWriteOpErr(err)
 		}
 		si.addLinks(1)
 		si.tmpLinkable = false
@@ -167,7 +167,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
-	return fs.doCreateAt(ctx, rp, true, func(parent *dentry, name string) (*inode, error) {
+	return fs.doCreateAt(ctx, rp, true, func(parent *dentry, name string, policy allocPolicy) (*inode, error) {
 		if parent.inode.attr().links >= maxLinks {
 			return nil, linuxerr.EMLINK
 		}
@@ -177,14 +177,14 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			mode |= linux.S_ISGID
 		}
 		return fs.newChildLocked(parent, name, mode, uid, gid, 0, func(n *node) error {
-			return n.initDir(parent.inode.ino)
-		})
+			return n.initDirPolicy(parent.inode.ino, policy)
+		}, policy)
 	})
 }
 
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
-	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name string) (*inode, error) {
+	return fs.doCreateAt(ctx, rp, false, func(parent *dentry, name string, policy allocPolicy) (*inode, error) {
 		uid, gid, _ := parent.inode.newOwner(rp.Credentials())
 		perm := uint16(opts.Mode & 0o7777)
 		var kind uint16
@@ -208,7 +208,7 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		default:
 			return nil, linuxerr.EINVAL
 		}
-		ino, err := fs.newChildLocked(parent, name, kind|perm, uid, gid, rdev, nil)
+		ino, err := fs.newChildLocked(parent, name, kind|perm, uid, gid, rdev, nil, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -410,7 +410,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if mnt != oldParentVD.Mount() {
 		return linuxerr.EXDEV
 	}
-	return fs.writeOp(mnt, func() error {
+	return fs.writeOp(mnt, func(policy allocPolicy) error {
 		creds := rp.Credentials()
 		oldParent := oldParentVD.Dentry().Impl().(*dentry)
 		if err := oldParent.inode.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
@@ -488,7 +488,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if exchange {
 			err = fs.exchangeEntries(oldParent, oldName, renamed, newParent, newName, replaced)
 		} else {
-			err = fs.moveEntries(oldParent, oldName, renamed, newParent, newName, replaced)
+			err = fs.moveEntries(oldParent, oldName, renamed, newParent, newName, replaced, policy)
 		}
 		if err != nil {
 			vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
@@ -580,7 +580,7 @@ func (fs *filesystem) checkReplaceLocked(creds *auth.Credentials, rp *vfs.Resolv
 
 // moveEntries changes the directory entries for a plain rename. It adds the
 // new name before it removes the old name, so a failure never loses the file.
-func (fs *filesystem) moveEntries(oldParent *dentry, oldName string, renamed *dentry, newParent *dentry, newName string, replaced *dentry) error {
+func (fs *filesystem) moveEntries(oldParent *dentry, oldName string, renamed *dentry, newParent *dentry, newName string, replaced *dentry, policy allocPolicy) error {
 	ri := renamed.inode
 	rft := fileTypeOfMode(ri.kind)
 	var steps []renameStep
@@ -599,7 +599,7 @@ func (fs *filesystem) moveEntries(oldParent *dentry, oldName string, renamed *de
 		})
 	} else {
 		steps = append(steps, renameStep{
-			do:   func() error { return newParent.inode.n.addEntry(newName, ri.ino, rft) },
+			do:   func() error { return newParent.inode.n.addEntryPolicy(newName, ri.ino, rft, policy) },
 			undo: func() { _ = newParent.inode.n.removeEntry(newName) },
 		})
 	}

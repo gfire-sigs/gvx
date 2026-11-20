@@ -502,7 +502,17 @@ func (n *node) allocTreeBlock(goal uint64) (uint64, error) {
 // canonical form. It changes nothing when it fails. The caller frees the data
 // runs that list drops, and it counts the data runs that list adds.
 func (n *node) setExtentsLocked(list []extent) error {
-	u, err := n.prepareTreeLocked(list, keepAll, n.allocTreeBlock)
+	return n.setExtentsPolicyLocked(list, allocReuseHeld)
+}
+
+// setExtentsPolicyLocked is setExtentsLocked with an explicit block-allocation
+// policy for new extent tree blocks.
+func (n *node) setExtentsPolicyLocked(list []extent, policy allocPolicy) error {
+	alloc := func(goal uint64) (uint64, error) {
+		blk, _, err := n.v.allocBlocksPolicy(goal, 1, policy)
+		return blk, err
+	}
+	u, err := n.prepareTreeLocked(list, keepAll, alloc)
 	if err != nil {
 		return err
 	}
