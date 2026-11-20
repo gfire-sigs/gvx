@@ -495,7 +495,7 @@ func forEachBlockSize(t *testing.T, fn func(t *testing.T, bs int)) {
 	t.Helper()
 	for _, bs := range blockSizes {
 		t.Run(fmt.Sprintf("block%d", bs), func(t *testing.T) {
-			if bs%hostarch.PageSize != 0 {
+			if bs%int(hostarch.PageSize) != 0 {
 				t.Skipf("block size %d is not a multiple of the %d-byte page size", bs, hostarch.PageSize)
 			}
 			fn(t, bs)

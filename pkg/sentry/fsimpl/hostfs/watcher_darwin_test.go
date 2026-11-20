@@ -108,11 +108,12 @@ func TestKqueueBackendWatchesAFileOnItsOwn(t *testing.T) {
 
 func TestKqueueBackendInvalidatesTheMappingOnAHostWrite(t *testing.T) {
 	w := nativeWatchEnv(t)
-	old := bytes.Repeat([]byte("o"), hostarch.PageSize)
+	page := uint64(hostarch.PageSize)
+	old := bytes.Repeat([]byte("o"), int(page))
 	w.writeFile("m", old)
 	fd := w.mustOpen("m", linux.O_RDONLY)
 	defer fd.DecRef(w.env.ctx)
-	m, ms, ar := w.mapFile(fd, hostarch.PageSize, false)
+	m, ms, ar := w.mapFile(fd, page, false)
 	defer m.RemoveMapping(w.env.ctx, ms, ar, 0, false)
 	if got := readMappedPage(t, w.env, m); !bytes.Equal(got, old) {
 		t.Fatalf("first mapped read = %q, want the old bytes", got[:8])
@@ -121,7 +122,7 @@ func TestKqueueBackendInvalidatesTheMappingOnAHostWrite(t *testing.T) {
 	w.add("m", hostEventMask)
 	w.drain()
 	c := &collector{w: w}
-	fresh := bytes.Repeat([]byte("N"), hostarch.PageSize)
+	fresh := bytes.Repeat([]byte("N"), int(page))
 	// The write keeps the size, as an editor that saves in place does.
 	f, err := os.OpenFile(w.host("m"), os.O_WRONLY, 0)
 	if err != nil {

@@ -41,7 +41,7 @@ func TestAddMappingWithoutConfigureMMapAfterLastUnmap(t *testing.T) {
 				content := []byte("twenty-six bytes of data.")
 				e.writeFile("layer-file", content)
 				fd := e.mustOpen("layer-file", tc.flags)
-				const length = hostarch.PageSize
+				length := uint64(hostarch.PageSize)
 				m, ms, ar := e.mapFile(fd, length, tc.writable)
 				m.RemoveMapping(e.ctx, ms, ar, 0, tc.writable)
 				fd.DecRef(e.ctx)
@@ -54,11 +54,11 @@ func TestAddMappingWithoutConfigureMMapAfterLastUnmap(t *testing.T) {
 				}
 
 				ms2 := &recordingSpace{}
-				ar2 := hostarch.AddrRange{Start: 0x50000, End: 0x50000 + length}
+				ar2 := hostarch.AddrRange{Start: 0x50000, End: 0x50000 + hostarch.Addr(length)}
 				if err := m.AddMapping(e.ctx, ms2, ar2, 0, tc.writable); err != nil {
 					t.Fatalf("AddMapping after the last unmap: %v", err)
 				}
-				required := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+				required := memmap.MappableRange{Start: 0, End: uint64(hostarch.PageSize)}
 				ts, err := m.Translate(e.ctx, required, required, tc.at)
 				if err != nil || len(ts) == 0 {
 					t.Fatalf("Translate after AddMapping = (%v, %v), want a translation", ts, err)

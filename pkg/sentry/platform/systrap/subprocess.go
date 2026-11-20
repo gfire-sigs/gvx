@@ -1347,6 +1347,16 @@ func (s *subprocess) PostFork() {
 	s.usertrap.PostFork() // +checklocksforce: PreFork acquires, above.
 }
 
+// PrepareForPtrace implements platform.AddressSpace.PrepareForPtrace.
+func (s *subprocess) PrepareForPtrace(ctx pkgcontext.Context, mm platform.MemoryManager) error {
+	if err := s.usertrap.UnpatchSyscalls(ctx, mm); err != nil {
+		ctx.Warningf("Killing subprocess after failing to unpatch syscalls for ptrace: %v", err)
+		s.kill()
+		return err
+	}
+	return nil
+}
+
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS.
 func (s *subprocess) UserModifiedGS(ctx pkgcontext.Context, mm platform.MemoryManager) error {
 	if s.usertrap == nil || s.usertrap.Disabled() {
@@ -1354,6 +1364,7 @@ func (s *subprocess) UserModifiedGS(ctx pkgcontext.Context, mm platform.MemoryMa
 	}
 
 	if err := s.usertrap.UnpatchSyscalls(ctx, mm); err != nil {
+		ctx.Warningf("Killing subprocess after failing to unpatch syscalls after GS modification: %v", err)
 		s.kill()
 		return err
 	}

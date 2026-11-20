@@ -19,10 +19,16 @@ package hostarch
 import "testing"
 
 func TestDarwinArm64PageConstants(t *testing.T) {
-	if PageSize != 1<<PageShift {
-		t.Fatalf("PageSize = %d, want %d", PageSize, 1<<PageShift)
+	if PageShift != 12 {
+		t.Fatalf("PageShift = %d, want 12", PageShift)
 	}
-	if HugePageSize != 1<<HugePageShift {
-		t.Fatalf("HugePageSize = %d, want %d", HugePageSize, 1<<HugePageShift)
+	if PageSize != uintptr(1)<<PageShift {
+		t.Fatalf("PageSize = %d, want %d", PageSize, uintptr(1)<<PageShift)
+	}
+	if HugePageShift != 21 {
+		t.Fatalf("HugePageShift = %d, want 21", HugePageShift)
+	}
+	if HugePageSize != uintptr(1)<<HugePageShift {
+		t.Fatalf("HugePageSize = %d, want %d", HugePageSize, uintptr(1)<<HugePageShift)
 	}
 }

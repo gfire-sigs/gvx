@@ -476,6 +476,12 @@ func putArchGPR(r *linux.PtraceRegs, reg uint8, val uint64) {
 // island.
 func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) || th.inIslandPC(pc) }
 
+// PrepareForPtrace implements platform.AddressSpace.PrepareForPtrace. The
+// Windows systrap engine does not run Linux ptrace on stubbed tasks.
+func (*addressSpace) PrepareForPtrace(context.Context, platform.MemoryManager) error {
+	return nil
+}
+
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS. patchPage
 // always patches GS-segment memory instructions on Windows amd64, so setting a
 // custom GS base requires no address space state change.

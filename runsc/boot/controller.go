@@ -22,10 +22,12 @@ import (
 	"io"
 	"path"
 	"strconv"
+	"strings"
 	gtime "time"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/control/server"
 	"z.gfire.dev/gvx/pkg/fd"
@@ -824,6 +826,40 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 		*out = append(*out, procDump)
 	}
 	return nil
+}
+
+// DrainDentryCache drains unused dentries without changing cache policy or
+// pausing guest tasks.
+func (cm *containerManager) DrainDentryCache(args *sentryapi.DrainDentryCacheArgs, _ *struct{}) error {
+	if !path.IsAbs(args.Path) || strings.ContainsRune(args.Path, 0) || len(args.Path) >= linux.PATH_MAX {
+		return fmt.Errorf("a valid absolute path shorter than PATH_MAX must be provided")
+	}
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	ep, ok := cm.l.processes[execID{cid: args.ContainerID}]
+	if !ok {
+		return fmt.Errorf("container %q is deleted", args.ContainerID)
+	}
+	if ep.tg == nil {
+		return fmt.Errorf("container %q isn't started", args.ContainerID)
+	}
+	t := ep.tg.Leader()
+	if t == nil {
+		return fmt.Errorf("container %q has no init process", args.ContainerID)
+	}
+	ctx := t.AsyncContext()
+	root := t.FSContext().RootDirectory()
+	if !root.Ok() {
+		return fmt.Errorf("container %q init process has exited", args.ContainerID)
+	}
+	defer root.DecRef(ctx)
+	pop := vfs.PathOperation{
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse(args.Path),
+		FollowFinalSymlink: true,
+	}
+	return t.Kernel().VFS().DrainDentryCache(ctx, t.Credentials(), &pop)
 }
 
 const initTID kernel.ThreadID = 1

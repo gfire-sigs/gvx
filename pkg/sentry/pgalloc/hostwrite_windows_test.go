@@ -32,7 +32,7 @@ func newObservedFile(t *testing.T) (*MemoryFile, memmap.FileRange) {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
 	t.Cleanup(mf.Destroy)
-	fr, err := mf.Allocate(4*hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	fr, err := mf.Allocate(4*uint64(hostarch.PageSize), AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestHostWriteObserverSeesWritesAndNotReads(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("a read mapping reported %v", got)
 	}
-	sub := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.Start + 2*hostarch.PageSize}
+	sub := memmap.FileRange{Start: fr.Start + uint64(hostarch.PageSize), End: fr.Start + 2*uint64(hostarch.PageSize)}
 	if _, err := mf.MapInternal(sub, hostarch.Write); err != nil {
 		t.Fatalf("MapInternal(write): %v", err)
 	}

@@ -21,9 +21,15 @@ import (
 	"runtime"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
+	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/hostsyscall"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
+
+// syscallStubMessageOffset is the offset of the stub message in the syscall
+// thread message. It is passed to the stub in a register, since the page size
+// is only known at runtime on arm64.
+var syscallStubMessageOffset = uintptr(hostarch.PageSize)
 
 func (t *syscallThread) detach() {
 	p := t.thread

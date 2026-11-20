@@ -27,7 +27,6 @@ import (
 	"z.gfire.dev/gvx/pkg/cleanup"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
-	"z.gfire.dev/gvx/pkg/fdnotifier"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/rand"
@@ -55,7 +54,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
 	fs.renameMu.Lock()
-	fs.evictAllCachedDentriesLocked(ctx)
+	fs.evictAllCachedDentriesLocked(ctx, false /* keepRenameMu */)
 	fs.renameMu.Unlock()
 	fs.savedDentryRW = make(map[*dentry]savedDentryRW)
 
@@ -501,12 +500,11 @@ func (fd *specialFileFD) completeRestore(ctx context.Context) error {
 	fd.handle = h
 	fd.mmapFile.SetFD(int(h.fd))
 
-	ftype := d.inode.fileType()
-	fd.haveQueue = (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK) && fd.handle.fd >= 0
-	if fd.haveQueue {
-		if err := fdnotifier.AddFD(fd.handle.fd, &fd.queue); err != nil {
-			return fmt.Errorf("failed to add FD to fdnotified for %q: %w", genericDebugPathname(d.inode.fs, d), err)
-		}
+	if h.fd < 0 && !fd.queue.IsEmpty() {
+		return fmt.Errorf("cannot restore waiters for %q: gofer did not donate a host file descriptor", genericDebugPathname(d.inode.fs, d))
+	}
+	if err := fd.initWaitQueue(d.inode.fileType()); err != nil {
+		return fmt.Errorf("restoring wait queue for %q: %w", genericDebugPathname(d.inode.fs, d), err)
 	}
 
 	return nil

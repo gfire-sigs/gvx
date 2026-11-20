@@ -315,6 +315,11 @@ func (fs *filesystem) MountSource() string {
 	return "/dev/" + fs.dev.Name
 }
 
+// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
+func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
+	return linuxerr.EOPNOTSUPP
+}
+
 // Sync implements vfs.FilesystemImpl.Sync.
 //
 // The sync protocol of the specification keeps a dirty tracker. Here the

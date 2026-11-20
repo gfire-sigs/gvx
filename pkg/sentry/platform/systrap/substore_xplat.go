@@ -144,8 +144,8 @@ func (l *subBlockLayer) readLocked(addr uint64, n int) ([]byte, bool) {
 		if err != nil {
 			return nil, false
 		}
-		off := int(addr % hostarch.PageSize)
-		chunk := min(n, hostarch.PageSize-off)
+		off := int(addr % uint64(hostarch.PageSize))
+		chunk := min(n, int(hostarch.PageSize)-off)
 		out = append(out, src[off:off+chunk]...)
 		addr += uint64(chunk)
 		n -= chunk
@@ -169,12 +169,12 @@ func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
 			// The check function ran bytes() before. Nothing else changes it.
 			panic(err)
 		}
-		off := int(addr % hostarch.PageSize)
-		chunk := min(len(b), hostarch.PageSize-off)
+		off := int(addr % uint64(hostarch.PageSize))
+		chunk := min(len(b), int(hostarch.PageSize)-off)
 		copy(src[off:], b[:chunk])
 		hb.wseq[i] = l.storeSeq.Add(1)
 		if hb.hasComp {
-			copy(hb.comp.buf[i*hostarch.PageSize+off:], b[:chunk])
+			copy(hb.comp.buf[i*int(hostarch.PageSize)+off:], b[:chunk])
 			hb.compDirty |= 1 << i
 		}
 		// The guest makes its I-cache maintenance on the page that it maps.
@@ -182,7 +182,7 @@ func (l *subBlockLayer) writeLocked(addr uint64, b []byte) {
 		// composite page can run after a change of the permissions.
 		flushICache(uintptr(unsafe.Pointer(&src[off])), uintptr(chunk))
 		if hb.hasComp {
-			flushICache(uintptr(unsafe.Pointer(&hb.comp.buf[i*hostarch.PageSize+off])), uintptr(chunk))
+			flushICache(uintptr(unsafe.Pointer(&hb.comp.buf[i*int(hostarch.PageSize)+off])), uintptr(chunk))
 		}
 		// Another composite page of this address space or of another address
 		// space can hold the same page. NoteHostWrite runs the observers of

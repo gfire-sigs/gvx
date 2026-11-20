@@ -396,7 +396,7 @@ func TestSaveRestoreRegularDirAndMMap(t *testing.T) {
 				t.Fatalf("SymlinkAt: %v", err)
 			}
 
-			initial := []byte(strings.Repeat("x", 2*hostarch.PageSize+64))
+			initial := []byte(strings.Repeat("x", 2*int(hostarch.PageSize)+64))
 			e.writeFile("work/data", initial)
 			regFD := e.mustOpen("work/data", linux.O_RDWR)
 
@@ -509,7 +509,7 @@ func TestSaveRestoreRegularDirAndMMap(t *testing.T) {
 			}
 			want := append([]byte(nil), initial...)
 			copy(want[32:], "BUFFERED")
-			copy(want[hostarch.PageSize+8:], "MAPPED-DIRTY")
+			copy(want[int(hostarch.PageSize)+8:], "MAPPED-DIRTY")
 			if !bytes.Equal(readBuf, want[savedOffset:savedOffset+32]) {
 				t.Fatalf("Read slice from saved offset = %q, want %q", readBuf, want[savedOffset:savedOffset+32])
 			}

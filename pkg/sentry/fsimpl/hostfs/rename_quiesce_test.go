@@ -106,8 +106,9 @@ func (e *env) registered(fd *vfs.FileDescription) string {
 // pattern returns n bytes that differ from page to page.
 func pattern(n int) []byte {
 	b := make([]byte, n)
+	page := int(hostarch.PageSize)
 	for i := range b {
-		b[i] = byte('a' + (i/hostarch.PageSize+i)%26)
+		b[i] = byte('a' + (i/page+i)%26)
 	}
 	return b
 }
@@ -125,8 +126,9 @@ func (e *env) pread(fd *vfs.FileDescription, off int64, n int) []byte {
 // mappedView returns the bytes of [off, off+n) of a mapping of the file.
 func mappedView(t *testing.T, e *env, m memmap.Mappable, perms hostarch.AccessType, off, n uint64) []byte {
 	t.Helper()
-	start := off &^ (hostarch.PageSize - 1)
-	end := (off + n + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1)
+	page := uint64(hostarch.PageSize)
+	start := off &^ (page - 1)
+	end := (off + n + page - 1) &^ (page - 1)
 	ts, err := m.Translate(e.ctx, memmap.MappableRange{Start: start, End: end}, memmap.MappableRange{Start: 0, End: end}, perms)
 	if err != nil {
 		t.Fatalf("Translate: %v", err)
@@ -221,7 +223,7 @@ func testRenameDirWithOpenDescendant(t *testing.T, variant string, oc openCase, 
 		e.mustMkdir(d)
 	}
 	rel := dirs[depth-1] + "/" + leaf
-	want := pattern(3 * hostarch.PageSize)
+	want := pattern(3 * int(hostarch.PageSize))
 	e.writeFile(rel, want)
 	// A lookup of the full path opens the pinned directory handles.
 	e.mustStat(rel)
@@ -307,8 +309,8 @@ func testRenameDirWithOpenDescendant(t *testing.T, variant string, oc openCase, 
 
 	if writableMap {
 		// A mapped write after the reopen reaches the host at unmap.
-		copy(mappedView(t, e, m, hostarch.ReadWrite, 2*hostarch.PageSize, 8), "post-map")
-		copy(want[2*hostarch.PageSize:], "post-map")
+		copy(mappedView(t, e, m, hostarch.ReadWrite, 2*uint64(hostarch.PageSize), 8), "post-map")
+		copy(want[2*int(hostarch.PageSize):], "post-map")
 	}
 
 	// Rename a directory in the middle of the path.

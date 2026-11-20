@@ -262,7 +262,7 @@ func TestCachePrepareSaveZeroMemoryFileLeakAndCompleteRestoreFaults(t *testing.T
 	if err := mfPre.SaveTo(stdCtx, &memBuf, &pgalloc.SaveOpts{}); err != nil {
 		t.Fatalf("MemoryFile.SaveTo: %v", err)
 	}
-	if memBuf.Len() >= hostarch.PageSize {
+	if memBuf.Len() >= int(hostarch.PageSize) {
 		t.Fatalf("MemoryFile.SaveTo after FlushAndDropLocked serialized %d bytes, want < %d (zero leaked pages)", memBuf.Len(), hostarch.PageSize)
 	}
 

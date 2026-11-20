@@ -222,25 +222,32 @@ func LoadPatchSet(allowlistPath string) (_ *PatchSet, err error) {
 // The first entry is the plain build. `go test -race`, `-msan`, and `-asan` each add one tag.
 var sanitizerTagSets = [][]string{nil, {"race"}, {"msan"}, {"asan"}}
 
-// buildCase is one compiler configuration: a target plus a sanitizer tag set.
+// buildCase is one compiler configuration: a target, sanitizer tag set, and cgo state.
 type buildCase struct {
 	target buildTarget
 	tags   []string
+	cgo    bool
 }
 
 func (c buildCase) String() string {
-	if len(c.tags) == 0 {
-		return c.target.goos + "/" + c.target.goarch
+	s := c.target.goos + "/" + c.target.goarch
+	if len(c.tags) > 0 {
+		s += " with -tags " + strings.Join(c.tags, ",")
 	}
-	return c.target.goos + "/" + c.target.goarch + " with -tags " + strings.Join(c.tags, ",")
+	if c.cgo {
+		s += " (cgo)"
+	}
+	return s
 }
 
-// buildCases returns every target and sanitizer tag set combination, in buildSet result order.
+// buildCases returns every target, sanitizer tag set, and cgo combination, in buildSet result order.
 func buildCases(targets []buildTarget) []buildCase {
-	cases := make([]buildCase, 0, len(targets)*len(sanitizerTagSets))
+	cases := make([]buildCase, 0, len(targets)*len(sanitizerTagSets)*2)
 	for _, t := range targets {
 		for _, tags := range sanitizerTagSets {
-			cases = append(cases, buildCase{target: t, tags: tags})
+			for _, cgo := range []bool{false, true} {
+				cases = append(cases, buildCase{target: t, tags: tags, cgo: cgo})
+			}
 		}
 	}
 	return cases
@@ -252,6 +259,7 @@ func matchesCase(name string, src []byte, c buildCase) (bool, error) {
 	ctx := build.Context{
 		GOOS:        c.target.goos,
 		GOARCH:      c.target.goarch,
+		CgoEnabled:  c.cgo,
 		Compiler:    "gc",
 		BuildTags:   c.tags,
 		ReleaseTags: build.Default.ReleaseTags,

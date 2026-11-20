@@ -280,7 +280,7 @@ func TestMincoreHelperFillsOneEntryPerHostarchPage(t *testing.T) {
 		t.Fatalf("unix.MincorePageSize = %d, want hostarch.PageSize = %d", unix.MincorePageSize, hostarch.PageSize)
 	}
 	hostPage := unix.Getpagesize()
-	size := 8 * max(hostPage, hostarch.PageSize)
+	size := 8 * max(hostPage, int(hostarch.PageSize))
 	mapping, err := unix.Mmap(-1, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
 	if err != nil {
 		t.Fatalf("Mmap: %v", err)

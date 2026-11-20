@@ -26,13 +26,19 @@ import (
 	"z.gfire.dev/gvx/pkg/memutil"
 )
 
-// The usage scan sizes its mincore vector with one byte per hostarch.PageSize.
-// The unix overlay must fill exactly that many bytes. When the two page sizes
-// differ, one of the arrays below gets a negative length and the build fails.
+// The usage scan sizes its mincore vector with one byte per page. Keep the
+// compile-time check against hostarch.MinPageSize and verify hostarch.PageSize
+// at init time so host page size mismatches fail immediately.
 var (
-	_ [unix.MincorePageSize - hostarch.PageSize]struct{}
-	_ [hostarch.PageSize - unix.MincorePageSize]struct{}
+	_ [unix.MincorePageSize - hostarch.MinPageSize]struct{}
+	_ [hostarch.MinPageSize - unix.MincorePageSize]struct{}
 )
+
+func init() {
+	if uintptr(unix.MincorePageSize) != uintptr(hostarch.PageSize) {
+		panic(fmt.Sprintf("darwin mincore page size %d != hostarch.PageSize %d", unix.MincorePageSize, hostarch.PageSize))
+	}
+}
 
 // NewDefaultMemoryFile creates an unlinked backing file on macOS and returns a
 // configured MemoryFile. MemoryFile.Decommit punches holes in the file with

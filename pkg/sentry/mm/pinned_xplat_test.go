@@ -66,7 +66,7 @@ func mapPinnedTestPage(ctx context.Context, manager *MemoryManager) error {
 		Addr:     pinnedTestAddr,
 		Fixed:    true,
 		Unmap:    true,
-		Length:   hostarch.PageSize,
+		Length:   uint64(hostarch.PageSize),
 		Private:  true,
 		Perms:    hostarch.AnyAccess,
 		MaxPerms: hostarch.AnyAccess,
@@ -136,7 +136,7 @@ func TestWithPinnedMappingsFailsOnAnUnmappedRange(t *testing.T) {
 	ctx, manager := newPinnedTestMM(t)
 	called := false
 	// The last 4 bytes of the call lie in the page after the mapping.
-	err := manager.WithPinnedMappings(ctx, pinnedTestAddr+hostarch.PageSize-4, 8, func(safemem.BlockSeq) error {
+	err := manager.WithPinnedMappings(ctx, pinnedTestAddr+hostarch.Addr(hostarch.PageSize)-4, 8, func(safemem.BlockSeq) error {
 		called = true
 		return nil
 	})

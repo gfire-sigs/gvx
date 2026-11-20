@@ -173,7 +173,7 @@ func forEachChunkMode(t *testing.T, fn func(t *testing.T, e *env)) {
 
 func TestMappedPagesWriteBackAndStayCoherent(t *testing.T) {
 	forEachChunkMode(t, func(t *testing.T, e *env) {
-		content := []byte(strings.Repeat("a", 3*hostarch.PageSize+100))
+		content := []byte(strings.Repeat("a", 3*int(hostarch.PageSize)+100))
 		e.writeFile("m", content)
 		fd := e.mustOpen("m", linux.O_RDWR)
 		defer fd.DecRef(e.ctx)
@@ -365,8 +365,8 @@ func TestMapBeyondEndOfFile(t *testing.T) {
 		e.writeFile("short", []byte("0123456789"))
 		fd := e.mustOpen("short", linux.O_RDONLY)
 		defer fd.DecRef(e.ctx)
-		mp := e.mapFile(fd, 3*hostarch.PageSize, false)
-		r := memmap.MappableRange{Start: hostarch.PageSize, End: 2 * hostarch.PageSize}
+		mp := e.mapFile(fd, 3*uint64(hostarch.PageSize), false)
+		r := memmap.MappableRange{Start: uint64(hostarch.PageSize), End: 2 * uint64(hostarch.PageSize)}
 		_, err := mp.m.Translate(e.ctx, r, r, hostarch.Read)
 		if _, ok := err.(*memmap.BusError); !ok {
 			t.Fatalf("Translate beyond the last page = %v, want a bus error", err)

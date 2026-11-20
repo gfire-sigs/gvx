@@ -147,7 +147,7 @@ func New() (*Platform, error) {
 // run the partition, including every non-Windows host, returns an error that
 // wraps ErrUnsupported or the failing call.
 func NewWithOptions(opts Options) (*Platform, error) {
-	if err := checkPageSize(hostarch.PageSize); err != nil {
+	if err := checkPageSize(int(hostarch.PageSize)); err != nil {
 		return nil, err
 	}
 	be, err := newBackend()

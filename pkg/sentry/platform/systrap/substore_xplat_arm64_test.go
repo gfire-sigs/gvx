@@ -263,7 +263,8 @@ func TestCrossLayerSharedCompositeRefresh(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	pageSize := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(2*pageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
@@ -278,13 +279,13 @@ func TestCrossLayerSharedCompositeRefresh(t *testing.T) {
 		readerAddr = hostarch.Addr(0x10000)
 		writerAddr = hostarch.Addr(0x20000)
 	)
-	page0 := memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.PageSize}
-	page1 := memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}
+	page0 := memmap.FileRange{Start: fr.Start, End: fr.Start + pageSize}
+	page1 := memmap.FileRange{Start: fr.Start + pageSize, End: fr.End}
 
 	if err := reader.mapFile(readerAddr, mf, page0, hostarch.Read, false); err != nil {
 		t.Fatalf("reader mapFile page0: %v", err)
 	}
-	if err := reader.mapFile(readerAddr+hostarch.PageSize, mf, page1, hostarch.ReadWrite, false); err != nil {
+	if err := reader.mapFile(readerAddr+hostarch.Addr(pageSize), mf, page1, hostarch.ReadWrite, false); err != nil {
 		t.Fatalf("reader mapFile page1: %v", err)
 	}
 	if err := writer.mapFile(writerAddr, mf, fr, hostarch.ReadWrite, false); err != nil {
@@ -344,20 +345,21 @@ func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
 				t.Fatalf("createMemoryFile: %v", err)
 			}
 			defer mf.Destroy()
-			fr, err := mf.Allocate(3*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+			pageSize := uint64(hostarch.PageSize)
+			fr, err := mf.Allocate(3*pageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
 			if err != nil {
 				t.Fatalf("Allocate: %v", err)
 			}
 			defer mf.DecRef(fr)
 			page := func(i uint64) memmap.FileRange {
-				return memmap.FileRange{Start: fr.Start + i*hostarch.PageSize, End: fr.Start + (i+1)*hostarch.PageSize}
+				return memmap.FileRange{Start: fr.Start + i*pageSize, End: fr.Start + (i+1)*pageSize}
 			}
 			bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
 			if err != nil {
 				t.Fatalf("MapInternal: %v", err)
 			}
 			mem := bs.Head().ToSlice()
-			binary.LittleEndian.PutUint32(mem[2*hostarch.PageSize:], stpX1X2)
+			binary.LittleEndian.PutUint32(mem[2*int(pageSize):], stpX1X2)
 
 			layer := newSubBlockLayer(fakeCompBlockHost{})
 			defer layer.reset()
@@ -365,7 +367,7 @@ func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
 				t.Fatalf("mapFile of the writable page: %v", err)
 			}
 			if tc.nextPage != nil {
-				if err := layer.mapFile(dataAddr+hostarch.PageSize, mf, page(1), *tc.nextPage, false); err != nil {
+				if err := layer.mapFile(dataAddr+hostarch.Addr(pageSize), mf, page(1), *tc.nextPage, false); err != nil {
 					t.Fatalf("mapFile of the next page: %v", err)
 				}
 			}
@@ -376,7 +378,7 @@ func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
 
 			ac := arch.New(arch.Host)
 			ac.SetIP(uintptr(codeAddr))
-			storeAddr := uint64(dataAddr) + hostarch.PageSize - 8
+			storeAddr := uint64(dataAddr) + pageSize - 8
 			regs := &ac.StateData().Regs
 			regs.Regs[0], regs.Regs[1], regs.Regs[2] = storeAddr, 0x1111111111111111, 0x2222222222222222
 
@@ -392,7 +394,7 @@ func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
 			if !at.Write {
 				t.Errorf("access = %v, want a write fault, so that the memory manager runs", at)
 			}
-			if got, want := si.Addr(), uint64(dataAddr)+hostarch.PageSize; got != want {
+			if got, want := si.Addr(), uint64(dataAddr)+pageSize; got != want {
 				t.Errorf("fault address = %#x, want %#x: the start of the page that blocks the store", got, want)
 			}
 			if si.Code != tc.wantCode {
@@ -401,7 +403,7 @@ func TestStoreCrossingIntoAnotherPageReportsThatPage(t *testing.T) {
 			if got := ac.IP(); got != uintptr(codeAddr) {
 				t.Errorf("IP = %#x, want %#x: the store did not run", got, uintptr(codeAddr))
 			}
-			if !bytes.Equal(mem[hostarch.PageSize-8:hostarch.PageSize], make([]byte, 8)) {
+			if !bytes.Equal(mem[int(pageSize)-8:int(pageSize)], make([]byte, 8)) {
 				t.Errorf("a refused store changed the writable page")
 			}
 		})
@@ -418,21 +420,22 @@ func TestEmulateStoreTBI0TaggedAddresses(t *testing.T) {
 	}
 	defer mf.Destroy()
 
-	fr, err := mf.Allocate(3*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	pageSize := uint64(hostarch.PageSize)
+	fr, err := mf.Allocate(3*pageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}
 	defer mf.DecRef(fr)
 
 	page := func(i uint64) memmap.FileRange {
-		return memmap.FileRange{Start: fr.Start + i*hostarch.PageSize, End: fr.Start + (i+1)*hostarch.PageSize}
+		return memmap.FileRange{Start: fr.Start + i*pageSize, End: fr.Start + (i+1)*pageSize}
 	}
 	bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatalf("MapInternal: %v", err)
 	}
 	mem := bs.Head().ToSlice()
-	code := mem[2*hostarch.PageSize:]
+	code := mem[2*int(pageSize):]
 	// 0: str x1, [x2], #8      (0xf8008441)
 	// 4: ldaddal x1, x0, [x2]  (0xf8e10040)
 	// 8: stp x1, x2, [x0]      (0xa9000801)
@@ -451,7 +454,7 @@ func TestEmulateStoreTBI0TaggedAddresses(t *testing.T) {
 	if err := layer.mapFile(dataAddr, mf, page(0), hostarch.ReadWrite, false); err != nil {
 		t.Fatalf("mapFile writable page: %v", err)
 	}
-	if err := layer.mapFile(dataAddr+hostarch.PageSize, mf, page(1), hostarch.Read, false); err != nil {
+	if err := layer.mapFile(dataAddr+hostarch.Addr(pageSize), mf, page(1), hostarch.Read, false); err != nil {
 		t.Fatalf("mapFile read-only page: %v", err)
 	}
 	if err := layer.mapFile(codeAddr, mf, page(2), hostarch.AccessType{Read: true, Execute: true}, false); err != nil {
@@ -500,7 +503,7 @@ func TestEmulateStoreTBI0TaggedAddresses(t *testing.T) {
 
 	// 3. Cross-page STP with 0xb4 tag into read-only COW page reports untagged fault address.
 	ac.SetIP(uintptr(codeAddr + 8))
-	storeAddr := uint64(dataAddr) + hostarch.PageSize - 8
+	storeAddr := uint64(dataAddr) + pageSize - 8
 	regs.Regs[0] = scudoTag | storeAddr
 	regs.Regs[1] = 1
 	regs.Regs[2] = 2
@@ -509,7 +512,7 @@ func TestEmulateStoreTBI0TaggedAddresses(t *testing.T) {
 	if subproc.resolveSubBlockFault(&ctx, ac, &si, &at) {
 		t.Fatal("cross-page TBI0 STP into read-only page returned restart = true, want fault report")
 	}
-	if want := uint64(dataAddr + hostarch.PageSize); si.Addr() != want {
+	if want := uint64(dataAddr) + pageSize; si.Addr() != want {
 		t.Fatalf("cross-page TBI0 fault address = %#x, want untagged %#x", si.Addr(), want)
 	}
 }

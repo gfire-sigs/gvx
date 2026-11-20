@@ -41,7 +41,7 @@ func init() {
 type faultPlatform struct{ platform.Platform }
 
 func (faultPlatform) SupportsAddressSpaceIO() bool  { return false }
-func (faultPlatform) MinUserAddress() hostarch.Addr { return hostarch.PageSize }
+func (faultPlatform) MinUserAddress() hostarch.Addr { return hostarch.Addr(hostarch.PageSize) }
 func (faultPlatform) MaxUserAddress() hostarch.Addr { return 0x0000_7fff_ffff_f000 }
 func (faultPlatform) MapUnit() uint64               { return 0 }
 func (faultPlatform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
@@ -116,8 +116,9 @@ func TestWriteFaultAfterPrefixTranslationBreaksCopyOnWrite(t *testing.T) {
 			const (
 				pages        = 4
 				hugeBoundary = 0x40_0000
-				fileBytes    = pages * hostarch.PageSize
 			)
+			page := int(hostarch.PageSize)
+			fileBytes := uint64(pages * page)
 			mf, err := newCOWTestMemoryFile()
 			if err != nil {
 				t.Fatalf("newCOWTestMemoryFile: %v", err)
@@ -137,7 +138,7 @@ func TestWriteFaultAfterPrefixTranslationBreaksCopyOnWrite(t *testing.T) {
 			}
 			content := make([]byte, fileBytes)
 			for i := range content {
-				content[i] = byte(i/hostarch.PageSize + 1)
+				content[i] = byte(i/page + 1)
 			}
 			dst, err := mf.MapInternal(fr, hostarch.Write)
 			if err != nil {
@@ -157,7 +158,7 @@ func TestWriteFaultAfterPrefixTranslationBreaksCopyOnWrite(t *testing.T) {
 			}
 			// The mapping crosses a hugepage boundary at the faulting page, so the
 			// copy range of the part before it is empty for any perms.
-			want := hostarch.Addr(hugeBoundary) - 2*hostarch.PageSize
+			want := hostarch.Addr(hugeBoundary) - 2*hostarch.Addr(page)
 			addr, err := manager.MMap(ctx, memmap.MMapOpts{
 				Addr:     want,
 				Fixed:    true,
@@ -174,7 +175,7 @@ func TestWriteFaultAfterPrefixTranslationBreaksCopyOnWrite(t *testing.T) {
 			if addr != want {
 				t.Fatalf("MMap placed the mapping at %#x, want %#x", uint64(addr), uint64(want))
 			}
-			fault := addr + 2*hostarch.PageSize
+			fault := addr + 2*hostarch.Addr(page)
 			if err := manager.HandleUserFault(ctx, fault, hostarch.Write, 0); err != nil {
 				t.Fatalf("HandleUserFault(write at %#x) = %v", uint64(fault), err)
 			}
@@ -186,7 +187,7 @@ func TestWriteFaultAfterPrefixTranslationBreaksCopyOnWrite(t *testing.T) {
 				t.Fatalf("CopyIn: %v", err)
 			}
 			expect := bytes.Clone(content)
-			expect[2*hostarch.PageSize] = 0xA5
+			expect[2*page] = 0xA5
 			if !bytes.Equal(got, expect) {
 				t.Errorf("the mapping differs from the file with one written byte")
 			}

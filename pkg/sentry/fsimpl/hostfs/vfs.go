@@ -241,6 +241,11 @@ func (fs *filesystem) Release(ctx context.Context) {
 	}
 }
 
+// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
+func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
+	return linuxerr.EOPNOTSUPP
+}
+
 // Sync implements vfs.FilesystemImpl.Sync. It writes back mapped file data and
 // flushes the metadata table, and it reports every failure.
 func (fs *filesystem) Sync(ctx context.Context) error {

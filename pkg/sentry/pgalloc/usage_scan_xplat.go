@@ -52,7 +52,7 @@ func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 	if memCgIDs == nil {
 		return true
 	}
-	if unix.Getpagesize() > hostarch.PageSize {
+	if unix.Getpagesize() > int(hostarch.PageSize) {
 		return false
 	}
 	return runtime.GOOS == "linux" || runtime.GOOS == "android"
@@ -65,7 +65,7 @@ func canSkipUsageScan(memCgIDs map[uint32]struct{}) bool {
 // enclosing host pages and copies each host-page result to its guest sub-pages.
 func mincoreGuestPages(s, buf []byte) error {
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		if hostPage := uintptr(unix.Getpagesize()); hostPage > hostarch.PageSize {
+		if hostPage := uintptr(unix.Getpagesize()); hostPage > uintptr(hostarch.PageSize) {
 			return mincoreExpandHostPages(s, buf, hostPage, rawMincore)
 		}
 	}
@@ -88,7 +88,7 @@ func mincoreExpandHostPages(s, buf []byte, hostPage uintptr, query func(base, sp
 		return nil
 	}
 	addr := uintptr(unsafe.Pointer(&s[0]))
-	if addr&(hostarch.PageSize-1) != 0 {
+	if addr&(uintptr(hostarch.PageSize)-1) != 0 {
 		return unix.EINVAL
 	}
 	length := uintptr(len(s))
@@ -98,9 +98,9 @@ func mincoreExpandHostPages(s, buf []byte, hostPage uintptr, query func(base, sp
 	if err := query(base, span, resident); err != nil {
 		return err
 	}
-	pages := int((length + hostarch.PageSize - 1) / hostarch.PageSize)
+	pages := int((length + uintptr(hostarch.PageSize) - 1) / uintptr(hostarch.PageSize))
 	for i := range pages {
-		buf[i] = resident[(addr-base+uintptr(i)*hostarch.PageSize)/hostPage]
+		buf[i] = resident[(addr-base+uintptr(i)*uintptr(hostarch.PageSize))/hostPage]
 	}
 	return nil
 }

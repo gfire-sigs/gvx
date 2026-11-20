@@ -725,7 +725,8 @@ const (
 
 func TestAllocateModes(t *testing.T) {
 	forEachExtVariant(t, []string{"native", "emulated-allocate"}, func(t *testing.T, e *env) {
-		content := bytes.Repeat([]byte{0xAB}, 3*hostarch.PageSize)
+		page := int(hostarch.PageSize)
+		content := bytes.Repeat([]byte{0xAB}, 3*page)
 		e.writeFile("f", content)
 		fd := e.mustOpen("f", linux.O_RDWR)
 		defer fd.DecRef(e.ctx)
@@ -735,10 +736,10 @@ func TestAllocateModes(t *testing.T) {
 		if err := allocate(e, fd, 0, 0, uint64(len(content))/2); err != nil || size() != int64(len(content)) {
 			t.Fatalf("allocate inside the file = %v, size %d, want %d", err, size(), len(content))
 		}
-		if err := allocate(e, fd, 0, uint64(len(content)), 4*hostarch.PageSize); err != nil || size() != int64(len(content)+4*hostarch.PageSize) {
+		if err := allocate(e, fd, 0, uint64(len(content)), 4*uint64(page)); err != nil || size() != int64(len(content)+4*page) {
 			t.Fatalf("allocate past the end = %v, size %d", err, size())
 		}
-		if got := e.hostRead("f"); len(got) != len(content)+4*hostarch.PageSize || got[:len(content)] != string(content) {
+		if got := e.hostRead("f"); len(got) != len(content)+4*page || got[:len(content)] != string(content) {
 			t.Fatalf("host file after growth has %d bytes with changed content", len(got))
 		}
 		if !bytes.Equal(e.pread(fd, int64(len(content)), 16), make([]byte, 16)) {
@@ -747,7 +748,7 @@ func TestAllocateModes(t *testing.T) {
 
 		// KEEP_SIZE never moves the end of the file.
 		before := size()
-		if err := allocate(e, fd, keepSize, uint64(before), 8*hostarch.PageSize); err != nil || size() != before {
+		if err := allocate(e, fd, keepSize, uint64(before), 8*uint64(page)); err != nil || size() != before {
 			t.Fatalf("allocate with KEEP_SIZE = %v, size %d, want %d", err, size(), before)
 		}
 
@@ -766,7 +767,7 @@ func TestAllocateModes(t *testing.T) {
 
 func TestAllocatePunchHole(t *testing.T) {
 	forEachExtVariant(t, []string{"native", "emulated-allocate"}, func(t *testing.T, e *env) {
-		const length = 8 * hostarch.PageSize
+		length := 8 * int(hostarch.PageSize)
 		content := bytes.Repeat([]byte{0xAB}, length)
 		e.writeFile("f", content)
 		fd := e.mustOpen("f", linux.O_RDWR)
@@ -782,7 +783,7 @@ func TestAllocatePunchHole(t *testing.T) {
 			if got := e.hostRead("f"); got != string(want) {
 				t.Fatalf("%s: host content differs from the expectation", what)
 			}
-			if got := e.mustStat("f").Size; got != length {
+			if got := e.mustStat("f").Size; got != uint64(length) {
 				t.Fatalf("%s: size = %d, want %d (a punch keeps the size)", what, got, length)
 			}
 		}
@@ -799,7 +800,7 @@ func TestAllocatePunchHole(t *testing.T) {
 		clear(content[100:400])
 		check("unaligned punch", 100, 400)
 		// A range that runs past the end of the file keeps the size.
-		if err := allocate(e, fd, punch, length-100, 1<<20); err != nil {
+		if err := allocate(e, fd, punch, uint64(length-100), 1<<20); err != nil {
 			t.Fatalf("punch past the end: %v", err)
 		}
 		clear(content[length-100:])
@@ -819,8 +820,9 @@ func TestAllocatePunchHoleKeepsMappedPagesCoherent(t *testing.T) {
 }
 
 func testAllocateMappedCoherence(t *testing.T, e *env) {
-	const length = 4 * hostarch.PageSize
-	content := bytes.Repeat([]byte("a"), length)
+	page := uint64(hostarch.PageSize)
+	length := 4 * page
+	content := bytes.Repeat([]byte("a"), int(length))
 	e.writeFile("m", content)
 	fd := e.mustOpen("m", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
@@ -829,50 +831,50 @@ func testAllocateMappedCoherence(t *testing.T, e *env) {
 
 	// Guest writes through the mapping, inside and outside the hole.
 	copy(mappedView(t, e, m, hostarch.ReadWrite, 0, 4), "KEEP")
-	copy(mappedView(t, e, m, hostarch.ReadWrite, hostarch.PageSize+10, 4), "HOLE")
-	copy(mappedView(t, e, m, hostarch.ReadWrite, 3*hostarch.PageSize, 4), "TAIL")
+	copy(mappedView(t, e, m, hostarch.ReadWrite, page+10, 4), "HOLE")
+	copy(mappedView(t, e, m, hostarch.ReadWrite, 3*page, 4), "TAIL")
 
-	holeStart, holeLen := uint64(hostarch.PageSize), uint64(hostarch.PageSize)
+	holeStart, holeLen := page, page
 	if err := allocate(e, fd, punch, holeStart, holeLen); err != nil {
 		t.Fatalf("punch: %v", err)
 	}
 	// The mapping sees zeros in the hole and keeps its other pages.
-	if got := mappedView(t, e, m, hostarch.ReadWrite, hostarch.PageSize+10, 4); !bytes.Equal(got, make([]byte, 4)) {
+	if got := mappedView(t, e, m, hostarch.ReadWrite, page+10, 4); !bytes.Equal(got, make([]byte, 4)) {
 		t.Fatalf("mapped hole = %q, want zeros", got)
 	}
 	if got := mappedView(t, e, m, hostarch.ReadWrite, 0, 4); string(got) != "KEEP" {
 		t.Fatalf("mapped page before the hole = %q, want KEEP", got)
 	}
-	if got := mappedView(t, e, m, hostarch.ReadWrite, 3*hostarch.PageSize, 4); string(got) != "TAIL" {
+	if got := mappedView(t, e, m, hostarch.ReadWrite, 3*page, 4); string(got) != "TAIL" {
 		t.Fatalf("mapped page after the hole = %q, want TAIL", got)
 	}
 	// A read system call and the host file agree with the mapping.
 	want := bytes.Clone(content)
 	copy(want, "KEEP")
-	copy(want[3*hostarch.PageSize:], "TAIL")
+	copy(want[3*int(page):], "TAIL")
 	clear(want[holeStart : holeStart+holeLen])
-	if got := e.pread(fd, 0, length); !bytes.Equal(got, want) {
+	if got := e.pread(fd, 0, int(length)); !bytes.Equal(got, want) {
 		t.Fatalf("read after the punch differs from the expectation")
 	}
 	if got := e.hostRead("m"); got != string(want) {
 		t.Fatalf("host file after the punch differs from the expectation")
 	}
 	// A later mapped write to the hole reaches the host again.
-	copy(mappedView(t, e, m, hostarch.ReadWrite, hostarch.PageSize+10, 4), "BACK")
+	copy(mappedView(t, e, m, hostarch.ReadWrite, page+10, 4), "BACK")
 	if err := fd.Sync(e.ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.hostRead("m")[hostarch.PageSize+10 : hostarch.PageSize+14]; got != "BACK" {
+	if got := e.hostRead("m")[int(page)+10 : int(page)+14]; got != "BACK" {
 		t.Fatalf("host file after a mapped write into the hole = %q, want BACK", got)
 	}
 
 	// Growth makes the new pages reachable through the mapping.
 	grow := e.mustOpen("m", linux.O_RDWR)
 	defer grow.DecRef(e.ctx)
-	if err := allocate(e, grow, 0, length, hostarch.PageSize); err != nil {
+	if err := allocate(e, grow, 0, length, page); err != nil {
 		t.Fatalf("grow: %v", err)
 	}
-	m2, ms2, ar2 := e.mapFile(grow, length+hostarch.PageSize, false)
+	m2, ms2, ar2 := e.mapFile(grow, length+page, false)
 	defer m2.RemoveMapping(e.ctx, ms2, ar2, 0, false)
 	if got := mappedView(t, e, m2, hostarch.Read, length, 8); !bytes.Equal(got, make([]byte, 8)) {
 		t.Fatalf("mapped page of the grown range = %q, want zeros", got)
@@ -882,7 +884,8 @@ func testAllocateMappedCoherence(t *testing.T, e *env) {
 func TestAllocateLeavesNoEcho(t *testing.T) {
 	w := newWatchEnv(t)
 	w.mustMkdir("d")
-	w.writeFile("d/f", bytes.Repeat([]byte("z"), 4*hostarch.PageSize))
+	page := uint64(hostarch.PageSize)
+	w.writeFile("d/f", bytes.Repeat([]byte("z"), 4*int(page)))
 	fd := w.mustOpen("d/f", linux.O_RDWR)
 	defer fd.DecRef(w.env.ctx)
 	w.add("d", hostEventMask)
@@ -896,8 +899,8 @@ func TestAllocateLeavesNoEcho(t *testing.T) {
 		off  uint64
 		n    uint64
 	}{
-		{"grow", 0, 4 * hostarch.PageSize, 4 * hostarch.PageSize},
-		{"keep size", keepSize, 0, 16 * hostarch.PageSize},
+		{"grow", 0, 4 * page, 4 * page},
+		{"keep size", keepSize, 0, 16 * page},
 		{"punch", punch, 100, 5000},
 	} {
 		if err := allocate(w.env, fd, step.mode, step.off, step.n); err != nil {
@@ -1123,7 +1126,7 @@ func TestTmpfileMapsAndSurvivesDirectoryRename(t *testing.T) {
 		fd := e.mustOpenTmp("d", linux.O_RDWR)
 		defer fd.DecRef(e.ctx)
 		e.pwriteAt(fd, 0, "0123456789")
-		m, ms, ar := e.mapFile(fd, hostarch.PageSize, true)
+		m, ms, ar := e.mapFile(fd, uint64(hostarch.PageSize), true)
 		defer m.RemoveMapping(e.ctx, ms, ar, 0, true)
 		if got := mappedView(t, e, m, hostarch.ReadWrite, 0, 10); string(got) != "0123456789" {
 			t.Fatalf("mapped view = %q", got)
@@ -1280,14 +1283,15 @@ func TestExecutingFileRefusesWriters(t *testing.T) {
 	}
 
 	// A writable shared mapping is refused. Read-only and private ones pass.
-	shared := &memmap.MMapOpts{Length: hostarch.PageSize, Perms: hostarch.ReadWrite, MaxPerms: hostarch.ReadWrite}
+	page := uint64(hostarch.PageSize)
+	shared := &memmap.MMapOpts{Length: page, Perms: hostarch.ReadWrite, MaxPerms: hostarch.ReadWrite}
 	wantErrno(t, "writable shared mapping", writer.ConfigureMMap(e.ctx, shared), linuxerr.ETXTBSY)
-	private := &memmap.MMapOpts{Length: hostarch.PageSize, Perms: hostarch.ReadWrite, MaxPerms: hostarch.ReadWrite, Private: true}
+	private := &memmap.MMapOpts{Length: page, Perms: hostarch.ReadWrite, MaxPerms: hostarch.ReadWrite, Private: true}
 	if err := writer.ConfigureMMap(e.ctx, private); err != nil {
 		t.Fatalf("private writable mapping: %v", err)
 	}
 	private.MappingIdentity.DecRef(e.ctx)
-	readonly := &memmap.MMapOpts{Length: hostarch.PageSize, Perms: hostarch.Read, MaxPerms: hostarch.Read}
+	readonly := &memmap.MMapOpts{Length: page, Perms: hostarch.Read, MaxPerms: hostarch.Read}
 	if err := writer.ConfigureMMap(e.ctx, readonly); err != nil {
 		t.Fatalf("read-only shared mapping: %v", err)
 	}
@@ -1296,7 +1300,7 @@ func TestExecutingFileRefusesWriters(t *testing.T) {
 	exec.AllowWriteAccess()
 	fd := e.mustOpen("prog", linux.O_WRONLY)
 	fd.DecRef(e.ctx)
-	ok := &memmap.MMapOpts{Length: hostarch.PageSize, Perms: hostarch.ReadWrite, MaxPerms: hostarch.ReadWrite}
+	ok := &memmap.MMapOpts{Length: page, Perms: hostarch.ReadWrite, MaxPerms: hostarch.ReadWrite}
 	if err := writer.ConfigureMMap(e.ctx, ok); err != nil {
 		t.Fatalf("writable shared mapping after the program ended: %v", err)
 	}
@@ -1515,7 +1519,7 @@ func TestFsyncFlushesDataFileDirectoryAndTable(t *testing.T) {
 	h.syncFn = func() error { hostSyncs++; return nil }
 
 	// A mapped write that no read system call saw.
-	m, ms, ar := e.mapFile(fd, hostarch.PageSize, true)
+	m, ms, ar := e.mapFile(fd, uint64(hostarch.PageSize), true)
 	defer m.RemoveMapping(e.ctx, ms, ar, 0, true)
 	copy(mappedView(t, e, m, hostarch.ReadWrite, 0, 3), "MAP")
 

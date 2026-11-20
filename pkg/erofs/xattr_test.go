@@ -30,7 +30,7 @@ import (
 )
 
 // testBlock is the smallest block size that OpenImage accepts in this build.
-const testBlock = hostarch.PageSize
+var testBlock = int(hostarch.PageSize)
 
 // xattrEntryBytes encodes one on-disk xattr entry, padded to four bytes.
 func xattrEntryBytes(index uint8, name, value string) []byte {
@@ -91,7 +91,7 @@ func TestInodeXattrsAndRdev(t *testing.T) {
 	img := make([]byte, 3*testBlock)
 	sb := img[SuperBlockOffset:]
 	binary.LittleEndian.PutUint32(sb[0:], SuperBlockMagicV1)
-	sb[12] = uint8(bits.TrailingZeros(testBlock))
+	sb[12] = uint8(bits.TrailingZeros(uint(testBlock)))
 	binary.LittleEndian.PutUint64(sb[16:], 4)
 	binary.LittleEndian.PutUint32(sb[36:], 3)
 	binary.LittleEndian.PutUint32(sb[40:], 1)
