@@ -175,6 +175,8 @@ seam pkg/sentry/socket/netstack/netstack.go
 # /sys/class/net and /sys/module/nf_conntrack (pkg/sentry/fsimpl/sys/netclass_xplat.go).
 # /sys/block, /sys/class/block, and /sys/dev/block list the disks of the sandbox
 # (pkg/sentry/fsimpl/sys/blockclass_xplat.go).
+# /sys/devices/pci0000:00, /sys/class/drm, and /sys/dev/char list the virtual GPU as a virtio
+# PCI device when InternalData.VirtGPU is set (pkg/sentry/fsimpl/sys/virtgpu_xplat.go).
 seam pkg/sentry/fsimpl/sys/sys.go
 # /proc/diskstats and /proc/partitions list the disks of the sandbox
 # (pkg/sentry/fsimpl/proc/diskstats_xplat.go).

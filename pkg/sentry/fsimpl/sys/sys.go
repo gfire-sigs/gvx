@@ -73,6 +73,9 @@ type InternalData struct {
 	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
 	// unit testing.
 	TestSysfsPathPrefix string
+	// VirtGPU, when non-nil, lists a render node as a virtio GPU on a PCI
+	// bus (virtgpu_xplat.go).
+	VirtGPU *VirtGPUSysfs `state:"nosave"`
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -152,6 +155,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	busSub := make(map[string]kernfs.Inode)     // /sys/bus
 	pciDevices := make(map[string]kernfs.Inode) // /sys/bus/pci/devices
 	pciDrivers := make(map[string]kernfs.Inode) // /sys/bus/pci/drivers
+	charSub := make(map[string]kernfs.Inode)    // /sys/dev/char
 	kernelSub := kernelDir(ctx, fs, creds)      // /sys/kernel
 	if opts.InternalData != nil {
 		idata := opts.InternalData.(*InternalData)
@@ -227,6 +231,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		if fs.enableNUMATopology {
 			systemSub["node"] = fs.buildNUMATopology(ctx, creds, k.ApplicationCores())
 		}
+		if err := fs.addVirtGPUXplat(ctx, creds, idata.VirtGPU, classSub, devicesSub, busSub, pciDevices, charSub); err != nil {
+			return nil, nil, err
+		}
 	}
 	if len(pciDevices) > 0 || len(pciDrivers) > 0 {
 		pciSub := map[string]kernfs.Inode{}
@@ -247,7 +254,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"class": fs.newDir(ctx, creds, defaultSysDirMode, classSub),
 		"dev": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"block": fs.newBlockListDir(ctx, creds, byDiskNumber),
-			"char":  fs.newDir(ctx, creds, defaultSysDirMode, nil),
+			"char":  fs.newDir(ctx, creds, defaultSysDirMode, charSub),
 		}),
 		"devices":  fs.newDir(ctx, creds, defaultSysDirMode, devicesSub),
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
