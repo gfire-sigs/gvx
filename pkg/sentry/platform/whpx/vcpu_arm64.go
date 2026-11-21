@@ -128,7 +128,7 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	comm.Regs = r.Regs
 	comm.SP = r.Sp
 	comm.PC = r.Pc
-	comm.Pstate = r.Pstate &^ a64PstateUserMask
+	comm.Pstate = r.Pstate & a64PstateUserMask
 	comm.TLS = r.TPIDR_EL0
 	comm.Root = as.rootValue()
 

@@ -19,15 +19,72 @@ package systrap
 import "golang.org/x/arch/x86/x86asm"
 
 // decodeX86 decodes the instruction at the start of b in 64-bit mode. It
-// returns the result of x86asm.Decode with two corrections:
+// returns the result of x86asm.Decode with three corrections:
 //  1. VZEROUPPER and VZEROALL have no ModRM byte, whereas x86asm.Decode reads
 //     one and returns a length 1 to 5 bytes too long. A scan that trusts that
 //     length starts the next instruction inside the previous one.
-//  2. x86asm.Decode zero-extends 32-bit ModRM displacements of non-VEX
+//  2. x86asm.Decode recognizes VEX (0xC5, 0xC4) and EVEX (0x62) only at byte 0.
+//     When legal segment or address-size prefixes precede VEX or EVEX,
+//     decodeX86 decodes the VEX or EVEX tail and restores those prefixes.
+//  3. x86asm.Decode zero-extends 32-bit ModRM displacements of non-VEX
 //     instructions instead of sign-extending them to 64 bits.
 func decodeX86(b []byte) (x86asm.Inst, error) {
-	if op, n := vzeroInsn(b); n > 0 {
-		return x86asm.Inst{Op: op, Mode: 64, Len: n}, nil
+	lead := 0
+	var lastSeg x86asm.Reg
+	hasAddr32 := false
+	for lead < len(b) && lead < amd64MaxInsnLen {
+		switch b[lead] {
+		case 0x26, 0x2E, 0x36, 0x3E:
+			lead++
+			continue
+		case 0x64:
+			lastSeg = x86asm.FS
+			lead++
+			continue
+		case 0x65:
+			lastSeg = x86asm.GS
+			lead++
+			continue
+		case 0x67:
+			hasAddr32 = true
+			lead++
+			continue
+		}
+		break
+	}
+	if lead < len(b) {
+		if op, n := vzeroInsn(b[lead:]); n > 0 && lead+n <= amd64MaxInsnLen {
+			inst := x86asm.Inst{Op: op, Mode: 64, Len: lead + n, AddrSize: 64}
+			if hasAddr32 {
+				inst.AddrSize = 32
+			}
+			copyLeadingPrefixes(&inst, b[:lead])
+			return inst, nil
+		}
+		if lead > 0 && (b[lead] == 0xC5 || b[lead] == 0xC4 || b[lead] == 0x62) {
+			inner, ierr := x86asm.Decode(b[lead:], 64)
+			if ierr == nil && inner.Op != 0 && inner.Len > 0 && lead+inner.Len <= amd64MaxInsnLen {
+				copyLeadingPrefixes(&inner, b[:lead])
+				inner.Len += lead
+				if inner.PCRel > 0 {
+					inner.PCRelOff += lead
+				}
+				if hasAddr32 {
+					inner.AddrSize = 32
+				} else if inner.AddrSize == 0 {
+					inner.AddrSize = 64
+				}
+				if lastSeg != 0 {
+					for i, arg := range inner.Args {
+						if m, ok := arg.(x86asm.Mem); ok && m.Segment == 0 {
+							m.Segment = lastSeg
+							inner.Args[i] = m
+						}
+					}
+				}
+				return inner, nil
+			}
+		}
 	}
 	inst, err := x86asm.Decode(b, 64)
 	if err != nil || inst.Op == 0 || inst.Len == 0 || inst.Len > len(b) {
@@ -46,6 +103,30 @@ func decodeX86(b []byte) (x86asm.Inst, error) {
 		}
 	}
 	return inst, nil
+}
+
+// copyLeadingPrefixes prepends raw legacy prefix bytes into inst.Prefix.
+func copyLeadingPrefixes(inst *x86asm.Inst, raw []byte) {
+	if len(raw) == 0 {
+		return
+	}
+	var merged x86asm.Prefixes
+	n := 0
+	for _, b := range raw {
+		if n >= len(merged) {
+			break
+		}
+		merged[n] = x86asm.Prefix(b)
+		n++
+	}
+	for _, p := range inst.Prefix {
+		if p == 0 || n >= len(merged) {
+			break
+		}
+		merged[n] = p
+		n++
+	}
+	inst.Prefix = merged
 }
 
 // isMoffsInsn reports whether raw starts with a direct-offset MOV (opcodes

@@ -659,7 +659,7 @@ func DecodeMRSSysRegISS(insn uint32) (SysRegISS, bool) {
 		CRm:  (insn >> 8) & 0xf,
 		CRn:  (insn >> 12) & 0xf,
 		Op1:  (insn >> 16) & 0x7,
-		Op0:  3,
+		Op0:  2 + ((insn >> 19) & 1),
 	}, true
 }
 

@@ -35,6 +35,7 @@ import (
 // becomes a branch to a slot that loads a constant.
 const (
 	arm64SVC0       = hvcommon.SVC0
+	arm64SVCMask    = 0xffe0001f // svc #imm16 with imm16 in bits 20:5.
 	arm64MRSTPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
 	arm64MRSCTR     = 0xd53b0020 // mrs xN, ctr_el0 with N in bits 4:0.
 	arm64MSRTPIDR   = 0xd51bd040 // msr tpidr_el0, xN with N in bits 4:0.
@@ -113,7 +114,7 @@ func scanARM64(code []byte) []patchSite {
 	for off := 0; off+4 <= len(code); off += 4 {
 		w := binary.LittleEndian.Uint32(code[off:])
 		switch {
-		case w == arm64SVC0:
+		case w&arm64SVCMask == arm64SVC0:
 			sites = append(sites, patchSite{Offset: uint32(off), Kind: siteSVC, Orig: w})
 		case w&^arm64RegMask == arm64MRSTPIDR:
 			sites = append(sites, patchSite{Offset: uint32(off), Kind: siteMRS, Reg: uint8(w & arm64RegMask), Orig: w})
@@ -146,8 +147,11 @@ func isDataCacheMaintenance(w uint32) bool {
 // isStoreExclusive reports whether w is STXR, STLXR, STXP, or STLXP. A store
 // exclusive succeeds only while the local monitor from the earlier load
 // exclusive is set. Every exception clears the monitor, so the instruction
-// fails each time it restarts after a fault.
-func isStoreExclusive(w uint32) bool { return w&0x3fc00000 == 0x08000000 }
+// fails each time it restarts after a fault. CASP and CASPL share bit 21 with
+// STXP but have bit 31 clear, so this check excludes them.
+func isStoreExclusive(w uint32) bool {
+	return w&0x3fe07c00 == 0x08007c00 || w&0xbfe00000 == 0x88200000
+}
 
 // encodeBranch returns the B instruction at address from that jumps to to.
 func encodeBranch(from, to uint64) (uint32, error) {
