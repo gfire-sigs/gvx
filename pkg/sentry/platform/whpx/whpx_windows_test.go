@@ -18,6 +18,7 @@ package whpx
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"testing"
@@ -157,4 +158,54 @@ func TestRealInterruptStopsALoop(t *testing.T) {
 		}
 	}
 	t.Fatal("Interrupt did not stop a spinning WHPX guest within 10s")
+}
+
+func TestRealConcurrentAcquireSerializesVPCreation(t *testing.T) {
+	for iter := range 10 {
+		t.Run(fmt.Sprintf("iter_%d", iter), func(t *testing.T) {
+			p := newRealPlatform(t)
+			workers := min(p.ConcurrencyCount(), 8)
+			if workers < 2 {
+				t.Skip("at least two virtual processors are required")
+			}
+			type guestRunner struct {
+				c  *Context
+				mm *fakeMM
+				ac *arch.Context64
+			}
+			runners := make([]guestRunner, workers)
+			for i := range workers {
+				c, mm, ac := realGuest(t, p, guestSyscallCode)
+				runners[i] = guestRunner{c: c, mm: mm, ac: ac}
+			}
+
+			start := make(chan struct{})
+			errs := make([]error, workers)
+			var wg sync.WaitGroup
+			for i := range workers {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					sig, _, err := runners[i].c.Switch(nil, runners[i].mm, runners[i].ac, -1)
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					if sig != nil {
+						errs[i] = fmt.Errorf("unexpected guest signal %+v", sig)
+					}
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+
+			for i, err := range errs {
+				if err != nil {
+					t.Fatalf("worker %d Switch: %v", i, err)
+				}
+				checkSyscallExit(t, runners[i].ac)
+			}
+		})
+	}
 }

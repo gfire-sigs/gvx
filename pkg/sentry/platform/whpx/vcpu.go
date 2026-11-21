@@ -200,25 +200,37 @@ func (p *Platform) acquire(c *Context) (*vcpu, error) {
 			}
 			return v, nil
 		}
-		if n := len(p.freeIdx); n > 0 {
+		// Windows on arm64 bugchecks the host hypervisor (HYPERVISOR_ERROR)
+		// when two threads call WHvCreateVirtualProcessor concurrently on one
+		// partition. Serialize creation with p.creating so indices also bring
+		// up in monotonic order and Close waits before deleting the partition.
+		if !p.creating && len(p.freeIdx) > 0 {
+			n := len(p.freeIdx)
 			index := p.freeIdx[n-1]
 			p.freeIdx = p.freeIdx[:n-1]
+			p.creating = true
 			p.mu.Unlock()
 			v, err := newVP(p, index)
 			p.mu.Lock()
 			if err != nil {
+				p.creating = false
 				p.freeIdx = append(p.freeIdx, index)
 				p.cond.Broadcast()
 				return nil, err
 			}
 			if p.closed {
-				err := v.destroy()
+				p.mu.Unlock()
+				derr := v.destroy()
+				p.mu.Lock()
+				p.creating = false
 				p.freeIdx = append(p.freeIdx, index)
 				p.cond.Broadcast()
-				return nil, fmt.Errorf("%w%s", errClosed, joinErr(err))
+				return nil, fmt.Errorf("%w%s", errClosed, joinErr(derr))
 			}
+			p.creating = false
 			p.vps = append(p.vps, v)
 			v.busy = true
+			p.cond.Broadcast()
 			return v, nil
 		}
 		if c.kicked.Swap(false) {
