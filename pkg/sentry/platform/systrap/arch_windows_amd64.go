@@ -527,7 +527,7 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 			v &= 0xFFFFFFFF
 		}
 		th.ctx.put64(ctxOffRax+8*int(site.reg), v)
-		th.ctx.setPC(ev.Addr + uint64(site.length))
+		th.ctx.setPC(th.resumePC(ev.Addr + uint64(site.length)))
 		if err := th.continueEvent(ev); err != nil {
 			return fatal(err, unix.EFAULT), true
 		}
@@ -545,7 +545,7 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 			si := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: linux.SI_KERNEL}
 			return outcome{done: true, si: si, err: platform.ErrContextSignal}, true
 		}
-		th.ctx.setPC(ev.Addr + uint64(site.length))
+		th.ctx.setPC(th.resumePC(ev.Addr + uint64(site.length)))
 		if site.kind == amd64SiteWRFSBASE {
 			ac.StateData().Regs.Fs_base = v
 			// A zero base must still reach the hardware when the thread
@@ -589,6 +589,62 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	return outcome{}, false
 }
 
+// guardedMemAccessors builds guest memory read and write callbacks that track
+// the exact faulting address across page boundaries for emulated instructions.
+func guardedMemAccessors(as *addressSpace, pc uint64, preciseFaultAddr *uint64) (
+	readMem func(addr uint64, buf []byte) bool,
+	writeMem func(addr uint64, buf []byte) bool,
+) {
+	readMem = func(addr uint64, buf []byte) bool {
+		if as.readGuest(addr, buf) {
+			return true
+		}
+		*preciseFaultAddr = addr
+		if len(buf) > 1 && as.inGuestRange(addr, len(buf)) {
+			nextPage := blockRound(addr) + blockSize
+			if nextPage > addr && nextPage < addr+uint64(len(buf)) {
+				var probe [8]byte
+				firstLen := int(nextPage - addr)
+				if as.readGuest(addr, probe[:firstLen]) {
+					*preciseFaultAddr = nextPage
+				}
+			}
+		}
+		return false
+	}
+	writeMem = func(addr uint64, buf []byte) bool {
+		if !as.inGuestRange(addr, len(buf)) {
+			*preciseFaultAddr = addr
+			return false
+		}
+		end := addr + uint64(len(buf))
+		for pg := blockRound(addr); pg <= blockRound(end-1); pg += blockSize {
+			if pg != blockRound(pc) {
+				_, _ = as.aliasWriteFault(max(addr, pg))
+				_, _ = as.restoreData(pg)
+			}
+		}
+		ok, badAddr := as.writeGuestSpanWritable(addr, buf)
+		if !ok {
+			*preciseFaultAddr = badAddr
+		}
+		return ok
+	}
+	return readMem, writeMem
+}
+
+// guardedIllegalStop delivers SIGILL at ev.Addr for a guarded instruction that
+// hardware rejects with #UD (such as an invalid LOCK prefix).
+func (th *thread) guardedIllegalStop(ac *arch.Context64, ev debugEvent) outcome {
+	th.ctx.setPC(ev.Addr)
+	if err := th.stopAndPull(ac, ev); err != nil {
+		return fatal(err, unix.EFAULT)
+	}
+	si := &linux.SignalInfo{Signo: int32(linux.SIGILL), Code: illIllOpc}
+	si.SetAddr(ev.Addr)
+	return outcome{done: true, si: si, err: platform.ErrContextSignal}
+}
+
 // emulateGuardedSite executes the unmodified outer instruction at ev.Addr that
 // covers an embedded raw kernel-entry byte pair without exposing the raw bytes
 // to direct branches.
@@ -603,45 +659,14 @@ func (th *thread) emulateGuardedSite(as *addressSpace, ac *arch.Context64, ev de
 	}
 	eflags := th.ctx.u32(ctxOffEFlags)
 	var preciseFaultAddr uint64
-	readMem := func(addr uint64, buf []byte) bool {
-		if as.readGuest(addr, buf) {
-			return true
-		}
-		preciseFaultAddr = addr
-		if len(buf) > 1 && as.inGuestRange(addr, len(buf)) {
-			nextPage := blockRound(addr) + blockSize
-			if nextPage > addr && nextPage < addr+uint64(len(buf)) {
-				var probe [8]byte
-				firstLen := int(nextPage - addr)
-				if as.readGuest(addr, probe[:firstLen]) {
-					preciseFaultAddr = nextPage
-				}
-			}
-		}
-		return false
-	}
-	writeMem := func(addr uint64, buf []byte) bool {
-		if !as.inGuestRange(addr, len(buf)) {
-			preciseFaultAddr = addr
-			return false
-		}
-		end := addr + uint64(len(buf))
-		for pg := blockRound(addr); pg <= blockRound(end-1); pg += blockSize {
-			if pg != blockRound(ev.Addr) {
-				_, _ = as.aliasWriteFault(max(addr, pg))
-				_, _ = as.restoreData(pg)
-			}
-		}
-		ok, badAddr := as.writeGuestSpanWritable(addr, buf)
-		if !ok {
-			preciseFaultAddr = badAddr
-		}
-		return ok
-	}
+	readMem, writeMem := guardedMemAccessors(as, ev.Addr, &preciseFaultAddr)
 	fsBase := ac.StateData().Regs.Fs_base
 	gsBase := ac.StateData().Regs.Gs_base
 	var nextPC uint64
 	res := emulateGuardedX86Insn(code, ev.Addr, fsBase, gsBase, &regs, &eflags, &nextPC, readMem, writeMem)
+	if res.illegal {
+		return th.guardedIllegalStop(ac, ev), true
+	}
 	if res.fault {
 		fAddr := res.faultAddr
 		if preciseFaultAddr != 0 {
@@ -693,8 +718,8 @@ func (th *thread) runGuardedScratch(as *addressSpace, ac *arch.Context64, ev deb
 	var savedVal uint64
 	if plan.useScratch {
 		accessLen := 1
-		if inst, err := decodeX86(code); err == nil && inst.MemBytes > 0 {
-			accessLen = inst.MemBytes
+		if inst, err := decodeX86(code); err == nil {
+			accessLen = guardedMemBytes(inst)
 		}
 		if !as.inGuestRange(plan.effAddr, accessLen) {
 			return th.guardedFaultStop(as, ac, ev, plan.effAddr, false), true
@@ -705,7 +730,8 @@ func (th *thread) runGuardedScratch(as *addressSpace, ac *arch.Context64, ev deb
 	if err != nil {
 		return fatal(err, unix.EFAULT), true
 	}
-	resumeAddr := th.resumePC(ev.Addr + uint64(site.length))
+	guestResume := ev.Addr + uint64(site.length)
+	resumeAddr := th.resumePC(guestResume)
 
 	codeOff := guardCodeBase + slot*guardCodeStride
 	dataOff := guardDataBase + slot*guardDataStride
@@ -750,7 +776,7 @@ func (th *thread) runGuardedScratch(as *addressSpace, ac *arch.Context64, ev deb
 	}
 
 	th.guardSite = ev.Addr
-	th.guardResume = resumeAddr
+	th.guardResume = guestResume
 	th.guardSavedVal = savedVal
 	th.guardInsnLen = uint8(L)
 	th.guardScratchReg = plan.scratchReg
@@ -782,40 +808,32 @@ func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debu
 	}
 	eflags := th.ctx.u32(ctxOffEFlags)
 	var preciseFaultAddr uint64
-	writeMem := func(addr uint64, buf []byte) bool {
-		if !as.inGuestRange(addr, len(buf)) {
-			preciseFaultAddr = addr
-			return false
-		}
-		end := addr + uint64(len(buf))
-		for pg := blockRound(addr); pg <= blockRound(end-1); pg += blockSize {
-			if pg != blockRound(ev.Addr) {
-				_, _ = as.aliasWriteFault(max(addr, pg))
-				_, _ = as.restoreData(pg)
-			}
-		}
-		ok, badAddr := as.writeGuestSpanWritable(addr, buf)
-		if !ok {
-			preciseFaultAddr = badAddr
-		}
-		return ok
+	readMem, writeMem := guardedMemAccessors(as, ev.Addr, &preciseFaultAddr)
+	fsBase := ac.StateData().Regs.Fs_base
+	gsBase := ac.StateData().Regs.Gs_base
+	nextPC := ev.Addr + uint64(site.length)
+	res := emulateSegMemInsn(code, x86asm.GS, gsBase, &regs, &eflags, readMem, writeMem)
+	if !res.ok && !res.fault && !res.illegal {
+		res = emulateGuardedX86Insn(code, ev.Addr, fsBase, gsBase, &regs, &eflags, &nextPC, readMem, writeMem)
 	}
-	res := emulateSegMemInsn(code, x86asm.GS, ac.StateData().Regs.Gs_base, &regs, &eflags, as.readGuest, writeMem)
+	if res.illegal {
+		return th.guardedIllegalStop(ac, ev), true
+	}
 	if res.fault {
 		fAddr := res.faultAddr
-		if res.faultWrite && preciseFaultAddr != 0 {
+		if preciseFaultAddr != 0 {
 			fAddr = preciseFaultAddr
 		}
 		return th.guardedFaultStop(as, ac, ev, fAddr, res.faultWrite), true
 	}
 	if !res.ok {
-		return outcome{}, false
+		return th.runGuardedScratch(as, ac, ev, site, code, fsBase, gsBase, &regs)
 	}
 	for i := range regs {
 		th.ctx.put64(ctxOffRax+8*i, regs[i])
 	}
 	th.ctx.put32(ctxOffEFlags, eflags)
-	th.ctx.setPC(ev.Addr + uint64(site.length))
+	th.ctx.setPC(th.resumePC(nextPC))
 	if err := th.continueEvent(ev); err != nil {
 		return fatal(err, unix.EFAULT), true
 	}
@@ -824,7 +842,7 @@ func (th *thread) emulateGSMemSite(as *addressSpace, ac *arch.Context64, ev debu
 
 // inGuestRange reports whether the n bytes at addr lie in the guest range.
 func (as *addressSpace) inGuestRange(addr uint64, n int) bool {
-	return n > 0 && addr >= as.p.userMin && addr+uint64(n) <= as.p.userMax
+	return n > 0 && addr >= as.p.userMin && addr <= as.p.userMax && uint64(n) <= as.p.userMax-addr
 }
 
 // readGuest reads the guest memory at addr into buf through the stub process.

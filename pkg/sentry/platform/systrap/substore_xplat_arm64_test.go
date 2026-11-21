@@ -190,6 +190,10 @@ func TestStoreChecksTheWholeRangeBeforeTheFirstWrite(t *testing.T) {
 }
 
 func TestEmulateAtomicOrCacheOp(t *testing.T) {
+	origZVA := dcZvaBlockSize
+	dcZvaBlockSize = 64
+	t.Cleanup(func() { dcZvaBlockSize = origZVA })
+
 	mem := make([]byte, 128)
 	for i := range mem {
 		mem[i] = 0xff
@@ -514,5 +518,97 @@ func TestEmulateStoreTBI0TaggedAddresses(t *testing.T) {
 	}
 	if want := uint64(dataAddr) + pageSize; si.Addr() != want {
 		t.Fatalf("cross-page TBI0 fault address = %#x, want untagged %#x", si.Addr(), want)
+	}
+}
+
+func TestComputeDCZVABlockSizeAndEmulation(t *testing.T) {
+	for _, tc := range []struct {
+		dczid uint64
+		want  int
+	}{
+		{3, 32},
+		{4, 64},
+		{5, 128},
+		{6, 256},
+		{9, 2048},
+		{10, 0},       // exceeds architectural max
+		{1<<4 | 4, 0}, // DZP=1 prohibits DC ZVA
+	} {
+		if got := computeDCZVABlockSize(tc.dczid); got != tc.want {
+			t.Errorf("computeDCZVABlockSize(%#x) = %d, want %d", tc.dczid, got, tc.want)
+		}
+	}
+
+	// Verify emulateAtomicOrCacheOp honors non-64-byte block sizes (128B and 32B) and DZP=1.
+	origSize := dcZvaBlockSize
+	t.Cleanup(func() { dcZvaBlockSize = origSize })
+
+	const dcZvaX0 = 0xd50b7420
+	for _, bs := range []int{32, 128} {
+		dcZvaBlockSize = bs
+		var buf [256]byte
+		for i := range buf {
+			buf[i] = 0xAA
+		}
+		var regs arch.Registers
+		regs.Regs[0] = 0x1000 + uint64(bs/2)
+		r := storeRegs{regs: &regs}
+		check := func(addr uint64, n int) bool { return addr >= 0x1000 && addr+uint64(n) <= 0x1000+uint64(len(buf)) }
+		write := func(addr uint64, b []byte) { copy(buf[addr-0x1000:], b) }
+		if line, ok := emulateAtomicOrCacheOp(dcZvaX0, r, check, nil, write); !ok || line != 0x1000 {
+			t.Fatalf("DC ZVA (bs=%d) = (%#x, %v), want (0x1000, true)", bs, line, ok)
+		}
+		for i := 0; i < bs; i++ {
+			if buf[i] != 0 {
+				t.Fatalf("bs=%d: buf[%d] = %#x, want 0", bs, i, buf[i])
+			}
+		}
+		if buf[bs] != 0xAA {
+			t.Fatalf("bs=%d: buf[%d] = %#x, want untouched 0xAA", bs, bs, buf[bs])
+		}
+	}
+	dcZvaBlockSize = 0
+	var regs arch.Registers
+	regs.Regs[0] = 0x1000
+	if _, ok := emulateAtomicOrCacheOp(dcZvaX0, storeRegs{regs: &regs}, func(uint64, int) bool { return true }, nil, func(uint64, []byte) {}); ok {
+		t.Fatal("DC ZVA succeeded when dcZvaBlockSize == 0 (DZP=1)")
+	}
+}
+
+func TestCASPX30XZRAndUnallocatedVectorSTTR(t *testing.T) {
+	// CASP X30, XZR, X0, X1, [X2] = 0x483E7C40 (Rs=30, Rt=0)
+	// CASP X0, X1, X30, XZR, [X2] = 0x48207C5E (Rs=0, Rt=30)
+	var mem [16]byte
+	binary.LittleEndian.PutUint64(mem[0:], 0x1111)
+	binary.LittleEndian.PutUint64(mem[8:], 0)
+	var regs arch.Registers
+	regs.Regs[30] = 0x1111
+	regs.Regs[0] = 0x2222
+	regs.Regs[1] = 0x3333
+	regs.Regs[2] = 0x2000
+	check := func(addr uint64, n int) bool { return addr == 0x2000 && n == 16 }
+	read := func(addr uint64, n int) []byte { return mem[:n] }
+	write := func(addr uint64, b []byte) { copy(mem[:], b) }
+
+	if _, ok := emulateAtomicOrCacheOp(0x483E7C40, storeRegs{regs: &regs}, check, read, write); !ok {
+		t.Fatal("CASP X30, XZR, X0, X1, [X2] failed")
+	}
+	if got0, got1 := binary.LittleEndian.Uint64(mem[0:]), binary.LittleEndian.Uint64(mem[8:]); got0 != 0x2222 || got1 != 0x3333 {
+		t.Fatalf("after CASP Rs=30: mem = (%#x, %#x), want (0x2222, 0x3333)", got0, got1)
+	}
+
+	regs.Regs[0] = 0x2222
+	regs.Regs[1] = 0x3333
+	regs.Regs[30] = 0x4444
+	if _, ok := emulateAtomicOrCacheOp(0x48207C5E, storeRegs{regs: &regs}, check, read, write); !ok {
+		t.Fatal("CASP X0, X1, X30, XZR, [X2] failed")
+	}
+	if got0, got1 := binary.LittleEndian.Uint64(mem[0:]), binary.LittleEndian.Uint64(mem[8:]); got0 != 0x4444 || got1 != 0 {
+		t.Fatalf("after CASP Rt=30: mem = (%#x, %#x), want (0x4444, 0)", got0, got1)
+	}
+
+	// Unallocated vector STTR (size=00, V=1, opc=00, [11:10]=10 -> 0x3C000800) must be rejected.
+	if st, ok := decodeStore(0x3C000800); ok {
+		t.Fatalf("decodeStore accepted unallocated vector STTR 0x3C000800: %+v", st)
 	}
 }

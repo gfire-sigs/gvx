@@ -1968,3 +1968,14 @@ func TestFastPathPlannerRejectsEmbeddedKernelExitsInRelocAndJmp(t *testing.T) {
 		t.Fatalf("encodeJmpSite rejected collision-free slot offset 128: %v", err)
 	}
 }
+
+func TestPreWindowDoesNotSplitLegacyPrefixFromVEX(t *testing.T) {
+	// fs: vmovdqu xmm0, [rax+0x10]; syscall; ret
+	fsVEX := []byte{0x64, 0xC5, 0xFA, 0x6F, 0x40, 0x10}
+	page := catBytes(nops(64), fsVEX, []byte{0x0F, 0x05, 0xC3})
+	siteOff := 64 + len(fsVEX)
+	pl := newJmpPlanner(nil, page, nil)
+	if got := pl.planSite(siteOff, 0); got.kind == planPre {
+		t.Fatalf("planSite split FS-prefixed VEX into pre-window JMP: %+v", got)
+	}
+}

@@ -35,10 +35,11 @@ const (
 	eflagsArithMask = eflagCF | eflagPF | eflagAF | eflagZF | eflagSF | eflagOF
 )
 
-// segEmulOutcome describes the result of emulating a segment-prefixed
-// instruction.
+// segEmulOutcome describes the result of emulating a segment-prefixed or
+// guarded instruction.
 type segEmulOutcome struct {
 	ok         bool
+	illegal    bool
 	fault      bool
 	faultAddr  uint64
 	faultWrite bool
@@ -72,6 +73,9 @@ func emulateSegMemInsn(
 	}
 	if memIdx < 0 {
 		return segEmulOutcome{}
+	}
+	if hasInvalidLockPrefix(inst, true) {
+		return segEmulOutcome{illegal: true}
 	}
 	addr, addrOK := evalSegMemAddr(memArg, segBase, regs, inst.AddrSize == 32)
 	if !addrOK {
@@ -150,11 +154,17 @@ func emulateSegMemInsn(
 		if !ok {
 			return segEmulOutcome{}
 		}
-		v, ok := readVal(memBytes)
+		srcW := memBytes
+		if inst.Op == x86asm.MOVSXD {
+			if _, dstW, _ := x86RegIndexWidth(dstReg); dstW == 2 {
+				srcW = 2
+			}
+		}
+		v, ok := readVal(srcW)
 		if !ok {
 			return segEmulOutcome{fault: true, faultAddr: addr}
 		}
-		ext := uint64(signExtendTo64(v, memBytes))
+		ext := uint64(signExtendTo64(v, srcW))
 		if !writeX86Reg(regs, dstReg, ext) {
 			return segEmulOutcome{}
 		}
@@ -269,15 +279,8 @@ func emulateSegMemInsn(
 	return segEmulOutcome{}
 }
 
-// isAtomicMemInsn reports whether inst changes memory atomically: it has a LOCK
-// prefix, or it is an exchange that locks the bus without one. A read and a
-// write from the Sentry cannot replace such an instruction while other guest
-// threads run.
-func isAtomicMemInsn(inst x86asm.Inst) bool {
-	switch inst.Op {
-	case x86asm.XCHG, x86asm.CMPXCHG, x86asm.CMPXCHG8B, x86asm.CMPXCHG16B, x86asm.XADD:
-		return true
-	}
+// hasLockPrefix reports whether inst carries a LOCK (0xF0) prefix.
+func hasLockPrefix(inst x86asm.Inst) bool {
 	for _, p := range inst.Prefix {
 		if p == 0 {
 			break
@@ -287,6 +290,35 @@ func isAtomicMemInsn(inst x86asm.Inst) bool {
 		}
 	}
 	return false
+}
+
+// hasInvalidLockPrefix reports whether inst has a LOCK prefix that x86-64
+// hardware rejects with #UD (either marked invalid by x86asm or placed on a
+// non-memory instruction).
+func hasInvalidLockPrefix(inst x86asm.Inst, hasMem bool) bool {
+	for _, p := range inst.Prefix {
+		if p == 0 {
+			break
+		}
+		if p&0xFF == x86asm.PrefixLOCK {
+			if !hasMem || p&x86asm.PrefixInvalid != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isAtomicMemInsn reports whether inst changes memory atomically: it has a LOCK
+// prefix, or it is an exchange that locks the bus without one. A read and a
+// write from the Sentry cannot replace such an instruction while other guest
+// threads run.
+func isAtomicMemInsn(inst x86asm.Inst) bool {
+	switch inst.Op {
+	case x86asm.XCHG, x86asm.CMPXCHG, x86asm.CMPXCHG8B, x86asm.CMPXCHG16B, x86asm.XADD:
+		return true
+	}
+	return hasLockPrefix(inst)
 }
 
 func evalSegMemAddr(m x86asm.Mem, segBase uint64, regs *[16]uint64, addr32 bool) (uint64, bool) {
@@ -808,6 +840,9 @@ func emulateGuardedX86Insn(
 			break
 		}
 	}
+	if hasInvalidLockPrefix(inst, hasMem) {
+		return segEmulOutcome{illegal: true}
+	}
 	if hasMem && isAtomicMemInsn(inst) {
 		return segEmulOutcome{}
 	}
@@ -922,14 +957,19 @@ func emulateGuardedX86Insn(
 		if !ok {
 			return segEmulOutcome{}
 		}
+		_, dstW, _ := x86RegIndexWidth(dstReg)
 		var srcW int
 		switch s := inst.Args[1].(type) {
 		case x86asm.Reg:
 			_, srcW, _ = x86RegIndexWidth(s)
 		case x86asm.Mem:
 			srcW = inst.MemBytes
-			if srcW == 0 && inst.Op == x86asm.MOVSXD {
-				srcW = 4
+			if inst.Op == x86asm.MOVSXD {
+				if dstW == 2 {
+					srcW = 2
+				} else if srcW == 0 {
+					srcW = 4
+				}
 			}
 		}
 		if srcW != 1 && srcW != 2 && srcW != 4 {
@@ -1216,43 +1256,98 @@ func emulateGuardedX86Insn(
 		return segEmulOutcome{ok: true}
 
 	case inst.Op == x86asm.BT, inst.Op == x86asm.BTS, inst.Op == x86asm.BTR, inst.Op == x86asm.BTC:
-		dstReg, ok := inst.Args[0].(x86asm.Reg)
-		if !ok {
-			return segEmulOutcome{}
-		}
-		lhs, w, rok := readX86Reg(regs, dstReg)
-		if !rok || (w != 2 && w != 4 && w != 8) {
-			return segEmulOutcome{}
-		}
-		var bitIdx uint64
-		switch b := inst.Args[1].(type) {
-		case x86asm.Imm:
-			bitIdx = uint64(uint8(b)) % uint64(w*8)
+		switch dst := inst.Args[0].(type) {
 		case x86asm.Reg:
-			bv, bw, bok := readX86Reg(regs, b)
-			if !bok || bw != w {
+			lhs, w, rok := readX86Reg(regs, dst)
+			if !rok || (w != 2 && w != 4 && w != 8) {
 				return segEmulOutcome{}
 			}
-			bitIdx = bv % uint64(w*8)
-		default:
-			return segEmulOutcome{}
+			var bitIdx uint64
+			switch b := inst.Args[1].(type) {
+			case x86asm.Imm:
+				bitIdx = uint64(uint8(b)) % uint64(w*8)
+			case x86asm.Reg:
+				bv, bw, bok := readX86Reg(regs, b)
+				if !bok || bw != w {
+					return segEmulOutcome{}
+				}
+				bitIdx = bv % uint64(w*8)
+			default:
+				return segEmulOutcome{}
+			}
+			bitMask := uint64(1) << bitIdx
+			if lhs&bitMask != 0 {
+				*eflags |= eflagCF
+			} else {
+				*eflags &^= eflagCF
+			}
+			switch inst.Op {
+			case x86asm.BTS:
+				writeX86Reg(regs, dst, lhs|bitMask)
+			case x86asm.BTR:
+				writeX86Reg(regs, dst, lhs&^bitMask)
+			case x86asm.BTC:
+				writeX86Reg(regs, dst, lhs^bitMask)
+			}
+			*nextPC = fallthroughPC
+			return segEmulOutcome{ok: true}
+		case x86asm.Mem:
+			w := memWidth()
+			if w != 2 && w != 4 && w != 8 {
+				return segEmulOutcome{}
+			}
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
+			if !aok {
+				return segEmulOutcome{}
+			}
+			var bitIdx uint64
+			switch b := inst.Args[1].(type) {
+			case x86asm.Imm:
+				bitIdx = uint64(uint8(b)) % uint64(w*8)
+			case x86asm.Reg:
+				bv, bw, bok := readX86Reg(regs, b)
+				if !bok || bw != w {
+					return segEmulOutcome{}
+				}
+				bitOff := signExtendTo64(bv, w)
+				shift := uint(4)
+				if w == 4 {
+					shift = 5
+				} else if w == 8 {
+					shift = 6
+				}
+				wordOff := bitOff >> shift
+				addr += uint64(wordOff) * uint64(w)
+				bitIdx = uint64(bitOff) & uint64(w*8-1)
+			default:
+				return segEmulOutcome{}
+			}
+			lhs, mok := readAt(addr, w)
+			if !mok {
+				return segEmulOutcome{fault: true, faultAddr: addr}
+			}
+			bitMask := uint64(1) << bitIdx
+			if lhs&bitMask != 0 {
+				*eflags |= eflagCF
+			} else {
+				*eflags &^= eflagCF
+			}
+			var res uint64
+			writeBack := false
+			switch inst.Op {
+			case x86asm.BTS:
+				res, writeBack = lhs|bitMask, true
+			case x86asm.BTR:
+				res, writeBack = lhs&^bitMask, true
+			case x86asm.BTC:
+				res, writeBack = lhs^bitMask, true
+			}
+			if writeBack && !writeAt(addr, w, res) {
+				return segEmulOutcome{fault: true, faultAddr: addr, faultWrite: true}
+			}
+			*nextPC = fallthroughPC
+			return segEmulOutcome{ok: true}
 		}
-		bitMask := uint64(1) << bitIdx
-		if lhs&bitMask != 0 {
-			*eflags |= eflagCF
-		} else {
-			*eflags &^= eflagCF
-		}
-		switch inst.Op {
-		case x86asm.BTS:
-			writeX86Reg(regs, dstReg, lhs|bitMask)
-		case x86asm.BTR:
-			writeX86Reg(regs, dstReg, lhs&^bitMask)
-		case x86asm.BTC:
-			writeX86Reg(regs, dstReg, lhs^bitMask)
-		}
-		*nextPC = fallthroughPC
-		return segEmulOutcome{ok: true}
 
 	case inst.Op == x86asm.XCHG:
 		r0, ok0 := inst.Args[0].(x86asm.Reg)
@@ -1466,11 +1561,19 @@ func isDisallowedScratchOp(inst x86asm.Inst) bool {
 		x86asm.XLATB, x86asm.MASKMOVQ, x86asm.MASKMOVDQU, x86asm.VMASKMOVDQU,
 		x86asm.ENTER, x86asm.LEAVE,
 		x86asm.PUSH, x86asm.POP, x86asm.PUSHF, x86asm.PUSHFQ, x86asm.POPF, x86asm.POPFQ,
-		x86asm.CALL, x86asm.RET, x86asm.IRET, x86asm.IRETD, x86asm.IRETQ,
+		x86asm.JMP, x86asm.LJMP, x86asm.CALL, x86asm.LCALL, x86asm.RET, x86asm.LRET,
+		x86asm.IRET, x86asm.IRETD, x86asm.IRETQ,
 		x86asm.SYSCALL, x86asm.SYSENTER, x86asm.SYSEXIT, x86asm.SYSRET,
 		x86asm.INT, x86asm.INTO, x86asm.UD2, x86asm.HLT,
 		x86asm.RDFSBASE, x86asm.RDGSBASE, x86asm.WRFSBASE, x86asm.WRGSBASE:
 		return true
+	case x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC:
+		// Register bit offsets on memory operands index outside [effAddr, effAddr+w).
+		if _, isMem := inst.Args[0].(x86asm.Mem); isMem {
+			if _, isReg := inst.Args[1].(x86asm.Reg); isReg {
+				return true
+			}
+		}
 	case x86asm.MOVSD, x86asm.CMPSD:
 		hasXMM := false
 		for _, arg := range inst.Args {
@@ -1506,28 +1609,43 @@ type guardedScratchPlan struct {
 	effAddr    uint64
 }
 
+// guardedMemBytes returns the byte span accessed by inst's memory operand for
+// guest-range validation in runGuardedScratch. x86asm leaves MemBytes zero for
+// some x87 multi-byte operands (tbyte, FPU env, and FPU state).
+func guardedMemBytes(inst x86asm.Inst) int {
+	if inst.MemBytes > 0 {
+		return inst.MemBytes
+	}
+	switch inst.Op {
+	case x86asm.FLD, x86asm.FSTP, x86asm.FBLD, x86asm.FBSTP:
+		return 10
+	case x86asm.FLDENV, x86asm.FNSTENV:
+		return 28
+	case x86asm.FRSTOR, x86asm.FNSAVE:
+		return 108
+	}
+	for _, arg := range inst.Args {
+		if r, ok := arg.(x86asm.Reg); ok {
+			switch {
+			case r >= x86asm.Z0 && r <= x86asm.Z31:
+				return 64
+			case r >= x86asm.Y0 && r <= x86asm.Y31:
+				return 32
+			case r >= x86asm.X0 && r <= x86asm.X31:
+				return 16
+			}
+		}
+	}
+	if n := inferMemBytes(inst); n > 0 {
+		return n
+	}
+	return 1
+}
+
 // planGuardedScratchInsn builds a raw-kernel-exit-free rewrite of the first
 // instruction in code at guest address pc.
 func planGuardedScratchInsn(code []byte, pc, fsBase, gsBase uint64, regs *[16]uint64) (guardedScratchPlan, bool) {
 	inst, err := decodeX86(code)
-	if err == nil && inst.Op == 0 {
-		// golang.org/x/arch/x86/x86asm stops at legacy segment prefixes before VEX (0xC5/0xC4).
-		segLead := 0
-		for segLead < len(code) && segLead < amd64MaxInsnLen {
-			switch code[segLead] {
-			case 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65:
-				segLead++
-				continue
-			}
-			break
-		}
-		if segLead > 0 && segLead < len(code) && (code[segLead] == 0xC5 || code[segLead] == 0xC4) {
-			if inner, ierr := decodeX86(code[segLead:]); ierr == nil && inner.Op != 0 && inner.Len > 0 && segLead+inner.Len <= amd64MaxInsnLen {
-				inner.Len += segLead
-				inst = inner
-			}
-		}
-	}
 	if err != nil || inst.Op == 0 || inst.Len == 0 || inst.Len > len(code) {
 		return guardedScratchPlan{}, false
 	}
@@ -1567,7 +1685,7 @@ func planGuardedScratchInsn(code []byte, pc, fsBase, gsBase uint64, regs *[16]ui
 			}
 		}
 	}
-	if memCount > 1 {
+	if memCount > 1 || hasInvalidLockPrefix(inst, memCount > 0) {
 		return guardedScratchPlan{}, false
 	}
 
@@ -1587,7 +1705,7 @@ func planGuardedScratchInsn(code []byte, pc, fsBase, gsBase uint64, regs *[16]ui
 			lastSeg = x86asm.GS
 			continue
 		case 0x26, 0x2E, 0x36, 0x3E:
-			lastSeg = 0
+			// CS/DS/ES/SS overrides are null in 64-bit mode and do not clear FS/GS.
 			continue
 		case 0x67:
 			// Reject 32-bit address-size overrides rather than stripping them.
@@ -1733,10 +1851,20 @@ func planGuardedScratchInsn(code []byte, pc, fsBase, gsBase uint64, regs *[16]ui
 		}
 		candHead := append([]byte(nil), head...)
 		if cand >= 8 {
-			if isVEX2 || hasHighByteReg {
+			if hasHighByteReg {
 				continue
 			}
-			if vex1Idx >= 0 {
+			if isVEX2 {
+				// Promote 2-byte VEX (C5 <RvvvvLpp> <op>) to 3-byte VEX
+				// (C4 <(R<<7)|~X=1|~B=0|mmmmm=1> <W=0|vvvvLpp> <op>) so R8..R15
+				// can serve as the scratch base register.
+				b1 := candHead[opcodeStartInHead+1]
+				op := candHead[opcodeStartInHead+2]
+				promoted := make([]byte, 0, len(candHead)+1)
+				promoted = append(promoted, candHead[:opcodeStartInHead]...)
+				promoted = append(promoted, 0xC4, (b1&0x80)|0x41, b1&0x7F, op)
+				candHead = promoted
+			} else if vex1Idx >= 0 {
 				candHead[vex1Idx] &^= 0x20 // ~B = 0 selects R8..R15
 			} else if rexIdx >= 0 {
 				candHead[rexIdx] |= 0x01

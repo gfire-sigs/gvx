@@ -57,3 +57,9 @@ ic_done:
 	DSB	$11		// DSB ISH
 	ISB	$15		// ISB SY
 	RET
+
+// func readDCZID() uint64
+TEXT ·readDCZID(SB),NOSPLIT,$0-8
+	MRS	DCZID_EL0, R0
+	MOVD	R0, ret+0(FP)
+	RET

@@ -283,7 +283,7 @@ func decodeAMD64(b []byte) amd64Decoded {
 
 func decodeAMD64WithGS(b []byte, gsMem bool) amd64Decoded {
 	inst, err := decodeX86(b)
-	if err != nil || inst.Len == 0 {
+	if err != nil || inst.Op == 0 || inst.Len == 0 {
 		return amd64Decoded{known: true}
 	}
 	d := amd64Decoded{size: uint8(inst.Len), known: true}

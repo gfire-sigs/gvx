@@ -331,11 +331,11 @@ type siteInfo struct {
 
 // patchPage replaces the instructions that Windows cannot run with BRK or
 // NOP. page is a copy of the original frame. With the fast path, each `svc #0`
-// becomes a branch to a trampoline slot, and a site without a slot keeps the
-// BRK. The patcher scans every executable page, writable or not, because an
-// aligned word has no marker that tells code from data. A data word that
-// equals one of the 289 patched encodings changes in the copy that the guest
-// reads. A word matches with a probability of 289 in 2^32 for uniform data.
+// becomes a branch to a trampoline slot, and every `svc #imm16` with a non-zero
+// immediate or without a slot keeps the BRK so no guest word can invoke a
+// Windows NT system call directly. The patcher scans every executable page,
+// writable or not, because an aligned word has no marker that tells code from
+// data.
 func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte, _ bool, _ []uint64) (map[uint16]siteInfo, []winSlotRef, []patchSpan, []uint16, error) {
 	sites := make(map[uint16]siteInfo)
 	var slots []winSlotRef
@@ -343,7 +343,7 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 		var imm uint32
 		switch s.Kind {
 		case siteSVC:
-			if as.p.fast {
+			if as.p.fast && s.Orig == arm64SVC0 {
 				if word, ref, ok := as.fastBranch(ctx, mm, base+uint64(s.Offset)); ok {
 					binary.LittleEndian.PutUint32(page[s.Offset:], word)
 					slots = append(slots, ref)

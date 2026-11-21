@@ -909,3 +909,24 @@ func TestSwitchEmulatesSysRegReadsAndRejectsWrites(t *testing.T) {
 		t.Fatalf("MSR write returned (%v, %v), want SIGILL", sig, err)
 	}
 }
+
+func TestPrepareRunSanitizesA64PstateAllowlist(t *testing.T) {
+	e := newA64Env(t, 0)
+	c, ac := e.newContext()
+	ac.StateData().Regs.Pc = 0x400000
+	// Set NZCV (0xa0000000) alongside forbidden IL (bit 20), SS (bit 21),
+	// DAIF (0x3c0), AArch32 M[4] (0x10), and EL1h M[3:0] (0x5).
+	ac.StateData().Regs.Pstate = 0xa0000000 | (1 << 20) | (1 << 21) | 0x3c0 | 0x15
+	var sawPstate uint64
+	e.fb.onRun = func(vp *fakeVP, exit []byte) error {
+		sawPstate = e.comm(vp).Pstate
+		e.svc(vp, exit, 0x400004, nil)
+		return nil
+	}
+	if sig, _, err := e.switchTo(c, ac); err != nil || sig != nil {
+		t.Fatalf("Switch returned (%v, %v), want syscall", sig, err)
+	}
+	if sawPstate != 0xa0000000 {
+		t.Fatalf("CommPage.Pstate = %#x, want 0xa0000000 (NZCV only)", sawPstate)
+	}
+}

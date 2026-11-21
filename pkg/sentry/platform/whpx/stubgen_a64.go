@@ -30,8 +30,8 @@ const (
 	a64CodeOffVectors = 0x000
 	a64CodeOffCommon  = hvcommon.VectorCommonOffset
 	a64PstateKernel   = hvcommon.PstateEL1h
-	a64PstateModeMask = 0xF
-	a64PstateUserMask = 0x3CF
+	a64PstateModeMask = 0x1F
+	a64PstateUserMask = 0xF0000000
 )
 
 // MAIR_EL1 attribute bytes. Index 0 must be Normal write-back because

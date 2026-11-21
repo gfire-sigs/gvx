@@ -867,3 +867,103 @@ func TestFaultInARelocatedInstructionKeepsTheSlotPinned(t *testing.T) {
 		t.Errorf("pin of the parked thread = %#x, want the slot at %#x", got, want)
 	}
 }
+
+func TestInGuestRangeRejectsWraparound(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	if r.as.inGuestRange(^uint64(3), 8) {
+		t.Fatal("inGuestRange accepted wraparound range [0xfffffffffffffffc, +8)")
+	}
+	if r.as.inGuestRange(r.as.p.userMax-4, 8) {
+		t.Fatal("inGuestRange accepted span crossing userMax")
+	}
+	if !r.as.inGuestRange(r.as.p.userMin, 8) {
+		t.Fatal("inGuestRange rejected valid range at userMin")
+	}
+}
+
+func TestHardenedAMD64RealGuestPaths(t *testing.T) {
+	p := newFastPlatform(t)
+
+	t.Run("gs_vex_vmovdqu_writes_guest_gs_not_host_teb", func(t *testing.T) {
+		r := newRig(t, p)
+		page := r.mapPage(dataVA, hostarch.ReadWrite)
+		store64(page[0x00:], 0x1122_3344_5566_7788)
+		store64(page[0x08:], 0x99AA_BBCC_DDEE_FF00)
+
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, imm64([]byte{0x48, 0xB8}, dataVA)...)              // mov rax, dataVA
+		prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD8)                      // wrgsbase rax
+		prog = append(prog, 0x0F, 0x10, 0x00)                                  // movups xmm0, [rax]
+		prog = append(prog, 0x65, 0xC5, 0xFA, 0x7F, 0x04, 0x25, 0x30, 0, 0, 0) // vmovdqu gs:[0x30], xmm0
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+		if got := load64(page[0x30:]); got != 0x1122_3344_5566_7788 {
+			t.Fatalf("low qword at gs:[0x30] = %#x, want 0x1122334455667788", got)
+		}
+		if got := load64(page[0x38:]); got != 0x99AA_BBCC_DDEE_FF00 {
+			t.Fatalf("high qword at gs:[0x38] = %#x, want 0x99aabbccddeeff00", got)
+		}
+	})
+
+	t.Run("cross_page_gs_read_reports_second_unmapped_page", func(t *testing.T) {
+		r := newRig(t, p)
+		r.mapPage(dataVA, hostarch.ReadWrite)
+		disp := uint16(blockSize - 4)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, imm64([]byte{0x48, 0xB8}, dataVA)...)
+		prog = append(prog, 0xF3, 0x48, 0x0F, 0xAE, 0xD8)
+		prog = append(prog, 0x65, 0x48, 0x8B, 0x1C, 0x25, byte(disp), byte(disp>>8), 0, 0) // mov rbx, gs:[blockSize-4]
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		wantSignal(t, si, err, linux.SIGSEGV)
+		if got, want := si.Addr(), uint64(dataVA)+blockSize; got != want {
+			t.Fatalf("cross-page GS read fault addr = %#x, want %#x", got, want)
+		}
+	})
+
+	t.Run("vex2_with_rsi_and_rdi_promotes_to_vex3_in_guard_slot", func(t *testing.T) {
+		r := newRig(t, p)
+		const vecPageVA = codeVA + 0x10000
+		vecPage := r.mapPage(vecPageVA, hostarch.ReadWrite)
+		store64(vecPage[0x50F:], 0xAAAA_BBBB_CCCC_DDDD)
+		store64(vecPage[0x517:], 0x1234_5678_9ABC_DEF0)
+
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, imm64([]byte{0x48, 0xBE}, vecPageVA-0x1000)...) // mov rsi, vecPageVA-0x1000
+		prog = append(prog, imm64([]byte{0x48, 0xBF}, 0x1000)...)           // mov rdi, 0x1000
+		prog = append(prog, 0xC5, 0xFA, 0x6F, 0x84, 0x3E, 0x0F, 0x05, 0, 0) // vmovdqu xmm0, [rsi+rdi+0x50f]
+		prog = append(prog, imm64([]byte{0x48, 0xB8}, vecPageVA+0x100)...)  // mov rax, vecPageVA+0x100
+		prog = append(prog, 0x0F, 0x11, 0x00)                               // movups [rax], xmm0
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+		if got := load64(vecPage[0x100:]); got != 0xAAAA_BBBB_CCCC_DDDD {
+			t.Fatalf("low qword = %#x, want 0xaaaabbbbccccdddd", got)
+		}
+		if got := load64(vecPage[0x108:]); got != 0x1234_5678_9ABC_DEF0 {
+			t.Fatalf("high qword = %#x, want 0x123456789abcdef0", got)
+		}
+	})
+
+	t.Run("invalid_lock_guarded_insn_raises_sigill", func(t *testing.T) {
+		r := newRig(t, p)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		prog = append(prog, 0xF0, 0x48, 0xB8, 0x0F, 0x05, 0, 0, 0, 0, 0, 0) // lock movabs rax, 0x50f
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		wantSignal(t, si, err, linux.SIGILL)
+	})
+}
