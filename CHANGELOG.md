@@ -2,6 +2,17 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.18.10012026111600] - 2026-11-21
+
+This release fixes `amd64` 32-bit ModRM displacement sign-extension in Windows `systrap` (#222). It also hardens `amd64` and `arm64` decoding, patching, and emulation across `systrap`, `hvcommon`, and `whpx` (#224), and removes throttled forks from the `k3s` B9 CPU sample (#223).
+
+### Bug Fixes
+
+- **Windows `amd64` `systrap` 32-bit ModRM displacement sign-extension (`pkg/sentry/platform/systrap`)** (#222): `decodeX86` now sign-extends negative 32-bit ModRM displacements while keeping direct `moffs` operands unsigned. This fixes `dockerd` startup crashes on Windows `amd64` `systrap`, where guarded instructions with negative RIP-relative displacements computed addresses `0x100000000` too high.
+- **Hardened `amd64` decode, patching, and emulation (`pkg/sentry/platform/systrap`)** (#224): `decodeX86` preserves legal leading segment and address-size prefixes before VEX, EVEX, and `VZEROUPPER`/`VZEROALL`, so `gs:`-prefixed VEX and EVEX instructions patch as `amd64SiteGSMem`. Guarded emulation raises `SIGILL` on invalid `LOCK` prefixes, reads 2 bytes for 16-bit `MOVSXD`, and emulates non-atomic memory `BT`/`BTS`/`BTR`/`BTC`. Scratch planning promotes 2-byte VEX to 3-byte VEX when `RSI` and `RDI` are busy, blocks control transfers and memory `BT*` register forms, and validates x87 operand spans. `inGuestRange` now prevents `uint64` wraparound, and `emulateGSMemSite` probes cross-page read faults and falls back to guarded emulation.
+- **Hardened `arm64` patching, sysreg decode, 16 KB store emulation, and WHPX Pstate (`pkg/sentry/platform/{systrap,hvcommon,whpx}`)** (#224): `scanARM64` patches every `SVC #imm16` encoding so Windows `arm64` guests cannot invoke raw NT syscalls, and `isStoreExclusive` excludes `CASP`/`CASPL`. `DecodeMRSSysRegISS` decodes `Op0` from bit 19 so `op0=2` privileged debug reads raise `SIGILL`. Linux 16 KB `DC ZVA` emulation reads host `DCZID_EL0`, `CASP` accepts `X30`/`XZR`, and `decodeStore` rejects unallocated vector `STTR`. `whpx` `arm64` now sanitizes `Pstate` with an NZCV allowlist (`0xF0000000`) and a 5-bit mode mask (`0x1F`).
+- **`k3s` B9 CPU measurement stability (`e2e`)** (#223): `TestE2EK3sSingleNode` now samples `burn`'s `cpu.stat` from the unthrottled node shell with pure shell `read` built-ins and midpoint uptime bracketing.
+
 ## [v0.18.10002026111600] - 2026-11-20
 
 This release adds opt-in `--auto-publish` (`Config.AutoPublishPorts`) to publish guest TCP listeners and `iptables` NAT `DNAT` ports onto host `127.0.0.1` under host lockdown (#218, #220). It also adds guest loopback fallback for inbound `-p` port forwarders (#219).
