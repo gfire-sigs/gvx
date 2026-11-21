@@ -265,23 +265,49 @@ spec:
 EOF
 k wait --for=condition=Ready pod/burn --timeout=300s >/dev/null 2>&1
 sleep 2
-# Each read takes the usage and the uptime of the guest in one exec. The exec of a
-# process takes seconds on some hosts, so the wall time between the reads is not 5 s.
-# A failed exec gives an empty output, so the sample tries up to five times.
+# Sample burn's cpu.stat from the unthrottled node shell when its cgroup file
+# is visible under /sys/fs/cgroup. That avoids forking helper processes inside
+# the 500m-throttled cgroup, where throttling between reading cpu.stat and
+# reading /proc/uptime can under-report elapsed wall time and inflate the rate.
+read_cpu_sample() {
+  f=$1
+  read up0 _ < /proc/uptime || return 1
+  u=
+  while read key val _; do
+    if [ "$key" = usage_usec ]; then u=$val; break; fi
+  done < "$f"
+  read up1 _ < /proc/uptime || return 1
+  [ -n "$u" ] || return 1
+  cs0=${up0#*.}; cs0=${cs0#0}
+  cs1=${up1#*.}; cs1=${cs1#0}
+  t0=$(( ${up0%.*} * 100 + ${cs0:-0} ))
+  t1=$(( ${up1%.*} * 100 + ${cs1:-0} ))
+  echo "$u $(( (t0 + t1) / 2 ))"
+}
+burn_cid=$(k get pod burn -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null)
+burn_cid=${burn_cid#*://}
+burn_stat=
+if [ -n "$burn_cid" ]; then
+  burn_stat=$(find /sys/fs/cgroup -name cpu.stat 2>/dev/null | grep "$burn_cid" | head -n 1)
+fi
 burn_sample() {
   for i in 1 2 3 4 5; do
-    out=$(k exec burn -- sh -c "grep usage_usec /sys/fs/cgroup/cpu.stat | cut -d' ' -f2; cut -d' ' -f1 /proc/uptime | tr -d ." 2>/dev/null)
+    if [ -n "$burn_stat" ] && [ -r "$burn_stat" ]; then
+      out=$(read_cpu_sample "$burn_stat" 2>/dev/null)
+    else
+      out=$(k exec burn -- sh -c 'read up0 _ < /proc/uptime || exit 1; u=; while read k v _; do [ "$k" = usage_usec ] && { u=$v; break; }; done < /sys/fs/cgroup/cpu.stat; read up1 _ < /proc/uptime || exit 1; [ -n "$u" ] || exit 1; cs0=${up0#*.}; cs0=${cs0#0}; cs1=${up1#*.}; cs1=${cs1#0}; t0=$(( ${up0%.*} * 100 + ${cs0:-0} )); t1=$(( ${up1%.*} * 100 + ${cs1:-0} )); echo "$u $(( (t0 + t1) / 2 ))"' 2>/dev/null)
+    fi
     [ "$(echo $out | wc -w)" = 2 ] && break
     sleep 2
   done
   echo $out
 }
 set -- $(burn_sample); u0=$1; t0=$2
-sleep 5
+sleep 8
 set -- $(burn_sample); u1=$1; t1=$2
 milli=0
 if [ -n "$u0" ] && [ -n "$u1" ] && [ "$t1" -gt "$t0" ]; then milli=$(( (u1 - u0) / ((t1 - t0) * 10) )); fi
-if [ "$milli" -le 600 ] && [ "$milli" -gt 0 ]; then log "B9-CPU-OK $milli"; else fail "B9 cpu ${milli}m"; fi
+if [ "$milli" -le 600 ] && [ "$milli" -gt 0 ]; then log "B9-CPU-OK $milli"; else fail "B9 cpu ${milli}m u0=$u0 u1=$u1 t0=$t0 t1=$t1 stat=$burn_stat"; fi
 if [ "$ENFORCE_MEMORY_MAX" = 1 ]; then
   for i in $(seq 1 60); do
     reason=$(k get pod hog -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}')
