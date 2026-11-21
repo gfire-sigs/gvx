@@ -83,7 +83,7 @@ func BuildSeatbeltProfile(opts Options) string {
 	}
 	switch {
 	case opts.AllowOutboundNet:
-		b.WriteString("(allow network-outbound)\n")
+		b.WriteString(allowOutboundIP)
 		b.WriteString("(allow network-inbound)\n")
 		b.WriteString(denyNewBind)
 		if opts.AllowLoopbackBind {
@@ -107,6 +107,12 @@ func BuildSeatbeltProfile(opts Options) string {
 	b.WriteString("(deny process-exec*)\n")
 	return b.String()
 }
+
+// allowOutboundIP permits new outbound TCP and UDP connections. The filter
+// (remote ip) keeps connect on a Unix domain socket denied. An unfiltered
+// network-outbound rule also matches the path of a host socket, such as the
+// socket of an SSH agent or of a container engine.
+const allowOutboundIP = "(allow network-outbound (remote ip))\n"
 
 // denyNewBind follows every network-inbound allow. network-inbound also
 // grants bind, and only pre-bound sockets may receive traffic.

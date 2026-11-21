@@ -95,7 +95,7 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 			opts: Options{AllowOutboundNet: true},
 			wantAllow: []string{
 				"(allow signal (target children))",
-				"(allow network-outbound)",
+				"(allow network-outbound (remote ip))",
 				"(allow network-inbound)",
 			},
 		},
@@ -104,7 +104,7 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 			opts: Options{AllowOutboundNet: true, AllowLoopbackBind: true},
 			wantAllow: []string{
 				"(allow signal (target children))",
-				"(allow network-outbound)",
+				"(allow network-outbound (remote ip))",
 				"(allow network-inbound)",
 				`(allow network-bind (local ip "localhost:*"))`,
 			},
@@ -131,7 +131,7 @@ func TestSeatbeltProfileAllowsOnlyConfiguredResources(t *testing.T) {
 			opts: Options{AllowOutboundNet: true, OutboundUDPPorts: []uint16{51820}},
 			wantAllow: []string{
 				"(allow signal (target children))",
-				"(allow network-outbound)",
+				"(allow network-outbound (remote ip))",
 				"(allow network-inbound)",
 			},
 		},
