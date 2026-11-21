@@ -27,7 +27,11 @@ package ext4lite
 // new file data. The log is linear. When it is full, the journal flushes the home
 // blocks and starts again with a higher sequence number.
 
-import "sync/atomic"
+import (
+	"cmp"
+	"slices"
+	"sync/atomic"
+)
 
 // disableJournalUpgrade stops the mount from adding a journal to an old volume.
 // The tests set it to run the legacy mode on a volume that has the room.
@@ -235,6 +239,21 @@ func (v *volume) parseJournalExtents(root []byte, blocks, volumeBlocks uint64) (
 	}
 	if next != blocks {
 		return nil, nil, corrupt("journal extents cover %d blocks, the inode has %d", next, blocks)
+	}
+	// Two extents of a damaged journal inode can name the same host blocks.
+	// The journal file is then longer than the blocks that hold it. The scan
+	// of a replay keeps state for each block of the file, so the state grows
+	// far beyond the size of the image. A log block must not lie on an extent
+	// leaf either.
+	runs := slices.Clone(out)
+	for _, lb := range leaves {
+		runs = append(runs, extent{n: 1, pblk: lb})
+	}
+	slices.SortFunc(runs, func(a, b extent) int { return cmp.Compare(a.pblk, b.pblk) })
+	for i := 1; i < len(runs); i++ {
+		if runs[i].pblk < runs[i-1].pend() {
+			return nil, nil, corrupt("journal inode names block %d twice", runs[i].pblk)
+		}
 	}
 	return out, leaves, nil
 }

@@ -350,6 +350,12 @@ func (n *node) xattrsLocked() (*xattrData, error) {
 	if err != nil {
 		return nil, corrupt("inode %d: %v", n.ino, err)
 	}
+	// The parser bounds each value alone, so two entries of a damaged block
+	// can name the same bytes. Such entries need more than one block, and
+	// encodeXattrBlock cannot write them.
+	if xattrBlockSize(es) > blockSize {
+		return nil, corrupt("inode %d: the attributes in xattr block %d do not fit", n.ino, n.fileACL)
+	}
 	n.xa.entries = append(n.xa.entries, es...)
 	n.xa.blockLoaded = true
 	return n.xa, nil

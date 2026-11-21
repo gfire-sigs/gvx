@@ -277,6 +277,16 @@ func openVolume(hf hostFile, opts volumeOptions) (*volume, error) {
 				return nil, err
 			}
 			v.state = le.Uint16(v.sb[sbState:])
+			// The replay can change the size of the volume and the journal
+			// inode. The journal state from before the replay can then name
+			// blocks beyond the end of the volume. The mount reads the journal
+			// again and fails when the new superblock does not accept it.
+			if v.j, err = v.loadJournal(); err != nil {
+				return nil, err
+			}
+			if v.j != nil {
+				v.j.seq = v.j.super.sequence
+			}
 		}
 	}
 
