@@ -393,6 +393,11 @@ func (w *Workspace) openRegularWithAttrLocked(rel string, e entry, flags int) (*
 	if w.closed {
 		return nil, os.ErrClosed
 	}
+	// The read-only flag of the mount is not sufficient, because the guest
+	// can clear it with a remount. The workspace is the owner of the rule.
+	if w.readOnly && flags&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_TRUNC) != 0 {
+		return nil, ErrReadOnly
+	}
 	if e.isDir() {
 		return nil, errIsDir
 	}

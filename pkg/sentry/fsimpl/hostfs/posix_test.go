@@ -1343,6 +1343,30 @@ func TestReadOnlyWorkspaceRejectsMutationsThroughTheVFS(t *testing.T) {
 	wantErrno(t, "mkdir on read-only workspace", e.mkdir("d"), linuxerr.EROFS)
 	wantErrno(t, "rename on read-only workspace", e.rename("f", "h"), linuxerr.EROFS)
 	wantErrno(t, "chmod on read-only workspace", e.setStat("f", linux.Statx{Mask: linux.STATX_MODE, Mode: 0o600}), linuxerr.EROFS)
+
+	// The mount of mountEnv has no read-only flag, as after a remount with
+	// the option rw by the guest. The workspace itself must refuse an open
+	// that can change the data of an existing file.
+	for name, flags := range map[string]uint32{
+		"write open":         linux.O_WRONLY,
+		"read and write":     linux.O_RDWR,
+		"append":             linux.O_WRONLY | linux.O_APPEND,
+		"truncate on open":   linux.O_WRONLY | linux.O_TRUNC,
+		"truncate, read too": linux.O_RDWR | linux.O_TRUNC,
+	} {
+		fd, err := e.open("f", flags, 0)
+		if err == nil {
+			fd.DecRef(e.ctx)
+		}
+		wantErrno(t, name+" on read-only workspace", err, linuxerr.EROFS)
+	}
+	wantErrno(t, "truncate on read-only workspace", e.setStat("f", linux.Statx{Mask: linux.STATX_SIZE, Size: 0}), linuxerr.EROFS)
+	if raw, err := os.ReadFile(dir + "/f"); err != nil || string(raw) != "ro" {
+		t.Fatalf("host file = (%q, %v), want it unchanged", raw, err)
+	}
+	if got := e.readFile("f"); string(got) != "ro" {
+		t.Fatalf("read after the refused opens = %q", got)
+	}
 }
 
 func waitWallClockPast(t *testing.T, ns int64) {
