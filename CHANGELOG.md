@@ -2,6 +2,14 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.19.10002026111600] - 2026-11-21
+
+This release serializes virtual processor creation and partition teardown in `pkg/sentry/platform/whpx` to prevent `HYPERVISOR_ERROR` (`0x00020001`) crashes on Windows `arm64` hosts.
+
+### Bug Fixes
+
+- **Serialized virtual processor creation in WHPX (`pkg/sentry/platform/whpx`)**: `Platform.acquire` now guards `newVP` with `Platform.creating` under `Platform.mu`, so at most one thread calls `WHvCreateVirtualProcessor` on a partition at a time. Virtual processor indices now start in monotonic order (`0`, `1`, `2`, and so on). `Platform.Close` broadcasts and waits for `Platform.creating` to clear before deleting the partition. When `Close` starts during creation, `acquire` releases `Platform.mu` while it destroys the new processor. This prevents `0x00020001` (`HYPERVISOR_ERROR`) host bugchecks on Windows `arm64` during concurrent guest startup and repeated checkpoint restores.
+
 ## [v0.18.10022026111600] - 2026-11-21
 
 This release fixes 14 security findings reported in `GHSA-424c-p5c6-jhhm` across mounts, host lockdown, checkpoint restore, `hostfs`, `oci`, `vxlan`, `ext4lite`, and `klauspost/compress`.
