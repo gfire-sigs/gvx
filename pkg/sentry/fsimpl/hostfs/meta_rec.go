@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"maps"
 	"slices"
+	"strings"
 )
 
 // recKind tells which table a .gvx_meta record belongs to and how its key is
@@ -286,8 +287,29 @@ func (r *byteReader) fileKey() fileKey {
 	return k
 }
 
-// readKey decodes one key. It returns false for a malformed key and for an
-// unknown kind.
+// storedPathEscapes reports whether a path from the metadata file can leave
+// the workspace. The file lies in the workspace, so another party can write
+// it. A stored path is relative and has no ".." component.
+func storedPathEscapes(p string) bool {
+	if strings.HasPrefix(p, "/") {
+		return true
+	}
+	for part := range strings.SplitSeq(p, "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// storedNameEscapes reports whether a name from the metadata file can select
+// an entry outside its directory. A stored name is one path component.
+func storedNameEscapes(name string) bool {
+	return name == ".." || strings.Contains(name, "/")
+}
+
+// readKey decodes one key. It returns false for a malformed key, for an
+// unknown kind, and for a path or a name that can leave the workspace.
 func readKey(r *byteReader) (recKey, bool) {
 	k := recKey{kind: recKind(r.byte())}
 	switch k.kind {
@@ -302,6 +324,9 @@ func readKey(r *byteReader) (recKey, bool) {
 		k.path = r.str()
 		k.name = r.str()
 	default:
+		return recKey{}, false
+	}
+	if storedPathEscapes(k.path) || storedNameEscapes(k.name) {
 		return recKey{}, false
 	}
 	return k, !r.bad
@@ -340,6 +365,9 @@ func readBody(body []byte) (*rec, bool) {
 	if len(r.b) > 0 {
 		out.parent = r.fileKey()
 		out.leaf = r.str()
+	}
+	if storedPathEscapes(out.hint) || storedNameEscapes(out.leaf) {
+		return nil, false
 	}
 	return out, !r.bad
 }
