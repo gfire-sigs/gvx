@@ -75,7 +75,7 @@ These commands work as with a local Docker Engine. Each `docker` command runs on
    docker run --rm alpine wget -qO- http://example.com
    ```
 
-2. Publish a container port inside the published range.
+2. Publish a container port on the host loopback.
 
    ```sh
    docker run -d --name web -p 9000:80 nginx:alpine
@@ -94,7 +94,7 @@ These commands work as with a local Docker Engine. Each `docker` command runs on
    docker build -t app ./app
    ```
 
-5. Start a Compose project. Use host ports inside the published range.
+5. Start a Compose project. With `--auto-publish`, `rungv` opens each published port on `127.0.0.1` automatically.
 
    ```sh
    docker compose up -d
@@ -184,7 +184,7 @@ Use the `ext4lite` volume unless you need the files as host files. The volume im
 
 | Limit | Effect |
 | :--- | :--- |
-| Published host ports | Fixed at the start. A container port outside the published range is reachable only inside the sandbox. |
+| Published host ports | Without `--auto-publish`, static `-p` rules fix published ports at start. With `--auto-publish`, `rungv` binds dynamic ports on `127.0.0.1` only (up to `net.forward.max_dynamic_ports`, default 64). |
 | Guest architecture | The engine runs images for the host architecture. On Apple Silicon, it runs `linux/arm64` images. |
 | `10.0.2.15` from a container | A `bridge` container cannot connect to the `eth0` address of the sandbox. Use the container address or a user-defined network. |
 | `docker stats` | Shows the memory, the CPU time, and the network counters of a container. The memory is `memory.current`, which counts page cache and mapped pages too. A container that wrote 64 MiB showed 64 MiB on `hvf` and 101 MiB on Linux systrap. `BLOCK I/O` stays at `0B / 0B`, because the guest has no `io` controller. |
