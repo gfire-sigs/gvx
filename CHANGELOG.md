@@ -2,6 +2,22 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.18.10022026111600] - 2026-11-21
+
+This release fixes 14 security findings reported in `GHSA-424c-p5c6-jhhm` across mounts, host lockdown, checkpoint restore, `hostfs`, `oci`, `vxlan`, `ext4lite`, and `klauspost/compress`.
+
+### Security
+
+- **Guest-initiated `hostfs` and `erofs` mounts (`pkg/gvx`, `pkg/sentry/fsimpl/hostfs`)** (`GHSA-424c-p5c6-jhhm` H1, H2): `hostfs` and `erofs` no longer allow guest-initiated `mount(2)` calls (`AllowUserMount: false`). Internal boot mounts now set `InternalMount: true`, and `hostfs.FilesystemType.GetFilesystem` refuses mounts that do not supply a pre-opened `Workspace`.
+- **macOS Seatbelt NAT Unix socket restriction (`pkg/hostlockdown`)** (`GHSA-424c-p5c6-jhhm` H3): The macOS NAT Seatbelt profile now restricts outbound network access with `(allow network-outbound (remote ip))`. Locked-down processes can reach IPv4 and IPv6 endpoints, while `connect(2)` calls to host Unix domain sockets fail with `EPERM`.
+- **Checkpoint restore Windows `systrap` opt-in (`pkg/gvx`)** (`GHSA-424c-p5c6-jhhm` H4): `Restore` now rejects a Windows `systrap` platform from `manifest.json` with `ErrPlatformUnavailable` unless the caller sets `-platform=systrap` or `-allow-unconfined-systrap`.
+- **Checkpoint bundle symlink containment (`pkg/gvx`)** (`GHSA-424c-p5c6-jhhm` M2): `Checkpoint` and `Restore` now open `manifest.json`, `state.img`, `pages.meta`, and `pages.img` through `os.Root` after checking that each entry is a regular file. Symbolic links and FIFOs in a bundle directory can no longer redirect reads or writes.
+- **`hostfs` read-only opens and `.gvx_meta` path containment (`pkg/sentry/fsimpl/hostfs`)** (`GHSA-424c-p5c6-jhhm` M1, M4): `openRegularWithAttrLocked` now rejects write, append, and truncate opens on read-only workspaces even after a guest `remount,rw`. The `.gvx_meta` decoder rejects paths outside the workspace, and Unix `walkParent` rejects `..` components with `ErrPathTraversal`.
+- **OCI tar path length, implicit directories, and sparse entries (`pkg/oci`)** (`GHSA-424c-p5c6-jhhm` M8, M9): `tar2erofs` now rejects tar entry paths of `PATH_MAX` bytes or more and counts implicit parent directories against `MaxEntries`. Sparse tar holes now draw from `MaxLayerBytes` and `MaxImageBytes`.
+- **VXLAN transmit nesting limit (`pkg/tcpip/link/vxlan`)** (`GHSA-424c-p5c6-jhhm` M6): `WritePackets` now tracks per-goroutine recursion depth and drops frames beyond 8 nested calls. A guest bridge loop over a VXLAN link can no longer overflow the Go stack.
+- **`ext4lite` aliased block validation (`pkg/sentry/fsimpl/ext4lite`)** (`GHSA-424c-p5c6-jhhm` M10 to M13): Extent tree walks now reject already visited tree blocks, and xattr parsing rejects sets whose total encoded size exceeds one block. Journal parsing rejects overlapping extents, and mounts reload the journal mapping after replay.
+- **Zstd dependency update (`go.mod`, `cmd/rungv/licenses`)** (`GHSA-424c-p5c6-jhhm` M14): Updates `github.com/klauspost/compress` from `v1.18.0` to `v1.20.5` to fix the reachable zstd decoder panic (`GO-2026-6865`) and refreshes third-party license notices.
+
 ## [v0.18.10012026111600] - 2026-11-21
 
 This release fixes `amd64` 32-bit ModRM displacement sign-extension in Windows `systrap` (#222). It also hardens `amd64` and `arm64` decoding, patching, and emulation across `systrap`, `hvcommon`, and `whpx` (#224), and removes throttled forks from the `k3s` B9 CPU sample (#223).
