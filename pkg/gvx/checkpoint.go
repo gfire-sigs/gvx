@@ -112,7 +112,7 @@ func openCheckpointBundleFiles(dir string) (*checkpointBundleFiles, error) {
 	files := &checkpointBundleFiles{dir: dir}
 	openWritable := func(name string) (*os.File, error) {
 		p := filepath.Join(dir, name)
-		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o600)
+		f, err := openBundleFile(dir, name, os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {
 			return nil, fmt.Errorf("gvx: pre-open checkpoint file %q: %w", p, err)
 		}

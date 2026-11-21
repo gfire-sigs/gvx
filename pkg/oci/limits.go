@@ -50,13 +50,16 @@ type Limits struct {
 	MaxJSONBytes int64
 	// MaxBlobBytes bounds one compressed layer blob.
 	MaxBlobBytes int64
-	// MaxLayerBytes bounds the decompressed tar stream of one layer.
+	// MaxLayerBytes bounds the decompressed tar stream of one layer. The holes
+	// of sparse tar entries count as stream bytes.
 	MaxLayerBytes int64
-	// MaxImageBytes bounds the decompressed tar streams of all layers of one image.
+	// MaxImageBytes bounds the decompressed tar streams of all layers of one
+	// image. The holes of sparse tar entries count as stream bytes.
 	MaxImageBytes int64
 	// MaxEntryBytes bounds the content of one regular file.
 	MaxEntryBytes int64
-	// MaxEntries bounds the number of tar entries of one layer.
+	// MaxEntries bounds the number of tar entries of one layer. A directory
+	// that an entry implies but no earlier entry created counts as one entry.
 	MaxEntries int64
 	// MaxArchiveEntries bounds the number of members of an image archive.
 	MaxArchiveEntries int64
@@ -168,6 +171,19 @@ func (b *boundedReader) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// charge draws n bytes that a consumer of the stream produced without a read
+// from r. The holes of a sparse tar entry are such bytes.
+func (b *boundedReader) charge(n int64) error {
+	b.n += n
+	if b.n > b.limit {
+		return &LimitError{What: b.what, Limit: b.limit}
+	}
+	if b.shared != nil {
+		return b.shared.take(n)
+	}
+	return nil
 }
 
 // readAllBounded reads r to EOF and fails if it holds more than limit bytes.

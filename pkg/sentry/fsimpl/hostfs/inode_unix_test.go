@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -203,5 +204,61 @@ func TestListingOfLargeDirectoryReturnsEveryName(t *testing.T) {
 		if name := fmt.Sprintf("a-long-entry-name-%05d", i); !seen[name] {
 			t.Fatalf("listing of %d entries misses %q (%d names)", n, name, len(entries))
 		}
+	}
+}
+
+// TestHostRootRefusesParentComponents proves that no host operation follows a
+// ".." component out of the workspace. O_NOFOLLOW does not stop that
+// component, so the walk must refuse it.
+func TestHostRootRefusesParentComponents(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	wsDir := filepath.Join(base, "ws")
+	if err := os.Mkdir(wsDir, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	victim := filepath.Join(base, "victim")
+	if err := os.WriteFile(victim, []byte("host-data"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	e := newEnvInDirWithOptions(t, wsDir, workspaceOptions{coalesce: defaultCoalesceWindow})
+	e.mustMkdir("sub")
+	e.writeFile("inside", []byte("x"))
+
+	// The same operations work on a path in the workspace.
+	if _, err := e.ws.host.readDir("sub"); err != nil {
+		t.Fatalf("readDir(sub): %v", err)
+	}
+	for name, op := range map[string]func() error{
+		"open":        func() error { f, err := e.ws.host.open("../victim", os.O_RDONLY, 0); closeIfOpen(f); return err },
+		"open nested": func() error { f, err := e.ws.host.open("sub/../../victim", os.O_RDONLY, 0); closeIfOpen(f); return err },
+		"lstat":       func() error { _, err := e.ws.host.lstat("../victim"); return err },
+		"unlink":      func() error { return e.ws.host.unlink("../victim") },
+		"mkdir":       func() error { return e.ws.host.mkdir("../made") },
+		"rename out":  func() error { return e.ws.host.rename("inside", "../moved") },
+		"rename in":   func() error { return e.ws.host.rename("../victim", "stolen") },
+		"link":        func() error { return e.ws.host.link("../victim", "linked") },
+		"readDir":     func() error { _, err := e.ws.host.readDir("../ws"); return err },
+		"final name":  func() error { _, err := e.ws.host.readDir("sub/.."); return err },
+	} {
+		if err := op(); !errors.Is(err, ErrPathTraversal) {
+			t.Errorf("%s with a \"..\" component = %v, want ErrPathTraversal", name, err)
+		}
+	}
+	if raw, err := os.ReadFile(victim); err != nil || string(raw) != "host-data" {
+		t.Errorf("file outside the workspace = (%q, %v), want it unchanged", raw, err)
+	}
+	for _, leaked := range []string{"made", "moved"} {
+		if _, err := os.Lstat(filepath.Join(base, leaked)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("an operation created %s outside the workspace: %v", leaked, err)
+		}
+	}
+}
+
+func closeIfOpen(f *os.File) {
+	if f != nil {
+		_ = f.Close()
 	}
 }

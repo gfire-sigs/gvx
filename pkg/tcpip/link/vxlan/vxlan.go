@@ -35,6 +35,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/atomicbitops"
 	"z.gfire.dev/gvx/pkg/buffer"
+	"z.gfire.dev/gvx/pkg/goid"
 	"z.gfire.dev/gvx/pkg/tcpip"
 	"z.gfire.dev/gvx/pkg/tcpip/checksum"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
@@ -68,6 +69,10 @@ const (
 	// inner frame plus Overhead4 or Overhead6 bytes, so the MTU of the link
 	// stays at maxPacket minus that overhead.
 	maxPacket = 65535
+
+	// maxTransmitNesting is the largest count of WritePackets calls that one
+	// goroutine has open at one time. It is XMIT_RECURSION_LIMIT of Linux.
+	maxTransmitNesting = 8
 
 	headerLen = 8
 	// flagVNI is the I flag: the VNI field is valid.
@@ -215,6 +220,41 @@ var vxlanNICs sync.Map
 
 func deleteVxlanNIC(key nicKey) {
 	vxlanNICs.Delete(key)
+}
+
+// transmitNesting counts the open WritePackets calls of each goroutine. The
+// key is the goroutine ID. The vxlanNICs guard reads only the outgoing NIC of
+// the outer route. An outer packet can thus return to a vxlan link through
+// another device on the same goroutine. A bridge with the link as a port is
+// such a device. The stack overflow that follows ends the process, and recover
+// cannot stop it. Linux counts the nesting on each CPU (dev_xmit_recursion).
+var transmitNesting struct {
+	sync.Mutex
+	m map[int64]int
+}
+
+// enterTransmit opens one WritePackets call for the goroutine id. It returns
+// false and opens nothing when the goroutine is at maxTransmitNesting.
+func enterTransmit(id int64) bool {
+	transmitNesting.Lock()
+	defer transmitNesting.Unlock()
+	if transmitNesting.m[id] >= maxTransmitNesting {
+		return false
+	}
+	if transmitNesting.m == nil {
+		transmitNesting.m = make(map[int64]int)
+	}
+	transmitNesting.m[id]++
+	return true
+}
+
+// leaveTransmit closes one WritePackets call of the goroutine id.
+func leaveTransmit(id int64) {
+	transmitNesting.Lock()
+	defer transmitNesting.Unlock()
+	if transmitNesting.m[id]--; transmitNesting.m[id] == 0 {
+		delete(transmitNesting.m, id)
+	}
 }
 
 // Endpoint is a VXLAN link endpoint.
@@ -713,8 +753,14 @@ func (e *Endpoint) IsAttached() bool {
 
 // WritePackets implements stack.LinkEndpoint. It encapsulates each frame and
 // sends the copies on the calling goroutine. Like a device of Linux, the link
-// never fails a write: it drops a frame that has no remote or no route.
+// never fails a write: it drops a frame that has no remote or no route. It
+// also drops the frames of a call that exceeds maxTransmitNesting.
 func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	id := goid.Get()
+	if !enterTransmit(id) {
+		return pkts.Len(), nil
+	}
+	defer leaveTransmit(id)
 	n := 0
 	for _, pkt := range pkts.AsSlice() {
 		e.transmit(pkt)

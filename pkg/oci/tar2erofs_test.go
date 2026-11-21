@@ -600,3 +600,138 @@ func TestEncodeXattrIbodyBoundsInlineSize(t *testing.T) {
 		t.Errorf("encodeXattrIbody above the limit = %v, want an inline space error", err)
 	}
 }
+
+func TestCompileBoundsTarPathLength(t *testing.T) {
+	// A name of PATH_MAX-1 bytes is the longest path that Linux can open.
+	component := strings.Repeat("n", erofs.MaxNameLen)
+	longest := strings.Repeat(component+"/", 15) + component
+	if len(longest) != linux.PATH_MAX-1 {
+		t.Fatalf("test name has %d bytes, want %d", len(longest), linux.PATH_MAX-1)
+	}
+	p, _ := compileTar(t, buildTar(t, fileEntry(longest, "x")))
+	if _, ok := readImage(t, p)["/"+longest]; !ok {
+		t.Error("the file at a path of PATH_MAX-1 bytes is missing")
+	}
+
+	// One more byte is enough for a name of 2048 components. Without a bound
+	// on the name, a PAX path of 1 MiB yields about 524,000 nested directories.
+	deep := strings.Repeat("a/", 2047) + "aa"
+	if len(deep) != linux.PATH_MAX {
+		t.Fatalf("test name has %d bytes, want %d", len(deep), linux.PATH_MAX)
+	}
+	for name, entry := range map[string]tarEntry{
+		"file":      fileEntry(deep, "x"),
+		"directory": dirEntry(deep + "/"),
+		"symlink":   symlinkEntry(deep, "target"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := CompileTarToEROFS(bytes.NewReader(buildTar(t, entry)), newMemImage())
+			if err == nil || !strings.Contains(err.Error(), "the limit is 4095 bytes") {
+				t.Errorf("err = %v, want a name length error", err)
+			}
+		})
+	}
+}
+
+func TestCompileCountsImplicitDirectoriesAsEntries(t *testing.T) {
+	lim := DefaultLimits()
+	lim.MaxEntries = 8
+
+	// One tar entry below seven absent directories adds eight nodes.
+	fits := buildTar(t, fileEntry("1/2/3/4/5/6/7/f", "x"))
+	if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(fits), newMemImage(), lim); err != nil {
+		t.Errorf("an entry that adds 8 nodes failed under the limit of 8: %v", err)
+	}
+	// A later entry for an existing directory adds one entry and no node.
+	fits = buildTar(t, fileEntry("1/2/3/4/5/6/f", "x"), dirEntry("1/2/3/"))
+	if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(fits), newMemImage(), lim); err != nil {
+		t.Errorf("entries that add 7 nodes failed under the limit of 8: %v", err)
+	}
+
+	over := buildTar(t, fileEntry("1/2/3/4/5/6/7/8/f", "x"))
+	if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(over), newMemImage(), lim); !errors.Is(err, ErrLimitExceeded) {
+		t.Errorf("an entry that adds 9 nodes: err = %v, want ErrLimitExceeded", err)
+	}
+	// Each entry below adds its own chain of absent directories.
+	over = buildTar(t, fileEntry("a/1/2/f", "x"), fileEntry("b/1/2/f", "x"), fileEntry("c/f", "x"))
+	if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(over), newMemImage(), lim); !errors.Is(err, ErrLimitExceeded) {
+		t.Errorf("entries that add 10 nodes: err = %v, want ErrLimitExceeded", err)
+	}
+}
+
+// paxSparseHole returns an archive with one PAX 1.0 sparse entry named "hole".
+// The entry has realSize zero bytes and no data runs in the stream.
+func paxSparseHole(realSize int64) []byte {
+	paxData := paxRecords(map[string]string{
+		"GNU.sparse.major": "1", "GNU.sparse.minor": "0",
+		"GNU.sparse.name": "hole", "GNU.sparse.realsize": fmt.Sprint(realSize),
+	})
+	// The sparse map has zero runs.
+	section := padBlock([]byte("0\n"))
+	var raw []byte
+	raw = append(raw, ustarHeader("PaxHeaders/hole", tar.TypeXHeader, int64(len(paxData)))...)
+	raw = append(raw, padBlock(paxData)...)
+	raw = append(raw, ustarHeader("GNUSparseFile.0/hole", tar.TypeReg, int64(len(section)))...)
+	raw = append(raw, section...)
+	return append(raw, make([]byte, 1024)...)
+}
+
+// gnuSparseHole returns an archive with one old GNU sparse entry named "hole".
+// The entry has realSize zero bytes and no data runs in the stream.
+func gnuSparseHole(realSize int64) []byte {
+	h := ustarHeader("hole", tar.TypeGNUSparse, 0)
+	copy(h[257:265], "ustar  \x00")
+	// One empty run at the end of the file makes the whole file a hole.
+	copy(h[386:398], fmt.Sprintf("%011o\x00", realSize))
+	copy(h[398:410], fmt.Sprintf("%011o\x00", 0))
+	copy(h[483:495], fmt.Sprintf("%011o\x00", realSize))
+	copy(h[148:156], "        ")
+	sum := 0
+	for _, b := range h {
+		sum += int(b)
+	}
+	copy(h[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	return append(h, make([]byte, 1024)...)
+}
+
+func TestCompileChargesSparseHolesToByteBudgets(t *testing.T) {
+	const realSize = 32 << 20
+	for name, build := range map[string]func(int64) []byte{"PAX 1.0": paxSparseHole, "old GNU": gnuSparseHole} {
+		t.Run(name, func(t *testing.T) {
+			// A hole within the budgets still compiles to a file of its real size.
+			p, _ := compileTar(t, build(1<<20))
+			if n := readImage(t, p)["/hole"]; n == nil || n.size != 1<<20 {
+				t.Fatalf("sparse entry of 1 MiB compiled to %+v", n)
+			}
+
+			raw := build(realSize)
+			if len(raw) > 4<<10 {
+				t.Fatalf("test input has %d bytes, want a stream far below the budgets", len(raw))
+			}
+			lim := DefaultLimits()
+			lim.MaxLayerBytes = 1 << 20
+			lim.MaxEntryBytes = 64 << 20
+			if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(raw), newMemImage(), lim); !errors.Is(err, ErrLimitExceeded) {
+				t.Errorf("layer budget: err = %v, want ErrLimitExceeded", err)
+			}
+
+			lim.MaxLayerBytes = 1 << 30
+			image := newByteBudget("decompressed image size", 1<<20)
+			if _, err := compileLayer(bytes.NewReader(raw), newMemImage(), lim, DefaultBlockSize, image, nil); !errors.Is(err, ErrLimitExceeded) {
+				t.Errorf("image budget: err = %v, want ErrLimitExceeded", err)
+			}
+			// The compiler stops within one streaming read after the budget runs out.
+			if over := -image.remaining.Load(); over > copyBytes {
+				t.Errorf("the compiler read %d bytes beyond the image budget, want at most %d", over, copyBytes)
+			}
+		})
+	}
+
+	// A dense file draws its bytes from the layer budget one time only.
+	lim := DefaultLimits()
+	lim.MaxLayerBytes = 1 << 20
+	dense := buildTar(t, fileEntry("dense", string(patternBytes(600<<10, 5))))
+	if _, err := CompileTarToEROFSWithLimits(bytes.NewReader(dense), newMemImage(), lim); err != nil {
+		t.Errorf("a dense file of 600 KiB failed under a layer budget of 1 MiB: %v", err)
+	}
+}

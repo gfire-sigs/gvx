@@ -179,3 +179,39 @@ func TestMetaTableKeepsItsIndexesInStepWithTheRecords(t *testing.T) {
 		t.Fatalf("an empty table has size %d and %d bytes", tab.size(), tab.memBytes())
 	}
 }
+
+// TestRecordDecoderRefusesEscapingPaths proves that a record of .gvx_meta
+// cannot name a path outside the workspace. The file lies in the workspace,
+// so a party that supplies the directory also supplies the file.
+func TestRecordDecoderRefusesEscapingPaths(t *testing.T) {
+	attr := &rec{attr: POSIXAttr{Mode: 0o100644}}
+	bad := []metaOp{
+		{key: recKey{kind: kindPath, path: "../outside"}, r: attr},
+		{key: recKey{kind: kindPath, path: "dir/../../outside"}, r: attr},
+		{key: recKey{kind: kindPath, path: ".."}, r: attr},
+		{key: recKey{kind: kindPath, path: "/etc/passwd"}, r: attr},
+		{key: recKey{kind: kindPathName, path: "../..", name: "x"}, r: attr},
+		{key: recKey{kind: kindPathName, path: "dir", name: ".."}, r: attr},
+		{key: recKey{kind: kindPathName, path: "dir", name: "../x"}, r: attr},
+		{key: recKey{kind: kindName, id: fileKey{dev: 1, ino: 2}, name: ".."}, r: attr},
+		{key: recKey{kind: kindPath, path: "../outside"}},
+		{key: recKey{kind: kindInode, id: fileKey{dev: 1, ino: 2}}, r: attr.withHint("../../outside")},
+		{key: recKey{kind: kindInode, id: fileKey{dev: 1, ino: 2}}, r: attr.withLoc("dir/f", fileKey{dev: 1, ino: 3}, "../f")},
+	}
+	for _, op := range bad {
+		if got, _, ok := readOp(appendOp(nil, op)); ok {
+			t.Errorf("readOp accepted key %+v with record %+v", got.key, got.r)
+		}
+	}
+	good := []metaOp{
+		{key: recKey{kind: kindPath, path: "dir/..name/file"}, r: attr},
+		{key: recKey{kind: kindPath, path: "..."}, r: attr},
+		{key: recKey{kind: kindPathName, path: ".", name: "..x"}, r: attr},
+		{key: recKey{kind: kindInode, id: fileKey{dev: 1, ino: 2}}, r: attr.withLoc("dir/f", fileKey{dev: 1, ino: 3}, "f")},
+	}
+	for _, op := range good {
+		if _, _, ok := readOp(appendOp(nil, op)); !ok {
+			t.Errorf("readOp refused key %+v", op.key)
+		}
+	}
+}
