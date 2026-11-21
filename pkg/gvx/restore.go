@@ -121,19 +121,12 @@ const maxManifestBytes = 1 << 20
 
 // readManifestBytes reads manifest.json from path and fails when the file is
 // larger than maxManifestBytes, before the whole file reaches memory.
-func readManifestBytes(path string) ([]byte, error) {
-	f, err := os.Open(path)
+func readManifestBytes(dir string) ([]byte, error) {
+	f, err := openBundleFile(dir, checkpointManifestFileName, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("not a regular file (mode %v)", st.Mode())
-	}
 	data, err := io.ReadAll(io.LimitReader(f, maxManifestBytes+1))
 	if err != nil {
 		return nil, err
@@ -146,7 +139,7 @@ func readManifestBytes(path string) ([]byte, error) {
 
 func readAndParseManifest(dir string) (CheckpointManifest, error) {
 	manifestPath := filepath.Join(dir, checkpointManifestFileName)
-	data, err := readManifestBytes(manifestPath)
+	data, err := readManifestBytes(dir)
 	if err != nil {
 		return CheckpointManifest{}, fmt.Errorf("%w: read %q: %w", ErrCheckpointManifest, manifestPath, err)
 	}
@@ -339,7 +332,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 
 	openReadOnly := func(name string) (*os.File, error) {
 		p := filepath.Join(opts.Dir, name)
-		f, oErr := os.Open(p)
+		f, oErr := openBundleFile(opts.Dir, name, os.O_RDONLY, 0)
 		if oErr != nil {
 			return nil, fmt.Errorf("gvx: open checkpoint file %q: %w", p, oErr)
 		}
