@@ -1,79 +1,79 @@
 # The `rungv` Command Line
 
-`rungv` runs one OCI image or one Linux ELF64 binary in the foreground. Its flags and its output follow the Docker command line where the sandbox can keep the same meaning. This document is the reference for every command, every flag of `rungv run`, and every difference from Docker. The architecture of the sandbox is in [`architecture.md`](architecture.md).
+`rungv` runs an OCI image or a Linux ELF64 binary in the foreground. Its flags and output follow the Docker CLI wherever the single-process sandbox model matches. This document covers every subcommand, every `rungv run` flag, runtime tunables, and all differences from Docker. See [`architecture.md`](architecture.md) for the internal architecture.
 
 ## 1. Model
 
-`rungv` has no daemon. A run starts a sandbox, runs the guest command, and removes everything when the guest exits. Every run therefore behaves like `docker run --rm`.
+`rungv` has no background daemon. Each run starts a sandbox, executes the guest command, and tears down everything on exit, behaving like `docker run --rm`.
 
-By default, writes from the guest go to a memory-backed layer on top of the read-only image layers. Data outlives the run only when it goes to a bind mount, a named volume, a `-rootfs-volume` image, or the image store of the host.
+By default, guest writes go to an ephemeral memory-backed layer above the read-only image layers. Data persists after exit only in a bind mount, a named volume, a `-rootfs-volume` image, or the host image store.
 
-The host process locks itself down before the guest starts. After that point it cannot open a new host file, start a process, or create a socket. Every host resource of a run exists before the lockdown. This rule is the reason that `rungv` has no `exec`, no `logs`, and no `-d` in this stage.
+The host process locks itself down before the guest starts. After lockdown, it cannot open unbound host files, spawn child processes, or bind arbitrary sockets (unless `--auto-publish` opts into host `127.0.0.1` loopback binds). Because every host resource is prepared up front and no daemon exists, `rungv` has no `exec`, `logs`, or `-d` mode.
 
 ## 2. Commands
 
-Run `rungv help` to print this list.
+Run `rungv help` to print this command list.
 
 | Command | Purpose |
 | :--- | :--- |
-| `run` | Run a command in an image or in an ELF binary. |
+| `run` | Run a command in an OCI image or a Linux ELF64 binary. |
 | `pull` | Download an image into the layer cache (`--platform linux/ARCH` selects the architecture). |
-| `images` | List the images of the cache. |
-| `inspect` | Print the metadata of images as JSON or through a Go template. |
-| `tag` | Give an image a second name. |
-| `rmi` | Remove a name of an image, or the image. |
-| `save` | Write images to a tar archive. |
-| `load` | Read images from a tar archive. |
+| `images` | List cached images. |
+| `inspect` | Print image metadata as JSON or through a Go template. |
+| `tag` | Add a second name or tag to a cached image. |
+| `rmi` | Remove an image tag or delete an unreferenced image. |
+| `save` | Export images to a tar archive. |
+| `load` | Import images from a tar archive. |
 | `image` | Group command for `ls`, `pull`, `rm`, `inspect`, `tag`, `save`, `load`, and `prune`. |
-| `volume` | Group command for `create`, `ls`, `inspect`, `rm`, and `prune` on local volumes. |
+| `volume` | Group command for `create`, `ls`, `inspect`, `compact`, `rm`, and `prune` on local volumes. |
 | `system` | Group command for `info`, `df`, and `prune` on host backends and local storage. |
 | `info` | Print the host OS, available execution backends, lockdown profile, and storage paths. |
 | `checkpoint` | Write a checkpoint bundle for a running sandbox over its control socket (alias: `snapshot`). |
 | `restore` | Restore and run a sandbox from a checkpoint bundle directory (alias: `resume`). |
-| `login` | Store the credentials of a registry. |
-| `logout` | Remove the credentials of a registry. |
+| `login` | Store registry credentials. |
+| `logout` | Remove registry credentials. |
 | `completion` | Print shell completion scripts for `bash`, `zsh`, `fish`, or `powershell`. |
-| `stub` | Probe the `systrap` engine of this host. |
-| `tune` | List the host-side tunables. Section 3.3 describes them. |
-| `license` | Print the license texts of `gvx`, of its upstream code, and of the libraries in the binary. Section 9 describes it. |
-| `version` | Print the version, the source commit, and the Go toolchain of the binary. Section 10 describes it. |
+| `stub` | Probe the `systrap` engine on this host. |
+| `tune` | List host-side tunables (see Section 3.3). |
+| `license` | Print license texts for `gvx`, upstream gVisor, and linked libraries (see Section 9). |
+| `version` | Print the version, source commit, and Go toolchain of the binary (see Section 10). |
 
-Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Every flag accepts both single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags either before or after positional arguments.
+Print the flags of any subcommand with `rungv COMMAND --help`. On `run`, `-h` sets the hostname, as in Docker. Every flag accepts single-dash (`-e`) and double-dash (`--env`) forms. On `run`, flags precede the image argument, and short clusters expand boolean flags (`-itP`) and value flags (`-itp 8080:80`, `-p8080:80`, `-eKEY=VAL`, `-w/app`, `-m512m`). Arguments after `--` or after the image name pass unchanged to the guest command. Non-execution commands (`pull`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`, `image`, `volume`, `system`, `info`, `checkpoint`, `restore`) accept flags before or after positional arguments.
 
 ## 3. `rungv run`
 
-The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first argument that is not a flag names the image. The arguments after it replace the `Cmd` of the image and keep its `Entrypoint`. The synopsis `rungv run [flags] -bin=ELF [ARG...]` runs a host ELF binary with the arguments as the whole command vector.
+The synopsis is `rungv run [flags] IMAGE [COMMAND [ARG...]]`. The first non-flag argument names the image. Later arguments replace the image `Cmd` while keeping its `Entrypoint`. The form `rungv run [flags] -bin=ELF [ARG...]` runs a host ELF64 binary with the trailing arguments as its full `argv`.
 
 ### 3.1 Docker flags
 
-The table below lists the `rungv run` flags that match the Docker command line.
+The table below lists the `rungv run` flags that match the Docker CLI.
 
 | Flag | Meaning |
 | :--- | :--- |
-| `-e`, `--env KEY=VALUE` | Set a variable. `KEY` alone copies it from the host and sets nothing when the host has none. |
-| `--env-file FILE` | Read `KEY=VALUE` and `KEY` lines. Blank lines and lines that start with `#` are skipped. |
-| `--entrypoint PROGRAM` | Replace the image entrypoint. An empty value clears it. The image `Cmd` is dropped. |
-| `-u`, `--user USER[:GROUP]` | Run as a user, by name or by number. |
-| `-h`, `--hostname NAME` | Set the hostname. The default is `gvx`. |
-| `-w`, `--workdir DIR` | Set the working directory inside the guest (applies to `restore` as well). |
-| `--name NAME` | Set the container name. It becomes the container ID of the kernel and has no other effect. |
-| `--rm` | Accepted. Every run removes its container. |
-| `-i` | Accepted. The guest always reads the standard input of `rungv`. |
+| `-e`, `--env KEY=VALUE` | Set an environment variable. `KEY` alone copies the variable from the host if set. |
+| `--env-file FILE` | Read `KEY=VALUE` and `KEY` lines, skipping blank lines and `#` comments. |
+| `--entrypoint PROGRAM` | Replace the image entrypoint (empty string clears it) and drop the image `Cmd`. |
+| `-u`, `--user USER[:GROUP]` | Run as a guest user by name or numeric ID. |
+| `-h`, `--hostname NAME` | Set the guest hostname (default: `gvx`). |
+| `-w`, `--workdir DIR` | Set the guest working directory (also supported on `restore`). |
+| `--name NAME` | Set the kernel container ID; has no other lifecycle effect. |
+| `--rm` | Accepted for compatibility; every run cleans up on exit. |
+| `-i` | Accepted for compatibility; the guest always reads `rungv` stdin. |
 | `-t` | Allocate a pseudo-terminal. |
-| `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. A missing host port or the host port `0` asks for a free port. The default bind address is `127.0.0.1`. A range such as `8000-8009:8000-8009` publishes each port. `unix:PATH:GUEST` publishes a guest TCP port on a host Unix socket. Section 4.7 gives the rules. |
-| `-P` | Publish every port that the image declares with `EXPOSE` to a free port of `127.0.0.1`. |
-| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` while the sandbox runs. Static `-p` rules keep precedence. Section 4.7 gives the rules. |
-| `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, one host file, or a named volume. |
-| `--mount type=bind\|volume\|tmpfs,src=...,dst=...,readonly[,driver=ext4lite\|hostfs]` | Mount with the Docker key syntax. The `driver` key applies to `type=volume` only. A `type=volume` source with a path separator names an image file. |
+| `-p`, `--publish [IP:][HOST:]GUEST[/PROTO]` | Publish a guest port. Omitting the host port or using `0` picks a free port on `127.0.0.1`. Ranges like `8000-8009:8000-8009` publish each port. `unix:PATH:GUEST` exposes a guest TCP port on a host Unix socket (see Section 4.7). |
+| `-P` | Publish every port declared by image `EXPOSE` to a free `127.0.0.1` port. |
+| `--auto-publish` | Automatically publish guest TCP listeners and `iptables` NAT `DNAT` ports on host `127.0.0.1` while the sandbox runs. Static `-p` rules keep precedence (see Section 4.7). |
+| `-v`, `--volume SRC:DST[:ro\|rw]` | Mount a host directory, a single host file, or a named volume. |
+| `--mount type=bind\|volume\|tmpfs\|overlay,src=...,dst=...,readonly[,driver=ext4lite\|hostfs][,upper=...][,tmpfs-size=...]` | Mount using Docker key-value syntax. `driver` applies to `type=volume` only; a volume `src` with a path separator names a host `.ext4` file. `type=overlay` mounts a copy-on-write branch over a read-only base volume. |
 | `--tmpfs PATH[:size=64m,ro]` | Mount a memory-backed directory. |
-| `--read-only` | Mount the root file system of the guest read-only. This option cannot combine with `-rootfs-volume`. |
-| `-m`, `--memory SIZE` | Limit the guest memory. The units are `b`, `k`, `m`, `g`, and `t`. The minimum is 6m. |
-| `--cpus N` | Limit the CPU quota. The value is a decimal number, such as `1.5`. |
-| `--network NAME` | `bridge` and `nat` select the NAT mode. `none` and `wg` are the other modes. `host` is refused. |
-| `--platform linux/ARCH` | Select the architecture of the image: `linux/amd64` or `linux/arm64`. |
-| `--pull POLICY` | Select when the image comes from its registry: `missing` (the default, as in Docker), `always`, or `never`. Section 5.1 describes the policies. |
+| `--read-only` | Mount the guest root filesystem read-only (cannot combine with `-rootfs-volume`). |
+| `-m`, `--memory SIZE` | Limit guest memory (`b`, `k`, `m`, `g`, `t`; minimum `6m`). |
+| `--cpus N` | Set the guest CPU count and quota as a decimal value, such as `1.5`. |
+| `--network NAME` | `bridge` and `nat` select NAT mode; `none` and `wg` are the other modes; `host` is refused. |
+| `--platform linux/ARCH` | Select the image architecture: `linux/amd64` or `linux/arm64`. |
+| `--pull POLICY` | Control registry pulls: `missing` (default), `always`, or `never` (see Section 5.1). |
 
-The flag `-d` is refused with a message, because a run has no daemon.
+The flag `-d` is refused with an error because `rungv` has no background daemon.
 
 ### 3.2 gvx flags
 
@@ -81,45 +81,45 @@ The table below lists the sandbox flags specific to `gvx`.
 
 | Flag | Meaning |
 | :--- | :--- |
-| `-image REF`, `-bin ELF` | Name the image or the binary without a positional argument. |
-| `-backend`, `--backend BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. Combine it with `--platform linux/ARCH` when selecting both the image architecture and the backend. |
-| `-platform BACKEND` | Legacy alias for `-backend` (`auto`, `whpx`, `hvf`, or `systrap`) when the value has no slash. A value with a slash (`linux/amd64` or `linux/arm64`) selects the image platform. Setting both `-backend` and `-platform BACKEND` to different engines is an error. |
-| `-allow-unconfined-systrap` | Allow `-backend=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted workloads on Windows require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
-| `-arch ARCH` | Select the guest architecture. The default is the host architecture. |
+| `-image REF`, `-bin ELF` | Specify the image or ELF binary without a positional argument. |
+| `-backend`, `--backend BACKEND` | Select the execution backend: `auto`, `whpx`, `hvf`, or `systrap`. Combine with `--platform linux/ARCH` to specify both image architecture and backend. |
+| `-platform BACKEND` | Legacy alias for `-backend` (`auto`, `whpx`, `hvf`, or `systrap`) when the value has no slash. Values with a slash (`linux/amd64`, `linux/arm64`) select the image platform. Setting both `-backend` and `-platform BACKEND` to different engines fails. |
+| `-allow-unconfined-systrap` | Allow `-backend=auto` on Windows to fall back to `systrap` when `whpx` is unavailable. Untrusted Windows workloads require `whpx`, because Windows `systrap` has no hardware or kernel syscall trap. |
+| `-arch ARCH` | Select the guest architecture (defaults to the host architecture). |
 | `-workspace DIR`, `-ro` | Mount a host directory at `/workspace`, optionally read-only. |
 | `-rootfs-volume NAME\|PATH` | Mount a managed `.ext4` volume or host `.ext4` file as the persistent root overlay upper layer (`upper` and `work`). |
-| `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode and its options. |
-| `--privileged` | On by default. Turns on `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` turns them off. A flag of the three that you set wins over `--privileged`. Section 4.8 describes the boundary. |
-| `--net-raw` | Let the guest open raw sockets and use `iptables`. `dockerd` needs it. The default comes from `--privileged`. |
-| `--allow-packet-socket-write` | Let the guest send on `AF_PACKET` sockets. It needs `--net-raw`. The default comes from `--privileged`, and it is off when `--net-raw` is off. |
-| `--allow-suid` | Obey the set-user-ID and set-group-ID bits of guest executables. `sudo`, `su`, and `passwd` need it for a user that is not root. The default comes from `--privileged`. |
-| `--host-ca-certs` | Make the guest trust the root certificates that the host trusts. Off by default. Section 4.10 describes the sources, the files, and the limits. |
-| `-registry-url URL` | Override the registry of the image reference. |
-| `--host-dns IP[:PORT]` | Name a DNS server of the host. The flag repeats. The servers replace the discovery of the host resolver for the DNS relay of the guest and for the registry requests. `pull` and `save` take it too. Section 5.2 gives the reason. |
-| `-cache-dir DIR` | Select the layer cache directory. |
-| `-checkpoint-dir DIR` | Pre-open a host directory before the lockdown for checkpoint bundle files. |
-| `-control-socket PATH` | Bind a Unix domain socket or loopback TCP listener before the lockdown for `rungv checkpoint`. A TCP listener and a Windows Unix socket need the per-run token that the server writes to a `0600` token file. |
-| `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
-| `--tune KEY=VALUE` | Set a host-side tunable. The flag repeats. Section 3.3 lists the keys. `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info` take it. |
-| `--tune-file FILE` | Read host-side tunables from a JSON object. A `--tune` flag wins over the file. The same commands take it. |
+| `-net MODE`, `-wg-conf FILE`, `-isolate-lan` | Select the network mode (`nat`, `wg`, `none`) and its options. |
+| `--privileged` | On by default. Enables `--net-raw`, `--allow-packet-socket-write`, and `--allow-suid`. `--privileged=false` disables all three. Explicit per-flag values override `--privileged` (see Section 4.8). |
+| `--net-raw` | Allow guest raw sockets and `iptables` (required by `dockerd`). Defaults to `--privileged`. |
+| `--allow-packet-socket-write` | Allow guest writes on `AF_PACKET` sockets (requires `--net-raw`). Defaults to `--privileged` when `--net-raw` is on. |
+| `--allow-suid` | Obey `setuid` and `setgid` bits on guest executables (`sudo`, `su`, `passwd` for non-root users). Defaults to `--privileged`. |
+| `--host-ca-certs` | Copy host root CA certificates into the guest (off by default; see Section 4.10). |
+| `-registry-url URL` | Override the registry host of the image reference. |
+| `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry pulls. Also accepted by `pull` and `save` (see Section 5.2). |
+| `-cache-dir DIR` | Override the layer cache directory. |
+| `-checkpoint-dir DIR` | Pre-open a host directory before lockdown for checkpoint bundle files. |
+| `-control-socket PATH` | Bind a Unix socket or loopback TCP listener before lockdown for `rungv checkpoint`. TCP listeners and Windows Unix sockets require the per-run token written to a `0600` token file. |
+| `-lockdown=false` | Skip host lockdown. Use for debugging only. |
+| `--tune KEY=VALUE` | Set a host-side tunable (repeatable; see Section 3.3). Accepted by `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info`. |
+| `--tune-file FILE` | Load host-side tunables from a JSON object. `--tune` flags override the file. Accepted by the same commands. |
 
 ### 3.3 Tunables
 
-A tunable is a limit or a time value of the host process that Linux has no knob for. The guest sets every Linux limit itself, through a `sysctl` file, a module parameter under `/sys/module`, or a netlink request. A tunable never replaces one of those. One registry in `pkg/gvx/tuning` holds all tunables. The SDK field `gvx.Config.Tuning`, the flags `--tune` and `--tune-file`, the command `rungv tune list`, and the table of this section come from that registry.
+A tunable controls a host-side limit or timeout that Linux has no sysctl for. Guest Linux settings still go through `sysctl`, `/sys/module`, or netlink; tunables never replace them. One registry in `pkg/gvx/tuning` defines every tunable for `gvx.Config.Tuning`, `--tune`, `--tune-file`, `rungv tune list`, and the table below.
 
-A duration has the form of a Go duration, such as `250ms` or `30s`. A size is a number of bytes with an optional binary suffix, such as `64MiB`. Each value in a `--tune-file` file is a string or a number. A `--tune` flag wins over the file. An unknown key, a value that does not parse, or a value outside the range is an error. The error names the key and the range.
+Durations use Go syntax (`250ms`, `30s`). Sizes accept byte counts with optional binary suffixes (`64MiB`). Values in `--tune-file` can be strings or numbers, and `--tune` flags override the file. Unknown keys, malformed values, or out-of-range values fail with an error showing the valid range.
 
 To set a tunable:
 
-1. Run `rungv tune list` to print the table.
-2. Choose a key and a value inside its range.
-3. Add `--tune net.nat.mtu=9000` to the command. Repeat the flag for each key.
-4. Add `--tune-file FILE` instead to read the keys from a JSON file, such as `{"net.nat.mtu": 9000, "net.dns.timeout": "8s"}`.
-5. Add the same flags to an image command, such as `rungv pull`, to set an `oci.*` key.
+1. Run `rungv tune list` to view all keys and defaults.
+2. Pick a key and a value within its range.
+3. Pass `--tune net.nat.mtu=9000` (repeat for multiple keys).
+4. Or pass `--tune-file FILE` with JSON such as `{"net.nat.mtu": 9000, "net.dns.timeout": "8s"}`.
+5. Pass the same flags to image commands like `rungv pull` to adjust `oci.*` limits.
 
-The test `TestDocsMatchRegistry` of `pkg/gvx/tuning` fails when this table differs from the registry.
+`TestDocsMatchRegistry` in `pkg/gvx/tuning` verifies that the table below stays synchronized with the registry.
 
-To rewrite the table after a change of the registry, run `go test ./pkg/gvx/tuning -run TestDocsMatchRegistry -update`.
+To regenerate this table after updating the registry, run `go test ./pkg/gvx/tuning -run TestDocsMatchRegistry -update`.
 
 <!-- tuning:begin -->
 | Key | Type | Default | Range | Unit | Description |
@@ -156,98 +156,95 @@ To rewrite the table after a change of the registry, run `go test ./pkg/gvx/tuni
 | `oci.registry_idle_timeout` | duration | 1m | 1s to 24h | time | Time that a registry request may go without data before the pull fails. |
 <!-- tuning:end -->
 
-The key `kernel.log_buf_len` sets the size of the kernel log ring that `/dev/kmsg`, `dmesg`, and `syslog(2)` read. The sandbox rounds the value up to a power of two, and `syslog(SYSLOG_ACTION_SIZE_BUFFER)` returns the result. When the ring is full, the oldest records leave. The guest controls the other settings of the log through the files `/proc/sys/kernel/printk_devkmsg` (`on`, `off`, or `ratelimit`), `/proc/sys/kernel/dmesg_restrict` (0 or 1), and `/proc/sys/kernel/printk`.
+`kernel.log_buf_len` sets the kernel log ring size read by `/dev/kmsg`, `dmesg`, and `syslog(2)`. The sandbox rounds it up to a power of two, and `syslog(SYSLOG_ACTION_SIZE_BUFFER)` returns that size. When full, the ring drops the oldest records. Guest processes control other log settings via `/proc/sys/kernel/printk_devkmsg` (`on`, `off`, or `ratelimit`), `/proc/sys/kernel/dmesg_restrict` (`0` or `1`), and `/proc/sys/kernel/printk`.
 
-The key `net.nat.mtu` sets the first MTU of `eth0` in the `nat` network mode. In the `wg` network mode, `eth0` starts with the `MTU` key of the `[Interface]` section of the WireGuard file, which is 1420 by default. Each link type accepts its own range of MTU values, and a value outside the range fails with `EINVAL`, as on Linux. A caller needs `CAP_NET_ADMIN`. Each end of a veth pair has its own MTU.
+`net.nat.mtu` sets the initial `eth0` MTU in NAT mode. In WireGuard mode, `eth0` starts with the `MTU` key from `[Interface]` (default `1420`). Each link type enforces its own MTU range and returns `EINVAL` outside it, as on Linux. Callers need `CAP_NET_ADMIN`, and each end of a veth pair has an independent MTU.
 
-A link with an MTU below 1280 has no IPv6, as on Linux. The link loses its IPv6 addresses and routes. It accepts no new IPv6 address while the MTU stays below 1280. When the MTU returns to 1280 or more, the link accepts IPv6 addresses again.
+A link with an MTU below `1280` drops its IPv6 addresses and routes and refuses new ones until the MTU returns to `1280` or higher, matching Linux.
 
 | Link | MTU range |
 | :--- | :--- |
-| `eth0` in the `nat` network mode | 68 to 65535 |
-| `eth0` in the `wg` network mode on Linux and macOS | 68 to 65503 |
-| `eth0` in the `wg` network mode on Windows | 68 to 1984 |
-| A veth link or a bridge that the guest creates | 68 to 65535 |
-| `lo` | The link accepts a request and keeps 65536. Linux changes the value. |
+| `eth0` in NAT mode | 68 to 65535 |
+| `eth0` in WireGuard mode on Linux and macOS | 68 to 65503 |
+| `eth0` in WireGuard mode on Windows | 68 to 1984 |
+| Guest-created veth or bridge link | 68 to 65535 |
+| `lo` | Accepts requests and keeps `65536` (Linux updates the value). |
 
-To change the MTU of a link in the guest:
+To change a link MTU inside the guest:
 
-1. Run `ip link set dev eth0 mtu 1400`. Both `ip` of iproute2 and `ip` of busybox work.
-2. Run `ifconfig eth0 mtu 1400` when the guest has only the busybox `ifconfig`.
-3. Read the value in `/sys/class/net/eth0/mtu` or with `ip link show dev eth0`.
+1. Run `ip link set dev eth0 mtu 1400` (works with iproute2 and busybox `ip`).
+2. Run `ifconfig eth0 mtu 1400` if the guest only has busybox `ifconfig`.
+3. Inspect the result in `/sys/class/net/eth0/mtu` or with `ip link show dev eth0`.
 
-Software in the guest derives the MTU of its tunnels from `eth0`. `flannel` uses the MTU of `eth0` minus 50 for `vxlan` and minus 80 for WireGuard. The NAT relay sends datagrams of every size that the MTU allows. On macOS, the relay raises the send buffer of its host UDP sockets. The default `net.inet.udp.maxdgram` of 9216 bytes would refuse a larger datagram.
+Guest networking tools derive tunnel MTUs from `eth0`: `flannel` subtracts `50` for VXLAN and `80` for WireGuard. The NAT relay forwards datagrams up to the link MTU. On macOS, the relay raises host UDP socket send buffers so the default `net.inet.udp.maxdgram` (`9216` bytes) does not reject larger datagrams.
 
 ## 4. Rules of `run`
 
 ### 4.1 Command and environment
 
-The command is the entrypoint followed by the command arguments. Each part comes from the caller, or else from the image. An override of the entrypoint drops the image `Cmd`, as in Docker. A run without any command stops with an error.
+The guest command combines `Entrypoint` followed by `Cmd`, taking CLI overrides before image defaults. Overriding `--entrypoint` drops the image `Cmd`, matching Docker. Running with no command fails.
 
-The environment starts with the `Env` of the image. Each `-e` entry and each env-file line then replaces the variable with the same name, or adds a new one. The env files are read first, and then the `-e` flags, so a `-e` flag wins. The sandbox adds `PATH`, `HOME`, and `HOSTNAME` when none sets them. It adds `TERM=xterm` for a terminal.
+The guest environment starts from the image `Env`, then applies `--env-file` entries, then `-e` flags (so `-e` wins). The sandbox sets default `PATH`, `HOME`, and `HOSTNAME` when missing, and adds `TERM=xterm` when `-t` is set.
 
 ### 4.2 User
 
-The user comes from `--user`, then from the `User` of the image, then it is root. The sandbox resolves a name in the `/etc/passwd` and `/etc/group` files of the image. A name that these files do not list stops the run. A number need not be listed.
+The guest user comes from `--user`, then the image `User`, and otherwise `root`. Named users resolve through the image's `/etc/passwd` and `/etc/group`; unknown names fail, while numeric IDs need not exist there.
 
-A user that the passwd file does not list gets the group 0 and the home `/`, as in Docker. The user form `name` adds the supplementary groups that list the user. The form `name:group` adds none. The process of a user that is not root has no capability.
+An unlisted numeric user gets group `0` and home `/`, as in Docker. Passing `name` alone adds its supplementary groups from `/etc/group`; passing `name:group` adds none. Non-root users start with no capabilities.
 
-The root directory of the guest has the mode 0755, as in an image. A user that is not root cannot create a file there.
+The guest root directory has mode `0755`, matching standard container images, so non-root users cannot create files directly in `/`.
 
 ### 4.3 Hostname
 
-The sandbox writes the hostname to `/etc/hostname`. It adds a line with the guest address to `/etc/hosts` when no line names the hostname. It also adds `host.docker.internal`, which names the host.
+The sandbox writes the hostname to `/etc/hostname` and adds it to `/etc/hosts` if missing. It also adds `host.docker.internal`, pointing to the host.
 
 ### 4.4 Mounts
 
-A bind mount shows a host directory or one host file in the guest. A named volume is one image file, `<name>.ext4`, in a `volumes` directory. That directory is inside the `-cache-dir` directory, or else next to the default layer cache. The volume name matches `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. The sandbox creates a missing volume image and a missing `-v` bind directory before the lockdown. The sandbox never creates a missing file. A `--mount type=bind` source must exist.
+A bind mount exposes a host directory or a single host file inside the guest. A named volume is a single image file, `<name>.ext4`, stored in the `volumes` directory inside `-cache-dir` (or next to the default layer cache). Volume names must match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. Before lockdown, the sandbox creates missing volume images and missing `-v` bind directories, but never creates missing single files. `--mount type=bind` always requires an existing source path.
 
-The image holds an ext4 file system that the `ext4lite` driver reads and writes. The image grows in steps of 16MiB, up to 64TiB. A clean exit returns the unused tail to the host. One sandbox at a time can use a volume, because the driver locks the image file. A second sandbox on the same volume fails at start. A read-only mount of a volume opens the image read-only and fails when the last run did not end cleanly.
+The `ext4lite` driver formats and mounts each `<name>.ext4` image as an ext4 filesystem. Images grow in 16 MiB steps up to 64 TiB, and a clean exit compacts unused tail blocks. Writable mounts acquire an exclusive file lock (`LOCK_EX`), so a second writer fails at start. Read-only mounts (`:ro`) acquire a shared lock (`LOCK_SH`), allowing multiple concurrent readers while blocking writers and deletions; a read-only mount fails if the previous run ended uncleanly and still needs journal replay.
 
-The guest sees only the files that it wrote. The host sees one file. The image has a metadata journal. After a crash or a kill, the next run replays the journal. It keeps every file that the guest synced, and it frees the files that a guest unlinked and still held open. A volume of an older release gets a journal at the first run when the first 16MiB of the image has room for it, and the image never grows for that. `e2fsck -fn` accepts a clean image, and `mount -o loop -t ext4` mounts it on Linux.
+Each volume carries a `jbd2` metadata journal. After a crash or kill, the next writable run replays the journal, preserving synced files and freeing unlinked open files. Clean images pass `e2fsck -fn` and mount directly on Linux with `mount -o loop -t ext4`.
 
-A `--mount type=volume` source that contains a path separator names the image file of an `ext4lite` volume at any host path, as in `--mount type=volume,src=/disk/vols/pg.ext4,dst=/var/lib/postgresql`. A relative source starts with `./`, because a source without a separator is a volume name. The sandbox creates a missing image file before the lockdown, but not its directory. A read-only mount never creates the file. The path must not name a directory or a device. Such a volume has the same lock, journal, and growth rules as a named volume. `-v` keeps its meaning: `-v /disk/vols/pg.ext4:/data` mounts that file as one regular file.
+In `--mount type=volume`, a `src` containing a path separator targets an `.ext4` image file at that host path, such as `--mount type=volume,src=/disk/vols/pg.ext4,dst=/var/lib/postgresql`. Prefix relative paths with `./` so they are not treated as volume names. The sandbox creates a missing image file before lockdown (except for read-only mounts) but never creates parent directories. `-v` keeps its Docker meaning: `-v /disk/vols/pg.ext4:/data` bind-mounts the file itself.
 
-A volume from an older release is a host directory in the same `volumes` directory. When that directory exists and the `.ext4` file does not, the sandbox keeps mounting the directory through `hostfs`. To use the `hostfs` driver for a new volume, write `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The value `driver=ext4lite` is the default.
+To branch a read-only base volume without copying it, pass `--mount type=overlay,src=BASE,dst=PATH[,upper=BRANCH][,tmpfs-size=SIZE]`. With `upper=BRANCH`, mutations and whiteouts persist in the `BRANCH` volume while `BASE` stays untouched; without `upper`, writes stay in an ephemeral `tmpfs` layer.
 
-A guest overlay mount, as in `mount -t overlay -o lowerdir=...,upperdir=...,workdir=...`, accepts an upper directory on tmpfs, on an `ext4lite` volume, or on a `hostfs` directory. `docker:dind` needs this for the overlay storage driver, with `-v NAME:/var/lib/docker` or `-v /host/dir:/var/lib/docker`. The `ext4lite` volume is the faster persistent choice. The `hostfs` directory keeps each file as a host file, but it is slower, because it calls the host for each file operation. A measured `docker pull nginx:alpine` in `docker:dind` on macOS took about 5s on tmpfs, 9s on `ext4lite`, and 32s to 54s on `hostfs`. Another upper file system gets `EINVAL`.
+Legacy directory volumes from older releases keep mounting through `hostfs` when no `.ext4` file exists for that name. To create a new directory volume explicitly, pass `--mount type=volume,src=NAME,dst=PATH,driver=hostfs`. The default driver is `ext4lite`.
 
-A source with no path separator that is not an absolute path names a volume. A Windows drive letter stays in the source, as in `C:\data:/data:ro`.
+Guest `mount -t overlay` accepts an upper directory on `tmpfs`, an `ext4lite` volume, or a `hostfs` directory (other upper filesystems return `EINVAL`). `docker:dind` relies on this for its overlay storage driver. `ext4lite` is the faster persistent choice; `hostfs` stores individual host files at higher per-syscall overhead. In a single run on macOS, `docker pull nginx:alpine` inside `docker:dind` took about `5 s` on `tmpfs`, `9 s` on `ext4lite`, and `32 to 54 s` on `hostfs`.
 
-A bind source can be one regular file, as in `-v /host/app.conf:/etc/app.conf:ro`. A socket, a device, or a pipe is not valid. The guest sees only that file. The parent directory and the sibling files of the host file are not exposed, and the guest cannot reach them by a path. The sandbox creates the guest path as an empty regular file with the mode 0644, and it creates the missing parent directories. The option `:ro` makes the file read-only. The option `-workspace` takes a directory only.
+A source without a path separator and without an absolute path names a volume. Windows drive letters stay part of the host path, such as `C:\data:/data:ro`.
 
-A file mount writes no `.gvx_meta` file. The mode, the owner, and the extended attributes that the guest sets stay in memory and reset at the next start. A change of the times reaches the host file. An `unlink` or a `rename` of the mounted file in the guest returns `EBUSY`, as for a file that Docker bind-mounts. A `link` to the file returns `EXDEV`.
+A bind mount can target a single regular file, such as `-v /host/app.conf:/etc/app.conf:ro` (sockets, devices, and pipes are refused). The guest sees only that file; the host parent directory and sibling files remain inaccessible. The sandbox creates an empty `0644` mount point file and any missing guest parent directories. `-workspace` accepts directories only.
 
-On macOS or with `-lockdown=false`, an atomic host rename replaces the mounted file for later opens. On Linux and Windows under lockdown, Landlock and file ACLs bind the original file, so atomic host replacement requires a directory mount or `-lockdown=false`. A descriptor that was already open keeps the old file.
+Single-file mounts write no `.gvx_meta` file. Mode, owner, and xattr changes stay in memory for the run, while timestamp updates reach the host file. Guest `unlink` or `rename` on the mount point returns `EBUSY` (as in Docker), and `link` returns `EXDEV`.
 
-On Windows, the sandbox puts the Low integrity label and an access entry for the logon session on the mounted file only. It also gives the logon session the traverse right (`FILE_TRAVERSE`) on the parent directory, with no inheritance. The restricted token has no `SeChangeNotifyPrivilege`, so the system needs that right to open the file through the parent. The right gives no listing and no creation of files. The sibling files keep their own security descriptors and stay closed. The entry stays on the parent directory after the run.
+On macOS, on Windows, and with `-lockdown=false`, an atomic host rename replaces the mounted file for future guest opens. On Windows, the pre-lockdown `winMountBroker` pins the parent directory handle and authorizes opens for the exact leaf filename without modifying any NTFS ACL or integrity label. On Linux under Landlock, the ruleset binds the original file descriptor, so atomic host replacement requires a directory mount or `-lockdown=false`. Open file descriptors always keep reading the old file.
 
-Each mounted host directory has one `.gvx_meta` table. Two mounts of one directory with the same access share the table. A host directory nested inside another mounted directory gets its own table. When the guest reaches the same file through both mounts, as in a non-aligned layout such as `-v $PWD:/app -v $PWD/logs:/var/log/app`, the two views can show different mode, owner, and attributes for that file. An aligned layout, as in `-v $PWD:/app -v $PWD/node_modules:/app/node_modules`, has no such overlap, because the inner mount covers the outer copy. A bind mount of one file keeps no table, so it can sit inside a mounted directory.
+Each mounted host directory owns one `.gvx_meta` table (shared by duplicate mounts of the same directory with the same access mode). A nested host directory gets its own table. In a non-aligned layout such as `-v $PWD:/app -v $PWD/logs:/var/log/app`, reaching the same file through two mounts can show different metadata. Aligned layouts such as `-v $PWD:/app -v $PWD/node_modules:/app/node_modules` avoid overlap because the inner mount shadows the outer path.
 
-The guest path of a mount is absolute and clean. It is not `/`. It is not `/proc`, `/sys`, `/dev`, or a path below them, except a path below `/dev/shm`. Two mounts cannot share a guest path. A mount at `/workspace` conflicts with `-workspace`.
+Guest mount destinations must be clean absolute paths and cannot be `/`, `/proc`, `/sys`, `/dev`, or paths beneath them (except under `/dev/shm`). Duplicate guest paths and conflicts with `-workspace` are rejected.
 
-The tmpfs options are `size`, `ro`, and `rw`. The option `size` takes a number with a binary unit. Any other tmpfs option stops the run with an error that names it.
+`--tmpfs` accepts `size` (with binary units), `ro`, and `rw`, rejecting unknown options.
 
-A volume with the `ext4lite` driver needs no lockdown rule for a host path. The sandbox opens the image file before the lockdown, and the guest reaches it only through that open file. Pass `-rootfs-volume NAME` or `-rootfs-volume PATH` to persist writes on the root file system inside a managed or external `.ext4` image instead of `tmpfs`. The runtime opens the root volume before host lockdown, rejects `--read-only`, rejects raw `-bin` runs without image layers, and rejects the same `.ext4` file passed to both `-rootfs-volume` and `-v`.
+`ext4lite` volumes need no host path lockdown rule because the sandbox opens the `.ext4` image file before lockdown. Pass `-rootfs-volume NAME` or `-rootfs-volume PATH` to back root filesystem writes with a persistent `.ext4` image instead of `tmpfs`. The runtime opens it before lockdown and rejects combinations with `--read-only`, raw `-bin` runs, or reusing the same `.ext4` file in `-v`.
 
-| Host OS | What the lockdown does with a mount |
+| Host OS | Lockdown behavior for host bind mounts |
 | :--- | :--- |
-| macOS | The Seatbelt profile gets a read rule, and a write rule for a writable mount, for the path and for its resolved path. |
-| Windows | The lockdown writes a Low integrity label on each object of a writable mount. It grants the logon session read and execute access, and write access for a writable mount. |
-| Linux | Landlock confines path opens to the mounted directories and files before seccomp restricts system calls to directory descriptors. |
-
-> [!WARNING]
-> On Windows, a bind mount changes the security descriptors of the host directory, or of the host file for a file mount. Mount only a path that the guest may change.
+| macOS | Seatbelt adds read rules (and write rules for writable mounts) for the mount path and its resolved target. |
+| Windows | `winMountBroker` pins each mounted directory or single-file parent handle before lockdown and routes opens in memory without changing NTFS security descriptors. |
+| Linux | Landlock confines path opens to the mounted directories and files before seccomp restricts syscalls. |
 
 ### 4.5 Resource limits
 
-`--memory` sets a limit on the memory use of the guest. A guard reads the memory accounting of the Sentry and kills the guest with SIGKILL when the use passes the limit. The exit code is 137, and `rungv` prints a message. The guard reads the use at short intervals, so a guest can pass the limit by the amount that it allocates between two readings. Without `--memory`, the limit is the physical RAM of the host, and the guard reads the use every 100 ms. The keys `memory.guard.poll_interval` and `memory.guard.host_poll_interval` set the two intervals.
+`--memory` caps guest memory usage. A background guard polls Sentry memory accounting and sends `SIGKILL` (exit code `137`) with a diagnostic message when usage exceeds the limit. Because the guard polls, a guest can briefly overshoot between readings. Without `--memory`, the cap defaults to host physical RAM polled every `100 ms` (configurable via `memory.guard.poll_interval` and `memory.guard.host_poll_interval`).
 
-The guest kernel takes its memory size from the physical RAM of the host, as runsc does. `MemTotal` in `/proc/meminfo` and `totalram` of `sysinfo(2)` equal `--memory` when it is below that RAM, and that RAM otherwise. A tmpfs mount without a size option, such as `/dev/shm`, gets half of the host RAM, as on Linux, also with `--memory`. A guest mount with `size=N%` gets N percent of the host RAM. The tmpfs that holds the writes to the root file system has no size limit of its own. The memory guard limits it.
+The guest kernel reports `MemTotal` in `/proc/meminfo` and `totalram` in `sysinfo(2)` as the lesser of `--memory` and host physical RAM. Unsized `tmpfs` mounts like `/dev/shm` default to half of host RAM (matching Linux), and `size=N%` uses `N` percent of host RAM. The rootfs `tmpfs` layer has no separate cap and is bounded by the memory guard.
 
-A program in the guest can also limit a cgroup with `memory.max`, as `docker run -m` does in `docker:dind`. The Sentry checks each cgroup with a finite limit every 5 ms or more while it uses half of its limit, and every 25 ms otherwise. The keys `memory.cgroup.poll_interval` and `memory.cgroup.idle_poll_interval` set these times. It compares the anonymous memory plus the tmpfs data of the subtree with the limit. When the use passes the limit, the Sentry ends the process with the highest score with SIGKILL, but never the init process of the guest or a process with `oom_score_adj` of -1000. With `memory.oom.group` set, it ends every other process of the subtree. The counters `oom` and `oom_kill` in `memory.events` grow, and the file reports a change through `inotify`. A process can pass the limit by what it allocates between two checks, and a process that frees its memory before the next check is not found. The limits `memory.high`, `cpu.max`, and `cpu.weight` are accepted and stored, but nothing enforces them. [`recipes/docker-engine.md`](recipes/docker-engine.md), section 7.4, lists the details.
+Inside the guest, nested cgroups also enforce `memory.max` (as `docker run -m` sets in `docker:dind`). The Sentry polls finite cgroups at least every `5 ms` above half their limit and every `25 ms` otherwise (`memory.cgroup.poll_interval`, `memory.cgroup.idle_poll_interval`). It compares subtree anonymous memory plus `tmpfs` data against the limit and kills the highest-scoring process with `SIGKILL` (skipping guest PID 1 and `oom_score_adj=-1000`, or killing the whole subtree when `memory.oom.group` is set). `memory.events` increments `oom` and `oom_kill` and notifies `inotify` watchers. Nested cgroups also enforce `cpu.max` on every engine; `memory.high`, `cpu.weight`, and `memory.swap.*` are accepted and stored without enforcement. See [`recipes/docker-engine.md`](recipes/docker-engine.md) Sections 7.4 and 7.5 for full details.
 
-`--cpus` sets the number of CPUs that the guest sees, rounded up. Windows also caps the CPU time of the host process with a hard cap on the containment job. The other host OSes have no such cap, and `rungv` prints a warning. On Windows with `-platform=systrap`, the guest runs in stub processes that the cap does not cover.
+`--cpus` sets the online guest CPU count (rounded up). On Windows, it also applies a hard CPU cap to the containment Job Object (excluding Windows `systrap` stub processes). macOS and Linux have no host-process CPU cap, so `rungv` prints a warning there.
 
 ### 4.6 Guest kernel
 
@@ -281,41 +278,41 @@ An unmodified `docker:dind` image starts with the default `--iptables=true`. [`r
 
 The exit code 137 has two causes that `rungv` tells apart. A guest that passes `--memory` gets the message about the memory limit. When the engine fails under the guest, the kernel ends the guest with SIGKILL, and `rungv` prints `the execution engine stopped the guest` with the cause. The SDK returns `ErrEngineFault` in that case. A stub process that a virus scanner ended is one example of an engine fault.
 
-`GVX_DEBUG_LOG=1` prints the log of the kernel to the standard error of `rungv`, and the value `2` also prints debug lines. Use it when a guest fails and no message names the cause. `GVX_STRACE=1` also prints each system call of the guest.
+`GVX_DEBUG_LOG=1` prints Sentry kernel logs to `rungv` stderr, and `GVX_DEBUG_LOG=2` adds debug lines. Use it when a guest fails without a clear error message. `GVX_STRACE=1` logs every guest system call.
 
 ### 4.10 Host root certificates
 
-A host behind a proxy that inspects TLS, or a host that uses a private registry, trusts a root that no image knows. The flag `--host-ca-certs` copies the roots of the host into the guest. The SDK field is `Config.HostCACerts`. Without the flag, the guest sees only the roots of its image. The sandbox never turns the flag on by itself.
+A host behind a TLS-inspecting proxy or using a private registry trusts root certificates that container images do not include. `--host-ca-certs` (`Config.HostCACerts`) copies host root certificates into the guest. Without this flag, the guest trusts only its image's CA bundle; the sandbox never enables it automatically.
 
-`rungv` reads the roots before the host lockdown, because the lockdown forbids a new host file and a child process. The table lists the sources of each host OS.
+`rungv` reads host root certificates before lockdown because lockdown forbids opening new host files or spawning child processes.
 
-| Host | Source of the roots |
+| Host | Source of root certificates |
 | :--- | :--- |
-| Linux | The file of `SSL_CERT_FILE`, or else the first system bundle that Go reads. Also the directories of `SSL_CERT_DIR`, or else `/etc/ssl/certs` and `/etc/pki/tls/certs`. |
-| macOS | The keychains `System.keychain`, `SystemRootCertificates.keychain`, and `login.keychain-db`. A certificate counts when the trust settings of the user, admin, or system domain accept it for TLS servers. A domain that denies it wins by its order: user, admin, system. |
-| Windows | The `ROOT` system store. The `CA` store holds intermediate certificates, so it is not a source. |
+| Linux | `SSL_CERT_FILE` (or the default Go system bundle) plus `SSL_CERT_DIR` (or `/etc/ssl/certs` and `/etc/pki/tls/certs`). |
+| macOS | `System.keychain`, `SystemRootCertificates.keychain`, and `login.keychain-db`. Certificates are included when user, admin, or system trust settings accept them for TLS servers; denials take precedence in user, admin, system order. |
+| Windows | The `ROOT` system store (the `CA` store holds intermediates and is ignored). |
 
-On macOS and Windows, the files of `SSL_CERT_FILE` and `SSL_CERT_DIR` add roots. Use them for a root that is not in the system store. The run stops when the host has no root at all. A source that fails gives a warning on the standard error.
+On macOS and Windows, `SSL_CERT_FILE` and `SSL_CERT_DIR` append extra roots outside the system store. The run fails if the host provides no roots at all, and unreadable sources print a stderr warning.
 
-At the start of the guest, the sandbox writes the roots into the layer above the image. The image stays unchanged. The sandbox does not mount a file over a bundle, so `update-ca-certificates` and `apk add ca-certificates` keep working. The table lists the writes.
+At guest startup, the sandbox writes host roots into the writable upper layer without modifying cached images or mounting over bundle files, so `update-ca-certificates` and `apk add ca-certificates` keep working.
 
 | Write | Detail |
 | :--- | :--- |
-| Image bundles | For each file in this list that exists, the sandbox appends the host roots that the file lacks: `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, and `/etc/ssl/ca-bundle.pem`. A root that the file holds is not added again. |
-| Image without a bundle | The sandbox creates `/etc/ssl/certs/ca-certificates.crt` with the host roots. |
-| Anchor files | Each host root that no image bundle holds becomes a file `gvx-host-*.crt`. The files go to `/usr/local/share/ca-certificates` (Debian and Alpine) and to `/etc/pki/ca-trust/source/anchors` (RHEL) when that directory exists. A later `update-ca-certificates` or `update-ca-trust` keeps the roots. |
-| Mounts | A path that is a mount point, or below one, stays as the mount shows it. |
+| Image bundles | Appends missing host roots to each existing bundle among `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, and `/etc/ssl/ca-bundle.pem`. |
+| Image without a bundle | Creates `/etc/ssl/certs/ca-certificates.crt` containing the host roots. |
+| Anchor files | Writes each missing host root as `gvx-host-*.crt` in `/usr/local/share/ca-certificates` (Debian/Alpine) and `/etc/pki/ca-trust/source/anchors` (RHEL) when those directories exist, so later `update-ca-certificates` or `update-ca-trust` runs preserve them. |
+| Mounts | Leaves mount points and mounted subtrees untouched. |
 
 > [!WARNING]
-> Only the guest processes trust the roots. A container that `dockerd` starts in the guest does not trust them. [`recipes/docker-engine.md`](recipes/docker-engine.md) shows how to give such a container the roots.
+> Only direct guest processes trust these roots. Nested containers started by `dockerd` have their own root filesystems; see [`recipes/docker-engine.md`](recipes/docker-engine.md) to pass host roots into them.
 
-Run an image behind an inspecting proxy:
+Run an image behind a TLS-inspecting proxy:
 
 ```sh
 rungv run --host-ca-certs alpine:3.20 wget -qO- https://example.com/
 ```
 
-Add a root that the system store lacks. The variable works on every host OS:
+Add an extra root certificate on any host OS:
 
 ```sh
 SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO- https://registry.corp.example/
@@ -323,15 +320,15 @@ SSL_CERT_FILE=$PWD/corp-root.pem rungv run --host-ca-certs alpine:3.20 wget -qO-
 
 ### 4.11 Checkpoint and restore
 
-`rungv` can save a running sandbox to a host directory and resume it in a new process. The host lockdown blocks new file opens and socket binds after the guest starts. The sandbox therefore opens the checkpoint files at `-checkpoint-dir` and binds the control listener at `-control-socket` before the lockdown applies.
+`rungv` can save a running sandbox to a host directory and resume it in a new process. Because host lockdown blocks new file opens and socket binds after startup, the sandbox pre-opens `-checkpoint-dir` and binds `-control-socket` before calling `hostlockdown.Apply()`.
 
-The bundle directory holds four files: `manifest.json`, `state.img`, `pages.meta`, and `pages.img`. `manifest.json` records the host OS, the CPU architecture, the active platform, the address holes, the EROFS layer digests, the mounts, and the network mode. `rungv restore` (or its alias `rungv resume`) validates `manifest.json` against the host and reopens the cached layers and mounts before it applies the lockdown.
+A checkpoint bundle contains four files: `manifest.json`, `state.img`, `pages.meta`, and `pages.img`. `manifest.json` records the host OS, CPU architecture, platform backend, address holes, EROFS layer digests, mounts, and network mode. `rungv restore` (`rungv resume`) validates `manifest.json` against the current host and reopens cached layers and mounts before applying lockdown.
 
 | Command or flag | Meaning |
 | :--- | :--- |
-| `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before the lockdown. |
-| `rungv checkpoint -control-socket PATH [-checkpoint-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` is an alias). Without `-leave-running`, the sandbox stops and exits `0` after the save finishes. When `-checkpoint-dir` is set, the server verifies that it matches the pre-opened directory. |
-| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w` or `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `-net`, `-wg-config`, `-checkpoint-dir`, and `-control-socket` to reattach mounts, network backends, or a new checkpoint listener. |
+| `rungv run -checkpoint-dir DIR -control-socket PATH` | Pre-open `DIR` and bind `PATH` (mode `0600` Unix socket or loopback TCP address) before lockdown. |
+| `rungv checkpoint -control-socket PATH [-checkpoint-dir DIR] [-leave-running]` | Connect to `PATH` and trigger a checkpoint (`rungv snapshot` alias). Without `-leave-running`, the sandbox stops with exit code `0` after saving. If `-checkpoint-dir` is given, the server verifies it matches the pre-opened directory. |
+| `rungv restore -checkpoint-dir DIR [flags]` | Restore a sandbox from `DIR` (alias: `rungv resume`). Pass `-w`, `-workspace`, `-v`, `--mount`, `-rootfs-volume`, `-p`, `--auto-publish`, `-net`, `-wg-conf`, `-checkpoint-dir`, and `-control-socket` to reattach mounts, networking, or a new control listener. |
 
 > [!IMPORTANT]
 > Pass the same workspace, volume mounts, and `-rootfs-volume` flag to `rungv restore` that the sandbox used when `rungv checkpoint` ran. `rungv restore` rejects the bundle when the mount paths, the `root_volume` setting, the layer digests, the platform, or the network mode do not match `manifest.json`.
@@ -406,13 +403,14 @@ The layer cache holds compiled EROFS layers, one record per image, and one recor
 
 ### 6.2 Named volumes and `rungv volume`
 
-`rungv volume` creates, inspects, and deletes named volumes in the local `volumes` directory without starting a sandbox. Each `ext4lite` volume probes its host file lock through `ext4lite.ProbeVolumeInUse` so `rungv` refuses deletion while a sandbox mounts the volume.
+`rungv volume` creates, inspects, compacts, and deletes named volumes in the local `volumes` directory without starting a sandbox. Each `ext4lite` volume probes its host file lock via `ext4lite.ProbeVolumeLock` so `rungv` refuses compaction or deletion while a sandbox mounts the volume.
 
 | Command | Behavior |
 | :--- | :--- |
 | `rungv volume create [-d ext4lite\|hostfs] [NAME]` | Formats an `ext4lite` image file (`<name>.ext4`, default) or creates a `hostfs` directory. Generates a 64-digit hex name when `NAME` is omitted. |
 | `rungv volume ls [-q] [--format SPEC]` | Lists local volumes sorted by name, or prints only names with `-q`. |
-| `rungv volume inspect [-f SPEC] NAME...` | Prints JSON metadata (`Name`, `Driver`, `Mountpoint`, `CreatedAt`, `SizeBytes`, `InUse`) or evaluates a Go template. |
+| `rungv volume inspect [-f SPEC] NAME...` | Prints JSON metadata (`Name`, `Driver`, `Mountpoint`, `CreatedAt`, `SizeBytes`, `AllocatedBytes`, `InUse`, `LockMode`) or evaluates a Go template. |
+| `rungv volume compact NAME...` | Replays any pending journal, punches freed blocks, and shrinks unused tail groups on unlocked `ext4lite` volumes. |
 | `rungv volume rm [-f] NAME...` | Deletes unlocked volumes. `-f` ignores missing names, and locked volumes always fail with `in use`. |
 | `rungv volume prune [-f]` | Deletes all unlocked local volumes after confirmation (or immediately with `-f`) and prints reclaimed bytes. |
 
@@ -446,21 +444,21 @@ The table below lists Docker CLI features that differ or do not exist in `rungv`
 | Docker | `rungv` |
 | :--- | :--- |
 | `-d`, `ps`, `exec`, `logs`, `stop`, `rm`, `restart` | Not available. A run executes in the foreground and keeps no container daemon state. |
-| `docker build`, `compose`, `network` | Not available. Use `rungv volume` to create, inspect, remove, or prune named volumes. |
+| `docker build`, `compose`, `network` | Not available. Use `rungv volume` to create, inspect, compact, remove, or prune named volumes. |
 | Image `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL`, labels | Ignored. |
 | `--network host` | Refused. The guest has its own network stack. |
 | `-p HOST-RANGE:PORT` | Refused. Publish ranges of the same length. |
 | `--privileged` | On by default. Its privileges stay inside the sandbox. |
-| `--name` | Sets the container ID of the kernel and nothing else. |
-| Image with a Docker manifest schema 1 | Refused with a message. Docker 28 and later also refuse it. Rebuild or re-push the image. |
-| `docker save` of any image | The command needs the registry that the image came from. |
-| Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. In the guest, `memory.max` of a nested cgroup ends processes with a delay. `cpu.max` of a nested cgroup holds on every engine. `memory.high` and `cpu.weight` of a nested cgroup are not enforced. |
-| Linux host with a seccomp listener in the filter chain of the process | The kernel allows one listener in a chain. The `systrap` engine then uses the futex loop for its stub threads. It writes one warning. This loop is slower than the listener. |
-| Cgroup v1 | Not available. `/sys/fs/cgroup` holds the `cgroup2` hierarchy. |
-| Guest architecture | Must equal the host architecture, except with `-backend=systrap` (`-platform=systrap`). |
-| Executables that link at a fixed address (non-PIE) | `hvf`, `whpx`, and the Windows `systrap` engine run them natively. The removed macOS `systrap` engine could not run them, because every `arm64` task on macOS has a 4GB `PAGEZERO`. |
-| A store into the page of the storing instruction | The Windows `systrap` engine completes the store with a single step, and the page runs the new bytes. Each such store costs three debug stops. On `arm64`, a store exclusive (`stxr`, `stlxr`, `stxp`, `stlxp`) into its own page ends with SIGSEGV. |
-| Writes to the root file system | Lost at exit unless `-rootfs-volume` is active. Use `-rootfs-volume` or a mount for data that must stay. |
+| `--name` | Sets the kernel container ID and nothing else. |
+| Image with Docker manifest schema 1 | Refused with an error. Docker 28 and later also refuse it; rebuild or re-push the image. |
+| `docker save` of any image | Requires the origin registry to fetch verified compressed layer blobs. |
+| Cgroup limits | `--memory` uses a polling guard. `--cpus` caps host process CPU time on Windows only. Inside the guest, nested cgroups enforce `memory.max` (polling) and `cpu.max` (on every engine); `memory.high` and `cpu.weight` are not enforced. |
+| Linux host with an active seccomp user-notify listener | Linux allows one listener per filter chain, so `systrap` prints a warning and falls back to the slower futex loop for stub threads. |
+| Cgroup v1 | Not available. `/sys/fs/cgroup` mounts `cgroup2`. |
+| Guest architecture | Must match the host CPU architecture on every backend (no Rosetta 2 or cross-architecture emulation). |
+| Non-PIE executables (fixed load address) | `hvf`, `whpx`, and Windows `systrap` run them natively. The removed macOS `systrap` engine could not, because macOS `arm64` processes reserve a 4 GB `PAGEZERO`. |
+| Self-modifying store into an executing code page | Windows `systrap` serves the store with a single-step window (three debug stops). On `arm64`, store-exclusive instructions (`stxr`, `stlxr`, `stxp`, `stlxp`) targeting their own page raise `SIGSEGV`. |
+| Root filesystem writes | Ephemeral unless `-rootfs-volume` is set. Use `-rootfs-volume` or a mount for persistent data. |
 
 ## 8. Examples
 
@@ -562,7 +560,7 @@ The amd64 results depend on four differences between `runsc` and Linux. The inne
 - `runsc` with the platform `systrap` patches the syscall instructions of the stub with jumps that use `GS`. It does not remove the patches when a tracer sets `GS`. The syscall thread of the stub calls `arch_prctl(ARCH_SET_GS)` once, so `runsc` removes the patches before the stub runs.
 - `runsc` with the platform `systrap` seals its table of syscall patches in the address space of the stub. A call that unmaps the whole range fails with `EPERM`. The inner `rungv` unmaps its address space mapping by mapping.
 
-The arm64 failure belongs in gVisor. Report it to the upstream project: write the `fpsimd_context` record, the `esr_context` record, and the end marker in the arm64 signal frame, as `gvx` does since this release. The same report can ask for the page fault error code in the amd64 signal frame, as Linux gives it.
+The arm64 failure belongs in upstream gVisor: `runsc` must write `fpsimd_context`, `esr_context`, and the end marker into the arm64 signal frame, as `gvx` does. The same upstream report can request Linux-compatible page fault error codes in the amd64 signal frame.
 
 ### 11.3 Limits
 

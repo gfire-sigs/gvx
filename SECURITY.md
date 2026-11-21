@@ -22,7 +22,7 @@ These limits are documented behavior, not vulnerabilities:
 - On Windows, `systrap` uses user-mode syscall patching with Low-integrity token and job containment; it provides no hardware or kernel syscall trap.
 - On Android, a host mount leaves `Status.UnboundFileOpenBlocked` false because the `untrusted_app` seccomp policy of Zygote blocks Landlock calls.
 - `-lockdown=false` disables the host lockdown.
-- A guest can use the host network that `-net=nat` and `-p` expose.
+- A guest can use the host network that `-net=nat`, `-p`, and `--auto-publish` (`127.0.0.1` loopback listeners) expose.
 
 ## 2. Supported Versions (Reference Module)
 

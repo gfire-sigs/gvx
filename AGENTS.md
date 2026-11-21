@@ -35,7 +35,7 @@ Execute these numbered steps at the start of every task before editing repositor
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
+| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/blockdev`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/hvcommon`, `pkg/sentry/fsimpl/chunkcache`, `pkg/sentry/fsimpl/fsutilx`, `pkg/sentry/socket/netlink/genetlink`, `pkg/ipset`, `pkg/tcpip/link/vxlan`, `pkg/tcpip/link/wgtun`, `pkg/sentry/fsimpl/hostfs`, `pkg/sentry/fsimpl/ext4lite`, `e2e`, `tools/upstream`, `tools/shiminterop`, `tools/licenses`, `tools/gvisorlint`, `tools/androidprobe`, `tools/gostateify`, `android`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Place alongside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip`, `pkg/sentry/platform/systrap/{usertrap,sysmsg}` (`amd64` files) | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below `5.0%`. Name every additive helper file in a shared package `*_xplat.go` or `*_darwin*.go`, so the audit counts it as a Tier 2 sibling. |
 
@@ -134,7 +134,7 @@ The workflow `.github/workflows/android.yml` runs `scripts/android/emulator-smok
 The workflow `.github/workflows/linux16k.yml` boots the `arm64-16k` kernel of Debian trixie in QEMU and runs `scripts/linux16k/run.sh`. That script runs the host facility report, the synthetic ELF probes, the `systrap`, `hostfs`, and `ext4lite` unit tests, and the offline `e2e` suite on 16 KB pages. Both workflows run on pull requests that change `systrap`, `mm`, `pgalloc`, `hostlockdown`, `chunkcache`, `hostfs`, `ext4lite`, `e2e`, or their harnesses.
 
 Native shim tests reexecute production `Main` without `GVX_SHIM_BINARY`. The existing Windows/arm64 job runs the shim package explicitly.
-Explicit interoperability tests use `GVX_SHIM_BINARY`; the private external-daemon test also requires `GVX_CONTAINERD_BINARY`. The [README procedure](README.md#23-containerd-control-shim-procedural-module) separates those smoke tests from guest workloads.
+Explicit interoperability tests use `GVX_SHIM_BINARY`; the private external-daemon test also requires `GVX_CONTAINERD_BINARY`. [`docs/architecture.md`](docs/architecture.md#43-containerd-shim-verification-reference-module) documents those control-boundary tests separately from guest workloads.
 
 Keep CI usage low. Do not add jobs that repeat work, and do not run registry tests on every push. Use these environment variables in CI only:
 
@@ -157,17 +157,17 @@ Each release tag has the form `vMAJOR.MINOR.PATCH`. The workflow `release.yml` r
 | Field | Current value | Rule |
 | :--- | :--- | :--- |
 | `MAJOR` | `0` | Keep `0`. |
-| `MINOR` | `13` | Increase by 1 when a release adds a feature or changes behavior. An upstream sync alone does not increase `MINOR`. |
-| `PATCH` | `10002026110200` | Join the four parts of the next table as decimal digits, in table order. |
+| `MINOR` | `18` | Increase by 1 when a release adds a feature or changes behavior. An upstream sync alone does not increase `MINOR`. |
+| `PATCH` | `10002026111600` | Join the four parts of the next table as decimal digits, in table order. |
 
-| PATCH part | Digits | Value in `v0.6.10002026110200` | Rule |
+| PATCH part | Digits | Value in `v0.18.10002026111600` | Rule |
 | :--- | ---: | :--- | :--- |
 | Fixed digit | 1 | `1` | Always `1`. It prevents a leading zero when the counter is `000`. |
 | Release counter | 3 | `000` | Set to `000` when `MINOR` increases. Increase by 1 for every other release, including an upstream sync. |
-| Upstream date | 8 | `20261102` | The `YYYYMMDD` of `release_tag` (`release-YYYYMMDD.N`) in `tools/upstream/sync_manifest.json`. |
+| Upstream date | 8 | `20261116` | The `YYYYMMDD` of `release_tag` (`release-YYYYMMDD.N`) in `tools/upstream/sync_manifest.json`. |
 | Upstream suffix | 2 | `00` | The `N` of that `release_tag`, padded to two digits. |
 
-The counter comes before the upstream date, so each later release in one `MINOR` version has a larger PATCH. One `MINOR` version holds at most 1000 releases. After `v0.6.10002026110200`, a fix without an upstream sync is `v0.6.10012026110200`. A later sync to `release-20261109.0` is `v0.6.10022026110900`. A tag with a hyphen, such as `v0.6.10012026110200-rc.1`, publishes a pre-release.
+The counter comes before the upstream date, so each later release in one `MINOR` version has a larger PATCH. One `MINOR` version holds at most 1000 releases. After `v0.18.10002026111600`, a fix without an upstream sync is `v0.18.10012026111600`. A later sync to `release-20261123.0` is `v0.18.10022026112300`. A tag with a hyphen, such as `v0.18.10012026111600-rc.1`, publishes a pre-release.
 
 ### 5.3 Release Procedure (Procedural Module)
 

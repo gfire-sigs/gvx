@@ -679,7 +679,7 @@ A signal frame that a guest wrote for a fault in a relocated instruction of a po
 | Engine | Syscall filter | Guest can reach host NT services | Basis |
 | :--- | :--- | :--- | :--- |
 | Linux `systrap` | `seccomp` allowlist in the Sentry, trap for guests | no | kernel filter |
-| macOS `systrap` | Seatbelt profile kills the stub | no | kernel filter |
+| macOS `systrap` (removed) | Seatbelt profile killed the stub (removed due to 4KB segments and non-PIE limits) | no | kernel filter |
 | Windows `whpx` and `hvf` | none needed | no | hardware virtualization |
 | Windows `arm64` `systrap` | none | yes, through `ntdll` stubs | token, job, mitigation policy, page scan |
 | Windows `amd64` `systrap` | none | yes, through `ntdll` stubs and anonymous RWX JIT pages | token, job, mitigation policy, page scan |

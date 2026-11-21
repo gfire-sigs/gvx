@@ -56,7 +56,7 @@ The repository has no end-to-end test for Chromium, Playwright, Puppeteer, or El
 | :--- | :--- |
 | Browser or Electron gate in `e2e/` | None |
 | `/dev/shm` | A `tmpfs` mount without a size option (`pkg/gvx/kernel_runner.go`), so the `tmpfs` default of 50% of host RAM applies |
-| Guest devices | `pkg/gvx` registers `memdev`, `ttydev`, `/dev/fuse`, and `tundev` (when the stack supports TUN). `pkg/sentry/devices` also holds `nvproxy`, `rdmaproxy`, and `tpuproxy`, which `pkg/gvx` does not register. |
+| Guest devices | `pkg/gvx` registers `memdev`, `/dev/kmsg`, `ttydev`, `/dev/fuse`, and `tundev` (when the stack supports TUN). `pkg/sentry/devices` also holds `nvproxy`, `rdmaproxy`, and `tpuproxy`, which `pkg/gvx` does not register. |
 | DRM device (`/dev/dri/*`) | None |
 | Cost of `fork` and `exec` on Windows `systrap` | 6.4 ms on `amd64` and 22 ms on `arm64` (hosted runners; `systrap-windows.md`, section 3.9) |
 
@@ -91,7 +91,7 @@ The design must satisfy the rules of [`AGENTS.md`](../AGENTS.md) and of the back
 | Sockets of `hostfs` live in Sentry memory | `docs/architecture.md`, "Special Files and Extended Attributes"; `pkg/sentry/fsimpl/hostfs/host.go` (`hostKindOther`) | A guest cannot connect to a host Unix socket through a bind mount. A display bridge needs a new socket bridge or TCP. |
 | Guest memory differs on each backend | `hvf` (`hv_vm_map`, 16 KiB blocks), `whpx` (`WHvMapGpaRange`), Windows `systrap` (section views), Linux `systrap` (memory file) | A shared buffer of the renderer needs a new `memmap.File` for each backend. |
 | Hosted CI runners have no GPU | GitHub-hosted runners | CI runs function tests on WARP for Windows only. The hosted macOS runner cannot run `hvf` (`docs/architecture.md`, section 4.2), so macOS tests run by hand on an Apple Silicon host. CI cannot detect a performance regression. |
-| Upstream diff budget below 2.0% | `tools/upstream -mode=audit` | Add each new package to `tier1Prefixes` first. Otherwise the audit charges each added file against the ceiling. The `sysfs` change needs a `seam` line in `buildtag_allowlist.txt`. |
+| Upstream diff budget below 5.0% (4.2% CI gate) | `tools/upstream -mode=audit` | Add each new package to `tier1Prefixes` first. Otherwise the audit charges each added file against the ceiling. The `sysfs` change needs a `seam` line in `buildtag_allowlist.txt`. |
 
 ---
 
