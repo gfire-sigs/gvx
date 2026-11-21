@@ -23,7 +23,7 @@ These limits are documented behavior, not vulnerabilities:
 - On Windows, `systrap` uses user-mode syscall patching with Low-integrity token and job containment; it provides no hardware or kernel syscall trap.
 - On Android, a host mount leaves `Status.UnboundFileOpenBlocked` false because the `untrusted_app` seccomp policy of Zygote blocks Landlock calls.
 - `-lockdown=false` disables the host lockdown.
-- A guest can use the host network that `-net=nat` and `-p` expose.
+- A guest can use the host network that `-net=nat`, `-p`, and `--auto-publish` (`127.0.0.1` loopback listeners) expose.
 - `-gpu=venus` and `-gpu=virgl` add a host process that parses guest-controlled command streams in C and calls the host GPU driver. In `venus` mode, a defect in `virglrenderer`, KosmicKrisp, or Metal is reachable inside the renderer confinement. In `virgl` mode, the renderer exposes the `vrend` decoder and the system OpenGL framework; the same confinement, limits, and opt-in rule apply. The renderer build applies pinned `virglrenderer` patches from `gpurenderer/patches/virglrenderer/` for Apple OpenGL 4.1 core and records their SHA-256 digests in `BUILDINFO`.
 - With `-gpu=venus` or `-gpu=virgl`, the host kernel does not limit the memory of the renderer. A watchdog inside the renderer exits above the configured limit; a corrupted renderer can skip it.
 - With `-gpu=venus` or `-gpu=virgl`, a guest can end its own GPU access: a malformed command stream stops the renderer, and the renderer does not restart.

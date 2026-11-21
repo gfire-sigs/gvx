@@ -17,11 +17,13 @@ package vxlan
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/buffer"
 	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/adapters/gonet"
 	"z.gfire.dev/gvx/pkg/tcpip/checksum"
 	"z.gfire.dev/gvx/pkg/tcpip/header"
 	"z.gfire.dev/gvx/pkg/tcpip/link/channel"
@@ -134,6 +136,159 @@ func TestLinksThatRouteThroughEachOtherDropTheLoop(t *testing.T) {
 	}
 	if got := s.NICInfo()[2].Stats.Tx.Packets.Value(); got != 0 {
 		t.Fatalf("the second link sent %d packets, want 0 because the first link drops the loop", got)
+	}
+}
+
+// loopBreaker counts the frames that a bridge port receives. At limit frames
+// it calls stop, so a transmit loop ends before the goroutine overflows its
+// stack.
+type loopBreaker struct {
+	frames, limit int
+	stop          func()
+}
+
+// WriteNotify implements channel.Notification. The channel calls it on the
+// goroutine that writes the frame.
+func (b *loopBreaker) WriteNotify() {
+	b.frames++
+	if b.frames == b.limit {
+		b.stop()
+	}
+}
+
+// TestLinkUnderABridgeThatCarriesItsOuterRouteBoundsTheNesting sets up a link
+// as a port of the bridge that carries the outer route of the link:
+//
+//	ip link add br0 type bridge
+//	ip addr add 192.168.50.1/24 dev br0
+//	ip link add vx0 type vxlan id 1 remote 192.168.50.2 dstport 8472
+//	ip link set vx0 master br0
+//	ip neigh add 192.168.50.2 lladdr 02:00:00:00:00:01 dev br0 nud permanent
+//
+// The bridge floods a frame for 192.168.50.2 to the link. The link wraps the
+// frame and sends the outer packet to 192.168.50.2 through the bridge again.
+// The outer route leaves through the bridge, which is not a vxlan link, so the
+// guard of the outer route does not drop the packet. A second bridge port
+// counts the frames. The link must wrap a frame eight times at most, which is
+// the transmit recursion limit of Linux.
+func TestLinkUnderABridgeThatCarriesItsOuterRouteBoundsTheNesting(t *testing.T) {
+	const (
+		bridgeNIC tcpip.NICID = 1
+		vxlanNIC  tcpip.NICID = 2
+		probeNIC  tcpip.NICID = 3
+		// wantFrames is the first frame plus one outer packet for each of the
+		// eight permitted transmit calls.
+		wantFrames = 1 + 8
+	)
+	s := newTestStack(t)
+	if err := s.CreateNIC(bridgeNIC, stack.NewBridgeEndpoint(1500)); err != nil {
+		t.Fatalf("CreateNIC(bridge): %v", err)
+	}
+	addAddr(t, s, bridgeNIC, ip4(192, 168, 50, 1), 24)
+	remote := ip4(192, 168, 50, 2)
+	vx, err := New(s, Config{ID: vxlanNIC, VNI: 1, Port: DefaultPort, Group: remote})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.CreateNIC(vxlanNIC, vx); err != nil {
+		t.Fatalf("CreateNIC(vxlan): %v", err)
+	}
+	probe := channel.New(1024, 1500, "\x02\x00\x00\x00\x00\x03")
+	if err := s.CreateNIC(probeNIC, probe); err != nil {
+		t.Fatalf("CreateNIC(probe): %v", err)
+	}
+	for _, port := range []tcpip.NICID{vxlanNIC, probeNIC} {
+		if err := s.SetNICCoordinator(port, bridgeNIC); err != nil {
+			t.Fatalf("SetNICCoordinator(%d): %v", port, err)
+		}
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: mustSubnet(t, ip4(192, 168, 50, 0), 24), NIC: bridgeNIC}})
+	if err := s.AddStaticNeighbor(bridgeNIC, ipv4.ProtocolNumber, remote, "\x02\x00\x00\x00\x00\x01"); err != nil {
+		t.Fatalf("AddStaticNeighbor: %v", err)
+	}
+	// Without a bound, the loop never ends. The breaker removes the only FDB
+	// entry of the link at 16 frames, so the test fails and does not crash.
+	breaker := &loopBreaker{limit: 16, stop: func() {
+		if err := vx.FDBDelete(zeroMAC, Remote{}); err != nil {
+			t.Errorf("FDBDelete: %v", err)
+		}
+	}}
+	probe.AddNotify(breaker)
+
+	c, err := gonet.DialUDP(s, nil, &tcpip.FullAddress{Addr: remote, Port: 9000}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte("loop")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if breaker.frames != wantFrames {
+		t.Fatalf("the bridge sent %d frames for one datagram, want %d: the first frame and 8 nested outer packets", breaker.frames, wantFrames)
+	}
+}
+
+// transmitGate holds each writer of the underlay inside its transmit call
+// until release closes.
+type transmitGate struct {
+	arrived chan struct{}
+	release chan struct{}
+}
+
+// WriteNotify implements channel.Notification.
+func (g *transmitGate) WriteNotify() {
+	g.arrived <- struct{}{}
+	<-g.release
+}
+
+// TestTransmitsOfManyGoroutinesAreNotNested keeps 32 goroutines inside a
+// transmit call of one link at the same time. The nesting bound counts the
+// calls of one goroutine only, so every frame must reach the underlay.
+func TestTransmitsOfManyGoroutinesAreNotNested(t *testing.T) {
+	const senders = 32
+	s := newTestStack(t)
+	ch := channel.New(senders, 1514, "\x02\x00\x00\x00\x00\x01")
+	if err := s.CreateNIC(underlayNIC, ethernet.New(ch)); err != nil {
+		t.Fatal(err)
+	}
+	addAddr(t, s, underlayNIC, ip4(10, 0, 0, 1), 24)
+	if err := s.AddStaticNeighbor(underlayNIC, ipv4.ProtocolNumber, ip4(10, 0, 0, 2), "\x02\x00\x00\x00\x00\x02"); err != nil {
+		t.Fatal(err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: mustSubnet(t, ip4(10, 0, 0, 0), 24), NIC: underlayNIC}})
+	ep, err := New(s, Config{ID: overlayNIC, VNI: 7, Port: 4789, Group: ip4(10, 0, 0, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ep.Close()
+	gate := &transmitGate{arrived: make(chan struct{}, senders), release: make(chan struct{})}
+	ch.AddNotify(gate)
+	var wg sync.WaitGroup
+	for range senders {
+		wg.Go(func() {
+			var pkts stack.PacketBufferList
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(make([]byte, 60))})
+			defer pkt.DecRef()
+			pkts.PushBack(pkt)
+			ep.WritePackets(pkts)
+		})
+	}
+	// A sender that the link drops returns at once and never arrives.
+	arrived := 0
+	timeout := time.After(5 * time.Second)
+wait:
+	for arrived < senders {
+		select {
+		case <-gate.arrived:
+			arrived++
+		case <-timeout:
+			break wait
+		}
+	}
+	close(gate.release)
+	wg.Wait()
+	if arrived != senders {
+		t.Fatalf("%d of %d concurrent frames reached the underlay", arrived, senders)
 	}
 }
 

@@ -22,24 +22,24 @@ It is built on Google's [gVisor](https://github.com/google/gvisor) user-space ap
 
 Upstream gVisor (`runsc`) is an OCI runtime for Linux hosts. On Windows and macOS, tools like Docker Desktop, WSL2, Lima, and Podman Desktop run Linux containers by booting a persistent Linux utility VM in the background.
 
-`gvx` takes the opposite approach: it ports gVisor's user-space Linux kernel to run directly as a normal Windows or macOS process. Despite running without a Linux VM, `gvx` provides a complete enough Linux kernel boundary to run unmodified `dockerd` (`docker:dind`), single-node and multi-node Kubernetes clusters (`rancher/k3s`), `containerd`, `runc`, and Calico CNI with `NetworkPolicy` enforcement.
+`gvx` takes the opposite approach: it runs gVisor's user-space Linux kernel directly as a normal Windows or macOS process. Without a Linux VM, `gvx` still runs unmodified `dockerd` (`docker:dind`), single-node and multi-node Kubernetes clusters (`rancher/k3s`), `containerd`, `runc`, and Calico CNI with `NetworkPolicy` enforcement.
 
 | Property | `gvx` (`whpx` / `hvf`) | `gvx` (`systrap`) | WSL2 / Lima / Docker Desktop |
 | :--- | :--- | :--- | :--- |
 | **Host OS** | Windows (`amd64`, `arm64`), macOS (`arm64`) | Linux (`amd64`, `arm64`), Windows (`amd64`, `arm64`) | Windows, macOS |
 | **Background VM / Daemon** | None (single process per sandbox) | None (single process per sandbox) | Persistent Linux VM + daemon |
 | **Admin / `root` Required** | No | No | Yes (initial VM/driver setup) |
-| **Typical Cold Start** | `~20 ms` (cached EROFS layer) | `~25 to 65 ms` (cached EROFS layer) | `800 to 2500 ms` (if VM is cold) |
-| **Base Memory Overhead** | `~16 MiB` per sandbox process | `~16 MiB` per sandbox process | `512 MiB+` reserved for the utility VM |
-| **Workload Coverage** | CLI tools, databases, `dockerd`, full `k3s` + Calico CNI | CLI tools, databases, `dockerd`, full `k3s` + Calico CNI | Full Linux kernel inside the VM |
+| **Typical Cold Start** | `~20 ms` (cached EROFS layer) | `~25 to 65 ms` (cached EROFS layer) | `800 to 2500 ms` (when VM is cold) |
+| **Base Memory Overhead** | `~16 MiB` per sandbox process | `~16 MiB` per sandbox process | `512 MiB+` reserved for utility VM |
+| **Workload Coverage** | CLI tools, databases, `dockerd`, `k3s` + Calico CNI | CLI tools, databases, `dockerd`, `k3s` + Calico CNI | Full Linux kernel inside the VM |
 | **Cross-Arch Emulation** | Host CPU arch (`amd64` or `arm64`) | Host CPU arch (`amd64` or `arm64`) | Via QEMU `binfmt_misc` / Rosetta |
 
-### What `gvx` Unlocks
+### Core Capabilities
 
-- **Full Docker Engine and Kubernetes (`k3s` + Calico CNI) in a single process**: `gvx` implements cgroup v2 (`memory.max`, `cpu.max`), `overlayfs`, `pivot_root`, netfilter/iptables (`addrtype`, `conntrack`, `xt_recent`, `rpfilter`, `set`), `ipset`, VXLAN, and kernel WireGuard netlink (`wg0`). An unmodified `rancher/k3s` server or multi-node cluster boots inside `gvx`, passes Kubernetes `sonobuoy` conformance checks (`Quick` and `[sig-network] Services`), and enforces pod `NetworkPolicy` rules with either `flannel` (`wireguard-native`) or Calico VXLAN.
-- **Portable, journaled single-file volumes (`ext4lite`)**: Databases (`PostgreSQL`, `SQLite`), `dockerd`, and `k3s` require real POSIX filesystem semantics (`overlayfs` whiteouts, xattrs, hard links, atomic rename, and `fsync` durability) that break on Windows NTFS or case-insensitive macOS APFS. `ext4lite` stores each named volume (`-v data:/var/lib/data`) as a standard Linux `ext4` image file (`<name>.ext4`) with a `jbd2` journal and dynamic 16 MiB block groups. Volumes start small, grow on demand, survive crashes via journal replay, and mount unmodified with `mount -o loop` on any Linux machine.
-- **Embedding Linux sandboxes in Go applications (`pkg/gvx`)**: Launch isolated Linux containers or ELF binaries directly from a Go library call without shipping a VM image or requiring Docker Desktop on the user's machine.
-- **Lockdown-safe Checkpoint and Restore (`rungv checkpoint` / `restore`)**: Snapshot a running sandbox's task graph, memory pages, `ext4lite` volumes, and child network namespaces to a directory bundle and resume execution in milliseconds.
+- **Docker Engine and Kubernetes (`k3s` + Calico CNI) in one process**: `gvx` implements cgroup v2 (`memory.max`, `cpu.max`), `overlayfs`, `pivot_root`, netfilter/iptables (`addrtype`, `conntrack`, `xt_recent`, `rpfilter`, `set`), `ipset`, VXLAN, and kernel WireGuard netlink (`wg0`). An unmodified `rancher/k3s` server or multi-node cluster boots inside `gvx`, passes Kubernetes `sonobuoy` conformance checks (`Quick` and `[sig-network] Services`), and enforces pod `NetworkPolicy` rules with `flannel` (`wireguard-native`) or Calico VXLAN.
+- **Portable, journaled single-file volumes (`ext4lite`)**: Databases (`PostgreSQL`, `SQLite`), `dockerd`, and `k3s` rely on POSIX filesystem semantics (`overlayfs` whiteouts, xattrs, hard links, atomic rename, and `fsync` durability) that break on Windows NTFS or case-insensitive macOS APFS. `ext4lite` stores each named volume (`-v data:/var/lib/data`) as a standard Linux `ext4` image file (`<name>.ext4`) with a `jbd2` journal and dynamic 16 MiB block groups. Volumes start small, grow on demand, recover from crashes through journal replay, and mount unmodified with `mount -o loop` on Linux.
+- **Embedded Linux sandboxes in Go (`pkg/gvx`)**: Launch isolated Linux containers or ELF binaries from a Go library call without shipping a VM image or requiring Docker Desktop.
+- **Lockdown-safe Checkpoint and Restore (`rungv checkpoint` / `restore`)**: Snapshot a running sandbox's task graph, memory pages, `ext4lite` volumes, and child network namespaces to a directory bundle, then resume execution in milliseconds.
 
 ### Scope and Trade-offs
 
@@ -55,28 +55,28 @@ When you start a container with `rungv` or `pkg/gvx`, the host process compiles 
 
 ![gvx Sandbox Architecture](docs/assets/overview.svg)
 
-### How the Host OS Gaps Are Bridged
+### How `gvx` Bridges Host OS Differences
 
 1. **CPU Ring and 4 KB Paging (`whpx`, `hvf`, `systrap`)**:
-   - On macOS (`arm64`), `pkg/sentry/platform/hvf` runs guest code inside an Apple `Hypervisor.framework` vCPU with 4 KB Stage-1 guest pages mapped over 16 KB macOS host pages.
+   - On macOS (`arm64`), `pkg/sentry/platform/hvf` runs guest code inside an Apple `Hypervisor.framework` vCPU with 4 KB Stage-1 guest pages over 16 KB host pages.
    - On Windows (`amd64`, `arm64`), `pkg/sentry/platform/whpx` runs guest code inside a Windows Hypervisor Platform (`WinHvPlatform.dll`) partition with 4 KB EPT / Stage-2 mappings.
-   - On Linux (`amd64`, `arm64`) and Android (`arm64`, including 16 KB page kernels), `gvx` uses `systrap` (`seccomp` + shared-memory trampolines + 4 KB sub-block paging).
+   - On Linux (`amd64`, `arm64`) and Android (`arm64`, including 16 KB page kernels), `gvx` uses `systrap` (`seccomp`, shared-memory trampolines, and 4 KB sub-block paging).
 2. **In-Memory OCI-to-EROFS Compilation (`pkg/oci`)**:
    - Extracting a Linux container `.tar` layer onto Windows NTFS or default macOS APFS breaks case-sensitive filenames (`Makefile` vs `makefile`), device nodes, and Windows reserved names (`CON`, `AUX`, `NUL`).
-   - `pkg/oci` never extracts container layers onto the host filesystem. It streams `.tar.gz` and `.tar.zst` layers in memory and compiles them directly into read-only `<sha256>.erofs` images cached on disk. By default, `gvx` mounts them under an in-memory `tmpfs` upper layer; `-rootfs-volume` (`Config.RootVolume`) mounts an `ext4lite` image as the persistent overlay upper layer instead.
+   - `pkg/oci` never extracts container layers onto the host filesystem. It streams `.tar.gz` and `.tar.zst` layers in memory and compiles them into read-only `<sha256>.erofs` images cached on disk. By default, `gvx` mounts them under an in-memory `tmpfs` upper layer; `-rootfs-volume` (`Config.RootVolume`) mounts an `ext4lite` image as the persistent overlay upper layer instead.
 3. **Single-File Journaled `ext4` Volumes (`pkg/sentry/fsimpl/ext4lite`)**:
-   - Named volumes (`-v appdata:/var/lib/data`) are backed by `ext4lite`, a pure-Go VFS2 driver that formats and mounts a single `<name>.ext4` file on the host.
-   - `ext4lite` organizes disk space into self-contained 16 MiB block groups with extent trees, inline data for small files, directory indexing, extended attributes (`security.*`, `trusted.overlay.*`), and an ordered metadata journal (`jbd2`). On filesystems where sparse hole punching (`FSCTL_SET_ZERO_DATA` or `F_PUNCHHOLE`) is unavailable or exhausted, `ext4lite` falls back cleanly to dense block allocation and compacts unused tail groups on unmount.
+   - Named volumes (`-v appdata:/var/lib/data`) use `ext4lite`, a pure-Go VFS2 driver that formats and mounts a single `<name>.ext4` file on the host.
+   - `ext4lite` divides disk space into 16 MiB block groups with extent trees, inline data for small files, directory indexing, extended attributes (`security.*`, `trusted.overlay.*`), and an ordered metadata journal (`jbd2`). When sparse hole punching (`FSCTL_SET_ZERO_DATA` or `F_PUNCHHOLE`) is unavailable, `ext4lite` falls back to dense block allocation and compacts unused tail groups on unmount.
 4. **Pinned Host Directory Sharing (`pkg/sentry/fsimpl/hostfs`)**:
    - When you mount a host directory with `-workspace` or `-v ./src:/src`, `hostfs` opens every path relative to a pinned `os.Root` directory handle (`NtCreateFile` with `FILE_OPEN_REPARSE_POINT` on Windows; `openat` with `O_NOFOLLOW` on macOS and Linux). It encodes Windows-invalid characters and case collisions with a stateless `~gvx~` prefix and bridges host filesystem events into guest `inotify` watches.
 5. **Driverless Networking (`pkg/netbackend`)**:
-   - `-net=nat` runs gVisor's user-space TCP/IP stack (`netstack`) and translates outbound guest TCP/UDP flows into unprivileged host Go `net` sockets, supporting port ranges (`-p`), host Unix domain socket forwarding (`-p unix:path:port`), and `host.docker.internal` (`10.0.2.2`).
-   - `-net=wg` routes L3 packets from `netstack` through an in-memory `wireguard-go` endpoint over a single unprivileged host UDP socket, requiring no `WinTun.dll` or `/dev/tun` driver.
+   - `-net=nat` runs gVisor's user-space TCP/IP stack (`netstack`) and relays outbound guest TCP and UDP flows through unprivileged host Go `net` sockets. It supports static port forwards and ranges (`-p`), host Unix socket forwarding (`-p unix:path:port`), opt-in dynamic loopback publishing (`--auto-publish`), and `host.docker.internal` (`10.0.2.2`).
+   - `-net=wg` routes L3 packets from `netstack` through an in-memory `wireguard-go` endpoint over one unprivileged host UDP socket, with no `WinTun.dll` or `/dev/tun` driver.
 6. **Pre-Execution Host Self-Lockdown (`pkg/hostlockdown`)**:
-   - Before executing the first guest instruction, `gvx` opens all required `.erofs` layers, `.ext4` volume files, workspace directory handles, and listeners, then calls `hostlockdown.Apply()`.
-   - Linux installs a Landlock filesystem ruleset restricting path access to mounted directories, followed by a `seccomp-bpf` filter.
+   - Before executing the first guest instruction, `gvx` opens all `.erofs` layers, `.ext4` volume files, workspace directory handles, and static listeners, then calls `hostlockdown.Apply()`.
+   - Linux installs a Landlock filesystem ruleset scoped to mounted paths, followed by a `seccomp-bpf` filter.
    - macOS applies a Seatbelt profile (`sandbox_init`) denying `process-fork` and unbound `file-*` paths.
-   - Windows applies a Restricted Token, Low Mandatory Integrity, and a Job Object (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, `JOB_OBJECT_UILIMIT_ALL`), routing legitimate post-lockdown workspace opens through an in-process pre-lockdown handle broker without mutating host directory ACLs.
+   - Windows lowers the primary token to Untrusted integrity, applies a Restricted Token and Job Object (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, `JOB_OBJECT_UILIMIT_ALL`), and routes post-lockdown workspace opens through an in-process file broker without changing host NTFS ACLs. Outbound NAT and `--auto-publish` loopback binds run through a Low-integrity socket broker.
 
 ---
 
@@ -134,11 +134,11 @@ See [`docs/cli.md`](docs/cli.md) for the complete command and flag reference, [`
 | :--- | :--- | :--- |
 | `run` | `rungv run [flags] IMAGE [COMMAND [ARG...]]` | Run a command inside an OCI image or a local Linux ELF64 binary (`-bin`). |
 | `checkpoint` / `restore` | `rungv checkpoint -control-socket PATH` / `rungv restore -checkpoint-dir DIR` | Save a running sandbox (`snapshot`) or resume a saved bundle (`resume`). |
-| `pull` / `images` / `rmi` | `rungv pull IMAGE` / `rungv images` / `rungv rmi IMAGE` | Pull, list, or remove cached OCI images and compiled `.erofs` layers. |
-| `inspect` / `tag` | `rungv inspect IMAGE` / `rungv tag SRC DST` | Inspect image configuration JSON or retag a cached image. |
-| `save` / `load` | `rungv save -o FILE IMAGE...` / `rungv load -i FILE` | Export images to an OCI `.tar` archive or import them offline. |
+| `image` (`pull`, `images`, `rmi`, `inspect`, `tag`, `save`, `load`) | `rungv image <subcommand>` | Pull, list, inspect, tag, save, load, remove, or prune cached OCI images. |
+| `volume` | `rungv volume <create\|ls\|inspect\|compact\|rm\|prune>` | Create, inspect, compact, remove, or prune local `ext4lite` and `hostfs` volumes. |
+| `system` / `info` | `rungv system <info\|df\|prune>` / `rungv info` | Probe host backends, show cache and volume usage, or prune local storage. |
 | `login` / `logout` | `rungv login [SERVER]` / `rungv logout [SERVER]` | Store or remove registry credentials in the Docker config store. |
-| `stub` / `tune` | `rungv stub` / `rungv tune list` | Probe `systrap` host readiness or list runtime tunables. |
+| `stub` / `tune` / `completion` | `rungv stub` / `rungv tune list` / `rungv completion SHELL` | Probe `systrap` readiness, list runtime tunables, or print shell completions. |
 | `version` / `license` | `rungv version` / `rungv license` | Print version metadata or embedded open-source licenses. |
 
 ### 3.3 Embed in Go (`pkg/gvx`)
@@ -248,7 +248,7 @@ With `venus`, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU Venus`
 | **macOS `arm64`** (Apple Silicon M1 to M5) | `hvf` (`Hypervisor.framework`) | None | Requires `com.apple.security.hypervisor` code-signing entitlement. Optional GPU for headless browsers: `-gpu=venus` or `-gpu=virgl` (macOS 26 or later, section 3.4). |
 | **Windows `amd64`** (Intel / AMD) | `whpx` (`WinHvPlatform.dll`) | `systrap` (opt-in) | `whpx` requires Windows Hypervisor Platform. `systrap` requires `-platform=systrap` or `-allow-unconfined-systrap`. |
 | **Windows `arm64`** (Snapdragon X) | `whpx` (`WinHvPlatform.dll`) | `systrap` (opt-in) | `whpx` on Windows 11 24H2+; `systrap` runs without a hypervisor for trusted workloads. |
-| **Linux `amd64` & `arm64`** | `systrap` / `kvm` | `systrap` | Supports both 4 KB and 16 KB host page kernels (including Android 15/16 `arm64`). |
+| **Linux `amd64` & `arm64`** | `systrap` | None | Supports both 4 KB and 16 KB host page kernels (including Android 15/16 `arm64`). |
 
 ---
 
@@ -256,10 +256,10 @@ With `venus`, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU Venus`
 
 | Document | Contents |
 | :--- | :--- |
-| [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, flags, mounts, checkpoint/restore, containerd shim, and Android usage. |
+| [`docs/cli.md`](docs/cli.md) | Complete `rungv` command reference, flags, tunables, mounts, checkpoint/restore, nested use, and Android usage. |
 | [`docs/recipes/docker-engine.md`](docs/recipes/docker-engine.md) | Recipe: Run `dockerd` inside a `gvx` sandbox with an `ext4lite` volume and connect your host `docker` CLI. |
 | [`docs/recipes/kubernetes.md`](docs/recipes/kubernetes.md) | Recipe: Run single-node or multi-node `k3s` Kubernetes clusters (with flannel or Calico CNI) inside `gvx`. |
-| [`docs/architecture.md`](docs/architecture.md) | Internal architecture, Tier 1/2/3 upstream isolation model, memory/handle ownership, and contributor guide. |
+| [`docs/architecture.md`](docs/architecture.md) | Internal architecture, Tier 1/2/3 upstream isolation model, containerd control shim, memory/handle ownership, and CI guide. |
 | [`docs/systrap-windows.md`](docs/systrap-windows.md) | Engineering deep dive and measurements for the Windows user-mode `systrap` engine. |
 | [`docs/moonshots.md`](docs/moonshots.md) | GPU acceleration for browser guests: the plan, the measured gates of the macOS paths (`-gpu=venus`, `-gpu=virgl`), and the proposals for Windows and for display output. |
 | [`SECURITY.md`](SECURITY.md) | Threat model, security boundaries per platform, and vulnerability reporting policy. |
@@ -273,18 +273,18 @@ With `venus`, `UNMASKED_RENDERER_WEBGL` contains `Vulkan` and `Virtio-GPU Venus`
 
 ### Upstream Traceability (`< 5.0%` Upstream Diff Budget)
 
-`gvx` tracks the official `go` branch of [google/gvisor](https://github.com/google/gvisor) (Apache License 2.0, Copyright The gVisor Authors) and pins the exact synced commit SHA in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT) (`tools/upstream/sync_manifest.json`). Rather than maintaining a diverging hard fork, `gvx` enforces a strict three-tier isolation boundary verified on every CI run by `go run ./tools/upstream -mode=audit -max-ratio=0.05`:
+`gvx` tracks the official `go` branch of [google/gvisor](https://github.com/google/gvisor) (Apache License 2.0, Copyright The gVisor Authors) and pins the synced commit SHA in [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT) (`tools/upstream/sync_manifest.json`). Rather than maintaining a diverging hard fork, `gvx` enforces a three-tier isolation boundary verified on every CI run by `go run ./tools/upstream -mode=audit -max-ratio=0.042` (within the `< 5.0%` budget):
 
 - **Tier 1 (Additive Packages, `0.0%` upstream overlap)**: Windows/macOS hypervisor engines (`whpx`, `hvf`, `hvcommon`), `ext4lite`, `hostfs`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/gvx`, `cmd/rungv`, and `tools/gostateify` live in standalone packages that never collide with upstream gVisor.
 - **Tier 2 (OS-Specific Sibling Files)**: Platform bindings live in `*_windows.go`, `*_darwin.go`, and `*_xplat.go` sibling files alongside unmodified upstream `*_linux.go` files.
-- **Tier 3 (Minimal Upstream Seams, `< 5.0%`)**: Fewer than `5.0%` of upstream gVisor files (`104 / 2,526` files, **`4.12%`**) contain build-tag expansions or hook seams, and `tools/upstream -mode=sync` performs automated 3-way merges (`git merge-file`) across upstream releases.
+- **Tier 3 (Minimal Upstream Seams, `< 5.0%`)**: Fewer than `5.0%` of upstream gVisor files (`105 / 2,550` files, **`4.12%`**) carry build-tag expansions or hook seams. `tools/upstream -mode=sync` runs automated 3-way merges (`git merge-file`) across upstream releases.
 
 Run `rungv license` to print the full license texts of `gvx`, upstream gVisor, the Go standard library, and all linked third-party Go modules, or `rungv license -list` for the SPDX summary table.
 
 | SPDX identifier | Third-party modules |
 | :--- | :--- |
 | `Apache-2.0` | `github.com/distribution/reference` v0.6.0, `github.com/google/btree` v1.1.2, `github.com/opencontainers/image-spec` v1.1.1 |
-| `Apache-2.0 AND BSD-3-Clause AND MIT` | `github.com/klauspost/compress` v1.18.0 |
+| `Apache-2.0 AND BSD-3-Clause AND MIT` | `github.com/klauspost/compress` v1.20.5 |
 | `BSD-3-Clause` | `golang.org/x/arch` v0.32.0, `golang.org/x/crypto` v0.57.0, `golang.org/x/exp` v0.0.0-20250711185948-6ae5c78190dc, `golang.org/x/mod` v0.41.0, `golang.org/x/net` v0.60.0, `golang.org/x/sync` v0.23.0, `golang.org/x/sys` v0.48.0, `golang.org/x/text` v0.42.0, `golang.org/x/time` v0.15.0, `google.golang.org/protobuf` v1.36.11 |
 | `MIT` | `golang.zx2c4.com/wintun` v0.0.0-20230126152724-0fa3db229ce2, `golang.zx2c4.com/wireguard` v0.0.0-20261006164505-2631ce99a06f |
 | `NOASSERTION` | `github.com/opencontainers/go-digest` v1.0.0 |

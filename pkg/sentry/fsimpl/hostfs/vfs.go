@@ -44,8 +44,12 @@ const (
 //
 // +stateify savable
 type InternalFilesystemOptions struct {
-	Workspace   *Workspace `state:"nosave"`
-	UniqueID    checkpoint.ResourceID
+	// Workspace is the host directory or file of the mount. GetFilesystem
+	// fails without it.
+	Workspace *Workspace `state:"nosave"`
+	UniqueID  checkpoint.ResourceID
+	// RestoreMode has no effect. The field stays so that the saved form of
+	// the type does not change.
 	RestoreMode bool
 }
 
@@ -64,14 +68,12 @@ func (FilesystemType) Release(ctx context.Context) {}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	ws, uniqueID, ownsWS, err := resolveWorkspaceForMount(source, opts)
+	ws, uniqueID, err := resolveWorkspaceForMount(opts)
 	if err != nil {
 		return nil, nil, err
 	}
+	// The caller owns ws, so a failed mount does not close it.
 	fail := func(err error) (*vfs.Filesystem, *vfs.Dentry, error) {
-		if ownsWS {
-			_ = ws.Close()
-		}
 		return nil, nil, err
 	}
 
@@ -85,7 +87,6 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	hfs := &filesystem{
 		ws:         ws,
-		ownsWS:     ownsWS,
 		devMinor:   devMinor,
 		uniqueID:   uniqueID,
 		singleFile: ws.SingleFile(),
@@ -103,33 +104,15 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	return &hfs.vfsfs, &hfs.root.vfsd, nil
 }
 
-func resolveWorkspaceForMount(source string, opts vfs.GetFilesystemOptions) (*Workspace, checkpoint.ResourceID, bool, error) {
-	var (
-		ws          *Workspace
-		uniqueID    checkpoint.ResourceID
-		restoreMode bool
-	)
-	if internalOpts, ok := opts.InternalData.(InternalFilesystemOptions); ok {
-		uniqueID = internalOpts.UniqueID
-		restoreMode = internalOpts.RestoreMode
-		ws = internalOpts.Workspace
+// resolveWorkspaceForMount returns the workspace that the Sentry opened for
+// this mount. A mount without that workspace fails. A source path cannot
+// select a host directory, because the caller of mount(2) controls that path.
+func resolveWorkspaceForMount(opts vfs.GetFilesystemOptions) (*Workspace, checkpoint.ResourceID, error) {
+	internalOpts, ok := opts.InternalData.(InternalFilesystemOptions)
+	if !ok || internalOpts.Workspace == nil {
+		return nil, checkpoint.ResourceID{}, linuxerr.EINVAL
 	}
-	if ws != nil {
-		return ws, uniqueID, false, nil
-	}
-	if source == "" {
-		return nil, checkpoint.ResourceID{}, false, linuxerr.EINVAL
-	}
-	var err error
-	if restoreMode {
-		ws, err = OpenWorkspaceForRestore(source, false)
-	} else {
-		ws, err = OpenWorkspace(source, false)
-	}
-	if err != nil {
-		return nil, checkpoint.ResourceID{}, false, translateHostError(err)
-	}
-	return ws, uniqueID, true, nil
+	return internalOpts.Workspace, internalOpts.UniqueID, nil
 }
 
 // filesystem implements vfs.FilesystemImpl. The host is the source of truth.

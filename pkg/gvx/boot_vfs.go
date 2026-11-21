@@ -48,8 +48,14 @@ import (
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
+// registerKernelVFS registers the file system types of the guest kernel.
+//
+// erofs and hostfs take a host resource as their source: erofs adopts the host
+// descriptor that the option ifd names, and hostfs serves a host directory.
+// The guest must not select such a resource, so mount(2) cannot create these
+// types. The Sentry mounts them with GetFilesystemOptions.InternalMount.
 func registerKernelVFS(vfsObj *vfs.VirtualFilesystem, rootNetNS *inet.Namespace) error {
-	vfsObj.MustRegisterFilesystemType("erofs", erofs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+	vfsObj.MustRegisterFilesystemType("erofs", erofs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{})
 	vfsObj.MustRegisterFilesystemType("overlay", overlay.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
 	vfsObj.MustRegisterFilesystemType("tmpfs", tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType("proc", proc.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
@@ -60,7 +66,7 @@ func registerKernelVFS(vfsObj *vfs.VirtualFilesystem, rootNetNS *inet.Namespace)
 	vfsObj.MustRegisterFilesystemType("cgroup2", cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(mqfs.Name, &mqfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(fuse.Name, &fuse.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
-	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
+	vfsObj.MustRegisterFilesystemType(hostfs.Name, hostfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserList: true})
 	vfsObj.MustRegisterFilesystemType(ext4lite.Name, ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true, AllowUserList: true})
 	if ext4lite.Name != "ext4lite" {
 		vfsObj.MustRegisterFilesystemType("ext4lite", ext4lite.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
@@ -392,6 +398,9 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 			Start: root,
 			Path:  makeFPath(target),
 		}
+		// The Sentry creates these mounts from the configuration of the
+		// host, not from a mount(2) call of the guest.
+		opts.GetFilesystemOptions.InternalMount = true
 		if _, err := vfsObj.MountAt(sctx, creds, "", &pop, fsName, opts); err != nil {
 			return fmt.Errorf("gvx: mount %s at %s: %w", fsName, target, err)
 		}

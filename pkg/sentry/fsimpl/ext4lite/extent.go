@@ -139,8 +139,16 @@ func (n *node) parseExtents(raw []byte) error {
 		if depth >= 2 {
 			ixLevels = make([][]indexBlock, depth-1)
 		}
+		// seen holds the tree blocks that the walk has read. Each entry of a
+		// damaged tree can name the same child block. The walk then reads one
+		// subtree many times, and each read extends the lists.
+		seen := make(map[uint64]struct{})
 		var walk func(blk uint64, d int) error
 		walk = func(blk uint64, d int) error {
+			if _, dup := seen[blk]; dup {
+				return corrupt("inode %d extent tree block %d is named twice", n.ino, blk)
+			}
+			seen[blk] = struct{}{}
 			var buf [blockSize]byte
 			cnt, err := n.readTreeBlock(blk, uint16(d), buf[:])
 			if err != nil {

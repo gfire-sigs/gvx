@@ -67,6 +67,10 @@ const (
 	// paxXattrPrefix prefixes the PAX records that carry POSIX xattrs.
 	paxXattrPrefix = "SCHILY.xattr."
 
+	// maxTarName is PATH_MAX. Linux cannot open a longer path, so a longer
+	// tar entry name is invalid. The bound also limits the depth of a path.
+	maxTarName = linux.PATH_MAX
+
 	// minHoleBytes is the shortest run of zero bytes that becomes a sparse
 	// hole. Shorter runs stay data so that ordinary files keep a flat layout.
 	minHoleBytes = 64 << 10
@@ -161,7 +165,9 @@ func newDir(parent *fsNode) *fsNode {
 
 // compiler streams one layer into an image file.
 type compiler struct {
-	dst     ImageFile
+	dst ImageFile
+	// stream is the bounded tar stream. It holds the layer and image budgets.
+	stream  *boundedReader
 	lim     Limits
 	bs      int
 	root    *fsNode
@@ -180,10 +186,11 @@ type compiler struct {
 	opaque    []string
 }
 
-func newCompiler(dst ImageFile, lim Limits, bs int) *compiler {
+func newCompiler(stream *boundedReader, dst ImageFile, lim Limits, bs int) *compiler {
 	copyBlocks := max(1, copyBytes/bs)
 	return &compiler{
 		dst:           dst,
+		stream:        stream,
 		lim:           lim,
 		bs:            bs,
 		root:          newDir(nil),
@@ -252,11 +259,12 @@ func compileLayer(src io.Reader, dst ImageFile, lim Limits, bs int, image *byteB
 		return CompileStats{}, err
 	}
 	defer dec.Close()
-	var stream io.Reader = newBoundedReader(dec, "decompressed layer size", lim.MaxLayerBytes, image)
+	bounded := newBoundedReader(dec, "decompressed layer size", lim.MaxLayerBytes, image)
+	var stream io.Reader = bounded
 	if diff != nil {
 		stream = io.TeeReader(stream, diff.h)
 	}
-	stats, err := compileTarReader(tar.NewReader(stream), dst, lim, bs)
+	stats, err := compileTarReader(tar.NewReader(stream), bounded, dst, lim, bs)
 	if err != nil {
 		return CompileStats{}, err
 	}
@@ -273,8 +281,10 @@ func compileLayer(src io.Reader, dst ImageFile, lim Limits, bs int, image *byteB
 	return stats, nil
 }
 
-func compileTarReader(tr *tar.Reader, dst ImageFile, lim Limits, bs int) (CompileStats, error) {
-	c := newCompiler(dst, lim, bs)
+// compileTarReader compiles the entries of tr. The tar reader tr must read
+// from stream without a buffer between them.
+func compileTarReader(tr *tar.Reader, stream *boundedReader, dst ImageFile, lim Limits, bs int) (CompileStats, error) {
+	c := newCompiler(stream, dst, lim, bs)
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -292,8 +302,12 @@ func compileTarReader(tr *tar.Reader, dst ImageFile, lim Limits, bs int) (Compil
 
 // cleanTarPath returns the slash-separated path of a tar member relative to
 // the layer root. It returns "" for the root itself and rejects names that
-// escape the root or contain NUL bytes or oversized components.
+// escape the root, contain NUL bytes or oversized components, or reach
+// maxTarName bytes.
 func cleanTarPath(name string) (string, error) {
+	if len(name) >= maxTarName {
+		return "", fmt.Errorf("oci: tar entry name %.64q has %d bytes, the limit is %d bytes", name, len(name), maxTarName-1)
+	}
 	if strings.IndexByte(name, 0) >= 0 {
 		return "", fmt.Errorf("oci: tar entry name %q contains a NUL byte", name)
 	}
@@ -316,7 +330,16 @@ func cleanTarPath(name string) (string, error) {
 	return strings.Join(parts, "/"), nil
 }
 
-// ensureDir returns the directory at dirPath, creating implicit parents.
+// countEntry draws one entry from the entry budget of the layer.
+func (c *compiler) countEntry() error {
+	if c.entries++; c.entries > c.lim.MaxEntries {
+		return &LimitError{What: "tar entry count", Limit: c.lim.MaxEntries}
+	}
+	return nil
+}
+
+// ensureDir returns the directory at dirPath, creating implicit parents. Each
+// implicit parent adds a node, so it draws from the entry budget.
 func (c *compiler) ensureDir(dirPath string) (*fsNode, error) {
 	cur := c.root
 	if dirPath == "" {
@@ -325,6 +348,9 @@ func (c *compiler) ensureDir(dirPath string) (*fsNode, error) {
 	for _, part := range strings.Split(dirPath, "/") {
 		next, ok := cur.children[part]
 		if !ok {
+			if err := c.countEntry(); err != nil {
+				return nil, err
+			}
 			next = newDir(cur)
 			cur.children[part] = next
 		} else if !next.isDir() {
@@ -430,8 +456,8 @@ func (c *compiler) addEntry(hdr *tar.Header, tr *tar.Reader) error {
 	if hdr.Typeflag == tar.TypeXGlobalHeader {
 		return nil
 	}
-	if c.entries++; c.entries > c.lim.MaxEntries {
-		return &LimitError{What: "tar entry count", Limit: c.lim.MaxEntries}
+	if err := c.countEntry(); err != nil {
+		return err
 	}
 	clean, err := cleanTarPath(hdr.Name)
 	if err != nil {
@@ -625,6 +651,20 @@ func (w *fileWriter) addBlocks(p []byte) error {
 	return nil
 }
 
+// readContent fills p with file content from tr. For a sparse entry, the tar
+// reader supplies hole bytes that the stream does not hold. Those bytes draw
+// from the stream budgets, so that the budgets bound the logical file size.
+func (c *compiler) readContent(tr io.Reader, p []byte) error {
+	before := c.stream.n
+	if _, err := io.ReadFull(tr, p); err != nil {
+		return unexpectedEOF(err)
+	}
+	if holes := int64(len(p)) - (c.stream.n - before); holes > 0 {
+		return c.stream.charge(holes)
+	}
+	return nil
+}
+
 // streamFile copies size bytes of file content from tr into data blocks.
 func (c *compiler) streamFile(tr io.Reader, n *fsNode, size int64) error {
 	n.size = uint64(size)
@@ -635,8 +675,8 @@ func (c *compiler) streamFile(tr io.Reader, n *fsNode, size int64) error {
 	for remaining := full; remaining > 0; {
 		cnt := min(remaining, c.copyBlocks)
 		chunk := c.buf[:cnt*uint64(c.bs)]
-		if _, err := io.ReadFull(tr, chunk); err != nil {
-			return unexpectedEOF(err)
+		if err := c.readContent(tr, chunk); err != nil {
+			return err
 		}
 		if err := w.addBlocks(chunk); err != nil {
 			return err
@@ -646,8 +686,8 @@ func (c *compiler) streamFile(tr io.Reader, n *fsNode, size int64) error {
 
 	if tailLen > 0 {
 		tail := c.buf[:c.bs]
-		if _, err := io.ReadFull(tr, tail[:tailLen]); err != nil {
-			return unexpectedEOF(err)
+		if err := c.readContent(tr, tail[:tailLen]); err != nil {
+			return err
 		}
 		clear(tail[tailLen:])
 		if w.isZero(tail) {

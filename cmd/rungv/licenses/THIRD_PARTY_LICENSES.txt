@@ -13,7 +13,7 @@ std go1.27.4 BSD-3-Clause
 github.com/google/gvisor 83282de1f21f9ff56941696424d8d9d74e01ee9a Apache-2.0
 github.com/distribution/reference v0.6.0 Apache-2.0
 github.com/google/btree v1.1.2 Apache-2.0
-github.com/klauspost/compress v1.18.0 Apache-2.0 AND BSD-3-Clause AND MIT
+github.com/klauspost/compress v1.20.5 Apache-2.0 AND BSD-3-Clause AND MIT
 github.com/opencontainers/go-digest v1.0.0 NOASSERTION
 github.com/opencontainers/image-spec v1.1.1 Apache-2.0
 golang.org/x/arch v0.32.0 BSD-3-Clause
@@ -924,7 +924,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 Components that use this text:
-  github.com/klauspost/compress v1.18.0
+  github.com/klauspost/compress v1.20.5
       Copyright (c) 2012 The Go Authors. All rights reserved.
       Copyright (c) 2019 Klaus Post. All rights reserved.
       Copyright 2016-2017 The New York Times Company
@@ -937,6 +937,7 @@ Components that use this text:
       Copyright 2016 The Snappy-Go Authors. All rights reserved.
       Copyright 2019+ Klaus Post. All rights reserved.
       Copyright 2020+ Klaus Post. All rights reserved.
+      Copyright 2025+ Klaus Post. All rights reserved.
 
 License text 5 of 8: NOASSERTION
 ----------------------------------------
@@ -1864,7 +1865,7 @@ The files below belong to this repository, or to the modules and the standard li
 Each notice names the files that carry it. The notices that restate the Go BSD-style license or the MIT SPDX line of a module are omitted, because the license texts above cover them.
 
 Notice 1 of 16 (SPDX: NOASSERTION)
-Files: github.com/klauspost/compress/zstd/bitreader.go, github.com/klauspost/compress/zstd/blockdec.go, github.com/klauspost/compress/zstd/blockenc.go, github.com/klauspost/compress/zstd/bytebuf.go, github.com/klauspost/compress/zstd/bytereader.go, github.com/klauspost/compress/zstd/decoder.go, github.com/klauspost/compress/zstd/decoder_options.go, github.com/klauspost/compress/zstd/enc_best.go, github.com/klauspost/compress/zstd/enc_better.go, github.com/klauspost/compress/zstd/enc_dfast.go, github.com/klauspost/compress/zstd/enc_fast.go, github.com/klauspost/compress/zstd/encoder.go, github.com/klauspost/compress/zstd/framedec.go, github.com/klauspost/compress/zstd/frameenc.go, github.com/klauspost/compress/zstd/fse_decoder.go, github.com/klauspost/compress/zstd/fse_encoder.go, github.com/klauspost/compress/zstd/fse_predefined.go, github.com/klauspost/compress/zstd/hash.go, github.com/klauspost/compress/zstd/history.go, github.com/klauspost/compress/zstd/seqdec.go, github.com/klauspost/compress/zstd/seqenc.go, github.com/klauspost/compress/zstd/snappy.go
+Files: github.com/klauspost/compress/zstd/bitreader.go, github.com/klauspost/compress/zstd/blockdec.go, github.com/klauspost/compress/zstd/blockenc.go, github.com/klauspost/compress/zstd/bytebuf.go, github.com/klauspost/compress/zstd/bytereader.go, github.com/klauspost/compress/zstd/decoder.go, github.com/klauspost/compress/zstd/decoder_options.go, github.com/klauspost/compress/zstd/enc_best.go, github.com/klauspost/compress/zstd/enc_better.go, github.com/klauspost/compress/zstd/enc_dfast.go, github.com/klauspost/compress/zstd/enc_fast.go, github.com/klauspost/compress/zstd/enc_jobs.go, github.com/klauspost/compress/zstd/encoder.go, github.com/klauspost/compress/zstd/framedec.go, github.com/klauspost/compress/zstd/frameenc.go, github.com/klauspost/compress/zstd/fse_decoder.go, github.com/klauspost/compress/zstd/fse_encoder.go, github.com/klauspost/compress/zstd/fse_predefined.go, github.com/klauspost/compress/zstd/hash.go, github.com/klauspost/compress/zstd/history.go, github.com/klauspost/compress/zstd/seqdec.go, github.com/klauspost/compress/zstd/seqenc.go, github.com/klauspost/compress/zstd/snappy.go
 Copyright lines:
   Copyright 2019+ Klaus Post. All rights reserved.
 ----------------------------------------
@@ -1873,10 +1874,11 @@ License information can be found in the LICENSE file.
 Based on work by Yann Collet, released under BSD License.
 
 Notice 2 of 16 (SPDX: NOASSERTION)
-Files: github.com/klauspost/compress/zstd/decodeheader.go, github.com/klauspost/compress/zstd/matchlen_amd64.go, github.com/klauspost/compress/zstd/matchlen_generic.go, github.com/klauspost/compress/zstd/zip.go
+Files: github.com/klauspost/compress/zstd/decodeheader.go, github.com/klauspost/compress/zstd/matchlen_amd64.go, github.com/klauspost/compress/zstd/matchlen_generic.go, github.com/klauspost/compress/zstd/simple.go, github.com/klauspost/compress/zstd/zip.go
 Copyright lines:
   Copyright 2020+ Klaus Post. All rights reserved.
   Copyright 2019+ Klaus Post. All rights reserved.
+  Copyright 2025+ Klaus Post. All rights reserved.
 ----------------------------------------
 
 License information can be found in the LICENSE file.

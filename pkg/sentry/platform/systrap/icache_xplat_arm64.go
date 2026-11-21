@@ -23,3 +23,7 @@ package systrap
 //
 //go:noescape
 func flushICache(addr, length uintptr)
+
+// readDCZID returns the host DCZID_EL0 system register, which reports the
+// DC ZVA block size and whether EL0 zeroing is prohibited.
+func readDCZID() uint64

@@ -111,11 +111,12 @@ type Platform struct {
 	nextASID atomic.Uint64
 
 	// mu guards the fields below and the busy flag of every vcpu.
-	mu      sync.Mutex
-	cond    *sync.Cond
-	vps     []*vcpu
-	freeIdx []uint32
-	closed  bool
+	mu       sync.Mutex
+	cond     *sync.Cond
+	vps      []*vcpu
+	freeIdx  []uint32
+	creating bool
+	closed   bool
 
 	// waiters counts the goroutines that wait in acquire.
 	waiters int
@@ -307,6 +308,10 @@ func (p *Platform) Close() error {
 	}
 	p.closed = true
 	p.closing.Store(true)
+	p.cond.Broadcast()
+	for p.creating {
+		p.cond.Wait()
+	}
 	vps := append([]*vcpu(nil), p.vps...)
 	p.mu.Unlock()
 

@@ -14,7 +14,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Zero Runtime Elevation** | Runs under a standard user account and locks down the host process before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
 | **Hardware 4KB Paging (`whpx` & `hvf`)** | Uses `WinHvPlatform.dll` (Windows) and `Hypervisor.framework` (macOS) with 4KB EPT and Stage-1/Stage-2 tables. | Bypasses the Windows 64KB `VirtualAlloc` limit and the Apple Silicon 16KB host page limit. |
 | **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (4KB and 16KB host pages). Windows (`winsystrap`) runs stub processes under explicit opt-in (`AllowUnconfinedSystrap` or `PlatformSystrap`), because Windows provides no kernel syscall trap. macOS has no `systrap` engine. | Executes ELF64 binaries and JIT runtimes (V8, OpenJDK) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
-| **Dual-Track Netstack & Overlay Networking** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`), with guest `vxlan`, `wireguard`, `bridge`, `conntrack`, and `ipset`. | Supports inbound/outbound port forwarding (`-p`), `host.docker.internal`, cryptographic L3 isolation, Docker Engine, and multi-node Kubernetes (`k3s`, Flannel, Calico). |
+| **Dual-Track Netstack & Overlay Networking** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`, `--auto-publish`) or an L3 `wireguard-go` tunnel (`-net=wg`), with guest `vxlan`, `wireguard`, `bridge`, `conntrack`, and `ipset`. | Supports static (`-p`) and opt-in dynamic loopback (`--auto-publish`) port forwarding, `host.docker.internal`, cryptographic L3 isolation, Docker Engine, and multi-node Kubernetes (`k3s`, Flannel, Calico). |
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.gvx-erofs-v3-b4096.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
 | **Pre-Lockdown Checkpoint & Restore** | Pre-opens checkpoint bundle descriptors and optional Unix or loopback TCP control listeners before `hostlockdown.Apply()`, and locks down `gvx.Restore` before decoding untrusted state. | Saves and restores running tasks, sparse `pgalloc` memory, `hostfs` mounts, `ext4lite` volumes, and Netstack state without weakening containment. |
 | **Clean Upstream Boundary** | Isolates host logic behind Tier 1 additive packages and Tier 2 `_windows.go`, `_darwin.go`, and `_xplat.go` files. | Enforces a `< 4.2%` CI audit gate inside the `< 5.0%` upstream diff ceiling and builds with Go 1.27.4+ without Bazel. |
@@ -27,14 +27,14 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 
 The `systrap` fallback runs on Windows (`amd64` and `arm64`) and on Linux and Android over 4KB and 16KB host kernels. The Windows engine starts its stubs from a generated 1 KB image, so it needs no C toolchain. The project removed the macOS engine (`darwinsystrap`) because it could not run executables with 4KB-aligned segments and non-PIE executables. Section 3.3 gives the reason. The project also dropped the Rosetta 2 engine and the `darwin/amd64` target because a syscall-number Seatbelt filter on a translated process panicked the host kernel. The guest architecture must equal the host architecture on every backend.
 
-| Host Target | Primary Engine (`whpx` / `hvf` / `kvm`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
+| Host Target | Primary Engine (`whpx` / `hvf` / `systrap`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | `platform/systrap` (`winsystrap`: `winSysmsg` fast path and debug-object stops, `jmp rel32`, `CC 90`, or dual-`INT3` guarded sites). Requires explicit opt-in; untrusted workloads require `whpx`. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
 | **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | `platform/systrap` (`winsystrap`: `winSysmsg` fast path and debug-object stops, `B` or `brk` patch). Runs on hosts without WHP under explicit opt-in; untrusted workloads require `whpx`. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
 | **`darwin/arm64`** (Apple Silicon M1-M5) | `platform/hvf` (`Hypervisor.framework` Stage-1 4KB + Stage-2 16KB) | None. The `darwinsystrap` engine was removed. `platform/systrap` builds a stub that returns `ErrUnavailable`. | 16KB Host Page / 16KB Map Granularity | Entitlement `com.apple.security.hypervisor` for `hvf`. Runs `linux/arm64` images. |
 | **`darwin/amd64`** (Intel Mac) | None. | None. | None. | Not supported. The project dropped this target, because no Intel Mac ran the engine. |
-| **`linux/amd64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap` (default under `PlatformAuto`). | 4KB Page | Official target; CI builds, vets, and runs the full `e2e` and conformance suites. |
-| **`linux/arm64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap` (4KB direct or 16KB `subblock_xplat.go` layer). | 4KB or 16KB Host Page | Official target; CI tests 4KB hosts natively and boots a 16KB Debian ARM64 kernel in QEMU. |
+| **`linux/amd64`** | Upstream `systrap` (default under `PlatformAuto`). | None. | 4KB Page | Official target; CI builds, vets, and runs the full `e2e` and conformance suites. |
+| **`linux/arm64`** | Upstream `systrap` (4KB direct or 16KB `subblock_xplat.go` layer). | None. | 4KB or 16KB Host Page | Official target; CI tests 4KB hosts natively and boots a 16KB Debian ARM64 kernel in QEMU. |
 | **`android/arm64`** (`android/amd64` CI) | None (`untrusted_app` cannot open `/dev/kvm`). | Upstream `systrap` with `MFD_EXEC`, `idleStubLimit = 2`, and 16KB sub-block support. | 4KB or 16KB Host Page | Packaged as `librungv.so` inside `gvx-android.aar` (`minSdkVersion 31`); CI tests on an Android 16 emulator. |
 
 ---
@@ -55,7 +55,7 @@ gvx/ (Fork of google/gvisor@go)
  │   ├── architecture.md                    # [NEW] Authoritative architecture and subsystem specifications
  │   ├── cli.md                             # [NEW] rungv CLI reference
  │   ├── systrap-windows.md                 # [NEW] Windows systrap engine design
- │   ├── moonshots.md                       # [NEW] Completed feature milestones
+ │   ├── moonshots.md                       # [NEW] GPU acceleration proposal for browser and GUI guests
  │   ├── assets/                            # [NEW] D2 diagram sources and compiled SVGs
  │   └── recipes/                           # [NEW] Docker Engine and Kubernetes integration guides
  ├── scripts/                               # [NEW] codesign-exec, sync-upstream, gostateify, gvisorlint, repro-build, gpu/build-renderer
@@ -757,7 +757,7 @@ Execute these steps in `lockdown_windows.go` before starting virtual processor o
 2. Pin directory and single-file mount handles in memory without modifying any NTFS security descriptor.
 3. Call `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` to delete all privileges from the primary token.
 4. Start the locked file-broker and thread-sweeper OS threads before lowering the primary token.
-5. Start the locked Low-integrity socket-broker worker pool when `-net=nat` enables outbound host connections.
+5. Start the locked Low-integrity socket-broker worker pool when `-net=nat` enables outbound host connections or `--auto-publish` enables dynamic loopback binds (`127.0.0.1`).
 6. Create an Untrusted restricted token with `NULL_SID` to verify that unlisted opens and raw sockets fail.
 7. Assign the current process to a Job Object with `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1` and UI restrictions.
 8. Call `SetProcessMitigationPolicy` with `DisallowWin32kSystemCalls = 1` to block `win32kfull.sys` system calls.
@@ -774,7 +774,7 @@ Windows applies `RestrictedSids` on thread impersonation tokens because `CreateP
 
 1. Pin `GOMAXPROCS` (`runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))`) so Seatbelt denials on CPU `sysctl` queries do not shrink worker parallelism.
 2. Call `setrlimit(RLIMIT_NPROC, &rlimit{Cur: 0, Max: 0})` to block `fork()` at the XNU kernel boundary.
-3. Call `sandbox_init_with_parameters` with the Seatbelt `deny default` profile to block `process-fork`, `process-exec*`, and unbound file or port binds.
+3. Call `sandbox_init_with_parameters` with the Seatbelt `deny default` profile to block `process-fork`, `process-exec*`, and unbound file or port binds (permitting `localhost:*` binds only when `--auto-publish` is enabled).
 4. Probe descriptor I/O and verify file, directory, and unbound socket denials; return an error if any denial probe succeeds.
 
 #### macOS Lockdown Notes (Descriptive Module)
@@ -790,7 +790,7 @@ Execute these steps after the `systrap` platform, the cached `.erofs` layer desc
 1. Create a Landlock filesystem ruleset for `Options.Mounts` masked to the kernel Landlock ABI.
 2. Restrict all process threads with that Landlock ruleset before seccomp blocks the Landlock calls.
 3. Build the seccomp rules with `config.Rules` for the `systrap` platform, network mode, and host mounts.
-4. Merge the embedder rules (`fcntl`, `sched_getaffinity`, `renameat`, `openat2`, `flock`, sockets, and cgo thread calls).
+4. Merge the embedder rules (`fcntl`, `sched_getaffinity`, `renameat`, `openat2`, `flock`, sockets, loopback binds for `--auto-publish` with MPTCP probing disabled, and cgo thread calls).
 5. Append the `EPERM` fallback rule set for `execve`, `execveat`, `clone`, `openat`, and `socket`.
 6. Install the seccomp program on every thread with `seccomp(SECCOMP_FILTER_FLAG_TSYNC)`.
 7. Probe `execve`, `clone`, `openat` (working directory and root descriptor), and `socket` to verify containment.
@@ -1260,10 +1260,11 @@ GitHub Actions executes cross-platform verification in `.github/workflows/`. Wor
 | `ci.yml` (`build, vet, and audit`) | `ubuntu-24.04` | Formatting of owned packages, five-target builds, `go vet`, `gostateify -check`, `tools/licenses -check`, `gvisorlint` (`checklocks`, `checkconst`, `checklinkname`), and `tools/upstream` (`-max-ratio=0.042`). |
 | `ci.yml` (`test linux/amd64`, `test linux/arm64`) | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of owned packages, 16KB sub-block emulation (`GVX_SYSTRAP_SUBBLOCKS=1`), seccomp lockdown, and the offline `e2e` suite on `systrap`. |
 | `ci.yml` (`repro`) | `ubuntu-24.04` | `scripts/verify-repro-gvx.sh`: builds `rungv` inside a Go container running on `gvx` and verifies bit-for-bit SHA-256 reproducibility against the host build. |
-| `ci.yml` (`test darwin/arm64`) | `macos-15` | Owned packages and `systrap` stub tests signed via `scripts/codesign-exec.sh` (`GVX_ALLOW_NO_HYPERVISOR=1` skips VM boot on nested macOS runners). |
+| `ci.yml` (`dind-build`) | `ubuntu-24.04` | Caches `docker:dind` layers and runs `TestE2EDockerBuildDindLocalRegistry` against an in-process OCI registry. |
+| `ci.yml` (`test darwin/arm64`) | `macos-26` | Owned packages and host-level `e2e` gates signed via `scripts/codesign-exec.sh` (`GVX_ALLOW_NO_HYPERVISOR=1` skips VM boot on nested macOS runners). |
 | `ci.yml` (`build gpu-renderer darwin/arm64`) | `macos-26` | Runs only when a change touches `gpurenderer/`, `scripts/gpu/`, `pkg/sentry/devices/virtgpu/`, `internal/gpurender/`, or `ci.yml`. Builds the renderer bundle from the pinned inputs (`scripts/gpu/build-renderer.sh`). With the repository variable `GVX_CI_METAL=1`, it also runs the renderer self-test and the tests of `internal/gpurender` and `pkg/sentry/devices/virtgpu` with the renderer. |
 | `diagnose.yml` with `scripts/gpu/ci-metal-probe.sh` | Chosen runner (`macos-26`) | Prints the Metal device of the runner, builds the renderer bundle, and runs its self-test. Set `GVX_CI_METAL=1` only after this run passes. |
-| None (by hand) | Apple Silicon host with macOS 26 or later | The GPU gates `TestE2EGateGPUVulkan`, `TestE2EGateGPUChromium`, and `TestE2EGPURendererKill` (`GVX_E2E_GPU=1`). They need `hvf` and Metal. Section 3.15 gives the commands. |
+| None (by hand) | Apple Silicon host with macOS 26 or later | The GPU gates `TestE2EGateGPUVulkan`, `TestE2EGateGPUOpenGL`, `TestE2EGateGPUChromium`, and `TestE2EGPURendererKill` (`GVX_E2E_GPU=1`). They need `hvf` and Metal. Section 3.15 gives the commands. |
 | `ci.yml` (`test windows/amd64`) | `windows-latest` | Owned packages, `winsystrap`, `hostlockdown`, hypervisor state report, and guest boot on `whpx`. |
 | `ci.yml` (`test windows/arm64`) | `windows-11-arm` | Containerd shim control plane, `winsystrap`, offline `e2e` suite, and `hostlockdown`. |
 | `android.yml` (`emulator smoke`) | `ubuntu-24.04` (KVM) | `scripts/android/emulator-smoke.sh` on an x86_64 Android 16 emulator: `androidprobe`, `systrap`/`hostfs`/`ext4lite` tests, offline `e2e`, and `gvx-android.aar` sample APK smoke. |
@@ -1271,7 +1272,7 @@ GitHub Actions executes cross-platform verification in `.github/workflows/`. Wor
 | `pjdfstest.yml` (`test pjdfstest <fs> <target>`) | `ubuntu-24.04*`, `windows-*` | Runs the POSIX conformance suite `pjdfstest` against `ext4lite` and `hostfs` and compares output with `scripts/pjdfstest/known-failures.txt`. |
 | `e2e-images.yml` (`test linux/*`, `test windows/*`) | `ubuntu-24.04*`, `windows-*` | Weekly real-registry OCI, Docker Engine, and multi-node K3s gates under host lockdown. |
 | `benchmark.yml` & `diagnose.yml` | Chosen runners | On-demand microbenchmarks (`microbench_e2e_test.go`) and targeted runner diagnostics. |
-| `release.yml` (`build <target>`, `build gpu-renderer darwin/arm64`, `publish`) | `ubuntu-24.04`, `macos-26` | Publishes seven archives (`linux-{amd64,arm64}`, `darwin-arm64`, `windows-{amd64,arm64}`, `android-arm64`, `gvx-android.aar`) and the renderer archive `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz`, with `SHA256SUMS` and SLSA provenance attestations. The renderer job builds KosmicKrisp from the pinned Mesa source (`scripts/gpu/build-renderer.sh --driver-source mesa-source`) and packages the bundle with `scripts/gpu/package-renderer.sh`. |
+| `release.yml` (`build <target>`, `build gpu-renderer darwin/arm64`, `publish`) | `ubuntu-24.04`, `macos-26` | Publishes seven archives (`linux-amd64`, `linux-arm64`, `linux-arm64v8.2`, `darwin-arm64`, `windows-amd64`, `windows-arm64`, and `android-arm64` containing `gvx-android.aar`), the renderer archive `gvx-gpu-renderer-<tag>-darwin-arm64.tar.gz`, `SHA256SUMS`, and a SLSA provenance bundle. The renderer job builds KosmicKrisp from the pinned Mesa source (`scripts/gpu/build-renderer.sh --driver-source mesa-source`) and packages the bundle with `scripts/gpu/package-renderer.sh`. |
 
 The `pjdfstest` harness lives in `scripts/pjdfstest`. The command `internal/pjdfsreport` compares the guest output with `scripts/pjdfstest/known-failures.txt`. That file lists only failures that a host file system cannot avoid, by driver, host OS, and test number. A failure that the file does not list fails the job. A listed failure that does not occur also fails the job, so the list cannot go stale. CI has no macOS guest, so run the suite on a Mac with `hvf` by hand. Set `PJDFS_PLATFORM=auto`, then run `build-bundle.sh`, `run.sh`, and `go run ./internal/pjdfsreport -os darwin`.
 
@@ -1308,7 +1309,7 @@ The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2
 | Upstream isolation | Historical snapshot at `f3b7ef4` charged 18/2507 files (0.72%); current `main` audits against the 4.2% CI gate (`< 5.0%` ceiling) | Charged share excludes Linux fences |
 
 Workload creation and native sandbox creation remain unsupported; these results make no CRI or guest-execution claim.
-The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-module) reproduces the SDK and external-daemon boundaries without registry or rootfs dependencies.
+To reproduce the SDK and external-daemon smoke tests without registry or rootfs dependencies, build `cmd/containerd-shim-gvx-v2` and run `go test ./...` in `tools/shiminterop` with `GVX_SHIM_BINARY` (and `GVX_CONTAINERD_BINARY` for the external daemon test).
 
 ### 4.4 Embedded `internal/xsys/unix` Package
 

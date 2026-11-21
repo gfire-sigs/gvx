@@ -59,7 +59,7 @@ The `e2e` browser gates run Chromium, Playwright, and Electron with software ren
 | :--- | :--- |
 | Browser or Electron gate in `e2e/` | `e2e/gate_browser_test.go` (on request: `GVX_E2E_BROWSER=1`), with the benchmark `TestE2EBrowserBench` (`GVX_E2E_BROWSER_BENCH=1`) |
 | `/dev/shm` | A `tmpfs` mount without a size option (`pkg/gvx/kernel_runner.go`), so the `tmpfs` default of 50% of host RAM applies |
-| Guest devices | `pkg/gvx` registers `memdev`, `ttydev`, `/dev/fuse`, and `tundev` (when the stack supports TUN). With `-gpu=venus` or `-gpu=virgl` it also registers `virtgpu`. `pkg/sentry/devices` also holds `nvproxy`, `rdmaproxy`, and `tpuproxy`, which `pkg/gvx` does not register. |
+| Guest devices | `pkg/gvx` registers `memdev`, `/dev/kmsg`, `ttydev`, `/dev/fuse`, and `tundev` (when the stack supports TUN). With `-gpu=venus` or `-gpu=virgl` it also registers `virtgpu`. `pkg/sentry/devices` also holds `nvproxy`, `rdmaproxy`, and `tpuproxy`, which `pkg/gvx` does not register. |
 | DRM device (`/dev/dri/*`) | `/dev/dri/renderD128` (character device 226:128) with `-gpu=venus` or `-gpu=virgl` on `darwin/arm64`. None without the option. |
 | Cost of `fork` and `exec` on Windows `systrap` | 6.4 ms on `amd64` and 22 ms on `arm64` (hosted runners; `systrap-windows.md`, section 3.9) |
 
@@ -93,8 +93,8 @@ The design must satisfy the rules of [`AGENTS.md`](../AGENTS.md) and of the back
 | Pure Go build | `release.yml` sets `CGO_ENABLED=0`, so the binary needs no C library on the host | `virglrenderer` and ANGLE live in the renderer binary. The Sentry talks to it through IPC. |
 | Sockets of `hostfs` live in Sentry memory | `docs/architecture.md`, "Special Files and Extended Attributes"; `pkg/sentry/fsimpl/hostfs/host.go` (`hostKindOther`) | A guest cannot connect to a host Unix socket through a bind mount. A display bridge needs a new socket bridge or TCP. |
 | Guest memory differs on each backend | `hvf` (`hv_vm_map`, 16 KiB blocks), `whpx` (`WHvMapGpaRange`), Windows `systrap` (section views), Linux `systrap` (memory file) | A shared buffer of the renderer needs a new `memmap.File` for each backend. |
-| Hosted CI runners have no GPU | GitHub-hosted runners | CI runs function tests on WARP for Windows only. The hosted macOS runner cannot run `hvf` (`docs/architecture.md`, section 4.2), so macOS gates run by hand on an Apple Silicon host. The renderer tests need Metal and no hypervisor. `ci.yml` builds the renderer on `macos-26` and runs those tests only when the repository variable `GVX_CI_METAL` is `1`. No run has measured Metal on a hosted macOS runner. CI cannot detect a performance regression. |
-| Upstream diff gate of 4.2% in CI | `tools/upstream -mode=audit -max-ratio=0.042` (`.github/workflows/ci.yml`) | The audit counts 105 of 2550 upstream files (4.12%). Neither the `venus` path nor D13 (`virgl`) adds an upstream file: `sys.go` was a counted seam before, and every new file is Tier 1 or Tier 2. |
+| Hosted CI runners have no GPU | GitHub-hosted runners | CI runs function tests on WARP for Windows only. The hosted macOS runner cannot run `hvf` (`docs/architecture.md`, section 4.2), so macOS tests run by hand on an Apple Silicon host. The renderer tests need Metal and no hypervisor. `ci.yml` builds the renderer on `macos-26` and runs those tests only when the repository variable `GVX_CI_METAL` is `1`. No run has measured Metal on a hosted macOS runner. CI cannot detect a performance regression. |
+| Upstream diff budget below 5.0% (4.2% CI gate) | `tools/upstream -mode=audit` | Add each new package to `tier1Prefixes` first. Otherwise the audit charges each added file against the ceiling. The `sysfs` change needs a `seam` line in `buildtag_allowlist.txt`. The audit counts 105 of 2550 upstream files (4.12%). Neither the `venus` path nor D13 (`virgl`) adds an upstream file. |
 
 ---
 

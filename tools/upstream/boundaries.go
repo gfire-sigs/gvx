@@ -938,6 +938,9 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "Windows and Darwin layer caches open files with POSIX rename semantics"},
 	{[]string{"cmd/rungv"}, "pkg/gvx/tuning", "CLI tune flags read and print the leaf tunable registry"},
 	{[]string{"pkg/netbackend"}, "pkg/gvx/tuning", "leaf tunable registry supplies NAT, DNS, and forwarder defaults"},
+
+	// pkg/tcpip/link/vxlan: the bound on transmit nesting.
+	{[]string{"pkg/tcpip/link/vxlan"}, "pkg/goid", "VXLAN transmit counts its nesting for each goroutine to stop a route loop"},
 }
 
 // boundaryTestExceptions apply to _test.go files only.

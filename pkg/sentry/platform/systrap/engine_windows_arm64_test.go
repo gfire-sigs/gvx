@@ -19,6 +19,7 @@ package systrap
 import (
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
@@ -249,4 +250,27 @@ func TestInvalidateICacheCostsNoStop(t *testing.T) {
 	if got := f.traps.Load(); got != 2 {
 		t.Errorf("the fast path served %d of 2 system calls", got)
 	}
+}
+
+// TestNonZeroSVCTrapsToSentry runs `svc #0x18` (a Windows ARM64 NT syscall
+// encoding) and verifies that the patcher intercepts it as a Linux system call
+// instead of executing a host NT system call.
+func TestNonZeroSVCTrapsToSentry(t *testing.T) {
+	r := newRig(t, newFastPlatform(t))
+	// mov x8, #39; svc #0x18 (0xd4000301); svc #0 (exit 93)
+	r.program(gConst(8, 39), words(0xd4000301), gSyscall(93))
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 39, r.ac)
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 93, r.ac)
+}
+
+// TestPrivilegedOp02MRSRaisesSIGILL verifies that an op0=2 debug MRS does not
+// alias an emulated op0=3 ID register and instead raises SIGILL.
+func TestPrivilegedOp02MRSRaisesSIGILL(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	// mrs x0, osdtrrx_el1 (0xd5300000); svc #0
+	r.program(words(0xd5300000), gSyscall(93))
+	si, _, err := r.run()
+	wantSignal(t, si, err, linux.SIGILL)
 }

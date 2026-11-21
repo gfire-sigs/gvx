@@ -384,3 +384,27 @@ func TestDecodeA64SyncException(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeMRSSysRegISSPreservesOp0(t *testing.T) {
+	ids := DefaultIDRegisters()
+	// op0=2 debug/trace MRS must decode Op0=2 and fail EL0 emulation.
+	for _, insn := range []uint32{0xD5300000, 0xD5300400, 0xD5330020, 0xD53300E0} {
+		iss, ok := DecodeMRSSysRegISS(insn)
+		if !ok || iss.Op0 != 2 {
+			t.Fatalf("DecodeMRSSysRegISS(%#x) = (%+v, %v), want Op0=2", insn, iss, ok)
+		}
+		if v, emulOK := ids.EmulateSysRegRead(iss); emulOK {
+			t.Errorf("EmulateSysRegRead(op0=2 insn %#x) = (%#x, true), want false", insn, v)
+		}
+	}
+	// op0=3 MIDR_EL1 and CTR_EL0 must decode Op0=3 and succeed.
+	for _, insn := range []uint32{0xD5380000, 0xD53B0020, 0xD53B00E0} {
+		iss, ok := DecodeMRSSysRegISS(insn)
+		if !ok || iss.Op0 != 3 {
+			t.Fatalf("DecodeMRSSysRegISS(%#x) = (%+v, %v), want Op0=3", insn, iss, ok)
+		}
+		if _, emulOK := ids.EmulateSysRegRead(iss); !emulOK {
+			t.Errorf("EmulateSysRegRead(op0=3 insn %#x) = false, want true", insn)
+		}
+	}
+}

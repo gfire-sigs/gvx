@@ -51,6 +51,7 @@ const (
 	childTCPEnv  = "GVX_HOSTLOCKDOWN_TCP_ADDR"
 	childUDPEnv  = "GVX_HOSTLOCKDOWN_UDP_ADDR"
 	childTCP6Env = "GVX_HOSTLOCKDOWN_TCP6_ADDR"
+	childUnixEnv = "GVX_HOSTLOCKDOWN_UNIX_PATHS"
 )
 
 func TestMain(m *testing.M) {
@@ -206,6 +207,64 @@ func TestLockdownDarwinOutboundNATAndInbound(t *testing.T) {
 		t.Fatalf("child listener reply = %q, %v; want pong\\n\nchild stderr:\n%s", reply, err, child.stderr.String())
 	}
 	child.wait(t)
+}
+
+// TestLockdownDarwinNATDeniesUnixConnect proves that the NAT profile permits
+// outbound IP traffic only. A Unix domain socket of the host, such as the
+// socket of an SSH agent, must stay out of reach. The socket in the writable
+// mount proves that a file rule does not grant connect.
+func TestLockdownDarwinNATDeniesUnixConnect(t *testing.T) {
+	// A short path under /tmp stays in the 104-byte sun_path limit of macOS.
+	shortDir := func() string {
+		dir, err := os.MkdirTemp("/tmp", "gvx-ux-*")
+		if err != nil {
+			t.Fatalf("MkdirTemp: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		real, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatalf("EvalSymlinks: %v", err)
+		}
+		return real
+	}
+	ws, outside := shortDir(), shortDir()
+	var paths []string
+	for _, dir := range []string{outside, ws} {
+		path := filepath.Join(dir, "h.sock")
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("Listen unix %s: %v", path, err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+			}
+		}()
+		paths = append(paths, path)
+	}
+	tcp, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = tcp.Close() }()
+	go func() {
+		for {
+			conn, err := tcp.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	runChildToCompletion(t, "net-nat-unix",
+		childWSEnv+"="+ws,
+		childTCPEnv+"="+tcp.Addr().String(),
+		childUnixEnv+"="+strings.Join(paths, string(os.PathListSeparator)))
 }
 
 func TestLockdownDarwinLoopbackBind(t *testing.T) {
@@ -389,6 +448,8 @@ func runLockedChild(mode string) error {
 		return childNetNone()
 	case "net-nat":
 		return childNetNAT()
+	case "net-nat-unix":
+		return childNetNATUnix()
 	case "net-loopback-bind":
 		return childNetLoopbackBind()
 	case "net-udp":
@@ -813,6 +874,40 @@ func childNetNAT() error {
 	}
 	_, err = conn.Write([]byte("pong\n"))
 	return err
+}
+
+func childNetNATUnix() error {
+	ws := os.Getenv(childWSEnv)
+	paths := filepath.SplitList(os.Getenv(childUnixEnv))
+	if len(paths) == 0 {
+		return errors.New("no Unix socket paths")
+	}
+	// The sockets must accept a connection before Apply. Otherwise a later
+	// permission error could have another cause.
+	for _, path := range paths {
+		conn, err := net.DialTimeout("unix", path, 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("Unix dial %s before Apply: %w", path, err)
+		}
+		_ = conn.Close()
+	}
+	if _, err := Apply(Options{Mounts: []HostMount{{Path: ws}}, AllowOutboundNet: true}); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	var c childChecks
+	conn, err := net.DialTimeout("tcp4", os.Getenv(childTCPEnv), 5*time.Second)
+	c.expect(err == nil, "outbound TCP dial: %v", err)
+	if err == nil {
+		_ = conn.Close()
+	}
+	for _, path := range paths {
+		conn, err := net.DialTimeout("unix", path, 5*time.Second)
+		c.expect(errors.Is(err, fs.ErrPermission), "Unix dial %s = %v, want permission error", path, err)
+		if err == nil {
+			_ = conn.Close()
+		}
+	}
+	return c.err()
 }
 
 func childNetLoopbackBind() error {

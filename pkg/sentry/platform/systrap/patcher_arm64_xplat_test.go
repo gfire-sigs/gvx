@@ -36,7 +36,8 @@ func TestScanARM64FindsEveryClass(t *testing.T) {
 	code := words(
 		0xd503201f, // nop
 		0xd4000001, // svc #0
-		0xd4000021, // svc #1: not a Linux system call
+		0xd4000021, // svc #1: still a Linux syscall and an NT syscall on Windows
+		0xd4000002, // hvc #0: not patched
 		0xd53bd040, // mrs x0, tpidr_el0
 		0xd53bd05e, // mrs x30, tpidr_el0
 		0xd53bd05f, // mrs xzr, tpidr_el0
@@ -49,12 +50,13 @@ func TestScanARM64FindsEveryClass(t *testing.T) {
 	)
 	want := []patchSite{
 		{Offset: 4, Kind: siteSVC, Orig: 0xd4000001},
-		{Offset: 12, Kind: siteMRS, Reg: 0, Orig: 0xd53bd040},
-		{Offset: 16, Kind: siteMRS, Reg: 30, Orig: 0xd53bd05e},
-		{Offset: 20, Kind: siteMRS, Reg: 31, Orig: 0xd53bd05f},
-		{Offset: 28, Kind: siteMSR, Reg: 1, Orig: 0xd51bd041},
-		{Offset: 32, Kind: siteMSR, Reg: 31, Orig: 0xd51bd05f},
-		{Offset: 44, Kind: siteSVC, Orig: 0xd4000001},
+		{Offset: 8, Kind: siteSVC, Orig: 0xd4000021},
+		{Offset: 16, Kind: siteMRS, Reg: 0, Orig: 0xd53bd040},
+		{Offset: 20, Kind: siteMRS, Reg: 30, Orig: 0xd53bd05e},
+		{Offset: 24, Kind: siteMRS, Reg: 31, Orig: 0xd53bd05f},
+		{Offset: 32, Kind: siteMSR, Reg: 1, Orig: 0xd51bd041},
+		{Offset: 36, Kind: siteMSR, Reg: 31, Orig: 0xd51bd05f},
+		{Offset: 48, Kind: siteSVC, Orig: 0xd4000001},
 	}
 	if got := scanARM64(code); !reflect.DeepEqual(got, want) {
 		t.Fatalf("scanARM64 = %+v, want %+v", got, want)
@@ -262,6 +264,10 @@ func TestIsStoreExclusive(t *testing.T) {
 		{"str x1, [x0]", 0xf9000001, false},
 		{"stp x1, x2, [x0]", 0xa9000801, false},
 		{"cas x1, x2, [x0]", 0xc8a17c02, false},
+		{"casp w0, w1, w2, w3, [x4]", 0x08207c82, false},
+		{"casp x0, x1, x2, x3, [x4]", 0x48207c82, false},
+		{"caspl w0, w1, w2, w3, [x4]", 0x0820fc82, false},
+		{"caspl x0, x1, x2, x3, [x4]", 0x4820fc82, false},
 		{"nop", 0xd503201f, false},
 	} {
 		if got := isStoreExclusive(tc.word); got != tc.want {

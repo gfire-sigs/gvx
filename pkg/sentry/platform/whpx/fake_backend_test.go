@@ -64,12 +64,13 @@ type fakeBackend struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 
-	feats     hostFeatures
-	featErr   error
-	createErr error
-	vpErr     func(index uint32) error
-	runErr    error
-	info      partitionInfo
+	feats      hostFeatures
+	featErr    error
+	createErr  error
+	onCreateVP func(index uint32)
+	vpErr      func(index uint32) error
+	runErr     error
+	info       partitionInfo
 
 	// flushes counts the calls of flushProcessWriteBuffers.
 	flushes int
@@ -244,7 +245,16 @@ func (fb *fakeBackend) calls() (maps, unmaps int) {
 
 func (fb *fakeBackend) createVP(index uint32) error {
 	fb.mu.Lock()
+	hook := fb.onCreateVP
+	fb.mu.Unlock()
+	if hook != nil {
+		hook(index)
+	}
+	fb.mu.Lock()
 	defer fb.mu.Unlock()
+	if !fb.partitionOpen {
+		return fmt.Errorf("create virtual processor %d on closed partition", index)
+	}
 	if fb.vpErr != nil {
 		if err := fb.vpErr(index); err != nil {
 			return err
@@ -271,6 +281,9 @@ func (fb *fakeBackend) createVP(index uint32) error {
 func (fb *fakeBackend) deleteVP(index uint32) error {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
+	if !fb.partitionOpen {
+		return fmt.Errorf("delete virtual processor %d on closed partition", index)
+	}
 	vp, ok := fb.vps[index]
 	if !ok {
 		return fmt.Errorf("virtual processor %d does not exist", index)

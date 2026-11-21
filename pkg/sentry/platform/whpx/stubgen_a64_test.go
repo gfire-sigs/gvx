@@ -381,8 +381,11 @@ func TestA64SystemRegisterValues(t *testing.T) {
 	if whpx.A64PstateKernelForTest&0x3C0 != 0x3C0 {
 		t.Errorf("kernel PSTATE does not mask D, A, I and F")
 	}
-	if whpx.A64PstateUserMaskForTest != 0xF|0x3C0 {
-		t.Errorf("user PSTATE clear mask is %#x", whpx.A64PstateUserMaskForTest)
+	if whpx.A64PstateUserMaskForTest != 0xF0000000 {
+		t.Errorf("user PSTATE allow mask is %#x, want 0xf0000000", whpx.A64PstateUserMaskForTest)
+	}
+	if whpx.A64PstateModeMaskForTest != 0x1F {
+		t.Errorf("PSTATE mode mask is %#x, want 0x1f", whpx.A64PstateModeMaskForTest)
 	}
 	if whpx.A64SctlrSetForTest&whpx.A64SctlrMForTest == 0 || whpx.A64SctlrSetForTest&whpx.A64SctlrCForTest == 0 || whpx.A64SctlrSetForTest&whpx.A64SctlrIForTest == 0 {
 		t.Error("SCTLR_EL1 bring-up does not enable the MMU and the caches")

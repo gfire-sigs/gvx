@@ -140,6 +140,43 @@ func TestNewReportsSystrapPrerequisiteError(t *testing.T) {
 	}
 }
 
+// TestRestorePlatform proves that a checkpoint bundle cannot select Windows
+// systrap without the permission of the caller.
+func TestRestorePlatform(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		goos            string
+		requested       PlatformType
+		manifest        string
+		allowUnconfined bool
+		want            PlatformType
+		wantErr         bool
+	}{
+		{name: "bundle names whpx on windows", goos: "windows", requested: PlatformAuto, manifest: "whpx", want: PlatformWHPX},
+		{name: "bundle names systrap on windows", goos: "windows", requested: PlatformAuto, manifest: "systrap", wantErr: true},
+		{name: "bundle names systrap on windows, empty request", goos: "windows", manifest: "systrap", wantErr: true},
+		{name: "bundle names systrap on windows, caller permits", goos: "windows", requested: PlatformAuto, manifest: "systrap", allowUnconfined: true, want: PlatformSystrap},
+		{name: "caller requests systrap on windows", goos: "windows", requested: PlatformSystrap, manifest: "systrap", want: PlatformSystrap},
+		{name: "caller request wins", goos: "windows", requested: PlatformWHPX, manifest: "systrap", want: PlatformWHPX},
+		{name: "bundle names systrap on linux", goos: "linux", requested: PlatformAuto, manifest: "systrap", want: PlatformSystrap},
+		{name: "bundle names hvf on darwin", goos: "darwin", requested: PlatformAuto, manifest: "hvf", want: PlatformHVF},
+		{name: "bundle names no platform", goos: "windows", requested: PlatformAuto, want: PlatformAuto},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := restorePlatform(tc.goos, tc.requested, tc.manifest, tc.allowUnconfined)
+			if tc.wantErr {
+				if !errors.Is(err, ErrPlatformUnavailable) {
+					t.Fatalf("restorePlatform = (%q, %v), want ErrPlatformUnavailable", got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("restorePlatform = (%q, %v), want (%q, nil)", got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestOpenAuto(t *testing.T) {
 	hwErr := errors.New("hypervisor entitlement missing")
 	fbErr := errors.New("stub spawn failed")

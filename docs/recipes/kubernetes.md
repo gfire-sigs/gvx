@@ -1,36 +1,36 @@
 # Run a Kubernetes Node with `gvx`
 
-This guide shows how to run an unmodified `k3s` node in a `gvx` sandbox: as a single-node cluster, or as a node of a cluster with several nodes. The sandbox provides the Linux kernel behavior that `k3s`, the `kubelet`, `containerd`, `runc`, `flannel`, and Calico CNI use. `gvx` has no Kubernetes-specific option.
+This guide shows how to run an unmodified `k3s` node inside a `gvx` sandbox, either as a single-node cluster or as part of a multi-node cluster. `gvx` supplies the Linux kernel behavior that `k3s`, `kubelet`, `containerd`, `runc`, `flannel`, and Calico CNI expect without any Kubernetes-specific flags.
 
 ## 1. How It Works
 
-`rungv` runs the official `rancher/k3s` image. The guest kernel gives the node agent what it needs. The table lists the parts of a node and the settings that each part uses.
+`rungv` runs the official `rancher/k3s` image. The table lists the key settings for a node.
 
 | Part | What it does |
 | :--- | :--- |
-| `IPTABLES_MODE=legacy` | Makes the `k3s` image use the legacy iptables. The guest has no `nftables`. |
-| `-v k3s:/var/lib/rancher` | Stores the cluster state, the images, and the containers in the `ext4lite` image `k3s.ext4`. The `overlayfs` snapshotter of `containerd` works on it. |
-| `-p 127.0.0.1:6443:6443` | Publishes the API server to the host. |
-| `--write-kubeconfig` | Writes the kubeconfig of the cluster to a host directory, so `kubectl` on the host reaches the API server. |
-| `--hostname` | Sets the node name. Each node of a cluster needs its own name. |
-| `-m` and `--cpus` | Set the capacity that the node reports. `MemTotal` and the online CPUs follow these limits. |
+| `IPTABLES_MODE=legacy` | Forces `k3s` to use legacy `iptables` because the guest has no `nftables`. |
+| `-v k3s:/var/lib/rancher` | Persists cluster state, images, and containers in `k3s.ext4`, where `containerd`'s `overlayfs` snapshotter runs natively. |
+| `-p 127.0.0.1:6443:6443` | Publishes the Kubernetes API server to host loopback. |
+| `--write-kubeconfig` | Writes the cluster kubeconfig into a bind-mounted host directory for your host `kubectl`. |
+| `--hostname` | Sets the Kubernetes node name (must be unique per node). |
+| `-m` and `--cpus` | Set reported node capacity (`MemTotal` and online CPUs). |
 
-The sandbox locks itself down before the guest starts. Publish every host port that the cluster needs, such as NodePorts and the WireGuard port, when you start the node.
+By default, the sandbox locks itself down before startup, so publish static ports like `6443`, UDP `51820`, or a NodePort range with `-p`. For local TCP NodePorts, you can also pass `--auto-publish` to bind guest listeners and `DNAT` ports on host `127.0.0.1` automatically.
 
 ## 2. Start a Single-Node Cluster
 
-These steps start a `k3s` server and connect `kubectl` on the host to it. You need `rungv` and a `kubectl` command on the host. The steps work on macOS, Windows, and Linux.
+These steps boot a `k3s` server and connect your host `kubectl`. They work on macOS, Windows, and Linux.
 
 > [!IMPORTANT]
-> Use host ports that no other program uses. `rungv` stops with `address already in use` when a port is busy.
+> Pick unused host ports. `rungv` exits with `address already in use` if any static `-p` port is busy.
 
-1. Create a directory for the kubeconfig.
+1. Create a host directory for the kubeconfig.
 
    ```sh
    mkdir -p ~/.gvx/k3s
    ```
 
-2. Start the server in a terminal. It runs in the foreground.
+2. Start the server in the foreground.
 
    ```sh
    rungv run \
@@ -45,7 +45,7 @@ These steps start a `k3s` server and connect `kubectl` on the host to it. You ne
      --write-kubeconfig-mode=644
    ```
 
-3. Wait for the line `k3s is up and running`.
+3. Wait for `k3s is up and running`.
 
 4. Point `kubectl` at the cluster in a second terminal.
 
@@ -53,30 +53,30 @@ These steps start a `k3s` server and connect `kubectl` on the host to it. You ne
    export KUBECONFIG=$HOME/.gvx/k3s/kubeconfig.yaml
    ```
 
-5. Verify the node.
+5. Verify the node status.
 
    ```sh
    kubectl get nodes
    ```
 
-   The node shows the status `Ready`.
+   The node shows `Ready`.
 
-A Service of the type `NodePort` with a port from 30000 to 30019 is then reachable at `127.0.0.1:<port>` on the host.
+Any `NodePort` Service using ports `30000` to `30019` is now reachable on host `127.0.0.1:<port>`.
 
-## 3. Start a Cluster with Two Nodes
+## 3. Start a Two-Node Cluster
 
-These steps start a server and an agent in two sandboxes on one host. The agent reaches the server through the published port on the host, which a guest sees at `10.0.2.2`. `flannel` carries the pod traffic between the nodes in WireGuard over the published UDP port 51820.
+These steps run a server and an agent in two sandboxes on one host. The agent connects to the server through the host's published port at `10.0.2.2`, and `flannel` carries inter-node pod traffic over WireGuard on UDP port `51820`.
 
 > [!IMPORTANT]
-> Stop the single-node server of section 2 first. Both setups publish the host port 6443.
+> Stop the single-node server from Section 2 first, because both setups bind host port `6443`.
 
-1. Create a directory for the kubeconfig.
+1. Create a host directory for the kubeconfig.
 
    ```sh
    mkdir -p ~/.gvx/k3s
    ```
 
-2. Start the server in a terminal. Replace `my-token` with a secret of your choice.
+2. Start the server in the foreground (replace `my-token` with your own secret).
 
    ```sh
    rungv run \
@@ -99,9 +99,9 @@ These steps start a server and an agent in two sandboxes on one host. The agent 
      --write-kubeconfig-mode=644
    ```
 
-3. Wait for the line `k3s is up and running`.
+3. Wait for `k3s is up and running`.
 
-4. Start the agent in a second terminal. Use the same token.
+4. Start the agent in a second terminal using the same token.
 
    ```sh
    rungv run \
@@ -120,27 +120,27 @@ These steps start a server and an agent in two sandboxes on one host. The agent 
    export KUBECONFIG=$HOME/.gvx/k3s/kubeconfig.yaml
    ```
 
-6. Verify the nodes.
+6. Verify both nodes.
 
    ```sh
    kubectl get nodes
    ```
 
-   Both nodes show the status `Ready`.
+   Both nodes show `Ready`.
 
-The agent publishes no port. It starts the WireGuard handshake, so the server learns the endpoint of the agent. The agent needs `--node-external-ip` because `k3s agent` refuses `--flannel-external-ip`, and the address `192.0.2.1` is a placeholder. Both nodes show the internal address `10.0.2.15`. `kubectl logs` and `kubectl exec` reach the agent through the tunnel of `k3s`.
+The agent publishes no ports; it initiates the WireGuard handshake so the server learns the agent's endpoint. `k3s agent` rejects `--flannel-external-ip`, so `--node-external-ip 192.0.2.1` acts as a placeholder. Both nodes report internal address `10.0.2.15`, and `kubectl logs` and `kubectl exec` reach the agent through the `k3s` tunnel.
 
 ## 4. Run Calico Instead of flannel
 
-Calico replaces `flannel` as the CNI and enforces NetworkPolicy. The VXLAN mode with the legacy iptables back end runs in a `gvx` sandbox. The guest provides the routing rules, the route types, proxy ARP, the reverse path match `rpfilter`, and the ipsets that Felix uses.
+Calico replaces `flannel` and enforces `NetworkPolicy` using VXLAN mode with legacy `iptables`. The guest kernel provides the policy routing rules, route types, proxy ARP, `rpfilter` match, and `ipset` tables that Felix requires.
 
 > [!IMPORTANT]
-> Start `k3s` after `mount --make-rshared /`. A Linux node with systemd has a shared root mount, and `calico-node` needs a shared `/sys/fs` mount. The guest has no init, so the command makes the root mount shared, as the entrypoint of kind does.
+> Run `mount --make-rshared /` before starting `k3s`. `calico-node` requires a shared `/sys/fs` mount; because the sandbox has no systemd init, this matches what `kind` does at startup.
 
-1. Download the manifest `calico-vxlan.yaml` of the Calico release v3.28.2.
-2. Edit the manifest: set `CALICO_IPV4POOL_CIDR` to `10.42.0.0/16`, and add `FELIX_IPTABLESBACKEND` with the value `Legacy` to the environment of `calico-node`.
-3. Put the manifest in a directory that you mount in the guest, such as `/output`.
-4. Start the server. The shell command copies the manifest to the manifest directory of `k3s`.
+1. Download `calico-vxlan.yaml` from Calico v3.28.2.
+2. In the manifest, set `CALICO_IPV4POOL_CIDR` to `10.42.0.0/16` and add `FELIX_IPTABLESBACKEND=Legacy` to `calico-node`.
+3. Save the manifest as `calico.yaml` in `$HOME/.gvx/k3s` (mounted at `/output`).
+4. Start the server; the shell wrapper copies `calico.yaml` into the `k3s` manifest directory.
 
    ```sh
    rungv run \
@@ -158,78 +158,78 @@ Calico replaces `flannel` as the CNI and enforces NetworkPolicy. The VXLAN mode 
          --write-kubeconfig=/output/kubeconfig.yaml --write-kubeconfig-mode=644'
    ```
 
-5. Wait until `kubectl -n kube-system get pods` shows `calico-node` and `calico-kube-controllers` as `Ready`.
+5. Wait until `kubectl -n kube-system get pods` reports `calico-node` and `calico-kube-controllers` as `Ready`.
 
-The test `TestE2EK3sCalico` runs these steps. It checks the Ready pods, `coredns`, the pod addresses, pod to pod and pod to service traffic, a deny-all NetworkPolicy, and an allow policy.
+`TestE2EK3sCalico` automates these steps and verifies Ready pods, `coredns`, pod IPs, pod-to-pod and pod-to-service traffic, a deny-all `NetworkPolicy`, and an allow policy.
 
 ## 5. Reference
 
-The tables below list the behavior that the tests prove and the limits of a `gvx` node.
+The tables below summarize verified test coverage and known limits for `gvx` Kubernetes nodes.
 
-### 5.1 Verified Behavior of a Single Node
+### 5.1 Verified Single-Node Behavior
 
-The test `TestE2EK3sSingleNode` runs these checks on each backend.
+`TestE2EK3sSingleNode` verifies these behaviors on each backend.
 
 | Check | Result |
 | :--- | :--- |
 | Node start | `Ready` within 120 seconds |
 | System pods | `coredns`, `local-path-provisioner`, and `metrics-server` run |
-| Services | Both endpoints of a service answer, a pod reaches a service whose only endpoint is that pod, and NodePorts answer from the host and from pods |
-| DNS | Name resolution works again after a restart of `coredns` |
+| Services | Multi-endpoint services answer, a pod reaches its own backing service, and NodePorts answer from the host and from pods |
+| DNS | Resolution recovers after restarting `coredns` |
 | Pod access | `kubectl logs`, `kubectl exec`, and `kubectl port-forward` work |
-| Pod sysctls | `securityContext.sysctls` reach the container |
-| Limits | A CPU limit of 500m holds a busy pod near 0.5 CPU; a pod above its memory limit ends with `OOMKilled` |
-| Metrics | `kubectl top node` and `kubectl top pod` print values |
-| Restart | The node returns with the same name after a restart, and its pods start again |
+| Pod sysctls | `securityContext.sysctls` apply inside containers |
+| Limits | A `500m` CPU limit caps a busy pod near `0.5` CPU; exceeding a memory limit triggers `OOMKilled` |
+| Metrics | `kubectl top node` and `kubectl top pod` report live values |
+| Restart | The node returns with the same name and restarts its pods |
 
-The test `TestE2EK3sNetworkPolicy` checks NetworkPolicy on each backend. The network policy controller of `k3s` (`kube-router`) needs the `ipset` tool and the iptables match `set`, and the guest provides both.
+`TestE2EK3sNetworkPolicy` verifies `k3s`'s built-in `kube-router` network policy controller using guest `ipset` and `-m set`.
 
 | Check | Result |
 | :--- | :--- |
 | Controller start | `k3s` does not log `Skipping network policy controller start, ipset save failed` |
-| Deny all | A NetworkPolicy that selects a server pod and allows no ingress stops a client pod from reaching the server pod |
-| Allow by label | A second policy that names the client label lets that client reach the server pod, and another client stays blocked |
-| Sets and rules | The kernel of the guest holds the `KUBE-*` IP sets and a rule with `-m set --match-set` |
-| Policy removal | Traffic returns after the policies end |
+| Deny all | An ingress deny-all `NetworkPolicy` blocks client pods from reaching the selected server pod |
+| Allow by label | Adding an allow policy for a labeled client unblocks only that client |
+| Sets and rules | The guest kernel holds `KUBE-*` IP sets and `-m set --match-set` rules |
+| Policy removal | Traffic resumes once policies are deleted |
 
-The test `TestE2EK3sCalico` runs `k3s` with Calico 3.28.2 in the VXLAN mode. Section 4 gives the procedure.
+`TestE2EK3sCalico` runs `k3s` with Calico 3.28.2 in VXLAN mode (see Section 4).
 
 | Check | Result |
 | :--- | :--- |
-| Calico start | `calico-node` and `calico-kube-controllers` are `Ready`, and `coredns` runs |
-| Addresses | Each pod gets an address of `10.42.0.0/16` from the IP pool of Calico |
-| Traffic | A pod reaches another pod, a service by name, and a service by address |
-| Deny all | A NetworkPolicy that selects a server pod and allows no ingress blocks the clients, also through the service address |
-| Allow by label | A policy that names the client label lets that client through, and another client stays blocked |
-| Policy removal | Traffic returns after the policies end |
+| Calico start | `calico-node` and `calico-kube-controllers` become `Ready`, and `coredns` runs |
+| Addresses | Pods receive IPs from Calico's `10.42.0.0/16` pool |
+| Traffic | Pods reach other pods and services by ClusterIP and DNS name |
+| Deny all | A deny-all `NetworkPolicy` blocks clients directly and via ClusterIP |
+| Allow by label | A labeled allow policy admits only matching clients |
+| Policy removal | Traffic resumes once policies are deleted |
 
-### 5.2 Verified Behavior of a Cluster
+### 5.2 Verified Multi-Node Behavior
 
-The tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` run their sandboxes on one host. The tests change no image and use no `gvx`-specific option. C2 and C4 copy the `wg` tool of Alpine into the guests, C4 copies `etcdctl`, and C5 copies `sonobuoy`.
+Tests in `e2e/k3s_multinode_e2e_test.go`, `e2e/k3s_wgmesh_e2e_test.go`, and `e2e/k3s_conformance_e2e_test.go` run unmodified images on one host with no `gvx`-specific options (copying Alpine's `wg` binary for C2/C4, `etcdctl` for C4, and `sonobuoy` for C5).
 
 | Test | Topology | Result |
 | :--- | :--- | :--- |
-| C1 | Section 3: the agent joins through the published API port, and `flannel` uses `wireguard-native` | Both nodes are `Ready`. Pods on the two nodes reach each other, a service with an endpoint on each node, and the DNS name of that service. `kubectl logs` and `kubectl exec` reach the agent. |
-| C2 | A WireGuard mesh `wg0` between the guests, set up with `ip` and `wg`. `k3s` uses the `wg0` addresses with `--flannel-iface wg0` and `--egress-selector-mode disabled` | The C1 checks pass, and the API server connects to the kubelet of the agent directly over `wg0`. |
-| C3 | A `gvx` agent joins a server that runs natively on a Linux host | The C1 checks pass. |
-| C4 | Three servers with embedded `etcd` over the WireGuard mesh, joined one at a time | The cluster keeps working when the `etcd` leader stops. A surviving server accepts a write within 30 seconds. The tests measured 5 to 9 seconds. |
-| C5 | `sonobuoy` with the `e2e` plugin | The quick mode passes. The `[sig-network] Services` tests pass. |
+| C1 | Section 3: agent joins through the published API port with `flannel` `wireguard-native` | Both nodes become `Ready`; cross-node pod traffic, multi-endpoint services, DNS, `kubectl logs`, and `kubectl exec` pass. |
+| C2 | Direct `wg0` WireGuard mesh between guests (`--flannel-iface wg0`, `--egress-selector-mode disabled`) | All C1 checks pass, and the API server reaches the agent kubelet directly over `wg0`. |
+| C3 | A `gvx` agent joins a native Linux `k3s` server | All C1 checks pass. |
+| C4 | Three-server HA cluster with embedded `etcd` over the `wg0` mesh | Cluster survives `etcd` leader loss; a surviving server accepts writes within 30 s (measured 5 to 9 s). |
+| C5 | `sonobuoy` with the `e2e` plugin | `Quick` mode and `[sig-network] Services` pass. |
 
 ### 5.3 Known Limits
 
-These limits come from the user-space guest kernel.
+These limits stem from the user-space guest kernel.
 
 | Limit | Effect |
 | :--- | :--- |
-| `nftables` | Set `IPTABLES_MODE=legacy`. A component that needs `iptables-nft` fails. |
-| Calico | `TestE2EK3sCalico` runs the VXLAN mode with the iptables legacy back end. The eBPF data plane and BGP with BIRD are not tested. The guest has no eBPF, so Felix logs warnings about XDP and BPF and goes on. Set `IPTABLES_MODE=legacy` and `FELIX_IPTABLESBACKEND=Legacy`. |
-| NFLOG | `-j NFLOG` accepts a rule, but no group receives a packet, because the guest has no `nflog` listener. |
-| IPVS, eBPF, and kernel modules | `kube-proxy` must use the iptables mode. CNIs that need eBPF, such as Cilium, do not run. |
-| Memory limits | The Sentry checks `memory.max` by polling. A process that allocates and frees more than its limit between two checks is not ended. [`docker-engine.md`](docker-engine.md), section 7.4, gives the intervals. |
-| Windows `systrap` | Supported. The Sentry queries stub working sets during scans and unmaps. Both reporting of pod memory usage and `memory.max` enforcement work as on Linux. |
-| MTU | `eth0` has the MTU 1500 at the start, as on a Linux node. `flannel` derives 1450 for VXLAN and 1420 for WireGuard. Set `--tune net.nat.mtu=N` to start with another value. A node can change it later with `ip link set dev eth0 mtu N` from 68 to 65535, and `flannel` follows the new value at the next start. |
-| WireGuard reply address | A `wireguard` link answers from the address that the route picks, and not from the address that the peer used. The two differ on an interface with several addresses. |
-| WireGuard link-local endpoints | An IPv6 endpoint loses its `sin6_scope_id`. Use a global address. |
-| Neighbor table | Static neighbors and VXLAN FDB entries have no limit, as in Linux. Dynamic neighbors follow `gc_thresh1` to `gc_thresh3` of each network namespace (128, 512, and 1024). The values belong to the namespace, where Linux shares one table for the kernel. `gc_thresh1` has no effect. Set `maxaddr` on a VXLAN link to bound its FDB. |
-| `xt_recent` parameters | `ip_list_tot` and `ip_pkt_list_tot` take a write by root while no `recent` rule exists. Write them before `kube-proxy` starts. A write after that fails with `EINVAL`. |
-| Connection tracking | The files of `/proc/sys/net/netfilter` set the tracker: a timeout for each TCP state, UDP, ICMP, and ICMPv6, and `nf_conntrack_max`. The limit is 262144 at the start, and only the root network namespace writes it. A full table removes a connection that timed out or is not assured. If it finds none, it drops the packet of a new flow. `kube-proxy` sets `nf_conntrack_max` and the two TCP timeouts at its start, and the tracker obeys them. `nf_conntrack_buckets` is read-only and shows 16384. The tracker of `nftables` has no limit. |
+| `nftables` | Set `IPTABLES_MODE=legacy`; components requiring `iptables-nft` fail. |
+| Calico | Verified in VXLAN mode with legacy `iptables` (`IPTABLES_MODE=legacy`, `FELIX_IPTABLESBACKEND=Legacy`). eBPF and BIRD BGP are untested; Felix logs non-fatal XDP/BPF warnings and continues. |
+| NFLOG | `-j NFLOG` accepts rules, but no listener receives packets. |
+| IPVS, eBPF, and kernel modules | `kube-proxy` must use `iptables` mode; eBPF-based CNIs like Cilium cannot run. |
+| Memory limits | The Sentry enforces `memory.max` by polling, so sub-interval spikes can escape detection (see [`docker-engine.md`](docker-engine.md) Section 7.4). |
+| Windows `systrap` | Supported. The Sentry queries stub working sets during scans and unmaps so pod memory metrics and `memory.max` match Linux. |
+| MTU | `eth0` starts at `1500`, so `flannel` uses `1450` (VXLAN) and `1420` (WireGuard). Override with `--tune net.nat.mtu=N` or `ip link set dev eth0 mtu N` (`68` to `65535`). |
+| WireGuard reply address | A `wireguard` interface replies from the route-selected source IP rather than the destination IP the peer sent to (matters on multi-address interfaces). |
+| WireGuard link-local endpoints | IPv6 endpoints drop `sin6_scope_id`; use global addresses. |
+| Neighbor table | Static neighbors and VXLAN FDB entries are unbounded (as on Linux). Dynamic neighbors use per-namespace `gc_thresh1..3` (`128`, `512`, `1024`; `gc_thresh1` is a no-op). Set `maxaddr` on a VXLAN link to bound its FDB. |
+| `xt_recent` parameters | Root can write `ip_list_tot` and `ip_pkt_list_tot` only before any `recent` rule exists (write them before `kube-proxy` starts; later writes return `EINVAL`). |
+| Connection tracking | `/proc/sys/net/netfilter` controls TCP, UDP, ICMP, and ICMPv6 timeouts plus `nf_conntrack_max` (default `262144`, writable in root netns only). When full, timed-out or unassured entries evict first; otherwise new flows drop. `kube-proxy` updates `nf_conntrack_max` and TCP timeouts at startup. `nf_conntrack_buckets` is read-only (`16384`). |

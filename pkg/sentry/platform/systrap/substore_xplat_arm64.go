@@ -175,7 +175,12 @@ func decodeStore(insn uint32) (storeInsn, bool) {
 		s.size = size
 		s.imm = int64(int32(insn>>12&0x1ff) << 23 >> 23)
 		switch insn >> 10 & 3 {
-		case 0, 2: // STUR and the unprivileged STTR, which behaves as STR at EL0.
+		case 0: // STUR
+			s.mode = storeOffset
+		case 2: // STTR (unprivileged GPR store; V=1 is unallocated)
+			if v {
+				return s, false
+			}
 			s.mode = storeOffset
 		case 1:
 			s.mode = storePost
@@ -339,6 +344,27 @@ func encodeLEUint(v uint64, size int) []byte {
 	return out
 }
 
+// computeDCZVABlockSize returns the DC ZVA block size in bytes reported by a
+// DCZID_EL0 value, or 0 when DZP (bit 4) prohibits EL0 zeroing or BS exceeds
+// the architectural maximum of 9 (2048 bytes).
+func computeDCZVABlockSize(dczid uint64) int {
+	if dczid&(1<<4) != 0 {
+		return 0
+	}
+	bs := dczid & 0xf
+	if bs > 9 {
+		return 0
+	}
+	return 4 << bs
+}
+
+// dcZvaBlockSize is the host DC ZVA block size in bytes from DCZID_EL0. Tests
+// may override it to verify non-64-byte hardware block sizes.
+var dcZvaBlockSize = computeDCZVABlockSize(readDCZID())
+
+// dcZvaZeros backs DC ZVA writes up to the architectural 2048-byte maximum.
+var dcZvaZeros [2048]byte
+
 // emulateAtomicOrCacheOp runs an AArch64 LSE atomic operation. These operations
 // are LDADD, LDCLR, LDEOR, LDSET, LDSMAX, LDSMIN, LDUMAX, LDUMIN, SWP, CAS, and
 // CASP. It also runs an address-based cache maintenance instruction (DC ZVA and
@@ -357,13 +383,15 @@ func emulateAtomicOrCacheOp(
 		}
 		addr := r.get(rt, false)
 		if insn&^31 == 0xd50b7420 { // dc zva
-			const zvaSize = 64
-			line := addr &^ (zvaSize - 1)
+			zvaSize := dcZvaBlockSize
+			if zvaSize <= 0 || zvaSize > len(dcZvaZeros) {
+				return addr, false
+			}
+			line := addr &^ uint64(zvaSize-1)
 			if !check(line, zvaSize) {
 				return line, false
 			}
-			var zeros [zvaSize]byte
-			write(line, zeros[:])
+			write(line, dcZvaZeros[:zvaSize])
 			return line, true
 		}
 		if !check(addr, 1) {
@@ -458,7 +486,7 @@ func emulateAtomicOrCacheOp(
 		rn := uint8(insn >> 5 & 31)
 		rs := uint8(insn >> 16 & 31)
 		rt := uint8(insn & 31)
-		if rs&1 != 0 || rt&1 != 0 || rs >= 30 || rt >= 30 {
+		if rs&1 != 0 || rt&1 != 0 {
 			return 0, false
 		}
 		addr := r.get(rn, true)

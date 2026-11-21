@@ -121,3 +121,68 @@ func TestScanAMD64FindsSyscallBehindVZero(t *testing.T) {
 		t.Errorf("scanAMD64GS = %+v, want %+v", got, want)
 	}
 }
+
+func TestDecodeX86SignExtendsModRMDisp32(t *testing.T) {
+	cases := []struct {
+		name     string
+		code     []byte
+		argIndex int
+		wantDisp int64
+	}{
+		{
+			name:     "lea rip negative disp32",
+			code:     []byte{0x48, 0x8d, 0x05, 0xcd, 0x2e, 0x99, 0xfe},
+			argIndex: 1,
+			wantDisp: -0x166d133,
+		},
+		{
+			name:     "mov reg negative disp32",
+			code:     []byte{0x48, 0x8b, 0x80, 0xcd, 0x2e, 0x99, 0xfe},
+			argIndex: 1,
+			wantDisp: -0x166d133,
+		},
+		{
+			name:     "mov fs negative sib disp32",
+			code:     []byte{0x64, 0x48, 0x8b, 0x04, 0x25, 0xf8, 0xff, 0xff, 0xff},
+			argIndex: 1,
+			wantDisp: -8,
+		},
+		{
+			name:     "mov gs negative sib disp32",
+			code:     []byte{0x65, 0x48, 0x8b, 0x04, 0x25, 0xf8, 0xff, 0xff, 0xff},
+			argIndex: 1,
+			wantDisp: -8,
+		},
+		{
+			name:     "movabs moffs64 above 2GiB stays unsigned",
+			code:     []byte{0x48, 0xa1, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00},
+			argIndex: 1,
+			wantDisp: 0x80001000,
+		},
+		{
+			name:     "mov moffs32 above 2GiB stays unsigned",
+			code:     []byte{0x67, 0x48, 0xa1, 0x00, 0x10, 0x00, 0x80},
+			argIndex: 1,
+			wantDisp: 0x80001000,
+		},
+		{
+			name:     "two-byte 0f a3 bt negative disp32 sign-extends",
+			code:     []byte{0x48, 0x0f, 0xa3, 0x88, 0xcd, 0x2e, 0x99, 0xfe},
+			argIndex: 0,
+			wantDisp: -0x166d133,
+		},
+	}
+	for _, c := range cases {
+		inst, err := decodeX86(c.code)
+		if err != nil || inst.Len != len(c.code) {
+			t.Fatalf("%s: decodeX86 = (%v, len %d, %v), want len %d", c.name, inst.Op, inst.Len, err, len(c.code))
+		}
+		m, ok := inst.Args[c.argIndex].(x86asm.Mem)
+		if !ok {
+			t.Fatalf("%s: arg[%d] = %T, want x86asm.Mem", c.name, c.argIndex, inst.Args[c.argIndex])
+		}
+		if m.Disp != c.wantDisp {
+			t.Errorf("%s: Disp = %#x (%d), want %#x (%d)", c.name, m.Disp, m.Disp, c.wantDisp, c.wantDisp)
+		}
+	}
+}

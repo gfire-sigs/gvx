@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -137,6 +138,12 @@ func (h *hostRoot) walkParent(rel string) (dirfd int, name string, release func(
 		return rootfd, ".", func() {}, nil
 	}
 	parts := strings.Split(rel, "/")
+	// openat follows a ".." component to the parent directory, and
+	// O_NOFOLLOW does not stop it. No path of the workspace has that
+	// component.
+	if slices.Contains(parts, "..") {
+		return -1, "", nil, ErrPathTraversal
+	}
 	cur := rootfd
 	opened := make([]int, 0, len(parts))
 	release = func() {

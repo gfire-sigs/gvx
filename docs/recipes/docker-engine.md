@@ -1,38 +1,38 @@
 # Use `gvx` as a Docker Engine
 
-This guide shows how to run a Docker Engine inside a `gvx` sandbox and control it with the `docker` command of the host. The engine keeps its images and containers in an `ext4lite` volume, so they stay after a restart. The `docker` command reaches the engine through a Docker context. The flag reference is in [`../cli.md`](../cli.md).
+This guide shows how to run Docker Engine inside a `gvx` sandbox and control it with your host `docker` CLI. `dockerd` stores its images and containers in an `ext4lite` volume so they survive restarts. The host `docker` CLI connects through a Docker context. See [`../cli.md`](../cli.md) for the full flag reference.
 
 ## 1. How It Works
 
-`rungv` runs the unmodified `docker:dind` image. Its entrypoint starts `dockerd` inside the sandbox. The guest kernel gives `dockerd` what it needs: `iptables` with the `addrtype` match, the `bridge` network, network namespaces, `pivot_root`, cgroup v2, and overlay mounts. The table below lists the parts of the setup.
+`rungv` runs the unmodified `docker:dind` image, whose entrypoint starts `dockerd` inside the sandbox. The guest kernel provides `iptables` (with `addrtype`), the `bridge` network, network namespaces, `pivot_root`, cgroup v2, and overlay mounts.
 
 | Part | What it does |
 | :--- | :--- |
-| `--privileged` | On by default. It turns on raw sockets, packet writes, and set-user-ID programs. These privileges stay inside the sandbox. |
-| `-v gvx-docker:/var/lib/docker` | Stores the data of `dockerd` in the `ext4lite` image `gvx-docker.ext4`. The overlay storage driver of `dockerd` works on it. |
-| `-p unix:~/.gvx/docker.sock:2375` | Binds a Unix socket on the host and forwards it to the API port 2375 of `dockerd`. Only your user can open the socket. |
-| `--auto-publish` | Publishes each `docker run -p` and `docker compose` port automatically on host `127.0.0.1:<port>`. Keeps port 2375 on the Unix socket only. |
+| `--privileged` | On by default. Enables raw sockets, packet writes, and setuid binaries inside the sandbox only. |
+| `-v gvx-docker:/var/lib/docker` | Stores `dockerd` data in the `ext4lite` image `gvx-docker.ext4`, where Docker's overlay storage driver works natively. |
+| `-p unix:~/.gvx/docker.sock:2375` | Binds a host Unix socket (`0600`, owner-only) and forwards it to `dockerd` port 2375. |
+| `--auto-publish` | Publishes each `docker run -p` and `docker compose` port automatically on host `127.0.0.1:<port>`, keeping port 2375 on the Unix socket only. |
 | `-p 127.0.0.1:9000-9019:9000-9019` | Optional static alternative to `--auto-publish` when you want strict lockdown with zero post-boot loopback binds. |
-| `-e DOCKER_TLS_CERTDIR=` | Makes the entrypoint listen on TCP port 2375 without TLS. The port is reachable only through the forwards above. |
-| `--tls=false` | Tells `dockerd` that the missing TLS is intended. Without it, `dockerd` waits 15 seconds before it starts. |
-| Docker context `gvx` | Points the `docker` command of the host at the Unix socket. |
+| `-e DOCKER_TLS_CERTDIR=` | Tells the entrypoint to listen on TCP port 2375 without TLS (reachable only through the Unix socket forward above). |
+| `--tls=false` | Tells `dockerd` that missing TLS is intentional, skipping its 15-second startup delay. |
+| Docker context `gvx` | Points your host `docker` CLI at the Unix socket. |
 
 By default, the sandbox locks itself down before the guest starts and rejects new host binds later. Pass `--auto-publish` to publish container ports dynamically on host `127.0.0.1` as containers start and stop. If you prefer strict lockdown without dynamic binds, omit `--auto-publish` and pre-bind a static `-p` port range instead.
 
 ## 2. Start the Engine
 
-These steps start the engine and connect the `docker` command of the host to it. You need `rungv` (see the [README](../../README.md#3-quickstart)) and a `docker` command on the host. The `docker` command needs no local engine. The steps work on macOS and Windows. On Windows, use PowerShell, create the directory with `mkdir $HOME\.gvx -Force`, and create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. A `unix://` host on Windows needs Docker CLI 29 or later. With an older CLI, publish `-p 127.0.0.1:2375:2375` and use `host=tcp://127.0.0.1:2375`.
+These steps start `dockerd` in `gvx` and connect your host `docker` CLI (no local Docker daemon needed). You need `rungv` (see the [README](../../README.md#3-quickstart)) and the `docker` CLI. The steps work on macOS, Linux, and Windows. On Windows PowerShell, create the socket directory with `mkdir $HOME\.gvx -Force` and create the context with `docker context create gvx --docker "host=unix://$($HOME -replace '\\','/')/.gvx/docker.sock"`. Using `unix://` on Windows requires Docker CLI 29 or later; with an older CLI, publish `-p 127.0.0.1:2375:2375` and use `host=tcp://127.0.0.1:2375`.
 
 > [!IMPORTANT]
-> Use host ports that no other program uses. `rungv` stops with `address already in use` when one port of a range is busy.
+> Pick unused host ports when using static `-p` ranges. `rungv` exits with `address already in use` if any port in the range is busy.
 
-1. Create the directory of the socket.
+1. Create the socket directory.
 
    ```sh
    mkdir -p ~/.gvx
    ```
 
-2. Start the engine in a terminal. It runs in the foreground.
+2. Start the engine in the foreground.
 
    ```sh
    rungv run \
@@ -43,15 +43,15 @@ These steps start the engine and connect the `docker` command of the host to it.
      docker:dind --tls=false
    ```
 
-3. Wait for the line `API listen on /var/run/docker.sock`.
+3. Wait for `API listen on /var/run/docker.sock`.
 
-4. Create the Docker context in a second terminal. Do this one time.
+4. Create the Docker context once in a second terminal.
 
    ```sh
    docker context create gvx --docker host=unix://$HOME/.gvx/docker.sock
    ```
 
-5. Select the context.
+5. Switch to the `gvx` context.
 
    ```sh
    docker context use gvx
@@ -63,11 +63,11 @@ These steps start the engine and connect the `docker` command of the host to it.
    docker info --format '{{.Driver}} {{.OperatingSystem}}'
    ```
 
-   The output is `overlayfs Alpine Linux ... (containerized)`.
+   Expected output: `overlayfs Alpine Linux ... (containerized)`.
 
 ## 3. Use the Engine
 
-These commands work as with a local Docker Engine. Each `docker` command runs on the host and talks to `dockerd` in the sandbox.
+Run normal `docker` commands from your host terminal; each request talks to `dockerd` inside the sandbox.
 
 1. Run a container on the default `bridge` network.
 
@@ -75,26 +75,26 @@ These commands work as with a local Docker Engine. Each `docker` command runs on
    docker run --rm alpine wget -qO- http://example.com
    ```
 
-2. Publish a container port inside the published range.
+2. Publish a container port on host loopback.
 
    ```sh
    docker run -d --name web -p 9000:80 nginx:alpine
    curl http://127.0.0.1:9000/
    ```
 
-3. Open a shell in the running container.
+3. Open an interactive shell in the container.
 
    ```sh
    docker exec -it web sh
    ```
 
-4. Build an image from a directory of the host. The `docker` command sends the build context to the engine.
+4. Build an image from a host directory (the `docker` CLI uploads the build context to `dockerd`).
 
    ```sh
    docker build -t app ./app
    ```
 
-5. Start a Compose project. Use host ports inside the published range.
+5. Start a Compose stack. With `--auto-publish`, `rungv` binds each published port on `127.0.0.1` automatically.
 
    ```sh
    docker compose up -d
@@ -102,13 +102,13 @@ These commands work as with a local Docker Engine. Each `docker` command runs on
 
 ## 4. Stop and Restart the Engine
 
-These steps stop the engine and start it again with the same data.
+These steps stop `dockerd` and bring it back with your persisted images and volumes intact.
 
-1. Press Ctrl-C in the terminal of `rungv`.
+1. Press `Ctrl-C` in the `rungv` terminal.
 
-2. Start the engine again with the command of step 2 in section 2. The images, the volumes, and the stopped containers are still there.
+2. Restart the engine with the `rungv run` command from Section 2. Your images, volumes, and stopped containers remain in `gvx-docker.ext4`.
 
-3. Select the default engine of the host when you no longer need `gvx`.
+3. Switch back to your default Docker context when finished.
 
    ```sh
    docker context use default
@@ -116,15 +116,15 @@ These steps stop the engine and start it again with the same data.
 
 ## 5. Share Host Directories
 
-A path in `docker run -v` names a path in the sandbox, not on the host. Mount a host directory into the sandbox first, and then mount its sandbox path into the container.
+A path in `docker run -v` refers to a path inside the `gvx` sandbox, not on the host. Bind-mount the host directory into `rungv` first, then mount that sandbox path into the container.
 
-1. Add a bind mount to the `rungv run` command of section 2.
+1. Add a host bind mount to the `rungv run` command in Section 2.
 
    ```sh
    -v ~/src:/src
    ```
 
-2. Use the sandbox path in the container.
+2. Mount the sandbox path into your container.
 
    ```sh
    docker run --rm -v /src/data:/data alpine ls /data
@@ -132,24 +132,24 @@ A path in `docker run -v` names a path in the sandbox, not on the host. Mount a 
 
 ## 6. Trust a TLS-Inspecting Proxy
 
-A host behind a proxy that inspects TLS, or a host with a private registry, trusts a root certificate that the images do not hold. Add `--host-ca-certs` to the `rungv run` command of section 2. `dockerd` then trusts the roots of the host, and `docker pull` and `docker build` can reach the registries through the proxy. [`../cli.md`](../cli.md#410-host-root-certificates) lists the sources of the roots.
+If your host sits behind a TLS-inspecting proxy or pulls from a private registry with an internal CA, add `--host-ca-certs` to the `rungv run` command in Section 2. `dockerd` then trusts host root certificates so `docker pull` and `docker build` succeed through the proxy. See [`../cli.md`](../cli.md#410-host-root-certificates) for certificate sources.
 
 > [!IMPORTANT]
-> Only the `dockerd` process and the other sandbox processes trust the roots. A container that `dockerd` starts has its own file system and does not trust them.
+> `--host-ca-certs` applies only to `dockerd` and direct sandbox processes. Containers started by `dockerd` have their own root filesystems and do not inherit host roots automatically.
 
-1. Add the flag to the `rungv run` command of section 2.
+1. Add `--host-ca-certs` to the `rungv run` command in Section 2.
 
    ```sh
    --host-ca-certs
    ```
 
-2. Give a container the bundle of the sandbox. The path in `-v` names a path in the sandbox, as in section 5.
+2. Mount the sandbox CA bundle into a container when it needs the host roots.
 
    ```sh
    docker run --rm -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro alpine wget -qO- https://example.com/
    ```
 
-3. Give a build the root. Put the PEM file of the root, here `host-ca.crt`, next to the `Dockerfile`.
+3. For `docker build`, place the root CA PEM file (here `host-ca.crt`) next to your `Dockerfile`.
 
    ```dockerfile
    FROM alpine:3.20
@@ -157,44 +157,44 @@ A host behind a proxy that inspects TLS, or a host with a private registry, trus
    RUN cat /tmp/host-ca.crt >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/host-ca.crt
    ```
 
-4. Build the image. The build steps after the `RUN` line trust the root.
+4. Build the image. Every step after the `RUN` line trusts the root certificate.
 
    ```sh
    docker build -t app .
    ```
 
-A private registry needs no step 2 or 3 when only `dockerd` pulls from it. Use `docker pull REGISTRY/IMAGE`.
+If only `dockerd` pulls from a private registry, skip steps 2 and 3 and run `docker pull REGISTRY/IMAGE` directly.
 
 ## 7. Reference
 
 ### 7.1 Storage Choices
 
-The data of `dockerd` can stay in three places. The overlay storage driver works on each of them. The times are single runs on an Apple M1 with `hvf`.
+`dockerd` can store its data in three ways, all compatible with the overlay storage driver. Measured times are single runs on an Apple M1 with `hvf`.
 
-| Storage | `rungv` flag | Kept after a restart | `docker pull nginx:alpine` |
+| Storage | `rungv` flag | Persists across restarts | `docker pull nginx:alpine` |
 | :--- | :--- | :--- | ---: |
 | `ext4lite` volume | `-v gvx-docker:/var/lib/docker` | Yes | 9 s |
-| `ext4lite` image at a path | `--mount type=volume,src=/disk/gvx-docker.ext4,dst=/var/lib/docker` | Yes | 9 s |
+| `ext4lite` image at a host path | `--mount type=volume,src=/disk/gvx-docker.ext4,dst=/var/lib/docker` | Yes | 9 s |
 | Host directory (`hostfs`) | `-v /disk/gvx-docker:/var/lib/docker` | Yes, as host files | 32 to 54 s |
-| Memory | `--tmpfs /var/lib/docker:size=6g` | No | 5 s |
+| Memory (`tmpfs`) | `--tmpfs /var/lib/docker:size=6g` | No | 5 s |
 
-Use the `ext4lite` volume unless you need the files as host files. The volume image grows as `dockerd` writes, and a clean exit returns the unused tail to the host. Delete `gvx-docker.ext4` in the `volumes` directory next to the layer cache to remove all data of the engine.
+Prefer an `ext4lite` volume unless you need direct host file access. The image grows on demand and compacts its unused tail on clean exit. To wipe all engine state, run `rungv volume rm gvx-docker` (or delete `gvx-docker.ext4` in the `volumes` directory).
 
 ### 7.2 Known Limits
 
 | Limit | Effect |
 | :--- | :--- |
-| Published host ports | Fixed at the start. A container port outside the published range is reachable only inside the sandbox. |
-| Guest architecture | The engine runs images for the host architecture. On Apple Silicon, it runs `linux/arm64` images. |
-| `10.0.2.15` from a container | A `bridge` container cannot connect to the `eth0` address of the sandbox. Use the container address or a user-defined network. |
-| `docker stats` | Shows the memory, the CPU time, and the network counters of a container. The memory is `memory.current`, which counts page cache and mapped pages too. A container that wrote 64 MiB showed 64 MiB on `hvf` and 101 MiB on Linux systrap. `BLOCK I/O` stays at `0B / 0B`, because the guest has no `io` controller. |
-| `docker run -m` | The Sentry polls the memory use of each limited container and ends the process with the highest score when the use passes the limit. Section 7.4 gives the details. |
-| `docker run --cpus` | `--cpus` becomes `cpu.max`, and the Sentry enforces it. Section 7.5 gives the details. |
-| `--memory-reservation`, `--memory-swap`, `--cpu-shares` | Accepted and stored. The engine does not enforce them. `docker run` prints a warning about the missing swap limit. |
+| Published host ports | Without `--auto-publish`, static `-p` rules fix published ports at start. With `--auto-publish`, `rungv` binds dynamic ports on `127.0.0.1` only (up to `net.forward.max_dynamic_ports`, default 64). |
+| Guest architecture | Matches the host CPU architecture (`linux/arm64` on Apple Silicon and ARM64 Windows; `linux/amd64` on x86_64). |
+| `10.0.2.15` from a container | A `bridge` container cannot reach the sandbox's `eth0` address. Use the container IP or a user-defined bridge network. |
+| `docker stats` | Reports memory (`memory.current`, including page cache and mapped pages), CPU time, and network counters. A container writing 64 MiB reported 64 MiB on `hvf` and 101 MiB on Linux `systrap`. `BLOCK I/O` stays `0B / 0B` because the guest has no `io` controller. |
+| `docker run -m` | The Sentry polls each limited container's memory usage and kills the highest-scoring process above the limit (see Section 7.4). |
+| `docker run --cpus` | Translates to `cpu.max`, enforced by the Sentry on every engine (see Section 7.5). |
+| `--memory-reservation`, `--memory-swap`, `--cpu-shares` | Accepted and stored without enforcement. `docker run` warns about the missing swap limit. |
 
 ### 7.3 Security
 
-The privileges of `--privileged` stay inside the sandbox. A container with `docker run --privileged` gets them only inside the sandbox too. A raw packet reaches only the network stack of the sandbox. The NAT forwarder relays only TCP and UDP connections, through host sockets. The API socket on the host has the mode `0600`, so only your user can open it. Any program of your user can therefore control the engine, as with a local Docker Engine.
+`--privileged` grants privileges only inside the sandbox, including for nested `docker run --privileged` containers. Raw packets never leave the guest network stack; the NAT forwarder only relays TCP and UDP through host sockets. The host API socket uses mode `0600`, so only your user account can access it, matching a local Docker daemon.
 
 ### 7.4 Memory Limits of Containers
 
