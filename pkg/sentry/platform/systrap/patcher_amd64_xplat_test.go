@@ -508,6 +508,7 @@ func TestEmulateSegMemInsnFSAccesses(t *testing.T) {
 		{name: "mov ebp, fs:[rbx]", code: []byte{0x64, 0x8b, 0x2b}, set: map[int]uint64{rbx: 0x28}, reg: rbp, want: 0x55667788},
 		{name: "sub rax, fs:[0x28] with an intact canary", code: []byte{0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}, set: map[int]uint64{rax: 0x1122334455667788}, reg: rax, want: 0, checkZF: true, wantZF: true},
 		{name: "sub rax, fs:[0x28] with a smashed canary", code: []byte{0x64, 0x48, 0x2b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00}, set: map[int]uint64{rax: 0x1122334455667789}, reg: rax, want: 1, checkZF: true, wantZF: false},
+		{name: "mov rax, fs:[-0x1b8] with negative disp32", code: []byte{0x64, 0x48, 0x8b, 0x04, 0x25, 0x48, 0xfe, 0xff, 0xff}, reg: rax, want: 0xaaaabbbbccccdddd},
 	}
 	for _, c := range cases {
 		var regs [16]uint64
@@ -887,6 +888,27 @@ func TestEmulateGuardedX86InsnCoversLegitimateCode(t *testing.T) {
 	if out := emulateGuardedX86Insn(pushw, 0x8000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); out.ok {
 		t.Fatalf("emulateGuardedX86Insn accepted 16-bit PUSHW % x: %+v", pushw, out)
 	}
+
+	// 8. lea rax, [rip - 0x166d133] (48 8d 05 cd 2e 99 fe) at PC=0x3de868c:
+	// the disp32 contains CD 2E and must sign-extend to 0x0277b560, not 0x10277b560.
+	leaNegRIP := []byte{0x48, 0x8d, 0x05, 0xcd, 0x2e, 0x99, 0xfe}
+	if out := emulateGuardedX86Insn(leaNegRIP, 0x3de868c, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || regs[0] != 0x0277b560 || nextPC != 0x3de8693 {
+		t.Fatalf("LEA negative RIP disp32 = %+v, RAX=%#x (want 0x0277b560), nextPC=%#x", out, regs[0], nextPC)
+	}
+
+	// 9. mov rcx, [rax - 0xd133] (48 8b 88 cd 2e ff ff) with negative disp32 containing CD 2E.
+	binary.LittleEndian.PutUint64(mem[0x40:], 0x1122334455667788)
+	regs[0] = memBase + 0x40 + 0xd133
+	movNegDisp := []byte{0x48, 0x8b, 0x88, 0xcd, 0x2e, 0xff, 0xff}
+	if out := emulateGuardedX86Insn(movNegDisp, 0x9000, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.ok || out.fault || regs[1] != 0x1122334455667788 || nextPC != 0x9007 {
+		t.Fatalf("MOV negative disp32 = %+v, RCX=%#x, nextPC=%#x", out, regs[1], nextPC)
+	}
+
+	// 10. 32-bit address-size override with no base register zero-extends the 32-bit offset.
+	movAddr32 := []byte{0x67, 0x48, 0x8b, 0x04, 0x25, 0xcd, 0x2e, 0xff, 0xff}
+	if out := emulateGuardedX86Insn(movAddr32, 0x9100, 0, 0, &regs, &eflags, &nextPC, readMem, writeMem); !out.fault || out.faultAddr != 0xffff2ecd {
+		t.Fatalf("MOV addr32 disp32 = %+v, want fault at 0xffff2ecd", out)
+	}
 }
 
 func TestPlanGuardedScratchInsnSanitizesVectorAndAtomicOps(t *testing.T) {
@@ -932,6 +954,20 @@ func TestPlanGuardedScratchInsnSanitizesVectorAndAtomicOps(t *testing.T) {
 			code:        []byte{0xf0, 0x0f, 0xc1, 0x8b, 0xcd, 0x2e, 0x00, 0x00},
 			pc:          0x30000,
 			wantAddr:    0x400000 + 0x2ecd,
+			wantScratch: true,
+		},
+		{
+			name:        "movups_xmm0_rip_neg_disp32_cd2e",
+			code:        []byte{0x0f, 0x10, 0x05, 0xcd, 0x2e, 0x99, 0xfe},
+			pc:          0x3de868c,
+			wantAddr:    0x0277b560,
+			wantScratch: true,
+		},
+		{
+			name:        "lock_xadd_rbx_neg_disp32_cd2e_ecx",
+			code:        []byte{0xf0, 0x0f, 0xc1, 0x8b, 0xcd, 0x2e, 0xff, 0xff},
+			pc:          0x30000,
+			wantAddr:    0x400000 - 0xd133,
 			wantScratch: true,
 		},
 		{
