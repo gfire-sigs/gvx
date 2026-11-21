@@ -19,17 +19,45 @@ package systrap
 import "golang.org/x/arch/x86/x86asm"
 
 // decodeX86 decodes the instruction at the start of b in 64-bit mode. It
-// returns the result of x86asm.Decode, with a correction for VZEROUPPER and
-// VZEROALL. These two VEX instructions have no ModRM byte, but x86asm.Decode
-// reads one. The length that it returns then depends on the next byte, and it
-// is 1 to 5 bytes too long. A scan that trusts that length starts the next
-// instruction inside the previous one, and it finds sites that are not
-// instructions.
+// returns the result of x86asm.Decode with two corrections:
+//  1. VZEROUPPER and VZEROALL have no ModRM byte, whereas x86asm.Decode reads
+//     one and returns a length 1 to 5 bytes too long. A scan that trusts that
+//     length starts the next instruction inside the previous one.
+//  2. x86asm.Decode zero-extends 32-bit ModRM displacements of non-VEX
+//     instructions instead of sign-extending them to 64 bits.
 func decodeX86(b []byte) (x86asm.Inst, error) {
 	if op, n := vzeroInsn(b); n > 0 {
 		return x86asm.Inst{Op: op, Mode: 64, Len: n}, nil
 	}
-	return x86asm.Decode(b, 64)
+	inst, err := x86asm.Decode(b, 64)
+	if err != nil || inst.Op == 0 || inst.Len == 0 || inst.Len > len(b) {
+		return inst, err
+	}
+	if !isMoffsInsn(b[:inst.Len]) {
+		for i, arg := range inst.Args {
+			m, ok := arg.(x86asm.Mem)
+			if !ok {
+				continue
+			}
+			if m.Disp > 0x7fffffff && m.Disp <= 0xffffffff {
+				m.Disp = int64(int32(m.Disp))
+				inst.Args[i] = m
+			}
+		}
+	}
+	return inst, nil
+}
+
+// isMoffsInsn reports whether raw starts with a direct-offset MOV (opcodes
+// 0xA0..0xA3 after legacy and REX prefixes). Those are the only 64-bit
+// instructions whose x86asm.Mem.Disp holds an unsigned 64-bit direct offset
+// rather than a signed 32-bit ModRM displacement.
+func isMoffsInsn(raw []byte) bool {
+	i := 0
+	for i < len(raw) && isX86Prefix(raw[i]) {
+		i++
+	}
+	return i < len(raw) && raw[i] >= 0xA0 && raw[i] <= 0xA3
 }
 
 // vzeroInsn recognizes VZEROUPPER and VZEROALL at the start of b. It returns

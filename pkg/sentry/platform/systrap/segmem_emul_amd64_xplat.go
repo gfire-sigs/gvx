@@ -73,7 +73,7 @@ func emulateSegMemInsn(
 	if memIdx < 0 {
 		return segEmulOutcome{}
 	}
-	addr, addrOK := evalSegMemAddr(memArg, segBase, regs)
+	addr, addrOK := evalSegMemAddr(memArg, segBase, regs, inst.AddrSize == 32)
 	if !addrOK {
 		return segEmulOutcome{}
 	}
@@ -289,30 +289,39 @@ func isAtomicMemInsn(inst x86asm.Inst) bool {
 	return false
 }
 
-func evalSegMemAddr(m x86asm.Mem, segBase uint64, regs *[16]uint64) (uint64, bool) {
-	addr := segBase + uint64(m.Disp)
+func evalSegMemAddr(m x86asm.Mem, segBase uint64, regs *[16]uint64, addr32 bool) (uint64, bool) {
+	off := uint64(m.Disp)
 	if m.Base != 0 {
-		if m.Base == x86asm.RIP {
+		if m.Base == x86asm.RIP || m.Base == x86asm.EIP {
 			return 0, false
 		}
-		v, _, ok := readX86Reg(regs, m.Base)
-		if !ok {
+		v, w, ok := readX86Reg(regs, m.Base)
+		if !ok || (w != 8 && w != 4) {
 			return 0, false
 		}
-		addr += v
+		if w == 4 {
+			addr32 = true
+		}
+		off += v
 	}
 	if m.Index != 0 {
-		v, _, ok := readX86Reg(regs, m.Index)
-		if !ok {
+		v, w, ok := readX86Reg(regs, m.Index)
+		if !ok || (w != 8 && w != 4) {
 			return 0, false
+		}
+		if w == 4 {
+			addr32 = true
 		}
 		scale := uint64(m.Scale)
 		if scale == 0 {
 			scale = 1
 		}
-		addr += v * scale
+		off += v * scale
 	}
-	return addr, true
+	if addr32 {
+		off &= 0xffffffff
+	}
+	return segBase + off, true
 }
 
 func inferMemBytes(inst x86asm.Inst) int {
@@ -555,8 +564,8 @@ func evalX86Cond(cc string, eflags uint32) (bool, bool) {
 
 // evalX86MemAddr computes the linear guest address of m for an instruction of
 // length insnLen at pc. When withSeg is false (as in LEA), segment bases are
-// ignored.
-func evalX86MemAddr(m x86asm.Mem, pc uint64, insnLen int, fsBase, gsBase uint64, regs *[16]uint64, withSeg bool) (uint64, bool) {
+// ignored. When addr32 is true, the offset wraps to 32 bits before adding seg.
+func evalX86MemAddr(m x86asm.Mem, pc uint64, insnLen int, fsBase, gsBase uint64, regs *[16]uint64, withSeg, addr32 bool) (uint64, bool) {
 	var seg uint64
 	if withSeg {
 		switch m.Segment {
@@ -570,7 +579,6 @@ func evalX86MemAddr(m x86asm.Mem, pc uint64, insnLen int, fsBase, gsBase uint64,
 		}
 	}
 	off := uint64(m.Disp)
-	addr32 := false
 	switch m.Base {
 	case 0:
 	case x86asm.RIP:
@@ -837,7 +845,7 @@ func emulateGuardedX86Insn(
 			if width != 1 && width != 2 && width != 4 && width != 8 {
 				return 0, false, 0, false
 			}
-			addr, aok := evalX86MemAddr(a, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(a, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				return 0, false, 0, false
 			}
@@ -866,7 +874,7 @@ func emulateGuardedX86Insn(
 		if dstIdx < 0 || (dstW != 2 && dstW != 4 && dstW != 8) {
 			return segEmulOutcome{}
 		}
-		addr, aok := evalX86MemAddr(memArg, pc, inst.Len, 0, 0, regs, false)
+		addr, aok := evalX86MemAddr(memArg, pc, inst.Len, 0, 0, regs, false, inst.AddrSize == 32)
 		if !aok || !writeX86Reg(regs, dstReg, addr) {
 			return segEmulOutcome{}
 		}
@@ -898,7 +906,7 @@ func emulateGuardedX86Insn(
 			if !ok {
 				return segEmulOutcome{}
 			}
-			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				return segEmulOutcome{}
 			}
@@ -983,7 +991,7 @@ func emulateGuardedX86Insn(
 				return segEmulOutcome{}
 			}
 		case x86asm.Mem:
-			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				return segEmulOutcome{}
 			}
@@ -1026,7 +1034,7 @@ func emulateGuardedX86Insn(
 			if !ok {
 				return segEmulOutcome{}
 			}
-			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				return segEmulOutcome{}
 			}
@@ -1079,7 +1087,7 @@ func emulateGuardedX86Insn(
 			if w != 1 && w != 2 && w != 4 && w != 8 {
 				return segEmulOutcome{}
 			}
-			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				return segEmulOutcome{}
 			}
@@ -1124,7 +1132,7 @@ func emulateGuardedX86Insn(
 			if w != 1 && w != 2 && w != 4 && w != 8 {
 				return segEmulOutcome{}
 			}
-			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				return segEmulOutcome{}
 			}
@@ -1316,7 +1324,7 @@ func emulateGuardedX86Insn(
 		case x86asm.Mem:
 			// Note: POP [rsp+...] evaluates the destination address after incrementing RSP.
 			regs[4] = sp + 8
-			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true)
+			addr, aok := evalX86MemAddr(dst, pc, inst.Len, fsBase, gsBase, regs, true, inst.AddrSize == 32)
 			if !aok {
 				regs[4] = sp
 				return segEmulOutcome{}
@@ -1688,7 +1696,7 @@ func planGuardedScratchInsn(code []byte, pc, fsBase, gsBase uint64, regs *[16]ui
 	if lastSeg != 0 && memArg.Segment == 0 {
 		memArg.Segment = lastSeg
 	}
-	effAddr, ok := evalX86MemAddr(memArg, pc, inst.Len, fsBase, gsBase, regs, true)
+	effAddr, ok := evalX86MemAddr(memArg, pc, inst.Len, fsBase, gsBase, regs, true, false)
 	if !ok {
 		return guardedScratchPlan{}, false
 	}

@@ -688,6 +688,55 @@ func TestHiddenSyscallInImmediateTrapsInteriorJumpAndPreservesFallthrough(t *tes
 			t.Fatalf("int 0x2e Rip = %#x, want %#x", got, intVA)
 		}
 	})
+
+	t.Run("negative_rip_disp32_with_cd2e_preserves_signed_addr", func(t *testing.T) {
+		r := newRig(t, p)
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		leaVA := codeVA + uint64(len(prog))
+		// lea rax, [rip - 0x166d133] (48 8d 05 cd 2e 99 fe)
+		prog = append(prog, 0x48, 0x8D, 0x05, 0xCD, 0x2E, 0x99, 0xFE)
+		prog = append(prog, 0x48, 0x89, 0xC3) // mov rbx, rax
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+		want := leaVA + 7 - 0x166d133
+		if got := r.ac.StateData().Regs.Rbx; got != want {
+			t.Fatalf("lea rax, [rip - 0x166d133] loaded %#x, want %#x", got, want)
+		}
+	})
+
+	t.Run("negative_disp32_vector_load_runs_in_guard_slot", func(t *testing.T) {
+		r := newRig(t, p)
+		const vecPageVA = codeVA + 0x10000
+		vecPage := r.mapPage(vecPageVA, hostarch.ReadWrite)
+		const targetOff = 0xCD
+		store64(vecPage[targetOff:], 0x0123_4567_89AB_CDEF)
+		store64(vecPage[targetOff+8:], 0xFEDC_BA98_7654_3210)
+
+		var prog []byte
+		prog = append(prog, nops(64)...)
+		// rcx - 0xd133 == vecPageVA + 0xcd
+		prog = append(prog, imm64([]byte{0x48, 0xB9}, vecPageVA+0xD200)...)
+		prog = append(prog, imm64([]byte{0x48, 0xBA}, vecPageVA+0x100)...)
+		// movups xmm0, [rcx - 0xd133] (0f 10 81 cd 2e ff ff)
+		prog = append(prog, 0x0F, 0x10, 0x81, 0xCD, 0x2E, 0xFF, 0xFF)
+		// movups [rdx], xmm0 (0f 11 02)
+		prog = append(prog, 0x0F, 0x11, 0x02)
+		prog = append(prog, gSyscall(93)...)
+		r.program(prog)
+
+		si, _, err := r.run()
+		mustSyscall(t, si, err, 93, r.ac)
+		if got := load64(vecPage[0x100:]); got != 0x0123_4567_89AB_CDEF {
+			t.Fatalf("low qword = %#x, want 0x0123456789abcdef", got)
+		}
+		if got := load64(vecPage[0x108:]); got != 0xFEDC_BA98_7654_3210 {
+			t.Fatalf("high qword = %#x, want 0xfedcba9876543210", got)
+		}
+	})
 }
 
 // TestGSStoreIntoReadOnlyViewFaults runs a trapped store through %gs into a
