@@ -240,6 +240,27 @@ func (s *Sandbox) openManifestLayers(digests []string) (err error) {
 	return nil
 }
 
+// restorePlatform returns the backend of a restored sandbox. An explicit
+// request of the caller wins. Without one, the bundle names the backend,
+// because the saved state fits only the backend that wrote it.
+//
+// The bundle is untrusted input, so it cannot give the permission that
+// openPlatform requires for Windows systrap. When the bundle names systrap on
+// Windows, the caller must permit it.
+func restorePlatform(goos string, requested PlatformType, manifestPlatform string, allowUnconfinedSystrap bool) (PlatformType, error) {
+	if requested != "" && requested != PlatformAuto {
+		return requested, nil
+	}
+	if manifestPlatform == "" {
+		return requested, nil
+	}
+	fromBundle := PlatformType(manifestPlatform)
+	if goos == "windows" && fromBundle == PlatformSystrap && !allowUnconfinedSystrap {
+		return "", fmt.Errorf("gvx: the checkpoint bundle names Windows systrap, which lacks hardware or kernel syscall isolation; set Config.Platform to systrap (-platform=systrap) or set Config.AllowUnconfinedSystrap (-allow-unconfined-systrap): %w", ErrPlatformUnavailable)
+	}
+	return fromBundle, nil
+}
+
 // Restore loads a checkpoint bundle from opts.Dir into a new Sandbox. Restore
 // opens all host handles, validates manifest.json, and applies hostlockdown
 // before loading untrusted checkpoint pages and kernel state.
@@ -262,8 +283,9 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if err != nil {
 		return nil, err
 	}
-	if (cfg.Platform == "" || cfg.Platform == PlatformAuto) && manifest.Platform != "" {
-		cfg.Platform = PlatformType(manifest.Platform)
+	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
+	if cfg.Platform, err = restorePlatform(runtime.GOOS, cfg.Platform, manifest.Platform, allowUnconfined); err != nil {
+		return nil, err
 	}
 	if cfg.NetworkMode == "" && manifest.NetMode != "" {
 		cfg.NetworkMode = manifest.NetMode
@@ -333,7 +355,6 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		return cleanup(err)
 	}
 
-	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
 	opened, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown, allowUnconfined)
 	if err != nil {
 		return cleanup(err)
