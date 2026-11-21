@@ -30,6 +30,7 @@ Run `rungv help` to print this command list.
 | `info` | Print the host OS, available execution backends, lockdown profile, and storage paths. |
 | `checkpoint` | Write a checkpoint bundle for a running sandbox over its control socket (alias: `snapshot`). |
 | `restore` | Restore and run a sandbox from a checkpoint bundle directory (alias: `resume`). |
+| `net-policy get`, `net-policy replace` | Read or replace a running NAT sandbox's host firewall and bandwidth limits. |
 | `login` | Store registry credentials. |
 | `logout` | Remove registry credentials. |
 | `completion` | Print shell completion scripts for `bash`, `zsh`, `fish`, or `powershell`. |
@@ -98,10 +99,14 @@ The table below lists the sandbox flags specific to `gvx`.
 | `--host-dns IP[:PORT]` | Specify a host DNS server (repeatable). Replaces host resolver discovery for the guest DNS relay and registry pulls. Also accepted by `pull` and `save` (see Section 5.2). |
 | `-cache-dir DIR` | Override the layer cache directory. |
 | `-checkpoint-dir DIR` | Pre-open a host directory before lockdown for checkpoint bundle files. |
-| `-control-socket PATH` | Bind a Unix socket or loopback TCP listener before lockdown for `rungv checkpoint`. TCP listeners and Windows Unix sockets require the per-run token written to a `0600` token file. |
+| `-control-socket ADDRESS` | Pre-bind a Unix socket or loopback TCP listener for `rungv checkpoint` or live policy control. TCP and Windows Unix sockets require a per-run token. |
 | `-lockdown=false` | Skip host lockdown. Use for debugging only. |
 | `--tune KEY=VALUE` | Set a host-side tunable (repeatable; see Section 3.3). Accepted by `run`, `restore`, `pull`, `load`, `save`, `images`, `inspect`, `rmi`, `tag`, `image`, `system`, and `info`. |
 | `--tune-file FILE` | Load host-side tunables from a JSON object. `--tune` flags override the file. Accepted by the same commands. |
+| `--net-policy-state FILE` | Create or reopen a host-owned policy store for `-net=nat` (see Section 4.12). |
+| `--nat-iptables-file FILE`, `--nat-ip6tables-file FILE` | Seed a new policy store with the IPv4 and IPv6 `*filter` files. |
+| `--qos-tx LIMIT`, `--qos-rx LIMIT` | Specify transmit and receive limits when seeding a store. Both arguments are required. |
+| `--net-policy-live` | Enable `net-policy get` and `net-policy replace` on `-control-socket`. |
 
 ### 3.3 Tunables
 
@@ -342,6 +347,40 @@ rungv run -checkpoint-dir=./ckpt -control-socket=./ckpt.sock -workspace=./work a
 rungv checkpoint -control-socket=./ckpt.sock -checkpoint-dir=./ckpt
 rungv restore -checkpoint-dir=./ckpt -workspace=./work
 ```
+
+### 4.12 Host NAT policy
+
+The host applies the policy at the NAT peer and its relays. It inspects IP addresses, protocols, and ports without connection state. Guest `iptables` commands neither list nor alter this policy. It does not apply to `wg`, `none`, or traffic that stays inside the guest.
+
+Each rule file has a 64 KiB limit. Each built-in chain can visit at most 4,096 rules, including repeated calls to user chains.
+
+| Setting | Contract |
+| :--- | :--- |
+| Rule files | Each file contains one `*filter` table from the matching IP family. The profile accepts address and protocol selectors, TCP/UDP ports and ranges, `multiport`, negation, comments, `ACCEPT`, `DROP`, user chains, and `RETURN`. |
+| Direction | `INPUT` governs guest transmit; `OUTPUT` governs guest receive. Only routed packets use `FORWARD`. Permit reply traffic explicitly. |
+| Relay rules | Both guest and host endpoint tuples must pass. A destination port on one side does not authorize a different port on the other side. |
+| Denials | Unsupported rules reject the full update. If an unknown field affects a verdict, the backend denies that operation. Policy `ACCEPT` never overrides `-isolate-lan`. |
+| Publications | Protected runs reject Unix-socket publications and wildcard UDP bind addresses. The default loopback bind is valid. |
+| Bandwidth | Each direction takes `unlimited` or `rate-bps=N,burst-bytes=B,queue-bytes=Q`. One bucket per direction covers all protected paths. RX limits delivery, not packets the host kernel already received. |
+
+> [!IMPORTANT]
+> Keep policy and control files in private host directories outside guest mounts. Create the store's parent directory before starting. Supply the same store on restart or restore.
+
+```sh
+rungv run -net=nat --net-policy-state ./private/policy.state \
+  --nat-iptables-file rules.v4 --nat-ip6tables-file rules.v6 \
+  --qos-tx unlimited --qos-rx rate-bps=10000000,burst-bytes=131072,queue-bytes=524288 \
+  --net-policy-live -control-socket tcp://127.0.0.1:7401 IMAGE
+rungv net-policy get -control-socket tcp://127.0.0.1:7401
+rungv net-policy replace -control-socket tcp://127.0.0.1:7401 --expected-revision REV \
+  --file next.v4 --file6 next.v6 --qos-tx unlimited --qos-rx unlimited
+```
+
+`REV` is the opaque revision from `get`. Replacement commits both rule files and both limits together. A restart invalidates the old revision token, not the saved configuration. If the reply is lost, use `get` before any retry.
+
+On an ordinary restart, specify the state path without seed rules or limits. For a protected checkpoint, restore requires a store with the recorded identity and at least the recorded generation. Restore uses a newer committed policy if the same store has one.
+
+The NAT backend refuses guest connections to its own TCP control endpoint. A checkpoint listener does not enable policy commands unless the operator sets `--net-policy-live`.
 
 ## 5. Images and registries
 

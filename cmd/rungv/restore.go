@@ -45,6 +45,7 @@ type restoreConfig struct {
 	cfg           gvx.Config
 	autoPlatform  bool
 	controlSocket string
+	netPolicyLive bool
 }
 
 // parseRestoreArgs converts `rungv restore` arguments into a restoreConfig.
@@ -84,6 +85,7 @@ func parseRestoreArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		cfg:           cfg,
 		autoPlatform:  autoPlatform,
 		controlSocket: strings.TrimSpace(flags.controlSocket),
+		netPolicyLive: flags.netPolicy.live,
 	}, 0, false
 }
 
@@ -108,7 +110,7 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 
 	var err error
-	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir})
+	sb, err = gvx.Restore(ctx, rc.cfg, gvx.RestoreOptions{Dir: rc.dir, NetPolicy: rc.cfg.NetPolicy})
 	if err != nil {
 		if rc.cfg.CheckpointListener != nil {
 			_ = rc.cfg.CheckpointListener.Close()
@@ -126,5 +128,5 @@ func restoreSubcommand(ctx context.Context, args []string, stdin io.Reader, stdo
 	if rc.cfg.Stderr != nil {
 		errOut = rc.cfg.Stderr
 	}
-	return executeSandboxWithControl(ctx, sb, &rc.cfg, control.token(), rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", errOut)
+	return executeSandboxWithControl(ctx, sb, &rc.cfg, control, rc.netPolicyLive, rc.autoPlatform, cleanCkptDir, absCkptDir, "rungv restore", errOut)
 }

@@ -68,6 +68,10 @@ type Sandbox struct {
 	netStack          *stack.Stack
 	natForwarder      *netbackend.NATForwarder
 	portForwarder     *netbackend.PortForwarder
+	netPolicy         *netbackend.NATPolicy
+	policyStore       *netPolicyStore
+	policyRunID       string
+	policyCommitErr   error
 	wgEndpoint        *netbackend.WireGuardEndpoint
 	wgPeerPort        uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
@@ -126,6 +130,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 	cleanup := func(cause error) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
+	}
+	if err := sb.openNetPolicy(nil, ""); err != nil {
+		return cleanup(err)
 	}
 	if cfg.HostCACerts {
 		roots, err := hostcerts.Collect(ctx, cfg.Warnings)
@@ -554,6 +561,11 @@ func (s *Sandbox) Close() error {
 	}
 	s.closed = true
 
+	if s.netPolicy != nil {
+		s.netPolicy.Close()
+		s.netPolicy = nil
+	}
+
 	if s.restoredKernel != nil {
 		if tk := s.restoredKernel.Timekeeper(); tk != nil {
 			tk.Destroy()
@@ -608,6 +620,12 @@ func (s *Sandbox) Close() error {
 	if s.netStack != nil {
 		s.netStack.Close()
 		s.netStack = nil
+	}
+	if s.policyStore != nil {
+		if err := s.policyStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.policyStore = nil
 	}
 
 	if s.plat != nil {

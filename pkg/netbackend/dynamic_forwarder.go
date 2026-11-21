@@ -264,12 +264,18 @@ func (pf *PortForwarder) bindDynamicCandidate(s *stack.Stack, opts DynamicForwar
 		GuestIP:   cand.guestIP,
 		GuestPort: cand.key.port,
 	}
+	wantBind := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), cand.key.port)
 
 	switch cand.key.proto {
 	case "tcp":
 		ln, err := opts.ListenTCP("tcp4", bindAddr)
 		if err != nil {
 			pf.recordDynamicBindError(opts, cand.key, err)
+			return
+		}
+		if pf.policy != nil && policySocketAddrPort(ln.Addr()) != wantBind {
+			_ = ln.Close()
+			pf.recordDynamicBindError(opts, cand.key, fmt.Errorf("netbackend: dynamic TCP socket must bind to %s", wantBind))
 			return
 		}
 		entry := &boundTCPForward{rule: rule, listener: ln}
@@ -302,6 +308,11 @@ func (pf *PortForwarder) bindDynamicCandidate(s *stack.Stack, opts DynamicForwar
 		if !ok {
 			_ = pc.Close()
 			pf.recordDynamicBindError(opts, cand.key, fmt.Errorf("netbackend: dynamic udp socket is %T, want *net.UDPConn", pc))
+			return
+		}
+		if pf.policy != nil && policySocketAddrPort(udpConn.LocalAddr()) != wantBind {
+			_ = udpConn.Close()
+			pf.recordDynamicBindError(opts, cand.key, fmt.Errorf("netbackend: dynamic UDP socket must bind to %s", wantBind))
 			return
 		}
 		widenUDPSend(udpConn)

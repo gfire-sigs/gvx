@@ -26,13 +26,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 )
 
-// Control token rules: a loopback TCP listener and any Windows AF_UNIX
-// listener have no owner-only file mode, so every request on them carries a
-// per-run secret. The listener process writes the secret to a 0600 token file
-// before it binds, and `rungv checkpoint` of the same user reads that file.
-// A POSIX Unix socket relies on its 0600 mode and has no token.
+// TCP and Windows AF_UNIX connections require a per-run token. POSIX Unix
+// connections use filesystem permissions instead.
 
 const (
 	controlTokenBytes = 32
@@ -52,6 +50,9 @@ func controlTokenRequired(network string) bool {
 func controlTokenDir() (string, error) {
 	if base, err := os.UserCacheDir(); err == nil && base != "" {
 		return filepath.Join(base, "gvx", "control"), nil
+	}
+	if runtime.GOOS == "windows" {
+		return "", errors.New("Windows user cache directory is unavailable")
 	}
 	return filepath.Join(os.TempDir(), "gvx-control-"+strconv.Itoa(os.Getuid())), nil
 }
@@ -83,54 +84,81 @@ func newControlToken() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-// writeControlToken creates a fresh 0600 token file at path. It removes an
-// older file first, so a stale or pre-created file never supplies the token.
-func writeControlToken(path, token string) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create control token directory %q: %w", dir, err)
+// Replace stale tokens only after binding the corresponding endpoint.
+func writeControlToken(path, token string, protected bool) (string, error) {
+	dir, err := privatePolicyControlDir(filepath.Dir(path), true)
+	if err != nil {
+		return "", err
+	}
+	path = filepath.Join(dir, filepath.Base(path))
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("control token path %q is not a regular file", path)
+		}
+		if protected {
+			if _, err := readControlTokenFile(path); err != nil {
+				return "", fmt.Errorf("verify stale control token: %w", err)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale control token %q: %w", path, err)
+		return "", fmt.Errorf("remove stale control token %q: %w", path, err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := createControlTokenFile(path)
 	if err != nil {
-		return fmt.Errorf("create control token %q: %w", path, err)
+		return "", fmt.Errorf("create control token %q: %w", path, err)
 	}
 	if _, err := f.WriteString(token + "\n"); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return fmt.Errorf("write control token %q: %w", path, err)
+		return "", fmt.Errorf("write control token %q: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(path)
-		return fmt.Errorf("close control token %q: %w", path, err)
+		return "", fmt.Errorf("close control token %q: %w", path, err)
 	}
-	return nil
+	return path, nil
 }
 
-// readControlToken returns the token that the listener of the endpoint
-// published. A missing file returns an empty token and no error, because a
-// POSIX Unix socket has no token.
+// A missing token is permitted only on transports that do not require one.
 func readControlToken(network, address string) (string, error) {
+	if !controlTokenRequired(network) {
+		return "", nil
+	}
 	path, err := controlTokenPath(network, address)
 	if err != nil {
 		return "", err
 	}
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
+	dir, err := privatePolicyControlDir(filepath.Dir(path), false)
+	if err != nil {
+		return "", err
 	}
+	return readControlTokenFile(filepath.Join(dir, filepath.Base(path)))
+}
+
+func readControlTokenFile(path string) (string, error) {
+	f, err := openControlInput(path, true)
 	if err != nil {
 		return "", fmt.Errorf("read control token: %w", err)
 	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxControlTokenFileBytes))
-	if err != nil {
+	data, err := io.ReadAll(io.LimitReader(f, maxControlTokenFileBytes+1))
+	if err := errors.Join(err, f.Close()); err != nil {
 		return "", fmt.Errorf("read control token %q: %w", path, err)
+	}
+	if len(data) > maxControlTokenFileBytes {
+		return "", errors.New("invalid control token file")
 	}
 	for len(data) > 0 && (data[len(data)-1] == '\n' || data[len(data)-1] == '\r') {
 		data = data[:len(data)-1]
+	}
+	var decoded [controlTokenBytes]byte
+	if len(data) != hex.EncodedLen(len(decoded)) {
+		return "", errors.New("invalid control token file")
+	}
+	if _, err := hex.Decode(decoded[:], data); err != nil {
+		return "", errors.New("invalid control token file")
 	}
 	return string(data), nil
 }
@@ -142,4 +170,80 @@ func controlTokenMatches(expected, presented string) bool {
 		return true
 	}
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(presented)) == 1
+}
+
+func privatePolicyControlDir(dir string, create bool) (string, error) {
+	if create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", fmt.Errorf("create private control directory %q: %w", dir, err)
+		}
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("control directory %q is not a directory or is a link", dir)
+	}
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", err
+	}
+	if err := validateControlDirectory(dir); err != nil {
+		return "", fmt.Errorf("control directory %q: %w", dir, err)
+	}
+	return dir, nil
+}
+
+func validateControlStatePaths(statePath, endpointPath string) error {
+	state, err := canonicalControlPath(statePath)
+	if err != nil {
+		return err
+	}
+	endpoint, err := canonicalControlPath(endpointPath)
+	if err != nil {
+		return err
+	}
+	if state == endpoint || runtime.GOOS == "windows" && strings.EqualFold(state, endpoint) {
+		return errors.New("state_mismatch: control endpoint overlaps the network policy store")
+	}
+	a, aErr := os.Stat(state)
+	b, bErr := os.Stat(endpoint)
+	for _, err := range []error{aErr, bErr} {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if aErr == nil && bErr == nil && os.SameFile(a, b) {
+		return errors.New("state_mismatch: control endpoint aliases the network policy store")
+	}
+	return nil
+}
+
+func canonicalControlPath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return resolveExistingControlPrefix(path)
+}
+
+func resolveExistingControlPrefix(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	parent := filepath.Dir(path)
+	if !errors.Is(err, os.ErrNotExist) || parent == path {
+		return "", err
+	}
+	dir, err := resolveExistingControlPrefix(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(path)), nil
 }

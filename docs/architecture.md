@@ -445,6 +445,16 @@ A DNS relay (`dns_relay.go`) answers guest UDP and TCP queries to `10.0.2.3:53` 
 
 TCP DNS queries from the guest travel directly over upstream TCP, while truncated UDP answers retry over TCP. The relay answers internal names (`localhost`, `host.docker.internal`, `gateway.docker.internal`, `gvx`) authoritatively for every `IN` query type without leaking them upstream. External `AAAA` queries return empty `NOERROR` when the guest has no IPv6 route on `eth0`. The relay defines no fixed public resolver address. `Config.HostDNSServers` (`--host-dns`) supplies explicit resolvers on hosts without `/etc/resolv.conf`, and `LayerCache.SetDNSServers` passes them to `pkg/oci`.
 
+#### Host NAT Policy (Descriptive Module)
+
+`pkg/netbackend` enforces the host policy at the private NAT peer and at the relays that open or accept host connections. The policy does not alter the guest's Netstack tables. Each sandbox has its own active IPv4 and IPv6 rules and directional budgets.
+
+The private peer uses the Netstack hook interface for `INPUT`, `FORWARD`, and `OUTPUT`. This adapter does not enable conntrack on that peer. Operator files still use the supported `iptables-save` syntax; the API does not accept nftables rules.
+
+`pkg/gvx` opens the host store before lockdown. It publishes one policy revision after the commit record reaches durable storage. A protected checkpoint records the store identity and minimum generation in its manifest and saved state. Restore rejects a mismatch before it starts NAT. Older runtimes cannot restore a protected checkpoint as an unprotected sandbox.
+
+`cmd/rungv` exposes live control only when the operator opts in. For rule syntax, commands, and direction semantics, see [Host NAT policy](cli.md#412-host-nat-policy).
+
 #### Track B: L3 In-Memory WireGuard Tunnel (`wireguard_endpoint.go` and `pkg/tcpip/link/wgtun`) (Descriptive Module)
 
 In `-net=wg` mode, `wireguard_endpoint.go` attaches a shared `wgtun.Endpoint` (`pkg/tcpip/link/wgtun`, default MTU 1420) directly to `golang.zx2c4.com/wireguard/device` in Go memory. `wgtun.Endpoint` implements both `stack.LinkEndpoint` and `wireguard-go`'s `tun.Device` with 16-packet batch reads and `Suspend`/`Resume` lifecycle hooks, serving both host `-net=wg` tunnels and in-guest `genetlink/wireguard` interfaces. Before `hostlockdown.Apply()` locks down the process, `wireguard_endpoint.go` opens one host UDP socket (`net.ListenPacket("udp", ":0")`) and passes it to `wireguard_bind.go`. Outbound guest IP packets enter `wireguard-go` in memory for ChaCha20-Poly1305 encryption and exit exclusively through that pre-bound UDP socket. Guest DNS queries to `10.0.2.3:53` resolve through `dns_relay.go`.

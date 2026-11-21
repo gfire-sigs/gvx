@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -217,24 +219,37 @@ type controlEndpoint struct {
 	Token string
 	// Cleanup removes the socket file and the token file. Call it only before
 	// host lockdown, because lockdown forbids file removal.
-	Cleanup func()
+	Cleanup        func()
+	tokenPath      string
+	verifyUnixPeer bool
 }
 
-// token returns the request token of ep, or empty when ep is nil.
-func (ep *controlEndpoint) token() string {
-	if ep == nil {
-		return ""
-	}
-	return ep.Token
-}
-
-// listenCheckpointSocket binds an owner-only control listener before host
-// lockdown applies. A loopback TCP listener and a Windows AF_UNIX listener
-// also get a per-run request token, published in a 0600 token file.
-func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
+// Bind and publish credentials before host lockdown.
+func listenCheckpointSocket(raw, statePath string) (*controlEndpoint, error) {
 	network, address, err := parseCheckpointEndpoint(raw)
 	if err != nil {
 		return nil, err
+	}
+	protected := statePath != ""
+	if protected && network == "unix" {
+		if err := validateControlStatePaths(statePath, address); err != nil {
+			return nil, err
+		}
+		if controlTokenRequired(network) {
+			path, err := controlTokenPath(network, address)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateControlStatePaths(statePath, path); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if protected {
+		address, err = policyControlAddress(network, address, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var token, tokenPath string
@@ -244,6 +259,11 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 		}
 		if tokenPath, err = controlTokenPath(network, address); err != nil {
 			return nil, err
+		}
+		if protected {
+			if err := validateControlStatePaths(statePath, tokenPath); err != nil {
+				return nil, err
+			}
 		}
 	}
 	removeToken := func() {
@@ -260,13 +280,22 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 		if err != nil {
 			return nil, err
 		}
+		if protected {
+			tokenPath, err = controlTokenPath(network, ln.Addr().String())
+			if err != nil {
+				return nil, errors.Join(err, ln.Close())
+			}
+			if err := validateControlStatePaths(statePath, tokenPath); err != nil {
+				return nil, errors.Join(err, ln.Close())
+			}
+		}
 		if tokenPath != "" {
-			if err := writeControlToken(tokenPath, token); err != nil {
+			if tokenPath, err = writeControlToken(tokenPath, token, protected); err != nil {
 				_ = ln.Close()
 				return nil, err
 			}
 		}
-		return &controlEndpoint{Listener: ln, Token: token, Cleanup: removeToken}, nil
+		return &controlEndpoint{Listener: ln, Token: token, Cleanup: removeToken, tokenPath: tokenPath}, nil
 	}
 
 	parent := filepath.Dir(address)
@@ -279,6 +308,14 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("checkpoint socket path %q already exists and is not a socket", address)
 		}
+		if protected {
+			if err := validatePolicySocket(address); err != nil {
+				return nil, err
+			}
+			if err := validateStalePolicySocket(address); err != nil {
+				return nil, err
+			}
+		}
 		if err := os.Remove(address); err != nil {
 			return nil, fmt.Errorf("remove stale checkpoint socket %q: %w", address, err)
 		}
@@ -288,7 +325,7 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 		return nil, err
 	}
 	if tokenPath != "" {
-		if err := writeControlToken(tokenPath, token); err != nil {
+		if tokenPath, err = writeControlToken(tokenPath, token, protected); err != nil {
 			_ = ln.Close()
 			_ = os.Remove(address)
 			return nil, err
@@ -307,7 +344,46 @@ func listenCheckpointSocket(raw string) (*controlEndpoint, error) {
 		_ = os.Remove(address)
 		removeToken()
 	}
-	return &controlEndpoint{Listener: ln, Token: token, Cleanup: cleanup}, nil
+	return &controlEndpoint{
+		Listener: ln, Token: token, Cleanup: cleanup, tokenPath: tokenPath,
+		verifyUnixPeer: protected && runtime.GOOS == "darwin",
+	}, nil
+}
+
+func policyControlAddress(network, address string, create bool) (string, error) {
+	if network == "tcp" {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return "", err
+		}
+		if host == "localhost" {
+			host = "127.0.0.1"
+		}
+		endpoint, err := netip.ParseAddrPort(net.JoinHostPort(host, port))
+		if err != nil || !endpoint.Addr().Unmap().IsLoopback() || endpoint.Addr().Zone() != "" || (!create && endpoint.Port() == 0) {
+			return "", errors.New("policy control requires a loopback IP and numeric port")
+		}
+		return netip.AddrPortFrom(endpoint.Addr().Unmap(), endpoint.Port()).String(), nil
+	}
+	if address == "" {
+		return "", errors.New("policy control socket path is empty")
+	}
+	dir, err := privatePolicyControlDir(filepath.Dir(address), create)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(address)), nil
+}
+
+func validateStalePolicySocket(address string) error {
+	conn, err := net.DialTimeout("unix", address, controlRequestTimeout)
+	if err == nil {
+		return errors.Join(fmt.Errorf("control socket %q is already listening", address), conn.Close())
+	}
+	if !controlConnectionRefused(err) {
+		return fmt.Errorf("verify stale control socket %q: %w", address, err)
+	}
+	return nil
 }
 
 func dialCheckpointSocket(ctx context.Context, raw string) (net.Conn, error) {
@@ -366,35 +442,34 @@ type checkpointer interface {
 // controlServer serves one control connection at a time and tracks the
 // connections that still wait for a request, so stop can close them.
 type controlServer struct {
-	cp       checkpointer
-	token    string
-	cleanDir string
-	absDir   string
+	cp             checkpointer
+	policy         netPolicyController
+	token          string
+	cleanDir       string
+	absDir         string
+	verifyUnixPeer bool
 
 	mu      sync.Mutex
 	closing bool
 	reading map[net.Conn]struct{}
 }
 
-// startCheckpointControl serves checkpoint control requests from sb in a
-// background goroutine until the listener closes. The returned stop function
-// closes the listener and every connection that has not sent a request, and
-// waits for an in-flight request to finish writing its response.
-func startCheckpointControl(ctx context.Context, sb *gvx.Sandbox, ln net.Listener, token, cleanDir, absDir string) func() {
-	if ln == nil {
+func startSandboxControl(ctx context.Context, sb *gvx.Sandbox, ep *controlEndpoint, policyLive bool, cleanDir, absDir string) func() {
+	if ep == nil {
 		return func() {}
 	}
-	return serveCheckpointControl(ctx, sb, sb.AcceptCheckpointConn, ln, token, cleanDir, absDir)
+	srv := &controlServer{token: ep.Token, cleanDir: cleanDir, absDir: absDir, verifyUnixPeer: ep.verifyUnixPeer}
+	if cleanDir != "" {
+		srv.cp = sb
+	}
+	if policyLive {
+		srv.policy = sb
+	}
+	return serveControl(ctx, srv, sb.AcceptCheckpointConn, ep.Listener)
 }
 
-func serveCheckpointControl(ctx context.Context, cp checkpointer, accept func() (net.Conn, error), ln net.Listener, token, cleanDir, absDir string) func() {
-	srv := &controlServer{
-		cp:       cp,
-		token:    token,
-		cleanDir: cleanDir,
-		absDir:   absDir,
-		reading:  make(map[net.Conn]struct{}),
-	}
+func serveControl(ctx context.Context, srv *controlServer, accept func() (net.Conn, error), ln net.Listener) func() {
+	srv.reading = make(map[net.Conn]struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -455,12 +530,24 @@ func (s *controlServer) serve(ctx context.Context, conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 	}()
+	if s.verifyUnixPeer && !controlUnixPeerOwned(conn) {
+		return
+	}
 	if !s.beginRead(conn) {
 		return
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(controlRequestTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(controlRequestTimeout)); err != nil {
+		s.endRead(conn)
+		return
+	}
+	reader := bufio.NewReader(conn)
+	prefix, err := reader.Peek(1)
+	if err == nil && prefix[0] == netPolicyFrameTag[0] {
+		s.serveNetPolicy(conn, reader)
+		return
+	}
 	var req checkpointControlRequest
-	decodeErr := json.NewDecoder(io.LimitReader(conn, 64<<10)).Decode(&req)
+	decodeErr := json.NewDecoder(io.LimitReader(reader, 64<<10)).Decode(&req)
 	s.endRead(conn)
 	_ = conn.SetReadDeadline(time.Time{})
 	if decodeErr != nil {
@@ -475,6 +562,10 @@ func (s *controlServer) serve(ctx context.Context, conn net.Conn) {
 			OK:    false,
 			Error: "unauthorized: the request lacks the control token of this sandbox",
 		})
+		return
+	}
+	if s.cp == nil {
+		s.reply(conn, checkpointControlResponse{Error: "sandbox was started without -checkpoint-dir"})
 		return
 	}
 	if err := validateRequestedCheckpointDir(req.Dir, s.cleanDir, s.absDir); err != nil {

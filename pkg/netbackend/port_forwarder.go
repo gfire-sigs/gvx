@@ -15,6 +15,7 @@
 package netbackend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,6 +41,11 @@ const (
 	// acceptBackoffMin and acceptBackoffMax bound the pause after a failed Accept.
 	acceptBackoffMin = 5 * time.Millisecond
 	acceptBackoffMax = time.Second
+)
+
+var (
+	errPolicyPublicationUnix    = errors.New("netbackend: network policy does not support Unix publications")
+	errPolicyPublicationUDPBind = errors.New("netbackend: network policy requires a concrete numeric UDP bind address")
 )
 
 // PortForwardRule defines a single host-to-guest port mapping (-p host:guest).
@@ -315,9 +321,11 @@ type boundUDPForward struct {
 // udpForwardSession carries the datagrams of one host client. It owns one
 // guest UDP endpoint, so the guest sees one stable source port per client.
 type udpForwardSession struct {
-	client netip.AddrPort
-	guest  *gonet.UDPConn
-	clock  *activityClock
+	client     netip.AddrPort
+	hostTuple  PolicyTuple
+	guestTuple PolicyTuple
+	guest      *gonet.UDPConn
+	clock      *activityClock
 }
 
 // PortForwarder binds host TCP listeners and UDP packet sockets prior to
@@ -332,6 +340,7 @@ type PortForwarder struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
+	policy  *NATPolicy
 
 	// udpIdle is the time without a datagram after which a UDP session ends.
 	udpIdle time.Duration
@@ -361,15 +370,27 @@ type PortForwarder struct {
 	dynFailed  map[dynPortKey]struct{}
 }
 
+// PortForwardOptions configures a forwarder before it binds any listeners.
+type PortForwardOptions struct {
+	// Policy is the shared NAT policy. The caller owns its lifetime.
+	Policy *NATPolicy
+}
+
 // NewPortForwarder constructs an empty PortForwarder ready for PreBind. The
 // tunables net.udp.idle_timeout, net.forward.udp_sessions,
 // net.forward.guest_dial_window, and net.forward.guest_dial_interval set its
 // limits.
 func NewPortForwarder(t tuning.Values) *PortForwarder {
+	return NewPortForwarderWithOptions(t, PortForwardOptions{})
+}
+
+// NewPortForwarderWithOptions constructs a forwarder with optional NAT policy enforcement.
+func NewPortForwarderWithOptions(t tuning.Values, opts PortForwardOptions) *PortForwarder {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PortForwarder{
 		ctx:               ctx,
 		cancel:            cancel,
+		policy:            opts.Policy,
 		udpIdle:           t.Duration(tuning.UDPIdleTimeout),
 		udpMaxSessions:    t.Int(tuning.ForwardUDPSessions),
 		guestDialWindow:   t.Duration(tuning.ForwardGuestDialWindow),
@@ -385,6 +406,20 @@ func (pf *PortForwarder) PreBind(rules []PortForwardRule) error {
 	defer pf.mu.Unlock()
 	if pf.closed {
 		return errors.New("netbackend: PortForwarder is closed")
+	}
+	if pf.policy != nil {
+		for _, r := range rules {
+			if r.HostSocket != "" {
+				return errPolicyPublicationUnix
+			}
+			if !strings.EqualFold(r.Proto, "udp") || r.HostIP == "" {
+				continue
+			}
+			addr, err := netip.ParseAddr(r.HostIP)
+			if err != nil || addr.WithZone("").Unmap().IsUnspecified() {
+				return fmt.Errorf("%w: %q", errPolicyPublicationUDPBind, r.HostIP)
+			}
+		}
 	}
 
 	for _, r := range rules {
@@ -503,7 +538,8 @@ func (pf *PortForwarder) BoundRules() []PortForwardRule {
 }
 
 // SetAccept sets the accept function used for pre-bound TCP and Unix listeners.
-// When fn is nil, PortForwarder calls net.Listener.Accept directly.
+// When fn is nil, PortForwarder calls net.Listener.Accept directly. Protected
+// publications require a real TCP socket from this function.
 func (pf *PortForwarder) SetAccept(fn func(net.Listener) (net.Conn, error)) {
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
@@ -629,16 +665,20 @@ func (pf *PortForwarder) ResumeAfterSave() error {
 // waitResumed blocks while the forwarder is quiesced. It returns when the
 // pause ends or the forwarder closes.
 func (pf *PortForwarder) waitResumed() {
+	_ = pf.waitResumedContext(pf.ctx)
+}
+
+func (pf *PortForwarder) waitResumedContext(ctx context.Context) error {
 	pf.mu.Lock()
 	ch := pf.resumed
 	pf.mu.Unlock()
-	if ch == nil {
-		return
+	if ch != nil {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+		}
 	}
-	select {
-	case <-ch:
-	case <-pf.ctx.Done():
-	}
+	return ctx.Err()
 }
 
 // quiescedGuestConn gates the writes of a relay into the guest Netstack on
@@ -652,6 +692,28 @@ type quiescedGuestConn struct {
 func (c quiescedGuestConn) Write(p []byte) (int, error) {
 	c.wait()
 	return c.TCPConn.Write(p)
+}
+
+type protectedGuestConn struct {
+	*gonet.TCPConn
+	pf *PortForwarder
+}
+
+func (c protectedGuestConn) Write(p []byte) (int, error) {
+	c.pf.mu.Lock()
+	defer c.pf.mu.Unlock()
+	// A checkpoint can start while a chunk waits for policy admission.
+	if c.pf.closed {
+		return 0, net.ErrClosed
+	}
+	if c.pf.resumed != nil {
+		return 0, errPolicyHandoffPaused
+	}
+	return c.TCPConn.Write(p)
+}
+
+func (c protectedGuestConn) waitPolicyWrite(ctx context.Context) error {
+	return c.pf.waitResumedContext(ctx)
 }
 
 // spawn runs fn on a tracked goroutine. It returns false after Close, so that
@@ -712,10 +774,24 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 // the dial retries during the guest dial window.
 func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bool, hostConn net.Conn) {
 	defer func() { _ = hostConn.Close() }()
+	var hostTCP *net.TCPConn
+	var hostTuple PolicyTuple
+	if pf.policy != nil {
+		var ok bool
+		hostTCP, ok = hostConn.(*net.TCPConn)
+		if !ok {
+			return
+		}
+		hostTuple = policySocketTuple(uint8(header.TCPProtocolNumber), hostTCP.RemoteAddr(), hostTCP.LocalAddr())
+		if !pf.policy.Allow(PolicyOutput, hostTuple) {
+			return
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(pf.ctx, pf.guestDialWindow)
 	defer cancel()
 	var guestConn *gonet.TCPConn
+	var guestTuple PolicyTuple
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -725,9 +801,12 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bo
 	for {
 		var err error
 		if s := pf.targetStack(); s != nil {
-			guestConn, err = dialGuestTCP(ctx, s, guestAddr, fallback)
+			guestConn, guestTuple, err = pf.dialGuestTCP(ctx, s, guestAddr, fallback, hostTuple)
 			if err == nil {
 				break
+			}
+			if errors.Is(err, ErrPolicyDenied) {
+				return
 			}
 		} else {
 			err = errors.New("target stack is nil")
@@ -745,26 +824,68 @@ func (pf *PortForwarder) relayTCPClient(guestAddr tcpip.FullAddress, fallback bo
 		}
 	}
 	defer func() { _ = guestConn.Close() }()
+	if pf.policy != nil {
+		relayPolicyTCP(pf.ctx, pf.policy, PolicyOutput,
+			protectedGuestConn{TCPConn: guestConn, pf: pf}, hostTCP, hostTuple, guestTuple)
+		return
+	}
 	relayBidirectional(pf.ctx, hostConn, quiescedGuestConn{TCPConn: guestConn, wait: pf.waitResumed})
 }
 
-func dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddress, fallback bool) (*gonet.TCPConn, error) {
+func (pf *PortForwarder) dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddress, fallback bool, hostTuple PolicyTuple) (*gonet.TCPConn, PolicyTuple, error) {
 	primary := guestAddr
 	secondary := guestLoopbackAddr(guestAddr.Port)
 	if fallback && prefersGuestLoopback(s, header.TCPProtocolNumber, guestAddr) {
 		primary, secondary = secondary, primary
 	}
-	conn, err := gonet.DialContextTCP(ctx, s, primary, ipv4.ProtocolNumber)
+	conn, tuple, err := pf.dialPublishedTCP(ctx, s, primary, hostTuple)
 	if err == nil || !fallback || ctx.Err() != nil {
-		return conn, err
+		return conn, tuple, err
 	}
-	return gonet.DialContextTCP(ctx, s, secondary, ipv4.ProtocolNumber)
+	fallbackConn, fallbackTuple, fallbackErr := pf.dialPublishedTCP(ctx, s, secondary, hostTuple)
+	if errors.Is(fallbackErr, ErrPolicyDenied) && !errors.Is(err, ErrPolicyDenied) {
+		return nil, PolicyTuple{}, err
+	}
+	return fallbackConn, fallbackTuple, fallbackErr
+}
+
+func (pf *PortForwarder) dialPublishedTCP(ctx context.Context, s *stack.Stack, target tcpip.FullAddress, hostTuple PolicyTuple) (*gonet.TCPConn, PolicyTuple, error) {
+	if pf.policy == nil {
+		conn, err := gonet.DialContextTCP(ctx, s, target, ipv4.ProtocolNumber)
+		return conn, PolicyTuple{}, err
+	}
+	const proto = uint8(header.TCPProtocolNumber)
+	conn, err := pf.policy.Dial(ctx, PolicyOutput, func(ctx context.Context) (net.Conn, error) {
+		guest, err := gonet.DialContextTCP(ctx, s, target, ipv4.ProtocolNumber)
+		if err != nil {
+			return nil, err
+		}
+		return guest, nil
+	}, hostTuple, publicationTargetTuple(proto, target))
+	if err != nil {
+		return nil, PolicyTuple{}, err
+	}
+	actual := policySocketTuple(proto, conn.LocalAddr(), conn.RemoteAddr())
+	if !pf.policy.Allow(PolicyOutput, hostTuple, actual) {
+		_ = conn.Close()
+		return nil, PolicyTuple{}, ErrPolicyDenied
+	}
+	return conn.(*gonet.TCPConn), actual, nil
+}
+
+func publicationTargetTuple(proto uint8, target tcpip.FullAddress) PolicyTuple {
+	destination := netip.AddrPortFrom(netip.AddrFrom4(target.Addr.As4()), target.Port)
+	return policyAddrTuple(proto, netip.AddrPort{}, destination)
 }
 
 func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 	defer pf.wg.Done()
 	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
 	fallback := allowsLoopbackFallback(b.rule.GuestIP)
+	var listener netip.AddrPort
+	if pf.policy != nil {
+		listener = b.packetConn.LocalAddr().(*net.UDPAddr).AddrPort()
+	}
 	buf := make([]byte, maxUDPDatagram)
 	var backoff time.Duration
 	var timer *time.Timer
@@ -795,8 +916,12 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
-		sess := pf.udpSession(b, guestAddr, fallback, client)
+		sess := pf.udpSession(b, guestAddr, fallback, client, listener)
 		if sess == nil {
+			continue
+		}
+		if pf.policy != nil {
+			pf.enqueuePublishedDatagram(b, sess, PolicyOutput, buf[:n])
 			continue
 		}
 		sess.clock.touch()
@@ -809,7 +934,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 // udpSession returns the session of client. It creates the session and its
 // reply goroutine on the first datagram. It returns nil when the forwarder is
 // closed, the rule is at its session limit, or the guest endpoint fails.
-func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, fallback bool, client netip.AddrPort) *udpForwardSession {
+func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, fallback bool, client, listener netip.AddrPort) *udpForwardSession {
 	pf.mu.Lock()
 	if pf.closed || b.closed || pf.stack == nil {
 		pf.mu.Unlock()
@@ -831,12 +956,36 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 	if fallback && prefersGuestLoopback(s, header.UDPProtocolNumber, guestAddr) {
 		target = guestLoopbackAddr(guestAddr.Port)
 	}
-	guest, err := gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
+	var guest *gonet.UDPConn
+	var err error
+	var hostTuple, guestTuple PolicyTuple
+	if pf.policy != nil {
+		const proto = uint8(header.UDPProtocolNumber)
+		hostTuple = policyAddrTuple(proto, client, listener)
+		release, allowed := pf.policy.Begin(PolicyOutput, hostTuple, publicationTargetTuple(proto, target))
+		if !allowed {
+			return nil
+		}
+		guest, err = gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
+		release()
+		if err == nil {
+			guestTuple = policySocketTuple(proto, guest.LocalAddr(), guest.RemoteAddr())
+			if !pf.policy.Allow(PolicyOutput, hostTuple, guestTuple) {
+				_ = guest.Close()
+				return nil
+			}
+		}
+	} else {
+		guest, err = gonet.DialUDP(s, nil, &target, ipv4.ProtocolNumber)
+	}
 	if err != nil {
 		pf.log.Debug("netbackend: open guest UDP endpoint", "client", client, "error", err)
 		return nil
 	}
-	sess := &udpForwardSession{client: client, guest: guest, clock: newActivityClock()}
+	sess := &udpForwardSession{
+		client: client, guest: guest, clock: newActivityClock(),
+		hostTuple: hostTuple, guestTuple: guestTuple,
+	}
 
 	// Only this rule's serveUDP goroutine inserts sessions, so the earlier
 	// lookup cannot race with another insert for the same key.
@@ -866,12 +1015,56 @@ func (pf *PortForwarder) runUDPSession(b *boundUDPForward, sess *udpForwardSessi
 		_ = sess.guest.Close()
 	}()
 	pumpDatagrams(sess.guest, func(p []byte) error {
+		if pf.policy != nil {
+			pf.enqueuePublishedDatagram(b, sess, PolicyInput, p)
+			return nil
+		}
 		_, err := b.packetConn.WriteToUDPAddrPort(p, sess.client)
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			pf.log.Debug("netbackend: write guest reply to host client", "client", sess.client, "error", err)
 		}
 		return err
 	}, sess.clock, pf.udpIdle)
+}
+
+func (pf *PortForwarder) enqueuePublishedDatagram(b *boundUDPForward, sess *udpForwardSession, chain PolicyChain, p []byte) {
+	host, guest := sess.hostTuple, sess.guestTuple
+	if chain == PolicyInput {
+		host, guest = host.Reverse(), guest.Reverse()
+	}
+	if !pf.policy.Allow(chain, host, guest) {
+		return
+	}
+	// The shared reader reuses its buffer before the queued write runs.
+	payload := bytes.Clone(p)
+	if pf.policy.Enqueue(chain, len(payload), func() {
+		if err := pf.writePublishedDatagram(b, sess, chain, payload); err != nil && !errors.Is(err, net.ErrClosed) {
+			pf.log.Debug("netbackend: write published datagram", "client", sess.client, "error", err)
+		}
+	}, nil, host, guest) && chain == PolicyOutput {
+		sess.clock.touch()
+	}
+}
+
+func (pf *PortForwarder) writePublishedDatagram(b *boundUDPForward, sess *udpForwardSession, chain PolicyChain, payload []byte) error {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	if pf.closed || b.closed || b.sessions[sess.client] != sess {
+		return net.ErrClosed
+	}
+	if chain == PolicyInput {
+		return policyWrite(b.packetConn, func() error {
+			_, err := b.packetConn.WriteToUDPAddrPort(payload, sess.client)
+			return err
+		})
+	}
+	if pf.resumed != nil {
+		return net.ErrClosed
+	}
+	return policyWrite(sess.guest, func() error {
+		_, err := sess.guest.Write(payload)
+		return err
+	})
 }
 
 var guestLoopbackIPv4 = tcpip.AddrFrom4([4]byte{127, 0, 0, 1})

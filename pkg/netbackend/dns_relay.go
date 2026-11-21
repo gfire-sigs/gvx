@@ -48,12 +48,16 @@ const (
 	// maxDNSMessage is the largest DNS message that a UDP or TCP exchange carries.
 	maxDNSMessage = 65535
 
+	maxGuestUDPDNSMessage = 4096
+
 	// maxConcurrentDNS bounds concurrent in-flight DNS queries per endpoint.
 	maxConcurrentDNS = 64
 )
 
 // errNoDNSServers reports that the host has no resolver to forward a query to.
 var errNoDNSServers = errors.New("netbackend: no host DNS servers are configured")
+
+var errInvalidDNSMessage = errors.New("netbackend: invalid DNS message")
 
 var (
 	dnsGatewayAddr = netip.MustParseAddr(HostGatewayIPv4)
@@ -230,7 +234,7 @@ func (w *WireGuardEndpoint) dnsSemaphore() chan struct{} {
 	return w.dnsSem
 }
 
-func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
+func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn, requestPolicy *dnsRequestPolicy) {
 	timeout := nf.cfg.Tuning.Duration(tuning.DNSTimeout)
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
@@ -244,12 +248,20 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 
 	sem := nf.dnsSemaphore()
 	var writeMu sync.Mutex
-	buf := make([]byte, 4096)
+	readSize := maxGuestUDPDNSMessage
+	if requestPolicy != nil {
+		// A truncated datagram must not reach the parser or the byte budget.
+		readSize++
+	}
+	buf := make([]byte, readSize)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buf)
 		if err != nil {
 			return
+		}
+		if n > maxGuestUDPDNSMessage {
+			continue
 		}
 		req := append([]byte(nil), buf[:n]...)
 		select {
@@ -263,26 +275,28 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 				<-sem
 				connWG.Done()
 			}()
-			resp := nf.dnsRelay().answerQuery(ctx, pkt, false)
-			if len(resp) == 0 {
+			reply := nf.dnsRelay().answerQuery(ctx, pkt, false, requestPolicy)
+			if len(reply.message) == 0 {
 				return
 			}
 			writeMu.Lock()
-			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-			if _, err := conn.Write(resp); err != nil {
+			err := requestPolicy.sendReply(ctx, conn, reply.message, reply, timeout)
+			writeMu.Unlock()
+			if err != nil {
 				nf.log.Debug("netbackend: write DNS response to guest", "error", err)
 			}
-			_ = conn.SetWriteDeadline(time.Time{})
-			writeMu.Unlock()
 		}(req)
 	}
 }
 
-func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn) {
-	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), nf.handleTCPDNSQuery)
+func (nf *NATForwarder) serveTCPDNS(ctx context.Context, conn net.Conn, requestPolicy *dnsRequestPolicy) {
+	answer := func(ctx context.Context, req []byte) dnsReply {
+		return nf.handleDNSQueryProto(ctx, req, true, requestPolicy)
+	}
+	serveTCPDNSConn(ctx, conn, nf.cfg.Tuning.Duration(tuning.DNSTimeout), requestPolicy, answer)
 }
 
-func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, answer func(context.Context, []byte) []byte) {
+func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, requestPolicy *dnsRequestPolicy, answer func(context.Context, []byte) dnsReply) {
 	stop := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
 	})
@@ -290,32 +304,84 @@ func serveTCPDNSConn(ctx context.Context, conn net.Conn, timeout time.Duration, 
 	defer func() {
 		_ = conn.Close()
 	}()
-	var lenBuf [2]byte
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		req, err := readDNSFrame(conn)
+		if err != nil {
 			return
 		}
-		msgLen := int(binary.BigEndian.Uint16(lenBuf[:]))
-		if msgLen == 0 {
+		reply := answer(ctx, req)
+		if len(reply.message) == 0 {
 			return
 		}
-		req := make([]byte, msgLen)
-		if _, err := io.ReadFull(conn, req); err != nil {
-			return
-		}
-		resp := answer(ctx, req)
-		if len(resp) == 0 {
-			return
-		}
-		out := make([]byte, 2+len(resp))
-		binary.BigEndian.PutUint16(out[0:2], uint16(len(resp)))
-		copy(out[2:], resp)
-		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-		if _, err := conn.Write(out); err != nil {
+		framed := frameDNSMessage(reply.message)
+		if err := requestPolicy.sendReply(ctx, conn, framed, reply, timeout); err != nil {
 			return
 		}
 	}
+}
+
+func readDNSFrame(r io.Reader) ([]byte, error) {
+	var length [2]byte
+	if _, err := io.ReadFull(r, length[:]); err != nil {
+		return nil, err
+	}
+	size := binary.BigEndian.Uint16(length[:])
+	if size == 0 {
+		return nil, errInvalidDNSMessage
+	}
+	msg := make([]byte, size)
+	if _, err := io.ReadFull(r, msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+func frameDNSMessage(msg []byte) []byte {
+	out := make([]byte, 2+len(msg))
+	binary.BigEndian.PutUint16(out[:2], uint16(len(msg)))
+	copy(out[2:], msg)
+	return out
+}
+
+// dnsRequestPolicy uses the guest tuple supplied by the NAT transport, even
+// when the upstream uses a different IP family or protocol.
+type dnsRequestPolicy struct {
+	policy *NATPolicy
+	guest  PolicyTuple
+}
+
+type dnsReply struct {
+	message        []byte
+	upstream       PolicyTuple // The request direction of the socket that supplied the reply.
+	upstreamBytes  int
+	requestCharged bool
+}
+
+func (p *dnsRequestPolicy) sendReply(ctx context.Context, conn net.Conn, wire []byte, reply dnsReply, timeout time.Duration) error {
+	write := func() error { return writeDNSWire(conn, wire) }
+	if p == nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+		defer conn.SetWriteDeadline(time.Time{})
+		return write()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	guest := p.guest.Reverse()
+	send := func() error { return policyWrite(conn, write) }
+	if !reply.upstream.ProtocolKnown {
+		return p.policy.Send(ctx, PolicyOutput, len(wire), send, guest)
+	}
+	return p.policy.Send(ctx, PolicyOutput, reply.upstreamBytes, send, guest, reply.upstream.Reverse())
+}
+
+func writeDNSWire(conn net.Conn, wire []byte) error {
+	n, err := conn.Write(wire)
+	if err == nil && n != len(wire) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 type dnsRelay struct {
@@ -384,85 +450,110 @@ func (w *WireGuardEndpoint) dnsRelay(log *slog.Logger) dnsRelay {
 	}
 }
 
-// handleDNSQuery answers one UDP DNS message. The relay owns internal names
-// and resolves A and AAAA queries through the LookupHost hook. It forwards
-// other queries to the host DNS servers and answers SERVFAIL when none replies.
+// handleDNSQuery answers one unprotected UDP DNS message.
 func (nf *NATForwarder) handleDNSQuery(ctx context.Context, req []byte) []byte {
-	return nf.handleDNSQueryProto(ctx, req, false)
+	return nf.handleDNSQueryProto(ctx, req, false, nil).message
 }
 
-// handleTCPDNSQuery answers one TCP DNS message, forwarding upstream directly
-// over TCP rather than UDP.
-func (nf *NATForwarder) handleTCPDNSQuery(ctx context.Context, req []byte) []byte {
-	return nf.handleDNSQueryProto(ctx, req, true)
-}
-
-func (nf *NATForwarder) handleDNSQueryProto(ctx context.Context, req []byte, viaTCP bool) []byte {
+func (nf *NATForwarder) handleDNSQueryProto(ctx context.Context, req []byte, viaTCP bool, requestPolicy *dnsRequestPolicy) dnsReply {
 	sem := nf.dnsSemaphore()
 	select {
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
 	case <-ctx.Done():
-		return nil
+		return dnsReply{}
 	}
-	return nf.dnsRelay().answerQuery(ctx, req, viaTCP)
+	return nf.dnsRelay().answerQuery(ctx, req, viaTCP, requestPolicy)
 }
 
 // forwardRawDNSUpstream sends the wire query to each host DNS server in turn
 // and returns the first usable answer. A server that fails, answers SERVFAIL,
 // or answers REFUSED does not stop the search.
 func (nf *NATForwarder) forwardRawDNSUpstream(ctx context.Context, req []byte) ([]byte, error) {
-	return nf.dnsRelay().forwardRawUpstream(ctx, req, false)
+	hdr, q, _, err := parseDNSQuery(req)
+	if err != nil {
+		return nil, fmt.Errorf("netbackend: invalid DNS query: %w", err)
+	}
+	reply, err := nf.dnsRelay().forwardRawUpstream(ctx, req, hdr.ID, q, false, nil)
+	return reply.message, err
 }
 
-func (r dnsRelay) answerQuery(ctx context.Context, req []byte, viaTCP bool) []byte {
+func (r dnsRelay) answerQuery(ctx context.Context, req []byte, viaTCP bool, requestPolicy *dnsRequestPolicy) dnsReply {
+	if requestPolicy != nil && !requestPolicy.policy.Allow(PolicyInput, requestPolicy.guest) {
+		return dnsReply{}
+	}
+	reply := r.resolveQuery(ctx, req, viaTCP, requestPolicy)
+	if requestPolicy == nil || len(reply.message) == 0 || reply.requestCharged {
+		return reply
+	}
+
+	n := len(req)
+	if viaTCP {
+		n += 2
+	}
+	ctx, cancel := context.WithTimeout(ctx, r.tune.Duration(tuning.DNSTimeout))
+	defer cancel()
+	if err := requestPolicy.policy.Send(ctx, PolicyInput, n, admitDNSMessage, requestPolicy.guest); err != nil {
+		return dnsReply{}
+	}
+	return reply
+}
+
+// The transfer ends at the relay for a local query or a received upstream answer.
+func admitDNSMessage() error { return nil }
+
+func (r dnsRelay) resolveQuery(ctx context.Context, req []byte, viaTCP bool, requestPolicy *dnsRequestPolicy) dnsReply {
 	reqHdr, q, hdrOK, err := parseDNSQuery(req)
 	if !hdrOK {
-		return nil
+		return dnsReply{}
 	}
 	if err != nil {
-		return buildDNSErrorResponse(reqHdr, nil, dnsmessage.RCodeFormatError)
+		return dnsReply{message: buildDNSErrorResponse(reqHdr, nil, dnsmessage.RCodeFormatError)}
 	}
 	name := q.Name.String()
 
 	if q.Class == dnsmessage.ClassINET {
 		if addrs, found, owned := r.lookupOwnName(name); owned {
 			if !found {
-				return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
+				return dnsReply{message: buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)}
 			}
 			if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA {
-				return buildDNSAddressResponse(reqHdr, q, addrs, true)
+				return dnsReply{message: buildDNSAddressResponse(reqHdr, q, addrs, true)}
 			}
-			return buildDNSAddressResponse(reqHdr, q, nil, true)
+			return dnsReply{message: buildDNSAddressResponse(reqHdr, q, nil, true)}
 		}
 
 		if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA {
 			if !r.ipv6Enabled && q.Type == dnsmessage.TypeAAAA {
-				return buildDNSAddressResponse(reqHdr, q, nil, false)
+				return dnsReply{message: buildDNSAddressResponse(reqHdr, q, nil, false)}
 			}
-			if r.lookupHost != nil {
+			if requestPolicy == nil && r.lookupHost != nil {
 				addrs, found, handled, lookupErr := r.lookupHookAddrs(ctx, name)
 				if lookupErr != nil && r.log != nil {
 					r.log.Debug("netbackend: DNS lookup hook failed", "name", name, "error", lookupErr)
 				}
 				if handled {
 					if !found {
-						return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
+						return dnsReply{message: buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)}
 					}
-					return buildDNSAddressResponse(reqHdr, q, addrs, true)
+					return dnsReply{message: buildDNSAddressResponse(reqHdr, q, addrs, true)}
 				}
 			}
 		}
 	}
 
-	resp, err := r.forwardRawUpstream(ctx, req, viaTCP)
-	if err != nil {
-		if r.log != nil {
-			r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
-		}
-		return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure)
+	reply, err := r.forwardRawUpstream(ctx, req, reqHdr.ID, q, viaTCP, requestPolicy)
+	if err == nil {
+		return reply
 	}
-	return resp
+	if r.log != nil {
+		r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
+	}
+	if requestPolicy != nil && (errors.Is(err, ErrPolicyDenied) || errors.Is(err, ErrPolicyQueueFull)) {
+		return dnsReply{}
+	}
+	reply.message = buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure)
+	return reply
 }
 
 // lookupOwnName resolves the internal names that the relay owns authoritatively.
@@ -541,108 +632,181 @@ func randomDNSTxID() (uint16, error) {
 	return binary.BigEndian.Uint16(b[:]), nil
 }
 
-func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, viaTCP bool) ([]byte, error) {
+func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte, guestTxID uint16, wantQ dnsmessage.Question, viaTCP bool, requestPolicy *dnsRequestPolicy) (dnsReply, error) {
 	if len(r.servers) == 0 {
-		return nil, errNoDNSServers
+		return dnsReply{}, errNoDNSServers
 	}
-	reqHdr, wantQ, _, err := parseDNSQuery(req)
-	if err != nil {
-		return nil, fmt.Errorf("netbackend: invalid DNS query: %w", err)
+	network := "udp"
+	if viaTCP {
+		network = "tcp"
 	}
+	timeout := r.tune.Duration(tuning.DNSUpstreamTimeout)
 	var errs []error
+	var requestCharged bool
 	for _, server := range r.servers {
 		for _, dial := range r.dials {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return dnsReply{requestCharged: requestCharged}, errors.Join(append(errs, err)...)
 			}
-			var (
-				resp    []byte
-				respHdr dnsmessage.Header
-			)
-			if viaTCP {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
-			} else {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
-				if err == nil && respHdr.Truncated {
-					resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
-				}
+			reply, hdr, err := exchangeDNSWithDial(ctx, dial, network, server, req, guestTxID, wantQ, timeout, requestPolicy)
+			requestCharged = requestCharged || reply.requestCharged
+			if err == nil && !viaTCP && hdr.Truncated {
+				reply, hdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, guestTxID, wantQ, timeout, requestPolicy)
+				requestCharged = requestCharged || reply.requestCharged
 			}
 			if err != nil {
 				errs = append(errs, fmt.Errorf("server %s: %w", server, err))
 				continue
 			}
-			switch respHdr.RCode {
+			switch hdr.RCode {
 			case dnsmessage.RCodeServerFailure, dnsmessage.RCodeRefused:
-				errs = append(errs, fmt.Errorf("server %s: rcode %v", server, respHdr.RCode))
+				errs = append(errs, fmt.Errorf("server %s: rcode %v", server, hdr.RCode))
 				continue
 			}
-			return resp, nil
+			reply.requestCharged = requestCharged
+			return reply, nil
 		}
 	}
-	return nil, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
+	return dnsReply{requestCharged: requestCharged}, fmt.Errorf("netbackend: all upstream DNS servers failed: %w", errors.Join(errs...))
 }
 
-func exchangeDNSWithDial(ctx context.Context, dial func(ctx context.Context, network, address string) (net.Conn, error), network, server string, req []byte, guestTxID uint16, wantQ dnsmessage.Question, timeout time.Duration) ([]byte, dnsmessage.Header, error) {
-	upstreamTxID, err := randomDNSTxID()
-	if err != nil {
-		return nil, dnsmessage.Header{}, err
-	}
-	upstreamReq := append([]byte(nil), req...)
-	binary.BigEndian.PutUint16(upstreamReq[0:2], upstreamTxID)
-
+func exchangeDNSWithDial(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error), network, server string, req []byte, guestTxID uint16, wantQ dnsmessage.Question, timeout time.Duration, requestPolicy *dnsRequestPolicy) (dnsReply, dnsmessage.Header, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	conn, err := dial(ctx, network, server)
+	var (
+		conn net.Conn
+		host PolicyTuple
+		err  error
+	)
+	if requestPolicy == nil {
+		conn, err = dial(ctx, network, server)
+	} else {
+		conn, host, err = requestPolicy.dialUpstream(ctx, dial, network, server)
+	}
 	if err != nil {
-		return nil, dnsmessage.Header{}, err
+		return dnsReply{}, dnsmessage.Header{}, err
 	}
 	defer conn.Close()
-	// The deadline also bounds the read and write calls below.
 	deadline, _ := ctx.Deadline()
 	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, dnsmessage.Header{}, err
+		return dnsReply{}, dnsmessage.Header{}, err
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
+	upstreamTxID, err := randomDNSTxID()
+	if err != nil {
+		return dnsReply{}, dnsmessage.Header{}, err
+	}
+	var wire []byte
 	if network == "tcp" {
-		framed := make([]byte, 2+len(upstreamReq))
-		binary.BigEndian.PutUint16(framed[0:2], uint16(len(upstreamReq)))
-		copy(framed[2:], upstreamReq)
-		if _, err := conn.Write(framed); err != nil {
-			return nil, dnsmessage.Header{}, err
-		}
-		var lenBuf [2]byte
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			return nil, dnsmessage.Header{}, err
-		}
-		resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
-		if _, err := io.ReadFull(conn, resp); err != nil {
-			return nil, dnsmessage.Header{}, err
-		}
-		respHdr, ok := parseDNSResponse(resp, upstreamTxID, wantQ)
-		if !ok {
-			return nil, dnsmessage.Header{}, errors.New("invalid DNS response")
-		}
-		binary.BigEndian.PutUint16(resp[0:2], guestTxID)
-		return resp, respHdr, nil
+		wire = frameDNSMessage(req)
+		binary.BigEndian.PutUint16(wire[2:4], upstreamTxID)
+	} else {
+		wire = append([]byte(nil), req...)
+		binary.BigEndian.PutUint16(wire[:2], upstreamTxID)
+	}
+	var reply dnsReply
+	if requestPolicy == nil {
+		err = writeDNSWire(conn, wire)
+	} else {
+		err = requestPolicy.policy.Send(ctx, PolicyInput, len(wire), func() error {
+			reply.requestCharged = true
+			return policyWrite(conn, func() error { return writeDNSWire(conn, wire) })
+		}, requestPolicy.guest, host)
+	}
+	if err != nil {
+		return reply, dnsmessage.Header{}, err
 	}
 
-	if _, err := conn.Write(upstreamReq); err != nil {
-		return nil, dnsmessage.Header{}, err
+	resp, hdr, err := readUpstreamDNS(conn, network, upstreamTxID, wantQ)
+	if err != nil {
+		return reply, dnsmessage.Header{}, err
 	}
+	if requestPolicy != nil {
+		reply.upstreamBytes = len(resp)
+		if network == "tcp" {
+			reply.upstreamBytes += 2
+		}
+		guest, upstream := requestPolicy.guest.Reverse(), host.Reverse()
+		if (network == "udp" && hdr.Truncated) || hdr.RCode == dnsmessage.RCodeServerFailure || hdr.RCode == dnsmessage.RCodeRefused {
+			// The relay consumes this reply; it does not write it to the guest.
+			if err := requestPolicy.policy.Send(ctx, PolicyOutput, reply.upstreamBytes, admitDNSMessage, guest, upstream); err != nil {
+				return reply, dnsmessage.Header{}, err
+			}
+		} else if !requestPolicy.policy.Allow(PolicyOutput, guest, upstream) {
+			return reply, dnsmessage.Header{}, ErrPolicyDenied
+		}
+	}
+	binary.BigEndian.PutUint16(resp[:2], guestTxID)
+	reply.message = resp
+	reply.upstream = host
+	return reply, hdr, nil
+}
+
+func (p *dnsRequestPolicy) dialUpstream(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error), network, server string) (net.Conn, PolicyTuple, error) {
+	target, err := netip.ParseAddrPort(server)
+	if err != nil {
+		addr, err := netip.ParseAddr(server)
+		if err != nil {
+			return nil, PolicyTuple{}, fmt.Errorf("%w: DNS upstream must be numeric", ErrPolicyDenied)
+		}
+		target = netip.AddrPortFrom(addr, DefaultDNSPort)
+	}
+	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+	if target.Port() == 0 || target.Addr().IsUnspecified() || (network == "tcp" && !p.policy.HostDialAllowed(target)) {
+		return nil, PolicyTuple{}, ErrPolicyDenied
+	}
+
+	proto := uint8(header.UDPProtocolNumber)
+	if network == "tcp" {
+		proto = uint8(header.TCPProtocolNumber)
+	}
+	if target.Addr().Is4() {
+		network += "4"
+	} else {
+		network += "6"
+	}
+	planned := policyAddrTuple(proto, netip.AddrPort{}, target)
+	conn, err := p.policy.Dial(ctx, PolicyInput, func(ctx context.Context) (net.Conn, error) {
+		return dial(ctx, network, target.String())
+	}, p.guest, planned)
+	if err != nil {
+		return nil, PolicyTuple{}, err
+	}
+	actual := policySocketTuple(proto, conn.LocalAddr(), conn.RemoteAddr())
+	if !actual.Source.IsValid() || actual.Source.IsUnspecified() || !actual.SourcePortKnown ||
+		actual.Destination.WithZone("") != target.Addr().WithZone("") ||
+		!actual.DestinationPortKnown || actual.DestinationPort != target.Port() {
+		_ = conn.Close()
+		return nil, PolicyTuple{}, ErrPolicyDenied
+	}
+	return conn, actual, nil
+}
+
+func readUpstreamDNS(conn net.Conn, network string, wantID uint16, wantQ dnsmessage.Question) ([]byte, dnsmessage.Header, error) {
+	if network == "tcp" {
+		resp, err := readDNSFrame(conn)
+		if err != nil {
+			return nil, dnsmessage.Header{}, err
+		}
+		hdr, ok := parseDNSResponse(resp, wantID, wantQ)
+		if !ok {
+			return nil, dnsmessage.Header{}, errInvalidDNSMessage
+		}
+		return resp, hdr, nil
+	}
+
 	buf := make([]byte, maxDNSMessage)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
 			return nil, dnsmessage.Header{}, err
 		}
-		// A connected UDP socket accepts datagrams from the server only. The
-		// ID and question checks drop late or mismatched answers on a reused port.
-		if respHdr, ok := parseDNSResponse(buf[:n], upstreamTxID, wantQ); ok {
-			resp := append([]byte(nil), buf[:n]...)
-			binary.BigEndian.PutUint16(resp[0:2], guestTxID)
-			return resp, respHdr, nil
+		// The connected socket filters source endpoints. The ID and question
+		// checks reject late or mismatched answers on a reused port.
+		if hdr, ok := parseDNSResponse(buf[:n], wantID, wantQ); ok {
+			return append([]byte(nil), buf[:n]...), hdr, nil
 		}
 	}
 }
@@ -765,7 +929,7 @@ func (w *WireGuardEndpoint) serveUDPDNS(ctx context.Context, conn *gonet.UDPConn
 				<-sem
 				w.dnsWG.Done()
 			}()
-			resp := w.dnsRelay(log).answerQuery(ctx, pkt, false)
+			resp := w.dnsRelay(log).answerQuery(ctx, pkt, false, nil).message
 			if len(resp) > 0 {
 				writeMu.Lock()
 				_ = conn.SetWriteDeadline(time.Now().Add(w.cfg.Tuning.Duration(tuning.DNSTimeout)))
@@ -784,14 +948,14 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 	defer stop()
 
 	sem := w.dnsSemaphore()
-	answer := func(qctx context.Context, req []byte) []byte {
+	answer := func(qctx context.Context, req []byte) dnsReply {
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
 		case <-qctx.Done():
-			return nil
+			return dnsReply{}
 		}
-		return w.dnsRelay(log).answerQuery(qctx, req, true)
+		return w.dnsRelay(log).answerQuery(qctx, req, true, nil)
 	}
 	for {
 		conn, err := ln.Accept()
@@ -801,7 +965,7 @@ func (w *WireGuardEndpoint) serveTCPDNSListener(ctx context.Context, ln *gonet.T
 		w.dnsWG.Add(1)
 		go func(c net.Conn) {
 			defer w.dnsWG.Done()
-			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), answer)
+			serveTCPDNSConn(ctx, c, w.cfg.Tuning.Duration(tuning.DNSTimeout), nil, answer)
 		}(conn)
 	}
 }

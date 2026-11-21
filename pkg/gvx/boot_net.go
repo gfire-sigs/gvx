@@ -87,6 +87,7 @@ func (s *Sandbox) initNATStack() error {
 		IsolateLAN:        s.cfg.IsolateLAN,
 		DNSServers:        s.cfg.HostDNSServers,
 		StreamInterceptor: s.cfg.StreamInterceptor,
+		Policy:            s.netPolicy,
 		Stack:             s.stackOptions(),
 		Tuning:            s.cfg.Tuning,
 	}
@@ -115,7 +116,8 @@ func (s *Sandbox) initPortForwarder() error {
 	if len(s.forwards) == 0 && !s.cfg.AutoPublishPorts {
 		return nil
 	}
-	pf := netbackend.NewPortForwarder(s.cfg.Tuning)
+	pf := netbackend.NewPortForwarderWithOptions(s.cfg.Tuning, netbackend.PortForwardOptions{Policy: s.netPolicy})
+	s.portForwarder = pf
 	if !s.cfg.DisableHostLockdown {
 		pf.SetAccept(hostlockdown.AcceptListener)
 	}
@@ -124,13 +126,11 @@ func (s *Sandbox) initPortForwarder() error {
 		for _, pfSpec := range s.forwards {
 			rule, err := buildPortForwardRule(pfSpec)
 			if err != nil {
-				_ = pf.Close()
 				return err
 			}
 			rules = append(rules, rule)
 		}
 		if err := pf.PreBind(rules); err != nil {
-			_ = pf.Close()
 			return err
 		}
 	}
@@ -158,7 +158,6 @@ func (s *Sandbox) initPortForwarder() error {
 		}
 		pf.EnableDynamicLoopback(dynOpts)
 	}
-	s.portForwarder = pf
 	return nil
 }
 

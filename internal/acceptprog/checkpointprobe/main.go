@@ -93,7 +93,7 @@ const (
 var stdinReader = bufio.NewReader(os.Stdin)
 
 func main() {
-	mode := flag.String("mode", "memory", "verification mode: memory, hostfs, ext4lite, ext4lite-verify, or net")
+	mode := flag.String("mode", "memory", "verification mode: memory, hostfs, ext4lite, ext4lite-verify, net, or net-policy")
 	workspaceDir := flag.String("workspace", "/workspace", "guest workspace mount path")
 	volDir := flag.String("vol", "/mnt/vol", "guest ext4lite mount path")
 	flag.Parse()
@@ -109,7 +109,9 @@ func main() {
 	case "ext4lite-verify":
 		err = runExt4liteVerifyMode(*volDir)
 	case "net":
-		err = runNetMode()
+		err = runNetMode(false)
+	case "net-policy":
+		err = runNetMode(true)
 	case "rootfs-write":
 		err = runRootfsWriteMode()
 	case "rootfs-verify":
@@ -891,9 +893,15 @@ func serveSingleTCPExchange(ln net.Listener, wantLine, replyLine string) error {
 	return nil
 }
 
-func runNetMode() error {
+func runNetMode(replaceFilter bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	if replaceFilter {
+		if err := setGuestForwardPolicy(false); err != nil {
+			return err
+		}
+	}
 
 	rootIno, err := threadNetnsInode()
 	if err != nil {
@@ -1062,6 +1070,12 @@ func runNetMode() error {
 	}
 	if err := verifyIPSetSockoptByName(rootIPSetName); err != nil {
 		return fmt.Errorf("post-restore root SO_IP_SET: %w", err)
+	}
+
+	if replaceFilter {
+		if err := setGuestForwardPolicy(true); err != nil {
+			return err
+		}
 	}
 
 	fmt.Println("READY_POST_CONN:net")

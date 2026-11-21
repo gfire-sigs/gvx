@@ -2,6 +2,14 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+`rungv` can enforce a host-owned firewall and bandwidth limits for a NAT sandbox. The policy can change during execution and persists outside the guest.
+
+### Features
+
+- **Host NAT policy** (#226): Apply a stateless IPv4 and IPv6 filter at the NAT peer, host dials, DNS relay, and published ports. Set aggregate transmit and receive limits for the sandbox. Use `rungv net-policy` to read or atomically replace the saved configuration. A protected checkpoint requires its matching host store.
+
 ## [v0.19.10002026111600] - 2026-11-21
 
 This release serializes virtual processor creation and partition teardown in `pkg/sentry/platform/whpx` to prevent `HYPERVISOR_ERROR` (`0x00020001`) crashes on Windows `arm64` hosts.

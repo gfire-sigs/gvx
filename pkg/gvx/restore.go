@@ -50,6 +50,10 @@ type RestoreOptions struct {
 	// Dir is the host directory containing manifest.json, state.img,
 	// pages.meta, and pages.img.
 	Dir string
+
+	// NetPolicy overrides Config.NetPolicy when non-nil. A protected bundle
+	// requires a matching existing store.
+	NetPolicy *NetPolicyOptions
 }
 
 // ErrCheckpointManifest reports a checkpoint manifest validation failure.
@@ -151,9 +155,6 @@ func readAndParseManifest(dir string) (CheckpointManifest, error) {
 }
 
 func (s *Sandbox) validateCheckpointManifest(m CheckpointManifest) error {
-	if m.Version != CheckpointManifestVersion {
-		return fmt.Errorf("%w: unsupported version %d (want %d)", ErrCheckpointManifest, m.Version, CheckpointManifestVersion)
-	}
 	if m.GOOS != runtime.GOOS {
 		return fmt.Errorf("%w: host OS mismatch: bundle has %q, current host is %q", ErrCheckpointManifest, m.GOOS, runtime.GOOS)
 	}
@@ -276,6 +277,12 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if err != nil {
 		return nil, err
 	}
+	if err := manifest.validateNetPolicyBinding(); err != nil {
+		return nil, err
+	}
+	if opts.NetPolicy != nil {
+		cfg.NetPolicy = opts.NetPolicy
+	}
 	allowUnconfined := cfg.AllowUnconfinedSystrap || os.Getenv("GVX_ALLOW_NO_HYPERVISOR") == "1"
 	if cfg.Platform, err = restorePlatform(runtime.GOOS, cfg.Platform, manifest.Platform, allowUnconfined); err != nil {
 		return nil, err
@@ -329,7 +336,6 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	cleanup := func(cause error) (*Sandbox, error) {
 		return nil, errors.Join(cause, closeBundleReadFiles(), sb.Close())
 	}
-
 	openReadOnly := func(name string) (*os.File, error) {
 		p := filepath.Join(opts.Dir, name)
 		f, oErr := openBundleFile(opts.Dir, name, os.O_RDONLY, 0)
@@ -339,6 +345,12 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		return f, nil
 	}
 	if stateFile, err = openReadOnly(checkpointStateFileName); err != nil {
+		return cleanup(err)
+	}
+	if _, err := manifest.statePayloadOffset(stateFile); err != nil {
+		return cleanup(err)
+	}
+	if err := sb.openNetPolicy(manifest.NetPolicy, opts.Dir); err != nil {
 		return cleanup(err)
 	}
 	if pagesMetaFile, err = openReadOnly(checkpointPagesMetaFileName); err != nil {
@@ -404,6 +416,17 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		installHostLockdownBridges()
 		if tb, ok := sb.plat.(interface{ SetThreadInit(func() error) }); ok {
 			tb.SetThreadInit(hostlockdown.BindThread)
+		}
+	}
+
+	// Recheck the retained file before decoding any saved state.
+	stateOffset, err := manifest.statePayloadOffset(stateFile)
+	if err != nil {
+		return cleanup(err)
+	}
+	if stateOffset != 0 {
+		if _, err := stateFile.Seek(stateOffset, io.SeekStart); err != nil {
+			return cleanup(fmt.Errorf("gvx: seek checkpoint payload: %w", err))
 		}
 	}
 

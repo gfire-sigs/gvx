@@ -347,6 +347,12 @@ var boundaryRules = []importRule{
 		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{
+		pkg:       "internal/darwinacl",
+		tier:      Tier1Additive,
+		allowed:   []string{"golang.org/x/sys/unix"},
+		forbidden: []string{"pkg/*", "cmd/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
+	},
+	{
 		pkg:       "internal/xsys",
 		tier:      Tier1Additive,
 		subtree:   true,
@@ -902,6 +908,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "runsc/boot/filter/config", "Linux lockdown installs the seccomp allowlist from runsc"},
 	{[]string{"pkg/gvx"}, "pkg/seccomp", "Linux lockdown compiles seccomp rules with upstream rule types"},
 	{[]string{"pkg/gvx"}, "golang.org/x/sys/*", "Linux lockdown names syscalls and TTY bridges read terminal state"},
+	{[]string{"pkg/gvx", "cmd/rungv"}, "internal/darwinacl", "policy stores and credentials reject unsafe Darwin ACL grants"},
 
 	// pkg/oci: EROFS writer and compression codecs.
 	{[]string{"pkg/oci"}, "pkg/erofs", "OCI layer compiler writes images with the upstream erofs ABI"},
@@ -910,6 +917,8 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/oci"}, "github.com/cespare/xxhash/*", "layer cache computes xxhash digests for content addressing"},
 	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "Windows and Darwin layer caches open files with POSIX rename semantics"},
 	{[]string{"cmd/rungv"}, "pkg/gvx/tuning", "CLI tune flags read and print the leaf tunable registry"},
+	{[]string{"cmd/rungv"}, "golang.org/x/sys/unix", "Unix control sockets verify peer credentials"},
+	{[]string{"cmd/rungv"}, "golang.org/x/sys/windows", "Windows control tokens require private DACLs"},
 	{[]string{"pkg/netbackend"}, "pkg/gvx/tuning", "leaf tunable registry supplies NAT, DNS, and forwarder defaults"},
 
 	// pkg/tcpip/link/vxlan: the bound on transmit nesting.

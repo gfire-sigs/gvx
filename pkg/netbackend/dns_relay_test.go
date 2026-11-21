@@ -833,7 +833,7 @@ func TestNATForwarderServeUDPDNSClosesConnOnIdleTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		nf.serveUDPDNS(nf.ctx, tracked)
+		nf.serveUDPDNS(nf.ctx, tracked, nil)
 	}()
 
 	req := buildDNSQuery(0x3131, "idle.example.test", dnsTypeA)

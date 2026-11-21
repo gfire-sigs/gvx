@@ -160,6 +160,9 @@ type Config struct {
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
 
+	// NetPolicy selects the host-owned policy store for a NAT sandbox.
+	NetPolicy *NetPolicyOptions
+
 	// HostDNSServers lists the DNS servers of the host, each a bare IP or
 	// "ip:port". A bare IP uses port 53. When set, they replace the discovery
 	// of the host resolver configuration for two users: the DNS relay of the
@@ -444,6 +447,9 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	case NetModeNAT, NetModeWireGuard, NetModeNone:
 	default:
 		return fmt.Errorf("%w: unsupported network mode %q", ErrInvalidConfig, c.NetworkMode)
+	}
+	if err := c.validateNetPolicyConfig(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	for _, pf := range c.PortForwards {
 		if pf.HostSocket != "" && pf.Protocol != "" && pf.Protocol != "tcp" {

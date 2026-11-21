@@ -164,6 +164,7 @@ type sandboxFlagValues struct {
 	portSpecs              multiStringFlag
 	checkpointDir          string
 	controlSocket          string
+	netPolicy              netPolicyStartupFlags
 }
 
 // registerAlias binds a registration callback to each flag name in names.
@@ -199,6 +200,7 @@ func (f *sandboxFlagValues) registerPlatformAndNetFlags(fs *flag.FlagSet, defs f
 	fs.StringVar(&f.wgConf, "wg-conf", "", "Path to WireGuard INI configuration file")
 	fs.StringVar(&f.wgConfigAlias, "wg-config", "", "Alias for -wg-conf")
 	f.hostDNS = addHostDNSFlag(fs)
+	f.netPolicy.register(fs)
 	fs.BoolVar(&f.publishAll, "P", false, "Publish every port that the image exposes to a free port of 127.0.0.1")
 	fs.BoolVar(&f.autoPublish, "auto-publish", false, "Automatically publish guest TCP listeners and iptables NAT DNAT ports on host 127.0.0.1")
 	registerAlias([]string{"p", "publish"}, func(n string) {
@@ -416,6 +418,10 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 	if err != nil {
 		return gvx.Config{}, false, err
 	}
+	netPolicy, err := f.netPolicy.options(fs, netMode, f.controlSocket)
+	if err != nil {
+		return gvx.Config{}, false, err
+	}
 	priv := resolvePrivileges(fs, f.privileged, f.netRaw, f.packetWrite, f.allowSUID)
 	rootVolume := strings.TrimSpace(f.rootVolume)
 	if flagVisited(fs, "rootfs-volume") && rootVolume == "" {
@@ -469,6 +475,7 @@ func (f *sandboxFlagValues) buildBaseConfig(fs *flag.FlagSet, stdin io.Reader, s
 		TTY:                    f.tty || f.it,
 		DisableHostLockdown:    !f.lockdown,
 		CheckpointDir:          strings.TrimSpace(f.checkpointDir),
+		NetPolicy:              netPolicy,
 	}
 	return cfg, backend == gvx.PlatformAuto, nil
 }

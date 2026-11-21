@@ -63,10 +63,11 @@ _rungv_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local top_cmds="run pull images rmi inspect tag save load login logout image volume system info checkpoint restore version license completion help"
+    local top_cmds="run pull images rmi inspect tag save load login logout image volume system info checkpoint restore net-policy version license completion help"
     local image_cmds="ls list pull rm remove rmi inspect tag save load prune"
     local volume_cmds="create ls list inspect compact rm remove prune"
     local system_cmds="info df prune"
+    local policy_flags="--net-policy-state --net-policy-live --nat-iptables-file --nat-ip6tables-file --qos-tx --qos-rx"
     local shells="bash zsh fish powershell"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -93,6 +94,22 @@ _rungv_completions() {
                 return 0
             fi
             ;;
+        net-policy)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "get replace" -- "${cur}") )
+            elif [[ "${cur}" == -* ]]; then
+                local flags="-control-socket"
+                if [[ "${COMP_WORDS[2]}" == replace ]]; then
+                    flags+=" --expected-revision --file --file6 --qos-tx --qos-rx"
+                fi
+                COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
+            fi
+            ;;
+        restore)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "-checkpoint-dir -control-socket ${policy_flags}" -- "${cur}") )
+            fi
+            ;;
         completion)
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "${shells}" -- "${cur}") )
@@ -115,7 +132,7 @@ _rungv_completions() {
                     ;;
             esac
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish -e --env-file -u --user -m --memory --cpus --net --backend --platform --pull --entrypoint --rm -cache-dir --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-i -t -w --workdir -workspace -v --volume --mount --rootfs-volume -p -P --auto-publish -e --env-file -u --user -m --memory --cpus --net --backend --platform --pull --entrypoint --rm -cache-dir -control-socket ${policy_flags} --help" -- "${cur}") )
                 return 0
             fi
             ;;
@@ -128,6 +145,16 @@ const zshCompletionScript = `#compdef rungv
 
 _rungv() {
     local -a top_cmds image_cmds volume_cmds system_cmds shells
+    local -a policy_flags
+    policy_flags=(
+        '-control-socket[Host control endpoint]:address:_files'
+        '--net-policy-state[Host NAT policy store]:file:_files'
+        '--net-policy-live[Enable live NAT policy control]'
+        '--nat-iptables-file[IPv4 filter rules]:file:_files'
+        '--nat-ip6tables-file[IPv6 filter rules]:file:_files'
+        '--qos-tx[Guest transmit limit]:limit:'
+        '--qos-rx[Guest receive limit]:limit:'
+    )
     top_cmds=(
         'run:Create and run a sandboxed Linux guest'
         'pull:Download an OCI image into the EROFS layer cache'
@@ -145,6 +172,7 @@ _rungv() {
         'info:Display host environment and backend information'
         'checkpoint:Checkpoint a running sandbox'
         'restore:Restore a sandbox from a checkpoint directory'
+        'net-policy:Read or replace the host NAT policy'
         'version:Print rungv version metadata'
         'license:Print third-party license notices'
         'completion:Print shell completion scripts'
@@ -170,11 +198,27 @@ _rungv() {
         system)
             (( CURRENT == 3 )) && compadd -a system_cmds
             ;;
+        net-policy)
+            if (( CURRENT == 3 )); then
+                compadd get replace
+            elif [[ "${words[3]}" == replace ]]; then
+                _arguments '-control-socket[Host control endpoint]:address:_files' \
+                    '--expected-revision[Current revision]:revision:' \
+                    '--file[IPv4 filter rules]:file:_files' '--file6[IPv6 filter rules]:file:_files' \
+                    '--qos-tx[Guest transmit limit]:limit:' '--qos-rx[Guest receive limit]:limit:'
+            else
+                _arguments '-control-socket[Host control endpoint]:address:_files'
+            fi
+            ;;
+        restore)
+            _arguments '-checkpoint-dir[Host checkpoint directory]:dir:_files -/' "${policy_flags[@]}"
+            ;;
         completion)
             (( CURRENT == 3 )) && compadd -a shells
             ;;
         run)
             _arguments \
+                "${policy_flags[@]}" \
                 '-i[Keep stdin open]' \
                 '-t[Allocate a pseudo-TTY]' \
                 '-w[Working directory inside guest]:dir:' \
@@ -205,7 +249,7 @@ compdef _rungv rungv
 const fishCompletionScript = `# fish completion for rungv
 complete -c rungv -f
 
-set -l __rungv_top_cmds run pull images rmi inspect tag save load login logout image volume system info checkpoint restore version license completion help
+set -l __rungv_top_cmds run pull images rmi inspect tag save load login logout image volume system info checkpoint restore net-policy version license completion help
 
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a run -d "Run a command in a new sandbox"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a pull -d "Download an OCI image"
@@ -223,6 +267,7 @@ complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a syst
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a info -d "Display host environment information"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a checkpoint -d "Checkpoint a running sandbox"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a restore -d "Restore a checkpointed sandbox"
+complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a net-policy -d "Read or replace the host NAT policy"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a version -d "Print version information"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a license -d "Print license notices"
 complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a completion -d "Generate shell completion script"
@@ -230,6 +275,7 @@ complete -c rungv -n "not __fish_seen_subcommand_from $__rungv_top_cmds" -a comp
 complete -c rungv -n "__fish_seen_subcommand_from image; and not __fish_seen_subcommand_from ls list pull rm remove rmi inspect tag save load prune" -a "ls pull rm inspect tag save load prune"
 complete -c rungv -n "__fish_seen_subcommand_from volume; and not __fish_seen_subcommand_from create ls list inspect compact rm remove prune" -a "create ls inspect compact rm prune"
 complete -c rungv -n "__fish_seen_subcommand_from system; and not __fish_seen_subcommand_from info df prune" -a "info df prune"
+complete -c rungv -n "__fish_seen_subcommand_from net-policy; and not __fish_seen_subcommand_from get replace" -a "get replace"
 complete -c rungv -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
 `
 
@@ -238,7 +284,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
     $tokens = $commandAst.CommandElements | ForEach-Object { $_.Extent.Text }
-    $topCmds = @('run','pull','images','rmi','inspect','tag','save','load','login','logout','image','volume','system','info','checkpoint','restore','version','license','completion','help')
+    $topCmds = @('run','pull','images','rmi','inspect','tag','save','load','login','logout','image','volume','system','info','checkpoint','restore','net-policy','version','license','completion','help')
 
     if ($tokens.Count -le 1 -or ($tokens.Count -eq 2 -and $wordToComplete -ne '')) {
         $topCmds | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -252,6 +298,7 @@ Register-ArgumentCompleter -Native -CommandName rungv -ScriptBlock {
         'image'      { @('ls','list','pull','rm','remove','rmi','inspect','tag','save','load','prune') }
         'volume'     { @('create','ls','list','inspect','compact','rm','remove','prune') }
         'system'     { @('info','df','prune') }
+        'net-policy' { @('get','replace') }
         'completion' { @('bash','zsh','fish','powershell') }
         default      { @() }
     }
