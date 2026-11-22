@@ -437,14 +437,14 @@ The first `virgl` gate run exposed two `vrend` defects on Apple OpenGL 4.1 core.
 
 The `venus` pass of gate G2 takes 22.19 s for both browsers. The screenshots of the `venus` and `virgl` passes differ from the SwiftShader pass only in one pixel row on a texel boundary of the checker texture. The fragment-bound page meets the Phase 0 minimum of 3 times in both modes. No run has measured the draw-call-bound page.
 
-| WebGL conformance subset (2026-11-22) | SwiftShader (`-gpu=off`) | `venus` | `virgl` |
+| WebGL conformance subset (2026-11-23) | SwiftShader (`-gpu=off`) | `venus` | `virgl` |
 | :--- | ---: | ---: | ---: |
-| Pages that pass, of 1009 | 1003 | 996 | 1003 |
-| Pages that fail, crash, or time out | 6 | 13 | 6 |
-| Wall time | 46 min | 34 min | 24 min |
+| Pages that pass, of 1009 | 1003 | 1004 | 1004 |
+| Pages that fail, crash, or time out | 6 | 5 | 5 |
+| Wall time | 42 min | 35 min | 35 min |
 | Renderer losses, refused ioctls, KD-1 counts | 0 | 0 | 0 |
 
-The gate runs the KhronosGroup/WebGL tests of commit `714857a2`, which Chromium 159 pins. A page that passes on SwiftShader and does not pass on a GPU mode is a regression. Each of the 13 regressions has a line with a reason in `e2e/testdata/gpu/webgl-cts-expectations.txt`, so the gate passes. The first run found two renderer crashes and twelve guest context losses. The pinned patches `0003` to `0013` and a flush in the CGL callbacks fix them. The remaining `venus` regressions are KosmicKrisp 26.3.0 defects. The remaining `virgl` regressions are an Apple OpenGL 4.1 limit and three known guest stack defects.
+The gate runs the KhronosGroup/WebGL tests of commit `714857a2`, which Chromium 159 pins. A page that passes on SwiftShader and does not pass on a GPU mode is a regression. Each of the 4 regressions has a line with a reason in `e2e/testdata/gpu/webgl-cts-expectations.txt`, so the gate passes. The first run found two renderer crashes and twelve guest context losses. The pinned `virglrenderer` patches `0003` to `0014`, a flush in the CGL callbacks, and the KosmicKrisp patches of `gpurenderer/patches/mesa/` fix them and nine other regressions. The run used a bundle from `--driver-source mesa-source`. The `venus` regression is a format that KosmicKrisp 26.3.0 does not support. The three `virgl` regressions are known guest stack defects of ANGLE GL and Mesa. The other non-pass pages fail on SwiftShader too. The machine had a load average of about 30 from other work during the run, so the wall times are not speed measurements.
 
 The first run of gate G2 used MoltenVK and failed. Section 5.3.1 gives the two causes and the change to KosmicKrisp.
 
@@ -481,7 +481,7 @@ These questions have no answer in this proposal. Each answer changes the scope o
 | Which renderer confinement on Windows keeps Direct3D 11 working? | Phase 2 |
 | Do the users need headed windows, or is headless rendering enough? | Before Phase 3 |
 | Does `venus` run on a macOS host? | Phase 2 (answered): yes, on KosmicKrisp with macOS 26 or later. On MoltenVK 1.4.2, Chromium gets no OpenGL ES 3.0 context. |
-| Does Chromium ANGLE on Vulkan render correct WebGL through `venus` on macOS? | Phase 2 (answered for the probe pages of gate G2): yes. The WebGL conformance subset passes with 13 expected regressions in `venus` and `virgl` together. |
+| Does Chromium ANGLE on Vulkan render correct WebGL through `venus` on macOS? | Phase 2 (answered for the probe pages of gate G2): yes. The WebGL conformance subset passes with 4 expected regressions in `venus` and `virgl` together. |
 | Does Chromium use PRIME or `sync_file` import with `--enable-features=Vulkan`? | Phase 2 (open). The device refuses both today and logs the refusal. |
 | Can the host kernel limit the memory of the renderer process? | Phase 2 (open). The limit is a watchdog inside the renderer today. |
 | Does Metal work on a hosted macOS CI runner, so that the renderer tests can run in CI? | Phase 2 (open). `scripts/gpu/ci-metal-probe.sh` measures it on a runner through `diagnose.yml`. The repository variable `GVX_CI_METAL=1` then turns on the renderer tests of `ci.yml`. |
