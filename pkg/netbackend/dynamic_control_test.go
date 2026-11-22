@@ -241,6 +241,25 @@ func TestDynamicControlAddReplaceLimitAndRemove(t *testing.T) {
 		t.Fatalf("udp #2 after in-place replace = %q, want udpB:ping2", got)
 	}
 
+	// Partial batch failure with replace=true must restore prior TCP and UDP rules
+	// in place without closing pre-existing bound host sockets.
+	if _, err := pf.AddDynamicRules([]PortForwardRule{
+		{Proto: "tcp", HostIP: "127.0.0.1", HostPort: dynTCP.HostPort, GuestPort: 18081},
+		{Proto: "udp", HostIP: "127.0.0.1", HostPort: dynUDP.HostPort, GuestPort: 19091},
+		{Proto: "tcp", HostIP: "127.0.0.1", HostPort: 0, GuestPort: 18081},
+	}, true, nil, nil); !errors.Is(err, ErrDynamicPortLimit) {
+		t.Fatalf("AddDynamicRules partial batch replace err = %v, want ErrDynamicPortLimit", err)
+	}
+	if got := dialAndReadTagTCP(t, dynTCP.HostPort, "still-b"); got != "tcpB:still-b" {
+		t.Fatalf("dynTCP after failed replace batch = %q, want tcpB:still-b", got)
+	}
+	if _, err := udpClient.WriteToUDP([]byte("ping3"), udpTarget); err != nil {
+		t.Fatalf("WriteToUDP(3): %v", err)
+	}
+	if got := recvFrom(t, udpClient); got != "udpB:ping3" {
+		t.Fatalf("dynUDP after failed replace batch = %q, want udpB:ping3", got)
+	}
+
 	// RemoveRule without force refuses to remove static rules; with force it succeeds.
 	if _, err := pf.RemoveRule(PortForwardRule{Proto: "tcp", HostPort: staticPort}, false); !errors.Is(err, ErrStaticRuleRequiresForce) {
 		t.Fatalf("RemoveRule(static, force=false) = %v, want ErrStaticRuleRequiresForce", err)

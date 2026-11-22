@@ -326,16 +326,17 @@ func ParsePortForwardSpec(spec string, allowSinglePort, strictBindIP bool) (Port
 }
 
 type boundTCPForward struct {
+	// PortForwarder.mu guards rule.
 	rule     PortForwardRule
 	listener net.Listener
 }
 
 type boundUDPForward struct {
+	// PortForwarder.mu guards rule, closed, and sessions.
 	rule       PortForwardRule
 	packetConn *net.UDPConn
 
 	// closed is set when this rule is unpublished or PortForwarder closes.
-	// PortForwarder.mu guards closed and sessions.
 	closed   bool
 	sessions map[netip.AddrPort]*udpForwardSession
 }

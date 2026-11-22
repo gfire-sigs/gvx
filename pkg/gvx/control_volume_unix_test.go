@@ -250,7 +250,7 @@ func TestControlVolumeAttachRemountAndLockRelease(t *testing.T) {
 		t.Fatalf("close reopened volume: %v", err)
 	}
 
-	// 4. Re-attach the same volume ReadOnly: verifies persistence, LOCK_SH, and RO->RW refusal.
+	// 4. Re-attach the same volume ReadOnly: verifies persistence, LOCK_SH, and RO-to-RW refusal.
 	roF, err := os.Open(volPath)
 	if err != nil {
 		t.Fatalf("open volume RO: %v", err)

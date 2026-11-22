@@ -470,9 +470,16 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 				var sigEv control.ExecSignalEvent
 				if json.Unmarshal(ev.Data, &sigEv) == nil {
 					if sig, parseErr := parseLinuxSignal(sigEv.Signal); parseErr == nil {
-						if tty != nil && sig != linux.SIGKILL && tty.ktty != nil && tty.ktty.ThreadGroup() != nil {
-							tty.signalForeground(sig)
-						} else {
+						sentForeground := false
+						if tty != nil && sig != linux.SIGKILL && tty.ktty != nil {
+							if cttyTG := tty.ktty.ThreadGroup(); cttyTG != nil {
+								if fg, _ := cttyTG.ForegroundProcessGroup(tty.ktty); fg != nil {
+									tty.signalForeground(sig)
+									sentForeground = true
+								}
+							}
+						}
+						if !sentForeground {
 							_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(sig)})
 						}
 					}

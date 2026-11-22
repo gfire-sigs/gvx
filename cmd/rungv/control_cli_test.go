@@ -835,7 +835,7 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		var bgPID string
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
-			if raw, err := os.ReadFile(bgPidFile); err == nil && strings.TrimSpace(string(raw)) != "" {
+			if raw, err := os.ReadFile(bgPidFile); err == nil && strings.Contains(string(raw), "\n") {
 				bgPID = strings.TrimSpace(string(raw))
 				break
 			}
@@ -883,7 +883,7 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		go func() {
 			evDone <- executeCLI(evCtx, []string{
 				"events", "-S", sockPath,
-				"--filter", "type=debug",
+				"--filter", "type=resource",
 				"--filter", "type=lifecycle",
 				"-f", "json",
 			}, nil, evOut, evErr)
@@ -898,21 +898,21 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 				}
 			}
 		})
-		// Synchronize deterministically on subscription using debug --log-level.
+		// Synchronize deterministically on subscription using per-sandbox resource.update.
 		subscribed := false
 		subDeadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(subDeadline) {
-			if code, _, errS := runCmd(nil, "debug", "-S", sockPath, "--log-level", "warning"); code != 0 {
-				t.Fatalf("debug --log-level warning = (%d, %q)", code, errS)
+			if code, _, errS := runCmd(nil, "update", "-S", sockPath, "--pids-limit", "64"); code != 0 {
+				t.Fatalf("update --pids-limit 64 = (%d, %q)", code, errS)
 			}
-			if strings.Contains(evOut.String(), `"action":"log_level"`) {
+			if strings.Contains(evOut.String(), `"action":"update"`) {
 				subscribed = true
 				break
 			}
 			time.Sleep(25 * time.Millisecond)
 		}
 		if !subscribed {
-			t.Fatalf("events CLI did not receive debug event within 5s (out=%q err=%q)", evOut.String(), evErr.String())
+			t.Fatalf("events CLI did not receive resource event within 5s (out=%q err=%q)", evOut.String(), evErr.String())
 		}
 		if code, _, errS := runCmd(nil, "pause", "-S", sockPath); code != 0 {
 			t.Fatalf("pause for cli events = (%d, %q)", code, errS)
@@ -926,24 +926,36 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		evJoined.Store(true)
 	}
 
-	// cp host -> guest -> host (regular, '-' tar pipe, ./dir/., -L symlink following, and :/ root)
+	// cp roundtrips between host and guest (regular, '-' tar pipe, ./dir/., -L symlink following, and :/ root).
 	srcFile := filepath.Join(t.TempDir(), "in.txt")
 	if err := os.WriteFile(srcFile, []byte("hello-cp-roundtrip\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if code, _, errS := runCmd(nil, "cp", "-S", sockPath, "-z", srcFile, ":/tmp/in.txt"); code != 0 {
-		t.Fatalf("cp host->guest = (%d, %q)", code, errS)
+		t.Fatalf("cp host to guest = (%d, %q)", code, errS)
 	}
 	dstFile := filepath.Join(t.TempDir(), "out.txt")
 	if code, _, errS := runCmd(nil, "cp", "-S", sockPath, "-z", ":/tmp/in.txt", dstFile); code != 0 {
-		t.Fatalf("cp guest->host = (%d, %q)", code, errS)
+		t.Fatalf("cp guest to host = (%d, %q)", code, errS)
 	}
 	gotCP, err := os.ReadFile(dstFile)
 	if err != nil || string(gotCP) != "hello-cp-roundtrip\n" {
 		t.Fatalf("cp roundtrip content = (%q, %v)", gotCP, err)
 	}
 
-	// cp '-' stdin tar pipe -> :/tmp and :/tmp/piped.txt -> '-' stdout tar pipe
+	// cp :/ full root export into a non-existing host dir before creating guest symlinks
+	// so unprivileged Windows hosts do not hit CreateSymbolicLinkW privilege errors.
+	{
+		rootDst := filepath.Join(t.TempDir(), "rootcopy")
+		if code, _, errS := runCmd(nil, "cp", "-S", sockPath, ":/", rootDst); code != 0 {
+			t.Fatalf("cp :/ = (%d, %q)", code, errS)
+		}
+		if got, err := os.ReadFile(filepath.Join(rootDst, "etc", "ready.txt")); err != nil || string(got) != "cli-ready\n" {
+			t.Fatalf("cp :/ etc/ready.txt = (%q, %v), want cli-ready", got, err)
+		}
+	}
+
+	// cp '-' stdin tar pipe into :/tmp and :/tmp/piped.txt into '-' stdout tar pipe.
 	{
 		var inTar bytes.Buffer
 		tw := tar.NewWriter(&inTar)
@@ -969,7 +981,7 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		// cp -L from guest symlink follows link to regular file content on all OSes.
 		followOut := filepath.Join(t.TempDir(), "followed.txt")
 		if code, _, errS := runCmd(nil, "cp", "-S", sockPath, "-L", ":/tmp/glink.txt", followOut); code != 0 {
-			t.Fatalf("cp -L guest->host = (%d, %q)", code, errS)
+			t.Fatalf("cp -L guest to host = (%d, %q)", code, errS)
 		}
 		if got, err := os.ReadFile(followOut); err != nil || string(got) != string(payload) {
 			t.Fatalf("cp -L guest symlink content = (%q, %v), want %q", got, err, payload)
@@ -1008,22 +1020,11 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 				t.Fatal(err)
 			}
 			if code, _, errS := runCmd(nil, "cp", "-S", sockPath, "-L", symSrc, ":/tmp/symdest"); code != 0 {
-				t.Fatalf("cp -L host->guest = (%d, %q)", code, errS)
+				t.Fatalf("cp -L host to guest = (%d, %q)", code, errS)
 			}
 			if code, out, errS := runCmd(nil, "exec", "-S", sockPath, "--", "/bin/cat", "/tmp/symdest/link.txt"); code != 0 || out != "followed-host\n" {
 				t.Fatalf("exec cat /tmp/symdest/link.txt = (%d, %q, %q)", code, out, errS)
 			}
-		}
-	}
-
-	// cp :/ full root export into a non-existing host dir must preserve top-level entries.
-	{
-		rootDst := filepath.Join(t.TempDir(), "rootcopy")
-		if code, _, errS := runCmd(nil, "cp", "-S", sockPath, ":/", rootDst); code != 0 {
-			t.Fatalf("cp :/ = (%d, %q)", code, errS)
-		}
-		if got, err := os.ReadFile(filepath.Join(rootDst, "etc", "ready.txt")); err != nil || string(got) != "cli-ready\n" {
-			t.Fatalf("cp :/ etc/ready.txt = (%q, %v), want cli-ready", got, err)
 		}
 	}
 

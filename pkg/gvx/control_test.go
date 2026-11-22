@@ -40,6 +40,9 @@ func shortControlSocketPath(t *testing.T, filename string) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "gvx-t-")
 	if err != nil {
+		dir, err = os.MkdirTemp("", "gvxc-")
+	}
+	if err != nil {
 		dir = t.TempDir()
 	} else {
 		t.Cleanup(func() { _ = os.RemoveAll(dir) })
@@ -1162,6 +1165,7 @@ func TestMatchesEventFilters(t *testing.T) {
 		{"distinct keys AND reject mismatch", evMount, []string{"type=mount", "action=remove"}, false},
 		{"bare token with whitespace matches type", evLifecycle, []string{" lifecycle ", "mount"}, true},
 		{"missing attribute fails", evLifecycle, []string{"target=/mnt/a"}, false},
+		{"malformed empty key rejected", evLifecycle, []string{"=foo"}, false},
 	}
 	for _, tc := range cases {
 		if got := matchesEventFilters(tc.ev, tc.filters); got != tc.want {
@@ -1251,7 +1255,7 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 		return string(out), exitEv
 	}
 
-	// 1. Exec TTY: TERM=xterm in environ, ONLCR echo, exec.resize, and exec.signal SIGINT -> 130.
+	// 1. Exec TTY: TERM=xterm in environ, ONLCR echo, exec.resize, and exec.signal SIGINT (exit 130).
 	{
 		envOut, exitEv := runExec(control.ExecStartRequest{
 			Argv: []string{"/bin/cat", "/proc/self/environ"},
@@ -1374,7 +1378,7 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 		}
 	}
 
-	// 3. Real live pids.max enforcement (guest SYS_clone -> EAGAIN=11 & exec -> LIMIT_EXCEEDED)
+	// 3. Real live pids.max enforcement (guest SYS_clone returns EAGAIN=11; exec returns LIMIT_EXCEEDED)
 	// plus proc.signal targeting a specific exec PID while PID 1 remains alive.
 	{
 		if _, exitEv := runExec(control.ExecStartRequest{Argv: []string{"/bin/fork"}}); exitEv.ExitCode != 0 {
@@ -1434,18 +1438,17 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 	}
 
 	// 4. sandbox.events multi-type OR filtering + kernel.log follow & clear.
-	{
+	func() {
 		evCtx, evCancel := context.WithCancel(ctx)
+		defer evCancel()
 		evSt, err := rs.client.OpenStream(evCtx, control.MethodEvents, control.EventsRequest{
 			Filters: []string{"type=lifecycle", "type=mount", "type=resource"},
 		})
 		if err != nil {
-			evCancel()
 			t.Fatalf("events open: %v", err)
 		}
+		defer evSt.Close()
 		if err := evSt.WaitResponse(evCtx, nil); err != nil {
-			evCancel()
-			evSt.Close()
 			t.Fatalf("events wait: %v", err)
 		}
 		received := make(chan control.SandboxEvent, 16)
@@ -1465,6 +1468,11 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 					received <- se
 				}
 			}
+		}()
+		defer func() {
+			evCancel()
+			evSt.Close()
+			<-evLoopDone
 		}()
 
 		// Trigger one filtered-out exec event, then 5 matching events.
@@ -1498,9 +1506,6 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 				t.Fatalf("timed out waiting for event[%d] %q", i, want)
 			}
 		}
-		evCancel()
-		evSt.Close()
-		<-evLoopDone
 
 		// kernel.log follow starts cleanly and cancels cleanly; clear empties the ring.
 		fCtx, fCancel := context.WithCancel(ctx)
@@ -1529,7 +1534,7 @@ func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
 		if len(afterClear.Records) != 0 {
 			t.Fatalf("kernel.log after clear returned %d records, want 0", len(afterClear.Records))
 		}
-	}
+	}()
 
 	// 5. Multi-spec port.add partial-failure rollback, replace=true, and --all-dynamic.
 	{

@@ -20,12 +20,62 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func assertOwnerOnlyProtectedDACL(t *testing.T, path, ownerSID string) {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		t.Fatalf("GetNamedSecurityInfo(%q): %v", path, err)
+	}
+	if sd == nil {
+		t.Fatalf("GetNamedSecurityInfo(%q) returned nil security descriptor", path)
+	}
+	ctrl, _, err := sd.Control()
+	if err != nil || ctrl&windows.SE_DACL_PROTECTED == 0 {
+		t.Fatalf("token file DACL is not protected: control=%#x err=%v", ctrl, err)
+	}
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil {
+		t.Fatalf("token file DACL missing: acl=%v err=%v", acl, err)
+	}
+	type aclHeader struct {
+		Revision  byte
+		Reserved  byte
+		Size      uint16
+		Count     uint16
+		Reserved2 uint16
+	}
+	count := (*aclHeader)(unsafe.Pointer(acl)).Count
+	expected := map[string]bool{ownerSID: false}
+	if ownerSID != "S-1-5-18" {
+		expected["S-1-5-18"] = false
+	}
+	if int(count) != len(expected) {
+		t.Fatalf("token file DACL ACE count = %d, want %d (sddl=%q)", count, len(expected), sd.String())
+	}
+	for index := range uint32(count) {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, index, &ace); err != nil {
+			t.Fatalf("GetAce(%d): %v", index, err)
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+		seen, ok := expected[sid]
+		if !ok || seen || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			t.Fatalf("unexpected token file ACE[%d]: SID=%q type=%d (sddl=%q)", index, sid, ace.Header.AceType, sd.String())
+		}
+		expected[sid] = true
+	}
+}
 
 func TestWindowsTokenFileDACLAndSocketDirChecks(t *testing.T) {
 	base := t.TempDir()
@@ -58,27 +108,7 @@ func TestWindowsTokenFileDACLAndSocketDirChecks(t *testing.T) {
 		t.Fatalf("GetTokenUser: %v", err)
 	}
 	ownerSID := user.User.Sid.String()
-
-	sd, err := windows.GetNamedSecurityInfo(
-		tokPath,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION,
-	)
-	if err != nil {
-		t.Fatalf("GetNamedSecurityInfo(%q): %v", tokPath, err)
-	}
-	sddl := sd.String()
-	if !strings.Contains(sddl, "D:P") {
-		t.Fatalf("token file SDDL %q lacks protected DACL (D:P)", sddl)
-	}
-	if !strings.Contains(sddl, ownerSID) && !(ownerSID == "S-1-5-18" && strings.Contains(sddl, ";SY)")) {
-		t.Fatalf("token file SDDL %q does not grant access to owner SID %s", sddl, ownerSID)
-	}
-	for _, forbidden := range []string{";WD)", ";BU)", ";AU)", "S-1-1-0", "S-1-5-32-545", "S-1-5-11"} {
-		if strings.Contains(sddl, forbidden) {
-			t.Fatalf("token file SDDL %q contains forbidden broad ACE %q", sddl, forbidden)
-		}
-	}
+	assertOwnerOnlyProtectedDACL(t, tokPath, ownerSID)
 
 	// Rewriting replaces the stale token cleanly with the same DACL protection.
 	if err := writeTokenFilePlatform(tokPath, "rotated-token"); err != nil {
@@ -88,6 +118,7 @@ func TestWindowsTokenFileDACLAndSocketDirChecks(t *testing.T) {
 	if err != nil || string(raw2) != "rotated-token\n" {
 		t.Fatalf("rewritten token content = (%q, %v), want rotated-token", raw2, err)
 	}
+	assertOwnerOnlyProtectedDACL(t, tokPath, ownerSID)
 }
 
 func TestWindowsHostErrorToLinuxErrnoMappings(t *testing.T) {

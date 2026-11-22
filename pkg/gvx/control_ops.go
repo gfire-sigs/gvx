@@ -483,7 +483,7 @@ func matchesEventFilters(ev control.SandboxEvent, filters []string) bool {
 		}
 		key := strings.ToLower(strings.TrimSpace(k))
 		if key == "" {
-			continue
+			return false
 		}
 		groups[key] = append(groups[key], strings.TrimSpace(v))
 	}

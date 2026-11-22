@@ -44,14 +44,19 @@ func HostErrorToLinuxErrno(err error) int {
 		return 0
 	}
 	switch {
-	case errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ENOENT):
-		return LinuxENOENT
-	case errors.Is(err, os.ErrExist), errors.Is(err, syscall.EEXIST):
-		return LinuxEEXIST
-	case errors.Is(err, os.ErrPermission), errors.Is(err, syscall.EACCES):
-		return LinuxEACCES
+	// Match specific errnos before Go's broad os.Err* sentinels because
+	// syscall.Errno.Is maps EPERM to os.ErrPermission and ERROR_DIR_NOT_EMPTY
+	// to os.ErrExist on Windows.
+	case errors.Is(err, winErrDirNotEmpty):
+		return LinuxENOTEMPTY
 	case errors.Is(err, syscall.EPERM):
 		return LinuxEPERM
+	case errors.Is(err, syscall.EACCES):
+		return LinuxEACCES
+	case errors.Is(err, syscall.ENOENT):
+		return LinuxENOENT
+	case errors.Is(err, syscall.EEXIST):
+		return LinuxEEXIST
 	case errors.Is(err, winErrBusy), errors.Is(err, winErrSharingViol), errors.Is(err, winErrLockViol):
 		return LinuxEBUSY
 	case errors.Is(err, winErrNotSameDevice):
@@ -62,8 +67,6 @@ func HostErrorToLinuxErrno(err error) int {
 		return LinuxEISDIR
 	case errors.Is(err, winErrNameTooLong):
 		return LinuxENAMETOOLONG
-	case errors.Is(err, winErrDirNotEmpty):
-		return LinuxENOTEMPTY
 	case errors.Is(err, winErrCantResolve):
 		return LinuxELOOP
 	case errors.Is(err, winErrInvalidParam), errors.Is(err, syscall.EINVAL):
@@ -74,6 +77,12 @@ func HostErrorToLinuxErrno(err error) int {
 		return LinuxENOSPC
 	case errors.Is(err, winErrNotSupported):
 		return LinuxEOPNOTSUPP
+	case errors.Is(err, os.ErrNotExist):
+		return LinuxENOENT
+	case errors.Is(err, os.ErrExist):
+		return LinuxEEXIST
+	case errors.Is(err, os.ErrPermission):
+		return LinuxEACCES
 	default:
 		return LinuxEIO
 	}
