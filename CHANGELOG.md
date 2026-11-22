@@ -2,6 +2,23 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [v0.20.10002026111600] - 2026-11-22
+
+This release adds the `gvx-ctrl/2` control protocol, runtime sandbox CLI commands, and the `rpcfs` virtual file system (#227). It also expands test coverage for control commands and fixes ten runtime defects (#229).
+
+### Features
+
+- **Multiplexed `gvx-ctrl/2` control protocol (`pkg/gvx/control`, `pkg/gvx`)** (#227): The control endpoint negotiates `gvx-ctrl/2` over Unix sockets or loopback TCP while keeping legacy `v1` compatibility. Framed streams multiplex unary calls, binary I/O channels, structured events, zstd compression, and `SCM_RIGHTS` descriptor passing. Connections enforce bearer tokens, policy profiles (`full`, `readonly`, `checkpoint-only`), method denylists, and protected owner-only token permissions on Unix and Windows.
+- **Docker-style `exec`, inspection, and lifecycle commands (`cmd/rungv`, `pkg/gvx`)** (#227): `rungv exec` starts guest processes with `-i`, `-t`, `-d`, `-u`, `-w`, `-e`, `--privileged=false`, `--pid-file`, resize, and signal forwarding. New commands add `pause`, `unpause`, `status`, `stats`, `top`, `kill`, `stop`, `dmesg`, `events`, `ping`, `debug`, and streaming `checkpoint -o`.
+- **Host-to-guest file transfer and live resource updates (`cmd/rungv`, `pkg/gvx`, `pkg/sentry`)** (#227): `rungv cp` and `rungv export` stream tar archives between host and guest with `-L` symlink following, `-z` compression, and `os.Root` path confinement. `rungv update` applies live memory, CPU bandwidth, `pids.max`, LAN isolation, and mutable host tunables without restarting the sandbox.
+- **Dynamic ports, client tunneling, and runtime mounts (`cmd/rungv`, `pkg/gvx`, `pkg/netbackend`, `pkg/sentry/fsimpl/rpcfs`)** (#227): `rungv port` adds, replaces, lists, and removes dynamic port rules under lockdown when `--dynamic-ports` or `--auto-publish` is active. `rungv port-forward` tunnels client-side TCP traffic into the guest without binding ports inside the locked-down sandbox. `rungv mount` mounts and removes `tmpfs`, `ext4lite` volumes via `SCM_RIGHTS`, and client-served host directories over the new `rpcfs` VFS driver.
+
+### Bug Fixes
+
+- **Privilege dropping, log clearing, and event filtering (`pkg/gvx`)** (#229): `exec --privileged=false` passes zero `TaskCapabilities` to `auth.NewUserCredentials` so UID 0 drops `CapPrm`, `CapEff`, and `CapBnd`. `dmesg` starts initial and follow cursors from `max(FirstSeq, ClearSeq)` so `--clear` hides cleared records. `sandbox.events` applies OR across repeated keys, applies AND across distinct keys, and rejects empty keys.
+- **Atomic port replacement, batch rollback, and restore workers (`pkg/netbackend`, `pkg/gvx`)** (#229): `AddDynamicRule` updates matching dynamic and auto-published bindings in place under `PortForwarder.mu` without closing live sockets. `AddDynamicRules` rolls back failed multi-spec batches in reverse order and restores replaced TCP and UDP rules without dropping sockets. `AttachRestoredStack` starts pre-existing manual TCP and UDP workers when restoring a stopped forwarder.
+- **Exec limits, TTY signals, volume close, and `rpcfs` errnos (`pkg/gvx`, `pkg/gvx/control`)** (#229): `exec.start` maps `EAGAIN` from `CreateProcess` to `LIMIT_EXCEEDED`, and `exec.signal` falls back to direct thread-group signals when no foreground group exists. `mount.add` omits a redundant file close after an `ext4lite.OpenVolume` failure. `HostErrorToLinuxErrno` matches `EPERM` and `ERROR_DIR_NOT_EMPTY` before `os.ErrPermission` and `os.ErrExist` on Windows and Unix.
+
 ## [v0.19.10002026111600] - 2026-11-21
 
 This release serializes virtual processor creation and partition teardown in `pkg/sentry/platform/whpx` to prevent `HYPERVISOR_ERROR` (`0x00020001`) crashes on Windows `arm64` hosts.
