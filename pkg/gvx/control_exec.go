@@ -27,6 +27,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
 	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
@@ -117,7 +118,11 @@ func (s *Sandbox) resolveExecCredentials(
 		return user, rootCreds, nil
 	}
 	var caps *auth.TaskCapabilities
-	if user.UID == 0 && !dropCaps {
+	if dropCaps {
+		// Pass a non-nil zero TaskCapabilities so NewUserCredentials drops all
+		// permitted, effective, and bounding capabilities even for UID 0.
+		caps = &auth.TaskCapabilities{}
+	} else if user.UID == 0 {
 		all := auth.AllCapabilities
 		caps = &auth.TaskCapabilities{
 			PermittedCaps:   all,
@@ -379,6 +384,9 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	if err != nil {
 		execCancel()
 		runCleanup()
+		if linuxerr.Equals(linuxerr.EAGAIN, err) {
+			return control.NewErrorf(control.CodeLimitExceeded, "create exec process %q: %v", execPath, err)
+		}
 		return control.NewErrorf(control.CodeInternal, "create exec process %q: %v", execPath, err)
 	}
 	k.StartProcess(tg)
@@ -462,7 +470,7 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 				var sigEv control.ExecSignalEvent
 				if json.Unmarshal(ev.Data, &sigEv) == nil {
 					if sig, parseErr := parseLinuxSignal(sigEv.Signal); parseErr == nil {
-						if tty != nil {
+						if tty != nil && sig != linux.SIGKILL && tty.ktty != nil && tty.ktty.ThreadGroup() != nil {
 							tty.signalForeground(sig)
 						} else {
 							_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(sig)})

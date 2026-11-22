@@ -81,17 +81,24 @@ func (pf *PortForwarder) AddDynamicRule(
 	pf.dynMu.Lock()
 	defer pf.dynMu.Unlock()
 
-	var evictTCP []*boundTCPForward
-	var evictUDP []*boundUDPForward
-	var evictUDPSessions []*gonetUDPCloserHolder
+	var (
+		evictUDPSessions []*gonetUDPCloserHolder
+	)
 
 	pf.mu.Lock()
 	if pf.closed {
 		pf.mu.Unlock()
 		return PortForwardRule{}, errors.New("netbackend: PortForwarder is closed")
 	}
-	// Check capacity before evicting any active listener.
-	var willEvict int
+	// Check capacity and static conflicts before mutating any active listener.
+	var (
+		matchManualTCP *boundTCPForward
+		matchDynTCPKey dynPortKey
+		matchDynTCP    *boundTCPForward
+		matchManualUDP *boundUDPForward
+		matchDynUDPKey dynPortKey
+		matchDynUDP    *boundUDPForward
+	)
 	if norm.HostPort != 0 || norm.HostSocket != "" {
 		for _, b := range pf.tcpList {
 			if portBindingsMatch(b.rule, norm) {
@@ -112,12 +119,15 @@ func (pf *PortForwarder) AddDynamicRule(
 						pf.mu.Unlock()
 						return PortForwardRule{}, fmt.Errorf("%w: dynamic rule already bound", ErrPortRuleExists)
 					}
-					willEvict++
+					matchManualTCP = b
+					break
 				}
 			}
-			for _, b := range pf.dynTCP {
+			for k, b := range pf.dynTCP {
 				if portBindingsMatch(b.rule, norm) {
-					willEvict++
+					matchDynTCPKey = k
+					matchDynTCP = b
+					break
 				}
 			}
 		} else {
@@ -127,75 +137,71 @@ func (pf *PortForwarder) AddDynamicRule(
 						pf.mu.Unlock()
 						return PortForwardRule{}, fmt.Errorf("%w: dynamic rule already bound", ErrPortRuleExists)
 					}
-					willEvict++
-				}
-			}
-			for _, b := range pf.dynUDP {
-				if portBindingsMatch(b.rule, norm) {
-					willEvict++
-				}
-			}
-		}
-	}
-	activeDynamic := len(pf.manualTCP) + len(pf.manualUDP) + len(pf.dynTCP) + len(pf.dynUDP)
-	if pf.maxDynamicPorts > 0 && activeDynamic-willEvict >= pf.maxDynamicPorts {
-		pf.mu.Unlock()
-		return PortForwardRule{}, fmt.Errorf("%w (%d active)", ErrDynamicPortLimit, pf.maxDynamicPorts)
-	}
-	if norm.HostPort != 0 || norm.HostSocket != "" {
-		// Evict replaced dynamic/auto rules now that validation and capacity succeeded.
-		if proto == "tcp" {
-			for i := 0; i < len(pf.manualTCP); i++ {
-				if portBindingsMatch(pf.manualTCP[i].rule, norm) {
-					evictTCP = append(evictTCP, pf.manualTCP[i])
-					pf.manualTCP = append(pf.manualTCP[:i], pf.manualTCP[i+1:]...)
-					i--
-				}
-			}
-			for k, b := range pf.dynTCP {
-				if portBindingsMatch(b.rule, norm) {
-					delete(pf.dynTCP, k)
-					evictTCP = append(evictTCP, b)
-				}
-			}
-		} else {
-			for i := 0; i < len(pf.manualUDP); i++ {
-				if portBindingsMatch(pf.manualUDP[i].rule, norm) {
-					b := pf.manualUDP[i]
-					b.closed = true
-					for c, s := range b.sessions {
-						evictUDPSessions = append(evictUDPSessions, &gonetUDPCloserHolder{c: s.guest})
-						delete(b.sessions, c)
-					}
-					evictUDP = append(evictUDP, b)
-					pf.manualUDP = append(pf.manualUDP[:i], pf.manualUDP[i+1:]...)
-					i--
+					matchManualUDP = b
+					break
 				}
 			}
 			for k, b := range pf.dynUDP {
 				if portBindingsMatch(b.rule, norm) {
-					b.closed = true
-					for c, s := range b.sessions {
-						evictUDPSessions = append(evictUDPSessions, &gonetUDPCloserHolder{c: s.guest})
-						delete(b.sessions, c)
-					}
-					delete(pf.dynUDP, k)
-					evictUDP = append(evictUDP, b)
+					matchDynUDPKey = k
+					matchDynUDP = b
+					break
 				}
 			}
 		}
 	}
-	pf.mu.Unlock()
 
-	for _, b := range evictTCP {
-		_ = b.listener.Close()
+	// Atomically update an existing dynamic or auto-published binding in place
+	// so replacing a rule never drops the bound host socket on rebind failure.
+	if matchManualTCP != nil {
+		matchManualTCP.rule = norm
+		updated := matchManualTCP.rule
+		pf.mu.Unlock()
+		return updated, nil
 	}
-	for _, b := range evictUDP {
-		_ = b.packetConn.Close()
+	if matchDynTCP != nil {
+		delete(pf.dynTCP, matchDynTCPKey)
+		matchDynTCP.rule = norm
+		pf.manualTCP = append(pf.manualTCP, matchDynTCP)
+		updated := matchDynTCP.rule
+		pf.mu.Unlock()
+		return updated, nil
 	}
-	for _, h := range evictUDPSessions {
-		_ = h.c.Close()
+	if matchManualUDP != nil {
+		matchManualUDP.rule = norm
+		for c, s := range matchManualUDP.sessions {
+			evictUDPSessions = append(evictUDPSessions, &gonetUDPCloserHolder{c: s.guest})
+			delete(matchManualUDP.sessions, c)
+		}
+		updated := matchManualUDP.rule
+		pf.mu.Unlock()
+		for _, h := range evictUDPSessions {
+			_ = h.c.Close()
+		}
+		return updated, nil
 	}
+	if matchDynUDP != nil {
+		delete(pf.dynUDP, matchDynUDPKey)
+		matchDynUDP.rule = norm
+		for c, s := range matchDynUDP.sessions {
+			evictUDPSessions = append(evictUDPSessions, &gonetUDPCloserHolder{c: s.guest})
+			delete(matchDynUDP.sessions, c)
+		}
+		pf.manualUDP = append(pf.manualUDP, matchDynUDP)
+		updated := matchDynUDP.rule
+		pf.mu.Unlock()
+		for _, h := range evictUDPSessions {
+			_ = h.c.Close()
+		}
+		return updated, nil
+	}
+
+	activeDynamic := len(pf.manualTCP) + len(pf.manualUDP) + len(pf.dynTCP) + len(pf.dynUDP)
+	if pf.maxDynamicPorts > 0 && activeDynamic >= pf.maxDynamicPorts {
+		pf.mu.Unlock()
+		return PortForwardRule{}, fmt.Errorf("%w (%d active)", ErrDynamicPortLimit, pf.maxDynamicPorts)
+	}
+	pf.mu.Unlock()
 
 	if norm.HostSocket != "" {
 		if proto != "tcp" {

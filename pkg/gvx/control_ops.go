@@ -397,13 +397,16 @@ func (s *Sandbox) handleKernelLog(ctx context.Context, stream *control.Stream, r
 		return err
 	}
 	kl := k.KernelLog()
-	first := kl.FirstSeq()
+	first := max(kl.FirstSeq(), kl.ClearSeq())
 	next := kl.NextSeq()
 	var records []control.KernelLogRecord
 	for seq := first; seq < next; seq++ {
 		rec, ok := kl.Lookup(seq)
-		if !ok {
-			continue
+		if !ok || rec.Seq >= next {
+			break
+		}
+		if rec.Seq > seq {
+			seq = rec.Seq
 		}
 		if req.MaxLevel > 0 && int(rec.Level) > req.MaxLevel-1 {
 			continue
@@ -432,15 +435,16 @@ func (s *Sandbox) handleKernelLog(ctx context.Context, stream *control.Stream, r
 
 	for {
 		curNext := kl.NextSeq()
-		if curFirst := kl.FirstSeq(); cursor < curFirst {
+		if curFirst := max(kl.FirstSeq(), kl.ClearSeq()); cursor < curFirst {
 			cursor = curFirst
 		}
 		for cursor < curNext {
 			rec, ok := kl.Lookup(cursor)
-			cursor++
-			if !ok {
-				continue
+			if !ok || rec.Seq >= curNext {
+				cursor = curNext
+				break
 			}
+			cursor = rec.Seq + 1
 			if req.MaxLevel > 0 && int(rec.Level) > req.MaxLevel-1 {
 				continue
 			}
@@ -464,27 +468,38 @@ func matchesEventFilters(ev control.SandboxEvent, filters []string) bool {
 	if len(filters) == 0 {
 		return true
 	}
+	// Group filters by key: values for the same key are OR'd, and distinct keys
+	// are AND'd, matching Docker event filter semantics.
+	groups := make(map[string][]string, len(filters))
 	for _, raw := range filters {
-		k, v, ok := strings.Cut(strings.TrimSpace(raw), "=")
-		if !ok {
-			if ev.Type != raw {
-				return false
-			}
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
 			continue
 		}
-		switch strings.ToLower(k) {
+		k, v, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			groups["type"] = append(groups["type"], trimmed)
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(k))
+		if key == "" {
+			continue
+		}
+		groups[key] = append(groups[key], strings.TrimSpace(v))
+	}
+	for key, vals := range groups {
+		var actual string
+		var exists bool
+		switch key {
 		case "type":
-			if ev.Type != v {
-				return false
-			}
+			actual, exists = ev.Type, true
 		case "action":
-			if ev.Action != v {
-				return false
-			}
+			actual, exists = ev.Action, true
 		default:
-			if ev.Attributes[k] != v {
-				return false
-			}
+			actual, exists = ev.Attributes[key]
+		}
+		if !exists || !slices.Contains(vals, actual) {
+			return false
 		}
 	}
 	return true

@@ -787,18 +787,146 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 		t.Fatalf("unpause = (%d, %q)", code, errS)
 	}
 
-	// exec (stdout, closed stdin, -i piped stdin, exit code)
+	// exec (stdout, closed stdin, -i piped stdin, -t -i PTY, --pid-file, exit code)
 	if code, out, errS := runCmd(nil, "exec", "-S", sockPath, "--", "/bin/hello"); code != 0 || out != "cli-exec-ok\n" {
 		t.Fatalf("exec hello = (%d, %q, %q)", code, out, errS)
 	}
 	if code, out, errS := runCmd(strings.NewReader("from-host\n"), "exec", "-S", sockPath, "-i", "--", "/bin/cat", "/proc/self/fd/0"); code != 0 || out != "from-host\n" {
 		t.Fatalf("exec -i = (%d, %q, %q)", code, out, errS)
 	}
+	if code, out, errS := runCmd(strings.NewReader("tty-line\r"), "exec", "-S", sockPath, "-t", "-i", "--", "/bin/cat", "/proc/self/fd/0"); code != 0 || !strings.Contains(out, "tty-line\r\n") {
+		t.Fatalf("exec -t -i = (%d, %q, %q)", code, out, errS)
+	}
+	pidFile := filepath.Join(t.TempDir(), "exec.pid")
+	if code, out, errS := runCmd(nil, "exec", "-S", sockPath, "--pid-file", pidFile, "--", "/bin/hello"); code != 0 || out != "cli-exec-ok\n" {
+		t.Fatalf("exec --pid-file = (%d, %q, %q)", code, out, errS)
+	}
+	if pidBytes, err := os.ReadFile(pidFile); err != nil {
+		t.Fatalf("read --pid-file: %v", err)
+	} else if pidVal, err := strconv.Atoi(strings.TrimSpace(string(pidBytes))); err != nil || pidVal <= 1 {
+		t.Fatalf("--pid-file content = %q (err=%v), want guest PID > 1", pidBytes, err)
+	}
 	if code, _, errS := runCmd(nil, "exec", "-S", sockPath, "--", "/bin/exit7"); code != 7 {
 		t.Fatalf("exec exit7 = (%d, %q), want 7", code, errS)
 	}
 
-	// cp host -> guest -> host
+	// Blocking exec -i with --pid-file + kill --pid <PID> leaves PID 1 alive.
+	{
+		bgInR, bgInW := io.Pipe()
+		bgPidFile := filepath.Join(t.TempDir(), "bg.pid")
+		bgDone := make(chan int, 1)
+		var bgOut, bgErr bytes.Buffer
+		go func() {
+			bgDone <- executeCLI(context.Background(), []string{
+				"exec", "-S", sockPath, "-i", "--pid-file", bgPidFile, "--", "/bin/cat", "/proc/self/fd/0",
+			}, bgInR, &bgOut, &bgErr)
+		}()
+		var bgJoined atomic.Bool
+		t.Cleanup(func() {
+			_ = bgInW.Close()
+			_ = bgInR.Close()
+			if !bgJoined.Load() {
+				select {
+				case <-bgDone:
+				case <-time.After(5 * time.Second):
+				}
+			}
+		})
+		var bgPID string
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if raw, err := os.ReadFile(bgPidFile); err == nil && strings.TrimSpace(string(raw)) != "" {
+				bgPID = strings.TrimSpace(string(raw))
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		if bgPID == "" {
+			t.Fatal("blocking exec -i did not write --pid-file within 5s")
+		}
+		if kCode, _, kErr := runCmd(nil, "kill", "-S", sockPath, "--pid", bgPID, "-s", "SIGTERM"); kCode != 0 {
+			t.Fatalf("kill --pid %s = (%d, %q)", bgPID, kCode, kErr)
+		}
+		select {
+		case exitC := <-bgDone:
+			bgJoined.Store(true)
+			if exitC != 143 {
+				t.Fatalf("killed exec -i exit code = %d (stderr=%q), want 143", exitC, bgErr.String())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("blocking exec -i (pid %s) did not exit after kill --pid SIGTERM", bgPID)
+		}
+		_ = bgInW.Close()
+		_ = bgInR.Close()
+		if pCode, pOut, pErr := runCmd(nil, "ping", "-S", sockPath); pCode != 0 || !strings.Contains(pOut, "state=running") {
+			t.Fatalf("ping after kill --pid = (%d, %q, %q)", pCode, pOut, pErr)
+		}
+	}
+
+	// dmesg --tail & --clear
+	if code, _, errS := runCmd(nil, "dmesg", "-S", sockPath, "--tail", "5"); code != 0 {
+		t.Fatalf("dmesg --tail 5 = (%d, %q)", code, errS)
+	}
+	if code, _, errS := runCmd(nil, "dmesg", "-S", sockPath, "--clear"); code != 0 {
+		t.Fatalf("dmesg --clear = (%d, %q)", code, errS)
+	}
+	if code, out, errS := runCmd(nil, "dmesg", "-S", sockPath); code != 0 || strings.TrimSpace(out) != "" {
+		t.Fatalf("dmesg after clear = (%d, %q, %q), want empty", code, out, errS)
+	}
+
+	// events --filter with multiple same-key types (OR semantics) in JSON format.
+	{
+		evCtx, evCancel := context.WithCancel(context.Background())
+		evOut := newSyncNotifyBuffer()
+		evErr := newSyncNotifyBuffer()
+		evDone := make(chan int, 1)
+		go func() {
+			evDone <- executeCLI(evCtx, []string{
+				"events", "-S", sockPath,
+				"--filter", "type=debug",
+				"--filter", "type=lifecycle",
+				"-f", "json",
+			}, nil, evOut, evErr)
+		}()
+		var evJoined atomic.Bool
+		t.Cleanup(func() {
+			evCancel()
+			if !evJoined.Load() {
+				select {
+				case <-evDone:
+				case <-time.After(3 * time.Second):
+				}
+			}
+		})
+		// Synchronize deterministically on subscription using debug --log-level.
+		subscribed := false
+		subDeadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(subDeadline) {
+			if code, _, errS := runCmd(nil, "debug", "-S", sockPath, "--log-level", "warning"); code != 0 {
+				t.Fatalf("debug --log-level warning = (%d, %q)", code, errS)
+			}
+			if strings.Contains(evOut.String(), `"action":"log_level"`) {
+				subscribed = true
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if !subscribed {
+			t.Fatalf("events CLI did not receive debug event within 5s (out=%q err=%q)", evOut.String(), evErr.String())
+		}
+		if code, _, errS := runCmd(nil, "pause", "-S", sockPath); code != 0 {
+			t.Fatalf("pause for cli events = (%d, %q)", code, errS)
+		}
+		if code, _, errS := runCmd(nil, "unpause", "-S", sockPath); code != 0 {
+			t.Fatalf("unpause for cli events = (%d, %q)", code, errS)
+		}
+		evOut.waitForSubstring(t, `"action":"unpause"`, 5*time.Second)
+		evCancel()
+		<-evDone
+		evJoined.Store(true)
+	}
+
+	// cp host -> guest -> host (regular, '-' tar pipe, ./dir/., -L symlink following, and :/ root)
 	srcFile := filepath.Join(t.TempDir(), "in.txt")
 	if err := os.WriteFile(srcFile, []byte("hello-cp-roundtrip\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -813,6 +941,133 @@ func TestCLIControlSubcommandsEndToEnd(t *testing.T) {
 	gotCP, err := os.ReadFile(dstFile)
 	if err != nil || string(gotCP) != "hello-cp-roundtrip\n" {
 		t.Fatalf("cp roundtrip content = (%q, %v)", gotCP, err)
+	}
+
+	// cp '-' stdin tar pipe -> :/tmp and :/tmp/piped.txt -> '-' stdout tar pipe
+	{
+		var inTar bytes.Buffer
+		tw := tar.NewWriter(&inTar)
+		payload := []byte("piped-tar-body\n")
+		_ = tw.WriteHeader(&tar.Header{Name: "piped.txt", Mode: 0o644, Size: int64(len(payload))})
+		_, _ = tw.Write(payload)
+		_ = tw.WriteHeader(&tar.Header{Name: "glink.txt", Typeflag: tar.TypeSymlink, Linkname: "piped.txt"})
+		_ = tw.Close()
+		if code, _, errS := runCmd(&inTar, "cp", "-S", sockPath, "-", ":/tmp"); code != 0 {
+			t.Fatalf("cp stdin pipe = (%d, %q)", code, errS)
+		}
+		var outTar bytes.Buffer
+		var errB bytes.Buffer
+		if code := executeCLI(context.Background(), []string{"cp", "-S", sockPath, ":/tmp/piped.txt", "-"}, nil, &outTar, &errB); code != 0 {
+			t.Fatalf("cp stdout pipe = (%d, %q)", code, errB.String())
+		}
+		tr := tar.NewReader(&outTar)
+		hdr, err := tr.Next()
+		body, rErr := io.ReadAll(tr)
+		if err != nil || rErr != nil || hdr.Name != "piped.txt" || string(body) != string(payload) {
+			t.Fatalf("cp stdout tar = (%+v, %q, %v, %v)", hdr, body, err, rErr)
+		}
+		// cp -L from guest symlink follows link to regular file content on all OSes.
+		followOut := filepath.Join(t.TempDir(), "followed.txt")
+		if code, _, errS := runCmd(nil, "cp", "-S", sockPath, "-L", ":/tmp/glink.txt", followOut); code != 0 {
+			t.Fatalf("cp -L guest->host = (%d, %q)", code, errS)
+		}
+		if got, err := os.ReadFile(followOut); err != nil || string(got) != string(payload) {
+			t.Fatalf("cp -L guest symlink content = (%q, %v), want %q", got, err, payload)
+		}
+	}
+
+	// cp ./dir/. contents-only into non-existing guest dir, plus host -L symlink + cycle on Unix.
+	{
+		srcDir := filepath.Join(t.TempDir(), "srcdir")
+		if err := os.MkdirAll(filepath.Join(srcDir, "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "sub", "item.txt"), []byte("dot-item\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code, _, errS := runCmd(nil, "cp", "-S", sockPath, srcDir+string(os.PathSeparator)+".", ":/tmp/dotdest"); code != 0 {
+			t.Fatalf("cp ./dir/. = (%d, %q)", code, errS)
+		}
+		if code, out, errS := runCmd(nil, "exec", "-S", sockPath, "--", "/bin/cat", "/tmp/dotdest/sub/item.txt"); code != 0 || out != "dot-item\n" {
+			t.Fatalf("exec cat /tmp/dotdest/sub/item.txt = (%d, %q, %q)", code, out, errS)
+		}
+		if runtime.GOOS != "windows" {
+			symSrc := filepath.Join(t.TempDir(), "symsrc")
+			if err := os.MkdirAll(symSrc, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			extFile := filepath.Join(t.TempDir(), "ext.txt")
+			if err := os.WriteFile(extFile, []byte("followed-host\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(extFile, filepath.Join(symSrc, "link.txt")); err != nil {
+				t.Fatal(err)
+			}
+			// Self-referential directory symlink must terminate cleanly under -L.
+			if err := os.Symlink(symSrc, filepath.Join(symSrc, "loop")); err != nil {
+				t.Fatal(err)
+			}
+			if code, _, errS := runCmd(nil, "cp", "-S", sockPath, "-L", symSrc, ":/tmp/symdest"); code != 0 {
+				t.Fatalf("cp -L host->guest = (%d, %q)", code, errS)
+			}
+			if code, out, errS := runCmd(nil, "exec", "-S", sockPath, "--", "/bin/cat", "/tmp/symdest/link.txt"); code != 0 || out != "followed-host\n" {
+				t.Fatalf("exec cat /tmp/symdest/link.txt = (%d, %q, %q)", code, out, errS)
+			}
+		}
+	}
+
+	// cp :/ full root export into a non-existing host dir must preserve top-level entries.
+	{
+		rootDst := filepath.Join(t.TempDir(), "rootcopy")
+		if code, _, errS := runCmd(nil, "cp", "-S", sockPath, ":/", rootDst); code != 0 {
+			t.Fatalf("cp :/ = (%d, %q)", code, errS)
+		}
+		if got, err := os.ReadFile(filepath.Join(rootDst, "etc", "ready.txt")); err != nil || string(got) != "cli-ready\n" {
+			t.Fatalf("cp :/ etc/ready.txt = (%q, %v), want cli-ready", got, err)
+		}
+	}
+
+	// export CLI (-z -o file and --upper-only -o -)
+	{
+		expFile := filepath.Join(t.TempDir(), "export.tar")
+		if code, _, errS := runCmd(nil, "export", "-S", sockPath, "-z", "-o", expFile, "/tmp/in.txt"); code != 0 {
+			t.Fatalf("export -z -o = (%d, %q)", code, errS)
+		}
+		f, err := os.Open(expFile)
+		if err != nil {
+			t.Fatalf("open export.tar: %v", err)
+		}
+		tr := tar.NewReader(f)
+		hdr, hErr := tr.Next()
+		_ = f.Close()
+		if hErr != nil || hdr.Name != "in.txt" {
+			t.Fatalf("export.tar header = (%+v, %v), want in.txt", hdr, hErr)
+		}
+
+		var upBuf, upErr bytes.Buffer
+		if code := executeCLI(context.Background(), []string{"export", "-S", sockPath, "--upper-only", "-o", "-"}, nil, &upBuf, &upErr); code != 0 {
+			t.Fatalf("export --upper-only -o - = (%d, %q)", code, upErr.String())
+		}
+		upTR := tar.NewReader(&upBuf)
+		var sawIn, sawLower bool
+		for {
+			h, err := upTR.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("export --upper-only tar read: %v", err)
+			}
+			if strings.HasSuffix(h.Name, "in.txt") {
+				sawIn = true
+			}
+			if strings.HasSuffix(h.Name, "ready.txt") {
+				sawLower = true
+			}
+		}
+		if !sawIn || sawLower {
+			t.Fatalf("export --upper-only: sawIn=%v sawLower=%v, want true/false", sawIn, sawLower)
+		}
 	}
 
 	// update live limits (and --cpu-quota=max reset)

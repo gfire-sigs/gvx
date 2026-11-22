@@ -27,12 +27,19 @@ func SetRootPidsMax(k *kernel.Kernel, limit int64) error {
 	if k == nil || k.Cgroup2FS() == nil {
 		return linuxerr.EINVAL
 	}
-	if limit > pidMaxLimit {
-		return fmt.Errorf("cgroup2fs: pids limit %d exceeds maximum %d: %w", limit, pidMaxLimit, linuxerr.EINVAL)
-	}
 	root, ok := k.Cgroup2FS().RootCgroup().(*cgroup)
 	if !ok || root == nil {
 		return linuxerr.EINVAL
+	}
+	return setRootPidsMax(root, limit)
+}
+
+func setRootPidsMax(root *cgroup, limit int64) error {
+	if root == nil {
+		return linuxerr.EINVAL
+	}
+	if limit > pidMaxLimit {
+		return fmt.Errorf("cgroup2fs: pids limit %d exceeds maximum %d: %w", limit, pidMaxLimit, linuxerr.EINVAL)
 	}
 	p := getPidsCtrl(root)
 	if p == nil {
@@ -56,6 +63,13 @@ func RootPidsLimit(k *kernel.Kernel) (current, limit int64) {
 	}
 	root, ok := k.Cgroup2FS().RootCgroup().(*cgroup)
 	if !ok || root == nil {
+		return 0, 0
+	}
+	return rootPidsLimit(root)
+}
+
+func rootPidsLimit(root *cgroup) (current, limit int64) {
+	if root == nil {
 		return 0, 0
 	}
 	p := getPidsCtrl(root)
