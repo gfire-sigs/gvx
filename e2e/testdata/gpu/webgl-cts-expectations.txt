@@ -1,0 +1,33 @@
+# <mode> <webgl> <pattern> <statuses> # <reason>
+# mode: swiftshader, venus, virgl, or "*" (venus and virgl only). webgl: 1, 2, or "*".
+# pattern: subset syntax (a trailing "/" selects a directory).
+# statuses: comma-separated list of fail, timeout, crash, not-run, software, or "any".
+# The reason is required. Name a known defect (KD-n) or a host limit.
+
+# SwiftShader reference. These pages do not pass in the pinned image on
+# SwiftShader, so the gate does not compare them.
+swiftshader 1 conformance/extensions/angle-instanced-arrays-out-of-bounds.html fail # Chromium crbug.com/849572: Failure on angle-swiftshader and angle-vulkan
+swiftshader 1 conformance/glsl/misc/shader-with-double-underscore.html fail # Chromium crbug.com/486945330: Failure on all configurations
+swiftshader 2 conformance2/extensions/oes-draw-buffers-indexed.html fail # guest stack: ANGLE on SwiftShader gives INVALID_VALUE for undefined color outputs; venus and virgl pass
+swiftshader 2 conformance2/extensions/ovr_multiview2.html fail # guest stack: ANGLE Vulkan accepts GL_OVR_multiview without the extension; Chromium crbug.com/949249 lists the same page for other back ends
+swiftshader 2 conformance2/rendering/instanced-rendering-large-divisor.html timeout # SwiftShader speed: the page does not finish in the page limit; venus and virgl pass
+swiftshader 2 conformance2/textures/misc/immutable-tex-render-feedback.html fail # Chromium crbug.com/angleproject/42267266: Failure on passthrough
+
+# venus: host driver defects and limits of KosmicKrisp 26.3.0 (Mesa).
+# Each one has a host Vulkan probe without the guest. See
+# docs/architecture.md, GPU known defects.
+venus 2 conformance2/glsl3/bool-type-cast-bug-uint-ivec-uvec.html fail # KosmicKrisp 26.3.0: a non-indexed draw with primitive restart, last provoking vertex, and a flat input loses vertex 0
+venus 2 conformance2/glsl3/uint-int-shift-bug.html fail # KosmicKrisp 26.3.0: a non-indexed draw with primitive restart, last provoking vertex, and a flat input loses vertex 0
+venus 2 conformance2/glsl3/loops-with-side-effects.html fail # KosmicKrisp 26.3.0: a non-indexed draw with primitive restart, last provoking vertex, and a flat input loses vertex 0
+venus 2 conformance2/rendering/vertex-id.html fail # KosmicKrisp 26.3.0: a non-indexed draw with primitive restart, last provoking vertex, and a flat input loses vertex 0
+venus 2 conformance2/extensions/ovr_multiview2_flat_varying.html fail # KosmicKrisp 26.3.0: a non-indexed draw with primitive restart, last provoking vertex, and a flat input loses vertex 0
+venus 2 conformance2/extensions/ovr_multiview2_instanced_draw.html fail # KosmicKrisp 26.3.0: a non-indexed draw with primitive restart, last provoking vertex, and a flat input loses vertex 0
+venus 2 conformance2/glsl3/float-parsing.html fail # host limit: KosmicKrisp 26.3.0 uses Metal fast math; infinity arithmetic is undefined without SignedZeroInfNanPreserve, which ANGLE does not set
+venus 2 conformance2/extensions/webgl-clip-cull-distance.html fail # KosmicKrisp 26.3.0: fragment shader reads of gl_ClipDistance[i] and gl_CullDistance[i] return element 0
+venus 2 conformance2/reading/read-pixels-from-fbo-test.html fail # host limit: KosmicKrisp 26.3.0 has no R5G5B5A1_UNORM_PACK16; the read format of the ANGLE fallback is not valid in WebGL (Chromium crbug.com/1237319)
+
+# virgl: Apple OpenGL 4.1 limits and guest stack defects.
+virgl 1 conformance/extensions/khr-parallel-shader-compile.html fail # Chromium crbug.com/1175371: ANGLE GL on Mesa compiles in the COMPLETION_STATUS query; llvmpipe fails the same checks
+virgl 2 conformance2/extensions/oes-sample-variables.html fail # host limit: Apple OpenGL 4.1 gl_SampleMaskIn does not include GL_SAMPLE_COVERAGE (native CGL probe)
+virgl 2 conformance2/reading/read-pixels-from-fbo-test.html crash,fail # Chromium crbug.com/577119296: ANGLE GL readPixels internal error on Mesa GLES stops the GPU process; llvmpipe stops the same way
+virgl 2 conformance2/rendering/blitframebuffer-filter-outofbounds.html fail # Chromium crbug.com/329698340: guest Mesa 23.2 and later clips an out-of-bounds linear blit differently; llvmpipe fails the same checks

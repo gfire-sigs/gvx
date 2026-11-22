@@ -138,23 +138,25 @@ func gpuModeEnabled(mode string) bool {
 
 // gpuRun describes one rungv run of a GPU gate.
 type gpuRun struct {
-	gpu       bool              // -gpu=venus when true and mode is empty, -gpu=off otherwise (kept for G1)
-	mode      string            // -gpu value when not empty: "venus", "virgl", or "off"
-	image     string            // OCI image reference
-	net       string            // -net value
-	workspace string            // host directory at /workspace
-	out       string            // host directory at /out (writable)
-	readOnly  map[string]string // host directory: guest path, mounted read-only
-	env       []string          // guest environment (KEY=VALUE)
-	argv      []string          // guest command
-	timeout   time.Duration
+	gpu         bool              // -gpu=venus when true and mode is empty, -gpu=off otherwise (kept for G1)
+	mode        string            // -gpu value when not empty: "venus", "virgl", or "off"
+	image       string            // OCI image reference
+	net         string            // -net value
+	workspace   string            // host directory at /workspace
+	out         string            // host directory at /out (writable)
+	readOnly    map[string]string // host directory: guest path, mounted read-only
+	env         []string          // guest environment (KEY=VALUE)
+	argv        []string          // guest command
+	timeout     time.Duration
+	softTimeout bool // return timedOut instead of calling t.Fatalf on timeout
 }
 
 // gpuRunResult is the outcome of one gpuRun.
 type gpuRunResult struct {
-	code   int    // exit code of rungv (the guest exit code when it ran)
-	stdout string // guest standard output
-	log    string // path of the rungv standard error: Sentry log, renderer lines, guest standard error
+	code     int    // exit code of rungv (the guest exit code when it ran)
+	stdout   string // guest standard output
+	log      string // path of the rungv standard error: Sentry log, renderer lines, guest standard error
+	timedOut bool   // rungv reached r.timeout with r.softTimeout set
 }
 
 // runGPUGuest runs r through the rungv command with the host lockdown on and
@@ -193,10 +195,17 @@ func runGPUGuest(t *testing.T, runDir string, r gpuRun) gpuRunResult {
 	case err == nil:
 	case errors.As(err, &exitErr):
 		res.code = exitErr.ExitCode()
+	case ctx.Err() != nil && r.softTimeout:
+		res.timedOut = true
+		return res
 	default:
 		t.Fatalf("run rungv: %v (log: %s)", err, logPath)
 	}
 	if ctx.Err() != nil {
+		if r.softTimeout {
+			res.timedOut = true
+			return res
+		}
 		t.Fatalf("rungv did not finish in %s (log: %s); stdout:\n%s", r.timeout, logPath, res.stdout)
 	}
 	return res
@@ -330,8 +339,15 @@ var (
 
 // gpuLogScan is the result of scanGPULog.
 type gpuLogScan struct {
-	Refused []refusedIoctl
-	KD1     kd1Counts
+	Refused           []refusedIoctl
+	KD1               kd1Counts
+	RendererLostLines []string
+}
+
+// isRendererLostLine reports whether line records an unexpected GPU renderer
+// loss outside normal teardown ("client closed").
+func isRendererLostLine(line string) bool {
+	return strings.Contains(line, rendererLostLine) && !strings.Contains(line, "client closed")
 }
 
 // scanGPULog reads the rungv log at path. It returns the refused ioctls in
@@ -356,6 +372,9 @@ func scanGPULog(t *testing.T, path string) gpuLogScan {
 			short.WriteByte('\n')
 		}
 		countKD1(&scan.KD1, line)
+		if isRendererLostLine(line) {
+			scan.RendererLostLines = append(scan.RendererLostLines, strings.TrimSpace(line))
+		}
 		m := refusedIoctlRE.FindStringSubmatch(line)
 		if m == nil {
 			continue
@@ -391,7 +410,7 @@ func countKD1(k *kd1Counts, line string) {
 		k.ProxyBlobReplyFailed++
 	case kd1ContextLostRE.MatchString(line):
 		k.ContextLost++
-	case strings.Contains(line, rendererLostLine) && !strings.Contains(line, "client closed"):
+	case isRendererLostLine(line):
 		k.RendererLost++
 	}
 	if m := kd1StderrDroppedRE.FindStringSubmatch(line); m != nil {
