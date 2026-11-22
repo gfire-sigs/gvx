@@ -659,8 +659,8 @@ func TestRPCFSReadOnlyPermissionsBoundsAndInterrupt(t *testing.T) {
 			}
 		}
 
-		// Stalled RPC must unblock immediately with EINTR when Sentry context is interrupted.
-		entered := make(chan struct{})
+		// Stalled RPC must unblock immediately with ERESTARTSYS when Sentry context is interrupted.
+		entered := make(chan struct{}, 1)
 		client.mu.Lock()
 		client.beforeCall = func(rpcCtx goContext.Context, op string) error {
 			if op == "stat" {
@@ -683,6 +683,8 @@ func TestRPCFSReadOnlyPermissionsBoundsAndInterrupt(t *testing.T) {
 		}()
 		select {
 		case <-entered:
+		case err := <-statErrCh:
+			t.Fatalf("StatAt returned %v before entering RPC hook", err)
 		case <-time.After(3 * time.Second):
 			t.Fatal("StatAt did not enter RPC hook")
 		}

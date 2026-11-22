@@ -575,9 +575,19 @@ func TestControlMaxConnectionsHandshakeTimeoutAndCancel(t *testing.T) {
 	}
 
 	// 2. First active client occupies MaxConnections=1; second client fails to connect.
-	c1, err := Dial(context.Background(), DialOptions{Endpoint: ep.Address})
-	if err != nil {
-		t.Fatalf("Dial c1: %v", err)
+	// Poll briefly because the server releases its semaphore slot in a defer right
+	// after closing the timed-out raw connection.
+	var c1 *Client
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c1, err = Dial(context.Background(), DialOptions{Endpoint: ep.Address})
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Dial c1 after HandshakeTimeout slot release: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	defer c1.Close()
 

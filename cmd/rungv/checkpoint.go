@@ -112,7 +112,8 @@ func isV2HandshakeWireError(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "read control hello response") ||
+	return strings.Contains(msg, "write control hello") ||
+		strings.Contains(msg, "read control hello response") ||
 		strings.Contains(msg, "unexpected control hello frame") ||
 		strings.Contains(msg, "decode control hello response")
 }
