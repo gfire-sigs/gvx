@@ -153,7 +153,7 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_E2E_BROWSER_BENCH=1` | Runs `TestE2EBrowserBench` with `GVX_E2E_BROWSER=1`. The test logs the browser start time, the tab time, and the SwiftShader share of each workload. |
 | `GVX_E2E_GPU=1` | Runs the GPU gates (`e2e/gate_gpu*_test.go`) on `darwin/arm64` with `hvf`. The gates need `GVX_GPU_RENDERER` and fail without it. |
 | `GVX_E2E_ARTIFACT_DIR` | Directory that receives the records of the GPU gates (`g1`, `g1-kill`, `g2`, `g3`, `webgl-cts`, `venus-guard`): results, logs, refused ioctls, and screenshots. |
-| `GVX_GPU_RENDERER` | Path of the `gvx-gpu-renderer` executable for `-gpu=venus` and `-gpu=virgl`. `scripts/gpu/build-renderer.sh` writes it to `build/gpu/gvx-gpu-renderer/bin/`. |
+| `GVX_GPU_RENDERER` | Path of the `gvx-gpu-renderer` executable for `-gpu=venus` and `-gpu=virgl`. `scripts/gpu/build-renderer.sh` writes it to `build/gpu/gvx-gpu-renderer/bin/`. The `venus` mode of `TestE2EGateGPUWebGLCTS` needs a bundle from `--driver-source mesa-source`, which applies `gpurenderer/patches/mesa/`. |
 | `GVX_E2E_GPU_MODES` | Comma-separated list of GPU modes (`venus`, `virgl`) that the GPU gates run. Unset selects both modes. |
 | `GVX_E2E_GPU_CHROMIUM_FLAGS` | Replaces the `venus` Chromium flags in `TestE2EGateGPUChromium` and `TestE2EGateGPUWebGLCTS`, for the fallback steps of the GPU design. |
 | `GVX_E2E_GPU_CHROMIUM_VIRGL_FLAGS` | Replaces the `virgl` Chromium flags in `TestE2EGateGPUChromium` and `TestE2EGateGPUWebGLCTS`, for the fallback steps of D13. |

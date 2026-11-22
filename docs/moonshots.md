@@ -377,7 +377,7 @@ Each gate writes its record to the directory in `GVX_E2E_ARTIFACT_DIR`: `result.
 
 | Gate | Command |
 | :--- | :--- |
-| Renderer build and self-test | `scripts/gpu/build-renderer.sh`, then `--selftest` and `--selftest --mode=virgl` |
+| Renderer build and self-test | `scripts/gpu/build-renderer.sh --driver-source mesa-source`, then `--selftest` and `--selftest --mode=virgl`. The source build needs `llvm`, `libclc`, `spirv-llvm-translator`, and `spirv-tools` from Homebrew. |
 | G1, guest Vulkan (record `g1/result.json`) | `GVX_E2E_GPU=1 GVX_GPU_RENDERER="$PWD/build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2EGateGPUVulkan$' -v` |
 | Venus guard, create info that the renderer must survive (record `venus-guard/result.json`) | The same variables, with `-run '^TestE2EGateGPUVenusGuard$'` |
 | G3, guest OpenGL (record `g3/result.json`) | The same variables, with `-run '^TestE2EGateGPUOpenGL$'` |
