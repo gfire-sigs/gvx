@@ -1,0 +1,49 @@
+From 999cebd9cc058192188b3ac530d2d6404770d25a Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 13:28:12 +0900
+Subject: [PATCH] vrend: use the depth of a 3D texture in the mipmap level
+ check
+
+check_resource_valid compared last_level only with the width and the
+height. A 3D texture gets its number of mipmap levels from its largest
+dimension. That dimension can be the depth (for example 1x1x8 with 4
+levels). vrend refused such a resource ("Mipmap levels 3 too large for
+texture size (1, 1)"). The guest got an error for a legal texture, and
+Chromium lost its GPU context (WebGL test tex-storage-and-subimage-3d).
+
+Include the depth in the check when the target is PIPE_TEXTURE_3D. Array
+layers do not count. Also make the limit exact: the largest last_level
+is util_logbase2 of the largest dimension. The old check permitted one
+level more than that. Refuse a largest dimension of 0.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4d23756..273fd9b 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8550,9 +8550,15 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
+          return -1;
+       }
+ 
+-      if (args->last_level > (floor(log2(MAX2(args->width, args->height))) + 1)) {
+-         snprintf(errmsg, 256, "Mipmap levels %d too large for texture size (%d, %d)",
+-                  args->last_level, args->width, args->height);
++      /* The largest dimension sets the number of mipmap levels. For a 3D
++       * texture that can be the depth. Array layers do not count. */
++      uint32_t max_size = MAX2(args->width, args->height);
++      if (args->target == PIPE_TEXTURE_3D)
++         max_size = MAX2(max_size, args->depth);
++
++      if (max_size == 0 || args->last_level > util_logbase2(max_size)) {
++         snprintf(errmsg, 256, "Mipmap levels %d too large for texture size (%d, %d, %d)",
++                  args->last_level, args->width, args->height, args->depth);
+          return -1;
+       }
+    }
+-- 
+2.55.0
+

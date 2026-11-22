@@ -164,6 +164,10 @@ void gl_cgl_destroy_context(void *cookie, virgl_renderer_gl_context ctx)
 		return;
 	}
 	CGLContextObj cgl = (CGLContextObj)ctx;
+	if (CGLGetCurrentContext() == cgl) {
+		glFlush();
+		(void)CGLSetCurrentContext(NULL);
+	}
 	if (cgl == g_root_ctx) {
 		g_root_ctx = NULL;
 	}
@@ -177,6 +181,12 @@ int gl_cgl_make_current(void *cookie, int scanout_idx, virgl_renderer_gl_context
 {
 	(void)cookie;
 	(void)scanout_idx;
+	/* CGLSetCurrentContext does not flush the old context. Flush before
+	 * switching so shared contexts observe prior commands and fences. */
+	CGLContextObj cur = CGLGetCurrentContext();
+	if (cur != NULL && cur != (CGLContextObj)ctx) {
+		glFlush();
+	}
 	CGLError cerr = CGLSetCurrentContext((CGLContextObj)ctx);
 	return cerr == kCGLNoError ? 0 : -1;
 }

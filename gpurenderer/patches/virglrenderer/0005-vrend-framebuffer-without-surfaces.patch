@@ -1,0 +1,169 @@
+From 9dbde0cd47b74bb98ec0ab919480f1859fe13462 Mon Sep 17 00:00:00 2001
+From: The gVisor Authors <gvisor-dev@googlegroups.com>
+Date: Sun, 22 Nov 2026 13:28:12 +0900
+Subject: [PATCH] vrend: keep the framebuffer complete when no surface is bound
+
+The guest binds no color surface and no depth surface when each draw
+buffer of its framebuffer is GL_NONE. The same occurs when the
+attachment of each draw buffer has no image. The guest framebuffer is
+complete in these conditions, and a draw is legal. The WebGL tests
+webgl-draw-buffers, draw-buffers, read-draw-when-missing-image and
+rendering-sampling-feedback-loop do such draws.
+
+vrend then removes each attachment from its framebuffer object. Without
+GL_ARB_framebuffer_no_attachments (Apple OpenGL 4.1) that object is
+incomplete (GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT). Each draw
+returns GL_INVALID_FRAMEBUFFER_OPERATION. With check-gl-errors the guest
+context then goes into the error state.
+
+On such a host, attach a 1x1 renderbuffer to color attachment 0 before a
+draw or a clear while the guest binds no surface. No draw buffer selects
+the renderbuffer, so no fragment output changes. Select the renderbuffer
+as the read buffer with glReadBuffer. Apple OpenGL 4.1 reports
+GL_FRAMEBUFFER_UNSUPPORTED for a color attachment when each draw buffer
+and the read buffer are GL_NONE.
+
+Limit: the 1x1 size clips rasterization to one pixel. An occlusion query
+on such a draw counts at most the samples of that pixel.
+
+License: MIT
+---
+ src/vrend/vrend_renderer.c | 73 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 1546048..86dddf9 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -771,6 +771,11 @@ struct vrend_sub_context {
+ 
+    GLuint blit_fb_ids[2];
+ 
++   /* Placeholder color attachment for a framebuffer without surfaces. Only
++    * for a host without GL_ARB_framebuffer_no_attachments. */
++   GLuint fb_placeholder_rb_id;
++   bool fb_placeholder_attached;
++
+    struct vrend_depth_stencil_alpha_state *dsa;
+ 
+    struct pipe_clip_state ucp_state;
+@@ -3384,6 +3389,10 @@ static void vrend_hw_set_color_surface(struct vrend_sub_context *sub_ctx, GLuint
+ {
+    struct vrend_surface *surf = sub_ctx->surf[index];
+ 
++   /* Each branch below replaces the placeholder on color attachment 0. */
++   if (index == 0)
++      sub_ctx->fb_placeholder_attached = false;
++
+    if (!surf) {
+       GLenum attachment = GL_COLOR_ATTACHMENT0 + index;
+ 
+@@ -3413,7 +3422,9 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
+    };
+ 
+    if (sub_ctx->nr_cbufs == 0) {
+-      glReadBuffer(GL_NONE);
++      /* Keep the placeholder as the read buffer while it is attached. See
++       * vrend_hw_attach_fb_placeholder. */
++      glReadBuffer(sub_ctx->fb_placeholder_attached ? GL_COLOR_ATTACHMENT0 : GL_NONE);
+       if (has_feature(feat_srgb_write_control)) {
+          glDisable(GL_FRAMEBUFFER_SRGB_EXT);
+          sub_ctx->framebuffer_srgb_enabled = false;
+@@ -3470,6 +3481,60 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
+    glDrawBuffers(sub_ctx->nr_cbufs, buffers);
+ }
+ 
++/* Keep the framebuffer complete when the guest binds no surface.
++ *
++ * The guest binds no surface when each draw buffer of its framebuffer is
++ * GL_NONE. The same occurs when the attachment of each draw buffer has no
++ * image. The guest framebuffer is complete then, and a draw is legal.
++ *
++ * Without GL_ARB_framebuffer_no_attachments (Apple OpenGL 4.1) the vrend
++ * framebuffer object is then incomplete
++ * (GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT), and each draw returns
++ * GL_INVALID_FRAMEBUFFER_OPERATION. Thus attach a 1x1 renderbuffer to color
++ * attachment 0 during that time. No draw buffer selects it, so no fragment
++ * output changes. Transform feedback continues to operate.
++ *
++ * Limit: the 1x1 size clips rasterization to one pixel. An occlusion query
++ * on such a draw counts at most the samples of that pixel. */
++static bool vrend_fb_needs_placeholder(const struct vrend_sub_context *sub_ctx)
++{
++   return !has_feature(feat_fb_no_attach) &&
++          sub_ctx->nr_cbufs == 0 && !sub_ctx->zsurf;
++}
++
++/* Attach the placeholder before a draw or a clear, if it is necessary.
++ * vrend_set_framebuffer_state does not attach it, so a guest that binds no
++ * surface and does not draw (context teardown) allocates nothing. */
++static void vrend_hw_attach_fb_placeholder(struct vrend_sub_context *sub_ctx)
++{
++   if (sub_ctx->fb_placeholder_attached || !vrend_fb_needs_placeholder(sub_ctx))
++      return;
++
++   if (!sub_ctx->fb_placeholder_rb_id) {
++      glGenRenderbuffers(1, &sub_ctx->fb_placeholder_rb_id);
++      glBindRenderbuffer(GL_RENDERBUFFER, sub_ctx->fb_placeholder_rb_id);
++      glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 1, 1);
++      glBindRenderbuffer(GL_RENDERBUFFER, 0);
++   }
++   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                             GL_RENDERBUFFER, sub_ctx->fb_placeholder_rb_id);
++   /* Apple OpenGL 4.1 reports GL_FRAMEBUFFER_UNSUPPORTED for a color
++    * attachment when each draw buffer and the read buffer are GL_NONE. */
++   glReadBuffer(GL_COLOR_ATTACHMENT0);
++   sub_ctx->fb_placeholder_attached = true;
++}
++
++/* Remove the placeholder when the guest binds a surface again. */
++static void vrend_hw_detach_fb_placeholder(struct vrend_sub_context *sub_ctx)
++{
++   if (!sub_ctx->fb_placeholder_attached || vrend_fb_needs_placeholder(sub_ctx))
++      return;
++
++   /* This call attaches the surface of color buffer 0 again, or nothing.
++    * It also clears fb_placeholder_attached. */
++   vrend_hw_set_color_surface(sub_ctx, 0);
++}
++
+ void vrend_set_framebuffer_state(struct vrend_context *ctx,
+                                  uint32_t nr_cbufs, uint32_t surf_handle[PIPE_MAX_COLOR_BUFS],
+                                  uint32_t zsurf_handle)
+@@ -3557,6 +3622,7 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
+       }
+    }
+ 
++   vrend_hw_detach_fb_placeholder(sub_ctx);
+    vrend_hw_emit_framebuffer_state(sub_ctx);
+ 
+    if (sub_ctx->nr_cbufs > 0 || sub_ctx->zsurf) {
+@@ -5136,6 +5202,7 @@ void vrend_clear(struct vrend_context *ctx, unsigned buffers,
+       vrend_update_viewport_state(sub_ctx);
+ 
+    vrend_use_program(NULL);
++   vrend_hw_attach_fb_placeholder(sub_ctx);
+ 
+    glDisable(GL_SCISSOR_TEST);
+ 
+@@ -6285,6 +6352,7 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+    }
+ 
+    vrend_use_program(sub_ctx->prog);
++   vrend_hw_attach_fb_placeholder(sub_ctx);
+ 
+    if (has_feature(feat_draw_parameters) &&
+        sub_ctx->prog->reads_drawid &&
+@@ -8190,6 +8258,9 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
+    if (sub->fb_id)
+       glDeleteFramebuffers(1, &sub->fb_id);
+ 
++   if (sub->fb_placeholder_rb_id)
++      glDeleteRenderbuffers(1, &sub->fb_placeholder_rb_id);
++
+    if (sub->blit_fb_ids[0])
+       glDeleteFramebuffers(2, sub->blit_fb_ids);
+ 
+-- 
+2.55.0
+
