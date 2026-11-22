@@ -127,7 +127,6 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 	t.Cleanup(func() {
 		_ = client.Close()
 		_ = stdinW.Close()
-		_ = stdinR.Close()
 		cancel()
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = sb.ShutdownControl(drainCtx)
@@ -139,6 +138,7 @@ func startControlTestSandbox(t *testing.T, cfg Config) *runningControlSandbox {
 		case <-time.After(10 * time.Second):
 			t.Errorf("Sandbox.Run did not exit within 10s during test cleanup")
 		}
+		_ = stdinR.Close()
 		_ = sb.Close()
 	})
 
@@ -1007,5 +1007,135 @@ func TestControlCheckpointStreamForceStopsActiveExec(t *testing.T) {
 	ckptSt.Close()
 	if err != nil || len(bundleTar) == 0 {
 		t.Fatalf("checkpoint_stream Force read = (%d bytes, %v)", len(bundleTar), err)
+	}
+}
+
+func TestControlEarlyRPCBeforeRunDoesNotDeadlock(t *testing.T) {
+	requireCheckpointGuestBackend(t)
+	cacheDir, regURL, imgRef := buildControlTestImage(t)
+
+	sockPath := shortControlSocketPath(t, "early.sock")
+	ep, err := control.Listen(sockPath, control.ListenOptions{})
+	if err != nil {
+		t.Fatalf("control.Listen: %v", err)
+	}
+	t.Cleanup(ep.Cleanup)
+
+	stdinR, stdinW := net.Pipe()
+	stdout := newNotifyBuffer()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := Config{
+		Name:                   "early-rpc",
+		Platform:               PlatformAuto,
+		AllowUnconfinedSystrap: runtime.GOOS == "windows",
+		NetworkMode:            NetModeNone,
+		OCIImage:               imgRef,
+		OCICacheDir:            cacheDir,
+		RegistryBaseURL:        regURL,
+		DisableHostLockdown:    true,
+		ControlListener:        ep.Listener,
+		ControlToken:           ep.Token,
+		Stdin:                  stdinR,
+		Stdout:                 stdout,
+		Stderr:                 io.Discard,
+	}
+	sb, err := New(ctx, cfg)
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = ep.Listener.Close()
+		t.Fatalf("gvx.New: %v", err)
+	}
+
+	// Start ServeControl BEFORE calling sb.Run so early RPCs arrive while
+	// kernelReady is still open.
+	ctrlCtx, ctrlCancel := context.WithCancel(ctx)
+	ctrlDone := make(chan struct{})
+	go func() {
+		defer close(ctrlDone)
+		_ = sb.ServeControl(ctrlCtx)
+	}()
+
+	client, err := control.Dial(ctx, control.DialOptions{Endpoint: sockPath, Token: ep.Token})
+	if err != nil {
+		ctrlCancel()
+		_ = sb.Close()
+		<-ctrlDone
+		t.Fatalf("control.Dial: %v", err)
+	}
+
+	runDone := make(chan struct{})
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = stdinW.Close()
+		cancel()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = sb.ShutdownControl(drainCtx)
+		drainCancel()
+		ctrlCancel()
+		<-ctrlDone
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			t.Errorf("Sandbox.Run did not exit during cleanup")
+		}
+		_ = stdinR.Close()
+		_ = sb.Close()
+	})
+
+	// Launch Pause and Exec RPCs BEFORE sb.Run starts; neither may deadlock
+	// executeActiveKernel (AB-BA opMu vs kernelReady).
+	pauseErrCh := make(chan error, 1)
+	go func() {
+		pauseErrCh <- client.Call(ctx, control.MethodPause, control.PauseRequest{}, nil)
+	}()
+	execErrCh := make(chan error, 1)
+	go func() {
+		st, err := client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{Argv: []string{"/bin/hello"}})
+		if err != nil {
+			execErrCh <- err
+			return
+		}
+		defer st.Close()
+		err = st.WaitResponse(ctx, nil)
+		if err != nil {
+			execErrCh <- err
+			return
+		}
+		_, rErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		execErrCh <- rErr
+	}()
+
+	// Give early RPCs time to block on kernelReady before starting Run.
+	time.Sleep(50 * time.Millisecond)
+
+	go func() {
+		defer close(runDone)
+		_, _ = sb.Run(ctx)
+	}()
+
+	select {
+	case err := <-pauseErrCh:
+		if err != nil {
+			t.Fatalf("early Pause RPC failed: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("early Pause RPC deadlocked with executeActiveKernel")
+	}
+	if err := client.Call(ctx, control.MethodUnpause, nil, nil); err != nil {
+		t.Fatalf("Unpause after early Pause: %v", err)
+	}
+	select {
+	case err := <-execErrCh:
+		// Either exec ran before Pause (nil) or hit ALREADY_PAUSED after Pause;
+		// either proves zero deadlock.
+		if err != nil && !control.IsCode(err, control.CodeAlreadyPaused) {
+			t.Fatalf("early Exec RPC unexpected error: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("early Exec RPC deadlocked with executeActiveKernel")
 	}
 }

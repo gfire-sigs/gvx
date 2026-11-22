@@ -191,6 +191,12 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 		return control.NewError(control.CodeForbiddenByPolicy, "exec TTY allocation is disabled by policy")
 	}
 
+	// Wait for kernel startup before acquiring s.opMu so early exec RPCs never
+	// deadlock with executeActiveKernel holding s.opMu.Lock() during startup.
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
+		return err
+	}
+
 	s.opMu.RLock()
 	opLocked := true
 	unlockOp := func() {
@@ -200,6 +206,11 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 		}
 	}
 	defer unlockOp()
+
+	k, _, err := s.activeKernelNow()
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	paused := s.userPaused
@@ -230,10 +241,6 @@ func (s *Sandbox) handleExecStart(ctx context.Context, stream *control.Stream, r
 	}
 	defer releaseReserved()
 
-	k, _, err := s.activeKernelChecked(ctx)
-	if err != nil {
-		return err
-	}
 	sctx := k.SupervisorContext()
 	root, mntns, err := s.guestRoot(sctx, k)
 	if err != nil {

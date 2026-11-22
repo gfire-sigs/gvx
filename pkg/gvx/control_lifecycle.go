@@ -34,12 +34,18 @@ import (
 
 // Pause pauses all guest vCPUs/tasks and optionally quiesces host network traffic.
 func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
+	// Wait for kernel startup before acquiring s.opMu to avoid AB-BA deadlocks
+	// with executeActiveKernel.
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
+		return err
+	}
+
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.ckptMu.Lock()
 	defer s.ckptMu.Unlock()
 
-	k, _, err := s.activeKernelChecked(ctx)
+	k, _, err := s.activeKernelNow()
 	if err != nil {
 		return err
 	}
@@ -76,12 +82,18 @@ func (s *Sandbox) Pause(ctx context.Context, quiesceNet bool) error {
 
 // Unpause resumes a sandbox previously paused with Pause.
 func (s *Sandbox) Unpause(ctx context.Context) error {
+	// Wait for kernel startup before acquiring s.opMu to avoid AB-BA deadlocks
+	// with executeActiveKernel.
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
+		return err
+	}
+
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.ckptMu.Lock()
 	defer s.ckptMu.Unlock()
 
-	k, _, err := s.activeKernelChecked(ctx)
+	k, _, err := s.activeKernelNow()
 	if err != nil {
 		return err
 	}

@@ -354,21 +354,8 @@ func (s *Sandbox) snapshotEth0() *netbackend.Eth0Config {
 // resumes the sandbox after writing the bundle. When opts.LeaveRunning is
 // false, Checkpoint stops the guest kernel so Run returns cleanly.
 func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retErr error) {
-	s.opMu.Lock()
-	opLocked := true
-	defer func() {
-		if opLocked {
-			s.opMu.Unlock()
-		}
-	}()
-	s.ckptMu.Lock()
-	ckptLocked := true
-	defer func() {
-		if ckptLocked {
-			s.ckptMu.Unlock()
-		}
-	}()
-
+	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
+	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
 	files := s.ckptFiles
 	readyCh := s.kernelReady
@@ -390,13 +377,32 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		return ctx.Err()
 	}
 
+	s.opMu.Lock()
+	opLocked := true
+	defer func() {
+		if opLocked {
+			s.opMu.Unlock()
+		}
+	}()
+	s.ckptMu.Lock()
+	ckptLocked := true
+	defer func() {
+		if ckptLocked {
+			s.ckptMu.Unlock()
+		}
+	}()
+
 	s.mu.Lock()
+	files = s.ckptFiles
 	k := s.activeKernel
 	dog := s.activeWatchdog
 	quiescers := s.saveQuiescersLocked()
 	alreadyPaused := s.userPaused
 	alreadyQuiesced := s.userPauseQuiesced
 	s.mu.Unlock()
+	if files == nil {
+		return fmt.Errorf("%w: Config.CheckpointDir must be set before New or Restore", ErrInvalidConfig)
+	}
 	if k == nil {
 		return errors.New("gvx: sandbox is not running")
 	}
@@ -603,21 +609,8 @@ func (s *Sandbox) checkpointStreamRun(
 	opts CheckpointOptions,
 	streamFn func(manifestBytes, stateBytes, pagesMetaBytes, pagesBytes []byte) error,
 ) (retErr error) {
-	s.opMu.Lock()
-	opLocked := true
-	defer func() {
-		if opLocked {
-			s.opMu.Unlock()
-		}
-	}()
-	s.ckptMu.Lock()
-	ckptLocked := true
-	defer func() {
-		if ckptLocked {
-			s.ckptMu.Unlock()
-		}
-	}()
-
+	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
+	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
 	readyCh := s.kernelReady
 	doneCh := s.runDone
@@ -633,6 +626,21 @@ func (s *Sandbox) checkpointStreamRun(
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+
+	s.opMu.Lock()
+	opLocked := true
+	defer func() {
+		if opLocked {
+			s.opMu.Unlock()
+		}
+	}()
+	s.ckptMu.Lock()
+	ckptLocked := true
+	defer func() {
+		if ckptLocked {
+			s.ckptMu.Unlock()
+		}
+	}()
 
 	s.mu.Lock()
 	k := s.activeKernel

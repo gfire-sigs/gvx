@@ -313,6 +313,13 @@ func (s *Sandbox) activeKernelChecked(ctx context.Context) (*kernel.Kernel, *ker
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
 	}
+	return s.activeKernelNow()
+}
+
+// activeKernelNow returns the currently active kernel without waiting on
+// kernelReady. Callers holding s.opMu must use this after waiting on
+// kernelReady beforehand to avoid AB-BA deadlocks with executeActiveKernel.
+func (s *Sandbox) activeKernelNow() (*kernel.Kernel, *kernel.ThreadGroup, error) {
 	s.mu.Lock()
 	k := s.activeKernel
 	s.mu.Unlock()

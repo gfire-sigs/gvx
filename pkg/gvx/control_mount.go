@@ -167,14 +167,18 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		kind = "tmpfs"
 	}
 
-	k, _, err := s.activeKernelChecked(ctx)
-	if err != nil {
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
 		return err
 	}
 	s.opMu.RLock()
 	defer s.opMu.RUnlock()
 	s.mountOpMu.Lock()
 	defer s.mountOpMu.Unlock()
+
+	k, _, err := s.activeKernelNow()
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	locked := s.lockdown.Applied
@@ -390,14 +394,18 @@ func (s *Sandbox) handleMountRemount(ctx context.Context, stream *control.Stream
 		return err
 	}
 	target := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(req.Target), "/"))
-	k, _, err := s.activeKernelChecked(ctx)
-	if err != nil {
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
 		return err
 	}
 	s.opMu.RLock()
 	defer s.opMu.RUnlock()
 	s.mountOpMu.Lock()
 	defer s.mountOpMu.Unlock()
+
+	k, _, err := s.activeKernelNow()
+	if err != nil {
+		return err
+	}
 
 	var (
 		matched control.MountInfo
@@ -476,14 +484,18 @@ func (s *Sandbox) handleMountRemove(ctx context.Context, stream *control.Stream,
 	if err := validateGuestPath(target); err != nil {
 		return control.NewError(control.CodeInvalidArgument, err.Error())
 	}
-	k, _, err := s.activeKernelChecked(ctx)
-	if err != nil {
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
 		return err
 	}
 	s.opMu.RLock()
 	defer s.opMu.RUnlock()
 	s.mountOpMu.Lock()
 	defer s.mountOpMu.Unlock()
+
+	k, _, err := s.activeKernelNow()
+	if err != nil {
+		return err
+	}
 
 	sctx := k.SupervisorContext()
 	root, mntns, err := s.guestRoot(sctx, k)
@@ -827,8 +839,7 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		return control.NewError(control.CodeInvalidArgument, err.Error())
 	}
 
-	k, _, err := s.activeKernelChecked(ctx)
-	if err != nil {
+	if _, _, err := s.activeKernelChecked(ctx); err != nil {
 		return err
 	}
 
@@ -851,6 +862,11 @@ func (s *Sandbox) handleMountServe(ctx context.Context, stream *control.Stream, 
 		}
 	}
 	defer unlockMount()
+
+	k, _, err := s.activeKernelNow()
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	dupStatic := s.mountTargetExistsLocked(target)

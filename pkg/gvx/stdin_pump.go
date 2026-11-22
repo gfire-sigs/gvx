@@ -63,7 +63,7 @@ func (p *stdinPump) read(ctx context.Context, dst usermem.IOSequence) (int64, er
 	if p.err != nil {
 		err := p.err
 		p.mu.Unlock()
-		return 0, err
+		return 0, translateHostReadErr(err)
 	}
 	p.startReadLocked(int(min(dst.NumBytes(), maxStdinChunk)))
 	p.mu.Unlock()
