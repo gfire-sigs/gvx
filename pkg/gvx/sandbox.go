@@ -19,13 +19,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/fd"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
 	"z.gfire.dev/gvx/pkg/hostlockdown"
@@ -79,9 +83,15 @@ type Sandbox struct {
 	hostCARoots [][]byte
 	// forwards holds the port forwards that initNetstack bound, in rule order:
 	// the caller list, then the ports that PublishAll added.
-	forwards          []PortForward
-	ckptFiles         *checkpointBundleFiles
+	forwards     []PortForward
+	ckptFiles    *checkpointBundleFiles
+	cleanCkptDir string
+	absCkptDir   string
+	// Lock order: opMu -> mountOpMu / ckptMu -> resourceMu -> mu -> execMu / rpcMountsMu.
+	opMu              sync.RWMutex
+	mountOpMu         sync.Mutex
 	ckptMu            sync.Mutex
+	resourceMu        sync.Mutex
 	kernelReady       chan struct{}
 	kernelReadyOnce   sync.Once
 	runDone           chan struct{}
@@ -92,8 +102,62 @@ type Sandbox struct {
 	restoredKernel    *kernel.Kernel
 	restoredStdio     *restoreStdioCollector
 	detachDebugLog    func()
+	startedAt         time.Time
+	events            *eventHub
+	controlSrv        *control.Server
+	execMu            sync.Mutex
+	execReserved      int
+	execSessions      map[int32]*execSession
+	nextStdioMinor    atomic.Uint32
+	userPaused        bool
+	userPauseQuiesced bool
+	liveMemoryBytes   atomic.Int64
+	liveMemoryLimit   atomic.Uint64
+	liveMemoryIntNS   atomic.Int64
+	liveMemoryWake    chan struct{}
+	rpcMountsMu       sync.Mutex
+	rpcMounts         map[string]*rpcMountEntry
 	closed            bool
+	closeDone         chan struct{}
 	closeErr          error
+}
+
+func (s *Sandbox) controlListener() net.Listener {
+	if s.cfg.ControlListener != nil {
+		return s.cfg.ControlListener
+	}
+	return s.cfg.CheckpointListener
+}
+
+func (s *Sandbox) initControlState() {
+	s.startedAt = time.Now()
+	s.events = newEventHub()
+	s.execSessions = make(map[int32]*execSession)
+	s.nextStdioMinor.Store(3)
+	s.liveMemoryBytes.Store(s.cfg.Resources.MemoryBytes)
+	s.liveMemoryWake = make(chan struct{}, 1)
+	s.rpcMounts = make(map[string]*rpcMountEntry)
+	if dir := strings.TrimSpace(s.cfg.CheckpointDir); dir != "" {
+		s.cleanCkptDir = filepath.Clean(dir)
+		if abs, err := filepath.Abs(s.cleanCkptDir); err == nil {
+			s.absCkptDir = filepath.Clean(abs)
+		}
+	}
+}
+
+func (s *Sandbox) validateCheckpointDir(reqDir string) error {
+	if s.cleanCkptDir == "" {
+		return control.NewError(control.CodeInvalidArgument, "sandbox was started without -checkpoint-dir")
+	}
+	trimmed := strings.TrimSpace(reqDir)
+	if trimmed == "" {
+		return nil
+	}
+	reqClean := filepath.Clean(trimmed)
+	if reqClean == s.cleanCkptDir || (s.absCkptDir != "" && reqClean == s.absCkptDir) {
+		return nil
+	}
+	return control.NewErrorf(control.CodeInvalidArgument, "checkpoint directory %q does not match pre-opened -checkpoint-dir %q", trimmed, s.cleanCkptDir)
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
@@ -106,7 +170,14 @@ type Sandbox struct {
 // fails, it closes the listener.
 func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
-	if ln := cfg.CheckpointListener; ln != nil {
+	if ln := cfg.ControlListener; ln != nil {
+		defer func() {
+			if retErr != nil {
+				_ = ln.Close()
+			}
+		}()
+	}
+	if ln := cfg.CheckpointListener; ln != nil && ln != cfg.ControlListener {
 		defer func() {
 			if retErr != nil {
 				_ = ln.Close()
@@ -124,6 +195,7 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 		runDone:        make(chan struct{}),
 		detachDebugLog: attachDebugLogSink(cfg.DebugLog),
 	}
+	sb.initControlState()
 	cleanup := func(cause error) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
@@ -309,11 +381,11 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 			}
 		}
 	}
-	if s.cfg.AutoPublishPorts && s.cfg.NetworkMode == NetModeNAT {
+	if (s.cfg.AutoPublishPorts || s.cfg.DynamicPorts) && s.cfg.NetworkMode == NetModeNAT {
 		opts.AllowLoopbackBind = true
 		opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
 	}
-	if s.cfg.CheckpointListener != nil {
+	if s.controlListener() != nil {
 		opts.PreboundListeners++
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {
@@ -499,8 +571,8 @@ type LimitReport struct {
 	Memory bool
 	// CPUCount is true when the guest sees only the CPUs of the quota.
 	CPUCount bool
-	// CPUTime is true when the host OS caps the CPU time of the sandbox. Only
-	// Windows does, and only when the lockdown is on.
+	// CPUTime is true when the sandbox caps guest CPU time via the Sentry root
+	// CPU bandwidth throttler or the host OS.
 	CPUTime bool
 }
 
@@ -510,7 +582,7 @@ func (s *Sandbox) Limits() LimitReport {
 	return LimitReport{
 		Memory:   s.cfg.Resources.MemoryBytes > 0,
 		CPUCount: s.cfg.Resources.CPUMillis > 0,
-		CPUTime:  s.lockdown.CPUQuotaEnforced,
+		CPUTime:  s.cfg.Resources.CPUMillis > 0 || s.lockdown.CPUQuotaEnforced,
 	}
 }
 
@@ -548,11 +620,24 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 // the hypervisor platform.
 func (s *Sandbox) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
-		return s.closeErr
+		done := s.closeDone
+		s.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		s.mu.Lock()
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
 	}
 	s.closed = true
+	done := make(chan struct{})
+	s.closeDone = done
+	defer func() {
+		s.mu.Unlock()
+		close(done)
+	}()
 
 	if s.restoredKernel != nil {
 		if tk := s.restoredKernel.Timekeeper(); tk != nil {
@@ -576,8 +661,28 @@ func (s *Sandbox) Close() error {
 		s.ckptFiles = nil
 	}
 
+	if s.controlSrv != nil {
+		srv := s.controlSrv
+		s.controlSrv = nil
+		s.mu.Unlock()
+		_ = srv.Close()
+		s.mu.Lock()
+	}
+
+	s.closeRPCMounts()
+
+	if s.cfg.ControlListener != nil {
+		if err := s.cfg.ControlListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+		if s.cfg.CheckpointListener == s.cfg.ControlListener {
+			s.cfg.CheckpointListener = nil
+		}
+		s.cfg.ControlListener = nil
+	}
+
 	if s.cfg.CheckpointListener != nil {
-		if err := s.cfg.CheckpointListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		if err := s.cfg.CheckpointListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, err)
 		}
 		s.cfg.CheckpointListener = nil

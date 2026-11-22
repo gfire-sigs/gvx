@@ -14,6 +14,8 @@
 
 package kernel
 
+import "time"
+
 // CPUBandwidthProvider is the optional interface of a Cgroup2 node that has
 // a CPU budget. The node returns the budget of its nearest ancestor with the
 // cpu controller, or nil when it has none.
@@ -96,14 +98,23 @@ func (k *Kernel) accountCPUBandwidth(all []*Task) {
 			continue
 		}
 		runs = appendBandwidthRuns(runs, t.cpuBandwidth(), m.billedAt, cur-m.billed)
+		if rootBW := counters.sandboxRoot.Load(); rootBW != nil && rootBW.limited() {
+			runs = append(runs, bandwidthRun{node: rootBW, bandwidthSpan: bandwidthSpan{from: m.billedAt, ns: cur - m.billed}})
+		}
 		m.billed, m.billedAt = cur, now
 	}
 	chargeBandwidthRuns(now, runs)
 	if counters.throttled.Load() == 0 {
 		return
 	}
+	rootBW := counters.sandboxRoot.Load()
+	rootThrottled := rootBW != nil && rootBW.Throttled()
 	for _, t := range all {
 		if t.TaskGoroutineState() != TaskGoroutineRunningApp {
+			continue
+		}
+		if rootThrottled {
+			t.interrupt()
 			continue
 		}
 		if bw := t.cpuBandwidth(); bw != nil && bw.Throttled() {
@@ -126,6 +137,13 @@ func (t *Task) WakeCPUBandwidth() {
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) throttleCPUBandwidth() bool {
+	if rootBW := t.bandwidthCounters().sandboxRoot.Load(); rootBW != nil {
+		if wake := rootBW.throttleWake(); wake != nil {
+			t.Block(wake)
+			t.cpuMeter.skipToApp = true
+			return true
+		}
+	}
 	bw := t.cpuBandwidth()
 	if bw == nil {
 		return false
@@ -137,4 +155,73 @@ func (t *Task) throttleCPUBandwidth() bool {
 	t.Block(wake)
 	t.cpuMeter.skipToApp = true
 	return true
+}
+
+// SetSandboxCPULimit configures the host-managed per-sandbox CPU bandwidth cap
+// on k. A negative quota removes the cap. Guest cgroup writes cannot bypass or
+// raise this cap.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
+func (k *Kernel) SetSandboxCPULimit(quota, period time.Duration) {
+	if k == nil {
+		return
+	}
+	e := k.ensureExtState()
+	e.mu.Lock()
+	bw := e.sandboxCPU
+	if bw == nil {
+		if quota < 0 {
+			e.mu.Unlock()
+			return
+		}
+		bw = NewCPUBandwidth(nil)
+		e.sandboxCPU = bw
+		bandwidthCountersOf(k).sandboxRoot.Store(bw)
+	}
+	e.mu.Unlock()
+	bw.SetLimits(k, quota, period)
+}
+
+// SandboxCPULimit returns the host-managed per-sandbox CPU quota and period.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
+func (k *Kernel) SandboxCPULimit() (quota, period time.Duration, limited bool) {
+	if k == nil {
+		return -1, 0, false
+	}
+	bw := bandwidthCountersOf(k).sandboxRoot.Load()
+	if bw == nil {
+		return -1, 0, false
+	}
+	return bw.Limit()
+}
+
+// SandboxCPUBandwidthStats returns throttling counters for the per-sandbox CPU
+// cap on k.
+func (k *Kernel) SandboxCPUBandwidthStats() CPUBandwidthStats {
+	if k == nil {
+		return CPUBandwidthStats{}
+	}
+	bw := bandwidthCountersOf(k).sandboxRoot.Load()
+	if bw == nil {
+		return CPUBandwidthStats{}
+	}
+	return bw.Stats()
+}
+
+// ActivateRestoredSandboxCPUBandwidth rebases and activates any saved
+// per-sandbox CPU bandwidth cap after state.Load completes.
+//
+// +checklocksexclude:k.checkpointMu
+// +checklocksexclude:k.CheckpointWait.mu
+func (k *Kernel) ActivateRestoredSandboxCPUBandwidth(now int64) {
+	if k == nil {
+		return
+	}
+	bw := bandwidthCountersOf(k).sandboxRoot.Load()
+	if bw != nil {
+		bw.ActivateRestored(k, now)
+	}
 }

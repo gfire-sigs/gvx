@@ -15,6 +15,8 @@
 package gvx
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +36,14 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
+// ErrCheckpointExecActive reports that active exec sessions prevent checkpointing
+// unless CheckpointOptions.Force is set.
+var ErrCheckpointExecActive = errors.New("gvx: active exec sessions prevent checkpoint; pass Force to detach them")
+
+// ErrCheckpointRPCFSActive reports that an active client-served rpcfs mount
+// prevents checkpointing.
+var ErrCheckpointRPCFSActive = errors.New("gvx: unmount active rpcfs proxy mounts before checkpointing")
+
 const (
 	// CheckpointManifestVersion identifies the schema version of manifest.json.
 	CheckpointManifestVersion = 1
@@ -44,11 +54,13 @@ const (
 	checkpointPagesFileName     = "pages.img"
 )
 
-// CheckpointOptions configures a Sandbox.Checkpoint call.
+// CheckpointOptions configures a Sandbox.Checkpoint or CheckpointStream call.
 type CheckpointOptions struct {
 	// LeaveRunning resumes the sandbox after writing the checkpoint bundle when
 	// true. When false, Checkpoint stops the sandbox after saving.
 	LeaveRunning bool
+	// Force detaches and kills any active control exec sessions before saving.
+	Force bool
 }
 
 // AddrHoleEntry records one reserved guest virtual address range in a
@@ -244,29 +256,38 @@ func sandboxManifestMounts(mounts []sandboxMount) []ManifestMount {
 }
 
 func (s *Sandbox) buildCheckpointManifest() CheckpointManifest {
+	s.mu.Lock()
 	arch := s.cfg.Architecture
 	if arch == "" {
 		arch = runtime.GOARCH
 	}
+	layerDigests := append([]string(nil), s.layerDigests...)
+	hasRootVol := s.rootVolume != nil
+	mounts := sandboxManifestMounts(s.mounts)
+	netMode := s.cfg.NetworkMode
+	plat := s.plat
+	platName := s.platName
+	s.mu.Unlock()
 	return CheckpointManifest{
 		Version:          CheckpointManifestVersion,
 		GOOS:             runtime.GOOS,
 		GOARCH:           runtime.GOARCH,
-		Platform:         s.platName,
+		Platform:         platName,
 		Arch:             arch,
-		UserAddressHoles: platformAddrHoles(s.plat),
-		LayerDigests:     append([]string(nil), s.layerDigests...),
-		RootVolume:       s.rootVolume != nil,
-		Mounts:           sandboxManifestMounts(s.mounts),
-		NetMode:          s.cfg.NetworkMode,
+		UserAddressHoles: platformAddrHoles(plat),
+		LayerDigests:     layerDigests,
+		RootVolume:       hasRootVol,
+		Mounts:           mounts,
+		NetMode:          netMode,
 		CreatedAt:        time.Now().UTC(),
 	}
 }
 
-// AcceptCheckpointConn accepts one connection from Config.CheckpointListener.
+// AcceptCheckpointConn accepts one connection from Config.ControlListener or
+// Config.CheckpointListener.
 func (s *Sandbox) AcceptCheckpointConn() (net.Conn, error) {
 	s.mu.Lock()
-	ln := s.cfg.CheckpointListener
+	ln := s.controlListener()
 	locked := s.lockdown.Applied
 	s.mu.Unlock()
 	if ln == nil {
@@ -333,14 +354,8 @@ func (s *Sandbox) snapshotEth0() *netbackend.Eth0Config {
 // resumes the sandbox after writing the bundle. When opts.LeaveRunning is
 // false, Checkpoint stops the guest kernel so Run returns cleanly.
 func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retErr error) {
-	s.ckptMu.Lock()
-	ckptLocked := true
-	defer func() {
-		if ckptLocked {
-			s.ckptMu.Unlock()
-		}
-	}()
-
+	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
+	// deadlocks with executeActiveKernel.
 	s.mu.Lock()
 	files := s.ckptFiles
 	readyCh := s.kernelReady
@@ -362,61 +377,104 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		return ctx.Err()
 	}
 
+	s.opMu.Lock()
+	opLocked := true
+	defer func() {
+		if opLocked {
+			s.opMu.Unlock()
+		}
+	}()
+	s.ckptMu.Lock()
+	ckptLocked := true
+	defer func() {
+		if ckptLocked {
+			s.ckptMu.Unlock()
+		}
+	}()
+
 	s.mu.Lock()
+	files = s.ckptFiles
 	k := s.activeKernel
 	dog := s.activeWatchdog
 	quiescers := s.saveQuiescersLocked()
+	alreadyPaused := s.userPaused
+	alreadyQuiesced := s.userPauseQuiesced
 	s.mu.Unlock()
+	if files == nil {
+		return fmt.Errorf("%w: Config.CheckpointDir must be set before New or Restore", ErrInvalidConfig)
+	}
 	if k == nil {
 		return errors.New("gvx: sandbox is not running")
+	}
+	if s.hasActiveRPCMounts() {
+		return ErrCheckpointRPCFSActive
+	}
+	if s.activeExecCount() > 0 {
+		if !opts.Force {
+			return ErrCheckpointExecActive
+		}
+		if alreadyPaused {
+			return fmt.Errorf("%w: cannot force-stop exec sessions while sandbox is paused", ErrCheckpointExecActive)
+		}
+		if err := s.forceStopExecSessions(ctx, k); err != nil {
+			return err
+		}
 	}
 
 	if err := files.rewindAndTruncate(); err != nil {
 		return err
 	}
 
-	if dog != nil {
-		dog.Stop()
+	if !alreadyPaused {
+		if dog != nil {
+			dog.Stop()
+		}
+		k.Pause()
 	}
-	k.Pause()
 	// Invariant: from here until the guest is resumed or killed, every
-	// return path undoes the pause, the watchdog stop, and the WireGuard
-	// quiesce. A bundle write or sync failure must not leave the kernel
-	// paused, because Run and Close would then block forever.
+	// return path restores the exact prior pause/quiesce/watchdog state.
 	paused := true
 	kCtx := k.SupervisorContext()
 	nicsBefore := s.guestNICCount()
+	quiescedHere := false
 	defer func() {
 		if !paused {
 			return
 		}
 		k.BeforeResume(kCtx)
-		// Kernel.SaveTo with resume=false removes the NICs of the guest
-		// Netstack and ends its connections, because the saved guest is not
-		// meant to continue. A failure after that point leaves a guest
-		// without a network, so the guest stops instead of resuming. A
-		// failure before it leaves the guest intact, and it resumes.
 		if retErr != nil && !opts.LeaveRunning && s.guestNICCount() < nicsBefore {
 			retErr = errors.Join(retErr, errors.New("gvx: the failed checkpoint removed the guest network configuration, so the guest was stopped"))
 			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			s.mu.Lock()
+			s.userPaused = false
+			s.userPauseQuiesced = false
+			s.mu.Unlock()
+			alreadyPaused = false
 		}
-		for _, q := range quiescers {
-			if err := q.ResumeAfterSave(); err != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("gvx: resume network backend after checkpoint: %w", err))
+		if quiescedHere {
+			for _, q := range quiescers {
+				if err := q.ResumeAfterSave(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("gvx: resume network backend after checkpoint: %w", err))
+				}
 			}
 		}
-		if dog != nil {
-			dog.Start()
+		if !alreadyPaused {
+			if dog != nil {
+				dog.Start()
+			}
+			k.Unpause()
 		}
-		k.Unpause()
 		k.OnCheckpointAttempt(retErr)
 	}()
 	if err := k.ReceiveTaskStatesChecked(); err != nil {
 		return fmt.Errorf("gvx: capture task states for checkpoint: %w", err)
 	}
 
-	for _, q := range quiescers {
-		q.QuiesceForSave()
+	if !alreadyQuiesced {
+		for _, q := range quiescers {
+			q.QuiesceForSave()
+		}
+		quiescedHere = true
 	}
 	eth0 := s.snapshotEth0()
 
@@ -446,7 +504,7 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	manifest := s.buildCheckpointManifest()
 	manifest.Eth0 = eth0
 	hostRAM, _ := hostMemory()
-	manifest.MemoryLimitBytes, _ = effectiveMemoryLimit(s.cfg.Resources.MemoryBytes, hostRAM, s.cfg.Tuning)
+	manifest.MemoryLimitBytes, _ = effectiveMemoryLimit(s.liveMemoryBytes.Load(), hostRAM, s.cfg.Tuning)
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("gvx: marshal checkpoint manifest: %w", err)
@@ -459,14 +517,22 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 		return err
 	}
 
+	s.emitEvent("lifecycle", "checkpoint", map[string]string{
+		"leave_running": fmt.Sprintf("%t", opts.LeaveRunning),
+	})
+
 	if opts.LeaveRunning {
 		k.SetSaveSuccess(false)
-		// The deferred rollback resumes the guest and reports success.
+		// The deferred rollback restores the pre-checkpoint running or paused state.
 		return nil
 	}
 
 	paused = false
 	s.checkpointStopped.Store(true)
+	s.mu.Lock()
+	s.userPaused = false
+	s.userPauseQuiesced = false
+	s.mu.Unlock()
 	k.SetSaveSuccess(false)
 	k.Kill(linux.WaitStatusExit(0))
 	if dog != nil {
@@ -477,6 +543,263 @@ func (s *Sandbox) Checkpoint(ctx context.Context, opts CheckpointOptions) (retEr
 	s.clearActiveKernel()
 	ckptLocked = false
 	s.ckptMu.Unlock()
+	opLocked = false
+	s.opMu.Unlock()
+	select {
+	case <-doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type bufWriteCloser struct {
+	bytes.Buffer
+}
+
+func (*bufWriteCloser) Close() error { return nil }
+
+// CheckpointStream captures a complete checkpoint bundle in memory (manifest.json,
+// state.img, pages.meta, pages.img) without opening host files under lockdown,
+// then writes it as a tar archive to dst.
+func (s *Sandbox) CheckpointStream(ctx context.Context, opts CheckpointOptions, dst io.Writer) error {
+	return s.checkpointStreamRun(ctx, opts, func(manifestBytes, stateBytes, pagesMetaBytes, pagesBytes []byte) error {
+		return writeCheckpointTar(dst, manifestBytes, stateBytes, pagesMetaBytes, pagesBytes)
+	})
+}
+
+func writeCheckpointTar(dst io.Writer, manifestBytes, stateBytes, pagesMetaBytes, pagesBytes []byte) error {
+	tw := tar.NewWriter(dst)
+	now := time.Now().UTC()
+	entries := []struct {
+		name string
+		data []byte
+	}{
+		{checkpointManifestFileName, manifestBytes},
+		{checkpointStateFileName, stateBytes},
+		{checkpointPagesMetaFileName, pagesMetaBytes},
+		{checkpointPagesFileName, pagesBytes},
+	}
+	for _, entry := range entries {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:    entry.name,
+			Mode:    0o600,
+			Size:    int64(len(entry.data)),
+			ModTime: now,
+		}); err != nil {
+			return fmt.Errorf("gvx: write tar header %s: %w", entry.name, err)
+		}
+		if _, err := tw.Write(entry.data); err != nil {
+			return fmt.Errorf("gvx: write tar body %s: %w", entry.name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("gvx: close checkpoint tar stream: %w", err)
+	}
+	return nil
+}
+
+// checkpointStreamRun captures the in-memory checkpoint bundle and invokes
+// streamFn. When opts.LeaveRunning is true, the guest resumes before streamFn
+// transfers bytes. When opts.LeaveRunning is false, the guest remains paused
+// until streamFn completes so Sandbox.Run does not exit and close the control
+// server mid-transfer.
+func (s *Sandbox) checkpointStreamRun(
+	ctx context.Context,
+	opts CheckpointOptions,
+	streamFn func(manifestBytes, stateBytes, pagesMetaBytes, pagesBytes []byte) error,
+) (retErr error) {
+	// Wait for kernel startup before acquiring s.opMu/s.ckptMu to avoid AB-BA
+	// deadlocks with executeActiveKernel.
+	s.mu.Lock()
+	readyCh := s.kernelReady
+	doneCh := s.runDone
+	s.mu.Unlock()
+	if readyCh == nil {
+		return errors.New("gvx: sandbox is not initialized for checkpoint")
+	}
+
+	select {
+	case <-readyCh:
+	case <-doneCh:
+		return errors.New("gvx: sandbox exited before Checkpoint started")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	s.opMu.Lock()
+	opLocked := true
+	defer func() {
+		if opLocked {
+			s.opMu.Unlock()
+		}
+	}()
+	s.ckptMu.Lock()
+	ckptLocked := true
+	defer func() {
+		if ckptLocked {
+			s.ckptMu.Unlock()
+		}
+	}()
+
+	s.mu.Lock()
+	k := s.activeKernel
+	dog := s.activeWatchdog
+	quiescers := s.saveQuiescersLocked()
+	alreadyPaused := s.userPaused
+	alreadyQuiesced := s.userPauseQuiesced
+	s.mu.Unlock()
+	if k == nil {
+		return errors.New("gvx: sandbox is not running")
+	}
+	if s.hasActiveRPCMounts() {
+		return ErrCheckpointRPCFSActive
+	}
+	if s.activeExecCount() > 0 {
+		if !opts.Force {
+			return ErrCheckpointExecActive
+		}
+		if alreadyPaused {
+			return fmt.Errorf("%w: cannot force-stop exec sessions while sandbox is paused", ErrCheckpointExecActive)
+		}
+		if err := s.forceStopExecSessions(ctx, k); err != nil {
+			return err
+		}
+	}
+
+	if !alreadyPaused {
+		if dog != nil {
+			dog.Stop()
+		}
+		k.Pause()
+	}
+	paused := true
+	kCtx := k.SupervisorContext()
+	nicsBefore := s.guestNICCount()
+	quiescedHere := false
+	resumeOrRestore := func(err error) error {
+		if !paused {
+			return err
+		}
+		paused = false
+		k.BeforeResume(kCtx)
+		if err != nil && !opts.LeaveRunning && s.guestNICCount() < nicsBefore {
+			err = errors.Join(err, errors.New("gvx: the failed checkpoint removed the guest network configuration, so the guest was stopped"))
+			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			s.mu.Lock()
+			s.userPaused = false
+			s.userPauseQuiesced = false
+			s.mu.Unlock()
+			alreadyPaused = false
+		}
+		if quiescedHere {
+			for _, q := range quiescers {
+				if rErr := q.ResumeAfterSave(); rErr != nil {
+					err = errors.Join(err, fmt.Errorf("gvx: resume network backend after checkpoint: %w", rErr))
+				}
+			}
+		}
+		if !alreadyPaused {
+			if dog != nil {
+				dog.Start()
+			}
+			k.Unpause()
+		}
+		k.OnCheckpointAttempt(err)
+		return err
+	}
+	defer func() {
+		if paused {
+			retErr = resumeOrRestore(retErr)
+		}
+	}()
+
+	if err := k.ReceiveTaskStatesChecked(); err != nil {
+		return fmt.Errorf("gvx: capture task states for checkpoint: %w", err)
+	}
+	if !alreadyQuiesced {
+		for _, q := range quiescers {
+			q.QuiesceForSave()
+		}
+		quiescedHere = true
+	}
+	eth0 := s.snapshotEth0()
+
+	var stateBuf, pagesMetaBuf, pagesBuf bufWriteCloser
+	stateWriter := stateio.NewBufioWriteCloser(&stateBuf)
+	pagesMetaWriter := stateio.NewBufioWriteCloser(&pagesMetaBuf)
+	pagesWriter := stateio.NewIOWriter(&pagesBuf, 256<<10, 64, 4)
+
+	if saveErr := k.SaveTo(
+		kCtx,
+		stateWriter,
+		pagesMetaWriter,
+		pagesWriter,
+		true,
+		opts.LeaveRunning,
+		nil,
+		vfs.PrepareSaveOptions{ValidateMetadata: true},
+		nil,
+	); saveErr != nil {
+		return fmt.Errorf("gvx: save kernel state: %w", saveErr)
+	}
+
+	manifest := s.buildCheckpointManifest()
+	manifest.Eth0 = eth0
+	hostRAM, _ := hostMemory()
+	s.mu.Lock()
+	curTune := s.cfg.Tuning
+	s.mu.Unlock()
+	manifest.MemoryLimitBytes, _ = effectiveMemoryLimit(s.liveMemoryBytes.Load(), hostRAM, curTune)
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gvx: marshal checkpoint manifest: %w", err)
+	}
+	manifestBytes = append(manifestBytes, '\n')
+
+	s.emitEvent("lifecycle", "checkpoint", map[string]string{
+		"leave_running": fmt.Sprintf("%t", opts.LeaveRunning),
+		"stream":        "true",
+	})
+
+	if opts.LeaveRunning {
+		k.SetSaveSuccess(false)
+		if err := resumeOrRestore(nil); err != nil {
+			return err
+		}
+		ckptLocked = false
+		s.ckptMu.Unlock()
+		opLocked = false
+		s.opMu.Unlock()
+		return streamFn(manifestBytes, stateBuf.Bytes(), pagesMetaBuf.Bytes(), pagesBuf.Bytes())
+	}
+
+	// Keep the sandbox paused until the caller finishes streaming the bundle so
+	// Run() cannot exit and close the control server mid-transfer.
+	streamErr := streamFn(manifestBytes, stateBuf.Bytes(), pagesMetaBuf.Bytes(), pagesBuf.Bytes())
+
+	paused = false
+	s.checkpointStopped.Store(true)
+	s.mu.Lock()
+	s.userPaused = false
+	s.userPauseQuiesced = false
+	s.mu.Unlock()
+	k.SetSaveSuccess(false)
+	k.Kill(linux.WaitStatusExit(0))
+	if dog != nil {
+		dog.Start()
+	}
+	k.Unpause()
+	k.OnCheckpointAttempt(nil)
+	s.clearActiveKernel()
+	ckptLocked = false
+	s.ckptMu.Unlock()
+	opLocked = false
+	s.opMu.Unlock()
+
+	if streamErr != nil {
+		return streamErr
+	}
 	select {
 	case <-doneCh:
 		return nil

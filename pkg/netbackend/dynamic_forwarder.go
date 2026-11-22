@@ -94,6 +94,9 @@ func (pf *PortForwarder) EnableDynamicLoopback(opts DynamicForwardOptions) {
 	alreadyRunning := pf.dynEnabled && pf.started
 	pf.dynEnabled = true
 	pf.dynOpts = opts
+	if pf.dynPollCh == nil {
+		pf.dynPollCh = make(chan struct{}, 1)
+	}
 	if pf.dynTCP == nil {
 		pf.dynTCP = make(map[dynPortKey]*boundTCPForward)
 	}
@@ -119,6 +122,7 @@ func (pf *PortForwarder) runDynamicLoop() {
 	pf.reconcileDynamicPorts()
 	pf.mu.Lock()
 	interval := pf.dynOpts.PollInterval
+	pollCh := pf.dynPollCh
 	pf.mu.Unlock()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -126,6 +130,14 @@ func (pf *PortForwarder) runDynamicLoop() {
 		select {
 		case <-pf.ctx.Done():
 			return
+		case <-pollCh:
+			pf.mu.Lock()
+			next := pf.dynOpts.PollInterval
+			pf.mu.Unlock()
+			if next > 0 && next != interval {
+				interval = next
+				ticker.Reset(interval)
+			}
 		case <-ticker.C:
 			pf.reconcileDynamicPorts()
 		}
@@ -161,12 +173,20 @@ func (pf *PortForwarder) reconcileDynamicPorts() {
 	}
 	s := pf.stack
 	opts := pf.dynOpts
-	staticKeys := make(map[dynPortKey]struct{}, len(pf.tcpList)+len(pf.udpList))
+	staticKeys := make(map[dynPortKey]struct{}, len(pf.tcpList)+len(pf.udpList)+len(pf.manualTCP)+len(pf.manualUDP))
 	for _, b := range pf.tcpList {
 		staticKeys[dynPortKey{proto: "tcp", port: b.rule.GuestPort}] = struct{}{}
 	}
 	for _, b := range pf.udpList {
 		staticKeys[dynPortKey{proto: "udp", port: b.rule.GuestPort}] = struct{}{}
+	}
+	for _, b := range pf.manualTCP {
+		staticKeys[dynPortKey{proto: "tcp", port: b.rule.GuestPort}] = struct{}{}
+		staticKeys[dynPortKey{proto: "tcp", port: b.rule.HostPort}] = struct{}{}
+	}
+	for _, b := range pf.manualUDP {
+		staticKeys[dynPortKey{proto: "udp", port: b.rule.GuestPort}] = struct{}{}
+		staticKeys[dynPortKey{proto: "udp", port: b.rule.HostPort}] = struct{}{}
 	}
 	pf.mu.Unlock()
 

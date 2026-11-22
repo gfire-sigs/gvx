@@ -52,11 +52,17 @@ func (d *stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dent
 	return &fd.vfsfd, nil
 }
 
-// openStdioFDs registers the stdio devices in vfsObj and returns the file
-// descriptions for stdin, stdout, and stderr. The device nodes live on a
-// private tmpfs that no mount namespace contains, so the guest sees the
-// streams only through its descriptor table.
+// openStdioFDs registers the PID 1 stdio devices at minors 0..2 in vfsObj and
+// returns the file descriptions for stdin, stdout, and stderr.
 func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, err error) {
+	fds, _, err = openStdioFDsAtMinor(ctx, vfsObj, creds, 0, in, out, errw, tty, pump)
+	return fds, err
+}
+
+// openStdioFDsAtMinor registers three stdio character devices at consecutive
+// minors starting at baseMinor and returns their file descriptions plus a
+// cleanup callback that unregisters those device slots.
+func openStdioFDsAtMinor(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, baseMinor uint32, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, unregister func(), err error) {
 	devs := [3]*stdioDevice{
 		{stream: stdioStreamStdin, reader: in, pump: pump},
 		{stream: stdioStreamStdout, writer: out},
@@ -77,18 +83,28 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 		}
 		flags = [3]uint32{linux.O_RDWR, linux.O_RDWR, linux.O_RDWR}
 	}
+	var registered []uint32
+	unregisterAll := func() {
+		for _, minor := range registered {
+			vfsObj.UnregisterDevice(vfs.CharDevice, stdioDeviceMajor, minor)
+		}
+	}
 	for i, dev := range devs {
 		if dev.mu == nil {
 			dev.mu = new(sync.Mutex)
 		}
-		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, uint32(i), dev, &vfs.RegisterDeviceOptions{}); err != nil {
-			return fds, fmt.Errorf("gvx: register the %s device: %w", names[i], err)
+		minor := baseMinor + uint32(i)
+		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, minor, dev, &vfs.RegisterDeviceOptions{}); err != nil {
+			unregisterAll()
+			return fds, nil, fmt.Errorf("gvx: register the %s device: %w", names[i], err)
 		}
+		registered = append(registered, minor)
 	}
 
 	fs, rootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(ctx, vfsObj, creds, "", vfs.GetFilesystemOptions{})
 	if err != nil {
-		return fds, fmt.Errorf("gvx: create the stdio device filesystem: %w", err)
+		unregisterAll()
+		return fds, nil, fmt.Errorf("gvx: create the stdio device filesystem: %w", err)
 	}
 	mnt := vfsObj.NewDisconnectedMount(fs, rootDentry, &vfs.MountOptions{})
 	fs.DecRef(ctx)
@@ -105,21 +121,22 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 				fds[i] = nil
 			}
 		}
+		unregisterAll()
 	}()
 	for i, name := range names {
 		pop := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(name)}
 		if err := vfsObj.MknodAt(ctx, creds, pop, &vfs.MknodOptions{
 			Mode:     linux.S_IFCHR | 0o666,
 			DevMajor: stdioDeviceMajor,
-			DevMinor: uint32(i),
+			DevMinor: baseMinor + uint32(i),
 		}); err != nil {
-			return fds, fmt.Errorf("gvx: create the %s device node: %w", name, err)
+			return fds, nil, fmt.Errorf("gvx: create the %s device node: %w", name, err)
 		}
 		fd, err := vfsObj.OpenAt(ctx, creds, pop, &vfs.OpenOptions{Flags: flags[i]})
 		if err != nil {
-			return fds, fmt.Errorf("gvx: open the %s device node: %w", name, err)
+			return fds, nil, fmt.Errorf("gvx: open the %s device node: %w", name, err)
 		}
 		fds[i] = fd
 	}
-	return fds, nil
+	return fds, unregisterAll, nil
 }

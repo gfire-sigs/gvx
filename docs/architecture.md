@@ -54,6 +54,7 @@ gvx/ (Fork of google/gvisor@go)
  ├── docs/
  │   ├── architecture.md                    # [NEW] Authoritative architecture and subsystem specifications
  │   ├── cli.md                             # [NEW] rungv CLI reference
+ │   ├── control-protocol.md                # [NEW] gvx-ctrl/2 framed control socket protocol specification
  │   ├── systrap-windows.md                 # [NEW] Windows systrap engine design
  │   ├── moonshots.md                       # [NEW] GPU acceleration proposal for browser and GUI guests
  │   ├── assets/                            # [NEW] D2 diagram sources and compiled SVGs
@@ -93,6 +94,7 @@ gvx/ (Fork of google/gvisor@go)
  │   │   ├── erofs_restore.go
  │   │   ├── kernel_runner.go
  │   │   ├── syscallfilter_linux.go
+ │   │   ├── control/                       # [NEW] gvx-ctrl/2 framed mux protocol, auth, and capability policy
  │   │   ├── hostcerts/                     # [NEW] Host root CA bundle collector and guest injector
  │   │   └── tuning/                        # [NEW] Typed runtime tuning registry
  │   ├── oci/                               # [NEW] Multi-arch OCI puller, cache, and Tar-to-EROFS compiler
@@ -137,7 +139,8 @@ gvx/ (Fork of google/gvisor@go)
  │           ├── chunkcache/                # [NEW] Shared 64 KiB page-chunk cache for hostfs and ext4lite
  │           ├── fsutilx/                   # [NEW] Shared VFS2 inode and dirent helpers
  │           ├── hostfs/                    # [NEW] Symlink-safe os.Root + .gvx_meta mount driver
- │           └── ext4lite/                  # [NEW] Single-file ext4 volume driver with JBD2 journal
+ │           ├── ext4lite/                  # [NEW] Single-file ext4 volume driver with JBD2 journal
+ │           └── rpcfs/                     # [NEW] Client-served proxy VFS driver for rungv mount serve
  └── e2e/                                   # [NEW] OS-agnostic black-box end-to-end test suite
 ```
 
@@ -151,8 +154,9 @@ Each package owns one architectural boundary. Top-down import directionality kee
 | `internal/gvxshim` | Owns shim bootstrap, local ttRPC control, state locking, and teardown. | Public containerd types, ttRPC, protobuf, and host OS APIs | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
 | `tools/shiminterop` | Exercises real containerd `2.1.5` ShimManager calls in an isolated Go module. | None | Root runtime, command, and internal packages |
 | `tools/gostateify` | Generates reflection-free `pkg/state` methods and verifies zero autogen drift. | `golang.org/x/tools/*` | `pkg/*` (production), `cmd/*`, `internal/*` |
-| `cmd/rungv` | Parses CLI commands in [`cli.md`](cli.md) for sandboxes, images, volumes, system diagnostics, checkpoint, restore, tuning, and shell completion. | `pkg/gvx`, `pkg/gvx/tuning`, `pkg/oci`, `pkg/netbackend` | `pkg/sentry/*`, `WinHvPlatform.dll` |
-| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, Sentry boot, checkpoint, and restore. | `pkg/gvx/{hostcerts,tuning}`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip`, `pkg/seccomp`, `runsc/boot/filter/config` | `cmd/*`, `internal/gvxshim` |
+| `cmd/rungv` | Parses CLI commands in [`cli.md`](cli.md) for sandboxes, control operations, images, volumes, system diagnostics, checkpoint, restore, tuning, and shell completion. | `pkg/gvx`, `pkg/gvx/{control,tuning}`, `pkg/oci`, `pkg/netbackend` | `pkg/sentry/*`, `WinHvPlatform.dll` |
+| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, Sentry boot, control server, checkpoint, and restore. | `pkg/gvx/{control,hostcerts,tuning}`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip`, `pkg/seccomp`, `runsc/boot/filter/config` | `cmd/*`, `internal/gvxshim` |
+| `pkg/gvx/control` | Implements the `gvx-ctrl/2` framed multiplexed control protocol, endpoint authentication, and capability filtering. | `internal/xsys/unix`, `golang.org/x/sys/windows`, `zstd` | `pkg/sentry/*`, `cmd/*`, `pkg/hostlockdown` |
 | `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests, caches layers, and compiles `.tar` streams into `.erofs` images. | `pkg/abi/linux`, `pkg/erofs`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
 | `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip`, `pkg/tcpip/link/wgtun`, `pkg/hostlockdown`, `pkg/gvx/tuning` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
 | `pkg/hostlockdown` | Confines the host process via Windows Tokens/JobObjects/brokers, macOS Seatbelt, or Linux Landlock. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
@@ -163,6 +167,7 @@ Each package owns one architectural boundary. Top-down import directionality kee
 | `pkg/sentry/platform/systrap` | Executes guest code via syscall patching, `sysmsg` shared memory, and isolated stubs on Linux and Windows. | `pkg/sentry/platform`, `pkg/sentry/platform/hvcommon`, `pkg/memutil`, `pkg/abi/linux`, `golang.org/x/arch/*` | `pkg/sentry/kernel`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf` |
 | `pkg/sentry/fsimpl/hostfs` | Mounts host workspaces via `os.Root`, `NtCreateFile`/`openat`, `chunkcache`, and `.gvx_meta`. | `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{chunkcache,fsutilx}`, `pkg/abi/linux`, `pkg/fd`, `pkg/hostlockdown`, `internal/xsys/unix` | `pkg/sentry/platform/*` |
 | `pkg/sentry/fsimpl/ext4lite` | Stores one named volume or writable rootfs upper layer in one pre-opened ext4 image file. | `pkg/sentry/vfs`, `pkg/sentry/blockdev`, `pkg/sentry/fsimpl/{chunkcache,fsutilx}`, `pkg/abi/linux`, `pkg/fd`, `internal/xsys/unix` | `pkg/sentry/platform/*`, `cmd/*` |
+| `pkg/sentry/fsimpl/rpcfs` | Exposes a client-served host directory inside the guest over a narrow RPC interface without host opens inside lockdown. | `pkg/sentry/vfs`, `pkg/abi/linux`, `pkg/errors/linuxerr`, `pkg/usermem` | `pkg/gvx/*`, `pkg/sentry/platform/*`, `pkg/hostlockdown` |
 | `pkg/sync`, `pkg/memutil`, `pkg/fd` | Provide host futexes, shared memory views, and host handles across Linux, Windows, and macOS. | `golang.org/x/sys/windows`, `internal/xsys/unix` | `pkg/sentry/*` |
 
 `tools/upstream` enforces this table in `boundaries.go` (`VerifyBoundaries`). Sentry foundation packages such as `pkg/context`, `pkg/hostarch`, `pkg/usermem`, and `pkg/sentry/memmap` appear in every platform and VFS interface, so platform and VFS packages import them directly. Every other cross-boundary import requires an explicit reason-annotated exception in `boundaries.go`.
@@ -173,7 +178,7 @@ Each package owns one architectural boundary. Top-down import directionality kee
 
 | Isolation Tier | File Paths | Upstream Conflict Rate | Maintenance Mechanism |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths (`file_mask.txt` omits unshipped upstream directories). |
+| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/ipset/`, `pkg/tcpip/link/{vxlan,wgtun}/`, `pkg/hostlockdown/`, `pkg/sentry/socket/netlink/genetlink/`, `pkg/sentry/platform/{whpx,hvf,hvcommon}/`, `pkg/sentry/blockdev/`, `pkg/sentry/fsimpl/{chunkcache,fsutilx,hostfs,ext4lite,rpcfs}/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/{upstream,shiminterop,licenses,gvisorlint,androidprobe,gostateify}/`, `android/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths (`file_mask.txt` omits unshipped upstream directories). |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr,safecopy}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{arch,kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin,xplat}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*`, `pkg/tcpip/**_{windows,darwin,xplat}*`, `pkg/sentry/{inet,socket,fsimpl,devices}/**_*xplat*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and narrow cross-platform seams | `< 5.0%` (`< 4.2%` CI gate) | Re-applied by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after each upstream sync and recorded in `sync_manifest.json`. |
 
@@ -976,6 +981,7 @@ A guest must never see or change the state of another sandbox. State of the host
 | `tcpip.AsyncLoading`, `hostinet.restoredListeners`, `state.previousMetadata` | `tcpip`, `socket/hostinet`, `state` | Only `runsc` sets them, and `Sandbox.Checkpoint` and `gvx.Restore` leave them unset. |
 | `hostfs` budget of watched objects (`processWatches`) | `fsimpl/hostfs` | The descriptors belong to the host process. All workspaces draw from one budget (section 3.7). |
 | `seccompNotifyBusy`, `hostlockdown` state, `fd.installedBroker` and `fd.installedBinder`, `tuning` registry, the log target | `platform/systrap`, `pkg/hostlockdown`, `pkg/fd`, `pkg/gvx` | They describe a host fact, a one-way lockdown of the process, or a table that never changes. |
+| `log.SetLevel` (`debug.log_level` RPC) | `pkg/log`, `pkg/gvx` | The upstream Sentry logger uses one global verbosity threshold per host process. Only `CapDebug` callers can mutate it, and `rungv` runs one sandbox per process. |
 
 Each row of the next table is state that a guest can read or limit. Each kernel owns that state through one of three keys. To attach per-sandbox fields to upstream structs without Tier 3 struct conflicts, `internal/weakmap.Map` provides a 16-shard `weak.Pointer` side table with `runtime.AddCleanup` eviction. `stackExtState` (`pkg/tcpip/stack/ext_state_xplat.go`) and `kernelExtState` (`pkg/sentry/kernel/ext_state_xplat.go`) store per-stack FIB rules, `rp_filter`, conntrack limits, `/dev/kmsg` rings, and checkpoint snapshots, serialized through `saveExt` and `loadExt` hooks.
 

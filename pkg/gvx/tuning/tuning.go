@@ -77,6 +77,9 @@ type Entry struct {
 	Unit string
 	// Doc is one sentence that tells what the tunable does.
 	Doc string
+	// Mutable reports whether a running sandbox accepts updates to this key
+	// over the control socket without restarting.
+	Mutable bool
 }
 
 // registry is the table of tunables. Define fills it while the package
@@ -118,8 +121,21 @@ func defineDuration(name string, def, lo, hi time.Duration, doc string) Duration
 	return DurationKey{define(Entry{Name: name, Kind: Duration, Default: int64(def), Min: int64(lo), Max: int64(hi), Unit: "time", Doc: doc})}
 }
 
+func defineMutableDuration(name string, def, lo, hi time.Duration, doc string) DurationKey {
+	return DurationKey{define(Entry{Name: name, Kind: Duration, Default: int64(def), Min: int64(lo), Max: int64(hi), Unit: "time", Doc: doc, Mutable: true})}
+}
+
 func defineSize(name string, def, lo, hi int64, doc string) SizeKey {
 	return SizeKey{define(Entry{Name: name, Kind: Size, Default: def, Min: lo, Max: hi, Unit: "bytes", Doc: doc})}
+}
+
+// IsMutable reports whether name is a known tunable that supports live updates.
+func IsMutable(name string) bool {
+	i, ok := index[name]
+	if !ok {
+		return false
+	}
+	return registry[i].Mutable
 }
 
 // Entries returns a copy of the registry in table order.

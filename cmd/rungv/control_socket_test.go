@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx"
+	"z.gfire.dev/gvx/pkg/gvx/control"
 )
 
 // fakeCheckpointer records Checkpoint calls. When gate is not nil, Checkpoint
@@ -47,6 +48,33 @@ func (f *fakeCheckpointer) Checkpoint(_ context.Context, _ gvx.CheckpointOptions
 		<-f.gate
 	}
 	return nil
+}
+
+type fakeControlHandler struct {
+	cp *fakeCheckpointer
+}
+
+func (h *fakeControlHandler) HandleStream(ctx context.Context, stream *control.Stream, req control.RequestEnvelope, fds []int) error {
+	for _, fd := range fds {
+		_ = os.NewFile(uintptr(fd), "unused").Close()
+	}
+	if req.Method != control.MethodCheckpoint {
+		return control.NewError(control.CodeUnsupported, "unsupported method")
+	}
+	var p control.CheckpointRequest
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return control.NewError(control.CodeInvalidArgument, err.Error())
+		}
+	}
+	if err := h.cp.Checkpoint(ctx, gvx.CheckpointOptions{LeaveRunning: p.LeaveRunning, Force: p.Force}); err != nil {
+		return err
+	}
+	return stream.Reply(map[string]any{"dir": p.Dir, "ok": true})
+}
+
+func (h *fakeControlHandler) HandleLegacyCheckpoint(ctx context.Context, req control.LegacyCheckpointRequest) error {
+	return h.cp.Checkpoint(ctx, gvx.CheckpointOptions{LeaveRunning: req.LeaveRunning})
 }
 
 // isolateControlTokenDir points the user cache directory at a temporary
@@ -70,19 +98,41 @@ func freeLoopbackAddr(t *testing.T) string {
 	return addr
 }
 
-// startFakeControl binds a real control endpoint and serves it with cp.
-func startFakeControl(t *testing.T, raw string, cp checkpointer) (*controlEndpoint, func()) {
+// startFakeControl binds a real control.Server endpoint and serves it with cp.
+func startFakeControl(t *testing.T, raw string, cp *fakeCheckpointer, handshakeTimeout time.Duration) (*control.Endpoint, func()) {
 	t.Helper()
-	ep, err := listenCheckpointSocket(raw)
+	ep, err := control.Listen(raw, control.ListenOptions{})
 	if err != nil {
-		t.Fatalf("listenCheckpointSocket(%q): %v", raw, err)
+		t.Fatalf("control.Listen(%q): %v", raw, err)
 	}
 	t.Cleanup(ep.Cleanup)
-	absCkpt, err := filepath.Abs("ckpt")
-	if err != nil {
-		t.Fatal(err)
+
+	srv := control.NewServer(ep.Listener, control.ServerConfig{
+		SandboxID:        "fake-sbx",
+		Token:            ep.Token,
+		HandshakeTimeout: handshakeTimeout,
+		Capabilities:     []string{control.CapPing, control.CapCheckpointLocal},
+		Handler:          &fakeControlHandler{cp: cp},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = srv.Serve(ctx)
+	}()
+
+	var stopped atomic.Bool
+	stop := func() {
+		if !stopped.CompareAndSwap(false, true) {
+			return
+		}
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = srv.Shutdown(drainCtx)
+		drainCancel()
+		cancel()
+		_ = srv.Close()
+		<-serveDone
 	}
-	stop := serveCheckpointControl(context.Background(), cp, ep.Listener.Accept, ep.Listener, ep.Token, "ckpt", absCkpt)
 	t.Cleanup(stop)
 	return ep, stop
 }
@@ -97,13 +147,13 @@ func dialRaw(t *testing.T, network, address string) net.Conn {
 	return conn
 }
 
-func exchange(t *testing.T, conn net.Conn, req checkpointControlRequest) checkpointControlResponse {
+func exchangeLegacyV1(t *testing.T, conn net.Conn, req control.LegacyCheckpointRequest) control.LegacyCheckpointResponse {
 	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		t.Fatalf("send request: %v", err)
 	}
-	var resp checkpointControlResponse
+	var resp control.LegacyCheckpointResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		t.Fatalf("read response: %v", err)
 	}
@@ -114,12 +164,12 @@ func TestControlTCPRequiresTokenAndCLIClientSendsIt(t *testing.T) {
 	isolateControlTokenDir(t)
 	addr := freeLoopbackAddr(t)
 	cp := &fakeCheckpointer{}
-	ep, _ := startFakeControl(t, "tcp://"+addr, cp)
+	ep, _ := startFakeControl(t, "tcp://"+addr, cp, 0)
 
 	if ep.Token == "" {
 		t.Fatal("TCP control endpoint has no token")
 	}
-	tokenPath, err := controlTokenPath("tcp", addr)
+	tokenPath, err := control.DefaultTokenPath("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +182,7 @@ func TestControlTCPRequiresTokenAndCLIClientSendsIt(t *testing.T) {
 	}
 
 	for name, token := range map[string]string{"missing": "", "wrong": strings.Repeat("0", len(ep.Token))} {
-		resp := exchange(t, dialRaw(t, "tcp", addr), checkpointControlRequest{Dir: "ckpt", Token: token})
+		resp := exchangeLegacyV1(t, dialRaw(t, "tcp", addr), control.LegacyCheckpointRequest{Dir: "ckpt", Token: token})
 		if resp.OK || !strings.Contains(resp.Error, "unauthorized") {
 			t.Fatalf("%s token: response = %+v, want unauthorized", name, resp)
 		}
@@ -156,7 +206,7 @@ func TestControlTCPRequiresTokenAndCLIClientSendsIt(t *testing.T) {
 func TestControlUnixSocketTokenFollowsHostOS(t *testing.T) {
 	sockPath := filepath.Join(shortSocketDir(t), "c.sock")
 	cp := &fakeCheckpointer{}
-	ep, _ := startFakeControl(t, sockPath, cp)
+	ep, _ := startFakeControl(t, sockPath, cp, 0)
 
 	wantToken := runtime.GOOS == "windows"
 	if got := ep.Token != ""; got != wantToken {
@@ -171,11 +221,11 @@ func TestControlUnixSocketTokenFollowsHostOS(t *testing.T) {
 
 func TestControlStopClosesIdleConnection(t *testing.T) {
 	sockPath := filepath.Join(shortSocketDir(t), "idle.sock")
-	_, stop := startFakeControl(t, sockPath, &fakeCheckpointer{})
+	_, stop := startFakeControl(t, sockPath, &fakeCheckpointer{}, 0)
 
 	idle := dialRaw(t, "unix", sockPath)
-	// Let the server accept the connection and block in its request read.
-	time.Sleep(100 * time.Millisecond)
+	// Wait briefly for Accept before initiating shutdown.
+	time.Sleep(50 * time.Millisecond)
 
 	stopped := make(chan struct{})
 	go func() {
@@ -194,20 +244,16 @@ func TestControlStopClosesIdleConnection(t *testing.T) {
 }
 
 func TestControlRequestReadDeadlineFreesTheServer(t *testing.T) {
-	old := controlRequestTimeout
-	controlRequestTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { controlRequestTimeout = old })
-
 	sockPath := filepath.Join(shortSocketDir(t), "slow.sock")
 	cp := &fakeCheckpointer{}
-	ep, _ := startFakeControl(t, sockPath, cp)
+	ep, _ := startFakeControl(t, sockPath, cp, 200*time.Millisecond)
 
 	slow := dialRaw(t, "unix", sockPath)
 	if _, err := slow.Write([]byte(`{"dir":`)); err != nil {
 		t.Fatal(err)
 	}
 
-	resp := exchange(t, dialRaw(t, "unix", sockPath), checkpointControlRequest{Dir: "ckpt", Token: ep.Token})
+	resp := exchangeLegacyV1(t, dialRaw(t, "unix", sockPath), control.LegacyCheckpointRequest{Dir: "ckpt", Token: ep.Token})
 	if !resp.OK || cp.calls.Load() != 1 {
 		t.Fatalf("second client = %+v, Checkpoint calls = %d, want ok and 1", resp, cp.calls.Load())
 	}
@@ -216,11 +262,13 @@ func TestControlRequestReadDeadlineFreesTheServer(t *testing.T) {
 func TestControlStopKeepsInFlightResponse(t *testing.T) {
 	sockPath := filepath.Join(shortSocketDir(t), "busy.sock")
 	cp := &fakeCheckpointer{started: make(chan struct{}, 1), gate: make(chan struct{})}
-	ep, stop := startFakeControl(t, sockPath, cp)
+	ep, stop := startFakeControl(t, sockPath, cp, 0)
 
 	conn := dialRaw(t, "unix", sockPath)
-	respCh := make(chan checkpointControlResponse, 1)
-	go func() { respCh <- exchange(t, conn, checkpointControlRequest{Dir: "ckpt", Token: ep.Token}) }()
+	respCh := make(chan control.LegacyCheckpointResponse, 1)
+	go func() {
+		respCh <- exchangeLegacyV1(t, conn, control.LegacyCheckpointRequest{Dir: "ckpt", Token: ep.Token})
+	}()
 	select {
 	case <-cp.started:
 	case resp := <-respCh:
@@ -249,22 +297,22 @@ func TestControlStopKeepsInFlightResponse(t *testing.T) {
 func TestControlFailedBindKeepsTheTokenOfTheLiveListener(t *testing.T) {
 	isolateControlTokenDir(t)
 	addr := freeLoopbackAddr(t)
-	first, err := listenCheckpointSocket("tcp://" + addr)
+	first, err := control.Listen("tcp://"+addr, control.ListenOptions{})
 	if err != nil {
-		t.Fatalf("first listenCheckpointSocket: %v", err)
+		t.Fatalf("first control.Listen: %v", err)
 	}
 	defer first.Cleanup()
 	defer first.Listener.Close()
 
-	if second, err := listenCheckpointSocket("tcp://" + addr); err == nil {
+	if second, err := control.Listen("tcp://"+addr, control.ListenOptions{}); err == nil {
 		second.Cleanup()
 		_ = second.Listener.Close()
 		t.Fatal("a second listener bound the address of a live listener")
 	}
 
-	got, err := readControlToken("tcp", addr)
+	got, err := control.ReadToken("tcp", addr, "")
 	if err != nil {
-		t.Fatalf("readControlToken: %v", err)
+		t.Fatalf("control.ReadToken: %v", err)
 	}
 	if got != first.Token {
 		t.Fatalf("token file holds %q after a failed second bind, want the token %q of the live listener", got, first.Token)
