@@ -2,6 +2,12 @@
 
 This file records the observable changes of each `gvx` release. The release workflow `.github/workflows/release.yml` publishes the section of a tag as its release notes. A tag with a hyphen, such as `v0.1.0-rc.1`, publishes a pre-release.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Android `SCM_RIGHTS` volume attachment (`pkg/gvx`, `pkg/gvx/control`)**: Treat `runtime.GOOS == "android"` identically to `"linux"` for `mount.volume_attach` capability advertisement, `scm_rights` server negotiation, lockdown error reporting, and `XDG_RUNTIME_DIR` control socket directory resolution.
+
 ## [v0.20.10002026111600] - 2026-11-22
 
 This release adds the `gvx-ctrl/2` control protocol, runtime sandbox CLI commands, and the `rpcfs` virtual file system (#227). It also expands test coverage for control commands and fixes ten runtime defects (#229).

@@ -418,6 +418,17 @@ func TestUnixSocketSCMRightsAndLiveConflict(t *testing.T) {
 	}
 }
 
+func TestSupportsControlFDsPlatforms(t *testing.T) {
+	for _, goos := range []string{"linux", "android", "darwin"} {
+		if !supportsControlFDs(goos) {
+			t.Errorf("supportsControlFDs(%q) = false, want true", goos)
+		}
+	}
+	if supportsControlFDs("windows") {
+		t.Errorf("supportsControlFDs(windows) = true, want false")
+	}
+}
+
 func TestShutdownDrainsInFlightAndClosesIdle(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})

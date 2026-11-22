@@ -162,10 +162,17 @@ func (s *Sandbox) ControlCapabilities() []string {
 	if !locked {
 		avail = append(avail, control.CapMountBind)
 	}
-	if runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && (!locked || cfg.AllowVolumeAttach)) {
+	if supportsVolumeAttach(runtime.GOOS, locked, cfg.AllowVolumeAttach) {
 		avail = append(avail, control.CapMountVolumeAttach)
 	}
 	return control.FilterCapabilities(avail, cfg.ControlPolicy, cfg.ControlDisable)
+}
+
+func supportsVolumeAttach(goos string, locked, allowVolumeAttach bool) bool {
+	if goos == "darwin" {
+		return true
+	}
+	return (goos == "linux" || goos == "android") && (!locked || allowVolumeAttach)
 }
 
 // ServeControl serves gvx-ctrl/2 (and legacy v1 JSON checkpoint) requests on
