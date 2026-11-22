@@ -252,7 +252,7 @@ func (s *Server) serveConn(ctx context.Context, nc net.Conn) {
 	}
 
 	_, isUnix := nc.(*net.UnixConn)
-	allowFDs := s.cfg.AllowFDs && isUnix && (runtime.GOOS == "linux" || runtime.GOOS == "darwin")
+	allowFDs := s.cfg.AllowFDs && isUnix && supportsControlFDs(runtime.GOOS)
 	features := []string{"zstd"}
 	if allowFDs {
 		features = append(features, "scm_rights")
@@ -403,4 +403,8 @@ func (s *Server) serveLegacyV1(ctx context.Context, nc net.Conn, br *bufio.Reade
 		return
 	}
 	writeResp(true, "")
+}
+
+func supportsControlFDs(goos string) bool {
+	return goos == "linux" || goos == "android" || goos == "darwin"
 }

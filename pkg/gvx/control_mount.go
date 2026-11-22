@@ -248,8 +248,8 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 
 	case "volume":
 		if !slices.Contains(caps, control.CapMountVolumeAttach) {
-			if runtime.GOOS == "linux" && locked && !s.cfg.AllowVolumeAttach {
-				return control.NewError(control.CodeLockdownDenied, "live ext4lite volume attachment on Linux requires --allow-volume-attach")
+			if (runtime.GOOS == "linux" || runtime.GOOS == "android") && locked && !s.cfg.AllowVolumeAttach {
+				return control.NewError(control.CodeLockdownDenied, "live ext4lite volume attachment on Linux/Android requires --allow-volume-attach")
 			}
 			return control.NewError(control.CodeForbiddenByPolicy, "volume attachment is disabled by policy")
 		}

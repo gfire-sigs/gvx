@@ -135,7 +135,7 @@ func runtimeSocketDir() (string, error) {
 		}
 		return filepath.Join(base, "gvx", "run"), nil
 	}
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		if xdg := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); xdg != "" {
 			cand := filepath.Join(xdg, "gvx")
 			if len(cand)+40 <= maxUnixSunPath {
