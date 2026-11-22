@@ -371,7 +371,7 @@ Exit criterion: the Phase 0 gates and the confinement tests pass with the GPU op
 
 #### 9.3.1 Phase 2 Results on macOS (Reference Module)
 
-The macOS path completed steps 1 to 10. Step 11 is open: no run of the WebGL conformance subset exists. Step 12 has its jobs: `ci.yml` builds the renderer bundle, and `release.yml` builds and packages the renderer archive. No hosted runner has run either job yet. Steps 13 and 14 belong to Windows. The tables below record the gates on an Apple M1 Ultra with 64 GB running macOS 27.2.1, with the host lockdown on.
+The macOS path completed steps 1 to 11. Step 12 has its jobs: `ci.yml` builds the renderer bundle, and `release.yml` builds and packages the renderer archive. No hosted runner has run either job yet. Steps 13 and 14 belong to Windows. The tables below record the gates on an Apple M1 Ultra with 64 GB running macOS 27.2.1, with the host lockdown on.
 
 Each gate writes its record to the directory in `GVX_E2E_ARTIFACT_DIR`: `result.json`, the Sentry log, the list of refused ioctls, and the screenshots.
 
@@ -379,9 +379,11 @@ Each gate writes its record to the directory in `GVX_E2E_ARTIFACT_DIR`: `result.
 | :--- | :--- |
 | Renderer build and self-test | `scripts/gpu/build-renderer.sh`, then `--selftest` and `--selftest --mode=virgl` |
 | G1, guest Vulkan (record `g1/result.json`) | `GVX_E2E_GPU=1 GVX_GPU_RENDERER="$PWD/build/gpu/gvx-gpu-renderer/bin/gvx-gpu-renderer" go test -count=1 -exec "$PWD/scripts/codesign-exec.sh" ./e2e -run '^TestE2EGateGPUVulkan$' -v` |
+| Venus guard, create info that the renderer must survive (record `venus-guard/result.json`) | The same variables, with `-run '^TestE2EGateGPUVenusGuard$'` |
 | G3, guest OpenGL (record `g3/result.json`) | The same variables, with `-run '^TestE2EGateGPUOpenGL$'` |
 | Renderer kill (record `g1-kill/<mode>/result.json`) | The same variables, with `-run '^TestE2EGPURendererKill$'` (`venus` and `virgl` subtests) |
 | G2, Chromium WebGL (record `g2/result.json`) | The same variables, with `-timeout 60m -run '^TestE2EGateGPUChromium$'` (`venus` and `virgl` passes) |
+| WebGL conformance subset (record `webgl-cts/result.json`) | The same variables and `GVX_E2E_WEBGL_CTS=subset`, with `-timeout 240m -run '^TestE2EGateGPUWebGLCTS$'` |
 
 | Gate G1 (2026-11-20) | Result |
 | :--- | :--- |
@@ -433,7 +435,16 @@ The first `virgl` gate run exposed two `vrend` defects on Apple OpenGL 4.1 core.
 | Load page, SwiftShader in the same guest with `-gpu=off` | 7725 ms |
 | Refused ioctls | None |
 
-The `venus` pass of gate G2 takes 22.19 s for both browsers. The screenshots of the `venus` and `virgl` passes differ from the SwiftShader pass only in one pixel row on a texel boundary of the checker texture. The fragment-bound page meets the Phase 0 minimum of 3 times in both modes. No run has measured the draw-call-bound page or the WebGL conformance subset with the GPU option on.
+The `venus` pass of gate G2 takes 22.19 s for both browsers. The screenshots of the `venus` and `virgl` passes differ from the SwiftShader pass only in one pixel row on a texel boundary of the checker texture. The fragment-bound page meets the Phase 0 minimum of 3 times in both modes. No run has measured the draw-call-bound page.
+
+| WebGL conformance subset (2026-11-22) | SwiftShader (`-gpu=off`) | `venus` | `virgl` |
+| :--- | ---: | ---: | ---: |
+| Pages that pass, of 1009 | 1003 | 996 | 1003 |
+| Pages that fail, crash, or time out | 6 | 13 | 6 |
+| Wall time | 46 min | 34 min | 24 min |
+| Renderer losses, refused ioctls, KD-1 counts | 0 | 0 | 0 |
+
+The gate runs the KhronosGroup/WebGL tests of commit `714857a2`, which Chromium 159 pins. A page that passes on SwiftShader and does not pass on a GPU mode is a regression. Each of the 13 regressions has a line with a reason in `e2e/testdata/gpu/webgl-cts-expectations.txt`, so the gate passes. The first run found two renderer crashes and twelve guest context losses. The pinned patches `0003` to `0013` and a flush in the CGL callbacks fix them. The remaining `venus` regressions are KosmicKrisp 26.3.0 defects. The remaining `virgl` regressions are an Apple OpenGL 4.1 limit and three known guest stack defects.
 
 The first run of gate G2 used MoltenVK and failed. Section 5.3.1 gives the two causes and the change to KosmicKrisp.
 
@@ -470,7 +481,7 @@ These questions have no answer in this proposal. Each answer changes the scope o
 | Which renderer confinement on Windows keeps Direct3D 11 working? | Phase 2 |
 | Do the users need headed windows, or is headless rendering enough? | Before Phase 3 |
 | Does `venus` run on a macOS host? | Phase 2 (answered): yes, on KosmicKrisp with macOS 26 or later. On MoltenVK 1.4.2, Chromium gets no OpenGL ES 3.0 context. |
-| Does Chromium ANGLE on Vulkan render correct WebGL through `venus` on macOS? | Phase 2 (answered for the probe pages of gate G2): yes. The WebGL conformance subset is open. |
+| Does Chromium ANGLE on Vulkan render correct WebGL through `venus` on macOS? | Phase 2 (answered for the probe pages of gate G2): yes. The WebGL conformance subset passes with 13 expected regressions in `venus` and `virgl` together. |
 | Does Chromium use PRIME or `sync_file` import with `--enable-features=Vulkan`? | Phase 2 (open). The device refuses both today and logs the refusal. |
 | Can the host kernel limit the memory of the renderer process? | Phase 2 (open). The limit is a watchdog inside the renderer today. |
 | Does Metal work on a hosted macOS CI runner, so that the renderer tests can run in CI? | Phase 2 (open). `scripts/gpu/ci-metal-probe.sh` measures it on a runner through `diagnose.yml`. The repository variable `GVX_CI_METAL=1` then turns on the renderer tests of `ci.yml`. |
