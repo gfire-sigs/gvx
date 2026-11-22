@@ -17,6 +17,7 @@
 package control
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -50,15 +51,31 @@ func TestControlUnixSecurityAndErrnos(t *testing.T) {
 		t.Fatal("ensureSecureSocketDir accepted mode 0777 directory")
 	}
 
-	// Verify extended Unix errno translations.
+	// Verify Unix errno translations including specific errnos that also match os.Err*.
 	for _, tc := range []struct {
 		err  error
 		want int
 	}{
+		{nil, 0},
+		{os.ErrNotExist, LinuxENOENT},
+		{syscall.ENOENT, LinuxENOENT},
+		{os.ErrExist, LinuxEEXIST},
+		{syscall.EEXIST, LinuxEEXIST},
+		{os.ErrPermission, LinuxEACCES},
+		{syscall.EACCES, LinuxEACCES},
+		{syscall.EPERM, LinuxEPERM},
 		{syscall.EBUSY, LinuxEBUSY},
 		{syscall.EXDEV, LinuxEXDEV},
+		{syscall.ENOTDIR, LinuxENOTDIR},
+		{syscall.EISDIR, LinuxEISDIR},
 		{syscall.ENAMETOOLONG, LinuxENAMETOOLONG},
+		{syscall.ENOTEMPTY, LinuxENOTEMPTY},
 		{syscall.ELOOP, LinuxELOOP},
+		{syscall.EINVAL, LinuxEINVAL},
+		{syscall.EROFS, LinuxEROFS},
+		{syscall.ENOSPC, LinuxENOSPC},
+		{syscall.EOPNOTSUPP, LinuxEOPNOTSUPP},
+		{errors.New("unmapped unix error"), LinuxEIO},
 	} {
 		if got := HostErrorToLinuxErrno(tc.err); got != tc.want {
 			t.Errorf("HostErrorToLinuxErrno(%v) = %d, want %d", tc.err, got, tc.want)

@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,11 +33,15 @@ import (
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
 	"z.gfire.dev/gvx/pkg/gvx/control"
+	"z.gfire.dev/gvx/pkg/gvx/tuning"
 )
 
 func shortControlSocketPath(t *testing.T, filename string) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "gvx-t-")
+	if err != nil {
+		dir, err = os.MkdirTemp("", "gvxc-")
+	}
 	if err != nil {
 		dir = t.TempDir()
 	} else {
@@ -1137,5 +1142,465 @@ func TestControlEarlyRPCBeforeRunDoesNotDeadlock(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("early Exec RPC deadlocked with executeActiveKernel")
+	}
+}
+
+func TestMatchesEventFilters(t *testing.T) {
+	evLifecycle := control.SandboxEvent{Type: "lifecycle", Action: "pause", Attributes: map[string]string{"quiesce_net": "true"}}
+	evMount := control.SandboxEvent{Type: "mount", Action: "add", Attributes: map[string]string{"type": "tmpfs", "target": "/mnt/a"}}
+	evExec := control.SandboxEvent{Type: "exec", Action: "start"}
+
+	cases := []struct {
+		name    string
+		ev      control.SandboxEvent
+		filters []string
+		want    bool
+	}{
+		{"empty filters match all", evExec, nil, true},
+		{"whitespace-only filter matches all", evExec, []string{"  "}, true},
+		{"multiple same-key types OR match first", evLifecycle, []string{"type=lifecycle", "type=mount"}, true},
+		{"multiple same-key types OR match second", evMount, []string{"type=lifecycle", "type=mount"}, true},
+		{"multiple same-key types OR reject other", evExec, []string{"type=lifecycle", "type=mount"}, false},
+		{"distinct keys AND match", evMount, []string{"type=mount", "action=add", "target=/mnt/a"}, true},
+		{"distinct keys AND reject mismatch", evMount, []string{"type=mount", "action=remove"}, false},
+		{"bare token with whitespace matches type", evLifecycle, []string{" lifecycle ", "mount"}, true},
+		{"missing attribute fails", evLifecycle, []string{"target=/mnt/a"}, false},
+		{"malformed empty key rejected", evLifecycle, []string{"=foo"}, false},
+	}
+	for _, tc := range cases {
+		if got := matchesEventFilters(tc.ev, tc.filters); got != tc.want {
+			t.Errorf("%s: matchesEventFilters(%+v, %v) = %v, want %v", tc.name, tc.ev, tc.filters, got, tc.want)
+		}
+	}
+}
+
+// TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback verifies the
+// advanced control paths in one shared sandbox to minimize CI resource usage:
+//   - exec TTY allocation (TERM=xterm, ONLCR echo), exec.resize, and exec.signal
+//   - exec non-root users (nobody, 1000:1000) and --privileged=false cap drop
+//   - real live pids.max enforcement (guest SYS_clone EAGAIN and exec LIMIT_EXCEEDED)
+//   - proc.signal targeting a specific guest PID while PID 1 stays alive
+//   - sandbox.events multi-type OR filtering and kernel.log follow + clear
+//   - multi-spec port.add partial-failure rollback, replace=true, and --all-dynamic
+func TestControlExecTTYPermissionsPidsEventsDmesgAndPortRollback(t *testing.T) {
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestCatELF64: %v", err)
+	}
+	helloELF, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "exec-ok\n")
+	if err != nil {
+		t.Fatalf("BuildGuestELF64: %v", err)
+	}
+	forkELF, err := testelf.BuildGuestForkELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("BuildGuestForkELF64: %v", err)
+	}
+
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/hello", Data: helloELF, Mode: 0o755},
+		testimage.File{Name: "bin/fork", Data: forkELF, Mode: 0o755},
+		testimage.File{Name: "etc/seed.txt", Data: []byte("adv-ready\n"), Mode: 0o644},
+		testimage.File{Name: "etc/rootonly.txt", Data: []byte("secret-root\n"), Mode: 0o600},
+		testimage.File{Name: "etc/passwd", Data: []byte("root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n"), Mode: 0o644},
+		testimage.File{Name: "etc/group", Data: []byte("root:x:0:\nnogroup:x:65534:\n"), Mode: 0o644},
+		testimage.File{Name: "mnt/", Type: tar.TypeDir, Mode: 0o755},
+		testimage.File{Name: "mnt/evtmp/", Type: tar.TypeDir, Mode: 0o755},
+	)
+	if err != nil {
+		t.Fatalf("testimage.Tar: %v", err)
+	}
+	regURL := testimage.NewRegistry(t, "advctrl", "latest", testimage.Image{
+		Arch:       runtime.GOARCH,
+		Layers:     [][]byte{layer},
+		Entrypoint: []string{"/bin/cat"},
+		Cmd:        []string{"/etc/seed.txt", "/proc/self/fd/0"},
+	})
+
+	tv, err := (tuning.Values{}).Set("net.forward.max_dynamic_ports", "1")
+	if err != nil {
+		t.Fatalf("tuning.Set: %v", err)
+	}
+	rs := startControlTestSandbox(t, Config{
+		Name:            "ctrl-adv",
+		OCIImage:        "advctrl:latest",
+		RegistryBaseURL: regURL,
+		NetworkMode:     NetModeNAT,
+		DynamicPorts:    true,
+		Tuning:          tv,
+		Resources:       Resources{PidsLimit: 16},
+	})
+	rs.stdout.waitForSubstring(t, "adv-ready\n", 15*time.Second)
+	ctx := context.Background()
+
+	runExec := func(req control.ExecStartRequest) (string, control.ExecExitEvent) {
+		t.Helper()
+		st, err := rs.client.OpenStream(ctx, control.MethodExecStart, req)
+		if err != nil {
+			t.Fatalf("exec %v open: %v", req.Argv, err)
+		}
+		defer st.Close()
+		if err := st.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("exec %v wait: %v", req.Argv, err)
+		}
+		out, rErr := io.ReadAll(st.ChannelReader(ctx, control.ChannelStdout))
+		ev, eErr := st.RecvEvent(ctx)
+		if rErr != nil || eErr != nil || ev.Type != "exec.exit" {
+			t.Fatalf("exec %v result: out=%q rErr=%v ev=%+v eErr=%v", req.Argv, out, rErr, ev, eErr)
+		}
+		var exitEv control.ExecExitEvent
+		if err := json.Unmarshal(ev.Data, &exitEv); err != nil {
+			t.Fatalf("exec %v decode exit: %v", req.Argv, err)
+		}
+		return string(out), exitEv
+	}
+
+	// 1. Exec TTY: TERM=xterm in environ, ONLCR echo, exec.resize, and exec.signal SIGINT (exit 130).
+	{
+		envOut, exitEv := runExec(control.ExecStartRequest{
+			Argv: []string{"/bin/cat", "/proc/self/environ"},
+			TTY:  true,
+		})
+		if exitEv.ExitCode != 0 || !strings.Contains(envOut, "TERM=xterm") {
+			t.Fatalf("TTY exec environ = (code=%d, out=%q), want TERM=xterm", exitEv.ExitCode, envOut)
+		}
+
+		ttySt, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv:  []string{"/bin/cat", "/proc/self/fd/0"},
+			Stdin: true,
+			TTY:   true,
+			Rows:  24,
+			Cols:  80,
+		})
+		if err != nil {
+			t.Fatalf("exec TTY open: %v", err)
+		}
+		if err := ttySt.WaitResponse(ctx, nil); err != nil {
+			ttySt.Close()
+			t.Fatalf("exec TTY wait: %v", err)
+		}
+		if err := ttySt.SendEvent(ctx, "exec.resize", control.ExecResizeEvent{Rows: 40, Cols: 120}); err != nil {
+			ttySt.Close()
+			t.Fatalf("exec.resize: %v", err)
+		}
+		inW := ttySt.ChannelWriter(ctx, control.ChannelStdin, false)
+		if _, err := io.WriteString(inW, "tty-hi\r"); err != nil {
+			ttySt.Close()
+			t.Fatalf("exec TTY write stdin: %v", err)
+		}
+		outR := ttySt.ChannelReader(ctx, control.ChannelStdout)
+		buf := make([]byte, 256)
+		var ttyOut strings.Builder
+		readCtx, readCancel := context.WithTimeout(ctx, 5*time.Second)
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			for !strings.Contains(ttyOut.String(), "tty-hi\r\n") {
+				n, err := outR.Read(buf)
+				if n > 0 {
+					ttyOut.Write(buf[:n])
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		select {
+		case <-readDone:
+		case <-readCtx.Done():
+			ttySt.Close()
+			<-readDone
+			t.Fatalf("timed out waiting for TTY echo, got %q", ttyOut.String())
+		}
+		readCancel()
+		if !strings.Contains(ttyOut.String(), "tty-hi\r\n") {
+			ttySt.Close()
+			t.Fatalf("TTY stdout = %q, want ONLCR echo containing tty-hi\\r\\n", ttyOut.String())
+		}
+
+		if err := ttySt.SendEvent(ctx, "exec.signal", control.ExecSignalEvent{Signal: "SIGINT"}); err != nil {
+			ttySt.Close()
+			t.Fatalf("exec.signal SIGINT: %v", err)
+		}
+		ev, err := ttySt.RecvEvent(ctx)
+		ttySt.Close()
+		if err != nil || ev.Type != "exec.exit" {
+			t.Fatalf("TTY exec exit after SIGINT = (%+v, %v), want exec.exit", ev, err)
+		}
+		var sigExit control.ExecExitEvent
+		if err := json.Unmarshal(ev.Data, &sigExit); err != nil || sigExit.Signal != 2 || sigExit.ExitCode != 130 {
+			t.Fatalf("TTY exec SIGINT exit = (%+v, %v), want Signal=2 ExitCode=130", sigExit, err)
+		}
+	}
+
+	// 2. Exec non-root users (-u nobody, -u 1000:1000) and --privileged=false cap drop.
+	{
+		if out, exitEv := runExec(control.ExecStartRequest{Argv: []string{"/bin/cat", "/etc/rootonly.txt"}}); exitEv.ExitCode != 0 || out != "secret-root\n" {
+			t.Fatalf("root cat /etc/rootonly.txt = (%q, %+v), want secret-root", out, exitEv)
+		}
+		privStatus, _ := runExec(control.ExecStartRequest{Argv: []string{"/bin/cat", "/proc/self/status"}})
+		if strings.Contains(privStatus, "CapEff:\t0000000000000000") {
+			t.Fatalf("default privileged root had empty CapEff:\n%s", privStatus)
+		}
+
+		dropPriv := false
+		unprivStatus, exitEv := runExec(control.ExecStartRequest{
+			Argv:       []string{"/bin/cat", "/proc/self/status"},
+			Privileged: &dropPriv,
+		})
+		if exitEv.ExitCode != 0 ||
+			!strings.Contains(unprivStatus, "CapEff:\t0000000000000000") ||
+			!strings.Contains(unprivStatus, "CapPrm:\t0000000000000000") ||
+			!strings.Contains(unprivStatus, "CapBnd:\t0000000000000000") {
+			t.Fatalf("privileged=false status = (code=%d), want zero CapEff/CapPrm/CapBnd:\n%s", exitEv.ExitCode, unprivStatus)
+		}
+
+		if _, exitEv := runExec(control.ExecStartRequest{
+			Argv: []string{"/bin/cat", "/etc/rootonly.txt"},
+			User: "nobody",
+		}); exitEv.ExitCode == 0 {
+			t.Fatal("user=nobody read 0600 rootonly.txt, want EACCES non-zero exit")
+		}
+		nobodyStatus, exitEv := runExec(control.ExecStartRequest{
+			Argv: []string{"/bin/cat", "/proc/self/status"},
+			User: "nobody",
+		})
+		if exitEv.ExitCode != 0 || !strings.Contains(nobodyStatus, "Uid:\t65534\t") {
+			t.Fatalf("user=nobody status = (code=%d), want Uid 65534:\n%s", exitEv.ExitCode, nobodyStatus)
+		}
+
+		numStatus, exitEv := runExec(control.ExecStartRequest{
+			Argv: []string{"/bin/cat", "/proc/self/status"},
+			User: "1000:1000",
+		})
+		if exitEv.ExitCode != 0 || !strings.Contains(numStatus, "Uid:\t1000\t") || !strings.Contains(numStatus, "Gid:\t1000\t") {
+			t.Fatalf("user=1000:1000 status = (code=%d), want Uid/Gid 1000:\n%s", exitEv.ExitCode, numStatus)
+		}
+	}
+
+	// 3. Real live pids.max enforcement (guest SYS_clone returns EAGAIN=11; exec returns LIMIT_EXCEEDED)
+	// plus proc.signal targeting a specific exec PID while PID 1 remains alive.
+	{
+		if _, exitEv := runExec(control.ExecStartRequest{Argv: []string{"/bin/fork"}}); exitEv.ExitCode != 0 {
+			t.Fatalf("initial /bin/fork with PidsLimit=16 exited %+v, want 0", exitEv)
+		}
+
+		cap2 := int64(2)
+		if err := rs.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{PidsLimit: &cap2}, nil); err != nil {
+			t.Fatalf("update PidsLimit=2: %v", err)
+		}
+		// PID 1 + /bin/fork occupy both slots; SYS_clone for the 3rd task must fail with EAGAIN (11).
+		if _, exitEv := runExec(control.ExecStartRequest{Argv: []string{"/bin/fork"}}); exitEv.ExitCode != 11 {
+			t.Fatalf("/bin/fork with PidsLimit=2 exited %+v, want exit code 11 (EAGAIN)", exitEv)
+		}
+
+		// Hold slot 2/2 with a blocking exec; a concurrent 2nd exec must fail with LIMIT_EXCEEDED.
+		holdSt, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv:  []string{"/bin/cat", "/proc/self/fd/0"},
+			Stdin: true,
+		})
+		if err != nil {
+			t.Fatalf("blocking exec open: %v", err)
+		}
+		var holdResp control.ExecStartResponse
+		if err := holdSt.WaitResponse(ctx, &holdResp); err != nil {
+			holdSt.Close()
+			t.Fatalf("blocking exec wait: %v", err)
+		}
+		if err := rs.client.Call(ctx, control.MethodExecStart, control.ExecStartRequest{Argv: []string{"/bin/hello"}}, nil); !control.IsCode(err, control.CodeLimitExceeded) {
+			holdSt.Close()
+			t.Fatalf("exec at PidsLimit=2 err = %v, want LIMIT_EXCEEDED", err)
+		}
+
+		// proc.signal targeting holdResp.PID kills only the exec session; PID 1 stays alive.
+		if err := rs.client.Call(ctx, control.MethodProcSignal, control.ProcSignalRequest{
+			PID:    holdResp.PID,
+			Signal: "SIGTERM",
+		}, nil); err != nil {
+			holdSt.Close()
+			t.Fatalf("proc.signal PID %d: %v", holdResp.PID, err)
+		}
+		ev, err := holdSt.RecvEvent(ctx)
+		holdSt.Close()
+		var holdExit control.ExecExitEvent
+		if err != nil || ev.Type != "exec.exit" || json.Unmarshal(ev.Data, &holdExit) != nil || holdExit.ExitCode != 143 {
+			t.Fatalf("killed exec exit = (%+v, %+v, %v), want ExitCode=143 (SIGTERM)", ev, holdExit, err)
+		}
+
+		// Raising PidsLimit back to 16 immediately allows /bin/fork to succeed again.
+		cap16 := int64(16)
+		if err := rs.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{PidsLimit: &cap16}, nil); err != nil {
+			t.Fatalf("update PidsLimit=16: %v", err)
+		}
+		if _, exitEv := runExec(control.ExecStartRequest{Argv: []string{"/bin/fork"}}); exitEv.ExitCode != 0 {
+			t.Fatalf("/bin/fork after raising PidsLimit=16 exited %+v, want 0", exitEv)
+		}
+	}
+
+	// 4. sandbox.events multi-type OR filtering + kernel.log follow & clear.
+	func() {
+		evCtx, evCancel := context.WithCancel(ctx)
+		defer evCancel()
+		evSt, err := rs.client.OpenStream(evCtx, control.MethodEvents, control.EventsRequest{
+			Filters: []string{"type=lifecycle", "type=mount", "type=resource"},
+		})
+		if err != nil {
+			t.Fatalf("events open: %v", err)
+		}
+		defer evSt.Close()
+		if err := evSt.WaitResponse(evCtx, nil); err != nil {
+			t.Fatalf("events wait: %v", err)
+		}
+		received := make(chan control.SandboxEvent, 16)
+		evLoopDone := make(chan struct{})
+		go func() {
+			defer close(evLoopDone)
+			for {
+				ev, err := evSt.RecvEvent(evCtx)
+				if err != nil {
+					return
+				}
+				if ev.Type != "event" {
+					continue
+				}
+				var se control.SandboxEvent
+				if json.Unmarshal(ev.Data, &se) == nil {
+					received <- se
+				}
+			}
+		}()
+		defer func() {
+			evCancel()
+			evSt.Close()
+			<-evLoopDone
+		}()
+
+		// Trigger one filtered-out exec event, then 5 matching events.
+		_, _ = runExec(control.ExecStartRequest{Argv: []string{"/bin/hello"}})
+		if err := rs.client.Call(ctx, control.MethodPause, control.PauseRequest{}, nil); err != nil {
+			t.Fatalf("pause for events: %v", err)
+		}
+		if err := rs.client.Call(ctx, control.MethodUnpause, nil, nil); err != nil {
+			t.Fatalf("unpause for events: %v", err)
+		}
+		if err := rs.client.Call(ctx, control.MethodMountAdd, control.MountAddRequest{Type: "tmpfs", Target: "/mnt/evtmp"}, nil); err != nil {
+			t.Fatalf("mount.add for events: %v", err)
+		}
+		if err := rs.client.Call(ctx, control.MethodMountRemove, control.MountRemoveRequest{Target: "/mnt/evtmp"}, nil); err != nil {
+			t.Fatalf("mount.remove for events: %v", err)
+		}
+		cap32 := int64(32)
+		if err := rs.client.Call(ctx, control.MethodResourceUpdate, control.ResourceUpdateRequest{PidsLimit: &cap32}, nil); err != nil {
+			t.Fatalf("resource.update for events: %v", err)
+		}
+
+		wantSeq := []string{"lifecycle:pause", "lifecycle:unpause", "mount:add", "mount:remove", "resource:update"}
+		for i, want := range wantSeq {
+			select {
+			case se := <-received:
+				got := se.Type + ":" + se.Action
+				if got != want {
+					t.Fatalf("event[%d] = %q, want %q", i, got, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for event[%d] %q", i, want)
+			}
+		}
+
+		// kernel.log follow starts cleanly and cancels cleanly; clear empties the ring.
+		fCtx, fCancel := context.WithCancel(ctx)
+		fSt, err := rs.client.OpenStream(fCtx, control.MethodKernelLog, control.KernelLogRequest{Follow: true, Tail: 5})
+		if err != nil {
+			fCancel()
+			t.Fatalf("kernel.log follow open: %v", err)
+		}
+		var initLog control.KernelLogResponse
+		if err := fSt.WaitResponse(fCtx, &initLog); err != nil {
+			fCancel()
+			fSt.Close()
+			t.Fatalf("kernel.log follow wait: %v", err)
+		}
+		fCancel()
+		fSt.Close()
+
+		var cleared control.KernelLogResponse
+		if err := rs.client.Call(ctx, control.MethodKernelLog, control.KernelLogRequest{Clear: true}, &cleared); err != nil {
+			t.Fatalf("kernel.log clear: %v", err)
+		}
+		var afterClear control.KernelLogResponse
+		if err := rs.client.Call(ctx, control.MethodKernelLog, control.KernelLogRequest{}, &afterClear); err != nil {
+			t.Fatalf("kernel.log after clear: %v", err)
+		}
+		if len(afterClear.Records) != 0 {
+			t.Fatalf("kernel.log after clear returned %d records, want 0", len(afterClear.Records))
+		}
+	}()
+
+	// 5. Multi-spec port.add partial-failure rollback, replace=true, and --all-dynamic.
+	{
+		// max_dynamic_ports=1: adding 2 specs must fail on the 2nd and roll back the 1st.
+		if err := rs.client.Call(ctx, control.MethodPortAdd, control.PortAddRequest{
+			Specs: []string{"127.0.0.1:0:8080", "127.0.0.1:0:8081"},
+		}, nil); !control.IsCode(err, control.CodeLimitExceeded) {
+			t.Fatalf("2-spec port.add with max=1 err = %v, want LIMIT_EXCEEDED", err)
+		}
+		var pl control.PortListResponse
+		if err := rs.client.Call(ctx, control.MethodPortList, nil, &pl); err != nil {
+			t.Fatalf("port.list after rollback: %v", err)
+		}
+		if len(pl.Ports) != 0 {
+			t.Fatalf("port.list after failed batch = %+v, want empty (rolled back)", pl.Ports)
+		}
+
+		// Add 1 dynamic rule, replace it in place, then remove with AllDynamic.
+		var addResp control.PortAddResponse
+		if err := rs.client.Call(ctx, control.MethodPortAdd, control.PortAddRequest{
+			Specs: []string{"127.0.0.1:0:8080"},
+		}, &addResp); err != nil || len(addResp.Ports) != 1 {
+			t.Fatalf("port.add single = (%+v, %v), want 1 port", addResp, err)
+		}
+		hp := addResp.Ports[0].HostPort
+
+		var repResp control.PortAddResponse
+		if err := rs.client.Call(ctx, control.MethodPortAdd, control.PortAddRequest{
+			Specs:   []string{"127.0.0.1:" + strconv.Itoa(int(hp)) + ":9090"},
+			Replace: true,
+		}, &repResp); err != nil || len(repResp.Ports) != 1 || repResp.Ports[0].GuestPort != 9090 {
+			t.Fatalf("port.add replace = (%+v, %v), want GuestPort=9090", repResp, err)
+		}
+
+		var rmResp control.PortRemoveResponse
+		if err := rs.client.Call(ctx, control.MethodPortRemove, control.PortRemoveRequest{AllDynamic: true}, &rmResp); err != nil || len(rmResp.Removed) != 1 {
+			t.Fatalf("port.remove all_dynamic = (%+v, %v), want 1 removed", rmResp, err)
+		}
+		if err := rs.client.Call(ctx, control.MethodPortList, nil, &pl); err != nil || len(pl.Ports) != 0 {
+			t.Fatalf("port.list after all_dynamic = (%+v, %v), want empty", pl, err)
+		}
+	}
+
+	// 6. proc.signal with All=true terminates both an active exec session and PID 1.
+	{
+		allExec, err := rs.client.OpenStream(ctx, control.MethodExecStart, control.ExecStartRequest{
+			Argv:  []string{"/bin/cat", "/proc/self/fd/0"},
+			Stdin: true,
+		})
+		if err != nil {
+			t.Fatalf("exec for kill --all open: %v", err)
+		}
+		defer allExec.Close()
+		if err := allExec.WaitResponse(ctx, nil); err != nil {
+			t.Fatalf("exec for kill --all wait: %v", err)
+		}
+		if err := rs.client.Call(ctx, control.MethodProcSignal, control.ProcSignalRequest{
+			All:    true,
+			Signal: "SIGKILL",
+		}, nil); err != nil {
+			t.Fatalf("proc.signal all SIGKILL: %v", err)
+		}
+		select {
+		case <-rs.runDone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("sandbox did not exit after proc.signal(all=true, SIGKILL)")
+		}
 	}
 }

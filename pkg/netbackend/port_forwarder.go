@@ -326,16 +326,17 @@ func ParsePortForwardSpec(spec string, allowSinglePort, strictBindIP bool) (Port
 }
 
 type boundTCPForward struct {
+	// PortForwarder.mu guards rule.
 	rule     PortForwardRule
 	listener net.Listener
 }
 
 type boundUDPForward struct {
+	// PortForwarder.mu guards rule, closed, and sessions.
 	rule       PortForwardRule
 	packetConn *net.UDPConn
 
 	// closed is set when this rule is unpublished or PortForwarder closes.
-	// PortForwarder.mu guards closed and sessions.
 	closed   bool
 	sessions map[netip.AddrPort]*udpForwardSession
 }
@@ -651,7 +652,15 @@ func (pf *PortForwarder) AttachRestoredStack(s *stack.Stack) error {
 			pf.wg.Add(1)
 			go pf.serveTCP(b)
 		}
+		for _, b := range pf.manualTCP {
+			pf.wg.Add(1)
+			go pf.serveTCP(b)
+		}
 		for _, b := range pf.udpList {
+			pf.wg.Add(1)
+			go pf.serveUDP(b)
+		}
+		for _, b := range pf.manualUDP {
 			pf.wg.Add(1)
 			go pf.serveUDP(b)
 		}
@@ -767,12 +776,11 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 	defer pf.wg.Done()
 	pf.mu.Lock()
 	acceptFn := pf.accept
+	hostPort := b.rule.HostPort
 	pf.mu.Unlock()
 	if acceptFn == nil {
 		acceptFn = net.Listener.Accept
 	}
-	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
-	fallback := allowsLoopbackFallback(b.rule.GuestIP)
 	var backoff time.Duration
 	var timer *time.Timer
 	defer func() {
@@ -788,7 +796,7 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 			}
 			// A transient error such as EMFILE must not end the listener.
 			backoff = min(max(2*backoff, acceptBackoffMin), acceptBackoffMax)
-			pf.log.Warn("netbackend: accept on forwarded port failed", "port", b.rule.HostPort, "retry_in", backoff, "error", err)
+			pf.log.Warn("netbackend: accept on forwarded port failed", "port", hostPort, "retry_in", backoff, "error", err)
 			if timer == nil {
 				timer = time.NewTimer(backoff)
 			} else {
@@ -803,6 +811,11 @@ func (pf *PortForwarder) serveTCP(b *boundTCPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
+		pf.mu.Lock()
+		r := b.rule
+		pf.mu.Unlock()
+		guestAddr := parseGuestFullAddr(r.GuestIP, r.GuestPort)
+		fallback := allowsLoopbackFallback(r.GuestIP)
 		if !pf.spawn(func() { pf.relayTCPClient(guestAddr, fallback, hostConn) }) {
 			_ = hostConn.Close()
 			return
@@ -870,8 +883,9 @@ func dialGuestTCP(ctx context.Context, s *stack.Stack, guestAddr tcpip.FullAddre
 
 func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 	defer pf.wg.Done()
-	guestAddr := parseGuestFullAddr(b.rule.GuestIP, b.rule.GuestPort)
-	fallback := allowsLoopbackFallback(b.rule.GuestIP)
+	pf.mu.Lock()
+	hostPort := b.rule.HostPort
+	pf.mu.Unlock()
 	buf := make([]byte, maxUDPDatagram)
 	var backoff time.Duration
 	var timer *time.Timer
@@ -887,7 +901,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 				return
 			}
 			backoff = min(max(2*backoff, acceptBackoffMin), acceptBackoffMax)
-			pf.log.Warn("netbackend: read on forwarded UDP port failed", "port", b.rule.HostPort, "retry_in", backoff, "error", err)
+			pf.log.Warn("netbackend: read on forwarded UDP port failed", "port", hostPort, "retry_in", backoff, "error", err)
 			if timer == nil {
 				timer = time.NewTimer(backoff)
 			} else {
@@ -902,7 +916,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 		}
 		backoff = 0
 		pf.waitResumed()
-		sess := pf.udpSession(b, guestAddr, fallback, client)
+		sess := pf.udpSession(b, client)
 		if sess == nil {
 			continue
 		}
@@ -916,7 +930,7 @@ func (pf *PortForwarder) serveUDP(b *boundUDPForward) {
 // udpSession returns the session of client. It creates the session and its
 // reply goroutine on the first datagram. It returns nil when the forwarder is
 // closed, the rule is at its session limit, or the guest endpoint fails.
-func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddress, fallback bool, client netip.AddrPort) *udpForwardSession {
+func (pf *PortForwarder) udpSession(b *boundUDPForward, client netip.AddrPort) *udpForwardSession {
 	pf.mu.Lock()
 	if pf.closed || b.closed || pf.stack == nil {
 		pf.mu.Unlock()
@@ -927,13 +941,17 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 		return sess
 	}
 	if len(b.sessions) >= pf.udpMaxSessions {
+		hostPort := b.rule.HostPort
 		pf.mu.Unlock()
-		pf.log.Warn("netbackend: UDP forward session limit reached", "port", b.rule.HostPort, "client", client)
+		pf.log.Warn("netbackend: UDP forward session limit reached", "port", hostPort, "client", client)
 		return nil
 	}
 	s := pf.stack
+	r := b.rule
 	pf.mu.Unlock()
 
+	guestAddr := parseGuestFullAddr(r.GuestIP, r.GuestPort)
+	fallback := allowsLoopbackFallback(r.GuestIP)
 	target := guestAddr
 	if fallback && prefersGuestLoopback(s, header.UDPProtocolNumber, guestAddr) {
 		target = guestLoopbackAddr(guestAddr.Port)
@@ -948,7 +966,7 @@ func (pf *PortForwarder) udpSession(b *boundUDPForward, guestAddr tcpip.FullAddr
 	// Only this rule's serveUDP goroutine inserts sessions, so the earlier
 	// lookup cannot race with another insert for the same key.
 	pf.mu.Lock()
-	if pf.closed || b.closed || pf.stack != s {
+	if pf.closed || b.closed || pf.stack != s || b.rule != r {
 		pf.mu.Unlock()
 		_ = guest.Close()
 		return nil

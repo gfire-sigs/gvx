@@ -266,7 +266,6 @@ func (s *Sandbox) handleMountAdd(ctx context.Context, stream *control.Stream, ra
 		}
 		vol, volErr := ext4lite.OpenVolume(f, ext4lite.VolumeOptions{ReadOnly: req.ReadOnly})
 		if volErr != nil {
-			_ = f.Close()
 			if errors.Is(volErr, ext4lite.ErrVolumeInUse) {
 				return control.NewError(control.CodeBusy, "volume image is already in use by another sandbox")
 			}

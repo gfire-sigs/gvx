@@ -29,14 +29,16 @@ func HostErrorToLinuxErrno(err error) int {
 		return 0
 	}
 	switch {
-	case errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ENOENT):
-		return LinuxENOENT
-	case errors.Is(err, os.ErrExist), errors.Is(err, syscall.EEXIST):
-		return LinuxEEXIST
-	case errors.Is(err, os.ErrPermission), errors.Is(err, syscall.EACCES):
-		return LinuxEACCES
+	// Match specific errnos before Go's broad os.Err* sentinels because
+	// syscall.Errno.Is maps EPERM to os.ErrPermission.
 	case errors.Is(err, syscall.EPERM):
 		return LinuxEPERM
+	case errors.Is(err, syscall.EACCES):
+		return LinuxEACCES
+	case errors.Is(err, syscall.ENOENT):
+		return LinuxENOENT
+	case errors.Is(err, syscall.EEXIST):
+		return LinuxEEXIST
 	case errors.Is(err, syscall.EBUSY):
 		return LinuxEBUSY
 	case errors.Is(err, syscall.EXDEV):
@@ -59,6 +61,12 @@ func HostErrorToLinuxErrno(err error) int {
 		return LinuxENOSPC
 	case errors.Is(err, syscall.EOPNOTSUPP), errors.Is(err, syscall.ENOTSUP):
 		return LinuxEOPNOTSUPP
+	case errors.Is(err, os.ErrNotExist):
+		return LinuxENOENT
+	case errors.Is(err, os.ErrExist):
+		return LinuxEEXIST
+	case errors.Is(err, os.ErrPermission):
+		return LinuxEACCES
 	default:
 		return LinuxEIO
 	}
