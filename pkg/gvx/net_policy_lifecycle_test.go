@@ -141,8 +141,14 @@ func TestProtectedCheckpointUsesLatestMatchingStoreGeneration(t *testing.T) {
 	cfg.NetPolicy = &NetPolicyOptions{Path: storePath}
 	bundle := filepath.Join(t.TempDir(), "checkpoint")
 	manifest := captureNetPolicyCheckpoint(t, cfg, bundle, &second)
-	if manifest.Version != 2 || manifest.NetPolicy == nil || manifest.NetPolicy.MinGeneration != 2 {
-		t.Fatalf("protected manifest: version %d, binding %+v; want version 2 and generation 2", manifest.Version, manifest.NetPolicy)
+	if manifest.Version != protectedCheckpointManifestVersion {
+		t.Fatalf("protected manifest version = %d, want %d", manifest.Version, protectedCheckpointManifestVersion)
+	}
+	if manifest.NetPolicy == nil {
+		t.Fatal("protected manifest has no policy binding")
+	}
+	if got := manifest.NetPolicy.MinGeneration; got != 2 {
+		t.Fatalf("protected manifest minimum policy generation = %d, want 2", got)
 	}
 	cfg.NetPolicy = nil
 
@@ -189,7 +195,7 @@ func TestProtectedCheckpointUsesLatestMatchingStoreGeneration(t *testing.T) {
 	})
 	t.Run("legacy manifest cannot name protected state", func(t *testing.T) {
 		stale := manifest
-		stale.Version, stale.NetPolicy = 1, nil
+		stale.Version, stale.NetPolicy = legacyCheckpointManifestVersion, nil
 		writeNetPolicyTestManifest(t, bundle, stale)
 		defer writeNetPolicyTestManifest(t, bundle, manifest)
 		requireNetPolicyRestoreError(t, cfg, RestoreOptions{Dir: bundle}, "state_mismatch")
@@ -230,24 +236,27 @@ func TestProtectedCheckpointUsesLatestMatchingStoreGeneration(t *testing.T) {
 	}
 }
 
-func TestLegacyNATCheckpointAcceptsExplicitPolicySeed(t *testing.T) {
+func TestUnprotectedNATCheckpointAcceptsExplicitPolicySeed(t *testing.T) {
 	cfg := netPolicyCheckpointConfig(t)
 	bundle := filepath.Join(t.TempDir(), "checkpoint")
 	manifest := captureNetPolicyCheckpoint(t, cfg, bundle, nil)
-	if manifest.Version != 1 || manifest.NetPolicy != nil {
-		t.Fatalf("legacy manifest: version %d, binding %+v; want version 1 and no binding", manifest.Version, manifest.NetPolicy)
+	if manifest.Version != CheckpointManifestVersion {
+		t.Fatalf("unprotected manifest version = %d, want %d", manifest.Version, CheckpointManifestVersion)
+	}
+	if manifest.NetPolicy != nil {
+		t.Fatalf("unprotected manifest policy binding = %+v, want nil", manifest.NetPolicy)
 	}
 	seed := netbackend.PolicyConfig{RulesV4: policyDropAll, RulesV6: policyDropAll}
 	path := filepath.Join(privatePolicyStoreDir(t), "policy")
 	opts := RestoreOptions{Dir: bundle, NetPolicy: &NetPolicyOptions{Path: path, Seed: &seed}}
 	restored, err := Restore(t.Context(), cfg, opts)
 	if err != nil {
-		t.Fatalf("restore legacy bundle with new policy: %v", err)
+		t.Fatalf("restore unprotected bundle with new policy: %v", err)
 	}
 	defer closeNetPolicyTestSandbox(t, restored)
 	current, err := restored.NetPolicy()
 	if err != nil || current.Revision == "" || current.PolicyConfig != seed {
-		t.Fatalf("policy after legacy restore: (%+v, %v), want a nonempty revision and %+v", current, err, seed)
+		t.Fatalf("policy after restore with seed: (%+v, %v), want a nonempty revision and %+v", current, err, seed)
 	}
 }
 

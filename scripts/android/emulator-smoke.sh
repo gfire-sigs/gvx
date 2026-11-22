@@ -3,6 +3,8 @@
 # offline e2e test suite, the untrusted_app probe APK, and the sample
 # foreground-service APK on the device that adb selects (GVXIP-006 P1-4).
 #
+# Use a device that supports adb root. The checkpoint tests run as shell.
+#
 # Go links android/amd64 only with cgo, so an x86_64 device needs the NDK:
 # set ANDROID_NDK_HOME, or install an NDK under ANDROID_HOME/ndk. The script
 # disables the Android phantom process killer during the test run and restores
@@ -13,14 +15,33 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
+dir=/data/local/tmp/gvx-smoke
+control_cache=
+
+switch_adb_uid() {
+	local want_uid=$1 mode=$2 uid=""
+	adb "$mode" >/dev/null 2>&1 || return 1
+	for _ in $(seq 1 30); do
+		adb wait-for-device >/dev/null 2>&1 || true
+		uid=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
+		if [ "$uid" = "$want_uid" ]; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
 cleanup() {
 	rm -rf "$work"
 	adb shell "rm -rf /data/local/tmp/gvx-smoke; settings delete global settings_enable_monitor_phantom_procs; device_config delete activity_manager max_phantom_processes; device_config set_sync_disabled_for_tests none" >/dev/null 2>&1 || true
+	if [ -n "$control_cache" ] && switch_adb_uid 0 root; then
+		adb shell "rm -rf '$control_cache'" >/dev/null 2>&1 || true
+	fi
 	adb unroot >/dev/null 2>&1 || true
 	adb wait-for-device >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-dir=/data/local/tmp/gvx-smoke
 
 abi=$(adb shell getprop ro.product.cpu.abi | tr -d '\r')
 ANDROID_ABI=$abi
@@ -43,6 +64,19 @@ for g in gostatic regprobe sigframeprobe forkprobe cowprobe codewrite spareprobe
 done
 GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-linkmode=internal -T 0x1001000" -o "$work/bins/brkgrow-0x1001000" ./internal/acceptprog/brkgrow
 
+# The TCP token path requires trusted ancestors. /dev is a root-owned tmpfs
+# with mode 0755. Use the shell data label so the tests can write their tokens.
+if ! switch_adb_uid 0 root; then
+	echo "FAIL adb-root (cannot create the checkpoint token cache)"
+	exit 1
+fi
+control_cache=$(adb shell -T 'mktemp -d /dev/gvx-control.XXXXXXXX')
+adb shell "chcon u:object_r:shell_data_file:s0 '$control_cache' && chown shell:shell '$control_cache'"
+if ! switch_adb_uid 2000 unroot; then
+	echo "FAIL adb-unroot (checkpoint tests must run as shell)"
+	exit 1
+fi
+
 adb shell "settings put global settings_enable_monitor_phantom_procs false; device_config set_sync_disabled_for_tests persistent; device_config put activity_manager max_phantom_processes 2147483647" >/dev/null 2>&1 || true
 adb shell "rm -rf $dir && mkdir -p $dir/cache $dir/tmp $dir/vws"
 adb push "$work/bins"/* "$dir/" >/dev/null
@@ -62,8 +96,9 @@ fi
 
 run_test_suite() {
 	local label=$1 bin=$2 timeout=$3 keep=${4:-0} extra=${5:-} rc=0
+	local cache=${6:-$dir/cache}
 	echo "== $label"
-	adb shell "umask 022 && cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/cache GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout $extra 2>&1" | tr -d '\r' || rc=$?
+	adb shell "umask 022 && cd $dir && HOME=$dir TMPDIR=$dir/tmp XDG_CACHE_HOME='$cache' GVX_E2E_OFFLINE=1 GVX_PREBUILT_DIR=$dir ./$bin -test.v -test.count=1 -test.timeout=$timeout $extra 2>&1" | tr -d '\r' || rc=$?
 	if [ "$keep" -eq 0 ]; then
 		adb shell "rm -f $dir/$bin" || true
 	fi
@@ -77,23 +112,7 @@ run_test_suite() {
 
 run_test_suite "systrap.test (shell)" systrap.test 10m
 run_test_suite "ext4lite.test (shell)" ext4lite.test 10m
-run_test_suite "e2e.test (shell)" e2e.test 30m 1
-
-# Switch adbd to root only for the hostfs and overlay hard-link suites, because
-# Android's shell SELinux domain denies linkat(2) on /data/local/tmp.
-switch_adb_uid() {
-	local want_uid=$1 mode=$2 uid=""
-	adb "$mode" >/dev/null 2>&1 || return 1
-	for _ in $(seq 1 30); do
-		adb wait-for-device >/dev/null 2>&1 || true
-		uid=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
-		if [ "$uid" = "$want_uid" ]; then
-			return 0
-		fi
-		sleep 1
-	done
-	return 1
-}
+run_test_suite "e2e.test (shell)" e2e.test 30m 1 "" "$control_cache"
 
 # run_shell runs cmd in the adb shell, and it passes only when the exit status
 # equals want_rc (default 0), the output holds want, and no line says FAIL. The
@@ -112,6 +131,8 @@ run_shell() {
 }
 
 if switch_adb_uid 0 root; then
+	adb shell "rm -rf '$control_cache'"
+	control_cache=
 	run_shell voltree-write-hostfs "write ok" "./rungv run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- write /workspace"
 	run_shell voltree-verify-hostfs "verify ok" "./rungv run -platform=systrap -net=none -workspace=$dir/vws -bin=$dir/voltree -- verify /workspace"
 	run_test_suite "hostfs.test (root)" hostfs.test 10m
@@ -121,12 +142,9 @@ if switch_adb_uid 0 root; then
 		echo "FAIL adb-unroot"
 		failed=1
 	fi
-elif [ "${CI:-}" = true ]; then
-	echo "FAIL adb-root"
-	failed=1
 else
-	echo "SKIP root-hostfs-suites (adb root unavailable on user build)"
-	adb shell "rm -f $dir/hostfs.test $dir/e2e.test" || true
+	echo "FAIL adb-root (cannot run the hostfs suites)"
+	failed=1
 fi
 
 echo "== probe APK (untrusted_app)"
